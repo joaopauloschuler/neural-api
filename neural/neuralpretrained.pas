@@ -41195,7 +41195,7 @@ type
   end;
 
 procedure TConvPatchGatherer.GatherEnCodec(t: integer; Dst: TNeuralFloatArrPtr);
-var i, k2: integer;
+var i, k2, sp: integer;
     InChM1, KM1, tS, iK: integer;
     SrcRow: TNeuralFloatDynArr;
 begin
@@ -41206,8 +41206,12 @@ begin
   begin
     iK := i * K;
     SrcRow := Src[i];
+    sp := tS;                      // #6: k2*Dil carried as a running offset
     for k2 := 0 to KM1 do
-      Dst^[iK + k2] := SrcRow[tS + k2 * Dil];
+    begin
+      Dst^[iK + k2] := SrcRow[sp];
+      Inc(sp, Dil);
+    end;
   end;
 end;
 
@@ -41223,14 +41227,16 @@ begin
   begin
     iK := i * K;
     SrcRow := Src[i];
+    sp := tSP;                   // #6: k2*Dil carried
+    dstIdx := iK;                // #6: k2 carried (dst advances by 1)
     for k2 := 0 to KM1 do
     begin
-      sp := tSP + k2 * Dil;
-      dstIdx := iK + k2;
       if (sp >= 0) and (sp < InLen) then
         Dst^[dstIdx] := SrcRow[sp]
       else
         Dst^[dstIdx] := 0;
+      Inc(sp, Dil);
+      Inc(dstIdx);
     end;
   end;
 end;
@@ -41252,7 +41258,7 @@ type
   end;
 
 procedure TEnCodecConvWorker.RunForward(index, threadnum: integer);
-var tStart, tFin, o, t, i, k2: integer; Patch: TNeuralFloatDynArr;
+var tStart, tFin, o, t, i, k2, src: integer; Patch: TNeuralFloatDynArr;
     InChM1, KM1, OutChM1: integer;
     tS, iK, PatchLen, wBase: integer; PadRow: TNeuralFloatDynArr;
 begin
@@ -41278,8 +41284,12 @@ begin
     begin
       iK := i * K;
       PadRow := Padded[i];
+      src := tS;                     // #6: k2*Dil carried
       for k2 := 0 to KM1 do
-        Patch[iK + k2] := PadRow[tS + k2 * Dil];
+      begin
+        Patch[iK + k2] := PadRow[src];
+        Inc(src, Dil);
+      end;
     end;
     wBase := 0;
     for o := 0 to OutChM1 do
@@ -41339,6 +41349,7 @@ var
   InChM1, OutChM1, KM1, InLenM1: integer;
   PadLeftM1, PadRightM1, OutLenM1, FullLenM1: integer;
   tS, iK, PatchLen, wBase, tInCh, wOfs, wBaseO: integer;
+  oK, OCK, srcBase: integer;
   PadRow, FullRow: TNeuralFloatDynArr;
   Acc: TNeuralFloat;
   Padded: TNNetFloatDynArr2D;
@@ -41473,8 +41484,12 @@ begin
         begin
           iK := i * K;
           PadRow := Padded[i];
+          src := tS;                   // #6: k2*Dil carried
           for k2 := 0 to KM1 do
-            Patch[iK + k2] := PadRow[tS + k2 * Dil];
+          begin
+            Patch[iK + k2] := PadRow[src];
+            Inc(src, Dil);
+          end;
         end;
         wBase := 0;
         for o := 0 to OutChM1 do
@@ -41524,14 +41539,22 @@ begin
        (Int64(OutCh) * K * InLen * InCh >= FConvOpenCLMinWork) then
     begin
       RunConvTransposeGemmOpenCL(WT, InT, OutCh, K, InCh, InLen);
+      OCK := OutCh * K;
       for o := 0 to OutChM1 do
+      begin
+        oK := o * K;                        // #11: o-invariant
         for t := 0 to InLenM1 do
+        begin
+          idx := t * Stride;                // #11: t-invariant, +k2 carried (#6)
+          srcBase := t * OCK + oK;          // #11: t*OutChK + oK, +k2 carried (#6)
           for k2 := 0 to KM1 do
           begin
-            idx := t * Stride + k2;
-            Full[o][idx] := Full[o][idx] +
-              FConvResMat.FData[t * (OutCh * K) + (o * K + k2)];
+            Full[o][idx] := Full[o][idx] + FConvResMat.FData[srcBase];
+            Inc(idx);
+            Inc(srcBase);
           end;
+        end;
+      end;
     end
     else
     {$ENDIF}
@@ -42422,6 +42445,7 @@ var
   IPGK, lp: integer;
   WDMax: integer;
   grpIPG, grpOPG, oBase, tS, giK, wOfs: integer;
+  OPGK, oK, wpack, wpos: integer;
   PadRow: TMimiDblArr;
 begin
   InCh := Conv.InCh;
@@ -42499,8 +42523,12 @@ begin
           i := grpIPG + gi;
           giK := gi * K;
           PadRow := Padded[i];
+          src := tS;                     // #6: k2*Dil carried
           for k2 := 0 to KM1 do
-            Patch[giK + k2] := PadRow[tS + k2 * Dil];
+          begin
+            Patch[giK + k2] := PadRow[src];
+            Inc(src, Dil);
+          end;
         end;
         wOfs := oBase;                    // o*IPGK carried
         for co := 0 to OPGM1 do
@@ -42538,26 +42566,50 @@ begin
     // (o,k2,t) contribution is one contiguous Double DotProduct, overlap-added
     // into Full[co][idx] in the SAME (gi-reduced) per-slot order as the scalar
     // scatter; only the inner gi-sum reassociates (4-wide). Coded by Claude (AI).
-    SetLength(Patch, IPG);     // InSig column over the group, [gi]
-    SetLength(WD, IPG);        // weight column over the group for one (o,k2)
+    SetLength(Patch, IPG);       // InSig column over the group, [gi]
+    OPGK := OPG * K;
+    SetLength(WD, OPGK * IPG);    // group's weight columns pre-packed, [(o*K+k2)*IPG + gi]
     for grp := 0 to GM1 do
-      for t := 0 to InLenM1 do
+    begin
+      grpIPG := grp * IPG;
+      grpOPG := grp * OPG;
+      // Pre-pack this group's weight columns once (all t-invariant): for each
+      // (o,k2) gather the gi-contiguous column W[(grpIPG+gi)*OPGK + o*K + k2]
+      // (otherwise strided by OPGK). Repacked once per group instead of per t.
+      wpack := 0;
+      for o := 0 to OPGM1 do
       begin
-        for gi := 0 to IPGM1 do Patch[gi] := InSig[grp * IPG + gi][t];
-        for o := 0 to OPGM1 do
+        oK := o * K;
+        for k2 := 0 to KM1 do
         begin
-          co := grp * OPG + o;
-          for k2 := 0 to KM1 do
+          wpos := grpIPG * OPGK + oK + k2;
+          for gi := 0 to IPGM1 do
           begin
-            idx := t * Stride + k2;
-            // W[ci, o, k2] = W[ci*OPG*K + o*K + k2]; gather the gi column.
-            for gi := 0 to IPGM1 do
-              WD[gi] := Conv.W[(grp * IPG + gi) * OPG * K + o * K + k2];
-            Full[co][idx] := Full[co][idx] +
-              MimiDotProductD(@WD[0], @Patch[0], IPG);
+            WD[wpack] := Conv.W[wpos];
+            Inc(wpack);
+            Inc(wpos, OPGK);
           end;
         end;
       end;
+      for t := 0 to InLenM1 do
+      begin
+        tS := t * Stride;
+        for gi := 0 to IPGM1 do Patch[gi] := InSig[grpIPG + gi][t];
+        wpack := 0;
+        for o := 0 to OPGM1 do
+        begin
+          co := grpOPG + o;
+          idx := tS;                     // t*Stride + k2, k2 = 0
+          for k2 := 0 to KM1 do
+          begin
+            Full[co][idx] := Full[co][idx] +
+              MimiDotProductD(@WD[wpack], @Patch[0], IPG);
+            Inc(idx);                    // k2 advances by 1
+            Inc(wpack, IPG);             // next (o,k2) packed column
+          end;
+        end;
+      end;
+    end;
     for o := 0 to OutChM1 do
       for t := 0 to FullLenM1 do Full[o][t] := Full[o][t] + Conv.B[o];
     // Causal right-trim: padding_right = K - stride (trim_right_ratio 1.0),
@@ -42694,7 +42746,7 @@ procedure TNNetMimi.RunTransformer(
   const Layers: array of TMimiTransformerLayer; var Sig: TMimiDblArr2D);
 var
   D, T, NH, NKV, Dh, FFN, L, h, t1, t2, dd, gidx, kvh, NRep, half: integer;
-  NHDh, hDh, kvhDh: integer;
+  NHDh, hDh, kvhDh, gBase, dBase, hbase: integer;
   TM1, DM1, halfM1, DhM1, NHM1, NKVM1, FFNM1, NHDhM1, NKVDhM1, LayersM1: integer;
   Theta, Scaling, eps, m, v, e, denom, sc, mx, qr, kr: double;
   X, Hn, Q, Kk, Vv, Attn, Mlp1: array of array of double; // [T][feature]
@@ -42735,6 +42787,11 @@ begin
   SetLength(invfreq, half);
   for dd := 0 to halfM1 do
     invfreq[dd] := 1.0 / Power(Theta, (2.0 * dd) / Dh);
+  // RoPE scratch + rotate_half snapshot: size once (Dh is call-invariant),
+  // reused across every layer/timestep instead of re-SetLength per (L, t1).
+  SetLength(cosv, Dh);
+  SetLength(sinv, Dh);
+  SetLength(Orig, Dh);
 
   for L := 0 to LayersM1 do
   begin
@@ -42761,29 +42818,32 @@ begin
       SetLength(Q[t1], NH * Dh);
       SetLength(Kk[t1], NKV * Dh);
       SetLength(Vv[t1], NKV * Dh);
+      gBase := 0;                        // gidx * D, carried (#6)
       for gidx := 0 to NHDhM1 do
       begin
         sc := 0;
-        for dd := 0 to DM1 do sc := sc + Layers[L].Wq.Data[gidx * D + dd] * Hn[t1][dd];
+        for dd := 0 to DM1 do sc := sc + Layers[L].Wq.Data[gBase + dd] * Hn[t1][dd];
         if Length(Layers[L].Bq) > 0 then sc := sc + Layers[L].Bq[gidx];
         Q[t1][gidx] := sc;
+        Inc(gBase, D);
       end;
+      gBase := 0;                        // gidx * D, carried (#6)
       for gidx := 0 to NKVDhM1 do
       begin
         sc := 0;
-        for dd := 0 to DM1 do sc := sc + Layers[L].Wk.Data[gidx * D + dd] * Hn[t1][dd];
+        for dd := 0 to DM1 do sc := sc + Layers[L].Wk.Data[gBase + dd] * Hn[t1][dd];
         if Length(Layers[L].Bk) > 0 then sc := sc + Layers[L].Bk[gidx];
         Kk[t1][gidx] := sc;
         sc := 0;
-        for dd := 0 to DM1 do sc := sc + Layers[L].Wv.Data[gidx * D + dd] * Hn[t1][dd];
+        for dd := 0 to DM1 do sc := sc + Layers[L].Wv.Data[gBase + dd] * Hn[t1][dd];
         if Length(Layers[L].Bv) > 0 then sc := sc + Layers[L].Bv[gidx];
         Vv[t1][gidx] := sc;
+        Inc(gBase, D);
       end;
     end;
     // ---- apply RoPE to Q and K (per head, rotate_half convention) ----
     for t1 := 0 to TM1 do
     begin
-      SetLength(cosv, Dh); SetLength(sinv, Dh);
       for dd := 0 to halfM1 do
       begin
         cosv[dd] := Cos(t1 * invfreq[dd]);
@@ -42794,23 +42854,24 @@ begin
       // rotate_half needs the ORIGINAL head values, so snapshot per head into
       // Orig before writing back (an in-place rotation would feed the already
       // rotated first half into the second half).
-      SetLength(Orig, Dh);
       for h := 0 to NHM1 do
       begin
-        for dd := 0 to DhM1 do Orig[dd] := Q[t1][h * Dh + dd];
+        hbase := h * Dh;                                  // #11: h*Dh once per head
+        Move(Q[t1][hbase], Orig[0], Dh * SizeOf(Double)); // #13: contiguous snapshot
         for dd := 0 to DhM1 do
         begin
           if dd < half then qr := -Orig[dd + half] else qr := Orig[dd - half];
-          Q[t1][h * Dh + dd] := Orig[dd] * cosv[dd] + qr * sinv[dd];
+          Q[t1][hbase + dd] := Orig[dd] * cosv[dd] + qr * sinv[dd];
         end;
       end;
       for h := 0 to NKVM1 do
       begin
-        for dd := 0 to DhM1 do Orig[dd] := Kk[t1][h * Dh + dd];
+        hbase := h * Dh;
+        Move(Kk[t1][hbase], Orig[0], Dh * SizeOf(Double));
         for dd := 0 to DhM1 do
         begin
           if dd < half then kr := -Orig[dd + half] else kr := Orig[dd - half];
-          Kk[t1][h * Dh + dd] := Orig[dd] * cosv[dd] + kr * sinv[dd];
+          Kk[t1][hbase + dd] := Orig[dd] * cosv[dd] + kr * sinv[dd];
         end;
       end;
     end;
@@ -42831,22 +42892,16 @@ begin
         begin
           if (FConfig.SlidingWindow > 0) and (t1 - t2 >= FConfig.SlidingWindow) then
             Continue;
-          sc := 0;
-          for dd := 0 to DhM1 do
-            sc := sc + Q[t1][hDh + dd] * Kk[t2][kvhDh + dd];
-          sc := sc * Scaling;
+          sc := MimiDotProductD(@Q[t1][hDh], @Kk[t2][kvhDh], Dh) * Scaling;
           if sc > mx then mx := sc;
         end;
         denom := 0;
-        for dd := 0 to DhM1 do AccVec[dd] := 0;
+        FillChar(AccVec[0], Dh * SizeOf(Double), 0);
         for t2 := 0 to t1 do
         begin
           if (FConfig.SlidingWindow > 0) and (t1 - t2 >= FConfig.SlidingWindow) then
             Continue;
-          sc := 0;
-          for dd := 0 to DhM1 do
-            sc := sc + Q[t1][hDh + dd] * Kk[t2][kvhDh + dd];
-          sc := sc * Scaling;
+          sc := MimiDotProductD(@Q[t1][hDh], @Kk[t2][kvhDh], Dh) * Scaling;
           e := Exp(sc - mx);
           denom := denom + e;
           for dd := 0 to DhM1 do
@@ -42859,13 +42914,15 @@ begin
     // ---- output projection + LayerScale residual ----
     for t1 := 0 to TM1 do
     begin
+      dBase := 0;                        // dd * NHDh, carried (#6)
       for dd := 0 to DM1 do
       begin
         sc := 0;
         for gidx := 0 to NHDhM1 do
-          sc := sc + Layers[L].Wo.Data[dd * NHDh + gidx] * Attn[t1][gidx];
+          sc := sc + Layers[L].Wo.Data[dBase + gidx] * Attn[t1][gidx];
         if Length(Layers[L].Bo) > 0 then sc := sc + Layers[L].Bo[dd];
         X[t1][dd] := X[t1][dd] + Layers[L].AttnScale[dd] * sc;
+        Inc(dBase, NHDh);
       end;
     end;
     // ---- post-attention LayerNorm + GELU MLP + LayerScale residual ----
@@ -42886,19 +42943,23 @@ begin
           Layers[L].LnPostB[dd];
       // fc1 -> GELU
       SetLength(Mlp1[t1], FFN);
+      gBase := 0;                        // gidx * D, carried (#6)
       for gidx := 0 to FFNM1 do
       begin
         sc := 0;
-        for dd := 0 to DM1 do sc := sc + Layers[L].Fc1.Data[gidx * D + dd] * Hn[t1][dd];
+        for dd := 0 to DM1 do sc := sc + Layers[L].Fc1.Data[gBase + dd] * Hn[t1][dd];
         Mlp1[t1][gidx] := MimiGELU(sc);
+        Inc(gBase, D);
       end;
       // fc2 -> residual
+      dBase := 0;                        // dd * FFN, carried (#6)
       for dd := 0 to DM1 do
       begin
         sc := 0;
         for gidx := 0 to FFNM1 do
-          sc := sc + Layers[L].Fc2.Data[dd * FFN + gidx] * Mlp1[t1][gidx];
+          sc := sc + Layers[L].Fc2.Data[dBase + gidx] * Mlp1[t1][gidx];
         X[t1][dd] := X[t1][dd] + Layers[L].MlpScale[dd] * sc;
+        Inc(dBase, FFN);
       end;
     end;
   end;
@@ -43519,7 +43580,7 @@ var
   Patch, WD, WT: TMimiDblArr;
   InCK: integer;
   PaddedLenM1, WDMax: integer;
-  tS, iK, wOfs, oK, OCK: integer;
+  tS, iK, wOfs, oK, OCK, wpos, wpack, src: integer;
   PadRow, FullRow: TMimiDblArr;
 begin
   InCh := Conv.InCh;
@@ -43561,8 +43622,12 @@ begin
       begin
         iK := i * K;
         PadRow := Padded[i];
+        src := tS;                   // #6: k2*Dil carried
         for k2 := 0 to KM1 do
-          Patch[iK + k2] := PadRow[tS + k2 * Dil];
+        begin
+          Patch[iK + k2] := PadRow[src];
+          Inc(src, Dil);
+        end;
       end;
       wOfs := 0; // o*InCK carried
       for o := 0 to OutChM1 do
@@ -43587,19 +43652,42 @@ begin
     end;
     // For each (out-channel o, tap k2) the contraction over input channels i is
     // contiguous once the weight column W[i*Out*K + o*K + k2] is repacked in i.
-    SetLength(Patch, InCh);   // InSig column over channels at time t
-    SetLength(WD, InCh);
+    SetLength(Patch, InCh);    // InSig column over channels at time t
+    OCK := OutCh * K;
+    SetLength(WD, OCK * InCh); // weight columns pre-packed, [(o*K+k2)*InCh + i]
+    // Pre-pack once (all t-invariant): for each (o,k2) gather the i-contiguous
+    // column W[i*OCK + o*K + k2] (otherwise strided by OCK). Packed once per call
+    // instead of re-gathered per t.
+    wpack := 0;
+    for o := 0 to OutChM1 do
+    begin
+      oK := o * K;
+      for k2 := 0 to KM1 do
+      begin
+        wpos := oK + k2;       // i = 0
+        for i := 0 to InChM1 do
+        begin
+          WD[wpack] := Conv.W[wpos];
+          Inc(wpack);
+          Inc(wpos, OCK);
+        end;
+      end;
+    end;
     for t := 0 to InLenM1 do
     begin
+      tS := t * Stride;
       for i := 0 to InChM1 do Patch[i] := InSig[i][t];
+      wpack := 0;
       for o := 0 to OutChM1 do
+      begin
+        idx := tS;             // t*Stride + k2*Dil, k2 = 0
         for k2 := 0 to KM1 do
         begin
-          idx := t * Stride + k2 * Dil;
-          for i := 0 to InChM1 do
-            WD[i] := Conv.W[i * OutCh * K + o * K + k2];
-          Full[o][idx] := Full[o][idx] + MimiDotProductD(@WD[0], @Patch[0], InCh);
+          Full[o][idx] := Full[o][idx] + MimiDotProductD(@WD[wpack], @Patch[0], InCh);
+          Inc(idx, Dil);       // k2 advances by 1 => idx by Dil
+          Inc(wpack, InCh);    // next (o,k2) packed column
         end;
+      end;
     end;
     for o := 0 to OutChM1 do
       for t := 0 to FullLenM1 do Full[o][t] := Full[o][t] + Conv.B[o];
@@ -44565,13 +44653,14 @@ begin
       begin
         iK := i * K;
         InRow := InSig[i];
+        src := tSP;              // #6: k2*Dil carried (implicit zero pad)
         for k2 := 0 to KM1 do
         begin
-          src := tSP + k2 * Dil; // implicit zero pad
           if (src >= 0) and (src < InLen) then
             Patch[iK + k2] := InRow[src]
           else
             Patch[iK + k2] := 0;
+          Inc(src, Dil);
         end;
       end;
       wBase := 0;
@@ -45135,7 +45224,8 @@ begin
   for c := 0 to MaxC do
   begin
     SetLength(NewSig[c], RefLen);
-    for t := 0 to RefLenM1 do NewSig[c][t] := Sig[c][t + Left];
+    // #13: contiguous center-trim copy.
+    Move(Sig[c][Left], NewSig[c][0], RefLen * csNeuralFloatSize);
   end;
   Sig := NewSig;
 end;
@@ -45612,7 +45702,7 @@ begin
   S := 0;
   for i := 0 to nM1 do
   begin
-    V[i] := Exp(V[i] - M);
+    V[i] := NeuralExp(V[i] - M);   // #16: fast trap-free exp on the decode path
     S := S + V[i];
   end;
   for i := 0 to nM1 do V[i] := V[i] / S;
@@ -45965,7 +46055,7 @@ procedure TNNetVits.RunTextEncoder(const Ids: array of integer;
   out Hidden: TNNetFloatDynArr2D);
 var
   T, H, NH, HD, Win, L, i, j, hh, t1, t2, d, RelLen: integer;
-  TM1, HM1, NHM1, HDM1, TwoTM2, NumHiddenLayersM1, FlowSizeM1, FfMidM1: integer;
+  TM1, HM1, NHM1, HDM1, TwoTM2, NumHiddenLayersM1, FlowSizeM1, FfMidM1, hhHD: integer;
   Scale, SqrtH, Acc: TNeuralFloat;
   Q, K, Vv: TNNetFloatDynArr2D;        // [token][hidden] projections
   Qh, Kh, Vh: TNNetFloatDynArr2D;      // current head [token][head_dim]
@@ -46060,15 +46150,14 @@ begin
     begin
       // Slice this head.
       SetLength(Qh, T); SetLength(Kh, T); SetLength(Vh, T);
+      hhHD := hh * HD;                    // #11: head base, invariant across i/d
       for i := 0 to TM1 do
       begin
         SetLength(Qh[i], HD); SetLength(Kh[i], HD); SetLength(Vh[i], HD);
-        for d := 0 to HDM1 do
-        begin
-          Qh[i][d] := Q[i][hh * HD + d];
-          Kh[i][d] := K[i][hh * HD + d];
-          Vh[i][d] := Vv[i][hh * HD + d];
-        end;
+        // #13: contiguous head-slice copies.
+        Move(Q[i][hhHD],  Qh[i][0], HD * csNeuralFloatSize);
+        Move(K[i][hhHD],  Kh[i][0], HD * csNeuralFloatSize);
+        Move(Vv[i][hhHD], Vh[i][0], HD * csNeuralFloatSize);
       end;
       // Content scores Q*K^T.
       SetLength(Scores, T);
@@ -46076,11 +46165,8 @@ begin
       begin
         SetLength(Scores[t1], T);
         for t2 := 0 to TM1 do
-        begin
-          Acc := 0;
-          for d := 0 to HDM1 do Acc := Acc + Qh[t1][d] * Kh[t2][d];
-          Scores[t1][t2] := Acc;
-        end;
+          // #13: contiguous head dot via AVX DotProduct.
+          Scores[t1][t2] := TNNetVolume.DotProduct(Addr(Qh[t1][0]), Addr(Kh[t2][0]), HD);
       end;
       // Relative key bias: rel_logits[t1][r] = Q[t1] . RelEmb[r];
       // then relative_position_to_absolute_position -> [t1][t2].
@@ -46090,11 +46176,8 @@ begin
       begin
         SetLength(RelLogits[t1], 2 * T - 1);
         for j := 0 to TwoTM2 do
-        begin
-          Acc := 0;
-          for d := 0 to HDM1 do Acc := Acc + Qh[t1][d] * RelEmb[j][d];
-          RelLogits[t1][j] := Acc;
-        end;
+          // #13: contiguous Q . RelEmb dot via AVX DotProduct.
+          RelLogits[t1][j] := TNNetVolume.DotProduct(Addr(Qh[t1][0]), Addr(RelEmb[j][0]), HD);
       end;
       // _relative_position_to_absolute_position: pad each row by 1 on the
       // right -> width 2T; flatten T*2T; pad T-1 at end; reshape (T+1, 2T-1);
@@ -46158,9 +46241,9 @@ begin
           for j := 0 to TwoTM2 do Acc := Acc + RelAbs[t1][j] * RelEmb[j][d];
           HeadOut[t1][d] := HeadOut[t1][d] + Acc;
         end;
-      // Scatter head output back.
+      // Scatter head output back (#13: contiguous copy, hhHD hoisted #11).
       for i := 0 to TM1 do
-        for d := 0 to HDM1 do AttnOut[i][hh * HD + d] := HeadOut[i][d];
+        Move(HeadOut[i][0], AttnOut[i][hhHD], HD * csNeuralFloatSize);
     end;
 
     // out_proj.
@@ -46440,7 +46523,7 @@ var
   TlenM1, LatentMaxIdx, HalfM1, FiltM1, NumBinsM1, NumBinsM2: integer;
   FirstHalf, Hid, Proj: TNNetFloatDynArr2D;
   UW, UH, UD: TNeuralFloatDynArr;
-  InvSqrtFilt, V: TNeuralFloat;
+  InvSqrtFilt, V, ScaleC, TransC: TNeuralFloat;
 begin
   Tlen := Length(Latent[0]);
   TlenM1 := Tlen - 1;
@@ -46449,8 +46532,13 @@ begin
     // reverse: out = (in - translate) * exp(-log_scale).
     LatentMaxIdx := Length(Latent) - 1;
     for c := 0 to LatentMaxIdx do
+    begin
+      // exp(-log_scale) and translate depend only on c (#8/#11); NeuralExp (#16).
+      ScaleC := NeuralExp(-Flow.LogScale[c]);
+      TransC := Flow.Translate[c];
       for t := 0 to TlenM1 do
-        Latent[c][t] := (Latent[c][t] - Flow.Translate[c]) * Exp(-Flow.LogScale[c]);
+        Latent[c][t] := (Latent[c][t] - TransC) * ScaleC;
+    end;
     Exit;
   end;
   // VitsConvFlow reverse. half_channels = depth_separable_channels div 2.
@@ -47368,7 +47456,7 @@ procedure TNNetKokoro.RunDecoder(const Expanded: TNNetFloatDynArr2D;
   out Waveform: TNeuralFloatDynArr);
 var
   H, L, NBins, c, t, HM1, LM1, NBinsM1: integer;
-  WaveSizeM1: integer;
+  WaveSizeM1, tBase, idx: integer;
   DecIn, Mix, MagC, PhaseC: TNNetFloatDynArr2D;
   MagVol, PhaseVol, WaveVol: TNNetVolume;
 begin
@@ -47399,7 +47487,7 @@ begin
     SetLength(Phase[c], L);
     for t := 0 to LM1 do
     begin
-      Magnitude[c][t] := Exp(MagC[c][t]);
+      Magnitude[c][t] := NeuralExp(MagC[c][t]);   // #16: fast trap-free exp
       Phase[c][t] := Sin(PhaseC[c][t]);
     end;
   end;
@@ -47410,11 +47498,15 @@ begin
   WaveVol := TNNetVolume.Create;
   try
     for t := 0 to LM1 do
+    begin
+      tBase := t * NBins;                // #11: t*NBins is c-invariant
       for c := 0 to NBinsM1 do
       begin
-        MagVol.FData[t * NBins + c] := Magnitude[c][t];
-        PhaseVol.FData[t * NBins + c] := Phase[c][t];
+        idx := tBase + c;                // #4: formed once; shared shape (#3)
+        MagVol.FData[idx] := Magnitude[c][t];
+        PhaseVol.FData[idx] := Phase[c][t];
       end;
+    end;
     ISTFTOverlapAdd(MagVol, PhaseVol, WaveVol, FConfig.NFFT, FConfig.HopLength);
     SetLength(Waveform, WaveVol.Size);
     WaveSizeM1 := WaveVol.Size - 1;
