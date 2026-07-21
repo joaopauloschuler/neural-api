@@ -2480,37 +2480,26 @@ end;
 
 procedure RowSoftMax(Row: TNNetVolume);
 var
-  Cnt, SizeM1: integer;
+  SizeM1: integer;
   MaxV, Sum: TNeuralFloat;
 begin
   SizeM1 := Row.Size - 1;
   if SizeM1 < 0 then exit;
-  MaxV := Row.FData[0];
-  for Cnt := 1 to SizeM1 do
-    if Row.FData[Cnt] > MaxV then MaxV := Row.FData[Cnt];
-  Sum := 0;
-  for Cnt := 0 to SizeM1 do
-  begin
-    Row.FData[Cnt] := Exp(Row.FData[Cnt] - MaxV);
-    Sum := Sum + Row.FData[Cnt];
-  end;
+  MaxV := Row.GetMax();
+  Row.Sub(MaxV);
+  TNNetVolume.VectorExp(Row.DataPtr, Row.DataPtr, Row.Size);
+  Sum := Row.GetSum();
   if Sum > 0 then Row.Mul(1 / Sum);
 end;
 
 function RowCosineSimilarity(A, B: TNNetVolume): TNeuralFloat;
 var
-  Cnt, SizeM1: integer;
   Dot, NormA, NormB: TNeuralFloat;
 begin
   if A.Size <> B.Size then exit(0);
-  Dot := 0; NormA := 0; NormB := 0;
-  SizeM1 := A.Size - 1;
-  for Cnt := 0 to SizeM1 do
-  begin
-    Dot   := Dot   + A.FData[Cnt] * B.FData[Cnt];
-    NormA := NormA + A.FData[Cnt] * A.FData[Cnt];
-    NormB := NormB + B.FData[Cnt] * B.FData[Cnt];
-  end;
+  Dot := TNNetVolume.DotProduct(A.DataPtr, B.DataPtr, A.Size);
+  NormA := A.GetSumSqr();
+  NormB := B.GetSumSqr();
   if (NormA <= 0) or (NormB <= 0) then
     Result := 0
   else
@@ -2519,23 +2508,20 @@ end;
 
 procedure NormalizeRowsL2(Mat: TNNetVolume);
 var
-  Rows, Dim, R, C: integer;
-  RowsM1, DimM1: integer;
+  Rows, Dim, R: integer;
+  RowsM1: integer;
   Norm: TNeuralFloat;
+  RowPtr: TNeuralFloatArrPtr;
 begin
   Rows := Mat.SizeX;
   Dim := Mat.Depth;
   RowsM1 := Rows - 1;
-  DimM1 := Dim - 1;
   for R := 0 to RowsM1 do
   begin
-    Norm := 0;
-    for C := 0 to DimM1 do
-      Norm := Norm + Mat.FData[R * Dim + C] * Mat.FData[R * Dim + C];
-    Norm := Sqrt(Norm);
+    RowPtr := Mat.GetRawPtr(R * Dim);
+    Norm := Sqrt(TNNetVolume.DotProduct(RowPtr, RowPtr, Dim));
     if Norm > 0 then
-      for C := 0 to DimM1 do
-        Mat.FData[R * Dim + C] := Mat.FData[R * Dim + C] / Norm;
+      TNNetVolume.Mul(RowPtr, 1 / Norm, Dim);
   end;
 end;
 
@@ -2544,6 +2530,7 @@ function NeuralLinearSolve(var A: array of TNeuralFloat;
 var
   col, row, piv, k: integer;
   nM1, mM1, rowStart: integer;
+  colBaseN, colBaseM, pivBaseN, pivBaseM, rowBaseN, rowBaseM: integer;
   maxAbs, v, factor, diag, tmp: TNeuralFloat;
 begin
   Result := True;
@@ -2551,9 +2538,11 @@ begin
   mM1 := m - 1;
   for col := 0 to nM1 do
   begin
+    colBaseN := col * n;
+    colBaseM := col * m;
     // Partial pivot: pick the row (>= col) with the largest |A[row,col]|.
     piv := col;
-    maxAbs := Abs(A[col * n + col]);
+    maxAbs := Abs(A[colBaseN + col]);
     rowStart := col + 1;
     for row := rowStart to nM1 do
     begin
@@ -2565,31 +2554,33 @@ begin
     // Swap the pivot row into place (in both A and B).
     if piv <> col then
     begin
+      pivBaseN := piv * n;
+      pivBaseM := piv * m;
       for k := 0 to nM1 do
       begin
-        tmp := A[col * n + k]; A[col * n + k] := A[piv * n + k]; A[piv * n + k] := tmp;
+        tmp := A[colBaseN + k]; A[colBaseN + k] := A[pivBaseN + k]; A[pivBaseN + k] := tmp;
       end;
       for k := 0 to mM1 do
       begin
-        tmp := B[col * m + k]; B[col * m + k] := B[piv * m + k]; B[piv * m + k] := tmp;
+        tmp := B[colBaseM + k]; B[colBaseM + k] := B[pivBaseM + k]; B[pivBaseM + k] := tmp;
       end;
     end;
 
     // Normalise the pivot row so A[col,col] = 1.
-    diag := A[col * n + col];
-    for k := 0 to nM1 do A[col * n + k] := A[col * n + k] / diag;
-    for k := 0 to mM1 do B[col * m + k] := B[col * m + k] / diag;
+    diag := A[colBaseN + col];
+    TNNetVolume.Mul(@A[colBaseN], 1 / diag, n);
+    TNNetVolume.Mul(@B[colBaseM], 1 / diag, m);
 
     // Eliminate the pivot column from every other row.
     for row := 0 to nM1 do
     begin
       if row = col then Continue;
-      factor := A[row * n + col];
+      rowBaseN := row * n;
+      rowBaseM := row * m;
+      factor := A[rowBaseN + col];
       if factor = 0 then Continue;
-      for k := 0 to nM1 do
-        A[row * n + k] := A[row * n + k] - factor * A[col * n + k];
-      for k := 0 to mM1 do
-        B[row * m + k] := B[row * m + k] - factor * B[col * m + k];
+      TNNetVolume.MulAdd(@A[rowBaseN], @A[colBaseN], -factor, n);
+      TNNetVolume.MulAdd(@B[rowBaseM], @B[colBaseM], -factor, m);
     end;
   end;
 end;
@@ -5203,6 +5194,8 @@ var
   TotalSize: integer;
   I, MaxIdx: integer;
   CurrPos: integer;
+  Vol: TNNetVolume;
+  VolSize: integer;
 begin
   if (Count>0) then
   begin
@@ -5219,12 +5212,10 @@ begin
     MaxIdx := Count - 1;
     for I := 0 to MaxIdx do
     begin
-      system.Move(Self[I].FData[0], V.FData[CurrPos], Self[I].Size * csNeuralFloatSize);
-      {$IFDEF FPC}
-      CurrPos += Self[I].Size;
-      {$ELSE}
-      CurrPos := CurrPos + Self[I].Size;
-      {$ENDIF}
+      Vol := Self[I];
+      VolSize := Vol.Size;
+      system.Move(Vol.FData[0], V.FData[CurrPos], VolSize * csNeuralFloatSize);
+      Inc(CurrPos, VolSize);
     end;
   end;
 end;
@@ -5234,6 +5225,7 @@ var
   CountVolume, CountElement: integer;
   MaxVolume, MaxElement: integer;
   CurrPos: integer;
+  Vols: array of TNNetVolume;
 begin
   if (Count>0) then
   begin
@@ -5241,11 +5233,15 @@ begin
     MaxElement := Self[0].Size - 1;
     CurrPos := 0;
 
+    SetLength(Vols, Count);
+    for CountVolume := 0 to MaxVolume do
+      Vols[CountVolume] := Self[CountVolume];
+
     for CountElement := 0 to MaxElement do
     begin
       for CountVolume := 0 to MaxVolume do
       begin
-        V.FData[CurrPos] := Self[CountVolume].FData[CountElement];
+        V.FData[CurrPos] := Vols[CountVolume].FData[CountElement];
         CurrPos := CurrPos + 1;
       end;
     end;
@@ -5257,6 +5253,8 @@ var
   TotalSize: integer;
   I, MaxIdx: integer;
   CurrPos: integer;
+  Vol: TNNetVolume;
+  VolSize: integer;
 begin
   if (Count>0) then
   begin
@@ -5271,12 +5269,10 @@ begin
     MaxIdx := Count - 1;
     for I := 0 to MaxIdx do
     begin
-      system.Move(V.FData[CurrPos], Self[I].FData[0], Self[I].Size * csNeuralFloatSize);
-      {$IFDEF FPC}
-      CurrPos += Self[I].Size;
-      {$ELSE}
-      CurrPos := CurrPos + Self[I].Size;
-      {$ENDIF}
+      Vol := Self[I];
+      VolSize := Vol.Size;
+      system.Move(V.FData[CurrPos], Vol.FData[0], VolSize * csNeuralFloatSize);
+      Inc(CurrPos, VolSize);
     end;
   end;
 end;
@@ -7377,15 +7373,19 @@ function TVolume.SumAtDepth(pDepth: integer): T;
 var
   CntX, CntY: integer;
   MaxX, MaxY: integer;
+  RawPos, RowStride: integer;
 begin
   MaxX := SizeX - 1;
   MaxY := SizeY - 1;
+  RowStride := FSizeX * FDepth; // per-CntY step
   Result := 0;
   for CntX := 0 to MaxX do
   begin
+    RawPos := Self.GetRawPos(CntX, 0, pDepth);
     for CntY := 0 to MaxY do
     begin
-      Result := Result + Get(CntX,CntY,pDepth);
+      Result := Result + FData[RawPos];
+      Inc(RawPos, RowStride);
     end;
   end;
 end;
@@ -7769,16 +7769,19 @@ end;
 function TVolume.CrossEntropyOnPixel(Target: TVolume; X, Y: integer): T;
 var
   d, MaxD: integer;
+  BaseT, BaseS: integer;
   P, Tgt: T;
 begin
   Result := 0;
   MaxD := FDepth - 1;
+  BaseT := Target.GetRawPos(X, Y);
+  BaseS := GetRawPos(X, Y);
   for d := 0 to MaxD do
   begin
-    Tgt := Target[X, Y, d];
+    Tgt := Target.FData[BaseT + d];
     if Tgt > 0 then
     begin
-      P := Self[X, Y, d];
+      P := FData[BaseS + d];
       if P < 1e-12 then P := 1e-12;
       Result := Result - Tgt * Ln(P);
     end;
@@ -8218,7 +8221,7 @@ begin
     begin
       // FData has already been shifted by Sub(MaxValue) above, so do not
       // subtract MaxValue again here (that would underflow Exp to zero).
-      LocalValue := Exp( NeuronForceRange(FData[I], 4000) );
+      LocalValue := NeuralExp( NeuronForceRange(FData[I], 4000) );
       // LocalValue := pcr_expf( FData[I] );
       FData[I] := LocalValue;
       TotalSum := TotalSum + FData[I];
@@ -8297,14 +8300,7 @@ begin
           StartPointPos := GetRawPos(CountX, CountY);
           TotalSum := AVXGetSum(TNeuralFloatArrPtr(@FData[StartPointPos]), MaxD + 1);
           if TotalSum > 0 then
-          begin
-            I := StartPointPos;
-            for CountD := 0 to MaxD do
-            begin
-              FData[I] := FData[I] / TotalSum;
-              Inc(I);
-            end;
-          end;
+            TNNetVolume.Mul(Addr(FData[StartPointPos]), 1.0 / TotalSum, MaxD + 1);
         end;
       end;
       Exit;
@@ -8353,21 +8349,14 @@ begin
         for CountD := 0 to MaxD do
         begin
           // LocalValue := pcr_expf( NeuronForceRange(FData[I] - MaxValue, 4000) );
-          LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
+          LocalValue := NeuralExp( NeuronForceRange(FData[I] - MaxValue, 4000) );
           FData[I] := LocalValue;
           TotalSum := TotalSum + LocalValue;
           Inc(I);
         end;
         {$ENDIF}
         if TotalSum > 0 then
-        begin
-          I := StartPointPos;
-          for CountD := 0 to MaxD do
-          begin
-            FData[I] := FData[I] / TotalSum;
-            Inc(I);
-          end;
-        end;
+          TNNetVolume.Mul(Addr(FData[StartPointPos]), 1.0 / TotalSum, MaxD + 1);
       end;
     end;
   end;
@@ -8692,7 +8681,7 @@ end;
 
 procedure TVolume.OneHotEncodingOnPixel(X, Y, Token: integer);
 var
-  d, MaxD: integer;
+  Base: integer;
 begin
   if (Token < 0) or (Token >= FDepth) then
   begin
@@ -8700,10 +8689,9 @@ begin
       ') at OneHotEncodingOnPixel.');
     Exit;
   end;
-  MaxD := FDepth - 1;
-  for d := 0 to MaxD do
-    Self[X, Y, d] := 0;
-  Self[X, Y, Token] := 1;
+  Base := GetRawPos(X, Y);
+  FillChar(FData[Base], FDepth * csNeuralFloatSize, 0);
+  FData[Base + Token] := 1;
 end;
 
 procedure TVolume.OneHotEncoding(aTokens: array of integer);
@@ -9300,7 +9288,7 @@ end;
 
 procedure TVolume.ShiftRight(Positions: integer = 1);
 var
-  I, VMax, VMin, VMinM1: longint;
+  VMax, VMin: longint;
 begin
   if ( (FSize > 0) and (Positions > 0) ) then
   begin
@@ -9310,26 +9298,21 @@ begin
       VMin := Low(FData) + Positions;
       if ( (VMin <= VMax) and (VMin > 0) ) then
       begin
-        for I := VMax downto VMin do FData[I] := FData[I - Positions];
-        VMinM1 := VMin - 1;
-        for I := 0 to VMinM1 do FData[I] := 0;
+        // memmove semantics handle the overlapping copy toward higher indices.
+        Move(FData[0], FData[Positions], (FSize - Positions) * csNeuralFloatSize);
+        FillChar(FData[0], Positions * csNeuralFloatSize, 0);
       end;
     end;
   end;
 end;
 
 procedure TVolume.ShiftLeft();
-var
-  I, VMax, VMin: longint;
 begin
   if FSize > 0 then
   begin
     if FSize > 1 then
-    begin
-      VMax := High(FData);
-      VMin := Low(FData) + 1;
-      for I := VMin to VMax do FData[I - 1] := FData[I];
-    end;
+      // memmove semantics handle the overlapping copy toward lower indices.
+      Move(FData[1], FData[0], (FSize - 1) * csNeuralFloatSize);
     FData[High(FData)] := 0;
   end;
 end;
@@ -9716,16 +9699,17 @@ end;
 procedure TNNetVolume.GetTokenArrayOnPixel(var TokenArray: TNNetTokenArray; X,
   Y: integer);
 var
-  I, vHigh: integer;
+  I, vHigh, Base: integer;
 begin
   if (Length(TokenArray) <> FDepth) then SetLength(TokenArray, FDepth);
   if FDepth > 0 then
   begin
     vHigh := FDepth - 1;
+    Base := GetRawPos(X, Y);
     for I := 0 to vHigh do
     begin
       TokenArray[I].Token := I;
-      TokenArray[I].Score := Self[X, Y, I];
+      TokenArray[I].Score := FData[Base + I];
     end;
   end;
 end;
@@ -11195,20 +11179,28 @@ procedure TNNetVolume.RecurrencePlot(Original: TNNetVolume; Threshold: TNeuralFl
 var
   MaxX, CntX, CntY: integer;
   LocalDiff: TNeuralFloat;
+  Dst1Pos, Dst2Pos: integer;
+  StrideXSelf, StrideYSelf: integer;
 begin
   if Original.Size > 0 then
   begin
     Resize(Original.Size, Original.Size, 1);
     MaxX := SizeX - 1;
+    StrideXSelf := FDepth;          // Self X-slot step per CntY (Depth=1)
+    StrideYSelf := FSizeX * FDepth; // Self Y-slot step per CntY
     for CntX := 0 to MaxX do
     begin
+      Dst1Pos := GetRawPos(CntX, 0, 0); // Self[CntX, CntY, 0]
+      Dst2Pos := GetRawPos(0, CntX, 0); // Self[CntY, CntX, 0]
       for CntY := 0 to CntX do
       begin
         if Abs(Original.FData[CntX] - Original.FData[CntY]) <= Threshold
         then LocalDiff := 1
         else LocalDiff := 0;
-        Self[CntX, CntY, 0] := LocalDiff;
-        Self[CntY, CntX, 0] := LocalDiff;
+        FData[Dst1Pos] := LocalDiff;
+        FData[Dst2Pos] := LocalDiff;
+        Inc(Dst1Pos, StrideYSelf);
+        Inc(Dst2Pos, StrideXSelf);
       end;
     end;
   end;
