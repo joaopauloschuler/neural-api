@@ -316,6 +316,8 @@ end;
 **Do this instead — compute each repeated value once:**
 
 ```pascal
+FDkIntSize := FDk * csShortIntSize;
+FDkFloatSize := FDk * csNeuralFloatSize;
 for j := FEvictSinks to CacheLenM2 do
 begin
   jP1 := j + 1;
@@ -323,15 +325,15 @@ begin
   begin
     jDk   := j   * FDk;
     jP1Dk := jP1 * FDk;
-    Move(FKCacheCodes[jP1Dk], FKCacheCodes[jDk], FDk * csShortIntSize);
-    Move(FVCacheCodes[jP1Dk], FVCacheCodes[jDk], FDk * csShortIntSize);
+    Move(FKCacheCodes[jP1Dk], FKCacheCodes[jDk], FDkIntSize);
+    Move(FVCacheCodes[jP1Dk], FVCacheCodes[jDk], FDkIntSize);
     FKCacheScale[j] := FKCacheScale[jP1];
     FVCacheScale[j] := FVCacheScale[jP1];
   end
   else
   begin
-    Move(FKCache.GetRawPtr(jP1, 0, 0)^, FKCache.GetRawPtr(j, 0, 0)^, FDk * csNeuralFloatSize);
-    Move(FVCache.GetRawPtr(jP1, 0, 0)^, FVCache.GetRawPtr(j, 0, 0)^, FDk * csNeuralFloatSize);
+    Move(FKCache.GetRawPtr(jP1, 0)^, FKCache.GetRawPtr(j, 0)^, FDkFloatSize);
+    Move(FVCache.GetRawPtr(jP1, 0)^, FVCache.GetRawPtr(j, 0)^, FDkFloatSize);
   end;
 end;
 ```
@@ -422,7 +424,7 @@ RowBytesI8 := FDk * csShortIntSize;
 for p := 0 to SeqLenM1 do
 begin
   ...
-  Move(FKCache.GetRawPtr(j + 1, 0, 0)^, FKCache.GetRawPtr(j, 0, 0)^, RowBytesFP);
+  Move(FKCache.GetRawPtr(j + 1, 0)^, FKCache.GetRawPtr(j, 0)^, RowBytesFP);
   ...
 end;
 ```
@@ -469,7 +471,7 @@ kScale := Coeff * E * InvT;                        // #5: once for the whole cal
 for X := 0 to MaxX do
   for Y := 0 to MaxY do
   begin
-    baseErr0 := FOutputError.GetRawPos(X, Y, 0);
+    baseErr0 := FOutputError.GetRawPos(X, Y);
     for D := 0 to EM1 do
       FOutputError.FData[baseErr0 + D] := kScale * FFBuf[D];
   end;
@@ -582,7 +584,7 @@ Neuron0 := FNeurons[0];              // one list accessor call, up front
 for t := 0 to SeqLenM1 do
 begin
   Logit := TNNetVolume.DotProduct(
-    Neuron0.FWeights.GetRawPtr(0, 0, 0), Prev.GetRawPtr(t, 0, 0),
+    Neuron0.FWeights.GetRawPtr(0, 0), Prev.GetRawPtr(t, 0),
     FFeatures) + Neuron0.FBiasWeight;
   ...
 end;
@@ -595,7 +597,7 @@ end;
 for t := 0 to SeqLenM1 do
 begin
   Logit := TNNetVolume.DotProduct(
-    FNeurons[0].FWeights.GetRawPtr(0, 0, 0), Prev.GetRawPtr(t, 0, 0),
+    FNeurons[0].FWeights.GetRawPtr(0, 0), Prev.GetRawPtr(t, 0),
     FFeatures) + FNeurons[0].FBiasWeight;
   ...
 end;
@@ -635,11 +637,11 @@ loop-invariant and belong *above* the loop:
 
 ```pascal
 Neuron0     := FNeurons[0];                        // #7: list element, once
-WeightsPtr  := Neuron0.FWeights.GetRawPtr(0, 0, 0); // #8: invariant pointer, once
+WeightsPtr  := Neuron0.FWeights.GetRawPtr(0, 0); // #8: invariant pointer, once
 Bias        := Neuron0.FBiasWeight;                 // #8: invariant field, once
 for t := 0 to SeqLenM1 do
 begin
-  Logit := TNNetVolume.DotProduct(WeightsPtr, Prev.GetRawPtr(t, 0, 0), FFeatures)
+  Logit := TNNetVolume.DotProduct(WeightsPtr, Prev.GetRawPtr(t, 0), FFeatures)
            + Bias;
   FVal  := Sigmoid(Logit);
   FF.FData[t] := FVal;
@@ -648,7 +650,7 @@ begin
 end;
 ```
 
-`Prev.GetRawPtr(t, 0, 0)` **stays inside** the loop — it depends on the induction
+`Prev.GetRawPtr(t, 0)` **stays inside** the loop — it depends on the induction
 variable `t`, so it is not invariant. Only the two arguments that do not depend
 on `t` are hoisted.
 
@@ -914,8 +916,8 @@ the output volume too:**
 for X := 0 to MaxX do
   for Y := 0 to MaxY do
   begin
-    basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y, 0);   // = ((FSizeX*Y)+X)*FInDepth, once per (X,Y)
-    baseOut0  := FOutput.GetRawPos(X, Y, 0);              // FOutput's own base (different shape)
+    basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);      // = ((FSizeX*Y)+X)*FInDepth, once per (X,Y)
+    baseOut0  := FOutput.GetRawPos(X, Y);                 // FOutput's own base (different shape)
     for D := 0 to MaxD do
     begin
       basePrev := basePrev0 + D;                          // just an add
@@ -1001,7 +1003,7 @@ end;
 **Do this — carry one offset, advance by the row stride:**
 
 ```pascal
-RowStride := Prev.GetRawPos(1, 0, 0);   // = FDepth; elements between consecutive j
+RowStride := Prev.GetRawPos(1, 0);       // = FDepth; elements between consecutive j
 posV      := VOfs;                       // = GetRawPos(0, 0, VOfs); the j = 0 offset
 for j := 0 to SeqLenM1 do
 begin
@@ -1116,7 +1118,7 @@ A mixed body splits: in the VAE-reparam backward, the `dmu` branch
 `dlogvar` branch (per-element `sigma`, `e`) stays scalar. Promote the promotable
 half; do not force the rest.
 
-### Related micro-notes (came up in the same review)
+### Equal dimensions ⇒ equal base — compute it once
 
 - **Equal dimensions ⇒ equal base — compute it once (flip side of #11).** If two
   volumes have identical `FSizeX`/`FSizeY`/`FDepth`, then `GetRawPos(X, Y, 0)` is
@@ -1151,31 +1153,10 @@ half; do not force the rest.
   bPtr := aPtr + HalfDepth;
   // if pointer math is not in scope, keep the index form: FData[base + HalfDepth]
   ```
-- **`GetRawPos(x, y)` / `GetRawPtr(x, y)` already exist — prefer them over the
-  `, 0` form; it is never more expensive and sometimes cheaper.** The two-argument
-  overloads (`neuralvolume.pas`) return `((FSizeX*y)+x)*FDepth`, i.e. the
-  three-argument call with `d = 0`. **The cost is not unconditionally identical** —
-  that depends on inlining. These accessors are declared `{$IFDEF Release} inline`:
-    - **Inlined (Release build):** the compiler folds the `+ 0` away, so
-      `GetRawPtr(n, 0, 0)` and `GetRawPtr(n, 0)` emit the same code — identical cost.
-    - **Not inlined (debug, or any build where `Release` is undefined):** each is a
-      real function *call*. The three-argument form pushes an extra argument and
-      executes the extra `+ d`, so `GetRawPtr(n, 0, 0)` is strictly *more* work than
-      `GetRawPtr(n, 0)`. It is **wrong** to call them equal-cost in general.
 
-  So the two-argument form is **never worse and sometimes better** — a real (if
-  small) win in non-inlined builds, free in inlined ones. Use it whenever `d = 0`.
-
-  ```pascal
-  base := V.GetRawPos(X, Y, 0);   // extra +0 (and an extra arg when not inlined)
-  base := V.GetRawPos(X, Y);      // same result; cheaper when not inlined, equal when inlined
-  ```
-
-  This is not a "don't do this" in the correctness sense, but — unlike the earlier
-  claim in older revisions of this note — it is a genuine micro-improvement, not
-  purely cosmetic. Prefer the short form in new and edited code; a standalone
-  churn-only flip of every existing site is still low priority (it only helps
-  non-inlined builds), but fold the switch in whenever you already touch the line.
+### Use `GetRawPos(x, y)` instead of `GetRawPos(x, y, 0)` 
+- Use `GetRawPos(x, y)` / `GetRawPtr(x, y)` instead of `GetRawPos(x, y, 0)` / `GetRawPtr(x, y, 0)`
+as `GetRawPos(x, y)` / `GetRawPtr(x, y)` overloads are faster.
 
 ## 14. Rank on the cheapest order-equivalent quantity — skip transforms used only to compare
 
