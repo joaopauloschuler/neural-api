@@ -37585,9 +37585,8 @@ begin
     begin
       rBase := Result.GetRawPos(0, i, 0);
       lBase := Leaf.AttentionWeights.GetRawPos(0, i, 0);
-      for j := 0 to EncFramesM1 do
-        Result.FData[rBase + j] :=
-          Result.FData[rBase + j] + Leaf.AttentionWeights.FData[lBase + j];
+      TNNetVolume.Add(Result.GetRawPtr(rBase),
+        Leaf.AttentionWeights.GetRawPtr(lBase), EncFrames);
     end;
     Inc(AvgN);
   end;
@@ -37607,9 +37606,9 @@ begin
     for i := 0 to TextLenM1 do
     begin
       rBase := Result.GetRawPos(0, i, 0);
-      for j := 0 to EncFramesM1 do FiltRow[j] := Result.FData[rBase + j];
+      Move(Result.FData[rBase], FiltRow[0], EncFrames * csNeuralFloatSize);
       WhisperMedianFilterRow(FiltRow, EncFrames, MedianKernel);
-      for j := 0 to EncFramesM1 do Result.FData[rBase + j] := FiltRow[j];
+      Move(FiltRow[0], Result.FData[rBase], EncFrames * csNeuralFloatSize);
     end;
   end;
 
