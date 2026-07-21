@@ -138,6 +138,12 @@ type
     FUniHistX0: array[0..1] of TNNetVolume;
     FUniHistT: array[0..1] of integer;
     FUniHistLen: integer;
+    // Persistent, lazily-sized eps/x0 scratch buffers (rule #17). Amortized
+    // resize replaces the per-step TNNetVolume.Create/Free in Step/PredictX0/
+    // LCMStep. FEpsScratch is shared by Step and PredictX0 (never nested);
+    // FX0HatScratch backs LCMStep's x0_hat.
+    FEpsScratch: TNNetVolume;
+    FX0HatScratch: TNNetVolume;
     procedure BuildTables(Beta1, BetaT, CosineS: TNeuralFloat);
     function GetBeta(Tt: integer): TNeuralFloat;
     function GetAlpha(Tt: integer): TNeuralFloat;
@@ -300,6 +306,8 @@ begin
   FUniPrevSample := nil;
   FUniHistX0[0] := nil;
   FUniHistX0[1] := nil;
+  FEpsScratch := nil;
+  FX0HatScratch := nil;
   FHasPrev := false;
   FUniThisOrder := 1;
   FUniLowerOrderNums := 0;
@@ -312,6 +320,8 @@ begin
   if Assigned(FUniPrevSample) then FUniPrevSample.Free;
   if Assigned(FUniHistX0[0]) then FUniHistX0[0].Free;
   if Assigned(FUniHistX0[1]) then FUniHistX0[1].Free;
+  if Assigned(FEpsScratch) then FEpsScratch.Free;
+  if Assigned(FX0HatScratch) then FX0HatScratch.Free;
   inherited Destroy;
 end;
 
@@ -495,8 +505,6 @@ end;
 
 procedure TNNetDiffusionScheduler.ToEps(Xt, RawPred, EpsOut: TNNetVolume; Tt: integer);
 var
-  i: integer;
-  EpsOutSizeM1: integer;
   sab, somab: TNeuralFloat;
 begin
   if FPrediction = dpEps then
@@ -505,34 +513,34 @@ begin
     Exit;
   end;
   // v-prediction: eps = sqrt(ab)*v + sqrt(1-ab)*x_t.
+  // Bulk form (rule #13). EpsOut never aliases RawPred or Xt at the (internal)
+  // call sites, so capturing RawPred into EpsOut first is safe.
   sab := FSqrtAlphaBar[Tt];
   somab := FSqrtOneMinusAlphaBar[Tt];
-  EpsOutSizeM1 := EpsOut.Size - 1;
-  for i := 0 to EpsOutSizeM1 do
-    EpsOut.FData[i] := sab * RawPred.FData[i] + somab * Xt.FData[i];
+  EpsOut.Copy(RawPred);
+  EpsOut.Mul(sab);
+  EpsOut.MulAdd(somab, Xt);
 end;
 
 procedure TNNetDiffusionScheduler.PredictX0(Xt, RawPred, X0Out: TNNetVolume;
   Tt: integer);
 var
-  i: integer;
-  X0OutSizeM1: integer;
   somab, invSqrtAb: TNeuralFloat;
   Eps: TNNetVolume;
 begin
-  // Reuse the shared eps plumbing, then map eps -> x0. Use a scratch buffer so
-  // X0Out may safely alias RawPred.
-  Eps := TNNetVolume.Create(Xt);
-  try
-    ToEps(Xt, RawPred, Eps, Tt);
-    somab := FSqrtOneMinusAlphaBar[Tt];
-    invSqrtAb := 1.0 / FSqrtAlphaBar[Tt];
-    X0OutSizeM1 := X0Out.Size - 1;
-    for i := 0 to X0OutSizeM1 do
-      X0Out.FData[i] := (Xt.FData[i] - somab * Eps.FData[i]) * invSqrtAb;
-  finally
-    Eps.Free;
-  end;
+  // Reuse the shared eps plumbing, then map eps -> x0. Use a persistent scratch
+  // buffer (rule #17) so X0Out may safely alias RawPred.
+  if not Assigned(FEpsScratch) then FEpsScratch := TNNetVolume.Create(Xt)
+  else FEpsScratch.ReSize(Xt);
+  Eps := FEpsScratch;
+  ToEps(Xt, RawPred, Eps, Tt);
+  somab := FSqrtOneMinusAlphaBar[Tt];
+  invSqrtAb := 1.0 / FSqrtAlphaBar[Tt];
+  // x0 = (Xt - somab*Eps)*invSqrtAb (rule #13). Eps is a distinct scratch and
+  // X0Out never aliases Xt at any call site, so the copy-first form is safe.
+  X0Out.Copy(Xt);
+  X0Out.MulAdd(-somab, Eps);
+  X0Out.Mul(invSqrtAb);
 end;
 
 procedure TNNetDiffusionScheduler.AddNoise(X0, Xt: TNNetVolume; Tt: integer;
@@ -541,15 +549,19 @@ var
   i: integer;
   X0SizeM1: integer;
   sab, somab, eps: TNeuralFloat;
+  hasPre, hasNoiseOut: boolean;
 begin
   sab := FSqrtAlphaBar[Tt];
   somab := FSqrtOneMinusAlphaBar[Tt];
   X0SizeM1 := X0.Size - 1;
+  // Hoist the per-element Assigned() tests (rule #5 / no-nil-tests-in-hot-loops).
+  hasPre := Assigned(PreSampledNoise);
+  hasNoiseOut := Assigned(NoiseOut);
   for i := 0 to X0SizeM1 do
   begin
-    if Assigned(PreSampledNoise) then eps := PreSampledNoise.FData[i]
+    if hasPre then eps := PreSampledNoise.FData[i]
     else eps := RandG(0, 1);
-    if Assigned(NoiseOut) then NoiseOut.FData[i] := eps;
+    if hasNoiseOut then NoiseOut.FData[i] := eps;
     Xt.FData[i] := sab * X0.FData[i] + somab * eps;
   end;
 end;
@@ -558,16 +570,27 @@ class procedure TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond,
   Dst: TNNetVolume; W: TNeuralFloat);
 var i, DstSizeM1: integer;
 begin
-  DstSizeM1 := Dst.Size - 1;
-  for i := 0 to DstSizeM1 do
-    Dst.FData[i] := EpsUncond.FData[i] +
-      W * (EpsCond.FData[i] - EpsUncond.FData[i]);
+  // Dst := (1-W)*EpsUncond + W*EpsCond (rule #13). The copy-first bulk form is
+  // safe when Dst aliases EpsUncond, but WRONG when Dst aliases EpsCond (Copy
+  // would clobber EpsCond before it is read); fall back to the scalar loop then.
+  if Dst = EpsCond then
+  begin
+    DstSizeM1 := Dst.Size - 1;
+    for i := 0 to DstSizeM1 do
+      Dst.FData[i] := EpsUncond.FData[i] +
+        W * (EpsCond.FData[i] - EpsUncond.FData[i]);
+  end
+  else
+  begin
+    Dst.Copy(EpsUncond);
+    Dst.Mul(1.0 - W);
+    Dst.MulAdd(W, EpsCond);
+  end;
 end;
 
 class procedure TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond,
   Dst: TNNetVolume; W, GuidanceRescale: TNeuralFloat);
 var
-  i, DstSizeM1: integer;
   stdCond, stdCfg, factor: TNeuralFloat;
 begin
   // Plain CFG mix first (also fills Dst when GuidanceRescale = 0).
@@ -580,10 +603,8 @@ begin
   stdCfg  := Dst.GetStdDeviation();
   if stdCfg = 0 then exit;
   factor := stdCond / stdCfg;
-  DstSizeM1 := Dst.Size - 1;
-  for i := 0 to DstSizeM1 do
-    Dst.FData[i] := GuidanceRescale * (Dst.FData[i] * factor) +
-      (1 - GuidanceRescale) * Dst.FData[i];
+  // Whole expression is Dst[i]*K with invariant K (rule #5/#13) -> one bulk scale.
+  Dst.Mul(GuidanceRescale * factor + (1 - GuidanceRescale));
 end;
 
 procedure TNNetDiffusionScheduler.ResetMultistep;
@@ -609,22 +630,30 @@ var
   alphaT, sigmaTuni, sigmaS0, hh, hphi1, Bh, rk, rhoC0, rhoC1: TNeuralFloat;
   detR, sigRatio, m0v, mtv, D1: TNeuralFloat;
   cOrder, pOrder: integer;
+  // Loop-invariant hoists (rule #5): per-step coefficients pulled out of the
+  // per-element loops below.
+  needNoise: boolean;
+  invSqrtAbT, somabT, cA, cB, kX, kD, kM0, kBh, invRk: TNeuralFloat;
 begin
-  Eps := TNNetVolume.Create(Xt);
-  try
-    // All updates work from eps; v-prediction is converted up front.
-    ToEps(Xt, RawPred, Eps, Tt);
-    XtSizeM1 := Xt.Size - 1;
-    case Method of
+  // Persistent lazily-sized eps scratch (rule #17). Step and PredictX0 never
+  // run nested, so they safely share FEpsScratch.
+  if not Assigned(FEpsScratch) then FEpsScratch := TNNetVolume.Create(Xt)
+  else FEpsScratch.ReSize(Xt);
+  Eps := FEpsScratch;
+  // All updates work from eps; v-prediction is converted up front.
+  ToEps(Xt, RawPred, Eps, Tt);
+  XtSizeM1 := Xt.Size - 1;
+  case Method of
       smDDPM:
         begin
           // x_{Tt-1} = 1/sqrt(a_t)*(x_t - beta_t/sqrt(1-ab_t)*eps) + sigma*z.
           invSqrtAlpha := 1.0 / Sqrt(FAlpha[Tt]);
           coef := FBeta[Tt] / FSqrtOneMinusAlphaBar[Tt];
-          if Tt > 1 then sigma := Sqrt(FBeta[Tt]) else sigma := 0;
+          needNoise := Tt > 1;
+          if needNoise then sigma := Sqrt(FBeta[Tt]) else sigma := 0;
           for i := 0 to XtSizeM1 do
           begin
-            if Tt > 1 then z := RandG(0, 1) else z := 0;
+            if needNoise then z := RandG(0, 1) else z := 0;
             Xt.FData[i] := invSqrtAlpha *
               (Xt.FData[i] - coef * Eps.FData[i]) + sigma * z;
           end;
@@ -643,12 +672,14 @@ begin
           else
             sigma := 0;
           dirCoef := Sqrt(Max(0.0, 1.0 - abPrev - sigma * sigma));
+          somabT := FSqrtOneMinusAlphaBar[Tt];
+          invSqrtAbT := 1.0 / Sqrt(abT);
           for i := 0 to XtSizeM1 do
           begin
             if sigma > 0 then z := RandG(0, 1) else z := 0;
             // x_{TtPrev} = sqrt(ab_prev)*x0 + dirCoef*eps + sigma*z,
             //   x0 = (x_t - somab_t*eps)/sqrt(ab_t).
-            x0 := (Xt.FData[i] - FSqrtOneMinusAlphaBar[Tt] * Eps.FData[i]) / Sqrt(abT);
+            x0 := (Xt.FData[i] - somabT * Eps.FData[i]) * invSqrtAbT;
             Xt.FData[i] := sqrtAbPrev * x0 + dirCoef * Eps.FData[i] + sigma * z;
           end;
         end;
@@ -667,12 +698,14 @@ begin
           // Finally re-noise to VP scale at TtPrev: multiply by sqrt(ab_prev)
           // and add the ancestral term sqrt(ab_prev)*sigma_up*z.
           abT := FAlphaBar[Tt];
+          somabT := FSqrtOneMinusAlphaBar[Tt];
+          invSqrtAbT := 1.0 / Sqrt(abT);
           if TtPrev = 0 then
           begin
             // Final hop: emit the denoised x0 directly.
             for i := 0 to XtSizeM1 do
               Xt.FData[i] :=
-                (Xt.FData[i] - FSqrtOneMinusAlphaBar[Tt] * Eps.FData[i]) / Sqrt(abT);
+                (Xt.FData[i] - somabT * Eps.FData[i]) * invSqrtAbT;
             Exit;
           end;
           abPrev := FAlphaBar[TtPrev];
@@ -691,9 +724,9 @@ begin
             for i := 0 to XtSizeM1 do
             begin
               if sigma > 0 then z := RandG(0, 1) else z := 0;
-              x0 := (Xt.FData[i] - FSqrtOneMinusAlphaBar[Tt] * Eps.FData[i]) / Sqrt(abT);
+              x0 := (Xt.FData[i] - somabT * Eps.FData[i]) * invSqrtAbT;
               // VE sample at sigma=s1 is x_t/sqrt(ab_t); Euler drift to sigma_down.
-              curX0 := x0 + r0 * (Xt.FData[i] / Sqrt(abT) - x0);
+              curX0 := x0 + r0 * (Xt.FData[i] * invSqrtAbT - x0);
               // Re-noise back to VP scale at TtPrev, add ancestral noise.
               Xt.FData[i] := sqrtAbPrev * (curX0 + sigma * z);
             end;
@@ -711,9 +744,11 @@ begin
           // is available): D = (1+1/(2r))*x0_cur - (1/(2r))*x0_prev,
           //   r = h_last / h, h_last = lambda_t - lambda_{Tt of previous step}.
           abT := FAlphaBar[Tt];
+          somabT := FSqrtOneMinusAlphaBar[Tt];
+          invSqrtAbT := 1.0 / Sqrt(abT);
           // Convert current eps -> x0 prediction; reuse Eps to hold curX0.
           for i := 0 to XtSizeM1 do
-            Eps.FData[i] := (Xt.FData[i] - FSqrtOneMinusAlphaBar[Tt] * Eps.FData[i]) / Sqrt(abT);
+            Eps.FData[i] := (Xt.FData[i] - somabT * Eps.FData[i]) * invSqrtAbT;
           lamT := Lambda(Tt);
           if TtPrev = 0 then
           begin
@@ -723,9 +758,10 @@ begin
               hLast := lamT - FPrevLambda;          // < 0
               h := -hLast;                          // approximate remaining step
               if Abs(h) < 1e-12 then r0 := 1.0 else r0 := hLast / h;
+              cA := 1.0 + 0.5 / r0;
+              cB := 0.5 / r0;
               for i := 0 to XtSizeM1 do
-                Xt.FData[i] := (1.0 + 1.0 / (2.0 * r0)) * Eps.FData[i]
-                  - (1.0 / (2.0 * r0)) * FPrevX0.FData[i];
+                Xt.FData[i] := cA * Eps.FData[i] - cB * FPrevX0.FData[i];
             end
             else
               Xt.Copy(Eps);
@@ -736,24 +772,27 @@ begin
           lamPrev := Lambda(TtPrev);
           sqrtAbPrev := Sqrt(abPrev);
           h := lamPrev - lamT;                      // > 0
+          // Step-invariant update coefficients (rule #5): kX scales x_t, kD
+          // scales the data-prediction term.
+          kX := sqrtAbPrev * invSqrtAbT;
+          kD := Sqrt(1.0 - abPrev) * (Exp(-h) - 1.0);
           if not FHasPrev then
           begin
             // First-order (DDIM-equivalent) bootstrap.
             for i := 0 to XtSizeM1 do
-              Xt.FData[i] := (sqrtAbPrev / Sqrt(abT)) * Xt.FData[i]
-                - Sqrt(1.0 - abPrev) * (Exp(-h) - 1.0) * Eps.FData[i];
+              Xt.FData[i] := kX * Xt.FData[i] - kD * Eps.FData[i];
           end
           else
           begin
             hLast := lamT - FPrevLambda;            // < 0
             if Abs(h) < 1e-12 then r0 := 1.0 else r0 := hLast / h;
+            cA := 1.0 + 0.5 / r0;
+            cB := 0.5 / r0;
             for i := 0 to XtSizeM1 do
             begin
               curX0 := Eps.FData[i];
-              dCoef := (1.0 + 1.0 / (2.0 * r0)) * curX0
-                       - (1.0 / (2.0 * r0)) * FPrevX0.FData[i];
-              Xt.FData[i] := (sqrtAbPrev / Sqrt(abT)) * Xt.FData[i]
-                - Sqrt(1.0 - abPrev) * (Exp(-h) - 1.0) * dCoef;
+              dCoef := cA * curX0 - cB * FPrevX0.FData[i];
+              Xt.FData[i] := kX * Xt.FData[i] - kD * dCoef;
             end;
           end;
           // Store this step's x0 and lambda for the next multistep correction.
@@ -773,8 +812,10 @@ begin
           //   h_phi_1 = expm1(hh),  B_h = expm1(hh) (bh2).
           // 1. Convert current eps -> current x0 prediction m_t (reuse Eps).
           abT := FAlphaBar[Tt];
+          somabT := FSqrtOneMinusAlphaBar[Tt];
+          invSqrtAbT := 1.0 / Sqrt(abT);
           for i := 0 to XtSizeM1 do
-            Eps.FData[i] := (Xt.FData[i] - FSqrtOneMinusAlphaBar[Tt] * Eps.FData[i]) / Sqrt(abT);
+            Eps.FData[i] := (Xt.FData[i] - somabT * Eps.FData[i]) * invSqrtAbT;
           lamT := Lambda(Tt);
 
           // 2. CORRECTOR: uses the PREVIOUS step's stored output (m0 = the
@@ -795,11 +836,15 @@ begin
             Bh := hphi1;                                   // bh2
             sigRatio := sigmaTuni / sigmaS0;
             cOrder := FUniThisOrder;
+            // Step-invariant products hoisted out of the per-element loops (#5).
+            kM0 := alphaT * hphi1;
+            kBh := alphaT * Bh;
             if cOrder >= 2 then
             begin
               // rk for the second history point (FUniHistX0[FUniHistLen-2] at
               // FUniHistT[FUniHistLen-2]); D1 = (m1 - m0)/rk.
               rk := (Lambda(FUniHistT[FUniHistLen - 2]) - lamPrev) / h;
+              invRk := 1.0 / rk;
               // Solve the 2x2 system R*rhos = b for the corrector weights.
               //   R = [[1, 1],[rk, 1]], b = [hphi1/hh - 1, ...]/Bh-scaled terms.
               //   b1 = (hphi1/hh - 1)/Bh,
@@ -814,10 +859,10 @@ begin
               begin
                 m0v := FUniHistX0[FUniHistLen - 1].FData[i];
                 mtv := Eps.FData[i];
-                D1 := (FUniHistX0[FUniHistLen - 2].FData[i] - m0v) / rk;
+                D1 := (FUniHistX0[FUniHistLen - 2].FData[i] - m0v) * invRk;
                 Xt.FData[i] := sigRatio * FUniPrevSample.FData[i]
-                  - alphaT * hphi1 * m0v
-                  - alphaT * Bh * (curX0 * D1 + dCoef * (mtv - m0v));
+                  - kM0 * m0v
+                  - kBh * (curX0 * D1 + dCoef * (mtv - m0v));
               end;
             end
             else
@@ -828,8 +873,8 @@ begin
                 m0v := FUniHistX0[FUniHistLen - 1].FData[i];
                 mtv := Eps.FData[i];
                 Xt.FData[i] := sigRatio * FUniPrevSample.FData[i]
-                  - alphaT * hphi1 * m0v
-                  - alphaT * Bh * 0.5 * (mtv - m0v);
+                  - kM0 * m0v
+                  - kBh * 0.5 * (mtv - m0v);
               end;
             end;
           end;
@@ -883,18 +928,22 @@ begin
             hphi1 := Exp(hh) - 1.0;
             Bh := hphi1;                             // bh2
             sigRatio := sigmaTuni / sigmaS0;
+            // Step-invariant products hoisted out of the per-element loops (#5).
+            kM0 := alphaT * hphi1;
+            kBh := alphaT * Bh;
             if (pOrder >= 2) and (FUniHistLen >= 2) then
             begin
               // Predictor D1 from the previous history entry (rhos_p = [0.5]).
               //   rk = (lambda_{prev hist} - lambda_t)/h.
               rk := (Lambda(FUniHistT[FUniHistLen - 2]) - lamT) / h;
+              invRk := 1.0 / rk;
               for i := 0 to XtSizeM1 do
               begin
                 m0v := Eps.FData[i];
-                D1 := (FUniHistX0[FUniHistLen - 2].FData[i] - m0v) / rk;
+                D1 := (FUniHistX0[FUniHistLen - 2].FData[i] - m0v) * invRk;
                 Xt.FData[i] := sigRatio * FUniPrevSample.FData[i]
-                  - alphaT * hphi1 * m0v
-                  - alphaT * Bh * 0.5 * D1;
+                  - kM0 * m0v
+                  - kBh * 0.5 * D1;
               end;
             end
             else
@@ -902,7 +951,7 @@ begin
               // First-order predictor (no correction term).
               for i := 0 to XtSizeM1 do
                 Xt.FData[i] := sigRatio * FUniPrevSample.FData[i]
-                  - alphaT * hphi1 * Eps.FData[i];
+                  - kM0 * Eps.FData[i];
             end;
           end;
 
@@ -910,9 +959,6 @@ begin
           FHasPrev := true;
         end;
     end;
-  finally
-    Eps.Free;
-  end;
 end;
 
 procedure TNNetDiffusionScheduler.SampleHeun(X: TNNetVolume;
@@ -923,6 +969,7 @@ var
   Pred, X0, Y, Ye, X0b, XPred: TNNetVolume;
   Schedule: TNeuralIntegerArray;
   sigma, sigmaNext, sqrtAbT, sqrtAbPrev, d, d2: TNeuralFloat;
+  invSqrtAbT, invSigma, invSigmaNext, dSig, halfDSig: TNeuralFloat;
 begin
   // Deterministic Heun 2nd-order sampler in the VE sigma parameterisation:
   //   y     = x_t / sqrt(ab_t)                    (VE sample),
@@ -953,34 +1000,41 @@ begin
       sigma := SigmaOf(Tt);
       sigmaNext := SigmaOf(TtPrev);          // 0 when TtPrev = 0
       sqrtAbT := FSqrtAlphaBar[Tt];
+      // Step-invariant reciprocals/deltas hoisted out of the element loops (#5).
+      invSqrtAbT := 1.0 / sqrtAbT;
+      invSigma := 1.0 / sigma;
+      dSig := sigmaNext - sigma;
       // First denoiser eval at (x_t, t) -> x0.
       Denoise(X, Pred, Tt);
       PredictX0(X, Pred, X0, Tt);
       // VE sample and Euler predictor y_e.
       for i := 0 to SizeM1 do
       begin
-        Y.FData[i] := X.FData[i] / sqrtAbT;
-        d := (Y.FData[i] - X0.FData[i]) / sigma;
-        Ye.FData[i] := Y.FData[i] + d * (sigmaNext - sigma);
+        Y.FData[i] := X.FData[i] * invSqrtAbT;
+        d := (Y.FData[i] - X0.FData[i]) * invSigma;
+        Ye.FData[i] := Y.FData[i] + d * dSig;
       end;
       if TtPrev = 0 then
       begin
         // Final step: sqrt(ab_prev) = 1, y_e is already the clean image.
-        for i := 0 to SizeM1 do X.FData[i] := Ye.FData[i];
+        X.Copy(Ye);
       end
       else
       begin
         sqrtAbPrev := FSqrtAlphaBar[TtPrev];
+        invSigmaNext := 1.0 / sigmaNext;
+        halfDSig := 0.5 * dSig;
         // Build the predicted VP sample for the 2nd eval, then re-evaluate.
-        for i := 0 to SizeM1 do XPred.FData[i] := sqrtAbPrev * Ye.FData[i];
+        XPred.Copy(Ye);
+        XPred.Mul(sqrtAbPrev);
         Denoise(XPred, Pred, TtPrev);
         PredictX0(XPred, Pred, X0b, TtPrev);
         for i := 0 to SizeM1 do
         begin
-          d  := (Y.FData[i]  - X0.FData[i])  / sigma;
-          d2 := (Ye.FData[i] - X0b.FData[i]) / sigmaNext;
+          d  := (Y.FData[i]  - X0.FData[i])  * invSigma;
+          d2 := (Ye.FData[i] - X0b.FData[i]) * invSigmaNext;
           X.FData[i] := sqrtAbPrev *
-            (Y.FData[i] + (sigmaNext - sigma) * 0.5 * (d + d2));
+            (Y.FData[i] + halfDSig * (d + d2));
         end;
       end;
     end;
@@ -1049,8 +1103,6 @@ end;
 
 procedure TNNetLCMScheduler.LCMStep(Xt, RawPred: TNNetVolume; Tt: integer);
 var
-  i: integer;
-  XtSizeM1: integer;
   cs, co: TNeuralFloat;
   X0Hat: TNNetVolume;
 begin
@@ -1058,15 +1110,15 @@ begin
   // plumbing so LCM consumes the SAME raw model output the iterative samplers do.
   cs := CSkip(Tt);
   co := COut(Tt);
-  X0Hat := TNNetVolume.Create(Xt);
-  try
-    PredictX0(Xt, RawPred, X0Hat, Tt);
-    XtSizeM1 := Xt.Size - 1;
-    for i := 0 to XtSizeM1 do
-      Xt.FData[i] := cs * Xt.FData[i] + co * X0Hat.FData[i];
-  finally
-    X0Hat.Free;
-  end;
+  // Persistent lazily-sized x0_hat scratch (rule #17); PredictX0 uses the
+  // separate FEpsScratch internally, so the two never collide.
+  if not Assigned(FX0HatScratch) then FX0HatScratch := TNNetVolume.Create(Xt)
+  else FX0HatScratch.ReSize(Xt);
+  X0Hat := FX0HatScratch;
+  PredictX0(Xt, RawPred, X0Hat, Tt);
+  // Xt := cs*Xt + co*X0Hat (rule #13); X0Hat is a distinct scratch.
+  Xt.Mul(cs);
+  Xt.MulAdd(co, X0Hat);
 end;
 
 procedure TNNetLCMScheduler.LCMSample(X: TNNetVolume;

@@ -311,6 +311,7 @@ var
   NIn, NOut, OutCnt, J, JLo, JHi: integer;
   NOutM1: integer;
   Ratio, Cutoff, SrcPos, Center, X, Acc, WSum, W, PiX, PiXA: double;
+  AOverRatio: double;
 
   // Lanczos-windowed sinc at offset T (in input-sample units), low-passed at
   // Cutoff (cycles per input sample, <= 0.5). Returns the kernel weight.
@@ -342,7 +343,7 @@ begin
   begin
     Result.ReSize(NIn, 1, 1);
     if NIn > 0 then
-      Move(Wave.FData[0], Result.FData[0], NIn * SizeOf(Wave.FData[0]));
+      Move(Wave.FData[0], Result.FData[0], NIn * csNeuralFloatSize);
     exit;
   end;
   NOut := Round(NIn * (TargetRate / SourceRate));
@@ -359,6 +360,8 @@ begin
     Cutoff := 0.5 * Ratio;
 
   NOutM1 := NOut - 1;
+  // Downsampling kernel half-width 1/Ratio is call-invariant (rule #5).
+  AOverRatio := csResampleLanczosA / Ratio;
   for OutCnt := 0 to NOutM1 do
   begin
     // Position of this output sample expressed in INPUT-sample coordinates.
@@ -372,8 +375,8 @@ begin
     end
     else
     begin
-      JLo := Floor(Center - csResampleLanczosA / Ratio);
-      JHi := Ceil(Center + csResampleLanczosA / Ratio);
+      JLo := Floor(Center - AOverRatio);
+      JHi := Ceil(Center + AOverRatio);
     end;
     Acc := 0.0;
     WSum := 0.0;
@@ -527,9 +530,12 @@ var
   FilterFreqs: array of double;   // NumMelBins + 2 triangle corner freqs
   Power: array of double;         // one frame's power spectrum
   LogMel: array of double;        // (NumFrames x NumMelBins)
+  FrameBuf: array of double;      // one windowed frame (built once per frame)
   SampleCnt, FrameCnt, BinCnt, MelCnt, TapCnt, FrameStart, SrcIdx: integer;
   MelMin, MelMax, FFTFreq, DownSlope, UpSlope, Tri: double;
   ReAcc, ImAcc, Acc, MaxLog, V: double;
+  logFloor, invLn10: double;
+  twBase, rowBase: integer;
   AllZero: boolean;
 
   // np.pad reflect indexing for the center pad (mirror WITHOUT the edge
@@ -601,8 +607,9 @@ begin
       Tri := DownSlope;
       if UpSlope < Tri then Tri := UpSlope;
       if Tri < 0.0 then Tri := 0.0;
-      // slaney norm: ~constant energy per channel.
-      FilterBank[BinCnt * NumMelBins + MelCnt] := Tri *
+      // slaney norm: ~constant energy per channel. Stored MEL-MAJOR so the mel
+      // projection's inner (BinCnt) loop is contiguous (App E / rule #6).
+      FilterBank[MelCnt * NumBins + BinCnt] := Tri *
         (2.0 / (FilterFreqs[MelCnt + 2] - FilterFreqs[MelCnt]));
     end;
   end;
@@ -615,9 +622,15 @@ begin
   NumStftFramesM1 := NumStftFrames - 1;
   SetLength(Power, NumBins);
   SetLength(LogMel, NumStftFrames * NumMelBins);
+  // One-shot windowed-frame scratch (preprocessing, not a Compute path).
+  SetLength(FrameBuf, csWhisperNFFT);
+  // log10 constants hoisted out of the frame/mel loops (rule #5).
+  invLn10 := 1.0 / Ln(10.0);
+  logFloor := Ln(csWhisperMelFloor) * invLn10;
   MaxLog := -1e30;
   for FrameCnt := 0 to NumStftFramesM1 do
   begin
+    rowBase := FrameCnt * NumMelBins;
     FrameStart := FrameCnt * csWhisperHop - (csWhisperNFFT div 2);
     // The 30 s zero-padding tail produces all-zero frames whose mel rows
     // are exactly log10(mel_floor) - skip their O(bins*taps) DFT.
@@ -634,46 +647,56 @@ begin
     if AllZero then
     begin
       for MelCnt := 0 to NumMelBinsM1 do
-        LogMel[FrameCnt * NumMelBins + MelCnt] := Ln(csWhisperMelFloor) / Ln(10.0);
+        LogMel[rowBase + MelCnt] := logFloor;
     end
     else
     begin
+      // Build the windowed frame ONCE; every bin reuses it (rule #5/#11 -
+      // ~200x fewer WaveAt calls than windowing inside the bin loop).
+      for TapCnt := 0 to NFFTM1 do
+        FrameBuf[TapCnt] := WaveAt(FrameStart + TapCnt) * Window[TapCnt];
       for BinCnt := 0 to NumBinsM1 do
       begin
         ReAcc := 0.0;
         ImAcc := 0.0;
+        twBase := BinCnt * csWhisperNFFT;   // invariant across the tap loop
         for TapCnt := 0 to NFFTM1 do
         begin
-          V := WaveAt(FrameStart + TapCnt) * Window[TapCnt];
-          ReAcc := ReAcc + V * CosTab[BinCnt * csWhisperNFFT + TapCnt];
-          ImAcc := ImAcc + V * SinTab[BinCnt * csWhisperNFFT + TapCnt];
+          V := FrameBuf[TapCnt];
+          ReAcc := ReAcc + V * CosTab[twBase + TapCnt];
+          ImAcc := ImAcc + V * SinTab[twBase + TapCnt];
         end;
         Power[BinCnt] := ReAcc * ReAcc + ImAcc * ImAcc;
       end;
       for MelCnt := 0 to NumMelBinsM1 do
       begin
         Acc := 0.0;
+        twBase := MelCnt * NumBins;         // mel-major filter bank row base
         for BinCnt := 0 to NumBinsM1 do
-          Acc := Acc + FilterBank[BinCnt * NumMelBins + MelCnt] *
-            Power[BinCnt];
+          Acc := Acc + FilterBank[twBase + BinCnt] * Power[BinCnt];
         if Acc < csWhisperMelFloor then Acc := csWhisperMelFloor;
-        LogMel[FrameCnt * NumMelBins + MelCnt] := Ln(Acc) / Ln(10.0);
+        LogMel[rowBase + MelCnt] := Ln(Acc) * invLn10;
       end;
     end;
     for MelCnt := 0 to NumMelBinsM1 do
-      if LogMel[FrameCnt * NumMelBins + MelCnt] > MaxLog then
-        MaxLog := LogMel[FrameCnt * NumMelBins + MelCnt];
+    begin
+      V := LogMel[rowBase + MelCnt];
+      if V > MaxLog then MaxLog := V;
+    end;
   end;
 
   // ---- global max-8 clamp + (x + 4) / 4 ----
   Mel.ReSize(NumFrames, 1, NumMelBins);
   for FrameCnt := 0 to NumFramesM1 do
+  begin
+    rowBase := FrameCnt * NumMelBins;
     for MelCnt := 0 to NumMelBinsM1 do
     begin
-      V := LogMel[FrameCnt * NumMelBins + MelCnt];
+      V := LogMel[rowBase + MelCnt];
       if V < MaxLog - 8.0 then V := MaxLog - 8.0;
-      Mel.FData[FrameCnt * NumMelBins + MelCnt] := (V + 4.0) / 4.0;
+      Mel.FData[rowBase + MelCnt] := (V + 4.0) * 0.25;
     end;
+  end;
 end;
 
 procedure WhisperLogMelFromWavFile(const FileName: string; Mel: TNNetVolume;
@@ -818,6 +841,7 @@ var
   Power: array of double;         // one frame's power spectrum (NumBins)
   RawChroma: array of double;     // (NumFrames x NumChroma)
   FrameStart, FrameCnt, TapCnt, BinCnt, ChCnt, SrcIdx, ArgMax: integer;
+  rowBase, fBase: integer;
   Acc, MaxVal, V: double;
 
   // reflect pad indexing (np pad mode 'reflect' = torch center pad): mirror
@@ -935,6 +959,7 @@ begin
       // frame center at FrameCnt*Hop in the centered (padded) signal -> start at
       // FrameCnt*Hop - PadLeft in the ORIGINAL signal.
       FrameStart := FrameCnt * Hop - PadLeft;
+      rowBase := FrameCnt * NumChroma;      // RawChroma row base (rule #4)
       for TapCnt := 0 to NFFTM1 do
       begin
         SrcIdx := FrameStart + TapCnt;
@@ -958,31 +983,34 @@ begin
       for ChCnt := 0 to NumChromaM1 do
       begin
         Acc := 0.0;
+        fBase := ChCnt * NumBins;           // filter row base (rule #6)
         for BinCnt := 0 to NumBinsM1 do
-          Acc := Acc + Filt.FData[ChCnt * NumBins + BinCnt] * Power[BinCnt];
-        RawChroma[FrameCnt * NumChroma + ChCnt] := Acc;
+          Acc := Acc + Filt.FData[fBase + BinCnt] * Power[BinCnt];
+        RawChroma[rowBase + ChCnt] := Acc;
         if Acc > MaxVal then MaxVal := Acc;
       end;
       // inf-norm normalize is monotonic, so the ARGMAX is unchanged by it; the
       // one-hot only needs the dominant chroma index.
       ArgMax := 0;
-      MaxVal := RawChroma[FrameCnt * NumChroma];
+      MaxVal := RawChroma[rowBase];
       for ChCnt := 1 to NumChromaM1 do
-        if RawChroma[FrameCnt * NumChroma + ChCnt] > MaxVal then
+        if RawChroma[rowBase + ChCnt] > MaxVal then
         begin
-          MaxVal := RawChroma[FrameCnt * NumChroma + ChCnt];
+          MaxVal := RawChroma[rowBase + ChCnt];
           ArgMax := ChCnt;
         end;
       for ChCnt := 0 to NumChromaM1 do
-        RawChroma[FrameCnt * NumChroma + ChCnt] := 0.0;
-      RawChroma[FrameCnt * NumChroma + ArgMax] := 1.0;
+        RawChroma[rowBase + ChCnt] := 0.0;
+      RawChroma[rowBase + ArgMax] := 1.0;
     end;
 
     Chroma.ReSize(NumFrames, 1, NumChroma);
     for FrameCnt := 0 to NumFramesM1 do
+    begin
+      rowBase := FrameCnt * NumChroma;
       for ChCnt := 0 to NumChromaM1 do
-        Chroma.FData[FrameCnt * NumChroma + ChCnt] :=
-          RawChroma[FrameCnt * NumChroma + ChCnt];
+        Chroma.FData[rowBase + ChCnt] := RawChroma[rowBase + ChCnt];
+    end;
   finally
     Filt.Free;
     SetLength(Re, 0); SetLength(Im, 0); SetLength(Power, 0);
@@ -996,11 +1024,14 @@ var
   NumFrames, NumBins, OutLen: integer;
   NFFTM1, NumBinsM1, OutLenM1, NumFramesM1: integer;
   FrameCnt, BinCnt, TapCnt, OutIdx, FrameStart: integer;
+  frameBase, twPos: integer;
   Window: array of double;        // periodic hann (matches forward analysis)
+  Win2: array of double;          // window^2 (COLA envelope contribution)
+  BinScale: array of double;      // per-bin self-conjugate weight (1 or 2)
   CosTab, SinTab: array of double; // (NumBins x NFFT) inverse-DFT twiddles
   AccSig: array of double;        // overlap-added windowed frames
   AccEnv: array of double;        // overlap-added squared-window envelope
-  ReVal, ImVal, Sample, Scale, WinTap: double;
+  ReVal, ImVal, Sample, WinTap: double;
 const
   csEnvEps = 1e-12;               // divide-by-zero guard for the COLA envelope
 begin
@@ -1020,9 +1051,15 @@ begin
     raise Exception.Create('ISTFTOverlapAdd: at least one frame is required.');
 
   // ---- periodic hann synthesis window (matches the forward analysis) ----
+  // Win2 (window^2) is precomputed once: the COLA envelope contribution is the
+  // SAME for every frame, so it need not be recomputed per frame (rule #5).
   SetLength(Window, NFFT);
+  SetLength(Win2, NFFT);
   for TapCnt := 0 to NFFTM1 do
+  begin
     Window[TapCnt] := 0.5 - 0.5 * Cos(2.0 * Pi * TapCnt / NFFT);
+    Win2[TapCnt] := Window[TapCnt] * Window[TapCnt];
+  end;
 
   // ---- inverse-rDFT twiddle tables (same cos/sin convention as forward) ----
   // x[t] = (1/NFFT) * ( Re[0]
@@ -1040,6 +1077,15 @@ begin
         Sin(2.0 * Pi * BinCnt * TapCnt / NFFT);
     end;
 
+  // Per-bin self-conjugate weight is BinCnt-only (call-invariant); precompute it
+  // once so the inner nest carries no per-element branch (rule #5 / App E).
+  SetLength(BinScale, NumBins);
+  for BinCnt := 0 to NumBinsM1 do
+    if (BinCnt = 0) or ((BinCnt = NumBins - 1) and (NFFT mod 2 = 0)) then
+      BinScale[BinCnt] := 1.0
+    else
+      BinScale[BinCnt] := 2.0;
+
   OutLen := NFFT + (NumFrames - 1) * HopLength;
   OutLenM1 := OutLen - 1;
   NumFramesM1 := NumFrames - 1;
@@ -1054,29 +1100,26 @@ begin
   for FrameCnt := 0 to NumFramesM1 do
   begin
     FrameStart := FrameCnt * HopLength;
+    frameBase := FrameCnt * NumBins;      // Re/Im row base (invariant over nest)
     for TapCnt := 0 to NFFTM1 do
     begin
       // inverse real DFT of this frame at sample TapCnt
       Sample := 0.0;
+      twPos := TapCnt;                     // carries BinCnt*NFFT + TapCnt (rule #6)
       for BinCnt := 0 to NumBinsM1 do
       begin
-        ReVal := Re.FData[FrameCnt * NumBins + BinCnt];
-        ImVal := Im.FData[FrameCnt * NumBins + BinCnt];
-        // bins 0 and NFFT/2 are self-conjugate -> weight 1, the rest weight 2
-        // (they stand in for their negative-frequency conjugate partner).
-        if (BinCnt = 0) or ((BinCnt = NumBins - 1) and (NFFT mod 2 = 0)) then
-          Scale := 1.0
-        else
-          Scale := 2.0;
-        Sample := Sample + Scale *
-          (ReVal * CosTab[BinCnt * NFFT + TapCnt] +
-           ImVal * SinTab[BinCnt * NFFT + TapCnt]);
+        ReVal := Re.FData[frameBase + BinCnt];
+        ImVal := Im.FData[frameBase + BinCnt];
+        // bins 0 and NFFT/2 are self-conjugate -> weight 1, the rest weight 2.
+        Sample := Sample + BinScale[BinCnt] *
+          (ReVal * CosTab[twPos] + ImVal * SinTab[twPos]);
+        Inc(twPos, NFFT);
       end;
       Sample := Sample / NFFT;
       WinTap := Window[TapCnt];
       OutIdx := FrameStart + TapCnt;
       AccSig[OutIdx] := AccSig[OutIdx] + Sample * WinTap;
-      AccEnv[OutIdx] := AccEnv[OutIdx] + WinTap * WinTap;
+      AccEnv[OutIdx] := AccEnv[OutIdx] + Win2[TapCnt];
     end;
   end;
 

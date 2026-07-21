@@ -970,19 +970,21 @@ var
   ABF: TRunOperation;
   PredictedState: byte;
   MaxIdx: longint;
+  NGP: ^TNeuronGroup;   // bind once per iteration (rule #4/#7-spirit)
 begin
   ABF.Load(FCS, PActions, pCurrentStates, pFoundStates);
   MaxIdx := FMaxOperationNeuronCount - 1;
   for neuronPos := 0 to MaxIdx do
   begin
-    if ABF.TestTests(FNN[neuronPos].TestNeuronLayer) > 0 then
+    NGP := @FNN[neuronPos];
+    if ABF.TestTests(NGP^.TestNeuronLayer) > 0 then
     begin
       if ByteToBool[ABF.OperateAndTestOperation(
-        FNN[neuronPos].OperationNeuronLayer, FNN[neuronPos].PredictionPos,
+        NGP^.OperationNeuronLayer, NGP^.PredictionPos,
         PredictedState)] then
-        Inc(FNN[neuronPos].CorrectNeuronPredictionCnt)
+        Inc(NGP^.CorrectNeuronPredictionCnt)
       else
-        Inc(FNN[neuronPos].WrongNeuronPredictionCnt);
+        Inc(NGP^.WrongNeuronPredictionCnt);
     end;
   end;
 end;
@@ -1273,6 +1275,7 @@ var
   NextState: byte;
   PredictionPos: integer;
   Hi: longint;
+  NGP: ^TNeuronGroup;   // pointer to the current group record (rule #4/#7-spirit)
 begin
   ABCopy(PNextStates, PCurrentStates); // LOOK
   ABF.Load(FCS, PActions, PCurrentStates, PNextStates);
@@ -1297,29 +1300,30 @@ begin
     else
       I := J;
 
-    PredictionPos := FNN[I].PredictionPos;
-    TotalCount := FNN[I].WrongNeuronPredictionCnt +
-      FNN[I].CorrectNeuronPredictionCnt + 1;
+    NGP := @FNN[I];   // bind once; avoids re-indexing the dynarray record below
+    PredictionPos := NGP^.PredictionPos;
+    TotalCount := NGP^.WrongNeuronPredictionCnt +
+      NGP^.CorrectNeuronPredictionCnt + 1;
 
-    if (TotalCount = 0) or not(FNN[I].Filled()) then
+    if (TotalCount = 0) or not(NGP^.Filled()) then
     begin
       Probability := 0;
     end
     else if FUseBelief then
     begin
       Probability :=
-        (FNN[I].CorrectNeuronPredictionCnt + 1) / (TotalCount + 2);
+        (NGP^.CorrectNeuronPredictionCnt + 1) / (TotalCount + 2);
     end
     else
-      Probability := FNN[I].CorrectNeuronPredictionCnt / TotalCount;  // best method
+      Probability := NGP^.CorrectNeuronPredictionCnt / TotalCount;  // best method
 
     if (Probability > pRelationProbability[PredictionPos]) and
-      (FNN[I].CorrectNeuronPredictionCnt > FCS.MinSampleForPrediction)
+      (NGP^.CorrectNeuronPredictionCnt > FCS.MinSampleForPrediction)
       then
     begin
-      if (ABF.TestTests(FNN[I].TestNeuronLayer) > 0) then
+      if (ABF.TestTests(NGP^.TestNeuronLayer) > 0) then
       begin
-        ABF.OperateAndTestOperation(FNN[I].OperationNeuronLayer,
+        ABF.OperateAndTestOperation(NGP^.OperationNeuronLayer,
           PredictionPos, NextState);
         if (Probability > pRelationProbability[PredictionPos]) then
         begin
@@ -1345,6 +1349,7 @@ var
   PredictionPosition: integer;
   Hi: longint;
   MaxIdx: longint;
+  NGP: ^TNeuronGroup;   // bind once per iteration (rule #4/#7-spirit)
 begin
   ABF.Load(FCS, PActions, PCurrentStates, PNextStates);
 
@@ -1358,20 +1363,21 @@ begin
   MaxIdx := FMaxOperationNeuronCount - 1;
   for I := 0 to MaxIdx do
   begin
-    PredictionPosition := FNN[I].PredictionPos;
-    if (FNN[I].Filled) and
+    NGP := @FNN[I];
+    PredictionPosition := NGP^.PredictionPos;
+    if (NGP^.Filled) and
       ByteToBool[ABF.OperateAndTestOperation(
-      FNN[I].OperationNeuronLayer, PredictionPosition, NextState)] and
-      ( ABF.TestTests(FNN[I].TestNeuronLayer) > 0) then
+      NGP^.OperationNeuronLayer, PredictionPosition, NextState)] and
+      ( ABF.TestTests(NGP^.TestNeuronLayer) > 0) then
     begin
-      TotalCount := FNN[I].WrongNeuronPredictionCnt +
-        FNN[I].CorrectNeuronPredictionCnt;
+      TotalCount := NGP^.WrongNeuronPredictionCnt +
+        NGP^.CorrectNeuronPredictionCnt;
       if TotalCount > 0 then
       begin
         if FUseBelief then
-          Probability := (FNN[I].CorrectNeuronPredictionCnt + 1) / (TotalCount + 2)
+          Probability := (NGP^.CorrectNeuronPredictionCnt + 1) / (TotalCount + 2)
         else
-          Probability := FNN[I].CorrectNeuronPredictionCnt / TotalCount; // best option
+          Probability := NGP^.CorrectNeuronPredictionCnt / TotalCount; // best option
       end
       else
         Probability := 0;
