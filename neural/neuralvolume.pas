@@ -757,6 +757,11 @@ type
   TNNetSamplerTypical = class (TNNetSamplerBase)
     protected
       FMass: TNeuralFloat;
+      // Persistent scratch, lazily sized to the vocab and reused across tokens
+      // so SampleTypical allocates ~once over the sampler's lifetime, not per
+      // call (rule #17 amortized-field form).
+      FDist: array of TNeuralFloat;  // |surprise - entropy| per FTokenArr entry
+      FOrder: array of integer;      // FTokenArr indices sorted by ascending FDist
       // Build the typical set from FTokenArr (any order) and draw from it.
       function SampleTypical(): integer;
     public
@@ -2834,10 +2839,10 @@ begin
   // Uniform center, then clamp the corners to the image bounds.
   Cx := Round(CenterFracX * W);
   Cy := Round(CenterFracY * H);
-  X0 := Cx - CutW div 2;
-  Y0 := Cy - CutH div 2;
-  X1 := Cx + (CutW - CutW div 2);
-  Y1 := Cy + (CutH - CutH div 2);
+  X0 := Cx - (CutW shr 1);
+  Y0 := Cy - (CutH shr 1);
+  X1 := Cx + (CutW - (CutW shr 1));
+  Y1 := Cy + (CutH - (CutH shr 1));
   if X0 < 0 then X0 := 0;
   if Y0 < 0 then Y0 := 0;
   if X1 > W then X1 := W;
@@ -2904,7 +2909,7 @@ begin
         begin
           // CutA (a copy of SrcA) and SrcB share XY/depth geometry here, so a
           // single base indexes both FData arrays.
-          PastePos := CutA.GetRawPos(X, Y, 0);
+          PastePos := CutA.GetRawPos(X, Y);
           Move(SrcB.FData[PastePos], CutA.FData[PastePos], (DepthMax + 1) * csNeuralFloatSize);
         end;
       // True pasted-area fraction after clamping.
@@ -3297,7 +3302,7 @@ var
 begin
   Lo := iLo;
   Hi := iHi;
-  Mid := A[(Lo + Hi) div 2];
+  Mid := A[(Lo + Hi) shr 1];
   repeat
     while A[Lo].Score > Mid.Score do Inc(Lo);
     while A[Hi].Score < Mid.Score do Dec(Hi);
@@ -3563,8 +3568,12 @@ begin
     if P > 0 then Entropy := Entropy - P * pcr_logf(P);
   end;
   // Per-token distance |(-log p) - H|.
-  SetLength(Dist, N);
-  SetLength(Order, N);
+  // Reuse the persistent scratch fields; resize only when the vocab size
+  // changes (rule #17: amortized, no per-call heap allocation).
+  if Length(FDist) <> N then SetLength(FDist, N);
+  if Length(FOrder) <> N then SetLength(FOrder, N);
+  Dist := FDist;   // reference share (refcount bump only, no new buffer)
+  Order := FOrder;
   for I := 0 to NM1 do
   begin
     P := FTokenArr[I].Score;
@@ -3710,9 +3719,9 @@ begin
     Epsilon := S - 1.0;
     // k from the paper's closed form; clamp into [1, N].
     if Abs(Epsilon) < 1e-6 then
-      KFloat := Exp(FMu)            // s ~ 1 limit
+      KFloat := NeuralExp(FMu)            // s ~ 1 limit
     else
-      KFloat := Exp( pcr_logf( (Epsilon * Exp(FMu * pcr_logf(2.0))) /
+      KFloat := NeuralExp( pcr_logf( (Epsilon * NeuralExp(FMu * pcr_logf(2.0))) /
                          (1 - pcr_powf(N, -Epsilon)) ) / S );
     if KFloat < 1 then KFloat := 1;
     KeptCount := Round(KFloat);
@@ -3898,7 +3907,7 @@ begin
       // (b) frequency + (c) presence: log-space subtraction is a
       // multiplicative exp() factor on the probability.
       if (FFrequency <> 0.0) or (FPresence <> 0.0) then
-        P := P * Exp(-(FFrequency * Count + FPresence));
+        P := P * NeuralExp(-(FFrequency * Count + FPresence));
       Probs.FData[I] := P;
       Changed := true;
     end;
@@ -5224,20 +5233,26 @@ procedure TNNetVolumeList.InterleaveInto(V: TNNetVolume);
 var
   CountVolume, CountElement: integer;
   MaxVolume, MaxElement: integer;
-  CurrPos: integer;
+  Vol: TNNetVolume;
+  Pos, Stride: integer;
 begin
   if (Count>0) then
   begin
     MaxVolume := Count - 1;
     MaxElement := Self[0].Size - 1;
-    CurrPos := 0;
+    Stride := MaxVolume + 1; // volume count == output interleave stride
 
-    for CountElement := 0 to MaxElement do
+    // Interleaved layout is V[CountElement*Stride + CountVolume]. Iterating
+    // volume-outer binds each list element once (#7, no Items[] getter per cell)
+    // and carries the strided write offset by addition (#12).
+    for CountVolume := 0 to MaxVolume do
     begin
-      for CountVolume := 0 to MaxVolume do
+      Vol := Self[CountVolume];
+      Pos := CountVolume;
+      for CountElement := 0 to MaxElement do
       begin
-        V.FData[CurrPos] := Self[CountVolume].FData[CountElement];
-        CurrPos := CurrPos + 1;
+        V.FData[Pos] := Vol.FData[CountElement];
+        Inc(Pos, Stride);
       end;
     end;
   end;
@@ -5557,8 +5572,8 @@ begin
     PepperPosX := Random(FSizeX);
     PepperPosY := Random(FSizeY);
 
-    SaltBase := GetRawPos(SaltPosX, SaltPosY, 0);
-    PepperBase := GetRawPos(PepperPosX, PepperPosY, 0);
+    SaltBase := GetRawPos(SaltPosX, SaltPosY);
+    PepperBase := GetRawPos(PepperPosX, PepperPosY);
     for CntDepth := 0 to DepthM1 do
     begin
       if (Not(pColor) or (Random(100) < 50) ) then
@@ -5754,7 +5769,7 @@ begin
     begin
       for CntY := 0 to MaxY do
       begin
-        DestBase := GetRawPos(CntX, CntY, 0);
+        DestBase := GetRawPos(CntX, CntY);
         SrcPos := Original.GetRawPos(0, CntY, CntX);
         for CntD := 0 to MaxD do
         begin
@@ -5768,7 +5783,7 @@ begin
   begin
     for CntX := 0 to MaxX do
     begin
-      DestBase := GetRawPos(CntX, 0, 0);
+      DestBase := GetRawPos(CntX, 0);
       SrcPos := Original.GetRawPos(0, 0, CntX);
       for CntD := 0 to MaxD do
       begin
@@ -5796,7 +5811,7 @@ begin
     begin
       for CntY := 0 to MaxY do
       begin
-        DestBase := GetRawPos(CntX, CntY, 0);
+        DestBase := GetRawPos(CntX, CntY);
         SrcPos := Original.GetRawPos(CntX, 0, CntY);
         for CntD := 0 to MaxD do
         begin
@@ -5810,7 +5825,7 @@ begin
   begin
     for CntY := 0 to MaxY do
     begin
-      DestBase := GetRawPos(0, CntY, 0);
+      DestBase := GetRawPos(0, CntY);
       SrcPos := Original.GetRawPos(0, 0, CntY);
       for CntD := 0 to MaxD do
       begin
@@ -5884,8 +5899,8 @@ begin
     begin
       for J := 0 to ASizeYM1 do
       begin
-        SelfBase := GetRawPos(I, J, 0);
-        SrcBase := A.GetRawPos(I, J, 0);
+        SelfBase := GetRawPos(I, J);
+        SrcBase := A.GetRawPos(I, J);
         Move(A.FData[SrcBase], FData[SelfBase], A.FDepth * csNeuralFloatSize);
       end;
     end;
@@ -5900,8 +5915,8 @@ begin
     begin
       for J := 0 to BSizeYM1 do
       begin
-        SelfBase := GetRawPos(I, J, 0);
-        SrcBase := B.GetRawPos(I, J, 0);
+        SelfBase := GetRawPos(I, J);
+        SrcBase := B.GetRawPos(I, J);
         Move(B.FData[SrcBase], FData[SelfBase + A.FDepth], B.FDepth * csNeuralFloatSize);
       end;
     end;
@@ -6858,8 +6873,8 @@ begin
   begin
     for Y := 0 to MaxY do
     begin
-      SelfBase := GetRawPos(X, Y, 0);
-      OrigBase := Original.GetRawPos(X, Y, 0);
+      SelfBase := GetRawPos(X, Y);
+      OrigBase := Original.GetRawPos(X, Y);
       OutputDepth := 0;
       for InputDepth in aChannels do
       begin
@@ -6941,9 +6956,9 @@ begin
 
     if (Original.Size <> Self.Size) then
     begin
-      if Original.Size mod 8 = 0 then
+      if Original.Size and 7 = 0 then
       begin
-        Self.ReSize(Original.Size div 8, 1, 8);
+        Self.ReSize(Original.Size shr 3, 1, 8);
       end else
       begin
         Self.ReSize(Original.Size, 1, 1);
@@ -7074,8 +7089,8 @@ begin
 
   for CntY := 0 to MaxY do
   begin
-    SourceRawPos := Original.GetRawPos(0, CntY, 0);
-    DestRawPos := GetRawPos(Padding, CntY + Padding, 0);
+    SourceRawPos := Original.GetRawPos(0, CntY);
+    DestRawPos := GetRawPos(Padding, CntY + Padding);
     Move(Original.FData[SourceRawPos], Self.FData[DestRawPos], RowSize);
   end;
 end;
@@ -7098,8 +7113,8 @@ begin
 
   for CntY := 0 to MaxY do
   begin
-    SourceRawPos := Original.GetRawPos(0, CntY, 0);
-    DestRawPos := GetRawPos(PaddingX, CntY + PaddingY, 0);
+    SourceRawPos := Original.GetRawPos(0, CntY);
+    DestRawPos := GetRawPos(PaddingX, CntY + PaddingY);
     Move(Original.FData[SourceRawPos], Self.FData[DestRawPos], RowSize);
   end;
 end;
@@ -7184,7 +7199,7 @@ begin
     begin
       for CntY := 0 to MaxY do
       begin
-        DestBase := GetRawPos(CntX, CntY, 0);
+        DestBase := GetRawPos(CntX, CntY);
         SrcPos := Original.GetRawPos(0, CntY, CntX);
         for CntD := 0 to MaxD do
         begin
@@ -7198,7 +7213,7 @@ begin
   begin
     for CntX := 0 to MaxX do
     begin
-      DestBase := GetRawPos(CntX, 0, 0);
+      DestBase := GetRawPos(CntX, 0);
       SrcPos := Original.GetRawPos(0, 0, CntX);
       for CntD := 0 to MaxD do
       begin
@@ -7226,7 +7241,7 @@ begin
     begin
       for CntY := 0 to MaxY do
       begin
-        DestBase := GetRawPos(CntX, CntY, 0);
+        DestBase := GetRawPos(CntX, CntY);
         SrcPos := Original.GetRawPos(CntX, 0, CntY);
         for CntD := 0 to MaxD do
         begin
@@ -7240,7 +7255,7 @@ begin
   begin
     for CntY := 0 to MaxY do
     begin
-      DestBase := GetRawPos(0, CntY, 0);
+      DestBase := GetRawPos(0, CntY);
       SrcPos := Original.GetRawPos(0, 0, CntY);
       for CntD := 0 to MaxD do
       begin
@@ -7810,15 +7825,15 @@ begin
   MaxY := FSizeY - 1;
   MaxD := FDepth - 1;
 
-  iTo := FSizeX div 2 - 1;
+  iTo := (FSizeX shr 1) - 1;
   iFrom := 0;
 
   for CountX := iFrom to iTo do
   begin
     for CountY := 0 to MaxY do
     begin
-      iBase1 := GetRawPos(CountX, CountY, 0);
-      iBase2 := GetRawPos(FSizeX-CountX-1, CountY, 0);
+      iBase1 := GetRawPos(CountX, CountY);
+      iBase2 := GetRawPos(FSizeX-CountX-1, CountY);
       for CountD := 0 to MaxD do
       begin
         iRawPos1 := iBase1 + CountD;
@@ -7843,15 +7858,15 @@ begin
   MaxX := FSizeX - 1;
   MaxD := FDepth - 1;
 
-  iTo := FSizeY div 2 - 1;
+  iTo := (FSizeY shr 1) - 1;
   iFrom := 0;
 
   for CountX := 0 to MaxX do
   begin
     for CountY := iFrom to iTo do
     begin
-      iBase1 := GetRawPos(CountX, CountY, 0);
-      iBase2 := GetRawPos(CountX, FSizeY-CountY-1, 0);
+      iBase1 := GetRawPos(CountX, CountY);
+      iBase2 := GetRawPos(CountX, FSizeY-CountY-1);
       for CountD := 0 to MaxD do
       begin
         iRawPos1 := iBase1 + CountD;
@@ -8310,12 +8325,7 @@ begin
         if NoForward and (MaxD < FDepth - 1) then
         begin
           MaxDP1 := MaxD + 1;
-          I := StartPointPos + MaxDP1;
-          for CountD := MaxDP1 to FDepthM1 do
-          begin
-            FData[I] := 0;
-            Inc(I);
-          end;
+          FillChar(FData[StartPointPos + MaxDP1], (FDepthM1 - MaxDP1 + 1) * csNeuralFloatSize, 0);
         end;
         I := StartPointPos;
         // Find the point max value.
@@ -8641,10 +8651,10 @@ begin
     begin
       for CountY := 0 to MaxY do
       begin
-        PointBase := GetRawPos(CountX, CountY, 0);
+        PointBase := GetRawPos(CountX, CountY);
+        StartD := 0;
         for GroupCnt := 0 to GroupsM1 do
         begin
-          StartD := ChannelsPerGroup * GroupCnt;
           //EndD := StartD + ChannelsPerGroup - 1;
           StartPointPos := PointBase + StartD;
           I := StartPointPos;
@@ -8661,13 +8671,14 @@ begin
           for CountD := 0 to ChannelsPerGroupM1 do
           begin
             //LocalValue := pcr_expf( NeuronForceRange(FData[I] - MaxValue, 4000) );
-            LocalValue := Exp( NeuronForceRange(FData[I] - MaxValue, 4000) );
+            LocalValue := NeuralExp( NeuronForceRange(FData[I] - MaxValue, 4000) );
             FData[I] := LocalValue;
             TotalSum := TotalSum + LocalValue;
             Inc(I);
           end;
           if TotalSum > 0 then
             TNNetVolume.Mul(Addr(FData[StartPointPos]), 1.0 / TotalSum, ChannelsPerGroupM1 + 1);
+          Inc(StartD, ChannelsPerGroup);
         end;
       end;
     end;
@@ -8792,7 +8803,7 @@ begin
   begin
     Token := 0;
     GroupSizePower := 1;
-    TokenBase := GetRawPos(CntToken, 0, 0);
+    TokenBase := GetRawPos(CntToken, 0);
     for GroupCnt := 0 to MaxGroup do
     begin
       InitTokenPos := GroupCnt * GroupSize;
@@ -9012,8 +9023,8 @@ begin
   RowStride := FSizeX * FDepth; // per-CntY step
   for CntDepth := 0 to MaxDepth do
   begin
-    divTerm := pcr_powf(n, (2 * (CntDepth div 2)) / EmbeddingSize);
-    IsEvenDepth := (CntDepth mod 2 = 0);
+    divTerm := pcr_powf(n, (CntDepth and (not 1)) / EmbeddingSize); // 2*(CntDepth div 2), CntDepth>=0
+    IsEvenDepth := ((CntDepth and 1) = 0);
     for CntX := 0 to MaxX do
     begin
       RawPos := GetRawPos(CntX, 0, CntDepth);
@@ -9050,7 +9061,7 @@ begin
     begin
       for J := 0 to MaxY do
       begin
-        base := Self.GetRawPos(I, J, 0);
+        base := Self.GetRawPos(I, J);
         rgb2hsv(FData[base], FData[base+1], FData[base+2], h, s, v);
         FData[base] := h;
         FData[base+1] := s;
@@ -9081,7 +9092,7 @@ begin
     begin
       for J := 0 to MaxY do
       begin
-        base := Self.GetRawPos(I, J, 0);
+        base := Self.GetRawPos(I, J);
         hsv2rgb(FData[base], FData[base+1], FData[base+2], r, g, b);
         FData[base] := r;
         FData[base+1] := g;
@@ -9112,7 +9123,7 @@ begin
     begin
       for J := 0 to MaxY do
       begin
-        base := Self.GetRawPos(I, J, 0);
+        base := Self.GetRawPos(I, J);
         rgb2hsl(FData[base], FData[base+1], FData[base+2], h, s, l);
         FData[base] := h;
         FData[base+1] := s;
@@ -9142,7 +9153,7 @@ begin
     begin
       for J := 0 to MaxY do
       begin
-        base := Self.GetRawPos(I, J, 0);
+        base := Self.GetRawPos(I, J);
         hsl2rgb(FData[base], FData[base+1], FData[base+2], r, g, b);
         FData[base] := r;
         FData[base+1] := g;
@@ -9172,7 +9183,7 @@ begin
     begin
       for J := 0 to MaxY do
       begin
-        base := Self.GetRawPos(I, J, 0);
+        base := Self.GetRawPos(I, J);
         rgb2lab(FData[base], FData[base+1], FData[base+2], l, a, b);
         FData[base] := l;
         FData[base+1] := a;
@@ -9203,7 +9214,7 @@ begin
     begin
       for J := 0 to MaxY do
       begin
-        base := Self.GetRawPos(I, J, 0);
+        base := Self.GetRawPos(I, J);
         lab2rgb(FData[base], FData[base+1], FData[base+2], r, g, b);
         FData[base] := r;
         FData[base+1] := g;
@@ -9229,7 +9240,7 @@ begin
     begin
       for J := 0 to MaxY do
       begin
-        base := Self.GetRawPos(I, J, 0);
+        base := Self.GetRawPos(I, J);
         aux := (FData[base] + FData[base+1] + FData[base+2]) / 3;
         FData[base] := aux;
         FData[base+1] := aux;
@@ -9255,7 +9266,7 @@ begin
     begin
       for J := 0 to MaxY do
       begin
-        rgbBase := Rgb.GetRawPos(I, J, 0);
+        rgbBase := Rgb.GetRawPos(I, J);
         Self.Data[I, J, 0] :=
           (Rgb.FData[rgbBase] + Rgb.FData[rgbBase+1] + Rgb.FData[rgbBase+2]) / 3;
       end;
@@ -9567,6 +9578,7 @@ var
   MinIX, MaxIX, MinIY, MaxIY: integer;
   CountX, CountY, CountD: integer;
   iBase: integer;
+  sqPos, RowStrideSq: integer;
 begin
   ReSize(Original);
   Fill(1);
@@ -9575,12 +9587,13 @@ begin
   MaxY := FSizeY - 1;
   MaxD := FDepth - 1;
 
-  iTo := pSize div 2;
+  iTo := pSize shr 1;
   iFrom := -iTo;
   SqrElements := TNNetVolume.Create();
   SqrElements.Copy(Original);
   SqrElements.Mul(SqrElements);
   SqrElements.Mul(alpha/(pSize*pSize));
+  RowStrideSq := SqrElements.FSizeX * SqrElements.FDepth; // CountIY step in SqrElements
 
   for CountX := 0 to MaxX do
   begin
@@ -9588,7 +9601,7 @@ begin
     MaxIX := Min(CountX + iTo, MaxX);
     for CountY := 0 to MaxY do
     begin
-      iBase := GetRawPos(CountX, CountY, 0);
+      iBase := GetRawPos(CountX, CountY);
       MinIY := Max(CountY + iFrom,0);
       MaxIY := Min(CountY + iTo, MaxY);
       for CountD := 0 to MaxD do
@@ -9597,13 +9610,16 @@ begin
 
         for CountIX := MinIX to MaxIX do
         begin
+          // (CountIX, MinIY, CountD) flat offset; +RowStrideSq per CountIY (#12).
+          sqPos := SqrElements.GetRawPos(CountIX, MinIY) + CountD;
           for CountIY := MinIY to MaxIY do
           begin
             {$IFDEF FPC}
-            FData[iRawPos] += SqrElements[CountIX, CountIY, CountD];
+            FData[iRawPos] += SqrElements.FData[sqPos];
             {$ELSE}
-            FData[iRawPos] := FData[iRawPos] + SqrElements[CountIX, CountIY, CountD];
+            FData[iRawPos] := FData[iRawPos] + SqrElements.FData[sqPos];
             {$ENDIF}
+            Inc(sqPos, RowStrideSq);
           end;
         end;
       end;
@@ -9634,7 +9650,7 @@ begin
   MaxY := FSizeY - 1;
   MaxD := FDepth - 1;
 
-  iTo := pSize div 2;
+  iTo := pSize shr 1;
   iFrom := -iTo;
   SqrElements := TNNetVolume.Create();
   SqrElements.Copy(Original);
@@ -9646,7 +9662,7 @@ begin
     for CountY := 0 to MaxY do
     begin
       // Self and SqrElements are both shaped like Original, so one base indexes both.
-      iBase := GetRawPos(CountX, CountY, 0);
+      iBase := GetRawPos(CountX, CountY);
       for CountD := 0 to MaxD do
       begin
         MinID := Max(CountD + iFrom,0);
@@ -10174,7 +10190,7 @@ end;
 procedure TNNetVolume.DotProductsTiled(NumAs, BStart, BFinish, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1);
 var
   CntA, CntB: Integer;
-  RowBase, AOfs: integer;
+  RowBase, AOfs, BPos: integer;
   //DestPointer: pointer;
   //CntBVectorSizePlusCntBPos: integer;
   {$IFDEF AVXANY}
@@ -10216,10 +10232,11 @@ begin
     begin
       StartTileA := AStart + TileACnt * TileSizeA;
       EndTileA := Min(StartTileA + TileSizeA - 1, AFinish);
+      BPos := StartTileB * VectorSize;   // #12: carried CntB*VectorSize
+      RowBase := StartTileB * NumAs;     // #12: carried CntB*NumAs
       for CntB := StartTileB to EndTileB do
       begin
-        PtrB := VBs.GetRawPtr(CntB*VectorSize);
-        RowBase := CntB * NumAs;
+        PtrB := VBs.GetRawPtr(BPos);
         AOfs := StartTileA * VectorSize;
         for CntA := StartTileA to EndTileA do
         begin
@@ -10454,6 +10471,8 @@ begin
           FData[RowBase + CntA] := Result;
           Inc(AOfs, VectorSize);
         end;
+        Inc(BPos, VectorSize); // #12: next CntB*VectorSize
+        Inc(RowBase, NumAs);   // #12: next CntB*NumAs
       end;
 
     end; // A Tiling.
@@ -10536,7 +10555,7 @@ procedure TNNetVolume.DotProductsTiledInt8(NumAs, BStart, BFinish,
   AStart: integer = 0; AFinish: integer = -1);
 var
   CntA, CntB: integer;
-  RowBase, AOfs: integer;
+  RowBase, AOfs, BPos: integer;
   PtrA: TNeuralInt8ArrPtr;
   PtrB: TNeuralFloatArrPtr;
   // Tiling
@@ -10559,10 +10578,11 @@ begin
     begin
       StartTileA := AStart + TileACnt * TileSizeA;
       EndTileA := Min(StartTileA + TileSizeA - 1, AFinish);
+      BPos := StartTileB * VectorSize;   // #12: carried CntB*VectorSize
+      RowBase := StartTileB * NumAs;     // #12: carried CntB*NumAs
       for CntB := StartTileB to EndTileB do
       begin
-        PtrB := VBs.GetRawPtr(CntB*VectorSize);
-        RowBase := CntB * NumAs;
+        PtrB := VBs.GetRawPtr(BPos);
         AOfs := StartTileA * VectorSize;
         for CntA := StartTileA to EndTileA do
         begin
@@ -10573,6 +10593,8 @@ begin
             * Scales[CntA];
           Inc(AOfs, VectorSize);
         end;
+        Inc(BPos, VectorSize); // #12: next CntB*VectorSize
+        Inc(RowBase, NumAs);   // #12: next CntB*NumAs
       end;
     end; // A Tiling.
   end; // B Tiling.
@@ -10608,10 +10630,10 @@ begin
     begin
       StartTileA := TileACnt * TileSizeA;
       EndTileA := Min(StartTileA + TileSizeA - 1, NumAs - 1);
+      RowBase := StartTileB * NumAs;     // #12: carried CntB*NumAs
+      BOfs := StartTileB * VectorBSize;  // #12: carried CntB*VectorBSize
       for CntB := StartTileB to EndTileB do
       begin
-        RowBase := CntB * NumAs;
-        BOfs := CntB * VectorBSize;
         AOfs := StartTileA * VectorSize;
         GroupIdVectorSize := (StartTileA div GroupASize) * VectorSize;
         InGroupLeft := GroupASize - (StartTileA mod GroupASize);
@@ -10629,6 +10651,8 @@ begin
             InGroupLeft := GroupASize;
           end;
         end;
+        Inc(RowBase, NumAs);     // #12: next CntB*NumAs
+        Inc(BOfs, VectorBSize);  // #12: next CntB*VectorBSize
       end;
     end;
   end;
@@ -10640,7 +10664,7 @@ end;
 procedure TNNetGroupedVolume.GroupedDotProductsTiled(Groups, NumAs, NumBs,
   VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
 var
-  CntA, CntB, CntAPos, CntBPos, MaxA, MaxB: integer;
+  CntA, CntB, CntAPos, CntBPos, MaxA, MaxB, BOfs, DestIdx: integer;
   GroupASize: integer;
   VectoreBSize: integer;
   DestPointer: pointer;
@@ -10706,9 +10730,11 @@ begin
         //PtrA := VAs.GetRawPtr(CntA*VectorSize);
         LocalGroupInfo := FGrInfoArray[CntA];
         PtrA := LocalGroupInfo.PtrA;
+        BOfs := StartTileB * VectoreBSize + LocalGroupInfo.GroupIdVectorSize; // #12: carried CntB*VectoreBSize
+        DestIdx := StartTileB * NumAs + CntA;                                 // #12: carried CntB*NumAs
         for CntB := StartTileB to EndTileB do
         begin
-          PtrB := VBs.GetRawPtr(CntB*VectoreBSize + LocalGroupInfo.GroupIdVectorSize);
+          PtrB := VBs.GetRawPtr(BOfs);
           {$IFDEF AVXANY}
           {$IFDEF AVX32}
           if localNumElements > 0 then
@@ -10936,7 +10962,9 @@ begin
           Result := DotProduct(PtrA, PtrB, VectorSize);
           {$ENDIF}
           // Use for debug only: WriteLn('Grouped dot product result [', CntB,' ',NumAs,' ',CntA,' Pos:',CntB * NumAs + CntA,']:',Result);
-          FData[CntB * NumAs + CntA] := Result;
+          FData[DestIdx] := Result;
+          Inc(BOfs, VectoreBSize); // #12: next CntB*VectoreBSize
+          Inc(DestIdx, NumAs);     // #12: next CntB*NumAs
         end;
       end;
 
@@ -11185,8 +11213,8 @@ begin
     StrideYSelf := FSizeX * FDepth; // Self Y-slot step per CntY
     for CntX := 0 to MaxX do
     begin
-      Dst1Pos := GetRawPos(CntX, 0, 0); // Self[CntX, CntY, 0]
-      Dst2Pos := GetRawPos(0, CntX, 0); // Self[CntY, CntX, 0]
+      Dst1Pos := GetRawPos(CntX, 0); // Self[CntX, CntY, 0]
+      Dst2Pos := GetRawPos(0, CntX); // Self[CntY, CntX, 0]
       for CntY := 0 to CntX do
       begin
         if Abs(Original.FData[CntX] - Original.FData[CntY]) <= Threshold
@@ -11221,9 +11249,12 @@ begin
     begin
       for CntX := 0 to MaxX do
       begin
-        OrigA := Original.FData[Original.GetRawPos(CntX, 0, CntD)];
-        SrcBPos := Original.GetRawPos(0, 0, CntD);
+        // Self was resized to (Original.SizeX, Original.SizeX, Original.Depth),
+        // so Self and Original share X-stride and depth: GetRawPos(CntX,0,CntD)
+        // is the same flat offset in both, so compute it once.
         Dst1Pos := GetRawPos(CntX, 0, CntD);
+        OrigA := Original.FData[Dst1Pos];
+        SrcBPos := Original.GetRawPos(0, 0, CntD);
         Dst2Pos := GetRawPos(0, CntX, CntD);
         for CntY := 0 to CntX do
         begin
@@ -14855,8 +14886,8 @@ begin
 
   for CntY := 0 to MaxY do
   begin
-    SourceRawPos := Original.GetRawPtr(0, CntY, 0);
-    DestRawPos := GetRawPtr(Padding, CntY + Padding, 0);
+    SourceRawPos := Original.GetRawPtr(0, CntY);
+    DestRawPos := GetRawPtr(Padding, CntY + Padding);
     asm_dword_copy;
   end;
 end;
@@ -14880,8 +14911,8 @@ begin
 
   for CntY := 0 to MaxY do
   begin
-    SourceRawPos := Original.GetRawPtr(0, CntY, 0);
-    DestRawPos := GetRawPtr(PaddingX, CntY + PaddingY, 0);
+    SourceRawPos := Original.GetRawPtr(0, CntY);
+    DestRawPos := GetRawPtr(PaddingX, CntY + PaddingY);
     asm_dword_copy;
   end;
 end;
