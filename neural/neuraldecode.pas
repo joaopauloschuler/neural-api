@@ -293,6 +293,11 @@ type
   // of producing an all-zero row (whose argmax would degenerate to token 0).
   // Coded by Claude (AI).
   TNNetTokenConstraint = class(TObject)
+    private
+      // Lazily-sized scratch reused across MaskAllowed calls (rule #17): a
+      // vocab-size membership buffer, grown only when a larger row is seen,
+      // never re-allocated per token.
+      FAllowedBuf: array of boolean;
     public
       // Called once at the start of generation with the prompt token ids so
       // stateful constraints can start a fresh sequence. Default: no-op.
@@ -582,6 +587,10 @@ type
       FScratch: array of array of integer;
       FScratchLen: array of integer;
       FScratchCount: integer;
+      // Persistent per-char advance buffer (rule #17): FeedChar is not
+      // re-entrant, so one lazily-sized buffer serves every matched stack
+      // instead of a fresh SetLength per (stack, char, probed token).
+      FAdvBuf: array of integer;
       function PackPos(Rule, Idx: integer): integer;
       procedure UnpackPos(Pos: integer; out Rule, Idx: integer);
       // Pushes a stack (copy of Src[0..Len-1] then descends rule refs so the
@@ -754,6 +763,9 @@ type
       FNGramSize: integer;
       FHistory: TNeuralIntegerArray;
       FLen: integer;
+      // Rule #17: persistent vocab-size ban buffer, lazily grown, cleared
+      // per call with FillChar - never re-allocated per token.
+      FBanBuf: array of boolean;
       procedure AppendToken(TokenId: integer);
     public
       constructor Create(pNGramSize: integer);
@@ -928,6 +940,9 @@ type
       FCount: integer;
       FHistory: TNeuralIntegerArray;
       FLen: integer;
+      // Rule #17: persistent vocab-size scale buffer, lazily grown, re-primed
+      // to 1.0 per call - never re-allocated per token.
+      FScaleBuf: TNeuralFloatDynArr;
       procedure AppendToken(TokenId: integer);
     public
       constructor Create();
@@ -2341,7 +2356,7 @@ begin
     // Materialise this frame's probabilities (exp the log-probs if needed).
     ScoreBase := Scores.GetRawPos(ti, 0, 0);
     for k := 0 to VocabM1 do
-      if LogInput then Prob[k] := Exp(Scores.FData[ScoreBase + k])
+      if LogInput then Prob[k] := NeuralExp(Scores.FData[ScoreBase + k])
       else Prob[k] := Scores.FData[ScoreBase + k];
 
     SetLength(Next, 0);
@@ -2476,18 +2491,18 @@ end;
 procedure TNNetTokenConstraint.MaskAllowed(Probs: TNNetVolume);
 var
   I, SizeM1: integer;
-  AllowedMass: TNeuralFloat;
-  Allowed: array of boolean;
+  AllowedMass, InvMass: TNeuralFloat;
   AnyBlocked: boolean;
 begin
-  SetLength(Allowed, Probs.Size);
+  // Rule #17: lazily grow the persistent membership buffer, never per call.
+  if Length(FAllowedBuf) < Probs.Size then SetLength(FAllowedBuf, Probs.Size);
   SizeM1 := Probs.Size - 1;
   AllowedMass := 0;
   AnyBlocked := false;
   for I := 0 to SizeM1 do
   begin
-    Allowed[I] := TokenAllowed(I);
-    if Allowed[I]
+    FAllowedBuf[I] := TokenAllowed(I);
+    if FAllowedBuf[I]
     then AllowedMass := AllowedMass + Probs.Raw[I]
     else AnyBlocked := true;
   end;
@@ -2497,9 +2512,10 @@ begin
   // row untouched so the step degrades to unconstrained sampling instead of
   // an all-zero row whose argmax would degenerate to token 0.
   if AllowedMass <= 0 then exit;
+  InvMass := 1.0 / AllowedMass;
   for I := 0 to SizeM1 do
-    if Allowed[I]
-    then Probs.Raw[I] := Probs.Raw[I] / AllowedMass
+    if FAllowedBuf[I]
+    then Probs.Raw[I] := Probs.Raw[I] * InvMass
     else Probs.Raw[I] := 0;
 end;
 
@@ -3457,8 +3473,6 @@ end;
 
 procedure TNNetGrammarMachine.AddStackRaw(const Src: array of integer;
   Len: integer);
-var
-  J, LenM1: integer;
 begin
   if ScratchHas(Src, Len) then exit;
   if FScratchCount >= Length(FScratch) then
@@ -3468,8 +3482,9 @@ begin
   end;
   if Length(FScratch[FScratchCount]) < Len then
     SetLength(FScratch[FScratchCount], Len + 8);
-  LenM1 := Len - 1;
-  for J := 0 to LenM1 do FScratch[FScratchCount][J] := Src[J];
+  // Contiguous integer copy -> Move (rule #13 / App. C).
+  if Len > 0 then
+    Move(Src[0], FScratch[FScratchCount][0], Len * csIntegerSize);
   FScratchLen[FScratchCount] := Len;
   Inc(FScratchCount);
 end;
@@ -3483,12 +3498,12 @@ procedure TNNetGrammarMachine.AddStackExpanded(const Src: array of integer;
 var
   Work: array of integer;
   WLen: integer;
-  TopPos, Rule, Idx, RefRule, ContPos, K, LenM1: integer;
+  TopPos, Rule, Idx, RefRule, ContPos: integer;
   Body: TNNetGrammarElemArray;
 begin
   SetLength(Work, Len + 8);
-  LenM1 := Len - 1;
-  for K := 0 to LenM1 do Work[K] := Src[K];
+  // Contiguous integer copy -> Move (rule #13 / App. C).
+  if Len > 0 then Move(Src[0], Work[0], Len * csIntegerSize);
   WLen := Len;
 
   if WLen = 0 then
@@ -3529,13 +3544,13 @@ procedure TNNetGrammarMachine.PushRuleAlternates(const Base: array of integer;
 // getEnd, which AddStackExpanded pops to continue with Base.
 var
   Work: array of integer;
-  AltIdx, K, BaseLenM1: integer;
+  AltIdx, K: integer;
   RefBody: TNNetGrammarElemArray;
 begin
   RefBody := FGrammar.FRules[RuleIdx];
   SetLength(Work, BaseLen + 1);
-  BaseLenM1 := BaseLen - 1;
-  for K := 0 to BaseLenM1 do Work[K] := Base[K];
+  // Contiguous integer copy -> Move (rule #13 / App. C).
+  if BaseLen > 0 then Move(Base[0], Work[0], BaseLen * csIntegerSize);
   AltIdx := 0;
   while true do
   begin
@@ -3551,7 +3566,7 @@ end;
 
 procedure TNNetGrammarMachine.CommitScratchToActive();
 var
-  I, J, FScratchCountM1, ScratchLenM1: integer;
+  I, FScratchCountM1: integer;
 begin
   if Length(FStacks) < FScratchCount then
   begin
@@ -3563,8 +3578,9 @@ begin
   begin
     if Length(FStacks[I]) < FScratchLen[I] then
       SetLength(FStacks[I], FScratchLen[I] + 8);
-    ScratchLenM1 := FScratchLen[I] - 1;
-    for J := 0 to ScratchLenM1 do FStacks[I][J] := FScratch[I][J];
+    // Contiguous integer copy -> Move (rule #13 / App. C).
+    if FScratchLen[I] > 0 then
+      Move(FScratch[I][0], FStacks[I][0], FScratchLen[I] * csIntegerSize);
     FStackLen[I] := FScratchLen[I];
   end;
   FStackCount := FScratchCount;
@@ -3584,7 +3600,7 @@ end;
 
 procedure TNNetGrammarMachine.CopyFrom(Source: TNNetGrammarMachine);
 var
-  I, J, SrcStackCountM1, SrcStackLenM1: integer;
+  I, SrcStackCountM1: integer;
 begin
   FGrammar := Source.FGrammar;
   if Length(FStacks) < Source.FStackCount then
@@ -3597,9 +3613,10 @@ begin
   begin
     if Length(FStacks[I]) < Source.FStackLen[I] then
       SetLength(FStacks[I], Source.FStackLen[I] + 8);
-    SrcStackLenM1 := Source.FStackLen[I] - 1;
-    for J := 0 to SrcStackLenM1 do
-      FStacks[I][J] := Source.FStacks[I][J];
+    // Contiguous integer copy -> Move (rule #13 / App. C).
+    if Source.FStackLen[I] > 0 then
+      Move(Source.FStacks[I][0], FStacks[I][0],
+        Source.FStackLen[I] * csIntegerSize);
     FStackLen[I] := Source.FStackLen[I];
   end;
   FStackCount := Source.FStackCount;
@@ -3636,22 +3653,24 @@ end;
 
 function TNNetGrammarMachine.FeedChar(C: char): boolean;
 var
-  I, TopPos, Rule, Idx, FStackCountM1: integer;
-  Adv: array of integer;
+  I, TopPos, Rule, Idx, FStackCountM1, StkLen: integer;
 begin
   FScratchCount := 0;
   FStackCountM1 := FStackCount - 1;
   for I := 0 to FStackCountM1 do
   begin
-    if FStackLen[I] = 0 then continue; // a completed stack accepts nothing
-    TopPos := FStacks[I][FStackLen[I] - 1];
+    StkLen := FStackLen[I];
+    if StkLen = 0 then continue; // a completed stack accepts nothing
+    TopPos := FStacks[I][StkLen - 1];
     if ElemMatches(TopPos, C) then
     begin
       UnpackPos(TopPos, Rule, Idx);
-      SetLength(Adv, FStackLen[I]);
-      Move(FStacks[I][0], Adv[0], FStackLen[I] * csIntegerSize);
-      Adv[FStackLen[I] - 1] := PackPos(Rule, Idx + 1);
-      AddStackExpanded(Adv, FStackLen[I]);
+      // Rule #17: reuse the persistent advance buffer (FeedChar is not
+      // re-entrant) instead of a fresh SetLength per matched stack.
+      if Length(FAdvBuf) < StkLen then SetLength(FAdvBuf, StkLen + 8);
+      Move(FStacks[I][0], FAdvBuf[0], StkLen * csIntegerSize);
+      FAdvBuf[StkLen - 1] := PackPos(Rule, Idx + 1);
+      AddStackExpanded(FAdvBuf, StkLen);
     end;
   end;
   Result := FScratchCount > 0;
@@ -4354,7 +4373,7 @@ end;
 procedure TNNetTemperatureProcessor.ProcessRow(Row: TNNetVolume);
 var
   I, SizeM1: integer;
-  T, MaxP, LogMaxP, Sum: TNeuralFloat;
+  T, MaxP, LogMaxP, Sum, InvT: TNeuralFloat;
 begin
   T := FTemperature;
   // Temperature 1.0 is a bit-for-bit no-op (p^(1/1) renormalized would
@@ -4373,15 +4392,15 @@ begin
   // element maps to exactly 1 and nothing overflows; with T at the clamp the
   // row degenerates to one-hot argmax (greedy).
   LogMaxP := SafeLogProb(MaxP);
+  InvT := 1.0 / T;
   Sum := 0;
   for I := 0 to SizeM1 do
   begin
-    Row.Raw[I] := Exp((SafeLogProb(Row.Raw[I]) - LogMaxP) / T);
+    Row.Raw[I] := NeuralExp((SafeLogProb(Row.Raw[I]) - LogMaxP) * InvT);
     Sum := Sum + Row.Raw[I];
   end;
   // Sum >= 1 by construction (the max element contributes exactly 1).
-  for I := 0 to SizeM1 do
-    Row.Raw[I] := Row.Raw[I] / Sum;
+  Row.Mul(1.0 / Sum);
 end;
 
 { TNNetPenaltyProcessor }
@@ -4490,8 +4509,7 @@ var
   I, J, K, Size, SuffixStart, Last, NM1, Banned: integer;
   SizeM1, SuffixStartM1, NM1M1: integer;
   Match: boolean;
-  KeptMass: TNeuralFloat;
-  Ban: array of boolean;
+  KeptMass, InvKept: TNeuralFloat;
 begin
   // OFF: an n-gram of size <= 1 has no (n-1)-suffix to key on.
   if FNGramSize <= 1 then exit;
@@ -4503,8 +4521,8 @@ begin
   if FLen < FNGramSize then exit;
   Size := Row.Size;
   SizeM1 := Size - 1;
-  SetLength(Ban, Size);
-  for I := 0 to SizeM1 do Ban[I] := false;
+  if Length(FBanBuf) < Size then SetLength(FBanBuf, Size);
+  FillChar(FBanBuf[0], Size * SizeOf(boolean), 0);
   // Current (n-1)-token suffix is the LAST NM1 tokens of the history.
   SuffixStart := FLen - NM1;
   SuffixStartM1 := SuffixStart - 1;
@@ -4529,9 +4547,9 @@ begin
     if Match then
     begin
       Last := FHistory[J + NM1];
-      if (Last >= 0) and (Last < Size) and (not Ban[Last]) then
+      if (Last >= 0) and (Last < Size) and (not FBanBuf[Last]) then
       begin
-        Ban[Last] := true;
+        FBanBuf[Last] := true;
         Inc(Banned);
       end;
     end;
@@ -4543,11 +4561,12 @@ begin
   // the row UNTOUCHED, mirroring MaskAllowed.
   KeptMass := 0;
   for I := 0 to SizeM1 do
-    if not Ban[I] then KeptMass := KeptMass + Row.Raw[I];
+    if not FBanBuf[I] then KeptMass := KeptMass + Row.Raw[I];
   if KeptMass <= 0 then exit;
+  InvKept := 1.0 / KeptMass;
   for I := 0 to SizeM1 do
-    if Ban[I] then Row.Raw[I] := 0
-    else Row.Raw[I] := Row.Raw[I] / KeptMass;
+    if FBanBuf[I] then Row.Raw[I] := 0
+    else Row.Raw[I] := Row.Raw[I] * InvKept;
 end;
 
 procedure TNNetNoRepeatNGramProcessor.Commit(TokenId: integer);
@@ -4638,8 +4657,7 @@ var
   I, K, Len, PrefLen, HistStart, Final, Size: integer;
   SizeM1, FCountM1, PrefLenM1: integer;
   Match: boolean;
-  Factor, KeptMass: TNeuralFloat;
-  Scale: TNeuralFloatDynArr;
+  Factor, KeptMass, InvKept: TNeuralFloat;
 begin
   if FCount = 0 then exit;
   Size := Row.Size;
@@ -4648,8 +4666,8 @@ begin
   // Per-token multiplicative factor (exp of the accumulated additive logit
   // bias), 1.0 = untouched. Biases on the SAME final token ADD in logit space
   // = multiply in probability space, matching HF (which sums into the logit).
-  SetLength(Scale, Size);
-  for I := 0 to SizeM1 do Scale[I] := 1.0;
+  if Length(FScaleBuf) < Size then SetLength(FScaleBuf, Size);
+  for I := 0 to SizeM1 do FScaleBuf[I] := 1.0;
   for I := 0 to FCountM1 do
   begin
     Len := Length(FSequences[I]);
@@ -4673,9 +4691,9 @@ begin
     // exp(csSequenceBiasBanBias) underflows to exactly 0 (the hard-ban image);
     // a finite bias scales the probability by exp(bias).
     if FBiases[I] <= csSequenceBiasBanBias then
-      Scale[Final] := 0
+      FScaleBuf[Final] := 0
     else
-      Scale[Final] := Scale[Final] * Exp(FBiases[I]);
+      FScaleBuf[Final] := FScaleBuf[Final] * Exp(FBiases[I]);
   end;
   // Probability-domain realization of "logit += bias": p *= exp(bias), then
   // renormalize. Compute the scaled mass FIRST (without mutating Row) so the
@@ -4683,13 +4701,14 @@ begin
   // convention) instead of emitting a degenerate all-zero distribution.
   KeptMass := 0;
   for I := 0 to SizeM1 do
-    KeptMass := KeptMass + Row.Raw[I] * Scale[I];
+    KeptMass := KeptMass + Row.Raw[I] * FScaleBuf[I];
   if KeptMass <= 0 then exit;
+  InvKept := 1.0 / KeptMass;
   for I := 0 to SizeM1 do
   begin
-    Factor := Scale[I];
+    Factor := FScaleBuf[I];
     if Factor <> 1.0 then Row.Raw[I] := Row.Raw[I] * Factor;
-    Row.Raw[I] := Row.Raw[I] / KeptMass;
+    Row.Raw[I] := Row.Raw[I] * InvKept;
   end;
 end;
 
@@ -4716,6 +4735,27 @@ begin
 end;
 {$POP}
 
+// Green-list membership for a token given the ALREADY-COMPUTED per-step seed
+// (= WatermarkSplitMix64(UInt32(PrevToken) xor Key)). Factored out so a caller
+// scanning the whole vocab for one (PrevToken, Key) can hoist that first mix
+// out of the loop instead of repeating it per token. The Seed+TokenId sum
+// wraps around UInt64 by design; checks stay off (debug -Co safe).
+{$PUSH}
+{$Q-}{$R-}
+function WatermarkGreenFromSeed(Seed: UInt64; TokenId: integer;
+  Gamma: TNeuralFloat): boolean;
+var
+  H: UInt64;
+  Frac: double;
+begin
+  H := WatermarkSplitMix64(Seed + UInt64(UInt32(TokenId)));
+  // Top 53 bits -> uniform double in [0,1) (mirrors the std double-from-u64
+  // trick; avoids the low-bit non-uniformity of a plain modulo).
+  Frac := (H shr 11) * (1.0 / 9007199254740992.0); // 2^53
+  Result := Frac < Gamma;
+end;
+{$POP}
+
 constructor TNNetWatermarkLogitsProcessor.Create(pKey: UInt64;
   pGamma: TNeuralFloat = 0.25; pDelta: TNeuralFloat = 2.0);
 begin
@@ -4733,19 +4773,14 @@ end;
 class function TNNetWatermarkLogitsProcessor.IsGreen(pKey: UInt64;
   PrevToken, TokenId: integer; Gamma: TNeuralFloat): boolean;
 var
-  Seed, H: UInt64;
-  Frac: double;
+  Seed: UInt64;
 begin
   // Seed the per-step PRNG from the previous token XOR the key (the h=1
   // "left-hash" rule of Kirchenbauer et al.); mixing once decorrelates
   // adjacent seeds. The token id is folded in and finalized so each token's
   // membership is an independent uniform draw in [0,1); green iff below Gamma.
   Seed := WatermarkSplitMix64(UInt64(UInt32(PrevToken)) xor pKey);
-  H := WatermarkSplitMix64(Seed + UInt64(UInt32(TokenId)));
-  // Top 53 bits -> uniform double in [0,1) (mirrors the std double-from-u64
-  // trick; avoids the low-bit non-uniformity of a plain modulo).
-  Frac := (H shr 11) * (1.0 / 9007199254740992.0); // 2^53
-  Result := Frac < Gamma;
+  Result := WatermarkGreenFromSeed(Seed, TokenId, Gamma);
 end;
 {$POP}
 
@@ -4762,6 +4797,7 @@ procedure TNNetWatermarkLogitsProcessor.ProcessRow(Row: TNNetVolume);
 var
   I, SizeM1: integer;
   ExpDelta, Sum: TNeuralFloat;
+  Seed: UInt64;
 begin
   // Delta = 0 (or a degenerate non-positive bias) is a no-op.
   if FDelta <= 0 then exit;
@@ -4770,19 +4806,21 @@ begin
   // a logit scales its softmax numerator by exp(Delta); the partition cancels
   // in the ratio, so renormalizing the post-softmax row reproduces it exactly.)
   ExpDelta := Exp(FDelta);
+  // The per-step PRNG seed depends only on (FPrevToken, FKey) - invariant
+  // across the vocab - so mix it once here instead of inside IsGreen per token.
+  Seed := WatermarkSplitMix64(UInt64(UInt32(FPrevToken)) xor FKey);
   Sum := 0;
   SizeM1 := Row.Size - 1;
   for I := 0 to SizeM1 do
   begin
-    if IsGreen(FKey, FPrevToken, I, FGamma) then
+    if WatermarkGreenFromSeed(Seed, I, FGamma) then
       Row.Raw[I] := Row.Raw[I] * ExpDelta;
     Sum := Sum + Row.Raw[I];
   end;
   // Defensive: an all-zero row (no probability mass) is left untouched,
   // mirroring the temperature/constraint zero-mass fallback.
   if Sum <= 0 then exit;
-  for I := 0 to SizeM1 do
-    Row.Raw[I] := Row.Raw[I] / Sum;
+  Row.Mul(1.0 / Sum);
 end;
 
 procedure TNNetWatermarkLogitsProcessor.Commit(TokenId: integer);
@@ -4955,11 +4993,11 @@ begin
   Sum := 0;
   for I := 0 to SizeM1 do
   begin
-    Row.Raw[I] := Exp(Row.Raw[I] - MaxL);
+    Row.Raw[I] := NeuralExp(Row.Raw[I] - MaxL);
     Sum := Sum + Row.Raw[I];
   end;
   if Sum > 0 then
-    for I := 0 to SizeM1 do Row.Raw[I] := Row.Raw[I] / Sum;
+    Row.Mul(1.0 / Sum);
 end;
 
 procedure TNNetCFGProcessor.Commit(TokenId: integer);
@@ -6470,10 +6508,10 @@ function DecodeEarlyExitSelfSpeculative(NN: TNNet; const Prompt: string;
   ExitLayer: integer; Confidence: TNeuralFloat;
   HeadStartIdx: integer): TNNetDecodeResult;
 var
-  InputVolume, OutputVolume, ExitSnap: TNNetVolume;
+  InputVolume, OutputVolume, ExitSnap, ExitOut: TNNetVolume;
   VocabSize, Step, I, HeadIdx, HeadInIdx, LastLayer, ResolvedExit: integer;
   FullBest, ExitBest, StopLen, VocabSizeM1: integer;
-  Total, MaxFinal, MaxExit, Pf: TNeuralFloat;
+  Total, MaxFinal, MaxExit, Pf, V: TNeuralFloat;
   Context: string;
   Confident: boolean;
 begin
@@ -6488,7 +6526,7 @@ begin
   // Resolve the intermediate exit layer. It must sit BELOW the head input so
   // its activation can be spliced through the LM head. Auto = midpoint.
   if ExitLayer < 0 then
-    ResolvedExit := HeadInIdx div 2
+    ResolvedExit := HeadInIdx shr 1  // div 2; HeadInIdx is a non-negative index
   else
     ResolvedExit := ExitLayer;
   if ResolvedExit < 1 then ResolvedExit := 1;
@@ -6536,16 +6574,20 @@ begin
         ExitSnap.Copy(NN.Layers[ResolvedExit].Output);
         NN.Layers[HeadInIdx].Output.CopyNoChecks(ExitSnap);
         for I := HeadIdx to LastLayer do NN.Layers[I].Compute();
-        Total := NN.GetLastLayer().Output.GetSum();
+        ExitOut := NN.GetLastLayer().Output;  // invariant across the scan (#8)
+        Total := ExitOut.GetSum();
         if Total <= 0 then Total := 1.0;
         ExitBest := 0;
-        MaxExit := NN.GetLastLayer().Output.Raw[0];
+        MaxExit := ExitOut.Raw[0];
         for I := 1 to VocabSizeM1 do
-          if NN.GetLastLayer().Output.Raw[I] > MaxExit then
+        begin
+          V := ExitOut.Raw[I];
+          if V > MaxExit then
           begin
-            MaxExit := NN.GetLastLayer().Output.Raw[I];
+            MaxExit := V;
             ExitBest := I;
           end;
+        end;
         MaxExit := MaxExit / Total;
         if MaxExit < 0 then MaxExit := 0;
 
@@ -6637,7 +6679,7 @@ begin
   if Mode = dlbFull then Exit;
   // Split the depth-ordered candidates at the midpoint and keep one half.
   Total := N;
-  Half := Total div 2;
+  Half := Total shr 1;  // div 2; Total = N is a non-negative count
   case Mode of
     dlbLow:  begin Lo := 0;    Hi := Half - 1; end;
     dlbHigh: begin Lo := Half; Hi := Total - 1; end;
@@ -6669,12 +6711,13 @@ function DecodeDoLa(NN: TNNet; const Prompt: string;
   HeadStartIdx: integer): TNNetDecodeResult;
 var
   InputVolume, OutputVolume: TNNetVolume;
-  CandSnap: TNNetVolume;
+  CandSnap, LensOut: TNNetVolume;
   PFinal, PLens, MFinalLens: array of TNeuralFloat;  // distributions + 0.5(p+q)
   Cands: TNeuralIntegerArray;
   VocabSize, Step, I, C, L, HeadIdx, HeadInIdx, LastLayer: integer;
   NumCand, BestLayer, Best, StopLen, VocabSizeM1, NumCandM1: integer;
   Total, MaxFinal, Threshold, JS, BestJS, Pf, Pl, Pm, ScoreV, BestScore: TNeuralFloat;
+  InvTotal: TNeuralFloat;
   Context: string;
   HaveContrast: boolean;
 const
@@ -6744,13 +6787,15 @@ begin
           CandSnap.Copy(NN.Layers[L].Output);
           NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
           for I := HeadIdx to LastLayer do NN.Layers[I].Compute();
-          Total := NN.GetLastLayer().Output.GetSum();
+          LensOut := NN.GetLastLayer().Output;  // invariant across the loop (#8)
+          Total := LensOut.GetSum();
           if Total <= 0 then Total := 1.0;
+          InvTotal := 1.0 / Total;
           // JS(p_final || p_lens) = 0.5 KL(p||m) + 0.5 KL(q||m), m = 0.5(p+q).
           JS := 0;
           for I := 0 to VocabSizeM1 do
           begin
-            Pl := NN.GetLastLayer().Output.Raw[I] / Total;
+            Pl := LensOut.Raw[I] * InvTotal;
             if Pl < 0 then Pl := 0;
             PLens[I] := Pl;
             MFinalLens[I] := 0.5 * (PFinal[I] + Pl);
@@ -6774,11 +6819,13 @@ begin
         CandSnap.Copy(NN.Layers[BestLayer].Output);
         NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
         for I := HeadIdx to LastLayer do NN.Layers[I].Compute();
-        Total := NN.GetLastLayer().Output.GetSum();
+        LensOut := NN.GetLastLayer().Output;  // invariant across the loop (#8)
+        Total := LensOut.GetSum();
         if Total <= 0 then Total := 1.0;
+        InvTotal := 1.0 / Total;
         for I := 0 to VocabSizeM1 do
         begin
-          Pl := NN.GetLastLayer().Output.Raw[I] / Total;
+          Pl := LensOut.Raw[I] * InvTotal;
           if Pl < 0 then Pl := 0;
           PLens[I] := Pl;
         end;
@@ -7158,13 +7205,13 @@ function DecodeBeamSearchAll(NN: TNNet; const Prompt: string;
 var
   InputVolume, OutputVolume: TNNetVolume;
   LogProbs: array of TNeuralFloat;
-  VocabSize, Step, I, T, B: integer;
+  VocabSize, Step, I, T, B, LenB: integer;
   VocabSizeM1, LiveHi, FinishedHi: integer;
   Live: TBeamArray;      // still-growing beams
   Finished: TBeamArray;  // beams that emitted EOS
   Cand: TBeamArray;      // expansion candidates for this step
   NewBeam: TBeam;
-  CutScore: TNeuralFloat;
+  CutScore, InvDenFin, InvDenExt: TNeuralFloat;
   AllDominated: boolean;
 begin
   if BeamWidth < 1 then BeamWidth := 1;
@@ -7210,6 +7257,13 @@ begin
       begin
         NextLogProbs(NN, Prompt + Live[B].Text,
           InputVolume, OutputVolume, LogProbs);
+        // The penalty denominator depends only on the beam text length, which is
+        // fixed across the vocab loop: LenB for the EOS branch (text unchanged),
+        // LenB+1 for the extend branch (Chr(T) is always exactly one char). Hoist
+        // both Power() reciprocals out of the T loop (#5).
+        LenB := Length(Live[B].Text);
+        InvDenFin := 1.0 / LengthPenaltyDenominator(LenB, LengthPenalty);
+        InvDenExt := 1.0 / LengthPenaltyDenominator(LenB + 1, LengthPenalty);
         for T := 0 to VocabSizeM1 do
         begin
           NewBeam.SumLogProb := Live[B].SumLogProb + LogProbs[T];
@@ -7217,8 +7271,7 @@ begin
           begin
             NewBeam.Text := Live[B].Text;
             NewBeam.Finished := True;
-            NewBeam.Score := NewBeam.SumLogProb /
-              LengthPenaltyDenominator(Length(NewBeam.Text), LengthPenalty);
+            NewBeam.Score := NewBeam.SumLogProb * InvDenFin;
             SetLength(Finished, Length(Finished) + 1);
             Finished[High(Finished)] := NewBeam;
           end
@@ -7226,8 +7279,7 @@ begin
           begin
             NewBeam.Text := Live[B].Text + Chr(T);
             NewBeam.Finished := False;
-            NewBeam.Score := NewBeam.SumLogProb /
-              LengthPenaltyDenominator(Length(NewBeam.Text), LengthPenalty);
+            NewBeam.Score := NewBeam.SumLogProb * InvDenExt;
             SetLength(Cand, Length(Cand) + 1);
             Cand[High(Cand)] := NewBeam;
           end;
@@ -7333,7 +7385,7 @@ function DecodeBeamSearchCachedAll(Session: TNNetStreamingDecoder;
 var
   InV, Row: TNNetVolume;
   LogProbs: array of TNeuralFloat;
-  VocabSize, PromptLen, Step, I, T, B, Pos: integer;
+  VocabSize, PromptLen, Step, I, T, B, Pos, LenB: integer;
   VocabSizeM1, LiveHi, CandHi, FinishedHi, FinSurvivorsHi, PromptLenM2: integer;
   Live: TCachedBeamArray;      // still-growing beams (each owns a Snap)
   Finished: TBeamArray;        // finished beams (Score-ranked, cache-free)
@@ -7342,7 +7394,7 @@ var
   NewC: TCachedCandidate;
   FinB: TBeam;
   NewLive: TCachedBeamArray;
-  CutScore, Total: TNeuralFloat;
+  CutScore, Total, InvTotal, InvDenFin, InvDenExt: TNeuralFloat;
   AllDominated: boolean;
   FinSurvivors: TBeamArray;
 
@@ -7449,11 +7501,17 @@ begin
         Row := Session.Output();
         Total := Row.GetSum();
         if Total <= 0 then Total := 1.0;
+        InvTotal := 1.0 / Total;
         for I := 0 to VocabSizeM1 do
-          LogProbs[I] := SafeLogProb(Row.Raw[I] / Total);
+          LogProbs[I] := SafeLogProb(Row.Raw[I] * InvTotal);
         // Snapshot the cache-through-LastPos once: it is the shared base for
         // every child of this beam (whose next input sits at LastPos+1).
         BaseAfter[B] := Session.Snapshot();
+        // Penalty denominator is fixed across the vocab loop: LenB for the EOS
+        // branch, LenB+1 for the extend branch (Chr(T) is one char). Hoist (#5).
+        LenB := Length(Live[B].Text);
+        InvDenFin := 1.0 / LengthPenaltyDenominator(LenB, LengthPenalty);
+        InvDenExt := 1.0 / LengthPenaltyDenominator(LenB + 1, LengthPenalty);
         for T := 0 to VocabSizeM1 do
         begin
           if T = csDecodeEOSToken then
@@ -7461,8 +7519,7 @@ begin
             FinB.SumLogProb := Live[B].SumLogProb + LogProbs[T];
             FinB.Text := Live[B].Text;
             FinB.Finished := True;
-            FinB.Score := FinB.SumLogProb /
-              LengthPenaltyDenominator(Length(FinB.Text), LengthPenalty);
+            FinB.Score := FinB.SumLogProb * InvDenFin;
             SetLength(Finished, Length(Finished) + 1);
             Finished[High(Finished)] := FinB;
           end
@@ -7470,8 +7527,7 @@ begin
           begin
             NewC.SumLogProb := Live[B].SumLogProb + LogProbs[T];
             NewC.Text := Live[B].Text + Chr(T);
-            NewC.Score := NewC.SumLogProb /
-              LengthPenaltyDenominator(Length(NewC.Text), LengthPenalty);
+            NewC.Score := NewC.SumLogProb * InvDenExt;
             NewC.ParentIdx := B;
             NewC.LastToken := T;             // future input char
             NewC.LastPos := Live[B].LastPos + 1;
@@ -7571,14 +7627,14 @@ var
   InputVolume, OutputVolume: TNNetVolume;
   LogProbs: array of TNeuralFloat;
   TokenTaken: array of integer;   // per-token collision count, this step
-  VocabSize, Step, I, T, B, GroupSize, G, GroupLo, GroupHi: integer;
+  VocabSize, Step, I, T, B, GroupSize, G, GroupLo, GroupHi, LenB: integer;
   VocabSizeM1, NumGroupsM1, CandHi, LiveHi, FinishedHi: integer;
   Live: TBeamArray;      // still-growing beams, contiguous by group
   NewLive: TBeamArray;   // frontier being assembled this step
   Finished: TBeamArray;  // beams that emitted EOS
   Cand: TBeamArray;      // expansion candidates for the CURRENT group
   NewBeam: TBeam;
-  Pen: TNeuralFloat;
+  Pen, InvDenFin, InvDenExt: TNeuralFloat;
 begin
   if BeamWidth < 1 then BeamWidth := 1;
   if NumGroups < 1 then NumGroups := 1;
@@ -7637,6 +7693,11 @@ begin
         begin
           NextLogProbs(NN, Prompt + Live[B].Text,
             InputVolume, OutputVolume, LogProbs);
+          // Denominator fixed across the vocab loop: LenB (EOS) / LenB+1 (extend,
+          // Chr(T) is one char). Hoist both Power() reciprocals out (#5).
+          LenB := Length(Live[B].Text);
+          InvDenFin := 1.0 / LengthPenaltyDenominator(LenB, LengthPenalty);
+          InvDenExt := 1.0 / LengthPenaltyDenominator(LenB + 1, LengthPenalty);
           for T := 0 to VocabSizeM1 do
           begin
             NewBeam.SumLogProb := Live[B].SumLogProb + LogProbs[T];
@@ -7644,8 +7705,7 @@ begin
             begin
               NewBeam.Text := Live[B].Text;
               NewBeam.Finished := True;
-              NewBeam.Score := NewBeam.SumLogProb /
-                LengthPenaltyDenominator(Length(NewBeam.Text), LengthPenalty);
+              NewBeam.Score := NewBeam.SumLogProb * InvDenFin;
               SetLength(Finished, Length(Finished) + 1);
               Finished[High(Finished)] := NewBeam;
             end
@@ -7656,9 +7716,7 @@ begin
               // Length-penalised base score, minus the diversity penalty for
               // collisions with earlier groups at THIS step (g=0: no penalty).
               Pen := Diversity * TokenTaken[T];
-              NewBeam.Score := NewBeam.SumLogProb /
-                LengthPenaltyDenominator(Length(NewBeam.Text), LengthPenalty)
-                - Pen;
+              NewBeam.Score := NewBeam.SumLogProb * InvDenExt - Pen;
               SetLength(Cand, Length(Cand) + 1);
               Cand[High(Cand)] := NewBeam;
             end;
@@ -7820,7 +7878,7 @@ function DecodeConstrainedBeamSearchAll(NN: TNNet; const Prompt: string;
 var
   InputVolume, OutputVolume: TNNetVolume;
   LogProbs: array of TNeuralFloat;
-  VocabSize, Step, I, T, B, RealForced, BestProg, KeptProg: integer;
+  VocabSize, Step, I, T, B, RealForced, BestProg, KeptProg, LenB: integer;
   VocabSizeM1, ForceTokensHi, LiveHi, CandHi, FinishedHi, NeededLen,
     BeamWidthM1: integer;
   Live: TBeamArray;
@@ -7828,6 +7886,7 @@ var
   Cand: TBeamArray;
   NewBeam: TBeam;
   Needed: string;
+  InvDenFin, InvDenExt: TNeuralFloat;
 begin
   if BeamWidth < 1 then BeamWidth := 1;
   BeamWidthM1 := BeamWidth - 1;
@@ -7870,14 +7929,18 @@ begin
         // makes progress toward every phrase always exists in the pool.
         Needed := NeededNextChars(Live[B].Text, ForceTokens);
         NeededLen := Length(Needed);
+        // Denominator fixed across both vocab passes for this beam: LenB (EOS,
+        // text unchanged) / LenB+1 (extend, one appended char). Hoist (#5).
+        LenB := Length(Live[B].Text);
+        InvDenFin := 1.0 / LengthPenaltyDenominator(LenB, LengthPenalty);
+        InvDenExt := 1.0 / LengthPenaltyDenominator(LenB + 1, LengthPenalty);
         for I := 1 to NeededLen do
         begin
           T := Ord(Needed[I]);
           NewBeam.SumLogProb := Live[B].SumLogProb + LogProbs[T];
           NewBeam.Text := Live[B].Text + Chr(T);
           NewBeam.Finished := False;
-          NewBeam.Score := NewBeam.SumLogProb /
-            LengthPenaltyDenominator(Length(NewBeam.Text), LengthPenalty);
+          NewBeam.Score := NewBeam.SumLogProb * InvDenExt;
           SetLength(Cand, Length(Cand) + 1);
           Cand[High(Cand)] := NewBeam;
         end;
@@ -7892,8 +7955,7 @@ begin
               Continue;
             NewBeam.Text := Live[B].Text;
             NewBeam.Finished := True;
-            NewBeam.Score := NewBeam.SumLogProb /
-              LengthPenaltyDenominator(Length(NewBeam.Text), LengthPenalty);
+            NewBeam.Score := NewBeam.SumLogProb * InvDenFin;
             SetLength(Finished, Length(Finished) + 1);
             Finished[High(Finished)] := NewBeam;
           end
@@ -7904,8 +7966,7 @@ begin
             if Pos(Chr(T), Needed) > 0 then Continue;
             NewBeam.Text := Live[B].Text + Chr(T);
             NewBeam.Finished := False;
-            NewBeam.Score := NewBeam.SumLogProb /
-              LengthPenaltyDenominator(Length(NewBeam.Text), LengthPenalty);
+            NewBeam.Score := NewBeam.SumLogProb * InvDenExt;
             SetLength(Cand, Length(Cand) + 1);
             Cand[High(Cand)] := NewBeam;
           end;
@@ -8197,7 +8258,7 @@ var
   EncSeqLen, DecSeqLen, VocabSize: integer;
   EncSeqLenM1, DecSeqLenM1, VocabSizeM1: integer;
   CurLen, Pos, T, Next, Base: integer;
-  MaxLogit, SumExp: TNeuralFloat;
+  MaxLogit, SumExp, InvT, V: TNeuralFloat;
 begin
   SetLength(Result, 0);
   if MaxNewTokens < 1 then exit;
@@ -8252,18 +8313,20 @@ begin
         Base := (CurLen - 1) * VocabSize;
         MaxLogit := Logits.FData[Base];
         for T := 1 to VocabSizeM1 do
-          if Logits.FData[Base + T] > MaxLogit then
-            MaxLogit := Logits.FData[Base + T];
+        begin
+          V := Logits.FData[Base + T];
+          if V > MaxLogit then MaxLogit := V;
+        end;
+        InvT := 1.0 / Temperature;
         SumExp := 0;
         for T := 0 to VocabSizeM1 do
         begin
-          Probs.FData[T] := Exp((Logits.FData[Base + T] - MaxLogit) /
-            Temperature);
+          Probs.FData[T] := NeuralExp((Logits.FData[Base + T] - MaxLogit) *
+            InvT);
           SumExp := SumExp + Probs.FData[T];
         end;
         if SumExp <= 0 then SumExp := 1.0;
-        for T := 0 to VocabSizeM1 do
-          Probs.FData[T] := Probs.FData[T] / SumExp;
+        Probs.Mul(1.0 / SumExp);
         Next := Sampler.GetToken(Probs);
       end;
       SetLength(Result, Length(Result) + 1);
@@ -8324,7 +8387,7 @@ var
   EncSeqLen, DecSeqLen, VocabSize, EffMaxNew: integer;
   EncSeqLenM1, DecSeqLenM1, VocabSizeM1, LiveHi: integer;
   Step, B, T, Pos, PrevLen, Base: integer;
-  MaxLogit, SumExp, CutScore: TNeuralFloat;
+  MaxLogit, SumExp, CutScore, V, InvDenExt: TNeuralFloat;
   AllDominated: boolean;
 begin
   SetLength(Result, 0);
@@ -8410,24 +8473,31 @@ begin
         Base := PrevLen * VocabSize;
         MaxLogit := Logits.FData[Base];
         for T := 1 to VocabSizeM1 do
-          if Logits.FData[Base + T] > MaxLogit then
-            MaxLogit := Logits.FData[Base + T];
+        begin
+          V := Logits.FData[Base + T];
+          if V > MaxLogit then MaxLogit := V;
+        end;
         SumExp := 0;
         for T := 0 to VocabSizeM1 do
-          SumExp := SumExp + Exp(Logits.FData[Base + T] - MaxLogit);
+          SumExp := SumExp + NeuralExp(Logits.FData[Base + T] - MaxLogit);
         if SumExp <= 0 then SumExp := 1.0;
         for T := 0 to VocabSizeM1 do
           LogProbs[T] :=
-            SafeLogProb(Exp(Logits.FData[Base + T] - MaxLogit) / SumExp);
+            SafeLogProb(NeuralExp(Logits.FData[Base + T] - MaxLogit) / SumExp);
+        // PrevLen is fixed across the vocab loop, so the length-penalty
+        // denominator (a Power call) is invariant - compute its reciprocal once.
+        InvDenExt := 1.0 / LengthPenaltyDenominator(PrevLen + 1, LengthPenalty);
         for T := 0 to VocabSizeM1 do
         begin
           NewBeam.SumLogProb := Live[B].SumLogProb + LogProbs[T];
-          NewBeam.Tokens := Copy(Live[B].Tokens, 0, PrevLen);
+          // One allocation instead of Copy(PrevLen)+SetLength(PrevLen+1)'s two
+          // (rule #4/#17): size once, then Move the prefix in.
           SetLength(NewBeam.Tokens, PrevLen + 1);
+          if PrevLen > 0 then
+            Move(Live[B].Tokens[0], NewBeam.Tokens[0], PrevLen * csIntegerSize);
           NewBeam.Tokens[PrevLen] := T; // EOS included, like greedy
           NewBeam.Finished := (T = EOSTokenId);
-          NewBeam.Score := NewBeam.SumLogProb /
-            LengthPenaltyDenominator(PrevLen + 1, LengthPenalty);
+          NewBeam.Score := NewBeam.SumLogProb * InvDenExt;
           if NewBeam.Finished then
           begin
             SetLength(Finished, Length(Finished) + 1);
