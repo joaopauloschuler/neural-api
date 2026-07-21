@@ -41122,6 +41122,7 @@ type
 procedure TEnCodecConvWorker.RunForward(index, threadnum: integer);
 var tStart, tFin, o, t, i, k2: integer; Patch: TNeuralFloatDynArr;
     InChM1, KM1, OutChM1: integer;
+    tS, iK, PatchLen, wBase: integer; PadRow: TNeuralFloatDynArr;
 begin
   // Split the OUTPUT-TIME axis across threads. Every output position (o,t) is
   // independent, so this is race-free - and unlike splitting over output channels
@@ -41137,20 +41138,31 @@ begin
   InChM1 := InCh - 1;
   KM1 := K - 1;
   OutChM1 := OutCh - 1;
+  PatchLen := InCh * K;
   for t := tStart to tFin do
   begin
+    tS := t * Stride;
     for i := 0 to InChM1 do
+    begin
+      iK := i * K;
+      PadRow := Padded[i];
       for k2 := 0 to KM1 do
-        Patch[i * K + k2] := Padded[i][t * Stride + k2 * Dil];
+        Patch[iK + k2] := PadRow[tS + k2 * Dil];
+    end;
+    wBase := 0;
     for o := 0 to OutChM1 do
+    begin
       OutSig[o][t] := B[o] +
-        TNNetVolume.DotProduct(Addr(W[o * InCh * K]), Addr(Patch[0]), InCh * K);
+        TNNetVolume.DotProduct(Addr(W[wBase]), Addr(Patch[0]), PatchLen);
+      Inc(wBase, PatchLen);
+    end;
   end;
 end;
 
 procedure TEnCodecConvWorker.RunTranspose(index, threadnum: integer);
 var oStart, oFin, o, t, k2, idx: integer; Contrib: TNeuralFloat;
     InLenM1, KM1: integer;
+    tInCh, wOfs, wBaseO: integer; FullRow: TNeuralFloatDynArr;
 begin
   TNeuralThreadList.CalculateWorkingRange(index, threadnum, OutCh, oStart, oFin);
   InLenM1 := InLen - 1;
@@ -41162,14 +41174,24 @@ begin
   // into Full[o][idx] matches the original scatter; only the inner i-sum
   // reassociates (AVX, parity < 1e-4). Coded by Claude (AI).
   for o := oStart to oFin do
+  begin
+    FullRow := Full[o];
+    wBaseO := (o * K) * InCh; // (o*K + 0)*InCh
     for t := 0 to InLenM1 do
+    begin
+      tInCh := t * InCh;
+      idx := t * Stride;      // + k2, carried
+      wOfs := wBaseO;         // (o*K + k2)*InCh, carried
       for k2 := 0 to KM1 do
       begin
-        idx := t * Stride + k2;
         Contrib := TNNetVolume.DotProduct(
-          Addr(WT[(o * K + k2) * InCh]), Addr(InT[t * InCh]), InCh);
-        Full[o][idx] := Full[o][idx] + Contrib;
+          Addr(WT[wOfs]), Addr(InT[tInCh]), InCh);
+        FullRow[idx] := FullRow[idx] + Contrib;
+        Inc(wOfs, InCh);
+        Inc(idx);
       end;
+    end;
+  end;
 end;
 
 // Causal Conv1d / ConvTranspose1d on a channel-major signal. Reflect
@@ -41184,6 +41206,8 @@ var
   NFrames, OutLen, idx, FullLen, PadLeft, PadRight, EffK: integer;
   InChM1, OutChM1, KM1, InLenM1: integer;
   PadLeftM1, PadRightM1, OutLenM1, FullLenM1: integer;
+  tS, iK, PatchLen, wBase, tInCh, wOfs, wBaseO: integer;
+  PadRow, FullRow: TNeuralFloatDynArr;
   Acc: TNeuralFloat;
   Padded: TNNetFloatDynArr2D;
   Full: TNNetFloatDynArr2D;
@@ -41309,14 +41333,24 @@ begin
       // reassociation matches the LSTM AVX change (parity < 1e-4, NOT
       // bit-identical to the prior scalar i-major,k2 order). Coded by Claude (AI).
       SetLength(Patch, InCh * K);
+      PatchLen := InCh * K;
       for t := 0 to OutLenM1 do
       begin
+        tS := t * Stride;
         for i := 0 to InChM1 do
+        begin
+          iK := i * K;
+          PadRow := Padded[i];
           for k2 := 0 to KM1 do
-            Patch[i * K + k2] := Padded[i][t * Stride + k2 * Dil];
+            Patch[iK + k2] := PadRow[tS + k2 * Dil];
+        end;
+        wBase := 0;
         for o := 0 to OutChM1 do
+        begin
           OutSig[o][t] := Conv.B[o] +
-            TNNetVolume.DotProduct(Addr(Conv.W[o * InCh * K]), Addr(Patch[0]), InCh * K);
+            TNNetVolume.DotProduct(Addr(Conv.W[wBase]), Addr(Patch[0]), PatchLen);
+          Inc(wBase, PatchLen);
+        end;
       end;
     end;
   end
@@ -41383,14 +41417,24 @@ begin
     end
     else
     for o := 0 to OutChM1 do
+    begin
+      FullRow := Full[o];
+      wBaseO := (o * K) * InCh; // (o*K + 0)*InCh
       for t := 0 to InLenM1 do
+      begin
+        tInCh := t * InCh;
+        idx := t * Stride;      // + k2, carried
+        wOfs := wBaseO;         // (o*K + k2)*InCh, carried
         for k2 := 0 to KM1 do
         begin
-          idx := t * Stride + k2;
           Contrib := TNNetVolume.DotProduct(
-            Addr(WT[(o * K + k2) * InCh]), Addr(InT[t * InCh]), InCh);
-          Full[o][idx] := Full[o][idx] + Contrib;
+            Addr(WT[wOfs]), Addr(InT[tInCh]), InCh);
+          FullRow[idx] := FullRow[idx] + Contrib;
+          Inc(wOfs, InCh);
+          Inc(idx);
         end;
+      end;
+    end;
     // Add bias across the whole (untrimmed) output.
     for o := 0 to OutChM1 do
       for t := 0 to FullLenM1 do Full[o][t] := Full[o][t] + Conv.B[o];
@@ -41428,8 +41472,10 @@ procedure RunEnCodecLSTM(const LSTM: TEnCodecLSTM;
 var
   H, T, L, t2, ch, g, j: integer;
   HM1, TM1, FourHM1, NumLayersM1: integer;
+  H2, H3, gOfs: integer;
   hPrev, cPrev, xIn: TNeuralFloatDynArr;
   gates: TNeuralFloatDynArr;
+  BihL, BhhL, WihData, WhhData: TNeuralFloatDynArr;
   ig, fg, gg, og, cNew, hNew: TNeuralFloat;
   Inp: TNNetFloatDynArr2D;
 begin
@@ -41439,17 +41485,24 @@ begin
   TM1 := T - 1;
   FourHM1 := 4 * H - 1;
   NumLayersM1 := LSTM.NumLayers - 1;
+  H2 := 2 * H;
+  H3 := 3 * H;
   // Keep the input copy for the final residual add.
   SetLength(Inp, H);
   for ch := 0 to HM1 do
   begin
     SetLength(Inp[ch], T);
-    for t2 := 0 to TM1 do Inp[ch][t2] := Sig[ch][t2];
+    if T > 0 then Move(Sig[ch][0], Inp[ch][0], T * csNeuralFloatSize);
   end;
   SetLength(xIn, H);
   SetLength(gates, 4 * H);
   for L := 0 to NumLayersM1 do
   begin
+    // Hoist the per-layer weight/bias rows out of the time loop (invariant in t2).
+    BihL := LSTM.Bih[L];
+    BhhL := LSTM.Bhh[L];
+    WihData := LSTM.Wih[L].Data;
+    WhhData := LSTM.Whh[L].Data;
     SetLength(hPrev, H);
     SetLength(cPrev, H);
     for j := 0 to HM1 do begin hPrev[j] := 0; cPrev[j] := 0; end;
@@ -41461,17 +41514,28 @@ begin
       // use the AVX-dispatching DotProduct (H is large -> AVXDotProduct path).
       // This is the dominant EnCodec-decode cost: a 4H x H mat-vec done twice per
       // timestep, ~3.4 GMAC total for a 4 s clip. Bit-approximate vs the prior
-      // scalar loop only in the usual AVX-reassociation sense.
+      // scalar loop only in the usual AVX-reassociation sense. gOfs = g*H carried.
+      gOfs := 0;
       for g := 0 to FourHM1 do
-        gates[g] := LSTM.Bih[L][g] + LSTM.Bhh[L][g] +
-          TNNetVolume.DotProduct(Addr(LSTM.Wih[L].Data[g * H]), Addr(xIn[0]), H) +
-          TNNetVolume.DotProduct(Addr(LSTM.Whh[L].Data[g * H]), Addr(hPrev[0]), H);
+      begin
+        gates[g] := BihL[g] + BhhL[g] +
+          TNNetVolume.DotProduct(Addr(WihData[gOfs]), Addr(xIn[0]), H) +
+          TNNetVolume.DotProduct(Addr(WhhData[gOfs]), Addr(hPrev[0]), H);
+        Inc(gOfs, H);
+      end;
+      // Gate nonlinearities on the contiguous quarter-blocks (order i,f,g,o):
+      // sigmoid on i/f/o, tanh on the cell candidate g. VectorSigmoid/VectorTanh
+      // run in place (dst=src) and are AVX-vectorized (parity < 1e-4).
+      TNNetVolume.VectorSigmoid(Addr(gates[0]), Addr(gates[0]), H);
+      TNNetVolume.VectorSigmoid(Addr(gates[H]), Addr(gates[H]), H);
+      TNNetVolume.VectorTanh(Addr(gates[H2]), Addr(gates[H2]), H);
+      TNNetVolume.VectorSigmoid(Addr(gates[H3]), Addr(gates[H3]), H);
       for ch := 0 to HM1 do
       begin
-        ig := 1 / (1 + Exp(-gates[ch]));
-        fg := 1 / (1 + Exp(-gates[H + ch]));
-        gg := Tanh(gates[2 * H + ch]);
-        og := 1 / (1 + Exp(-gates[3 * H + ch]));
+        ig := gates[ch];
+        fg := gates[H + ch];
+        gg := gates[H2 + ch];
+        og := gates[H3 + ch];
         cNew := fg * cPrev[ch] + ig * gg;
         hNew := og * Tanh(cNew);
         cPrev[ch] := cNew;
@@ -41480,9 +41544,10 @@ begin
       end;
     end;
   end;
-  // Residual add of the ORIGINAL pre-LSTM input.
-  for ch := 0 to HM1 do
-    for t2 := 0 to TM1 do Sig[ch][t2] := Sig[ch][t2] + Inp[ch][t2];
+  // Residual add of the ORIGINAL pre-LSTM input (contiguous per-row AVX add).
+  if T > 0 then
+    for ch := 0 to HM1 do
+      TNNetVolume.Add(Addr(Sig[ch][0]), Addr(Inp[ch][0]), T);
 end;
 
 procedure ApplyEnCodecELU(var Sig: TNNetFloatDynArr2D);
@@ -41564,8 +41629,9 @@ var
   Sig, Nxt: TNNetFloatDynArr2D;
   s, q, t, d, best, K, Dm, Frames: integer;
   WaveformMax, EncStagesMax, CodebooksMax, FramesM1, DmM1, KM1: integer;
+  sBase: integer;
   Dist, BestDist, Diff: TNeuralFloat;
-  Residual, Vec: TNeuralFloatDynArr;
+  Residual, Vec, CB: TNeuralFloatDynArr;
 begin
   EnsureThreadPool;
   // Channel-major input (mono): Sig[0][t] = waveform.
@@ -41603,22 +41669,25 @@ begin
     for d := 0 to DmM1 do Residual[d] := Sig[d][t];
     for q := 0 to CodebooksMax do
     begin
+      CB := FCodebooks[q].Data;
       best := 0; BestDist := -1;
+      sBase := 0; // s*Dm carried
       for s := 0 to KM1 do
       begin
         Dist := 0;
         for d := 0 to DmM1 do
         begin
-          Diff := Residual[d] - FCodebooks[q].Data[s * Dm + d];
+          Diff := Residual[d] - CB[sBase + d];
           Dist := Dist + Diff * Diff;
         end;
         if (BestDist < 0) or (Dist < BestDist) then
         begin BestDist := Dist; best := s; end;
+        Inc(sBase, Dm);
       end;
       Codes[q][t] := best;
-      // Subtract the chosen code from the residual for the next stage.
-      for d := 0 to DmM1 do
-        Residual[d] := Residual[d] - FCodebooks[q].Data[best * Dm + d];
+      // Subtract the chosen code from the residual for the next stage
+      // (scaled accumulate: Residual += CB[best*Dm..] * -1).
+      TNNetVolume.MulAdd(Addr(Residual[0]), Addr(CB[best * Dm]), -1, Dm);
     end;
   end;
 end;
@@ -41629,6 +41698,8 @@ var
   Sig, Nxt: TNNetFloatDynArr2D;
   s, q, t, d, Dm, Frames, NQ, code: integer;
   DmM1, FramesM1, NQM1, DecStagesM1, SigLenM1: integer;
+  codeBase: integer;
+  CB: TNeuralFloatDynArr;
   tStageTick: QWord;   // per-stage wall clock (always-on instrumentation)
 begin
   EnsureThreadPool;
@@ -41659,12 +41730,16 @@ begin
     for t := 0 to FramesM1 do Sig[d][t] := 0;
   end;
   for q := 0 to NQM1 do
+  begin
+    CB := FCodebooks[q].Data;
     for t := 0 to FramesM1 do
     begin
       code := Codes[q][t];
+      codeBase := code * Dm; // invariant across the d loop
       for d := 0 to DmM1 do
-        Sig[d][t] := Sig[d][t] + FCodebooks[q].Data[code * Dm + d];
+        Sig[d][t] := Sig[d][t] + CB[codeBase + d];
     end;
+  end;
   // Run the decoder stages.
   DecStagesM1 := Length(FDecStages) - 1;
   for s := 0 to DecStagesM1 do
@@ -42214,6 +42289,8 @@ var
   Patch, WD: TMimiDblArr; // im2col gather + Double-packed weights
   IPGK, lp: integer;
   WDMax: integer;
+  grpIPG, grpOPG, oBase, tS, giK, wOfs: integer;
+  PadRow: TMimiDblArr;
 begin
   InCh := Conv.InCh;
   OutCh := Conv.OutCh;
@@ -42278,21 +42355,31 @@ begin
     // Double DotProduct per output channel.
     SetLength(Patch, IPGK);
     for grp := 0 to GM1 do
+    begin
+      grpIPG := grp * IPG;                // in-channel base for this group
+      grpOPG := grp * OPG;                // out-channel base for this group
+      oBase := grpOPG * IPGK;             // (grp*OPG + 0)*IPGK, carried across co
       for t := 0 to OutLenM1 do
       begin
+        tS := t * Stride;
         for gi := 0 to IPGM1 do
         begin
-          i := grp * IPG + gi;
+          i := grpIPG + gi;
+          giK := gi * K;
+          PadRow := Padded[i];
           for k2 := 0 to KM1 do
-            Patch[gi * K + k2] := Padded[i][t * Stride + k2 * Dil];
+            Patch[giK + k2] := PadRow[tS + k2 * Dil];
         end;
+        wOfs := oBase;                    // o*IPGK carried
         for co := 0 to OPGM1 do
         begin
-          o := grp * OPG + co;
+          o := grpOPG + co;
           OutSig[o][t] := Conv.B[o] +
-            MimiDotProductD(@WD[o * IPGK], @Patch[0], IPGK);
+            MimiDotProductD(@WD[wOfs], @Patch[0], IPGK);
+          Inc(wOfs, IPGK);
         end;
       end;
+    end;
   end
   else
   begin
@@ -42753,6 +42840,8 @@ var
   Sig, Nxt, Proj: TMimiDblArr2D;
   s, q, t, d, best, Dm, Frames, K, NSem, NAco: integer;
   WaveLenM1, EncStagesM1, NSemNAcoM1, FramesM1, DmM1, NSemM1, NAcoM1, KM1: integer;
+  sBase, bestBase: integer;
+  CB: TNeuralFloatDynArr;
   Dist, BestDist, Diff: double;
   Residual: TMimiDblArr;
 begin
@@ -42795,21 +42884,27 @@ begin
     for d := 0 to DmM1 do Residual[d] := Proj[d][t];
     for q := 0 to NSemM1 do
     begin
+      CB := FSemCodebooks[q].Data;
       best := 0; BestDist := -1;
+      sBase := 0; // s*Dm carried
       for s := 0 to KM1 do
       begin
         Dist := 0;
         for d := 0 to DmM1 do
         begin
-          Diff := Residual[d] - FSemCodebooks[q].Data[s * Dm + d];
+          Diff := Residual[d] - CB[sBase + d];
           Dist := Dist + Diff * Diff;
         end;
         if (BestDist < 0) or (Dist < BestDist) then
         begin BestDist := Dist; best := s; end;
+        Inc(sBase, Dm);
       end;
       Codes[q][t] := best;
+      // double residual: no single-precision bulk primitive applies, scalar
+      // subtract with hoisted codebook row + code base.
+      bestBase := best * Dm;
       for d := 0 to DmM1 do
-        Residual[d] := Residual[d] - FSemCodebooks[q].Data[best * Dm + d];
+        Residual[d] := Residual[d] - CB[bestBase + d];
     end;
   end;
 
@@ -42820,21 +42915,25 @@ begin
     for d := 0 to DmM1 do Residual[d] := Proj[d][t];
     for q := 0 to NAcoM1 do
     begin
+      CB := FAcoCodebooks[q].Data;
       best := 0; BestDist := -1;
+      sBase := 0; // s*Dm carried
       for s := 0 to KM1 do
       begin
         Dist := 0;
         for d := 0 to DmM1 do
         begin
-          Diff := Residual[d] - FAcoCodebooks[q].Data[s * Dm + d];
+          Diff := Residual[d] - CB[sBase + d];
           Dist := Dist + Diff * Diff;
         end;
         if (BestDist < 0) or (Dist < BestDist) then
         begin BestDist := Dist; best := s; end;
+        Inc(sBase, Dm);
       end;
       Codes[NSem + q][t] := best;
+      bestBase := best * Dm;
       for d := 0 to DmM1 do
-        Residual[d] := Residual[d] - FAcoCodebooks[q].Data[best * Dm + d];
+        Residual[d] := Residual[d] - CB[bestBase + d];
     end;
   end;
 end;
@@ -42845,6 +42944,8 @@ var
   Sig, Nxt, Zsem, Zaco, Zh: TMimiDblArr2D;
   s, q, t, d, Dm, Frames, NSem, NAco, code, code2: integer;
   DmM1, FramesM1, NSemM1, NAcoM1, SigM1, DecStagesM1, Sig0M1: integer;
+  codeBase: integer;
+  CB: TNeuralFloatDynArr;
 begin
   Dm := FConfig.VqHiddenDim;
   DmM1 := Dm - 1;
@@ -42863,12 +42964,16 @@ begin
     for t := 0 to FramesM1 do Zsem[d][t] := 0;
   end;
   for q := 0 to NSemM1 do
+  begin
+    CB := FSemCodebooks[q].Data;
     for t := 0 to FramesM1 do
     begin
       code := Codes[q][t];
+      codeBase := code * Dm; // invariant across the d loop
       for d := 0 to DmM1 do
-        Zsem[d][t] := Zsem[d][t] + FSemCodebooks[q].Data[code * Dm + d];
+        Zsem[d][t] := Zsem[d][t] + CB[codeBase + d];
     end;
+  end;
   RunMimiConv(FSemOutProj, Zsem, Sig); // Sig now [hidden][frames]
   // acoustic RVQ decode
   if NAco > 0 then
@@ -42880,12 +42985,16 @@ begin
       for t := 0 to FramesM1 do Zaco[d][t] := 0;
     end;
     for q := 0 to NAcoM1 do
+    begin
+      CB := FAcoCodebooks[q].Data;
       for t := 0 to FramesM1 do
       begin
         code2 := Codes[NSem + q][t];
+        codeBase := code2 * Dm; // invariant across the d loop
         for d := 0 to DmM1 do
-          Zaco[d][t] := Zaco[d][t] + FAcoCodebooks[q].Data[code2 * Dm + d];
+          Zaco[d][t] := Zaco[d][t] + CB[codeBase + d];
       end;
+    end;
     RunMimiConv(FAcoOutProj, Zaco, Zh);
     SigM1 := Length(Sig) - 1;
     for d := 0 to SigM1 do
@@ -43271,9 +43380,11 @@ var
   PaddedLen, OutLen, FullLen, idx: integer;
   InChM1, OutChM1, KM1, InLenM1, OutLenM1, FullLenM1, lp: integer;
   Padded, Full: TMimiDblArr2D;
-  Patch, WD: TMimiDblArr;
+  Patch, WD, WT: TMimiDblArr;
   InCK: integer;
   PaddedLenM1, WDMax: integer;
+  tS, iK, wOfs, oK, OCK: integer;
+  PadRow, FullRow: TMimiDblArr;
 begin
   InCh := Conv.InCh;
   OutCh := Conv.OutCh;
@@ -43309,12 +43420,21 @@ begin
     SetLength(Patch, InCK);
     for t := 0 to OutLenM1 do
     begin
+      tS := t * Stride;
       for i := 0 to InChM1 do
+      begin
+        iK := i * K;
+        PadRow := Padded[i];
         for k2 := 0 to KM1 do
-          Patch[i * K + k2] := Padded[i][t * Stride + k2 * Dil];
+          Patch[iK + k2] := PadRow[tS + k2 * Dil];
+      end;
+      wOfs := 0; // o*InCK carried
       for o := 0 to OutChM1 do
+      begin
         OutSig[o][t] := Conv.B[o] +
-          MimiDotProductD(@WD[o * InCK], @Patch[0], InCK);
+          MimiDotProductD(@WD[wOfs], @Patch[0], InCK);
+        Inc(wOfs, InCK);
+      end;
     end;
   end
   else
@@ -43331,19 +43451,39 @@ begin
     end;
     // For each (out-channel o, tap k2) the contraction over input channels i is
     // contiguous once the weight column W[i*Out*K + o*K + k2] is repacked in i.
+    // That column is t-INVARIANT, so pre-pack every (o,k2) column ONCE into WT
+    // laid out [(o*K + k2)*InCh + i] (as the EnCodec transpose does), instead of
+    // re-gathering it on every t.
     SetLength(Patch, InCh);   // InSig column over channels at time t
-    SetLength(WD, InCh);
+    OCK := OutCh * K;
+    SetLength(WT, OutCh * K * InCh);
+    for o := 0 to OutChM1 do
+    begin
+      oK := o * K;
+      for k2 := 0 to KM1 do
+      begin
+        wOfs := (oK + k2) * InCh;
+        for i := 0 to InChM1 do
+          WT[wOfs + i] := Conv.W[i * OCK + oK + k2];
+      end;
+    end;
     for t := 0 to InLenM1 do
     begin
       for i := 0 to InChM1 do Patch[i] := InSig[i][t];
+      tS := t * Stride;
+      wOfs := 0; // (o*K + k2)*InCh carried across the whole (o,k2) nest
       for o := 0 to OutChM1 do
+      begin
+        FullRow := Full[o];
+        idx := tS; // + k2*Dil, carried by Dil
         for k2 := 0 to KM1 do
         begin
-          idx := t * Stride + k2 * Dil;
-          for i := 0 to InChM1 do
-            WD[i] := Conv.W[i * OutCh * K + o * K + k2];
-          Full[o][idx] := Full[o][idx] + MimiDotProductD(@WD[0], @Patch[0], InCh);
+          FullRow[idx] := FullRow[idx] +
+            MimiDotProductD(@WT[wOfs], @Patch[0], InCh);
+          Inc(wOfs, InCh);
+          Inc(idx, Dil);
         end;
+      end;
     end;
     for o := 0 to OutChM1 do
       for t := 0 to FullLenM1 do Full[o][t] := Full[o][t] + Conv.B[o];
