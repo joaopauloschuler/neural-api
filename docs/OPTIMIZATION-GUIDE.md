@@ -4,6 +4,39 @@ A running list of recommendations for keeping the neural-api codebase fast,
 consistent, and maintainable. Each entry states the problem, the fix, and why
 it matters. Recommendations are added incrementally as we discover them.
 
+> ## ⛔ HARD PROHIBITION — read before applying ANY optimization
+>
+> **NEVER introduce a heap allocation on a compute path.** Do **NOT** add
+> `SetLength`, `New`, `GetMem`, dynamic-array creation, `TXxx.Create`, or any
+> other per-call allocation inside a layer's `Compute`, `ComputeCPU`,
+> `ComputeRange`, `ComputeIncremental`, `Backpropagate`, or `Backpropagate*`
+> method — nor inside **any** routine in `neuralvolume.pas`, nor inside the
+> inference decode helpers (audio codecs, samplers, etc.).
+>
+> This is **the single most damaging mistake** you can make here. These methods
+> run once per token / per sample / per training step; a `SetLength` there is a
+> heap allocation (and often a zero-fill) on the hottest path in the system.
+> Hoisting a `1-mix` vector or a section table "once per call" into a fresh
+> `SetLength` array is **slower than the original scalar code you were trying to
+> improve** — you traded a few arithmetic ops for a malloc. **This is very
+> wrong. Do not do it.**
+>
+> If a rule below (e.g. #5 hoist-invariant, #13 bulk-method, App. D scratch)
+> seems to call for a temporary buffer:
+> 1. **Prefer no buffer at all** — most invariant hoists (a scalar, a base
+>    offset, a bound) need only a local `integer`/`TNeuralFloat`, never an array.
+> 2. If a buffer is genuinely required, it MUST be a **persistent, lazily-sized
+>    layer field** (e.g. `FScratch: TNNetVolume` allocated in `SetPrevLayer`,
+>    or a field resized only when `Length(field) <> needed`), **never** a
+>    fresh `SetLength` of a local on every call.
+> 3. If neither is possible, **do not apply the optimization** — leave the
+>    original code and note it. A correct scalar loop beats an allocating
+>    "optimization" every time.
+>
+> The only acceptable `SetLength` on these paths is a **lazy, amortized resize
+> of a persistent field** guarded by a size check, so it allocates ~once over
+> the lifetime of the layer, not once per call. See rule #17.
+
 ## 1. Prefer named size constants over `SizeOf(type)`
 
 Replace repeated `SizeOf(<type>)` expressions with a predefined named size
@@ -1304,6 +1337,68 @@ where exactness is the point, not speed:
 When in doubt on a hot forward/backward path, prefer `NeuralExp`; on a
 once-per-model setup path, leave `Exp`. (The same applies to the other `Neural*` /
 `pcr_*` fast transcendentals versus their RTL equivalents.)
+
+## 17. NEVER `SetLength`/allocate per call in `Compute`/`Backpropagate` (or in `neuralvolume.pas`)
+
+See the **HARD PROHIBITION** box at the top of this guide. This rule exists because
+the mistake was made repeatedly during an optimization sweep and each instance was
+**slower than the code it replaced**.
+
+**The anti-pattern (NEVER do this):**
+
+```pascal
+procedure TNNetTokenShift.Compute();
+var
+  oneMinusMix: array of TNeuralFloat;   // <-- local dynamic array
+begin
+  ...
+  // "hoist the (1-mix) vector once per call"  <-- WRONG: this is a per-call malloc
+  SetLength(oneMinusMix, Depth);
+  for d := 0 to MaxD do oneMinusMix[d] := 1.0 - W.Raw[d];
+  for t := 1 to MaxT do
+    for d := 0 to MaxD do
+      FOutput.FData[base + d] := mix * xt + oneMinusMix[d] * xtm1;
+end;
+```
+
+The `SetLength` runs on **every forward call** (every token during decode). It
+allocates + zero-fills a heap array to save one subtraction per element — a net
+loss. The correct code keeps the trivial scalar:
+
+```pascal
+  for t := 1 to MaxT do
+    for d := 0 to MaxD do
+    begin
+      mix := W.Raw[d];
+      one_minus_mix := 1.0 - mix;               // one local, no allocation
+      FOutput.FData[base + d] := mix * xt + one_minus_mix * xtm1;
+    end;
+```
+
+Same verdict for a "section table" (`SetLength(secTab, HalfD)` to cache a
+per-`k` branch selector), a "snapshot array" (`SetLength(Vols, Count)` in a
+`TNNetVolumeList` method to avoid a list getter), a "repacked weight column"
+(`SetLength(WT, ...)` in a decode conv), etc. **All were reverted.** The list
+getter / branch / small recompute they replaced is cheaper than the allocation.
+
+**Forbidden on every `Compute*`/`Backpropagate*` path and everywhere in
+`neuralvolume.pas`:** `SetLength`, `New`, `GetMem`, `TXxx.Create`,
+`Copy(dynarray)`, `Concat`, and any implicit dynamic-array/temporary-string
+allocation.
+
+**The only allowed form — lazy, amortized resize of a persistent field:**
+
+```pascal
+  // FScratch is a LAYER FIELD, not a local. This allocates ~once, then reuses.
+  if FScratch.Size <> Depth then FScratch.ReSize(1, 1, Depth);   // amortized
+  // ... use FScratch.FData[...] ...
+```
+
+Even then, reach for it only when an invariant genuinely needs a *vector* of
+results across the loop. The overwhelming majority of hoists (rules #4/#5/#8/#11)
+need a **scalar or an integer offset** — a plain local — and allocate nothing.
+**If the only way you can see to apply an optimization is to allocate, the
+correct action is to NOT apply it.**
 
 ## Appendix: the patterns agents miss most — extra worked examples
 
