@@ -2060,7 +2060,9 @@ var
   LocalTotalLoss, LocalErrorSum: TNeuralFloat;
   LocalTestPair: TNNetVolumePair;
   TotalDiv: TNeuralFloat;
+  HalfCrop: integer;
 begin
+  HalfCrop := FMaxCropSize shr 1;
   vInput     := TNNetVolume.Create();
   pOutput    := TNNetVolume.Create();
   vOutput    := TNNetVolume.Create();
@@ -2098,7 +2100,7 @@ begin
 
     if FHasImgCrop then
     begin
-      vInputCopy.CopyCropping(vInput, FMaxCropSize div 2, FMaxCropSize div 2, vInput.SizeX-FMaxCropSize, vInput.SizeY-FMaxCropSize);
+      vInputCopy.CopyCropping(vInput, HalfCrop, HalfCrop, vInput.SizeX-FMaxCropSize, vInput.SizeY-FMaxCropSize);
       vInput.Copy(vInputCopy);
     end;
 
@@ -2131,7 +2133,7 @@ begin
 
       if ((FMaxCropSize >= 2) and Not(FHasImgCrop)) then
       begin
-        vInputCopy.CopyCropping(vInput, FMaxCropSize div 2, FMaxCropSize div 2, vInput.SizeX - FMaxCropSize, vInput.SizeY - FMaxCropSize);
+        vInputCopy.CopyCropping(vInput, HalfCrop, HalfCrop, vInput.SizeX - FMaxCropSize, vInput.SizeY - FMaxCropSize);
         vInput.CopyResizing(vInputCopy, vInput.SizeX, vInput.SizeY);
         LocalNN.Compute( vInput );
         LocalNN.GetOutput( pOutput );
@@ -3886,7 +3888,9 @@ var
   LocalTotalLoss, LocalErrorSum: TNeuralFloat;
   PredictedClass: integer;
   TotalDiv: TNeuralFloat;
+  HalfCrop: integer;
 begin
+  HalfCrop := FMaxCropSize shr 1;
   ImgInput := TNNetVolume.Create();
   ImgInputCp := TNNetVolume.Create();
   pOutput := TNNetVolume.Create(FNumClasses,1,1);
@@ -3922,7 +3926,7 @@ begin
     begin
       // Note: crop bounds intentionally read sizes from FImgVolumes[ImgIdx]
       // (preserved as-is), while the crop source is FWorkingVolumes[ImgIdx].
-      ImgInput.CopyCropping(LocalImg, FMaxCropSize div 2, FMaxCropSize div 2, FImgVolumes[ImgIdx].SizeX-FMaxCropSize, FImgVolumes[ImgIdx].SizeY-FMaxCropSize);
+      ImgInput.CopyCropping(LocalImg, HalfCrop, HalfCrop, FImgVolumes[ImgIdx].SizeX-FMaxCropSize, FImgVolumes[ImgIdx].SizeY-FMaxCropSize);
     end
     else
     begin
@@ -3958,7 +3962,7 @@ begin
 
       if ((FMaxCropSize >= 2) and Not(FHasImgCrop)) then
       begin
-        ImgInputCp.CopyCropping(ImgInput, FMaxCropSize div 2, FMaxCropSize div 2, ImgInput.SizeX - FMaxCropSize, ImgInput.SizeY - FMaxCropSize);
+        ImgInputCp.CopyCropping(ImgInput, HalfCrop, HalfCrop, ImgInput.SizeX - FMaxCropSize, ImgInput.SizeY - FMaxCropSize);
         ImgInput.CopyResizing(ImgInputCp, ImgInput.SizeX, ImgInput.SizeY);
         LocalNN.Compute( ImgInput );
         LocalNN.GetOutput( pOutput );
@@ -4019,7 +4023,9 @@ var
   ImgInput, ImgInputCp: TNNetVolume;
   sumOutput: TNNetVolume;
   TotalDiv: TNeuralFloat;
+  HalfCrop: integer;
 begin
+  HalfCrop := FMaxCropSize shr 1;
   ImgInput := TNNetVolume.Create();
   ImgInputCp := TNNetVolume.Create();
   sumOutput := TNNetVolume.Create(pNN.GetLastLayer().Output);
@@ -4054,7 +4060,7 @@ begin
 
     if FMaxCropSize >= 2 then
     begin
-      ImgInputCp.CopyCropping(ImgInput, FMaxCropSize div 2, FMaxCropSize div 2, ImgInput.SizeX - FMaxCropSize, ImgInput.SizeY - FMaxCropSize);
+      ImgInputCp.CopyCropping(ImgInput, HalfCrop, HalfCrop, ImgInput.SizeX - FMaxCropSize, ImgInput.SizeY - FMaxCropSize);
       ImgInput.CopyResizing(ImgInputCp, ImgInput.SizeX, ImgInput.SizeY);
       pNN.Compute( ImgInput );
       pNN.GetOutput( pOutput );

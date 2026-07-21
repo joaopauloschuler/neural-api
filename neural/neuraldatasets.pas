@@ -1280,7 +1280,8 @@ begin
   end;
   if FDocCount >= Length(FDocs) then SetLength(FDocs, 8 + FDocCount * 2);
   SetLength(FDocs[FDocCount], Length(Tokens));
-  for I := 0 to MaxIdx do FDocs[FDocCount][I] := Tokens[I];
+  if MaxIdx >= 0 then
+    Move(Tokens[0], FDocs[FDocCount][0], Length(Tokens) * csIntegerSize);
   Inc(FDocCount);
   FIsPacked := false;
 end;
@@ -1319,10 +1320,10 @@ begin
   for DocIdx := 0 to DocM1 do
   begin
     DocLenM1 := Length(FDocs[DocIdx]) - 1;
-    for I := 0 to DocLenM1 do
+    if DocLenM1 >= 0 then
     begin
-      Stream[Pos] := FDocs[DocIdx][I];
-      Inc(Pos);
+      Move(FDocs[DocIdx][0], Stream[Pos], (DocLenM1 + 1) * csIntegerSize);
+      Inc(Pos, DocLenM1 + 1);
     end;
     Stream[Pos] := FSeparatorToken;
     Inc(Pos);
@@ -1423,7 +1424,8 @@ begin
   RequirePacked();
   SetLength(Result, FContextLen);
   ContextM1 := FContextLen - 1;
-  for I := 0 to ContextM1 do Result[I] := FWindows[WindowIdx][I];
+  if ContextM1 >= 0 then
+    Move(FWindows[WindowIdx][0], Result[0], FContextLen * csIntegerSize);
 end;
 
 function TNNetSequencePacker.GetToken(WindowIdx, Pos: integer): integer;
@@ -1479,7 +1481,7 @@ begin
   Ids := GetSegmentIds(WindowIdx);
   ContextM1 := FContextLen - 1;
   for Pos := 0 to ContextM1 do
-    pSegment[Pos, 0, 0] := Ids[Pos];
+    pSegment.FData[Pos] := Ids[Pos];
   SetLength(Ids, 0);
 end;
 
@@ -2054,9 +2056,7 @@ begin
   if FSampleCount >= Length(FSamples) then
     SetLength(FSamples, (FSampleCount + 1) * 2);
   SetLength(FSamples[FSampleCount], Length(Tokens));
-  TokM1 := Length(Tokens) - 1;
-  for I := 0 to TokM1 do
-    FSamples[FSampleCount][I] := Tokens[I];
+  Move(Tokens[0], FSamples[FSampleCount][0], Length(Tokens) * csIntegerSize);
   Inc(FSampleCount);
   FIsBuilt := false;
 end;
@@ -2730,16 +2730,17 @@ begin
   MaxY := M.Height - 1;
   Vol.ReSize(MaxX + 1, MaxY + 1, 3);
 
-  for CountX := 0 to MaxX do
+  for CountY := 0 to MaxY do
   begin
-    for CountY := 0 to MaxY do
+    RawPos := Vol.GetRawPos(0, CountY, 0);
+    for CountX := 0 to MaxX do
     begin
       LocalColor := M.Colors[CountX, CountY];
-      RawPos := Vol.GetRawPos(CountX, CountY, 0);
 
       Vol.FData[RawPos]     := LocalColor.red shr 8;
       Vol.FData[RawPos + 1] := LocalColor.green shr 8;
       Vol.FData[RawPos + 2] := LocalColor.blue shr 8;
+      Inc(RawPos, 3);
     end;
   end;
 end;
@@ -2753,15 +2754,16 @@ begin
   MaxX := Vol.SizeX - 1;
   MaxY := Vol.SizeY - 1;
   M.SetSize(Vol.SizeX, Vol.SizeY);
-  for CountX := 0 to MaxX do
+  for CountY := 0 to MaxY do
   begin
-    for CountY := 0 to MaxY do
+    RawPos := Vol.GetRawPos(0, CountY, 0);
+    for CountX := 0 to MaxX do
     begin
-      RawPos := Vol.GetRawPos(CountX, CountY, 0);
       LocalColor.red := NeuronForceMinMax(Round(Vol.FData[RawPos]),0,255) shl 8;
       LocalColor.green := NeuronForceMinMax(Round(Vol.FData[RawPos + 1]),0,255) shl 8;
       LocalColor.blue := NeuronForceMinMax(Round(Vol.FData[RawPos + 2]),0, 255) shl 8;
       M.Colors[CountX, CountY] := LocalColor;
+      Inc(RawPos, 3);
     end;
   end;
 end;
@@ -2776,16 +2778,17 @@ begin
   MaxY := Picture.Height - 1;
   Vol.ReSize(MaxX + 1, MaxY + 1, 3);
 
-  for CountX := 0 to MaxX do
+  for CountY := 0 to MaxY do
   begin
-    for CountY := 0 to MaxY do
+    RawPos := Vol.GetRawPos(0, CountY, 0);
+    for CountX := 0 to MaxX do
     begin
       LocalColor := Picture.Bitmap.Canvas.Pixels[CountX, CountY];
-      RawPos := Vol.GetRawPos(CountX, CountY, 0);
 
       Vol.FData[RawPos]     := LocalColor and 255;
       Vol.FData[RawPos + 1] := (LocalColor shr 8) and 255;
       Vol.FData[RawPos + 2] := (LocalColor shr 16) and 255;
+      Inc(RawPos, 3);
     end;
   end;
 end;
@@ -3061,6 +3064,7 @@ var
   Img: TTinyImage;
   cifarFile: TTInyImageFile;
   AuxVolume: TNNetVolume;
+  Vol: TNNetVolume;
   pMin, pMax: TNeuralFloat;
   globalMin0, globalMax0: TNeuralFloat;
   globalMin1, globalMax1: TNeuralFloat;
@@ -3084,32 +3088,33 @@ begin
   begin
     Read(cifarFile, Img);
     ImgPos := I + base_pos;
-    LoadTinyImageIntoNNetVolume(Img, ImgVolumes[ImgPos]);
+    Vol := ImgVolumes[ImgPos];
+    LoadTinyImageIntoNNetVolume(Img, Vol);
 
     if (color_encoding = csEncodeGray) then
     begin
-      AuxVolume.Copy(ImgVolumes[ImgPos]);
-      ImgVolumes[ImgPos].GetGrayFromRgb(AuxVolume);
+      AuxVolume.Copy(Vol);
+      Vol.GetGrayFromRgb(AuxVolume);
     end;
 
-    ImgVolumes[ImgPos].RgbImgToNeuronalInput(color_encoding);
+    Vol.RgbImgToNeuronalInput(color_encoding);
 
-    ImgVolumes[ImgPos].GetMinMaxAtDepth(0, pMin, pMax); //WriteLn  (I:8,' - #0 Min:',pMin, ' Max:',pMax);
+    Vol.GetMinMaxAtDepth(0, pMin, pMax); //WriteLn  (I:8,' - #0 Min:',pMin, ' Max:',pMax);
 
     globalMin0 := Math.Min(pMin, globalMin0);
     globalMax0 := Math.Max(pMax, globalMax0);
 
-    if (ImgVolumes[ImgPos].Depth >= 2) then
+    if (Vol.Depth >= 2) then
     begin
-      ImgVolumes[ImgPos].GetMinMaxAtDepth(1, pMin, pMax); //Write  (' #1 Min:',pMin, ' Max:',pMax);
+      Vol.GetMinMaxAtDepth(1, pMin, pMax); //Write  (' #1 Min:',pMin, ' Max:',pMax);
 
       globalMin1 := Math.Min(pMin, globalMin1);
       globalMax1 := Math.Max(pMax, globalMax1);
     end;
 
-    if (ImgVolumes[ImgPos].Depth >= 3) then
+    if (Vol.Depth >= 3) then
     begin
-      ImgVolumes[ImgPos].GetMinMaxAtDepth(2, pMin, pMax); //WriteLn(' #2 Min:',pMin, ' Max:',pMax);
+      Vol.GetMinMaxAtDepth(2, pMin, pMax); //WriteLn(' #2 Min:',pMin, ' Max:',pMax);
 
       globalMin2 := Math.Min(pMin, globalMin2);
       globalMax2 := Math.Max(pMax, globalMax2);
@@ -3342,6 +3347,10 @@ var
   ResizeW, ResizeH, OffX, OffY, X, Y, C, SrcX, SrcY: integer;
   Scale, Fx, Fy, V: TNeuralFloat;
   ResizeWM1, ResizeHM1, CropM1, WorkBase, SrcBase, DstBase: integer;
+  ScaleX, ScaleY: TNeuralFloat;
+  SrcXMax, SrcYMax, DstStride, WorkStride: integer;
+  WorkSizeXM1, WorkSizeYM1, WorkRowBase: integer;
+  RowOutY: boolean;
 begin
   if (Src = nil) or (Dst = nil) then
     raise Exception.Create('PreprocessImageForVisionModel: nil volume.');
@@ -3380,22 +3389,28 @@ begin
       Work.ReSize(ResizeW, ResizeH, 3);
       ResizeHM1 := ResizeH - 1;
       ResizeWM1 := ResizeW - 1;
+      ScaleX := Src.SizeX / ResizeW;
+      ScaleY := Src.SizeY / ResizeH;
+      SrcXMax := Src.SizeX - 1;
+      SrcYMax := Src.SizeY - 1;
       for Y := 0 to ResizeHM1 do
+      begin
+        // bilinear sample location (align_corners = false convention); Y-only
+        Fy := (Y + 0.5) * ScaleY - 0.5;
+        if Fy < 0 then Fy := 0;
+        SrcY := Trunc(Fy);
+        if SrcY > SrcYMax then SrcY := SrcYMax;
         for X := 0 to ResizeWM1 do
         begin
-          // bilinear sample location (align_corners = false convention)
-          Fx := (X + 0.5) * Src.SizeX / ResizeW - 0.5;
-          Fy := (Y + 0.5) * Src.SizeY / ResizeH - 0.5;
+          Fx := (X + 0.5) * ScaleX - 0.5;
           if Fx < 0 then Fx := 0;
-          if Fy < 0 then Fy := 0;
-          SrcX := Trunc(Fx); SrcY := Trunc(Fy);
-          if SrcX > Src.SizeX - 1 then SrcX := Src.SizeX - 1;
-          if SrcY > Src.SizeY - 1 then SrcY := Src.SizeY - 1;
+          SrcX := Trunc(Fx);
+          if SrcX > SrcXMax then SrcX := SrcXMax;
           WorkBase := Work.GetRawPos(X, Y, 0);
           SrcBase := Src.GetRawPos(SrcX, SrcY, 0);
-          for C := 0 to 2 do
-            Work.FData[WorkBase + C] := Src.FData[SrcBase + C];
+          Move(Src.FData[SrcBase], Work.FData[WorkBase], 3 * csNeuralFloatSize);
         end;
+      end;
     end
     else
       Work.Copy(Src);
@@ -3405,27 +3420,38 @@ begin
     OffY := (Work.SizeY - CropSize) div 2;
     Dst.ReSize(CropSize, CropSize, 3);
     CropM1 := CropSize - 1;
+    DstStride := Dst.GetRawPos(1, 0, 0);
+    WorkStride := Work.GetRawPos(1, 0, 0);
+    WorkSizeXM1 := Work.SizeX - 1;
+    WorkSizeYM1 := Work.SizeY - 1;
     for Y := 0 to CropM1 do
+    begin
+      SrcY := OffY + Y;
+      RowOutY := (SrcY < 0) or (SrcY > WorkSizeYM1);
+      if not RowOutY then WorkRowBase := Work.GetRawPos(0, SrcY, 0)
+      else WorkRowBase := 0;
+      DstBase := Dst.GetRawPos(0, Y, 0);
       for X := 0 to CropM1 do
       begin
         SrcX := OffX + X;
-        SrcY := OffY + Y;
-        DstBase := Dst.GetRawPos(X, Y, 0);
         // pad with zeros if the crop window exceeds the resized image
-        if (SrcX < 0) or (SrcY < 0) or
-           (SrcX > Work.SizeX - 1) or (SrcY > Work.SizeY - 1) then
+        if RowOutY or (SrcX < 0) or (SrcX > WorkSizeXM1) then
         begin
           for C := 0 to 2 do Dst.FData[DstBase + C] := 0;
-          continue;
-        end;
-        // ---- (3) rescale by 1/255 then per-channel normalize.
-        WorkBase := Work.GetRawPos(SrcX, SrcY, 0);
-        for C := 0 to 2 do
+        end
+        else
         begin
-          V := Work.FData[WorkBase + C] / 255.0;
-          Dst.FData[DstBase + C] := (V - Mean[C]) / Std[C];
+          // ---- (3) rescale by 1/255 then per-channel normalize.
+          WorkBase := WorkRowBase + SrcX * WorkStride;
+          for C := 0 to 2 do
+          begin
+            V := Work.FData[WorkBase + C] / 255.0;
+            Dst.FData[DstBase + C] := (V - Mean[C]) / Std[C];
+          end;
         end;
+        Inc(DstBase, DstStride);
       end;
+    end;
   finally
     Work.Free;
   end;
@@ -4202,16 +4228,17 @@ end;
 procedure AugBlendTowardScalar(V: TNNetVolume; GrayPixel, Factor: TNeuralFloat);
 var
   I: integer;
-  p: TNeuralFloat;
+  p, kAdd: TNeuralFloat;
   SizeM1: integer;
 begin
   // out_px = Factor*orig_px + (1-Factor)*gray  (torchvision uses
   //   img2 = (1-ratio)*degenerate + ratio*img). Factor>1 enhances.
   SizeM1 := V.Size - 1;
+  kAdd := (1.0 - Factor) * GrayPixel;
   for I := 0 to SizeM1 do
   begin
     p := AugNeuronToPixel(V.FData[I]);
-    p := Factor * p + (1.0 - Factor) * GrayPixel;
+    p := Factor * p + kAdd;
     V.FData[I] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
   end;
 end;
@@ -4223,7 +4250,7 @@ end;
 procedure AugAffineWarp(V: TNNetVolume; const Mat: array of TNeuralFloat);
 var
   W, H, Dep, dx, dy, d, sx, sy: integer;
-  cx, cy, ox, oy, fx, fy: TNeuralFloat;
+  cx, cy, ox, oy, fx, fy, rowFx, rowFy: TNeuralFloat;
   Src: TNNetVolume;
   WM1, HM1, DepM1, VBase, SrcBase: integer;
 begin
@@ -4235,25 +4262,28 @@ begin
   cy := (H - 1) / 2.0;
   WM1 := W - 1; HM1 := H - 1; DepM1 := Dep - 1;
   for dy := 0 to HM1 do
+  begin
+    oy := dy - cy;
+    rowFx := Mat[1] * oy + Mat[2] + cx;
+    rowFy := Mat[4] * oy + Mat[5] + cy;
+    VBase := V.GetRawPos(0, dy, 0);
     for dx := 0 to WM1 do
     begin
       ox := dx - cx;
-      oy := dy - cy;
-      fx := Mat[0] * ox + Mat[1] * oy + Mat[2] + cx;
-      fy := Mat[3] * ox + Mat[4] * oy + Mat[5] + cy;
+      fx := Mat[0] * ox + rowFx;
+      fy := Mat[3] * ox + rowFy;
       sx := Round(fx);
       sy := Round(fy);
-      VBase := V.GetRawPos(dx, dy, 0);
       if (sx >= 0) and (sx < W) and (sy >= 0) and (sy < H) then
       begin
         SrcBase := Src.GetRawPos(sx, sy, 0);
-        for d := 0 to DepM1 do
-          V.FData[VBase + d] := Src.FData[SrcBase + d];
+        Move(Src.FData[SrcBase], V.FData[VBase], Dep * csNeuralFloatSize);
       end
       else
-        for d := 0 to DepM1 do
-          V.FData[VBase + d] := 0.0; // neutral gray fill (pixel 128)
+        FillChar(V.FData[VBase], Dep * csNeuralFloatSize, 0); // neutral gray fill (pixel 128)
+      Inc(VBase, Dep);
     end;
+  end;
   Src.Free;
 end;
 
@@ -4317,7 +4347,7 @@ begin
   XStride := V.GetRawPos(1, 0, 0);
   for d := 0 to DepthM1 do
   begin
-    for i := 0 to 255 do hist[i] := 0;
+    FillChar(hist, SizeOf(hist), 0);
     for y := 0 to SizeYM1 do
     begin
       Pos := V.GetRawPos(0, y, d);
@@ -4379,7 +4409,7 @@ end;
 procedure AugColor(V: TNNetVolume; Factor: TNeuralFloat);
 var
   W, H, Dep, x, y, d: integer;
-  gray, p: TNeuralFloat;
+  gray, p, OneMinusFactor, pixelAdd: TNeuralFloat;
   WM1, HM1, DepM1, Base: integer;
 begin
   // Saturation adjustment: blend each pixel toward its per-pixel grayscale.
@@ -4390,6 +4420,7 @@ begin
     Exit;
   end;
   WM1 := W - 1; HM1 := H - 1; DepM1 := Dep - 1;
+  OneMinusFactor := 1.0 - Factor;
   for y := 0 to HM1 do
     for x := 0 to WM1 do
     begin
@@ -4398,10 +4429,11 @@ begin
       for d := 0 to DepM1 do
         gray := gray + AugClampPixel(AugNeuronToPixel(V.FData[Base + d]));
       gray := gray / Dep;
+      pixelAdd := OneMinusFactor * gray;
       for d := 0 to DepM1 do
       begin
         p := AugClampPixel(AugNeuronToPixel(V.FData[Base + d]));
-        p := Factor * p + (1.0 - Factor) * gray;
+        p := Factor * p + pixelAdd;
         V.FData[Base + d] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
       end;
     end;
@@ -4424,7 +4456,7 @@ var
   W, H, Dep, x, y, d, ix, iy: integer;
   Src: TNNetVolume;
   acc, wsum, p, smooth: TNeuralFloat;
-  kw: TNeuralFloat;
+  kw, OneMinusFactor: TNeuralFloat;
   WM1, HM1, DepM1, CtrPos: integer;
 begin
   // Blend toward a 3x3 box-blurred image (torchvision uses a smoothing kernel;
@@ -4434,6 +4466,7 @@ begin
   Src := TNNetVolume.Create;
   Src.Copy(V);
   WM1 := W - 1; HM1 := H - 1; DepM1 := Dep - 1;
+  OneMinusFactor := 1.0 - Factor;
   for d := 0 to DepM1 do
     for y := 0 to HM1 do
       for x := 0 to WM1 do
@@ -4452,7 +4485,7 @@ begin
         smooth := acc / wsum;
         CtrPos := Src.GetRawPos(x, y, d);
         p := AugClampPixel(AugNeuronToPixel(Src.FData[CtrPos]));
-        p := Factor * p + (1.0 - Factor) * smooth;
+        p := Factor * p + OneMinusFactor * smooth;
         V.FData[CtrPos] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
       end;
   Src.Free;
@@ -4651,7 +4684,7 @@ procedure NeuralRandomErasing(V: TNNetVolume;
 var
   W, H, Dep, area, x0, y0, ew, eh, x, y, d, attempt: integer;
   targetArea, aspect, logLo, logHi: TNeuralFloat;
-  YMax, XMax, DepM1, Base: integer;
+  YMax, XMax, DepM1, Base, RunLen: integer;
 begin
   if (V = nil) or (V.Size = 0) then Exit;
   if Random >= pProb then Exit;
@@ -4673,13 +4706,16 @@ begin
       YMax := y0 + eh - 1;
       XMax := x0 + ew - 1;
       DepM1 := Dep - 1;
+      RunLen := ew * Dep; // whole x-run per row is contiguous
       for y := y0 to YMax do
-        for x := x0 to XMax do
-        begin
-          Base := V.GetRawPos(x, y, 0);
-          for d := 0 to DepM1 do
+      begin
+        Base := V.GetRawPos(x0, y, 0);
+        if pFill = 0 then
+          FillChar(V.FData[Base], RunLen * csNeuralFloatSize, 0)
+        else
+          for d := 0 to RunLen - 1 do
             V.FData[Base + d] := pFill;
-        end;
+      end;
       Exit;
     end;
   end;
