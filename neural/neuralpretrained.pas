@@ -54230,9 +54230,9 @@ var
   NN: TNNet;
   PatchConv, PosEmb, PreLN, PostLN, Proj: TNNetLayer;
   Blocks: TClipBlockLayersArray;
-  Tbl: TNNetVolume;
-  Grid, NumPatches, BlockCnt, BuiltLayers, ChanCnt: integer;
-  BuiltLayersM1, HiddenSizeM1: integer;
+  Tbl, WVol: TNNetVolume;
+  Grid, NumPatches, BlockCnt, BuiltLayers: integer;
+  BuiltLayersM1: integer;
   PreLNName: string;
 begin
   if (Tower.NumHeads < 1) or
@@ -54280,7 +54280,6 @@ begin
       BuiltLayers := Tower.NumLayers;
     if BuiltLayers < 0 then BuiltLayers := 0;
     BuiltLayersM1 := BuiltLayers - 1;
-    HiddenSizeM1 := Tower.HiddenSize - 1;
     SetLength(Blocks, BuiltLayers);
     for BlockCnt := 0 to BuiltLayersM1 do
       AddClipEncoderBlock(NN, Tower, {CausalMask=}false,
@@ -54324,9 +54323,8 @@ begin
           'embeddings.class_embedding" must have ' +
           IntToStr(Tower.HiddenSize) + ' elements, got ' +
           IntToStr(Tbl.Size) + '.');
-      for ChanCnt := 0 to HiddenSizeM1 do
-        PosEmb.FArrNeurons[0].Weights.FData[ChanCnt] :=
-          PosEmb.FArrNeurons[0].Weights.FData[ChanCnt] + Tbl.FData[ChanCnt];
+      WVol := PosEmb.FArrNeurons[0].Weights;
+      TNNetVolume.Add(WVol.GetRawPtr(0), Tbl.GetRawPtr(0), Tower.HiddenSize);
       PosEmb.FlushWeightCache();
     finally
       Tbl.Free;
@@ -54500,7 +54498,7 @@ var
   Kind: TOpenClipReaderKind;
   Src: TNNetVolume;
   RowBase, Rows, Cols, r, c: integer;
-  ColsM1, RowsM1, FWidthM1: integer;
+  ColsM1, RowsM1: integer;
 begin
   Idx := FindTensor(pName);
   if Idx < 0 then
@@ -54537,21 +54535,16 @@ begin
     end;
     if Src.Size = 3 * FWidth then
     begin
-      // bias [3*Width] -> [Width]
+      // bias [3*Width] -> [Width] (contiguous slice, single Move)
       Dest.ReSize(FWidth, 1, 1);
-      FWidthM1 := FWidth - 1;
-      for r := 0 to FWidthM1 do
-        Dest.FData[r] := Src.FData[RowBase + r];
+      Move(Src.FData[RowBase], Dest.FData[0], FWidth * csNeuralFloatSize);
     end
     else
     begin
-      // weight [3*Width, Width] -> [Width, Width]
+      // weight [3*Width, Width] -> [Width, Width] (contiguous slab, single Move)
       Dest.ReSize(FWidth * FWidth, 1, 1);
-      FWidthM1 := FWidth - 1;
-      for r := 0 to FWidthM1 do
-        for c := 0 to FWidthM1 do
-          Dest.FData[r * FWidth + c] :=
-            Src.FData[(RowBase + r) * FWidth + c];
+      Move(Src.FData[RowBase * FWidth], Dest.FData[0],
+        FWidth * FWidth * csNeuralFloatSize);
     end;
   finally
     Src.Free;
@@ -55347,9 +55340,8 @@ begin
       if Tmp.Size <> d then
         ImportError('BLIP import: class_embedding must have ' +
           IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
-      for ci := 0 to DM1 do
-        PosEmb.FArrNeurons[0].Weights.FData[ci] :=
-          PosEmb.FArrNeurons[0].Weights.FData[ci] + Tmp.FData[ci];
+      TNNetVolume.Add(PosEmb.FArrNeurons[0].Weights.GetRawPtr(0),
+        Tmp.GetRawPtr(0), d);
       PosEmb.FlushWeightCache();
     finally
       Tmp.Free;
@@ -55978,9 +55970,8 @@ begin
         ImportError('TrOCR import: cls_token must have ' +
           IntToStr(Tower.HiddenSize) + ' elements, got ' +
           IntToStr(Tmp.Size) + '.');
-      for ci := 0 to TowerHiddenSizeM1 do
-        PosEmb.FArrNeurons[0].Weights.FData[ci] :=
-          PosEmb.FArrNeurons[0].Weights.FData[ci] + Tmp.FData[ci];
+      TNNetVolume.Add(PosEmb.FArrNeurons[0].Weights.GetRawPtr(0),
+        Tmp.GetRawPtr(0), Tower.HiddenSize);
       Consumed.Add('encoder.embeddings.cls_token');
       // distillation_token [1,1,hidden] folded into position row 1.
       if not Reader.HasTensor('encoder.embeddings.distillation_token') then
@@ -55991,10 +55982,8 @@ begin
         ImportError('TrOCR import: distillation_token must have ' +
           IntToStr(Tower.HiddenSize) + ' elements, got ' +
           IntToStr(Tmp.Size) + '.');
-      for ci := 0 to TowerHiddenSizeM1 do
-        PosEmb.FArrNeurons[0].Weights.FData[Tower.HiddenSize + ci] :=
-          PosEmb.FArrNeurons[0].Weights.FData[Tower.HiddenSize + ci] +
-          Tmp.FData[ci];
+      TNNetVolume.Add(PosEmb.FArrNeurons[0].Weights.GetRawPtr(Tower.HiddenSize),
+        Tmp.GetRawPtr(0), Tower.HiddenSize);
       PosEmb.FlushWeightCache();
       Consumed.Add('encoder.embeddings.distillation_token');
     finally
@@ -57302,9 +57291,8 @@ begin
       if Tmp.Size <> d then
         ImportError('ViT import: "vit.embeddings.cls_token" must have ' +
           IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
-      for ci := 0 to dM1 do
-        PosEmb.FArrNeurons[0].Weights.FData[ci] :=
-          PosEmb.FArrNeurons[0].Weights.FData[ci] + Tmp.FData[ci];
+      TNNetVolume.Add(PosEmb.FArrNeurons[0].Weights.GetRawPtr(0),
+        Tmp.GetRawPtr(0), d);
       PosEmb.FlushWeightCache();
     finally
       Tmp.Free;
@@ -57504,9 +57492,10 @@ procedure LoadResNetConvFoldBN(Reader: TNNetSafeTensorsReader;
   OutCh, InCh, K: integer; BnEps: TNeuralFloat);
 var
   W, Gamma, Beta, Mean, Var_: TNNetVolume;
-  o, c, ky, kx: integer;
+  o, c, ky, kx, kBase: integer;
   OutChM1, InChM1, KM1: integer;
   Scale, Shift, Denom: TNeuralFloat;
+  WVol: TNNetVolume;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(ConvWName) then
@@ -57566,11 +57555,15 @@ begin
         Scale := 1.0;
         Shift := 0.0;
       end;
+      WVol := Layer.FArrNeurons[o].Weights;
       for ky := 0 to KM1 do
         for kx := 0 to KM1 do
+        begin
+          kBase := (ky * K + kx) * InCh;
           for c := 0 to InChM1 do
-            Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+            WVol.FData[kBase + c] :=
               W.FData[((o * InCh + c) * K + ky) * K + kx] * Scale;
+        end;
       Layer.FArrNeurons[o].BiasWeight := Shift;
     end;
     Layer.FlushWeightCache();
@@ -57592,9 +57585,10 @@ procedure LoadInceptionRectConvFoldBN(Reader: TNNetSafeTensorsReader;
   OutCh, InCh, Kh, Kw: integer; BnEps: TNeuralFloat);
 var
   W, Gamma, Beta, Mean, Var_: TNNetVolume;
-  o, c, ky, kx: integer;
+  o, c, ky, kx, kBase: integer;
   OutChM1, InChM1, KhM1, KwM1: integer;
   Scale, Shift, Denom: TNeuralFloat;
+  WVol: TNNetVolume;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(ConvWName) then
@@ -57654,11 +57648,15 @@ begin
         Scale := 1.0;
         Shift := 0.0;
       end;
+      WVol := Layer.FArrNeurons[o].Weights;
       for ky := 0 to KhM1 do
         for kx := 0 to KwM1 do
+        begin
+          kBase := (ky * Kw + kx) * InCh;
           for c := 0 to InChM1 do
-            Layer.FArrNeurons[o].Weights.FData[(ky * Kw + kx) * InCh + c] :=
+            WVol.FData[kBase + c] :=
               W.FData[((o * InCh + c) * Kh + ky) * Kw + kx] * Scale;
+        end;
       Layer.FArrNeurons[o].BiasWeight := Shift;
     end;
     Layer.FlushWeightCache();
@@ -57985,8 +57983,8 @@ procedure ReparamRepVGGBlock(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const Prefix: string;
   OutCh, InCh: integer; Has1x1, HasIdentity: boolean; BnEps: TNeuralFloat);
 var
-  Wd, W1, Gd, Bd, Md, Vd, G1, B1, M1, V1, Gi, Bi, Mi, Vi: TNNetVolume;
-  o, c, ky, kx, OutChM1, InChM1: integer;
+  Wd, W1, Gd, Bd, Md, Vd, G1, B1, M1, V1, Gi, Bi, Mi, Vi, WVol: TNNetVolume;
+  o, c, ky, kx, kBase, OutChM1, InChM1: integer;
   Sd, Sh, Den, S1, H1, Si, Hi, Acc: TNeuralFloat;
 
   procedure NeedBN(const P: string; Ga, Be, Me, Va: TNNetVolume);
@@ -58082,8 +58080,11 @@ begin
         Hi := Bi.FData[o] - Gi.FData[o] * Mi.FData[o] / Den;
       end
       else begin Si := 0.0; Hi := 0.0; end;
+      WVol := Layer.FArrNeurons[o].Weights;
       for ky := 0 to 2 do
         for kx := 0 to 2 do
+        begin
+          kBase := (ky * 3 + kx) * InCh;
           for c := 0 to InChM1 do
           begin
             // dense 3x3 kernel (torch [o,c,ky,kx]).
@@ -58094,8 +58095,9 @@ begin
             // identity centred 3x3 identity kernel.
             if HasIdentity and (ky = 1) and (kx = 1) and (c = o) then
               Acc := Acc + Si;
-            Layer.FArrNeurons[o].Weights.FData[(ky * 3 + kx) * InCh + c] := Acc;
+            WVol.FData[kBase + c] := Acc;
           end;
+        end;
       Layer.FArrNeurons[o].BiasWeight := Sh + H1 + Hi;
     end;
     Layer.FlushWeightCache();
@@ -58224,8 +58226,8 @@ end;
 procedure LoadMaskRCNNConv(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BName: string; OutCh, InCh, K: integer);
 var
-  W, B: TNNetVolume;
-  o, c, ky, kx, OutChM1, InChM1, KM1: integer;
+  W, B, WVol: TNNetVolume;
+  o, c, ky, kx, kBase, OutChM1, InChM1, KM1: integer;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -58253,11 +58255,15 @@ begin
     OutChM1 := OutCh - 1;  InChM1 := InCh - 1;  KM1 := K - 1;
     for o := 0 to OutChM1 do
     begin
+      WVol := Layer.FArrNeurons[o].Weights;
       for ky := 0 to KM1 do
         for kx := 0 to KM1 do
+        begin
+          kBase := (ky * K + kx) * InCh;
           for c := 0 to InChM1 do
-            Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+            WVol.FData[kBase + c] :=
               W.FData[((o * InCh + c) * K + ky) * K + kx];
+        end;
       Layer.FArrNeurons[o].BiasWeight := B.FData[o];
     end;
     Layer.FlushWeightCache();
@@ -58427,8 +58433,8 @@ end;
 procedure LoadMaskRCNNFlatFC(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BName: string; InDim, OutDim: integer);
 var
-  W, B: TNNetVolume;
-  o, i, OutM1, InDimM1: integer;
+  W, B, WVol: TNNetVolume;
+  o, OutM1: integer;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -58452,11 +58458,10 @@ begin
       ImportError('Mask R-CNN import: "' + BName + '" must have ' +
         IntToStr(OutDim) + ' elements.');
     OutM1 := OutDim - 1;
-    InDimM1 := InDim - 1;
     for o := 0 to OutM1 do
     begin
-      for i := 0 to InDimM1 do
-        Layer.FArrNeurons[o].Weights.FData[i] := W.FData[o * InDim + i];
+      WVol := Layer.FArrNeurons[o].Weights;
+      Move(W.FData[o * InDim], WVol.FData[0], InDim * csNeuralFloatSize);
       Layer.FArrNeurons[o].BiasWeight := B.FData[o];
     end;
     Layer.FlushWeightCache();
@@ -58474,8 +58479,8 @@ procedure LoadMaskRCNNDeconv(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BName: string;
   InCh, OutCh, K: integer);
 var
-  W, B: TNNetVolume;
-  o, c, ky, kx, OutM1, InM1, KM1: integer;
+  W, B, WVol: TNNetVolume;
+  o, c, ky, kx, kBase, OutM1, InM1, KM1: integer;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -58503,11 +58508,15 @@ begin
     OutM1 := OutCh - 1;  InM1 := InCh - 1;  KM1 := K - 1;
     for o := 0 to OutM1 do
     begin
+      WVol := Layer.FArrNeurons[o].Weights;
       for ky := 0 to KM1 do
         for kx := 0 to KM1 do
+        begin
+          kBase := (ky * K + kx) * InCh;
           for c := 0 to InM1 do
-            Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+            WVol.FData[kBase + c] :=
               W.FData[((c * OutCh + o) * K + ky) * K + kx];
+        end;
       Layer.FArrNeurons[o].BiasWeight := B.FData[o];
     end;
     Layer.FlushWeightCache();
@@ -58851,8 +58860,8 @@ end;
 procedure LoadConvNeXtConv(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BName: string; OutCh, InCh, K: integer);
 var
-  W, B: TNNetVolume;
-  o, c, ky, kx: integer;
+  W, B, WVol: TNNetVolume;
+  o, c, ky, kx, kBase: integer;
   OutChM1, InChM1, KM1: integer;
 begin
   EnsureWritableImportWeights(Layer);
@@ -58883,11 +58892,15 @@ begin
     KM1 := K - 1;
     for o := 0 to OutChM1 do
     begin
+      WVol := Layer.FArrNeurons[o].Weights;
       for ky := 0 to KM1 do
         for kx := 0 to KM1 do
+        begin
+          kBase := (ky * K + kx) * InCh;
           for c := 0 to InChM1 do
-            Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
+            WVol.FData[kBase + c] :=
               W.FData[((o * InCh + c) * K + ky) * K + kx];
+        end;
       Layer.FArrNeurons[o].BiasWeight := B.FData[o];
     end;
     Layer.FlushWeightCache();
@@ -59319,9 +59332,9 @@ procedure LoadSegformer1x1(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName: string; OutCh, InCh: integer;
   const BName: string = '');
 var
-  W, B: TNNetVolume;
-  o, c: integer;
-  OutChM1, InChM1: integer;
+  W, B, WVol: TNNetVolume;
+  o: integer;
+  OutChM1: integer;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -59347,11 +59360,10 @@ begin
           IntToStr(OutCh) + ' elements.');
     end;
     OutChM1 := OutCh - 1;
-    InChM1 := InCh - 1;
     for o := 0 to OutChM1 do
     begin
-      for c := 0 to InChM1 do
-        Layer.FArrNeurons[o].Weights.FData[c] := W.FData[o * InCh + c];
+      WVol := Layer.FArrNeurons[o].Weights;
+      Move(W.FData[o * InCh], WVol.FData[0], InCh * csNeuralFloatSize);
       if BName <> '' then Layer.FArrNeurons[o].BiasWeight := B.FData[o]
       else Layer.FArrNeurons[o].BiasWeight := 0;
     end;
@@ -62111,6 +62123,7 @@ var
   Mat: TNNetVolume;
   RegBase: integer;
   qReg, kReg: integer;
+  iBase, ij: integer;
 begin
   ws2 := WindowSize * WindowSize;
   ws2M1 := ws2 - 1;
@@ -62118,18 +62131,22 @@ begin
   Mat := TNNetVolume.Create(ws2 * ws2, 1, 1);
   try
     for i := 0 to ws2M1 do
+    begin
+      iBase := i * ws2;
+      qReg := RegionId[RegBase + i];
       for j := 0 to ws2M1 do
       begin
-        idx := RelPosIndex[i * ws2 + j];
+        ij := iBase + j;
+        idx := RelPosIndex[ij];
         // BiasTable row = idx, column = head: flat index idx*NumHeads + head.
-        Mat.FData[i * ws2 + j] := BiasTable.FData[idx * NumHeads + HeadIdx];
+        Mat.FData[ij] := BiasTable.FData[idx * NumHeads + HeadIdx];
         // cyclic-shift mask: -100 (HF) when the two tokens are in different
         // image regions. We use a large negative sentinel.
-        qReg := RegionId[RegBase + i];
         kReg := RegionId[RegBase + j];
         if qReg <> kReg then
-          Mat.FData[i * ws2 + j] := Mat.FData[i * ws2 + j] - 1e9;
+          Mat.FData[ij] := Mat.FData[ij] - 1e9;
       end;
+    end;
     TNNetWindowAttention(WinAttn).SetBiasMatrix(Mat);
   finally
     Mat.Free;
@@ -69593,7 +69610,7 @@ var
   // vision tower
   PatchConv, VPosEmb, VPreLN: TNNetLayer;
   VBlocks: TClipBlockLayersArray;
-  Tbl: TNNetVolume;
+  Tbl, WVol: TNNetVolume;
   // decoder
   TapInputs, ReduceLayers: array of TNNetLayer;
   CondInput, FilmMul, FilmAdd, FilmCond, Acc, Reduced, FilmOut: TNNetLayer;
@@ -69601,7 +69618,7 @@ var
   CplxK: integer;
   DecRefs: array of TCLIPSegDecoderRefs;
   SeqLen, Grid, NumPatches, NumTaps, i, TapBlock, ChanCnt, NumTokens: integer;
-  NumTapsM1, VisionNumLayersM1, TextNumLayersM1, VisionHiddenSizeM1: integer;
+  NumTapsM1, VisionNumLayersM1, TextNumLayersM1: integer;
   PreLNName: string;
 begin
   VisionNet := nil;
@@ -69631,7 +69648,6 @@ begin
   NumTapsM1 := NumTaps - 1;
   VisionNumLayersM1 := Config.Vision.NumLayers - 1;
   TextNumLayersM1 := Config.Text.NumLayers - 1;
-  VisionHiddenSizeM1 := Config.Vision.HiddenSize - 1;
   if NumTaps < 1 then
     ImportError('CLIPSeg import: extract_layers must list at least one block.');
   for i := 0 to NumTapsM1 do
@@ -69687,9 +69703,9 @@ begin
       try
         Reader.LoadTensorFlat(
           'clip.vision_model.embeddings.class_embedding', Tbl);
-        for ChanCnt := 0 to VisionHiddenSizeM1 do
-          VPosEmb.FArrNeurons[0].Weights.FData[ChanCnt] :=
-            VPosEmb.FArrNeurons[0].Weights.FData[ChanCnt] + Tbl.FData[ChanCnt];
+        WVol := VPosEmb.FArrNeurons[0].Weights;
+        TNNetVolume.Add(WVol.GetRawPtr(0), Tbl.GetRawPtr(0),
+          Config.Vision.HiddenSize);
         VPosEmb.FlushWeightCache();
       finally
         Tbl.Free;
@@ -70611,9 +70627,8 @@ begin
       if Tmp.Size <> d then
         ImportError('DINOv2 import: "dinov2.embeddings.cls_token" must have ' +
           IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
-      for ci := 0 to DM1 do
-        PosEmb.FArrNeurons[0].Weights.FData[ci] :=
-          PosEmb.FArrNeurons[0].Weights.FData[ci] + Tmp.FData[ci];
+      TNNetVolume.Add(PosEmb.FArrNeurons[0].Weights.GetRawPtr(0),
+        Tmp.GetRawPtr(0), d);
       PosEmb.FlushWeightCache();
     finally
       Tmp.Free;
@@ -73136,9 +73151,8 @@ begin
           'resolution only).');
       PosEmb.FArrNeurons[0].Weights.Copy(Tmp);
       Reader.LoadTensorFlat(Pfx + 'embeddings.cls_token', Tmp);
-      for ci := 0 to dM1 do
-        PosEmb.FArrNeurons[0].Weights.FData[ci] :=
-          PosEmb.FArrNeurons[0].Weights.FData[ci] + Tmp.FData[ci];
+      TNNetVolume.Add(PosEmb.FArrNeurons[0].Weights.GetRawPtr(0),
+        Tmp.GetRawPtr(0), d);
       PosEmb.FlushWeightCache();
     finally Tmp.Free; end;
     for BlockCnt := 0 to NumLayersM1 do
@@ -73757,7 +73771,7 @@ const
   cNormEps = 0.000001;
   cTwoPi = 6.283185307179586;
 var
-  nfeat, t, x, y, i, half: integer;
+  nfeat, t, x, y, i, half, tBase: integer;
   GridHM1, GridWM1, nfeatM1: integer;
   YEmbed, XEmbed, DimT, Ang: double;
   W: TNNetVolume;
@@ -73776,6 +73790,7 @@ begin
     for x := 0 to GridWM1 do
     begin
       t := y * GridW + x;
+      tBase := t * DModel;
       YEmbed := ((y + 1) / (GridH + cNormEps)) * cTwoPi;
       XEmbed := ((x + 1) / (GridW + cNormEps)) * cTwoPi;
       for i := 0 to nfeatM1 do
@@ -73784,12 +73799,12 @@ begin
         DimT := Power(10000.0, (2.0 * half) / nfeat);
         // pos_y -> channels 0..nfeat-1 ; even index sin, odd index cos.
         Ang := YEmbed / DimT;
-        if (i and 1) = 0 then W.FData[t * DModel + i] := Sin(Ang)
-        else W.FData[t * DModel + i] := Cos(Ang);
+        if (i and 1) = 0 then W.FData[tBase + i] := Sin(Ang)
+        else W.FData[tBase + i] := Cos(Ang);
         // pos_x -> channels nfeat..2*nfeat-1.
         Ang := XEmbed / DimT;
-        if (i and 1) = 0 then W.FData[t * DModel + nfeat + i] := Sin(Ang)
-        else W.FData[t * DModel + nfeat + i] := Cos(Ang);
+        if (i and 1) = 0 then W.FData[tBase + nfeat + i] := Sin(Ang)
+        else W.FData[tBase + nfeat + i] := Cos(Ang);
       end;
     end;
   Layer.FlushWeightCache();
@@ -73803,7 +73818,6 @@ procedure LoadDetrLearnedPosEmbed(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName: string; Rows, DModel: integer);
 var
   Tmp: TNNetVolume;
-  t, c, RowsM1, DModelM1: integer;
 begin
   if not Reader.HasTensor(WName) then
     ImportError('DETR import: missing tensor "' + WName + '".');
@@ -73816,12 +73830,9 @@ begin
   Tmp := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(WName, Tmp);
-    RowsM1 := Rows - 1;
-    DModelM1 := DModel - 1;
-    for t := 0 to RowsM1 do
-      for c := 0 to DModelM1 do
-        Layer.FArrNeurons[0].Weights.FData[t * DModel + c] :=
-          Tmp.FData[t * DModel + c];
+    // whole table [Rows, DModel] is contiguous in both volumes -> single Move
+    Move(Tmp.FData[0], Layer.FArrNeurons[0].Weights.FData[0],
+      Rows * DModel * csNeuralFloatSize);
     Layer.FlushWeightCache();
   finally
     Tmp.Free;
@@ -80865,7 +80876,7 @@ end;
 procedure FillVideoMAEPosTable(PosEmb: TNNetLayer;
   TGrid, HGrid, WGrid, Hidden: integer);
 var
-  tt, hh, ww, j, NativeRow, HFPos: integer;
+  tt, hh, ww, j, NativeRow, HFPos, rowBase: integer;
   TGridM1, HGridM1, WGridM1, HiddenM1: integer;
   Angle, Power: double;
   Tbl: TNNetVolume;
@@ -80881,14 +80892,15 @@ begin
       begin
         NativeRow := (hh * WGrid + ww) * TGrid + tt;
         HFPos := (tt * HGrid + hh) * WGrid + ww;
+        rowBase := NativeRow * Hidden;
         for j := 0 to HiddenM1 do
         begin
           Power := Exp((2 * (j div 2) / Hidden) * Ln(10000.0));
           Angle := HFPos / Power;
           if (j and 1) = 0 then
-            Tbl.FData[NativeRow * Hidden + j] := Sin(Angle)
+            Tbl.FData[rowBase + j] := Sin(Angle)
           else
-            Tbl.FData[NativeRow * Hidden + j] := Cos(Angle);
+            Tbl.FData[rowBase + j] := Cos(Angle);
         end;
       end;
   PosEmb.FlushWeightCache();
@@ -81507,14 +81519,10 @@ end;
 // shaped [Hidden, 1, In] row-major - i.e. an exact row-for-row block copy.
 procedure CopyGateWeightBlock(T: TNNetVolume; G, GateIdx, Hidden, InW: integer;
   Dest: TNNetVolume);
-var d, j: integer;
-  HiddenM1, InWM1: integer;
 begin
-  HiddenM1 := Hidden - 1;
-  InWM1 := InW - 1;
-  for d := 0 to HiddenM1 do
-    for j := 0 to InWM1 do
-      Dest.FData[d * InW + j] := T.FData[(GateIdx * Hidden + d) * InW + j];
+  // source block and dest are both fully contiguous over [Hidden, InW]
+  Move(T.FData[GateIdx * Hidden * InW], Dest.FData[0],
+    Hidden * InW * csNeuralFloatSize);
 end;
 
 // Sums torch bias_ih + bias_hh gate block g into the cell's per-gate bias.
