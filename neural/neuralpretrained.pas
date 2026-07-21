@@ -24635,8 +24635,7 @@ end;
 procedure BertPoolSentenceEmbedding(HiddenStates: TNNetVolume;
   RealTokens: integer; Embedding: TNNetVolume);
 var
-  SeqLen, Depth, PosCnt, ChanCnt, DepthM1, RealMax: integer;
-  Sum: TNeuralFloat;
+  SeqLen, Depth, PosCnt, RealMax: integer;
 begin
   SeqLen := HiddenStates.SizeX;
   Depth := HiddenStates.Depth;
@@ -24648,17 +24647,15 @@ begin
     ImportError('BertPoolSentenceEmbedding: RealTokens ' +
       IntToStr(RealTokens) + ' out of range 1..' + IntToStr(SeqLen) + '.');
   Embedding.ReSize(1, 1, Depth);
-  DepthM1 := Depth - 1;
   RealMax := RealTokens - 1;
   // manual sum/count over the REAL rows only (never TNNetAvgChannel: it
   // averages all SeqLen rows, pads included)
-  for ChanCnt := 0 to DepthM1 do
-  begin
-    Sum := 0;
-    for PosCnt := 0 to RealMax do
-      Sum := Sum + HiddenStates.FData[PosCnt * Depth + ChanCnt];
-    Embedding.FData[ChanCnt] := Sum / RealTokens;
-  end;
+  // #13/App.E: interchange to row-outer bulk Add (cache-friendly), then scale
+  Embedding.Fill(0);
+  for PosCnt := 0 to RealMax do
+    TNNetVolume.Add(Embedding.GetRawPtr(0), HiddenStates.GetRawPtr(PosCnt, 0),
+      Depth);
+  TNNetVolume.Mul(Embedding.GetRawPtr(0), 1 / RealTokens, Depth);
   // L2-normalize the single (1,1,Depth) embedding vector
   NormalizeRowsL2(Embedding);
 end;
@@ -24701,8 +24698,9 @@ procedure PoolSentenceEmbedding(HiddenStates: TNNetVolume;
   RealTokens: integer; Pooling: TNNetEmbedPooling; Embedding: TNNetVolume;
   Normalize: boolean = True);
 var
-  SeqLen, Depth, ChanCnt, SrcRow, DepthM1, RealMax: integer;
+  SeqLen, Depth, SrcRow, RealMax: integer;
   Norm: TNeuralFloat;
+  P: pointer;
 begin
   SeqLen := HiddenStates.SizeX;
   Depth := HiddenStates.Depth;
@@ -24720,7 +24718,6 @@ begin
     Exit;
   end;
   Embedding.ReSize(1, 1, Depth);
-  DepthM1 := Depth - 1;
   RealMax := RealTokens - 1;
   case Pooling of
     epCLS:        SrcRow := 0;
@@ -24729,25 +24726,25 @@ begin
     SrcRow := -1; // epMean (un-normalized) handled below
   end;
   if SrcRow >= 0 then
-    for ChanCnt := 0 to DepthM1 do
-      Embedding.FData[ChanCnt] := HiddenStates.FData[SrcRow * Depth + ChanCnt]
+    // #13/#5: contiguous row copy (SrcRow*Depth hoisted out of the loop)
+    Move(HiddenStates.FData[SrcRow * Depth], Embedding.FData[0],
+      Depth * csNeuralFloatSize)
   else
-    for ChanCnt := 0 to DepthM1 do
-    begin
-      Norm := 0; // reuse Norm as a row accumulator
-      for SrcRow := 0 to RealMax do
-        Norm := Norm + HiddenStates.FData[SrcRow * Depth + ChanCnt];
-      Embedding.FData[ChanCnt] := Norm / RealTokens;
-    end;
+  begin
+    // #13/App.E: row-outer bulk Add (cache-friendly) then scale
+    Embedding.Fill(0);
+    for SrcRow := 0 to RealMax do
+      TNNetVolume.Add(Embedding.GetRawPtr(0),
+        HiddenStates.GetRawPtr(SrcRow, 0), Depth);
+    TNNetVolume.Mul(Embedding.GetRawPtr(0), 1 / RealTokens, Depth);
+  end;
   if Normalize then
   begin
-    Norm := 0;
-    for ChanCnt := 0 to DepthM1 do
-      Norm := Norm + Embedding.FData[ChanCnt] * Embedding.FData[ChanCnt];
-    Norm := Sqrt(Norm);
+    // #13: L2 norm via bulk dot-product + reciprocal bulk scale
+    P := Embedding.GetRawPtr(0);
+    Norm := Sqrt(TNNetVolume.DotProduct(P, P, Depth));
     if Norm > 0 then
-      for ChanCnt := 0 to DepthM1 do
-        Embedding.FData[ChanCnt] := Embedding.FData[ChanCnt] / Norm;
+      TNNetVolume.Mul(P, 1 / Norm, Depth);
   end;
 end;
 
@@ -25161,8 +25158,8 @@ procedure ColBERTEmbedTokens(Net: TNNet; Tokenizer: TNeuralHFTokenizer;
 var
   TokenIds: TNeuralIntegerArray;
   Input, Proj: TNNetVolume;
-  SeqLen, Dim, RealTokens, PosCnt, ChanCnt, InDepth: integer;
-  SeqLenM1, RealTokensM1, DimM1: integer;
+  SeqLen, Dim, RealTokens, PosCnt, InDepth: integer;
+  SeqLenM1: integer;
 begin
   SeqLen := Net.Layers[0].Output.SizeX;
   InDepth := Net.Layers[0].Output.Depth;
@@ -25196,12 +25193,8 @@ begin
         IntToStr(Dim) + '.');
     // Keep only the MaxSim-contributing rows (skip [PAD] for documents).
     Mat.ReSize(RealTokens, 1, Dim);
-    RealTokensM1 := RealTokens - 1;
-    DimM1 := Dim - 1;
-    for PosCnt := 0 to RealTokensM1 do
-      for ChanCnt := 0 to DimM1 do
-        Mat.FData[PosCnt * Dim + ChanCnt] :=
-          Proj.FData[PosCnt * Dim + ChanCnt];
+    // #13/#11: both sides are the same contiguous (RealTokens*Dim) prefix
+    Move(Proj.FData[0], Mat.FData[0], RealTokens * Dim * csNeuralFloatSize);
     ColBERTNormalizeRows(Mat);
   finally
     Proj.Free;
@@ -25212,7 +25205,8 @@ end;
 function ColBERTMaxSimScore(QueryMat, DocMat: TNNetVolume): TNeuralFloat;
 var
   QRows, DRows, Dim, Qi, Di, C: integer;
-  QRowsM1, DRowsM1, DimM1: integer;
+  QRowsM1, DRowsM1, DimM1, posD: integer;
+  QRow: pointer;
   Dot, Best: TNeuralFloat;
 begin
   Dim := QueryMat.Depth;
@@ -25233,13 +25227,15 @@ begin
   DimM1 := Dim - 1;
   for Qi := 0 to QRowsM1 do
   begin
+    QRow := QueryMat.GetRawPtr(Qi, 0); // #11: hoist query row ptr above Di loop
     Best := -1e30;
+    posD := 0;
     for Di := 0 to DRowsM1 do
     begin
-      Dot := 0;
-      for C := 0 to DimM1 do
-        Dot := Dot + QueryMat.FData[Qi * Dim + C] * DocMat.FData[Di * Dim + C];
+      // #13: elementwise dot -> bulk method; #12: carry doc offset
+      Dot := TNNetVolume.DotProduct(QRow, DocMat.GetRawPtr(posD), Dim);
       if Dot > Best then Best := Dot;
+      Inc(posD, Dim);
     end;
     Result := Result + Best;
   end;
