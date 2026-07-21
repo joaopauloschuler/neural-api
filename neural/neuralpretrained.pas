@@ -4543,6 +4543,10 @@ type
     FEncStages, FDecStages: array of TEnCodecStage;
     FEncLSTM, FDecLSTM: TEnCodecLSTM;
     FCodebooks: array of TEnCodecMat;   // [NumQuantizers] each [size, dim]
+    // #14: per-codebook per-row ||c||^2, computed ONCE at model load. Lets the
+    // RVQ nearest search rank on (||c||^2 - 2 r.c) via an AVX dot instead of
+    // the scalar diff-square loop (||r||^2 is shared, so it cancels).
+    FCodebookNormSqr: array of TNeuralFloatDynArr; // [q][K]
     // Worker pool for the conv kernels, sized like neuralfit (NeuralDefault
     // ThreadCount, settable via MaxThreadNum). Built lazily on the first
     // encode/decode and reused. NOTE: sized from NeuralDefaultThreadCount, NOT
@@ -31201,8 +31205,12 @@ begin
     begin
       Acc := 0;
       TVal := Temporal.FData[ch];
+      pos := ch; // #6: carry CellIdx*C + ch instead of a multiply per cell
       for CellIdx := 0 to NumCellsM1 do
-        Acc := Acc + PosFeat.FData[CellIdx * C + ch] + TVal;
+      begin
+        Acc := Acc + PosFeat.FData[pos] + TVal;
+        Inc(pos, C);
+      end;
       SpatialMean.FData[ch] := Acc / NumCells;
     end;
 
@@ -32202,24 +32210,28 @@ end;
 
 procedure TMusicGenModel.ProjectEncoderStates(EncStates, Dst: TNNetVolume);
 var
-  t, o, i, FEncSeqLenM1, HiddenM1, TextDModelM1: integer;
-  Acc: TNeuralFloat;
+  t, o, FEncSeqLenM1, HiddenM1, TDM, tBase, dstBase, oBase: integer;
 begin
   FEncSeqLenM1 := FEncSeqLen - 1;
   HiddenM1 := FConfig.Hidden - 1;
-  TextDModelM1 := FConfig.TextDModel - 1;
   // EncStates is (EncSeqLen, 1, TextDModel); Dst becomes (EncSeqLen,1,Hidden):
   // Dst[t][o] = sum_i EncToDecW[o][i] * EncStates[t][i] + EncToDecB[o].
   Dst.ReSize(FEncSeqLen, 1, FConfig.Hidden);
+  TDM := FConfig.TextDModel;
   for t := 0 to FEncSeqLenM1 do
+  begin
+    tBase := t * TDM;              // App A: hoist row bases out of the inner loops
+    dstBase := t * FConfig.Hidden; // #11
+    oBase := 0;
     for o := 0 to HiddenM1 do
     begin
-      Acc := FEncToDecB.FData[o];
-      for i := 0 to TextDModelM1 do
-        Acc := Acc + FEncToDecW.FData[o * FConfig.TextDModel + i] *
-          EncStates.FData[t * FConfig.TextDModel + i];
-      Dst.FData[t * FConfig.Hidden + o] := Acc;
+      // #13: contiguous dot EncToDecW[o] . EncStates[t] + bias
+      Dst.FData[dstBase + o] := FEncToDecB.FData[o] +
+        TNNetVolume.DotProduct(Addr(FEncToDecW.FData[oBase]),
+          Addr(EncStates.FData[tBase]), TDM);
+      Inc(oBase, TDM);             // #6: carry o*TextDModel
     end;
+  end;
 end;
 
 procedure TMusicGenModel.ComputeLogits(const Codes: TNNetIntArr2D;
@@ -32437,7 +32449,7 @@ var
   function SelectToken(L: TNNetVolume; Off: integer): integer;
   var
     v, best, VsM1: integer;
-    bestVal, vv, MaxLogit, SumExp, InvT, Lv: TNeuralFloat;
+    bestVal, vv, MaxLogit, SumExp, InvT, Lv, eProb: TNeuralFloat;
   begin
     VsM1 := FConfig.VocabSize - 1;
     if Sampler = nil then
@@ -32465,8 +32477,9 @@ var
       SumExp := 0;
       for v := 0 to VsM1 do
       begin
-        Probs.FData[v] := NeuralExp((L.FData[Off + v] - MaxLogit) * InvT);
-        SumExp := SumExp + Probs.FData[v];
+        eProb := NeuralExp((L.FData[Off + v] - MaxLogit) * InvT); // #4
+        Probs.FData[v] := eProb;
+        SumExp := SumExp + eProb;
       end;
       if SumExp <= 0 then SumExp := 1.0;
       TNNetVolume.Mul(Probs.GetRawPtr(0), 1.0 / SumExp, VsM1 + 1);
@@ -33261,22 +33274,26 @@ end;
 
 procedure TParlerTTSModel.ProjectEncoderStates(EncStates, Dst: TNNetVolume);
 var
-  t, o, i, FEncSeqLenM1, HiddenM1, TextDModelM1: integer;
-  Acc: TNeuralFloat;
+  t, o, FEncSeqLenM1, HiddenM1, TDM, tBase, dstBase, oBase: integer;
 begin
   FEncSeqLenM1 := FEncSeqLen - 1;
   HiddenM1 := FConfig.Hidden - 1;
-  TextDModelM1 := FConfig.TextDModel - 1;
   Dst.ReSize(FEncSeqLen, 1, FConfig.Hidden);
+  TDM := FConfig.TextDModel;
   for t := 0 to FEncSeqLenM1 do
+  begin
+    tBase := t * TDM;              // App A: hoist row bases out of the inner loops
+    dstBase := t * FConfig.Hidden; // #11
+    oBase := 0;
     for o := 0 to HiddenM1 do
     begin
-      Acc := FEncToDecB.FData[o];
-      for i := 0 to TextDModelM1 do
-        Acc := Acc + FEncToDecW.FData[o * FConfig.TextDModel + i] *
-          EncStates.FData[t * FConfig.TextDModel + i];
-      Dst.FData[t * FConfig.Hidden + o] := Acc;
+      // #13: contiguous dot EncToDecW[o] . EncStates[t] + bias
+      Dst.FData[dstBase + o] := FEncToDecB.FData[o] +
+        TNNetVolume.DotProduct(Addr(FEncToDecW.FData[oBase]),
+          Addr(EncStates.FData[tBase]), TDM);
+      Inc(oBase, TDM);             // #6: carry o*TextDModel
     end;
+  end;
 end;
 
 procedure TParlerTTSModel.BuildInputEmbeddings(
@@ -34446,7 +34463,7 @@ procedure BarkApplyTrunkAndHead(SubModel: TBarkSubModel; Emb: TNNetVolume;
 var
   TrunkOut: TNNetVolume;
   Hidden, OutVocab, SeqLen, p, t, k: integer;
-  SeqLenM1, OutVocabM1, HiddenM1, pBase, tBase: integer;
+  SeqLenM1, OutVocabM1, HiddenM1, pBase, tBase, pOut: integer;
   Acc: TNeuralFloat;
   HW, HB: TNNetVolume;
 begin
@@ -34464,10 +34481,11 @@ begin
   for p := 0 to SeqLenM1 do
   begin
     pBase := p * Hidden;
+    pOut := p * OutVocab; // #11: hoist logits row base
     for t := 0 to OutVocabM1 do
     begin
       tBase := t * Hidden;
-      Logits.FData[p * OutVocab + t] := HB.FData[t] +
+      Logits.FData[pOut + t] := HB.FData[t] +
         TNNetVolume.DotProduct(Addr(TrunkOut.FData[pBase]),
           Addr(HW.FData[tBase]), Hidden);
     end;
@@ -37480,7 +37498,7 @@ procedure WhisperMedianFilterRow(var Row: array of TNeuralFloat;
   Len, Kernel: integer);
 var
   Half, i, k, SrcIdx, w, a, b: integer;
-  LenM1, KernelM1: integer;
+  LenM1, KernelM1, TwoLenM2: integer;
   Win: array of TNeuralFloat;
   Orig: array of TNeuralFloat;
   Tmp: TNeuralFloat;
@@ -37495,6 +37513,7 @@ begin
   for i := 0 to LenM1 do Orig[i] := Row[i];
   SetLength(Win, Kernel);
   KernelM1 := Kernel - 1;
+  TwoLenM2 := 2 * (Len - 1); // #5: reflect clamp constant hoisted out of nest
   for i := 0 to LenM1 do
   begin
     for k := 0 to KernelM1 do
@@ -37504,7 +37523,7 @@ begin
       while (SrcIdx < 0) or (SrcIdx >= Len) do
       begin
         if SrcIdx < 0 then SrcIdx := -SrcIdx
-        else if SrcIdx >= Len then SrcIdx := 2 * (Len - 1) - SrcIdx;
+        else if SrcIdx >= Len then SrcIdx := TwoLenM2 - SrcIdx;
       end;
       Win[k] := Orig[SrcIdx];
     end;
@@ -39696,14 +39715,10 @@ var
 begin
   n := EmbA.Size;
   if EmbB.Size < n then n := EmbB.Size;
-  dot := 0; na := 0; nb := 0;
-  nM1 := n - 1;
-  for i := 0 to nM1 do
-  begin
-    dot := dot + EmbA.FData[i] * EmbB.FData[i];
-    na := na + EmbA.FData[i] * EmbA.FData[i];
-    nb := nb + EmbB.FData[i] * EmbB.FData[i];
-  end;
+  // #13: contiguous dots (AVX) instead of scalar accumulation
+  dot := TNNetVolume.DotProduct(Addr(EmbA.FData[0]), Addr(EmbB.FData[0]), n);
+  na := TNNetVolume.DotProduct(Addr(EmbA.FData[0]), Addr(EmbA.FData[0]), n);
+  nb := TNNetVolume.DotProduct(Addr(EmbB.FData[0]), Addr(EmbB.FData[0]), n);
   if (na <= 0) or (nb <= 0) then Result := 0
   else Result := dot / (Sqrt(na) * Sqrt(nb));
 end;
@@ -41309,7 +41324,7 @@ begin
   TNeuralThreadList.CalculateWorkingRange(index, threadnum, OutCh, oStart, oFin);
   InLenM1 := InLen - 1;
   KM1 := K - 1;
-  // Full[o] was zeroed by the caller; each thread owns a disjoint set of o.
+  // Full[o] was bias-preset by the caller; each thread owns a disjoint set of o.
   // Transposed-im2col overlap-add: for each output channel o and tap k2, the
   // in-channel contraction sum_i W[(o,k2),i]*InSig[i][t] is one InCh-contiguous
   // DotProduct of WT against the t-th InT column. The (t,k2) overlap-add order
@@ -41350,6 +41365,7 @@ var
   PadLeftM1, PadRightM1, OutLenM1, FullLenM1: integer;
   tS, iK, PatchLen, wBase, tInCh, wOfs, wBaseO: integer;
   oK, OCK, srcBase: integer;
+  tInChP, OCKp, dstBaseP, srcIdxP: integer;
   PadRow, FullRow: TNeuralFloatDynArr;
   Acc: TNeuralFloat;
   Padded: TNNetFloatDynArr2D;
@@ -41511,7 +41527,9 @@ begin
     for o := 0 to OutChM1 do
     begin
       SetLength(Full[o], FullLen);
-      FillChar(Full[o][0], FullLen * csNeuralFloatSize, 0);
+      // #13/#5: preset bias once (single pass) instead of zero-fill + later
+      // bias-add pass over the full untrimmed length.
+      for t := 0 to FullLenM1 do Full[o][t] := Conv.B[o];
     end;
     // Transposed-im2col overlap-add upsample. InT packs InSig as [t*InCh + i] so
     // each t-column is InCh-contiguous; WT repacks W as [(o*K + k2)*InCh + i] so
@@ -41522,13 +41540,24 @@ begin
     // Claude (AI).
     SetLength(InT, InLen * InCh);
     for t := 0 to InLenM1 do
+    begin
+      tInChP := t * InCh;                // #11: hoist t*InCh
       for i := 0 to InChM1 do
-        InT[t * InCh + i] := InSig[i][t];
+        InT[tInChP + i] := InSig[i][t];
+    end;
     SetLength(WT, OutCh * K * InCh);
+    OCKp := OutCh * K;                   // App A: hoist OutCh*K
     for o := 0 to OutChM1 do
       for k2 := 0 to KM1 do
+      begin
+        dstBaseP := (o * K + k2) * InCh; // #11: pack column base
+        srcIdxP := o * K + k2;           // #6: carry src by OutCh*K across i
         for i := 0 to InChM1 do
-          WT[(o * K + k2) * InCh + i] := Conv.W[i * OutCh * K + o * K + k2];
+        begin
+          WT[dstBaseP + i] := Conv.W[srcIdxP];
+          Inc(srcIdxP, OCKp);
+        end;
+      end;
     {$IFDEF OpenCL}
     // Opt-in OpenCL fast path: the per-(o,t,k2) in-channel contraction is one
     // device GEMM (same shared dot-product kernel as the forward path), then the
@@ -41590,9 +41619,8 @@ begin
         end;
       end;
     end;
-    // Add bias across the whole (untrimmed) output.
-    for o := 0 to OutChM1 do
-      for t := 0 to FullLenM1 do Full[o][t] := Full[o][t] + Conv.B[o];
+    // Bias was preset into Full at init (see above); overlap-add accumulated on
+    // top, so no separate bias pass is needed here.
     // Un-pad: padding_total = K - stride. Causal trims it all on the RIGHT
     // (trim_right_ratio 1.0, padding_left = 0); non-causal trims symmetrically
     // (padding_right = padding_total div 2, the remainder on the left).
@@ -41785,7 +41813,8 @@ var
   s, q, t, d, best, K, Dm, Frames: integer;
   WaveformMax, EncStagesMax, CodebooksMax, FramesM1, DmM1, KM1: integer;
   sBase: integer;
-  Dist, BestDist, Diff: TNeuralFloat;
+  Dist, BestDist: TNeuralFloat;
+  CBN: TNeuralFloatDynArr;   // #14: bound FCodebookNormSqr[q]
   Residual, Vec, CB: TNeuralFloatDynArr;
 begin
   EnsureThreadPool;
@@ -41825,17 +41854,16 @@ begin
     for q := 0 to CodebooksMax do
     begin
       CB := FCodebooks[q].Data;
-      best := 0; BestDist := -1;
+      CBN := FCodebookNormSqr[q];
+      best := 0; BestDist := 1e30;
       sBase := 0; // s*Dm carried
+      // #14: argmin ||r-c||^2 = argmin (||c||^2 - 2 r.c) since ||r||^2 is shared
+      // across candidates (monotone rank; identical winner). AVX dot + one FMA.
       for s := 0 to KM1 do
       begin
-        Dist := 0;
-        for d := 0 to DmM1 do
-        begin
-          Diff := Residual[d] - CB[sBase + d];
-          Dist := Dist + Diff * Diff;
-        end;
-        if (BestDist < 0) or (Dist < BestDist) then
+        Dist := CBN[s] - 2 *
+          TNNetVolume.DotProduct(Addr(Residual[0]), Addr(CB[sBase]), Dm);
+        if Dist < BestDist then
         begin BestDist := Dist; best := s; end;
         Inc(sBase, Dm);
       end;
@@ -41936,6 +41964,7 @@ var
   Consumed: TStringList;
   Idx, r, j, dim, NumRatios, ratio, dil, NQ, ScalePow: integer;
   NumRatiosM1, NumResLayM1, NQM1: integer;
+  NormRows, NormCols, NormR: integer;   // #14: codebook norm precompute
   EncStages, DecStages: array of TEnCodecStage;
   EncCnt, DecCnt: integer;
   Pref: string;
@@ -42082,6 +42111,18 @@ begin
       if Reader.HasTensor(Pref + 'embed_avg') then Consumed.Add(Pref + 'embed_avg');
       if Reader.HasTensor(Pref + 'cluster_size') then Consumed.Add(Pref + 'cluster_size');
       if Reader.HasTensor(Pref + 'inited') then Consumed.Add(Pref + 'inited');
+    end;
+    // #14: precompute per-row squared norms of every codebook (once, at load).
+    SetLength(Model.FCodebookNormSqr, NQ);
+    for j := 0 to NQM1 do
+    begin
+      NormRows := Model.FCodebooks[j].Rows;
+      NormCols := Model.FCodebooks[j].Cols;
+      SetLength(Model.FCodebookNormSqr[j], NormRows);
+      for NormR := 0 to NormRows - 1 do
+        Model.FCodebookNormSqr[j][NormR] := TNNetVolume.DotProduct(
+          Addr(Model.FCodebooks[j].Data[NormR * NormCols]),
+          Addr(Model.FCodebooks[j].Data[NormR * NormCols]), NormCols);
     end;
 
     Result := Model;
@@ -42555,7 +42596,9 @@ begin
     for o := 0 to OutChM1 do
     begin
       SetLength(Full[o], FullLen);
-      FillChar(Full[o][0], FullLen * SizeOf(Double), 0);
+      // #13/#5: preset bias once (single pass) instead of zero-fill + a later
+      // full bias-add pass.
+      for t := 0 to FullLenM1 do Full[o][t] := Conv.B[o];
     end;
     // Transposed-im2col overlap-add (decode-only; recon-gated < 1e-4). For a
     // fixed (group, out-channel-in-group o, tap k2) the contraction over the
@@ -42610,8 +42653,7 @@ begin
         end;
       end;
     end;
-    for o := 0 to OutChM1 do
-      for t := 0 to FullLenM1 do Full[o][t] := Full[o][t] + Conv.B[o];
+    // Bias was preset into Full at init; overlap-add accumulated on top.
     // Causal right-trim: padding_right = K - stride (trim_right_ratio 1.0),
     // padding_left = 0.
     PadRight := K - Stride;
@@ -42673,7 +42715,7 @@ procedure LoadMimiCodebook(Reader: TNNetSafeTensorsReader;
   Consumed: TStrings);
 var
   ES, CU: TNNetVolume;
-  K, D, r, c: integer;
+  K, D, r, c, rBase: integer;
   KM1, DM1: integer;
   denom: TNeuralFloat;
 begin
@@ -42698,8 +42740,9 @@ begin
     begin
       denom := CU.FData[r];
       if denom < Eps then denom := Eps;
+      rBase := r * D; // #11: hoist row base
       for c := 0 to DM1 do
-        Mat.Data[r * D + c] := ES.FData[r * D + c] / denom;
+        Mat.Data[rBase + c] := ES.FData[rBase + c] / denom;
     end;
   finally
     CU.Free;
@@ -42748,10 +42791,16 @@ var
   D, T, NH, NKV, Dh, FFN, L, h, t1, t2, dd, gidx, kvh, NRep, half: integer;
   NHDh, hDh, kvhDh, gBase, dBase, hbase: integer;
   TM1, DM1, halfM1, DhM1, NHM1, NKVM1, FFNM1, NHDhM1, NKVDhM1, LayersM1: integer;
-  Theta, Scaling, eps, m, v, e, denom, sc, mx, qr, kr: double;
+  Theta, Scaling, eps, m, v, e, denom, sc, mx, qr, kr, ang: double;
   X, Hn, Q, Kk, Vv, Attn, Mlp1: array of array of double; // [T][feature]
   cosv, sinv, invfreq: array of double;
   AccVec, Orig: array of double;
+  // #9: per-layer field-chain binds (Data is single; Hn/Q/... are double, so
+  // the mixed-precision scalar accumulation is kept - the Mimi carve-out).
+  WqD, WkD, WvD, WoD, Fc1D, Fc2D: array of TNeuralFloat;
+  BqA, BkA, BvA, BoA: array of TNeuralFloat;
+  HnRow, Mlp1Row: array of double;
+  HasBq, HasBk, HasBv, HasBo: boolean;
 begin
   D := FConfig.HiddenSize;
   T := Length(Sig[0]);
@@ -42795,6 +42844,15 @@ begin
 
   for L := 0 to LayersM1 do
   begin
+    // #9/#5: bind the per-layer weight/bias arrays + hoist the bias guards
+    // once (they are loop-invariant across t1/gidx/dd).
+    WqD := Layers[L].Wq.Data; WkD := Layers[L].Wk.Data;
+    WvD := Layers[L].Wv.Data; WoD := Layers[L].Wo.Data;
+    Fc1D := Layers[L].Fc1.Data; Fc2D := Layers[L].Fc2.Data;
+    BqA := Layers[L].Bq; BkA := Layers[L].Bk;
+    BvA := Layers[L].Bv; BoA := Layers[L].Bo;
+    HasBq := Length(BqA) > 0; HasBk := Length(BkA) > 0;
+    HasBv := Length(BvA) > 0; HasBo := Length(BoA) > 0;
     // ---- input LayerNorm ----
     SetLength(Hn, T);
     for t1 := 0 to TM1 do
@@ -42818,12 +42876,13 @@ begin
       SetLength(Q[t1], NH * Dh);
       SetLength(Kk[t1], NKV * Dh);
       SetLength(Vv[t1], NKV * Dh);
+      HnRow := Hn[t1];                    // #9: bind row once
       gBase := 0;                        // gidx * D, carried (#6)
       for gidx := 0 to NHDhM1 do
       begin
         sc := 0;
-        for dd := 0 to DM1 do sc := sc + Layers[L].Wq.Data[gBase + dd] * Hn[t1][dd];
-        if Length(Layers[L].Bq) > 0 then sc := sc + Layers[L].Bq[gidx];
+        for dd := 0 to DM1 do sc := sc + WqD[gBase + dd] * HnRow[dd];
+        if HasBq then sc := sc + BqA[gidx];
         Q[t1][gidx] := sc;
         Inc(gBase, D);
       end;
@@ -42831,12 +42890,12 @@ begin
       for gidx := 0 to NKVDhM1 do
       begin
         sc := 0;
-        for dd := 0 to DM1 do sc := sc + Layers[L].Wk.Data[gBase + dd] * Hn[t1][dd];
-        if Length(Layers[L].Bk) > 0 then sc := sc + Layers[L].Bk[gidx];
+        for dd := 0 to DM1 do sc := sc + WkD[gBase + dd] * HnRow[dd];
+        if HasBk then sc := sc + BkA[gidx];
         Kk[t1][gidx] := sc;
         sc := 0;
-        for dd := 0 to DM1 do sc := sc + Layers[L].Wv.Data[gBase + dd] * Hn[t1][dd];
-        if Length(Layers[L].Bv) > 0 then sc := sc + Layers[L].Bv[gidx];
+        for dd := 0 to DM1 do sc := sc + WvD[gBase + dd] * HnRow[dd];
+        if HasBv then sc := sc + BvA[gidx];
         Vv[t1][gidx] := sc;
         Inc(gBase, D);
       end;
@@ -42846,9 +42905,10 @@ begin
     begin
       for dd := 0 to halfM1 do
       begin
-        cosv[dd] := Cos(t1 * invfreq[dd]);
+        ang := t1 * invfreq[dd];         // #4: shared angle for Cos and Sin
+        cosv[dd] := Cos(ang);
         cosv[dd + half] := cosv[dd];
-        sinv[dd] := Sin(t1 * invfreq[dd]);
+        sinv[dd] := Sin(ang);
         sinv[dd + half] := sinv[dd];
       end;
       // rotate_half needs the ORIGINAL head values, so snapshot per head into
@@ -42914,13 +42974,14 @@ begin
     // ---- output projection + LayerScale residual ----
     for t1 := 0 to TM1 do
     begin
+      HnRow := Attn[t1];                  // #9: bind attn row once
       dBase := 0;                        // dd * NHDh, carried (#6)
       for dd := 0 to DM1 do
       begin
         sc := 0;
         for gidx := 0 to NHDhM1 do
-          sc := sc + Layers[L].Wo.Data[dBase + gidx] * Attn[t1][gidx];
-        if Length(Layers[L].Bo) > 0 then sc := sc + Layers[L].Bo[dd];
+          sc := sc + WoD[dBase + gidx] * HnRow[gidx];
+        if HasBo then sc := sc + BoA[dd];
         X[t1][dd] := X[t1][dd] + Layers[L].AttnScale[dd] * sc;
         Inc(dBase, NHDh);
       end;
@@ -42941,14 +43002,16 @@ begin
       for dd := 0 to DM1 do
         Hn[t1][dd] := (X[t1][dd] - m) / denom * Layers[L].LnPostG[dd] +
           Layers[L].LnPostB[dd];
+      HnRow := Hn[t1];                    // #9: bind row once
       // fc1 -> GELU
       SetLength(Mlp1[t1], FFN);
+      Mlp1Row := Mlp1[t1];
       gBase := 0;                        // gidx * D, carried (#6)
       for gidx := 0 to FFNM1 do
       begin
         sc := 0;
-        for dd := 0 to DM1 do sc := sc + Layers[L].Fc1.Data[gBase + dd] * Hn[t1][dd];
-        Mlp1[t1][gidx] := MimiGELU(sc);
+        for dd := 0 to DM1 do sc := sc + Fc1D[gBase + dd] * HnRow[dd];
+        Mlp1Row[gidx] := MimiGELU(sc);
         Inc(gBase, D);
       end;
       // fc2 -> residual
@@ -42957,7 +43020,7 @@ begin
       begin
         sc := 0;
         for gidx := 0 to FFNM1 do
-          sc := sc + Layers[L].Fc2.Data[dBase + gidx] * Mlp1[t1][gidx];
+          sc := sc + Fc2D[dBase + gidx] * Mlp1Row[gidx];
         X[t1][dd] := X[t1][dd] + Layers[L].MlpScale[dd] * sc;
         Inc(dBase, FFN);
       end;
@@ -43158,7 +43221,7 @@ begin
   for d := 0 to DmM1 do
   begin
     SetLength(Zsem[d], Frames);
-    for t := 0 to FramesM1 do Zsem[d][t] := 0;
+    FillChar(Zsem[d][0], Frames * SizeOf(Double), 0); // #13
   end;
   for q := 0 to NSemM1 do
   begin
@@ -43179,7 +43242,7 @@ begin
     for d := 0 to DmM1 do
     begin
       SetLength(Zaco[d], Frames);
-      for t := 0 to FramesM1 do Zaco[d][t] := 0;
+      FillChar(Zaco[d][0], Frames * SizeOf(Double), 0); // #13
     end;
     for q := 0 to NAcoM1 do
     begin
@@ -43931,6 +43994,7 @@ var
   pn, cn, dot, BestSim: double;
   CodebookNorms: TMimiDblArr2D; // L2-normalized codebook rows per quantizer
   CBN: TMimiDblArr;             // reference bind of CodebookNorms[q]
+  WIn, BIn, WOut, BOut, CBData: TNeuralFloatDynArr; // #9 per-q field binds
   CbSize, d, CdM1: integer;
   wBase, cbBase, bestBase, oBase: integer;
   WaveLenM1, NumStagesM1, EncResHigh, NQM1, CbSizeM1, HiddenDimM1: integer;
@@ -43999,6 +44063,11 @@ begin
     for i := 0 to HiddenDimM1 do Residual[i] := Sig[i][t];
     for q := 0 to NQM1 do
     begin
+      // #9: bind the per-q record field chains once (array-of-record deref +
+      // dynarray resolution otherwise re-done per innermost element).
+      WIn := FInProj[q].W;   BIn := FInProj[q].B;
+      WOut := FOutProj[q].W; BOut := FOutProj[q].B;
+      CBData := FCodebooks[q].Data;
       // in_proj: 1x1 conv hidden->codebook_dim. Residual is one frame; do the
       // matmul (out[o] = bias + sum_i W[o,i]*residual[i]).
       Km := FInProj[q].Kernel; // = 1
@@ -44006,9 +44075,9 @@ begin
       wBase := 0; // d * HiddenDim
       for d := 0 to CdM1 do
       begin
-        dot := FInProj[q].B[d];
+        dot := BIn[d];
         for i := 0 to HiddenDimM1 do
-          dot := dot + FInProj[q].W[wBase + i] * Residual[i];
+          dot := dot + WIn[wBase + i] * Residual[i];
         NormP[d] := dot;
         Inc(wBase, HiddenDim);
       end;
@@ -44040,9 +44109,9 @@ begin
       oBase := 0;            // i * Cd
       for i := 0 to HiddenDimM1 do
       begin
-        dot := FOutProj[q].B[i];
+        dot := BOut[i];
         for d := 0 to CdM1 do
-          dot := dot + FOutProj[q].W[oBase + d] * FCodebooks[q].Data[bestBase + d];
+          dot := dot + WOut[oBase + d] * CBData[bestBase + d];
         Residual[i] := Residual[i] - dot;
         Inc(oBase, Cd);
       end;
@@ -44587,6 +44656,7 @@ var
   OutLen, FullLen, idx, val: integer;
   InChM1, OutChM1, KM1, InLenM1, OutLenM1: integer;
   PatchLen, tSP, iK, wBase, oKInCh, tS, tInCh, wOfs: integer;
+  tInChP, OCKp, dstBaseP, srcIdxP, oK: integer;
   Acc: TNeuralFloat;
   Patch: TNeuralFloatDynArr;
   InT, WT: TNeuralFloatDynArr;
@@ -44695,13 +44765,24 @@ begin
     // Claude (AI).
     SetLength(InT, InLen * InCh);
     for t := 0 to InLenM1 do
+    begin
+      tInChP := t * InCh;                // #11: hoist t*InCh
       for i := 0 to InChM1 do
-        InT[t * InCh + i] := InSig[i][t];
+        InT[tInChP + i] := InSig[i][t];
+    end;
     SetLength(WT, OutCh * K * InCh);
+    OCKp := OutCh * K;                   // App A: hoist OutCh*K
     for o := 0 to OutChM1 do
       for k2 := 0 to KM1 do
+      begin
+        dstBaseP := (o * K + k2) * InCh; // #11: pack column base
+        srcIdxP := o * K + k2;           // #6: carry src by OutCh*K across i
         for i := 0 to InChM1 do
-          WT[(o * K + k2) * InCh + i] := Conv.W[i * OutCh * K + o * K + k2];
+        begin
+          WT[dstBaseP + i] := Conv.W[srcIdxP];
+          Inc(srcIdxP, OCKp);
+        end;
+      end;
     {$IFDEF OpenCL}
     // Opt-in OpenCL fast path: the per-(o,t,k2) in-channel contraction is one
     // device GEMM (shared dot-product kernel), then the result scatters into the
@@ -44711,16 +44792,24 @@ begin
        (Int64(OutCh) * K * InLen * InCh >= FConvOpenCLMinWork) then
     begin
       RunConvTransposeGemmOpenCL(WT, InT, OutCh, K, InCh, InLen);
+      OCKp := OutCh * K;                 // #11: hoist OutCh*K
       for o := 0 to OutChM1 do
+      begin
+        oK := o * K;                     // #11: o-invariant
         for t := 0 to InLenM1 do
+        begin
+          idx := t * Stride;             // #11: t-invariant, +k2 carried (#6)
+          srcIdxP := t * OCKp + oK;      // #11: t*OutChK + oK, +k2 carried (#6)
           for k2 := 0 to KM1 do
           begin
-            idx := t * Stride + k2;     // index into the FullLen buffer
-            val := idx - Pad;           // index into the trimmed output
+            val := idx - Pad;            // index into the trimmed output
             if (val >= 0) and (val < OutLen) then
-              OutSig[o][val] := OutSig[o][val] +
-                FConvResMat.FData[t * (OutCh * K) + (o * K + k2)];
+              OutSig[o][val] := OutSig[o][val] + FConvResMat.FData[srcIdxP];
+            Inc(idx);
+            Inc(srcIdxP);
           end;
+        end;
+      end;
       Exit;
     end;
     {$ENDIF}
@@ -45239,7 +45328,7 @@ procedure DemucsLSTMCell(const Seq: TNNetFloatDynArr2D;
 var
   h, cstate, g: TNeuralFloatDynArr;
   step, t0, k, j, baseR: integer;
-  gi, gf, gg, go: TNeuralFloat;
+  gi, gf, gg, go, accg: TNeuralFloat;
   HiddenM1, Hidden4M1, TM1, InSizeM1: integer;
 begin
   SetLength(h, Hidden);
@@ -45259,12 +45348,15 @@ begin
     for k := 0 to Hidden4M1 do
     begin
       baseR := k * InSize;
-      g[k] := Bih[k] + Bhh[k];
+      accg := Bih[k] + Bhh[k];             // #4: accumulate into a local
+      // Wih*x stays scalar: Seq[j][t0] is strided across j (channel-major),
+      // and this free procedure has no persistent owner for a gather buffer.
       for j := 0 to InSizeM1 do
-        g[k] := g[k] + Wih[baseR + j] * Seq[j][t0];
-      baseR := k * Hidden;
-      for j := 0 to HiddenM1 do
-        g[k] := g[k] + Whh[baseR + j] * h[j];
+        accg := accg + Wih[baseR + j] * Seq[j][t0];
+      // Whh*h is contiguous over h -> one AVX DotProduct (#13).
+      accg := accg + TNNetVolume.DotProduct(
+        Addr(Whh[k * Hidden]), Addr(h[0]), Hidden);
+      g[k] := accg;
     end;
     // Gate nonlinearities over the contiguous quarter-blocks of g (i,f,g,o).
     TNNetVolume.VectorSigmoid(Addr(g[0]), Addr(g[0]), Hidden);
@@ -45298,6 +45390,7 @@ var
   AudioChM1, InLenM1, LenSig, LSTMLayersM1: integer;
   FLinOutM1, TlenM1, FLinInM1, LM1, SourcesM1: integer;
   SigTLen, LSTMHiddenM1, cBase: integer;
+  SrcRow: TNeuralFloatDynArr;
 begin
   InLen := Length(Mix[0]);
   // ---- mixed waveform as channel-major Sig[channel][sample].
@@ -45307,7 +45400,7 @@ begin
   for c := 0 to AudioChM1 do
   begin
     SetLength(Sig[c], InLen);
-    for t := 0 to InLenM1 do Sig[c][t] := Mix[c][t];
+    Move(Mix[c][0], Sig[c][0], InLen * csNeuralFloatSize); // #13 contiguous copy
   end;
 
   // ---- encoder: depth blocks, saving each GLU output as a skip.
@@ -45326,9 +45419,9 @@ begin
     LenSig := Length(Sig) - 1;
     for c := 0 to LenSig do
     begin
-      SetLength(Skips[i][c], Length(Sig[c]));
-      SigTLen := Length(Sig[c]) - 1;
-      for t := 0 to SigTLen do Skips[i][c][t] := Sig[c][t];
+      SigTLen := Length(Sig[c]);
+      SetLength(Skips[i][c], SigTLen);
+      Move(Sig[c][0], Skips[i][c][0], SigTLen * csNeuralFloatSize); // #13
     end;
   end;
 
@@ -45401,8 +45494,8 @@ begin
     for ch := 0 to AudioChM1 do
     begin
       SetLength(Stems[src][ch], Tlen);
-      for t := 0 to TlenM1 do
-        Stems[src][ch][t] := Sig[src * FConfig.AudioChannels + ch][t];
+      SrcRow := Sig[src * FConfig.AudioChannels + ch]; // #13: hoist row + Move
+      Move(SrcRow[0], Stems[src][ch][0], Tlen * csNeuralFloatSize);
     end;
   end;
 end;
@@ -45669,7 +45762,7 @@ begin
   if X < 0 then Sgn := -1 else Sgn := 1;
   X := Abs(X);
   T := 1.0 / (1.0 + P * X);
-  Y := 1.0 - (((((A5 * T + A4) * T) + A3) * T + A2) * T + A1) * T * Exp(-X * X);
+  Y := 1.0 - (((((A5 * T + A4) * T) + A3) * T + A2) * T + A1) * T * NeuralExp(-X * X);
   Result := Sgn * Y;
 end;
 
@@ -45684,8 +45777,8 @@ end;
 function VitsSoftplus(X: TNeuralFloat): TNeuralFloat; inline;
 begin
   if X > 30 then Result := X
-  else if X < -30 then Result := Exp(X)
-  else Result := Ln(1.0 + Exp(X));
+  else if X < -30 then Result := NeuralExp(X)
+  else Result := Ln(1.0 + NeuralExp(X));
 end;
 
 // In-place softmax over a vector.
@@ -45721,11 +45814,14 @@ const
   MinBinWidth = 1.0e-3;
   MinBinHeight = 1.0e-3;
   MinDerivative = 1.0e-3;
+  // #17/#5: compile-time fold of Ln(Exp(1-MinDerivative)-1) (was recomputed per
+  // call). Exact to double precision, well within the 1e-4 parity gate.
+  ConstantD = 0.5397424172369522;
 var
   i, BinIdx: integer;
   NumBinsM1: integer;
   Widths, Heights, CumWidths, CumHeights, Derivatives: TNeuralFloatDynArr;
-  ConstantD, LowerBound, UpperBound: TNeuralFloat;
+  LowerBound, UpperBound: TNeuralFloat;
   InCumW, InBinW, InCumH, InDelta, InDeriv, InDerivP1, InHeight: TNeuralFloat;
   Inter1, Inter2, Inter3, A, B, C, Discr, Root: TNeuralFloat;
 begin
@@ -45737,7 +45833,6 @@ begin
     Result := InputVal;
     Exit;
   end;
-  ConstantD := Ln(Exp(1.0 - MinDerivative) - 1.0);
   NumBinsM1 := NumBins - 1;
 
   // widths = min_bin_width + (1 - min_bin_width*num_bins) * softmax(UW).
@@ -46056,6 +46151,7 @@ procedure TNNetVits.RunTextEncoder(const Ids: array of integer;
 var
   T, H, NH, HD, Win, L, i, j, hh, t1, t2, d, RelLen: integer;
   TM1, HM1, NHM1, HDM1, TwoTM2, NumHiddenLayersM1, FlowSizeM1, FfMidM1, hhHD: integer;
+  embBase: integer;
   Scale, SqrtH, Acc: TNeuralFloat;
   Q, K, Vv: TNNetFloatDynArr2D;        // [token][hidden] projections
   Qh, Kh, Vh: TNNetFloatDynArr2D;      // current head [token][head_dim]
@@ -46125,7 +46221,10 @@ begin
   for i := 0 to TM1 do
   begin
     SetLength(Hidden[i], H);
-    for j := 0 to HM1 do Hidden[i][j] := FEmbed[Ids[i] * H + j] * SqrtH;
+    // App A/#13: hoist embedding row base, contiguous copy then scale.
+    embBase := Ids[i] * H;
+    Move(FEmbed[embBase], Hidden[i][0], H * csNeuralFloatSize);
+    TNNetVolume.Mul(Addr(Hidden[i][0]), SqrtH, H);
   end;
 
   for L := 0 to NumHiddenLayersM1 do
@@ -46201,7 +46300,7 @@ begin
         SumE := 0;
         for t2 := 0 to TM1 do
         begin
-          Scores[t1][t2] := Exp(Scores[t1][t2] - MaxV);
+          Scores[t1][t2] := NeuralExp(Scores[t1][t2] - MaxV); // #16
           SumE := SumE + Scores[t1][t2];
         end;
         for t2 := 0 to TM1 do Scores[t1][t2] := Scores[t1][t2] / SumE;
@@ -46211,12 +46310,12 @@ begin
       for t1 := 0 to TM1 do
       begin
         SetLength(HeadOut[t1], HD);
-        for d := 0 to HDM1 do
-        begin
-          Acc := 0;
-          for t2 := 0 to TM1 do Acc := Acc + Scores[t1][t2] * Vh[t2][d];
-          HeadOut[t1][d] := Acc;
-        end;
+        // App E/#13: reorder to contiguous scaled-accumulate per key (Vh rows
+        // are HD-contiguous; the t2-strided inner dot was cache-hostile).
+        FillChar(HeadOut[t1][0], HD * csNeuralFloatSize, 0);
+        for t2 := 0 to TM1 do
+          TNNetVolume.MulAdd(Addr(HeadOut[t1][0]), Addr(Vh[t2][0]),
+            Scores[t1][t2], HD);
       end;
       // Relative value bias: absolute_position_to_relative_position(Scores)
       // gives [t1][2T] weights; drop col 0 -> [t1][2T-1]; matmul RelEmbV.
@@ -46234,13 +46333,13 @@ begin
           else RelAbs[t1][j] := 0;
         end;
       end;
+      // App E/#13: reorder to contiguous scaled-accumulate over RelEmb rows;
+      // RelAbs rows are mostly zero outside the T-wide band, so the skip is free.
       for t1 := 0 to TM1 do
-        for d := 0 to HDM1 do
-        begin
-          Acc := 0;
-          for j := 0 to TwoTM2 do Acc := Acc + RelAbs[t1][j] * RelEmb[j][d];
-          HeadOut[t1][d] := HeadOut[t1][d] + Acc;
-        end;
+        for j := 0 to TwoTM2 do
+          if RelAbs[t1][j] <> 0 then
+            TNNetVolume.MulAdd(Addr(HeadOut[t1][0]), Addr(RelEmb[j][0]),
+              RelAbs[t1][j], HD);
       // Scatter head output back (#13: contiguous copy, hhHD hoisted #11).
       for i := 0 to TM1 do
         Move(HeadOut[i][0], AttnOut[i][hhHD], HD * csNeuralFloatSize);
@@ -46256,7 +46355,9 @@ begin
     for i := 0 to TM1 do
     begin
       SetLength(Tmp, H);
-      for j := 0 to HM1 do Tmp[j] := Hidden[i][j] + AttnOut[i][j];
+      // #13: contiguous residual add.
+      Move(Hidden[i][0], Tmp[0], H * csNeuralFloatSize);
+      TNNetVolume.Add(Addr(Tmp[0]), Addr(AttnOut[i][0]), H);
       VitsLayerNormVec(Tmp, FLayers[L].LnW, FLayers[L].LnB, FConfig.LayerNormEps);
       Hidden[i] := Tmp;
     end;
@@ -46432,9 +46533,9 @@ begin
     RunWaveNet(FFlows[fi].WaveNet, Pre, WNOut);
     RunHiFiGANConv(FFlows[fi].ConvPost, WNOut, Mean);   // half channels
     // reverse: second_half := second_half - mean (log_stddev == 0).
+    // #13: contiguous scaled-subtract (removes per-element half+c index/deref).
     for c := 0 to HalfM1 do
-      for t := 0 to TlenM1 do
-        Latent[half + c][t] := Latent[half + c][t] - Mean[c][t];
+      TNNetVolume.MulAdd(Addr(Latent[half + c][0]), Addr(Mean[c][0]), -1, Tlen);
   end;
 end;
 
@@ -46465,11 +46566,12 @@ begin
     for t := 0 to InLenM1 do
     begin
       Acc := Conv.B[c];
+      src := t - Pad;               // #6: seed tap, carry by Dil
       for k2 := 0 to KM1 do
       begin
-        src := t + k2 * Dil - Pad;
         if (src >= 0) and (src < InLen) then
           Acc := Acc + Conv.W[wBase + k2] * InRow[src];
+        Inc(src, Dil);
       end;
       OutSig[c][t] := Acc;
     end;
@@ -46519,7 +46621,7 @@ end;
 procedure TNNetVits.RunSDPFlowReverse(const Flow: TVitsSDPFlow;
   var Latent: TNNetFloatDynArr2D; const Cond: TNNetFloatDynArr2D);
 var
-  Half, Filt, NumBins, Tlen, c, t, b, o: integer;
+  Half, Filt, NumBins, Tlen, c, t, b, o, oN, o2N, ThreeNbM1: integer;
   TlenM1, LatentMaxIdx, HalfM1, FiltM1, NumBinsM1, NumBinsM2: integer;
   FirstHalf, Hid, Proj: TNNetFloatDynArr2D;
   UW, UH, UD: TNeuralFloatDynArr;
@@ -46556,28 +46658,33 @@ begin
   RunHiFiGANConv(Flow.ConvPre, FirstHalf, Hid);     // -> Filt channels
   // global_conditioning is ADDED at the start of the DDS (inputs+cond).
   for c := 0 to FiltM1 do
-    for t := 0 to TlenM1 do Hid[c][t] := Hid[c][t] + Cond[c][t];
+    TNNetVolume.Add(Addr(Hid[c][0]), Addr(Cond[c][0]), Tlen); // #13
   RunVitsDDS(Flow.DDS, Hid);
   RunHiFiGANConv(Flow.ConvProj, Hid, Proj);         // -> Half*(3*NumBins-1) ch
   // reshape (channels=Half, bins-per-channel = 3*NumBins-1) per (half, time).
   SetLength(UW, NumBins);
   SetLength(UH, NumBins);
   SetLength(UD, NumBins - 1);
+  ThreeNbM1 := 3 * NumBins - 1;       // #5: hoist bins-per-channel stride
   for c := 0 to HalfM1 do
+  begin
+    o := c * ThreeNbM1;               // #11/#4: o depends only on c
+    oN := o + NumBins;
+    o2N := o + 2 * NumBins;
     for t := 0 to TlenM1 do
     begin
-      o := c * (3 * NumBins - 1);
       for b := 0 to NumBinsM1 do
       begin
         UW[b] := Proj[o + b][t] * InvSqrtFilt;
-        UH[b] := Proj[o + NumBins + b][t] * InvSqrtFilt;
+        UH[b] := Proj[oN + b][t] * InvSqrtFilt;
       end;
       for b := 0 to NumBinsM2 do
-        UD[b] := Proj[o + 2 * NumBins + b][t];
+        UD[b] := Proj[o2N + b][t];
       V := VitsRQSplineInverse(Latent[Half + c][t], UW, UH, UD, NumBins,
         FConfig.DurTailBound);
       Latent[Half + c][t] := V;
     end;
+  end;
 end;
 
 procedure TNNetVits.StochasticDurationReverse(const Hidden: TNNetFloatDynArr2D;
@@ -46692,6 +46799,7 @@ procedure TNNetVits.ExpandPrior(const PriorMean, PriorLogVar: TNNetFloatDynArr2D
 var
   T, Flow, OutLen, tok, rep, col, c, TM1, FlowM1: integer;
   DurM1: integer;
+  mval, lval: TNeuralFloat;
 begin
   T := Length(PriorMean);
   Flow := FConfig.FlowSize;
@@ -46707,19 +46815,23 @@ begin
     SetLength(ExpMean[c], OutLen);
     SetLength(ExpLogVar[c], OutLen);
   end;
-  col := 0;
-  for tok := 0 to TM1 do
+  // App E: c-outer so each (c,tok) value is read once and fills a contiguous
+  // run ExpMean[c][col..] instead of strided column writes per repeat.
+  for c := 0 to FlowM1 do
   begin
-    DurM1 := Durations[tok] - 1;
-    for rep := 0 to DurM1 do
+    col := 0;
+    for tok := 0 to TM1 do
     begin
-      if col >= OutLen then Break;
-      for c := 0 to FlowM1 do
+      DurM1 := Durations[tok] - 1;
+      mval := PriorMean[tok][c];
+      lval := PriorLogVar[tok][c];
+      for rep := 0 to DurM1 do
       begin
-        ExpMean[c][col] := PriorMean[tok][c];
-        ExpLogVar[c][col] := PriorLogVar[tok][c];
+        if col >= OutLen then Break;
+        ExpMean[c][col] := mval;
+        ExpLogVar[c][col] := lval;
+        Inc(col);
       end;
-      Inc(col);
     end;
   end;
 end;
@@ -46741,7 +46853,7 @@ var
   PriorMean, PriorLogVar, ExpMean, ExpLogVar, Latent, Spec: TNNetFloatDynArr2D;
   Durations: array of integer;
   Flow, OutLen, c, t, FlowM1, OutLenM1: integer;
-  ZVal: TNeuralFloat;
+  ZVal, NoiseScale: TNeuralFloat;
 begin
   SetLength(Durations, Length(Ids));
   Analyze(Ids, PriorMean, PriorLogVar, Durations);
@@ -46750,6 +46862,7 @@ begin
   OutLen := Length(ExpMean[0]);
   FlowM1 := Flow - 1;
   OutLenM1 := OutLen - 1;
+  NoiseScale := FConfig.NoiseScale;   // #5: hoist config read out of the nest
   // prior_latents = mean + z * exp(logvar) * noise_scale.
   SetLength(Latent, Flow);
   for c := 0 to FlowM1 do
@@ -46760,7 +46873,7 @@ begin
       if (Length(Z) > c) and (Length(Z[c]) > t) then ZVal := Z[c][t]
       else ZVal := 0;
       Latent[c][t] := ExpMean[c][t] +
-        ZVal * Exp(ExpLogVar[c][t]) * FConfig.NoiseScale;
+        ZVal * NeuralExp(ExpLogVar[c][t]) * NoiseScale; // #16
     end;
   end;
   FlowReverse(Latent, Spec);
@@ -47290,7 +47403,7 @@ end;
 procedure TNNetKokoro.RunTextEncoder(const Ids: array of integer;
   out Hidden: TNNetFloatDynArr2D);
 var
-  H, Tlen, c, t, id, TM1, HM1: integer;
+  H, Tlen, c, t, id, TM1, HM1, embBase: integer;
   Emb, Conv: TNNetFloatDynArr2D;
 begin
   H := FConfig.HiddenSize;
@@ -47303,7 +47416,8 @@ begin
   for t := 0 to TM1 do
   begin
     id := Ids[t];
-    for c := 0 to HM1 do Emb[c][t] := FEmbed[id * H + c];
+    embBase := id * H;                 // #11: hoist embedding row base
+    for c := 0 to HM1 do Emb[c][t] := FEmbed[embBase + c];
   end;
   // conv (k=enc_kernel, "same") -> ReLU.
   RunHiFiGANConv(FEncConv, Emb, Conv);
@@ -47386,7 +47500,7 @@ begin
   for t := 0 to TM1 do
   begin
     LogDur[t] := Pr[0][t];
-    D := Round(Exp(LogDur[t]) * FConfig.Speed);
+    D := Round(NeuralExp(LogDur[t]) * FConfig.Speed); // #16
     if D < 1 then D := 1;
     Durations[t] := D;
   end;
@@ -47397,6 +47511,7 @@ procedure TNNetKokoro.ExpandHidden(const Hidden: TNNetFloatDynArr2D;
 var
   H, Tlen, OutLen, tok, rep, col, c, HM1, TM1: integer;
   DurM1: integer;
+  hval: TNeuralFloat;
 begin
   H := FConfig.HiddenSize;
   Tlen := Length(Hidden[0]);
@@ -47407,15 +47522,21 @@ begin
   if OutLen < 1 then OutLen := 1;
   SetLength(Expanded, H);
   for c := 0 to HM1 do SetLength(Expanded[c], OutLen);
-  col := 0;
-  for tok := 0 to TM1 do
+  // App E: c-outer so each (c,tok) value is read once and fills a contiguous
+  // run Expanded[c][col..] instead of strided writes down the channel axis.
+  for c := 0 to HM1 do
   begin
-    DurM1 := Durations[tok] - 1;
-    for rep := 0 to DurM1 do
+    col := 0;
+    for tok := 0 to TM1 do
     begin
-      if col >= OutLen then Break;
-      for c := 0 to HM1 do Expanded[c][col] := Hidden[c][tok];
-      Inc(col);
+      DurM1 := Durations[tok] - 1;
+      hval := Hidden[c][tok];
+      for rep := 0 to DurM1 do
+      begin
+        if col >= OutLen then Break;
+        Expanded[c][col] := hval;
+        Inc(col);
+      end;
     end;
   end;
 end;
@@ -47509,8 +47630,8 @@ begin
     end;
     ISTFTOverlapAdd(MagVol, PhaseVol, WaveVol, FConfig.NFFT, FConfig.HopLength);
     SetLength(Waveform, WaveVol.Size);
-    WaveSizeM1 := WaveVol.Size - 1;
-    for t := 0 to WaveSizeM1 do Waveform[t] := WaveVol.FData[t];
+    if WaveVol.Size > 0 then
+      Move(WaveVol.FData[0], Waveform[0], WaveVol.Size * csNeuralFloatSize); // #13
   finally
     MagVol.Free;
     PhaseVol.Free;
@@ -47536,9 +47657,11 @@ begin
   // s_dec = style[H..StyleDim-1].
   SetLength(SPred, H);
   SetLength(SDec, FConfig.StyleDim - H);
-  for i := 0 to HM1 do SPred[i] := Style[i];
+  if H > 0 then
+    Move(Style[0], SPred[0], H * csNeuralFloatSize); // #13 contiguous split
   SDecM1 := FConfig.StyleDim - H - 1;
-  for i := 0 to SDecM1 do SDec[i] := Style[H + i];
+  if SDecM1 >= 0 then
+    Move(Style[H], SDec[0], (SDecM1 + 1) * csNeuralFloatSize);
   RunTextEncoder(Ids, Hidden);
   RunDuration(Hidden, SPred, LogDur, Durations);
   ExpandHidden(Hidden, Durations, Expanded);
@@ -47557,7 +47680,8 @@ begin
   Vol := TNNetVolume.Create(Length(Waveform), 1, 1);
   try
     WaveM1 := Length(Waveform) - 1;
-    for i := 0 to WaveM1 do Vol.FData[i] := Waveform[i];
+    if WaveM1 >= 0 then
+      Move(Waveform[0], Vol.FData[0], (WaveM1 + 1) * csNeuralFloatSize); // #13
     SaveVolumeToWav16(Vol, FileName, FConfig.SamplingRate);
   finally
     Vol.Free;
