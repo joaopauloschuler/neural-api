@@ -428,43 +428,44 @@ end;
 procedure DequantizeQ4K(const Raw: PByte; NumBlocks: Int64;
   Dest: PSingle);
 var
-  b, j, c, i: Int64;
-  Base: PByte;
-  d, dmin, dsc, dm: single;
+  b, c, i, jLo: Int64;
+  Base, ChunkPtr: PByte;
+  d, dmin, dscLo, dscHi, dmLo, dmHi: single;
   Sc, Mn: array[0..7] of byte;
-  q: byte;
-  Outp: PSingle;
+  pb: byte;
+  Outp, OutLo, OutHi: PSingle;
   NumBlocksM1: Int64;
 begin
   NumBlocksM1 := NumBlocks - 1;
+  Base := Raw;
+  Outp := Dest;
   for b := 0 to NumBlocksM1 do
   begin
-    Base := Raw + b * GGUF_Q4_K_BLOCK_BYTES;
     d    := DecodeF16(PWord(Base)^);
     dmin := DecodeF16(PWord(Base + 2)^);
     DequantizeQ4KScaleMin(Base + 4, Sc, Mn);
-    Outp := Dest + b * GGUF_QK_K;
-    // Sub-blocks come in low/high-nibble pairs sharing one 32-byte chunk.
+    // Sub-blocks come in low/high-nibble pairs sharing one 32-byte chunk;
+    // read each packed byte once and split it into both sub-blocks.
     for c := 0 to 3 do
     begin
       // even sub-block: low nibble; odd sub-block: high nibble.
-      j := 2 * c;
-      dsc := d * Sc[j];
-      dm  := dmin * Mn[j];
+      jLo := 2 * c;
+      dscLo := d * Sc[jLo];
+      dmLo  := dmin * Mn[jLo];
+      dscHi := d * Sc[jLo + 1];
+      dmHi  := dmin * Mn[jLo + 1];
+      ChunkPtr := Base + 16 + (c shl 5);
+      OutLo := Outp + (jLo shl 5);
+      OutHi := OutLo + 32;
       for i := 0 to 31 do
       begin
-        q := (Base + 16 + c * 32 + i)^ and $0F;
-        Outp[j * 32 + i] := dsc * q - dm;
-      end;
-      j := 2 * c + 1;
-      dsc := d * Sc[j];
-      dm  := dmin * Mn[j];
-      for i := 0 to 31 do
-      begin
-        q := ((Base + 16 + c * 32 + i)^ shr 4) and $0F;
-        Outp[j * 32 + i] := dsc * q - dm;
+        pb := (ChunkPtr + i)^;
+        OutLo[i] := dscLo * (pb and $0F) - dmLo;
+        OutHi[i] := dscHi * ((pb shr 4) and $0F) - dmHi;
       end;
     end;
+    Inc(Base, GGUF_Q4_K_BLOCK_BYTES);
+    Inc(Outp, GGUF_QK_K);
   end;
 end;
 
@@ -483,50 +484,49 @@ end;
 procedure DequantizeQ5K(const Raw: PByte; NumBlocks: Int64;
   Dest: PSingle);
 var
-  b, j, c, i: Int64;
-  Base, QhPtr, QlPtr: PByte;
-  d, dmin, dsc, dm: single;
+  b, c, i, jLo: Int64;
+  Base, QhPtr, QlPtr, QlChunk: PByte;
+  d, dmin, dscLo, dscHi, dmLo, dmHi: single;
   Sc, Mn: array[0..7] of byte;
-  ql, qh, q: byte;
-  Outp: PSingle;
+  qlb, qhb, qLo, qHi: byte;
+  Outp, OutLo, OutHi: PSingle;
   NumBlocksM1: Int64;
 begin
   NumBlocksM1 := NumBlocks - 1;
+  Base := Raw;
+  Outp := Dest;
   for b := 0 to NumBlocksM1 do
   begin
-    Base := Raw + b * GGUF_Q5_K_BLOCK_BYTES;
     d    := DecodeF16(PWord(Base)^);
     dmin := DecodeF16(PWord(Base + 2)^);
     DequantizeQ4KScaleMin(Base + 4, Sc, Mn);
     QhPtr := Base + 16;        // 32-byte 5th-bit plane
     QlPtr := Base + 48;        // 128 bytes of 4-bit low quants
-    Outp := Dest + b * GGUF_QK_K;
     // Sub-blocks come in low/high-nibble pairs sharing one 32-byte chunk;
-    // the 5th bit of sub-block j is bit j of the qh byte at (i mod 32).
+    // read the ql/qh bytes once and split them into both sub-blocks.
     for c := 0 to 3 do
     begin
       // even sub-block: low nibble; odd sub-block: high nibble.
-      j := 2 * c;
-      dsc := d * Sc[j];
-      dm  := dmin * Mn[j];
+      jLo := 2 * c;
+      dscLo := d * Sc[jLo];
+      dmLo  := dmin * Mn[jLo];
+      dscHi := d * Sc[jLo + 1];
+      dmHi  := dmin * Mn[jLo + 1];
+      QlChunk := QlPtr + (c shl 5);
+      OutLo := Outp + (jLo shl 5);
+      OutHi := OutLo + 32;
       for i := 0 to 31 do
       begin
-        ql := (QlPtr + c * 32 + i)^ and $0F;
-        qh := ((QhPtr + i)^ shr j) and $01;
-        q  := ql or (qh shl 4);
-        Outp[j * 32 + i] := dsc * q - dm;
-      end;
-      j := 2 * c + 1;
-      dsc := d * Sc[j];
-      dm  := dmin * Mn[j];
-      for i := 0 to 31 do
-      begin
-        ql := ((QlPtr + c * 32 + i)^ shr 4) and $0F;
-        qh := ((QhPtr + i)^ shr j) and $01;
-        q  := ql or (qh shl 4);
-        Outp[j * 32 + i] := dsc * q - dm;
+        qlb := (QlChunk + i)^;
+        qhb := (QhPtr + i)^;
+        qLo := (qlb and $0F) or (((qhb shr jLo) and $01) shl 4);
+        qHi := ((qlb shr 4) and $0F) or (((qhb shr (jLo + 1)) and $01) shl 4);
+        OutLo[i] := dscLo * qLo - dmLo;
+        OutHi[i] := dscHi * qHi - dmHi;
       end;
     end;
+    Inc(Base, GGUF_Q5_K_BLOCK_BYTES);
+    Inc(Outp, GGUF_QK_K);
   end;
 end;
 
@@ -547,31 +547,34 @@ var
   b, e, c, s, p, sb: Int64;
   Base, ScPtr, QsPtr: PByte;
   d, dmin: single;
-  scale, mn, q: byte;
+  scale, mn, q, scb: byte;
   Outp: PSingle;
   NumBlocksM1, QKM1: Int64;
 begin
   NumBlocksM1 := NumBlocks - 1;
   QKM1 := GGUF_QK_K - 1;
+  Base := Raw;
+  Outp := Dest;
   for b := 0 to NumBlocksM1 do
   begin
-    Base   := Raw + b * GGUF_Q2_K_BLOCK_BYTES;
     ScPtr  := Base;            // 16 bytes scale|min
     QsPtr  := Base + 16;       // 64 bytes of 2-bit quants
     d    := DecodeF16(PWord(Base + 80)^);
     dmin := DecodeF16(PWord(Base + 82)^);
-    Outp := Dest + b * GGUF_QK_K;
     for e := 0 to QKM1 do
     begin
-      c := e div 128;
-      s := (e mod 128) div 32;
-      p := e mod 32;
-      q := ((QsPtr + (c * 32 + p))^ shr (2 * s)) and $03;
-      sb := e div 16;
-      scale := (ScPtr + sb)^ and $0F;
-      mn    := ((ScPtr + sb)^ shr 4) and $0F;
+      c := e shr 7;
+      s := (e and 127) shr 5;
+      p := e and 31;
+      q := ((QsPtr + (c * 32 + p))^ shr (s shl 1)) and $03;
+      sb := e shr 4;
+      scb := (ScPtr + sb)^;
+      scale := scb and $0F;
+      mn    := scb shr 4;
       Outp[e] := d * scale * q - dmin * mn;
     end;
+    Inc(Base, GGUF_Q2_K_BLOCK_BYTES);
+    Inc(Outp, GGUF_QK_K);
   end;
 end;
 
@@ -590,6 +593,7 @@ procedure DequantizeQ6K(const Raw: PByte; NumBlocks: Int64;
   Dest: PSingle);
 var
   b, i, g: Int64;
+  iDiv128, iMod128: Int64;
   Base, QlPtr, QhPtr: PByte;
   d: single;
   Scales: PShortInt;
@@ -599,14 +603,14 @@ var
 begin
   NumBlocksM1 := NumBlocks - 1;
   QKM1 := GGUF_QK_K - 1;
+  Base := Raw;
+  Outp := Dest;
   for b := 0 to NumBlocksM1 do
   begin
-    Base := Raw + b * GGUF_Q6_K_BLOCK_BYTES;
     QlPtr := Base;
     QhPtr := Base + 128;
     Scales := PShortInt(Base + 192);
     d := DecodeF16(PWord(Base + 208)^);
-    Outp := Dest + b * GGUF_QK_K;
     // Walk the 256 element indices; recompute each byte/bit position from
     // ggml's ql reshape((-1,1,64))>>[0,4] and qh reshape((-1,1,32))>>
     // [0,2,4,6] super-block decomposition (the two 128-element halves
@@ -618,18 +622,22 @@ begin
     //              2*((i mod 128) div 32).
     for i := 0 to QKM1 do
     begin
-      ql := (QlPtr + ((i div 128) * 64 + (i mod 64)))^;
-      if (i mod 128) < 64 then
+      iDiv128 := i shr 7;
+      iMod128 := i and 127;
+      ql := (QlPtr + ((iDiv128 shl 6) + (i and 63)))^;
+      if iMod128 < 64 then
         ql := ql and $0F
       else
         ql := (ql shr 4) and $0F;
-      idx := (i div 128) * 32 + (i mod 32);
+      idx := (iDiv128 shl 5) + (i and 31);
       qh := (QhPtr + idx)^;
-      qh := (qh shr (2 * ((i mod 128) div 32))) and $03;
+      qh := (qh shr ((iMod128 shr 5) shl 1)) and $03;
       qv := (ql or (qh shl 4)) - 32;
-      g := i div 16;
+      g := i shr 4;
       Outp[i] := d * Scales[g] * qv;
     end;
+    Inc(Base, GGUF_Q6_K_BLOCK_BYTES);
+    Inc(Outp, GGUF_QK_K);
   end;
 end;
 
@@ -668,9 +676,10 @@ var
 begin
   NumBlocksM1 := NumBlocks - 1;
   QKM1 := GGUF_QK_K - 1;
+  Base := Raw;
+  Outp := Dest;
   for b := 0 to NumBlocksM1 do
   begin
-    Base  := Raw + b * GGUF_Q3_K_BLOCK_BYTES;
     HmPtr := Base;             // 32 bytes hmask (3rd bit-plane)
     QsPtr := Base + 32;        // 64 bytes 2-bit low quants
     ScPtr := Base + 96;        // 12 bytes 6-bit packed scales
@@ -684,22 +693,23 @@ begin
       else lsc := (lsc shr 4) and $0F;
       // high 2 bits: byte 8 + (j mod 4), shift 2*(j div 4).
       hsc := (ScPtr + 8 + (j and $03))^;
-      hsc := (hsc shr (2 * (j shr 2))) and $03;
+      hsc := (hsc shr ((j shr 2) shl 1)) and $03;
       Scales[j] := shortint(byte(lsc or (hsc shl 4)) - 32);
     end;
-    Outp := Dest + b * GGUF_QK_K;
     for e := 0 to QKM1 do
     begin
-      h0 := e div 128;
-      p  := e mod 32;
-      s  := (e mod 128) div 32;
-      ql := ((QsPtr + (h0 * 32 + p))^ shr (2 * s)) and $03;
-      qh := ((HmPtr + p)^ shr (e div 32)) and $01;
+      h0 := e shr 7;
+      p  := e and 31;
+      s  := (e and 127) shr 5;
+      ql := ((QsPtr + (h0 * 32 + p))^ shr (s shl 1)) and $03;
+      qh := ((HmPtr + p)^ shr (e shr 5)) and $01;
       qh := qh xor $01;        // CLEAR high bit -> contributes -4
       qv := ql - (qh shl 2);
-      sb := e div 16;
+      sb := e shr 4;
       Outp[e] := d * Scales[sb] * qv;
     end;
+    Inc(Base, GGUF_Q3_K_BLOCK_BYTES);
+    Inc(Outp, GGUF_QK_K);
   end;
 end;
 
@@ -729,13 +739,15 @@ var
 begin
   NumBlocksM1 := NumBlocks - 1;
   QKM1 := GGUF_QK_LEGACY - 1;
+  Base := Raw;
+  Outp := Dest;
   for b := 0 to NumBlocksM1 do
   begin
-    Base := Raw + b * GGUF_Q4_0_BLOCK_BYTES;
     d := DecodeF16(PWord(Base)^);
-    Outp := Dest + b * GGUF_QK_LEGACY;
     for e := 0 to QKM1 do
       Outp[e] := d * (integer(LegacyNibble(Base + 2, e)) - 8);
+    Inc(Base, GGUF_Q4_0_BLOCK_BYTES);
+    Inc(Outp, GGUF_QK_LEGACY);
   end;
 end;
 
@@ -754,14 +766,16 @@ var
 begin
   NumBlocksM1 := NumBlocks - 1;
   QKM1 := GGUF_QK_LEGACY - 1;
+  Base := Raw;
+  Outp := Dest;
   for b := 0 to NumBlocksM1 do
   begin
-    Base := Raw + b * GGUF_Q4_1_BLOCK_BYTES;
     d := DecodeF16(PWord(Base)^);
     m := DecodeF16(PWord(Base + 2)^);
-    Outp := Dest + b * GGUF_QK_LEGACY;
     for e := 0 to QKM1 do
       Outp[e] := d * integer(LegacyNibble(Base + 4, e)) + m;
+    Inc(Base, GGUF_Q4_1_BLOCK_BYTES);
+    Inc(Outp, GGUF_QK_LEGACY);
   end;
 end;
 
@@ -782,18 +796,20 @@ var
 begin
   NumBlocksM1 := NumBlocks - 1;
   QKM1 := GGUF_QK_LEGACY - 1;
+  Base := Raw;
+  Outp := Dest;
   for b := 0 to NumBlocksM1 do
   begin
-    Base := Raw + b * GGUF_Q5_0_BLOCK_BYTES;
     d := DecodeF16(PWord(Base)^);
     qh := PCardinal(Base + 2)^;
-    Outp := Dest + b * GGUF_QK_LEGACY;
     for e := 0 to QKM1 do
     begin
       q5 := integer(LegacyNibble(Base + 6, e)) or
         (integer((qh shr e) and $01) shl 4);
       Outp[e] := d * (q5 - 16);
     end;
+    Inc(Base, GGUF_Q5_0_BLOCK_BYTES);
+    Inc(Outp, GGUF_QK_LEGACY);
   end;
 end;
 
@@ -814,19 +830,21 @@ var
 begin
   NumBlocksM1 := NumBlocks - 1;
   QKM1 := GGUF_QK_LEGACY - 1;
+  Base := Raw;
+  Outp := Dest;
   for b := 0 to NumBlocksM1 do
   begin
-    Base := Raw + b * GGUF_Q5_1_BLOCK_BYTES;
     d := DecodeF16(PWord(Base)^);
     m := DecodeF16(PWord(Base + 2)^);
     qh := PCardinal(Base + 4)^;
-    Outp := Dest + b * GGUF_QK_LEGACY;
     for e := 0 to QKM1 do
     begin
       q5 := integer(LegacyNibble(Base + 8, e)) or
         (integer((qh shr e) and $01) shl 4);
       Outp[e] := d * q5 + m;
     end;
+    Inc(Base, GGUF_Q5_1_BLOCK_BYTES);
+    Inc(Outp, GGUF_QK_LEGACY);
   end;
 end;
 
@@ -1492,7 +1510,7 @@ begin
     // (hf_row[p] = stored[2p], hf_row[p + HeadDim/2] = stored[2p+1]) -
     // the same mapping LoadTensorFlat applies, here used to LOCATE each
     // row instead of shuffling a full-tensor copy.
-    HalfDim := HeadDim div 2;
+    HalfDim := HeadDim shr 1;
     SetLength(RawBytes, RowBytes);
     TensorBase := FDataStarts[0] + FTensors[Idx].DataBegin;
     DstOfs := 0;
@@ -1520,10 +1538,9 @@ var
   NumElements, i, BlockCnt, NumBlocks: Int64;
   Rows, RowLen, r, RowInHead, SrcRow: Int64;
   NumElementsM1, NumBlocksM1, Q8ElemsM1, RowsM1, RowLenM1: Int64;
+  BlockOfs, OutBase: Int64;
   RawBytes: TBytes;
   Scale: single;
-  WordPtr: PWord;
-  SinglePtr: PSingle;
   QuantPtr: PShortInt;
   Tmp: array of TNeuralFloat;
 begin
@@ -1557,23 +1574,12 @@ begin
   FStreams[0].ReadBuffer(RawBytes[0], Length(RawBytes));
   case GGMLType of
     GGML_TYPE_F32:
-    begin
-      SinglePtr := PSingle(@RawBytes[0]);
-      for i := 0 to NumElementsM1 do
-      begin
-        Dest.FData[i] := SinglePtr^;
-        Inc(SinglePtr);
-      end;
-    end;
+      // Native singles: a bit-exact contiguous copy (TNeuralFloat = single).
+      Move(RawBytes[0], Dest.FData[0], NumElements * csNeuralFloatSize);
     GGML_TYPE_F16:
-    begin
-      WordPtr := PWord(@RawBytes[0]);
-      for i := 0 to NumElementsM1 do
-      begin
-        Dest.FData[i] := DecodeF16(WordPtr^);
-        Inc(WordPtr);
-      end;
-    end;
+      // Parallel half->single decode (bit-identical to the serial sweep).
+      DecodeHalfBuffer(PWord(@RawBytes[0]), PSingle(@Dest.FData[0]),
+        integer(NumElements), false);
     GGML_TYPE_Q8_0:
     begin
       // Blocks of 32 elements along the contiguous axis: f16 scale d,
@@ -1582,18 +1588,19 @@ begin
       // rows and a sequential sweep decodes the flat row-major order.
       NumBlocks := NumElements div GGUF_Q8_0_BLOCK_ELEMS;
       NumBlocksM1 := NumBlocks - 1;
+      BlockOfs := 0;
+      OutBase := 0;
       for BlockCnt := 0 to NumBlocksM1 do
       begin
-        Scale := DecodeF16(
-          PWord(@RawBytes[BlockCnt * GGUF_Q8_0_BLOCK_BYTES])^);
-        QuantPtr := PShortInt(
-          @RawBytes[BlockCnt * GGUF_Q8_0_BLOCK_BYTES + 2]);
+        Scale := DecodeF16(PWord(@RawBytes[BlockOfs])^);
+        QuantPtr := PShortInt(@RawBytes[BlockOfs + 2]);
         for i := 0 to Q8ElemsM1 do
         begin
-          Dest.FData[BlockCnt * GGUF_Q8_0_BLOCK_ELEMS + i] :=
-            Scale * QuantPtr^;
+          Dest.FData[OutBase + i] := Scale * QuantPtr^;
           Inc(QuantPtr);
         end;
+        Inc(BlockOfs, GGUF_Q8_0_BLOCK_BYTES);
+        Inc(OutBase, GGUF_Q8_0_BLOCK_ELEMS);
       end;
     end;
     GGML_TYPE_Q4_K:
@@ -1659,11 +1666,10 @@ begin
   begin
     Rows := FTensors[Idx].Shape[0];
     RowLen := NumElements div Rows;
-    HalfDim := HeadDim div 2;
+    HalfDim := HeadDim shr 1;
     SetLength(Tmp, NumElements);
-    for i := 0 to NumElementsM1 do Tmp[i] := Dest.FData[i];
+    Move(Dest.FData[0], Tmp[0], NumElements * csNeuralFloatSize);
     RowsM1 := Rows - 1;
-    RowLenM1 := RowLen - 1;
     for r := 0 to RowsM1 do
     begin
       RowInHead := r mod HeadDim;
@@ -1671,8 +1677,8 @@ begin
         SrcRow := (r - RowInHead) + 2 * RowInHead
       else
         SrcRow := (r - RowInHead) + 2 * (RowInHead - HalfDim) + 1;
-      for i := 0 to RowLenM1 do
-        Dest.FData[r * RowLen + i] := Tmp[SrcRow * RowLen + i];
+      Move(Tmp[SrcRow * RowLen], Dest.FData[r * RowLen],
+        RowLen * csNeuralFloatSize);
     end;
   end;
 end;
@@ -1831,8 +1837,8 @@ procedure TNNetGGUFWriter.AddTensorFlat(const pName: string;
 var
   Idx, i, ContigDim: integer;
   NumElements, NumBlocks, b, e: Int64;
+  ElemBase, ByteBase: Int64;
   WordPtr: PWord;
-  SinglePtr: PSingle;
   QuantPtr: PShortInt;
   ScalePtr: PWord;
   AbsMax, V, Scale, InvScale, Q: single;
@@ -1877,12 +1883,8 @@ begin
     begin
       Pending.GGMLType := GGML_TYPE_F32;
       SetLength(Pending.Data, NumElements * 4);
-      SinglePtr := PSingle(@Pending.Data[0]);
-      for i := 0 to NumElementsM1 do
-      begin
-        SinglePtr^ := Src.FData[i];
-        Inc(SinglePtr);
-      end;
+      // Bit-exact contiguous copy (TNeuralFloat = single).
+      Move(Src.FData[0], Pending.Data[0], NumElements * csNeuralFloatSize);
     end;
     gwF16:
     begin
@@ -1912,20 +1914,22 @@ begin
         // ggml quantize_row_q8_0: scale = max|x| / 127, quants = round(x/scale)
         // clamped to int8; the scale is stored as f16. Mirrors gguf's
         // quants.quantize(..., Q8_0) so a reader round-trip is bit-stable.
+        ElemBase := b * GGUF_Q8_0_BLOCK_ELEMS;
+        ByteBase := b * GGUF_Q8_0_BLOCK_BYTES;
         AbsMax := 0;
         for i := 0 to Q8ElemsM1 do
         begin
-          V := Abs(Src.FData[b * GGUF_Q8_0_BLOCK_ELEMS + i]);
+          V := Abs(Src.FData[ElemBase + i]);
           if V > AbsMax then AbsMax := V;
         end;
         Scale := AbsMax / 127.0;
         if Scale = 0 then InvScale := 0 else InvScale := 1.0 / Scale;
-        ScalePtr := PWord(@Pending.Data[b * GGUF_Q8_0_BLOCK_BYTES]);
+        ScalePtr := PWord(@Pending.Data[ByteBase]);
         ScalePtr^ := EncodeF16(Scale);
-        QuantPtr := PShortInt(@Pending.Data[b * GGUF_Q8_0_BLOCK_BYTES + 2]);
+        QuantPtr := PShortInt(@Pending.Data[ByteBase + 2]);
         for i := 0 to Q8ElemsM1 do
         begin
-          Q := Src.FData[b * GGUF_Q8_0_BLOCK_ELEMS + i] * InvScale;
+          Q := Src.FData[ElemBase + i] * InvScale;
           // round-half-away-from-zero then clamp to [-127, 127]
           if Q >= 0 then e := Trunc(Q + 0.5) else e := Trunc(Q - 0.5);
           if e > 127 then e := 127;
@@ -1948,6 +1952,7 @@ procedure TNNetGGUFWriter.AddTensorFlatInt8(const pName: string;
 var
   Idx, i, ContigDim, r, AbsMaxCode, c: integer;
   NumElements, NumBlocks, RowBlocks, b, RowBase, BlockBase, e: Int64;
+  DataByteBase: Int64;
   QuantPtr: PShortInt;
   ScalePtr: PWord;
   Scale, Q: single;
@@ -2036,25 +2041,32 @@ begin
         if c > AbsMaxCode then AbsMaxCode := c;
       end;
       Scale := (AbsMaxCode * pScales[r]) / 127.0;
-      ScalePtr := PWord(@Pending.Data[(Int64(r) * RowBlocks + b) *
-        GGUF_Q8_0_BLOCK_BYTES]);
+      DataByteBase := (Int64(r) * RowBlocks + b) * GGUF_Q8_0_BLOCK_BYTES;
+      ScalePtr := PWord(@Pending.Data[DataByteBase]);
       ScalePtr^ := EncodeF16(Scale);
-      QuantPtr := PShortInt(@Pending.Data[(Int64(r) * RowBlocks + b) *
-        GGUF_Q8_0_BLOCK_BYTES + 2]);
-      for i := 0 to Q8ElemsM1 do
+      QuantPtr := PShortInt(@Pending.Data[DataByteBase + 2]);
+      // AbsMaxCode = 0 is invariant across the block: a zero block quantizes
+      // to all-zero quants (the divide/round/clamp never runs).
+      if AbsMaxCode = 0 then
       begin
-        if AbsMaxCode = 0 then
-          e := 0
-        else
+        for i := 0 to Q8ElemsM1 do
+        begin
+          QuantPtr^ := 0;
+          Inc(QuantPtr);
+        end;
+      end
+      else
+      begin
+        for i := 0 to Q8ElemsM1 do
         begin
           Q := (pCodes[BlockBase + i] * 127.0) / AbsMaxCode;
           // round-half-away-from-zero then clamp to [-127, 127]
           if Q >= 0 then e := Trunc(Q + 0.5) else e := Trunc(Q - 0.5);
           if e > 127 then e := 127;
           if e < -127 then e := -127;
+          QuantPtr^ := ShortInt(e);
+          Inc(QuantPtr);
         end;
-        QuantPtr^ := ShortInt(e);
-        Inc(QuantPtr);
       end;
     end;
   end;
