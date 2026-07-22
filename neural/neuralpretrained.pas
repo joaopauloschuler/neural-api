@@ -15410,7 +15410,7 @@ var
   InName, OutName, RouterName: string;
   W, WV, WVup, WVgate: TNNetVolume;
   EG, ED: TNNetLayer;
-  e, j, i, TwoI, Base, SrcUp, SrcGate: integer;
+  e, j, i, TwoI, Base, SrcUp, SrcGate, eBase: integer;
   NumExpertsM1, HiddenSizeM1, ExpertWidthM1: integer;
 begin
   TwoI := 2 * ExpertWidth;
@@ -15455,6 +15455,7 @@ begin
     begin
       EG := Block.ExpertGateUp[e];
       EnsureWritableImportWeights(EG);
+      eBase := (e * HiddenSize) * TwoI; // #5/#11: invariant across the j loop
       for j := 0 to ExpertWidthM1 do
       begin
         // UP column (gate_up_proj col I+j) -> neuron j; GATE column
@@ -15462,8 +15463,8 @@ begin
         // in the flat [E*H, 2I] slab, so carry the source offset (#12).
         WVup := EG.FArrNeurons[j].Weights;
         WVgate := EG.FArrNeurons[ExpertWidth + j].Weights;
-        SrcUp := (e * HiddenSize) * TwoI + ExpertWidth + j;
-        SrcGate := (e * HiddenSize) * TwoI + j;
+        SrcGate := eBase + j;
+        SrcUp := SrcGate + ExpertWidth;
         for i := 0 to HiddenSizeM1 do
         begin
           WVup.FData[i] := W.FData[SrcUp];
@@ -15490,12 +15491,13 @@ begin
     begin
       ED := Block.ExpertDown[e];
       EnsureWritableImportWeights(ED);
+      eBase := (e * ExpertWidth) * HiddenSize; // #5/#11: invariant across the j loop
       for j := 0 to HiddenSizeM1 do
       begin
         // down_proj column j (strided by HiddenSize in the flat [E*I, H]
         // slab) -> neuron j; carry the source offset (#12).
         WV := ED.FArrNeurons[j].Weights;
-        SrcUp := (e * ExpertWidth) * HiddenSize + j;
+        SrcUp := eBase + j;
         for i := 0 to ExpertWidthM1 do
         begin
           WV.FData[i] := W.FData[SrcUp];
@@ -25396,7 +25398,7 @@ var
   Tmp: integer;
   IsRel: array of boolean;
   RecallSum: TNeuralFloatDynArr;
-  NDCGSum, DCG, IDCG, Ln2: TNeuralFloat;
+  NDCGSum, DCG, IDCG, Ln2, TmpScore: TNeuralFloat;
   HitCount, NumRel, i, j: integer;
   KListHi, NQM1, NPM1, NumRelM1, MaxKM1, KListKiM1: integer;
 begin
@@ -25621,8 +25623,9 @@ function TColBERTIndex.Search(const Query: string;
 var
   Scores: TNeuralFloatDynArr;
   Order: array of integer;
-  i, j, Tmp: integer;
+  i, j, Tmp, Oi: integer;
   FCountM1, TopKM1: integer;
+  TmpScore: TNeuralFloat;
 begin
   ScoreAll(Query, Scores);
   SetLength(Order, FCount);
@@ -25633,7 +25636,8 @@ begin
   for i := 1 to FCountM1 do
   begin
     Tmp := Order[i]; j := i - 1;
-    while (j >= 0) and (Scores[Order[j]] < Scores[Tmp]) do
+    TmpScore := Scores[Tmp]; // #8: bound once, not re-read per shift step
+    while (j >= 0) and (Scores[Order[j]] < TmpScore) do
     begin
       Order[j + 1] := Order[j]; Dec(j);
     end;
@@ -25644,9 +25648,10 @@ begin
   TopKM1 := TopK - 1;
   for i := 0 to TopKM1 do
   begin
-    Result[i].DocIndex := Order[i];
-    Result[i].Score := Scores[Order[i]];
-    Result[i].Text := FDocTexts[Order[i]];
+    Oi := Order[i]; // #4: indexed once, reused for DocIndex/Score/Text
+    Result[i].DocIndex := Oi;
+    Result[i].Score := Scores[Oi];
+    Result[i].Text := FDocTexts[Oi];
   end;
 end;
 
@@ -26515,7 +26520,7 @@ procedure DebertaBuildRelLN(RelEmb, RelGamma, RelBeta: TNNetVolume;
 var
   a, c: integer;
   Mean, Variance, InvStd, V: TNeuralFloat;
-  twoSpanM1, HiddenM1, aBase: integer;
+  twoSpanM1, HiddenM1, aBase, idx: integer;
 begin
   twoSpanM1 := twoSpan - 1;
   HiddenM1 := Hidden - 1;
@@ -26537,9 +26542,12 @@ begin
       Variance := Variance / Hidden;
       InvStd := 1.0 / Sqrt(Variance + Eps);
       for c := 0 to HiddenM1 do
-        RelLN.FData[aBase + c] :=
-          (RelEmb.FData[aBase + c] - Mean) * InvStd *
+      begin
+        idx := aBase + c; // #4: the (aBase + c) add, done once
+        RelLN.FData[idx] :=
+          (RelEmb.FData[idx] - Mean) * InvStd *
           RelGamma.FData[c] + RelBeta.FData[c];
+      end;
     end
     else
       // pass-through: the whole row is a contiguous copy.
