@@ -4651,7 +4651,9 @@ begin
     SetLength(FBiases, (FCount + 1) * 2);
   end;
   SetLength(FSequences[FCount], Len);
-  for J := 0 to LenM1 do FSequences[FCount][J] := Sequence[J];
+  // Contiguous integer copy -> Move (rule #13 / App. C).
+  if Len > 0 then
+    Move(Sequence[0], FSequences[FCount][0], Len * csIntegerSize);
   FBiases[FCount] := Bias;
   Inc(FCount);
 end;
@@ -4688,6 +4690,7 @@ var
   SizeM1, FCountM1, PrefLenM1: integer;
   Match: boolean;
   KeptMass, InvKept: TNeuralFloat;
+  Seq: TNeuralIntegerArray; // #7: bind this sequence once (reference copy)
 begin
   if FCount = 0 then exit;
   Size := Row.Size;
@@ -4702,8 +4705,9 @@ begin
   FillDWord(FScaleBuf[0], Size, $3F800000);
   for I := 0 to FCountM1 do
   begin
-    Len := Length(FSequences[I]);
-    Final := FSequences[I][Len - 1];
+    Seq := FSequences[I];        // #7: bind once per I, then index the local
+    Len := Length(Seq);
+    Final := Seq[Len - 1];
     if (Final < 0) or (Final >= Size) then continue;
     // The (Len-1)-token prefix must be a SUFFIX of the generated history. A
     // single-token sequence has an empty prefix -> always matches (an
@@ -4714,7 +4718,7 @@ begin
     HistStart := FLen - PrefLen;
     PrefLenM1 := PrefLen - 1;
     for K := 0 to PrefLenM1 do
-      if FHistory[HistStart + K] <> FSequences[I][K] then
+      if FHistory[HistStart + K] <> Seq[K] then
       begin
         Match := false;
         break;
@@ -6981,7 +6985,11 @@ begin
         for I := 0 to VocabSizeM1 do
           if PFinal[I] >= Threshold then
           begin
-            ScoreV := SafeLogProb(PFinal[I]) - SafeLogProb(PLens[I]);
+            // #14: argmax of ln(pf')-ln(pl') == argmax of pf'/pl' (ln strictly monotone);
+            // same 1e-30 clamps as SafeLogProb, so ranking is order-identical.
+            Pf := PFinal[I]; if Pf < 1e-30 then Pf := 1e-30;
+            Pl := PLens[I];  if Pl < 1e-30 then Pl := 1e-30;
+            ScoreV := Pf / Pl;
             if (Best < 0) or (ScoreV > BestScore) then
             begin
               BestScore := ScoreV;

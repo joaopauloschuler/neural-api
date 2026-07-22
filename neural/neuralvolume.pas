@@ -4903,6 +4903,7 @@ var
   ClusterCount, MaxClusterCount: integer;
   ClosestId: integer;
   StartTime: double;
+  Smp, CS, Cl: TNNetVolume; // #7: bind repeatedly-indexed list elements
 begin
   StartTime := Now();
   MaxSampleCount := FSample.Count - 1;
@@ -4915,26 +4916,30 @@ begin
   begin
     for SampleCount := 0 to MaxSampleCount do
     begin
-      ClosestId := GetClusterId(FSample[SampleCount]);
-      FClusterSums[ClosestId].Add(FSample[SampleCount]);
-      FClusterSums[ClosestId].IncTag();
-      FSample[SampleCount].Tag := ClosestId;
+      Smp := FSample[SampleCount];      // #7: bound once
+      ClosestId := GetClusterId(Smp);
+      CS := FClusterSums[ClosestId];    // #7: bound once
+      CS.Add(Smp);
+      CS.IncTag();
+      Smp.Tag := ClosestId;
     end;
 
     for ClusterCount := 0 to MaxClusterCount do
     begin
-      if FClusterSums[ClusterCount].Tag > 0 then
+      CS := FClusterSums[ClusterCount];   // #7: bound once
+      Cl := FClusters[ClusterCount];      // #7: bound once
+      if CS.Tag > 0 then
       begin
-        FClusterSums[ClusterCount].Divi(FClusterSums[ClusterCount].Tag);
+        CS.Divi(CS.Tag);
         if RepositionClusters then
         begin
-          FClusters[ClusterCount].Copy(FClusterSums[ClusterCount]);
+          Cl.Copy(CS);
         end;
-        FClusters[ClusterCount].Tag := FClusterSums[ClusterCount].Tag;
+        Cl.Tag := CS.Tag;
       end
       else
       begin
-        FClusters[ClusterCount].Tag := 0;
+        Cl.Tag := 0;
       end;
     end;
   end;
@@ -5129,23 +5134,26 @@ function TNNetVolumeList.GetClosestId(Original: TNNetVolume; var MinDist: TNeura
 var
   I: integer;
   MaxCount: integer;
-  CurrentDist: TNeuralFloat;
+  CurrentDist, MinSqr: TNeuralFloat;
 begin
   Result := 0;
   MaxCount := Count - 1;
   if (MaxCount > 0) then
   begin
-    MinDist := Original.GetDistance(Self[0]);
+    // #14: rank on GetDistanceSqr (argmin identical, Sqrt strictly increasing);
+    // take the one Sqrt on the winner after the loop. MinSqr<=0 <=> MinDist<=0.
+    MinSqr := Original.GetDistanceSqr(Self[0]);
     for I := 1 to MaxCount do
     begin
-      CurrentDist := Original.GetDistance(Self[I]);
-      if (CurrentDist < MinDist) then
+      CurrentDist := Original.GetDistanceSqr(Self[I]);
+      if (CurrentDist < MinSqr) then
       begin
         Result := I;
-        MinDist := CurrentDist;
+        MinSqr := CurrentDist;
       end;
-      if MinDist <= 0 then Break;
+      if MinSqr <= 0 then Break;
     end;
+    if MinSqr > 0 then MinDist := Sqrt(MinSqr) else MinDist := 0;
   end;
 end;
 

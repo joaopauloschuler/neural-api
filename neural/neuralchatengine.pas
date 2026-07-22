@@ -1184,6 +1184,7 @@ var
   Penalty: TNNetTokenHistoryPenalty;
   Sampler: TNNetSamplerBase;
   CacheReuse: boolean;
+  GreedyFast: boolean;
   Tokens: TNeuralIntegerArray;
   Generated: TNeuralIntegerArray;
   InV, Output, Row: TNNetVolume;
@@ -1302,6 +1303,10 @@ begin
       NN.ResetSchedulerStats();
     end;
     RowBytes := VocabSize * csNeuralFloatSize;
+    // #14: pure-greedy decode (no sampler, empty processor chain) needs only
+    // argmax(logits); softmax and its full-vocab Move are order-preserving, so
+    // argmax(softmax(L)) = argmax(L). Skip both on this hot per-token path.
+    GreedyFast := (Sampler = nil) and (Chain.Count = 0);
     for StepCnt := 1 to GenOpt.MaxNewTokens do
     begin
       if Len >= SeqLen then break;
@@ -1310,11 +1315,16 @@ begin
       InV.FData[0] := Tokens[LastPos];
       Session.StepForward(InV, LastPos);
       Output := Session.Output(); // (1,1,vocab) -- the single logits row
-      Move(Output.FData[0], Row.FData[0], RowBytes);
-      RowSoftMax(Row);
-      Chain.ProcessRow(Row);
-      if Assigned(Sampler) then NewToken := Sampler.GetToken(Row)
-      else NewToken := ArgMaxRow(Row);
+      if GreedyFast then
+        NewToken := ArgMaxRow(Output)   // #14: argmax(softmax)=argmax(logits)
+      else
+      begin
+        Move(Output.FData[0], Row.FData[0], RowBytes);
+        RowSoftMax(Row);
+        Chain.ProcessRow(Row);
+        if Assigned(Sampler) then NewToken := Sampler.GetToken(Row)
+        else NewToken := ArgMaxRow(Row);
+      end;
       Chain.Commit(NewToken);
       Tokens[Len] := NewToken;
       Inc(Len);
