@@ -2510,7 +2510,7 @@ procedure TNNetTokenConstraint.MaskAllowed(Probs: TNNetVolume);
 var
   I, SizeM1: integer;
   AllowedMass, InvMass: TNeuralFloat;
-  AnyBlocked: boolean;
+  AnyBlocked, A: boolean;
 begin
   // Rule #17: lazily grow the persistent membership buffer, never per call.
   if Length(FAllowedBuf) < Probs.Size then SetLength(FAllowedBuf, Probs.Size);
@@ -2519,8 +2519,9 @@ begin
   AnyBlocked := false;
   for I := 0 to SizeM1 do
   begin
-    FAllowedBuf[I] := TokenAllowed(I);
-    if FAllowedBuf[I]
+    A := TokenAllowed(I);           // #4: bind once, avoid re-reading FAllowedBuf[I]
+    FAllowedBuf[I] := A;
+    if A
     then AllowedMass := AllowedMass + Probs.Raw[I]
     else AnyBlocked := true;
   end;
@@ -6180,6 +6181,7 @@ var
   Done: array of boolean;
   Total, BestVal: TNeuralFloat;
   AnyRunning: boolean;
+  RowV: TNNetVolume;
 begin
   N := Length(Prompts);
   SetLength(Result, N);
@@ -6215,17 +6217,18 @@ begin
         // Rule #14: rank on the raw distribution (SafeLogProb is monotonic,
         // /Total a shared positive constant), one SafeLogProb for the winner.
         Total := NextTokenForward(NN, Contexts[R], InVols[R], OutVols[R]);
-        // #4: carry the running best value; also avoids the OutVols[R] list
-        // accessor re-indexing Raw[Best] each iteration.
+        // #4/#7: bind the row volume once; carry the running best value; also
+        // avoids the OutVols[R] accessor re-indexing Raw[Best] each iteration.
+        RowV := OutVols[R];
         Best := 0;
-        BestVal := OutVols[R].Raw[0];
+        BestVal := RowV.Raw[0];
         for I := 1 to VocabSizeM1 do
-          if OutVols[R].Raw[I] > BestVal then
+          if RowV.Raw[I] > BestVal then
           begin
             Best := I;
-            BestVal := OutVols[R].Raw[I];
+            BestVal := RowV.Raw[I];
           end;
-        Result[R].SumLogProb := Result[R].SumLogProb + SafeLogProb(OutVols[R].Raw[Best] / Total);
+        Result[R].SumLogProb := Result[R].SumLogProb + SafeLogProb(RowV.Raw[Best] / Total);
         if Best = csDecodeEOSToken then
         begin
           Result[R].Finished := True;
@@ -6307,7 +6310,7 @@ var
   CandHidden: TNNetVolume;         // snapshot of a candidate's hidden state
   VocabSize, Step, I, J, NumCand, Best, StopLen, PastLen: integer;
   VocabSizeM1, NumCandM1, PastLenM1, IP1: integer;
-  Total, InvTotal, MaxSim, Sim, ScoreV, BestScore, BestP: TNeuralFloat;
+  Total, InvTotal, MaxSim, Sim, ScoreV, BestScore, BestP, PJ: TNeuralFloat;
   Context, CandStr: string;
   TmpI: integer;
 begin
@@ -6366,11 +6369,14 @@ begin
         BestP := Probs[Cand[Best]];   // #4: hoist the running best, drop reload
         IP1 := I + 1;
         for J := IP1 to VocabSizeM1 do
-          if Probs[Cand[J]] > BestP then
+        begin
+          PJ := Probs[Cand[J]];   // #4: bind once, drop the second index+reload
+          if PJ > BestP then
           begin
             Best := J;
-            BestP := Probs[Cand[J]];
+            BestP := PJ;
           end;
+        end;
         TmpI := Cand[I]; Cand[I] := Cand[Best]; Cand[Best] := TmpI;
       end;
       // Re-rank candidates by the contrastive objective. PenaltyAlpha=0 keeps
@@ -6458,7 +6464,7 @@ var
   CandHidden: TNNetVolume;
   VocabSize, Pos, CapLen, I, J, NumCand, Best, PastLen, StopLen: integer;
   VocabSizeM1, NumCandM1, PastLenM1, PromptLenM2, IP1: integer;
-  Total, InvTotal, MaxSim, Sim, ScoreV, BestScore, BestP: TNeuralFloat;
+  Total, InvTotal, MaxSim, Sim, ScoreV, BestScore, BestP, PJ: TNeuralFloat;
   TmpI: integer;
 begin
   if Session.Net.GetFirstLayer().Output.SizeX <> 1 then
@@ -6539,11 +6545,14 @@ begin
         BestP := Probs[Cand[Best]];   // #4: hoist the running best, drop reload
         IP1 := I + 1;
         for J := IP1 to VocabSizeM1 do
-          if Probs[Cand[J]] > BestP then
+        begin
+          PJ := Probs[Cand[J]];   // #4: bind once, drop the second index+reload
+          if PJ > BestP then
           begin
             Best := J;
-            BestP := Probs[Cand[J]];
+            BestP := PJ;
           end;
+        end;
         TmpI := Cand[I]; Cand[I] := Cand[Best]; Cand[Best] := TmpI;
       end;
       // Re-rank by the contrastive objective. PenaltyAlpha=0 keeps
@@ -7372,6 +7381,8 @@ var
   NewBeam: TBeam;
   CutScore, InvDenFin, InvDenExt: TNeuralFloat;
   AllDominated: boolean;
+  BSumLP: TNeuralFloat;
+  BText: string;
 begin
   if BeamWidth < 1 then BeamWidth := 1;
   InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
@@ -7417,21 +7428,24 @@ begin
       LiveHi := High(Live);
       for B := 0 to LiveHi do
       begin
-        NextLogProbs(NN, Prompt + Live[B].Text,
+        // #11: Live[B] fields are invariant across the vocab (T) loop - hoist.
+        BSumLP := Live[B].SumLogProb;
+        BText := Live[B].Text;
+        NextLogProbs(NN, Prompt + BText,
           InputVolume, OutputVolume, LogProbs);
         // The penalty denominator depends only on the beam text length, which is
         // fixed across the vocab loop: LenB for the EOS branch (text unchanged),
         // LenB+1 for the extend branch (Chr(T) is always exactly one char). Hoist
         // both Power() reciprocals out of the T loop (#5).
-        LenB := Length(Live[B].Text);
+        LenB := Length(BText);
         InvDenFin := 1.0 / LengthPenaltyDenominator(LenB, LengthPenalty);
         InvDenExt := 1.0 / LengthPenaltyDenominator(LenB + 1, LengthPenalty);
         for T := 0 to VocabSizeM1 do
         begin
-          NewBeam.SumLogProb := Live[B].SumLogProb + LogProbs[T];
+          NewBeam.SumLogProb := BSumLP + LogProbs[T];
           if T = csDecodeEOSToken then
           begin
-            NewBeam.Text := Live[B].Text;
+            NewBeam.Text := BText;
             NewBeam.Finished := True;
             NewBeam.Score := NewBeam.SumLogProb * InvDenFin;
             SetLength(Finished, Length(Finished) + 1);
@@ -7439,7 +7453,7 @@ begin
           end
           else
           begin
-            NewBeam.Text := Live[B].Text + Chr(T);
+            NewBeam.Text := BText + Chr(T);
             NewBeam.Finished := False;
             NewBeam.Score := NewBeam.SumLogProb * InvDenExt;
             Cand[CandCount] := NewBeam;
@@ -7560,6 +7574,9 @@ var
   CutScore, Total, InvTotal, InvDenFin, InvDenExt: TNeuralFloat;
   AllDominated: boolean;
   FinSurvivors: TBeamArray;
+  BSumLP: TNeuralFloat;
+  BText: string;
+  BLastPosP1: integer;
 
   procedure FreeLiveSnaps;
   var k, LiveHi: integer;
@@ -7676,15 +7693,23 @@ begin
         BaseAfter[B] := Session.Snapshot();
         // Penalty denominator is fixed across the vocab loop: LenB for the EOS
         // branch, LenB+1 for the extend branch (Chr(T) is one char). Hoist (#5).
-        LenB := Length(Live[B].Text);
+        // #11: Live[B] fields are invariant across the vocab (T) loop - hoist.
+        BSumLP := Live[B].SumLogProb;
+        BText := Live[B].Text;
+        BLastPosP1 := Live[B].LastPos + 1;
+        LenB := Length(BText);
         InvDenFin := 1.0 / LengthPenaltyDenominator(LenB, LengthPenalty);
         InvDenExt := 1.0 / LengthPenaltyDenominator(LenB + 1, LengthPenalty);
+        // A1: candidate Text is materialized only for survivors (post-prune,
+        // below) from ParentIdx+LastToken; keep NewC.Text empty so the reused
+        // record never leaks a prior iteration's string into a candidate.
+        NewC.Text := '';
         for T := 0 to VocabSizeM1 do
         begin
           if T = csDecodeEOSToken then
           begin
-            FinB.SumLogProb := Live[B].SumLogProb + LogProbs[T];
-            FinB.Text := Live[B].Text;
+            FinB.SumLogProb := BSumLP + LogProbs[T];
+            FinB.Text := BText;
             FinB.Finished := True;
             FinB.Score := FinB.SumLogProb * InvDenFin;
             SetLength(Finished, Length(Finished) + 1);
@@ -7692,12 +7717,11 @@ begin
           end
           else
           begin
-            NewC.SumLogProb := Live[B].SumLogProb + LogProbs[T];
-            NewC.Text := Live[B].Text + Chr(T);
+            NewC.SumLogProb := BSumLP + LogProbs[T];
             NewC.Score := NewC.SumLogProb * InvDenExt;
             NewC.ParentIdx := B;
             NewC.LastToken := T;             // future input char
-            NewC.LastPos := Live[B].LastPos + 1;
+            NewC.LastPos := BLastPosP1;
             Cand[CandCount] := NewC;
             Inc(CandCount);
           end;
@@ -7717,7 +7741,8 @@ begin
       CandHi := High(Cand);
       for I := 0 to CandHi do
       begin
-        NewLive[I].Text := Cand[I].Text;
+        // A1: materialize survivor text here from parent + appended char.
+        NewLive[I].Text := Live[Cand[I].ParentIdx].Text + Chr(Cand[I].LastToken);
         NewLive[I].SumLogProb := Cand[I].SumLogProb;
         NewLive[I].Score := Cand[I].Score;
         NewLive[I].Finished := False;
@@ -7803,6 +7828,8 @@ var
   Cand: TBeamArray;      // expansion candidates for the CURRENT group
   NewBeam: TBeam;
   Pen, InvDenFin, InvDenExt: TNeuralFloat;
+  BSumLP: TNeuralFloat;
+  BText: string;
 begin
   if BeamWidth < 1 then BeamWidth := 1;
   if NumGroups < 1 then NumGroups := 1;
@@ -7863,19 +7890,22 @@ begin
         CandCount := 0;
         for B := GroupLo to GroupHi do
         begin
-          NextLogProbs(NN, Prompt + Live[B].Text,
+          // #11: Live[B] fields are invariant across the vocab (T) loop - hoist.
+          BSumLP := Live[B].SumLogProb;
+          BText := Live[B].Text;
+          NextLogProbs(NN, Prompt + BText,
             InputVolume, OutputVolume, LogProbs);
           // Denominator fixed across the vocab loop: LenB (EOS) / LenB+1 (extend,
           // Chr(T) is one char). Hoist both Power() reciprocals out (#5).
-          LenB := Length(Live[B].Text);
+          LenB := Length(BText);
           InvDenFin := 1.0 / LengthPenaltyDenominator(LenB, LengthPenalty);
           InvDenExt := 1.0 / LengthPenaltyDenominator(LenB + 1, LengthPenalty);
           for T := 0 to VocabSizeM1 do
           begin
-            NewBeam.SumLogProb := Live[B].SumLogProb + LogProbs[T];
+            NewBeam.SumLogProb := BSumLP + LogProbs[T];
             if T = csDecodeEOSToken then
             begin
-              NewBeam.Text := Live[B].Text;
+              NewBeam.Text := BText;
               NewBeam.Finished := True;
               NewBeam.Score := NewBeam.SumLogProb * InvDenFin;
               SetLength(Finished, Length(Finished) + 1);
@@ -7883,7 +7913,7 @@ begin
             end
             else
             begin
-              NewBeam.Text := Live[B].Text + Chr(T);
+              NewBeam.Text := BText + Chr(T);
               NewBeam.Finished := False;
               // Length-penalised base score, minus the diversity penalty for
               // collisions with earlier groups at THIS step (g=0: no penalty).
@@ -8060,6 +8090,8 @@ var
   NewBeam: TBeam;
   Needed: string;
   InvDenFin, InvDenExt: TNeuralFloat;
+  BSumLP: TNeuralFloat;
+  BText: string;
 begin
   if BeamWidth < 1 then BeamWidth := 1;
   BeamWidthM1 := BeamWidth - 1;
@@ -8099,23 +8131,26 @@ begin
       LiveHi := High(Live);
       for B := 0 to LiveHi do
       begin
-        NextLogProbs(NN, Prompt + Live[B].Text,
+        // #11: Live[B] fields are invariant across both vocab passes - hoist.
+        BSumLP := Live[B].SumLogProb;
+        BText := Live[B].Text;
+        NextLogProbs(NN, Prompt + BText,
           InputVolume, OutputVolume, LogProbs);
         // Characters that advance an unmet phrase: each is FORCE-INJECTED as a
         // candidate (even if the model assigns it ~0 probability) so a path that
         // makes progress toward every phrase always exists in the pool.
-        Needed := NeededNextChars(Live[B].Text, ForceTokens);
+        Needed := NeededNextChars(BText, ForceTokens);
         NeededLen := Length(Needed);
         // Denominator fixed across both vocab passes for this beam: LenB (EOS,
         // text unchanged) / LenB+1 (extend, one appended char). Hoist (#5).
-        LenB := Length(Live[B].Text);
+        LenB := Length(BText);
         InvDenFin := 1.0 / LengthPenaltyDenominator(LenB, LengthPenalty);
         InvDenExt := 1.0 / LengthPenaltyDenominator(LenB + 1, LengthPenalty);
         for I := 1 to NeededLen do
         begin
           T := Ord(Needed[I]);
-          NewBeam.SumLogProb := Live[B].SumLogProb + LogProbs[T];
-          NewBeam.Text := Live[B].Text + Chr(T);
+          NewBeam.SumLogProb := BSumLP + LogProbs[T];
+          NewBeam.Text := BText + Chr(T);
           NewBeam.Finished := False;
           NewBeam.Score := NewBeam.SumLogProb * InvDenExt;
           Cand[CandCount] := NewBeam;
@@ -8123,14 +8158,14 @@ begin
         end;
         for T := 0 to VocabSizeM1 do
         begin
-          NewBeam.SumLogProb := Live[B].SumLogProb + LogProbs[T];
+          NewBeam.SumLogProb := BSumLP + LogProbs[T];
           if T = csDecodeEOSToken then
           begin
             // EOS only allowed once ALL phrases are present; otherwise the
             // hypothesis must keep generating to satisfy the constraint.
-            if not AllForcedPhrasesPresent(Live[B].Text, ForceTokens) then
+            if not AllForcedPhrasesPresent(BText, ForceTokens) then
               Continue;
-            NewBeam.Text := Live[B].Text;
+            NewBeam.Text := BText;
             NewBeam.Finished := True;
             NewBeam.Score := NewBeam.SumLogProb * InvDenFin;
             SetLength(Finished, Length(Finished) + 1);
@@ -8141,7 +8176,7 @@ begin
             // Skip a token already added through the force-injection pass above
             // (it is a needed next-char) to avoid a duplicate candidate.
             if Pos(Chr(T), Needed) > 0 then Continue;
-            NewBeam.Text := Live[B].Text + Chr(T);
+            NewBeam.Text := BText + Chr(T);
             NewBeam.Finished := False;
             NewBeam.Score := NewBeam.SumLogProb * InvDenExt;
             Cand[CandCount] := NewBeam;
@@ -8592,6 +8627,8 @@ var
   MaxLogit, SumExp, CutScore, V, InvDenExt: TNeuralFloat;
   LnSumExp, LnTiny, LP: TNeuralFloat;
   AllDominated: boolean;
+  BSumLP: TNeuralFloat;
+  BToks: TNeuralIntegerArray;
 begin
   SetLength(Result, 0);
   if MaxNewTokens < 1 then exit;
@@ -8671,14 +8708,18 @@ begin
       LiveHi := High(Live);
       for B := 0 to LiveHi do
       begin
-        PrevLen := Length(Live[B].Tokens); // = Step - 1
+        // #11: Live[B] fields are invariant across the vocab (T) loop - hoist.
+        // BToks references the same dynarray (refcount), not a copy.
+        BToks := Live[B].Tokens;
+        BSumLP := Live[B].SumLogProb;
+        PrevLen := Length(BToks); // = Step - 1
         // StartTokenId + generated prefix, padded with StartTokenId: causal
         // self-attention makes the padding invisible to row PrevLen (same
         // re-forward convention as DecodeSeq2SeqSampled).
         // DecToks was Fill(StartTokenId)'d once; positions past the prefix stay
         // StartTokenId, so only the [1..PrevLen] prefix needs (re)writing here.
         for Pos := 1 to PrevLen do
-          DecToks.FData[Pos] := Live[B].Tokens[Pos - 1];
+          DecToks.FData[Pos] := BToks[Pos - 1];
         DecoderNet.Compute(DecToks);
         // Stable softmax of the logits row at the last prefix position,
         // then SafeLogProb - the log image of the greedy/sampled row.
@@ -8709,12 +8750,12 @@ begin
         InvDenExt := 1.0 / LengthPenaltyDenominator(PrevLen + 1, LengthPenalty);
         for T := 0 to VocabSizeM1 do
         begin
-          NewBeam.SumLogProb := Live[B].SumLogProb + LogProbs[T];
+          NewBeam.SumLogProb := BSumLP + LogProbs[T];
           // One allocation instead of Copy(PrevLen)+SetLength(PrevLen+1)'s two
           // (rule #4/#17): size once, then Move the prefix in.
           SetLength(NewBeam.Tokens, PrevLen + 1);
           if PrevLen > 0 then
-            Move(Live[B].Tokens[0], NewBeam.Tokens[0], PrevLen * csIntegerSize);
+            Move(BToks[0], NewBeam.Tokens[0], PrevLen * csIntegerSize);
           NewBeam.Tokens[PrevLen] := T; // EOS included, like greedy
           NewBeam.Finished := (T = EOSTokenId);
           NewBeam.Score := NewBeam.SumLogProb * InvDenExt;

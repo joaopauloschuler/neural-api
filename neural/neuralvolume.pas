@@ -3860,10 +3860,11 @@ end;
 
 procedure TNNetTokenHistoryPenalty.ResetHistory();
 var
-  I, MaxI: integer;
+  Len: integer;
 begin
-  MaxI := Length(FCounts) - 1;
-  for I := 0 to MaxI do FCounts[I] := 0;
+  // #13/App C: bulk zero-fill the integer counter array in one call.
+  Len := Length(FCounts);
+  if Len > 0 then FillChar(FCounts[0], Len * csIntegerSize, 0);
 end;
 
 procedure TNNetTokenHistoryPenalty.Apply(Logits: TNNetVolume);
@@ -8611,7 +8612,7 @@ const
   cErfA5: TNeuralFloat =  1.061405429;
   cErfP:  TNeuralFloat =  0.3275911;
 var
-  I, ChunkStart, ChunkLen, J: integer;
+  I, ChunkStart, ChunkLen, ChunkLenM1, J: integer;
   X, AX, T, Poly, E: TNeuralFloat;
   ExpBuf: array[0..255] of TNeuralFloat;
 begin
@@ -8627,13 +8628,14 @@ begin
   begin
     ChunkLen := N - ChunkStart;
     if ChunkLen > 256 then ChunkLen := 256;
-    for J := 0 to ChunkLen - 1 do
+    ChunkLenM1 := ChunkLen - 1;   // #2: hoist the for-bound (both loops)
+    for J := 0 to ChunkLenM1 do
     begin
       X := pSrc^[ChunkStart + J];
       ExpBuf[J] := -X * X;
     end;
     VectorExp(TNeuralFloatArrPtr(@ExpBuf[0]), TNeuralFloatArrPtr(@ExpBuf[0]), ChunkLen);
-    for J := 0 to ChunkLen - 1 do
+    for J := 0 to ChunkLenM1 do
     begin
       I := ChunkStart + J;
       X := pSrc^[I];
