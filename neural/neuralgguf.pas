@@ -544,15 +544,14 @@ end;
 procedure DequantizeQ2K(const Raw: PByte; NumBlocks: Int64;
   Dest: PSingle);
 var
-  b, e, c, s, p, sb: Int64;
+  b, e, c, s, p, sb, k, eBase: Int64;
   Base, ScPtr, QsPtr: PByte;
-  d, dmin: single;
+  d, dmin, dl, ml: single;
   scale, mn, q, scb: byte;
   Outp: PSingle;
-  NumBlocksM1, QKM1: Int64;
+  NumBlocksM1: Int64;
 begin
   NumBlocksM1 := NumBlocks - 1;
-  QKM1 := GGUF_QK_K - 1;
   Base := Raw;
   Outp := Dest;
   for b := 0 to NumBlocksM1 do
@@ -561,17 +560,25 @@ begin
     QsPtr  := Base + 16;       // 64 bytes of 2-bit quants
     d    := DecodeF16(PWord(Base + 80)^);
     dmin := DecodeF16(PWord(Base + 82)^);
-    for e := 0 to QKM1 do
+    // Each 16-element sub-block sb shares one scale|min byte, so the products
+    // d*scale and dmin*mn are hoisted out of the per-element loop (#11/#5).
+    for sb := 0 to 15 do
     begin
-      c := e shr 7;
-      s := (e and 127) shr 5;
-      p := e and 31;
-      q := ((QsPtr + (c * 32 + p))^ shr (s shl 1)) and $03;
-      sb := e shr 4;
       scb := (ScPtr + sb)^;
       scale := scb and $0F;
       mn    := scb shr 4;
-      Outp[e] := d * scale * q - dmin * mn;
+      dl := d * scale;
+      ml := dmin * mn;
+      eBase := sb shl 4;
+      for k := 0 to 15 do
+      begin
+        e := eBase + k;
+        c := e shr 7;
+        s := (e and 127) shr 5;
+        p := e and 31;
+        q := ((QsPtr + (c * 32 + p))^ shr (s shl 1)) and $03;
+        Outp[e] := dl * q - ml;
+      end;
     end;
     Inc(Base, GGUF_Q2_K_BLOCK_BYTES);
     Inc(Outp, GGUF_QK_K);
@@ -592,17 +599,16 @@ end;
 procedure DequantizeQ6K(const Raw: PByte; NumBlocks: Int64;
   Dest: PSingle);
 var
-  b, i, g: Int64;
+  b, i, g, k, iBase: Int64;
   iDiv128, iMod128: Int64;
   Base, QlPtr, QhPtr: PByte;
-  d: single;
+  d, dl: single;
   Scales: PShortInt;
   Outp: PSingle;
   ql, qh, idx, qv: integer;
-  NumBlocksM1, QKM1: Int64;
+  NumBlocksM1: Int64;
 begin
   NumBlocksM1 := NumBlocks - 1;
-  QKM1 := GGUF_QK_K - 1;
   Base := Raw;
   Outp := Dest;
   for b := 0 to NumBlocksM1 do
@@ -620,21 +626,28 @@ begin
     //              < 64, else high nibble.
     //   qh byte  = (i div 128)*32 + (i mod 32); 2-bit field at shift
     //              2*((i mod 128) div 32).
-    for i := 0 to QKM1 do
+    // 16 scale groups of 16 elements; d*Scales[g] is invariant per group, so
+    // hoist it out of the per-element loop (#11/#5).
+    for g := 0 to 15 do
     begin
-      iDiv128 := i shr 7;
-      iMod128 := i and 127;
-      ql := (QlPtr + ((iDiv128 shl 6) + (i and 63)))^;
-      if iMod128 < 64 then
-        ql := ql and $0F
-      else
-        ql := (ql shr 4) and $0F;
-      idx := (iDiv128 shl 5) + (i and 31);
-      qh := (QhPtr + idx)^;
-      qh := (qh shr ((iMod128 shr 5) shl 1)) and $03;
-      qv := (ql or (qh shl 4)) - 32;
-      g := i shr 4;
-      Outp[i] := d * Scales[g] * qv;
+      dl := d * Scales[g];
+      iBase := g shl 4;
+      for k := 0 to 15 do
+      begin
+        i := iBase + k;
+        iDiv128 := i shr 7;
+        iMod128 := i and 127;
+        ql := (QlPtr + ((iDiv128 shl 6) + (i and 63)))^;
+        if iMod128 < 64 then
+          ql := ql and $0F
+        else
+          ql := (ql shr 4) and $0F;
+        idx := (iDiv128 shl 5) + (i and 31);
+        qh := (QhPtr + idx)^;
+        qh := (qh shr ((iMod128 shr 5) shl 1)) and $03;
+        qv := (ql or (qh shl 4)) - 32;
+        Outp[i] := dl * qv;
+      end;
     end;
     Inc(Base, GGUF_Q6_K_BLOCK_BYTES);
     Inc(Outp, GGUF_QK_K);
@@ -663,19 +676,18 @@ end;
 procedure DequantizeQ3K(const Raw: PByte; NumBlocks: Int64;
   Dest: PSingle);
 var
-  b, e, h0, p, s, sb: Int64;
+  b, e, h0, p, s, sb, k, eBase: Int64;
   Base, HmPtr, QsPtr, ScPtr: PByte;
-  d: single;
+  d, dl: single;
   Scales: array[0..15] of shortint;
   lsc, hsc: byte;
   ql, qh: integer;
   qv: integer;
   Outp: PSingle;
-  NumBlocksM1, QKM1: Int64;
+  NumBlocksM1: Int64;
   j: integer;
 begin
   NumBlocksM1 := NumBlocks - 1;
-  QKM1 := GGUF_QK_K - 1;
   Base := Raw;
   Outp := Dest;
   for b := 0 to NumBlocksM1 do
@@ -696,17 +708,24 @@ begin
       hsc := (hsc shr ((j shr 2) shl 1)) and $03;
       Scales[j] := shortint(byte(lsc or (hsc shl 4)) - 32);
     end;
-    for e := 0 to QKM1 do
+    // Each 16-element sub-block sb shares one scale, so d*Scales[sb] is
+    // hoisted out of the per-element loop (#11/#5).
+    for sb := 0 to 15 do
     begin
-      h0 := e shr 7;
-      p  := e and 31;
-      s  := (e and 127) shr 5;
-      ql := ((QsPtr + (h0 * 32 + p))^ shr (s shl 1)) and $03;
-      qh := ((HmPtr + p)^ shr (e shr 5)) and $01;
-      qh := qh xor $01;        // CLEAR high bit -> contributes -4
-      qv := ql - (qh shl 2);
-      sb := e shr 4;
-      Outp[e] := d * Scales[sb] * qv;
+      dl := d * Scales[sb];
+      eBase := sb shl 4;
+      for k := 0 to 15 do
+      begin
+        e := eBase + k;
+        h0 := e shr 7;
+        p  := e and 31;
+        s  := (e and 127) shr 5;
+        ql := ((QsPtr + (h0 * 32 + p))^ shr (s shl 1)) and $03;
+        qh := ((HmPtr + p)^ shr (e shr 5)) and $01;
+        qh := qh xor $01;        // CLEAR high bit -> contributes -4
+        qv := ql - (qh shl 2);
+        Outp[e] := dl * qv;
+      end;
     end;
     Inc(Base, GGUF_Q3_K_BLOCK_BYTES);
     Inc(Outp, GGUF_QK_K);

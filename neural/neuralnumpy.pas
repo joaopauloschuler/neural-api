@@ -346,7 +346,6 @@ procedure DecodeRawToVolume(const Raw: TBytes; NumElements: Int64;
   const DType: string; Dest: TNNetVolume);
 var
   i: Int64;
-  pf4: PSingle;
   pf8: PDouble;
   pu16: PWord;
   pi1: PShortInt;
@@ -354,14 +353,16 @@ var
   pi2: PSmallInt;
   pi4: PLongInt;
   pi8: PInt64;
+  pu4: PCardinal;
   NumElementsM1: Int64;
 begin
   // Dest is expected pre-sized to NumElements by the caller.
   NumElementsM1 := NumElements - 1;
   if DType = 'f4' then
   begin
-    pf4 := PSingle(@Raw[0]);
-    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pf4^; Inc(pf4); end;
+    // LE host: numpy little-endian f4 bytes are identical to native Single,
+    // so a single contiguous copy replaces the per-element pointer walk.
+    Move(Raw[0], Dest.FData[0], NumElements * csNeuralFloatSize);
   end
   else if DType = 'f8' then
   begin
@@ -401,10 +402,9 @@ begin
   end
   else if DType = 'u4' then
   begin
-    pi8 := nil; // unused
-    for i := 0 to NumElementsM1 do
-      Dest.FData[i] := Cardinal(ReadU32LE(Raw, i * 4));
-    if pi8 = nil then ;
+    // LE host: walk the raw u32s directly (drops the per-element i*4 offset).
+    pu4 := PCardinal(@Raw[0]);
+    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pu4^; Inc(pu4); end;
   end
   else if (DType = 'i8') or (DType = 'u8') then
   begin
@@ -691,9 +691,20 @@ begin
     Result[PreambleLen + i - 1] := Ord(HeaderText[i]);
 
   DataPos := PreambleLen + HeaderLen;
-  NumElementsM1 := NumElements - 1;
-  for i := 0 to NumElementsM1 do
-    AppendElement(Result, DataPos, DType, Src.FData[i]);
+  // f4 (the common/default case) is a byte-identical contiguous copy on a LE
+  // host, so it skips AppendElement's per-element dtype string-dispatch. Other
+  // dtypes keep the per-element encode (genuine format conversion).
+  if DType = 'f4' then
+  begin
+    if NumElements > 0 then
+      Move(Src.FData[0], Result[DataPos], NumElements * csNeuralFloatSize);
+  end
+  else
+  begin
+    NumElementsM1 := NumElements - 1;
+    for i := 0 to NumElementsM1 do
+      AppendElement(Result, DataPos, DType, Src.FData[i]);
+  end;
 end;
 
 procedure SaveVolumeToNpy(const pFileName: string; Src: TNNetVolume;
