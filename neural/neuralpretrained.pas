@@ -56813,6 +56813,8 @@ var
   ShiftBase, ScaleBase, BoxBase, voBase, qeBase, qeStride: integer;
   Norm, Shift, ScaleRaw, ScaleVal, Cos, Logit, Score, LogitThr: TNeuralFloat;
   BiasCx, BiasCy, BiasW, BiasH: TNeuralFloat;
+  BoxCx, BoxCy, BoxW, BoxH: TNeuralFloat;
+  BoxDone: boolean;
   ImgEmb: array of TNeuralFloat;
 begin
   NumPatches := VisionOutput.SizeX;
@@ -56846,6 +56848,10 @@ begin
     if ScaleRaw > 0 then ScaleVal := ScaleRaw + 1
     else ScaleVal := NeuralExp(ScaleRaw); // (exp(x)-1)+1
     qeBase := QueryEmbeds.GetRawPos(0, 0, 0);
+    // #11: the box bias + the four box-coord sigmoids depend only on p (voBase,
+    // BoxBase and the OwlViTBoxBias output are all q-invariant), so compute them
+    // lazily once per patch on the first accepted query and reuse for later hits.
+    BoxDone := false;
     for q := 0 to NumQueriesM1 do
     begin
       Cos := TNNetVolume.DotProduct(
@@ -56854,18 +56860,22 @@ begin
       if Logit >= LogitThr then
       begin
         Score := 1.0 / (1.0 + NeuralExp(-Logit));
-        OwlViTBoxBias(p, GridH, GridW, BiasCx, BiasCy, BiasW, BiasH);
+        if not BoxDone then
+        begin
+          OwlViTBoxBias(p, GridH, GridW, BiasCx, BiasCy, BiasW, BiasH);
+          BoxCx := 1.0 / (1.0 + NeuralExp(-(VisionOutput.FData[voBase + BoxBase + 0] + BiasCx)));
+          BoxCy := 1.0 / (1.0 + NeuralExp(-(VisionOutput.FData[voBase + BoxBase + 1] + BiasCy)));
+          BoxW := 1.0 / (1.0 + NeuralExp(-(VisionOutput.FData[voBase + BoxBase + 2] + BiasW)));
+          BoxH := 1.0 / (1.0 + NeuralExp(-(VisionOutput.FData[voBase + BoxBase + 3] + BiasH)));
+          BoxDone := true;
+        end;
         Result[Cnt].PatchIndex := p;
         Result[Cnt].QueryIndex := q;
         Result[Cnt].Score := Score;
-        Result[Cnt].Cx :=
-          1.0 / (1.0 + NeuralExp(-(VisionOutput.FData[voBase + BoxBase + 0] + BiasCx)));
-        Result[Cnt].Cy :=
-          1.0 / (1.0 + NeuralExp(-(VisionOutput.FData[voBase + BoxBase + 1] + BiasCy)));
-        Result[Cnt].W :=
-          1.0 / (1.0 + NeuralExp(-(VisionOutput.FData[voBase + BoxBase + 2] + BiasW)));
-        Result[Cnt].H :=
-          1.0 / (1.0 + NeuralExp(-(VisionOutput.FData[voBase + BoxBase + 3] + BiasH)));
+        Result[Cnt].Cx := BoxCx;
+        Result[Cnt].Cy := BoxCy;
+        Result[Cnt].W := BoxW;
+        Result[Cnt].H := BoxH;
         Inc(Cnt);
       end;
       Inc(qeBase, qeStride);
@@ -65195,6 +65205,7 @@ var
   tx, ty, d: integer;
   gx, gy, gxBase, gyBase: integer;  // global image coords
   wx, wy, w, oneMinusW: TNeuralFloat;  // feather weights
+  invOv: Double;                       // 1/(ImgOverlap+1), call-invariant (#5)
   StartsYHi, StartsXHi, TileLatentMinSizeM1, LatentDepthM1: integer;
   ImgTileWM1, OutChannelsM1: integer;
   ltBase, latBase, resBase, doBase: integer;
@@ -65217,6 +65228,9 @@ begin
   Stride := TileLatentMinSize - Overlap;
   if Stride < 1 then Stride := 1;
   ImgOverlap := Overlap * Scale;
+  // #5: the feather-ramp denominator is call-invariant; hoist its reciprocal so
+  // the per-row/col ramp is a multiply, not a divide (float; feeds blend weights).
+  invOv := 1.0 / (ImgOverlap + 1);
 
   if (Latent.SizeX < TileLatentMinSize) or (Latent.SizeY < TileLatentMinSize) then
     ImportError('TiledVaeDecode: latent smaller than one tile; use plain decode.');
@@ -65282,7 +65296,7 @@ begin
       begin
         gy := gyBase + ty;
         if (nj > 0) and (ty < ImgOverlap) then
-          wy := (ty + 1) / (ImgOverlap + 1)
+          wy := (ty + 1) * invOv
         else
           wy := 1.0;
         // Seed the row bases at tx=0; both advance by OutChannels per tx (#12).
@@ -65291,7 +65305,7 @@ begin
         for tx := 0 to ImgTileWM1 do
         begin
           if (nx > 0) and (tx < ImgOverlap) then
-            wx := (tx + 1) / (ImgOverlap + 1)
+            wx := (tx + 1) * invOv
           else
             wx := 1.0;
           w := wx * wy;
@@ -71915,8 +71929,8 @@ end;
 procedure SAMPosEnc(const PosEmbed: TNNetVolume; const Coords: TSAMMat;
   N, NumPosFeats: integer; var Out_: TSAMMat);
 var
-  i, f, OutDim: integer;
-  proj, twopi: TNeuralFloat;
+  i, f, OutDim, i2, oBase: integer;
+  proj, twopi, cx, cy: TNeuralFloat;
   NM1, NumPosFeatsM1: integer;
 begin
   OutDim := 2 * NumPosFeats;
@@ -71924,16 +71938,25 @@ begin
   NM1 := N - 1;
   NumPosFeatsM1 := NumPosFeats - 1;
   SetLength(Out_, N * OutDim);
+  i2 := 0;                          // i * 2, carried (#6)
+  oBase := 0;                       // i * OutDim, carried (#6)
   for i := 0 to NM1 do
+  begin
+    // (2x-1), (2y-1) are f-invariant -> hoist to the i body (#11, same value).
+    cx := 2.0 * Coords[i2 + 0] - 1.0;
+    cy := 2.0 * Coords[i2 + 1] - 1.0;
     for f := 0 to NumPosFeatsM1 do
     begin
       // (2x-1)*P[0,f] + (2y-1)*P[1,f], P row-major (2, NumPosFeats)
-      proj := (2.0 * Coords[i * 2 + 0] - 1.0) * PosEmbed.FData[0 * NumPosFeats + f]
-            + (2.0 * Coords[i * 2 + 1] - 1.0) * PosEmbed.FData[1 * NumPosFeats + f];
+      proj := cx * PosEmbed.FData[f]
+            + cy * PosEmbed.FData[NumPosFeats + f];
       proj := twopi * proj;
-      Out_[i * OutDim + f] := Sin(proj);
-      Out_[i * OutDim + NumPosFeats + f] := Cos(proj);
+      Out_[oBase + f] := Sin(proj);
+      Out_[oBase + NumPosFeats + f] := Cos(proj);
     end;
+    Inc(i2, 2);
+    Inc(oBase, OutDim);
+  end;
 end;
 
 procedure RunSAMMaskDecoderEx(Reader: TNNetSafeTensorsReader;
@@ -71971,7 +71994,8 @@ var
   CmidM1, H2W2M1, CuM1, HuWuM1, H2M1, W2M1, CuHuWuM1: integer;
   NumMasksM1, HuM1, WuM1: integer;
   rwc, posU, HuWu, wOfs, H2W2, dstCol: integer;
-  sv: TNeuralFloat;
+  ciW, ciBase, rowBase, tdst, tsrc, qBase: integer;
+  sv, bv: TNeuralFloat;
 begin
   Pfx := Prefix;
   H := Config.HiddenSize;
@@ -72207,10 +72231,20 @@ begin
     // mask_tokens_out = queries[1 .. 1+MaskTokenCount]
     // ----- upscaling: keys -> (H, Grid, Grid) CHW, ConvTranspose x2 -----
     SetLength(ImgCHW, H * Grid * Grid);
+    // CHW transpose: dst = ci*NImg + (r*Grid+c) is contiguous (NImg = Grid*Grid),
+    // src = (r*Grid+c)*H + ci advances by H each (r,c) -> carry both (#6/#11/#12).
     for ci := 0 to HM1 do
+    begin
+      tdst := ci * NImg;
+      tsrc := ci;
       for r := 0 to GridM1 do
         for c := 0 to GridM1 do
-          ImgCHW[ci * NImg + r * Grid + c] := Keys[(r * Grid + c) * H + ci];
+        begin
+          ImgCHW[tdst] := Keys[tsrc];
+          Inc(tdst);
+          Inc(tsrc, H);
+        end;
+    end;
 
     // upscale_conv1: ConvTranspose2d(H -> H/4, k2 s2). weight (H, H/4, 2, 2).
     Cmid := H div 4;
@@ -72227,23 +72261,31 @@ begin
       SetLength(U1, Cmid * H2 * W2);
       posU := 0;
       for oc := 0 to CmidM1 do
+      begin
+        bv := C1b.FData[oc];              // #8: read the bias once per oc
         for i := 0 to H2W2M1 do
         begin
-          U1[posU] := C1b.FData[oc];
+          U1[posU] := bv;
           Inc(posU);
         end;
+      end;
       for ci := 0 to HM1 do
+      begin
+        ciBase := ci * NImg;              // #6/#11: src channel base, once per ci
+        ciW := ci * Cmid * 4;            // #6/#11: weight channel base, once per ci
         for r := 0 to GridM1 do
+        begin
+          rowBase := ciBase + r * Grid;
           for c := 0 to GridM1 do
           begin
-            sv := ImgCHW[ci * NImg + r * Grid + c];
+            sv := ImgCHW[rowBase + c];
             for ki := 0 to 1 do
               for kj := 0 to 1 do
               begin
                 oi := 2 * r + ki; oj := 2 * c + kj;
                 dstCol := oi * W2 + oj;
                 posU := dstCol;
-                wOfs := ci * Cmid * 4 + ki * 2 + kj;
+                wOfs := ciW + ki * 2 + kj;
                 for oc := 0 to CmidM1 do
                 begin
                   U1[posU] := U1[posU] + sv * C1w.FData[wOfs];
@@ -72252,6 +72294,8 @@ begin
                 end;
               end;
           end;
+        end;
+      end;
     finally
       C1w.Free; C1b.Free;
     end;
@@ -72304,23 +72348,31 @@ begin
       SetLength(U2, Cu * Hu * Wu);
       posU := 0;
       for oc := 0 to CuM1 do
+      begin
+        bv := C2b.FData[oc];              // #8: read the bias once per oc
         for i := 0 to HuWuM1 do
         begin
-          U2[posU] := C2b.FData[oc];
+          U2[posU] := bv;
           Inc(posU);
         end;
+      end;
       for ci := 0 to CmidM1 do
+      begin
+        ciBase := ci * H2W2;             // #6/#11: src channel base, once per ci
+        ciW := ci * Cu * 4;             // #6/#11: weight channel base, once per ci
         for r := 0 to H2M1 do
+        begin
+          rowBase := ciBase + r * W2;
           for c := 0 to W2M1 do
           begin
-            sv := U1[ci * H2W2 + r * W2 + c];
+            sv := U1[rowBase + c];
             for ki := 0 to 1 do
               for kj := 0 to 1 do
               begin
                 oi := 2 * r + ki; oj := 2 * c + kj;
                 dstCol := oi * Wu + oj;
                 posU := dstCol;
-                wOfs := ci * Cu * 4 + ki * 2 + kj;
+                wOfs := ciW + ki * 2 + kj;
                 for oc := 0 to CuM1 do
                 begin
                   U2[posU] := U2[posU] + sv * C2w.FData[wOfs];
@@ -72329,6 +72381,8 @@ begin
                 end;
               end;
           end;
+        end;
+      end;
     finally
       C2w.Free; C2b.Free;
     end;
@@ -72369,7 +72423,8 @@ begin
       // pass: SAMLinear resizes its OUTPUT array, so reusing one buffer for an
       // (H->Cu) projection would shrink it and OOB the next (H-wide) read.
       SetLength(Hbuf, H);
-      for d := 0 to HM1 do Hbuf[d] := Queries[(1 + mt) * H + d];
+      qBase := (1 + mt) * H;                        // #5/#13: contiguous slice copy
+      Move(Queries[qBase], Hbuf[0], H * csNeuralFloatSize);
       BPfx := Pfx + 'mask_decoder.output_hypernetworks_mlps.' + IntToStr(mt) + '.';
       SAMLinear(Reader, BPfx + 'proj_in.weight', BPfx + 'proj_in.bias',
         H, H, 1, Hbuf, Mlp1);
@@ -72408,7 +72463,7 @@ begin
     if IoUScores <> nil then
     begin
       SetLength(Hbuf, H);
-      for d := 0 to HM1 do Hbuf[d] := Queries[0 * H + d];
+      Move(Queries[0], Hbuf[0], H * csNeuralFloatSize);   // #5/#13: contiguous copy
       BPfx := Pfx + 'mask_decoder.iou_prediction_head.';
       SAMLinear(Reader, BPfx + 'proj_in.weight', BPfx + 'proj_in.bias',
         H, H, 1, Hbuf, Mlp1);
@@ -74752,7 +74807,7 @@ function DecodeDetrDetections(Output: TNNetVolume; NumLabels: integer;
 var
   LpMax: integer;
   q, c, BestCls, Cnt: integer;
-  MaxLogit, SumExp, BestProb: TNeuralFloat;
+  MaxLogit, SumExp, BestProb, sv: TNeuralFloat;
   BoxBase, NumLabelsM1, qBase: integer;
 begin
   SetLength(Result, Output.SizeX);
@@ -74766,7 +74821,10 @@ begin
     // softmax over the NumLabels+1 class logits.
     MaxLogit := Output.FData[qBase];
     for c := 1 to NumLabels do
-      if Output.FData[qBase + c] > MaxLogit then MaxLogit := Output.FData[qBase + c];
+    begin
+      sv := Output.FData[qBase + c];   // #4: read once per c
+      if sv > MaxLogit then MaxLogit := sv;
+    end;
     // best FOREGROUND class (exclude the no-object slot = NumLabels).
     // argmax of softmax prob == argmax of the raw logit: Exp is monotonic and the
     // /SumExp normalizer is a positive constant across classes, so the ranking is
@@ -75449,7 +75507,8 @@ var
   NumQueriesM1, LevelHM1, LevelWM1, NumKeysM1: integer;
   mlBase, biasQBase: integer;
   x0, y0, x1, y1, MaskWM1, MaskHM1, row0, row1: integer;
-  gx, gy, wx, wy, v00, v01, v10, v11, val: TNeuralFloat;
+  gx, gy, wx, wy, v00, v01, v10, v11, val, omwx, omwy: TNeuralFloat;
+  ryF, rxF: Double;
 const
   cNegInf = -1.0e9;
 begin
@@ -75461,6 +75520,9 @@ begin
   NumKeysM1 := NumKeys - 1;
   MaskWM1 := MaskW - 1;
   MaskHM1 := MaskH - 1;
+  // #5: the grid-coord ratios are call-invariant (float divide via Pascal '/').
+  ryF := MaskH / LevelH;
+  rxF := MaskW / LevelW;
   for q := 0 to NumQueriesM1 do
   begin
     AllowedCnt := 0;
@@ -75472,15 +75534,16 @@ begin
       // bilinear sample of the 1/4-res mask at the level-grid centre
       // (align_corners=False, matching torch F.interpolate). The whole y-side
       // depends only on ly -> hoist it out of the lx loop (#11, bit-exact).
-      gy := (ly + 0.5) * MaskH / LevelH - 0.5;
+      gy := (ly + 0.5) * ryF - 0.5;
       y0 := Floor(gy); wy := gy - y0; y1 := y0 + 1;
       if y0 < 0 then y0 := 0; if y0 > MaskHM1 then y0 := MaskHM1;
       if y1 < 0 then y1 := 0; if y1 > MaskHM1 then y1 := MaskHM1;
       row0 := mlBase + y0 * MaskW;
       row1 := mlBase + y1 * MaskW;
+      omwy := 1 - wy;             // #4: (1-wy) is ly-invariant across the lx loop
       for lx := 0 to LevelWM1 do
       begin
-        gx := (lx + 0.5) * MaskW / LevelW - 0.5;
+        gx := (lx + 0.5) * rxF - 0.5;
         x0 := Floor(gx); wx := gx - x0; x1 := x0 + 1;
         if x0 < 0 then x0 := 0; if x0 > MaskWM1 then x0 := MaskWM1;
         if x1 < 0 then x1 := 0; if x1 > MaskWM1 then x1 := MaskWM1;
@@ -75488,8 +75551,9 @@ begin
         v01 := MaskLogits.FData[row0 + x1];
         v10 := MaskLogits.FData[row1 + x0];
         v11 := MaskLogits.FData[row1 + x1];
-        val := v00 * (1 - wx) * (1 - wy) + v01 * wx * (1 - wy) +
-               v10 * (1 - wx) * wy + v11 * wx * wy;
+        omwx := 1 - wx;          // #4: (1-wx) computed once (same value, order kept)
+        val := v00 * omwx * omwy + v01 * wx * omwy +
+               v10 * omwx * wy + v11 * wx * wy;
         // sigmoid(val) < 0.5 iff val < 0 (rule #14/#16): the sigmoid is only
         // compared against 0.5, so test the pre-image and skip the Exp entirely.
         if val < 0 then
@@ -75599,8 +75663,10 @@ begin
     clBase := ClassLogits.GetRawPos(q, 0, 0);
     MaxLogit := ClassLogits.FData[clBase];
     for c := 1 to NumLabels do
-      if ClassLogits.FData[clBase + c] > MaxLogit then
-        MaxLogit := ClassLogits.FData[clBase + c];
+    begin
+      e := ClassLogits.FData[clBase + c];   // #4: read once per c
+      if e > MaxLogit then MaxLogit := e;
+    end;
     // #4: store each Exp into ClsProb in the first pass (was recomputed twice);
     // #16: NeuralExp; #5: divide-by-SumExp becomes a multiply by its reciprocal.
     cpBase := q * NumLabels;
@@ -76011,7 +76077,7 @@ var
   rm, nc, OutDim, Stride, cellBase: integer;
   gwM1, ncM1, rmM1, HiCand, KeptIdxHi, clsOfs, sideBase, clsBase: integer;
   MaxLogit, SumExp, P, BestScore, Dist, Cx, Cy, L, Tp, R, Bp: TNeuralFloat;
-  BestLogit, LogitThr: TNeuralFloat;
+  BestLogit, LogitThr, sv: TNeuralFloat;
   Dists: array[0..3] of TNeuralFloat;
   expBuf: array of TNeuralFloat;
   Cand: TYoloDetectionArray;
@@ -76057,8 +76123,10 @@ begin
             sideBase := cellBase + side * rm;  // #5/#11: hoisted out of the b loops
             MaxLogit := Output.FData[sideBase];
             for b := 1 to rmM1 do
-              if Output.FData[sideBase + b] > MaxLogit then
-                MaxLogit := Output.FData[sideBase + b];
+            begin
+              sv := Output.FData[sideBase + b];   // #4: read once per b
+              if sv > MaxLogit then MaxLogit := sv;
+            end;
             SumExp := 0;
             for b := 0 to rmM1 do
             begin
@@ -76294,6 +76362,7 @@ var
   workBase, srcBase, dstBase, wkBase: integer;
   Scale, Fx, Fy, rf: TNeuralFloat;
   a0, a1, a2, b0, b1, b2: TNeuralFloat;
+  rxF, ryF: Double;   // Src->resize coord ratios, invariant across the pixel nest (#5/#8)
 begin
   if (Src = nil) or (Dst = nil) then
     ImportError('ClipPreprocessImage: nil volume.');
@@ -76328,17 +76397,21 @@ begin
       ResizeHM1 := ResizeH - 1;
       SrcXMax := Src.SizeX - 1;
       SrcYMax := Src.SizeY - 1;
+      // #5/#8: the coord ratios are invariant across the whole pixel nest; hoist
+      // them (also removes the per-pixel SizeX/SizeY property getter). Float '/'.
+      rxF := Src.SizeX / ResizeW;
+      ryF := Src.SizeY / ResizeH;
       for Y := 0 to ResizeHM1 do
       begin
-        // The whole y-side depends only on Y; hoist it (#11, bit-exact).
-        Fy := (Y + 0.5) * Src.SizeY / ResizeH - 0.5;
+        // The whole y-side depends only on Y; hoist it (#11).
+        Fy := (Y + 0.5) * ryF - 0.5;
         if Fy < 0 then Fy := 0;
         SrcY := Trunc(Fy);
         if SrcY > SrcYMax then SrcY := SrcYMax;
         for X := 0 to ResizeWM1 do
         begin
           // bilinear sample (align_corners = false convention)
-          Fx := (X + 0.5) * Src.SizeX / ResizeW - 0.5;
+          Fx := (X + 0.5) * rxF - 0.5;
           if Fx < 0 then Fx := 0;
           SrcX := Trunc(Fx);
           if SrcX > SrcXMax then SrcX := SrcXMax;
