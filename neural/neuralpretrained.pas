@@ -4725,6 +4725,10 @@ type
     // semantic + acoustic RVQ codebooks (effective embed), one TEnCodecMat per
     // stage [codebook_size, codebook_dim], plus the 1x1 in/out projections.
     FSemCodebooks, FAcoCodebooks: array of TEnCodecMat;
+    // #14: per-row squared L2 norms of each codebook, built once at load so the
+    // RVQ nearest-code search uses argmin(||c||^2 - 2 r.c) (see Encode). Double
+    // to stay on the Mimi Double carve-out.
+    FSemCodebookNormSqr, FAcoCodebookNormSqr: array of TMimiDblArr;
     FSemInProj, FSemOutProj, FAcoInProj, FAcoOutProj: TEnCodecConv;
     // #4: persistent, lazily-grown attention-score scratch (length >= SeqLen).
     // Lets RunTransformer cache each Q.K score in the softmax max-pass and reuse
@@ -42441,7 +42445,8 @@ end;
 
 function MimiGELU(x: double): double;
 begin
-  Result := 0.5 * x * (1.0 + MimiErf(x / Sqrt(2.0)));
+  // #5: 1/sqrt(2) folded to a constant, divide -> multiply (as VitsGELU does).
+  Result := 0.5 * x * (1.0 + MimiErf(x * 0.70710678118654752440));
 end;
 
 // Loads a PLAIN Conv1d / ConvTranspose1d (no weight_norm). HF stores the
@@ -42563,6 +42568,8 @@ var
   grpIPG, grpOPG, oBase, tS, giK, wOfs: integer;
   OPGK, oK, wpack, wpos: integer;
   PadRow, FullRow: TMimiDblArr;
+  IsReplicate: boolean;   // #8: hoist the pad-mode string compare once
+  Left, Right: double;    // #5: per-channel replicate pad values
 begin
   InCh := Conv.InCh;
   OutCh := Conv.OutCh;
@@ -42586,24 +42593,27 @@ begin
     if Extra < 0 then Extra := 0;
     PadTotalM1 := PadTotal - 1;
     ExtraM1 := Extra - 1;
+    IsReplicate := Conv.PadMode = 'replicate';   // #8: string compare once
     SetLength(Padded, InCh);
     for i := 0 to InChM1 do
     begin
       SetLength(Padded[i], PadTotal + InLen + Extra);
-      // Causal left pad (PadTotal frames) + extra right pad.
-      for t := 0 to PadTotalM1 do
+      PadRow := Padded[i];                        // #9: bind row once
+      // Causal left pad (PadTotal frames) + extra right pad. #5: replicate edge
+      // values are per-channel invariants (0 for 'constant').
+      if IsReplicate then
       begin
-        if Conv.PadMode = 'replicate' then Padded[i][t] := InSig[i][0]
-        else Padded[i][t] := 0; // 'constant'
-      end;
-      for t := 0 to InLenM1 do Padded[i][PadTotal + t] := InSig[i][t];
-      for t := 0 to ExtraM1 do
+        Left := InSig[i][0];
+        Right := InSig[i][InLen - 1];
+      end
+      else
       begin
-        if Conv.PadMode = 'replicate' then
-          Padded[i][PadTotal + InLen + t] := InSig[i][InLen - 1]
-        else
-          Padded[i][PadTotal + InLen + t] := 0;
+        Left := 0;
+        Right := 0;
       end;
+      for t := 0 to PadTotalM1 do PadRow[t] := Left;
+      for t := 0 to InLenM1 do PadRow[PadTotal + t] := InSig[i][t];
+      for t := 0 to ExtraM1 do PadRow[PadTotal + InLen + t] := Right;
     end;
     OutLen := (Length(Padded[0]) - EffK) div Stride + 1;
     if OutLen < 0 then OutLen := 0;
@@ -42828,6 +42838,32 @@ begin
   end;
 end;
 
+// #14: precompute per-row squared L2 norms of a codebook (once, at load) so the
+// RVQ nearest-code search can rank by argmin(||c||^2 - 2 r.c) instead of a full
+// ||r-c||^2 recompute. Mirrors the EnCodec FCodebookNormSqr table, but keeps the
+// norm in Double to match Mimi's Double residual arithmetic.
+procedure BuildMimiCodebookNorm(const Mat: TEnCodecMat; out Norms: TMimiDblArr);
+var
+  Rows, Cols, r, c, rB, RowsM1, ColsM1: integer;
+  Dat: TNeuralFloatDynArr;
+  nrm: double;
+begin
+  Rows := Mat.Rows;
+  Cols := Mat.Cols;
+  ColsM1 := Cols - 1;
+  RowsM1 := Rows - 1;
+  SetLength(Norms, Rows);
+  Dat := Mat.Data;   // #9: bind the row chain once
+  rB := 0;           // #6: r*Cols carried
+  for r := 0 to RowsM1 do
+  begin
+    nrm := 0;
+    for c := 0 to ColsM1 do nrm := nrm + Dat[rB + c] * Dat[rB + c];
+    Norms[r] := nrm;
+    Inc(rB, Cols);
+  end;
+end;
+
 { TNNetMimi }
 
 constructor TNNetMimi.Create(const pConfig: TMimiConfig);
@@ -42851,13 +42887,19 @@ var
   c, t: integer;
   SigM1: integer;
   SigLenM1: integer;
+  SigRow: TMimiDblArr;   // #9: bind the channel row once (Double, stays scalar)
+  x: double;             // #4: reuse the read value
 begin
   SigM1 := Length(Sig) - 1;
   for c := 0 to SigM1 do
   begin
-    SigLenM1 := Length(Sig[c]) - 1;
+    SigRow := Sig[c];
+    SigLenM1 := Length(SigRow) - 1;
     for t := 0 to SigLenM1 do
-      if Sig[c][t] <= 0 then Sig[c][t] := Exp(Sig[c][t]) - 1;
+    begin
+      x := SigRow[t];
+      if x <= 0 then SigRow[t] := Exp(x) - 1;
+    end;
   end;
 end;
 
@@ -42867,7 +42909,7 @@ procedure TNNetMimi.RunTransformer(
   const Layers: array of TMimiTransformerLayer; var Sig: TMimiDblArr2D);
 var
   D, T, NH, NKV, Dh, FFN, L, h, t1, t2, dd, gidx, kvh, NRep, half: integer;
-  NHDh, hDh, kvhDh, gBase, dBase, hbase: integer;
+  NHDh, hDh, kvhDh, gBase, dBase, hbase, t2Start: integer;
   TM1, DM1, halfM1, DhM1, NHM1, NKVM1, FFNM1, NHDhM1, NKVDhM1, LayersM1: integer;
   Theta, Scaling, eps, m, v, e, denom, sc, mx, qr, kr, ang: double;
   X, Hn, Q, Kk, Vv, Attn, Mlp1: array of array of double; // [T][feature]
@@ -43042,20 +43084,20 @@ begin
         QPtr := @Q[t1][hDh];       // #8: invariant across the t2 loop
         // scores over keys 0..t1 (causal); sliding window optional.
         mx := -1e30;
-        for t2 := 0 to t1 do
+        // #5/#2: sliding window (t1 - t2 >= SW  <=>  t2 <= t1 - SW) hoisted into
+        // the loop start, so the per-iteration guard is gone from both passes.
+        t2Start := 0;
+        if HasSW and (t1 - SW >= 0) then t2Start := t1 - SW + 1;
+        for t2 := t2Start to t1 do
         begin
-          if HasSW and (t1 - t2 >= SW) then
-            Continue;
           sc := MimiDotProductD(QPtr, @Kk[t2][kvhDh], Dh) * Scaling;
           FAttnScores[t2] := sc;   // #4: cache the score, avoid the 2nd dot below
           if sc > mx then mx := sc;
         end;
         denom := 0;
         FillChar(AccVec[0], Dh * csDoubleSize, 0);
-        for t2 := 0 to t1 do
+        for t2 := t2Start to t1 do
         begin
-          if HasSW and (t1 - t2 >= SW) then
-            Continue;
           sc := FAttnScores[t2];   // #4: reuse the score computed in the max pass
           e := Exp(sc - mx);
           denom := denom + e;
@@ -43203,7 +43245,8 @@ var
   WaveLenM1, EncStagesM1, NSemNAcoM1, FramesM1, DmM1, NSemM1, NAcoM1, KM1: integer;
   sBase, bestBase: integer;
   CB: TNeuralFloatDynArr;
-  Dist, BestDist, Diff: double;
+  CBN: TMimiDblArr;   // #14: bound codebook ||c||^2 table
+  Dist, BestDist: double;
   Residual: TMimiDblArr;
 begin
   SetLength(Sig, FConfig.AudioChannels);
@@ -43246,17 +43289,18 @@ begin
     for q := 0 to NSemM1 do
     begin
       CB := FSemCodebooks[q].Data;
-      best := 0; BestDist := -1;
+      CBN := FSemCodebookNormSqr[q];
+      best := 0; BestDist := 1e30;
       sBase := 0; // s*Dm carried
+      // #14: argmin ||r-c||^2 = argmin(||c||^2 - 2 r.c) since ||r||^2 is shared
+      // across candidates (identical winner). Double scalar dot (Mimi carve-out).
       for s := 0 to KM1 do
       begin
         Dist := 0;
         for d := 0 to DmM1 do
-        begin
-          Diff := Residual[d] - CB[sBase + d];
-          Dist := Dist + Diff * Diff;
-        end;
-        if (BestDist < 0) or (Dist < BestDist) then
+          Dist := Dist + Residual[d] * CB[sBase + d];
+        Dist := CBN[s] - 2 * Dist;
+        if Dist < BestDist then
         begin BestDist := Dist; best := s; end;
         Inc(sBase, Dm);
       end;
@@ -43277,17 +43321,17 @@ begin
     for q := 0 to NAcoM1 do
     begin
       CB := FAcoCodebooks[q].Data;
-      best := 0; BestDist := -1;
+      CBN := FAcoCodebookNormSqr[q];
+      best := 0; BestDist := 1e30;
       sBase := 0; // s*Dm carried
+      // #14: argmin(||c||^2 - 2 r.c) (see semantic RVQ above).
       for s := 0 to KM1 do
       begin
         Dist := 0;
         for d := 0 to DmM1 do
-        begin
-          Diff := Residual[d] - CB[sBase + d];
-          Dist := Dist + Diff * Diff;
-        end;
-        if (BestDist < 0) or (Dist < BestDist) then
+          Dist := Dist + Residual[d] * CB[sBase + d];
+        Dist := CBN[s] - 2 * Dist;
+        if Dist < BestDist then
         begin BestDist := Dist; best := s; end;
         Inc(sBase, Dm);
       end;
@@ -43577,6 +43621,13 @@ begin
         IntToStr(j) + '.codebook.';
       LoadMimiCodebook(Reader, Pref, Model.FAcoCodebooks[j], 1e-5, Consumed);
     end;
+    // #14: per-row ||c||^2 tables, once at load (see TNNetMimi.Encode).
+    SetLength(Model.FSemCodebookNormSqr, NSem);
+    for j := 0 to NSemM1 do
+      BuildMimiCodebookNorm(Model.FSemCodebooks[j], Model.FSemCodebookNormSqr[j]);
+    SetLength(Model.FAcoCodebookNormSqr, NAco);
+    for j := 0 to NAcoM1 do
+      BuildMimiCodebookNorm(Model.FAcoCodebooks[j], Model.FAcoCodebookNormSqr[j]);
     // 1x1 in/out projections (present iff vq dim != hidden).
     TPref := 'quantizer.semantic_residual_vector_quantizer.';
     if Reader.HasTensor(TPref + 'input_proj.weight') then
@@ -44057,6 +44108,7 @@ var
   c, t, ChM1, InLen, OutLen, Padding, OutM1: integer;
   Pad1: integer;
   InLenM1: integer;
+  HRow, SRow: TMimiDblArr;   // #9: bind the per-channel rows once (Double)
 begin
   ChM1 := Length(Sig) - 1;
   InLen := Length(Sig[0]);
@@ -44081,8 +44133,12 @@ begin
   OutM1 := OutLen - 1;
   // out = crop(Sig, padding) + H.
   for c := 0 to ChM1 do
+  begin
+    HRow := H[c];
+    SRow := Sig[c];
     for t := 0 to OutM1 do
-      H[c][t] := Sig[c][Padding + t] + H[c][t];
+      HRow[t] := SRow[Padding + t] + HRow[t];
+  end;
   // Resize Sig to OutLen and copy back.
   for c := 0 to ChM1 do
   begin
@@ -45414,8 +45470,7 @@ begin
   begin
     Row := Sig[c];
     SigTLen := Length(Row) - 1;
-    for t := 0 to SigTLen do
-      if Row[t] < 0 then Row[t] := 0;
+    TNNetVolume.VectorRelu(@Row[0], @Row[0], SigTLen + 1);
   end;
 end;
 
@@ -45981,8 +46036,11 @@ begin
   // derivatives = min_derivative + softplus(UD padded with the two endpoint
   // constants) -> length NumBins+1.
   SetLength(Derivatives, NumBins + 1);
-  Derivatives[0] := MinDerivative + VitsSoftplus(ConstantD);
-  Derivatives[NumBins] := MinDerivative + VitsSoftplus(ConstantD);
+  // #5: softplus(ConstantD) = softplus(Ln(Exp(1-MinDerivative)-1)) = 1-MinDerivative
+  // (softplus is the inverse of the invsoftplus that produced ConstantD), so the
+  // endpoint derivatives are exactly MinDerivative + (1-MinDerivative) = 1.0.
+  Derivatives[0] := 1.0;
+  Derivatives[NumBins] := 1.0;
   for i := 1 to NumBinsM1 do
     Derivatives[i] := MinDerivative + VitsSoftplus(UD[i - 1]);
 
@@ -46516,8 +46574,7 @@ begin
     for j := 0 to FfMidM1 do
     begin
       ReluRow := FfMid[j];
-      for i := 0 to TM1 do
-        if ReluRow[i] < 0 then ReluRow[i] := 0;
+      TNNetVolume.VectorRelu(@ReluRow[0], @ReluRow[0], TM1 + 1);
     end;
     RunHiFiGANConv(FLayers[L].FF2, FfMid, FfOut);
     // residual + final_layer_norm (token-major).
@@ -46580,7 +46637,7 @@ begin
   for c := 0 to FM1 do
   begin
     ReluRow := C1[c];
-    for t := 0 to TlenM1 do if ReluRow[t] < 0 then ReluRow[t] := 0;
+    TNNetVolume.VectorRelu(@ReluRow[0], @ReluRow[0], TlenM1 + 1);
   end;
   SetLength(Col, F);
   for t := 0 to TlenM1 do
@@ -46594,7 +46651,7 @@ begin
   for c := 0 to FM1 do
   begin
     ReluRow := C2[c];
-    for t := 0 to TlenM1 do if ReluRow[t] < 0 then ReluRow[t] := 0;
+    TNNetVolume.VectorRelu(@ReluRow[0], @ReluRow[0], TlenM1 + 1);
   end;
   for t := 0 to TlenM1 do
   begin
@@ -47006,8 +47063,10 @@ procedure TNNetVits.Synthesize(const Ids: array of integer;
 var
   PriorMean, PriorLogVar, ExpMean, ExpLogVar, Latent, Spec: TNNetFloatDynArr2D;
   Durations: array of integer;
-  Flow, OutLen, c, t, FlowM1, OutLenM1: integer;
+  Flow, OutLen, c, t, FlowM1, OutLenM1, ZLen: integer;
   ZVal, NoiseScale: TNeuralFloat;
+  ZRow, LatRow, MRow, LVRow: TNeuralFloatDynArr;   // #9: bind rows once
+  HasZRow: boolean;                                 // #11: hoist Length(Z)>c
 begin
   SetLength(Durations, Length(Ids));
   Analyze(Ids, PriorMean, PriorLogVar, Durations);
@@ -47022,12 +47081,21 @@ begin
   for c := 0 to FlowM1 do
   begin
     SetLength(Latent[c], OutLen);
+    HasZRow := Length(Z) > c;
+    if HasZRow then
+    begin
+      ZRow := Z[c];
+      ZLen := Length(ZRow);
+    end;
+    LatRow := Latent[c];
+    MRow := ExpMean[c];
+    LVRow := ExpLogVar[c];
     for t := 0 to OutLenM1 do
     begin
-      if (Length(Z) > c) and (Length(Z[c]) > t) then ZVal := Z[c][t]
+      if HasZRow and (t < ZLen) then ZVal := ZRow[t]
       else ZVal := 0;
-      Latent[c][t] := ExpMean[c][t] +
-        ZVal * NeuralExp(ExpLogVar[c][t]) * NoiseScale; // #16
+      LatRow[t] := MRow[t] +
+        ZVal * NeuralExp(LVRow[t]) * NoiseScale; // #16
     end;
   end;
   FlowReverse(Latent, Spec);
@@ -47579,7 +47647,7 @@ begin
   for c := 0 to HM1 do
   begin
     ReluRow := Conv[c];
-    for t := 0 to TM1 do if ReluRow[t] < 0 then ReluRow[t] := 0;
+    TNNetVolume.VectorRelu(@ReluRow[0], @ReluRow[0], TM1 + 1);
   end;
   Hidden := Conv;
 end;
@@ -47657,7 +47725,7 @@ begin
   for c := 0 to HM1 do
   begin
     ReluRow := Conv[c];
-    for t := 0 to TM1 do if ReluRow[t] < 0 then ReluRow[t] := 0;
+    TNNetVolume.VectorRelu(@ReluRow[0], @ReluRow[0], TM1 + 1);
   end;
   RunHiFiGANConv(FDurProj, Conv, Pr);   // 1 channel
   SetLength(LogDur, Tlen);
@@ -47727,7 +47795,7 @@ begin
   for c := 0 to HM1 do
   begin
     ReluRow := Cv[c];
-    for t := 0 to LM1 do if ReluRow[t] < 0 then ReluRow[t] := 0;
+    TNNetVolume.VectorRelu(@ReluRow[0], @ReluRow[0], LM1 + 1);
   end;
   RunHiFiGANConv(Proj, Cv, Pr);
   Curve := Copy(Pr[0]);
@@ -47750,6 +47818,7 @@ var
   DecIn, Mix, MagC, PhaseC: TNNetFloatDynArr2D;
   MagVol, PhaseVol, WaveVol: TNNetVolume;
   ReluRow: TNeuralFloatDynArr;   // #7/#4: bound channel row for the ReLU clamp
+  MagRow, PhRow, MSrc, PSrc: TNeuralFloatDynArr;   // #9: bind mag/phase rows once
 begin
   H := FConfig.HiddenSize;
   L := Length(Expanded[0]);
@@ -47767,7 +47836,7 @@ begin
   for c := 0 to HM1 do
   begin
     ReluRow := Mix[c];
-    for t := 0 to LM1 do if ReluRow[t] < 0 then ReluRow[t] := 0;
+    TNNetVolume.VectorRelu(@ReluRow[0], @ReluRow[0], LM1 + 1);
   end;
   RunAdaIN(FDecAdaIN, SDec, Mix);
   // magnitude head = exp(conv), phase head = sin(conv).
@@ -47779,10 +47848,14 @@ begin
   begin
     SetLength(Magnitude[c], L);
     SetLength(Phase[c], L);
+    MagRow := Magnitude[c];
+    PhRow := Phase[c];
+    MSrc := MagC[c];
+    PSrc := PhaseC[c];
     for t := 0 to LM1 do
     begin
-      Magnitude[c][t] := NeuralExp(MagC[c][t]);   // #16: fast trap-free exp
-      Phase[c][t] := Sin(PhaseC[c][t]);
+      MagRow[t] := NeuralExp(MSrc[t]);   // #16: fast trap-free exp
+      PhRow[t] := Sin(PSrc[t]);
     end;
   end;
   // ISTFT(mag, phase) -> waveform. ISTFTOverlapAdd consumes a (frames,1,bins)
