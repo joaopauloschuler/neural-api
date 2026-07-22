@@ -66360,7 +66360,7 @@ var
   AddIn: TNNetLayer;
   Vec: TNNetVolume;
   half, halfM1, i, k, base: integer;
-  LogMax, freq, angle: TNeuralFloat;
+  LogMax, freq, angle, c: TNeuralFloat;
   AddTextDimM1: integer;
 begin
   if not Config.UseAddEmbedding then
@@ -66386,18 +66386,19 @@ begin
   half := Config.AdditionTimeEmbedDim div 2;
   halfM1 := half - 1;
   LogMax := Ln(10000.0);
+  c := -LogMax / half;                 // #5: hoist the per-i divide out of the loop
   // i outer / k inner: each freq (depends only on i) is computed once, 6x fewer
   // Exp; base carried across the 6 time_ids (#5/App E, no alloc).
   for i := 0 to halfM1 do
   begin
-    freq := Exp(-LogMax * i / half);
+    freq := NeuralExp(c * i);
     base := Config.AdditionEmbedTextDim;
     for k := 0 to 5 do
     begin
       angle := TimeIds[k] * freq;
       // diffusers flip_sin_to_cos=True -> [cos | sin].
-      Vec.FData[base + i] := Cos(angle);
-      Vec.FData[base + half + i] := Sin(angle);
+      Vec.FData[base + i] := pcr_cosf(angle);
+      Vec.FData[base + half + i] := pcr_sinf(angle);
       base := base + Config.AdditionTimeEmbedDim;
     end;
   end;
@@ -66470,21 +66471,19 @@ begin
     // timestep, so the visible region carries the right noise level for t while
     // only the hole (mask=1) is driven by the denoiser.
     Sched.AddNoise(Z0, KnownNoised, Schedule[sIdx]);
-    for i := 0 to LatentsSizeM1 do
-    begin
-      m := MaskLatent.FData[i];
-      Latents.FData[i] := m * Latents.FData[i] + (1.0 - m) * KnownNoised.FData[i];
-    end;
+    // m*L + (1-m)*K = K + m*(L-K), in place on Latents (rule #13, no scratch).
+    Latents.Sub(KnownNoised);
+    TNNetVolume.Mul(Latents.GetRawPtr(0), MaskLatent.GetRawPtr(0), Latents.Size);
+    Latents.Add(KnownNoised);
     SDUNetDenoise(Net, Config, Latents, EncStates, Schedule[sIdx], Scratch);
     Sched.Step(Latents, Scratch, Schedule[sIdx], Schedule[sIdx + 1], Sampler, Eta);
   end;
   // Final composite at t=0: the kept region is EXACTLY the clean source latent so
   // the unmasked output is pixel-faithful (latent-exact) by construction.
-  for i := 0 to LatentsSizeM1 do
-  begin
-    m := MaskLatent.FData[i];
-    Latents.FData[i] := m * Latents.FData[i] + (1.0 - m) * Z0.FData[i];
-  end;
+  // m*L + (1-m)*Z0 = Z0 + m*(L-Z0), in place on Latents (rule #13, no scratch).
+  Latents.Sub(Z0);
+  TNNetVolume.Mul(Latents.GetRawPtr(0), MaskLatent.GetRawPtr(0), Latents.Size);
+  Latents.Add(Z0);
 end;
 
 function SDUNetControlDownCount(const Config: TSDUNetConfig): integer;
@@ -72001,8 +72000,8 @@ begin
       proj := cx * PosEmbed.FData[f]
             + cy * PosEmbed.FData[NumPosFeats + f];
       proj := twopi * proj;
-      Out_[oBase + f] := Sin(proj);
-      Out_[oBase + NumPosFeats + f] := Cos(proj);
+      Out_[oBase + f] := pcr_sinf(proj);
+      Out_[oBase + NumPosFeats + f] := pcr_cosf(proj);
     end;
     Inc(i2, 2);
     Inc(oBase, OutDim);
@@ -72135,7 +72134,7 @@ begin
 
     SAMPosEnc(PEPos, Coords, NSparse, Config.NumPosFeats, SparseRaw);
     SetLength(Sparse, NSparse * H);
-    for i := 0 to NSparseHM1 do Sparse[i] := SparseRaw[i];
+    Move(SparseRaw[0], Sparse[0], (NSparseHM1 + 1) * csNeuralFloatSize);
 
     // Per-row label embedding addition, mirroring HF _embed_points/_embed_boxes:
     //   label 1 -> + point_embed[1], label 0 -> + point_embed[0],
@@ -72245,8 +72244,7 @@ begin
       // MLP (lin1 -> relu -> lin2), residual
       SAMLinear(Reader, BPfx + 'mlp.lin1.weight', BPfx + 'mlp.lin1.bias',
         H, Config.MlpDim, NTok, Queries, Mlp1);
-      for i := 0 to NTokMlpM1 do
-        if Mlp1[i] < 0 then Mlp1[i] := 0;
+      TNNetVolume.VectorRelu(@Mlp1[0], @Mlp1[0], NTokMlpM1 + 1);
       SAMLinear(Reader, BPfx + 'mlp.lin2.weight', BPfx + 'mlp.lin2.bias',
         Config.MlpDim, H, NTok, Mlp1, Mlp2);
       TNNetVolume.Add(@Queries[0], @Mlp2[0], NTok * H);
@@ -72478,10 +72476,10 @@ begin
       BPfx := Pfx + 'mask_decoder.output_hypernetworks_mlps.' + IntToStr(mt) + '.';
       SAMLinear(Reader, BPfx + 'proj_in.weight', BPfx + 'proj_in.bias',
         H, H, 1, Hbuf, Mlp1);
-      for i := 0 to HM1 do if Mlp1[i] < 0 then Mlp1[i] := 0;
+      TNNetVolume.VectorRelu(@Mlp1[0], @Mlp1[0], HM1 + 1);
       SAMLinear(Reader, BPfx + 'layers.0.weight', BPfx + 'layers.0.bias',
         H, H, 1, Mlp1, Mlp2);
-      for i := 0 to HM1 do if Mlp2[i] < 0 then Mlp2[i] := 0;
+      TNNetVolume.VectorRelu(@Mlp2[0], @Mlp2[0], HM1 + 1);
       SAMLinear(Reader, BPfx + 'proj_out.weight', BPfx + 'proj_out.bias',
         H, Cu, 1, Mlp2, HyperIn);
       // HyperIn now holds the per-channel hypernetwork output (length Cu).
@@ -72517,10 +72515,10 @@ begin
       BPfx := Pfx + 'mask_decoder.iou_prediction_head.';
       SAMLinear(Reader, BPfx + 'proj_in.weight', BPfx + 'proj_in.bias',
         H, H, 1, Hbuf, Mlp1);
-      for i := 0 to HM1 do if Mlp1[i] < 0 then Mlp1[i] := 0;
+      TNNetVolume.VectorRelu(@Mlp1[0], @Mlp1[0], HM1 + 1);
       SAMLinear(Reader, BPfx + 'layers.0.weight', BPfx + 'layers.0.bias',
         H, H, 1, Mlp1, Mlp2);
-      for i := 0 to HM1 do if Mlp2[i] < 0 then Mlp2[i] := 0;
+      TNNetVolume.VectorRelu(@Mlp2[0], @Mlp2[0], HM1 + 1);
       SAMLinear(Reader, BPfx + 'proj_out.weight', BPfx + 'proj_out.bias',
         H, MaskTokenCount, 1, Mlp2, Hbuf);
       IoUScores.ReSize(NumMasks, 1, 1);
