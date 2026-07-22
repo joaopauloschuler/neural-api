@@ -315,18 +315,22 @@ var
   NIn, NOut, OutCnt, J, JLo, JHi: integer;
   NOutM1, NInM1: integer;
   Ratio, Cutoff, SrcPos, Center, X, Acc, WSum, W, PiX, PiXA: double;
-  AOverRatio: double;
+  AOverRatio, InvRatio: double;
+  FC: integer;
 
   // Lanczos-windowed sinc at offset T (in input-sample units), low-passed at
   // Cutoff (cycles per input sample, <= 0.5). Returns the kernel weight.
   function LanczosKernel(T: double): double;
+  var
+    AT: double;
   begin
-    if Abs(T) < 1e-12 then
+    AT := Abs(T);
+    if AT < 1e-12 then
     begin
       Result := 2.0 * Cutoff;
       exit;
     end;
-    if Abs(T) >= csResampleLanczosA then
+    if AT >= csResampleLanczosA then
     begin
       Result := 0.0;
       exit;
@@ -367,16 +371,18 @@ begin
   NInM1 := NIn - 1;   // last valid input index, invariant across the tap loop (#5)
   // Downsampling kernel half-width 1/Ratio is call-invariant (rule #5).
   AOverRatio := csResampleLanczosA / Ratio;
+  InvRatio := 1.0 / Ratio;   // reciprocal hoisted; multiply per output sample (#5)
   for OutCnt := 0 to NOutM1 do
   begin
     // Position of this output sample expressed in INPUT-sample coordinates.
-    SrcPos := OutCnt / Ratio;
+    SrcPos := OutCnt * InvRatio;
     Center := SrcPos;
     // Kernel support in input samples: A lobes scaled by the cutoff stretch.
     if Ratio >= 1.0 then
     begin
-      JLo := Floor(Center) - csResampleLanczosA + 1;
-      JHi := Floor(Center) + csResampleLanczosA;
+      FC := Floor(Center);
+      JLo := FC - csResampleLanczosA + 1;
+      JHi := FC + csResampleLanczosA;
     end
     else
     begin
@@ -478,7 +484,8 @@ begin
     Scaled := Round(V * 32768.0);
     if Scaled > 32767 then Scaled := 32767
     else if Scaled < -32768 then Scaled := -32768;
-    Raw[i] := smallint(Round(Scaled));
+    // Scaled is already integral from the Round above; Trunc is exact (#4).
+    Raw[i] := smallint(Trunc(Scaled));
   end;
 
   FS := TFileStream.Create(FileName, fmCreate);

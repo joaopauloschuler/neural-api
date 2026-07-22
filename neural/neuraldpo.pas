@@ -432,6 +432,11 @@ type
       procedure BackpropagateToken(
         const Prompt, Completion: array of integer; UpToTokenCount,
         Target: integer; ErrScale: TNeuralFloat);
+      // Backward-only variant: reuses the policy forward already stored in
+      // FPolicy's layers (no recompute). The caller MUST have run
+      // FPolicy.Compute for `Target`'s prefix as the most recent policy forward.
+      procedure BackpropagateFromLastForward(Target: integer;
+        ErrScale: TNeuralFloat);
       // Samples one completion from the policy (multinomial w/ temperature).
       // Returns the per-token logpi of the sampled tokens in OldLogProbs.
       procedure SampleCompletion(const Prompt: array of integer;
@@ -605,7 +610,7 @@ end;
 procedure TNeuralDPOTrainer.EncodePrefix(NN: TNNet;
   const Prompt, Completion: array of integer; UpToTokenCount: integer);
 var
-  PrefixLen, ContextLen, StartPos, I, PrefixLenM1, PromptLen, Needed: integer;
+  PrefixLen, ContextLen, StartPos, PromptLen, Needed, nP, nC: integer;
   FirstLayerOutput: TNNetVolume;
 begin
   FirstLayerOutput := NN.GetFirstLayer().Output;
@@ -617,13 +622,15 @@ begin
   StartPos := Max(0, PrefixLen - ContextLen);
   Needed := PrefixLen - StartPos;
   if Length(FPrefix) <> Needed then SetLength(FPrefix, Needed);  // #17: amortized
-  PrefixLenM1 := PrefixLen - 1;
-  for I := StartPos to PrefixLenM1 do
-  begin
-    if I < PromptLen
-    then FPrefix[I - StartPos] := Prompt[I]
-    else FPrefix[I - StartPos] := Completion[I - PromptLen];
-  end;
+  // Two contiguous halves: prompt tokens [StartPos..PromptLen-1] then completion
+  // tokens. nP prompt elements land at FPrefix[0], nC completion at FPrefix[nP].
+  nP := PromptLen - StartPos;
+  if nP < 0 then nP := 0;                 // clamp: window starts inside completion
+  if nP > 0 then
+    Move(Prompt[StartPos], FPrefix[0], nP * csIntegerSize);
+  nC := Needed - nP;
+  if nC > 0 then
+    Move(Completion[StartPos + nP - PromptLen], FPrefix[nP], nC * csIntegerSize);
   FInput.OneHotEncodingReversed(FPrefix);
 end;
 
@@ -640,7 +647,7 @@ begin
     EncodePrefix(NN, Prompt, Completion, T);
     NN.Compute(FInput);
     P := NN.GetLastLayer().Output.FData[Completion[T]];
-    Result := Result + Ln(Max(P, FProbFloor));
+    Result := Result + pcr_logf(Max(P, FProbFloor));  // #16: fast log
   end;
 end;
 
@@ -865,7 +872,7 @@ end;
 procedure TNeuralRewardModelTrainer.EncodeSequence(
   const Prompt, Response: array of integer);
 var
-  SeqLen, ContextLen, StartPos, I, SeqLenM1, PromptLen, Needed: integer;
+  SeqLen, ContextLen, StartPos, PromptLen, Needed, nP, nC: integer;
   FirstLayerOutput: TNNetVolume;
 begin
   FirstLayerOutput := FRewardNet.GetFirstLayer().Output;
@@ -877,13 +884,15 @@ begin
   StartPos := Max(0, SeqLen - ContextLen);
   Needed := SeqLen - StartPos;
   if Length(FSeq) <> Needed then SetLength(FSeq, Needed);  // #17: amortized
-  SeqLenM1 := SeqLen - 1;
-  for I := StartPos to SeqLenM1 do
-  begin
-    if I < PromptLen
-    then FSeq[I - StartPos] := Prompt[I]
-    else FSeq[I - StartPos] := Response[I - PromptLen];
-  end;
+  // Two contiguous halves: prompt tokens [StartPos..PromptLen-1] then response
+  // tokens. nP prompt elements land at FSeq[0], nC response at FSeq[nP].
+  nP := PromptLen - StartPos;
+  if nP < 0 then nP := 0;                 // clamp: window starts inside response
+  if nP > 0 then
+    Move(Prompt[StartPos], FSeq[0], nP * csIntegerSize);
+  nC := Needed - nP;
+  if nC > 0 then
+    Move(Response[StartPos + nP - PromptLen], FSeq[nP], nC * csIntegerSize);
   FInput.OneHotEncodingReversed(FSeq);
 end;
 
@@ -1011,7 +1020,7 @@ end;
 procedure TNeuralGRPOTrainer.EncodePrefix(NN: TNNet;
   const Prompt, Completion: array of integer; UpToTokenCount: integer);
 var
-  PrefixLen, ContextLen, StartPos, I, PrefixLenM1, PromptLen, Needed: integer;
+  PrefixLen, ContextLen, StartPos, PromptLen, Needed, nP, nC: integer;
   FirstLayerOutput: TNNetVolume;
 begin
   FirstLayerOutput := NN.GetFirstLayer().Output;
@@ -1022,13 +1031,15 @@ begin
   StartPos := Max(0, PrefixLen - ContextLen);
   Needed := PrefixLen - StartPos;
   if Length(FPrefix) <> Needed then SetLength(FPrefix, Needed);  // #17: amortized
-  PrefixLenM1 := PrefixLen - 1;
-  for I := StartPos to PrefixLenM1 do
-  begin
-    if I < PromptLen
-    then FPrefix[I - StartPos] := Prompt[I]
-    else FPrefix[I - StartPos] := Completion[I - PromptLen];
-  end;
+  // Two contiguous halves: prompt tokens [StartPos..PromptLen-1] then completion
+  // tokens. nP prompt elements land at FPrefix[0], nC completion at FPrefix[nP].
+  nP := PromptLen - StartPos;
+  if nP < 0 then nP := 0;                 // clamp: window starts inside completion
+  if nP > 0 then
+    Move(Prompt[StartPos], FPrefix[0], nP * csIntegerSize);
+  nC := Needed - nP;
+  if nC > 0 then
+    Move(Completion[StartPos + nP - PromptLen], FPrefix[nP], nC * csIntegerSize);
   FInput.OneHotEncodingReversed(FPrefix);
 end;
 
@@ -1045,7 +1056,7 @@ begin
     EncodePrefix(NN, Prompt, Completion, T);
     NN.Compute(FInput);
     P := NN.GetLastLayer().Output.FData[Completion[T]];
-    Result := Result + Ln(Max(P, FProbFloor));
+    Result := Result + pcr_logf(Max(P, FProbFloor));  // #16: fast log
   end;
 end;
 
@@ -1096,7 +1107,7 @@ begin
     // OldLogProb is the UNTEMPERED policy log-prob of the picked token (the
     // ratio in PPO is against the actual sampling policy log-prob; we store
     // the model's own log p(token) so logpi==logpi_old on the first epoch).
-    OldLogProbs[T] := Ln(Max(Y.FData[Picked], FProbFloor));
+    OldLogProbs[T] := pcr_logf(Max(Y.FData[Picked], FProbFloor));  // #16: fast log
   end;
 end;
 
@@ -1105,7 +1116,7 @@ class procedure TNeuralGRPOTrainer.ComputeAdvantages(
   Eps: TNeuralFloat; out Mean, Std: TNeuralFloat);
 var
   I, N, NM1: integer;
-  S, Var_: TNeuralFloat;
+  S, Var_, InvStd: TNeuralFloat;
 begin
   N := Length(Rewards);
   Mean := 0; Std := 0;
@@ -1118,19 +1129,26 @@ begin
   for I := 0 to NM1 do Var_ := Var_ + Sqr(Rewards[I] - Mean);
   Var_ := Var_ / N;            // population variance (GRPO uses /N)
   Std := Sqrt(Var_);
+  InvStd := 1.0 / (Std + Eps);  // #5: reciprocal hoisted out of the loop
   for I := 0 to NM1 do
-    Advantages[I] := (Rewards[I] - Mean) / (Std + Eps);
+    Advantages[I] := (Rewards[I] - Mean) * InvStd;
 end;
 
 procedure TNeuralGRPOTrainer.BackpropagateToken(
   const Prompt, Completion: array of integer; UpToTokenCount,
   Target: integer; ErrScale: TNeuralFloat);
+begin
+  EncodePrefix(FPolicy, Prompt, Completion, UpToTokenCount);
+  FPolicy.Compute(FInput);
+  BackpropagateFromLastForward(Target, ErrScale);
+end;
+
+procedure TNeuralGRPOTrainer.BackpropagateFromLastForward(Target: integer;
+  ErrScale: TNeuralFloat);
 var
   Y: TNNetVolume;
   PTarget: TNeuralFloat;
 begin
-  EncodePrefix(FPolicy, Prompt, Completion, UpToTokenCount);
-  FPolicy.Compute(FInput);
   Y := FPolicy.GetLastLayer().Output;
   if FPseudoTarget.Size <> Y.Size then FPseudoTarget.ReSize(Y);
   // ErrScale = dL/d logpi(target). Since d logpi/d logit = (onehot - y),
@@ -1159,6 +1177,7 @@ var
   G, T, Len, MaxLen, FGroupSizeM1, LenM1: integer;
   Completions: array of TNeuralDPOTokenArray;
   OldLP: array of array of TNeuralFloat;
+  OldG: array of TNeuralFloat;   // bound row OldLP[G]
   Lengths: array of integer;
   Rewards, Advantages: array of TNeuralFloat;
   Mean, Std, A, LogPi, LogRef, KLt, PGGrad, KLGrad, ErrScale: TNeuralFloat;
@@ -1206,21 +1225,25 @@ begin
     Len := Lengths[G];
     LenM1 := Len - 1;
     Comp := Completions[G];
+    OldG := OldLP[G];   // #7: bind the per-group old-logprob row once
     for T := 0 to LenM1 do
     begin
       Tok := Comp[T];
+      // Reference log-prob (frozen) for the KL estimator. Computed FIRST so the
+      // policy forward below is the most recent one and its activations stay
+      // live for BackpropagateFromLastForward (avoids a duplicate policy
+      // forward; also robust if reference and policy alias the same net).
+      EncodePrefix(FReference, Prompt, Comp, T);
+      FReference.Compute(FInput);
+      PRef := Max(FReference.GetLastLayer().Output.FData[Tok],
+                  FProbFloor);
+      LogRef := pcr_logf(PRef);  // #16: fast log
       // Current policy log-prob of the sampled token (forward pass).
       EncodePrefix(FPolicy, Prompt, Comp, T);
       FPolicy.Compute(FInput);
       Y := FPolicy.GetLastLayer().Output;
       P := Max(Y.FData[Tok], FProbFloor);
-      LogPi := Ln(P);
-      // Reference log-prob (frozen) for the KL estimator.
-      EncodePrefix(FReference, Prompt, Comp, T);
-      FReference.Compute(FInput);
-      PRef := Max(FReference.GetLastLayer().Output.FData[Tok],
-                  FProbFloor);
-      LogRef := Ln(PRef);
+      LogPi := pcr_logf(P);  // #16: fast log
 
       // DeepSeek k3 unbiased per-token KL estimator (>= 0):
       //   KL_t = exp(logref-logpi) - (logref-logpi) - 1
@@ -1233,7 +1256,7 @@ begin
       // Policy-gradient term with optional PPO clip.
       if FClipEpsilon > 0 then
       begin
-        Ratio := Exp(LogPi - OldLP[G][T]);
+        Ratio := NeuralExp(LogPi - OldG[T]);  // #16: fast, trap-free exp
         Surr1 := Ratio * A;
         RatioClip := Ratio;
         if RatioClip > 1 + FClipEpsilon then RatioClip := 1 + FClipEpsilon
@@ -1255,7 +1278,9 @@ begin
       // L = -PG_objective + beta*KL  ->  dL/dlogpi = -PGGrad + beta*KLGrad.
       // Logit gradient = ErrScale*(y - onehot) with ErrScale = dL/dlogpi.
       ErrScale := -PGGrad + FBeta * KLGrad;
-      BackpropagateToken(Prompt, Comp, T, Tok, ErrScale);
+      // Reuse the policy forward computed above (most recent Compute); no
+      // duplicate forward pass.
+      BackpropagateFromLastForward(Tok, ErrScale);
       Inc(TokenCount);
     end;
   end;

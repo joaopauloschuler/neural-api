@@ -569,6 +569,7 @@ end;
 class procedure TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond,
   Dst: TNNetVolume; W: TNeuralFloat);
 var i, DstSizeM1: integer;
+  eu: TNeuralFloat;
 begin
   // Dst := (1-W)*EpsUncond + W*EpsCond (rule #13). The copy-first bulk form is
   // safe when Dst aliases EpsUncond, but WRONG when Dst aliases EpsCond (Copy
@@ -577,8 +578,10 @@ begin
   begin
     DstSizeM1 := Dst.Size - 1;
     for i := 0 to DstSizeM1 do
-      Dst.FData[i] := EpsUncond.FData[i] +
-        W * (EpsCond.FData[i] - EpsUncond.FData[i]);
+    begin
+      eu := EpsUncond.FData[i];   // #4: read once
+      Dst.FData[i] := eu + W * (EpsCond.FData[i] - eu);
+    end;
   end
   else
   begin
@@ -628,12 +631,14 @@ var
   curX0, dCoef: TNeuralFloat;
   // UniPC locals (order-2 bh2, predict_x0).
   alphaT, sigmaTuni, sigmaS0, hh, hphi1, Bh, rk, rhoC0, rhoC1: TNeuralFloat;
-  detR, sigRatio, m0v, mtv, D1: TNeuralFloat;
+  detR, sigRatio: TNeuralFloat;
   cOrder, pOrder: integer;
   // Loop-invariant hoists (rule #5): per-step coefficients pulled out of the
   // per-element loops below.
   needNoise: boolean;
   invSqrtAbT, somabT, cA, cB, kX, kD, kM0, kBh, invRk: TNeuralFloat;
+  ev, xv, cD1: TNeuralFloat;   // per-element Eps/Xt binds (#4); UniPC D1 coef
+  m0Vol, m1Vol: TNNetVolume;   // UniPC history rows bound once (#5)
 begin
   // Persistent lazily-sized eps scratch (rule #17). Step and PredictX0 never
   // run nested, so they safely share FEpsScratch.
@@ -651,11 +656,20 @@ begin
           coef := FBeta[Tt] / FSqrtOneMinusAlphaBar[Tt];
           needNoise := Tt > 1;
           if needNoise then sigma := Sqrt(FBeta[Tt]) else sigma := 0;
-          for i := 0 to XtSizeM1 do
+          if needNoise then
           begin
-            if needNoise then z := RandG(0, 1) else z := 0;
-            Xt.FData[i] := invSqrtAlpha *
-              (Xt.FData[i] - coef * Eps.FData[i]) + sigma * z;
+            for i := 0 to XtSizeM1 do
+            begin
+              z := RandG(0, 1);
+              Xt.FData[i] := invSqrtAlpha *
+                (Xt.FData[i] - coef * Eps.FData[i]) + sigma * z;
+            end;
+          end
+          else
+          begin
+            // No noise: uniform affine Xt := invSqrtAlpha*(Xt - coef*Eps) (#13).
+            Xt.Mul(invSqrtAlpha);
+            Xt.MulAdd(-invSqrtAlpha * coef, Eps);
           end;
         end;
       smDDIM:
@@ -674,13 +688,25 @@ begin
           dirCoef := Sqrt(Max(0.0, 1.0 - abPrev - sigma * sigma));
           somabT := FSqrtOneMinusAlphaBar[Tt];
           invSqrtAbT := 1.0 / Sqrt(abT);
-          for i := 0 to XtSizeM1 do
+          if sigma > 0 then
           begin
-            if sigma > 0 then z := RandG(0, 1) else z := 0;
-            // x_{TtPrev} = sqrt(ab_prev)*x0 + dirCoef*eps + sigma*z,
-            //   x0 = (x_t - somab_t*eps)/sqrt(ab_t).
-            x0 := (Xt.FData[i] - somabT * Eps.FData[i]) * invSqrtAbT;
-            Xt.FData[i] := sqrtAbPrev * x0 + dirCoef * Eps.FData[i] + sigma * z;
+            for i := 0 to XtSizeM1 do
+            begin
+              z := RandG(0, 1);
+              ev := Eps.FData[i];   // #4: read once
+              // x_{TtPrev} = sqrt(ab_prev)*x0 + dirCoef*eps + sigma*z,
+              //   x0 = (x_t - somab_t*eps)/sqrt(ab_t).
+              x0 := (Xt.FData[i] - somabT * ev) * invSqrtAbT;
+              Xt.FData[i] := sqrtAbPrev * x0 + dirCoef * ev + sigma * z;
+            end;
+          end
+          else
+          begin
+            // sigma=0 (z=0): Xt := k*Xt + c*Eps, a uniform affine map (#13).
+            //   k = sqrt(ab_prev)/sqrt(ab_t),
+            //   c = dirCoef - sqrt(ab_prev)/sqrt(ab_t)*somab_t.
+            Xt.Mul(sqrtAbPrev * invSqrtAbT);
+            Xt.MulAdd(dirCoef - sqrtAbPrev * invSqrtAbT * somabT, Eps);
           end;
         end;
       smEulerAncestral:
@@ -721,14 +747,28 @@ begin
               sigma := 0;                            // sigma_up
             h := Sqrt(Max(0.0, lamPrev * lamPrev - sigma * sigma)); // sigma_down
             if lamT > 0 then r0 := h / lamT else r0 := 0;           // drift ratio
-            for i := 0 to XtSizeM1 do
+            if sigma > 0 then
             begin
-              if sigma > 0 then z := RandG(0, 1) else z := 0;
-              x0 := (Xt.FData[i] - somabT * Eps.FData[i]) * invSqrtAbT;
-              // VE sample at sigma=s1 is x_t/sqrt(ab_t); Euler drift to sigma_down.
-              curX0 := x0 + r0 * (Xt.FData[i] * invSqrtAbT - x0);
-              // Re-noise back to VP scale at TtPrev, add ancestral noise.
-              Xt.FData[i] := sqrtAbPrev * (curX0 + sigma * z);
+              for i := 0 to XtSizeM1 do
+              begin
+                z := RandG(0, 1);
+                ev := Eps.FData[i];   // #4: read once
+                xv := Xt.FData[i];    // #4: read once
+                x0 := (xv - somabT * ev) * invSqrtAbT;
+                // VE sample at sigma=s1 is x_t/sqrt(ab_t); Euler drift to sigma_down.
+                curX0 := x0 + r0 * (xv * invSqrtAbT - x0);
+                // Re-noise back to VP scale at TtPrev, add ancestral noise.
+                Xt.FData[i] := sqrtAbPrev * (curX0 + sigma * z);
+              end;
+            end
+            else
+            begin
+              // sigma=0 (z=0): the whole update collapses to a uniform affine
+              // Xt := k*Xt + c*Eps (#13), with
+              //   k = sqrt(ab_prev)/sqrt(ab_t),
+              //   c = -sqrt(ab_prev)*(1-r0)*somab_t/sqrt(ab_t).
+              Xt.Mul(sqrtAbPrev * invSqrtAbT);
+              Xt.MulAdd(-(sqrtAbPrev * (1 - r0) * somabT * invSqrtAbT), Eps);
             end;
           end;
         end;
@@ -858,27 +898,27 @@ begin
               // rhos = R^{-1} b ; R^{-1} = 1/detR * [[1,-1],[-rk,1]].
               curX0 := (rhoC0 - rhoC1) / detR;        // rhos_c[0]
               dCoef := (-rk * rhoC0 + rhoC1) / detR;  // rhos_c[1] (multiplies D1_t)
-              for i := 0 to XtSizeM1 do
-              begin
-                m0v := FUniHistX0[FUniHistLen - 1].FData[i];
-                mtv := Eps.FData[i];
-                D1 := (FUniHistX0[FUniHistLen - 2].FData[i] - m0v) * invRk;
-                Xt.FData[i] := sigRatio * FUniPrevSample.FData[i]
-                  - kM0 * m0v
-                  - kBh * (curX0 * D1 + dCoef * (mtv - m0v));
-              end;
+              // Uniform affine over Xt (#13). Expanding the scalar body with
+              //   D1 = (m1 - m0)*invRk, m0=hist[-1], m1=hist[-2], mt=Eps:
+              //   Xt = sigRatio*prev + m0*(-kM0 + kBh*(curX0*invRk + dCoef))
+              //                      + m1*(-kBh*curX0*invRk) + mt*(-kBh*dCoef).
+              m0Vol := FUniHistX0[FUniHistLen - 1];
+              m1Vol := FUniHistX0[FUniHistLen - 2];
+              Xt.Copy(FUniPrevSample);
+              Xt.Mul(sigRatio);
+              Xt.MulAdd(-kM0 + kBh * (curX0 * invRk + dCoef), m0Vol);
+              Xt.MulAdd(-kBh * curX0 * invRk, m1Vol);
+              Xt.MulAdd(-kBh * dCoef, Eps);
             end
             else
             begin
-              // First-order corrector: rhos_c = [0.5].
-              for i := 0 to XtSizeM1 do
-              begin
-                m0v := FUniHistX0[FUniHistLen - 1].FData[i];
-                mtv := Eps.FData[i];
-                Xt.FData[i] := sigRatio * FUniPrevSample.FData[i]
-                  - kM0 * m0v
-                  - kBh * 0.5 * (mtv - m0v);
-              end;
+              // First-order corrector: rhos_c = [0.5]. Uniform affine (#13):
+              //   Xt = sigRatio*prev + m0*(-kM0 + 0.5*kBh) + mt*(-0.5*kBh).
+              m0Vol := FUniHistX0[FUniHistLen - 1];
+              Xt.Copy(FUniPrevSample);
+              Xt.Mul(sigRatio);
+              Xt.MulAdd(-kM0 + 0.5 * kBh, m0Vol);
+              Xt.MulAdd(-0.5 * kBh, Eps);
             end;
           end;
 
@@ -940,14 +980,15 @@ begin
               //   rk = (lambda_{prev hist} - lambda_t)/h.
               rk := (Lambda(FUniHistT[FUniHistLen - 2]) - lamT) / h;
               invRk := 1.0 / rk;
-              for i := 0 to XtSizeM1 do
-              begin
-                m0v := Eps.FData[i];
-                D1 := (FUniHistX0[FUniHistLen - 2].FData[i] - m0v) * invRk;
-                Xt.FData[i] := sigRatio * FUniPrevSample.FData[i]
-                  - kM0 * m0v
-                  - kBh * 0.5 * D1;
-              end;
+              // Uniform affine over Xt (#13). With m0=Eps, m1=hist[-2],
+              //   D1 = (m1 - m0)*invRk and cD1 = 0.5*kBh*invRk:
+              //   Xt = sigRatio*prev + Eps*(-kM0 + cD1) + m1*(-cD1).
+              cD1 := 0.5 * kBh * invRk;
+              m1Vol := FUniHistX0[FUniHistLen - 2];
+              Xt.Copy(FUniPrevSample);
+              Xt.Mul(sigRatio);
+              Xt.MulAdd(-kM0 + cD1, Eps);
+              Xt.MulAdd(-cD1, m1Vol);
             end
             else
             begin
@@ -968,7 +1009,7 @@ end;
 procedure TNNetDiffusionScheduler.SampleHeun(X: TNNetVolume;
   Denoise: TNNetDenoiseCallback; NumSteps: integer; Spacing: TNNetTimestepSpacing);
 var
-  k, Tt, TtPrev, i, SizeM1: integer;
+  k, Tt, TtPrev: integer;
   NumStepsM1: integer;
   Pred, X0, Y, Ye, X0b, XPred: TNNetVolume;
   Schedule: TNeuralIntegerArray;
@@ -990,7 +1031,6 @@ begin
   if NumSteps < 1 then NumSteps := 1;
   NumStepsM1 := NumSteps - 1;
   Schedule := BuildTimestepSchedule(NumSteps, Spacing);
-  SizeM1 := X.Size - 1;
   Pred  := TNNetVolume.Create(X);
   X0    := TNNetVolume.Create(X);
   Y     := TNNetVolume.Create(X);

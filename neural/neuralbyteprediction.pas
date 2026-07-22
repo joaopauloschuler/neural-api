@@ -537,13 +537,15 @@ begin
   for I := 0 to MaxIdx do
   begin
     NGP := @FNN[I];
-    Probability := NGP^.GetF();
     PredictionPosition := 0;
+    // Gate on the cheap Filled/count tests first; only then compute GetF (a
+    // divide) and its probability test (#5: skip the divide when gated out).
     if (NGP^.Filled) and
-      (Probability > 0.1) and
       (NGP^.CorrectNeuronPredictionCnt > 10) then
     begin
-      if ( ABF.TestTests(NGP^.TestNeuronLayer) > 0) then
+      Probability := NGP^.GetF();
+      if (Probability > 0.1) and
+        ( ABF.TestTests(NGP^.TestNeuronLayer) > 0) then
       begin
         ABF.OperateAndTestOperation(
           NGP^.OperationNeuronLayer, PredictionPosition, NextState);
@@ -1064,6 +1066,7 @@ var
   I, neuronPos: longint;
   Actual, Best: extended;
   R: boolean;
+  NGP: ^TNeuronGroup;   // bind once per iteration (rule #7)
 begin
   R := False;
   Result := R;
@@ -1072,8 +1075,12 @@ begin
   for I := 1 to Num do
   begin
     neuronPos := random(FMaxOperationNeuronCount);
-    if ByteToBool[EvalNeuronGroup(FNN[neuronPos], ABF)] and
-      FNN[neuronPos].Filled() and (GetD(neuronPos) > 0.8) then
+    NGP := @FNN[neuronPos];
+    // Filled() is a pure cheap gate; test it first so a false short-circuits the
+    // EvalNeuronGroup call (both TestTests/OperateAndTestOperation are free of
+    // persistent side effects, so the AND result is unchanged).
+    if NGP^.Filled() and ByteToBool[EvalNeuronGroup(NGP^, ABF)] and
+      (GetD(neuronPos) > 0.8) then
       Actual := 1
     else
       Actual := 0;
@@ -1369,10 +1376,14 @@ begin
   begin
     NGP := @FNN[I];
     PredictionPosition := NGP^.PredictionPos;
+    // TestTests before OperateAndTestOperation (matches sibling Prediction());
+    // both are free of persistent side effects (NextState is discarded here),
+    // so swapping the AND operands preserves the result while letting the
+    // cheaper test gate short-circuit the operation eval.
     if (NGP^.Filled) and
+      ( ABF.TestTests(NGP^.TestNeuronLayer) > 0) and
       ByteToBool[ABF.OperateAndTestOperation(
-      NGP^.OperationNeuronLayer, PredictionPosition, NextState)] and
-      ( ABF.TestTests(NGP^.TestNeuronLayer) > 0) then
+      NGP^.OperationNeuronLayer, PredictionPosition, NextState)] then
     begin
       TotalCount := NGP^.WrongNeuronPredictionCnt +
         NGP^.CorrectNeuronPredictionCnt;
