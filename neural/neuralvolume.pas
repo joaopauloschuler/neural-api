@@ -2514,19 +2514,21 @@ end;
 procedure NormalizeRowsL2(Mat: TNNetVolume);
 var
   Rows, Dim, R: integer;
-  RowsM1: integer;
+  RowsM1, RowOfs: integer;
   Norm: TNeuralFloat;
   RowPtr: TNeuralFloatArrPtr;
 begin
   Rows := Mat.SizeX;
   Dim := Mat.Depth;
   RowsM1 := Rows - 1;
+  RowOfs := 0;
   for R := 0 to RowsM1 do
   begin
-    RowPtr := Mat.GetRawPtr(R * Dim);
+    RowPtr := Mat.GetRawPtr(RowOfs);
     Norm := Sqrt(TNNetVolume.DotProduct(RowPtr, RowPtr, Dim));
     if Norm > 0 then
       TNNetVolume.Mul(RowPtr, 1 / Norm, Dim);
+    Inc(RowOfs, Dim);
   end;
 end;
 
@@ -2534,9 +2536,9 @@ function NeuralLinearSolve(var A: array of TNeuralFloat;
   var B: array of TNeuralFloat; n, m: integer): boolean;
 var
   col, row, piv, k: integer;
-  nM1, mM1, rowStart: integer;
+  nM1, mM1, rowStart, rowBase, idxC, idxP: integer;
   colBaseN, colBaseM, pivBaseN, pivBaseM, rowBaseN, rowBaseM: integer;
-  maxAbs, v, factor, diag, tmp: TNeuralFloat;
+  maxAbs, v, factor, diag, tmp, InvDiag: TNeuralFloat;
 begin
   Result := True;
   nM1 := n - 1;
@@ -2549,10 +2551,12 @@ begin
     piv := col;
     maxAbs := Abs(A[colBaseN + col]);
     rowStart := col + 1;
+    rowBase := rowStart * n;
     for row := rowStart to nM1 do
     begin
-      v := Abs(A[row * n + col]);
+      v := Abs(A[rowBase + col]);
       if v > maxAbs then begin maxAbs := v; piv := row; end;
+      Inc(rowBase, n);
     end;
     if maxAbs < 1e-30 then begin Result := False; Exit; end;
 
@@ -2563,18 +2567,21 @@ begin
       pivBaseM := piv * m;
       for k := 0 to nM1 do
       begin
-        tmp := A[colBaseN + k]; A[colBaseN + k] := A[pivBaseN + k]; A[pivBaseN + k] := tmp;
+        idxC := colBaseN + k; idxP := pivBaseN + k;
+        tmp := A[idxC]; A[idxC] := A[idxP]; A[idxP] := tmp;
       end;
       for k := 0 to mM1 do
       begin
-        tmp := B[colBaseM + k]; B[colBaseM + k] := B[pivBaseM + k]; B[pivBaseM + k] := tmp;
+        idxC := colBaseM + k; idxP := pivBaseM + k;
+        tmp := B[idxC]; B[idxC] := B[idxP]; B[idxP] := tmp;
       end;
     end;
 
     // Normalise the pivot row so A[col,col] = 1.
     diag := A[colBaseN + col];
-    TNNetVolume.Mul(@A[colBaseN], 1 / diag, n);
-    TNNetVolume.Mul(@B[colBaseM], 1 / diag, m);
+    InvDiag := 1 / diag;
+    TNNetVolume.Mul(@A[colBaseN], InvDiag, n);
+    TNNetVolume.Mul(@B[colBaseM], InvDiag, m);
 
     // Eliminate the pivot column from every other row.
     for row := 0 to nM1 do
@@ -7837,6 +7844,7 @@ function TVolume.GetEntropy: T;
 var
   I, vHigh: integer;
   vSum: TNeuralFloat;
+  v: T;
 begin
   vSum := 0;
   if FSize > 0 then
@@ -7844,8 +7852,9 @@ begin
     vHigh := FSize - 1;
     for I := 0 to vHigh do
     begin
-      if FData[I] > 0 then // To avoid log(0) which is undefined
-        vSum := vSum + (FData[i] * pcr_log2f(FData[i]));
+      v := FData[I];
+      if v > 0 then // To avoid log(0) which is undefined
+        vSum := vSum + (v * pcr_log2f(v));
     end;
   end;
   Result := -vSum;
@@ -7873,7 +7882,7 @@ begin
     begin
       P := FData[BaseS + d];
       if P < 1e-12 then P := 1e-12;
-      Result := Result - Tgt * Ln(P);
+      Result := Result - Tgt * pcr_logf(P);
     end;
   end;
 end;
@@ -8336,6 +8345,7 @@ var
   CountX, CountY, CountD: integer;
   MaxValue: T;
   LocalValue: T;
+  v: T;
   TotalSum: TNeuralFloat;
   RowStride, colBase: integer;
 begin
@@ -8372,7 +8382,8 @@ begin
           for CountD := 1 to MaxD do
           begin
             Inc(I);
-            if FData[I] > MaxValue then MaxValue := FData[I];
+            v := FData[I];
+            if v > MaxValue then MaxValue := v;
           end;
           I := StartPointPos;
           for CountD := 0 to MaxD do
@@ -8424,8 +8435,9 @@ begin
         for CountD := 1 to MaxD do
         begin
           Inc(I);
-          if FData[I] > MaxValue
-            then MaxValue := FData[I];
+          v := FData[I];
+          if v > MaxValue
+            then MaxValue := v;
         end;
         TotalSum := 0;
         I := StartPointPos;
@@ -8739,6 +8751,7 @@ var
   CountX, CountY, CountD: integer;
   MaxValue: T;
   LocalValue: T;
+  v: T;
   TotalSum: TNeuralFloat;
   GroupCnt, StartD, PointBase: integer;
   ChannelsPerGroup, ChannelsPerGroupM1, GroupsM1: integer;
@@ -8770,8 +8783,9 @@ begin
           for CountD := 1 to ChannelsPerGroupM1 do
           begin
             Inc(I);
-            if FData[I] > MaxValue
-              then MaxValue := FData[I];
+            v := FData[I];
+            if v > MaxValue
+              then MaxValue := v;
           end;
           TotalSum := 0;
           I := StartPointPos;
@@ -8964,7 +8978,7 @@ begin
   begin
     Token := 0;
     GroupSizePower := 1;
-    RawTokenPos := GetRawPos(X, Y, 0); // #6: carried GetRawPos(X,Y,GroupCnt*GroupSize)
+    RawTokenPos := GetRawPos(X, Y); // #6: carried GetRawPos(X,Y,GroupCnt*GroupSize)
     for GroupCnt := 0 to MaxGroup do
     begin
       MaxValue := FData[RawTokenPos];
@@ -9908,7 +9922,7 @@ var
   NumA, NumB, NumBM1: integer;
   DestPointer: pointer;
   CntBVectorSizePlusCntBPos: integer;
-  AOfs: integer;
+  AOfs, DestOfs: integer;
 begin
   NumA := InterleavedAs.Size div VectorSize;
   NumB := Bs.Size div VectorSize;
@@ -9922,10 +9936,11 @@ begin
   end;
 
   Fill(0);
+  DestOfs := 0;
+  CntBVectorSizePlusCntBPos := 0;
   for CntB := 0 to NumBM1 do
   begin
-    DestPointer := Self.GetRawPtr(NumA*CntB);
-    CntBVectorSizePlusCntBPos := CntB*VectorSize;
+    DestPointer := Self.GetRawPtr(DestOfs);
     AOfs := 0;
     for CntBPos := 0 to MaxBPos do
     begin
@@ -9934,6 +9949,7 @@ begin
       Inc(CntBVectorSizePlusCntBPos);
       Inc(AOfs, NumA);
     end;
+    Inc(DestOfs, NumA);
   end;
 end;
 
@@ -9944,7 +9960,7 @@ var
   NumA, NumB: integer;
   DestPointer: pointer;
   CntBVectorSizePlusCntBPos: integer;
-  AOfs: integer;
+  AOfs, DestOfs: integer;
 begin
   NumA := InterleavedAs.Size div VectorSize;
   NumB := Bs.Size div VectorSize;
@@ -9956,10 +9972,11 @@ begin
     Resize(1, NumB, NumA);
   end;
 
+  DestOfs := NumA*BStart;
+  CntBVectorSizePlusCntBPos := BStart*VectorSize;
   for CntB := BStart to BFinish do
   begin
-    DestPointer := Self.GetRawPtr(NumA*CntB);
-    CntBVectorSizePlusCntBPos := CntB*VectorSize;
+    DestPointer := Self.GetRawPtr(DestOfs);
     AOfs := 0;
     for CntBPos := 0 to MaxBPos do
     begin
@@ -9968,6 +9985,7 @@ begin
       Inc(CntBVectorSizePlusCntBPos);
       Inc(AOfs, NumA);
     end;
+    Inc(DestOfs, NumA);
   end;
 end;
 
