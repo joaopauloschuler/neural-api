@@ -89,6 +89,7 @@ const
   csLongintSize = SizeOf(Longint);
   csIntegerSize = SizeOf(Integer);
   csShortIntSize = SizeOf(ShortInt);
+  csDoubleSize = SizeOf(Double);
   csNeuralFloat4Zero : TNeuralFloat4 = (0,0,0,0);
   csNeuralFloat4One : TNeuralFloat4  = (1,1,1,1);
 
