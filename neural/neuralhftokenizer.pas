@@ -219,6 +219,11 @@ type
       // GPT-2 bytes<->unicode table
       FByteToCP: array[0..255] of cardinal;
       FCPToByte: array[0..$143] of integer;
+      // SentencePiece '<0xNN>' byte-piece ids (or -1 if absent), indexed by
+      // byte value 0..255. Built once per load (immutable vocab) so the unk
+      // byte-fallback path needs no per-byte string build + VocabFind.
+      FBytePieceId: array[0..255] of integer;
+      FBytePieceTableBuilt: boolean;
       FKeysMangled: boolean;
       // BPE-dropout (Provilkov et al. 2020): probability of skipping each
       // otherwise-applicable merge during TRAINING tokenization, so the model
@@ -228,6 +233,7 @@ type
       procedure DetectKeyMangling();
       function FixJSONKey(const Key: string): string;
       procedure BuildByteTable();
+      procedure BuildBytePieceTable();
       procedure ClearState();
       function VocabFind(const Token: string): integer; // id or -1
       function MergeRank(const A, B: string): integer;  // rank or MaxInt
@@ -1144,6 +1150,7 @@ begin
   SetLength(FDecReplaceFrom, 0);
   SetLength(FDecReplaceTo, 0);
   FByteFallback := false;
+  FBytePieceTableBuilt := false;
   FFuseUnk := false;
   FIgnoreMerges := false;
   FUnigram := false;
@@ -1178,6 +1185,19 @@ begin
   FUnkId := -1;
   FBosId := -1;
   FEosId := -1;
+end;
+
+// Precomputes the '<0xNN>' SentencePiece byte-piece id for every byte value
+// 0..255 once, after the (immutable) vocab has finished loading. The unk
+// byte-fallback path then indexes FBytePieceId[b] instead of building a
+// '<0xNN>' string and running VocabFind per byte on every fallback.
+procedure TNeuralHFTokenizer.BuildBytePieceTable();
+var
+  B: integer;
+begin
+  for B := 0 to 255 do
+    FBytePieceId[B] := VocabFind('<0x' + IntToHex(B, 2) + '>');
+  FBytePieceTableBuilt := true;
 end;
 
 // The GPT-2 bytes-to-unicode table: printable latin-1 bytes map to
@@ -3649,6 +3669,8 @@ var
   begin
     Result := false;
     if not FByteFallback then Exit;
+    // Byte-piece id table is built once per load (immutable vocab).
+    if not FBytePieceTableBuilt then BuildBytePieceTable();
     KStart := CPStart[CharStart];
     KEndM1 := CPStart[CharEnd] - 1;
     // #4: single pass with rollback -> VocabFind once per byte instead of
@@ -3657,7 +3679,7 @@ var
     StartCount := Ids.Count;
     for K := KStart to KEndM1 do
     begin
-      BId := VocabFind('<0x' + IntToHex(Ord(PieceText[K]), 2) + '>');
+      BId := FBytePieceId[Ord(PieceText[K])];
       if BId < 0 then
       begin
         Ids.Count := StartCount;
@@ -3899,6 +3921,7 @@ var
   Pieces, Symbols, DigitPieces: TStringList;
   Cnt, Position, RunStart, PieceStart, PiecesCnt, NormReplaceHi: integer;
   PieceLen: integer;
+  MSLen, NormLen: integer;
   Normalized: string;
   Seg, Piece: string;
 
@@ -4130,19 +4153,23 @@ begin
       begin
         PieceStart := 1;
         Position := 1;
-        while Position <= Length(Normalized) do
+        MSLen := Length(FMSReplacement);
+        NormLen := Length(Normalized);
+        while Position <= NormLen do
         begin
           RunStart := Position;
           NextCodePoint(Normalized, Position);
+          // alloc-free equivalent of Copy(Normalized,RunStart,MSLen)=FMSReplacement
           if (RunStart > PieceStart) and
-            (Copy(Normalized, RunStart, Length(FMSReplacement)) =
-             FMSReplacement) then
+            (RunStart + MSLen - 1 <= NormLen) and
+            (Normalized[RunStart] = FMSReplacement[1]) and
+            CompareMem(@Normalized[RunStart], @FMSReplacement[1], MSLen) then
           begin // new piece starts at each replacement (MergedWithNext)
             BPECodePoints(PieceStart, RunStart - 1);
             PieceStart := RunStart;
           end;
         end;
-        BPECodePoints(PieceStart, Length(Normalized));
+        BPECodePoints(PieceStart, NormLen);
         exit;
       end;
     end;
@@ -4207,7 +4234,7 @@ var
   Ids: TIntegerList;
   WordOf: array of integer;   // 1-based byte pos -> 0-based word index
   Cnt, Cursor, TokenIndex, SurfPos, SurfLen, StartPos, WordStart: integer;
-  IdsCnt, IdsCntM1, TextLen: integer;
+  IdsCnt, IdsCntM1, TextLen, WPLen: integer;
   InWord: boolean;
   WordCnt: integer;
   Surface: string;
@@ -4263,6 +4290,7 @@ begin
     // bytes, e.g. unk_surface) keeps Start=0/Length=0/WordId=-1.
     Cursor := 1;
     IdsCntM1 := IdsCnt - 1;
+    WPLen := Length(FWPPrefix);
     for Cnt := 0 to IdsCntM1 do
     begin
       Result[Cnt].Id := Ids[Cnt];
@@ -4276,9 +4304,11 @@ begin
       Surface := DecodeToken(Ids[Cnt]);
       // Strip the WordPiece continuation prefix ('##') so the surface is the
       // raw substring (WordPiece tokens carry no leading-space byte).
+      // alloc-free equivalent of Copy(Surface,1,WPLen)=FWPPrefix
       if FWordPiece and (FWPPrefix <> '') and
-        (Copy(Surface, 1, Length(FWPPrefix)) = FWPPrefix) then
-        Surface := Copy(Surface, Length(FWPPrefix) + 1, MaxInt);
+        (Length(Surface) >= WPLen) and (Surface[1] = FWPPrefix[1]) and
+        CompareMem(@Surface[1], @FWPPrefix[1], WPLen) then
+        Surface := Copy(Surface, WPLen + 1, MaxInt);
       if Surface = '' then Continue;
 
       // Consume Surface byte by byte against Text[Cursor..].
@@ -4350,8 +4380,21 @@ end;
 function TNeuralHFTokenizer.DecodeToken(Id: integer): string;
 var
   Token: string;
-  Position, ByteVal, Cnt, DecReplaceHi: integer;
+  Position, Cnt, DecReplaceHi, HiNib, LoNib: integer;
   CP: cardinal;
+
+  // Hex digit -> nibble value (0..15), or -1 if not a hex digit. Matches the
+  // accept/reject set of StrToIntDef('$'+..) without any string allocation.
+  function HexNibble(c: char): integer;
+  begin
+    case c of
+      '0'..'9': Result := Ord(c) - Ord('0');
+      'a'..'f': Result := Ord(c) - Ord('a') + 10;
+      'A'..'F': Result := Ord(c) - Ord('A') + 10;
+    else Result := -1;
+    end;
+  end;
+
 begin
   Result := '';
   if (Id < 0) or (Id > High(FIdToToken)) then exit;
@@ -4370,11 +4413,13 @@ begin
   else
   begin
     // byte-fallback token? "<0xNN>"
-    if FByteFallback and (Length(Token) = 6) and (Copy(Token, 1, 3) = '<0x')
-      and (Token[6] = '>') then
+    if FByteFallback and (Length(Token) = 6) and
+      (Token[1] = '<') and (Token[2] = '0') and (Token[3] = 'x') and
+      (Token[6] = '>') then
     begin
-      ByteVal := StrToIntDef('$' + Copy(Token, 4, 2), -1);
-      if ByteVal >= 0 then Exit(Chr(ByteVal));
+      HiNib := HexNibble(Token[4]);
+      LoNib := HexNibble(Token[5]);
+      if (HiNib >= 0) and (LoNib >= 0) then Exit(Chr((HiNib shl 4) or LoNib));
     end;
     Result := Token;
     DecReplaceHi := High(FDecReplaceFrom);
@@ -4387,11 +4432,12 @@ end;
 function TNeuralHFTokenizer.Decode(const Ids: array of integer;
   SkipSpecialTokens: boolean = true): string;
 var
-  Cnt, TokenIndex, Stripped, IdsHi: integer;
+  Cnt, TokenIndex, Stripped, IdsHi, WPLen: integer;
   Piece: string;
 begin
   Result := '';
   IdsHi := High(Ids);
+  WPLen := Length(FWPPrefix);
   for Cnt := 0 to IdsHi do
   begin
     if IsAddedTokenId(Ids[Cnt], TokenIndex) then
@@ -4406,9 +4452,11 @@ begin
     begin
       // WordPiece decoder: join with spaces, gluing '##' continuations.
       Piece := DecodeToken(Ids[Cnt]);
+      // alloc-free equivalent of Copy(Piece,1,WPLen)=FWPPrefix
       if (FWPPrefix <> '') and
-        (Copy(Piece, 1, Length(FWPPrefix)) = FWPPrefix) then
-        Result := Result + Copy(Piece, Length(FWPPrefix) + 1, MaxInt)
+        (Length(Piece) >= WPLen) and (Piece[1] = FWPPrefix[1]) and
+        CompareMem(@Piece[1], @FWPPrefix[1], WPLen) then
+        Result := Result + Copy(Piece, WPLen + 1, MaxInt)
       else
       begin
         if Result <> '' then Result := Result + ' ';

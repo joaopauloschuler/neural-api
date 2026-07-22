@@ -1496,11 +1496,14 @@ function TNNetSequencePacker.PredictableTargetCount(WindowIdx: integer): integer
 var
   Pos: integer;
   ContextM2: integer;
+  Win: array of integer;
 begin
+  RequirePacked();
   Result := 0;
   ContextM2 := FContextLen - 2;
+  Win := FWindows[WindowIdx];
   for Pos := 0 to ContextM2 do
-    if IsTargetPredictable(WindowIdx, Pos) then Inc(Result);
+    if Win[Pos + 1] <> FPadToken then Inc(Result);
 end;
 
 function TNNetSequencePacker.Utilization(): TNeuralFloat;
@@ -1525,6 +1528,7 @@ var
   Pos, Token: integer;
   ContextM1, ContextM2, InputDepth: integer;
   IsIdInput: boolean;
+  Win: array of integer;
 begin
   RequirePacked();
   if pInput.SizeX <> FContextLen then
@@ -1538,9 +1542,10 @@ begin
   ContextM2 := FContextLen - 2;
   InputDepth := pInput.Depth;
   IsIdInput := (InputDepth = 1);
+  Win := FWindows[WindowIdx];
   for Pos := 0 to ContextM1 do
   begin
-    Token := FWindows[WindowIdx][Pos];
+    Token := Win[Pos];
     if IsIdInput
     then pInput.FData[Pos] := Token              // token ids -> embedding
     else if Token < InputDepth
@@ -1549,9 +1554,9 @@ begin
   pTarget.Fill(0);
   for Pos := 0 to ContextM2 do
   begin
-    if IsTargetPredictable(WindowIdx, Pos) then
+    if Win[Pos + 1] <> FPadToken then
     begin
-      Token := FWindows[WindowIdx][Pos + 1];
+      Token := Win[Pos + 1];
       if Token < pTarget.Depth then pTarget[Pos, 0, Token] := 1;
     end;
   end;
@@ -1562,19 +1567,25 @@ procedure TNNetSequencePacker.ApplyLossMask(WindowIdx: integer;
 var
   Pos: integer;
   ContextM1, DepthM1, DesBase, ActBase, CopyBytes: integer;
+  DesStride, ActStride: integer;
+  Win: array of integer;
 begin
   RequirePacked();
   ContextM1 := FContextLen - 1;
   DepthM1 := Desired.Depth - 1;
   CopyBytes := (DepthM1 + 1) * csNeuralFloatSize;
+  Win := FWindows[WindowIdx];
+  DesBase := 0;
+  ActBase := 0;
+  DesStride := Desired.GetRawPos(1, 0);
+  ActStride := Actual.GetRawPos(1, 0);
   for Pos := 0 to ContextM1 do
   begin
-    if not IsTargetPredictable(WindowIdx, Pos) then
-    begin
-      DesBase := Desired.GetRawPos(Pos, 0, 0);
-      ActBase := Actual.GetRawPos(Pos, 0, 0);
+    // not IsTargetPredictable: last slot (no Pos+1 target) or next token is pad
+    if (Pos >= ContextM1) or (Win[Pos + 1] = FPadToken) then
       Move(Actual.FData[ActBase], Desired.FData[DesBase], CopyBytes);
-    end;
+    Inc(DesBase, DesStride);
+    Inc(ActBase, ActStride);
   end;
 end;
 
@@ -1789,17 +1800,22 @@ procedure TNNetMaskedLMCollator.ApplyLossMask(const Labels: TNeuralIntegerArray;
 var
   P: integer;
   LabelsM1, DepthM1, DesBase, ActBase, CopyBytes: integer;
+  DesStride, ActStride: integer;
 begin
   LabelsM1 := Length(Labels) - 1;
   DepthM1 := Desired.Depth - 1;
   CopyBytes := (DepthM1 + 1) * csNeuralFloatSize;
+  DesBase := 0;
+  ActBase := 0;
+  DesStride := Desired.GetRawPos(1, 0);
+  ActStride := Actual.GetRawPos(1, 0);
   for P := 0 to LabelsM1 do
+  begin
     if Labels[P] = csMaskedLMIgnoreLabel then
-    begin
-      DesBase := Desired.GetRawPos(P, 0, 0);
-      ActBase := Actual.GetRawPos(P, 0, 0);
       Move(Actual.FData[ActBase], Desired.FData[DesBase], CopyBytes);
-    end;
+    Inc(DesBase, DesStride);
+    Inc(ActBase, ActStride);
+  end;
 end;
 
 { TNNetSpanCorruptionCollator }
@@ -4422,9 +4438,10 @@ begin
   WM1 := W - 1; HM1 := H - 1; DepM1 := Dep - 1;
   OneMinusFactor := 1.0 - Factor;
   for y := 0 to HM1 do
+  begin
+    Base := V.GetRawPos(0, y);
     for x := 0 to WM1 do
     begin
-      Base := V.GetRawPos(x, y, 0);
       gray := 0;
       for d := 0 to DepM1 do
         gray := gray + AugClampPixel(AugNeuronToPixel(V.FData[Base + d]));
@@ -4436,7 +4453,9 @@ begin
         p := Factor * p + pixelAdd;
         V.FData[Base + d] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
       end;
+      Inc(Base, Dep);
     end;
+  end;
 end;
 
 procedure AugContrast(V: TNNetVolume; Factor: TNeuralFloat);
@@ -4455,9 +4474,10 @@ procedure AugSharpness(V: TNNetVolume; Factor: TNeuralFloat);
 var
   W, H, Dep, x, y, d, ix, iy: integer;
   Src: TNNetVolume;
-  acc, wsum, p, smooth: TNeuralFloat;
+  acc, p, smooth: TNeuralFloat;
   kw, OneMinusFactor: TNeuralFloat;
-  WM1, HM1, DepM1, CtrPos: integer;
+  DepM1, CtrPos: integer;
+  RowStride, XHi, YHi, TapPos: integer;
 begin
   // Blend toward a 3x3 box-blurred image (torchvision uses a smoothing kernel;
   // a box blur is a close, dependency-free stand-in). Factor>1 sharpens.
@@ -4465,25 +4485,27 @@ begin
   if (W < 3) or (H < 3) then Exit;
   Src := TNNetVolume.Create;
   Src.Copy(V);
-  WM1 := W - 1; HM1 := H - 1; DepM1 := Dep - 1;
+  DepM1 := Dep - 1;
   OneMinusFactor := 1.0 - Factor;
+  // Interior pixels get blurred; the 1px border is left unchanged
+  // (matches torchvision which keeps the border).
+  RowStride := Src.GetRawPos(0, 1);  // element stride between rows (= SizeX*Depth)
+  XHi := W - 2; YHi := H - 2;
   for d := 0 to DepM1 do
-    for y := 0 to HM1 do
-      for x := 0 to WM1 do
+    for y := 1 to YHi do
+      for x := 1 to XHi do
       begin
-        // Interior pixels get blurred; the 1px border is left unchanged
-        // (matches torchvision which keeps the border).
-        if (x = 0) or (y = 0) or (x = W - 1) or (y = H - 1) then continue;
-        acc := 0; wsum := 0;
+        CtrPos := Src.GetRawPos(x, y, d);
+        acc := 0;
         for iy := -1 to 1 do
           for ix := -1 to 1 do
           begin
             if (ix = 0) and (iy = 0) then kw := 5 else kw := 1;
-            acc := acc + kw * AugClampPixel(AugNeuronToPixel(Src[x + ix, y + iy, d]));
-            wsum := wsum + kw;
+            TapPos := CtrPos + iy * RowStride + ix * Dep;
+            acc := acc + kw * AugClampPixel(AugNeuronToPixel(Src.FData[TapPos]));
           end;
-        smooth := acc / wsum;
-        CtrPos := Src.GetRawPos(x, y, d);
+        // wsum is always 5 + 8*1 = 13 for the fixed 3x3 kernel.
+        smooth := acc / 13.0;
         p := AugClampPixel(AugNeuronToPixel(Src.FData[CtrPos]));
         p := Factor * p + OneMinusFactor * smooth;
         V.FData[CtrPos] := AugClampNeuron(AugPixelToNeuron(AugClampPixel(p)));
@@ -4684,7 +4706,7 @@ procedure NeuralRandomErasing(V: TNNetVolume;
 var
   W, H, Dep, area, x0, y0, ew, eh, x, y, d, attempt: integer;
   targetArea, aspect, logLo, logHi: TNeuralFloat;
-  YMax, XMax, DepM1, Base, RunLen: integer;
+  YMax, XMax, DepM1, Base, RunLen, RunLenM1: integer;
 begin
   if (V = nil) or (V.Size = 0) then Exit;
   if Random >= pProb then Exit;
@@ -4707,13 +4729,14 @@ begin
       XMax := x0 + ew - 1;
       DepM1 := Dep - 1;
       RunLen := ew * Dep; // whole x-run per row is contiguous
+      RunLenM1 := RunLen - 1;
       for y := y0 to YMax do
       begin
         Base := V.GetRawPos(x0, y, 0);
         if pFill = 0 then
           FillChar(V.FData[Base], RunLen * csNeuralFloatSize, 0)
         else
-          for d := 0 to RunLen - 1 do
+          for d := 0 to RunLenM1 do
             V.FData[Base + d] := pFill;
       end;
       Exit;
