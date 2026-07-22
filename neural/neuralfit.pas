@@ -1300,7 +1300,7 @@ begin
         // Get the A Class
         I := StartPointPos;
         MaxValue := ExpectedOutput.FData[I];
-        MaxPos := 0;
+        MaxPos := StartPointPos;
         for CountD := 1 to MaxD do
         begin
           Inc(I);
@@ -3595,7 +3595,7 @@ var
   MixLambda: TNeuralFloat;
   DidBatchMix: boolean;
   CutX0, CutY0, CutBoxW, CutBoxH, CutX, CutY, CutD, CutXMax, CutYMax: integer;
-  CutBase, CutRowFloats: integer;
+  CutBase, CutRowFloats, CutRowBytes, CutRowStride: integer;
 begin
   ImgInput := TNNetVolume.Create();
   ImgInputCp := TNNetVolume.Create();
@@ -3735,10 +3735,13 @@ begin
             // X positions are Depth apart), so paste each row with one Move of
             // CutBoxW*Depth floats. Bit-exact (no float op).
             CutRowFloats := CutBoxW * (DepthM1 + 1);
+            CutRowBytes := CutRowFloats * csNeuralFloatSize;
+            CutRowStride := ImgInput.GetRawPos(0, 1);   // SizeX*Depth: one row apart
+            CutBase := ImgInput.GetRawPos(CutX0, CutY0, 0);
             for CutY := CutY0 to CutYMax do
             begin
-              CutBase := ImgInput.GetRawPos(CutX0, CutY, 0);
-              Move(PartnerInput.FData[CutBase], ImgInput.FData[CutBase], CutRowFloats * csNeuralFloatSize);
+              Move(PartnerInput.FData[CutBase], ImgInput.FData[CutBase], CutRowBytes);
+              Inc(CutBase, CutRowStride);
             end;
           end;
           // True pasted-area fraction (clamped box may shrink at borders).
