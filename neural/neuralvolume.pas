@@ -553,6 +553,10 @@ type
       // via tanh(x) = 1 - 2/(exp(2x)+1) so it inherits VectorExp's AVX2 path.
       // Matches pcr_tanhf to ~1e-6. Buffers may alias (dst = src).
       class procedure VectorTanh(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // VectorRelu writes dst[0..N-1] := max(src[0..N-1], 0). AVX2-accelerated
+      // (AVXCopyRelu) with a scalar fallback on non-AVX builds. Bit-exact vs the
+      // scalar relu-copy. Buffers may alias (dst = src).
+      class procedure VectorRelu(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
       // VectorErf writes dst[0..N-1] := erf(src[0..N-1]) using the Abramowitz &
       // Stegun 7.1.26 approximation (|err| < 1.5e-7, i.e. matches pcr_erff to
       // ~1e-6). Built on VectorExp so it inherits the AVX2 path. dst may alias src.
@@ -8600,6 +8604,29 @@ begin
     E := pDst^[I]; // E = exp(-2x) in [exp(-88), exp(88)]
     pDst^[I] := (1 - E) / (1 + E);
   end;
+end;
+
+{$IFDEF AVXANY}
+// AVXCopyRelu (dst := max(src,0)) is defined later in this section under
+// {$IFDEF AVXANY}; forward-declare it so VectorRelu can call it here.
+procedure AVXCopyRelu(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer); forward;
+{$ENDIF}
+class procedure TNNetVolume.VectorRelu(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+{$IFNDEF AVXANY}
+var
+  I: integer;
+{$ENDIF}
+begin
+  // dst[i] := max(src[i], 0). On an AVX build this is the vectorized
+  // AVXCopyRelu kernel; otherwise a plain scalar relu-copy loop. Bit-exact
+  // either way (no float arithmetic, just a compare-and-select).
+  if N <= 0 then exit;
+  {$IFDEF AVXANY}
+  AVXCopyRelu(pDst, pSrc, N);
+  {$ELSE}
+  for I := 0 to N - 1 do
+    if pSrc^[I] > 0 then pDst^[I] := pSrc^[I] else pDst^[I] := 0;
+  {$ENDIF}
 end;
 
 class procedure TNNetVolume.VectorErf(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
