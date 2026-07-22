@@ -732,7 +732,7 @@ begin
         '</s>' + #10;
     // {% if loop.last and add_generation_prompt %} -- INSIDE the loop, so
     // an empty conversation gets no generation prompt (HF parity).
-    if (Cnt = High(Messages)) and AddGenerationPrompt then
+    if (Cnt = MessagesHi) and AddGenerationPrompt then
       Result := Result + '<|assistant|>' + #10;
   end;
 end;
@@ -1857,7 +1857,8 @@ function RenderFormatWithSpans(ChatFormat: TNeuralChatFormat;
   const Messages: array of TChatMessage;
   AddGenerationPrompt: boolean; out Spans: TChatSpanArray): string;
 var
-  Cnt, FoundAt, Cursor, MessagesHi: integer;
+  Cnt, FoundAt, Cursor, MessagesHi, L: integer;
+  C: string;
 begin
   SetLength(Spans, 0);
   if (ChatFormat = cfChatML) or (ChatFormat = cfQwen) or
@@ -1879,12 +1880,14 @@ begin
   for Cnt := 0 to MessagesHi do
     if Messages[Cnt].Role = 'assistant' then
     begin
-      if Messages[Cnt].Content = '' then continue;
-      FoundAt := PosEx(Messages[Cnt].Content, Result, Cursor);
+      C := Messages[Cnt].Content;
+      if C = '' then continue;
+      L := Length(C);
+      FoundAt := PosEx(C, Result, Cursor);
       if FoundAt > 0 then
       begin
-        AddSpan(Spans, FoundAt, Length(Messages[Cnt].Content));
-        Cursor := FoundAt + Length(Messages[Cnt].Content);
+        AddSpan(Spans, FoundAt, L);
+        Cursor := FoundAt + L;
       end;
     end;
 end;
