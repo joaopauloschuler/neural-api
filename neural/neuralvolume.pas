@@ -6933,24 +6933,29 @@ var
   MaxX, MaxY: integer;
   X, Y, InputDepth, OutputDepth: integer;
   SelfBase, OrigBase: integer;
+  SelfRowStride, OrigRowStride: integer;
 begin
   Resize(Original.SizeX, Original.SizeY, Length(aChannels));
 
   MaxX := SizeX - 1;
   MaxY := SizeY - 1;
+  SelfRowStride := FSizeX * FDepth;                  // #12: per-Y self step
+  OrigRowStride := Original.FSizeX * Original.FDepth; // #12: per-Y src step
 
   for X := 0 to MaxX do
   begin
+    SelfBase := GetRawPos(X, 0);
+    OrigBase := Original.GetRawPos(X, 0);
     for Y := 0 to MaxY do
     begin
-      SelfBase := GetRawPos(X, Y);
-      OrigBase := Original.GetRawPos(X, Y);
       OutputDepth := 0;
       for InputDepth in aChannels do
       begin
         FData[SelfBase + OutputDepth] := Original.FData[OrigBase + InputDepth];
         Inc(OutputDepth);
       end;
+      Inc(SelfBase, SelfRowStride);
+      Inc(OrigBase, OrigRowStride);
     end;
   end;
 end;
@@ -7219,6 +7224,7 @@ var
   OrigPosX, OrigPosY: integer;
   MoveSizeBytes: integer;
   RawPostDest, RawPosSource: integer;
+  DestRowStride, SrcRowStride, SrcColBase: integer;
 begin
   if (NewSizeX=Original.SizeX) and (NewSizeY=Original.SizeY) then
   begin
@@ -7237,16 +7243,20 @@ begin
     OrigMaxX := Original.SizeX - 1;
     OrigMaxY := Original.SizeY - 1;
     MoveSizeBytes := Depth * SizeOf(T);
+    DestRowStride := FSizeX * FDepth;                  // #12: per-CntY dest step
+    SrcRowStride := Original.FSizeX * Original.FDepth;  // #5: invariant per call
 
     for CntX := 0 to MaxX do
     begin
       OrigPosX := Min(OrigMaxX, Round(CntX * InvRatioX));
+      SrcColBase := OrigPosX * Original.FDepth; // #11: invariant across CntY
+      RawPostDest := GetRawPos(CntX, 0);        // #12: carried across CntY
       for CntY := 0 to MaxY do
       begin
         OrigPosY := Min(OrigMaxY, Round(CntY * InvRatioY));
-        RawPostDest := GetRawPos(CntX, CntY);
-        RawPosSource := Original.GetRawPos(OrigPosX, OrigPosY);
+        RawPosSource := SrcRowStride * OrigPosY + SrcColBase;
         Move(Original.FData[RawPosSource], FData[RawPostDest], MoveSizeBytes);
+        Inc(RawPostDest, DestRowStride);
       end;
     end;
   end;
@@ -7921,6 +7931,7 @@ var
   iFrom, iTo: integer;
   iRawPos1, iRawPos2: integer;
   iBase1, iBase2: integer;
+  RowStride: integer;
   MaxY, MaxD: integer;
   CountX, CountY, CountD: integer;
   Aux: TNeuralFloat;
@@ -7930,13 +7941,14 @@ begin
 
   iTo := (FSizeX shr 1) - 1;
   iFrom := 0;
+  RowStride := FSizeX * FDepth;
 
   for CountX := iFrom to iTo do
   begin
+    iBase1 := GetRawPos(CountX, 0);
+    iBase2 := GetRawPos(FSizeX-CountX-1, 0);
     for CountY := 0 to MaxY do
     begin
-      iBase1 := GetRawPos(CountX, CountY);
-      iBase2 := GetRawPos(FSizeX-CountX-1, CountY);
       for CountD := 0 to MaxD do
       begin
         iRawPos1 := iBase1 + CountD;
@@ -7945,6 +7957,8 @@ begin
         FData[iRawPos1] := FData[iRawPos2];
         FData[iRawPos2] := Aux;
       end;
+      Inc(iBase1, RowStride);
+      Inc(iBase2, RowStride);
     end;
   end;
 end;
@@ -7954,6 +7968,7 @@ var
   iFrom, iTo: integer;
   iRawPos1, iRawPos2: integer;
   iBase1, iBase2: integer;
+  RowStride: integer;
   MaxX, MaxD: integer;
   CountX, CountY, CountD: integer;
   Aux: TNeuralFloat;
@@ -7963,13 +7978,14 @@ begin
 
   iTo := (FSizeY shr 1) - 1;
   iFrom := 0;
+  RowStride := FSizeX * FDepth;
 
   for CountX := 0 to MaxX do
   begin
+    iBase1 := GetRawPos(CountX, iFrom);
+    iBase2 := GetRawPos(CountX, FSizeY-iFrom-1);
     for CountY := iFrom to iTo do
     begin
-      iBase1 := GetRawPos(CountX, CountY);
-      iBase2 := GetRawPos(CountX, FSizeY-CountY-1);
       for CountD := 0 to MaxD do
       begin
         iRawPos1 := iBase1 + CountD;
@@ -7978,6 +7994,8 @@ begin
         FData[iRawPos1] := FData[iRawPos2];
         FData[iRawPos2] := Aux;
       end;
+      Inc(iBase1, RowStride);
+      Dec(iBase2, RowStride);
     end;
   end;
 end;
@@ -8863,31 +8881,35 @@ end;
 
 procedure TVolume.OneHotEncoding(aTokens: array of integer);
 var
-  CntToken, MaxToken, Token, SizeXM1, MaxTokenP1: integer;
+  CntToken, MaxToken, Token, SizeXM1, MaxTokenP1, rowBase: integer;
 begin
   MaxToken := Length(aTokens) - 1;
   SizeXM1 := SizeX - 1;
   Self.Fill(0);
   if MaxToken < SizeX then
   begin
+    rowBase := 0; // #12: GetRawPos(CntToken,0), steps FDepth per token
     for CntToken := 0 to MaxToken do
     begin
       Token := aTokens[CntToken];
       if Token < FDepth then
       begin
-        Self[CntToken, 0, Token] := 1;
+        FData[rowBase + Token] := 1;
       end
       else
       begin
         WriteLn('Token '+IntToStr(Token)+' is bigger than Depth '+IntToStr(FDepth)+' at OneHotEncoding.');
       end;
+      Inc(rowBase, FDepth);
     end;
     if MaxToken < SizeX - 1 then
     begin
       MaxTokenP1 := MaxToken + 1;
+      // rowBase now equals MaxTokenP1*FDepth = GetRawPos(MaxTokenP1,0)
       for CntToken := MaxTokenP1 to SizeXM1 do
       begin
-        Self[CntToken, 0, 0] := 1;
+        FData[rowBase] := 1;
+        Inc(rowBase, FDepth);
       end;
     end;
   end
@@ -9149,23 +9171,25 @@ end;
 
 procedure TVolume.OneHotEncodingReversed(var aTokens: array of integer);
 var
-  CntToken, MaxToken, Token: integer;
+  CntToken, MaxToken, Token, rowBase: integer;
 begin
   MaxToken := Length(aTokens) - 1;
   Self.Fill(0);
   if MaxToken < SizeX then
   begin
+    rowBase := MaxToken * FDepth; // #12: GetRawPos(MaxToken-CntToken,0), Dec per token
     for CntToken := 0 to MaxToken do
     begin
       Token := aTokens[CntToken];
       if Token < FDepth then
       begin
-        Self[MaxToken-CntToken, 0, Token] := 1;
+        FData[rowBase + Token] := 1;
       end
       else
       begin
         WriteLn('Token '+IntToStr(Token)+' is bigger than Depth '+IntToStr(FDepth)+' at OneHotEncodingReversed.');
       end;
+      Dec(rowBase, FDepth);
     end;
   end
   else
@@ -11195,18 +11219,22 @@ procedure TNNetVolume.AddArea(DestX, DestY, OriginX, OriginY, LenX,
 var
   CntY: integer;
   SizeXDepth: integer;
-  PtrA, PtrB: Pointer;
   MaxLenY: integer;
+  PosA, PosB, StrideA, StrideB: integer;
 begin
   if Self.Depth = Original.Depth then
   begin
     SizeXDepth := LenX * Self.Depth;
     MaxLenY := LenY - 1;
+    PosA := Self.GetRawPos(DestX, DestY);
+    PosB := Original.GetRawPos(OriginX, OriginY);
+    StrideA := FSizeX * FDepth;
+    StrideB := Original.FSizeX * Original.FDepth;
     for CntY := 0 to MaxLenY do
     begin
-      PtrA := Self.GetRawPtr(DestX, DestY+CntY);
-      PtrB := Original.GetRawPtr(OriginX, OriginY+CntY);
-      Add(PtrA, PtrB, SizeXDepth);
+      Add(Self.GetRawPtr(PosA), Original.GetRawPtr(PosB), SizeXDepth);
+      Inc(PosA, StrideA);
+      Inc(PosB, StrideB);
     end;
   end
   {$IFDEF Debug}
@@ -11452,7 +11480,7 @@ var
   MaxX, MaxD, CntX, CntY, CntD: integer;
   LocalDiff: TNeuralFloat;
   OrigA: TNeuralFloat;
-  SrcBPos, Dst1Pos, Dst2Pos: integer;
+  SrcB0, SrcBPos, Dst1Pos, Dst2Pos: integer;
   StrideXOrig, StrideXSelf, StrideYSelf: integer;
 begin
   if Original.Size > 0 then
@@ -11465,6 +11493,7 @@ begin
     StrideYSelf := FSizeX * FDepth;      // Self Y-slot step per CntY
     for CntD := 0 to MaxD do
     begin
+      SrcB0 := Original.GetRawPos(0, 0, CntD); // #11: no CntX in args
       for CntX := 0 to MaxX do
       begin
         // Self was resized to (Original.SizeX, Original.SizeX, Original.Depth),
@@ -11472,7 +11501,7 @@ begin
         // is the same flat offset in both, so compute it once.
         Dst1Pos := GetRawPos(CntX, 0, CntD);
         OrigA := Original.FData[Dst1Pos];
-        SrcBPos := Original.GetRawPos(0, 0, CntD);
+        SrcBPos := SrcB0;
         Dst2Pos := GetRawPos(0, CntX, CntD);
         for CntY := 0 to CntX do
         begin
