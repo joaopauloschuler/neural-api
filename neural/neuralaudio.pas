@@ -215,9 +215,9 @@ var
   BlockAlign: word;
   HaveFmt: boolean;
   DataBytes, FrameCnt, NumFrames, ChCnt: integer;
-  NumFramesM1, NumChannelsM1: integer;
+  NumFramesM1, NumChannelsM1, fBase: integer;
   Raw: array of smallint;
-  Acc: double;
+  Acc, InvScale: double;
 
   procedure ReadExact(var Buf; Count: integer);
   begin
@@ -286,12 +286,16 @@ begin
         Samples.ReSize(NumFrames, 1, 1);
         NumFramesM1 := NumFrames - 1;
         NumChannelsM1 := NumChannels - 1;
+        // Invariant per-frame base (#11) and the two constant divides folded
+        // into one reciprocal multiply (#5).
+        InvScale := 1.0 / (NumChannels * 32768.0);
         for FrameCnt := 0 to NumFramesM1 do
         begin
+          fBase := FrameCnt * NumChannels;
           Acc := 0;
           for ChCnt := 0 to NumChannelsM1 do
-            Acc := Acc + Raw[FrameCnt * NumChannels + ChCnt];
-          Samples.FData[FrameCnt] := (Acc / NumChannels) / 32768.0;
+            Acc := Acc + Raw[fBase + ChCnt];
+          Samples.FData[FrameCnt] := Acc * InvScale;
         end;
         Result := SampleRate;
         exit;
@@ -309,7 +313,7 @@ end;
 function ResampleVolume(Wave: TNNetVolume; SourceRate, TargetRate: integer): TNNetVolume;
 var
   NIn, NOut, OutCnt, J, JLo, JHi: integer;
-  NOutM1: integer;
+  NOutM1, NInM1: integer;
   Ratio, Cutoff, SrcPos, Center, X, Acc, WSum, W, PiX, PiXA: double;
   AOverRatio: double;
 
@@ -360,6 +364,7 @@ begin
     Cutoff := 0.5 * Ratio;
 
   NOutM1 := NOut - 1;
+  NInM1 := NIn - 1;   // last valid input index, invariant across the tap loop (#5)
   // Downsampling kernel half-width 1/Ratio is call-invariant (rule #5).
   AOverRatio := csResampleLanczosA / Ratio;
   for OutCnt := 0 to NOutM1 do
@@ -382,7 +387,7 @@ begin
     WSum := 0.0;
     for J := JLo to JHi do
     begin
-      if (J < 0) or (J > NIn - 1) then continue;
+      if (J < 0) or (J > NInM1) then continue;
       X := Center - J;
       W := LanczosKernel(X);
       if W = 0.0 then continue;
@@ -533,9 +538,9 @@ var
   FrameBuf: array of double;      // one windowed frame (built once per frame)
   SampleCnt, FrameCnt, BinCnt, MelCnt, TapCnt, FrameStart, SrcIdx: integer;
   MelMin, MelMax, FFTFreq, DownSlope, UpSlope, Tri: double;
-  ReAcc, ImAcc, Acc, MaxLog, V: double;
+  ReAcc, ImAcc, Acc, MaxLog, V, MaxLogM8: double;
   logFloor, invLn10: double;
-  twBase, rowBase: integer;
+  twBase, rowBase, twIdx, idx, nCopy, nCopyM1: integer;
   AllZero: boolean;
 
   // np.pad reflect indexing for the center pad (mirror WITHOUT the edge
@@ -563,12 +568,18 @@ begin
   NumFramesM1 := NumFrames - 1;
 
   // ---- pad / truncate to the fixed 30 s context ----
+  // Hoist the Samples.Size getter out of the per-sample loop (#5/#13): copy the
+  // first nCopy samples, then zero the tail. (Element-wise copy, not Move: Wave
+  // is double while Samples.FData is single, so the widening conversion is
+  // required and a byte-wise Move would be incorrect.)
   SetLength(Wave, NumSamples);
-  for SampleCnt := 0 to NumSamplesM1 do
-    if SampleCnt < Samples.Size then
-      Wave[SampleCnt] := Samples.FData[SampleCnt]
-    else
-      Wave[SampleCnt] := 0.0;
+  nCopy := Samples.Size;
+  if nCopy > NumSamples then nCopy := NumSamples;
+  nCopyM1 := nCopy - 1;
+  for SampleCnt := 0 to nCopyM1 do
+    Wave[SampleCnt] := Samples.FData[SampleCnt];
+  for SampleCnt := nCopy to NumSamplesM1 do
+    Wave[SampleCnt] := 0.0;
 
   // ---- periodic hann window (transformers window_function default) ----
   SetLength(Window, csWhisperNFFT);
@@ -663,8 +674,9 @@ begin
         for TapCnt := 0 to NFFTM1 do
         begin
           V := FrameBuf[TapCnt];
-          ReAcc := ReAcc + V * CosTab[twBase + TapCnt];
-          ImAcc := ImAcc + V * SinTab[twBase + TapCnt];
+          twIdx := twBase + TapCnt;   // one index for both twiddle tables (#4)
+          ReAcc := ReAcc + V * CosTab[twIdx];
+          ImAcc := ImAcc + V * SinTab[twIdx];
         end;
         Power[BinCnt] := ReAcc * ReAcc + ImAcc * ImAcc;
       end;
@@ -687,14 +699,16 @@ begin
 
   // ---- global max-8 clamp + (x + 4) / 4 ----
   Mel.ReSize(NumFrames, 1, NumMelBins);
+  MaxLogM8 := MaxLog - 8.0;   // clamp floor, invariant across the whole nest (#5)
   for FrameCnt := 0 to NumFramesM1 do
   begin
     rowBase := FrameCnt * NumMelBins;
     for MelCnt := 0 to NumMelBinsM1 do
     begin
-      V := LogMel[rowBase + MelCnt];
-      if V < MaxLog - 8.0 then V := MaxLog - 8.0;
-      Mel.FData[rowBase + MelCnt] := (V + 4.0) * 0.25;
+      idx := rowBase + MelCnt;   // one index for LogMel read + Mel write (#4)
+      V := LogMel[idx];
+      if V < MaxLogM8 then V := MaxLogM8;
+      Mel.FData[idx] := (V + 4.0) * 0.25;
     end;
   end;
 end;
@@ -842,7 +856,7 @@ var
   RawChroma: array of double;     // (NumFrames x NumChroma)
   FrameStart, FrameCnt, TapCnt, BinCnt, ChCnt, SrcIdx, ArgMax: integer;
   rowBase, fBase: integer;
-  Acc, MaxVal, V: double;
+  Acc, MaxVal, V, WinNormInv: double;
 
   // reflect pad indexing (np pad mode 'reflect' = torch center pad): mirror
   // WITHOUT repeating the edge sample. Single bounce suffices (PadLeft < len).
@@ -945,6 +959,7 @@ begin
   end;
   WinNorm := Sqrt(WinNorm);
   if WinNorm <= 0.0 then WinNorm := 1.0;
+  WinNormInv := 1.0 / WinNorm;   // fold the two per-bin divides into a multiply (#5)
 
   Filt := TNNetVolume.Create;
   SetLength(Re, NFFT);
@@ -974,8 +989,8 @@ begin
       // one-sided power spectrum, normalized by the window L2 energy
       for BinCnt := 0 to NumBinsM1 do
       begin
-        V := (Re[BinCnt] / WinNorm);
-        Acc := (Im[BinCnt] / WinNorm);
+        V := Re[BinCnt] * WinNormInv;
+        Acc := Im[BinCnt] * WinNormInv;
         Power[BinCnt] := V * V + Acc * Acc;
       end;
       // raw_chroma[c] = sum_b Filt[c][b] * Power[b]
@@ -1024,7 +1039,8 @@ var
   NumFrames, NumBins, OutLen: integer;
   NFFTM1, NumBinsM1, OutLenM1, NumFramesM1: integer;
   FrameCnt, BinCnt, TapCnt, OutIdx, FrameStart: integer;
-  frameBase, twPos: integer;
+  frameBase, twPos, reIdx: integer;
+  invNFFT: double;
   Window: array of double;        // periodic hann (matches forward analysis)
   Win2: array of double;          // window^2 (COLA envelope contribution)
   BinScale: array of double;      // per-bin self-conjugate weight (1 or 2)
@@ -1042,6 +1058,7 @@ begin
   NumBins := NFFT div 2 + 1;
   NFFTM1 := NFFT - 1;
   NumBinsM1 := NumBins - 1;
+  invNFFT := 1.0 / NFFT;   // per-sample 1/NFFT scale, invariant over the nest (#5)
   if (Re.Depth <> NumBins) or (Im.Depth <> NumBins) then
     raise Exception.Create('ISTFTOverlapAdd: Re/Im Depth must be NFFT div 2 + 1.');
   NumFrames := Re.SizeX;
@@ -1108,14 +1125,15 @@ begin
       twPos := TapCnt;                     // carries BinCnt*NFFT + TapCnt (rule #6)
       for BinCnt := 0 to NumBinsM1 do
       begin
-        ReVal := Re.FData[frameBase + BinCnt];
-        ImVal := Im.FData[frameBase + BinCnt];
+        reIdx := frameBase + BinCnt;   // one index for Re and Im (#4)
+        ReVal := Re.FData[reIdx];
+        ImVal := Im.FData[reIdx];
         // bins 0 and NFFT/2 are self-conjugate -> weight 1, the rest weight 2.
         Sample := Sample + BinScale[BinCnt] *
           (ReVal * CosTab[twPos] + ImVal * SinTab[twPos]);
         Inc(twPos, NFFT);
       end;
-      Sample := Sample / NFFT;
+      Sample := Sample * invNFFT;
       WinTap := Window[TapCnt];
       OutIdx := FrameStart + TapCnt;
       AccSig[OutIdx] := AccSig[OutIdx] + Sample * WinTap;

@@ -519,6 +519,7 @@ var
   PossibleStates: array of single;
   Hi: longint;
   MaxIdx: longint;
+  NGP: ^TNeuronGroup;   // bind FNN[I] once per iteration (rule #4)
 begin
   PCurrentStates[0] := 0;
   PNextStates[0] := 0;
@@ -535,16 +536,17 @@ begin
   MaxIdx := FMaxOperationNeuronCount - 1;
   for I := 0 to MaxIdx do
   begin
-    Probability := FNN[I].GetF();
+    NGP := @FNN[I];
+    Probability := NGP^.GetF();
     PredictionPosition := 0;
-    if (FNN[I].Filled) and
+    if (NGP^.Filled) and
       (Probability > 0.1) and
-      (FNN[I].CorrectNeuronPredictionCnt > 10) then
+      (NGP^.CorrectNeuronPredictionCnt > 10) then
     begin
-      if ( ABF.TestTests(FNN[I].TestNeuronLayer) > 0) then
+      if ( ABF.TestTests(NGP^.TestNeuronLayer) > 0) then
       begin
         ABF.OperateAndTestOperation(
-          FNN[I].OperationNeuronLayer, PredictionPosition, NextState);
+          NGP^.OperationNeuronLayer, PredictionPosition, NextState);
         PossibleStates[NextState] := (Probability - FRandomProbability) + PossibleStates[NextState];
       end;// of if
     end;
@@ -959,7 +961,7 @@ procedure TStatePredictionClass.RemoveAllNeurons;
 var
   neuronPos: longint;
 begin
-  for neuronPos := 0 to FMaxOperationNeuronCount do
+  for neuronPos := 0 to FMaxOperationNeuronCount - 1 do
     RemoveNeuronsAtPos(neuronPos);
 end;
 
@@ -1037,18 +1039,20 @@ end;
 function TStatePredictionClass.ProbToWin(neuronPos: longint): extended;
 var
   TotalCount, ResultingProbability: extended;
+  NGP: ^TNeuronGroup;   // bind FNN[neuronPos] once (rule #4)
 begin
   ResultingProbability := 0;
-  TotalCount := FNN[neuronPos].WrongPredictionAtWin +
-    FNN[neuronPos].CorrectPredictionAtWin;
+  NGP := @FNN[neuronPos];
+  TotalCount := NGP^.WrongPredictionAtWin +
+    NGP^.CorrectPredictionAtWin;
   if (TotalCount > 0) then
-    ResultingProbability := FNN[neuronPos].CorrectPredictionAtWin / TotalCount
+    ResultingProbability := NGP^.CorrectPredictionAtWin / TotalCount
   else
   begin
-    TotalCount := FNN[neuronPos].WrongNeuronPredictionCnt +
-      FNN[neuronPos].CorrectNeuronPredictionCnt;
+    TotalCount := NGP^.WrongNeuronPredictionCnt +
+      NGP^.CorrectNeuronPredictionCnt;
     if TotalCount > 0 then
-      ResultingProbability := (FNN[neuronPos].CorrectNeuronPredictionCnt /
+      ResultingProbability := (NGP^.CorrectNeuronPredictionCnt /
         TotalCount) / 100;
   end;
   ProbToWin := ResultingProbability;
@@ -1456,6 +1460,7 @@ var
   I: word;
   IVict: integer;
   Hi: longint;
+  NGP: ^TNeuronGroup;   // bind FNN[IVict] once (rule #4)
 begin
   Inc(FCycle);
   Hi := High(pFoundStates);
@@ -1464,16 +1469,17 @@ begin
     IVict := pVictoryIndex[I];
     if (IVict <> -1) then
     begin
+      NGP := @FNN[IVict];
       if (pFoundStates[I] = pPredictedStates[I]) then
       begin
-        Inc(FNN[IVict].Vitories);
-        Inc(FNN[IVict].CorrectPredictionAtWin);
-        FNN[IVict].LastVictory := FCycle;
+        Inc(NGP^.Vitories);
+        Inc(NGP^.CorrectPredictionAtWin);
+        NGP^.LastVictory := FCycle;
       end
       else
       begin
-        Dec(FNN[IVict].Vitories);
-        Inc(FNN[IVict].WrongPredictionAtWin);
+        Dec(NGP^.Vitories);
+        Inc(NGP^.WrongPredictionAtWin);
       end;
     end;
   end;

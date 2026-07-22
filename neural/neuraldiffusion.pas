@@ -703,9 +703,9 @@ begin
           if TtPrev = 0 then
           begin
             // Final hop: emit the denoised x0 directly.
-            for i := 0 to XtSizeM1 do
-              Xt.FData[i] :=
-                (Xt.FData[i] - somabT * Eps.FData[i]) * invSqrtAbT;
+            // (Xt - somabT*Eps)*invSqrtAbT as a uniform affine map (#13).
+            Xt.Mul(invSqrtAbT);
+            Xt.MulAdd(-somabT * invSqrtAbT, Eps);
             Exit;
           end;
           abPrev := FAlphaBar[TtPrev];
@@ -747,8 +747,9 @@ begin
           somabT := FSqrtOneMinusAlphaBar[Tt];
           invSqrtAbT := 1.0 / Sqrt(abT);
           // Convert current eps -> x0 prediction; reuse Eps to hold curX0.
-          for i := 0 to XtSizeM1 do
-            Eps.FData[i] := (Xt.FData[i] - somabT * Eps.FData[i]) * invSqrtAbT;
+          // (Xt - somabT*Eps)*invSqrtAbT as a uniform affine map (#13).
+          Eps.Mul(-somabT * invSqrtAbT);
+          Eps.MulAdd(invSqrtAbT, Xt);
           lamT := Lambda(Tt);
           if TtPrev = 0 then
           begin
@@ -760,8 +761,10 @@ begin
               if Abs(h) < 1e-12 then r0 := 1.0 else r0 := hLast / h;
               cA := 1.0 + 0.5 / r0;
               cB := 0.5 / r0;
-              for i := 0 to XtSizeM1 do
-                Xt.FData[i] := cA * Eps.FData[i] - cB * FPrevX0.FData[i];
+              // cA*Eps - cB*FPrevX0 as a uniform affine map (#13).
+              Xt.Copy(Eps);
+              Xt.Mul(cA);
+              Xt.MulAdd(-cB, FPrevX0);
             end
             else
               Xt.Copy(Eps);
@@ -779,8 +782,9 @@ begin
           if not FHasPrev then
           begin
             // First-order (DDIM-equivalent) bootstrap.
-            for i := 0 to XtSizeM1 do
-              Xt.FData[i] := kX * Xt.FData[i] - kD * Eps.FData[i];
+            // kX*Xt - kD*Eps as a uniform affine map (#13).
+            Xt.Mul(kX);
+            Xt.MulAdd(-kD, Eps);
           end
           else
           begin
@@ -788,12 +792,10 @@ begin
             if Abs(h) < 1e-12 then r0 := 1.0 else r0 := hLast / h;
             cA := 1.0 + 0.5 / r0;
             cB := 0.5 / r0;
-            for i := 0 to XtSizeM1 do
-            begin
-              curX0 := Eps.FData[i];
-              dCoef := cA * curX0 - cB * FPrevX0.FData[i];
-              Xt.FData[i] := kX * Xt.FData[i] - kD * dCoef;
-            end;
+            // Xt := kX*Xt - kD*(cA*Eps - cB*FPrevX0) as a uniform affine map (#13).
+            Xt.Mul(kX);
+            Xt.MulAdd(-kD * cA, Eps);
+            Xt.MulAdd(kD * cB, FPrevX0);
           end;
           // Store this step's x0 and lambda for the next multistep correction.
           if not Assigned(FPrevX0) then FPrevX0 := TNNetVolume.Create(Xt);
@@ -814,8 +816,9 @@ begin
           abT := FAlphaBar[Tt];
           somabT := FSqrtOneMinusAlphaBar[Tt];
           invSqrtAbT := 1.0 / Sqrt(abT);
-          for i := 0 to XtSizeM1 do
-            Eps.FData[i] := (Xt.FData[i] - somabT * Eps.FData[i]) * invSqrtAbT;
+          // (Xt - somabT*Eps)*invSqrtAbT as a uniform affine map (#13).
+          Eps.Mul(-somabT * invSqrtAbT);
+          Eps.MulAdd(invSqrtAbT, Xt);
           lamT := Lambda(Tt);
 
           // 2. CORRECTOR: uses the PREVIOUS step's stored output (m0 = the
@@ -949,9 +952,10 @@ begin
             else
             begin
               // First-order predictor (no correction term).
-              for i := 0 to XtSizeM1 do
-                Xt.FData[i] := sigRatio * FUniPrevSample.FData[i]
-                  - kM0 * Eps.FData[i];
+              // sigRatio*FUniPrevSample - kM0*Eps as a uniform affine map (#13).
+              Xt.Copy(FUniPrevSample);
+              Xt.Mul(sigRatio);
+              Xt.MulAdd(-kM0, Eps);
             end;
           end;
 
@@ -968,7 +972,8 @@ var
   NumStepsM1: integer;
   Pred, X0, Y, Ye, X0b, XPred: TNNetVolume;
   Schedule: TNeuralIntegerArray;
-  sigma, sigmaNext, sqrtAbT, sqrtAbPrev, d, d2: TNeuralFloat;
+  sigma, sigmaNext, sqrtAbT, sqrtAbPrev: TNeuralFloat;
+  kEuler, cCorr1, cCorr2: TNeuralFloat;
   invSqrtAbT, invSigma, invSigmaNext, dSig, halfDSig: TNeuralFloat;
 begin
   // Deterministic Heun 2nd-order sampler in the VE sigma parameterisation:
@@ -1008,12 +1013,15 @@ begin
       Denoise(X, Pred, Tt);
       PredictX0(X, Pred, X0, Tt);
       // VE sample and Euler predictor y_e.
-      for i := 0 to SizeM1 do
-      begin
-        Y.FData[i] := X.FData[i] * invSqrtAbT;
-        d := (Y.FData[i] - X0.FData[i]) * invSigma;
-        Ye.FData[i] := Y.FData[i] + d * dSig;
-      end;
+      //   y  = x_t * invSqrtAbT
+      //   ye = y + (dSig*invSigma)*(y - x0) = (1+k)*y - k*x0,  k = dSig*invSigma.
+      // Uniform affine maps (#13).
+      kEuler := dSig * invSigma;
+      Y.Copy(X);
+      Y.Mul(invSqrtAbT);
+      Ye.Copy(Y);
+      Ye.Mul(1.0 + kEuler);
+      Ye.MulAdd(-kEuler, X0);
       if TtPrev = 0 then
       begin
         // Final step: sqrt(ab_prev) = 1, y_e is already the clean image.
@@ -1029,13 +1037,18 @@ begin
         XPred.Mul(sqrtAbPrev);
         Denoise(XPred, Pred, TtPrev);
         PredictX0(XPred, Pred, X0b, TtPrev);
-        for i := 0 to SizeM1 do
-        begin
-          d  := (Y.FData[i]  - X0.FData[i])  * invSigma;
-          d2 := (Ye.FData[i] - X0b.FData[i]) * invSigmaNext;
-          X.FData[i] := sqrtAbPrev *
-            (Y.FData[i] + halfDSig * (d + d2));
-        end;
+        // x = sqrtAbPrev*(Y + halfDSig*(d + d2)), with
+        //   d  = (Y - X0)*invSigma, d2 = (Ye - X0b)*invSigmaNext.
+        // Expands to a uniform affine combination of Y, X0, Ye, X0b (#13):
+        //   x = (sqrtAbPrev + c1)*Y - c1*X0 + c2*Ye - c2*X0b,
+        //   c1 = sqrtAbPrev*halfDSig*invSigma, c2 = sqrtAbPrev*halfDSig*invSigmaNext.
+        cCorr1 := sqrtAbPrev * halfDSig * invSigma;
+        cCorr2 := sqrtAbPrev * halfDSig * invSigmaNext;
+        X.Copy(Y);
+        X.Mul(sqrtAbPrev + cCorr1);
+        X.MulAdd(-cCorr1, X0);
+        X.MulAdd(cCorr2, Ye);
+        X.MulAdd(-cCorr2, X0b);
       end;
     end;
   finally
