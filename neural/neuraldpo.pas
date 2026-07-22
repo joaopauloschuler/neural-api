@@ -639,14 +639,16 @@ function TNeuralDPOTrainer.SequenceLogProb(NN: TNNet;
 var
   T, CompletionHi: integer;
   P: TNeuralFloat;
+  Last: TNNetLayer;
 begin
   Result := 0;
   CompletionHi := High(Completion);
+  Last := NN.GetLastLayer(); // #8: fixed network structure across the loop
   for T := 0 to CompletionHi do
   begin
     EncodePrefix(NN, Prompt, Completion, T);
     NN.Compute(FInput);
-    P := NN.GetLastLayer().Output.FData[Completion[T]];
+    P := Last.Output.FData[Completion[T]];
     Result := Result + pcr_logf(Max(P, FProbFloor));  // #16: fast log
   end;
 end;
@@ -775,14 +777,16 @@ var
   T, Target, CompletionHi: integer;
   Y: TNNetVolume;
   PTarget: TNeuralFloat;
+  Last: TNNetLayer;
 begin
   CompletionHi := High(Completion);
+  Last := FPolicy.GetLastLayer(); // #8: fixed network structure across the loop
   for T := 0 to CompletionHi do
   begin
     Target := Completion[T];
     EncodePrefix(FPolicy, Prompt, Completion, T);
     FPolicy.Compute(FInput);
-    Y := FPolicy.GetLastLayer().Output;
+    Y := Last.Output;
     if FPseudoTarget.Size <> Y.Size then FPseudoTarget.ReSize(Y);
     // TNNet.Backpropagate(pDesired) sets the output error e = Y - pDesired,
     // so pDesired = Y - e for the error signal e we want (see unit header).
@@ -1048,14 +1052,16 @@ function TNeuralGRPOTrainer.SequenceLogProb(NN: TNNet;
 var
   T, CompletionHi: integer;
   P: TNeuralFloat;
+  Last: TNNetLayer;
 begin
   Result := 0;
   CompletionHi := High(Completion);
+  Last := NN.GetLastLayer(); // #8: fixed network structure across the loop
   for T := 0 to CompletionHi do
   begin
     EncodePrefix(NN, Prompt, Completion, T);
     NN.Compute(FInput);
-    P := NN.GetLastLayer().Output.FData[Completion[T]];
+    P := Last.Output.FData[Completion[T]];
     Result := Result + pcr_logf(Max(P, FProbFloor));  // #16: fast log
   end;
 end;
@@ -1067,10 +1073,12 @@ var
   T, I, Vocab, Picked, FMaxNewTokensM1, VocabM1: integer;
   Y: TNNetVolume;
   R, Acc, Sum, MaxLogit, P, InvTemp: TNeuralFloat;
+  Last: TNNetLayer;
 begin
   SetLength(Completion, FMaxNewTokens);
   SampledLen := FMaxNewTokens;
-  Vocab := FPolicy.GetLastLayer().Output.Size;
+  Last := FPolicy.GetLastLayer(); // #8: fixed network structure across the loop
+  Vocab := Last.Output.Size;
   VocabM1 := Vocab - 1;
   if Length(FProbs) <> Vocab then SetLength(FProbs, Vocab);  // #17: allocate once
   if FTemperature > 0 then InvTemp := 1.0 / FTemperature else InvTemp := 1.0;
@@ -1079,7 +1087,7 @@ begin
   begin
     EncodePrefix(FPolicy, Prompt, Completion, T);
     FPolicy.Compute(FInput);
-    Y := FPolicy.GetLastLayer().Output;
+    Y := Last.Output;
     // Re-shape the softmax probabilities by temperature: p_i^(1/Tau), renorm.
     // (The last layer already outputs probabilities, so apply temperature in
     // log space: logit' = ln(p)/Tau.)
@@ -1188,6 +1196,7 @@ var
   Y: TNNetVolume;
   TotalKL, TotalObj: TNeuralFloat;
   TokenCount: integer;
+  LastPol, LastRef: TNNetLayer;
 begin
   if not Assigned(FReward) then
     raise Exception.Create('TNeuralGRPOTrainer: Reward callback not assigned.');
@@ -1219,6 +1228,8 @@ begin
   FPolicy.SetBatchUpdate(true);
   FPolicy.ClearDeltas();
   TotalKL := 0; TotalObj := 0; TokenCount := 0;
+  LastPol := FPolicy.GetLastLayer();    // #8: fixed network structure across the loop
+  LastRef := FReference.GetLastLayer(); // #8: fixed network structure across the loop
   for G := 0 to FGroupSizeM1 do
   begin
     A := Advantages[G];
@@ -1235,13 +1246,13 @@ begin
       // forward; also robust if reference and policy alias the same net).
       EncodePrefix(FReference, Prompt, Comp, T);
       FReference.Compute(FInput);
-      PRef := Max(FReference.GetLastLayer().Output.FData[Tok],
+      PRef := Max(LastRef.Output.FData[Tok],
                   FProbFloor);
       LogRef := pcr_logf(PRef);  // #16: fast log
       // Current policy log-prob of the sampled token (forward pass).
       EncodePrefix(FPolicy, Prompt, Comp, T);
       FPolicy.Compute(FInput);
-      Y := FPolicy.GetLastLayer().Output;
+      Y := LastPol.Output;
       P := Max(Y.FData[Tok], FProbFloor);
       LogPi := pcr_logf(P);  // #16: fast log
 

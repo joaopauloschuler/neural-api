@@ -764,7 +764,7 @@ begin
   // NFFT-1 bins of linspace(0,sr,NFFT,endpoint=False)[1:]); the final result is
   // sliced to the first NFFT div 2 + 1 one-sided bins.
   NumBins := NFFT;                 // freq_bins length after the 0-Hz prepend
-  NumKept := NFFT div 2 + 1;       // one-sided bins kept
+  NumKept := (NFFT shr 1) + 1;     // one-sided bins kept (#15: div 2 -> shr 1)
   NumChromaM1 := NumChroma - 1;
   NumBinsM1 := NumBins - 1;
   NumKeptM1 := NumKept - 1;
@@ -945,12 +945,12 @@ begin
   if NumSamplesIn < 1 then
     raise Exception.Create('ComputeMusicgenMelodyChroma: empty waveform.');
   NFFTM1 := NFFT - 1;
-  NumBins := NFFT div 2 + 1;
+  NumBins := (NFFT shr 1) + 1; // #15: div 2 -> shr 1
   NumBinsM1 := NumBins - 1;
   NumChromaM1 := NumChroma - 1;
   // center=True: torch reflect-pads NFFT div 2 on each side, then frames hop by
   // Hop. Frame count = 1 + NumSamplesIn div Hop.
-  PadLeft := NFFT div 2;
+  PadLeft := NFFT shr 1; // #15: div 2 -> shr 1
   NumFrames := 1 + NumSamplesIn div Hop;
   NumFramesM1 := NumFrames - 1;
   NumSamples := NumSamplesIn;
@@ -1062,7 +1062,7 @@ begin
     raise Exception.Create('ISTFTOverlapAdd: NFFT must be >= 2.');
   if HopLength < 1 then
     raise Exception.Create('ISTFTOverlapAdd: HopLength must be >= 1.');
-  NumBins := NFFT div 2 + 1;
+  NumBins := (NFFT shr 1) + 1; // #15: div 2 -> shr 1
   NFFTM1 := NFFT - 1;
   NumBinsM1 := NumBins - 1;
   invNFFT := 1.0 / NFFT;   // per-sample 1/NFFT scale, invariant over the nest (#5)
@@ -1105,7 +1105,7 @@ begin
   // once so the inner nest carries no per-element branch (rule #5 / App E).
   SetLength(BinScale, NumBins);
   for BinCnt := 0 to NumBinsM1 do
-    if (BinCnt = 0) or ((BinCnt = NumBins - 1) and (NFFT mod 2 = 0)) then
+    if (BinCnt = 0) or ((BinCnt = NumBins - 1) and ((NFFT and 1) = 0)) then
       BinScale[BinCnt] := 1.0
     else
       BinScale[BinCnt] := 2.0;

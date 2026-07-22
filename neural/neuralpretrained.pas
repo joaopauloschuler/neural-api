@@ -25743,7 +25743,6 @@ procedure SelectTokenLogits(NetOutput: TNNetVolume; TokenPos: integer;
   Logits: TNNetVolume);
 var
   ChanCnt, LabelCnt: integer;
-  LabelCntM1: integer;
 begin
   if NetOutput.SizeY <> 1 then
     ImportError('SelectTokenLogits: expected a (SeqLen,1,num_labels) ' +
@@ -25753,7 +25752,6 @@ begin
       ' is outside 0..' + IntToStr(NetOutput.SizeX - 1) + '.');
   LabelCnt := NetOutput.Depth;
   Logits.ReSize(1, 1, LabelCnt);
-  LabelCntM1 := LabelCnt - 1;
   // #13 + #5: contiguous copy of a loop-invariant source row (TokenPos*LabelCnt).
   Move(NetOutput.FData[TokenPos * LabelCnt], Logits.FData[0],
     LabelCnt * csNeuralFloatSize);
