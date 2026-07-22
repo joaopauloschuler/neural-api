@@ -24771,7 +24771,8 @@ end;
 procedure BertPoolSentenceEmbedding(HiddenStates: TNNetVolume;
   RealTokens: integer; Embedding: TNNetVolume);
 var
-  SeqLen, Depth, PosCnt, RealMax: integer;
+  SeqLen, Depth, PosCnt, RealMax, pos: integer;
+  EmbPtr: pointer;
 begin
   SeqLen := HiddenStates.SizeX;
   Depth := HiddenStates.Depth;
@@ -24788,10 +24789,14 @@ begin
   // averages all SeqLen rows, pads included)
   // #13/App.E: interchange to row-outer bulk Add (cache-friendly), then scale
   Embedding.Fill(0);
+  EmbPtr := Embedding.GetRawPtr(0);   // #8: invariant dest pointer, once
+  pos := 0;                           // #12: carried source offset (row*Depth)
   for PosCnt := 0 to RealMax do
-    TNNetVolume.Add(Embedding.GetRawPtr(0), HiddenStates.GetRawPtr(PosCnt, 0),
-      Depth);
-  TNNetVolume.Mul(Embedding.GetRawPtr(0), 1 / RealTokens, Depth);
+  begin
+    TNNetVolume.Add(EmbPtr, HiddenStates.GetRawPtr(pos), Depth);
+    Inc(pos, Depth);
+  end;
+  TNNetVolume.Mul(EmbPtr, 1 / RealTokens, Depth);
   // L2-normalize the single (1,1,Depth) embedding vector
   NormalizeRowsL2(Embedding);
 end;
@@ -24838,9 +24843,9 @@ procedure PoolSentenceEmbedding(HiddenStates: TNNetVolume;
   RealTokens: integer; Pooling: TNNetEmbedPooling; Embedding: TNNetVolume;
   Normalize: boolean = True);
 var
-  SeqLen, Depth, SrcRow, RealMax: integer;
+  SeqLen, Depth, SrcRow, RealMax, pos: integer;
   Norm: TNeuralFloat;
-  P: pointer;
+  P, EmbPtr: pointer;
 begin
   SeqLen := HiddenStates.SizeX;
   Depth := HiddenStates.Depth;
@@ -24873,10 +24878,14 @@ begin
   begin
     // #13/App.E: row-outer bulk Add (cache-friendly) then scale
     Embedding.Fill(0);
+    EmbPtr := Embedding.GetRawPtr(0);   // #8: invariant dest pointer, once
+    pos := 0;                           // #12: carried source offset (row*Depth)
     for SrcRow := 0 to RealMax do
-      TNNetVolume.Add(Embedding.GetRawPtr(0),
-        HiddenStates.GetRawPtr(SrcRow, 0), Depth);
-    TNNetVolume.Mul(Embedding.GetRawPtr(0), 1 / RealTokens, Depth);
+    begin
+      TNNetVolume.Add(EmbPtr, HiddenStates.GetRawPtr(pos), Depth);
+      Inc(pos, Depth);
+    end;
+    TNNetVolume.Mul(EmbPtr, 1 / RealTokens, Depth);
   end;
   if Normalize then
   begin
@@ -27530,7 +27539,7 @@ var
   Idx, Kind: integer;
   Wqkv: TNNetVolume;
   GroupStride, KOffset, VOffset: integer;
-  g, q, r, c, DstRow: integer;
+  g, r, DstRow: integer;
   SrcBase: integer;
   FNumKVHeadsM1, QPerKVHeadDimM1, FHeadDimM1, FHiddenM1: integer;
 begin
@@ -27568,24 +27577,23 @@ begin
       SrcBase := g * GroupStride;
       if Kind = 1 then
       begin
-        // all q_per_kv query head-rows of this group (group-major)
-        for q := 0 to QPerKVHeadDimM1 do
-        begin
-          Move(Wqkv.FData[(SrcBase + q) * FHidden],
-            Dest.FData[DstRow * FHidden], FHidden * csNeuralFloatSize);
-          Inc(DstRow);
-        end;
+        // all q_per_kv query head-rows of this group (group-major): source
+        // rows SrcBase.. and dest rows DstRow.. are each contiguous, so the
+        // per-row Move loop collapses to one block Move (#13).
+        Move(Wqkv.FData[SrcBase * FHidden],
+          Dest.FData[DstRow * FHidden],
+          (QPerKVHeadDimM1 + 1) * FHidden * csNeuralFloatSize);
+        Inc(DstRow, QPerKVHeadDimM1 + 1);
       end
       else
       begin
         if Kind = 2 then r := SrcBase + KOffset
         else r := SrcBase + VOffset;
-        for q := 0 to FHeadDimM1 do
-        begin
-          Move(Wqkv.FData[(r + q) * FHidden],
-            Dest.FData[DstRow * FHidden], FHidden * csNeuralFloatSize);
-          Inc(DstRow);
-        end;
+        // the K (or V) block is FHeadDim contiguous rows -> one block Move.
+        Move(Wqkv.FData[r * FHidden],
+          Dest.FData[DstRow * FHidden],
+          (FHeadDimM1 + 1) * FHidden * csNeuralFloatSize);
+        Inc(DstRow, FHeadDimM1 + 1);
       end;
     end;
   finally
@@ -27914,7 +27922,8 @@ procedure LoadGptOssExpertMatrix(WLayer: TNNetLayer; const W, B: TNNetVolume;
   ExpertIdx, InDim, OutDim: integer);
 var
   i, j, ExpertBase, BiasBase: integer;
-  OutDimM1, InDimM1: integer;
+  OutDimM1, InDimM1, src: integer;
+  WV: TNNetVolume;
 begin
   EnsureWritableImportWeights(WLayer);
   if WLayer.Neurons.Count <> OutDim then
@@ -27927,8 +27936,13 @@ begin
   InDimM1 := InDim - 1;
   for j := 0 to OutDimM1 do
   begin
+    WV := WLayer.FArrNeurons[j].Weights;   // #9: bind the invariant chain once
+    src := ExpertBase + j;                  // #6: carry the strided source
     for i := 0 to InDimM1 do
-      WLayer.FArrNeurons[j].Weights.FData[i] := W.FData[ExpertBase + i * OutDim + j];
+    begin
+      WV.FData[i] := W.FData[src];
+      Inc(src, OutDim);
+    end;
     if B <> nil then
       WLayer.FArrNeurons[j].BiasWeight := B.FData[BiasBase + j]
     else
@@ -27952,6 +27966,7 @@ var
   e, ii, oo, NumBlocks: integer;
   BlocksName, ScalesName: string;
   NumExpertsM1, OutDimM1, InDimM1: integer;
+  srcIdx, dstIdx, InTimesOut: integer;
 begin
   if Reader.HasTensor(BaseName) then
   begin
@@ -27994,11 +28009,21 @@ begin
   NumExpertsM1 := NumExperts - 1;
   OutDimM1 := OutDim - 1;
   InDimM1 := InDim - 1;
+  InTimesOut := InDim * OutDim;
+  // Source index runs fully sequentially across the whole nest (#6); the dest
+  // index is a per-(e,oo) base advanced by OutDim each ii (#11/#4).
+  srcIdx := 0;
   for e := 0 to NumExpertsM1 do
     for oo := 0 to OutDimM1 do
+    begin
+      dstIdx := e * InTimesOut + oo;
       for ii := 0 to InDimM1 do
-        Dest.FData[(e * InDim + ii) * OutDim + oo] :=
-          Deq[(e * OutDim + oo) * InDim + ii];
+      begin
+        Dest.FData[dstIdx] := Deq[srcIdx];
+        Inc(srcIdx);
+        Inc(dstIdx, OutDim);
+      end;
+    end;
   SetLength(Deq, 0);
 end;
 
@@ -48786,7 +48811,7 @@ var
   // discretizations, see the MAMBA IMPORT section); D -> e.
   procedure LoadScanWeights(Layer: TNNetLayer; const MixP: string);
   var
-    XW, DtW, WV: TNNetVolume;
+    XW, DtW, WV, WB, WC: TNNetVolume;
     d, s, r, j, NS, DI, RK, NSM1, DIM1, RKM1: integer;
     dBase, xOff, idx, sBase, bBase, cBase: integer;
     Acc: double;
@@ -48858,18 +48883,16 @@ var
       end;
       // W_B / W_C: the next d_state + d_state x_proj rows (shared across
       // channels - TNNetSelectiveSSM's (NS,1,Depth) projections).
+      WB := Layer.FArrNeurons[1].Weights;   // #9: bind chains once
+      WC := Layer.FArrNeurons[2].Weights;
       for s := 0 to NSM1 do
       begin
         sBase := s * DI;
         bBase := (RK + s) * DI;
         cBase := (RK + NS + s) * DI;
-        for j := 0 to DIM1 do
-        begin
-          Layer.FArrNeurons[1].Weights.FData[sBase + j] :=
-            XW.FData[bBase + j];
-          Layer.FArrNeurons[2].Weights.FData[sBase + j] :=
-            XW.FData[cBase + j];
-        end;
+        // each s-row is DI contiguous elements (#13 block copy)
+        Move(XW.FData[bBase], WB.FData[sBase], DI * csNeuralFloatSize);
+        Move(XW.FData[cBase], WC.FData[sBase], DI * csNeuralFloatSize);
       end;
     finally
       DtW.Free;
@@ -50920,7 +50943,8 @@ var
   // [0]=dt_proj.weight (DI,RK), [6]=x_proj_dt (RK,DI). W_B/W_C are the
   // remaining x_proj rows; the three inner gains go to [7..9].
   procedure LoadJambaScan(Layer: TNNetLayer; const MixPfx: string);
-  var d, j, r, s, DIM1, RKM1, NSM1: integer;
+  var s, DIM1, RKM1, NSM1, sBase: integer;
+      W0, W6, WB, WC: TNNetVolume;
   begin
     DIM1 := DI - 1;
     RKM1 := RK - 1;
@@ -50938,19 +50962,21 @@ var
     Reader.LoadTensorFlat(MixPfx + 'x_proj.weight', XW);
     Reader.LoadTensorFlat(MixPfx + 'dt_proj.weight', DtW);
     // [0] dt_proj.weight (DI rows of RK), [6] x_proj_dt (RK rows of DI).
-    for d := 0 to DIM1 do
-      for r := 0 to RKM1 do
-        Layer.FArrNeurons[0].Weights.FData[d * RK + r] := DtW.FData[d * RK + r];
-    for r := 0 to RKM1 do
-      for j := 0 to DIM1 do
-        Layer.FArrNeurons[6].Weights.FData[r * DI + j] := XW.FData[r * DI + j];
-    // W_B / W_C: the d_state + d_state rows after the dt rows.
+    // Both are identity-index contiguous copies -> one block Move each (#13/#9).
+    W0 := Layer.FArrNeurons[0].Weights;
+    Move(DtW.FData[0], W0.FData[0], DI * RK * csNeuralFloatSize);
+    W6 := Layer.FArrNeurons[6].Weights;
+    Move(XW.FData[0], W6.FData[0], RK * DI * csNeuralFloatSize);
+    // W_B / W_C: the d_state + d_state rows after the dt rows; each s-row is
+    // DI contiguous elements from a strided x_proj offset (#13/#9).
+    WB := Layer.FArrNeurons[1].Weights;
+    WC := Layer.FArrNeurons[2].Weights;
     for s := 0 to NSM1 do
-      for j := 0 to DIM1 do
-      begin
-        Layer.FArrNeurons[1].Weights.FData[s * DI + j] := XW.FData[(RK + s) * DI + j];
-        Layer.FArrNeurons[2].Weights.FData[s * DI + j] := XW.FData[(RK + NS + s) * DI + j];
-      end;
+    begin
+      sBase := s * DI;
+      Move(XW.FData[(RK + s) * DI], WB.FData[sBase], DI * csNeuralFloatSize);
+      Move(XW.FData[(RK + NS + s) * DI], WC.FData[sBase], DI * csNeuralFloatSize);
+    end;
     MarkConsumed(MixPfx + 'x_proj.weight');
     MarkConsumed(MixPfx + 'dt_proj.weight');
     LoadVec(Layer, 3, MixPfx + 'dt_proj.bias', DI);       // b_d
@@ -53180,8 +53206,9 @@ procedure LoadModernBertQKVWeights(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BName: string; Hidden, HeadDim: integer);
 var
   W, B: TNNetVolume;
-  r, i, Third, RowInThird, HeadIdx, RowInHead, HalfDim, TargetIdx: integer;
-  ThreeHiddenM1, HiddenM1: integer;
+  r, Third, RowInThird, HeadIdx, RowInHead, HalfDim, TargetIdx: integer;
+  ThreeHiddenM1: integer;
+  WV: TNNetVolume;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -53207,7 +53234,6 @@ begin
       IntToStr(3 * Hidden) + '.');
   HalfDim := HeadDim div 2;
   ThreeHiddenM1 := 3 * Hidden - 1;
-  HiddenM1 := Hidden - 1;
   W := TNNetVolume.Create;
   B := nil;
   try
@@ -53234,13 +53260,14 @@ begin
       end
       else
         TargetIdx := r; // v: straight
-      if Layer.FArrNeurons[TargetIdx].Weights.Size <> Hidden then
+      WV := Layer.FArrNeurons[TargetIdx].Weights;   // #9: bind chain once
+      if WV.Size <> Hidden then
         ImportError('ModernBERT import: internal error - neuron ' +
           IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
-          IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
+          IntToStr(WV.Size) +
           ' weights, expected ' + IntToStr(Hidden) + '.');
-      for i := 0 to HiddenM1 do
-        Layer.FArrNeurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
+      // contiguous source row -> contiguous neuron weights (#13)
+      Move(W.FData[r * Hidden], WV.FData[0], Hidden * csNeuralFloatSize);
       if B <> nil then
         Layer.FArrNeurons[TargetIdx].BiasWeight := B.FData[r]
       else
@@ -53265,7 +53292,8 @@ procedure LoadModernBertWiWeights(Reader: TNNetSafeTensorsReader;
   Hidden, Intermediate: integer);
 var
   W, B: TNNetVolume;
-  r, i, TargetIdx, TwoIntermediateM1, HiddenM1: integer;
+  r, TargetIdx, TwoIntermediateM1: integer;
+  WV: TNNetVolume;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -53300,7 +53328,6 @@ begin
       Reader.LoadTensorFlat(BName, B);
     end;
     TwoIntermediateM1 := 2 * Intermediate - 1;
-    HiddenM1 := Hidden - 1;
     for r := 0 to TwoIntermediateM1 do
     begin
       // Swap the halves: HF input rows (r < I) -> neurons I + r (the
@@ -53309,13 +53336,14 @@ begin
         TargetIdx := Intermediate + r
       else
         TargetIdx := r - Intermediate;
-      if Layer.FArrNeurons[TargetIdx].Weights.Size <> Hidden then
+      WV := Layer.FArrNeurons[TargetIdx].Weights;   // #9: bind chain once
+      if WV.Size <> Hidden then
         ImportError('ModernBERT import: internal error - neuron ' +
           IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
-          IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
+          IntToStr(WV.Size) +
           ' weights, expected ' + IntToStr(Hidden) + '.');
-      for i := 0 to HiddenM1 do
-        Layer.FArrNeurons[TargetIdx].Weights.FData[i] := W.FData[r * Hidden + i];
+      // contiguous source row -> contiguous neuron weights (#13)
+      Move(W.FData[r * Hidden], WV.FData[0], Hidden * csNeuralFloatSize);
       if B <> nil then
         Layer.FArrNeurons[TargetIdx].BiasWeight := B.FData[r]
       else
@@ -53336,8 +53364,8 @@ procedure LoadModernBertNormWeights(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BName: string; d_model: integer;
   HasBias: boolean);
 var
-  Tmp: TNNetVolume;
-  i, DModelM1: integer;
+  Tmp, W0, W1: TNNetVolume;
+  NBytes: integer;
 begin
   if not Reader.HasTensor(WName) then
     ImportError('ModernBERT import: missing tensor "' + WName + '".');
@@ -53345,12 +53373,13 @@ begin
      (Reader.DimSize(WName, 0) <> d_model) then
     ImportError('ModernBERT import: "' + WName + '" must have shape [' +
       IntToStr(d_model) + '], got ' + Reader.ShapeAsString(WName));
-  DModelM1 := d_model - 1;
+  NBytes := d_model * csNeuralFloatSize;
+  W0 := Layer.FArrNeurons[0].Weights;   // #9: gamma target, bound once
+  W1 := Layer.FArrNeurons[1].Weights;   // #9: beta target, bound once
   Tmp := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(WName, Tmp);
-    for i := 0 to DModelM1 do
-      Layer.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i]; // gamma
+    Move(Tmp.FData[0], W0.FData[0], NBytes); // gamma (#13 contiguous copy)
     if HasBias then
     begin
       if not Reader.HasTensor(BName) then
@@ -53360,12 +53389,10 @@ begin
         ImportError('ModernBERT import: "' + BName + '" must have shape [' +
           IntToStr(d_model) + '], got ' + Reader.ShapeAsString(BName));
       Reader.LoadTensorFlat(BName, Tmp);
-      for i := 0 to DModelM1 do
-        Layer.FArrNeurons[1].Weights.FData[i] := Tmp.FData[i]; // beta
+      Move(Tmp.FData[0], W1.FData[0], NBytes); // beta (#13 contiguous copy)
     end
     else
-      for i := 0 to DModelM1 do
-        Layer.FArrNeurons[1].Weights.FData[i] := 0; // bias-free norm
+      FillChar(W1.FData[0], NBytes, 0); // bias-free norm (#13 zero-fill)
   finally
     Tmp.Free;
   end;
