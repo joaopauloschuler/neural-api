@@ -2060,7 +2060,9 @@ var
   LocalTotalLoss, LocalErrorSum: TNeuralFloat;
   LocalTestPair: TNNetVolumePair;
   TotalDiv: TNeuralFloat;
+  HalfCrop: integer;
 begin
+  HalfCrop := FMaxCropSize shr 1;
   vInput     := TNNetVolume.Create();
   pOutput    := TNNetVolume.Create();
   vOutput    := TNNetVolume.Create();
@@ -2098,7 +2100,7 @@ begin
 
     if FHasImgCrop then
     begin
-      vInputCopy.CopyCropping(vInput, FMaxCropSize div 2, FMaxCropSize div 2, vInput.SizeX-FMaxCropSize, vInput.SizeY-FMaxCropSize);
+      vInputCopy.CopyCropping(vInput, HalfCrop, HalfCrop, vInput.SizeX-FMaxCropSize, vInput.SizeY-FMaxCropSize);
       vInput.Copy(vInputCopy);
     end;
 
@@ -2131,7 +2133,7 @@ begin
 
       if ((FMaxCropSize >= 2) and Not(FHasImgCrop)) then
       begin
-        vInputCopy.CopyCropping(vInput, FMaxCropSize div 2, FMaxCropSize div 2, vInput.SizeX - FMaxCropSize, vInput.SizeY - FMaxCropSize);
+        vInputCopy.CopyCropping(vInput, HalfCrop, HalfCrop, vInput.SizeX - FMaxCropSize, vInput.SizeY - FMaxCropSize);
         vInput.CopyResizing(vInputCopy, vInput.SizeX, vInput.SizeY);
         LocalNN.Compute( vInput );
         LocalNN.GetOutput( pOutput );
@@ -3582,6 +3584,7 @@ var
   BlockSize, BlockSizeRest, CropSizeX, CropSizeY: integer;
   LocalNN: TNNet;
   ImgInput, ImgInputCp, PartnerInput: TNNetVolume;
+  LocalImg, LocalPartner: TNNetVolume;
   pOutput, vOutput: TNNetVolume;
   I, ImgIdx, PartnerIdx, PartnerTag: integer;
   OutputValue, CurrentLoss: TNeuralFloat;
@@ -3592,6 +3595,7 @@ var
   MixLambda: TNeuralFloat;
   DidBatchMix: boolean;
   CutX0, CutY0, CutBoxW, CutBoxH, CutX, CutY, CutD, CutXMax, CutYMax: integer;
+  CutBase, CutRowFloats: integer;
 begin
   ImgInput := TNNetVolume.Create();
   ImgInputCp := TNNetVolume.Create();
@@ -3620,23 +3624,24 @@ begin
     ImgIdx := Random(FImgVolumes.Count);
     ImgIdx := FTrainingSampleProcessedCnt.GetSmallestIdxInRange(ImgIdx, 100);
     FTrainingSampleProcessedCnt.FData[ImgIdx] := FTrainingSampleProcessedCnt.FData[ImgIdx] + 1;
+    LocalImg := FImgVolumes[ImgIdx];
 
     if FDataAugmentation then
     begin
       if FHasImgCrop then
       begin
-        ImgInput.CopyCropping(FImgVolumes[ImgIdx], random(FMaxCropSize), random(FMaxCropSize), FImgVolumes[ImgIdx].SizeX-FMaxCropSize, FImgVolumes[ImgIdx].SizeY-FMaxCropSize);
+        ImgInput.CopyCropping(LocalImg, random(FMaxCropSize), random(FMaxCropSize), LocalImg.SizeX-FMaxCropSize, LocalImg.SizeY-FMaxCropSize);
       end
       else if FHasResizing then
       begin
         CropSizeX := random(FMaxCropSize + 1);
         CropSizeY := random(FMaxCropSize + 1);
-        ImgInputCp.CopyCropping(FImgVolumes[ImgIdx], random(CropSizeX), random(CropSizeY),FImgVolumes[ImgIdx].SizeX-CropSizeX, FImgVolumes[ImgIdx].SizeY-CropSizeY);
-        ImgInput.CopyResizing(ImgInputCp, FImgVolumes[ImgIdx].SizeX, FImgVolumes[ImgIdx].SizeY);
+        ImgInputCp.CopyCropping(LocalImg, random(CropSizeX), random(CropSizeY),LocalImg.SizeX-CropSizeX, LocalImg.SizeY-CropSizeY);
+        ImgInput.CopyResizing(ImgInputCp, LocalImg.SizeX, LocalImg.SizeY);
       end
       else
       begin
-        ImgInput.Copy(FImgVolumes[ImgIdx]);
+        ImgInput.Copy(LocalImg);
       end;
 
       if FChannelShiftRate > 0 then
@@ -3676,9 +3681,9 @@ begin
     end
     else
     begin
-      ImgInput.Copy(FImgVolumes[ImgIdx]);
+      ImgInput.Copy(LocalImg);
     end;
-    ImgInput.Tag := FImgVolumes[ImgIdx].Tag;
+    ImgInput.Tag := LocalImg.Tag;
 
     if ImgInput.Tag >= FNumClasses then
     begin
@@ -3702,8 +3707,9 @@ begin
        and ( (FBatchAugProb >= 1.0) or (Random() < FBatchAugProb) ) then
     begin
       PartnerIdx := Random(FImgVolumes.Count);
-      PartnerInput.Copy(FImgVolumes[PartnerIdx]);
-      PartnerTag := FImgVolumes[PartnerIdx].Tag;
+      LocalPartner := FImgVolumes[PartnerIdx];
+      PartnerInput.Copy(LocalPartner);
+      PartnerTag := LocalPartner.Tag;
       if (PartnerTag < FNumClasses)
          and (PartnerInput.SizeX = ImgInput.SizeX)
          and (PartnerInput.SizeY = ImgInput.SizeY)
@@ -3725,10 +3731,15 @@ begin
             CutXMax := CutX0 + CutBoxW - 1;
             CutYMax := CutY0 + CutBoxH - 1;
             DepthM1 := ImgInput.Depth - 1;
-            for CutX := CutX0 to CutXMax do
-              for CutY := CutY0 to CutYMax do
-                for CutD := 0 to DepthM1 do
-                  ImgInput[CutX, CutY, CutD] := PartnerInput[CutX, CutY, CutD];
+            // App E: for a fixed row the whole X-run is contiguous (consecutive
+            // X positions are Depth apart), so paste each row with one Move of
+            // CutBoxW*Depth floats. Bit-exact (no float op).
+            CutRowFloats := CutBoxW * (DepthM1 + 1);
+            for CutY := CutY0 to CutYMax do
+            begin
+              CutBase := ImgInput.GetRawPos(CutX0, CutY, 0);
+              Move(PartnerInput.FData[CutBase], ImgInput.FData[CutBase], CutRowFloats * csNeuralFloatSize);
+            end;
           end;
           // True pasted-area fraction (clamped box may shrink at borders).
           MixLambda := 1.0 -
@@ -3802,7 +3813,7 @@ begin
     end;
     LocalTotalLoss := LocalTotalLoss + CurrentLoss;
 
-    if pOutput.GetClass() = FImgVolumes[ImgIdx].Tag then
+    if pOutput.GetClass() = LocalImg.Tag then
     begin
       Inc(LocalHit);
     end
@@ -3868,6 +3879,7 @@ var
   BlockSize: integer;
   LocalNN: TNNet;
   ImgInput, ImgInputCp: TNNetVolume;
+  LocalImg: TNNetVolume;
   pOutput, vOutput, sumOutput: TNNetVolume;
   I, ImgIdx: integer;
   StartPos, FinishPos, FinishPosM1: integer;
@@ -3876,7 +3888,9 @@ var
   LocalTotalLoss, LocalErrorSum: TNeuralFloat;
   PredictedClass: integer;
   TotalDiv: TNeuralFloat;
+  HalfCrop: integer;
 begin
+  HalfCrop := FMaxCropSize shr 1;
   ImgInput := TNNetVolume.Create();
   ImgInputCp := TNNetVolume.Create();
   pOutput := TNNetVolume.Create(FNumClasses,1,1);
@@ -3906,17 +3920,20 @@ begin
     if FShouldQuit then Break;
     sumOutput.Fill(0);
     ImgIdx := I;
+    LocalImg := FWorkingVolumes[ImgIdx];
 
     if FHasImgCrop then
     begin
-      ImgInput.CopyCropping(FWorkingVolumes[ImgIdx], FMaxCropSize div 2, FMaxCropSize div 2, FImgVolumes[ImgIdx].SizeX-FMaxCropSize, FImgVolumes[ImgIdx].SizeY-FMaxCropSize);
+      // Note: crop bounds intentionally read sizes from FImgVolumes[ImgIdx]
+      // (preserved as-is), while the crop source is FWorkingVolumes[ImgIdx].
+      ImgInput.CopyCropping(LocalImg, HalfCrop, HalfCrop, FImgVolumes[ImgIdx].SizeX-FMaxCropSize, FImgVolumes[ImgIdx].SizeY-FMaxCropSize);
     end
     else
     begin
-      ImgInput.Copy(FWorkingVolumes[ImgIdx]);
+      ImgInput.Copy(LocalImg);
     end;
 
-    ImgInput.Tag := FWorkingVolumes[ImgIdx].Tag;
+    ImgInput.Tag := LocalImg.Tag;
 
     LocalNN.Compute( ImgInput );
     LocalNN.GetOutput( pOutput );
@@ -3945,7 +3962,7 @@ begin
 
       if ((FMaxCropSize >= 2) and Not(FHasImgCrop)) then
       begin
-        ImgInputCp.CopyCropping(ImgInput, FMaxCropSize div 2, FMaxCropSize div 2, ImgInput.SizeX - FMaxCropSize, ImgInput.SizeY - FMaxCropSize);
+        ImgInputCp.CopyCropping(ImgInput, HalfCrop, HalfCrop, ImgInput.SizeX - FMaxCropSize, ImgInput.SizeY - FMaxCropSize);
         ImgInput.CopyResizing(ImgInputCp, ImgInput.SizeX, ImgInput.SizeY);
         LocalNN.Compute( ImgInput );
         LocalNN.GetOutput( pOutput );
@@ -4006,7 +4023,9 @@ var
   ImgInput, ImgInputCp: TNNetVolume;
   sumOutput: TNNetVolume;
   TotalDiv: TNeuralFloat;
+  HalfCrop: integer;
 begin
+  HalfCrop := FMaxCropSize shr 1;
   ImgInput := TNNetVolume.Create();
   ImgInputCp := TNNetVolume.Create();
   sumOutput := TNNetVolume.Create(pNN.GetLastLayer().Output);
@@ -4041,7 +4060,7 @@ begin
 
     if FMaxCropSize >= 2 then
     begin
-      ImgInputCp.CopyCropping(ImgInput, FMaxCropSize div 2, FMaxCropSize div 2, ImgInput.SizeX - FMaxCropSize, ImgInput.SizeY - FMaxCropSize);
+      ImgInputCp.CopyCropping(ImgInput, HalfCrop, HalfCrop, ImgInput.SizeX - FMaxCropSize, ImgInput.SizeY - FMaxCropSize);
       ImgInput.CopyResizing(ImgInputCp, ImgInput.SizeX, ImgInput.SizeY);
       pNN.Compute( ImgInput );
       pNN.GetOutput( pOutput );

@@ -920,7 +920,7 @@ begin
   if Info.DType = 'F32' then
     // TNeuralFloat = single, so the stored bytes ARE the destination format
     // (both little-endian, like every existing decode path assumes).
-    Move(RawBytes[0], Dest.FData[0], NumElements * SizeOf(Single))
+    Move(RawBytes[0], Dest.FData[0], NumElements * csNeuralFloatSize)
   else if (Info.DType = 'F16') or (Info.DType = 'BF16') then
     DecodeHalfBuffer(PWord(@RawBytes[0]), PSingle(@Dest.FData[0]),
       integer(NumElements), Info.DType = 'BF16')
@@ -979,7 +979,7 @@ begin
   FStreams[Info.Shard].ReadBuffer(RawBytes[0], Length(RawBytes));
   if Info.DType = 'F32' then
     // TNeuralFloat = single: raw bytes are already the destination format.
-    Move(RawBytes[0], Dest.FData[0], ElemCount * SizeOf(Single))
+    Move(RawBytes[0], Dest.FData[0], ElemCount * csNeuralFloatSize)
   else // F16 / BF16 (dtype-checked above)
     DecodeHalfBuffer(PWord(@RawBytes[0]), PSingle(@Dest.FData[0]),
       integer(ElemCount), Info.DType = 'BF16');

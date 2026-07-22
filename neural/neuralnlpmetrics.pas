@@ -928,8 +928,9 @@ var
   ContextLen, InDepth, VocabSize: integer;
   PerPosition, Overflows: boolean;
   SampleLen, Pos, D, Tgt, FirstPos, WinStart, WinLen, Row: integer;
-  SampleLenM1, VocabSizeM1: integer;
+  SampleLenM1, VocabSizeM1, RowBase: integer;
   RowSum, Prob: TNeuralFloat;
+  LO: TNNetVolume;
 begin
   SetLength(Result, 0);
   if NN = nil then Exit;
@@ -973,6 +974,7 @@ begin
       then InV.CopyNoChecksIntArr(Tokens)       // token ids -> embedding
       else InV.OneHotEncoding(Tokens);          // one-hot, left-aligned
       NN.Compute(InV);
+      LO := Last.Output;
       for Pos := FirstPos to SampleLenM1 do
       begin
         Tgt := Tokens[Pos];
@@ -983,11 +985,12 @@ begin
         end;
         // Output row Pos-1 predicts token Pos (the causal shift). Defensive
         // re-normalisation, exactly like Perplexity.
+        RowBase := LO.GetRawPos(Pos - 1, 0, 0);
         RowSum := 0;
         for D := 0 to VocabSizeM1 do
-          RowSum := RowSum + Last.Output[Pos - 1, 0, D];
+          RowSum := RowSum + LO.FData[RowBase + D];
         if RowSum <= 0 then RowSum := 1.0;
-        Prob := Last.Output[Pos - 1, 0, Tgt] / RowSum;
+        Prob := LO.FData[RowBase + Tgt] / RowSum;
         Result[Pos] := SafeLogProb(Prob);
       end;
     end
@@ -1012,12 +1015,14 @@ begin
         then InV.CopyNoChecksIntArr(Prefix)
         else InV.OneHotEncoding(Prefix);
         NN.Compute(InV);
+        LO := Last.Output;
         Row := WinLen - 2;                       // row predicting the last token
+        RowBase := LO.GetRawPos(Row, 0, 0);
         RowSum := 0;
         for D := 0 to VocabSizeM1 do
-          RowSum := RowSum + Last.Output[Row, 0, D];
+          RowSum := RowSum + LO.FData[RowBase + D];
         if RowSum <= 0 then RowSum := 1.0;
-        Prob := Last.Output[Row, 0, Tgt] / RowSum;
+        Prob := LO.FData[RowBase + Tgt] / RowSum;
         Result[Pos] := SafeLogProb(Prob);
       end;
     end
@@ -1361,9 +1366,10 @@ var
   Last: TNNetLayer;
   Prefix: TNeuralIntegerArray;
   ContextLen, InDepth, VocabSize, WinStart, WinLen, Row, D, Best: integer;
-  VocabSizeM1: integer;
+  VocabSizeM1, RowBase: integer;
   PerPosition, Overflows: boolean;
   BestVal, V: TNeuralFloat;
+  LO: TNNetVolume;
 begin
   Result := -1;
   if NN = nil then Exit;
@@ -1402,11 +1408,13 @@ begin
       else InV.OneHotEncoding(Prefix);
       NN.Compute(InV);
       Row := WinLen - 1;                         // row predicting token at Pos
+      LO := Last.Output;
+      RowBase := LO.GetRawPos(Row, 0, 0);
       Best := 0;
-      BestVal := Last.Output[Row, 0, 0];
+      BestVal := LO.FData[RowBase];
       for D := 1 to VocabSizeM1 do
       begin
-        V := Last.Output[Row, 0, D];
+        V := LO.FData[RowBase + D];
         if V > BestVal then begin BestVal := V; Best := D; end;
       end;
       Result := Best;

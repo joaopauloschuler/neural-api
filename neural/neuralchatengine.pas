@@ -592,11 +592,17 @@ end;
 function ArgMaxRow(Row: TNNetVolume): integer;
 var
   Cnt, SizeM1: integer;
+  Best: TNeuralFloat;
 begin
   Result := 0;
   SizeM1 := Row.Size - 1;
+  Best := Row.FData[0];
   for Cnt := 1 to SizeM1 do
-    if Row.FData[Cnt] > Row.FData[Result] then Result := Cnt;
+    if Row.FData[Cnt] > Best then
+    begin
+      Best := Row.FData[Cnt];
+      Result := Cnt;
+    end;
 end;
 
 // True when the tail of Tokens[0..Len-1] equals Marker.
@@ -1184,6 +1190,7 @@ var
   Len, GenLen, StepCnt, Cnt, NewToken: integer;
   Reused, PromptLen: integer;  // KV-cache reuse bookkeeping (and --stats)
   LenM1, LenM2, MarkerLen, EmLen, DecLen: integer;
+  LastPos, RowBytes: integer;
   Decoded, Emitted: string;
   // --stats timing (monotonic ms). TStart: before prefill; TFirst: when the
   // first reply token is produced (so TTFT covers prefill + first step);
@@ -1244,7 +1251,7 @@ begin
   LenM1 := Len - 1;
   LenM2 := Len - 2;
   MarkerLen := Length(MarkerIds);
-  for Cnt := 0 to LenM1 do Tokens[Cnt] := PromptIds[Cnt];
+  if Len > 0 then Move(PromptIds[0], Tokens[0], Len * csIntegerSize);
   SetLength(Generated, 0);
   Emitted := '';
   InV := TNNetVolume.Create(1, 1, 1);
@@ -1294,14 +1301,16 @@ begin
       NN.ClearTime();
       NN.ResetSchedulerStats();
     end;
+    RowBytes := VocabSize * csNeuralFloatSize;
     for StepCnt := 1 to GenOpt.MaxNewTokens do
     begin
       if Len >= SeqLen then break;
       // One width-1 forward of the last committed token over the cached past.
-      InV.FData[0] := Tokens[Len - 1];
-      Session.StepForward(InV, Len - 1);
+      LastPos := Len - 1;
+      InV.FData[0] := Tokens[LastPos];
+      Session.StepForward(InV, LastPos);
       Output := Session.Output(); // (1,1,vocab) -- the single logits row
-      Move(Output.FData[0], Row.FData[0], VocabSize * csNeuralFloatSize);
+      Move(Output.FData[0], Row.FData[0], RowBytes);
       RowSoftMax(Row);
       Chain.ProcessRow(Row);
       if Assigned(Sampler) then NewToken := Sampler.GetToken(Row)
@@ -1352,8 +1361,7 @@ begin
     // the final produced token (Tokens[Len-1]) was sampled but never fed, so
     // it is not.
     SetLength(CachedTokens, Len - 1);
-    LenM2 := Len - 2;
-    for Cnt := 0 to LenM2 do CachedTokens[Cnt] := Tokens[Cnt];
+    if Len > 1 then Move(Tokens[0], CachedTokens[0], (Len - 1) * csIntegerSize);
     // Per-turn timing to stderr (keeps stdout = pure model output). TTFT =
     // prefill + first decode step; tok/s measures the steady-state decode of
     // the tokens AFTER the first, so prefill cost is excluded. prompt N (reused

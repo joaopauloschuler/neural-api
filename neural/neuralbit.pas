@@ -153,8 +153,8 @@ function BARead(var A: array of byte; P: longint): byte;
 var
   BytePos, BitPos: longint;
 begin
-  BytePos := P div 8;
-  BitPos := P mod 8;
+  BytePos := P shr 3;
+  BitPos := P and 7;
   if BytePos > High(A) then
     Result := 0
   else
@@ -166,8 +166,8 @@ procedure BAFlip(var A: array of byte; P: longint);
 var
   BytePos, BitPos: longint;
 begin
-  BytePos := P div 8;
-  BitPos := P mod 8;
+  BytePos := P shr 3;
+  BitPos := P and 7;
   if BytePos <= High(A) then
     A[BytePos] := A[BytePos] xor POW2[BitPos];
 end;
@@ -206,8 +206,8 @@ procedure BAWrite(var A: array of byte; P: longint; Data: byte);
 var
   BytePos, BitPos: longint;
 begin
-  BytePos := P div 8;
-  BitPos := P mod 8;
+  BytePos := P shr 3;
+  BitPos := P and 7;
   if Data = 0 then
     A[BytePos] := A[BytePos] and (255 - POW2[BitPos])
   else
@@ -714,7 +714,7 @@ function RegOrdEqual(var x, y: array of extended): extended;
 var
   NumVars: longint;
   NumVarsM1: longint;
-  O1, O2: extended;
+  O1, O2, W: extended;
   Cont: longint;
 begin
   O1 := 0;
@@ -723,8 +723,9 @@ begin
   NumVarsM1 := NumVars - 1;
   for Cont := 0 to NumVarsM1 do
   begin
-    O1 := O1 + x[Cont] * WPOW2[NumVars - Cont - 1];
-    O2 := O2 + y[Cont] * WPOW2[NumVars - Cont - 1];
+    W := WPOW2[NumVars - Cont - 1];
+    O1 := O1 + x[Cont] * W;
+    O2 := O2 + y[Cont] * W;
   end;
 
   RegOrdEqual := 1 - (abs(O1 - O2) / (WPOW2[NumVars] - 1));
@@ -764,7 +765,7 @@ begin
   for Cont := NumBits - 1 downto 0 do
   begin
     R := R + Fator * BARead(VARS, Cont);
-    Fator := Fator / 2;
+    Fator := Fator * 0.5;
   end;
   BAToFloat := R;
 end; { of function }
@@ -786,7 +787,7 @@ begin
       Valor := Valor - Fator;
       BAWrite(VARS, Cont, 1);
     end;
-    Fator := Fator / 2;
+    Fator := Fator * 0.5;
   end;
 end; { of procedure }
 

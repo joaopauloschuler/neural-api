@@ -149,7 +149,7 @@ DPOTokens('abc') converts a string to char-level token ids.
 interface
 
 uses
-  Classes, SysUtils, Math, neuralnetwork, neuralvolume;
+  Classes, SysUtils, Math, neuralnetwork, neuralvolume, pascoremath32;
 
 type
   TNeuralDPOTokenArray = array of integer;
@@ -189,6 +189,7 @@ type
       FLastErrScaleChosen, FLastErrScaleRejected: TNeuralFloat;
       FInput: TNNetVolume;
       FPseudoTarget: TNNetVolume;
+      FPrefix: TNeuralDPOTokenArray;  // persistent EncodePrefix scratch (#17)
       // Computes the scalar loss, refreshes Last* diagnostics, and returns the
       // per-completion log-prob gradient ErrScale = dLoss/d(sumlogp) for the
       // chosen and rejected completions, dispatched on FLossMode.
@@ -312,6 +313,7 @@ type
       FRewardNet: TNNet;
       FInput: TNNetVolume;
       FPseudoTarget: TNNetVolume;
+      FSeq: TNeuralDPOTokenArray;  // persistent EncodeSequence scratch (#17)
       FLastLoss: TNeuralFloat;
       FLastMargin: TNeuralFloat;
       FLastScale: TNeuralFloat;
@@ -415,6 +417,8 @@ type
       FReward: TNeuralGRPORewardEvent;
       FInput: TNNetVolume;
       FPseudoTarget: TNNetVolume;
+      FPrefix: TNeuralDPOTokenArray;  // persistent EncodePrefix scratch (#17)
+      FProbs: array of TNeuralFloat;  // persistent SampleCompletion scratch (#17)
       // Diagnostics of the last TrainOnPrompt call.
       FLastMeanReward: TNeuralFloat;
       FLastStdReward: TNeuralFloat;
@@ -601,25 +605,26 @@ end;
 procedure TNeuralDPOTrainer.EncodePrefix(NN: TNNet;
   const Prompt, Completion: array of integer; UpToTokenCount: integer);
 var
-  Prefix: TNeuralDPOTokenArray;
-  PrefixLen, ContextLen, StartPos, I, PrefixLenM1: integer;
+  PrefixLen, ContextLen, StartPos, I, PrefixLenM1, PromptLen, Needed: integer;
   FirstLayerOutput: TNNetVolume;
 begin
   FirstLayerOutput := NN.GetFirstLayer().Output;
   if FInput.Size <> FirstLayerOutput.Size then FInput.ReSize(FirstLayerOutput);
   ContextLen := FirstLayerOutput.SizeX;
-  PrefixLen := Length(Prompt) + UpToTokenCount;
+  PromptLen := Length(Prompt);
+  PrefixLen := PromptLen + UpToTokenCount;
   // Sliding window: keep only the most recent ContextLen tokens.
   StartPos := Max(0, PrefixLen - ContextLen);
-  SetLength(Prefix, PrefixLen - StartPos);
+  Needed := PrefixLen - StartPos;
+  if Length(FPrefix) <> Needed then SetLength(FPrefix, Needed);  // #17: amortized
   PrefixLenM1 := PrefixLen - 1;
   for I := StartPos to PrefixLenM1 do
   begin
-    if I < Length(Prompt)
-    then Prefix[I - StartPos] := Prompt[I]
-    else Prefix[I - StartPos] := Completion[I - Length(Prompt)];
+    if I < PromptLen
+    then FPrefix[I - StartPos] := Prompt[I]
+    else FPrefix[I - StartPos] := Completion[I - PromptLen];
   end;
-  FInput.OneHotEncodingReversed(Prefix);
+  FInput.OneHotEncodingReversed(FPrefix);
 end;
 
 function TNeuralDPOTrainer.SequenceLogProb(NN: TNNet;
@@ -760,7 +765,7 @@ end;
 procedure TNeuralDPOTrainer.BackpropagateCompletion(
   const Prompt, Completion: array of integer; ErrScale: TNeuralFloat);
 var
-  T, I, Target, CompletionHi, YSizeM1: integer;
+  T, Target, CompletionHi: integer;
   Y: TNNetVolume;
   PTarget: TNeuralFloat;
 begin
@@ -772,14 +777,13 @@ begin
     FPolicy.Compute(FInput);
     Y := FPolicy.GetLastLayer().Output;
     if FPseudoTarget.Size <> Y.Size then FPseudoTarget.ReSize(Y);
-    YSizeM1 := Y.Size - 1;
     // TNNet.Backpropagate(pDesired) sets the output error e = Y - pDesired,
     // so pDesired = Y - e for the error signal e we want (see unit header).
     if FSkipDerivSoftmax then
     begin
       // e must equal dL/dlogit = -ErrScale*(y - onehot) directly.
-      for I := 0 to YSizeM1 do
-        FPseudoTarget.FData[I] := Y.FData[I] * (1 + ErrScale);
+      FPseudoTarget.Copy(Y);
+      FPseudoTarget.Mul(1 + ErrScale);
       FPseudoTarget.FData[Target] := FPseudoTarget.FData[Target] - ErrScale;
     end
     else
@@ -861,25 +865,26 @@ end;
 procedure TNeuralRewardModelTrainer.EncodeSequence(
   const Prompt, Response: array of integer);
 var
-  Seq: TNeuralDPOTokenArray;
-  SeqLen, ContextLen, StartPos, I, SeqLenM1: integer;
+  SeqLen, ContextLen, StartPos, I, SeqLenM1, PromptLen, Needed: integer;
   FirstLayerOutput: TNNetVolume;
 begin
   FirstLayerOutput := FRewardNet.GetFirstLayer().Output;
   if FInput.Size <> FirstLayerOutput.Size then FInput.ReSize(FirstLayerOutput);
   ContextLen := FirstLayerOutput.SizeX;
-  SeqLen := Length(Prompt) + Length(Response);
+  PromptLen := Length(Prompt);
+  SeqLen := PromptLen + Length(Response);
   // Sliding window: keep only the most recent ContextLen tokens.
   StartPos := Max(0, SeqLen - ContextLen);
-  SetLength(Seq, SeqLen - StartPos);
+  Needed := SeqLen - StartPos;
+  if Length(FSeq) <> Needed then SetLength(FSeq, Needed);  // #17: amortized
   SeqLenM1 := SeqLen - 1;
   for I := StartPos to SeqLenM1 do
   begin
-    if I < Length(Prompt)
-    then Seq[I - StartPos] := Prompt[I]
-    else Seq[I - StartPos] := Response[I - Length(Prompt)];
+    if I < PromptLen
+    then FSeq[I - StartPos] := Prompt[I]
+    else FSeq[I - StartPos] := Response[I - PromptLen];
   end;
-  FInput.OneHotEncodingReversed(Seq);
+  FInput.OneHotEncodingReversed(FSeq);
 end;
 
 function TNeuralRewardModelTrainer.Reward(
@@ -1006,24 +1011,25 @@ end;
 procedure TNeuralGRPOTrainer.EncodePrefix(NN: TNNet;
   const Prompt, Completion: array of integer; UpToTokenCount: integer);
 var
-  Prefix: TNeuralDPOTokenArray;
-  PrefixLen, ContextLen, StartPos, I, PrefixLenM1: integer;
+  PrefixLen, ContextLen, StartPos, I, PrefixLenM1, PromptLen, Needed: integer;
   FirstLayerOutput: TNNetVolume;
 begin
   FirstLayerOutput := NN.GetFirstLayer().Output;
   if FInput.Size <> FirstLayerOutput.Size then FInput.ReSize(FirstLayerOutput);
   ContextLen := FirstLayerOutput.SizeX;
-  PrefixLen := Length(Prompt) + UpToTokenCount;
+  PromptLen := Length(Prompt);
+  PrefixLen := PromptLen + UpToTokenCount;
   StartPos := Max(0, PrefixLen - ContextLen);
-  SetLength(Prefix, PrefixLen - StartPos);
+  Needed := PrefixLen - StartPos;
+  if Length(FPrefix) <> Needed then SetLength(FPrefix, Needed);  // #17: amortized
   PrefixLenM1 := PrefixLen - 1;
   for I := StartPos to PrefixLenM1 do
   begin
-    if I < Length(Prompt)
-    then Prefix[I - StartPos] := Prompt[I]
-    else Prefix[I - StartPos] := Completion[I - Length(Prompt)];
+    if I < PromptLen
+    then FPrefix[I - StartPos] := Prompt[I]
+    else FPrefix[I - StartPos] := Completion[I - PromptLen];
   end;
-  FInput.OneHotEncodingReversed(Prefix);
+  FInput.OneHotEncodingReversed(FPrefix);
 end;
 
 function TNeuralGRPOTrainer.SequenceLogProb(NN: TNNet;
@@ -1050,13 +1056,12 @@ var
   T, I, Vocab, Picked, FMaxNewTokensM1, VocabM1: integer;
   Y: TNNetVolume;
   R, Acc, Sum, MaxLogit, P, InvTemp: TNeuralFloat;
-  Probs: array of TNeuralFloat;
 begin
   SetLength(Completion, FMaxNewTokens);
   SampledLen := FMaxNewTokens;
   Vocab := FPolicy.GetLastLayer().Output.Size;
   VocabM1 := Vocab - 1;
-  SetLength(Probs, Vocab);
+  if Length(FProbs) <> Vocab then SetLength(FProbs, Vocab);  // #17: allocate once
   if FTemperature > 0 then InvTemp := 1.0 / FTemperature else InvTemp := 1.0;
   FMaxNewTokensM1 := FMaxNewTokens - 1;
   for T := 0 to FMaxNewTokensM1 do
@@ -1070,21 +1075,21 @@ begin
     MaxLogit := -1e30;
     for I := 0 to VocabM1 do
     begin
-      P := Ln(Max(Y.FData[I], FProbFloor)) * InvTemp;
-      Probs[I] := P;
+      P := pcr_logf(Max(Y.FData[I], FProbFloor)) * InvTemp;  // #16: fast log
+      FProbs[I] := P;
       if P > MaxLogit then MaxLogit := P;
     end;
     Sum := 0;
     for I := 0 to VocabM1 do
     begin
-      Probs[I] := Exp(Probs[I] - MaxLogit);
-      Sum := Sum + Probs[I];
+      FProbs[I] := NeuralExp(FProbs[I] - MaxLogit);  // #16: fast, trap-free exp
+      Sum := Sum + FProbs[I];
     end;
     R := Random * Sum;
     Acc := 0; Picked := Vocab - 1;
     for I := 0 to VocabM1 do
     begin
-      Acc := Acc + Probs[I];
+      Acc := Acc + FProbs[I];
       if R <= Acc then begin Picked := I; Break; end;
     end;
     Completion[T] := Picked;
@@ -1121,7 +1126,6 @@ procedure TNeuralGRPOTrainer.BackpropagateToken(
   const Prompt, Completion: array of integer; UpToTokenCount,
   Target: integer; ErrScale: TNeuralFloat);
 var
-  I, YSizeM1: integer;
   Y: TNNetVolume;
   PTarget: TNeuralFloat;
 begin
@@ -1129,7 +1133,6 @@ begin
   FPolicy.Compute(FInput);
   Y := FPolicy.GetLastLayer().Output;
   if FPseudoTarget.Size <> Y.Size then FPseudoTarget.ReSize(Y);
-  YSizeM1 := Y.Size - 1;
   // ErrScale = dL/d logpi(target). Since d logpi/d logit = (onehot - y),
   //   dL/d logit = ErrScale*(onehot - y) = -ErrScale*(y - onehot),
   // identical to the DPO plumbing: pass pDesired so the logit gradient is
@@ -1137,8 +1140,8 @@ begin
   // backward conventions.)
   if FSkipDerivSoftmax then
   begin
-    for I := 0 to YSizeM1 do
-      FPseudoTarget.FData[I] := Y.FData[I] * (1 + ErrScale);
+    FPseudoTarget.Copy(Y);
+    FPseudoTarget.Mul(1 + ErrScale);
     FPseudoTarget.FData[Target] := FPseudoTarget.FData[Target] - ErrScale;
   end
   else
@@ -1159,8 +1162,10 @@ var
   Lengths: array of integer;
   Rewards, Advantages: array of TNeuralFloat;
   Mean, Std, A, LogPi, LogRef, KLt, PGGrad, KLGrad, ErrScale: TNeuralFloat;
-  Ratio, RatioClip, Surr1, Surr2: TNeuralFloat;
+  Ratio, RatioClip, Surr1, Surr2, E: TNeuralFloat;
   P, PRef: TNeuralFloat;
+  Tok: integer;
+  Comp: TNeuralDPOTokenArray;
   Y: TNNetVolume;
   TotalKL, TotalObj: TNeuralFloat;
   TokenCount: integer;
@@ -1200,26 +1205,29 @@ begin
     A := Advantages[G];
     Len := Lengths[G];
     LenM1 := Len - 1;
+    Comp := Completions[G];
     for T := 0 to LenM1 do
     begin
+      Tok := Comp[T];
       // Current policy log-prob of the sampled token (forward pass).
-      EncodePrefix(FPolicy, Prompt, Completions[G], T);
+      EncodePrefix(FPolicy, Prompt, Comp, T);
       FPolicy.Compute(FInput);
       Y := FPolicy.GetLastLayer().Output;
-      P := Max(Y.FData[Completions[G][T]], FProbFloor);
+      P := Max(Y.FData[Tok], FProbFloor);
       LogPi := Ln(P);
       // Reference log-prob (frozen) for the KL estimator.
-      EncodePrefix(FReference, Prompt, Completions[G], T);
+      EncodePrefix(FReference, Prompt, Comp, T);
       FReference.Compute(FInput);
-      PRef := Max(FReference.GetLastLayer().Output.FData[Completions[G][T]],
+      PRef := Max(FReference.GetLastLayer().Output.FData[Tok],
                   FProbFloor);
       LogRef := Ln(PRef);
 
       // DeepSeek k3 unbiased per-token KL estimator (>= 0):
       //   KL_t = exp(logref-logpi) - (logref-logpi) - 1
       // d KL_t / d logpi = 1 - exp(logref - logpi).
-      KLt := Exp(LogRef - LogPi) - (LogRef - LogPi) - 1;
-      KLGrad := 1 - Exp(LogRef - LogPi);
+      E := NeuralExp(LogRef - LogPi);  // #4/#16: one fast exp reused
+      KLt := E - (LogRef - LogPi) - 1;
+      KLGrad := 1 - E;
       TotalKL := TotalKL + KLt;
 
       // Policy-gradient term with optional PPO clip.
@@ -1247,7 +1255,7 @@ begin
       // L = -PG_objective + beta*KL  ->  dL/dlogpi = -PGGrad + beta*KLGrad.
       // Logit gradient = ErrScale*(y - onehot) with ErrScale = dL/dlogpi.
       ErrScale := -PGGrad + FBeta * KLGrad;
-      BackpropagateToken(Prompt, Completions[G], T, Completions[G][T], ErrScale);
+      BackpropagateToken(Prompt, Comp, T, Tok, ErrScale);
       Inc(TokenCount);
     end;
   end;
