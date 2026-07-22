@@ -41269,9 +41269,8 @@ begin
     end;
   // B = InT directly: [t*InCh + i], one column per input timestep.
   FConvPatchMat.ReSize(InLen * InCh, 1, 1);
-  for t := 0 to InLenM1 do
-    for i := 0 to InChM1 do
-      FConvPatchMat.FData[t * InCh + i] := InT[t * InCh + i];
+  if InLen * InCh > 0 then
+    Move(InT[0], FConvPatchMat.FData[0], InLen * InCh * csNeuralFloatSize);
   FConvResMat.ReSize(InLen * rows, 1, 1);
   FConvDotCL.PrepareForCompute(FConvWInter, FConvPatchMat, InCh);
   FConvDotCL.Compute(FConvWInter, FConvPatchMat, {ActFN}0, true, true);
@@ -71964,7 +71963,7 @@ begin
         s := s + scores[j];
       end;
       invS := 1.0 / s;
-      for j := 0 to NKM1 do scores[j] := scores[j] * invS;
+      TNNetVolume.Mul(@scores[0], invS, NK);
       // Accumulate V weighted by softmax scores, j-outer so each add is a
       // contiguous MulAdd over the head slice (rule #13/E).
       FillChar(O[qOfs], hd * csNeuralFloatSize, 0);
@@ -75643,7 +75642,7 @@ begin
     end;
     // fallback: if the query masks ALL keys, unmask everything.
     if AllowedCnt = 0 then
-      for p := 0 to NumKeysM1 do Bias.FData[biasQBase + p] := 0;
+      FillChar(Bias.FData[biasQBase], NumKeys * csNeuralFloatSize, 0);
   end;
 end;
 
@@ -75755,8 +75754,7 @@ begin
     // no-object slot (c = NumLabels): contributes to the denominator only.
     SumExp := SumExp + NeuralExp(ClassLogits.FData[clBase + NumLabels] - MaxLogit);
     invSum := 1.0 / SumExp;
-    for c := 0 to NumLabelsM1 do
-      ClsProb[cpBase + c] := ClsProb[cpBase + c] * invSum;
+    TNNetVolume.Mul(@ClsProb[cpBase], invSum, NumLabels);
   end;
   // per pixel: argmax_c sum_q clsprob[q,c] * sigmoid(mask[q,p]).
   // #5/#11: sigmoid depends only on (q,p), not c -> precompute Sig[q] once per
