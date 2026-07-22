@@ -88,6 +88,7 @@ var
   Tokens: TNNetStringList;
   CurrentToken, NexToken: string;
   ShouldQuit: boolean;
+  NewCount: integer;
 begin
   pairCounts.Clear;
   pairCounts.Sorted := true;
@@ -114,8 +115,10 @@ begin
           then pairCounts.AddInteger(pair, 1)
           else
           begin
-            pairCounts.Integers[PairIndex] := pairCounts.Integers[PairIndex] + 1;
-            if pairCounts.Integers[PairIndex] > 32 then ShouldQuit := true;
+            // #4: resolve the Integers[] getter once instead of three times.
+            NewCount := pairCounts.Integers[PairIndex] + 1;
+            pairCounts.Integers[PairIndex] := NewCount;
+            if NewCount > 32 then ShouldQuit := true;
           end;
         end;
         if ShouldQuit then break;
