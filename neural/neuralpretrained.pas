@@ -31218,7 +31218,7 @@ var
   Temporal: TNNetVolume;    // (C) the row-0 cosine vector
   SpatialMean: TNNetVolume; // (C)
   Acc, Mean, Variance, Inv, NormVal, Eps: TNeuralFloat;
-  srcPtr: TNeuralFloatArrPtr;
+  srcPtr, smPtr: TNeuralFloatArrPtr;
 begin
   C := Config.FeatureChannels;
   H := Config.FeatureHeight;
@@ -31286,17 +31286,16 @@ begin
     end;
 
     // spatial_image_features = mean over cells of visual_token_features.
-    for ch := 0 to CM1 do
+    // #13: row-outer bulk accumulate; per-channel accumulation order preserved.
+    SpatialMean.Fill(0);
+    smPtr := SpatialMean.GetRawPtr(0);
+    pos := 0;
+    for CellIdx := 0 to NumCellsM1 do
     begin
-      Acc := 0;
-      pos := ch; // #6: carry CellIdx*C + ch instead of a multiply per cell
-      for CellIdx := 0 to NumCellsM1 do
-      begin
-        Acc := Acc + PosFeat.FData[pos];
-        Inc(pos, C);
-      end;
-      SpatialMean.FData[ch] := Acc / NumCells;
+      TNNetVolume.Add(smPtr, PosFeat.GetRawPtr(pos), C);
+      Inc(pos, C);
     end;
+    TNNetVolume.Mul(smPtr, 1.0 / NumCells, C);
 
     // image_features (pre-projection) = cat([spatial_mean ; per-cell tokens]).
     // Token 0 = spatial mean; tokens 1..NumCells = visual_token_features.
@@ -31943,16 +31942,17 @@ begin
     // left/right delay layout (build_delay_pattern_mask, audio_channels==2).
     Off := k_i div Channels;
     SetLength(Delayed[k_i], Len);
-    for t := 0 to LenM1 do
-      // HF build_delay_pattern_mask: a row is placed at shifted columns
-      // [Off .. seq_len+Off) then the lower-triangular BOS mask pads columns
-      // [0 .. Off] (Off+1 leading slots), so the truncated delayed form is
-      // Delayed[k][t] = pad for t <= Off, else raw[k][t-Off] (raw[k][0] is the
-      // dropped BOS slot - the model generates it, it is not an input id).
-      if t <= Off then
-        Delayed[k_i][t] := PadId
-      else
-        Delayed[k_i][t] := Raw[k_i][t - Off];
+    // HF build_delay_pattern_mask: a row is placed at shifted columns
+    // [Off .. seq_len+Off) then the lower-triangular BOS mask pads columns
+    // [0 .. Off] (Off+1 leading slots), so the truncated delayed form is
+    // Delayed[k][t] = pad for t <= Off, else raw[k][t-Off] (raw[k][0] is the
+    // dropped BOS slot - the model generates it, it is not an input id).
+    // #13: split into the pad run then a contiguous shifted copy. For
+    // t=Off+1..LenM1, Raw[k][t-Off] = Raw[k][1..Len-Off-1] (contiguous).
+    for t := 0 to Min(Off, LenM1) do
+      Delayed[k_i][t] := PadId;
+    if Len > Off + 1 then
+      Move(Raw[k_i][1], Delayed[k_i][Off + 1], (Len - Off - 1) * csIntegerSize);
   end;
 end;
 
@@ -31971,11 +31971,11 @@ begin
   begin
     Off := k_i div Channels;
     SetLength(Raw[k_i], OutLen);
-    for t := 0 to OutLenM1 do
-      // Inverse shift: raw[k][t] (for t >= 1) was placed at delayed column
-      // t + Off by the interleave above; raw[k][0] is the dropped BOS slot, so
-      // index 0 reads back the leading pad (callers ignore it / overwrite it).
-      Raw[k_i][t] := Delayed[k_i][t + Off];
+    // Inverse shift: raw[k][t] (for t >= 1) was placed at delayed column
+    // t + Off by the interleave above; raw[k][0] is the dropped BOS slot, so
+    // index 0 reads back the leading pad (callers ignore it / overwrite it).
+    // #13: contiguous int copy of the OutLen-wide window starting at Off.
+    Move(Delayed[k_i][Off], Raw[k_i][0], OutLen * csIntegerSize);
   end;
 end;
 
@@ -37682,12 +37682,16 @@ begin
       continue;
     GlobalIdx := LayerCnt * Config.DecoderHeads + HeadCnt;
     Leaf := CrossLeaves[GlobalIdx];
+    // #12: carry the row bases (Depth=1 -> step is EncFrames); both volumes
+    // share shape (EncFrames, TextLen, 1).
+    rBase := 0;
+    lBase := 0;
     for i := 0 to TextLenM1 do
     begin
-      rBase := Result.GetRawPos(0, i);
-      lBase := Leaf.AttentionWeights.GetRawPos(0, i);
       TNNetVolume.Add(Result.GetRawPtr(rBase),
         Leaf.AttentionWeights.GetRawPtr(lBase), EncFrames);
+      Inc(rBase, EncFrames);
+      Inc(lBase, EncFrames);
     end;
     Inc(AvgN);
   end;
@@ -37704,20 +37708,21 @@ begin
   if MedianKernel > 1 then
   begin
     SetLength(FiltRow, EncFrames);
+    rBase := 0;   // #12: carry the row base (step EncFrames, Depth=1)
     for i := 0 to TextLenM1 do
     begin
-      rBase := Result.GetRawPos(0, i);
       Move(Result.FData[rBase], FiltRow[0], EncFrames * csNeuralFloatSize);
       WhisperMedianFilterRow(FiltRow, EncFrames, MedianKernel);
       Move(FiltRow[0], Result.FData[rBase], EncFrames * csNeuralFloatSize);
+      Inc(rBase, EncFrames);
     end;
   end;
 
   // 4. Per-row (per-token) softmax over frames - normalizes the averaged
   //    map back into a distribution along the audio axis.
+  rBase := 0;   // #12: carry the row base (step EncFrames, Depth=1)
   for i := 0 to TextLenM1 do
   begin
-    rBase := Result.GetRawPos(0, i);
     RowMax := Result.FData[rBase];
     for j := 1 to EncFramesM1 do
     begin
@@ -37735,6 +37740,7 @@ begin
     end;
     if SumExp > 0 then
       TNNetVolume.Mul(Result.GetRawPtr(rBase), 1.0 / SumExp, EncFramesM1 + 1);
+    Inc(rBase, EncFrames);
   end;
 end;
 
@@ -41850,6 +41856,7 @@ var
   c, t: integer;
   InSigMax, TmpMax: integer;
   InSigLenM1, TmpLenM1: integer;
+  InRow, OutRow: TNeuralFloatDynArr;
 begin
   InSigMax := Length(InSig) - 1;
   case Stage.Kind of
@@ -41860,9 +41867,10 @@ begin
         for c := 0 to InSigMax do
         begin
           SetLength(OutSig[c], Length(InSig[c]));
-          InSigLenM1 := Length(InSig[c]) - 1;
+          InRow := InSig[c]; OutRow := OutSig[c];   // #9: bind rows once
+          InSigLenM1 := Length(InRow) - 1;
           for t := 0 to InSigLenM1 do
-            OutSig[c][t] := EnCodecELU(InSig[c][t]);
+            OutRow[t] := EnCodecELU(InRow[t]);
         end;
       end;
     eskResnet:
@@ -41872,9 +41880,10 @@ begin
         for c := 0 to InSigMax do
         begin
           SetLength(Tmp[c], Length(InSig[c]));
-          InSigLenM1 := Length(InSig[c]) - 1;
+          InRow := InSig[c]; OutRow := Tmp[c];      // #9: bind rows once
+          InSigLenM1 := Length(InRow) - 1;
           for t := 0 to InSigLenM1 do
-            Tmp[c][t] := EnCodecELU(InSig[c][t]);
+            OutRow[t] := EnCodecELU(InRow[t]);
         end;
         RunEnCodecConv(Stage.Resnet.Conv1, Tmp, Res, FConfig.UseCausalConv, FProcs);
         ApplyEnCodecELU(Res);
@@ -45531,7 +45540,7 @@ var
   h, cstate, g: TNeuralFloatDynArr;
   step, t0, k, j, baseR, whhBase: integer;
   gi, gf, gg, go, accg: TNeuralFloat;
-  HiddenM1, Hidden4M1, TM1, InSizeM1: integer;
+  HiddenM1, Hidden4M1, TM1, InSizeM1, H2, H3: integer;
 begin
   SetLength(h, Hidden);
   SetLength(cstate, Hidden);
@@ -45540,6 +45549,8 @@ begin
   Hidden4M1 := 4 * Hidden - 1;
   TM1 := T - 1;
   InSizeM1 := InSize - 1;
+  H2 := 2 * Hidden;                       // #5: invariant across time loop
+  H3 := 3 * Hidden;
   for k := 0 to HiddenM1 do begin h[k] := 0; cstate[k] := 0; end;
   SetLength(Outp, Hidden);
   for k := 0 to HiddenM1 do SetLength(Outp[k], T);
@@ -45566,14 +45577,14 @@ begin
     // Gate nonlinearities over the contiguous quarter-blocks of g (i,f,g,o).
     TNNetVolume.VectorSigmoid(Addr(g[0]), Addr(g[0]), Hidden);
     TNNetVolume.VectorSigmoid(Addr(g[Hidden]), Addr(g[Hidden]), Hidden);
-    TNNetVolume.VectorTanh(Addr(g[2 * Hidden]), Addr(g[2 * Hidden]), Hidden);
-    TNNetVolume.VectorSigmoid(Addr(g[3 * Hidden]), Addr(g[3 * Hidden]), Hidden);
+    TNNetVolume.VectorTanh(Addr(g[H2]), Addr(g[H2]), Hidden);
+    TNNetVolume.VectorSigmoid(Addr(g[H3]), Addr(g[H3]), Hidden);
     for k := 0 to HiddenM1 do
     begin
       gi := g[k];
       gf := g[Hidden + k];
-      gg := g[2 * Hidden + k];
-      go := g[3 * Hidden + k];
+      gg := g[H2 + k];
+      go := g[H3 + k];
       cstate[k] := gf * cstate[k] + gi * gg;
       h[k] := go * pcr_tanhf(cstate[k]); // #16: fast trap-free tanh (single)
       Outp[k][t0] := h[k];
@@ -46374,7 +46385,6 @@ var
   AQW, AQB, AKW, AKB, AVW, AVB, AOW, AOB: TNeuralFloatDynArr; // #9: bound per-L
   FfIn, FfMid, FfOut: TNNetFloatDynArr2D;
   MaxV, SumE: TNeuralFloat;
-  RelAbs: TNNetFloatDynArr2D;          // abs->rel weights [t1][2T]
   QPtr: TNeuralFloatArrPtr;            // #8: hoisted per-t1 query pointer
   SRow: TNeuralFloatDynArr;            // #9: bound score/logit row
 
@@ -46509,8 +46519,8 @@ begin
       for t1 := 0 to TM1 do
       begin
         ofs := (T - 1) - t1;              // #11: invariant across t2
-        for t2 := 0 to TM1 do
-          Scores[t1][t2] := Scores[t1][t2] + RelLogits[t1][t2 + ofs];
+        // #13: contiguous row add; RelLogits row length 2T-1, ofs+T-1 <= 2T-2.
+        TNNetVolume.Add(Addr(Scores[t1][0]), Addr(RelLogits[t1][ofs]), T);
       end;
       // Softmax over t2.
       for t1 := 0 to TM1 do
@@ -46544,24 +46554,19 @@ begin
       // Direct form: rel_weights[t1][r] = Scores[t1][ r - (T-1) + t1 ] when
       // the col index is in [0,T-1], else 0; with r in [0..2T-2].
       GatherRel(FLayers[L].Attn.RelV, RelEmb);
-      SetLength(RelAbs, T);
+      // #13: fold the RelAbs intermediate away. Its only non-zero band on row
+      // t1 is j = t2+ofs (ofs=(T-1)-t1) with coefficient Scores[t1][t2], so
+      // accumulate RelEmb[t2+ofs] scaled by Scores[t1][t2] directly. Same
+      // (t1,j) pairs, same order, same coefficients (softmax weights ~never 0);
+      // removes the build/scan passes and the per-row SetLength allocations.
       for t1 := 0 to TM1 do
       begin
-        SetLength(RelAbs[t1], 2 * T - 1);
-        for j := 0 to TwoTM2 do
-        begin
-          t2 := j - (T - 1) + t1;
-          if (t2 >= 0) and (t2 < T) then RelAbs[t1][j] := Scores[t1][t2]
-          else RelAbs[t1][j] := 0;
-        end;
+        ofs := (T - 1) - t1;
+        SRow := Scores[t1];
+        for t2 := 0 to TM1 do
+          TNNetVolume.MulAdd(Addr(HeadOut[t1][0]), Addr(RelEmb[t2 + ofs][0]),
+            SRow[t2], HD);
       end;
-      // App E/#13: reorder to contiguous scaled-accumulate over RelEmb rows;
-      // RelAbs rows are mostly zero outside the T-wide band, so the skip is free.
-      for t1 := 0 to TM1 do
-        for j := 0 to TwoTM2 do
-          if RelAbs[t1][j] <> 0 then
-            TNNetVolume.MulAdd(Addr(HeadOut[t1][0]), Addr(RelEmb[j][0]),
-              RelAbs[t1][j], HD);
       // Scatter head output back (#13: contiguous copy, hhHD hoisted #11).
       for i := 0 to TM1 do
         Move(HeadOut[i][0], AttnOut[i][hhHD], HD * csNeuralFloatSize);
