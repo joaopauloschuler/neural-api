@@ -1282,10 +1282,12 @@ procedure TStatePredictionClass.Prediction(
 var
   I, J, MaxIndex: word;
   ABF: TRunOperation;
-  Probability, TotalCount: single;
+  Probability, TotalCount, relP: single;
   NextState: byte;
   PredictionPos: integer;
   Hi: longint;
+  MinSample: integer;   // FCS.MinSampleForPrediction hoisted (#5)
+  UseBelief: boolean;   // FUseBelief hoisted (#5)
   NGP: ^TNeuronGroup;   // pointer to the current group record (rule #4/#7-spirit)
 begin
   ABCopy(PNextStates, PCurrentStates); // LOOK
@@ -1303,6 +1305,9 @@ begin
   else
     MaxIndex := FMaxOperationNeuronCount - 1;
 
+  MinSample := FCS.MinSampleForPrediction;   // #5: loop-invariant, hoist once
+  UseBelief := FUseBelief;                    // #5: loop-invariant, hoist once
+
   for J := 0 to MaxIndex do
   begin
 
@@ -1313,30 +1318,30 @@ begin
 
     NGP := @FNN[I];   // bind once; avoids re-indexing the dynarray record below
     PredictionPos := NGP^.PredictionPos;
-    TotalCount := NGP^.WrongNeuronPredictionCnt +
-      NGP^.CorrectNeuronPredictionCnt + 1;
 
-    if (TotalCount = 0) or not(NGP^.Filled()) then
+    // Gate on the cheap Filled/count tests first (matching PredictClass); only
+    // then compute Probability (a divide) and the relation-probability test
+    // (#5/#8/#4: skip the divide and the pRelationProbability index when gated
+    // out; bind relP once - PredictionPos and pRelationProbability[PredictionPos]
+    // are unchanged by OperateAndTestOperation).
+    if (NGP^.Filled()) and
+      (NGP^.CorrectNeuronPredictionCnt > MinSample) then
     begin
-      Probability := 0;
-    end
-    else if FUseBelief then
-    begin
-      Probability :=
-        (NGP^.CorrectNeuronPredictionCnt + 1) / (TotalCount + 2);
-    end
-    else
-      Probability := NGP^.CorrectNeuronPredictionCnt / TotalCount;  // best method
+      TotalCount := NGP^.WrongNeuronPredictionCnt +
+        NGP^.CorrectNeuronPredictionCnt + 1;
+      if UseBelief then
+        Probability :=
+          (NGP^.CorrectNeuronPredictionCnt + 1) / (TotalCount + 2)
+      else
+        Probability := NGP^.CorrectNeuronPredictionCnt / TotalCount;  // best method
 
-    if (Probability > pRelationProbability[PredictionPos]) and
-      (NGP^.CorrectNeuronPredictionCnt > FCS.MinSampleForPrediction)
-      then
-    begin
-      if (ABF.TestTests(NGP^.TestNeuronLayer) > 0) then
+      relP := pRelationProbability[PredictionPos];
+      if (Probability > relP) and
+        (ABF.TestTests(NGP^.TestNeuronLayer) > 0) then
       begin
         ABF.OperateAndTestOperation(NGP^.OperationNeuronLayer,
           PredictionPos, NextState);
-        if (Probability > pRelationProbability[PredictionPos]) then
+        if (Probability > relP) then
         begin
           PNextStates[PredictionPos] := NextState;
           pRelationProbability[PredictionPos] := Probability;
