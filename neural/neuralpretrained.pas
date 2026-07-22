@@ -40931,10 +40931,7 @@ begin
     for o := 0 to OutDimM1 do
     begin
       Base := o * InDim * K;
-      Norm := 0;
-      for i := 0 to InDimM1 do
-        for k2 := 0 to KM1 do
-          Norm := Norm + Sqr(V.FData[Base + i * K + k2]);
+      Norm := TNNetVolume.DotProduct(@V.FData[Base], @V.FData[Base], InDim * K);
       Norm := Sqrt(Norm);
       if Norm = 0 then Norm := 1;
       for i := 0 to InDimM1 do
@@ -43957,9 +43954,7 @@ begin
       for o := 0 to OutDimM1 do
       begin
         Base := o * InDim * K;
-        Norm := 0;
-        for i := 0 to InDimM1 do
-          for k2 := 0 to KM1 do Norm := Norm + Sqr(V.FData[Base + i * K + k2]);
+        Norm := TNNetVolume.DotProduct(@V.FData[Base], @V.FData[Base], InDim * K);
         Norm := Sqrt(Norm);
         if Norm = 0 then Norm := 1;
         for i := 0 to InDimM1 do
@@ -44712,10 +44707,7 @@ begin
       for o := 0 to OutDimM1 do
       begin
         Base := o * InDim * K;
-        Norm := 0;
-        for i := 0 to InDimM1 do
-          for k2 := 0 to KM1 do
-            Norm := Norm + Sqr(V.FData[Base + i * K + k2]);
+        Norm := TNNetVolume.DotProduct(@V.FData[Base], @V.FData[Base], InDim * K);
         Norm := Sqrt(Norm);
         if Norm = 0 then Norm := 1;
         for i := 0 to InDimM1 do
@@ -56504,9 +56496,10 @@ begin
             IntToStr(Config.VocabSize * Config.DModel) + ').');
         if Config.ScaleEmbedding then EmbedScale := Sqrt(Config.DModel)
         else EmbedScale := 1.0;
-        LpMax := Tmp.Size - 1;
-        for i := 0 to LpMax do
-          DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedScale * Tmp.FData[i];
+        Move(Tmp.FData[0], DecEmbed.FArrNeurons[0].Weights.FData[0],
+          Tmp.Size * csNeuralFloatSize);
+        TNNetVolume.Mul(@DecEmbed.FArrNeurons[0].Weights.FData[0],
+          EmbedScale, Tmp.Size);
         DecEmbed.FlushWeightCache();
         Consumed.Add('decoder.model.decoder.embed_tokens.weight');
         // Tied head: logits = h . embed_tokens^T, NO final_logits_bias.
