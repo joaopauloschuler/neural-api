@@ -2687,9 +2687,8 @@ procedure TNeuralHFTokenizer.ByteLevelPieces(const Segment: string;
   Pieces: TStringList);
 var
   CPs: array of cardinal;
-  CPStr: array of string;
   CPByte: array of integer; // 1-based byte offset where each char starts (+sentinel)
-  Total, Position, Idx, RunStart, RunEnd: integer;
+  Total, Position, Idx, RunStart, RunEnd, SegLen: integer;
 
   // #12: slice the byte range in one Copy instead of concatenating per-codepoint
   // substrings (which is O(n^2) across a run).
@@ -2720,22 +2719,20 @@ var
 
 begin
   // decode UTF-8 into codepoint arrays
-  SetLength(CPs, Length(Segment));
-  SetLength(CPStr, Length(Segment));
-  SetLength(CPByte, Length(Segment) + 1);
+  SegLen := Length(Segment);
+  SetLength(CPs, SegLen);
+  SetLength(CPByte, SegLen + 1);
   Total := 0;
   Position := 1;
-  while Position <= Length(Segment) do
+  while Position <= SegLen do
   begin
     RunStart := Position;
     CPByte[Total] := RunStart;
     CPs[Total] := NextCodePoint(Segment, Position);
-    CPStr[Total] := Copy(Segment, RunStart, Position - RunStart);
     Inc(Total);
   end;
   CPByte[Total] := Position; // sentinel: one past the last byte
   SetLength(CPs, Total);
-  SetLength(CPStr, Total);
   SetLength(CPByte, Total + 1);
 
   Idx := 0;
@@ -2993,9 +2990,9 @@ procedure TNeuralHFTokenizer.SplitCl100kPieces(const Segment: string;
   Pieces: TStringList);
 var
   CPs: array of cardinal;
-  CPStr: array of string;
   CPByte: array of integer; // 1-based byte offset where each char starts (+sentinel)
-  Total, Position, Idx, RunStart, RunEnd, LastNL, DigitCnt, DigitsMax: integer;
+  Total, Position, Idx, RunStart, RunEnd, LastNL, DigitCnt, DigitsMax,
+    SegLen: integer;
   MarksJoin, IdxIsRun: boolean;
 
   // the letter-run class: \p{L}, or [\p{L}\p{M}] in marks-join mode
@@ -3050,22 +3047,20 @@ begin
   MarksJoin := FSplitMarksJoin; // hoisted field read (hot loop)
   DigitsMax := FSplitDigitsMax; // #19: hoisted field read (inner digit loop)
   // decode UTF-8 into codepoint arrays
-  SetLength(CPs, Length(Segment));
-  SetLength(CPStr, Length(Segment));
-  SetLength(CPByte, Length(Segment) + 1);
+  SegLen := Length(Segment);
+  SetLength(CPs, SegLen);
+  SetLength(CPByte, SegLen + 1);
   Total := 0;
   Position := 1;
-  while Position <= Length(Segment) do
+  while Position <= SegLen do
   begin
     RunStart := Position;
     CPByte[Total] := RunStart;
     CPs[Total] := NextCodePoint(Segment, Position);
-    CPStr[Total] := Copy(Segment, RunStart, Position - RunStart);
     Inc(Total);
   end;
   CPByte[Total] := Position; // sentinel: one past the last byte
   SetLength(CPs, Total);
-  SetLength(CPStr, Total);
   SetLength(CPByte, Total + 1);
 
   Idx := 0;
@@ -3147,7 +3142,7 @@ begin
       end
       else
       begin // 7. \s+ : a single whitespace char before non-space
-        Pieces.Add(CPStr[Idx]);
+        Pieces.Add(Collect(Idx, Idx));
         Inc(Idx);
       end;
     end;
@@ -3177,9 +3172,8 @@ procedure TNeuralHFTokenizer.SplitDeepSeekPieces(const Segment: string;
   Pieces: TStringList);
 var
   CPs: array of cardinal;
-  CPStr: array of string;
   CPByte: array of integer; // 1-based byte offset where each char starts (+sentinel)
-  Total, Position, Idx, RunStart, RunEnd: integer;
+  Total, Position, Idx, RunStart, RunEnd, SegLen: integer;
 
   // #12: slice the byte range in one Copy instead of per-codepoint concat.
   function Collect(StartIdx, EndIdx: integer): string;
@@ -3221,22 +3215,20 @@ var
 
 begin
   // decode UTF-8 into codepoint arrays
-  SetLength(CPs, Length(Segment));
-  SetLength(CPStr, Length(Segment));
-  SetLength(CPByte, Length(Segment) + 1);
+  SegLen := Length(Segment);
+  SetLength(CPs, SegLen);
+  SetLength(CPByte, SegLen + 1);
   Total := 0;
   Position := 1;
-  while Position <= Length(Segment) do
+  while Position <= SegLen do
   begin
     RunStart := Position;
     CPByte[Total] := RunStart;
     CPs[Total] := NextCodePoint(Segment, Position);
-    CPStr[Total] := Copy(Segment, RunStart, Position - RunStart);
     Inc(Total);
   end;
   CPByte[Total] := Position; // sentinel: one past the last byte
   SetLength(CPs, Total);
-  SetLength(CPStr, Total);
   SetLength(CPByte, Total + 1);
 
   Idx := 0;
@@ -3245,7 +3237,7 @@ begin
     // 1. [\r\n] : each CR / LF isolated
     if IsNL(CPs[Idx]) then
     begin
-      Pieces.Add(CPStr[Idx]);
+      Pieces.Add(Collect(Idx, Idx));
       Inc(Idx);
     end
     // 2. \s?[\p{L}]+  (optional ONE leading space glued to a letter run)
@@ -3282,7 +3274,7 @@ begin
     // 5. Digits(individual) : each digit isolated
     else if IsNumberCP(CPs[Idx]) then
     begin
-      Pieces.Add(CPStr[Idx]);
+      Pieces.Add(Collect(Idx, Idx));
       Inc(Idx);
     end
     else
@@ -3328,9 +3320,8 @@ procedure TNeuralHFTokenizer.SplitO200kPieces(const Segment: string;
   Pieces: TStringList);
 var
   CPs: array of cardinal;
-  CPStr: array of string;
   CPByte: array of integer; // 1-based byte offset where each char starts (+sentinel)
-  Total, Position, Idx, RunEnd, LastNL: integer;
+  Total, Position, Idx, RunEnd, LastNL, SegLen: integer;
 
   // #12: slice the byte range in one Copy instead of per-codepoint concat.
   function Collect(StartIdx, EndIdx: integer): string;
@@ -3394,7 +3385,8 @@ var
     P := Idx;
     LeadOk := false;
     // optional leading non-CR/LF non-letter non-number char
-    if (P <= High(CPs)) and (not IsNewlineCP(CPs[P])) and
+    // #2/#8: Total = Length(CPs) here (set after decode), so P < Total == P <= High(CPs)
+    if (P < Total) and (not IsNewlineCP(CPs[P])) and
       (not IsLetterCP(CPs[P])) and (not IsNumberCP(CPs[P])) then
     begin
       LeadOk := true;
@@ -3402,14 +3394,14 @@ var
     end;
     // [\p{Lu}...]* greedy uppercase run
     UpperEnd := P - 1;
-    while (P <= High(CPs)) and IsUpperLetterCP(CPs[P]) do
+    while (P < Total) and IsUpperLetterCP(CPs[P]) do
     begin
       UpperEnd := P;
       Inc(P);
     end;
     // [\p{Ll}...]+ : alt 1 requires >=1 lowercase letter here
     LowerEnd := P - 1;
-    while (P <= High(CPs)) and IsLowerLetterCP(CPs[P]) do
+    while (P < Total) and IsLowerLetterCP(CPs[P]) do
     begin
       LowerEnd := P;
       Inc(P);
@@ -3439,22 +3431,20 @@ var
 
 begin
   // decode UTF-8 into codepoint arrays
-  SetLength(CPs, Length(Segment));
-  SetLength(CPStr, Length(Segment));
-  SetLength(CPByte, Length(Segment) + 1);
+  SegLen := Length(Segment);
+  SetLength(CPs, SegLen);
+  SetLength(CPByte, SegLen + 1);
   Total := 0;
   Position := 1;
-  while Position <= Length(Segment) do
+  while Position <= SegLen do
   begin
     LastNL := Position;
     CPByte[Total] := LastNL;
     CPs[Total] := NextCodePoint(Segment, Position);
-    CPStr[Total] := Copy(Segment, LastNL, Position - LastNL);
     Inc(Total);
   end;
   CPByte[Total] := Position; // sentinel: one past the last byte
   SetLength(CPs, Total);
-  SetLength(CPStr, Total);
   SetLength(CPByte, Total + 1);
 
   Idx := 0;
@@ -3517,7 +3507,7 @@ begin
       end
       else
       begin // 7. \s+ : a single whitespace char before non-space
-        Pieces.Add(CPStr[Idx]);
+        Pieces.Add(Collect(Idx, Idx));
         Inc(Idx);
       end;
     end;
@@ -3649,7 +3639,8 @@ var
   SegId: array of integer;    // backtracked ids, collected in reverse
   SegStart: array of integer; // backtracked start CHAR index of each segment
   Total, Position, SegCnt, I, J, BestPrev, TokenId: integer;
-  JM1, CPJ: integer;
+  JM1, CPJ, CPI, PieceLen: integer;
+  BSI: double;
   BestScore: array of double; // best score to reach char-boundary J (0..Total)
   BackPtr: array of integer;  // start char index of the piece ending at J
   BackId: array of integer;   // vocab id of that piece, or -1 for unk
@@ -3694,10 +3685,11 @@ begin
   if PieceText = '' then exit;
   // Char-boundary table: CPStart[i] is the 1-based byte offset of char i,
   // with a sentinel one past the last byte.
-  SetLength(CPStart, Length(PieceText) + 1);
+  PieceLen := Length(PieceText);
+  SetLength(CPStart, PieceLen + 1);
   Total := 0;
   Position := 1;
-  while Position <= Length(PieceText) do
+  while Position <= PieceLen do
   begin
     CPStart[Total] := Position;
     NextCodePoint(PieceText, Position);
@@ -3725,15 +3717,17 @@ begin
     CPJ := CPStart[J]; // #17: invariant across the inner I loop
     for I := 0 to JM1 do
     begin
-      if BestScore[I] = NegInfinity then continue;
-      Sub := Copy(PieceText, CPStart[I], CPJ - CPStart[I]);
+      BSI := BestScore[I]; // #4: bound once per I iteration
+      if BSI = NegInfinity then continue;
+      CPI := CPStart[I];
+      Sub := Copy(PieceText, CPI, CPJ - CPI);
       TokenId := VocabFind(Sub);
       if TokenId >= 0 then
-        CandScore := BestScore[I] + FUniScore[TokenId]
+        CandScore := BSI + FUniScore[TokenId]
       else if J = I + 1 then
       begin
         // single-character unk node (spans exactly one character)
-        CandScore := BestScore[I] + UnkScore;
+        CandScore := BSI + UnkScore;
         TokenId := -1;
       end
       else
@@ -3788,12 +3782,13 @@ end;
 // \t\n\r to spaces; handle_chinese_chars pads CJK ideographs with spaces.
 function TNeuralHFTokenizer.BertNormalize(const Segment: string): string;
 var
-  Position: integer;
+  Position, SegLen: integer;
   CP, Base: cardinal;
 begin
   Result := '';
   Position := 1;
-  while Position <= Length(Segment) do
+  SegLen := Length(Segment);
+  while Position <= SegLen do
   begin
     CP := NextCodePoint(Segment, Position);
     if FBertCleanText then
@@ -3823,13 +3818,14 @@ end;
 procedure TNeuralHFTokenizer.BertPieces(const Segment: string;
   Pieces: TStringList);
 var
-  Position, RunStart: integer;
+  Position, RunStart, SegLen: integer;
   CP: cardinal;
   Current: string;
 begin
   Current := '';
   Position := 1;
-  while Position <= Length(Segment) do
+  SegLen := Length(Segment);
+  while Position <= SegLen do
   begin
     RunStart := Position;
     CP := NextCodePoint(Segment, Position);
@@ -3858,17 +3854,18 @@ procedure TNeuralHFTokenizer.WordPieceWord(const WordText: string;
   Ids: TIntegerList);
 var
   CPByte: array of integer; // 1-based byte offset where each char starts (+sentinel)
-  Total, Position: integer;
-  StartIdx, EndIdx, TokenId, Found, Cnt, MatchedCnt: integer;
+  Total, Position, WordLen: integer;
+  StartIdx, EndIdx, TokenId, Found, Cnt, MatchedCnt, BStart: integer;
   Sub: string;
   Matched: TIntegerList;
 begin
   // split the word into codepoints, recording byte offsets so a substring can
   // be sliced with a single Copy (#13) instead of per-codepoint concatenation.
-  SetLength(CPByte, Length(WordText) + 1);
+  WordLen := Length(WordText);
+  SetLength(CPByte, WordLen + 1);
   Total := 0;
   Position := 1;
-  while Position <= Length(WordText) do
+  while Position <= WordLen do
   begin
     CPByte[Total] := Position;
     NextCodePoint(WordText, Position);
@@ -3888,9 +3885,10 @@ begin
     begin
       Found := -1;
       EndIdx := Total;
+      BStart := CPByte[StartIdx]; // #11/#4: invariant across the EndIdx loop
       while EndIdx > StartIdx do
       begin
-        Sub := Copy(WordText, CPByte[StartIdx], CPByte[EndIdx] - CPByte[StartIdx]);
+        Sub := Copy(WordText, BStart, CPByte[EndIdx] - BStart);
         if StartIdx > 0 then Sub := FWPPrefix + Sub;
         TokenId := VocabFind(Sub);
         if TokenId >= 0 then
@@ -4186,13 +4184,14 @@ end;
 
 procedure TNeuralHFTokenizer.Encode(const Text: string; Ids: TIntegerList);
 var
-  Position, SegStart, TokenIndex: integer;
+  Position, SegStart, TokenIndex, TextLen: integer;
 begin
   if GetVocabSize() = 0 then
     raise EHFTokenizerError.Create('Encode called before LoadFromFile.');
   Position := 1;
   SegStart := 1;
-  while Position <= Length(Text) do
+  TextLen := Length(Text); // #2/#5: Text is const, not mutated in loop
+  while Position <= TextLen do
   begin
     if FindAddedToken(Text, Position, TokenIndex) then
     begin
@@ -4327,12 +4326,12 @@ begin
           // surface is just that space). Claim one source whitespace byte if
           // the source has whitespace at the cursor; if not, it is a synthetic
           // prepended space -- drop it from the surface without advancing.
-          if (Cursor <= Length(Text)) and IsWs(Text[Cursor]) then
+          if (Cursor <= TextLen) and IsWs(Text[Cursor]) then
           begin
             if StartPos = 0 then StartPos := Cursor;
             Inc(Cursor);
             // collapse any further source whitespace into this one span
-            while (Cursor <= Length(Text)) and IsWs(Text[Cursor]) do
+            while (Cursor <= TextLen) and IsWs(Text[Cursor]) do
               Inc(Cursor);
           end;
           Inc(SurfPos);
@@ -4340,9 +4339,9 @@ begin
         end;
         // A non-whitespace surface byte must match the source byte exactly.
         // Skip leading source whitespace once (token order stays monotonic).
-        while (Cursor <= Length(Text)) and IsWs(Text[Cursor]) do
+        while (Cursor <= TextLen) and IsWs(Text[Cursor]) do
           Inc(Cursor);
-        if (Cursor <= Length(Text)) and (Text[Cursor] = C) then
+        if (Cursor <= TextLen) and (Text[Cursor] = C) then
         begin
           if StartPos = 0 then StartPos := Cursor;
           if WordStart = 0 then WordStart := Cursor;
@@ -4380,7 +4379,7 @@ end;
 function TNeuralHFTokenizer.DecodeToken(Id: integer): string;
 var
   Token: string;
-  Position, Cnt, DecReplaceHi, HiNib, LoNib: integer;
+  Position, Cnt, DecReplaceHi, HiNib, LoNib, TokenLen: integer;
   CP: cardinal;
 
   // Hex digit -> nibble value (0..15), or -1 if not a hex digit. Matches the
@@ -4402,7 +4401,8 @@ begin
   if FByteLevel then
   begin
     Position := 1;
-    while Position <= Length(Token) do
+    TokenLen := Length(Token);
+    while Position <= TokenLen do
     begin
       CP := NextCodePoint(Token, Position);
       if (CP <= cardinal(High(FCPToByte))) and (FCPToByte[CP] >= 0)
