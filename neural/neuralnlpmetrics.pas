@@ -1777,7 +1777,7 @@ end;
 // Classic O(|cand|*|ref|) two-row LCS length.
 function LCSLength(const A, B: TNeuralIntegerArray): integer;
 var
-  Prev, Curr: array of integer;
+  Prev, Curr, Tmp: array of integer;
   RowIdx, ColIdx, LenA, LenB: integer;
 begin
   Result := 0;
@@ -1794,7 +1794,9 @@ begin
       if A[RowIdx - 1] = B[ColIdx - 1]
       then Curr[ColIdx] := Prev[ColIdx - 1] + 1
       else Curr[ColIdx] := Max(Prev[ColIdx], Curr[ColIdx - 1]);
-    Prev := Copy(Curr, 0, Length(Curr));
+    // Two-row swap: every Curr[0..LenB] is overwritten next row, so exchanging
+    // the row references is exact and avoids a per-row heap copy (#17 spirit).
+    Tmp := Prev; Prev := Curr; Curr := Tmp;
   end;
   Result := Prev[Length(B)];
 end;

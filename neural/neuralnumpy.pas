@@ -559,8 +559,24 @@ begin
   end;
 end;
 
+// Numeric tag for a normalized dtype, resolved once so the per-element writer
+// switches on an integer instead of re-running up to 8 string compares each
+// element (#5/#8). Tags: 0=f4 1=f8 2=f2 3=i1/u1 4=i2/u2 5=i4/u4 6=i8/u8.
+function DTypeTag(const DType: string): integer;
+begin
+  if DType = 'f4' then Result := 0
+  else if DType = 'f8' then Result := 1
+  else if DType = 'f2' then Result := 2
+  else if (DType = 'i1') or (DType = 'u1') then Result := 3
+  else if (DType = 'i2') or (DType = 'u2') then Result := 4
+  else if (DType = 'i4') or (DType = 'u4') then Result := 5
+  else if (DType = 'i8') or (DType = 'u8') then Result := 6
+  else
+    raise ENumpyError.CreateFmt('numpy: cannot write dtype "%s"', [DType]);
+end;
+
 procedure AppendElement(var Buf: TBytes; var Pos: integer;
-  const DType: string; Value: Single);
+  Tag: integer; Value: Single);
 var
   u: Cardinal;
   d: Double;
@@ -568,14 +584,15 @@ var
   w: Word;
   i64: Int64;
 begin
-  if DType = 'f4' then
+  case Tag of
+  0: // f4
   begin
     u := PCardinal(@Value)^;
     Buf[Pos] := u and $FF; Buf[Pos+1] := (u shr 8) and $FF;
     Buf[Pos+2] := (u shr 16) and $FF; Buf[Pos+3] := (u shr 24) and $FF;
     Inc(Pos, 4);
-  end
-  else if DType = 'f8' then
+  end;
+  1: // f8
   begin
     d := Value;
     pd := PCardinal(@d);
@@ -585,30 +602,30 @@ begin
     Buf[Pos+4] := pd^ and $FF; Buf[Pos+5] := (pd^ shr 8) and $FF;
     Buf[Pos+6] := (pd^ shr 16) and $FF; Buf[Pos+7] := (pd^ shr 24) and $FF;
     Inc(Pos, 8);
-  end
-  else if DType = 'f2' then
+  end;
+  2: // f2
   begin
     w := EncodeF16(Value);
     Buf[Pos] := w and $FF; Buf[Pos+1] := (w shr 8) and $FF;
     Inc(Pos, 2);
-  end
-  else if (DType = 'i1') or (DType = 'u1') then
+  end;
+  3: // i1/u1
   begin
     Buf[Pos] := Round(Value) and $FF; Inc(Pos);
-  end
-  else if (DType = 'i2') or (DType = 'u2') then
+  end;
+  4: // i2/u2
   begin
     i64 := Round(Value);
     Buf[Pos] := i64 and $FF; Buf[Pos+1] := (i64 shr 8) and $FF; Inc(Pos, 2);
-  end
-  else if (DType = 'i4') or (DType = 'u4') then
+  end;
+  5: // i4/u4
   begin
     i64 := Round(Value);
     Buf[Pos] := i64 and $FF; Buf[Pos+1] := (i64 shr 8) and $FF;
     Buf[Pos+2] := (i64 shr 16) and $FF; Buf[Pos+3] := (i64 shr 24) and $FF;
     Inc(Pos, 4);
-  end
-  else if (DType = 'i8') or (DType = 'u8') then
+  end;
+  6: // i8/u8
   begin
     i64 := Round(Value);
     Buf[Pos]   := i64 and $FF;        Buf[Pos+1] := (i64 shr 8) and $FF;
@@ -616,9 +633,8 @@ begin
     Buf[Pos+4] := (i64 shr 32) and $FF; Buf[Pos+5] := (i64 shr 40) and $FF;
     Buf[Pos+6] := (i64 shr 48) and $FF; Buf[Pos+7] := (i64 shr 56) and $FF;
     Inc(Pos, 8);
-  end
-  else
-    raise ENumpyError.CreateFmt('numpy: cannot write dtype "%s"', [DType]);
+  end;
+  end;
 end;
 
 function BuildNpyBlob(Src: TNNetVolume; const pShape: array of Int64;
@@ -631,7 +647,7 @@ var
   HeaderLen, TotalHeader, PadTo: integer;
   PreambleLen: integer;
   DataPos: integer;
-  pShapeHi, ShapeHi, HeaderTextLen: integer;
+  pShapeHi, ShapeHi, HeaderTextLen, Tag: integer;
   NumElementsM1: Int64;
 begin
   // normalize dtype (lower, strip byte-order if caller passed one)
@@ -702,8 +718,9 @@ begin
   else
   begin
     NumElementsM1 := NumElements - 1;
+    Tag := DTypeTag(DType);   // resolve dtype dispatch once, not per element (#5)
     for i := 0 to NumElementsM1 do
-      AppendElement(Result, DataPos, DType, Src.FData[i]);
+      AppendElement(Result, DataPos, Tag, Src.FData[i]);
   end;
 end;
 
@@ -1034,6 +1051,7 @@ var
   NameBytes: TBytes;
   Crc, CompSize: Cardinal;
   LocalOfs: array of Cardinal;
+  Crcs: array of Cardinal;
   CdStart: Cardinal;
   Hdr: TBytes;
 
@@ -1054,6 +1072,7 @@ begin
   n := FKeys.Count;
   nM1 := n - 1;
   SetLength(LocalOfs, n);
+  SetLength(Crcs, n);
   Stream := TFileStream.Create(FFileName, fmCreate);
   try
     // local file headers + data
@@ -1065,7 +1084,8 @@ begin
       EntryNameLenM1 := Length(EntryName) - 1;
       for P := 0 to EntryNameLenM1 do
         NameBytes[P] := Ord(EntryName[P + 1]);
-      Crc := Crc32Of(FBlobs[i]);
+      Crc := Crc32Of(FBlobs[i]);   // computed once here, reused in central dir
+      Crcs[i] := Crc;
       CompSize := Length(FBlobs[i]);
       SetLength(Hdr, 30);
       P := 0;
@@ -1094,7 +1114,7 @@ begin
       EntryNameLenM1 := Length(EntryName) - 1;
       for P := 0 to EntryNameLenM1 do
         NameBytes[P] := Ord(EntryName[P + 1]);
-      Crc := Crc32Of(FBlobs[i]);
+      Crc := Crcs[i];              // reuse first-loop CRC (no second byte pass)
       CompSize := Length(FBlobs[i]);
       SetLength(Hdr, 46);
       P := 0;

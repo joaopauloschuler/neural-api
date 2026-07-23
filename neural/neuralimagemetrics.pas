@@ -953,7 +953,7 @@ var
   Win: TIMDoubleArray;
   half, oy, ox, wy, wx, wi, pix, rowB: integer;
   outH, outW, cnt, outHM1, outWM1, WinM1: integer;
-  mx, my, sxx, syy, sxy, gw, a, b: Double;
+  mx, my, sxx, syy, sxy, gw, a, b, wa, wb: Double;
   a1, a2, b1, b2, ssimSum: Double;
 begin
   if (H < cSSIMWin) or (W < cSSIMWin) then
@@ -982,11 +982,13 @@ begin
           gw := Win[wi];
           a := PA[pix];
           b := PB[pix];
-          mx := mx + gw * a;
-          my := my + gw * b;
-          sxx := sxx + gw * a * a;
-          syy := syy + gw * b * b;
-          sxy := sxy + gw * a * b;
+          wa := gw * a;                 // #4: gw*a computed once
+          wb := gw * b;                 // #4: gw*b computed once
+          mx := mx + wa;
+          my := my + wb;
+          sxx := sxx + wa * a;          // (gw*a)*a = gw*a*a, left-assoc
+          syy := syy + wb * b;
+          sxy := sxy + wa * b;
           Inc(wi);
         end;
       end;
@@ -1029,7 +1031,7 @@ end;
 procedure AvgPool2x2(const Plane: TIMDoubleArray; H, W: integer;
   out OutPlane: TIMDoubleArray; out OH, OW: integer);
 var
-  y, x, OHM1, OWM1: integer;
+  y, x, OHM1, OWM1, r0, r1, dst, c: integer;
 begin
   OH := H div 2;
   OW := W div 2;
@@ -1037,12 +1039,21 @@ begin
   OWM1 := OW - 1;
   SetLength(OutPlane, OH * OW);
   for y := 0 to OHM1 do
+  begin
+    r0 := (2 * y) * W;   // #11: row bases, once per y
+    r1 := r0 + W;
+    dst := y * OW;
     for x := 0 to OWM1 do
-      OutPlane[y * OW + x] := 0.25 *
-        (Plane[(2 * y) * W + (2 * x)] +
-         Plane[(2 * y) * W + (2 * x + 1)] +
-         Plane[(2 * y + 1) * W + (2 * x)] +
-         Plane[(2 * y + 1) * W + (2 * x + 1)]);
+    begin
+      c := 2 * x;        // #4: 2*x once
+      OutPlane[dst] := 0.25 *
+        (Plane[r0 + c] +
+         Plane[r0 + c + 1] +
+         Plane[r1 + c] +
+         Plane[r1 + c + 1]);
+      Inc(dst);          // #6
+    end;
+  end;
 end;
 
 // Per-scale luminance (l) and contrast-structure (cs) means over the valid
@@ -1053,7 +1064,7 @@ var
   Win: TIMDoubleArray;
   oy, ox, wy, wx, wi, pix, rowB: integer;
   outH, outW, cnt, outHM1, outWM1, WinM1: integer;
-  mx, my, sxx, syy, sxy, gw, a, b: Double;
+  mx, my, sxx, syy, sxy, gw, a, b, wa, wb: Double;
   lSum, csSum: Double;
 begin
   if (H < cSSIMWin) or (W < cSSIMWin) then
@@ -1080,11 +1091,13 @@ begin
           gw := Win[wi];
           a := PA[pix];
           b := PB[pix];
-          mx := mx + gw * a;
-          my := my + gw * b;
-          sxx := sxx + gw * a * a;
-          syy := syy + gw * b * b;
-          sxy := sxy + gw * a * b;
+          wa := gw * a;                 // #4: gw*a computed once
+          wb := gw * b;                 // #4: gw*b computed once
+          mx := mx + wa;
+          my := my + wb;
+          sxx := sxx + wa * a;          // (gw*a)*a = gw*a*a, left-assoc
+          syy := syy + wb * b;
+          sxy := sxy + wa * b;
           Inc(wi);
         end;
       end;
@@ -1169,7 +1182,7 @@ var
   Win: TIMDoubleArray;
   oy, ox, wy, wx, wi, pix, gpix, rowB: integer;
   outH, outW, cnt, outHM1, outWM1, WinM1: integer;
-  mx, my, sxx, syy, sxy, gw, a, b: Double;
+  mx, my, sxx, syy, sxy, gw, a, b, wa, wb: Double;
   a1, a2, b1, b2, bb, sp, ssimSum: Double;
   dSdmx, dSdsxx, dSdsxy, gi: Double;
 begin
@@ -1194,9 +1207,10 @@ begin
           pix := rowB + wx;
           gw := Win[wi];
           a := PA[pix]; b := PB[pix];
-          mx := mx + gw * a; my := my + gw * b;
-          sxx := sxx + gw * a * a; syy := syy + gw * b * b;
-          sxy := sxy + gw * a * b;
+          wa := gw * a; wb := gw * b;               // #4: computed once
+          mx := mx + wa; my := my + wb;
+          sxx := sxx + wa * a; syy := syy + wb * b; // (gw*a)*a, left-assoc
+          sxy := sxy + wa * b;
           Inc(wi);
         end;
       end;
