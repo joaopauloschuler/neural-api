@@ -665,9 +665,23 @@ type
   TNNetSamplerBase = class(TObject)
     protected
       FTokenArr: TNNetTokenArray;
+      // Live candidate window: only FTokenArr[0..FCount-1] is meaningful.
+      // FTokenArr itself stays vocabulary-sized so the load path never
+      // reallocates (rule #17); a truncating stage just lowers FCount, the
+      // shape llama.cpp's llama_token_data_array{size, sorted} uses. FSorted
+      // records whether that window is already in descending Score order, so
+      // a later stage can skip a redundant sort.
+      FCount: integer;
+      FSorted: boolean;
+      // Fill the candidate window from a whole volume / from one pixel and
+      // arm it as untruncated + unsorted.
+      procedure LoadCandidates(Origin: TNNetVolume);
+      procedure LoadCandidatesOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer);
     public
       function GetToken(Origin: TNNetVolume): integer; virtual; abstract;
       function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; virtual; abstract;
+      // Sorts the live window descending by Score. A no-op when FSorted is
+      // already set.
       procedure SortTokenArray();
       // State-init hook for STATEFUL samplers (e.g. TNNetSamplerMirostat carries
       // a running mu across the generation). The streamed decode path calls this
@@ -3354,12 +3368,12 @@ var
   CumulativeSum: TNeuralFloat;
   I, Threshold, Hi, Lo: Integer;
 begin
-  Origin.GetTokenArray(FTokenArr);
+  LoadCandidates(Origin);
   SortTokenArray();
   CumulativeSum := 0;
   Threshold := 0;
-  Hi := High(FTokenArr);
-  Lo := Low(FTokenArr);
+  Hi := FCount - 1;
+  Lo := 0;
   for I := Lo to Hi do
   begin
     CumulativeSum := CumulativeSum + FTokenArr[i].Score;
@@ -3383,12 +3397,12 @@ var
   CumulativeSum: TNeuralFloat;
   I, Threshold, Hi, Lo: Integer;
 begin
-  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
+  LoadCandidatesOnPixel(Origin, PixelX, PixelY);
   SortTokenArray();
   CumulativeSum := 0;
   Threshold := 0;
-  Hi := High(FTokenArr);
-  Lo := Low(FTokenArr);
+  Hi := FCount - 1;
+  Lo := 0;
   for I := Lo to Hi do
   begin
     CumulativeSum := CumulativeSum + FTokenArr[i].Score;
@@ -3419,7 +3433,7 @@ var
   Threshold, KeptSum, Roll, Cumulative: TNeuralFloat;
   I, KeptCount, KeptCountM1, Hi, Lo: integer;
 begin
-  if Length(FTokenArr) = 0 then
+  if FCount = 0 then
   begin
     Result := 0; // defensive: empty distribution
     exit;
@@ -3428,8 +3442,8 @@ begin
   Threshold := FMinP * FTokenArr[0].Score;
   KeptCount := 0;
   KeptSum := 0;
-  Hi := High(FTokenArr);
-  Lo := Low(FTokenArr);
+  Hi := FCount - 1;
+  Lo := 0;
   for I := Lo to Hi do
   begin
     if FTokenArr[I].Score >= Threshold then
@@ -3462,7 +3476,7 @@ end;
 
 function TNNetSamplerMinP.GetToken(Origin: TNNetVolume): integer;
 begin
-  Origin.GetTokenArray(FTokenArr);
+  LoadCandidates(Origin);
   SortTokenArray();
   Result := SampleFromSorted();
 end;
@@ -3470,7 +3484,7 @@ end;
 function TNNetSamplerMinP.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 begin
-  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
+  LoadCandidatesOnPixel(Origin, PixelX, PixelY);
   SortTokenArray();
   Result := SampleFromSorted();
 end;
@@ -3485,7 +3499,7 @@ end;
 
 function TNNetSamplerTopK.GetToken(Origin: TNNetVolume): integer;
 begin
-  Origin.GetTokenArray(FTokenArr);
+  LoadCandidates(Origin);
   SortTokenArray();
   Result := FTokenArr[Random(FTopK)].Token;
 end;
@@ -3493,7 +3507,7 @@ end;
 function TNNetSamplerTopK.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 begin
-  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
+  LoadCandidatesOnPixel(Origin, PixelX, PixelY);
   SortTokenArray();
   Result := FTokenArr[Random(FTopK)].Token;
 end;
@@ -3511,15 +3525,15 @@ var
   KeptSum, Roll, Cumulative: TNeuralFloat;
   I, KeptCount, KeptCountM1: integer;
 begin
-  if Length(FTokenArr) = 0 then
+  if FCount = 0 then
   begin
     Result := 0; // defensive: empty distribution
     exit;
   end;
   // FTokenArr is sorted DESCENDING, so [0..KeptCount-1] are the top-K tokens.
   KeptCount := FTopK;
-  if (KeptCount <= 0) or (KeptCount > Length(FTokenArr)) then
-    KeptCount := Length(FTokenArr); // <=0 or >=vocab => whole row
+  if (KeptCount <= 0) or (KeptCount > FCount) then
+    KeptCount := FCount; // <=0 or >=candidate count => whole window
   KeptSum := 0;
   KeptCountM1 := KeptCount - 1;
   for I := 0 to KeptCountM1 do
@@ -3546,7 +3560,7 @@ end;
 
 function TNNetSamplerWeightedTopK.GetToken(Origin: TNNetVolume): integer;
 begin
-  Origin.GetTokenArray(FTokenArr);
+  LoadCandidates(Origin);
   SortTokenArray();
   Result := SampleFromSorted();
 end;
@@ -3554,7 +3568,7 @@ end;
 function TNNetSamplerWeightedTopK.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 begin
-  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
+  LoadCandidatesOnPixel(Origin, PixelX, PixelY);
   SortTokenArray();
   Result := SampleFromSorted();
 end;
@@ -3574,7 +3588,7 @@ var
   Order: array of integer;     // FTokenArr indices sorted by ascending Dist
   I, J, KeptCount, KeptCountM1, Tmp, N, NM1, NM2, JStart: integer;
 begin
-  N := Length(FTokenArr);
+  N := FCount;
   if N = 0 then
   begin
     Result := 0; // defensive: empty distribution
@@ -3648,14 +3662,14 @@ end;
 
 function TNNetSamplerTypical.GetToken(Origin: TNNetVolume): integer;
 begin
-  Origin.GetTokenArray(FTokenArr);
+  LoadCandidates(Origin);
   Result := SampleTypical();
 end;
 
 function TNNetSamplerTypical.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 begin
-  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
+  LoadCandidatesOnPixel(Origin, PixelX, PixelY);
   Result := SampleTypical();
 end;
 
@@ -3683,7 +3697,7 @@ var
   S, Epsilon, KFloat, ChosenScore: TNeuralFloat;
   I, KeptCount, KeptCountM1, N, NM1, NumFit, NumFitM2, K: integer;
 begin
-  N := Length(FTokenArr);
+  N := FCount;
   if N = 0 then
   begin
     Result := 0; // defensive
@@ -3788,7 +3802,7 @@ end;
 
 function TNNetSamplerMirostat.GetToken(Origin: TNNetVolume): integer;
 begin
-  Origin.GetTokenArray(FTokenArr);
+  LoadCandidates(Origin);
   SortTokenArray();
   Result := SampleAndUpdate();
 end;
@@ -3796,16 +3810,33 @@ end;
 function TNNetSamplerMirostat.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 begin
-  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
+  LoadCandidatesOnPixel(Origin, PixelX, PixelY);
   SortTokenArray();
   Result := SampleAndUpdate();
 end;
 
 { TNNetSamplerBase }
 
+procedure TNNetSamplerBase.LoadCandidates(Origin: TNNetVolume);
+begin
+  Origin.GetTokenArray(FTokenArr);
+  FCount := Length(FTokenArr);
+  FSorted := false;
+end;
+
+procedure TNNetSamplerBase.LoadCandidatesOnPixel(Origin: TNNetVolume;
+  PixelX, PixelY: integer);
+begin
+  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
+  FCount := Length(FTokenArr);
+  FSorted := false;
+end;
+
 procedure TNNetSamplerBase.SortTokenArray;
 begin
-  QuickSortTokenArray(FTokenArr, Low(FTokenArr), High(FTokenArr));
+  if FSorted then exit;
+  if FCount > 1 then QuickSortTokenArray(FTokenArr, 0, FCount - 1);
+  FSorted := true;
 end;
 
 procedure TNNetSamplerBase.Reset();
