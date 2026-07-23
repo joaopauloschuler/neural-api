@@ -2532,10 +2532,12 @@ begin
   // an all-zero row whose argmax would degenerate to token 0.
   if AllowedMass <= 0 then exit;
   InvMass := 1.0 / AllowedMass;
+  // #13/#18: scale the whole row once (AVX in-place), then zero the disallowed
+  // entries. Bit-identical: allowed entries get the same single multiply;
+  // disallowed are scaled-then-zeroed = 0.
+  Probs.Mul(InvMass);
   for I := 0 to SizeM1 do
-    if FAllowedBuf[I]
-    then Probs.Raw[I] := Probs.Raw[I] * InvMass
-    else Probs.Raw[I] := 0;
+    if not FAllowedBuf[I] then Probs.Raw[I] := 0;
 end;
 
 procedure TNNetTokenConstraint.Commit(TokenId: integer);
@@ -3474,19 +3476,16 @@ end;
 function TNNetGrammarMachine.ScratchHas(const Src: array of integer;
   Len: integer): boolean;
 var
-  I, J, FScratchCountM1, LenM1: integer;
-  Same: boolean;
+  I, FScratchCountM1: integer;
 begin
   Result := false;
   FScratchCountM1 := FScratchCount - 1;
-  LenM1 := Len - 1;
   for I := 0 to FScratchCountM1 do
   begin
     if FScratchLen[I] <> Len then continue;
-    Same := true;
-    for J := 0 to LenM1 do
-      if FScratch[I][J] <> Src[J] then begin Same := false; break; end;
-    if Same then exit(true);
+    // #13/App C: exact integer equality via CompareMem (mirrors PrefixEqual).
+    if (Len = 0) or CompareMem(@FScratch[I][0], @Src[0], Len * csIntegerSize) then
+      exit(true);
   end;
 end;
 
@@ -4594,9 +4593,11 @@ begin
     if not FBanBuf[I] then KeptMass := KeptMass + Row.Raw[I];
   if KeptMass <= 0 then exit;
   InvKept := 1.0 / KeptMass;
+  // #13/#18: scale the whole row once (AVX in-place), then zero the banned
+  // entries. Bit-identical (see MaskAllowed).
+  Row.Mul(InvKept);
   for I := 0 to SizeM1 do
-    if FBanBuf[I] then Row.Raw[I] := 0
-    else Row.Raw[I] := Row.Raw[I] * InvKept;
+    if FBanBuf[I] then Row.Raw[I] := 0;
 end;
 
 procedure TNNetNoRepeatNGramProcessor.Commit(TokenId: integer);
@@ -4778,17 +4779,24 @@ end;
 // wraps around UInt64 by design; checks stay off (debug -Co safe).
 {$PUSH}
 {$Q-}{$R-}
+// Threshold form: compares the top-53-bit integer draw directly against
+// GammaThresh (= Gamma * 2^53), letting a per-vocab caller hoist the Gamma*2^53
+// scale once instead of dividing every draw by 2^53. Bit-exact vs the Frac<Gamma
+// form: H shr 11 is <= 53 bits (converts to double exactly) and both scalings
+// are exact power-of-2 exponent shifts.
+function WatermarkGreenFromSeedThresh(Seed: UInt64; TokenId: integer;
+  GammaThresh: double): boolean;
+begin
+  Result := (WatermarkSplitMix64(Seed + UInt64(UInt32(TokenId))) shr 11) < GammaThresh;
+end;
+
 function WatermarkGreenFromSeed(Seed: UInt64; TokenId: integer;
   Gamma: TNeuralFloat): boolean;
-var
-  H: UInt64;
-  Frac: double;
 begin
-  H := WatermarkSplitMix64(Seed + UInt64(UInt32(TokenId)));
-  // Top 53 bits -> uniform double in [0,1) (mirrors the std double-from-u64
-  // trick; avoids the low-bit non-uniformity of a plain modulo).
-  Frac := (H shr 11) * (1.0 / 9007199254740992.0); // 2^53
-  Result := Frac < Gamma;
+  // Delegate to the threshold form so IsGreen / DetectWatermark parity is
+  // preserved (same bit-exact test, one scaling site).
+  Result := WatermarkGreenFromSeedThresh(Seed, TokenId,
+    Gamma * 9007199254740992.0); // 2^53
 end;
 {$POP}
 
@@ -4842,6 +4850,7 @@ var
   I, SizeM1: integer;
   ExpDelta, Sum, v: TNeuralFloat;
   Seed: UInt64;
+  GammaThresh: double;
 begin
   // Delta = 0 (or a degenerate non-positive bias) is a no-op.
   if FDelta <= 0 then exit;
@@ -4854,13 +4863,16 @@ begin
   // The per-step PRNG seed depends only on (FPrevToken, FKey) - invariant
   // across the vocab - so mix it once here instead of inside IsGreen per token.
   Seed := WatermarkSplitMix64(UInt64(UInt32(FPrevToken)) xor FKey);
+  // #5: Gamma*2^53 threshold is invariant across the vocab - hoist once so the
+  // per-token green test is an integer compare with no divide.
+  GammaThresh := FGamma * 9007199254740992.0; // 2^53
   Sum := 0;
   SizeM1 := Row.Size - 1;
   for I := 0 to SizeM1 do
   begin
     // #4: touch FData[I] once (read), scale in place only on green, accumulate.
     v := Row.FData[I];
-    if WatermarkGreenFromSeed(Seed, I, FGamma) then
+    if WatermarkGreenFromSeedThresh(Seed, I, GammaThresh) then
     begin
       v := v * ExpDelta;
       Row.FData[I] := v;
@@ -6053,8 +6065,10 @@ begin
   for S := 0 to StopStringsHi do
   begin
     L := Length(StopStrings[S]);
+    // #13/App C: exact single-byte suffix compare via CompareMem - no Copy
+    // heap-string alloc per probe (guarded by L >= 1 and L <= Length(Text)).
     if (L > Result) and (L >= 1) and (L <= Length(Text)) and
-      (Copy(Text, Length(Text) - L + 1, L) = StopStrings[S]) then
+      CompareMem(@Text[Length(Text) - L + 1], @StopStrings[S][1], L) then
       Result := L;
   end;
 end;
@@ -6852,7 +6866,7 @@ function DecodeDoLa(NN: TNNet; const Prompt: string;
 var
   InputVolume, OutputVolume: TNNetVolume;
   CandSnap, LensOut: TNNetVolume;
-  PFinal, PLens, MFinalLens: array of TNeuralFloat;  // distributions + 0.5(p+q)
+  PFinal, PLens: array of TNeuralFloat;  // final + chosen-lens distributions
   Cands: TNeuralIntegerArray;
   VocabSize, Step, I, C, L, HeadIdx, HeadInIdx, LastLayer: integer;
   NumCand, BestLayer, Best, StopLen, VocabSizeM1, NumCandM1: integer;
@@ -6870,7 +6884,6 @@ begin
   VocabSizeM1 := VocabSize - 1;
   SetLength(PFinal, VocabSize);
   SetLength(PLens, VocabSize);
-  SetLength(MFinalLens, VocabSize);
   LastLayer := NN.GetLastLayerIdx();
   HeadIdx := ResolveHeadStartIdx(NN, HeadStartIdx);
   HeadInIdx := HeadIdx - 1;
@@ -6938,23 +6951,20 @@ begin
           if Total <= 0 then Total := 1.0;
           InvTotal := 1.0 / Total;
           // JS(p_final || p_lens) = 0.5 KL(p||m) + 0.5 KL(q||m), m = 0.5(p+q).
+          // #4/#5: single fused vocab loop - Pl and Pm live in locals; the
+          // PLens/MFinalLens arrays are not needed for JS (PLens is recomputed
+          // for the chosen layer below). Bit-identical.
           JS := 0;
           for I := 0 to VocabSizeM1 do
           begin
             Pl := LensOut.Raw[I] * InvTotal;
             if Pl < 0 then Pl := 0;
-            PLens[I] := Pl;
-            MFinalLens[I] := 0.5 * (PFinal[I] + Pl);
-          end;
-          for I := 0 to VocabSizeM1 do
-          begin
-            Pm := MFinalLens[I];
+            Pm := 0.5 * (PFinal[I] + Pl);
             if Pm < cEps then Continue;
             // Rule #16: JS only ranks candidate layers (if JS > BestJS), so the
             // fast Cephes logf is safe here; 2*Vocab*NumCand RTL Ln removed/token.
             Pf := PFinal[I];
             if Pf >= cEps then JS := JS + 0.5 * Pf * pcr_logf(Pf / Pm);
-            Pl := PLens[I];
             if Pl >= cEps then JS := JS + 0.5 * Pl * pcr_logf(Pl / Pm);
           end;
           if JS > BestJS then
@@ -8036,8 +8046,10 @@ begin
     MatchLen := 0;
     PhraseLenM1 := Length(Phrase) - 1;
     for P := PhraseLenM1 downto 1 do
+      // #13/App C: exact single-byte suffix compare via CompareMem - no Copy
+      // heap-string allocations per probe (guarded by Length(Text) >= P, P >= 1).
       if (Length(Text) >= P) and
-         (Copy(Text, Length(Text) - P + 1, P) = Copy(Phrase, 1, P)) then
+         CompareMem(@Text[Length(Text) - P + 1], @Phrase[1], P) then
       begin
         MatchLen := P;
         Break;
@@ -8072,8 +8084,10 @@ begin
     begin
       PhraseLenM1 := Length(Phrase) - 1;
       for P := PhraseLenM1 downto 1 do
+        // #13/App C: exact single-byte suffix compare via CompareMem - no Copy
+        // heap-string allocations per probe (guarded by Length(Text) >= P).
         if (Length(Text) >= P) and
-           (Copy(Text, Length(Text) - P + 1, P) = Copy(Phrase, 1, P)) then
+           CompareMem(@Text[Length(Text) - P + 1], @Phrase[1], P) then
         begin
           Inc(Result, P);
           Break;
@@ -8097,6 +8111,7 @@ var
   Cand: TBeamArray;
   NewBeam: TBeam;
   Needed: string;
+  NeededSet: set of char;   // #5/#8: value-type set, no heap alloc
   InvDenFin, InvDenExt: TNeuralFloat;
   BSumLP: TNeuralFloat;
   BText: string;
@@ -8149,6 +8164,12 @@ begin
         // makes progress toward every phrase always exists in the pool.
         Needed := NeededNextChars(BText, ForceTokens);
         NeededLen := Length(Needed);
+        // #5/#8: Needed is invariant across the vocab T loop below; build the
+        // membership set once per beam so the dup check is O(1) set-in instead
+        // of an O(NeededLen) Pos scan (which also allocated no heap, but Pos
+        // rescans the string each T). Sets are value types - no heap alloc.
+        NeededSet := [];
+        for I := 1 to NeededLen do Include(NeededSet, Needed[I]);
         // Denominator fixed across both vocab passes for this beam: LenB (EOS,
         // text unchanged) / LenB+1 (extend, one appended char). Hoist (#5).
         LenB := Length(BText);
@@ -8183,7 +8204,7 @@ begin
           begin
             // Skip a token already added through the force-injection pass above
             // (it is a needed next-char) to avoid a duplicate candidate.
-            if Pos(Chr(T), Needed) > 0 then Continue;
+            if Chr(T) in NeededSet then Continue;
             NewBeam.Text := BText + Chr(T);
             NewBeam.Finished := False;
             NewBeam.Score := NewBeam.SumLogProb * InvDenExt;
@@ -8497,7 +8518,7 @@ var
   Targets: TNeuralIntegerArray; // StartTokenId + generated prefix
   EncSeqLen, DecSeqLen, VocabSize: integer;
   EncSeqLenM1, DecSeqLenM1, VocabSizeM1: integer;
-  CurLen, CurLenM1, Pos, Next, Base, ResCount: integer;
+  CurLen, Pos, Next, Base, ResCount: integer;
   MaxLogit, SumExp, InvT: TNeuralFloat;
   ProbsPtr: TNeuralFloatArrPtr;
 begin
@@ -8548,8 +8569,11 @@ begin
     ResCount := 0;
     while True do
     begin
-      CurLenM1 := CurLen - 1;
-      for Pos := 0 to CurLenM1 do DecToks.FData[Pos] := Targets[Pos];
+      // #5/#11: positions 0..CurLen-2 already hold these Targets from prior
+      // iterations (DecToks is Fill'd once above and never reset; Compute does
+      // not mutate its input; Targets is append-only), so only the newly
+      // appended prefix slot needs writing each step. O(1) instead of O(CurLen).
+      DecToks.FData[CurLen - 1] := Targets[CurLen - 1];
       DecoderNet.Compute(DecToks);
       if Sampler = nil then
         // Greedy: argmax over the logits row (Temperature-invariant).
