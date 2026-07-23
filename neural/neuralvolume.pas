@@ -683,6 +683,15 @@ type
       // Sorts the live window descending by Score. A no-op when FSorted is
       // already set.
       procedure SortTokenArray();
+      // Reduces the window to its K highest-Score entries, sorted descending,
+      // WITHOUT sorting the whole vocabulary: an O(n) average quickselect
+      // partition followed by a sort of the K-element prefix. The prefix is
+      // identical to the first K entries of a full descending sort (ties
+      // aside), so callers that only read [0..K-1] are unaffected.
+      procedure SelectTopCandidates(K: integer);
+      // Re-arms the full window and sorts it. Used as the fallback when a
+      // truncated window turned out to be too small to answer the query.
+      procedure RestoreFullWindowSorted();
       // State-init hook for STATEFUL samplers (e.g. TNNetSamplerMirostat carries
       // a running mu across the generation). The streamed decode path calls this
       // at the start of every fresh sequence (right where it Reset()s the
@@ -712,6 +721,10 @@ type
   TNNetSamplerTopP = class (TNNetSamplerBase)
     protected
       FTopP: TNeuralFloat;
+      // Cumulative-mass cut over the candidate window, with an adaptive
+      // top-k pre-truncation so the whole vocabulary is not sorted to find
+      // a nucleus that is typically a few dozen tokens wide.
+      function SampleFromNucleus(): integer;
     public
       constructor Create(TopP: TNeuralFloat);
       function GetToken(Origin: TNNetVolume): integer; override;
@@ -730,6 +743,9 @@ type
   TNNetSamplerMinP = class (TNNetSamplerBase)
     protected
       FMinP: TNeuralFloat;
+      // Counts the p >= MinP * max(p) survivors in linear passes and reduces
+      // the window to exactly that many, so the full row is never sorted.
+      procedure TruncateToMinP();
       // Weighted draw over the (descending-sorted) FTokenArr entries that
       // pass the p >= MinP * max(p) cut.
       function SampleFromSorted(): integer;
@@ -3363,26 +3379,52 @@ begin
   FTopP := TopP;
 end;
 
-function TNNetSamplerTopP.GetToken(Origin: TNNetVolume): integer;
+function TNNetSamplerTopP.SampleFromNucleus(): integer;
+const
+  // Below this window size a full sort is already cheap, so skip the
+  // partial-selection machinery entirely.
+  csTopPAdaptiveMin = 1024;
+  // First guess at the nucleus width. A 0.8-0.95 nucleus over a peaked
+  // next-token distribution is far narrower than this in practice; when it
+  // is not, the retry below pays one full sort and is still correct.
+  csTopPAdaptiveK = 256;
 var
   CumulativeSum: TNeuralFloat;
-  I, Threshold, Hi, Lo: Integer;
+  I, Threshold, Hi: Integer;
+  Found, Truncated: boolean;
 begin
-  LoadCandidates(Origin);
-  SortTokenArray();
-  CumulativeSum := 0;
-  Threshold := 0;
-  Hi := FCount - 1;
-  Lo := 0;
-  for I := Lo to Hi do
+  if FCount = 0 then
   begin
-    CumulativeSum := CumulativeSum + FTokenArr[i].Score;
-    if CumulativeSum > FTopP then
-    begin
-      Threshold := I;
-      Break;
-    end;
+    Result := 0; // defensive: empty distribution
+    exit;
   end;
+  // Sorting 152k tokens to consume the first few dozen is the dominant cost
+  // of this sampler, so try a bounded prefix first (llama.cpp's adaptive
+  // top-k scheme) and only widen when the mass was not reached.
+  Truncated := FCount > csTopPAdaptiveMin;
+  if Truncated then SelectTopCandidates(csTopPAdaptiveK)
+  else SortTokenArray();
+  repeat
+    CumulativeSum := 0;
+    Threshold := 0;
+    Found := false;
+    Hi := FCount - 1;
+    for I := 0 to Hi do
+    begin
+      CumulativeSum := CumulativeSum + FTokenArr[I].Score;
+      if CumulativeSum > FTopP then
+      begin
+        Threshold := I;
+        Found := true;
+        Break;
+      end;
+    end;
+    if Found or (not Truncated) then Break;
+    // The prefix did not hold FTopP of the mass: re-arm the full row (the
+    // partition only permuted it) and redo the scan exactly once.
+    RestoreFullWindowSorted();
+    Truncated := false;
+  until false;
 
   // Randomly select one of the top tokens within the threshold.
   if Threshold > 0 then
@@ -3391,33 +3433,17 @@ begin
     Result := FTokenArr[0].Token; // Fallback in case P is too low.
 end;
 
+function TNNetSamplerTopP.GetToken(Origin: TNNetVolume): integer;
+begin
+  LoadCandidates(Origin);
+  Result := SampleFromNucleus();
+end;
+
 function TNNetSamplerTopP.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
-var
-  CumulativeSum: TNeuralFloat;
-  I, Threshold, Hi, Lo: Integer;
 begin
   LoadCandidatesOnPixel(Origin, PixelX, PixelY);
-  SortTokenArray();
-  CumulativeSum := 0;
-  Threshold := 0;
-  Hi := FCount - 1;
-  Lo := 0;
-  for I := Lo to Hi do
-  begin
-    CumulativeSum := CumulativeSum + FTokenArr[i].Score;
-    if CumulativeSum > FTopP then
-    begin
-      Threshold := I;
-      Break;
-    end;
-  end;
-
-  // Randomly select one of the top tokens within the threshold.
-  if Threshold > 0 then
-    Result := FTokenArr[Random(Threshold)].Token
-  else
-    Result := FTokenArr[0].Token; // Fallback in case P is too low.
+  Result := SampleFromNucleus();
 end;
 
 { TNNetSamplerMinP }
@@ -3474,10 +3500,32 @@ begin
   end;
 end;
 
+procedure TNNetSamplerMinP.TruncateToMinP();
+var
+  I, Hi, KeepCount: integer;
+  MaxScore, Threshold: TNeuralFloat;
+begin
+  if FCount = 0 then exit;
+  // The p >= MinP * max(p) cut does not need a sorted row to be COUNTED, so
+  // find the max and the survivor count in two linear passes and select
+  // exactly that many. Avoids sorting the whole vocabulary for a kept set
+  // that is normally a handful of tokens.
+  Hi := FCount - 1;
+  MaxScore := FTokenArr[0].Score;
+  for I := 1 to Hi do
+    if FTokenArr[I].Score > MaxScore then MaxScore := FTokenArr[I].Score;
+  Threshold := FMinP * MaxScore;
+  KeepCount := 0;
+  for I := 0 to Hi do
+    if FTokenArr[I].Score >= Threshold then Inc(KeepCount);
+  if KeepCount < 1 then KeepCount := 1;
+  SelectTopCandidates(KeepCount);
+end;
+
 function TNNetSamplerMinP.GetToken(Origin: TNNetVolume): integer;
 begin
   LoadCandidates(Origin);
-  SortTokenArray();
+  TruncateToMinP();
   Result := SampleFromSorted();
 end;
 
@@ -3485,7 +3533,7 @@ function TNNetSamplerMinP.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 begin
   LoadCandidatesOnPixel(Origin, PixelX, PixelY);
-  SortTokenArray();
+  TruncateToMinP();
   Result := SampleFromSorted();
 end;
 
@@ -3500,7 +3548,7 @@ end;
 function TNNetSamplerTopK.GetToken(Origin: TNNetVolume): integer;
 begin
   LoadCandidates(Origin);
-  SortTokenArray();
+  SelectTopCandidates(FTopK);
   Result := FTokenArr[Random(FTopK)].Token;
 end;
 
@@ -3508,7 +3556,7 @@ function TNNetSamplerTopK.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 begin
   LoadCandidatesOnPixel(Origin, PixelX, PixelY);
-  SortTokenArray();
+  SelectTopCandidates(FTopK);
   Result := FTokenArr[Random(FTopK)].Token;
 end;
 
@@ -3561,7 +3609,9 @@ end;
 function TNNetSamplerWeightedTopK.GetToken(Origin: TNNetVolume): integer;
 begin
   LoadCandidates(Origin);
-  SortTokenArray();
+  // FTopK <= 0 keeps its documented "whole row" meaning, so only a positive
+  // K may pre-truncate the window.
+  if FTopK > 0 then SelectTopCandidates(FTopK) else SortTokenArray();
   Result := SampleFromSorted();
 end;
 
@@ -3569,7 +3619,7 @@ function TNNetSamplerWeightedTopK.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 begin
   LoadCandidatesOnPixel(Origin, PixelX, PixelY);
-  SortTokenArray();
+  if FTopK > 0 then SelectTopCandidates(FTopK) else SortTokenArray();
   Result := SampleFromSorted();
 end;
 
@@ -3817,6 +3867,58 @@ end;
 
 { TNNetSamplerBase }
 
+// Hoare-partition quickselect: permutes A[0..Count-1] so that the K highest
+// Scores occupy A[0..K-1] (in no particular order). Average O(Count); the
+// median-of-three pivot keeps the already-descending and all-equal inputs
+// (a post-softmax row that a previous stage sorted, or a uniform one) off
+// the quadratic path. Coded by Claude (AI).
+procedure PartialSelectTokenArray(var A: TNNetTokenArray; Count, K: integer);
+var
+  Lo, Hi, I, J, Mid, Bound: integer;
+  Pivot: TNeuralFloat;
+  T: TNNetToken;
+begin
+  if (K <= 0) or (K >= Count) then exit;
+  Lo := 0;
+  Hi := Count - 1;
+  Bound := K - 1;
+  while Lo < Hi do
+  begin
+    // Median of A[Lo], A[Mid], A[Hi] as the pivot value.
+    Mid := (Lo + Hi) shr 1;
+    if A[Mid].Score > A[Lo].Score then
+    begin
+      T := A[Mid]; A[Mid] := A[Lo]; A[Lo] := T;
+    end;
+    if A[Hi].Score > A[Lo].Score then
+    begin
+      T := A[Hi]; A[Hi] := A[Lo]; A[Lo] := T;
+    end;
+    if A[Mid].Score > A[Hi].Score then
+    begin
+      T := A[Mid]; A[Mid] := A[Hi]; A[Hi] := T;
+    end;
+    Pivot := A[Mid].Score;
+    I := Lo;
+    J := Hi;
+    repeat
+      while A[I].Score > Pivot do Inc(I);
+      while A[J].Score < Pivot do Dec(J);
+      if I <= J then
+      begin
+        T := A[I]; A[I] := A[J]; A[J] := T;
+        Inc(I);
+        Dec(J);
+      end;
+    until I > J;
+    // Recurse into the side that still contains the K-th boundary; when the
+    // boundary falls inside the equal-to-pivot gap the split is exact.
+    if Bound <= J then Hi := J
+    else if Bound >= I then Lo := I
+    else Break;
+  end;
+end;
+
 procedure TNNetSamplerBase.LoadCandidates(Origin: TNNetVolume);
 begin
   Origin.GetTokenArray(FTokenArr);
@@ -3837,6 +3939,36 @@ begin
   if FSorted then exit;
   if FCount > 1 then QuickSortTokenArray(FTokenArr, 0, FCount - 1);
   FSorted := true;
+end;
+
+procedure TNNetSamplerBase.SelectTopCandidates(K: integer);
+begin
+  if K <= 0 then K := 1;
+  if K >= FCount then
+  begin
+    // Nothing to truncate - the caller wants the whole window.
+    SortTokenArray();
+    exit;
+  end;
+  if FSorted then
+  begin
+    // Already descending: the top K are exactly the current prefix.
+    FCount := K;
+    exit;
+  end;
+  PartialSelectTokenArray(FTokenArr, FCount, K);
+  FCount := K;
+  SortTokenArray();
+end;
+
+procedure TNNetSamplerBase.RestoreFullWindowSorted();
+begin
+  // PartialSelectTokenArray only PERMUTES the array, so the entries beyond
+  // the truncated window are still the rest of the vocabulary and re-arming
+  // the full length is sound - no reload from the volume needed.
+  FCount := Length(FTokenArr);
+  FSorted := false;
+  SortTokenArray();
 end;
 
 procedure TNNetSamplerBase.Reset();
