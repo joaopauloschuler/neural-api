@@ -190,7 +190,7 @@ begin
       if pairCounts.Count>1 then
       begin
         pairCounts.SortByIntegerDesc;
-        MaxJ := Min(MergesPerLoop - 1, pairCounts.Count);
+        MaxJ := Min(MergesPerLoop - 1, pairCounts.Count - 1);
         for J := 0 to MaxJ do
         begin
           pair := pairCounts[J];
