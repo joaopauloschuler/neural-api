@@ -29398,20 +29398,30 @@ end;
 procedure FillMarianSinusoidalPositions(Layer: TNNetLayer;
   SeqLen, DModel: integer);
 var
-  PosCnt, ChCnt, Half, SeqLenM1, HalfM1: integer;
-  Angle: double;
+  PosCnt, ChCnt, Half, SeqLenM1, HalfM1, ColCos, RowBase: integer;
+  Angle, Freq, LnBase: double;
+  W: TNNetVolume;
 begin
   Half := DModel div 2;
   SeqLenM1 := SeqLen - 1;
   HalfM1 := Half - 1;
-  for PosCnt := 0 to SeqLenM1 do
-    for ChCnt := 0 to HalfM1 do
+  W := Layer.FArrNeurons[0].Weights;
+  LnBase := Ln(10000.0);
+  // ChCnt-outer so the per-channel Exp is evaluated once per column instead of
+  // once per element; the write stays PosCnt/Freq (an exact divide, bit-for-bit
+  // identical to the original PosCnt/Exp(...) - NOT a reciprocal-multiply).
+  for ChCnt := 0 to HalfM1 do
+  begin
+    Freq := Exp(LnBase * (2 * ChCnt) / DModel);
+    ColCos := Half + ChCnt;
+    for PosCnt := 0 to SeqLenM1 do
     begin
-      Angle := PosCnt / Exp(Ln(10000.0) * (2 * ChCnt) / DModel);
-      Layer.FArrNeurons[0].Weights.FData[PosCnt * DModel + ChCnt] := Sin(Angle);
-      Layer.FArrNeurons[0].Weights.FData[PosCnt * DModel + Half + ChCnt] :=
-        Cos(Angle);
+      Angle := PosCnt / Freq;
+      RowBase := PosCnt * DModel;
+      W.FData[RowBase + ChCnt] := Sin(Angle);
+      W.FData[RowBase + ColCos] := Cos(Angle);
     end;
+  end;
   Layer.FlushWeightCache();
 end;
 
@@ -29429,22 +29439,28 @@ procedure FillM2M100SinusoidalPositions(Layer: TNNetLayer;
 const
   M2M100PositionOffset = 2;
 var
-  PosCnt, ChCnt, Half, Row, SeqLenM1, HalfM1: integer;
-  EmbConst, Angle: double;
+  PosCnt, ChCnt, Half, Row, SeqLenM1, HalfM1, ColCos, RowBase: integer;
+  EmbConst, Angle, Factor: double;
+  W: TNNetVolume;
 begin
   Half := DModel div 2;
   EmbConst := Ln(10000.0) / (Half - 1);
   SeqLenM1 := SeqLen - 1;
   HalfM1 := Half - 1;
-  for PosCnt := 0 to SeqLenM1 do
+  W := Layer.FArrNeurons[0].Weights;
+  // ChCnt-outer so the per-channel Exp runs once per column; Angle stays the
+  // exact same Row*Factor product as before (bit-for-bit identical).
+  for ChCnt := 0 to HalfM1 do
   begin
-    Row := PosCnt + M2M100PositionOffset;
-    for ChCnt := 0 to HalfM1 do
+    Factor := Exp(-ChCnt * EmbConst);
+    ColCos := Half + ChCnt;
+    for PosCnt := 0 to SeqLenM1 do
     begin
-      Angle := Row * Exp(-ChCnt * EmbConst);
-      Layer.FArrNeurons[0].Weights.FData[PosCnt * DModel + ChCnt] := Sin(Angle);
-      Layer.FArrNeurons[0].Weights.FData[PosCnt * DModel + Half + ChCnt] :=
-        Cos(Angle);
+      Row := PosCnt + M2M100PositionOffset;
+      Angle := Row * Factor;
+      RowBase := PosCnt * DModel;
+      W.FData[RowBase + ChCnt] := Sin(Angle);
+      W.FData[RowBase + ColCos] := Cos(Angle);
     end;
   end;
   Layer.FlushWeightCache();
@@ -31186,8 +31202,9 @@ end;
 procedure FillFlorence2TemporalTable(Tbl: TNNetVolume;
   MaxPos, EmbedDim: integer);
 var
-  HalfDim, PosCnt, i, MaxPosM1, HalfDimM1: integer;
+  HalfDim, PosCnt, i, MaxPosM1, HalfDimM1, ColSin, ColCos, RowBase: integer;
   EmbStep, Freq, Angle: TNeuralFloat;
+  HasCos: boolean;
 begin
   Tbl.ReSize(MaxPos, 1, EmbedDim);
   Tbl.Fill(0);
@@ -31196,15 +31213,23 @@ begin
   EmbStep := Ln(10000.0) / HalfDim;
   MaxPosM1 := MaxPos - 1;
   HalfDimM1 := HalfDim - 1;
-  for PosCnt := 0 to MaxPosM1 do
-    for i := 0 to HalfDimM1 do
+  // i-outer so the per-slot Exp runs once per depth pair; Angle stays the exact
+  // same PosCnt*Freq product as before (bit-for-bit identical).
+  for i := 0 to HalfDimM1 do
+  begin
+    Freq := Exp(-i * EmbStep);
+    ColSin := 2 * i;
+    ColCos := ColSin + 1;
+    HasCos := ColCos < EmbedDim;
+    for PosCnt := 0 to MaxPosM1 do
     begin
-      Freq := Exp(-i * EmbStep);
       Angle := PosCnt * Freq;
-      Tbl.FData[PosCnt * EmbedDim + 2 * i] := Sin(Angle);
-      if 2 * i + 1 < EmbedDim then
-        Tbl.FData[PosCnt * EmbedDim + 2 * i + 1] := Cos(Angle);
+      RowBase := PosCnt * EmbedDim;
+      Tbl.FData[RowBase + ColSin] := Sin(Angle);
+      if HasCos then
+        Tbl.FData[RowBase + ColCos] := Cos(Angle);
     end;
+  end;
 end;
 
 procedure RunFlorence2Projector(const Config: TFlorence2Config;
@@ -36119,22 +36144,28 @@ procedure FillSeamlessSinusoidalPositions(Layer: TNNetLayer;
 const
   SeamlessPositionOffset = 1;
 var
-  PosCnt, ChCnt, Half, Row, SeqLenM1, HalfM1: integer;
-  EmbConst, Angle: double;
+  PosCnt, ChCnt, Half, Row, SeqLenM1, HalfM1, ColCos, RowBase: integer;
+  EmbConst, Angle, Factor: double;
+  W: TNNetVolume;
 begin
   Half := HiddenSize div 2;
   EmbConst := Ln(10000.0) / (Half - 1);
   SeqLenM1 := SeqLen - 1;
   HalfM1 := Half - 1;
-  for PosCnt := 0 to SeqLenM1 do
+  W := Layer.FArrNeurons[0].Weights;
+  // ChCnt-outer so the per-channel Exp runs once per column; Angle stays the
+  // exact same Row*Factor product as before (bit-for-bit identical).
+  for ChCnt := 0 to HalfM1 do
   begin
-    Row := PosCnt + SeamlessPositionOffset;
-    for ChCnt := 0 to HalfM1 do
+    Factor := Exp(-ChCnt * EmbConst);
+    ColCos := Half + ChCnt;
+    for PosCnt := 0 to SeqLenM1 do
     begin
-      Angle := Row * Exp(-ChCnt * EmbConst);
-      Layer.FArrNeurons[0].Weights.FData[PosCnt * HiddenSize + ChCnt] := Sin(Angle);
-      Layer.FArrNeurons[0].Weights.FData[PosCnt * HiddenSize + Half + ChCnt] :=
-        Cos(Angle);
+      Row := PosCnt + SeamlessPositionOffset;
+      Angle := Row * Factor;
+      RowBase := PosCnt * HiddenSize;
+      W.FData[RowBase + ChCnt] := Sin(Angle);
+      W.FData[RowBase + ColCos] := Cos(Angle);
     end;
   end;
   Layer.FlushWeightCache();
@@ -37095,20 +37126,30 @@ end;
 procedure FillWhisperSinusoidalPositions(Layer: TNNetLayer;
   SeqLen, DModel: integer);
 var
-  PosCnt, ChCnt, Half, SeqLenM1, HalfM1: integer;
-  Angle: double;
+  PosCnt, ChCnt, Half, SeqLenM1, HalfM1, ColCos, RowBase: integer;
+  Angle, InvTs, LnBase: double;
+  W: TNNetVolume;
 begin
   Half := DModel div 2;
   SeqLenM1 := SeqLen - 1;
   HalfM1 := Half - 1;
-  for PosCnt := 0 to SeqLenM1 do
-    for ChCnt := 0 to HalfM1 do
+  W := Layer.FArrNeurons[0].Weights;
+  LnBase := Ln(10000.0);
+  // ChCnt-outer so the per-channel inverse-timescale Exp (and Ln(10000)) run
+  // once per column; Angle stays the exact same PosCnt*InvTs product as before
+  // (bit-for-bit identical).
+  for ChCnt := 0 to HalfM1 do
+  begin
+    InvTs := Exp(-LnBase * ChCnt / HalfM1);
+    ColCos := Half + ChCnt;
+    for PosCnt := 0 to SeqLenM1 do
     begin
-      Angle := PosCnt * Exp(-Ln(10000.0) * ChCnt / (Half - 1));
-      Layer.FArrNeurons[0].Weights.FData[PosCnt * DModel + ChCnt] := Sin(Angle);
-      Layer.FArrNeurons[0].Weights.FData[PosCnt * DModel + Half + ChCnt] :=
-        Cos(Angle);
+      Angle := PosCnt * InvTs;
+      RowBase := PosCnt * DModel;
+      W.FData[RowBase + ChCnt] := Sin(Angle);
+      W.FData[RowBase + ColCos] := Cos(Angle);
     end;
+  end;
   Layer.FlushWeightCache();
 end;
 
