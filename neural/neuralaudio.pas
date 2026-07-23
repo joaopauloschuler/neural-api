@@ -316,6 +316,7 @@ var
   NOutM1, NInM1: integer;
   Ratio, Cutoff, SrcPos, Center, X, Acc, WSum, W, PiX, PiXA: double;
   AOverRatio, InvRatio: double;
+  TwoCutoff, TwoPiCutoff, PiOverA: double;
   FC: integer;
 
   // Lanczos-windowed sinc at offset T (in input-sample units), low-passed at
@@ -327,7 +328,7 @@ var
     AT := Abs(T);
     if AT < 1e-12 then
     begin
-      Result := 2.0 * Cutoff;
+      Result := TwoCutoff;
       exit;
     end;
     if AT >= csResampleLanczosA then
@@ -336,9 +337,9 @@ var
       exit;
     end;
     // sinc(2*Cutoff*T) low-pass, windowed by the Lanczos lobe sinc(T/A).
-    PiX := Pi * 2.0 * Cutoff * T;
-    PiXA := Pi * T / csResampleLanczosA;
-    Result := 2.0 * Cutoff * (Sin(PiX) / PiX) * (Sin(PiXA) / PiXA);
+    PiX := TwoPiCutoff * T;
+    PiXA := PiOverA * T;
+    Result := TwoCutoff * (Sin(PiX) / PiX) * (Sin(PiXA) / PiXA);
   end;
 
 begin
@@ -372,6 +373,11 @@ begin
   // Downsampling kernel half-width 1/Ratio is call-invariant (rule #5).
   AOverRatio := csResampleLanczosA / Ratio;
   InvRatio := 1.0 / Ratio;   // reciprocal hoisted; multiply per output sample (#5)
+  // Cutoff-derived kernel constants: invariant for the whole call (#5), read by
+  // the nested LanczosKernel instead of recomputing per tap.
+  TwoCutoff := 2.0 * Cutoff;
+  TwoPiCutoff := Pi * TwoCutoff;
+  PiOverA := Pi / csResampleLanczosA;
   for OutCnt := 0 to NOutM1 do
   begin
     // Position of this output sample expressed in INPUT-sample coordinates.
@@ -546,7 +552,7 @@ var
   SampleCnt, FrameCnt, BinCnt, MelCnt, TapCnt, FrameStart, SrcIdx: integer;
   MelMin, MelMax, FFTFreq, DownSlope, UpSlope, Tri: double;
   ReAcc, ImAcc, Acc, MaxLog, V, MaxLogM8: double;
-  logFloor, invLn10: double;
+  logFloor, invLn10, angStep, ang: double;
   twBase, rowBase, twIdx, idx, nCopy, nCopyM1: integer;
   AllZero: boolean;
 
@@ -597,13 +603,17 @@ begin
   SetLength(CosTab, NumBins * csWhisperNFFT);
   SetLength(SinTab, NumBins * csWhisperNFFT);
   for BinCnt := 0 to NumBinsM1 do
+  begin
+    rowBase := BinCnt * csWhisperNFFT;            // #11: bin-only row base
+    angStep := 2.0 * Pi * BinCnt / csWhisperNFFT; // #11: per-tap angle increment
     for TapCnt := 0 to NFFTM1 do
     begin
-      CosTab[BinCnt * csWhisperNFFT + TapCnt] :=
-        Cos(2.0 * Pi * BinCnt * TapCnt / csWhisperNFFT);
-      SinTab[BinCnt * csWhisperNFFT + TapCnt] :=
-        Sin(2.0 * Pi * BinCnt * TapCnt / csWhisperNFFT);
+      twIdx := rowBase + TapCnt;   // one index for both twiddle tables (#4)
+      ang := angStep * TapCnt;
+      CosTab[twIdx] := Cos(ang);
+      SinTab[twIdx] := Sin(ang);
     end;
+  end;
 
   // ---- slaney mel filter bank (triangles in Hz, slaney-normed) ----
   MelMin := HertzToMelSlaney(0.0);
@@ -1046,8 +1056,8 @@ var
   NumFrames, NumBins, OutLen: integer;
   NFFTM1, NumBinsM1, OutLenM1, NumFramesM1: integer;
   FrameCnt, BinCnt, TapCnt, OutIdx, FrameStart: integer;
-  frameBase, twPos, reIdx: integer;
-  invNFFT: double;
+  frameBase, twPos, reIdx, rowBase, twIdx: integer;
+  invNFFT, angStep, ang: double;
   Window: array of double;        // periodic hann (matches forward analysis)
   Win2: array of double;          // window^2 (COLA envelope contribution)
   BinScale: array of double;      // per-bin self-conjugate weight (1 or 2)
@@ -1093,13 +1103,17 @@ begin
   SetLength(CosTab, NumBins * NFFT);
   SetLength(SinTab, NumBins * NFFT);
   for BinCnt := 0 to NumBinsM1 do
+  begin
+    rowBase := BinCnt * NFFT;            // #11: bin-only row base
+    angStep := 2.0 * Pi * BinCnt / NFFT; // #11: per-tap angle increment
     for TapCnt := 0 to NFFTM1 do
     begin
-      CosTab[BinCnt * NFFT + TapCnt] :=
-        Cos(2.0 * Pi * BinCnt * TapCnt / NFFT);
-      SinTab[BinCnt * NFFT + TapCnt] :=
-        Sin(2.0 * Pi * BinCnt * TapCnt / NFFT);
+      twIdx := rowBase + TapCnt;   // one index for both twiddle tables (#4)
+      ang := angStep * TapCnt;
+      CosTab[twIdx] := Cos(ang);
+      SinTab[twIdx] := Sin(ang);
     end;
+  end;
 
   // Per-bin self-conjugate weight is BinCnt-only (call-invariant); precompute it
   // once so the inner nest carries no per-element branch (rule #5 / App E).

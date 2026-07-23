@@ -1097,12 +1097,15 @@ begin
 end;
 
 procedure TStatePredictionClass.CopyNeurons(SourceRelationPos, DestRelationPos: longint);
+var
+  Dst, Src: ^TNeuronGroup;   // bind FNN[...] records once (rule #4)
 begin
   RemoveNeuronsAtPos(DestRelationPos);
-  FNN[DestRelationPos].TestNeuronLayer := FNN[SourceRelationPos].TestNeuronLayer;
-  FNN[DestRelationPos].OperationNeuronLayer :=
-    FNN[SourceRelationPos].OperationNeuronLayer;
-  FNN[DestRelationPos].PredictionPos := FNN[SourceRelationPos].PredictionPos;
+  Dst := @FNN[DestRelationPos];
+  Src := @FNN[SourceRelationPos];
+  Dst^.TestNeuronLayer := Src^.TestNeuronLayer;
+  Dst^.OperationNeuronLayer := Src^.OperationNeuronLayer;
+  Dst^.PredictionPos := Src^.PredictionPos;
 end;
 
 procedure TStatePredictionClass.CreateNewNeuronsOnError(
@@ -1114,6 +1117,7 @@ procedure TStatePredictionClass.CreateNewNeuronsOnError(
     IV, NumV: word;
     NumVM1: longint;
     OP: neuralabfun.TOperation;
+    NGP: ^TNeuronGroup;   // bind FNN[neuronPos] once (rule #4/#9)
   begin
     NewOp.Create(False{no tests}, FZerosIncluded, pred{prediction errors});
 
@@ -1122,11 +1126,12 @@ procedure TStatePredictionClass.CreateNewNeuronsOnError(
     else
     begin
       RemoveNeuronsAtPos(neuronPos);
-      FNN[neuronPos].OperationNeuronLayer := NewOp.GetRandomOp;
+      NGP := @FNN[neuronPos];
+      NGP^.OperationNeuronLayer := NewOp.GetRandomOp;
 
       NumV := FCS.MinTests+random(FCS.MaxTests-FCS.MinTests)+1;
 
-      FNN[neuronPos].TestNeuronLayer.N := NumV;
+      NGP^.TestNeuronLayer.N := NumV;
       NewOp.Create(True{with tests}, FZerosIncluded, pred{prediction errorss});
       NumVM1 := NumV - 1;
       for IV := 0 to NumVM1 do
@@ -1134,15 +1139,15 @@ procedure TStatePredictionClass.CreateNewNeuronsOnError(
         OP := NewOp.GetRandomOp;
         if (OP.OpCode = 0) then
         begin
-          FNN[neuronPos].TestNeuronLayer.N := IV;
+          NGP^.TestNeuronLayer.N := IV;
           break;
         end;
-        FNN[neuronPos].TestNeuronLayer.T[IV] := OP;
+        NGP^.TestNeuronLayer.T[IV] := OP;
       end;
 
       if (FCS.PartialTestEval)
-        then FNN[neuronPos].TestNeuronLayer.TestThreshold := random(FNN[neuronPos].TestNeuronLayer.N)+1
-        else FNN[neuronPos].TestNeuronLayer.TestThreshold := FNN[neuronPos].TestNeuronLayer.N;
+        then NGP^.TestNeuronLayer.TestThreshold := random(NGP^.TestNeuronLayer.N)+1
+        else NGP^.TestNeuronLayer.TestThreshold := NGP^.TestNeuronLayer.N;
     end;
   end;
 
@@ -1150,6 +1155,7 @@ var
   SourceI, WorstNeuronGrPos: longint;
   PredictedBytePos: byte;
   NewOp: TCreateValidOperations;
+  WGP: ^TNeuronGroup;   // bind FNN[WorstNeuronGrPos] once (rule #4/#9)
 begin
   WorstNeuronGrPos := 0;
   SourceI := 0;
@@ -1161,13 +1167,14 @@ begin
   NewOp.Load(FCS, PActions, PCurrentStates, PNextStates);
   NewOp.LoadCreationData(PredictedBytePos);
 
+  WGP := @FNN[WorstNeuronGrPos];   // bind once; FNN is never reallocated here
   // select a predicted byte that was wrongly predicted.
-  FNN[WorstNeuronGrPos].PredictionPos := PredictedBytePos;
+  WGP^.PredictionPos := PredictedBytePos;
 
   if FCS.Bidimensional
-    then FNN[WorstNeuronGrPos].TestNeuronLayer.TestBasePosition :=
+    then WGP^.TestNeuronLayer.TestBasePosition :=
       NewOp.GetFeatureCenter2D()
-    else FNN[WorstNeuronGrPos].TestNeuronLayer.TestBasePosition :=
+    else WGP^.TestNeuronLayer.TestBasePosition :=
       PredictedBytePos;
 
   if (Random(100) < 5) and FGeneralize and         // should copy the neuron ?
@@ -1175,8 +1182,8 @@ begin
     (SourceI <> WorstNeuronGrPos) then
   begin
     CopyNeurons(SourceI, WorstNeuronGrPos);
-    FNN[WorstNeuronGrPos].TestNeuronLayer.DeleteOperation(Random(
-      FNN[WorstNeuronGrPos].TestNeuronLayer.N));
+    WGP^.TestNeuronLayer.DeleteOperation(Random(
+      WGP^.TestNeuronLayer.N));
   end
   else
   begin

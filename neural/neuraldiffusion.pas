@@ -460,6 +460,7 @@ var
   k, Tt: integer;
   NumStepsM1: integer;
   sigMin, sigMax, invRho, frac, targetSigma: double;
+  pMax, pMin: double;
 const
   cRho = 7.0; // Karras et al. (2022) recommended rho.
 begin
@@ -476,13 +477,14 @@ begin
         sigMin := SigmaOf(1);
         sigMax := SigmaOf(FT);
         invRho := 1.0 / cRho;
+        pMax := Power(sigMax, invRho);   // #5: invariant across the k loop
+        pMin := Power(sigMin, invRho);
         for k := 0 to NumStepsM1 do
         begin
           if NumSteps = 1 then frac := 0.0
           else frac := k / (NumSteps - 1);
           // k=0 -> sigma_max (most noise, highest Tt); k=n-1 -> sigma_min.
-          targetSigma := Power(Power(sigMax, invRho) +
-            frac * (Power(sigMin, invRho) - Power(sigMax, invRho)), cRho);
+          targetSigma := Power(pMax + frac * (pMin - pMax), cRho);
           Tt := SigmaToTimestep(targetSigma);
           // Index 0 of Result is the FIRST (highest-noise) step.
           Result[k] := Tt;
@@ -637,7 +639,8 @@ var
   // per-element loops below.
   needNoise: boolean;
   invSqrtAbT, somabT, cA, cB, kX, kD, kM0, kBh, invRk: TNeuralFloat;
-  ev, xv, cD1: TNeuralFloat;   // per-element Eps/Xt binds (#4); UniPC D1 coef
+  cD1: TNeuralFloat;           // UniPC D1 coef
+  kA, cE, kZ: TNeuralFloat;    // per-step affine coeffs for the sampler loops (#5)
   m0Vol, m1Vol: TNNetVolume;   // UniPC history rows bound once (#5)
 begin
   // Persistent lazily-sized eps scratch (rule #17). Step and PredictX0 never
@@ -658,11 +661,12 @@ begin
           if needNoise then sigma := Sqrt(FBeta[Tt]) else sigma := 0;
           if needNoise then
           begin
+            cE := invSqrtAlpha * coef;   // #5: invariant across the element loop
             for i := 0 to XtSizeM1 do
             begin
               z := RandG(0, 1);
-              Xt.FData[i] := invSqrtAlpha *
-                (Xt.FData[i] - coef * Eps.FData[i]) + sigma * z;
+              Xt.FData[i] := invSqrtAlpha * Xt.FData[i] -
+                cE * Eps.FData[i] + sigma * z;
             end;
           end
           else
@@ -690,14 +694,15 @@ begin
           invSqrtAbT := 1.0 / Sqrt(abT);
           if sigma > 0 then
           begin
+            // #5: fold the affine into per-step coeffs. Expanding
+            //   sqrt(ab_prev)*(x_t - somab_t*eps)/sqrt(ab_t) + dirCoef*eps
+            // gives kA*x_t + cE*eps, kA = sqrt(ab_prev)/sqrt(ab_t).
+            kA := sqrtAbPrev * invSqrtAbT;
+            cE := dirCoef - kA * somabT;
             for i := 0 to XtSizeM1 do
             begin
               z := RandG(0, 1);
-              ev := Eps.FData[i];   // #4: read once
-              // x_{TtPrev} = sqrt(ab_prev)*x0 + dirCoef*eps + sigma*z,
-              //   x0 = (x_t - somab_t*eps)/sqrt(ab_t).
-              x0 := (Xt.FData[i] - somabT * ev) * invSqrtAbT;
-              Xt.FData[i] := sqrtAbPrev * x0 + dirCoef * ev + sigma * z;
+              Xt.FData[i] := kA * Xt.FData[i] + cE * Eps.FData[i] + sigma * z;
             end;
           end
           else
@@ -749,16 +754,15 @@ begin
             if lamT > 0 then r0 := h / lamT else r0 := 0;           // drift ratio
             if sigma > 0 then
             begin
+              // #5: curX0 = invSqrtAbT*x_t - (1-r0)*somab_t*invSqrtAbT*eps, so
+              // the whole update folds to kA*x_t + cE*eps + kZ*z per step.
+              kA := sqrtAbPrev * invSqrtAbT;
+              cE := -sqrtAbPrev * (1 - r0) * somabT * invSqrtAbT;
+              kZ := sqrtAbPrev * sigma;
               for i := 0 to XtSizeM1 do
               begin
                 z := RandG(0, 1);
-                ev := Eps.FData[i];   // #4: read once
-                xv := Xt.FData[i];    // #4: read once
-                x0 := (xv - somabT * ev) * invSqrtAbT;
-                // VE sample at sigma=s1 is x_t/sqrt(ab_t); Euler drift to sigma_down.
-                curX0 := x0 + r0 * (xv * invSqrtAbT - x0);
-                // Re-noise back to VP scale at TtPrev, add ancestral noise.
-                Xt.FData[i] := sqrtAbPrev * (curX0 + sigma * z);
+                Xt.FData[i] := kA * Xt.FData[i] + cE * Eps.FData[i] + kZ * z;
               end;
             end
             else

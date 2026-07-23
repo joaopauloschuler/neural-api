@@ -1128,6 +1128,7 @@ var
   Operand1Value, Operand2Value: integer;
   StatePosition1, StatePosition2: integer;
   CurrentBaseValue: integer;
+  MaxAct, MaxCur: integer;
 begin
   // NextState is a var output read below (and returned as the result for test
   // opcodes); csNop, csDiv/csMod by zero and the invalid-opcode branch never
@@ -1157,6 +1158,10 @@ begin
     exit;
   end;
 
+  // Upper index bounds bound once (#4); reused by the EnsureRange clamps below.
+  MaxAct := NumberOfActions - 1;
+  MaxCur := NumberOfCurrentStates - 1;
+
   // Upstream can pass operand/base positions outside the state arrays (the
   // range is "wrong" per the historical TODOs here); clamp every index into
   // its own array's bounds so the reads stay in range. EnsureRange handles
@@ -1165,8 +1170,8 @@ begin
   begin
     if NumberOfActions > 0 then
     begin
-      Operand1Value := Actions[EnsureRange(StatePosition1, 0, NumberOfActions - 1)];
-      Operand2Value := Actions[EnsureRange(StatePosition2, 0, NumberOfActions - 1)];
+      Operand1Value := Actions[EnsureRange(StatePosition1, 0, MaxAct)];
+      Operand2Value := Actions[EnsureRange(StatePosition2, 0, MaxAct)];
     end
     else
     begin
@@ -1178,8 +1183,8 @@ begin
   begin
     if NumberOfCurrentStates > 0 then
     begin
-      Operand1Value := CurrentStates[EnsureRange(StatePosition1, 0, NumberOfCurrentStates - 1)];
-      Operand2Value := CurrentStates[EnsureRange(StatePosition2, 0, NumberOfCurrentStates - 1)];
+      Operand1Value := CurrentStates[EnsureRange(StatePosition1, 0, MaxCur)];
+      Operand2Value := CurrentStates[EnsureRange(StatePosition2, 0, MaxCur)];
     end
     else
     begin
@@ -1191,7 +1196,7 @@ begin
   // Some opcodes read the current state at BasePosition directly; clamp it the
   // same way (BasePosition itself was never range-checked).
   if NumberOfCurrentStates > 0
-    then CurrentBaseValue := CurrentStates[EnsureRange(BasePosition, 0, NumberOfCurrentStates - 1)]
+    then CurrentBaseValue := CurrentStates[EnsureRange(BasePosition, 0, MaxCur)]
     else CurrentBaseValue := 0;
 
   try
