@@ -3887,7 +3887,7 @@ var
   BlockSize: integer;
   LocalNN: TNNet;
   ImgInput, ImgInputCp: TNNetVolume;
-  LocalImg: TNNetVolume;
+  LocalImg, CropSrc: TNNetVolume;
   pOutput, vOutput, sumOutput: TNNetVolume;
   I, ImgIdx: integer;
   StartPos, FinishPos, FinishPosM1: integer;
@@ -3934,7 +3934,8 @@ begin
     begin
       // Note: crop bounds intentionally read sizes from FImgVolumes[ImgIdx]
       // (preserved as-is), while the crop source is FWorkingVolumes[ImgIdx].
-      ImgInput.CopyCropping(LocalImg, HalfCrop, HalfCrop, FImgVolumes[ImgIdx].SizeX-FMaxCropSize, FImgVolumes[ImgIdx].SizeY-FMaxCropSize);
+      CropSrc := FImgVolumes[ImgIdx];  // #7: bind list element once
+      ImgInput.CopyCropping(LocalImg, HalfCrop, HalfCrop, CropSrc.SizeX-FMaxCropSize, CropSrc.SizeY-FMaxCropSize);
     end
     else
     begin

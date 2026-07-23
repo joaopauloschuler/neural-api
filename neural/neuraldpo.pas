@@ -1091,18 +1091,33 @@ begin
     // Re-shape the softmax probabilities by temperature: p_i^(1/Tau), renorm.
     // (The last layer already outputs probabilities, so apply temperature in
     // log space: logit' = ln(p)/Tau.)
-    MaxLogit := -1e30;
-    for I := 0 to VocabM1 do
+    // #14: at Tau=1 (default), p_i^(1/1)=p_i, so the two transcendental passes
+    // are identity up to the shared positive normalizer that multinomial
+    // sampling is invariant to -> sample straight from Y.
+    if InvTemp = 1.0 then
     begin
-      P := pcr_logf(Max(Y.FData[I], FProbFloor)) * InvTemp;  // #16: fast log
-      FProbs[I] := P;
-      if P > MaxLogit then MaxLogit := P;
-    end;
-    Sum := 0;
-    for I := 0 to VocabM1 do
+      Sum := 0;
+      for I := 0 to VocabM1 do
+      begin
+        FProbs[I] := Y.FData[I];
+        Sum := Sum + FProbs[I];
+      end;
+    end
+    else
     begin
-      FProbs[I] := NeuralExp(FProbs[I] - MaxLogit);  // #16: fast, trap-free exp
-      Sum := Sum + FProbs[I];
+      MaxLogit := -1e30;
+      for I := 0 to VocabM1 do
+      begin
+        P := pcr_logf(Max(Y.FData[I], FProbFloor)) * InvTemp;  // #16: fast log
+        FProbs[I] := P;
+        if P > MaxLogit then MaxLogit := P;
+      end;
+      Sum := 0;
+      for I := 0 to VocabM1 do
+      begin
+        FProbs[I] := NeuralExp(FProbs[I] - MaxLogit);  // #16: fast, trap-free exp
+        Sum := Sum + FProbs[I];
+      end;
     end;
     R := Random * Sum;
     Acc := 0; Picked := Vocab - 1;

@@ -126,7 +126,7 @@ procedure ForwardProbsAndLogits(
 var
   Output: TNNetVolume;
   I, N, NM1: integer;
-  Sum, MaxV, Acc: TNeuralFloat;
+  Sum, MaxV, Acc, V, AccClamped: TNeuralFloat;
   IsProb: boolean;
 begin
   NN.Compute(Input);
@@ -162,10 +162,13 @@ begin
     for I := 0 to NM1 do
     begin
       Logits[I] := Output.FData[I];
-      Acc := Acc + Exp(Output.FData[I] - MaxV);
+      V := Exp(Output.FData[I] - MaxV);
+      Probs[I] := V;
+      Acc := Acc + V;
     end;
+    AccClamped := Max(cEps, Acc);
     for I := 0 to NM1 do
-      Probs[I] := Exp(Output.FData[I] - MaxV) / Max(cEps, Acc);
+      Probs[I] := Probs[I] / AccClamped;
   end;
 end;
 
@@ -175,17 +178,23 @@ procedure SoftmaxTemp(
   out Probs: array of TNeuralFloat; N: integer);
 var
   I, NM1: integer;
-  MaxV, Acc: TNeuralFloat;
+  MaxV, Acc, MaxRaw, V, AccClamped: TNeuralFloat;
 begin
   NM1 := N - 1;
-  MaxV := Logits[0] / T;
+  MaxRaw := Logits[0];
   for I := 1 to NM1 do
-    if Logits[I] / T > MaxV then MaxV := Logits[I] / T;
+    if Logits[I] > MaxRaw then MaxRaw := Logits[I];
+  MaxV := MaxRaw / T;
   Acc := 0;
   for I := 0 to NM1 do
-    Acc := Acc + Exp(Logits[I] / T - MaxV);
+  begin
+    V := Exp(Logits[I] / T - MaxV);
+    Probs[I] := V;
+    Acc := Acc + V;
+  end;
+  AccClamped := Max(cEps, Acc);
   for I := 0 to NM1 do
-    Probs[I] := Exp(Logits[I] / T - MaxV) / Max(cEps, Acc);
+    Probs[I] := Probs[I] / AccClamped;
 end;
 
 function ComputeCalibration(
@@ -425,7 +434,7 @@ begin
     if (TrueClass < 0) or (TrueClass >= N) then Continue;
     ForwardProbsAndLogits(NN, Inputs[I], Probs, Logits);
     SetLength(AllLogits[Total], N);
-    for J := 0 to NM1 do AllLogits[Total][J] := Logits[J];
+    Move(Logits[0], AllLogits[Total][0], N * csNeuralFloatSize);
     AllLabel[Total] := TrueClass;
     Inc(Total);
   end;
