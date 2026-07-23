@@ -844,6 +844,14 @@ type
       FFrequency: TNeuralFloat;
       FPresence: TNeuralFloat;
       FCounts: array of integer;
+      // Compact list of the DISTINCT token ids with a non-zero count, in
+      // first-seen order (mirrors llama.cpp's penalty token_count map). Apply
+      // and ApplyToProbabilities walk this instead of scanning FCounts up to
+      // the highest id ever registered - the history is a few hundred tokens
+      // while FCounts spans the vocabulary (152k on Qwen2.5). Rule #17: grown
+      // only by RegisterToken, never inside the per-token apply path.
+      FSeen: array of integer;
+      FSeenCount: integer;
       procedure EnsureSize(NewSize: integer);
     public
       // Defaults are NO-OP: r=1.0, alpha_f=0.0, alpha_p=0.0.
@@ -3834,11 +3842,14 @@ begin
   FFrequency := Frequency;
   FPresence := Presence;
   SetLength(FCounts, 0);
+  SetLength(FSeen, 0);
+  FSeenCount := 0;
 end;
 
 destructor TNNetTokenHistoryPenalty.Destroy();
 begin
   SetLength(FCounts, 0);
+  SetLength(FSeen, 0);
   inherited Destroy();
 end;
 
@@ -3859,32 +3870,46 @@ procedure TNNetTokenHistoryPenalty.RegisterToken(TokenId: integer);
 begin
   if TokenId < 0 then exit;
   EnsureSize(TokenId + 1);
+  // A zero count means this id is not in FSeen yet: append it before the
+  // increment so FSeen holds exactly the ids with FCounts > 0.
+  if FCounts[TokenId] = 0 then
+  begin
+    if FSeenCount >= Length(FSeen) then
+      SetLength(FSeen, (FSeenCount + 1) * 2);
+    FSeen[FSeenCount] := TokenId;
+    Inc(FSeenCount);
+  end;
   Inc(FCounts[TokenId]);
 end;
 
 procedure TNNetTokenHistoryPenalty.ResetHistory();
 var
-  Len: integer;
+  I, SeenM1: integer;
 begin
-  // #13/App C: bulk zero-fill the integer counter array in one call.
-  Len := Length(FCounts);
-  if Len > 0 then FillChar(FCounts[0], Len * csIntegerSize, 0);
+  // Only the ids actually registered can be non-zero, so clearing them is
+  // proportional to the history rather than to the vocabulary. FSeen itself
+  // keeps its capacity for the next sequence (no per-sequence realloc).
+  SeenM1 := FSeenCount - 1;
+  for I := 0 to SeenM1 do FCounts[FSeen[I]] := 0;
+  FSeenCount := 0;
 end;
 
 procedure TNNetTokenHistoryPenalty.Apply(Logits: TNNetVolume);
 var
-  I, MaxToken, Count: integer;
+  I, Tok, MaxToken, SeenM1, Count: integer;
   Logit: TNeuralFloat;
 begin
+  // Walk the distinct-id history, not the vocabulary-sized FCounts array.
   // The history can never be larger than the logit volume of interest.
-  MaxToken := Length(FCounts) - 1;
-  if MaxToken >= Logits.Size then MaxToken := Logits.Size - 1;
-  for I := 0 to MaxToken do
+  MaxToken := Logits.Size - 1;
+  SeenM1 := FSeenCount - 1;
+  for I := 0 to SeenM1 do
   begin
-    Count := FCounts[I];
-    if Count > 0 then
+    Tok := FSeen[I];
+    if Tok <= MaxToken then
     begin
-      Logit := Logits.FData[I];
+      Count := FCounts[Tok];
+      Logit := Logits.FData[Tok];
       // (a) repetition penalty - sign-correct CTRL form.
       if FRepetition <> 1.0 then
       begin
@@ -3895,28 +3920,30 @@ begin
       Logit := Logit - FFrequency * Count;
       // (c) presence penalty - flat push for any token used at least once.
       Logit := Logit - FPresence;
-      Logits.FData[I] := Logit;
+      Logits.FData[Tok] := Logit;
     end;
   end;
 end;
 
 procedure TNNetTokenHistoryPenalty.ApplyToProbabilities(Probs: TNNetVolume);
 var
-  I, MaxToken, Count: integer;
+  I, Tok, MaxToken, SeenM1, Count: integer;
   P, Total: TNeuralFloat;
   Changed: boolean;
 begin
   // Guaranteed bit-for-bit no-op when every knob is at its default.
   if (FRepetition = 1.0) and (FFrequency = 0.0) and (FPresence = 0.0) then exit;
   Changed := false;
-  MaxToken := Length(FCounts) - 1;
-  if MaxToken >= Probs.Size then MaxToken := Probs.Size - 1;
-  for I := 0 to MaxToken do
+  // Walk the distinct-id history, not the vocabulary-sized FCounts array.
+  MaxToken := Probs.Size - 1;
+  SeenM1 := FSeenCount - 1;
+  for I := 0 to SeenM1 do
   begin
-    Count := FCounts[I];
-    if Count > 0 then
+    Tok := FSeen[I];
+    if Tok <= MaxToken then
     begin
-      P := Probs.FData[I];
+      Count := FCounts[Tok];
+      P := Probs.FData[Tok];
       // (a) repetition penalty: p := p^r ("power then renormalize", the
       // probability-domain image of the sign-correct CTRL logit rule -
       // ln p <= 0 always, so the negative branch ln p * r applies).
@@ -3925,7 +3952,7 @@ begin
       // multiplicative exp() factor on the probability.
       if (FFrequency <> 0.0) or (FPresence <> 0.0) then
         P := P * NeuralExp(-(FFrequency * Count + FPresence));
-      Probs.FData[I] := P;
+      Probs.FData[Tok] := P;
       Changed := true;
     end;
   end;

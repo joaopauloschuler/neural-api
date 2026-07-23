@@ -41,6 +41,8 @@ type
     procedure TestPenaltyRepetitionSignCorrect;
     procedure TestPenaltyResetHistory;
     procedure TestPenaltyFrequencyScalesWithCount;
+    procedure TestPenaltyTokenIdBeyondVolumeIsIgnored;
+    procedure TestPenaltyHistoryReusableAfterReset;
 
     // TNNetSamplerMinP tests
     procedure TestMinPSamplerKeepsExactlyExpectedSet;
@@ -610,6 +612,61 @@ begin
   finally
     V.Free;
     Before.Free;
+    Penalty.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestPenaltyTokenIdBeyondVolumeIsIgnored;
+var
+  Penalty: TNNetTokenHistoryPenalty;
+  V, Before: TNNetVolume;
+  I: integer;
+begin
+  // A registered id larger than the volume being penalized must be skipped
+  // (the history outlives any single logit row - e.g. a shorter draft-model
+  // vocabulary). Guards the distinct-id walk against an out-of-range write.
+  Penalty := TNNetTokenHistoryPenalty.Create(2.0, 0.5, 0.75);
+  V := TNNetVolume.Create(4, 1, 1);
+  Before := TNNetVolume.Create(4, 1, 1);
+  try
+    for I := 0 to 3 do V.Raw[I] := I - 1.5;
+    Before.Copy(V);
+    Penalty.RegisterToken(99);
+    Penalty.Apply(V);
+    for I := 0 to 3 do
+      AssertTrue('Out-of-range id must leave element ' + IntToStr(I) +
+        ' untouched', V.Raw[I] = Before.Raw[I]);
+  finally
+    V.Free;
+    Before.Free;
+    Penalty.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestPenaltyHistoryReusableAfterReset;
+var
+  Penalty: TNNetTokenHistoryPenalty;
+  V: TNNetVolume;
+  Orig1: TNeuralFloat;
+begin
+  // After ResetHistory the tracker must still work for a NEW sequence: the
+  // freshly registered token is penalized and the previously registered one
+  // is not. Exercises reuse of the retained distinct-id buffer.
+  Penalty := TNNetTokenHistoryPenalty.Create(1.0, 0.0, 0.75);
+  V := TNNetVolume.Create(4, 1, 1);
+  try
+    V.Fill(2.0);
+    Orig1 := V.Raw[1];
+    Penalty.RegisterToken(0);
+    Penalty.ResetHistory();
+    Penalty.RegisterToken(1);
+    Penalty.Apply(V);
+    AssertTrue('Token registered before the reset must not be penalized',
+      V.Raw[0] = 2.0);
+    AssertTrue('Token registered after the reset must be penalized',
+      V.Raw[1] < Orig1);
+  finally
+    V.Free;
     Penalty.Free;
   end;
 end;
