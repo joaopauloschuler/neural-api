@@ -41,6 +41,8 @@ type
     procedure TestPenaltyRepetitionSignCorrect;
     procedure TestPenaltyResetHistory;
     procedure TestPenaltyFrequencyScalesWithCount;
+    procedure TestPenaltyTokenIdBeyondVolumeIsIgnored;
+    procedure TestPenaltyHistoryReusableAfterReset;
 
     // TNNetSamplerMinP tests
     procedure TestMinPSamplerKeepsExactlyExpectedSet;
@@ -72,6 +74,14 @@ type
     procedure TestMirostatResetReArmsMu;
     procedure TestMirostatV2MuConvergesTowardTau;
     procedure TestMirostatV1MuStaysBounded;
+
+    // Large-vocabulary tests: these exercise the partial-selection path,
+    // which only engages above the adaptive threshold (a small-vocab test
+    // silently takes the plain full-sort branch and proves nothing).
+    procedure TestTopPLargeVocabNucleusIsCorrect;
+    procedure TestTopPLargeVocabFlatDistributionRetries;
+    procedure TestWeightedTopKLargeVocabNeverDrawsOutsideTopK;
+    procedure TestMinPLargeVocabRespectsThreshold;
   end;
 
 implementation
@@ -610,6 +620,61 @@ begin
   finally
     V.Free;
     Before.Free;
+    Penalty.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestPenaltyTokenIdBeyondVolumeIsIgnored;
+var
+  Penalty: TNNetTokenHistoryPenalty;
+  V, Before: TNNetVolume;
+  I: integer;
+begin
+  // A registered id larger than the volume being penalized must be skipped
+  // (the history outlives any single logit row - e.g. a shorter draft-model
+  // vocabulary). Guards the distinct-id walk against an out-of-range write.
+  Penalty := TNNetTokenHistoryPenalty.Create(2.0, 0.5, 0.75);
+  V := TNNetVolume.Create(4, 1, 1);
+  Before := TNNetVolume.Create(4, 1, 1);
+  try
+    for I := 0 to 3 do V.Raw[I] := I - 1.5;
+    Before.Copy(V);
+    Penalty.RegisterToken(99);
+    Penalty.Apply(V);
+    for I := 0 to 3 do
+      AssertTrue('Out-of-range id must leave element ' + IntToStr(I) +
+        ' untouched', V.Raw[I] = Before.Raw[I]);
+  finally
+    V.Free;
+    Before.Free;
+    Penalty.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestPenaltyHistoryReusableAfterReset;
+var
+  Penalty: TNNetTokenHistoryPenalty;
+  V: TNNetVolume;
+  Orig1: TNeuralFloat;
+begin
+  // After ResetHistory the tracker must still work for a NEW sequence: the
+  // freshly registered token is penalized and the previously registered one
+  // is not. Exercises reuse of the retained distinct-id buffer.
+  Penalty := TNNetTokenHistoryPenalty.Create(1.0, 0.0, 0.75);
+  V := TNNetVolume.Create(4, 1, 1);
+  try
+    V.Fill(2.0);
+    Orig1 := V.Raw[1];
+    Penalty.RegisterToken(0);
+    Penalty.ResetHistory();
+    Penalty.RegisterToken(1);
+    Penalty.Apply(V);
+    AssertTrue('Token registered before the reset must not be penalized',
+      V.Raw[0] = 2.0);
+    AssertTrue('Token registered after the reset must be penalized',
+      V.Raw[1] < Orig1);
+  finally
+    V.Free;
     Penalty.Free;
   end;
 end;
@@ -1297,6 +1362,192 @@ begin
         (Token >= 0) and (Token < V_SIZE));
       AssertTrue('v1 Mu must stay bounded',
         (Sampler.Mu > -100) and (Sampler.Mu < 100));
+    end;
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+// Fills V with a normalized, deterministically "peaked" distribution: token
+// PeakAt gets the dominant mass, the rest decay geometrically. Returns the
+// probabilities already summing to 1.
+procedure BuildLargePeakedRow(V: TNNetVolume; Size, PeakAt: integer);
+var
+  I: integer;
+  Sum, Val: TNeuralFloat;
+begin
+  Sum := 0;
+  for I := 0 to Size - 1 do
+  begin
+    // Deterministic, no RNG: geometric decay with distance from the peak.
+    // The decay must be EXPONENTIAL, not harmonic - a 1/(1+d) row is so flat
+    // that its 0.8 nucleus spans most of the vocabulary, which would make
+    // this a retry-path test rather than a prefix-path one.
+    Val := Exp(-0.35 * Abs(I - PeakAt));
+    V.Raw[I] := Val;
+    Sum := Sum + Val;
+  end;
+  for I := 0 to Size - 1 do V.Raw[I] := V.Raw[I] / Sum;
+end;
+
+procedure TTestNeuralSamplers.TestTopPLargeVocabNucleusIsCorrect;
+const
+  V_SIZE = 5000; // > the 1024 adaptive threshold and > the 256 first guess
+var
+  Sampler: TNNetSamplerTopP;
+  V: TNNetVolume;
+  I, Token, NucleusSize: integer;
+  Cum, MaxP: TNeuralFloat;
+begin
+  // With a peaked row the nucleus is far narrower than the first-guess K, so
+  // the partial-selection prefix must answer without the retry - and every
+  // draw must land inside the true nucleus.
+  Sampler := TNNetSamplerTopP.Create(0.80);
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  try
+    BuildLargePeakedRow(V, V_SIZE, 0);
+    // Independently compute the nucleus width: the row is already descending
+    // from index 0 here, so a plain cumulative scan gives the true answer.
+    Cum := 0;
+    NucleusSize := V_SIZE;
+    MaxP := V.Raw[0];
+    for I := 0 to V_SIZE - 1 do
+    begin
+      Cum := Cum + V.Raw[I];
+      if Cum > 0.80 then
+      begin
+        NucleusSize := I;
+        Break;
+      end;
+    end;
+    AssertTrue('Test setup: nucleus must be narrower than the first guess',
+      NucleusSize < 256);
+    AssertTrue('Test setup: peak must dominate', MaxP > 0);
+    for I := 0 to 299 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('Large-vocab top-p draw must stay inside the nucleus, got ' +
+        IntToStr(Token), (Token >= 0) and (Token < NucleusSize));
+    end;
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestTopPLargeVocabFlatDistributionRetries;
+const
+  V_SIZE = 5000;
+var
+  Sampler: TNNetSamplerTopP;
+  V: TNNetVolume;
+  I, Token, Distinct: integer;
+  Seen: array of boolean;
+begin
+  // A UNIFORM row needs ~0.9*5000 = 4500 tokens to reach the mass, far more
+  // than the 256-token first guess, so this forces the widen-and-retry path.
+  // Every token must still be reachable and in range.
+  Sampler := TNNetSamplerTopP.Create(0.90);
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  SetLength(Seen, V_SIZE);
+  try
+    V.Fill(1.0 / V_SIZE);
+    Distinct := 0;
+    for I := 0 to 499 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('Retry-path draw must be a valid token, got ' +
+        IntToStr(Token), (Token >= 0) and (Token < V_SIZE));
+      if not Seen[Token] then
+      begin
+        Seen[Token] := true;
+        Inc(Distinct);
+      end;
+    end;
+    // A retry that silently collapsed to the truncated window would keep
+    // returning the same handful of tokens.
+    AssertTrue('Retry path must still draw from a wide set, distinct=' +
+      IntToStr(Distinct), Distinct > 100);
+  finally
+    SetLength(Seen, 0);
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestWeightedTopKLargeVocabNeverDrawsOutsideTopK;
+const
+  V_SIZE = 4096;
+  TOP_K  = 40;
+var
+  Sampler: TNNetSamplerWeightedTopK;
+  V: TNNetVolume;
+  I, J, Token, BestIdx: integer;
+  Scratch: TNNetVolume;
+  Cutoff, Best: TNeuralFloat;
+begin
+  // The quickselect prefix must equal the true top-K. Build the reference by
+  // repeatedly extracting the max from a scratch copy.
+  Sampler := TNNetSamplerWeightedTopK.Create(TOP_K);
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  Scratch := TNNetVolume.Create(V_SIZE, 1, 1);
+  try
+    BuildLargePeakedRow(V, V_SIZE, 1234); // peak away from index 0
+    Scratch.Copy(V);
+    Cutoff := 0;
+    for I := 0 to TOP_K - 1 do
+    begin
+      BestIdx := 0;
+      Best := Scratch.Raw[0];
+      for J := 1 to V_SIZE - 1 do
+        if Scratch.Raw[J] > Best then
+        begin
+          Best := Scratch.Raw[J];
+          BestIdx := J;
+        end;
+      Cutoff := Best;          // after the loop: the K-th largest probability
+      Scratch.Raw[BestIdx] := -1;
+    end;
+    for I := 0 to 299 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('Draw must be a valid token', (Token >= 0) and (Token < V_SIZE));
+      AssertTrue('Large-vocab weighted top-k drew outside the true top-K: ' +
+        'token ' + IntToStr(Token), V.Raw[Token] >= Cutoff);
+    end;
+  finally
+    Scratch.Free;
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestMinPLargeVocabRespectsThreshold;
+const
+  V_SIZE = 4096;
+var
+  Sampler: TNNetSamplerMinP;
+  V: TNNetVolume;
+  I, Token: integer;
+  MaxP, Threshold: TNeuralFloat;
+begin
+  // The linear survivor count must reduce the window to exactly the tokens
+  // passing p >= MinP * max(p) - no draw may fall below that cut.
+  Sampler := TNNetSamplerMinP.Create(0.10);
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  try
+    BuildLargePeakedRow(V, V_SIZE, 77);
+    MaxP := V.Raw[0];
+    for I := 1 to V_SIZE - 1 do
+      if V.Raw[I] > MaxP then MaxP := V.Raw[I];
+    Threshold := 0.10 * MaxP;
+    for I := 0 to 299 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('Draw must be a valid token', (Token >= 0) and (Token < V_SIZE));
+      AssertTrue('Large-vocab min-p drew below the threshold: token ' +
+        IntToStr(Token), V.Raw[Token] >= Threshold);
     end;
   finally
     V.Free;

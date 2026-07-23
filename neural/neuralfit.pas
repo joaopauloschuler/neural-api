@@ -28,7 +28,7 @@ interface
 
 uses
   Classes, SysUtils, neuralnetwork, neuralvolume, neuralthread, neuraldatasets,
-  neuralscheduler
+  neuralscheduler, pascoremath32
   {$IFDEF OpenCL}, cl
   {$IFNDEF FPC}, neuralopencl {$ENDIF}
   {$ENDIF}
@@ -919,6 +919,7 @@ var
   LocalPos, LocalClassA, LocalClassB: integer;
   CountX, CountY, CountD: integer;
   MaxValueA, MaxValueB: TNeuralFloat;
+  v: TNeuralFloat;
 begin
   Result := True;
   if Not(A.SameSize(B)) then
@@ -947,9 +948,10 @@ begin
         begin
           Inc(I);
           Inc(LocalPos);
-          if A.FData[I] > MaxValueA then
+          v := A.FData[I];
+          if v > MaxValueA then
           begin
-            MaxValueA := A.FData[I];
+            MaxValueA := v;
             LocalClassA := LocalPos;
           end;
         end;
@@ -962,9 +964,10 @@ begin
         begin
           Inc(I);
           Inc(LocalPos);
-          if B.FData[I] > MaxValueB then
+          v := B.FData[I];
+          if v > MaxValueB then
           begin
-            MaxValueB := B.FData[I];
+            MaxValueB := v;
             LocalClassB := LocalPos;
           end;
         end;
@@ -1256,7 +1259,7 @@ begin
 
   if (OutputValue > 0) then
   begin
-    result := -Ln(OutputValue);
+    result := -pcr_logf(OutputValue);
   end
   else
   begin
@@ -1277,6 +1280,7 @@ var
   ClassesCnt: TNeuralFloat;
   LossSum: TNeuralFloat;
   MaxPos: integer;
+  v: TNeuralFloat;
 begin
   if Not(ExpectedOutput.SameSize(FoundOutput)) then
   begin
@@ -1300,13 +1304,14 @@ begin
         // Get the A Class
         I := StartPointPos;
         MaxValue := ExpectedOutput.FData[I];
-        MaxPos := 0;
+        MaxPos := StartPointPos;
         for CountD := 1 to MaxD do
         begin
           Inc(I);
-          if ExpectedOutput.FData[I] > MaxValue then
+          v := ExpectedOutput.FData[I];
+          if v > MaxValue then
           begin
-            MaxValue := ExpectedOutput.FData[I];
+            MaxValue := v;
             MaxPos := I;
           end;
           if MaxValue >= 1 then break;
@@ -1316,7 +1321,7 @@ begin
           ClassesCnt := ClassesCnt + 1;
           LocalValue := FoundOutput.FData[MaxPos];
           if LocalValue>0
-          then LossSum := LossSum + -Ln(LocalValue)
+          then LossSum := LossSum + -pcr_logf(LocalValue)
           else LossSum := LossSum + 100;
         end;
       end;
@@ -1350,7 +1355,7 @@ begin
 
   if (OutputValue > 0) then
   begin
-    result := -Ln(OutputValue);
+    result := -pcr_logf(OutputValue);
   end
   else
   begin
@@ -1371,7 +1376,7 @@ begin
   OutputValue := FoundOutput[FoundOutput.SizeX - 1, FoundOutput.SizeY - 1, ClassId];
   if (OutputValue > 0) then
   begin
-    result := -Ln(OutputValue);
+    result := -pcr_logf(OutputValue);
   end
   else
   begin
@@ -3595,7 +3600,7 @@ var
   MixLambda: TNeuralFloat;
   DidBatchMix: boolean;
   CutX0, CutY0, CutBoxW, CutBoxH, CutX, CutY, CutD, CutXMax, CutYMax: integer;
-  CutBase, CutRowFloats: integer;
+  CutBase, CutRowFloats, CutRowBytes, CutRowStride: integer;
 begin
   ImgInput := TNNetVolume.Create();
   ImgInputCp := TNNetVolume.Create();
@@ -3735,10 +3740,13 @@ begin
             // X positions are Depth apart), so paste each row with one Move of
             // CutBoxW*Depth floats. Bit-exact (no float op).
             CutRowFloats := CutBoxW * (DepthM1 + 1);
+            CutRowBytes := CutRowFloats * csNeuralFloatSize;
+            CutRowStride := ImgInput.GetRawPos(0, 1);   // SizeX*Depth: one row apart
+            CutBase := ImgInput.GetRawPos(CutX0, CutY0, 0);
             for CutY := CutY0 to CutYMax do
             begin
-              CutBase := ImgInput.GetRawPos(CutX0, CutY, 0);
-              Move(PartnerInput.FData[CutBase], ImgInput.FData[CutBase], CutRowFloats * csNeuralFloatSize);
+              Move(PartnerInput.FData[CutBase], ImgInput.FData[CutBase], CutRowBytes);
+              Inc(CutBase, CutRowStride);
             end;
           end;
           // True pasted-area fraction (clamped box may shrink at borders).
@@ -3802,7 +3810,7 @@ begin
 
     if (OutputValue > 0) then
     begin
-      CurrentLoss := -Ln(OutputValue);
+      CurrentLoss := -pcr_logf(OutputValue);
     end
     else
     begin
@@ -3879,7 +3887,7 @@ var
   BlockSize: integer;
   LocalNN: TNNet;
   ImgInput, ImgInputCp: TNNetVolume;
-  LocalImg: TNNetVolume;
+  LocalImg, CropSrc: TNNetVolume;
   pOutput, vOutput, sumOutput: TNNetVolume;
   I, ImgIdx: integer;
   StartPos, FinishPos, FinishPosM1: integer;
@@ -3926,7 +3934,8 @@ begin
     begin
       // Note: crop bounds intentionally read sizes from FImgVolumes[ImgIdx]
       // (preserved as-is), while the crop source is FWorkingVolumes[ImgIdx].
-      ImgInput.CopyCropping(LocalImg, HalfCrop, HalfCrop, FImgVolumes[ImgIdx].SizeX-FMaxCropSize, FImgVolumes[ImgIdx].SizeY-FMaxCropSize);
+      CropSrc := FImgVolumes[ImgIdx];  // #7: bind list element once
+      ImgInput.CopyCropping(LocalImg, HalfCrop, HalfCrop, CropSrc.SizeX-FMaxCropSize, CropSrc.SizeY-FMaxCropSize);
     end
     else
     begin
@@ -3982,7 +3991,7 @@ begin
 
     if (OutputValue > 0) then
     begin
-      CurrentLoss := -Ln(OutputValue);
+      CurrentLoss := -pcr_logf(OutputValue);
     end
     else
     begin

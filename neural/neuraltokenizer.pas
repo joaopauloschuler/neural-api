@@ -88,6 +88,7 @@ var
   Tokens: TNNetStringList;
   CurrentToken, NexToken: string;
   ShouldQuit: boolean;
+  NewCount: integer;
 begin
   pairCounts.Clear;
   pairCounts.Sorted := true;
@@ -100,9 +101,11 @@ begin
     MaxLen := Tokens.Count - 2;
     if MaxLen > -1 then
     begin
+      // #7/#4: carry the previous element instead of re-fetching Tokens[j];
+      // each element passes the TStringList.Get accessor once per iteration.
+      CurrentToken := Tokens[0];
       for j := 0 to MaxLen do
       begin
-        CurrentToken := Tokens[j];
         NexToken := Tokens[j+1];
         if
           (((CurrentToken >= 'a') and (CurrentToken < '{')) or (CurrentToken='''')) and
@@ -114,11 +117,14 @@ begin
           then pairCounts.AddInteger(pair, 1)
           else
           begin
-            pairCounts.Integers[PairIndex] := pairCounts.Integers[PairIndex] + 1;
-            if pairCounts.Integers[PairIndex] > 32 then ShouldQuit := true;
+            // #4: resolve the Integers[] getter once instead of three times.
+            NewCount := pairCounts.Integers[PairIndex] + 1;
+            pairCounts.Integers[PairIndex] := NewCount;
+            if NewCount > 32 then ShouldQuit := true;
           end;
         end;
         if ShouldQuit then break;
+        CurrentToken := NexToken; // carry to next iteration (single accessor)
       end;
     end;
     if ShouldQuit then break;
@@ -184,7 +190,7 @@ begin
       if pairCounts.Count>1 then
       begin
         pairCounts.SortByIntegerDesc;
-        MaxJ := Min(MergesPerLoop - 1, pairCounts.Count);
+        MaxJ := Min(MergesPerLoop - 1, pairCounts.Count - 1);
         for J := 0 to MaxJ do
         begin
           pair := pairCounts[J];

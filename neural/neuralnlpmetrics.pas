@@ -662,8 +662,9 @@ procedure ScorePerPositionWindow(NN: TNNet; InV: TNNetVolume; Last: TNNetLayer;
   VocabSize: integer; ExcludeSpecial: boolean; var SumNLL: TNeuralFloat;
   var Stats: TNNetPerplexityStats);
 var
-  Pos, D, Tgt, VocabSizeM1: integer;
+  Pos, D, Tgt, VocabSizeM1, RowBase: integer;
   RowSum, Prob: TNeuralFloat;
+  LO: TNNetVolume;
 begin
   InV.Fill(0);
   if InDepth = 1
@@ -671,6 +672,7 @@ begin
   else InV.OneHotEncoding(WindowToks);       // one-hot, left-aligned
   NN.Compute(InV);
   VocabSizeM1 := VocabSize - 1;
+  LO := Last.Output;
   for Pos := FirstTgt to LastTgt do
   begin
     Tgt := WindowToks[Pos];
@@ -681,11 +683,12 @@ begin
     end;
     // Output row Pos-1 predicts token Pos. Defensive re-normalisation keeps
     // the math honest even for near-softmax heads.
+    RowBase := LO.GetRawPos(Pos - 1, 0);
     RowSum := 0;
     for D := 0 to VocabSizeM1 do
-      RowSum := RowSum + Last.Output[Pos - 1, 0, D];
+      RowSum := RowSum + LO.FData[RowBase + D];
     if RowSum <= 0 then RowSum := 1.0;
-    Prob := Last.Output[Pos - 1, 0, Tgt] / RowSum;
+    Prob := LO.FData[RowBase + Tgt] / RowSum;
     SumNLL := SumNLL - SafeLogProb(Prob);
     Inc(Stats.PredictedTokens);
   end;
@@ -985,7 +988,7 @@ begin
         end;
         // Output row Pos-1 predicts token Pos (the causal shift). Defensive
         // re-normalisation, exactly like Perplexity.
-        RowBase := LO.GetRawPos(Pos - 1, 0, 0);
+        RowBase := LO.GetRawPos(Pos - 1, 0);
         RowSum := 0;
         for D := 0 to VocabSizeM1 do
           RowSum := RowSum + LO.FData[RowBase + D];
@@ -1017,7 +1020,7 @@ begin
         NN.Compute(InV);
         LO := Last.Output;
         Row := WinLen - 2;                       // row predicting the last token
-        RowBase := LO.GetRawPos(Row, 0, 0);
+        RowBase := LO.GetRawPos(Row, 0);
         RowSum := 0;
         for D := 0 to VocabSizeM1 do
           RowSum := RowSum + LO.FData[RowBase + D];
@@ -1409,7 +1412,7 @@ begin
       NN.Compute(InV);
       Row := WinLen - 1;                         // row predicting token at Pos
       LO := Last.Output;
-      RowBase := LO.GetRawPos(Row, 0, 0);
+      RowBase := LO.GetRawPos(Row, 0);
       Best := 0;
       BestVal := LO.FData[RowBase];
       for D := 1 to VocabSizeM1 do
@@ -1774,7 +1777,7 @@ end;
 // Classic O(|cand|*|ref|) two-row LCS length.
 function LCSLength(const A, B: TNeuralIntegerArray): integer;
 var
-  Prev, Curr: array of integer;
+  Prev, Curr, Tmp: array of integer;
   RowIdx, ColIdx, LenA, LenB: integer;
 begin
   Result := 0;
@@ -1791,7 +1794,9 @@ begin
       if A[RowIdx - 1] = B[ColIdx - 1]
       then Curr[ColIdx] := Prev[ColIdx - 1] + 1
       else Curr[ColIdx] := Max(Prev[ColIdx], Curr[ColIdx - 1]);
-    Prev := Copy(Curr, 0, Length(Curr));
+    // Two-row swap: every Curr[0..LenB] is overwritten next row, so exchanging
+    // the row references is exact and avoids a per-row heap copy (#17 spirit).
+    Tmp := Prev; Prev := Curr; Curr := Tmp;
   end;
   Result := Prev[Length(B)];
 end;

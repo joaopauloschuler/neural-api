@@ -186,8 +186,11 @@ function MulModP(a, b: UInt64): UInt64;
 var
   res: UInt64;
 begin
+  // #5/#14: precondition -- a MUST already be < csP. The sole caller passes
+  // FA[I] (built in [1, csP-1] by InitPermutations), so the reductive
+  // `a := a mod csP` is redundant and has been dropped. AddModP assumes inputs
+  // < csP, which holds for a here and is preserved by AddModP(a, a).
   res := 0;
-  a := a mod csP;
   while b > 0 do
   begin
     if (b and 1) = 1 then

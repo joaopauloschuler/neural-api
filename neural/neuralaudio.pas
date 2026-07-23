@@ -315,26 +315,31 @@ var
   NIn, NOut, OutCnt, J, JLo, JHi: integer;
   NOutM1, NInM1: integer;
   Ratio, Cutoff, SrcPos, Center, X, Acc, WSum, W, PiX, PiXA: double;
-  AOverRatio: double;
+  AOverRatio, InvRatio: double;
+  TwoCutoff, TwoPiCutoff, PiOverA: double;
+  FC: integer;
 
   // Lanczos-windowed sinc at offset T (in input-sample units), low-passed at
   // Cutoff (cycles per input sample, <= 0.5). Returns the kernel weight.
   function LanczosKernel(T: double): double;
+  var
+    AT: double;
   begin
-    if Abs(T) < 1e-12 then
+    AT := Abs(T);
+    if AT < 1e-12 then
     begin
-      Result := 2.0 * Cutoff;
+      Result := TwoCutoff;
       exit;
     end;
-    if Abs(T) >= csResampleLanczosA then
+    if AT >= csResampleLanczosA then
     begin
       Result := 0.0;
       exit;
     end;
     // sinc(2*Cutoff*T) low-pass, windowed by the Lanczos lobe sinc(T/A).
-    PiX := Pi * 2.0 * Cutoff * T;
-    PiXA := Pi * T / csResampleLanczosA;
-    Result := 2.0 * Cutoff * (Sin(PiX) / PiX) * (Sin(PiXA) / PiXA);
+    PiX := TwoPiCutoff * T;
+    PiXA := PiOverA * T;
+    Result := TwoCutoff * (Sin(PiX) / PiX) * (Sin(PiXA) / PiXA);
   end;
 
 begin
@@ -367,16 +372,23 @@ begin
   NInM1 := NIn - 1;   // last valid input index, invariant across the tap loop (#5)
   // Downsampling kernel half-width 1/Ratio is call-invariant (rule #5).
   AOverRatio := csResampleLanczosA / Ratio;
+  InvRatio := 1.0 / Ratio;   // reciprocal hoisted; multiply per output sample (#5)
+  // Cutoff-derived kernel constants: invariant for the whole call (#5), read by
+  // the nested LanczosKernel instead of recomputing per tap.
+  TwoCutoff := 2.0 * Cutoff;
+  TwoPiCutoff := Pi * TwoCutoff;
+  PiOverA := Pi / csResampleLanczosA;
   for OutCnt := 0 to NOutM1 do
   begin
     // Position of this output sample expressed in INPUT-sample coordinates.
-    SrcPos := OutCnt / Ratio;
+    SrcPos := OutCnt * InvRatio;
     Center := SrcPos;
     // Kernel support in input samples: A lobes scaled by the cutoff stretch.
     if Ratio >= 1.0 then
     begin
-      JLo := Floor(Center) - csResampleLanczosA + 1;
-      JHi := Floor(Center) + csResampleLanczosA;
+      FC := Floor(Center);
+      JLo := FC - csResampleLanczosA + 1;
+      JHi := FC + csResampleLanczosA;
     end
     else
     begin
@@ -478,7 +490,8 @@ begin
     Scaled := Round(V * 32768.0);
     if Scaled > 32767 then Scaled := 32767
     else if Scaled < -32768 then Scaled := -32768;
-    Raw[i] := smallint(Round(Scaled));
+    // Scaled is already integral from the Round above; Trunc is exact (#4).
+    Raw[i] := smallint(Trunc(Scaled));
   end;
 
   FS := TFileStream.Create(FileName, fmCreate);
@@ -539,7 +552,7 @@ var
   SampleCnt, FrameCnt, BinCnt, MelCnt, TapCnt, FrameStart, SrcIdx: integer;
   MelMin, MelMax, FFTFreq, DownSlope, UpSlope, Tri: double;
   ReAcc, ImAcc, Acc, MaxLog, V, MaxLogM8: double;
-  logFloor, invLn10: double;
+  logFloor, invLn10, angStep, ang: double;
   twBase, rowBase, twIdx, idx, nCopy, nCopyM1: integer;
   AllZero: boolean;
 
@@ -590,13 +603,17 @@ begin
   SetLength(CosTab, NumBins * csWhisperNFFT);
   SetLength(SinTab, NumBins * csWhisperNFFT);
   for BinCnt := 0 to NumBinsM1 do
+  begin
+    rowBase := BinCnt * csWhisperNFFT;            // #11: bin-only row base
+    angStep := 2.0 * Pi * BinCnt / csWhisperNFFT; // #11: per-tap angle increment
     for TapCnt := 0 to NFFTM1 do
     begin
-      CosTab[BinCnt * csWhisperNFFT + TapCnt] :=
-        Cos(2.0 * Pi * BinCnt * TapCnt / csWhisperNFFT);
-      SinTab[BinCnt * csWhisperNFFT + TapCnt] :=
-        Sin(2.0 * Pi * BinCnt * TapCnt / csWhisperNFFT);
+      twIdx := rowBase + TapCnt;   // one index for both twiddle tables (#4)
+      ang := angStep * TapCnt;
+      CosTab[twIdx] := Cos(ang);
+      SinTab[twIdx] := Sin(ang);
     end;
+  end;
 
   // ---- slaney mel filter bank (triangles in Hz, slaney-normed) ----
   MelMin := HertzToMelSlaney(0.0);
@@ -757,7 +774,7 @@ begin
   // NFFT-1 bins of linspace(0,sr,NFFT,endpoint=False)[1:]); the final result is
   // sliced to the first NFFT div 2 + 1 one-sided bins.
   NumBins := NFFT;                 // freq_bins length after the 0-Hz prepend
-  NumKept := NFFT div 2 + 1;       // one-sided bins kept
+  NumKept := (NFFT shr 1) + 1;     // one-sided bins kept (#15: div 2 -> shr 1)
   NumChromaM1 := NumChroma - 1;
   NumBinsM1 := NumBins - 1;
   NumKeptM1 := NumKept - 1;
@@ -938,12 +955,12 @@ begin
   if NumSamplesIn < 1 then
     raise Exception.Create('ComputeMusicgenMelodyChroma: empty waveform.');
   NFFTM1 := NFFT - 1;
-  NumBins := NFFT div 2 + 1;
+  NumBins := (NFFT shr 1) + 1; // #15: div 2 -> shr 1
   NumBinsM1 := NumBins - 1;
   NumChromaM1 := NumChroma - 1;
   // center=True: torch reflect-pads NFFT div 2 on each side, then frames hop by
   // Hop. Frame count = 1 + NumSamplesIn div Hop.
-  PadLeft := NFFT div 2;
+  PadLeft := NFFT shr 1; // #15: div 2 -> shr 1
   NumFrames := 1 + NumSamplesIn div Hop;
   NumFramesM1 := NumFrames - 1;
   NumSamples := NumSamplesIn;
@@ -1039,8 +1056,8 @@ var
   NumFrames, NumBins, OutLen: integer;
   NFFTM1, NumBinsM1, OutLenM1, NumFramesM1: integer;
   FrameCnt, BinCnt, TapCnt, OutIdx, FrameStart: integer;
-  frameBase, twPos, reIdx: integer;
-  invNFFT: double;
+  frameBase, twPos, reIdx, rowBase, twIdx: integer;
+  invNFFT, angStep, ang: double;
   Window: array of double;        // periodic hann (matches forward analysis)
   Win2: array of double;          // window^2 (COLA envelope contribution)
   BinScale: array of double;      // per-bin self-conjugate weight (1 or 2)
@@ -1055,7 +1072,7 @@ begin
     raise Exception.Create('ISTFTOverlapAdd: NFFT must be >= 2.');
   if HopLength < 1 then
     raise Exception.Create('ISTFTOverlapAdd: HopLength must be >= 1.');
-  NumBins := NFFT div 2 + 1;
+  NumBins := (NFFT shr 1) + 1; // #15: div 2 -> shr 1
   NFFTM1 := NFFT - 1;
   NumBinsM1 := NumBins - 1;
   invNFFT := 1.0 / NFFT;   // per-sample 1/NFFT scale, invariant over the nest (#5)
@@ -1086,19 +1103,23 @@ begin
   SetLength(CosTab, NumBins * NFFT);
   SetLength(SinTab, NumBins * NFFT);
   for BinCnt := 0 to NumBinsM1 do
+  begin
+    rowBase := BinCnt * NFFT;            // #11: bin-only row base
+    angStep := 2.0 * Pi * BinCnt / NFFT; // #11: per-tap angle increment
     for TapCnt := 0 to NFFTM1 do
     begin
-      CosTab[BinCnt * NFFT + TapCnt] :=
-        Cos(2.0 * Pi * BinCnt * TapCnt / NFFT);
-      SinTab[BinCnt * NFFT + TapCnt] :=
-        Sin(2.0 * Pi * BinCnt * TapCnt / NFFT);
+      twIdx := rowBase + TapCnt;   // one index for both twiddle tables (#4)
+      ang := angStep * TapCnt;
+      CosTab[twIdx] := Cos(ang);
+      SinTab[twIdx] := Sin(ang);
     end;
+  end;
 
   // Per-bin self-conjugate weight is BinCnt-only (call-invariant); precompute it
   // once so the inner nest carries no per-element branch (rule #5 / App E).
   SetLength(BinScale, NumBins);
   for BinCnt := 0 to NumBinsM1 do
-    if (BinCnt = 0) or ((BinCnt = NumBins - 1) and (NFFT mod 2 = 0)) then
+    if (BinCnt = 0) or ((BinCnt = NumBins - 1) and ((NFFT and 1) = 0)) then
       BinScale[BinCnt] := 1.0
     else
       BinScale[BinCnt] := 2.0;

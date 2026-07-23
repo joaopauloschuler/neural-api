@@ -191,6 +191,8 @@ function HubShardListFromIndexJson(const IndexJsonText: string): TStringArray;
 var
   Root: TJSONData;
   WeightMap: TJSONData;
+  WM: TJSONObject;
+  Item: TJSONData;
   Shards: TStringList;
   I: integer;
   WeightMapCount, ShardsCount, WeightMapMax, ShardsMax: integer;
@@ -213,16 +215,18 @@ begin
     if not (WeightMap is TJSONObject) then
       raise EHubError.Create(
         'neuralhfhub: index json has no "weight_map" object.');
-    WeightMapCount := TJSONObject(WeightMap).Count;
+    WM := TJSONObject(WeightMap); // #4/#7: cast once, reuse across the loop
+    WeightMapCount := WM.Count;
     if WeightMapCount = 0 then
       raise EHubError.Create('neuralhfhub: index "weight_map" is empty.');
     WeightMapMax := WeightMapCount - 1;
     for I := 0 to WeightMapMax do
     begin
-      if not (TJSONObject(WeightMap).Items[I].JSONType = jtString) then
+      Item := WM.Items[I]; // #7: resolve the getter once per iteration
+      if not (Item.JSONType = jtString) then
         raise EHubError.Create('neuralhfhub: index weight_map entry "' +
-          TJSONObject(WeightMap).Names[I] + '" is not a string.');
-      Shards.Add(TJSONObject(WeightMap).Items[I].AsString);
+          WM.Names[I] + '" is not a string.');
+      Shards.Add(Item.AsString);
     end;
     ShardsCount := Shards.Count;
     SetLength(Result, ShardsCount);

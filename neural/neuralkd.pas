@@ -100,7 +100,7 @@ Weight updates use the student's per-layer learning rate/inertia
 interface
 
 uses
-  Classes, SysUtils, Math, neuralnetwork, neuralvolume;
+  Classes, SysUtils, Math, neuralnetwork, neuralvolume, pascoremath32;
 
 type
   /// Trainer-level helper implementing classic Hinton knowledge distillation:
@@ -222,13 +222,14 @@ begin
   if Dest.Size <> Logits.Size then Dest.ReSize(Logits);
   LogitsSizeM1 := Logits.Size - 1;
   // Numerically stable softmax over (Logits / Temp).
-  MaxLogit := Logits.FData[0] / Temp;
+  MaxLogit := Logits.FData[0];
   for I := 1 to LogitsSizeM1 do
-    if (Logits.FData[I] / Temp) > MaxLogit then MaxLogit := Logits.FData[I] / Temp;
+    if Logits.FData[I] > MaxLogit then MaxLogit := Logits.FData[I];
+  MaxLogit := MaxLogit / Temp;
   SumExp := 0;
   for I := 0 to LogitsSizeM1 do
   begin
-    V := Exp((Logits.FData[I] / Temp) - MaxLogit);
+    V := NeuralExp((Logits.FData[I] / Temp) - MaxLogit);
     Dest.FData[I] := V;
     SumExp := SumExp + V;
   end;
@@ -262,8 +263,8 @@ begin
   TeacherSoftSizeM1 := FTeacherSoft.Size - 1;
   for I := 0 to TeacherSoftSizeM1 do
     FLastKL := FLastKL + FTeacherSoft.FData[I] *
-      ( Ln(Max(FTeacherSoft.FData[I], FProbFloor)) -
-        Ln(Max(FStudentSoft.FData[I], FProbFloor)) );
+      ( pcr_logf(Max(FTeacherSoft.FData[I], FProbFloor)) -
+        pcr_logf(Max(FStudentSoft.FData[I], FProbFloor)) );
 
   FLastLoss := FAlpha * FLastHardLoss
              + (1 - FAlpha) * Sqr(FTemperature) * FLastKL;

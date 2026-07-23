@@ -553,6 +553,10 @@ type
       // via tanh(x) = 1 - 2/(exp(2x)+1) so it inherits VectorExp's AVX2 path.
       // Matches pcr_tanhf to ~1e-6. Buffers may alias (dst = src).
       class procedure VectorTanh(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // VectorRelu writes dst[0..N-1] := max(src[0..N-1], 0). AVX2-accelerated
+      // (AVXCopyRelu) with a scalar fallback on non-AVX builds. Bit-exact vs the
+      // scalar relu-copy. Buffers may alias (dst = src).
+      class procedure VectorRelu(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
       // VectorErf writes dst[0..N-1] := erf(src[0..N-1]) using the Abramowitz &
       // Stegun 7.1.26 approximation (|err| < 1.5e-7, i.e. matches pcr_erff to
       // ~1e-6). Built on VectorExp so it inherits the AVX2 path. dst may alias src.
@@ -661,10 +665,33 @@ type
   TNNetSamplerBase = class(TObject)
     protected
       FTokenArr: TNNetTokenArray;
+      // Live candidate window: only FTokenArr[0..FCount-1] is meaningful.
+      // FTokenArr itself stays vocabulary-sized so the load path never
+      // reallocates (rule #17); a truncating stage just lowers FCount, the
+      // shape llama.cpp's llama_token_data_array{size, sorted} uses. FSorted
+      // records whether that window is already in descending Score order, so
+      // a later stage can skip a redundant sort.
+      FCount: integer;
+      FSorted: boolean;
+      // Fill the candidate window from a whole volume / from one pixel and
+      // arm it as untruncated + unsorted.
+      procedure LoadCandidates(Origin: TNNetVolume);
+      procedure LoadCandidatesOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer);
     public
       function GetToken(Origin: TNNetVolume): integer; virtual; abstract;
       function GetTokenOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): integer; virtual; abstract;
+      // Sorts the live window descending by Score. A no-op when FSorted is
+      // already set.
       procedure SortTokenArray();
+      // Reduces the window to its K highest-Score entries, sorted descending,
+      // WITHOUT sorting the whole vocabulary: an O(n) average quickselect
+      // partition followed by a sort of the K-element prefix. The prefix is
+      // identical to the first K entries of a full descending sort (ties
+      // aside), so callers that only read [0..K-1] are unaffected.
+      procedure SelectTopCandidates(K: integer);
+      // Re-arms the full window and sorts it. Used as the fallback when a
+      // truncated window turned out to be too small to answer the query.
+      procedure RestoreFullWindowSorted();
       // State-init hook for STATEFUL samplers (e.g. TNNetSamplerMirostat carries
       // a running mu across the generation). The streamed decode path calls this
       // at the start of every fresh sequence (right where it Reset()s the
@@ -694,6 +721,10 @@ type
   TNNetSamplerTopP = class (TNNetSamplerBase)
     protected
       FTopP: TNeuralFloat;
+      // Cumulative-mass cut over the candidate window, with an adaptive
+      // top-k pre-truncation so the whole vocabulary is not sorted to find
+      // a nucleus that is typically a few dozen tokens wide.
+      function SampleFromNucleus(): integer;
     public
       constructor Create(TopP: TNeuralFloat);
       function GetToken(Origin: TNNetVolume): integer; override;
@@ -712,6 +743,9 @@ type
   TNNetSamplerMinP = class (TNNetSamplerBase)
     protected
       FMinP: TNeuralFloat;
+      // Counts the p >= MinP * max(p) survivors in linear passes and reduces
+      // the window to exactly that many, so the full row is never sorted.
+      procedure TruncateToMinP();
       // Weighted draw over the (descending-sorted) FTokenArr entries that
       // pass the p >= MinP * max(p) cut.
       function SampleFromSorted(): integer;
@@ -840,6 +874,14 @@ type
       FFrequency: TNeuralFloat;
       FPresence: TNeuralFloat;
       FCounts: array of integer;
+      // Compact list of the DISTINCT token ids with a non-zero count, in
+      // first-seen order (mirrors llama.cpp's penalty token_count map). Apply
+      // and ApplyToProbabilities walk this instead of scanning FCounts up to
+      // the highest id ever registered - the history is a few hundred tokens
+      // while FCounts spans the vocabulary (152k on Qwen2.5). Rule #17: grown
+      // only by RegisterToken, never inside the per-token apply path.
+      FSeen: array of integer;
+      FSeenCount: integer;
       procedure EnsureSize(NewSize: integer);
     public
       // Defaults are NO-OP: r=1.0, alpha_f=0.0, alpha_p=0.0.
@@ -3337,26 +3379,52 @@ begin
   FTopP := TopP;
 end;
 
-function TNNetSamplerTopP.GetToken(Origin: TNNetVolume): integer;
+function TNNetSamplerTopP.SampleFromNucleus(): integer;
+const
+  // Below this window size a full sort is already cheap, so skip the
+  // partial-selection machinery entirely.
+  csTopPAdaptiveMin = 1024;
+  // First guess at the nucleus width. A 0.8-0.95 nucleus over a peaked
+  // next-token distribution is far narrower than this in practice; when it
+  // is not, the retry below pays one full sort and is still correct.
+  csTopPAdaptiveK = 256;
 var
   CumulativeSum: TNeuralFloat;
-  I, Threshold, Hi, Lo: Integer;
+  I, Threshold, Hi: Integer;
+  Found, Truncated: boolean;
 begin
-  Origin.GetTokenArray(FTokenArr);
-  SortTokenArray();
-  CumulativeSum := 0;
-  Threshold := 0;
-  Hi := High(FTokenArr);
-  Lo := Low(FTokenArr);
-  for I := Lo to Hi do
+  if FCount = 0 then
   begin
-    CumulativeSum := CumulativeSum + FTokenArr[i].Score;
-    if CumulativeSum > FTopP then
-    begin
-      Threshold := I;
-      Break;
-    end;
+    Result := 0; // defensive: empty distribution
+    exit;
   end;
+  // Sorting 152k tokens to consume the first few dozen is the dominant cost
+  // of this sampler, so try a bounded prefix first (llama.cpp's adaptive
+  // top-k scheme) and only widen when the mass was not reached.
+  Truncated := FCount > csTopPAdaptiveMin;
+  if Truncated then SelectTopCandidates(csTopPAdaptiveK)
+  else SortTokenArray();
+  repeat
+    CumulativeSum := 0;
+    Threshold := 0;
+    Found := false;
+    Hi := FCount - 1;
+    for I := 0 to Hi do
+    begin
+      CumulativeSum := CumulativeSum + FTokenArr[I].Score;
+      if CumulativeSum > FTopP then
+      begin
+        Threshold := I;
+        Found := true;
+        Break;
+      end;
+    end;
+    if Found or (not Truncated) then Break;
+    // The prefix did not hold FTopP of the mass: re-arm the full row (the
+    // partition only permuted it) and redo the scan exactly once.
+    RestoreFullWindowSorted();
+    Truncated := false;
+  until false;
 
   // Randomly select one of the top tokens within the threshold.
   if Threshold > 0 then
@@ -3365,33 +3433,17 @@ begin
     Result := FTokenArr[0].Token; // Fallback in case P is too low.
 end;
 
+function TNNetSamplerTopP.GetToken(Origin: TNNetVolume): integer;
+begin
+  LoadCandidates(Origin);
+  Result := SampleFromNucleus();
+end;
+
 function TNNetSamplerTopP.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
-var
-  CumulativeSum: TNeuralFloat;
-  I, Threshold, Hi, Lo: Integer;
 begin
-  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
-  SortTokenArray();
-  CumulativeSum := 0;
-  Threshold := 0;
-  Hi := High(FTokenArr);
-  Lo := Low(FTokenArr);
-  for I := Lo to Hi do
-  begin
-    CumulativeSum := CumulativeSum + FTokenArr[i].Score;
-    if CumulativeSum > FTopP then
-    begin
-      Threshold := I;
-      Break;
-    end;
-  end;
-
-  // Randomly select one of the top tokens within the threshold.
-  if Threshold > 0 then
-    Result := FTokenArr[Random(Threshold)].Token
-  else
-    Result := FTokenArr[0].Token; // Fallback in case P is too low.
+  LoadCandidatesOnPixel(Origin, PixelX, PixelY);
+  Result := SampleFromNucleus();
 end;
 
 { TNNetSamplerMinP }
@@ -3407,7 +3459,7 @@ var
   Threshold, KeptSum, Roll, Cumulative: TNeuralFloat;
   I, KeptCount, KeptCountM1, Hi, Lo: integer;
 begin
-  if Length(FTokenArr) = 0 then
+  if FCount = 0 then
   begin
     Result := 0; // defensive: empty distribution
     exit;
@@ -3416,8 +3468,8 @@ begin
   Threshold := FMinP * FTokenArr[0].Score;
   KeptCount := 0;
   KeptSum := 0;
-  Hi := High(FTokenArr);
-  Lo := Low(FTokenArr);
+  Hi := FCount - 1;
+  Lo := 0;
   for I := Lo to Hi do
   begin
     if FTokenArr[I].Score >= Threshold then
@@ -3448,18 +3500,40 @@ begin
   end;
 end;
 
+procedure TNNetSamplerMinP.TruncateToMinP();
+var
+  I, Hi, KeepCount: integer;
+  MaxScore, Threshold: TNeuralFloat;
+begin
+  if FCount = 0 then exit;
+  // The p >= MinP * max(p) cut does not need a sorted row to be COUNTED, so
+  // find the max and the survivor count in two linear passes and select
+  // exactly that many. Avoids sorting the whole vocabulary for a kept set
+  // that is normally a handful of tokens.
+  Hi := FCount - 1;
+  MaxScore := FTokenArr[0].Score;
+  for I := 1 to Hi do
+    if FTokenArr[I].Score > MaxScore then MaxScore := FTokenArr[I].Score;
+  Threshold := FMinP * MaxScore;
+  KeepCount := 0;
+  for I := 0 to Hi do
+    if FTokenArr[I].Score >= Threshold then Inc(KeepCount);
+  if KeepCount < 1 then KeepCount := 1;
+  SelectTopCandidates(KeepCount);
+end;
+
 function TNNetSamplerMinP.GetToken(Origin: TNNetVolume): integer;
 begin
-  Origin.GetTokenArray(FTokenArr);
-  SortTokenArray();
+  LoadCandidates(Origin);
+  TruncateToMinP();
   Result := SampleFromSorted();
 end;
 
 function TNNetSamplerMinP.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 begin
-  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
-  SortTokenArray();
+  LoadCandidatesOnPixel(Origin, PixelX, PixelY);
+  TruncateToMinP();
   Result := SampleFromSorted();
 end;
 
@@ -3473,16 +3547,16 @@ end;
 
 function TNNetSamplerTopK.GetToken(Origin: TNNetVolume): integer;
 begin
-  Origin.GetTokenArray(FTokenArr);
-  SortTokenArray();
+  LoadCandidates(Origin);
+  SelectTopCandidates(FTopK);
   Result := FTokenArr[Random(FTopK)].Token;
 end;
 
 function TNNetSamplerTopK.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 begin
-  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
-  SortTokenArray();
+  LoadCandidatesOnPixel(Origin, PixelX, PixelY);
+  SelectTopCandidates(FTopK);
   Result := FTokenArr[Random(FTopK)].Token;
 end;
 
@@ -3499,15 +3573,15 @@ var
   KeptSum, Roll, Cumulative: TNeuralFloat;
   I, KeptCount, KeptCountM1: integer;
 begin
-  if Length(FTokenArr) = 0 then
+  if FCount = 0 then
   begin
     Result := 0; // defensive: empty distribution
     exit;
   end;
   // FTokenArr is sorted DESCENDING, so [0..KeptCount-1] are the top-K tokens.
   KeptCount := FTopK;
-  if (KeptCount <= 0) or (KeptCount > Length(FTokenArr)) then
-    KeptCount := Length(FTokenArr); // <=0 or >=vocab => whole row
+  if (KeptCount <= 0) or (KeptCount > FCount) then
+    KeptCount := FCount; // <=0 or >=candidate count => whole window
   KeptSum := 0;
   KeptCountM1 := KeptCount - 1;
   for I := 0 to KeptCountM1 do
@@ -3534,16 +3608,18 @@ end;
 
 function TNNetSamplerWeightedTopK.GetToken(Origin: TNNetVolume): integer;
 begin
-  Origin.GetTokenArray(FTokenArr);
-  SortTokenArray();
+  LoadCandidates(Origin);
+  // FTopK <= 0 keeps its documented "whole row" meaning, so only a positive
+  // K may pre-truncate the window.
+  if FTopK > 0 then SelectTopCandidates(FTopK) else SortTokenArray();
   Result := SampleFromSorted();
 end;
 
 function TNNetSamplerWeightedTopK.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 begin
-  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
-  SortTokenArray();
+  LoadCandidatesOnPixel(Origin, PixelX, PixelY);
+  if FTopK > 0 then SelectTopCandidates(FTopK) else SortTokenArray();
   Result := SampleFromSorted();
 end;
 
@@ -3562,7 +3638,7 @@ var
   Order: array of integer;     // FTokenArr indices sorted by ascending Dist
   I, J, KeptCount, KeptCountM1, Tmp, N, NM1, NM2, JStart: integer;
 begin
-  N := Length(FTokenArr);
+  N := FCount;
   if N = 0 then
   begin
     Result := 0; // defensive: empty distribution
@@ -3636,14 +3712,14 @@ end;
 
 function TNNetSamplerTypical.GetToken(Origin: TNNetVolume): integer;
 begin
-  Origin.GetTokenArray(FTokenArr);
+  LoadCandidates(Origin);
   Result := SampleTypical();
 end;
 
 function TNNetSamplerTypical.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 begin
-  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
+  LoadCandidatesOnPixel(Origin, PixelX, PixelY);
   Result := SampleTypical();
 end;
 
@@ -3671,7 +3747,7 @@ var
   S, Epsilon, KFloat, ChosenScore: TNeuralFloat;
   I, KeptCount, KeptCountM1, N, NM1, NumFit, NumFitM2, K: integer;
 begin
-  N := Length(FTokenArr);
+  N := FCount;
   if N = 0 then
   begin
     Result := 0; // defensive
@@ -3776,7 +3852,7 @@ end;
 
 function TNNetSamplerMirostat.GetToken(Origin: TNNetVolume): integer;
 begin
-  Origin.GetTokenArray(FTokenArr);
+  LoadCandidates(Origin);
   SortTokenArray();
   Result := SampleAndUpdate();
 end;
@@ -3784,16 +3860,115 @@ end;
 function TNNetSamplerMirostat.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 begin
-  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
+  LoadCandidatesOnPixel(Origin, PixelX, PixelY);
   SortTokenArray();
   Result := SampleAndUpdate();
 end;
 
 { TNNetSamplerBase }
 
+// Hoare-partition quickselect: permutes A[0..Count-1] so that the K highest
+// Scores occupy A[0..K-1] (in no particular order). Average O(Count); the
+// median-of-three pivot keeps the already-descending and all-equal inputs
+// (a post-softmax row that a previous stage sorted, or a uniform one) off
+// the quadratic path. Coded by Claude (AI).
+procedure PartialSelectTokenArray(var A: TNNetTokenArray; Count, K: integer);
+var
+  Lo, Hi, I, J, Mid, Bound: integer;
+  Pivot: TNeuralFloat;
+  T: TNNetToken;
+begin
+  if (K <= 0) or (K >= Count) then exit;
+  Lo := 0;
+  Hi := Count - 1;
+  Bound := K - 1;
+  while Lo < Hi do
+  begin
+    // Median of A[Lo], A[Mid], A[Hi] as the pivot value.
+    Mid := (Lo + Hi) shr 1;
+    if A[Mid].Score > A[Lo].Score then
+    begin
+      T := A[Mid]; A[Mid] := A[Lo]; A[Lo] := T;
+    end;
+    if A[Hi].Score > A[Lo].Score then
+    begin
+      T := A[Hi]; A[Hi] := A[Lo]; A[Lo] := T;
+    end;
+    if A[Mid].Score > A[Hi].Score then
+    begin
+      T := A[Mid]; A[Mid] := A[Hi]; A[Hi] := T;
+    end;
+    Pivot := A[Mid].Score;
+    I := Lo;
+    J := Hi;
+    repeat
+      while A[I].Score > Pivot do Inc(I);
+      while A[J].Score < Pivot do Dec(J);
+      if I <= J then
+      begin
+        T := A[I]; A[I] := A[J]; A[J] := T;
+        Inc(I);
+        Dec(J);
+      end;
+    until I > J;
+    // Recurse into the side that still contains the K-th boundary; when the
+    // boundary falls inside the equal-to-pivot gap the split is exact.
+    if Bound <= J then Hi := J
+    else if Bound >= I then Lo := I
+    else Break;
+  end;
+end;
+
+procedure TNNetSamplerBase.LoadCandidates(Origin: TNNetVolume);
+begin
+  Origin.GetTokenArray(FTokenArr);
+  FCount := Length(FTokenArr);
+  FSorted := false;
+end;
+
+procedure TNNetSamplerBase.LoadCandidatesOnPixel(Origin: TNNetVolume;
+  PixelX, PixelY: integer);
+begin
+  Origin.GetTokenArrayOnPixel(FTokenArr, PixelX, PixelY);
+  FCount := Length(FTokenArr);
+  FSorted := false;
+end;
+
 procedure TNNetSamplerBase.SortTokenArray;
 begin
-  QuickSortTokenArray(FTokenArr, Low(FTokenArr), High(FTokenArr));
+  if FSorted then exit;
+  if FCount > 1 then QuickSortTokenArray(FTokenArr, 0, FCount - 1);
+  FSorted := true;
+end;
+
+procedure TNNetSamplerBase.SelectTopCandidates(K: integer);
+begin
+  if K <= 0 then K := 1;
+  if K >= FCount then
+  begin
+    // Nothing to truncate - the caller wants the whole window.
+    SortTokenArray();
+    exit;
+  end;
+  if FSorted then
+  begin
+    // Already descending: the top K are exactly the current prefix.
+    FCount := K;
+    exit;
+  end;
+  PartialSelectTokenArray(FTokenArr, FCount, K);
+  FCount := K;
+  SortTokenArray();
+end;
+
+procedure TNNetSamplerBase.RestoreFullWindowSorted();
+begin
+  // PartialSelectTokenArray only PERMUTES the array, so the entries beyond
+  // the truncated window are still the rest of the vocabulary and re-arming
+  // the full length is sound - no reload from the volume needed.
+  FCount := Length(FTokenArr);
+  FSorted := false;
+  SortTokenArray();
 end;
 
 procedure TNNetSamplerBase.Reset();
@@ -3830,11 +4005,14 @@ begin
   FFrequency := Frequency;
   FPresence := Presence;
   SetLength(FCounts, 0);
+  SetLength(FSeen, 0);
+  FSeenCount := 0;
 end;
 
 destructor TNNetTokenHistoryPenalty.Destroy();
 begin
   SetLength(FCounts, 0);
+  SetLength(FSeen, 0);
   inherited Destroy();
 end;
 
@@ -3855,31 +4033,46 @@ procedure TNNetTokenHistoryPenalty.RegisterToken(TokenId: integer);
 begin
   if TokenId < 0 then exit;
   EnsureSize(TokenId + 1);
+  // A zero count means this id is not in FSeen yet: append it before the
+  // increment so FSeen holds exactly the ids with FCounts > 0.
+  if FCounts[TokenId] = 0 then
+  begin
+    if FSeenCount >= Length(FSeen) then
+      SetLength(FSeen, (FSeenCount + 1) * 2);
+    FSeen[FSeenCount] := TokenId;
+    Inc(FSeenCount);
+  end;
   Inc(FCounts[TokenId]);
 end;
 
 procedure TNNetTokenHistoryPenalty.ResetHistory();
 var
-  I, MaxI: integer;
+  I, SeenM1: integer;
 begin
-  MaxI := Length(FCounts) - 1;
-  for I := 0 to MaxI do FCounts[I] := 0;
+  // Only the ids actually registered can be non-zero, so clearing them is
+  // proportional to the history rather than to the vocabulary. FSeen itself
+  // keeps its capacity for the next sequence (no per-sequence realloc).
+  SeenM1 := FSeenCount - 1;
+  for I := 0 to SeenM1 do FCounts[FSeen[I]] := 0;
+  FSeenCount := 0;
 end;
 
 procedure TNNetTokenHistoryPenalty.Apply(Logits: TNNetVolume);
 var
-  I, MaxToken, Count: integer;
+  I, Tok, MaxToken, SeenM1, Count: integer;
   Logit: TNeuralFloat;
 begin
+  // Walk the distinct-id history, not the vocabulary-sized FCounts array.
   // The history can never be larger than the logit volume of interest.
-  MaxToken := Length(FCounts) - 1;
-  if MaxToken >= Logits.Size then MaxToken := Logits.Size - 1;
-  for I := 0 to MaxToken do
+  MaxToken := Logits.Size - 1;
+  SeenM1 := FSeenCount - 1;
+  for I := 0 to SeenM1 do
   begin
-    Count := FCounts[I];
-    if Count > 0 then
+    Tok := FSeen[I];
+    if Tok <= MaxToken then
     begin
-      Logit := Logits.FData[I];
+      Count := FCounts[Tok];
+      Logit := Logits.FData[Tok];
       // (a) repetition penalty - sign-correct CTRL form.
       if FRepetition <> 1.0 then
       begin
@@ -3890,28 +4083,30 @@ begin
       Logit := Logit - FFrequency * Count;
       // (c) presence penalty - flat push for any token used at least once.
       Logit := Logit - FPresence;
-      Logits.FData[I] := Logit;
+      Logits.FData[Tok] := Logit;
     end;
   end;
 end;
 
 procedure TNNetTokenHistoryPenalty.ApplyToProbabilities(Probs: TNNetVolume);
 var
-  I, MaxToken, Count: integer;
+  I, Tok, MaxToken, SeenM1, Count: integer;
   P, Total: TNeuralFloat;
   Changed: boolean;
 begin
   // Guaranteed bit-for-bit no-op when every knob is at its default.
   if (FRepetition = 1.0) and (FFrequency = 0.0) and (FPresence = 0.0) then exit;
   Changed := false;
-  MaxToken := Length(FCounts) - 1;
-  if MaxToken >= Probs.Size then MaxToken := Probs.Size - 1;
-  for I := 0 to MaxToken do
+  // Walk the distinct-id history, not the vocabulary-sized FCounts array.
+  MaxToken := Probs.Size - 1;
+  SeenM1 := FSeenCount - 1;
+  for I := 0 to SeenM1 do
   begin
-    Count := FCounts[I];
-    if Count > 0 then
+    Tok := FSeen[I];
+    if Tok <= MaxToken then
     begin
-      P := Probs.FData[I];
+      Count := FCounts[Tok];
+      P := Probs.FData[Tok];
       // (a) repetition penalty: p := p^r ("power then renormalize", the
       // probability-domain image of the sign-correct CTRL logit rule -
       // ln p <= 0 always, so the negative branch ln p * r applies).
@@ -3920,7 +4115,7 @@ begin
       // multiplicative exp() factor on the probability.
       if (FFrequency <> 0.0) or (FPresence <> 0.0) then
         P := P * NeuralExp(-(FFrequency * Count + FPresence));
-      Probs.FData[I] := P;
+      Probs.FData[Tok] := P;
       Changed := true;
     end;
   end;
@@ -4898,6 +5093,7 @@ var
   ClusterCount, MaxClusterCount: integer;
   ClosestId: integer;
   StartTime: double;
+  Smp, CS, Cl: TNNetVolume; // #7: bind repeatedly-indexed list elements
 begin
   StartTime := Now();
   MaxSampleCount := FSample.Count - 1;
@@ -4910,26 +5106,30 @@ begin
   begin
     for SampleCount := 0 to MaxSampleCount do
     begin
-      ClosestId := GetClusterId(FSample[SampleCount]);
-      FClusterSums[ClosestId].Add(FSample[SampleCount]);
-      FClusterSums[ClosestId].IncTag();
-      FSample[SampleCount].Tag := ClosestId;
+      Smp := FSample[SampleCount];      // #7: bound once
+      ClosestId := GetClusterId(Smp);
+      CS := FClusterSums[ClosestId];    // #7: bound once
+      CS.Add(Smp);
+      CS.IncTag();
+      Smp.Tag := ClosestId;
     end;
 
     for ClusterCount := 0 to MaxClusterCount do
     begin
-      if FClusterSums[ClusterCount].Tag > 0 then
+      CS := FClusterSums[ClusterCount];   // #7: bound once
+      Cl := FClusters[ClusterCount];      // #7: bound once
+      if CS.Tag > 0 then
       begin
-        FClusterSums[ClusterCount].Divi(FClusterSums[ClusterCount].Tag);
+        CS.Divi(CS.Tag);
         if RepositionClusters then
         begin
-          FClusters[ClusterCount].Copy(FClusterSums[ClusterCount]);
+          Cl.Copy(CS);
         end;
-        FClusters[ClusterCount].Tag := FClusterSums[ClusterCount].Tag;
+        Cl.Tag := CS.Tag;
       end
       else
       begin
-        FClusters[ClusterCount].Tag := 0;
+        Cl.Tag := 0;
       end;
     end;
   end;
@@ -5124,23 +5324,26 @@ function TNNetVolumeList.GetClosestId(Original: TNNetVolume; var MinDist: TNeura
 var
   I: integer;
   MaxCount: integer;
-  CurrentDist: TNeuralFloat;
+  CurrentDist, MinSqr: TNeuralFloat;
 begin
   Result := 0;
   MaxCount := Count - 1;
   if (MaxCount > 0) then
   begin
-    MinDist := Original.GetDistance(Self[0]);
+    // #14: rank on GetDistanceSqr (argmin identical, Sqrt strictly increasing);
+    // take the one Sqrt on the winner after the loop. MinSqr<=0 <=> MinDist<=0.
+    MinSqr := Original.GetDistanceSqr(Self[0]);
     for I := 1 to MaxCount do
     begin
-      CurrentDist := Original.GetDistance(Self[I]);
-      if (CurrentDist < MinDist) then
+      CurrentDist := Original.GetDistanceSqr(Self[I]);
+      if (CurrentDist < MinSqr) then
       begin
         Result := I;
-        MinDist := CurrentDist;
+        MinSqr := CurrentDist;
       end;
-      if MinDist <= 0 then Break;
+      if MinSqr <= 0 then Break;
     end;
+    if MinSqr > 0 then MinDist := Sqrt(MinSqr) else MinDist := 0;
   end;
 end;
 
@@ -6920,24 +7123,29 @@ var
   MaxX, MaxY: integer;
   X, Y, InputDepth, OutputDepth: integer;
   SelfBase, OrigBase: integer;
+  SelfRowStride, OrigRowStride: integer;
 begin
   Resize(Original.SizeX, Original.SizeY, Length(aChannels));
 
   MaxX := SizeX - 1;
   MaxY := SizeY - 1;
+  SelfRowStride := FSizeX * FDepth;                  // #12: per-Y self step
+  OrigRowStride := Original.FSizeX * Original.FDepth; // #12: per-Y src step
 
   for X := 0 to MaxX do
   begin
+    SelfBase := GetRawPos(X, 0);
+    OrigBase := Original.GetRawPos(X, 0);
     for Y := 0 to MaxY do
     begin
-      SelfBase := GetRawPos(X, Y);
-      OrigBase := Original.GetRawPos(X, Y);
       OutputDepth := 0;
       for InputDepth in aChannels do
       begin
         FData[SelfBase + OutputDepth] := Original.FData[OrigBase + InputDepth];
         Inc(OutputDepth);
       end;
+      Inc(SelfBase, SelfRowStride);
+      Inc(OrigBase, OrigRowStride);
     end;
   end;
 end;
@@ -7206,6 +7414,7 @@ var
   OrigPosX, OrigPosY: integer;
   MoveSizeBytes: integer;
   RawPostDest, RawPosSource: integer;
+  DestRowStride, SrcRowStride, SrcColBase: integer;
 begin
   if (NewSizeX=Original.SizeX) and (NewSizeY=Original.SizeY) then
   begin
@@ -7224,16 +7433,20 @@ begin
     OrigMaxX := Original.SizeX - 1;
     OrigMaxY := Original.SizeY - 1;
     MoveSizeBytes := Depth * SizeOf(T);
+    DestRowStride := FSizeX * FDepth;                  // #12: per-CntY dest step
+    SrcRowStride := Original.FSizeX * Original.FDepth;  // #5: invariant per call
 
     for CntX := 0 to MaxX do
     begin
       OrigPosX := Min(OrigMaxX, Round(CntX * InvRatioX));
+      SrcColBase := OrigPosX * Original.FDepth; // #11: invariant across CntY
+      RawPostDest := GetRawPos(CntX, 0);        // #12: carried across CntY
       for CntY := 0 to MaxY do
       begin
         OrigPosY := Min(OrigMaxY, Round(CntY * InvRatioY));
-        RawPostDest := GetRawPos(CntX, CntY);
-        RawPosSource := Original.GetRawPos(OrigPosX, OrigPosY);
+        RawPosSource := SrcRowStride * OrigPosY + SrcColBase;
         Move(Original.FData[RawPosSource], FData[RawPostDest], MoveSizeBytes);
+        Inc(RawPostDest, DestRowStride);
       end;
     end;
   end;
@@ -7908,6 +8121,7 @@ var
   iFrom, iTo: integer;
   iRawPos1, iRawPos2: integer;
   iBase1, iBase2: integer;
+  RowStride: integer;
   MaxY, MaxD: integer;
   CountX, CountY, CountD: integer;
   Aux: TNeuralFloat;
@@ -7917,13 +8131,14 @@ begin
 
   iTo := (FSizeX shr 1) - 1;
   iFrom := 0;
+  RowStride := FSizeX * FDepth;
 
   for CountX := iFrom to iTo do
   begin
+    iBase1 := GetRawPos(CountX, 0);
+    iBase2 := GetRawPos(FSizeX-CountX-1, 0);
     for CountY := 0 to MaxY do
     begin
-      iBase1 := GetRawPos(CountX, CountY);
-      iBase2 := GetRawPos(FSizeX-CountX-1, CountY);
       for CountD := 0 to MaxD do
       begin
         iRawPos1 := iBase1 + CountD;
@@ -7932,6 +8147,8 @@ begin
         FData[iRawPos1] := FData[iRawPos2];
         FData[iRawPos2] := Aux;
       end;
+      Inc(iBase1, RowStride);
+      Inc(iBase2, RowStride);
     end;
   end;
 end;
@@ -7941,6 +8158,7 @@ var
   iFrom, iTo: integer;
   iRawPos1, iRawPos2: integer;
   iBase1, iBase2: integer;
+  RowStride: integer;
   MaxX, MaxD: integer;
   CountX, CountY, CountD: integer;
   Aux: TNeuralFloat;
@@ -7950,13 +8168,14 @@ begin
 
   iTo := (FSizeY shr 1) - 1;
   iFrom := 0;
+  RowStride := FSizeX * FDepth;
 
   for CountX := 0 to MaxX do
   begin
+    iBase1 := GetRawPos(CountX, iFrom);
+    iBase2 := GetRawPos(CountX, FSizeY-iFrom-1);
     for CountY := iFrom to iTo do
     begin
-      iBase1 := GetRawPos(CountX, CountY);
-      iBase2 := GetRawPos(CountX, FSizeY-CountY-1);
       for CountD := 0 to MaxD do
       begin
         iRawPos1 := iBase1 + CountD;
@@ -7965,6 +8184,8 @@ begin
         FData[iRawPos1] := FData[iRawPos2];
         FData[iRawPos2] := Aux;
       end;
+      Inc(iBase1, RowStride);
+      Dec(iBase2, RowStride);
     end;
   end;
 end;
@@ -8601,6 +8822,29 @@ begin
   end;
 end;
 
+{$IFDEF AVXANY}
+// AVXCopyRelu (dst := max(src,0)) is defined later in this section under
+// {$IFDEF AVXANY}; forward-declare it so VectorRelu can call it here.
+procedure AVXCopyRelu(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer); forward;
+{$ENDIF}
+class procedure TNNetVolume.VectorRelu(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+{$IFNDEF AVXANY}
+var
+  I: integer;
+{$ENDIF}
+begin
+  // dst[i] := max(src[i], 0). On an AVX build this is the vectorized
+  // AVXCopyRelu kernel; otherwise a plain scalar relu-copy loop. Bit-exact
+  // either way (no float arithmetic, just a compare-and-select).
+  if N <= 0 then exit;
+  {$IFDEF AVXANY}
+  AVXCopyRelu(pDst, pSrc, N);
+  {$ELSE}
+  for I := 0 to N - 1 do
+    if pSrc^[I] > 0 then pDst^[I] := pSrc^[I] else pDst^[I] := 0;
+  {$ENDIF}
+end;
+
 class procedure TNNetVolume.VectorErf(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 const
   // Abramowitz & Stegun 7.1.26 coefficients (|err| < 1.5e-7).
@@ -8611,7 +8855,7 @@ const
   cErfA5: TNeuralFloat =  1.061405429;
   cErfP:  TNeuralFloat =  0.3275911;
 var
-  I, ChunkStart, ChunkLen, J: integer;
+  I, ChunkStart, ChunkLen, ChunkLenM1, J: integer;
   X, AX, T, Poly, E: TNeuralFloat;
   ExpBuf: array[0..255] of TNeuralFloat;
 begin
@@ -8627,13 +8871,14 @@ begin
   begin
     ChunkLen := N - ChunkStart;
     if ChunkLen > 256 then ChunkLen := 256;
-    for J := 0 to ChunkLen - 1 do
+    ChunkLenM1 := ChunkLen - 1;   // #2: hoist the for-bound (both loops)
+    for J := 0 to ChunkLenM1 do
     begin
       X := pSrc^[ChunkStart + J];
       ExpBuf[J] := -X * X;
     end;
     VectorExp(TNeuralFloatArrPtr(@ExpBuf[0]), TNeuralFloatArrPtr(@ExpBuf[0]), ChunkLen);
-    for J := 0 to ChunkLen - 1 do
+    for J := 0 to ChunkLenM1 do
     begin
       I := ChunkStart + J;
       X := pSrc^[I];
@@ -8826,31 +9071,35 @@ end;
 
 procedure TVolume.OneHotEncoding(aTokens: array of integer);
 var
-  CntToken, MaxToken, Token, SizeXM1, MaxTokenP1: integer;
+  CntToken, MaxToken, Token, SizeXM1, MaxTokenP1, rowBase: integer;
 begin
   MaxToken := Length(aTokens) - 1;
   SizeXM1 := SizeX - 1;
   Self.Fill(0);
   if MaxToken < SizeX then
   begin
+    rowBase := 0; // #12: GetRawPos(CntToken,0), steps FDepth per token
     for CntToken := 0 to MaxToken do
     begin
       Token := aTokens[CntToken];
       if Token < FDepth then
       begin
-        Self[CntToken, 0, Token] := 1;
+        FData[rowBase + Token] := 1;
       end
       else
       begin
         WriteLn('Token '+IntToStr(Token)+' is bigger than Depth '+IntToStr(FDepth)+' at OneHotEncoding.');
       end;
+      Inc(rowBase, FDepth);
     end;
     if MaxToken < SizeX - 1 then
     begin
       MaxTokenP1 := MaxToken + 1;
+      // rowBase now equals MaxTokenP1*FDepth = GetRawPos(MaxTokenP1,0)
       for CntToken := MaxTokenP1 to SizeXM1 do
       begin
-        Self[CntToken, 0, 0] := 1;
+        FData[rowBase] := 1;
+        Inc(rowBase, FDepth);
       end;
     end;
   end
@@ -9112,23 +9361,25 @@ end;
 
 procedure TVolume.OneHotEncodingReversed(var aTokens: array of integer);
 var
-  CntToken, MaxToken, Token: integer;
+  CntToken, MaxToken, Token, rowBase: integer;
 begin
   MaxToken := Length(aTokens) - 1;
   Self.Fill(0);
   if MaxToken < SizeX then
   begin
+    rowBase := MaxToken * FDepth; // #12: GetRawPos(MaxToken-CntToken,0), Dec per token
     for CntToken := 0 to MaxToken do
     begin
       Token := aTokens[CntToken];
       if Token < FDepth then
       begin
-        Self[MaxToken-CntToken, 0, Token] := 1;
+        FData[rowBase + Token] := 1;
       end
       else
       begin
         WriteLn('Token '+IntToStr(Token)+' is bigger than Depth '+IntToStr(FDepth)+' at OneHotEncodingReversed.');
       end;
+      Dec(rowBase, FDepth);
     end;
   end
   else
@@ -11158,18 +11409,22 @@ procedure TNNetVolume.AddArea(DestX, DestY, OriginX, OriginY, LenX,
 var
   CntY: integer;
   SizeXDepth: integer;
-  PtrA, PtrB: Pointer;
   MaxLenY: integer;
+  PosA, PosB, StrideA, StrideB: integer;
 begin
   if Self.Depth = Original.Depth then
   begin
     SizeXDepth := LenX * Self.Depth;
     MaxLenY := LenY - 1;
+    PosA := Self.GetRawPos(DestX, DestY);
+    PosB := Original.GetRawPos(OriginX, OriginY);
+    StrideA := FSizeX * FDepth;
+    StrideB := Original.FSizeX * Original.FDepth;
     for CntY := 0 to MaxLenY do
     begin
-      PtrA := Self.GetRawPtr(DestX, DestY+CntY);
-      PtrB := Original.GetRawPtr(OriginX, OriginY+CntY);
-      Add(PtrA, PtrB, SizeXDepth);
+      Add(Self.GetRawPtr(PosA), Original.GetRawPtr(PosB), SizeXDepth);
+      Inc(PosA, StrideA);
+      Inc(PosB, StrideB);
     end;
   end
   {$IFDEF Debug}
@@ -11415,7 +11670,7 @@ var
   MaxX, MaxD, CntX, CntY, CntD: integer;
   LocalDiff: TNeuralFloat;
   OrigA: TNeuralFloat;
-  SrcBPos, Dst1Pos, Dst2Pos: integer;
+  SrcB0, SrcBPos, Dst1Pos, Dst2Pos: integer;
   StrideXOrig, StrideXSelf, StrideYSelf: integer;
 begin
   if Original.Size > 0 then
@@ -11428,6 +11683,7 @@ begin
     StrideYSelf := FSizeX * FDepth;      // Self Y-slot step per CntY
     for CntD := 0 to MaxD do
     begin
+      SrcB0 := Original.GetRawPos(0, 0, CntD); // #11: no CntX in args
       for CntX := 0 to MaxX do
       begin
         // Self was resized to (Original.SizeX, Original.SizeX, Original.Depth),
@@ -11435,7 +11691,7 @@ begin
         // is the same flat offset in both, so compute it once.
         Dst1Pos := GetRawPos(CntX, 0, CntD);
         OrigA := Original.FData[Dst1Pos];
-        SrcBPos := Original.GetRawPos(0, 0, CntD);
+        SrcBPos := SrcB0;
         Dst2Pos := GetRawPos(0, CntX, CntD);
         for CntY := 0 to CntX do
         begin

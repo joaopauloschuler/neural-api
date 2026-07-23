@@ -464,14 +464,15 @@ end;
 function TCyclicLR.NextLR(Epoch, Step: integer): TNeuralFloat;
 var
   T, totalSize, cycle: integer;
-  stepRatio, x, scaleFactor, baseHeight, amp: TNeuralFloat;
+  stepRatio, x, scaleFactor, baseHeight, amp, tOverTotal: TNeuralFloat;
 begin
   T := Step;
   if T < 0 then T := 0;
   totalSize := FStepSizeUp + FStepSizeDown;
   stepRatio := FStepSizeUp / totalSize;
-  cycle := Floor(1 + T / totalSize);
-  x := 1.0 + T / totalSize - cycle;
+  tOverTotal := T / totalSize;                 // #4: one divide, reused twice
+  cycle := Floor(1 + tOverTotal);
+  x := 1.0 + tOverTotal - cycle;
   if x <= stepRatio then
     scaleFactor := x / stepRatio
   else

@@ -29,6 +29,15 @@ core count.
 A speedup > 1.00x means threading pays off at that size; <= 1.00x means the
 serial path would have been faster on that shape.
 
+Experiments A and B each close with a SUMMARY block of geometric means, so a
+run is comparable across machines and not only within itself: A reports the
+all-shapes / chunk-eligible / not-eligible geomeans plus per-family subtotals
+and approximate GOP/s throughput, then a memory-mode comparison across its two
+passes; B reports each small shape's best pool policy, its sensitivity to the
+policy choice, and a ranking of the policies. Summaries carry a shapeset
+version (SHAPESET_A / SHAPESET_B) and the build tag - bump the version whenever
+a shape is added, removed or resized, or old numbers stop being comparable.
+
 This program is free software; you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation; either version 2 of the License, or
@@ -78,6 +87,105 @@ begin
   Result := best;
 end;
 
+// ============================ Summary machinery ===============================
+// Shapeset versions. A summary line is only comparable across boxes/commits
+// when the shape list behind it is identical, so every summary carries its
+// version - BUMP THESE whenever a shape is added, removed or resized.
+const
+  SHAPESET_A = 'A/v1';
+  SHAPESET_B = 'B/v1';
+
+// Build identity, so pasted results are self-describing (a run built without
+// AVX is not comparable with one built with it).
+function BuildTag: string;
+begin
+  Result := '';
+  {$IFDEF AVX512}
+  Result := Result + 'AVX512 ';
+  {$ELSE}{$IFDEF AVX2}
+  Result := Result + 'AVX2 ';
+  {$ELSE}{$IFDEF AVX}
+  Result := Result + 'AVX ';
+  {$ELSE}
+  Result := Result + 'no-SIMD ';
+  {$ENDIF}{$ENDIF}{$ENDIF}
+  {$IFDEF OpenCL}
+  Result := Result + 'OpenCL ';
+  {$ENDIF}
+  {$IFDEF Debug}
+  Result := Result + 'Debug ';
+  {$ENDIF}
+  Result := Result + 'FPC ' + {$I %FPCVERSION%} + ' ' +
+    {$I %FPCTARGETOS%} + '-' + {$I %FPCTARGETCPU%};
+end;
+
+// Geometric-mean accumulator. Times across the sweep span orders of magnitude
+// (a 64x64 FC against a 512-token GDN), so an arithmetic mean would report the
+// largest shape and nothing else. The geomean weights every shape equally and
+// has the property that geomean(off)/geomean(on) IS geomean(per-shape speedup),
+// so the summary speedup never disagrees with the speedup column above it.
+type
+  TAggr = record
+    N: integer;         // shapes accumulated
+    NTp: integer;       // shapes with a usable op count (throughput columns)
+    LOff, LOn: double;      // sum of ln(time ms)
+    LTpOff, LTpOn: double;  // sum of ln(GOP/s)
+  end;
+
+procedure AggrReset(var G: TAggr);
+begin
+  G.N := 0; G.NTp := 0;
+  G.LOff := 0; G.LOn := 0; G.LTpOff := 0; G.LTpOn := 0;
+end;
+
+// Ops/(ms * 1e6) = GOP/s. Times are clamped away from zero: a shape that timed
+// below the clock's resolution would otherwise take Ln(0) down with it.
+procedure AggrAdd(var G: TAggr; Off, On_, Ops: double);
+begin
+  Off := Max(Off, 1e-6); On_ := Max(On_, 1e-6);
+  Inc(G.N);
+  G.LOff := G.LOff + Ln(Off);
+  G.LOn := G.LOn + Ln(On_);
+  if Ops > 0 then
+  begin
+    Inc(G.NTp);
+    G.LTpOff := G.LTpOff + Ln(Ops / (Off * 1e6));
+    G.LTpOn := G.LTpOn + Ln(Ops / (On_ * 1e6));
+  end;
+end;
+
+function GeoMean(LogSum: double; N: integer): double;
+begin
+  if N <= 0 then Result := 0 else Result := Exp(LogSum / N);
+end;
+
+function AggrOff(const G: TAggr): double;
+begin
+  Result := GeoMean(G.LOff, G.N);
+end;
+
+function AggrOn(const G: TAggr): double;
+begin
+  Result := GeoMean(G.LOn, G.N);
+end;
+
+procedure WriteAggrHeader;
+begin
+  WriteLn(Format('  %-22s %6s %10s %10s %8s %10s %9s',
+    ['', 'shapes', 'off ms', 'on ms', 'speedup', 'off GOP/s', 'on GOP/s']));
+end;
+
+procedure WriteAggrRow(const Tag: string; const G: TAggr);
+var off, on_, sp: double;
+begin
+  if G.N = 0 then exit;
+  off := AggrOff(G); on_ := AggrOn(G);
+  if on_ > 0 then sp := off / on_ else sp := 0;
+  WriteLn(Format('  %-22s %6d %10.3f %10.3f %7.2fx %10.2f %9.2f',
+    [Tag, G.N, off, on_, sp,
+     GeoMean(G.LTpOff, G.NTp), GeoMean(G.LTpOn, G.NTp)]));
+end;
+
 // =============================== Experiment A =================================
 type
   TShape = record Name: string; Kind, A, B, C, D: integer; end;
@@ -104,6 +212,61 @@ begin
   SetLength(ShA, idx + 1);
   ShA[idx].Name := N; ShA[idx].Kind := K;
   ShA[idx].A := A; ShA[idx].B := B; ShA[idx].C := C; ShA[idx].D := D;
+end;
+
+// Approximate op count for ONE forward pass of the shape's single compute
+// layer (one MAC = one op). This drives the GOP/s summary columns only: raw ms
+// is comparable across boxes only when the shape list is identical, whereas a
+// per-shape work/time figure stays meaningful when a shape is resized. It is a
+// consistent work proxy, NOT a certified FLOP count - the element-wise layers
+// (SwiGLU/RMSN/RoPE) have no MACs to count, so their op weights are estimates
+// and their absolute GOP/s should be read as a within-family comparison.
+function WorkOps(const S: TShape): double;
+var outXY: double;
+begin
+  case S.Kind of
+    // FC: in x out MACs.
+    0: Result := double(S.A) * S.B;
+    // Conv, stride 1, no pad: out positions x features x kernel x in depth.
+    1: begin
+         outXY := Sqr(double(Max(1, S.A - S.D + 1)));
+         Result := outXY * S.C * S.D * S.D * S.B;
+       end;
+    // Pointwise: positions x in depth x out features.
+    2: Result := double(S.A) * S.A * S.B * S.C;
+    // SwiGLU: one gated output per element (2B in -> B out).
+    3: Result := double(S.A) * S.B;
+    // TokenRMSNorm: sum-of-squares pass + scale pass.
+    4: Result := double(S.A) * S.B * 2;
+    // RotaryEmbedding: ~3 multiplies per element (pair rotation).
+    5: Result := double(S.A) * S.B * 3;
+    // DepthwiseConv1D: C taps per channel per token.
+    6, 7: Result := double(S.A) * S.B * S.C;
+    // GatedDeltaNet: per token, per v-head, ~4 sweeps of the Dk x Dv state.
+    8, 9: Result := double(S.A) * S.C * S.D * S.D * 4;
+  else
+    Result := 0;
+  end;
+end;
+
+// Family buckets for the per-family subtotals. One global geomean hides why a
+// box wins: FC/PW/Conv lean on cache and SIMD width, the token-wise layers on
+// memory bandwidth, and the decode bucket is the ChatTerminal-relevant path.
+const
+  FAM_COUNT = 5;
+  FAM_NAMES: array[0..FAM_COUNT - 1] of string =
+    ('FullConnect', 'Convolution', 'Pointwise', 'Norm/RoPE/SwiGLU',
+     'Decode (Dw/GDN)');
+
+function FamilyOf(Kind: integer): integer;
+begin
+  case Kind of
+    0: Result := 0;
+    1: Result := 1;
+    2: Result := 2;
+    3, 4, 5: Result := 3;
+  else Result := 4;  // 6..9: DepthwiseConv1D / GatedDeltaNet, sweep and decode
+  end;
 end;
 
 function BuildOne(const S: TShape): TNNet;
@@ -223,22 +386,31 @@ end;
 // counts or the speedup. FC is unaffected by the memory mode (no released
 // weight caches); under low memory conv/pointwise release the concatenated-
 // weight caches and take the per-neuron ranged path, so their timing can differ.
-procedure ExperimentA(LowMem: boolean);
+// Returns the ALL-shapes aggregate for this pass, so the caller can compare the
+// two memory modes against each other.
+function ExperimentA(LowMem: boolean): TAggr;
 var
-  si, i: integer;
+  si, i, fam: integer;
   S: TShape;
   NN: TNNet;
   L: TNNetLayer;
   MyIn, OutSerial: TNNetVolume;
-  Ts, Tt, sp, maxdiff, d: double;
-  elig, memtag: string;
+  Ts, Tt, sp, maxdiff, d, ops, worstdiff: double;
+  elig, memtag, worstname: string;
   workers, chunks, neurons: integer;
+  AggElig, AggNo: TAggr;
+  AggFam: array[0..FAM_COUNT - 1] of TAggr;
 begin
   BuildShapesA;
+  AggrReset(Result); AggrReset(AggElig); AggrReset(AggNo);
+  for i := 0 to FAM_COUNT - 1 do AggrReset(AggFam[i]);
+  worstdiff := -1; worstname := '(none)';
   if LowMem then memtag := 'low-memory ON' else memtag := 'low-memory OFF';
   WriteLn('=== Experiment A: per-layer threading OFF vs ON  [', memtag, '] ===');
   WriteLn('Cores (NeuralDefaultThreadCount) = ', NeuralDefaultThreadCount(),
-    '   FC/PW/Conv/Dw/GDN: every size is chunk-eligible; ',
+    '   shapeset ', SHAPESET_A, ' (', Length(ShA), ' shapes)');
+  WriteLn('build: ', BuildTag);
+  WriteLn('FC/PW/Conv/Dw/GDN: every size is chunk-eligible; ',
     'SwiGLU/RMSN/RoPE show their current verdict');
   WriteLn(Format('%-20s %8s %6s %9s %9s %8s %7s %9s',
     ['shape', 'neurons', 'elig?', 'off ms', 'on ms', 'speedup',
@@ -307,10 +479,41 @@ begin
     // Parallel/serial pass counts for this shape's timed run (passes: P/S).
     WriteLn('      ', NN.SchedulerStatsReport());
 
+    // Accumulate. The eligible/not-eligible split matters for the speedup
+    // reading: non-eligible shapes are ~1.00x by construction, so they only
+    // dilute a global parallel-gain figure - but they are real work, so they
+    // stay in the absolute (ALL) score.
+    ops := WorkOps(S);
+    AggrAdd(Result, Ts, Tt, ops);
+    if L.ChunkEligible() then AggrAdd(AggElig, Ts, Tt, ops)
+    else AggrAdd(AggNo, Ts, Tt, ops);
+    fam := FamilyOf(S.Kind);
+    AggrAdd(AggFam[fam], Ts, Tt, ops);
+    if maxdiff > worstdiff then
+    begin
+      worstdiff := maxdiff;
+      worstname := S.Name;
+    end;
+
     OutSerial.Free;
     MyIn.Free;
     NN.Free;
   end;
+
+  WriteLn;
+  WriteLn('--- Experiment A summary  [', memtag, ']  shapeset ', SHAPESET_A,
+    '  ', StringOfChar('-', 20));
+  WriteAggrHeader;
+  WriteAggrRow('ALL (geomean)', Result);
+  WriteAggrRow('chunk-eligible', AggElig);
+  WriteAggrRow('not eligible', AggNo);
+  WriteLn;
+  WriteLn('  by family');
+  for i := 0 to FAM_COUNT - 1 do
+    WriteAggrRow('  ' + FAM_NAMES[i], AggFam[i]);
+  WriteLn;
+  WriteLn(Format('  parity: worst maxdiff %.2g  (%s)',
+    [worstdiff, worstname]));
   WriteLn;
 end;
 
@@ -326,14 +529,34 @@ end;
 // pHotThreadNum (arg 2) = how many low-index workers stay hot (never napping
 // while idle within a pass); pHotThreadTimeoutSeconds (arg 3) = the cool-down
 // window before a non-primary hot worker is allowed to nap.
+// Policy grid: hot-core counts HOT_MIN..HOT_MAX crossed with cool-down
+// timeouts 0..TMO_MAX, flattened to (hot - HOT_MIN) * (TMO_MAX + 1) + tmo.
+const
+  HOT_MIN = 1;
+  HOT_MAX = 4;
+  TMO_MAX = 2;
+  POL_COUNT = (HOT_MAX - HOT_MIN + 1) * (TMO_MAX + 1);
+
+type
+  TSmallResult = record
+    Name: string;
+    Off, BestOn, WorstOn: double;
+    BestHot, BestTmo: integer;
+  end;
+
 procedure ExperimentB;
 var
-  si, hot, tmo: integer;
+  si, hot, tmo, pol, i, j, t: integer;
   S: TShape;
   NN: TNNet;
   MyIn: TNNetVolume;
-  off, on_, sp: double;
+  off, on_, sp, sens, sumOff, sumBest, sumSens: double;
   Small: array of TShape;
+  Res: array of TSmallResult;
+  polLog: array[0..POL_COUNT - 1] of double;   // sum of ln(on ms) over shapes
+  polN: array[0..POL_COUNT - 1] of integer;
+  polGeo: array[0..POL_COUNT - 1] of double;
+  ord_: array[0..POL_COUNT - 1] of integer;
 
   procedure AddSmall(const N: string; K, A, B, C, D: integer);
   var idx: integer;
@@ -345,7 +568,9 @@ var
   end;
 begin
   WriteLn('=== Experiment B: small shapes x StartThreadWorkers() policy ===');
-  WriteLn('Cores (NeuralDefaultThreadCount) = ', NeuralDefaultThreadCount());
+  WriteLn('Cores (NeuralDefaultThreadCount) = ', NeuralDefaultThreadCount(),
+    '   shapeset ', SHAPESET_B);
+  WriteLn('build: ', BuildTag);
   WriteLn('hot = hot-core count (StartThreadWorkers arg 2), ',
     'tmo = cool-down seconds (arg 3)');
 
@@ -354,6 +579,12 @@ begin
   AddSmall('FC 128x128',     0, 128, 128, 0,  0);
   AddSmall('Pw 8x8x64->64',  2, 8,  64,  64, 0);
   AddSmall('Conv 8x8x32 k3', 1, 8,  32,  32, 3);
+  SetLength(Res, Length(Small));
+  for i := 0 to POL_COUNT - 1 do
+  begin
+    polLog[i] := 0;
+    polN[i] := 0;
+  end;
 
   for si := 0 to High(Small) do
   begin
@@ -373,8 +604,15 @@ begin
     off := BestTimeMs(NN, MyIn, {parallel=}false);
     NN.Free;
 
-    for hot := 1 to 4 do
-      for tmo := 0 to 2 do
+    Res[si].Name := S.Name;
+    Res[si].Off := off;
+    Res[si].BestOn := 1e30;
+    Res[si].WorstOn := 0;
+    Res[si].BestHot := 0;
+    Res[si].BestTmo := 0;
+
+    for hot := HOT_MIN to HOT_MAX do
+      for tmo := 0 to TMO_MAX do
       begin
         NN := BuildOne(S);
         NN.SetTrainable(False, {pLowMemory=}False);
@@ -387,9 +625,83 @@ begin
         WriteLn(Format('    %4d %4d %10.3f %10.3f %7.2fx',
           [hot, tmo, off, on_, sp]));
         NN.Free;
+
+        pol := (hot - HOT_MIN) * (TMO_MAX + 1) + tmo;
+        polLog[pol] := polLog[pol] + Ln(Max(on_, 1e-6));
+        Inc(polN[pol]);
+        if on_ < Res[si].BestOn then
+        begin
+          Res[si].BestOn := on_;
+          Res[si].BestHot := hot;
+          Res[si].BestTmo := tmo;
+        end;
+        if on_ > Res[si].WorstOn then Res[si].WorstOn := on_;
       end;
     MyIn.Free;
+
+    // Per-shape verdict: the policy that won, and how much the policy choice
+    // moved this shape at all (worst/best on-time).
+    sens := Res[si].WorstOn / Max(Res[si].BestOn, 1e-6);
+    WriteLn(Format('    best: hot=%d tmo=%d   on %.3f ms  %.2fx' +
+      '     sensitivity %.2fx (%.3f..%.3f)',
+      [Res[si].BestHot, Res[si].BestTmo, Res[si].BestOn,
+       Res[si].Off / Max(Res[si].BestOn, 1e-6), sens,
+       Res[si].BestOn, Res[si].WorstOn]));
   end;
+
+  // ------------------------------- summary ------------------------------
+  // Averaging all POL_COUNT cells would fold deliberately-bad policies into the
+  // box's number, which is meaningless for a hardware comparison. The per-shape
+  // BEST policy is the box's real small-shape latency; the spread across
+  // policies is reported separately as sensitivity.
+  WriteLn;
+  WriteLn('--- Experiment B summary  shapeset ', SHAPESET_B, ' (',
+    Length(Small), ' small shapes) ', StringOfChar('-', 20));
+  WriteLn(Format('  %-18s %9s %12s %8s   %-13s %11s',
+    ['shape', 'off ms', 'best on ms', 'speedup', 'best policy',
+     'sensitivity']));
+  sumOff := 0; sumBest := 0; sumSens := 0;
+  for si := 0 to High(Res) do
+  begin
+    sens := Res[si].WorstOn / Max(Res[si].BestOn, 1e-6);
+    if Res[si].BestOn > 0 then sp := Res[si].Off / Res[si].BestOn else sp := 0;
+    WriteLn(Format('  %-18s %9.3f %12.3f %7.2fx   hot=%d tmo=%d %10.2fx',
+      [Res[si].Name, Res[si].Off, Res[si].BestOn, sp,
+       Res[si].BestHot, Res[si].BestTmo, sens]));
+    sumOff := sumOff + Ln(Max(Res[si].Off, 1e-6));
+    sumBest := sumBest + Ln(Max(Res[si].BestOn, 1e-6));
+    sumSens := sumSens + Ln(Max(sens, 1e-6));
+  end;
+  WriteLn('  ', StringOfChar('-', 78));
+  WriteLn(Format('  %-18s %9.3f %12.3f %7.2fx   %-13s %10.2fx',
+    ['geomean', GeoMean(sumOff, Length(Res)), GeoMean(sumBest, Length(Res)),
+     GeoMean(sumOff, Length(Res)) / Max(GeoMean(sumBest, Length(Res)), 1e-6),
+     '', GeoMean(sumSens, Length(Res))]));
+
+  // Which pool policy this class of machine actually wants - the answer the
+  // per-shape tables above make you eyeball across POL_COUNT x shapes numbers.
+  for i := 0 to POL_COUNT - 1 do
+  begin
+    polGeo[i] := GeoMean(polLog[i], polN[i]);
+    ord_[i] := i;
+  end;
+  for i := 0 to POL_COUNT - 2 do
+    for j := 0 to POL_COUNT - 2 - i do
+      if polGeo[ord_[j]] > polGeo[ord_[j + 1]] then
+      begin
+        t := ord_[j]; ord_[j] := ord_[j + 1]; ord_[j + 1] := t;
+      end;
+  WriteLn;
+  WriteLn('  policy ranking (geomean on ms across all shapes, best first)');
+  for i := 0 to POL_COUNT - 1 do
+  begin
+    pol := ord_[i];
+    Write(Format('    hot=%d tmo=%d %7.3f',
+      [HOT_MIN + pol div (TMO_MAX + 1), pol mod (TMO_MAX + 1), polGeo[pol]]));
+    if (i mod 3 = 2) or (i = POL_COUNT - 1) then WriteLn;
+  end;
+  WriteLn(Format('  small-shape latency floor (this box): %.3f ms geomean ' +
+    'at best policy', [GeoMean(sumBest, Length(Res))]));
   WriteLn;
 end;
 
@@ -495,14 +807,30 @@ begin
   MyIn.Free;
 end;
 
+var
+  AggMemOff, AggMemOn: TAggr;
 begin
   Randomize;
   // Experiment A is run twice: once with the low-memory inference contract off
   // (concatenated-weight caches kept) and once with it on (caches released,
   // per-neuron ranged path). Conv/pointwise chunk in both modes, so the two
   // passes expose whether the memory mode shifts eligibility or timing.
-  ExperimentA({LowMem=}False);
-  ExperimentA({LowMem=}True);
+  AggMemOff := ExperimentA({LowMem=}False);
+  AggMemOn := ExperimentA({LowMem=}True);
+  // What the low-memory contract costs on this box, as one ratio per column.
+  WriteLn('--- Experiment A: memory-mode comparison  shapeset ', SHAPESET_A,
+    '  ', StringOfChar('-', 20));
+  WriteLn(Format('  %-22s %10s %10s %8s', ['', 'off ms', 'on ms', 'speedup']));
+  WriteLn(Format('  %-22s %10.3f %10.3f %7.2fx',
+    ['low-memory OFF', AggrOff(AggMemOff), AggrOn(AggMemOff),
+     AggrOff(AggMemOff) / Max(AggrOn(AggMemOff), 1e-6)]));
+  WriteLn(Format('  %-22s %10.3f %10.3f %7.2fx',
+    ['low-memory ON', AggrOff(AggMemOn), AggrOn(AggMemOn),
+     AggrOff(AggMemOn) / Max(AggrOn(AggMemOn), 1e-6)]));
+  WriteLn(Format('  %-22s %9.2fx %9.2fx',
+    ['ON / OFF cost',
+     AggrOff(AggMemOn) / Max(AggrOff(AggMemOff), 1e-6),
+     AggrOn(AggMemOn) / Max(AggrOn(AggMemOff), 1e-6)]));
   // Experiments B (pool-policy sweep) and C (end-to-end nets) are no longer
   // relevant; kept in the source for reference but not run.
   // ExperimentB;
@@ -521,4 +849,12 @@ begin
   WriteLn('<= 1.00x on a SINGLE-layer shape overstates the in-net cost: the');
   WriteLn('scheduler pass overhead charged here to one layer is paid once per');
   WriteLn('forward in a real net - validate borderline shapes on a real model.');
+  WriteLn;
+  WriteLn('Summary rows are GEOMETRIC means, so every shape counts equally and');
+  WriteLn('the summary speedup equals the geomean of the per-shape speedups.');
+  WriteLn('Timings are BEST-of-5 after warm-up: good for comparing boxes, but a');
+  WriteLn('best case, so a noisy machine looks better here than in real use.');
+  WriteLn('ms figures compare across boxes only for the SAME shapeset version;');
+  WriteLn('GOP/s is an approximate work proxy (element-wise layer op weights are');
+  WriteLn('estimates) - read it within a family, not as a certified FLOP rate.');
 end.

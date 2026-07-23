@@ -373,6 +373,7 @@ procedure TFIDFeatureAccumulator.Add(const AFeature: array of Double);
 var
   i, j, DimM1: integer;
   xi: Double;
+  row: TIMDoubleArray;   // bound FOuter[i] row (#7)
 begin
   if Length(AFeature) <> FDim then
     raise Exception.CreateFmt(
@@ -384,8 +385,9 @@ begin
   begin
     xi := AFeature[i];
     FSum[i] := FSum[i] + xi;
+    row := FOuter[i];   // #7: resolve the outer-product row once, not per j
     for j := 0 to DimM1 do
-      FOuter[i][j] := FOuter[i][j] + xi * AFeature[j];
+      row[j] := row[j] + xi * AFeature[j];
   end;
 end;
 
@@ -461,6 +463,7 @@ var
   M: TIMDoubleMatrix;
   offdiag, theta, t, c, s, tau, g, h, aij: Double;
   Mik, Mjk, Vik, Vjk: Double;
+  Mi, Mj, Mk, Vk: TIMDoubleArray;   // bound matrix rows (#7)
 begin
   n := Length(A);
   nM1 := n - 1;
@@ -522,24 +525,28 @@ begin
         M[j][i] := 0;
 
         // Update remaining entries in rows/cols i and j.
+        Mi := M[i];   // #7: rows i and j are invariant across the k loop
+        Mj := M[j];
         for k := 0 to nM1 do
           if (k <> i) and (k <> j) then
           begin
-            Mik := M[i][k];
-            Mjk := M[j][k];
-            M[i][k] := Mik - s * (Mjk + tau * Mik);
-            M[k][i] := M[i][k];
-            M[j][k] := Mjk + s * (Mik - tau * Mjk);
-            M[k][j] := M[j][k];
+            Mik := Mi[k];
+            Mjk := Mj[k];
+            Mi[k] := Mik - s * (Mjk + tau * Mik);
+            Mj[k] := Mjk + s * (Mik - tau * Mjk);
+            Mk := M[k];   // #7: bind the M[k] row for the two symmetric writes
+            Mk[i] := Mi[k];
+            Mk[j] := Mj[k];
           end;
 
         // Accumulate eigenvectors.
         for k := 0 to nM1 do
         begin
-          Vik := EigVecs[k][i];
-          Vjk := EigVecs[k][j];
-          EigVecs[k][i] := Vik - s * (Vjk + tau * Vik);
-          EigVecs[k][j] := Vjk + s * (Vik - tau * Vjk);
+          Vk := EigVecs[k];   // #7: bind the row once for four accesses
+          Vik := Vk[i];
+          Vjk := Vk[j];
+          Vk[i] := Vik - s * (Vjk + tau * Vik);
+          Vk[j] := Vjk + s * (Vik - tau * Vjk);
         end;
       end;
   end;
@@ -759,6 +766,7 @@ function ISBlock(const Probs: TIMDoubleMatrix; First, Last: integer): Double;
 var
   numClass, numClassM1, i, c, n: integer;
   pbar: TIMDoubleArray;
+  prow: TIMDoubleArray;   // bound Probs[i] row (#7)
   klSum, kl, p, q: Double;
 begin
   numClass := Length(Probs[First]);
@@ -767,8 +775,11 @@ begin
   SetLength(pbar, numClass);
   for c := 0 to numClassM1 do pbar[c] := 0;
   for i := First to Last do
+  begin
+    prow := Probs[i];   // #7: resolve the sample row once
     for c := 0 to numClassM1 do
-      pbar[c] := pbar[c] + Probs[i][c];
+      pbar[c] := pbar[c] + prow[c];
+  end;
   for c := 0 to numClassM1 do
     pbar[c] := pbar[c] / n;
 
@@ -776,9 +787,10 @@ begin
   for i := First to Last do
   begin
     kl := 0;
+    prow := Probs[i];   // #7: resolve the sample row once
     for c := 0 to numClassM1 do
     begin
-      p := Probs[i][c];
+      p := prow[c];
       if p > cEPS then
       begin
         q := pbar[c];
@@ -872,18 +884,43 @@ begin
     W[idx] := W[idx] / sum;
 end;
 
+var
+  // Lazily-built cache of the normalised Gaussian window (#5/#8/§17). The window
+  // depends only on the constants cSSIMWin/cSSIMSigma, so it is built once and
+  // shared read-only by every SSIM caller (SSIMPlaneMean / SSIMPlaneLCS /
+  // SSIMPlaneLossGrad) instead of re-running SetLength + 121 Exp + normalize on
+  // each call. SSIMPlaneLossGrad in particular is a training-path hook
+  // (NeuralSSIMLossGradientHook), called once per optimisation step.
+  GaussWin: TIMDoubleArray;
+
+// Returns the shared normalised Gaussian window, building it once on first use.
+// Callers must treat the returned array as read-only (it is the shared cache).
+function SharedGaussianWindow: TIMDoubleArray;
+begin
+  if Length(GaussWin) = 0 then
+    BuildGaussianWindow(GaussWin);
+  Result := GaussWin;
+end;
+
 // Extract one channel of a channel-last flat image into a dense H*W plane.
 procedure ExtractChannel(const Img: TIMDoubleArray; H, W, Channels, C: integer;
   out Plane: TIMDoubleArray);
 var
-  y, x, HM1, WM1: integer;
+  y, x, HM1, WM1, dst, src: integer;
 begin
   SetLength(Plane, H * W);
   HM1 := H - 1;
   WM1 := W - 1;
   for y := 0 to HM1 do
+  begin
+    dst := y * W;              // #11: row base, once per row
+    src := dst * Channels + C; // channel-last source offset for x = 0
     for x := 0 to WM1 do
-      Plane[y * W + x] := Img[(y * W + x) * Channels + C];
+    begin
+      Plane[dst + x] := Img[src];
+      Inc(src, Channels);      // #6: strength-reduce the per-pixel multiply
+    end;
+  end;
 end;
 
 function ComputePSNR(const ImgA, ImgB: TIMDoubleArray;
@@ -914,15 +951,15 @@ function SSIMPlaneMean(const PA, PB: TIMDoubleArray; H, W: integer;
   C1, C2: Double): Double;
 var
   Win: TIMDoubleArray;
-  half, oy, ox, wy, wx, wi, pix: integer;
+  half, oy, ox, wy, wx, wi, pix, rowB: integer;
   outH, outW, cnt, outHM1, outWM1, WinM1: integer;
-  mx, my, sxx, syy, sxy, gw, a, b: Double;
+  mx, my, sxx, syy, sxy, gw, a, b, wa, wb: Double;
   a1, a2, b1, b2, ssimSum: Double;
 begin
   if (H < cSSIMWin) or (W < cSSIMWin) then
     raise Exception.CreateFmt(
       'SSIM: image %dx%d smaller than %dx%d window', [H, W, cSSIMWin, cSSIMWin]);
-  BuildGaussianWindow(Win);
+  Win := SharedGaussianWindow;   // #5: shared cached window, no per-call rebuild
   half := cSSIMWin div 2;
   outH := H - cSSIMWin + 1;
   outW := W - cSSIMWin + 1;
@@ -937,19 +974,24 @@ begin
       mx := 0; my := 0; sxx := 0; syy := 0; sxy := 0;
       wi := 0;
       for wy := 0 to WinM1 do
+      begin
+        rowB := (oy + wy) * W + ox;   // #11: row base, once per wy
         for wx := 0 to WinM1 do
         begin
-          pix := (oy + wy) * W + (ox + wx);
+          pix := rowB + wx;
           gw := Win[wi];
           a := PA[pix];
           b := PB[pix];
-          mx := mx + gw * a;
-          my := my + gw * b;
-          sxx := sxx + gw * a * a;
-          syy := syy + gw * b * b;
-          sxy := sxy + gw * a * b;
+          wa := gw * a;                 // #4: gw*a computed once
+          wb := gw * b;                 // #4: gw*b computed once
+          mx := mx + wa;
+          my := my + wb;
+          sxx := sxx + wa * a;          // (gw*a)*a = gw*a*a, left-assoc
+          syy := syy + wb * b;
+          sxy := sxy + wa * b;
           Inc(wi);
         end;
+      end;
       sxx := sxx - mx * mx;
       syy := syy - my * my;
       sxy := sxy - mx * my;
@@ -989,7 +1031,7 @@ end;
 procedure AvgPool2x2(const Plane: TIMDoubleArray; H, W: integer;
   out OutPlane: TIMDoubleArray; out OH, OW: integer);
 var
-  y, x, OHM1, OWM1: integer;
+  y, x, OHM1, OWM1, r0, r1, dst, c: integer;
 begin
   OH := H div 2;
   OW := W div 2;
@@ -997,12 +1039,21 @@ begin
   OWM1 := OW - 1;
   SetLength(OutPlane, OH * OW);
   for y := 0 to OHM1 do
+  begin
+    r0 := (2 * y) * W;   // #11: row bases, once per y
+    r1 := r0 + W;
+    dst := y * OW;
     for x := 0 to OWM1 do
-      OutPlane[y * OW + x] := 0.25 *
-        (Plane[(2 * y) * W + (2 * x)] +
-         Plane[(2 * y) * W + (2 * x + 1)] +
-         Plane[(2 * y + 1) * W + (2 * x)] +
-         Plane[(2 * y + 1) * W + (2 * x + 1)]);
+    begin
+      c := 2 * x;        // #4: 2*x once
+      OutPlane[dst] := 0.25 *
+        (Plane[r0 + c] +
+         Plane[r0 + c + 1] +
+         Plane[r1 + c] +
+         Plane[r1 + c + 1]);
+      Inc(dst);          // #6
+    end;
+  end;
 end;
 
 // Per-scale luminance (l) and contrast-structure (cs) means over the valid
@@ -1011,15 +1062,15 @@ procedure SSIMPlaneLCS(const PA, PB: TIMDoubleArray; H, W: integer;
   C1, C2: Double; out LMean, CSMean: Double);
 var
   Win: TIMDoubleArray;
-  oy, ox, wy, wx, wi, pix: integer;
+  oy, ox, wy, wx, wi, pix, rowB: integer;
   outH, outW, cnt, outHM1, outWM1, WinM1: integer;
-  mx, my, sxx, syy, sxy, gw, a, b: Double;
+  mx, my, sxx, syy, sxy, gw, a, b, wa, wb: Double;
   lSum, csSum: Double;
 begin
   if (H < cSSIMWin) or (W < cSSIMWin) then
     raise Exception.CreateFmt(
       'MS-SSIM: scale %dx%d smaller than %dx%d window', [H, W, cSSIMWin, cSSIMWin]);
-  BuildGaussianWindow(Win);
+  Win := SharedGaussianWindow;   // #5: shared cached window, no per-call rebuild
   outH := H - cSSIMWin + 1;
   outW := W - cSSIMWin + 1;
   outHM1 := outH - 1;
@@ -1032,19 +1083,24 @@ begin
       mx := 0; my := 0; sxx := 0; syy := 0; sxy := 0;
       wi := 0;
       for wy := 0 to WinM1 do
+      begin
+        rowB := (oy + wy) * W + ox;   // #11: row base, once per wy
         for wx := 0 to WinM1 do
         begin
-          pix := (oy + wy) * W + (ox + wx);
+          pix := rowB + wx;
           gw := Win[wi];
           a := PA[pix];
           b := PB[pix];
-          mx := mx + gw * a;
-          my := my + gw * b;
-          sxx := sxx + gw * a * a;
-          syy := syy + gw * b * b;
-          sxy := sxy + gw * a * b;
+          wa := gw * a;                 // #4: gw*a computed once
+          wb := gw * b;                 // #4: gw*b computed once
+          mx := mx + wa;
+          my := my + wb;
+          sxx := sxx + wa * a;          // (gw*a)*a = gw*a*a, left-assoc
+          syy := syy + wb * b;
+          sxy := sxy + wa * b;
           Inc(wi);
         end;
+      end;
       sxx := sxx - mx * mx;
       syy := syy - my * my;
       sxy := sxy - mx * my;
@@ -1124,13 +1180,13 @@ function SSIMPlaneLossGrad(const PA, PB: TIMDoubleArray; H, W: integer;
   C1, C2: Double; var GA: TIMDoubleArray; OffStride, Off: integer): Double;
 var
   Win: TIMDoubleArray;
-  oy, ox, wy, wx, wi, pix, gpix: integer;
+  oy, ox, wy, wx, wi, pix, gpix, rowB: integer;
   outH, outW, cnt, outHM1, outWM1, WinM1: integer;
-  mx, my, sxx, syy, sxy, gw, a, b: Double;
+  mx, my, sxx, syy, sxy, gw, a, b, wa, wb: Double;
   a1, a2, b1, b2, bb, sp, ssimSum: Double;
   dSdmx, dSdsxx, dSdsxy, gi: Double;
 begin
-  BuildGaussianWindow(Win);
+  Win := SharedGaussianWindow;   // #5: shared cached window, no per-call rebuild
   outH := H - cSSIMWin + 1;
   outW := W - cSSIMWin + 1;
   outHM1 := outH - 1;
@@ -1144,16 +1200,20 @@ begin
       mx := 0; my := 0; sxx := 0; syy := 0; sxy := 0;
       wi := 0;
       for wy := 0 to WinM1 do
+      begin
+        rowB := (oy + wy) * W + ox;   // #11: row base, once per wy
         for wx := 0 to WinM1 do
         begin
-          pix := (oy + wy) * W + (ox + wx);
+          pix := rowB + wx;
           gw := Win[wi];
           a := PA[pix]; b := PB[pix];
-          mx := mx + gw * a; my := my + gw * b;
-          sxx := sxx + gw * a * a; syy := syy + gw * b * b;
-          sxy := sxy + gw * a * b;
+          wa := gw * a; wb := gw * b;               // #4: computed once
+          mx := mx + wa; my := my + wb;
+          sxx := sxx + wa * a; syy := syy + wb * b; // (gw*a)*a, left-assoc
+          sxy := sxy + wa * b;
           Inc(wi);
         end;
+      end;
       sxx := sxx - mx * mx; syy := syy - my * my; sxy := sxy - mx * my;
       a1 := 2.0 * mx * my + C1;
       a2 := 2.0 * sxy + C2;
@@ -1171,19 +1231,23 @@ begin
       // scatter to pixels of PA
       wi := 0;
       for wy := 0 to WinM1 do
+      begin
+        rowB := (oy + wy) * W + ox;      // #11: row base, once per wy
+        gpix := rowB * OffStride + Off;  // #6: seed gpix for wx = 0, then Inc
         for wx := 0 to WinM1 do
         begin
-          pix := (oy + wy) * W + (ox + wx);
+          pix := rowB + wx;
           gw := Win[wi];
           a := PA[pix]; b := PB[pix];
           // dmx/dx_i = w; dsxx/dx_i = 2 w (a - mx); dsxy/dx_i = w (b - my)
           gi := dSdmx * gw
               + dSdsxx * (2.0 * gw * (a - mx))
               + dSdsxy * (gw * (b - my));
-          gpix := pix * OffStride + Off;
           GA[gpix] := GA[gpix] - gi / cnt;  // d(1-SSIM) = -dSSIM
           Inc(wi);
+          Inc(gpix, OffStride);           // #6: advance by the channel stride
         end;
+      end;
     end;
   Result := ssimSum / cnt;
 end;

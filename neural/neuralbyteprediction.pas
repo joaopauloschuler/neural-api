@@ -537,13 +537,15 @@ begin
   for I := 0 to MaxIdx do
   begin
     NGP := @FNN[I];
-    Probability := NGP^.GetF();
     PredictionPosition := 0;
+    // Gate on the cheap Filled/count tests first; only then compute GetF (a
+    // divide) and its probability test (#5: skip the divide when gated out).
     if (NGP^.Filled) and
-      (Probability > 0.1) and
       (NGP^.CorrectNeuronPredictionCnt > 10) then
     begin
-      if ( ABF.TestTests(NGP^.TestNeuronLayer) > 0) then
+      Probability := NGP^.GetF();
+      if (Probability > 0.1) and
+        ( ABF.TestTests(NGP^.TestNeuronLayer) > 0) then
       begin
         ABF.OperateAndTestOperation(
           NGP^.OperationNeuronLayer, PredictionPosition, NextState);
@@ -1064,6 +1066,7 @@ var
   I, neuronPos: longint;
   Actual, Best: extended;
   R: boolean;
+  NGP: ^TNeuronGroup;   // bind once per iteration (rule #7)
 begin
   R := False;
   Result := R;
@@ -1072,8 +1075,12 @@ begin
   for I := 1 to Num do
   begin
     neuronPos := random(FMaxOperationNeuronCount);
-    if ByteToBool[EvalNeuronGroup(FNN[neuronPos], ABF)] and
-      FNN[neuronPos].Filled() and (GetD(neuronPos) > 0.8) then
+    NGP := @FNN[neuronPos];
+    // Filled() is a pure cheap gate; test it first so a false short-circuits the
+    // EvalNeuronGroup call (both TestTests/OperateAndTestOperation are free of
+    // persistent side effects, so the AND result is unchanged).
+    if NGP^.Filled() and ByteToBool[EvalNeuronGroup(NGP^, ABF)] and
+      (GetD(neuronPos) > 0.8) then
       Actual := 1
     else
       Actual := 0;
@@ -1090,12 +1097,15 @@ begin
 end;
 
 procedure TStatePredictionClass.CopyNeurons(SourceRelationPos, DestRelationPos: longint);
+var
+  Dst, Src: ^TNeuronGroup;   // bind FNN[...] records once (rule #4)
 begin
   RemoveNeuronsAtPos(DestRelationPos);
-  FNN[DestRelationPos].TestNeuronLayer := FNN[SourceRelationPos].TestNeuronLayer;
-  FNN[DestRelationPos].OperationNeuronLayer :=
-    FNN[SourceRelationPos].OperationNeuronLayer;
-  FNN[DestRelationPos].PredictionPos := FNN[SourceRelationPos].PredictionPos;
+  Dst := @FNN[DestRelationPos];
+  Src := @FNN[SourceRelationPos];
+  Dst^.TestNeuronLayer := Src^.TestNeuronLayer;
+  Dst^.OperationNeuronLayer := Src^.OperationNeuronLayer;
+  Dst^.PredictionPos := Src^.PredictionPos;
 end;
 
 procedure TStatePredictionClass.CreateNewNeuronsOnError(
@@ -1107,6 +1117,7 @@ procedure TStatePredictionClass.CreateNewNeuronsOnError(
     IV, NumV: word;
     NumVM1: longint;
     OP: neuralabfun.TOperation;
+    NGP: ^TNeuronGroup;   // bind FNN[neuronPos] once (rule #4/#9)
   begin
     NewOp.Create(False{no tests}, FZerosIncluded, pred{prediction errors});
 
@@ -1115,11 +1126,12 @@ procedure TStatePredictionClass.CreateNewNeuronsOnError(
     else
     begin
       RemoveNeuronsAtPos(neuronPos);
-      FNN[neuronPos].OperationNeuronLayer := NewOp.GetRandomOp;
+      NGP := @FNN[neuronPos];
+      NGP^.OperationNeuronLayer := NewOp.GetRandomOp;
 
       NumV := FCS.MinTests+random(FCS.MaxTests-FCS.MinTests)+1;
 
-      FNN[neuronPos].TestNeuronLayer.N := NumV;
+      NGP^.TestNeuronLayer.N := NumV;
       NewOp.Create(True{with tests}, FZerosIncluded, pred{prediction errorss});
       NumVM1 := NumV - 1;
       for IV := 0 to NumVM1 do
@@ -1127,15 +1139,15 @@ procedure TStatePredictionClass.CreateNewNeuronsOnError(
         OP := NewOp.GetRandomOp;
         if (OP.OpCode = 0) then
         begin
-          FNN[neuronPos].TestNeuronLayer.N := IV;
+          NGP^.TestNeuronLayer.N := IV;
           break;
         end;
-        FNN[neuronPos].TestNeuronLayer.T[IV] := OP;
+        NGP^.TestNeuronLayer.T[IV] := OP;
       end;
 
       if (FCS.PartialTestEval)
-        then FNN[neuronPos].TestNeuronLayer.TestThreshold := random(FNN[neuronPos].TestNeuronLayer.N)+1
-        else FNN[neuronPos].TestNeuronLayer.TestThreshold := FNN[neuronPos].TestNeuronLayer.N;
+        then NGP^.TestNeuronLayer.TestThreshold := random(NGP^.TestNeuronLayer.N)+1
+        else NGP^.TestNeuronLayer.TestThreshold := NGP^.TestNeuronLayer.N;
     end;
   end;
 
@@ -1143,6 +1155,7 @@ var
   SourceI, WorstNeuronGrPos: longint;
   PredictedBytePos: byte;
   NewOp: TCreateValidOperations;
+  WGP: ^TNeuronGroup;   // bind FNN[WorstNeuronGrPos] once (rule #4/#9)
 begin
   WorstNeuronGrPos := 0;
   SourceI := 0;
@@ -1154,13 +1167,14 @@ begin
   NewOp.Load(FCS, PActions, PCurrentStates, PNextStates);
   NewOp.LoadCreationData(PredictedBytePos);
 
+  WGP := @FNN[WorstNeuronGrPos];   // bind once; FNN is never reallocated here
   // select a predicted byte that was wrongly predicted.
-  FNN[WorstNeuronGrPos].PredictionPos := PredictedBytePos;
+  WGP^.PredictionPos := PredictedBytePos;
 
   if FCS.Bidimensional
-    then FNN[WorstNeuronGrPos].TestNeuronLayer.TestBasePosition :=
+    then WGP^.TestNeuronLayer.TestBasePosition :=
       NewOp.GetFeatureCenter2D()
-    else FNN[WorstNeuronGrPos].TestNeuronLayer.TestBasePosition :=
+    else WGP^.TestNeuronLayer.TestBasePosition :=
       PredictedBytePos;
 
   if (Random(100) < 5) and FGeneralize and         // should copy the neuron ?
@@ -1168,8 +1182,8 @@ begin
     (SourceI <> WorstNeuronGrPos) then
   begin
     CopyNeurons(SourceI, WorstNeuronGrPos);
-    FNN[WorstNeuronGrPos].TestNeuronLayer.DeleteOperation(Random(
-      FNN[WorstNeuronGrPos].TestNeuronLayer.N));
+    WGP^.TestNeuronLayer.DeleteOperation(Random(
+      WGP^.TestNeuronLayer.N));
   end
   else
   begin
@@ -1275,10 +1289,12 @@ procedure TStatePredictionClass.Prediction(
 var
   I, J, MaxIndex: word;
   ABF: TRunOperation;
-  Probability, TotalCount: single;
+  Probability, TotalCount, relP: single;
   NextState: byte;
   PredictionPos: integer;
   Hi: longint;
+  MinSample: integer;   // FCS.MinSampleForPrediction hoisted (#5)
+  UseBelief: boolean;   // FUseBelief hoisted (#5)
   NGP: ^TNeuronGroup;   // pointer to the current group record (rule #4/#7-spirit)
 begin
   ABCopy(PNextStates, PCurrentStates); // LOOK
@@ -1296,6 +1312,9 @@ begin
   else
     MaxIndex := FMaxOperationNeuronCount - 1;
 
+  MinSample := FCS.MinSampleForPrediction;   // #5: loop-invariant, hoist once
+  UseBelief := FUseBelief;                    // #5: loop-invariant, hoist once
+
   for J := 0 to MaxIndex do
   begin
 
@@ -1306,30 +1325,30 @@ begin
 
     NGP := @FNN[I];   // bind once; avoids re-indexing the dynarray record below
     PredictionPos := NGP^.PredictionPos;
-    TotalCount := NGP^.WrongNeuronPredictionCnt +
-      NGP^.CorrectNeuronPredictionCnt + 1;
 
-    if (TotalCount = 0) or not(NGP^.Filled()) then
+    // Gate on the cheap Filled/count tests first (matching PredictClass); only
+    // then compute Probability (a divide) and the relation-probability test
+    // (#5/#8/#4: skip the divide and the pRelationProbability index when gated
+    // out; bind relP once - PredictionPos and pRelationProbability[PredictionPos]
+    // are unchanged by OperateAndTestOperation).
+    if (NGP^.Filled()) and
+      (NGP^.CorrectNeuronPredictionCnt > MinSample) then
     begin
-      Probability := 0;
-    end
-    else if FUseBelief then
-    begin
-      Probability :=
-        (NGP^.CorrectNeuronPredictionCnt + 1) / (TotalCount + 2);
-    end
-    else
-      Probability := NGP^.CorrectNeuronPredictionCnt / TotalCount;  // best method
+      TotalCount := NGP^.WrongNeuronPredictionCnt +
+        NGP^.CorrectNeuronPredictionCnt + 1;
+      if UseBelief then
+        Probability :=
+          (NGP^.CorrectNeuronPredictionCnt + 1) / (TotalCount + 2)
+      else
+        Probability := NGP^.CorrectNeuronPredictionCnt / TotalCount;  // best method
 
-    if (Probability > pRelationProbability[PredictionPos]) and
-      (NGP^.CorrectNeuronPredictionCnt > FCS.MinSampleForPrediction)
-      then
-    begin
-      if (ABF.TestTests(NGP^.TestNeuronLayer) > 0) then
+      relP := pRelationProbability[PredictionPos];
+      if (Probability > relP) and
+        (ABF.TestTests(NGP^.TestNeuronLayer) > 0) then
       begin
         ABF.OperateAndTestOperation(NGP^.OperationNeuronLayer,
           PredictionPos, NextState);
-        if (Probability > pRelationProbability[PredictionPos]) then
+        if (Probability > relP) then
         begin
           PNextStates[PredictionPos] := NextState;
           pRelationProbability[PredictionPos] := Probability;
@@ -1369,10 +1388,14 @@ begin
   begin
     NGP := @FNN[I];
     PredictionPosition := NGP^.PredictionPos;
+    // TestTests before OperateAndTestOperation (matches sibling Prediction());
+    // both are free of persistent side effects (NextState is discarded here),
+    // so swapping the AND operands preserves the result while letting the
+    // cheaper test gate short-circuit the operation eval.
     if (NGP^.Filled) and
+      ( ABF.TestTests(NGP^.TestNeuronLayer) > 0) and
       ByteToBool[ABF.OperateAndTestOperation(
-      NGP^.OperationNeuronLayer, PredictionPosition, NextState)] and
-      ( ABF.TestTests(NGP^.TestNeuronLayer) > 0) then
+      NGP^.OperationNeuronLayer, PredictionPosition, NextState)] then
     begin
       TotalCount := NGP^.WrongNeuronPredictionCnt +
         NGP^.CorrectNeuronPredictionCnt;

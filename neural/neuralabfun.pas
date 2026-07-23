@@ -368,8 +368,7 @@ begin
     Dec(Self.N)
   else
   begin
-    if (operationIndex >= 0) and (operationIndex < Self.N - 1) and
-      (operationIndex < Self.N - 1) then
+    if (operationIndex >= 0) and (operationIndex < Self.N - 1) then
     begin
       NM2 := Self.N - 2;
       for I := operationIndex to NM2 do
@@ -1047,23 +1046,28 @@ var
   POS: integer;
   efeito: byte;
   PermissibleErrors: ShortInt;
+  N, BasePos: integer;   // #8: Tests is a var param; its fields would reload each
+                         // iteration. OperateAndTestOperation takes Oper/Base by
+                         // value and never mutates Tests, so both are invariant.
 begin
   // Initialised so the Tests.N = 0 case below does not read it uninitialised.
   PermissibleErrors := 0;
-  if Tests.N > 0 then
+  N := Tests.N;
+  BasePos := Tests.TestBasePosition;
+  if N > 0 then
   begin
-    PermissibleErrors := Tests.N - Tests.TestThreshold;
+    PermissibleErrors := N - Tests.TestThreshold;
     POS := 0;
-    while (PermissibleErrors >= 0) and (POS < Tests.N) do
+    while (PermissibleErrors >= 0) and (POS < N) do
     begin
-      if (0 = OperateAndTestOperation(Tests.T[POS], Tests.TestBasePosition, efeito))
+      if (0 = OperateAndTestOperation(Tests.T[POS], BasePos, efeito))
         then Dec(PermissibleErrors);
       Inc(POS);
     end;
   end;
 
-  if ( (PermissibleErrors >= 0) and (Tests.N > 0) )
-    then Result := Tests.N - PermissibleErrors
+  if ( (PermissibleErrors >= 0) and (N > 0) )
+    then Result := N - PermissibleErrors
     else Result := 0;
 end;
 
@@ -1071,22 +1075,27 @@ function TRunOperation.ConvoluteTests(var Tests: TTestsClass): integer;
 var
   X,Y: integer;
   TopX, TopY: integer;
-  Pos: integer;
+  Pos, RowStep, ColSeed: integer;
 begin
   Result := 0;
   TopX := FCS.ImageSizeX - FCS.FeatureSize - 1;
   TopY := FCS.ImageSizeY - FCS.FeatureSize - 1;
+  // Make2D(X,Y) = X + Y*ImageSizeY. Y is the inner loop, so Pos advances by
+  // ImageSizeY each Y (#6 strength reduction); seed at Y = FeatureSize.
+  RowStep := FCS.ImageSizeY;
+  ColSeed := FCS.FeatureSize * RowStep;
   for X := FCS.FeatureSize to TopX do
   begin
+    Pos := X + ColSeed;               // = Make2D(X, FeatureSize)
     for Y := FCS.FeatureSize to TopY do
     begin
-      Pos := Self.Make2D(X,Y);
       Tests.TestBasePosition := Pos;
       if (Self.LocalTestTests(Tests)>0) then
       begin
         Result := Pos;
         Break;
       end;
+      Inc(Pos, RowStep);              // next Y: Make2D(X, Y+1)
     end;
     if (Result>0) then Break;
   end;
@@ -1119,6 +1128,7 @@ var
   Operand1Value, Operand2Value: integer;
   StatePosition1, StatePosition2: integer;
   CurrentBaseValue: integer;
+  MaxAct, MaxCur: integer;
 begin
   // NextState is a var output read below (and returned as the result for test
   // opcodes); csNop, csDiv/csMod by zero and the invalid-opcode branch never
@@ -1148,6 +1158,10 @@ begin
     exit;
   end;
 
+  // Upper index bounds bound once (#4); reused by the EnsureRange clamps below.
+  MaxAct := NumberOfActions - 1;
+  MaxCur := NumberOfCurrentStates - 1;
+
   // Upstream can pass operand/base positions outside the state arrays (the
   // range is "wrong" per the historical TODOs here); clamp every index into
   // its own array's bounds so the reads stay in range. EnsureRange handles
@@ -1156,8 +1170,8 @@ begin
   begin
     if NumberOfActions > 0 then
     begin
-      Operand1Value := Actions[EnsureRange(StatePosition1, 0, NumberOfActions - 1)];
-      Operand2Value := Actions[EnsureRange(StatePosition2, 0, NumberOfActions - 1)];
+      Operand1Value := Actions[EnsureRange(StatePosition1, 0, MaxAct)];
+      Operand2Value := Actions[EnsureRange(StatePosition2, 0, MaxAct)];
     end
     else
     begin
@@ -1169,8 +1183,8 @@ begin
   begin
     if NumberOfCurrentStates > 0 then
     begin
-      Operand1Value := CurrentStates[EnsureRange(StatePosition1, 0, NumberOfCurrentStates - 1)];
-      Operand2Value := CurrentStates[EnsureRange(StatePosition2, 0, NumberOfCurrentStates - 1)];
+      Operand1Value := CurrentStates[EnsureRange(StatePosition1, 0, MaxCur)];
+      Operand2Value := CurrentStates[EnsureRange(StatePosition2, 0, MaxCur)];
     end
     else
     begin
@@ -1182,7 +1196,7 @@ begin
   // Some opcodes read the current state at BasePosition directly; clamp it the
   // same way (BasePosition itself was never range-checked).
   if NumberOfCurrentStates > 0
-    then CurrentBaseValue := CurrentStates[EnsureRange(BasePosition, 0, NumberOfCurrentStates - 1)]
+    then CurrentBaseValue := CurrentStates[EnsureRange(BasePosition, 0, MaxCur)]
     else CurrentBaseValue := 0;
 
   try
@@ -1216,7 +1230,8 @@ begin
       csAddS:     {$R-}NextState:=EnsureRange(Operand1Value+Operand2Value, 0, 255){$R+};
       csSubS:     {$R-}NextState:=EnsureRange(Operand1Value-Operand2Value, 0, 255){$R+};
       csAbsDiff:  NextState:=Abs(Integer(Operand1Value)-Integer(Operand2Value));
-      csAvg:      NextState:=(Operand1Value+Operand2Value) div 2;
+      // Operands are 0..255 bytes, so the sum is non-negative: div 2 = shr 1.
+      csAvg:      NextState:=(Operand1Value+Operand2Value) shr 1;
     else
       writeln('ERROR: invalid operation code:',Oper.OpCode);
     end;
