@@ -5630,6 +5630,8 @@ type
       // Compute scratch: per-half top-K indices (TopK) + candidate buffers (TopK*TopK).
       FSelABuf, FSelBBuf, FCandABuf, FCandBBuf: array of integer;
       FCandScoreBuf: array of TNeuralFloat;
+      // Top-K selection "already taken" marks (HalfKeys), reused per call.
+      FTopKUsed: array of boolean;
       // Backpropagate scratch (TopK): g_k and softmax-Jacobian score gradient.
       FGBuf, FdScoreBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -32953,6 +32955,7 @@ begin
   SetLength(FSelABuf, 0); SetLength(FSelBBuf, 0);
   SetLength(FCandABuf, 0); SetLength(FCandBBuf, 0);
   SetLength(FCandScoreBuf, 0);
+  SetLength(FTopKUsed, 0);
   FreeBackpropScratch();
   inherited Destroy();
 end;
@@ -33018,6 +33021,7 @@ begin
   SetLength(FSelABuf, FTopK); SetLength(FSelBBuf, FTopK);
   SetLength(FCandScoreBuf, FTopK * FTopK);
   SetLength(FCandABuf, FTopK * FTopK); SetLength(FCandBBuf, FTopK * FTopK);
+  SetLength(FTopKUsed, FHalfKeys);
   // Backprop-only scratch: skip on inference-only layers.
   if FIsTrainable then
   begin
@@ -33029,26 +33033,31 @@ end;
 // Fills SelIdx[0..Want-1] with the indices of the Want largest entries of
 // Scores[0..Count-1] (descending). Simple partial selection sort -- Want is
 // TopK (tiny) and Count is HalfKeys (sqrt of memory), so this is cheap.
+// Used[0..Count-1] is caller-owned scratch (a persistent layer field, sized at
+// SetPrevLayer): the routine runs per (head, token), so it must never allocate.
 procedure PKMTopKIndices(Scores: TNeuralFloatArrPtr; Count, Want: integer;
-  var SelIdx: array of integer);
+  var SelIdx: array of integer; var Used: array of boolean);
 var
   i, j, best, tmp, CountM1, WantM1, WantM2: integer;
   JStart: integer;
-  used: array of boolean;
+  bestVal: TNeuralFloat;
 begin
   CountM1 := Count - 1;
   WantM1 := Want - 1;
   WantM2 := Want - 2;
-  SetLength(used, Count);
-  for i := 0 to CountM1 do used[i] := False;
+  FillChar(Used[0], Count, 0);
+  bestVal := 0;
   for i := 0 to WantM1 do
   begin
     best := -1;
     for j := 0 to CountM1 do
-      if (not used[j]) and
-         ((best = -1) or (Scores^[j] > Scores^[best])) then
-        best := j;
-    used[best] := True;
+      if not Used[j] then
+        if (best = -1) or (Scores^[j] > bestVal) then
+        begin
+          best := j;
+          bestVal := Scores^[j];
+        end;
+    Used[best] := True;
     SelIdx[i] := best;
   end;
   // Ensure strictly descending order (selection already yields it, but keep
@@ -33114,8 +33123,8 @@ begin
         Inc(posK2, FHalfQ);
       end;
       // Top-TopK per half.
-      PKMTopKIndices(FS1.GetRawPtr(t, 0), FHalfKeys, FTopK, FSelABuf);
-      PKMTopKIndices(FS2.GetRawPtr(t, 0), FHalfKeys, FTopK, FSelBBuf);
+      PKMTopKIndices(FS1.GetRawPtr(t, 0), FHalfKeys, FTopK, FSelABuf, FTopKUsed);
+      PKMTopKIndices(FS2.GetRawPtr(t, 0), FHalfKeys, FTopK, FSelBBuf, FTopKUsed);
       // TopK x TopK candidate combinations, scored s1[a] + s2[b].
       nCand := 0;
       for a := 0 to TopKM1 do
@@ -99281,7 +99290,12 @@ begin
   {$ENDIF}
   PrevOut := FPrevLayer.Output;   // #8: invariant across the token loops
   MaxToken := PrevOut.Size - 1;
-  FOutput.Fill(0);
+  // FOutput is (PrevOut.Size, 1, FEmbeddingSize), so the token loops below write
+  // one full row per output row: only a SKIPPED token leaves a row to be zeroed,
+  // which the else branches do. A blanket Fill(0) would be overwritten entirely.
+  RowBytes := FEmbeddingSize * csNeuralFloatSize;  // #5: byte count hoisted
+  RowStride := FOutput.Depth;                       // #12: carried dst offset
+  dstPos := 0;
   if FQuantInt8 then
   begin
     // Int8 gather: dequantize the looked-up row straight into the output
@@ -99301,10 +99315,12 @@ begin
         FInputTokens[CntToken] := CurrentToken;
         RowBase := CurrentToken * FEmbeddingSize;
         RowScale := FQuantScales[CurrentToken];
-        DestPtr := FOutput.GetRawPtr(CntToken, 0);
+        DestPtr := FOutput.GetRawPtr(dstPos);
         for ElementCnt := 0 to EmbSizeM1 do
           DestPtr^[ElementCnt] := FQuantCodes[RowBase + ElementCnt] * RowScale;
-      end;
+      end
+      else FillChar(FOutput.FData[dstPos], RowBytes, 0);
+      Inc(dstPos, RowStride);
     end;
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
@@ -99325,9 +99341,6 @@ begin
     );
   end;
   {$ENDIF}
-  RowBytes := FEmbeddingSize * csNeuralFloatSize;  // #5: byte count hoisted
-  RowStride := FOutput.Depth;                       // #12: carried dst offset
-  dstPos := 0;
   for CntToken := 0 to MaxToken do
   begin
     CurrentToken := Round(PrevOut.FData[CntToken]);
@@ -99340,9 +99353,10 @@ begin
     begin
       FInputTokens[CntToken] := CurrentToken;
       SourcePtr := LocalWeights.GetRawPtr(CurrentToken, 0);
-      // Row lands on a zeroed FOutput (Fill(0) above), so copy == MulAdd-onto-0.
+      // The copy overwrites the whole row, so no pre-zeroing is needed here.
       Move(SourcePtr^, FOutput.FData[dstPos], RowBytes);
-    end;
+    end
+    else FillChar(FOutput.FData[dstPos], RowBytes, 0);  // skipped token: zero row
     Inc(dstPos, RowStride);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -99574,7 +99588,13 @@ begin
   StartTime := Now();
   PrevOut := FPrevLayer.Output;   // #8: invariant across the token loops
   MaxToken := PrevOut.Size - 1;
-  FOutput.Fill(0);
+  // FOutput is (PrevOut.Size, 1, FEmbeddingSize) and FPositionalEmbedding shares
+  // its shape, so each loop iteration writes one complete output row. Only a
+  // SKIPPED token needs zeroing, which the else branches do.
+  RowBytes := FEmbeddingSize * csNeuralFloatSize;  // #5: byte count hoisted
+  RowStride := FOutput.Depth;                       // #12: carried dst/pos offsets
+  dstPos := 0;
+  posPos := 0;
   if FQuantInt8 then
   begin
     // Int8 token gather + FP32 positional add. Zero-padding semantics match
@@ -99593,12 +99613,15 @@ begin
         FInputTokens[CntToken] := CurrentToken;
         RowBase := CurrentToken * FEmbeddingSize;
         RowScale := FQuantScales[CurrentToken];
-        SourcePtrPos := FPositionalEmbedding.GetRawPtr(CntToken, 0);
-        DestPtr := FOutput.GetRawPtr(CntToken, 0);
+        SourcePtrPos := FPositionalEmbedding.GetRawPtr(posPos);
+        DestPtr := FOutput.GetRawPtr(dstPos);
         for ElementCnt := 0 to EmbSizeM1 do
           DestPtr^[ElementCnt] := FQuantCodes[RowBase + ElementCnt] * RowScale
             + SourcePtrPos^[ElementCnt];
-      end;
+      end
+      else FillChar(FOutput.FData[dstPos], RowBytes, 0);
+      Inc(dstPos, RowStride);
+      Inc(posPos, RowStride);
     end;
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
@@ -99619,10 +99642,6 @@ begin
     );
   end;
   {$ENDIF}
-  RowBytes := FEmbeddingSize * csNeuralFloatSize;  // #5: byte count hoisted
-  RowStride := FOutput.Depth;                       // #12: carried dst/pos offsets
-  dstPos := 0;
-  posPos := 0;
   for CntToken := 0 to MaxToken do
   begin
     CurrentToken := Round(PrevOut.FData[CntToken]);
@@ -99635,12 +99654,13 @@ begin
     begin
       FInputTokens[CntToken] := CurrentToken;
       SourcePtr := LocalWeights.GetRawPtr(CurrentToken, 0);
-      // Row lands on a zeroed FOutput (Fill(0) above): copy the token row, then
-      // add the positional row (drops the per-element x1 multiply of MulAdd).
+      // The copy overwrites the whole row, then the positional row is added
+      // (drops the per-element x1 multiply of MulAdd).
       Move(SourcePtr^, FOutput.FData[dstPos], RowBytes);
       TNNetVolume.Add(@FOutput.FData[dstPos], @FPositionalEmbedding.FData[posPos],
         FEmbeddingSize);
-    end;
+    end
+    else FillChar(FOutput.FData[dstPos], RowBytes, 0);  // skipped token: zero row
     Inc(dstPos, RowStride);
     Inc(posPos, RowStride);
   end;

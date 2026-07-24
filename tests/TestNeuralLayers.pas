@@ -97,6 +97,9 @@ type
     // Embedding layers
     procedure TestEmbeddingLayer;
     procedure TestTokenAndPositionalEmbedding;
+    procedure TestEmbeddingZeroPaddedRows;
+    procedure TestEmbeddingInt8ZeroPaddedRows;
+    procedure TestTokenAndPositionalEmbeddingZeroPaddedRows;
     // Rectangular (W <> H) channel reductions + flip/padded-conv regressions
     procedure TestMaxChannelRectangular;
     procedure TestMinChannelRectangular;
@@ -3031,6 +3034,156 @@ begin
     // Output should be 8 x 32 (8 tokens, 32 embedding dim)
     AssertEquals('Output SizeX should be 8', 8, NN.GetLastLayer.Output.SizeX);
     AssertEquals('Output Depth should be 32', 32, NN.GetLastLayer.Output.Depth);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Regression: with EncodeZero=0, token 0 is a PAD - its output row must be all
+// zeros, even when a previous forward pass left a real embedding row there.
+procedure TTestNeuralLayers.TestEmbeddingZeroPaddedRows;
+const
+  cVocab = 10;
+  cDim = 4;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Emb: TNNetEmbedding;
+  W, Output: TNNetVolume;
+  t, d: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    Emb := TNNetEmbedding(NN.AddLayer(TNNetEmbedding.Create(cVocab, cDim)));
+    W := Emb.Neurons[0].Weights;
+    // Every row (including row 0) is non-zero, so a leaked row is visible.
+    for t := 0 to cVocab - 1 do
+      for d := 0 to cDim - 1 do
+        W[t, 0, d] := (t + 1) * 10 + d + 1;
+    Output := NN.GetLastLayer.Output;
+    // First pass: all tokens are real, so every output row is filled.
+    Input.Raw[0] := 3; Input.Raw[1] := 7; Input.Raw[2] := 5; Input.Raw[3] := 9;
+    NN.Compute(Input);
+    AssertEquals('Row 1 holds token 7', 81.0, Output[1, 0, 0], 0.0001);
+    // Second pass: tokens 1 and 3 are pads and must come back as zero rows.
+    Input.Raw[0] := 3; Input.Raw[1] := 0; Input.Raw[2] := 5; Input.Raw[3] := 0;
+    NN.Compute(Input);
+    for d := 0 to cDim - 1 do
+    begin
+      AssertEquals('Token row 0 element ' + IntToStr(d),
+        W[3, 0, d], Output[0, 0, d], 0.0001);
+      AssertEquals('Padded row 1 element ' + IntToStr(d),
+        0.0, Output[1, 0, d], 0.0);
+      AssertEquals('Token row 2 element ' + IntToStr(d),
+        W[5, 0, d], Output[2, 0, d], 0.0001);
+      AssertEquals('Padded row 3 element ' + IntToStr(d),
+        0.0, Output[3, 0, d], 0.0);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Same pad contract on the int8 gather path.
+procedure TTestNeuralLayers.TestEmbeddingInt8ZeroPaddedRows;
+const
+  cVocab = 10;
+  cDim = 4;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Emb: TNNetEmbedding;
+  W, Output: TNNetVolume;
+  t, d: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    Emb := TNNetEmbedding(NN.AddLayer(TNNetEmbedding.Create(cVocab, cDim)));
+    W := Emb.Neurons[0].Weights;
+    for t := 0 to cVocab - 1 do
+      for d := 0 to cDim - 1 do
+        W[t, 0, d] := (t + 1) * 10 + d + 1;
+    Emb.QuantizeWeightsInt8();
+    Output := NN.GetLastLayer.Output;
+    Input.Raw[0] := 3; Input.Raw[1] := 7; Input.Raw[2] := 5; Input.Raw[3] := 9;
+    NN.Compute(Input);
+    AssertEquals('Int8 row 1 holds token 7', 81.0, Output[1, 0, 0], 0.5);
+    Input.Raw[0] := 3; Input.Raw[1] := 0; Input.Raw[2] := 5; Input.Raw[3] := 0;
+    NN.Compute(Input);
+    for d := 0 to cDim - 1 do
+    begin
+      AssertEquals('Int8 token row 0 element ' + IntToStr(d),
+        (3 + 1) * 10 + d + 1, Output[0, 0, d], 0.5);
+      AssertEquals('Int8 padded row 1 element ' + IntToStr(d),
+        0.0, Output[1, 0, d], 0.0);
+      AssertEquals('Int8 token row 2 element ' + IntToStr(d),
+        (5 + 1) * 10 + d + 1, Output[2, 0, d], 0.5);
+      AssertEquals('Int8 padded row 3 element ' + IntToStr(d),
+        0.0, Output[3, 0, d], 0.0);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// A padded token gets NEITHER table: not the vocab row and not the positional
+// row, so the output row stays exactly zero.
+procedure TTestNeuralLayers.TestTokenAndPositionalEmbeddingZeroPaddedRows;
+const
+  cVocab = 10;
+  cDim = 8;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Emb: TNNetTokenAndPositionalEmbedding;
+  W, Output: TNNetVolume;
+  t, d: integer;
+  Row0, Row2: array[0..cDim - 1] of TNeuralFloat;
+  AnyPositional: boolean;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    Emb := TNNetTokenAndPositionalEmbedding(NN.AddLayer(
+      TNNetTokenAndPositionalEmbedding.Create(cVocab, cDim)));
+    W := Emb.Neurons[0].Weights;
+    for t := 0 to cVocab - 1 do
+      for d := 0 to cDim - 1 do
+        W[t, 0, d] := (t + 1) * 10 + d + 1;
+    Output := NN.GetLastLayer.Output;
+    Input.Raw[0] := 3; Input.Raw[1] := 7; Input.Raw[2] := 5; Input.Raw[3] := 9;
+    NN.Compute(Input);
+    // Rows 0 and 2 keep the same tokens in both passes: vocab row + positional
+    // row, so they must be reproduced exactly (and stay above the vocab row).
+    AnyPositional := false;
+    for d := 0 to cDim - 1 do
+    begin
+      Row0[d] := Output[0, 0, d];
+      Row2[d] := Output[2, 0, d];
+      if Row2[d] <> W[5, 0, d] then AnyPositional := true;
+    end;
+    AssertTrue('Positional term must reach a real token row', AnyPositional);
+    Input.Raw[0] := 3; Input.Raw[1] := 0; Input.Raw[2] := 5; Input.Raw[3] := 0;
+    NN.Compute(Input);
+    for d := 0 to cDim - 1 do
+    begin
+      AssertEquals('Positional padded row 1 element ' + IntToStr(d),
+        0.0, Output[1, 0, d], 0.0);
+      AssertEquals('Positional padded row 3 element ' + IntToStr(d),
+        0.0, Output[3, 0, d], 0.0);
+      AssertEquals('Positional token row 0 element ' + IntToStr(d),
+        Row0[d], Output[0, 0, d], 0.0001);
+      AssertEquals('Positional token row 2 element ' + IntToStr(d),
+        Row2[d], Output[2, 0, d], 0.0001);
+    end;
   finally
     NN.Free;
     Input.Free;
