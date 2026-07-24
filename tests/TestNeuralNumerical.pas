@@ -628,6 +628,7 @@ type
     procedure TestSincConv1DInputGradientCheck;
     procedure TestSincConv1DWeightGradientCheck;
     procedure TestSincConv1DSerializationRoundTrip;
+    procedure TestSincConv1DBankFollowsWeightChanges;
     procedure TestConvLSTMCellShapeInference;
     procedure TestConvLSTMCellInputGradientCheck;
     procedure TestConvLSTMCellWeightGradientCheck;
@@ -37471,6 +37472,95 @@ begin
   RandSeed := 424242;
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetSincConv1D.Create(3, 5, 2, 4000), 'SincConv1D', 16, 1, 1, 1e-5);
+end;
+
+// The forward caches the materialized filter bank and only rebuilds it when the
+// (low_freq, band) scalars actually changed. This asserts the cache can never go
+// stale: whichever way the weights are written - a direct Neurons[0].Weights
+// write from outside the layer, or a real training step - the next forward must
+// reproduce EXACTLY what a freshly built layer carrying those same weights
+// computes (and must differ from the pre-change output).
+procedure TTestNeuralNumerical.TestSincConv1DBankFollowsWeightChanges;
+var
+  NN, RefNN: TNNet;
+  Input, Out0, Out1: TNNetVolume;
+  L, RefL: TNNetSincConv1D;
+  i, T, NF, K: integer;
+  maxDiff, maxChange: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  T := 24; NF := 3; K := 5;
+  NN := TNNet.Create();
+  RefNN := TNNet.Create();
+  Input := TNNetVolume.Create(T, 1, 1);
+  Out0 := TNNetVolume.Create();
+  Out1 := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(T, 1, 1, 1));
+    L := TNNetSincConv1D.Create(NF, K, 2, 4000);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    RefNN.AddLayer(TNNetInput.Create(T, 1, 1, 1));
+    RefL := TNNetSincConv1D.Create(NF, K, 2, 4000);
+    RefNN.AddLayer(RefL);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.41) * 1.3 + 0.15;
+    SeedSincConv1D(L, NF);
+    NN.Compute(Input);
+    Out0.Copy(NN.GetLastLayer.Output);
+
+    // A second forward with unchanged weights must hit the cache and reproduce
+    // the first output bit for bit.
+    NN.Compute(Input);
+    for i := 0 to Out0.Size - 1 do
+      AssertTrue('SincConv1D cached forward changed the output at ' + IntToStr(i),
+        NN.GetLastLayer.Output.Raw[i] = Out0.Raw[i]);
+
+    // Direct weight write from OUTSIDE the layer, with no FlushWeightCache.
+    for i := 0 to L.Neurons[0].Weights.Size - 1 do
+      L.Neurons[0].Weights.Raw[i] := L.Neurons[0].Weights.Raw[i] * 1.35 + 3;
+    NN.Compute(Input);
+    Out1.Copy(NN.GetLastLayer.Output);
+    // Reference: a pristine layer built with those very weights.
+    for i := 0 to RefL.Neurons[0].Weights.Size - 1 do
+      RefL.Neurons[0].Weights.Raw[i] := L.Neurons[0].Weights.Raw[i];
+    RefNN.Compute(Input);
+    maxDiff := 0; maxChange := 0;
+    for i := 0 to Out1.Size - 1 do
+    begin
+      if Abs(Out1.Raw[i] - RefNN.GetLastLayer.Output.Raw[i]) > maxDiff then
+        maxDiff := Abs(Out1.Raw[i] - RefNN.GetLastLayer.Output.Raw[i]);
+      if Abs(Out1.Raw[i] - Out0.Raw[i]) > maxChange then
+        maxChange := Abs(Out1.Raw[i] - Out0.Raw[i]);
+    end;
+    AssertTrue('SincConv1D bank went stale after a direct weight write ' +
+      '(max diff vs a fresh layer = ' + FloatToStr(maxDiff) + ')',
+      maxDiff < 1e-7);
+    AssertTrue('SincConv1D output did not react to the weight change',
+      maxChange > 1e-5);
+
+    // Now the training path: one backward step moves the two scalars per filter.
+    NN.SetBatchUpdate(false);
+    NN.Compute(Input);
+    Out0.Copy(NN.GetLastLayer.Output);
+    Out1.ReSize(Out0);
+    Out1.Fill(0);                // a zero target: the error is the output itself
+    NN.Backpropagate(Out1);
+    NN.Compute(Input);
+    Out1.Copy(NN.GetLastLayer.Output);
+    for i := 0 to RefL.Neurons[0].Weights.Size - 1 do
+      RefL.Neurons[0].Weights.Raw[i] := L.Neurons[0].Weights.Raw[i];
+    RefNN.Compute(Input);
+    maxDiff := 0;
+    for i := 0 to Out1.Size - 1 do
+      if Abs(Out1.Raw[i] - RefNN.GetLastLayer.Output.Raw[i]) > maxDiff then
+        maxDiff := Abs(Out1.Raw[i] - RefNN.GetLastLayer.Output.Raw[i]);
+    AssertTrue('SincConv1D bank went stale after a training weight update ' +
+      '(max diff vs a fresh layer = ' + FloatToStr(maxDiff) + ')',
+      maxDiff < 1e-7);
+  finally
+    NN.Free; RefNN.Free; Input.Free; Out0.Free; Out1.Free;
+  end;
 end;
 
 // --- TNNetConvLSTMCell (convolutional LSTM spatiotemporal recurrent cell) -----

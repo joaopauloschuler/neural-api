@@ -9133,7 +9133,17 @@ type
       FWindow: TNNetVolume;   // Hamming window, (KernelSize,1,1)
       FGradS: TNNetVolume;    // (NumFilters,1,2) scalar grad accumulator
       FGBank: TNNetVolume;    // persistent per-tap kernel-grad scratch (KernelSize,1,NumFilters)
+      // Snapshot of the (NumFilters,1,2) (low,band) scalars FBank was built from.
+      // The bank is a pure function of them, so the forward only has to
+      // rematerialize when one of them differs: 2*NumFilters compares instead of
+      // 2*NumFilters*KernelSize transcendentals per call. Comparing the VALUES
+      // (rather than trusting an AfterWeightUpdate dirty flag) keeps the bank
+      // correct no matter which path wrote the weights - training, a loader, or
+      // a direct Neurons[0].Weights write from outside the layer.
+      FBankSrc: TNNetVolume;
+      FBankValid: boolean;    // false until FBank/FBankSrc have been built once
       procedure MaterializeBank();
+      procedure MaterializeBankIfStale();
     public
       constructor Create(pNumFilters, pKernelSize: integer; pStride: integer = 1;
         pSampleRate: TNeuralFloat = 16000); reintroduce; overload;
@@ -57766,8 +57776,8 @@ var
   SeqLen, C, t, d: integer;
   MaxC, MaxT, basePrev, baseC, pvStride, ocStride: integer;
   raw, wv, uv, kt, vt, aprev, bprev: TNeuralFloat;
-  qprev, ww1, qmax, e1, e2, num, den, dwexp: TNeuralFloat;
-  ww2, qmax2, e3, e4: TNeuralFloat;
+  qprev, ww1, qmax, e1, e2, num, den: TNeuralFloat;
+  ww2, qmax2, e3, e4, eq: TNeuralFloat;
   anew, bnew: TNeuralFloat;
 begin
   if FDecodeEnabled then
@@ -57798,7 +57808,6 @@ begin
   begin
     wv := FW.FData[d];
     uv := Wu.FData[d];
-    dwexp := NeuralExp(-wv);             // e^{-w} in (0,1)
     aprev := 0;                    // stabilised A_{t-1}
     bprev := 0;                    // stabilised B_{t-1}
     qprev := -1e30;                // log-space running max, -inf
@@ -57828,8 +57837,9 @@ begin
       anew := e3 * aprev + e4 * vt;
       bnew := e3 * bprev + e4;
       // Cache TRUE accumulators a_t,b_t (= stabilised * e^{Q_t}).
-      FA.FData[baseC] := anew * NeuralExp(qmax2);
-      FB.FData[baseC] := bnew * NeuralExp(qmax2);
+      eq := NeuralExp(qmax2);              // one exp, two uses
+      FA.FData[baseC] := anew * eq;
+      FB.FData[baseC] := bnew * eq;
       aprev := anew;
       bprev := bnew;
       qprev := qmax2;
@@ -59067,7 +59077,7 @@ var
   MaxC, MaxT, baseKV, baseC, kvStride, ocStride: integer;
   raw, wv, uv, kt, vt, rt, aprev, bprev: TNeuralFloat;
   qprev, ww1, qmax, e1, e2, num, den: TNeuralFloat;
-  ww2, qmax2, e3, e4, anew, bnew, wkv: TNeuralFloat;
+  ww2, qmax2, e3, e4, anew, bnew, wkv, eq: TNeuralFloat;
 begin
   StartTime := Now();
   Rcp := FPrevLayer.FOutput;        // receptance source A (depth C)
@@ -59124,8 +59134,9 @@ begin
       e4 := NeuralExp(kt - qmax2);
       anew := e3 * aprev + e4 * vt;
       bnew := e3 * bprev + e4;
-      FA.FData[baseC] := anew * NeuralExp(qmax2);
-      FB.FData[baseC] := bnew * NeuralExp(qmax2);
+      eq := NeuralExp(qmax2);                          // one exp, two uses
+      FA.FData[baseC] := anew * eq;
+      FB.FData[baseC] := bnew * eq;
       aprev := anew;
       bprev := bnew;
       qprev := qmax2;
@@ -59151,7 +59162,7 @@ var
   QLen, KVLen, C, t, i, d: integer;
   MaxC, MaxKV, MaxQ, baseKV, baseC, baseLast, baseQ, kvStride, ocStride: integer;
   raw, wv, kt, vt, aprev, bprev: TNeuralFloat;
-  qprev, ww2, qmax2, e3, e4, anew, bnew, summaryWkv, rt: TNeuralFloat;
+  qprev, ww2, qmax2, e3, e4, anew, bnew, summaryWkv, rt, eq: TNeuralFloat;
 begin
   StartTime := Now();
   Rcp := FPrevLayer.FOutput;        // receptance source A (depth C), len QLen
@@ -59194,8 +59205,9 @@ begin
       anew := e3 * aprev + e4 * vt;
       bnew := e3 * bprev + e4;
       // FA, FB share (KVLen,1,C): one offset for both.
-      FA.FData[baseC] := anew * NeuralExp(qmax2);
-      FB.FData[baseC] := bnew * NeuralExp(qmax2);
+      eq := NeuralExp(qmax2);                     // one exp, two uses
+      FA.FData[baseC] := anew * eq;
+      FB.FData[baseC] := bnew * eq;
       aprev := anew;
       bprev := bnew;
       qprev := qmax2;
@@ -62185,11 +62197,14 @@ begin
   FWindow := TNNetVolume.Create();
   FGradS := TNNetVolume.Create();
   FGBank := TNNetVolume.Create();
+  FBankSrc := TNNetVolume.Create();
+  FBankValid := false;
   AddMissingNeurons(1);
 end;
 
 destructor TNNetSincConv1D.Destroy();
 begin
+  FBankSrc.Free;
   FGBank.Free;
   FGradS.Free;
   FWindow.Free;
@@ -62226,6 +62241,8 @@ begin
   FBank.ReSize(FKernelSize, 1, FNumFilters);
   FWindow.ReSize(FKernelSize, 1, 1);
   FGradS.ReSize(FNumFilters, 1, 2);
+  FBankSrc.ReSize(FNumFilters, 1, 2);
+  FBankValid := false;   // geometry changed: the cached bank no longer applies
   // Hamming window over n = 0..K-1: 0.54 - 0.46*cos(2*pi*n/(K-1)).
   half := (FKernelSize - 1) shr 1;
   KernelSizeM1 := FKernelSize - 1;
@@ -62272,6 +62289,37 @@ begin
   end;
 end;
 
+// Rebuilds the filter bank only when the (low,band) scalars it was built from
+// changed. The check is 2*NumFilters float compares; the rebuild it skips is
+// 2*NumFilters*KernelSize sin/divide evaluations.
+procedure TNNetSincConv1D.MaterializeBankIfStale();
+var
+  W: TNNetVolume;
+  i, WSize, WSizeM1: integer;
+  stale: boolean;
+begin
+  W := FNeurons[0].FWeights;
+  WSize := W.Size;
+  stale := (not FBankValid) or (FBankSrc.Size <> WSize);
+  if not stale then
+  begin
+    WSizeM1 := WSize - 1;
+    for i := 0 to WSizeM1 do
+      if FBankSrc.FData[i] <> W.FData[i] then
+      begin
+        stale := true;
+        break;
+      end;
+  end;
+  if not stale then exit;
+  // Lazy, amortized resize of a persistent field (rule #17): only on a shape
+  // change, never per call.
+  if FBankSrc.Size <> WSize then FBankSrc.ReSize(W);
+  MaterializeBank();
+  Move(W.FData[0], FBankSrc.FData[0], WSize * csNeuralFloatSize);
+  FBankValid := true;
+end;
+
 procedure TNNetSincConv1D.Compute();
 var
   StartTime: double;
@@ -62282,7 +62330,7 @@ var
   XPtr, BankPtr, OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  MaterializeBank();
+  MaterializeBankIfStale();
   Prev := FPrevLayer.FOutput;
   XPtr := Prev.GetRawPtr(0, 0);
   BankPtr := FBank.GetRawPtr(0, 0);
@@ -67893,7 +67941,7 @@ var
   dInner, P, N, NG, gw, hbase, ebase, xbase: integer;
   SeqLenM1, NumHeadsM1, PM1, NM1, dInnerM1, tHeads, tDInner: integer;
   idxH, hP, bBase, cBase, idxS, idxC: integer;
-  pre, dth, ah, xv, hnew, accY, ar, zsq, gate, msq, rstd: TNeuralFloat;
+  pre, dth, ah, xv, dtxv, hnew, accY, ar, zsq, gate, msq, rstd: TNeuralFloat;
   XtPtr, OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
@@ -67957,13 +68005,14 @@ begin
       begin
         xbase := hP + c;
         xv := XtPtr^[xbase];
+        dtxv := dth * xv;   // invariant across the s loop: one multiply per s, not two
         ebase := xbase * N;
         hbase := (tDInner + xbase) * N;
         for s := 0 to NM1 do
         begin
           idxS := ebase + s;
           hnew := ah * FH.FData[idxS] +
-            dth * XtPtr^[bBase + s] * xv;
+            dtxv * XtPtr^[bBase + s];
           FH.FData[idxS] := hnew;
           FState.FData[hbase + s] := hnew;
         end;
@@ -68004,11 +68053,12 @@ var
   SeqLen, t, h, c, s, g, hpg, bOff, cOff, dtOff, gateOff, SeqLenM1: integer;
   dInner, P, N, NG, gw, hbase, ebase, xbase: integer;
   NumHeadsM1, PM1, NM1, dInnerM1, tDInner, tHeads, idx: integer;
-  DInnerN, hbasePrev, bBase, cBase: integer;
+  DInnerN, hbasePrev, bBase, cBase, hP: integer;
   hasInputGrad: boolean;
   GyPtr, XtPtr, PrevErrPtr: TNeuralFloatArrPtr;
   rstd, gy, z, dotzg, gz, gate, sig, silu, dsilu, gdth, ght, gAlog: TNeuralFloat;
   dth, ah, ar, xv, htm1, gy_y, gpre, gxv, yval: TNeuralFloat;
+  kZ, arah, ghtdth, gyz: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -68065,18 +68115,20 @@ begin
     for c := 0 to dInnerM1 do
     begin
       z := FZ.FData[tDInner + c];
+      gyz := GyPtr^[c] * z;                      // one product, two uses
       FGradNorm.FData[c] := FGradNorm.FData[c] +
-        GyPtr^[c] * z * rstd;                    // dL/dnorm_weight
-      dotzg := dotzg + NormW.FData[c] * GyPtr^[c] * z;
+        gyz * rstd;                              // dL/dnorm_weight
+      dotzg := dotzg + NormW.FData[c] * gyz;
     end;
     // dL/dy_c and dL/dgate_c. Overwrite FY in place with dL/dy_c for the
     // recurrence pass (the forward y_t is no longer needed).
+    // rstd^3/dInner*dotzg is invariant across c: one divide per t, not per element.
+    kZ := rstd * rstd * rstd / dInner * dotzg;
     for c := 0 to dInnerM1 do
     begin
       gy := GyPtr^[c];
       idx := tDInner + c;
-      gz := NormW.FData[c] * rstd * gy
-        - FZ.FData[idx] * rstd * rstd * rstd / dInner * dotzg;
+      gz := NormW.FData[c] * rstd * gy - FZ.FData[idx] * kZ;
       gate := XtPtr^[gateOff + c];
       sig := 1 / (1 + NeuralExp(-gate));
       silu := gate * sig;
@@ -68097,11 +68149,13 @@ begin
       dth := FDt.FData[tHeads + h];
       ah := FAt.FData[tHeads + h];
       ar := FArBuf[h];   // A = -exp(A_log)
+      arah := ar * ah;   // invariant across the c/s loops below
+      hP := h * P;
       gdth := 0;
       gAlog := 0;
       for c := 0 to PM1 do
       begin
-        xbase := h * P + c;
+        xbase := hP + c;
         xv := XtPtr^[xbase];
         ebase := xbase * N;
         hbase := (tDInner + xbase) * N;
@@ -68123,16 +68177,17 @@ begin
               gy_y * FState.FData[hbase + s];
           // h_t = a*h_{t-1} + dt*B*x ; a = exp(dt*ar).
           // dt path: dh/ddt = ar*a*h_{t-1} + B*x.
-          gdth := gdth + ght * (ar * ah * htm1 +
+          gdth := gdth + ght * (arah * htm1 +
             XtPtr^[bBase + s] * xv);
           // A_log path: da/dA_log = a*dt*ar (ar=-exp(A_log)); dh/da = h_{t-1}.
           gAlog := gAlog + ght * htm1;
+          ghtdth := ght * dth;   // one product, two uses
           // B path (input grad): dh/dB = dt*x.
           if hasInputGrad then
             PrevErrPtr^[bBase + s] := PrevErrPtr^[bBase + s] +
-              ght * dth * xv;
+              ghtdth * xv;
           // x path through dt*B*x.
-          gxv := gxv + ght * dth * XtPtr^[bBase + s];
+          gxv := gxv + ghtdth * XtPtr^[bBase + s];
           // Propagate to t-1: gh_{t-1}[c,s] = a*gh_t[c,s].
           FGh.FData[ebase + s] := ah * ght;
         end;
