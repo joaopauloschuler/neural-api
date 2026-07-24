@@ -844,7 +844,6 @@ end;
 // cross-layer purposes is 1 and "gain bound" stays 1.00x, so every bit of gain
 // measured here comes from intra-layer chunking and nothing else.
 const
-  // v2 added widths 64 and 128 below the previous 256..1024 range.
   SHAPESET_D = 'D/v2';
   // Depths fitted per shape. Must stay >= 2 points for a fit; the spread is
   // geometric so the intercept is not dominated by the deep end.
@@ -983,18 +982,17 @@ begin
   WriteLn;
 end;
 
-// The widths swept. They straddle Experiment A's single-layer crossover (which
-// on the reference box sits between 512 at 0.71x and 768 at 1.74x), so the
-// table shows both shapes A calls a loss and shapes A calls a win - and whether
-// depth moves that verdict.
+// The widths swept. They straddle Experiment A's single-layer crossover (on the
+// reference box between 512 at 0.71x and 768 at 1.74x), so the table holds both
+// shapes A calls a loss and shapes A calls a win, and shows at what depth - if
+// any - each crosses 1.00x once the per-pass cost is amortised over the stack.
 //
-// 64 and 128 are the deep end of the "A says no" range: A scores them 0.08x and
-// 0.13x, so a single-layer reading rejects them outright. They are also the
-// widths where the per-PASS fit is most trustworthy - their whole stack stays in
-// cache at every depth (64: 16KB/layer, 128: 64KB/layer, so even K=16 is 1MB),
-// which is what bent the 768/1024 fits into a negative (unphysical) intercept.
-// If the per-pass cost F really is the whole story, these two should still cross
-// 1.00x somewhere in the sweep - measuring where is the point of adding them.
+// The narrow widths carry the fit. A stack's weights are K*W*W*4 bytes, so at 64
+// and 128 (16KB and 64KB per layer) even K=16 stays in cache and per-layer cost
+// is flat with depth, which is what the intercept/slope split assumes. From 768
+// up the stack outgrows cache as K grows, per-layer cost rises with it, and the
+// fit answers with a negative - unphysical - intercept: read those two widths as
+// bandwidth behaviour, and take F from the narrow end.
 procedure ExperimentD;
 begin
   WriteLn('=== Experiment D: depth sweep  (per-pass vs per-layer overhead) ===');
