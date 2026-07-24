@@ -1,0 +1,586 @@
+object frmInstaller: TfrmInstaller
+  Left = 320
+  Height = 480
+  Top = 200
+  Width = 720
+  Caption = 'Instalador CAI Neural API'
+  ClientHeight = 480
+  ClientWidth = 720
+  Color = clBtnFace
+  Font.Color = clWindowText
+  Font.Height = -12
+  Font.Name = 'Segoe UI'
+  OnCreate = FormCreate
+  OnClose = FormClose
+  Position = poScreenCenter
+  object pnlSidebar: TPanel
+    Left = 0
+    Height = 430
+    Top = 0
+    Width = 180
+    Align = alLeft
+    BevelOuter = bvNone
+    Color = 2956822
+    ParentBackground = False
+    ParentColor = False
+    TabOrder = 0
+    object lblStepWelcome: TLabel
+      Left = 16
+      Height = 17
+      Top = 60
+      Width = 148
+      AutoSize = False
+      Caption = '1. Boas-vindas'
+      Font.Color = clGray
+      Font.Height = -13
+      ParentColor = False
+    end
+    object lblStepPath: TLabel
+      Left = 16
+      Height = 17
+      Top = 95
+      Width = 148
+      AutoSize = False
+      Caption = '2. Pasta de Destino'
+      Font.Color = clGray
+      Font.Height = -13
+      ParentColor = False
+    end
+    object lblStepModels: TLabel
+      Left = 16
+      Height = 17
+      Top = 130
+      Width = 148
+      AutoSize = False
+      Caption = '3. Download de Modelos'
+      Font.Color = clGray
+      Font.Height = -13
+      ParentColor = False
+    end
+    object lblStepServer: TLabel
+      Left = 16
+      Height = 17
+      Top = 165
+      Width = 148
+      AutoSize = False
+      Caption = '4. Iniciar Servidor'
+      Font.Color = clGray
+      Font.Height = -13
+      ParentColor = False
+    end
+    object lblStepTest: TLabel
+      Left = 16
+      Height = 17
+      Top = 200
+      Width = 148
+      AutoSize = False
+      Caption = '5. Teste de IA'
+      Font.Color = clGray
+      Font.Height = -13
+      ParentColor = False
+    end
+    object lblStepFinish: TLabel
+      Left = 16
+      Height = 17
+      Top = 235
+      Width = 148
+      AutoSize = False
+      Caption = '6. Conclusão'
+      Font.Color = clGray
+      Font.Height = -13
+      ParentColor = False
+    end
+    object lblTitle: TLabel
+      Left = 16
+      Height = 21
+      Top = 20
+      Width = 148
+      AutoSize = False
+      Caption = 'INSTALAÇÃO'
+      Font.Color = clWhite
+      Font.Height = -15
+      Font.Style = [fsBold]
+      ParentColor = False
+    end
+  end
+  object pnlButtons: TPanel
+    Left = 0
+    Height = 50
+    Top = 430
+    Width = 720
+    Align = alBottom
+    BevelOuter = bvNone
+    ClientHeight = 50
+    ClientWidth = 720
+    TabOrder = 1
+    object btnCancel: TButton
+      Left = 614
+      Height = 30
+      Top = 10
+      Width = 90
+      Anchors = [akTop, akRight]
+      Caption = 'Cancelar'
+      OnClick = btnCancelClick
+      TabOrder = 0
+    end
+    object btnNext: TButton
+      Left = 514
+      Height = 30
+      Top = 10
+      Width = 90
+      Anchors = [akTop, akRight]
+      Caption = 'Avançar >'
+      OnClick = btnNextClick
+      TabOrder = 1
+    end
+    object btnBack: TButton
+      Left = 414
+      Height = 30
+      Top = 10
+      Width = 90
+      Anchors = [akTop, akRight]
+      Caption = '< Voltar'
+      OnClick = btnBackClick
+      TabOrder = 2
+    end
+  end
+  object pnlMain: TPanel
+    Left = 180
+    Height = 430
+    Top = 0
+    Width = 540
+    Align = alClient
+    BevelOuter = bvNone
+    ClientHeight = 430
+    ClientWidth = 540
+    TabOrder = 2
+    object pgcWizard: TPageControl
+      Left = 0
+      Height = 430
+      Top = 0
+      Width = 540
+      ActivePage = tsWelcome
+      Align = alClient
+      ShowTabs = False
+      TabOrder = 0
+      object tsWelcome: TTabSheet
+        Caption = 'tsWelcome'
+        ClientHeight = 422
+        ClientWidth = 532
+        object lblWelcome: TLabel
+          Left = 20
+          Height = 25
+          Top = 20
+          Width = 490
+          Anchors = [akTop, akLeft, akRight]
+          AutoSize = False
+          Caption = 'Bem-vindo ao CAI Neural API'
+          Font.Height = -19
+          Font.Style = [fsBold]
+          ParentColor = False
+        end
+        object lblWelcomeDesc: TLabel
+          Left = 20
+          Height = 40
+          Top = 55
+          Width = 490
+          Anchors = [akTop, akLeft, akRight]
+          AutoSize = False
+          Caption = 'Este assistente irá guiar você através da instalação, download de modelos e configuração de teste do CAI Neural API.'
+          WordWrap = True
+          ParentColor = False
+        end
+        object lblLanguage: TLabel
+          Left = 20
+          Height = 15
+          Top = 100
+          Width = 120
+          Caption = 'Language / Idioma:'
+          ParentColor = False
+        end
+        object cmbLanguage: TComboBox
+          Left = 150
+          Height = 23
+          Top = 97
+          Width = 180
+          Style = csDropDownList
+          ItemHeight = 15
+          ItemIndex = 1
+          Items.Strings = (
+            'English'
+            'Português'
+            'Français'
+            'Deutsch'
+            'Español'
+            'العربية'
+            '中文'
+            '日本語'
+            'Русский'
+          )
+          TabOrder = 1
+          Text = 'Português'
+          OnChange = cmbLanguageChange
+        end
+        object memWelcomeInfo: TMemo
+          Left = 20
+          Height = 260
+          Top = 140
+          Width = 490
+          Anchors = [akTop, akLeft, akRight, akBottom]
+          Lines.Strings = (
+            'O CAI NEURAL API é uma biblioteca Pascal robusta para redes neurais, otimizada para instruções AVX e OpenCL (GPU).'
+            ''
+            'Destaques:'
+            '- Execute LLMs reais de forma nativa e rápida (sem Python ou CUDA).'
+            '- Suporte embutido para Transformers, MoE, RWKV e xLSTM.'
+            '- Executável nativo único e otimizado.'
+            ''
+            'Clique em Avançar para prosseguir com a configuração.'
+          )
+          ReadOnly = True
+          ScrollBars = ssAutoVertical
+          TabOrder = 0
+        end
+      end
+      object tsDirectory: TTabSheet
+        Caption = 'tsDirectory'
+        ClientHeight = 422
+        ClientWidth = 532
+        object lblDestDir: TLabel
+          Left = 20
+          Height = 15
+          Top = 20
+          Width = 490
+          Anchors = [akTop, akLeft, akRight]
+          Caption = 'Selecione a pasta raiz onde o repositório está localizado:'
+          ParentColor = False
+        end
+        object edtDestDir: TEdit
+          Left = 20
+          Height = 23
+          Top = 45
+          Width = 390
+          Anchors = [akTop, akLeft, akRight]
+          TabOrder = 0
+        end
+        object btnBrowse: TButton
+          Left = 420
+          Height = 25
+          Top = 44
+          Width = 90
+          Anchors = [akTop, akRight]
+          Caption = 'Procurar...'
+          OnClick = btnBrowseClick
+          TabOrder = 1
+        end
+        object lblLazarusDir: TLabel
+          Left = 20
+          Height = 15
+          Top = 90
+          Width = 490
+          Anchors = [akTop, akLeft, akRight]
+          Caption = 'Selecione a pasta onde o Lazarus está instalado:'
+          ParentColor = False
+        end
+        object edtLazarusDir: TEdit
+          Left = 20
+          Height = 23
+          Top = 115
+          Width = 390
+          Anchors = [akTop, akLeft, akRight]
+          TabOrder = 2
+          Text = 'C:\lazarus'
+        end
+        object btnBrowseLazarus: TButton
+          Left = 420
+          Height = 25
+          Top = 114
+          Width = 90
+          Anchors = [akTop, akRight]
+          Caption = 'Procurar...'
+          OnClick = btnBrowseLazarusClick
+          TabOrder = 3
+        end
+      end
+      object tsDownloader: TTabSheet
+        Caption = 'tsDownloader'
+        ClientHeight = 422
+        ClientWidth = 532
+        object lblSelectFiles: TLabel
+          Left = 20
+          Height = 15
+          Top = 20
+          Width = 490
+          Anchors = [akTop, akLeft, akRight]
+          Caption = 'Selecione o modelo instruct que deseja baixar e os respectivos arquivos:'
+          ParentColor = False
+        end
+        object cmbModels: TComboBox
+          Left = 20
+          Height = 23
+          Top = 45
+          Width = 490
+          Anchors = [akTop, akLeft, akRight]
+          Style = csDropDownList
+          TabOrder = 0
+          OnChange = cmbModelsChange
+        end
+        object chkModelFiles: TCheckListBox
+          Left = 20
+          Height = 100
+          Top = 80
+          Width = 490
+          Anchors = [akTop, akLeft, akRight]
+          ItemHeight = 0
+          TabOrder = 1
+        end
+        object memDownloadLog: TMemo
+          Left = 20
+          Height = 100
+          Top = 190
+          Width = 490
+          Anchors = [akTop, akLeft, akRight, akBottom]
+          ReadOnly = True
+          ScrollBars = ssAutoVertical
+          TabOrder = 4
+        end
+        object btnDownload: TButton
+          Left = 20
+          Height = 30
+          Top = 305
+          Width = 490
+          Anchors = [akLeft, akRight, akBottom]
+          Caption = 'Baixar Modelos Selecionados'
+          OnClick = btnDownloadClick
+          TabOrder = 2
+        end
+        object pbDownload: TProgressBar
+          Left = 20
+          Height = 20
+          Top = 350
+          Width = 490
+          Anchors = [akLeft, akRight, akBottom]
+          TabOrder = 3
+        end
+        object lblDownloadStatus: TLabel
+          Left = 20
+          Height = 15
+          Top = 380
+          Width = 490
+          Anchors = [akLeft, akRight, akBottom]
+          Caption = 'Status: Pronto para baixar.'
+          ParentColor = False
+        end
+      end
+      object tsChatServer: TTabSheet
+        Caption = 'tsChatServer'
+        ClientHeight = 422
+        ClientWidth = 532
+        object lblServerStatus: TLabel
+          Left = 20
+          Height = 25
+          Top = 20
+          Width = 490
+          Anchors = [akTop, akLeft, akRight]
+          AutoSize = False
+          Caption = 'Aguardando inicialização do servidor...'
+          Font.Height = -15
+          Font.Style = [fsBold]
+          ParentColor = False
+        end
+        object btnStartServer: TButton
+          Left = 20
+          Height = 30
+          Top = 55
+          Width = 180
+          Caption = 'Iniciar Servidor'
+          OnClick = btnStartServerClick
+          TabOrder = 0
+        end
+        object lblServerPort: TLabel
+          Left = 220
+          Height = 15
+          Top = 62
+          Width = 30
+          Caption = 'Port:'
+          ParentColor = False
+        end
+        object edtServerPort: TEdit
+          Left = 260
+          Height = 23
+          Top = 58
+          Width = 60
+          TabOrder = 2
+          Text = '8095'
+        end
+        object memServerLog: TMemo
+          Left = 20
+          Height = 310
+          Top = 95
+          Width = 490
+          Anchors = [akTop, akLeft, akRight, akBottom]
+          ReadOnly = True
+          ScrollBars = ssAutoVertical
+          TabOrder = 1
+        end
+      end
+      object tsChatGPT: TTabSheet
+        Caption = 'tsChatGPT'
+        ClientHeight = 422
+        ClientWidth = 532
+        object lblProvider: TLabel
+          Left = 20
+          Height = 15
+          Top = 15
+          Width = 100
+          Caption = 'Provedor:'
+          ParentColor = False
+        end
+        object cmbProvider: TComboBox
+          Left = 20
+          Height = 23
+          Top = 35
+          Width = 150
+          Style = csDropDownList
+          ItemHeight = 15
+          ItemIndex = 0
+          Items.Strings = (
+            'OpenAI'
+            'OpenRouter'
+            'Cerebras'
+            'Local Ollama'
+            'Google Gemini'
+            'Claude'
+          )
+          TabOrder = 0
+          Text = 'OpenAI'
+          OnChange = cmbProviderChange
+        end
+        object lblToken: TLabel
+          Left = 190
+          Height = 15
+          Top = 15
+          Width = 100
+          Caption = 'Token / API Key:'
+          ParentColor = False
+        end
+        object edtToken: TEdit
+          Left = 190
+          Height = 23
+          Top = 35
+          Width = 320
+          EchoMode = emPassword
+          TabOrder = 1
+        end
+        object lblURL: TLabel
+          Left = 20
+          Height = 15
+          Top = 70
+          Width = 120
+          Caption = 'Endpoint URL:'
+          ParentColor = False
+        end
+        object edtURL: TEdit
+          Left = 20
+          Height = 23
+          Top = 90
+          Width = 270
+          TabOrder = 2
+          Text = 'https://api.openai.com/v1/chat/completions'
+        end
+        object lblCustomModel: TLabel
+          Left = 310
+          Height = 15
+          Top = 70
+          Width = 120
+          Caption = 'Nome do Modelo:'
+          ParentColor = False
+        end
+        object edtCustomModel: TEdit
+          Left = 310
+          Height = 23
+          Top = 90
+          Width = 200
+          TabOrder = 3
+          Text = 'gpt-4o-mini'
+        end
+        object lblQuestion: TLabel
+          Left = 20
+          Height = 15
+          Top = 125
+          Width = 100
+          Caption = 'Sua Pergunta:'
+          ParentColor = False
+        end
+        object memQuestion: TMemo
+          Left = 20
+          Height = 70
+          Top = 145
+          Width = 490
+          Lines.Strings = (
+            'Olá! Por favor, confirme se você está funcionando respondendo "OK, sistema ativo!".'
+          )
+          TabOrder = 4
+        end
+        object lblResponse: TLabel
+          Left = 20
+          Height = 15
+          Top = 225
+          Width = 100
+          Caption = 'Resposta do Teste:'
+          ParentColor = False
+        end
+        object memResponse: TMemo
+          Left = 20
+          Height = 110
+          Top = 245
+          Width = 490
+          ReadOnly = True
+          ScrollBars = ssAutoVertical
+          TabOrder = 5
+        end
+        object btnSendQuestion: TButton
+          Left = 20
+          Height = 30
+          Top = 370
+          Width = 490
+          Caption = 'Testar Conexão / Enviar Pergunta'
+          OnClick = btnSendQuestionClick
+          TabOrder = 6
+        end
+      end
+      object tsFinished: TTabSheet
+        Caption = 'tsFinished'
+        ClientHeight = 422
+        ClientWidth = 532
+        object lblFinishTitle: TLabel
+          Left = 20
+          Height = 25
+          Top = 30
+          Width = 490
+          Anchors = [akTop, akLeft, akRight]
+          AutoSize = False
+          Caption = 'Instalação Concluída!'
+          Font.Height = -19
+          Font.Style = [fsBold]
+          ParentColor = False
+        end
+        object lblFinishDesc: TLabel
+          Left = 20
+          Height = 80
+          Top = 75
+          Width = 490
+          Anchors = [akTop, akLeft, akRight]
+          AutoSize = False
+          Caption = 'O CAI Neural API foi configurado com sucesso.'#13#10#13#10'Você selecionou a pasta e baixou os arquivos necessários para rodar os exemplos do repositório.'
+          WordWrap = True
+          ParentColor = False
+        end
+      end
+    end
+  end
+  object selectDirDialog: TSelectDirectoryDialog
+    Left = 64
+    Top = 280
+  end
+end

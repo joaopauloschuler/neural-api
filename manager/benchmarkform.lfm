@@ -1,0 +1,152 @@
+object frmBenchmark: TfrmBenchmark
+  Left = 320
+  Height = 480
+  Top = 220
+  Width = 640
+  Caption = 'System Performance & Benchmark'
+  ClientHeight = 480
+  ClientWidth = 640
+  OnCreate = FormCreate
+  OnDestroy = FormDestroy
+  OnShow = FormShow
+  Position = poScreenCenter
+  object pgcBenchmark: TPageControl
+    Left = 10
+    Height = 460
+    Top = 10
+    Width = 620
+    ActivePage = tsPerformance
+    Align = alClient
+    BorderSpacing.Around = 10
+    TabIndex = 0
+    TabOrder = 0
+    object tsPerformance: TTabSheet
+      Caption = 'Performance'
+      ClientHeight = 432
+      ClientWidth = 612
+      object pnlCPU: TPanel
+        Left = 0
+        Height = 210
+        Top = 0
+        Width = 612
+        Align = alTop
+        BevelOuter = bvNone
+        ClientHeight = 210
+        ClientWidth = 612
+        TabOrder = 0
+        object lblCPUTitle: TLabel
+          Left = 10
+          Height = 15
+          Top = 5
+          Width = 150
+          Caption = 'CPU Utilization (60s)'
+          Font.Style = [fsBold]
+          ParentColor = False
+        end
+        object paintBoxCPU: TPaintBox
+          Left = 10
+          Height = 175
+          Top = 25
+          Width = 592
+          Align = alBottom
+          BorderSpacing.Around = 10
+          OnPaint = paintBoxCPUPaint
+        end
+      end
+      object pnlMemory: TPanel
+        Left = 0
+        Height = 222
+        Top = 210
+        Width = 612
+        Align = alClient
+        BevelOuter = bvNone
+        ClientHeight = 222
+        ClientWidth = 612
+        TabOrder = 1
+        object lblMemoryTitle: TLabel
+          Left = 10
+          Height = 15
+          Top = 5
+          Width = 150
+          Caption = 'Memory Utilization (60s)'
+          Font.Style = [fsBold]
+          ParentColor = False
+        end
+        object paintBoxMemory: TPaintBox
+          Left = 10
+          Height = 187
+          Top = 25
+          Width = 592
+          Align = alBottom
+          BorderSpacing.Around = 10
+          OnPaint = paintBoxMemoryPaint
+        end
+      end
+    end
+    object tsProcesses: TTabSheet
+      Caption = 'Running Processes'
+      ClientHeight = 432
+      ClientWidth = 612
+      object lvProcesses: TListView
+        Left = 10
+        Height = 412
+        Top = 10
+        Width = 592
+        Align = alClient
+        BorderSpacing.Around = 10
+        Columns = <        
+          item
+            Caption = 'PID'
+            Width = 60
+          end        
+          item
+            Caption = 'Name'
+            Width = 180
+          end        
+          item
+            Caption = 'CPU %'
+            Width = 70
+          end        
+          item
+            Caption = 'Memory'
+            Width = 90
+          end        
+          item
+            Caption = 'PPID'
+            Width = 60
+          end        
+          item
+            Caption = 'User'
+            Width = 90
+          end>
+        ReadOnly = True
+        RowSelect = True
+        TabOrder = 0
+        ViewStyle = vsReport
+      end
+    end
+    object tsHardware: TTabSheet
+      Caption = 'Hardware Info'
+      ClientHeight = 432
+      ClientWidth = 612
+      object memHardware: TMemo
+        Left = 10
+        Height = 412
+        Top = 10
+        Width = 592
+        Align = alClient
+        BorderSpacing.Around = 10
+        ReadOnly = True
+        ScrollBars = ssAutoVertical
+        TabOrder = 0
+      end
+    end
+  end
+  object timerBenchmark: TTimer
+    Enabled = False
+    Interval = 1000
+    OnTimer = timerBenchmarkTimer
+    Left = 520
+    Top = 40
+  end
+end
