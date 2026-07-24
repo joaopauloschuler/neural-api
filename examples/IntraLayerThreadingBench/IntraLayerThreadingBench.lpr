@@ -12,13 +12,25 @@ IntraLayerThreadingBench: validates the intra-layer threading decision.
     check (threaded output MUST equal serial output - only independent outputs
     are partitioned). It is run twice, once with the low-memory inference
     contract off and once on, since conv/pointwise chunk in both modes.
-  * Experiment B (no longer run - kept in the source for reference) took the
-    small shapes from A and swept them across NN.StartThreadWorkers()
-    policies - hot-core counts 1..4 crossed with cool-down timeouts 0..2
-    seconds - since the small end is where the pool policy actually moves
-    the OFF-vs-ON speedup.
-  * Experiment C (no longer run - kept in the source for reference) timed a
-    few realistic multi-layer nets OFF vs ON end to end.
+  * Experiment B (opt-in) takes the small shapes from A and sweeps them across
+    NN.StartThreadWorkers() policies - hot-core counts 1..4 crossed with
+    cool-down timeouts 0..2 seconds - since the small end is where the pool
+    policy actually moves the OFF-vs-ON speedup.
+  * Experiment C (opt-in) times a few realistic multi-layer nets OFF vs ON end
+    to end.
+  * Experiment D sweeps DEPTH: stacks of K identical FullConnectReLU layers at
+    K = 1,2,4,8,16, then least-squares fits time against K. A parallel pass pays
+    a fixed cost once per FORWARD (plan walk, pool wake, setup/teardown) plus a
+    cost once per LAYER (chunk enqueue + barrier join); Experiment A runs one
+    layer and so fuses the two into a single unreadable number. The fit splits
+    them - intercept = per-pass, slope = per-layer - which is what decides
+    whether a shape A calls a loss (speedup < 1.00x) still loses inside a deep
+    net or wins there because the fixed cost amortises over the stack.
+
+Experiment selection: run with no argument for the default set (A twice, then
+D), or name the experiments to run as arguments, e.g. "IntraLayerThreadingBench
+D" for the depth sweep alone. A is minutes of wall clock, so selecting D on its
+own is what makes the depth sweep iterable.
 
 ChunkEligible returns true for every size, so a parallel pass always chunks.
 Experiment A measures where that pays: the tiny shapes at the top of each block
@@ -807,10 +819,227 @@ begin
   MyIn.Free;
 end;
 
+// =============================== Experiment D =================================
+// Depth sweep: separates the two halves of the scheduler overhead that a
+// SINGLE-layer measurement (Experiment A) fuses into one number.
+//
+// A parallel pass pays:
+//   F - once per forward pass: plan walk, pool wake, pass setup/teardown.
+//   L - once per LAYER: enqueue the layer's chunks, join the chunk barrier.
+// Experiment A only ever runs one layer, so its "on ms" is F + L + compute/S
+// and cannot tell F from L. That matters: a straight-line stack of K layers
+// pays F once but L K times, so if the overhead is mostly F the small shapes
+// that lose in A (speedup < 1.00x) can still WIN inside a real net, while if it
+// is mostly L their A verdict carries over unchanged.
+//
+// The separation is a straight line. Timing the SAME layer shape at depths
+// K = 1, 2, 4, 8, 16 gives
+//   on(K)  = F + K * (L + compute/S)      -> intercept F, slope perLayerOn
+//   off(K) = ~0 + K * compute             -> slope perLayerOff
+// so a least-squares fit over K yields F directly, and the slope ratio
+// perLayerOff / perLayerOn is the speedup this shape converges to in a deep
+// net - the number to compare against A's single-layer column.
+//
+// The stack is deliberately straight-line (no branches): scheduler width for
+// cross-layer purposes is 1 and "gain bound" stays 1.00x, so every bit of gain
+// measured here comes from intra-layer chunking and nothing else.
+const
+  SHAPESET_D = 'D/v1';
+  // Depths fitted per shape. Must stay >= 2 points for a fit; the spread is
+  // geometric so the intercept is not dominated by the deep end.
+  DEPTHS: array[0..4] of integer = (1, 2, 4, 8, 16);
+  DEPTH_COUNT = Length(DEPTHS);
+  // Depth the amortised-speedup column reports at (a small-transformer-ish
+  // block count - the depth the brainstorm question was asked about).
+  REPORT_DEPTH = 10;
+
+// K stacked FullConnectReLU(Width) layers over a Width-wide input: the
+// Experiment A "FC WxW" shape, repeated. InitDefault per layer so the weights
+// are realistic (a zeroed matrix can be optimised differently by the memory
+// subsystem).
+function BuildFCStack(Width, Depth: integer): TNNet;
+var NN: TNNet; i: integer;
+begin
+  NN := TNNet.Create();
+  NN.AddLayer(TNNetInput.Create(Width));
+  for i := 0 to Depth - 1 do NN.AddLayer(TNNetFullConnectReLU.Create(Width));
+  for i := 0 to NN.CountLayers - 1 do NN.Layers[i].InitDefault();
+  // Inference-only contract, the same one Experiment A times the ON case under.
+  NN.SetTrainable(False, {pLowMemory=}False);
+  Result := NN;
+end;
+
+// Ordinary least squares of Y on X (Y = A + B*X), plus R2 as a fit-quality
+// guard: this box is noisy and a depth sweep is only readable while the points
+// really are collinear. R2 well below 1 means the run was too noisy to trust
+// the intercept, NOT that the model is wrong.
+procedure LinFit(const X, Y: array of double; N: integer;
+  out A, B, R2: double);
+var
+  i: integer;
+  SX, SY, SXX, SXY, MeanY, SSTot, SSRes, Pred, Den: double;
+begin
+  A := 0; B := 0; R2 := 0;
+  if N < 2 then exit;
+  SX := 0; SY := 0; SXX := 0; SXY := 0;
+  for i := 0 to N - 1 do
+  begin
+    SX := SX + X[i]; SY := SY + Y[i];
+    SXX := SXX + X[i] * X[i]; SXY := SXY + X[i] * Y[i];
+  end;
+  Den := N * SXX - SX * SX;
+  if Abs(Den) < 1e-12 then exit;
+  B := (N * SXY - SX * SY) / Den;
+  A := (SY - B * SX) / N;
+  MeanY := SY / N;
+  SSTot := 0; SSRes := 0;
+  for i := 0 to N - 1 do
+  begin
+    Pred := A + B * X[i];
+    SSTot := SSTot + Sqr(Y[i] - MeanY);
+    SSRes := SSRes + Sqr(Y[i] - Pred);
+  end;
+  if SSTot > 0 then R2 := 1 - SSRes / SSTot else R2 := 1;
+end;
+
+// One shape width: time every depth OFF and ON, print the raw points, then fit.
+// Returns nothing - the fit summary is printed per width and the cross-width
+// reading is the printed table.
+procedure DepthSweepOne(Width: integer);
+var
+  di, i, DepthK: integer;
+  NN: TNNet;
+  MyIn: TNNetVolume;
+  OutSerial: TNNetVolume;
+  Ts, Tt, sp, d, maxdiff: double;
+  XD, YOff, YOn: array[0..DEPTH_COUNT - 1] of double;
+  FOff, BOff, R2Off, FOn, BOn, R2On: double;
+  LastStats: string;
+  AmortOff, AmortOn: double;
+begin
+  LastStats := '(none)';
+  for di := 0 to DEPTH_COUNT - 1 do
+  begin
+    DepthK := DEPTHS[di];
+    NN := BuildFCStack(Width, DepthK);
+    MyIn := TNNetVolume.Create(NN.Layers[0].Output);
+    MyIn.Randomize();
+
+    // Serial reference plus the parity snapshot (chunking splits independent
+    // output neurons, so a stack must still match the serial pass element for
+    // element - a mismatch here would mean a chunk boundary corrupted a layer's
+    // input for the next one).
+    NN.Compute(MyIn, 0, {parallel=}false);
+    OutSerial := TNNetVolume.Create(NN.GetLastLayer().Output);
+    Ts := BestTimeMs(NN, MyIn, {parallel=}false);
+
+    NN.StartThreadWorkers();   // keep the pool hot across the timed passes
+    NN.Compute(MyIn, 0, {parallel=}true);
+    maxdiff := 0;
+    for i := 0 to OutSerial.Size - 1 do
+    begin
+      d := Abs(OutSerial.FData[i] - NN.GetLastLayer().Output.FData[i]);
+      if d > maxdiff then maxdiff := d;
+    end;
+    NN.ResetSchedulerStats();  // count only this depth's timed parallel passes
+    Tt := BestTimeMs(NN, MyIn, {parallel=}true);
+    LastStats := NN.SchedulerStatsReport();
+
+    if Tt > 0 then sp := Ts / Tt else sp := 0;
+    WriteLn(Format('  %-10s depth %-3d %9.3f %9.3f %7.2fx %9.2g',
+      ['FC ' + IntToStr(Width), DepthK, Ts, Tt, sp, maxdiff]));
+
+    XD[di] := DepthK; YOff[di] := Ts; YOn[di] := Tt;
+
+    OutSerial.Free;
+    MyIn.Free;
+    NN.Free;
+  end;
+  WriteLn('      deepest stack: ', LastStats);
+
+  LinFit(XD, YOff, DEPTH_COUNT, FOff, BOff, R2Off);
+  LinFit(XD, YOn,  DEPTH_COUNT, FOn,  BOn,  R2On);
+  // Intercept = per-PASS fixed cost, slope = per-LAYER marginal cost. The OFF
+  // intercept is the control: the serial path has no pass setup, so a non-zero
+  // OFF intercept is measurement noise and sets the scale for how much of the
+  // ON intercept to believe.
+  WriteLn(Format('      fit OFF: %.4f ms/pass + %.4f ms/layer  (R2 %.4f)',
+    [FOff, BOff, R2Off]));
+  WriteLn(Format('      fit ON : %.4f ms/pass + %.4f ms/layer  (R2 %.4f)',
+    [FOn, BOn, R2On]));
+  // Slope ratio = the speedup a DEEP stack of this shape converges to, with the
+  // once-per-pass cost fully amortised away. This is the number Experiment A's
+  // single-layer column understates.
+  if BOn > 0 then
+    WriteLn(Format('      per-layer speedup (deep-stack limit): %.2fx', [BOff / BOn]))
+  else
+    WriteLn('      per-layer speedup: n/a (non-positive ON slope)');
+  AmortOff := FOff + REPORT_DEPTH * BOff;
+  AmortOn := FOn + REPORT_DEPTH * BOn;
+  if AmortOn > 0 then
+    WriteLn(Format('      predicted at depth %d: off %.3f  on %.3f  %.2fx',
+      [REPORT_DEPTH, AmortOff, AmortOn, AmortOff / AmortOn]));
+  WriteLn;
+end;
+
+// The widths swept. They straddle Experiment A's single-layer crossover (which
+// on the reference box sits between 512 at 0.71x and 768 at 1.74x), so the
+// table shows both a shape that A calls a loss and shapes A calls a win - and
+// whether depth moves that verdict.
+procedure ExperimentD;
+begin
+  WriteLn('=== Experiment D: depth sweep  (per-pass vs per-layer overhead) ===');
+  WriteLn('Cores (NeuralDefaultThreadCount) = ', NeuralDefaultThreadCount(),
+    '   shapeset ', SHAPESET_D);
+  WriteLn('build: ', BuildTag);
+  WriteLn('Stacks of K identical FullConnectReLU layers, K = 1,2,4,8,16.');
+  WriteLn('on(K) = F + K*(L + compute/S): the intercept is the once-per-PASS');
+  WriteLn('cost, the slope the once-per-LAYER cost. Experiment A measures only');
+  WriteLn('K=1 and so charges the whole intercept to a single layer.');
+  WriteLn(Format('  %-10s %-9s %9s %9s %8s %9s',
+    ['shape', 'depth', 'off ms', 'on ms', 'speedup', 'maxdiff']));
+  WriteLn(StringOfChar('-', 62));
+  DepthSweepOne(256);
+  DepthSweepOne(512);
+  DepthSweepOne(768);
+  DepthSweepOne(1024);
+  WriteLn('Reading: if the ON intercept dominates, small shapes that lose in');
+  WriteLn('Experiment A still pay off inside a deep net (the fixed cost is paid');
+  WriteLn('once per forward, not once per layer) and the crossover width moves');
+  WriteLn('down. If the ON slope dominates, A''s per-shape verdicts carry over');
+  WriteLn('to deep nets unchanged. Weights grow with depth (K*W*W*4 bytes), so');
+  WriteLn('the deep points also leave cache - part of the OFF slope is DRAM,');
+  WriteLn('not scheduling. Confirm on a quiet box before drawing conclusions.');
+  WriteLn;
+end;
+
+// Experiment selection: no argument runs the default set (A twice, then D);
+// otherwise each argument names one experiment to run, e.g. "D" for the depth
+// sweep alone. Experiment A is minutes of wall clock, so being able to ask for
+// D on its own is what makes the depth sweep iterable.
+function WantsExperiment(const Which: string): boolean;
+var i: integer;
+begin
+  if ParamCount = 0 then
+  begin
+    Result := (Which = 'A') or (Which = 'D');
+    exit;
+  end;
+  Result := false;
+  for i := 1 to ParamCount do
+    if UpperCase(ParamStr(i)) = Which then
+    begin
+      Result := true;
+      exit;
+    end;
+end;
+
 var
   AggMemOff, AggMemOn: TAggr;
 begin
   Randomize;
+  if WantsExperiment('A') then
+  begin
   // Experiment A is run twice: once with the low-memory inference contract off
   // (concatenated-weight caches kept) and once with it on (caches released,
   // per-neuron ranged path). Conv/pointwise chunk in both modes, so the two
@@ -831,24 +1060,12 @@ begin
     ['ON / OFF cost',
      AggrOff(AggMemOn) / Max(AggrOff(AggMemOff), 1e-6),
      AggrOn(AggMemOn) / Max(AggrOn(AggMemOff), 1e-6)]));
-  // Experiments B (pool-policy sweep) and C (end-to-end nets) are no longer
-  // relevant; kept in the source for reference but not run.
-  // ExperimentB;
-  // WriteLn('=== Experiment C: realistic nets  threading OFF vs ON (end-to-end) ===');
-  // SweepNet('small GPT MLP', 512,  2048, 6, 8);
-  // SwiGLU-FFN stack (RoPE + per-block RMSNorm -> up-proj -> SwiGLU ->
-  // down-proj): the end-to-end probe for the token-layer ComputeRange work.
-  // seq=8 is prefill-like; seq=1 is the KV-cache decode shape where the token
-  // layers need a finer-than-token chunk axis to thread at all.
-  // SweepNet('GPT SwiGLU FFN', 512,  2048, 6, 8, {UseSwiGLU=}true);
-  // SweepNet('SwiGLU 1-token', 1024, 4096, 4, 1, {UseSwiGLU=}true);
-  // SweepNet('mid GPT MLP',   768,  3072, 6, 16);
-  // SweepNet('wide 1-token',  2048, 8192, 4, 1);
   WriteLn;
   WriteLn('speedup > 1.00x => chunking that shape pays off on this box;');
   WriteLn('<= 1.00x on a SINGLE-layer shape overstates the in-net cost: the');
   WriteLn('scheduler pass overhead charged here to one layer is paid once per');
-  WriteLn('forward in a real net - validate borderline shapes on a real model.');
+  WriteLn('forward in a real net - Experiment D measures how much of it is');
+  WriteLn('per-pass; validate borderline shapes on a real model.');
   WriteLn;
   WriteLn('Summary rows are GEOMETRIC means, so every shape counts equally and');
   WriteLn('the summary speedup equals the geomean of the per-shape speedups.');
@@ -857,4 +1074,22 @@ begin
   WriteLn('ms figures compare across boxes only for the SAME shapeset version;');
   WriteLn('GOP/s is an approximate work proxy (element-wise layer op weights are');
   WriteLn('estimates) - read it within a family, not as a certified FLOP rate.');
+  WriteLn;
+  end;  // Experiment A
+  if WantsExperiment('B') then ExperimentB;
+  if WantsExperiment('C') then
+  begin
+    WriteLn('=== Experiment C: realistic nets  threading OFF vs ON (end-to-end) ===');
+    SweepNet('small GPT MLP', 512,  2048, 6, 8);
+    // SwiGLU-FFN stack (RoPE + per-block RMSNorm -> up-proj -> SwiGLU ->
+    // down-proj): the end-to-end probe for the token-layer ComputeRange work.
+    // seq=8 is prefill-like; seq=1 is the KV-cache decode shape where the token
+    // layers need a finer-than-token chunk axis to thread at all.
+    SweepNet('GPT SwiGLU FFN', 512,  2048, 6, 8, {UseSwiGLU=}true);
+    SweepNet('SwiGLU 1-token', 1024, 4096, 4, 1, {UseSwiGLU=}true);
+    SweepNet('mid GPT MLP',   768,  3072, 6, 16);
+    SweepNet('wide 1-token',  2048, 8192, 4, 1);
+    WriteLn;
+  end;
+  if WantsExperiment('D') then ExperimentD;
 end.
