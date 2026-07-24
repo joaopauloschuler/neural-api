@@ -138,6 +138,44 @@ begin
     {$I %FPCTARGETOS%} + '-' + {$I %FPCTARGETCPU%};
 end;
 
+// Every experiment names its shapes with the same abbreviations and opens by
+// calling this, so a pasted result block is readable on its own without the
+// source next to it. It prints on the FIRST call only - Experiment A alone runs
+// twice (once per memory mode), and a legend repeated between every table is
+// noise rather than help. The chunk axis is the part that matters: it is the
+// index space ComputeRange is handed, so it decides both how many chunks a layer
+// can be split into (capped at min(workers, axis length)) and how much work each
+// chunk carries.
+var
+  LegendDone: boolean = false;
+
+procedure WriteLegend;
+begin
+  if LegendDone then exit;
+  LegendDone := true;
+  WriteLn('legend - shape name, layer class, and the axis its chunks split:');
+  WriteLn('  FC in x out       TNNetFullConnect      splits OUTPUT NEURONS');
+  WriteLn('  Pw XxYxD->F       TNNetPointwiseConv    splits OUTPUT POSITIONS,');
+  WriteLn('  Conv XxXxD kK     TNNetConvolution        falling back to output');
+  WriteLn('                                            neurons once the grid is');
+  WriteLn('                                            too small to fill the pool');
+  WriteLn('                                            (ChunkOverNeurons; seq=1)');
+  WriteLn('  Dw sN dC kK       TNNetDepthwiseConv1D  splits CHANNELS (C)');
+  WriteLn('  GDN sN hHk/Hv dD  TNNetGatedDeltaNet    splits K-HEADS (Hk), so its');
+  WriteLn('                                            chunk count cannot exceed');
+  WriteLn('                                            Hk however many workers');
+  WriteLn('                                            are free');
+  WriteLn('  SwiGLU sN dD      TNNetSwiGLU           splits OUTPUT ELEMENTS');
+  WriteLn('  RMSN sN dD        TNNetTokenRMSNorm     splits TOKENS');
+  WriteLn('  RoPE sN dD        TNNetRotaryEmbedding  splits ROTATION PAIRS');
+  WriteLn('  name parts: sN = sequence length N (s1 = one-token decode shape),');
+  WriteLn('    dD = depth/channels, kK = kernel taps, hHk/Hv = k-heads/v-heads,');
+  WriteLn('    "up"/"dn" = widening/narrowing FC. A "Dec" suffix on the layer');
+  WriteLn('    name (DwDec, GDNDec) drives the stateful incremental-decode');
+  WriteLn('    kernel rather than the full-sequence one; "ctl" marks a control');
+  WriteLn('    stack that exists to be subtracted from the row above it.');
+end;
+
 // Geometric-mean accumulator. Times across the sweep span orders of magnitude
 // (a 64x64 FC against a 512-token GDN), so an arithmetic mean would report the
 // largest shape and nothing else. The geomean weights every shape equally and
@@ -429,8 +467,9 @@ begin
   WriteLn('Cores (NeuralDefaultThreadCount) = ', NeuralDefaultThreadCount(),
     '   shapeset ', SHAPESET_A, ' (', Length(ShA), ' shapes)');
   WriteLn('build: ', BuildTag);
-  WriteLn('FC/PW/Conv/Dw/GDN: every size is chunk-eligible; ',
-    'SwiGLU/RMSN/RoPE show their current verdict');
+  WriteLegend;
+  WriteLn('FC/Pw/Conv/Dw/GDN are chunk-eligible at every size; SwiGLU/RMSN/RoPE');
+  WriteLn('show whatever their current ChunkEligible verdict is.');
   WriteLn(Format('%-20s %8s %6s %9s %9s %8s %7s %9s',
     ['shape', 'neurons', 'elig?', 'off ms', 'on ms', 'speedup',
      'chunks', 'maxdiff']));
@@ -1114,7 +1153,9 @@ end;
 procedure SweepFC(Width: integer);
 var S: TEShape; BOff, BOn: double;
 begin
-  S.Name := 'FC ' + IntToStr(Width);
+  // Square, so the name carries both dimensions the legend's "FC in x out"
+  // promises rather than a bare width.
+  S.Name := Format('FC %dx%d', [Width, Width]);
   S.Kind := EK_FC; S.Seq := 1;
   S.P1 := Width; S.P2 := 0; S.P3 := 0;
   S.Decode := false;
@@ -1127,6 +1168,7 @@ begin
   WriteLn('Cores (NeuralDefaultThreadCount) = ', NeuralDefaultThreadCount(),
     '   shapeset ', SHAPESET_D);
   WriteLn('build: ', BuildTag);
+  WriteLegend;
   WriteLn('Stacks of K identical FullConnectReLU layers, K = 1,2,4,8,16.');
   WriteLn('on(K) = F + K*(L + compute/S): the intercept is the once-per-PASS');
   WriteLn('cost, the slope the once-per-LAYER cost. Experiment A measures only');
@@ -1218,6 +1260,7 @@ begin
   WriteLn('Cores (NeuralDefaultThreadCount) = ', NeuralDefaultThreadCount(),
     '   shapeset ', SHAPESET_E);
   WriteLn('build: ', BuildTag);
+  WriteLegend;
   WriteLn('DepthwiseConv1D chunks on channels, GatedDeltaNet on k-heads (4..8),');
   WriteLn('so unlike Experiment D''s FullConnect the chunk count can fall short');
   WriteLn('of the worker count. GDN rows are followed by a control stack with');
@@ -1228,11 +1271,11 @@ begin
   // DepthwiseConv1D: channel axis is wide, so the probe is per-chunk work.
   // Decode (Seq=1) is the ChatTerminal path; the Seq=64 row is the same layer
   // with 64x the work per chunk and nothing else changed.
-  AddE(S, 'Dw1D c512 k4 dec', EK_DW, 1, 512, 4, 0, true);
+  AddE(S, 'DwDec s1 d512 k4', EK_DW, 1, 512, 4, 0, true);
   DepthSweepShape(S, BOff, BOn);
-  AddE(S, 'Dw1D c2048 k4 dec', EK_DW, 1, 2048, 4, 0, true);
+  AddE(S, 'DwDec s1 d2048 k4', EK_DW, 1, 2048, 4, 0, true);
   DepthSweepShape(S, BOff, BOn);
-  AddE(S, 'Dw1D c512 k4 s64', EK_DW, 64, 512, 4, 0, false);
+  AddE(S, 'Dw s64 d512 k4', EK_DW, 64, 512, 4, 0, false);
   DepthSweepShape(S, BOff, BOn);
 
   // GatedDeltaNet: 4 k-heads cannot fill an 8-worker pool; 8 k-heads can. That
@@ -1240,8 +1283,8 @@ begin
   // out-projection is quadratic in it (input depth 2*Hk*D + 2*Hv*D + 2*Hv), and
   // at D=128 the projection costs enough to dominate the block it is only meant
   // to be a control for.
-  SweepGdnPair('GDN h4/8 d64 dec', 1, 4, 8, 64, true);
-  SweepGdnPair('GDN h8/8 d64 dec', 1, 8, 8, 64, true);
+  SweepGdnPair('GDNDec s1 h4/8 d64', 1, 4, 8, 64, true);
+  SweepGdnPair('GDNDec s1 h8/8 d64', 1, 8, 8, 64, true);
 
   WriteLn('Reading: the per-layer (deep-stack limit) speedup is the verdict -');
   WriteLn('below 1.00x the layer''s chunking costs more than it saves and no');
