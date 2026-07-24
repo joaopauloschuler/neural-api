@@ -3371,6 +3371,35 @@ begin
   if Lo < iHi then QuickSortTokenArray(A, Lo, iHi);
 end;
 
+// In-place quicksort of the index array Order so that Dist[Order[0..]] ends up
+// ascending. Sorts the caller's existing Order/Dist buffers by reference and
+// recurses on the CPU stack only, so it adds no heap allocation (rule #17). Used
+// by SampleTypical to replace an O(N^2) selection sort over the full vocab.
+procedure QuickSortOrderByDist(var Order: array of integer;
+  const Dist: array of TNeuralFloat; iLo, iHi: Integer);
+var
+  Lo, Hi, T: Integer;
+  Mid: TNeuralFloat;
+begin
+  Lo := iLo;
+  Hi := iHi;
+  Mid := Dist[Order[(Lo + Hi) shr 1]];
+  repeat
+    while Dist[Order[Lo]] < Mid do Inc(Lo);
+    while Dist[Order[Hi]] > Mid do Dec(Hi);
+    if Lo <= Hi then
+    begin
+      T := Order[Lo];
+      Order[Lo] := Order[Hi];
+      Order[Hi] := T;
+      Inc(Lo);
+      Dec(Hi);
+    end;
+  until Lo > Hi;
+  if Hi > iLo then QuickSortOrderByDist(Order, Dist, iLo, Hi);
+  if Lo < iHi then QuickSortOrderByDist(Order, Dist, Lo, iHi);
+end;
+
 { TNNetSamplerTopP }
 
 constructor TNNetSamplerTopP.Create(TopP: TNeuralFloat);
@@ -3633,10 +3662,10 @@ end;
 
 function TNNetSamplerTypical.SampleTypical(): integer;
 var
-  Entropy, P, Surprise, KeptSum, Roll, Cumulative, best: TNeuralFloat;
+  Entropy, P, Surprise, KeptSum, Roll, Cumulative: TNeuralFloat;
   Dist: array of TNeuralFloat; // |surprise - entropy| per FTokenArr entry
   Order: array of integer;     // FTokenArr indices sorted by ascending Dist
-  I, J, KeptCount, KeptCountM1, Tmp, N, NM1, NM2, JStart: integer;
+  I, KeptCount, KeptCountM1, N, NM1: integer;
 begin
   N := FCount;
   if N = 0 then
@@ -3645,7 +3674,6 @@ begin
     exit;
   end;
   NM1 := N - 1;
-  NM2 := N - 2;
   // Conditional (Shannon) entropy of the row, in nats.
   Entropy := 0;
   for I := 0 to NM1 do
@@ -3667,19 +3695,10 @@ begin
     Dist[I] := Abs(Surprise - Entropy);
     Order[I] := I;
   end;
-  // Selection sort of Order by ascending Dist (vocab-sized but only run once
-  // per step; mirrors the simple sort style used elsewhere in this unit).
-  for I := 0 to NM2 do
-  begin
-    JStart := I + 1;
-    best := Dist[Order[I]]; // #4: pivot keyed value, refreshed on swap
-    for J := JStart to NM1 do
-      if Dist[Order[J]] < best then
-      begin
-        Tmp := Order[I]; Order[I] := Order[J]; Order[J] := Tmp;
-        best := Dist[Order[I]];
-      end;
-  end;
+  // Sort Order by ascending Dist in O(N log N) with an in-place quicksort over
+  // the existing index buffer (no heap allocation, rule #17), replacing the
+  // former O(N^2) selection sort over the full vocab.
+  if N > 1 then QuickSortOrderByDist(Order, Dist, 0, NM1);
   // Smallest prefix (by ascending distance) whose cumulative mass reaches FMass.
   KeptCount := 0;
   KeptSum := 0;
