@@ -468,8 +468,8 @@ begin
     '   shapeset ', SHAPESET_A, ' (', Length(ShA), ' shapes)');
   WriteLn('build: ', BuildTag);
   WriteLegend;
-  WriteLn('FC/Pw/Conv/Dw/GDN are chunk-eligible at every size; SwiGLU/RMSN/RoPE');
-  WriteLn('show whatever their current ChunkEligible verdict is.');
+  WriteLn('The elig? column is the live ChunkEligible verdict. FC and Dw carry a');
+  WriteLn('minimum-work bar, so their narrow shapes read no and run whole-layer.');
   WriteLn(Format('%-20s %8s %6s %9s %9s %8s %7s %9s',
     ['shape', 'neurons', 'elig?', 'off ms', 'on ms', 'speedup',
      'chunks', 'maxdiff']));
