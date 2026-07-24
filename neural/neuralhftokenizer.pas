@@ -156,6 +156,7 @@ type
       FUnigram: boolean;          // model.type = Unigram
       FUniScore: array of double; // per-id piece log-prob (score), id-indexed
       FUniMinScore: double;       // min vocab score (unk penalty base)
+      FUniMaxPieceChars: integer; // longest vocab piece in codepoints (Viterbi look-back bound)
       // WordPiece (BERT) family
       FWordPiece: boolean;        // model.type = WordPiece
       FWPPrefix: string;          // continuing_subword_prefix ('##')
@@ -505,6 +506,21 @@ begin
       Exit(B); // truncated/invalid sequence
     Result := (Result shl 6) or (cardinal(Ord(S[Position])) and $3F);
     Inc(Position);
+  end;
+end;
+
+// Number of Unicode codepoints in S (same segmentation NextCodePoint uses).
+function CodePointCount(const S: string): integer;
+var
+  Position, Len: integer;
+begin
+  Result := 0;
+  Position := 1;
+  Len := Length(S);
+  while Position <= Len do
+  begin
+    NextCodePoint(S, Position);
+    Inc(Result);
   end;
 end;
 
@@ -1154,6 +1170,7 @@ begin
   FFuseUnk := false;
   FIgnoreMerges := false;
   FUnigram := false;
+  FUniMaxPieceChars := 1;
   SetLength(FUniScore, 0);
   FUniMinScore := 0;
   FByteLevel := false;
@@ -1438,7 +1455,7 @@ var
   VocabObj: TJSONObject;
   MergesArr, AddedArr, SubArr, VocabArr: TJSONArray;
   FS: TFileStream;
-  Cnt, TokenId, MaxId: integer;
+  Cnt, TokenId, MaxId, UniCPLen: integer;
   VocabCnt, VocabObjCnt, MergesCnt, AddedCnt: integer;
   VocabCntM1, VocabObjCntM1, AddedCntM1: integer;
   Score: double;
@@ -1831,6 +1848,7 @@ begin
       SetLength(FIdToToken, VocabCnt);
       SetLength(FUniScore, VocabCnt);
       FUniMinScore := 0;
+      FUniMaxPieceChars := 1;
       VocabCntM1 := VocabCnt - 1;
       for Cnt := 0 to VocabCntM1 do
       begin
@@ -1841,6 +1859,8 @@ begin
         FIdToToken[Cnt] := Content;
         FUniScore[Cnt] := Score;
         if (Cnt = 0) or (Score < FUniMinScore) then FUniMinScore := Score;
+        UniCPLen := CodePointCount(Content);
+        if UniCPLen > FUniMaxPieceChars then FUniMaxPieceChars := UniCPLen;
       end;
       // unk_id is an INDEX into the vocab array (not a token string).
       Node := ModelObj.Find('unk_id');
@@ -2113,7 +2133,7 @@ var
   PieceCountM1: integer;
   ModelType: integer;           // trainer_spec.model_type (default UNIGRAM)
   SpmUnk, SpmBos, SpmEos: integer;
-  Cnt: integer;
+  Cnt, UniCPLen: integer;
   Score: single;
 
   // Reads a base-128 varint at Pos (0-based into Buf), advances Pos.
@@ -2314,6 +2334,7 @@ begin
   SetLength(FIdToToken, PieceCount);
   SetLength(FUniScore, PieceCount);
   FUniMinScore := 0;
+  FUniMaxPieceChars := 1;
   FByteFallback := false;
   PieceCountM1 := PieceCount - 1;
   for Cnt := 0 to PieceCountM1 do
@@ -2322,6 +2343,8 @@ begin
     FIdToToken[Cnt] := PieceTextV[Cnt];
     if (Cnt = 0) or (FUniScore[Cnt] < FUniMinScore) then
       FUniMinScore := FUniScore[Cnt];
+    UniCPLen := CodePointCount(PieceTextV[Cnt]);
+    if UniCPLen > FUniMaxPieceChars then FUniMaxPieceChars := UniCPLen;
     // SentencePiece BYTE pieces (type 6) are the <0x00>..<0xFF> byte-
     // fallback alphabet. Their presence means byte_fallback=true: unknown
     // bytes route through <0xNN> on encode and those pieces decode back to
@@ -2400,6 +2423,7 @@ var
   TokType: integer;
   Content, MergeStr, Left, Right: string;
   SpacePos: integer;
+  UniCPLen: integer;
   MetaBos, MetaEos, MetaUnk: Int64;
 begin
   ClearState();
@@ -2425,11 +2449,14 @@ begin
 
     // ---- vocab (the 0-based array index IS the id) ----
     SetLength(FIdToToken, TokCount);
+    FUniMaxPieceChars := 1;
     for Cnt := 0 to TokCountM1 do
     begin
       Content := Reader.GetMetaArrayString('tokenizer.ggml.tokens', Cnt);
       FVocab.AddObject(Content, TObject(PtrInt(Cnt)));
       FIdToToken[Cnt] := Content;
+      UniCPLen := CodePointCount(Content);
+      if UniCPLen > FUniMaxPieceChars then FUniMaxPieceChars := UniCPLen;
     end;
 
     // ---- special-token ids (authoritative scalar metadata) ----
@@ -3639,7 +3666,7 @@ var
   SegId: array of integer;    // backtracked ids, collected in reverse
   SegStart: array of integer; // backtracked start CHAR index of each segment
   Total, Position, SegCnt, I, J, BestPrev, TokenId: integer;
-  JM1, CPJ, CPI, PieceLen: integer;
+  JM1, CPJ, CPI, PieceLen, IStart: integer;
   BSI: double;
   BestScore: array of double; // best score to reach char-boundary J (0..Total)
   BackPtr: array of integer;  // start char index of the piece ending at J
@@ -3715,7 +3742,13 @@ begin
   begin
     JM1 := J - 1;
     CPJ := CPStart[J]; // #17: invariant across the inner I loop
-    for I := 0 to JM1 do
+    // A span of (J - I) chars longer than the longest vocab piece can never be
+    // found by VocabFind; the only node that fires past that width is the
+    // single-char unk at I = J-1, which stays in range since FUniMaxPieceChars
+    // >= 1. Bounding the look-back turns the DP from O(n^2) into O(n*L).
+    IStart := J - FUniMaxPieceChars;
+    if IStart < 0 then IStart := 0;
+    for I := IStart to JM1 do
     begin
       BSI := BestScore[I]; // #4: bound once per I iteration
       if BSI = NegInfinity then continue;
