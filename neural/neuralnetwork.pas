@@ -31125,7 +31125,7 @@ var
   SeqLenM1, DkM1: integer;
   AttnRow, AttnIdx: integer;
   RowStride, TwoFDk, posK, posV: integer;
-  Score, MaxScore, SumExp: TNeuralFloat;
+  Score, MaxScore, SumExp, A: TNeuralFloat;
   Prev, Seg: TNNetVolume;
   OutPtr, QueryPtr: TNeuralFloatArrPtr;
   SegI: integer;
@@ -31245,9 +31245,14 @@ begin
     posV := TwoFDk;                       // j=0 V offset (#12)
     for j := 0 to SeqLenM1 do
     begin
-      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV),
-        FAttn.FData[AttnRow + j], FDk);
-      Inc(posV, RowStride);
+      // A masked key scored -1e9, whose exp underflows to EXACTLY 0 (and an
+      // all-masked row was zero-filled), so its length-FDk AVX MulAdd adds a
+      // provable zero. Under a causal mask that is about half the keys: skip
+      // them. Same idiom as the "if dS <> 0" guard in the backward pass.
+      A := FAttn.FData[AttnRow + j];
+      if A <> 0 then
+        TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV), A, FDk);
+      Inc(posV, RowStride);               // advance unconditionally (#12)
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -31289,9 +31294,9 @@ var
   SeqLen, i, j, d, j0, jEnd: integer;
   SeqLenM1, DkM1: integer;
   RowStride, TwoFDk, posK, posV: integer;
-  Score, MRun, MNew, LRun, Alpha, Eg: TNeuralFloat;
+  Score, MRun, LRun, Alpha, Eg: TNeuralFloat;
   Prev: TNNetVolume;
-  OutPtr, VPtr, QueryPtr: TNeuralFloatArrPtr;
+  OutPtr, QueryPtr: TNeuralFloatArrPtr;
 begin
   // v1 scope guard: only the plain scaled-dot-product softmax with the static
   // causal / window masks. Anything else (soft-cap, segment/document, prefix-LM,
@@ -31339,22 +31344,29 @@ begin
         begin
           Score := TNNetVolume.DotProduct(
             QueryPtr, Prev.GetRawPtr(posK), FDk) * FInvSqrtDk;
-          // Online-softmax update with this single key's score.
-          if Score > MRun then MNew := Score else MNew := MRun;
-          if MRun = -1e30 then
-            Alpha := 0            // first unmasked key: nothing to rescale yet
-          else
-            Alpha := NeuralExp(MRun - MNew);
-          Eg := NeuralExp(Score - MNew);
-          LRun := LRun * Alpha + Eg;
-          VPtr := Prev.GetRawPtr(posV);
-          // FTileAcc[d] := FTileAcc[d]*Alpha + Eg*VPtr[d] over the depth-contiguous
-          // head-dim span: an in-place AVX rescale followed by a fused
-          // multiply-add (FTileAcc += VPtr*Eg). Only this accumulate is
-          // vectorized; the exp/max transcendental work above stays scalar.
-          TNNetVolume.Mul(TNeuralFloatArrPtr(@FTileAcc[0]), Alpha, FDk);
-          TNNetVolume.MulAdd(TNeuralFloatArrPtr(@FTileAcc[0]), VPtr, Eg, FDk);
-          MRun := MNew;
+          // Online-softmax update with this single key's score. The running
+          // state only needs rescaling when this key RAISES the running max;
+          // otherwise the rescale factor is exp(0) = 1, so both the exp and the
+          // length-FDk AVX Mul by 1.0 are pure overhead. Guarding them keeps the
+          // recurrence identical and removes them from the common case.
+          if Score > MRun then
+          begin
+            if MRun = -1e30 then
+              Alpha := 0          // first unmasked key: nothing to rescale yet
+            else
+              Alpha := NeuralExp(MRun - Score);
+            LRun := LRun * Alpha;
+            // In-place AVX rescale of the running accumulator by Alpha.
+            TNNetVolume.Mul(TNeuralFloatArrPtr(@FTileAcc[0]), Alpha, FDk);
+            MRun := Score;
+          end;
+          Eg := NeuralExp(Score - MRun);
+          LRun := LRun + Eg;
+          // FTileAcc[d] += Eg*V[j,d] over the depth-contiguous head-dim span:
+          // a fused AVX multiply-add. Only this accumulate is vectorized; the
+          // exp/max transcendental work above stays scalar.
+          TNNetVolume.MulAdd(TNeuralFloatArrPtr(@FTileAcc[0]),
+            Prev.GetRawPtr(posV), Eg, FDk);
         end;
         // Advance unconditionally so masked keys keep the offsets in step (#12).
         Inc(posK, RowStride);
@@ -31426,11 +31438,21 @@ begin
       posV := 2 * FDk;                              // j=0 offset (#12)
       for j := 0 to SeqLenM1 do
       begin
+        // A masked key's attention weight is EXACTLY 0 (its -1e9 score's exp
+        // underflows; an all-masked row was zero-filled), so both the dV
+        // MulAdd and dAttn[j] are dead: the MulAdd adds zero, and dAttn[j] is
+        // only ever consumed multiplied by that same zero weight (the
+        // SumDAttnAttn dot product and dScore[j] below), so storing 0 is
+        // exact. Under a causal mask this skips about half the keys.
         A := FAttn.FData[AttnRow + j];
-        TNNetVolume.MulAdd(PrevErr.GetRawPtr(posV), dOutPtr, A, FDk);
-        FdAttnBuf[j] := TNNetVolume.DotProduct(
-          dOutPtr, Prev.GetRawPtr(posV), FDk);
-        Inc(posV, RowStride);
+        if A <> 0 then
+        begin
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(posV), dOutPtr, A, FDk);
+          FdAttnBuf[j] := TNNetVolume.DotProduct(
+            dOutPtr, Prev.GetRawPtr(posV), FDk);
+        end
+        else FdAttnBuf[j] := 0;
+        Inc(posV, RowStride);                       // unconditional (#12)
       end;
       // ---- Softmax Jacobian: dScore[j] = Attn[j] * (dAttn[j] - sum_k dAttn[k]*Attn[k]) ----
       SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[AttnRow], SeqLen);
@@ -31545,7 +31567,7 @@ var
   QOfs, KOfs, VOfs: integer;
   AttnRow, AttnIdx, HRowBase: integer;
   RowStride, posK, posV: integer;
-  Score, MaxScore, SumExp: TNeuralFloat;
+  Score, MaxScore, SumExp, A: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr, QueryPtr: TNeuralFloatArrPtr;
 begin
@@ -31613,9 +31635,14 @@ begin
       posV := VOfs;                       // j=0 V offset (#12)
       for j := 0 to SeqLenM1 do
       begin
-        TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV),
-          FAttn.FData[AttnRow + j], FDk);
-        Inc(posV, RowStride);
+        // Masked keys carry an EXACTLY zero weight (exp(-1e9 - max) underflows
+        // to 0; an all-masked row was zero-filled), so their length-FDk AVX
+        // MulAdd is provably a no-op - skip it (about half the keys under a
+        // causal mask). Same idiom as the "if dS <> 0" backward guard.
+        A := FAttn.FData[AttnRow + j];
+        if A <> 0 then
+          TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV), A, FDk);
+        Inc(posV, RowStride);             // advance unconditionally (#12)
       end;
     end;
   end;
@@ -39145,6 +39172,7 @@ var
   RawPtr: TNeuralFloatArrPtr;
   RowStride, posV, NormStride, posN, AttnRow: integer;
   dOutPtr, qnPtr, gQnPtr, knPtr, gKnPtr: pointer;
+  LearnScale: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -39167,6 +39195,12 @@ begin
     if FgQn.Size <> SeqLen * FDk then FgQn.ReSize(SeqLen, 1, FDk);
     if FgKn.Size <> SeqLen * FDk then FgKn.ReSize(SeqLen, 1, FDk);
     NormStride := FKNorm.GetRawPos(1, 0);
+    // GradScale feeds ONLY the learnable-scale step at the end of this method,
+    // which is itself guarded by exactly this condition. With a fixed scale the
+    // whole SeqLen^2 x FDk cos[i,j] pass below is computed and discarded, so
+    // hoist the guard here (#5) and skip it.
+    LearnScale := FLearnableScale and (FNeurons.Count > 0) and
+      (FNeurons[0].FWeights.Size = 1);
       FgQn.Fill(0);
       FgKn.Fill(0);
       for i := 0 to SeqLenM1 do
@@ -39207,8 +39241,12 @@ begin
         begin
           // score[i,j] = scale * cos[i,j], cos[i,j] = qn[i].kn[j].
           // d(loss)/d(scale) += dScore[j] * cos[i,j] (accumulated over i,j).
-          Cos := TNNetVolume.DotProduct(qnPtr, FKNorm.GetRawPtr(posN), FDk);
-          GradScale := GradScale + FdScoreBuf[j] * Cos;
+          // Only needed when the scale is learnable (see LearnScale above).
+          if LearnScale then
+          begin
+            Cos := TNNetVolume.DotProduct(qnPtr, FKNorm.GetRawPtr(posN), FDk);
+            GradScale := GradScale + FdScoreBuf[j] * Cos;
+          end;
           dS := FdScoreBuf[j] * LiveScale;
           if dS <> 0 then
           begin
@@ -39246,8 +39284,7 @@ begin
       end;
     // ---- Step the learnable scale like TNNetReZero ----
     // delta += -LearningRate * grad; applied now unless in batch-update mode.
-    if FLearnableScale and (FNeurons.Count > 0) and
-       (FNeurons[0].FWeights.Size = 1) then
+    if LearnScale then
     begin
       FNeurons[0].FDelta.Raw[0] := FNeurons[0].FDelta.Raw[0] +
         (-FLearningRate) * GradScale;
