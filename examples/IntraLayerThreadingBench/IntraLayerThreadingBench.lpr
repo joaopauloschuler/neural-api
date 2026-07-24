@@ -844,7 +844,8 @@ end;
 // cross-layer purposes is 1 and "gain bound" stays 1.00x, so every bit of gain
 // measured here comes from intra-layer chunking and nothing else.
 const
-  SHAPESET_D = 'D/v1';
+  // v2 added widths 64 and 128 below the previous 256..1024 range.
+  SHAPESET_D = 'D/v2';
   // Depths fitted per shape. Must stay >= 2 points for a fit; the spread is
   // geometric so the intercept is not dominated by the deep end.
   DEPTHS: array[0..4] of integer = (1, 2, 4, 8, 16);
@@ -984,8 +985,16 @@ end;
 
 // The widths swept. They straddle Experiment A's single-layer crossover (which
 // on the reference box sits between 512 at 0.71x and 768 at 1.74x), so the
-// table shows both a shape that A calls a loss and shapes A calls a win - and
-// whether depth moves that verdict.
+// table shows both shapes A calls a loss and shapes A calls a win - and whether
+// depth moves that verdict.
+//
+// 64 and 128 are the deep end of the "A says no" range: A scores them 0.08x and
+// 0.13x, so a single-layer reading rejects them outright. They are also the
+// widths where the per-PASS fit is most trustworthy - their whole stack stays in
+// cache at every depth (64: 16KB/layer, 128: 64KB/layer, so even K=16 is 1MB),
+// which is what bent the 768/1024 fits into a negative (unphysical) intercept.
+// If the per-pass cost F really is the whole story, these two should still cross
+// 1.00x somewhere in the sweep - measuring where is the point of adding them.
 procedure ExperimentD;
 begin
   WriteLn('=== Experiment D: depth sweep  (per-pass vs per-layer overhead) ===');
@@ -999,6 +1008,8 @@ begin
   WriteLn(Format('  %-10s %-9s %9s %9s %8s %9s',
     ['shape', 'depth', 'off ms', 'on ms', 'speedup', 'maxdiff']));
   WriteLn(StringOfChar('-', 62));
+  DepthSweepOne(64);
+  DepthSweepOne(128);
   DepthSweepOne(256);
   DepthSweepOne(512);
   DepthSweepOne(768);
