@@ -12,13 +12,32 @@ IntraLayerThreadingBench: validates the intra-layer threading decision.
     check (threaded output MUST equal serial output - only independent outputs
     are partitioned). It is run twice, once with the low-memory inference
     contract off and once on, since conv/pointwise chunk in both modes.
-  * Experiment B (no longer run - kept in the source for reference) took the
-    small shapes from A and swept them across NN.StartThreadWorkers()
-    policies - hot-core counts 1..4 crossed with cool-down timeouts 0..2
-    seconds - since the small end is where the pool policy actually moves
-    the OFF-vs-ON speedup.
-  * Experiment C (no longer run - kept in the source for reference) timed a
-    few realistic multi-layer nets OFF vs ON end to end.
+  * Experiment B (opt-in) takes the small shapes from A and sweeps them across
+    NN.StartThreadWorkers() policies - hot-core counts 1..4 crossed with
+    cool-down timeouts 0..2 seconds - since the small end is where the pool
+    policy actually moves the OFF-vs-ON speedup.
+  * Experiment C (opt-in) times a few realistic multi-layer nets OFF vs ON end
+    to end.
+  * Experiment D sweeps DEPTH: stacks of K identical FullConnectReLU layers at
+    K = 1,2,4,8,16, then least-squares fits time against K. A parallel pass pays
+    a fixed cost once per FORWARD (plan walk, pool wake, setup/teardown) plus a
+    cost once per LAYER (chunk enqueue + barrier join); Experiment A runs one
+    layer and so fuses the two into a single unreadable number. The fit splits
+    them - intercept = per-pass, slope = per-layer - which is what decides
+    whether a shape A calls a loss (speedup < 1.00x) still loses inside a deep
+    net or wins there because the fixed cost amortises over the stack.
+  * Experiment E runs D's depth sweep against the two decode layers that chunk
+    on a SHORT axis: TNNetDepthwiseConv1D (channels) and TNNetGatedDeltaNet
+    (k-heads, typically 4..8, so the chunk count can be capped below the worker
+    count). Both are driven through the stateful incremental-decode kernel at
+    Seq=1. GatedDeltaNet cannot stack bare - it maps its [q|k|v|z|b|a] input
+    down to Hv*Dv - so each block carries an out-projection, and a control stack
+    with the GDN swapped for a same-shape pointwise prices that projection out.
+
+Experiment selection: run with no argument for the default set (A twice, then D
+and E), or name the experiments to run as arguments, e.g.
+"IntraLayerThreadingBench E" for the short-chunk-axis sweep alone. A is minutes
+of wall clock, so selecting one sweep is what makes them iterable.
 
 ChunkEligible returns true for every size, so a parallel pass always chunks.
 Experiment A measures where that pays: the tiny shapes at the top of each block
@@ -117,6 +136,44 @@ begin
   {$ENDIF}
   Result := Result + 'FPC ' + {$I %FPCVERSION%} + ' ' +
     {$I %FPCTARGETOS%} + '-' + {$I %FPCTARGETCPU%};
+end;
+
+// Every experiment names its shapes with the same abbreviations and opens by
+// calling this, so a pasted result block is readable on its own without the
+// source next to it. It prints on the FIRST call only - Experiment A alone runs
+// twice (once per memory mode), and a legend repeated between every table is
+// noise rather than help. The chunk axis is the part that matters: it is the
+// index space ComputeRange is handed, so it decides both how many chunks a layer
+// can be split into (capped at min(workers, axis length)) and how much work each
+// chunk carries.
+var
+  LegendDone: boolean = false;
+
+procedure WriteLegend;
+begin
+  if LegendDone then exit;
+  LegendDone := true;
+  WriteLn('legend - shape name, layer class, and the axis its chunks split:');
+  WriteLn('  FC in x out       TNNetFullConnect      splits OUTPUT NEURONS');
+  WriteLn('  Pw XxYxD->F       TNNetPointwiseConv    splits OUTPUT POSITIONS,');
+  WriteLn('  Conv XxXxD kK     TNNetConvolution        falling back to output');
+  WriteLn('                                            neurons once the grid is');
+  WriteLn('                                            too small to fill the pool');
+  WriteLn('                                            (ChunkOverNeurons; seq=1)');
+  WriteLn('  Dw sN dC kK       TNNetDepthwiseConv1D  splits CHANNELS (C)');
+  WriteLn('  GDN sN hHk/Hv dD  TNNetGatedDeltaNet    splits K-HEADS (Hk), so its');
+  WriteLn('                                            chunk count cannot exceed');
+  WriteLn('                                            Hk however many workers');
+  WriteLn('                                            are free');
+  WriteLn('  SwiGLU sN dD      TNNetSwiGLU           splits OUTPUT ELEMENTS');
+  WriteLn('  RMSN sN dD        TNNetTokenRMSNorm     splits TOKENS');
+  WriteLn('  RoPE sN dD        TNNetRotaryEmbedding  splits ROTATION PAIRS');
+  WriteLn('  name parts: sN = sequence length N (s1 = one-token decode shape),');
+  WriteLn('    dD = depth/channels, kK = kernel taps, hHk/Hv = k-heads/v-heads,');
+  WriteLn('    "up"/"dn" = widening/narrowing FC. A "Dec" suffix on the layer');
+  WriteLn('    name (DwDec, GDNDec) drives the stateful incremental-decode');
+  WriteLn('    kernel rather than the full-sequence one; "ctl" marks a control');
+  WriteLn('    stack that exists to be subtracted from the row above it.');
 end;
 
 // Geometric-mean accumulator. Times across the sweep span orders of magnitude
@@ -410,8 +467,9 @@ begin
   WriteLn('Cores (NeuralDefaultThreadCount) = ', NeuralDefaultThreadCount(),
     '   shapeset ', SHAPESET_A, ' (', Length(ShA), ' shapes)');
   WriteLn('build: ', BuildTag);
-  WriteLn('FC/PW/Conv/Dw/GDN: every size is chunk-eligible; ',
-    'SwiGLU/RMSN/RoPE show their current verdict');
+  WriteLegend;
+  WriteLn('The elig? column is the live ChunkEligible verdict. FC and Dw carry a');
+  WriteLn('minimum-work bar, so their narrow shapes read no and run whole-layer.');
   WriteLn(Format('%-20s %8s %6s %9s %9s %8s %7s %9s',
     ['shape', 'neurons', 'elig?', 'off ms', 'on ms', 'speedup',
      'chunks', 'maxdiff']));
@@ -756,9 +814,12 @@ end;
 // Per-layer chunk report for a net that has just run a parallel pass. The
 // scheduler splits a chunk-eligible layer into clamp(WorkerCount, 1, WorkCount)
 // slices (see SchedEnqueueReady); a non-eligible layer runs as one whole-layer
-// item. WorkCount is the ComputeRange index space (FullConnect: output neurons;
-// Convolution: output positions), so this exposes the seq=1 pointwise case
-// where positions=1 forces a single chunk and no intra-layer parallelism.
+// item. WorkCount is the ComputeRange index space, which differs per layer:
+// FullConnect splits output neurons, Convolution/pointwise splits output
+// positions but falls back to the neuron axis when the spatial grid is too
+// small to fill the pool (ChunkOverNeurons - the seq=1 decode case), and
+// GatedDeltaNet splits k-heads, capping its chunk count at NumKHeads however
+// many workers are free.
 procedure DumpChunks(NN: TNNet);
 var
   li, workers, work, chunks: integer;
@@ -807,10 +868,461 @@ begin
   MyIn.Free;
 end;
 
+// =============================== Experiment D =================================
+// Depth sweep: separates the two halves of the scheduler overhead that a
+// SINGLE-layer measurement (Experiment A) fuses into one number.
+//
+// A parallel pass pays:
+//   F - once per forward pass: plan walk, pool wake, pass setup/teardown.
+//   L - once per LAYER: enqueue the layer's chunks, join the chunk barrier.
+// Experiment A only ever runs one layer, so its "on ms" is F + L + compute/S
+// and cannot tell F from L. That matters: a straight-line stack of K layers
+// pays F once but L K times, so if the overhead is mostly F the small shapes
+// that lose in A (speedup < 1.00x) can still WIN inside a real net, while if it
+// is mostly L their A verdict carries over unchanged.
+//
+// The separation is a straight line. Timing the SAME layer shape at depths
+// K = 1, 2, 4, 8, 16 gives
+//   on(K)  = F + K * (L + compute/S)      -> intercept F, slope perLayerOn
+//   off(K) = ~0 + K * compute             -> slope perLayerOff
+// so a least-squares fit over K yields F directly, and the slope ratio
+// perLayerOff / perLayerOn is the speedup this shape converges to in a deep
+// net - the number to compare against A's single-layer column.
+//
+// The stack is deliberately straight-line (no branches): scheduler width for
+// cross-layer purposes is 1 and "gain bound" stays 1.00x, so every bit of gain
+// measured here comes from intra-layer chunking and nothing else.
+const
+  SHAPESET_D = 'D/v2';
+  // Depths fitted per shape. Must stay >= 2 points for a fit; the spread is
+  // geometric so the intercept is not dominated by the deep end.
+  DEPTHS: array[0..4] of integer = (1, 2, 4, 8, 16);
+  DEPTH_COUNT = Length(DEPTHS);
+  // Depth the amortised-speedup column reports at (a small-transformer-ish
+  // block count - the depth the brainstorm question was asked about).
+  REPORT_DEPTH = 10;
+
+// A stackable block, repeated K times to make the depth sweep's nets.
+//
+// EK_FC        - FullConnectReLU(P1) over a P1-wide input. The Experiment A
+//                "FC WxW" shape, repeated.
+// EK_DW        - DepthwiseConv1D(P2 taps) over (Seq, 1, P1). Depthwise preserves
+//                the channel count, so these stack with nothing in between and
+//                the measurement is of that layer and nothing else.
+// EK_GDN       - GatedDeltaNet(Hk=P1, Hv=P2, Dk=Dv=P3) followed by a pointwise
+//                back to its own input depth. GDN maps
+//                2*Hk*Dk + 2*Hv*Dv + 2*Hv channels down to Hv*Dv, so it cannot
+//                stack bare; the out-projection is what a real GDN/Mamba block
+//                carries anyway, and EK_GDNC below prices it.
+// EK_GDNC      - the EK_GDN control: the same two tensor shapes and the same
+//                two barriers per block, with the GatedDeltaNet swapped for a
+//                pointwise of identical in/out shape. Differencing the two
+//                slopes prices the GatedDeltaNet against a known layer instead
+//                of against the projection it is bundled with.
+const
+  EK_FC = 0;
+  EK_DW = 1;
+  EK_GDN = 2;
+  EK_GDNC = 3;
+
+type
+  TEShape = record
+    Name: string;
+    Kind: integer;
+    Seq: integer;           // sequence length; 1 = the decode shape
+    P1, P2, P3: integer;    // per-kind, see the EK_ notes above
+    Decode: boolean;        // drive the stateful incremental-decode kernel
+  end;
+
+// Input depth a GatedDeltaNet(Hk, Hv, D, D) demands: [q|k|v|z|b|a].
+function GdnInDepth(Hk, Hv, D: integer): integer;
+begin
+  Result := 2 * Hk * D + 2 * Hv * D + 2 * Hv;
+end;
+
+// The stack under test at depth K. InitDefault per layer so the weights are
+// realistic (a zeroed matrix can be optimised differently by the memory
+// subsystem), then the inference-only contract Experiment A times the ON case
+// under.
+function BuildStackAt(const S: TEShape; Depth: integer): TNNet;
+var NN: TNNet; i, InD: integer;
+begin
+  NN := TNNet.Create();
+  case S.Kind of
+    EK_FC:
+      begin
+        NN.AddLayer(TNNetInput.Create(S.P1));
+        for i := 0 to Depth - 1 do
+          NN.AddLayer(TNNetFullConnectReLU.Create(S.P1));
+      end;
+    EK_DW:
+      begin
+        NN.AddLayer(TNNetInput.Create(S.Seq, 1, S.P1));
+        for i := 0 to Depth - 1 do
+          NN.AddLayer(TNNetDepthwiseConv1D.Create(S.P2, {causal=}true));
+      end;
+    EK_GDN:
+      begin
+        InD := GdnInDepth(S.P1, S.P2, S.P3);
+        NN.AddLayer(TNNetInput.Create(S.Seq, 1, InD));
+        for i := 0 to Depth - 1 do
+        begin
+          NN.AddLayer(TNNetGatedDeltaNet.Create(S.P1, S.P2, S.P3, S.P3));
+          NN.AddLayer(TNNetPointwiseConvLinear.Create(InD));
+        end;
+      end;
+    EK_GDNC:
+      begin
+        InD := GdnInDepth(S.P1, S.P2, S.P3);
+        NN.AddLayer(TNNetInput.Create(S.Seq, 1, InD));
+        for i := 0 to Depth - 1 do
+        begin
+          NN.AddLayer(TNNetPointwiseConvLinear.Create(S.P2 * S.P3));
+          NN.AddLayer(TNNetPointwiseConvLinear.Create(InD));
+        end;
+      end;
+  end;
+  for i := 0 to NN.CountLayers - 1 do NN.Layers[i].InitDefault();
+  NN.SetTrainable(False, {pLowMemory=}False);
+  Result := NN;
+end;
+
+// Arm every stateful layer in the stack for incremental decode. Experiment A
+// arms one layer because it builds one; a stack has to arm all of them or the
+// sweep times the full-sequence kernel with a decode-shaped input.
+procedure BeginAllDecode(NN: TNNet);
+var i: integer;
+begin
+  for i := 0 to NN.CountLayers - 1 do
+    if NN.Layers[i] is TNNetRecurrentDecodeBase then
+      TNNetRecurrentDecodeBase(NN.Layers[i]).BeginIncrementalDecode();
+end;
+
+// Rewind the carried state (conv history / delta-rule state bank) across the
+// whole stack. The serial timing passes advance it, so the parity pass has to
+// start from the same zero state the serial snapshot was taken at.
+procedure ResetAllDecode(NN: TNNet);
+var i: integer;
+begin
+  for i := 0 to NN.CountLayers - 1 do
+    if NN.Layers[i] is TNNetRecurrentDecodeBase then
+      TNNetRecurrentDecodeBase(NN.Layers[i]).ResetState();
+end;
+
+// Ordinary least squares of Y on X (Y = A + B*X), plus R2 as a fit-quality
+// guard: this box is noisy and a depth sweep is only readable while the points
+// really are collinear. R2 well below 1 means the run was too noisy to trust
+// the intercept, NOT that the model is wrong.
+procedure LinFit(const X, Y: array of double; N: integer;
+  out A, B, R2: double);
+var
+  i: integer;
+  SX, SY, SXX, SXY, MeanY, SSTot, SSRes, Pred, Den: double;
+begin
+  A := 0; B := 0; R2 := 0;
+  if N < 2 then exit;
+  SX := 0; SY := 0; SXX := 0; SXY := 0;
+  for i := 0 to N - 1 do
+  begin
+    SX := SX + X[i]; SY := SY + Y[i];
+    SXX := SXX + X[i] * X[i]; SXY := SXY + X[i] * Y[i];
+  end;
+  Den := N * SXX - SX * SX;
+  if Abs(Den) < 1e-12 then exit;
+  B := (N * SXY - SX * SY) / Den;
+  A := (SY - B * SX) / N;
+  MeanY := SY / N;
+  SSTot := 0; SSRes := 0;
+  for i := 0 to N - 1 do
+  begin
+    Pred := A + B * X[i];
+    SSTot := SSTot + Sqr(Y[i] - MeanY);
+    SSRes := SSRes + Sqr(Y[i] - Pred);
+  end;
+  if SSTot > 0 then R2 := 1 - SSRes / SSTot else R2 := 1;
+end;
+
+// One shape: time every depth OFF and ON, print the raw points, then fit.
+// BOffOut/BOnOut hand the fitted slopes back so a caller can difference two
+// shapes (the GDN-vs-control pairing) without re-reading the printed table.
+procedure DepthSweepShape(const S: TEShape; out BOffOut, BOnOut: double);
+var
+  di, i, DepthK: integer;
+  NN: TNNet;
+  MyIn: TNNetVolume;
+  OutSerial: TNNetVolume;
+  Ts, Tt, sp, d, maxdiff: double;
+  XD, YOff, YOn: array[0..DEPTH_COUNT - 1] of double;
+  FOff, BOff, R2Off, FOn, BOn, R2On: double;
+  LastStats: string;
+  AmortOff, AmortOn: double;
+begin
+  LastStats := '(none)';
+  for di := 0 to DEPTH_COUNT - 1 do
+  begin
+    DepthK := DEPTHS[di];
+    NN := BuildStackAt(S, DepthK);
+    MyIn := TNNetVolume.Create(NN.Layers[0].Output);
+    MyIn.Randomize();
+    if S.Decode then BeginAllDecode(NN);
+
+    // Serial reference plus the parity snapshot (chunking splits an independent
+    // axis - output neurons, channels, k-heads - so a stack must still match the
+    // serial pass element for element; a mismatch would mean a chunk boundary
+    // corrupted a layer's input for the next one).
+    NN.Compute(MyIn, 0, {parallel=}false);
+    OutSerial := TNNetVolume.Create(NN.GetLastLayer().Output);
+    Ts := BestTimeMs(NN, MyIn, {parallel=}false);
+
+    NN.StartThreadWorkers();   // keep the pool hot across the timed passes
+    // The serial timing passes advanced the carried state; rewind so the parity
+    // pass sees the zero state OutSerial was snapshotted at.
+    if S.Decode then ResetAllDecode(NN);
+    NN.Compute(MyIn, 0, {parallel=}true);
+    maxdiff := 0;
+    for i := 0 to OutSerial.Size - 1 do
+    begin
+      d := Abs(OutSerial.FData[i] - NN.GetLastLayer().Output.FData[i]);
+      if d > maxdiff then maxdiff := d;
+    end;
+    // One block's worth of chunk counts, from the shallowest stack: this is
+    // where a short chunk axis shows up as chunks < workers.
+    if di = 0 then DumpChunks(NN);
+    NN.ResetSchedulerStats();  // count only this depth's timed parallel passes
+    Tt := BestTimeMs(NN, MyIn, {parallel=}true);
+    LastStats := NN.SchedulerStatsReport();
+
+    if Tt > 0 then sp := Ts / Tt else sp := 0;
+    WriteLn(Format('  %-22s depth %-3d %9.3f %9.3f %7.2fx %9.2g',
+      [S.Name, DepthK, Ts, Tt, sp, maxdiff]));
+
+    XD[di] := DepthK; YOff[di] := Ts; YOn[di] := Tt;
+
+    OutSerial.Free;
+    MyIn.Free;
+    NN.Free;
+  end;
+  WriteLn('      deepest stack: ', LastStats);
+
+  LinFit(XD, YOff, DEPTH_COUNT, FOff, BOff, R2Off);
+  LinFit(XD, YOn,  DEPTH_COUNT, FOn,  BOn,  R2On);
+  // Intercept = per-PASS fixed cost, slope = per-LAYER marginal cost. The OFF
+  // intercept is the control: the serial path has no pass setup, so a non-zero
+  // OFF intercept is measurement noise and sets the scale for how much of the
+  // ON intercept to believe.
+  WriteLn(Format('      fit OFF: %.4f ms/pass + %.4f ms/layer  (R2 %.4f)',
+    [FOff, BOff, R2Off]));
+  WriteLn(Format('      fit ON : %.4f ms/pass + %.4f ms/layer  (R2 %.4f)',
+    [FOn, BOn, R2On]));
+  // Slope ratio = the speedup a DEEP stack of this shape converges to, with the
+  // once-per-pass cost fully amortised away. This is the number Experiment A's
+  // single-layer column understates.
+  if BOn > 0 then
+    WriteLn(Format('      per-layer speedup (deep-stack limit): %.2fx', [BOff / BOn]))
+  else
+    WriteLn('      per-layer speedup: n/a (non-positive ON slope)');
+  AmortOff := FOff + REPORT_DEPTH * BOff;
+  AmortOn := FOn + REPORT_DEPTH * BOn;
+  if AmortOn > 0 then
+    WriteLn(Format('      predicted at depth %d: off %.3f  on %.3f  %.2fx',
+      [REPORT_DEPTH, AmortOff, AmortOn, AmortOff / AmortOn]));
+  WriteLn;
+  BOffOut := BOff; BOnOut := BOn;
+end;
+
+// The widths swept. They straddle Experiment A's single-layer crossover (on the
+// reference box between 512 at 0.71x and 768 at 1.74x), so the table holds both
+// shapes A calls a loss and shapes A calls a win, and shows at what depth - if
+// any - each crosses 1.00x once the per-pass cost is amortised over the stack.
+//
+// The narrow widths carry the fit. A stack's weights are K*W*W*4 bytes, so at 64
+// and 128 (16KB and 64KB per layer) even K=16 stays in cache and per-layer cost
+// is flat with depth, which is what the intercept/slope split assumes. From 768
+// up the stack outgrows cache as K grows, per-layer cost rises with it, and the
+// fit answers with a negative - unphysical - intercept: read those two widths as
+// bandwidth behaviour, and take F from the narrow end.
+// Column header shared by D and E.
+procedure WriteHeadD;
+begin
+  WriteLn(Format('  %-22s %-9s %9s %9s %8s %9s',
+    ['shape', 'depth', 'off ms', 'on ms', 'speedup', 'maxdiff']));
+  WriteLn(StringOfChar('-', 74));
+end;
+
+// One FC width, discarding the slopes (only the GDN pairing in E needs them).
+procedure SweepFC(Width: integer);
+var S: TEShape; BOff, BOn: double;
+begin
+  // Square, so the name carries both dimensions the legend's "FC in x out"
+  // promises rather than a bare width.
+  S.Name := Format('FC %dx%d', [Width, Width]);
+  S.Kind := EK_FC; S.Seq := 1;
+  S.P1 := Width; S.P2 := 0; S.P3 := 0;
+  S.Decode := false;
+  DepthSweepShape(S, BOff, BOn);
+end;
+
+procedure ExperimentD;
+begin
+  WriteLn('=== Experiment D: depth sweep  (per-pass vs per-layer overhead) ===');
+  WriteLn('Cores (NeuralDefaultThreadCount) = ', NeuralDefaultThreadCount(),
+    '   shapeset ', SHAPESET_D);
+  WriteLn('build: ', BuildTag);
+  WriteLegend;
+  WriteLn('Stacks of K identical FullConnectReLU layers, K = 1,2,4,8,16.');
+  WriteLn('on(K) = F + K*(L + compute/S): the intercept is the once-per-PASS');
+  WriteLn('cost, the slope the once-per-LAYER cost. Experiment A measures only');
+  WriteLn('K=1 and so charges the whole intercept to a single layer.');
+  WriteHeadD;
+  SweepFC(64);
+  SweepFC(128);
+  SweepFC(256);
+  SweepFC(512);
+  SweepFC(768);
+  SweepFC(1024);
+  WriteLn('Reading: if the ON intercept dominates, small shapes that lose in');
+  WriteLn('Experiment A still pay off inside a deep net (the fixed cost is paid');
+  WriteLn('once per forward, not once per layer) and the crossover width moves');
+  WriteLn('down. If the ON slope dominates, A''s per-shape verdicts carry over');
+  WriteLn('to deep nets unchanged. Weights grow with depth (K*W*W*4 bytes), so');
+  WriteLn('the deep points also leave cache - part of the OFF slope is DRAM,');
+  WriteLn('not scheduling. Confirm on a quiet box before drawing conclusions.');
+  WriteLn;
+end;
+
+// =============================== Experiment E =================================
+// The same depth sweep as D, aimed at the two layers that chunk on a SHORT axis.
+//
+// D sweeps FullConnect, which chunks on output neurons - hundreds to thousands
+// of them, so the chunk count always reaches the worker count and each chunk
+// carries real work. The recurrent decode layers do not have that luxury:
+//   TNNetDepthwiseConv1D chunks on CHANNELS (ChunkWorkCount = neuron count, one
+//     neuron per channel), which is wide - but at decode (Seq=1) each channel
+//     contributes only KernelSize taps, so the per-chunk work is tiny.
+//   TNNetGatedDeltaNet chunks on K-HEADS (ChunkWorkCount = NumKHeads), typically
+//     4 to 8. That caps the chunk count at min(workers, Hk) no matter how wide
+//     the model is, so on an 8-worker box a 4-k-head layer can only ever fill
+//     half the pool.
+// Both are timed at Seq=1 through the stateful incremental-decode kernel - the
+// path ChatTerminal actually runs - and DepthwiseConv1D also at a prefill-like
+// Seq, where the same chunk axis carries Seq times more work per chunk.
+//
+// The GDN rows pair each block against its EK_GDNC control, which swaps the
+// GatedDeltaNet for a pointwise of identical shape and keeps everything else
+// (tensor sizes, barrier count) equal. The printed slope difference is then the
+// GatedDeltaNet's own marginal cost, free of the out-projection it is bundled
+// with. The control is a genuine second measurement, not a constant to be
+// assumed away: its pointwise layers chunk over output NEURONS at Seq=1
+// (TNNetConvolution.ChunkWorkCount switches axis via ChunkOverNeurons once the
+// spatial grid is too small to fill the pool), so they thread too, and how well
+// they thread is exactly what has to be subtracted off the block.
+const
+  SHAPESET_E = 'E/v1';
+
+procedure AddE(var S: TEShape; const N: string; K, Seq, P1, P2, P3: integer;
+  Dec_: boolean);
+begin
+  S.Name := N; S.Kind := K; S.Seq := Seq;
+  S.P1 := P1; S.P2 := P2; S.P3 := P3; S.Decode := Dec_;
+end;
+
+// A GatedDeltaNet block and its pointwise-swap control, back to back, closing
+// with the slope difference that prices the GatedDeltaNet layer itself.
+procedure SweepGdnPair(const Tag: string; Seq, Hk, Hv, D: integer; Dec_: boolean);
+var
+  SBlk, SCtl: TEShape;
+  BOffBlk, BOnBlk, BOffCtl, BOnCtl: double;
+  DOff, DOn: double;
+begin
+  AddE(SBlk, Tag, EK_GDN, Seq, Hk, Hv, D, Dec_);
+  AddE(SCtl, Tag + ' ctl', EK_GDNC, Seq, Hk, Hv, D, Dec_);
+  DepthSweepShape(SBlk, BOffBlk, BOnBlk);
+  DepthSweepShape(SCtl, BOffCtl, BOnCtl);
+  DOff := BOffBlk - BOffCtl;
+  DOn := BOnBlk - BOnCtl;
+  WriteLn(Format('      %s: GatedDeltaNet layer alone = %.4f ms off, %.4f ms on',
+    [Tag, DOff, DOn]));
+  // Below 1.00x the layer's own chunking costs more than it saves, and no depth
+  // fixes that - the per-layer cost is what a deep stack converges to.
+  if DOn > 0 then
+    WriteLn(Format('      %s: GatedDeltaNet layer speedup %.2fx (k-heads=%d)',
+      [Tag, DOff / DOn, Hk]))
+  else
+    WriteLn(Format('      %s: GatedDeltaNet layer speedup n/a ' +
+      '(control slope >= block slope - too close to separate)', [Tag]));
+  WriteLn;
+end;
+
+procedure ExperimentE;
+var S: TEShape; BOff, BOn: double;
+begin
+  WriteLn('=== Experiment E: depth sweep, short-chunk-axis decode layers ===');
+  WriteLn('Cores (NeuralDefaultThreadCount) = ', NeuralDefaultThreadCount(),
+    '   shapeset ', SHAPESET_E);
+  WriteLn('build: ', BuildTag);
+  WriteLegend;
+  WriteLn('DepthwiseConv1D chunks on channels, GatedDeltaNet on k-heads (4..8),');
+  WriteLn('so unlike Experiment D''s FullConnect the chunk count can fall short');
+  WriteLn('of the worker count. GDN rows are followed by a control stack with');
+  WriteLn('the GDN swapped for a same-shape pointwise, to price the GDN layer');
+  WriteLn('apart from the out-projection it needs in order to stack.');
+  WriteHeadD;
+
+  // DepthwiseConv1D: channel axis is wide, so the probe is per-chunk work.
+  // Decode (Seq=1) is the ChatTerminal path; the Seq=64 row is the same layer
+  // with 64x the work per chunk and nothing else changed.
+  AddE(S, 'DwDec s1 d512 k4', EK_DW, 1, 512, 4, 0, true);
+  DepthSweepShape(S, BOff, BOn);
+  AddE(S, 'DwDec s1 d2048 k4', EK_DW, 1, 2048, 4, 0, true);
+  DepthSweepShape(S, BOff, BOn);
+  AddE(S, 'Dw s64 d512 k4', EK_DW, 64, 512, 4, 0, false);
+  DepthSweepShape(S, BOff, BOn);
+
+  // GatedDeltaNet: 4 k-heads cannot fill an 8-worker pool; 8 k-heads can. That
+  // contrast is the whole point of the pair, so both hold head dim at 64 - the
+  // out-projection is quadratic in it (input depth 2*Hk*D + 2*Hv*D + 2*Hv), and
+  // at D=128 the projection costs enough to dominate the block it is only meant
+  // to be a control for.
+  SweepGdnPair('GDNDec s1 h4/8 d64', 1, 4, 8, 64, true);
+  SweepGdnPair('GDNDec s1 h8/8 d64', 1, 8, 8, 64, true);
+
+  WriteLn('Reading: the per-layer (deep-stack limit) speedup is the verdict -');
+  WriteLn('below 1.00x the layer''s chunking costs more than it saves and no');
+  WriteLn('depth repairs it, because the per-layer cost is exactly what a deep');
+  WriteLn('stack converges to. Compare each shape''s chunks-vs-workers line: a');
+  WriteLn('chunk count below the worker count caps the achievable gain, and a');
+  WriteLn('full chunk count with a sub-1.00x speedup means the chunks are too');
+  WriteLn('small to repay the barrier.');
+  WriteLn;
+end;
+
+// Experiment selection: no argument runs the default set (A twice, then D and
+// E); otherwise each argument names one experiment to run, e.g. "E" for the
+// short-chunk-axis sweep alone. Experiment A is minutes of wall clock, so being
+// able to ask for one sweep on its own is what makes them iterable.
+function WantsExperiment(const Which: string): boolean;
+var i: integer;
+begin
+  if ParamCount = 0 then
+  begin
+    Result := (Which = 'A') or (Which = 'D') or (Which = 'E');
+    exit;
+  end;
+  Result := false;
+  for i := 1 to ParamCount do
+    if UpperCase(ParamStr(i)) = Which then
+    begin
+      Result := true;
+      exit;
+    end;
+end;
+
 var
   AggMemOff, AggMemOn: TAggr;
 begin
   Randomize;
+  if WantsExperiment('A') then
+  begin
   // Experiment A is run twice: once with the low-memory inference contract off
   // (concatenated-weight caches kept) and once with it on (caches released,
   // per-neuron ranged path). Conv/pointwise chunk in both modes, so the two
@@ -831,24 +1343,12 @@ begin
     ['ON / OFF cost',
      AggrOff(AggMemOn) / Max(AggrOff(AggMemOff), 1e-6),
      AggrOn(AggMemOn) / Max(AggrOn(AggMemOff), 1e-6)]));
-  // Experiments B (pool-policy sweep) and C (end-to-end nets) are no longer
-  // relevant; kept in the source for reference but not run.
-  // ExperimentB;
-  // WriteLn('=== Experiment C: realistic nets  threading OFF vs ON (end-to-end) ===');
-  // SweepNet('small GPT MLP', 512,  2048, 6, 8);
-  // SwiGLU-FFN stack (RoPE + per-block RMSNorm -> up-proj -> SwiGLU ->
-  // down-proj): the end-to-end probe for the token-layer ComputeRange work.
-  // seq=8 is prefill-like; seq=1 is the KV-cache decode shape where the token
-  // layers need a finer-than-token chunk axis to thread at all.
-  // SweepNet('GPT SwiGLU FFN', 512,  2048, 6, 8, {UseSwiGLU=}true);
-  // SweepNet('SwiGLU 1-token', 1024, 4096, 4, 1, {UseSwiGLU=}true);
-  // SweepNet('mid GPT MLP',   768,  3072, 6, 16);
-  // SweepNet('wide 1-token',  2048, 8192, 4, 1);
   WriteLn;
   WriteLn('speedup > 1.00x => chunking that shape pays off on this box;');
   WriteLn('<= 1.00x on a SINGLE-layer shape overstates the in-net cost: the');
   WriteLn('scheduler pass overhead charged here to one layer is paid once per');
-  WriteLn('forward in a real net - validate borderline shapes on a real model.');
+  WriteLn('forward in a real net - Experiment D measures how much of it is');
+  WriteLn('per-pass; validate borderline shapes on a real model.');
   WriteLn;
   WriteLn('Summary rows are GEOMETRIC means, so every shape counts equally and');
   WriteLn('the summary speedup equals the geomean of the per-shape speedups.');
@@ -857,4 +1357,23 @@ begin
   WriteLn('ms figures compare across boxes only for the SAME shapeset version;');
   WriteLn('GOP/s is an approximate work proxy (element-wise layer op weights are');
   WriteLn('estimates) - read it within a family, not as a certified FLOP rate.');
+  WriteLn;
+  end;  // Experiment A
+  if WantsExperiment('B') then ExperimentB;
+  if WantsExperiment('C') then
+  begin
+    WriteLn('=== Experiment C: realistic nets  threading OFF vs ON (end-to-end) ===');
+    SweepNet('small GPT MLP', 512,  2048, 6, 8);
+    // SwiGLU-FFN stack (RoPE + per-block RMSNorm -> up-proj -> SwiGLU ->
+    // down-proj): the end-to-end probe for the token-layer ComputeRange work.
+    // seq=8 is prefill-like; seq=1 is the KV-cache decode shape where the token
+    // layers need a finer-than-token chunk axis to thread at all.
+    SweepNet('GPT SwiGLU FFN', 512,  2048, 6, 8, {UseSwiGLU=}true);
+    SweepNet('SwiGLU 1-token', 1024, 4096, 4, 1, {UseSwiGLU=}true);
+    SweepNet('mid GPT MLP',   768,  3072, 6, 16);
+    SweepNet('wide 1-token',  2048, 8192, 4, 1);
+    WriteLn;
+  end;
+  if WantsExperiment('D') then ExperimentD;
+  if WantsExperiment('E') then ExperimentE;
 end.
