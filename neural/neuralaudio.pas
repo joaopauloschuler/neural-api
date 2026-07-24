@@ -1010,7 +1010,11 @@ begin
         Acc := Im[BinCnt] * WinNormInv;
         Power[BinCnt] := V * V + Acc * Acc;
       end;
-      // raw_chroma[c] = sum_b Filt[c][b] * Power[b]
+      // raw_chroma[c] = sum_b Filt[c][b] * Power[b]. The inf-norm normalize is
+      // monotonic, so the ARGMAX is unchanged by it and the one-hot only needs
+      // the dominant chroma index -- track it in this same pass (strict '>' keeps
+      // the FIRST index that attains the max, matching a from-index-0 argmax).
+      ArgMax := 0;
       MaxVal := -1e30;
       for ChCnt := 0 to NumChromaM1 do
       begin
@@ -1019,18 +1023,12 @@ begin
         for BinCnt := 0 to NumBinsM1 do
           Acc := Acc + Filt.FData[fBase + BinCnt] * Power[BinCnt];
         RawChroma[rowBase + ChCnt] := Acc;
-        if Acc > MaxVal then MaxVal := Acc;
-      end;
-      // inf-norm normalize is monotonic, so the ARGMAX is unchanged by it; the
-      // one-hot only needs the dominant chroma index.
-      ArgMax := 0;
-      MaxVal := RawChroma[rowBase];
-      for ChCnt := 1 to NumChromaM1 do
-        if RawChroma[rowBase + ChCnt] > MaxVal then
+        if Acc > MaxVal then
         begin
-          MaxVal := RawChroma[rowBase + ChCnt];
+          MaxVal := Acc;
           ArgMax := ChCnt;
         end;
+      end;
       for ChCnt := 0 to NumChromaM1 do
         RawChroma[rowBase + ChCnt] := 0.0;
       RawChroma[rowBase + ArgMax] := 1.0;
