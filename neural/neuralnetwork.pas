@@ -33059,12 +33059,13 @@ begin
     qOff := h * FHeadQueryDim;       // start of this head's sub-query in the input
     wOff := h * FTopK;               // this head's softmax-weight slots in FW Depth
     outOff := h * FValueDim;         // this head's output slot in FOutput Depth
+    base := h * SeqLen * FTopK;       // seed of (h*SeqLen+t)*FTopK; carried by +FTopK per t (#6)
     for t := 0 to SeqLenM1 do
     begin
       q1 := Prev.GetRawPtr(t, 0, qOff);            // sub-q[0..HalfQ-1]
       q2 := Prev.GetRawPtr(t, 0, qOff + FHalfQ);   // sub-q[HalfQ..2HalfQ-1]
       baseS1 := FS1.GetRawPos(t, 0);            // this row's FS1 offset (invariant across a)
-      baseS2 := FS2.GetRawPos(t, 0);            // this row's FS2 offset (invariant across b)
+      baseS2 := baseS1;                         // FS2 shares FS1's shape (SeqLen,1,FHalfKeys) => same offset (#3)
       baseW := FW.GetRawPos(t, 0, wOff);           // this head's weight slots for row t
       // Half scores.
       posK1 := 0;                          // key-row offset a*FHalfQ (#12)
@@ -33093,7 +33094,6 @@ begin
           Inc(nCand);
         end;
       // Pick the global top-TopK of the candidates (partial selection sort).
-      base := (h * SeqLen + t) * FTopK;
       nCandM1 := nCand - 1;
       for kk := 0 to TopKM1 do
       begin
@@ -33132,6 +33132,7 @@ begin
         Vptr := V.GetRawPtr(keyIdx, 0);
         TNNetVolume.MulAdd(OutPtr, Vptr, w, FValueDim);
       end;
+      Inc(base, FTopK);                 // advance to next t's (h*SeqLen+t)*FTopK (#6)
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -33178,9 +33179,9 @@ begin
     FGradK1.Fill(0);
     FGradK2.Fill(0);
     FGradV.Fill(0);
+    base := h * SeqLen * FTopK;       // seed of (h*SeqLen+t)*FTopK; carried by +FTopK per t (#6)
     for t := 0 to SeqLenM1 do
     begin
-      base := (h * SeqLen + t) * FTopK;
       baseW := FW.GetRawPos(t, 0, wOff);   // this head's weight slots for row t
       dOut := FOutputError.GetRawPtr(t, 0, outOff);
       q1 := Prev.GetRawPtr(t, 0, qOff);
@@ -33233,6 +33234,7 @@ begin
           TNNetVolume.MulAdd(dq2, K2.GetRawPtr(posB), ds, FHalfQ);
         end;
       end;
+      Inc(base, FTopK);                 // advance to next t's (h*SeqLen+t)*FTopK (#6)
     end;
     // Flush this head's bank gradients into its neuron deltas (-LR scaled).
     TNNetVolume.MulAdd(N0.FDelta.GetRawPtr(), FGradK1.GetRawPtr(),
