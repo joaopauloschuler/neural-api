@@ -26163,12 +26163,11 @@ const
   cCTCUnalignable = 1e30; // returned when L*2+1 > T (target cannot be aligned)
   cNegInf = -1e30;
 var
-  NT, Vocab, L, NS, NTM1, NSM1, VocabM1, LM1, ti, si, i, k: integer;
-  NTM2: integer;
+  NT, L, NS, NTM1, NSM1, VocabM1, LM1, ti, si, i: integer;
+  NTM2, GradBase, GradIdx: integer;
   Ext: array of integer;          // extended label l' (blank-interleaved), length NS
   Alpha, Beta: array of array of double; // [ti][si] log-space lattice
-  LogLike, av, bv, occ, lse: double;
-  Gamma: array of array of double; // [ti][si] = exp(alpha+beta-LogLike)
+  LogLike, av, bv, occ: double;
   function LP(volume: TNNetVolume; tt, kk: integer): double; inline;
   begin
     Result := volume[tt, 0, kk];
@@ -26182,10 +26181,8 @@ var
   end;
 begin
   NT := ALogProbs.SizeX;
-  Vocab := ALogProbs.Depth;
   L := Length(Labels);
   NTM1 := NT - 1;
-  VocabM1 := Vocab - 1;
   LM1 := L - 1;
   if Assigned(AGrad) then
   begin
@@ -26207,6 +26204,15 @@ begin
     Ext[2 * i + 1] := Labels[i];
   end;
   Ext[NS - 1] := Blank;
+  // Clamp the symbol ids into the vocabulary once, so both the lattice reads
+  // (LP indexes by Ext[si]) and the gradient scatter below stay in bounds
+  // without a per-element range test.
+  VocabM1 := ALogProbs.Depth - 1;
+  for i := 0 to NSM1 do
+  begin
+    if Ext[i] < 0 then Ext[i] := 0
+    else if Ext[i] > VocabM1 then Ext[i] := VocabM1;
+  end;
 
   SetLength(Alpha, NT, NS);
   SetLength(Beta, NT, NS);
@@ -26257,24 +26263,24 @@ begin
   if LogLike <= cNegInf then Exit; // degenerate, leave grad at zero
 
   // Posterior occupancy gamma[ti][si] = exp(alpha+beta-LogLike); per symbol k,
-  // dL/d(logp_{ti,k}) = -sum_{si: Ext[si]=k} gamma[ti][si].
-  SetLength(Gamma, NT, NS);
+  // dL/d(logp_{ti,k}) = -sum_{si: Ext[si]=k} gamma[ti][si]. Scatter each
+  // occupancy straight into its own symbol slot instead of scanning the whole
+  // vocabulary per frame: AGrad was zero-filled above, so a symbol that never
+  // appears in Ext keeps the 0 the empty sum would have produced, and the
+  // ascending-si accumulation order is unchanged. O(NT*NS), not O(NT*Vocab*NS).
   for ti := 0 to NTM1 do
+  begin
+    GradBase := AGrad.GetRawPos(ti, 0);
     for si := 0 to NSM1 do
     begin
       occ := Alpha[ti][si] + Beta[ti][si] - LogLike;
-      if occ <= cNegInf then Gamma[ti][si] := 0
-      else Gamma[ti][si] := NeuralExp(occ);
+      if occ > cNegInf then
+      begin
+        GradIdx := GradBase + Ext[si];
+        AGrad.FData[GradIdx] := AGrad.FData[GradIdx] - NeuralExp(occ);
+      end;
     end;
-
-  for ti := 0 to NTM1 do
-    for k := 0 to VocabM1 do
-    begin
-      lse := 0;
-      for si := 0 to NSM1 do
-        if Ext[si] = k then lse := lse + Gamma[ti][si];
-      AGrad[ti, 0, k] := -lse;
-    end;
+  end;
 end;
 
 procedure TNNetCTCLoss.Backpropagate();
@@ -112186,6 +112192,78 @@ begin
   end;
 end;
 
+// Returns the (K+1)-th smallest element of Arr[0..N-1] (0-based rank K), i.e.
+// exactly the value Arr[K] would hold after an ascending sort of the same
+// multiset - ties and duplicates included. Arr is partially permuted in place.
+// Median-of-three Hoare quickselect (same shape as PartialSelectTokenArray in
+// neuralvolume.pas), average O(N) instead of the O(N^2) full sort the magnitude
+// pruning paths used to run just to read one order statistic. The two extreme
+// ranks are a plain linear scan: cheaper and obviously exact.
+// Coded by Claude (AI).
+function SelectKthSmallest(var Arr: array of TNeuralFloat;
+  N, K: integer): TNeuralFloat;
+var
+  Lo, Hi, I, J, Mid, NM1: integer;
+  Pivot, T: TNeuralFloat;
+begin
+  Result := 0;
+  if (N <= 0) or (K < 0) or (K >= N) then Exit;
+  NM1 := N - 1;
+  if K = 0 then
+  begin
+    Result := Arr[0];
+    for I := 1 to NM1 do
+      if Arr[I] < Result then Result := Arr[I];
+    Exit;
+  end;
+  if K = NM1 then
+  begin
+    Result := Arr[0];
+    for I := 1 to NM1 do
+      if Arr[I] > Result then Result := Arr[I];
+    Exit;
+  end;
+  Lo := 0;
+  Hi := NM1;
+  while Lo < Hi do
+  begin
+    // Median of Arr[Lo], Arr[Mid], Arr[Hi] as the pivot value; it lies between
+    // Arr[Lo] and Arr[Hi], so both scans below stop inside [Lo, Hi].
+    Mid := (Lo + Hi) shr 1;
+    if Arr[Mid] < Arr[Lo] then
+    begin
+      T := Arr[Mid]; Arr[Mid] := Arr[Lo]; Arr[Lo] := T;
+    end;
+    if Arr[Hi] < Arr[Lo] then
+    begin
+      T := Arr[Hi]; Arr[Hi] := Arr[Lo]; Arr[Lo] := T;
+    end;
+    if Arr[Mid] > Arr[Hi] then
+    begin
+      T := Arr[Mid]; Arr[Mid] := Arr[Hi]; Arr[Hi] := T;
+    end;
+    Pivot := Arr[Mid];
+    I := Lo;
+    J := Hi;
+    repeat
+      while Arr[I] < Pivot do Inc(I);
+      while Arr[J] > Pivot do Dec(J);
+      if I <= J then
+      begin
+        T := Arr[I]; Arr[I] := Arr[J]; Arr[J] := T;
+        Inc(I);
+        Dec(J);
+      end;
+    until I > J;
+    // Descend into the side still holding rank K; if K falls in the
+    // equal-to-pivot gap (J < K < I) the answer is already in place.
+    if K <= J then Hi := J
+    else if K >= I then Lo := I
+    else Break;
+  end;
+  Result := Arr[K];
+end;
+
 function TNNet.PruneWeightsByMagnitude(Sparsity: TNeuralFloat;
   PerLayer: boolean = False): integer;
 var
@@ -112201,22 +112279,6 @@ var
   Neuron: TNNetNeuron;
   AllAbs: array of TNeuralFloat;
   Threshold: TNeuralFloat;
-
-  procedure SortAsc(var Arr: array of TNeuralFloat; N: integer);
-  var A, B, NM2, BBnd: integer; SwapF: TNeuralFloat;
-  begin
-    NM2 := N - 2;
-    for A := 0 to NM2 do
-    begin
-      BBnd := NM2 - A;
-      for B := 0 to BBnd do
-        if Arr[B] > Arr[B + 1] then
-        begin
-          SwapF := Arr[B]; Arr[B] := Arr[B + 1]; Arr[B + 1] := SwapF;
-        end;
-    end;
-  end;
-
 begin
   Result := 0;
   if Sparsity <= 0 then
@@ -112262,12 +112324,11 @@ begin
         end;
       end;
     end;
-    SortAsc(AllAbs, TotalWeights);
     CutIdx := Trunc(Sparsity * TotalWeights);
     if CutIdx < 1 then CutIdx := 1;
     if CutIdx > TotalWeights then CutIdx := TotalWeights;
     // Threshold = magnitude of the largest weight we still prune.
-    Threshold := AllAbs[CutIdx - 1];
+    Threshold := SelectKthSmallest(AllAbs, TotalWeights, CutIdx - 1);
     for LayerCnt := 0 to PruneLastLayerIdx do
       Result := Result +
         FLayers[LayerCnt].BuildPruneMaskFromThreshold(Threshold);
@@ -112299,11 +112360,10 @@ begin
           Inc(K);
         end;
       end;
-      SortAsc(AllAbs, TotalWeights);
       CutIdx := Trunc(Sparsity * TotalWeights);
       if CutIdx < 1 then CutIdx := 1;
       if CutIdx > TotalWeights then CutIdx := TotalWeights;
-      Threshold := AllAbs[CutIdx - 1];
+      Threshold := SelectKthSmallest(AllAbs, TotalWeights, CutIdx - 1);
       Result := Result + Layer.BuildPruneMaskFromThreshold(Threshold);
     end;
   end;
@@ -112428,25 +112488,7 @@ var
   PredClass, TrueClass: integer;
   Bar, ShapeStr, Verdict, MetricName: string;
   KneeSparsity: TNeuralFloat;
-  SwapF: TNeuralFloat;
   LayerAbs: array of TNeuralFloat;
-
-  // Quickselect-free: collect |w| of a slice into Buf then sort ascending.
-  procedure SortAsc(var Arr: array of TNeuralFloat; N: integer);
-  var A, B, NM2, BBnd: integer;
-  begin
-    NM2 := N - 2;
-    for A := 0 to NM2 do
-    begin
-      BBnd := NM2 - A;
-      for B := 0 to BBnd do
-        if Arr[B] > Arr[B + 1] then
-        begin
-          SwapF := Arr[B]; Arr[B] := Arr[B + 1]; Arr[B + 1] := SwapF;
-        end;
-    end;
-  end;
-
 begin
   Result := '';
   Lines := TStringList.Create();
@@ -112575,15 +112617,15 @@ begin
             end;
           end;
         end;
-        SortAsc(AllAbs, TotalWeights);
         CutIdx := Trunc(S * TotalWeights);
         if CutIdx < 0 then CutIdx := 0;
         if CutIdx > TotalWeights then CutIdx := TotalWeights;
         // Threshold = the (CutIdx)-th smallest |w|; zero all <= that value.
         if CutIdx = 0 then Threshold := -1            // zero nothing
         else if CutIdx >= TotalWeights then
-          Threshold := AllAbs[TotalWeights - 1]       // zero everything
-        else Threshold := AllAbs[CutIdx - 1];
+          Threshold := SelectKthSmallest(AllAbs, TotalWeights,
+            TotalWeights - 1)                         // zero everything (max |w|)
+        else Threshold := SelectKthSmallest(AllAbs, TotalWeights, CutIdx - 1);
       end
       else
         Threshold := 0; // unused; per-layer threshold computed inside loop
@@ -112614,12 +112656,13 @@ begin
               Inc(K);
             end;
           end;
-          SortAsc(LayerAbs, PerLayerCount);
           PerLayerCut := Trunc(S * PerLayerCount);
           if PerLayerCut <= 0 then Threshold := -1
           else if PerLayerCut >= PerLayerCount then
-            Threshold := LayerAbs[PerLayerCount - 1]
-          else Threshold := LayerAbs[PerLayerCut - 1];
+            Threshold := SelectKthSmallest(LayerAbs, PerLayerCount,
+              PerLayerCount - 1)
+          else Threshold := SelectKthSmallest(LayerAbs, PerLayerCount,
+            PerLayerCut - 1);
         end;
 
         LpBnd230 := Layer.Neurons.Count - 1;
@@ -112786,11 +112829,11 @@ begin
           end;
         end;
       end;
-      SortAsc(AllAbs, TotalWeights);
       CutIdx := Trunc(S * TotalWeights);
       if CutIdx <= 0 then Threshold := -1
-      else if CutIdx >= TotalWeights then Threshold := AllAbs[TotalWeights - 1]
-      else Threshold := AllAbs[CutIdx - 1];
+      else if CutIdx >= TotalWeights then
+        Threshold := SelectKthSmallest(AllAbs, TotalWeights, TotalWeights - 1)
+      else Threshold := SelectKthSmallest(AllAbs, TotalWeights, CutIdx - 1);
     end;
     for I := 0 to MPTrainM1 do
     begin
@@ -112814,12 +112857,13 @@ begin
             Inc(K);
           end;
         end;
-        SortAsc(LayerAbs, PerLayerCount);
         PerLayerCut := Trunc(S * PerLayerCount);
         if PerLayerCut <= 0 then Threshold := -1
         else if PerLayerCut >= PerLayerCount then
-          Threshold := LayerAbs[PerLayerCount - 1]
-        else Threshold := LayerAbs[PerLayerCut - 1];
+          Threshold := SelectKthSmallest(LayerAbs, PerLayerCount,
+            PerLayerCount - 1)
+        else Threshold := SelectKthSmallest(LayerAbs, PerLayerCount,
+          PerLayerCut - 1);
       end;
       LpBnd238 := Layer.Neurons.Count - 1;
       for NeuronIdx := 0 to LpBnd238 do

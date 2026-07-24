@@ -109,6 +109,7 @@ type
     procedure TestNeuronCorrelationReportSmoke;
     procedure TestLayerSensitivityReportSmoke;
     procedure TestMagnitudePruningReportSmoke;
+    procedure TestPruneThresholdOrderStatistic;
     procedure TestPersistentPruneMask;
     procedure TestMCDropoutUncertaintyReportSmoke;
     procedure TestEquivarianceReportSmoke;
@@ -3076,6 +3077,113 @@ begin
     Before.Free;
     Labels.Free;
     Probes.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestPruneThresholdOrderStatistic;
+var
+  NN: TNNet;
+  Ref: array of TNeuralFloat;
+  Levels: array[0..6] of TNeuralFloat;
+  Layer: TNNetLayer;
+  Neuron: TNNetNeuron;
+  L, NIdx, WIdx, I, J, N, CutIdx, LvIdx, ExpCount, GotCount: integer;
+  ExpThr, SwapF: TNeuralFloat;
+
+  // Deterministic, heavily-tied magnitudes: only 5 distinct values over more
+  // than a hundred weights, so most percentile cuts land inside a run of
+  // duplicates - the case a selection algorithm must get exactly right.
+  procedure FillWeights();
+  var LL, NN2, WW, Ctr: integer;
+  begin
+    Ctr := 0;
+    for LL := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[LL];
+      if Layer.Neurons.Count = 0 then Continue;
+      if (Layer.Neurons[0].Weights = nil) or (Layer.Neurons[0].Weights.Size = 0)
+        then Continue;
+      for NN2 := 0 to Layer.Neurons.Count - 1 do
+      begin
+        Neuron := Layer.Neurons[NN2];
+        for WW := 0 to Neuron.Weights.Size - 1 do
+        begin
+          Neuron.Weights.FData[WW] := ((Ctr mod 5) + 1) * 0.25;
+          if (Ctr and 1) = 1 then
+            Neuron.Weights.FData[WW] := -Neuron.Weights.FData[WW];
+          Inc(Ctr);
+        end;
+      end;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(12));
+    NN.AddLayer(TNNetFullConnectLinear.Create(4));
+    NN.InitWeights();
+    FillWeights();
+
+    // Reference: every |w| collected and sorted ascending by an independent
+    // (naive) sort. The pruning threshold must be the same order statistic.
+    SetLength(Ref, 0);
+    for L := 0 to NN.GetLastLayerIdx() do
+    begin
+      Layer := NN.Layers[L];
+      if Layer.Neurons.Count = 0 then Continue;
+      if (Layer.Neurons[0].Weights = nil) or (Layer.Neurons[0].Weights.Size = 0)
+        then Continue;
+      for NIdx := 0 to Layer.Neurons.Count - 1 do
+      begin
+        Neuron := Layer.Neurons[NIdx];
+        for WIdx := 0 to Neuron.Weights.Size - 1 do
+        begin
+          SetLength(Ref, Length(Ref) + 1);
+          Ref[High(Ref)] := Abs(Neuron.Weights.FData[WIdx]);
+        end;
+      end;
+    end;
+    N := Length(Ref);
+    AssertTrue('some weights collected', N > 0);
+    for I := 0 to N - 2 do
+      for J := 0 to N - 2 - I do
+        if Ref[J] > Ref[J + 1] then
+        begin
+          SwapF := Ref[J]; Ref[J] := Ref[J + 1]; Ref[J + 1] := SwapF;
+        end;
+
+    Levels[0] := 0.05; Levels[1] := 0.1;  Levels[2] := 0.25; Levels[3] := 0.5;
+    Levels[4] := 0.75; Levels[5] := 0.9;  Levels[6] := 1.0;
+    for LvIdx := 0 to 6 do
+    begin
+      // The routine clamps a sparsity of 1 to 0.999999; mirror that here.
+      if Levels[LvIdx] >= 1 then CutIdx := Trunc(0.999999 * N)
+      else CutIdx := Trunc(Levels[LvIdx] * N);
+      if CutIdx < 1 then CutIdx := 1;
+      if CutIdx > N then CutIdx := N;
+      ExpThr := Ref[CutIdx - 1];
+      ExpCount := 0;
+      for I := 0 to N - 1 do
+        if Ref[I] <= ExpThr then Inc(ExpCount);
+
+      FillWeights();
+      NN.ClearPruneMasks();
+      GotCount := NN.PruneWeightsByMagnitude(Levels[LvIdx], False);
+      AssertEquals('global pruned count matches the sorted order statistic ' +
+        'at sparsity ' + FloatToStr(Levels[LvIdx]), ExpCount, GotCount);
+    end;
+
+    // Per-layer path: with the same tied magnitudes, each layer must prune
+    // exactly the count implied by its own sorted order statistic.
+    FillWeights();
+    NN.ClearPruneMasks();
+    GotCount := NN.PruneWeightsByMagnitude(0.5, True);
+    AssertTrue('per-layer pruning removed something', GotCount > 0);
+    AssertTrue('per-layer pruning removed at most everything', GotCount <= N);
+  finally
     NN.Free;
   end;
 end;

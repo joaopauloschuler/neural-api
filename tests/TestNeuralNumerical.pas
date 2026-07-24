@@ -865,6 +865,7 @@ type
     procedure TestNLLLossLoadFromString;
     procedure TestCTCLossForwardPassthrough;
     procedure TestCTCLossGradient;
+    procedure TestCTCLossGradientScatter;
     procedure TestCTCLossLoadFromString;
     procedure TestCTCDecodeGreedyRoundTrip;
     procedure TestCTCDecodeBeamSearch;
@@ -47058,6 +47059,63 @@ begin
     NN.Free;
     Input.Free; Target.Free; Logits.Free;
     LPPlus.Free; LPMinus.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestCTCLossGradientScatter;
+const
+  cT = 7;
+  cVocab = 5;
+  cBlank = 0;
+var
+  Logits, LogProbs, Grad: TNNetVolume;
+  Labels: array[0..2] of integer;
+  ti, k: integer;
+  RowSum, G: TNeuralFloat;
+begin
+  // Structural properties of dL/d(log p) that pin the per-frame occupancy
+  // scatter: a symbol absent from the extended label sequence gets EXACTLY 0,
+  // a symbol occupying several extended slots accumulates all of them, and the
+  // whole frame sums to -1 because the posteriors of one frame sum to 1.
+  // Labels [1, 2, 2] make Ext = [b,1,b,2,b,2,b]: blank appears 4x, label 2
+  // twice, and vocabulary entries 3 and 4 never.
+  Labels[0] := 1; Labels[1] := 2; Labels[2] := 2;
+  Logits := TNNetVolume.Create(cT, 1, cVocab);
+  LogProbs := TNNetVolume.Create(cT, 1, cVocab);
+  Grad := TNNetVolume.Create(1, 1, 1);
+  try
+    RandSeed := 20260724;
+    for ti := 0 to cT - 1 do
+      for k := 0 to cVocab - 1 do
+        Logits[ti, 0, k] := (Random - 0.5) * 3.0;
+    CTCLogitsToLogProbs(Logits, LogProbs);
+    // Pre-fill the gradient with garbage: the routine must resize + clear it.
+    Grad.ReSize(2, 1, 2);
+    Grad.Fill(7.0);
+    TNNetCTCLoss.ForwardBackwardLogLoss(LogProbs, Labels, cBlank, Grad);
+
+    AssertEquals('CTC grad SizeX', cT, Grad.SizeX);
+    AssertEquals('CTC grad Depth', cVocab, Grad.Depth);
+    for ti := 0 to cT - 1 do
+    begin
+      RowSum := 0;
+      for k := 0 to cVocab - 1 do
+      begin
+        G := Grad[ti, 0, k];
+        RowSum := RowSum + G;
+        AssertTrue('CTC grad is non-positive at ' + IntToStr(ti) + ',' +
+          IntToStr(k), G <= 0);
+        if k >= 3 then
+          AssertEquals('CTC grad exactly zero for unused symbol ' +
+            IntToStr(k) + ' at frame ' + IntToStr(ti), 0.0, G, 0.0);
+      end;
+      AssertEquals('CTC grad frame ' + IntToStr(ti) + ' sums to -1',
+        -1.0, RowSum, 1e-4);
+    end;
+  finally
+    Grad.Free;
+    LogProbs.Free;
+    Logits.Free;
   end;
 end;
 
