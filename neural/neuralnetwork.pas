@@ -67139,7 +67139,7 @@ var
   Wd, WB, WC, Bd, Ar, Ee, Prev: TNNetVolume;
   SeqLen, Depth, NS, t, d, j, s, hbase, ebase: integer;
   DepthM1, SeqLenM1, NSM1, tDepth, tNS: integer;
-  pre, sp, ad, hnew, accY, xd: TNeuralFloat;
+  pre, sp, ad, hnew, accY, xd, spxd: TNeuralFloat;
   XtPtr, OutPtr, WdRow: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
@@ -67193,13 +67193,14 @@ begin
     begin
       sp := FDelta.FData[tDepth + d];
       xd := XtPtr^[d];
+      spxd := sp * xd;   // Rule #5: sp,xd fixed across the s loop -> one mul/state.
       hbase := (tDepth + d) * NS;
       ebase := d * NS;
       for s := 0 to NSM1 do
       begin
         ad := NeuralExp(-sp * FExpA.FData[ebase + s]);
         FAt.FData[hbase + s] := ad;
-        hnew := ad * FH.FData[ebase + s] + sp * FBt.FData[tNS + s] * xd;
+        hnew := ad * FH.FData[ebase + s] + spxd * FBt.FData[tNS + s];
         FH.FData[ebase + s] := hnew;
         FState.FData[hbase + s] := hnew;
       end;
@@ -67229,7 +67230,7 @@ var
   WdtProj, WB, WC, Bd, Ar, Ee, WxProj, GDt, GB, GC, Prev: TNNetVolume;
   SeqLen, Depth, NS, RK, t, d, s, r, hbase, ebase: integer;
   DepthM1, SeqLenM1, NSM1, RKM1, tDepth, tNS: integer;
-  pre, sp, ad, hnew, accY, xd, ss, inv, eps: TNeuralFloat;
+  pre, sp, ad, hnew, accY, xd, ss, inv, eps, spxd: TNeuralFloat;
   XtPtr, OutPtr, WdtRow: TNeuralFloatArrPtr;
 
   function RmsScale(V: TNNetVolume; Cnt: integer): TNeuralFloat;
@@ -67315,13 +67316,14 @@ begin
     begin
       sp := FDelta.FData[tDepth + d];
       xd := XtPtr^[d];
+      spxd := sp * xd;   // Rule #5: sp,xd fixed across the s loop -> one mul/state.
       hbase := (tDepth + d) * NS;
       ebase := d * NS;
       for s := 0 to NSM1 do
       begin
         ad := NeuralExp(-sp * FExpA.FData[ebase + s]);
         FAt.FData[hbase + s] := ad;
-        hnew := ad * FH.FData[ebase + s] + sp * FBt.FData[tNS + s] * xd;
+        hnew := ad * FH.FData[ebase + s] + spxd * FBt.FData[tNS + s];
         FH.FData[ebase + s] := hnew;
         FState.FData[hbase + s] := hnew;
       end;
