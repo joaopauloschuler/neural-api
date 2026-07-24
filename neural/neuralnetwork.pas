@@ -69782,7 +69782,7 @@ begin
     // FOutput = gamma .* x_hat + beta  (elementwise over the depth segment).
     system.Move(XHatPtr^, XPtr^, Depth * csNeuralFloatSize);
     TNNetVolume.Mul(XPtr, GammaPtr, Depth);
-    TNNetVolume.MulAdd(XPtr, BetaPtr, 1, Depth);
+    TNNetVolume.Add(XPtr, BetaPtr, Depth);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
