@@ -7163,14 +7163,15 @@ type
     // whole table in FNeurons[0].Weights (VocabSize rows of EmbeddingSize),
     // outside the TNNetLayerConcatedWeights storage the conv/FC int8 path
     // uses - so it carries its own container with the SAME convention:
-    // vocab row t is FQuantCodes[t*EmbeddingSize..] with dequantized value
-    // code*FQuantScales[t], scale = max|row|/127 (symmetric, round-to-
-    // nearest). The forward gather dequantizes the looked-up row directly
-    // into the output (the FP32 table is never rebuilt), cutting the
+    // vocab row t holds codes with dequantized value code*Scale[0,t],
+    // scale = max|row|/127 (symmetric, round-to-nearest). FQuantTable is
+    // shaped (1, VocabSize, EmbeddingSize), so row t starts at
+    // t*EmbeddingSize and owns scale (0,t) - the same linear layout the two
+    // raw arrays had. The forward gather dequantizes the looked-up row
+    // directly into the output (the FP32 table is never rebuilt), cutting the
     // table's memory AND per-token bandwidth to ~1/4. Backpropagate raises.
     FQuantInt8: boolean;
-    FQuantCodes: array of ShortInt;
-    FQuantScales: array of TNeuralFloat;
+    FQuantTable: TNNetVolumeQuant8;
     {$IFDEF OpenCL}
     FTokenRows: array of integer;
     FEmbeddingCL: TNNetEmbeddingCL;
@@ -99147,10 +99148,9 @@ end;
 constructor TNNetEmbedding.Create(pVocabSize, pEmbeddingSize: integer;
   EncodeZero: integer = 0; ScaleEmbedding: TNeuralFloat = 0.02;
   pTrainable: boolean = true; pQuantizeInt8: boolean = false);
-var
-  RowCnt, VocabM1: integer;
 begin
   inherited Create();
+  FQuantTable := TNNetVolumeQuant8.Create();
   FVocabSize := pVocabSize;
   FEmbeddingSize := pEmbeddingSize;
   FEncodeZero := (EncodeZero>0);
@@ -99169,13 +99169,13 @@ begin
   if pQuantizeInt8 then
   begin
     // Arm the int8 container directly: zero codes (dequantized weight 0 -
-    // a valid forward), unit scales (the zero-row convention). The FP32
-    // table is never allocated; DequantizeWeightsInt8 can still restore
-    // writable rows for the FP32 import path.
-    SetLength(FQuantCodes, pVocabSize * pEmbeddingSize);
-    SetLength(FQuantScales, pVocabSize);
-    VocabM1 := pVocabSize - 1;
-    for RowCnt := 0 to VocabM1 do FQuantScales[RowCnt] := 1;
+    // a valid forward), unit scales (the zero-row convention). ReSize does
+    // not fill, so the scales are set explicitly. The FP32 table is never
+    // allocated; DequantizeWeightsInt8 can still restore writable rows for
+    // the FP32 import path.
+    FQuantTable.ReSize(1, pVocabSize, pEmbeddingSize);
+    FQuantTable.Fill(0);
+    FQuantTable.ScaleData.Fill(1);
     FQuantInt8 := true;
     // Parity with the FP32 sizing path, which refreshes the fast neuron
     // mirror inside SetNumWeightsForAllNeurons.
@@ -99192,6 +99192,7 @@ end;
 
 destructor TNNetEmbedding.Destroy;
 begin
+  FQuantTable.Free;
   SetLength(FInputTokens, 0);
   {$IFDEF OpenCL}
   SetLength(FTokenRows, 0);
@@ -99284,15 +99285,14 @@ begin
       IntToStr(FVocabSize * FEmbeddingSize) + '.');
     exit;
   end;
-  SetLength(FQuantScales, FVocabSize);
-  SetLength(FQuantCodes, FVocabSize * FEmbeddingSize);
+  FQuantTable.ReSize(1, FVocabSize, FEmbeddingSize);
   VocabM1 := FVocabSize - 1;
   for RowCnt := 0 to VocabM1 do
   begin
     RowBase := RowCnt * FEmbeddingSize;
     QuantizeInt8RowTolerant(TNeuralFloatArrPtr(@W.FData[RowBase]),
-      FEmbeddingSize, @FQuantCodes[RowBase], Scale);
-    FQuantScales[RowCnt] := Scale;
+      FEmbeddingSize, @FQuantTable.FData[RowBase], Scale);
+    FQuantTable.Scale[0, RowCnt] := Scale;
   end;
   // Free the FP32 table only after every row quantized successfully.
   // (1,1,1) matches the pre-SetNumWeights state; SetLength inside ReSize
@@ -99305,28 +99305,22 @@ end;
 
 procedure TNNetEmbedding.DequantizeWeightsInt8();
 var
-  RowCnt, ElementCnt, RowBase, EmbSizeM1, VocabM1, idx: integer;
-  Scale: TNeuralFloat;
+  RowCnt, VocabM1: integer;
   W: TNNetVolume;
 begin
   if not FQuantInt8 then exit;
   W := FNeurons[0].Weights;
+  // W keeps its own (VocabSize, 1, EmbeddingSize) shape, which shares the
+  // table's linear layout - hence the per-row expansion rather than
+  // DequantizeTo, which would impose the table's geometry on W.
   W.ReSize(FVocabSize, 1, FEmbeddingSize);
   VocabM1 := FVocabSize - 1;
-  EmbSizeM1 := FEmbeddingSize - 1;
   for RowCnt := 0 to VocabM1 do
   begin
-    RowBase := RowCnt * FEmbeddingSize;
-    Scale := FQuantScales[RowCnt];
-    idx := RowBase;
-    for ElementCnt := 0 to EmbSizeM1 do
-    begin
-      W.FData[idx] := FQuantCodes[idx] * Scale;
-      Inc(idx);
-    end;
+    FQuantTable.DequantizeRowTo(0, RowCnt,
+      TNeuralFloatArrPtr(@W.FData[RowCnt * FEmbeddingSize]));
   end;
-  SetLength(FQuantCodes, 0);
-  SetLength(FQuantScales, 0);
+  FQuantTable.ReSize(0, 0, 0);
   FQuantInt8 := false;
   AfterWeightUpdate();
 end;
@@ -99358,33 +99352,31 @@ begin
   end;
   RowBase := RowIdx * FEmbeddingSize;
   if QuantizeInt8RowTolerant(TNeuralFloatArrPtr(@Src.FData[SrcOffset]),
-       FEmbeddingSize, @FQuantCodes[RowBase], Scale) then
-    FQuantScales[RowIdx] := pExtraScale * Scale
+       FEmbeddingSize, @FQuantTable.FData[RowBase], Scale) then
+    FQuantTable.Scale[0, RowIdx] := pExtraScale * Scale
   else
     // Zero row: zero codes with unit scale, matching QuantizeWeightsInt8's
     // zero-row convention (pExtraScale is irrelevant - dequant is 0 either
     // way - and scale 1 keeps requantize-after-dequantize exact).
-    FQuantScales[RowIdx] := 1;
+    FQuantTable.Scale[0, RowIdx] := 1;
 end;
 
 function TNNetEmbedding.Int8QuantizedSizeBytes(): int64;
 begin
-  Result := int64(Length(FQuantCodes)) * csShortIntSize +
-    int64(Length(FQuantScales)) * csNeuralFloatSize;
+  Result := FQuantTable.GetMemSize();
 end;
 
 function TNNetEmbedding.CountWeights(): int64;
 begin
   if FQuantInt8 and (not FLinkedNeurons)
-  then Result := Length(FQuantCodes)
+  then Result := FQuantTable.Size
   else Result := inherited CountWeights();
 end;
 
 procedure TNNetEmbedding.Compute();
 var
   MaxToken, CntToken, CurrentToken: integer;
-  RowBase, ElementCnt, EmbSizeM1, RowBytes, RowStride, dstPos: integer;
-  RowScale: TNeuralFloat;
+  RowBytes, RowStride, dstPos: integer;
   SourcePtr, DestPtr: TNeuralFloatArrPtr;
   LocalWeights, PrevOut: TNNetVolume;
   StartTime: double;
@@ -99417,7 +99409,6 @@ begin
     // Int8 gather: dequantize the looked-up row straight into the output
     // token (code * per-row scale). The FP32 table is never rebuilt - the
     // weight stream costs 1 byte/element.
-    EmbSizeM1 := FEmbeddingSize - 1;
     for CntToken := 0 to MaxToken do
     begin
       CurrentToken := Round(PrevOut.FData[CntToken]);
@@ -99429,11 +99420,8 @@ begin
       if FEncodeZero or (CurrentToken>0) then
       begin
         FInputTokens[CntToken] := CurrentToken;
-        RowBase := CurrentToken * FEmbeddingSize;
-        RowScale := FQuantScales[CurrentToken];
         DestPtr := FOutput.GetRawPtr(dstPos);
-        for ElementCnt := 0 to EmbSizeM1 do
-          DestPtr^[ElementCnt] := FQuantCodes[RowBase + ElementCnt] * RowScale;
+        FQuantTable.DequantizeRowTo(0, CurrentToken, DestPtr);
       end
       else FillChar(FOutput.FData[dstPos], RowBytes, 0);
       Inc(dstPos, RowStride);
@@ -99697,6 +99685,7 @@ var
   MaxToken, CntToken, CurrentToken: integer;
   RowBase, ElementCnt, EmbSizeM1, RowBytes, RowStride, dstPos, posPos: integer;
   RowScale: TNeuralFloat;
+  CodesPtr: TNeuralInt8ArrPtr;
   SourcePtr, SourcePtrPos, DestPtr: TNeuralFloatArrPtr;
   LocalWeights, PrevOut: TNNetVolume;
   StartTime: double;
@@ -99715,7 +99704,10 @@ begin
   begin
     // Int8 token gather + FP32 positional add. Zero-padding semantics match
     // the FP32 path: a skipped token gets NEITHER table (output row stays 0).
+    // The dequantization is fused with the positional add rather than going
+    // through DequantizeRowTo, which would write the row twice.
     EmbSizeM1 := FEmbeddingSize - 1;
+    CodesPtr := FQuantTable.DataPtr;   // #11: base hoisted out of both loops
     for CntToken := 0 to MaxToken do
     begin
       CurrentToken := Round(PrevOut.FData[CntToken]);
@@ -99728,11 +99720,11 @@ begin
       begin
         FInputTokens[CntToken] := CurrentToken;
         RowBase := CurrentToken * FEmbeddingSize;
-        RowScale := FQuantScales[CurrentToken];
+        RowScale := FQuantTable.Scale[0, CurrentToken];
         SourcePtrPos := FPositionalEmbedding.GetRawPtr(posPos);
         DestPtr := FOutput.GetRawPtr(dstPos);
         for ElementCnt := 0 to EmbSizeM1 do
-          DestPtr^[ElementCnt] := FQuantCodes[RowBase + ElementCnt] * RowScale
+          DestPtr^[ElementCnt] := CodesPtr^[RowBase + ElementCnt] * RowScale
             + SourcePtrPos^[ElementCnt];
       end
       else FillChar(FOutput.FData[dstPos], RowBytes, 0);
