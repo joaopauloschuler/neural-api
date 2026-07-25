@@ -872,6 +872,7 @@ type
     procedure TestCTCDecodeGreedyRoundTrip;
     procedure TestCTCDecodeBeamSearch;
     procedure TestCTCDecodeBeamSearchPartialSortMatchesFullSort;
+    procedure TestCTCDecodeBeamSearchMatchesReferenceStress;
     procedure TestKLDivergenceForwardPassthrough;
     procedure TestKLDivergenceGradient;
     procedure TestKLDivergenceLoadFromString;
@@ -47625,6 +47626,86 @@ begin
   finally
     Scores.Free;
   end;
+end;
+
+// DecodeCTCBeamSearch addresses its candidate table by slot arithmetic instead
+// of searching it, so the one prefix collision the layout cannot express - a
+// live beam whose prefix IS another live beam's prefix plus one symbol (e.g.
+// "a" and "ab" both alive) - is resolved by an explicit per-frame alias pass.
+// This sweep must therefore reproduce the reference prefix-search decoder
+// EXACTLY on inputs that make that case common: a small alphabet with a wide
+// beam saturates the beam list with every prefix of the alphabet, so nearly
+// every frame carries parent/child beam pairs (and chains of them).
+//
+// Coverage: vocab 2/3/5, blank both last and first, T 4/8, blank-heavy and
+// blank-free extremes, a repeated-dominant-symbol pattern, raw-probability
+// (LogInput = false) input, and beam widths from 1 (no aliasing possible) to 40
+// (beam list saturated). Seeds are fixed, so any failure reproduces.
+procedure TTestNeuralNumerical.TestCTCDecodeBeamSearchMatchesReferenceStress;
+var
+  Scores: TNNetVolume;
+  Got, Ref: TNeuralIntegerArray;
+  Vocab, Blank, cT, Mode, Trial, Widx, BW, ti, k, n, Seed: integer;
+  VIdx, BIdx, TIdx: integer;
+  Vocabs: array[0..2] of integer;
+  Widths: array[0..5] of integer;
+  Ts: array[0..1] of integer;
+  LogIn: boolean;
+  V: TNeuralFloat;
+  Msg: string;
+begin
+  Vocabs[0] := 2; Vocabs[1] := 3; Vocabs[2] := 5;
+  Widths[0] := 1; Widths[1] := 2; Widths[2] := 3;
+  Widths[3] := 7; Widths[4] := 16; Widths[5] := 40;
+  Ts[0] := 4; Ts[1] := 8;
+  for VIdx := 0 to 2 do
+    for BIdx := 0 to 1 do
+      for TIdx := 0 to 1 do
+        for Mode := 0 to 4 do
+          for Trial := 0 to 2 do
+          begin
+            Vocab := Vocabs[VIdx];
+            if BIdx = 0 then Blank := Vocab - 1 else Blank := 0;
+            cT := Ts[TIdx];
+            // Mode 3 feeds raw probabilities instead of log-probabilities.
+            LogIn := (Mode <> 3);
+            Scores := TNNetVolume.Create(cT, 1, Vocab);
+            try
+              // Deterministic pseudo-random scores (a plain LCG, so the test is
+              // reproducible and independent of the RTL's generator).
+              Seed := 1 + Trial * 913 + VIdx * 77 + BIdx * 31 + TIdx * 13 +
+                Mode * 401;
+              for ti := 0 to cT - 1 do
+                for k := 0 to Vocab - 1 do
+                begin
+                  Seed := (Seed * 75 + 74) mod 65537;   // Lehmer; cannot overflow
+                  V := -4.0 + (Seed mod 1000) * 0.004;
+                  // Mode 1: blank dominates (nearly every frame is a blank, so
+                  // beams keep their prefix). Mode 2: blank is starved (nearly
+                  // every frame extends). Mode 4: one symbol dominates for two
+                  // consecutive frames, exercising the repeat-last-symbol merge.
+                  if (Mode = 1) and (k = Blank) then V := V + 3.0;
+                  if (Mode = 2) and (k = Blank) then V := V - 6.0;
+                  if (Mode = 4) and (k = ((ti div 2) mod Vocab)) then V := V + 4.0;
+                  if Mode = 3 then V := NeuralExp(V);
+                  Scores[ti, 0, k] := V;
+                end;
+              for Widx := 0 to 5 do
+              begin
+                BW := Widths[Widx];
+                Ref := RefCTCBeamSearchFullSort(Scores, BW, Blank, LogIn);
+                Got := DecodeCTCBeamSearch(Scores, BW, Blank, LogIn);
+                Msg := 'vocab ' + IntToStr(Vocab) + ' blank ' + IntToStr(Blank) +
+                  ' T ' + IntToStr(cT) + ' mode ' + IntToStr(Mode) +
+                  ' trial ' + IntToStr(Trial) + ' beam ' + IntToStr(BW);
+                AssertEquals(Msg + ': decoded length', Length(Ref), Length(Got));
+                for n := 0 to Length(Ref) - 1 do
+                  AssertEquals(Msg + ': label ' + IntToStr(n), Ref[n], Got[n]);
+              end;
+            finally
+              Scores.Free;
+            end;
+          end;
 end;
 
 procedure TTestNeuralNumerical.TestKLDivergenceForwardPassthrough;
