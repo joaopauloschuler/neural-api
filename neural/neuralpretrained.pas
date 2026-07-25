@@ -45595,14 +45595,19 @@ procedure DemucsLSTMCell(const Seq: TNNetFloatDynArr2D;
   const Wih, Whh, Bih, Bhh: array of TNeuralFloat;
   InSize, Hidden, T: integer; Reverse: boolean; out Outp: TNNetFloatDynArr2D);
 var
-  h, cstate, g: TNeuralFloatDynArr;
+  h, cstate, g, xbuf: TNeuralFloatDynArr;
   step, t0, k, j, baseR, whhBase: integer;
   gi, gf, gg, go, accg: TNeuralFloat;
   HiddenM1, Hidden4M1, TM1, InSizeM1, H2, H3: integer;
+  xptr: TNeuralFloatArrPtr;
 begin
   SetLength(h, Hidden);
   SetLength(cstate, Hidden);
   SetLength(g, 4 * Hidden);
+  SetLength(xbuf, InSize);
+  // Timestep input gathered once per step; xbuf never moves, so bind its base
+  // here (nil when InSize is 0, which DotProduct treats as an empty sum).
+  if InSize > 0 then xptr := Addr(xbuf[0]) else xptr := nil;
   HiddenM1 := Hidden - 1;
   Hidden4M1 := 4 * Hidden - 1;
   TM1 := T - 1;
@@ -45615,16 +45620,18 @@ begin
   for step := 0 to TM1 do
   begin
     if Reverse then t0 := T - 1 - step else t0 := step;
+    // Gather the strided channel-major column Seq[j][t0] into a contiguous
+    // vector once: it is the same for all 4*Hidden gate rows below.
+    for j := 0 to InSizeM1 do xbuf[j] := Seq[j][t0];
     // g = Wih*x + Bih + Whh*h + Bhh
     baseR := 0;                            // #6: k*InSize carried
     whhBase := 0;                          // #6: k*Hidden carried
     for k := 0 to Hidden4M1 do
     begin
       accg := Bih[k] + Bhh[k];             // #4: accumulate into a local
-      // Wih*x stays scalar: Seq[j][t0] is strided across j (channel-major),
-      // and this free procedure has no persistent owner for a gather buffer.
-      for j := 0 to InSizeM1 do
-        accg := accg + Wih[baseR + j] * Seq[j][t0];
+      // Wih*x over the gathered input -> one AVX DotProduct (#13).
+      accg := accg + TNNetVolume.DotProduct(
+        Addr(Wih[baseR]), xptr, InSize);
       // Whh*h is contiguous over h -> one AVX DotProduct (#13).
       accg := accg + TNNetVolume.DotProduct(
         Addr(Whh[whhBase]), Addr(h[0]), Hidden);
