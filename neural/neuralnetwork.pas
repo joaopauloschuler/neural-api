@@ -10928,6 +10928,12 @@ type
       FBaseV: TNNetVolume;     // forward cache base, (SeqLen,1,Depth)
       FDecayV: TNNetVolume;    // forward cache decay window, (SeqLen,1,Depth)
       FFilter: TNNetVolume;    // forward cache h = base.*decay, (SeqLen,1,Depth)
+      FSpLog: TNNetVolume;     // softplus(logDecay) per channel, (1,1,Depth)
+      // Backward scratch (filter / base / act / pre gradients). Persistent
+      // fields lazily sized in Backpropagate: creating them per call is four
+      // heap allocations on a training step (rule #17), and an inference-only
+      // net never touches them.
+      FGdH, FGdBase, FGdAct, FGdPre: TNNetVolume;
       procedure BuildPhi();
       procedure BuildFilter();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -68519,6 +68525,11 @@ begin
   FBaseV := TNNetVolume.Create();
   FDecayV := TNNetVolume.Create();
   FFilter := TNNetVolume.Create();
+  FSpLog := TNNetVolume.Create();
+  FGdH := TNNetVolume.Create();
+  FGdBase := TNNetVolume.Create();
+  FGdAct := TNNetVolume.Create();
+  FGdPre := TNNetVolume.Create();
   // The implicit MLP needs five learnable tensors with DIFFERENT shapes, so we
   // size each neuron individually in SetPrevLayer (Depth/SeqLen are not known
   // yet here). AddMissingNeurons gives us the five neuron slots.
@@ -68527,6 +68538,11 @@ end;
 
 destructor TNNetImplicitLongConv.Destroy();
 begin
+  FGdPre.Free;
+  FGdAct.Free;
+  FGdBase.Free;
+  FGdH.Free;
+  FSpLog.Free;
   FFilter.Free;
   FDecayV.Free;
   FBaseV.Free;
@@ -68590,6 +68606,7 @@ begin
   FBaseV.ReSize(FSeqLen, 1, Depth);
   FDecayV.ReSize(FSeqLen, 1, Depth);
   FFilter.ReSize(FSeqLen, 1, Depth);
+  FSpLog.ReSize(1, 1, Depth);
   BuildPhi();
   InitDefault();
   AfterWeightUpdate();
@@ -68600,7 +68617,8 @@ var
   W1, B1, W2, B2, WLog: TNNetVolume;
   Depth, p, j, f, c, pFeatBase, pHidBase: integer;
   DepthM1, FSeqLenM1, FHiddenM1, FNumFeatM1: integer;
-  pn, s, sp, dec, invLen: TNeuralFloat;
+  pn, s, dec, invLen: TNeuralFloat;
+  pBase: integer;
 begin
   // Generate the full-length implicit filter h[p,c] = base[p,c]*decay[p,c] and
   // cache every intermediate (pre, act, base, decay) for the backward pass.
@@ -68617,11 +68635,22 @@ begin
   // p_norm = p/(FSeqLen-1): hoist the reciprocal (#5). FSeqLen<=1 => 0.
   invLen := 0;
   if FSeqLen > 1 then invLen := 1 / (FSeqLen - 1);
+  // softplus(logDecay[c]) depends only on the weights, not on p (#5/#11): build
+  // the per-channel vector once instead of a log+exp pair per (p,c).
+  for c := 0 to DepthM1 do
+    FSpLog.FData[c] := pcr_logf(1 + NeuralExp(-Abs(WLog.FData[c]))) +
+      Max(WLog.FData[c], 0);   // stable softplus
   for p := 0 to FSeqLenM1 do
   begin
     pn := p * invLen;
     pFeatBase := p * FNumFeat;
     pHidBase := p * FHidden;
+    pBase := p * Depth;
+    // decay[p,c] = exp(-softplus(logDecay[c])*p_norm): the whole row is one
+    // contiguous scaled copy of FSpLog followed by one vectorized exp (#19).
+    Move(FSpLog.FData[0], FDecayV.FData[pBase], Depth * csNeuralFloatSize);
+    TNNetVolume.Mul(@FDecayV.FData[pBase], -pn, Depth);
+    TNNetVolume.VectorExp(@FDecayV.FData[pBase], @FDecayV.FData[pBase], Depth);
     // Hidden layer: pre = W1*phi + b1, act = tanh(pre).
     // W1[j,0,f]=W1.FData[j*FNumFeat+f]; FPhi row p is contiguous -> DotProduct.
     for j := 0 to FHiddenM1 do
@@ -68637,11 +68666,9 @@ begin
     begin
       s := B2.FData[c] + TNNetVolume.DotProduct(
         @W2.FData[c * FHidden], @FAct.FData[pHidBase], FHidden);
-      FBaseV[p, 0, c] := s;
-      sp := pcr_logf(1 + NeuralExp(-Abs(WLog.FData[c]))) + Max(WLog.FData[c], 0); // softplus, stable
-      dec := NeuralExp(-sp * pn);
-      FDecayV[p, 0, c] := dec;
-      FFilter[p, 0, c] := s * dec;
+      FBaseV.FData[pBase + c] := s;
+      dec := FDecayV.FData[pBase + c];
+      FFilter.FData[pBase + c] := s * dec;
     end;
   end;
 end;
@@ -68690,7 +68717,6 @@ var
   Depth, t, p, c, j, f, s, posH, posX, posF, idx: integer;
   DepthM1, FSeqLenM1, FHiddenM1, FNumFeatM1: integer;
   gy, gh, gbase, gdec, gpre, pn, dsp_dlog, gAccum, invLen, w2cj: TNeuralFloat;
-  GdH, GdBase, GdAct, GdPre: TNNetVolume;
   hasInputGrad: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -68711,13 +68737,20 @@ begin
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
 
-  // Scratch grad volumes (filter, base, act, pre) over the filter axis.
-  GdH := TNNetVolume.Create(FSeqLen, 1, Depth);
-  GdBase := TNNetVolume.Create(FSeqLen, 1, Depth);
-  GdAct := TNNetVolume.Create(FSeqLen, 1, FHidden);
-  GdPre := TNNetVolume.Create(FSeqLen, 1, FHidden);
-  try
-    GdH.Fill(0); GdBase.Fill(0); GdAct.Fill(0); GdPre.Fill(0);
+  // Scratch grad volumes (filter, base, act, pre) over the filter axis. Layer
+  // fields resized only when the shape changed (#17), never re-created.
+  if FGdH.Size <> FSeqLen * Depth then
+  begin
+    FGdH.ReSize(FSeqLen, 1, Depth);
+    FGdBase.ReSize(FSeqLen, 1, Depth);
+  end;
+  if FGdAct.Size <> FSeqLen * FHidden then
+  begin
+    FGdAct.ReSize(FSeqLen, 1, FHidden);
+    FGdPre.ReSize(FSeqLen, 1, FHidden);
+  end;
+  begin
+    FGdH.Fill(0); FGdBase.Fill(0); FGdAct.Fill(0); FGdPre.Fill(0);
     // dL/dh[p,c] = sum_{t>=p} gy[t,c]*x[t-p,c]
     // dL/dx[s,c] = sum_{p=0..SeqLen-1-s} gy[s+p,c]*h[p,c]   (s = t-p)
     invLen := 0;
@@ -68728,14 +68761,14 @@ begin
         idx := t * Depth + c;
         gy := FOutputError.FData[idx];
         if gy = 0 then continue;
-        // GdH[p,0,c] +Depth per p; Prev/PrevErr[t-p,0,c] share one offset,
+        // FGdH[p,0,c] +Depth per p; Prev/PrevErr[t-p,0,c] share one offset,
         // -Depth per p; FFilter[p,0,c] +Depth per p. Carry the offsets (#12).
         posH := c;
         posX := idx;
         posF := c;
         for p := 0 to t do
         begin
-          GdH.FData[posH] := GdH.FData[posH] + gy * Prev.FData[posX];
+          FGdH.FData[posH] := FGdH.FData[posH] + gy * Prev.FData[posX];
           if hasInputGrad then
             PrevErr.FData[posX] := PrevErr.FData[posX] + gy * FFilter.FData[posF];
           Inc(posH, Depth);
@@ -68754,15 +68787,15 @@ begin
       for p := 0 to FSeqLenM1 do
       begin
         pn := p * invLen;
-        gh := GdH[p, 0, c];
-        GdBase[p, 0, c] := gh * FDecayV[p, 0, c];
+        gh := FGdH[p, 0, c];
+        FGdBase[p, 0, c] := gh * FDecayV[p, 0, c];
         gdec := gh * FBaseV[p, 0, c];
         gAccum := gAccum + gdec * FDecayV[p, 0, c] * (-pn) * dsp_dlog;
       end;
       // dL/db2[c] += sum_p dL/dbase[p,c] ; dL/dlogDecay[c] += gAccum.
       gbase := 0;
       for p := 0 to FSeqLenM1 do
-        gbase := gbase + GdBase[p, 0, c];
+        gbase := gbase + FGdBase[p, 0, c];
       N3.FDelta.FData[c] := N3.FDelta.FData[c] + (-FLearningRate) * gbase;
       N4.FDelta.FData[c] := N4.FDelta.FData[c] + (-FLearningRate) * gAccum;
     end;
@@ -68777,9 +68810,9 @@ begin
         w2cj := W2[c, 0, j]; // invariant across p (#8)
         for p := 0 to FSeqLenM1 do
         begin
-          gbase := GdBase[p, 0, c];
+          gbase := FGdBase[p, 0, c];
           gAccum := gAccum + gbase * FAct[p, 0, j];
-          GdAct[p, 0, j] := GdAct[p, 0, j] + gbase * w2cj;
+          FGdAct[p, 0, j] := FGdAct[p, 0, j] + gbase * w2cj;
         end;
         N2.FDelta[c, 0, j] := N2.FDelta[c, 0, j] + (-FLearningRate) * gAccum;
       end;
@@ -68787,7 +68820,7 @@ begin
     // act = tanh(pre) -> dL/dpre = dL/dact*(1-act^2).
     for p := 0 to FSeqLenM1 do
       for j := 0 to FHiddenM1 do
-        GdPre[p, 0, j] := GdAct[p, 0, j] *
+        FGdPre[p, 0, j] := FGdAct[p, 0, j] *
           (1 - FAct[p, 0, j] * FAct[p, 0, j]);
 
     // pre = W1*phi + b1:
@@ -68797,21 +68830,16 @@ begin
     begin
       gpre := 0;
       for p := 0 to FSeqLenM1 do
-        gpre := gpre + GdPre[p, 0, j];
+        gpre := gpre + FGdPre[p, 0, j];
       N1.FDelta.FData[j] := N1.FDelta.FData[j] + (-FLearningRate) * gpre;
       for f := 0 to FNumFeatM1 do
       begin
         gAccum := 0;
         for p := 0 to FSeqLenM1 do
-          gAccum := gAccum + GdPre[p, 0, j] * FPhi[p, 0, f];
+          gAccum := gAccum + FGdPre[p, 0, j] * FPhi[p, 0, f];
         N0.FDelta[j, 0, f] := N0.FDelta[j, 0, f] + (-FLearningRate) * gAccum;
       end;
     end;
-  finally
-    GdPre.Free;
-    GdAct.Free;
-    GdBase.Free;
-    GdH.Free;
   end;
 
   if (not FBatchUpdate) then
