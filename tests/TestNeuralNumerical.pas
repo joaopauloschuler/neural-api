@@ -108,6 +108,7 @@ type
     procedure TestFourierMixLoadFromString;
     procedure TestFourierMixFFTMatchesDirect;
     procedure TestFourierMixForwardKnownValue;
+    procedure TestFourierMixDirectSeparableMatchesNaive;
 
     // Activation function numerical tests
     procedure TestReLUNumericalRange;
@@ -7750,6 +7751,55 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFourierMixDirectSeparableMatchesNaive;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Shapes: array[0..6, 0..1] of integer =
+    ((3, 5), (6, 10), (7, 7), (12, 9), (1, 6), (5, 1), (9, 4));
+  ShapeIdx, L, D, a, b, s, h, LM1, DM1, SizeM1: integer;
+  Acc, TwoPi: Double;
+begin
+  // The direct path is SEPARABLE (cos(A+B) expansion) and reads fundamental
+  // twiddle tables with a carried, conditionally-wrapped index. Pin it against
+  // a verbatim naive sum_{s,h} x[s,h]*Cos(2*pi*(a*s/L + b*h/D)) reference over
+  // NON-power-of-two shapes (which TestFourierMixFFTMatchesDirect cannot cover)
+  // plus the degenerate L=1 and D=1 axes, so a wrong table wrap is caught.
+  TwoPi := 2 * Pi;
+  for ShapeIdx := 0 to 6 do
+  begin
+    L := Shapes[ShapeIdx][0];
+    D := Shapes[ShapeIdx][1];
+    LM1 := L - 1;
+    DM1 := D - 1;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(L, 1, D);
+    try
+      NN.AddLayer(TNNetInput.Create(L, 1, D, 1));
+      NN.AddLayer(TNNetFourierMix.Create(0)); // direct path
+      SizeM1 := Input.Size - 1;
+      for s := 0 to SizeM1 do
+        Input.Raw[s] := Sin(s * 1.1 + 0.4) * 1.7 + Cos(s * 0.23) * 0.4;
+      NN.Compute(Input);
+      for a := 0 to LM1 do
+        for b := 0 to DM1 do
+        begin
+          Acc := 0;
+          for s := 0 to LM1 do
+            for h := 0 to DM1 do
+              Acc := Acc + Input.Raw[s * D + h] *
+                Cos(TwoPi * (a * s) / L + TwoPi * (b * h) / D);
+          AssertEquals('FourierMix direct ' + IntToStr(L) + 'x' + IntToStr(D) +
+            ' at (' + IntToStr(a) + ',' + IntToStr(b) + ')',
+            Acc, NN.GetLastLayer.Output.Raw[a * D + b], 1e-3);
+        end;
+    finally
+      NN.Free;
+      Input.Free;
+    end;
   end;
 end;
 

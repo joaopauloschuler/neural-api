@@ -3614,6 +3614,18 @@ type
   TNNetFourierMix = class(TNNetIdentity)
   protected
     FGradVol: TNNetVolume; // persistent, lazily-sized backprop DFT scratch (rule #17)
+    // Persistent, lazily-sized DFT scratch and twiddle tables (rule #17): built
+    // once per (SeqLen, Depth) shape, never allocated per call.
+    FDirCacheL, FDirCacheD: integer;
+    FTwCosL, FTwSinL: array of Double;  // fundamental cos/sin(2*pi*t/L), t=0..L-1
+    FTwCosD, FTwSinD: array of Double;  // fundamental cos/sin(2*pi*t/D), t=0..D-1
+    FCosA, FSinA: array of Double;      // one sequence-axis row (length L)
+    FCrT, FCiT: array of Double;        // hidden-axis partial sums, [b*L + s]
+    FFFTCacheL, FFFTCacheD: integer;
+    FFFTRe, FFFTIm: array of array of Double; // [s][h] after hidden-axis FFT
+    FFFTColRe, FFFTColIm: array of Double;    // one sequence-axis column
+    procedure EnsureDirectBuffers(L, D: integer);
+    procedure EnsureFFTBuffers(L, D: integer);
     procedure ApplyRealDFT(Src, Dst: TNNetVolume);
     procedure ApplyRealDFTDirect(Src, Dst: TNNetVolume);
     procedure ApplyRealDFTFFT(Src, Dst: TNNetVolume);
@@ -29823,6 +29835,10 @@ begin
   inherited Create();
   if pUseFFT <> 0 then FStruct[0] := 1 else FStruct[0] := 0;
   FGradVol := TNNetVolume.Create();
+  FDirCacheL := -1;
+  FDirCacheD := -1;
+  FFFTCacheL := -1;
+  FFFTCacheD := -1;
 end;
 
 destructor TNNetFourierMix.Destroy();
@@ -29854,38 +29870,116 @@ begin
       '. Disable UseFFT for the direct O(n^2) path.');
 end;
 
-// Direct O(n^2) real 2D-DFT operator, valid for arbitrary L and D:
+// Lazily (re)builds the direct-path twiddle tables and separable intermediates
+// for an (L x D) transform. These are persistent layer fields resized only when
+// the shape changes (rule #17), so the compute path never allocates once warm.
+procedure TNNetFourierMix.EnsureDirectBuffers(L, D: integer);
+var
+  t, LM1, DM1: integer;
+  Step, Ang: Double;
+begin
+  if (L = FDirCacheL) and (D = FDirCacheD) then exit;
+  LM1 := L - 1;
+  DM1 := D - 1;
+  SetLength(FTwCosL, L);
+  SetLength(FTwSinL, L);
+  SetLength(FTwCosD, D);
+  SetLength(FTwSinD, D);
+  SetLength(FCosA, L);
+  SetLength(FSinA, L);
+  SetLength(FCrT, L * D);
+  SetLength(FCiT, L * D);
+  // cos/sin(2*pi*a*s/L) depends only on (a*s) mod L, so ONE fundamental L-entry
+  // table serves every (a,s) pair -- no (L x L) product table, no modulo, and
+  // L instead of L*L RTL Cos/Sin calls. Same for the hidden axis with D.
+  Step := 2 * Pi / L;
+  for t := 0 to LM1 do
+  begin
+    Ang := Step * t;
+    FTwCosL[t] := Cos(Ang);
+    FTwSinL[t] := Sin(Ang);
+  end;
+  Step := 2 * Pi / D;
+  for t := 0 to DM1 do
+  begin
+    Ang := Step * t;
+    FTwCosD[t] := Cos(Ang);
+    FTwSinD[t] := Sin(Ang);
+  end;
+  FDirCacheL := L;
+  FDirCacheD := D;
+end;
+
+// Direct real 2D-DFT operator, valid for arbitrary L and D:
 //   Dst[a,b] = sum_{s,h} Src[s,h] * cos( 2*pi*(a*s/L + b*h/D) )
 // This is both the forward map (FNet Re(DFT)) AND its own adjoint, so the same
 // routine serves Compute (Src=input) and Backpropagate (Src=dL/dy).
+//
+// The naive quadruple nest is O(L^2*D^2) with an RTL Cos per innermost step.
+// Because cos(A+B) = cos A cos B - sin A sin B, the transform is SEPARABLE:
+//   Cr[s,b] = sum_h x[s,h]*cos(2*pi*b*h/D)   Ci[s,b] = sum_h x[s,h]*sin(2*pi*b*h/D)
+//   Dst[a,b] = sum_s ( cos(2*pi*a*s/L)*Cr[s,b] - sin(2*pi*a*s/L)*Ci[s,b] )
+// which costs O(L*D^2 + L^2*D). Both stages read a fundamental twiddle table
+// with a carried index, so no Cos/Sin call remains on the compute path at all.
 procedure TNNetFourierMix.ApplyRealDFTDirect(Src, Dst: TNNetVolume);
 var
-  L, D, LM1, DM1, a, b, s, h, sD, aD: integer;
-  Acc, TwoPi, AngS, bStep, aStep: Double;
+  L, D, LM1, DM1, a, b, s, h, sD, aD, bL, pos, idx: integer;
+  Cr, Ci, Acc, V: Double;
 begin
   L := Src.SizeX;
   D := Src.Depth;
   LM1 := L - 1;
   DM1 := D - 1;
-  TwoPi := 2 * Pi;
+  EnsureDirectBuffers(L, D);
+  // ---- Stage 1: hidden axis, O(L*D^2). Cr/Ci are stored TRANSPOSED as
+  // [b*L + s] so stage 2's s-loop walks them contiguously.
+  for s := 0 to LM1 do
+  begin
+    sD := s * D;   // #11: s*D is invariant across the b and h loops
+    pos := s;      // #6: carries b*L + s; one L-step per b
+    for b := 0 to DM1 do
+    begin
+      Cr := 0;
+      Ci := 0;
+      // idx carries (b*h) mod D. The step is b <= D-1 and idx < D before each
+      // step, so idx + b < 2*D and a single conditional subtract reduces it.
+      idx := 0;
+      for h := 0 to DM1 do
+      begin
+        V := Src.FData[sD + h];
+        Cr := Cr + V * FTwCosD[idx];
+        Ci := Ci + V * FTwSinD[idx];
+        Inc(idx, b);
+        if idx >= D then Dec(idx, D);
+      end;
+      FCrT[pos] := Cr;
+      FCiT[pos] := Ci;
+      Inc(pos, L);
+    end;
+  end;
+  // ---- Stage 2: sequence axis, O(L^2*D).
   for a := 0 to LM1 do
   begin
-    // #11: TwoPi*(a*s)/L = (TwoPi*a/L)*s and a*D are a-only, invariant across b.
-    aStep := TwoPi * a / L;
+    // The a-th row of sequence-axis twiddles is invariant across b (#11), so
+    // build it once per a; idx carries (a*s) mod L with the same reduction
+    // argument (step a <= L-1, idx < L before each step).
+    idx := 0;
+    for s := 0 to LM1 do
+    begin
+      FCosA[s] := FTwCosL[idx];
+      FSinA[s] := FTwSinL[idx];
+      Inc(idx, a);
+      if idx >= L then Dec(idx, L);
+    end;
     aD := a * D;
+    bL := 0;   // #6: carries b*L, the base of Cr/Ci row b
     for b := 0 to DM1 do
     begin
       Acc := 0;
-      // #5: TwoPi*(b*h)/D = (TwoPi*b/D)*h; hoist the b-only factor out of the h loop.
-      bStep := TwoPi * b / D;
       for s := 0 to LM1 do
-      begin
-        AngS := aStep * s;
-        sD := s * D;   // #11: s*D is invariant across the h loop
-        for h := 0 to DM1 do
-          Acc := Acc + Src.FData[sD + h] * Cos(AngS + bStep * h);
-      end;
+        Acc := Acc + FCosA[s] * FCrT[bL + s] - FSinA[s] * FCiT[bL + s];
       Dst.FData[aD + b] := Acc;
+      Inc(bL, L);
     end;
   end;
 end;
@@ -29893,6 +29987,17 @@ end;
 // FFT fast path: a separable 2D FFT. We FFT along the hidden axis (length D),
 // then along the sequence axis (length L), and keep the real part. The result
 // equals Re(DFT_seq(DFT_hidden(x))) exactly. Both axes must be powers of two.
+procedure TNNetFourierMix.EnsureFFTBuffers(L, D: integer);
+begin
+  if (L = FFFTCacheL) and (D = FFFTCacheD) then exit;
+  SetLength(FFFTRe, L, D);
+  SetLength(FFFTIm, L, D);
+  SetLength(FFFTColRe, L);
+  SetLength(FFFTColIm, L);
+  FFFTCacheL := L;
+  FFFTCacheD := D;
+end;
+
 procedure TNNetFourierMix.ApplyRealDFTFFT(Src, Dst: TNNetVolume);
 var
   L, D, LM1, DM1, s, h, sD, pos: integer;
@@ -29904,8 +30009,10 @@ begin
   D := Src.Depth;
   LM1 := L - 1;
   DM1 := D - 1;
-  SetLength(reRows, L, D);
-  SetLength(imRows, L, D);
+  // Persistent, lazily-sized layer fields (rule #17) -- not a per-call SetLength.
+  EnsureFFTBuffers(L, D);
+  reRows := FFFTRe;
+  imRows := FFFTIm;
   // FFT each row across the hidden (depth) axis.
   for s := 0 to LM1 do
   begin
@@ -29920,8 +30027,8 @@ begin
     FourierMixFFT(rowRe, rowIm, D, false);
   end;
   // FFT each column across the sequence axis, keep real part.
-  SetLength(colRe, L);
-  SetLength(colIm, L);
+  colRe := FFFTColRe;
+  colIm := FFFTColIm;
   for h := 0 to DM1 do
   begin
     for s := 0 to LM1 do
