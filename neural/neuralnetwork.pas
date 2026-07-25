@@ -10749,6 +10749,15 @@ type
       FH: TNNetVolume;       // running state vector h, Depth*N-long scratch
       FGh: TNNetVolume;      // backward state-gradient gh, Depth*N-long scratch
       FExpA: TNNetVolume;    // exp(A_raw), Depth*N-long scratch
+      // Snapshot of the A_raw weights FExpA was built from. exp(A_raw) is a pure
+      // function of neuron [4], so a forward only has to rebuild it when one of
+      // those weights differs: one AVX SumDiff instead of Depth*N
+      // transcendentals per call (24k per token on a real Mamba block).
+      // Comparing the VALUES (rather than trusting an AfterWeightUpdate dirty
+      // flag) keeps FExpA correct no matter which path wrote A_raw - training,
+      // an importer, or a direct Neurons[4].Weights write from outside.
+      FExpASrc: TNNetVolume;
+      FExpAValid: boolean;   // false until FExpA/FExpASrc have been built once
       FTsBuf: TNNetVolume;   // dt_rank-long scratch (Jamba inner-norm forward)
       FGbT, FGcT: TNNetVolume; // per-timestep dL/db_t, dL/dc_t (DState>1 only)
       FGradWd, FGradWB, FGradWC: TNNetVolume; // projection grad accumulators
@@ -10757,6 +10766,9 @@ type
       // mode flag / step counter live in TNNetRecurrentDecodeBase) ---
       FDecH: TNNetVolume;     // persisted running state h, Depth*N-long
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      // Rebuilds FExpA = exp(min(A_raw,10)) only when A_raw differs from the
+      // snapshot the current FExpA was built from (see FExpASrc).
+      procedure BuildExpAIfStale();
       // pResetState=true zeroes the running state h before the scan (the normal
       // full-sequence forward); pResetState=false resumes h from FH (incremental
       // decode). The arithmetic per token is otherwise identical.
@@ -67214,6 +67226,8 @@ begin
   FH := TNNetVolume.Create();
   FGh := TNNetVolume.Create();
   FExpA := TNNetVolume.Create();
+  FExpASrc := TNNetVolume.Create();
+  FExpAValid := false;
   FTsBuf := TNNetVolume.Create();
   FGbT := TNNetVolume.Create();
   FGcT := TNNetVolume.Create();
@@ -67255,6 +67269,7 @@ begin
   FGradWB.Free;
   FGradWd.Free;
   FTsBuf.Free;
+  FExpASrc.Free;
   FExpA.Free;
   FGh.Free;
   FH.Free;
@@ -67333,6 +67348,7 @@ begin
   FDecH.ReSize(1, 1, Depth * NS);
   FGh.ReSize(1, 1, Depth * NS);
   FExpA.ReSize(1, 1, Depth * NS);
+  FExpAValid := false;   // A_raw is (re)initialized below; force a rebuild.
   FGbT.ReSize(1, 1, BCRows);
   FGcT.ReSize(1, 1, BCRows);
   FGradWd.ReSize(Depth, 1, Depth);
@@ -67342,6 +67358,31 @@ begin
   FGradA.ReSize(1, 1, Depth * NS);
   FGradE.ReSize(1, 1, Depth);
   InitDefault();
+end;
+
+// exp(A_raw) depends only on neuron [4], so it survives across calls: on the
+// Mamba decode path (one token per forward, Depth*N ~ 24k) rebuilding it every
+// forward costs as many transcendentals as the recurrence itself. The rebuild
+// is skipped while the weights match FExpASrc; the clamp keeps the decay term
+// from overflowing if A_raw drifts large during training.
+procedure TNNetSelectiveSSM.BuildExpAIfStale();
+var
+  Ar: TNNetVolume;
+  i, ASize, ASizeM1: integer;
+begin
+  Ar := FNeurons[4].FWeights;
+  ASize := Ar.Size;
+  if ASize <= 0 then exit;
+  if FExpAValid and (FExpA.Size = ASize) and (FExpASrc.Size = ASize) and
+     (FExpASrc.SumDiff(Ar) = 0) then exit;
+  if FExpA.Size <> ASize then FExpA.ReSize(1, 1, ASize);
+  FExpASrc.Copy(Ar);
+  ASizeM1 := ASize - 1;
+  for i := 0 to ASizeM1 do
+    FExpA.FData[i] := Min(Ar.FData[i], 10);
+  // Rule #19: one vectorized exp over the whole contiguous block.
+  TNNetVolume.VectorExp(FExpA.GetRawPtr(), FExpA.GetRawPtr(), ASize);
+  FExpAValid := true;
 end;
 
 procedure TNNetSelectiveSSM.Compute();
@@ -67369,8 +67410,8 @@ end;
 procedure TNNetSelectiveSSM.ComputeLegacy(pResetState: boolean = true);
 var
   StartTime: double;
-  Wd, WB, WC, Bd, Ar, Ee, Prev: TNNetVolume;
-  SeqLen, Depth, t, d, j: integer;
+  Wd, WB, WC, Bd, Ee, Prev: TNNetVolume;
+  SeqLen, Depth, t, d: integer;
   DepthM1, SeqLenM1: integer;
   pre, sp, xj, acc, hprev, bbar: TNeuralFloat;
   XtPtr, OutPtr: TNeuralFloatArrPtr;
@@ -67383,16 +67424,12 @@ begin
   WB := FNeurons[1].FWeights;
   WC := FNeurons[2].FWeights;
   Bd := FNeurons[3].FWeights;
-  Ar := FNeurons[4].FWeights;
   Ee := FNeurons[5].FWeights;
   SeqLen := FOutput.SizeX;
   Depth := FOutput.Depth;
   DepthM1 := Depth - 1;
   SeqLenM1 := SeqLen - 1;
-  // Precompute per-channel exp(A_raw), clamped so the decay term cannot
-  // overflow if A_raw drifts large during training.
-  for d := 0 to DepthM1 do
-    FExpA.FData[d] := NeuralExp(Min(Ar.FData[d], 10));
+  BuildExpAIfStale();   // per-channel exp(A_raw), rebuilt only when A_raw moved
   if pResetState then FH.Fill(0);
   for t := 0 to SeqLenM1 do
   begin
@@ -67442,10 +67479,9 @@ end;
 // channels, per-(channel,state) decay. See the class comment for the formulas.
 procedure TNNetSelectiveSSM.ComputeMultiState(pResetState: boolean = true);
 var
-  MaxARawPos: integer;
   StartTime: double;
-  Wd, WB, WC, Bd, Ar, Ee, Prev: TNNetVolume;
-  SeqLen, Depth, NS, t, d, j, s, hbase, ebase: integer;
+  Wd, WB, WC, Bd, Ee, Prev: TNNetVolume;
+  SeqLen, Depth, NS, t, d, s, hbase, ebase: integer;
   DepthM1, SeqLenM1, NSM1, tDepth, tNS: integer;
   pre, sp, ad, hnew, accY, xd, spxd: TNeuralFloat;
   XtPtr, OutPtr, WdRow: TNeuralFloatArrPtr;
@@ -67456,7 +67492,6 @@ begin
   WB := FNeurons[1].FWeights;
   WC := FNeurons[2].FWeights;
   Bd := FNeurons[3].FWeights;
-  Ar := FNeurons[4].FWeights;
   Ee := FNeurons[5].FWeights;
   SeqLen := FOutput.SizeX;
   Depth := FOutput.Depth;
@@ -67464,10 +67499,8 @@ begin
   DepthM1 := Depth - 1;
   SeqLenM1 := SeqLen - 1;
   NSM1 := NS - 1;
-  // Precompute exp(A_raw[d,s]), clamped against overflow during training.
-  MaxARawPos := Ar.Size - 1;
-  for j := 0 to MaxARawPos do
-    FExpA.FData[j] := NeuralExp(Min(Ar.FData[j], 10));
+  // exp(A_raw[d,s]), rebuilt only when A_raw moved.
+  BuildExpAIfStale();
   if pResetState then FH.Fill(0);
   for t := 0 to SeqLenM1 do
   begin
@@ -67533,9 +67566,8 @@ procedure TNNetSelectiveSSM.ComputeJambaInner(pResetState: boolean = true);
 //   y_t[d]   = sum_s c_t[s]*h_t[d,s] + D[d]*x[d]
 // rms(v) = v / sqrt(mean(v^2) + eps).  Forward-only (see Backpropagate).
 var
-  MaxARawPos: integer;
   StartTime: double;
-  WdtProj, WB, WC, Bd, Ar, Ee, WxProj, GDt, GB, GC, Prev: TNNetVolume;
+  WdtProj, WB, WC, Bd, Ee, WxProj, GDt, GB, GC, Prev: TNNetVolume;
   SeqLen, Depth, NS, RK, t, d, s, r, hbase, ebase: integer;
   DepthM1, SeqLenM1, NSM1, RKM1, tDepth, tNS: integer;
   pre, sp, ad, hnew, accY, xd, ss, inv, eps, spxd: TNeuralFloat;
@@ -67556,7 +67588,6 @@ begin
   WB := FNeurons[1].FWeights;        // W_B (NS,1,Depth)
   WC := FNeurons[2].FWeights;        // W_C (NS,1,Depth)
   Bd := FNeurons[3].FWeights;        // dt_proj.bias (Depth)
-  Ar := FNeurons[4].FWeights;        // A_log (Depth,1,NS)
   Ee := FNeurons[5].FWeights;        // D (Depth)
   WxProj := FNeurons[6].FWeights;    // x_proj_dt (RK,1,Depth)
   GDt := FNeurons[7].FWeights;       // dt_gain (RK)
@@ -67572,9 +67603,7 @@ begin
   RKM1 := RK - 1;
   eps := FFloatSt[0];
   if eps <= 0 then eps := 1e-6;
-  MaxARawPos := Ar.Size - 1;
-  for s := 0 to MaxARawPos do
-    FExpA.FData[s] := NeuralExp(Min(Ar.FData[s], 10));
+  BuildExpAIfStale();
   if pResetState then FH.Fill(0);
   for t := 0 to SeqLenM1 do
   begin
@@ -67700,7 +67729,7 @@ procedure TNNetSelectiveSSM.Backpropagate();
 var
   StartTime: double;
   Nd, NB, NC, NBd, NA, NE: TNNetNeuron;
-  Wd, WB, WC, Ar, Ee, Prev, PrevErr: TNNetVolume;
+  Wd, WB, WC, Ee, Prev, PrevErr: TNNetVolume;
   SeqLen, Depth, t, d, SeqLenM1: integer;
   DepthM1, tDepth, idx: integer;
   hasInputGrad: boolean;
@@ -67725,7 +67754,7 @@ begin
   Nd := FNeurons[0]; NB := FNeurons[1]; NC := FNeurons[2];
   NBd := FNeurons[3]; NA := FNeurons[4]; NE := FNeurons[5];
   Wd := Nd.FWeights; WB := NB.FWeights; WC := NC.FWeights;
-  Ar := NA.FWeights; Ee := NE.FWeights;
+  Ee := NE.FWeights;
   Prev := FPrevLayer.FOutput;
   SeqLen := FOutput.SizeX;
   Depth := FOutput.Depth;
@@ -67734,8 +67763,7 @@ begin
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
   DepthM1 := Depth - 1;
-  for d := 0 to DepthM1 do
-    FExpA.FData[d] := NeuralExp(Min(Ar.FData[d], 10));
+  BuildExpAIfStale();
   FGh.Fill(0);
   FGradWd.Fill(0); FGradWB.Fill(0); FGradWC.Fill(0);
   FGradBd.Fill(0); FGradA.Fill(0); FGradE.Fill(0);
@@ -67839,11 +67867,10 @@ end;
 // input gradient.
 procedure TNNetSelectiveSSM.BackpropagateMultiState();
 var
-  MaxARawPos: integer;
   StartTime: double;
   Nd, NB, NC, NBd, NA, NE: TNNetNeuron;
   Wd, WB, WC, Ar, Ee, Prev, PrevErr: TNNetVolume;
-  SeqLen, Depth, NS, t, d, j, s, hbase, ebase, tb, SeqLenM1: integer;
+  SeqLen, Depth, NS, t, d, s, hbase, ebase, tb, SeqLenM1: integer;
   DepthM1, NSM1, tDepth, idx, DepthNS, hbasePrev: integer;
   hasInputGrad: boolean;
   GyPtr, XtPtr, PrevErrPtr, WdRow, GradWdRow: TNeuralFloatArrPtr;
@@ -67865,9 +67892,7 @@ begin
   DepthM1 := Depth - 1;
   NSM1 := NS - 1;
   DepthNS := Depth * NS;                 // #5: fully loop-invariant state stride
-  MaxARawPos := Ar.Size - 1;
-  for j := 0 to MaxARawPos do
-    FExpA.FData[j] := NeuralExp(Min(Ar.FData[j], 10));
+  BuildExpAIfStale();
   FGh.Fill(0);
   FGradWd.Fill(0); FGradWB.Fill(0); FGradWC.Fill(0);
   FGradBd.Fill(0); FGradA.Fill(0); FGradE.Fill(0);

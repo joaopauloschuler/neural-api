@@ -596,6 +596,7 @@ type
     procedure TestSelectiveSSMDStateWeightGradientCheck;
     procedure TestSelectiveSSMDStateSerializationRoundTrip;
     procedure TestSelectiveSSMIncrementalDecodeEquivalence;
+    procedure TestSelectiveSSMARawWriteIsSeenByForward;
     procedure TestMamba2InputGradientCheck;
     procedure TestMamba2WeightGradientCheck;
     procedure TestMamba2SerializationRoundTrip;
@@ -35466,6 +35467,57 @@ begin
   RandSeed := 424242;
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetSelectiveSSM.Create(4), 'SelectiveSSM-DState4', 4, 1, 3, 1e-5);
+end;
+
+// The forward caches exp(A_raw) across calls, so a DIRECT write to
+// Neurons[4].Weights - no AfterWeightUpdate, no UpdateWeights, which is what a
+// seeder, an importer or a gradient check does - must still be picked up by the
+// next forward. The reference is a second layer that never saw the old weights:
+// the two outputs must match bit-for-bit, and must differ from the pre-write
+// output (so the assert cannot pass on a stale cache).
+procedure TTestNeuralNumerical.TestSelectiveSSMARawWriteIsSeenByForward;
+var
+  NN, NNRef: TNNet;
+  Input, Before: TNNetVolume;
+  L, LRef: TNNetSelectiveSSM;
+  SeqLen, Depth, NS, i, d, s: integer;
+  newA: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  SeqLen := 5; Depth := 3; NS := 4;
+  NN := TNNet.Create();
+  NNRef := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  Before := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    L := TNNetSelectiveSSM.Create(NS);
+    NN.AddLayer(L);
+    NNRef.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    LRef := TNNetSelectiveSSM.Create(NS);
+    NNRef.AddLayer(LRef);
+    SeedSelectiveSSMDState(L, Depth, NS);
+    SeedSelectiveSSMDState(LRef, Depth, NS);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.8) * 1.4 + 0.1;
+    NN.Compute(Input);          // populates whatever the forward caches
+    Before.Copy(L.Output);
+    for d := 0 to Depth - 1 do
+      for s := 0 to NS - 1 do
+      begin
+        newA := Cos(d * 0.7 + s * 1.1) * 0.9;
+        L.Neurons[4].Weights[d, 0, s] := newA;
+        LRef.Neurons[4].Weights[d, 0, s] := newA;
+      end;
+    NN.Compute(Input);
+    NNRef.Compute(Input);
+    for i := 0 to L.Output.Size - 1 do
+      AssertEquals('SelectiveSSM A_raw direct write seen by forward at ' +
+        IntToStr(i), LRef.Output.Raw[i], L.Output.Raw[i], 0);
+    AssertTrue('SelectiveSSM A_raw direct write must change the output',
+      Before.SumDiff(L.Output) > 1e-6);
+  finally
+    NNRef.Free; NN.Free; Input.Free; Before.Free;
+  end;
 end;
 
 // Headline correctness for the O(1)-per-step incremental decode path: feeding a
