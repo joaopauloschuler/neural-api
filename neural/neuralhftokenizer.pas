@@ -353,7 +353,19 @@ type
         SkipSpecialTokens: boolean = true): string; overload;
       function Decode(Ids: TIntegerList;
         SkipSpecialTokens: boolean = true): string; overload;
+      // Decodes only the first Count ids of Ids, for callers that grow their
+      // id array with spare capacity instead of resizing it per token.
+      function DecodeCount(const Ids: array of integer; Count: integer;
+        SkipSpecialTokens: boolean = true): string;
       function DecodeToken(Id: integer): string;
+      // True when Decode is an exact left-to-right concatenation of the
+      // per-id pieces, so Decode(A + B) = Decode(A) + Decode(B). That holds
+      // for every model except WordPiece (which space-joins and runs a
+      // whole-string punctuation cleanup) and for decoders that strip leading
+      // spaces at position 0 (which only applies to the first piece).
+      // Streaming callers use it to detokenize one new id per step instead of
+      // re-decoding the whole reply.
+      function DecodeIsConcatenative(): boolean;
 
       // Unicode normalization of UTF-8 text. Compat=False: canonical (NFC if
       // Compose else NFD); Compat=True: compatibility (NFKC if Compose else
@@ -4460,8 +4472,9 @@ end;
 // or metaspace replacement + byte-fallback included).
 function TNeuralHFTokenizer.DecodeToken(Id: integer): string;
 var
-  Token: string;
+  Token, Encoded: string;
   Position, Cnt, DecReplaceHi, HiNib, LoNib, TokenLen: integer;
+  OutPos, EncLen: integer;
   CP: cardinal;
 
   // Hex digit -> nibble value (0..15), or -1 if not a hex digit. Matches the
@@ -4482,15 +4495,37 @@ begin
   Token := FIdToToken[Id];
   if FByteLevel then
   begin
-    Position := 1;
+    // #23: one preallocated buffer plus a carried write index, instead of a
+    // concat per codepoint (quadratic here: {$CODEPAGE UTF8} defeats FPC's
+    // in-place append, so every concat copies the whole accumulated string).
+    // Bound: a codepoint that maps back to a raw byte emits 1 byte; otherwise
+    // NextCodePoint consumed k bytes and CP < 2^(5+6*(k-1)), so re-encoding
+    // emits at most max(k, 2) bytes - the only expanding case is a lone
+    // invalid/truncated byte >= $80, which grows 1 -> 2. Hence 2 * Length.
     TokenLen := Length(Token);
+    SetLength(Result, TokenLen * 2);
+    OutPos := 0;
+    Position := 1;
     while Position <= TokenLen do
     begin
       CP := NextCodePoint(Token, Position);
-      if (CP <= cardinal(High(FCPToByte))) and (FCPToByte[CP] >= 0)
-      then Result := Result + Chr(FCPToByte[CP])
-      else Result := Result + CodePointToUTF8(CP);
+      if (CP <= cardinal(High(FCPToByte))) and (FCPToByte[CP] >= 0) then
+      begin
+        Inc(OutPos);
+        Result[OutPos] := Chr(FCPToByte[CP]);
+      end
+      else
+      begin
+        Encoded := CodePointToUTF8(CP);
+        EncLen := Length(Encoded);
+        for Cnt := 1 to EncLen do
+        begin
+          Inc(OutPos);
+          Result[OutPos] := Encoded[Cnt];
+        end;
+      end;
     end;
+    SetLength(Result, OutPos);
   end
   else
   begin
@@ -4513,12 +4548,57 @@ end;
 
 function TNeuralHFTokenizer.Decode(const Ids: array of integer;
   SkipSpecialTokens: boolean = true): string;
+begin
+  Result := DecodeCount(Ids, Length(Ids), SkipSpecialTokens);
+end;
+
+function TNeuralHFTokenizer.DecodeIsConcatenative(): boolean;
+begin
+  Result := (not FWordPiece) and (FDecStripLeft = 0);
+end;
+
+function TNeuralHFTokenizer.DecodeCount(const Ids: array of integer;
+  Count: integer; SkipSpecialTokens: boolean = true): string;
 var
   Cnt, TokenIndex, Stripped, IdsHi, WPLen: integer;
+  OutPos, OutCap: integer;
   Piece: string;
+
+  // #23: the pieces land in one geometrically-grown buffer with a carried
+  // write index, instead of `Result := Result + Piece` per id - that concat
+  // is quadratic here, because {$CODEPAGE UTF8} defeats FPC's in-place
+  // append and every concat copies the whole accumulated text. No cheap
+  // exact upper bound exists (a non byte-level DecodeToken runs
+  // StringReplace, which may grow a piece), so the buffer doubles on demand
+  // and is truncated once at the end.
+  procedure AppendRange(const S: string; From, Len: integer);
+  var
+    NewCap: integer;
+  begin
+    if Len <= 0 then exit;
+    if OutPos + Len > OutCap then
+    begin
+      NewCap := OutCap * 2;
+      if NewCap < OutPos + Len then NewCap := OutPos + Len;
+      if NewCap < 64 then NewCap := 64;
+      OutCap := NewCap;
+      SetLength(Result, OutCap);
+    end;
+    Move(S[From], Result[OutPos + 1], Len);
+    Inc(OutPos, Len);
+  end;
+
+  procedure AppendStr(const S: string);
+  begin
+    AppendRange(S, 1, Length(S));
+  end;
+
 begin
   Result := '';
-  IdsHi := High(Ids);
+  OutPos := 0;
+  OutCap := 0;
+  IdsHi := Count - 1;
+  if IdsHi > High(Ids) then IdsHi := High(Ids);
   WPLen := Length(FWPPrefix);
   for Cnt := 0 to IdsHi do
   begin
@@ -4526,8 +4606,8 @@ begin
     begin
       if not (SkipSpecialTokens and FAddedTokens[TokenIndex].Special) then
       begin
-        if FWordPiece and (Result <> '') then Result := Result + ' ';
-        Result := Result + FAddedTokens[TokenIndex].Content;
+        if FWordPiece and (OutPos > 0) then AppendStr(' ');
+        AppendStr(FAddedTokens[TokenIndex].Content);
       end;
     end
     else if FWordPiece then
@@ -4538,16 +4618,17 @@ begin
       if (FWPPrefix <> '') and
         (Length(Piece) >= WPLen) and (Piece[1] = FWPPrefix[1]) and
         CompareMem(@Piece[1], @FWPPrefix[1], WPLen) then
-        Result := Result + Copy(Piece, WPLen + 1, MaxInt)
+        AppendRange(Piece, WPLen + 1, Length(Piece) - WPLen)
       else
       begin
-        if Result <> '' then Result := Result + ' ';
-        Result := Result + Piece;
+        if OutPos > 0 then AppendStr(' ');
+        AppendStr(Piece);
       end;
     end
     else
-      Result := Result + DecodeToken(Ids[Cnt]);
+      AppendStr(DecodeToken(Ids[Cnt]));
   end;
+  SetLength(Result, OutPos);
   if FWordPiece and FDecWordPieceCleanup then
   begin
     // HF WordPiece decoder cleanup: re-attach punctuation/contractions.
@@ -4584,16 +4665,29 @@ end;
 
 function TNeuralHFTokenizer.FragmentToSurface(const Fragment: string): string;
 var
-  Cnt, FragmentLen: integer;
+  Cnt, FragmentLen, OutPos, ByteCnt, EncLen: integer;
+  Encoded: string;
 begin
   if FByteLevel then
   begin
     // Each raw byte -> its GPT-2 byte-alphabet codepoint (same mapping
     // MapPieceToByteLevel applies during encoding; DecodeToken inverts it).
-    Result := '';
+    // #23: preallocated buffer + carried write index; one UTF-8 encoding is
+    // at most 4 bytes, so 4 * Length(Fragment) is a safe upper bound.
     FragmentLen := Length(Fragment);
+    SetLength(Result, FragmentLen * 4);
+    OutPos := 0;
     for Cnt := 1 to FragmentLen do
-      Result := Result + CodePointToUTF8(FByteToCP[Ord(Fragment[Cnt])]);
+    begin
+      Encoded := CodePointToUTF8(FByteToCP[Ord(Fragment[Cnt])]);
+      EncLen := Length(Encoded);
+      for ByteCnt := 1 to EncLen do
+      begin
+        Inc(OutPos);
+        Result[OutPos] := Encoded[ByteCnt];
+      end;
+    end;
+    SetLength(Result, OutPos);
   end
   else if FMetaspacePreTok then
     // Metaspace: spaces are stored as the replacement char (usually U+2581).

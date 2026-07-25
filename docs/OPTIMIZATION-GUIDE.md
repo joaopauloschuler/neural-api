@@ -2009,9 +2009,12 @@ SetLength(Result, OutPos);            // truncate to what was actually written
 
 The existing `AppendChar` local procedure at `neuralhftokenizer.pas:1079` is the
 reference implementation of exactly this, including how to justify the bound (there:
-escapes never grow the text, so `Length(S)` is a safe upper bound). Sites still
-using the quadratic form include `neuralhftokenizer.pas:1380, 1438, 3884, 4491,
-4529, 4549, 4596` and `neuraltokenizer.pas:440`.
+escapes never grow the text, so `Length(S)` is a safe upper bound).
+`TNeuralHFTokenizer.DecodeCount`/`DecodeToken`/`FragmentToSurface` are the
+detokenization-side worked examples: `DecodeToken` justifies an exact bound
+(`2 * Length(Token)`), `DecodeCount` cannot and instead doubles a buffer it
+truncates once at the end. Sites still using the quadratic form include
+`neuralhftokenizer.pas:1380, 1438, 3884` and `neuraltokenizer.pas:440`.
 
 **This does NOT violate #17 — and the distinction matters.** #17 forbids a
 `SetLength` *added* to a `Compute*`/`Backpropagate*` path or to `neuralvolume.pas`,

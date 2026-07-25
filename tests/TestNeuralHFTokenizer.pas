@@ -61,6 +61,17 @@ type
     procedure TestByteLevelSpecialTokenIds;
     procedure TestMetaspaceSpecialTokenIds;
     procedure TestDecodeKeepsSpecialsWhenAsked;
+    // Streaming detokenization contract. On a byte-level BPE, Decode is an
+    // exact left-to-right concatenation of the per-id pieces, so decoding one
+    // new id per step must reproduce the one-shot decode byte for byte -
+    // including a multi-byte UTF-8 codepoint split across several tokens,
+    // where the individual pieces are incomplete sequences. DecodeCount must
+    // honour Count over an array carrying spare capacity past it. WordPiece
+    // and leading-space-stripping decoders are NOT concatenative and must
+    // report so.
+    procedure TestDecodeStreamedMatchesOneShot;
+    procedure TestDecodeMultiByteUTF8SplitAcrossTokens;
+    procedure TestDecodeIsConcatenativeOnlyWhenSafe;
     procedure TestRejectsNonBPEModel;
     // fpjson's TJSONObject truncates member names to 255 bytes
     // (shortstring-keyed hash), so GPT-NeoX-lineage whitespace-run vocab
@@ -934,6 +945,122 @@ begin
     AssertEquals('keep specials', '<s> hello</s>', Tok.Decode(Ids, false));
   finally
     Ids.Free;
+    Tok.Free;
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestDecodeStreamedMatchesOneShot;
+const
+  // ASCII + accented latin (2-byte) + CJK (3-byte) + emoji (4-byte).
+  cText = 'hello world! caf' + #$C3#$A9 + ' ' + #$E4#$B8#$AD#$E6#$96#$87 +
+    ' ' + #$F0#$9F#$98#$80 + ' end';
+var
+  Tok: TNeuralHFTokenizer;
+  Ids: TIntegerList;
+  Arr: array of integer;
+  One: array[0..0] of integer;
+  Cnt, IdsCnt, PadCnt: integer;
+  Joined, Full, Prefix: string;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  Ids := TIntegerList.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+    AssertTrue('byte-level decode is concatenative',
+      Tok.DecodeIsConcatenative());
+    Tok.Encode(cText, Ids);
+    IdsCnt := Ids.Count;
+    AssertTrue('text produced ids', IdsCnt > 1);
+    SetLength(Arr, IdsCnt);
+    for Cnt := 0 to IdsCnt - 1 do Arr[Cnt] := Ids[Cnt];
+    Full := Tok.Decode(Arr, true);
+    AssertEquals('byte-level round trip is exact', cText, Full);
+    // Streaming: every step detokenizes ONLY the new id.
+    Joined := '';
+    for Cnt := 0 to IdsCnt - 1 do
+    begin
+      One[0] := Arr[Cnt];
+      Joined := Joined + Tok.Decode(One, true);
+    end;
+    AssertEquals('streamed pieces equal one-shot decode', Full, Joined);
+    // DecodeCount over an array with spare capacity past Count: every prefix
+    // decode is a prefix of the full decode, and Count is honoured (the pad
+    // repeats a non-empty id, so ignoring Count would change the output).
+    SetLength(Arr, IdsCnt + 7);
+    for PadCnt := IdsCnt to IdsCnt + 6 do Arr[PadCnt] := Arr[0];
+    for Cnt := 0 to IdsCnt do
+    begin
+      Prefix := Tok.DecodeCount(Arr, Cnt, true);
+      AssertEquals('DecodeCount ' + IntToStr(Cnt) + ' is a prefix',
+        Copy(Full, 1, Length(Prefix)), Prefix);
+    end;
+    AssertEquals('DecodeCount honours Count', Full,
+      Tok.DecodeCount(Arr, IdsCnt, true));
+  finally
+    Ids.Free;
+    Tok.Free;
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestDecodeMultiByteUTF8SplitAcrossTokens;
+const
+  cEmoji = #$F0#$9F#$98#$80; // U+1F600 GRINNING FACE, 4 UTF-8 bytes
+var
+  Tok: TNeuralHFTokenizer;
+  Ids: TIntegerList;
+  One: array[0..0] of integer;
+  Cnt, IdsCnt: integer;
+  Joined, Piece: string;
+  SawPartial: boolean;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  Ids := TIntegerList.Create();
+  try
+    Tok.LoadFromFile(FixturePath('tiny_bpe_bytelevel_tokenizer.json'));
+    Tok.Encode(cEmoji, Ids);
+    IdsCnt := Ids.Count;
+    AssertTrue('emoji is split across several tokens', IdsCnt > 1);
+    Joined := '';
+    SawPartial := false;
+    for Cnt := 0 to IdsCnt - 1 do
+    begin
+      One[0] := Ids[Cnt];
+      Piece := Tok.Decode(One, true);
+      // A piece that is a bare UTF-8 continuation byte is not a standalone
+      // codepoint - exactly the case a streaming emitter must survive.
+      if (Piece <> '') and ((Ord(Piece[1]) and $C0) = $80) then
+        SawPartial := true;
+      Joined := Joined + Piece;
+    end;
+    AssertTrue('a piece is an incomplete UTF-8 sequence', SawPartial);
+    AssertEquals('pieces reassemble the codepoint', cEmoji, Joined);
+  finally
+    Ids.Free;
+    Tok.Free;
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestDecodeIsConcatenativeOnlyWhenSafe;
+var
+  Tok: TNeuralHFTokenizer;
+begin
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    // Metaspace decoder strips a leading space at position 0 only, so the
+    // whole-string decode is not the concatenation of the piece decodes.
+    Tok.LoadFromFile(FixturePath('tiny_bpe_metaspace_tokenizer.json'));
+    AssertTrue('metaspace strip is not concatenative',
+      not Tok.DecodeIsConcatenative());
+  finally
+    Tok.Free;
+  end;
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    // WordPiece space-joins pieces and runs a whole-string cleanup.
+    Tok.LoadFromFile(FixturePath('tiny_wordpiece_tokenizer.json'));
+    AssertTrue('wordpiece is not concatenative',
+      not Tok.DecodeIsConcatenative());
+  finally
     Tok.Free;
   end;
 end;
