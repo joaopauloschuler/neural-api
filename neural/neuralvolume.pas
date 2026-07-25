@@ -3929,6 +3929,28 @@ end;
 
 { TNNetSamplerMirostat }
 
+const
+  // 2^Mu in the Mirostat v1 closed form is exp(Mu * ln 2).
+  csLn2 = 0.693147180559945309417;
+  // Highest loop index of the v1 Zipf fit: the fit window is capped at
+  // csMirostatMaxFitIdx + 2 candidates and the regression pairs candidate i
+  // with i + 1, so i never exceeds csMirostatMaxFitIdx.
+  csMirostatMaxFitIdx = 98;
+
+var
+  // ln((i+2)/(i+1)) for i in [0, csMirostatMaxFitIdx]. The regressor depends
+  // only on the loop index, never on the logits, so it is tabulated once at
+  // unit start-up instead of recomputed on every sampled token.
+  vMirostatLogRank: array[0..csMirostatMaxFitIdx] of TNeuralFloat;
+
+procedure BuildMirostatLogRankTable();
+var
+  I: integer;
+begin
+  for I := 0 to csMirostatMaxFitIdx do
+    vMirostatLogRank[I] := pcr_logf((I + 2) / (I + 1));
+end;
+
 constructor TNNetSamplerMirostat.Create(Tau: TNeuralFloat; Eta: TNeuralFloat;
   Version: TNNetMirostatVersion);
 begin
@@ -3992,7 +4014,9 @@ begin
     // v1: estimate Zipf exponent s from the head of the distribution, then a
     // target truncation size k = ((eps * 2^Mu) / (1 - N^(-eps)))^(1/s).
     NumFit := N;
-    if NumFit > 100 then NumFit := 100; // fit on the head (paper uses ~100)
+    // fit on the head (paper uses ~100); the cap is what bounds the
+    // vMirostatLogRank lookup below.
+    if NumFit > csMirostatMaxFitIdx + 2 then NumFit := csMirostatMaxFitIdx + 2;
     SumLogP := 0; SumLogRank := 0; SumLogPLogRank := 0; SumLogRankSq := 0;
     K := 0;
     NumFitM2 := NumFit - 2;
@@ -4002,7 +4026,7 @@ begin
       if (P <= 0) or (FTokenArr[I + 1].Score <= 0) then Break;
       // t_i = log(p_i / p_{i+1}) regressed on log((i+2)/(i+1)) gives s.
       LogP := pcr_logf(P / FTokenArr[I + 1].Score);
-      LogRank := pcr_logf((I + 2) / (I + 1));
+      LogRank := vMirostatLogRank[I];
       SumLogP := SumLogP + LogP;
       SumLogRank := SumLogRank + LogRank;
       SumLogPLogRank := SumLogPLogRank + LogP * LogRank;
@@ -4019,7 +4043,7 @@ begin
     if Abs(Epsilon) < 1e-6 then
       KFloat := NeuralExp(FMu)            // s ~ 1 limit
     else
-      KFloat := NeuralExp( pcr_logf( (Epsilon * NeuralExp(FMu * pcr_logf(2.0))) /
+      KFloat := NeuralExp( pcr_logf( (Epsilon * NeuralExp(FMu * csLn2)) /
                          (1 - pcr_powf(N, -Epsilon)) ) / S );
     if KFloat < 1 then KFloat := 1;
     KeptCount := Round(KFloat);
@@ -8738,14 +8762,13 @@ begin
     if MinValue < -1000 then Mul( -1000/MinValue );
     vHigh := High(FData);
 
+    // Invariant reached here: Sub(MaxValue) put every element at <= 0 and the
+    // Mul above floors the smallest at -1000, so the whole buffer lies in
+    // [-1000, 0] - inside AVXExp's safe range, and already inside the +/-4000
+    // band a NeuronForceRange clamp would enforce, so no clamp is needed.
     {$IFDEF AVXANY}
-    // FData has already been shifted by Sub(MaxValue), so every element is <= 0
-    // (and floored to [-1000,0] above), well inside AVXExp's safe range. Clamp
-    // in place for bit-parity with the scalar NeuronForceRange path, then
-    // exponentiate the whole flat buffer 8-wide and sum it with the AVX
+    // Exponentiate the whole flat buffer 8-wide and sum it with the AVX
     // reduction (parity with the scalar Exp/accumulate loop within ~1e-6).
-    for I := 0 to vHigh do
-      FData[I] := NeuronForceRange(FData[I], 4000);
     AVXExp(TNeuralFloatArrPtr(@FData[0]),
            TNeuralFloatArrPtr(@FData[0]), vHigh + 1);
     TotalSum := AVXGetSum(TNeuralFloatArrPtr(@FData[0]), vHigh + 1);
@@ -8754,10 +8777,9 @@ begin
     begin
       // FData has already been shifted by Sub(MaxValue) above, so do not
       // subtract MaxValue again here (that would underflow Exp to zero).
-      LocalValue := NeuralExp( NeuronForceRange(FData[I], 4000) );
-      // LocalValue := pcr_expf( FData[I] );
+      LocalValue := NeuralExp( FData[I] );
       FData[I] := LocalValue;
-      TotalSum := TotalSum + FData[I];
+      TotalSum := TotalSum + LocalValue;
     end;
     {$ENDIF}
 
@@ -9245,16 +9267,31 @@ begin
           end;
           TotalSum := 0;
           I := StartPointPos;
+          {$IFDEF AVXANY}
+          // A group is ChannelsPerGroup contiguous elements from StartPointPos,
+          // so the stabilized values can be clamped in place and then
+          // exponentiated 8-wide by AVXExp and reduced by the AVX sum (parity
+          // with the scalar NeuralExp loop within ~1e-6 relative error) - the
+          // same promotion PointwiseSoftMax applies to its depth spans.
           for CountD := 0 to ChannelsPerGroupM1 do
           begin
-            //LocalValue := pcr_expf( NeuronForceRange(FData[I] - MaxValue, 4000) );
+            FData[I] := NeuronForceRange(FData[I] - MaxValue, 4000);
+            Inc(I);
+          end;
+          AVXExp(TNeuralFloatArrPtr(@FData[StartPointPos]),
+                 TNeuralFloatArrPtr(@FData[StartPointPos]), ChannelsPerGroup);
+          TotalSum := AVXGetSum(TNeuralFloatArrPtr(@FData[StartPointPos]), ChannelsPerGroup);
+          {$ELSE}
+          for CountD := 0 to ChannelsPerGroupM1 do
+          begin
             LocalValue := NeuralExp( NeuronForceRange(FData[I] - MaxValue, 4000) );
             FData[I] := LocalValue;
             TotalSum := TotalSum + LocalValue;
             Inc(I);
           end;
+          {$ENDIF}
           if TotalSum > 0 then
-            TNNetVolume.Mul(Addr(FData[StartPointPos]), 1.0 / TotalSum, ChannelsPerGroupM1 + 1);
+            TNNetVolume.Mul(Addr(FData[StartPointPos]), 1.0 / TotalSum, ChannelsPerGroup);
           Inc(StartD, ChannelsPerGroup);
         end;
         Inc(PointBase, RowStride);
@@ -15917,5 +15954,8 @@ begin
   Put(Index,AObject);
 end;
 {$ENDIF}
+
+initialization
+  BuildMirostatLogRankTable();
 
 end.

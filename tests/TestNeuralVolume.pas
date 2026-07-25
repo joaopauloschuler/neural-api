@@ -28,6 +28,7 @@ type
     procedure TestVolumeSoftMax;
     procedure TestVolumeSoftMaxParity;
     procedure TestVolumePointwiseSoftMaxParity;
+    procedure TestVolumeGroupedPointwiseSoftMaxParity;
     procedure TestVolumePadding;
     procedure TestVolumeTranspose;
     // Additional volume tests
@@ -493,6 +494,72 @@ begin
     for K := 0 to SX * SY * D - 1 do
       AssertEquals('PointwiseSoftMax parity at ' + IntToStr(K),
         Ref[K], V.Raw[K], 1e-4);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeGroupedPointwiseSoftMaxParity;
+// Verifies TVolume.GroupedPointwiseSoftMax (per-(x,y), per-group over a
+// contiguous slice of the depth axis) against an independent scalar stable
+// softmax reference, within 1e-4. Depth is split so that ChannelsPerGroup is
+// neither a multiple of 8 nor above csMinAvxSize in one of the cases, which
+// exercises the vectorized group path and its scalar tail.
+var
+  V: TNNetVolume;
+  SX, SY, D, Groups, ChPerGroup, X, Y, G, K, Base, Total: integer;
+  Ref: array of TNeuralFloat;
+  MaxV, S: TNeuralFloat;
+begin
+  SX := 3; SY := 2; Groups := 4; ChPerGroup := 11; // 11 is not a multiple of 8
+  D := Groups * ChPerGroup;
+  Total := SX * SY * D;
+  V := TNNetVolume.Create(SX, SY, D);
+  SetLength(Ref, Total);
+  try
+    RandSeed := 101;
+    for K := 0 to Total - 1 do
+    begin
+      V.Raw[K] := (Random - 0.5) * 16.0;
+      Ref[K] := V.Raw[K];
+    end;
+
+    // Independent per-(x,y), per-group scalar reference.
+    for X := 0 to SX - 1 do
+      for Y := 0 to SY - 1 do
+        for G := 0 to Groups - 1 do
+        begin
+          Base := V.GetRawPos(X, Y, 0) + G * ChPerGroup;
+          MaxV := Ref[Base];
+          for K := 1 to ChPerGroup - 1 do
+            if Ref[Base + K] > MaxV then MaxV := Ref[Base + K];
+          S := 0;
+          for K := 0 to ChPerGroup - 1 do
+          begin
+            Ref[Base + K] := Exp(NeuronForceRange(Ref[Base + K] - MaxV, 4000));
+            S := S + Ref[Base + K];
+          end;
+          if S > 0 then
+            for K := 0 to ChPerGroup - 1 do Ref[Base + K] := Ref[Base + K] / S;
+        end;
+
+    V.GroupedPointwiseSoftMax(Groups);
+
+    for K := 0 to Total - 1 do
+      AssertEquals('GroupedPointwiseSoftMax parity at ' + IntToStr(K),
+        Ref[K], V.Raw[K], 1e-4);
+
+    // Every group must sum to 1 - catches a group whose normalization used the
+    // wrong element count.
+    for X := 0 to SX - 1 do
+      for Y := 0 to SY - 1 do
+        for G := 0 to Groups - 1 do
+        begin
+          Base := V.GetRawPos(X, Y, 0) + G * ChPerGroup;
+          S := 0;
+          for K := 0 to ChPerGroup - 1 do S := S + V.Raw[Base + K];
+          AssertEquals('Group sums to one', 1.0, S, 1e-4);
+        end;
   finally
     V.Free;
   end;
