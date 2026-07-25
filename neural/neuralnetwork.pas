@@ -56512,7 +56512,7 @@ end;
 
 procedure TNNetTDNNConv1D.Backpropagate();
 var
-  LpBnd: integer;
+  MaxNeuronPos: integer;
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
   SeqLen, InputDepth, Ksize, Dil, Half, t, f, k, srcT: integer;
@@ -56541,8 +56541,8 @@ begin
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
 
   // Standard conv backward restricted to the centred in-range window.
-  LpBnd := FNeurons.Count - 1;
-  for f := 0 to LpBnd do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for f := 0 to MaxNeuronPos do
   begin
     localNeuron := FArrNeurons[f];
     W := localNeuron.FWeights;
@@ -57126,8 +57126,8 @@ end;
 
 procedure TNNetConvolution3D.Compute();
 var
-  LpBnd48: integer;
-  LpBnd49: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   StartTime: double;
   Prev: TNNetVolume;
   NumFeat, ot, oy, ox, f, kt, ky, kx, ix, iy: integer;
@@ -57148,11 +57148,11 @@ begin
   begin
     localNeuron := FArrNeurons[f];
     W := localNeuron.FWeights;
-    LpBnd48 := FOutput.SizeY - 1;
-    LpBnd49 := FOutput.SizeX - 1;
+    MaxOutputY := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
     for ot := 0 to MaxOT do
-    for oy := 0 to LpBnd48 do
-    for ox := 0 to LpBnd49 do
+    for oy := 0 to MaxOutputY do
+    for ox := 0 to MaxOutputX do
     begin
       if FSuppressBias = 0
         then sum := localNeuron.FBiasWeight
@@ -57184,8 +57184,8 @@ end;
 
 procedure TNNetConvolution3D.Backpropagate();
 var
-  LpBnd50: integer;
-  LpBnd51: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
   NumFeat, ot, oy, ox, f, kt, ky, kx, ix, iy: integer;
@@ -57221,11 +57221,11 @@ begin
     localNeuron := FArrNeurons[f];
     W := localNeuron.FWeights;
     GW := localNeuron.FDelta;
-    LpBnd50 := FOutput.SizeY - 1;
-    LpBnd51 := FOutput.SizeX - 1;
+    MaxOutputY := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
     for ot := 0 to MaxOT do
-    for oy := 0 to LpBnd50 do
-    for ox := 0 to LpBnd51 do
+    for oy := 0 to MaxOutputY do
+    for ox := 0 to MaxOutputX do
     begin
       gy := FOutputError[ox, oy, ot * NumFeat + f];
       if gy = 0 then continue;
@@ -66070,7 +66070,7 @@ end;
 
 procedure TNNetTestTimeTraining.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  LpBnd52: integer;
+  MaxNeuronPos: integer;
   ii, SeqLen: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -66103,8 +66103,8 @@ begin
   // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
   if FIsTrainable then
   begin
-    LpBnd52 := FNeurons.Count - 1;
-    for ii := 0 to LpBnd52 do
+    MaxNeuronPos := FNeurons.Count - 1;
+    for ii := 0 to MaxNeuronPos do
     begin
       FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
       FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
@@ -66303,7 +66303,7 @@ end;
 
 procedure TNNetTestTimeTraining.Backpropagate();
 var
-  LpBnd53: integer;
+  MaxNeuronPos: integer;
   StartTime: double;
   ThK, ThV, ThQ, W1init, W2init: TNNetVolume;
   GThK, GThV, GThQ, GW1in, GW2in: TNNetVolume;
@@ -66555,8 +66555,8 @@ begin
   FNeurons[3].FDelta.FData[0] := FNeurons[3].FDelta.FData[0] + negLR * etaGrad;
   if (not FBatchUpdate) then
   begin
-    LpBnd53 := FNeurons.Count - 1;
-    for j := 0 to LpBnd53 do FNeurons[j].UpdateWeights(FInertia);
+    MaxNeuronPos := FNeurons.Count - 1;
+    for j := 0 to MaxNeuronPos do FNeurons[j].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -66565,8 +66565,8 @@ end;
 
 procedure TNNetTestTimeTraining.InitDefault();
 var
-  LpBnd54: integer;
-  LpBnd55: integer;
+  MaxW1InitPos: integer;
+  MaxW2InitPos: integer;
   WeightsSizeM1: integer;
   Depth, Hd, a, b: integer;
   oldSeed: Cardinal;
@@ -66591,11 +66591,11 @@ begin
     Hd := FHidden;
     sc1 := 1.0 / Sqrt(Depth);
     sc2 := 1.0 / Sqrt(Max(Hd, 1));
-    LpBnd54 := FNeurons[4].FWeights.Size - 1;
-    for b := 0 to LpBnd54 do
+    MaxW1InitPos := FNeurons[4].FWeights.Size - 1;
+    for b := 0 to MaxW1InitPos do
       FNeurons[4].FWeights.FData[b] := FNeurons[4].FWeights.RandomGaussianValue() * sc1;
-    LpBnd55 := FNeurons[5].FWeights.Size - 1;
-    for b := 0 to LpBnd55 do
+    MaxW2InitPos := FNeurons[5].FWeights.Size - 1;
+    for b := 0 to MaxW2InitPos do
       FNeurons[5].FWeights.FData[b] := FNeurons[5].FWeights.RandomGaussianValue() * sc2;
   end;
   RandSeed := oldSeed;
@@ -66652,7 +66652,7 @@ end;
 
 procedure TNNetTitansMemory.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  LpBnd56: integer;
+  MaxNeuronPos: integer;
   ii, SeqLen: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -66679,8 +66679,8 @@ begin
   // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
   if FIsTrainable then
   begin
-    LpBnd56 := FNeurons.Count - 1;
-    for ii := 0 to LpBnd56 do
+    MaxNeuronPos := FNeurons.Count - 1;
+    for ii := 0 to MaxNeuronPos do
     begin
       FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
       FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
@@ -66845,7 +66845,7 @@ end;
 
 procedure TNNetTitansMemory.Backpropagate();
 var
-  LpBnd57: integer;
+  MaxNeuronPos: integer;
   StartTime: double;
   ThK, ThV, ThQ, Walpha, W1init, W2init, W1pVol, W2pVol: TNNetVolume;
   GThK, GThV, GThQ, GWalpha, GW1in, GW2in: TNNetVolume;
@@ -67126,8 +67126,8 @@ begin
   TNNetVolume.MulAdd(GW2in.GetRawPtr(), @FgW2Buf[0], negLR, DHM1 + 1);
   if (not FBatchUpdate) then
   begin
-    LpBnd57 := FNeurons.Count - 1;
-    for j := 0 to LpBnd57 do FNeurons[j].UpdateWeights(FInertia);
+    MaxNeuronPos := FNeurons.Count - 1;
+    for j := 0 to MaxNeuronPos do FNeurons[j].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -67136,9 +67136,9 @@ end;
 
 procedure TNNetTitansMemory.InitDefault();
 var
-  LpBnd58: integer;
-  LpBnd59: integer;
-  LpBnd60: integer;
+  MaxAlphaWeightPos: integer;
+  MaxW1InitPos: integer;
+  MaxW2InitPos: integer;
   WeightsSizeM1: integer;
   Depth, Hd, a, b: integer;
   oldSeed: Cardinal;
@@ -67169,16 +67169,16 @@ begin
     FNeurons[4].FWeights.FData[b] := 1.5;  // theta~0.82: a brisk one-shot inner write
     FNeurons[5].FWeights.FData[b] := -3.0; // alpha~0.047: gentle forgetting bounds the momentum sum
   end;
-  LpBnd58 := FNeurons[6].FWeights.Size - 1;
-  for b := 0 to LpBnd58 do
+  MaxAlphaWeightPos := FNeurons[6].FWeights.Size - 1;
+  for b := 0 to MaxAlphaWeightPos do
     FNeurons[6].FWeights.FData[b] := FNeurons[6].FWeights.RandomGaussianValue() * 0.1;
   sc1 := 1.0 / Sqrt(Depth);
   sc2 := 1.0 / Sqrt(Max(Hd, 1));
-  LpBnd59 := FNeurons[7].FWeights.Size - 1;
-  for b := 0 to LpBnd59 do
+  MaxW1InitPos := FNeurons[7].FWeights.Size - 1;
+  for b := 0 to MaxW1InitPos do
     FNeurons[7].FWeights.FData[b] := FNeurons[7].FWeights.RandomGaussianValue() * sc1;
-  LpBnd60 := FNeurons[8].FWeights.Size - 1;
-  for b := 0 to LpBnd60 do
+  MaxW2InitPos := FNeurons[8].FWeights.Size - 1;
+  for b := 0 to MaxW2InitPos do
     FNeurons[8].FWeights.FData[b] := FNeurons[8].FWeights.RandomGaussianValue() * sc2;
   RandSeed := oldSeed;
   AfterWeightUpdate();
@@ -67256,7 +67256,7 @@ end;
 
 procedure TNNetSelectiveSSM.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  LpBnd61: integer;
+  MaxNeuronPos: integer;
   Depth, NS, BCRows, ii: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -67304,8 +67304,8 @@ begin
   // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
   if FIsTrainable then
   begin
-    LpBnd61 := FNeurons.Count - 1;
-    for ii := 0 to LpBnd61 do
+    MaxNeuronPos := FNeurons.Count - 1;
+    for ii := 0 to MaxNeuronPos do
     begin
       FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
       FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
