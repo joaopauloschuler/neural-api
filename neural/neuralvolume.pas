@@ -260,10 +260,13 @@ type
     function GetRawPtr(x, y: integer): pointer; overload; {$IFDEF Release} inline; {$ENDIF}
     function GetRawPtr(x: integer): pointer; overload; {$IFDEF Release} inline; {$ENDIF}
     function GetRawPtr(): pointer; overload; {$IFDEF Release} inline; {$ENDIF}
-    function GetMin(): T; {$IFDEF Release} inline; {$ENDIF}
-    function GetMax(): T; {$IFDEF Release} inline; {$ENDIF}
+    // GetMin/GetMax/GetMaxAbs also record the flat index of the element they
+    // returned in FLastPos (first occurrence wins on ties). They are virtual
+    // so TNNetVolume can serve them from a vectorized kernel.
+    function GetMin(): T; virtual;
+    function GetMax(): T; virtual;
     function GetNonZero(): integer; {$IFDEF Release} inline; {$ENDIF}
-    function GetMaxAbs(): T; {$IFDEF Release} inline; {$ENDIF}
+    function GetMaxAbs(): T; virtual;
     procedure GetMinMaxAtDepth(pDepth: integer; out pMin, pMax: T);
     function GetSum(): T; virtual;
     function GetSumAbs(): T; virtual;
@@ -339,7 +342,7 @@ type
     // GetClass is similar to argmax over the whole volume (returns the flat
     // index of the maximum element). Prefer it instead of hand-rolling an
     // argmax loop over Raw/FData.
-    function GetClass(): integer;
+    function GetClass(): integer; virtual;
     // GetClassOnPixel is the per-position argmax along the depth axis at pixel
     // (X, Y): it returns the depth index with the maximum value. This is
     // exactly the "argmax over the depth/vocab axis at a sequence position"
@@ -645,6 +648,18 @@ type
       procedure CopyNoChecks(Original: TNNetVolume);
       function GetSum(): TNeuralFloat; override;
       function GetSumSqr(): TNeuralFloat; override;
+      {$IFDEF AVX2}
+      // Served by the AVXGetMaxPos family. They keep the scalar contract in
+      // full: same value, same FLastPos (first occurrence wins), same GetClass
+      // tie-break. Only AVX64 assembles those kernels, so a 32-bit AVX2 build
+      // keeps the inherited scalar loops.
+      {$IFDEF AVX64}
+      function GetMin(): TNeuralFloat; override;
+      function GetMax(): TNeuralFloat; override;
+      function GetMaxAbs(): TNeuralFloat; override;
+      function GetClass(): integer; override;
+      {$ENDIF}
+      {$ENDIF}
       function GetDistanceSqr(Original: TNNetVolume): TNeuralFloat;  overload; {$IFDEF Release} inline; {$ENDIF}
       function GetDistance(Original: TNNetVolume): TNeuralFloat;  overload; {$IFDEF Release} inline; {$ENDIF}
       function SumDiff(Original: TNNetVolume): TNeuralFloat; overload; {$IFDEF Release} inline; {$ENDIF}
@@ -14791,6 +14806,288 @@ begin
   end;
 end;
 
+
+{$IFDEF AVX2}
+// Lane-index seeds for the argmax/argmin kernels below: cAVXArgLaneSeed is the
+// flat index of each of the 16 lanes in the first block, cAVXArgLaneStep is the
+// per-iteration increment (16 elements are consumed per iteration).
+// cAVXArgAbsMask clears the sign bit of eight Singles.
+const
+  cAVXArgLaneSeed: array[0..15] of integer =
+    (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+  cAVXArgLaneStep: array[0..15] of integer =
+    (16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16);
+  cAVXArgAbsMask: array[0..7] of longword =
+    ($7FFFFFFF, $7FFFFFFF, $7FFFFFFF, $7FFFFFFF,
+     $7FFFFFFF, $7FFFFFFF, $7FFFFFFF, $7FFFFFFF);
+
+{ AVXGetMaxPos returns the largest of PtrA[0..NumElements-1] and writes the flat
+  index of its FIRST occurrence into Pos - the exact contract of the scalar
+  TVolume.GetMax loop, ties included.
+
+  Sixteen elements are consumed per iteration through two independent
+  accumulator pairs (value + winning index), which halves the vcmpps->vblendvps
+  latency chain. The compare is _CMP_GT_OQ (predicate 30): ordered, so a NaN
+  never wins, and quiet, so it does not raise the invalid-operation exception
+  FPC leaves unmasked. Both the value and the index are moved by the same mask,
+  so they can never disagree, and because the compare is strict the first
+  occurrence within a lane is the one that survives. Cross-lane ties are broken
+  towards the lower index in the scalar fold, which is what makes the overall
+  result the FIRST maximum.
+
+  The (NumElements mod 16) tail is folded by the scalar loop at the end, which
+  also uses a strict compare and therefore cannot displace an equal earlier
+  winner. NaN inputs are outside the contract: a NaN among the first 16 elements
+  pins its lane, exactly as a NaN in element 0 pins the scalar loop. }
+function AVXGetMaxPos(PtrA: TNeuralFloatArrPtr; NumElements: integer;
+  out Pos: integer): Single;
+var
+  vMax: array[0..15] of Single;
+  vIdx: array[0..15] of integer;
+  I, J, localNumElements: integer;
+  v: Single;
+begin
+  localNumElements := NumElements and (not 15);
+  if localNumElements >= 16 then
+  begin
+  asm
+  mov rax, PtrA
+  mov ecx, localNumElements
+  shr ecx, 4
+  dec ecx                          // remaining iterations after the seed block
+  vmovups   ymm0, [rax]            // seed values, lanes 0..7
+  vmovups   ymm1, [rax+32]         // seed values, lanes 8..15
+  vmovdqu   ymm4, cAVXArgLaneSeed
+  vmovdqu   ymm5, cAVXArgLaneSeed+32
+  vmovdqa   ymm2, ymm4             // seed winning indices = 0..15
+  vmovdqa   ymm3, ymm5
+  vmovdqu   ymm6, cAVXArgLaneStep
+  add rax, 64
+  test ecx, ecx
+  jz @Fold
+@Loop:
+  vmovups   ymm7, [rax]
+  vmovups   ymm8, [rax+32]
+  vpaddd    ymm4, ymm4, ymm6
+  vpaddd    ymm5, ymm5, ymm6
+  vcmpps    ymm9,  ymm7, ymm0, 30  // 30 = _CMP_GT_OQ
+  vcmpps    ymm10, ymm8, ymm1, 30
+  vblendvps ymm2, ymm2, ymm4, ymm9
+  vblendvps ymm3, ymm3, ymm5, ymm10
+  vblendvps ymm0, ymm0, ymm7, ymm9
+  vblendvps ymm1, ymm1, ymm8, ymm10
+  add rax, 64
+  dec ecx
+  jnz @Loop
+@Fold:
+  vmovups   vMax, ymm0
+  vmovups   vMax+32, ymm1
+  vmovdqu   vIdx, ymm2
+  vmovdqu   vIdx+32, ymm3
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm6',
+    'ymm7', 'ymm8', 'ymm9', 'ymm10'
+  ];
+    Result := vMax[0];
+    Pos := vIdx[0];
+    for J := 1 to 15 do
+      if (vMax[J] > Result) or ((vMax[J] = Result) and (vIdx[J] < Pos)) then
+      begin
+        Result := vMax[J];
+        Pos := vIdx[J];
+      end;
+  end
+  else
+  begin
+    Result := PtrA^[0];
+    Pos := 0;
+    localNumElements := 1;
+  end;
+  for I := localNumElements to NumElements - 1 do
+  begin
+    v := PtrA^[I];
+    if v > Result then
+    begin
+      Result := v;
+      Pos := I;
+    end;
+  end;
+end;
+
+{ AVXGetMinPos is AVXGetMaxPos with the compare inverted (predicate 17 =
+  _CMP_LT_OQ) and the fold taking the smaller value: it returns the smallest
+  element and the flat index of its first occurrence, matching TVolume.GetMin. }
+function AVXGetMinPos(PtrA: TNeuralFloatArrPtr; NumElements: integer;
+  out Pos: integer): Single;
+var
+  vMin: array[0..15] of Single;
+  vIdx: array[0..15] of integer;
+  I, J, localNumElements: integer;
+  v: Single;
+begin
+  localNumElements := NumElements and (not 15);
+  if localNumElements >= 16 then
+  begin
+  asm
+  mov rax, PtrA
+  mov ecx, localNumElements
+  shr ecx, 4
+  dec ecx
+  vmovups   ymm0, [rax]
+  vmovups   ymm1, [rax+32]
+  vmovdqu   ymm4, cAVXArgLaneSeed
+  vmovdqu   ymm5, cAVXArgLaneSeed+32
+  vmovdqa   ymm2, ymm4
+  vmovdqa   ymm3, ymm5
+  vmovdqu   ymm6, cAVXArgLaneStep
+  add rax, 64
+  test ecx, ecx
+  jz @Fold
+@Loop:
+  vmovups   ymm7, [rax]
+  vmovups   ymm8, [rax+32]
+  vpaddd    ymm4, ymm4, ymm6
+  vpaddd    ymm5, ymm5, ymm6
+  vcmpps    ymm9,  ymm7, ymm0, 17  // 17 = _CMP_LT_OQ
+  vcmpps    ymm10, ymm8, ymm1, 17
+  vblendvps ymm2, ymm2, ymm4, ymm9
+  vblendvps ymm3, ymm3, ymm5, ymm10
+  vblendvps ymm0, ymm0, ymm7, ymm9
+  vblendvps ymm1, ymm1, ymm8, ymm10
+  add rax, 64
+  dec ecx
+  jnz @Loop
+@Fold:
+  vmovups   vMin, ymm0
+  vmovups   vMin+32, ymm1
+  vmovdqu   vIdx, ymm2
+  vmovdqu   vIdx+32, ymm3
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm6',
+    'ymm7', 'ymm8', 'ymm9', 'ymm10'
+  ];
+    Result := vMin[0];
+    Pos := vIdx[0];
+    for J := 1 to 15 do
+      if (vMin[J] < Result) or ((vMin[J] = Result) and (vIdx[J] < Pos)) then
+      begin
+        Result := vMin[J];
+        Pos := vIdx[J];
+      end;
+  end
+  else
+  begin
+    Result := PtrA^[0];
+    Pos := 0;
+    localNumElements := 1;
+  end;
+  for I := localNumElements to NumElements - 1 do
+  begin
+    v := PtrA^[I];
+    if v < Result then
+    begin
+      Result := v;
+      Pos := I;
+    end;
+  end;
+end;
+
+{ AVXGetMaxAbsPos is AVXGetMaxPos over |x|: each loaded vector has its sign bits
+  cleared by cAVXArgAbsMask before the compare, so the returned value is a
+  magnitude and Pos is the flat index of the first element carrying it - the
+  contract of TVolume.GetMaxAbs. Clearing the sign bit costs one vandps per
+  vector and replaces the per-element compare-and-negate branch the scalar loop
+  mispredicts on roughly half of a zero-mean tensor. }
+function AVXGetMaxAbsPos(PtrA: TNeuralFloatArrPtr; NumElements: integer;
+  out Pos: integer): Single;
+var
+  vMax: array[0..15] of Single;
+  vIdx: array[0..15] of integer;
+  I, J, localNumElements: integer;
+  v: Single;
+begin
+  localNumElements := NumElements and (not 15);
+  if localNumElements >= 16 then
+  begin
+  asm
+  mov rax, PtrA
+  mov ecx, localNumElements
+  shr ecx, 4
+  dec ecx
+  vmovdqu   ymm11, cAVXArgAbsMask
+  vmovups   ymm0, [rax]
+  vmovups   ymm1, [rax+32]
+  vandps    ymm0, ymm0, ymm11
+  vandps    ymm1, ymm1, ymm11
+  vmovdqu   ymm4, cAVXArgLaneSeed
+  vmovdqu   ymm5, cAVXArgLaneSeed+32
+  vmovdqa   ymm2, ymm4
+  vmovdqa   ymm3, ymm5
+  vmovdqu   ymm6, cAVXArgLaneStep
+  add rax, 64
+  test ecx, ecx
+  jz @Fold
+@Loop:
+  vmovups   ymm7, [rax]
+  vmovups   ymm8, [rax+32]
+  vandps    ymm7, ymm7, ymm11
+  vandps    ymm8, ymm8, ymm11
+  vpaddd    ymm4, ymm4, ymm6
+  vpaddd    ymm5, ymm5, ymm6
+  vcmpps    ymm9,  ymm7, ymm0, 30
+  vcmpps    ymm10, ymm8, ymm1, 30
+  vblendvps ymm2, ymm2, ymm4, ymm9
+  vblendvps ymm3, ymm3, ymm5, ymm10
+  vblendvps ymm0, ymm0, ymm7, ymm9
+  vblendvps ymm1, ymm1, ymm8, ymm10
+  add rax, 64
+  dec ecx
+  jnz @Loop
+@Fold:
+  vmovups   vMax, ymm0
+  vmovups   vMax+32, ymm1
+  vmovdqu   vIdx, ymm2
+  vmovdqu   vIdx+32, ymm3
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm6',
+    'ymm7', 'ymm8', 'ymm9', 'ymm10', 'ymm11'
+  ];
+    Result := vMax[0];
+    Pos := vIdx[0];
+    for J := 1 to 15 do
+      if (vMax[J] > Result) or ((vMax[J] = Result) and (vIdx[J] < Pos)) then
+      begin
+        Result := vMax[J];
+        Pos := vIdx[J];
+      end;
+  end
+  else
+  begin
+    Result := Abs(PtrA^[0]);
+    Pos := 0;
+    localNumElements := 1;
+  end;
+  for I := localNumElements to NumElements - 1 do
+  begin
+    v := Abs(PtrA^[I]);
+    if v > Result then
+    begin
+      Result := v;
+      Pos := I;
+    end;
+  end;
+end;
+{$ENDIF}
+
 { AVXExp: dst[0..N-1] := exp(src[0..N-1]). 8-wide AVX2 polynomial body plus a
   scalar NeuralExp remainder for the (N mod 8) tail. Under plain-AVX (no AVX2)
   the whole thing degrades to a scalar NeuralExp loop. }
@@ -15345,6 +15642,47 @@ begin
       Result := DotProduct(Self);
     end;
 end;
+
+{$IFDEF AVX2}
+{$IFDEF AVX64}
+// GetMin/GetMax/GetMaxAbs/GetClass below hand the whole buffer to one
+// vectorized argmax/argmin pass. The kernel returns the winning index as well,
+// so FLastPos keeps the meaning the scalar loops gave it and GetClass is the
+// same pass with the index as the result instead of the value. Below
+// csMinAvxSize the per-call setup outweighs the work, so the inherited scalar
+// loop runs.
+function TNNetVolume.GetMin(): TNeuralFloat;
+begin
+  if FSize >= csMinAvxSize
+    then Result := AVXGetMinPos(FDataPtr, FSize, FLastPos)
+    else Result := inherited GetMin();
+end;
+
+function TNNetVolume.GetMax(): TNeuralFloat;
+begin
+  if FSize >= csMinAvxSize
+    then Result := AVXGetMaxPos(FDataPtr, FSize, FLastPos)
+    else Result := inherited GetMax();
+end;
+
+function TNNetVolume.GetMaxAbs(): TNeuralFloat;
+begin
+  if FSize >= csMinAvxSize
+    then Result := AVXGetMaxAbsPos(FDataPtr, FSize, FLastPos)
+    else Result := inherited GetMaxAbs();
+end;
+
+function TNNetVolume.GetClass(): integer;
+begin
+  // The scalar GetClass answers -1 for a volume of one element or less; the
+  // AVX path only runs well above that, so the guard only has to keep the
+  // small sizes on the inherited loop.
+  if FSize >= csMinAvxSize
+    then AVXGetMaxPos(FDataPtr, FSize, Result)
+    else Result := inherited GetClass();
+end;
+{$ENDIF}
+{$ENDIF}
 
 function TNNetVolume.GetDistanceSqr(Original: TNNetVolume): TNeuralFloat;
 var

@@ -23,6 +23,7 @@ type
     procedure TestVolumeStatistics;
     procedure TestVolumeMinMax;
     procedure TestVolumeMaxAbsNegativeFirst;
+    procedure TestVolumeMinMaxClassParity;
     procedure TestVolumeFlip;
     procedure TestVolumeClassification;
     procedure TestVolumeSoftMax;
@@ -319,6 +320,73 @@ begin
       V.GetMaxAbs(), 0.0001);
   finally
     V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeMinMaxClassParity;
+// GetMax / GetMin / GetMaxAbs / GetClass are served by a vectorized kernel on
+// an AVX2 64-bit build and by a scalar loop everywhere else. Both must agree
+// EXACTLY with an independent scalar reference - value and, for GetClass, the
+// argmax index including the "first occurrence wins" tie-break. Sizes straddle
+// csMinAvxSize (16), the 16-element block width and its tail; the data patterns
+// cover all-negative buffers (which a max-abs kernel that forgets the sign gets
+// wrong), constant buffers (every element ties) and single elements.
+const
+  Sizes: array[0..13] of integer =
+    (1, 2, 7, 15, 16, 17, 23, 31, 32, 33, 47, 64, 65, 1000);
+var
+  V: TNNetVolume;
+  SI, Pattern, K, N, RefClass: integer;
+  RefMax, RefMin, RefAbs, Val, AbsVal: TNeuralFloat;
+  Tag: string;
+begin
+  RandSeed := 271828;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    for Pattern := 0 to 4 do
+    begin
+      V := TNNetVolume.Create(N, 1, 1);
+      try
+        for K := 0 to N - 1 do
+          case Pattern of
+            0: V.Raw[K] := (Random - 0.5) * 20;      // mixed signs
+            1: V.Raw[K] := -(Random + 0.01) * 20;    // all negative
+            2: V.Raw[K] := (Random + 0.01) * 20;     // all positive
+            3: V.Raw[K] := 3.0;                      // every element ties
+            4: V.Raw[K] := Round((Random - 0.5) * 6); // many repeated values
+          end;
+
+        RefMax := V.Raw[0];
+        RefMin := V.Raw[0];
+        RefAbs := Abs(V.Raw[0]);
+        RefClass := 0;
+        for K := 1 to N - 1 do
+        begin
+          Val := V.Raw[K];
+          AbsVal := Abs(Val);
+          if Val > RefMax then
+          begin
+            RefMax := Val;
+            RefClass := K;
+          end;
+          if Val < RefMin then RefMin := Val;
+          if AbsVal > RefAbs then RefAbs := AbsVal;
+        end;
+
+        Tag := ' (N=' + IntToStr(N) + ', pattern ' + IntToStr(Pattern) + ')';
+        AssertEquals('GetMax' + Tag, RefMax, V.GetMax(), 0.0);
+        AssertEquals('GetMin' + Tag, RefMin, V.GetMin(), 0.0);
+        AssertEquals('GetMaxAbs' + Tag, RefAbs, V.GetMaxAbs(), 0.0);
+        // GetClass answers -1 for a volume of one element or less.
+        if N > 1 then
+          AssertEquals('GetClass' + Tag, RefClass, V.GetClass())
+        else
+          AssertEquals('GetClass' + Tag, -1, V.GetClass());
+      finally
+        V.Free;
+      end;
+    end;
   end;
 end;
 
