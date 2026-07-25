@@ -238,6 +238,10 @@ type
       // sees alternative subword segmentations of the same text. Default 0.0
       // = OFF = bit-identical to deterministic eval/inference tokenization.
       FDropoutProb: TNeuralFloat;
+      // Scratch merge-rank cache for BPEWord: one entry per adjacent symbol
+      // pair of the word being merged. Grown lazily and reused across words,
+      // so the merge loop itself never allocates.
+      FBPERanks: array of integer;
       procedure DetectKeyMangling();
       function FixJSONKey(const Key: string): string;
       procedure BuildByteTable();
@@ -3660,6 +3664,7 @@ procedure TNeuralHFTokenizer.BPEWord(const Symbols: TStringList;
   Ids: TIntegerList);
 var
   Cnt, BestIdx, BestRank, Rank, WholeId, SymMax, SymCntM2: integer;
+  SymCount, PairMax, TailCnt: integer;
   Whole, Left, Right: string;
 begin
   if Symbols.Count = 0 then exit;
@@ -3677,36 +3682,89 @@ begin
       Exit;
     end;
   end;
-  while Symbols.Count > 1 do
+  if FDropoutProb > 0 then
   begin
-    BestIdx := -1;
-    BestRank := High(integer);
-    SymCntM2 := Symbols.Count - 2;
-    // #7/#14: carry Left := Right so each symbol is fetched from the list once
-    // per pass instead of twice (this iteration's right symbol is the next
-    // iteration's left symbol).
+    // BPE-dropout (Provilkov et al. 2020): with probability FDropoutProb skip
+    // an otherwise-applicable merge, so the segmentation falls back to shorter
+    // symbols. Train-time only; the symbols still concatenate back to the
+    // original word, so decode round-trips. The Random draw happens once per
+    // ranked pair per pass, so the DRAW COUNT - and with it the segmentation
+    // for a given seed - is part of the observable behaviour. That pins this
+    // path to the full rescan below; a cached-rank version would draw a
+    // different number of times.
+    while Symbols.Count > 1 do
+    begin
+      BestIdx := -1;
+      BestRank := High(integer);
+      SymCntM2 := Symbols.Count - 2;
+      // #7/#14: carry Left := Right so each symbol is fetched from the list
+      // once per pass instead of twice (this iteration's right symbol is the
+      // next iteration's left symbol).
+      Left := Symbols[0];
+      for Cnt := 0 to SymCntM2 do
+      begin
+        Right := Symbols[Cnt + 1];
+        Rank := MergeRank(Left, Right);
+        Left := Right; // carry: next left symbol (before any continue)
+        if (Rank < High(integer)) and (Random < FDropoutProb) then
+          continue;
+        if Rank < BestRank then
+        begin
+          BestRank := Rank;
+          BestIdx := Cnt;
+        end;
+      end;
+      if BestIdx < 0 then break;
+      Symbols[BestIdx] := Symbols[BestIdx] + Symbols[BestIdx + 1];
+      Symbols.Delete(BestIdx + 1);
+    end;
+  end
+  else
+  begin
+    // Deterministic merge loop with cached pair ranks. Re-ranking every pair
+    // after every merge is O(n^2) MergeRank calls per word, and each one
+    // builds a temporary 'A </w> B' string and binary-searches a ~150k-entry
+    // sorted list. Applying a merge at BestIdx only invalidates the two pairs
+    // touching the merge point, so recompute exactly those and slide the tail
+    // ranks down; the per-pass scan then reads a plain integer array.
+    SymCount := Symbols.Count;
+    if Length(FBPERanks) < SymCount then SetLength(FBPERanks, SymCount);
+    PairMax := SymCount - 2;
     Left := Symbols[0];
-    for Cnt := 0 to SymCntM2 do
+    for Cnt := 0 to PairMax do
     begin
       Right := Symbols[Cnt + 1];
-      Rank := MergeRank(Left, Right);
-      Left := Right; // carry: next iteration's left symbol (before any continue)
-      // BPE-dropout (Provilkov et al. 2020): with probability FDropoutProb
-      // skip an otherwise-applicable merge, so the segmentation falls back to
-      // shorter symbols. Train-time only (FDropoutProb > 0); the symbols still
-      // concatenate back to the original word, so decode round-trips.
-      if (FDropoutProb > 0) and (Rank < High(integer)) and
-        (Random < FDropoutProb) then
-        continue;
-      if Rank < BestRank then
-      begin
-        BestRank := Rank;
-        BestIdx := Cnt;
-      end;
+      FBPERanks[Cnt] := MergeRank(Left, Right);
+      Left := Right;
     end;
-    if BestIdx < 0 then break;
-    Symbols[BestIdx] := Symbols[BestIdx] + Symbols[BestIdx + 1];
-    Symbols.Delete(BestIdx + 1);
+    while SymCount > 1 do
+    begin
+      BestIdx := -1;
+      BestRank := High(integer);
+      PairMax := SymCount - 2;
+      // Strict '<' keeps the original tie-break: the lowest rank wins, and
+      // among equal ranks the lowest pair index.
+      for Cnt := 0 to PairMax do
+        if FBPERanks[Cnt] < BestRank then
+        begin
+          BestRank := FBPERanks[Cnt];
+          BestIdx := Cnt;
+        end;
+      if BestIdx < 0 then break;
+      Symbols[BestIdx] := Symbols[BestIdx] + Symbols[BestIdx + 1];
+      Symbols.Delete(BestIdx + 1);
+      Dec(SymCount);
+      // Old pair k (k >= BestIdx + 2) is now pair k - 1.
+      TailCnt := SymCount - BestIdx - 2;
+      if TailCnt > 0 then
+        Move(FBPERanks[BestIdx + 2], FBPERanks[BestIdx + 1],
+          TailCnt * csIntegerSize);
+      if BestIdx > 0 then
+        FBPERanks[BestIdx - 1] :=
+          MergeRank(Symbols[BestIdx - 1], Symbols[BestIdx]);
+      if BestIdx < SymCount - 1 then
+        FBPERanks[BestIdx] := MergeRank(Symbols[BestIdx], Symbols[BestIdx + 1]);
+    end;
   end;
   SymMax := Symbols.Count - 1;
   for Cnt := 0 to SymMax do
