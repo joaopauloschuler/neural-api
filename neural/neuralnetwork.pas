@@ -67481,9 +67481,10 @@ procedure TNNetSelectiveSSM.ComputeMultiState(pResetState: boolean = true);
 var
   StartTime: double;
   Wd, WB, WC, Bd, Ee, Prev: TNNetVolume;
-  SeqLen, Depth, NS, t, d, s, hbase, ebase: integer;
+  SeqLen, Depth, NS, t, d, s, hbase, ebase, tBase: integer;
   DepthM1, SeqLenM1, NSM1, tDepth, tNS: integer;
-  pre, sp, ad, hnew, accY, xd, spxd: TNeuralFloat;
+  DepthNS, NSFloatSize, DepthNSFloatSize: integer;
+  pre, sp, accY, xd, spxd: TNeuralFloat;
   XtPtr, OutPtr, WdRow: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
@@ -67499,6 +67500,9 @@ begin
   DepthM1 := Depth - 1;
   SeqLenM1 := SeqLen - 1;
   NSM1 := NS - 1;
+  DepthNS := Depth * NS;                 // #5: one timestep's state block
+  NSFloatSize := NS * csNeuralFloatSize;
+  DepthNSFloatSize := DepthNS * csNeuralFloatSize;
   // exp(A_raw[d,s]), rebuilt only when A_raw moved.
   BuildExpAIfStale();
   if pResetState then FH.Fill(0);
@@ -67529,26 +67533,38 @@ begin
       FCt.FData[tNS + s] := TNNetVolume.DotProduct(
         WC.GetRawPtr(s, 0), XtPtr, Depth);
     end;
-    // Recurrence over (channel,state) + output sum over states.
+    // Decay a_t[d,s] = exp(-delta_t[d]*exp(A_raw[d,s])). FExpA and this
+    // timestep's FAt block share the [d*NS+s] layout, so the whole Depth*NS
+    // argument block is ONE contiguous run: copy it, scale each channel row by
+    // -delta, then take a single vectorized exp over the block (rule #19)
+    // instead of Depth*NS scalar ones.
+    tBase := tDepth * NS;
+    Move(FExpA.FData[0], FAt.FData[tBase], DepthNSFloatSize);
+    hbase := tBase;
     for d := 0 to DepthM1 do
     begin
-      sp := FDelta.FData[tDepth + d];
+      TNNetVolume.Mul(@FAt.FData[hbase], -FDelta.FData[tDepth + d], NS);
+      Inc(hbase, NS);
+    end;
+    TNNetVolume.VectorExp(@FAt.FData[tBase], @FAt.FData[tBase], DepthNS);
+    // Recurrence over (channel,state) + output sum over states. h, a_t and b_t
+    // are all contiguous over the state axis, so the step is a bulk elementwise
+    // multiply plus a bulk MulAdd (rule #13).
+    hbase := tBase;
+    ebase := 0;
+    for d := 0 to DepthM1 do
+    begin
       xd := XtPtr^[d];
-      spxd := sp * xd;   // Rule #5: sp,xd fixed across the s loop -> one mul/state.
-      hbase := (tDepth + d) * NS;
-      ebase := d * NS;
-      for s := 0 to NSM1 do
-      begin
-        ad := NeuralExp(-sp * FExpA.FData[ebase + s]);
-        FAt.FData[hbase + s] := ad;
-        hnew := ad * FH.FData[ebase + s] + spxd * FBt.FData[tNS + s];
-        FH.FData[ebase + s] := hnew;
-        FState.FData[hbase + s] := hnew;
-      end;
+      spxd := FDelta.FData[tDepth + d] * xd;   // #5: fixed across the states
+      TNNetVolume.Mul(@FH.FData[ebase], @FAt.FData[hbase], NS);
+      TNNetVolume.MulAdd(@FH.FData[ebase], @FBt.FData[tNS], spxd, NS);
+      Move(FH.FData[ebase], FState.FData[hbase], NSFloatSize);
       // Read-out accY = sum_s c_t[s]*h_new[s]: FCt row + FState row both
       // contiguous over the state axis -> AVX dot product.
       accY := TNNetVolume.DotProduct(@FCt.FData[tNS], @FState.FData[hbase], NS);
       OutPtr^[d] := accY + Ee.FData[d] * xd;
+      Inc(hbase, NS);
+      Inc(ebase, NS);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -67568,9 +67584,10 @@ procedure TNNetSelectiveSSM.ComputeJambaInner(pResetState: boolean = true);
 var
   StartTime: double;
   WdtProj, WB, WC, Bd, Ee, WxProj, GDt, GB, GC, Prev: TNNetVolume;
-  SeqLen, Depth, NS, RK, t, d, s, r, hbase, ebase: integer;
+  SeqLen, Depth, NS, RK, t, d, s, r, hbase, ebase, tBase: integer;
   DepthM1, SeqLenM1, NSM1, RKM1, tDepth, tNS: integer;
-  pre, sp, ad, hnew, accY, xd, ss, inv, eps, spxd: TNeuralFloat;
+  DepthNS, NSFloatSize, DepthNSFloatSize: integer;
+  pre, sp, accY, xd, ss, inv, eps, spxd: TNeuralFloat;
   XtPtr, OutPtr, WdtRow: TNeuralFloatArrPtr;
 
   function RmsScale(V: TNNetVolume; Cnt: integer): TNeuralFloat;
@@ -67601,6 +67618,9 @@ begin
   SeqLenM1 := SeqLen - 1;
   NSM1 := NS - 1;
   RKM1 := RK - 1;
+  DepthNS := Depth * NS;                 // #5: one timestep's state block
+  NSFloatSize := NS * csNeuralFloatSize;
+  DepthNSFloatSize := DepthNS * csNeuralFloatSize;
   eps := FFloatSt[0];
   if eps <= 0 then eps := 1e-6;
   BuildExpAIfStale();
@@ -67648,26 +67668,35 @@ begin
     inv := 1.0 / Sqrt(ss / NS + eps);
     TNNetVolume.Mul(@FCt.FData[tNS], inv, NS);
     TNNetVolume.Mul(@FCt.FData[tNS], GC.GetRawPtr(), NS);
-    // Recurrence + output sum over states.
+    // Decay a_t[d,s] = exp(-dt[d]*exp(A_raw[d,s])): one contiguous Depth*NS
+    // argument block per timestep -> one vectorized exp (rule #19), exactly as
+    // in ComputeMultiState.
+    tBase := tDepth * NS;
+    Move(FExpA.FData[0], FAt.FData[tBase], DepthNSFloatSize);
+    hbase := tBase;
     for d := 0 to DepthM1 do
     begin
-      sp := FDelta.FData[tDepth + d];
+      TNNetVolume.Mul(@FAt.FData[hbase], -FDelta.FData[tDepth + d], NS);
+      Inc(hbase, NS);
+    end;
+    TNNetVolume.VectorExp(@FAt.FData[tBase], @FAt.FData[tBase], DepthNS);
+    // Recurrence + output sum over states; every row is contiguous over the
+    // state axis -> bulk multiply + bulk MulAdd (rule #13).
+    hbase := tBase;
+    ebase := 0;
+    for d := 0 to DepthM1 do
+    begin
       xd := XtPtr^[d];
-      spxd := sp * xd;   // Rule #5: sp,xd fixed across the s loop -> one mul/state.
-      hbase := (tDepth + d) * NS;
-      ebase := d * NS;
-      for s := 0 to NSM1 do
-      begin
-        ad := NeuralExp(-sp * FExpA.FData[ebase + s]);
-        FAt.FData[hbase + s] := ad;
-        hnew := ad * FH.FData[ebase + s] + spxd * FBt.FData[tNS + s];
-        FH.FData[ebase + s] := hnew;
-        FState.FData[hbase + s] := hnew;
-      end;
+      spxd := FDelta.FData[tDepth + d] * xd;   // #5: fixed across the states
+      TNNetVolume.Mul(@FH.FData[ebase], @FAt.FData[hbase], NS);
+      TNNetVolume.MulAdd(@FH.FData[ebase], @FBt.FData[tNS], spxd, NS);
+      Move(FH.FData[ebase], FState.FData[hbase], NSFloatSize);
       // Read-out accY = sum_s c_t[s]*h_new[s]: FCt row + FState row both
       // contiguous over the state axis -> AVX dot product.
       accY := TNNetVolume.DotProduct(@FCt.FData[tNS], @FState.FData[hbase], NS);
       OutPtr^[d] := accY + Ee.FData[d] * xd;
+      Inc(hbase, NS);
+      Inc(ebase, NS);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
