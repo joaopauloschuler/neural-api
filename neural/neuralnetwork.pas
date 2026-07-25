@@ -3813,10 +3813,14 @@ type
     // dequantized to memory. Quantization is lossy, so the logits are
     // NOT bit-exact vs the FP32 cache (see EnableInt8KV's tolerance note).
     FKVQuantInt8: boolean;
-    FKCacheCodes: array of ShortInt;     // [MaxContext * d_k] quantized keys
-    FVCacheCodes: array of ShortInt;     // [MaxContext * d_k] quantized values
-    FKCacheScale: array of TNeuralFloat; // [MaxContext] per-row key scale
-    FVCacheScale: array of TNeuralFloat; // [MaxContext] per-row value scale
+    // (MaxContext, KVHeads, d_k): X is the cached position, Y the KV head and
+    // Depth the quantized vector, so slot s = head*MaxContext + position owns
+    // codes at s*d_k and scale (position, head). This layer has one head, so
+    // SizeY is 1 and the slot is just the position; TNNetFusedSDPA reuses the
+    // very same containers with SizeY = KVHeads, which is exactly the
+    // head-major plane layout its append and decode loops already assume.
+    FKCacheQ: TNNetVolumeQuant8;
+    FVCacheQ: TNNetVolumeQuant8;
     // --- StreamingLLM attention-sink + rolling-window eviction (opt-in) ---
     // FEvictSinks = 0 (default) => eviction OFF, the cache grows to MaxContext
     // and overflowing it is an error (the original unbounded behavior). When
@@ -3883,10 +3887,10 @@ type
     // Coded by Claude (AI).
     function ScoreIsMasked(i, j: integer; HasSeg: boolean; Seg: TNNetVolume;
       SegI: integer): boolean;
-    // Quantize Src[0..d_k-1] into the int8 cache row Slot (Codes/Scale arrays).
+    // Quantize Src[0..d_k-1] into int8 cache row Slot of Dst, where Slot is
+    // the flat (position, head) row index head*MaxContext + position.
     procedure QuantizeCacheRow(Src: TNeuralFloatArrPtr;
-      var Codes: array of ShortInt; var Scale: array of TNeuralFloat;
-      Slot: integer);
+      Dst: TNNetVolumeQuant8; Slot: integer);
     procedure ComputeIncremental();
     // FlashAttention-1 tiled online-softmax forward (opt-in, forward-only).
     // Returns true if it handled the forward; false to fall back to the naive
@@ -30439,6 +30443,8 @@ constructor TNNetScaledDotProductAttention.Create(d_k: integer; CausalMask: bool
   pSegmentSource: TNNetLayer);
 begin
   inherited Create();
+  FKCacheQ := TNNetVolumeQuant8.Create();
+  FVCacheQ := TNNetVolumeQuant8.Create();
   FDk := d_k;
   FCausal := CausalMask;
   FWindow := pWindow;
@@ -30492,6 +30498,8 @@ end;
 
 destructor TNNetScaledDotProductAttention.Destroy();
 begin
+  FKCacheQ.Free;
+  FVCacheQ.Free;
   FKCache.Free;
   FVCache.Free;
   FAttn.Free;
@@ -30546,22 +30554,18 @@ begin
   begin
     FKCache.ReSize(1, 1, 1);
     FVCache.ReSize(1, 1, 1);
-    SetLength(FKCacheCodes, MaxContext * FDk);
-    SetLength(FVCacheCodes, MaxContext * FDk);
-    SetLength(FKCacheScale, MaxContext);
-    SetLength(FVCacheScale, MaxContext);
+    FKCacheQ.ReSize(MaxContext, 1, FDk);
+    FVCacheQ.ReSize(MaxContext, 1, FDk);
   end
   else
   begin
     FKCache.ReSize(MaxContext, 1, FDk);
     FVCache.ReSize(MaxContext, 1, FDk);
-    // Drop any code arrays left over from a previous int8 session
-    // (EnableInt8KV reallocates them). The int8 read path needs no scratch:
-    // the fused kernels stream the codes directly.
-    SetLength(FKCacheCodes, 0);
-    SetLength(FVCacheCodes, 0);
-    SetLength(FKCacheScale, 0);
-    SetLength(FVCacheScale, 0);
+    // Drop any codes left over from a previous int8 session (EnableInt8KV
+    // reallocates them). The int8 read path needs no scratch: the fused
+    // kernels stream the codes directly.
+    FKCacheQ.ReSize(0, 0, 0);
+    FVCacheQ.ReSize(0, 0, 0);
   end;
   SetLength(FCacheScores, MaxContext);
   FCacheMax := MaxContext;
@@ -30583,10 +30587,8 @@ begin
   FEvictSinks := 0;
   FEvictWindow := 0;
   FKVQuantInt8 := false;
-  SetLength(FKCacheCodes, 0);
-  SetLength(FVCacheCodes, 0);
-  SetLength(FKCacheScale, 0);
-  SetLength(FVCacheScale, 0);
+  FKCacheQ.ReSize(0, 0, 0);
+  FVCacheQ.ReSize(0, 0, 0);
 end;
 
 procedure TNNetScaledDotProductAttention.ResetCache();
@@ -30679,11 +30681,9 @@ begin
       'CacheLength=' + IntToStr(FCacheLen));
     exit;
   end;
-  // Allocate the int8 code + per-row scale arrays once (MaxContext rows).
-  SetLength(FKCacheCodes, FCacheMax * FDk);
-  SetLength(FVCacheCodes, FCacheMax * FDk);
-  SetLength(FKCacheScale, FCacheMax);
-  SetLength(FVCacheScale, FCacheMax);
+  // Allocate the int8 codes + per-row scales once (MaxContext rows).
+  FKCacheQ.ReSize(FCacheMax, 1, FDk);
+  FVCacheQ.ReSize(FCacheMax, 1, FDk);
   // Release the FP32 K/V storage: the int8 path never reads it (append
   // quantizes straight to the codes, the fused kernels stream the codes), so
   // keeping the MaxContext x d_k FP32 buffers would make "int8 KV" cost
@@ -30706,10 +30706,8 @@ begin
     // Restore the FP32 K/V storage EnableInt8KV released and drop the codes.
     FKCache.ReSize(FCacheMax, 1, FDk);
     FVCache.ReSize(FCacheMax, 1, FDk);
-    SetLength(FKCacheCodes, 0);
-    SetLength(FVCacheCodes, 0);
-    SetLength(FKCacheScale, 0);
-    SetLength(FVCacheScale, 0);
+    FKCacheQ.ReSize(0, 0, 0);
+    FVCacheQ.ReSize(0, 0, 0);
   end;
   FKVQuantInt8 := false;
 end;
@@ -30721,10 +30719,11 @@ end;
 // running max with the SIGNED first element (the documented GetMaxAbs bug) and
 // would miss a negative max-magnitude element 0.
 procedure TNNetScaledDotProductAttention.QuantizeCacheRow(Src: TNeuralFloatArrPtr;
-  var Codes: array of ShortInt; var Scale: array of TNeuralFloat; Slot: integer);
+  Dst: TNNetVolumeQuant8; Slot: integer);
 var
   d, RowBase, Code, DkM1: integer;
   MaxAbs, RowScale, InvScale, AbsVal: TNeuralFloat;
+  CodesPtr: TNeuralInt8ArrPtr;
 begin
   DkM1 := FDk - 1;
   MaxAbs := 0;
@@ -30736,15 +30735,18 @@ begin
   if MaxAbs > 0
     then RowScale := MaxAbs / 127
     else RowScale := 1;
-  Scale[Slot] := RowScale;
+  // Slot is the flat row index, so it indexes the scale plane directly and
+  // the codes at Slot*Depth - the same arithmetic the raw arrays used.
+  Dst.ScalePtr^[Slot] := RowScale;
   InvScale := 1 / RowScale;
   RowBase := Slot * FDk;
+  CodesPtr := Dst.DataPtr;
   for d := 0 to DkM1 do
   begin
     Code := Round(Src^[d] * InvScale);
     if Code > 127 then Code := 127;
     if Code < -127 then Code := -127;
-    Codes[RowBase + d] := Code;
+    CodesPtr^[RowBase + d] := Code;
   end;
 end;
 
@@ -30814,6 +30816,8 @@ var
   Score, MaxScore, SumExp, InvSumExp: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr, QueryPtr: TNeuralFloatArrPtr;
+  KCodesPtr, VCodesPtr: TNeuralInt8ArrPtr;
+  KScalePtr, VScalePtr: TNeuralFloatArrPtr;
 begin
   // The KV-cache decode attention is CPU-only (no OpenCL path here), so count
   // it as a CPU dispatch - otherwise a profiler sees neither counter and the
@@ -30821,6 +30825,13 @@ begin
   Inc(FForwardCPUCnt);
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
+  // Cache bases hoisted out of every loop below (#11). They stay valid for the
+  // whole call: the containers are preallocated at MaxContext and no ReSize
+  // happens between here and the last read.
+  KCodesPtr := FKCacheQ.DataPtr;
+  VCodesPtr := FVCacheQ.DataPtr;
+  KScalePtr := FKCacheQ.ScalePtr;
+  VScalePtr := FVCacheQ.ScalePtr;
   SeqLen := Prev.SizeX;
   SeqLenM1 := SeqLen - 1;
   // Byte size of one cached K/V row, loop-invariant for the whole call: FDk is
@@ -30864,7 +30875,7 @@ begin
       // Every per-slot store keeps FDk contiguous elements, so slot j begins at
       // flat offset j * FDk in ALL of them: FKCache/FVCache.FData (float rows,
       // since their shape MaxContext x 1 x FDk gives GetRawPos(j, 0) = j * FDk)
-      // and FKCacheCodes/FVCacheCodes (int8 rows). Carry that offset (and the
+      // and FKCacheQ/FVCacheQ.FData (int8 rows). Carry that offset (and the
       // next slot's) by addition and reuse it for K and V in both formats -
       // no per-row GetRawPtr / multiply. The one multiply below is the only one.
       jDk := FEvictSinks * FDk;
@@ -30875,10 +30886,13 @@ begin
         if FKVQuantInt8 then
         begin
           // int8 storage: shift the codes + per-row scales instead of FP32.
-          Move(FKCacheCodes[jP1Dk], FKCacheCodes[jDk], RowBytesI8);
-          Move(FVCacheCodes[jP1Dk], FVCacheCodes[jDk], RowBytesI8);
-          FKCacheScale[j] := FKCacheScale[jP1];
-          FVCacheScale[j] := FVCacheScale[jP1];
+          // Not DeleteRows: that drops whole Y rows (KV heads), whereas an
+          // eviction drops one POSITION and must stop at the live length
+          // rather than running to MaxContext.
+          Move(FKCacheQ.FData[jP1Dk], FKCacheQ.FData[jDk], RowBytesI8);
+          Move(FVCacheQ.FData[jP1Dk], FVCacheQ.FData[jDk], RowBytesI8);
+          FKCacheQ.ScalePtr^[j] := FKCacheQ.ScalePtr^[jP1];
+          FVCacheQ.ScalePtr^[j] := FVCacheQ.ScalePtr^[jP1];
         end
         else
         begin
@@ -30895,10 +30909,8 @@ begin
     // (depth is contiguous, so each slice is one Move).
     if FKVQuantInt8 then
     begin
-      QuantizeCacheRow(Prev.GetRawPtr(posPrev + FDk),
-        FKCacheCodes, FKCacheScale, FCacheLen);
-      QuantizeCacheRow(Prev.GetRawPtr(posPrev + TwoFDk),
-        FVCacheCodes, FVCacheScale, FCacheLen);
+      QuantizeCacheRow(Prev.GetRawPtr(posPrev + FDk), FKCacheQ, FCacheLen);
+      QuantizeCacheRow(Prev.GetRawPtr(posPrev + TwoFDk), FVCacheQ, FCacheLen);
     end
     else
     begin
@@ -30931,8 +30943,8 @@ begin
       // Coded by Claude (AI).
       if FKVQuantInt8 then
         Score := TNNetVolume.DotProductInt8(
-          TNeuralInt8ArrPtr(@FKCacheCodes[jDk]),
-          QueryPtr, FDk) * (FKCacheScale[j] * FInvSqrtDk)
+          TNeuralInt8ArrPtr(@KCodesPtr^[jDk]),
+          QueryPtr, FDk) * (KScalePtr^[j] * FInvSqrtDk)
       else
       Score := TNNetVolume.DotProduct(
         QueryPtr, FKCache.GetRawPtr(jDk), FDk) * FInvSqrtDk;
@@ -30967,8 +30979,8 @@ begin
           // scale all fold into the one scalar (fused int8 axpy, no
           // dequantize-to-scratch pass). Coded by Claude (AI).
           TNNetVolume.MulAddInt8Scalar(OutPtr,
-            TNeuralInt8ArrPtr(@FVCacheCodes[jDk]),
-            FCacheScores[j] * InvSumExp * FVCacheScale[j], FDk)
+            TNeuralInt8ArrPtr(@VCodesPtr^[jDk]),
+            FCacheScores[j] * InvSumExp * VScalePtr^[j], FDk)
         else
         TNNetVolume.MulAdd(OutPtr, FVCache.GetRawPtr(jDk),
           FCacheScores[j] * InvSumExp, FDk);
@@ -31754,9 +31766,9 @@ begin
     for g := 0 to KVHeadsM1 do
     begin
       QuantizeCacheRow(Prev.GetRawPtr(pBase + FQW + gFDk),
-        FKCacheCodes, FKCacheScale, ScaleSlot);
+        FKCacheQ, ScaleSlot);
       QuantizeCacheRow(Prev.GetRawPtr(pBase + PVBase + gFDk),
-        FVCacheCodes, FVCacheScale, ScaleSlot);
+        FVCacheQ, ScaleSlot);
       Inc(gFDk, FDk);
       Inc(ScaleSlot, FCacheMax);
     end;
@@ -31802,12 +31814,15 @@ begin
       SrcRow := DstRow + FDk;
       if FKVQuantInt8 then
       begin
-        Move(FKCacheCodes[SrcRow], FKCacheCodes[DstRow], BlockBytesI8);
-        Move(FVCacheCodes[SrcRow], FVCacheCodes[DstRow], BlockBytesI8);
-        Move(FKCacheScale[ScaleBase + 1],
-          FKCacheScale[ScaleBase], ScaleBlockBytes);
-        Move(FVCacheScale[ScaleBase + 1],
-          FVCacheScale[ScaleBase], ScaleBlockBytes);
+        // Within one Y-plane (one KV head) this slides POSITIONS left, so it
+        // is not DeleteRows (which drops whole planes) and it stops at the
+        // live length rather than running to MaxContext.
+        Move(FKCacheQ.FData[SrcRow], FKCacheQ.FData[DstRow], BlockBytesI8);
+        Move(FVCacheQ.FData[SrcRow], FVCacheQ.FData[DstRow], BlockBytesI8);
+        Move(FKCacheQ.ScaleData.FData[ScaleBase + 1],
+          FKCacheQ.ScaleData.FData[ScaleBase], ScaleBlockBytes);
+        Move(FVCacheQ.ScaleData.FData[ScaleBase + 1],
+          FVCacheQ.ScaleData.FData[ScaleBase], ScaleBlockBytes);
       end
       else
       begin
@@ -31851,8 +31866,16 @@ var
   Score, MaxScore, SumExp, InvSumExp: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr, QueryPtr: TNeuralFloatArrPtr;
+  KCodesPtr, VCodesPtr: TNeuralInt8ArrPtr;
+  KScalePtr, VScalePtr: TNeuralFloatArrPtr;
 begin
   Prev := FPrevLayer.FOutput;
+  // Cache bases hoisted above the head loop (#11); the containers are
+  // preallocated at MaxContext and never resized during a decode step.
+  KCodesPtr := FKCacheQ.DataPtr;
+  VCodesPtr := FVCacheQ.DataPtr;
+  KScalePtr := FKCacheQ.ScalePtr;
+  VScalePtr := FVCacheQ.ScalePtr;
   if (FWindow > 0) and (LiveLen > FWindow)
     then jStart := LiveLen - FWindow
     else jStart := 0;
@@ -31869,7 +31892,7 @@ begin
     // offsets advance by FDk / 1 and the key stream prefetches like the
     // per-head caches did (the whole point of the plane layout).
     // CodeBase is the flat FDk-row offset; it indexes BOTH the int8 code rows
-    // (FKCacheCodes/FVCacheCodes) and the FP32 rows (FKCache/FVCache.FData) —
+    // (FKCacheQ/FVCacheQ.FData) and the FP32 rows (FKCache/FVCache.FData) —
     // same per-slot stride, one carried offset for both formats (#3).
     ScaleSeed := g * FCacheMax + jStart;   // #4: reused by both j passes
     CodeSeed := ScaleSeed * FDk;
@@ -31879,8 +31902,8 @@ begin
     begin
       if FKVQuantInt8 then
         Score := TNNetVolume.DotProductInt8(
-          TNeuralInt8ArrPtr(@FKCacheCodes[CodeBase]),
-          QueryPtr, FDk) * (FKCacheScale[ScaleIdx] * FInvSqrtDk)
+          TNeuralInt8ArrPtr(@KCodesPtr^[CodeBase]),
+          QueryPtr, FDk) * (KScalePtr^[ScaleIdx] * FInvSqrtDk)
       else
         Score := TNNetVolume.DotProduct(QueryPtr,
           TNeuralFloatArrPtr(@FKCache.FData[CodeBase]), FDk) * FInvSqrtDk;
@@ -31911,8 +31934,8 @@ begin
       begin
         if FKVQuantInt8 then
           TNNetVolume.MulAddInt8Scalar(OutPtr,
-            TNeuralInt8ArrPtr(@FVCacheCodes[CodeBase]),
-            FCacheScores[pos] * InvSumExp * FVCacheScale[ScaleIdx],
+            TNeuralInt8ArrPtr(@VCodesPtr^[CodeBase]),
+            FCacheScores[pos] * InvSumExp * VScalePtr^[ScaleIdx],
             FDk)
         else
           TNNetVolume.MulAdd(OutPtr,
@@ -32043,19 +32066,18 @@ begin
   begin
     FKCache.ReSize(1, 1, 1);
     FVCache.ReSize(1, 1, 1);
-    SetLength(FKCacheCodes, pMaxContext * FKW);
-    SetLength(FVCacheCodes, pMaxContext * FKW);
-    SetLength(FKCacheScale, pMaxContext * FKVHeads);
-    SetLength(FVCacheScale, pMaxContext * FKVHeads);
+    // (MaxContext, KVHeads, d_k) IS the head-major plane layout: head g's
+    // rows occupy the contiguous Y-plane g, so slot g*MaxContext + position
+    // addresses both the codes and the per-(position, head) scale.
+    FKCacheQ.ReSize(pMaxContext, FKVHeads, FDk);
+    FVCacheQ.ReSize(pMaxContext, FKVHeads, FDk);
   end
   else
   begin
     FKCache.ReSize(pMaxContext, 1, FKW);
     FVCache.ReSize(pMaxContext, 1, FKW);
-    SetLength(FKCacheCodes, 0);
-    SetLength(FVCacheCodes, 0);
-    SetLength(FKCacheScale, 0);
-    SetLength(FVCacheScale, 0);
+    FKCacheQ.ReSize(0, 0, 0);
+    FVCacheQ.ReSize(0, 0, 0);
   end;
   SetLength(FCacheScores, pMaxContext * FQHeads);
   FCacheMax := pMaxContext;
@@ -32082,10 +32104,8 @@ begin
       'ResetCache. CacheLength=' + IntToStr(FCacheLen));
     exit;
   end;
-  SetLength(FKCacheCodes, FCacheMax * FKW);
-  SetLength(FVCacheCodes, FCacheMax * FKW);
-  SetLength(FKCacheScale, FCacheMax * FKVHeads);
-  SetLength(FVCacheScale, FCacheMax * FKVHeads);
+  FKCacheQ.ReSize(FCacheMax, FKVHeads, FDk);
+  FVCacheQ.ReSize(FCacheMax, FKVHeads, FDk);
   FKCache.ReSize(1, 1, 1);
   FVCache.ReSize(1, 1, 1);
   FKVQuantInt8 := true;
@@ -32103,10 +32123,8 @@ begin
   begin
     FKCache.ReSize(FCacheMax, 1, FKW);
     FVCache.ReSize(FCacheMax, 1, FKW);
-    SetLength(FKCacheCodes, 0);
-    SetLength(FVCacheCodes, 0);
-    SetLength(FKCacheScale, 0);
-    SetLength(FVCacheScale, 0);
+    FKCacheQ.ReSize(0, 0, 0);
+    FVCacheQ.ReSize(0, 0, 0);
   end;
   FKVQuantInt8 := false;
 end;
