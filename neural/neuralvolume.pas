@@ -3400,6 +3400,59 @@ begin
   if Lo < iHi then QuickSortOrderByDist(Order, Dist, Lo, iHi);
 end;
 
+// Hoare-partition quickselect over the index array: permutes Order[0..Count-1]
+// so that the K entries with the SMALLEST Dist occupy Order[0..K-1] (in no
+// particular order). Average O(Count) and, like QuickSortOrderByDist, it works
+// entirely inside the caller's buffers - no heap allocation (rule #17). The
+// median-of-three pivot keeps already-ordered and all-equal inputs off the
+// quadratic path. Coded by Claude (AI).
+procedure PartialSelectOrderByDist(var Order: array of integer;
+  const Dist: array of TNeuralFloat; Count, K: integer);
+var
+  Lo, Hi, I, J, Mid, Bound, T: integer;
+  Pivot: TNeuralFloat;
+begin
+  if (K <= 0) or (K >= Count) then exit;
+  Lo := 0;
+  Hi := Count - 1;
+  Bound := K - 1;
+  while Lo < Hi do
+  begin
+    // Median of Dist[Order[Lo]], Dist[Order[Mid]], Dist[Order[Hi]], left at Mid.
+    Mid := (Lo + Hi) shr 1;
+    if Dist[Order[Lo]] > Dist[Order[Mid]] then
+    begin
+      T := Order[Lo]; Order[Lo] := Order[Mid]; Order[Mid] := T;
+    end;
+    if Dist[Order[Lo]] > Dist[Order[Hi]] then
+    begin
+      T := Order[Lo]; Order[Lo] := Order[Hi]; Order[Hi] := T;
+    end;
+    if Dist[Order[Mid]] > Dist[Order[Hi]] then
+    begin
+      T := Order[Mid]; Order[Mid] := Order[Hi]; Order[Hi] := T;
+    end;
+    Pivot := Dist[Order[Mid]];
+    I := Lo;
+    J := Hi;
+    repeat
+      while Dist[Order[I]] < Pivot do Inc(I);
+      while Dist[Order[J]] > Pivot do Dec(J);
+      if I <= J then
+      begin
+        T := Order[I]; Order[I] := Order[J]; Order[J] := T;
+        Inc(I);
+        Dec(J);
+      end;
+    until I > J;
+    // Recurse into the side that still holds the K-th boundary; when the
+    // boundary falls inside the equal-to-pivot gap the split is already exact.
+    if Bound <= J then Hi := J
+    else if Bound >= I then Lo := I
+    else Break;
+  end;
+end;
+
 { TNNetSamplerTopP }
 
 constructor TNNetSamplerTopP.Create(TopP: TNeuralFloat);
@@ -3661,11 +3714,20 @@ begin
 end;
 
 function TNNetSamplerTypical.SampleTypical(): integer;
+const
+  // Below this window size a full sort is already cheap, so skip the
+  // partial-selection machinery entirely.
+  csTypicalAdaptiveMin = 1024;
+  // First guess at the typical-set width. Over a peaked next-token row the
+  // set that first reaches FMass is far narrower than this; when it is not,
+  // the retry below pays one full sort and is still correct.
+  csTypicalAdaptiveK = 256;
 var
-  Entropy, P, Surprise, KeptSum, Roll, Cumulative: TNeuralFloat;
+  Entropy, P, LogP, KeptSum, Roll, Cumulative: TNeuralFloat;
   Dist: array of TNeuralFloat; // |surprise - entropy| per FTokenArr entry
   Order: array of integer;     // FTokenArr indices sorted by ascending Dist
-  I, KeptCount, KeptCountM1, N, NM1: integer;
+  I, KeptCount, KeptCountM1, N, NM1, Limit: integer;
+  Truncated: boolean;
 begin
   N := FCount;
   if N = 0 then
@@ -3674,40 +3736,62 @@ begin
     exit;
   end;
   NM1 := N - 1;
-  // Conditional (Shannon) entropy of the row, in nats.
-  Entropy := 0;
-  for I := 0 to NM1 do
-  begin
-    P := FTokenArr[I].Score;
-    if P > 0 then Entropy := Entropy - P * pcr_logf(P);
-  end;
-  // Per-token distance |(-log p) - H|.
   // Reuse the persistent scratch fields; resize only when the vocab size
   // changes (rule #17: amortized, no per-call heap allocation).
   if Length(FDist) <> N then SetLength(FDist, N);
   if Length(FOrder) <> N then SetLength(FOrder, N);
   Dist := FDist;   // reference share (refcount bump only, no new buffer)
   Order := FOrder;
+  // Conditional (Shannon) entropy of the row, in nats. log p is stashed in
+  // Dist on the way through so the distance pass below needs no second log.
+  Entropy := 0;
   for I := 0 to NM1 do
   begin
     P := FTokenArr[I].Score;
-    if P > 0 then Surprise := -pcr_logf(P) else Surprise := 1e30; // p=0 => infinite
-    Dist[I] := Abs(Surprise - Entropy);
+    if P > 0 then
+    begin
+      LogP := pcr_logf(P);
+      Dist[I] := LogP;
+      Entropy := Entropy - P * LogP;
+    end
+    else Dist[I] := -1e30; // p = 0 => surprise +infinite
     Order[I] := I;
   end;
-  // Sort Order by ascending Dist in O(N log N) with an in-place quicksort over
-  // the existing index buffer (no heap allocation, rule #17), replacing the
-  // former O(N^2) selection sort over the full vocab.
-  if N > 1 then QuickSortOrderByDist(Order, Dist, 0, NM1);
-  // Smallest prefix (by ascending distance) whose cumulative mass reaches FMass.
-  KeptCount := 0;
-  KeptSum := 0;
+  // Per-token distance |(-log p) - H|: surprise is -LogP, so this is purely
+  // arithmetic over the cached logs.
   for I := 0 to NM1 do
+    Dist[I] := Abs(-Dist[I] - Entropy);
+  // Sorting the whole vocabulary to consume a prefix of a few hundred entries
+  // dominates this sampler, so select a bounded prefix first (the adaptive
+  // scheme TNNetSamplerTopP already uses) and widen only if the mass was not
+  // reached. Both branches sort in place over the existing index buffer, so
+  // there is still no heap allocation (rule #17).
+  Truncated := N > csTypicalAdaptiveMin;
+  if Truncated then
   begin
-    Inc(KeptCount);
-    KeptSum := KeptSum + FTokenArr[Order[I]].Score;
-    if KeptSum >= FMass then Break;
-  end;
+    PartialSelectOrderByDist(Order, Dist, N, csTypicalAdaptiveK);
+    Limit := csTypicalAdaptiveK - 1;
+  end
+  else Limit := NM1;
+  if Limit > 0 then QuickSortOrderByDist(Order, Dist, 0, Limit);
+  // Smallest prefix (by ascending distance) whose cumulative mass reaches FMass.
+  repeat
+    KeptCount := 0;
+    KeptSum := 0;
+    for I := 0 to Limit do
+    begin
+      Inc(KeptCount);
+      KeptSum := KeptSum + FTokenArr[Order[I]].Score;
+      if KeptSum >= FMass then Break;
+    end;
+    if (KeptSum >= FMass) or (not Truncated) then Break;
+    // The prefix did not hold FMass: re-arm the identity order over the whole
+    // row and sort it in full, exactly once.
+    for I := 0 to NM1 do Order[I] := I;
+    QuickSortOrderByDist(Order, Dist, 0, NM1);
+    Truncated := false;
+    Limit := NM1;
+  until false;
   if (KeptCount = 0) or (KeptSum <= 0) then
   begin
     Result := FTokenArr[Order[0]].Token; // fallback: degenerate distribution
@@ -3761,7 +3845,7 @@ end;
 
 function TNNetSamplerMirostat.SampleAndUpdate(): integer;
 var
-  KeptSum, Roll, Cumulative, P, Surprise: TNeuralFloat;
+  KeptSum, Roll, Cumulative, P, Surprise, SurpriseCut: TNeuralFloat;
   SumLogP, SumLogRank, SumLogPLogRank, SumLogRankSq, LogRank, LogP: TNeuralFloat;
   S, Epsilon, KFloat, ChosenScore: TNeuralFloat;
   I, KeptCount, KeptCountM1, N, NM1, NumFit, NumFitM2, K: integer;
@@ -3776,14 +3860,20 @@ begin
   // FTokenArr is sorted DESCENDING: [0] is the max probability.
   if FVersion = mvV2 then
   begin
-    // v2: keep every token with surprise -log p <= Mu.
+    // v2: keep every token with surprise -log p <= Mu. Rule #14: that cut is
+    // exactly p >= exp(-Mu) (exp is strictly increasing), so one exp on the
+    // pre-image replaces a log per candidate - and a typical Tau keeps
+    // thousands of candidates. A huge Mu underflows the cut to ~0 and keeps
+    // everything; a very negative Mu overflows it to +Inf, keeps nothing, and
+    // falls through to the "always keep the most-likely token" guard below.
+    SurpriseCut := NeuralExp(-FMu);
     KeptCount := 0;
     KeptSum := 0;
     for I := 0 to NM1 do
     begin
       P := FTokenArr[I].Score;
       if P <= 0 then Break; // descending: nothing later is larger
-      if -pcr_logf(P) <= FMu then
+      if P >= SurpriseCut then
       begin
         Inc(KeptCount);
         KeptSum := KeptSum + P;
