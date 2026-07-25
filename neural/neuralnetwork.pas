@@ -91729,8 +91729,8 @@ end;
 
 procedure TNNetSpatialDropout2D.Compute();
 var
-  LpBnd112: integer;
-  LpBnd113: integer;
+  MaxDropMaskD: integer;
+  MaxIdentityMaskD: integer;
   StartTime: double;
   P, Keep, InvKeep: TNeuralFloat;
   d: integer;
@@ -91746,8 +91746,8 @@ begin
     Keep := 1 - P;
     if Keep <= 0 then Keep := 1e-6;
     InvKeep := 1.0 / Keep;
-    LpBnd112 := FOutput.Depth - 1;
-    for d := 0 to LpBnd112 do
+    MaxDropMaskD := FOutput.Depth - 1;
+    for d := 0 to MaxDropMaskD do
     begin
       if Random < P then
         FChannelMask.Raw[d] := 0
@@ -91759,8 +91759,8 @@ begin
   else
   begin
     // Identity at inference: fill mask with 1 so backward is a no-op.
-    LpBnd113 := FOutput.Depth - 1;
-    for d := 0 to LpBnd113 do
+    MaxIdentityMaskD := FOutput.Depth - 1;
+    for d := 0 to MaxIdentityMaskD do
       FChannelMask.Raw[d] := 1;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -91800,8 +91800,8 @@ end;
 
 procedure TNNetSpatialDropout1D.Compute();
 var
-  LpBnd114: integer;
-  LpBnd115: integer;
+  MaxDropMaskD: integer;
+  MaxIdentityMaskD: integer;
   StartTime: double;
   P, Keep, InvKeep: TNeuralFloat;
   d: integer;
@@ -91816,8 +91816,8 @@ begin
     Keep := 1 - P;
     if Keep <= 0 then Keep := 1e-6;
     InvKeep := 1.0 / Keep;
-    LpBnd114 := FOutput.Depth - 1;
-    for d := 0 to LpBnd114 do
+    MaxDropMaskD := FOutput.Depth - 1;
+    for d := 0 to MaxDropMaskD do
     begin
       if Random < P then
         FChannelMask.Raw[d] := 0
@@ -91828,8 +91828,8 @@ begin
   end
   else
   begin
-    LpBnd115 := FOutput.Depth - 1;
-    for d := 0 to LpBnd115 do
+    MaxIdentityMaskD := FOutput.Depth - 1;
+    for d := 0 to MaxIdentityMaskD do
       FChannelMask.Raw[d] := 1;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -91947,8 +91947,8 @@ end;
 
 procedure TNNetDropBlock.Compute();
 var
-  LpBnd116: integer;
-  LpBnd117: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   StartTime: double;
   x, y, OutDepthMax: integer;
   m: TNeuralFloat;
@@ -91962,11 +91962,11 @@ begin
   begin
     if not FFreezeMask then RefreshMask();
     // Apply the spatial keep mask broadcast over all channels (Depth).
-    LpBnd116 := FOutput.SizeY - 1;
-    LpBnd117 := FOutput.SizeX - 1;
+    MaxOutputY := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
     OutDepthMax := FOutput.Depth - 1;
-    for y := 0 to LpBnd116 do
-      for x := 0 to LpBnd117 do
+    for y := 0 to MaxOutputY do
+      for x := 0 to MaxOutputX do
       begin
         m := FKeepMask.Data[x, y, 0];
         if m <> 1 then
@@ -91982,8 +91982,8 @@ end;
 
 procedure TNNetDropBlock.Backpropagate();
 var
-  LpBnd118: integer;
-  LpBnd119: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   StartTime: double;
   x, y, OutDepthMax: integer;
   m: TNeuralFloat;
@@ -91997,11 +91997,11 @@ begin
   if FEnabled and (FOutputError.Size = FOutput.Size) and
      (FKeepMask.SizeX = FOutput.SizeX) and (FKeepMask.SizeY = FOutput.SizeY) then
   begin
-    LpBnd118 := FOutput.SizeY - 1;
-    LpBnd119 := FOutput.SizeX - 1;
+    MaxOutputY := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
     OutDepthMax := FOutput.Depth - 1;
-    for y := 0 to LpBnd118 do
-      for x := 0 to LpBnd119 do
+    for y := 0 to MaxOutputY do
+      for x := 0 to MaxOutputX do
       begin
         m := FKeepMask.Data[x, y, 0];
         if m <> 1 then
@@ -92291,7 +92291,7 @@ end;
 
 procedure TNNetLpPool.Compute();
 var
-  LpBnd120: integer;
+  MaxOutputPos: integer;
   CntX, CntY, CntD: integer;
   MaxX, MaxY, MaxD: integer;
   OutX, OutY: integer;
@@ -92328,8 +92328,8 @@ begin
   // y = ( (1/N) * sum |x_i|^p )^(1/p)
   N := FPoolSize * FPoolSize;
   InvP := 1.0 / FP;
-  LpBnd120 := FOutput.Size - 1;
-  for OutputRawPos := 0 to LpBnd120 do
+  MaxOutputPos := FOutput.Size - 1;
+  for OutputRawPos := 0 to MaxOutputPos do
   begin
     FOutput.FData[OutputRawPos] :=
       pcr_powf(FOutput.FData[OutputRawPos] / N, InvP);
@@ -95332,7 +95332,7 @@ end;
 
 procedure TNNetTopKGate.Backpropagate;
 var
-  LpBnd122: integer;
+  MaxOutputPos: integer;
   StartTime: double;
   CntX, CntY, CntD, MaxX, MaxY, MaxD, StartPos, TopCnt: integer;
   SurvSum, Dot, gy, ErrY: TNeuralFloat;
@@ -95363,8 +95363,8 @@ begin
       // Raw mode: y_j = g_j on survivors, so the backward is a hard 0/1
       // straight-through mask (no renorm Jacobian), like
       // TNNetExpertChoiceGate. Survivors are exactly the FOutput<>0 cells.
-      LpBnd122 := FOutput.Size - 1;
-      for CntD := 0 to LpBnd122 do
+      MaxOutputPos := FOutput.Size - 1;
+      for CntD := 0 to MaxOutputPos do
         if FOutput.FData[CntD] <> 0 then
           FPrevLayer.OutputError.FData[CntD] :=
             FPrevLayer.OutputError.FData[CntD] + FOutputError.FData[CntD];
@@ -99700,8 +99700,8 @@ end;
 
 procedure TNNetLearnedPositionalEmbedding.Compute();
 var
-  LpBnd124: integer;
-  LpBnd125: integer;
+  MaxOutputX: integer;
+  MaxOutputY: integer;
   StartTime: double;
   CntX, CntY, OutDepth: integer;
   LocalWeights: TNNetVolume;
@@ -99718,8 +99718,8 @@ begin
   {$ENDIF}
   // Out[x, y, :] += Table[x + PositionOffset, :]; the same row is broadcast
   // over Y. PositionOffset (default 0) shifts the lookup for streamed decode.
-  LpBnd124 := FOutput.SizeX - 1;
-  LpBnd125 := FOutput.SizeY - 1;
+  MaxOutputX := FOutput.SizeX - 1;
+  MaxOutputY := FOutput.SizeY - 1;
   OutDepth := FOutput.Depth;
   if FOutput.SizeY = 1 then
   begin
@@ -99728,11 +99728,11 @@ begin
       LocalWeights.GetRawPtr(FPositionOffset, 0), FOutput.SizeX * OutDepth);
   end
   else
-    for CntX := 0 to LpBnd124 do
+    for CntX := 0 to MaxOutputX do
     begin
       // #11: weights row invariant across Y; #18: MulAdd factor 1 -> Add.
       wPtr := LocalWeights.GetRawPtr(CntX + FPositionOffset, 0);
-      for CntY := 0 to LpBnd125 do
+      for CntY := 0 to MaxOutputY do
         TNNetVolume.Add(FOutput.GetRawPtr(CntX, CntY), wPtr, OutDepth);
     end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -99740,8 +99740,8 @@ end;
 
 procedure TNNetLearnedPositionalEmbedding.Backpropagate();
 var
-  LpBnd126: integer;
-  LpBnd127: integer;
+  MaxOutputX: integer;
+  MaxOutputY: integer;
   StartTime: double;
   CntX, CntY: integer;
   DestPtr: TNeuralFloatArrPtr;
@@ -99753,15 +99753,15 @@ begin
   StartTime := Now();
   // dTable[x, :] += sum_y dOut[x, y, :] (scaled by -LearningRate into Delta
   // following the repo's delta convention).
-  LpBnd126 := FOutput.SizeX - 1;
-  LpBnd127 := FOutput.SizeY - 1;   // #5: loop-invariant bound hoisted
+  MaxOutputX := FOutput.SizeX - 1;
+  MaxOutputY := FOutput.SizeY - 1;   // #5: loop-invariant bound hoisted
   if FBatchUpdate                  // #5: invariant destination selection hoisted
     then DestVol := FNeurons[0].FDelta
     else DestVol := FNeurons[0].FWeights;
-  for CntX := 0 to LpBnd126 do
+  for CntX := 0 to MaxOutputX do
   begin
     DestPtr := DestVol.GetRawPtr(CntX, 0);
-    for CntY := 0 to LpBnd127 do
+    for CntY := 0 to MaxOutputY do
       TNNetVolume.MulAdd(DestPtr, FOutputError.GetRawPtr(CntX, CntY),
         -FLearningRate, FOutput.Depth);
   end;
@@ -99933,7 +99933,7 @@ end;
 
 procedure TNNet.ComputeL2Decay(ExcludeBias: boolean);
 var
-  LpBnd128: integer;
+  MaxLayerNeuronPos: integer;
   LayerCnt, NeuronCnt, LastLayerIdx: integer;
   CurrentLayer: TNNetLayer;
   Factor: TNeuralFloat;
@@ -99955,8 +99955,8 @@ begin
     if CurrentLayer is TNNetIdentityWithoutL2 then Continue;
     if (CurrentLayer.Neurons.Count = 0) or (CurrentLayer.L2Decay <= 0) then Continue;
     Factor := 1 - (CurrentLayer.L2Decay * CurrentLayer.LearningRate);
-    LpBnd128 := CurrentLayer.Neurons.Count - 1;
-    for NeuronCnt := 0 to LpBnd128 do
+    MaxLayerNeuronPos := CurrentLayer.Neurons.Count - 1;
+    for NeuronCnt := 0 to MaxLayerNeuronPos do
     begin
       CurrentLayer.Neurons[NeuronCnt].Weights.Mul(Factor);
       // Bias deliberately untouched (excluded from weight decay).
@@ -100199,7 +100199,7 @@ type
   end;
   TSigArray = array of TLayerSig;
 var
-  LpBnd129: integer;
+  MaxLinePos: integer;
   A, B: TSigArray;
   M, N: integer;
   LCS: array of array of integer;
@@ -100292,8 +100292,8 @@ begin
   try
     Emit(M, N);
     Same := True;
-    LpBnd129 := Lines.Count - 1;
-    for I := 0 to LpBnd129 do
+    MaxLinePos := Lines.Count - 1;
+    for I := 0 to MaxLinePos do
       if (Length(Lines[I]) > 0) and (Lines[I][1] <> ' ') then
       begin
         Same := False;
