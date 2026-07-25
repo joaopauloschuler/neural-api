@@ -663,11 +663,21 @@ type
   { TNNetVolumeQuant8 }
 
   // Symmetric int8 storage carrying the geometry contract of TNNetVolume:
-  // code (x,y,d) lives at ((SizeX*y) + x) * Depth + d, so Depth is always the
-  // quantized vector, Y the slow row axis and X the inner grouping axis. Every
-  // (x,y) pair owns one scale and the dequantized value is code*Scale[x,y].
-  // The scale plane is itself a TNNetVolume of shape (SizeX, SizeY, 1), so a
-  // scale is addressed by the very same formula with d = 0.
+  // code (x,y,d) lives at ((SizeX*y) + x) * Depth + d. Every (x,y) pair owns
+  // one scale and the dequantized value is code*Scale[x,y]. The scale plane is
+  // itself a TNNetVolume of shape (SizeX, SizeY, 1), so a scale is addressed
+  // by the very same formula with d = 0.
+  //
+  // Axis convention across the int8 call sites: Depth is always the quantized
+  // vector, X the primary row index and Y a secondary grouping, 1 when there
+  // is none. So a vocab table is (VocabSize, 1, EmbeddingSize), concatenated
+  // layer weights are (NumNeurons, 1, VectorSize), a single-head KV cache is
+  // (MaxContext, 1, d_k) and a grouped-query KV cache is
+  // (MaxContext, KVHeads, d_k) - one contiguous Y-plane per KV head, which is
+  // the head-major layout that cache already had. This matches how the FP32
+  // volumes beside them are shaped and indexed (row index first,
+  // GetRawPtr(Row, 0)). Note DeleteRows works on Y, so it drops groups, not
+  // rows, under this convention.
   //
   // ReSize is the only member that changes lengths. SetLength may move the
   // buffer, so a SetLength on FData anywhere else would leave DataPtr

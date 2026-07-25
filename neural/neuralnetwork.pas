@@ -7167,11 +7167,13 @@ type
     // whole table in FNeurons[0].Weights (VocabSize rows of EmbeddingSize),
     // outside the TNNetLayerConcatedWeights storage the conv/FC int8 path
     // uses - so it carries its own container with the SAME convention:
-    // vocab row t holds codes with dequantized value code*Scale[0,t],
+    // vocab row t holds codes with dequantized value code*Scale[t,0],
     // scale = max|row|/127 (symmetric, round-to-nearest). FQuantTable is
-    // shaped (1, VocabSize, EmbeddingSize), so row t starts at
-    // t*EmbeddingSize and owns scale (0,t) - the same linear layout the two
-    // raw arrays had. The forward gather dequantizes the looked-up row
+    // shaped (VocabSize, 1, EmbeddingSize) - the row index on X, as
+    // everywhere else - so row t starts at t*EmbeddingSize and owns scale
+    // (t,0), the same linear layout the two raw arrays had. It mirrors the
+    // FP32 table's own (VocabSize, 1, EmbeddingSize) shape. The forward
+    // gather dequantizes the looked-up row
     // directly into the output (the FP32 table is never rebuilt), cutting the
     // table's memory AND per-token bandwidth to ~1/4. Backpropagate raises.
     FQuantInt8: boolean;
@@ -99191,7 +99193,7 @@ begin
     // not fill, so the scales are set explicitly. The FP32 table is never
     // allocated; DequantizeWeightsInt8 can still restore writable rows for
     // the FP32 import path.
-    FQuantTable.ReSize(1, pVocabSize, pEmbeddingSize);
+    FQuantTable.ReSize(pVocabSize, 1, pEmbeddingSize);
     FQuantTable.Fill(0);
     FQuantTable.ScaleData.Fill(1);
     FQuantInt8 := true;
@@ -99303,14 +99305,14 @@ begin
       IntToStr(FVocabSize * FEmbeddingSize) + '.');
     exit;
   end;
-  FQuantTable.ReSize(1, FVocabSize, FEmbeddingSize);
+  FQuantTable.ReSize(FVocabSize, 1, FEmbeddingSize);
   VocabM1 := FVocabSize - 1;
   for RowCnt := 0 to VocabM1 do
   begin
     RowBase := RowCnt * FEmbeddingSize;
     QuantizeInt8RowTolerant(TNeuralFloatArrPtr(@W.FData[RowBase]),
       FEmbeddingSize, @FQuantTable.FData[RowBase], Scale);
-    FQuantTable.Scale[0, RowCnt] := Scale;
+    FQuantTable.Scale[RowCnt, 0] := Scale;
   end;
   // Free the FP32 table only after every row quantized successfully.
   // (1,1,1) matches the pre-SetNumWeights state; SetLength inside ReSize
@@ -99335,7 +99337,7 @@ begin
   VocabM1 := FVocabSize - 1;
   for RowCnt := 0 to VocabM1 do
   begin
-    FQuantTable.DequantizeRowTo(0, RowCnt,
+    FQuantTable.DequantizeRowTo(RowCnt, 0,
       TNeuralFloatArrPtr(@W.FData[RowCnt * FEmbeddingSize]));
   end;
   FQuantTable.ReSize(0, 0, 0);
@@ -99371,12 +99373,12 @@ begin
   RowBase := RowIdx * FEmbeddingSize;
   if QuantizeInt8RowTolerant(TNeuralFloatArrPtr(@Src.FData[SrcOffset]),
        FEmbeddingSize, @FQuantTable.FData[RowBase], Scale) then
-    FQuantTable.Scale[0, RowIdx] := pExtraScale * Scale
+    FQuantTable.Scale[RowIdx, 0] := pExtraScale * Scale
   else
     // Zero row: zero codes with unit scale, matching QuantizeWeightsInt8's
     // zero-row convention (pExtraScale is irrelevant - dequant is 0 either
     // way - and scale 1 keeps requantize-after-dequantize exact).
-    FQuantTable.Scale[0, RowIdx] := 1;
+    FQuantTable.Scale[RowIdx, 0] := 1;
 end;
 
 function TNNetEmbedding.Int8QuantizedSizeBytes(): int64;
@@ -99439,7 +99441,7 @@ begin
       begin
         FInputTokens[CntToken] := CurrentToken;
         DestPtr := FOutput.GetRawPtr(dstPos);
-        FQuantTable.DequantizeRowTo(0, CurrentToken, DestPtr);
+        FQuantTable.DequantizeRowTo(CurrentToken, 0, DestPtr);
       end
       else FillChar(FOutput.FData[dstPos], RowBytes, 0);
       Inc(dstPos, RowStride);
@@ -99738,7 +99740,7 @@ begin
       begin
         FInputTokens[CntToken] := CurrentToken;
         RowBase := CurrentToken * FEmbeddingSize;
-        RowScale := FQuantTable.Scale[0, CurrentToken];
+        RowScale := FQuantTable.Scale[CurrentToken, 0];
         SourcePtrPos := FPositionalEmbedding.GetRawPtr(posPos);
         DestPtr := FOutput.GetRawPtr(dstPos);
         for ElementCnt := 0 to EmbSizeM1 do
