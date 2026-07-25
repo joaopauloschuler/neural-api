@@ -24590,14 +24590,20 @@ procedure TNNetReGLU.Compute();
 var
   StartTime: double;
   MaxX, MaxY, MaxD: integer;
-  X, Y, D, HalfDepth, basePrev, basePrev0, baseOut0: integer;
+  X, Y, HalfDepth: integer;
+{$IFNDEF AVXANY}
+  D, basePrev, basePrev0, baseOut0: integer;
   a, b, reluA: TNeuralFloat;
+{$ELSE}
+  aPtr, bPtr, outPtr: TNeuralFloatArrPtr;
+{$ENDIF}
 begin
   StartTime := Now();
   HalfDepth := FOutput.Depth;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := HalfDepth - 1;
+  {$IFNDEF AVXANY}
   for X := 0 to MaxX do
     for Y := 0 to MaxY do
     begin
@@ -24612,6 +24618,22 @@ begin
         FOutput.FData[baseOut0 + D] := reluA * b;
       end;
     end;
+  {$ELSE}
+  // ReGLU = ReLU(A)*B. The A (offset 0) and B (offset HalfDepth) depth-halves
+  // are each a contiguous depth-axis run, so the relu ride is AVX-vectorized
+  // via TNNetVolume.VectorRelu: write ReLU(A) into the output row, then an AVX
+  // elementwise Mul folds in B. Bit-exact (relu is a compare-and-select).
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      aPtr := FPrevLayer.FOutput.GetRawPtr(X, Y);
+      // #13: b-half is a's constant-offset neighbour (+HalfDepth), no 2nd accessor
+      bPtr := TNeuralFloatArrPtr(@aPtr^[HalfDepth]);
+      outPtr := FOutput.GetRawPtr(X, Y);
+      TNNetVolume.VectorRelu(outPtr, aPtr, HalfDepth); // out := ReLU(A)
+      TNNetVolume.Mul(outPtr, bPtr, HalfDepth);        // out := ReLU(A) * B
+    end;
+  {$ENDIF}
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -24877,14 +24899,20 @@ procedure TNNetReGLUSquared.Compute();
 var
   StartTime: double;
   MaxX, MaxY, MaxD: integer;
-  X, Y, D, HalfDepth, basePrev, basePrev0, baseOut0: integer;
+  X, Y, HalfDepth: integer;
+{$IFNDEF AVXANY}
+  D, basePrev, basePrev0, baseOut0: integer;
   a, b, reluB: TNeuralFloat;
+{$ELSE}
+  aPtr, bPtr, outPtr: TNeuralFloatArrPtr;
+{$ENDIF}
 begin
   StartTime := Now();
   HalfDepth := FOutput.Depth;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := HalfDepth - 1;
+  {$IFNDEF AVXANY}
   for X := 0 to MaxX do
     for Y := 0 to MaxY do
     begin
@@ -24899,6 +24927,24 @@ begin
         FOutput.FData[baseOut0 + D] := a * reluB * reluB;
       end;
     end;
+  {$ELSE}
+  // ReGLUSquared = A*ReLU(B)^2. The A (offset 0) and B (offset HalfDepth)
+  // depth-halves are each a contiguous depth-axis run, so the row is three AVX
+  // passes: ReLU(B) into the output via VectorRelu, an in-place elementwise
+  // square, then an elementwise Mul by A. The products are re-associated as
+  // A*(r*r) instead of (A*r)*r, so this is equivalent but not bit-identical.
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      aPtr := FPrevLayer.FOutput.GetRawPtr(X, Y);
+      // #13: b-half is a's constant-offset neighbour (+HalfDepth), no 2nd accessor
+      bPtr := TNeuralFloatArrPtr(@aPtr^[HalfDepth]);
+      outPtr := FOutput.GetRawPtr(X, Y);
+      TNNetVolume.VectorRelu(outPtr, bPtr, HalfDepth); // out := ReLU(B)
+      TNNetVolume.Mul(outPtr, outPtr, HalfDepth);      // out := ReLU(B)^2
+      TNNetVolume.Mul(outPtr, aPtr, HalfDepth);        // out := A * ReLU(B)^2
+    end;
+  {$ENDIF}
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -27946,13 +27992,20 @@ end;
 procedure TNNetLookupFreeQuant.ComputeEntropyTerms();
 var
   DM1, X, Y, MaxX, MaxY, I, NPos, basePrev0: integer;
-  Z, DNeg, DPos, M, ENeg, EPos, S, PNeg, PPos, H, Acc: TNeuralFloat;
+  Z, E, PNeg, PPos, H, Acc, FourT: TNeuralFloat;
 const
   cEps = 1e-12;
 begin
   // Factorized binary entropy_aux_loss (lucidrains LFQ). Per channel, per
   // spatial position the soft assignment to {-1,+1} is
   //   logits = -t*[(z+1)^2, (z-1)^2];  p = softmax(logits).
+  // #14: a 2-logit softmax is a sigmoid. The logit gap collapses to
+  //   d(+1) - d(-1) = -t*[(z-1)^2 - (z+1)^2] = 4*t*z,
+  // so p(+1) = 1/(1 + exp(-4*t*z)) - one exp and one divide instead of a max,
+  // two exps and two divides. The exponent is taken on the sign of z so its
+  // argument is never positive (the role the max played) and the small
+  // probability is formed as E*P, never as 1-P, keeping both tails accurate.
+  FourT := 4 * FInvTemp;
   DM1 := FNumCh - 1;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
@@ -27967,15 +28020,18 @@ begin
       for I := 0 to DM1 do
       begin
         Z := FPrevLayer.FOutput.FData[basePrev0 + I];
-        DNeg := -FInvTemp * (Z + 1) * (Z + 1); // logit for level -1
-        DPos := -FInvTemp * (Z - 1) * (Z - 1); // logit for level +1
-        // numerically-stable softmax over the 2 logits
-        if DNeg > DPos then M := DNeg else M := DPos;
-        ENeg := NeuralExp(DNeg - M);
-        EPos := NeuralExp(DPos - M);
-        S := ENeg + EPos;
-        PNeg := ENeg / S;
-        PPos := EPos / S;
+        if Z >= 0 then
+        begin
+          E := NeuralExp(-FourT * Z);  // <= 1
+          PPos := 1.0 / (1.0 + E);
+          PNeg := E * PPos;
+        end
+        else
+        begin
+          E := NeuralExp(FourT * Z);   // <= 1
+          PNeg := 1.0 / (1.0 + E);
+          PPos := E * PNeg;
+        end;
         // per-sample entropy H(p) = -sum p*ln(p)
         H := 0;
         if PNeg > cEps then H := H - PNeg * pcr_logf(PNeg); // #16 (metric only)
@@ -30006,7 +30062,7 @@ var
   CntE, MaxE, ArgMin, ArgMax: integer;
   CntD, Depth, DepthM1, Pos, NumPos, NumPosM1, Idx: integer;
   LocalPrevOutput: TNNetVolume;
-  MinV, MaxV, Denom, Eps, Xv: TNeuralFloat;
+  MinV, MaxV, Denom, InvDenom, Eps, Xv: TNeuralFloat;
 begin
   StartTime := Now();
   LocalPrevOutput := FPrevLayer.FOutput;
@@ -30041,10 +30097,14 @@ begin
       Denom := (MaxV - MinV) + Eps;
       FDenoms.FData[CntD] := Denom;
       FMaxVals.FData[CntD] := MaxV;
+      // #5: 1/Denom is loop-invariant (the backward already carries InvDenom);
+      // #6: carry Pos*Depth+CntD instead of re-multiplying it every position.
+      InvDenom := 1.0 / Denom;
+      Idx := CntD;
       for Pos := 0 to NumPosM1 do
       begin
-        Idx := Pos * Depth + CntD;
-        FOutput.FData[Idx] := (LocalPrevOutput.FData[Idx] - MinV) / Denom;
+        FOutput.FData[Idx] := (LocalPrevOutput.FData[Idx] - MinV) * InvDenom;
+        Inc(Idx, Depth);
       end;
     end;
     FForwardTime := FForwardTime + (Now() - StartTime);
@@ -30118,9 +30178,9 @@ begin
         ArgMax := Round(FArgMax.FData[CntD]);
         DotGY := 0;
         ArgMinExtra := 0;
+        Idx := CntD; // #6: carry Pos*Depth+CntD as a running offset
         for Pos := 0 to NumPosM1 do
         begin
-          Idx := Pos * Depth + CntD;
           Gi := FOutputError.FData[Idx];
           Yi := FOutput.FData[Idx];
           DotGY := DotGY + Gi * Yi;
@@ -30128,6 +30188,7 @@ begin
           ArgMinExtra := ArgMinExtra + Gi * (Yi - 1.0) * Denom;
           FPrevLayer.OutputError.FData[Idx] :=
             FPrevLayer.OutputError.FData[Idx] + Gi * InvDenom;
+          Inc(Idx, Depth);
         end;
         FPrevLayer.OutputError.FData[ArgMax] :=
           FPrevLayer.OutputError.FData[ArgMax] - InvDenom * DotGY;

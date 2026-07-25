@@ -44,6 +44,7 @@ type
     procedure TestLookupFreeQuantSTEGradientCheck;
     procedure TestLookupFreeQuantCodeIndexRoundTrip;
     procedure TestLookupFreeQuantEntropy;
+    procedure TestLookupFreeQuantSoftAssignment;
     procedure TestSoftPoolGradientCheck;
     procedure TestSoftPoolGradientCheckBetaSweep;
     procedure TestSoftPoolBetaLimits;
@@ -963,6 +964,7 @@ type
     procedure TestTanhGLUSerializationRoundTrip;
     procedure TestReGLUForward;
     procedure TestReGLUGradientCheck;
+    procedure TestReGLUFamilyForwardParity;
     procedure TestCosineSimilarityForward;
     procedure TestCosineSimilarityGradientCheck;
     procedure TestSquaredReLUForward;
@@ -8099,6 +8101,58 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestLookupFreeQuantSoftAssignment;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LFQ: TNNetLookupFreeQuant;
+  Zs: array[0..3] of TNeuralFloat;
+  I: integer;
+  P, Q, HSum, MeanPNeg, ExpPerSample, ExpCodebook: double;
+begin
+  // Pins the exact soft assignment, not just its ordering. The 2-level softmax
+  //   p = softmax(-t*[(z+1)^2, (z-1)^2])
+  // reduces to the sigmoid p(+1) = 1/(1 + exp(-4*t*z)); at t = 0.25 that is a
+  // plain sigmoid(z), so the per-sample and codebook entropies have a closed
+  // form here. A wrong temperature factor (or a lost stabilization branch)
+  // moves both numbers well outside the tolerance.
+  Zs[0] :=  0.3;
+  Zs[1] := -0.7;
+  Zs[2] :=  1.5;
+  Zs[3] :=  0.0;   // exercises the z >= 0 branch boundary: p = 0.5, H = ln 2
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    LFQ := TNNetLookupFreeQuant.Create(1, 0.25, 1.0); // 4*t = 1 => sigmoid(z)
+    NN.AddLayer(LFQ);
+    for I := 0 to 3 do Input[I, 0, 0] := Zs[I];
+    NN.Compute(Input);
+
+    HSum := 0;
+    MeanPNeg := 0;
+    for I := 0 to 3 do
+    begin
+      P := 1.0 / (1.0 + Exp(-Zs[I]));   // p(+1)
+      Q := 1.0 - P;                     // p(-1)
+      HSum := HSum - (P * Ln(P) + Q * Ln(Q));
+      MeanPNeg := MeanPNeg + Q;
+    end;
+    ExpPerSample := HSum / 4;
+    MeanPNeg := MeanPNeg / 4;
+    ExpCodebook := -(MeanPNeg * Ln(MeanPNeg) +
+      (1 - MeanPNeg) * Ln(1 - MeanPNeg));
+
+    AssertEquals('LFQ per-sample entropy matches the sigmoid closed form',
+      ExpPerSample, LFQ.PerSampleEntropy(), 1e-4);
+    AssertEquals('LFQ codebook entropy matches the sigmoid closed form',
+      ExpCodebook, LFQ.CodebookEntropy(), 1e-4);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestSoftPoolGradientCheck;
 begin
   // TNNetSoftPool: activation-weighted (softmax) average over each 2x2 window.
@@ -10643,6 +10697,59 @@ end;
 procedure TTestNeuralNumerical.TestReGLUGradientCheck;
 begin
   LayerInputGradientCheck(Self, TNNetReGLU.Create(), 'ReGLU', 2, 2, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestReGLUFamilyForwardParity;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, D, HalfDepth, SizeX, SizeY, FullDepth: integer;
+  a, b, reluA, reluB, expReGLU, expReGLUSq: TNeuralFloat;
+  reglu, reglusq: TNNetLayer;
+begin
+  // Pins ReGLU = ReLU(A)*B and ReGLUSquared = A*ReLU(B)^2 element by element
+  // over a half-depth of 13, so the vectorized row kernels run a full 8-wide
+  // body plus a 5-element remainder (the 2-element TestReGLUForward exercises
+  // only the remainder path). Both signs of A and B occur at every position.
+  SizeX := 2; SizeY := 2; HalfDepth := 13; FullDepth := HalfDepth * 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, FullDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, FullDepth, 1));
+    reglu   := NN.AddLayerAfter(TNNetReGLU.Create(),        0);
+    reglusq := NN.AddLayerAfter(TNNetReGLUSquared.Create(), 0);
+
+    // Deterministic spread of A and B values across rows and depths.
+    for X := 0 to SizeX - 1 do
+      for Y := 0 to SizeY - 1 do
+        for D := 0 to FullDepth - 1 do
+          Input[X, Y, D] := Sin(0.7 * (X * 13 + Y * 5 + D)) * 2.5;
+
+    NN.Compute(Input);
+
+    AssertEquals('ReGLU output depth = input depth / 2', HalfDepth,
+      reglu.Output.Depth);
+    AssertEquals('ReGLUSquared output depth = input depth / 2', HalfDepth,
+      reglusq.Output.Depth);
+
+    for X := 0 to SizeX - 1 do
+      for Y := 0 to SizeY - 1 do
+        for D := 0 to HalfDepth - 1 do
+        begin
+          a := Input[X, Y, D];
+          b := Input[X, Y, D + HalfDepth];
+          if a > 0 then reluA := a else reluA := 0;
+          if b > 0 then reluB := b else reluB := 0;
+          expReGLU := reluA * b;
+          expReGLUSq := a * reluB * reluB;
+          AssertEquals('ReGLU parity', expReGLU, reglu.Output[X, Y, D], 0.0001);
+          AssertEquals('ReGLUSquared parity', expReGLUSq,
+            reglusq.Output[X, Y, D], 0.0001);
+        end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestCosineSimilarityForward;

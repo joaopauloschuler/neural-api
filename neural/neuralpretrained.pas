@@ -33465,16 +33465,12 @@ end;
 procedure TParlerTTSModel.ComputeLogits(const PromptIds: array of integer;
   const Codes: TNNetIntArr2D; EncHidden, Logits: TNNetVolume);
 var
-  InEmb, FullLogits: TNNetVolume;
+  InEmb, OutVol: TNNetVolume;
   EncStatesInput: TNNetLayer;
-  t, d, KV, CodecLenM1, KVm1: integer;
-  srcBase, dstBase: integer;
+  KV: integer;
 begin
   KV := FConfig.NumCodebooks * FConfig.VocabSize;
-  CodecLenM1 := FCodecLen - 1;
-  KVm1 := KV - 1;
   InEmb := TNNetVolume.Create;
-  FullLogits := TNNetVolume.Create;
   try
     BuildInputEmbeddings(PromptIds, Codes, InEmb);
     EncStatesInput := T5EncoderStatesInput(FDecoder);
@@ -33482,19 +33478,20 @@ begin
       ImportError('Parler ComputeLogits: encoder-states size mismatch.');
     EncStatesInput.Output.Copy(EncHidden);
     FDecoder.Compute(InEmb);
-    FullLogits.Copy(FDecoder.GetLastLayer().Output); // (DecSeqLen,1,K*Vocab)
     // Read only the CODEC-FRAME positions (drop the transcript prefix rows).
+    // The retained rows are the contiguous tail of the (DecSeqLen,1,K*Vocab)
+    // layer output (dst and src both advance by KV per frame), so this is ONE
+    // Move off the BORROWED layer output - no full-tensor copy of the whole
+    // DecSeqLen*K*Vocab logit block first.
+    OutVol := FDecoder.GetLastLayer().Output;   // borrowed, not owned
+    if OutVol.Size < (FPromptLen + FCodecLen) * KV then
+      ImportError('Parler ComputeLogits: decoder output is smaller than ' +
+        'prompt + codec frames.');
     Logits.ReSize(FCodecLen, 1, KV);
-    for t := 0 to CodecLenM1 do
-    begin
-      dstBase := t * KV;
-      srcBase := (FPromptLen + t) * KV;
-      Move(FullLogits.FData[srcBase], Logits.FData[dstBase],
-        KV * csNeuralFloatSize);
-    end;
+    Move(OutVol.FData[FPromptLen * KV], Logits.FData[0],
+      FCodecLen * KV * csNeuralFloatSize);
   finally
     InEmb.Free;
-    FullLogits.Free;
   end;
 end;
 
@@ -42982,11 +42979,11 @@ procedure TNNetMimi.RunTransformer(
   const Layers: array of TMimiTransformerLayer; var Sig: TMimiDblArr2D);
 var
   D, T, NH, NKV, Dh, FFN, L, h, t1, t2, dd, gidx, kvh, NRep, half: integer;
-  NHDh, hDh, kvhDh, gBase, dBase, hbase, t2Start: integer;
+  NHDh, hDh, kvhDh, gBase, dBase, hbase, t2Start, tBase: integer;
   TM1, DM1, halfM1, DhM1, NHM1, NKVM1, FFNM1, NHDhM1, NKVDhM1, LayersM1: integer;
   Theta, Scaling, eps, m, v, e, denom, sc, mx, qr, kr, ang: double;
   X, Hn, Q, Kk, Vv, Attn, Mlp1: array of array of double; // [T][feature]
-  cosv, sinv, invfreq: array of double;
+  CosTab, SinTab, invfreq: array of double;
   AccVec, Orig: array of double;
   // #9: per-layer field-chain binds (Data is single; Hn/Q/... are double, so
   // the mixed-precision scalar accumulation is kept - the Mimi carve-out).
@@ -43039,10 +43036,29 @@ begin
   SetLength(invfreq, half);
   for dd := 0 to halfM1 do
     invfreq[dd] := 1.0 / Power(Theta, (2.0 * dd) / Dh);
-  // RoPE scratch + rotate_half snapshot: size once (Dh is call-invariant),
-  // reused across every layer/timestep instead of re-SetLength per (L, t1).
-  SetLength(cosv, Dh);
-  SetLength(sinv, Dh);
+  // RoPE tables: cos/sin depend only on (t1, dd), never on the layer, so the
+  // whole T x Dh table is built ONCE here instead of being rebuilt inside the
+  // layer loop - all but 1/Layers of the RTL Sin/Cos calls disappear. Flat
+  // row-major [t1*Dh + dd]; the second half mirrors the first (rotate_half).
+  SetLength(CosTab, T * Dh);
+  SetLength(SinTab, T * Dh);
+  tBase := 0;
+  for t1 := 0 to TM1 do
+  begin
+    for dd := 0 to halfM1 do
+    begin
+      ang := t1 * invfreq[dd];           // #4: shared angle for Cos and Sin
+      qr := Cos(ang);
+      kr := Sin(ang);
+      CosTab[tBase + dd] := qr;
+      CosTab[tBase + dd + half] := qr;
+      SinTab[tBase + dd] := kr;
+      SinTab[tBase + dd + half] := kr;
+    end;
+    Inc(tBase, Dh);                      // #6: t1*Dh carried by addition
+  end;
+  // rotate_half snapshot: size once (Dh is call-invariant), reused across every
+  // layer/timestep instead of re-SetLength per (L, t1).
   SetLength(Orig, Dh);
 
   for L := 0 to LayersM1 do
@@ -43109,16 +43125,9 @@ begin
       end;
     end;
     // ---- apply RoPE to Q and K (per head, rotate_half convention) ----
+    tBase := 0;
     for t1 := 0 to TM1 do
     begin
-      for dd := 0 to halfM1 do
-      begin
-        ang := t1 * invfreq[dd];         // #4: shared angle for Cos and Sin
-        cosv[dd] := Cos(ang);
-        cosv[dd + half] := cosv[dd];
-        sinv[dd] := Sin(ang);
-        sinv[dd + half] := sinv[dd];
-      end;
       // rotate_half needs the ORIGINAL head values, so snapshot per head into
       // Orig before writing back (an in-place rotation would feed the already
       // rotated first half into the second half).
@@ -43129,7 +43138,8 @@ begin
         for dd := 0 to DhM1 do
         begin
           if dd < half then qr := -Orig[dd + half] else qr := Orig[dd - half];
-          Q[t1][hbase + dd] := Orig[dd] * cosv[dd] + qr * sinv[dd];
+          Q[t1][hbase + dd] :=
+            Orig[dd] * CosTab[tBase + dd] + qr * SinTab[tBase + dd];
         end;
       end;
       for h := 0 to NKVM1 do
@@ -43139,9 +43149,11 @@ begin
         for dd := 0 to DhM1 do
         begin
           if dd < half then kr := -Orig[dd + half] else kr := Orig[dd - half];
-          Kk[t1][hbase + dd] := Orig[dd] * cosv[dd] + kr * sinv[dd];
+          Kk[t1][hbase + dd] :=
+            Orig[dd] * CosTab[tBase + dd] + kr * SinTab[tBase + dd];
         end;
       end;
+      Inc(tBase, Dh);                    // #6: t1*Dh carried by addition
     end;
     // ---- causal attention per head (GQA: head h uses kv head h div NRep) ----
     SetLength(Attn, T);
@@ -64327,9 +64339,9 @@ procedure ClapBatchNormMelImage(Reader: TNNetSafeTensorsReader;
   RawMel: TNNetVolume; Image: TNNetVolume; const Config: TClapAudioConfig);
 var
   Gamma, Beta, Mean, Var_: TNNetVolume;
-  f, Time, Mel, FreqRatio, Spec, hh, ww, c2, srcT, SpecM1: integer;
+  f, Time, Mel, FreqRatio, Spec, hh, ww, c2, srcT, SpecM1, MelM1: integer;
   imgPos, imgStride: integer;
-  Eps, Normed: TNeuralFloat;
+  Eps: TNeuralFloat;
   EncPrefix: string;
 begin
   Mel := Config.NumMelBins;
@@ -64371,6 +64383,17 @@ begin
     // At fr = 1 this is the plain freq<->time transpose (Image[W=t, H=f]).
     Image.ReSize(Spec, Spec, 1);
     SpecM1 := Spec - 1;
+    // #5: the batch-norm affine collapses to one per-mel-bin scale+bias,
+    //   scale_f = gamma_f / sqrt(var_f + eps),  bias_f = beta_f - mean_f*scale_f,
+    // so the per-pixel Sqrt and divide (Spec*Spec of them, over only Mel
+    // distinct bins) are folded once into the already-allocated Gamma/Beta
+    // rows - no extra buffer.
+    MelM1 := Mel - 1;
+    for f := 0 to MelM1 do
+    begin
+      Gamma.FData[f] := Gamma.FData[f] / Sqrt(Var_.FData[f] + Eps);
+      Beta.FData[f] := Beta.FData[f] - Mean.FData[f] * Gamma.FData[f];
+    end;
     imgStride := Image.GetRawPos(0, 1, 0);  // = Spec; elements between consecutive hh
     for ww := 0 to SpecM1 do          // W = time // fr axis
     begin
@@ -64380,10 +64403,8 @@ begin
         f := hh mod Mel;                // mel bin
         c2 := hh div Mel;               // time chunk
         srcT := c2 * Spec + ww;         // source time frame
-        Normed := (RawMel.FData[srcT * Mel + f] - Mean.FData[f]) /
-          Sqrt(Var_.FData[f] + Eps);
-        Normed := Normed * Gamma.FData[f] + Beta.FData[f];
-        Image.FData[imgPos] := Normed;
+        Image.FData[imgPos] :=
+          RawMel.FData[srcT * Mel + f] * Gamma.FData[f] + Beta.FData[f];
         Inc(imgPos, imgStride);
       end;
     end;
