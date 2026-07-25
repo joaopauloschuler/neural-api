@@ -14936,11 +14936,11 @@ begin
   dec ecx                          // remaining iterations after the seed block
   vmovups   ymm0, [rax]            // seed values, lanes 0..7
   vmovups   ymm1, [rax+32]         // seed values, lanes 8..15
-  vmovdqu   ymm4, cAVXArgLaneSeed
-  vmovdqu   ymm5, cAVXArgLaneSeed+32
+  vmovdqu   ymm4, [rip+cAVXArgLaneSeed]
+  vmovdqu   ymm5, [rip+cAVXArgLaneSeed+32]
   vmovdqa   ymm2, ymm4             // seed winning indices = 0..15
   vmovdqa   ymm3, ymm5
-  vmovdqu   ymm6, cAVXArgLaneStep
+  vmovdqu   ymm6, [rip+cAVXArgLaneStep]
   add rax, 64
   test ecx, ecx
   jz @Fold
@@ -15017,11 +15017,11 @@ begin
   dec ecx
   vmovups   ymm0, [rax]
   vmovups   ymm1, [rax+32]
-  vmovdqu   ymm4, cAVXArgLaneSeed
-  vmovdqu   ymm5, cAVXArgLaneSeed+32
+  vmovdqu   ymm4, [rip+cAVXArgLaneSeed]
+  vmovdqu   ymm5, [rip+cAVXArgLaneSeed+32]
   vmovdqa   ymm2, ymm4
   vmovdqa   ymm3, ymm5
-  vmovdqu   ymm6, cAVXArgLaneStep
+  vmovdqu   ymm6, [rip+cAVXArgLaneStep]
   add rax, 64
   test ecx, ecx
   jz @Fold
@@ -15099,16 +15099,16 @@ begin
   mov ecx, localNumElements
   shr ecx, 4
   dec ecx
-  vmovdqu   ymm11, cAVXArgAbsMask
+  vmovdqu   ymm11, [rip+cAVXArgAbsMask]
   vmovups   ymm0, [rax]
   vmovups   ymm1, [rax+32]
   vandps    ymm0, ymm0, ymm11
   vandps    ymm1, ymm1, ymm11
-  vmovdqu   ymm4, cAVXArgLaneSeed
-  vmovdqu   ymm5, cAVXArgLaneSeed+32
+  vmovdqu   ymm4, [rip+cAVXArgLaneSeed]
+  vmovdqu   ymm5, [rip+cAVXArgLaneSeed+32]
   vmovdqa   ymm2, ymm4
   vmovdqa   ymm3, ymm5
-  vmovdqu   ymm6, cAVXArgLaneStep
+  vmovdqu   ymm6, [rip+cAVXArgLaneStep]
   add rax, 64
   test ecx, ecx
   jz @Fold
