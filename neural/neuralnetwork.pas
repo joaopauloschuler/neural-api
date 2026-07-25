@@ -30850,9 +30850,9 @@ end;
 // Quantize the d_k-element row Src into int8 cache row Slot, with a per-row
 // scale (mirrors the int8 WEIGHT path QuantizeWeightsInt8): scale = maxabs/127
 // (or 1 if the row is all zero), code = round(value/scale) clamped to
-// [-127,127]. maxabs is computed inline because TVolume.GetMaxAbs seeds its
-// running max with the SIGNED first element (the documented GetMaxAbs bug) and
-// would miss a negative max-magnitude element 0.
+// [-127,127]. maxabs is computed inline because Src is a raw pointer into a
+// caller's row - GetMaxAbs is an instance method over a whole volume and has no
+// pointer-and-count form to hand a slice to.
 procedure TNNetScaledDotProductAttention.QuantizeCacheRow(Src: TNeuralFloatArrPtr;
   Dst: TNNetVolumeQuant8; Slot: integer);
 var
@@ -71846,9 +71846,9 @@ var
   InvScale: double;
 begin
   CountM1 := Count - 1;
-  // max|row| computed inline: TVolume.GetMaxAbs seeds its running max
-  // with the SIGNED first element and never abs-es it, so a negative
-  // max-magnitude element 0 is missed - unusable for a scale.
+  // max|row| computed inline: GetMaxAbs takes no pointer-and-count slice, and
+  // more importantly it compares every element, which is what this function
+  // exists to avoid.
   MaxAbs := 0;
   for i := 0 to CountM1 do
   begin
