@@ -53518,7 +53518,6 @@ end;
 
 procedure TNNetReZero.Backpropagate();
 var
-  MaxOutputErrorPos: integer;
   StartTime: double;
   localNeuron: TNNetNeuron;
   gradAlpha, alpha: TNeuralFloat;
