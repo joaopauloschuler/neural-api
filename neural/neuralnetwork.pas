@@ -13688,6 +13688,13 @@ type
     FKnots: array of TNeuralFloat;     // B-spline knot vector (clamped uniform)
     FBVal: array of TNeuralFloat;      // scratch B_j(u) buffer (length G+K)
     FBDeriv: array of TNeuralFloat;    // scratch B_j'(u) buffer (length G+K)
+    // Cox-de Boor working buffers (one knot vector long each). Layer fields, not
+    // EvalBSpline locals: that routine runs once per (ox,oy,fy,fx,ic) of every
+    // forward and backward, so a per-call SetLength would be OutH*OutW*Taps heap
+    // allocations per pass (rule #17). Sized once in SetupBSplineBasis; each
+    // threaded network clone owns its own layer, so they carry no shared state.
+    FBNprev: array of TNeuralFloat;
+    FBNcur: array of TNeuralFloat;
     FKanBasisVec: array of TNeuralFloat; // per-position assembled basis super-vector (length FVectorSize = Taps*CoeffsPerEdge)
     {$IFDEF OpenCL}
     // Scratch operands for the tap-diagonal coefficient-GEMV offload
@@ -87771,6 +87778,8 @@ begin
   for jj := 0 to KK1 do FKnots[KK1 + csKANBSplineGrid + jj] := 1.0;
   SetLength(FBVal, csKANBSplineGrid + KK1);
   SetLength(FBDeriv, csKANBSplineGrid + KK1);
+  SetLength(FBNprev, nKnots);
+  SetLength(FBNcur, nKnots);
 end;
 
 // Cox-de Boor evaluation of all G+K basis functions at squashed coordinate u.
@@ -87783,7 +87792,6 @@ var
   nBasis, nKnots, p, ii: integer;
   knotMax2, nBasisMax, knotMax2mp: integer;
   left, right, denomA, denomB, termA, termB: TNeuralFloat;
-  Nprev, Ncur: array of TNeuralFloat;
 begin
   nBasis := csKANBSplineGrid + FDegree;
   nKnots := Length(FKnots);
@@ -87791,13 +87799,11 @@ begin
   nBasisMax := nBasis - 1;
   if u < -1.0 then u := -1.0;
   if u > 1.0 then u := 1.0;
-  SetLength(Nprev, nKnots);
-  SetLength(Ncur, nKnots);
   // Degree-0 basis: indicator of each knot span [t_i, t_{i+1}).
   for ii := 0 to knotMax2 do
   begin
-    if ((u >= FKnots[ii]) and (u < FKnots[ii + 1])) then Nprev[ii] := 1.0
-    else Nprev[ii] := 0.0;
+    if ((u >= FKnots[ii]) and (u < FKnots[ii + 1])) then FBNprev[ii] := 1.0
+    else FBNprev[ii] := 0.0;
   end;
   // Closed right end: u=1 belongs to the last non-empty span.
   if u >= FKnots[nKnots - 1] then
@@ -87805,7 +87811,7 @@ begin
     for ii := knotMax2 downto 0 do
       if FKnots[ii] < FKnots[ii + 1] then
       begin
-        Nprev[ii] := 1.0;
+        FBNprev[ii] := 1.0;
         break;
       end;
   end;
@@ -87821,30 +87827,30 @@ begin
       if denomA > 0 then
       begin
         left := (u - FKnots[ii]) / denomA;
-        termA := left * Nprev[ii];
+        termA := left * FBNprev[ii];
       end;
       if denomB > 0 then
       begin
         right := (FKnots[ii + p + 1] - u) / denomB;
-        termB := right * Nprev[ii + 1];
+        termB := right * FBNprev[ii + 1];
       end;
-      Ncur[ii] := termA + termB;
+      FBNcur[ii] := termA + termB;
     end;
     if p < FDegree then
-      for ii := 0 to knotMax2mp do Nprev[ii] := Ncur[ii];
+      for ii := 0 to knotMax2mp do FBNprev[ii] := FBNcur[ii];
   end;
-  for ii := 0 to nBasisMax do FBVal[ii] := Ncur[ii];
+  for ii := 0 to nBasisMax do FBVal[ii] := FBNcur[ii];
   if wantDeriv then
   begin
-    // Need the degree-(K-1) basis (it is in Nprev after the last raise above,
-    // since the loop copies Ncur->Nprev only for p<FDegree).
+    // Need the degree-(K-1) basis (it is in FBNprev after the last raise above,
+    // since the loop copies FBNcur->FBNprev only for p<FDegree).
     for ii := 0 to nBasisMax do
     begin
       denomA := FKnots[ii + FDegree] - FKnots[ii];
       denomB := FKnots[ii + FDegree + 1] - FKnots[ii + 1];
       termA := 0; termB := 0;
-      if denomA > 0 then termA := Nprev[ii] / denomA;
-      if denomB > 0 then termB := Nprev[ii + 1] / denomB;
+      if denomA > 0 then termA := FBNprev[ii] / denomA;
+      if denomB > 0 then termB := FBNprev[ii + 1] / denomB;
       FBDeriv[ii] := FDegree * (termA - termB);
     end;
   end;
