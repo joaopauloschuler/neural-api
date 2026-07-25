@@ -115,17 +115,6 @@ clSetKernelArg(k, 0, SizeOf(Longint), @N);
 Move(FKCacheCodes[(j + 1) * FDk], FKCacheCodes[j * FDk], FDk * SizeOf(ShortInt));
 ```
 
-**Why it matters**
-
-- **Consistency** — one canonical name per element size across the whole
-  codebase, so `Move`/allocation/stride/`clSetKernelArg` arithmetic all read the
-  same way.
-- **Single source of truth** — if a type's width ever changes, the intent stays
-  expressed through one named constant rather than scattered `SizeOf` literals.
-- **Readability** — `csNeuralFloatSize` signals *"one neural-float element"* at
-  a glance, which is clearer than a bare `SizeOf` inside a byte-count
-  expression.
-
 **Adding a new size constant.** When you hit a repeated `SizeOf(<sometype>)`,
 add a `cs<Type>Size = SizeOf(<sometype>);` line to the same `const` block in
 `neuralvolume.pas` (keep the literal `SizeOf` in the definition itself), then
@@ -165,17 +154,10 @@ for i := 0 to QLen - 1 do
   ...
 ```
 
-**Why it matters**
-
-- **No repeated evaluation** — the bound is evaluated once up front rather than
-  potentially being recomputed. This is most important when the bound is a
-  property getter or function call (e.g. `Volume.SizeX - 1`), where the
-  expression can hide real work behind an innocent-looking loop header.
-- **Readability** — a named bound like `QLenM1` documents the intent
-  ("last query index") and keeps the loop header uncluttered.
-- **Consistency** — matches the established style in the hot paths of this
-  codebase, where loop bounds such as `SeqLenM1`, `DkM1`, and `CacheLenM1` are
-  precomputed before the loop.
+**Where it matters most.** A bound that is a **property getter or function call**
+(`Volume.SizeX - 1`, `Layer.Neurons.Count - 1`) hides real work behind an
+innocent-looking loop header — those are the ones to hunt. A bound built from
+literal arithmetic on a local is the same rule but a far smaller prize.
 
 ## 3. Access volume elements directly via `FData[]` in hot loops
 
@@ -206,12 +188,6 @@ sigma := FSigma.FData[c];
 mu    := FMu[0, 0, c];
 sigma := FSigma[0, 0, c];
 ```
-
-**Why it matters**
-
-- **Skips index arithmetic and the accessor call** — `FData[c]` is a plain
-  array read; the `[0, 0, c]` form recomputes `((SizeX*0)+0)*Depth + c` and goes
-  through `Get`/`GetRawPos` each time.
 
 **When it is valid.** You must compute the flat index yourself, so this is only
 safe when you know the volume's layout. The clean, common cases:
@@ -385,15 +361,6 @@ begin
 end;
 ```
 
-**Why it matters**
-
-- **Less repeated work** — the index arithmetic is done once per iteration
-  instead of once per use.
-- **Readability** — a named `jP1` makes it explicit that every reference is the
-  *same* neighbouring slot, not several independent computations.
-- **Fewer edit hazards** — with one definition there is a single place to change
-  if the offset logic ever moves, so the uses cannot drift out of sync.
-
 (This eviction loop has further, larger problems beyond the repeated
 subexpression — see later recommendations.)
 
@@ -475,14 +442,6 @@ begin
   ...
 end;
 ```
-
-**Why it matters**
-
-- **Work is done once, not N times** — the deeper the loop nest, the bigger the
-  saving; an invariant hoisted out of an inner loop is removed from every
-  iteration of every enclosing loop.
-- **Readability** — a named `RowBytesFP` states *what* the quantity is ("bytes
-  in one cache row") at the point it is computed.
 
 **How far to hoist.** Lift the value to the outermost scope in which it is still
 invariant. If it never changes across calls (a per-layer quantity), consider
@@ -589,13 +548,6 @@ The single seed multiply outside the loop replaces one multiply *per iteration*;
 `jDk` and `jP1Dk` are each computed once and reused for both the K and V rows in
 *both* storage formats (folding in #4's de-duplication and #3's shared offset).
 
-**Why it matters**
-
-- **Multiply → add** — the inner loop becomes add-only; only one multiply (the
-  seed) remains, outside the loop.
-- **Fewer operations overall** — combined with reusing each offset for the K and
-  V rows, four multiplies per iteration collapse to one add plus one copy-forward.
-
 **Caveats.**
 
 - **The step must be constant.** Strength reduction is valid only because `j`
@@ -650,7 +602,7 @@ begin
 end;
 ```
 
-**Why it matters**
+**Why a list index is not a field read (FPC specifics)**
 
 - **Skips the accessor call** — `Neuron0` is a plain reference; `FNeurons[0]`
   re-enters `GetItem` (call + index + optional range check/cast) on every use.
@@ -700,15 +652,6 @@ end;
 `Prev.GetRawPtr(t, 0)` **stays inside** the loop — it depends on the induction
 variable `t`, so it is not invariant. Only the two arguments that do not depend
 on `t` are hoisted.
-
-**Why it matters**
-
-- **Removes a call per iteration, not just a recompute** — unlike a hoisted
-  arithmetic expression, hoisting a getter also removes the call overhead
-  (dispatch, argument setup, any inlined offset math) from every iteration.
-- **Exposes the intent** — `WeightsPtr` and `Bias` state plainly that these are
-  fixed for the whole loop, which the inline `GetRawPtr(0,0,0)`/`FBiasWeight`
-  spelling actively obscures.
 
 **How to spot it.** Look at the *arguments*: if a call's arguments contain none
 of the loop's induction variables (all literals or loop-invariant locals), its
@@ -762,14 +705,6 @@ Now the list getter runs once instead of `2 * FNumPatterns * FDim` times, and
 both the write target and the `RandomGaussianValue()` receiver go through the
 same local. (This exact chain recurs in many `InitDefault`/init routines in
 `neuralnetwork.pas` — the same one-line hoist applies to each.)
-
-**Why it matters**
-
-- **Collapses N² accessor calls to one** — the deeper the nest, the larger the
-  multiplier removed; an invariant lifted above the outer loop is gone from every
-  inner iteration.
-- **Readability** — `W` names the one volume the whole nest initialises, instead
-  of restating the `FNeurons[0].FWeights` path four times.
 
 **Note on the remaining `[p, 0, d]` write.** It still goes through the volume
 accessor (#3). Here that is fine: it is a lone write per cell with no reused
@@ -826,7 +761,7 @@ begin
 end;
 ```
 
-**Why it matters**
+**Why the mirror exists, and why using it is the convention here**
 
 - **No accessor call per element** — `FArrNeurons[i]` is a direct array read;
   `FNeurons[i]` re-enters `GetItem` (call + index + optional range check/cast)
@@ -907,14 +842,8 @@ the inner loop — they carry `j`, so they are not inner-invariant. Only the
 applies to `AttnRow` (hoisted to the `i` level); the `dOut` pointer simply
 deserves the same.
 
-**Why it matters**
-
-- **Removes work from the whole inner loop** — an inner-invariant lifted one
-  level runs `SeqLen`× fewer times per `i` (and it was computed *twice* per
-  iteration here, so it also folds in #4).
-- **Multiplies through nesting** — the deeper the nest, the more iterations a
-  single correct hoist removes; a partial invariant left in place is the most
-  common missed hoist in nested numeric code.
+A partial invariant left in place is the most common missed hoist in nested
+numeric code.
 
 **How far to lift.** Place the binding at the *lowest* loop level whose body it
 is still invariant in: one that uses only outer indices goes just inside the
@@ -1061,13 +990,6 @@ begin
   Inc(posV, RowStride);                  // next j's offset, by addition (#6)
 end;
 ```
-
-**Why it matters**
-
-- **Multiply → add** — the inner-loop address math drops from a multiply-add per
-  pointer to one shared `Inc`; `RowStride` and the seed are computed once.
-- **One offset, two volumes** — folds in #3: same shape ⇒ `posV` indexes both
-  `Prev` and `PrevErr`.
 
 **Apply it everywhere the pattern occurs — every cycle counts.** The transform is
 always valid and essentially free, so apply it to *every* per-iteration
@@ -1266,7 +1188,7 @@ per candidate. Same shape elsewhere: a `sigmoid(x) > t` gate with constant `t` i
 a nearest-neighbour search compares **squared** distances and takes the one `sqrt`
 only on the reported minimum.
 
-**Why it matters**
+**Why this outranks the rest of the guide (priority note)**
 
 - **Fewer operations, not just cheaper ones** — unlike #13 (which vectorizes the
   same work), this changes the operation *count*: `N` transcendentals/divides drop to
@@ -1631,7 +1553,7 @@ if HasPrevErr then
   for i := 0 to NM1 do ...
 ```
 
-**Why it matters**
+**Why this pays more than the branch itself costs**
 
 - **Removes a test from every iteration**, and with it the load of whatever the
   test reads (a field, an object reference, an indirection through `FPrevLayer`).
