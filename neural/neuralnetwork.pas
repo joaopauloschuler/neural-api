@@ -100327,8 +100327,8 @@ const
   cFrozenThreshold = 1e-6;
   cRelEps = 1e-12;
 var
-  LpBnd130: integer;
-  LpBnd131: integer;
+  MaxLayerNeuronPos: integer;
+  MaxNeuronWeightPos: integer;
   NA, NB: TNNet;
   Lines: TStringList;
   LayerIdx, NeuronIdx, K, NALastIdx: integer;
@@ -100375,14 +100375,14 @@ begin
       L2A := 0;
       TotalWeights := 0;
       FrozenCount := 0;
-      LpBnd130 := LayerA.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd130 do
+      MaxLayerNeuronPos := LayerA.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxLayerNeuronPos do
       begin
         NeuronA := LayerA.Neurons[NeuronIdx];
         NeuronB := LayerB.Neurons[NeuronIdx];
         if NeuronA.Weights.Size <> NeuronB.Weights.Size then Continue;
-        LpBnd131 := NeuronA.Weights.Size - 1;
-        for K := 0 to LpBnd131 do
+        MaxNeuronWeightPos := NeuronA.Weights.Size - 1;
+        for K := 0 to MaxNeuronWeightPos do
         begin
           Diff := NeuronB.Weights.FData[K] - NeuronA.Weights.FData[K];
           L2Diff := L2Diff + Diff * Diff;
@@ -100432,7 +100432,7 @@ const
   cEps = 1e-30;
   cBins = 10;
 var
-  LpBnd132: integer;
+  MaxLayerNeuronPos: integer;
   Lines: TStringList;
   LayerIdx, NeuronIdx, BinIdx, NNLastIdx, BinsMax: integer;
   Layer, PrevLayer: TNNetLayer;
@@ -100518,8 +100518,8 @@ begin
       WGrad := 0;
       if Layer.Neurons.Count > 0 then
       begin
-        LpBnd132 := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to LpBnd132 do
+        MaxLayerNeuronPos := Layer.Neurons.Count - 1;
+        for NeuronIdx := 0 to MaxLayerNeuronPos do
         begin
           if Layer.Neurons[NeuronIdx].Delta.Size > 0 then
             WGrad := WGrad +
@@ -100681,14 +100681,14 @@ const
   cEps = 1e-12;
   cCurveWidth = 60;
 var
-  LpBnd133: integer;
-  LpBnd134: integer;
-  LpBnd135: integer;
-  LpBnd136: integer;
-  LpBnd137: integer;
-  LpBnd138: integer;
-  LpBnd139: integer;
-  LpBnd140: integer;
+  MaxDirWeightPos: integer;
+  MaxPerturbNeuronPos: integer;
+  MaxPerturbWeightPos: integer;
+  MaxSamplePos: integer;
+  MaxOutputPos: integer;
+  MaxRestoreNeuronPos: integer;
+  MaxRestoreWeightPos: integer;
+  MaxFallbackRestoreWeightPos: integer;
   Lines: TStringList;
   TrainableIdxs: array of integer;
   // Per-trainable-layer snapshots and direction tensors.
@@ -100802,8 +100802,8 @@ begin
         if (WNorm > cEps) and (DNorm > cEps) then
         begin
           Scale := WNorm / DNorm;
-          LpBnd133 := DirW[I][NIdx].Size - 1;
-          for WIdx := 0 to LpBnd133 do
+          MaxDirWeightPos := DirW[I][NIdx].Size - 1;
+          for WIdx := 0 to MaxDirWeightPos do
             DirW[I][NIdx].FData[WIdx] := DirW[I][NIdx].FData[WIdx] * Scale;
         end
         else
@@ -100839,11 +100839,11 @@ begin
       for LIdx := 0 to TMax do
       begin
         Layer := NN.Layers[TrainableIdxs[LIdx]];
-        LpBnd134 := Layer.Neurons.Count - 1;
-        for NIdx := 0 to LpBnd134 do
+        MaxPerturbNeuronPos := Layer.Neurons.Count - 1;
+        for NIdx := 0 to MaxPerturbNeuronPos do
         begin
-          LpBnd135 := Layer.Neurons[NIdx].Weights.Size - 1;
-          for WIdx := 0 to LpBnd135 do
+          MaxPerturbWeightPos := Layer.Neurons[NIdx].Weights.Size - 1;
+          for WIdx := 0 to MaxPerturbWeightPos do
             Layer.Neurons[NIdx].Weights.FData[WIdx] :=
               SnapW[LIdx][NIdx].FData[WIdx] +
               Alpha * DirW[LIdx][NIdx].FData[WIdx];
@@ -100856,8 +100856,8 @@ begin
       end;
 
       SumLoss := 0;
-      LpBnd136 := Samples.Count - 1;
-      for N := 0 to LpBnd136 do
+      MaxSamplePos := Samples.Count - 1;
+      for N := 0 to MaxSamplePos do
       begin
         Pair := Samples[N];
         if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
@@ -100867,8 +100867,8 @@ begin
         case LossKind of
           1: // Cross-entropy on (clamped) softmax-family output vs one-hot.
             begin
-              LpBnd137 := Output.Size - 1;
-              for WIdx := 0 to LpBnd137 do
+              MaxOutputPos := Output.Size - 1;
+              for WIdx := 0 to MaxOutputPos do
               begin
                 Tgt := 0;
                 if WIdx < Pair.O.Size then Tgt := Pair.O.FData[WIdx];
@@ -100906,11 +100906,11 @@ begin
     for LIdx := 0 to TMax do
     begin
       Layer := NN.Layers[TrainableIdxs[LIdx]];
-      LpBnd138 := Layer.Neurons.Count - 1;
-      for NIdx := 0 to LpBnd138 do
+      MaxRestoreNeuronPos := Layer.Neurons.Count - 1;
+      for NIdx := 0 to MaxRestoreNeuronPos do
       begin
-        LpBnd139 := Layer.Neurons[NIdx].Weights.Size - 1;
-        for WIdx := 0 to LpBnd139 do
+        MaxRestoreWeightPos := Layer.Neurons[NIdx].Weights.Size - 1;
+        for WIdx := 0 to MaxRestoreWeightPos do
           Layer.Neurons[NIdx].Weights.FData[WIdx] :=
             SnapW[LIdx][NIdx].FData[WIdx];
         Layer.Neurons[NIdx].FBiasWeight := SnapB[LIdx][NIdx];
@@ -101030,8 +101030,8 @@ begin
         begin
           if SnapW[LIdx][NIdx] <> nil then
           begin
-            LpBnd140 := Layer.Neurons[NIdx].Weights.Size - 1;
-            for WIdx := 0 to LpBnd140 do
+            MaxFallbackRestoreWeightPos := Layer.Neurons[NIdx].Weights.Size - 1;
+            for WIdx := 0 to MaxFallbackRestoreWeightPos do
               Layer.Neurons[NIdx].Weights.FData[WIdx] :=
                 SnapW[LIdx][NIdx].FData[WIdx];
             Layer.Neurons[NIdx].FBiasWeight := SnapB[LIdx][NIdx];
@@ -101070,8 +101070,8 @@ const
   cEps = 1e-30;
   cBins = 10;
 var
-  LpBnd141: integer;
-  LpBnd142: integer;
+  MaxProbeInputPos: integer;
+  MaxAttnMapX: integer;
   Lines: TStringList;
   LayerIdx, ProbeIdx, i, j, SeqLen, ValidK, BinIdx: integer;
   NNLastIdx, BinsMax, SeqLenMax, AttnDepth, pos: integer;
@@ -101140,8 +101140,8 @@ begin
       SetLength(Bins, cBins);
       for BinIdx := 0 to BinsMax do Bins[BinIdx] := 0;
 
-      LpBnd141 := ProbeInputs.Count - 1;
-      for ProbeIdx := 0 to LpBnd141 do
+      MaxProbeInputPos := ProbeInputs.Count - 1;
+      for ProbeIdx := 0 to MaxProbeInputPos do
       begin
         NN.Compute(ProbeInputs[ProbeIdx]);
         AttnMap := AttnLayer.AttentionWeights;
@@ -101153,10 +101153,10 @@ begin
         begin
           RowEntropy := 0;
           ValidK := 0;
-          LpBnd142 := AttnMap.SizeX - 1;
+          MaxAttnMapX := AttnMap.SizeX - 1;
           // #11/#12: [j,i,0] steps by Depth as j advances; carry the offset.
           pos := AttnMap.GetRawPos(0, i);
-          for j := 0 to LpBnd142 do
+          for j := 0 to MaxAttnMapX do
           begin
             P := AttnMap.FData[pos];
             if P > cEps then
@@ -101654,7 +101654,7 @@ class function TNNet.ProfileReport(
   Iterations: integer = 20
 ): string;
 var
-  LpBnd143: integer;
+  MaxLayerNeuronPos: integer;
   Lines: TStringList;
   LayerCnt, NeuronIdx, IterCnt, NNLastIdx: integer;
   Layer: TNNetLayer;
@@ -101741,8 +101741,8 @@ begin
       ParamElements := 0;
       if Layer.Neurons.Count > 0 then
       begin
-        LpBnd143 := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to LpBnd143 do
+        MaxLayerNeuronPos := Layer.Neurons.Count - 1;
+        for NeuronIdx := 0 to MaxLayerNeuronPos do
           ParamElements := ParamElements +
             Layer.Neurons[NeuronIdx].Weights.Size;
         if (ParamElements > 0) and (not Layer.LinkedNeurons) then
@@ -101792,7 +101792,7 @@ class function TNNet.DeadNeuronReport(
 const
   cBins = 10;
 var
-  LpBnd144: integer;
+  MaxSamplePos: integer;
   Lines: TStringList;
   LayerIdx, SampleIdx, UnitIdx, BinIdx, NNLastIdx: integer;
   Layer: TNNetLayer;
@@ -101882,8 +101882,8 @@ begin
       for UnitIdx := 0 to UnitsM1 do MaxAbs[UnitIdx] := 0;
       ZeroSum := 0;
 
-      LpBnd144 := Samples.Count - 1;
-      for SampleIdx := 0 to LpBnd144 do
+      MaxSamplePos := Samples.Count - 1;
+      for SampleIdx := 0 to MaxSamplePos do
       begin
         NN.Compute(Samples[SampleIdx]);
         ZeroCount := 0;
@@ -101985,10 +101985,10 @@ const
   cMaxBarWidth = 40;
   cHeavyFraction = 0.10;
 var
-  LpBnd145: integer;
-  LpBnd146: integer;
-  LpBnd147: integer;
-  LpBnd148: integer;
+  MaxParamCountNeuronPos: integer;
+  MaxSamplePos: integer;
+  MaxGradNeuronPos: integer;
+  MaxNeuronDeltaPos: integer;
   LastLayerIdx, cBinsM1, NetParamCntM1, LayerParamM1: integer;
   Lines: TStringList;
   LayerIdx, NeuronIdx, K, SampleIdx, BinIdx: integer;
@@ -102066,8 +102066,8 @@ begin
       FlatBase[LayerIdx] := NetParamCnt;
       if Layer.Neurons.Count = 0 then Continue;
       ParamsThisLayer := 0;
-      LpBnd145 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd145 do
+      MaxParamCountNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxParamCountNeuronPos do
         // +1 per neuron for the bias parameter.
         ParamsThisLayer := ParamsThisLayer +
           Layer.Neurons[NeuronIdx].Delta.Size + 1;
@@ -102103,8 +102103,8 @@ begin
     Target := TNNetVolume.Create(OutSize, 1, 1);
     ProcessedSamples := 0;
     try
-      LpBnd146 := Samples.Count - 1;
-      for SampleIdx := 0 to LpBnd146 do
+      MaxSamplePos := Samples.Count - 1;
+      for SampleIdx := 0 to MaxSamplePos do
       begin
         Pair := Samples[SampleIdx];
         if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
@@ -102132,12 +102132,12 @@ begin
           LR := Layer.LearningRate;
           if LR <= 0 then LR := 1.0;
           P := FlatBase[LayerIdx];
-          LpBnd147 := Layer.Neurons.Count - 1;
-          for NeuronIdx := 0 to LpBnd147 do
+          MaxGradNeuronPos := Layer.Neurons.Count - 1;
+          for NeuronIdx := 0 to MaxGradNeuronPos do
           begin
             Neuron := Layer.Neurons[NeuronIdx];
-            LpBnd148 := Neuron.Delta.Size - 1;
-            for K := 0 to LpBnd148 do
+            MaxNeuronDeltaPos := Neuron.Delta.Size - 1;
+            for K := 0 to MaxNeuronDeltaPos do
             begin
               G := Neuron.Delta.FData[K] / LR;
               ParamFisher[P] := ParamFisher[P] + G * G;
@@ -102362,10 +102362,10 @@ const
 type
   TFloatArray = array of TNeuralFloat;
 var
-  LpBnd149: integer;
-  LpBnd150: integer;
-  LpBnd151: integer;
-  LpBnd152: integer;
+  MaxParamCountNeuronPos: integer;
+  MaxSamplePos: integer;
+  MaxGradNeuronPos: integer;
+  MaxNeuronDeltaPos: integer;
   LastLayerIdx, cBinsM1, NumClassesM1, UsableCountM1: integer;
   ScopeParamCntM1, PairCountM1, MM1, LayerParamM1: integer;
   IP1: integer;
@@ -102450,8 +102450,8 @@ begin
       FlatBase[LIdx] := NetParamCnt;
       if Layer.Neurons.Count = 0 then Continue;
       M := 0;
-      LpBnd149 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd149 do
+      MaxParamCountNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxParamCountNeuronPos do
         // +1 per neuron for the bias parameter.
         M := M + Layer.Neurons[NeuronIdx].Delta.Size + 1;
       if M = 0 then Continue;
@@ -102535,8 +102535,8 @@ begin
     HaveLabels := true;
 
     try
-      LpBnd150 := Samples.Count - 1;
-      for SampleIdx := 0 to LpBnd150 do
+      MaxSamplePos := Samples.Count - 1;
+      for SampleIdx := 0 to MaxSamplePos do
       begin
         Pair := Samples[SampleIdx];
         if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
@@ -102564,12 +102564,12 @@ begin
           LR := Layer.LearningRate;
           if LR <= 0 then LR := 1.0;
           P := FlatBase[LIdx];
-          LpBnd151 := Layer.Neurons.Count - 1;
-          for NeuronIdx := 0 to LpBnd151 do
+          MaxGradNeuronPos := Layer.Neurons.Count - 1;
+          for NeuronIdx := 0 to MaxGradNeuronPos do
           begin
             Neuron := Layer.Neurons[NeuronIdx];
-            LpBnd152 := Neuron.Delta.Size - 1;
-            for K := 0 to LpBnd152 do
+            MaxNeuronDeltaPos := Neuron.Delta.Size - 1;
+            for K := 0 to MaxNeuronDeltaPos do
             begin
               G := Neuron.Delta.FData[K] / LR;
               Grads[UsableCount][ScopeMap[P]] := G;
@@ -102866,7 +102866,7 @@ const
   cEps = 1e-30;
   cBuckets = ' .:-=+*#%@';   // 10 intensity buckets (index 0 = blank/zero)
 var
-  LpBnd153: integer;
+  MaxProbePos: integer;
   InXM1, InYM1, InDepthM1, HeatMaxIdx, MaxRTrunc: integer;
   Lines: TStringList;
   InX, InY, InDepth: integer;
@@ -102973,8 +102973,8 @@ begin
     // Accumulate |d out_centre / d input| (summed over depth) over the probe
     // batch. Frozen: ClearDeltas before each pass, never UpdateWeights.
     Used := 0;
-    LpBnd153 := Probes.Count - 1;
-    for P := 0 to LpBnd153 do
+    MaxProbePos := Probes.Count - 1;
+    for P := 0 to MaxProbePos do
     begin
       if Used >= MaxProbes then Break;
       Probe := Probes[P];
@@ -104603,7 +104603,7 @@ const
 type
   TFloatArray = array of TNeuralFloat;
 var
-  LpBnd154: integer;
+  MaxTranslatorNeuronPos: integer;
   Lines: TStringList;
   LayerIdx, SampleIdx, I, J, L, C, It: integer;
   InVol: TNNetVolume;
@@ -104769,8 +104769,8 @@ begin
       L := CompatOrder[I];
 
       // Seed translator to identity: W = I, bias = 0.
-      LpBnd154 := Translator.Neurons.Count - 1;
-      for C := 0 to LpBnd154 do
+      MaxTranslatorNeuronPos := Translator.Neurons.Count - 1;
+      for C := 0 to MaxTranslatorNeuronPos do
       begin
         Translator.Neurons[C].Weights.Fill(0);
         if C < Translator.Neurons[C].Weights.Size then
@@ -106376,10 +106376,10 @@ const
   cZeroEps = 1e-6;
   cMaxBarWidth = 40;
 var
-  LpBnd155: integer;
-  LpBnd156: integer;
-  LpBnd157: integer;
-  LpBnd158: integer;
+  MaxStatsNeuronPos: integer;
+  MaxStatsWeightPos: integer;
+  MaxBinNeuronPos: integer;
+  MaxBinWeightPos: integer;
   Lines: TStringList;
   LayerIdx, NeuronIdx, K, BinIdx: integer;
   Layer: TNNetLayer;
@@ -106426,12 +106426,12 @@ begin
       SumSq := 0;
       NearZero := 0;
       Linf := 0;
-      LpBnd155 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd155 do
+      MaxStatsNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxStatsNeuronPos do
       begin
         Neuron := Layer.Neurons[NeuronIdx];
-        LpBnd156 := Neuron.Weights.Size - 1;
-        for K := 0 to LpBnd156 do
+        MaxStatsWeightPos := Neuron.Weights.Size - 1;
+        for K := 0 to MaxStatsWeightPos do
         begin
           W := Neuron.Weights.FData[K];
           if WCount = 0 then
@@ -106468,12 +106468,12 @@ begin
       // Second pass: bin counts over [-MaxAbs, +MaxAbs].
       SetLength(BinCounts, Bins);
       for BinIdx := 0 to BinsM1 do BinCounts[BinIdx] := 0;
-      LpBnd157 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd157 do
+      MaxBinNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxBinNeuronPos do
       begin
         Neuron := Layer.Neurons[NeuronIdx];
-        LpBnd158 := Neuron.Weights.Size - 1;
-        for K := 0 to LpBnd158 do
+        MaxBinWeightPos := Neuron.Weights.Size - 1;
+        for K := 0 to MaxBinWeightPos do
         begin
           W := Neuron.Weights.FData[K];
           BinIdx := Trunc(((W + MaxAbs) / Span) * Bins);
@@ -106540,7 +106540,7 @@ const
   cMaxBarWidth = 40;
   cHeavyFraction = 0.10;
 var
-  LpBnd159: integer;
+  MaxLayerNeuronPos: integer;
   Lines: TStringList;
   LayerIdx, NeuronIdx, NumLayers, BinIdx, BarLen, MaxBin: integer;
   Layer: TNNetLayer;
@@ -106618,8 +106618,8 @@ begin
       ParamElements := 0;
       if Layer.Neurons.Count > 0 then
       begin
-        LpBnd159 := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to LpBnd159 do
+        MaxLayerNeuronPos := Layer.Neurons.Count - 1;
+        for NeuronIdx := 0 to MaxLayerNeuronPos do
           ParamElements := ParamElements +
             Layer.Neurons[NeuronIdx].Weights.Size;
         if (ParamElements > 0) and (not Layer.LinkedNeurons) then
@@ -107040,7 +107040,7 @@ const
   cNearZero = 1e-6;
   cCollapseStd = 1e-4;
 var
-  LpBnd160: integer;
+  MaxSamplePos: integer;
   Lines: TStringList;
   Flags: TStringList;
   LayerIdx, SampleIdx, UnitIdx, BinIdx: integer;
@@ -107129,8 +107129,8 @@ begin
       SatLowCount := 0; SatHighCount := 0;
       SetLength(LastVals, Units);
 
-      LpBnd160 := Samples.Count - 1;
-      for SampleIdx := 0 to LpBnd160 do
+      MaxSamplePos := Samples.Count - 1;
+      for SampleIdx := 0 to MaxSamplePos do
       begin
         NN.Compute(Samples[SampleIdx]);
         for UnitIdx := 0 to UnitsM1 do
@@ -107532,8 +107532,8 @@ const
   cMaxBarWidth = 40;
   cStableRankCollapse = 0.95; // sigma_1/||W||_F above this ~ rank-1 collapse
 var
-  LpBnd161: integer;
-  LpBnd162: integer;
+  MaxLayerNeuronPos: integer;
+  MaxNeuronWeightPos: integer;
   LastLayerIdx, cBinsM1, RatioCountM1: integer;
   Lines: TStringList;
   Flags: TStringList;
@@ -107590,12 +107590,12 @@ begin
       WCount := 0;
       Sum := 0;
       SumSq := 0;
-      LpBnd161 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd161 do
+      MaxLayerNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxLayerNeuronPos do
       begin
         Neuron := Layer.Neurons[NeuronIdx];
-        LpBnd162 := Neuron.Weights.Size - 1;
-        for K := 0 to LpBnd162 do
+        MaxNeuronWeightPos := Neuron.Weights.Size - 1;
+        for K := 0 to MaxNeuronWeightPos do
         begin
           W := Neuron.Weights.FData[K];
           Sum := Sum + W;
@@ -107750,10 +107750,10 @@ type
   TDoubleArray = array of Double;
   TDoubleMatrix = array of TDoubleArray;
 var
-  LpBnd163: integer;
-  LpBnd164: integer;
-  LpBnd165: integer;
-  LpBnd166: integer;
+  MaxFrobNeuronPos: integer;
+  MaxFrobWeightPos: integer;
+  MaxStdNeuronPos: integer;
+  MaxStdWeightPos: integer;
   LastLayerIdx, DimM1, FanInM1, FanOutM1, AlphaCountM1, cBinsM1: integer;
   JStart: integer;
   Lines: TStringList;
@@ -107905,12 +107905,12 @@ begin
       // Frobenius norm (= sqrt of sum of squared singular values = sqrt of the
       // Gram trace) plus the weight std for the Marchenko-Pastur bulk edge.
       FrobSq := 0;
-      LpBnd163 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd163 do
+      MaxFrobNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxFrobNeuronPos do
       begin
         Neuron := Layer.Neurons[NeuronIdx];
-        LpBnd164 := Neuron.Weights.Size - 1;
-        for K := 0 to LpBnd164 do
+        MaxFrobWeightPos := Neuron.Weights.Size - 1;
+        for K := 0 to MaxFrobWeightPos do
         begin
           W := Neuron.Weights.FData[K];
           FrobSq := FrobSq + W * W;
@@ -107922,12 +107922,12 @@ begin
       SumW := 0;
       SumSqW := 0;
       Cnt := FanOut * FanIn;
-      LpBnd165 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd165 do
+      MaxStdNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxStdNeuronPos do
       begin
         Neuron := Layer.Neurons[NeuronIdx];
-        LpBnd166 := Neuron.Weights.Size - 1;
-        for K := 0 to LpBnd166 do
+        MaxStdWeightPos := Neuron.Weights.Size - 1;
+        for K := 0 to MaxStdWeightPos do
         begin
           W := Neuron.Weights.FData[K];
           SumW := SumW + W;
@@ -108761,12 +108761,12 @@ type
   TDoubleArray = array of Double;
   TDoubleMatrix = array of TDoubleArray;
 var
-  LpBnd167: integer;
-  LpBnd168: integer;
-  LpBnd169: integer;
-  LpBnd170: integer;
-  LpBnd171: integer;
-  LpBnd172: integer;
+  MaxAlignedNeuronPos: integer;
+  MaxAlignedDeltaPos: integer;
+  MaxParamCountNeuronPos: integer;
+  MaxSamplePos: integer;
+  MaxGradNeuronPos: integer;
+  MaxNeuronDeltaPos: integer;
   Lines: TStringList;
   LIdx, NeuronIdx, K, SampleIdx, BinIdx, P, I, J, N: integer;
   JStart: integer;
@@ -108865,12 +108865,12 @@ var
           lr2 := lay.LearningRate;
           if lr2 <= 0 then lr2 := 1.0;
           pp := FlatBase[li];
-          LpBnd167 := lay.Neurons.Count - 1;
-          for ni := 0 to LpBnd167 do
+          MaxAlignedNeuronPos := lay.Neurons.Count - 1;
+          for ni := 0 to MaxAlignedNeuronPos do
           begin
             neu := lay.Neurons[ni];
-            LpBnd168 := neu.Delta.Size - 1;
-            for kk := 0 to LpBnd168 do
+            MaxAlignedDeltaPos := neu.Delta.Size - 1;
+            for kk := 0 to MaxAlignedDeltaPos do
             begin
               gg := neu.Delta.FData[kk] / lr2;
               aGrads[si][pp] := gg;
@@ -108991,8 +108991,8 @@ begin
       FlatBase[LIdx] := NetParamCnt;
       if Layer.Neurons.Count = 0 then Continue;
       M := 0;
-      LpBnd169 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd169 do
+      MaxParamCountNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxParamCountNeuronPos do
         // +1 per neuron for the bias parameter.
         M := M + Layer.Neurons[NeuronIdx].Delta.Size + 1;
       if M = 0 then Continue;
@@ -109029,8 +109029,8 @@ begin
     UsableCount := 0;
 
     try
-      LpBnd170 := Samples.Count - 1;
-      for SampleIdx := 0 to LpBnd170 do
+      MaxSamplePos := Samples.Count - 1;
+      for SampleIdx := 0 to MaxSamplePos do
       begin
         Probe := Samples[SampleIdx];
         if Probe = nil then Continue;
@@ -109060,12 +109060,12 @@ begin
           LR := Layer.LearningRate;
           if LR <= 0 then LR := 1.0;
           P := FlatBase[LIdx];
-          LpBnd171 := Layer.Neurons.Count - 1;
-          for NeuronIdx := 0 to LpBnd171 do
+          MaxGradNeuronPos := Layer.Neurons.Count - 1;
+          for NeuronIdx := 0 to MaxGradNeuronPos do
           begin
             Neuron := Layer.Neurons[NeuronIdx];
-            LpBnd172 := Neuron.Delta.Size - 1;
-            for K := 0 to LpBnd172 do
+            MaxNeuronDeltaPos := Neuron.Delta.Size - 1;
+            for K := 0 to MaxNeuronDeltaPos do
             begin
               G := Neuron.Delta.FData[K] / LR;
               Grads[UsableCount][P] := G;
@@ -109498,10 +109498,10 @@ const
 type
   TFloatArray = array of TNeuralFloat;
 var
-  LpBnd173: integer;
-  LpBnd174: integer;
-  LpBnd175: integer;
-  LpBnd176: integer;
+  MaxParamCountNeuronPos: integer;
+  MaxSamplePos: integer;
+  MaxGradNeuronPos: integer;
+  MaxNeuronDeltaPos: integer;
   Lines: TStringList;
   LIdx, NeuronIdx, K, SampleIdx, BinIdx, P, I: integer;
   Layer: TNNetLayer;
@@ -109594,8 +109594,8 @@ begin
       FlatBase[LIdx] := NetParamCnt;
       if Layer.Neurons.Count = 0 then Continue;
       K := 0;
-      LpBnd173 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd173 do
+      MaxParamCountNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxParamCountNeuronPos do
         // +1 per neuron for the bias parameter.
         K := K + Layer.Neurons[NeuronIdx].Delta.Size + 1;
       if K = 0 then Continue;
@@ -109679,8 +109679,8 @@ begin
     UsableCount := 0;
 
     try
-      LpBnd174 := Samples.Count - 1;
-      for SampleIdx := 0 to LpBnd174 do
+      MaxSamplePos := Samples.Count - 1;
+      for SampleIdx := 0 to MaxSamplePos do
       begin
         Pair := Samples[SampleIdx];
         if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
@@ -109707,12 +109707,12 @@ begin
           LR := Layer.LearningRate;
           if LR <= 0 then LR := 1.0;
           P := FlatBase[LIdx];
-          LpBnd175 := Layer.Neurons.Count - 1;
-          for NeuronIdx := 0 to LpBnd175 do
+          MaxGradNeuronPos := Layer.Neurons.Count - 1;
+          for NeuronIdx := 0 to MaxGradNeuronPos do
           begin
             Neuron := Layer.Neurons[NeuronIdx];
-            LpBnd176 := Neuron.Delta.Size - 1;
-            for K := 0 to LpBnd176 do
+            MaxNeuronDeltaPos := Neuron.Delta.Size - 1;
+            for K := 0 to MaxNeuronDeltaPos do
             begin
               Grads[UsableCount][ScopeMap[P]] := Neuron.Delta.FData[K] / LR;
               Inc(P);
@@ -109981,12 +109981,12 @@ const
 type
   TFloatArray = array of TNeuralFloat;
 var
-  LpBnd177: integer;
-  LpBnd178: integer;
-  LpBnd179: integer;
-  LpBnd180: integer;
-  LpBnd181: integer;
-  LpBnd182: integer;
+  MaxPerturbNeuronPos: integer;
+  MaxPerturbWeightPos: integer;
+  MaxSamplePos: integer;
+  MaxGradNeuronPos: integer;
+  MaxNeuronDeltaPos: integer;
+  MaxParamCountNeuronPos: integer;
   Lines: TStringList;
   LIdx, NeuronIdx, K, SampleIdx, BinIdx, P, I, Iter, Probe: integer;
   Layer: TNNetLayer;
@@ -110037,12 +110037,12 @@ var
       if not LayerHasParams[LL] then Continue;
       Lay := NN.Layers[LL];
       PP := FlatBase[LL];
-      LpBnd177 := Lay.Neurons.Count - 1;
-      for NN_ := 0 to LpBnd177 do
+      MaxPerturbNeuronPos := Lay.Neurons.Count - 1;
+      for NN_ := 0 to MaxPerturbNeuronPos do
       begin
         Neu := Lay.Neurons[NN_];
-        LpBnd178 := Neu.Weights.Size - 1;
-        for KK := 0 to LpBnd178 do
+        MaxPerturbWeightPos := Neu.Weights.Size - 1;
+        for KK := 0 to MaxPerturbWeightPos do
         begin
           Neu.Weights.FData[KK] := Neu.Weights.FData[KK] + Scale * V[PP];
           Inc(PP);
@@ -110069,8 +110069,8 @@ var
     Lr2: TNeuralFloat;
   begin
     for KK := 0 to NetParamCntM1 do G[KK] := 0;
-    LpBnd179 := Samples.Count - 1;
-    for SI := 0 to LpBnd179 do
+    MaxSamplePos := Samples.Count - 1;
+    for SI := 0 to MaxSamplePos do
     begin
       Pair := Samples[SI];
       if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
@@ -110090,12 +110090,12 @@ var
         Lr2 := Lay.LearningRate;
         if Lr2 <= 0 then Lr2 := 1.0;
         PP := FlatBase[LL];
-        LpBnd180 := Lay.Neurons.Count - 1;
-        for NN_ := 0 to LpBnd180 do
+        MaxGradNeuronPos := Lay.Neurons.Count - 1;
+        for NN_ := 0 to MaxGradNeuronPos do
         begin
           Neu := Lay.Neurons[NN_];
-          LpBnd181 := Neu.Delta.Size - 1;
-          for KK := 0 to LpBnd181 do
+          MaxNeuronDeltaPos := Neu.Delta.Size - 1;
+          for KK := 0 to MaxNeuronDeltaPos do
           begin
             G[PP] := G[PP] - Neu.Delta.FData[KK] / Lr2;
             Inc(PP);
@@ -110172,8 +110172,8 @@ begin
       if Layer.Neurons[0].Weights = nil then Continue;
       if Layer.Neurons[0].Weights.Size = 0 then Continue;
       K := 0;
-      LpBnd182 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd182 do
+      MaxParamCountNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxParamCountNeuronPos do
         // +1 per neuron for the bias parameter.
         K := K + Layer.Neurons[NeuronIdx].Weights.Size + 1;
       if K = 0 then Continue;
