@@ -63,6 +63,9 @@ type
     procedure TestPSNRIdenticalIsInf;
     // 1-SSIM loss gradient matches a central difference.
     procedure TestSSIMLossGradient;
+    // The separable (1-D x 1-D) window passes reproduce a verbatim dense
+    // 11x11-window reference, for both the SSIM value and the loss gradient.
+    procedure TestSSIMSeparableMatchesDenseWindow;
     // TNNetSSIMLoss head: forward is an identity passthrough.
     procedure TestSSIMLossLayerForwardPassthrough;
     // TNNetSSIMLoss head: the +gradient it writes to FOutputError matches a
@@ -483,6 +486,186 @@ begin
   end;
   AssertTrue('SSIM loss grad vs central diff (maxErr=' +
     FloatToStr(maxErr) + ')', maxErr < 1e-4);
+end;
+
+// --- verbatim dense 11x11-window reference for the separable-path test ------
+// This is the pre-separable formulation, kept here (not in neuralimagemetrics)
+// precisely so it stays an INDEPENDENT oracle: it materialises the full 121-tap
+// 2-D Gaussian and walks it per output window. The unit under test factors that
+// window into two 11-tap 1-D passes, so any mistake in the factorisation - a
+// dropped tap, a wrong normalisation, a mis-shifted transposed convolution -
+// shows up as a mismatch here.
+const
+  cRefWin   = 11;
+  cRefSigma = 1.5;
+
+procedure RefBuildWindow(out Win: TIMDoubleArray);
+var
+  half, x, y, idx: integer;
+  s, v, sum: Double;
+begin
+  SetLength(Win, cRefWin * cRefWin);
+  half := cRefWin div 2;
+  s := 2.0 * cRefSigma * cRefSigma;
+  sum := 0;
+  idx := 0;
+  for y := -half to half do
+    for x := -half to half do
+    begin
+      v := Exp(-(x * x + y * y) / s);
+      Win[idx] := v;
+      sum := sum + v;
+      Inc(idx);
+    end;
+  for idx := 0 to cRefWin * cRefWin - 1 do
+    Win[idx] := Win[idx] / sum;
+end;
+
+procedure RefExtractChannel(const Img: TIMDoubleArray; H, W, Channels, C: integer;
+  out Plane: TIMDoubleArray);
+var
+  i: integer;
+begin
+  SetLength(Plane, H * W);
+  for i := 0 to H * W - 1 do
+    Plane[i] := Img[i * Channels + C];
+end;
+
+// Dense mean SSIM of one plane pair, plus (optionally) the dense scatter of the
+// per-window gradient into GA at (pixel * OffStride + Off).
+function RefPlaneSSIM(const PA, PB: TIMDoubleArray; H, W: integer;
+  C1, C2: Double; WantGrad: boolean; var GA: TIMDoubleArray;
+  OffStride, Off: integer): Double;
+var
+  Win: TIMDoubleArray;
+  oy, ox, wy, wx, wi, pix, gpix, rowB, outH, outW, cnt: integer;
+  mx, my, sxx, syy, sxy, gw, a, b, wa, wb: Double;
+  a1, a2, b1, b2, bb, ssimSum, dSdmx, dSdsxx, dSdsxy, gi: Double;
+begin
+  RefBuildWindow(Win);
+  outH := H - cRefWin + 1;
+  outW := W - cRefWin + 1;
+  cnt := outH * outW;
+  ssimSum := 0;
+  for oy := 0 to outH - 1 do
+    for ox := 0 to outW - 1 do
+    begin
+      mx := 0; my := 0; sxx := 0; syy := 0; sxy := 0;
+      wi := 0;
+      for wy := 0 to cRefWin - 1 do
+      begin
+        rowB := (oy + wy) * W + ox;
+        for wx := 0 to cRefWin - 1 do
+        begin
+          pix := rowB + wx;
+          gw := Win[wi];
+          a := PA[pix]; b := PB[pix];
+          wa := gw * a; wb := gw * b;
+          mx := mx + wa; my := my + wb;
+          sxx := sxx + wa * a; syy := syy + wb * b; sxy := sxy + wa * b;
+          Inc(wi);
+        end;
+      end;
+      sxx := sxx - mx * mx; syy := syy - my * my; sxy := sxy - mx * my;
+      a1 := 2.0 * mx * my + C1;
+      a2 := 2.0 * sxy + C2;
+      b1 := mx * mx + my * my + C1;
+      b2 := sxx + syy + C2;
+      bb := b1 * b2;
+      ssimSum := ssimSum + (a1 * a2) / bb;
+      if not WantGrad then continue;
+      dSdmx  := (2.0 * my * a2 * bb - a1 * a2 * (2.0 * mx) * b2) / (bb * bb);
+      dSdsxy := (2.0 * a1) / bb;
+      dSdsxx := -(a1 * a2) / (b1 * b2 * b2);
+      wi := 0;
+      for wy := 0 to cRefWin - 1 do
+      begin
+        rowB := (oy + wy) * W + ox;
+        gpix := rowB * OffStride + Off;
+        for wx := 0 to cRefWin - 1 do
+        begin
+          pix := rowB + wx;
+          gw := Win[wi];
+          a := PA[pix]; b := PB[pix];
+          gi := dSdmx * gw
+              + dSdsxx * (2.0 * gw * (a - mx))
+              + dSdsxy * (gw * (b - my));
+          GA[gpix] := GA[gpix] - gi / cnt;
+          Inc(wi);
+          Inc(gpix, OffStride);
+        end;
+      end;
+    end;
+  Result := ssimSum / cnt;
+end;
+
+procedure TTestNeuralImageMetrics.TestSSIMSeparableMatchesDenseWindow;
+const
+  // (H, W, Channels): the exact 11x11 minimum, both non-square orientations,
+  // a multi-channel case and a larger plane.
+  cCases: array[0..6, 0..2] of integer =
+    ((11, 11, 1), (11, 11, 3), (12, 11, 1), (11, 19, 1),
+     (16, 16, 1), (13, 27, 2), (32, 24, 3));
+var
+  a, b, g, gref, PA, PB: TIMDoubleArray;
+  cs, i, ch, n, H, W, C: integer;
+  C1, C2, acc, ssim, ssimRef, loss, lossRef, dG: Double;
+  seed: LongWord;
+begin
+  C1 := Sqr(0.01);   // DataRange = 1.0
+  C2 := Sqr(0.03);
+  for cs := 0 to High(cCases) do
+  begin
+    H := cCases[cs][0]; W := cCases[cs][1]; C := cCases[cs][2];
+    n := H * W * C;
+    SetLength(a, n); SetLength(b, n);
+    // Deterministic LCG - independent of RandSeed/mtwist behaviour.
+    seed := 20260725 + LongWord(cs);
+    for i := 0 to n - 1 do
+    begin
+      seed := seed * 1103515245 + 12345;
+      a[i] := ((seed shr 9) and $7FFFFF) / 8388608.0;
+      seed := seed * 1103515245 + 12345;
+      b[i] := ((seed shr 9) and $7FFFFF) / 8388608.0;
+    end;
+
+    // forward value
+    ssim := ComputeSSIM(a, b, H, W, C, 1.0);
+    acc := 0;
+    SetLength(gref, n);
+    for i := 0 to n - 1 do gref[i] := 0;
+    for ch := 0 to C - 1 do
+    begin
+      RefExtractChannel(a, H, W, C, ch, PA);
+      RefExtractChannel(b, H, W, C, ch, PB);
+      acc := acc + RefPlaneSSIM(PA, PB, H, W, C1, C2, False, gref, C, ch);
+    end;
+    ssimRef := acc / C;
+    AssertEquals(Format('separable SSIM %dx%dx%d', [H, W, C]),
+      ssimRef, ssim, 1e-12);
+
+    // loss + gradient
+    loss := ComputeSSIMLossAndGradient(a, b, H, W, C, g, 1.0);
+    acc := 0;
+    for i := 0 to n - 1 do gref[i] := 0;
+    for ch := 0 to C - 1 do
+    begin
+      RefExtractChannel(a, H, W, C, ch, PA);
+      RefExtractChannel(b, H, W, C, ch, PB);
+      acc := acc + RefPlaneSSIM(PA, PB, H, W, C1, C2, True, gref, C, ch);
+    end;
+    for i := 0 to n - 1 do gref[i] := gref[i] / C;
+    lossRef := 1.0 - acc / C;
+    AssertEquals(Format('separable 1-SSIM loss %dx%dx%d', [H, W, C]),
+      lossRef, loss, 1e-12);
+    dG := 0;
+    for i := 0 to n - 1 do
+      if Abs(g[i] - gref[i]) > dG then dG := Abs(g[i] - gref[i]);
+    // Separable and dense differ only in summation order, so the gap is at the
+    // double-precision floor; the gradient entries themselves are O(1e-3)..O(1).
+    AssertTrue(Format('separable SSIM grad %dx%dx%d maxAbsDiff=%g',
+      [H, W, C, dG]), dG < 1e-13);
+  end;
 end;
 
 procedure TTestNeuralImageMetrics.TestSSIMLossLayerForwardPassthrough;

@@ -860,46 +860,155 @@ const
   cSSIM_K1   = 0.01;
   cSSIM_K2   = 0.03;
 
-// Build the normalised 11x11 Gaussian window (sum = 1), row-major length 121.
-procedure BuildGaussianWindow(out W: TIMDoubleArray);
+// Build the normalised 1-D Gaussian window (sum = 1), length cSSIMWin.
+//
+// The 11x11 SSIM window is exp(-(x^2 + y^2) / s) / sum2d, which factors exactly:
+//   exp(-(x^2 + y^2)/s) / sum2d = (exp(-y^2/s) / s1d) * (exp(-x^2/s) / s1d)
+// because sum2d = s1d^2 for a separable Gaussian. So the normalisation folds
+// into the 1-D taps once and the 2-D window never has to be materialised - both
+// halves of every window pass run with this single vector.
+procedure BuildGaussianWindow1D(out G: TIMDoubleArray);
 var
-  half, x, y, idx, WinSizeM1: integer;
-  s, v, sum: Double;
+  half, i, d, WinM1: integer;
+  s, sum: Double;
 begin
-  SetLength(W, cSSIMWin * cSSIMWin);
-  WinSizeM1 := cSSIMWin * cSSIMWin - 1;
+  SetLength(G, cSSIMWin);
+  WinM1 := cSSIMWin - 1;
   half := cSSIMWin div 2;
   s := 2.0 * cSSIMSigma * cSSIMSigma;
   sum := 0;
-  idx := 0;
-  for y := -half to half do
-    for x := -half to half do
-    begin
-      v := Exp(-(x * x + y * y) / s);
-      W[idx] := v;
-      sum := sum + v;
-      Inc(idx);
-    end;
-  for idx := 0 to WinSizeM1 do
-    W[idx] := W[idx] / sum;
+  for i := 0 to WinM1 do
+  begin
+    d := i - half;
+    G[i] := Exp(-(d * d) / s);
+    sum := sum + G[i];
+  end;
+  for i := 0 to WinM1 do
+    G[i] := G[i] / sum;
 end;
 
 var
-  // Lazily-built cache of the normalised Gaussian window (#5/#8/§17). The window
-  // depends only on the constants cSSIMWin/cSSIMSigma, so it is built once and
-  // shared read-only by every SSIM caller (SSIMPlaneMean / SSIMPlaneLCS /
-  // SSIMPlaneLossGrad) instead of re-running SetLength + 121 Exp + normalize on
-  // each call. SSIMPlaneLossGrad in particular is a training-path hook
-  // (NeuralSSIMLossGradientHook), called once per optimisation step.
-  GaussWin: TIMDoubleArray;
+  // The normalised 1-D Gaussian window, built once in this unit's initialization
+  // section (#5/#8/§17) and read-only thereafter, so every SSIM caller
+  // (SSIMPlaneMean / SSIMPlaneLCS / SSIMPlaneLossGrad) shares it without
+  // re-running Exp + normalize per call and without a lazy-build race.
+  GaussWin1D: TIMDoubleArray;
 
-// Returns the shared normalised Gaussian window, building it once on first use.
-// Callers must treat the returned array as read-only (it is the shared cache).
-function SharedGaussianWindow: TIMDoubleArray;
+type
+  // Reusable per-thread scratch for the separable window passes.
+  //
+  // THREAD SAFETY - the reason this is per-thread and not a unit-level array.
+  // SSIMPlaneLossGrad is reached from TNNetSSIMLoss.Backpropagate through the
+  // NeuralSSIMLossGradientHook, and TNeuralFit runs one network CLONE per worker
+  // thread concurrently (neuralfit.pas RunNNThread, dispatched by
+  // FProcs.StartProc), so several SSIM passes can be in flight at the same time.
+  // Unlike GaussWin1D - which is built once and only ever read - these buffers
+  // are mutable per-call state, so sharing them at unit level would be a data
+  // race. Each thread lazily creates its own instance via ThreadSSIMScratch and
+  // never touches another thread's; the instances are registered in
+  // vSSIMScratchList purely so unit finalization can free them.
+  //
+  // The buffers are grow-only (rule #17): they are resized only when a larger
+  // image arrives, so a training run allocates once and reuses forever.
+  TSSIMScratch = class
+  public
+    // H x outW horizontal-pass accumulators, one per SSIM statistic. The
+    // gradient scatter reuses the first three as its vertical-spread temps.
+    HMx, HMy, HSxx, HSyy, HSxy: TIMDoubleArray;
+    // outH x outW per-window gradient coefficients (constant / a / b terms).
+    K0, K1, K2: TIMDoubleArray;
+    procedure EnsureRows(n: integer);
+    procedure EnsureWindows(n: integer);
+  end;
+
+procedure TSSIMScratch.EnsureRows(n: integer);
 begin
-  if Length(GaussWin) = 0 then
-    BuildGaussianWindow(GaussWin);
-  Result := GaussWin;
+  if Length(HMx) < n then
+  begin
+    SetLength(HMx, n);
+    SetLength(HMy, n);
+    SetLength(HSxx, n);
+    SetLength(HSyy, n);
+    SetLength(HSxy, n);
+  end;
+end;
+
+procedure TSSIMScratch.EnsureWindows(n: integer);
+begin
+  if Length(K0) < n then
+  begin
+    SetLength(K0, n);
+    SetLength(K1, n);
+    SetLength(K2, n);
+  end;
+end;
+
+threadvar
+  // Pointer-sized (unmanaged) per-thread cache of this thread's scratch.
+  vSSIMScratch: TSSIMScratch;
+
+var
+  // Owns every scratch ever created, so finalization frees them all. Guarded
+  // because two threads can reach their first SSIM call simultaneously; the
+  // lock is taken once per thread, never per call.
+  vSSIMScratchList: TList;
+  vSSIMScratchCS: TRTLCriticalSection;
+
+// The calling thread's scratch, created on first use.
+function ThreadSSIMScratch: TSSIMScratch;
+begin
+  Result := vSSIMScratch;
+  if Result = nil then
+  begin
+    Result := TSSIMScratch.Create;
+    vSSIMScratch := Result;
+    EnterCriticalSection(vSSIMScratchCS);
+    try
+      vSSIMScratchList.Add(Result);
+    finally
+      LeaveCriticalSection(vSSIMScratchCS);
+    end;
+  end;
+end;
+
+// Horizontal half of the separable window pass. For every image row y and every
+// valid window column ox, accumulates the cSSIMWin taps of the 1-D Gaussian into
+// the five SSIM statistics at once. The products A*A, B*B and A*B are formed
+// INLINE from the two source planes, so no product planes are materialised.
+// Writes H * outW entries (row-major, stride outW) into the five scratch rows.
+procedure SSIMHorizontalPass(const PA, PB, G: TIMDoubleArray;
+  H, W, outW: integer;
+  var HMx, HMy, HSxx, HSyy, HSxy: TIMDoubleArray);
+var
+  y, ox, wx, pix, rowB, idx, HM1, outWM1, WinM1: integer;
+  mx, my, sxx, syy, sxy, gw, a, b, wa, wb: Double;
+begin
+  HM1 := H - 1;
+  outWM1 := outW - 1;
+  WinM1 := cSSIMWin - 1;
+  idx := 0;                          // = y * outW + ox, carried (#6)
+  for y := 0 to HM1 do
+  begin
+    rowB := y * W;                   // #11: row base, once per row
+    for ox := 0 to outWM1 do
+    begin
+      mx := 0; my := 0; sxx := 0; syy := 0; sxy := 0;
+      pix := rowB + ox;
+      for wx := 0 to WinM1 do
+      begin
+        gw := G[wx];
+        a := PA[pix]; b := PB[pix];
+        wa := gw * a; wb := gw * b;                // #4: computed once
+        mx := mx + wa; my := my + wb;
+        sxx := sxx + wa * a; syy := syy + wb * b;  // (gw*a)*a, left-assoc
+        sxy := sxy + wa * b;
+        Inc(pix);
+      end;
+      HMx[idx] := mx; HMy[idx] := my;
+      HSxx[idx] := sxx; HSyy[idx] := syy; HSxy[idx] := sxy;
+      Inc(idx);
+    end;
+  end;
 end;
 
 // Extract one channel of a channel-last flat image into a dense H*W plane.
@@ -950,47 +1059,47 @@ end;
 function SSIMPlaneMean(const PA, PB: TIMDoubleArray; H, W: integer;
   C1, C2: Double): Double;
 var
-  Win: TIMDoubleArray;
-  half, oy, ox, wy, wx, wi, pix, rowB: integer;
+  G, HMx, HMy, HSxx, HSyy, HSxy: TIMDoubleArray;
+  Sc: TSSIMScratch;
+  oy, ox, wy, sIdx, rowB: integer;
   outH, outW, cnt, outHM1, outWM1, WinM1: integer;
-  mx, my, sxx, syy, sxy, gw, a, b, wa, wb: Double;
+  mx, my, sxx, syy, sxy, gw: Double;
   a1, a2, b1, b2, ssimSum: Double;
 begin
   if (H < cSSIMWin) or (W < cSSIMWin) then
     raise Exception.CreateFmt(
       'SSIM: image %dx%d smaller than %dx%d window', [H, W, cSSIMWin, cSSIMWin]);
-  Win := SharedGaussianWindow;   // #5: shared cached window, no per-call rebuild
-  half := cSSIMWin div 2;
+  G := GaussWin1D;               // #5: shared read-only 1-D window
   outH := H - cSSIMWin + 1;
   outW := W - cSSIMWin + 1;
   outHM1 := outH - 1;
   outWM1 := outW - 1;
   WinM1 := cSSIMWin - 1;
+  // Separable window: the horizontal half runs once over the whole plane pair,
+  // then each output window costs cSSIMWin taps instead of cSSIMWin^2.
+  Sc := ThreadSSIMScratch;
+  Sc.EnsureRows(H * outW);
+  HMx := Sc.HMx; HMy := Sc.HMy;
+  HSxx := Sc.HSxx; HSyy := Sc.HSyy; HSxy := Sc.HSxy;
+  SSIMHorizontalPass(PA, PB, G, H, W, outW, HMx, HMy, HSxx, HSyy, HSxy);
   ssimSum := 0;
-  cnt := 0;
+  cnt := outH * outW;
   for oy := 0 to outHM1 do
+  begin
+    rowB := oy * outW;             // #11: row base, once per oy
     for ox := 0 to outWM1 do
     begin
       mx := 0; my := 0; sxx := 0; syy := 0; sxy := 0;
-      wi := 0;
-      for wy := 0 to WinM1 do
+      sIdx := rowB + ox;
+      for wy := 0 to WinM1 do      // vertical half of the separable pass
       begin
-        rowB := (oy + wy) * W + ox;   // #11: row base, once per wy
-        for wx := 0 to WinM1 do
-        begin
-          pix := rowB + wx;
-          gw := Win[wi];
-          a := PA[pix];
-          b := PB[pix];
-          wa := gw * a;                 // #4: gw*a computed once
-          wb := gw * b;                 // #4: gw*b computed once
-          mx := mx + wa;
-          my := my + wb;
-          sxx := sxx + wa * a;          // (gw*a)*a = gw*a*a, left-assoc
-          syy := syy + wb * b;
-          sxy := sxy + wa * b;
-          Inc(wi);
-        end;
+        gw := G[wy];
+        mx := mx + gw * HMx[sIdx];
+        my := my + gw * HMy[sIdx];
+        sxx := sxx + gw * HSxx[sIdx];
+        syy := syy + gw * HSyy[sIdx];
+        sxy := sxy + gw * HSxy[sIdx];
+        Inc(sIdx, outW);           // #6: next image row of the same window
       end;
       sxx := sxx - mx * mx;
       syy := syy - my * my;
@@ -1000,8 +1109,8 @@ begin
       b1 := mx * mx + my * my + C1;
       b2 := sxx + syy + C2;
       ssimSum := ssimSum + (a1 * a2) / (b1 * b2);
-      Inc(cnt);
     end;
+  end;
   Result := ssimSum / cnt;
 end;
 
@@ -1061,53 +1170,54 @@ end;
 procedure SSIMPlaneLCS(const PA, PB: TIMDoubleArray; H, W: integer;
   C1, C2: Double; out LMean, CSMean: Double);
 var
-  Win: TIMDoubleArray;
-  oy, ox, wy, wx, wi, pix, rowB: integer;
+  G, HMx, HMy, HSxx, HSyy, HSxy: TIMDoubleArray;
+  Sc: TSSIMScratch;
+  oy, ox, wy, sIdx, rowB: integer;
   outH, outW, cnt, outHM1, outWM1, WinM1: integer;
-  mx, my, sxx, syy, sxy, gw, a, b, wa, wb: Double;
+  mx, my, sxx, syy, sxy, gw: Double;
   lSum, csSum: Double;
 begin
   if (H < cSSIMWin) or (W < cSSIMWin) then
     raise Exception.CreateFmt(
       'MS-SSIM: scale %dx%d smaller than %dx%d window', [H, W, cSSIMWin, cSSIMWin]);
-  Win := SharedGaussianWindow;   // #5: shared cached window, no per-call rebuild
+  G := GaussWin1D;               // #5: shared read-only 1-D window
   outH := H - cSSIMWin + 1;
   outW := W - cSSIMWin + 1;
   outHM1 := outH - 1;
   outWM1 := outW - 1;
   WinM1 := cSSIMWin - 1;
-  lSum := 0; csSum := 0; cnt := 0;
+  // Separable window - see SSIMPlaneMean.
+  Sc := ThreadSSIMScratch;
+  Sc.EnsureRows(H * outW);
+  HMx := Sc.HMx; HMy := Sc.HMy;
+  HSxx := Sc.HSxx; HSyy := Sc.HSyy; HSxy := Sc.HSxy;
+  SSIMHorizontalPass(PA, PB, G, H, W, outW, HMx, HMy, HSxx, HSyy, HSxy);
+  lSum := 0; csSum := 0;
+  cnt := outH * outW;
   for oy := 0 to outHM1 do
+  begin
+    rowB := oy * outW;             // #11: row base, once per oy
     for ox := 0 to outWM1 do
     begin
       mx := 0; my := 0; sxx := 0; syy := 0; sxy := 0;
-      wi := 0;
-      for wy := 0 to WinM1 do
+      sIdx := rowB + ox;
+      for wy := 0 to WinM1 do      // vertical half of the separable pass
       begin
-        rowB := (oy + wy) * W + ox;   // #11: row base, once per wy
-        for wx := 0 to WinM1 do
-        begin
-          pix := rowB + wx;
-          gw := Win[wi];
-          a := PA[pix];
-          b := PB[pix];
-          wa := gw * a;                 // #4: gw*a computed once
-          wb := gw * b;                 // #4: gw*b computed once
-          mx := mx + wa;
-          my := my + wb;
-          sxx := sxx + wa * a;          // (gw*a)*a = gw*a*a, left-assoc
-          syy := syy + wb * b;
-          sxy := sxy + wa * b;
-          Inc(wi);
-        end;
+        gw := G[wy];
+        mx := mx + gw * HMx[sIdx];
+        my := my + gw * HMy[sIdx];
+        sxx := sxx + gw * HSxx[sIdx];
+        syy := syy + gw * HSyy[sIdx];
+        sxy := sxy + gw * HSxy[sIdx];
+        Inc(sIdx, outW);           // #6: next image row of the same window
       end;
       sxx := sxx - mx * mx;
       syy := syy - my * my;
       sxy := sxy - mx * my;
       lSum := lSum + (2.0 * mx * my + C1) / (mx * mx + my * my + C1);
       csSum := csSum + (2.0 * sxy + C2) / (sxx + syy + C2);
-      Inc(cnt);
     end;
+  end;
   LMean := lSum / cnt;
   CSMean := csSum / cnt;
 end;
@@ -1176,43 +1286,67 @@ end;
 //   dS/dsxx = -(A1 A2)/(B1 B2^2)
 // (note dmx, dsxx, dsxy each also pull mx through their definitions, already
 // folded into the per-pixel chain above).
+//
+// BOTH halves are separable. Forward: mx, my and the raw sxx/syy/sxy moments are
+// 2-D convolutions of A, B, A*A, B*B, A*B with the Gaussian, so they split into
+// a horizontal and a vertical 1-D pass. Backward: expanding the per-pixel chain
+//   dS_p/dx_i / w_i = (dS/dmx - 2 dS/dsxx mx - dS/dsxy my)
+//                     + (2 dS/dsxx) a_i + (dS/dsxy) b_i
+//                   = K0_p + K1_p a_i + K2_p b_i
+// shows the pixel dependence is only through a_i and b_i, which are constant
+// across the windows p that cover pixel i. So the scatter is
+//   grad_i = -(1/N) [ (K0 * w)_i + a_i (K1 * w)_i + b_i (K2 * w)_i ]
+// i.e. three transposed convolutions of the per-window coefficient planes K0,
+// K1, K2 with the SAME separable Gaussian - a vertical spread followed by a
+// horizontal one. Nothing here stays dense: cost drops from 121 taps x 5 (fwd)
+// + 121 taps (bwd) per window to 11+11 taps x 5 and 11+11 taps x 3.
 function SSIMPlaneLossGrad(const PA, PB: TIMDoubleArray; H, W: integer;
   C1, C2: Double; var GA: TIMDoubleArray; OffStride, Off: integer): Double;
 var
-  Win: TIMDoubleArray;
-  oy, ox, wy, wx, wi, pix, gpix, rowB: integer;
-  outH, outW, cnt, outHM1, outWM1, WinM1: integer;
-  mx, my, sxx, syy, sxy, gw, a, b, wa, wb: Double;
+  G, HMx, HMy, HSxx, HSyy, HSxy, K0, K1, K2: TIMDoubleArray;
+  SK0, SK1, SK2: TIMDoubleArray;
+  Sc: TSSIMScratch;
+  oy, ox, x, y, wy, wx, sIdx, kIdx, vIdx, pix, gpix, rowB, rowV: integer;
+  outH, outW, cnt, outHM1, outWM1, WinM1, HM1, WM1: integer;
+  wLo, wHi: integer;
+  mx, my, sxx, syy, sxy, gw, a, b: Double;
   a1, a2, b1, b2, bb, sp, ssimSum: Double;
-  dSdmx, dSdsxx, dSdsxy, gi: Double;
+  dSdmx, dSdsxx, dSdsxy, k1v, k2v: Double;
+  acc0, acc1, acc2: Double;
 begin
-  Win := SharedGaussianWindow;   // #5: shared cached window, no per-call rebuild
+  G := GaussWin1D;               // #5: shared read-only 1-D window
   outH := H - cSSIMWin + 1;
   outW := W - cSSIMWin + 1;
   outHM1 := outH - 1;
   outWM1 := outW - 1;
   WinM1 := cSSIMWin - 1;
+  HM1 := H - 1;
+  WM1 := W - 1;
   cnt := outH * outW;
+  Sc := ThreadSSIMScratch;
+  Sc.EnsureRows(H * outW);
+  Sc.EnsureWindows(cnt);
+  HMx := Sc.HMx; HMy := Sc.HMy;
+  HSxx := Sc.HSxx; HSyy := Sc.HSyy; HSxy := Sc.HSxy;
+  K0 := Sc.K0; K1 := Sc.K1; K2 := Sc.K2;
+  SSIMHorizontalPass(PA, PB, G, H, W, outW, HMx, HMy, HSxx, HSyy, HSxy);
   ssimSum := 0;
   for oy := 0 to outHM1 do
+  begin
+    rowB := oy * outW;             // #11: row base, once per oy
     for ox := 0 to outWM1 do
     begin
       mx := 0; my := 0; sxx := 0; syy := 0; sxy := 0;
-      wi := 0;
-      for wy := 0 to WinM1 do
+      sIdx := rowB + ox;
+      for wy := 0 to WinM1 do      // vertical half of the separable pass
       begin
-        rowB := (oy + wy) * W + ox;   // #11: row base, once per wy
-        for wx := 0 to WinM1 do
-        begin
-          pix := rowB + wx;
-          gw := Win[wi];
-          a := PA[pix]; b := PB[pix];
-          wa := gw * a; wb := gw * b;               // #4: computed once
-          mx := mx + wa; my := my + wb;
-          sxx := sxx + wa * a; syy := syy + wb * b; // (gw*a)*a, left-assoc
-          sxy := sxy + wa * b;
-          Inc(wi);
-        end;
+        gw := G[wy];
+        mx := mx + gw * HMx[sIdx];
+        my := my + gw * HMy[sIdx];
+        sxx := sxx + gw * HSxx[sIdx];
+        syy := syy + gw * HSyy[sIdx];
+        sxy := sxy + gw * HSxy[sIdx];
+        Inc(sIdx, outW);           // #6: next image row of the same window
       end;
       sxx := sxx - mx * mx; syy := syy - my * my; sxy := sxy - mx * my;
       a1 := 2.0 * mx * my + C1;
@@ -1224,31 +1358,76 @@ begin
       ssimSum := ssimSum + sp;
       // partial derivatives of S_p w.r.t. the three moments (treating mx,sxx,
       // sxy as the independent aggregates; the mx coupling inside sxx/sxy is
-      // handled per-pixel below).
+      // handled by the per-pixel a and b terms below).
       dSdmx  := (2.0 * my * a2 * bb - a1 * a2 * (2.0 * mx) * b2) / (bb * bb);
       dSdsxy := (2.0 * a1) / bb;
       dSdsxx := -(a1 * a2) / (b1 * b2 * b2);
-      // scatter to pixels of PA
-      wi := 0;
-      for wy := 0 to WinM1 do
-      begin
-        rowB := (oy + wy) * W + ox;      // #11: row base, once per wy
-        gpix := rowB * OffStride + Off;  // #6: seed gpix for wx = 0, then Inc
-        for wx := 0 to WinM1 do
-        begin
-          pix := rowB + wx;
-          gw := Win[wi];
-          a := PA[pix]; b := PB[pix];
-          // dmx/dx_i = w; dsxx/dx_i = 2 w (a - mx); dsxy/dx_i = w (b - my)
-          gi := dSdmx * gw
-              + dSdsxx * (2.0 * gw * (a - mx))
-              + dSdsxy * (gw * (b - my));
-          GA[gpix] := GA[gpix] - gi / cnt;  // d(1-SSIM) = -dSSIM
-          Inc(wi);
-          Inc(gpix, OffStride);           // #6: advance by the channel stride
-        end;
-      end;
+      // dmx/dx_i = w; dsxx/dx_i = 2 w (a - mx); dsxy/dx_i = w (b - my), so the
+      // per-window scatter coefficient is K0 + K1*a_i + K2*b_i.
+      k1v := 2.0 * dSdsxx;
+      k2v := dSdsxy;
+      kIdx := rowB + ox;
+      K0[kIdx] := dSdmx - k1v * mx - k2v * my;
+      K1[kIdx] := k1v;
+      K2[kIdx] := k2v;
     end;
+  end;
+  // Transposed (scatter) convolution of K0/K1/K2 back onto the H*W pixel grid,
+  // vertical half first. The horizontal-pass rows are dead by now, so they are
+  // reused as the H x outW vertical-spread temporaries.
+  SK0 := HMx; SK1 := HMy; SK2 := HSxx;
+  for y := 0 to HM1 do
+  begin
+    // window rows wy with 0 <= y - wy <= outH-1 are the ones that reach row y
+    wLo := y - outHM1;
+    if wLo < 0 then wLo := 0;
+    wHi := y;
+    if wHi > WinM1 then wHi := WinM1;
+    rowV := y * outW;              // #11: row base, once per y
+    for ox := 0 to outWM1 do
+    begin
+      acc0 := 0; acc1 := 0; acc2 := 0;
+      kIdx := (y - wLo) * outW + ox;
+      for wy := wLo to wHi do
+      begin
+        gw := G[wy];
+        acc0 := acc0 + gw * K0[kIdx];
+        acc1 := acc1 + gw * K1[kIdx];
+        acc2 := acc2 + gw * K2[kIdx];
+        Dec(kIdx, outW);           // #6: previous window row
+      end;
+      vIdx := rowV + ox;
+      SK0[vIdx] := acc0; SK1[vIdx] := acc1; SK2[vIdx] := acc2;
+    end;
+  end;
+  // Horizontal half of the scatter, applied straight into GA.
+  for y := 0 to HM1 do
+  begin
+    rowV := y * outW;              // #11: row bases, once per y
+    rowB := y * W;
+    gpix := rowB * OffStride + Off;  // #6: seed gpix for x = 0, then Inc
+    for x := 0 to WM1 do
+    begin
+      wLo := x - outWM1;
+      if wLo < 0 then wLo := 0;
+      wHi := x;
+      if wHi > WinM1 then wHi := WinM1;
+      acc0 := 0; acc1 := 0; acc2 := 0;
+      vIdx := rowV + x - wLo;
+      for wx := wLo to wHi do
+      begin
+        gw := G[wx];
+        acc0 := acc0 + gw * SK0[vIdx];
+        acc1 := acc1 + gw * SK1[vIdx];
+        acc2 := acc2 + gw * SK2[vIdx];
+        Dec(vIdx);                 // #6: previous window column
+      end;
+      pix := rowB + x;
+      a := PA[pix]; b := PB[pix];
+      GA[gpix] := GA[gpix] - (acc0 + acc1 * a + acc2 * b) / cnt;  // d(1-SSIM) = -dSSIM
+      Inc(gpix, OffStride);        // #6: advance by the channel stride
+    end;
+  end;
   Result := ssimSum / cnt;
 end;
 
@@ -1603,5 +1782,19 @@ end;
 
 initialization
   NeuralSSIMLossGradientHook := @SSIMLossGradientHookAdapter;
+  // Built eagerly (not lazily) so concurrent first calls cannot race on the
+  // build; read-only from here on.
+  BuildGaussianWindow1D(GaussWin1D);
+  vSSIMScratchList := TList.Create;
+  InitCriticalSection(vSSIMScratchCS);
+
+finalization
+  while vSSIMScratchList.Count > 0 do
+  begin
+    TSSIMScratch(vSSIMScratchList[vSSIMScratchList.Count - 1]).Free;
+    vSSIMScratchList.Delete(vSSIMScratchList.Count - 1);
+  end;
+  vSSIMScratchList.Free;
+  DoneCriticalSection(vSSIMScratchCS);
 
 end.
