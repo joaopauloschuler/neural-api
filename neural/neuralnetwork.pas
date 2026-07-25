@@ -793,9 +793,10 @@ type
       FAfterWeightUpdateHasBeenCalled:boolean;
       // INT8 QUANTIZED WEIGHT STORAGE (inference-only). When FQuantInt8 is
       // true the FP32 weights have been replaced by per-output-channel
-      // symmetric int8 codes: row r of the weight matrix (= neuron r's
-      // weight vector) is stored as FQuantCodes[r*VS..r*VS+VS-1] with
-      // dequantized value code*FQuantScales[r], scale = max|row|/127.
+      // symmetric int8 codes in FQuantTable, shaped (NumNeurons, 1, VS): row
+      // r of the weight matrix (= neuron r's weight vector) is the table's
+      // row r, with dequantized value code*FQuantTable.Scale[r, 0] and
+      // scale = max|row|/127.
       // The per-neuron FP32 volumes and the concatenated weight cache are
       // shrunk to a single element (the heap is genuinely released), so a
       // quantized layer holds ~1/4 of the FP32 weight bytes. The forward
@@ -806,8 +807,7 @@ type
       // Biases stay FP32. Backpropagation raises - quantized layers are
       // inference-only.
       FQuantInt8: boolean;
-      FQuantCodes: array of ShortInt;
-      FQuantScales: array of TNeuralFloat;
+      FQuantTable: TNNetVolumeQuant8;
       FQuantVectorSize: integer;
       FQuantWSizeX, FQuantWSizeY, FQuantWSizeD: integer;
       // Construction-time int8 arming (see TNNet.BuildQuantInt8): puts the
@@ -836,9 +836,9 @@ type
       // Quantizes ONE weight row straight into the armed int8 container:
       // row NeuronIdx receives codes Round(v*127/max|row|) over the
       // QuantInt8VectorSize elements of Src starting at SrcOffset, and
-      // FQuantScales[NeuronIdx] := pExtraScale*max|row|/127. These are the
-      // same codes QuantizeWeightsInt8 would produce after an FP32 fill of
-      // pExtraScale-scaled rows (a uniform row scale cancels out of the
+      // FQuantTable.Scale[NeuronIdx, 0] := pExtraScale*max|row|/127. These
+      // are the same codes QuantizeWeightsInt8 would produce after an FP32
+      // fill of pExtraScale-scaled rows (a uniform row scale cancels out of the
       // codes), so checkpoint importers can stream rows into a quantized
       // layer without ever restoring FP32 neuron volumes (no
       // DequantizeWeightsInt8/requantize cycle, no full-tensor FP32 spike).
@@ -878,8 +878,8 @@ type
       property QuantInt8VectorSize: integer read FQuantVectorSize;
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
-      // Interleaves FQuantCodes into the device layout and arms FDotCL's
-      // resident int8 mode (cai_dot_product_int8) against VBs.
+      // Interleaves FQuantTable's codes into the device layout and arms
+      // FDotCL's resident int8 mode (cai_dot_product_int8) against VBs.
       // Coded by Claude (AI).
       procedure PrepareInt8DotCL(VBs: TNNetVolume);
       {$ENDIF}
@@ -7221,7 +7221,7 @@ type
     procedure DequantizeWeightsInt8(); virtual;
     // Quantizes ONE vocab row straight into the int8 container: row RowIdx
     // receives codes Round(v*127/max|row|) over the EmbeddingSize elements
-    // of Src starting at SrcOffset, and FQuantScales[RowIdx] :=
+    // of Src starting at SrcOffset, and the row's scale :=
     // pExtraScale*max|row|/127 - the same codes QuantizeWeightsInt8 would
     // produce after an FP32 fill of pExtraScale-scaled rows (a uniform row
     // scale cancels), so checkpoint importers can stream the vocab table
@@ -47923,7 +47923,7 @@ begin
     // weight) and applies the per-row scale once per dot product - the
     // FP32 weights are never materialized (FConcatedWeights stays shrunk).
     FOutputRaw.GroupedDotProductsTiledInt8(FStruct[5], FNeurons.Count,
-      FOutputSizeX * FOutputSizeY, FVectorSize, FQuantCodes, FQuantScales,
+      FOutputSizeX * FOutputSizeY, FVectorSize, FQuantTable,
       FInputPrepared, FTileSizeD, FTileSizeX);
     if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
     ApplyActivationFunctionToOutput();
@@ -53042,9 +53042,12 @@ var
   FeatureSizeXM1, FeatureSizeYM1: integer;
   InputX, InputY: integer;
   WeightDepth, WeightDepthM1: integer;
-  RowBase, TapOfs: integer;
+  TapOfs: integer;
   TapRowStride, InRowStride, InOfs: integer;
   RowScale: TNeuralFloat;
+  RowPtr: TNeuralInt8ArrPtr;
+  CodesPtr: TNeuralInt8ArrPtr;
+  ScalePtr: TNeuralFloatArrPtr;
 begin
   FOutputRaw.Fill(0.0);
   MaxX := FOutput.SizeX - 1;
@@ -53058,6 +53061,8 @@ begin
   // FQuantWSizeX*WeightDepth and the input offset by one FInputCopy row.
   TapRowStride := FQuantWSizeX * WeightDepth;
   InRowStride := FInputCopy.GetRawPos(0, 1);
+  CodesPtr := FQuantTable.DataPtr;   // #13: table bases hoisted out of the nest
+  ScalePtr := FQuantTable.ScalePtr;
   for OutputX := 0 to MaxX do
   begin
     InputX := OutputX * FStride;
@@ -53066,7 +53071,9 @@ begin
       InputY := OutputY * FStride;
       for NeuronIdx := 0 to MaxNeurons do
       begin
-        RowBase := NeuronIdx * FQuantVectorSize;
+        // Neuron row base as a pointer (#11): the tap loops then add only
+        // TapOfs instead of carrying RowBase + TapOfs.
+        RowPtr := TNeuralInt8ArrPtr(@CodesPtr^[NeuronIdx * FQuantVectorSize]);
         OutputPtr := FOutputRaw.GetRawPtr(OutputX, OutputY,
           WeightDepth * NeuronIdx);
         for CntX := 0 to FeatureSizeXM1 do
@@ -53082,7 +53089,7 @@ begin
             TNNetVolume.MulAddInt8(
               OutputPtr,
               FInputCopy.GetRawPtr(InOfs),
-              Addr(FQuantCodes[RowBase + TapOfs]),
+              TNeuralInt8ArrPtr(@RowPtr^[TapOfs]),
               WeightDepth
             );
             Inc(TapOfs, TapRowStride);
@@ -53091,7 +53098,7 @@ begin
         end;
         // Per-neuron scale applied once per output element - after every
         // spatial tap accumulated its raw code product.
-        RowScale := FQuantScales[NeuronIdx];
+        RowScale := ScalePtr^[NeuronIdx];
         TNNetVolume.Mul(OutputPtr, RowScale, WeightDepthM1 + 1);
       end;
     end;
@@ -71620,7 +71627,7 @@ begin
       // Only the concatenated weight cache is skipped:
       //  - int8: the per-neuron FP32 volumes are shrunk to a single element,
       //    so concatenating them would build a garbage cache (the fused int8
-      //    kernels consume FQuantCodes directly).
+      //    kernels consume FQuantTable directly).
       //  - low-memory: ComputeLowMemoryCPU reads per-neuron weights directly,
       //    so the persistent cache is pure overhead.
       if not FQuantInt8 and not ActiveLowMemory() then
@@ -71657,8 +71664,7 @@ end;
 function TNNetLayerConcatedWeights.ArmBuildQuantInt8Storage(
   x, y, d: integer): boolean;
 var
-  NeuronsM1: integer;
-  NeuronCnt, V: integer;
+  V: integer;
 begin
   Result := false;
   if (FNN = nil) or (not FNN.FBuildQuantInt8) then exit;
@@ -71671,15 +71677,15 @@ begin
   if not NeuralInt8QuantizableClass(Self) then exit;
   if FNeurons[0].Weights.Size > 1 then exit; // live FP32 rows: FP32 path
   if FQuantInt8 and (FQuantVectorSize = V) then exit(true);
-  if FQuantInt8 then SetLength(FQuantCodes, 0); // dim change: fresh zeros
   FQuantVectorSize := V;
   FQuantWSizeX := x;
   FQuantWSizeY := y;
   FQuantWSizeD := d;
-  SetLength(FQuantCodes, FNeurons.Count * V); // zero codes = zero weights
-  SetLength(FQuantScales, FNeurons.Count);
-  NeuronsM1 := FNeurons.Count - 1;
-  for NeuronCnt := 0 to NeuronsM1 do FQuantScales[NeuronCnt] := 1;
+  // ReSize does no zero fill, so the arming state is written explicitly:
+  // zero codes = zero weights, unit scales.
+  FQuantTable.ReSize(FNeurons.Count, 1, V);
+  FQuantTable.Fill(0);
+  FQuantTable.ScaleData.Fill(1);
   FQuantInt8 := true;
   // Parity with the inherited FP32 sizing path: refresh the fast mirror and
   // run the post-sizing hook (the FQuantInt8 guard inside AfterWeightUpdate
@@ -71786,8 +71792,7 @@ begin
   FQuantWSizeX := FNeurons[0].Weights.SizeX;
   FQuantWSizeY := FNeurons[0].Weights.SizeY;
   FQuantWSizeD := FNeurons[0].Weights.Depth;
-  SetLength(FQuantScales, FNeurons.Count);
-  SetLength(FQuantCodes, FNeurons.Count * FQuantVectorSize);
+  FQuantTable.ReSize(FNeurons.Count, 1, FQuantVectorSize);
   LpBnd84 := FNeurons.Count - 1;
   for NeuronCnt := 0 to LpBnd84 do
   begin
@@ -71801,8 +71806,8 @@ begin
     end;
     RowBase := NeuronCnt * FQuantVectorSize;
     QuantizeInt8RowTolerant(TNeuralFloatArrPtr(@W.FData[0]),
-      FQuantVectorSize, @FQuantCodes[RowBase], Scale);
-    FQuantScales[NeuronCnt] := Scale;
+      FQuantVectorSize, @FQuantTable.FData[RowBase], Scale);
+    FQuantTable.Scale[NeuronCnt, 0] := Scale;
   end;
   // Free the FP32 storage only after every row quantized successfully.
   // (1,1,1) matches the pre-SetNumWeights state; SetLength inside ReSize
@@ -71821,24 +71826,18 @@ end;
 procedure TNNetLayerConcatedWeights.DequantizeWeightsInt8();
 var
   LpBnd86: integer;
-  NeuronCnt, ElementCnt, RowBase, QVSizeM1: integer;
-  Scale: TNeuralFloat;
+  NeuronCnt: integer;
   W: TNNetVolume;
 begin
   if not FQuantInt8 then exit;
   LpBnd86 := FNeurons.Count - 1;
-  QVSizeM1 := FQuantVectorSize - 1;
   for NeuronCnt := 0 to LpBnd86 do
   begin
     W := FNeurons[NeuronCnt].Weights;
     W.ReSize(FQuantWSizeX, FQuantWSizeY, FQuantWSizeD);
-    RowBase := NeuronCnt * FQuantVectorSize;
-    Scale := FQuantScales[NeuronCnt];
-    for ElementCnt := 0 to QVSizeM1 do
-      W.FData[ElementCnt] := FQuantCodes[RowBase + ElementCnt] * Scale;
+    FQuantTable.DequantizeRowTo(NeuronCnt, 0, TNeuralFloatArrPtr(@W.FData[0]));
   end;
-  SetLength(FQuantCodes, 0);
-  SetLength(FQuantScales, 0);
+  FQuantTable.ReSize(0, 0, 0);
   FQuantInt8 := false;
   AfterWeightUpdate(); // rebuild the concatenated cache / bias output
 end;
@@ -71869,32 +71868,29 @@ begin
   end;
   RowBase := NeuronIdx * FQuantVectorSize;
   if QuantizeInt8RowTolerant(TNeuralFloatArrPtr(@Src.FData[SrcOffset]),
-       FQuantVectorSize, @FQuantCodes[RowBase], Scale) then
-    FQuantScales[NeuronIdx] := pExtraScale * Scale
+       FQuantVectorSize, @FQuantTable.FData[RowBase], Scale) then
+    FQuantTable.Scale[NeuronIdx, 0] := pExtraScale * Scale
   else
     // Zero row: zero codes with unit scale, matching QuantizeWeightsInt8's
     // zero-row convention (pExtraScale is irrelevant - dequant is 0 either
     // way - and scale 1 keeps requantize-after-dequantize exact).
-    FQuantScales[NeuronIdx] := 1;
+    FQuantTable.Scale[NeuronIdx, 0] := 1;
 end;
 
 function TNNetLayerConcatedWeights.Int8QuantizedSizeBytes(): int64;
 begin
-  Result := int64(Length(FQuantCodes)) * csShortIntSize +
-    int64(Length(FQuantScales)) * csNeuralFloatSize;
+  Result := FQuantTable.GetMemSize();
 end;
 
 function TNNetLayerConcatedWeights.CountWeights(): int64;
 begin
   if FQuantInt8 and (not FLinkedNeurons)
-  then Result := Length(FQuantCodes)
+  then Result := FQuantTable.Size
   else Result := inherited CountWeights();
 end;
 
 function TNNetLayerConcatedWeights.GetInt8QuantData(out pCodes: TInt8DynArr;
   out pScales: TNeuralFloatDynArr; out NumRows, VS: integer): boolean;
-var
-  i, CodesMax, ScalesMax: integer;
 begin
   SetLength(pCodes, 0);
   SetLength(pScales, 0);
@@ -71904,12 +71900,7 @@ begin
   if not Result then exit;
   NumRows := FNeurons.Count;
   VS := FQuantVectorSize;
-  SetLength(pCodes, Length(FQuantCodes));
-  CodesMax := Length(FQuantCodes) - 1;
-  for i := 0 to CodesMax do pCodes[i] := FQuantCodes[i];
-  SetLength(pScales, Length(FQuantScales));
-  ScalesMax := Length(FQuantScales) - 1;
-  for i := 0 to ScalesMax do pScales[i] := FQuantScales[i];
+  FQuantTable.GetQuantData(pCodes, pScales);
 end;
 
 procedure TNNetLayerConcatedWeights.BuildBiasOutput();
@@ -71965,6 +71956,7 @@ begin
   FNeuronWeightList := TNNetVolumeList.Create(false);
   FConcatedWeights := TNNetVolume.Create();
   FConcatedWInter := TNNetVolume.Create();
+  FQuantTable := TNNetVolumeQuant8.Create();
   FBiasOutput := TNNetVolume.Create();
   FShouldConcatWeights := false;
   FShouldInterleaveWeights := false;
@@ -71976,6 +71968,7 @@ end;
 destructor TNNetLayerConcatedWeights.Destroy();
 begin
   FBiasOutput.Free;
+  FQuantTable.Free;
   FConcatedWeights.Free;
   FNeuronWeightList.Free;
   FConcatedWInter.Free;
@@ -72063,19 +72056,21 @@ begin
   AfterWeightUpdate();
 end;
 
-// Interleaves FQuantCodes into the device layout (codes[a + i*NumAs], the
-// same transposed indexing cai_dot_product uses for FP32 weights, so adjacent
-// work-items read adjacent bytes) and arms FDotCL's resident int8 mode
+// Interleaves FQuantTable's codes into the device layout (codes[a + i*NumAs],
+// the same transposed indexing cai_dot_product uses for FP32 weights, so
+// adjacent work-items read adjacent bytes) and arms FDotCL's resident int8 mode
 // against VBs. One-time: the codes/scales are immutable after quantization.
 // Coded by Claude (AI).
 procedure TNNetLayerConcatedWeights.PrepareInt8DotCL(VBs: TNNetVolume);
 var
   Inter: TInt8DynArr;
+  CodesPtr: TNeuralInt8ArrPtr;
   NumAs, ACnt, ECnt, VSizeM1, NumAsM1, aBase, pos: integer;
 begin
   NumAs := FNeurons.Count;
   if (not Assigned(FDotCL)) or (NumAs = 0) or (FQuantVectorSize = 0) or
     (VBs.Size = 0) then exit;
+  CodesPtr := FQuantTable.DataPtr;   // #13: one base pointer for the transpose
   SetLength(Inter, NumAs * FQuantVectorSize);
   VSizeM1 := FQuantVectorSize - 1;
   NumAsM1 := NumAs - 1;                   // #2: hoist the arithmetic for-bound
@@ -72085,11 +72080,11 @@ begin
     pos := ACnt;                         // #6: ACnt + ECnt*NumAs carried by +NumAs
     for ECnt := 0 to VSizeM1 do
     begin
-      Inter[pos] := FQuantCodes[aBase + ECnt];
+      Inter[pos] := CodesPtr^[aBase + ECnt];
       Inc(pos, NumAs);
     end;
   end;
-  FDotCL.PrepareForComputeInt8(@Inter[0], @FQuantScales[0], NumAs,
+  FDotCL.PrepareForComputeInt8(@Inter[0], FQuantTable.ScalePtr, NumAs,
     FQuantVectorSize, VBs);
 end;
 {$ENDIF}
@@ -96177,7 +96172,7 @@ begin
   // it (the concatenated-weight caches it would otherwise need are released in
   // low-memory mode). Int8-quantized is NOT excluded either: ComputeRange
   // routes to the ranged fused int8 kernel on both chunk axes, which reads
-  // only the immutable FQuantCodes/FQuantScales. Coded by Claude (AI).
+  // only the immutable FQuantTable. Coded by Claude (AI).
   Result := (FNN <> nil) and FNN.FIntraLayerThreading and
     (not WillOpenCL()) and
     (not WinogradEligible())
@@ -96233,11 +96228,11 @@ begin
       // Int8-quantized: the FP32 weight storage was released at quantization
       // time, so the branches below would read freed memory. The fused int8
       // kernel restricted to this neuron slice reads only the immutable
-      // FQuantCodes/FQuantScales (checked BEFORE ActiveLowMemory, like the
+      // FQuantTable (checked BEFORE ActiveLowMemory, like the
       // serial forward: the codes are the resident storage in both memory
       // modes). Coded by Claude (AI).
       FOutputRaw.DotProductsTiledInt8(FNeurons.Count, {BStart}0,
-        {BFinish}NumPositionsM1, FVectorSize, FQuantCodes, FQuantScales,
+        {BFinish}NumPositionsM1, FVectorSize, FQuantTable,
         FInputPrepared, FTileSizeD, FTileSizeX,
         {AStart}StartRange, {AFinish}FinRange);
     end
@@ -96297,12 +96292,12 @@ begin
   begin
     // Int8-quantized: position-sliced twin of the serial fused int8 forward
     // (same kernel, B range = this chunk's output positions). Reads only the
-    // immutable FQuantCodes/FQuantScales and writes only this slice's rows,
+    // immutable FQuantTable and writes only this slice's rows,
     // so disjoint chunks stay race-free. Checked BEFORE ActiveLowMemory,
     // like the serial forward. Bias + activation run in the shared tail
     // below. Coded by Claude (AI).
     FOutputRaw.DotProductsTiledInt8(FNeurons.Count, StartRange, FinRange,
-      FVectorSize, FQuantCodes, FQuantScales, FInputPrepared,
+      FVectorSize, FQuantTable, FInputPrepared,
       FTileSizeD, FTileSizeX);
   end
   else if ActiveLowMemory() then
@@ -97210,7 +97205,7 @@ procedure TNNetConvolution.Compute();
       // weight) and applies the per-row scale once per dot product - the
       // FP32 weights are never materialized, in memory or in cache.
       FOutputRaw.DotProductsTiledInt8(FNeurons.Count,
-        FOutputSizeX * FOutputSizeY, FVectorSize, FQuantCodes, FQuantScales,
+        FOutputSizeX * FOutputSizeY, FVectorSize, FQuantTable,
         FInputPrepared, FTileSizeD, FTileSizeX);
       if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
       ApplyActivationFunctionToOutput();
@@ -98754,16 +98749,20 @@ var
   Cnt, RowBase: integer;
   Sum: TNeuralFloat;
   PrevOutputPtr: TNeuralFloatArrPtr;
+  CodesPtr: TNeuralInt8ArrPtr;
+  ScalePtr: TNeuralFloatArrPtr;
   AddBias: boolean;
 begin
   PrevOutputPtr := FPrevLayer.Output.DataPtr;
+  CodesPtr := FQuantTable.DataPtr;   // #13: table bases hoisted out of the loop
+  ScalePtr := FQuantTable.ScalePtr;
   AddBias := FSuppressBias = 0;              // #5: invariant across the loop
   RowBase := StartRange * FQuantVectorSize;  // #6: first row's int8 code offset
   for Cnt := StartRange to FinRange do
   begin
     Sum := TNNetVolume.DotProductInt8(
-      TNeuralInt8ArrPtr(@FQuantCodes[RowBase]),
-      PrevOutputPtr, FQuantVectorSize) * FQuantScales[Cnt];
+      TNeuralInt8ArrPtr(@CodesPtr^[RowBase]),
+      PrevOutputPtr, FQuantVectorSize) * ScalePtr^[Cnt];
     if AddBias then Sum := Sum + FArrNeurons[Cnt].FBiasWeight;
     FOutputRaw.FData[Cnt] := Sum;
     FOutput.FData[Cnt] := FActivationFn(Sum);
