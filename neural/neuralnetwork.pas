@@ -122669,7 +122669,7 @@ end;
 
 procedure TNNet.LoadStructureFromString(strData: string);
 var
-  LpBnd261: integer;
+  MaxStructureTokenPos: integer;
   S, S2: TStringList;
   Cnt: integer;
 begin
@@ -122678,8 +122678,8 @@ begin
   S2 := CreateTokenizedStringList(')');
   if S.Count > 0 then
   begin
-    LpBnd261 := S.Count - 1;
-    for Cnt := 0 to LpBnd261 do
+    MaxStructureTokenPos := S.Count - 1;
+    for Cnt := 0 to MaxStructureTokenPos do
     begin
       S2.DelimitedText := S[Cnt];
       //WriteLn(Cnt,':',S2[1],'->',S2[0]);
@@ -122927,7 +122927,7 @@ end;
 
 procedure TNNetGrokfastWrapper.AllocBuffers;
 var
-  LpBnd262: integer;
+  MaxLayerNeuronPos: integer;
   LayerIdx, NeuronIdx, MuIdx: integer;
   Layer: TNNetLayer;
   MuVol: TNNetVolume;
@@ -122951,8 +122951,8 @@ begin
   for LayerIdx := 0 to LiveLastLayerIdx do
   begin
     Layer := FLiveNet.Layers[LayerIdx];
-    LpBnd262 := Layer.Neurons.Count - 1;
-    for NeuronIdx := 0 to LpBnd262 do
+    MaxLayerNeuronPos := Layer.Neurons.Count - 1;
+    for NeuronIdx := 0 to MaxLayerNeuronPos do
     begin
       MuVol := TNNetVolume.Create();
       MuVol.ReSize(Layer.Neurons[NeuronIdx].Delta);
@@ -122964,7 +122964,7 @@ end;
 
 procedure TNNetGrokfastWrapper.Filter;
 var
-  LpBnd263: integer;
+  MaxLayerNeuronPos: integer;
   LayerIdx, NeuronIdx, MuIdx: integer;
   Layer: TNNetLayer;
   Neuron: TNNetNeuron;
@@ -122979,8 +122979,8 @@ begin
   for LayerIdx := 0 to LiveLastLayerIdx do
   begin
     Layer := FLiveNet.Layers[LayerIdx];
-    LpBnd263 := Layer.Neurons.Count - 1;
-    for NeuronIdx := 0 to LpBnd263 do
+    MaxLayerNeuronPos := Layer.Neurons.Count - 1;
+    for NeuronIdx := 0 to MaxLayerNeuronPos do
     begin
       Neuron := Layer.FArrNeurons[NeuronIdx];  // #10: index the mirror
       GradVol := Neuron.Delta;
@@ -123076,7 +123076,7 @@ end;
 
 function TNNet.ToGraphvizDot(const GraphName: string): string;
 var
-  LpBnd264: integer;
+  MaxPrevLayerPos: integer;
   SL: TStringList;
   LayerCnt: integer;
   InputCnt: integer;
@@ -123131,8 +123131,8 @@ begin
       if Layer is TNNetConcatBase then
       begin
         ConcatLayer := TNNetConcatBase(Layer);
-        LpBnd264 := ConcatLayer.FPrevLayerList.Count - 1;
-        for InputCnt := 0 to LpBnd264 do
+        MaxPrevLayerPos := ConcatLayer.FPrevLayerList.Count - 1;
+        for InputCnt := 0 to MaxPrevLayerPos do
         begin
           if Assigned(ConcatLayer.FPrevLayerList[InputCnt]) then
           begin
@@ -123156,9 +123156,9 @@ end;
 
 procedure TNNet.LoadDataFromString(strData: string);
 var
-  LpBnd265: integer;
-  LpBnd266: integer;
-  LpBnd267: integer;
+  MaxDataTokenPos: integer;
+  MaxDumpTokenPos: integer;
+  MaxLayerPos: integer;
   S: TStringList;
   Cnt: integer;
 begin
@@ -123168,8 +123168,8 @@ begin
   begin
     if S.Count > 0 then
     begin
-      LpBnd265 := S.Count - 1;
-      for Cnt := 0 to LpBnd265 do
+      MaxDataTokenPos := S.Count - 1;
+      for Cnt := 0 to MaxDataTokenPos do
       begin
         FLayers[Cnt].LoadDataFromString(S[Cnt]);
       end;
@@ -123188,8 +123188,8 @@ begin
     WriteLn('Loaded Data Layers:');
     if S.Count > 0 then
     begin
-      LpBnd266 := S.Count - 1;
-      for Cnt := 0 to LpBnd266 do
+      MaxDumpTokenPos := S.Count - 1;
+      for Cnt := 0 to MaxDumpTokenPos do
       begin
         Writeln(Cnt, ':', Copy(S[Cnt],1,20) );
       end;
@@ -123198,8 +123198,8 @@ begin
     WriteLn('Structure Layers:');
     if FLayers.Count>0 then
     begin
-      LpBnd267 := FLayers.Count - 1;
-      for Cnt := 0 to LpBnd267 do
+      MaxLayerPos := FLayers.Count - 1;
+      for Cnt := 0 to MaxLayerPos do
       begin
         Writeln(Cnt, ':', FLayers[Cnt].ClassName );
       end;
@@ -123355,12 +123355,12 @@ end;
 
 procedure TNNetLayer.BuildArrNeurons();
 var
-  LpBnd268: integer;
+  MaxNeuronPos: integer;
   NeuronIdx: integer;
 begin
   SetLength(FArrNeurons, FNeurons.Count);
-  LpBnd268 := FNeurons.Count - 1;
-  for NeuronIdx := 0 to LpBnd268 do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for NeuronIdx := 0 to MaxNeuronPos do
   begin
     FArrNeurons[NeuronIdx] := FNeurons[NeuronIdx];
   end;
@@ -123573,7 +123573,7 @@ end;
 
 function TNNetLayer.InitUniform(Value: TNeuralFloat): TNNetLayer;
 var
-  LpBnd269: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   // Inference-only layers skip random weight init (overwritten by the loader).
@@ -123581,8 +123581,8 @@ begin
   begin
     if (FNeurons.Count > 0) then
     begin
-      LpBnd269 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd269 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         FNeurons[Cnt].InitUniform(Value);
       end;
@@ -123594,7 +123594,7 @@ end;
 
 function TNNetLayer.InitLeCunUniform(Value: TNeuralFloat): TNNetLayer;
 var
-  LpBnd270: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   // Inference-only layers skip random weight init (overwritten by the loader).
@@ -123602,8 +123602,8 @@ begin
   begin
     if (FNeurons.Count > 0) then
     begin
-      LpBnd270 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd270 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         FNeurons[Cnt].InitLeCunUniform(Value);
       end;
@@ -123615,7 +123615,7 @@ end;
 
 function TNNetLayer.InitHeUniform(Value: TNeuralFloat): TNNetLayer;
 var
-  LpBnd271: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   // Inference-only layers skip random weight init (overwritten by the loader).
@@ -123623,8 +123623,8 @@ begin
   begin
     if (FNeurons.Count > 0) then
     begin
-      LpBnd271 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd271 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         FNeurons[Cnt].InitHeUniform(Value);
       end;
@@ -123636,7 +123636,7 @@ end;
 
 function TNNetLayer.InitHeUniformDepthwise(Value: TNeuralFloat): TNNetLayer;
 var
-  LpBnd272: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   // Inference-only layers skip random weight init (overwritten by the loader).
@@ -123644,8 +123644,8 @@ begin
   begin
     if (FNeurons.Count > 0) then
     begin
-      LpBnd272 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd272 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         FNeurons[Cnt].InitHeUniformDepthwise(Value);
       end;
@@ -123657,7 +123657,7 @@ end;
 
 function TNNetLayer.InitHeGaussian(Value: TNeuralFloat): TNNetLayer;
 var
-  LpBnd273: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   // Inference-only layers skip random weight init (overwritten by the loader).
@@ -123665,8 +123665,8 @@ begin
   begin
     if (FNeurons.Count > 0) then
     begin
-      LpBnd273 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd273 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         FNeurons[Cnt].InitHeGaussian(Value);
       end;
@@ -123678,7 +123678,7 @@ end;
 
 function TNNetLayer.InitHeGaussianDepthwise(Value: TNeuralFloat): TNNetLayer;
 var
-  LpBnd274: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   // Inference-only layers skip random weight init (overwritten by the loader).
@@ -123686,8 +123686,8 @@ begin
   begin
     if (FNeurons.Count > 0) then
     begin
-      LpBnd274 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd274 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         FNeurons[Cnt].InitHeGaussianDepthwise(Value);
       end;
@@ -123725,7 +123725,7 @@ end;
 
 function TNNetLayer.InitSELU(Value: TNeuralFloat): TNNetLayer;
 var
-  LpBnd275: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   // Inference-only layers skip random weight init (overwritten by the loader).
@@ -123733,8 +123733,8 @@ begin
   begin
     if (FNeurons.Count > 0) then
     begin
-      LpBnd275 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd275 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         FNeurons[Cnt].InitSELU(Value);
       end;
@@ -123746,7 +123746,7 @@ end;
 
 function TNNetLayer.InitAdam(Beta1, Beta2, Epsilon: TNeuralFloat): TNNetLayer;
 var
-  LpBnd276: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   FBeta1 := Beta1;
@@ -123760,8 +123760,8 @@ begin
   begin
     if (FNeurons.Count > 0) then
     begin
-      LpBnd276 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd276 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         FNeurons[Cnt].InitAdam(Self);
       end;
@@ -124005,13 +124005,13 @@ end;
 
 procedure TNNetLayer.Fill(value: TNeuralFloat);
 var
-  LpBnd278: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   if (FNeurons.Count > 0) then
   begin
-    LpBnd278 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd278 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       FArrNeurons[Cnt].Fill(Value);  // #10: array mirror
     end;
@@ -124021,15 +124021,15 @@ end;
 
 procedure TNNetLayer.ClearDeltas();
 var
-  LpBnd279: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   // Inference-only (SetTrainable(false)): the training volumes are freed.
   if not FIsTrainable then exit;
   if (FNeurons.Count > 0) then
   begin
-    LpBnd279 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd279 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       FArrNeurons[Cnt].ClearDelta();  // #10: array mirror
     end;
@@ -124062,13 +124062,13 @@ end;
 
 procedure TNNetLayer.SetNumWeightsForAllNeurons(NumWeights: integer);
 var
-  LpBnd280: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   if (FNeurons.Count > 0) and (FCanSetNumWeightsForAllNeurons) then
   begin
-    LpBnd280 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd280 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       FNeurons[Cnt].Weights.ReSize(NumWeights,1,1);
       // Inference-only layers skip the training-only buffers (see
@@ -124085,14 +124085,14 @@ end;
 
 procedure TNNetLayer.SetNumWeightsForAllNeurons(x, y, d: integer);
 var
-  LpBnd281: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N: TNNetNeuron;
 begin
   if (FNeurons.Count > 0) and (FCanSetNumWeightsForAllNeurons) then
   begin
-    LpBnd281 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd281 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       N := FNeurons[Cnt];  // #7: bind the list element once
       N.Weights.ReSize(x,y,d);
@@ -124134,7 +124134,7 @@ end;
 
 function TNNetLayer.GetMaxDelta(): TNeuralFloat;
 var
-  LpBnd282: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   MaxValue: TNeuralFloat;
 begin
@@ -124143,9 +124143,9 @@ begin
     Result := FArrNeurons[0].Delta.GetMax();
     if FNeurons.Count > 1 then
     begin
-      LpBnd282 := FNeurons.Count-1;
+      MaxNeuronPos := FNeurons.Count-1;
       // #4: neuron 0 is the seed above; start at 1 (max(a,a)=a, bit-identical).
-      for Cnt := 1 to LpBnd282 do
+      for Cnt := 1 to MaxNeuronPos do
       begin
         MaxValue := FArrNeurons[Cnt].Delta.GetMax();
         if MaxValue > Result then Result := MaxValue;
@@ -124260,7 +124260,7 @@ end;
 
 function TNNetLayer.GetMinDelta(): TNeuralFloat;
 var
-  LpBnd283: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   MinValue: TNeuralFloat;
 begin
@@ -124269,9 +124269,9 @@ begin
     Result := FArrNeurons[0].Delta.GetMin();
     if FNeurons.Count > 1 then
     begin
-      LpBnd283 := FNeurons.Count-1;
+      MaxNeuronPos := FNeurons.Count-1;
       // #4: neuron 0 is the seed above; start at 1 (min(a,a)=a, bit-identical).
-      for Cnt := 1 to LpBnd283 do
+      for Cnt := 1 to MaxNeuronPos do
       begin
         MinValue := FArrNeurons[Cnt].Delta.GetMin();
         if MinValue < Result then Result := MinValue;
