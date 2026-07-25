@@ -82,9 +82,10 @@ mechanically; argument rules are where sweeps introduce bugs.
 **Appendices**
 
 - [The patterns agents miss most](#appendix-the-patterns-agents-miss-most--extra-worked-examples) — extra worked examples: **A** repeated `(t*Stride)+d` (most-missed) · **B** consecutive fixed depth slots · **C** contiguous copies are `Move`/bulk ops · **D** elementwise math as an op sequence · **E** loop reorder for contiguity · **F** initializers are not exempt.
-- [Known non-targets — do NOT optimize these](#appendix-known-non-targets--do-not-optimize-these) — `pascoremath*` is off limits; clone, never patch.
+- [Known non-targets — do NOT optimize these](#appendix-known-non-targets--do-not-optimize-these) — `pascoremath*` is off limits; clone, never patch · the `AVX32` and plain-`AVX` kernel paths look like duplication and must stay.
 
-See also: [How to build what you changed](#how-to-build-what-you-changed--lazbuild--b-always) — `lazbuild -B`, always.
+See also: [How to build what you changed](#how-to-build-what-you-changed--lazbuild--b-always) — `lazbuild -B`, always ·
+[Authoring a new `TNNetVolume` method](#authoring-a-new-tnnetvolume-method--avx-path-and-plain-pascal-fallback) — never call `AVX*` from a call site; a new method needs **both** an AVX path and a plain-Pascal fallback.
 
 **Two rules that most often fire together:** #5 exposes an invariant, then #13/#19
 vectorize what is left. **Two that most often conflict:** #13/#21 want a bulk
@@ -1052,7 +1053,9 @@ call. This is a bigger win than #11/#12 at the same site — it changes the
 instruction mix (scalar → SIMD), not just one multiply into an add.
 
 The primitives (all in `neuralvolume.pas`; pointer-form class methods are the ones
-that consume a hoisted `GetRawPtr`):
+that consume a hoisted `GetRawPtr`). If the shape you found has no primitive, see
+[Authoring a new `TNNetVolume` method](#authoring-a-new-tnnetvolume-method--avx-path-and-plain-pascal-fallback)
+before reaching for an `AVX*` function directly — never call one from a call site:
 
 | Inner loop (after #11 hoist) | Meaning | Call |
 | --- | --- | --- |
@@ -1434,6 +1437,12 @@ need a **scalar or an integer offset** — a plain local — and allocate nothin
 **If the only way you can see to apply an optimization is to allocate, the
 correct action is to NOT apply it.**
 
+This is also why an `array of Single` cannot be handed to a `TNNetVolume`
+instance method: a volume cannot alias external memory, so "wrap it in a volume"
+is a per-call allocation *and* a copy. Either promote the array to a persistent
+volume field (#27) or add a pointer-form method — see
+[Authoring a new `TNNetVolume` method](#authoring-a-new-tnnetvolume-method--avx-path-and-plain-pascal-fallback).
+
 ## 18. TNNetVolume methods are faster than pure pascal equivalents
 
 The below `TNNetVolume` methods are faster than equivalent pure Pascal implementations:
@@ -1467,6 +1476,187 @@ The below `TNNetVolume` methods are faster than equivalent pure Pascal implement
       function GetDistance(Original: TNNetVolume): TNeuralFloat;  overload; {$IFDEF Release} inline; {$ENDIF}
       function SumDiff(Original: TNNetVolume): TNeuralFloat; overload; {$IFDEF Release} inline; {$ENDIF}
 ```
+
+## Authoring a new `TNNetVolume` method — AVX path **and** plain-Pascal fallback
+
+**Never call an `AVX*` function from a call site.** `TNNetVolume.GetSum`
+(`neuralvolume.pas:15162`) already tests `FSize >= csMinAvxSize` and calls
+`AVXGetSum` itself; the whole override block lives inside `{$IFDEF AVXANY}`
+(`:15135`–`:15482`), so a build without AVX falls back to `TVolume.GetSum`
+(`:7988`) on its own. A caller that names `AVXGetSum` has taken on an `{$IFDEF}`
+and a size threshold the method was already handling, and breaks the non-AVX
+build. Call the method; if the method you want does not exist, add it — with
+both halves.
+
+The fallback is not hypothetical. `neuralnetwork.inc` undefines `AVXANY` for
+AArch64, PowerPC, M68K, any non-FPC (Delphi) build, and any build that simply
+does not define `-dAVX`/`-dAVX2`/`-dAVX512` (`:40`–`:102`). **A method with only
+an AVX body does not compile there.**
+
+**New AVX work targets `AVX2` on 64-bit.** This is a rule about what you *write*,
+not about what exists:
+
+- ⛔ **Never delete or narrow an existing kernel.** The `{$IFDEF AVX32}` block
+  (`:11822`–`:13295`) and the plain-`AVX` fallbacks inside the 64-bit kernels
+  (the `VPERM2F128`-style two-`xmm` paths, e.g. `:12609`) are what keeps older
+  hardware fast. They stay. "Unused on my machine" is not a finding.
+- **`AVX2` is the baseline for new code.** Every modern x86 part has it. Write
+  `ymm` code and assume FMA and the full integer set.
+- **A new kernel needs no plain-`AVX` and no 32-bit twin.** Those builds take the
+  Pascal fallback for that one method — slower than a hand-written kernel, but
+  correct, and it costs them nothing they had before.
+- **`AVX512` only for an extreme case**, and never as a separate kernel — as a
+  `{$IFDEF AVX512}` `zmm` variant of the same loop body, which is exactly how
+  `AVXSub` does it (`:14315`–`:14339`). Justify it with a measurement: on many
+  parts the downclock eats the width.
+
+⚠ **So gate on `AVX2`, not `AVXANY`.** `AVXANY` is also defined for plain `AVX`
+and for `AVX32` (`neuralnetwork.inc:95`–`97`), so `{$IFDEF AVXANY} MyNewKernel(…)`
+compiles a call to a kernel that was never assembled on those builds — a link
+error that no `-dAVX2` build will ever show you.
+
+### Before adding one: does the data have the right type?
+
+You need a new method only when the operation has no form that fits your data.
+`TNNetVolume` **cannot alias an external array** — wrapping an `array of Single`
+in a fresh volume is a copy, and on a compute path that is a #17 violation. So:
+
+- The buffer is **long-lived and object-owned** → don't add a method. Promote the
+  array to a persistent `TNNetVolume` field (`ReSize` in `SetPrevLayer`, #27) and
+  the whole instance family becomes available at once.
+- The buffer is a **local**, or you need a **slice** (`@Arr[Offset]`, `Count`) →
+  add the **pointer-form class method**. Precedent: `Product(PtrA, N)` (`:249`)
+  is already a pointer-form reduction sitting next to `DotProduct`.
+- Neither, and it is one cold setup/eval-path loop → add nothing.
+
+### Pattern 1 — one method, internal dispatch (preferred for a new primitive)
+
+Declare it **unconditionally**, and branch inside the body. `VectorRelu`
+(`:8939`) is the reference:
+
+```pascal
+{$IFDEF AVXANY}
+// AVXCopyRelu is defined later in this file under {$IFDEF AVXANY};
+// forward-declare it so VectorRelu can call it here.
+procedure AVXCopyRelu(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer); forward;
+{$ENDIF}
+class procedure TNNetVolume.VectorRelu(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+{$IFNDEF AVXANY}
+var
+  I: integer;
+{$ENDIF}
+begin
+  if N <= 0 then exit;
+  {$IFDEF AVXANY}
+  AVXCopyRelu(pDst, pSrc, N);
+  {$ELSE}
+  for I := 0 to N - 1 do
+    if pSrc^[I] > 0 then pDst^[I] := pSrc^[I] else pDst^[I] := 0;
+  {$ENDIF}
+end;
+```
+
+Note the `{$IFNDEF AVXANY}` around `var I` — an unused local is a hint on the AVX
+build. Declare it next to the other `Vector*` members (`:548`–`:587`), **outside**
+the `{$IFDEF AVXANY}` declaration block that starts at `:613`.
+
+`VectorRelu` can test `AVXANY` because `AVXCopyRelu` exists in every asm block. A
+method built on a **new** kernel must test `AVX2` instead — same shape, swap the
+symbol in both the body and the `{$IFNDEF}` around the locals:
+
+```pascal
+  {$IFDEF AVX2}
+  MyNewKernel(pDst, pSrc, N);
+  {$ELSE}
+  for I := 0 to N - 1 do ...    // plain-AVX and 32-bit land here too, by design
+  {$ENDIF}
+```
+
+### Pattern 2 — virtual base + AVX override
+
+Use this when a correct scalar version already belongs on `TVolume`: declare it
+`virtual` there, `override` it in `TNNetVolume` inside the `{$IFDEF AVXANY}`
+blocks, and gate on size. `GetSum` (`:268` virtual, `:636` override, `:15162`
+body) is the reference:
+
+```pascal
+function TNNetVolume.GetSum(): TNeuralFloat;
+begin
+  if FSize >= csMinAvxSize            // = 16, neuralvolume.pas:48
+    then Result := AVXGetSum(FDataPtr, FSize)
+    else begin { scalar loop } end;
+end;
+```
+
+Here the non-AVX build never sees the override at all — the virtual call lands on
+`TVolume.GetSum`. That is why declaration *and* implementation must both sit
+inside `{$IFDEF AVXANY}`: an unconditional declaration with a conditional body is
+an unimplemented-method link error on the fallback build.
+
+This works for `GetSum` because `AVXGetSum` exists in every asm block. With a new
+**`AVX2`-only** kernel the override is still compiled on a plain-`AVX` or 32-bit
+build, so either prefer Pattern 1, or keep the
+`{$IFDEF AVX2} … {$ELSE} scalar {$ENDIF}` branch *inside* the override body.
+
+### Compose existing kernels — or write a fused one
+
+Composition is the cheaper thing to write, not automatically the faster thing to
+run. **Each composed call is a separate pass over the whole buffer.** Expressing
+`dst := (a * k + b)` as `Mul` then `Add` reads `N` floats and writes `N` floats
+twice; one fused kernel reads each input once, keeps the intermediate in a
+register, and writes once. When the buffer does not fit in cache, that is the
+difference between memory-bound at 2–3× the traffic and memory-bound at 1×, and
+no amount of tuning inside the individual kernels recovers it.
+
+**Write a fused kernel when** the composed form would:
+
+- make **more than one pass** over a buffer larger than L2, or
+- **materialize an intermediate** the caller does not otherwise want — especially
+  if holding it needs a scratch field that #17 would otherwise forbid, or
+- run a **short** `N` where per-call overhead (dispatch, remainder handling)
+  rivals the work, or
+- leave an obvious **FMA** on the table by splitting a multiply from an add.
+
+**Compose when** the operands are already cache-resident, the passes are few, or
+the shape is rare — a new kernel is permanent surface area, and asm is the one
+part of this codebase a later reader cannot skim.
+
+State which case you are in, with the reasoning, in the commit message. "Fused
+because the composed form made three passes over a 40 MB logits buffer" is a
+review-able claim; "faster" is not.
+
+Put a new kernel in the `{$IFDEF AVX64}` block (`:13297`–`:15133`) and gate its
+call on `AVX2`. The `{$IFDEF AVX32}` mirror (`:11822`–`:13295`) gets no new
+entries — and no deletions either. Carry the scalar remainder every kernel
+carries:
+
+```pascal
+MissedElements := NumElements and 3;
+localNumElements := NumElements xor MissedElements;
+...
+if MissedElements > 0 then { fold the last 1-3 elements by hand }
+```
+
+Two things the asm itself must get right: list **every** register you touch in the
+clobber list (append the `zmm` names under `{$IFDEF AVX512}`, as the existing
+kernels do), and issue `vzeroupper` on every path out of an `ymm` kernel — note
+`AVXGetSum` has four of them (`:14437`, `:14444`, `:14454`, `:14464`), one per
+exit, not one at the end.
+
+### Checklist
+
+- [ ] Declaration and implementation agree on their `{$IFDEF}` nesting, and a new
+      kernel is reached through `AVX2`, never `AVXANY`.
+- [ ] Compiles **and passes tests** both with and without `-dAVX2` —
+      `lazbuild -B` each time, or the `.ppu` from the other build is what you tested.
+- [ ] A fused kernel's commit message says what the composed form cost, and the
+      two paths were compared on a buffer that does **not** fit in cache.
+- [ ] `Single` only (#25) — there is no Double AVX path.
+- [ ] No allocation in the body (#17); take pointers and a count.
+- [ ] `{$IFDEF Release} inline {$ENDIF}` if the body is small (#26).
+- [ ] A test that fails if the body is wrong — the two paths must agree with each
+      other, so test the scalar result, not just that it runs.
+- [ ] `neuralvolume.pas` is **CRLF**; check `git diff --stat` for a whole-file rewrite.
 
 ## 19. Promote a scalar transcendental loop to the `Vector*` kernels
 
@@ -2195,3 +2385,15 @@ of the two to call from model math.
 Applies to *every* rule here: do not hoist a bound (#2), do not strength-reduce a
 `div` (#15), do not promote a loop to a `TNNetVolume` method (#13), do not touch
 the formatting. Report the finding if you like; do not act on it.
+
+### The `AVX32` block and the plain-`AVX` paths — dead-looking, not dead
+
+`neuralvolume.pas:11822`–`:13295` (`{$IFDEF AVX32}`) duplicates the 64-bit
+kernels, and several 64-bit kernels carry a `{$ELSE}` branch for builds without
+`AVX2` (`:12609` is the shape: two `xmm` halves and a `VPERM2F128` where AVX2
+would use one `ymm`). A sweep reads this as duplication to collapse. **It is
+not.** Those paths are the only fast path old hardware has; removing them
+converts a working AVX build into a scalar one for that method, and no test on a
+modern machine will notice. New code targets `AVX2`/64-bit and simply adds
+nothing here — see
+[Authoring a new `TNNetVolume` method](#authoring-a-new-tnnetvolume-method--avx-path-and-plain-pascal-fallback).
