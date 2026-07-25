@@ -1187,12 +1187,15 @@ var
   GreedyFast: boolean;
   Tokens: TNeuralIntegerArray;
   Generated: TNeuralIntegerArray;
+  GenCount, GenCap: integer;   // Generated is grown with spare capacity
+  OneId: array[0..0] of integer;
+  Incremental: boolean;
   InV, Output, Row: TNNetVolume;
-  Len, GenLen, StepCnt, Cnt, NewToken: integer;
+  Len, StepCnt, Cnt, NewToken: integer;
   Reused, PromptLen: integer;  // KV-cache reuse bookkeeping (and --stats)
-  LenM1, LenM2, MarkerLen, EmLen, DecLen: integer;
+  LenM2, MarkerLen, EmLen, DecLen: integer;
   LastPos, RowBytes: integer;
-  Decoded, Emitted: string;
+  Decoded, Emitted, Piece: string;
   // --stats timing (monotonic ms). TStart: before prefill; TFirst: when the
   // first reply token is produced (so TTFT covers prefill + first step);
   // TEnd: after the decode loop. Produced counts emitted tokens.
@@ -1249,12 +1252,20 @@ begin
   else if GenOpt.TopP > 0 then Sampler := TNNetSamplerTopP.Create(GenOpt.TopP)
   else if GenOpt.MinP > 0 then Sampler := TNNetSamplerMinP.Create(GenOpt.MinP);
   SetLength(Tokens, SeqLen);
-  LenM1 := Len - 1;
   LenM2 := Len - 2;
   MarkerLen := Length(MarkerIds);
   if Len > 0 then Move(PromptIds[0], Tokens[0], Len * csIntegerSize);
   SetLength(Generated, 0);
+  GenCount := 0;
+  GenCap := 0;
   Emitted := '';
+  EmLen := 0;
+  // Streamed emission strategy, resolved once (#20/#27). When Decode is an
+  // exact left-to-right concatenation of the per-id pieces, each step needs
+  // to detokenize ONLY the new id; otherwise (WordPiece space-join, or a
+  // decoder that strips leading spaces at position 0) the whole generated
+  // region has to be re-decoded and diffed against what was already emitted.
+  Incremental := Tokenizer.DecodeIsConcatenative();
   InV := TNNetVolume.Create(1, 1, 1);
   Output := nil; // a reference into the net, returned by Session.Output()
   Row := TNNetVolume.Create(VocabSize, 1, 1);
@@ -1330,41 +1341,70 @@ begin
       Inc(Len);
       Inc(Produced);
       if Produced = 1 then TFirst := GetTickCount64(); // TTFT boundary
-      GenLen := Length(Generated);
-      SetLength(Generated, GenLen + 1);
-      Generated[GenLen] := NewToken;
+      // Grow by doubling: an exact regrow per token copies the whole reply
+      // again on every step.
+      if GenCount >= GenCap then
+      begin
+        if GenCap = 0 then GenCap := 32 else GenCap := GenCap * 2;
+        SetLength(Generated, GenCap);
+      end;
+      Generated[GenCount] := NewToken;
+      Inc(GenCount);
       // EOS / end-of-turn checks BEFORE emitting so markers never echo.
       if (Tokenizer.EosId >= 0) and (NewToken = Tokenizer.EosId) then
       begin
         LastFinishReason := 'stop';
         break;
       end;
-      if TailMatches(Generated, GenLen + 1, MarkerIds) then
+      if TailMatches(Generated, GenCount, MarkerIds) then
       begin
-        SetLength(Generated, GenLen + 1 - MarkerLen);
+        Dec(GenCount, MarkerLen);
         LastFinishReason := 'stop';
         break;
       end;
-      // Streamed emission: decode the whole generated region and emit the
-      // delta (BPE merges/UTF-8 multibyte pieces can rewrite the tail, so
-      // only emit when the previous text is still a prefix).
-      Decoded := Tokenizer.Decode(Generated, {SkipSpecialTokens=}true);
-      DecLen := Length(Decoded);
-      EmLen := Length(Emitted);
-      if (DecLen > EmLen) and
-        (Copy(Decoded, 1, EmLen) = Emitted) then
+      if Incremental then
       begin
-        EmitToken(Copy(Decoded, EmLen + 1, DecLen - EmLen));
-        Emitted := Decoded;
+        // The new id's own piece IS the delta, so no re-decode and no prefix
+        // test: Decode over this tokenizer concatenates the per-id pieces, so
+        // the emitted text stays exactly Decode(Generated[0..GenCount-1]).
+        // The piece may be an incomplete UTF-8 sequence when a codepoint
+        // straddles two tokens - that is what the old whole-string diff
+        // emitted too, byte for byte.
+        OneId[0] := NewToken;
+        Piece := Tokenizer.Decode(OneId, {SkipSpecialTokens=}true);
+        if Piece <> '' then
+        begin
+          EmitToken(Piece);
+          Inc(EmLen, Length(Piece));
+        end;
+      end
+      else
+      begin
+        // Non-concatenative decoder: re-decode the whole generated region and
+        // emit the delta. The join/cleanup can rewrite the tail, so only emit
+        // while the previous text is still a prefix.
+        Decoded := Tokenizer.DecodeCount(Generated, GenCount,
+          {SkipSpecialTokens=}true);
+        DecLen := Length(Decoded);
+        if (DecLen > EmLen) and
+          ((EmLen = 0) or CompareMem(@Decoded[1], @Emitted[1], EmLen)) then
+        begin
+          EmitToken(Copy(Decoded, EmLen + 1, DecLen - EmLen));
+          Emitted := Decoded;
+          EmLen := DecLen;
+        end;
       end;
     end;
     LastCompletionTokens := Produced;
-    Result := Tokenizer.Decode(Generated, {SkipSpecialTokens=}true);
-    // Anything the prefix-guard held back (or trimmed markers shortened).
-    if (Length(Result) > Length(Emitted)) and
-      (Copy(Result, 1, Length(Emitted)) = Emitted) then
-      EmitToken(Copy(Result, Length(Emitted) + 1,
-        Length(Result) - Length(Emitted)));
+    Result := Tokenizer.DecodeCount(Generated, GenCount,
+      {SkipSpecialTokens=}true);
+    // Anything the prefix-guard held back (or trimmed markers shortened). On
+    // the incremental path the emitted text is by construction the decode of
+    // a PREFIX of Generated, so a longer Result always extends it.
+    DecLen := Length(Result);
+    if (DecLen > EmLen) and
+      (Incremental or (EmLen = 0) or CompareMem(@Result[1], @Emitted[1], EmLen))
+      then EmitToken(Copy(Result, EmLen + 1, DecLen - EmLen));
     if Assigned(OnReplyDone) then OnReplyDone();
     // Record the sequence now resident in the cache for the next call's
     // prefix diff: every token that was FED is cached (positions 0..Len-2);
