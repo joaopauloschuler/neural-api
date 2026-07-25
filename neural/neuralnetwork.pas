@@ -20893,7 +20893,7 @@ procedure RebuildNeuronListOnPreviousPatterns
   Threshold: TNeuralFloat = 0.5
 );
 var
-  LpBnd1: integer;
+  MaxCurrentLayerNeuronPos: integer;
   NeuronCnt: integer;
 begin
   if CurrentLayer.Count <> CalculatedLayer.Count then
@@ -20905,8 +20905,8 @@ begin
     exit;
   end;
 
-  LpBnd1 := CurrentLayer.Count - 1;
-  for NeuronCnt := 0 to LpBnd1 do
+  MaxCurrentLayerNeuronPos := CurrentLayer.Count - 1;
+  for NeuronCnt := 0 to MaxCurrentLayerNeuronPos do
   begin
     RebuildPatternOnPreviousPatterns
     (
@@ -22105,8 +22105,8 @@ end;
 
 procedure TNNetMaxPoolWithPosition.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  LpBnd2: integer;
-  LpBnd3: integer;
+  MaxPrevOutputX: integer;
+  MaxPrevOutputY: integer;
   CntSizeX, CntSizeY: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -22118,13 +22118,13 @@ begin
     SetLength(FMaxPosY, FOutput.Size);
     SetLength(FPosX, FPrevLayer.Output.SizeX);
     SetLength(FPosY, FPrevLayer.Output.SizeY);
-    LpBnd2 := FPrevLayer.Output.SizeX - 1;
-    for CntSizeX := 0 to LpBnd2 do
+    MaxPrevOutputX := FPrevLayer.Output.SizeX - 1;
+    for CntSizeX := 0 to MaxPrevOutputX do
     begin
       FPosX[CntSizeX] := CntSizeX/FPrevLayer.Output.SizeX;
     end;
-    LpBnd3 := FPrevLayer.Output.SizeY - 1;
-    for CntSizeY := 0 to LpBnd3 do
+    MaxPrevOutputY := FPrevLayer.Output.SizeY - 1;
+    for CntSizeY := 0 to MaxPrevOutputY do
     begin
       FPosY[CntSizeY] := CntSizeY/FPrevLayer.Output.SizeY;
     end;
@@ -22822,7 +22822,7 @@ end;
 
 procedure TNNetSwishLearnable.Backpropagate();
 var
-  LpBnd4: integer;
+  MaxOutputErrorPos: integer;
   PropagatesErr: boolean;
   StartTime: double;
   localNeuron: TNNetNeuron;
@@ -22842,13 +22842,13 @@ begin
   // Fused with the input-gradient pass (#4): sig is computed once per element and
   // reused for both the gradBeta accumulation and (when PropagatesErr) PrevErr.
   gradBeta := 0;
-  LpBnd4 := FOutputError.Size - 1;
+  MaxOutputErrorPos := FOutputError.Size - 1;
   PropagatesErr := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
   PrevErr := nil;
   if PropagatesErr then
     PrevErr := FPrevLayer.FOutputError;  // #9: bind the invariant chain once
-  for i := 0 to LpBnd4 do
+  for i := 0 to MaxOutputErrorPos do
   begin
     x := LocalPrevOutput.Raw[i];
     betaX := beta * x;
@@ -22974,7 +22974,7 @@ end;
 
 procedure TNNetMishLearnable.Backpropagate();
 var
-  LpBnd6: integer;
+  MaxOutputErrorPos: integer;
   PropagatesErr: boolean;
   StartTime: double;
   localNeuron: TNNetNeuron;
@@ -22995,13 +22995,13 @@ begin
   // computed once per element and reused for both the gradAlpha accumulation and
   // (when PropagatesErr) the PrevErr write.
   gradAlpha := 0;
-  LpBnd6 := FOutputError.Size - 1;
+  MaxOutputErrorPos := FOutputError.Size - 1;
   PropagatesErr := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
   PrevErr := nil;
   if PropagatesErr then
     PrevErr := FPrevLayer.FOutputError;  // #9: bind the invariant chain once
-  for i := 0 to LpBnd6 do
+  for i := 0 to MaxOutputErrorPos do
   begin
     x := LocalPrevOutput.Raw[i];
     ax := alpha * x;
@@ -30049,7 +30049,7 @@ end;
 procedure TNNetFourierMix.ApplyRealDFT(Src, Dst: TNNetVolume);
 {$IFDEF Debug}
 var
-  LpBnd8: integer;
+  MaxDstPos: integer;
   RefVol: TNNetVolume;
   i: integer;
   MaxDiff, Diff: Double;
@@ -30064,8 +30064,8 @@ begin
     try
       ApplyRealDFTDirect(Src, RefVol);
       MaxDiff := 0;
-      LpBnd8 := Dst.Size - 1;
-      for i := 0 to LpBnd8 do
+      MaxDstPos := Dst.Size - 1;
+      for i := 0 to MaxDstPos do
       begin
         Diff := Abs(Dst.FData[i] - RefVol.FData[i]);
         if Diff > MaxDiff then MaxDiff := Diff;
@@ -38617,8 +38617,8 @@ end;
 
 procedure TNNetHyperConv.Compute();
 var
-  LpBnd9: integer;
-  LpBnd10: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   OutChM1, FeatSzM1, InChM1: integer;
   StartTime: double;
   X, Wgt: TNNetVolume;
@@ -38631,8 +38631,8 @@ begin
   Wgt := FWeightsLayer.FOutput;
   BiasBase := FOutChannels * FFeatureSize * FFeatureSize * FInChannels;
   FOutput.Fill(0);
-  LpBnd9 := FOutput.SizeY - 1;
-  LpBnd10 := FOutput.SizeX - 1;
+  MaxOutputY := FOutput.SizeY - 1;
+  MaxOutputX := FOutput.SizeX - 1;
   OutChM1 := FOutChannels - 1;
   FeatSzM1 := FFeatureSize - 1;
   InChM1 := FInChannels - 1;
@@ -38641,8 +38641,8 @@ begin
   for o := 0 to OutChM1 do
   begin
     oFS := o * FFeatureSize;                  // #11: invariant across oy/ox
-    for oy := 0 to LpBnd9 do
-      for ox := 0 to LpBnd10 do
+    for oy := 0 to MaxOutputY do
+      for ox := 0 to MaxOutputX do
       begin
         Acc := 0;
         for ky := 0 to FeatSzM1 do
@@ -38666,8 +38666,8 @@ end;
 
 procedure TNNetHyperConv.Backpropagate();
 var
-  LpBnd11: integer;
-  LpBnd12: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   OutChM1, FeatSzM1, InChM1: integer;
   StartTime: double;
   X, Wgt, XErr, WgtErr: TNNetVolume;
@@ -38688,14 +38688,14 @@ begin
   if PropMain or PropGen then
   begin
     StartTime := Now();
-    LpBnd11 := FOutput.SizeY - 1;
-    LpBnd12 := FOutput.SizeX - 1;
+    MaxOutputY := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
     OutChM1 := FOutChannels - 1;
     FeatSzM1 := FFeatureSize - 1;
     InChM1 := FInChannels - 1;
     for o := 0 to OutChM1 do
-      for oy := 0 to LpBnd11 do
-        for ox := 0 to LpBnd12 do
+      for oy := 0 to MaxOutputY do
+        for ox := 0 to MaxOutputX do
         begin
           Dy := FOutputError.Get(ox, oy, o);
           if Dy = 0 then continue;
@@ -38851,8 +38851,8 @@ end;
 
 procedure TNNetModulatedConv2D.Compute();
 var
-  LpBnd13: integer;
-  LpBnd14: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   OutChM1, FeatSzM1, InChM1, TapsM1: integer;
   StartTime: double;
   X, Style: TNNetVolume;
@@ -38901,16 +38901,16 @@ begin
   end;
   // ---- SAME-padding stride-1 convolution with the modulated kernel ----
   FOutput.Fill(0);
-  LpBnd13 := FOutput.SizeY - 1;
-  LpBnd14 := FOutput.SizeX - 1;
+  MaxOutputY := FOutput.SizeY - 1;
+  MaxOutputX := FOutput.SizeX - 1;
   BiasW := FNeurons[FOutChannels].FWeights;
   UseBias := FSuppressBias = 0;
   for o := 0 to OutChM1 do
   begin
     oBase := o * tapsPerOut;
     if UseBias then BiasO := BiasW.FData[o] else BiasO := 0;
-    for oy := 0 to LpBnd13 do
-      for ox := 0 to LpBnd14 do
+    for oy := 0 to MaxOutputY do
+      for ox := 0 to MaxOutputX do
       begin
         Acc := 0;
         for ky := 0 to FeatSzM1 do
@@ -38937,8 +38937,8 @@ end;
 
 procedure TNNetModulatedConv2D.Backpropagate();
 var
-  LpBnd15: integer;
-  LpBnd16: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   OutChM1, FeatSzM1, InChM1, TapsM1: integer;
   StartTime: double;
   X, Style, XErr, StyleErr: TNNetVolume;
@@ -38972,13 +38972,13 @@ begin
   if FGBias.Size <> FOutChannels then FGBias.ReSize(FOutChannels, 1, 1);
     FGModW.Fill(0); FGBias.Fill(0);
     // ---- conv backward: dL/dx and dL/dw'' ----
-    LpBnd15 := FOutput.SizeY - 1;
-    LpBnd16 := FOutput.SizeX - 1;
+    MaxOutputY := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
     for o := 0 to OutChM1 do
     begin
       oBase := o * tapsPerOut;
-      for oy := 0 to LpBnd15 do
-        for ox := 0 to LpBnd16 do
+      for oy := 0 to MaxOutputY do
+        for ox := 0 to MaxOutputX do
         begin
           Dy := FOutputError.Get(ox, oy, o);
           if FSuppressBias = 0 then FGBias.FData[o] := FGBias.FData[o] + Dy;
@@ -44505,8 +44505,8 @@ end;
 
 procedure TNNetSoftPlusBetaLearnable.Backpropagate();
 var
-  LpBnd17: integer;
-  LpBnd18: integer;
+  MaxOutputErrorPos: integer;
+  MaxPrevOutputErrorPos: integer;
   StartTime: double;
   localNeuron: TNNetNeuron;
   gradBeta, beta, invBeta, x, betaX, sig, y: TNeuralFloat;
@@ -44526,8 +44526,8 @@ begin
   // d(beta) = sum_i OutputError[i] * (1/beta) * (x_i*sigmoid(beta*x_i) - y_i),
   // where y_i = (1/beta)*ln(1+exp(beta*x_i)) is the layer output.
   gradBeta := 0;
-  LpBnd17 := FOutputError.Size - 1;
-  for i := 0 to LpBnd17 do
+  MaxOutputErrorPos := FOutputError.Size - 1;
+  for i := 0 to MaxOutputErrorPos do
   begin
     x := LocalPrevOutput.Raw[i];
     betaX := beta * x;
@@ -44559,8 +44559,8 @@ begin
   if Assigned(FPrevLayer) and (FPrevLayer.FOutputError.Size = FOutputError.Size) then
   begin
     // Gradient w.r.t. the input: dInput[i] = OutputError[i] * sigmoid(beta*x_i).
-    LpBnd18 := FOutputError.Size - 1;
-    for i := 0 to LpBnd18 do
+    MaxPrevOutputErrorPos := FOutputError.Size - 1;
+    for i := 0 to MaxPrevOutputErrorPos do
     begin
       x := LocalPrevOutput.Raw[i];
       betaX := beta * x;
