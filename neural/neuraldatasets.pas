@@ -3361,12 +3361,13 @@ procedure PreprocessImageForVisionModel(Src, Dst: TNNetVolume;
 var
   Work: TNNetVolume;
   ResizeW, ResizeH, OffX, OffY, X, Y, C, SrcX, SrcY: integer;
-  Scale, Fx, Fy, V: TNeuralFloat;
+  Scale, Fx, Fy: TNeuralFloat;
   ResizeWM1, ResizeHM1, CropM1, WorkBase, SrcBase, DstBase: integer;
   ScaleX, ScaleY: TNeuralFloat;
   SrcXMax, SrcYMax, DstStride, WorkStride: integer;
   WorkSizeXM1, WorkSizeYM1, WorkRowBase: integer;
   RowOutY: boolean;
+  ScaleC, BiasC: array[0..2] of TNeuralFloat;
 begin
   if (Src = nil) or (Dst = nil) then
     raise Exception.Create('PreprocessImageForVisionModel: nil volume.');
@@ -3440,6 +3441,13 @@ begin
     WorkStride := Work.GetRawPos(1, 0, 0);
     WorkSizeXM1 := Work.SizeX - 1;
     WorkSizeYM1 := Work.SizeY - 1;
+    // (v/255 - Mean[C]) / Std[C] folded into one multiply-add per pixel: the
+    // per-channel scale and bias are invariant over the whole crop (#5).
+    for C := 0 to 2 do
+    begin
+      ScaleC[C] := (1.0 / 255.0) / Std[C];
+      BiasC[C] := -Mean[C] / Std[C];
+    end;
     for Y := 0 to CropM1 do
     begin
       SrcY := OffY + Y;
@@ -3460,10 +3468,8 @@ begin
           // ---- (3) rescale by 1/255 then per-channel normalize.
           WorkBase := WorkRowBase + SrcX * WorkStride;
           for C := 0 to 2 do
-          begin
-            V := Work.FData[WorkBase + C] / 255.0;
-            Dst.FData[DstBase + C] := (V - Mean[C]) / Std[C];
-          end;
+            Dst.FData[DstBase + C] :=
+              Work.FData[WorkBase + C] * ScaleC[C] + BiasC[C];
         end;
         Inc(DstBase, DstStride);
       end;

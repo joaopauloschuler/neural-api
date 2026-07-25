@@ -101,7 +101,7 @@ end;
 procedure DequantizeNF4(const Codes: PByte; const Absmax: PSingle;
   NumElements: Int64; Dest: PSingle; BlockSize: Int64 = NF4_DEFAULT_BLOCKSIZE);
 var
-  i, NumElementsM1: Int64;
+  i, iEnd, Blk, NumElementsM1: Int64;
   PackedByte: byte;
   ScaleVal: single;
   SrcByte: PByte;
@@ -113,16 +113,32 @@ begin
   if BlockSize <= 0 then
     raise ENF4Error.Create('DequantizeNF4: BlockSize must be positive.');
   NumElementsM1 := NumElements - 1;
-  for i := 0 to NumElementsM1 do
+  // Block-outer: the absmax scale is block-invariant, so load it once per block
+  // instead of paying an Int64 hardware divide (i div BlockSize) per element.
+  i := 0;
+  Blk := 0;
+  while i <= NumElementsM1 do
   begin
-    // Two elements per byte; HIGH nibble is the even element.
+    ScaleVal := (Absmax + Blk)^;
+    iEnd := i + BlockSize - 1;
+    if iEnd > NumElementsM1 then iEnd := NumElementsM1;
+    // Re-derived per block, so an odd BlockSize (block starting on a LOW
+    // nibble) still addresses the right byte.
     SrcByte := Codes + (i shr 1);
-    PackedByte := SrcByte^;
-    ScaleVal := (Absmax + (i div BlockSize))^;
-    if (i and 1) = 0 then
-      Dest[i] := cNF4Code[(PackedByte shr 4) and $0F] * ScaleVal
-    else
-      Dest[i] := cNF4Code[PackedByte and $0F] * ScaleVal;
+    while i <= iEnd do
+    begin
+      // Two elements per byte; HIGH nibble is the even element.
+      PackedByte := SrcByte^;
+      if (i and 1) = 0 then
+        Dest[i] := cNF4Code[PackedByte shr 4] * ScaleVal
+      else
+      begin
+        Dest[i] := cNF4Code[PackedByte and $0F] * ScaleVal;
+        Inc(SrcByte);
+      end;
+      Inc(i);
+    end;
+    Inc(Blk);
   end;
 end;
 

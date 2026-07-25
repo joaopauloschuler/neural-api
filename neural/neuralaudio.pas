@@ -600,19 +600,17 @@ begin
     Window[TapCnt] := 0.5 - 0.5 * Cos(2.0 * Pi * TapCnt / csWhisperNFFT);
 
   // ---- DFT twiddle tables (400 is not a power of two - direct rDFT) ----
-  SetLength(CosTab, NumBins * csWhisperNFFT);
-  SetLength(SinTab, NumBins * csWhisperNFFT);
-  for BinCnt := 0 to NumBinsM1 do
+  // cos/sin(2*pi*k*t/NFFT) depends only on (k*t) mod NFFT, so ONE fundamental
+  // table of csWhisperNFFT entries replaces the (NumBins x NFFT) product table
+  // (1.3 MB streamed per frame -> a 400-entry table that stays in cache).
+  SetLength(CosTab, csWhisperNFFT);
+  SetLength(SinTab, csWhisperNFFT);
+  angStep := 2.0 * Pi / csWhisperNFFT;
+  for TapCnt := 0 to NFFTM1 do
   begin
-    rowBase := BinCnt * csWhisperNFFT;            // #11: bin-only row base
-    angStep := 2.0 * Pi * BinCnt / csWhisperNFFT; // #11: per-tap angle increment
-    for TapCnt := 0 to NFFTM1 do
-    begin
-      twIdx := rowBase + TapCnt;   // one index for both twiddle tables (#4)
-      ang := angStep * TapCnt;
-      CosTab[twIdx] := Cos(ang);
-      SinTab[twIdx] := Sin(ang);
-    end;
+    ang := angStep * TapCnt;
+    CosTab[TapCnt] := Cos(ang);
+    SinTab[TapCnt] := Sin(ang);
   end;
 
   // ---- slaney mel filter bank (triangles in Hz, slaney-normed) ----
@@ -687,13 +685,17 @@ begin
       begin
         ReAcc := 0.0;
         ImAcc := 0.0;
-        twBase := BinCnt * csWhisperNFFT;   // invariant across the tap loop
+        // twIdx carries (BinCnt*TapCnt) mod csWhisperNFFT (rule #6). The step is
+        // BinCnt <= NumBins-1 = 200 < csWhisperNFFT and twIdx < csWhisperNFFT
+        // before each step, so one conditional subtract reduces it.
+        twIdx := 0;
         for TapCnt := 0 to NFFTM1 do
         begin
           V := FrameBuf[TapCnt];
-          twIdx := twBase + TapCnt;   // one index for both twiddle tables (#4)
           ReAcc := ReAcc + V * CosTab[twIdx];
           ImAcc := ImAcc + V * SinTab[twIdx];
+          Inc(twIdx, BinCnt);
+          if twIdx >= csWhisperNFFT then Dec(twIdx, csWhisperNFFT);
         end;
         Power[BinCnt] := ReAcc * ReAcc + ImAcc * ImAcc;
       end;
@@ -1054,7 +1056,7 @@ var
   NumFrames, NumBins, OutLen: integer;
   NFFTM1, NumBinsM1, OutLenM1, NumFramesM1: integer;
   FrameCnt, BinCnt, TapCnt, OutIdx, FrameStart: integer;
-  frameBase, twPos, reIdx, rowBase, twIdx: integer;
+  frameBase, twPos, reIdx: integer;
   invNFFT, angStep, ang: double;
   Window: array of double;        // periodic hann (matches forward analysis)
   Win2: array of double;          // window^2 (COLA envelope contribution)
@@ -1098,19 +1100,18 @@ begin
   //        + 2*sum_{k=1..NumBins-1}( Re[k]*cos + Im[k]*sin )  [k=NFFT/2 halved]
   //        ). The Im sign matches the forward SinTab (stored Im = +sum x*sin),
   // so feeding a forward STFT computed with this file's tables back in inverts.
-  SetLength(CosTab, NumBins * NFFT);
-  SetLength(SinTab, NumBins * NFFT);
-  for BinCnt := 0 to NumBinsM1 do
+  // cos/sin(2*pi*k*t/NFFT) depends only on (k*t) mod NFFT, so ONE fundamental
+  // table of NFFT entries replaces the (NumBins x NFFT) product table: 8.4 MB
+  // walked with an NFFT-element stride becomes an NFFT-element table that stays
+  // in cache, and the setup cost drops from NumBins*NFFT to NFFT Cos/Sin calls.
+  SetLength(CosTab, NFFT);
+  SetLength(SinTab, NFFT);
+  angStep := 2.0 * Pi / NFFT;
+  for TapCnt := 0 to NFFTM1 do
   begin
-    rowBase := BinCnt * NFFT;            // #11: bin-only row base
-    angStep := 2.0 * Pi * BinCnt / NFFT; // #11: per-tap angle increment
-    for TapCnt := 0 to NFFTM1 do
-    begin
-      twIdx := rowBase + TapCnt;   // one index for both twiddle tables (#4)
-      ang := angStep * TapCnt;
-      CosTab[twIdx] := Cos(ang);
-      SinTab[twIdx] := Sin(ang);
-    end;
+    ang := angStep * TapCnt;
+    CosTab[TapCnt] := Cos(ang);
+    SinTab[TapCnt] := Sin(ang);
   end;
 
   // Per-bin self-conjugate weight is BinCnt-only (call-invariant); precompute it
@@ -1141,7 +1142,10 @@ begin
     begin
       // inverse real DFT of this frame at sample TapCnt
       Sample := 0.0;
-      twPos := TapCnt;                     // carries BinCnt*NFFT + TapCnt (rule #6)
+      // twPos carries (BinCnt*TapCnt) mod NFFT (rule #6). The step is TapCnt
+      // <= NFFT-1 and twPos < NFFT before each step, so twPos + TapCnt < 2*NFFT
+      // and a single conditional subtract performs the reduction.
+      twPos := 0;
       for BinCnt := 0 to NumBinsM1 do
       begin
         reIdx := frameBase + BinCnt;   // one index for Re and Im (#4)
@@ -1150,7 +1154,8 @@ begin
         // bins 0 and NFFT/2 are self-conjugate -> weight 1, the rest weight 2.
         Sample := Sample + BinScale[BinCnt] *
           (ReVal * CosTab[twPos] + ImVal * SinTab[twPos]);
-        Inc(twPos, NFFT);
+        Inc(twPos, TapCnt);
+        if twPos >= NFFT then Dec(twPos, NFFT);
       end;
       Sample := Sample * invNFFT;
       WinTap := Window[TapCnt];

@@ -203,6 +203,10 @@ type
     procedure TestMXFP4DequantHandBlock;
     procedure TestMXFP4DequantNaNScale;
     procedure TestNF4DequantHandBlock;
+    // The block-outer dequant loop must be BIT-EXACT against the plain
+    // per-element (i div BlockSize) reference, over even/odd block sizes and
+    // element counts that do not fill the last block.
+    procedure TestNF4DequantBlockOuterBitExact;
     procedure TestNF4DequantFixtureParity;
     procedure TestNF4ImporterLinearParity;
     procedure TestNF4ImporterRejectsDoubleQuant;
@@ -27719,6 +27723,59 @@ begin
   AssertEquals('NF4Code(0)', -1.0, NF4Code(0), 0);
   AssertEquals('NF4Code(7)', 0.0, NF4Code(7), 0);
   AssertEquals('NF4Code(15)', 1.0, NF4Code(15), 0);
+end;
+
+// Bit-exact parity of DequantizeNF4's block-outer loop against the naive
+// per-element reference (one Int64 divide per element to pick the block). Any
+// nibble-order or block-boundary slip shows up as an exact mismatch.
+procedure TTestNeuralPretrained.TestNF4DequantBlockOuterBitExact;
+const
+  cNF4Ref: array[0..15] of single = (
+    -1.0, -0.6961928009986877, -0.5250730514526367, -0.39491748809814453,
+    -0.28444138169288635, -0.18477343022823334, -0.09105003625154495, 0.0,
+    0.07958029955625534, 0.16093020141124725, 0.24611230194568634,
+    0.33791524171829224, 0.44070982933044434, 0.5626170039176941,
+    0.7229568362236023, 1.0);
+  cCases = 6;
+  cBlockSizes: array[0..cCases - 1] of integer = (64, 64, 1, 2, 3, 7);
+  cCounts: array[0..cCases - 1] of integer = (128, 100, 9, 9, 10, 23);
+var
+  PkBytes: array of byte;
+  Absmax: array of single;
+  Got, Want: array of single;
+  CaseCnt, i, n, bs, NumBlocks, ScaleIdx: integer;
+  PackedByte: byte;
+begin
+  RandSeed := 20260724;
+  for CaseCnt := 0 to cCases - 1 do
+  begin
+    n := cCounts[CaseCnt];
+    bs := cBlockSizes[CaseCnt];
+    SetLength(PkBytes, (n + 1) div 2);
+    for i := 0 to Length(PkBytes) - 1 do
+      PkBytes[i] := Random(256);
+    NumBlocks := (n + bs - 1) div bs;
+    SetLength(Absmax, NumBlocks);
+    for i := 0 to NumBlocks - 1 do
+      Absmax[i] := 0.25 + 0.5 * i;
+    SetLength(Got, n);
+    SetLength(Want, n);
+    // Reference: verbatim per-element form (HIGH nibble = even element).
+    for i := 0 to n - 1 do
+    begin
+      PackedByte := PkBytes[i shr 1];
+      ScaleIdx := i div bs;
+      if (i and 1) = 0 then
+        Want[i] := cNF4Ref[(PackedByte shr 4) and $0F] * Absmax[ScaleIdx]
+      else
+        Want[i] := cNF4Ref[PackedByte and $0F] * Absmax[ScaleIdx];
+    end;
+    DequantizeNF4(@PkBytes[0], @Absmax[0], n, @Got[0], bs);
+    for i := 0 to n - 1 do
+      AssertTrue('NF4 block-outer bit-exact: n=' + IntToStr(n) + ' bs=' +
+        IntToStr(bs) + ' elem ' + IntToStr(i) + ' got ' + FloatToStr(Got[i]) +
+        ' want ' + FloatToStr(Want[i]), Got[i] = Want[i]);
+  end;
 end;
 
 // NF4 dequant parity against the committed pico fixture (tests/fixtures/
