@@ -71932,13 +71932,13 @@ end;
 
 procedure TNNetLayerConcatedWeights.DequantizeWeightsInt8();
 var
-  LpBnd86: integer;
+  MaxDequantNeuronPos: integer;
   NeuronCnt: integer;
   W: TNNetVolume;
 begin
   if not FQuantInt8 then exit;
-  LpBnd86 := FNeurons.Count - 1;
-  for NeuronCnt := 0 to LpBnd86 do
+  MaxDequantNeuronPos := FNeurons.Count - 1;
+  for NeuronCnt := 0 to MaxDequantNeuronPos do
   begin
     W := FNeurons[NeuronCnt].Weights;
     W.ReSize(FQuantWSizeX, FQuantWSizeY, FQuantWSizeD);
@@ -72084,13 +72084,13 @@ end;
 
 procedure TNNetLayerConcatedWeights.RefreshNeuronWeightList();
 var
-  LpBnd87: integer;
+  MaxNeuronPos: integer;
   NeuronCnt: integer;
 begin
   FNeuronWeightList.Clear;
 
-  LpBnd87 := FNeurons.Count - 1;
-  for NeuronCnt := 0 to LpBnd87 do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for NeuronCnt := 0 to MaxNeuronPos do
   begin
     FNeuronWeightList.Add(FNeurons[NeuronCnt].Weights);
   end;
@@ -72377,7 +72377,7 @@ end;
 
 procedure TNNetSum.Compute();
 var
-  LpBnd88: integer;
+  MaxPrevOutputPos: integer;
   LayerCnt: integer;
   StartTime: double;
 begin
@@ -72385,8 +72385,8 @@ begin
   FOutput.Copy(FPrevOutput[0]);
   if FPrevOutput.Count > 1 then
   begin
-    LpBnd88 := FPrevOutput.Count - 1;
-    for LayerCnt := 1 to LpBnd88 do
+    MaxPrevOutputPos := FPrevOutput.Count - 1;
+    for LayerCnt := 1 to MaxPrevOutputPos do
     begin
       FOutput.Add(FPrevOutput[LayerCnt]);
     end;
@@ -72396,7 +72396,7 @@ end;
 
 procedure TNNetSum.Backpropagate();
 var
-  LpBnd89: integer;
+  MaxPrevOutputPos: integer;
   LayerCnt: integer;
   StartTime: double;
   MaxError: TNeuralFloat;
@@ -72409,8 +72409,8 @@ begin
   if MaxError > 0 then
   begin
     //FOutputError.Divi(FPrevOutput.Count);
-    LpBnd89 := FPrevOutput.Count - 1;
-    for LayerCnt := 0 to LpBnd89 do
+    MaxPrevOutputPos := FPrevOutput.Count - 1;
+    for LayerCnt := 0 to MaxPrevOutputPos do
     begin
       if FPrevOutputError[LayerCnt].Size = FOutput.Size then
       begin
@@ -72483,8 +72483,8 @@ end;
 
 procedure TNNetFiLM.Compute();
 var
-  LpBnd90: integer;
-  LpBnd91: integer;
+  MaxOutputX: integer;
+  MaxOutputY: integer;
   StartTime: double;
   Feature, Cond: TNNetVolume;
   X, Y: integer;
@@ -72497,10 +72497,10 @@ begin
   // gamma = Cond.FData[0..FDepth-1], beta = Cond.FData[FDepth..2*FDepth-1] (contiguous).
   GammaPtr := Cond.GetRawPtr(0, 0);
   BetaPtr  := Cond.GetRawPtr(0, 0, FDepth);
-  LpBnd90 := FOutput.SizeX - 1;
-  LpBnd91 := FOutput.SizeY - 1;
-  for X := 0 to LpBnd90 do
-    for Y := 0 to LpBnd91 do
+  MaxOutputX := FOutput.SizeX - 1;
+  MaxOutputY := FOutput.SizeY - 1;
+  for X := 0 to MaxOutputX do
+    for Y := 0 to MaxOutputY do
     begin
       OutPtr  := FOutput.GetRawPtr(X, Y);
       FeatPtr := Feature.GetRawPtr(X, Y);
@@ -72513,8 +72513,8 @@ end;
 
 procedure TNNetFiLM.Backpropagate();
 var
-  LpBnd92: integer;
-  LpBnd93: integer;
+  MaxOutputX: integer;
+  MaxOutputY: integer;
   StartTime: double;
   Feature, FeatureErr, Cond, CondErr: TNNetVolume;
   X, Y, C, FDepthM1, base, FeatStrideY: integer;
@@ -72538,8 +72538,8 @@ begin
     // GetRawPos(x,y,d) = ((SizeX*y)+x)*Depth + d, so stepping the inner Y loop
     // advances the flat offset by SizeX*Depth.
     FeatStrideY := Feature.SizeX * Feature.Depth;
-    LpBnd92 := FOutput.SizeX - 1;
-    LpBnd93 := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
+    MaxOutputY := FOutput.SizeY - 1;
     for C := 0 to FDepthM1 do
     begin
       Gamma     := Cond.FData[C];
@@ -72549,10 +72549,10 @@ begin
       // #12: the (X,Y) offset advances by FeatDepth down the Y axis - carry it.
       if HasFeatureGrad then
       begin
-        for X := 0 to LpBnd92 do
+        for X := 0 to MaxOutputX do
         begin
           base := Feature.GetRawPos(X, 0, C);
-          for Y := 0 to LpBnd93 do
+          for Y := 0 to MaxOutputY do
           begin
             dOut := FOutputError.FData[base];
             // dL/dinput0[x,y,c] = gamma[c] * dOut[x,y,c]
@@ -72566,10 +72566,10 @@ begin
       end
       else
       begin
-        for X := 0 to LpBnd92 do
+        for X := 0 to MaxOutputX do
         begin
           base := Feature.GetRawPos(X, 0, C);
-          for Y := 0 to LpBnd93 do
+          for Y := 0 to MaxOutputY do
           begin
             dOut := FOutputError.FData[base];
             GradGamma := GradGamma + Feature.FData[base] * dOut;
@@ -74165,7 +74165,7 @@ end;
 function TNNet.AddLoRAAdapter(FrozenLayer: TNNetLayer; Rank: integer;
   Alpha: TNeuralFloat): TNNetLayer;
 var
-  LpBnd96: integer;
+  MaxUpNeuronPos: integer;
   InputLayer, Down, Up, Scaled: TNNetLayer;
   d_out, n: integer;
 begin
@@ -74188,8 +74188,8 @@ begin
   // Zero-init B (weights AND bias) so the bypass is the exact zero map at step 0
   // and the wrapped forward equals the frozen base bit-for-bit. B trains away
   // from zero during fine-tuning; A keeps its default random init.
-  LpBnd96 := Up.Neurons.Count - 1;
-  for n := 0 to LpBnd96 do
+  MaxUpNeuronPos := Up.Neurons.Count - 1;
+  for n := 0 to MaxUpNeuronPos do
     Up.Neurons[n].Fill(0);
   Up.ClearBias();
   Up.AfterWeightUpdate(); // refresh concatenated-weight caches after manual zero
@@ -81682,8 +81682,8 @@ end;
 // start near zero so every expert begins with alpha ~ 0.5 (balanced blend).
 procedure TNNetCondConv.InitDefault();
 var
-  LpBnd97: integer;
-  LpBnd98: integer;
+  MaxExpertWeightPos: integer;
+  MaxRouterWeightPos: integer;
   iK, i, MaxNExp: integer;
   W: TNNetVolume;
   Range: TNeuralFloat;
@@ -81695,13 +81695,13 @@ begin
   for iK := 0 to MaxNExp do
   begin
     W := FArrNeurons[iK].FWeights;
-    LpBnd97 := W.Size - 1;
-    for i := 0 to LpBnd97 do
+    MaxExpertWeightPos := W.Size - 1;
+    for i := 0 to MaxExpertWeightPos do
       W.FData[i] := Range * (Random - 0.5) * 2;
   end;
   W := FArrNeurons[FNumExperts].FWeights;
-  LpBnd98 := W.Size - 1;
-  for i := 0 to LpBnd98 do
+  MaxRouterWeightPos := W.Size - 1;
+  for i := 0 to MaxRouterWeightPos do
     W.FData[i] := 0.05 * (Random - 0.5) * 2;
   FArrNeurons[FNumExperts + 1].FWeights.Fill(0);
 end;
@@ -82083,7 +82083,7 @@ end;
 // is ZERO-initialised so the layer starts identical to a plain convolution.
 procedure TNNetDeformableConv.InitDefault();
 var
-  LpBnd99: integer;
+  MaxWeightPos: integer;
   i: integer;
   W: TNNetVolume;
   Range: TNeuralFloat;
@@ -82092,8 +82092,8 @@ begin
   Range := Sqrt(2.0 / (FFeatureSizeX * FFeatureSizeY * FInDepth));
   if Range > 0.25 then Range := 0.25;  // bound for clean gradient checks
   W := FArrNeurons[0].FWeights;
-  LpBnd99 := W.Size - 1;
-  for i := 0 to LpBnd99 do
+  MaxWeightPos := W.Size - 1;
+  for i := 0 to MaxWeightPos do
     W.FData[i] := Range * (Random - 0.5) * 2;
   FArrNeurons[1].FWeights.Fill(0);  // bias starts at 0
   FArrNeurons[2].FWeights.Fill(0);  // offset-head weights: ZERO init
@@ -82818,7 +82818,7 @@ end;
 // finite-difference weight-gradient test does not suffer truncation noise).
 procedure TNNetGroupConvP4.InitDefault();
 var
-  LpBnd100: integer;
+  MaxWeightPos: integer;
   co, i, MaxFeat: integer;
   W: TNNetVolume;
   Range: TNeuralFloat;
@@ -82830,8 +82830,8 @@ begin
   for co := 0 to MaxFeat do
   begin
     W := FArrNeurons[co].FWeights;
-    LpBnd100 := W.Size - 1;
-    for i := 0 to LpBnd100 do
+    MaxWeightPos := W.Size - 1;
+    for i := 0 to MaxWeightPos do
       W.FData[i] := Range * (Random - 0.5) * 2;
   end;
 end;
