@@ -37,6 +37,53 @@ it matters. Recommendations are added incrementally as we discover them.
 > of a persistent field** guarded by a size check, so it allocates ~once over
 > the lifetime of the layer, not once per call. See rule #17.
 
+## Menu
+
+Rules are numbered in the order they were discovered, not by importance. The
+**Payoff** column is the reading order that matters: a tier-1 rule removes work
+outright, a tier-3 rule shaves cycles off work you are still doing. When sweeping
+with limited attention, start at the top tier.
+
+**Judgment** says whether a rule can be applied by pattern-matching or needs a
+correctness argument written into the commit. Pattern rules are safe to sweep
+mechanically; argument rules are where sweeps introduce bugs.
+
+| # | Rule | Payoff | Judgment |
+| --- | --- | --- | --- |
+| ⛔ | [**HARD PROHIBITION** — never allocate on a compute path](#-hard-prohibition--read-before-applying-any-optimization) | — | **read first** |
+| [14](#14-rank-on-the-cheapest-order-equivalent-quantity--skip-transforms-used-only-to-compare) | Rank on the cheapest order-equivalent quantity — skip transforms used only to compare | **1 — fewer ops** | argument |
+| [22](#22-select-dont-sort--partial-selection-when-you-need-top-k-a-threshold-or-a-median) | Select, don't sort — quickselect for top-k / threshold / median | **1 — fewer ops** | argument |
+| [13](#13-promote-a-degenerate-elementwise-inner-loop-to-a-tnnetvolume-bulk-method) | Promote a degenerate elementwise loop to a `TNNetVolume` bulk method | 2 — scalar → SIMD | pattern |
+| [19](#19-promote-a-scalar-transcendental-loop-to-the-vector-kernels) | Promote a scalar transcendental loop to the `Vector*` kernels | 2 — scalar → SIMD | pattern + numerics |
+| [18](#18-tnnetvolume-methods-are-faster-than-pure-pascal-equivalents) | `TNNetVolume` methods beat hand-written Pascal equivalents | 2 — scalar → SIMD | pattern |
+| [23](#23-non-float-hot-paths-count-too--preallocate-string-buffers-instead-of-repeated-concatenation) | Non-float paths: preallocate string buffers, don't concatenate | 2 — O(n²) → O(n) | pattern |
+| [20](#20-unswitch-a-loop-invariant-condition--hoist-the-test-or-split-the-loop) | Unswitch a loop-invariant condition — hoist the test or split the loop | 2 — also unlocks #13/#19 | pattern |
+| [21](#21-replace-a-loop-invariant-divide-with-one-reciprocal-and-n-multiplies--except-where-a-gradient-check-watches) | One reciprocal + N multiplies instead of N divides — ⚠ **not** where a gradient check watches | 3 — cheaper op | **argument** |
+| [11](#11-hoist-to-the-innermost-loop-level-at-which-a-value-is-still-invariant) | Hoist to the innermost level at which a value is still invariant | 3 — multiplies through nesting | pattern |
+| [12](#12-strength-reduce-a-per-iteration-getrawptrloopvar--into-a-carried-offset) | Strength-reduce a per-iteration `GetRawPtr(loopvar, …)` into a carried offset | 3 — multiply → add | pattern |
+| [5](#5-hoist-loop-invariant-computations-out-of-the-loop-entirely) | Hoist loop-invariant computations out of the loop entirely | 3 — N× → 1× | pattern |
+| [4](#4-hoist-repeated-subexpressions-inside-a-loop-body) | Hoist a subexpression repeated within one iteration | 3 — fewer repeats | pattern |
+| [6](#6-replace-loop-multiplication-with-a-running-sum-strength-reduction) | Replace `loopvar * const` with a running sum (strength reduction) | 3 — multiply → add | pattern |
+| [8](#8-hoist-invariant-method-and-property-results-not-just-arithmetic) | Hoist invariant *method* and *property* results, not just arithmetic | 3 — removes a call | pattern |
+| [9](#9-bind-the-whole-invariant-access-chain-above-the-outermost-loop--worked-example) | Bind the whole invariant access *chain* above the outermost loop | 3 — removes a call | pattern |
+| [3](#3-access-volume-elements-directly-via-fdata-in-hot-loops) | Direct `FData[]` in hot loops — **only when the offset is reused** | 3 — skips the accessor | pattern + test |
+| [7](#7-bind-a-repeatedly-accessed-list-element-to-a-local) | Bind a repeatedly-accessed list element to a local | 3 — skips `GetItem` | pattern |
+| [10](#10-in-hot-paths-index-farrneurons-the-array-mirror-not-fneurons-the-list) | Index `FArrNeurons` (array mirror), not `FNeurons` (list), in hot paths | 3 — skips `GetItem` | pattern |
+| [15](#15-strength-reduce-div-by-a-compile-time-power-of-two-to-shlshr) | `*`/`div` by a compile-time power of two → `shl`/`shr` | 3 — cheaper op | pattern |
+| [16](#16-use-neuralexp-the-fast-trap-free-exp-not-the-rtl-exp-in-model-math) | Use `NeuralExp`, not the RTL `Exp`, in model math | 3 — cheaper + trap-free | pattern |
+| [2](#2-never-place-expressions-in-a-for-bound-hoist-them-into-a-variable) | Never put an expression in a `for` bound | 3 — style + hidden calls | pattern |
+| [17](#17-never-setlengthallocate-per-call-in-computebackpropagate-or-in-neuralvolumepas) | **NEVER** `SetLength`/allocate per call in `Compute`/`Backpropagate` | — prohibition | **hard rule** |
+| [1](#1-prefer-named-size-constants-over-sizeoftype) | Prefer named size constants over `SizeOf(type)` | — consistency | pattern |
+
+**Appendices**
+
+- [The patterns agents miss most](#appendix-the-patterns-agents-miss-most--extra-worked-examples) — extra worked examples: **A** repeated `(t*Stride)+d` (most-missed) · **B** consecutive fixed depth slots · **C** contiguous copies are `Move`/bulk ops · **D** elementwise math as an op sequence · **E** loop reorder for contiguity · **F** initializers are not exempt.
+- [Known non-targets — do NOT optimize these](#appendix-known-non-targets--do-not-optimize-these) — `pascoremath*` is off limits; clone, never patch.
+
+**Two rules that most often fire together:** #5 exposes an invariant, then #13/#19
+vectorize what is left. **Two that most often conflict:** #13/#21 want a bulk
+reciprocal-multiply; #21's exception and #17 say when you may not have it.
+
 ## 1. Prefer named size constants over `SizeOf(type)`
 
 Replace repeated `SizeOf(<type>)` expressions with a predefined named size
@@ -1419,6 +1466,385 @@ The below `TNNetVolume` methods are faster than equivalent pure Pascal implement
       function SumDiff(Original: TNNetVolume): TNeuralFloat; overload; {$IFDEF Release} inline; {$ENDIF}
 ```
 
+## 19. Promote a scalar transcendental loop to the `Vector*` kernels
+
+Rule #13 promotes a degenerate elementwise loop to a `TNNetVolume` bulk method, but
+its table lists only the arithmetic primitives (`Move`, `Add`, `Mul`, `MulAdd`,
+`DotProduct`). The same promotion applies to the **transcendentals**. Rule #16 tells
+you to call `NeuralExp` instead of the RTL `Exp` — that is the right answer for *one*
+value, but when a whole contiguous run needs the same function, the scalar loop is
+the wrong shape entirely. `neuralvolume.pas` exports a vectorized kernel for each:
+
+| Scalar inner loop | Call |
+| --- | --- |
+| `dst[i] := NeuralExp(src[i])` | `TNNetVolume.VectorExp(dstPtr, srcPtr, N)` |
+| `dst[i] := 1/(1 + NeuralExp(-src[i]))` | `TNNetVolume.VectorSigmoid(dstPtr, srcPtr, N)` |
+| `dst[i] := pcr_tanhf(src[i])` | `TNNetVolume.VectorTanh(dstPtr, srcPtr, N)` |
+| `dst[i] := Max(src[i], 0)` | `TNNetVolume.VectorRelu(dstPtr, srcPtr, N)` |
+| `dst[i] := pcr_erff(src[i])` | `TNNetVolume.VectorErf(dstPtr, srcPtr, N)` |
+| `dst[i] := pcr_sinhf(src[i])` | `TNNetVolume.VectorSinh(dstPtr, srcPtr, N)` |
+| `dst[i] := pcr_logf(src[i])` | `TNNetVolume.VectorLn(dstPtr, srcPtr, N)` |
+| `dst[i] := pcr_sinf/pcr_cosf(src[i])` | `TNNetVolume.VectorSin/VectorCos(dstPtr, srcPtr, N)` |
+| `dst[i] := arcsinh(src[i])` | `TNNetVolume.VectorArcSinh(dstPtr, srcPtr, N)` |
+
+On an AVX2 build these run an 8-wide polynomial (`AVXExp`, `AVXLn`, `AVXSinCos`,
+`AVXCopyRelu`) with a scalar remainder; on a non-AVX build they degrade to exactly
+the scalar loop you replaced, so the promotion is never a regression. **All of them
+allow `dst` to alias `src`**, so an in-place `VectorExp(p, p, N)` is legal — the
+kernels are documented to read before they write, and the ones that need a temp
+(`VectorSinh`, `VectorArcSinh`) use their own internal scratch rather than `pDst`.
+
+**Anti-example — do NOT hand-roll the map:**
+
+```pascal
+for i := 0 to NM1 do
+  FOutput.FData[base + i] := NeuralExp(FPrevLayer.FOutput.FData[base + i]);
+```
+
+**Do this:**
+
+```pascal
+TNNetVolume.VectorExp(FOutput.GetRawPtr(base), FPrevLayer.FOutput.GetRawPtr(base), N);
+```
+
+**The precondition is #13's, sharpened: the run must be uniform and
+branch-free.** Every element must take the *same* function with no per-element
+`if`, no early exit, and no data-dependent coefficient. A run guarded per element
+is not promotable as written.
+
+**Worked anti-case — the boundary.** `TNNetTanhExp.Compute` (`neuralnetwork.pas`
+~23320) is a `tanh(exp(x))` map, which *looks* like a two-kernel promotion, but it
+carries per-element saturation guards:
+
+```pascal
+for OutputCnt := 0 to SizeM1 do
+begin
+  x := LocalPrevOutput.FData[OutputCnt];
+  if x > 20 then
+    FOutput.FData[OutputCnt] := x
+  else if x < -20 then
+    FOutput.FData[OutputCnt] := 0
+  else
+    FOutput.FData[OutputCnt] := x * pcr_tanhf(NeuralExp(x));   // the promotable part
+end;
+```
+
+The `x > 20` / `x < -20` tests depend on the *data*, not on the loop variable, so
+they are **not** rule #20 unswitching candidates either — they cannot be hoisted or
+split away. As written, this loop stays scalar.
+
+**But ask the follow-on question before you walk away.** The guards exist to keep
+`exp` in range; if `VectorExp` already saturates safely at both ends, the branch is
+buying nothing and the whole body collapses to two kernel calls over a scratch run.
+That is a *numerics* question, not a mechanical one: check what the kernel returns
+at the extremes, confirm the limits agree (`x·tanh(exp(x)) → x` as `x → +∞`,
+`→ 0` as `x → −∞`), and only then remove the guard — with the argument written down
+in a comment. Where the answer is "the guard is load-bearing," leave the loop scalar
+and note it.
+
+**Reach for the vector form when the run is long.** For a handful of elements the
+call overhead and the pointer setup dominate; the win scales with `N`. A whole
+activation map, a full logits row, a `FDk`-length gate — yes. Three channels — no.
+
+## 20. Unswitch a loop-invariant condition — hoist the test, or split the loop
+
+Rules #5/#8/#11 hoist invariant *values*. A **condition** is a value too. When an
+`if` inside a loop tests something that contains none of the loop's induction
+variables — a layer flag, an `Assigned()` on a field, a mode enum — the branch
+resolves the same way on every single iteration, yet it is re-tested `N` times and
+blocks the compiler from straight-lining (or vectorizing) either body.
+
+Two fixes, in increasing order of payoff:
+
+1. **Hoist the test to a boolean local** above the loop and branch on the local.
+   This removes the field load / method call / pointer chase, keeping one cheap
+   predictable branch per iteration.
+2. **Unswitch — split the loop in two**, one per branch, with the `if` outside.
+   This removes the branch from the body entirely and leaves two uniform loops,
+   which is often what makes each half a #13 or #19 promotion candidate.
+
+**Anti-example — do NOT follow this.** The KV-cache eviction shift used throughout
+rules #4/#5/#6 tests `FKVQuantInt8` on **every** iteration, though it is a layer
+field that cannot change during the loop:
+
+```pascal
+for j := FEvictSinks to CacheLenM2 do
+begin
+  if FKVQuantInt8 then          // loop-invariant — re-tested CacheLen times
+  begin
+    Move(FKCacheCodes[jP1Dk], FKCacheCodes[jDk], RowBytesI8);
+    ...
+  end
+  else
+  begin
+    Move(FKCache.FData[jP1Dk], FKCache.FData[jDk], RowBytesFP);
+    ...
+  end;
+  jDk := jP1Dk;
+end;
+```
+
+**Do this — unswitch; each half is now branch-free:**
+
+```pascal
+if FKVQuantInt8 then
+begin
+  jDk := FEvictSinks * FDk;
+  for j := FEvictSinks to CacheLenM2 do
+  begin
+    jP1   := j + 1;                  // #4: the scale arrays index by slot, not by offset
+    jP1Dk := jDk + FDk;
+    Move(FKCacheCodes[jP1Dk], FKCacheCodes[jDk], RowBytesI8);
+    Move(FVCacheCodes[jP1Dk], FVCacheCodes[jDk], RowBytesI8);
+    FKCacheScale[j] := FKCacheScale[jP1];
+    FVCacheScale[j] := FVCacheScale[jP1];
+    jDk := jP1Dk;
+  end;
+end
+else
+begin
+  jDk := FEvictSinks * FDk;
+  for j := FEvictSinks to CacheLenM2 do
+  begin
+    jP1Dk := jDk + FDk;
+    Move(FKCache.FData[jP1Dk], FKCache.FData[jDk], RowBytesFP);
+    Move(FVCache.FData[jP1Dk], FVCache.FData[jDk], RowBytesFP);
+    jDk := jP1Dk;
+  end;
+end;
+```
+
+**`Assigned()` / `<> nil` in a hot loop is the same pattern.** A nil test on a
+field, a previous layer, or an error volume is loop-invariant almost every time it
+appears inside a compute loop. Hoist it to a layer-level flag (set once in
+`SetPrevLayer`) or to a loop-invariant boolean local — never re-test the pointer
+per element:
+
+```pascal
+// anti — a pointer chase and a test per element:
+for i := 0 to NM1 do
+  if Assigned(FPrevLayer.FOutputError) then ...
+
+// do — resolve once, outside:
+HasPrevErr := Assigned(FPrevLayer.FOutputError);
+if HasPrevErr then
+  for i := 0 to NM1 do ...
+```
+
+**Why it matters**
+
+- **Removes a test from every iteration**, and with it the load of whatever the
+  test reads (a field, an object reference, an indirection through `FPrevLayer`).
+- **Uncovers other rules** — a body that was "an `if` and two half-loops" becomes
+  two uniform runs, which is precisely the shape #13 and #19 promote. This is the
+  usual reason unswitching pays more than the branch itself costs.
+- **Helps the branch predictor and the compiler** — a straight-line body can be
+  software-pipelined and vectorized; a body with a branch in it often cannot.
+
+**Caveats.**
+
+- **The condition must be genuinely invariant.** If any operand can be written by
+  the loop body — or by anything the body calls — it is not invariant, and
+  unswitching changes behaviour. A *data*-dependent test (`if x > 20`, per element,
+  as in #19's anti-case) is never an unswitching candidate.
+- **Duplicated bodies must stay in sync.** Splitting means two copies of the loop;
+  a later edit to one half silently diverges from the other. Split when the halves
+  are genuinely different work (the int8 vs FP32 case above); prefer the cheaper
+  hoist-to-a-boolean when the bodies would be near-identical.
+- **Carried offsets must be seeded in *both* halves.** This is #6's caveat seen
+  from the other side: #6 says "advance the accumulator outside the branch," which
+  is the right rule while the branch is *inside* the loop. Once you unswitch, each
+  loop needs its own seed and its own unconditional advance. Getting one half's
+  seed wrong is the classic unswitching bug.
+
+## 21. Replace a loop-invariant divide with one reciprocal and N multiplies — except where a gradient check watches
+
+When every iteration divides by the *same* value, compute `1/divisor` once and
+multiply. A float divide is several times the latency of a multiply and does not
+pipeline as well; `N` divides become one divide plus `N` multiplies.
+
+**Anti-example — a normalize loop dividing by an invariant accumulator:**
+
+```pascal
+SumExp := 0;
+for J := 0 to KM1 do SumExp := SumExp + FProbsBuf[J];
+for J := 0 to KM1 do
+  FProbsBuf[J] := FProbsBuf[J] / SumExp;    // K divides by one fixed value
+```
+
+**Do this — one reciprocal, then a scale (which is also a #13 promotion):**
+
+```pascal
+InvSum := 1.0 / SumExp;                     // one divide, outside the loop
+for J := 0 to KM1 do
+  FProbsBuf[J] := FProbsBuf[J] * InvSum;
+// better still, if FProbsBuf is a contiguous run: TNNetVolume.Mul(ptr, InvSum, K)
+```
+
+The same shape recurs as `x / FScale`, `v / Total`, `e / Norm` — any divisor that is
+a field or an already-accumulated total. Note that `1/x` followed by `*` is **not**
+bit-identical to `/`: the reciprocal rounds once more, so results can differ by
+~1 ULP. Per the no-bit-parity policy that is normally acceptable — but see the
+exception, which is where this rule earns its length.
+
+**⚠ Exception — keep the exact divide on softmax/normalization that feeds a
+gradient-checked stack.** This is not hypothetical; it was measured. Converting a
+softmax `A[i] := A[i] / SumExp` to `TNNetVolume.Mul(ptr, 1/SumExp, N)` broke
+`TestSABInputGradientCheck` (num 0.863 vs ana 0.848, tolerance 0.01) — while the
+standalone ISAB and MultiHead-ISAB gradient checks still passed at ~0.0017. The
+~1 ULP reciprocal-vs-divide perturbation is harmless in isolation and gets
+**amplified through a deep stack** (multi-head ISAB + residual + two LayerNorms +
+FFN) until finite-difference verification fails. Known sites to leave alone:
+`TNNetInducedSetAttention.Compute` (`FA1`/`FA2`) and
+`TNNetAttentionPooling.Compute` (`FA`) in `neuralnetwork.pas`.
+
+**So: reserve reciprocal-multiply for hot paths no gradient check verifies** —
+inference/decode helpers, samplers, metrics, quantizer application, forward-only
+layers. On the softmax of an attention layer that participates in a
+gradient-checked stack, keep the divide and say why in a comment. Bit-parity is not
+required in this codebase (see the no-bit-parity policy); **a passing gradient
+check is.** If you are unsure whether a site is covered, run the numerical suite
+before and after — that is the whole test.
+
+**Caveats.**
+
+- **The divisor must be loop-invariant and non-zero.** Where the code already
+  clamps (`if SumExp < 1e-30 then SumExp := 1e-30`), keep the clamp — the
+  reciprocal of a denormal is an overflow.
+- **A per-iteration divisor is not a candidate.** `a[i] / b[i]` stays a divide.
+
+## 22. Select, don't sort — partial selection when you need top-k, a threshold, or a median
+
+This is #14's sibling and belongs in the same tier: it reduces the **operation
+count**, not the cost per operation. Sorting is `O(N log N)` and produces a total
+order; almost no consumer needs a total order. If you need the top `k`, or the
+elements above a threshold, or a median, use **quickselect / a partial heap** —
+`O(N)` expected for a fixed `k`, and it touches a fraction of the array.
+
+The archetype is token sampling at a real vocabulary size. The samplers used to
+quicksort all 151,936 tokens per decode step to consume the ~5 that top-p actually
+needs. Replacing the full sort with a median-of-3 Hoare quickselect
+(`PartialSelectTokenArray` / `TNNetSamplerBase.SelectTopCandidates`, both in
+`neuralvolume.pas`) took sampler overhead from **13.9 ms to ~1.15 ms per token** —
+a larger win than the whole #1–#13 family produces at a single site.
+
+**Anti-example — a full sort to consume a handful of elements:**
+
+```pascal
+SortTokenArray();                    // O(N log N) over the entire vocabulary
+Cum := 0;
+for i := 0 to FCountM1 do            // ... to read the first few entries
+begin
+  Cum := Cum + FTokenArr[i].Prob;
+  if Cum > FTopP then break;
+end;
+```
+
+**Do this — select the candidate window first, then work inside it:**
+
+```pascal
+SelectTopCandidates(K);              // O(N) partition; only the top K are ordered
+```
+
+**The shapes worth recognising**
+
+- **top-k** — select `k`, sort only those `k` if an order is actually needed.
+- **top-p / nucleus** — no fixed `k`: select an adaptive prefix (the codebase uses
+  llama.cpp's 256-then-retry), and only fall back to a full sort if the prefix is
+  genuinely insufficient.
+- **min-p / any threshold** — you do not need an order at all; two linear passes
+  count and then collect the survivors.
+- **median / percentile** — quickselect at the rank; never sort.
+- **argmax / argmin** — a single linear pass (and see #14: rank on the cheapest
+  order-equivalent quantity, so no `exp`/divide in the scan).
+
+**When the full sort is correct.** Some consumers really do need the whole ordered
+row — Typical sampling and Mirostat both walk the entire distribution — and there
+the sort stays. Do not force a selection where the algorithm is genuinely global.
+
+**Caveats.**
+
+- **Benchmark at realistic sizes.** Every pre-existing sampler test used a
+  <100-token vocabulary, below the adaptive threshold, so none of them exercised
+  the path that mattered. A microbenchmark at toy `N` will tell you this rule is
+  worthless.
+- **Build flags matter more than the code here.** These measurements were once
+  distorted ~17x by benchmarking against stale non-AVX `.ppu` files left in
+  `neural/` by an earlier `fpc` test build. Force a rebuild (`fpc -B`, or
+  `lazbuild -B`, or a private `-FU` directory) before trusting any number.
+- **Quickselect reorders the array.** It is a partition, not a sort: elements
+  outside the selected window end up in unspecified positions. Callers that later
+  assume the original order must not share the buffer.
+
+## 23. Non-float hot paths count too — preallocate string buffers instead of repeated concatenation
+
+Rules #1–#22 are about float loops, but per-token cost is not only
+`neuralnetwork.pas`. Tokenization and detokenization (`neuralhftokenizer.pas`,
+`neuraltokenizer.pas`) and the decode helpers (`neuraldecode.pas`) run on the same
+per-token budget, and their dominant cost is **string building**.
+
+`Result := Result + piece` in a loop is **quadratic**: each concatenation
+reallocates and copies the entire accumulated string. In this codebase it is worse
+than the usual textbook case — `{$CODEPAGE UTF8}` (pulled in via
+`neuralnetwork.inc`) defeats FPC's in-place append optimization, so *every* append
+copies. The unit already documents the consequence at `neuralhftokenizer.pas:1079`:
+a 466 KB BERT `tokenizer.json` took **minutes instead of milliseconds**.
+
+**Anti-example — do NOT accumulate by concatenation:**
+
+```pascal
+Result := '';
+for Cnt := 0 to NM1 do
+  Result := Result + CodePointToUTF8(FByteToCP[Ord(Fragment[Cnt])]);   // O(n^2)
+```
+
+**Do this — one allocation, a carried write index, one final truncate:**
+
+```pascal
+SetLength(Result, UpperBound);        // one allocation; a safe over-estimate
+OutPos := 0;
+for Cnt := 0 to NM1 do
+begin
+  Enc := CodePointToUTF8(FByteToCP[Ord(Fragment[Cnt])]);
+  for ByteCnt := 1 to Length(Enc) do
+  begin
+    Inc(OutPos);
+    Result[OutPos] := Enc[ByteCnt];
+  end;
+end;
+SetLength(Result, OutPos);            // truncate to what was actually written
+```
+
+The existing `AppendChar` local procedure at `neuralhftokenizer.pas:1079` is the
+reference implementation of exactly this, including how to justify the bound (there:
+escapes never grow the text, so `Length(S)` is a safe upper bound). Sites still
+using the quadratic form include `neuralhftokenizer.pas:1380, 1438, 3884, 4491,
+4529, 4549, 4596` and `neuraltokenizer.pas:440`.
+
+**This does NOT violate #17 — and the distinction matters.** #17 forbids a
+`SetLength` *added* to a `Compute*`/`Backpropagate*` path or to `neuralvolume.pas`,
+where it would be a fresh per-call allocation replacing pure arithmetic. Here:
+
+- the code is a **tokenizer/decode helper**, not a layer compute path, and
+- the `SetLength` **replaces `n` allocations with one** — it is a strict reduction
+  in allocation count, which is the very thing #17 is protecting.
+
+The test #17 actually encodes is *"does this add an allocation to a hot path?"* An
+edit that removes `n − 1` of them passes that test. Do not refuse this fix by
+citing #17; do not use it as licence to add a buffer to a `Compute` method.
+
+**Other allocation-shaped costs on these paths**, same reasoning:
+
+- `Copy(S, a, b)` in a scan loop allocates a temporary string per call — compare
+  in place with indices, or hoist the substring out if it is invariant.
+- A list/dictionary lookup (`IndexOf`, `TryGetValue`) inside a per-character loop
+  is a hash or a linear scan per character — hoist it, or pre-resolve to an array
+  indexed by byte/codepoint (`FByteToCP`/`FCPToByte` are the codebase's own
+  precedent).
+- Rules #2, #4, #5, #11 and #20 apply verbatim to these loops — a bound, an
+  invariant, a nil test, a repeated `Length(S)` call cost the same here as in a
+  float loop.
+
 ## Appendix: the patterns agents miss most — extra worked examples
 
 These reinforce rules already stated; they are collected here because review keeps
@@ -1565,3 +1991,34 @@ for c := 0 to DepthM1 do
 `[c, 0, j]` accessor recomputes `GetRawPos` per element when a hoisted base + `Move`-free
 inner write would do (#11). Cost is one-time, so this is low priority — but it is
 still a violation, and a reviewer will still flag it; apply the same reflexes.
+
+## Appendix: known non-targets — do NOT optimize these
+
+Files and paths that are **out of scope** for this guide. A sweep will keep
+surfacing them as "violations"; they are excluded deliberately, and the correct
+action is to leave them alone and move on.
+
+### `pascoremath*` — never modify
+
+`neural/pascoremath32.pas`, `neural/pascoremathtypes.pas`,
+`neural/pascoremathhelperfuncs.pas`, `neural/pascoremath.inc`.
+
+These are **off limits for edits of any kind** — including edits this guide would
+otherwise mandate. They are a vendored fast-math library (`pcr_expf`, `pcr_logf`,
+`pcr_tanhf`, `pcr_erff`, `pcr_sinf`, `pcr_rsqrtf`, …) whose value is that it stays
+byte-for-byte what upstream ships: the bit patterns, the magic constants, and the
+deliberate overflow behaviour are the contract the rest of the codebase is
+validated against. A local "improvement" there silently changes the numerics under
+every layer at once, with no test that isolates the cause.
+
+**If a `pascoremath*` routine is the problem, clone it — do not patch it.** The
+established pattern is `NeuralExp` in `neuralvolume.pas`: a verbatim copy of
+`pcr_expf` wrapped in `{$PUSH}{$Q-}{$R-}` so it cannot raise on debug
+(`-Co`/`-Cr`) builds, bit-identical to the original across its whole non-trapping
+domain, with call sites redirected to the clone. That keeps the vendored file
+pristine and puts the divergence somewhere a test can pin down. See #16 for which
+of the two to call from model math.
+
+Applies to *every* rule here: do not hoist a bound (#2), do not strength-reduce a
+`div` (#15), do not promote a loop to a `TNNetVolume` method (#13), do not touch
+the formatting. Report the finding if you like; do not act on it.
