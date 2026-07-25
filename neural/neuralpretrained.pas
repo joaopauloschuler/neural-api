@@ -45511,7 +45511,7 @@ end;
 procedure DemucsGLU(const InSig: array of TNeuralFloatDynArr;
   out OutSig: TNNetFloatDynArr2D);
 var
-  Half, c, t: integer;
+  Half, c: integer;
   HalfM1: integer;
   InSigTLen: integer;
   InRow, GateRow, OutRow: TNeuralFloatDynArr;
@@ -45526,8 +45526,13 @@ begin
     InRow := InSig[c];
     GateRow := InSig[Half + c];
     OutRow := OutSig[c];
-    for t := 0 to InSigTLen do
-      OutRow[t] := InRow[t] * (1.0 / (1.0 + NeuralExp(-GateRow[t])));
+    // #13/#18: OutRow is a freshly-sized row that aliases neither input, so the
+    // gate becomes one vectorized sigmoid pass followed by an elementwise Mul.
+    if InSigTLen >= 0 then
+    begin
+      TNNetVolume.VectorSigmoid(Addr(OutRow[0]), Addr(GateRow[0]), InSigTLen + 1);
+      TNNetVolume.Mul(Addr(OutRow[0]), Addr(InRow[0]), InSigTLen + 1);
+    end;
   end;
 end;
 
@@ -47921,10 +47926,12 @@ begin
     PhRow := Phase[c];
     MSrc := MagC[c];
     PSrc := PhaseC[c];
-    for t := 0 to LM1 do
+    // #13/#18: both rows are freshly-sized contiguous L-element buffers distinct
+    // from the conv outputs, so the two maps are vectorized whole-row passes.
+    if L > 0 then
     begin
-      MagRow[t] := NeuralExp(MSrc[t]);   // #16: fast trap-free exp
-      PhRow[t] := Sin(PSrc[t]);
+      TNNetVolume.VectorExp(Addr(MagRow[0]), Addr(MSrc[0]), L);
+      TNNetVolume.VectorSin(Addr(PhRow[0]), Addr(PSrc[0]), L);
     end;
   end;
   // ISTFT(mag, phase) -> waveform. ISTFTOverlapAdd consumes a (frames,1,bins)
@@ -72188,7 +72195,9 @@ var
   NumMasksM1, HuM1, WuM1: integer;
   rwc, posU, HuWu, wOfs, H2W2, dstCol: integer;
   ciW, ciBase, rowBase, tdst, tsrc, qBase: integer;
-  sv, bv: TNeuralFloat;
+  ocBase, wBase, dst0, dst1: integer;
+  sv, bv, w00, w01, w10, w11: TNeuralFloat;
+  Plane: TSAMMat;   // Hu*Wu hypernetwork accumulator, sized once per call
 begin
   Pfx := Prefix;
   H := Config.HiddenSize;
@@ -72461,30 +72470,35 @@ begin
           Inc(posU);
         end;
       end;
-      for ci := 0 to HM1 do
+      // Output channel OUTERMOST: the oc axis strides U1 by H2W2, so keeping it
+      // innermost touched a fresh page per iteration and blocked vectorization.
+      // With oc outside, each (oc, ci) pass walks one contiguous source plane and
+      // one contiguous destination plane, and the 2x2 kernel collapses to four
+      // scalars. Per output element the ci contributions still arrive in ascending
+      // ci order, so the result is unchanged.
+      for oc := 0 to CmidM1 do
       begin
-        ciBase := ci * NImg;              // #6/#11: src channel base, once per ci
-        ciW := ci * Cmid * 4;            // #6/#11: weight channel base, once per ci
-        for r := 0 to GridM1 do
+        ocBase := oc * H2W2;
+        for ci := 0 to HM1 do
         begin
-          rowBase := ciBase + r * Grid;
-          for c := 0 to GridM1 do
+          ciBase := ci * NImg;            // #6/#11: src channel base, once per ci
+          wBase := ci * Cmid * 4 + oc * 4;
+          w00 := C1w.FData[wBase];     w01 := C1w.FData[wBase + 1];
+          w10 := C1w.FData[wBase + 2]; w11 := C1w.FData[wBase + 3];
+          for r := 0 to GridM1 do
           begin
-            sv := ImgCHW[rowBase + c];
-            for ki := 0 to 1 do
-              for kj := 0 to 1 do
-              begin
-                oi := 2 * r + ki; oj := 2 * c + kj;
-                dstCol := oi * W2 + oj;
-                posU := dstCol;
-                wOfs := ciW + ki * 2 + kj;
-                for oc := 0 to CmidM1 do
-                begin
-                  U1[posU] := U1[posU] + sv * C1w.FData[wOfs];
-                  Inc(posU, H2W2);
-                  Inc(wOfs, 4);
-                end;
-              end;
+            rowBase := ciBase + r * Grid;
+            dst0 := ocBase + (2 * r) * W2;
+            dst1 := dst0 + W2;
+            for c := 0 to GridM1 do
+            begin
+              sv := ImgCHW[rowBase + c];
+              U1[dst0]     := U1[dst0]     + sv * w00;
+              U1[dst0 + 1] := U1[dst0 + 1] + sv * w01;
+              U1[dst1]     := U1[dst1]     + sv * w10;
+              U1[dst1 + 1] := U1[dst1 + 1] + sv * w11;
+              Inc(dst0, 2); Inc(dst1, 2);
+            end;
           end;
         end;
       end;
@@ -72548,30 +72562,30 @@ begin
           Inc(posU);
         end;
       end;
-      for ci := 0 to CmidM1 do
+      // Output channel OUTERMOST (see upscale_conv1 above for the rationale).
+      for oc := 0 to CuM1 do
       begin
-        ciBase := ci * H2W2;             // #6/#11: src channel base, once per ci
-        ciW := ci * Cu * 4;             // #6/#11: weight channel base, once per ci
-        for r := 0 to H2M1 do
+        ocBase := oc * HuWu;
+        for ci := 0 to CmidM1 do
         begin
-          rowBase := ciBase + r * W2;
-          for c := 0 to W2M1 do
+          ciBase := ci * H2W2;           // #6/#11: src channel base, once per ci
+          wBase := ci * Cu * 4 + oc * 4;
+          w00 := C2w.FData[wBase];     w01 := C2w.FData[wBase + 1];
+          w10 := C2w.FData[wBase + 2]; w11 := C2w.FData[wBase + 3];
+          for r := 0 to H2M1 do
           begin
-            sv := U1[rowBase + c];
-            for ki := 0 to 1 do
-              for kj := 0 to 1 do
-              begin
-                oi := 2 * r + ki; oj := 2 * c + kj;
-                dstCol := oi * Wu + oj;
-                posU := dstCol;
-                wOfs := ciW + ki * 2 + kj;
-                for oc := 0 to CuM1 do
-                begin
-                  U2[posU] := U2[posU] + sv * C2w.FData[wOfs];
-                  Inc(posU, HuWu);
-                  Inc(wOfs, 4);
-                end;
-              end;
+            rowBase := ciBase + r * W2;
+            dst0 := ocBase + (2 * r) * Wu;
+            dst1 := dst0 + Wu;
+            for c := 0 to W2M1 do
+            begin
+              sv := U1[rowBase + c];
+              U2[dst0]     := U2[dst0]     + sv * w00;
+              U2[dst0 + 1] := U2[dst0 + 1] + sv * w01;
+              U2[dst1]     := U2[dst1]     + sv * w10;
+              U2[dst1 + 1] := U2[dst1 + 1] + sv * w11;
+              Inc(dst0, 2); Inc(dst1, 2);
+            end;
           end;
         end;
       end;
@@ -72608,6 +72622,8 @@ begin
     NumMasksM1 := NumMasks - 1;
     MaskLogits.ReSize(Hu, Wu, NumMasks);
     SetLength(HyperIn, Cu);
+    HuWu := Hu * Wu;
+    SetLength(Plane, HuWu);   // scratch, sized once for every mask token
     for mi := 0 to NumMasksM1 do
     begin
       mt := FirstMask + mi;
@@ -72628,24 +72644,25 @@ begin
         H, Cu, 1, Mlp2, HyperIn);
       // HyperIn now holds the per-channel hypernetwork output (length Cu).
 
-      HuWu := Hu * Wu;
-      rwc := 0;                 // = r*Wu + c, increments by 1 each (r,c)
+      // The dot product over Cu channels gathers values HuWu apart, one useful
+      // float per cache line. Accumulate it channel-major instead: one contiguous
+      // MulAdd per channel over a Hu*Wu plane, then scatter the plane into the
+      // mask-logit depth slot. Per output element the oc accumulation order is
+      // unchanged (MulAdd is elementwise, not a reduction).
+      FillChar(Plane[0], HuWu * csNeuralFloatSize, 0);
+      posU := 0;                // = oc*Hu*Wu, carried over oc
+      for oc := 0 to CuM1 do
+      begin
+        TNNetVolume.MulAdd(@Plane[0], @U2[posU], HyperIn[oc], HuWu);
+        Inc(posU, HuWu);
+      end;
+      // depth axis indexes the emitted masks (HF order).
       wOfs := mi;               // = (r*Wu+c)*NumMasks + mi
-      for r := 0 to HuM1 do
-        for c := 0 to WuM1 do
-        begin
-          acc := 0;
-          posU := rwc;          // = oc*Hu*Wu + rwc, carried over oc
-          for oc := 0 to CuM1 do
-          begin
-            acc := acc + HyperIn[oc] * U2[posU];
-            Inc(posU, HuWu);
-          end;
-          // depth axis indexes the emitted masks (HF order).
-          MaskLogits.FData[wOfs] := acc;
-          Inc(rwc);
-          Inc(wOfs, NumMasks);
-        end;
+      for rwc := 0 to HuWuM1 do
+      begin
+        MaskLogits.FData[wOfs] := Plane[rwc];
+        Inc(wOfs, NumMasks);
+      end;
     end;
 
     // ----- IoU prediction head: one scalar per emitted mask -----
@@ -75826,10 +75843,10 @@ var
   q, c, p, NumPix, NumQueries, BestC: integer;
   NumQueriesM1, NumLabelsM1, NumPixM1: integer;
   clBase, mlPos, mlStride: integer;
-  MaxLogit, SumExp, prob, acc, BestVal, invSum, e: TNeuralFloat;
+  MaxLogit, SumExp, prob, sg, BestVal, invSum, e: TNeuralFloat;
   cpBase: integer;
   ClsProb: array of TNeuralFloat;
-  Sig: array of TNeuralFloat;
+  Acc: array of TNeuralFloat;
 begin
   NumQueries := ClassLogits.SizeX;
   NumPix := MaskWidth * MaskHeight;
@@ -75865,29 +75882,29 @@ begin
     TNNetVolume.Mul(@ClsProb[cpBase], invSum, NumLabels);
   end;
   // per pixel: argmax_c sum_q clsprob[q,c] * sigmoid(mask[q,p]).
-  // #5/#11: sigmoid depends only on (q,p), not c -> precompute Sig[q] once per
-  // pixel, then the (c,q) loops only accumulate. Scratch allocated once.
-  SetLength(Sig, NumQueries);
+  // #13/App.E: q drives one contiguous MulAdd over the NumLabels accumulator, so
+  // the ClsProb row for a query is walked contiguously and the sigmoid folds into
+  // the same pass. Per label the accumulation order over q is unchanged.
+  // Scratch allocated once.
+  SetLength(Acc, NumLabels);
+  if NumLabels > 0 then
   for p := 0 to NumPixM1 do
   begin
+    FillChar(Acc[0], NumLabels * csNeuralFloatSize, 0);
     mlPos := p;  // = MaskLogits.GetRawPos(0, 0, p); the q = 0 offset
+    cpBase := 0; // ClsProb[q * NumLabels]; carry the q stride (#6/#12)
     for q := 0 to NumQueriesM1 do
     begin
-      Sig[q] := 1.0 / (1.0 + NeuralExp(-MaskLogits.FData[mlPos]));
+      sg := 1.0 / (1.0 + NeuralExp(-MaskLogits.FData[mlPos]));
+      TNNetVolume.MulAdd(@Acc[0], @ClsProb[cpBase], sg, NumLabels);
       Inc(mlPos, mlStride);
+      Inc(cpBase, NumLabels);
     end;
-    BestC := 0; BestVal := -1;
-    for c := 0 to NumLabelsM1 do
-    begin
-      acc := 0;
-      cpBase := c;   // ClsProb[q * NumLabels + c]; carry the q stride (#6/#12)
-      for q := 0 to NumQueriesM1 do
-      begin
-        acc := acc + ClsProb[cpBase] * Sig[q];
-        Inc(cpBase, NumLabels);
-      end;
-      if acc > BestVal then begin BestVal := acc; BestC := c; end;
-    end;
+    // every Acc[c] is a sum of non-negative terms, so seeding with Acc[0] matches
+    // the old (BestVal = -1, strict >) scan, which always accepted c = 0 first.
+    BestC := 0; BestVal := Acc[0];
+    for c := 1 to NumLabelsM1 do
+      if Acc[c] > BestVal then begin BestVal := Acc[c]; BestC := c; end;
     Result[p] := BestC;
   end;
   if prob = 0 then ;

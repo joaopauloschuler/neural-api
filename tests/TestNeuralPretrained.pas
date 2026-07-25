@@ -531,6 +531,7 @@ type
     procedure TestDetrObjectDetectionParity;
     procedure TestDetrDetectionDecode;
     procedure TestMask2FormerParity;
+    procedure TestMask2FormerSemanticDecodeReference;
     procedure TestYoloConfigFromJSONFile;
     procedure TestYoloObjectDetectionParity;
     procedure TestYoloDetectionDecode;
@@ -20982,6 +20983,92 @@ begin
     MaskLogits.Free;
     for i := 0 to Length(SrcArr) - 1 do begin SrcArr[i].Free; PosArr[i].Free; end;
     FreeMask2Former(NN);
+  end;
+end;
+
+// DecodeMask2FormerSemantic index/argmax check: the shipped decoder is compared
+// against a straightforward per-pixel reference (the plain nested formulation of
+// argmax_c sum_q softmax(cls)[q,c] * sigmoid(mask[q,p])) on small synthetic
+// shapes, including non-square and single-query/single-label degenerate ones.
+procedure TTestNeuralPretrained.TestMask2FormerSemanticDecodeReference;
+var
+  ShapeIdx, NQ, NL, MW, MH, NumPix, q, c, p: integer;
+  clBase, mlStride, cpBase, BestC: integer;
+  MaxLogit, SumExp, e, acc, BestVal, invSum: TNeuralFloat;
+  ClassLogits, MaskLogits: TNNetVolume;
+  ClsProb, Sig: array of TNeuralFloat;
+  Got, Ref: TMask2FormerLabelMap;
+const
+  csNQ: array[0..3] of integer = (3, 5, 1, 4);
+  csNL: array[0..3] of integer = (4, 2, 3, 1);
+  csMW: array[0..3] of integer = (5, 3, 2, 7);
+  csMH: array[0..3] of integer = (3, 6, 2, 1);
+begin
+  RandSeed := 987651;
+  for ShapeIdx := 0 to 3 do
+  begin
+    NQ := csNQ[ShapeIdx];
+    NL := csNL[ShapeIdx];
+    MW := csMW[ShapeIdx];
+    MH := csMH[ShapeIdx];
+    NumPix := MW * MH;
+    ClassLogits := TNNetVolume.Create(NQ, 1, NL + 1);
+    MaskLogits := TNNetVolume.Create(NQ, 1, NumPix);
+    try
+      for q := 0 to ClassLogits.Size - 1 do
+        ClassLogits.FData[q] := (Random - 0.5) * 8;
+      for q := 0 to MaskLogits.Size - 1 do
+        MaskLogits.FData[q] := (Random - 0.5) * 8;
+
+      // --- reference: the plain nested formulation ---
+      mlStride := MaskLogits.GetRawPos(1, 0, 0);
+      SetLength(Ref, NumPix);
+      SetLength(ClsProb, NQ * NL);
+      SetLength(Sig, NQ);
+      for q := 0 to NQ - 1 do
+      begin
+        clBase := ClassLogits.GetRawPos(q, 0, 0);
+        MaxLogit := ClassLogits.FData[clBase];
+        for c := 1 to NL do
+          if ClassLogits.FData[clBase + c] > MaxLogit then
+            MaxLogit := ClassLogits.FData[clBase + c];
+        SumExp := 0;
+        for c := 0 to NL do
+          SumExp := SumExp + NeuralExp(ClassLogits.FData[clBase + c] - MaxLogit);
+        invSum := 1.0 / SumExp;
+        for c := 0 to NL - 1 do
+          ClsProb[q * NL + c] :=
+            NeuralExp(ClassLogits.FData[clBase + c] - MaxLogit) * invSum;
+      end;
+      for p := 0 to NumPix - 1 do
+      begin
+        for q := 0 to NQ - 1 do
+          Sig[q] := 1.0 / (1.0 + NeuralExp(-MaskLogits.FData[p + q * mlStride]));
+        BestC := 0; BestVal := -1;
+        for c := 0 to NL - 1 do
+        begin
+          acc := 0;
+          cpBase := c;
+          for q := 0 to NQ - 1 do
+          begin
+            acc := acc + ClsProb[cpBase] * Sig[q];
+            Inc(cpBase, NL);
+          end;
+          if acc > BestVal then begin BestVal := acc; BestC := c; end;
+        end;
+        Ref[p] := BestC;
+      end;
+
+      Got := DecodeMask2FormerSemantic(ClassLogits, MaskLogits, NL, MW, MH);
+      AssertEquals('label map length (shape ' + IntToStr(ShapeIdx) + ')',
+        NumPix, Length(Got));
+      for p := 0 to NumPix - 1 do
+        AssertEquals('label at pixel ' + IntToStr(p) + ' (shape ' +
+          IntToStr(ShapeIdx) + ')', Ref[p], Got[p]);
+    finally
+      MaskLogits.Free;
+      ClassLogits.Free;
+    end;
   end;
 end;
 
