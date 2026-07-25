@@ -426,20 +426,36 @@ begin
   end;
 end;
 
-// TODO: code a faster implementation.
 function TNeuralTokenizer.DeTokenize(TokenIds: TIntegerList): string;
 var
-  TokenCnt, MaxToken: integer;
+  TokenCnt, MaxToken, OutLen, OutCap, PieceLen, NewCap: integer;
+  Piece: string;
 begin
+  // The pieces land in one geometrically-grown buffer with a carried write
+  // index. `Result := Result + piece` per token is quadratic: {$CODEPAGE UTF8}
+  // defeats FPC's in-place append, so every concat copies the whole
+  // accumulated text.
   Result := '';
+  OutLen := 0;
+  OutCap := 0;
   MaxToken := TokenIds.Count - 1;
-  if MaxToken >= 0 then
+  for TokenCnt := 0 to MaxToken do
   begin
-    for TokenCnt := 0 to MaxToken do
+    Piece := DeTokenize(TokenIds[TokenCnt]);
+    PieceLen := Length(Piece);
+    if PieceLen = 0 then continue;
+    if OutLen + PieceLen > OutCap then
     begin
-      Result := Result + DeTokenize(TokenIds[TokenCnt]);
+      NewCap := OutCap * 2;
+      if NewCap < OutLen + PieceLen then NewCap := OutLen + PieceLen;
+      if NewCap < 64 then NewCap := 64;
+      OutCap := NewCap;
+      SetLength(Result, OutCap);
     end;
+    System.Move(Piece[1], Result[OutLen + 1], PieceLen);
+    Inc(OutLen, PieceLen);
   end;
+  SetLength(Result, OutLen);
 end;
 
 function TNeuralTokenizer.TokenizerHasSeparator: boolean;

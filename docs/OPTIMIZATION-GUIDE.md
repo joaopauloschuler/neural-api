@@ -2014,7 +2014,7 @@ escapes never grow the text, so `Length(S)` is a safe upper bound).
 detokenization-side worked examples: `DecodeToken` justifies an exact bound
 (`2 * Length(Token)`), `DecodeCount` cannot and instead doubles a buffer it
 truncates once at the end. Sites still using the quadratic form include
-`neuralhftokenizer.pas:1380, 1438, 3884` and `neuraltokenizer.pas:440`.
+`neuralhftokenizer.pas:1380, 1438, 3884`.
 
 **This does NOT violate #17 — and the distinction matters.** #17 forbids a
 `SetLength` *added* to a `Compute*`/`Backpropagate*` path or to `neuralvolume.pas`,

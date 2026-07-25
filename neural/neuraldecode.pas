@@ -5932,6 +5932,31 @@ var
   HealChain: TNNetLogitsProcessorChain;
   EffProcessors: TNNetLogitsProcessor;
   DroppedToken: integer;
+  ContLen, ContCap: integer;
+  HasSeparator: boolean;
+
+  // #23: the continuation is built in one geometrically-grown buffer with a
+  // carried write index. `Continuation := Continuation + piece` per token is
+  // quadratic - {$CODEPAGE UTF8} defeats FPC's in-place append, so every
+  // concat copies the whole accumulated reply.
+  procedure AppendContinuation(const S: string);
+  var
+    L, NewCap: integer;
+  begin
+    L := Length(S);
+    if L = 0 then exit;
+    if ContLen + L > ContCap then
+    begin
+      NewCap := ContCap * 2;
+      if NewCap < ContLen + L then NewCap := ContLen + L;
+      if NewCap < 64 then NewCap := 64;
+      ContCap := NewCap;
+      SetLength(Continuation, ContCap);
+    end;
+    Move(S[1], Continuation[ContLen + 1], L);
+    Inc(ContLen, L);
+  end;
+
 begin
   Result := InputString;
   VocabCount := Dict.GetVocabCount();
@@ -6003,17 +6028,20 @@ begin
   // TokensToText convention) and join with a space only for separator
   // vocabularies (word dicts; BPE vocabularies concatenate).
   Continuation := '';
+  ContLen := 0;
+  ContCap := 0;
   TotalLenM1 := TotalLen - 1;
+  HasSeparator := Dict.TokenizerHasSeparator; // #20: loop-invariant
   for Pos := PromptLen to TotalLenM1 do
   begin
     if TokenIsEOS(Tokens[Pos], EOSTokens) then Break;
     if Tokens[Pos] < VocabCount then
     begin
-      if Dict.TokenizerHasSeparator
-      then Continuation := Continuation + ' ' + Dict.DeTokenize(Tokens[Pos])
-      else Continuation := Continuation + Dict.DeTokenize(Tokens[Pos]);
+      if HasSeparator then AppendContinuation(' ');
+      AppendContinuation(Dict.DeTokenize(Tokens[Pos]));
     end;
   end;
+  SetLength(Continuation, ContLen);
   // String-level safety net: even when the stop text was emitted across
   // token boundaries the token core could not match, truncate the
   // continuation at the EARLIEST occurrence of any stop string.
