@@ -25712,26 +25712,49 @@ begin
 end;
 
 procedure TNNetSoftCapping.Compute();
+const
+  // |x/Cap| below which the series form of tanh replaces the vectorized one.
+  cSmallArg = 1e-2;
+  cOneThird = 1.0 / 3.0;
 var
   StartTime: double;
-  SizeM1, OutputCnt: integer;
+  LocalSize, SizeM1, OutputCnt: integer;
   LocalPrevOutput: TNNetVolume;
-  Cap, InvCap, TanhVal, OutVal: TNeuralFloat;
+  Cap, InvCap, ArgVal, TanhVal: TNeuralFloat;
 begin
   StartTime := Now();
   LocalPrevOutput := FPrevLayer.FOutput;
-  SizeM1 := LocalPrevOutput.Size - 1;
+  LocalSize := LocalPrevOutput.Size;
+  SizeM1 := LocalSize - 1;
   Cap := FFloatSt[0];
   if Cap = 0 then Cap := 30.0;
   InvCap := 1.0 / Cap;
 
+  // The whole volume is one contiguous uniform map, so tanh runs vectorized in
+  // place (#19): copy the input, scale by 1/Cap, then VectorTanh. Gemma-2
+  // applies this layer to the final logits, so LocalSize is the whole
+  // vocabulary on every decoded token.
+  Move(LocalPrevOutput.FData[0], FOutput.FData[0],
+    LocalSize * csNeuralFloatSize);
+  TNNetVolume.Mul(@FOutput.FData[0], InvCap, LocalSize);
+  TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalSize);
+  // The finishing pass applies the Cap scaling and, where needed, the
+  // small-argument correction: VectorTanh evaluates
+  // (1 - exp(-2u)) / (1 + exp(-2u)), whose numerator has lost every significant
+  // digit by the time u is small, and this layer's argument is x/Cap - tiny by
+  // construction whenever the cap is large. The odd series u - u^3/3 is exact
+  // to better than 1e-11 relative below the cut, so the branch is more accurate
+  // than the kernel it overrides, not just a guard. Unswitched on the training
+  // test (#20), which is invariant across the volume.
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
-      TanhVal := pcr_tanhf(LocalPrevOutput.FData[OutputCnt] * InvCap);
-      OutVal := Cap * TanhVal;
-      FOutput.FData[OutputCnt] := OutVal;
+      ArgVal := LocalPrevOutput.FData[OutputCnt] * InvCap;
+      if Abs(ArgVal) < cSmallArg
+        then TanhVal := ArgVal * (1 - ArgVal * ArgVal * cOneThird)
+        else TanhVal := FOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := Cap * TanhVal;
       // dy/dx = 1 - tanh(x/c)^2
       FOutputErrorDeriv.FData[OutputCnt] := 1 - TanhVal * TanhVal;
     end;
@@ -25740,7 +25763,10 @@ begin
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
-      TanhVal := pcr_tanhf(LocalPrevOutput.FData[OutputCnt] * InvCap);
+      ArgVal := LocalPrevOutput.FData[OutputCnt] * InvCap;
+      if Abs(ArgVal) < cSmallArg
+        then TanhVal := ArgVal * (1 - ArgVal * ArgVal * cOneThird)
+        else TanhVal := FOutput.FData[OutputCnt];
       FOutput.FData[OutputCnt] := Cap * TanhVal;
     end;
   end;
