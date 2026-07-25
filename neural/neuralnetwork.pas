@@ -48247,8 +48247,8 @@ end;
 
 procedure TNNetGroupedConvolutionLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  LpBnd19: integer;
-  LpBnd20: integer;
+  MaxPrevOutputD: integer;
+  MaxOutputD: integer;
   PrevLayerGroupDSize: integer;
   OutputGroupDSize: integer;
   OutputD: integer;
@@ -48272,8 +48272,8 @@ begin
   SetLength(FGroupIdToPrevLayerIdStart, FStruct[5]);
   SetLength(FGroupIdToOutputIdStart, FStruct[5]);
 
-  LpBnd19 := pPrevLayer.Output.Depth - 1;
-  for OutputD := 0 to LpBnd19 do
+  MaxPrevOutputD := pPrevLayer.Output.Depth - 1;
+  for OutputD := 0 to MaxPrevOutputD do
   begin
     GroupId := OutputD div PrevLayerGroupDSize;
     GroupDStart := GroupId * PrevLayerGroupDSize;
@@ -48282,8 +48282,8 @@ begin
     FArrPrevLayerGroupIdStart[OutputD] := GroupDStart;
   end;
 
-  LpBnd20 := FOutput.Depth - 1;
-  for OutputD := 0 to LpBnd20 do
+  MaxOutputD := FOutput.Depth - 1;
+  for OutputD := 0 to MaxOutputD do
   begin
     GroupId := OutputD div OutputGroupDSize;
     GroupDStart := GroupId * OutputGroupDSize;
@@ -48723,12 +48723,12 @@ end;
 
 procedure TNNetAdaIN.Backpropagate();
 var
-  LpBnd31: integer;
-  LpBnd32: integer;
-  LpBnd33: integer;
-  LpBnd34: integer;
-  LpBnd35: integer;
-  LpBnd36: integer;
+  MaxContentOutX: integer;
+  MaxContentOutY: integer;
+  MaxContentErrX: integer;
+  MaxContentErrY: integer;
+  MaxStyleOutX: integer;
+  MaxStyleOutY: integer;
   StartTime: double;
   C, ContentN, StyleM, Depth: integer;
   DepthM1: integer;
@@ -48760,14 +48760,14 @@ begin
     // Reductions of the upstream gradient over the CONTENT spatial positions.
     SumG := 0;
     SumGXHat := 0;
-    LpBnd31 := ContentOut.SizeX - 1;
-    LpBnd32 := ContentOut.SizeY - 1;
+    MaxContentOutX := ContentOut.SizeX - 1;
+    MaxContentOutY := ContentOut.SizeY - 1;
     // Row-outer walk with a carried flat offset (step = Depth per x); the
     // fixed-C accessor multiply-add is gone (rules #3/#11).
-    for CntY := 0 to LpBnd32 do
+    for CntY := 0 to MaxContentOutY do
     begin
       pos := FOutputError.GetRawPos(0, CntY, C);
-      for CntX := 0 to LpBnd31 do
+      for CntX := 0 to MaxContentOutX do
       begin
         G := FOutputError.FData[pos];
         SumG := SumG + G;
@@ -48779,12 +48779,12 @@ begin
     //   dx_i = (style_std * inv_content_std / N) *
     //          ( N*g_i - sum(g) - xhat_i * sum(g*xhat) )
     ContentFactor := StyleStd * ContentInvStd / ContentN;
-    LpBnd33 := ContentOut.SizeX - 1;
-    LpBnd34 := ContentOut.SizeY - 1;
-    for CntY := 0 to LpBnd34 do
+    MaxContentErrX := ContentOut.SizeX - 1;
+    MaxContentErrY := ContentOut.SizeY - 1;
+    for CntY := 0 to MaxContentErrY do
     begin
       pos := FOutputError.GetRawPos(0, CntY, C);
-      for CntX := 0 to LpBnd33 do
+      for CntX := 0 to MaxContentErrX do
       begin
         G := FOutputError.FData[pos];
         XHat := FNormContent.FData[pos];
@@ -48798,12 +48798,12 @@ begin
     //   where shat_j = (s_j - style_mean) / style_std.
     GMean := SumG / StyleM;
     GXHatMean := SumGXHat / StyleM;
-    LpBnd35 := StyleOut.SizeX - 1;
-    LpBnd36 := StyleOut.SizeY - 1;
-    for CntY := 0 to LpBnd36 do
+    MaxStyleOutX := StyleOut.SizeX - 1;
+    MaxStyleOutY := StyleOut.SizeY - 1;
+    for CntY := 0 to MaxStyleOutY do
     begin
       pos := StyleOut.GetRawPos(0, CntY, C);
-      for CntX := 0 to LpBnd35 do
+      for CntX := 0 to MaxStyleOutX do
       begin
         SHat := (StyleOut.FData[pos] - StyleMean) / StyleStd;
         StyleErr.FData[pos] := StyleErr.FData[pos] + GMean + GXHatMean * SHat;
@@ -53733,8 +53733,8 @@ end;
 
 procedure TNNetSquash.Compute();
 var
-  LpBnd38: integer;
-  LpBnd39: integer;
+  MaxOutputX: integer;
+  MaxOutputY: integer;
   NumCapsM1, DimM1: integer;
   StartTime: double;
   Dim, NumCaps, x, y, c, i, baseD, baseIn, baseCap: integer;
@@ -53748,10 +53748,10 @@ begin
   Eps := 1e-12;
   NumCapsM1 := NumCaps - 1;
   DimM1 := Dim - 1;
-  LpBnd38 := FOutput.SizeX - 1;
-  LpBnd39 := FOutput.SizeY - 1;
-  for x := 0 to LpBnd38 do
-    for y := 0 to LpBnd39 do
+  MaxOutputX := FOutput.SizeX - 1;
+  MaxOutputY := FOutput.SizeY - 1;
+  for x := 0 to MaxOutputX do
+    for y := 0 to MaxOutputY do
       for c := 0 to NumCapsM1 do
       begin
         baseD := c * Dim;
@@ -53773,8 +53773,8 @@ end;
 
 procedure TNNetSquash.Backpropagate();
 var
-  LpBnd40: integer;
-  LpBnd41: integer;
+  MaxOutputX: integer;
+  MaxOutputY: integer;
   NumCapsM1, DimM1: integer;
   StartTime: double;
   Dim, NumCaps, x, y, c, i, baseD, baseIn, baseCap: integer;
@@ -53798,12 +53798,12 @@ begin
     //   d(f/n)/ds_j = ( 2/((1+n2)^2)/n - (f/n^3) ) * s_j
     // where g = dL/dv (FOutputError), n2 = ||s||^2, n = sqrt(n2+eps),
     //       f = n2/(1+n2), f/n cached in FScale.
-    LpBnd40 := FOutput.SizeX - 1;
-    LpBnd41 := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
+    MaxOutputY := FOutput.SizeY - 1;
     NumCapsM1 := NumCaps - 1;
     DimM1 := Dim - 1;
-    for x := 0 to LpBnd40 do
-      for y := 0 to LpBnd41 do
+    for x := 0 to MaxOutputX do
+      for y := 0 to MaxOutputY do
         for c := 0 to NumCapsM1 do
         begin
           baseD := c * Dim;
@@ -53908,13 +53908,13 @@ end;
 
 procedure TNNetCapsuleRouting.InitDefault();
 var
-  LpBnd42: integer;
+  MaxNeuronPos: integer;
   cnt: integer;
 begin
   if FNeurons.Count < FNumInCaps * FNumOutCaps then
     AddMissingNeurons(FNumInCaps * FNumOutCaps);
-  LpBnd42 := FNeurons.Count - 1;
-  for cnt := 0 to LpBnd42 do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for cnt := 0 to MaxNeuronPos do
     FNeurons[cnt].InitHeUniform(1);
 end;
 
@@ -54037,7 +54037,7 @@ end;
 
 procedure TNNetCapsuleRouting.Backpropagate();
 var
-  LpBnd43: integer;
+  MaxNeuronPos: integer;
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
   i, j, o, k, nIdx, sjBase, oBase, iBase, errBase: integer;
@@ -54115,8 +54115,8 @@ begin
 
   if (not FBatchUpdate) then
   begin
-    LpBnd43 := FNeurons.Count - 1;
-    for nIdx := 0 to LpBnd43 do
+    MaxNeuronPos := FNeurons.Count - 1;
+    for nIdx := 0 to MaxNeuronPos do
       FArrNeurons[nIdx].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
@@ -54817,8 +54817,8 @@ end;
 
 procedure TNNetPReLU.Backpropagate();
 var
-  LpBnd44: integer;
-  LpBnd45: integer;
+  MaxOutputErrorPos: integer;
+  MaxPrevOutputErrorPos: integer;
   StartTime: double;
   localNeuron: TNNetNeuron;
   gradAlpha, alpha, x: TNeuralFloat;
@@ -54835,8 +54835,8 @@ begin
   // Gradient w.r.t. the scalar alpha:
   // d(alpha) = sum over elements where x <= 0 of OutputError[i] * Input[i].
   gradAlpha := 0;
-  LpBnd44 := FOutputError.Size - 1;
-  for i := 0 to LpBnd44 do
+  MaxOutputErrorPos := FOutputError.Size - 1;
+  for i := 0 to MaxOutputErrorPos do
   begin
     x := LocalPrevOutput.Raw[i];
     if x <= 0 then
@@ -54853,8 +54853,8 @@ begin
   if Assigned(FPrevLayer) and (FPrevLayer.FOutputError.Size = FOutputError.Size) then
   begin
     // Gradient w.r.t. the input: dInput[i] = OutputError[i] * (1 if x>0 else alpha).
-    LpBnd45 := FOutputError.Size - 1;
-    for i := 0 to LpBnd45 do
+    MaxPrevOutputErrorPos := FOutputError.Size - 1;
+    for i := 0 to MaxPrevOutputErrorPos do
     begin
       x := LocalPrevOutput.Raw[i];
       if x > 0 then
@@ -56290,7 +56290,7 @@ end;
 
 procedure TNNetCausalConv1D.Compute();
 var
-  LpBnd46: integer;
+  MaxNeuronPos: integer;
   StartTime: double;
   Prev: TNNetVolume;
   SeqLen, InputDepth, Ksize, Dil, t, f, k, srcT: integer;
@@ -56308,8 +56308,8 @@ begin
   MaxT := SeqLen - 1;
   MaxK := Ksize - 1;
   OutDepth := FOutput.Depth;
-  LpBnd46 := FNeurons.Count - 1;
-  for f := 0 to LpBnd46 do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for f := 0 to MaxNeuronPos do
   begin
     localNeuron := FArrNeurons[f];
     W := localNeuron.FWeights;
@@ -56343,7 +56343,7 @@ end;
 
 procedure TNNetCausalConv1D.Backpropagate();
 var
-  LpBnd47: integer;
+  MaxNeuronPos: integer;
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
   SeqLen, InputDepth, Ksize, Dil, t, f, k, srcT: integer;
@@ -56377,8 +56377,8 @@ begin
   //   dL/dbias[f]   += OutErr[t,f]
   // The -FLearningRate convention is applied to the accumulated weight/bias
   // deltas (matching TNNetTokenShift).
-  LpBnd47 := FNeurons.Count - 1;
-  for f := 0 to LpBnd47 do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for f := 0 to MaxNeuronPos do
   begin
     localNeuron := FArrNeurons[f];
     W := localNeuron.FWeights;
@@ -56458,7 +56458,7 @@ end;
 
 procedure TNNetTDNNConv1D.Compute();
 var
-  LpBnd: integer;
+  MaxNeuronPos: integer;
   StartTime: double;
   Prev: TNNetVolume;
   SeqLen, InputDepth, Ksize, Dil, Half, t, f, k, srcT: integer;
@@ -56477,8 +56477,8 @@ begin
   MaxT := SeqLen - 1;
   MaxK := Ksize - 1;
   OutDepth := FOutput.Depth;
-  LpBnd := FNeurons.Count - 1;
-  for f := 0 to LpBnd do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for f := 0 to MaxNeuronPos do
   begin
     localNeuron := FArrNeurons[f];
     W := localNeuron.FWeights;
