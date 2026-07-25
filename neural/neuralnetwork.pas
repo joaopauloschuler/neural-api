@@ -23516,12 +23516,11 @@ end;
 
 procedure TNNetGELU.Compute();
 var
-  SizeM1: integer;
+  LocalSize, SizeM1: integer;
   LocalPrevOutput: TNNetVolume;
   OutputCnt: integer;
   StartTime: double;
   x: TNeuralFloat;
-  x3: TNeuralFloat;
   tanhVal: TNeuralFloat;
   outputVal: TNeuralFloat;
   cdf: TNeuralFloat;
@@ -23532,17 +23531,24 @@ const
 begin
   StartTime := Now();
   LocalPrevOutput := FPrevLayer.Output;
-  SizeM1 := LocalPrevOutput.Size - 1;
+  LocalSize := LocalPrevOutput.Size;
+  SizeM1 := LocalSize - 1;
 
   // Two-pass: fill FOutput with the tanh argument, vectorize tanh in place
   // (VectorTanh), then a scalar finishing pass reads tanhVal back from FOutput.
-  for OutputCnt := 0 to SizeM1 do
-  begin
-    x := LocalPrevOutput.FData[OutputCnt];
-    x3 := x * x * x;
-    FOutput.FData[OutputCnt] := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
-  end;
-  TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+  // The argument sqrt(2/pi) * (x + 0.044715*x^3) is itself a short sequence of
+  // bulk ops rather than a scalar map (#13, appendix D): x^2, then *x, then the
+  // cubic coefficient, with the linear term folded in by one MulAdd. That
+  // re-associates the products, so the result is equivalent to the scalar form
+  // but not bit-identical to it.
+  Move(LocalPrevOutput.FData[0], FOutput.FData[0],
+    LocalSize * csNeuralFloatSize);
+  TNNetVolume.Mul(@FOutput.FData[0], @FOutput.FData[0], LocalSize);        // x^2
+  TNNetVolume.Mul(@FOutput.FData[0], @LocalPrevOutput.FData[0], LocalSize); // x^3
+  TNNetVolume.Mul(@FOutput.FData[0], SQRT_2_OVER_PI * GELU_CONST, LocalSize);
+  TNNetVolume.MulAdd(@FOutput.FData[0], @LocalPrevOutput.FData[0],
+    SQRT_2_OVER_PI, LocalSize);
+  TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalSize);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
@@ -23763,12 +23769,15 @@ begin
       // #13: b-half is a's constant-offset neighbour (+HalfDepth), no 2nd accessor
       bPtr := TNeuralFloatArrPtr(@aPtr^[HalfDepth]);
       outPtr := FOutput.GetRawPtr(X, Y);
-      for D := 0 to MaxD do
-      begin
-        b := bPtr^[D];
-        b3 := b * b * b;
-        outPtr^[D] := SQRT_2_OVER_PI * (b + GELU_CONST * b3);
-      end;
+      // Same bulk-op form as TNNetGELU.Compute for the tanh argument
+      // sqrt(2/pi) * (b + 0.044715*b^3): b^2, then *b, then the cubic
+      // coefficient, with the linear term folded in by one MulAdd. Equivalent
+      // to the scalar map, not bit-identical (the products re-associate).
+      Move(bPtr^[0], outPtr^[0], HalfDepth * csNeuralFloatSize);
+      TNNetVolume.Mul(outPtr, outPtr, HalfDepth);                        // b^2
+      TNNetVolume.Mul(outPtr, bPtr, HalfDepth);                          // b^3
+      TNNetVolume.Mul(outPtr, SQRT_2_OVER_PI * GELU_CONST, HalfDepth);
+      TNNetVolume.MulAdd(outPtr, bPtr, SQRT_2_OVER_PI, HalfDepth);
       TNNetVolume.VectorTanh(outPtr, outPtr, HalfDepth); // out := tanh(arg)
       for D := 0 to MaxD do
       begin
