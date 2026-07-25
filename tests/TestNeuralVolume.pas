@@ -24,6 +24,7 @@ type
     procedure TestVolumeMinMax;
     procedure TestVolumeMaxAbsNegativeFirst;
     procedure TestVolumeMinMaxClassParity;
+    procedure TestVolumeExpShiftSumParity;
     procedure TestVolumeFlip;
     procedure TestVolumeClassification;
     procedure TestVolumeSoftMax;
@@ -388,6 +389,75 @@ begin
       end;
     end;
   end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeExpShiftSumParity;
+// VectorExpShiftSum is one fused AVX2/64-bit kernel (broadcast subtract,
+// 8-wide exp, in-register reduction) and a plain scalar loop on every other
+// build; both must reproduce the stable-softmax numerator/denominator the
+// attention layers used to compute element by element. Sizes straddle the
+// 8-element block width and its tail. Two properties are load-bearing beyond
+// raw accuracy: an argument far below the exp underflow point must come back
+// EXACTLY zero (that is what keeps an additive -1e9 attention mask at a hard
+// zero weight, which the value-sum loops skip on), and dst may alias src.
+const
+  Sizes: array[0..10] of integer = (1, 2, 7, 8, 9, 15, 16, 17, 31, 64, 517);
+  cShift = 1.75;
+var
+  Src, Dst, Ref: array of TNeuralFloat;
+  SI, K, N: integer;
+  RefSum, GotSum, V: TNeuralFloat;
+  Tag: string;
+begin
+  RandSeed := 314159;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    SetLength(Src, N);
+    SetLength(Dst, N);
+    SetLength(Ref, N);
+    for K := 0 to N - 1 do Src[K] := (Random - 0.5) * 12;
+    // Two masked entries (the additive attention mask sentinel).
+    if N > 6 then
+    begin
+      Src[1] := -1e9;
+      Src[N - 2] := -1e9;
+    end;
+    RefSum := 0;
+    for K := 0 to N - 1 do
+    begin
+      Ref[K] := NeuralExp(Src[K] - cShift);
+      RefSum := RefSum + Ref[K];
+    end;
+
+    Tag := ' (N=' + IntToStr(N) + ')';
+    GotSum := TNNetVolume.VectorExpShiftSum(TNeuralFloatArrPtr(@Dst[0]),
+      TNeuralFloatArrPtr(@Src[0]), cShift, N);
+    for K := 0 to N - 1 do
+      AssertEquals('exp[' + IntToStr(K) + ']' + Tag, Ref[K], Dst[K],
+        1e-6 * Ref[K] + 1e-30);
+    AssertEquals('sum' + Tag, RefSum, GotSum, 1e-5 * RefSum);
+    if N > 6 then
+    begin
+      AssertEquals('masked head is a hard zero' + Tag, 0.0, Dst[1], 0.0);
+      AssertEquals('masked tail is a hard zero' + Tag, 0.0, Dst[N - 2], 0.0);
+    end;
+
+    // In place: dst = src must give the same answer.
+    for K := 0 to N - 1 do Dst[K] := Src[K];
+    GotSum := TNNetVolume.VectorExpShiftSum(TNeuralFloatArrPtr(@Dst[0]),
+      TNeuralFloatArrPtr(@Dst[0]), cShift, N);
+    for K := 0 to N - 1 do
+    begin
+      V := Ref[K];
+      AssertEquals('in-place exp[' + IntToStr(K) + ']' + Tag, V, Dst[K],
+        1e-6 * V + 1e-30);
+    end;
+    AssertEquals('in-place sum' + Tag, RefSum, GotSum, 1e-5 * RefSum);
+  end;
+  // A zero-length run is a no-op that sums to zero.
+  AssertEquals('empty run', 0.0, TNNetVolume.VectorExpShiftSum(
+    TNeuralFloatArrPtr(@Src[0]), TNeuralFloatArrPtr(@Src[0]), cShift, 0), 0.0);
 end;
 
 procedure TTestNeuralVolume.TestVolumeFlip;

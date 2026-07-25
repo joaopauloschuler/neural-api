@@ -559,6 +559,16 @@ type
       // remainder; on a non-AVX build it is a plain NeuralExp loop. Buffers may
       // alias (dst = src) since the read happens before the write per lane/element.
       class procedure VectorExp(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // VectorExpShiftSum writes dst[0..N-1] := exp(src[0..N-1] - Shift) and
+      // returns the sum of everything it wrote - the numerator and the
+      // denominator of a numerically stable softmax in a single pass. On an
+      // AVX2/64-bit build one fused kernel (AVXExpShiftSum) applies the
+      // broadcast subtract, runs the 8-wide exp polynomial and reduces the
+      // result while the exponentials are still in registers; every other build
+      // runs the equivalent scalar loop. Buffers may alias (dst = src).
+      // Arguments far below -88 exponentiate to EXACTLY 0 on both paths, so an
+      // additive -1e9 attention mask still yields a hard zero weight.
+      class function VectorExpShiftSum(pDst, pSrc: TNeuralFloatArrPtr; Shift: TNeuralFloat; N: integer): TNeuralFloat; static;
       // VectorSigmoid writes dst[0..N-1] := 1/(1+exp(-src)). AVX2-accelerated
       // path built on VectorExp; numerically stable scalar form on the tail.
       class procedure VectorSigmoid(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
@@ -9023,6 +9033,41 @@ begin
 end;
 {$ENDIF}
 
+// The fused exp-shift-sum kernel is assembled only in the AVX64 block below, so
+// a 32-bit AVX2 build has to take the scalar path like every non-AVX build.
+{$IFDEF AVX2}{$IFDEF AVX64}{$DEFINE HASAVXEXPSHIFTSUM}{$ENDIF}{$ENDIF}
+{$IFDEF HASAVXEXPSHIFTSUM}
+// AVXExpShiftSum is defined later in this file inside the AVX64 asm block;
+// forward-declare it so VectorExpShiftSum can dispatch to it from here.
+function AVXExpShiftSum(pDst, pSrc: TNeuralFloatArrPtr; Shift: TNeuralFloat;
+  NumElements: integer): TNeuralFloat; forward;
+{$ENDIF}
+class function TNNetVolume.VectorExpShiftSum(pDst, pSrc: TNeuralFloatArrPtr;
+  Shift: TNeuralFloat; N: integer): TNeuralFloat;
+{$IFDEF HASAVXEXPSHIFTSUM}
+begin
+  if N <= 0 then exit(0);
+  Result := AVXExpShiftSum(pDst, pSrc, Shift, N);
+end;
+{$ELSE}
+var
+  I, NM1: integer;
+  V, Sum: TNeuralFloat;
+begin
+  if N <= 0 then exit(0);
+  NM1 := N - 1;
+  Sum := 0;
+  for I := 0 to NM1 do
+  begin
+    V := NeuralExp(pSrc^[I] - Shift);
+    pDst^[I] := V;
+    Sum := Sum + V;
+  end;
+  Result := Sum;
+end;
+{$ENDIF}
+{$UNDEF HASAVXEXPSHIFTSUM}
+
 class procedure TNNetVolume.VectorSigmoid(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 var
   I, NM1: integer;
@@ -15160,6 +15205,112 @@ begin
   for I := 0 to NumElementsM1 do
     pDst^[I] := NeuralExp(pSrc^[I]);
 end;
+{$ENDIF}
+
+{ AVXExpShiftSum: dst[0..N-1] := exp(src[0..N-1] - Shift), returning the sum of
+  what was written - the whole numerator-and-denominator half of a numerically
+  stable softmax in one pass over the row.
+
+  It is the AVXExp body with two additions that cost one instruction each: a
+  broadcast vsubps of the row max on the way in, and a vaddps of the finished
+  exponentials into an accumulator on the way out. That is why this is fused
+  rather than composed: the shift-then-exp-then-sum spelling reads and writes
+  the row three times and dispatches three kernels per softmax row, whereas an
+  attention softmax row is short (the live cache length during decode) and is
+  run once per head per layer per token, so the per-call overhead is as much of
+  the cost as the arithmetic.
+
+  The eight lane partials are folded in a fixed order, so the sum is
+  reproducible but not identical to the scalar left-to-right accumulation (it is
+  in fact better conditioned). exp() itself matches the scalar NeuralExp to
+  ~1e-6 relative, except that arguments below about -88 return exactly +0 here
+  (the 2^k bit assembly leaves a zero exponent field) where the scalar returns a
+  denormal below 4e-39 - which is what keeps an additive -1e9 attention mask at
+  a hard zero weight. }
+{$IFDEF AVX2}
+{$IFDEF AVX64}
+function AVXExpShiftSum(pDst, pSrc: TNeuralFloatArrPtr; Shift: TNeuralFloat;
+  NumElements: integer): TNeuralFloat;
+var
+  localNumElements, MissedElements, I, NumElementsM1: integer;
+  LaneSums: array[0..7] of Single;
+  ShiftPtr, LaneSumsPtr: pointer;
+  V, Sum: TNeuralFloat;
+begin
+  Sum := 0;
+  MissedElements := NumElements and 7;
+  localNumElements := NumElements xor MissedElements;
+  NumElementsM1 := NumElements - 1;
+  if localNumElements > 0 then
+  begin
+    // localNumElements is a non-zero multiple of 8 here, so the loop below
+    // always runs at least once and always fills LaneSums.
+    ShiftPtr := Addr(Shift);
+    LaneSumsPtr := Addr(LaneSums[0]);
+  asm
+  mov rax, pSrc
+  mov rcx, pDst
+  mov r8d, localNumElements
+  shr r8d, 3
+  vbroadcastss ymm10, [rip+cAVXExpHi]
+  vbroadcastss ymm11, [rip+cAVXExpLo]
+  vbroadcastss ymm12, [rip+cAVXLog2e]
+  vbroadcastss ymm13, [rip+cAVXLn2]
+  vmovd xmm14, dword ptr [rip+cAVXExp127]
+  vpbroadcastd ymm14, xmm14
+  mov rdx, ShiftPtr
+  vbroadcastss ymm15, [rdx]
+  vxorps ymm8, ymm8, ymm8
+@LoopAVXExpShiftSum:
+  vmovups ymm0, [rax]
+  vsubps  ymm0, ymm0, ymm15        // x = src - Shift
+  vminps  ymm0, ymm0, ymm10
+  vmaxps  ymm0, ymm0, ymm11
+  vmulps  ymm1, ymm0, ymm12        // t = x*log2e
+  vroundps ymm2, ymm1, 0           // k = round(t)
+  vsubps  ymm1, ymm1, ymm2         // f = t-k in [-0.5,0.5]
+  vmulps  ymm3, ymm1, ymm13        // g = f*ln2
+  vbroadcastss ymm4, [rip+cAVXExpP6]
+  vbroadcastss ymm5, [rip+cAVXExpP5]
+  vfmadd213ps ymm4, ymm3, ymm5
+  vbroadcastss ymm5, [rip+cAVXExpP4]
+  vfmadd213ps ymm4, ymm3, ymm5
+  vbroadcastss ymm5, [rip+cAVXExpP3]
+  vfmadd213ps ymm4, ymm3, ymm5
+  vbroadcastss ymm5, [rip+cAVXExpP2]
+  vfmadd213ps ymm4, ymm3, ymm5
+  vbroadcastss ymm5, [rip+cAVXExpP1]
+  vfmadd213ps ymm4, ymm3, ymm5
+  vbroadcastss ymm5, [rip+cAVXExpP0]
+  vfmadd213ps ymm4, ymm3, ymm5     // ymm4 = 2^f
+  vcvtps2dq ymm2, ymm2             // k -> int32
+  vpaddd ymm2, ymm2, ymm14
+  vpslld ymm2, ymm2, 23            // 2^k as float bits
+  vmulps ymm0, ymm4, ymm2
+  vmovups [rcx], ymm0
+  vaddps ymm8, ymm8, ymm0          // per-lane running sum
+  add rax, 32
+  add rcx, 32
+  dec r8d
+  jnz @LoopAVXExpShiftSum
+  mov rdx, LaneSumsPtr
+  vmovups [rdx], ymm8
+  vzeroupper
+  end ['rax','rcx','rdx','r8',
+       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5',
+       'ymm8','ymm10','ymm11','ymm12','ymm13','ymm14','ymm15'];
+    for I := 0 to 7 do
+      Sum := Sum + LaneSums[I];
+  end;
+  for I := localNumElements to NumElementsM1 do
+  begin
+    V := NeuralExp(pSrc^[I] - Shift);
+    pDst^[I] := V;
+    Sum := Sum + V;
+  end;
+  Result := Sum;
+end;
+{$ENDIF}
 {$ENDIF}
 
 { AVXLn: dst[0..N-1] := ln(src[0..N-1]). 8-wide AVX2 Cephes logf body plus a scalar
