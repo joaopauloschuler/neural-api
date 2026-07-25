@@ -417,6 +417,10 @@ type
 
   TNNetGroupInfoArray = array of TNNetGroupInfo;
 
+  // Forward: the int8 tiled kernels below take a TNNetVolumeQuant8 table
+  // (declared after TNNetVolume, since it owns one as its scale plane).
+  TNNetVolumeQuant8 = class;
+
   { TNNetVolume }
   {$IFDEF FPC}
   TNNetVolume = class (specialize TVolume<TNeuralFloat>)
@@ -531,6 +535,11 @@ type
       // fused into the output store). Same tiling and same output layout
       // (FData[CntB*NumAs + CntA]) as the FP32 version. Coded by Claude (AI).
       procedure DotProductsTiledInt8(NumAs, NumBs, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer); overload;
+      // TNNetVolumeQuant8 twin of the two calls above: one table carries the
+      // codes and the per-row scales together, shaped (NumAs, 1, VectorSize) -
+      // exactly the layout the open-array versions document, so these forward
+      // straight to them. Coded by Claude (AI).
+      procedure DotProductsTiledInt8(NumAs, NumBs, VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolume; TileSizeA, TileSizeB: integer); overload;
       // Ranged twin (same contract as the ranged DotProductsTiled): computes
       // only B columns [BStart..BFinish] and A rows [AStart..AFinish], with
       // ceil-division tiling anchored at the range start and a clamped trailing
@@ -539,6 +548,7 @@ type
       // chunk scheduler calls (position-axis chunks range B, neuron-axis
       // chunks range A). AFinish < 0 means all rows. Coded by Claude (AI).
       procedure DotProductsTiledInt8(NumAs, BStart, BFinish, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
+      procedure DotProductsTiledInt8(NumAs, BStart, BFinish, VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
       procedure PointwiseNorm(pNorms: TNNetVolume = nil);
       procedure PointwiseMul(pNorms: TNNetVolume);
       // VectorExp writes dst[0..N-1] := exp(src[0..N-1]). On an AVX2 build it
@@ -657,7 +667,10 @@ type
       // grouped B addressing (input vectors hold VectorSize*Groups, neuron r
       // reads its group's slice) and same output layout
       // (FData[CntB*NumAs + CntA]) as the FP32 version. Coded by Claude (AI).
-      procedure GroupedDotProductsTiledInt8(Groups, NumAs, NumBs, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
+      procedure GroupedDotProductsTiledInt8(Groups, NumAs, NumBs, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer); overload;
+      // TNNetVolumeQuant8 twin: same (NumAs, 1, VectorSize) table shape as the
+      // ungrouped kernel. Coded by Claude (AI).
+      procedure GroupedDotProductsTiledInt8(Groups, NumAs, NumBs, VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolume; TileSizeA, TileSizeB: integer); overload;
   end;
 
   { TNNetVolumeQuant8 }
@@ -11171,6 +11184,21 @@ begin
     TileSizeA, TileSizeB);
 end;
 
+procedure TNNetVolume.DotProductsTiledInt8(NumAs, NumBs, VectorSize: integer;
+  Codes: TNNetVolumeQuant8; VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
+begin
+  DotProductsTiledInt8(NumAs, 0, NumBs - 1, VectorSize, Codes, VBs,
+    TileSizeA, TileSizeB);
+end;
+
+procedure TNNetVolume.DotProductsTiledInt8(NumAs, BStart, BFinish,
+  VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolume;
+  TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1);
+begin
+  DotProductsTiledInt8(NumAs, BStart, BFinish, VectorSize, Codes.FData,
+    Codes.ScaleData.FData, VBs, TileSizeA, TileSizeB, AStart, AFinish);
+end;
+
 procedure TNNetVolume.DotProductsTiledInt8(NumAs, BStart, BFinish,
   VectorSize: integer;
   const Codes: array of ShortInt; const Scales: array of TNeuralFloat;
@@ -11223,6 +11251,14 @@ begin
       end;
     end; // A Tiling.
   end; // B Tiling.
+end;
+
+procedure TNNetGroupedVolume.GroupedDotProductsTiledInt8(Groups, NumAs, NumBs,
+  VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolume;
+  TileSizeA, TileSizeB: integer);
+begin
+  GroupedDotProductsTiledInt8(Groups, NumAs, NumBs, VectorSize, Codes.FData,
+    Codes.ScaleData.FData, VBs, TileSizeA, TileSizeB);
 end;
 
 procedure TNNetGroupedVolume.GroupedDotProductsTiledInt8(Groups, NumAs, NumBs,

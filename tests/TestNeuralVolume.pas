@@ -74,6 +74,8 @@ type
     procedure TestQuant8GetQuantData;
     procedure TestQuant8MemSize;
     procedure TestQuant8FillAndReshapeCycles;
+    procedure TestQuant8TiledDotProductMatchesArrays;
+    procedure TestQuant8GroupedTiledDotProductMatchesArrays;
   end;
 
 implementation
@@ -1489,13 +1491,13 @@ begin
     AssertEquals('Regrown scale count', 5, V.ScaleCount);
     AssertTrue('Regrown DataPtr is armed', V.DataPtr <> nil);
     AssertEquals('Regrown FData length', 15, Length(V.FData));
-    // Weight shape: X = 1, Y = neuron, Depth = vector size. Row r starts at
+    // Weight shape: X = neuron, Y = 1, Depth = vector size. Row r starts at
     // r*Depth, which is how the concatenated weights are laid out today.
-    V.ReSize(1, 4, 6);
+    V.ReSize(4, 1, 6);
     AssertEquals('Weight shape size', 24, V.Size);
     AssertEquals('Weight shape scale count', 4, V.ScaleCount);
-    AssertEquals('Weight row base', 3 * 6, V.GetRawPos(0, 3));
-    AssertEquals('Weight element', 3 * 6 + 5, V.GetRawPos(0, 3, 5));
+    AssertEquals('Weight row base', 3 * 6, V.GetRawPos(3, 0));
+    AssertEquals('Weight element', 3 * 6 + 5, V.GetRawPos(3, 0, 5));
     // Same element count, different geometry: the buffer is kept, the scale
     // plane follows the new (x,y) count.
     V.ReSize(2, 4, 3);
@@ -1504,6 +1506,126 @@ begin
     AssertEquals('Reshaped scale plane', 8, V.ScaleData.Size);
   finally
     V.Free;
+  end;
+end;
+
+// Fills a (NumAs, 1, VectorSize) weight table - the shape the concatenated
+// layer weights use - with a distinct code per element and a distinct scale
+// per row, then hands back the loose-array view of the same data.
+procedure FillQuant8Table(V: TNNetVolumeQuant8; NumAs, VectorSize: integer;
+  out pCodes: TInt8DynArr; out pScales: TNeuralFloatDynArr);
+var
+  a, e: integer;
+begin
+  V.ReSize(NumAs, 1, VectorSize);
+  for a := 0 to NumAs - 1 do
+  begin
+    V.Scale[a, 0] := 0.125 * (a + 1);
+    for e := 0 to VectorSize - 1 do
+      V.Store(a, 0, e, ShortInt(((a * 7 + e * 3) mod 61) - 30));
+  end;
+  V.GetQuantData(pCodes, pScales);
+end;
+
+// Fills VBs with distinct, sign-varying inputs.
+procedure FillQuant8Inputs(VBs: TNNetVolume);
+var
+  i: integer;
+begin
+  for i := 0 to VBs.Size - 1 do
+    VBs.FData[i] := ((i mod 9) - 4) * 0.25;
+end;
+
+// The TNNetVolumeQuant8 overloads forward to the open-array kernels, so they
+// must agree element for element - not merely within a tolerance.
+procedure TTestNeuralVolumeQuant8.TestQuant8TiledDotProductMatchesArrays;
+const
+  NumAs = 5;
+  NumBs = 4;
+  VectorSize = 6;
+var
+  Q: TNNetVolumeQuant8;
+  Codes: TInt8DynArr;
+  Scales: TNeuralFloatDynArr;
+  VBs, OutArr, OutVol: TNNetVolume;
+  i: integer;
+begin
+  Q := TNNetVolumeQuant8.Create();
+  VBs := TNNetVolume.Create(NumBs, 1, VectorSize);
+  OutArr := TNNetVolume.Create(NumAs * NumBs, 1, 1);
+  OutVol := TNNetVolume.Create(NumAs * NumBs, 1, 1);
+  try
+    FillQuant8Table(Q, NumAs, VectorSize, Codes, Scales);
+    FillQuant8Inputs(VBs);
+    // Full range. Tile sizes deliberately do not divide the ranges.
+    OutArr.Fill(0);
+    OutVol.Fill(0);
+    OutArr.DotProductsTiledInt8(NumAs, NumBs, VectorSize, Codes, Scales, VBs,
+      3, 3);
+    OutVol.DotProductsTiledInt8(NumAs, NumBs, VectorSize, Q, VBs, 3, 3);
+    for i := 0 to NumAs * NumBs - 1 do
+      AssertEquals('Full range element ' + IntToStr(i),
+        OutArr.FData[i], OutVol.FData[i]);
+    // Guards against a vacuous comparison of two all-zero outputs.
+    AssertTrue('Full range produced non-zero output',
+      OutVol.GetSumAbs() > 0);
+    // Ranged twin: a neuron slice crossed with a position slice.
+    OutArr.Fill(0);
+    OutVol.Fill(0);
+    OutArr.DotProductsTiledInt8(NumAs, {BStart}1, {BFinish}2, VectorSize,
+      Codes, Scales, VBs, 2, 2, {AStart}1, {AFinish}3);
+    OutVol.DotProductsTiledInt8(NumAs, {BStart}1, {BFinish}2, VectorSize,
+      Q, VBs, 2, 2, {AStart}1, {AFinish}3);
+    for i := 0 to NumAs * NumBs - 1 do
+      AssertEquals('Ranged element ' + IntToStr(i),
+        OutArr.FData[i], OutVol.FData[i]);
+    // The slice really did write only its own rows.
+    AssertEquals('Outside the slice stays zero', 0, OutVol.FData[0]);
+  finally
+    OutVol.Free;
+    OutArr.Free;
+    VBs.Free;
+    Q.Free;
+  end;
+end;
+
+procedure TTestNeuralVolumeQuant8.TestQuant8GroupedTiledDotProductMatchesArrays;
+const
+  Groups = 2;
+  NumAs = 4;
+  NumBs = 3;
+  VectorSize = 3;
+var
+  Q: TNNetVolumeQuant8;
+  Codes: TInt8DynArr;
+  Scales: TNeuralFloatDynArr;
+  VBs: TNNetVolume;
+  OutArr, OutVol: TNNetGroupedVolume;
+  i: integer;
+begin
+  Q := TNNetVolumeQuant8.Create();
+  // Grouped inputs hold VectorSize*Groups per position.
+  VBs := TNNetVolume.Create(NumBs, 1, VectorSize * Groups);
+  OutArr := TNNetGroupedVolume.Create(NumAs * NumBs, 1, 1);
+  OutVol := TNNetGroupedVolume.Create(NumAs * NumBs, 1, 1);
+  try
+    FillQuant8Table(Q, NumAs, VectorSize, Codes, Scales);
+    FillQuant8Inputs(VBs);
+    OutArr.Fill(0);
+    OutVol.Fill(0);
+    OutArr.GroupedDotProductsTiledInt8(Groups, NumAs, NumBs, VectorSize,
+      Codes, Scales, VBs, 3, 2);
+    OutVol.GroupedDotProductsTiledInt8(Groups, NumAs, NumBs, VectorSize,
+      Q, VBs, 3, 2);
+    for i := 0 to NumAs * NumBs - 1 do
+      AssertEquals('Grouped element ' + IntToStr(i),
+        OutArr.FData[i], OutVol.FData[i]);
+    AssertTrue('Grouped produced non-zero output', OutVol.GetSumAbs() > 0);
+  finally
+    OutVol.Free;
+    OutArr.Free;
+    VBs.Free;
+    Q.Free;
   end;
 end;
 
