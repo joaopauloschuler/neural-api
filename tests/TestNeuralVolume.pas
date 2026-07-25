@@ -55,6 +55,27 @@ type
     procedure TestNeuralGreedyNMS;
   end;
 
+  // TNNetVolumeQuant8 holds int8 codes under the TNNetVolume geometry
+  // contract, with one scale per (x,y). These tests pin the layout agreement
+  // with TNNetVolume, the empty state and the eviction primitive.
+  TTestNeuralVolumeQuant8 = class(TTestCase)
+  published
+    procedure TestQuant8EmptyState;
+    procedure TestQuant8ResizeGeometry;
+    procedure TestQuant8LayoutMatchesVolume;
+    procedure TestQuant8StoreAndGet;
+    procedure TestQuant8RawPointers;
+    procedure TestQuant8ScaleAccess;
+    procedure TestQuant8Dequantize;
+    procedure TestQuant8DequantizeTo;
+    procedure TestQuant8CopyFrom;
+    procedure TestQuant8DeleteRows;
+    procedure TestQuant8DeleteRowsGuards;
+    procedure TestQuant8GetQuantData;
+    procedure TestQuant8MemSize;
+    procedure TestQuant8FillAndReshapeCycles;
+  end;
+
 implementation
 
 procedure TTestNeuralVolume.TestVolumeCreation;
@@ -1074,7 +1095,420 @@ begin
   AssertEquals('Empty NMS count', 0, Length(Kept));
 end;
 
+{ TTestNeuralVolumeQuant8 }
+
+// Fills a (2,3,4) volume with a distinct code per element and a distinct
+// scale per row, so any layout mistake shows up as a mismatched value.
+procedure FillQuant8Sample(V: TNNetVolumeQuant8);
+var
+  x, y, d: integer;
+begin
+  V.ReSize(2, 3, 4);
+  for y := 0 to 2 do
+  begin
+    for x := 0 to 1 do
+    begin
+      V.Scale[x, y] := 0.5 + y + 10 * x;
+      for d := 0 to 3 do V.Store(x, y, d, ShortInt(x * 10 + y * 2 + d));
+    end;
+  end;
+end;
+
+procedure TTestNeuralVolumeQuant8.TestQuant8EmptyState;
+var
+  V: TNNetVolumeQuant8;
+begin
+  V := TNNetVolumeQuant8.Create();
+  try
+    AssertEquals('Empty size', 0, V.Size);
+    AssertEquals('Empty scale count', 0, V.ScaleCount);
+    AssertEquals('Empty SizeX', 0, V.SizeX);
+    AssertEquals('Empty SizeY', 0, V.SizeY);
+    AssertEquals('Empty Depth', 0, V.Depth);
+    AssertTrue('Empty DataPtr is nil', V.DataPtr = nil);
+    // The scale plane is parked at (1,1,1) rather than emptied: TNNetVolume
+    // takes addr(FData[0]) unconditionally, which range-checks on a
+    // zero-length array. ScaleCount, not ScaleData.Size, is the live count.
+    AssertTrue('Scale plane is never nil', V.ScaleData <> nil);
+    AssertEquals('Empty memory size', 0, V.GetMemSize());
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolumeQuant8.TestQuant8ResizeGeometry;
+var
+  V: TNNetVolumeQuant8;
+begin
+  V := TNNetVolumeQuant8.Create(2, 3, 4);
+  try
+    AssertEquals('Size', 24, V.Size);
+    AssertEquals('SizeX', 2, V.SizeX);
+    AssertEquals('SizeY', 3, V.SizeY);
+    AssertEquals('Depth', 4, V.Depth);
+    AssertEquals('Scale count', 6, V.ScaleCount);
+    AssertEquals('Scale plane SizeX', 2, V.ScaleData.SizeX);
+    AssertEquals('Scale plane SizeY', 3, V.ScaleData.SizeY);
+    AssertEquals('Scale plane Depth', 1, V.ScaleData.Depth);
+    AssertTrue('DataPtr is armed', V.DataPtr <> nil);
+    AssertEquals('FData length', 24, Length(V.FData));
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolumeQuant8.TestQuant8LayoutMatchesVolume;
+var
+  V: TNNetVolumeQuant8;
+  F: TNNetVolume;
+  x, y, d: integer;
+begin
+  V := TNNetVolumeQuant8.Create(2, 3, 4);
+  F := TNNetVolume.Create(2, 3, 4);
+  try
+    // The whole point of the type: identical addressing to TNNetVolume, so
+    // migrated call sites keep their byte order.
+    for y := 0 to 2 do
+      for x := 0 to 1 do
+      begin
+        AssertEquals('Row base at ' + IntToStr(x) + ',' + IntToStr(y),
+          F.GetRawPos(x, y), V.GetRawPos(x, y));
+        for d := 0 to 3 do
+          AssertEquals('Pos at ' + IntToStr(x) + ',' + IntToStr(y) + ',' +
+            IntToStr(d), F.GetRawPos(x, y, d), V.GetRawPos(x, y, d));
+      end;
+  finally
+    F.Free;
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolumeQuant8.TestQuant8StoreAndGet;
+var
+  V: TNNetVolumeQuant8;
+  x, y, d: integer;
+begin
+  V := TNNetVolumeQuant8.Create();
+  try
+    FillQuant8Sample(V);
+    for y := 0 to 2 do
+      for x := 0 to 1 do
+        for d := 0 to 3 do
+        begin
+          AssertEquals('Get', x * 10 + y * 2 + d, integer(V.Get(x, y, d)));
+          AssertEquals('GetRaw agrees with Get', integer(V.Get(x, y, d)),
+            integer(V.GetRaw(V.GetRawPos(x, y, d))));
+        end;
+    V.SetRaw(0, -128);
+    AssertEquals('SetRaw lower bound', -128, integer(V.Get(0, 0, 0)));
+    V.Store(1, 2, 3, 127);
+    AssertEquals('Store upper bound', 127, integer(V.Get(1, 2, 3)));
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolumeQuant8.TestQuant8RawPointers;
+var
+  V: TNNetVolumeQuant8;
+  P: TNeuralInt8ArrPtr;
+begin
+  V := TNNetVolumeQuant8.Create();
+  try
+    FillQuant8Sample(V);
+    // Row base.
+    P := V.GetRawPtr(1, 2);
+    AssertEquals('Row base element 0', integer(V.Get(1, 2, 0)), integer(P^[0]));
+    AssertEquals('Row base element 3', integer(V.Get(1, 2, 3)), integer(P^[3]));
+    // Mid-row, as the convolutional taps index it.
+    P := V.GetRawPtr(1, 2, 3);
+    AssertEquals('Mid-row element', integer(V.Get(1, 2, 3)), integer(P^[0]));
+    // DataPtr is the base of the whole buffer.
+    AssertEquals('DataPtr element 0', integer(V.GetRaw(0)),
+      integer(V.DataPtr^[0]));
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolumeQuant8.TestQuant8ScaleAccess;
+var
+  V: TNNetVolumeQuant8;
+  x, y: integer;
+begin
+  V := TNNetVolumeQuant8.Create();
+  try
+    FillQuant8Sample(V);
+    for y := 0 to 2 do
+      for x := 0 to 1 do
+      begin
+        AssertEquals('Scale property', 0.5 + y + 10 * x, V.Scale[x, y], 1e-6);
+        // ScalePtr delegates to the scale plane and must see the same writes.
+        AssertEquals('ScalePtr agrees', V.Scale[x, y],
+          V.ScalePtr^[V.SizeX * y + x], 1e-6);
+      end;
+    V.Scale[0, 1] := -3.25;
+    AssertEquals('Scale write', -3.25, V.Scale[0, 1], 1e-6);
+    AssertEquals('Scale write via plane', -3.25, V.ScalePtr^[2], 1e-6);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolumeQuant8.TestQuant8Dequantize;
+var
+  V: TNNetVolumeQuant8;
+  x, y, d: integer;
+begin
+  V := TNNetVolumeQuant8.Create();
+  try
+    FillQuant8Sample(V);
+    for y := 0 to 2 do
+      for x := 0 to 1 do
+        for d := 0 to 3 do
+          AssertEquals('Dequantize', V.Get(x, y, d) * V.Scale[x, y],
+            V.Dequantize(x, y, d), 1e-5);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolumeQuant8.TestQuant8DequantizeTo;
+var
+  V: TNNetVolumeQuant8;
+  F: TNNetVolume;
+  x, y, d: integer;
+begin
+  V := TNNetVolumeQuant8.Create();
+  F := TNNetVolume.Create(1, 1, 1);
+  try
+    FillQuant8Sample(V);
+    V.DequantizeTo(F);
+    AssertEquals('Dest SizeX', 2, F.SizeX);
+    AssertEquals('Dest SizeY', 3, F.SizeY);
+    AssertEquals('Dest Depth', 4, F.Depth);
+    for y := 0 to 2 do
+      for x := 0 to 1 do
+        for d := 0 to 3 do
+          AssertEquals('Dequantized element',
+            V.Get(x, y, d) * V.Scale[x, y], F[x, y, d], 1e-5);
+    // A row expansion writes exactly the row it was asked for.
+    F.Fill(0);
+    V.DequantizeRowTo(1, 2, TNeuralFloatArrPtr(F.GetRawPtr(1, 2, 0)));
+    for d := 0 to 3 do
+      AssertEquals('Row expansion', V.Get(1, 2, d) * V.Scale[1, 2],
+        F[1, 2, d], 1e-5);
+    AssertEquals('Untouched neighbour', 0.0, F[0, 0, 0], 1e-5);
+  finally
+    F.Free;
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolumeQuant8.TestQuant8CopyFrom;
+var
+  V, C: TNNetVolumeQuant8;
+  x, y, d: integer;
+begin
+  V := TNNetVolumeQuant8.Create();
+  C := TNNetVolumeQuant8.Create(1, 1, 1);
+  try
+    FillQuant8Sample(V);
+    C.CopyFrom(V);
+    AssertEquals('Copied size', V.Size, C.Size);
+    AssertEquals('Copied scale count', V.ScaleCount, C.ScaleCount);
+    for y := 0 to 2 do
+      for x := 0 to 1 do
+      begin
+        AssertEquals('Copied scale', V.Scale[x, y], C.Scale[x, y], 1e-6);
+        for d := 0 to 3 do
+          AssertEquals('Copied code', integer(V.Get(x, y, d)),
+            integer(C.Get(x, y, d)));
+      end;
+    // Deep copy: writing the copy must not reach the original.
+    C.Store(0, 0, 0, 99);
+    C.Scale[0, 0] := 42;
+    AssertEquals('Original code untouched', 0, integer(V.Get(0, 0, 0)));
+    AssertEquals('Original scale untouched', 0.5, V.Scale[0, 0], 1e-6);
+  finally
+    C.Free;
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolumeQuant8.TestQuant8DeleteRows;
+var
+  V, C: TNNetVolumeQuant8;
+  x, d: integer;
+begin
+  V := TNNetVolumeQuant8.Create();
+  C := TNNetVolumeQuant8.Create();
+  try
+    FillQuant8Sample(V);
+    C.CopyFrom(V);
+    // Rolling-window eviction: drop row 0, rows 1 and 2 shift down.
+    C.DeleteRows(0, 1);
+    AssertEquals('Capacity unchanged', 24, C.Size);
+    AssertEquals('SizeY unchanged', 3, C.SizeY);
+    for x := 0 to 1 do
+    begin
+      AssertEquals('Scale row 0', V.Scale[x, 1], C.Scale[x, 0], 1e-6);
+      AssertEquals('Scale row 1', V.Scale[x, 2], C.Scale[x, 1], 1e-6);
+      for d := 0 to 3 do
+      begin
+        AssertEquals('Code row 0', integer(V.Get(x, 1, d)),
+          integer(C.Get(x, 0, d)));
+        AssertEquals('Code row 1', integer(V.Get(x, 2, d)),
+          integer(C.Get(x, 1, d)));
+      end;
+    end;
+    // Default Count is 1, and two rows can go at once.
+    C.CopyFrom(V);
+    C.DeleteRows(0);
+    for x := 0 to 1 do
+      AssertEquals('Default count drops one row', V.Scale[x, 1],
+        C.Scale[x, 0], 1e-6);
+    C.CopyFrom(V);
+    C.DeleteRows(0, 2);
+    for x := 0 to 1 do
+    begin
+      AssertEquals('Two rows dropped', V.Scale[x, 2], C.Scale[x, 0], 1e-6);
+      for d := 0 to 3 do
+        AssertEquals('Two rows dropped, codes', integer(V.Get(x, 2, d)),
+          integer(C.Get(x, 0, d)));
+    end;
+  finally
+    C.Free;
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolumeQuant8.TestQuant8DeleteRowsGuards;
+var
+  V, C: TNNetVolumeQuant8;
+  x, y, d: integer;
+
+  procedure AssertUnchanged(const Msg: string);
+  var
+    xi, yi, di: integer;
+  begin
+    for yi := 0 to 2 do
+      for xi := 0 to 1 do
+      begin
+        AssertEquals(Msg + ' scale', V.Scale[xi, yi], C.Scale[xi, yi], 1e-6);
+        for di := 0 to 3 do
+          AssertEquals(Msg + ' code', integer(V.Get(xi, yi, di)),
+            integer(C.Get(xi, yi, di)));
+      end;
+  end;
+
+begin
+  V := TNNetVolumeQuant8.Create();
+  C := TNNetVolumeQuant8.Create();
+  try
+    FillQuant8Sample(V);
+    C.CopyFrom(V);
+    C.DeleteRows(0, 0);        // nothing to drop
+    AssertUnchanged('Zero count');
+    C.DeleteRows(-1, 1);       // negative start
+    AssertUnchanged('Negative start');
+    C.DeleteRows(2, 5);        // runs past the end
+    AssertUnchanged('Overrun');
+    C.DeleteRows(2, 1);        // last row: nothing above it to shift
+    AssertUnchanged('Last row');
+  finally
+    C.Free;
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolumeQuant8.TestQuant8GetQuantData;
+var
+  V: TNNetVolumeQuant8;
+  Codes: TInt8DynArr;
+  Scales: TNeuralFloatDynArr;
+  i: integer;
+begin
+  V := TNNetVolumeQuant8.Create();
+  try
+    FillQuant8Sample(V);
+    V.GetQuantData(Codes, Scales);
+    AssertEquals('Exported code count', 24, Length(Codes));
+    AssertEquals('Exported scale count', 6, Length(Scales));
+    for i := 0 to 23 do
+      AssertEquals('Exported code ' + IntToStr(i), integer(V.GetRaw(i)),
+        integer(Codes[i]));
+    for i := 0 to 5 do
+      AssertEquals('Exported scale ' + IntToStr(i), V.ScalePtr^[i],
+        Scales[i], 1e-6);
+    // An empty volume exports empty arrays instead of failing.
+    V.ReSize(0, 0, 0);
+    V.GetQuantData(Codes, Scales);
+    AssertEquals('Empty export codes', 0, Length(Codes));
+    AssertEquals('Empty export scales', 0, Length(Scales));
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolumeQuant8.TestQuant8MemSize;
+var
+  V: TNNetVolumeQuant8;
+begin
+  V := TNNetVolumeQuant8.Create(2, 3, 4);
+  try
+    // 24 codes at one byte plus 6 scales at four bytes.
+    AssertEquals('Memory size', 24 + 6 * 4, V.GetMemSize());
+    // A weight-shaped volume: one scale per neuron row.
+    V.ReSize(1, 4, 6);
+    AssertEquals('Weight-shaped memory size', 24 + 4 * 4, V.GetMemSize());
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolumeQuant8.TestQuant8FillAndReshapeCycles;
+var
+  V: TNNetVolumeQuant8;
+begin
+  V := TNNetVolumeQuant8.Create();
+  try
+    FillQuant8Sample(V);
+    V.Fill(-7);
+    AssertEquals('Filled negative', -7, integer(V.Get(1, 1, 1)));
+    AssertEquals('Filled negative, first', -7, integer(V.GetRaw(0)));
+    V.Fill(0);
+    AssertEquals('Filled zero', 0, integer(V.Get(1, 1, 1)));
+    // Shrink to empty and grow again: ReSize alone keeps every field in step.
+    V.ReSize(0, 0, 0);
+    AssertEquals('Shrunk size', 0, V.Size);
+    AssertEquals('Shrunk scale count', 0, V.ScaleCount);
+    AssertTrue('Shrunk DataPtr is nil', V.DataPtr = nil);
+    V.ReSize(5, 1, 3);
+    AssertEquals('Regrown size', 15, V.Size);
+    AssertEquals('Regrown scale count', 5, V.ScaleCount);
+    AssertTrue('Regrown DataPtr is armed', V.DataPtr <> nil);
+    AssertEquals('Regrown FData length', 15, Length(V.FData));
+    // Weight shape: X = 1, Y = neuron, Depth = vector size. Row r starts at
+    // r*Depth, which is how the concatenated weights are laid out today.
+    V.ReSize(1, 4, 6);
+    AssertEquals('Weight shape size', 24, V.Size);
+    AssertEquals('Weight shape scale count', 4, V.ScaleCount);
+    AssertEquals('Weight row base', 3 * 6, V.GetRawPos(0, 3));
+    AssertEquals('Weight element', 3 * 6 + 5, V.GetRawPos(0, 3, 5));
+    // Same element count, different geometry: the buffer is kept, the scale
+    // plane follows the new (x,y) count.
+    V.ReSize(2, 4, 3);
+    AssertEquals('Reshaped size', 24, V.Size);
+    AssertEquals('Reshaped scale count', 8, V.ScaleCount);
+    AssertEquals('Reshaped scale plane', 8, V.ScaleData.Size);
+  finally
+    V.Free;
+  end;
+end;
+
 initialization
   RegisterTest(TTestNeuralVolume);
+  RegisterTest(TTestNeuralVolumeQuant8);
 
 end.

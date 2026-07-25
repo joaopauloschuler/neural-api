@@ -660,6 +660,84 @@ type
       procedure GroupedDotProductsTiledInt8(Groups, NumAs, NumBs, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
   end;
 
+  { TNNetVolumeQuant8 }
+
+  // Symmetric int8 storage carrying the geometry contract of TNNetVolume:
+  // code (x,y,d) lives at ((SizeX*y) + x) * Depth + d, so Depth is always the
+  // quantized vector, Y the slow row axis and X the inner grouping axis. Every
+  // (x,y) pair owns one scale and the dequantized value is code*Scale[x,y].
+  // The scale plane is itself a TNNetVolume of shape (SizeX, SizeY, 1), so a
+  // scale is addressed by the very same formula with d = 0.
+  //
+  // ReSize is the only member that changes lengths. SetLength may move the
+  // buffer, so a SetLength on FData anywhere else would leave DataPtr
+  // dangling. ReSize does not fill: after a growth the contents are whatever
+  // SetLength left behind, and callers wanting a known state fill it
+  // themselves. The empty state is Size = 0, a nil DataPtr and an empty (never
+  // nil) scale plane. Coded by Claude (AI).
+  TNNetVolumeQuant8 = class(TObject)
+    private
+      FScaleData: TNNetVolume;
+      FDataPtr: TNeuralInt8ArrPtr;
+      FSizeX, FSizeY, FDepth, FSize: integer;
+      function GetScale(x, y: integer): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      procedure SetScale(x, y: integer; Value: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
+      function GetScalePtr(): TNeuralFloatArrPtr; {$IFDEF Release} inline; {$ENDIF}
+      function GetScaleCount(): integer; {$IFDEF Release} inline; {$ENDIF}
+    public
+      // Exposed exactly like TNNetVolume.FData: the int8 kernels and the
+      // loaders take raw pointers into it. Never SetLength it - call ReSize.
+      FData: TInt8DynArr;
+
+      constructor Create(); {$IFNDEF FPC} overload; {$ENDIF}
+      constructor Create(pSizeX, pSizeY, pDepth: integer); {$IFNDEF FPC} overload; {$ENDIF}
+      destructor Destroy(); override;
+
+      procedure ReSize(pSizeX, pSizeY, pDepth: integer); overload;
+      procedure ReSize(Original: TNNetVolumeQuant8); overload;
+
+      function GetRawPos(x, y, d: integer): integer; overload; {$IFDEF Release} inline; {$ENDIF}
+      function GetRawPos(x, y: integer): integer; overload; {$IFDEF Release} inline; {$ENDIF}
+      // Base of the (x,y) row, or of the element (x,y,d) - convolutional taps
+      // index mid-row. Both are pure arithmetic on DataPtr.
+      function GetRawPtr(x, y: integer): TNeuralInt8ArrPtr; overload; {$IFDEF Release} inline; {$ENDIF}
+      function GetRawPtr(x, y, d: integer): TNeuralInt8ArrPtr; overload; {$IFDEF Release} inline; {$ENDIF}
+
+      function Get(x, y, d: integer): ShortInt; {$IFDEF Release} inline; {$ENDIF}
+      procedure Store(x, y, d: integer; Value: ShortInt); {$IFDEF Release} inline; {$ENDIF}
+      function GetRaw(p: integer): ShortInt; {$IFDEF Release} inline; {$ENDIF}
+      procedure SetRaw(p: integer; Value: ShortInt); {$IFDEF Release} inline; {$ENDIF}
+
+      function Dequantize(x, y, d: integer): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      // Expands the (x,y) row into Depth floats at Dest.
+      procedure DequantizeRowTo(x, y: integer; Dest: TNeuralFloatArrPtr);
+      // Expands every row into Dest, resized to (SizeX, SizeY, Depth). Leaves
+      // Dest untouched when this volume is empty.
+      procedure DequantizeTo(Dest: TNNetVolume);
+
+      procedure Fill(c: ShortInt = 0);
+      procedure CopyFrom(Original: TNNetVolumeQuant8);
+      // Drops Count rows from row StartY on and shifts the rows above them
+      // down, leaving the last Count rows stale. Capacity is untouched: this
+      // is the rolling-window eviction primitive, not a resize.
+      procedure DeleteRows(StartY: integer; Count: integer = 1);
+      // Plain copies of both planes, for callers that export or serialize.
+      procedure GetQuantData(out pCodes: TInt8DynArr; out pScales: TNeuralFloatDynArr);
+      function GetMemSize(): int64;
+
+      property SizeX: integer read FSizeX;
+      property SizeY: integer read FSizeY;
+      property Depth: integer read FDepth;
+      property Size: integer read FSize;
+      property ScaleCount: integer read GetScaleCount;
+      property DataPtr: TNeuralInt8ArrPtr read FDataPtr;
+      property ScalePtr: TNeuralFloatArrPtr read GetScalePtr;
+      // Exposed for Fill/Copy/inspection. Never ReSize it directly: ReSize
+      // keeps it in step with FData.
+      property ScaleData: TNNetVolume read FScaleData;
+      property Scale[x, y: integer]: TNeuralFloat read GetScale write SetScale;
+  end;
+
   { TNNetSamplerBase }
 
   TNNetSamplerBase = class(TObject)
@@ -15480,6 +15558,211 @@ begin
 end;
 
 {$ENDIF} // of AVXANY
+
+{ TNNetVolumeQuant8 }
+
+constructor TNNetVolumeQuant8.Create();
+begin
+  Create(0, 0, 0);
+end;
+
+constructor TNNetVolumeQuant8.Create(pSizeX, pSizeY, pDepth: integer);
+begin
+  inherited Create();
+  FScaleData := TNNetVolume.Create(1, 1, 1);
+  FSizeX := 0;
+  FSizeY := 0;
+  FDepth := 0;
+  FSize := 0;
+  FDataPtr := nil;
+  ReSize(pSizeX, pSizeY, pDepth);
+end;
+
+destructor TNNetVolumeQuant8.Destroy();
+begin
+  SetLength(FData, 0);
+  FDataPtr := nil;
+  FScaleData.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetVolumeQuant8.ReSize(pSizeX, pSizeY, pDepth: integer);
+var
+  NewSize: integer;
+begin
+  NewSize := pSizeX * pSizeY * pDepth;
+  if (NewSize <> FSize) then
+  begin
+    FSize := NewSize;
+    SetLength(FData, FSize);
+  end;
+  FSizeX := pSizeX;
+  FSizeY := pSizeY;
+  FDepth := pDepth;
+  // One scale per (x,y). The scale plane keeps Depth 1 so that GetRawPos with
+  // d = 0 addresses both planes. It is never emptied: TNNetVolume.ReSize takes
+  // addr(FData[0]) unconditionally, which range-checks under -Cr on a
+  // zero-length array, so an empty volume parks the plane at (1,1,1). Read
+  // ScaleCount, not ScaleData.Size, for the number of live scales.
+  if (pSizeX * pSizeY) > 0
+  then FScaleData.ReSize(pSizeX, pSizeY, 1)
+  else FScaleData.ReSize(1, 1, 1);
+  if FSize > 0
+  then FDataPtr := addr(FData[0])
+  else FDataPtr := nil;
+end;
+
+procedure TNNetVolumeQuant8.ReSize(Original: TNNetVolumeQuant8);
+begin
+  ReSize(Original.SizeX, Original.SizeY, Original.Depth);
+end;
+
+function TNNetVolumeQuant8.GetRawPos(x, y, d: integer): integer;
+begin
+  Result := ((FSizeX * y) + x) * FDepth + d;
+end;
+
+function TNNetVolumeQuant8.GetRawPos(x, y: integer): integer;
+begin
+  Result := ((FSizeX * y) + x) * FDepth;
+end;
+
+function TNNetVolumeQuant8.GetRawPtr(x, y: integer): TNeuralInt8ArrPtr;
+begin
+  Result := TNeuralInt8ArrPtr(@FDataPtr^[((FSizeX * y) + x) * FDepth]);
+end;
+
+function TNNetVolumeQuant8.GetRawPtr(x, y, d: integer): TNeuralInt8ArrPtr;
+begin
+  Result := TNeuralInt8ArrPtr(@FDataPtr^[((FSizeX * y) + x) * FDepth + d]);
+end;
+
+function TNNetVolumeQuant8.Get(x, y, d: integer): ShortInt;
+begin
+  Result := FData[((FSizeX * y) + x) * FDepth + d];
+end;
+
+procedure TNNetVolumeQuant8.Store(x, y, d: integer; Value: ShortInt);
+begin
+  FData[((FSizeX * y) + x) * FDepth + d] := Value;
+end;
+
+function TNNetVolumeQuant8.GetRaw(p: integer): ShortInt;
+begin
+  Result := FData[p];
+end;
+
+procedure TNNetVolumeQuant8.SetRaw(p: integer; Value: ShortInt);
+begin
+  FData[p] := Value;
+end;
+
+function TNNetVolumeQuant8.GetScale(x, y: integer): TNeuralFloat;
+begin
+  Result := FScaleData.FData[(FSizeX * y) + x];
+end;
+
+procedure TNNetVolumeQuant8.SetScale(x, y: integer; Value: TNeuralFloat);
+begin
+  FScaleData.FData[(FSizeX * y) + x] := Value;
+end;
+
+function TNNetVolumeQuant8.GetScalePtr(): TNeuralFloatArrPtr;
+begin
+  Result := FScaleData.DataPtr;
+end;
+
+function TNNetVolumeQuant8.GetScaleCount(): integer;
+begin
+  Result := FSizeX * FSizeY;
+end;
+
+function TNNetVolumeQuant8.Dequantize(x, y, d: integer): TNeuralFloat;
+begin
+  Result := FData[((FSizeX * y) + x) * FDepth + d] *
+    FScaleData.FData[(FSizeX * y) + x];
+end;
+
+procedure TNNetVolumeQuant8.DequantizeRowTo(x, y: integer;
+  Dest: TNeuralFloatArrPtr);
+var
+  RowBase, DepthM1, DCnt: integer;
+  RowScale: TNeuralFloat;
+begin
+  RowBase := ((FSizeX * y) + x) * FDepth;
+  RowScale := FScaleData.FData[(FSizeX * y) + x];
+  DepthM1 := FDepth - 1;
+  for DCnt := 0 to DepthM1 do
+  begin
+    Dest^[DCnt] := FDataPtr^[RowBase + DCnt] * RowScale;
+  end;
+end;
+
+procedure TNNetVolumeQuant8.DequantizeTo(Dest: TNNetVolume);
+var
+  XCnt, YCnt, SizeXM1, SizeYM1: integer;
+begin
+  if FSize = 0 then exit;
+  Dest.ReSize(FSizeX, FSizeY, FDepth);
+  SizeXM1 := FSizeX - 1;
+  SizeYM1 := FSizeY - 1;
+  for YCnt := 0 to SizeYM1 do
+  begin
+    for XCnt := 0 to SizeXM1 do
+    begin
+      DequantizeRowTo(XCnt, YCnt,
+        TNeuralFloatArrPtr(Dest.GetRawPtr(XCnt, YCnt, 0)));
+    end;
+  end;
+end;
+
+procedure TNNetVolumeQuant8.Fill(c: ShortInt);
+begin
+  if FSize > 0 then FillChar(FData[0], FSize * csShortIntSize, byte(c));
+end;
+
+procedure TNNetVolumeQuant8.CopyFrom(Original: TNNetVolumeQuant8);
+begin
+  ReSize(Original.SizeX, Original.SizeY, Original.Depth);
+  if FSize > 0
+  then Move(Original.FData[0], FData[0], FSize * csShortIntSize);
+  FScaleData.Copy(Original.ScaleData);
+end;
+
+procedure TNNetVolumeQuant8.DeleteRows(StartY: integer; Count: integer);
+var
+  RowCodes, RowScales, MoveRows: integer;
+begin
+  if (Count <= 0) or (StartY < 0) or (StartY + Count > FSizeY) then exit;
+  MoveRows := FSizeY - StartY - Count;
+  if MoveRows <= 0 then exit;
+  RowCodes := FSizeX * FDepth;
+  RowScales := FSizeX;
+  Move(FData[(StartY + Count) * RowCodes], FData[StartY * RowCodes],
+    MoveRows * RowCodes * csShortIntSize);
+  Move(FScaleData.FData[(StartY + Count) * RowScales],
+    FScaleData.FData[StartY * RowScales],
+    MoveRows * RowScales * csNeuralFloatSize);
+end;
+
+procedure TNNetVolumeQuant8.GetQuantData(out pCodes: TInt8DynArr;
+  out pScales: TNeuralFloatDynArr);
+var
+  ScaleCnt: integer;
+begin
+  ScaleCnt := FSizeX * FSizeY;
+  SetLength(pCodes, FSize);
+  SetLength(pScales, ScaleCnt);
+  if FSize > 0 then Move(FData[0], pCodes[0], FSize * csShortIntSize);
+  if ScaleCnt > 0
+  then Move(FScaleData.FData[0], pScales[0], ScaleCnt * csNeuralFloatSize);
+end;
+
+function TNNetVolumeQuant8.GetMemSize(): int64;
+begin
+  Result := int64(FSize) * csShortIntSize +
+    int64(FSizeX) * int64(FSizeY) * csNeuralFloatSize;
+end;
 
 { TNNetGroupedVolume }
 
