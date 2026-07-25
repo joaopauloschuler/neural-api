@@ -53518,7 +53518,7 @@ end;
 
 procedure TNNetReZero.Backpropagate();
 var
-  LpBnd37: integer;
+  MaxOutputErrorPos: integer;
   StartTime: double;
   localNeuron: TNNetNeuron;
   gradAlpha, alpha: TNeuralFloat;
@@ -124286,7 +124286,7 @@ end;
 
 function TNNetLayer.ForceMaxAbsoluteDelta(vMax: TNeuralFloat): TNeuralFloat;
 var
-  LpBnd284: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   MaxValue, MulValue: TNeuralFloat;
   D: TNNetVolume;
@@ -124294,8 +124294,8 @@ begin
   Result := 1;
   if FNeurons.Count > 0 then
   begin
-    LpBnd284 := FNeurons.Count - 1;
-    for Cnt := 0 to LpBnd284 do
+    MaxNeuronPos := FNeurons.Count - 1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       D := FNeurons[Cnt].Delta;  // #7: bind the Delta chain once
       MaxValue := D.GetMaxAbs();
@@ -124323,7 +124323,7 @@ end;
 
 procedure TNNetLayer.GetMinMaxAtDepth(pDepth: integer; var pMin, pMax: TNeuralFloat);
 var
-  LpBnd285: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   localMin, localMax: TNeuralFloat;
 begin
@@ -124334,8 +124334,8 @@ begin
     pMax := localMax;
     if FNeurons.Count > 1 then
     begin
-      LpBnd285 := FNeurons.Count-1;
-      for Cnt := 1 to LpBnd285 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 1 to MaxNeuronPos do
       begin
         FNeurons[Cnt].Weights.GetMinMaxAtDepth(pDepth, localMin, localMax);
         pMin := Min(pMin, localMin);
@@ -124347,14 +124347,14 @@ end;
 
 function TNNetLayer.GetWeightSum(): TNeuralFloat;
 var
-  LpBnd286: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   Result := 0;
   if FNeurons.Count > 0 then
   begin
-    LpBnd286 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd286 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       Result := Result + FNeurons[Cnt].Weights.GetSum();
     end;
@@ -124363,14 +124363,14 @@ end;
 
 function TNNetLayer.GetBiasSum(): TNeuralFloat;
 var
-  LpBnd287: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   Result := 0;
   if FNeurons.Count > 0 then
   begin
-    LpBnd287 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd287 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       Result := Result + FNeurons[Cnt].FBiasWeight;
     end;
@@ -124379,7 +124379,7 @@ end;
 
 function TNNetLayer.GetDeltaSum(): TNeuralFloat;
 var
-  LpBnd288: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   Neuron: TNNetNeuron;
 begin
@@ -124388,8 +124388,8 @@ begin
   if not FIsTrainable then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd288 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd288 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       Neuron := FNeurons[Cnt];
       Result := Result +
@@ -124402,7 +124402,7 @@ end;
 
 function TNNetLayer.GetInertiaSum(): TNeuralFloat;
 var
-  LpBnd289: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   Neuron: TNNetNeuron;
 begin
@@ -124411,8 +124411,8 @@ begin
   if not FIsTrainable then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd289 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd289 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       Neuron := FNeurons[Cnt];
       Result := Result +
@@ -124426,15 +124426,15 @@ end;
 
 function TNNetLayer.CountWeights(): int64;
 var
-  LpBnd290: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   Result := 0;
   if FLinkedNeurons then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd290 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd290 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       Result := Result + FNeurons[Cnt].Weights.Size;
     end;
@@ -124450,14 +124450,14 @@ end;
 
 function TNNetLayer.MulWeights(V: TNeuralFloat): TNNetLayer;
 var
-  LpBnd291: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N: TNNetNeuron;
 begin
   if FNeurons.Count > 0 then
   begin
-    LpBnd291 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd291 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       N := FNeurons[Cnt];  // #7: bind once
       N.Weights.Mul(V);
@@ -124474,7 +124474,7 @@ end;
 
 procedure TNNetLayer.MulInertia(V: TNeuralFloat);
 var
-  LpBnd292: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N: TNNetNeuron;
 begin
@@ -124482,8 +124482,8 @@ begin
   if not FIsTrainable then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd292 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd292 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       N := FNeurons[Cnt];  // #7: bind once
       N.BackInertia.Mul(V);
@@ -124500,7 +124500,7 @@ end;
 
 procedure TNNetLayer.MulDeltas(V: TNeuralFloat);
 var
-  LpBnd293: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N: TNNetNeuron;
 begin
@@ -124508,8 +124508,8 @@ begin
   if not FIsTrainable then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd293 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd293 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       N := FNeurons[Cnt];  // #7: bind once
       N.Delta.Mul(V);
@@ -124521,7 +124521,7 @@ end;
 
 procedure TNNetLayer.ClipDeltasToValue(MaxAbsValue: TNeuralFloat);
 var
-  LpBnd294: integer;
+  MaxNeuronPos: integer;
   Cnt, ElemCnt, MaxElem: integer;
   V: TNeuralFloat;
   D: TNNetVolume;
@@ -124532,8 +124532,8 @@ begin
   if MaxAbsValue <= 0 then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd294 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd294 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       Neuron := FNeurons[Cnt];
       D := Neuron.Delta;
@@ -124557,13 +124557,13 @@ end;
 
 procedure TNNetLayer.ClearBias();
 var
-  LpBnd295: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   if FNeurons.Count > 0 then
   begin
-    LpBnd295 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd295 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       FNeurons[Cnt].FBiasWeight := 0;
     end;
@@ -124572,7 +124572,7 @@ end;
 
 procedure TNNetLayer.ClearInertia();
 var
-  LpBnd296: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N: TNNetNeuron;
 begin
@@ -124580,8 +124580,8 @@ begin
   if not FIsTrainable then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd296 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd296 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       N := FNeurons[Cnt];  // #7: bind once
       N.BackInertia.Fill(0);
@@ -124619,7 +124619,7 @@ end;
 
 procedure TNNetLayer.MulMulAddWeights(Value1, Value2: TNeuralFloat; Origin: TNNetLayer);
 var
-  LpBnd297: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N, O: TNNetNeuron;
 begin
@@ -124628,8 +124628,8 @@ begin
   begin
     if FNeurons.Count > 0 then
     begin
-      LpBnd297 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd297 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         N := FNeurons[Cnt];  // #7: bind both once
         O := Origin.Neurons[Cnt];
@@ -124655,7 +124655,7 @@ end;
 procedure TNNetLayer.MulMulAddInertia(Value1, Value2: TNeuralFloat;
   Origin: TNNetLayer);
 var
-  LpBnd298: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N, O: TNNetNeuron;
 begin
@@ -124666,8 +124666,8 @@ begin
   begin
     if FNeurons.Count > 0 then
     begin
-      LpBnd298 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd298 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         N := FNeurons[Cnt];  // #7: bind both once
         O := Origin.Neurons[Cnt];
@@ -124693,7 +124693,7 @@ end;
 
 procedure TNNetLayer.SumWeights(Origin: TNNetLayer);
 var
-  LpBnd299: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N, O: TNNetNeuron;
 begin
@@ -124702,8 +124702,8 @@ begin
   begin
     if FNeurons.Count > 0 then
     begin
-      LpBnd299 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd299 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         N := FNeurons[Cnt];  // #7: bind both once
         O := Origin.Neurons[Cnt];
@@ -124733,7 +124733,7 @@ end;
 
 procedure TNNetLayer.SumInertia(Origin: TNNetLayer);
 var
-  LpBnd300: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N, O: TNNetNeuron;
 begin
@@ -124744,8 +124744,8 @@ begin
   begin
     if FNeurons.Count > 0 then
     begin
-      LpBnd300 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd300 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         N := FNeurons[Cnt];  // #7: bind both once
         O := Origin.Neurons[Cnt];
@@ -124822,7 +124822,7 @@ end;
 
 procedure TNNetLayer.CopyWeights(Origin: TNNetLayer);
 var
-  LpBnd301: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N, O: TNNetNeuron;
 begin
@@ -124831,8 +124831,8 @@ begin
   begin
     if FNeurons.Count > 0 then
     begin
-      LpBnd301 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd301 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         N := FNeurons[Cnt];  // #7: bind both once
         O := Origin.Neurons[Cnt];
@@ -124871,7 +124871,7 @@ end;
 
 procedure TNNetLayer.CopyInertia(Origin: TNNetLayer);
 var
-  LpBnd302: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N, O: TNNetNeuron;
 begin
@@ -124882,8 +124882,8 @@ begin
   begin
     if FNeurons.Count > 0 then
     begin
-      LpBnd302 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd302 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         N := FNeurons[Cnt];  // #7: bind both once
         O := Origin.Neurons[Cnt];
@@ -124921,14 +124921,14 @@ end;
 
 procedure TNNetLayer.ForceRangeWeights(V: TNeuralFloat);
 var
-  LpBnd303: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   if (FLinkedNeurons) or not(FCanNormalizeDelta) then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd303 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd303 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       FNeurons[Cnt].Weights.ForceMaxRange(V);
     end;
@@ -124938,14 +124938,14 @@ end;
 
 procedure TNNetLayer.ForcePositiveWeights();
 var
-  LpBnd304: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   if FLinkedNeurons and not(FCanNormalizeDelta) then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd304 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd304 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       FNeurons[Cnt].Weights.ForcePositive();
     end;
@@ -124983,7 +124983,7 @@ end;
 
 function TNNetLayer.SaveDataToString(): string;
 var
-  LpBnd305: integer;
+  MaxNeuronPos: integer;
   S: TNNetStringList;
   Cnt: integer;
 begin
@@ -124991,8 +124991,8 @@ begin
   S.SetCapacity(FNeurons.Count);
   if FNeurons.Count > 0 then
   begin
-    LpBnd305 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd305 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       S.Add(FNeurons[Cnt].SaveToString());
     end;
@@ -125004,7 +125004,7 @@ end;
 
 procedure TNNetLayer.LoadDataFromString(strData: string);
 var
-  LpBnd306: integer;
+  MaxNeuronTokenPos: integer;
   S: TStringList;
   Cnt: integer;
 begin
@@ -125014,8 +125014,8 @@ begin
   begin
     if S.Count > 0 then
     begin
-      LpBnd306 := S.Count-1;
-      for Cnt := 0 to LpBnd306 do
+      MaxNeuronTokenPos := S.Count-1;
+      for Cnt := 0 to MaxNeuronTokenPos do
       begin
         FNeurons[Cnt].LoadFromString(S[Cnt]);
       end;
@@ -125495,7 +125495,7 @@ end;
 
 function TNNetLayer.BuildPruneMaskFromThreshold(aThreshold: TNeuralFloat): integer;
 var
-  LpBnd307: integer;
+  MaxNeuronPos: integer;
   NeuronCnt, WeightCnt, WSize, WSizeM1: integer;
   Neuron: TNNetNeuron;
   Mask: TNNetVolume;
@@ -125510,8 +125510,8 @@ begin
     FPruneMask.Add(TNNetVolume.Create(1, 1, 1));
   while FPruneMask.Count > FNeurons.Count do
     FPruneMask.Delete(FPruneMask.Count - 1);
-  LpBnd307 := FNeurons.Count - 1;
-  for NeuronCnt := 0 to LpBnd307 do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for NeuronCnt := 0 to MaxNeuronPos do
   begin
     Neuron := FNeurons[NeuronCnt];
     Mask := FPruneMask[NeuronCnt];
@@ -125534,15 +125534,15 @@ end;
 
 procedure TNNetLayer.ZeroPrunedWeights();
 var
-  LpBnd308: integer;
+  MaxNeuronPos: integer;
   NeuronCnt, WSize: integer;
   Neuron: TNNetNeuron;
   Mask: TNNetVolume;
   ZeroDelta, ZeroInertia, ZeroInertia2: boolean;
 begin
   if not Assigned(FPruneMask) then Exit;
-  LpBnd308 := FNeurons.Count - 1;
-  for NeuronCnt := 0 to LpBnd308 do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for NeuronCnt := 0 to MaxNeuronPos do
   begin
     if NeuronCnt >= FPruneMask.Count then Break;
     Neuron := FNeurons[NeuronCnt];
@@ -125593,19 +125593,19 @@ end;
 
 function TNNetLayer.CountPrunedWeights(): integer;
 var
-  LpBnd309: integer;
-  LpBnd310: integer;
+  MaxPruneMaskPos: integer;
+  MaxMaskPos: integer;
   NeuronCnt, WeightCnt: integer;
   Mask: TNNetVolume;
 begin
   Result := 0;
   if not Assigned(FPruneMask) then Exit;
-  LpBnd309 := FPruneMask.Count - 1;
-  for NeuronCnt := 0 to LpBnd309 do
+  MaxPruneMaskPos := FPruneMask.Count - 1;
+  for NeuronCnt := 0 to MaxPruneMaskPos do
   begin
     Mask := FPruneMask[NeuronCnt];
-    LpBnd310 := Mask.Size - 1;
-    for WeightCnt := 0 to LpBnd310 do
+    MaxMaskPos := Mask.Size - 1;
+    for WeightCnt := 0 to MaxMaskPos do
       if Mask.FData[WeightCnt] = 0 then Inc(Result);
   end;
 end;
@@ -126808,7 +126808,7 @@ end;
 function TNNetConvolution.ComputeNeuronAtOutputPosDefaultFast(NeuronIdx, x,
   y: integer): TNeuralFloat;
 var
-  LpBnd311: integer;
+  MaxWeightY: integer;
   Total: TNeuralFloat;
   LocalW: TNNetVolume;
   fi00, lo00: integer;
@@ -126820,8 +126820,8 @@ begin
 
   DepthX := FInputCopy.Depth * LocalW.SizeX;
 
-  LpBnd311 := LocalW.SizeY - 1;
-  for yCount := 0 to LpBnd311 do
+  MaxWeightY := LocalW.SizeY - 1;
+  for yCount := 0 to MaxWeightY do
   begin
     fi00 := FInputCopy.GetRawPos(x, y + yCount);
     lo00 := LocalW.GetRawPos(0, yCount);
