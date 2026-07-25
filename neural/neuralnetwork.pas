@@ -25265,7 +25265,7 @@ var
   StartTime: double;
   MaxX, MaxY, MaxD, Depth: integer;
   X, Y, D, Offset: integer;
-  XBnd, XStart, base, cnt, idx, idxEnd: integer;
+  XBnd, XStart, base, cnt: integer;
   LowerTriangle: boolean;
   MaskValue: TNeuralFloat;
 begin
@@ -25289,9 +25289,7 @@ begin
       begin
         base := FOutput.GetRawPos(0, Y);
         cnt := (XBnd + 1) * Depth;
-        idxEnd := base + cnt - 1;
-        for idx := base to idxEnd do
-          FOutput.FData[idx] := FOutput.FData[idx] + MaskValue;
+        TNNetVolume.AddScalar(FOutput.GetRawPtr(base), MaskValue, cnt);
       end;
     end;
   end
@@ -25307,9 +25305,7 @@ begin
       begin
         base := FOutput.GetRawPos(XStart, Y);
         cnt := (MaxX - XStart + 1) * Depth;
-        idxEnd := base + cnt - 1;
-        for idx := base to idxEnd do
-          FOutput.FData[idx] := FOutput.FData[idx] + MaskValue;
+        TNNetVolume.AddScalar(FOutput.GetRawPtr(base), MaskValue, cnt);
       end;
     end;
   end;
@@ -25346,7 +25342,7 @@ procedure TNNetTriangularCausalMask.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
   SeqLen, MaxX, MaxY, MaxD, Depth: integer;
   X, Y, D: integer;
-  XStart, base, cnt, k: integer;
+  XStart, base, cnt: integer;
   MaskValue: TNeuralFloat;
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -25372,8 +25368,7 @@ begin
     begin
       base := FMask.GetRawPos(XStart, Y);
       cnt := (MaxX - XStart + 1) * Depth;
-      for k := 0 to cnt - 1 do
-        FMask.FData[base + k] := FMask.FData[base + k] + MaskValue;
+      TNNetVolume.AddScalar(FMask.GetRawPtr(base), MaskValue, cnt);
     end;
   end;
 end;
@@ -25420,7 +25415,7 @@ procedure TNNetSlidingWindowMaskedFill.Compute();
 var
   StartTime: double;
   MaxX, MaxY, MaxD, Depth: integer;
-  X, Y, D, W, PastLimit, base, cnt, cntM1, k: integer;
+  X, Y, D, W, PastLimit, base, cnt: integer;
   MaskValue: TNeuralFloat;
 begin
   StartTime := Now();
@@ -25444,18 +25439,14 @@ begin
     begin
       base := FOutput.GetRawPos(0, Y);
       cnt := PastLimit * Depth;
-      cntM1 := cnt - 1;
-      for k := 0 to cntM1 do
-        FOutput.FData[base + k] := FOutput.FData[base + k] + MaskValue;
+      TNNetVolume.AddScalar(FOutput.GetRawPtr(base), MaskValue, cnt);
     end;
     // Strict-future run: X = Y+1 .. MaxX.
     if Y + 1 <= MaxX then
     begin
       base := FOutput.GetRawPos(Y + 1, Y);
       cnt := (MaxX - Y) * Depth;
-      cntM1 := cnt - 1;
-      for k := 0 to cntM1 do
-        FOutput.FData[base + k] := FOutput.FData[base + k] + MaskValue;
+      TNNetVolume.AddScalar(FOutput.GetRawPtr(base), MaskValue, cnt);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);

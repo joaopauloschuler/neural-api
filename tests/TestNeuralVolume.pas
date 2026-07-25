@@ -25,6 +25,7 @@ type
     procedure TestVolumeMaxAbsNegativeFirst;
     procedure TestVolumeMinMaxClassParity;
     procedure TestVolumeExpShiftSumParity;
+    procedure TestVolumeAddScalarParity;
     procedure TestVolumeFlip;
     procedure TestVolumeClassification;
     procedure TestVolumeSoftMax;
@@ -389,6 +390,40 @@ begin
       end;
     end;
   end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeAddScalarParity;
+// AddScalar is a broadcast add on an AVX2/64-bit build and a scalar loop
+// everywhere else, and it must be BIT-exact against the loop it replaces on
+// both - every element takes one float add, so there is no reassociation to
+// excuse a difference. Sizes straddle the 32-element block width and its tail.
+const
+  Sizes: array[0..10] of integer = (1, 7, 8, 31, 32, 33, 63, 64, 65, 97, 1000);
+  cAddend = -1e9;
+var
+  Buf, Ref: array of TNeuralFloat;
+  SI, K, N: integer;
+begin
+  RandSeed := 161803;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    SetLength(Buf, N);
+    SetLength(Ref, N);
+    for K := 0 to N - 1 do
+    begin
+      Buf[K] := (Random - 0.5) * 8;
+      Ref[K] := Buf[K] + cAddend;
+    end;
+    TNNetVolume.AddScalar(TNeuralFloatArrPtr(@Buf[0]), cAddend, N);
+    for K := 0 to N - 1 do
+      AssertEquals('AddScalar[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
+        Ref[K], Buf[K], 0.0);
+  end;
+  // A zero-length run must leave the buffer untouched.
+  Buf[0] := 5.0;
+  TNNetVolume.AddScalar(TNeuralFloatArrPtr(@Buf[0]), 1.0, 0);
+  AssertEquals('empty run', 5.0, Buf[0], 0.0);
 end;
 
 procedure TTestNeuralVolume.TestVolumeExpShiftSumParity;

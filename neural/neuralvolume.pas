@@ -558,6 +558,12 @@ type
       // uses an 8-wide polynomial approximation (AVXExp) with a scalar NeuralExp
       // remainder; on a non-AVX build it is a plain NeuralExp loop. Buffers may
       // alias (dst = src) since the read happens before the write per lane/element.
+      // AddScalar adds the same Value to dst[0..N-1] in place - the uniform
+      // scalar accumulate that rule #13's table has no entry for (it lists
+      // dst+=src and dst+=src*k, but not dst+=k). AVX2/64-bit builds broadcast
+      // the value and add 32 elements per iteration; every other build runs the
+      // scalar loop. Bit-exact either way: a float add is a float add.
+      class procedure AddScalar(PtrA: TNeuralFloatArrPtr; Value: TNeuralFloat; pSize: integer); static;
       class procedure VectorExp(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
       // VectorExpShiftSum writes dst[0..N-1] := exp(src[0..N-1] - Shift) and
       // returns the sum of everything it wrote - the numerator and the
@@ -9017,6 +9023,34 @@ begin
   end;
 end;
 
+// The broadcast-add kernel is assembled only in the AVX64 block below, so a
+// 32-bit AVX2 build takes the scalar path like every non-AVX build.
+{$IFDEF AVX2}{$IFDEF AVX64}{$DEFINE HASAVXADDSCALAR}{$ENDIF}{$ENDIF}
+{$IFDEF HASAVXADDSCALAR}
+// AVXAddScalar is defined later in this file inside the AVX64 asm block;
+// forward-declare it so AddScalar can dispatch to it from here.
+procedure AVXAddScalar(PtrA: TNeuralFloatArrPtr; Value: TNeuralFloat;
+  NumElements: integer); forward;
+{$ENDIF}
+class procedure TNNetVolume.AddScalar(PtrA: TNeuralFloatArrPtr;
+  Value: TNeuralFloat; pSize: integer);
+{$IFDEF HASAVXADDSCALAR}
+begin
+  if pSize <= 0 then exit;
+  AVXAddScalar(PtrA, Value, pSize);
+end;
+{$ELSE}
+var
+  I, pSizeM1: integer;
+begin
+  if pSize <= 0 then exit;
+  pSizeM1 := pSize - 1;
+  for I := 0 to pSizeM1 do
+    PtrA^[I] := PtrA^[I] + Value;
+end;
+{$ENDIF}
+{$UNDEF HASAVXADDSCALAR}
+
 class procedure TNNetVolume.VectorExp(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 {$IFDEF AVXANY}
 begin
@@ -15131,6 +15165,51 @@ begin
     end;
   end;
 end;
+{$ENDIF}
+
+{ AVXAddScalar: dst[0..N-1] += Value. Thirty-two elements per iteration through
+  four independent ymm adds off one broadcast register, with a scalar
+  (N mod 32) remainder. Bit-exact against the scalar loop: every element takes
+  the same single add, in any order. }
+{$IFDEF AVX2}
+{$IFDEF AVX64}
+procedure AVXAddScalar(PtrA: TNeuralFloatArrPtr; Value: TNeuralFloat;
+  NumElements: integer);
+var
+  localNumElements, MissedElements, I, NumElementsM1: integer;
+  ValuePtr: pointer;
+begin
+  MissedElements := NumElements and 31;
+  localNumElements := NumElements xor MissedElements;
+  NumElementsM1 := NumElements - 1;
+  if localNumElements > 0 then
+  begin
+    ValuePtr := Addr(Value);
+  asm
+  mov rax, PtrA
+  mov rdx, ValuePtr
+  mov r8d, localNumElements
+  shr r8d, 5
+  vbroadcastss ymm7, [rdx]
+@LoopAVXAddScalar:
+  vaddps ymm0, ymm7, [rax]
+  vaddps ymm1, ymm7, [rax+32]
+  vaddps ymm2, ymm7, [rax+64]
+  vaddps ymm3, ymm7, [rax+96]
+  vmovups [rax], ymm0
+  vmovups [rax+32], ymm1
+  vmovups [rax+64], ymm2
+  vmovups [rax+96], ymm3
+  add rax, 128
+  dec r8d
+  jnz @LoopAVXAddScalar
+  vzeroupper
+  end ['rax','rdx','r8','ymm0','ymm1','ymm2','ymm3','ymm7'];
+  end;
+  for I := localNumElements to NumElementsM1 do
+    PtrA^[I] := PtrA^[I] + Value;
+end;
+{$ENDIF}
 {$ENDIF}
 
 { AVXExp: dst[0..N-1] := exp(src[0..N-1]). 8-wide AVX2 polynomial body plus a
