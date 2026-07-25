@@ -84039,8 +84039,8 @@ end;
 // conditioned at init.
 procedure TNNetKroneckerLinear.InitDefault();
 var
-  LpBnd101: integer;
-  LpBnd102: integer;
+  MaxWeightAPos: integer;
+  MaxWeightBPos: integer;
   i: integer;
   scaleA, scaleB: TNeuralFloat;
   WA, WB, Bias: TNNetVolume;
@@ -84051,11 +84051,11 @@ begin
   Bias := FArrNeurons[2].FWeights;
   if FP > 0 then scaleA := 1.0 / Sqrt(FP) else scaleA := 0.1;
   if FQ > 0 then scaleB := 1.0 / Sqrt(FQ) else scaleB := 0.1;
-  LpBnd101 := WA.Size - 1;
-  for i := 0 to LpBnd101 do
+  MaxWeightAPos := WA.Size - 1;
+  for i := 0 to MaxWeightAPos do
     WA.FData[i] := scaleA * (Random - 0.5) * 2;
-  LpBnd102 := WB.Size - 1;
-  for i := 0 to LpBnd102 do
+  MaxWeightBPos := WB.Size - 1;
+  for i := 0 to MaxWeightBPos do
     WB.FData[i] := scaleB * (Random - 0.5) * 2;
   Bias.Fill(0);
 end;
@@ -84420,7 +84420,7 @@ end;
 // conditioned at init (the product of d cores stays O(1)).
 procedure TNNetTensorTrain.InitDefault();
 var
-  LpBnd103: integer;
+  MaxWeightPos: integer;
   k, i, fanIn, MaxCore: integer;
   scale: TNeuralFloat;
   W: TNNetVolume;
@@ -84432,8 +84432,8 @@ begin
     W := FArrNeurons[k].FWeights;
     fanIn := FRanks[k] * FFactors[k];
     if fanIn > 0 then scale := 1.0 / Sqrt(fanIn) else scale := 0.1;
-    LpBnd103 := W.Size - 1;
-    for i := 0 to LpBnd103 do
+    MaxWeightPos := W.Size - 1;
+    for i := 0 to MaxWeightPos do
       W.FData[i] := scale * (Random - 0.5) * 2;
   end;
   FArrNeurons[FCores].FWeights.Fill(0);
@@ -84998,7 +84998,7 @@ end;
 // scaled by 1/sigma to get N(0,1/sigma^2).
 procedure TNNetRandomFourierFeatures.InitDefault();
 var
-  LpBnd104: integer;
+  MaxWeightPos: integer;
   i: integer;
   W: TNNetVolume;
   oldSeed: Cardinal;
@@ -85011,8 +85011,8 @@ begin
   // Seed = 0 leaves the global RandSeed alone (non-reproducible draw); a non-zero
   // seed makes the random map deterministic and restorable on reload.
   if FSeed <> 0 then RandSeed := FSeed;
-  LpBnd104 := W.Size - 1;
-  for i := 0 to LpBnd104 do
+  MaxWeightPos := W.Size - 1;
+  for i := 0 to MaxWeightPos do
     W.FData[i] := W.RandomGaussianValue() * invSigma;
   if FSeed <> 0 then RandSeed := oldSeed;
 end;
@@ -88936,7 +88936,7 @@ end;
 // accumulating dL/dZ into FAggErr and the W/bias/attention gradients.
 procedure TNNetGraphAttention.BackpropagateCPU();
 var
-  LpBnd105: integer;
+  MaxNeuronPos: integer;
   OutFeat, NodeIdx, FeatOut, NbrIdx: integer;
   numNodesMax, outFeatMax, inFeatMax: integer;
   row, idx, iRow, alphaPos, errPos, aggPos: integer;
@@ -89089,8 +89089,8 @@ begin
     end;
     if not FBatchUpdate then
     begin
-      LpBnd105 := FNeurons.Count - 1;
-      for FeatOut := 0 to LpBnd105 do
+      MaxNeuronPos := FNeurons.Count - 1;
+      for FeatOut := 0 to MaxNeuronPos do
         FArrNeurons[FeatOut].UpdateWeightsWithoutInertia();
       AfterWeightUpdate();
     end;
@@ -90267,7 +90267,7 @@ end;
 { TNNetDeepConcat }
 constructor TNNetDeepConcat.Create(aL: array of TNNetLayer);
 var
-  LpBnd106: integer;
+  MaxPrevOutputD: integer;
   LayerCnt, aLHigh, aLLow: integer;
   ForDeepCnt, DeepCnt: integer;
   SizeX, SizeY: integer;
@@ -90314,8 +90314,8 @@ begin
     FPrevLayerList.Add(aL[LayerCnt]);
     aL[LayerCnt].IncDepartingBranchesCnt();
 
-    LpBnd106 := Al[LayerCnt].FOutput.Depth - 1;
-    for ForDeepCnt := 0 to LpBnd106 do
+    MaxPrevOutputD := Al[LayerCnt].FOutput.Depth - 1;
+    for ForDeepCnt := 0 to MaxPrevOutputD do
     begin
       Inc(DeepCnt);
       SetLength(FDeepsLayer, DeepCnt);
@@ -90494,13 +90494,13 @@ end;
 
 function TNNetConcatBase.SaveStructureToString(): string;
 var
-  LpBnd107: integer;
+  MaxPrevLayerPos: integer;
   I: integer;
   LayersStr: string;
 begin
   LayersStr := '';
-  LpBnd107 := FPrevLayerList.Count - 1;
-  for I := 0 to LpBnd107 do
+  MaxPrevLayerPos := FPrevLayerList.Count - 1;
+  for I := 0 to MaxPrevLayerPos do
   begin
     if I > 0 then LayersStr := LayersStr + ';';
     LayersStr := LayersStr + IntToStr(FPrevLayerList[I].FLayerIdx);
@@ -90510,12 +90510,12 @@ end;
 
 procedure TNNetConcatBase.BackpropagateConcat();
 var
-  LpBnd108: integer;
+  MaxPrevLayerPos: integer;
   LayerCnt: integer;
   LocalLayer: TNNetLayer;
 begin
-  LpBnd108 := FPrevLayerList.Count - 1;
-  for LayerCnt := 0 to LpBnd108 do
+  MaxPrevLayerPos := FPrevLayerList.Count - 1;
+  for LayerCnt := 0 to MaxPrevLayerPos do
   begin
     LocalLayer := FPrevLayerList[LayerCnt];
     if (Assigned(LocalLayer) and (LocalLayer.OutputError.Size = LocalLayer.Output.Size)) then
@@ -90695,7 +90695,7 @@ end;
 
 procedure TestDataParallelism(NN: TNNet);
 var
-  LpBnd109: integer;
+  MaxLayerPos: integer;
   I: integer;
   NN2: TNNet;
   Par: TNNetDataParallelism;
@@ -90707,8 +90707,8 @@ begin
   NN2 := NN.Clone();
   Par.SumWeights(NN2);
   AllGood := True;
-  LpBnd109 := NN.Layers.Count - 1;
-  for I := 0 to LpBnd109 do
+  MaxLayerPos := NN.Layers.Count - 1;
+  for I := 0 to MaxLayerPos do
   begin
     if NN.Layers[I].Neurons.Count <> NN2.Layers[I].Neurons.Count then
     begin
@@ -90748,7 +90748,7 @@ end;
 
 procedure CompareNNStructure(NN, NN2: TNNet);
 var
-  LpBnd110: integer;
+  MaxLayerPos: integer;
   I: integer;
   AllGood: boolean;
 begin
@@ -90765,8 +90765,8 @@ begin
     WriteLn('Saving to string has passed.');
   end;
 
-  LpBnd110 := NN.Layers.Count - 1;
-  for I := 0 to LpBnd110 do
+  MaxLayerPos := NN.Layers.Count - 1;
+  for I := 0 to MaxLayerPos do
   begin
     if NN.Layers[I].SaveDataToString() <> NN2.Layers[I].SaveDataToString() then
     begin
@@ -91067,7 +91067,7 @@ end;
 {$IFDEF OpenCL}
 procedure TestConvolutionOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
 var
-  LpBnd111: integer;
+  MaxOutputPos: integer;
   NN: TNNet;
   Input, Output, Output2: TNNetVolume;
   NRelu: TNNetConvolutionReLU;
@@ -91175,8 +91175,8 @@ begin
   NN.GetOutput(Output2);
   Output2.PrintDebug(); WriteLn;
 
-  LpBnd111 := Output.Size - 1;
-  for I := 0 to LpBnd111 do
+  MaxOutputPos := Output.Size - 1;
+  for I := 0 to MaxOutputPos do
   begin
     if Abs( Output.Raw[I] - Output2.Raw[I] ) > 0.1 then
     begin
