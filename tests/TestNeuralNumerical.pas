@@ -870,6 +870,7 @@ type
     procedure TestCTCLossLoadFromString;
     procedure TestCTCDecodeGreedyRoundTrip;
     procedure TestCTCDecodeBeamSearch;
+    procedure TestCTCDecodeBeamSearchPartialSortMatchesFullSort;
     procedure TestKLDivergenceForwardPassthrough;
     procedure TestKLDivergenceGradient;
     procedure TestKLDivergenceLoadFromString;
@@ -47308,6 +47309,214 @@ begin
   finally
     Scores.Free;
     LP.Free;
+  end;
+end;
+
+// Reference CTC prefix beam search: a verbatim copy of DecodeCTCBeamSearch
+// EXCEPT that the prune step runs the FULL selection sort over the whole
+// candidate list before truncating. Used to pin the partial-sort optimization
+// (which stops the sort at BeamWidth-1 when the tail is discarded) as exactly
+// equivalent, not merely approximately so.
+function RefCTCBeamSearchFullSort(Scores: TNNetVolume; BeamWidth: integer;
+  Blank: integer; LogInput: boolean): TNeuralIntegerArray;
+type
+  TCTCBeam = record
+    Prefix: TNeuralIntegerArray;
+    PB: double;
+    PNB: double;
+  end;
+var
+  NumT, Vocab, ti, k, i, j, bi, LastSym: integer;
+  NumTM1, VocabM1, BeamsHi, BeamsHiM1, NextHi, IP1, ScoreBase: integer;
+  Beams, Next: array of TCTCBeam;
+  Prob: array of double;
+  BestIdx: integer;
+  BestScore, Total, Sum: double;
+  LocalPrefix: TNeuralIntegerArray;
+  BeamPB, BeamPNB, SumPBNB: double;
+  function PrefixEqual(const A, B: TNeuralIntegerArray): boolean;
+  var LA: integer;
+  begin
+    LA := Length(A);
+    if LA <> Length(B) then Exit(false);
+    if LA = 0 then Exit(true);
+    Result := CompareMem(@A[0], @B[0], LA * csIntegerSize);
+  end;
+  function FindNext(const P: TNeuralIntegerArray): integer;
+  var n, Hi: integer;
+  begin
+    Hi := High(Next);
+    for n := 0 to Hi do
+      if PrefixEqual(Next[n].Prefix, P) then Exit(n);
+    Result := -1;
+  end;
+  procedure AddNext(const P: TNeuralIntegerArray; AddPB, AddPNB: double);
+  var n: integer;
+  begin
+    n := FindNext(P);
+    if n < 0 then
+    begin
+      SetLength(Next, Length(Next) + 1);
+      Next[High(Next)].Prefix := Copy(P, 0, Length(P));
+      Next[High(Next)].PB := AddPB;
+      Next[High(Next)].PNB := AddPNB;
+    end
+    else
+    begin
+      Next[n].PB := Next[n].PB + AddPB;
+      Next[n].PNB := Next[n].PNB + AddPNB;
+    end;
+  end;
+  function ExtendOne(const P: TNeuralIntegerArray; sym: integer): TNeuralIntegerArray;
+  var LP: integer;
+  begin
+    LP := Length(P);
+    SetLength(Result, LP + 1);
+    if LP > 0 then Move(P[0], Result[0], LP * csIntegerSize);
+    Result[LP] := sym;
+  end;
+begin
+  NumT := Scores.SizeX;
+  Vocab := Scores.Depth;
+  if Blank < 0 then Blank := Vocab - 1;
+  if BeamWidth < 1 then BeamWidth := 1;
+  NumTM1 := NumT - 1;
+  VocabM1 := Vocab - 1;
+  SetLength(Prob, Vocab);
+
+  SetLength(Beams, 1);
+  SetLength(Beams[0].Prefix, 0);
+  Beams[0].PB := 1.0;
+  Beams[0].PNB := 0.0;
+
+  for ti := 0 to NumTM1 do
+  begin
+    ScoreBase := Scores.GetRawPos(ti, 0, 0);
+    if LogInput then
+      for k := 0 to VocabM1 do Prob[k] := NeuralExp(Scores.FData[ScoreBase + k])
+    else
+      for k := 0 to VocabM1 do Prob[k] := Scores.FData[ScoreBase + k];
+
+    SetLength(Next, 0);
+    BeamsHi := High(Beams);
+    for bi := 0 to BeamsHi do
+    begin
+      LocalPrefix := Beams[bi].Prefix;
+      BeamPB := Beams[bi].PB;
+      BeamPNB := Beams[bi].PNB;
+      SumPBNB := BeamPB + BeamPNB;
+      if Length(LocalPrefix) > 0 then
+        LastSym := LocalPrefix[High(LocalPrefix)]
+      else
+        LastSym := -1;
+
+      AddNext(LocalPrefix, SumPBNB * Prob[Blank], 0.0);
+      if LastSym >= 0 then
+        AddNext(LocalPrefix, 0.0, BeamPNB * Prob[LastSym]);
+      for k := 0 to VocabM1 do
+      begin
+        if k = Blank then Continue;
+        if k = LastSym then
+          AddNext(ExtendOne(LocalPrefix, k), 0.0, BeamPB * Prob[k])
+        else
+          AddNext(ExtendOne(LocalPrefix, k), 0.0, SumPBNB * Prob[k]);
+      end;
+    end;
+
+    SetLength(Beams, Length(Next));
+    NextHi := High(Next);
+    for i := 0 to NextHi do Beams[i] := Next[i];
+    BeamsHi := High(Beams);
+    BeamsHiM1 := BeamsHi - 1;
+    // FULL sort - the reference behaviour being pinned.
+    for i := 0 to BeamsHiM1 do
+    begin
+      BestIdx := i;
+      BestScore := Beams[i].PB + Beams[i].PNB;
+      IP1 := i + 1;
+      for j := IP1 to BeamsHi do
+      begin
+        Total := Beams[j].PB + Beams[j].PNB;
+        if Total > BestScore then
+        begin
+          BestScore := Total;
+          BestIdx := j;
+        end;
+      end;
+      if BestIdx <> i then
+      begin
+        Next[0] := Beams[i];
+        Beams[i] := Beams[BestIdx];
+        Beams[BestIdx] := Next[0];
+      end;
+    end;
+    if Length(Beams) > BeamWidth then SetLength(Beams, BeamWidth);
+  end;
+
+  BestIdx := 0;
+  BestScore := -1;
+  BeamsHi := High(Beams);
+  for i := 0 to BeamsHi do
+  begin
+    Sum := Beams[i].PB + Beams[i].PNB;
+    if Sum > BestScore then
+    begin
+      BestScore := Sum;
+      BestIdx := i;
+    end;
+  end;
+  if Length(Beams) > 0 then
+    Result := Copy(Beams[BestIdx].Prefix, 0, Length(Beams[BestIdx].Prefix))
+  else
+    SetLength(Result, 0);
+end;
+
+// The pruning step only needs the top BeamWidth records ordered, because the
+// tail is dropped by the SetLength truncation. Bounding the selection sort must
+// leave the decoded label sequence bit-identical on every input, including the
+// no-truncation case (where the full sort is kept because the tail order is
+// still observable through the next frame).
+procedure TTestNeuralNumerical.TestCTCDecodeBeamSearchPartialSortMatchesFullSort;
+const
+  cT = 6;
+  cVocab = 5;
+  cBlank = 4;
+var
+  Scores: TNNetVolume;
+  Got, Ref: TNeuralIntegerArray;
+  Seed, Trial, ti, k, Widx, BW, n: integer;
+  Widths: array[0..3] of integer;
+  Msg: string;
+begin
+  Widths[0] := 1; Widths[1] := 2; Widths[2] := 5; Widths[3] := 25;
+  Scores := TNNetVolume.Create(cT, 1, cVocab);
+  try
+    for Trial := 0 to 5 do
+    begin
+      // Deterministic pseudo-random log-probs (a plain LCG, so the test is
+      // reproducible and independent of the RTL's generator).
+      Seed := 1 + Trial * 913;
+      for ti := 0 to cT - 1 do
+        for k := 0 to cVocab - 1 do
+        begin
+          Seed := (Seed * 75 + 74) mod 65537;   // Lehmer; cannot overflow
+          Scores[ti, 0, k] := -4.0 + (Seed mod 1000) * 0.004;
+        end;
+      for Widx := 0 to 3 do
+      begin
+        BW := Widths[Widx];
+        // The wide beam leaves the first frames untruncated, so the retained
+        // full-sort branch is exercised as well as the bounded one.
+        Ref := RefCTCBeamSearchFullSort(Scores, BW, cBlank, true);
+        Got := DecodeCTCBeamSearch(Scores, BW, cBlank, true);
+        Msg := 'trial ' + IntToStr(Trial) + ' beam ' + IntToStr(BW);
+        AssertEquals(Msg + ': decoded length', Length(Ref), Length(Got));
+        for n := 0 to Length(Ref) - 1 do
+          AssertEquals(Msg + ': label ' + IntToStr(n), Ref[n], Got[n]);
+      end;
+    end;
+  finally
+    Scores.Free;
   end;
 end;
 

@@ -2295,6 +2295,7 @@ type
 var
   NumT, Vocab, ti, k, i, j, bi, LastSym: integer;
   NumTM1, VocabM1, BeamsHi, BeamsHiM1, NextHi, IP1, ScoreBase: integer;
+  SortLimit: integer;
   Beams, Next: array of TCTCBeam;
   Prob: array of double; // current frame probabilities
   BestIdx: integer;
@@ -2414,10 +2415,18 @@ begin
     SetLength(Beams, Length(Next));
     NextHi := High(Next);
     for i := 0 to NextHi do Beams[i] := Next[i];
-    // Sort descending by total prob (selection sort over the whole list).
+    // Sort descending by total prob (selection sort). Pass i fixes position i
+    // permanently, so when the list is about to be truncated to BeamWidth the
+    // passes beyond BeamWidth-1 only order records that are then discarded:
+    // bound the outer loop (partial selection sort, O(N*BeamWidth) instead of
+    // O(N^2)). When nothing is truncated the tail order is still observable
+    // through the next frame's beam iteration, so keep the full sort there.
     BeamsHi := High(Beams);
     BeamsHiM1 := BeamsHi - 1;
-    for i := 0 to BeamsHiM1 do
+    SortLimit := BeamsHiM1;
+    if (Length(Beams) > BeamWidth) and (BeamWidth - 1 < SortLimit) then
+      SortLimit := BeamWidth - 1;
+    for i := 0 to SortLimit do
     begin
       BestIdx := i;
       BestScore := Beams[i].PB + Beams[i].PNB;
@@ -3800,6 +3809,13 @@ begin
   if TokenId < 2 then exit(FMachine.IsComplete());
   S := FTokenStr[TokenId];
   if S = '' then exit(false);
+  // Rule #14/#17: FeedChar returns FScratchCount > 0, and the scratch is only
+  // ever written inside its "if ElemMatches(TopPos, C)" branch - so a char no
+  // active stack top matches can NEVER be fed. CharAllowed decides exactly that,
+  // read-only and allocation-free, on FMachine (FProbe would be its clone). The
+  // vast majority of the vocabulary dies on its first character, so this guard
+  // skips the CopyFrom deep copy and the FeedChar advance-buffer work entirely.
+  if not FMachine.CharAllowed(S[1]) then exit(false);
   // Transitive multi-character validation on a forked machine.
   FProbe.CopyFrom(FMachine);
   LenS := Length(S);

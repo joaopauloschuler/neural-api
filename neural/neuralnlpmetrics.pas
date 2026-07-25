@@ -2320,17 +2320,21 @@ begin
   SetLength(Order, N);
   NM1 := N - 1;
   for I := 0 to NM1 do Order[I] := I;
-  // simple selection sort by descending logit (N is small: TopK candidates)
-  for I := 0 to NM1 do
+  if TopK > N then TopK := N;
+  if TopK < 0 then TopK := 0;
+  TopKM1 := TopK - 1;
+  // Selection sort by descending logit. Pass I leaves Order[I] holding the
+  // maximum of Order[I..NM1] and never touches positions < I afterwards, so
+  // only the first TopK passes affect the returned prefix: bound the outer
+  // loop by TopK-1 (partial sort, O(N*TopK) instead of O(N^2)). Bit-exact -
+  // the discarded tail Order[TopK..NM1] is never read.
+  for I := 0 to TopKM1 do
     for J := I + 1 to NM1 do
       if Logits[Order[J]] > Logits[Order[I]] then
       begin
         Tmp := Order[I]; Order[I] := Order[J]; Order[J] := Tmp;
       end;
-  if TopK > N then TopK := N;
-  if TopK < 0 then TopK := 0;
   SetLength(Result, TopK);
-  TopKM1 := TopK - 1;
   for I := 0 to TopKM1 do Result[I] := Order[I];
 end;
 
@@ -2371,19 +2375,21 @@ begin
     end;
   SetLength(Cand, Count);
 
-  // descending by score (stable selection sort; small candidate set)
+  // Only the first Tmp rows are returned, so compute the cut first and stop the
+  // selection sort there: pass A fixes Cand[A] permanently, hence passes beyond
+  // Tmp-1 only reorder rows that are dropped. Bit-exact, O(Count*Tmp).
+  Tmp := Count;
+  if (NBest > 0) and (NBest < Tmp) then Tmp := NBest;
+  TmpM1 := Tmp - 1;
   CountM1 := Count - 1;
-  for A := 0 to CountM1 do
+  for A := 0 to TmpM1 do
     for B := A + 1 to CountM1 do
       if Cand[B].Score > Cand[A].Score then
       begin
         TmpSpan := Cand[A]; Cand[A] := Cand[B]; Cand[B] := TmpSpan;
       end;
 
-  Tmp := Count;
-  if (NBest > 0) and (NBest < Tmp) then Tmp := NBest;
   SetLength(Result, Tmp);
-  TmpM1 := Tmp - 1;
   for A := 0 to TmpM1 do Result[A] := Cand[A];
 end;
 

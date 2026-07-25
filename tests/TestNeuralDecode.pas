@@ -264,6 +264,7 @@ type
     procedure TestGrammarAlternationGroupingRepetitionOptional;
     procedure TestGrammarConstraintGreedyDrivenWalkStaysValid;
     procedure TestGrammarConstraintSampledDrivenWalkStaysValid;
+    procedure TestGrammarConstraintMaskMatchesUnguardedReference;
     // Model-integration: constrained generation emits parseable JSON.
     procedure TestGenerateTokensStreamedJSONConstraintEmitsParseableJSON;
     procedure TestDecodeGreedyJSONConstraintEmitsParseableJSON;
@@ -6231,6 +6232,121 @@ begin
     Verify.Free;
     VG.Free;
     C.Free;
+  end;
+end;
+
+// TokenAllowed rejects a token whose FIRST character no active stack top can
+// match, WITHOUT forking the machine. This pins that shortcut as exactly
+// equivalent to the unguarded "fork then feed every character" definition: the
+// full allowed/blocked MASK over a multi-character vocabulary must be identical
+// to an independent oracle that re-parses (committed prefix + token text) from
+// a fresh machine at every step.
+procedure TTestNeuralDecode.TestGrammarConstraintMaskMatchesUnguardedReference;
+var
+  Dict: TStringListInt;
+  C: TNNetGrammarConstraint;
+  Ref: TNNetGrammarMachine;
+  RG: TNNetGrammar;
+  P: TNNetVolume;
+  Committed: string;
+  Step, Tok, VocabHi: integer;
+  Expected, Got: boolean;
+  Msg: string;
+
+  // Unguarded semantics: from a machine holding exactly the committed prefix,
+  // feed the whole token text; ids < 2 are the special/EOS gate.
+  function RefAllowed(Id: integer): boolean;
+  begin
+    Ref.Reset();
+    if not Ref.FeedString(Committed) then
+    begin
+      Result := false;
+      exit;
+    end;
+    if Id < 2 then exit(Ref.IsComplete());
+    Result := Ref.FeedString(Dict.DeTokenize(Id));
+  end;
+
+  procedure CompareWholeMask(const StepMsg: string);
+  var
+    I: integer;
+  begin
+    for I := 0 to VocabHi do
+    begin
+      Expected := RefAllowed(I);
+      Got := C.TokenAllowed(I);
+      AssertEquals(StepMsg + ' id ' + IntToStr(I) + ' ("' +
+        Dict.DeTokenize(I) + '")', Expected, Got);
+    end;
+    // The mask the sampler actually sees must agree with it, too.
+    P.Fill(1.0);
+    C.MaskAllowed(P);
+    for I := 0 to VocabHi do
+      if not RefAllowed(I) then
+        AssertEquals(StepMsg + ' masked id ' + IntToStr(I), 0.0, P.Raw[I], 0.0)
+      else
+        AssertTrue(StepMsg + ' kept id ' + IntToStr(I), P.Raw[I] > 0);
+  end;
+
+begin
+  Dict := TStringListInt.Create();
+  C := nil;
+  RG := nil;
+  Ref := nil;
+  P := nil;
+  try
+    // Insertion order = token id. Deliberately mixes tokens that die on their
+    // first char (the guard's fast path), tokens that die on a LATER char (the
+    // guard must NOT reject those early), and legal multi-char tokens.
+    Dict.Add('<eos>');   // 0  special
+    Dict.Add('<pad>');   // 1  special
+    Dict.Add('1');       // 2
+    Dict.Add('23');      // 3
+    Dict.Add('+');       // 4
+    Dict.Add('-');       // 5
+    Dict.Add('4+5');     // 6
+    Dict.Add('a');       // 7  never legal
+    Dict.Add('+7');      // 8
+    Dict.Add('9-');      // 9  legal prefix, incomplete
+    Dict.Add('0');       // 10
+    Dict.Add('+-');      // 11 dies on its SECOND char
+    Dict.Add('12+34');   // 12
+    Dict.Add('5a');      // 13 dies on its SECOND char
+    Dict.Add('-8');      // 14
+    Dict.SaveCurrentPosition();
+    VocabHi := Dict.GetVocabCount() - 1;
+
+    C := TNNetGrammarConstraint.Create(ArithGrammar, Dict);
+    RG := TNNetGrammar.Create(ArithGrammar);
+    Ref := TNNetGrammarMachine.Create(RG);
+    P := TNNetVolume.Create(Dict.GetVocabCount(), 1, 1);
+
+    C.Reset([]);
+    Committed := '';
+    CompareWholeMask('start');
+
+    // Walk a nontrivial parse, comparing the whole mask after every commit.
+    for Step := 1 to 4 do
+    begin
+      case Step of
+        1: Tok := 3;    // '23'
+        2: Tok := 4;    // '+'
+        3: Tok := 12;   // '12+34'
+        else Tok := 5;  // '-'
+      end;
+      AssertTrue('driver token ' + IntToStr(Tok) + ' must be legal',
+        C.TokenAllowed(Tok));
+      C.Commit(Tok);
+      Committed := Committed + Dict.DeTokenize(Tok);
+      Msg := 'after "' + Committed + '"';
+      CompareWholeMask(Msg);
+    end;
+  finally
+    P.Free;
+    Ref.Free;
+    RG.Free;
+    C.Free;
+    Dict.Free;
   end;
 end;
 

@@ -133,6 +133,7 @@ type
     // QA span extraction (Task B): pinned logits -> pinned n-best spans.
     procedure TestExtractQASpansPinned;
     procedure TestExtractQASpansMaxLenAndOrder;
+    procedure TestExtractQASpansPartialSortMatchesFullSort;
     // MMLU harness: with the monotone linear scorer the largest answer-letter
     // token id always wins, so per-question predictions (hence per-subject /
     // macro / micro accuracy) are analytic. Verifies the answer-letter argmax,
@@ -1218,6 +1219,132 @@ begin
   // NBest cap limits the list length.
   Spans := ExtractQASpans(StartLogits, EndLogits, 20, 30, 3);
   AssertTrue('n-best capped at 3', Length(Spans) <= 3);
+end;
+
+// Reference n-best QA span extraction: a verbatim copy of TopKIndices +
+// ExtractQASpans EXCEPT that both selection sorts run over the WHOLE array
+// before the TopK / NBest truncation. Pins the partial-sort optimization (stop
+// each sort at the cut) as exactly equivalent.
+function RefTopKIndicesFullSort(const Logits: TNeuralFloatDynArr;
+  TopK: integer): TNeuralIntegerArray;
+var
+  Order: TNeuralIntegerArray;
+  I, J, Tmp, N, NM1, TopKM1: integer;
+begin
+  N := Length(Logits);
+  SetLength(Order, N);
+  NM1 := N - 1;
+  for I := 0 to NM1 do Order[I] := I;
+  for I := 0 to NM1 do                       // FULL sort - the reference
+    for J := I + 1 to NM1 do
+      if Logits[Order[J]] > Logits[Order[I]] then
+      begin
+        Tmp := Order[I]; Order[I] := Order[J]; Order[J] := Tmp;
+      end;
+  if TopK > N then TopK := N;
+  if TopK < 0 then TopK := 0;
+  SetLength(Result, TopK);
+  TopKM1 := TopK - 1;
+  for I := 0 to TopKM1 do Result[I] := Order[I];
+end;
+
+function RefExtractQASpansFullSort(const StartLogits, EndLogits: TNeuralFloatDynArr;
+  TopK, MaxAnswerLen, NBest: integer): TNNetQASpanArray;
+var
+  StartIdx, EndIdx: TNeuralIntegerArray;
+  I, J, S, E, Count, A, B, Tmp: integer;
+  StartIdxHi, EndIdxHi, CountM1, TmpM1: integer;
+  Cand: TNNetQASpanArray;
+  TmpSpan: TNNetQASpan;
+begin
+  SetLength(Result, 0);
+  if Length(StartLogits) = 0 then Exit;
+  StartIdx := RefTopKIndicesFullSort(StartLogits, TopK);
+  EndIdx := RefTopKIndicesFullSort(EndLogits, TopK);
+  Count := 0;
+  SetLength(Cand, Length(StartIdx) * Length(EndIdx));
+  StartIdxHi := High(StartIdx);
+  EndIdxHi := High(EndIdx);
+  for I := 0 to StartIdxHi do
+    for J := 0 to EndIdxHi do
+    begin
+      S := StartIdx[I];
+      E := EndIdx[J];
+      if E < S then Continue;
+      if (MaxAnswerLen > 0) and ((E - S + 1) > MaxAnswerLen) then Continue;
+      Cand[Count].TokenStart := S;
+      Cand[Count].TokenEnd := E;
+      Cand[Count].Score := StartLogits[S] + EndLogits[E];
+      Inc(Count);
+    end;
+  SetLength(Cand, Count);
+  CountM1 := Count - 1;
+  for A := 0 to CountM1 do                   // FULL sort - the reference
+    for B := A + 1 to CountM1 do
+      if Cand[B].Score > Cand[A].Score then
+      begin
+        TmpSpan := Cand[A]; Cand[A] := Cand[B]; Cand[B] := TmpSpan;
+      end;
+  Tmp := Count;
+  if (NBest > 0) and (NBest < Tmp) then Tmp := NBest;
+  SetLength(Result, Tmp);
+  TmpM1 := Tmp - 1;
+  for A := 0 to TmpM1 do Result[A] := Cand[A];
+end;
+
+// Both selection sorts on the QA-span path (TopKIndices' candidate ranking and
+// the span ranking) are truncated right after they run, so they only need the
+// returned prefix ordered. Bounding them must leave the n-best list - order,
+// spans and scores - bit-identical, including ties (which the strict '>'
+// exchange resolves to the earlier index) and the untruncated case.
+procedure TTestNeuralNLPMetrics.TestExtractQASpansPartialSortMatchesFullSort;
+const
+  cN = 12;
+var
+  StartLogits, EndLogits: TNeuralFloatDynArr;
+  Got, Ref: TNNetQASpanArray;
+  Trial, I, Seed, TopK, NBest, MaxLen, K: integer;
+  Msg: string;
+begin
+  SetLength(StartLogits, cN);
+  SetLength(EndLogits, cN);
+  for Trial := 0 to 7 do
+  begin
+    Seed := 1 + Trial * 613;
+    for I := 0 to cN - 1 do
+    begin
+      Seed := (Seed * 75 + 74) mod 65537;    // Lehmer; cannot overflow
+      // A coarse quantisation on purpose, so exact score TIES occur and the
+      // tie-break behaviour is pinned too.
+      StartLogits[I] := (Seed mod 7) * 0.5;
+      Seed := (Seed * 75 + 74) mod 65537;
+      EndLogits[I] := (Seed mod 7) * 0.5;
+    end;
+    // TopK/NBest both below and above the available counts (the latter leaves
+    // nothing truncated, where the full sort is what must still happen).
+    for K := 0 to 3 do
+    begin
+      case K of
+        0: begin TopK := 3;  NBest := 4;  MaxLen := 5;  end;
+        1: begin TopK := 1;  NBest := 1;  MaxLen := 0;  end;
+        2: begin TopK := 5;  NBest := 50; MaxLen := 30; end;
+        else begin TopK := 50; NBest := 7; MaxLen := 3; end;
+      end;
+      Ref := RefExtractQASpansFullSort(StartLogits, EndLogits, TopK, MaxLen, NBest);
+      Got := ExtractQASpans(StartLogits, EndLogits, TopK, MaxLen, NBest);
+      Msg := 'trial ' + IntToStr(Trial) + ' cfg ' + IntToStr(K);
+      AssertEquals(Msg + ': n-best count', Length(Ref), Length(Got));
+      for I := 0 to Length(Ref) - 1 do
+      begin
+        AssertEquals(Msg + ': span ' + IntToStr(I) + ' start',
+          Ref[I].TokenStart, Got[I].TokenStart);
+        AssertEquals(Msg + ': span ' + IntToStr(I) + ' end',
+          Ref[I].TokenEnd, Got[I].TokenEnd);
+        AssertEquals(Msg + ': span ' + IntToStr(I) + ' score',
+          Ref[I].Score, Got[I].Score, 0.0);
+      end;
+    end;
+  end;
 end;
 
 procedure TTestNeuralNLPMetrics.TestMMLUAnswerLetterArgmaxAndAggregation;
