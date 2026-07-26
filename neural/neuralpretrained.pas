@@ -72366,6 +72366,38 @@ begin
   end;
 end;
 
+// In-place GELU(erf) over A[Ofs .. Ofs+N-1]: y = x * 0.5 * (1 + erf(x/sqrt(2))).
+// The erf ride runs through the vectorized VectorErf kernel (rule #19) a tile at
+// a time via a fixed stack scratch, so an arbitrarily long run costs no heap and
+// no growth in peak RAM. VectorErf is the Abramowitz-Stegun approximation, so
+// this matches the scalar pcr_erff spelling to ~1e-6 rather than bit-exactly.
+procedure SAMGeluInPlace(var A: TSAMMat; Ofs, N: integer);
+const
+  INV_SQRT_2 = 0.70710678118654752;
+  cTile = 4096;
+var
+  Buf: array[0..cTile - 1] of TNeuralFloat;
+  Base, Done, Len, LenM1, j, k: integer;
+begin
+  Done := 0;
+  while Done < N do
+  begin
+    Len := N - Done;
+    if Len > cTile then Len := cTile;
+    LenM1 := Len - 1;
+    Base := Ofs + Done;
+    Move(A[Base], Buf[0], Len * csNeuralFloatSize);
+    TNNetVolume.Mul(@Buf[0], INV_SQRT_2, Len);
+    TNNetVolume.VectorErf(@Buf[0], @Buf[0], Len);
+    for j := 0 to LenM1 do
+    begin
+      k := Base + j;
+      A[k] := A[k] * 0.5 * (1.0 + Buf[j]);
+    end;
+    Inc(Done, Len);
+  end;
+end;
+
 // Multi-head scaled-dot-product attention. Q is [NQ*Dim], K/V are [NK*Dim] in
 // the FULL internal dim; Heads split Dim contiguously. Out is [NQ*Dim].
 procedure SAMAttnCore(const Q, K, V: TSAMMat; NQ, NK, Dim, Heads: integer;
@@ -72900,13 +72932,9 @@ begin
         end;
       end;
     end;
-    // GELU(erf) on the conv2 output.
-    for i := 0 to CuHuWuM1 do
-    begin
-      x := U2[i];
-      cdf := 0.5 * (1.0 + pcr_erff(x * INV_SQRT_2));
-      U2[i] := x * cdf;
-    end;
+    // GELU(erf) on the conv2 output: one contiguous Cu*Hu*Wu run, so the erf
+    // goes through the vector kernel instead of Cu*Hu*Wu scalar pcr_erff calls.
+    SAMGeluInPlace(U2, 0, CuHuWuM1 + 1);
 
     // ----- mask-output selection -----
     // HF: multimask -> mask tokens 1..num_mask_tokens-1 (slice(1,None));
