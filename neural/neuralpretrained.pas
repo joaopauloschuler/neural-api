@@ -12559,11 +12559,61 @@ begin
     TNNetEmbedding(Layer).DequantizeWeightsInt8();
 end;
 
+// Transposes ColCount COLUMNS of a row-major [Rows, Stride] slab (starting
+// at Src.FData[SrcBase], first column ColBase) onto per-neuron weight rows:
+// neuron NeuronBase+c receives column ColBase+c as its Rows contiguous
+// weights. A destination neuron is a column, so walking one neuron to
+// completion strides the source by Stride - at the widths the Llama-4 MoE
+// and GPT-2 Conv1D slabs have (Stride*4 is tens of KB) that is a distinct
+// cache line AND a distinct page on every single read, which thrashes the
+// TLB. Iterating in tiles instead consumes each source cache line for all
+// the destinations in the tile before it can be evicted, and the working
+// set of one tile fits in L2. Coded by Claude (AI).
+procedure CopySlabColumnsToNeurons(Src: TNNetVolume;
+  SrcBase, Stride, Rows, ColBase, ColCount: integer;
+  Layer: TNNetLayer; NeuronBase: integer);
+const
+  // 64x64 singles = 16 KB of source rows + 16 KB of destination rows.
+  cTile = 64;
+var
+  RowTile, RowLast, ColTile, ColLast, RowsM1, ColCountM1: integer;
+  i, c, SrcPos: integer;
+  WV: TNNetVolume;
+begin
+  RowsM1 := Rows - 1;
+  ColCountM1 := ColCount - 1;
+  ColTile := 0;
+  while ColTile <= ColCountM1 do
+  begin
+    ColLast := ColTile + cTile - 1;
+    if ColLast > ColCountM1 then ColLast := ColCountM1;
+    RowTile := 0;
+    while RowTile <= RowsM1 do
+    begin
+      RowLast := RowTile + cTile - 1;
+      if RowLast > RowsM1 then RowLast := RowsM1;
+      for c := ColTile to ColLast do
+      begin
+        WV := Layer.FArrNeurons[NeuronBase + c].Weights;
+        // = SrcBase + RowTile*Stride + ColBase + c, then carried (#6/#12).
+        SrcPos := SrcBase + RowTile * Stride + ColBase + c;
+        for i := RowTile to RowLast do
+        begin
+          WV.FData[i] := Src.FData[SrcPos];
+          Inc(SrcPos, Stride);
+        end;
+      end;
+      Inc(RowTile, cTile);
+    end;
+    Inc(ColTile, cTile);
+  end;
+end;
+
 procedure LoadConv1DWeights(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BName: string; InDim, OutDim: integer);
 var
-  W, B, WV: TNNetVolume;
-  i, j, InDimM1, OutDimM1, src: integer;
+  W, B: TNNetVolume;
+  j, OutDimM1: integer;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -12588,7 +12638,6 @@ begin
   try
     Reader.LoadTensorFlat(WName, W);
     Reader.LoadTensorFlat(BName, B);
-    InDimM1 := InDim - 1;
     OutDimM1 := OutDim - 1;
     for j := 0 to OutDimM1 do
     begin
@@ -12597,15 +12646,11 @@ begin
           ' for "' + WName + '" has ' +
           IntToStr(Layer.FArrNeurons[j].Weights.Size) + ' weights, expected ' +
           IntToStr(InDim) + '.');
-      WV := Layer.FArrNeurons[j].Weights;
-      src := j;
-      for i := 0 to InDimM1 do
-      begin
-        WV.FData[i] := W.FData[src];
-        Inc(src, OutDim);
-      end;
       Layer.FArrNeurons[j].BiasWeight := B.FData[j];
     end;
+    // HF Conv1D stores [in, out]: neuron j is COLUMN j of the slab.
+    CopySlabColumnsToNeurons(W, {SrcBase=}0, {Stride=}OutDim, {Rows=}InDim,
+      {ColBase=}0, {ColCount=}OutDim, Layer, {NeuronBase=}0);
   finally
     B.Free;
     W.Free;
@@ -15483,23 +15528,17 @@ begin
       eBase := (e * HiddenSize) * TwoI; // #5/#11: invariant across the j loop
       for j := 0 to ExpertWidthM1 do
       begin
-        // UP column (gate_up_proj col I+j) -> neuron j; GATE column
-        // (gate_up_proj col j) -> neuron I+j. Columns are strided by TwoI
-        // in the flat [E*H, 2I] slab, so carry the source offset (#12).
-        WVup := EG.FArrNeurons[j].Weights;
-        WVgate := EG.FArrNeurons[ExpertWidth + j].Weights;
-        SrcGate := eBase + j;
-        SrcUp := SrcGate + ExpertWidth;
-        for i := 0 to HiddenSizeM1 do
-        begin
-          WVup.FData[i] := W.FData[SrcUp];
-          WVgate.FData[i] := W.FData[SrcGate];
-          Inc(SrcUp, TwoI);
-          Inc(SrcGate, TwoI);
-        end;
         EG.FArrNeurons[j].BiasWeight := 0;
         EG.FArrNeurons[ExpertWidth + j].BiasWeight := 0;
       end;
+      // UP column (gate_up_proj col I+j) -> neuron j; GATE column
+      // (gate_up_proj col j) -> neuron I+j. Both are columns of the flat
+      // [E*H, 2I] slab, transposed in tiles.
+      CopySlabColumnsToNeurons(W, eBase, TwoI, HiddenSize,
+        {ColBase=}ExpertWidth, {ColCount=}ExpertWidth, EG, {NeuronBase=}0);
+      CopySlabColumnsToNeurons(W, eBase, TwoI, HiddenSize,
+        {ColBase=}0, {ColCount=}ExpertWidth, EG,
+        {NeuronBase=}ExpertWidth);
       EG.FlushWeightCache();
     end;
     Consumed.Add(InName);
@@ -15518,18 +15557,11 @@ begin
       EnsureWritableImportWeights(ED);
       eBase := (e * ExpertWidth) * HiddenSize; // #5/#11: invariant across the j loop
       for j := 0 to HiddenSizeM1 do
-      begin
-        // down_proj column j (strided by HiddenSize in the flat [E*I, H]
-        // slab) -> neuron j; carry the source offset (#12).
-        WV := ED.FArrNeurons[j].Weights;
-        SrcUp := eBase + j;
-        for i := 0 to ExpertWidthM1 do
-        begin
-          WV.FData[i] := W.FData[SrcUp];
-          Inc(SrcUp, HiddenSize);
-        end;
         ED.FArrNeurons[j].BiasWeight := 0;
-      end;
+      // down_proj column j of the flat [E*I, H] slab -> neuron j, transposed
+      // in tiles.
+      CopySlabColumnsToNeurons(W, eBase, HiddenSize, ExpertWidth,
+        {ColBase=}0, {ColCount=}HiddenSize, ED, {NeuronBase=}0);
       ED.FlushWeightCache();
     end;
     Consumed.Add(OutName);
