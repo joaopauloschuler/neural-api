@@ -61,7 +61,7 @@ unit neuralaudio;
 interface
 
 uses
-  Classes, SysUtils, Math, neuralvolume;
+  Classes, SysUtils, Math, neuralvolume, pascoremath32;
 
 // Reads a 16-bit PCM RIFF/WAVE file into Samples as mono floats in [-1, 1)
 // (multi-channel input is averaged). Samples is resized to (N, 1, 1).
@@ -1180,7 +1180,7 @@ var
   Re, Im: TNNetVolume;
   Idx: integer;
   MagSizeM1: integer;
-  M, P: double;
+  M, P, SinP, CosP: TNeuralFloat;
 begin
   if (Mag.SizeX <> Phase.SizeX) or (Mag.Depth <> Phase.Depth) then
     raise Exception.Create('ISTFTOverlapAdd: Mag and Phase must have the same shape.');
@@ -1194,8 +1194,10 @@ begin
     begin
       M := Mag.FData[Idx];
       P := Phase.FData[Idx];
-      Re.FData[Idx] := M * Cos(P);
-      Im.FData[Idx] := M * Sin(P);
+      // Both sin and cos at one argument: one shared range reduction (#16).
+      pcr_sincosf(P, SinP, CosP);
+      Re.FData[Idx] := M * CosP;
+      Im.FData[Idx] := M * SinP;
     end;
     ISTFTOverlapAddReIm(Re, Im, Wave, NFFT, HopLength);
   finally
