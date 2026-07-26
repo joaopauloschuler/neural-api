@@ -73566,48 +73566,44 @@ end;
 procedure TNNetMaskedMean.Compute();
 var
   StartTime: double;
-  X, Y, C, MaxX, MaxY, MaxC, MaskIdx, Count: integer;
+  X, Y, C, MaxX, MaxY, MaxC, MaskIdx, Count, NumC: integer;
   Depth, baseY, outBase, pos: integer;
-  Sum: TNeuralFloat;
   Prev: TNNetVolume;
+  OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Prev := FPrevLayer.Output;
   MaxX := Prev.SizeX - 1;
   MaxY := Prev.SizeY - 1;
   MaxC := Prev.Depth - 2; // last data channel index (mask is Depth-1)
+  NumC := MaxC + 1;
   MaskIdx := Prev.Depth - 1;
   Depth := Prev.Depth;
+  // X-OUTER: the mask test depends only on X, so it runs once per position
+  // instead of once per (channel, position), and each surviving position
+  // contributes one contiguous vector Add over the whole channel run (#13/#20).
+  // The per-channel accumulation order over X and the final divide are
+  // unchanged.
   for Y := 0 to MaxY do
   begin
     baseY := Prev.GetRawPos(0, Y);      // element (0,Y,0); (X,Y,d) = baseY + X*Depth + d
     outBase := FOutput.GetRawPos(0, Y); // FOutput's own (Depth-1) stride
+    OutPtr := FOutput.GetRawPtr(outBase);
+    FillChar(FOutput.FData[outBase], NumC * csNeuralFloatSize, 0);
     Count := 0;
     pos := baseY;
     for X := 0 to MaxX do
     begin
-      if Prev.FData[pos + MaskIdx] > 0.5 then Inc(Count);
+      if Prev.FData[pos + MaskIdx] > 0.5 then
+      begin
+        Inc(Count);
+        TNNetVolume.Add(OutPtr, Prev.GetRawPtr(pos), NumC);
+      end;
       Inc(pos, Depth);
     end;
-    for C := 0 to MaxC do
-    begin
-      Sum := 0;
-      if Count > 0 then
-      begin
-        pos := baseY;
-        for X := 0 to MaxX do
-        begin
-          if Prev.FData[pos + MaskIdx] > 0.5 then
-            Sum := Sum + Prev.FData[pos + C];
-          Inc(pos, Depth);
-        end;
-        FOutput.FData[outBase + C] := Sum / Count;
-      end
-      else
-      begin
-        FOutput.FData[outBase + C] := 0;
-      end;
-    end;
+    if Count > 0 then
+      for C := 0 to MaxC do
+        FOutput.FData[outBase + C] := FOutput.FData[outBase + C] / Count;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -73615,10 +73611,11 @@ end;
 procedure TNNetMaskedMean.Backpropagate();
 var
   StartTime: double;
-  X, Y, C, MaxX, MaxY, MaxC, MaskIdx, Count: integer;
+  X, Y, MaxX, MaxY, MaxC, MaskIdx, Count, NumC: integer;
   Depth, baseY, outBase, pos: integer;
   PrevOut, PrevErr: TNNetVolume;
-  Grad: TNeuralFloat;
+  InvCount: TNeuralFloat;
+  ErrPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -73633,6 +73630,7 @@ begin
     MaxX := PrevOut.SizeX - 1;
     MaxY := PrevOut.SizeY - 1;
     MaxC := PrevOut.Depth - 2;
+    NumC := MaxC + 1;
     MaskIdx := PrevOut.Depth - 1;
     Depth := PrevOut.Depth;
     for Y := 0 to MaxY do
@@ -73647,16 +73645,18 @@ begin
         Inc(pos, Depth);
       end;
       if Count = 0 then continue;
-      for C := 0 to MaxC do
+      // X-OUTER (#20): one mask test per position instead of one per
+      // (channel, position), one contiguous scaled accumulate per survivor
+      // (#13), and the 1/Count reciprocal hoisted out of the channel loop
+      // (#21 -- this layer's gradient is not amplified through a deep stack).
+      InvCount := 1.0 / Count;
+      ErrPtr := FOutputError.GetRawPtr(outBase);
+      pos := baseY;
+      for X := 0 to MaxX do
       begin
-        Grad := FOutputError.FData[outBase + C] / Count;
-        pos := baseY;
-        for X := 0 to MaxX do
-        begin
-          if PrevOut.FData[pos + MaskIdx] > 0.5 then
-            PrevErr.FData[pos + C] := PrevErr.FData[pos + C] + Grad;
-          Inc(pos, Depth);
-        end;
+        if PrevOut.FData[pos + MaskIdx] > 0.5 then
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(pos), ErrPtr, InvCount, NumC);
+        Inc(pos, Depth);
       end;
     end;
   end;
