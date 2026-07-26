@@ -605,6 +605,15 @@ type
       // re-entrant, so one lazily-sized buffer serves every matched stack
       // instead of a fresh SetLength per (stack, char, probed token).
       FAdvBuf: array of integer;
+      // Persistent per-recursion-depth work buffers (rule #17). Every entry
+      // into AddStackExpanded / PushRuleAlternates takes FWorkPool[FWorkDepth]
+      // and increments the depth, so a recursive expansion reuses buffers
+      // instead of SetLength-ing a fresh dynamic array per frame. Like FScratch
+      // and FAdvBuf, this makes the expansion non-reentrant per machine
+      // instance - FMachine and FProbe are separate objects, so a probed token
+      // never shares these with the live automaton.
+      FWorkPool: array of array of integer;
+      FWorkDepth: integer;
       // Bumped by every state change (Reset/CopyFrom/FeedChar); CharAllowed and
       // IsComplete are read-only and leave it alone. It identifies the
       // observable active set, so callers can cache per-state work and rebuild
@@ -3708,45 +3717,49 @@ procedure TNNetGrammarMachine.AddStackExpanded(const Src: array of integer;
 // set. Recursion depth is bounded by the grammar nesting + recursion depth of
 // the partial parse.
 var
-  Work: array of integer;
-  WLen: integer;
+  D, WLen: integer;
   TopPos, Rule, Idx, RefRule, ContPos: integer;
   Body: TNNetGrammarElemArray;
 begin
-  SetLength(Work, Len + 8);
+  // Rule #17: this frame's work buffer comes from the persistent pool. Src is
+  // always a shallower slot or an external buffer, never FWorkPool[D] itself.
+  D := FWorkDepth;
+  if D >= Length(FWorkPool) then SetLength(FWorkPool, D + 8);
+  if Length(FWorkPool[D]) < Len then SetLength(FWorkPool[D], Len + 8);
   // Contiguous integer copy -> Move (rule #13 / App. C).
-  if Len > 0 then Move(Src[0], Work[0], Len * csIntegerSize);
+  if Len > 0 then Move(Src[0], FWorkPool[D][0], Len * csIntegerSize);
   WLen := Len;
+  Inc(FWorkDepth);
 
-  if WLen = 0 then
+  if WLen = 0 then AddStackRaw(FWorkPool[D], 0)
+  else
   begin
-    AddStackRaw(Work, 0);
-    exit;
-  end;
+    TopPos := FWorkPool[D][WLen - 1];
+    UnpackPos(TopPos, Rule, Idx);
+    Body := FGrammar.FRules[Rule];
 
-  TopPos := Work[WLen - 1];
-  UnpackPos(TopPos, Rule, Idx);
-  Body := FGrammar.FRules[Rule];
-
-  case Body[Idx].ElemType of
-    getEnd, getAlt:
-      begin
-        // End of an alternate/rule: pop and continue with the parent.
-        Dec(WLen);
-        AddStackExpanded(Work, WLen);
-      end;
-    getRuleRef:
-      begin
-        RefRule := Body[Idx].Value;
-        ContPos := PackPos(Rule, Idx + 1);
-        Work[WLen - 1] := ContPos; // continuation replaces the ref on top
-        // Fork into each alternate of the referenced rule.
-        PushRuleAlternates(Work, WLen, RefRule);
-      end;
-    else
-      // Terminal top: a valid resting state.
-      AddStackRaw(Work, WLen);
+    case Body[Idx].ElemType of
+      getEnd, getAlt:
+        begin
+          // End of an alternate/rule: pop and continue with the parent.
+          Dec(WLen);
+          AddStackExpanded(FWorkPool[D], WLen);
+        end;
+      getRuleRef:
+        begin
+          RefRule := Body[Idx].Value;
+          ContPos := PackPos(Rule, Idx + 1);
+          // Continuation replaces the ref on top.
+          FWorkPool[D][WLen - 1] := ContPos;
+          // Fork into each alternate of the referenced rule.
+          PushRuleAlternates(FWorkPool[D], WLen, RefRule);
+        end;
+      else
+        // Terminal top: a valid resting state.
+        AddStackRaw(FWorkPool[D], WLen);
+    end;
   end;
+  FWorkDepth := D;
 end;
 
 procedure TNNetGrammarMachine.PushRuleAlternates(const Base: array of integer;
@@ -3755,25 +3768,33 @@ procedure TNNetGrammarMachine.PushRuleAlternates(const Base: array of integer;
 // Base[0..BaseLen-1] and expand. An empty alternate's first position is its
 // getEnd, which AddStackExpanded pops to continue with Base.
 var
-  Work: array of integer;
-  AltIdx, K: integer;
+  D, AltIdx, K, BaseLenP1: integer;
   RefBody: TNNetGrammarElemArray;
 begin
   RefBody := FGrammar.FRules[RuleIdx];
-  SetLength(Work, BaseLen + 1);
+  // Rule #17: this frame's work buffer comes from the persistent pool (see
+  // AddStackExpanded). The base bytes never change across alternates, so they
+  // are copied once; only the top slot is rewritten per alternate.
+  D := FWorkDepth;
+  BaseLenP1 := BaseLen + 1;
+  if D >= Length(FWorkPool) then SetLength(FWorkPool, D + 8);
+  if Length(FWorkPool[D]) < BaseLenP1 then
+    SetLength(FWorkPool[D], BaseLenP1 + 8);
   // Contiguous integer copy -> Move (rule #13 / App. C).
-  if BaseLen > 0 then Move(Base[0], Work[0], BaseLen * csIntegerSize);
+  if BaseLen > 0 then Move(Base[0], FWorkPool[D][0], BaseLen * csIntegerSize);
+  Inc(FWorkDepth);
   AltIdx := 0;
   while true do
   begin
-    Work[BaseLen] := PackPos(RuleIdx, AltIdx);
-    AddStackExpanded(Work, BaseLen + 1);
+    FWorkPool[D][BaseLen] := PackPos(RuleIdx, AltIdx);
+    AddStackExpanded(FWorkPool[D], BaseLenP1);
     K := AltIdx;
     while (RefBody[K].ElemType <> getAlt) and
           (RefBody[K].ElemType <> getEnd) do Inc(K);
     if RefBody[K].ElemType = getEnd then break;
     AltIdx := K + 1;
   end;
+  FWorkDepth := D;
 end;
 
 procedure TNNetGrammarMachine.CommitScratchToActive();
