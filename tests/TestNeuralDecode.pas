@@ -256,6 +256,7 @@ type
     procedure TestJSONStateMachineTopLevelCompletionAllowsOnlyWS;
     procedure TestJSONStateMachineBalancedStackClosing;
     procedure TestJSONConstraintValidatesMultiCharTokens;
+    procedure TestJSONConstraintMaskMatchesUnguardedReference;
     procedure TestJSONStateMachineFuzzRandomWalksStayValid;
     // GBNF grammar engine + constraint (no model).
     procedure TestGrammarArithmeticAcceptsOnlyValidExpressions;
@@ -5859,6 +5860,123 @@ begin
     AssertTrue('no second value', not C.TokenAllowed(2));
     AssertTrue('machine agrees', C.Machine.IsComplete());
   finally
+    C.Free;
+    Dict.Free;
+  end;
+end;
+
+// DIFFERENTIAL: the constraint's cached first-character gate must decide every
+// vocabulary id exactly as the unguarded reference (a fresh machine fed the
+// committed text, then the whole token text). Walks a random legal parse so
+// many machine states are compared, and mutates the machine THROUGH the public
+// Machine property - the cache must notice that too.
+procedure TTestNeuralDecode.TestJSONConstraintMaskMatchesUnguardedReference;
+var
+  Dict: TStringListInt;
+  C: TNNetJSONConstraint;
+  Ref: TNNetJSONStateMachine;
+  Committed: string;
+  Walk, Step, Tok, VocabHi, LegalCnt: integer;
+  Legal: array[0..63] of integer;
+
+  // Unguarded semantics: replay the committed prefix, then feed the whole
+  // token text; ids < 2 are the special/EOS gate; empty tokens never advance.
+  function RefAllowed(Id: integer): boolean;
+  var
+    S: string;
+  begin
+    Ref.Reset();
+    if not Ref.FeedString(Committed) then exit(false);
+    if Id < 2 then exit(Ref.IsComplete());
+    S := Dict.DeTokenize(Id);
+    if S = '' then exit(false);
+    Result := Ref.FeedString(S);
+  end;
+
+  procedure CompareWholeMask(const StepMsg: string);
+  var
+    I: integer;
+  begin
+    LegalCnt := 0;
+    for I := 0 to VocabHi do
+    begin
+      if C.TokenAllowed(I) <> RefAllowed(I) then
+        Fail(StepMsg + ': id ' + IntToStr(I) + ' ("' + Dict.DeTokenize(I) +
+          '") guarded=' + BoolToStr(C.TokenAllowed(I), true) + ' reference=' +
+          BoolToStr(RefAllowed(I), true));
+      if (I >= 2) and C.TokenAllowed(I) and (LegalCnt <= High(Legal)) then
+      begin
+        Legal[LegalCnt] := I;
+        Inc(LegalCnt);
+      end;
+    end;
+  end;
+
+begin
+  Dict := TStringListInt.Create();
+  C := nil;
+  Ref := nil;
+  try
+    // Insertion order = token id. Mixes tokens that die on their FIRST char
+    // (the gate's fast path), tokens that die on a LATER char (the gate must
+    // not reject those early), and legal multi-char tokens.
+    Dict.Add('<eos>');    // 0  special
+    Dict.Add('<pad>');    // 1  special
+    Dict.Add('{');        // 2
+    Dict.Add('}');        // 3
+    Dict.Add('[');        // 4
+    Dict.Add(']');        // 5
+    Dict.Add('"a"');      // 6
+    Dict.Add('"b"');      // 7
+    Dict.Add(':');        // 8
+    Dict.Add(',');        // 9
+    Dict.Add('12');       // 10
+    Dict.Add('-3.5e2');   // 11
+    Dict.Add('true');     // 12
+    Dict.Add('null');     // 13
+    Dict.Add('tru');      // 14 legal prefix, incomplete
+    Dict.Add('trx');      // 15 dies on its THIRD char
+    Dict.Add('{"a":1}');  // 16 a whole value in one token
+    Dict.Add('[]');       // 17
+    Dict.Add('x');        // 18 never legal
+    Dict.Add('01');       // 19 dies on its SECOND char (leading zero)
+    Dict.Add(' ');        // 20 whitespace
+    Dict.SaveCurrentPosition();
+    VocabHi := Dict.GetVocabCount() - 1;
+
+    C := TNNetJSONConstraint.Create(Dict);
+    Ref := TNNetJSONStateMachine.Create();
+
+    RandSeed := 20260725;
+    for Walk := 1 to 12 do
+    begin
+      C.Reset([]);
+      Committed := '';
+      CompareWholeMask('walk ' + IntToStr(Walk) + ' start');
+      for Step := 1 to 8 do
+      begin
+        if LegalCnt = 0 then break;
+        Tok := Legal[Random(LegalCnt)];
+        C.Commit(Tok);
+        Committed := Committed + Dict.DeTokenize(Tok);
+        CompareWholeMask('walk ' + IntToStr(Walk) + ' after "' +
+          Committed + '"');
+      end;
+    end;
+
+    // The cache must also follow a state change made through the public
+    // Machine property, not only through Reset/Commit.
+    C.Reset([]);
+    Committed := '';
+    CompareWholeMask('direct-mutation start');
+    AssertTrue('{ is fed directly', C.Machine.FeedChar('{'));
+    Committed := '{';
+    CompareWholeMask('after a direct FeedChar');
+    AssertTrue('"a" is fed directly', C.Machine.FeedString('"a"'));
+    Committed := Committed + '"a"';
+    CompareWholeMask('after a direct FeedString');
+  finally
+    Ref.Free;
     C.Free;
     Dict.Free;
   end;

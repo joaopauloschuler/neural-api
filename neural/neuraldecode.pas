@@ -421,6 +421,10 @@ type
       FKeyString: boolean;     // is the current string an object key?
       FStack: array of char;   // '{' / '[' nesting stack
       FStackLen: integer;
+      // Bumped by every state change (Reset/CopyFrom/FeedChar) and RESTORED by
+      // the non-destructive CharAllowed probe, so it identifies the observable
+      // state: callers cache per-state work and rebuild when it moves.
+      FVersion: int64;
       procedure Push(C: char);
       procedure Pop();
       function Top(): char;
@@ -447,6 +451,9 @@ type
       function IsComplete(): boolean;
       function StackDepth(): integer;
       property State: TNNetJSONMainState read FState;
+      // Monotonic state-change counter (see FVersion): equal versions on the
+      // same machine mean the automaton state is unchanged.
+      property Version: int64 read FVersion;
   end;
 
   { TNNetJSONConstraint }
@@ -468,6 +475,13 @@ type
       FTokenStr: array of string;
       FMachine: TNNetJSONStateMachine;
       FProbe: TNNetJSONStateMachine;
+      // Rule #27: the answer to "can a token starting with byte B be fed?"
+      // depends only on the machine state, so it has 256 possible answers per
+      // decode step, not one per vocabulary id. Built lazily on the first
+      // TokenAllowed after the state moves, keyed on the machine's version.
+      FFirstOK: array[0..255] of boolean;
+      FFirstOKVersion: int64;
+      procedure BuildFirstOK();
     public
       constructor Create(Dict: TStringListInt); overload;
       constructor CreateCharLevel(VocabSize: integer);
@@ -591,6 +605,11 @@ type
       // re-entrant, so one lazily-sized buffer serves every matched stack
       // instead of a fresh SetLength per (stack, char, probed token).
       FAdvBuf: array of integer;
+      // Bumped by every state change (Reset/CopyFrom/FeedChar); CharAllowed and
+      // IsComplete are read-only and leave it alone. It identifies the
+      // observable active set, so callers can cache per-state work and rebuild
+      // it exactly when the version moves.
+      FVersion: int64;
       function PackPos(Rule, Idx: integer): integer;
       procedure UnpackPos(Pos: integer; out Rule, Idx: integer);
       // Pushes a stack (copy of Src[0..Len-1] then descends rule refs so the
@@ -620,6 +639,9 @@ type
       // True when a complete parse of the root rule stands (some empty stack).
       function IsComplete(): boolean;
       function ActiveCount(): integer;
+      // Monotonic state-change counter (see FVersion): equal versions on the
+      // same machine mean the active set is unchanged.
+      property Version: int64 read FVersion;
   end;
 
   { TNNetGrammarConstraint }
@@ -641,6 +663,11 @@ type
       FGrammar: TNNetGrammar;
       FMachine: TNNetGrammarMachine;
       FProbe: TNNetGrammarMachine;
+      // Rule #27: see TNNetJSONConstraint.FFirstOK - the first-character gate
+      // has 256 possible answers per decode step, not one per vocabulary id.
+      FFirstOK: array[0..255] of boolean;
+      FFirstOKVersion: int64;
+      procedure BuildFirstOK();
     public
       constructor Create(const GBNFText: string; Dict: TStringListInt); overload;
       constructor CreateCharLevel(const GBNFText: string; VocabSize: integer);
@@ -2874,10 +2901,12 @@ begin
   FLitRemain := '';
   FKeyString := false;
   FStackLen := 0;
+  Inc(FVersion);
 end;
 
 procedure TNNetJSONStateMachine.CopyFrom(Source: TNNetJSONStateMachine);
 begin
+  Inc(FVersion);
   FState := Source.FState;
   FNumState := Source.FNumState;
   FHexRemain := Source.FHexRemain;
@@ -2962,6 +2991,7 @@ end;
 
 function TNNetJSONStateMachine.FeedChar(C: char): boolean;
 begin
+  Inc(FVersion);
   Result := true;
   case FState of
     jmsValue, jmsValueOrArrayClose:
@@ -3075,11 +3105,14 @@ var
   SavedHexRemain, SavedStackLen: integer;
   SavedLitRemain: string;
   SavedKeyString: boolean;
+  SavedVersion: int64;
 begin
   // One FeedChar performs at most one push (appended above SavedStackLen,
   // discarded by restoring the length) or one pop (the popped element is
   // left intact below SavedStackLen), so saving the scalar fields plus the
-  // stack LENGTH restores the exact state.
+  // stack LENGTH restores the exact state. The version is restored too - a
+  // probe leaves no observable change.
+  SavedVersion := FVersion;
   SavedState := FState;
   SavedNumState := FNumState;
   SavedHexRemain := FHexRemain;
@@ -3093,6 +3126,7 @@ begin
   FLitRemain := SavedLitRemain;
   FKeyString := SavedKeyString;
   FStackLen := SavedStackLen;
+  FVersion := SavedVersion;
 end;
 
 function TNNetJSONStateMachine.IsComplete(): boolean;
@@ -3118,6 +3152,7 @@ begin
   inherited Create();
   FMachine := TNNetJSONStateMachine.Create();
   FProbe := TNNetJSONStateMachine.Create();
+  FFirstOKVersion := -1; // no table yet; machine versions start above zero
   SetLength(FTokenStr, Dict.GetVocabCount());
   Hi := High(FTokenStr);
   for I := 0 to Hi do
@@ -3133,6 +3168,7 @@ begin
   inherited Create();
   FMachine := TNNetJSONStateMachine.Create();
   FProbe := TNNetJSONStateMachine.Create();
+  FFirstOKVersion := -1; // no table yet; machine versions start above zero
   SetLength(FTokenStr, VocabSize);
   Hi := High(FTokenStr);
   for I := 0 to Hi do
@@ -3155,6 +3191,16 @@ begin
   FMachine.Reset();
 end;
 
+procedure TNNetJSONConstraint.BuildFirstOK();
+var
+  C: integer;
+begin
+  // CharAllowed is the non-destructive save/feed/restore probe, so this leaves
+  // FMachine (and its version) exactly where it was.
+  for C := 0 to 255 do FFirstOK[C] := FMachine.CharAllowed(Chr(C));
+  FFirstOKVersion := FMachine.Version;
+end;
+
 function TNNetJSONConstraint.TokenAllowed(TokenId: integer): boolean;
 var
   S: string;
@@ -3165,6 +3211,13 @@ begin
   if TokenId < 2 then exit(FMachine.IsComplete());
   S := FTokenStr[TokenId];
   if S = '' then exit(false); // would not advance generation
+  // First-character gate: the probe's first FeedChar starts from exactly the
+  // state FFirstOK was built from, so a token whose first byte the machine
+  // rejects can never be fed - and this skips the CopyFrom deep copy plus the
+  // per-character feed for the vast majority of the vocabulary. The table is
+  // per state, hence rebuilt exactly when the machine's version moves.
+  if FFirstOKVersion <> FMachine.Version then BuildFirstOK();
+  if not FFirstOK[Ord(S[1])] then exit(false);
   // Transitive multi-character validation: clone the live state and feed the
   // token's characters one by one; ALL must be legal continuations.
   FProbe.CopyFrom(FMachine);
@@ -3749,6 +3802,7 @@ procedure TNNetGrammarMachine.Reset();
 var
   Empty: array of integer;
 begin
+  Inc(FVersion);
   FStackCount := 0;
   FScratchCount := 0;
   SetLength(Empty, 0);
@@ -3761,6 +3815,7 @@ procedure TNNetGrammarMachine.CopyFrom(Source: TNNetGrammarMachine);
 var
   I, SrcStackCountM1: integer;
 begin
+  Inc(FVersion);
   FGrammar := Source.FGrammar;
   if Length(FStacks) < Source.FStackCount then
   begin
@@ -3819,6 +3874,7 @@ function TNNetGrammarMachine.FeedChar(C: char): boolean;
 var
   I, TopPos, Rule, Idx, FStackCountM1, StkLen: integer;
 begin
+  Inc(FVersion);
   FScratchCount := 0;
   FStackCountM1 := FStackCount - 1;
   for I := 0 to FStackCountM1 do
@@ -3891,6 +3947,7 @@ begin
   FGrammar := TNNetGrammar.Create(GBNFText);
   FMachine := TNNetGrammarMachine.Create(FGrammar);
   FProbe := TNNetGrammarMachine.Create(FGrammar);
+  FFirstOKVersion := -1; // no table yet; machine versions start above zero
   SetLength(FTokenStr, Dict.GetVocabCount());
   Hi := High(FTokenStr);
   for I := 0 to Hi do
@@ -3908,6 +3965,7 @@ begin
   FGrammar := TNNetGrammar.Create(GBNFText);
   FMachine := TNNetGrammarMachine.Create(FGrammar);
   FProbe := TNNetGrammarMachine.Create(FGrammar);
+  FFirstOKVersion := -1; // no table yet; machine versions start above zero
   SetLength(FTokenStr, VocabSize);
   Hi := High(FTokenStr);
   for I := 0 to Hi do
@@ -3931,6 +3989,16 @@ begin
   FMachine.Reset();
 end;
 
+procedure TNNetGrammarConstraint.BuildFirstOK();
+var
+  C: integer;
+begin
+  // CharAllowed only reads the active set, so this leaves FMachine (and its
+  // version) exactly where it was.
+  for C := 0 to 255 do FFirstOK[C] := FMachine.CharAllowed(Chr(C));
+  FFirstOKVersion := FMachine.Version;
+end;
+
 function TNNetGrammarConstraint.TokenAllowed(TokenId: integer): boolean;
 var
   S: string;
@@ -3947,7 +4015,11 @@ begin
   // read-only and allocation-free, on FMachine (FProbe would be its clone). The
   // vast majority of the vocabulary dies on its first character, so this guard
   // skips the CopyFrom deep copy and the FeedChar advance-buffer work entirely.
-  if not FMachine.CharAllowed(S[1]) then exit(false);
+  // Rule #27: that verdict depends only on the machine state, so it is answered
+  // from a 256-entry table rebuilt exactly when the machine's version moves -
+  // once per decode step instead of once per vocabulary id.
+  if FFirstOKVersion <> FMachine.Version then BuildFirstOK();
+  if not FFirstOK[Ord(S[1])] then exit(false);
   // Transitive multi-character validation on a forked machine.
   FProbe.CopyFrom(FMachine);
   LenS := Length(S);
