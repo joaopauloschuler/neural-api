@@ -101,7 +101,7 @@ end;
 procedure DequantizeNF4(const Codes: PByte; const Absmax: PSingle;
   NumElements: Int64; Dest: PSingle; BlockSize: Int64 = NF4_DEFAULT_BLOCKSIZE);
 var
-  i, iEnd, Blk, NumElementsM1: Int64;
+  i, iEnd, iPairEnd, Blk, NumElementsM1: Int64;
   PackedByte: byte;
   ScaleVal: single;
   SrcByte: PByte;
@@ -125,17 +125,29 @@ begin
     // Re-derived per block, so an odd BlockSize (block starting on a LOW
     // nibble) still addresses the right byte.
     SrcByte := Codes + (i shr 1);
-    while i <= iEnd do
+    // Head: only reachable with an odd BlockSize, where a block can start on a
+    // LOW nibble. Consuming it leaves the pair loop byte-aligned.
+    if (i and 1) = 1 then
     begin
-      // Two elements per byte; HIGH nibble is the even element.
+      Dest[i] := cNF4Code[SrcByte^ and $0F] * ScaleVal;
+      Inc(SrcByte);
+      Inc(i);
+    end;
+    // Two elements per byte, HIGH nibble first: one load feeds both, so the
+    // per-element parity test is gone (#20).
+    iPairEnd := iEnd - 1;
+    while i <= iPairEnd do
+    begin
       PackedByte := SrcByte^;
-      if (i and 1) = 0 then
-        Dest[i] := cNF4Code[PackedByte shr 4] * ScaleVal
-      else
-      begin
-        Dest[i] := cNF4Code[PackedByte and $0F] * ScaleVal;
-        Inc(SrcByte);
-      end;
+      Dest[i]     := cNF4Code[PackedByte shr 4] * ScaleVal;
+      Dest[i + 1] := cNF4Code[PackedByte and $0F] * ScaleVal;
+      Inc(SrcByte);
+      Inc(i, 2);
+    end;
+    // Tail: a lone even element (odd block length or the last partial block).
+    if i <= iEnd then
+    begin
+      Dest[i] := cNF4Code[SrcByte^ shr 4] * ScaleVal;
       Inc(i);
     end;
     Inc(Blk);
