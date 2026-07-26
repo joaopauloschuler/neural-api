@@ -50323,10 +50323,11 @@ begin
       OutputCntD := 0;
       PtrA := FInputPrepared.GetRawPtr(OutputCntX, OutputCntY);
       OutputIdx := FOutput.GetRawPos(OutputCntX, OutputCntY);
+      // #5: the reduction reads only the (X,Y) patch - it does not depend on
+      // OutputCntD, so it runs once per position and fills the Depth slots.
+      Product := TNNetVolume.Product(PtrA, LocalSize);
       while OutputCntD <= MaxD do
       begin
-        Product := TNNetVolume.Product(PtrA, LocalSize);
-
         FOutputRaw.FData[OutputIdx] := Product;
         FOutput.FData[OutputIdx] := Product;
         Inc(OutputIdx);
