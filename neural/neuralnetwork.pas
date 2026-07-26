@@ -10698,6 +10698,9 @@ type
       // Per-pass Backpropagate scratch promoted from method locals (sized in
       // SetPrevLayer) to avoid per-call heap allocation.
       FgkvBuf, FgvvBuf, FgqqBuf: array of TNeuralFloat;
+      // Per-call gate invariants sigmoid(eta_raw) / sigmoid(theta_raw): weight
+      // only, so they are built once per pass instead of per timestep.
+      FEtaBuf, FThetaBuf: array of TNeuralFloat;
       FdrBuf, Fdh1Buf, Fda1Buf, FdSjBuf: array of TNeuralFloat;
       FgW1Buf, FgW2Buf, FgS1Buf, FgS2Buf: array of TNeuralFloat;
       FgW1pBuf, FgW2pBuf, FgS1pBuf, FgS2pBuf: array of TNeuralFloat;
@@ -66950,6 +66953,8 @@ begin
   FA1q.ReSize(SeqLen, 1, FHidden);
   FH1q.ReSize(SeqLen, 1, FHidden);
   FAlpha.ReSize(SeqLen, 1, FDepth);
+  SetLength(FEtaBuf, FDepth);
+  SetLength(FThetaBuf, FDepth);
   // Promote per-pass Backpropagate scratch from method locals. Backprop-only:
   // skip on inference-only layers (FreeBackpropScratch frees it if marked later).
   if FIsTrainable then
@@ -66988,6 +66993,13 @@ begin
   SeqLenM1 := SeqLen - 1;
   DepthM1 := Depth - 1;
   HdM1 := Hd - 1;
+  // #5/#27: the momentum gates depend only on the raw gate weights, so build
+  // both tables once instead of re-running SeqLen*(Depth+Hd) sigmoids.
+  for o := 0 to DepthM1 do
+  begin
+    FEtaBuf[o] := Sigmoid(EtaR.FData[o]);
+    FThetaBuf[o] := Sigmoid(ThetaR.FData[o]);
+  end;
   for t := 0 to SeqLenM1 do
   begin
     XtPtr := FPrevLayer.FOutput.GetRawPtr(t, 0);
@@ -67040,8 +67052,8 @@ begin
     // momentum + forget update of W2: gW2[o,j]=r[o]*h1[j].
     for o := 0 to DepthM1 do
     begin
-      etao   := Sigmoid(EtaR.FData[o]);
-      thetao := Sigmoid(ThetaR.FData[o]);
+      etao   := FEtaBuf[o];
+      thetao := FThetaBuf[o];
       alphao := FAlpha.FData[baseT + o];
       // Momentum+forget S2_t[o,:] = eta*S2p[o,:] - theta*r[o]*h1, per row o (over j).
       if t > 0 then ThR := @FS2.FData[prevW2 + o * Hd]
@@ -67055,11 +67067,11 @@ begin
     end;
     // momentum + forget update of W1: gW1[j,i]=da1[j]*k[i],
     // da1[j]=g1(a1[j])*(W2_{t-1}^T r)[j]. Gate row j by gj = j mod Depth.
+    gj := 0;                         // #6: j mod Depth carried, no division
     for j := 0 to HdM1 do
     begin
-      gj := j mod Depth;
-      etao   := Sigmoid(EtaR.FData[gj]);
-      thetao := Sigmoid(ThetaR.FData[gj]);
+      etao   := FEtaBuf[gj];
+      thetao := FThetaBuf[gj];
       alphao := FAlpha.FData[baseT + gj];
       TTTGelu(FA1k.FData[tHd + j], gg, g1, g2);
       Ss := 0;
@@ -67079,6 +67091,8 @@ begin
       TNNetVolume.RankOneUpdateRow(@FW1.FData[baseW1 + j * Depth],
         @W1pVol.FData[w1pBase + j * Depth],
         @FS1.FData[baseW1 + j * Depth], 1 - alphao, 1.0, Depth);
+      Inc(gj);
+      if gj = Depth then gj := 0;
     end;
     // read-out using M_t: a1q=W1_t q, h1q=GeLU(a1q), y=W2_t h1q.
     for j := 0 to HdM1 do
@@ -67143,6 +67157,12 @@ begin
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
   for i := 0 to HDepM1 do begin FgW1Buf[i] := 0; FgS1Buf[i] := 0; end;
   for i := 0 to DHM1 do begin FgW2Buf[i] := 0; FgS2Buf[i] := 0; end;
+  // #5/#27: weight-only gate invariants, built once for the whole pass.
+  for o := 0 to DepthM1 do
+  begin
+    FEtaBuf[o] := Sigmoid(EtaR.FData[o]);
+    FThetaBuf[o] := Sigmoid(ThetaR.FData[o]);
+  end;
   SeqLenM1 := SeqLen - 1;
   for t := SeqLenM1 downto 0 do
   begin
@@ -67239,9 +67259,9 @@ begin
         TNNetVolume.MulAdd(PrevErrPtr, @Walpha.FData[oD], galpha_pre, Depth);
     end;
     // W1 branch (gate index gj).
+    gj := 0;                         // #6: j mod Depth carried, no division
     for j := 0 to HdM1 do
     begin
-      gj := j mod Depth;
       jD := j * Depth;
       gjD := gj * Depth;
       alphao := FAlpha.FData[baseT + gj];
@@ -67252,6 +67272,8 @@ begin
       TNNetVolume.MulAdd(@GWalpha.FData[gjD], XtPtr, negLR * galpha_pre, Depth);
       if hasInputGrad then
         TNNetVolume.MulAdd(PrevErrPtr, @Walpha.FData[gjD], galpha_pre, Depth);
+      Inc(gj);
+      if gj = Depth then gj := 0;
     end;
 
     // ---- undo the momentum update S_t = eta*S_{t-1} - theta*grad_t ----
@@ -67259,8 +67281,8 @@ begin
     for o := 0 to DepthM1 do
     begin
       oH := o * Hd;
-      etao   := Sigmoid(EtaR.FData[o]);
-      thetao := Sigmoid(ThetaR.FData[o]);
+      etao   := FEtaBuf[o];
+      thetao := FThetaBuf[o];
       // Shared j-sum dot(gS2[o,:], h1); (t>0) dot(gS2[o,:], S2p).
       dotAH := TNNetVolume.DotProduct(@FgS2Buf[oH], @FH1k.FData[tHd], Hd);
       if t > 0 then dEta := TNNetVolume.DotProduct(@FgS2Buf[oH], @FS2.FData[prevW2 + oH], Hd)
@@ -67278,12 +67300,12 @@ begin
     end;
     // S1_t[j,i] = eta[gj]*S1p[j,i] - theta[gj]*da1[j]*k[i]
     // need dL/d(da1[j]) accumulated then split through g1.
+    gj := 0;                         // #6: j mod Depth carried, no division
     for j := 0 to HdM1 do
     begin
-      gj := j mod Depth;
       jD := j * Depth;
-      etao   := Sigmoid(EtaR.FData[gj]);
-      thetao := Sigmoid(ThetaR.FData[gj]);
+      etao   := FEtaBuf[gj];
+      thetao := FThetaBuf[gj];
       TTTGelu(FA1k.FData[tHd + j], gg, g1, g2);
       Ss := 0; // (W2p^T r)[j] ; W2p[o,j]=W2pVol.FData[w2pBase+o*Hd+j]
       wpos := w2pBase + j;
@@ -67308,6 +67330,8 @@ begin
       // da1 = g1(a1)*Ss : dS feeds (W2p^T r)[j]; g2 second-deriv term on a1.
       FdSjBuf[j] := FdSjBuf[j] + rj * g1;
       Fda1Buf[j] := Fda1Buf[j] + rj * g2 * Ss;
+      Inc(gj);
+      if gj = Depth then gj := 0;
     end;
 
     // ---- inner-forward backward (forms r, h1, a1) ----
