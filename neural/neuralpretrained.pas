@@ -43175,6 +43175,21 @@ begin
   // rotate_half snapshot: size once (Dh is call-invariant), reused across every
   // layer/timestep instead of re-SetLength per (L, t1).
   SetLength(Orig, Dh);
+  // #5/#11: every one of these shapes is layer-invariant. Sized once here, the
+  // per-layer SetLengths become no-op-sized ReAllocMem calls - six per token per
+  // layer, tens of thousands of allocator round-trips on a real sequence.
+  SetLength(Hn, T); SetLength(Q, T); SetLength(Kk, T); SetLength(Vv, T);
+  SetLength(Attn, T); SetLength(Mlp1, T);
+  SetLength(AccVec, Dh);
+  for t1 := 0 to TM1 do
+  begin
+    SetLength(Hn[t1], D);
+    SetLength(Q[t1], NHDh);
+    SetLength(Kk[t1], NKVDhM1 + 1);
+    SetLength(Vv[t1], NKVDhM1 + 1);
+    SetLength(Attn[t1], NHDh);
+    SetLength(Mlp1[t1], FFN);
+  end;
 
   for L := 0 to LayersM1 do
   begin
@@ -43192,10 +43207,8 @@ begin
     LnPG := Layers[L].LnPostG; LnPB := Layers[L].LnPostB;
     ASc := Layers[L].AttnScale; MSc := Layers[L].MlpScale;
     // ---- input LayerNorm ----
-    SetLength(Hn, T);
     for t1 := 0 to TM1 do
     begin
-      SetLength(Hn[t1], D);
       XRow := X[t1];                     // #9: bind rows once
       HnRow := Hn[t1];
       m := 0;
@@ -43209,12 +43222,8 @@ begin
         HnRow[dd] := (XRow[dd] - m) / denom * LnG[dd] + LnB[dd];
     end;
     // ---- Q,K,V projections (rows = out, cols = in) ----
-    SetLength(Q, T); SetLength(Kk, T); SetLength(Vv, T);
     for t1 := 0 to TM1 do
     begin
-      SetLength(Q[t1], NH * Dh);
-      SetLength(Kk[t1], NKV * Dh);
-      SetLength(Vv[t1], NKV * Dh);
       HnRow := Hn[t1];                    // #9: bind row once
       gBase := 0;                        // gidx * D, carried (#6)
       for gidx := 0 to NHDhM1 do
@@ -43271,9 +43280,6 @@ begin
       Inc(tBase, Dh);                    // #6: t1*Dh carried by addition
     end;
     // ---- causal attention per head (GQA: head h uses kv head h div NRep) ----
-    SetLength(Attn, T);
-    for t1 := 0 to TM1 do SetLength(Attn[t1], NH * Dh);
-    SetLength(AccVec, Dh);
     for h := 0 to NHM1 do
     begin
       kvh := h div NRep;
@@ -43326,7 +43332,6 @@ begin
       end;
     end;
     // ---- post-attention LayerNorm + GELU MLP + LayerScale residual ----
-    SetLength(Mlp1, T);
     for t1 := 0 to TM1 do
     begin
       // post LN
@@ -43338,12 +43343,10 @@ begin
       for dd := 0 to DM1 do v := v + Sqr(XRow[dd] - m);
       v := v / D;
       denom := Sqrt(v + eps);
-      SetLength(Hn[t1], D);
       HnRow := Hn[t1];                    // #9: bind row once
       for dd := 0 to DM1 do
         HnRow[dd] := (XRow[dd] - m) / denom * LnPG[dd] + LnPB[dd]; // #9
       // fc1 -> GELU
-      SetLength(Mlp1[t1], FFN);
       Mlp1Row := Mlp1[t1];
       gBase := 0;                        // gidx * D, carried (#6)
       for gidx := 0 to FFNM1 do
