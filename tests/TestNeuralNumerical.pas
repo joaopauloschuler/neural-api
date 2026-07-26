@@ -817,6 +817,8 @@ type
     procedure TestDepthwiseConv1DInputGradientCheck;
     procedure TestDepthwiseConv1DWeightGradientCheck;
     procedure TestDepthwiseConv1DSerializationRoundTrip;
+    procedure TestDepthwiseConv1DMatchesNaiveReference;
+    procedure TestDepthwiseConv1DChunkedMatchesNaiveReference;
     procedure TestPReLUChannelInputGradientCheck;
     procedure TestPReLUChannelWeightGradientCheck;
     procedure TestGatedResidualGradient;
@@ -44443,6 +44445,137 @@ begin
     finally
       NN2.Free;
     end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Differential check of the depthwise forward against a verbatim naive
+// reference (the layer's documented definition, one scalar accumulation per
+// output element) over randomized shapes, both window modes and both bias
+// modes. The fast path transposes the per-channel kernels into a tap-major
+// table and folds one tap of a whole output row per vector call, so a wrong
+// transpose or a wrong window would produce a plausible-looking output that a
+// gradient check (which compares the layer against itself) cannot see.
+procedure TTestNeuralNumerical.TestDepthwiseConv1DMatchesNaiveReference;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LConv: TNNetDepthwiseConv1D;
+  cfg, i, c, t, kk, srcT, off: integer;
+  SeqLen, Depth, K, SuppressBias: integer;
+  Causal: boolean;
+  expected, refSum: TNeuralFloat;
+begin
+  RandSeed := 20260725;
+  for cfg := 0 to 11 do
+  begin
+    SeqLen := 1 + Random(9);
+    Depth := 1 + Random(37);
+    K := 1 + Random(6);
+    Causal := (cfg and 1) = 0;
+    SuppressBias := (cfg shr 1) and 1;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, Depth);
+    try
+      NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+      LConv := TNNetDepthwiseConv1D.Create(K, Causal, SuppressBias);
+      NN.AddLayer(LConv);
+      // Per-channel kernels AND biases must differ per channel and per tap: a
+      // transposed table indexed the wrong way round is only visible when
+      // every (channel, tap) value is distinct.
+      for c := 0 to Depth - 1 do
+      begin
+        for kk := 0 to K - 1 do
+          LConv.Neurons[c].Weights.Raw[kk] := (Random(2000) - 1000) / 1000;
+        LConv.Neurons[c].BiasWeight := (Random(2000) - 1000) / 1000;
+      end;
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := (Random(2000) - 1000) / 700;
+      NN.Compute(Input);
+
+      if Causal then off := K - 1 else off := K div 2;
+      for c := 0 to Depth - 1 do
+        for t := 0 to SeqLen - 1 do
+        begin
+          refSum := 0;
+          if SuppressBias = 0 then refSum := LConv.Neurons[c].BiasWeight;
+          for kk := 0 to K - 1 do
+          begin
+            srcT := t - off + kk;
+            if (srcT >= 0) and (srcT < SeqLen) then // else zero pad
+              refSum := refSum +
+                LConv.Neurons[c].Weights.Raw[kk] * Input[srcT, 0, c];
+          end;
+          expected := refSum;
+          AssertEquals('DepthwiseConv1D cfg ' + IntToStr(cfg) +
+            ' (SeqLen=' + IntToStr(SeqLen) + ' Depth=' + IntToStr(Depth) +
+            ' K=' + IntToStr(K) + ' causal=' + BoolToStr(Causal, true) +
+            ' suppressBias=' + IntToStr(SuppressBias) + ') at t=' +
+            IntToStr(t) + ' c=' + IntToStr(c),
+            expected, LConv.Output[t, 0, c], 1e-5);
+        end;
+    finally
+      NN.Free;
+      Input.Free;
+    end;
+  end;
+end;
+
+// Same differential reference, but through the intra-layer threaded chunk path
+// (ComputeRange over CHANNEL sub-ranges). A chunk offsets every pointer of the
+// tap-major forward by FirstC, so an off-by-one in that offset shows up here
+// and nowhere else.
+procedure TTestNeuralNumerical.TestDepthwiseConv1DChunkedMatchesNaiveReference;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LConv: TNNetDepthwiseConv1D;
+  i, c, t, kk, srcT, off: integer;
+  SeqLen, Depth, K: integer;
+  expected, refSum: TNeuralFloat;
+begin
+  RandSeed := 987654;
+  // FOutput.Size * K must clear the chunk-eligibility bar (4096).
+  SeqLen := 8; Depth := 96; K := 6;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    LConv := TNNetDepthwiseConv1D.Create(K, {pCausal=}true);
+    NN.AddLayer(LConv);
+    for c := 0 to Depth - 1 do
+    begin
+      for kk := 0 to K - 1 do
+        LConv.Neurons[c].Weights.Raw[kk] := (Random(2000) - 1000) / 1000;
+      LConv.Neurons[c].BiasWeight := (Random(2000) - 1000) / 1000;
+    end;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := (Random(2000) - 1000) / 700;
+
+    NN.EnableIntraLayerThreading(true);
+    NN.SchedulerMinGain := 0; // force the parallel scheduler on every pass
+    NN.SetTrainable(False, {pLowMemory=}False);
+    AssertTrue('DepthwiseConv1D must be chunk-eligible', LConv.ChunkEligible());
+    NN.Compute(Input, 0, True);
+
+    off := K - 1;
+    for c := 0 to Depth - 1 do
+      for t := 0 to SeqLen - 1 do
+      begin
+        refSum := LConv.Neurons[c].BiasWeight;
+        for kk := 0 to K - 1 do
+        begin
+          srcT := t - off + kk;
+          if srcT >= 0 then
+            refSum := refSum +
+              LConv.Neurons[c].Weights.Raw[kk] * Input[srcT, 0, c];
+        end;
+        expected := refSum;
+        AssertEquals('DepthwiseConv1D chunked at t=' + IntToStr(t) +
+          ' c=' + IntToStr(c), expected, LConv.Output[t, 0, c], 1e-5);
+      end;
   finally
     NN.Free;
     Input.Free;

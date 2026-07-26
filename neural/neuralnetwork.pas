@@ -8677,8 +8677,11 @@ type
   // KernelSize is stored in FStruct[1], the causal flag in FStruct[2] (1=causal,
   // 0=SAME) and the bias-suppression flag in FStruct[4] for round-tripping.
   // Backward is the exact conv backward (gradient w.r.t. input, per-channel
-  // weights and bias) restricted to the valid window. Scalar (not AVX) because
-  // the per-channel kernel is not contiguous along the depth axis.
+  // weights and bias) restricted to the valid window; it is scalar, because
+  // the per-channel kernel is not contiguous along the depth axis. The CPU
+  // forward instead transposes the kernels into a tap-major table (FTapW),
+  // which makes each tap of an output row a contiguous vector operation - see
+  // BuildTapTables / PrepareTapTables.
   //
   // Incremental decode (inference only, CAUSAL mode only). A causal K-tap conv
   // needs exactly the last K-1 input rows to produce the next output row, so
@@ -8700,6 +8703,18 @@ type
       // Last K-1 input rows, oldest -> newest; zero rows = the left zero-pad.
       // (K=1 keeps one never-read zero row so the volume stays well-formed.)
       FDecHist: TNNetVolume;
+      // --- tap-major forward tables (CPU forward only, not serialized) ---
+      // FTapW is shaped (K, 1, Channels), so tap kk of EVERY channel is the
+      // contiguous run FTapW.FData[kk*Channels .. kk*Channels+Channels-1] and
+      // one output row is a bias Move plus K elementwise MulAdds over
+      // contiguous vectors, instead of a channel-outer scalar sweep whose
+      // reads stride by Channels. FTapBias is the (1,1,Channels) bias row
+      // (already zeroed when bias is suppressed).
+      FTapW: TNNetVolume;
+      FTapBias: TNNetVolume;
+      // Set whenever something that CAN be known to change the kernels happens
+      // (construction, AfterWeightUpdate, the start of a decode session).
+      FTapDirty: boolean;
       {$IFDEF OpenCL}
       // True-depthwise device forward (cai_depthwise_conv1d): one work-item per
       // output (time, channel) element, no cross-channel overspend.
@@ -8710,6 +8725,27 @@ type
       // kernels/biases only then, keeping the resident copy across forwards.
       FGpuWeightsDirty: boolean;
       {$ENDIF}
+      // Rebuilds both tables from the neurons.
+      procedure BuildTapTables();
+      // Rebuild policy, called once per forward from the single-threaded entry
+      // points (Compute / PrepareChunkedForward) - NEVER from a chunk, so the
+      // ranged kernels only ever READ a finished table and the channel split
+      // stays race-free.
+      //
+      // Outside a decode session the tables are rebuilt UNCONDITIONALLY: the
+      // transpose reads the neurons the way the old channel-outer sweep did,
+      // so it costs one token's worth of work, amortized over the whole
+      // sequence - and it keeps trainers, seeders, importers and gradient
+      // checks that write Neurons[].Weights directly (with no invalidation
+      // hook) correct by construction, which a dirty flag would not.
+      //
+      // Inside an incremental-decode session a rebuild per token would cost
+      // MORE than the single-token forward itself, so there the table is
+      // trusted and only rebuilt when FTapDirty. That is sound because the
+      // session is inference-only (PrepareDecodeState rejects training-shaped
+      // use), it starts with a forced rebuild, and AfterWeightUpdate marks the
+      // table dirty for anything that does go through the weight-update path.
+      procedure PrepareTapTables();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure ComputeCPU(); {$IFDEF Release} inline; {$ENDIF}
       procedure ComputeDecodeCPU();
@@ -8724,8 +8760,8 @@ type
       procedure ComputeDecodeCPURange(FirstC, LastC: integer);
       {$IFDEF OpenCL}
       procedure ComputeOpenCL();
-      procedure AfterWeightUpdate(); override;
       {$ENDIF}
+      procedure AfterWeightUpdate(); override;
     protected
       procedure PrepareDecodeState(); override;
       // Threaded slice: one contiguous block of CHANNELS, dispatched to the
@@ -56669,18 +56705,22 @@ begin
   if FCausal then FStruct[2] := 1 else FStruct[2] := 0;
   FStruct[4] := FSuppressBias;
   FDecHist := TNNetVolume.Create();
+  FTapW := TNNetVolume.Create();
+  FTapBias := TNNetVolume.Create();
+  FTapDirty := true;
   {$IFDEF OpenCL}
   FGpuWeightsDirty := true; // force the first device forward to upload weights
   {$ENDIF}
 end;
 
-{$IFDEF OpenCL}
 procedure TNNetDepthwiseConv1D.AfterWeightUpdate();
 begin
   inherited AfterWeightUpdate();
+  FTapDirty := true;        // next forward re-transposes the tap-major tables
+  {$IFDEF OpenCL}
   FGpuWeightsDirty := true; // next device forward re-packs + re-uploads kernels
+  {$ENDIF}
 end;
-{$ENDIF}
 
 procedure TNNetDepthwiseConv1D.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
@@ -56707,6 +56747,52 @@ begin
   AfterWeightUpdate();
 end;
 
+procedure TNNetDepthwiseConv1D.BuildTapTables();
+var
+  Channels, Ksize, c, kk, wPos: integer;
+  ChannelsM1, KsizeM1: integer;
+  W: TNNetVolume;
+  localNeuron: TNNetNeuron;
+  UseBias: boolean;
+begin
+  Channels := FNeurons.Count;
+  if Channels = 0 then exit;
+  Ksize := FKernelSize;
+  // Lazy, amortized resize of persistent fields (rule #17): only on a shape
+  // change, never per call.
+  if (FTapW.SizeX <> Ksize) or (FTapW.Depth <> Channels) then
+    FTapW.ReSize(Ksize, 1, Channels);
+  if FTapBias.Size <> Channels then FTapBias.ReSize(1, 1, Channels);
+  ChannelsM1 := Channels - 1;
+  KsizeM1 := Ksize - 1;
+  UseBias := FSuppressBias = 0;
+  for c := 0 to ChannelsM1 do
+  begin
+    localNeuron := FArrNeurons[c];
+    W := localNeuron.FWeights;
+    if UseBias
+      then FTapBias.FData[c] := localNeuron.FBiasWeight
+      else FTapBias.FData[c] := 0;
+    // FTapW.GetRawPos(kk, 0, c) = kk*Channels + c: carry it (#12).
+    wPos := c;
+    for kk := 0 to KsizeM1 do
+    begin
+      FTapW.FData[wPos] := W.FData[kk];
+      Inc(wPos, Channels);
+    end;
+  end;
+  FTapDirty := false;
+end;
+
+procedure TNNetDepthwiseConv1D.PrepareTapTables();
+begin
+  // See the declaration for why the decode session is the one case that trusts
+  // the cached table instead of re-transposing.
+  if FDecodeEnabled and (not FTapDirty) and
+     (FTapW.SizeX = FKernelSize) and (FTapW.Depth = FNeurons.Count) then exit;
+  BuildTapTables();
+end;
+
 procedure TNNetDepthwiseConv1D.Compute();
 var
   StartTime: double;
@@ -56720,6 +56806,7 @@ begin
     {$IFDEF OpenCL}
     Inc(FForwardCPUCnt);
     {$ENDIF}
+    PrepareTapTables();
     ComputeDecodeCPU();
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
@@ -56738,6 +56825,7 @@ begin
   end
   else Inc(FForwardCPUCnt);
   {$ENDIF}
+  PrepareTapTables();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -56747,48 +56835,50 @@ begin
   ComputeCPURange(0, FNeurons.Count - 1);
 end;
 
+// Time-outer / channel-inner sweep: the channel axis is the contiguous one, so
+// each output row is seeded with the bias run (a Move) and each tap folds in a
+// whole contiguous length-runLen vector (MulAdd: out += x * Wtap). Taps are
+// accumulated in ascending kk order, exactly as the bias-then-taps scalar sum
+// did. The [FirstC..LastC] chunk is a contiguous channel sub-range of every row
+// involved, so a chunk just offsets all three pointers.
 procedure TNNetDepthwiseConv1D.ComputeCPURange(FirstC, LastC: integer);
 var
   Prev: TNNetVolume;
-  SeqLen, Ksize, Channels, t, c, kk, srcT, off, pos, outPos: integer;
-  MaxT, MaxK: integer;
-  W: TNNetVolume;
-  sum, biasInit: TNeuralFloat;
-  localNeuron: TNNetNeuron;
+  SeqLen, Ksize, Channels, t, kk, srcT, off, outPos: integer;
+  MaxT, MaxK, prevPos, wPos, runLen, runBytes: integer;
 begin
+  runLen := LastC - FirstC + 1;
+  if runLen <= 0 then exit;
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   Channels := Prev.Depth;    // Prev shape (SeqLen,1,Channels): row stride = Channels
   Ksize := FKernelSize;
   MaxT := SeqLen - 1;
   MaxK := Ksize - 1;
+  runBytes := runLen * csNeuralFloatSize;
   // Offset of the first tap relative to t: causal reads [t-(K-1) .. t], SAME
   // reads [t-(K div 2) .. t-(K div 2)+K-1].
   if FCausal then off := Ksize - 1 else off := Ksize shr 1;
-  for c := FirstC to LastC do
+  outPos := FirstC;                  // #12: carried FOutput offset (stride Channels).
+  for t := 0 to MaxT do
   begin
-    localNeuron := FArrNeurons[c];
-    W := localNeuron.FWeights;
-    // #5: bias init is invariant per channel - lift the branch out of t.
-    biasInit := 0;
-    if FSuppressBias = 0 then biasInit := localNeuron.FBiasWeight;
-    outPos := c;                     // #12: carried FOutput offset (stride Channels).
-    for t := 0 to MaxT do
+    // FTapBias already carries the suppression (it is zero-filled then).
+    Move(FTapBias.FData[FirstC], FOutput.FData[outPos], runBytes);
+    // Carry the flat read offsets: prevPos = srcT*Channels + FirstC and
+    // wPos = kk*Channels + FirstC (both stride by Channels per tap).
+    srcT := t - off;
+    prevPos := srcT * Channels + FirstC;
+    wPos := FirstC;
+    for kk := 0 to MaxK do
     begin
-      sum := biasInit;
-      // Carry the flat read offset: pos = srcT*Channels + c (= Prev[srcT,0,c]).
-      srcT := t - off;
-      pos := srcT * Channels + c;
-      for kk := 0 to MaxK do
-      begin
-        if (srcT >= 0) and (srcT < SeqLen) then // else zero pad
-          sum := sum + W.FData[kk] * Prev.FData[pos];
-        Inc(srcT);
-        Inc(pos, Channels);
-      end;
-      FOutput.FData[outPos] := sum;
-      Inc(outPos, Channels);
+      if (srcT >= 0) and (srcT < SeqLen) then // else zero pad
+        TNNetVolume.MulAdd(FOutput.GetRawPtr(outPos), Prev.GetRawPtr(prevPos),
+          FTapW.GetRawPtr(wPos), runLen);
+      Inc(srcT);
+      Inc(prevPos, Channels);
+      Inc(wPos, Channels);
     end;
+    Inc(outPos, Channels);
   end;
 end;
 
@@ -56807,50 +56897,52 @@ begin
   Inc(FDecodeSteps, FPrevLayer.FOutput.SizeX);
 end;
 
+// Time-outer / channel-inner, like ComputeCPURange: a bias Move seeds the row
+// and each tap is one contiguous MulAdd, reading the window or the history row
+// (the choice depends on the tap, not on the channel, so it stays a per-tap
+// pointer selection).
 procedure TNNetDepthwiseConv1D.ComputeDecodeCPURange(FirstC, LastC: integer);
 var
   Prev: TNNetVolume;
-  SeqLen, HistLen, Channels, t, c, kk, srcT, pos, hpos, runLen, outPos: integer;
+  SeqLen, HistLen, Channels, t, kk, srcT, pos, hpos, outPos: integer;
   MaxT, MaxK, KeepRows, HistLenM1, KeepRowsM1, mvSrc, mvDst: integer;
-  W: TNNetVolume;
-  sum, biasInit: TNeuralFloat;
-  localNeuron: TNNetNeuron;
+  wPos, runCols, runBytes: integer;
 begin
+  runCols := LastC - FirstC + 1;
+  if runCols <= 0 then exit;
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   Channels := Prev.Depth;    // Prev/FDecHist share row stride = Channels
   HistLen := FKernelSize - 1;
   MaxT := SeqLen - 1;
   MaxK := FKernelSize - 1;
-  for c := FirstC to LastC do
+  runBytes := runCols * csNeuralFloatSize;
+  outPos := FirstC;                  // #12: carried FOutput offset (stride Channels).
+  for t := 0 to MaxT do
   begin
-    localNeuron := FArrNeurons[c];
-    W := localNeuron.FWeights;
-    // #5: bias init is invariant per channel - lift the branch out of t.
-    biasInit := 0;
-    if FSuppressBias = 0 then biasInit := localNeuron.FBiasWeight;
-    outPos := c;                     // #12: carried FOutput offset (stride Channels).
-    for t := 0 to MaxT do
+    // FTapBias already carries the suppression (it is zero-filled then).
+    Move(FTapBias.FData[FirstC], FOutput.FData[outPos], runBytes);
+    // Carry the flat read offsets (srcT increments by 1 per tap):
+    //   pos  = srcT*Channels + FirstC            (window,  srcT >= 0)
+    //   hpos = (HistLen+srcT)*Channels + FirstC  (history, srcT <  0)
+    //   wPos = kk*Channels + FirstC              (tap-major weights)
+    srcT := t - HistLen; // causal taps [t-(K-1) .. t]
+    pos := srcT * Channels + FirstC;
+    hpos := (HistLen + srcT) * Channels + FirstC;
+    wPos := FirstC;
+    for kk := 0 to MaxK do
     begin
-      sum := biasInit;
-      // Carry both flat read offsets (srcT increments by 1 per tap):
-      //   pos  = srcT*Channels + c            (= Prev[srcT,0,c],       srcT>=0)
-      //   hpos = (HistLen+srcT)*Channels + c  (= FDecHist[HistLen+srcT,0,c], srcT<0)
-      srcT := t - HistLen; // causal taps [t-(K-1) .. t]
-      pos := srcT * Channels + c;
-      hpos := (HistLen + srcT) * Channels + c;
-      for kk := 0 to MaxK do
-      begin
-        if srcT >= 0
-          then sum := sum + W.FData[kk] * Prev.FData[pos]
-          else sum := sum + W.FData[kk] * FDecHist.FData[hpos];
-        Inc(srcT);
-        Inc(pos, Channels);
-        Inc(hpos, Channels);
-      end;
-      FOutput.FData[outPos] := sum;
-      Inc(outPos, Channels);
+      if srcT >= 0
+        then TNNetVolume.MulAdd(FOutput.GetRawPtr(outPos), Prev.GetRawPtr(pos),
+               FTapW.GetRawPtr(wPos), runCols)
+        else TNNetVolume.MulAdd(FOutput.GetRawPtr(outPos), FDecHist.GetRawPtr(hpos),
+               FTapW.GetRawPtr(wPos), runCols);
+      Inc(srcT);
+      Inc(pos, Channels);
+      Inc(hpos, Channels);
+      Inc(wPos, Channels);
     end;
+    Inc(outPos, Channels);
   end;
   // Advance the history to the last HistLen rows of (history ++ window) -
   // this range's channel columns only, so concurrent chunks stay race-free.
@@ -56858,7 +56950,6 @@ begin
   // each row copy is a single Move.
   if HistLen > 0 then
   begin
-    runLen := (LastC - FirstC + 1) * csNeuralFloatSize;
     // #6: carry the source/dest row offsets by Channels instead of remultiplying.
     if SeqLen >= HistLen then
     begin
@@ -56867,7 +56958,7 @@ begin
       mvDst := FirstC;
       for t := 0 to HistLenM1 do
       begin
-        Move(Prev.FData[mvSrc], FDecHist.FData[mvDst], runLen);
+        Move(Prev.FData[mvSrc], FDecHist.FData[mvDst], runBytes);
         Inc(mvSrc, Channels);
         Inc(mvDst, Channels);
       end;
@@ -56880,7 +56971,7 @@ begin
       mvDst := FirstC;
       for t := 0 to KeepRowsM1 do
       begin
-        Move(FDecHist.FData[mvSrc], FDecHist.FData[mvDst], runLen);
+        Move(FDecHist.FData[mvSrc], FDecHist.FData[mvDst], runBytes);
         Inc(mvSrc, Channels);
         Inc(mvDst, Channels);
       end;
@@ -56888,7 +56979,7 @@ begin
       mvDst := KeepRows * Channels + FirstC;
       for t := 0 to MaxT do
       begin
-        Move(Prev.FData[mvSrc], FDecHist.FData[mvDst], runLen);
+        Move(Prev.FData[mvSrc], FDecHist.FData[mvDst], runBytes);
         Inc(mvSrc, Channels);
         Inc(mvDst, Channels);
       end;
@@ -56909,6 +57000,9 @@ procedure TNNetDepthwiseConv1D.PrepareChunkedForward();
 begin
   // Once per forward (the chunk path never calls Compute/ComputeDecodeCPU,
   // where the serial paths do this). Coded by Claude (AI).
+  // The tap-major tables must likewise be built HERE: single-threaded and
+  // before any chunk is published, so every worker reads a finished table.
+  PrepareTapTables();
   if FDecodeEnabled then Inc(FDecodeSteps, FPrevLayer.FOutput.SizeX);
 end;
 
@@ -56938,6 +57032,9 @@ begin
   // K-1 history rows; K=1 keeps a single never-read zero row so the state
   // volume (and CaptureState) stay well-formed.
   FDecHist.ReSize(Max(FKernelSize - 1, 1), 1, FNeurons.Count);
+  // A session starts from a freshly transposed table; from here on the decode
+  // forward trusts it (see PrepareTapTables).
+  FTapDirty := true;
 end;
 
 procedure TNNetDepthwiseConv1D.ResetState();
@@ -57040,6 +57137,8 @@ end;
 destructor TNNetDepthwiseConv1D.Destroy();
 begin
   FDecHist.Free;
+  FTapW.Free;
+  FTapBias.Free;
   {$IFDEF OpenCL}
   if Assigned(FDepthwise1DCL) then FDepthwise1DCL.Free;
   if Assigned(FGemmWChan)     then FGemmWChan.Free;
