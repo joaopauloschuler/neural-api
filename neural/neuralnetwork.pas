@@ -20799,6 +20799,12 @@ var
 
 implementation
 
+// Quickselect order statistic, defined further below beside the pruning paths
+// that were its first callers; declared here so LayerSensitivityReport can use
+// it too.
+function SelectKthSmallest(var Arr: array of TNeuralFloat;
+  N, K: integer): TNeuralFloat; forward;
+
 {$IFDEF OpenCL}
 // Work threshold (output-element MACs) gating the device offload of the
 // conv/elementwise layer family (conv variants, FullConnect's friends, the
@@ -112177,10 +112183,9 @@ var
   Lines: TStringList;
   Flags: TStringList;
   LayerIdx, TrIdx, SampleIdx, I, J, K, BinIdx: integer;
-  JBnd: integer;
   Layer: TNNetLayer;
   UsedSamples, TrainableLayers: integer;
-  LSLastLayerIdx, LSUsedSamplesM1, LSTrainM1, LSTrainM2, LSTrialsM1, LScBinsM1, LSBaselineHigh: integer;
+  LSLastLayerIdx, LSUsedSamplesM1, LSTrainM1, LSTrialsM1, LScBinsM1, LSBaselineHigh: integer;
   HasTargets: boolean;
   Snapshot: string;
   SavedRandSeed: longword;
@@ -112204,9 +112209,8 @@ var
   MinMean, MaxMean, Width, V: TNeuralFloat;
   MaxBin, BarLen: integer;
   Bar, ShapeStr: string;
-  // sorted copy of MeanDelta for percentile thresholds + median
+  // scratch copy of MeanDelta for percentile thresholds + median
   Sorted: array of TNeuralFloat;
-  SwapF: TNeuralFloat;
   HighThr, LowThr, Median, MaxSens, FragRatio: TNeuralFloat;
 
   // Local LCG -> uniform (0,1], so this report never disturbs the caller's
@@ -112334,7 +112338,6 @@ begin
     end;
     TrainableLayers := Length(TrLayerIdx);
     LSTrainM1 := TrainableLayers - 1;
-    LSTrainM2 := TrainableLayers - 2;
 
     if TrainableLayers = 0 then
     begin
@@ -112492,28 +112495,26 @@ begin
     Lines.Add('');
 
     // ---- (e) high/low-impact flags via top/bottom-10% thresholds. ----
+    // Only five order statistics are needed, so select them (#22) instead of
+    // ordering the whole array. SelectKthSmallest permutes Sorted in place but
+    // keeps the multiset, so every later call still returns the rank it asks
+    // for; Sorted is a scratch copy of MeanDelta used nowhere else.
     SetLength(Sorted, TrainableLayers);
     for TrIdx := 0 to LSTrainM1 do Sorted[TrIdx] := MeanDelta[TrIdx];
-    for I := 0 to LSTrainM2 do
-    begin
-      JBnd := TrainableLayers - 2 - I;
-      for J := 0 to JBnd do
-        if Sorted[J] > Sorted[J + 1] then
-        begin
-          SwapF := Sorted[J]; Sorted[J] := Sorted[J + 1]; Sorted[J + 1] := SwapF;
-        end;
-    end;
     // median
     if (TrainableLayers mod 2) = 1 then
-      Median := Sorted[TrainableLayers div 2]
+      Median := SelectKthSmallest(Sorted, TrainableLayers, TrainableLayers div 2)
     else
-      Median := 0.5 * (Sorted[TrainableLayers div 2 - 1] +
-                       Sorted[TrainableLayers div 2]);
+      Median := 0.5 *
+        (SelectKthSmallest(Sorted, TrainableLayers, TrainableLayers div 2 - 1) +
+         SelectKthSmallest(Sorted, TrainableLayers, TrainableLayers div 2));
     // top/bottom 10% index thresholds (at least the extreme element each).
     K := Trunc(cTailFrac * TrainableLayers);
     if K < 1 then K := 1;
-    HighThr := Sorted[TrainableLayers - K];        // >= this -> high impact
-    LowThr := Sorted[K - 1];                        // <= this -> low impact
+    // >= this -> high impact
+    HighThr := SelectKthSmallest(Sorted, TrainableLayers, TrainableLayers - K);
+    // <= this -> low impact
+    LowThr := SelectKthSmallest(Sorted, TrainableLayers, K - 1);
 
     Flags.Add('High-impact layers (top 10% by mean output-delta):');
     for TrIdx := 0 to LSTrainM1 do
@@ -112531,7 +112532,7 @@ begin
     Lines.Add('');
 
     // ---- (f) fragility verdict: max / median sensitivity. ----
-    MaxSens := Sorted[TrainableLayers - 1];
+    MaxSens := SelectKthSmallest(Sorted, TrainableLayers, TrainableLayers - 1);
     if Median > 1e-30 then
       FragRatio := MaxSens / Median
     else
