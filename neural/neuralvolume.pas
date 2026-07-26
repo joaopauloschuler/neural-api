@@ -823,7 +823,11 @@ type
       // partition followed by a sort of the K-element prefix. The prefix is
       // identical to the first K entries of a full descending sort (ties
       // aside), so callers that only read [0..K-1] are unaffected.
-      procedure SelectTopCandidates(K: integer);
+      // Sorted=False skips that prefix sort. It is for callers that draw
+      // UNIFORMLY inside the window and so do not depend on the order within
+      // it; every caller that walks the window in cumulative order (top-p,
+      // min-p, Mirostat, weighted top-k) needs the default.
+      procedure SelectTopCandidates(K: integer; Sorted: boolean = True);
       // Re-arms the full window and sorts it. Used as the fallback when a
       // truncated window turned out to be too small to answer the query.
       procedure RestoreFullWindowSorted();
@@ -846,6 +850,8 @@ type
   TNNetSamplerTopK = class (TNNetSamplerBase)
     protected
       FTopK: integer;
+      // Uniform draw over the live window (see the implementation note).
+      function DrawFromWindow(): integer;
     public
       constructor Create(TopK: integer);
       function GetToken(Origin: TNNetVolume): integer; override;
@@ -3762,19 +3768,31 @@ begin
   FTopK := TopK;
 end;
 
+// Uniform draw over the truncated window. FCount is the live window size, so
+// it is already Min(FTopK, vocabulary size): drawing on FTopK instead would
+// index past the loaded candidates whenever FTopK exceeds the vocabulary.
+function TNNetSamplerTopK.DrawFromWindow(): integer;
+begin
+  if FCount > 0
+    then Result := FTokenArr[Random(FCount)].Token
+    else Result := 0; // defensive: empty distribution
+end;
+
 function TNNetSamplerTopK.GetToken(Origin: TNNetVolume): integer;
 begin
   LoadCandidates(Origin);
-  SelectTopCandidates(FTopK);
-  Result := FTokenArr[Random(FTopK)].Token;
+  // The draw is uniform over the window, so the order inside it is irrelevant
+  // and the prefix sort is pure waste here.
+  SelectTopCandidates(FTopK, {Sorted=}False);
+  Result := DrawFromWindow();
 end;
 
 function TNNetSamplerTopK.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 begin
   LoadCandidatesOnPixel(Origin, PixelX, PixelY);
-  SelectTopCandidates(FTopK);
-  Result := FTokenArr[Random(FTopK)].Token;
+  SelectTopCandidates(FTopK, {Sorted=}False);
+  Result := DrawFromWindow();
 end;
 
 { TNNetSamplerWeightedTopK }
@@ -4209,13 +4227,13 @@ begin
   FSorted := true;
 end;
 
-procedure TNNetSamplerBase.SelectTopCandidates(K: integer);
+procedure TNNetSamplerBase.SelectTopCandidates(K: integer; Sorted: boolean);
 begin
   if K <= 0 then K := 1;
   if K >= FCount then
   begin
     // Nothing to truncate - the caller wants the whole window.
-    SortTokenArray();
+    if Sorted then SortTokenArray();
     exit;
   end;
   if FSorted then
@@ -4226,7 +4244,7 @@ begin
   end;
   PartialSelectTokenArray(FTokenArr, FCount, K);
   FCount := K;
-  SortTokenArray();
+  if Sorted then SortTokenArray();
 end;
 
 procedure TNNetSamplerBase.RestoreFullWindowSorted();

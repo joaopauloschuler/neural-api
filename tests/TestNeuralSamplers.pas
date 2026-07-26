@@ -24,6 +24,8 @@ type
     procedure TestTopKSamplerGetToken;
     procedure TestTopKSamplerGetTokenOnPixel;
     procedure TestTopKSamplerWithDifferentK;
+    procedure TestTopKSamplerKLargerThanVocab;
+    procedure TestTopKSamplerNonPositiveK;
     
     // TNNetSamplerTopP tests
     procedure TestTopPSamplerCreation;
@@ -246,6 +248,57 @@ begin
     
     Token := Sampler.GetTokenOnPixel(V, 1, 1);
     AssertEquals('TopK with K=1 should select token 3', 3, Token);
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+// A K wider than the vocabulary must fall back to the whole row: the draw is
+// bounded by the number of loaded candidates, not by K.
+procedure TTestNeuralSamplers.TestTopKSamplerKLargerThanVocab;
+var
+  Sampler: TNNetSamplerTopK;
+  V: TNNetVolume;
+  Token, I: integer;
+  Seen: array[0..5] of integer;
+begin
+  Sampler := TNNetSamplerTopK.Create(500);
+  V := TNNetVolume.Create(6, 1, 1);
+  try
+    V.Fill(0.1);
+    V.Raw[2] := 0.5;
+    for I := 0 to 5 do Seen[I] := 0;
+    for I := 1 to 400 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('Token ' + IntToStr(Token) + ' out of vocabulary',
+        (Token >= 0) and (Token <= 5));
+      Inc(Seen[Token]);
+    end;
+    // The whole row is the window, so every token must be reachable.
+    for I := 0 to 5 do
+      AssertTrue('Token ' + IntToStr(I) + ' was never drawn', Seen[I] > 0);
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+// K <= 0 is clamped to a single candidate, which makes the sampler greedy.
+procedure TTestNeuralSamplers.TestTopKSamplerNonPositiveK;
+var
+  Sampler: TNNetSamplerTopK;
+  V: TNNetVolume;
+  I: integer;
+begin
+  Sampler := TNNetSamplerTopK.Create(0);
+  V := TNNetVolume.Create(6, 1, 1);
+  try
+    V.Fill(0.1);
+    V.Raw[4] := 0.5;
+    for I := 1 to 20 do
+      AssertEquals('K=0 should behave like greedy', 4, Sampler.GetToken(V));
   finally
     V.Free;
     Sampler.Free;
