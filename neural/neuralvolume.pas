@@ -11872,54 +11872,55 @@ begin
   {$ENDIF}
 end;
 
+// The two centered copies this used to materialize were two heap allocations
+// per call inside neuralvolume.pas (rule #17) and three extra traversals. The
+// centered second moments need no buffer: one pass accumulating the three
+// centered sums replaces the copies, the two GetSumSqr passes and the
+// DotProduct pass. Centering is still done against the measured means (rather
+// than the E[X^2]-E[X]^2 shortcut), so the numerics are unchanged.
 function TNNetVolume.PearsonCorrelation(Y: TNNetVolume): TNeuralFloat;
 var
-  X, XMinusAvg, YMinusAvg: TNNetVolume;
-  SumX, SumY: TNeuralFloat;
+  I, vHigh: integer;
+  DX, DY: TNeuralFloat;
+  SumXX, SumYY, SumXY: TNeuralFloat;
   AvgX, AvgY: TNeuralFloat;
   VarianceX, VarianceY: TNeuralFloat;
   StdDevX, StdDevY: TNeuralFloat;
   Covariance: TNeuralFloat;
   SizeFloat: TNeuralFloat;
 begin
-  X := Self;
-  if (X.Size < 1) or (Y.Size < 1) or (X.Size <> Y.Size) then
+  if (FSize < 1) or (Y.FSize < 1) or (FSize <> Y.FSize) then
   begin
     Result := 0;
     exit;
   end;
 
-  SizeFloat := X.Size;
+  SizeFloat := FSize;
+  AvgX := GetSum() / SizeFloat;
+  AvgY := Y.GetSum() / SizeFloat;
 
-  SumX := X.GetSum();
-  SumY := Y.GetSum();
+  SumXX := 0;
+  SumYY := 0;
+  SumXY := 0;
+  vHigh := FSize - 1;
+  for I := 0 to vHigh do
+  begin
+    DX := FData[I] - AvgX;
+    DY := Y.FData[I] - AvgY;
+    SumXX := SumXX + DX * DX;
+    SumYY := SumYY + DY * DY;
+    SumXY := SumXY + DX * DY;
+  end;
 
-  AvgX := SumX / SizeFloat;
-  AvgY := SumY / SizeFloat;
-
-  XMinusAvg := TNNetVolume.Create(1, 1, X.Size, -AvgX);
-  YMinusAvg := TNNetVolume.Create(1, 1, Y.Size, -AvgY);
-
-  XMinusAvg.Add(X);
-  YMinusAvg.Add(Y);
-
-  VarianceX := XMinusAvg.GetSumSqr() / SizeFloat;
-  VarianceY := YMinusAvg.GetSumSqr() / SizeFloat;
+  VarianceX := SumXX / SizeFloat;
+  VarianceY := SumYY / SizeFloat;
 
   StdDevX := Sqrt( VarianceX );
   StdDevY := Sqrt( VarianceY );
 
-  (*
-  // Debug code
-  WriteLn('Sum X:', SumX, ' Avg X:', AvgX, ' Variance X:', VarianceX, ' StdDev X:', StdDevX);
-  WriteLn('Sum Y:', SumY, ' Avg Y:', AvgY, ' Variance Y:', VarianceX, ' StdDev Y:', StdDevY);
-  WriteLn('Variance X:', X.GetVariance() );
-  WriteLn('Variance Y:', Y.GetVariance() );
-  *)
-
   if (StdDevX <> 0) and (StdDevY<>0) then
   begin
-    Covariance := XMinusAvg.DotProduct(YMinusAvg) / SizeFloat;
+    Covariance := SumXY / SizeFloat;
     Result := (Covariance) / (StdDevX * StdDevY);
     Result := NeuronForceRange(Result, 1);
   end
@@ -11927,9 +11928,6 @@ begin
   begin
     Result := 0;
   end;
-
-  YMinusAvg.Free;
-  XMinusAvg.Free;
 end;
 
 procedure TNNetVolume.AddSumChannel(Original: TNNetVolume);

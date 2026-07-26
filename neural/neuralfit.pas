@@ -944,7 +944,7 @@ begin
   begin
     for CountX := 0 to MaxX do
     begin
-      if Result then for CountY := 0 to MaxY do
+      for CountY := 0 to MaxY do
       begin
         StartPointPos := A.GetRawPos(CountX, CountY);
         // Get the A Class
@@ -952,7 +952,7 @@ begin
         MaxValueA := A.FData[I];
         LocalPos := 0;
         LocalClassA := 0;
-        if Result then for CountD := 1 to MaxD do
+        for CountD := 1 to MaxD do
         begin
           Inc(I);
           Inc(LocalPos);
@@ -968,7 +968,7 @@ begin
         MaxValueB := B.FData[I];
         LocalPos := 0;
         LocalClassB := 0;
-        if Result then for CountD := 1 to MaxD do
+        for CountD := 1 to MaxD do
         begin
           Inc(I);
           Inc(LocalPos);
@@ -981,8 +981,10 @@ begin
         end;
         if (MaxValueA>0) and (MaxValueB>0) and (LocalClassA <> LocalClassB) then
         begin
+          // Exit, not Break: a Break only leaves the CountY loop and the
+          // CountX loop then spins to completion doing nothing.
           Result := False;
-          Break;
+          exit;
         end;
       end;
     end;

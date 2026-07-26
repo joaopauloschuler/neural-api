@@ -123,7 +123,7 @@ function ABKey(S: array of byte; Divisor: longint): longint;
 var
   I: longint;
   SumKey: longint;
-  Hi: longint;
+  Hi, HiP1: longint;
 begin
   SumKey := 203;
 {$IFDEF FPC}
@@ -132,11 +132,14 @@ begin
 {$OVERFLOWCHECKS OFF}
 
   Hi := High(S);
+  HiP1 := Hi + 1; // element count, invariant across the loop
   for I := Low(S) to Hi do
   begin
+    // Both mod operations are load-bearing: the inner one bounds the running
+    // key before it is multiplied again, so dropping it would overflow.
     SumKey :=
       (((SumKey * (S[I] + 11)) mod Divisor) *
-      (S[(I + 1) mod (High(S) + 1)] + 17) + 3) mod Divisor;
+      (S[(I + 1) mod HiP1] + 17) + 3) mod Divisor;
   end;
   ABKey := abs(SumKey) mod Divisor;
 {$OVERFLOWCHECKS ON}
@@ -157,13 +160,9 @@ end;
 
 // Example: ABSet(X,[1,2]);
 procedure ABSet(var A: array of byte; B: array of byte);
-var
-  I: longint;
-  Hi: longint;
 begin
-  Hi := High(A);
-  for I := Low(A) to Hi do
-    A[I] := B[I];
+  // A contiguous element-for-element copy is a Move (App. C).
+  if Length(A) > 0 then Move(B[0], A[0], Length(A));
 end;
 
 procedure ABTriPascal(var A, B: array of byte);
@@ -206,23 +205,14 @@ begin
 end;
 
 procedure ABClear(var AB: array of byte);
-var
-  I: longint;
-  Hi: longint;
 begin
-  Hi := High(AB);
-  for I := Low(AB) to Hi do
-    AB[I] := 0;
+  // A uniform byte fill is FillChar (App. C); this is on TABHash.Clear.
+  if Length(AB) > 0 then FillChar(AB[0], Length(AB), 0);
 end;
 
 procedure ABFull(var AB: array of byte);
-var
-  I: longint;
-  Hi: longint;
 begin
-  Hi := High(AB);
-  for I := Low(AB) to Hi do
-    AB[I] := 1;
+  if Length(AB) > 0 then FillChar(AB[0], Length(AB), 1);
 end;
 
 procedure ABAnd(var A, B: array of byte);
@@ -375,35 +365,57 @@ end;
 
 function ABToString(var AB: array of byte): string;
 var
-  I: longint;
+  I, Hi, OutPos: longint;
   R: string;
-  Hi: longint;
+  C: char;
 begin
-  R := '';
+  // One byte in, one character out: Length(AB) is an exact bound, so the
+  // quadratic concatenation becomes one allocation and a carried index (#23).
   Hi := High(AB);
+  SetLength(R, Length(AB));
+  OutPos := 0;
   for I := Low(AB) to Hi do
+  begin
     case AB[I] of
-      0: R := R + '0';
-      1: R := R + '1';
+      0: C := '0';
+      1: C := '1';
       else
-        R := R + 'X';
+        C := 'X';
     end; // of case
+    Inc(OutPos);
+    R[OutPos] := C;
+  end;
   ABToString := R;
 end;
 
 function ABToStringR(var AB: array of byte): string;
 var
-  I: longint;
-  R: string;
-  Hi: longint;
+  I, J, Hi, OutPos: longint;
+  R, Piece: string;
 begin
-  R := '';
+  // AB[I] is a byte, so IntToStr yields at most three characters; 3 per
+  // element is a safe over-estimate, truncated once at the end (#23).
   Hi := High(AB);
+  SetLength(R, Length(AB) * 3);
+  OutPos := 0;
   for I := Low(AB) to Hi do
+  begin
     if AB[I] <> 0 then
-      R := R + IntToStr(AB[I])
+    begin
+      Piece := IntToStr(AB[I]);
+      for J := 1 to Length(Piece) do
+      begin
+        Inc(OutPos);
+        R[OutPos] := Piece[J];
+      end;
+    end
     else
-      R := R + ' ';
+    begin
+      Inc(OutPos);
+      R[OutPos] := ' ';
+    end;
+  end;
+  SetLength(R, OutPos);
   ABToStringR := R;
 end;
 
