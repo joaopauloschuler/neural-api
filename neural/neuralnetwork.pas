@@ -7520,9 +7520,14 @@ type
       FTokenNormCL: TNNetTokenNormCL;
       procedure ComputeOpenCL();
       {$ENDIF}
+      // Releases FNormalized: it is read only by Backpropagate, so an
+      // inference-only layer neither fills nor needs it. Compute keys the
+      // snapshot on FNormalized's size.
+      procedure FreeBackpropScratch();
     public
       constructor Create(); override;
       destructor Destroy(); override;
+      function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -7600,9 +7605,14 @@ type
       FTokenNormCL: TNNetTokenNormCL;
       procedure ComputeOpenCL();
       {$ENDIF}
+      // Releases FNormalized: it is read only by Backpropagate, so an
+      // inference-only layer neither fills nor needs it. Compute keys the
+      // snapshot on FNormalized's size.
+      procedure FreeBackpropScratch();
     public
       constructor Create(); override;
       destructor Destroy(); override;
+      function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -7808,9 +7818,14 @@ type
       FGroupNormCL: TNNetGroupNormCL;
       procedure ComputeOpenCL();
       {$ENDIF}
+      // Releases FNormalized: it is read only by Backpropagate, so an
+      // inference-only layer neither fills nor needs it. Compute keys the
+      // snapshot on FNormalized's size.
+      procedure FreeBackpropScratch();
     public
       constructor Create(Groups: integer; PerChannelAffine: boolean = True); reintroduce; overload;
       destructor Destroy(); override;
+      function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -70344,13 +70359,30 @@ begin
   inherited Destroy();
 end;
 
+procedure TNNetLayerNorm.FreeBackpropScratch();
+begin
+  FNormalized.ReSize(1, 1, 1);
+end;
+
+function TNNetLayerNorm.SetTrainable(pTrainable: boolean;
+  pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if pTrainable then
+  begin
+    if Assigned(FPrevLayer) then FNormalized.ReSize(FOutput);
+  end
+  else FreeBackpropScratch();
+end;
+
 procedure TNNetLayerNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   if FNeurons.Count < 2 then AddMissingNeurons(2);
   // FNeurons[0] holds gamma (scale), FNeurons[1] holds beta (bias).
   SetNumWeightsForAllNeurons(FOutput);
-  FNormalized.ReSize(FOutput);
+  if FIsTrainable then FNormalized.ReSize(FOutput)
+  else FreeBackpropScratch();
   SetOutputErrorSize(FOutput);
   {$IFDEF OpenCL}
   FShouldOpenCL := false; // bandwidth-bound: GPU < CPU at every size (OpenCLForwardBenchmark ~0.50x), pin to CPU. Old verdict: Int64(FOutput.Size) >= cNeuralOpenCLMinWork
@@ -70385,8 +70417,10 @@ begin
   Variance := FOutput.GetSumSqr() / FOutput.Size;
   FInvStdDev := pcr_rsqrtf(Variance + FLayerNormEpsilon);
   FOutput.Mul(FInvStdDev);
-  // Keep the normalized values for the backward pass.
-  FNormalized.Copy(FOutput);
+  // Keep the normalized values for the backward pass. FNormalized is read only
+  // by Backpropagate and is released on an inference-only layer, so the
+  // whole-volume snapshot is keyed on the buffer still being there.
+  if FNormalized.Size = FOutput.Size then FNormalized.Copy(FOutput);
   // Apply learnable per-element scale (gamma) and bias (beta).
   FOutput.Mul(FNeurons[0].FWeights);
   FOutput.Add(FNeurons[1].FWeights);
@@ -70765,13 +70799,30 @@ begin
   inherited Destroy();
 end;
 
+procedure TNNetRMSNorm.FreeBackpropScratch();
+begin
+  FNormalized.ReSize(1, 1, 1);
+end;
+
+function TNNetRMSNorm.SetTrainable(pTrainable: boolean;
+  pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if pTrainable then
+  begin
+    if Assigned(FPrevLayer) then FNormalized.ReSize(FOutput);
+  end
+  else FreeBackpropScratch();
+end;
+
 procedure TNNetRMSNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   // FNeurons[0] holds gamma (scale).
   SetNumWeightsForAllNeurons(FOutput);
-  FNormalized.ReSize(FOutput);
+  if FIsTrainable then FNormalized.ReSize(FOutput)
+  else FreeBackpropScratch();
   SetOutputErrorSize(FOutput);
   {$IFDEF OpenCL}
   // Bandwidth-bound: whole-volume RMSNorm loses to AVX2 on the device at
@@ -70814,8 +70865,10 @@ begin
   MeanSqr := FOutput.GetSumSqr() / FOutput.Size;
   FInvRMS := pcr_rsqrtf(MeanSqr + FRMSNormEpsilon);
   FOutput.Mul(FInvRMS);
-  // Keep the normalized values for the backward pass.
-  FNormalized.Copy(FOutput);
+  // Keep the normalized values for the backward pass. FNormalized is read only
+  // by Backpropagate and is released on an inference-only layer, so the
+  // whole-volume snapshot is keyed on the buffer still being there.
+  if FNormalized.Size = FOutput.Size then FNormalized.Copy(FOutput);
   // Apply learnable per-element scale (gamma).
   FOutput.Mul(FNeurons[0].FWeights);
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -71273,12 +71326,21 @@ procedure TNNetRMSNormGated.FreeBackpropScratch();
 begin
   SetLength(FgradGBuf, 0);
   SetLength(FsByDepthBuf, 0);
+  FNormalized.ReSize(1, 1, 1);
 end;
 
 function TNNetRMSNormGated.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if pTrainable then
+  begin
+    if Assigned(FPrevLayer) then
+    begin
+      FNormalized.ReSize(FOutput);
+      SetLength(FgradGBuf, FOutput.Depth);
+    end;
+  end
+  else FreeBackpropScratch();
 end;
 
 destructor TNNetRMSNormGated.Destroy();
@@ -71294,7 +71356,6 @@ begin
   // The base allocates FNeurons[0] with Depth weights; these hold one gate
   // logit g[d] per channel.
   SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
-  FNormalized.ReSize(FOutput);
   SetOutputErrorSize(FOutput);
   // Per-channel sigmoid gate cache: used by Compute (forward) too, so allocate
   // it regardless of trainability.
@@ -71302,8 +71363,10 @@ begin
   // Backprop-only scratch: skip on inference-only layers.
   if FIsTrainable then
   begin
+    FNormalized.ReSize(FOutput);
     SetLength(FgradGBuf, FOutput.Depth);
-  end;
+  end
+  else FNormalized.ReSize(1, 1, 1);
   InitDefault();
 end;
 
@@ -71323,8 +71386,10 @@ begin
   MeanSqr := FOutput.GetSumSqr() / FOutput.Size;
   FInvRMS := pcr_rsqrtf(MeanSqr + FRMSNormEpsilon);
   FOutput.Mul(FInvRMS);
-  // Keep the normalized values n[x,y,d] for the backward pass.
-  FNormalized.Copy(FOutput);
+  // Keep the normalized values n[x,y,d] for the backward pass. FNormalized is
+  // read only by Backpropagate and is released on an inference-only layer, so
+  // the whole-volume snapshot is keyed on the buffer still being there.
+  if FNormalized.Size = FOutput.Size then FNormalized.Copy(FOutput);
   // Apply the learnable per-channel sigmoid gate: y = n * sigmoid(g[d]).
   W := FNeurons[0].FWeights;
   Depth := FOutput.Depth;
@@ -71873,6 +71938,22 @@ begin
   inherited Destroy();
 end;
 
+procedure TNNetGroupNorm.FreeBackpropScratch();
+begin
+  FNormalized.ReSize(1, 1, 1);
+end;
+
+function TNNetGroupNorm.SetTrainable(pTrainable: boolean;
+  pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if pTrainable then
+  begin
+    if Assigned(FPrevLayer) then FNormalized.ReSize(FOutput);
+  end
+  else FreeBackpropScratch();
+end;
+
 procedure TNNetGroupNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -71895,7 +71976,8 @@ begin
   else
     // Legacy affine: one gamma/beta per output element.
     SetNumWeightsForAllNeurons(FOutput);
-  FNormalized.ReSize(FOutput);
+  if FIsTrainable then FNormalized.ReSize(FOutput)
+  else FreeBackpropScratch();
   SetOutputErrorSize(FOutput);
   {$IFDEF OpenCL}
   FShouldOpenCL := false; // bandwidth-bound: GPU < CPU at every size (OpenCLForwardBenchmark ~0.29x), pin to CPU. Old verdict: Int64(FOutput.Size) >= cNeuralOpenCLMinWork
@@ -71956,7 +72038,9 @@ begin
         TNNetVolume.Mul(ColPtr, InvStdPtr, FOutput.Depth);
       end;
     // Keep the normalized values for the backward pass and apply the affine.
-    FNormalized.Copy(FOutput);
+    // FNormalized is read only by Backpropagate and is released on an
+    // inference-only layer, so the snapshot is keyed on the buffer size.
+    if FNormalized.Size = FOutput.Size then FNormalized.Copy(FOutput);
     if FPerChannelAffine then
     begin
       FOutput.MulChannels(FNeurons[0].FWeights);
@@ -72004,8 +72088,10 @@ begin
         TNNetVolume.Mul(ColPtr, InvStd, GroupDepth);
       end;
   end;
-  // Keep the normalized values for the backward pass.
-  FNormalized.Copy(FOutput);
+  // Keep the normalized values for the backward pass. FNormalized is read only
+  // by Backpropagate and is released on an inference-only layer, so the
+  // snapshot is keyed on the buffer size.
+  if FNormalized.Size = FOutput.Size then FNormalized.Copy(FOutput);
   // Apply the learnable scale (gamma) and bias (beta).
   if FPerChannelAffine then
   begin
