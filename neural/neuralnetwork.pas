@@ -7559,7 +7559,6 @@ type
       FNormalized: TNNetVolume;   // x_hat, same shape as the input
       FInvStd: TNNetVolume;       // per-token 1/sqrt(var+eps), SizeX x SizeY x 1
       FOnes: TNNetVolume;         // Depth-length ones vector for the mean reduction
-      FCentered: TNNetVolume;     // per-token (x - mean) scratch, Depth-length
       FGammaGradScratch: TNNetVolume; // Depth-length backward gamma-grad accumulator
       FBetaGradScratch: TNNetVolume;  // Depth-length backward beta-grad accumulator
       {$IFDEF OpenCL}
@@ -7567,10 +7566,16 @@ type
       procedure ComputeOpenCL();
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      // Releases FNormalized / FInvStd and the gamma/beta grad accumulators:
+      // they are read only by Backpropagate, so an inference-only layer
+      // neither fills nor needs them. Compute keys the x_hat snapshot on
+      // FNormalized's size.
+      procedure FreeBackpropScratch();
     public
       constructor Create(); overload; override;
       constructor Create(pEpsilon: TNeuralFloat); reintroduce; overload;
       destructor Destroy(); override;
+      function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -70487,7 +70492,6 @@ begin
   FNormalized := TNNetVolume.Create();
   FInvStd := TNNetVolume.Create();
   FOnes := TNNetVolume.Create();
-  FCentered := TNNetVolume.Create();
   FGammaGradScratch := TNNetVolume.Create();
   FBetaGradScratch := TNNetVolume.Create();
 end;
@@ -70506,11 +70510,35 @@ begin
   {$ENDIF}
   FBetaGradScratch.Free;
   FGammaGradScratch.Free;
-  FCentered.Free;
   FOnes.Free;
   FInvStd.Free;
   FNormalized.Free;
   inherited Destroy();
+end;
+
+procedure TNNetTokenLayerNorm.FreeBackpropScratch();
+begin
+  FNormalized.ReSize(1, 1, 1);
+  FInvStd.ReSize(1, 1, 1);
+  FGammaGradScratch.ReSize(1, 1, 1);
+  FBetaGradScratch.ReSize(1, 1, 1);
+end;
+
+function TNNetTokenLayerNorm.SetTrainable(pTrainable: boolean;
+  pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if pTrainable then
+  begin
+    if Assigned(FPrevLayer) then
+    begin
+      FNormalized.ReSize(FOutput);
+      FInvStd.ReSize(FOutput.SizeX, FOutput.SizeY, 1);
+      FGammaGradScratch.ReSize(1, 1, FOutput.Depth);
+      FBetaGradScratch.ReSize(1, 1, FOutput.Depth);
+    end;
+  end
+  else FreeBackpropScratch();
 end;
 
 procedure TNNetTokenLayerNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -70520,13 +70548,16 @@ begin
   // FNeurons[0] holds gamma (per-channel scale, Depth weights),
   // FNeurons[1] holds beta (per-channel bias, Depth weights).
   SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
-  FNormalized.ReSize(FOutput);
-  FInvStd.ReSize(FOutput.SizeX, FOutput.SizeY, 1);
   FOnes.ReSize(1, 1, FOutput.Depth);
   FOnes.Fill(1);
-  FCentered.ReSize(1, 1, FOutput.Depth);
-  FGammaGradScratch.ReSize(1, 1, FOutput.Depth);
-  FBetaGradScratch.ReSize(1, 1, FOutput.Depth);
+  if FIsTrainable then
+  begin
+    FNormalized.ReSize(FOutput);
+    FInvStd.ReSize(FOutput.SizeX, FOutput.SizeY, 1);
+    FGammaGradScratch.ReSize(1, 1, FOutput.Depth);
+    FBetaGradScratch.ReSize(1, 1, FOutput.Depth);
+  end
+  else FreeBackpropScratch();
   SetOutputErrorSize(FOutput);
   {$IFDEF OpenCL}
   FShouldOpenCL := false; // bandwidth-bound: GPU < CPU at every size (OpenCLForwardBenchmark ~0.54x), pin to CPU. Old verdict: Int64(FOutput.Size) >= cNeuralOpenCLMinWork
@@ -70539,9 +70570,10 @@ var
   StartTime: double;
   Depth, TokenCnt, TokenMax, BaseIdx: integer;
   Mean, Variance, InvStdDev: TNeuralFloat;
+  KeepNorm: boolean;
   Gamma, Beta: TNNetVolume;
   GammaPtr, BetaPtr, OnesPtr: TNeuralFloatArrPtr;
-  XPtr, XHatPtr, CenPtr: TNeuralFloatArrPtr;
+  XPtr, XHatPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   inherited Compute;
@@ -70569,26 +70601,31 @@ begin
   GammaPtr := Gamma.GetRawPtr();
   BetaPtr := Beta.GetRawPtr();
   OnesPtr := FOnes.GetRawPtr();
-  CenPtr := FCentered.GetRawPtr();
+  // FNormalized / FInvStd are read only by Backpropagate and are released on
+  // an inference-only layer, so the snapshot is keyed on the buffer still
+  // being there (#20: one test for the whole pass, not one per token).
+  KeepNorm := FNormalized.Size = FOutput.Size;
   for TokenCnt := 0 to TokenMax do
   begin
     BaseIdx := TokenCnt * Depth;
     XPtr := FOutput.GetRawPtr(BaseIdx);
-    XHatPtr := FNormalized.GetRawPtr(BaseIdx);
     // mean( x ) via the vectorized dot product of the segment with a ones vector.
     Mean := TNNetVolume.DotProduct(XPtr, OnesPtr, Depth) / Depth;
-    // centered = x - mean  (Depth-length scratch).
-    system.Move(XPtr^, CenPtr^, Depth * csNeuralFloatSize);
-    TNNetVolume.MulAdd(CenPtr, OnesPtr, -Mean, Depth);
+    // Center the segment in place: FOutput already holds this layer's own copy
+    // of the input, so no separate centered scratch is needed.
+    TNNetVolume.MulAdd(XPtr, OnesPtr, -Mean, Depth);
     // var = mean( centered^2 ) via the vectorized dot product with itself.
-    Variance := TNNetVolume.DotProduct(CenPtr, CenPtr, Depth) / Depth;
+    Variance := TNNetVolume.DotProduct(XPtr, XPtr, Depth) / Depth;
     InvStdDev := 1 / Sqrt(Variance + FTokenLNEpsilon);
-    FInvStd.FData[TokenCnt] := InvStdDev;
-    // x_hat = centered * invStd  (store normalized).
-    system.Move(CenPtr^, XHatPtr^, Depth * csNeuralFloatSize);
-    TNNetVolume.Mul(XHatPtr, InvStdDev, Depth);
+    // x_hat = centered * invStd, in place.
+    TNNetVolume.Mul(XPtr, InvStdDev, Depth);
+    if KeepNorm then
+    begin
+      FInvStd.FData[TokenCnt] := InvStdDev;
+      XHatPtr := FNormalized.GetRawPtr(BaseIdx);
+      system.Move(XPtr^, XHatPtr^, Depth * csNeuralFloatSize);
+    end;
     // FOutput = gamma .* x_hat + beta  (elementwise over the depth segment).
-    system.Move(XHatPtr^, XPtr^, Depth * csNeuralFloatSize);
     TNNetVolume.Mul(XPtr, GammaPtr, Depth);
     TNNetVolume.Add(XPtr, BetaPtr, Depth);
   end;
