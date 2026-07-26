@@ -30,6 +30,7 @@ type
     procedure TestLionOptimizer;
     procedure TestAdafactorOptimizer;
     procedure TestAdafactorUsesFewerBuffersThanAdam;
+    procedure TestAdamDeltaMatchesClosedForm;
     procedure TestReluErrorDerivIsGated;
     procedure TestMuonOptimizer;
     procedure TestMuonOrthogonalizesUpdate;
@@ -801,6 +802,64 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestAdamDeltaMatchesClosedForm;
+const
+  cLR = 0.01;
+  cBeta1 = 0.9;
+  cBeta2 = 0.999;
+  cEps = 1e-8;
+var
+  NN: TNNet;
+  Layer: TNNetLayer;
+  N: TNNetNeuron;
+  I, MaxI: integer;
+  D, Expected: TNeuralFloat;
+begin
+  // First Adam step in closed form. With zero-initialised moments and
+  // Beta1Decay = Beta1, Beta2Decay = Beta2 after one step:
+  //   m1 = (1-B1)*d,                 m1/(1-B1Decay) = d
+  //   m2 = (1-B2)*d^2,   sqrt(m2/(1-B2Decay)) = |d|
+  //   delta = LR * d / (|d| + eps)
+  // This pins the exact arithmetic of TNNetNeuron.CalcAdamDelta, including the
+  // bias-correction scaling of the second moment.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer([
+      TNNetInput.Create(4),
+      TNNetFullConnectLinear.Create(2)
+    ]);
+    NN.SetLearningRate(cLR, 0);
+    Layer := NN.Layers[1];
+    Layer.InitAdam(cBeta1, cBeta2, cEps);
+
+    N := Layer.Neurons[0];
+    MaxI := N.Delta.Size - 1;
+    AssertEquals('Neuron delta has one slot per input', 3, MaxI);
+    N.Delta.FData[0] := 0.5;
+    N.Delta.FData[1] := -0.25;
+    N.Delta.FData[2] := 2.0;
+    N.Delta.FData[3] := 0.0;
+
+    Layer.CalcAdamDelta();
+
+    for I := 0 to MaxI do
+    begin
+      case I of
+        0: D := 0.5;
+        1: D := -0.25;
+        2: D := 2.0;
+      else
+        D := 0.0;
+      end;
+      Expected := cLR * D / (Abs(D) + cEps);
+      AssertEquals('Adam delta at ' + IntToStr(I), Expected,
+        N.Delta.FData[I], 1e-6);
+    end;
+  finally
+    NN.Free;
   end;
 end;
 

@@ -125947,7 +125947,10 @@ begin
   );
   *)
   FDelta2.Copy(FBackInertia2);
-  FDelta2.Divi(OmB2D);
+  // OmB2D = 1 - Beta2Decay is fixed for the whole optimizer step, so scale by
+  // its reciprocal (#21). On a build without AVX this turns one divide per
+  // weight into one divide per layer.
+  FDelta2.Mul(1.0 / OmB2D);
   FDelta2.VSqrt();
   FDelta2.Add(Eps);
 
