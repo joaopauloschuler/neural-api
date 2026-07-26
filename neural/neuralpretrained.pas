@@ -65694,6 +65694,7 @@ var
   StartsYHi, StartsXHi, TileLatentMinSizeM1, LatentDepthM1: integer;
   ImgTileWM1, OutChannelsM1: integer;
   ltBase, latBase, resBase, doBase: integer;
+  FeatherCols, FeatherColsM1, RunLen: integer;
 begin
   // The decoder's fixed-size TNNetInput defines the tile; the latent->image
   // scale is read from the first/last layer spatial sizes.
@@ -65777,6 +65778,13 @@ begin
       // Tile placement offsets are invariant across the ty/tx nest (#5/#12).
       gyBase := StartsY[nj] * Scale;
       gxBase := StartsX[nx] * Scale;
+      // #20: 'nx > 0' is invariant across the ENTIRE tx loop, so resolve it once
+      // into a feather-column count instead of re-testing it per pixel.
+      if nx > 0 then FeatherCols := ImgOverlap else FeatherCols := 0;
+      if FeatherCols > ImgTileW then FeatherCols := ImgTileW;
+      FeatherColsM1 := FeatherCols - 1;
+      // Interior columns share one contiguous run in BOTH volumes (#13/App C).
+      RunLen := (ImgTileW - FeatherCols) * OutChannels;
       for ty := 0 to ImgTileWM1 do
       begin
         gy := gyBase + ty;
@@ -65787,15 +65795,14 @@ begin
         // Seed the row bases at tx=0; both advance by OutChannels per tx (#12).
         resBase := Result.GetRawPos(gxBase, gy, 0);
         doBase := DecOut.GetRawPos(0, ty, 0);
-        for tx := 0 to ImgTileWM1 do
+        // Feather prefix: wx ramps per column, so this stays per-pixel. It is
+        // at most ImgOverlap columns wide and only exists when nx > 0.
+        for tx := 0 to FeatherColsM1 do
         begin
-          if (nx > 0) and (tx < ImgOverlap) then
-            wx := (tx + 1) * invOv
-          else
-            wx := 1.0;
+          wx := (tx + 1) * invOv;
           w := wx * wy;
-          // w is d-invariant: full overwrite (w=1, the tile interior) is a Move;
-          // the feather edge is scale-in-place + scaled accumulate.
+          // w is d-invariant: full overwrite (w=1) is a Move; the feather edge
+          // is scale-in-place + scaled accumulate.
           if w = 1.0 then
             Move(DecOut.FData[doBase], Result.FData[resBase],
               OutChannels * csNeuralFloatSize)
@@ -65808,6 +65815,22 @@ begin
           end;
           Inc(resBase, OutChannels);
           Inc(doBase, OutChannels);
+        end;
+        // Interior: wx = 1 across every remaining column, so w = wy is constant
+        // and the run is contiguous in both volumes. One bulk call per ROW
+        // replaces ImgTileW-ImgOverlap calls over OutChannels (=3) floats each.
+        if RunLen > 0 then
+        begin
+          if wy = 1.0 then
+            Move(DecOut.FData[doBase], Result.FData[resBase],
+              RunLen * csNeuralFloatSize)
+          else
+          begin
+            oneMinusW := 1.0 - wy;
+            TNNetVolume.Mul(Result.GetRawPtr(resBase), oneMinusW, RunLen);
+            TNNetVolume.MulAdd(Result.GetRawPtr(resBase),
+              DecOut.GetRawPtr(doBase), wy, RunLen);
+          end;
         end;
       end;
     end;
