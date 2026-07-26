@@ -11204,6 +11204,9 @@ type
   TNNetLocalResponseNorm2D = class(TNNetIdentity)
     private
       FLRN: TNNetVolume;
+      // Squared-input scratch owned by the layer, so the normalization itself
+      // allocates nothing per forward pass (rule #17/#27).
+      FLRNSqr: TNNetVolume;
     public
       constructor Create(pSize: integer); reintroduce; overload;
       destructor Destroy(); override;
@@ -90590,7 +90593,7 @@ var
 begin
   StartTime := Now();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
-  FLRN.CalculateLocalResponseFromDepth(FOutput, FStruct[0], 0.001 / 9.0, 0.75);
+  FLRN.CalculateLocalResponseFromDepth(FOutput, FLRNSqr, FStruct[0], 0.001 / 9.0, 0.75);
   FOutput.Divi(FLRN);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -90600,11 +90603,13 @@ constructor TNNetLocalResponseNorm2D.Create(pSize: integer);
 begin
   inherited Create();
   FLRN := TNNetVolume.Create;
+  FLRNSqr := TNNetVolume.Create;
   FStruct[0] := pSize;
 end;
 
 destructor TNNetLocalResponseNorm2D.Destroy();
 begin
+  FLRNSqr.Free;
   FLRN.Free;
   inherited Destroy();
 end;
@@ -90615,7 +90620,7 @@ var
 begin
   StartTime := Now();
   inherited Compute();
-  FLRN.CalculateLocalResponseFrom2D(FOutput, FStruct[0], 0.001 / 9.0, 0.75);
+  FLRN.CalculateLocalResponseFrom2D(FOutput, FLRNSqr, FStruct[0], 0.001 / 9.0, 0.75);
   FOutput.Divi(FLRN);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;

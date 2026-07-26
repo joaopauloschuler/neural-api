@@ -57,6 +57,8 @@ type
     procedure TestAssertFiniteNilVolume;
     procedure TestNeuralBoxIoU;
     procedure TestNeuralGreedyNMS;
+    procedure TestLocalResponse2DMatchesReference;
+    procedure TestLocalResponseDepthMatchesReference;
   end;
 
   // TNNetVolumeQuant8 holds int8 codes under the TNNetVolume geometry
@@ -1866,6 +1868,138 @@ begin
     OutArr.Free;
     VBs.Free;
     Q.Free;
+  end;
+end;
+
+// Straightforward O(pSize*pSize) box sum: the definition the summed-area-table
+// implementation in TNNetVolume.CalculateLocalResponseFrom2D has to reproduce.
+procedure ReferenceLocalResponse2D(Dest, Original: TNNetVolume;
+  pSize: integer; alpha, beta: TNeuralFloat);
+var
+  iFrom, iTo, CountIX, CountIY: integer;
+  MaxX, MaxY, MaxD: integer;
+  MinIX, MaxIX, MinIY, MaxIY: integer;
+  CountX, CountY, CountD: integer;
+  Sum, Scale: TNeuralFloat;
+begin
+  Dest.ReSize(Original);
+  MaxX := Original.SizeX - 1;
+  MaxY := Original.SizeY - 1;
+  MaxD := Original.Depth - 1;
+  iTo := pSize shr 1;
+  iFrom := -iTo;
+  Scale := alpha / (pSize * pSize);
+  for CountX := 0 to MaxX do
+  begin
+    MinIX := Max(CountX + iFrom, 0);
+    MaxIX := Min(CountX + iTo, MaxX);
+    for CountY := 0 to MaxY do
+    begin
+      MinIY := Max(CountY + iFrom, 0);
+      MaxIY := Min(CountY + iTo, MaxY);
+      for CountD := 0 to MaxD do
+      begin
+        Sum := 1;
+        for CountIX := MinIX to MaxIX do
+          for CountIY := MinIY to MaxIY do
+            Sum := Sum + Scale * Sqr(Original[CountIX, CountIY, CountD]);
+        Dest[CountX, CountY, CountD] := Power(Sum, beta);
+      end;
+    end;
+  end;
+end;
+
+// Straightforward O(pSize) depth window: the definition the prefix-sum
+// implementation in TNNetVolume.CalculateLocalResponseFromDepth reproduces.
+procedure ReferenceLocalResponseDepth(Dest, Original: TNNetVolume;
+  pSize: integer; alpha, beta: TNeuralFloat);
+var
+  iFrom, iTo, CountID: integer;
+  MaxX, MaxY, MaxD: integer;
+  MinID, MaxID: integer;
+  CountX, CountY, CountD: integer;
+  Sum, Scale: TNeuralFloat;
+begin
+  Dest.ReSize(Original);
+  MaxX := Original.SizeX - 1;
+  MaxY := Original.SizeY - 1;
+  MaxD := Original.Depth - 1;
+  iTo := pSize shr 1;
+  iFrom := -iTo;
+  Scale := alpha / pSize;
+  for CountX := 0 to MaxX do
+    for CountY := 0 to MaxY do
+      for CountD := 0 to MaxD do
+      begin
+        MinID := Max(CountD + iFrom, 0);
+        MaxID := Min(CountD + iTo, MaxD);
+        Sum := 1;
+        for CountID := MinID to MaxID do
+          Sum := Sum + Scale * Sqr(Original[CountX, CountY, CountID]);
+        Dest[CountX, CountY, CountD] := Power(Sum, beta);
+      end;
+end;
+
+procedure TTestNeuralVolume.TestLocalResponse2DMatchesReference;
+var
+  Original, Got, Want, Scratch: TNNetVolume;
+  I, pSize: integer;
+begin
+  Original := TNNetVolume.Create(7, 5, 6);
+  Got      := TNNetVolume.Create(1, 1, 1);
+  Want     := TNNetVolume.Create(1, 1, 1);
+  Scratch  := TNNetVolume.Create(1, 1, 1);
+  try
+    RandSeed := 1234;
+    for I := 0 to Original.Size - 1 do
+      Original.FData[I] := (Random - 0.5) * 20;
+    for pSize := 1 to 5 do
+    begin
+      ReferenceLocalResponse2D(Want, Original, pSize, 0.001 / 9.0, 0.75);
+      Got.CalculateLocalResponseFrom2D(Original, Scratch, pSize, 0.001 / 9.0, 0.75);
+      AssertEquals('Size for pSize ' + IntToStr(pSize), Want.Size, Got.Size);
+      for I := 0 to Want.Size - 1 do
+        AssertEquals('pSize ' + IntToStr(pSize) + ' element ' + IntToStr(I),
+          Want.FData[I], Got.FData[I], 1e-5);
+    end;
+    // The scratch is reused across calls without reallocation.
+    AssertEquals('Scratch keeps the input shape', Original.Size, Scratch.Size);
+  finally
+    Scratch.Free;
+    Want.Free;
+    Got.Free;
+    Original.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestLocalResponseDepthMatchesReference;
+var
+  Original, Got, Want, Scratch: TNNetVolume;
+  I, pSize: integer;
+begin
+  Original := TNNetVolume.Create(4, 3, 9);
+  Got      := TNNetVolume.Create(1, 1, 1);
+  Want     := TNNetVolume.Create(1, 1, 1);
+  Scratch  := TNNetVolume.Create(1, 1, 1);
+  try
+    RandSeed := 4321;
+    for I := 0 to Original.Size - 1 do
+      Original.FData[I] := (Random - 0.5) * 20;
+    for pSize := 1 to 5 do
+    begin
+      ReferenceLocalResponseDepth(Want, Original, pSize, 0.001 / 9.0, 0.75);
+      Got.CalculateLocalResponseFromDepth(Original, Scratch, pSize, 0.001 / 9.0, 0.75);
+      AssertEquals('Size for pSize ' + IntToStr(pSize), Want.Size, Got.Size);
+      for I := 0 to Want.Size - 1 do
+        AssertEquals('pSize ' + IntToStr(pSize) + ' element ' + IntToStr(I),
+          Want.FData[I], Got.FData[I], 1e-5);
+    end;
+    AssertEquals('Scratch keeps the input shape', Original.Size, Scratch.Size);
+  finally
+    Scratch.Free;
+    Want.Free;
+    Got.Free;
+    Original.Free;
   end;
 end;
 

@@ -435,8 +435,11 @@ type
     public
       procedure ReSize(pSizeX, pSizeY, pDepth: integer); override;
       function GetMemSize(): integer; {$IFDEF Release} inline; {$ENDIF}
-      procedure CalculateLocalResponseFrom2D(Original: TNNetVolume; pSize:integer; alpha, beta: TNeuralFloat );
-      procedure CalculateLocalResponseFromDepth(Original: TNNetVolume; pSize:integer; alpha, beta: TNeuralFloat );
+      // SqrElements is a caller-owned scratch volume shaped like Original; it
+      // is resized here only when the shape changes, so nothing is allocated
+      // per call (rule #17).
+      procedure CalculateLocalResponseFrom2D(Original, SqrElements: TNNetVolume; pSize:integer; alpha, beta: TNeuralFloat );
+      procedure CalculateLocalResponseFromDepth(Original, SqrElements: TNNetVolume; pSize:integer; alpha, beta: TNeuralFloat );
       procedure GetTokenArray(var TokenArray: TNNetTokenArray);
       procedure GetTokenArrayOnPixel(var TokenArray: TNNetTokenArray; X,Y: integer);
       (*
@@ -10332,86 +10335,107 @@ begin
 end;
 
 // inspired on: http://caffe.berkeleyvision.org/tutorial/layers/lrn.html
-procedure TNNetVolume.CalculateLocalResponseFrom2D(Original: TNNetVolume;
+// The pSize x pSize spatial box sum is read off a 2-D summed-area table built
+// in place in the caller's scratch volume, so every output costs at most three
+// adds instead of pSize*pSize. The summands are all alpha*x^2 >= 0 and the
+// window is a fraction of the plane, so the four-corner subtraction loses only
+// a few ULP of a quantity that is then added to 1.
+procedure TNNetVolume.CalculateLocalResponseFrom2D(Original, SqrElements: TNNetVolume;
   pSize: integer; alpha, beta: TNeuralFloat);
 var
-  SqrElements: TNNetVolume;
-  iFrom, iTo, CountIX, CountIY: integer;
-  iRawPos: integer;
-  MaxX, MaxY, MaxD: integer;
+  iFrom, iTo: integer;
+  MaxX, MaxY: integer;
   MinIX, MaxIX, MinIY, MaxIY: integer;
-  CountX, CountY, CountD: integer;
+  CountX, CountY: integer;
   iBase: integer;
-  sqPos, RowStrideSq, sqBase, SqDepth: integer;
+  RowStrideSq, SqDepth: integer;
+  HasLeft, HasTop: boolean;
 begin
   ReSize(Original);
   Fill(1);
+  SqrElements.ReSize(Original); // no-op once the shape settles (rule #17)
 
   MaxX := FSizeX - 1;
   MaxY := FSizeY - 1;
-  MaxD := FDepth - 1;
 
   iTo := pSize shr 1;
   iFrom := -iTo;
-  SqrElements := TNNetVolume.Create();
   SqrElements.Copy(Original);
   SqrElements.Mul(SqrElements);
   SqrElements.Mul(alpha/(pSize*pSize));
-  RowStrideSq := SqrElements.FSizeX * SqrElements.FDepth; // CountIY step in SqrElements
-  SqDepth := SqrElements.FDepth; // #12: per-CountIX step in SqrElements
+  SqDepth := SqrElements.FDepth;               // one CountX step in SqrElements
+  RowStrideSq := SqrElements.FSizeX * SqDepth; // one CountY step in SqrElements
 
+  // Inclusive summed-area table, in place: prefix along X, then along Y.
+  for CountY := 0 to MaxY do
+  begin
+    iBase := SqrElements.GetRawPos(0, CountY);
+    for CountX := 1 to MaxX do
+    begin
+      TNNetVolume.Add(SqrElements.GetRawPtr(iBase + SqDepth),
+        SqrElements.GetRawPtr(iBase), SqDepth);
+      Inc(iBase, SqDepth);
+    end;
+  end;
+  iBase := 0;
+  for CountY := 1 to MaxY do
+  begin
+    // A whole row is contiguous, so one call carries the Y prefix.
+    TNNetVolume.Add(SqrElements.GetRawPtr(iBase + RowStrideSq),
+      SqrElements.GetRawPtr(iBase), RowStrideSq);
+    Inc(iBase, RowStrideSq);
+  end;
+
+  // Self is filled with 1, so each box sum accumulates on top of it. Self and
+  // SqrElements share Original's shape, so one base indexes both.
   for CountX := 0 to MaxX do
   begin
     MinIX := Max(CountX + iFrom,0);
     MaxIX := Min(CountX + iTo, MaxX);
+    HasLeft := MinIX > 0;
     for CountY := 0 to MaxY do
     begin
-      iBase := GetRawPos(CountX, CountY);
       MinIY := Max(CountY + iFrom,0);
       MaxIY := Min(CountY + iTo, MaxY);
-      for CountD := 0 to MaxD do
+      HasTop := MinIY > 0;
+      iBase := GetRawPos(CountX, CountY);
+      TNNetVolume.Add(GetRawPtr(iBase),
+        SqrElements.GetRawPtr(SqrElements.GetRawPos(MaxIX, MaxIY)), FDepth);
+      if HasLeft then
+        TNNetVolume.MulAdd(GetRawPtr(iBase),
+          SqrElements.GetRawPtr(SqrElements.GetRawPos(MinIX - 1, MaxIY)), -1, FDepth);
+      if HasTop then
       begin
-        iRawPos := iBase + CountD;
-
-        // (MinIX, MinIY, CountD) flat offset; +SqDepth per CountIX (#12).
-        sqBase := SqrElements.GetRawPos(MinIX, MinIY) + CountD;
-        for CountIX := MinIX to MaxIX do
-        begin
-          sqPos := sqBase;
-          for CountIY := MinIY to MaxIY do
-          begin
-            {$IFDEF FPC}
-            FData[iRawPos] += SqrElements.FData[sqPos];
-            {$ELSE}
-            FData[iRawPos] := FData[iRawPos] + SqrElements.FData[sqPos];
-            {$ENDIF}
-            Inc(sqPos, RowStrideSq);
-          end;
-          Inc(sqBase, SqDepth);
-        end;
+        TNNetVolume.MulAdd(GetRawPtr(iBase),
+          SqrElements.GetRawPtr(SqrElements.GetRawPos(MaxIX, MinIY - 1)), -1, FDepth);
+        if HasLeft then
+          TNNetVolume.Add(GetRawPtr(iBase),
+            SqrElements.GetRawPtr(SqrElements.GetRawPos(MinIX - 1, MinIY - 1)), FDepth);
       end;
     end;
   end;
 
   Pow(beta);
-
-  SqrElements.Free;
 end;
 
-procedure TNNetVolume.CalculateLocalResponseFromDepth(Original: TNNetVolume;
+// The MinID..MaxID depth window is a sliding box sum, so it is read off an
+// inclusive prefix sum built in place along the depth axis of the caller's
+// scratch volume: one subtraction per output instead of pSize adds. All the
+// summands are alpha*x^2 >= 0 and the result is then added to 1, so the
+// prefix difference is numerically harmless.
+procedure TNNetVolume.CalculateLocalResponseFromDepth(Original, SqrElements: TNNetVolume;
   pSize: integer; alpha, beta: TNeuralFloat);
 var
-  SqrElements: TNNetVolume;
-  iFrom, iTo, CountID: integer;
-  iRawPos: integer;
+  iFrom, iTo: integer;
   MaxX, MaxY, MaxD: integer;
   MinID, MaxID: integer;
   CountX, CountY, CountD: integer;
-  sqrBase: integer;
+  sqrPos: integer;
   iBase: integer;
+  WindowSum: TNeuralFloat;
 begin
   ReSize(Original);
-  Fill(1);
+  SqrElements.ReSize(Original); // no-op once the shape settles (rule #17)
 
   MaxX := FSizeX - 1;
   MaxY := FSizeY - 1;
@@ -10419,7 +10443,6 @@ begin
 
   iTo := pSize shr 1;
   iFrom := -iTo;
-  SqrElements := TNNetVolume.Create();
   SqrElements.Copy(Original);
   SqrElements.Mul(SqrElements);
   SqrElements.Mul(alpha/pSize);
@@ -10430,32 +10453,27 @@ begin
     begin
       // Self and SqrElements are both shaped like Original, so one base indexes both.
       iBase := GetRawPos(CountX, CountY);
+      // Inclusive prefix along the depth axis of this (X, Y) column, in place.
+      for CountD := 1 to MaxD do
+      begin
+        sqrPos := iBase + CountD;
+        SqrElements.FData[sqrPos] :=
+          SqrElements.FData[sqrPos] + SqrElements.FData[sqrPos - 1];
+      end;
       for CountD := 0 to MaxD do
       begin
-        MinID := Max(CountD + iFrom,0);
+        MinID := CountD + iFrom;
         MaxID := Min(CountD + iTo, MaxD);
-        iRawPos := iBase + CountD;
-
-        //WriteLn('CountX:', CountX,' CountY:', CountY, ' CountD:',CountD, ' MinID:',MinID, ' MaxID:', MaxID);
-
-        sqrBase := iBase + MinID;
-        for CountID := MinID to MaxID do
-        begin
-          {$IFDEF FPC}
-          FData[iRawPos] += SqrElements.FData[sqrBase];
-          {$ELSE}
-          FData[iRawPos] := FData[iRawPos] + SqrElements.FData[sqrBase];
-          {$ENDIF}
-          Inc(sqrBase);
-        end;
-
+        WindowSum := SqrElements.FData[iBase + MaxID];
+        // MinID <= 0 means the window starts at depth 0: nothing to subtract.
+        if MinID > 0 then
+          WindowSum := WindowSum - SqrElements.FData[iBase + MinID - 1];
+        FData[iBase + CountD] := 1 + WindowSum;
       end;
     end;
   end;
 
   Pow(beta);
-
-  SqrElements.Free;
 end;
 
 procedure TNNetVolume.GetTokenArray(var TokenArray: TNNetTokenArray);
