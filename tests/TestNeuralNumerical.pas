@@ -603,6 +603,9 @@ type
     procedure TestSelectiveSSMDStateSerializationRoundTrip;
     procedure TestSelectiveSSMIncrementalDecodeEquivalence;
     procedure TestSelectiveSSMARawWriteIsSeenByForward;
+    // Inference-only (SetTrainable(False)) forward parity for the state-space
+    // layers that cache a per-timestep BPTT state during Compute.
+    procedure TestSSMLayersInferenceOnlyForwardParity;
     procedure TestMamba2InputGradientCheck;
     procedure TestMamba2WeightGradientCheck;
     procedure TestMamba2SerializationRoundTrip;
@@ -36031,6 +36034,142 @@ begin
   end;
   for c := 0 to DInner - 1 do
     LM2.Neurons[3].Weights.Raw[c] := 1.0 + Sin(c * 0.6) * 0.3; // norm_weight
+end;
+
+procedure TTestNeuralNumerical.TestSSMLayersInferenceOnlyForwardParity;
+// TNNetMamba2 and TNNetSelectiveSSM (all three forward variants: legacy
+// DState=1, multi-state DState>1 and the Jamba inner-norm mode) cache the
+// per-timestep hidden state h_t while scanning. That cache is read only by the
+// backward sweep, so marking the net inference-only releases it and the forward
+// must produce exactly the same activations with and without it - including
+// after a flip back to trainable, which has to restore the cache.
+var
+  NN, NNFull, NNInc: TNNet;
+  Input, Snapshot, InfOut: TNNetVolume;
+  LM2: TNNetMamba2;
+  LMulti, LLegacy, LJamba, LFull, LInc: TNNetSelectiveSSM;
+  InFull, InInc: TNNetInput;
+  SeqLen, Depth, NS, i, t, d, nCnt: integer;
+  e, maxErr: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  // (A) Forward parity across a stack of every state-caching scan variant.
+  // Mamba2 (2 heads x head_dim 2 -> d_inner 4; state 3, groups 1) takes
+  // InDepth = 2*4 + 2*1*3 + 2 = 16 and emits depth 4, which then feeds the
+  // three SelectiveSSM modes (all depth-preserving).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 16);
+  Snapshot := TNNetVolume.Create();
+  InfOut := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(6, 1, 16, 1));
+    LM2 := TNNetMamba2.Create(2, 2, 3, 1, 1e-5);
+    NN.AddLayer(LM2);
+    LMulti := TNNetSelectiveSSM.Create(4);
+    NN.AddLayer(LMulti);
+    LJamba := TNNetSelectiveSSM.CreateJambaInner(4, 4, 1e-6);
+    NN.AddLayer(LJamba);
+    LLegacy := TNNetSelectiveSSM.Create(1);
+    NN.AddLayer(LLegacy);
+
+    SeedMamba2(LM2, 2, 4);
+    SeedSelectiveSSMDState(LMulti, 4, 4);
+    // Jamba shares slots [0..5] with the multi-state layout (dt_rank = Depth
+    // here, so neuron [0] has the same shape); [6..9] are its own.
+    SeedSelectiveSSMDState(LJamba, 4, 4);
+    for i := 0 to 3 do
+      for d := 0 to 3 do
+        LJamba.Neurons[6].Weights[i, 0, d] := Cos(i * 0.8 + d * 0.35) * 0.2;
+    for i := 0 to 3 do
+    begin
+      LJamba.Neurons[7].Weights.Raw[i] := 0.8 + i * 0.1;   // dt_gain
+      LJamba.Neurons[8].Weights.Raw[i] := 1.1 - i * 0.1;   // b_gain
+      LJamba.Neurons[9].Weights.Raw[i] := 0.9 + i * 0.05;  // c_gain
+    end;
+    SeedSelectiveSSM(LLegacy, 4);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.37) * 1.1 + 0.15;
+
+    NN.Compute(Input);
+    Snapshot.Copy(NN.GetLastLayer.Output);
+    AssertTrue('Trainable SSM forward must produce finite activations',
+      Snapshot.GetSum() = Snapshot.GetSum());
+    AssertTrue('Trainable SSM forward must not be all zeros',
+      Abs(Snapshot.GetSum()) > 1e-6);
+
+    NN.SetTrainable(False);
+    NN.Compute(Input);
+    InfOut.Copy(NN.GetLastLayer.Output);
+    AssertEquals('Inference-only SSM output size', Snapshot.Size, InfOut.Size);
+    for i := 0 to Snapshot.Size - 1 do
+      AssertEquals('Inference-only SSM forward parity at ' + IntToStr(i),
+        Snapshot.Raw[i], InfOut.Raw[i], 1e-6);
+
+    // Flipping back to trainable must restore the released state cache, so the
+    // forward keeps producing the same activations (and fills the cache again).
+    NN.SetTrainable(True);
+    NN.Compute(Input);
+    for i := 0 to Snapshot.Size - 1 do
+      AssertEquals('Re-trainable SSM forward parity at ' + IntToStr(i),
+        Snapshot.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    InfOut.Free;
+    Snapshot.Free;
+    Input.Free;
+    NN.Free;
+  end;
+
+  // (B) Incremental decode is the configuration real inference runs in: the net
+  // is inference-only AND the scan resumes from the carried state. Token-by-
+  // token decode must still reproduce the full-sequence scan.
+  SeqLen := 12;
+  Depth := 4;
+  NS := 4;
+  maxErr := 0;
+  NNFull := TNNet.Create();
+  NNInc := TNNet.Create();
+  try
+    InFull := TNNetInput.Create(SeqLen, 1, Depth, 1);
+    NNFull.AddLayer(InFull);
+    LFull := TNNetSelectiveSSM.Create(NS);
+    NNFull.AddLayer(LFull);
+    InInc := TNNetInput.Create(1, 1, Depth, 1);
+    NNInc.AddLayer(InInc);
+    LInc := TNNetSelectiveSSM.Create(NS);
+    NNInc.AddLayer(LInc);
+
+    SeedSelectiveSSMDState(LFull, Depth, NS);
+    for nCnt := 0 to LFull.Neurons.Count - 1 do
+      LInc.Neurons[nCnt].Weights.Copy(LFull.Neurons[nCnt].Weights);
+
+    NNFull.SetTrainable(False);
+    NNInc.SetTrainable(False);
+
+    for t := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        InFull.Output[t, 0, d] := 1.5 * (Random - 0.5);
+    NNFull.Compute(InFull.Output);
+
+    LInc.BeginIncrementalDecode();
+    for t := 0 to SeqLen - 1 do
+    begin
+      for d := 0 to Depth - 1 do
+        InInc.Output[0, 0, d] := InFull.Output[t, 0, d];
+      NNInc.Compute(InInc.Output);
+      for d := 0 to Depth - 1 do
+      begin
+        e := Abs(LInc.Output[0, 0, d] - LFull.Output[t, 0, d]);
+        if e > maxErr then maxErr := e;
+      end;
+    end;
+    LInc.EndIncrementalDecode();
+    AssertTrue('Inference-only incremental decode matches the full scan (< 1e-5)',
+      maxErr < 1e-5);
+  finally
+    NNInc.Free;
+    NNFull.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestMamba2InputGradientCheck;

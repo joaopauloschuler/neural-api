@@ -10863,6 +10863,10 @@ type
       // --- incremental-decode state (inference only, not serialized; the
       // mode flag / step counter live in TNNetRecurrentDecodeBase) ---
       FDecH: TNNetVolume;     // persisted running state h, Depth*N-long
+      // Releases FState: the per-timestep h cache is read only by the backward
+      // sweep, so an inference-only layer neither fills nor needs it. The
+      // forward scans key the store on FState's size.
+      procedure FreeBackpropScratch();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       // Rebuilds FExpA = exp(min(A_raw,10)) only when A_raw differs from the
       // snapshot the current FExpA was built from (see FExpASrc).
@@ -10884,6 +10888,7 @@ type
       constructor CreateJambaInner(pDState, pDtRank: integer;
         pEps: TNeuralFloat = 1e-6); reintroduce; overload;
       destructor Destroy(); override;
+      function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -10952,12 +10957,17 @@ type
       FGh: TNNetVolume;      // backward state-gradient gh, DInner*N-long scratch
       FGradA, FGradD, FGradDtB, FGradNorm: TNNetVolume; // weight grad accums
       FArBuf: array of TNeuralFloat; // per-head ar = -exp(min(A_log,30)), invariant across t
+      // Releases FState: the per-timestep h cache is read only by Backpropagate,
+      // so an inference-only layer neither fills nor needs it. Compute keys the
+      // store on FState's size.
+      procedure FreeBackpropScratch();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(pNumHeads: integer = 1; pHeadDim: integer = 1;
         pStateSize: integer = 16; pNGroups: integer = 1;
         pEps: TNeuralFloat = 1e-5); reintroduce; overload;
       destructor Destroy(); override;
+      function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -67712,6 +67722,23 @@ begin
   inherited Destroy();
 end;
 
+procedure TNNetSelectiveSSM.FreeBackpropScratch();
+begin
+  FState.ReSize(1, 1, 1);
+end;
+
+function TNNetSelectiveSSM.SetTrainable(pTrainable: boolean;
+  pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if pTrainable then
+  begin
+    if Assigned(FPrevLayer) then
+      FState.ReSize(FOutput.SizeX, 1, FOutput.Depth * Max(FDState, 1));
+  end
+  else FreeBackpropScratch();
+end;
+
 procedure TNNetSelectiveSSM.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
   MaxNeuronPos: integer;
@@ -67770,7 +67797,9 @@ begin
     end;
   end;
   FTsBuf.ReSize(1, 1, Max(FDtRank, 1));
-  FState.ReSize(FOutput.SizeX, 1, Depth * NS);
+  // Backprop-only per-timestep state cache: skip on inference-only layers.
+  if FIsTrainable then FState.ReSize(FOutput.SizeX, 1, Depth * NS)
+  else FreeBackpropScratch();
   FDelta.ReSize(FOutput.SizeX, 1, Depth);
   FBt.ReSize(FOutput.SizeX, 1, BCRows);
   FCt.ReSize(FOutput.SizeX, 1, BCRows);
@@ -67847,7 +67876,8 @@ var
   pre, sp, xj, acc, hprev, bbar: TNeuralFloat;
   XtPtr, OutPtr: TNeuralFloatArrPtr;
   WdRow, WBRow, WCRow: TNeuralFloatArrPtr;
-  tDepth, idx, rowOfs: integer;
+  tDepth, idx, rowOfs, DepthFloatSize: integer;
+  KeepState: boolean;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -67860,6 +67890,10 @@ begin
   Depth := FOutput.Depth;
   DepthM1 := Depth - 1;
   SeqLenM1 := SeqLen - 1;
+  DepthFloatSize := Depth * csNeuralFloatSize;
+  // FState is the BPTT-only per-timestep h cache, released on an inference-only
+  // layer: rule #20, the test is hoisted out of the token loop.
+  KeepState := FState.Size = SeqLen * Depth;
   BuildExpAIfStale();   // per-channel exp(A_raw), rebuilt only when A_raw moved
   if pResetState then FH.Fill(0);
   for t := 0 to SeqLenM1 do
@@ -67899,9 +67933,11 @@ begin
       hprev := FH.FData[d];
       acc := FAt.FData[idx] * hprev + bbar * XtPtr^[d];
       FH.FData[d] := acc;
-      FState.FData[idx] := acc;
       OutPtr^[d] := FCt.FData[idx] * acc + Ee.FData[d] * XtPtr^[d];
     end;
+    // BPTT cache: FH now holds the whole h_t row, and FState's timestep block
+    // has the same layout, so one Move replaces the Depth scalar stores.
+    if KeepState then Move(FH.FData[0], FState.FData[tDepth], DepthFloatSize);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -67914,9 +67950,10 @@ var
   Wd, WB, WC, Bd, Ee, Prev: TNNetVolume;
   SeqLen, Depth, NS, t, d, s, hbase, ebase, tBase: integer;
   DepthM1, SeqLenM1, NSM1, tDepth, tNS: integer;
-  DepthNS, NSFloatSize, DepthNSFloatSize: integer;
+  DepthNS, DepthNSFloatSize: integer;
   pre, sp, accY, xd, spxd: TNeuralFloat;
   XtPtr, OutPtr, WdRow: TNeuralFloatArrPtr;
+  KeepState: boolean;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -67932,8 +67969,10 @@ begin
   SeqLenM1 := SeqLen - 1;
   NSM1 := NS - 1;
   DepthNS := Depth * NS;                 // #5: one timestep's state block
-  NSFloatSize := NS * csNeuralFloatSize;
   DepthNSFloatSize := DepthNS * csNeuralFloatSize;
+  // FState is the BPTT-only per-timestep h cache, released on an inference-only
+  // layer: rule #20, the test is hoisted out of the token loop.
+  KeepState := FState.Size = SeqLen * DepthNS;
   // exp(A_raw[d,s]), rebuilt only when A_raw moved.
   BuildExpAIfStale();
   if pResetState then FH.Fill(0);
@@ -67989,7 +68028,6 @@ begin
       spxd := FDelta.FData[tDepth + d] * xd;   // #5: fixed across the states
       TNNetVolume.Mul(@FH.FData[ebase], @FAt.FData[hbase], NS);
       TNNetVolume.MulAdd(@FH.FData[ebase], @FBt.FData[tNS], spxd, NS);
-      Move(FH.FData[ebase], FState.FData[hbase], NSFloatSize);
       // Read-out accY = sum_s c_t[s]*h_new[s]: FCt row + the just-updated FH row
       // both contiguous over the state axis -> AVX dot product. FH is the live
       // (1,1,Depth*NS) state, so it stays in cache; FState is the BPTT cache.
@@ -67998,6 +68036,10 @@ begin
       Inc(hbase, NS);
       Inc(ebase, NS);
     end;
+    // BPTT cache: FH now holds the whole (Depth,NS) state and FState's timestep
+    // block has the same layout, so one Move replaces the Depth per-channel ones.
+    if KeepState then
+      Move(FH.FData[0], FState.FData[tBase], DepthNSFloatSize);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -68018,9 +68060,10 @@ var
   WdtProj, WB, WC, Bd, Ee, WxProj, GDt, GB, GC, Prev: TNNetVolume;
   SeqLen, Depth, NS, RK, t, d, s, r, hbase, ebase, tBase: integer;
   DepthM1, SeqLenM1, NSM1, RKM1, tDepth, tNS: integer;
-  DepthNS, NSFloatSize, DepthNSFloatSize: integer;
+  DepthNS, DepthNSFloatSize: integer;
   pre, sp, accY, xd, ss, inv, eps, spxd: TNeuralFloat;
   XtPtr, OutPtr, WdtRow: TNeuralFloatArrPtr;
+  KeepState: boolean;
 
   function RmsScale(V: TNNetVolume; Cnt: integer): TNeuralFloat;
   var acc: TNeuralFloat;
@@ -68051,8 +68094,10 @@ begin
   NSM1 := NS - 1;
   RKM1 := RK - 1;
   DepthNS := Depth * NS;                 // #5: one timestep's state block
-  NSFloatSize := NS * csNeuralFloatSize;
   DepthNSFloatSize := DepthNS * csNeuralFloatSize;
+  // FState is the BPTT-only per-timestep h cache, released on an inference-only
+  // layer: rule #20, the test is hoisted out of the token loop.
+  KeepState := FState.Size = SeqLen * DepthNS;
   eps := FFloatSt[0];
   if eps <= 0 then eps := 1e-6;
   BuildExpAIfStale();
@@ -68122,7 +68167,6 @@ begin
       spxd := FDelta.FData[tDepth + d] * xd;   // #5: fixed across the states
       TNNetVolume.Mul(@FH.FData[ebase], @FAt.FData[hbase], NS);
       TNNetVolume.MulAdd(@FH.FData[ebase], @FBt.FData[tNS], spxd, NS);
-      Move(FH.FData[ebase], FState.FData[hbase], NSFloatSize);
       // Read-out accY = sum_s c_t[s]*h_new[s]: FCt row + the just-updated FH row
       // both contiguous over the state axis -> AVX dot product. FH is the live
       // (1,1,Depth*NS) state, so it stays in cache; FState is the BPTT cache.
@@ -68131,6 +68175,10 @@ begin
       Inc(hbase, NS);
       Inc(ebase, NS);
     end;
+    // BPTT cache: FH now holds the whole (Depth,NS) state and FState's timestep
+    // block has the same layout, so one Move replaces the Depth per-channel ones.
+    if KeepState then
+      Move(FH.FData[0], FState.FData[tBase], DepthNSFloatSize);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -68576,6 +68624,23 @@ begin
   inherited Destroy();
 end;
 
+procedure TNNetMamba2.FreeBackpropScratch();
+begin
+  FState.ReSize(1, 1, 1);
+end;
+
+function TNNetMamba2.SetTrainable(pTrainable: boolean;
+  pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if pTrainable then
+  begin
+    if Assigned(FPrevLayer) then
+      FState.ReSize(FOutput.SizeX, 1, FDInner * FStateSize);
+  end
+  else FreeBackpropScratch();
+end;
+
 procedure TNNetMamba2.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
   MaxNeuronPos: integer;
@@ -68613,7 +68678,9 @@ begin
       FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
     end;
   end;
-  FState.ReSize(FOutput.SizeX, 1, FDInner * FStateSize);
+  // Backprop-only per-timestep state cache: skip on inference-only layers.
+  if FIsTrainable then FState.ReSize(FOutput.SizeX, 1, FDInner * FStateSize)
+  else FreeBackpropScratch();
   FDt.ReSize(FOutput.SizeX, 1, FNumHeads);
   FAt.ReSize(FOutput.SizeX, 1, FNumHeads);
   FY.ReSize(FOutput.SizeX, 1, FDInner);
@@ -68633,11 +68700,12 @@ var
   StartTime: double;
   Alog, Dd, DtB, NormW, Prev: TNNetVolume;
   SeqLen, t, h, c, s, g, hpg, bOff, cOff, dtOff, gateOff: integer;
-  dInner, P, N, NG, gw, hbase, ebase, xbase: integer;
+  dInner, P, N, NG, gw, ebase, xbase: integer;
   SeqLenM1, NumHeadsM1, PM1, NM1, dInnerM1, tHeads, tDInner: integer;
-  idxH, hP, bBase, cBase, idxS, idxC: integer;
+  idxH, hP, bBase, cBase, idxS, idxC, DInnerN, DInnerNFloatSize: integer;
   pre, dth, ah, xv, dtxv, hnew, accY, ar, zsq, gate, msq, rstd: TNeuralFloat;
   XtPtr, OutPtr: TNeuralFloatArrPtr;
+  KeepState: boolean;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -68658,6 +68726,11 @@ begin
   PM1 := P - 1;
   NM1 := N - 1;
   dInnerM1 := dInner - 1;
+  DInnerN := dInner * N;                 // #5: one timestep's state block
+  DInnerNFloatSize := DInnerN * csNeuralFloatSize;
+  // FState is the BPTT-only per-timestep h cache, released on an inference-only
+  // layer: rule #20, the test is hoisted out of the token loop.
+  KeepState := FState.Size = SeqLen * DInnerN;
   FH.Fill(0);
   // Rule #5/#8: ar_h = -exp(min(A_log_h, 30)) depends only on per-head A_log,
   // invariant across every timestep t. Precompute once per call into the
@@ -68702,14 +68775,12 @@ begin
         xv := XtPtr^[xbase];
         dtxv := dth * xv;   // invariant across the s loop: one multiply per s, not two
         ebase := xbase * N;
-        hbase := (tDInner + xbase) * N;
         for s := 0 to NM1 do
         begin
           idxS := ebase + s;
           hnew := ah * FH.FData[idxS] +
             dtxv * XtPtr^[bBase + s];
           FH.FData[idxS] := hnew;
-          FState.FData[hbase + s] := hnew;
         end;
         // Read-out accY = sum_s C_t[s]*h_new[s]: the C slice of x_t and the
         // just-updated FH row are both contiguous over the state axis -> AVX dot
@@ -68719,6 +68790,10 @@ begin
         FY.FData[tDInner + xbase] := accY + Dd.FData[h] * xv;
       end;
     end;
+    // BPTT cache: FH now holds the whole (d_inner,N) state and FState's timestep
+    // block has the same layout, so one Move replaces the d_inner*N scalar stores.
+    if KeepState then
+      Move(FH.FData[0], FState.FData[tDInner * N], DInnerNFloatSize);
     // Gated RMSNorm over the d_inner axis: z = y*silu(gate); out = rms(z)*w.
     msq := 0;
     for c := 0 to dInnerM1 do
