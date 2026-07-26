@@ -74795,9 +74795,10 @@ const
   cNormEps = 0.000001;
   cTwoPi = 6.283185307179586;
 var
-  nfeat, t, x, y, i, half, tBase: integer;
+  nfeat, t, x, y, i, tBase: integer;
   GridHM1, GridWM1, nfeatM1: integer;
   YEmbed, XEmbed, DimT, Ang: double;
+  DimTbl: array of double;   // dim_t per channel, shared by the sin/cos pair
   W: TNNetVolume;
 begin
   nfeat := DModel div 2;
@@ -74810,6 +74811,13 @@ begin
   if W.Size <> GridH * GridW * DModel then
     ImportError('DETR import: spatial pos-embed table size ' +
       IntToStr(W.Size) + ' <> ' + IntToStr(GridH * GridW * DModel) + '.');
+  // dim_t depends only on the channel, yet it sat inside the (y, x, i) nest -
+  // ~109K Power calls for 64 distinct values on a canonical grid. Build it once
+  // (#5/#27); this is a load-time table build, so the allocation is fine. The
+  // expression is kept verbatim so the table stays bit-identical.
+  SetLength(DimTbl, nfeat);
+  for i := 0 to nfeatM1 do
+    DimTbl[i] := Power(10000.0, (2.0 * (i div 2)) / nfeat);
   for y := 0 to GridHM1 do
     for x := 0 to GridWM1 do
     begin
@@ -74819,8 +74827,7 @@ begin
       XEmbed := ((x + 1) / (GridW + cNormEps)) * cTwoPi;
       for i := 0 to nfeatM1 do
       begin
-        half := (i div 2);  // dim_t shared by the (sin,cos) pair
-        DimT := Power(10000.0, (2.0 * half) / nfeat);
+        DimT := DimTbl[i];
         // pos_y -> channels 0..nfeat-1 ; even index sin, odd index cos.
         Ang := YEmbed / DimT;
         if (i and 1) = 0 then W.FData[tBase + i] := Sin(Ang)
@@ -81936,7 +81943,8 @@ procedure FillVideoMAEPosTable(PosEmb: TNNetLayer;
 var
   tt, hh, ww, j, NativeRow, HFPos, rowBase: integer;
   TGridM1, HGridM1, WGridM1, HiddenM1: integer;
-  Angle, Power: double;
+  Angle: double;
+  PowTbl: array of double;   // frequency denominator per channel
   Tbl: TNNetVolume;
 begin
   Tbl := PosEmb.FArrNeurons[0].Weights;
@@ -81944,6 +81952,14 @@ begin
   HGridM1 := HGrid - 1;
   WGridM1 := WGrid - 1;
   HiddenM1 := Hidden - 1;
+  // The frequency denominator depends only on j, yet it sat inside the
+  // (tt, hh, ww) nest: for an 8x14x14 grid at Hidden=768 that is ~1.2M Exp+Ln
+  // pairs computing only 768 distinct values. Build it once up front (#5/#27) -
+  // allocation is fine here, this is a load-time table build, not a compute
+  // path. The expression is kept verbatim so the table stays bit-identical.
+  SetLength(PowTbl, Hidden);
+  for j := 0 to HiddenM1 do
+    PowTbl[j] := Exp((2 * (j div 2) / Hidden) * Ln(10000.0));
   for tt := 0 to TGridM1 do
     for hh := 0 to HGridM1 do
       for ww := 0 to WGridM1 do
@@ -81953,8 +81969,7 @@ begin
         rowBase := NativeRow * Hidden;
         for j := 0 to HiddenM1 do
         begin
-          Power := Exp((2 * (j div 2) / Hidden) * Ln(10000.0));
-          Angle := HFPos / Power;
+          Angle := HFPos / PowTbl[j];
           if (j and 1) = 0 then
             Tbl.FData[rowBase + j] := Sin(Angle)
           else
