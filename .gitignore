@@ -13,6 +13,7 @@ bin/
 backup/
 lib/
 tests/RunTests
+tests/RunTestsAVX2
 examples/YoloDetect/YoloDetect
 examples/YoloDetect/*.ppm
 examples/ActivationBakeoff/ActivationBakeoff
