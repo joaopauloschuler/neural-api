@@ -1994,7 +1994,7 @@ begin
   begin
     if Index + 1 < FThreadNum then
     begin
-      while (FFinishedThread.FData[Index + 1] = 0) and Not(FShouldQuit) do;
+      while (FFinishedThread.FData[Index + 1] = 0) and Not(FShouldQuit) do NeuralPause;
       LocalNN.SumDeltasNoChecks(FThreadNN[Index + 1]);
       {$IFDEF FPC}
       FFinishedThread.FData[Index] += FFinishedThread.FData[Index + 1];
@@ -2009,7 +2009,7 @@ begin
   begin
     if Index + 2 < FThreadNum then
     begin
-      while (FFinishedThread.FData[Index + 2] = 0) and Not(FShouldQuit) do;
+      while (FFinishedThread.FData[Index + 2] = 0) and Not(FShouldQuit) do NeuralPause;
       LocalNN.SumDeltasNoChecks(FThreadNN[Index + 2]);
       {$IFDEF FPC}
       FFinishedThread.FData[Index] += FFinishedThread.FData[Index + 2];
@@ -3835,7 +3835,7 @@ begin
   begin
     if Index + 1 < FThreadNum then
     begin
-      while (FFinishedThread.FData[Index + 1] = 0) and Not(FShouldQuit) do;
+      while (FFinishedThread.FData[Index + 1] = 0) and Not(FShouldQuit) do NeuralPause;
       LocalNN.SumDeltasNoChecks(FThreadNN[Index + 1]);
       {$IFDEF FPC}
       FFinishedThread.FData[Index] += FFinishedThread.FData[Index + 1];
@@ -3850,7 +3850,7 @@ begin
   begin
     if Index + 2 < FThreadNum then
     begin
-      while (FFinishedThread.FData[Index + 2] = 0) and Not(FShouldQuit) do;
+      while (FFinishedThread.FData[Index + 2] = 0) and Not(FShouldQuit) do NeuralPause;
       LocalNN.SumDeltasNoChecks(FThreadNN[Index + 2]);
       {$IFDEF FPC}
       FFinishedThread.FData[Index] += FFinishedThread.FData[Index + 2];
