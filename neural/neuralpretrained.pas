@@ -43097,6 +43097,7 @@ var
   NHDh, hDh, kvhDh, gBase, dBase, hbase, t2Start, tBase: integer;
   TM1, DM1, halfM1, DhM1, NHM1, NKVM1, FFNM1, NHDhM1, NKVDhM1, LayersM1: integer;
   Theta, Scaling, eps, m, v, e, denom, sc, mx, qr, kr, ang: double;
+  InvDenom: double;   // #21: loop-invariant 1/denom
   X, Hn, Q, Kk, Vv, Attn, Mlp1: array of array of double; // [T][feature]
   CosTab, SinTab, invfreq: array of double;
   AccVec, Orig: array of double;
@@ -43217,9 +43218,9 @@ begin
       v := 0;
       for dd := 0 to DM1 do v := v + Sqr(XRow[dd] - m);
       v := v / D;
-      denom := Sqrt(v + eps);
+      InvDenom := 1.0 / Sqrt(v + eps);   // #21: one divide, then D multiplies
       for dd := 0 to DM1 do
-        HnRow[dd] := (XRow[dd] - m) / denom * LnG[dd] + LnB[dd];
+        HnRow[dd] := (XRow[dd] - m) * InvDenom * LnG[dd] + LnB[dd];
     end;
     // ---- Q,K,V projections (rows = out, cols = in) ----
     for t1 := 0 to TM1 do
@@ -43311,8 +43312,9 @@ begin
           for dd := 0 to DhM1 do
             AccVec[dd] := AccVec[dd] + e * VRow[kvhDh + dd];
         end;
+        InvDenom := 1.0 / denom;           // #21
         for dd := 0 to DhM1 do
-          Attn[t1][hDh + dd] := AccVec[dd] / denom;
+          Attn[t1][hDh + dd] := AccVec[dd] * InvDenom;
       end;
     end;
     // ---- output projection + LayerScale residual ----
@@ -43342,10 +43344,10 @@ begin
       v := 0;
       for dd := 0 to DM1 do v := v + Sqr(XRow[dd] - m);
       v := v / D;
-      denom := Sqrt(v + eps);
+      InvDenom := 1.0 / Sqrt(v + eps);   // #21
       HnRow := Hn[t1];                    // #9: bind row once
       for dd := 0 to DM1 do
-        HnRow[dd] := (XRow[dd] - m) / denom * LnPG[dd] + LnPB[dd]; // #9
+        HnRow[dd] := (XRow[dd] - m) * InvDenom * LnPG[dd] + LnPB[dd]; // #9
       // fc1 -> GELU
       Mlp1Row := Mlp1[t1];
       gBase := 0;                        // gidx * D, carried (#6)
