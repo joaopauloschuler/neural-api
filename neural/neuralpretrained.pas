@@ -72518,8 +72518,16 @@ procedure RunSAMMaskDecoderEx(Reader: TNNetSafeTensorsReader;
   Cache: TSAMWeightCache);
 const
   INV_SQRT_2 = 0.70710678118654752;
+  // Pixels processed per upscale_layer_norm tile. cSAMPixTile*Cmid floats is the
+  // working set the three channel passes share; 128 keeps it inside L1 for the
+  // canonical Cmid = 64.
+  cSAMPixTile = 128;
 var
   OwnCache: TSAMWeightCache;   // created only when the caller supplied none
+  MeanB: array[0..cSAMPixTile - 1] of TNeuralFloat;   // per-pixel mean
+  InvB: array[0..cSAMPixTile - 1] of TNeuralFloat;    // variance, then 1/sigma
+  pix0, NPix, NPixM1, jp, kp: integer;
+  gw, gb: TNeuralFloat;
   H, Internal, Heads, Grid, NImg, NTok, MaskTokenCount: integer;
   i, d, li, ki, kj, ci, oc, oi, oj, r, c: integer;
   PEPos, SharedPE, T1, T2: TNNetVolume;
@@ -72856,28 +72864,54 @@ begin
     C1w := Cache.Get(Reader, Pfx + 'mask_decoder.upscale_layer_norm.weight');
     C1b := Cache.Get(Reader, Pfx + 'mask_decoder.upscale_layer_norm.bias');
     begin
-      for i := 0 to H2W2M1 do
+      // Tiled over the PIXEL axis. Normalizing one pixel walks the Cmid channels
+      // with a stride of H2W2 floats (64KB for SAM-base), so each of the three
+      // passes took a fresh cache line per channel and used a single float from
+      // it. Doing cSAMPixTile consecutive pixels together turns every channel
+      // pass into a contiguous run while leaving each pixel's arithmetic - and
+      // its ci accumulation order - exactly as before, so this is bit-identical.
+      pix0 := 0;
+      while pix0 < H2W2 do
       begin
-        mean := 0;
-        posU := i;
-        for ci := 0 to CmidM1 do begin mean := mean + U1[posU]; Inc(posU, H2W2); end;
-        mean := mean / Cmid;
-        varc := 0;
-        posU := i;
+        NPix := H2W2 - pix0;
+        if NPix > cSAMPixTile then NPix := cSAMPixTile;
+        NPixM1 := NPix - 1;
+        for jp := 0 to NPixM1 do MeanB[jp] := 0;
+        posU := pix0;
         for ci := 0 to CmidM1 do
         begin
-          vv := U1[posU] - mean; varc := varc + vv * vv; Inc(posU, H2W2);
-        end;
-        varc := varc / Cmid;
-        inv := 1.0 / Sqrt(varc + 1e-6);
-        posU := i;
-        for ci := 0 to CmidM1 do
-        begin
-          x := (U1[posU] - mean) * inv * C1w.FData[ci] + C1b.FData[ci];
-          cdf := 0.5 * (1.0 + pcr_erff(x * INV_SQRT_2));   // GELU(erf)
-          U1[posU] := x * cdf;
+          for jp := 0 to NPixM1 do MeanB[jp] := MeanB[jp] + U1[posU + jp];
           Inc(posU, H2W2);
         end;
+        for jp := 0 to NPixM1 do MeanB[jp] := MeanB[jp] / Cmid;
+        for jp := 0 to NPixM1 do InvB[jp] := 0;      // variance accumulator
+        posU := pix0;
+        for ci := 0 to CmidM1 do
+        begin
+          for jp := 0 to NPixM1 do
+          begin
+            vv := U1[posU + jp] - MeanB[jp];
+            InvB[jp] := InvB[jp] + vv * vv;
+          end;
+          Inc(posU, H2W2);
+        end;
+        for jp := 0 to NPixM1 do
+          InvB[jp] := 1.0 / Sqrt(InvB[jp] / Cmid + 1e-6);
+        posU := pix0;
+        for ci := 0 to CmidM1 do
+        begin
+          gw := C1w.FData[ci];      // #11: gain/bias are invariant across the tile
+          gb := C1b.FData[ci];
+          for jp := 0 to NPixM1 do
+          begin
+            kp := posU + jp;
+            x := (U1[kp] - MeanB[jp]) * InvB[jp] * gw + gb;
+            cdf := 0.5 * (1.0 + pcr_erff(x * INV_SQRT_2));   // GELU(erf)
+            U1[kp] := x * cdf;
+          end;
+          Inc(posU, H2W2);
+        end;
+        Inc(pix0, NPix);
       end;
     end;
 
