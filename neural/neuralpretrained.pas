@@ -42117,10 +42117,11 @@ procedure TEnCodecModel.DecodeCodesToAudio(const Codes: TNNetIntArr2D;
   out Waveform: TNeuralFloatDynArr; UseQuantizers: integer = 0);
 var
   Sig, Nxt: TNNetFloatDynArr2D;
-  s, q, t, d, Dm, Frames, NQ, code: integer;
+  s, q, t, d, Dm, Frames, NQ: integer;
   DmM1, FramesM1, NQM1, DecStagesM1, SigLenM1: integer;
-  codeBase: integer;
+  codeBase, tBase: integer;
   CB: TNeuralFloatDynArr;
+  Acc: TNeuralFloatDynArr;   // frame-major [t*Dm + d] RVQ accumulator
   tStageTick: QWord;   // per-stage wall clock (always-on instrumentation)
 begin
   EnsureThreadPool;
@@ -42143,23 +42144,31 @@ begin
   Frames := 0;
   if Length(Codes) > 0 then Frames := Length(Codes[0]);
   FramesM1 := Frames - 1;
-  // RVQ decode: latent = sum over stages of embed[code].
-  SetLength(Sig, Dm);
-  for d := 0 to DmM1 do
-  begin
-    SetLength(Sig[d], Frames);
-    FillChar(Sig[d][0], Frames * csNeuralFloatSize, 0);
-  end;
+  // RVQ decode: latent = sum over stages of embed[code]. Accumulate FRAME-major
+  // so each add is one contiguous AVX Add against the (contiguous) codebook row;
+  // the channel-major form touched Dm separate dynamic arrays per frame, one
+  // element (and one cache line) each. Transposed once at the end - the decoder
+  // stages want channel-major - instead of NQ times inside the stage loop.
+  // The sum over q per (t, d) keeps its original order, so this is bit-exact.
+  SetLength(Acc, Frames * Dm);
   for q := 0 to NQM1 do
   begin
     CB := FCodebooks[q].Data;
+    tBase := 0;   // #6: t*Dm carried
     for t := 0 to FramesM1 do
     begin
-      code := Codes[q][t];
-      codeBase := code * Dm; // invariant across the d loop
-      for d := 0 to DmM1 do
-        Sig[d][t] := Sig[d][t] + CB[codeBase + d];
+      codeBase := Codes[q][t] * Dm;
+      TNNetVolume.Add(Addr(Acc[tBase]), Addr(CB[codeBase]), Dm); // #13
+      Inc(tBase, Dm);
     end;
+  end;
+  SetLength(Sig, Dm);
+  for d := 0 to DmM1 do SetLength(Sig[d], Frames);
+  tBase := 0;
+  for t := 0 to FramesM1 do
+  begin
+    for d := 0 to DmM1 do Sig[d][t] := Acc[tBase + d];
+    Inc(tBase, Dm);
   end;
   // Run the decoder stages.
   DecStagesM1 := Length(FDecStages) - 1;
@@ -43591,11 +43600,12 @@ procedure TNNetMimi.Decode(const Codes: TNNetIntArr2D;
   out Waveform: TNeuralFloatDynArr);
 var
   Sig, Nxt, Zsem, Zaco, Zh: TMimiDblArr2D;
-  s, q, t, d, Dm, Frames, NSem, NAco, code, code2: integer;
+  s, q, t, d, Dm, Frames, NSem, NAco: integer;
   DmM1, FramesM1, NSemM1, NAcoM1, SigM1, DecStagesM1, Sig0M1: integer;
-  codeBase: integer;
+  codeBase, tBase: integer;
   CB: TNeuralFloatDynArr;
   SigRow, ZhRow: TMimiDblArr;
+  Acc: TMimiDblArr;   // frame-major [t*Dm + d] RVQ accumulator
 begin
   Dm := FConfig.VqHiddenDim;
   DmM1 := Dm - 1;
@@ -43607,43 +43617,58 @@ begin
   if Length(Codes) > 0 then Frames := Length(Codes[0]);
   FramesM1 := Frames - 1;
   // semantic RVQ decode -> vq dim -> output proj -> hidden
-  SetLength(Zsem, Dm);
-  for d := 0 to DmM1 do
-  begin
-    SetLength(Zsem[d], Frames);
-    FillChar(Zsem[d][0], Frames * csDoubleSize, 0); // #13
-  end;
+  // Accumulate FRAME-major: both operands are then contiguous runs. The
+  // channel-major form walked Dm SEPARATE dynamic arrays per frame, touching
+  // one element (and one cache line) in each. The accumulator is Double, so no
+  // Single bulk primitive applies (#25) and the inner add stays scalar - the
+  // win is the contiguity and the removed per-element dynarray resolution.
+  // Transposed to channel-major once at the end, not NSem times.
+  SetLength(Acc, Frames * Dm);
   for q := 0 to NSemM1 do
   begin
     CB := FSemCodebooks[q].Data;
+    tBase := 0;   // #6: t*Dm carried
     for t := 0 to FramesM1 do
     begin
-      code := Codes[q][t];
-      codeBase := code * Dm; // invariant across the d loop
+      codeBase := Codes[q][t] * Dm;
       for d := 0 to DmM1 do
-        Zsem[d][t] := Zsem[d][t] + CB[codeBase + d];
+        Acc[tBase + d] := Acc[tBase + d] + CB[codeBase + d];
+      Inc(tBase, Dm);
     end;
+  end;
+  SetLength(Zsem, Dm);
+  for d := 0 to DmM1 do SetLength(Zsem[d], Frames);
+  tBase := 0;
+  for t := 0 to FramesM1 do
+  begin
+    for d := 0 to DmM1 do Zsem[d][t] := Acc[tBase + d];
+    Inc(tBase, Dm);
   end;
   RunMimiConv(FSemOutProj, Zsem, Sig); // Sig now [hidden][frames]
   // acoustic RVQ decode
   if NAco > 0 then
   begin
-    SetLength(Zaco, Dm);
-    for d := 0 to DmM1 do
-    begin
-      SetLength(Zaco[d], Frames);
-      FillChar(Zaco[d][0], Frames * csDoubleSize, 0); // #13
-    end;
+    // Acc is reused for the acoustic stack; re-zero it.
+    if Frames > 0 then FillChar(Acc[0], Frames * Dm * csDoubleSize, 0);
     for q := 0 to NAcoM1 do
     begin
       CB := FAcoCodebooks[q].Data;
+      tBase := 0;   // #6: t*Dm carried
       for t := 0 to FramesM1 do
       begin
-        code2 := Codes[NSem + q][t];
-        codeBase := code2 * Dm; // invariant across the d loop
+        codeBase := Codes[NSem + q][t] * Dm;
         for d := 0 to DmM1 do
-          Zaco[d][t] := Zaco[d][t] + CB[codeBase + d];
+          Acc[tBase + d] := Acc[tBase + d] + CB[codeBase + d];
+        Inc(tBase, Dm);
       end;
+    end;
+    SetLength(Zaco, Dm);
+    for d := 0 to DmM1 do SetLength(Zaco[d], Frames);
+    tBase := 0;
+    for t := 0 to FramesM1 do
+    begin
+      for d := 0 to DmM1 do Zaco[d][t] := Acc[tBase + d];
+      Inc(tBase, Dm);
     end;
     RunMimiConv(FAcoOutProj, Zaco, Zh);
     SigM1 := Length(Sig) - 1;
