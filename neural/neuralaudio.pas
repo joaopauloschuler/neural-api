@@ -311,6 +311,11 @@ begin
 end;
 
 function ResampleVolume(Wave: TNNetVolume; SourceRate, TargetRate: integer): TNNetVolume;
+const
+  // Cap on the polyphase table (weights). Beyond this the per-tap kernel
+  // evaluation below is used instead; only reached for a rate pair whose
+  // reduced denominator is enormous (near-coprime rates).
+  cMaxPolyphaseEntries = 1 shl 20;
 var
   NIn, NOut, OutCnt, J, JLo, JHi: integer;
   NOutM1, NInM1: integer;
@@ -318,6 +323,15 @@ var
   AOverRatio, InvRatio: double;
   TwoCutoff, TwoPiCutoff, PiOverA: double;
   FC: integer;
+  // Polyphase decomposition: SrcPos = OutCnt * S / P in lowest terms, so the
+  // fractional part - and therefore the whole tap-weight vector - takes only P
+  // distinct values, indexed by the numerator Num = (OutCnt * S) mod P.
+  UsePoly: boolean;
+  NumPhases, PhaseStepInt, PhaseStepFrac, Num, IntBase: integer;
+  MaxTaps, TapCnt, TapCntM1, RelLo, WBase, T, TLo, THi, J0, G, A, B: integer;
+  Frac: double;
+  PhaseW, PhaseWSum: array of double;
+  PhaseLo, PhaseCnt: array of integer;
 
   // Lanczos-windowed sinc at offset T (in input-sample units), low-passed at
   // Cutoff (cycles per input sample, <= 0.5). Returns the kernel weight.
@@ -378,6 +392,115 @@ begin
   TwoCutoff := 2.0 * Cutoff;
   TwoPiCutoff := Pi * TwoCutoff;
   PiOverA := Pi / csResampleLanczosA;
+
+  // Reduce TargetRate/SourceRate to lowest terms: NumPhases distinct phases,
+  // each advancing the input position by S = SourceRate/G input samples.
+  A := SourceRate;
+  B := TargetRate;
+  while B <> 0 do
+  begin
+    G := A mod B;
+    A := B;
+    B := G;
+  end;
+  G := A;
+  NumPhases := TargetRate div G;
+  PhaseStepInt := (SourceRate div G) div NumPhases;
+  PhaseStepFrac := (SourceRate div G) mod NumPhases;
+  if Ratio >= 1.0 then
+    MaxTaps := 2 * csResampleLanczosA
+  else
+    MaxTaps := 2 * Ceil(AOverRatio) + 4;   // safe bound on Ceil(f+A/r)-Floor(f-A/r)+1
+  // Worth building only when the table is bounded AND there are at least as
+  // many output samples as phases - otherwise building it evaluates more taps
+  // than the direct path below would.
+  UsePoly := (NumPhases <= cMaxPolyphaseEntries div MaxTaps) and
+    (NumPhases <= NOut);
+
+  if UsePoly then
+  begin
+    // Build the NumPhases x MaxTaps kernel table once (this is a cold load-time
+    // path, so the allocation is legal) and the inner loop becomes a table read
+    // plus a multiply-accumulate instead of two Sin calls and two divides.
+    SetLength(PhaseW, NumPhases * MaxTaps);
+    SetLength(PhaseWSum, NumPhases);
+    SetLength(PhaseLo, NumPhases);
+    SetLength(PhaseCnt, NumPhases);
+    for Num := 0 to NumPhases - 1 do
+    begin
+      Frac := Num / NumPhases;
+      if Ratio >= 1.0 then
+      begin
+        // Floor(IntBase + Frac) = IntBase because 0 <= Frac < 1.
+        RelLo := -csResampleLanczosA + 1;
+        TapCnt := 2 * csResampleLanczosA;
+      end
+      else
+      begin
+        RelLo := Floor(Frac - AOverRatio);
+        TapCnt := Ceil(Frac + AOverRatio) - RelLo + 1;
+      end;
+      PhaseLo[Num] := RelLo;
+      PhaseCnt[Num] := TapCnt;
+      WBase := Num * MaxTaps;
+      WSum := 0.0;
+      for T := 0 to TapCnt - 1 do
+      begin
+        W := LanczosKernel(Frac - (RelLo + T));
+        PhaseW[WBase + T] := W;
+        WSum := WSum + W;
+      end;
+      PhaseWSum[Num] := WSum;
+    end;
+
+    Num := 0;
+    IntBase := 0;
+    for OutCnt := 0 to NOutM1 do
+    begin
+      TapCntM1 := PhaseCnt[Num] - 1;
+      WBase := Num * MaxTaps;
+      J0 := IntBase + PhaseLo[Num];
+      // Clamp the tap range to the valid input span once, so the inner loop
+      // carries no per-tap bounds test (#20).
+      TLo := 0;
+      if J0 < 0 then TLo := -J0;
+      THi := TapCntM1;
+      if J0 + THi > NInM1 then THi := NInM1 - J0;
+      Acc := 0.0;
+      if (TLo = 0) and (THi = TapCntM1) then
+      begin
+        // Interior sample: every tap is in range, so the normalizer is the
+        // phase's precomputed total.
+        WSum := PhaseWSum[Num];
+        for T := 0 to TapCntM1 do
+          Acc := Acc + PhaseW[WBase + T] * Wave.FData[J0 + T];
+      end
+      else
+      begin
+        WSum := 0.0;
+        for T := TLo to THi do
+        begin
+          W := PhaseW[WBase + T];
+          Acc := Acc + W * Wave.FData[J0 + T];
+          WSum := WSum + W;
+        end;
+      end;
+      if WSum <> 0.0 then
+        Result.FData[OutCnt] := Acc / WSum
+      else
+        Result.FData[OutCnt] := 0.0;
+      // Exact rational advance of the input position: no accumulated rounding.
+      Inc(IntBase, PhaseStepInt);
+      Inc(Num, PhaseStepFrac);
+      if Num >= NumPhases then
+      begin
+        Dec(Num, NumPhases);
+        Inc(IntBase);
+      end;
+    end;
+    exit;
+  end;
+
   for OutCnt := 0 to NOutM1 do
   begin
     // Position of this output sample expressed in INPUT-sample coordinates.

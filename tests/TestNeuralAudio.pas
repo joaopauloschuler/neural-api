@@ -48,6 +48,9 @@ type
     // A pure low-frequency sine survives 44.1k -> 16k and 8k -> 16k with its
     // fundamental (zero-crossing rate) preserved within tolerance.
     procedure TestResampleSinePreservesFrequency;
+    // The polyphase kernel table must agree with a straightforward per-tap
+    // Lanczos evaluation on random signals, over up/down/near-coprime rates.
+    procedure TestResampleMatchesDirectKernel;
     // LoadWavResampledToVolume on an 8 kHz WAV returns a 16 kHz volume of the
     // right length, round-tripped through a temp WAV on disk.
     procedure TestLoadWavResampledRoundTrip;
@@ -493,6 +496,109 @@ begin
   finally
     Src.Free;
     Dst.Free;
+  end;
+end;
+
+// Independent reference: the textbook per-output-sample windowed-sinc
+// evaluation ResampleVolume's polyphase table replaces. Written out longhand
+// (no shared helper) so a bug in the table cannot hide behind a shared bug.
+procedure DirectLanczosResample(Wave, Dst: TNNetVolume;
+  SourceRate, TargetRate: integer);
+const
+  cA = 4;   // must match neuralaudio's csResampleLanczosA
+var
+  NIn, NOut, OutCnt, J, JLo, JHi, NInM1: integer;
+  Ratio, Cutoff, Center, X, AT, Acc, WSum, W: double;
+begin
+  NIn := Wave.Size;
+  Ratio := TargetRate / SourceRate;
+  NOut := Round(NIn * Ratio);
+  Dst.ReSize(NOut, 1, 1);
+  if (NIn = 0) or (NOut = 0) then Exit;
+  NInM1 := NIn - 1;
+  if Ratio >= 1.0 then Cutoff := 0.5 else Cutoff := 0.5 * Ratio;
+  for OutCnt := 0 to NOut - 1 do
+  begin
+    Center := OutCnt / Ratio;
+    if Ratio >= 1.0 then
+    begin
+      JLo := Floor(Center) - cA + 1;
+      JHi := Floor(Center) + cA;
+    end
+    else
+    begin
+      JLo := Floor(Center - cA / Ratio);
+      JHi := Ceil(Center + cA / Ratio);
+    end;
+    Acc := 0.0;
+    WSum := 0.0;
+    for J := JLo to JHi do
+    begin
+      if (J < 0) or (J > NInM1) then Continue;
+      X := Center - J;
+      AT := Abs(X);
+      if AT < 1e-12 then
+        W := 2.0 * Cutoff
+      else if AT >= cA then
+        W := 0.0
+      else
+        W := 2.0 * Cutoff
+          * (Sin(2.0 * Pi * Cutoff * X) / (2.0 * Pi * Cutoff * X))
+          * (Sin(Pi * X / cA) / (Pi * X / cA));
+      if W = 0.0 then Continue;
+      Acc := Acc + W * Wave.FData[J];
+      WSum := WSum + W;
+    end;
+    if WSum <> 0.0 then Dst.FData[OutCnt] := Acc / WSum
+    else Dst.FData[OutCnt] := 0.0;
+  end;
+end;
+
+procedure TTestNeuralAudio.TestResampleMatchesDirectKernel;
+const
+  cCases = 5;
+  cSrcRates: array[0..cCases - 1] of integer = (44100, 8000, 22050, 48000, 44101);
+  cDstRates: array[0..cCases - 1] of integer = (16000, 16000, 16000, 16000, 16000);
+var
+  Src, Got, Want: TNNetVolume;
+  CaseCnt, i, N: integer;
+  Diff, MaxDiff: double;
+begin
+  RandSeed := 20260726;
+  Src := TNNetVolume.Create(1, 1, 1);
+  Want := TNNetVolume.Create(1, 1, 1);
+  Got := nil;
+  try
+    for CaseCnt := 0 to cCases - 1 do
+    begin
+      N := 3000;
+      Src.ReSize(N, 1, 1);
+      for i := 0 to N - 1 do
+        Src.FData[i] := 0.8 * (Random - 0.5)
+          + 0.3 * Sin(2.0 * Pi * 220.0 * i / cSrcRates[CaseCnt]);
+      DirectLanczosResample(Src, Want, cSrcRates[CaseCnt], cDstRates[CaseCnt]);
+      Got := ResampleVolume(Src, cSrcRates[CaseCnt], cDstRates[CaseCnt]);
+      try
+        AssertEquals('resample length ' + IntToStr(cSrcRates[CaseCnt]),
+          Want.Size, Got.Size);
+        MaxDiff := 0;
+        for i := 0 to Got.Size - 1 do
+        begin
+          Diff := Abs(Got.FData[i] - Want.FData[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+        AssertTrue('polyphase matches direct kernel for ' +
+          IntToStr(cSrcRates[CaseCnt]) + ' -> ' +
+          IntToStr(cDstRates[CaseCnt]) + ' (max diff ' +
+          FloatToStr(MaxDiff) + ')', MaxDiff < 1e-5);
+      finally
+        Got.Free; Got := nil;
+      end;
+    end;
+  finally
+    Src.Free;
+    Want.Free;
+    Got.Free;
   end;
 end;
 
