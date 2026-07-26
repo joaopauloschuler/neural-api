@@ -1741,6 +1741,7 @@ type
     FSeed: integer;            // RNG seed used to sample B
     FFreqMatrix: TNNetVolume;  // FIXED B, stored as 1 x M x D_in (row j = column B[:,j])
     FZ: TNNetVolume;           // cached z = B^T x (length M), reused in backward
+    FdZ: TNNetVolume;          // dL/dz scratch (length M), #17 persistent
     procedure SampleFrequencies();
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
@@ -45910,6 +45911,7 @@ begin
   FFloatSt[0] := pSigma;
   FFreqMatrix := TNNetVolume.Create(1, 1, 1);
   FZ := TNNetVolume.Create(1, 1, M);
+  FdZ := TNNetVolume.Create(1, 1, M);
   // The output is always 1 x 1 x (2*M) regardless of upstream spatial shape.
   FOutput.ReSize(1, 1, 2 * M);
   SetOutputErrorSize(1, 1, 2 * M);
@@ -45917,6 +45919,7 @@ end;
 
 destructor TNNetFourierFeatures.Destroy();
 begin
+  FdZ.Free;
   FZ.Free;
   FFreqMatrix.Free;
   inherited Destroy;
@@ -45963,7 +45966,7 @@ var
   LocalPrevOutput: TNNetVolume;
   DInputs, i, j, idx: integer;
   DInputsM1, NumFeaturesM1: integer;
-  Acc, TwoPi, Angle, xv: TNeuralFloat;
+  Acc, TwoPi, Angle: TNeuralFloat;
   StartTime: double;
 begin
   StartTime := Now();
@@ -45972,18 +45975,22 @@ begin
   TwoPi := 2.0 * Pi;
   DInputsM1 := DInputs - 1;
   NumFeaturesM1 := FNumFeatures - 1;
-  // z_j = sum_i B[i,j] * x_i.
+  // z_j = sum_i B[i,j] * x_i. B row i is the contiguous run at i*M, so running i
+  // OUTERMOST (App. E) walks it linearly and turns each step into one scaled
+  // accumulate over the whole z vector (#13). Every z_j still accumulates over
+  // i in ascending order. The STORAGE is untouched, so the serialized B and
+  // SaveDataToString are unaffected.
+  FZ.Fill(0);
+  idx := 0;
+  for i := 0 to DInputsM1 do
+  begin
+    TNNetVolume.MulAdd(FZ.GetRawPtr(0), FFreqMatrix.GetRawPtr(idx),
+      LocalPrevOutput.FData[i], FNumFeatures);
+    Inc(idx, FNumFeatures);
+  end;
   for j := 0 to NumFeaturesM1 do
   begin
-    Acc := 0;
-    idx := j;
-    for i := 0 to DInputsM1 do
-    begin
-      xv := LocalPrevOutput.FData[i];
-      Acc := Acc + FFreqMatrix.FData[idx] * xv;
-      Inc(idx, FNumFeatures);
-    end;
-    FZ.FData[j] := Acc;
+    Acc := FZ.FData[j];
     Angle := TwoPi * Acc;
     pcr_sincosf(Angle, FOutput.FData[FNumFeatures + j], FOutput.FData[j]);
   end;
@@ -45995,7 +46002,7 @@ var
   LocalPrevError: TNNetVolume;
   DInputs, i, j, idx: integer;
   DInputsM1, NumFeaturesM1: integer;
-  TwoPi, Angle, dZ, gCos, gSin, cAng, sAng: TNeuralFloat;
+  TwoPi, Angle, gCos, gSin, cAng, sAng: TNeuralFloat;
   StartTime: double;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -46013,20 +46020,24 @@ begin
     TwoPi := 2.0 * Pi;
     DInputsM1 := DInputs - 1;
     NumFeaturesM1 := FNumFeatures - 1;
+    // Materialise dL/dz once into persistent scratch (#17), then run i
+    // OUTERMOST so the contiguous B row i is a single dot product (App. E/#13).
+    if FdZ.Size <> FNumFeatures then FdZ.ReSize(1, 1, FNumFeatures);
     for j := 0 to NumFeaturesM1 do
     begin
       gCos := FOutputError.FData[j];
       gSin := FOutputError.FData[FNumFeatures + j];
       Angle := TwoPi * FZ.FData[j];
       pcr_sincosf(Angle, sAng, cAng);
-      dZ := TwoPi * (-sAng * gCos + cAng * gSin);
-      idx := j;
-      for i := 0 to DInputsM1 do
-      begin
-        LocalPrevError.FData[i] := LocalPrevError.FData[i] +
-          FFreqMatrix.FData[idx] * dZ;
-        Inc(idx, FNumFeatures);
-      end;
+      FdZ.FData[j] := TwoPi * (-sAng * gCos + cAng * gSin);
+    end;
+    idx := 0;
+    for i := 0 to DInputsM1 do
+    begin
+      LocalPrevError.FData[i] := LocalPrevError.FData[i] +
+        TNNetVolume.DotProduct(FFreqMatrix.GetRawPtr(idx), FdZ.GetRawPtr(0),
+          FNumFeatures);
+      Inc(idx, FNumFeatures);
     end;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
