@@ -1000,9 +1000,17 @@ type
       FCount: integer;
       FHistory: TNeuralIntegerArray;
       FLen: integer;
-      // Rule #17: persistent vocab-size scale buffer, lazily grown, re-primed
-      // to 1.0 per call - never re-allocated per token.
+      // Rule #17: persistent vocab-size scale buffer, lazily grown. Its
+      // RESTING value is the -1.0 clean sentinel (a scale is exp(bias) or the
+      // hard-ban 0, so it is never negative): a call primes only the finals it
+      // actually matches and restores them, instead of re-filling the whole
+      // vocabulary with 1.0 per token.
       FScaleBuf: TNeuralFloatDynArr;
+      // The finals this call scaled, and their pre-scale probabilities (the
+      // zero-mass fallback restores the row from these).
+      FTouched: TNeuralIntegerArray;
+      FTouchedOrig: TNeuralFloatDynArr;
+      FTouchedCount: integer;
       procedure AppendToken(TokenId: integer);
     public
       constructor Create();
@@ -5034,23 +5042,27 @@ end;
 
 procedure TNNetSequenceBiasProcessor.ProcessRow(Row: TNNetVolume);
 var
-  I, K, Len, PrefLen, HistStart, Final, Size: integer;
-  SizeM1, FCountM1, PrefLenM1: integer;
+  I, K, Len, PrefLen, HistStart, Final, Size, OldLen: integer;
+  FCountM1, PrefLenM1, TouchedM1: integer;
   Match: boolean;
   KeptMass, InvKept: TNeuralFloat;
   Seq: TNeuralIntegerArray; // #7: bind this sequence once (reference copy)
 begin
   if FCount = 0 then exit;
   Size := Row.Size;
-  SizeM1 := Size - 1;
   FCountM1 := FCount - 1;
   // Per-token multiplicative factor (exp of the accumulated additive logit
   // bias), 1.0 = untouched. Biases on the SAME final token ADD in logit space
   // = multiply in probability space, matching HF (which sums into the logit).
-  if Length(FScaleBuf) < Size then SetLength(FScaleBuf, Size);
-  // Rule #13/App C: bulk-fill 1.0 (single bit pattern $3F800000) instead of a
-  // vocab-size scalar loop. Guarded by TNeuralFloat = single (csNeuralFloatSize).
-  FillDWord(FScaleBuf[0], Size, $3F800000);
+  // Only matched finals are primed here - the rest of the buffer rests at the
+  // -1.0 clean sentinel, so nothing walks the vocabulary to set up.
+  if Length(FScaleBuf) < Size then
+  begin
+    OldLen := Length(FScaleBuf);
+    SetLength(FScaleBuf, Size);
+    for I := OldLen to Size - 1 do FScaleBuf[I] := -1.0;
+  end;
+  FTouchedCount := 0;
   for I := 0 to FCountM1 do
   begin
     Seq := FSequences[I];        // #7: bind once per I, then index the local
@@ -5072,8 +5084,20 @@ begin
         break;
       end;
     if not Match then continue;
+    if FScaleBuf[Final] < 0 then // first match on this final in this call
+    begin
+      if FTouchedCount >= Length(FTouched) then
+      begin
+        SetLength(FTouched, (FTouchedCount + 1) * 2);
+        SetLength(FTouchedOrig, (FTouchedCount + 1) * 2);
+      end;
+      FScaleBuf[Final] := 1.0;
+      FTouched[FTouchedCount] := Final;
+      Inc(FTouchedCount);
+    end;
     // exp(csSequenceBiasBanBias) underflows to exactly 0 (the hard-ban image);
-    // a finite bias scales the probability by exp(bias).
+    // a finite bias scales the probability by exp(bias). A ban therefore wins
+    // over any later finite bias on the same final: 0 * exp(bias) = 0.
     if FBiases[I] <= csSequenceBiasBanBias then
       FScaleBuf[Final] := 0
     else
@@ -5081,18 +5105,30 @@ begin
       FScaleBuf[Final] := FScaleBuf[Final] * NeuralExp(FBiases[I]);
   end;
   // Probability-domain realization of "logit += bias": p *= exp(bias), then
-  // renormalize. Compute the scaled mass FIRST (without mutating Row) so the
-  // zero-mass fallback can leave the row UNTOUCHED (the MaskAllowed
-  // convention) instead of emitting a degenerate all-zero distribution.
-  // Rule #13/App C: scaled mass is a pure dot product over two contiguous
-  // vocab-size runs; the final rescale is an elementwise multiply by FScaleBuf
-  // then a uniform InvKept scale. Two AVX calls replace the branchy vocab loops.
-  KeptMass := TNNetVolume.DotProduct(
-    TNeuralFloatArrPtr(Row.GetRawPtr(0)), TNeuralFloatArrPtr(@FScaleBuf[0]), Size);
-  if KeptMass <= 0 then exit;
+  // renormalize. Only the matched finals change, so they are scaled in place
+  // (saving the originals) and the scaled mass is one AVX GetSum over the row
+  // - two vocabulary passes instead of a fill, a dot product, an elementwise
+  // multiply and a scale. Every entry still ends up as p * scale * InvKept.
+  TouchedM1 := FTouchedCount - 1;
+  for I := 0 to TouchedM1 do
+  begin
+    Final := FTouched[I];
+    FTouchedOrig[I] := Row.Raw[Final];
+    Row.Raw[Final] := FTouchedOrig[I] * FScaleBuf[Final];
+    FScaleBuf[Final] := -1.0; // back to the clean sentinel
+  end;
+  KeptMass := Row.GetSum();
+  // Zero-mass fallback: leave the row UNTOUCHED (the MaskAllowed convention)
+  // instead of emitting a degenerate all-zero distribution. The row is a
+  // probability distribution and every scale is non-negative, so the scaled
+  // mass is zero exactly when every scaled entry is zero - the same inputs the
+  // dot-product form fell back on.
+  if KeptMass <= 0 then
+  begin
+    for I := 0 to TouchedM1 do Row.Raw[FTouched[I]] := FTouchedOrig[I];
+    exit;
+  end;
   InvKept := 1.0 / KeptMass;
-  TNNetVolume.Mul(
-    TNeuralFloatArrPtr(Row.GetRawPtr(0)), TNeuralFloatArrPtr(@FScaleBuf[0]), Size);
   Row.Mul(InvKept);
 end;
 

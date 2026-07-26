@@ -237,6 +237,7 @@ type
     procedure TestWatermarkDetectsWatermarkedAndRejectsRandom;
     procedure TestWatermarkProcessorBoostsGreenInProbabilityDomain;
     // Sequence-bias / bad-words processor (HF SequenceBiasLogitsProcessor).
+    procedure TestSequenceBiasMatchesScaleVectorReference;
     procedure TestSequenceBiasSingleTokenIsUnconditionalBias;
     procedure TestSequenceBiasMultiTokenFiresOnlyOnPrefixMatch;
     procedure TestSequenceBiasBannedWordNeverAppearsInGreedyOutput;
@@ -5170,6 +5171,126 @@ end;
 // A single-token bias has an empty prefix, so it fires UNCONDITIONALLY every
 // step (transformers' documented degradation). The probability-domain image is
 // p *= exp(bias), renormalized.
+// DIFFERENTIAL: the in-place scaling of the matched finals must reproduce the
+// full scale-vector reference (build a scale per vocabulary id, multiply the
+// whole row, renormalize) on random configurations - including SEVERAL biases
+// landing on the SAME final (they multiply) and a hard ban competing with a
+// finite bias (the ban wins whichever comes first).
+procedure TTestNeuralDecode.TestSequenceBiasMatchesScaleVectorReference;
+const
+  VocabSize = 10;
+  Finals: array[0..2] of integer = (3, 4, 5); // deliberate final collisions
+var
+  Proc: TNNetSequenceBiasProcessor;
+  Row, RefRow: TNNetVolume;
+  Seqs: array[0..7] of TNeuralIntegerArray;
+  Bias: array[0..7] of TNeuralFloat;
+  Scale: array[0..VocabSize - 1] of TNeuralFloat;
+  Hist: array of integer;
+  SeqCount, Trial, Step, I, J, K, L, Final, PrefLen, HistStart, Tok: integer;
+  Match, Dup: boolean;
+  KeptMass: TNeuralFloat;
+  Msg: string;
+begin
+  RandSeed := 20260727;
+  Row := TNNetVolume.Create(VocabSize, 1, 1);
+  RefRow := TNNetVolume.Create(VocabSize, 1, 1);
+  try
+    for Trial := 1 to 40 do
+    begin
+      Proc := TNNetSequenceBiasProcessor.Create();
+      try
+        SeqCount := 0;
+        for I := 0 to 5 do
+        begin
+          L := 1 + Random(3);
+          SetLength(Seqs[SeqCount], L);
+          for K := 0 to L - 2 do Seqs[SeqCount][K] := Random(4);
+          Seqs[SeqCount][L - 1] := Finals[Random(Length(Finals))];
+          // Skip a duplicate SEQUENCE (the processor overwrites those, which
+          // the reference below does not model); duplicate FINALS are the
+          // interesting case and stay in.
+          Dup := false;
+          for J := 0 to SeqCount - 1 do
+            if Length(Seqs[J]) = L then
+            begin
+              Match := true;
+              for K := 0 to L - 1 do
+                if Seqs[J][K] <> Seqs[SeqCount][K] then
+                begin
+                  Match := false;
+                  break;
+                end;
+              if Match then Dup := true;
+            end;
+          if Dup then continue;
+          case Random(4) of
+            0: Bias[SeqCount] := csSequenceBiasBanBias; // hard ban
+            1: Bias[SeqCount] := -1.5;
+            2: Bias[SeqCount] := 0.75;
+            else Bias[SeqCount] := 2.25;
+          end;
+          Proc.AddSequenceBias(Seqs[SeqCount], Bias[SeqCount]);
+          Inc(SeqCount);
+        end;
+        SetLength(Hist, Random(5));
+        for I := 0 to High(Hist) do Hist[I] := Random(4);
+        Proc.Reset(Hist);
+        for Step := 1 to 8 do
+        begin
+          for I := 0 to VocabSize - 1 do
+          begin
+            Row.Raw[I] := 0.01 + Random();
+            RefRow.Raw[I] := Row.Raw[I];
+          end;
+          // Reference: the full per-id scale vector.
+          for I := 0 to VocabSize - 1 do Scale[I] := 1.0;
+          for I := 0 to SeqCount - 1 do
+          begin
+            L := Length(Seqs[I]);
+            Final := Seqs[I][L - 1];
+            PrefLen := L - 1;
+            if PrefLen > Length(Hist) then continue;
+            HistStart := Length(Hist) - PrefLen;
+            Match := true;
+            for K := 0 to PrefLen - 1 do
+              if Hist[HistStart + K] <> Seqs[I][K] then
+              begin
+                Match := false;
+                break;
+              end;
+            if not Match then continue;
+            if Bias[I] <= csSequenceBiasBanBias
+            then Scale[Final] := 0
+            else Scale[Final] := Scale[Final] * NeuralExp(Bias[I]);
+          end;
+          KeptMass := 0;
+          for I := 0 to VocabSize - 1 do
+            KeptMass := KeptMass + RefRow.Raw[I] * Scale[I];
+          if KeptMass > 0 then
+            for I := 0 to VocabSize - 1 do
+              RefRow.Raw[I] := RefRow.Raw[I] * Scale[I] / KeptMass;
+
+          Proc.ProcessRow(Row);
+          Msg := 'trial ' + IntToStr(Trial) + ' step ' + IntToStr(Step);
+          for I := 0 to VocabSize - 1 do
+            AssertEquals(Msg + ' id ' + IntToStr(I), RefRow.Raw[I], Row.Raw[I],
+              1e-6);
+          Tok := Random(6);
+          Proc.Commit(Tok);
+          SetLength(Hist, Length(Hist) + 1);
+          Hist[High(Hist)] := Tok;
+        end;
+      finally
+        Proc.Free;
+      end;
+    end;
+  finally
+    RefRow.Free;
+    Row.Free;
+  end;
+end;
+
 procedure TTestNeuralDecode.TestSequenceBiasSingleTokenIsUnconditionalBias;
 const
   Vocab = 5;
