@@ -78334,19 +78334,35 @@ begin
   PrevOut := FPrevLayer.FOutput;
   vn := FN;
   vnM1 := vn - 1;
-  for k := 0 to vnM1 do
-  begin
-    acc := 0;
-    for j := 0 to vnM1 do
+  // #20/#12: FUnbind is loop-invariant, so unswitch it out of the O(n^2) body;
+  // the cyclic index then walks by +-1 with a wrap test instead of costing two
+  // integer divisions per element.
+  if FUnbind = 0 then
+    for k := 0 to vnM1 do
     begin
-      if FUnbind = 0 then
-        idx := ((k - j) mod vn + vn) mod vn   // (k - j) mod vn
-      else
-        idx := ((j - k) mod vn + vn) mod vn;  // (j - k) mod vn
-      acc := acc + PrevOut.FData[j] * PrevOut.FData[vn + idx];
+      acc := 0;
+      idx := k;                              // (k - j) mod vn at j = 0
+      for j := 0 to vnM1 do
+      begin
+        acc := acc + PrevOut.FData[j] * PrevOut.FData[vn + idx];
+        Dec(idx);
+        if idx < 0 then idx := vnM1;
+      end;
+      FOutput.FData[k] := acc;
+    end
+  else
+    for k := 0 to vnM1 do
+    begin
+      acc := 0;
+      if k = 0 then idx := 0 else idx := vn - k;  // (j - k) mod vn at j = 0
+      for j := 0 to vnM1 do
+      begin
+        acc := acc + PrevOut.FData[j] * PrevOut.FData[vn + idx];
+        Inc(idx);
+        if idx = vn then idx := 0;
+      end;
+      FOutput.FData[k] := acc;
     end;
-    FOutput.FData[k] := acc;
-  end;
 end;
 
 procedure TNNetHolographicBinding.Backpropagate();
@@ -78385,38 +78401,65 @@ begin
   PrevErr := FPrevLayer.OutputError;
   vn := FN;
   vnM1 := vn - 1;
-  // da
-  for j := 0 to vnM1 do
-  begin
-    daj := 0;
-    for k := 0 to vnM1 do
+  // da. #20/#12 as in the forward: the mode test leaves the O(n^2) body and the
+  // cyclic index is carried with a wrap test instead of two divisions.
+  if FUnbind = 0 then
+    for j := 0 to vnM1 do
     begin
-      e := FOutputError.FData[k];
-      if e = 0 then continue;
-      if FUnbind = 0 then
-        idx := ((k - j) mod vn + vn) mod vn
-      else
-        idx := ((j - k) mod vn + vn) mod vn;
-      daj := daj + e * PrevOut.FData[vn + idx];
+      daj := 0;
+      if j = 0 then idx := 0 else idx := vn - j;  // (k - j) mod vn at k = 0
+      for k := 0 to vnM1 do
+      begin
+        e := FOutputError.FData[k];
+        if e <> 0 then daj := daj + e * PrevOut.FData[vn + idx];
+        Inc(idx);
+        if idx = vn then idx := 0;
+      end;
+      PrevErr.FData[j] := PrevErr.FData[j] + daj;
+    end
+  else
+    for j := 0 to vnM1 do
+    begin
+      daj := 0;
+      idx := j;                                   // (j - k) mod vn at k = 0
+      for k := 0 to vnM1 do
+      begin
+        e := FOutputError.FData[k];
+        if e <> 0 then daj := daj + e * PrevOut.FData[vn + idx];
+        Dec(idx);
+        if idx < 0 then idx := vnM1;
+      end;
+      PrevErr.FData[j] := PrevErr.FData[j] + daj;
     end;
-    PrevErr.FData[j] := PrevErr.FData[j] + daj;
-  end;
   // db
-  for m := 0 to vnM1 do
-  begin
-    dbm := 0;
-    for k := 0 to vnM1 do
+  if FUnbind = 0 then
+    for m := 0 to vnM1 do
     begin
-      e := FOutputError.FData[k];
-      if e = 0 then continue;
-      if FUnbind = 0 then
-        idx := ((k - m) mod vn + vn) mod vn   // a[(k-m) mod vn]
-      else
-        idx := ((m + k) mod vn) mod vn;      // a[(m+k) mod vn]
-      dbm := dbm + e * PrevOut.FData[idx];
+      dbm := 0;
+      if m = 0 then idx := 0 else idx := vn - m;  // a[(k-m) mod vn] at k = 0
+      for k := 0 to vnM1 do
+      begin
+        e := FOutputError.FData[k];
+        if e <> 0 then dbm := dbm + e * PrevOut.FData[idx];
+        Inc(idx);
+        if idx = vn then idx := 0;
+      end;
+      PrevErr.FData[vn + m] := PrevErr.FData[vn + m] + dbm;
+    end
+  else
+    for m := 0 to vnM1 do
+    begin
+      dbm := 0;
+      idx := m;                                   // a[(m+k) mod vn] at k = 0
+      for k := 0 to vnM1 do
+      begin
+        e := FOutputError.FData[k];
+        if e <> 0 then dbm := dbm + e * PrevOut.FData[idx];
+        Inc(idx);
+        if idx = vn then idx := 0;
+      end;
+      PrevErr.FData[vn + m] := PrevErr.FData[vn + m] + dbm;
     end;
-    PrevErr.FData[vn + m] := PrevErr.FData[vn + m] + dbm;
-  end;
 end;
 
 { TNNetComplexLinear }
