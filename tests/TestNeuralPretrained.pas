@@ -630,6 +630,7 @@ type
     procedure TestSAMEncoderParity;
     procedure TestSAMMaskDecoderParity;
     procedure TestSAMMaskDecoderV2Parity;
+    procedure TestSAMWeightCacheParity;
     procedure TestWhisperLogMelFrontend;
     procedure TestWavReaderRoundTrip;
     procedure TestBertSeqClsLogitParity;
@@ -27401,6 +27402,90 @@ begin
   finally
     RefRoot.Free; V2Root.Free;
     IoUScores.Free; MaskLogits.Free; ImgEmb.Free; RefJson.Free; Reader.Free;
+  end;
+end;
+
+// A TSAMWeightCache must change nothing about the result, only where the
+// weights come from. Runs the same prompt cached and uncached and demands BIT
+// equality, then re-runs against the warm cache to prove no tensor is fetched
+// twice (the whole point: a click must not re-read the decoder from disk).
+procedure TTestNeuralPretrained.TestSAMWeightCacheParity;
+var
+  VisCfg: TSAMConfig;
+  MDCfg: TSAMMaskDecoderConfig;
+  Reader: TNNetSafeTensorsReader;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  EmbArr, EmbRow, EmbCell: TJSONArray;
+  ImgEmb, Plain, Cached, IoUPlain, IoUCached: TNNetVolume;
+  Cache: TSAMWeightCache;
+  Grid, OutCh, RowCnt, ColCnt, DCnt, i: integer;
+  WarmCount: integer;
+  Pts: array of TNeuralFloat;
+  Labels: array of integer;
+  NoBox: array of TNeuralFloat;
+begin
+  RandSeed := 424242;
+  VisCfg := ReadSAMConfigFromJSONFile(FixturePath('tiny_sam_config.json'));
+  MDCfg := ReadSAMMaskDecoderConfig(FixturePath('tiny_sam_config.json'), VisCfg);
+  Reader := TNNetSafeTensorsReader.Create(FixturePath('tiny_sam.safetensors'));
+  RefJson := TStringList.Create;
+  ImgEmb := TNNetVolume.Create;
+  Plain := TNNetVolume.Create;   Cached := TNNetVolume.Create;
+  IoUPlain := TNNetVolume.Create; IoUCached := TNNetVolume.Create;
+  Cache := TSAMWeightCache.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_sam_embed.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    EmbArr := TJSONArray(TJSONObject(RefRoot).Find('embed'));
+    Grid := TJSONObject(RefRoot).Get('grid', 0);
+    OutCh := TJSONObject(RefRoot).Get('out_channels', 0);
+    ImgEmb.ReSize(Grid, Grid, OutCh);
+    for RowCnt := 0 to Grid - 1 do
+    begin
+      EmbRow := TJSONArray(EmbArr.Items[RowCnt]);
+      for ColCnt := 0 to Grid - 1 do
+      begin
+        EmbCell := TJSONArray(EmbRow.Items[ColCnt]);
+        for DCnt := 0 to OutCh - 1 do
+          ImgEmb.FData[(RowCnt * Grid + ColCnt) * OutCh + DCnt] :=
+            EmbCell.Items[DCnt].AsFloat;
+      end;
+    end;
+
+    SetLength(Pts, 2); Pts[0] := 12.0; Pts[1] := 7.0;
+    SetLength(Labels, 1); Labels[0] := 1;
+    SetLength(NoBox, 0);
+
+    RunSAMMaskDecoderEx(Reader, MDCfg, ImgEmb, Pts, Labels, NoBox,
+      {MultiMaskOutput=}true, Plain, IoUPlain, '', nil);
+    RunSAMMaskDecoderEx(Reader, MDCfg, ImgEmb, Pts, Labels, NoBox,
+      {MultiMaskOutput=}true, Cached, IoUCached, '', Cache);
+
+    AssertTrue('cache populated', Cache.Count > 0);
+    AssertEquals('mask size', Plain.Size, Cached.Size);
+    for i := 0 to Plain.Size - 1 do
+      AssertEquals('mask logit ' + IntToStr(i),
+        Plain.FData[i], Cached.FData[i], 0.0);
+    AssertEquals('iou size', IoUPlain.Size, IoUCached.Size);
+    for i := 0 to IoUPlain.Size - 1 do
+      AssertEquals('iou ' + IntToStr(i),
+        IoUPlain.FData[i], IoUCached.FData[i], 0.0);
+
+    // Second click on a warm cache: still identical, and NOTHING new loaded.
+    WarmCount := Cache.Count;
+    Cached.Fill(0);
+    RunSAMMaskDecoderEx(Reader, MDCfg, ImgEmb, Pts, Labels, NoBox,
+      {MultiMaskOutput=}true, Cached, IoUCached, '', Cache);
+    AssertEquals('warm cache loads no further tensors', WarmCount, Cache.Count);
+    for i := 0 to Plain.Size - 1 do
+      AssertEquals('warm mask logit ' + IntToStr(i),
+        Plain.FData[i], Cached.FData[i], 0.0);
+  finally
+    RefRoot.Free; Cache.Free;
+    IoUCached.Free; IoUPlain.Free; Cached.Free; Plain.Free;
+    ImgEmb.Free; RefJson.Free; Reader.Free;
   end;
 end;
 

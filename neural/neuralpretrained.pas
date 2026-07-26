@@ -9564,6 +9564,30 @@ type
     LayerNormEps: TNeuralFloat;
   end;
 
+type
+  // Caller-owned name -> tensor cache for the SAM mask decoder. SAM's image
+  // encoder runs once per image, but the mask decoder re-runs for every
+  // prompt/click; without a cache each run re-reads the WHOLE mask-decoder
+  // parameter set from the checkpoint (and, on an F16/BF16 file, re-decodes it
+  // to single). Hand the same cache to every RunSAMMaskDecoder(Ex) call that
+  // shares a Reader and a Prefix and the weights are read exactly once. Results
+  // are numerically identical with or without it. Pass nil to opt out.
+  // Not thread-safe: give each concurrent decode its own cache. Coded by
+  // Claude (AI).
+  TSAMWeightCache = class(TObject)
+  private
+    FNames: array of string;
+    FVolumes: array of TNNetVolume;
+    FCount: integer;
+  public
+    destructor Destroy; override;
+    // Returns the named tensor, loading it through Reader on first request.
+    // The cache OWNS the result: read it, never modify or free it.
+    function Get(Reader: TNNetSafeTensorsReader;
+      const pName: string): TNNetVolume;
+    property Count: integer read FCount;
+  end;
+
 // Reads the prompt_encoder + mask_decoder sub-blocks of a SAM config.json into
 // a TSAMMaskDecoderConfig (VisionConfig supplies Grid + NumPosFeats).
 function ReadSAMMaskDecoderConfig(const FileName: string;
@@ -9582,7 +9606,8 @@ function ReadSAMMaskDecoderConfig(const FileName: string;
 procedure RunSAMMaskDecoder(Reader: TNNetSafeTensorsReader;
   const Config: TSAMMaskDecoderConfig; ImageEmbedding: TNNetVolume;
   PointX, PointY: TNeuralFloat; IsPositive: boolean;
-  MaskLogits: TNNetVolume; const Prefix: string = '');
+  MaskLogits: TNNetVolume; const Prefix: string = '';
+  Cache: TSAMWeightCache = nil);
 
 // Generalized SAM mask decoder (v2): N point prompts and/or a box prompt,
 // optional multi-mask output, plus the IoU-prediction-head quality scores.
@@ -9603,11 +9628,15 @@ procedure RunSAMMaskDecoder(Reader: TNNetSafeTensorsReader;
 //                skip. (No sigmoid: SAM's iou head has sigmoid_output=False.)
 // At least one prompt (a point or a box) must be supplied. The legacy
 // single-point RunSAMMaskDecoder above is a thin wrapper over this routine.
+//   Cache:       optional caller-owned weight cache (see TSAMWeightCache). Reuse
+//                one across clicks on the same image to skip re-reading the
+//                decoder weights; nil loads them fresh on every call.
 procedure RunSAMMaskDecoderEx(Reader: TNNetSafeTensorsReader;
   const Config: TSAMMaskDecoderConfig; ImageEmbedding: TNNetVolume;
   const PointsXY: array of TNeuralFloat; const PointLabels: array of integer;
   const Box: array of TNeuralFloat; MultiMaskOutput: boolean;
-  MaskLogits: TNNetVolume; IoUScores: TNNetVolume; const Prefix: string = '');
+  MaskLogits: TNNetVolume; IoUScores: TNNetVolume; const Prefix: string = '';
+  Cache: TSAMWeightCache = nil);
 
 // ---------------------------------------------------------------------------
 // VGG-16 / VGG-19 IMPORT (torchvision / timm "vgg", the canonical perceptual-
@@ -72231,43 +72260,82 @@ end;
 type
   TSAMMat = array of TNeuralFloat;   // row-major [rows*cols]
 
-// Loads a 2-D linear weight (out_dim, in_dim) + bias, applies y = x.W^T + b to
-// each of NRows input rows. X is [NRows*InDim], Y is [NRows*OutDim].
-procedure SAMLinear(Reader: TNNetSafeTensorsReader; const WName, BName: string;
+destructor TSAMWeightCache.Destroy;
+var
+  i, CountM1: integer;
+begin
+  CountM1 := FCount - 1;
+  for i := 0 to CountM1 do FVolumes[i].Free;
+  inherited Destroy;
+end;
+
+function TSAMWeightCache.Get(Reader: TNNetSafeTensorsReader;
+  const pName: string): TNNetVolume;
+var
+  i, CountM1, Cap: integer;
+  V: TNNetVolume;
+begin
+  CountM1 := FCount - 1;
+  for i := 0 to CountM1 do
+    if FNames[i] = pName then
+    begin
+      Result := FVolumes[i];
+      exit;
+    end;
+  V := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(pName, V);
+  except
+    V.Free;
+    raise;
+  end;
+  if FCount >= Length(FVolumes) then
+  begin
+    Cap := FCount * 2 + 16;
+    SetLength(FVolumes, Cap);
+    SetLength(FNames, Cap);
+  end;
+  FNames[FCount] := pName;
+  FVolumes[FCount] := V;
+  Inc(FCount);
+  Result := V;
+end;
+
+// Applies y = x.W^T + b to each of NRows input rows, with the 2-D linear weight
+// (out_dim, in_dim) and bias taken from the weight cache. X is [NRows*InDim],
+// Y is [NRows*OutDim].
+procedure SAMLinear(Reader: TNNetSafeTensorsReader; Cache: TSAMWeightCache;
+  const WName, BName: string;
   InDim, OutDim, NRows: integer; const X: TSAMMat; var Y: TSAMMat);
 var
   W, B: TNNetVolume;
   r, o, rIn, oIn, yBase: integer;
   NRowsM1, OutDimM1: integer;
 begin
-  W := TNNetVolume.Create; B := TNNetVolume.Create;
   NRowsM1 := NRows - 1;
   OutDimM1 := OutDim - 1;
-  try
-    Reader.LoadTensorFlat(WName, W);
-    Reader.LoadTensorFlat(BName, B);
-    SetLength(Y, NRows * OutDim);
-    yBase := 0;
-    for r := 0 to NRowsM1 do
+  W := Cache.Get(Reader, WName);
+  B := Cache.Get(Reader, BName);
+  SetLength(Y, NRows * OutDim);
+  yBase := 0;
+  for r := 0 to NRowsM1 do
+  begin
+    rIn := r * InDim;
+    oIn := 0;
+    for o := 0 to OutDimM1 do
     begin
-      rIn := r * InDim;
-      oIn := 0;
-      for o := 0 to OutDimM1 do
-      begin
-        // Contiguous InDim dot over plain TSAMMat rows (rule #13/#11/#12).
-        Y[yBase + o] := B.FData[o] +
-          TNNetVolume.DotProduct(@X[rIn], W.GetRawPtr(oIn), InDim);
-        Inc(oIn, InDim);
-      end;
-      Inc(yBase, OutDim);
+      // Contiguous InDim dot over plain TSAMMat rows (rule #13/#11/#12).
+      Y[yBase + o] := B.FData[o] +
+        TNNetVolume.DotProduct(@X[rIn], W.GetRawPtr(oIn), InDim);
+      Inc(oIn, InDim);
     end;
-  finally
-    W.Free; B.Free;
+    Inc(yBase, OutDim);
   end;
 end;
 
 // In-place LayerNorm over the last (Dim) axis of NRows rows, affine gamma/beta.
-procedure SAMLayerNorm(Reader: TNNetSafeTensorsReader; const WName, BName: string;
+procedure SAMLayerNorm(Reader: TNNetSafeTensorsReader; Cache: TSAMWeightCache;
+  const WName, BName: string;
   Dim, NRows: integer; Eps: TNeuralFloat; var X: TSAMMat);
 var
   G, B: TNNetVolume;
@@ -72275,31 +72343,26 @@ var
   mean, varc, v, inv: TNeuralFloat;
   NRowsM1, DimM1: integer;
 begin
-  G := TNNetVolume.Create; B := TNNetVolume.Create;
   NRowsM1 := NRows - 1;
   DimM1 := Dim - 1;
-  try
-    Reader.LoadTensorFlat(WName, G);
-    Reader.LoadTensorFlat(BName, B);
-    for r := 0 to NRowsM1 do
+  G := Cache.Get(Reader, WName);
+  B := Cache.Get(Reader, BName);
+  for r := 0 to NRowsM1 do
+  begin
+    rBase := r * Dim;
+    mean := 0;
+    for d := 0 to DimM1 do mean := mean + X[rBase + d];
+    mean := mean / Dim;
+    varc := 0;
+    for d := 0 to DimM1 do
     begin
-      rBase := r * Dim;
-      mean := 0;
-      for d := 0 to DimM1 do mean := mean + X[rBase + d];
-      mean := mean / Dim;
-      varc := 0;
-      for d := 0 to DimM1 do
-      begin
-        v := X[rBase + d] - mean;
-        varc := varc + v * v;
-      end;
-      varc := varc / Dim;
-      inv := 1.0 / Sqrt(varc + Eps);
-      for d := 0 to DimM1 do
-        X[rBase + d] := (X[rBase + d] - mean) * inv * G.FData[d] + B.FData[d];
+      v := X[rBase + d] - mean;
+      varc := varc + v * v;
     end;
-  finally
-    G.Free; B.Free;
+    varc := varc / Dim;
+    inv := 1.0 / Sqrt(varc + Eps);
+    for d := 0 to DimM1 do
+      X[rBase + d] := (X[rBase + d] - mean) * inv * G.FData[d] + B.FData[d];
   end;
 end;
 
@@ -72361,20 +72424,21 @@ end;
 // Full SAM attention sub-layer: q/k/v projections (HiddenSize -> InternalDim),
 // multi-head SDPA, out projection (InternalDim -> HiddenSize). Q is [NQ*Hidden],
 // K,V are [NK*Hidden]; result Out is [NQ*Hidden].
-procedure SAMAttention(Reader: TNNetSafeTensorsReader; const Pfx: string;
+procedure SAMAttention(Reader: TNNetSafeTensorsReader; Cache: TSAMWeightCache;
+  const Pfx: string;
   Hidden, Internal, Heads: integer; const Q, K, V: TSAMMat; NQ, NK: integer;
   var Out_: TSAMMat);
 var
   Qp, Kp, Vp, Ap: TSAMMat;
 begin
-  SAMLinear(Reader, Pfx + 'q_proj.weight', Pfx + 'q_proj.bias',
+  SAMLinear(Reader, Cache, Pfx + 'q_proj.weight', Pfx + 'q_proj.bias',
     Hidden, Internal, NQ, Q, Qp);
-  SAMLinear(Reader, Pfx + 'k_proj.weight', Pfx + 'k_proj.bias',
+  SAMLinear(Reader, Cache, Pfx + 'k_proj.weight', Pfx + 'k_proj.bias',
     Hidden, Internal, NK, K, Kp);
-  SAMLinear(Reader, Pfx + 'v_proj.weight', Pfx + 'v_proj.bias',
+  SAMLinear(Reader, Cache, Pfx + 'v_proj.weight', Pfx + 'v_proj.bias',
     Hidden, Internal, NK, V, Vp);
   SAMAttnCore(Qp, Kp, Vp, NQ, NK, Internal, Heads, Ap);
-  SAMLinear(Reader, Pfx + 'out_proj.weight', Pfx + 'out_proj.bias',
+  SAMLinear(Reader, Cache, Pfx + 'out_proj.weight', Pfx + 'out_proj.bias',
     Internal, Hidden, NQ, Ap, Out_);
 end;
 
@@ -72418,10 +72482,12 @@ procedure RunSAMMaskDecoderEx(Reader: TNNetSafeTensorsReader;
   const Config: TSAMMaskDecoderConfig; ImageEmbedding: TNNetVolume;
   const PointsXY: array of TNeuralFloat; const PointLabels: array of integer;
   const Box: array of TNeuralFloat; MultiMaskOutput: boolean;
-  MaskLogits: TNNetVolume; IoUScores: TNNetVolume; const Prefix: string);
+  MaskLogits: TNNetVolume; IoUScores: TNNetVolume; const Prefix: string;
+  Cache: TSAMWeightCache);
 const
   INV_SQRT_2 = 0.70710678118654752;
 var
+  OwnCache: TSAMWeightCache;   // created only when the caller supplied none
   H, Internal, Heads, Grid, NImg, NTok, MaskTokenCount: integer;
   i, d, li, ki, kj, ci, oc, oi, oj, r, c: integer;
   PEPos, SharedPE, T1, T2: TNNetVolume;
@@ -72496,20 +72562,21 @@ begin
     ImportError('SAM mask decoder: image embedding shape mismatch (expected ' +
       IntToStr(Grid) + 'x' + IntToStr(Grid) + 'x' + IntToStr(H) + ').');
 
-  PEPos := TNNetVolume.Create;       // shared_embedding.positional_embedding
-  SharedPE := TNNetVolume.Create;    // shared_image_embedding (grid pos-enc)
-  NotAPoint := TNNetVolume.Create;
-  PE0 := TNNetVolume.Create; PE1 := TNNetVolume.Create;
-  PE2 := TNNetVolume.Create; PE3 := TNNetVolume.Create;
-  NoMask := TNNetVolume.Create;
+  // Every weight below comes from the cache, which owns it: none of these
+  // references is freed here.
+  if Cache <> nil then OwnCache := nil else OwnCache := TSAMWeightCache.Create;
   try
-    Reader.LoadTensorFlat(Pfx + 'prompt_encoder.shared_embedding.positional_embedding', PEPos);
-    Reader.LoadTensorFlat(Pfx + 'shared_image_embedding.positional_embedding', SharedPE);
-    Reader.LoadTensorFlat(Pfx + 'prompt_encoder.not_a_point_embed.weight', NotAPoint);
-    Reader.LoadTensorFlat(Pfx + 'prompt_encoder.point_embed.0.weight', PE0);
-    Reader.LoadTensorFlat(Pfx + 'prompt_encoder.point_embed.1.weight', PE1);
-    Reader.LoadTensorFlat(Pfx + 'prompt_encoder.point_embed.2.weight', PE2);
-    Reader.LoadTensorFlat(Pfx + 'prompt_encoder.point_embed.3.weight', PE3);
+    if OwnCache <> nil then Cache := OwnCache;
+    PEPos := Cache.Get(Reader,
+      Pfx + 'prompt_encoder.shared_embedding.positional_embedding');
+    SharedPE := Cache.Get(Reader,
+      Pfx + 'shared_image_embedding.positional_embedding');
+    NotAPoint := Cache.Get(Reader,
+      Pfx + 'prompt_encoder.not_a_point_embed.weight');
+    PE0 := Cache.Get(Reader, Pfx + 'prompt_encoder.point_embed.0.weight');
+    PE1 := Cache.Get(Reader, Pfx + 'prompt_encoder.point_embed.1.weight');
+    PE2 := Cache.Get(Reader, Pfx + 'prompt_encoder.point_embed.2.weight');
+    PE3 := Cache.Get(Reader, Pfx + 'prompt_encoder.point_embed.3.weight');
 
     // ----- prompt encoder: N points (+ optional pad) + box corners -----
     // Coords order: NumPoints clicks, then pad (0,0) if HasPad, then box
@@ -72574,7 +72641,7 @@ begin
     end;
 
     // dense no-mask embedding broadcast over the grid, ADDED to the image emb.
-    Reader.LoadTensorFlat(Pfx + 'prompt_encoder.no_mask_embed.weight', NoMask);
+    NoMask := Cache.Get(Reader, Pfx + 'prompt_encoder.no_mask_embed.weight');
     SetLength(Keys, NImg * H);
     Move(ImageEmbedding.FData[0], Keys[0], NImg * H * csNeuralFloatSize);
     rwc := 0;
@@ -72596,18 +72663,13 @@ begin
     SAMPosEnc(SharedPE, Coords, NImg, Config.NumPosFeats, ImgPE);
 
     // ----- output tokens = iou + mask tokens, then sparse prompt -----
-    T1 := TNNetVolume.Create; T2 := TNNetVolume.Create;
-    try
-      Reader.LoadTensorFlat(Pfx + 'mask_decoder.iou_token.weight', T1);
-      Reader.LoadTensorFlat(Pfx + 'mask_decoder.mask_tokens.weight', T2);
-      SetLength(PointEmb, NTok * H);
-      Move(T1.FData[0], PointEmb[0], H * csNeuralFloatSize);
-      Move(T2.FData[0], PointEmb[H], MaskTokenCount * H * csNeuralFloatSize);
-      Move(Sparse[0], PointEmb[(1 + MaskTokenCount) * H],
-        NSparseRows * H * csNeuralFloatSize);
-    finally
-      T1.Free; T2.Free;
-    end;
+    T1 := Cache.Get(Reader, Pfx + 'mask_decoder.iou_token.weight');
+    T2 := Cache.Get(Reader, Pfx + 'mask_decoder.mask_tokens.weight');
+    SetLength(PointEmb, NTok * H);
+    Move(T1.FData[0], PointEmb[0], H * csNeuralFloatSize);
+    Move(T2.FData[0], PointEmb[H], MaskTokenCount * H * csNeuralFloatSize);
+    Move(Sparse[0], PointEmb[(1 + MaskTokenCount) * H],
+      NSparseRows * H * csNeuralFloatSize);
 
     SetLength(Queries, NTok * H);
     Move(PointEmb[0], Queries[0], NTok * H * csNeuralFloatSize);
@@ -72623,7 +72685,7 @@ begin
       if li = 0 then
       begin
         // skip_first_layer_pe: output REPLACES queries (NO residual, NO pe).
-        SAMAttention(Reader, BPfx + 'self_attn.', H, H, Heads,
+        SAMAttention(Reader, Cache, BPfx + 'self_attn.', H, H, Heads,
           Queries, Queries, Queries, NTok, NTok, AttnOut);
         Move(AttnOut[0], Queries[0], NTok * H * csNeuralFloatSize);
       end
@@ -72631,11 +72693,11 @@ begin
       begin
         Move(Queries[0], Qinp[0], NTok * H * csNeuralFloatSize);
         TNNetVolume.Add(@Qinp[0], @PointEmb[0], NTok * H);
-        SAMAttention(Reader, BPfx + 'self_attn.', H, H, Heads,
+        SAMAttention(Reader, Cache, BPfx + 'self_attn.', H, H, Heads,
           Qinp, Qinp, Queries, NTok, NTok, AttnOut);
         TNNetVolume.Add(@Queries[0], @AttnOut[0], NTok * H);
       end;
-      SAMLayerNorm(Reader, BPfx + 'layer_norm1.weight', BPfx + 'layer_norm1.bias',
+      SAMLayerNorm(Reader, Cache, BPfx + 'layer_norm1.weight', BPfx + 'layer_norm1.bias',
         H, NTok, Eps, Queries);
 
       // cross attention token -> image (query=q+pe, key=keys+imgpe, value=keys)
@@ -72643,20 +72705,20 @@ begin
       TNNetVolume.Add(@Qinp[0], @PointEmb[0], NTok * H);
       Move(Keys[0], Kinp[0], NImg * H * csNeuralFloatSize);
       TNNetVolume.Add(@Kinp[0], @ImgPE[0], NImg * H);
-      SAMAttention(Reader, BPfx + 'cross_attn_token_to_image.', H, Internal, Heads,
+      SAMAttention(Reader, Cache, BPfx + 'cross_attn_token_to_image.', H, Internal, Heads,
         Qinp, Kinp, Keys, NTok, NImg, AttnOut);
       TNNetVolume.Add(@Queries[0], @AttnOut[0], NTok * H);
-      SAMLayerNorm(Reader, BPfx + 'layer_norm2.weight', BPfx + 'layer_norm2.bias',
+      SAMLayerNorm(Reader, Cache, BPfx + 'layer_norm2.weight', BPfx + 'layer_norm2.bias',
         H, NTok, Eps, Queries);
 
       // MLP (lin1 -> relu -> lin2), residual
-      SAMLinear(Reader, BPfx + 'mlp.lin1.weight', BPfx + 'mlp.lin1.bias',
+      SAMLinear(Reader, Cache, BPfx + 'mlp.lin1.weight', BPfx + 'mlp.lin1.bias',
         H, Config.MlpDim, NTok, Queries, Mlp1);
       TNNetVolume.VectorRelu(@Mlp1[0], @Mlp1[0], NTokMlpM1 + 1);
-      SAMLinear(Reader, BPfx + 'mlp.lin2.weight', BPfx + 'mlp.lin2.bias',
+      SAMLinear(Reader, Cache, BPfx + 'mlp.lin2.weight', BPfx + 'mlp.lin2.bias',
         Config.MlpDim, H, NTok, Mlp1, Mlp2);
       TNNetVolume.Add(@Queries[0], @Mlp2[0], NTok * H);
-      SAMLayerNorm(Reader, BPfx + 'layer_norm3.weight', BPfx + 'layer_norm3.bias',
+      SAMLayerNorm(Reader, Cache, BPfx + 'layer_norm3.weight', BPfx + 'layer_norm3.bias',
         H, NTok, Eps, Queries);
 
       // cross attention image -> token (query=keys+imgpe, key=q+pe, value=queries)
@@ -72664,10 +72726,10 @@ begin
       TNNetVolume.Add(@Qinp[0], @PointEmb[0], NTok * H);
       Move(Keys[0], Kinp[0], NImg * H * csNeuralFloatSize);
       TNNetVolume.Add(@Kinp[0], @ImgPE[0], NImg * H);
-      SAMAttention(Reader, BPfx + 'cross_attn_image_to_token.', H, Internal, Heads,
+      SAMAttention(Reader, Cache, BPfx + 'cross_attn_image_to_token.', H, Internal, Heads,
         Kinp, Qinp, Queries, NImg, NTok, AttnOut);
       TNNetVolume.Add(@Keys[0], @AttnOut[0], NImg * H);
-      SAMLayerNorm(Reader, BPfx + 'layer_norm4.weight', BPfx + 'layer_norm4.bias',
+      SAMLayerNorm(Reader, Cache, BPfx + 'layer_norm4.weight', BPfx + 'layer_norm4.bias',
         H, NImg, Eps, Keys);
     end;
 
@@ -72676,10 +72738,10 @@ begin
     TNNetVolume.Add(@Qinp[0], @PointEmb[0], NTok * H);
     Move(Keys[0], Kinp[0], NImg * H * csNeuralFloatSize);
     TNNetVolume.Add(@Kinp[0], @ImgPE[0], NImg * H);
-    SAMAttention(Reader, Pfx + 'mask_decoder.transformer.final_attn_token_to_image.',
+    SAMAttention(Reader, Cache, Pfx + 'mask_decoder.transformer.final_attn_token_to_image.',
       H, Internal, Heads, Qinp, Kinp, Keys, NTok, NImg, AttnOut);
     TNNetVolume.Add(@Queries[0], @AttnOut[0], NTok * H);
-    SAMLayerNorm(Reader,
+    SAMLayerNorm(Reader, Cache,
       Pfx + 'mask_decoder.transformer.layer_norm_final_attn.weight',
       Pfx + 'mask_decoder.transformer.layer_norm_final_attn.bias',
       H, NTok, Eps, Queries);
@@ -72710,10 +72772,9 @@ begin
     H2W2M1 := H2 * W2 - 1;
     H2M1 := H2 - 1;
     W2M1 := W2 - 1;
-    C1w := TNNetVolume.Create; C1b := TNNetVolume.Create;
-    try
-      Reader.LoadTensorFlat(Pfx + 'mask_decoder.upscale_conv1.weight', C1w);
-      Reader.LoadTensorFlat(Pfx + 'mask_decoder.upscale_conv1.bias', C1b);
+    C1w := Cache.Get(Reader, Pfx + 'mask_decoder.upscale_conv1.weight');
+    C1b := Cache.Get(Reader, Pfx + 'mask_decoder.upscale_conv1.bias');
+    begin
       SetLength(U1, Cmid * H2 * W2);
       posU := 0;
       for oc := 0 to CmidM1 do
@@ -72757,15 +72818,12 @@ begin
           end;
         end;
       end;
-    finally
-      C1w.Free; C1b.Free;
     end;
 
     // upscale_layer_norm (channels-first over Cmid) then GELU(erf).
-    C1w := TNNetVolume.Create; C1b := TNNetVolume.Create;
-    try
-      Reader.LoadTensorFlat(Pfx + 'mask_decoder.upscale_layer_norm.weight', C1w);
-      Reader.LoadTensorFlat(Pfx + 'mask_decoder.upscale_layer_norm.bias', C1b);
+    C1w := Cache.Get(Reader, Pfx + 'mask_decoder.upscale_layer_norm.weight');
+    C1b := Cache.Get(Reader, Pfx + 'mask_decoder.upscale_layer_norm.bias');
+    begin
       for i := 0 to H2W2M1 do
       begin
         mean := 0;
@@ -72789,8 +72847,6 @@ begin
           Inc(posU, H2W2);
         end;
       end;
-    finally
-      C1w.Free; C1b.Free;
     end;
 
     // upscale_conv2: ConvTranspose2d(H/4 -> H/8, k2 s2). weight (H/4, H/8, 2, 2).
@@ -72802,10 +72858,9 @@ begin
     CuHuWuM1 := Cu * Hu * Wu - 1;
     HuM1 := Hu - 1;
     WuM1 := Wu - 1;
-    C2w := TNNetVolume.Create; C2b := TNNetVolume.Create;
-    try
-      Reader.LoadTensorFlat(Pfx + 'mask_decoder.upscale_conv2.weight', C2w);
-      Reader.LoadTensorFlat(Pfx + 'mask_decoder.upscale_conv2.bias', C2b);
+    C2w := Cache.Get(Reader, Pfx + 'mask_decoder.upscale_conv2.weight');
+    C2b := Cache.Get(Reader, Pfx + 'mask_decoder.upscale_conv2.bias');
+    begin
       SetLength(U2, Cu * Hu * Wu);
       posU := 0;
       for oc := 0 to CuM1 do
@@ -72844,8 +72899,6 @@ begin
           end;
         end;
       end;
-    finally
-      C2w.Free; C2b.Free;
     end;
     // GELU(erf) on the conv2 output.
     for i := 0 to CuHuWuM1 do
@@ -72889,13 +72942,13 @@ begin
       qBase := (1 + mt) * H;                        // #5/#13: contiguous slice copy
       Move(Queries[qBase], Hbuf[0], H * csNeuralFloatSize);
       BPfx := Pfx + 'mask_decoder.output_hypernetworks_mlps.' + IntToStr(mt) + '.';
-      SAMLinear(Reader, BPfx + 'proj_in.weight', BPfx + 'proj_in.bias',
+      SAMLinear(Reader, Cache, BPfx + 'proj_in.weight', BPfx + 'proj_in.bias',
         H, H, 1, Hbuf, Mlp1);
       TNNetVolume.VectorRelu(@Mlp1[0], @Mlp1[0], HM1 + 1);
-      SAMLinear(Reader, BPfx + 'layers.0.weight', BPfx + 'layers.0.bias',
+      SAMLinear(Reader, Cache, BPfx + 'layers.0.weight', BPfx + 'layers.0.bias',
         H, H, 1, Mlp1, Mlp2);
       TNNetVolume.VectorRelu(@Mlp2[0], @Mlp2[0], HM1 + 1);
-      SAMLinear(Reader, BPfx + 'proj_out.weight', BPfx + 'proj_out.bias',
+      SAMLinear(Reader, Cache, BPfx + 'proj_out.weight', BPfx + 'proj_out.bias',
         H, Cu, 1, Mlp2, HyperIn);
       // HyperIn now holds the per-channel hypernetwork output (length Cu).
 
@@ -72929,13 +72982,13 @@ begin
       SetLength(Hbuf, H);
       Move(Queries[0], Hbuf[0], H * csNeuralFloatSize);   // #5/#13: contiguous copy
       BPfx := Pfx + 'mask_decoder.iou_prediction_head.';
-      SAMLinear(Reader, BPfx + 'proj_in.weight', BPfx + 'proj_in.bias',
+      SAMLinear(Reader, Cache, BPfx + 'proj_in.weight', BPfx + 'proj_in.bias',
         H, H, 1, Hbuf, Mlp1);
       TNNetVolume.VectorRelu(@Mlp1[0], @Mlp1[0], HM1 + 1);
-      SAMLinear(Reader, BPfx + 'layers.0.weight', BPfx + 'layers.0.bias',
+      SAMLinear(Reader, Cache, BPfx + 'layers.0.weight', BPfx + 'layers.0.bias',
         H, H, 1, Mlp1, Mlp2);
       TNNetVolume.VectorRelu(@Mlp2[0], @Mlp2[0], HM1 + 1);
-      SAMLinear(Reader, BPfx + 'proj_out.weight', BPfx + 'proj_out.bias',
+      SAMLinear(Reader, Cache, BPfx + 'proj_out.weight', BPfx + 'proj_out.bias',
         H, MaskTokenCount, 1, Mlp2, Hbuf);
       IoUScores.ReSize(NumMasks, 1, 1);
       NumMasksM1 := NumMasks - 1;
@@ -72943,8 +72996,7 @@ begin
         IoUScores.FData[mi] := Hbuf[FirstMask + mi];
     end;
   finally
-    PEPos.Free; SharedPE.Free; NotAPoint.Free;
-    PE0.Free; PE1.Free; PE2.Free; PE3.Free; NoMask.Free;
+    OwnCache.Free;
   end;
 end;
 
@@ -72952,7 +73004,7 @@ end;
 procedure RunSAMMaskDecoder(Reader: TNNetSafeTensorsReader;
   const Config: TSAMMaskDecoderConfig; ImageEmbedding: TNNetVolume;
   PointX, PointY: TNeuralFloat; IsPositive: boolean;
-  MaskLogits: TNNetVolume; const Prefix: string);
+  MaskLogits: TNNetVolume; const Prefix: string; Cache: TSAMWeightCache);
 var
   Pts: array[0..1] of TNeuralFloat;
   Labels: array[0..0] of integer;
@@ -72962,7 +73014,7 @@ begin
   if IsPositive then Labels[0] := 1 else Labels[0] := 0;
   SetLength(NoBox, 0);
   RunSAMMaskDecoderEx(Reader, Config, ImageEmbedding, Pts, Labels, NoBox,
-    {MultiMaskOutput=}false, MaskLogits, {IoUScores=}nil, Prefix);
+    {MultiMaskOutput=}false, MaskLogits, {IoUScores=}nil, Prefix, Cache);
 end;
 
 // ===========================================================================
