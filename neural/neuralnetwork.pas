@@ -88841,6 +88841,7 @@ var
   Neuron: TNNetNeuron;
   PrevOut: TNNetVolume;
   AhatVal: TNeuralFloat;
+  OutPtr: TNeuralFloatArrPtr;
 begin
   if (FAhat.Size = 0) or (FNumNodes = 0) then
     FErrorProc('TNNetGraphConvolution: SetAdjacency must be called before Compute.');
@@ -88867,22 +88868,24 @@ begin
     end;
   end;
   // (2) neighbour aggregation  Y = Ahat * Z.
+  // Appendix E: neighbour-OUTER / feature-INNER makes each step a contiguous
+  // MulAdd over the OutFeat run instead of a scalar walk strided by OutFeat.
+  // For a fixed output element the additions still happen in ascending NbrIdx
+  // order and start from zero, so this is the same accumulation the register
+  // form ran. The Ahat sparsity skip survives at the row level.
   for NodeIdx := 0 to numNodesMax do
   begin
     ahatRow := NodeIdx * FNumNodes;
     outBase := NodeIdx * OutFeat;
-    for FeatOut := 0 to outFeatMax do
+    OutPtr := FOutput.GetRawPtr(outBase);
+    FillChar(FOutput.FData[outBase], OutFeat * csNeuralFloatSize, 0);
+    aggPos := 0;
+    for NbrIdx := 0 to numNodesMax do
     begin
-      Acc := 0;
-      aggPos := FeatOut;
-      for NbrIdx := 0 to numNodesMax do
-      begin
-        AhatVal := FAhat.FData[ahatRow + NbrIdx];
-        if AhatVal <> 0.0 then
-          Acc := Acc + AhatVal * FAggIn.FData[aggPos];
-        Inc(aggPos, OutFeat);
-      end;
-      FOutput.FData[outBase + FeatOut] := Acc;
+      AhatVal := FAhat.FData[ahatRow + NbrIdx];
+      if AhatVal <> 0.0 then
+        TNNetVolume.MulAdd(OutPtr, FAggIn.GetRawPtr(aggPos), AhatVal, OutFeat);
+      Inc(aggPos, OutFeat);
     end;
   end;
   // Linear activation: raw output equals output.
@@ -88917,33 +88920,39 @@ procedure TNNetGraphConvolution.BackpropagateCPU();
 var
   OutFeat, NodeIdx, FeatOut, NbrIdx: integer;
   numNodesMax, outFeatMax, inFeatMax: integer;
-  ahatPos, errPos, aggPos, prevPos: integer;
+  ahatPos, errPos, aggPos, prevPos, aggBase: integer;
   AhatVal, dZ, Scale: TNeuralFloat;
   Neuron: TNNetNeuron;
   PrevOut: TNNetVolume;
+  AggErrPtr: TNeuralFloatArrPtr;
 begin
   OutFeat := FOutput.Depth;
   PrevOut := FPrevLayer.FOutput;
   numNodesMax := FNumNodes - 1;
   outFeatMax := OutFeat - 1;
   inFeatMax := FInFeat - 1;
-  // dL/dZ = Ahat * dL/dY (stored in FAggErr).
+  // dL/dZ = Ahat * dL/dY (stored in FAggErr). Appendix E: neighbour-OUTER /
+  // feature-INNER turns the OutFeat-strided scalar walk into a contiguous
+  // MulAdd over the whole feature run, in the same ascending-i order and
+  // starting from zero.
+  aggBase := 0;                                // m * OutFeat
   for NodeIdx := 0 to numNodesMax do          // m
-    for FeatOut := 0 to outFeatMax do
+  begin
+    AggErrPtr := FAggErr.GetRawPtr(aggBase);
+    FillChar(FAggErr.FData[aggBase], OutFeat * csNeuralFloatSize, 0);
+    ahatPos := NodeIdx;                        // Ahat[i,m], i = NbrIdx (stride FNumNodes)
+    errPos := 0;                               // i * OutFeat
+    for NbrIdx := 0 to numNodesMax do         // i
     begin
-      dZ := 0;
-      ahatPos := NodeIdx;                      // Ahat[i,m], i = NbrIdx (stride FNumNodes)
-      errPos := FeatOut;                       // dL/dY[i,f] (stride OutFeat)
-      for NbrIdx := 0 to numNodesMax do       // i
-      begin
-        AhatVal := FAhat.FData[ahatPos];
-        if AhatVal <> 0.0 then
-          dZ := dZ + AhatVal * FOutputError.FData[errPos];
-        Inc(ahatPos, FNumNodes);
-        Inc(errPos, OutFeat);
-      end;
-      FAggErr.FData[NodeIdx * OutFeat + FeatOut] := dZ;
+      AhatVal := FAhat.FData[ahatPos];
+      if AhatVal <> 0.0 then
+        TNNetVolume.MulAdd(AggErrPtr, FOutputError.GetRawPtr(errPos),
+          AhatVal, OutFeat);
+      Inc(ahatPos, FNumNodes);
+      Inc(errPos, OutFeat);
     end;
+    Inc(aggBase, OutFeat);
+  end;
   if FLearningRate = 0.0 then exit;
   Scale := -FLearningRate;
   // Accumulate weight/bias deltas (the standard inertia/Adam update consumes
@@ -89178,6 +89187,7 @@ var
   Acc, Pre, MaxE, SumE, alphaVal, KeepScale: TNeuralFloat;
   Neuron, AttNeuron: TNNetNeuron;
   PrevOut: TNNetVolume;
+  OutPtr: TNeuralFloatArrPtr;
 begin
   if (FMask.Size = 0) or (FNumNodes = 0) then
     FErrorProc('TNNetGraphAttention: SetAdjacency must be called before Compute.');
@@ -89283,23 +89293,24 @@ begin
   else
     FAttDropMask.Fill(1);
   // (4) aggregate Y[i,f] = sum_j (m[i,j]*alpha[i,j]) * Z[j,f].
+  // Appendix E: neighbour-OUTER / feature-INNER makes each step a contiguous
+  // MulAdd over the OutFeat run instead of a scalar walk strided by OutFeat.
+  // Ascending-j accumulation order and the zero start are unchanged, and the
+  // alpha sparsity skip survives at the row level.
   for NodeIdx := 0 to numNodesMax do
   begin
     row := NodeIdx * FNumNodes;
     outRow := NodeIdx * OutFeat;
-    for FeatOut := 0 to outFeatMax do
+    OutPtr := FOutput.GetRawPtr(outRow);
+    FillChar(FOutput.FData[outRow], OutFeat * csNeuralFloatSize, 0);
+    aggPos := 0;                                // #6: NbrIdx * OutFeat
+    for NbrIdx := 0 to numNodesMax do
     begin
-      Acc := 0;
-      aggPos := FeatOut;                        // #8/#6: NbrIdx*OutFeat + FeatOut
-      for NbrIdx := 0 to numNodesMax do
-      begin
-        idx := row + NbrIdx;
-        alphaVal := FAlpha.FData[idx] * FAttDropMask.FData[idx];
-        if alphaVal <> 0.0 then
-          Acc := Acc + alphaVal * FAggIn.FData[aggPos];
-        Inc(aggPos, OutFeat);
-      end;
-      FOutput.FData[outRow + FeatOut] := Acc;
+      idx := row + NbrIdx;
+      alphaVal := FAlpha.FData[idx] * FAttDropMask.FData[idx];
+      if alphaVal <> 0.0 then
+        TNNetVolume.MulAdd(OutPtr, FAggIn.GetRawPtr(aggPos), alphaVal, OutFeat);
+      Inc(aggPos, OutFeat);
     end;
   end;
   FOutputRaw.Copy(FOutput);
@@ -89334,6 +89345,7 @@ var
   alphaVal, dZ, Scale, gP, gPRowSum, leak, dotg: TNeuralFloat;
   Neuron, AttNeuron: TNNetNeuron;
   PrevOut: TNNetVolume;
+  AggErrPtr: TNeuralFloatArrPtr;
   NNNeed, dstPos: integer;
 begin
   OutFeat := FOutput.Depth;
@@ -89352,23 +89364,27 @@ begin
     // (A) direct aggregation path into dL/dZ. The aggregation used the
     // dropout-scaled coefficients (m[i,j]*alpha[i,j]), so the same mask multiplies
     // here:  dL/dZ[j,f] += sum_i m[i,j]*alpha[i,j] * gY[i,f].
+    // Appendix E: node-INNER / feature-INNER-contiguous -- each i contributes a
+    // whole OutFeat run, so the OutFeat-strided scalar walk becomes one
+    // contiguous MulAdd, accumulating into FAggErr in the same ascending-i
+    // order.
+    aggPos := 0;                                   // j * OutFeat
     for NbrIdx := 0 to numNodesMax do            // j
-      for FeatOut := 0 to outFeatMax do
+    begin
+      AggErrPtr := FAggErr.GetRawPtr(aggPos);
+      alphaPos := NbrIdx;                          // i*FNumNodes + j, i = 0
+      errPos := 0;                                 // i * OutFeat
+      for NodeIdx := 0 to numNodesMax do         // i
       begin
-        dZ := 0;
-        alphaPos := NbrIdx;                       // i*FNumNodes + j, i = 0
-        errPos := FeatOut;                         // i*OutFeat + FeatOut, i = 0
-        for NodeIdx := 0 to numNodesMax do       // i
-        begin
-          alphaVal := FAlpha.FData[alphaPos] * FAttDropMask.FData[alphaPos];
-          if alphaVal <> 0.0 then
-            dZ := dZ + alphaVal * FOutputError.FData[errPos];
-          Inc(alphaPos, FNumNodes);
-          Inc(errPos, OutFeat);
-        end;
-        aggPos := NbrIdx * OutFeat + FeatOut;
-        FAggErr.FData[aggPos] := FAggErr.FData[aggPos] + dZ;
+        alphaVal := FAlpha.FData[alphaPos] * FAttDropMask.FData[alphaPos];
+        if alphaVal <> 0.0 then
+          TNNetVolume.MulAdd(AggErrPtr, FOutputError.GetRawPtr(errPos),
+            alphaVal, OutFeat);
+        Inc(alphaPos, FNumNodes);
+        Inc(errPos, OutFeat);
       end;
+      Inc(aggPos, OutFeat);
+    end;
     // gAlpha[i,j] = grad w.r.t. the PRE-dropout softmax output. The aggregation
     // multiplied alpha by the dropout mask m, so the per-edge gradient picks up
     // the SAME mask:  gAlpha[i,j] = m[i,j] * sum_f gY[i,f] * Z[j,f].
