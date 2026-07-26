@@ -10309,8 +10309,8 @@ type
     private
       FN: integer;              // reservoir size (units), = output Depth
       FInputDim: integer;       // resolved in SetPrevLayer (input Depth)
-      FWin: TNNetVolume;        // N x InputDim frozen input matrix (rows=units)
-      FW: TNNetVolume;          // N x N frozen recurrent matrix (rows=units)
+      FWin: TNNetVolume;        // N x InputDim frozen input matrix, ROW-MAJOR (row i = unit i, contiguous)
+      FW: TNNetVolume;          // N x N frozen recurrent matrix, ROW-MAJOR (row i = unit i, contiguous)
       FH: TNNetVolume;          // cached state h_t, (SeqLen,1,N)
       FPre: TNNetVolume;        // cached tanh(.) value at each step, (SeqLen,1,N)
       FMeasuredRho: TNeuralFloat; // measured spectral radius of raw W (info)
@@ -59311,7 +59311,7 @@ var
 var
   ProbeNN: TNNet;
   ProbeLayer: TNNetLayer;
-  FNM1, FInputDimM1, FNFNM1: integer;
+  FNM1, FInputDimM1, FNFNM1, WinRow, WRow, RowBytes: integer;
 begin
   inScale := FFloatSt[3];
   sparsity := FFloatSt[2];
@@ -59319,25 +59319,30 @@ begin
   RngState := longword(FStruct[2]);
 
   // Rows = reservoir units (one per output channel). FWin[i] = input weights of
-  // unit i; FW[i] = recurrent weights of unit i. Laid out as (SizeX=cols, 1,
-  // Depth=rows) so row i is the depth-slice at SizeX index... no: we use the
-  // simplest layout, FW stored as N rows of N (raw linear), indexed manually.
-  FWin.ReSize(FInputDim, 1, FN);   // [row i, col j] at GetRawPos(j,0,i)
-  FW.ReSize(FN, 1, FN);            // [row i, col j] at GetRawPos(j,0,i)
+  // unit i; FW[i] = recurrent weights of unit i. Every use walks a whole ROW, so
+  // both are stored ROW-MAJOR (SizeX = row i, Depth = col j): row i is the
+  // contiguous run at GetRawPos(i, 0), which makes the forward a dot product and
+  // the backward a scaled accumulate (App. E / #13).
+  FWin.ReSize(FN, 1, FInputDim);   // [row i, col j] at GetRawPos(i,0) + j
+  FW.ReSize(FN, 1, FN);            // [row i, col j] at GetRawPos(i,0) + j
 
   FNM1 := FN - 1;
   FInputDimM1 := FInputDim - 1;
   FNFNM1 := FN * FN - 1;
   for i := 0 to FNM1 do
   begin
+    // The LCG draw order (row i outer, col j inner) is unchanged, so the same
+    // draw still lands in the same logical cell.
+    WinRow := FWin.GetRawPos(i, 0);
+    WRow := FW.GetRawPos(i, 0);
     for j := 0 to FInputDimM1 do
-      FWin.FData[FWin.GetRawPos(j, 0, i)] := NextUnit() * inScale;
+      FWin.FData[WinRow + j] := NextUnit() * inScale;
     for j := 0 to FNM1 do
     begin
       if NextU01() < sparsity then
-        FW.FData[FW.GetRawPos(j, 0, i)] := NextUnit()
+        FW.FData[WRow + j] := NextUnit()
       else
-        FW.FData[FW.GetRawPos(j, 0, i)] := 0;
+        FW.FData[WRow + j] := 0;
     end;
   end;
 
@@ -59352,9 +59357,11 @@ begin
       TNNetFullConnectLinear.Create(FN)
     ]);
     ProbeLayer := ProbeNN.GetLastLayer();
+    // Row i is contiguous now, so each probe row is one Move (#13).
+    RowBytes := FN * csNeuralFloatSize;
     for i := 0 to FNM1 do
-      for j := 0 to FNM1 do
-        ProbeLayer.Neurons[i].Weights.FData[j] := FW.FData[FW.GetRawPos(j, 0, i)];
+      Move(FW.FData[FW.GetRawPos(i, 0)],
+        ProbeLayer.Neurons[i].Weights.FData[0], RowBytes);
     FMeasuredRho := TNNet.EstimateSpectralRadius(ProbeLayer, 200);
   finally
     ProbeNN.Free;
@@ -59389,11 +59396,12 @@ procedure TNNetEchoStateReservoir.Compute();
 var
   StartTime: double;
   Prev: TNNetVolume;
-  SeqLen, t, i, j: integer;
-  MaxT, MaxN, MaxIn: integer;
+  SeqLen, t, i: integer;
+  MaxT, MaxN: integer;
   leak, oneMinusLeak, preAct, tanhVal: TNeuralFloat;
   hPrevPos, hCurPos: integer;
-  winStride, wStride, winPos, wPos, prevBaseT, hPrevBaseT: integer;
+  prevBaseT, hPrevBaseT: integer;
+  xPtr, hPrevPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -59411,35 +59419,24 @@ begin
   oneMinusLeak := 1 - leak;
   MaxT := SeqLen - 1;
   MaxN := FN - 1;
-  MaxIn := FInputDim - 1;
-  // Row strides for the strength-reduced weight-column walks: FWin/FW are stored
-  // [row i, col j] at GetRawPos(j,0,i), so stepping j advances by one row (= FDepth).
-  winStride := FWin.GetRawPos(1, 0);
-  wStride   := FW.GetRawPos(1, 0);
+  hPrevPtr := nil;
   for t := 0 to MaxT do
   begin
     prevBaseT := Prev.GetRawPos(t, 0);            // Prev row t; +j indexes depth
-    if t > 0 then hPrevBaseT := FH.GetRawPos(t - 1, 0); // FH row t-1; +j indexes depth
+    xPtr := Prev.GetRawPtr(prevBaseT);            // #11: invariant across i
+    if t > 0 then
+    begin
+      hPrevBaseT := FH.GetRawPos(t - 1, 0);       // FH row t-1; +j indexes depth
+      hPrevPtr := FH.GetRawPtr(hPrevBaseT);       // #11: invariant across i
+    end;
     for i := 0 to MaxN do
     begin
-      // preAct = W_in[i] . x_t + W[i] . h_{t-1}
-      preAct := 0;
-      // FWin[j,0,i] steps by winStride as j advances; seed at j=0 -> column i.
-      winPos := FWin.GetRawPos(0, 0, i);
-      for j := 0 to MaxIn do
-      begin
-        preAct := preAct + FWin.FData[winPos] * Prev.FData[prevBaseT + j];
-        Inc(winPos, winStride);
-      end;
+      // preAct = W_in[i] . x_t + W[i] . h_{t-1}; both weight rows are contiguous,
+      // so both terms are dot products (#13).
+      preAct := TNNetVolume.DotProduct(FWin.GetRawPtr(i, 0), xPtr, FInputDim);
       if t > 0 then
-      begin
-        wPos := FW.GetRawPos(0, 0, i);
-        for j := 0 to MaxN do
-        begin
-          preAct := preAct + FW.FData[wPos] * FH.FData[hPrevBaseT + j];
-          Inc(wPos, wStride);
-        end;
-      end;
+        preAct := preAct +
+          TNNetVolume.DotProduct(FW.GetRawPtr(i, 0), hPrevPtr, FN);
       // (t = 0 uses h_{-1} = 0, so no recurrent term.)
       tanhVal := pcr_tanhf(preAct);
       // FPre, FH and FOutput all share (SeqLen,1,FN): one offset addresses all.
@@ -59462,9 +59459,9 @@ procedure TNNetEchoStateReservoir.Backpropagate();
 var
   StartTime: double;
   PrevErr: TNNetVolume;
-  SeqLen, t, i, j: integer;
-  MaxN, MaxIn, SeqLenM1, base, posPE: integer;
-  winStride, wStride, winPos, wPos, peBaseT: integer;
+  SeqLen, t, i: integer;
+  MaxN, SeqLenM1, base, peBaseT: integer;
+  peRowPtr: TNeuralFloatArrPtr;
   leak, oneMinusLeak, tanhVal, dTanh, dPre, gh: TNeuralFloat;
   hasInputGrad: boolean;
 begin
@@ -59483,7 +59480,6 @@ begin
   leak := FFloatSt[0];
   oneMinusLeak := 1 - leak;
   MaxN := FN - 1;
-  MaxIn := FInputDim - 1;
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
   PrevErr := nil;
@@ -59493,12 +59489,14 @@ begin
   if Length(FphPrevBuf) <> FN then SetLength(FphPrevBuf, FN);
   FillDWord(FphBuf[0], FN, 0);       // #13
 
-  // Row strides for the strength-reduced weight-column walks (see Compute).
-  winStride := FWin.GetRawPos(1, 0);
-  wStride   := FW.GetRawPos(1, 0);
+  peRowPtr := nil;
   for t := SeqLenM1 downto 0 do
   begin
-    if hasInputGrad then peBaseT := PrevErr.GetRawPos(t, 0); // PrevErr row t; +j depth
+    if hasInputGrad then
+    begin
+      peBaseT := PrevErr.GetRawPos(t, 0);   // PrevErr row t; +j depth
+      peRowPtr := PrevErr.GetRawPtr(peBaseT);
+    end;
     FillDWord(FphPrevBuf[0], FN, 0);       // #13
     // ph_t += incoming output-error at this timestep.
     for i := 0 to MaxN do
@@ -59516,31 +59514,15 @@ begin
       dPre := gh * leak * dTanh;             // dL/dpre_t for unit i
       // pre_t = sum_j W_in[i,j]*x_t[j] + sum_j W[i,j]*h_{t-1}[j]
       // -> dL/dx_t[j] += dPre * W_in[i,j]
+      // Both weight rows are contiguous, so both scatters are one scaled
+      // accumulate over the row (#13).
       if hasInputGrad then
-      begin
-        // FWin[j,0,i] steps by winStride as j advances; seed at j=0 -> column i.
-        winPos := FWin.GetRawPos(0, 0, i);
-        for j := 0 to MaxIn do
-        begin
-          // RMW of one PrevErr cell: carried peBaseT + j (depth j at row t).
-          posPE := peBaseT + j;
-          PrevErr.FData[posPE] := PrevErr.FData[posPE] +
-            dPre * FWin.FData[winPos];
-          Inc(winPos, winStride);
-        end;
-      end;
+        TNNetVolume.MulAdd(peRowPtr, FWin.GetRawPtr(i, 0), dPre, FInputDim);
       // -> dL/dh_{t-1}[j] += dPre * W[i,j]
       if t > 0 then
-      begin
-        wPos := FW.GetRawPos(0, 0, i);
-        for j := 0 to MaxN do
-        begin
-          FphPrevBuf[j] := FphPrevBuf[j] + dPre * FW.FData[wPos];
-          Inc(wPos, wStride);
-        end;
-      end;
+        TNNetVolume.MulAdd(@FphPrevBuf[0], FW.GetRawPtr(i, 0), dPre, FN);
     end;
-    for i := 0 to MaxN do FphBuf[i] := FphPrevBuf[i];
+    Move(FphPrevBuf[0], FphBuf[0], FN * csNeuralFloatSize);   // #13
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if hasInputGrad then FPrevLayer.Backpropagate();
