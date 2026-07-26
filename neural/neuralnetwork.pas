@@ -13057,6 +13057,10 @@ type
   /// where softmax(x)[d] = exp(out[d]).
   // Coded by Claude (AI).
   TNNetLogSoftMax = class(TNNetIdentity)
+    private
+      // Persistent, lazily-sized (grow-only) scratch holding exp(out) for one
+      // depth run in the backward (rule #17 -- never SetLength per call).
+      FExpBuf: array of TNeuralFloat;
     public
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -78557,7 +78561,8 @@ procedure TNNetComplexLinear.ComputeCPU();
 var
   oc, ic, oBase, base, i, j: integer;
   OutCM1, InCM1: integer;
-  acc: TNeuralFloat;
+  acc: array[0..1] of TNeuralFloat;
+  xj: TNeuralFloat;
   W, PrevOut, Bias: TNNetVolume;
 begin
   PrevOut := FPrevLayer.FOutput;
@@ -78568,21 +78573,26 @@ begin
   begin
     W := FArrNeurons[oc].FWeights;
     oBase := oc * 2;
-    for i := 0 to 1 do
+    // Both output components share the same weight row: block loop outermost,
+    // components accumulated in registers, so the row is traversed once instead
+    // of twice. Per component the additions still run in (ic, j) order.
+    for i := 0 to 1 do acc[i] := 0;
+    for ic := 0 to InCM1 do
     begin
-      acc := 0;
-      for ic := 0 to InCM1 do
+      base := ic * 2;                            // #9: one base for W and input
+      for j := 0 to 1 do
       begin
-        base := ic * 2;                          // #9: one base for W and input
-        for j := 0 to 1 do
-          acc := acc + CPX_SGN[i, j] * W.FData[base + CPX_SRC[i, j]]
-                       * PrevOut.FData[base + j];
+        xj := PrevOut.FData[base + j];
+        for i := 0 to 1 do
+          acc[i] := acc[i] + CPX_SGN[i, j] * W.FData[base + CPX_SRC[i, j]] * xj;
       end;
-      if FSuppressBias = 0 then
-        FOutput.FData[oBase + i] := acc + Bias.FData[oBase + i]
-      else
-        FOutput.FData[oBase + i] := acc;
     end;
+    if FSuppressBias = 0 then
+      for i := 0 to 1 do
+        FOutput.FData[oBase + i] := acc[i] + Bias.FData[oBase + i]
+    else
+      for i := 0 to 1 do
+        FOutput.FData[oBase + i] := acc[i];
   end;
 end;
 
@@ -78855,7 +78865,8 @@ procedure TNNetOctonionLinear.ComputeCPU();
 var
   oo, io, oBase, base, i, j: integer;
   OutOM1, InOM1: integer;
-  acc: TNeuralFloat;
+  acc: array[0..7] of TNeuralFloat;
+  xj: TNeuralFloat;
   W, PrevOut, Bias: TNNetVolume;
 begin
   PrevOut := FPrevLayer.FOutput;
@@ -78866,21 +78877,28 @@ begin
   begin
     W := FArrNeurons[oo].FWeights;
     oBase := oo * 8;
-    for i := 0 to 7 do
+    // The eight output components share the same weight row, so the BLOCK loop
+    // is outermost and the components accumulate in registers -- one traversal
+    // of the InOctonions*8 row instead of eight, like TNNetQuaternionLinear and
+    // the *Conv siblings. For a fixed component the additions still run in
+    // (io, j) order, so the sums are unchanged.
+    for i := 0 to 7 do acc[i] := 0;
+    for io := 0 to InOM1 do
     begin
-      acc := 0;
-      for io := 0 to InOM1 do
+      base := io * 8;                            // #9: one base for W and input
+      for j := 0 to 7 do
       begin
-        base := io * 8;                          // #9: one base for W and input
-        for j := 0 to 7 do
-          acc := acc + OCT_SGN[i, j] * W.FData[base + OCT_SRC[i, j]]
-                       * PrevOut.FData[base + j];
+        xj := PrevOut.FData[base + j];
+        for i := 0 to 7 do
+          acc[i] := acc[i] + OCT_SGN[i, j] * W.FData[base + OCT_SRC[i, j]] * xj;
       end;
-      if FSuppressBias = 0 then
-        FOutput.FData[oBase + i] := acc + Bias.FData[oBase + i]
-      else
-        FOutput.FData[oBase + i] := acc;
     end;
+    if FSuppressBias = 0 then
+      for i := 0 to 7 do
+        FOutput.FData[oBase + i] := acc[i] + Bias.FData[oBase + i]
+    else
+      for i := 0 to 7 do
+        FOutput.FData[oBase + i] := acc[i];
   end;
 end;
 
@@ -95541,9 +95559,10 @@ end;
 procedure TNNetLogSoftMax.Backpropagate;
 var
   StartTime: double;
-  CntX, CntY, CntD, MaxX, MaxY, MaxD, StartPos, idx: integer;
-  SumDy, Yi: TNeuralFloat;
+  CntX, CntY, CntD, MaxX, MaxY, MaxD, StartPos, Depth: integer;
+  SumDy: TNeuralFloat;
   PrevErr: TNNetVolume;
+  ExpPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
@@ -95560,6 +95579,10 @@ begin
     MaxY := FOutput.SizeY - 1;
     MaxD := FOutput.Depth - 1;
     PrevErr := FPrevLayer.OutputError;  // #9
+    Depth := MaxD + 1;
+    // Grow-only lazy resize of the persistent scratch (rule #17).
+    if Length(FExpBuf) < Depth then SetLength(FExpBuf, Depth);
+    ExpPtr := TNeuralFloatArrPtr(@FExpBuf[0]);
     for CntX := 0 to MaxX do
     begin
       for CntY := 0 to MaxY do
@@ -95568,13 +95591,14 @@ begin
         SumDy := 0;
         for CntD := 0 to MaxD do
           SumDy := SumDy + FOutputError.FData[StartPos + CntD];
-        for CntD := 0 to MaxD do
-        begin
-          idx := StartPos + CntD;  // #4
-          Yi := NeuralExp(FOutput.FData[idx]);
-          PrevErr.FData[idx] := PrevErr.FData[idx] +
-            FOutputError.FData[idx] - Yi * SumDy;
-        end;
+        // #19: the depth run is contiguous and takes the same exp for every
+        // element, so it goes through the vector kernel instead of a scalar
+        // NeuralExp per element; the two accumulates that follow are #13
+        // primitives.
+        TNNetVolume.VectorExp(ExpPtr, FOutput.GetRawPtr(StartPos), Depth);
+        TNNetVolume.Add(PrevErr.GetRawPtr(StartPos),
+          FOutputError.GetRawPtr(StartPos), Depth);
+        TNNetVolume.MulAdd(PrevErr.GetRawPtr(StartPos), ExpPtr, -SumDy, Depth);
       end;
     end;
   end;
