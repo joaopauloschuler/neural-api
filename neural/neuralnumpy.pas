@@ -342,8 +342,11 @@ end;
 // ---------------------------------------------------------------------------
 // raw-bytes -> volume decode (shared by .npy and .npz)
 // ---------------------------------------------------------------------------
+// Decodes NumElements elements of dtype DType from Raw into
+// Dest.FData[DestOfs .. DestOfs+NumElements-1] (Dest pre-sized by the
+// caller). DestOfs lets a caller feed the destination in chunks.
 procedure DecodeRawToVolume(const Raw: TBytes; NumElements: Int64;
-  const DType: string; Dest: TNNetVolume);
+  const DType: string; Dest: TNNetVolume; DestOfs: Int64 = 0);
 var
   i: Int64;
   pf8: PDouble;
@@ -355,61 +358,63 @@ var
   pi8: PInt64;
   pu4: PCardinal;
   NumElementsM1: Int64;
+  Dst: PSingle;
 begin
+  Dst := PSingle(@Dest.FData[DestOfs]);
   // Dest is expected pre-sized to NumElements by the caller.
   NumElementsM1 := NumElements - 1;
   if DType = 'f4' then
   begin
     // LE host: numpy little-endian f4 bytes are identical to native Single,
     // so a single contiguous copy replaces the per-element pointer walk.
-    Move(Raw[0], Dest.FData[0], NumElements * csNeuralFloatSize);
+    Move(Raw[0], Dst^, NumElements * csNeuralFloatSize);
   end
   else if DType = 'f8' then
   begin
     pf8 := PDouble(@Raw[0]);
-    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pf8^; Inc(pf8); end;
+    for i := 0 to NumElementsM1 do begin Dst[i] := pf8^; Inc(pf8); end;
   end
   else if DType = 'f2' then
   begin
     pu16 := PWord(@Raw[0]);
     for i := 0 to NumElementsM1 do
-      begin Dest.FData[i] := DecodeF16(pu16^); Inc(pu16); end;
+      begin Dst[i] := DecodeF16(pu16^); Inc(pu16); end;
   end
   else if DType = 'i1' then
   begin
     pi1 := PShortInt(@Raw[0]);
-    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pi1^; Inc(pi1); end;
+    for i := 0 to NumElementsM1 do begin Dst[i] := pi1^; Inc(pi1); end;
   end
   else if (DType = 'u1') or (DType = 'b1') then
   begin
     pu1 := PByte(@Raw[0]);
-    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pu1^; Inc(pu1); end;
+    for i := 0 to NumElementsM1 do begin Dst[i] := pu1^; Inc(pu1); end;
   end
   else if DType = 'i2' then
   begin
     pi2 := PSmallInt(@Raw[0]);
-    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pi2^; Inc(pi2); end;
+    for i := 0 to NumElementsM1 do begin Dst[i] := pi2^; Inc(pi2); end;
   end
   else if DType = 'u2' then
   begin
     pu16 := PWord(@Raw[0]);
-    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pu16^; Inc(pu16); end;
+    for i := 0 to NumElementsM1 do begin Dst[i] := pu16^; Inc(pu16); end;
   end
   else if DType = 'i4' then
   begin
     pi4 := PLongInt(@Raw[0]);
-    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pi4^; Inc(pi4); end;
+    for i := 0 to NumElementsM1 do begin Dst[i] := pi4^; Inc(pi4); end;
   end
   else if DType = 'u4' then
   begin
     // LE host: walk the raw u32s directly (drops the per-element i*4 offset).
     pu4 := PCardinal(@Raw[0]);
-    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pu4^; Inc(pu4); end;
+    for i := 0 to NumElementsM1 do begin Dst[i] := pu4^; Inc(pu4); end;
   end
   else if (DType = 'i8') or (DType = 'u8') then
   begin
     pi8 := PInt64(@Raw[0]);
-    for i := 0 to NumElementsM1 do begin Dest.FData[i] := pi8^; Inc(pi8); end;
+    for i := 0 to NumElementsM1 do begin Dst[i] := pi8^; Inc(pi8); end;
   end
   else
     raise ENumpyError.CreateFmt('numpy: unsupported dtype "%s"', [DType]);
@@ -448,6 +453,7 @@ var
   ElemSize: integer;
   Raw: TBytes;
   HeaderLenM1, ShapeHi: integer;
+  ElemsPerChunk, Done, ThisElems, ChunkBytes: Int64;
 begin
   if Stream.Read(Magic, 6) <> 6 then
     raise ENumpyError.Create('numpy: stream too short for magic');
@@ -499,18 +505,29 @@ begin
       [NumElements]);
 
   ElemSize := DTypeSize(OutDType);
-  SetLength(Raw, NumElements * ElemSize);
-  if NumElements > 0 then
-    if Stream.Read(Raw[0], Length(Raw)) <> Length(Raw) then
-      raise ENumpyError.Create('numpy: truncated data section');
-
   ApplyShapeToVolume(Dest, Shape, NumElements);
   if Dest.Size <> NumElements then
     raise ENumpyError.CreateFmt(
       'numpy: internal shape/volume mismatch (%d vs %d)',
       [NumElements, Dest.Size]);
-  if NumElements > 0 then
-    DecodeRawToVolume(Raw, NumElements, OutDType, Dest);
+  // Stage the raw data through a fixed few-MB chunk instead of a full
+  // second copy of the array: the destination is already allocated, so a
+  // whole-array Raw would double the peak footprint of every load.
+  ElemsPerChunk := NeuralLoaderStageBytes div ElemSize;
+  if ElemsPerChunk < 1 then ElemsPerChunk := 1;
+  if ElemsPerChunk > NumElements then ElemsPerChunk := NumElements;
+  SetLength(Raw, ElemsPerChunk * ElemSize);
+  Done := 0;
+  while Done < NumElements do
+  begin
+    ThisElems := NumElements - Done;
+    if ThisElems > ElemsPerChunk then ThisElems := ElemsPerChunk;
+    ChunkBytes := ThisElems * ElemSize;
+    if Stream.Read(Raw[0], ChunkBytes) <> ChunkBytes then
+      raise ENumpyError.Create('numpy: truncated data section');
+    DecodeRawToVolume(Raw, ThisElems, OutDType, Dest, Done);
+    Inc(Done, ThisElems);
+  end;
 end;
 
 function LoadVolumeFromNpy(const pFileName: string): TNNetVolume;

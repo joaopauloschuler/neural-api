@@ -90,6 +90,15 @@ type
     // pattern. Coded by Claude (AI).
     procedure DecodeHalfBuffer(Src: PWord; Dst: PSingle; Count: integer;
       IsBF16: boolean);
+    // Reads ElemCount elements of dtype DType starting at absolute byte
+    // position FilePos of shard ShardIdx into Dest.FData[0..ElemCount-1].
+    // F32 lands STRAIGHT in the destination (TNeuralFloat = single, both
+    // little-endian) and F16/BF16/I64 decode through a fixed few-MB staging
+    // buffer, so peak memory is the destination plus that chunk instead of
+    // the destination plus a full second copy of the on-disk tensor.
+    // Coded by Claude (AI).
+    procedure ReadElementsInto(ShardIdx: integer; FilePos: Int64;
+      const DType: string; ElemCount: integer; Dest: TNNetVolume);
   private
     // Opens one .safetensors file, validates and parses its header and
     // appends its tensors (tagged with the new shard index) to FTensors.
@@ -267,6 +276,18 @@ procedure SaveNNetToSafeTensorsEx(NN: TNNet; const pFileName: string;
 // layer. Refreshes each touched layer's derived weight caches and clears
 // inertia/deltas, so the net is immediately ready for inference/training.
 procedure LoadNNetFromSafeTensors(NN: TNNet; const pFileName: string);
+
+var
+  // Size in bytes of the staging chunk every checkpoint reader here (and in
+  // neuralgguf / neuralnumpy) decodes through. The destination volume is
+  // already allocated when a tensor is read, so a whole-tensor staging copy
+  // would double the peak footprint of a load - a multi-GB spike on the
+  // largest embedding matrices. Chunked, the extra cost is this constant.
+  // 8 MB keeps the reads long and stays well past the 256K-element crossover
+  // where the parallel F16/BF16 decode starts paying. Writable so tests can
+  // shrink it and exercise the chunk-boundary paths on small fixtures.
+  // Coded by Claude (AI).
+  NeuralLoaderStageBytes: integer = 8 * 1024 * 1024;
 
 implementation
 
@@ -893,13 +914,73 @@ begin
   end;
 end;
 
+procedure TNNetSafeTensorsReader.ReadElementsInto(ShardIdx: integer;
+  FilePos: Int64; const DType: string; ElemCount: integer;
+  Dest: TNNetVolume);
+var
+  Stage: TBytes;
+  Stream: TFileStream;
+  DSize, ElemsPerChunk, Done, ThisElems, i: integer;
+  IsHalf, IsBF16: boolean;
+  Int64Ptr: PInt64;
+  DstPtr: PSingle;
+begin
+  if ElemCount <= 0 then exit;
+  DSize := DTypeByteSize(DType);
+  Stream := FStreams[ShardIdx];
+  Stream.Position := FilePos;
+  if DType = 'F32' then
+  begin
+    // TNeuralFloat = single, so the stored bytes ARE the destination format
+    // (both little-endian, like every existing decode path assumes). Read
+    // straight into Dest: no staging copy exists at all on this path.
+    ElemsPerChunk := NeuralLoaderStageBytes div csNeuralFloatSize;
+    if ElemsPerChunk < 1 then ElemsPerChunk := 1;
+    Done := 0;
+    while Done < ElemCount do
+    begin
+      ThisElems := ElemCount - Done;
+      if ThisElems > ElemsPerChunk then ThisElems := ElemsPerChunk;
+      Stream.ReadBuffer(Dest.FData[Done], ThisElems * csNeuralFloatSize);
+      Inc(Done, ThisElems);
+    end;
+    exit;
+  end;
+  IsHalf := (DType = 'F16') or (DType = 'BF16');
+  IsBF16 := DType = 'BF16';
+  ElemsPerChunk := NeuralLoaderStageBytes div DSize;
+  if ElemsPerChunk < 1 then ElemsPerChunk := 1;
+  if ElemsPerChunk > ElemCount then ElemsPerChunk := ElemCount;
+  SetLength(Stage, ElemsPerChunk * DSize);
+  Done := 0;
+  while Done < ElemCount do
+  begin
+    ThisElems := ElemCount - Done;
+    if ThisElems > ElemsPerChunk then ThisElems := ElemsPerChunk;
+    Stream.ReadBuffer(Stage[0], ThisElems * DSize);
+    if IsHalf then
+      DecodeHalfBuffer(PWord(@Stage[0]), PSingle(@Dest.FData[Done]),
+        ThisElems, IsBF16)
+    else // I64
+    begin
+      Int64Ptr := PInt64(@Stage[0]);
+      DstPtr := PSingle(@Dest.FData[Done]);
+      for i := 1 to ThisElems do
+      begin
+        DstPtr^ := Int64Ptr^;
+        Inc(Int64Ptr);
+        Inc(DstPtr);
+      end;
+    end;
+    Inc(Done, ThisElems);
+  end;
+end;
+
 procedure TNNetSafeTensorsReader.LoadTensorFlat(const pName: string;
   Dest: TNNetVolume);
 var
   Info: TSafeTensorInfo;
-  NumElements, i, MaxIdx: Int64;
-  RawBytes: TBytes;
-  Int64Ptr: PInt64;
+  NumElements: Int64;
 begin
   Info := GetInfo(pName);
   NumElements := ElementCount(pName);
@@ -913,26 +994,9 @@ begin
       [pName, NumElements, FFileName]);
   Dest.ReSize(integer(NumElements), 1, 1);
   if NumElements = 0 then exit;
-  MaxIdx := NumElements - 1;
-  SetLength(RawBytes, Info.DataEnd - Info.DataBegin);
-  FStreams[Info.Shard].Position := FDataStarts[Info.Shard] + Info.DataBegin;
-  FStreams[Info.Shard].ReadBuffer(RawBytes[0], Length(RawBytes));
-  if Info.DType = 'F32' then
-    // TNeuralFloat = single, so the stored bytes ARE the destination format
-    // (both little-endian, like every existing decode path assumes).
-    Move(RawBytes[0], Dest.FData[0], NumElements * csNeuralFloatSize)
-  else if (Info.DType = 'F16') or (Info.DType = 'BF16') then
-    DecodeHalfBuffer(PWord(@RawBytes[0]), PSingle(@Dest.FData[0]),
-      integer(NumElements), Info.DType = 'BF16')
-  else // I64
-  begin
-    Int64Ptr := PInt64(@RawBytes[0]);
-    for i := 0 to MaxIdx do
-    begin
-      Dest.FData[i] := Int64Ptr^;
-      Inc(Int64Ptr);
-    end;
-  end;
+  ReadElementsInto(Info.Shard,
+    FDataStarts[Info.Shard] + Info.DataBegin, Info.DType,
+    integer(NumElements), Dest);
 end;
 
 function TNNetSafeTensorsReader.CanStreamTensorRows(
@@ -950,7 +1014,6 @@ var
   Info: TSafeTensorInfo;
   NumElements, ElemBegin, ElemCount: Int64;
   DSize: integer;
-  RawBytes: TBytes;
 begin
   Info := GetInfo(pName);
   if (Info.DType <> 'F32') and (Info.DType <> 'F16') and
@@ -973,16 +1036,9 @@ begin
   ElemBegin := Int64(FirstRow) * RowSize;
   DSize := DTypeByteSize(Info.DType);
   Dest.ReSize(integer(ElemCount), 1, 1);
-  SetLength(RawBytes, ElemCount * DSize);
-  FStreams[Info.Shard].Position := FDataStarts[Info.Shard] +
-    Info.DataBegin + ElemBegin * DSize;
-  FStreams[Info.Shard].ReadBuffer(RawBytes[0], Length(RawBytes));
-  if Info.DType = 'F32' then
-    // TNeuralFloat = single: raw bytes are already the destination format.
-    Move(RawBytes[0], Dest.FData[0], ElemCount * csNeuralFloatSize)
-  else // F16 / BF16 (dtype-checked above)
-    DecodeHalfBuffer(PWord(@RawBytes[0]), PSingle(@Dest.FData[0]),
-      integer(ElemCount), Info.DType = 'BF16');
+  ReadElementsInto(Info.Shard,
+    FDataStarts[Info.Shard] + Info.DataBegin + ElemBegin * DSize,
+    Info.DType, integer(ElemCount), Dest);
 end;
 
 procedure TNNetSafeTensorsReader.LoadTensorRawBytes(const pName: string;

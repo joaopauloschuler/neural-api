@@ -178,6 +178,14 @@ type
     procedure ReadMetaValue(Stream: TFileStream; var Meta: TGGUFMetaValue);
     function FindMeta(const pKey: string): integer;
     function DeinterleaveHeadDimFor(const pName: string): integer;
+    // Reads ElemCount elements of ggml dtype GGMLType, starting at absolute
+    // byte position FilePos, into Dest.FData[DestOfs ...]. F32 lands
+    // straight in the destination; every other dtype decodes through a
+    // fixed few-MB block-aligned staging chunk, so a load never doubles the
+    // tensor's footprint. FilePos must be a block boundary and ElemCount a
+    // whole number of blocks. Coded by Claude (AI).
+    procedure ReadGGMLSpanInto(GGMLType: integer; FilePos, ElemCount: Int64;
+      Dest: TNNetVolume; DestOfs: Int64);
   public
     constructor Create(const pFileName: string);
 
@@ -391,6 +399,41 @@ begin
       Result := (NumElements div GGUF_QK_LEGACY) * GGUF_Q5_1_BLOCK_BYTES;
     else Result := 0;
   end;
+end;
+
+// Number of elements one stored block of the given ggml dtype covers (1 for
+// the raw scalar dtypes). A span that starts on a block boundary and spans a
+// whole multiple of this is independently decodable, which is what lets the
+// loaders read a tensor in bounded chunks instead of whole.
+// Coded by Claude (AI).
+function GGMLBlockElems(TypeId: integer): integer;
+begin
+  case TypeId of
+    GGML_TYPE_F32, GGML_TYPE_F16: Result := 1;
+    GGML_TYPE_Q8_0: Result := GGUF_Q8_0_BLOCK_ELEMS;
+    GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
+    GGML_TYPE_Q6_K: Result := GGUF_QK_K;
+    GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0,
+    GGML_TYPE_Q5_1: Result := GGUF_QK_LEGACY;
+    else Result := 0;
+  end;
+end;
+
+// llama.cpp stores q/k projection rows in a per-head INTERLEAVED rotary
+// order; HF's rotate_half layout wants hf_row[p] = stored[2p] and
+// hf_row[p + HeadDim/2] = stored[2p+1]. Returns the STORED row that HF row
+// HFRow comes from - the single definition of that permutation, shared by
+// the whole-tensor and the row-streaming loaders. Coded by Claude (AI).
+function GGUFDeinterleavedSrcRow(HFRow: Int64; HeadDim: integer): Int64;
+var
+  RowInHead, HalfDim: Int64;
+begin
+  HalfDim := HeadDim shr 1;
+  RowInHead := HFRow mod HeadDim;
+  if RowInHead < HalfDim then
+    Result := (HFRow - RowInHead) + 2 * RowInHead
+  else
+    Result := (HFRow - RowInHead) + 2 * (RowInHead - HalfDim) + 1;
 end;
 
 // Unpacks the 12 packed bytes of a Q4_K super-block into the 8 6-bit
@@ -1472,6 +1515,52 @@ begin
   end;
 end;
 
+procedure TNNetGGUFReader.ReadGGMLSpanInto(GGMLType: integer;
+  FilePos, ElemCount: Int64; Dest: TNNetVolume; DestOfs: Int64);
+var
+  Stage: TBytes;
+  Stream: TFileStream;
+  BlockElems: integer;
+  BlockBytes, ElemsPerChunk, Done, ThisElems: Int64;
+begin
+  if ElemCount <= 0 then exit;
+  Stream := FStreams[0];
+  Stream.Position := FilePos;
+  if GGMLType = GGML_TYPE_F32 then
+  begin
+    // Native singles (TNeuralFloat = single, both little-endian): read
+    // straight into the destination - no staging copy exists at all.
+    ElemsPerChunk := NeuralLoaderStageBytes div csNeuralFloatSize;
+    if ElemsPerChunk < 1 then ElemsPerChunk := 1;
+    Done := 0;
+    while Done < ElemCount do
+    begin
+      ThisElems := ElemCount - Done;
+      if ThisElems > ElemsPerChunk then ThisElems := ElemsPerChunk;
+      Stream.ReadBuffer(Dest.FData[DestOfs + Done],
+        ThisElems * csNeuralFloatSize);
+      Inc(Done, ThisElems);
+    end;
+    exit;
+  end;
+  BlockElems := GGMLBlockElems(GGMLType);
+  BlockBytes := GGMLByteSize(GGMLType, BlockElems);
+  ElemsPerChunk := (NeuralLoaderStageBytes div BlockBytes) * BlockElems;
+  if ElemsPerChunk < BlockElems then ElemsPerChunk := BlockElems;
+  if ElemsPerChunk > ElemCount then ElemsPerChunk := ElemCount;
+  SetLength(Stage, GGMLByteSize(GGMLType, ElemsPerChunk));
+  Done := 0;
+  while Done < ElemCount do
+  begin
+    ThisElems := ElemCount - Done;
+    if ThisElems > ElemsPerChunk then ThisElems := ElemsPerChunk;
+    Stream.ReadBuffer(Stage[0], GGMLByteSize(GGMLType, ThisElems));
+    DecodeGGMLSpan(GGMLType, PByte(@Stage[0]), ThisElems,
+      PSingle(@Dest.FData[DestOfs + Done]));
+    Inc(Done, ThisElems);
+  end;
+end;
+
 function TNNetGGUFReader.CanStreamTensorRows(const pName: string): boolean;
 var
   Idx: integer;
@@ -1492,9 +1581,9 @@ end;
 procedure TNNetGGUFReader.LoadTensorRowsFlat(const pName: string;
   FirstRow, RowCount, RowSize: integer; Dest: TNNetVolume);
 var
-  Idx, GGMLType, HeadDim, HalfDim: integer;
+  Idx, GGMLType, HeadDim: integer;
   NumElements, ElemCount, InnerDim, RowBytes: Int64;
-  dr, r, RowInHead, SrcRow, RowCountM1, TensorBase, DstOfs: Int64;
+  dr, r, SrcRow, RowCountM1, TensorBase, DstOfs: Int64;
   RawBytes: TBytes;
 begin
   Idx := FindTensor(pName);
@@ -1547,13 +1636,10 @@ begin
   RowCountM1 := RowCount - 1;
   if HeadDim = 0 then
   begin
-    // Contiguous stored rows: one ranged read, one decode sweep.
-    SetLength(RawBytes, Int64(RowCount) * RowBytes);
-    FStreams[0].Position := FDataStarts[0] + FTensors[Idx].DataBegin +
-      Int64(FirstRow) * RowBytes;
-    FStreams[0].ReadBuffer(RawBytes[0], Length(RawBytes));
-    DecodeGGMLSpan(GGMLType, PByte(@RawBytes[0]), ElemCount,
-      PSingle(@Dest.FData[0]));
+    // Contiguous stored rows: one sequential ranged read, decoded in
+    // bounded chunks straight into the destination.
+    ReadGGMLSpanInto(GGMLType, FDataStarts[0] + FTensors[Idx].DataBegin +
+      Int64(FirstRow) * RowBytes, ElemCount, Dest, 0);
   end
   else
   begin
@@ -1562,18 +1648,13 @@ begin
     // (hf_row[p] = stored[2p], hf_row[p + HeadDim/2] = stored[2p+1]) -
     // the same mapping LoadTensorFlat applies, here used to LOCATE each
     // row instead of shuffling a full-tensor copy.
-    HalfDim := HeadDim shr 1;
     SetLength(RawBytes, RowBytes);
     TensorBase := FDataStarts[0] + FTensors[Idx].DataBegin;
     DstOfs := 0;
     for dr := 0 to RowCountM1 do
     begin
       r := Int64(FirstRow) + dr;
-      RowInHead := r mod HeadDim;
-      if RowInHead < HalfDim then
-        SrcRow := (r - RowInHead) + 2 * RowInHead
-      else
-        SrcRow := (r - RowInHead) + 2 * (RowInHead - HalfDim) + 1;
+      SrcRow := GGUFDeinterleavedSrcRow(r, HeadDim);
       FStreams[0].Position := TensorBase + SrcRow * RowBytes;
       FStreams[0].ReadBuffer(RawBytes[0], Length(RawBytes));
       DecodeGGMLSpan(GGMLType, PByte(@RawBytes[0]), RowSize,
@@ -1586,14 +1667,9 @@ end;
 procedure TNNetGGUFReader.LoadTensorFlat(const pName: string;
   Dest: TNNetVolume);
 var
-  Idx, GGMLType, HeadDim, HalfDim: integer;
-  NumElements, i, BlockCnt, NumBlocks: Int64;
-  Rows, RowLen, r, RowInHead, SrcRow, RowBytes, rRowLen: Int64;
-  NumElementsM1, NumBlocksM1, Q8ElemsM1, RowsM1, RowLenM1: Int64;
-  BlockOfs, OutBase: Int64;
-  RawBytes: TBytes;
-  Scale: single;
-  QuantPtr: PShortInt;
+  Idx, GGMLType, HeadDim: integer;
+  NumElements: Int64;
+  Rows, RowLen, r, SrcRow, RowBytes, rRowLen, RowsM1: Int64;
   Tmp: array of TNeuralFloat;
 begin
   Idx := FindTensor(pName);
@@ -1601,13 +1677,7 @@ begin
     raise EGGUFError.CreateFmt(
       'gguf: tensor "%s" not found in %s', [pName, FFileName]);
   GGMLType := FGGMLTypes[Idx];
-  if (GGMLType <> GGML_TYPE_F32) and (GGMLType <> GGML_TYPE_F16) and
-     (GGMLType <> GGML_TYPE_Q8_0) and (GGMLType <> GGML_TYPE_Q2_K) and
-     (GGMLType <> GGML_TYPE_Q3_K) and
-     (GGMLType <> GGML_TYPE_Q4_K) and (GGMLType <> GGML_TYPE_Q5_K) and
-     (GGMLType <> GGML_TYPE_Q6_K) and (GGMLType <> GGML_TYPE_Q4_0) and
-     (GGMLType <> GGML_TYPE_Q4_1) and (GGMLType <> GGML_TYPE_Q5_0) and
-     (GGMLType <> GGML_TYPE_Q5_1) then
+  if not GGMLRowStreamable(GGMLType) then
     raise EGGUFError.CreateFmt(
       'gguf: tensor "%s" has unsupported ggml dtype %s (supported: F32, ' +
       'F16, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q4_0, Q4_1, Q5_0, Q5_1): %s',
@@ -1617,108 +1687,31 @@ begin
     raise EGGUFError.CreateFmt(
       'gguf: tensor "%s" is too large (%d elements): %s',
       [pName, NumElements, FFileName]);
+  // Registered q/k projections: undo llama.cpp's per-head interleaved-rotary
+  // row permutation so the served rows are in HF rotate_half order.
+  HeadDim := DeinterleaveHeadDimFor(pName);
+  if (NumElements > 0) and (HeadDim > 0) and
+     (Length(FTensors[Idx].Shape) = 2) then
+  begin
+    // The 2-D form is exactly what LoadTensorRowsFlat serves: it applies the
+    // permutation while LOCATING each row, so the whole tensor arrives in HF
+    // order with no second full copy and no post-hoc shuffle.
+    Rows := FTensors[Idx].Shape[0];
+    LoadTensorRowsFlat(pName, 0, integer(Rows),
+      integer(NumElements div Rows), Dest);
+    exit;
+  end;
   Dest.ReSize(integer(NumElements), 1, 1);
   if NumElements = 0 then exit;
-  NumElementsM1 := NumElements - 1;
-  Q8ElemsM1 := GGUF_Q8_0_BLOCK_ELEMS - 1;
-  SetLength(RawBytes, FTensors[Idx].DataEnd - FTensors[Idx].DataBegin);
-  FStreams[0].Position := FDataStarts[0] + FTensors[Idx].DataBegin;
-  FStreams[0].ReadBuffer(RawBytes[0], Length(RawBytes));
-  case GGMLType of
-    GGML_TYPE_F32:
-      // Native singles: a bit-exact contiguous copy (TNeuralFloat = single).
-      Move(RawBytes[0], Dest.FData[0], NumElements * csNeuralFloatSize);
-    GGML_TYPE_F16:
-      // Parallel half->single decode (bit-identical to the serial sweep).
-      DecodeHalfBuffer(PWord(@RawBytes[0]), PSingle(@Dest.FData[0]),
-        integer(NumElements), false);
-    GGML_TYPE_Q8_0:
-    begin
-      // Blocks of 32 elements along the contiguous axis: f16 scale d,
-      // then 32 int8 quants; x = d * q. The contiguous dimension is a
-      // multiple of 32 (validated at parse), so blocks never straddle
-      // rows and a sequential sweep decodes the flat row-major order.
-      NumBlocks := NumElements div GGUF_Q8_0_BLOCK_ELEMS;
-      NumBlocksM1 := NumBlocks - 1;
-      BlockOfs := 0;
-      OutBase := 0;
-      for BlockCnt := 0 to NumBlocksM1 do
-      begin
-        Scale := DecodeF16(PWord(@RawBytes[BlockOfs])^);
-        QuantPtr := PShortInt(@RawBytes[BlockOfs + 2]);
-        for i := 0 to Q8ElemsM1 do
-        begin
-          Dest.FData[OutBase + i] := Scale * QuantPtr^;
-          Inc(QuantPtr);
-        end;
-        Inc(BlockOfs, GGUF_Q8_0_BLOCK_BYTES);
-        Inc(OutBase, GGUF_Q8_0_BLOCK_ELEMS);
-      end;
-    end;
-    GGML_TYPE_Q4_K:
-    begin
-      // k-quant super-blocks of 256 along the contiguous axis (a multiple
-      // of 256, validated at parse), so a sequential sweep decodes the
-      // flat row-major order. Each block: f16 d, f16 d_min, 12 packed
-      // 6-bit sub-scales/sub-mins, 128 bytes of 4-bit quants.
-      NumBlocks := NumElements div GGUF_QK_K;
-      DequantizeQ4K(PByte(@RawBytes[0]), NumBlocks, PSingle(@Dest.FData[0]));
-    end;
-    GGML_TYPE_Q5_K:
-    begin
-      // Like Q4_K plus a 32-byte 5th-bit plane: 176-byte super-blocks.
-      NumBlocks := NumElements div GGUF_QK_K;
-      DequantizeQ5K(PByte(@RawBytes[0]), NumBlocks, PSingle(@Dest.FData[0]));
-    end;
-    GGML_TYPE_Q2_K:
-    begin
-      // 2-bit quants with 4-bit packed sub-scales/sub-mins: 84-byte blocks.
-      NumBlocks := NumElements div GGUF_QK_K;
-      DequantizeQ2K(PByte(@RawBytes[0]), NumBlocks, PSingle(@Dest.FData[0]));
-    end;
-    GGML_TYPE_Q6_K:
-    begin
-      NumBlocks := NumElements div GGUF_QK_K;
-      DequantizeQ6K(PByte(@RawBytes[0]), NumBlocks, PSingle(@Dest.FData[0]));
-    end;
-    GGML_TYPE_Q3_K:
-    begin
-      // 2-bit low quants + a 3rd bit-plane (hmask) and 6-bit packed scales:
-      // 110-byte super-blocks of 256, 16 sub-blocks of 16.
-      NumBlocks := NumElements div GGUF_QK_K;
-      DequantizeQ3K(PByte(@RawBytes[0]), NumBlocks, PSingle(@Dest.FData[0]));
-    end;
-    GGML_TYPE_Q4_0:
-    begin
-      // Legacy round-to-nearest 32-element blocks: f16 d + 32 nibbles.
-      NumBlocks := NumElements div GGUF_QK_LEGACY;
-      DequantizeQ4_0(PByte(@RawBytes[0]), NumBlocks, PSingle(@Dest.FData[0]));
-    end;
-    GGML_TYPE_Q4_1:
-    begin
-      NumBlocks := NumElements div GGUF_QK_LEGACY;
-      DequantizeQ4_1(PByte(@RawBytes[0]), NumBlocks, PSingle(@Dest.FData[0]));
-    end;
-    GGML_TYPE_Q5_0:
-    begin
-      NumBlocks := NumElements div GGUF_QK_LEGACY;
-      DequantizeQ5_0(PByte(@RawBytes[0]), NumBlocks, PSingle(@Dest.FData[0]));
-    end;
-    GGML_TYPE_Q5_1:
-    begin
-      NumBlocks := NumElements div GGUF_QK_LEGACY;
-      DequantizeQ5_1(PByte(@RawBytes[0]), NumBlocks, PSingle(@Dest.FData[0]));
-    end;
-  end;
-  // Registered q/k projections: undo llama.cpp's per-head interleaved-
-  // rotary row permutation so the served rows are in HF rotate_half order
-  // (hf_row[p] = stored[2p], hf_row[p + HeadDim/2] = stored[2p+1]).
-  HeadDim := DeinterleaveHeadDimFor(pName);
+  ReadGGMLSpanInto(GGMLType, FDataStarts[0] + FTensors[Idx].DataBegin,
+    NumElements, Dest, 0);
   if HeadDim > 0 then
   begin
+    // 1-D bias form: the permutation runs over single ELEMENTS along ne[0],
+    // which is not a row view, so it is shuffled after the decode. These
+    // targets are bias vectors, so the temporary is negligible.
     Rows := FTensors[Idx].Shape[0];
     RowLen := NumElements div Rows;
-    HalfDim := HeadDim shr 1;
     SetLength(Tmp, NumElements);
     Move(Dest.FData[0], Tmp[0], NumElements * csNeuralFloatSize);
     RowsM1 := Rows - 1;
@@ -1726,11 +1719,7 @@ begin
     rRowLen := 0;                             // = r * RowLen, carried (#6)
     for r := 0 to RowsM1 do
     begin
-      RowInHead := r mod HeadDim;
-      if RowInHead < HalfDim then
-        SrcRow := (r - RowInHead) + 2 * RowInHead
-      else
-        SrcRow := (r - RowInHead) + 2 * (RowInHead - HalfDim) + 1;
+      SrcRow := GGUFDeinterleavedSrcRow(r, HeadDim);
       Move(Tmp[SrcRow * RowLen], Dest.FData[rRowLen], RowBytes);
       Inc(rRowLen, RowLen);
     end;

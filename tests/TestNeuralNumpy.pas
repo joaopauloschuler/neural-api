@@ -18,7 +18,7 @@ interface
 
 uses
   Classes, SysUtils, Math, fpcunit, testregistry,
-  neuralvolume, neuralnumpy;
+  neuralvolume, neuralnumpy, neuralsafetensors;
 
 type
   TTestNeuralNumpy = class(TTestCase)
@@ -36,6 +36,7 @@ type
     procedure TestRejectFortranOrder;
     procedure TestRejectObjectDtype;
     procedure TestNumpyCrossCheckFixture;
+    procedure TestChunkedStageParity;
   end;
 
 implementation
@@ -373,6 +374,78 @@ begin
     finally
       Reader.Free;
     end;
+  end;
+end;
+
+// DIFFERENTIAL: LoadNpyFromStream decodes into the already-sized destination
+// through a NeuralLoaderStageBytes-sized staging buffer instead of a
+// full-array second copy, so a chunk boundary can now fall inside an array.
+// Every supported dtype is written, read back at the default stage size, and
+// re-read at stage sizes smaller than one element, a non-multiple of the
+// element size, and larger than the whole array; all reads must agree
+// element for element. Coded by Claude (AI).
+procedure TTestNeuralNumpy.TestChunkedStageParity;
+const
+  cStages: array[0..3] of integer = (3, 7, 100, 1 shl 20);
+  cDTypes: array[0..6] of string = ('f4', 'f8', 'f2', 'i1', 'i2', 'i4', 'i8');
+  cCount = 173;   // prime: never a whole multiple of any chunk
+var
+  SavedStage, DTypeCnt, StageCnt, ElemCnt: integer;
+  Path: string;
+  Src, Ref, Cur: TNNetVolume;
+
+  // LoadVolumeFromNpy allocates; copy into Dest and free the loaded volume.
+  procedure LoadInto(Dest: TNNetVolume);
+  var
+    V: TNNetVolume;
+  begin
+    V := LoadVolumeFromNpy(Path);
+    try
+      Dest.Copy(V);
+    finally
+      V.Free;
+    end;
+  end;
+
+begin
+  SavedStage := NeuralLoaderStageBytes;
+  Src := TNNetVolume.Create(cCount, 1, 1);
+  Ref := TNNetVolume.Create;
+  Cur := TNNetVolume.Create;
+  try
+    for ElemCnt := 0 to cCount - 1 do
+      Src.FData[ElemCnt] := (ElemCnt mod 61) - 30;   // exact in every dtype
+    for DTypeCnt := Low(cDTypes) to High(cDTypes) do
+    begin
+      Path := TmpName('stage_' + cDTypes[DTypeCnt] + '.npy');
+      SaveVolumeToNpy(Path, Src, [cCount], cDTypes[DTypeCnt]);
+      try
+        NeuralLoaderStageBytes := SavedStage;
+        LoadInto(Ref);
+        AssertEquals(cDTypes[DTypeCnt] + ' whole-read size', cCount, Ref.Size);
+        for StageCnt := Low(cStages) to High(cStages) do
+        begin
+          NeuralLoaderStageBytes := cStages[StageCnt];
+          LoadInto(Cur);
+          AssertEquals(cDTypes[DTypeCnt] + ' size at stage ' +
+            IntToStr(cStages[StageCnt]), Ref.Size, Cur.Size);
+          for ElemCnt := 0 to Ref.Size - 1 do
+            AssertTrue(cDTypes[DTypeCnt] + '[' + IntToStr(ElemCnt) +
+              '] differs at stage ' + IntToStr(cStages[StageCnt]) + ': ' +
+              FloatToStr(Cur.FData[ElemCnt]) + ' vs whole-read ' +
+              FloatToStr(Ref.FData[ElemCnt]),
+              Cur.FData[ElemCnt] = Ref.FData[ElemCnt]);
+        end;
+      finally
+        NeuralLoaderStageBytes := SavedStage;
+        DeleteFile(Path);
+      end;
+    end;
+  finally
+    NeuralLoaderStageBytes := SavedStage;
+    Cur.Free;
+    Ref.Free;
+    Src.Free;
   end;
 end;
 

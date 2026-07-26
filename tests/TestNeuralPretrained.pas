@@ -126,6 +126,7 @@ type
     procedure TestSafeTensorsWriterRoundTrip;
     procedure TestSafeTensorsWriterF16BF16RoundTrip;
     procedure TestParallelHalfDecodeParity;
+    procedure TestChunkedLoaderStageParity;
     procedure TestSafeTensorsWriterRejectsBadInput;
     procedure TestSaveLoadNNetToSafeTensors;
     procedure TestSaveLoadNNetToSafeTensorsF16;
@@ -1694,6 +1695,151 @@ begin
     Dst.Free;
     Src.Free;
     DeleteFile(Path);
+  end;
+end;
+
+// DIFFERENTIAL: reading a tensor through the bounded staging chunk must be
+// BIT-IDENTICAL to reading it whole. Every reader here (safetensors, its
+// torch.save subclass, GGUF) decodes into an already-allocated destination
+// through a NeuralLoaderStageBytes-sized buffer instead of a full-size
+// second copy, so the chunk boundary now lands INSIDE tensors. This test
+// drives that boundary everywhere it can go: stage sizes smaller than one
+// element, smaller than one quant block, a non-multiple of the element and
+// block sizes, an exact multiple, and larger than the whole tensor. The
+// whole-file reference is taken at the default stage size (one chunk), then
+// every tensor of the mixed-dtype (F32/F16/BF16/I64) fixture, its
+// torch.save twin, and the F32/F16/Q8_0/k-quant GGUF fixtures - including a
+// de-interleave-registered q projection, whose rows are permuted while
+// being located - is reloaded at each small size and compared element for
+// element. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestChunkedLoaderStageParity;
+const
+  // 3 < one F32/I64 element; 34 = one Q8_0 block exactly and a non-multiple
+  // of 4/8; 100 is a non-multiple of every block byte size; 512 spans several
+  // k-quant super-blocks; 1 shl 20 exceeds every fixture tensor (one chunk).
+  cStages: array[0..4] of integer = (3, 34, 100, 512, 1 shl 20);
+var
+  SavedStage: integer;
+  Ref, Cur: TNNetVolume;
+  GGUF: TNNetGGUFReader;
+  Bin: TNNetTorchBinReader;
+  ST: TNNetSafeTensorsReader;
+
+  // Loads every tensor R serves at the default stage size, then at each
+  // cStages size, and asserts exact equality.
+  procedure CheckAllTensors(R: TNNetSafeTensorsReader; const Tag: string);
+  var
+    TensorCnt, StageCnt, ElemCnt: integer;
+    TName: string;
+  begin
+    for TensorCnt := 0 to R.Count - 1 do
+    begin
+      TName := R.TensorName(TensorCnt);
+      NeuralLoaderStageBytes := SavedStage;
+      R.LoadTensorFlat(TName, Ref);
+      for StageCnt := Low(cStages) to High(cStages) do
+      begin
+        NeuralLoaderStageBytes := cStages[StageCnt];
+        R.LoadTensorFlat(TName, Cur);
+        AssertEquals(Tag + ' ' + TName + ' size at stage ' +
+          IntToStr(cStages[StageCnt]), Ref.Size, Cur.Size);
+        for ElemCnt := 0 to Ref.Size - 1 do
+          AssertTrue(Tag + ' ' + TName + '[' + IntToStr(ElemCnt) +
+            '] differs at stage ' + IntToStr(cStages[StageCnt]) + ': ' +
+            FloatToStr(Cur.FData[ElemCnt]) + ' vs whole-read ' +
+            FloatToStr(Ref.FData[ElemCnt]),
+            Cur.FData[ElemCnt] = Ref.FData[ElemCnt]);
+      end;
+      NeuralLoaderStageBytes := SavedStage;
+    end;
+  end;
+
+  // Same for a row slice, whose staged read starts at a mid-tensor offset.
+  procedure CheckRowSlice(R: TNNetSafeTensorsReader; const TName: string;
+    FirstRow, RowCount, RowSize: integer; const Tag: string);
+  var
+    StageCnt, ElemCnt: integer;
+  begin
+    NeuralLoaderStageBytes := SavedStage;
+    R.LoadTensorRowsFlat(TName, FirstRow, RowCount, RowSize, Ref);
+    AssertEquals(Tag + ' slice size', RowCount * RowSize, Ref.Size);
+    for StageCnt := Low(cStages) to High(cStages) do
+    begin
+      NeuralLoaderStageBytes := cStages[StageCnt];
+      R.LoadTensorRowsFlat(TName, FirstRow, RowCount, RowSize, Cur);
+      AssertEquals(Tag + ' slice size at stage ' +
+        IntToStr(cStages[StageCnt]), Ref.Size, Cur.Size);
+      for ElemCnt := 0 to Ref.Size - 1 do
+        AssertTrue(Tag + ' slice ' + TName + '[' + IntToStr(ElemCnt) +
+          '] differs at stage ' + IntToStr(cStages[StageCnt]),
+          Cur.FData[ElemCnt] = Ref.FData[ElemCnt]);
+    end;
+    NeuralLoaderStageBytes := SavedStage;
+  end;
+
+begin
+  SavedStage := NeuralLoaderStageBytes;
+  Ref := TNNetVolume.Create;
+  Cur := TNNetVolume.Create;
+  try
+    // ---- safetensors: F32 + F16 + BF16 + I64 in one fixture ----
+    ST := TNNetSafeTensorsReader.Create(
+      FixturePath('tiny_torch_state.safetensors'));
+    try
+      AssertTrue('fixture covers the decoded dtypes',
+        (ST.GetDType('w_f16') = 'F16') and (ST.GetDType('w_bf16') = 'BF16') and
+        (ST.GetDType('ids_i64') = 'I64'));
+      CheckAllTensors(ST, 'safetensors');
+      // Row slices start the staged read at a mid-tensor byte offset.
+      CheckRowSlice(ST, 'w_f32', {FirstRow=}1, {RowCount=}2, {RowSize=}4,
+        'safetensors');
+      CheckRowSlice(ST, 'w_bf16', {FirstRow=}1, {RowCount=}3, {RowSize=}2,
+        'safetensors');
+    finally
+      ST.Free;
+    end;
+    // ---- the same bytes through the torch.save subclass ----
+    Bin := TNNetTorchBinReader.Create(FixturePath('tiny_torch_state.bin'));
+    try
+      CheckAllTensors(Bin, 'torchbin');
+    finally
+      Bin.Free;
+    end;
+    // ---- GGUF: F32, F16, Q8_0 and the k-quant set ----
+    GGUF := TNNetGGUFReader.Create(FixturePath('tiny_llama_f32.gguf'));
+    try
+      // Registered so the de-interleave path (rows permuted while located)
+      // is exercised at every chunk size too.
+      GGUF.RegisterRowDeinterleave('blk.0.attn_q.weight', {HeadDim=}4);
+      CheckAllTensors(GGUF, 'gguf-f32');
+    finally
+      GGUF.Free;
+    end;
+    GGUF := TNNetGGUFReader.Create(FixturePath('tiny_llama_f16.gguf'));
+    try
+      GGUF.RegisterRowDeinterleave('blk.0.attn_q.weight', {HeadDim=}4);
+      CheckAllTensors(GGUF, 'gguf-f16');
+      CheckRowSlice(GGUF, 'blk.0.ffn_up.weight', {FirstRow=}3,
+        {RowCount=}5, {RowSize=}8, 'gguf-f16');
+    finally
+      GGUF.Free;
+    end;
+    GGUF := TNNetGGUFReader.Create(FixturePath('tiny_llama_q8.gguf'));
+    try
+      CheckAllTensors(GGUF, 'gguf-q8');
+    finally
+      GGUF.Free;
+    end;
+    GGUF := TNNetGGUFReader.Create(FixturePath('tiny_kquant.gguf'));
+    try
+      CheckAllTensors(GGUF, 'gguf-kquant');
+    finally
+      GGUF.Free;
+    end;
+  finally
+    NeuralLoaderStageBytes := SavedStage;
+    Cur.Free;
+    Ref.Free;
   end;
 end;
 
