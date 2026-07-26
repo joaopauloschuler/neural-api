@@ -66796,6 +66796,7 @@ var
   Vec: TNNetVolume;
   half, halfM1, i, k, base: integer;
   LogMax, freq, angle, c: TNeuralFloat;
+  sinv, cosv: TNeuralFloat;
   AddTextDimM1: integer;
 begin
   if not Config.UseAddEmbedding then
@@ -66831,9 +66832,11 @@ begin
     for k := 0 to 5 do
     begin
       angle := TimeIds[k] * freq;
-      // diffusers flip_sin_to_cos=True -> [cos | sin].
-      Vec.FData[base + i] := pcr_cosf(angle);
-      Vec.FData[base + half + i] := pcr_sinf(angle);
+      // diffusers flip_sin_to_cos=True -> [cos | sin]. Both come from ONE
+      // argument reduction (#16) rather than a pcr_cosf plus a pcr_sinf.
+      pcr_sincosf(angle, sinv, cosv);
+      Vec.FData[base + i] := cosv;
+      Vec.FData[base + half + i] := sinv;
       base := base + Config.AdditionTimeEmbedDim;
     end;
   end;
@@ -76656,6 +76659,7 @@ var
   s, gx, gy, gw, side, b, k, cls, BestCls, Cnt, Cell, i2: integer;
   rm, nc, OutDim, Stride, cellBase: integer;
   gwM1, ncM1, rmM1, HiCand, KeptIdxHi, clsOfs, sideBase, clsBase: integer;
+  TotalCells: integer;
   MaxLogit, SumExp, P, BestScore, Dist, Cx, Cy, L, Tp, R, Bp: TNeuralFloat;
   BestLogit, LogitThr, sv: TNeuralFloat;
   Dists: array[0..3] of TNeuralFloat;
@@ -76674,7 +76678,19 @@ begin
   else if ScoreThreshold >= 1 then LogitThr := 1e30
   else LogitThr := Ln(ScoreThreshold / (1.0 - ScoreThreshold));
   SetLength(expBuf, rm);     // #4: cached per-bin exp, reused between SumExp/Dist
-  SetLength(Cand, 0);
+  // Size Cand for the worst case (every cell accepted) once, then carry the
+  // count and trim. Growing it one element at a time made FPC reallocate to the
+  // exact new size on every accepted cell - up to ~8400 realloc+copy cycles per
+  // image with a permissive threshold, i.e. O(N^2) memory traffic. Same pattern
+  // DecodeDetrDetections and DecodeOwlViTDetections already use.
+  TotalCells := 0;
+  for s := 0 to 2 do
+  begin
+    gw := Config.ImageSize div Config.Strides[s];
+    TotalCells := TotalCells + gw * gw;
+  end;
+  SetLength(Cand, TotalCells);
+  Cnt := 0;
   Cell := 0;
   for s := 0 to 2 do
   begin
@@ -76723,18 +76739,18 @@ begin
           // ltrb distances from the cell centre (in grid units), -> xyxy.
           Cx := gx + 0.5; Cy := gy + 0.5;
           L := Dists[0]; Tp := Dists[1]; R := Dists[2]; Bp := Dists[3];
-          Cnt := Length(Cand);
-          SetLength(Cand, Cnt + 1);
           Cand[Cnt].ClassId := BestCls;
           Cand[Cnt].Score := BestScore;
           Cand[Cnt].X1 := (Cx - L) * Stride;
           Cand[Cnt].Y1 := (Cy - Tp) * Stride;
           Cand[Cnt].X2 := (Cx + R) * Stride;
           Cand[Cnt].Y2 := (Cy + Bp) * Stride;
+          Inc(Cnt);
         end;
         Inc(Cell);
       end;
   end;
+  SetLength(Cand, Cnt);   // trim to the accepted candidates
   // Score-sorted, class-aware greedy NMS via the shared neuralvolume helper.
   // Build the parallel box / score / class arrays it expects (corner xyxy).
   HiCand := High(Cand);
