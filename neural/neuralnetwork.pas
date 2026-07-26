@@ -12106,8 +12106,16 @@ type
   // Coded by Claude (AI).
   TNNetBitLinear = class(TNNetFullConnectLinear)
   private
-    FQuantWeights: TNNetVolume;  // scratch: quantized weights of one neuron
+    // Effective (ternarized) weights of the WHOLE matrix, one row per neuron,
+    // materialized only when the latent weights move; FWSnapshot is the latent
+    // matrix it was built from (the staleness guard). Costs two extra copies of
+    // the weight matrix and removes two passes plus a scalar Round per weight
+    // from every forward and every backward.
+    FQuantWeights: TNNetVolume;
+    FWSnapshot: TNNetVolume;
+    FBankValid: boolean;
     FQuantInput: TNNetVolume;    // scratch: int8-quantized layer input (act-quant)
+    procedure MaterializeBankIfStale();
     function GetQuantizeActivation(): boolean;
     // Returns the (possibly activation-quantized) input volume the forward and
     // input-gradient passes should multiply against. When the act-quant flag is
@@ -77170,56 +77178,106 @@ begin
   Result := FQuantInput;
 end;
 
-// Quantize one neuron's latent weight vector into FQuantWeights using the
-// BitNet b1.58 per-neuron absmean rule:
+// Materializes the effective (ternarized) weight matrix into FQuantWeights, one
+// contiguous row per neuron, using the BitNet b1.58 per-neuron absmean rule:
 //   scale = mean(|w|); w_eff = scale * round(clip(w/scale, -1, +1)).
-// Effective weights (scale * {-1,0,+1}) are returned in FQuantWeights.
-// When the activation-quant flag is ON the dot-product runs against the
-// absmax-int8 quantized input (EffectiveInput) instead of the raw input.
-procedure TNNetBitLinear.ComputeCPU();
+// The effective weights (scale * {-1,0,+1}) depend ONLY on the latent weights,
+// so they are rebuilt exclusively when those move -- otherwise the forward and
+// the backward each re-ran an absmean pass plus a scalar clip/Round pass over
+// every weight, per token. The staleness test is a VALUE compare against
+// FWSnapshot rather than an AfterWeightUpdate hook, because seeders, importers
+// and gradient-check tests write Neurons[].Weights.Raw directly; it is one
+// early-exit compare pass against the two passes it replaces (one of them
+// scalar, with a Round per element).
+procedure TNNetBitLinear.MaterializeBankIfStale();
 var
-  StartTime: double;
-  Cnt, MaxCnt, WeightCnt, MaxWeights: integer;
-  localNeuron: TNNetNeuron;
-  localInput: TNNetVolume;
-  Scale, InvScale, FloatN, Acc, Wq: TNeuralFloat;
+  Cnt, MaxCnt, WeightCnt, WSize, WSizeM1, BankSize, RowPos: integer;
+  W: TNNetVolume;
+  Scale, InvScale, FloatN, Wq: TNeuralFloat;
+  Stale: boolean;
 begin
-  StartTime := Now();
-  localInput := EffectiveInput();
   MaxCnt := FNeurons.Count - 1;
-  MaxWeights := FNeurons[0].FWeights.Size - 1;
-  FloatN := FNeurons[0].FWeights.Size;
-  FQuantWeights.ReSize(FNeurons[0].FWeights);
+  WSize := FArrNeurons[0].FWeights.Size;
+  WSizeM1 := WSize - 1;
+  BankSize := (MaxCnt + 1) * WSize;
+  Stale := (not FBankValid) or (FWSnapshot.Size <> BankSize) or
+    (FQuantWeights.Size <> BankSize);
+  if not Stale then
+  begin
+    RowPos := 0;
+    for Cnt := 0 to MaxCnt do
+    begin
+      W := FArrNeurons[Cnt].FWeights;
+      for WeightCnt := 0 to WSizeM1 do
+        if FWSnapshot.FData[RowPos + WeightCnt] <> W.FData[WeightCnt] then
+        begin
+          Stale := true;
+          break;
+        end;
+      if Stale then break;
+      Inc(RowPos, WSize);
+    end;
+  end;
+  if not Stale then exit;
+  // Lazy, amortized resize of persistent fields (rule #17): shape changes only.
+  if FQuantWeights.Size <> BankSize then FQuantWeights.ReSize(MaxCnt + 1, 1, WSize);
+  if FWSnapshot.Size <> BankSize then FWSnapshot.ReSize(MaxCnt + 1, 1, WSize);
+  FloatN := WSize;
+  RowPos := 0;
   for Cnt := 0 to MaxCnt do
   begin
-    localNeuron := FArrNeurons[Cnt];
+    W := FArrNeurons[Cnt].FWeights;
     // Per-neuron absmean scale = mean(|w|) over this neuron's weight vector.
-    Scale := localNeuron.FWeights.GetSumAbs() / FloatN;
-    Acc := 0;
+    Scale := W.GetSumAbs() / FloatN;
     if Scale > 0 then
     begin
       InvScale := 1.0 / Scale;
-      for WeightCnt := 0 to MaxWeights do
+      for WeightCnt := 0 to WSizeM1 do
       begin
         // Ternarize: w_q = round(clip(w/scale, -1, +1)) in {-1, 0, +1}.
-        Wq := localNeuron.FWeights.FData[WeightCnt] * InvScale;
+        Wq := W.FData[WeightCnt] * InvScale;
         if Wq > 1.0 then Wq := 1.0
         else if Wq < -1.0 then Wq := -1.0;
-        Wq := Round(Wq);
         // Effective weight is scale * w_q.
-        FQuantWeights.FData[WeightCnt] := Scale * Wq;
+        FQuantWeights.FData[RowPos + WeightCnt] := Scale * Round(Wq);
       end;
-      Acc := TNNetVolume.DotProduct(FQuantWeights.DataPtr, localInput.DataPtr, MaxWeights + 1);
     end
     else
     begin
       // All-zero weights: effective weight is 0.
-      FQuantWeights.Fill(0);
+      FillChar(FQuantWeights.FData[RowPos], WSize * csNeuralFloatSize, 0);
     end;
+    Move(W.FData[0], FWSnapshot.FData[RowPos], WSize * csNeuralFloatSize);
+    Inc(RowPos, WSize);
+  end;
+  FBankValid := true;
+end;
+
+// Forward against the effective (ternarized) weight bank. When the
+// activation-quant flag is ON the dot-product runs against the absmax-int8
+// quantized input (EffectiveInput) instead of the raw input.
+procedure TNNetBitLinear.ComputeCPU();
+var
+  StartTime: double;
+  Cnt, MaxCnt, WSize, RowPos: integer;
+  localInput: TNNetVolume;
+  Acc: TNeuralFloat;
+begin
+  StartTime := Now();
+  localInput := EffectiveInput();
+  MaterializeBankIfStale();
+  MaxCnt := FNeurons.Count - 1;
+  WSize := FArrNeurons[0].FWeights.Size;
+  RowPos := 0;
+  for Cnt := 0 to MaxCnt do
+  begin
+    Acc := TNNetVolume.DotProduct(FQuantWeights.GetRawPtr(RowPos),
+      localInput.DataPtr, WSize);
     if FSuppressBias = 0 then
-      FOutput.FData[Cnt] := Acc + localNeuron.FBiasWeight
+      FOutput.FData[Cnt] := Acc + FArrNeurons[Cnt].FBiasWeight
     else
       FOutput.FData[Cnt] := Acc;
+    Inc(RowPos, WSize);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -77227,46 +77285,28 @@ end;
 // Input gradient. The forward used the EFFECTIVE (quantized) weights w_eff, and
 // the quantization does NOT depend on the input, so dL/dx = sum_o err_o*w_eff_o
 // is the exact input gradient (no STE approximation needed on this path). The
-// effective weights are recomputed per neuron (latent weights are unchanged
-// between Compute and this backward pass). Note this differs from the inherited
+// effective weights come from the same materialized bank the forward used (the
+// staleness guard reuses it when the latent weights have not moved). Note this
+// differs from the inherited
 // FullConnectLinear version, which would (incorrectly here) use the LATENT
 // weights. The STE only applies to the LATENT-WEIGHT gradient, which stays the
 // ordinary linear gradient (inherited BackpropagateCPU, w.r.t. FWeights).
 procedure TNNetBitLinear.ComputePreviousLayerErrorCPU();
 var
-  MaxOutputCnt, OutputCnt, WeightCnt, MaxWeights: integer;
+  MaxOutputCnt, OutputCnt, WSize, RowPos: integer;
   LocalPrevError: TNNetVolume;
-  localNeuron: TNNetNeuron;
-  Scale, InvScale, FloatN, Wq: TNeuralFloat;
 begin
   LocalPrevError := FPrevLayer.OutputError;
   MaxOutputCnt := FOutput.Size - 1;
-  MaxWeights := FNeurons[0].FWeights.Size - 1;
-  FloatN := FNeurons[0].FWeights.Size;
-  FQuantWeights.ReSize(FNeurons[0].FWeights);
+  WSize := FArrNeurons[0].FWeights.Size;
+  MaterializeBankIfStale();
+  RowPos := 0;
   for OutputCnt := 0 to MaxOutputCnt do
   begin
     if (FOutputError.FData[OutputCnt] <> 0.0) then
-    begin
-      localNeuron := FArrNeurons[OutputCnt];
-      Scale := localNeuron.FWeights.GetSumAbs() / FloatN;
-      if Scale > 0 then
-      begin
-        InvScale := 1.0 / Scale;
-        for WeightCnt := 0 to MaxWeights do
-        begin
-          Wq := localNeuron.FWeights.FData[WeightCnt] * InvScale;
-          if Wq > 1.0 then Wq := 1.0
-          else if Wq < -1.0 then Wq := -1.0;
-          FQuantWeights.FData[WeightCnt] := Scale * Round(Wq);
-        end;
-      end
-      else
-      begin
-        FQuantWeights.Fill(0);
-      end;
-      LocalPrevError.MulAdd(FOutputError.FData[OutputCnt], FQuantWeights);
-    end;
+      TNNetVolume.MulAdd(LocalPrevError.DataPtr,
+        FQuantWeights.GetRawPtr(RowPos), FOutputError.FData[OutputCnt], WSize);
+    Inc(RowPos, WSize);
   end;
 end;
 
@@ -77277,6 +77317,8 @@ begin
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
   FQuantWeights := TNNetVolume.Create();
+  FWSnapshot := TNNetVolume.Create();
+  FBankValid := false;
   FQuantInput := TNNetVolume.Create();
   // Activation quantization defaults to OFF (FStruct[4] = 0) so the un-flagged
   // class is bit-for-bit identical to the ternary-weights-only behavior.
@@ -77300,6 +77342,7 @@ end;
 destructor TNNetBitLinear.Destroy();
 begin
   FQuantInput.Free;
+  FWSnapshot.Free;
   FQuantWeights.Free;
   inherited Destroy();
 end;

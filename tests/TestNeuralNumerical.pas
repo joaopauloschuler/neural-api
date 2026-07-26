@@ -176,6 +176,7 @@ type
     procedure TestBitLinearForward;
     procedure TestBitLinearInputGradientCheck;
     procedure TestBitLinearSerializationRoundTrip;
+    procedure TestBitLinearDirectWeightWriteRebuildsBank;
     // BitLinear activation-quantization variant (absmax-int8 input + STE)
     procedure TestBitLinearActQuantForward;
     procedure TestBitLinearActQuantInputGradientCheck;
@@ -54115,6 +54116,70 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+// The ternarized weight bank is guarded by a VALUE snapshot of the latent
+// weights, so a caller that writes Neurons[].Weights.Raw DIRECTLY (seeders,
+// importers, the gradient-check tests) must get a rebuilt bank on the next
+// forward AND on the next input-gradient pass. A stale bank would keep the old
+// ternary pattern and scale.
+procedure TTestNeuralNumerical.TestBitLinearDirectWeightWriteRebuildsBank;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  BL: TNNetBitLinear;
+  i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  Desired := TNNetVolume.Create(1, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    BL := TNNetBitLinear.Create({pSize=}1, {pSuppressBias=}1);
+    NN.AddLayer(BL);
+    NN.SetLearningRate(0.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 1.0;
+    Desired.Raw[0] := 0.0;
+
+    // Weights [0.2, 0.6, -0.4, 0.0]: scale 0.3, w_q [1, 1, -1, 0], out 0.3.
+    BL.Neurons[0].Weights.Raw[0] :=  0.2;
+    BL.Neurons[0].Weights.Raw[1] :=  0.6;
+    BL.Neurons[0].Weights.Raw[2] := -0.4;
+    BL.Neurons[0].Weights.Raw[3] :=  0.0;
+    NN.Compute(Input);
+    AssertEquals('BitLinear forward before the direct weight write', 0.3,
+      NN.GetLastLayer.Output.Raw[0], 1e-5);
+
+    // Direct write of a different matrix: [-0.8, 0.0, 0.4, 0.4].
+    //   scale = (0.8+0.0+0.4+0.4)/4 = 0.4
+    //   w/scale = [-2, 0, 1, 1] -> clip -> [-1, 0, 1, 1]
+    //   out = 0.4 * (-1 + 0 + 1 + 1) = 0.4
+    BL.Neurons[0].Weights.Raw[0] := -0.8;
+    BL.Neurons[0].Weights.Raw[1] :=  0.0;
+    BL.Neurons[0].Weights.Raw[2] :=  0.4;
+    BL.Neurons[0].Weights.Raw[3] :=  0.4;
+    NN.Compute(Input);
+    AssertEquals('BitLinear forward after the direct weight write', 0.4,
+      NN.GetLastLayer.Output.Raw[0], 1e-5);
+
+    // Input gradient uses the SAME effective weights: dL/dx = err * w_eff with
+    // err = out - desired = 0.4, so dL/dx = 0.4 * 0.4 * [-1, 0, 1, 1].
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    AssertEquals('BitLinear input gradient 0 after the direct write', -0.16,
+      NN.Layers[0].OutputError.Raw[0], 1e-5);
+    AssertEquals('BitLinear input gradient 1 after the direct write', 0.0,
+      NN.Layers[0].OutputError.Raw[1], 1e-5);
+    AssertEquals('BitLinear input gradient 2 after the direct write', 0.16,
+      NN.Layers[0].OutputError.Raw[2], 1e-5);
+    AssertEquals('BitLinear input gradient 3 after the direct write', 0.16,
+      NN.Layers[0].OutputError.Raw[3], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
   end;
 end;
 
