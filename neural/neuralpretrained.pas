@@ -41960,8 +41960,15 @@ begin
           SetLength(OutSig[c], Length(InSig[c]));
           InRow := InSig[c]; OutRow := OutSig[c];   // #9: bind rows once
           InSigLenM1 := Length(InRow) - 1;
+          // #19: ELU(x) = x for x>0 else exp(x)-1. The per-element guard would
+          // normally block promotion, but OutRow is a distinct freshly-sized row,
+          // so the original x survives the vector pass and the guard can run
+          // AFTER it as a transcendental-free select. Positive lanes may produce
+          // a huge/Inf exp that is then discarded; the AVX kernel cannot raise.
+          TNNetVolume.VectorExp(Addr(OutRow[0]), Addr(InRow[0]), InSigLenM1 + 1);
           for t := 0 to InSigLenM1 do
-            OutRow[t] := EnCodecELU(InRow[t]);
+            if InRow[t] > 0 then OutRow[t] := InRow[t]
+            else OutRow[t] := OutRow[t] - 1;
         end;
       end;
     eskResnet:
@@ -41973,8 +41980,12 @@ begin
           SetLength(Tmp[c], Length(InSig[c]));
           InRow := InSig[c]; OutRow := Tmp[c];      // #9: bind rows once
           InSigLenM1 := Length(InRow) - 1;
+          // #19: vector exp then a select on the untouched input row (see the
+          // eskELU branch above).
+          TNNetVolume.VectorExp(Addr(OutRow[0]), Addr(InRow[0]), InSigLenM1 + 1);
           for t := 0 to InSigLenM1 do
-            OutRow[t] := EnCodecELU(InRow[t]);
+            if InRow[t] > 0 then OutRow[t] := InRow[t]
+            else OutRow[t] := OutRow[t] - 1;
         end;
         RunEnCodecConv(Stage.Resnet.Conv1, Tmp, Res, FConfig.UseCausalConv, FProcs);
         ApplyEnCodecELU(Res);
