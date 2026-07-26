@@ -64000,8 +64000,9 @@ var
   StartTime: double;
   Wi, Wf, Wo, Wg, Bi, Bf, Bo, Bg: TNNetVolume;
   Prev: TNNetVolume;
-  t, y, x, oc, ky, kx, sy, sx, tap, oy, zi, ZCnt: integer;
-  TimeStepsM1, HM1, WM1, InCM1, HiddenCM1, FeatureM1, ZCntM1: integer;
+  t, y, x, oc, ky, kx, sy, sx, tap, oy, ZCnt: integer;
+  TimeStepsM1, HM1, WM1, HiddenCM1, FeatureM1: integer;
+  zBase, InCBytes, HiddenCBytes: integer;
   accI, accF, accO, accG, fv, iv, ov, gv, cv, hp, tc: TNeuralFloat;
   WiR, WfR, WoR, WgR, ZPtr: TNeuralFloatArrPtr;
 begin
@@ -64014,8 +64015,10 @@ begin
   ZCnt := FInC + FHiddenC;
   TimeStepsM1 := FTimeSteps - 1;
   HM1 := FH - 1; WM1 := FW - 1;
-  InCM1 := FInC - 1; HiddenCM1 := FHiddenC - 1;
-  FeatureM1 := FFeature - 1; ZCntM1 := ZCnt - 1;
+  HiddenCM1 := FHiddenC - 1;
+  FeatureM1 := FFeature - 1;
+  InCBytes := FInC * csNeuralFloatSize;
+  HiddenCBytes := FHiddenC * csNeuralFloatSize;
   FHprev.Fill(0);
   for t := 0 to TimeStepsM1 do
   begin
@@ -64024,10 +64027,11 @@ begin
     for y := 0 to HM1 do
       for x := 0 to WM1 do
       begin
-        ZPtr := FZ.GetRawPtr(y, x);
-        for oc := 0 to InCM1 do ZPtr^[oc] := Prev.Data[oy + y, x, oc];
-        for oc := 0 to HiddenCM1 do
-          ZPtr^[FInC + oc] := FHprev.Data[y, x, oc];
+        // Both halves of z are contiguous channel runs: two Moves (App. C).
+        zBase := FZ.GetRawPos(y, x);
+        Move(Prev.FData[Prev.GetRawPos(oy + y, x)], FZ.FData[zBase], InCBytes);
+        Move(FHprev.FData[FHprev.GetRawPos(y, x)], FZ.FData[zBase + FInC],
+          HiddenCBytes);
       end;
     // Convolve each gate over z_t (SAME padding), then update c_t and h_t.
     for y := 0 to HM1 do
@@ -64049,13 +64053,11 @@ begin
               if (sx < 0) or (sx >= FW) then continue;
               tap := (ky * FFeature + kx) * ZCnt;
               ZPtr := FZ.GetRawPtr(sy, sx);
-              for zi := 0 to ZCntM1 do
-              begin
-                accI := accI + WiR^[tap + zi] * ZPtr^[zi];
-                accF := accF + WfR^[tap + zi] * ZPtr^[zi];
-                accO := accO + WoR^[tap + zi] * ZPtr^[zi];
-                accG := accG + WgR^[tap + zi] * ZPtr^[zi];
-              end;
+              // One tap of one gate is a contiguous ZCnt-long dot product (#13).
+              accI := accI + TNNetVolume.DotProduct(@WiR^[tap], ZPtr, ZCnt);
+              accF := accF + TNNetVolume.DotProduct(@WfR^[tap], ZPtr, ZCnt);
+              accO := accO + TNNetVolume.DotProduct(@WoR^[tap], ZPtr, ZCnt);
+              accG := accG + TNNetVolume.DotProduct(@WgR^[tap], ZPtr, ZCnt);
             end;
           end;
           iv := Sigmoid(accI); fv := Sigmoid(accF);
@@ -64069,11 +64071,11 @@ begin
           FOutput.Data[oy + y, x, oc] := ov * tc;
         end;
       end;
-    // Carry h_t forward as h_{t-1} for the next step.
+    // Carry h_t forward as h_{t-1} for the next step (contiguous row copies).
     for y := 0 to HM1 do
       for x := 0 to WM1 do
-        for oc := 0 to HiddenCM1 do
-          FHprev.Data[y, x, oc] := FOutput.Data[oy + y, x, oc];
+        Move(FOutput.FData[FOutput.GetRawPos(oy + y, x)],
+          FHprev.FData[FHprev.GetRawPos(y, x)], HiddenCBytes);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -64082,11 +64084,12 @@ procedure TNNetConvLSTMCell.Backpropagate();
 var
   StartTime: double;
   Wi, Wf, Wo, Wg, Prev, PrevErr: TNNetVolume;
-  t, y, x, oc, ky, kx, sy, sx, tap, zc, oy, j, ZCnt: integer;
-  HM1, WM1, InCM1, HiddenCM1, FeatureM1, ZCntM1, FTimeStepsM1: integer;
+  t, y, x, oc, ky, kx, sy, sx, tap, oy, j, ZCnt: integer;
+  HM1, WM1, HiddenCM1, FeatureM1, FTimeStepsM1: integer;
+  zBase, InCBytes, HiddenCBytes: integer;
   hasInputGrad: boolean;
-  iv, fv, ov, gv, tc, hp, gh, gc, gtc, gcv: TNeuralFloat;
-  gpreI, gpreF, gpreO, gpreG, zval: TNeuralFloat;
+  iv, fv, ov, gv, tc, hp, gh, gc, gtc: TNeuralFloat;
+  gpreI, gpreF, gpreO, gpreG: TNeuralFloat;
   WiR, WfR, WoR, WgR, ZPtr, GzPtr: TNeuralFloatArrPtr;
   GWiR, GWfR, GWoR, GWgR: TNeuralFloatArrPtr;
 begin
@@ -64099,8 +64102,10 @@ begin
   Wo := FNeurons[2].FWeights; Wg := FNeurons[3].FWeights;
   ZCnt := FInC + FHiddenC;
   HM1 := FH - 1; WM1 := FW - 1;
-  InCM1 := FInC - 1; HiddenCM1 := FHiddenC - 1;
-  FeatureM1 := FFeature - 1; ZCntM1 := ZCnt - 1;
+  HiddenCM1 := FHiddenC - 1;
+  FeatureM1 := FFeature - 1;
+  InCBytes := FInC * csNeuralFloatSize;
+  HiddenCBytes := FHiddenC * csNeuralFloatSize;
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
   PrevErr := nil;
@@ -64118,13 +64123,14 @@ begin
     for y := 0 to HM1 do
       for x := 0 to WM1 do
       begin
-        ZPtr := FZ.GetRawPtr(y, x);
-        for oc := 0 to InCM1 do ZPtr^[oc] := Prev.Data[oy + y, x, oc];
+        // Both halves of z are contiguous channel runs (App. C).
+        zBase := FZ.GetRawPos(y, x);
+        Move(Prev.FData[Prev.GetRawPos(oy + y, x)], FZ.FData[zBase], InCBytes);
         if t > 0 then
-          for oc := 0 to HiddenCM1 do
-            ZPtr^[FInC + oc] := FOutput.Data[(t - 1) * FH + y, x, oc]
+          Move(FOutput.FData[FOutput.GetRawPos((t - 1) * FH + y, x)],
+            FZ.FData[zBase + FInC], HiddenCBytes)
         else
-          for oc := 0 to HiddenCM1 do ZPtr^[FInC + oc] := 0;
+          FillChar(FZ.FData[zBase + FInC], HiddenCBytes, 0);
       end;
     FGz.Fill(0);
     for y := 0 to HM1 do
@@ -64168,17 +64174,16 @@ begin
               tap := (ky * FFeature + kx) * ZCnt;
               ZPtr := FZ.GetRawPtr(sy, sx);
               GzPtr := FGz.GetRawPtr(sy, sx);
-              for zc := 0 to ZCntM1 do
-              begin
-                zval := ZPtr^[zc];
-                GWiR^[tap + zc] := GWiR^[tap + zc] + gpreI * zval;
-                GWfR^[tap + zc] := GWfR^[tap + zc] + gpreF * zval;
-                GWoR^[tap + zc] := GWoR^[tap + zc] + gpreO * zval;
-                GWgR^[tap + zc] := GWgR^[tap + zc] + gpreG * zval;
-                GzPtr^[zc] := GzPtr^[zc] + gpreI * WiR^[tap + zc] +
-                  gpreF * WfR^[tap + zc] + gpreO * WoR^[tap + zc] +
-                  gpreG * WgR^[tap + zc];
-              end;
+              // Weight grads and dL/dz are eight contiguous ZCnt-long scaled
+              // accumulates over one tap (#13).
+              TNNetVolume.MulAdd(@GWiR^[tap], ZPtr, gpreI, ZCnt);
+              TNNetVolume.MulAdd(@GWfR^[tap], ZPtr, gpreF, ZCnt);
+              TNNetVolume.MulAdd(@GWoR^[tap], ZPtr, gpreO, ZCnt);
+              TNNetVolume.MulAdd(@GWgR^[tap], ZPtr, gpreG, ZCnt);
+              TNNetVolume.MulAdd(GzPtr, @WiR^[tap], gpreI, ZCnt);
+              TNNetVolume.MulAdd(GzPtr, @WfR^[tap], gpreF, ZCnt);
+              TNNetVolume.MulAdd(GzPtr, @WoR^[tap], gpreO, ZCnt);
+              TNNetVolume.MulAdd(GzPtr, @WgR^[tap], gpreG, ZCnt);
             end;
           end;
         end;
@@ -64189,16 +64194,13 @@ begin
       for x := 0 to WM1 do
       begin
         GzPtr := FGz.GetRawPtr(y, x);
+        // Contiguous channel runs again: an accumulate and a copy (App. C).
         if hasInputGrad then
-          for oc := 0 to InCM1 do
-            PrevErr.Data[oy + y, x, oc] :=
-              PrevErr.Data[oy + y, x, oc] + GzPtr^[oc];
-        for oc := 0 to HiddenCM1 do
-        begin
-          FGh.Data[y, x, oc] := GzPtr^[FInC + oc];
-          FGcNext.Data[y, x, oc] := FGc.Data[y, x, oc];
-        end;
+          TNNetVolume.Add(PrevErr.GetRawPtr(oy + y, x), GzPtr, FInC);
+        Move(GzPtr^[FInC], FGh.FData[FGh.GetRawPos(y, x)], HiddenCBytes);
       end;
+    // FGc was fully rewritten by the loop above, so the carry is one copy.
+    FGcNext.Copy(FGc);
   end;
   for j := 0 to 3 do
     TNNetVolume.MulAdd(FNeurons[j].FDelta.GetRawPtr(), FGradW[j].GetRawPtr(),
