@@ -15517,6 +15517,8 @@ type
     // shared by Compute and Backpropagate (rule #17 — never SetLength per call).
     FArgBuf: array of TNeuralFloat;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    // Rebuilds FWinMax / FExpSum from the previous layer's output.
+    procedure RebuildWindowStats();
   public
     constructor Create(pPoolSize: integer; pStride: integer = 0;
       pPadding: integer = 0; pBeta: TNeuralFloat = 1.0); overload;
@@ -92887,17 +92889,20 @@ begin
   inherited Destroy();
 end;
 
-procedure TNNetSoftPool.Compute();
+// Builds the two per-output-cell window statistics the SoftPool weights are
+// made of: FWinMax (the window maximum of beta*x, the softmax max-subtraction
+// that keeps the exp in range) and FExpSum (the window sum of
+// exp(beta*x - winMax)). Both depend only on the previous layer's output.
+procedure TNNetSoftPool.RebuildWindowStats();
 var
   CntX, CntY, CntD: integer;
   MaxX, MaxY, MaxD: integer;
   OutX, OutY: integer;
-  StartTime: double;
   OutputRawPos: integer;
   InputRawPtr: TNeuralFloatPtr;
-  ExpVal, BetaX: TNeuralFloat;
+  BetaX: TNeuralFloat;
   {$IFDEF AVXANY}
-  WinMaxPtr, ExpSumPtr, OutPtr: TNeuralFloatPtr;
+  WinMaxPtr, ExpSumPtr: TNeuralFloatPtr;
   RowArg: TNeuralFloat;
   Depth: integer;
   {$ENDIF}
@@ -92905,20 +92910,9 @@ const
   cExpArgLo = -88.0;
   cExpArgHi = 88.0;
 begin
-  StartTime := Now();
-  // Per pooling window W and channel, with temperature beta (FFloatSt[0]):
-  //   w_i = exp(beta*x_i - winMax) / sum_j exp(beta*x_j - winMax)
-  //   y   = sum_i w_i * x_i
-  // where winMax = max_j (beta*x_j) stabilises the exp (max-subtraction trick),
-  // so large beta*x never overflows. Every cell of a window shares the same
-  // window-wide max and exp-sum, so we accumulate over the input cells in three
-  // passes using the (non-serialized) scratch volumes FWinMax (per-output-cell
-  // window maximum of beta*x) and FExpSum (window exp-sum). The final weighted
-  // sum is built into FOutput.
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
   MaxD := FPrevLayer.Output.Depth - 1;
-
   // Pass 1: window maximum of beta*x per output cell+channel (stability).
   FWinMax.ReSize(FOutput);
   FWinMax.Fill(-3.402823e38);
@@ -92998,6 +92992,46 @@ begin
       end;
     end;
   end;
+  {$ENDIF}
+end;
+
+procedure TNNetSoftPool.Compute();
+var
+  CntX, CntY, CntD: integer;
+  MaxX, MaxY, MaxD: integer;
+  OutX, OutY: integer;
+  StartTime: double;
+  OutputRawPos: integer;
+  InputRawPtr: TNeuralFloatPtr;
+  ExpVal, BetaX: TNeuralFloat;
+  {$IFDEF AVXANY}
+  WinMaxPtr, ExpSumPtr, OutPtr: TNeuralFloatPtr;
+  RowArg: TNeuralFloat;
+  Depth: integer;
+  {$ENDIF}
+const
+  cExpArgLo = -88.0;
+  cExpArgHi = 88.0;
+begin
+  StartTime := Now();
+  // Per pooling window W and channel, with temperature beta (FFloatSt[0]):
+  //   w_i = exp(beta*x_i - winMax) / sum_j exp(beta*x_j - winMax)
+  //   y   = sum_i w_i * x_i
+  // where winMax = max_j (beta*x_j) stabilises the exp (max-subtraction trick),
+  // so large beta*x never overflows. Every cell of a window shares the same
+  // window-wide max and exp-sum, so we accumulate over the input cells in three
+  // passes using the (non-serialized) scratch volumes FWinMax (per-output-cell
+  // window maximum of beta*x) and FExpSum (window exp-sum). The final weighted
+  // sum is built into FOutput.
+  MaxX := FPrevLayer.Output.SizeX - 1;
+  MaxY := FPrevLayer.Output.SizeY - 1;
+  MaxD := FPrevLayer.Output.Depth - 1;
+
+  RebuildWindowStats();
+  {$IFDEF AVXANY}
+  // Grow-only lazy resize of the persistent exp-argument row (rule #17).
+  Depth := MaxD + 1;
+  if Length(FArgBuf) < Depth then SetLength(FArgBuf, Depth);
   {$ENDIF}
 
   // Pass 3: weighted sum  y = sum_i x_i * exp(beta*x_i - winMax) / expSum, into
@@ -93096,82 +93130,18 @@ begin
   MaxY := FPrevLayer.Output.SizeY - 1;
   MaxD := FPrevLayer.Output.Depth - 1;
 
-  // Recompute, per output cell+channel, the window maximum of beta*x
-  // (stability) and the sum of exp(beta*x - winMax) so
-  // w_i = exp(beta*x_i - winMax) / expSum can be rebuilt. FWinMax = winMax,
-  // FExpSum = expSum (the non-serialized scratch volumes).
-  FWinMax.ReSize(FOutput);
-  FWinMax.Fill(-3.402823e38);
-  for CntX := 0 to MaxX do
-  begin
-    OutX := CntX div FPoolSize;
-    for CntY := 0 to MaxY do
-    begin
-      OutY := CntY div FPoolSize;
-      OutputRawPos := FWinMax.GetRawPos(OutX, OutY);
-      InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
-      for CntD := 0 to MaxD do
-      begin
-        BetaX := FBeta * InputRawPtr^;
-        if BetaX > FWinMax.FData[OutputRawPos] then
-          FWinMax.FData[OutputRawPos] := BetaX;
-        Inc(OutputRawPos);
-        Inc(InputRawPtr);
-      end;
-    end;
-  end;
-  FExpSum.ReSize(FOutput);
-  FExpSum.Fill(0);
+  // FWinMax / FExpSum are persistent layer scratch built by the matching
+  // forward from the SAME previous-layer output this backward reads, so the two
+  // full passes that produced them are not repeated here (the FVmem/FSpike and
+  // FCacheZP layers reuse their forward state the same way). The size test is
+  // the guard for a layer whose shape moved since -- or that was never computed
+  // -- in which case they are rebuilt.
+  if (FWinMax.Size <> FOutput.Size) or (FExpSum.Size <> FOutput.Size) then
+    RebuildWindowStats();
   {$IFDEF AVXANY}
-  // Depth axis contiguous: exponentiate (beta*x - winMax) 8-wide via AVXExp into
-  // a scratch buffer (argument pre-clamped to [-88,88], matching the forward),
-  // then accumulate into FExpSum.
+  // Grow-only lazy resize of the persistent exp-argument row (rule #17).
   Depth := MaxD + 1;
   if Length(FArgBuf) < Depth then SetLength(FArgBuf, Depth);
-  for CntX := 0 to MaxX do
-  begin
-    OutX := CntX div FPoolSize;
-    for CntY := 0 to MaxY do
-    begin
-      OutY := CntY div FPoolSize;
-      InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
-      WinMaxPtr := FWinMax.GetRawPtr(OutX, OutY);
-      ExpSumPtr := FExpSum.GetRawPtr(OutX, OutY);
-      for CntD := 0 to MaxD do
-      begin
-        RowArg := FBeta * InputRawPtr^ - WinMaxPtr^;
-        if RowArg < cExpArgLo then RowArg := cExpArgLo
-        else if RowArg > cExpArgHi then RowArg := cExpArgHi;
-        FArgBuf[CntD] := RowArg;
-        Inc(InputRawPtr);
-        Inc(WinMaxPtr);
-      end;
-      AVXExp(TNeuralFloatArrPtr(@FArgBuf[0]), TNeuralFloatArrPtr(@FArgBuf[0]), Depth);
-      for CntD := 0 to MaxD do
-      begin
-        ExpSumPtr^ := ExpSumPtr^ + FArgBuf[CntD];
-        Inc(ExpSumPtr);
-      end;
-    end;
-  end;
-  {$ELSE}
-  for CntX := 0 to MaxX do
-  begin
-    OutX := CntX div FPoolSize;
-    for CntY := 0 to MaxY do
-    begin
-      OutY := CntY div FPoolSize;
-      OutputRawPos := FExpSum.GetRawPos(OutX, OutY);
-      InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
-      for CntD := 0 to MaxD do
-      begin
-        FExpSum.FData[OutputRawPos] := FExpSum.FData[OutputRawPos] +
-          NeuralExp(FBeta * InputRawPtr^ - FWinMax.FData[OutputRawPos]);
-        Inc(OutputRawPos);
-        Inc(InputRawPtr);
-      end;
-    end;
-  end;
   {$ENDIF}
 
   // dy/dx_i = w_i * (1 + beta*(x_i - y)), so
