@@ -44788,6 +44788,7 @@ var
   gradBeta, beta, invBeta, x, betaX, sig, y: TNeuralFloat;
   i: integer;
   LocalPrevOutput: TNNetVolume;
+  HasDeriv: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -44801,28 +44802,48 @@ begin
   // Gradient w.r.t. the scalar beta:
   // d(beta) = sum_i OutputError[i] * (1/beta) * (x_i*sigmoid(beta*x_i) - y_i),
   // where y_i = (1/beta)*ln(1+exp(beta*x_i)) is the layer output.
+  // Compute already cached sigmoid(beta*x) in FOutputErrorDeriv and y in
+  // FOutput, under exactly this condition and with this same beta (the local
+  // is read before UpdateWeights fires below), so the backward reads them
+  // instead of running NeuralExp twice per element again.
+  HasDeriv := (FOutput.Size = FOutputError.Size) and
+              (FOutputErrorDeriv.Size = FOutput.Size);
   gradBeta := 0;
   MaxOutputErrorPos := FOutputError.Size - 1;
-  for i := 0 to MaxOutputErrorPos do
+  if HasDeriv then
   begin
-    x := LocalPrevOutput.Raw[i];
-    betaX := beta * x;
-    if betaX > 30 then
+    for i := 0 to MaxOutputErrorPos do
     begin
-      sig := 1.0;
-      y := x;
-    end
-    else if betaX < -30 then
-    begin
-      sig := NeuralExp(betaX);
-      y := invBeta * pcr_logf(1 + NeuralExp(betaX));
-    end
-    else
-    begin
-      sig := 1 / (1 + NeuralExp(-betaX));
-      y := invBeta * pcr_logf(1 + NeuralExp(betaX));
+      x := LocalPrevOutput.FData[i];
+      sig := FOutputErrorDeriv.FData[i];
+      y := FOutput.FData[i];
+      gradBeta := gradBeta + FOutputError.FData[i] * invBeta * (x * sig - y);
     end;
-    gradBeta := gradBeta + FOutputError.Raw[i] * invBeta * (x * sig - y);
+  end
+  else
+  begin
+    // Compute never filled the cache on this layer: recompute.
+    for i := 0 to MaxOutputErrorPos do
+    begin
+      x := LocalPrevOutput.Raw[i];
+      betaX := beta * x;
+      if betaX > 30 then
+      begin
+        sig := 1.0;
+        y := x;
+      end
+      else if betaX < -30 then
+      begin
+        sig := NeuralExp(betaX);
+        y := invBeta * pcr_logf(1 + NeuralExp(betaX));
+      end
+      else
+      begin
+        sig := 1 / (1 + NeuralExp(-betaX));
+        y := invBeta * pcr_logf(1 + NeuralExp(betaX));
+      end;
+      gradBeta := gradBeta + FOutputError.Raw[i] * invBeta * (x * sig - y);
+    end;
   end;
   localNeuron.FDelta.Raw[0] := localNeuron.FDelta.Raw[0] +
     (-FLearningRate) * gradBeta;
@@ -44836,19 +44857,25 @@ begin
   begin
     // Gradient w.r.t. the input: dInput[i] = OutputError[i] * sigmoid(beta*x_i).
     MaxPrevOutputErrorPos := FOutputError.Size - 1;
-    for i := 0 to MaxPrevOutputErrorPos do
-    begin
-      x := LocalPrevOutput.Raw[i];
-      betaX := beta * x;
-      if betaX > 30 then
-        sig := 1.0
-      else if betaX < -30 then
-        sig := NeuralExp(betaX)
-      else
-        sig := 1 / (1 + NeuralExp(-betaX));
-      FPrevLayer.FOutputError.Raw[i] := FPrevLayer.FOutputError.Raw[i] +
-        FOutputError.Raw[i] * sig;
-    end;
+    if HasDeriv then
+      // #13: the cached sigmoid turns the whole loop into one elementwise FMA.
+      TNNetVolume.MulAdd(FPrevLayer.FOutputError.GetRawPtr(),
+        FOutputError.GetRawPtr(), FOutputErrorDeriv.GetRawPtr(),
+        MaxPrevOutputErrorPos + 1)
+    else
+      for i := 0 to MaxPrevOutputErrorPos do
+      begin
+        x := LocalPrevOutput.Raw[i];
+        betaX := beta * x;
+        if betaX > 30 then
+          sig := 1.0
+        else if betaX < -30 then
+          sig := NeuralExp(betaX)
+        else
+          sig := 1 / (1 + NeuralExp(-betaX));
+        FPrevLayer.FOutputError.Raw[i] := FPrevLayer.FOutputError.Raw[i] +
+          FOutputError.Raw[i] * sig;
+      end;
     FPrevLayer.Backpropagate();
   end;
 end;
