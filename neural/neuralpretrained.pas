@@ -4863,6 +4863,9 @@ type
     // RVQ: per quantizer an in_proj (1x1), out_proj (1x1) and a raw codebook.
     FInProj, FOutProj: array of TEnCodecConv;
     FCodebooks: array of TEnCodecMat;                  // [size, codebook_dim]
+    // #27: L2-normalized copy of every codebook row. Depends only on the loaded
+    // weights, so it is built once by the loader, not per Encode call.
+    FCodebookNorms: TMimiDblArr2D;                     // [q][size*codebook_dim]
     // Decoder: conv1, then NumStages blocks, then snake+conv2(+tanh). A block is
     // a snake-alpha + an upsample conv-transpose + three residual units.
     FDecConv1: TEnCodecConv;
@@ -44432,6 +44435,41 @@ begin
   end;
 end;
 
+// #27: builds the L2-normalized (over codebook_dim) copy of every DAC codebook
+// row. Called once from the loader; Encode then only reads it.
+procedure BuildDACCodebookNorm(const Codebooks: array of TEnCodecMat;
+  Cd: integer; out Norms: TMimiDblArr2D);
+var
+  q, cbk, d, CbSize, rowBase, NQM1, CbSizeM1, CdM1: integer;
+  cn: double;
+  CBData: TNeuralFloatDynArr;
+  CBN: TMimiDblArr;
+begin
+  NQM1 := Length(Codebooks) - 1;
+  CdM1 := Cd - 1;
+  SetLength(Norms, NQM1 + 1);
+  for q := 0 to NQM1 do
+  begin
+    CbSize := Codebooks[q].Rows;
+    CbSizeM1 := CbSize - 1;
+    SetLength(Norms[q], CbSize * Cd);
+    CBData := Codebooks[q].Data;   // #9: bind source/dest chains once
+    CBN := Norms[q];
+    rowBase := 0;                  // #6: cbk*Cd carried
+    for cbk := 0 to CbSizeM1 do
+    begin
+      cn := 0;
+      for d := 0 to CdM1 do
+        cn := cn + Sqr(CBData[rowBase + d]);
+      cn := Sqrt(cn);
+      if cn = 0 then cn := 1e-12;
+      for d := 0 to CdM1 do
+        CBN[rowBase + d] := CBData[rowBase + d] / cn;
+      Inc(rowBase, Cd);
+    end;
+  end;
+end;
+
 procedure TNNetDAC.Encode(const Waveform: array of TNeuralFloat;
   out Codes: TNNetIntArr2D; out FrameCount: integer);
 var
@@ -44440,12 +44478,11 @@ var
   Frames, FramesM1, Stride, Pad, Km: integer;
   Residual, NormP: TMimiDblArr;
   cbk, best: integer;
-  pn, cn, dot, BestSim: double;
-  CodebookNorms: TMimiDblArr2D; // L2-normalized codebook rows per quantizer
-  CBN: TMimiDblArr;             // reference bind of CodebookNorms[q]
+  pn, dot, BestSim: double;
+  CBN: TMimiDblArr;             // reference bind of FCodebookNorms[q]
   WIn, BIn, WOut, BOut, CBData: TNeuralFloatDynArr; // #9 per-q field binds
   CbSize, d, CdM1: integer;
-  wBase, cbBase, bestBase, oBase, rowBase: integer;
+  wBase, cbBase, bestBase, oBase: integer;
   WaveLenM1, NumStagesM1, EncResHigh, NQM1, CbSizeM1, HiddenDimM1: integer;
 begin
   // input -> [1][T]
@@ -44486,29 +44523,6 @@ begin
   SetLength(Codes, NQ);
   for q := 0 to NQM1 do SetLength(Codes[q], Frames);
 
-  // Pre-normalize each codebook's rows once (L2 over codebook_dim).
-  SetLength(CodebookNorms, NQ);
-  for q := 0 to NQM1 do
-  begin
-    CbSize := FCodebooks[q].Rows;
-    CbSizeM1 := CbSize - 1;
-    SetLength(CodebookNorms[q], CbSize * Cd);
-    CBData := FCodebooks[q].Data;   // #9: bind source/dest chains once
-    CBN := CodebookNorms[q];
-    rowBase := 0;                   // #6: cbk*Cd carried
-    for cbk := 0 to CbSizeM1 do
-    begin
-      cn := 0;
-      for d := 0 to CdM1 do
-        cn := cn + Sqr(CBData[rowBase + d]);
-      cn := Sqrt(cn);
-      if cn = 0 then cn := 1e-12;
-      for d := 0 to CdM1 do
-        CBN[rowBase + d] := CBData[rowBase + d] / cn;
-      Inc(rowBase, Cd);
-    end;
-  end;
-
   SetLength(Residual, HiddenDim);
   SetLength(NormP, Cd);
   for t := 0 to FramesM1 do
@@ -44545,7 +44559,7 @@ begin
       CbSize := FCodebooks[q].Rows;
       CbSizeM1 := CbSize - 1;
       best := 0; BestSim := -1e30;
-      CBN := CodebookNorms[q];
+      CBN := FCodebookNorms[q];
       cbBase := 0; // cbk * Cd
       for cbk := 0 to CbSizeM1 do
       begin
@@ -44730,6 +44744,12 @@ begin
       LoadEnCodecMat(Reader, QPref + '.codebook.weight', Model.FCodebooks[q],
         Consumed);
     end;
+    // #27: the normalized codebook copy the RVQ search compares against depends
+    // only on the weights just loaded. Built here, so a reload rebuilds it and
+    // Encode never touches it - it used to be rebuilt (NQ*CbSize Sqrts and
+    // NQ*CbSize*Cd divides) on every single call.
+    BuildDACCodebookNorm(Model.FCodebooks, Model.FConfig.CodebookDim,
+      Model.FCodebookNorms);
 
     // ---------------- DECODER ----------------
     LoadDACConv(Reader, 'decoder.conv1', Model.FDecConv1, False, 1, 1, Consumed);
