@@ -7634,6 +7634,10 @@ type
       procedure ComputeOpenCL();
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      // Releases FNormalized / FInvRMS / FGainGradScratch: they are read only
+      // by Backpropagate, so an inference-only layer neither fills nor needs
+      // them. ComputeRange keys the x_hat snapshot on FNormalized's size.
+      procedure FreeBackpropScratch();
     protected
       // Length of one normalization segment. 0 (the default) resolves to the
       // full Depth in SetPrevLayer - the classic per-token RMSNorm. The
@@ -7658,6 +7662,7 @@ type
       constructor Create(); overload; override;
       constructor Create(pEpsilon: TNeuralFloat); reintroduce; overload;
       destructor Destroy(); override;
+      function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -70886,6 +70891,29 @@ begin
   inherited Destroy();
 end;
 
+procedure TNNetTokenRMSNorm.FreeBackpropScratch();
+begin
+  FNormalized.ReSize(1, 1, 1);
+  FInvRMS.ReSize(1, 1, 1);
+  FGainGradScratch.ReSize(1, 1, 1);
+end;
+
+function TNNetTokenRMSNorm.SetTrainable(pTrainable: boolean;
+  pLowMemory: boolean): TNNetLayer;
+begin
+  Result := inherited SetTrainable(pTrainable, pLowMemory);
+  if pTrainable then
+  begin
+    if Assigned(FPrevLayer) then
+    begin
+      FNormalized.ReSize(FOutput);
+      FInvRMS.ReSize(FOutput.SizeX, FOutput.SizeY, FOutput.Depth div FNormDim);
+      FGainGradScratch.ReSize(1, 1, FNormDim);
+    end;
+  end
+  else FreeBackpropScratch();
+end;
+
 procedure TNNetTokenRMSNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -70893,10 +70921,14 @@ begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
   // FNeurons[0] holds the shared per-segment gain (FNormDim weights, no bias).
   SetNumWeightsForAllNeurons(1, 1, FNormDim);
-  FNormalized.ReSize(FOutput);
-  // One invRMS slot per segment (= per token, or per token x head when tiled).
-  FInvRMS.ReSize(FOutput.SizeX, FOutput.SizeY, FOutput.Depth div FNormDim);
-  FGainGradScratch.ReSize(1, 1, FNormDim);
+  if FIsTrainable then
+  begin
+    FNormalized.ReSize(FOutput);
+    // One invRMS slot per segment (per token, or per token x head when tiled).
+    FInvRMS.ReSize(FOutput.SizeX, FOutput.SizeY, FOutput.Depth div FNormDim);
+    FGainGradScratch.ReSize(1, 1, FNormDim);
+  end
+  else FreeBackpropScratch();
   SetOutputErrorSize(FOutput);
   {$IFDEF OpenCL}
   FShouldOpenCL := false; // bandwidth-bound: GPU < CPU at every size (OpenCLForwardBenchmark ~0.54x), pin to CPU. Old verdict: Int64(FOutput.Size) >= cNeuralOpenCLMinWork
@@ -70951,6 +70983,7 @@ procedure TNNetTokenRMSNorm.ComputeRange(StartRange, FinRange: integer);
 var
   Depth, TokenCnt, BaseIdx: integer;
   MeanSqr, InvRMSV: TNeuralFloat;
+  KeepNorm: boolean;
   GainPtr, XPtr, XHatPtr, OutPtr: TNeuralFloatArrPtr;
 begin
   // Segment index runs over the flattened normalization groups: per token for
@@ -70964,21 +70997,28 @@ begin
   // owned by this segment range.
   Depth := FNormDim;
   GainPtr := FNeurons[0].FWeights.GetRawPtr();
+  // FNormalized / FInvRMS are read only by Backpropagate and are released on
+  // an inference-only layer, so the snapshot is keyed on the buffer still
+  // being there (#20: one test for the whole range, not one per segment).
+  KeepNorm := FNormalized.Size = FOutput.Size;
   for TokenCnt := StartRange to FinRange do
   begin
     BaseIdx := TokenCnt * Depth;
     XPtr := FPrevLayer.FOutput.GetRawPtr(BaseIdx);
-    XHatPtr := FNormalized.GetRawPtr(BaseIdx);
     OutPtr := FOutput.GetRawPtr(BaseIdx);
     // mean( x^2 ) via the vectorized dot product of the segment with itself.
     MeanSqr := TNNetVolume.DotProduct(XPtr, XPtr, Depth) / Depth;
     InvRMSV := 1 / Sqrt(MeanSqr + FTokenRMSEpsilon);
-    FInvRMS.FData[TokenCnt] := InvRMSV;
-    // x_hat = x * invRMS  (store normalized, then produce the gained output).
-    system.Move(XPtr^, XHatPtr^, Depth * csNeuralFloatSize);
-    TNNetVolume.Mul(XHatPtr, InvRMSV, Depth);
+    // x_hat = x * invRMS, normalized straight into the output segment.
+    system.Move(XPtr^, OutPtr^, Depth * csNeuralFloatSize);
+    TNNetVolume.Mul(OutPtr, InvRMSV, Depth);
+    if KeepNorm then
+    begin
+      FInvRMS.FData[TokenCnt] := InvRMSV;
+      XHatPtr := FNormalized.GetRawPtr(BaseIdx);
+      system.Move(OutPtr^, XHatPtr^, Depth * csNeuralFloatSize);
+    end;
     // FOutput = gain .* x_hat  (elementwise multiply over the depth segment).
-    system.Move(XHatPtr^, OutPtr^, Depth * csNeuralFloatSize);
     TNNetVolume.Mul(OutPtr, GainPtr, Depth);
   end;
 end;
