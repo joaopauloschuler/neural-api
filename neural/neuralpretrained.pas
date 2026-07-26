@@ -42004,14 +42004,25 @@ end;
 procedure TEnCodecModel.EncodeAudioToCodes(
   const Waveform: array of TNeuralFloat;
   out Codes: TNNetIntArr2D; out FrameCount: integer);
+const
+  // Frames are independent in RVQ (the residual chain runs across q WITHIN one
+  // frame), so the frame axis can be blocked: one codebook row is read once and
+  // scored against every residual in the block. csRvqFrameBlock * HiddenSize
+  // floats is the working set that must stay L1-resident (16 * 128 * 4 = 8 KB
+  // for EnCodec-32k).
+  csRvqFrameBlock = 16;
 var
   Sig, Nxt: TNNetFloatDynArr2D;
   s, q, t, d, best, K, Dm, Frames: integer;
   WaveformMax, EncStagesMax, CodebooksMax, FramesM1, DmM1, KM1: integer;
   sBase: integer;
-  Dist, BestDist: TNeuralFloat;
+  t0, tt, b, BCountM1, rBase: integer;
+  CNorm, Dist: TNeuralFloat;
   CBN: TNeuralFloatDynArr;   // #14: bound FCodebookNormSqr[q]
-  Residual, Vec, CB: TNeuralFloatDynArr;
+  CB: TNeuralFloatDynArr;
+  RBuf: TNeuralFloatDynArr;      // csRvqFrameBlock residuals, frame-major
+  BestDist: TNeuralFloatDynArr;  // per blocked frame
+  BestIdx: TNeuralIntegerArray;  // per blocked frame
 begin
   EnsureThreadPool;
   // Channel-major input (mono): Sig[0][t] = waveform.
@@ -42041,33 +42052,64 @@ begin
   DmM1 := Dm - 1;
   KM1 := K - 1;
   SetLength(Codes, Length(FCodebooks));
-  SetLength(Residual, Dm);
-  SetLength(Vec, Dm);
+  SetLength(RBuf, csRvqFrameBlock * Dm);
+  SetLength(BestDist, csRvqFrameBlock);
+  SetLength(BestIdx, csRvqFrameBlock);
   for q := 0 to CodebooksMax do SetLength(Codes[q], Frames);
-  for t := 0 to FramesM1 do
+  // Frame-blocked RVQ. The scan is memory-bound: unblocked, every frame streams
+  // all NQ codebooks end to end (NQ*K*Dm floats per frame) for only NQ*K*Dm MACs
+  // - under one MAC per byte. Blocking csRvqFrameBlock frames cuts the codebook
+  // traffic by that factor; the dots, their order and the argmin comparisons per
+  // frame are unchanged, so the codes are bit-identical to the per-frame form.
+  t0 := 0;
+  while t0 <= FramesM1 do
   begin
-    for d := 0 to DmM1 do Residual[d] := Sig[d][t];
+    BCountM1 := csRvqFrameBlock - 1;
+    if t0 + BCountM1 > FramesM1 then BCountM1 := FramesM1 - t0;
+    rBase := 0;
+    for b := 0 to BCountM1 do
+    begin
+      tt := t0 + b;
+      for d := 0 to DmM1 do RBuf[rBase + d] := Sig[d][tt];
+      Inc(rBase, Dm);
+    end;
     for q := 0 to CodebooksMax do
     begin
       CB := FCodebooks[q].Data;
       CBN := FCodebookNormSqr[q];
-      best := 0; BestDist := 1e30;
+      for b := 0 to BCountM1 do
+      begin
+        BestDist[b] := 1e30; BestIdx[b] := 0;
+      end;
       sBase := 0; // s*Dm carried
       // #14: argmin ||r-c||^2 = argmin (||c||^2 - 2 r.c) since ||r||^2 is shared
       // across candidates (monotone rank; identical winner). AVX dot + one FMA.
       for s := 0 to KM1 do
       begin
-        Dist := CBN[s] - 2 *
-          TNNetVolume.DotProduct(Addr(Residual[0]), Addr(CB[sBase]), Dm);
-        if Dist < BestDist then
-        begin BestDist := Dist; best := s; end;
+        CNorm := CBN[s];   // #11: invariant across the block
+        rBase := 0;
+        for b := 0 to BCountM1 do
+        begin
+          Dist := CNorm - 2 *
+            TNNetVolume.DotProduct(Addr(RBuf[rBase]), Addr(CB[sBase]), Dm);
+          if Dist < BestDist[b] then
+          begin BestDist[b] := Dist; BestIdx[b] := s; end;
+          Inc(rBase, Dm);
+        end;
         Inc(sBase, Dm);
       end;
-      Codes[q][t] := best;
-      // Subtract the chosen code from the residual for the next stage
-      // (scaled accumulate: Residual += CB[best*Dm..] * -1).
-      TNNetVolume.MulAdd(Addr(Residual[0]), Addr(CB[best * Dm]), -1, Dm);
+      rBase := 0;
+      for b := 0 to BCountM1 do
+      begin
+        best := BestIdx[b];
+        Codes[q][t0 + b] := best;
+        // Subtract the chosen code from this frame's residual for the next
+        // stage (scaled accumulate: Residual += CB[best*Dm..] * -1).
+        TNNetVolume.MulAdd(Addr(RBuf[rBase]), Addr(CB[best * Dm]), -1, Dm);
+        Inc(rBase, Dm);
+      end;
     end;
+    Inc(t0, csRvqFrameBlock);
   end;
 end;
 
@@ -43377,15 +43419,24 @@ end;
 
 procedure TNNetMimi.Encode(const Waveform: array of TNeuralFloat;
   out Codes: TNNetIntArr2D; out FrameCount: integer);
+const
+  // See TEnCodecModel.EncodeAudioToCodes: frames are independent, so blocking
+  // the frame axis reads each codebook row once per block instead of once per
+  // frame. Mimi's residual is Double, so the block working set is
+  // csMimiRvqFrameBlock * VqHiddenDim * 8 bytes (8 * 256 * 8 = 16 KB).
+  csMimiRvqFrameBlock = 8;
 var
   Sig, Nxt, Proj: TMimiDblArr2D;
   s, q, t, d, best, Dm, Frames, K, NSem, NAco: integer;
   WaveLenM1, EncStagesM1, NSemNAcoM1, FramesM1, DmM1, NSemM1, NAcoM1, KM1: integer;
   sBase, bestBase: integer;
+  t0, tt, b, BCountM1, rBase: integer;
   CB: TNeuralFloatDynArr;
   CBN: TMimiDblArr;   // #14: bound codebook ||c||^2 table
-  Dist, BestDist: double;
-  Residual: TMimiDblArr;
+  CNorm, Dist: double;
+  RBuf: TMimiDblArr;             // csMimiRvqFrameBlock residuals, frame-major
+  BestDist: TMimiDblArr;         // per blocked frame
+  BestIdx: TNeuralIntegerArray;  // per blocked frame
 begin
   SetLength(Sig, FConfig.AudioChannels);
   SetLength(Sig[0], Length(Waveform));
@@ -43420,64 +43471,119 @@ begin
   RunMimiConv(FSemInProj, Sig, Proj);
   Dm := FConfig.VqHiddenDim;
   DmM1 := Dm - 1;
-  SetLength(Residual, Dm);
-  for t := 0 to FramesM1 do
+  SetLength(RBuf, csMimiRvqFrameBlock * Dm);
+  SetLength(BestDist, csMimiRvqFrameBlock);
+  SetLength(BestIdx, csMimiRvqFrameBlock);
+  // Frame-blocked RVQ: each codebook row is read once per block of frames
+  // instead of once per frame. Every dot keeps its element order and every
+  // argmin sees the same candidate sequence, so the codes are bit-identical.
+  t0 := 0;
+  while t0 <= FramesM1 do
   begin
-    for d := 0 to DmM1 do Residual[d] := Proj[d][t];
+    BCountM1 := csMimiRvqFrameBlock - 1;
+    if t0 + BCountM1 > FramesM1 then BCountM1 := FramesM1 - t0;
+    rBase := 0;
+    for b := 0 to BCountM1 do
+    begin
+      tt := t0 + b;
+      for d := 0 to DmM1 do RBuf[rBase + d] := Proj[d][tt];
+      Inc(rBase, Dm);
+    end;
     for q := 0 to NSemM1 do
     begin
       CB := FSemCodebooks[q].Data;
       CBN := FSemCodebookNormSqr[q];
-      best := 0; BestDist := 1e30;
+      for b := 0 to BCountM1 do
+      begin
+        BestDist[b] := 1e30; BestIdx[b] := 0;
+      end;
       sBase := 0; // s*Dm carried
       // #14: argmin ||r-c||^2 = argmin(||c||^2 - 2 r.c) since ||r||^2 is shared
       // across candidates (identical winner). Double scalar dot (Mimi carve-out).
       for s := 0 to KM1 do
       begin
-        Dist := 0;
-        for d := 0 to DmM1 do
-          Dist := Dist + Residual[d] * CB[sBase + d];
-        Dist := CBN[s] - 2 * Dist;
-        if Dist < BestDist then
-        begin BestDist := Dist; best := s; end;
+        CNorm := CBN[s];   // #11: invariant across the block
+        rBase := 0;
+        for b := 0 to BCountM1 do
+        begin
+          Dist := 0;
+          for d := 0 to DmM1 do
+            Dist := Dist + RBuf[rBase + d] * CB[sBase + d];
+          Dist := CNorm - 2 * Dist;
+          if Dist < BestDist[b] then
+          begin BestDist[b] := Dist; BestIdx[b] := s; end;
+          Inc(rBase, Dm);
+        end;
         Inc(sBase, Dm);
       end;
-      Codes[q][t] := best;
-      // double residual: no single-precision bulk primitive applies, scalar
-      // subtract with hoisted codebook row + code base.
-      bestBase := best * Dm;
-      for d := 0 to DmM1 do
-        Residual[d] := Residual[d] - CB[bestBase + d];
+      rBase := 0;
+      for b := 0 to BCountM1 do
+      begin
+        best := BestIdx[b];
+        Codes[q][t0 + b] := best;
+        // double residual: no single-precision bulk primitive applies, scalar
+        // subtract with hoisted codebook row + code base.
+        bestBase := best * Dm;
+        for d := 0 to DmM1 do
+          RBuf[rBase + d] := RBuf[rBase + d] - CB[bestBase + d];
+        Inc(rBase, Dm);
+      end;
     end;
+    Inc(t0, csMimiRvqFrameBlock);
   end;
 
   // ---- acoustic RVQ ----
   RunMimiConv(FAcoInProj, Sig, Proj);
-  for t := 0 to FramesM1 do
+  t0 := 0;
+  while t0 <= FramesM1 do
   begin
-    for d := 0 to DmM1 do Residual[d] := Proj[d][t];
+    BCountM1 := csMimiRvqFrameBlock - 1;
+    if t0 + BCountM1 > FramesM1 then BCountM1 := FramesM1 - t0;
+    rBase := 0;
+    for b := 0 to BCountM1 do
+    begin
+      tt := t0 + b;
+      for d := 0 to DmM1 do RBuf[rBase + d] := Proj[d][tt];
+      Inc(rBase, Dm);
+    end;
     for q := 0 to NAcoM1 do
     begin
       CB := FAcoCodebooks[q].Data;
       CBN := FAcoCodebookNormSqr[q];
-      best := 0; BestDist := 1e30;
+      for b := 0 to BCountM1 do
+      begin
+        BestDist[b] := 1e30; BestIdx[b] := 0;
+      end;
       sBase := 0; // s*Dm carried
       // #14: argmin(||c||^2 - 2 r.c) (see semantic RVQ above).
       for s := 0 to KM1 do
       begin
-        Dist := 0;
-        for d := 0 to DmM1 do
-          Dist := Dist + Residual[d] * CB[sBase + d];
-        Dist := CBN[s] - 2 * Dist;
-        if Dist < BestDist then
-        begin BestDist := Dist; best := s; end;
+        CNorm := CBN[s];
+        rBase := 0;
+        for b := 0 to BCountM1 do
+        begin
+          Dist := 0;
+          for d := 0 to DmM1 do
+            Dist := Dist + RBuf[rBase + d] * CB[sBase + d];
+          Dist := CNorm - 2 * Dist;
+          if Dist < BestDist[b] then
+          begin BestDist[b] := Dist; BestIdx[b] := s; end;
+          Inc(rBase, Dm);
+        end;
         Inc(sBase, Dm);
       end;
-      Codes[NSem + q][t] := best;
-      bestBase := best * Dm;
-      for d := 0 to DmM1 do
-        Residual[d] := Residual[d] - CB[bestBase + d];
+      rBase := 0;
+      for b := 0 to BCountM1 do
+      begin
+        best := BestIdx[b];
+        Codes[NSem + q][t0 + b] := best;
+        bestBase := best * Dm;
+        for d := 0 to DmM1 do
+          RBuf[rBase + d] := RBuf[rBase + d] - CB[bestBase + d];
+        Inc(rBase, Dm);
+      end;
     end;
+    Inc(t0, csMimiRvqFrameBlock);
   end;
 end;
 
