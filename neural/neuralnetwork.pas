@@ -67965,9 +67965,10 @@ begin
       TNNetVolume.Mul(@FH.FData[ebase], @FAt.FData[hbase], NS);
       TNNetVolume.MulAdd(@FH.FData[ebase], @FBt.FData[tNS], spxd, NS);
       Move(FH.FData[ebase], FState.FData[hbase], NSFloatSize);
-      // Read-out accY = sum_s c_t[s]*h_new[s]: FCt row + FState row both
-      // contiguous over the state axis -> AVX dot product.
-      accY := TNNetVolume.DotProduct(@FCt.FData[tNS], @FState.FData[hbase], NS);
+      // Read-out accY = sum_s c_t[s]*h_new[s]: FCt row + the just-updated FH row
+      // both contiguous over the state axis -> AVX dot product. FH is the live
+      // (1,1,Depth*NS) state, so it stays in cache; FState is the BPTT cache.
+      accY := TNNetVolume.DotProduct(@FCt.FData[tNS], @FH.FData[ebase], NS);
       OutPtr^[d] := accY + Ee.FData[d] * xd;
       Inc(hbase, NS);
       Inc(ebase, NS);
@@ -68097,9 +68098,10 @@ begin
       TNNetVolume.Mul(@FH.FData[ebase], @FAt.FData[hbase], NS);
       TNNetVolume.MulAdd(@FH.FData[ebase], @FBt.FData[tNS], spxd, NS);
       Move(FH.FData[ebase], FState.FData[hbase], NSFloatSize);
-      // Read-out accY = sum_s c_t[s]*h_new[s]: FCt row + FState row both
-      // contiguous over the state axis -> AVX dot product.
-      accY := TNNetVolume.DotProduct(@FCt.FData[tNS], @FState.FData[hbase], NS);
+      // Read-out accY = sum_s c_t[s]*h_new[s]: FCt row + the just-updated FH row
+      // both contiguous over the state axis -> AVX dot product. FH is the live
+      // (1,1,Depth*NS) state, so it stays in cache; FState is the BPTT cache.
+      accY := TNNetVolume.DotProduct(@FCt.FData[tNS], @FH.FData[ebase], NS);
       OutPtr^[d] := accY + Ee.FData[d] * xd;
       Inc(hbase, NS);
       Inc(ebase, NS);
@@ -68685,8 +68687,10 @@ begin
           FState.FData[hbase + s] := hnew;
         end;
         // Read-out accY = sum_s C_t[s]*h_new[s]: the C slice of x_t and the
-        // FState row are both contiguous over the state axis -> AVX dot product.
-        accY := TNNetVolume.DotProduct(@XtPtr^[cBase], @FState.FData[hbase], N);
+        // just-updated FH row are both contiguous over the state axis -> AVX dot
+        // product. FH is the live (1,1,dInner*N) state, so it stays in cache;
+        // FState is the BPTT cache.
+        accY := TNNetVolume.DotProduct(@XtPtr^[cBase], @FH.FData[ebase], N);
         FY.FData[tDInner + xbase] := accY + Dd.FData[h] * xv;
       end;
     end;
