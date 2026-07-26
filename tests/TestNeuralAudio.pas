@@ -48,6 +48,11 @@ type
     // A pure low-frequency sine survives 44.1k -> 16k and 8k -> 16k with its
     // fundamental (zero-crossing rate) preserved within tolerance.
     procedure TestResampleSinePreservesFrequency;
+    // The mixed-radix real DFT must agree with the direct O(N*NumBins)
+    // evaluation on random frames, including a prime N (no decomposition).
+    procedure TestMixedRadixDFTMatchesDirect;
+    // SplitTwoFactors returns the balanced factor pair, or fails on a prime.
+    procedure TestSplitTwoFactors;
     // The polyphase kernel table must agree with a straightforward per-tap
     // Lanczos evaluation on random signals, over up/down/near-coprime rates.
     procedure TestResampleMatchesDirectKernel;
@@ -496,6 +501,79 @@ begin
   finally
     Src.Free;
     Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralAudio.TestSplitTwoFactors;
+var
+  N1, N2: integer;
+begin
+  AssertTrue('400 splits', SplitTwoFactors(400, N1, N2));
+  AssertEquals('400 = 20 * 20 (N1)', 20, N1);
+  AssertEquals('400 = 20 * 20 (N2)', 20, N2);
+  AssertTrue('512 splits', SplitTwoFactors(512, N1, N2));
+  AssertEquals('512 N1', 16, N1);
+  AssertEquals('512 N2', 32, N2);
+  AssertTrue('36 splits', SplitTwoFactors(36, N1, N2));
+  AssertEquals('36 N1', 6, N1);
+  AssertEquals('36 N2', 6, N2);
+  AssertTrue('30 splits', SplitTwoFactors(30, N1, N2));
+  AssertEquals('30 N1', 5, N1);
+  AssertEquals('30 N2', 6, N2);
+  AssertFalse('101 is prime', SplitTwoFactors(101, N1, N2));
+  AssertEquals('prime N1 falls back to N', 101, N1);
+  AssertEquals('prime N2 falls back to 1', 1, N2);
+end;
+
+procedure TTestNeuralAudio.TestMixedRadixDFTMatchesDirect;
+const
+  cCases = 6;
+  cSizes: array[0..cCases - 1] of integer = (400, 512, 36, 30, 101, 200);
+var
+  Frame, CosTab, SinTab, ScrRe, ScrIm, Got, Want: array of double;
+  CaseCnt, N, NumBins, N1, N2, i, k: integer;
+  Diff, MaxDiff, Scale: double;
+begin
+  RandSeed := 20260726;
+  for CaseCnt := 0 to cCases - 1 do
+  begin
+    N := cSizes[CaseCnt];
+    NumBins := N div 2 + 1;
+    SetLength(Frame, N);
+    SetLength(CosTab, N);
+    SetLength(SinTab, N);
+    SetLength(ScrRe, N);
+    SetLength(ScrIm, N);
+    SetLength(Got, NumBins);
+    SetLength(Want, NumBins);
+    for i := 0 to N - 1 do
+    begin
+      Frame[i] := Random - 0.5;
+      CosTab[i] := Cos(2.0 * Pi * i / N);
+      SinTab[i] := Sin(2.0 * Pi * i / N);
+    end;
+    // Reference: force the direct path with an invalid factor pair.
+    RealFramePowerSpectrum(Frame, N, NumBins, 0, 0, CosTab, SinTab,
+      ScrRe, ScrIm, Want);
+    SplitTwoFactors(N, N1, N2);
+    RealFramePowerSpectrum(Frame, N, NumBins, N1, N2, CosTab, SinTab,
+      ScrRe, ScrIm, Got);
+    // Power of a unit-ish random frame is O(N); compare relative to that.
+    Scale := N;
+    MaxDiff := 0;
+    for k := 0 to NumBins - 1 do
+    begin
+      Diff := Abs(Got[k] - Want[k]) / Scale;
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('mixed-radix matches direct DFT for N=' + IntToStr(N) +
+      ' (' + IntToStr(N1) + 'x' + IntToStr(N2) + ', rel max diff ' +
+      FloatToStr(MaxDiff) + ')', MaxDiff < 1e-12);
+    // Bin 0 is the squared DC sum - an independent closed form.
+    Diff := 0;
+    for i := 0 to N - 1 do Diff := Diff + Frame[i];
+    AssertTrue('DC bin for N=' + IntToStr(N),
+      Abs(Got[0] - Diff * Diff) < 1e-9);
   end;
 end;
 

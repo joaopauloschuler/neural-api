@@ -107,6 +107,30 @@ function ResampleVolumeTo16k(Wave: TNNetVolume; SourceRate: integer): TNNetVolum
 function LoadWavResampledToVolume(const FileName: string; Samples: TNNetVolume;
   TargetRate: integer = 16000): integer;
 
+// Balanced two-factor split N = N1 * N2 with N1 as close to sqrt(N) as it can
+// be. Returns False (and N1 = N, N2 = 1) when N is prime, i.e. when no useful
+// Cooley-Tukey decomposition exists.
+function SplitTwoFactors(N: integer; out N1, N2: integer): boolean;
+
+// One-sided power spectrum |X[k]|^2 for k = 0..NumBins-1 of a real N-point
+// frame, where X[k] = sum_n Frame[n] * (cos(2*pi*n*k/N) + i*sin(2*pi*n*k/N))
+// - the codebase's forward STFT convention (stored Im = +sum x*sin; the sign
+// is irrelevant to the power anyway).
+//
+// When N = N1 * N2 with N1, N2 > 1 this runs a two-factor Cooley-Tukey
+// decomposition costing ~N*(N1+N2) butterflies instead of the direct
+// N*NumBins, plus it evaluates only the k2 that land inside NumBins. Pass
+// N1 = 0 (or a pair that does not multiply to N) to force the direct
+// evaluation, which is also the correct path for a prime N.
+//
+// CosTab/SinTab must hold cos/sin(2*pi*j/N) for j = 0..N-1. ScrRe/ScrIm are
+// caller-owned scratch of at least N doubles each: this routine allocates
+// nothing because it runs once per STFT frame.
+procedure RealFramePowerSpectrum(const Frame: array of double;
+  N, NumBins, N1, N2: integer;
+  const CosTab, SinTab: array of double;
+  var ScrRe, ScrIm, PowerOut: array of double);
+
 // HF WhisperFeatureExtractor log-mel spectrogram (see the unit header).
 // Samples: mono waveform at 16 kHz, any length (padded/truncated to
 // NumFrames*160 samples). Mel is resized to (NumFrames, 1, NumMelBins).
@@ -658,6 +682,126 @@ begin
     Result := 200.0 * Mels / 3.0;
 end;
 
+function SplitTwoFactors(N: integer; out N1, N2: integer): boolean;
+var
+  I, Root: integer;
+begin
+  N1 := N;
+  N2 := 1;
+  Result := False;
+  if N < 4 then Exit;
+  Root := Trunc(Sqrt(N * 1.0));
+  // Guard against a sqrt that landed one below the true integer root.
+  while (Root + 1) * (Root + 1) <= N do Inc(Root);
+  for I := Root downto 2 do
+    if N mod I = 0 then
+    begin
+      N1 := I;
+      N2 := N div I;
+      Exit(True);
+    end;
+end;
+
+procedure RealFramePowerSpectrum(const Frame: array of double;
+  N, NumBins, N1, N2: integer;
+  const CosTab, SinTab: array of double;
+  var ScrRe, ScrIm, PowerOut: array of double);
+var
+  K, K1, K2, N1Cnt, N2Cnt, NM1, N1M1, N2M1, NumBinsM1: integer;
+  Tw, TwStep, TwFix, SrcIdx, DstBase: integer;
+  Re, Im, Br, Bi, C, S, V: double;
+begin
+  NM1 := N - 1;
+  NumBinsM1 := NumBins - 1;
+  if (N1 < 2) or (N2 < 2) or (N1 * N2 <> N) then
+  begin
+    // Direct evaluation: the correct path for a prime N (and the reference the
+    // decomposition below is checked against).
+    for K := 0 to NumBinsM1 do
+    begin
+      Re := 0.0;
+      Im := 0.0;
+      Tw := 0;
+      for N1Cnt := 0 to NM1 do
+      begin
+        V := Frame[N1Cnt];
+        Re := Re + V * CosTab[Tw];
+        Im := Im + V * SinTab[Tw];
+        Inc(Tw, K);
+        if Tw >= N then Dec(Tw, N);
+      end;
+      PowerOut[K] := Re * Re + Im * Im;
+    end;
+    Exit;
+  end;
+
+  N1M1 := N1 - 1;
+  N2M1 := N2 - 1;
+  // Cooley-Tukey with n = N2*n1 + n2 and k = k1 + N1*k2.
+  //
+  // Stage 1: for every n2, a length-N1 DFT down the stride-N2 subsequence,
+  //   A[n2][k1] = sum_n1 Frame[N2*n1 + n2] * W^(N2*n1*k1),
+  // immediately multiplied by the stage twiddle W^(n2*k1). W^j is read off the
+  // fundamental table at j mod N, so no second table is needed. The result is
+  // stored k1-major so stage 2 walks it contiguously.
+  for N2Cnt := 0 to N2M1 do
+  begin
+    for K1 := 0 to N1M1 do
+    begin
+      Re := 0.0;
+      Im := 0.0;
+      Tw := 0;
+      TwStep := (N2 * K1) mod N;
+      SrcIdx := N2Cnt;
+      for N1Cnt := 0 to N1M1 do
+      begin
+        V := Frame[SrcIdx];
+        Re := Re + V * CosTab[Tw];
+        Im := Im + V * SinTab[Tw];
+        Inc(Tw, TwStep);
+        if Tw >= N then Dec(Tw, N);
+        Inc(SrcIdx, N2);
+      end;
+      TwFix := (N2Cnt * K1) mod N;
+      C := CosTab[TwFix];
+      S := SinTab[TwFix];
+      DstBase := K1 * N2 + N2Cnt;
+      ScrRe[DstBase] := Re * C - Im * S;
+      ScrIm[DstBase] := Re * S + Im * C;
+    end;
+  end;
+
+  // Stage 2: for every k1, a length-N2 DFT over n2 evaluated only at the k2
+  //   whose output bin k = k1 + N1*k2 falls inside the requested range.
+  for K1 := 0 to N1M1 do
+  begin
+    DstBase := K1 * N2;
+    K := K1;
+    K2 := 0;
+    while (K <= NumBinsM1) and (K2 <= N2M1) do
+    begin
+      Re := 0.0;
+      Im := 0.0;
+      Tw := 0;
+      TwStep := (N1 * K2) mod N;
+      for N2Cnt := 0 to N2M1 do
+      begin
+        Br := ScrRe[DstBase + N2Cnt];
+        Bi := ScrIm[DstBase + N2Cnt];
+        C := CosTab[Tw];
+        S := SinTab[Tw];
+        Re := Re + Br * C - Bi * S;
+        Im := Im + Br * S + Bi * C;
+        Inc(Tw, TwStep);
+        if Tw >= N then Dec(Tw, N);
+      end;
+      PowerOut[K] := Re * Re + Im * Im;
+      Inc(K2);
+      K := K1 + N1 * K2;
+    end;
+  end;
+end;
+
 procedure ComputeWhisperLogMel(Samples: TNNetVolume; Mel: TNNetVolume;
   NumMelBins: integer = 80; NumFrames: integer = 3000);
 var
@@ -672,6 +816,8 @@ var
   Power: array of double;         // one frame's power spectrum
   LogMel: array of double;        // (NumFrames x NumMelBins)
   FrameBuf: array of double;      // one windowed frame (built once per frame)
+  DftScrRe, DftScrIm: array of double; // mixed-radix stage-1 scratch (NFFT each)
+  DftN1, DftN2: integer;          // csWhisperNFFT = DftN1 * DftN2
   SampleCnt, FrameCnt, BinCnt, MelCnt, TapCnt, FrameStart, SrcIdx: integer;
   MelMin, MelMax, FFTFreq, DownSlope, UpSlope, Tri: double;
   ReAcc, ImAcc, Acc, MaxLog, V, MaxLogM8: double;
@@ -773,6 +919,16 @@ begin
   SetLength(LogMel, NumStftFrames * NumMelBins);
   // One-shot windowed-frame scratch (preprocessing, not a Compute path).
   SetLength(FrameBuf, csWhisperNFFT);
+  // Mixed-radix scratch, allocated once for the whole call. csWhisperNFFT is
+  // 400 = 20*20, so the per-frame spectrum costs ~N*(20+20) instead of
+  // ~N*NumBins; SplitTwoFactors falling through leaves the direct evaluation.
+  SetLength(DftScrRe, csWhisperNFFT);
+  SetLength(DftScrIm, csWhisperNFFT);
+  if not SplitTwoFactors(csWhisperNFFT, DftN1, DftN2) then
+  begin
+    DftN1 := 0;
+    DftN2 := 0;
+  end;
   // log10 constants hoisted out of the frame/mel loops (rule #5).
   invLn10 := 1.0 / Ln(10.0);
   logFloor := Ln(csWhisperMelFloor) * invLn10;
@@ -804,24 +960,8 @@ begin
       // ~200x fewer WaveAt calls than windowing inside the bin loop).
       for TapCnt := 0 to NFFTM1 do
         FrameBuf[TapCnt] := WaveAt(FrameStart + TapCnt) * Window[TapCnt];
-      for BinCnt := 0 to NumBinsM1 do
-      begin
-        ReAcc := 0.0;
-        ImAcc := 0.0;
-        // twIdx carries (BinCnt*TapCnt) mod csWhisperNFFT (rule #6). The step is
-        // BinCnt <= NumBins-1 = 200 < csWhisperNFFT and twIdx < csWhisperNFFT
-        // before each step, so one conditional subtract reduces it.
-        twIdx := 0;
-        for TapCnt := 0 to NFFTM1 do
-        begin
-          V := FrameBuf[TapCnt];
-          ReAcc := ReAcc + V * CosTab[twIdx];
-          ImAcc := ImAcc + V * SinTab[twIdx];
-          Inc(twIdx, BinCnt);
-          if twIdx >= csWhisperNFFT then Dec(twIdx, csWhisperNFFT);
-        end;
-        Power[BinCnt] := ReAcc * ReAcc + ImAcc * ImAcc;
-      end;
+      RealFramePowerSpectrum(FrameBuf, csWhisperNFFT, NumBins, DftN1, DftN2,
+        CosTab, SinTab, DftScrRe, DftScrIm, Power);
       for MelCnt := 0 to NumMelBinsM1 do
       begin
         Acc := 0.0;
