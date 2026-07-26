@@ -560,8 +560,8 @@ function MatrixSqrtSPD(const A: TIMDoubleMatrix): TIMDoubleMatrix;
 var
   n, nM1, i, j, k: integer;
   vals: TIMDoubleArray;
-  vecs: TIMDoubleMatrix;
-  sl: TIMDoubleArray;
+  vecs, Vs: TIMDoubleMatrix;
+  sl, Vsi, Vj, Ri: TIMDoubleArray;
   acc: Double;
 begin
   n := Length(A);
@@ -570,17 +570,30 @@ begin
   SetLength(sl, n);
   for i := 0 to nM1 do
     if vals[i] > 0 then sl[i] := Sqrt(vals[i]) else sl[i] := 0;
-  // Result = V * diag(sl) * V^T
+  // Vs = V * diag(sl), built once in n^2 work, so the n^3 loop below is a plain
+  // contiguous dot product of two rows instead of a scaled triple product.
+  SetLength(Vs, n);
+  for i := 0 to nM1 do
+  begin
+    SetLength(Vs[i], n);
+    Vsi := Vs[i];
+    Vj := vecs[i];
+    for k := 0 to nM1 do Vsi[k] := Vj[k] * sl[k];
+  end;
+  // Result = V * diag(sl) * V^T = Vs * V^T
   SetLength(Result, n);
   for i := 0 to nM1 do
   begin
     SetLength(Result[i], n);
+    Ri := Result[i];
+    Vsi := Vs[i];
     for j := 0 to nM1 do
     begin
+      Vj := vecs[j];
       acc := 0;
       for k := 0 to nM1 do
-        acc := acc + vecs[i][k] * sl[k] * vecs[j][k];
-      Result[i][j] := acc;
+        acc := acc + Vsi[k] * Vj[k];
+      Ri[j] := acc;
     end;
   end;
 end;
@@ -589,20 +602,25 @@ end;
 function MatMul(const A, B: TIMDoubleMatrix): TIMDoubleMatrix;
 var
   n, nM1, i, j, k: integer;
-  acc: Double;
+  aik: Double;
+  Ai, Bk, Ri: TIMDoubleArray;
 begin
   n := Length(A);
   nM1 := n - 1;
   SetLength(Result, n);
+  // i-k-j order: B is walked along a contiguous row instead of down a column of
+  // separately-allocated rows, and each row reference is resolved once per k.
   for i := 0 to nM1 do
   begin
-    SetLength(Result[i], n);
-    for j := 0 to nM1 do
+    SetLength(Result[i], n);   // zero-filled, so it can accumulate
+    Ai := A[i];
+    Ri := Result[i];
+    for k := 0 to nM1 do
     begin
-      acc := 0;
-      for k := 0 to nM1 do
-        acc := acc + A[i][k] * B[k][j];
-      Result[i][j] := acc;
+      aik := Ai[k];
+      Bk := B[k];
+      for j := 0 to nM1 do
+        Ri[j] := Ri[j] + aik * Bk[j];
     end;
   end;
 end;
@@ -1485,20 +1503,22 @@ end;
 function UnbiasedSelfTerm(const F: TIMDoubleMatrix; d: integer): Double;
 var
   m, mM1, i, j: integer;
-  s, k: Double;
+  s: Double;
+  Fi: TIMDoubleArray;
 begin
   m := Length(F);
   if m < 2 then
     raise Exception.Create('KID: each set needs at least 2 samples');
   mM1 := m - 1;
   s := 0;
+  // k(x,y) is symmetric, so only the upper triangle is evaluated and doubled.
   for i := 0 to mM1 do
-    for j := 0 to mM1 do
-      if i <> j then
-      begin
-        k := PolyKernel(F[i], F[j], d);
-        s := s + k;
-      end;
+  begin
+    Fi := F[i];
+    for j := i + 1 to mM1 do
+      s := s + PolyKernel(Fi, F[j], d);
+  end;
+  s := s * 2.0;
   Result := s / (m * (m - 1));
 end;
 
