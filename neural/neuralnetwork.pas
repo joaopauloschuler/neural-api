@@ -34694,7 +34694,7 @@ var
   QLen, KVLen, i, j, d: integer;
   QLenM1, KVLenM1, DkM1: integer;
   AttnRow, RowStride, posK, posV: integer;
-  Score, MaxScore, SumExp: TNeuralFloat;
+  Score, MaxScore, SumExp, A: TNeuralFloat;
   Q, KV: TNNetVolume;
   OutPtr, QiPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
@@ -34752,9 +34752,14 @@ begin
     posV := FDk;                          // KV value row j=0 offset, depth FDk (#12)
     for j := 0 to KVLenM1 do
     begin
-      TNNetVolume.MulAdd(OutPtr, KV.GetRawPtr(posV),
-        FAttn.FData[AttnRow + j], FDk);
-      Inc(posV, RowStride);
+      A := FAttn.FData[AttnRow + j];
+      // A masked key's -1e9 score exp-underflows to EXACTLY 0 and the softmax
+      // normalizer keeps it 0, so its FDk-long MulAdd contributes nothing:
+      // skip it (#20). Halves the P.V matmul under a causal mask and costs one
+      // compare when nothing is masked.
+      if A <> 0 then
+        TNNetVolume.MulAdd(OutPtr, KV.GetRawPtr(posV), A, FDk);
+      Inc(posV, RowStride);               // advance unconditionally (#12)
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -39488,7 +39493,7 @@ var
   SeqLen, i, j, d: integer;
   SeqLenM1, DkM1: integer;
   RowStride, TwoFDk, KnStride, posKn, posV, RowBytes: integer;
-  Score, MaxScore, SumExp, SumSq, InvN, LiveScale: TNeuralFloat;
+  Score, MaxScore, SumExp, SumSq, InvN, LiveScale, A: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr, QnPtr, QPtr, KPtr, KnPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
@@ -39574,9 +39579,14 @@ begin
     posV := TwoFDk;                       // j=0 V offset (#12)
     for j := 0 to SeqLenM1 do
     begin
-      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV),
-        FAttn.FData[AttnRow + j], FDk);
-      Inc(posV, RowStride);
+      A := FAttn.FData[AttnRow + j];
+      // A masked key's -1e9 score exp-underflows to EXACTLY 0 and the softmax
+      // normalizer keeps it 0, so its FDk-long MulAdd contributes nothing:
+      // skip it (#20). Halves the P.V matmul under a causal mask and costs one
+      // compare when nothing is masked.
+      if A <> 0 then
+        TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV), A, FDk);
+      Inc(posV, RowStride);               // advance unconditionally (#12)
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -39993,7 +40003,7 @@ var
   SeqLen, i, j, d: integer;
   SeqLenM1, DkM1: integer;
   RowStride, TwoFDk, posK, posV, bucketBase, RowBytes: integer;
-  Score, MaxScore, SumExp: TNeuralFloat;
+  Score, MaxScore, SumExp, A: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
   Bias: TNeuralFloatArrPtr;
@@ -40059,9 +40069,14 @@ begin
     posV := TwoFDk;                       // j=0 V offset (#12)
     for j := 0 to SeqLenM1 do
     begin
-      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV),
-        FAttn.FData[AttnRow + j], FDk);
-      Inc(posV, RowStride);
+      A := FAttn.FData[AttnRow + j];
+      // A masked key's -1e9 score exp-underflows to EXACTLY 0 and the softmax
+      // normalizer keeps it 0, so its FDk-long MulAdd contributes nothing:
+      // skip it (#20). Halves the P.V matmul under a causal mask and costs one
+      // compare when nothing is masked.
+      if A <> 0 then
+        TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV), A, FDk);
+      Inc(posV, RowStride);               // advance unconditionally (#12)
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -40384,7 +40399,7 @@ var
   SeqLen, i, j, d: integer;
   SeqLenM1, DkM1: integer;
   RowStride, TwoFDk, posKey, posV, RowBytes: integer;
-  Score, MaxScore, SumExp, c2c, c2p, p2c: TNeuralFloat;
+  Score, MaxScore, SumExp, c2c, c2p, p2c, A: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr, Krow, Qrow, QueryPtr, kPtr, AttnRowPtr: TNeuralFloatArrPtr;
   PosK, PosQ: TNNetVolume;
@@ -40457,9 +40472,14 @@ begin
     posV := TwoFDk;                       // j=0 V offset (#12)
     for j := 0 to SeqLenM1 do
     begin
-      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV),
-        FAttn.FData[AttnRow + j], FDk);
-      Inc(posV, RowStride);
+      A := FAttn.FData[AttnRow + j];
+      // A masked key's -1e9 score exp-underflows to EXACTLY 0 and the softmax
+      // normalizer keeps it 0, so its FDk-long MulAdd contributes nothing:
+      // skip it (#20). Halves the P.V matmul under a causal mask and costs one
+      // compare when nothing is masked.
+      if A <> 0 then
+        TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV), A, FDk);
+      Inc(posV, RowStride);               // advance unconditionally (#12)
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -41097,7 +41117,7 @@ var
   SeqLen, i, j, d: integer;
   SeqLenM1, FDkM1: integer;
   RowStride, TwoFDk, posK, posV, RowBytes: integer;
-  Score, MaxScore, SumExp, bias: TNeuralFloat;
+  Score, MaxScore, SumExp, bias, A: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
@@ -41174,9 +41194,14 @@ begin
     posV := TwoFDk;                       // j=0 V offset (#12)
     for j := 0 to SeqLenM1 do
     begin
-      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV),
-        FAttn.FData[AttnRow + j], FDk);
-      Inc(posV, RowStride);
+      A := FAttn.FData[AttnRow + j];
+      // A masked key's -1e9 score exp-underflows to EXACTLY 0 and the softmax
+      // normalizer keeps it 0, so its FDk-long MulAdd contributes nothing:
+      // skip it (#20). Halves the P.V matmul under a causal mask and costs one
+      // compare when nothing is masked.
+      if A <> 0 then
+        TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV), A, FDk);
+      Inc(posV, RowStride);               // advance unconditionally (#12)
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -42080,7 +42105,7 @@ var
   SeqLen, AugLen, i, j, s, d, Row: integer;
   SeqLenM1, AugLenM1, FNumSinksM1, FDkM1: integer;
   RowStride, TwoFDk, posK, posV, RowS, pos, RowBytes: integer;
-  Score, MaxScore, SumExp: TNeuralFloat;
+  Score, MaxScore, SumExp, A: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr, QueryPtr, RowPtr: TNeuralFloatArrPtr;
 begin
@@ -42164,9 +42189,14 @@ begin
     posV := TwoFDk;                       // j=0 V offset (#12)
     for j := 0 to SeqLenM1 do
     begin
-      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV),
-        FSinkAttn.FData[RowS + j], FDk);
-      Inc(posV, RowStride);
+      A := FSinkAttn.FData[RowS + j];
+      // A masked key's -1e9 score exp-underflows to EXACTLY 0 and the softmax
+      // normalizer keeps it 0, so its FDk-long MulAdd contributes nothing:
+      // skip it (#20). Halves the P.V matmul under a causal mask and costs one
+      // compare when nothing is masked.
+      if A <> 0 then
+        TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV), A, FDk);
+      Inc(posV, RowStride);               // advance unconditionally (#12)
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -42359,7 +42389,7 @@ var
   SeqLen, i, j, d: integer;
   SeqLenM1, FDkM1: integer;
   RowStride, TwoFDk, posK, posV, RowBytes: integer;
-  Score, MaxScore, SumExp, Sink: TNeuralFloat;
+  Score, MaxScore, SumExp, Sink, A: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
@@ -42413,9 +42443,14 @@ begin
     posV := TwoFDk;                       // j=0 V offset (#12)
     for j := 0 to SeqLenM1 do
     begin
-      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV),
-        FAttn.FData[AttnRow + j], FDk);
-      Inc(posV, RowStride);
+      A := FAttn.FData[AttnRow + j];
+      // A masked key's -1e9 score exp-underflows to EXACTLY 0 and the softmax
+      // normalizer keeps it 0, so its FDk-long MulAdd contributes nothing:
+      // skip it (#20). Halves the P.V matmul under a causal mask and costs one
+      // compare when nothing is masked.
+      if A <> 0 then
+        TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV), A, FDk);
+      Inc(posV, RowStride);               // advance unconditionally (#12)
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -42578,7 +42613,7 @@ var
   StartTime: double;
   SeqLen, i, j: integer;
   SeqLenM1, FDkM1: integer;
-  Score1, Score2, Max1, Max2, Sum1, Sum2, lambdaVal: TNeuralFloat;
+  Score1, Score2, Max1, Max2, Sum1, Sum2, lambdaVal, A: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr, QPtr1, QPtr2, Row1Ptr, Row2Ptr: TNeuralFloatArrPtr;
 begin
@@ -42654,9 +42689,13 @@ begin
     posV := 2 * FDk;
     for j := 0 to SeqLenM1 do
     begin
-      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV),
-        FAttn.FData[Row + j] - lambdaVal * FAttn2.FData[Row + j], FDk);
-      Inc(posV, RowStride);
+      // A masked key's -1e9 score exp-underflows to EXACTLY 0 in BOTH maps and
+      // the two normalizers keep both 0, so the combined weight is exactly 0
+      // and its FDk-long MulAdd contributes nothing: skip it (#20).
+      A := FAttn.FData[Row + j] - lambdaVal * FAttn2.FData[Row + j];
+      if A <> 0 then
+        TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV), A, FDk);
+      Inc(posV, RowStride);               // advance unconditionally (#12)
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
