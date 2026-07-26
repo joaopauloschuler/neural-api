@@ -46636,7 +46636,11 @@ var
   Qh, Kh, Vh: TNNetFloatDynArr2D;      // current head [token][head_dim]
   Scores: TNNetFloatDynArr2D;          // [t1][t2]
   ReluRow: TNeuralFloatDynArr;         // #7/#4: bound channel row for ReLU clamp
-  RelEmb: TNNetFloatDynArr2D;          // gathered rel embeddings [2T-1][hd]
+  // #11/#5: gathered rel embeddings [2T-1][hd]. Invariant across the head loop
+  // (GatherRel reads only FLayers[L].Attn.Rel*, T, Win, HD, RelLen), so both are
+  // built once per layer. Two variables, not one: hoisted above the head loop
+  // they are live at the same time.
+  RelEmbK, RelEmbV: TNNetFloatDynArr2D;
   RelLogits: TNNetFloatDynArr2D;       // [t1][2T-1]
   ofs: integer;                        // #11: RelLogits->Scores fold offset
   HeadOut: TNNetFloatDynArr2D;         // [token][head_dim]
@@ -46733,6 +46737,11 @@ begin
     SetLength(AttnOut, T);
     for i := 0 to TM1 do SetLength(AttnOut[i], H);
 
+    // #11: the relative-position embeddings do not depend on the head - each
+    // GatherRel does 2T-1 SetLengths plus (2T-1)*HD element copies, and ran
+    // 2*NH times per layer where twice is enough.
+    GatherRel(FLayers[L].Attn.RelK, RelEmbK);   // [2T-1][HD]
+    GatherRel(FLayers[L].Attn.RelV, RelEmbV);
     for hh := 0 to NHM1 do
     begin
       // Slice this head.
@@ -46759,7 +46768,6 @@ begin
       end;
       // Relative key bias: rel_logits[t1][r] = Q[t1] . RelEmb[r];
       // then relative_position_to_absolute_position -> [t1][t2].
-      GatherRel(FLayers[L].Attn.RelK, RelEmb);   // [2T-1][HD]
       SetLength(RelLogits, T);
       for t1 := 0 to TM1 do
       begin
@@ -46768,7 +46776,7 @@ begin
         QPtr := Addr(Qh[t1][0]);           // #8: invariant across j
         for j := 0 to TwoTM2 do
           // #13: contiguous Q . RelEmb dot via AVX DotProduct.
-          SRow[j] := TNNetVolume.DotProduct(QPtr, Addr(RelEmb[j][0]), HD);
+          SRow[j] := TNNetVolume.DotProduct(QPtr, Addr(RelEmbK[j][0]), HD);
       end;
       // _relative_position_to_absolute_position: pad each row by 1 on the
       // right -> width 2T; flatten T*2T; pad T-1 at end; reshape (T+1, 2T-1);
@@ -46813,7 +46821,6 @@ begin
       // gives [t1][2T] weights; drop col 0 -> [t1][2T-1]; matmul RelEmbV.
       // Direct form: rel_weights[t1][r] = Scores[t1][ r - (T-1) + t1 ] when
       // the col index is in [0,T-1], else 0; with r in [0..2T-2].
-      GatherRel(FLayers[L].Attn.RelV, RelEmb);
       // #13: fold the RelAbs intermediate away. Its only non-zero band on row
       // t1 is j = t2+ofs (ofs=(T-1)-t1) with coefficient Scores[t1][t2], so
       // accumulate RelEmb[t2+ofs] scaled by Scores[t1][t2] directly. Same
@@ -46824,7 +46831,7 @@ begin
         ofs := (T - 1) - t1;
         SRow := Scores[t1];
         for t2 := 0 to TM1 do
-          TNNetVolume.MulAdd(Addr(HeadOut[t1][0]), Addr(RelEmb[t2 + ofs][0]),
+          TNNetVolume.MulAdd(Addr(HeadOut[t1][0]), Addr(RelEmbV[t2 + ofs][0]),
             SRow[t2], HD);
       end;
       // Scatter head output back (#13: contiguous copy, hhHD hoisted #11).
