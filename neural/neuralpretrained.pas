@@ -74608,38 +74608,44 @@ function DecodeViTPoseKeypoints(
   Heatmaps: TNNetVolume): TViTPoseKeypointArray;
 var
   c, x, y, K: integer;
-  HeatXMax, HeatYMax, KM1, hmPos, hmStride: integer;
-  Val, Best: TNeuralFloat;
+  HeatXMax, HeatYMax, KM1, hmPos: integer;
+  Val: TNeuralFloat;
 begin
   K := Heatmaps.Depth;
   SetLength(Result, K);
   KM1 := K - 1;
-  hmStride := Heatmaps.GetRawPos(1, 0, 0);  // = Depth; elements between consecutive x
-  HeatYMax := Heatmaps.SizeY - 1;  // #5: invariant across c, hoisted out of the c loop
+  HeatYMax := Heatmaps.SizeY - 1;  // #5: invariant across the nest
   HeatXMax := Heatmaps.SizeX - 1;
+  // Seed every channel at (0, 0), exactly as the per-channel scan did.
   for c := 0 to KM1 do
   begin
-    Best := Heatmaps[0, 0, c];
     Result[c].X := 0;
     Result[c].Y := 0;
-    Result[c].Score := Best;
-    for y := 0 to HeatYMax do
+    Result[c].Score := Heatmaps[0, 0, c];
+  end;
+  // (y, x) OUTER, channel INNER. Channel-outer made the inner read stride by
+  // Depth, so the whole heatmap volume was traversed K times taking one useful
+  // float per cache line. With c innermost each pixel's K channels are one
+  // contiguous run, so the volume is swept exactly once. Result[c] is already
+  // the per-channel accumulator, so no extra state is needed; keeping the (y, x)
+  // visiting order per channel and the strict '>' preserves the tie-break -
+  // the first maximum in scan order still wins.
+  hmPos := 0;                      // = GetRawPos(x, y, 0), carried (#6/#12)
+  for y := 0 to HeatYMax do
+    for x := 0 to HeatXMax do
     begin
-      hmPos := Heatmaps.GetRawPos(0, y, c);  // = the x = 0 offset for this (y, c)
-      for x := 0 to HeatXMax do
+      for c := 0 to KM1 do
       begin
-        Val := Heatmaps.FData[hmPos];
-        if Val > Best then
+        Val := Heatmaps.FData[hmPos + c];
+        if Val > Result[c].Score then
         begin
-          Best := Val;
           Result[c].X := x;
           Result[c].Y := y;
           Result[c].Score := Val;
         end;
-        Inc(hmPos, hmStride);
       end;
+      Inc(hmPos, K);
     end;
-  end;
 end;
 
 // ===========================================================================

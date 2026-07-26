@@ -532,6 +532,7 @@ type
     procedure TestViTPoseConfigFromJSONFile;
     procedure TestViTPosePoseEstimationParity;
     procedure TestViTPoseKeypointDecode;
+    procedure TestViTPoseKeypointDecodeTieBreak;
     procedure TestDetrConfigFromJSONFile;
     procedure TestDetrObjectDetectionParity;
     procedure TestDetrDetectionDecode;
@@ -20829,6 +20830,55 @@ end;
 // Verifies the spatial-argmax keypoint decode (DecodeViTPoseKeypoints) recovers
 // the correct (x, y) peak per joint, matching the float64 oracle's per-channel
 // argmax stored in the fixture ("peaks").
+// The argmax decode resolves ties by scan order: with a strict '>' the FIRST
+// (y, x) reaching the maximum wins, scanning y outer and x inner. Nothing in
+// the oracle-peak test pins that down (its peaks are unique), so exercise it
+// directly on a hand-built volume - a plateau of equal maxima per channel, plus
+// an all-equal channel that must stay at the (0, 0) seed.
+procedure TTestNeuralPretrained.TestViTPoseKeypointDecodeTieBreak;
+var
+  HM: TNNetVolume;
+  Keypoints: TViTPoseKeypointArray;
+  W, H, K, x, y, c: integer;
+begin
+  W := 7; H := 5; K := 4;
+  HM := TNNetVolume.Create;
+  try
+    HM.ReSize(W, H, K);
+    HM.Fill(0);
+    // Channel 0: equal maxima at (x=5,y=1), (x=2,y=3) -> earlier row wins.
+    HM[5, 1, 0] := 9.0;
+    HM[2, 3, 0] := 9.0;
+    // Channel 1: equal maxima in the SAME row -> smaller x wins.
+    HM[1, 2, 1] := 4.0;
+    HM[6, 2, 1] := 4.0;
+    // Channel 2: a unique peak, as a control.
+    HM[3, 4, 2] := 2.5;
+    // Channel 3: left entirely flat at 0 -> must stay at the (0, 0) seed.
+    Keypoints := DecodeViTPoseKeypoints(HM);
+    AssertEquals('kp count', K, Length(Keypoints));
+    AssertEquals('c0 tie x', 5, Keypoints[0].X);
+    AssertEquals('c0 tie y', 1, Keypoints[0].Y);
+    AssertEquals('c0 score', 9.0, Keypoints[0].Score, 0.0);
+    AssertEquals('c1 tie x', 1, Keypoints[1].X);
+    AssertEquals('c1 tie y', 2, Keypoints[1].Y);
+    AssertEquals('c2 x', 3, Keypoints[2].X);
+    AssertEquals('c2 y', 4, Keypoints[2].Y);
+    AssertEquals('c3 flat x', 0, Keypoints[3].X);
+    AssertEquals('c3 flat y', 0, Keypoints[3].Y);
+    AssertEquals('c3 flat score', 0.0, Keypoints[3].Score, 0.0);
+    // Every channel must be decoded independently: a large value in one channel
+    // must not leak into a neighbour's peak.
+    for c := 0 to K - 1 do
+      for y := 0 to H - 1 do
+        for x := 0 to W - 1 do
+          AssertTrue('decoded score is the channel max',
+            HM[x, y, c] <= Keypoints[c].Score);
+  finally
+    HM.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestViTPoseKeypointDecode;
 var
   NN: TNNet;
