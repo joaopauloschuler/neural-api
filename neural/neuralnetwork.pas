@@ -6495,7 +6495,7 @@ type
     FSeed: integer;     // RandSeed used to draw the frozen projection W
     FScale: TNeuralFloat; // 1/sqrt(m)
     // Forward caches reused by Backpropagate().
-    FWProj: TNNetVolume; // frozen random projection W, [d_k,1,m] (X=feature a, Depth=random row r)
+    FWProj: TNNetVolume; // frozen random projection W, [m,1,d_k] (X=random row r, Depth=feature a): row r is contiguous
     FQproj: TNNetVolume; // W.Q_t per query, [SeqLen,1,m]
     FKproj: TNNetVolume; // W.K_s per key,   [SeqLen,1,m]
     FPhiQ: TNNetVolume;  // phi(Q_t),        [SeqLen,1,m]
@@ -38110,8 +38110,9 @@ begin
       IntToStr(pPrevLayer.FOutput.Depth) + ', d_k=' + IntToStr(FDk));
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, 1, FDk);
   SetOutputErrorSize(FOutput);
-  // W laid out X=feature a (d_k), Depth=random row r (m): W[a,0,r] = W_{r,a}.
-  FWProj.ReSize(FDk, 1, FM);
+  // W laid out X=random row r (m), Depth=feature a (d_k): W[r,0,a] = W_{r,a}.
+  // Every use walks a whole row r, so a row is the contiguous run (App. E).
+  FWProj.ReSize(FM, 1, FDk);
   FQproj.ReSize(pPrevLayer.FOutput.SizeX, 1, FM);
   FKproj.ReSize(pPrevLayer.FOutput.SizeX, 1, FM);
   FPhiQ.ReSize(pPrevLayer.FOutput.SizeX, 1, FM);
@@ -38146,10 +38147,11 @@ begin
   if FSeed <> 0 then RandSeed := FSeed;
   MM1 := FM - 1;
   DkM1 := FDk - 1;
-  // Fill rows with N(0,1).
+  // Fill rows with N(0,1). The (r, a) visiting order - and therefore which draw
+  // lands in which logical cell - is unchanged by the transposed storage.
   for r := 0 to MM1 do
     for a := 0 to DkM1 do
-      FWProj[a, 0, r] := FWProj.RandomGaussianValue();
+      FWProj[r, 0, a] := FWProj.RandomGaussianValue();
   // Block-wise Gram-Schmidt orthogonalization (each block of up to FDk rows).
   r := 0;
   while r < FM do
@@ -38164,13 +38166,13 @@ begin
       for j := blockStart to RM1 do
       begin
         dot := 0;
-        for a := 0 to DkM1 do dot := dot + FWProj[a, 0, r] * FWProj[a, 0, j];
+        for a := 0 to DkM1 do dot := dot + FWProj[r, 0, a] * FWProj[j, 0, a];
         for a := 0 to DkM1 do
-          FWProj[a, 0, r] := FWProj[a, 0, r] - dot * FWProj[a, 0, j];
+          FWProj[r, 0, a] := FWProj[r, 0, a] - dot * FWProj[j, 0, a];
       end;
       // Normalize to unit length, then rescale to expected Gaussian-row norm.
       nrm := 0;
-      for a := 0 to DkM1 do nrm := nrm + Sqr(FWProj[a, 0, r]);
+      for a := 0 to DkM1 do nrm := nrm + Sqr(FWProj[r, 0, a]);
       nrm := Sqrt(nrm);
       if nrm < 1e-12 then nrm := 1e-12;
       // Each orthonormal direction is scaled by a fresh chi-norm draw so the row
@@ -38179,7 +38181,7 @@ begin
       for a := 0 to DkM1 do dot := dot + Sqr(FWProj.RandomGaussianValue());
       dot := Sqrt(dot);
       for a := 0 to DkM1 do
-        FWProj[a, 0, r] := FWProj[a, 0, r] * (dot / nrm);
+        FWProj[r, 0, a] := FWProj[r, 0, a] * (dot / nrm);
     end;
     r := blockEnd + 1;
   end;
@@ -38194,9 +38196,9 @@ var
   SeqLen, i, a, r: integer;
   SeqLenM1, DkM1, MM1: integer;
   basePrev, basePhi, posS, SRowStride, baseK: integer;
-  wpos, WprojDepth, TwoFDk, RowBytes: integer;
+  TwoFDk, RowBytes: integer;
   Prev: TNNetVolume;
-  outPtr, VPtr, qPtr, kPtr: TNeuralFloatArrPtr;
+  outPtr, VPtr, qPtr, kPtr, wPtr: TNeuralFloatArrPtr;
   sqNormQ, sqNormK, proj, PhiVal, Den: TNeuralFloat;
   SavedExMask: TFPUExceptionMask;
 begin
@@ -38206,7 +38208,6 @@ begin
   SeqLenM1 := SeqLen - 1;
   DkM1 := FDk - 1;
   MM1 := FM - 1;
-  WprojDepth := FWProj.Depth;                          // #5: FWProj a-step, once per call
   TwoFDk := 2 * FDk;                                   // #5
   RowBytes := FDk * csNeuralFloatSize;                 // #5: once per call
   SRowStride := FS.GetRawPos(1, 0);                    // elements between FS rows (= FDk)
@@ -38232,22 +38233,12 @@ begin
     sqNormK := TNNetVolume.DotProduct(kPtr, kPtr, FDk);
     for r := 0 to MM1 do
     begin
-      proj := 0;
-      wpos := r;                                       // #12: FWProj[a,0,r], a=0 seed
-      for a := 0 to DkM1 do
-      begin
-        proj := proj + FWProj.FData[wpos] * Prev.FData[basePrev + a];
-        Inc(wpos, WprojDepth);
-      end;
+      // W row r is contiguous, so each projection is one dot product (#13).
+      wPtr := FWProj.GetRawPtr(r, 0);
+      proj := TNNetVolume.DotProduct(wPtr, qPtr, FDk);
       FQproj.FData[basePhi + r] := proj;
       FPhiQ.FData[basePhi + r] := FScale * NeuralExp(proj - 0.5 * sqNormQ);
-      proj := 0;
-      wpos := r;                                       // #12: reseed per projection
-      for a := 0 to DkM1 do
-      begin
-        proj := proj + FWProj.FData[wpos] * Prev.FData[baseK + a];
-        Inc(wpos, WprojDepth);
-      end;
+      proj := TNNetVolume.DotProduct(wPtr, kPtr, FDk);
       FKproj.FData[basePhi + r] := proj;
       FPhiK.FData[basePhi + r] := FScale * NeuralExp(proj - 0.5 * sqNormK);
     end;
@@ -38297,10 +38288,10 @@ end;
 procedure TNNetPerformerAttention.Backpropagate();
 var
   StartTime: double;
-  SeqLen, i, a, r: integer;
+  SeqLen, i, r: integer;
   SeqLenM1, DkM1, MM1: integer;
   basePrev, basePhi: integer;
-  idx, posSd, wpos, baseK, TwoFDk, WprojDepth, SdStride: integer;
+  posSd, baseK, TwoFDk, SdStride: integer;
   Prev, PrevErr: TNNetVolume;
   dOutPtr, VPtr, dVPtr, dSPtr: TNeuralFloatArrPtr;
   Den, PhiQr, PhiKr, dPhiVal, T, dPhiKr, dProjQ, dProjK, dNormQ, dNormK: TNeuralFloat;
@@ -38323,7 +38314,6 @@ begin
     if FdS.Size <> FM * FDk then FdS.ReSize(FM, 1, FDk);
     if FdZ.Size <> FM then FdZ.ReSize(FM, 1, 1);
     TwoFDk := 2 * FDk;                                 // #5: once per call
-    WprojDepth := FWProj.Depth;                        // #5: FWProj a-step
     SdStride := FdS.GetRawPos(1, 0);                   // = FDk; FdS/FS row stride
     // Cached phi values may be denormal (see Compute); mask FP exceptions.
     SavedExMask := GetExceptionMask();
@@ -38357,14 +38347,10 @@ begin
           // phi(Q_i,r) = scale*exp(projQ - ||Q||^2/2)  =>  dphi/dprojQ = phi,
           // dphi/d(||Q||^2) = -phi/2. Chain dPhiVal through phi:
           dProjQ := dPhiVal * PhiQr;
-          // grad into projQ[r] = W_r . Q  ->  dQ[a] += dProjQ * W[a,r]
-          wpos := r;                                    // #12: FWProj[a,0,r], a=0 seed
-          for a := 0 to DkM1 do
-          begin
-            idx := basePrev + a;                        // #4
-            PrevErr.FData[idx] := PrevErr.FData[idx] + dProjQ * FWProj.FData[wpos];
-            Inc(wpos, WprojDepth);
-          end;
+          // grad into projQ[r] = W_r . Q  ->  dQ[a] += dProjQ * W[r,a]; W row r
+          // is contiguous, so this is one scaled accumulate (#13).
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(basePrev),
+            FWProj.GetRawPtr(r, 0), dProjQ, FDk);
           // grad into ||Q||^2 (accumulated, applied below): -dPhiVal*PhiQr/2
           dNormQ := dNormQ - 0.5 * dProjQ;
           // gradient into S[r,*] and Z[r]
@@ -38394,13 +38380,8 @@ begin
           // phi(K) chain (same exp form as phi(Q)).
           PhiKr := FPhiK.FData[basePhi + r];            // #4
           dProjK := dPhiKr * PhiKr;
-          wpos := r;                                    // #12: FWProj[a,0,r], a=0 seed
-          for a := 0 to DkM1 do
-          begin
-            idx := baseK + a;                           // #4
-            PrevErr.FData[idx] := PrevErr.FData[idx] + dProjK * FWProj.FData[wpos];
-            Inc(wpos, WprojDepth);
-          end;
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(baseK),
+            FWProj.GetRawPtr(r, 0), dProjK, FDk);
           dNormK := dNormK - 0.5 * dProjK;
           // dV[s,*] += dS row r * phiK[s,r]
           TNNetVolume.MulAdd(dVPtr, dSPtr, PhiKr, FDk);
