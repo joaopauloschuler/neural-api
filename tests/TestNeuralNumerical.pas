@@ -1085,6 +1085,7 @@ type
     procedure TestDisentangledAttentionSerializationRoundTrip;
     procedure TestConformerRelPosAttentionGradientCheck;
     procedure TestConformerRelPosAttentionSerializationRoundTrip;
+    procedure TestConformerRelPosAttentionMaskBandEquivalence;
     procedure TestALiBiSlopeMatchesReference;
     procedure TestALiBiAttentionGradientCheck;
     procedure TestALiBiAttentionZeroSlopeMatchesSDPA;
@@ -23086,6 +23087,96 @@ begin
     NN.Free;
     if Assigned(NN2) then NN2.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConformerRelPosAttentionMaskBandEquivalence;
+// The causal / sliding-window mask must confine query i to the key range it
+// claims. Relative-position indices depend only on (j - i), so a masked query
+// row computed over the FULL sequence has to equal the SAME query computed
+// over just its attendable slice, on a shorter net with the same distance
+// table. Two checks: pure causal (slice [0..i]) and causal + sliding window
+// (slice [i-W+1..i]). Fails if the attendable range is too wide (future or
+// out-of-window keys leak in) or too narrow (attendable keys dropped).
+var
+  Dk, LMax, RMax, SeqLen, W, i, d, s: integer;
+  Full, Slice: TNNet;
+  AttnFull, AttnSlice: TNNetConformerRelPosAttention;
+  InFull, InSlice: TNNetVolume;
+  OutFull, OutSlice: TNNetVolume;
+
+  procedure BuildPair(pSeqLen, pSliceLen, pWindow: integer);
+  var
+    w_: integer;
+  begin
+    Full := TNNet.Create();
+    Full.AddLayer(TNNetInput.Create(pSeqLen, 1, 3 * Dk, 1));
+    AttnFull := TNNetConformerRelPosAttention.Create(Dk, {Causal=}true,
+      LMax, RMax, pWindow);
+    Full.AddLayer(AttnFull);
+    Slice := TNNet.Create();
+    Slice.AddLayer(TNNetInput.Create(pSliceLen, 1, 3 * Dk, 1));
+    AttnSlice := TNNetConformerRelPosAttention.Create(Dk, {Causal=}true,
+      LMax, RMax, pWindow);
+    Slice.AddLayer(AttnSlice);
+    // Identical NON-zero distance tables, so the position bias really acts.
+    for w_ := 0 to AttnFull.Neurons[0].Weights.Size - 1 do
+    begin
+      AttnFull.Neurons[0].Weights.Raw[w_] := Sin((w_ + 1) * 0.37) * 0.5;
+      AttnSlice.Neurons[0].Weights.Raw[w_] := Sin((w_ + 1) * 0.37) * 0.5;
+    end;
+    InFull := TNNetVolume.Create(pSeqLen, 1, 3 * Dk);
+    InSlice := TNNetVolume.Create(pSliceLen, 1, 3 * Dk);
+    for w_ := 0 to InFull.Size - 1 do
+      InFull.Raw[w_] := Sin(w_ * 0.41) * 0.8 - 0.2;
+  end;
+
+  procedure FreePair();
+  begin
+    InSlice.Free;
+    InFull.Free;
+    Slice.Free;
+    Full.Free;
+  end;
+
+begin
+  Dk := 4;
+  LMax := 3;
+  RMax := 2;
+  // ---- pure causal: query 5 of an 8-long sequence sees keys 0..5 ----
+  SeqLen := 8;
+  i := 5;
+  BuildPair(SeqLen, i + 1, {Window=}0);
+  try
+    for s := 0 to i do
+      for d := 0 to 3 * Dk - 1 do
+        InSlice[s, 0, d] := InFull[s, 0, d];
+    Full.Compute(InFull);
+    Slice.Compute(InSlice);
+    OutFull := Full.GetLastLayer().Output;
+    OutSlice := Slice.GetLastLayer().Output;
+    for d := 0 to Dk - 1 do
+      AssertEquals('causal conformer row ' + IntToStr(i) + ' depth ' +
+        IntToStr(d), OutFull[i, 0, d], OutSlice[i, 0, d], 1e-6);
+  finally
+    FreePair();
+  end;
+  // ---- causal + window 4: query 5 sees keys 2..5 only ----
+  W := 4;
+  BuildPair(SeqLen, W, W);
+  try
+    for s := 0 to W - 1 do
+      for d := 0 to 3 * Dk - 1 do
+        InSlice[s, 0, d] := InFull[i - W + 1 + s, 0, d];
+    Full.Compute(InFull);
+    Slice.Compute(InSlice);
+    OutFull := Full.GetLastLayer().Output;
+    OutSlice := Slice.GetLastLayer().Output;
+    for d := 0 to Dk - 1 do
+      AssertEquals('windowed conformer row ' + IntToStr(i) + ' depth ' +
+        IntToStr(d), OutFull[i, 0, d], OutSlice[W - 1, 0, d], 1e-6);
+  finally
+    FreePair();
   end;
 end;
 

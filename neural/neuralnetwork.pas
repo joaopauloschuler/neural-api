@@ -40782,7 +40782,7 @@ var
   pos, AttnRow, idxBase: integer;
   StartTime: double;
   SeqLen, i, j, d: integer;
-  SeqLenM1, DkM1: integer;
+  SeqLenM1, DkM1, jLo, jHi: integer;
   RowStride, TwoFDk, posK, posV, RowBytes: integer;
   Score, MaxScore, SumExp, c2c, c2p: TNeuralFloat;
   Prev: TNNetVolume;
@@ -40812,27 +40812,30 @@ begin
     idxBase := i * SeqLen;
     // Query row pointer is fixed for this i - invariant across the key loop (#11).
     QueryPtr := Prev.GetRawPtr(i, 0);
-    posK := FDk;                          // j=0 K offset (#12)
+    // This layer never takes a segment source, so the attendable keys are ONE
+    // contiguous band (see MaskBand): score just the band and write the exact
+    // zeros the softmax produces outside it.
+    MaskBand(i, SeqLenM1, jLo, jHi);
+    posK := FDk + jLo * RowStride;        // j=jLo K offset (#12)
     MaxScore := -1e30;
-    for j := 0 to SeqLenM1 do
+    for j := jLo to jHi do
     begin
-      pos := AttnRow + j;
-      if ScoreIsMasked(i, j, false, nil, 0) then
-        Score := -1e9
-      else
-      begin
-        // Content-to-content: Q[i].K[j] (depth-contiguous AVX dot).
-        c2c := TNNetVolume.DotProduct(
-          QueryPtr, Prev.GetRawPtr(posK), FDk);
-        // Content-to-position: Q[i].P[idx(i,j)].
-        Prow := PosT.GetRawPtr(FPosIdx[idxBase + j], 0);
-        c2p := TNNetVolume.DotProduct(QueryPtr, Prow, FDk);
-        Score := (c2c + c2p) * FInvSqrtDk;
-      end;
-      FAttn.FData[pos] := Score;
+      // Content-to-content: Q[i].K[j] (depth-contiguous AVX dot).
+      c2c := TNNetVolume.DotProduct(
+        QueryPtr, Prev.GetRawPtr(posK), FDk);
+      // Content-to-position: Q[i].P[idx(i,j)].
+      Prow := PosT.GetRawPtr(FPosIdx[idxBase + j], 0);
+      c2p := TNNetVolume.DotProduct(QueryPtr, Prow, FDk);
+      Score := (c2c + c2p) * FInvSqrtDk;
+      FAttn.FData[AttnRow + j] := Score;
       if Score > MaxScore then MaxScore := Score;
       Inc(posK, RowStride);
     end;
+    if jLo > 0 then
+      FillChar(FAttn.FData[AttnRow], jLo * csNeuralFloatSize, 0);
+    if jHi < SeqLenM1 then
+      FillChar(FAttn.FData[AttnRow + jHi + 1],
+        (SeqLenM1 - jHi) * csNeuralFloatSize, 0);
     if MaxScore <= cMaskFloor then
     begin
       FillChar(FAttn.FData[AttnRow], SeqLen * csNeuralFloatSize, 0);
@@ -40840,7 +40843,7 @@ begin
     else
     begin
       SumExp := 0;
-      for j := 0 to SeqLenM1 do
+      for j := jLo to jHi do
       begin
         pos := AttnRow + j;
         Score := NeuralExp(FAttn.FData[pos] - MaxScore);
@@ -40848,12 +40851,13 @@ begin
         SumExp := SumExp + Score;
       end;
       if SumExp > 0 then
-        TNNetVolume.Mul(FAttn.GetRawPtr(0, i), 1 / SumExp, SeqLen);
+        TNNetVolume.Mul(FAttn.GetRawPtr(AttnRow + jLo), 1 / SumExp,
+          jHi - jLo + 1);
     end;
     OutPtr := FOutput.GetRawPtr(i, 0);
     FillChar(OutPtr^, RowBytes, 0);
-    posV := TwoFDk;                       // j=0 V offset (#12)
-    for j := 0 to SeqLenM1 do
+    posV := TwoFDk + jLo * RowStride;     // j=jLo V offset (#12)
+    for j := jLo to jHi do
     begin
       TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV),
         FAttn.FData[AttnRow + j], FDk);
