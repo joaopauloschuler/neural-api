@@ -13225,6 +13225,10 @@ type
       //FDotProductResult: TNNetVolume;
       FPointwise: boolean;
       FLearnSmoothener: TNeuralFloat;
+      // 1/FLearnSmoothener, kept beside it so the backward passes scale by a
+      // multiply instead of dividing by the same per-forward constant once per
+      // output element. Exactly 1.0 when error smoothing is off (the default).
+      FInvLearnSmoothener: TNeuralFloat;
       // Tiling
       FMaxTileX, FMaxTileD: integer;
       FTileSizeX, FTileSizeD: integer;
@@ -48242,7 +48246,7 @@ begin
                     begin
                       if CanBackpropOnPos then
                       begin
-                        SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv / FLearnSmoothener;
+                        SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv * FInvLearnSmoothener;
                         // Carry both offsets: per LocalCntX the prev-error base
                         // advances by one depth column, the weight base by one
                         // weight-depth column (rules #11/#12). PrevErrDepth and
@@ -48379,10 +48383,12 @@ begin
     if FSmoothErrorPropagation then
     begin
       FLearnSmoothener := FFeatureSizeX * FFeatureSizeY;
+      FInvLearnSmoothener := 1.0 / FLearnSmoothener;
     end
     else
     begin
       FLearnSmoothener := 1;
+      FInvLearnSmoothener := 1.0;
     end;
 
     FSizeXDepth := FFeatureSizeX * FInputCopy.Depth div FStruct[5];
@@ -96325,7 +96331,7 @@ begin
         begin
           if pCanBackpropOnPos then
           begin
-            SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv / FLearnSmoothener;
+            SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv * FInvLearnSmoothener;
             for LocalCntY := 0 to FFeatureSizeYMinus1 do
             begin
               (*
@@ -97372,10 +97378,12 @@ begin
   if FSmoothErrorPropagation then
   begin
     FLearnSmoothener := FFeatureSizeX * FFeatureSizeY;
+    FInvLearnSmoothener := 1.0 / FLearnSmoothener;
   end
   else
   begin
     FLearnSmoothener := 1;
+    FInvLearnSmoothener := 1.0;
   end;
 
   FSizeXDepth := FFeatureSizeX * FInputCopy.Depth;
@@ -97727,7 +97735,7 @@ begin
                   begin
                     if CanBackpropOnPos then
                     begin
-                      SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv / FLearnSmoothener;
+                      SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv * FInvLearnSmoothener;
                       PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY);
                       PrevPtrB := LocalWeight.DataPtr;
                       for LocalCntY := 0 to FFeatureSizeYMinus1 do
@@ -97939,8 +97947,13 @@ begin
                     begin
                       if CanBackpropOnPos then
                       begin
-                        SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv / FLearnSmoothener;
-                        PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY);
+                        SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv * FInvLearnSmoothener;
+                        // LocalDestPtr already holds LocalPrevError(PrevX, PrevY):
+                        // it is bound under the same
+                        // (FCalculatePrevLayerError and CanBackpropOnPos) guard
+                        // once per OutputX, and neither PrevX/PrevY nor it change
+                        // inside the OutputD loop.
+                        PrevPtrA := LocalDestPtr;
                         PrevPtrB := LocalWeight.DataPtr;
                         for LocalCntY := 0 to FFeatureSizeYMinus1 do
                         begin
@@ -98136,7 +98149,7 @@ begin
                   begin
                     if CanBackpropOnPos then
                     begin
-                      SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv / FLearnSmoothener;
+                      SmoothLocalOutputErrorDeriv := LocalOutputErrorDeriv * FInvLearnSmoothener;
                       PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY);
                       PrevPtrB := LocalWeight.DataPtr;
                       for LocalCntY := 0 to FFeatureSizeYMinus1 do
@@ -98578,7 +98591,7 @@ begin
           PrevPtrA := LocalPrevError.GetRawPtr(PrevX, PrevY + fy);
           PrevPtrB := FBpPatchByK.GetRawPtr(ColBase + fy * DepthFSize);
           TNNetVolume.MulAdd(PrevPtrA, PrevPtrB,
-            1.0 / FLearnSmoothener, DepthFSize);
+            FInvLearnSmoothener, DepthFSize);
         end;
       end;
     end;
