@@ -8172,6 +8172,8 @@ type
   // Coded by Claude (AI).
   TNNetDyT = class(TNNetChannelTransformBase)
     private
+      // Per-channel backward accumulators (#17: persistent, sized once).
+      FgradGammaBuf, FgradBetaBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
@@ -8282,6 +8284,8 @@ type
   // Coded by Claude (AI).
   TNNetPReLUChannel = class(TNNetChannelTransformBase)
     private
+      // Per-channel backward accumulator (#17: persistent, sized once).
+      FgradAlphaBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
@@ -8322,6 +8326,8 @@ type
   TNNetSReLU = class(TNNetChannelTransformBase)
     private
       FInitialTr, FInitialAr, FInitialTl, FInitialAl: TNeuralFloat;
+      // Per-channel backward accumulators (#17: persistent, sized once).
+      FgradTrBuf, FgradArBuf, FgradTlBuf, FgradAlBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); overload; override;
@@ -8447,6 +8453,8 @@ type
   // Coded by Claude (AI).
   TNNetAconC = class(TNNetChannelTransformBase)
     private
+      // Per-channel backward accumulators (#17: persistent, sized once).
+      FgradP1Buf, FgradP2Buf, FgradBetaBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
@@ -8491,6 +8499,10 @@ type
   // Coded by Claude (AI).
   TNNetMetaAconC = class(TNNetChannelTransformBase)
     private
+      // Per-channel forward/backward state (#17: persistent, sized once).
+      FmBuf, FBetaBuf: array of TNeuralFloat;
+      FgradP1Buf, FgradP2Buf, FgradBetaBuf,
+        FBetaPathBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
@@ -54800,6 +54812,8 @@ begin
   begin
     FNeurons[2].BackInertia.ReSize(1, 1, 1);
     FNeurons[2].Delta.ReSize(1, 1, 1);
+    SetLength(FgradGammaBuf, FOutput.Depth);
+    SetLength(FgradBetaBuf, FOutput.Depth);
   end;
   InitDefault();
 end;
@@ -54848,9 +54862,10 @@ var
   Ng, Nb, Na: TNNetNeuron;
   Wg: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
-  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d, pos: integer;
-  alpha, xv, gy, t, dt, g_d, gradGamma, gradBeta, gradAlpha, gygd: TNeuralFloat;
+  SizeX, SizeY, Depth, DepthM1, d, pos, k, NumPixM1: integer;
+  alpha, xv, gy, t, dt, gradAlpha, gygd: TNeuralFloat;
   hasInputGrad: boolean;
+  GammaPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -54865,9 +54880,8 @@ begin
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
   Depth := FOutput.Depth;
-  SizeXM1 := SizeX - 1;
-  SizeYM1 := SizeY - 1;
   DepthM1 := Depth - 1;
+  NumPixM1 := SizeX * SizeY - 1;
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
   PrevErr := nil;
@@ -54877,49 +54891,54 @@ begin
   // dL/dbeta[c]  += dL/dy
   // dL/dalpha    += sum over everything of dL/dy * gamma[c] * x * dt
   // dL/dx[x,y,c]  = dL/dy * gamma[c] * alpha * dt
+  // App.E: pixel-outer / channel-inner, so the depth axis is contiguous and the
+  // volume is swept once instead of once per channel. The per-element tanh keeps
+  // the body scalar, so only the addressing and the locality improve; the
+  // per-channel gamma/beta gradients become accumulator vectors (#17). The
+  // reductions now run pixel-major - a float reassociation.
   gradAlpha := 0;
+  GammaPtr := Wg.GetRawPtr(0);   // #8: the gamma row base, once
+  FillDWord(FgradGammaBuf[0], Depth, 0);
+  FillDWord(FgradBetaBuf[0], Depth, 0);
+  // #5: lift the invariant hasInputGrad test out of the pixel nest.
+  // #3: Prev/FOutputError/PrevErr share the same shape -> one base per column.
+  pos := 0;
+  if hasInputGrad then
+  begin
+    for k := 0 to NumPixM1 do
+      for d := 0 to DepthM1 do
+      begin
+        xv := Prev.FData[pos];
+        gy := FOutputError.FData[pos];
+        t := pcr_tanhf(alpha * xv);
+        dt := 1 - t * t;
+        gygd := gy * GammaPtr^[d];
+        FgradGammaBuf[d] := FgradGammaBuf[d] + gy * t;
+        FgradBetaBuf[d] := FgradBetaBuf[d] + gy;
+        gradAlpha := gradAlpha + gygd * xv * dt;
+        PrevErr.FData[pos] := PrevErr.FData[pos] + gygd * alpha * dt;
+        Inc(pos);
+      end;
+  end
+  else
+  begin
+    for k := 0 to NumPixM1 do
+      for d := 0 to DepthM1 do
+      begin
+        xv := Prev.FData[pos];
+        gy := FOutputError.FData[pos];
+        t := pcr_tanhf(alpha * xv);
+        dt := 1 - t * t;
+        FgradGammaBuf[d] := FgradGammaBuf[d] + gy * t;
+        FgradBetaBuf[d] := FgradBetaBuf[d] + gy;
+        gradAlpha := gradAlpha + gy * GammaPtr^[d] * xv * dt;
+        Inc(pos);
+      end;
+  end;
   for d := 0 to DepthM1 do
   begin
-    g_d := Wg.Raw[d];
-    gradGamma := 0;
-    gradBeta := 0;
-    // #5: lift the invariant hasInputGrad test out of the (x,y) nest.
-    // #3: Prev/FOutputError/PrevErr share the same shape -> one GetRawPos per
-    // element, reused via FData; gygd = gy*g_d formed once.
-    if hasInputGrad then
-    begin
-      for x := 0 to SizeXM1 do
-        for y := 0 to SizeYM1 do
-        begin
-          pos := Prev.GetRawPos(x, y, d);
-          xv := Prev.FData[pos];
-          gy := FOutputError.FData[pos];
-          t := pcr_tanhf(alpha * xv);
-          dt := 1 - t * t;
-          gygd := gy * g_d;
-          gradGamma := gradGamma + gy * t;
-          gradBeta := gradBeta + gy;
-          gradAlpha := gradAlpha + gygd * xv * dt;
-          PrevErr.FData[pos] := PrevErr.FData[pos] + gygd * alpha * dt;
-        end;
-    end
-    else
-    begin
-      for x := 0 to SizeXM1 do
-        for y := 0 to SizeYM1 do
-        begin
-          pos := Prev.GetRawPos(x, y, d);
-          xv := Prev.FData[pos];
-          gy := FOutputError.FData[pos];
-          t := pcr_tanhf(alpha * xv);
-          dt := 1 - t * t;
-          gradGamma := gradGamma + gy * t;
-          gradBeta := gradBeta + gy;
-          gradAlpha := gradAlpha + gy * g_d * xv * dt;
-        end;
-    end;
-    Ng.FDelta.Raw[d] := Ng.FDelta.Raw[d] + (-FLearningRate) * gradGamma;
-    Nb.FDelta.Raw[d] := Nb.FDelta.Raw[d] + (-FLearningRate) * gradBeta;
+    Ng.FDelta.Raw[d] := Ng.FDelta.Raw[d] + (-FLearningRate) * FgradGammaBuf[d];
+    Nb.FDelta.Raw[d] := Nb.FDelta.Raw[d] + (-FLearningRate) * FgradBetaBuf[d];
   end;
   Na.FDelta.Raw[0] := Na.FDelta.Raw[0] + (-FLearningRate) * gradAlpha;
   if (not FBatchUpdate) then
@@ -55091,6 +55110,8 @@ procedure TNNetPReLUChannel.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   // Base class already allocates FNeurons[0] with Depth weights.
+  // Backprop-only scratch: skip on inference-only layers.
+  if FIsTrainable then SetLength(FgradAlphaBuf, FOutput.Depth);
   InitDefault();
 end;
 
@@ -55099,9 +55120,10 @@ var
   StartTime: double;
   W: TNNetVolume;
   Prev: TNNetVolume;
-  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d: integer;
-  pos, xBase, rowStride: integer;
-  xv, alpha_d: TNeuralFloat;
+  SizeX, SizeY, Depth, DepthM1, d, k, NumPixM1: integer;
+  pos: integer;
+  xv: TNeuralFloat;
+  AlphaPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   // Do NOT call inherited Compute (which would copy input to FOutput).
@@ -55110,34 +55132,28 @@ begin
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
   Depth := FOutput.Depth;
-  SizeXM1 := SizeX - 1;
-  SizeYM1 := SizeY - 1;
   DepthM1 := Depth - 1;
+  NumPixM1 := SizeX * SizeY - 1;
   {$IFDEF Debug}
   if W.Size <> Depth then
     FErrorProc('Neuron weight count isn''t compatible with output depth ' +
       'at TNNetPReLUChannel.');
   {$ENDIF}
-  rowStride := SizeX * Depth;
-  for d := 0 to DepthM1 do
-  begin
-    alpha_d := W.Raw[d];
-    xBase := d;
-    for x := 0 to SizeXM1 do
+  // App.E: pixel-outer / channel-inner, so the volume is swept once with the
+  // contiguous depth axis innermost instead of once per channel with a Depth
+  // stride. The per-element sign branch keeps the body scalar.
+  AlphaPtr := W.GetRawPtr(0);   // #8: the alpha row base, once
+  pos := 0;
+  for k := 0 to NumPixM1 do
+    for d := 0 to DepthM1 do
     begin
-      pos := xBase;
-      for y := 0 to SizeYM1 do
-      begin
-        xv := Prev.FData[pos];
-        if xv >= 0 then
-          FOutput.FData[pos] := xv
-        else
-          FOutput.FData[pos] := alpha_d * xv;
-        Inc(pos, rowStride);
-      end;
-      Inc(xBase, Depth);
+      xv := Prev.FData[pos];
+      if xv >= 0 then
+        FOutput.FData[pos] := xv
+      else
+        FOutput.FData[pos] := AlphaPtr^[d] * xv;
+      Inc(pos);
     end;
-  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -55147,10 +55163,11 @@ var
   N: TNNetNeuron;
   W: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
-  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d: integer;
-  pos, xBase, rowStride: integer;
-  xv, gy, gradAlpha, alpha_d: TNeuralFloat;
+  SizeX, SizeY, Depth, DepthM1, d, k, NumPixM1: integer;
+  pos: integer;
+  xv, gy, alpha_d: TNeuralFloat;
   hasInputGrad: boolean;
+  AlphaPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -55166,39 +55183,35 @@ begin
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
-  SizeXM1 := SizeX - 1;
-  SizeYM1 := SizeY - 1;
   DepthM1 := Depth - 1;
-  rowStride := SizeX * Depth;
-  for d := 0 to DepthM1 do
-  begin
-    alpha_d := W.Raw[d];
-    gradAlpha := 0;
-    xBase := d;
-    for x := 0 to SizeXM1 do
+  NumPixM1 := SizeX * SizeY - 1;
+  // App.E: pixel-outer / channel-inner (one contiguous sweep of the volume).
+  // The per-channel alpha gradient becomes an accumulator vector (#17), so it
+  // now sums pixel-major - a float reassociation.
+  AlphaPtr := W.GetRawPtr(0);   // #8: the alpha row base, once
+  FillDWord(FgradAlphaBuf[0], Depth, 0);
+  pos := 0;
+  for k := 0 to NumPixM1 do
+    for d := 0 to DepthM1 do
     begin
-      pos := xBase;
-      for y := 0 to SizeYM1 do
+      xv := Prev.FData[pos];
+      gy := FOutputError.FData[pos];
+      if xv < 0 then
       begin
-        xv := Prev.FData[pos];
-        gy := FOutputError.FData[pos];
-        if xv < 0 then
-        begin
-          gradAlpha := gradAlpha + gy * xv;
-          if hasInputGrad then
-            PrevErr.FData[pos] := PrevErr.FData[pos] + gy * alpha_d;
-        end
-        else
-        begin
-          if hasInputGrad then
-            PrevErr.FData[pos] := PrevErr.FData[pos] + gy;
-        end;
-        Inc(pos, rowStride);
+        alpha_d := AlphaPtr^[d];
+        FgradAlphaBuf[d] := FgradAlphaBuf[d] + gy * xv;
+        if hasInputGrad then
+          PrevErr.FData[pos] := PrevErr.FData[pos] + gy * alpha_d;
+      end
+      else
+      begin
+        if hasInputGrad then
+          PrevErr.FData[pos] := PrevErr.FData[pos] + gy;
       end;
-      Inc(xBase, Depth);
+      Inc(pos);
     end;
-    N.FDelta.Raw[d] := N.FDelta.Raw[d] + (-FLearningRate) * gradAlpha;
-  end;
+  for d := 0 to DepthM1 do
+    N.FDelta.Raw[d] := N.FDelta.Raw[d] + (-FLearningRate) * FgradAlphaBuf[d];
   if (not FBatchUpdate) then
   begin
     N.UpdateWeights(FInertia);
@@ -55248,6 +55261,14 @@ begin
   // with Depth weights.
   if FNeurons.Count < 4 then AddMissingNeurons(4);
   SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  // Backprop-only scratch: skip on inference-only layers.
+  if FIsTrainable then
+  begin
+    SetLength(FgradTrBuf, FOutput.Depth);
+    SetLength(FgradArBuf, FOutput.Depth);
+    SetLength(FgradTlBuf, FOutput.Depth);
+    SetLength(FgradAlBuf, FOutput.Depth);
+  end;
   InitDefault();
 end;
 
@@ -55256,9 +55277,10 @@ var
   StartTime: double;
   Wtr, War, Wtl, Wal: TNNetVolume;
   Prev: TNNetVolume;
-  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d: integer;
-  pos, xBase, rowStride: integer;
+  SizeX, SizeY, Depth, DepthM1, d, k, NumPixM1: integer;
+  pos: integer;
   tr_d, ar_d, tl_d, al_d, xv: TNeuralFloat;
+  TrPtr, ArPtr, TlPtr, AlPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   // Do NOT call inherited Compute (which would copy input to FOutput).
@@ -55276,34 +55298,36 @@ begin
     FErrorProc('Neuron weight count isn''t compatible with output depth ' +
       'at TNNetSReLU.');
   {$ENDIF}
-  SizeXM1 := SizeX - 1;
-  SizeYM1 := SizeY - 1;
   DepthM1 := Depth - 1;
-  rowStride := SizeX * Depth;
-  for d := 0 to DepthM1 do
-  begin
-    tr_d := Wtr.Raw[d];
-    ar_d := War.Raw[d];
-    tl_d := Wtl.Raw[d];
-    al_d := Wal.Raw[d];
-    xBase := d;
-    for x := 0 to SizeXM1 do
+  NumPixM1 := SizeX * SizeY - 1;
+  // App.E: pixel-outer / channel-inner, so the volume is swept once with the
+  // contiguous depth axis innermost instead of once per channel with a Depth
+  // stride. The per-element three-way branch keeps the body scalar.
+  TrPtr := Wtr.GetRawPtr(0);   // #8: the four parameter row bases, once
+  ArPtr := War.GetRawPtr(0);
+  TlPtr := Wtl.GetRawPtr(0);
+  AlPtr := Wal.GetRawPtr(0);
+  pos := 0;
+  for k := 0 to NumPixM1 do
+    for d := 0 to DepthM1 do
     begin
-      pos := xBase;
-      for y := 0 to SizeYM1 do
+      xv := Prev.FData[pos];
+      tr_d := TrPtr^[d];
+      tl_d := TlPtr^[d];
+      if xv >= tr_d then
       begin
-        xv := Prev.FData[pos];
-        if xv >= tr_d then
-          FOutput.FData[pos] := tr_d + ar_d * (xv - tr_d)
-        else if xv <= tl_d then
-          FOutput.FData[pos] := tl_d + al_d * (xv - tl_d)
-        else
-          FOutput.FData[pos] := xv;
-        Inc(pos, rowStride);
-      end;
-      Inc(xBase, Depth);
+        ar_d := ArPtr^[d];
+        FOutput.FData[pos] := tr_d + ar_d * (xv - tr_d);
+      end
+      else if xv <= tl_d then
+      begin
+        al_d := AlPtr^[d];
+        FOutput.FData[pos] := tl_d + al_d * (xv - tl_d);
+      end
+      else
+        FOutput.FData[pos] := xv;
+      Inc(pos);
     end;
-  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -55313,11 +55337,11 @@ var
   Ntr, Nar, Ntl, Nal: TNNetNeuron;
   Wtr, War, Wtl, Wal: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
-  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d: integer;
-  pos, xBase, rowStride: integer;
+  SizeX, SizeY, Depth, DepthM1, d, k, NumPixM1: integer;
+  pos: integer;
   tr_d, ar_d, tl_d, al_d, xv, gy: TNeuralFloat;
-  gradTr, gradAr, gradTl, gradAl: TNeuralFloat;
   hasInputGrad: boolean;
+  TrPtr, ArPtr, TlPtr, AlPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -55339,58 +55363,59 @@ begin
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
-  SizeXM1 := SizeX - 1;
-  SizeYM1 := SizeY - 1;
   DepthM1 := Depth - 1;
-  rowStride := SizeX * Depth;
+  NumPixM1 := SizeX * SizeY - 1;
+  // App.E: pixel-outer / channel-inner (one contiguous sweep of the volume).
+  // The four per-channel parameter gradients become accumulator vectors (#17),
+  // so they now sum pixel-major - a float reassociation.
+  TrPtr := Wtr.GetRawPtr(0);   // #8: the four parameter row bases, once
+  ArPtr := War.GetRawPtr(0);
+  TlPtr := Wtl.GetRawPtr(0);
+  AlPtr := Wal.GetRawPtr(0);
+  FillDWord(FgradTrBuf[0], Depth, 0);
+  FillDWord(FgradArBuf[0], Depth, 0);
+  FillDWord(FgradTlBuf[0], Depth, 0);
+  FillDWord(FgradAlBuf[0], Depth, 0);
+  pos := 0;
+  for k := 0 to NumPixM1 do
+    for d := 0 to DepthM1 do
+    begin
+      xv := Prev.FData[pos];
+      gy := FOutputError.FData[pos];
+      tr_d := TrPtr^[d];
+      tl_d := TlPtr^[d];
+      if xv >= tr_d then
+      begin
+        // Right branch: y = t_r + a_r*(x - t_r).
+        ar_d := ArPtr^[d];
+        FgradArBuf[d] := FgradArBuf[d] + gy * (xv - tr_d);
+        FgradTrBuf[d] := FgradTrBuf[d] + gy * (1 - ar_d);
+        if hasInputGrad then
+          PrevErr.FData[pos] := PrevErr.FData[pos] + gy * ar_d;
+      end
+      else if xv <= tl_d then
+      begin
+        // Left branch: y = t_l + a_l*(x - t_l).
+        al_d := AlPtr^[d];
+        FgradAlBuf[d] := FgradAlBuf[d] + gy * (xv - tl_d);
+        FgradTlBuf[d] := FgradTlBuf[d] + gy * (1 - al_d);
+        if hasInputGrad then
+          PrevErr.FData[pos] := PrevErr.FData[pos] + gy * al_d;
+      end
+      else
+      begin
+        // Central identity branch: y = x.
+        if hasInputGrad then
+          PrevErr.FData[pos] := PrevErr.FData[pos] + gy;
+      end;
+      Inc(pos);
+    end;
   for d := 0 to DepthM1 do
   begin
-    tr_d := Wtr.Raw[d];
-    ar_d := War.Raw[d];
-    tl_d := Wtl.Raw[d];
-    al_d := Wal.Raw[d];
-    gradTr := 0;
-    gradAr := 0;
-    gradTl := 0;
-    gradAl := 0;
-    xBase := d;
-    for x := 0 to SizeXM1 do
-    begin
-      pos := xBase;
-      for y := 0 to SizeYM1 do
-      begin
-        xv := Prev.FData[pos];
-        gy := FOutputError.FData[pos];
-        if xv >= tr_d then
-        begin
-          // Right branch: y = t_r + a_r*(x - t_r).
-          gradAr := gradAr + gy * (xv - tr_d);
-          gradTr := gradTr + gy * (1 - ar_d);
-          if hasInputGrad then
-            PrevErr.FData[pos] := PrevErr.FData[pos] + gy * ar_d;
-        end
-        else if xv <= tl_d then
-        begin
-          // Left branch: y = t_l + a_l*(x - t_l).
-          gradAl := gradAl + gy * (xv - tl_d);
-          gradTl := gradTl + gy * (1 - al_d);
-          if hasInputGrad then
-            PrevErr.FData[pos] := PrevErr.FData[pos] + gy * al_d;
-        end
-        else
-        begin
-          // Central identity branch: y = x.
-          if hasInputGrad then
-            PrevErr.FData[pos] := PrevErr.FData[pos] + gy;
-        end;
-        Inc(pos, rowStride);
-      end;
-      Inc(xBase, Depth);
-    end;
-    Ntr.FDelta.Raw[d] := Ntr.FDelta.Raw[d] + (-FLearningRate) * gradTr;
-    Nar.FDelta.Raw[d] := Nar.FDelta.Raw[d] + (-FLearningRate) * gradAr;
-    Ntl.FDelta.Raw[d] := Ntl.FDelta.Raw[d] + (-FLearningRate) * gradTl;
-    Nal.FDelta.Raw[d] := Nal.FDelta.Raw[d] + (-FLearningRate) * gradAl;
+    Ntr.FDelta.Raw[d] := Ntr.FDelta.Raw[d] + (-FLearningRate) * FgradTrBuf[d];
+    Nar.FDelta.Raw[d] := Nar.FDelta.Raw[d] + (-FLearningRate) * FgradArBuf[d];
+    Ntl.FDelta.Raw[d] := Ntl.FDelta.Raw[d] + (-FLearningRate) * FgradTlBuf[d];
+    Nal.FDelta.Raw[d] := Nal.FDelta.Raw[d] + (-FLearningRate) * FgradAlBuf[d];
   end;
   if (not FBatchUpdate) then
   begin
@@ -55832,6 +55857,13 @@ begin
   // need FNeurons[1] (p2, Depth weights) and FNeurons[2] (beta, Depth weights).
   if FNeurons.Count < 3 then AddMissingNeurons(3);
   SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  // Backprop-only scratch: skip on inference-only layers.
+  if FIsTrainable then
+  begin
+    SetLength(FgradP1Buf, FOutput.Depth);
+    SetLength(FgradP2Buf, FOutput.Depth);
+    SetLength(FgradBetaBuf, FOutput.Depth);
+  end;
   InitDefault();
 end;
 
@@ -55840,9 +55872,10 @@ var
   StartTime: double;
   W1, W2, Wb: TNNetVolume;
   Prev: TNNetVolume;
-  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d: integer;
-  pos, xBase, rowStride: integer;
+  SizeX, SizeY, Depth, DepthM1, d, k, NumPixM1: integer;
+  pos: integer;
   p1_d, p2_d, beta_d, xv, dv, s: TNeuralFloat;
+  P1Ptr, P2Ptr, BetaPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   // Do NOT call inherited Compute (which would copy input to FOutput).
@@ -55859,30 +55892,27 @@ begin
       'at TNNetAconC.');
   {$ENDIF}
   // d = (p1[c]-p2[c])*x;  y = d*sigmoid(beta[c]*d) + p2[c]*x.
-  SizeXM1 := SizeX - 1;
-  SizeYM1 := SizeY - 1;
+  // App.E: pixel-outer / channel-inner, so the volume is swept once with the
+  // contiguous depth axis innermost instead of once per channel with a Depth
+  // stride. The per-element sigmoid keeps the body scalar.
   DepthM1 := Depth - 1;
-  rowStride := SizeX * Depth;
-  for d := 0 to DepthM1 do
-  begin
-    p1_d := W1.Raw[d];
-    p2_d := W2.Raw[d];
-    beta_d := Wb.Raw[d];
-    xBase := d;
-    for x := 0 to SizeXM1 do
+  NumPixM1 := SizeX * SizeY - 1;
+  P1Ptr := W1.GetRawPtr(0);   // #8: the three parameter row bases, once
+  P2Ptr := W2.GetRawPtr(0);
+  BetaPtr := Wb.GetRawPtr(0);
+  pos := 0;
+  for k := 0 to NumPixM1 do
+    for d := 0 to DepthM1 do
     begin
-      pos := xBase;
-      for y := 0 to SizeYM1 do
-      begin
-        xv := Prev.FData[pos];
-        dv := (p1_d - p2_d) * xv;
-        s := 1 / (1 + NeuralExp(-beta_d * dv));
-        FOutput.FData[pos] := dv * s + p2_d * xv;
-        Inc(pos, rowStride);
-      end;
-      Inc(xBase, Depth);
+      p1_d := P1Ptr^[d];
+      p2_d := P2Ptr^[d];
+      beta_d := BetaPtr^[d];
+      xv := Prev.FData[pos];
+      dv := (p1_d - p2_d) * xv;
+      s := 1 / (1 + NeuralExp(-beta_d * dv));
+      FOutput.FData[pos] := dv * s + p2_d * xv;
+      Inc(pos);
     end;
-  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -55892,11 +55922,11 @@ var
   N1, N2, Nb: TNNetNeuron;
   W1, W2, Wb: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
-  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, d: integer;
-  pos, xBase, rowStride: integer;
+  SizeX, SizeY, Depth, DepthM1, d, k, NumPixM1: integer;
+  pos: integer;
   p1_d, p2_d, beta_d, xv, gy, dv, s, sds, phi: TNeuralFloat;
-  gradP1, gradP2, gradBeta: TNeuralFloat;
   hasInputGrad: boolean;
+  P1Ptr, P2Ptr, BetaPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -55921,43 +55951,43 @@ begin
   // dL/dp1[c]   += dL/dy * x*phi
   // dL/dp2[c]   += dL/dy * x*(1 - phi)
   // dL/dbeta[c] += dL/dy * d*d*s*(1-s)
-  SizeXM1 := SizeX - 1;
-  SizeYM1 := SizeY - 1;
+  // App.E: pixel-outer / channel-inner (one contiguous sweep of the volume).
+  // The three per-channel parameter gradients become accumulator vectors (#17),
+  // so they now sum pixel-major - a float reassociation.
   DepthM1 := Depth - 1;
-  rowStride := SizeX * Depth;
+  NumPixM1 := SizeX * SizeY - 1;
+  P1Ptr := W1.GetRawPtr(0);   // #8: the three parameter row bases, once
+  P2Ptr := W2.GetRawPtr(0);
+  BetaPtr := Wb.GetRawPtr(0);
+  FillDWord(FgradP1Buf[0], Depth, 0);
+  FillDWord(FgradP2Buf[0], Depth, 0);
+  FillDWord(FgradBetaBuf[0], Depth, 0);
+  pos := 0;
+  for k := 0 to NumPixM1 do
+    for d := 0 to DepthM1 do
+    begin
+      p1_d := P1Ptr^[d];
+      p2_d := P2Ptr^[d];
+      beta_d := BetaPtr^[d];
+      xv := Prev.FData[pos];
+      gy := FOutputError.FData[pos];
+      dv := (p1_d - p2_d) * xv;
+      s := 1 / (1 + NeuralExp(-beta_d * dv));
+      sds := s * (1 - s);
+      phi := s + beta_d * dv * sds;
+      FgradP1Buf[d] := FgradP1Buf[d] + gy * xv * phi;
+      FgradP2Buf[d] := FgradP2Buf[d] + gy * xv * (1 - phi);
+      FgradBetaBuf[d] := FgradBetaBuf[d] + gy * dv * dv * sds;
+      if hasInputGrad then
+        PrevErr.FData[pos] := PrevErr.FData[pos] +
+          gy * ((p1_d - p2_d) * phi + p2_d);
+      Inc(pos);
+    end;
   for d := 0 to DepthM1 do
   begin
-    p1_d := W1.Raw[d];
-    p2_d := W2.Raw[d];
-    beta_d := Wb.Raw[d];
-    gradP1 := 0;
-    gradP2 := 0;
-    gradBeta := 0;
-    xBase := d;
-    for x := 0 to SizeXM1 do
-    begin
-      pos := xBase;
-      for y := 0 to SizeYM1 do
-      begin
-        xv := Prev.FData[pos];
-        gy := FOutputError.FData[pos];
-        dv := (p1_d - p2_d) * xv;
-        s := 1 / (1 + NeuralExp(-beta_d * dv));
-        sds := s * (1 - s);
-        phi := s + beta_d * dv * sds;
-        gradP1 := gradP1 + gy * xv * phi;
-        gradP2 := gradP2 + gy * xv * (1 - phi);
-        gradBeta := gradBeta + gy * dv * dv * sds;
-        if hasInputGrad then
-          PrevErr.FData[pos] := PrevErr.FData[pos] +
-            gy * ((p1_d - p2_d) * phi + p2_d);
-        Inc(pos, rowStride);
-      end;
-      Inc(xBase, Depth);
-    end;
-    N1.FDelta.Raw[d] := N1.FDelta.Raw[d] + (-FLearningRate) * gradP1;
-    N2.FDelta.Raw[d] := N2.FDelta.Raw[d] + (-FLearningRate) * gradP2;
-    Nb.FDelta.Raw[d] := Nb.FDelta.Raw[d] + (-FLearningRate) * gradBeta;
+    N1.FDelta.Raw[d] := N1.FDelta.Raw[d] + (-FLearningRate) * FgradP1Buf[d];
+    N2.FDelta.Raw[d] := N2.FDelta.Raw[d] + (-FLearningRate) * FgradP2Buf[d];
+    Nb.FDelta.Raw[d] := Nb.FDelta.Raw[d] + (-FLearningRate) * FgradBetaBuf[d];
   end;
   if (not FBatchUpdate) then
   begin
@@ -55994,6 +56024,17 @@ begin
   // FNeurons[2] (gamma) and FNeurons[3] (delta), each Depth weights.
   if FNeurons.Count < 4 then AddMissingNeurons(4);
   SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  // m[c] and beta[c] are forward state (recomputed in the backward); the grad
+  // accumulators are backprop-only.
+  SetLength(FmBuf, FOutput.Depth);
+  SetLength(FBetaBuf, FOutput.Depth);
+  if FIsTrainable then
+  begin
+    SetLength(FgradP1Buf, FOutput.Depth);
+    SetLength(FgradP2Buf, FOutput.Depth);
+    SetLength(FgradBetaBuf, FOutput.Depth);
+    SetLength(FBetaPathBuf, FOutput.Depth);
+  end;
   InitDefault();
 end;
 
@@ -56002,10 +56043,10 @@ var
   StartTime: double;
   W1, W2, Wg, Wb: TNNetVolume;
   Prev: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, d, N: integer;
-  MaxD, MaxX, MaxY: integer;
-  pos, xBase, rowStride: integer;
-  p1_d, p2_d, gamma_d, delta_d, m_d, beta_d, xv, dv, s: TNeuralFloat;
+  SizeX, SizeY, Depth, d, k, N: integer;
+  MaxD, NumPixM1, pos: integer;
+  p1_d, p2_d, beta_d, xv, dv, s: TNeuralFloat;
+  P1Ptr, P2Ptr, GammaPtr, DeltaPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -56018,52 +56059,48 @@ begin
   Depth := FOutput.Depth;
   N := SizeX * SizeY;
   MaxD := Depth - 1;
-  MaxX := SizeX - 1;
-  MaxY := SizeY - 1;
+  NumPixM1 := N - 1;
   {$IFDEF Debug}
   if (W1.Size <> Depth) or (W2.Size <> Depth) or (Wg.Size <> Depth) or
      (Wb.Size <> Depth) then
     FErrorProc('Neuron weight count isn''t compatible with output depth ' +
       'at TNNetMetaAconC.');
   {$ENDIF}
-  rowStride := SizeX * Depth;
+  // App.E: pixel-outer / channel-inner, so the volume is swept twice in total
+  // (squeeze + map) instead of twice per channel. The squeeze becomes a bulk
+  // per-channel accumulate (#13); the per-element sigmoid keeps the map scalar.
+  P1Ptr := W1.GetRawPtr(0);   // #8: the four parameter row bases, once
+  P2Ptr := W2.GetRawPtr(0);
+  GammaPtr := Wg.GetRawPtr(0);
+  DeltaPtr := Wb.GetRawPtr(0);
+  // Squeeze: m[c] = mean over all spatial positions of channel c.
+  FillDWord(FmBuf[0], Depth, 0);
+  pos := 0;
+  for k := 0 to NumPixM1 do
+  begin
+    TNNetVolume.Add(@FmBuf[0], Prev.GetRawPtr(pos), Depth);
+    Inc(pos, Depth);
+  end;
+  // Data-dependent beta.
   for d := 0 to MaxD do
   begin
-    p1_d := W1.Raw[d];
-    p2_d := W2.Raw[d];
-    gamma_d := Wg.Raw[d];
-    delta_d := Wb.Raw[d];
-    // Squeeze: m[c] = mean over all spatial positions of channel c.
-    m_d := 0;
-    xBase := d;
-    for x := 0 to MaxX do
-    begin
-      pos := xBase;
-      for y := 0 to MaxY do
-      begin
-        m_d := m_d + Prev.FData[pos];
-        Inc(pos, rowStride);
-      end;
-      Inc(xBase, Depth);
-    end;
-    m_d := m_d / N;
-    // Data-dependent beta.
-    beta_d := 1 / (1 + NeuralExp(-(gamma_d * m_d + delta_d)));
-    xBase := d;
-    for x := 0 to MaxX do
-    begin
-      pos := xBase;
-      for y := 0 to MaxY do
-      begin
-        xv := Prev.FData[pos];
-        dv := (p1_d - p2_d) * xv;
-        s := 1 / (1 + NeuralExp(-beta_d * dv));
-        FOutput.FData[pos] := dv * s + p2_d * xv;
-        Inc(pos, rowStride);
-      end;
-      Inc(xBase, Depth);
-    end;
+    FmBuf[d] := FmBuf[d] / N;
+    FBetaBuf[d] := 1 / (1 + NeuralExp(-(GammaPtr^[d] * FmBuf[d] +
+      DeltaPtr^[d])));
   end;
+  pos := 0;
+  for k := 0 to NumPixM1 do
+    for d := 0 to MaxD do
+    begin
+      p1_d := P1Ptr^[d];
+      p2_d := P2Ptr^[d];
+      beta_d := FBetaBuf[d];
+      xv := Prev.FData[pos];
+      dv := (p1_d - p2_d) * xv;
+      s := 1 / (1 + NeuralExp(-beta_d * dv));
+      FOutput.FData[pos] := dv * s + p2_d * xv;
+      Inc(pos);
+    end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -56073,13 +56110,12 @@ var
   N1, N2, Ng, Nb: TNNetNeuron;
   W1, W2, Wg, Wb: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, d, N: integer;
-  MaxD, MaxX, MaxY: integer;
-  pos, xBase, rowStride: integer;
-  p1_d, p2_d, gamma_d, delta_d, m_d, beta_d, betaSig: TNeuralFloat;
+  SizeX, SizeY, Depth, d, k, N: integer;
+  MaxD, NumPixM1, pos: integer;
+  p1_d, p2_d, beta_d, betaSig: TNeuralFloat;
   xv, gy, dv, s, sds, phi: TNeuralFloat;
-  gradP1, gradP2, gradBeta, betaPathFactor: TNeuralFloat;
   hasInputGrad: boolean;
+  P1Ptr, P2Ptr, GammaPtr, DeltaPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -56099,93 +56135,94 @@ begin
   Depth := FOutput.Depth;
   N := SizeX * SizeY;
   MaxD := Depth - 1;
-  MaxX := SizeX - 1;
-  MaxY := SizeY - 1;
+  NumPixM1 := N - 1;
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
-  rowStride := SizeX * Depth;
+  // App.E: pixel-outer / channel-inner, so each of the three volume sweeps runs
+  // once over the contiguous depth axis instead of once per channel. The
+  // per-channel scalars become vectors (#17); the squeeze and the beta-path
+  // distribution become bulk per-channel accumulates (#13). The reductions now
+  // sum pixel-major - a float reassociation.
+  P1Ptr := W1.GetRawPtr(0);   // #8: the four parameter row bases, once
+  P2Ptr := W2.GetRawPtr(0);
+  GammaPtr := Wg.GetRawPtr(0);
+  DeltaPtr := Wb.GetRawPtr(0);
+  // Recompute the squeeze and beta consistently with the forward.
+  FillDWord(FmBuf[0], Depth, 0);
+  pos := 0;
+  for k := 0 to NumPixM1 do
+  begin
+    TNNetVolume.Add(@FmBuf[0], Prev.GetRawPtr(pos), Depth);
+    Inc(pos, Depth);
+  end;
   for d := 0 to MaxD do
   begin
-    p1_d := W1.Raw[d];
-    p2_d := W2.Raw[d];
-    gamma_d := Wg.Raw[d];
-    delta_d := Wb.Raw[d];
-    // Recompute the squeeze and beta consistently with the forward.
-    m_d := 0;
-    xBase := d;
-    for x := 0 to MaxX do
+    FmBuf[d] := FmBuf[d] / N;
+    FBetaBuf[d] := 1 / (1 + NeuralExp(-(GammaPtr^[d] * FmBuf[d] +
+      DeltaPtr^[d])));
+  end;
+  FillDWord(FgradP1Buf[0], Depth, 0);
+  FillDWord(FgradP2Buf[0], Depth, 0);
+  // FgradBetaBuf[c] = dL/dbeta[c], summed over all positions of the channel.
+  FillDWord(FgradBetaBuf[0], Depth, 0);
+  // First pass: direct-path input gradient + p1/p2 grads + accumulate
+  // dL/dbeta[c] across positions.
+  pos := 0;
+  for k := 0 to NumPixM1 do
+    for d := 0 to MaxD do
     begin
-      pos := xBase;
-      for y := 0 to MaxY do
-      begin
-        m_d := m_d + Prev.FData[pos];
-        Inc(pos, rowStride);
-      end;
-      Inc(xBase, Depth);
+      p1_d := P1Ptr^[d];
+      p2_d := P2Ptr^[d];
+      beta_d := FBetaBuf[d];
+      xv := Prev.FData[pos];
+      gy := FOutputError.FData[pos];
+      dv := (p1_d - p2_d) * xv;
+      s := 1 / (1 + NeuralExp(-beta_d * dv));
+      sds := s * (1 - s);
+      phi := s + beta_d * dv * sds;
+      FgradP1Buf[d] := FgradP1Buf[d] + gy * xv * phi;
+      FgradP2Buf[d] := FgradP2Buf[d] + gy * xv * (1 - phi);
+      FgradBetaBuf[d] := FgradBetaBuf[d] + gy * dv * dv * sds;
+      if hasInputGrad then
+        PrevErr.FData[pos] := PrevErr.FData[pos] +
+          gy * ((p1_d - p2_d) * phi + p2_d);
+      Inc(pos);
     end;
-    m_d := m_d / N;
-    beta_d := 1 / (1 + NeuralExp(-(gamma_d * m_d + delta_d)));
+  // Second pass: distribute the beta-path input gradient. beta[c] depends on
+  // every element of the channel through m[c] (dm/dx = 1/N), and
+  // dbeta/dm = beta*(1-beta)*gamma, so each position gets the same extra
+  // term (1/N)*beta*(1-beta)*gamma * dL/dbeta[c] - one per-channel constant
+  // vector added to every pixel column.
+  if hasInputGrad then
+  begin
+    for d := 0 to MaxD do
+    begin
+      beta_d := FBetaBuf[d];
+      FBetaPathBuf[d] := beta_d * (1 - beta_d) * GammaPtr^[d] *
+        FgradBetaBuf[d] / N;
+    end;
+    pos := 0;
+    for k := 0 to NumPixM1 do
+    begin
+      TNNetVolume.Add(PrevErr.GetRawPtr(pos), @FBetaPathBuf[0], Depth);
+      Inc(pos, Depth);
+    end;
+  end;
+  // Param grads for the affine that produces beta.
+  //   dL/dgamma[c] = dL/dbeta[c] * beta*(1-beta) * m[c]
+  //   dL/ddelta[c] = dL/dbeta[c] * beta*(1-beta)
+  for d := 0 to MaxD do
+  begin
+    beta_d := FBetaBuf[d];
     betaSig := beta_d * (1 - beta_d);   // dbeta/d(pre-activation)
-    gradP1 := 0;
-    gradP2 := 0;
-    gradBeta := 0;   // dL/dbeta[c], summed over all positions of the channel.
-    // First pass: direct-path input gradient + p1/p2 grads + accumulate
-    // dL/dbeta[c] across positions.
-    xBase := d;
-    for x := 0 to MaxX do
-    begin
-      pos := xBase;
-      for y := 0 to MaxY do
-      begin
-        xv := Prev.FData[pos];
-        gy := FOutputError.FData[pos];
-        dv := (p1_d - p2_d) * xv;
-        s := 1 / (1 + NeuralExp(-beta_d * dv));
-        sds := s * (1 - s);
-        phi := s + beta_d * dv * sds;
-        gradP1 := gradP1 + gy * xv * phi;
-        gradP2 := gradP2 + gy * xv * (1 - phi);
-        gradBeta := gradBeta + gy * dv * dv * sds;
-        if hasInputGrad then
-          PrevErr.FData[pos] := PrevErr.FData[pos] +
-            gy * ((p1_d - p2_d) * phi + p2_d);
-        Inc(pos, rowStride);
-      end;
-      Inc(xBase, Depth);
-    end;
-    // Second pass: distribute the beta-path input gradient. beta[c] depends on
-    // every element of the channel through m[c] (dm/dx = 1/N), and
-    // dbeta/dm = beta*(1-beta)*gamma, so each position gets the same extra
-    // term (1/N)*beta*(1-beta)*gamma * dL/dbeta[c].
-    if hasInputGrad then
-    begin
-      betaPathFactor := betaSig * gamma_d * gradBeta / N;
-      if betaPathFactor <> 0 then
-      begin
-        xBase := d;
-        for x := 0 to MaxX do
-        begin
-          pos := xBase;
-          for y := 0 to MaxY do
-          begin
-            PrevErr.FData[pos] := PrevErr.FData[pos] + betaPathFactor;
-            Inc(pos, rowStride);
-          end;
-          Inc(xBase, Depth);
-        end;
-      end;
-    end;
-    // Param grads for the affine that produces beta.
-    //   dL/dgamma[c] = dL/dbeta[c] * beta*(1-beta) * m[c]
-    //   dL/ddelta[c] = dL/dbeta[c] * beta*(1-beta)
-    N1.FDelta.Raw[d] := N1.FDelta.Raw[d] + (-FLearningRate) * gradP1;
-    N2.FDelta.Raw[d] := N2.FDelta.Raw[d] + (-FLearningRate) * gradP2;
+    N1.FDelta.Raw[d] := N1.FDelta.Raw[d] + (-FLearningRate) * FgradP1Buf[d];
+    N2.FDelta.Raw[d] := N2.FDelta.Raw[d] + (-FLearningRate) * FgradP2Buf[d];
     Ng.FDelta.Raw[d] := Ng.FDelta.Raw[d] +
-      (-FLearningRate) * (gradBeta * betaSig * m_d);
+      (-FLearningRate) * (FgradBetaBuf[d] * betaSig * FmBuf[d]);
     Nb.FDelta.Raw[d] := Nb.FDelta.Raw[d] +
-      (-FLearningRate) * (gradBeta * betaSig);
+      (-FLearningRate) * (FgradBetaBuf[d] * betaSig);
   end;
   if (not FBatchUpdate) then
   begin
