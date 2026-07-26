@@ -14644,7 +14644,8 @@ var
   j, TargetIdx, HalfDim, SrcRow, Base, Row: integer;
   OutDimM1: integer;
   QLayer: TNNetLayerConcatedWeights;
-  DirectInt8: boolean;
+  DirectInt8, RowStream: boolean;
+  WRowBase: integer;
   ChunkRows, RowsInChunk, RowCnt, RowsInChunkM1: integer;
   ChunkTargets: TNeuralIntegerArray;
   Fan: TInt8RowChunkFan;
@@ -14784,12 +14785,32 @@ begin
     end
     else
     begin
-      if IsNF4QuantizedTensor(Reader, WName) then
-        // bnb-4bit: expand the packed nibbles + FP32 absmax into a flat F32
-        // [SrcRows, InDim] buffer; the rest of the loader is dtype-agnostic.
-        LoadNF4QuantizedTensorFlat(Reader, WName, SrcRows, InDim, W)
+      // Slicing a row block out of a larger FUSED slab (Phi-3 qkv_proj /
+      // gate_up_proj, the Qwen3.5 per-head q_proj, granite's shared MLP):
+      // stream just this block's rows instead of materializing - and
+      // BF16/F16-decoding - all SrcRows of the slab and copying OutDim rows
+      // out of it. Every extra slice of the same slab otherwise re-reads and
+      // re-decodes the whole thing. The packed NF4 form has no row view and
+      // the synthetic-view readers answer CanStreamTensorRows false, so both
+      // fall back to the full load.
+      RowStream := (SrcRows > OutDim) and
+        (not IsNF4QuantizedTensor(Reader, WName)) and
+        Reader.CanStreamTensorRows(WName);
+      if RowStream then
+      begin
+        Reader.LoadTensorRowsFlat(WName, SrcRowBase, OutDim, InDim, W);
+        WRowBase := 0;             // W holds the slice, so row j is row j
+      end
       else
-        Reader.LoadTensorFlat(WName, W);
+      begin
+        if IsNF4QuantizedTensor(Reader, WName) then
+          // bnb-4bit: expand the packed nibbles + FP32 absmax into a flat F32
+          // [SrcRows, InDim] buffer; the rest of the loader is dtype-agnostic.
+          LoadNF4QuantizedTensorFlat(Reader, WName, SrcRows, InDim, W)
+        else
+          Reader.LoadTensorFlat(WName, W);
+        WRowBase := SrcRowBase;    // W holds the whole slab
+      end;
       for j := 0 to OutDimM1 do
       begin
         TargetIdx := MapTargetNeuron(j);
@@ -14799,7 +14820,7 @@ begin
             IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
             IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
             ' weights, expected ' + IntToStr(InDim) + '.');
-        Base := SrcRow * InDim;
+        Base := (WRowBase + j) * InDim;
         WV := Layer.FArrNeurons[TargetIdx].Weights;
         Move(W.FData[Base], WV.FData[0], InDim * csNeuralFloatSize);
         if Scale <> 1.0 then TNNetVolume.Mul(WV.GetRawPtr(0), Scale, InDim);
