@@ -172,33 +172,31 @@ begin
   end;
 end;
 
-// Softmax of Logits/T into Probs.
-procedure SoftmaxTemp(
-  const Logits: array of TNeuralFloat; T: TNeuralFloat;
-  out Probs: array of TNeuralFloat; N: integer);
+// -ln(softmax(Logits/T)[K]) for one sample. Only the label's probability is
+// ever consumed, so the normalize pass and the N probability stores of a full
+// softmax are skipped: the sum is accumulated and the single needed term is
+// divided out afterwards. MaxRaw is max(Logits), supplied by the caller because
+// it does not depend on T (T > 0, and scaling by a positive constant does not
+// move the argmax).
+function NLLAtTemp(
+  const Logits: array of TNeuralFloat; MaxRaw, T: TNeuralFloat;
+  K, N: integer): TNeuralFloat;
 var
   I, NM1: integer;
-  MaxV, Acc, MaxRaw, V, AccClamped, InvT, InvAcc: TNeuralFloat;
+  MaxV, Acc, AccClamped, InvT, InvAcc, P: TNeuralFloat;
 begin
   NM1 := N - 1;
-  // Both divisors are loop-invariant: one reciprocal each, then a multiply per
-  // element instead of N divides (#5).
+  // Both divisors are loop-invariant: one reciprocal each, then a multiply
+  // instead of a divide (#21).
   InvT := 1.0 / T;
-  MaxRaw := Logits[0];
-  for I := 1 to NM1 do
-    if Logits[I] > MaxRaw then MaxRaw := Logits[I];
   MaxV := MaxRaw * InvT;
   Acc := 0;
   for I := 0 to NM1 do
-  begin
-    V := Exp(Logits[I] * InvT - MaxV);
-    Probs[I] := V;
-    Acc := Acc + V;
-  end;
+    Acc := Acc + Exp(Logits[I] * InvT - MaxV);
   AccClamped := Max(cEps, Acc);
   InvAcc := 1.0 / AccClamped;
-  for I := 0 to NM1 do
-    Probs[I] := Probs[I] * InvAcc;
+  P := Exp(Logits[K] * InvT - MaxV) * InvAcc;
+  Result := -Ln(Max(cEps, P));
 end;
 
 function ComputeCalibration(
@@ -411,6 +409,10 @@ var
   // cached pseudo-logits for every valid sample (one forward pass total).
   AllLogits: array of array of TNeuralFloat;
   AllLabel: array of integer;
+  // max(Logits) per sample: temperature-invariant, so it is computed once here
+  // instead of once per (sample, grid point).
+  AllMax: array of TNeuralFloat;
+  MaxRaw: TNeuralFloat;
   T, BestT, NLL, BestNLL, Lo, Hi, GridStep: TNeuralFloat;
 begin
   Result := 1.0;
@@ -426,6 +428,7 @@ begin
   SetLength(Probs, N);
   SetLength(AllLogits, InputCount);
   SetLength(AllLabel, InputCount);
+  SetLength(AllMax, InputCount);
 
   // Single forward pass over the set; cache logits so the grid scan is pure
   // arithmetic (the backbone is touched exactly once and never mutated).
@@ -440,6 +443,10 @@ begin
     SetLength(AllLogits[Total], N);
     Move(Logits[0], AllLogits[Total][0], N * csNeuralFloatSize);
     AllLabel[Total] := TrueClass;
+    MaxRaw := Logits[0];
+    for J := 1 to NM1 do
+      if Logits[J] > MaxRaw then MaxRaw := Logits[J];
+    AllMax[Total] := MaxRaw;
     Inc(Total);
   end;
   if Total = 0 then Exit;
@@ -459,10 +466,7 @@ begin
     begin
       NLL := 0;
       for I := 0 to TotalM1 do
-      begin
-        SoftmaxTemp(AllLogits[I], T, Probs, N);
-        NLL := NLL - Ln(Max(cEps, Probs[AllLabel[I]]));
-      end;
+        NLL := NLL + NLLAtTemp(AllLogits[I], AllMax[I], T, AllLabel[I], N);
       NLL := NLL / Total;
       if NLL < BestNLL then
       begin
