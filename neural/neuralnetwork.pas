@@ -23405,7 +23405,7 @@ begin
   if Size > 0 then
   begin
     if Length(FExpBuf) <> Size then SetLength(FExpBuf, Size); // rule #17: lazy amortized resize
-    AVXExp(TNeuralFloatArrPtr(@FExpBuf[0]),
+    TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpBuf[0]),
       TNeuralFloatArrPtr(@LocalPrevOutput.FData[0]), Size);
     if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
     begin
@@ -37762,14 +37762,14 @@ begin
   begin
     basePrev := Prev.GetRawPos(i, 0);
     basePhi := FPhiQ.GetRawPos(i, 0);          // FPhiK shares FPhiQ shape (#4: reuse)
-    AVXExp(TNeuralFloatArrPtr(FPhiQ.GetRawPtr(basePhi)),
+    TNNetVolume.VectorExp(TNeuralFloatArrPtr(FPhiQ.GetRawPtr(basePhi)),
            TNeuralFloatArrPtr(Prev.GetRawPtr(basePrev)), FDk);
     for a := 0 to DkM1 do
     begin
       Q := Prev.FData[basePrev + a];
       if Q >= 0 then FPhiQ.FData[basePhi + a] := Q + 1;
     end;
-    AVXExp(TNeuralFloatArrPtr(FPhiK.GetRawPtr(basePhi)),
+    TNNetVolume.VectorExp(TNeuralFloatArrPtr(FPhiK.GetRawPtr(basePhi)),
            TNeuralFloatArrPtr(Prev.GetRawPtr(basePrev + FDk)), FDk);
     for a := 0 to DkM1 do
     begin
@@ -44357,7 +44357,7 @@ begin
     begin
       if Length(FExpNeg) <> Size then SetLength(FExpNeg, Size); // rule #17: lazy amortized resize
       // FExpNeg := exp(-x) before FExpPos := exp(x), since FExpPos currently holds -x.
-      AVXExp(TNeuralFloatArrPtr(@FExpNeg[0]), TNeuralFloatArrPtr(@FExpPos[0]), Size);
+      TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpNeg[0]), TNeuralFloatArrPtr(@FExpPos[0]), Size);
       // FExpPos := exp(clamp(x)). Refill with the clamped +x argument.
       for OutputCnt := 0 to SizeM1 do
       begin
@@ -44366,7 +44366,7 @@ begin
         else if x < -88 then FExpPos[OutputCnt] := -88
         else FExpPos[OutputCnt] := x;
       end;
-      AVXExp(TNeuralFloatArrPtr(@FExpPos[0]), TNeuralFloatArrPtr(@FExpPos[0]), Size);
+      TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpPos[0]), TNeuralFloatArrPtr(@FExpPos[0]), Size);
       for OutputCnt := 0 to SizeM1 do
       begin
         x := LocalPrevOutput.FData[OutputCnt];
@@ -44397,7 +44397,7 @@ begin
         else if x < -88 then FExpPos[OutputCnt] := -88
         else FExpPos[OutputCnt] := x;
       end;
-      AVXExp(TNeuralFloatArrPtr(@FExpPos[0]), TNeuralFloatArrPtr(@FExpPos[0]), Size);
+      TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpPos[0]), TNeuralFloatArrPtr(@FExpPos[0]), Size);
       for OutputCnt := 0 to SizeM1 do
       begin
         x := LocalPrevOutput.FData[OutputCnt];
@@ -44514,7 +44514,7 @@ begin
     Move(LocalPrevOutput.FData[0], FBetaXBuf[0], Size * csNeuralFloatSize);
     TNNetVolume.Mul(@FBetaXBuf[0], Beta, Size);
     if Length(FExpBuf) <> Size then SetLength(FExpBuf, Size); // rule #17: lazy amortized resize
-    AVXExp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FBetaXBuf[0]), Size);
+    TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FBetaXBuf[0]), Size);
     if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
     begin
       for OutputCnt := 0 to SizeM1 do
@@ -44827,7 +44827,7 @@ begin
           if x > 88 then x := 88 else if x < -88 then x := -88;
           FExpBuf[OutputCnt] := x;
         end;
-        AVXExp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FExpBuf[0]), Size);
+        TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FExpBuf[0]), Size);
         for OutputCnt := 0 to SizeM1 do
         begin
           // y = (exp(alpha*x) - 1)/alpha + alpha; derivative = exp(alpha*x).
@@ -44875,7 +44875,7 @@ begin
           if x > 88 then x := 88 else if x < -88 then x := -88;
           FExpBuf[OutputCnt] := x;
         end;
-        AVXExp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FExpBuf[0]), Size);
+        TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FExpBuf[0]), Size);
         for OutputCnt := 0 to SizeM1 do
           FOutput.FData[OutputCnt] := (FExpBuf[OutputCnt] - 1) * InvAlpha + Alpha;
       end;
@@ -44923,7 +44923,7 @@ begin
       x := LocalPrevOutput.FData[OutputCnt];
       FExpBuf[OutputCnt] := -x * x;
     end;
-    AVXExp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FExpBuf[0]), Size);
+    TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FExpBuf[0]), Size);
     if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
     begin
       for OutputCnt := 0 to SizeM1 do
@@ -52192,7 +52192,7 @@ begin
   if Size > 0 then
   begin
     if Length(FExpBuf) <> Size then SetLength(FExpBuf, Size);
-    AVXExp(TNeuralFloatArrPtr(@FExpBuf[0]),
+    TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpBuf[0]),
       TNeuralFloatArrPtr(@LocalPrevOutput.FData[0]), Size);
     if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
     begin
@@ -52302,7 +52302,7 @@ begin
   if Size > 0 then
   begin
     if Length(FExpBuf) <> Size then SetLength(FExpBuf, Size);
-    AVXExp(TNeuralFloatArrPtr(@FExpBuf[0]),
+    TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpBuf[0]),
       TNeuralFloatArrPtr(@LocalPrevOutput.FData[0]), Size);
     if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
     begin
@@ -80705,7 +80705,7 @@ begin
 
   // Output := exp(L)  (#13: vectorized exp over the full N*N contiguous run)
   {$IFDEF AVXANY}
-  AVXExp(L.DataPtr, L.DataPtr, FN * FN);
+  TNNetVolume.VectorExp(L.DataPtr, L.DataPtr, FN * FN);
   {$ELSE}
   for ri := 0 to NNm1 do
     L.FData[ri] := NeuralExp(L.FData[ri]);
@@ -92966,7 +92966,7 @@ begin
         Inc(InputRawPtr);
         Inc(WinMaxPtr);
       end;
-      AVXExp(TNeuralFloatArrPtr(@FArgBuf[0]), TNeuralFloatArrPtr(@FArgBuf[0]), Depth);
+      TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FArgBuf[0]), TNeuralFloatArrPtr(@FArgBuf[0]), Depth);
       for CntD := 0 to MaxD do
       begin
         ExpSumPtr^ := ExpSumPtr^ + FArgBuf[CntD];
@@ -93060,7 +93060,7 @@ begin
         Inc(InputRawPtr);
         Inc(WinMaxPtr);
       end;
-      AVXExp(TNeuralFloatArrPtr(@FArgBuf[0]), TNeuralFloatArrPtr(@FArgBuf[0]), Depth);
+      TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FArgBuf[0]), TNeuralFloatArrPtr(@FArgBuf[0]), Depth);
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
       for CntD := 0 to MaxD do
       begin
@@ -93170,7 +93170,7 @@ begin
         Inc(InputRawPtr);
         Inc(WinMaxPtr);
       end;
-      AVXExp(TNeuralFloatArrPtr(@FArgBuf[0]), TNeuralFloatArrPtr(@FArgBuf[0]), Depth);
+      TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FArgBuf[0]), TNeuralFloatArrPtr(@FArgBuf[0]), Depth);
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
       for CntD := 0 to MaxD do
       begin
