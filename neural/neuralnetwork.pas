@@ -92740,7 +92740,8 @@ var
   StartTime: double;
   OutputRawPos: integer;
   InputRawPtr: TNeuralFloatPtr;
-  N, InvP: TNeuralFloat;
+  N, InvP, XVal: TNeuralFloat;
+  IsP2: boolean;
 begin
   StartTime := Now();
   // Accumulate sum_i |x_i|^p into the output.
@@ -92748,6 +92749,10 @@ begin
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
   MaxD := FPrevLayer.Output.Depth - 1;
+  // #24/#20: p = 2 is the constructor default, and there |x|^p is x*x and the
+  // 1/p root is a Sqrt -- no transcendental at all. Unswitch once per window
+  // row rather than calling pcr_powf per element.
+  IsP2 := FP = 2.0;
 
   for CntX := 0 to MaxX do
   begin
@@ -92757,13 +92762,23 @@ begin
       OutY := CntY div FPoolSize;
       OutputRawPos := FOutput.GetRawPos(OutX, OutY);
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
-      for CntD := 0 to MaxD do
-      begin
-        FOutput.FData[OutputRawPos] :=
-          FOutput.FData[OutputRawPos] + pcr_powf(Abs(InputRawPtr^), FP);
-        Inc(OutputRawPos);
-        Inc(InputRawPtr);
-      end;
+      if IsP2 then
+        for CntD := 0 to MaxD do
+        begin
+          XVal := InputRawPtr^;
+          FOutput.FData[OutputRawPos] :=
+            FOutput.FData[OutputRawPos] + XVal * XVal;
+          Inc(OutputRawPos);
+          Inc(InputRawPtr);
+        end
+      else
+        for CntD := 0 to MaxD do
+        begin
+          FOutput.FData[OutputRawPos] :=
+            FOutput.FData[OutputRawPos] + pcr_powf(Abs(InputRawPtr^), FP);
+          Inc(OutputRawPos);
+          Inc(InputRawPtr);
+        end;
     end;
   end;
 
@@ -92771,11 +92786,13 @@ begin
   N := FPoolSize * FPoolSize;
   InvP := 1.0 / FP;
   MaxOutputPos := FOutput.Size - 1;
-  for OutputRawPos := 0 to MaxOutputPos do
-  begin
-    FOutput.FData[OutputRawPos] :=
-      pcr_powf(FOutput.FData[OutputRawPos] / N, InvP);
-  end;
+  if IsP2 then
+    for OutputRawPos := 0 to MaxOutputPos do
+      FOutput.FData[OutputRawPos] := Sqrt(FOutput.FData[OutputRawPos] / N)
+  else
+    for OutputRawPos := 0 to MaxOutputPos do
+      FOutput.FData[OutputRawPos] :=
+        pcr_powf(FOutput.FData[OutputRawPos] / N, InvP);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -92788,6 +92805,7 @@ var
   OutputRawPos, PrevRawPos: integer;
   InputRawPtr: TNeuralFloatPtr;
   N, Y, AbsX, XVal, Coef, Grad, OneMinusP, PM1, InvN: TNeuralFloat;
+  IsP2: boolean;
 const
   cEps = 1e-12;
 begin
@@ -92802,6 +92820,9 @@ begin
   OneMinusP := 1.0 - FP;
   PM1 := FP - 1.0;
   InvN := 1.0 / N;
+  // #24/#20: at p = 2 the coefficient y^(1-p)*|x|^(p-1) is just |x|/y, so both
+  // pcr_powf calls drop out of the per-element body.
+  IsP2 := FP = 2.0;
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
   MaxD := FPrevLayer.Output.Depth - 1;
@@ -92824,7 +92845,8 @@ begin
         // Guard against division by zero / underflow.
         if (Y > cEps) and (AbsX > cEps) then
         begin
-          Coef := (pcr_powf(Y, OneMinusP) * InvN) * pcr_powf(AbsX, PM1);
+          if IsP2 then Coef := (AbsX * InvN) / Y
+          else Coef := (pcr_powf(Y, OneMinusP) * InvN) * pcr_powf(AbsX, PM1);
           if XVal < 0 then Coef := -Coef;
           Grad := Coef * FOutputError.FData[OutputRawPos];
           FPrevLayer.OutputError.FData[PrevRawPos] :=
