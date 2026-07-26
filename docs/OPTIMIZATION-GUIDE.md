@@ -1680,8 +1680,16 @@ the wrong shape entirely. `neuralvolume.pas` exports a vectorized kernel for eac
 | `dst[i] := arcsinh(src[i])` | `TNNetVolume.VectorArcSinh(dstPtr, srcPtr, N)` |
 
 On an AVX2 build these run an 8-wide polynomial (`AVXExp`, `AVXLn`, `AVXSinCos`,
-`AVXCopyRelu`) with a scalar remainder; on a non-AVX build they degrade to exactly
-the scalar loop you replaced, so the promotion is never a regression. **All of them
+`AVXCopyRelu`) with a scalar remainder. On a non-AVX build most degrade to exactly
+the scalar loop you replaced, so the promotion costs nothing there.
+
+`VectorErf` is the exception: its fallback is not `pcr_erff` at all but an
+Abramowitz–Stegun approximation layered over `VectorExp`, so a promotion that
+needs a separate scale or copy pass can run ~1.3x *slower* than the scalar loop on
+a non-AVX build (measured on the SAM upscale GELU: 45 ms scalar, 59 ms promoted;
+the same change is 1.8x faster with AVX2). Almost every shipped `.lpi` builds with
+`-dAVX2`, so the promotion is still right — but if a path must be fast on a
+non-AVX target, measure both builds rather than assuming. **All of them
 allow `dst` to alias `src`**, so an in-place `VectorExp(p, p, N)` is legal — the
 kernels are documented to read before they write, and the ones that need a temp
 (`VectorSinh`, `VectorArcSinh`) use their own internal scratch rather than `pDst`.
