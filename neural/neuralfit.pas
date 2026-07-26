@@ -372,7 +372,12 @@ type
       FCustomLearningRateScheduleFn: TCustomLearningRateScheduleFn;
       FCustomLearningRateScheduleObjFn: TCustomLearningRateScheduleObjFn;
       FDataAugmentation: boolean;
-      FFinishedThread: TNNetVolume;
+      // Per-thread "my subtree of deltas is merged" publication, one slot per
+      // worker. It is written by one thread and read by another with no lock
+      // around it, so it MUST be an atomic word: NeuralAtomicIncrement's full
+      // barrier is what orders a worker's delta writes ahead of the flag its
+      // partner spins on, and NeuralAtomicRead is the matching acquire.
+      FFinishedThread: array of LongInt;
       {$IFDEF HASTHREADS}FCritSec: TRTLCriticalSection;{$ENDIF}
       FNN: TNNet;
       FGlobalHit: integer;
@@ -438,6 +443,9 @@ type
       // Reapplies the per-group norm-layer LR multiplier after the base LR has
       // been broadcast to every layer. No-op when the multiplier is 1.
       procedure ApplyParamGroupLearningRate();
+      // Re-arms every FFinishedThread slot to "not finished". Runs on the main
+      // thread before the workers are started, so it needs no barrier of its own.
+      procedure ClearFinishedThread();
       procedure SetAccumulationSteps(Value: integer);
       procedure CheckLearningRate(iEpochCount: integer);
       procedure Optimize();
@@ -1990,33 +1998,29 @@ begin
     end;
   end; // of for
 
+  // Pairwise then stride-2 delta reduction. A slot becomes non-zero only after
+  // this thread has merged everything below it, so a non-zero read is the
+  // signal that the partner's deltas are complete AND visible: the atomic
+  // increment publishes them, the atomic read acquires them.
   if (Index and 1 = 0) and Not(FShouldQuit) then
   begin
     if Index + 1 < FThreadNum then
     begin
-      while (FFinishedThread.FData[Index + 1] = 0) and Not(FShouldQuit) do NeuralPause;
+      while (NeuralAtomicRead(FFinishedThread[Index + 1]) = 0) and
+        Not(FShouldQuit) do NeuralPause;
       LocalNN.SumDeltasNoChecks(FThreadNN[Index + 1]);
-      {$IFDEF FPC}
-      FFinishedThread.FData[Index] += FFinishedThread.FData[Index + 1];
-      {$ELSE}
-      FFinishedThread.FData[Index] := FFinishedThread.FData[Index] +
-        FFinishedThread.FData[Index + 1];
-      {$ENDIF}
+      NeuralAtomicIncrement(FFinishedThread[Index]);
     end;
   end;
-  FFinishedThread.FData[Index] := FFinishedThread.FData[Index] + 1;
+  NeuralAtomicIncrement(FFinishedThread[Index]);
   if (Index and 3 = 0) and Not(FShouldQuit) then
   begin
     if Index + 2 < FThreadNum then
     begin
-      while (FFinishedThread.FData[Index + 2] = 0) and Not(FShouldQuit) do NeuralPause;
+      while (NeuralAtomicRead(FFinishedThread[Index + 2]) = 0) and
+        Not(FShouldQuit) do NeuralPause;
       LocalNN.SumDeltasNoChecks(FThreadNN[Index + 2]);
-      {$IFDEF FPC}
-      FFinishedThread.FData[Index] += FFinishedThread.FData[Index + 2];
-      {$ELSE}
-      FFinishedThread.FData[Index] := FFinishedThread.FData[Index] +
-        FFinishedThread.FData[Index + 2];
-      {$ENDIF}
+      NeuralAtomicIncrement(FFinishedThread[Index]);
     end;
   end;
   {$IFDEF DEBUG}
@@ -2230,7 +2234,7 @@ begin
   if (FPlatformId <> nil) and (FDeviceId <> nil) then
     FThreadNN.EnableOpenCL(FPlatformId, FDeviceId);
   {$ENDIF}
-  FFinishedThread.Resize(1, 1, FThreadNum);
+  SetLength(FFinishedThread, FThreadNum);
   FAvgWeights := nil;
   FAvgWeight := FNN.Clone();
   FThreadNN.SetLearningRate(FCurrentLearningRate, FInertia);
@@ -2291,7 +2295,7 @@ begin
   begin
     FCurrentAccumulationStep := AccStep;
     if FShouldQuit then break;
-    FFinishedThread.Fill(0);
+    ClearFinishedThread();
     FNN.ClearTime();
     FNN.RefreshDropoutMask();
     {$IFDEF HASTHREADS}
@@ -2641,13 +2645,21 @@ begin
 end;
 
 { TNeuralFitBase }
+procedure TNeuralFitBase.ClearFinishedThread();
+var
+  I: integer;
+  HighSlot: integer;
+begin
+  HighSlot := Length(FFinishedThread) - 1;
+  for I := 0 to HighSlot do FFinishedThread[I] := 0;
+end;
+
 constructor TNeuralFitBase.Create();
 begin
   inherited Create();
   {$IFDEF OpenCL}
   DisableOpenCL();
   {$ENDIF}
-  FFinishedThread := TNNetVolume.Create();
   {$IFDEF HASTHREADS}
   FMaxThreadNum := NeuralDefaultThreadCount();
     //{$IFDEF OpenCL}
@@ -2798,7 +2810,7 @@ begin
   {$IFDEF HASTHREADS}
   NeuralDoneCriticalSection(FCritSec);
   {$ENDIF}
-  FFinishedThread.Free;
+  SetLength(FFinishedThread, 0);
   inherited Destroy();
 end;
 
@@ -3216,7 +3228,7 @@ begin
   if (FPlatformId <> nil) and (FDeviceId <> nil) then
     FThreadNN.EnableOpenCL(FPlatformId, FDeviceId);
   {$ENDIF}
-  FFinishedThread.Resize(1, 1, FThreadNum);
+  SetLength(FFinishedThread, FThreadNum);
   FNumClasses := pNumClasses;
   AccuracyWithInertia := 100 / FNumClasses;
   CurrentError := 0;
@@ -3295,7 +3307,7 @@ begin
       FGlobalMiss      := 0;
       FGlobalTotalLoss := 0;
       FGlobalErrorSum  := 0;
-      FFinishedThread.Fill(0);
+      ClearFinishedThread();
       FNN.ClearTime();
       FNN.RefreshDropoutMask();
       {$IFDEF HASTHREADS}
@@ -3831,33 +3843,29 @@ begin
     end;
   end; // of for
 
+  // Pairwise then stride-2 delta reduction. A slot becomes non-zero only after
+  // this thread has merged everything below it, so a non-zero read is the
+  // signal that the partner's deltas are complete AND visible: the atomic
+  // increment publishes them, the atomic read acquires them.
   if (Index and 1 = 0) and Not(FShouldQuit) then
   begin
     if Index + 1 < FThreadNum then
     begin
-      while (FFinishedThread.FData[Index + 1] = 0) and Not(FShouldQuit) do NeuralPause;
+      while (NeuralAtomicRead(FFinishedThread[Index + 1]) = 0) and
+        Not(FShouldQuit) do NeuralPause;
       LocalNN.SumDeltasNoChecks(FThreadNN[Index + 1]);
-      {$IFDEF FPC}
-      FFinishedThread.FData[Index] += FFinishedThread.FData[Index + 1];
-      {$ELSE}
-      FFinishedThread.FData[Index] := FFinishedThread.FData[Index] +
-        FFinishedThread.FData[Index + 1];
-      {$ENDIF}
+      NeuralAtomicIncrement(FFinishedThread[Index]);
     end;
   end;
-  FFinishedThread.FData[Index] := FFinishedThread.FData[Index] + 1;
+  NeuralAtomicIncrement(FFinishedThread[Index]);
   if (Index and 3 = 0) and Not(FShouldQuit) then
   begin
     if Index + 2 < FThreadNum then
     begin
-      while (FFinishedThread.FData[Index + 2] = 0) and Not(FShouldQuit) do NeuralPause;
+      while (NeuralAtomicRead(FFinishedThread[Index + 2]) = 0) and
+        Not(FShouldQuit) do NeuralPause;
       LocalNN.SumDeltasNoChecks(FThreadNN[Index + 2]);
-      {$IFDEF FPC}
-      FFinishedThread.FData[Index] += FFinishedThread.FData[Index + 2];
-      {$ELSE}
-      FFinishedThread.FData[Index] := FFinishedThread.FData[Index] +
-        FFinishedThread.FData[Index + 2];
-      {$ENDIF}
+      NeuralAtomicIncrement(FFinishedThread[Index]);
     end;
   end;
 

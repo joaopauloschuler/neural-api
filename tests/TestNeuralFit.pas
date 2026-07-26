@@ -105,6 +105,7 @@ type
     // Scheduler wiring
     procedure TestSchedulerDefaultsNil;
     procedure TestConstantSchedulerMatchesFixedLR;
+    procedure TestMultiThreadedFitReducesLoss;
 
     // AdamW optimizer (decoupled weight decay) tests
     procedure TestAdamWOptimizerCreation;
@@ -595,6 +596,76 @@ begin
   finally
     Fit.Free;
     Pairs.Free;
+  end;
+end;
+
+// Exercises the cross-thread delta reduction in RunNNThread: workers publish
+// "my subtree is merged" through FFinishedThread and spin on their partner's
+// slot. A lost publication hangs the run; a delta read that races ahead of the
+// partner's writes shows up as a network that does not learn. Four threads
+// cover both wait sites (thread 0 waits on 1 and on 2, thread 2 waits on 3)
+// without oversubscribing a 4-core box - the waits are busy-spins, so more
+// threads than cores makes the test minutes long instead of milliseconds.
+procedure TTestNeuralFit.TestMultiThreadedFitReducesLoss;
+var
+  Net: TNNet;
+  Fit: TNeuralFit;
+  Pairs: TNNetVolumePairList;
+  Pair: TNNetVolumePair;
+  I, RunIdx: integer;
+  X0, X1: TNeuralFloat;
+  Predicted: TNNetVolume;
+begin
+  for RunIdx := 1 to 2 do
+  begin
+    RandSeed := 909 + RunIdx;
+    Pairs := TNNetVolumePairList.Create();
+    for I := 0 to 63 do
+    begin
+      X0 := Random;
+      X1 := Random;
+      Pair := TNNetVolumePair.Create();
+      Pair.A.ReSize(2, 1, 1);
+      Pair.B.ReSize(1, 1, 1);
+      Pair.A.Raw[0] := X0;
+      Pair.A.Raw[1] := X1;
+      Pair.B.Raw[0] := 0.5 * X0 - 0.3 * X1 + 0.1;
+      Pairs.Add(Pair);
+    end;
+    Net := TNNet.Create();
+    Predicted := TNNetVolume.Create(1, 1, 1);
+    Fit := TNeuralFit.Create;
+    try
+      Net.AddLayer([
+        TNNetInput.Create(2),
+        TNNetFullConnectReLU.Create(16),
+        TNNetFullConnectLinear.Create(1)
+      ]);
+      Net.SetLearningRate(0.05, 0.9);
+      Fit.HideMessages;
+      Fit.Verbose := False;
+      Fit.MaxThreadNum := 4;   // pairwise merge plus one stride-2 merge
+      Fit.InitialLearningRate := 0.05;
+      Fit.LearningRateDecay := 0;
+      Fit.StaircaseEpochs := 1;
+      Fit.LoadBestAtEnd := False;
+      Fit.Fit(Net, Pairs, nil, nil, 16, 10);
+      AssertTrue('Training must have run multi-threaded', Fit.MaxThreadNum > 1);
+      // A reduction that dropped a worker's deltas leaves the net untrained.
+      Net.Compute(Pairs[0].A);
+      Net.GetOutput(Predicted);
+      AssertTrue('Prediction must be finite',
+        not IsNan(Predicted.Raw[0]) and not IsInfinite(Predicted.Raw[0]));
+      AssertTrue('Run ' + IntToStr(RunIdx) + ': multi-threaded training must fit the ' +
+        'linear target (got ' + FloatToStr(Predicted.Raw[0]) + ' want ' +
+        FloatToStr(Pairs[0].B.Raw[0]) + ')',
+        Abs(Predicted.Raw[0] - Pairs[0].B.Raw[0]) < 0.1);
+    finally
+      Fit.Free;
+      Predicted.Free;
+      Net.Free;
+      Pairs.Free;
+    end;
   end;
 end;
 
