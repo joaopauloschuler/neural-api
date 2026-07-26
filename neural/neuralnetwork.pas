@@ -8139,7 +8139,9 @@ type
   // Coded by Claude (AI).
   TNNetGRN = class(TNNetChannelTransformBase)
     private
-      FGxBuf, FNxBuf, FdL_dNBuf, FdL_dGBuf, FsumGyXBuf: array of TNeuralFloat;
+      FGxBuf, FNxBuf, FCoefBuf: array of TNeuralFloat;
+      FdL_dNBuf, FdL_dGBuf, FsumGyXBuf, FgradBetaBuf,
+        FTermBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure FreeBackpropScratch();
     public
@@ -54518,6 +54520,8 @@ begin
   SetLength(FdL_dNBuf, 0);
   SetLength(FdL_dGBuf, 0);
   SetLength(FsumGyXBuf, 0);
+  SetLength(FgradBetaBuf, 0);
+  SetLength(FTermBuf, 0);
 end;
 
 function TNNetGRN.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
@@ -54530,6 +54534,7 @@ destructor TNNetGRN.Destroy();
 begin
   SetLength(FGxBuf, 0);
   SetLength(FNxBuf, 0);
+  SetLength(FCoefBuf, 0);
   FreeBackpropScratch();
   inherited Destroy();
 end;
@@ -54543,13 +54548,16 @@ begin
   SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
   SetLength(FGxBuf, FOutput.Depth);
   SetLength(FNxBuf, FOutput.Depth);
-  // FGxBuf/FNxBuf are forward caches (also recomputed in backward); the rest is
-  // backprop-only scratch: skip on inference-only layers.
+  SetLength(FCoefBuf, FOutput.Depth);
+  // FGxBuf/FNxBuf/FCoefBuf are forward caches (also recomputed in backward); the
+  // rest is backprop-only scratch: skip on inference-only layers.
   if FIsTrainable then
   begin
     SetLength(FdL_dNBuf, FOutput.Depth);
     SetLength(FdL_dGBuf, FOutput.Depth);
     SetLength(FsumGyXBuf, FOutput.Depth);
+    SetLength(FgradBetaBuf, FOutput.Depth);
+    SetLength(FTermBuf, FOutput.Depth);
   end;
   InitDefault();
 end;
@@ -54562,9 +54570,9 @@ var
   Prev: TNNetVolume;
   Wg, Wb: TNNetVolume;
   SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, c: integer;
-  pos, k, NumPixM1: integer;
-  s, xv, meanG, onePlusA, wbc, invG: TNeuralFloat;
-  P: TNeuralFloatArrPtr;
+  pos, k, NumPixM1, DepthBytes: integer;
+  meanG, invG: TNeuralFloat;
+  P, CoefPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   // Do NOT call inherited Compute (which would copy input into FOutput);
@@ -54605,18 +54613,21 @@ begin
   invG := 1.0 / meanG;
   Move(FGxBuf[0], FNxBuf[0], Depth * csNeuralFloatSize);
   TNNetVolume.Mul(@FNxBuf[0], invG, Depth);
-  // Y[x,y,c] = X[x,y,c]*(1 + gamma[c]*Nx[c]) + beta[c]. For fixed c the pixel
-  // positions are c, c+Depth, ...: hoist the per-channel scalars and carry pos.
+  // Y[x,y,c] = X[x,y,c]*(1 + gamma[c]*Nx[c]) + beta[c]. App.E: walk pixel-outer
+  // so the depth axis is contiguous (one pass over the volume instead of one
+  // pass per channel), which turns each pixel column into a beta seed plus one
+  // elementwise FMA (#13).
   for c := 0 to DepthM1 do
+    FCoefBuf[c] := 1 + Wg.Raw[c] * FNxBuf[c];
+  CoefPtr := @FCoefBuf[0];
+  DepthBytes := Depth * csNeuralFloatSize;
+  pos := 0;
+  for k := 0 to NumPixM1 do
   begin
-    onePlusA := 1 + Wg.Raw[c] * FNxBuf[c];
-    wbc := Wb.Raw[c];
-    pos := c;
-    for k := 0 to NumPixM1 do
-    begin
-      FOutput.FData[pos] := onePlusA * Prev.FData[pos] + wbc;
-      Inc(pos, Depth);
-    end;
+    Move(Wb.FData[0], FOutput.FData[pos], DepthBytes);
+    TNNetVolume.MulAdd(FOutput.GetRawPtr(pos), CoefPtr, Prev.GetRawPtr(pos),
+      Depth);
+    Inc(pos, Depth);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -54629,11 +54640,11 @@ var
   Ng, Nb: TNNetNeuron;
   Wg: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
-  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, c, cp: integer;
+  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, c: integer;
   pos, k, NumPixM1: integer;
-  s, xv, gy, meanG, gradGamma, gradBeta, term, dL_dM, coef, invG: TNeuralFloat;
+  meanG, dL_dM, invG: TNeuralFloat;
   hasInputGrad: boolean;
-  P: TNeuralFloatArrPtr;
+  P, GyPtr, PrevErrPtr, CoefPtr, TermPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -54680,22 +54691,27 @@ begin
   //   dL/dgamma[c] = Nx[c] * sumGyX[c]
   //   dL/dbeta[c]  = sum_{x,y} gy[x,y,c]
   //   dL/dN[c]     = gamma[c] * sumGyX[c]
+  // App.E: pixel-outer so the depth axis is contiguous; both reductions then run
+  // as per-channel accumulator vectors fed by one elementwise FMA and one
+  // elementwise add per pixel column (#13). This sums pixel-major rather than
+  // channel-major - a float reassociation, covered by the gradient checks.
+  FillDWord(FsumGyXBuf[0], Depth, 0);
+  FillDWord(FgradBetaBuf[0], Depth, 0);
+  pos := 0;
+  for k := 0 to NumPixM1 do
+  begin
+    GyPtr := FOutputError.GetRawPtr(pos);
+    TNNetVolume.MulAdd(@FsumGyXBuf[0], GyPtr, Prev.GetRawPtr(pos), Depth);
+    TNNetVolume.Add(@FgradBetaBuf[0], GyPtr, Depth);
+    Inc(pos, Depth);
+  end;
   for c := 0 to DepthM1 do
   begin
-    gradGamma := 0;   // = sumGyX[c]
-    gradBeta := 0;
-    pos := c;
-    for k := 0 to NumPixM1 do
-    begin
-      gy := FOutputError.FData[pos];
-      gradGamma := gradGamma + gy * Prev.FData[pos];
-      gradBeta := gradBeta + gy;
-      Inc(pos, Depth);
-    end;
-    FsumGyXBuf[c] := gradGamma;
-    FdL_dNBuf[c]  := Wg.Raw[c] * gradGamma;
-    Ng.FDelta.Raw[c] := Ng.FDelta.Raw[c] + (-FLearningRate) * (FNxBuf[c] * gradGamma);
-    Nb.FDelta.Raw[c] := Nb.FDelta.Raw[c] + (-FLearningRate) * gradBeta;
+    FdL_dNBuf[c] := Wg.Raw[c] * FsumGyXBuf[c];
+    Ng.FDelta.Raw[c] := Ng.FDelta.Raw[c] +
+      (-FLearningRate) * (FNxBuf[c] * FsumGyXBuf[c]);
+    Nb.FDelta.Raw[c] := Nb.FDelta.Raw[c] +
+      (-FLearningRate) * FgradBetaBuf[c];
   end;
 
   // Chain dL/dN -> dL/dG via Nx[c] = Gx[c]/M.
@@ -54722,15 +54738,20 @@ begin
     //     dL_dG[c'] * X[x',y',c'] / Gx[c']
     for c := 0 to DepthM1 do
     begin
-      term := FdL_dGBuf[c] / FGxBuf[c];   // multiplier for X[x,y,c] in chain term
-      coef := 1 + Wg.Raw[c] * FNxBuf[c];  // per-channel residual+gate slope
-      pos := c;
-      for k := 0 to NumPixM1 do
-      begin
-        PrevErr.FData[pos] := PrevErr.FData[pos] +
-          FOutputError.FData[pos] * coef + term * Prev.FData[pos];
-        Inc(pos, Depth);
-      end;
+      FTermBuf[c] := FdL_dGBuf[c] / FGxBuf[c]; // multiplier for X in chain term
+      FCoefBuf[c] := 1 + Wg.Raw[c] * FNxBuf[c]; // residual+gate slope
+    end;
+    CoefPtr := @FCoefBuf[0];
+    TermPtr := @FTermBuf[0];
+    // App.E/#13: pixel-outer, so each column is two elementwise FMAs.
+    pos := 0;
+    for k := 0 to NumPixM1 do
+    begin
+      PrevErrPtr := PrevErr.GetRawPtr(pos);
+      TNNetVolume.MulAdd(PrevErrPtr, FOutputError.GetRawPtr(pos), CoefPtr,
+        Depth);
+      TNNetVolume.MulAdd(PrevErrPtr, Prev.GetRawPtr(pos), TermPtr, Depth);
+      Inc(pos, Depth);
     end;
   end;
 
