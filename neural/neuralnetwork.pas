@@ -61781,19 +61781,21 @@ begin
         TNNetVolume.MulAdd(GRiR, hPrevPtr, gli,   Depth);
         TNNetVolume.MulAdd(GRfR, hPrevPtr, glf,   Depth);
         TNNetVolume.MulAdd(GRoR, hPrevPtr, gpreO, Depth);
-        // dL/dh_{t-1} mixes four scaled r_* rows into one accumulator: not a
-        // single MulAdd, kept scalar.
-        for j := 0 to DepthM1 do
-          GhNextPtr^[j] := GhNextPtr^[j] +
-            gpreZ * RzR^[j] + gli * RiR^[j] +
-            glf * RfR^[j] + gpreO * RoR^[j];
+        // dL/dh_{t-1} accumulates four scaled r_* rows: four contiguous
+        // scaled accumulates (#13), one per gate.
+        TNNetVolume.MulAdd(GhNextPtr, RzR, gpreZ, Depth);
+        TNNetVolume.MulAdd(GhNextPtr, RiR, gli,   Depth);
+        TNNetVolume.MulAdd(GhNextPtr, RfR, glf,   Depth);
+        TNNetVolume.MulAdd(GhNextPtr, RoR, gpreO, Depth);
       end;
       // Scatter to the input gradient (the four input projections).
       if hasInputGrad then
-        for j := 0 to DepthM1 do
-          PrevErrPtr^[j] := PrevErrPtr^[j] +
-            gpreZ * WzR^[j] + gli * WiR^[j] +
-            glf * WfR^[j] + gpreO * WoR^[j];
+      begin
+        TNNetVolume.MulAdd(PrevErrPtr, WzR, gpreZ, Depth);
+        TNNetVolume.MulAdd(PrevErrPtr, WiR, gli,   Depth);
+        TNNetVolume.MulAdd(PrevErrPtr, WfR, glf,   Depth);
+        TNNetVolume.MulAdd(PrevErrPtr, WoR, gpreO, Depth);
+      end;
       // Carry the memory-path grads to step t-1:
       //   dL/dc_{t-1} += f'_t * gc ; dL/dn_{t-1} += f'_t * gn
       FGc.FData[d] := fp * gc;
@@ -62243,11 +62245,14 @@ begin
       TNNetVolume.MulAdd(GWqR, XtPtr, FgqBuf[d],  Depth);
       TNNetVolume.MulAdd(GWkR, XtPtr, gscat,      Depth);
       TNNetVolume.MulAdd(GWvR, XtPtr, FgvvBuf[d], Depth);
-      // dL/dx mixes three scaled W rows per channel: kept scalar.
+      // dL/dx accumulates three scaled W rows per channel: three contiguous
+      // scaled accumulates (#13).
       if hasInputGrad then
-        for j := 0 to DepthM1 do
-          PrevErrPtr^[j] := PrevErrPtr^[j] +
-            FgqBuf[d] * WqR^[j] + gscat * WkR^[j] + FgvvBuf[d] * WvR^[j];
+      begin
+        TNNetVolume.MulAdd(PrevErrPtr, WqR, FgqBuf[d],  Depth);
+        TNNetVolume.MulAdd(PrevErrPtr, WkR, gscat,      Depth);
+        TNNetVolume.MulAdd(PrevErrPtr, WvR, FgvvBuf[d], Depth);
+      end;
       Inc(rowOfs, Depth);
     end;
   end;
@@ -63465,18 +63470,20 @@ begin
         TNNetVolume.MulAdd(GWhfR, hPrevPtr, gpreF, Depth);
         TNNetVolume.MulAdd(GWhgR, hPrevPtr, gpreG, Depth);
         TNNetVolume.MulAdd(GWhoR, hPrevPtr, gpreO, Depth);
-        // dL/dh_{t-1} mixes four scaled W_h rows into one accumulator: not a
-        // single MulAdd, kept scalar.
-        for j := 0 to DepthM1 do
-          GhNextPtr^[j] := GhNextPtr^[j] +
-            gpreI * WhiR^[j] + gpreF * WhfR^[j] +
-            gpreG * WhgR^[j] + gpreO * WhoR^[j];
+        // dL/dh_{t-1} accumulates four scaled W_h rows: four contiguous
+        // scaled accumulates (#13), one per gate.
+        TNNetVolume.MulAdd(GhNextPtr, WhiR, gpreI, Depth);
+        TNNetVolume.MulAdd(GhNextPtr, WhfR, gpreF, Depth);
+        TNNetVolume.MulAdd(GhNextPtr, WhgR, gpreG, Depth);
+        TNNetVolume.MulAdd(GhNextPtr, WhoR, gpreO, Depth);
       end;
       if hasInputGrad then
-        for j := 0 to DepthM1 do
-          PrevErrPtr^[j] := PrevErrPtr^[j] +
-            gpreI * WiiR^[j] + gpreF * WifR^[j] +
-            gpreG * WigR^[j] + gpreO * WioR^[j];
+      begin
+        TNNetVolume.MulAdd(PrevErrPtr, WiiR, gpreI, Depth);
+        TNNetVolume.MulAdd(PrevErrPtr, WifR, gpreF, Depth);
+        TNNetVolume.MulAdd(PrevErrPtr, WigR, gpreG, Depth);
+        TNNetVolume.MulAdd(PrevErrPtr, WioR, gpreO, Depth);
+      end;
       // carry dL/dc_{t-1} += f_t * gcell
       FGc.FData[d] := fv * gcell;
       Inc(rowOfs, Depth);
@@ -63855,16 +63862,18 @@ begin
         TNNetVolume.MulAdd(GWhrR, hPrevPtr, gpreR, Depth);
         TNNetVolume.MulAdd(GWhzR, hPrevPtr, gpreZ, Depth);
         TNNetVolume.MulAdd(GWhnR, hPrevPtr, gwhn, Depth);
-        // dL/dh_{t-1} mixes three scaled W_h rows into one accumulator: not a
-        // single MulAdd, kept scalar.
-        for j := 0 to DepthM1 do
-          GhNextPtr^[j] := GhNextPtr^[j] +
-            gpreR * WhrR^[j] + gpreZ * WhzR^[j] + gwhn * WhnR^[j];
+        // dL/dh_{t-1} accumulates three scaled W_h rows: three contiguous
+        // scaled accumulates (#13), one per gate.
+        TNNetVolume.MulAdd(GhNextPtr, WhrR, gpreR, Depth);
+        TNNetVolume.MulAdd(GhNextPtr, WhzR, gpreZ, Depth);
+        TNNetVolume.MulAdd(GhNextPtr, WhnR, gwhn,  Depth);
       end;
       if hasInputGrad then
-        for j := 0 to DepthM1 do
-          PrevErrPtr^[j] := PrevErrPtr^[j] +
-            gpreR * WirR^[j] + gpreZ * WizR^[j] + gpreN * WinR^[j];
+      begin
+        TNNetVolume.MulAdd(PrevErrPtr, WirR, gpreR, Depth);
+        TNNetVolume.MulAdd(PrevErrPtr, WizR, gpreZ, Depth);
+        TNNetVolume.MulAdd(PrevErrPtr, WinR, gpreN, Depth);
+      end;
       Inc(rowOfs, Depth);
     end;
     FGh.Copy(FGhNext);
