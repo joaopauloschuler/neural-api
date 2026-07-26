@@ -12151,8 +12151,10 @@ type
   // Coded by Claude (AI).
   TNNetSpectralNorm = class(TNNetFullConnectLinear)
   private
-    FScaledWeights: TNNetVolume;  // scratch: W/sigma for one neuron
+    FWSnapshot: TNNetVolume;      // latent W the cached FSigma was estimated from
     FSigma: TNeuralFloat;         // last estimated largest singular value
+    FSigmaValid: boolean;         // FSigma matches FWSnapshot
+    procedure EstimateSigmaIfStale();
     procedure ComputePreviousLayerErrorCPU(); override;
   public
     procedure ComputeCPU(); override;
@@ -15153,6 +15155,7 @@ type
     FRawFilters: TNNetVolumeList;  // per-neuron raw (latent) weight scratch
     FPreDelta: TNNetVolumeList;    // per-neuron Delta snapshot before backprop
     FSigma: TNeuralFloat;          // last estimated largest singular value
+    FSigmaValid: boolean;          // FSigma matches the FRawFilters snapshot
     procedure ScaleFilters();
     procedure RestoreRawFilters();
   public
@@ -77303,11 +77306,66 @@ end;
 
 { TNNetSpectralNorm }
 
+// Recomputes sigma_1(W) only when the latent weight matrix moved since the last
+// estimate. TNNet.EstimateSpectralNorm is a deterministic function of the
+// weights (fixed LCG seed, no carried power-iteration state), so reusing the
+// cached scalar is exact rather than an approximation of a running estimate.
+// The staleness test is a VALUE compare against a snapshot -- not an
+// AfterWeightUpdate hook -- because seeders, importers and gradient-check tests
+// write Neurons[].Weights.Raw directly. It costs one early-exit pass over W;
+// the estimate it skips is 2*Iters passes over W plus two allocations.
+procedure TNNetSpectralNorm.EstimateSigmaIfStale();
+const
+  cEps = 1e-12;
+var
+  Cnt, MaxCnt, WeightCnt, WSize, WSizeM1, SnapSize, SnapPos: integer;
+  W: TNNetVolume;
+  Stale: boolean;
+begin
+  MaxCnt := FNeurons.Count - 1;
+  WSize := FArrNeurons[0].FWeights.Size;
+  SnapSize := (MaxCnt + 1) * WSize;
+  WSizeM1 := WSize - 1;
+  Stale := (not FSigmaValid) or (FWSnapshot.Size <> SnapSize);
+  if not Stale then
+  begin
+    SnapPos := 0;
+    for Cnt := 0 to MaxCnt do
+    begin
+      W := FArrNeurons[Cnt].FWeights;
+      for WeightCnt := 0 to WSizeM1 do
+        if FWSnapshot.FData[SnapPos + WeightCnt] <> W.FData[WeightCnt] then
+        begin
+          Stale := true;
+          break;
+        end;
+      if Stale then break;
+      Inc(SnapPos, WSize);
+    end;
+  end;
+  if not Stale then exit;
+  // sigma_1(W) via Iters power-iteration steps (FStruct[5]); deterministic seed.
+  FSigma := TNNet.EstimateSpectralNorm(Self, FStruct[5]);
+  if FSigma < cEps then FSigma := cEps;
+  // Lazy, amortized resize of a persistent field (rule #17): shape changes only.
+  if FWSnapshot.Size <> SnapSize then FWSnapshot.ReSize(MaxCnt + 1, 1, WSize);
+  SnapPos := 0;
+  for Cnt := 0 to MaxCnt do
+  begin
+    Move(FArrNeurons[Cnt].FWeights.FData[0], FWSnapshot.FData[SnapPos],
+      WSize * csNeuralFloatSize);
+    Inc(SnapPos, WSize);
+  end;
+  FSigmaValid := true;
+end;
+
 // Forward: estimate sigma_1(W) with power iteration (shared scalar over all
 // neurons), then run the ordinary linear forward against the SCALED weights
-// w_eff = W / max(sigma, eps). The scaled weights of each neuron are cached in
-// FScaledWeights (reused per neuron, like TNNetBitLinear caches its quantized
-// weights), so the matmul uses the TRANSFORMED weights, not the latent ones.
+// w_eff = W / max(sigma, eps). 1/sigma is a single scalar shared by every
+// weight, so (W/sigma).x is folded into (W.x)/sigma: the latent row goes
+// straight into the dot product and the scale is applied once to the result,
+// which removes the per-neuron copy and scale passes over the weight matrix
+// (the same fold TNNetWeightNormLinear already uses).
 procedure TNNetSpectralNorm.ComputeCPU();
 const
   cEps = 1e-12;
@@ -77317,19 +77375,12 @@ var
   localNeuron: TNNetNeuron;
 begin
   MaxCnt := FNeurons.Count - 1;
-  // sigma_1(W) via Iters power-iteration steps (FStruct[5]); deterministic seed.
-  FSigma := TNNet.EstimateSpectralNorm(Self, FStruct[5]);
-  if FSigma < cEps then FSigma := cEps;
+  EstimateSigmaIfStale();
   InvSigma := 1.0 / FSigma;
-  // #5/#8: all neurons share weight shape, so size the scratch once (as
-  // TNNetBitLinear does) instead of ReSizing every iteration.
-  FScaledWeights.ReSize(FArrNeurons[0].FWeights);
   for Cnt := 0 to MaxCnt do
   begin
     localNeuron := FArrNeurons[Cnt];
-    FScaledWeights.Copy(localNeuron.FWeights);
-    FScaledWeights.Mul(InvSigma);
-    Acc := FScaledWeights.DotProduct(FPrevLayer.Output);
+    Acc := localNeuron.FWeights.DotProduct(FPrevLayer.Output) * InvSigma;
     if FSuppressBias = 0 then
       FOutput.FData[Cnt] := Acc + localNeuron.FBiasWeight
     else
@@ -77358,16 +77409,15 @@ begin
   // Reuse the sigma estimated during the matching forward pass.
   if FSigma < cEps then FSigma := cEps;
   InvSigma := 1.0 / FSigma;
-  // #5/#8: all neurons share weight shape — size the scratch once, not per row.
-  FScaledWeights.ReSize(FArrNeurons[0].FWeights);
   for OutputCnt := 0 to MaxOutputCnt do
   begin
     if (FOutputError.FData[OutputCnt] <> 0.0) then
     begin
       localNeuron := FArrNeurons[OutputCnt];
-      FScaledWeights.Copy(localNeuron.FWeights);
-      FScaledWeights.Mul(InvSigma);
-      LocalPrevError.MulAdd(FOutputError.FData[OutputCnt], FScaledWeights);
+      // err * (W/sigma) folded into (err/sigma) * W: one scalar multiply
+      // instead of a copy and a scale pass over the whole weight row.
+      LocalPrevError.MulAdd(FOutputError.FData[OutputCnt] * InvSigma,
+        localNeuron.FWeights);
     end;
   end;
 end;
@@ -77378,8 +77428,9 @@ begin
   inherited Create(pSizeX, pSizeY, pDepth, pSuppressBias);
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
-  FScaledWeights := TNNetVolume.Create();
+  FWSnapshot := TNNetVolume.Create();
   FSigma := 1.0;
+  FSigmaValid := false;
   // Default power-iteration steps: 10 (a stable estimate). Iters=1 reproduces
   // the task's "one power-iteration step per forward pass".
   if FStruct[5] < 1 then FStruct[5] := 10;
@@ -77399,7 +77450,7 @@ end;
 
 destructor TNNetSpectralNorm.Destroy();
 begin
-  FScaledWeights.Free;
+  FWSnapshot.Free;
   inherited Destroy();
 end;
 
@@ -89987,6 +90038,7 @@ begin
   FRawFilters := TNNetVolumeList.Create();
   FPreDelta := TNNetVolumeList.Create();
   FSigma := 1.0;
+  FSigmaValid := false;
   // Default power-iteration steps: 10 (a stable estimate). Iters=1 reproduces
   // the task's "one power-iteration step per forward pass". Stored in FStruct[5]
   // exactly like the dense TNNetSpectralNorm (FStruct[0..4] hold the conv params).
@@ -90017,14 +90069,48 @@ procedure TNNetSpectralNormConv.ScaleFilters();
 const
   cEps = 1e-12;
 var
-  NeuronCnt, MaxNeurons: integer;
+  NeuronCnt, MaxNeurons, WeightCnt, WSizeM1: integer;
   InvSigma: TNeuralFloat;
+  W, RawW: TNNetVolume;
+  Stale: boolean;
 begin
   MaxNeurons := FNeurons.Count - 1;
   while FRawFilters.Count <= MaxNeurons do
     FRawFilters.Add(TNNetVolume.Create());
-  FSigma := TNNet.EstimateSpectralNorm(Self, FStruct[5]);
-  if FSigma < cEps then FSigma := cEps;
+  // FRawFilters still holds the raw weights this method saved on its previous
+  // call (RestoreRawFilters copies them straight back), so it doubles as the
+  // staleness snapshot for the cached sigma. EstimateSpectralNorm is a
+  // deterministic function of the weights (fixed LCG seed), so reusing the
+  // scalar while the weights are unchanged is exact. A VALUE compare is used
+  // rather than an AfterWeightUpdate hook because seeders, importers and
+  // gradient-check tests write Neurons[].Weights.Raw directly. It costs one
+  // early-exit pass over the kernel; the estimate it skips is 2*Iters passes.
+  Stale := not FSigmaValid;
+  if not Stale then
+    for NeuronCnt := 0 to MaxNeurons do
+    begin
+      W := FArrNeurons[NeuronCnt].FWeights;
+      RawW := FRawFilters[NeuronCnt];
+      if RawW.Size <> W.Size then
+      begin
+        Stale := true;
+        break;
+      end;
+      WSizeM1 := W.Size - 1;
+      for WeightCnt := 0 to WSizeM1 do
+        if RawW.FData[WeightCnt] <> W.FData[WeightCnt] then
+        begin
+          Stale := true;
+          break;
+        end;
+      if Stale then break;
+    end;
+  if Stale then
+  begin
+    FSigma := TNNet.EstimateSpectralNorm(Self, FStruct[5]);
+    if FSigma < cEps then FSigma := cEps;
+    FSigmaValid := true;
+  end;
   InvSigma := 1.0 / FSigma;
   for NeuronCnt := 0 to MaxNeurons do
   begin

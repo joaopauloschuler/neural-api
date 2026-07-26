@@ -187,6 +187,8 @@ type
     procedure TestSpectralNormConvForward;
     procedure TestSpectralNormConvInputGradientCheck;
     procedure TestSpectralNormConvSerializationRoundTrip;
+    procedure TestSpectralNormDirectWeightWriteRecomputesSigma;
+    procedure TestSpectralNormConvDirectWeightWriteRecomputesSigma;
     // TNNetCirculantLinear structured-matrix dense layer
     procedure TestCirculantLinearKnownConvolution;
     procedure TestCirculantLinearGradientCheck;
@@ -54767,6 +54769,118 @@ begin
   finally
     NN.Free;
     NNScaled.Free;
+    Input.Free;
+  end;
+end;
+
+// The cached sigma is guarded by a VALUE snapshot of the latent weights, so a
+// caller that writes Neurons[].Weights.Raw DIRECTLY (seeders, importers, the
+// gradient-check tests) must still get a freshly estimated sigma on the next
+// forward. Compute once with W1, overwrite with a structurally different W2,
+// compute again, and require the result to match a layer that only ever saw W2.
+// A stale cache would keep sigma(W1) and shift every output.
+procedure TTestNeuralNumerical.TestSpectralNormDirectWeightWriteRecomputesSigma;
+var
+  NN, NNRef: TNNet;
+  Input: TNNetVolume;
+  SN, SNRef: TNNetSpectralNorm;
+  o, i, k: integer;
+  Sigma1, Sigma2: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  NNRef := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 4);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    SN := TNNetSpectralNorm.Create({pSizeX=}3, {pSizeY=}1, {pDepth=}1,
+      {pSuppressBias=}1, {pIters=}30);
+    NN.AddLayer(SN);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.4 - 0.15 * i;
+
+    for o := 0 to SN.Neurons.Count - 1 do
+      for i := 0 to SN.Neurons[o].Weights.Size - 1 do
+        SN.Neurons[o].Weights.Raw[i] := 0.3 + 0.5 * o - 0.2 * i + 0.1 * o * i;
+    NN.Compute(Input);
+    Sigma1 := TNNet.EstimateSpectralNorm(SN, 30);
+
+    // Direct write of a matrix with a clearly different largest singular value.
+    for o := 0 to SN.Neurons.Count - 1 do
+      for i := 0 to SN.Neurons[o].Weights.Size - 1 do
+        SN.Neurons[o].Weights.Raw[i] := 0.05 - 0.9 * o + 0.6 * i - 0.3 * o * i;
+    Sigma2 := TNNet.EstimateSpectralNorm(SN, 30);
+    AssertTrue('The two weight matrices must have different sigma',
+      Abs(Sigma1 - Sigma2) > 0.5);
+    NN.Compute(Input);
+
+    NNRef.AddLayer(TNNetInput.Create(1, 1, 4, 1));
+    SNRef := TNNetSpectralNorm.Create({pSizeX=}3, {pSizeY=}1, {pDepth=}1,
+      {pSuppressBias=}1, {pIters=}30);
+    NNRef.AddLayer(SNRef);
+    for o := 0 to SNRef.Neurons.Count - 1 do
+      for i := 0 to SNRef.Neurons[o].Weights.Size - 1 do
+        SNRef.Neurons[o].Weights.Raw[i] := 0.05 - 0.9 * o + 0.6 * i - 0.3 * o * i;
+    NNRef.Compute(Input);
+
+    for k := 0 to SN.Output.Size - 1 do
+      AssertEquals('SpectralNorm output after a direct weight write at ' +
+        IntToStr(k), SNRef.Output.Raw[k], SN.Output.Raw[k], 1e-5);
+  finally
+    NN.Free;
+    NNRef.Free;
+    Input.Free;
+  end;
+end;
+
+// Conv sibling of the test above: TNNetSpectralNormConv reuses FRawFilters as
+// the staleness snapshot, so a direct weight write must still force a fresh
+// power-iteration estimate on the next forward.
+procedure TTestNeuralNumerical.TestSpectralNormConvDirectWeightWriteRecomputesSigma;
+var
+  NN, NNRef: TNNet;
+  Input: TNNetVolume;
+  SN, SNRef: TNNetSpectralNormConv;
+  o, i, k: integer;
+  Sigma1, Sigma2: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  NNRef := TNNet.Create();
+  Input := TNNetVolume.Create(5, 5, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(5, 5, 3));
+    SN := TNNetSpectralNormConv.Create({pNumFeatures=}4, {pFeatureSize=}3,
+      {pInputPadding=}1, {pStride=}1, {pSuppressBias=}1, {pIters=}30);
+    NN.AddLayer(SN);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.2 + 0.01 * i;
+
+    for o := 0 to SN.Neurons.Count - 1 do
+      for i := 0 to SN.Neurons[o].Weights.Size - 1 do
+        SN.Neurons[o].Weights.Raw[i] := 0.3 + 0.5 * o - 0.02 * i + 0.01 * o * i;
+    NN.Compute(Input);
+    Sigma1 := TNNet.EstimateSpectralNorm(SN, 30);
+
+    for o := 0 to SN.Neurons.Count - 1 do
+      for i := 0 to SN.Neurons[o].Weights.Size - 1 do
+        SN.Neurons[o].Weights.Raw[i] := 0.02 - 1.1 * o + 0.09 * i - 0.05 * o * i;
+    Sigma2 := TNNet.EstimateSpectralNorm(SN, 30);
+    AssertTrue('The two conv kernels must have different sigma',
+      Abs(Sigma1 - Sigma2) > 0.5);
+    NN.Compute(Input);
+
+    NNRef.AddLayer(TNNetInput.Create(5, 5, 3));
+    SNRef := TNNetSpectralNormConv.Create({pNumFeatures=}4, {pFeatureSize=}3,
+      {pInputPadding=}1, {pStride=}1, {pSuppressBias=}1, {pIters=}30);
+    NNRef.AddLayer(SNRef);
+    for o := 0 to SNRef.Neurons.Count - 1 do
+      for i := 0 to SNRef.Neurons[o].Weights.Size - 1 do
+        SNRef.Neurons[o].Weights.Raw[i] := 0.02 - 1.1 * o + 0.09 * i - 0.05 * o * i;
+    NNRef.Compute(Input);
+
+    for k := 0 to SN.Output.Size - 1 do
+      AssertEquals('SpectralNormConv output after a direct weight write at ' +
+        IntToStr(k), SNRef.Output.Raw[k], SN.Output.Raw[k], 1e-4);
+  finally
+    NN.Free;
+    NNRef.Free;
     Input.Free;
   end;
 end;
