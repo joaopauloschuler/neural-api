@@ -31861,7 +31861,7 @@ const
 var
   StartTime: double;
   SeqLen, i, j, d, j0, jEnd: integer;
-  SeqLenM1, DkM1: integer;
+  SeqLenM1, DkM1, jLo, jHi: integer;
   RowStride, TwoFDk, posK, posV: integer;
   Score, MRun, LRun, Alpha, Eg: TNeuralFloat;
   Prev: TNNetVolume;
@@ -31898,46 +31898,48 @@ begin
     QueryPtr := Prev.GetRawPtr(i, 0);
     FillDWord(FTileAcc[0], FDk, 0); // running unnormalized output
 
-    // Stream the key axis in tiles of FTileBc. Keys are visited strictly in
-    // order across tiles, so carry the K/V row offsets across the whole run (#12).
-    posK := FDk;
-    posV := TwoFDk;
-    j0 := 0;
-    while j0 <= SeqLenM1 do
+    // The v1 scope guard above rules out every data-dependent mask term, so the
+    // attendable keys form ONE contiguous band (see MaskBand). A masked key
+    // contributed nothing to the recurrence, so streaming the band alone is the
+    // same computation - and the tile boundaries only chop a per-key loop, they
+    // do not enter the arithmetic.
+    MaskBand(i, SeqLenM1, jLo, jHi);
+    // Keys are visited strictly in order across tiles, so carry the K/V row
+    // offsets across the whole run, seeded at the band's first key (#12).
+    posK := FDk + jLo * RowStride;
+    posV := TwoFDk + jLo * RowStride;
+    j0 := jLo;
+    while j0 <= jHi do
     begin
       jEnd := j0 + FTileBc - 1;
-      if jEnd > SeqLenM1 then jEnd := SeqLenM1;
+      if jEnd > jHi then jEnd := jHi;
       for j := j0 to jEnd do
       begin
-        if not ScoreIsMasked(i, j, false, nil, 0) then
+        Score := TNNetVolume.DotProduct(
+          QueryPtr, Prev.GetRawPtr(posK), FDk) * FInvSqrtDk;
+        // Online-softmax update with this single key's score. The running
+        // state only needs rescaling when this key RAISES the running max;
+        // otherwise the rescale factor is exp(0) = 1, so both the exp and the
+        // length-FDk AVX Mul by 1.0 are pure overhead. Guarding them keeps the
+        // recurrence identical and removes them from the common case.
+        if Score > MRun then
         begin
-          Score := TNNetVolume.DotProduct(
-            QueryPtr, Prev.GetRawPtr(posK), FDk) * FInvSqrtDk;
-          // Online-softmax update with this single key's score. The running
-          // state only needs rescaling when this key RAISES the running max;
-          // otherwise the rescale factor is exp(0) = 1, so both the exp and the
-          // length-FDk AVX Mul by 1.0 are pure overhead. Guarding them keeps the
-          // recurrence identical and removes them from the common case.
-          if Score > MRun then
-          begin
-            if MRun = -1e30 then
-              Alpha := 0          // first unmasked key: nothing to rescale yet
-            else
-              Alpha := NeuralExp(MRun - Score);
-            LRun := LRun * Alpha;
-            // In-place AVX rescale of the running accumulator by Alpha.
-            TNNetVolume.Mul(TNeuralFloatArrPtr(@FTileAcc[0]), Alpha, FDk);
-            MRun := Score;
-          end;
-          Eg := NeuralExp(Score - MRun);
-          LRun := LRun + Eg;
-          // FTileAcc[d] += Eg*V[j,d] over the depth-contiguous head-dim span:
-          // a fused AVX multiply-add. Only this accumulate is vectorized; the
-          // exp/max transcendental work above stays scalar.
-          TNNetVolume.MulAdd(TNeuralFloatArrPtr(@FTileAcc[0]),
-            Prev.GetRawPtr(posV), Eg, FDk);
+          if MRun = -1e30 then
+            Alpha := 0            // first key of the band: nothing to rescale
+          else
+            Alpha := NeuralExp(MRun - Score);
+          LRun := LRun * Alpha;
+          // In-place AVX rescale of the running accumulator by Alpha.
+          TNNetVolume.Mul(TNeuralFloatArrPtr(@FTileAcc[0]), Alpha, FDk);
+          MRun := Score;
         end;
-        // Advance unconditionally so masked keys keep the offsets in step (#12).
+        Eg := NeuralExp(Score - MRun);
+        LRun := LRun + Eg;
+        // FTileAcc[d] += Eg*V[j,d] over the depth-contiguous head-dim span:
+        // a fused AVX multiply-add. Only this accumulate is vectorized; the
+        // exp/max transcendental work above stays scalar.
+        TNNetVolume.MulAdd(TNeuralFloatArrPtr(@FTileAcc[0]),
+          Prev.GetRawPtr(posV), Eg, FDk);
         Inc(posK, RowStride);
         Inc(posV, RowStride);
       end;
