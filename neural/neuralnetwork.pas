@@ -10544,6 +10544,8 @@ type
       FLogDet: TNeuralFloat;  // (SizeX*SizeY)*sum(logs) over the last forward
       FLogDetLossWeight: TNeuralFloat; // coef of d(-logdet)/dparams folded into backward (ML=1)
       FsScratchBuf: array of TNeuralFloat; // #17: persistent s=exp(+-logs) scratch (Compute+Backprop)
+      // #17: persistent per-channel backward reductions (sum gy, sum gy*x).
+      FgyAccBuf, FgyxAccBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure DataDependentInit();
     public
@@ -60725,6 +60727,7 @@ var
   StartTime: double;
   SizeX, SizeY, x, y, c: integer;
   FCM1, SizeXM1, SizeYM1: integer;
+  CBytes: integer;
   sumLogS, sval, bval: TNeuralFloat;
   LogSPtr, BPtr, InPtr, OutPtr: TNeuralFloatArrPtr;
 begin
@@ -60738,6 +60741,7 @@ begin
   SizeYM1 := SizeY - 1;
   LogSPtr := FNeurons[0].FWeights.GetRawPtr(0, 0);
   BPtr := FNeurons[1].FWeights.GetRawPtr(0, 0);
+  CBytes := FC * csNeuralFloatSize;
   sumLogS := 0;
   for c := 0 to FCM1 do sumLogS := sumLogS + LogSPtr^[c];
   if not FInverse then FLogDet := SizeX * SizeY * sumLogS
@@ -60756,11 +60760,10 @@ begin
       OutPtr := FOutput.GetRawPtr(x, y);
       if not FInverse then
       begin
-        for c := 0 to FCM1 do
-        begin
-          sval := FsScratchBuf[c];
-          OutPtr^[c] := sval * InPtr^[c] + BPtr^[c];
-        end;
+        // #13: y = b + s*x over the contiguous channel run is a seed copy plus
+        // one elementwise FMA.
+        Move(BPtr^[0], OutPtr^[0], CBytes);
+        TNNetVolume.MulAdd(OutPtr, @FsScratchBuf[0], InPtr, FC);
       end
       else
       begin
@@ -60782,7 +60785,6 @@ var
   SizeX, SizeY, x, y, c: integer;
   FCM1, SizeXM1, SizeYM1: integer;
   hasInputGrad: boolean;
-  sval, gy: TNeuralFloat;
   LogSPtr, GyPtr, InPtr, PrevErrPtr, dLogSPtr, dBPtr: TNeuralFloatArrPtr;
   lr: TNeuralFloat;
 begin
@@ -60823,22 +60825,34 @@ begin
   // dL/dx[c]    = gy * s
   // dL/db[c]    = gy
   // dL/dlogs[c] = gy * s * x = gy * (y - b) ... computed directly as gy*s*x.
+  // #13: over a contiguous channel run every term is a bulk primitive -
+  // sum_pos gy and sum_pos gy*x are one Add and one elementwise FMA into
+  // per-channel accumulator vectors (#17), and the input gradient is a third
+  // elementwise FMA. The two weight reductions therefore sum position-major
+  // over the whole sample instead of folding (-lr)*s in per element - a float
+  // reassociation, covered by the ActNorm gradient checks.
+  if Length(FgyAccBuf) < FC then SetLength(FgyAccBuf, FC);
+  if Length(FgyxAccBuf) < FC then SetLength(FgyxAccBuf, FC);
+  FillDWord(FgyAccBuf[0], FC, 0);
+  FillDWord(FgyxAccBuf[0], FC, 0);
   for y := 0 to SizeYM1 do
     for x := 0 to SizeXM1 do
     begin
       InPtr := FPrevLayer.FOutput.GetRawPtr(x, y);
       GyPtr := FOutputError.GetRawPtr(x, y);
-      if hasInputGrad then PrevErrPtr := FPrevLayer.FOutputError.GetRawPtr(x, y);
-      for c := 0 to FCM1 do
+      TNNetVolume.Add(@FgyAccBuf[0], GyPtr, FC);
+      TNNetVolume.MulAdd(@FgyxAccBuf[0], GyPtr, InPtr, FC);
+      if hasInputGrad then
       begin
-        sval := FsScratchBuf[c];
-        gy := GyPtr^[c];
-        dBPtr^[c] := dBPtr^[c] + (-lr) * gy;
-        dLogSPtr^[c] := dLogSPtr^[c] + (-lr) * gy * sval * InPtr^[c];
-        if hasInputGrad then
-          PrevErrPtr^[c] := PrevErrPtr^[c] + gy * sval;
+        PrevErrPtr := FPrevLayer.FOutputError.GetRawPtr(x, y);
+        TNNetVolume.MulAdd(PrevErrPtr, GyPtr, @FsScratchBuf[0], FC);
       end;
     end;
+  for c := 0 to FCM1 do
+  begin
+    dBPtr^[c] := dBPtr^[c] + (-lr) * FgyAccBuf[c];
+    dLogSPtr^[c] := dLogSPtr^[c] + (-lr) * FsScratchBuf[c] * FgyxAccBuf[c];
+  end;
   if (not FBatchUpdate) then
   begin
     FNeurons[0].UpdateWeights(FInertia);
