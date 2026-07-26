@@ -3914,6 +3914,13 @@ type
     // Coded by Claude (AI).
     function ScoreIsMasked(i, j: integer; HasSeg: boolean; Seg: TNNetVolume;
       SegI: integer): boolean;
+    // Contiguous attendable key range [jLo..jHi] within [0..MaxJ] for query i,
+    // valid ONLY where no segment source participates (HasSeg=false). Every
+    // remaining ScoreIsMasked term is then a half-line in j, so their
+    // intersection is a single band; jHi < jLo means the row is fully masked.
+    // Coded by Claude (AI).
+    procedure MaskBand(i, MaxJ: integer; out jLo, jHi: integer);
+      {$IFDEF Release} inline; {$ENDIF}
     // Quantize Src[0..d_k-1] into int8 cache row Slot of Dst, where Slot is
     // the flat (position, head) row index head*MaxContext + position.
     procedure QuantizeCacheRow(Src: TNeuralFloatArrPtr;
@@ -31472,6 +31479,34 @@ begin
     (HasSeg and FBlockCausalSeg and (Round(Seg[j, 0, 0]) > SegI));
 end;
 
+procedure TNNetScaledDotProductAttention.MaskBand(i, MaxJ: integer;
+  out jLo, jHi: integer);
+begin
+  // Mirrors ScoreIsMasked with HasSeg=false, one half-line per active mask:
+  //   causal            -> j <= i
+  //   causal + prefix-LM -> j <= FPrefixLen-1 for a query inside the prefix
+  //                         (i < FPrefixLen, so this bound is >= i)
+  //   sliding window     -> j >= i - FWindow + 1
+  //   bidirectional      -> j <= i + FWindow - 1
+  jLo := 0;
+  jHi := MaxJ;
+  if FCausal then
+  begin
+    if (FPrefixLen > 0) and (i < FPrefixLen) then
+    begin
+      if FPrefixLen - 1 < jHi then jHi := FPrefixLen - 1;
+    end
+    else if i < jHi then jHi := i;
+  end;
+  if FWindow > 0 then
+  begin
+    jLo := i - FWindow + 1;
+    if jLo < 0 then jLo := 0;
+    if FBidirectionalWindow and (i + FWindow - 1 < jHi) then
+      jHi := i + FWindow - 1;
+  end;
+end;
+
 {$IFDEF OpenCL}
 procedure TNNetScaledDotProductAttention.EnableOpenCL(
   DotProductKernel: TDotProductKernel);
@@ -32055,13 +32090,11 @@ end;
 // its FAttn Y band and output slice. Disjoint (h, i) state per head, so head
 // ranges are race-free chunk work. Coded by Claude (AI).
 procedure TNNetFusedSDPA.ComputePrefillHeads(h1, h2: integer);
-const
-  cMaskFloor = -1e8; // matches TNNetScaledDotProductAttention.Compute
 var
-  SeqLen, i, j, d, h, g: integer;
-  SeqLenM1, DkM1: integer;
+  SeqLen, i, j, h, g: integer;
+  SeqLenM1, jLo, jHi, BandLen: integer;
   QOfs, KOfs, VOfs: integer;
-  AttnRow, AttnIdx, HRowBase: integer;
+  AttnRow, AttnBandBase, HRowBase: integer;
   RowStride, posK, posV: integer;
   Score, MaxScore, SumExp, A: TNeuralFloat;
   Prev: TNNetVolume;
@@ -32070,7 +32103,6 @@ begin
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   SeqLenM1 := SeqLen - 1;
-  DkM1 := FDk - 1;
   RowStride := Prev.GetRawPos(1, 0);
   for h := h1 to h2 do
   begin
@@ -32084,53 +32116,57 @@ begin
     begin
       // Head h's attention map lives in the Y-row band [h*SeqLen .. +SeqLen-1].
       AttnRow := FAttn.GetRawPos(0, HRowBase + i);
-      // Query row pointer is fixed for this i - invariant across the key loop.
-      QueryPtr := Prev.GetRawPtr(i, 0, QOfs);
-      posK := KOfs;                       // j=0 K offset (#12)
-      MaxScore := -1e30;
-      for j := 0 to SeqLenM1 do
+      // No segment source participates here, so the attendable keys form ONE
+      // contiguous band; everything outside it is masked and its softmax
+      // weight is exactly zero, so it is written rather than scored.
+      MaskBand(i, SeqLenM1, jLo, jHi);
+      if jHi < jLo then
       begin
-        AttnIdx := AttnRow + j;
-        if ScoreIsMasked(i, j, {HasSeg=}false, nil, 0) then
-          FAttn.FData[AttnIdx] := -1e9
-        else
+        // Fully masked row: the JAX/Flax all-masked-row zero policy (see the
+        // single-head Compute for the full rationale).
+        FillChar(FAttn.FData[AttnRow], SeqLen * csNeuralFloatSize, 0);
+      end
+      else
+      begin
+        // Query row pointer is fixed for this i - invariant across the key loop.
+        QueryPtr := Prev.GetRawPtr(i, 0, QOfs);
+        posK := KOfs + jLo * RowStride;   // j=jLo K offset (#12)
+        AttnBandBase := AttnRow + jLo;
+        MaxScore := -1e30;
+        for j := jLo to jHi do
         begin
           Score := TNNetVolume.DotProduct(
             QueryPtr, Prev.GetRawPtr(posK), FDk);
           Score := Score * FInvSqrtDk;
           if FScoreSoftCap > 0 then
             Score := FScoreSoftCap * pcr_tanhf(Score * FInvScoreSoftCap);
-          FAttn.FData[AttnIdx] := Score;
+          FAttn.FData[AttnRow + j] := Score;
+          if Score > MaxScore then MaxScore := Score;
+          Inc(posK, RowStride);
         end;
-        if FAttn.FData[AttnIdx] > MaxScore then
-          MaxScore := FAttn.FData[AttnIdx];
-        Inc(posK, RowStride);
-      end;
-      // Stable softmax with the JAX/Flax all-masked-row zero policy (see the
-      // single-head Compute for the full rationale).
-      if MaxScore <= cMaskFloor then
-      begin
-        FillChar(FAttn.FData[AttnRow], SeqLen * csNeuralFloatSize, 0);
-      end
-      else
-      begin
-        // The score row is contiguous, so the shift, the exp and the
+        if jLo > 0 then
+          FillChar(FAttn.FData[AttnRow], jLo * csNeuralFloatSize, 0);
+        if jHi < SeqLenM1 then
+          FillChar(FAttn.FData[AttnRow + jHi + 1],
+            (SeqLenM1 - jHi) * csNeuralFloatSize, 0);
+        // Stable softmax over the band only: the shift, the exp and the
         // normalizer are one fused vectorized pass (#19).
-        AttnRowPtr := FAttn.GetRawPtr(AttnRow);
+        BandLen := jHi - jLo + 1;
+        AttnRowPtr := FAttn.GetRawPtr(AttnBandBase);
         SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr,
-          MaxScore, SeqLen);
+          MaxScore, BandLen);
         if SumExp > 0 then
-          TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
+          TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, BandLen);
       end;
       OutPtr := FOutput.GetRawPtr(i, 0, QOfs);
       FillChar(OutPtr^, FDk * csNeuralFloatSize, 0);
-      posV := VOfs;                       // j=0 V offset (#12)
-      for j := 0 to SeqLenM1 do
+      posV := VOfs + jLo * RowStride;     // j=jLo V offset (#12)
+      for j := jLo to jHi do
       begin
-        // Masked keys carry an EXACTLY zero weight (exp(-1e9 - max) underflows
-        // to 0; an all-masked row was zero-filled), so their length-FDk AVX
-        // MulAdd is provably a no-op - skip it (about half the keys under a
-        // causal mask). Same idiom as the "if dS <> 0" backward guard.
+        // Outside the band the weight is exactly zero, so only the band can
+        // contribute; inside it a weight can still underflow to zero, and its
+        // length-FDk AVX MulAdd is then provably a no-op - skip it. Same idiom
+        // as the "if dS <> 0" backward guard.
         A := FAttn.FData[AttnRow + j];
         if A <> 0 then
           TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV), A, FDk);

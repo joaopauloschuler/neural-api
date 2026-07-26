@@ -32,6 +32,8 @@ type
     procedure TestPrefillParityMHA;      // Hq = Hkv (plain multi-head)
     procedure TestPrefillParityGQA;      // Hq > Hkv (grouped queries)
     procedure TestPrefillParityWindow;   // sliding-window mask
+    procedure TestPrefillParityFull;     // no mask at all (bidirectional)
+    procedure TestPrefillParityPrefixLM; // PaliGemma prefix-LM block
     procedure TestDecodeParityFP32;      // per-token cached decode
     procedure TestDecodeParityInt8KV;    // int8 KV cache decode
     procedure TestDecodeMultiTokenPrefill; // cached multi-token prompt
@@ -166,6 +168,54 @@ begin
     PerHead.Compute(Input);
     Fused.Compute(Input);
     AssertOutputsEqual('windowed prefill fused vs per-head',
+      PerHead, Fused, 0);
+  finally
+    Input.Free;
+    Fused.Free;
+    PerHead.Free;
+  end;
+end;
+
+procedure TTestNeuralFusedSDPA.TestPrefillParityFull;
+var
+  PerHead, Fused: TNNet;
+  Input: TNNetVolume;
+begin
+  // No causal mask and no window: every query attends every key.
+  PerHead := BuildPerHeadNet(6, 2, 2, 8, 0, {Causal=}false);
+  Fused := BuildFusedNet(6, 2, 2, 8, 0, {Causal=}false);
+  Input := TNNetVolume.Create(6, 1, (2 + 4) * 8);
+  try
+    FillPacked(Input, 51);
+    PerHead.Compute(Input);
+    Fused.Compute(Input);
+    AssertOutputsEqual('unmasked prefill fused vs per-head',
+      PerHead, Fused, 0);
+  finally
+    Input.Free;
+    Fused.Free;
+    PerHead.Free;
+  end;
+end;
+
+procedure TTestNeuralFusedSDPA.TestPrefillParityPrefixLM;
+var
+  PerHead, Fused: TNNet;
+  Input: TNNetVolume;
+begin
+  // Prefix-LM (PaliGemma): queries 0..2 see the whole prefix 0..2 in both
+  // directions, queries 3..6 stay strictly causal. SeqLen 7 with PrefixLen 3
+  // exercises both arms of the mask in one forward.
+  PerHead := BuildPerHeadNet(7, 2, 2, 4, 0, {Causal=}true);
+  Fused := BuildFusedNet(7, 2, 2, 4, 0, {Causal=}true);
+  Input := TNNetVolume.Create(7, 1, (2 + 4) * 4);
+  try
+    PerHead.SetAttentionPrefixLen(3);
+    Fused.SetAttentionPrefixLen(3);
+    FillPacked(Input, 65);
+    PerHead.Compute(Input);
+    Fused.Compute(Input);
+    AssertOutputsEqual('prefix-LM prefill fused vs per-head',
       PerHead, Fused, 0);
   finally
     Input.Free;
