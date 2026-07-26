@@ -6790,7 +6790,10 @@ type
     FCachedPosT, FCachedPosH, FCachedPosW: array of integer;
     FCachedHalfD, FCachedPosOffset: integer;
     {$ENDIF}
-    // Returns the section (0=T,1=H,2=W) that channel-pair k belongs to.
+    // Returns the section (0=T,1=H,2=W) that channel-pair k belongs to. This
+    // is the reference definition of the section boundaries; the forward and
+    // backward loops implement it by splitting k into the three contiguous
+    // ranges instead of testing it per pair.
     function SectionOfPair(k: integer): integer;
     {$IFDEF OpenCL}
     procedure ComputeOpenCL();
@@ -43490,6 +43493,7 @@ var
   SeqLen, Depth, HalfD: integer;
   HalfDM1: integer;
   pos, k, sec, idx, StartRow, p, baseRow: integer;
+  kStart, kEnd, idxOfs, SecT, SecTH: integer;
   CanReuse: boolean;
   FAngleCacheRowsM1, SeqLenM1: integer;
 begin
@@ -43518,18 +43522,25 @@ begin
   else
     StartRow := 0;              // full rebuild
   SeqLenM1 := SeqLen - 1;
+  // The three sections are CONTIGUOUS k ranges (see SectionOfPair), so walk
+  // them one at a time (#20): the per-k section test and position lookup both
+  // leave the inner loop, which then carries one loop-invariant position.
+  SecT := FMSection[0];
+  SecTH := FMSection[0] + FMSection[1];
   for pos := StartRow to SeqLenM1 do
   begin
     baseRow := pos * HalfD;                  // #11: row base, invariant across k
-    for k := 0 to HalfDM1 do
+    for sec := 0 to 2 do
     begin
-      case SectionOfPair(k) of
-        0: idx := FPosT[pos];
-        1: idx := FPosH[pos];
+      case sec of
+        0: begin kStart := 0;     kEnd := SecT - 1;  idx := FPosT[pos]; end;
+        1: begin kStart := SecT;  kEnd := SecTH - 1; idx := FPosH[pos]; end;
       else
-        idx := FPosW[pos];
+        begin kStart := SecTH; kEnd := HalfDM1; idx := FPosW[pos]; end;
       end;
-      FAngleTable.FData[baseRow + k] := (idx + FPositionOffset) * FTheta[k];
+      idxOfs := idx + FPositionOffset;
+      for k := kStart to kEnd do
+        FAngleTable.FData[baseRow + k] := idxOfs * FTheta[k];
     end;
   end;
   // Match FOutput to the active prefix length. SetPrevLayer sized it to the
@@ -43604,8 +43615,8 @@ var
   StartTime: double;
   SeqLen, Depth, HalfD: integer;
   SeqLenM1, HalfDM1: integer;
-  pos, k, idx: integer;
-  base, i0: integer;
+  pos, k, idx, sec: integer;
+  base, i0, kStart, kEnd, idxOfs, SecT, SecTH: integer;
   Angle, c, s, x0, x1: TNeuralFloat;
   Prev: TNNetVolume;
 begin
@@ -43639,25 +43650,34 @@ begin
   {$ENDIF}
   SeqLenM1 := SeqLen - 1;
   HalfDM1 := HalfD - 1;
+  // The three sections are CONTIGUOUS k ranges (see SectionOfPair), so walk
+  // them one at a time (#20): the per-k section test and position lookup both
+  // leave the inner loop, which then carries one loop-invariant position.
+  SecT := FMSection[0];
+  SecTH := FMSection[0] + FMSection[1];
   for pos := 0 to SeqLenM1 do
   begin
     base := Prev.GetRawPos(pos, 0);
-    i0 := base;
-    for k := 0 to HalfDM1 do
+    for sec := 0 to 2 do
     begin
-      case SectionOfPair(k) of
-        0: idx := FPosT[pos];
-        1: idx := FPosH[pos];
+      case sec of
+        0: begin kStart := 0;     kEnd := SecT - 1;  idx := FPosT[pos]; end;
+        1: begin kStart := SecT;  kEnd := SecTH - 1; idx := FPosH[pos]; end;
       else
-        idx := FPosW[pos];
+        begin kStart := SecTH; kEnd := HalfDM1; idx := FPosW[pos]; end;
       end;
-      Angle := (idx + FPositionOffset) * FTheta[k];
-      pcr_sincosf(Angle, s, c);
-      x0 := Prev.FData[i0];
-      x1 := Prev.FData[i0 + 1];
-      FOutput.FData[i0]     := FOutScale * (c * x0 - s * x1);
-      FOutput.FData[i0 + 1] := FOutScale * (s * x0 + c * x1);
-      Inc(i0, 2);
+      idxOfs := idx + FPositionOffset;
+      i0 := base + 2 * kStart;   // pair k occupies slots base+2k, base+2k+1
+      for k := kStart to kEnd do
+      begin
+        Angle := idxOfs * FTheta[k];
+        pcr_sincosf(Angle, s, c);
+        x0 := Prev.FData[i0];
+        x1 := Prev.FData[i0 + 1];
+        FOutput.FData[i0]     := FOutScale * (c * x0 - s * x1);
+        FOutput.FData[i0 + 1] := FOutScale * (s * x0 + c * x1);
+        Inc(i0, 2);
+      end;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -43668,8 +43688,8 @@ var
   StartTime: double;
   SeqLen, Depth, HalfD: integer;
   SeqLenM1, HalfDM1: integer;
-  pos, k, idx: integer;
-  base, i0: integer;
+  pos, k, idx, sec: integer;
+  base, i0, kStart, kEnd, idxOfs, SecT, SecTH: integer;
   Angle, c, s, gy0, gy1: TNeuralFloat;
   PrevErr: TNNetVolume;
 begin
@@ -43688,25 +43708,32 @@ begin
     SeqLenM1 := SeqLen - 1;
     HalfDM1 := HalfD - 1;
     if Length(FTheta) <> HalfD then BuildThetaCache(Depth);
+    // Same contiguous-section split as Compute (#20).
+    SecT := FMSection[0];
+    SecTH := FMSection[0] + FMSection[1];
     for pos := 0 to SeqLenM1 do
     begin
       base := PrevErr.GetRawPos(pos, 0);
-      i0 := base;
-      for k := 0 to HalfDM1 do
+      for sec := 0 to 2 do
       begin
-        case SectionOfPair(k) of
-          0: idx := FPosT[pos];
-          1: idx := FPosH[pos];
+        case sec of
+          0: begin kStart := 0;     kEnd := SecT - 1;  idx := FPosT[pos]; end;
+          1: begin kStart := SecT;  kEnd := SecTH - 1; idx := FPosH[pos]; end;
         else
-          idx := FPosW[pos];
+          begin kStart := SecTH; kEnd := HalfDM1; idx := FPosW[pos]; end;
         end;
-        Angle := (idx + FPositionOffset) * FTheta[k];
-        pcr_sincosf(Angle, s, c);
-        gy0 := FOutputError.FData[i0];
-        gy1 := FOutputError.FData[i0 + 1];
-        PrevErr.FData[i0]     := PrevErr.FData[i0]     + FOutScale * (c * gy0 + s * gy1);
-        PrevErr.FData[i0 + 1] := PrevErr.FData[i0 + 1] + FOutScale * (-s * gy0 + c * gy1);
-        Inc(i0, 2);
+        idxOfs := idx + FPositionOffset;
+        i0 := base + 2 * kStart;   // pair k occupies slots base+2k, base+2k+1
+        for k := kStart to kEnd do
+        begin
+          Angle := idxOfs * FTheta[k];
+          pcr_sincosf(Angle, s, c);
+          gy0 := FOutputError.FData[i0];
+          gy1 := FOutputError.FData[i0 + 1];
+          PrevErr.FData[i0]     := PrevErr.FData[i0]     + FOutScale * (c * gy0 + s * gy1);
+          PrevErr.FData[i0 + 1] := PrevErr.FData[i0 + 1] + FOutScale * (-s * gy0 + c * gy1);
+          Inc(i0, 2);
+        end;
       end;
     end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
