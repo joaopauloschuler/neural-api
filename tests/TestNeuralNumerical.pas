@@ -503,6 +503,9 @@ type
     procedure TestRMSNormForward;
     procedure TestRMSNormGradientCheck;
     procedure TestRMSNormGatedForward;
+    // Inference-only (SetTrainable(False)) forward parity for the norm layers
+    // that cache backprop-only scratch during Compute.
+    procedure TestNormLayersInferenceOnlyForwardParity;
     procedure TestRMSNormGatedGradientCheck;
     procedure TestRMSNormGatedSerializationRoundTrip;
     // Residual builder helpers (AddPreNormResidual / AddRMSNormResidual / AddPostNormResidual / AddGatedResidual)
@@ -3278,6 +3281,85 @@ begin
     Input.Free;
     InputPlus.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestNormLayersInferenceOnlyForwardParity;
+// The normalization layers below cache backprop-only state (FNormalized /
+// FInvStd / FInvRMS) while normalizing. Marking the net inference-only frees
+// that scratch, so the forward path must produce exactly the same activations
+// with and without it.
+var
+  NN: TNNet;
+  Input, Snapshot: TNNetVolume;
+  TokenLN: TNNetTokenLayerNorm;
+  TokenRMS: TNNetTokenRMSNorm;
+  LN: TNNetLayerNorm;
+  RMS: TNNetRMSNorm;
+  GN: TNNetGroupNorm;
+  RMSG: TNNetRMSNormGated;
+  i: integer;
+
+  procedure FillWeights(pLayer: TNNetLayer);
+  var
+    NeuronCnt, WeightCnt: integer;
+    W: TNNetVolume;
+  begin
+    for NeuronCnt := 0 to pLayer.Neurons.Count - 1 do
+    begin
+      W := pLayer.Neurons[NeuronCnt].Weights;
+      for WeightCnt := 0 to W.Size - 1 do
+        W.Raw[WeightCnt] := 0.5 + 0.25 * Sin(WeightCnt * 0.9 + NeuronCnt);
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 8);
+  Snapshot := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 8));
+    TokenLN := TNNetTokenLayerNorm.Create(1e-5);
+    NN.AddLayer(TokenLN);
+    TokenRMS := TNNetTokenRMSNorm.Create(1e-6);
+    NN.AddLayer(TokenRMS);
+    LN := TNNetLayerNorm.Create();
+    NN.AddLayer(LN);
+    RMS := TNNetRMSNorm.Create();
+    NN.AddLayer(RMS);
+    GN := TNNetGroupNorm.Create(2);
+    NN.AddLayer(GN);
+    RMSG := TNNetRMSNormGated.Create();
+    NN.AddLayer(RMSG);
+
+    // Non-trivial gamma/beta/gain/gate so a mis-ordered normalize is visible.
+    FillWeights(TokenLN);
+    FillWeights(TokenRMS);
+    FillWeights(LN);
+    FillWeights(RMS);
+    FillWeights(GN);
+    FillWeights(RMSG);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+
+    NN.Compute(Input);
+    Snapshot.Copy(NN.GetLastLayer.Output);
+    AssertTrue('Trainable forward must produce finite activations',
+      Snapshot.GetSum() = Snapshot.GetSum());
+
+    NN.SetTrainable(False);
+    NN.Compute(Input);
+
+    AssertEquals('Inference-only output size', Snapshot.Size,
+      NN.GetLastLayer.Output.Size);
+    for i := 0 to Snapshot.Size - 1 do
+      AssertEquals('Inference-only norm forward parity at ' + IntToStr(i),
+        Snapshot.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+  finally
+    NN.Free;
+    Input.Free;
+    Snapshot.Free;
   end;
 end;
 
