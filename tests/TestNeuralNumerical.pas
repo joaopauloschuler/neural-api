@@ -1431,6 +1431,7 @@ type
     procedure TestMinMaxNormPerChannelForward;
     procedure TestMinMaxNormPerChannelGradientCheck;
     procedure TestMinMaxNormPerChannelSerializationRoundTrip;
+    procedure TestMinMaxNormPerChannelTieBreak;
     procedure TestLogitNormalizeGradientCheck;
     procedure TestLogitNormalizeReducesToL2WhenTauOne;
     procedure TestLogitNormalizeSerializationRoundTrip;
@@ -28850,6 +28851,69 @@ begin
   finally
     NN.Free;
     NNFull.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestMinMaxNormPerChannelTieBreak;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  PrevErr: TNNetVolume;
+  CntE: integer;
+  Bulk0, Bulk1: TNeuralFloat;
+const
+  SizeX = 4; SizeY = 1; Depth = 2;
+  Eps = 1e-7;
+  Gy = 0.5;   // uniform output error
+begin
+  // Per-channel min/max: when several spatial positions of a channel hold the
+  // SAME extreme value, the reduction must select the FIRST one in ascending
+  // position order, because the backward routes the argmax/argmin corrections
+  // through exactly those flat indices. A gradient check cannot see this (it
+  // perturbs one cell at a time and never creates the tie), so pin it here.
+  //   channel 0: 5, 1, 9, 1   -> min 1 TIED at positions 1 and 3; max 9 at 2
+  //   channel 1: 2, 7, 7, 0   -> max 7 TIED at positions 1 and 2; min 0 at 3
+  // A layer that used <= / >= (or scanned descending) would move the
+  // correction to the LAST tied position instead.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, Depth);
+  Desired := TNNetVolume.Create(1, 1, SizeX * SizeY * Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, Depth, 1));
+    NN.AddLayer(TNNetIdentity.Create());
+    NN.AddLayer(TNNetMinMaxNorm.Create(Eps, true));
+    Input.Store(0, 0, 0, 5.0); Input.Store(0, 0, 1, 2.0);
+    Input.Store(1, 0, 0, 1.0); Input.Store(1, 0, 1, 7.0);
+    Input.Store(2, 0, 0, 9.0); Input.Store(2, 0, 1, 7.0);
+    Input.Store(3, 0, 0, 1.0); Input.Store(3, 0, 1, 0.0);
+    NN.Compute(Input);
+    // OutputError = Output - Desired, so Desired = Output - Gy gives a uniform
+    // output error of Gy at every cell.
+    Desired.ReSize(NN.GetLastLayer.Output);
+    Desired.Copy(NN.GetLastLayer.Output);
+    for CntE := 0 to Desired.Size - 1 do
+      Desired.Raw[CntE] := Desired.Raw[CntE] - Gy;
+    NN.Backpropagate(Desired);
+    PrevErr := NN.Layers[1].OutputError;
+    // Bulk term only: gy / denom, with denom = (max - min) + eps.
+    Bulk0 := Gy / ((9.0 - 1.0) + Eps);
+    Bulk1 := Gy / ((7.0 - 0.0) + Eps);
+    // Channel 0: the argmin correction belongs to position 1, so position 3 -
+    // the SECOND cell holding the tied minimum - must carry the bulk term only.
+    AssertEquals('tie-break ch0: second tied min cell is bulk-only',
+      Bulk0, PrevErr.Get(3, 0, 0), 1e-5);
+    AssertTrue('tie-break ch0: first tied min cell carries the correction',
+      Abs(PrevErr.Get(1, 0, 0) - Bulk0) > 1e-3);
+    // Channel 1: the argmax correction belongs to position 1, so position 2 -
+    // the SECOND cell holding the tied maximum - must carry the bulk term only.
+    AssertEquals('tie-break ch1: second tied max cell is bulk-only',
+      Bulk1, PrevErr.Get(2, 0, 1), 1e-5);
+    AssertTrue('tie-break ch1: first tied max cell carries the correction',
+      Abs(PrevErr.Get(1, 0, 1) - Bulk1) > 1e-3);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
   end;
 end;
 

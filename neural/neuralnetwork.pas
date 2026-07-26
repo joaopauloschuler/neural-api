@@ -3705,6 +3705,11 @@ type
     FArgMax: TNNetVolume;  // flat argmax index (one cell, or one per channel)
     FDenoms: TNNetVolume;  // (M - m) + eps (one cell, or one per channel)
     FMaxVals: TNNetVolume; // M (one cell, or one per channel)
+    // Per-channel running state for the position-outer sweeps (#17: persistent
+    // layer fields sized once in SetPrevLayer, never per call).
+    FMinBuf, FMaxBuf, FNegMinBuf, FInvDenBuf: array of TNeuralFloat;
+    FDotGYBuf, FGYm1Buf: array of TNeuralFloat;
+    FArgMinBuf, FArgMaxBuf: array of integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(); overload; override;
@@ -30345,6 +30350,14 @@ begin
     FArgMax.ReSize(1, 1, FOutput.Depth);
     FDenoms.ReSize(1, 1, FOutput.Depth);
     FMaxVals.ReSize(1, 1, FOutput.Depth);
+    SetLength(FMinBuf, FOutput.Depth);
+    SetLength(FMaxBuf, FOutput.Depth);
+    SetLength(FNegMinBuf, FOutput.Depth);
+    SetLength(FInvDenBuf, FOutput.Depth);
+    SetLength(FDotGYBuf, FOutput.Depth);
+    SetLength(FGYm1Buf, FOutput.Depth);
+    SetLength(FArgMinBuf, FOutput.Depth);
+    SetLength(FArgMaxBuf, FOutput.Depth);
   end
   else
   begin
@@ -30360,7 +30373,7 @@ procedure TNNetMinMaxNorm.Compute();
 var
   StartTime: double;
   CntE, MaxE, ArgMin, ArgMax: integer;
-  CntD, Depth, DepthM1, Pos, NumPos, NumPosM1, Idx: integer;
+  CntD, Depth, DepthM1, Pos, NumPos, NumPosM1, Idx, DepthBytes: integer;
   LocalPrevOutput: TNNetVolume;
   MinV, MaxV, Denom, InvDenom, Eps, Xv: TNeuralFloat;
 begin
@@ -30372,40 +30385,62 @@ begin
   begin
     // Per-channel mode: reduce over the spatial positions (x,y) ONLY, one
     // (min_d, max_d, argmin_d, argmax_d, denom_d) per depth channel. Depth is
-    // the fastest-varying axis, so element d of position p lives at p*Depth+d.
+    // the fastest-varying axis, so element d of position p lives at p*Depth+d:
+    // both sweeps therefore run position-outer / depth-inner (App. E) with the
+    // per-channel state held in vectors, one contiguous pass over the volume
+    // each instead of one strided pass per channel.
+    //
+    // TIE-BREAKING: the channel-outer form picked, for each channel, the FIRST
+    // position in ascending Pos that strictly beat the running extreme. This
+    // form still visits positions in ascending Pos and still uses a strict
+    // < / >, so it selects the same index; the backward routes gradient through
+    // exactly those indices, so the tie-break is load-bearing.
     Depth := LocalPrevOutput.Depth;
     DepthM1 := Depth - 1;
     NumPos := LocalPrevOutput.SizeX * LocalPrevOutput.SizeY;
     NumPosM1 := NumPos - 1;
     for CntD := 0 to DepthM1 do
     begin
-      Xv := LocalPrevOutput.FData[CntD]; // #4: read the Pos=0 seed once
-      MinV := Xv;
-      MaxV := Xv;
-      ArgMin := CntD;
-      ArgMax := CntD;
-      Idx := CntD; // #6: carry Pos*Depth+CntD as a running offset
-      for Pos := 1 to NumPosM1 do
+      Xv := LocalPrevOutput.FData[CntD]; // the Pos=0 seed column
+      FMinBuf[CntD] := Xv;
+      FMaxBuf[CntD] := Xv;
+      FArgMinBuf[CntD] := CntD;
+      FArgMaxBuf[CntD] := CntD;
+    end;
+    Idx := Depth; // #6: carry Pos*Depth+CntD as a running offset
+    for Pos := 1 to NumPosM1 do
+      for CntD := 0 to DepthM1 do
       begin
-        Inc(Idx, Depth);
         Xv := LocalPrevOutput.FData[Idx];
-        if Xv < MinV then begin MinV := Xv; ArgMin := Idx; end;
-        if Xv > MaxV then begin MaxV := Xv; ArgMax := Idx; end;
+        if Xv < FMinBuf[CntD] then
+        begin FMinBuf[CntD] := Xv; FArgMinBuf[CntD] := Idx; end;
+        if Xv > FMaxBuf[CntD] then
+        begin FMaxBuf[CntD] := Xv; FArgMaxBuf[CntD] := Idx; end;
+        Inc(Idx);
       end;
-      FArgMin.FData[CntD] := ArgMin;
-      FArgMax.FData[CntD] := ArgMax;
+    for CntD := 0 to DepthM1 do
+    begin
+      MinV := FMinBuf[CntD];
+      MaxV := FMaxBuf[CntD];
+      FArgMin.FData[CntD] := FArgMinBuf[CntD];
+      FArgMax.FData[CntD] := FArgMaxBuf[CntD];
       Denom := (MaxV - MinV) + Eps;
       FDenoms.FData[CntD] := Denom;
       FMaxVals.FData[CntD] := MaxV;
-      // #5: 1/Denom is loop-invariant (the backward already carries InvDenom);
-      // #6: carry Pos*Depth+CntD instead of re-multiplying it every position.
-      InvDenom := 1.0 / Denom;
-      Idx := CntD;
-      for Pos := 0 to NumPosM1 do
-      begin
-        FOutput.FData[Idx] := (LocalPrevOutput.FData[Idx] - MinV) * InvDenom;
-        Inc(Idx, Depth);
-      end;
+      // #5: 1/Denom is loop-invariant (the backward already carries InvDenom).
+      FNegMinBuf[CntD] := -MinV;
+      FInvDenBuf[CntD] := 1.0 / Denom;
+    end;
+    // #13: (x + (-min_d)) * invdenom_d over a contiguous depth column is a copy
+    // plus two elementwise vector ops, and is bit-identical to (x - min)*inv.
+    DepthBytes := Depth * csNeuralFloatSize;
+    Idx := 0;
+    for Pos := 0 to NumPosM1 do
+    begin
+      Move(LocalPrevOutput.FData[Idx], FOutput.FData[Idx], DepthBytes);
+      TNNetVolume.Add(FOutput.GetRawPtr(Idx), @FNegMinBuf[0], Depth);
+      TNNetVolume.Mul(FOutput.GetRawPtr(Idx), @FInvDenBuf[0], Depth);
+      Inc(Idx, Depth);
     end;
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
@@ -30465,31 +30500,44 @@ begin
       // Per-channel backward: same structure as the full-volume case, but the
       // bulk term, the argmax-row correction and the argmin extra term are all
       // scoped to a single depth channel's spatial positions.
+      // App. E: position-outer / depth-inner, so the volume is swept once over
+      // its contiguous axis instead of once per channel. Denom_d is invariant
+      // across positions, so it factors out of the argmin sum (#5); the two
+      // reductions become per-channel accumulator vectors and the bulk term is
+      // one elementwise FMA per column (#13). The reductions now sum
+      // position-major - a float reassociation.
       Depth := FOutput.Depth;
       NumPos := FOutput.SizeX * FOutput.SizeY;
       DepthM1 := Depth - 1;
       NumPosM1 := NumPos - 1;
       for CntD := 0 to DepthM1 do
+        FInvDenBuf[CntD] := 1.0 / FDenoms.FData[CntD];
+      FillDWord(FDotGYBuf[0], Depth, 0);
+      FillDWord(FGYm1Buf[0], Depth, 0);
+      Idx := 0;
+      for Pos := 0 to NumPosM1 do
       begin
-        Denom := FDenoms.FData[CntD];
-        InvDenom := 1.0 / Denom;
-        InvDenomSq := InvDenom * InvDenom;
-        ArgMin := Round(FArgMin.FData[CntD]);
-        ArgMax := Round(FArgMax.FData[CntD]);
-        DotGY := 0;
-        ArgMinExtra := 0;
-        Idx := CntD; // #6: carry Pos*Depth+CntD as a running offset
-        for Pos := 0 to NumPosM1 do
+        TNNetVolume.MulAdd(FPrevLayer.OutputError.GetRawPtr(Idx),
+          FOutputError.GetRawPtr(Idx), @FInvDenBuf[0], Depth);
+        for CntD := 0 to DepthM1 do
         begin
           Gi := FOutputError.FData[Idx];
           Yi := FOutput.FData[Idx];
-          DotGY := DotGY + Gi * Yi;
-          // (x_j - M_d - eps) = (Yi - 1)*Denom_d (see full-volume derivation).
-          ArgMinExtra := ArgMinExtra + Gi * (Yi - 1.0) * Denom;
-          FPrevLayer.OutputError.FData[Idx] :=
-            FPrevLayer.OutputError.FData[Idx] + Gi * InvDenom;
-          Inc(Idx, Depth);
+          FDotGYBuf[CntD] := FDotGYBuf[CntD] + Gi * Yi;
+          FGYm1Buf[CntD] := FGYm1Buf[CntD] + Gi * (Yi - 1.0);
+          Inc(Idx);
         end;
+      end;
+      for CntD := 0 to DepthM1 do
+      begin
+        Denom := FDenoms.FData[CntD];
+        InvDenom := FInvDenBuf[CntD];
+        InvDenomSq := InvDenom * InvDenom;
+        ArgMin := Round(FArgMin.FData[CntD]);
+        ArgMax := Round(FArgMax.FData[CntD]);
+        DotGY := FDotGYBuf[CntD];
+        // (x_j - M_d - eps) = (Yi - 1)*Denom_d (see full-volume derivation).
+        ArgMinExtra := FGYm1Buf[CntD] * Denom;
         FPrevLayer.OutputError.FData[ArgMax] :=
           FPrevLayer.OutputError.FData[ArgMax] - InvDenom * DotGY;
         FPrevLayer.OutputError.FData[ArgMin] :=
