@@ -32969,7 +32969,7 @@ var
   SeqLenM1, StepsM1, NumPatternsM1: integer;
   PBase, posP, posPrev: integer;
   Score, MaxScore, SumExp: TNeuralFloat;
-  XiCur, XiNext: TNeuralFloatArrPtr;
+  XiCur, XiNext, PRowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -32999,13 +32999,11 @@ begin
         if Score > MaxScore then MaxScore := Score;
         Inc(posP, FDim);
       end;
-      SumExp := 0;
-      for p := 0 to NumPatternsM1 do
-      begin
-        Score := NeuralExp(FP.FData[PBase + p] - MaxScore);
-        FP.FData[PBase + p] := Score;
-        SumExp := SumExp + Score;
-      end;
+      // The pattern-score row is contiguous, so the shift, the exp and the
+      // normalizer are one fused vectorized pass (#19).
+      PRowPtr := FP.GetRawPtr(PBase);
+      SumExp := TNNetVolume.VectorExpShiftSum(PRowPtr, PRowPtr, MaxScore,
+        FNumPatterns);
       if SumExp > 0 then
         for p := 0 to NumPatternsM1 do
           FP.FData[PBase + p] := FP.FData[PBase + p] / SumExp;
@@ -34700,7 +34698,7 @@ var
   AttnRow, RowStride, posK, posV: integer;
   Score, MaxScore, SumExp: TNeuralFloat;
   Q, KV: TNNetVolume;
-  OutPtr, QiPtr: TNeuralFloatArrPtr;
+  OutPtr, QiPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
   {$IFDEF OpenCL}
   // Offload to the device when OpenCL is enabled and the query sequence is long
@@ -34744,15 +34742,13 @@ begin
       if Score > MaxScore then MaxScore := Score;
       Inc(posK, RowStride);
     end;
-    SumExp := 0;
-    for j := 0 to KVLenM1 do
-    begin
-      Score := NeuralExp(FAttn.FData[AttnRow + j] - MaxScore);
-      FAttn.FData[AttnRow + j] := Score;
-      SumExp := SumExp + Score;
-    end;
+    // The score row is contiguous, so the shift, the exp and the normalizer
+    // are one fused vectorized pass (#19).
+    AttnRowPtr := FAttn.GetRawPtr(AttnRow);
+    SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+      KVLen);
     if SumExp > 0 then
-      TNNetVolume.Mul(FAttn.GetRawPtr(0, i), 1 / SumExp, KVLenM1 + 1);
+      TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, KVLen);
     OutPtr := FOutput.GetRawPtr(i, 0);
     FillChar(OutPtr^, FDk * csNeuralFloatSize, 0);
     posV := FDk;                          // KV value row j=0 offset, depth FDk (#12)
@@ -39496,7 +39492,7 @@ var
   RowStride, TwoFDk, KnStride, posKn, posV, RowBytes: integer;
   Score, MaxScore, SumExp, SumSq, InvN, LiveScale: TNeuralFloat;
   Prev: TNNetVolume;
-  OutPtr, QnPtr, QPtr, KPtr, KnPtr: TNeuralFloatArrPtr;
+  OutPtr, QnPtr, QPtr, KPtr, KnPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
   {$IFDEF OpenCL}
   // Prefill matmuls on the device when OpenCL is enabled and the sequence is
@@ -39565,17 +39561,13 @@ begin
       if Score > MaxScore then MaxScore := Score;
       Inc(posKn, KnStride);
     end;
-    // Softmax (numerically stable).
-    SumExp := 0;
-    for j := 0 to SeqLenM1 do
-    begin
-      pos := AttnRow + j;
-      Score := NeuralExp(FAttn.FData[pos] - MaxScore);
-      FAttn.FData[pos] := Score;
-      SumExp := SumExp + Score;
-    end;
+    // Softmax (numerically stable). The score row is contiguous, so the shift,
+    // the exp and the normalizer are one fused vectorized pass (#19).
+    AttnRowPtr := FAttn.GetRawPtr(AttnRow);
+    SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+      SeqLen);
     if SumExp > 0 then
-      TNNetVolume.Mul(FAttn.GetRawPtr(0, i), 1 / SumExp, SeqLen);
+      TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
     // Output[i, 0, d] = sum_j Attn[i, j] * V[j, 0, d]. V is contiguous along
     // depth, so accumulate j-outer with AVX MulAdd over FDk floats (the old
     // d-outer / j-inner order was strided over j and not vectorizable).
@@ -40011,7 +40003,7 @@ var
   RowStride, TwoFDk, posK, posV, bucketBase, RowBytes: integer;
   Score, MaxScore, SumExp: TNeuralFloat;
   Prev: TNNetVolume;
-  OutPtr, QueryPtr: TNeuralFloatArrPtr;
+  OutPtr, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
   Bias: TNeuralFloatArrPtr;
 begin
   if FCacheEnabled then
@@ -40062,16 +40054,13 @@ begin
     end
     else
     begin
-      SumExp := 0;
-      for j := 0 to SeqLenM1 do
-      begin
-        pos := AttnRow + j;
-        Score := NeuralExp(FAttn.FData[pos] - MaxScore);
-        FAttn.FData[pos] := Score;
-        SumExp := SumExp + Score;
-      end;
+      // The score row is contiguous, so the shift, the exp and the normalizer
+      // are one fused vectorized pass (#19).
+      AttnRowPtr := FAttn.GetRawPtr(AttnRow);
+      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+        SeqLen);
       if SumExp > 0 then
-        TNNetVolume.Mul(FAttn.GetRawPtr(0, i), 1 / SumExp, SeqLen);
+        TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
     end;
     OutPtr := FOutput.GetRawPtr(i, 0);
     FillChar(OutPtr^, RowBytes, 0);
@@ -40405,7 +40394,7 @@ var
   RowStride, TwoFDk, posKey, posV, RowBytes: integer;
   Score, MaxScore, SumExp, c2c, c2p, p2c: TNeuralFloat;
   Prev: TNNetVolume;
-  OutPtr, Krow, Qrow, QueryPtr, kPtr: TNeuralFloatArrPtr;
+  OutPtr, Krow, Qrow, QueryPtr, kPtr, AttnRowPtr: TNeuralFloatArrPtr;
   PosK, PosQ: TNNetVolume;
 begin
   {$IFDEF OpenCL}
@@ -40463,16 +40452,13 @@ begin
     end
     else
     begin
-      SumExp := 0;
-      for j := 0 to SeqLenM1 do
-      begin
-        pos := AttnRow + j;
-        Score := NeuralExp(FAttn.FData[pos] - MaxScore);
-        FAttn.FData[pos] := Score;
-        SumExp := SumExp + Score;
-      end;
+      // The score row is contiguous, so the shift, the exp and the normalizer
+      // are one fused vectorized pass (#19).
+      AttnRowPtr := FAttn.GetRawPtr(AttnRow);
+      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+        SeqLen);
       if SumExp > 0 then
-        TNNetVolume.Mul(FAttn.GetRawPtr(0, i), 1 / SumExp, SeqLen);
+        TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
     end;
     OutPtr := FOutput.GetRawPtr(i, 0);
     FillChar(OutPtr^, RowBytes, 0);
@@ -40784,11 +40770,11 @@ var
   pos, AttnRow, idxBase: integer;
   StartTime: double;
   SeqLen, i, j, d: integer;
-  SeqLenM1, DkM1, jLo, jHi: integer;
+  SeqLenM1, DkM1, jLo, jHi, BandLen: integer;
   RowStride, TwoFDk, posK, posV, RowBytes: integer;
   Score, MaxScore, SumExp, c2c, c2p: TNeuralFloat;
   Prev: TNNetVolume;
-  OutPtr, Prow, QueryPtr: TNeuralFloatArrPtr;
+  OutPtr, Prow, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
   PosT: TNNetVolume;
 begin
   {$IFDEF OpenCL}
@@ -40844,17 +40830,14 @@ begin
     end
     else
     begin
-      SumExp := 0;
-      for j := jLo to jHi do
-      begin
-        pos := AttnRow + j;
-        Score := NeuralExp(FAttn.FData[pos] - MaxScore);
-        FAttn.FData[pos] := Score;
-        SumExp := SumExp + Score;
-      end;
+      // The band is contiguous, so the shift, the exp and the normalizer are
+      // one fused vectorized pass (#19).
+      BandLen := jHi - jLo + 1;
+      AttnRowPtr := FAttn.GetRawPtr(AttnRow + jLo);
+      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+        BandLen);
       if SumExp > 0 then
-        TNNetVolume.Mul(FAttn.GetRawPtr(AttnRow + jLo), 1 / SumExp,
-          jHi - jLo + 1);
+        TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, BandLen);
     end;
     OutPtr := FOutput.GetRawPtr(i, 0);
     FillChar(OutPtr^, RowBytes, 0);
@@ -41133,7 +41116,7 @@ var
   RowStride, TwoFDk, posK, posV, RowBytes: integer;
   Score, MaxScore, SumExp, bias: TNeuralFloat;
   Prev: TNNetVolume;
-  OutPtr, QueryPtr: TNeuralFloatArrPtr;
+  OutPtr, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
   if FCacheEnabled then
   begin
@@ -41195,16 +41178,13 @@ begin
     end
     else
     begin
-      SumExp := 0;
-      for j := 0 to SeqLenM1 do
-      begin
-        pos := AttnRow + j;
-        Score := NeuralExp(FAttn.FData[pos] - MaxScore);
-        FAttn.FData[pos] := Score;
-        SumExp := SumExp + Score;
-      end;
+      // The score row is contiguous, so the shift, the exp and the normalizer
+      // are one fused vectorized pass (#19).
+      AttnRowPtr := FAttn.GetRawPtr(AttnRow);
+      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+        SeqLen);
       if SumExp > 0 then
-        TNNetVolume.Mul(FAttn.GetRawPtr(0, i), 1 / SumExp, SeqLen);
+        TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
     end;
     OutPtr := FOutput.GetRawPtr(i, 0);
     FillChar(OutPtr^, RowBytes, 0);
@@ -41483,7 +41463,7 @@ var
   RowStride, TwoFDk, posK, posV, RowBytes: integer;
   Score, MaxScore, SumExp: TNeuralFloat;
   Prev: TNNetVolume;
-  OutPtr, Bias, BiasRow, QueryPtr: TNeuralFloatArrPtr;
+  OutPtr, Bias, BiasRow, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -41522,16 +41502,13 @@ begin
     end
     else
     begin
-      SumExp := 0;
-      for j := 0 to SeqNM1 do
-      begin
-        pos := AttnRow + j;
-        Score := NeuralExp(FAttn.FData[pos] - MaxScore);
-        FAttn.FData[pos] := Score;
-        SumExp := SumExp + Score;
-      end;
+      // The score row is contiguous, so the shift, the exp and the normalizer
+      // are one fused vectorized pass (#19).
+      AttnRowPtr := FAttn.GetRawPtr(AttnRow);
+      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+        SeqN);
       if SumExp > 0 then
-        TNNetVolume.Mul(FAttn.GetRawPtr(0, i), 1 / SumExp, SeqN);
+        TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqN);
     end;
     OutPtr := FOutput.GetRawPtr(i, 0);
     FillChar(OutPtr^, RowBytes, 0);
@@ -41601,7 +41578,7 @@ var
   RowStride, TwoFDk, KnStride, posKn, posV, RowBytes: integer;
   Score, MaxScore, SumExp, SumSq, InvN, Scale: TNeuralFloat;
   Prev: TNNetVolume;
-  OutPtr, Bias, BiasRow, QnPtr, QPtr, KPtr, KnPtr: TNeuralFloatArrPtr;
+  OutPtr, Bias, BiasRow, QnPtr, QPtr, KPtr, KnPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -41654,16 +41631,13 @@ begin
     end
     else
     begin
-      SumExp := 0;
-      for j := 0 to SeqNM1 do
-      begin
-        pos := AttnRow + j;
-        Score := NeuralExp(FAttn.FData[pos] - MaxScore);
-        FAttn.FData[pos] := Score;
-        SumExp := SumExp + Score;
-      end;
+      // The score row is contiguous, so the shift, the exp and the normalizer
+      // are one fused vectorized pass (#19).
+      AttnRowPtr := FAttn.GetRawPtr(AttnRow);
+      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+        SeqN);
       if SumExp > 0 then
-        TNNetVolume.Mul(FAttn.GetRawPtr(0, i), 1 / SumExp, SeqN);
+        TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqN);
     end;
     OutPtr := FOutput.GetRawPtr(i, 0);
     FillChar(OutPtr^, RowBytes, 0);
@@ -42130,7 +42104,7 @@ var
   RowStride, TwoFDk, posK, posV, RowS, pos, RowBytes: integer;
   Score, MaxScore, SumExp: TNeuralFloat;
   Prev: TNNetVolume;
-  OutPtr, QueryPtr: TNeuralFloatArrPtr;
+  OutPtr, QueryPtr, RowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -42193,17 +42167,13 @@ begin
         MaxScore := Score;
       Inc(posK, RowStride);
     end;
-    // 2) Softmax over the augmented row (numerically stable).
-    SumExp := 0;
-    for j := 0 to AugLenM1 do
-    begin
-      pos := Row + j;                     // (#4)
-      Score := NeuralExp(FSinkAttn.FData[pos] - MaxScore);
-      FSinkAttn.FData[pos] := Score;
-      SumExp := SumExp + Score;
-    end;
+    // 2) Softmax over the augmented row (numerically stable). The augmented row
+    // is contiguous, so the shift, the exp and the normalizer are one fused
+    // vectorized pass (#19).
+    RowPtr := FSinkAttn.GetRawPtr(Row);
+    SumExp := TNNetVolume.VectorExpShiftSum(RowPtr, RowPtr, MaxScore, AugLen);
     if SumExp > 0 then
-      TNNetVolume.Mul(FSinkAttn.GetRawPtr(0, i), 1 / SumExp, AugLen);
+      TNNetVolume.Mul(RowPtr, 1 / SumExp, AugLen);
     // 3) Output[i, d] = sum_s w_sink[s]*SinkValue[s,d] + sum_j w_real[j]*V[j,d].
     // Sink values and V are contiguous along depth, so accumulate s-outer then
     // j-outer with AVX MulAdd over FDk floats into the zeroed output row (the
@@ -42413,7 +42383,7 @@ var
   RowStride, TwoFDk, posK, posV, RowBytes: integer;
   Score, MaxScore, SumExp, Sink: TNeuralFloat;
   Prev: TNNetVolume;
-  OutPtr, QueryPtr: TNeuralFloatArrPtr;
+  OutPtr, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -42451,16 +42421,14 @@ begin
     end;
     // 2) Softmax with the sink term in the denominator only (the sink column is
     //    never written into FAttn and contributes nothing to the output).
-    SumExp := NeuralExp(Sink - MaxScore);
-    for j := 0 to SeqLenM1 do
-    begin
-      pos := AttnRow + j;
-      Score := NeuralExp(FAttn.FData[pos] - MaxScore);
-      FAttn.FData[pos] := Score;
-      SumExp := SumExp + Score;
-    end;
+    //    The real-key score row is contiguous, so the shift, the exp and the
+    //    row's contribution to the normalizer are one fused vectorized pass
+    //    (#19); the sink term seeds the denominator.
+    AttnRowPtr := FAttn.GetRawPtr(AttnRow);
+    SumExp := NeuralExp(Sink - MaxScore) +
+      TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore, SeqLen);
     if SumExp > 0 then
-      TNNetVolume.Mul(FAttn.GetRawPtr(0, i), 1 / SumExp, SeqLen);
+      TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
     // 3) Output[i, d] = sum_j Attn[i,j] * V[j,d] (V contiguous along depth).
     OutPtr := FOutput.GetRawPtr(i, 0);
     FillChar(OutPtr^, RowBytes, 0);
@@ -42634,7 +42602,7 @@ var
   SeqLenM1, FDkM1: integer;
   Score1, Score2, Max1, Max2, Sum1, Sum2, lambdaVal: TNeuralFloat;
   Prev: TNNetVolume;
-  OutPtr, QPtr1, QPtr2: TNeuralFloatArrPtr;
+  OutPtr, QPtr1, QPtr2, Row1Ptr, Row2Ptr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
@@ -42686,24 +42654,19 @@ begin
       if FAttn2.FData[AttnIdx] > Max2 then Max2 := FAttn2.FData[AttnIdx];
       Inc(posK, RowStride);
     end;
-    // 2) Two numerically-stable softmaxes.
-    Sum1 := 0;
-    Sum2 := 0;
-    for j := 0 to SeqLenM1 do
-    begin
-      AttnIdx := Row + j;
-      Score1 := NeuralExp(FAttn.FData[AttnIdx] - Max1);
-      FAttn.FData[AttnIdx] := Score1;
-      Sum1 := Sum1 + Score1;
-      Score2 := NeuralExp(FAttn2.FData[AttnIdx] - Max2);
-      FAttn2.FData[AttnIdx] := Score2;
-      Sum2 := Sum2 + Score2;
-    end;
+    // 2) Two numerically-stable softmaxes. Each map's row is contiguous, so
+    //    the shift, the exp and the normalizer are one fused vectorized pass
+    //    per map (#19) - the interleaved scalar loop covered both at once but
+    //    neither vectorizably.
+    Row1Ptr := FAttn.GetRawPtr(Row);
+    Row2Ptr := FAttn2.GetRawPtr(Row);
+    Sum1 := TNNetVolume.VectorExpShiftSum(Row1Ptr, Row1Ptr, Max1, SeqLen);
+    Sum2 := TNNetVolume.VectorExpShiftSum(Row2Ptr, Row2Ptr, Max2, SeqLen);
     // Normalize each contiguous length-SeqLen row with one AVX scale (#13).
     if Sum1 > 0 then
-      TNNetVolume.Mul(FAttn.GetRawPtr(0, i), 1 / Sum1, SeqLenM1 + 1);
+      TNNetVolume.Mul(Row1Ptr, 1 / Sum1, SeqLen);
     if Sum2 > 0 then
-      TNNetVolume.Mul(FAttn2.GetRawPtr(0, i), 1 / Sum2, SeqLenM1 + 1);
+      TNNetVolume.Mul(Row2Ptr, 1 / Sum2, SeqLen);
     // 3) Output[i,d] = sum_j (Attn1[i,j] - lambdaVal*Attn2[i,j]) * V[j,d]. V is
     //    contiguous along depth, so accumulate j-outer with AVX MulAdd over FDk
     //    floats (the old d-outer / j-inner order was strided over j).
