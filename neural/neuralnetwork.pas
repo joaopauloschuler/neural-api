@@ -123652,11 +123652,25 @@ procedure TNNetLayer.ComputeErrorDeriv();
         FActivationFnDerivative(FOutputRaw.FData[OutputCnt]);
     end;
   end;
+  // ReLU derivative is 1 above zero and 0 below, so the generic
+  // err * f'(raw) reduces to a copy-or-zero: no indirect call, no multiply.
+  procedure ReluComputeErrorDeriv();
+  var
+    MaxOutput, OutputCnt: integer;
+  begin
+    MaxOutput := OutputError.Size - 1;
+    for OutputCnt := 0 to MaxOutput do
+    begin
+      if FOutputRaw.FData[OutputCnt] > 0
+        then OutputErrorDeriv.FData[OutputCnt] := OutputError.FData[OutputCnt]
+        else OutputErrorDeriv.FData[OutputCnt] := 0;
+    end;
+  end;
 begin
   {$IFDEF FPC}
   if FActivationFn = @RectifiedLinearUnit then
   begin
-    FallbackComputeErrorDeriv();
+    ReluComputeErrorDeriv();
   end
   else if FActivationFn = @Identity then
   begin

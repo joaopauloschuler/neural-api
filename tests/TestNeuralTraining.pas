@@ -30,6 +30,7 @@ type
     procedure TestLionOptimizer;
     procedure TestAdafactorOptimizer;
     procedure TestAdafactorUsesFewerBuffersThanAdam;
+    procedure TestReluErrorDerivIsGated;
     procedure TestMuonOptimizer;
     procedure TestMuonOrthogonalizesUpdate;
     
@@ -752,6 +753,54 @@ begin
     NN.Free;
     Input.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestReluErrorDerivIsGated;
+var
+  NN: TNNet;
+  Layer: TNNetLayer;
+  Input: TNNetVolume;
+  I, MaxI: integer;
+  Raw, Err, Expected: TNeuralFloat;
+begin
+  // TNNetLayer.ComputeErrorDeriv() on a ReLU layer must produce exactly
+  // err * relu'(raw): the error where the raw pre-activation is positive and a
+  // hard zero elsewhere (relu'(0) = 0).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer([
+      TNNetInput.Create(4),
+      TNNetFullConnectReLU.Create(5)
+    ]);
+    Input.Fill(0.5);
+    NN.Compute(Input);
+
+    Layer := NN.Layers[1];
+    MaxI := Layer.OutputError.Size - 1;
+    AssertEquals('ReLU layer has 5 outputs', 4, MaxI);
+    for I := 0 to MaxI do
+    begin
+      // raw alternates sign and includes an exact zero at I = 2.
+      Layer.OutputRaw.FData[I] := (I - 2) * 1.5;
+      Layer.OutputError.FData[I] := 1.0 + I;
+      Layer.OutputErrorDeriv.FData[I] := -999;
+    end;
+
+    Layer.ComputeErrorDeriv();
+
+    for I := 0 to MaxI do
+    begin
+      Raw := (I - 2) * 1.5;
+      Err := 1.0 + I;
+      if Raw > 0 then Expected := Err else Expected := 0;
+      AssertEquals('ReLU error deriv at ' + IntToStr(I), Expected,
+        Layer.OutputErrorDeriv.FData[I], 0);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 
