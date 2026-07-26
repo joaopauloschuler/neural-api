@@ -688,6 +688,9 @@ type
     procedure TestEchoStateReservoirShapeInference;
     procedure TestEchoStateReservoirReadoutGradientCheck;
     procedure TestEchoStateReservoirSerializationRoundTrip;
+    procedure TestEchoStateReservoirLayoutDifferential;
+    procedure TestPerformerAttentionLayoutDifferential;
+    procedure TestFourierFeaturesLayoutDifferential;
     procedure TestLRUShapeInference;
     procedure TestLRUInputGradientCheck;
     procedure TestLRUWeightGradientCheck;
@@ -28910,6 +28913,174 @@ begin
       Bulk1, PrevErr.Get(2, 0, 1), 1e-5);
     AssertTrue('tie-break ch1: first tied max cell carries the correction',
       Abs(PrevErr.Get(1, 0, 1) - Bulk1) > 1e-3);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestEchoStateReservoirLayoutDifferential;
+const
+  cExpOut: array[0..19] of TNeuralFloat = (
+    -0.00337117, 0.22226083, -0.17821953, -0.05877850,
+    -0.21584703, -0.13499367, 0.00065395, -0.14909033,
+    -0.18727820, 0.10517648, 0.04884424, -0.20996980,
+    0.17968085, 0.12940370, -0.07638041, 0.06862924,
+    0.08621201, -0.07475190, 0.01986950, -0.28145012);
+  cExpPrevErr: array[0..11] of TNeuralFloat = (
+    -0.58274925, -0.23823184, -0.61273241, -1.16038644,
+    -0.14601883, -0.61355627, 0.24615958, 0.00148377,
+    -0.32018209, -0.46820801, -0.25316310, -0.28909394);
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i: integer;
+  Outp, PrevErr: TNNetVolume;
+begin
+  // Differential pin against the ORIGINAL matrix layout: these numbers were
+  // produced by the pre-transpose code. A wrong transpose stays internally
+  // consistent (so a gradient check still passes) but moves every weight, and
+  // therefore shows up here immediately.
+  NN := TNNet.Create();
+  NN.AddLayer(TNNetInput.Create(4, 1, 3));
+  NN.AddLayer(TNNetIdentity.Create());
+  NN.AddLayer(TNNetEchoStateReservoir.Create(5, 0.3, 0.9, 0.6, 1.0, 20260726));
+  Input := TNNetVolume.Create(4, 1, 3);
+  Desired := TNNetVolume.Create(1, 1, 1);
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.FData[i] := Sin(i * 0.7) * 1.3 - 0.2;
+    NN.Compute(Input);
+    Outp := NN.GetLastLayer.Output;
+    AssertEquals('TestEchoStateReservoirLayoutDifferential output size', Length(cExpOut), Outp.Size);
+    for i := 0 to Outp.Size - 1 do
+      AssertEquals('TestEchoStateReservoirLayoutDifferential output ' + IntToStr(i), cExpOut[i],
+        Outp.FData[i], 1e-5);
+    // OutputError = Output - Desired, so this seeds gy_i = 0.25 + 0.1*i.
+    Desired.ReSize(Outp);
+    Desired.Copy(Outp);
+    for i := 0 to Desired.Size - 1 do
+      Desired.FData[i] := Desired.FData[i] - (0.25 + 0.1 * i);
+    NN.Backpropagate(Desired);
+    PrevErr := NN.Layers[1].OutputError;
+    AssertEquals('TestEchoStateReservoirLayoutDifferential input-gradient size', Length(cExpPrevErr),
+      PrevErr.Size);
+    for i := 0 to PrevErr.Size - 1 do
+      AssertEquals('TestEchoStateReservoirLayoutDifferential input gradient ' + IntToStr(i),
+        cExpPrevErr[i], PrevErr.FData[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestPerformerAttentionLayoutDifferential;
+const
+  cExpOut: array[0..11] of TNeuralFloat = (
+    0.16139428, -0.06610914, -0.25779068, -0.38187745,
+    0.16015971, -0.06204491, -0.24910131, -0.37000328,
+    -0.17812628, -0.25753859, -0.26939797, -0.21173860);
+  cExpPrevErr: array[0..35] of TNeuralFloat = (
+    0.04237496, -0.04034873, -0.02425725, 0.05994927,
+    0.17648318, 0.13613090, -0.29466766, -0.04291484,
+    0.58965456, 0.65566880, 0.72168285, 0.78769708,
+    0.06776384, -0.05045709, -0.03866348, 0.09904517,
+    -0.33691561, 0.00258160, 0.24158189, -0.21085782,
+    0.83374798, 0.97828966, 1.12283123, 1.26737297,
+    0.52436030, 0.20822261, -0.05429881, 0.38766068,
+    1.10773444, -0.37728947, -1.02991581, -0.61505604,
+    0.52659732, 0.61604172, 0.70548594, 0.79493028);
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i: integer;
+  Outp, PrevErr: TNNetVolume;
+begin
+  // Differential pin against the ORIGINAL matrix layout: these numbers were
+  // produced by the pre-transpose code. A wrong transpose stays internally
+  // consistent (so a gradient check still passes) but moves every weight, and
+  // therefore shows up here immediately.
+  NN := TNNet.Create();
+  NN.AddLayer(TNNetInput.Create(3, 1, 12));
+  NN.AddLayer(TNNetIdentity.Create());
+  NN.AddLayer(TNNetPerformerAttention.Create(4, 6, 987654));
+  Input := TNNetVolume.Create(3, 1, 12);
+  Desired := TNNetVolume.Create(1, 1, 1);
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.FData[i] := Cos(i * 0.41) * 0.8 + 0.15;
+    NN.Compute(Input);
+    Outp := NN.GetLastLayer.Output;
+    AssertEquals('TestPerformerAttentionLayoutDifferential output size', Length(cExpOut), Outp.Size);
+    for i := 0 to Outp.Size - 1 do
+      AssertEquals('TestPerformerAttentionLayoutDifferential output ' + IntToStr(i), cExpOut[i],
+        Outp.FData[i], 1e-5);
+    // OutputError = Output - Desired, so this seeds gy_i = 0.25 + 0.1*i.
+    Desired.ReSize(Outp);
+    Desired.Copy(Outp);
+    for i := 0 to Desired.Size - 1 do
+      Desired.FData[i] := Desired.FData[i] - (0.25 + 0.1 * i);
+    NN.Backpropagate(Desired);
+    PrevErr := NN.Layers[1].OutputError;
+    AssertEquals('TestPerformerAttentionLayoutDifferential input-gradient size', Length(cExpPrevErr),
+      PrevErr.Size);
+    for i := 0 to PrevErr.Size - 1 do
+      AssertEquals('TestPerformerAttentionLayoutDifferential input gradient ' + IntToStr(i),
+        cExpPrevErr[i], PrevErr.FData[i], 1e-5);
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestFourierFeaturesLayoutDifferential;
+const
+  cExpOut: array[0..7] of TNeuralFloat = (
+    -0.54869694, -0.97673708, 0.36765039, -0.17325871,
+    -0.83602130, -0.21444038, 0.92996407, 0.98487633);
+  cExpPrevErr: array[0..4] of TNeuralFloat = (
+    0.11956549, -5.45807934, -9.08976364, 2.53550601,
+    2.40470648);
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i: integer;
+  Outp, PrevErr: TNNetVolume;
+begin
+  // Differential pin against the ORIGINAL matrix layout: these numbers were
+  // produced by the pre-transpose code. A wrong transpose stays internally
+  // consistent (so a gradient check still passes) but moves every weight, and
+  // therefore shows up here immediately.
+  NN := TNNet.Create();
+  NN.AddLayer(TNNetInput.Create(5, 1, 1));
+  NN.AddLayer(TNNetIdentity.Create());
+  NN.AddLayer(TNNetFourierFeatures.Create(4, 0.7, 13579));
+  Input := TNNetVolume.Create(5, 1, 1);
+  Desired := TNNetVolume.Create(1, 1, 1);
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.FData[i] := Sin(i * 1.1) * 0.9;
+    NN.Compute(Input);
+    Outp := NN.GetLastLayer.Output;
+    AssertEquals('TestFourierFeaturesLayoutDifferential output size', Length(cExpOut), Outp.Size);
+    for i := 0 to Outp.Size - 1 do
+      AssertEquals('TestFourierFeaturesLayoutDifferential output ' + IntToStr(i), cExpOut[i],
+        Outp.FData[i], 1e-5);
+    // OutputError = Output - Desired, so this seeds gy_i = 0.25 + 0.1*i.
+    Desired.ReSize(Outp);
+    Desired.Copy(Outp);
+    for i := 0 to Desired.Size - 1 do
+      Desired.FData[i] := Desired.FData[i] - (0.25 + 0.1 * i);
+    NN.Backpropagate(Desired);
+    PrevErr := NN.Layers[1].OutputError;
+    AssertEquals('TestFourierFeaturesLayoutDifferential input-gradient size', Length(cExpPrevErr),
+      PrevErr.Size);
+    for i := 0 to PrevErr.Size - 1 do
+      AssertEquals('TestFourierFeaturesLayoutDifferential input gradient ' + IntToStr(i),
+        cExpPrevErr[i], PrevErr.FData[i], 1e-5);
   finally
     NN.Free;
     Input.Free;
