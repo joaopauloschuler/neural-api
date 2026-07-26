@@ -799,10 +799,29 @@ type
       FNGramSize: integer;
       FHistory: TNeuralIntegerArray;
       FLen: integer;
-      // Rule #17: persistent vocab-size ban buffer, lazily grown, cleared
-      // per call with FillChar - never re-allocated per token.
+      // Rule #17: persistent vocab-size ban membership, lazily grown. Only the
+      // handful of slots listed in FBannedIds is ever set, so each call clears
+      // exactly those instead of wiping the whole vocabulary.
       FBanBuf: array of boolean;
+      FBannedIds: array of integer;
+      FBannedProb: array of TNeuralFloat; // pre-ban values, for the fallback
+      FBannedCount: integer;
+      // Incremental n-gram index (rule #27): an open-addressed, insert-only
+      // table of n-gram START positions in FHistory. A slot holds a position J
+      // (-1 = empty) whose key is FHistory[J..J+NGramSize-2] and whose follower
+      // is FHistory[J+NGramSize-1]. Linear probing plus insert-only means every
+      // entry sharing a home bucket sits between that bucket and the next empty
+      // slot, so one probe run finds them all. FIdxLen is the history length
+      // already covered; Reset rewinds it, each step extends it by one n-gram.
+      FIdxSlot: array of integer;
+      FIdxMask: integer;   // Length(FIdxSlot) - 1; the table is a power of two
+      FIdxCount: integer;
+      FIdxLen: integer;
       procedure AppendToken(TokenId: integer);
+      function NGramHash(Pos: integer): cardinal;
+      procedure IndexGrow();
+      procedure IndexInsert(Pos: integer);
+      procedure EnsureIndex();
     public
       constructor Create(pNGramSize: integer);
       procedure Reset(const PromptTokens: array of integer); override;
@@ -4765,80 +4784,167 @@ end;
 procedure TNNetNoRepeatNGramProcessor.Reset(
   const PromptTokens: array of integer);
 var
-  I, Hi: integer;
+  I, Hi, SlotHi: integer;
 begin
   // Fresh sequence: the history is the WHOLE context (prompt tokens), so the
   // first generated step already sees prompt n-grams (HF semantics).
   FLen := 0;
   Hi := High(PromptTokens);
   for I := 0 to Hi do AppendToken(PromptTokens[I]);
+  // Rewind the index; the table capacity is kept for the next run.
+  FIdxLen := 0;
+  FIdxCount := 0;
+  SlotHi := High(FIdxSlot);
+  for I := 0 to SlotHi do FIdxSlot[I] := -1;
+end;
+
+// FNV-1a over the (NGramSize-1)-token key at Pos. The multiply/xor mixing
+// wraps around cardinal on purpose: checks stay off here even in debug builds,
+// where -Co would turn the wrap into EIntOverflow.
+{$PUSH}
+{$Q-}{$R-}
+function TNNetNoRepeatNGramProcessor.NGramHash(Pos: integer): cardinal;
+var
+  K, KeyHi: integer;
+  H: cardinal;
+begin
+  H := 2166136261;
+  KeyHi := FNGramSize - 2; // NGramSize-1 key tokens
+  for K := 0 to KeyHi do
+    H := (H xor cardinal(FHistory[Pos + K])) * 16777619;
+  Result := H;
+end;
+{$POP}
+
+procedure TNNetNoRepeatNGramProcessor.IndexGrow();
+var
+  Old: array of integer;
+  I, OldHi, NewLen, Pos, Slot: integer;
+begin
+  // Amortized doubling of a persistent field (rule #17): O(log n) times per
+  // generation, never per token.
+  NewLen := Length(FIdxSlot) * 2;
+  if NewLen < 64 then NewLen := 64;
+  Old := FIdxSlot;
+  OldHi := High(Old);
+  FIdxSlot := nil;
+  SetLength(FIdxSlot, NewLen);
+  FIdxMask := NewLen - 1;
+  for I := 0 to NewLen - 1 do FIdxSlot[I] := -1;
+  for I := 0 to OldHi do
+  begin
+    Pos := Old[I];
+    if Pos < 0 then continue;
+    Slot := NGramHash(Pos) and FIdxMask;
+    while FIdxSlot[Slot] >= 0 do Slot := (Slot + 1) and FIdxMask;
+    FIdxSlot[Slot] := Pos;
+  end;
+end;
+
+procedure TNNetNoRepeatNGramProcessor.IndexInsert(Pos: integer);
+var
+  Slot: integer;
+begin
+  // Keep the load factor at or below 3/4 so a probe run always ends on an
+  // empty slot.
+  if (FIdxCount + 1) * 4 > Length(FIdxSlot) * 3 then IndexGrow();
+  Slot := NGramHash(Pos) and FIdxMask;
+  while FIdxSlot[Slot] >= 0 do Slot := (Slot + 1) and FIdxMask;
+  FIdxSlot[Slot] := Pos;
+  Inc(FIdxCount);
+end;
+
+procedure TNNetNoRepeatNGramProcessor.EnsureIndex();
+var
+  NM1, J, StartJ, EndJ: integer;
+begin
+  // Index every n-gram start position that fits in the history: J is valid
+  // while J+NGramSize-1 <= FLen-1. FIdxLen records how much history is already
+  // covered, so a step normally inserts exactly one new position.
+  NM1 := FNGramSize - 1;
+  StartJ := FIdxLen - NM1;
+  if StartJ < 0 then StartJ := 0;
+  EndJ := FLen - NM1 - 1;
+  for J := StartJ to EndJ do IndexInsert(J);
+  FIdxLen := FLen;
 end;
 
 procedure TNNetNoRepeatNGramProcessor.ProcessRow(Row: TNNetVolume);
 var
-  I, J, K, Size, SuffixStart, Last, NM1, Banned: integer;
-  SizeM1, SuffixStartM1, NM1M1: integer;
-  Match: boolean;
+  I, Size, SuffixStart, Slot, Pos, Last, NM1, KeyBytes, Id: integer;
+  BannedCountM1: integer;
   KeptMass, InvKept: TNeuralFloat;
 begin
   // OFF: an n-gram of size <= 1 has no (n-1)-suffix to key on.
   if FNGramSize <= 1 then exit;
   NM1 := FNGramSize - 1;
-  NM1M1 := NM1 - 1;
   // Need at least NM1 history tokens to form the suffix AND one preceding
   // n-gram (a position p with the same suffix and a follower): the earliest
   // such follower sits at index FNGramSize-1, so we need FLen >= FNGramSize.
   if FLen < FNGramSize then exit;
   Size := Row.Size;
-  SizeM1 := Size - 1;
+  // Clear ONLY what the previous call set (rule #13 would still be a whole
+  // vocabulary pass; the ban set is a handful of ids).
+  BannedCountM1 := FBannedCount - 1;
+  for I := 0 to BannedCountM1 do FBanBuf[FBannedIds[I]] := false;
+  FBannedCount := 0;
   if Length(FBanBuf) < Size then SetLength(FBanBuf, Size);
-  FillChar(FBanBuf[0], Size * SizeOf(boolean), 0);
-  // Current (n-1)-token suffix is the LAST NM1 tokens of the history.
+  EnsureIndex();
+  // Current (n-1)-token suffix is the LAST NM1 tokens of the history. The
+  // banned continuations are the followers of every earlier occurrence of that
+  // same suffix - exactly the index entries whose key equals it. The index
+  // covers J in [0, FLen-NM1-1] = [0, SuffixStart-1], the range the linear
+  // history rescan used to walk per token.
   SuffixStart := FLen - NM1;
-  SuffixStartM1 := SuffixStart - 1;
-  Banned := 0;
-  // Scan every position whose n-gram ENDS at or before the suffix start, i.e.
-  // its (n-1)-prefix could match the current suffix and its follower (the
-  // token at J+NM1) is the banned continuation. J ranges so that J+NM1 is a
-  // valid index BEFORE the current suffix (J+NM1 <= SuffixStart-1 would be too
-  // strict; the standard scan allows the follower up to FLen-1 of the prefix
-  // window, which is index FLen-NM1-1 + ... ). Concretely: for each start J
-  // with J in [0, SuffixStart-1], if history[J..J+NM1-1] = suffix then ban
-  // history[J+NM1].
-  for J := 0 to SuffixStartM1 do
+  KeyBytes := NM1 * csIntegerSize;
+  Slot := NGramHash(SuffixStart) and FIdxMask;
+  while FIdxSlot[Slot] >= 0 do
   begin
-    Match := true;
-    for K := 0 to NM1M1 do
-      if FHistory[J + K] <> FHistory[SuffixStart + K] then
-      begin
-        Match := false;
-        break;
-      end;
-    if Match then
+    Pos := FIdxSlot[Slot];
+    // Exact integer key equality via CompareMem (mirrors ScratchHas).
+    if CompareMem(@FHistory[Pos], @FHistory[SuffixStart], KeyBytes) then
     begin
-      Last := FHistory[J + NM1];
+      Last := FHistory[Pos + NM1];
       if (Last >= 0) and (Last < Size) and (not FBanBuf[Last]) then
       begin
         FBanBuf[Last] := true;
-        Inc(Banned);
+        if FBannedCount >= Length(FBannedIds) then
+        begin
+          SetLength(FBannedIds, (FBannedCount + 1) * 2);
+          SetLength(FBannedProb, (FBannedCount + 1) * 2);
+        end;
+        FBannedIds[FBannedCount] := Last;
+        Inc(FBannedCount);
       end;
     end;
+    Slot := (Slot + 1) and FIdxMask;
   end;
-  if Banned = 0 then exit;
+  if FBannedCount = 0 then exit;
   // Probability-domain ban: zero the banned tokens and renormalize the
-  // surviving mass (image of logit -> -inf before softmax). Zero-mass
-  // fallback (every surviving token has zero prob, or all were banned): leave
-  // the row UNTOUCHED, mirroring MaskAllowed.
-  KeptMass := 0;
-  for I := 0 to SizeM1 do
-    if not FBanBuf[I] then KeptMass := KeptMass + Row.Raw[I];
-  if KeptMass <= 0 then exit;
+  // surviving mass (image of logit -> -inf before softmax). Zeroing FIRST lets
+  // GetSum (one AVX pass) produce the kept mass, replacing two branchy
+  // vocabulary loops. The row is a probability distribution (no negative
+  // entries), so the sum of the kept values is zero exactly when every one of
+  // them is zero - the zero-mass fallback (leave the row UNTOUCHED, mirroring
+  // MaskAllowed) therefore fires on exactly the same inputs as the masked
+  // accumulation it replaces.
+  BannedCountM1 := FBannedCount - 1;
+  for I := 0 to BannedCountM1 do
+  begin
+    Id := FBannedIds[I];
+    FBannedProb[I] := Row.Raw[Id];
+    Row.Raw[Id] := 0;
+  end;
+  KeptMass := Row.GetSum();
+  if KeptMass <= 0 then
+  begin
+    for I := 0 to BannedCountM1 do Row.Raw[FBannedIds[I]] := FBannedProb[I];
+    exit;
+  end;
   InvKept := 1.0 / KeptMass;
-  // #13/#18: scale the whole row once (AVX in-place), then zero the banned
-  // entries. Bit-identical (see MaskAllowed).
+  // #13/#18: scale the whole row once (AVX in-place); the banned entries are
+  // already zero and stay zero.
   Row.Mul(InvKept);
-  for I := 0 to SizeM1 do
-    if FBanBuf[I] then Row.Raw[I] := 0;
 end;
 
 procedure TNNetNoRepeatNGramProcessor.Commit(TokenId: integer);

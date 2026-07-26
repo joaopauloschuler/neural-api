@@ -220,6 +220,7 @@ type
     procedure TestTemperatureProcessorProbabilityDomainMath;
     procedure TestProcessorChainOrderMatters;
     procedure TestNoRepeatNGramBansSeenBigramAndTrigram;
+    procedure TestNoRepeatNGramMatchesRescanReference;
     procedure TestNoOpChainAndConfigBitIdenticalToPlainPath;
     procedure TestGenerateWithConfigMatchesHandAssembled;
     procedure TestTemperatureNearZeroWithSamplerMatchesGreedy;
@@ -4186,6 +4187,93 @@ begin
         0.0, Row.Raw[I], 1e-6);
   finally
     Proc.Free;
+    Row.Free;
+  end;
+end;
+
+// DIFFERENTIAL: the incremental n-gram index must ban EXACTLY the set the
+// straightforward history rescan bans, over random prompts and random emitted
+// continuations. A row of strictly positive values makes the ban set directly
+// observable: a banned id is exactly a zeroed id (unless every id is banned,
+// where the zero-mass fallback leaves the row untouched).
+procedure TTestNeuralDecode.TestNoRepeatNGramMatchesRescanReference;
+const
+  VocabSize = 12;
+  KeyAlphabet = 5; // small, so suffixes repeat often
+var
+  Proc: TNNetNoRepeatNGramProcessor;
+  Row: TNNetVolume;
+  Hist: array of integer;
+  Prompt: array of integer;
+  RefBan: array[0..VocabSize - 1] of boolean;
+  N, Trial, Step, I, J, K, HLen, SuffixStart, RefCount, Tok: integer;
+  Match, Expected: boolean;
+  Msg: string;
+begin
+  RandSeed := 20260726;
+  Row := TNNetVolume.Create(VocabSize, 1, 1);
+  try
+    for N := 2 to 4 do
+    for Trial := 1 to 20 do
+    begin
+      Proc := TNNetNoRepeatNGramProcessor.Create(N);
+      try
+        SetLength(Prompt, Random(20));
+        for I := 0 to High(Prompt) do Prompt[I] := Random(KeyAlphabet);
+        Proc.Reset(Prompt);
+        SetLength(Hist, Length(Prompt));
+        for I := 0 to High(Prompt) do Hist[I] := Prompt[I];
+        for Step := 1 to 12 do
+        begin
+          for I := 0 to VocabSize - 1 do Row.Raw[I] := 0.01 + Random();
+          // Reference: rescan the whole history for the current (N-1)-suffix
+          // and ban every follower found before it.
+          for I := 0 to VocabSize - 1 do RefBan[I] := false;
+          RefCount := 0;
+          HLen := Length(Hist);
+          if HLen >= N then
+          begin
+            SuffixStart := HLen - (N - 1);
+            for J := 0 to SuffixStart - 1 do
+            begin
+              Match := true;
+              for K := 0 to N - 2 do
+                if Hist[J + K] <> Hist[SuffixStart + K] then
+                begin
+                  Match := false;
+                  break;
+                end;
+              if Match and (not RefBan[Hist[J + N - 1]]) then
+              begin
+                RefBan[Hist[J + N - 1]] := true;
+                Inc(RefCount);
+              end;
+            end;
+          end;
+          Proc.ProcessRow(Row);
+          Msg := 'n=' + IntToStr(N) + ' trial ' + IntToStr(Trial) + ' step ' +
+            IntToStr(Step);
+          for I := 0 to VocabSize - 1 do
+          begin
+            // All-banned would trip the zero-mass fallback (row untouched);
+            // the row values are strictly positive so it cannot happen here
+            // unless every id is banned.
+            Expected := RefBan[I] and (RefCount < VocabSize);
+            if Expected <> (Row.Raw[I] = 0.0) then
+              Fail(Msg + ': id ' + IntToStr(I) + ' banned=' +
+                BoolToStr(RefBan[I], true) + ' zeroed=' +
+                BoolToStr(Row.Raw[I] = 0.0, true));
+          end;
+          Tok := Random(KeyAlphabet);
+          Proc.Commit(Tok);
+          SetLength(Hist, Length(Hist) + 1);
+          Hist[High(Hist)] := Tok;
+        end;
+      finally
+        Proc.Free;
+      end;
+    end;
+  finally
     Row.Free;
   end;
 end;
