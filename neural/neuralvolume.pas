@@ -8150,12 +8150,21 @@ begin
   begin
     Result := FData[0];
     vHigh := High(FData);
-    if vHigh > 0 then
+    // Eight accumulations per iteration into the one left-associated chain, so
+    // the summation order - and therefore the result - is exactly the
+    // element-at-a-time loop's, at a fraction of the loop overhead. This is the
+    // fallback used on every build without AVXANY (AArch64, PowerPC, Delphi).
+    I := 1;
+    while I <= vHigh - 7 do
     begin
-      for I := 1 to vHigh do
-      begin
-        Result := Result + FData[I];
-      end;
+      Result := Result + FData[I] + FData[I+1] + FData[I+2] + FData[I+3] +
+        FData[I+4] + FData[I+5] + FData[I+6] + FData[I+7];
+      Inc(I, 8);
+    end;
+    while I <= vHigh do
+    begin
+      Result := Result + FData[I];
+      Inc(I);
     end;
   end
   else
