@@ -2622,7 +2622,7 @@ type
   // not underflow. When L = 0, or when L*2+1 > T makes the target unalignable,
   // the gradient is left at zero for that sample (the loss is +inf / undefined).
   //
-  // The scalar CTC loss itself (-log p(l|x)) is exposed by the class method
+  // The scalar CTC loss itself (-log p(l|x)) is exposed by the instance method
   // ForwardBackwardLogLoss for diagnostics / the numerical-gradient test.
   // No trainable parameters; output shape equals input shape.
   // Coded by Claude (AI).
@@ -2630,6 +2630,11 @@ type
   private
     // Persistent, lazily-sized backprop scratch volumes (rule #17).
     FCTCTarget, FCTCGrad: TNNetVolume;
+    // Persistent, lazily-sized forward-backward lattices, stored FLAT as
+    // ti*NS + si (rule #17). Double is deliberate: these are log-space
+    // accumulators (the stated exception to rule #25).
+    FAlphaFlat, FBetaFlat: array of double;
+    FExtBuf: TNeuralIntegerArray;   // extended label l', length NS
   public
     constructor Create(); overload; override;
     constructor Create(Blank: integer); reintroduce; overload;
@@ -2648,7 +2653,9 @@ type
     // LOG-probabilities; returns the CTC loss -log p(Labels|ALogProbs) and, when
     // AGrad <> nil, fills it (same shape) with dL/d(logp) = -gamma_{t,k}. Returns
     // a large positive sentinel (and zero grad) when the target is unalignable.
-    class function ForwardBackwardLogLoss(ALogProbs: TNNetVolume;
+    // An instance method (not a class method) because the lattices live in
+    // per-layer scratch fields.
+    function ForwardBackwardLogLoss(ALogProbs: TNNetVolume;
       const Labels: array of integer; Blank: integer; AGrad: TNNetVolume): TNeuralFloat;
   end;
 
@@ -26435,16 +26442,14 @@ begin
     Labels[i] := Round(ATarget[0, 0, 1 + i]);
 end;
 
-class function TNNetCTCLoss.ForwardBackwardLogLoss(ALogProbs: TNNetVolume;
+function TNNetCTCLoss.ForwardBackwardLogLoss(ALogProbs: TNNetVolume;
   const Labels: array of integer; Blank: integer; AGrad: TNNetVolume): TNeuralFloat;
 const
   cCTCUnalignable = 1e30; // returned when L*2+1 > T (target cannot be aligned)
   cNegInf = -1e30;
 var
   NT, L, NS, NTM1, NSM1, VocabM1, LM1, ti, si, i: integer;
-  NTM2, GradBase, GradIdx: integer;
-  Ext: array of integer;          // extended label l' (blank-interleaved), length NS
-  Alpha, Beta: array of array of double; // [ti][si] log-space lattice
+  NTM2, GradBase, GradIdx, Cells, Row, RowPrev, RowNext: integer;
   LogLike, av, bv, occ: double;
   function LP(volume: TNNetVolume; tt, kk: integer): double; inline;
   begin
@@ -26475,65 +26480,89 @@ begin
     Exit;
   end;
   NSM1 := NS - 1;
-  SetLength(Ext, NS);
+  // #17: lazy, amortized growth of the persistent scratch - never a per-call
+  // allocation. The lattices are FLAT (ti*NS + si), which also removes the
+  // double indirection Alpha[ti][si] paid on every access of three O(NT*NS)
+  // nests.
+  if Length(FExtBuf) < NS then SetLength(FExtBuf, NS);
+  Cells := NT * NS;
+  if Length(FAlphaFlat) < Cells then SetLength(FAlphaFlat, Cells);
+  if Length(FBetaFlat) < Cells then SetLength(FBetaFlat, Cells);
   for i := 0 to LM1 do
   begin
-    Ext[2 * i] := Blank;
-    Ext[2 * i + 1] := Labels[i];
+    FExtBuf[2 * i] := Blank;
+    FExtBuf[2 * i + 1] := Labels[i];
   end;
-  Ext[NS - 1] := Blank;
+  FExtBuf[NSM1] := Blank;
   // Clamp the symbol ids into the vocabulary once, so both the lattice reads
   // (LP indexes by Ext[si]) and the gradient scatter below stay in bounds
   // without a per-element range test.
   VocabM1 := ALogProbs.Depth - 1;
   for i := 0 to NSM1 do
   begin
-    if Ext[i] < 0 then Ext[i] := 0
-    else if Ext[i] > VocabM1 then Ext[i] := VocabM1;
+    if FExtBuf[i] < 0 then FExtBuf[i] := 0
+    else if FExtBuf[i] > VocabM1 then FExtBuf[i] := VocabM1;
   end;
 
-  SetLength(Alpha, NT, NS);
-  SetLength(Beta, NT, NS);
-  for ti := 0 to NTM1 do
-    for si := 0 to NSM1 do
-    begin
-      Alpha[ti][si] := cNegInf;
-      Beta[ti][si] := cNegInf;
-    end;
+  // The scratch may be larger than this call needs, so every cell in
+  // [0, NT*NS) is explicitly seeded here before it is ever read.
+  for i := 0 to Cells - 1 do
+  begin
+    FAlphaFlat[i] := cNegInf;
+    FBetaFlat[i] := cNegInf;
+  end;
 
   // Forward (alpha). Init: at ti=0 only the first blank or first label.
-  Alpha[0][0] := LP(ALogProbs, 0, Ext[0]);
-  if NS > 1 then Alpha[0][1] := LP(ALogProbs, 0, Ext[1]);
+  FAlphaFlat[0] := LP(ALogProbs, 0, FExtBuf[0]);
+  if NS > 1 then FAlphaFlat[1] := LP(ALogProbs, 0, FExtBuf[1]);
+  Row := NS;          // #6: carry ti*NS instead of re-multiplying it
+  RowPrev := 0;
   for ti := 1 to NTM1 do
+  begin
     for si := 0 to NSM1 do
     begin
-      av := Alpha[ti - 1][si];
-      if si >= 1 then av := LogAdd(av, Alpha[ti - 1][si - 1]);
+      av := FAlphaFlat[RowPrev + si];
+      if si >= 1 then av := LogAdd(av, FAlphaFlat[RowPrev + si - 1]);
       // Skip transition allowed only between two DISTINCT non-blank labels.
-      if (si >= 2) and (Ext[si] <> Blank) and (Ext[si] <> Ext[si - 2]) then
-        av := LogAdd(av, Alpha[ti - 1][si - 2]);
-      Alpha[ti][si] := av + LP(ALogProbs, ti, Ext[si]);
+      if (si >= 2) and (FExtBuf[si] <> Blank) and
+         (FExtBuf[si] <> FExtBuf[si - 2]) then
+        av := LogAdd(av, FAlphaFlat[RowPrev + si - 2]);
+      FAlphaFlat[Row + si] := av + LP(ALogProbs, ti, FExtBuf[si]);
     end;
+    RowPrev := Row;
+    Inc(Row, NS);
+  end;
 
   // Backward (beta). Init: at ti=NT-1 only the last blank or last label.
-  Beta[NT - 1][NS - 1] := 0;
-  if NS > 1 then Beta[NT - 1][NS - 2] := 0;
+  Row := NTM1 * NS;
+  FBetaFlat[Row + NSM1] := 0;
+  if NS > 1 then FBetaFlat[Row + NSM1 - 1] := 0;
   NTM2 := NT - 2;
+  RowNext := Row;
+  Dec(Row, NS);
   for ti := NTM2 downto 0 do
+  begin
     for si := NSM1 downto 0 do
     begin
-      bv := Beta[ti + 1][si] + LP(ALogProbs, ti + 1, Ext[si]);
-      if si + 1 <= NS - 1 then
-        bv := LogAdd(bv, Beta[ti + 1][si + 1] + LP(ALogProbs, ti + 1, Ext[si + 1]));
-      if (si + 2 <= NS - 1) and (Ext[si] <> Blank) and (Ext[si] <> Ext[si + 2]) then
-        bv := LogAdd(bv, Beta[ti + 1][si + 2] + LP(ALogProbs, ti + 1, Ext[si + 2]));
-      Beta[ti][si] := bv;
+      bv := FBetaFlat[RowNext + si] + LP(ALogProbs, ti + 1, FExtBuf[si]);
+      if si + 1 <= NSM1 then
+        bv := LogAdd(bv, FBetaFlat[RowNext + si + 1] +
+          LP(ALogProbs, ti + 1, FExtBuf[si + 1]));
+      if (si + 2 <= NSM1) and (FExtBuf[si] <> Blank) and
+         (FExtBuf[si] <> FExtBuf[si + 2]) then
+        bv := LogAdd(bv, FBetaFlat[RowNext + si + 2] +
+          LP(ALogProbs, ti + 1, FExtBuf[si + 2]));
+      FBetaFlat[Row + si] := bv;
     end;
+    RowNext := Row;
+    Dec(Row, NS);
+  end;
 
   // Total log-likelihood = LogAdd of the two valid end states (last blank and
   // last label) at ti=NT-1 via alpha.
-  LogLike := Alpha[NT - 1][NS - 1];
-  if NS > 1 then LogLike := LogAdd(LogLike, Alpha[NT - 1][NS - 2]);
+  Row := NTM1 * NS;
+  LogLike := FAlphaFlat[Row + NSM1];
+  if NS > 1 then LogLike := LogAdd(LogLike, FAlphaFlat[Row + NSM1 - 1]);
 
   Result := -LogLike;
 
@@ -26546,18 +26575,20 @@ begin
   // vocabulary per frame: AGrad was zero-filled above, so a symbol that never
   // appears in Ext keeps the 0 the empty sum would have produced, and the
   // ascending-si accumulation order is unchanged. O(NT*NS), not O(NT*Vocab*NS).
+  Row := 0;   // #6: carry ti*NS
   for ti := 0 to NTM1 do
   begin
     GradBase := AGrad.GetRawPos(ti, 0);
     for si := 0 to NSM1 do
     begin
-      occ := Alpha[ti][si] + Beta[ti][si] - LogLike;
+      occ := FAlphaFlat[Row + si] + FBetaFlat[Row + si] - LogLike;
       if occ > cNegInf then
       begin
-        GradIdx := GradBase + Ext[si];
+        GradIdx := GradBase + FExtBuf[si];
         AGrad.FData[GradIdx] := AGrad.FData[GradIdx] - NeuralExp(occ);
       end;
     end;
+    Inc(Row, NS);
   end;
 end;
 
@@ -26587,7 +26618,7 @@ begin
 
   // Run the log-space forward-backward and write -gamma into FOutputError.
   // ForwardBackwardLogLoss ReSizes+Fills FCTCGrad internally (rule #17 scratch).
-  TNNetCTCLoss.ForwardBackwardLogLoss(FOutput, Labels, BlankIndex(), FCTCGrad);
+  ForwardBackwardLogLoss(FOutput, Labels, BlankIndex(), FCTCGrad);
   FOutputError.Copy(FCTCGrad);
 
   FBackwardTime := FBackwardTime + (Now() - StartTime);

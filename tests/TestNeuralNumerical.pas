@@ -47572,6 +47572,7 @@ const
   cBlank = 0;
 var
   Logits, LogProbs, Grad: TNNetVolume;
+  CTC: TNNetCTCLoss;
   Labels: array[0..2] of integer;
   ti, k: integer;
   RowSum, G: TNeuralFloat;
@@ -47586,6 +47587,9 @@ begin
   Logits := TNNetVolume.Create(cT, 1, cVocab);
   LogProbs := TNNetVolume.Create(cT, 1, cVocab);
   Grad := TNNetVolume.Create(1, 1, 1);
+  // The forward-backward is an instance method: its lattices are per-layer
+  // scratch fields, so it needs a (standalone) layer to hold them.
+  CTC := TNNetCTCLoss.Create(cBlank);
   try
     RandSeed := 20260724;
     for ti := 0 to cT - 1 do
@@ -47595,7 +47599,7 @@ begin
     // Pre-fill the gradient with garbage: the routine must resize + clear it.
     Grad.ReSize(2, 1, 2);
     Grad.Fill(7.0);
-    TNNetCTCLoss.ForwardBackwardLogLoss(LogProbs, Labels, cBlank, Grad);
+    CTC.ForwardBackwardLogLoss(LogProbs, Labels, cBlank, Grad);
 
     AssertEquals('CTC grad SizeX', cT, Grad.SizeX);
     AssertEquals('CTC grad Depth', cVocab, Grad.Depth);
@@ -47616,6 +47620,7 @@ begin
         -1.0, RowSum, 1e-4);
     end;
   finally
+    CTC.Free;
     Grad.Free;
     LogProbs.Free;
     Logits.Free;
