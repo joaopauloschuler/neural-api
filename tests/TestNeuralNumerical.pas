@@ -1264,6 +1264,8 @@ type
     procedure TestTopKForward;
     procedure TestTopKGradientCheck;
     procedure TestTopKSerializationRoundTrip;
+    procedure TestTopKSelectionMatchesRescanReference;
+    procedure TestExpertChoiceSelectionMatchesRescanReference;
     procedure TestChannelShuffleIndivisibleGuard;
     procedure TestChannelShuffleInverseProperty;
     procedure TestReverseChannelsForward;
@@ -52328,6 +52330,126 @@ begin
         AssertTrue('TopK kept count at (' + IntToStr(x) + ',' + IntToStr(y) +
           ')=' + IntToStr(nonzero), nonzero <= 3);
       end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Differential check of the single-pass top-k selection against the K-full-
+// rescan reference it replaced, on an input deliberately full of EXACT TIES
+// (values drawn from a four-element set). The tie rule under test is "first
+// occurrence wins": a changed tie-break silently reroutes tokens to different
+// experts, which no accuracy assertion would catch.
+procedure TTestNeuralNumerical.TestTopKSelectionMatchesRescanReference;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Kept: array of boolean;
+  x, y, d, k, i, BestIdx, Depth, K3: integer;
+  BestVal, Val: TNeuralFloat;
+begin
+  Depth := 9;
+  K3 := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 3, Depth);
+  SetLength(Kept, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 3, Depth, 1));
+    NN.AddLayer(TNNetTopK.Create(K3));
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.5 + 0.25 * ((i * 7) mod 4);   // many exact ties
+    NN.Compute(Input);
+
+    for x := 0 to Input.SizeX - 1 do
+      for y := 0 to Input.SizeY - 1 do
+      begin
+        // Reference: K complete rescans skipping the already-kept entries.
+        for d := 0 to Depth - 1 do Kept[d] := false;
+        for k := 1 to K3 do
+        begin
+          BestIdx := -1;
+          BestVal := 0;
+          for d := 0 to Depth - 1 do
+          begin
+            if Kept[d] then continue;
+            Val := Input[x, y, d];
+            if (BestIdx = -1) or (Val > BestVal) then
+            begin
+              BestIdx := d;
+              BestVal := Val;
+            end;
+          end;
+          if BestIdx >= 0 then Kept[BestIdx] := True;
+        end;
+        for d := 0 to Depth - 1 do
+          if Kept[d] then
+            AssertEquals('TopK survivor at (' + IntToStr(x) + ',' + IntToStr(y) +
+              ',' + IntToStr(d) + ')', Input[x, y, d],
+              NN.GetLastLayer.Output[x, y, d], 1e-6)
+          else
+            AssertEquals('TopK non-survivor at (' + IntToStr(x) + ',' +
+              IntToStr(y) + ',' + IntToStr(d) + ')', 0.0,
+              NN.GetLastLayer.Output[x, y, d], 1e-6);
+      end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Same differential check for the TRANSPOSED selection: TNNetExpertChoiceGate
+// selects over the strided TOKEN axis (SizeX), so it exercises the strided form
+// of the single-pass selection. Ties are again deliberate.
+procedure TTestNeuralNumerical.TestExpertChoiceSelectionMatchesRescanReference;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Kept: array of boolean;
+  x, d, k, i, BestIdx, Depth, Tokens, Cap: integer;
+  BestVal, Val: TNeuralFloat;
+begin
+  Tokens := 7;
+  Depth := 4;
+  Cap := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(Tokens, 1, Depth);
+  SetLength(Kept, Tokens);
+  try
+    NN.AddLayer(TNNetInput.Create(Tokens, 1, Depth, 1));
+    NN.AddLayer(TNNetExpertChoiceGate.Create(Cap));
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.5 + 0.25 * ((i * 5) mod 3);   // many exact ties
+    NN.Compute(Input);
+
+    for d := 0 to Depth - 1 do
+    begin
+      for x := 0 to Tokens - 1 do Kept[x] := false;
+      for k := 1 to Cap do
+      begin
+        BestIdx := -1;
+        BestVal := 0;
+        for x := 0 to Tokens - 1 do
+        begin
+          if Kept[x] then continue;
+          Val := Input[x, 0, d];
+          if (BestIdx = -1) or (Val > BestVal) then
+          begin
+            BestIdx := x;
+            BestVal := Val;
+          end;
+        end;
+        if BestIdx >= 0 then Kept[BestIdx] := True;
+      end;
+      for x := 0 to Tokens - 1 do
+        if Kept[x] then
+          AssertEquals('ExpertChoice survivor at (' + IntToStr(x) + ',' +
+            IntToStr(d) + ')', Input[x, 0, d],
+            NN.GetLastLayer.Output[x, 0, d], 1e-6)
+        else
+          AssertEquals('ExpertChoice non-survivor at (' + IntToStr(x) + ',' +
+            IntToStr(d) + ')', 0.0, NN.GetLastLayer.Output[x, 0, d], 1e-6);
+    end;
   finally
     NN.Free;
     Input.Free;

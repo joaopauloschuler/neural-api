@@ -2915,6 +2915,8 @@ type
     // SetPrevLayer) to avoid per-pass heap allocation in the hot path.
     FPBuf, FFBuf: array of TNeuralFloat;
     FKeptBuf: array of boolean;
+    FTopIdx: array of integer;        // top-k selection scratch (NeuralMarkTopK)
+    FTopVal: array of TNeuralFloat;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(); overload; override;
@@ -13067,6 +13069,8 @@ type
   TNNetTopK = class(TNNetIdentity)
     private
       FKeptBuf: array of boolean;
+      FTopIdx: array of integer;      // top-k selection scratch (NeuralMarkTopK)
+      FTopVal: array of TNeuralFloat;
     public
       constructor Create(K: integer); reintroduce; overload;
       destructor Destroy(); override;
@@ -13101,6 +13105,8 @@ type
   TNNetTopKGate = class(TNNetIdentity)
     private
       FKeptBuf: array of boolean;
+      FTopIdx: array of integer;      // top-k selection scratch (NeuralMarkTopK)
+      FTopVal: array of TNeuralFloat;
     public
       constructor Create(TopCnt: integer;
         pRenormalize: boolean = true); reintroduce; overload;
@@ -13129,6 +13135,8 @@ type
   TNNetExpertChoiceGate = class(TNNetIdentity)
     private
       FKeptBuf: array of boolean;
+      FTopIdx: array of integer;      // top-k selection scratch (NeuralMarkTopK)
+      FTopVal: array of TNeuralFloat;
     public
       constructor Create(Capacity: integer); reintroduce; overload;
       destructor Destroy(); override;
@@ -20888,6 +20896,55 @@ begin
   if B then Result := TrueS else Result := FalseS;
 end;
 
+// Marks the pK largest of the pCount values read at
+// pValues^[pBase + i*pStride] (plus pBias^[i] when pBias is assigned) as True
+// in pKept, which the caller must have zeroed. Rule #22: one pass keeping a
+// pK-entry insertion-ordered buffer, O(pCount + pK^2), instead of pK complete
+// rescans of the candidate axis skipping the already-kept entries, O(pK*pCount)
+// -- for a router with 64-128 experts and K=8 that is ~8x fewer iterations per
+// token. Ranking order is (value DESCENDING, index ASCENDING): insertion shifts
+// only on a STRICT '>', so an equal value lands after the entry already held
+// and the FIRST occurrence wins a tie, exactly as the rescan selection did.
+// pTopIdx / pTopVal are caller-owned scratch of at least pK entries (rule #17:
+// persistent layer fields, never allocated here).
+procedure NeuralMarkTopK(pValues, pBias: TNeuralFloatArrPtr;
+  pBase, pStride, pCount, pK: integer;
+  var pKept: array of boolean;
+  var pTopIdx: array of integer;
+  var pTopVal: array of TNeuralFloat);
+var
+  i, Pos, Kept, Ins, KM1, CountM1, KeptM1: integer;
+  Val: TNeuralFloat;
+  HasBias: boolean;
+begin
+  if (pK < 1) or (pCount < 1) then exit;
+  HasBias := Assigned(pBias);   // #20: loop-invariant, resolved once
+  KM1 := pK - 1;
+  CountM1 := pCount - 1;
+  Kept := 0;
+  Pos := pBase;
+  for i := 0 to CountM1 do
+  begin
+    Val := pValues^[Pos];
+    if HasBias then Val := Val + pBias^[i];
+    Inc(Pos, pStride);
+    // Full buffer and not strictly better than the worst kept: nothing to do.
+    if (Kept = pK) and not (Val > pTopVal[KM1]) then continue;
+    if Kept < pK then Inc(Kept);
+    Ins := Kept - 1;
+    while (Ins > 0) and (Val > pTopVal[Ins - 1]) do
+    begin
+      pTopVal[Ins] := pTopVal[Ins - 1];
+      pTopIdx[Ins] := pTopIdx[Ins - 1];
+      Dec(Ins);
+    end;
+    pTopVal[Ins] := Val;
+    pTopIdx[Ins] := i;
+  end;
+  KeptM1 := Kept - 1;
+  for i := 0 to KeptM1 do pKept[pTopIdx[i]] := True;
+end;
+
 procedure RebuildPatternOnPreviousPatterns
 (
   Calculated: TNNetVolume;
@@ -26795,6 +26852,8 @@ begin
   SetLength(FPBuf, E);
   SetLength(FFBuf, E);
   SetLength(FKeptBuf, E);
+  SetLength(FTopIdx, E);
+  SetLength(FTopVal, E);
 end;
 
 destructor TNNetLoadBalanceLoss.Destroy();
@@ -26802,6 +26861,8 @@ begin
   SetLength(FPBuf, 0);
   SetLength(FFBuf, 0);
   SetLength(FKeptBuf, 0);
+  SetLength(FTopIdx, 0);
+  SetLength(FTopVal, 0);
   inherited Destroy();
 end;
 
@@ -26835,23 +26896,9 @@ begin
       baseOut0 := FOutput.GetRawPos(X, Y);
       TNNetVolume.Add(@FPBuf[0], FOutput.GetRawPtr(baseOut0), E);
       FillChar(FKeptBuf[0], E, 0); // Boolean = 1 byte
-      // Hard top-TopCnt assignment for this token.
-      for CntK := 1 to TopCnt do
-      begin
-        BestIdx := -1;
-        BestVal := 0;
-        for D := 0 to EM1 do
-        begin
-          if FKeptBuf[D] then continue;
-          Val := FOutput.FData[baseOut0 + D];
-          if (BestIdx = -1) or (Val > BestVal) then
-          begin
-            BestIdx := D;
-            BestVal := Val;
-          end;
-        end;
-        if BestIdx >= 0 then FKeptBuf[BestIdx] := True;
-      end;
+      // Hard top-TopCnt assignment for this token (#22: one pass, not TopCnt).
+      NeuralMarkTopK(FOutput.DataPtr, nil, baseOut0, 1, E, TopCnt,
+        FKeptBuf, FTopIdx, FTopVal);
       for D := 0 to EM1 do
         if FKeptBuf[D] then FFBuf[D] := FFBuf[D] + 1;
     end;
@@ -95545,6 +95592,8 @@ procedure TNNetTopK.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   SetLength(FKeptBuf, FOutput.Depth);
+  SetLength(FTopIdx, FOutput.Depth);
+  SetLength(FTopVal, FOutput.Depth);
 end;
 
 procedure TNNetTopK.Compute;
@@ -95570,22 +95619,9 @@ begin
     begin
       StartPos := FOutput.GetRawPos(CntX, CntY);
       FillChar(FKeptBuf[0], MaxD + 1, 0);  // #13 (Boolean = 1 byte)
-      for CntK := 1 to K do
-      begin
-        BestIdx := -1;
-        BestVal := 0;
-        for CntD := 0 to MaxD do
-        begin
-          if FKeptBuf[CntD] then continue;
-          Val := FOutput.FData[StartPos + CntD];
-          if (BestIdx = -1) or (Val > BestVal) then
-          begin
-            BestIdx := CntD;
-            BestVal := Val;
-          end;
-        end;
-        if BestIdx >= 0 then FKeptBuf[BestIdx] := True;
-      end;
+      // #22: one pass with a K-entry insertion buffer, not K full rescans.
+      NeuralMarkTopK(FOutput.DataPtr, nil, StartPos, 1, MaxD + 1, K,
+        FKeptBuf, FTopIdx, FTopVal);
       for CntD := 0 to MaxD do
         if not FKeptBuf[CntD] then
           FOutput.FData[StartPos + CntD] := 0;
@@ -95642,6 +95678,8 @@ procedure TNNetTopKGate.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   SetLength(FKeptBuf, FOutput.Depth);
+  SetLength(FTopIdx, FOutput.Depth);
+  SetLength(FTopVal, FOutput.Depth);
 end;
 
 procedure TNNetTopKGate.Compute;
@@ -95667,22 +95705,8 @@ begin
       StartPos := FOutput.GetRawPos(CntX, CntY);
       FillChar(FKeptBuf[0], MaxD + 1, 0);  // #13 (Boolean = 1 byte)
       // Keep the TopCnt largest gate weights (first occurrence wins on ties).
-      for CntK := 1 to TopCnt do
-      begin
-        BestIdx := -1;
-        BestVal := 0;
-        for CntD := 0 to MaxD do
-        begin
-          if FKeptBuf[CntD] then continue;
-          Val := FOutput.FData[StartPos + CntD];
-          if (BestIdx = -1) or (Val > BestVal) then
-          begin
-            BestIdx := CntD;
-            BestVal := Val;
-          end;
-        end;
-        if BestIdx >= 0 then FKeptBuf[BestIdx] := True;
-      end;
+      NeuralMarkTopK(FOutput.DataPtr, nil, StartPos, 1, MaxD + 1, TopCnt,
+        FKeptBuf, FTopIdx, FTopVal);
       if FStruct[1] = 1 then
       begin
         // Raw mode (norm_topk_prob=false): survivors keep their input gate
@@ -95805,6 +95829,8 @@ procedure TNNetExpertChoiceGate.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   SetLength(FKeptBuf, FOutput.SizeX);
+  SetLength(FTopIdx, FOutput.SizeX);
+  SetLength(FTopVal, FOutput.SizeX);
 end;
 
 procedure TNNetExpertChoiceGate.Compute;
@@ -95834,26 +95860,10 @@ begin
     begin
       rowBase := FOutput.GetRawPos(0, CntY, CntD);
       FillChar(FKeptBuf[0], MaxX + 1, 0);  // #13 (Boolean = 1 byte)
-      for CntK := 1 to Capacity do
-      begin
-        BestIdx := -1;
-        BestVal := 0;
-        pos := rowBase;
-        for CntX := 0 to MaxX do
-        begin
-          if not FKeptBuf[CntX] then
-          begin
-            Val := FOutput.FData[pos];
-            if (BestIdx = -1) or (Val > BestVal) then
-            begin
-              BestIdx := CntX;
-              BestVal := Val;
-            end;
-          end;
-          Inc(pos, Depth);
-        end;
-        if BestIdx >= 0 then FKeptBuf[BestIdx] := True;
-      end;
+      // #22: one strided pass with a Capacity-entry insertion buffer, not
+      // Capacity full rescans of the token axis.
+      NeuralMarkTopK(FOutput.DataPtr, nil, rowBase, Depth, MaxX + 1, Capacity,
+        FKeptBuf, FTopIdx, FTopVal);
       pos := rowBase;
       for CntX := 0 to MaxX do
       begin
@@ -95989,22 +95999,8 @@ begin
       StartPos := FOutput.GetRawPos(CntX, CntY);
       FillChar(FKeptBuf[0], MaxD + 1, 0);  // #13 (Boolean = 1 byte)
       // SELECTION uses the BIASED affinity g + b (first occurrence wins ties).
-      for CntK := 1 to TopCnt do
-      begin
-        BestIdx := -1;
-        BestVal := 0;
-        for CntD := 0 to MaxD do
-        begin
-          if FKeptBuf[CntD] then continue;
-          Val := FOutput.FData[StartPos + CntD] + BiasPtr^[CntD];
-          if (BestIdx = -1) or (Val > BestVal) then
-          begin
-            BestIdx := CntD;
-            BestVal := Val;
-          end;
-        end;
-        if BestIdx >= 0 then FKeptBuf[BestIdx] := True;
-      end;
+      NeuralMarkTopK(FOutput.DataPtr, BiasPtr, StartPos, 1, MaxD + 1, TopCnt,
+        FKeptBuf, FTopIdx, FTopVal);
       // COMBINE weights stay UNBIASED: renormalize the surviving raw g values
       // so they sum to 1; zero the rest. Accumulate per-expert load counts.
       SurvSum := 0;
