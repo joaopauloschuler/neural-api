@@ -31658,6 +31658,7 @@ var
   SeqLen, i, j, d: integer;
   SeqLenM1, DkM1: integer;
   AttnRow, AttnIdx: integer;
+  jLo, jHi, BandLen: integer;
   RowStride, TwoFDk, posK, posV: integer;
   Score, MaxScore, SumExp, A: TNeuralFloat;
   Prev, Seg: TNNetVolume;
@@ -31709,38 +31710,73 @@ begin
     AttnRow := FAttn.GetRawPos(0, i);
     // Query row pointer is fixed for this i - invariant across the key loop.
     QueryPtr := Prev.GetRawPtr(i, 0);
-    posK := FDk;                          // j=0 K offset (#12)
     MaxScore := -1e30;
-    for j := 0 to SeqLenM1 do
+    // A segment source makes the mask data-dependent, so that path keeps the
+    // per-(i, j) predicate over the whole row. Without one every mask term is
+    // a half-line in j and the attendable keys form ONE contiguous band: score
+    // just the band and write the provable zeros outside it (see MaskBand).
+    if HasSeg then
     begin
-      AttnIdx := AttnRow + j;
-      if ScoreIsMasked(i, j, HasSeg, Seg, SegI) then
+      jLo := 0;
+      jHi := SeqLenM1;
+      posK := FDk;                        // j=0 K offset (#12)
+      for j := 0 to SeqLenM1 do
       begin
-        // Masked: strict future (causal) - EXCEPT when both query and key are in
-        // the prefix-LM bidirectional block ([0..FPrefixLen-1] attend to each
-        // other regardless of order, the PaliGemma PrefixLM mask) -, a key
-        // beyond the sliding window
-        // (more than Window-1 positions in the past), - bidirectional window
-        // only - more than Window-1 positions in the FUTURE (the symmetric
-        // encoder band), OR (per-sample segment mask) a key that belongs to a
-        // DIFFERENT document than this query (seg[j] <> seg[i]). The three
-        // masks INTERSECT: a key is attendable only if every active mask
-        // permits it. Same -1e9 sentinel.
-        FAttn.FData[AttnIdx] := -1e9;
-      end
-      else
+        AttnIdx := AttnRow + j;
+        if ScoreIsMasked(i, j, HasSeg, Seg, SegI) then
+        begin
+          // Masked: strict future (causal) - EXCEPT when both query and key are in
+          // the prefix-LM bidirectional block ([0..FPrefixLen-1] attend to each
+          // other regardless of order, the PaliGemma PrefixLM mask) -, a key
+          // beyond the sliding window
+          // (more than Window-1 positions in the past), - bidirectional window
+          // only - more than Window-1 positions in the FUTURE (the symmetric
+          // encoder band), OR (per-sample segment mask) a key that belongs to a
+          // DIFFERENT document than this query (seg[j] <> seg[i]). The three
+          // masks INTERSECT: a key is attendable only if every active mask
+          // permits it. Same -1e9 sentinel.
+          FAttn.FData[AttnIdx] := -1e9;
+        end
+        else
+        begin
+          Score := TNNetVolume.DotProduct(
+            QueryPtr, Prev.GetRawPtr(posK), FDk);
+          Score := Score * FInvSqrtDk;
+          // Gemma-2-style attention-logit soft-cap (opt-in, default off):
+          // squash the scaled score into (-c, c) with c*tanh(s/c).
+          if FScoreSoftCap > 0 then
+            Score := FScoreSoftCap * pcr_tanhf(Score * FInvScoreSoftCap);
+          FAttn.FData[AttnIdx] := Score;
+        end;
+        if FAttn.FData[AttnIdx] > MaxScore then MaxScore := FAttn.FData[AttnIdx];
+        Inc(posK, RowStride);
+      end;
+    end
+    else
+    begin
+      // No segment source: every remaining mask term is a half-line in j, so
+      // the attendable keys are ONE contiguous band (see MaskBand). Score the
+      // band with no per-key test, and write the zeros the softmax would have
+      // produced outside it (exp(-1e9 - max) underflows to EXACTLY 0, which is
+      // what the value sum below already relies on).
+      MaskBand(i, SeqLenM1, jLo, jHi);
+      posK := FDk + jLo * RowStride;      // j=jLo K offset (#12)
+      for j := jLo to jHi do
       begin
         Score := TNNetVolume.DotProduct(
           QueryPtr, Prev.GetRawPtr(posK), FDk);
         Score := Score * FInvSqrtDk;
-        // Gemma-2-style attention-logit soft-cap (opt-in, default off):
-        // squash the scaled score into (-c, c) with c*tanh(s/c).
         if FScoreSoftCap > 0 then
           Score := FScoreSoftCap * pcr_tanhf(Score * FInvScoreSoftCap);
-        FAttn.FData[AttnIdx] := Score;
+        FAttn.FData[AttnRow + j] := Score;
+        if Score > MaxScore then MaxScore := Score;
+        Inc(posK, RowStride);
       end;
-      if FAttn.FData[AttnIdx] > MaxScore then MaxScore := FAttn.FData[AttnIdx];
-      Inc(posK, RowStride);
+      if jLo > 0 then
+        FillChar(FAttn.FData[AttnRow], jLo * csNeuralFloatSize, 0);
+      if jHi < SeqLenM1 then
+        FillChar(FAttn.FData[AttnRow + jHi + 1],
+          (SeqLenM1 - jHi) * csNeuralFloatSize, 0);
     end;
     // 2) Softmax (numerically stable).
     // All-masked-row policy: if EVERY key for this query is masked, the row
@@ -31760,26 +31796,28 @@ begin
     end
     else
     begin
-      // The score row is contiguous, so the shift, the exp and the normalizer
-      // are one fused vectorized pass (#19).
-      AttnRowPtr := FAttn.GetRawPtr(AttnRow);
+      // The band is contiguous, so the shift, the exp and the normalizer are
+      // one fused vectorized pass (#19). Outside it the weight is already the
+      // exact zero the softmax would have produced.
+      BandLen := jHi - jLo + 1;
+      AttnRowPtr := FAttn.GetRawPtr(AttnRow + jLo);
       SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
-        SeqLen);
+        BandLen);
       if SumExp > 0 then
-        TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
+        TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, BandLen);
     end;
     // 3) Output[i, 0, d] = sum_j Attn[i, j] * V[j, 0, d]. V is contiguous along
     //    depth, so accumulate j-outer with AVX MulAdd over FDk floats (the old
     //    d-outer / j-inner order was strided over j and not vectorizable).
     OutPtr := FOutput.GetRawPtr(i, 0);
     FillChar(OutPtr^, FDk * csNeuralFloatSize, 0);
-    posV := TwoFDk;                       // j=0 V offset (#12)
-    for j := 0 to SeqLenM1 do
+    posV := TwoFDk + jLo * RowStride;     // j=jLo V offset (#12)
+    for j := jLo to jHi do
     begin
-      // A masked key scored -1e9, whose exp underflows to EXACTLY 0 (and an
-      // all-masked row was zero-filled), so its length-FDk AVX MulAdd adds a
-      // provable zero. Under a causal mask that is about half the keys: skip
-      // them. Same idiom as the "if dS <> 0" guard in the backward pass.
+      // Outside the band the weight is exactly zero, so only the band can
+      // contribute; inside it a masked (segment path) or underflowed key still
+      // carries an EXACT zero, whose length-FDk AVX MulAdd adds a provable
+      // zero. Same idiom as the "if dS <> 0" guard in the backward pass.
       A := FAttn.FData[AttnRow + j];
       if A <> 0 then
         TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV), A, FDk);
