@@ -6748,8 +6748,23 @@ type
       // per head: the frequency schedule uses this head_dim and the resulting
       // head_dim/2 theta table is TILED across the full width. Lets builders
       // hoist RoPE ahead of the per-head split (one layer instead of NumHeads).
-      // Standard RoPE only (full rotary, single theta, no per-head QK-norm).
-      pRotaryHeadDim: integer = 0); reintroduce; overload;
+      // Standard RoPE only (single theta, no per-head QK-norm).
+      pRotaryHeadDim: integer = 0;
+      // pRotaryTileDims (FStruct[7], 0 = rotate the whole tile) is PARTIAL
+      // rotary: only the FIRST pRotaryTileDims channels of each tile rotate and
+      // the rest pass through unchanged (HF partial_rotary_factor / rotary_pct:
+      // Qwen3.5, Phi-3, GPT-NeoX, GPT-J). It is encoded in the theta table
+      // itself - BuildThetaCache zeroes the pass-through pairs, and a zero angle
+      // is (c=1, s=0), i.e. an exact identity in the forward, the backward AND
+      // the device kernel, all three of which read only FTheta. The frequency
+      // schedule denominator becomes pRotaryTileDims (HF's inv_freq runs over
+      // rotary_dim, not head_dim) while the TILE STRIDE stays pRotaryHeadDim.
+      // Valid without tiling too (pRotaryHeadDim = 0): one layer then replaces a
+      // [rotary slice -> RoPE | pass-through slice] split/concat pair over a
+      // single head. The identity holds only while the rotated output is
+      // unscaled, so the modes that set an output scale (YaRN mscale, LongRoPE
+      // long_mscale) are rejected below.
+      pRotaryTileDims: integer = 0); reintroduce; overload;
     // LongRoPE (rsmLongRoPE) constructor: pLongFactors is the per-frequency
     // factor table (length head_dim/2, divides each inverse frequency) and
     // pAttnFactor multiplies the rotated output (long_mscale).
@@ -43191,7 +43206,7 @@ constructor TNNetRotaryEmbedding.Create(pBase: TNeuralFloat;
   pScalingMode: TNNetRoPEScalingMode; pScaleFactor: TNeuralFloat;
   pOriginalContextLen: integer; pYarnAlpha: TNeuralFloat;
   pYarnBeta: TNeuralFloat; pLongAttnFactor: TNeuralFloat;
-  pYarnTruncate: boolean; pRotaryHeadDim: integer);
+  pYarnTruncate: boolean; pRotaryHeadDim, pRotaryTileDims: integer);
 begin
   inherited Create();
   if pBase <= 0 then
@@ -43208,6 +43223,33 @@ begin
       FErrorProc('TNNetRotaryEmbedding head_dim must be even. Got ' +
         IntToStr(pRotaryHeadDim));
     FStruct[6] := pRotaryHeadDim;
+  end;
+  // Partial rotary (see the constructor's pRotaryTileDims doc), FStruct[7].
+  // (Coded by Claude (AI).)
+  if pRotaryTileDims > 0 then
+  begin
+    if (pRotaryTileDims and 1) <> 0 then
+      FErrorProc('TNNetRotaryEmbedding rotary dims must be even. Got ' +
+        IntToStr(pRotaryTileDims));
+    if (pRotaryHeadDim > 0) and (pRotaryTileDims > pRotaryHeadDim) then
+      FErrorProc('TNNetRotaryEmbedding rotary dims must not exceed the tile ' +
+        'head_dim. Got rotary dims=' + IntToStr(pRotaryTileDims) +
+        ', head_dim=' + IntToStr(pRotaryHeadDim));
+    // The pass-through channels are an identity ONLY while the rotated output
+    // carries no extra scale: both of these modes multiply every rotated pair
+    // by FOutScale (mscale / long_mscale), which would silently rescale the
+    // channels partial rotary must leave untouched. No released partial-rotary
+    // checkpoint combines them, so reject loudly rather than approximate.
+    if pScalingMode = rsmLongRoPE then
+      FErrorProc('TNNetRotaryEmbedding partial rotary + LongRoPE is not ' +
+        'supported (long_mscale scales the pass-through channels, and the ' +
+        'long_factor table is indexed over the FULL head).');
+    if (pScalingMode = rsmYaRN) and
+       ((pLongAttnFactor > 0) or (pScaleFactor > 1)) then
+      FErrorProc('TNNetRotaryEmbedding partial rotary + YaRN is not ' +
+        'supported (the mscale attention factor scales the pass-through ' +
+        'channels).');
+    FStruct[7] := pRotaryTileDims;
   end;
   // Only write the scaling slots when a mode is active so a default-mode
   // layer serializes exactly as before (and old files with zeros in these
@@ -43312,13 +43354,17 @@ procedure TNNetRotaryEmbedding.BuildThetaCache(pDepth: integer);
 var
   HalfD, pairIdx: integer;
   HalfDM1: integer;
-  // EffDepth is the rotary dimension the frequency SCHEDULE is computed over:
-  // the full input depth normally, or the per-head dim in head-tiled mode
-  // (FStruct[6] > 0). HalfPeriod = EffDepth div 2 is the tile length; effIdx =
-  // pairIdx mod HalfPeriod indexes within one head. When tiling is off
-  // (FStruct[6] = 0) EffDepth = pDepth and effIdx = pairIdx, so every value
-  // below is byte-identical to the original. (Coded by Claude (AI).)
-  EffDepth, HalfPeriod, effIdx: integer;
+  // HalfPeriod is the TILE length in pairs: half the per-head dim in head-tiled
+  // mode (FStruct[6] > 0), else the whole half-depth. effIdx = pairIdx mod
+  // HalfPeriod indexes within one head. EffDepth is the rotary dimension the
+  // frequency SCHEDULE is computed over, which is the tile width normally but
+  // the PARTIAL rotary width when FStruct[7] > 0 - HF's inv_freq exponent runs
+  // over rotary_dim, not head_dim. RotPairs is the pair count that actually
+  // rotates within a tile (0 = all of them); the rest get theta 0, an exact
+  // identity in every FTheta consumer. With FStruct[6] = FStruct[7] = 0,
+  // EffDepth = pDepth, effIdx = pairIdx and RotPairs = 0, so every value below
+  // is byte-identical to the original. (Coded by Claude (AI).)
+  EffDepth, HalfPeriod, effIdx, RotPairs: integer;
   Base, InvD, Theta, Scale, Alpha, Beta, TrainLen: TNeuralFloat;
   Lambda, Ratio, Gamma, Temperature: TNeuralFloat;
   YarnLow, YarnHigh: TNeuralFloat;
@@ -43347,6 +43393,18 @@ begin
   else
     EffDepth := pDepth;
   HalfPeriod := EffDepth div 2;
+  // Partial rotary: the tile stride stays HalfPeriod, but the schedule
+  // denominator narrows to the rotary width and the trailing pairs of each tile
+  // stop rotating. (Coded by Claude (AI).)
+  RotPairs := 0;
+  if FStruct[7] > 0 then
+  begin
+    if FStruct[7] > EffDepth then
+      FErrorProc('TNNetRotaryEmbedding rotary dims ' + IntToStr(FStruct[7]) +
+        ' exceed the rotary width ' + IntToStr(EffDepth) + '.');
+    EffDepth := FStruct[7];
+    RotPairs := EffDepth div 2;
+  end;
   Base := FFloatSt[0];
   if Base <= 0 then Base := 10000.0;
   Mode := TNNetRoPEScalingMode(FStruct[0]);
@@ -43431,6 +43489,14 @@ begin
     // the schedule is unchanged; repeats every HalfPeriod when tiling, making
     // each head's theta block identical to a standalone per-head layer's).
     effIdx := pairIdx mod HalfPeriod;
+    // Partial rotary: the tile's trailing pairs pass through. Theta 0 gives
+    // (c, s) = (1, 0) - an exact identity in ComputeRange, in Backpropagate and
+    // in the device kernel, none of which need to know about partial rotary.
+    if (RotPairs > 0) and (effIdx >= RotPairs) then
+    begin
+      FTheta[pairIdx] := 0;
+      Continue;
+    end;
     Theta := NeuralExp(-2.0 * effIdx * InvD * pcr_logf(Base));
     case Mode of
       // Position Interpolation: angle uses m/s, i.e. theta' = theta/s.
@@ -118731,7 +118797,7 @@ begin
       'TNNetPerformerAttention' :   Result := TNNetPerformerAttention.Create(St[0], St[1], St[5]);
       'TNNetCausalLinearAttention' : Result := TNNetCausalLinearAttention.Create(St[0]);
       'TNNetLinformerAttention' :   Result := TNNetLinformerAttention.Create(St[0], St[1]);
-      'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0, St[6]);
+      'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0, St[6], St[7]);
       'TNNetMRotaryEmbedding' :     Result := TNNetMRotaryEmbedding.Create(Ft[0], St[3], St[4], St[5], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0);
       'TNNetVisionRoPE2D' :         Result := TNNetVisionRoPE2D.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
@@ -119172,7 +119238,7 @@ begin
       if S[0] = 'TNNetPerformerAttention' then Result := TNNetPerformerAttention.Create(St[0], St[1], St[5]) else
       if S[0] = 'TNNetCausalLinearAttention' then Result := TNNetCausalLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetLinformerAttention' then Result := TNNetLinformerAttention.Create(St[0], St[1]) else
-      if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0, St[6]) else
+      if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0, St[6], St[7]) else
       if S[0] = 'TNNetMRotaryEmbedding' then Result := TNNetMRotaryEmbedding.Create(Ft[0], St[3], St[4], St[5], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0) else
       if S[0] = 'TNNetVisionRoPE2D' then Result := TNNetVisionRoPE2D.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else

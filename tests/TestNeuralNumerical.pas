@@ -1127,6 +1127,10 @@ type
     procedure TestRotaryEmbeddingInverse;
     procedure TestRotaryEmbeddingInverseSeqLen5;
     procedure TestRotaryEmbeddingOddDepthGuard;
+    procedure TestRoPEPartialTiledMatchesPerHead;
+    procedure TestRoPEPartialTiledGradientCheck;
+    procedure TestRoPEPartialSerializationRoundTrip;
+    procedure TestRoPEPartialExceedsWidthGuard;
     procedure TestRoPEScalingNoneBitIdentical;
     procedure TestRoPEScalingPIHalfPositions;
     procedure TestRoPEScalingNTKDimSelective;
@@ -15222,6 +15226,171 @@ begin
     AssertTrue('RoPE odd-Depth guard must fire FErrorProc', Capture.Triggered);
     AssertTrue('RoPE odd-Depth message must mention "even Depth"',
       Pos('even Depth', Capture.Message) > 0);
+  finally
+    NN.Free;
+    Capture.Free;
+  end;
+end;
+
+// PARTIAL rotary in head-tiled mode (pRotaryHeadDim + pRotaryTileDims) must
+// reproduce, layer for layer, what the importers' per-head partial-rotary
+// forest computes: per head, the FIRST RotDims channels rotate with the
+// frequency schedule base^(-2k/RotDims) and the remaining channels pass
+// through untouched. This equivalence is what lets a builder hoist ONE rotary
+// layer ahead of the head split for Qwen3.5 / Phi-3 / GPT-NeoX / GPT-J.
+// Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestRoPEPartialTiledMatchesPerHead;
+var
+  Tiled, Ref: TNNet;
+  Input: TNNetVolume;
+  InputLayer, HeadSlice, RotSlice, PassSlice: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  SeqLen, Heads, HeadDim, RotDims, TotalD, h, pos, d: integer;
+  Base: TNeuralFloat;
+begin
+  SeqLen := 5;
+  Heads := 2;
+  HeadDim := 8;
+  RotDims := 4;   // partial_rotary_factor 0.5
+  TotalD := Heads * HeadDim;
+  Base := 10000.0;
+  Tiled := TNNet.Create();
+  Ref := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, TotalD);
+  try
+    // ONE layer over the whole multi-head projection.
+    Tiled.AddLayer(TNNetInput.Create(SeqLen, 1, TotalD, 1));
+    Tiled.AddLayer(TNNetRotaryEmbedding.Create(Base, rsmNone, 1.0, 0, 1.0,
+      32.0, 0.0, true, {pRotaryHeadDim=}HeadDim, {pRotaryTileDims=}RotDims));
+
+    // The per-head reference: split the head, cut the rotary slice off it,
+    // rotate ONLY that slice (a depth-RotDims layer, so its schedule runs over
+    // RotDims), and re-concatenate [rotated | pass-through].
+    SetLength(HeadOutputs, Heads);
+    InputLayer := Ref.AddLayer(TNNetInput.Create(SeqLen, 1, TotalD, 1));
+    for h := 0 to Heads - 1 do
+    begin
+      HeadSlice := Ref.AddLayerAfter(
+        TNNetSplitChannels.Create(h * HeadDim, HeadDim), InputLayer);
+      RotSlice := Ref.AddLayerAfter(
+        TNNetSplitChannels.Create(0, RotDims), HeadSlice);
+      RotSlice := Ref.AddLayerAfter(TNNetRotaryEmbedding.Create(Base), RotSlice);
+      PassSlice := Ref.AddLayerAfter(
+        TNNetSplitChannels.Create(RotDims, HeadDim - RotDims), HeadSlice);
+      HeadOutputs[h] := Ref.AddLayer(
+        TNNetDeepConcat.Create([RotSlice, PassSlice]));
+    end;
+    Ref.AddLayer(TNNetDeepConcat.Create(HeadOutputs));
+
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to TotalD - 1 do
+        Input[pos, 0, d] := Sin((pos * TotalD + d) * 0.37) * 0.9 - 0.15;
+
+    Tiled.Compute(Input);
+    Ref.Compute(Input);
+
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to TotalD - 1 do
+        AssertEquals('partial tiled RoPE pos=' + IntToStr(pos) + ' d=' +
+          IntToStr(d), Ref.GetLastLayer.Output[pos, 0, d],
+          Tiled.GetLastLayer.Output[pos, 0, d], 1e-5);
+
+    // The pass-through channels of every head must be EXACTLY the input (the
+    // zero-theta pairs are an identity, not an approximation of one).
+    for pos := 0 to SeqLen - 1 do
+      for h := 0 to Heads - 1 do
+        for d := RotDims to HeadDim - 1 do
+          AssertEquals('partial tiled RoPE pass-through pos=' + IntToStr(pos) +
+            ' head=' + IntToStr(h) + ' d=' + IntToStr(d),
+            Input[pos, 0, h * HeadDim + d],
+            Tiled.GetLastLayer.Output[pos, 0, h * HeadDim + d], 0);
+
+    // The point of the exercise: one layer replaces the whole forest.
+    AssertEquals('tiled net layer count', 2, Tiled.Layers.Count);
+    AssertTrue('per-head reference is the bigger net',
+      Ref.Layers.Count > Tiled.Layers.Count);
+    SetLength(HeadOutputs, 0);
+  finally
+    Tiled.Free;
+    Ref.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRoPEPartialTiledGradientCheck;
+begin
+  // The zero-theta pass-through pairs must also be an identity BACKWARD - the
+  // backward pass reads the same FTheta table, so this is what proves the
+  // "encode it in the data, not the kernel" claim end to end.
+  // 2 tiles of head_dim 4 (pair 0 rotates, pair 1 passes through). Kept to the
+  // same element count as TestRotaryEmbeddingGradientCheck on purpose: the
+  // central-difference loss is a sum of squares in SINGLE precision, so a
+  // wider volume inflates the cancellation error past the tolerance without
+  // saying anything about the gradient.
+  LayerInputGradientCheck(Self,
+    TNNetRotaryEmbedding.Create(10000.0, rsmNone, 1.0, 0, 1.0, 32.0, 0.0,
+      true, {pRotaryHeadDim=}4, {pRotaryTileDims=}2),
+    'RoPEPartialTiled', 2, 1, 8, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestRoPEPartialSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  SeqLen, TotalD, pos, d: integer;
+begin
+  // FStruct[7] must survive SaveToString / LoadFromString: a reloaded net that
+  // silently dropped the partial width would rotate the pass-through channels.
+  SeqLen := 4;
+  TotalD := 16;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, TotalD);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, TotalD, 1));
+    NN.AddLayer(TNNetRotaryEmbedding.Create(10000.0, rsmNone, 1.0, 0, 1.0,
+      32.0, 0.0, true, {pRotaryHeadDim=}8, {pRotaryTileDims=}4));
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to TotalD - 1 do
+        Input[pos, 0, d] := Cos((pos * TotalD + d) * 0.29) * 0.7;
+    NN.Compute(Input);
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(NN.SaveToString());
+      NN2.Compute(Input);
+      for pos := 0 to SeqLen - 1 do
+        for d := 0 to TotalD - 1 do
+          AssertEquals('partial RoPE round-trip pos=' + IntToStr(pos) +
+            ' d=' + IntToStr(d), NN.GetLastLayer.Output[pos, 0, d],
+            NN2.GetLastLayer.Output[pos, 0, d], 0);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRoPEPartialExceedsWidthGuard;
+var
+  NN: TNNet;
+  Rope: TNNetRotaryEmbedding;
+  Capture: TErrorCapture;
+begin
+  // A partial width wider than the rotary width it sits in is a builder bug
+  // (it would index past the tile); BuildThetaCache rejects it at attach time.
+  NN := TNNet.Create();
+  Capture := TErrorCapture.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 4, 1));
+    Rope := TNNetRotaryEmbedding.Create(10000.0, rsmNone, 1.0, 0, 1.0, 32.0,
+      0.0, true, {pRotaryHeadDim=}0, {pRotaryTileDims=}8);
+    Rope.ErrorProc := {$IFDEF FPC}@{$ENDIF}Capture.Capture;
+    NN.AddLayer(Rope);
+    AssertTrue('partial-rotary over-width guard must fire FErrorProc',
+      Capture.Triggered);
+    AssertTrue('message must mention the rotary width',
+      Pos('rotary width', Capture.Message) > 0);
   finally
     NN.Free;
     Capture.Free;

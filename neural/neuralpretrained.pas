@@ -13402,7 +13402,8 @@ end;
 // (partial rotary, Phi-3) is never hoisted, so it ignores the head dim.
 function CreateRoPEFromScaling(Base: TNeuralFloat;
   const S: TRoPEScalingConfig;
-  pRotaryHeadDim: integer = 0): TNNetRotaryEmbedding;
+  pRotaryHeadDim: integer = 0;
+  pRotaryTileDims: integer = 0): TNNetRotaryEmbedding;
 begin
   if S.Mode = rsmLongRoPE then
     Result := TNNetRotaryEmbedding.CreateLongRoPE(Base, S.LongFactors,
@@ -13413,7 +13414,7 @@ begin
     // for every other YaRN config keeps the layer's 0.1*ln(s)+1 default.
     Result := TNNetRotaryEmbedding.Create(Base, S.Mode, S.Factor,
       S.OriginalContextLen, S.YarnAlpha, S.YarnBeta, S.YarnAttnFactor,
-      S.YarnTruncate, pRotaryHeadDim);
+      S.YarnTruncate, pRotaryHeadDim, pRotaryTileDims);
 end;
 
 // Returns the per-head Q/K rotary layer for the decoder block: an ordinary
@@ -13421,11 +13422,13 @@ end;
 // TNNetMRotaryEmbedding carrying the mrope_section split. The frequency
 // schedule / scaling is identical either way; only the per-token rotary index
 // differs. Coded by Claude (AI).
-// pRotaryHeadDim > 0 requests the head-tiled full-width layer (only the plain
-// non-M-RoPE path supports it; M-RoPE is never hoisted, so it ignores it).
+// pRotaryHeadDim > 0 requests the head-tiled full-width layer and
+// pRotaryTileDims > 0 the partial rotary within each tile (only the plain
+// non-M-RoPE path supports either; M-RoPE is never hoisted, so it ignores both).
 function CreateRoPELayerForConfig(const Config: TLlamaConfig;
   Base: TNeuralFloat; const S: TRoPEScalingConfig;
-  pRotaryHeadDim: integer = 0): TNNetRotaryEmbedding;
+  pRotaryHeadDim: integer = 0;
+  pRotaryTileDims: integer = 0): TNNetRotaryEmbedding;
 begin
   if Config.MRoPEEnabled then
   begin
@@ -13438,7 +13441,7 @@ begin
       S.YarnTruncate);
   end
   else
-    Result := CreateRoPEFromScaling(Base, S, pRotaryHeadDim);
+    Result := CreateRoPEFromScaling(Base, S, pRotaryHeadDim, pRotaryTileDims);
 end;
 
 // ============================ LLAMA IMPORT =================================
