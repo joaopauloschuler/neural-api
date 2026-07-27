@@ -21901,25 +21901,27 @@ end;
 procedure TTestNeuralNumerical.TestMultiHeadGroupedQueryAttentionKVSharing;
 // The K/V projections must be GENUINELY shared: with QueryHeads=2, KVHeads=1
 // (MQA) both query heads read the SAME single K head. Re-randomizing the K
-// projection layer must therefore change the output of BOTH per-head SDPA
-// layers (with per-head K projections, perturbing one head's K could never
-// move the other head). Also pins the structural fact that the K and V
-// projections are only KVHeads*d_k channels wide.
+// projection layer must therefore change the output of BOTH query heads (with
+// per-head K projections, perturbing one head's K could never move the other
+// head). The heads live in the two d_k channel bands of the attention layer's
+// output. Also pins the structural fact that the K and V projections are only
+// KVHeads*d_k channels wide.
 var
   NN: TNNet;
   Input: TNNetVolume;
-  Head0Before, Head1Before: TNNetVolume;
-  SDPAs: array[0..1] of TNNetLayer;
-  d_model, SeqLen, i, SDPACnt: integer;
-  diff0, diff1: TNeuralFloat;
+  AttnBefore: TNNetVolume;
+  Attn: TNNetLayer;
+  d_model, d_k, SeqLen, i, x, d, SDPACnt: integer;
+  diff0, diff1, LocalDiff: TNeuralFloat;
 begin
   RandSeed := 424242;
   d_model := 8;
+  d_k := d_model div 2;   // QueryHeads = 2
   SeqLen := 4;
   NN := TNNet.Create();
   Input := TNNetVolume.Create(SeqLen, 1, d_model);
-  Head0Before := TNNetVolume.Create();
-  Head1Before := TNNetVolume.Create();
+  AttnBefore := TNNetVolume.Create();
+  Attn := nil;
   try
     NN.AddLayer(TNNetInput.Create(SeqLen, 1, d_model, 1));
     NN.AddMultiHeadGroupedQueryAttention({QueryHeads=}2, {KVHeads=}1, false);
@@ -21931,42 +21933,47 @@ begin
     AssertEquals('MQA V projection width (KVHeads*d_k)',
       d_model div 2, NN.Layers[3].Output.Depth);
 
-    // Collect the two per-head attention layers.
+    // With NeuralAllowFusedAttention (the default) the builder emits ONE fused
+    // attention layer carrying both query heads.
     SDPACnt := 0;
     for i := 0 to NN.Layers.Count - 1 do
-      if (NN.Layers[i] is TNNetScaledDotProductAttention) and (SDPACnt < 2) then
+      if NN.Layers[i] is TNNetScaledDotProductAttention then
       begin
-        SDPAs[SDPACnt] := NN.Layers[i];
+        if SDPACnt = 0 then Attn := NN.Layers[i];
         Inc(SDPACnt);
       end;
-    AssertEquals('MQA has one SDPA per query head', 2, SDPACnt);
+    AssertEquals('MQA has one fused SDPA over both query heads', 1, SDPACnt);
+    AssertTrue('fused SDPA class', Attn is TNNetFusedSDPA);
+    AssertEquals('fused SDPA output width (QueryHeads*d_k)',
+      d_model, Attn.Output.Depth);
 
     for i := 0 to Input.Size - 1 do
       Input.Raw[i] := Cos(i * 0.61) * 0.7 + 0.2;
     NN.Compute(Input);
-    Head0Before.Copy(SDPAs[0].Output);
-    Head1Before.Copy(SDPAs[1].Output);
+    AttnBefore.Copy(Attn.Output);
 
     // Perturb ONLY the shared K projection (layer 2) and recompute.
     NN.Layers[2].InitUniform(2.0);
     NN.Compute(Input);
 
+    // Head h owns channels [h*d_k .. h*d_k+d_k-1] of the fused output.
     diff0 := 0;
     diff1 := 0;
-    for i := 0 to Head0Before.Size - 1 do
-    begin
-      if Abs(SDPAs[0].Output.Raw[i] - Head0Before.Raw[i]) > diff0 then
-        diff0 := Abs(SDPAs[0].Output.Raw[i] - Head0Before.Raw[i]);
-      if Abs(SDPAs[1].Output.Raw[i] - Head1Before.Raw[i]) > diff1 then
-        diff1 := Abs(SDPAs[1].Output.Raw[i] - Head1Before.Raw[i]);
-    end;
+    for x := 0 to SeqLen - 1 do
+      for d := 0 to d_k - 1 do
+      begin
+        LocalDiff := Abs(Attn.Output[x, 0, d] - AttnBefore[x, 0, d]);
+        if LocalDiff > diff0 then diff0 := LocalDiff;
+        LocalDiff := Abs(Attn.Output[x, 0, d_k + d] -
+          AttnBefore[x, 0, d_k + d]);
+        if LocalDiff > diff1 then diff1 := LocalDiff;
+      end;
     AssertTrue('shared K perturbation moves query head 0 (diff=' +
       FloatToStr(diff0) + ')', diff0 > 1e-6);
     AssertTrue('shared K perturbation moves query head 1 (diff=' +
       FloatToStr(diff1) + ')', diff1 > 1e-6);
   finally
-    Head1Before.Free;
-    Head0Before.Free;
+    AttnBefore.Free;
     Input.Free;
     NN.Free;
   end;

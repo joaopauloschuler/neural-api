@@ -17557,9 +17557,10 @@ type
       // channels (QueryHeads*d_k); K and V are each projected token-wise to only
       // KVHeads*d_k channels. For query head h, the KV group is
       // h div (QueryHeads div KVHeads): the SAME KV head's d_k channels are
-      // replicated across every query head in its group. Per head,
-      // [Q_h | K_group | V_group] (width 3*d_k) is fed to
-      // TNNetScaledDotProductAttention; head outputs are concatenated then
+      // replicated across every query head in its group. The attention itself
+      // is wired by AddGQAAttentionFromSources (one fused layer, or the
+      // equivalent per-head forest when NeuralAllowFusedAttention is False),
+      // whose concatenated head outputs are then
       // out-projected token-wise to depth d_model. All projections are 1x1 convs
       // (TNNetPointwiseConvLinear) so the sequence axis is preserved.
       // K/V parameter cost: full MHA K/V projections scale with QueryHeads, GQA
@@ -17568,6 +17569,23 @@ type
       // d_model is inferred from the input depth (GetLastLayer().Output.Depth).
       function AddMultiHeadGroupedQueryAttention(QueryHeads,
         KVHeads: integer; CausalMask: boolean = false): TNNetLayer;
+      // Grouped-query attention over ALREADY-PREPARED Q/K/V source layers -
+      // the single place that decides between the fused attention layer and
+      // the per-head forest. QSrc must be QHeads*HeadDim channels wide, KSrc
+      // and VSrc KVHeads*HeadDim each, all three on the same sequence grid and
+      // already carrying whatever per-head preparation the architecture needs
+      // (QK-norm, RoPE, ...). Query head h reads the KV head
+      // h div (QHeads div KVHeads).
+      // NeuralAllowFusedAttention=True builds ONE TNNetDeepConcat
+      // [Q|K|V] + TNNetFusedSDPA; False builds the equivalent per-head wiring
+      // (per head: three TNNetSplitChannels, a [Q|K|V] TNNetDeepConcat and a
+      // TNNetScaledDotProductAttention, then one TNNetDeepConcat over the head
+      // outputs). Both paths return the layer holding the CONCATENATED head
+      // outputs (width QHeads*HeadDim) - callers add their own out-projection.
+      // Coded by Claude (AI).
+      function AddGQAAttentionFromSources(QSrc, KSrc, VSrc: TNNetLayer;
+        QHeads, KVHeads, HeadDim: integer; CausalMask: boolean = false;
+        Window: integer = 0; ScoreSoftCap: TNeuralFloat = 0): TNNetLayer;
       // Multi-head Latent Attention (MLA, DeepSeek-V2, Liu et al. 2024) over a
       // (SeqLen,1,d_model) token tensor (source is GetLastLayer()). Unlike GQA
       // -- which shrinks the KV cache by SHARING full-width K/V across query-head
@@ -20917,6 +20935,15 @@ type
     out GradA: array of Double; DataRange: Double): Double;
 var
   NeuralSSIMLossGradientHook: TNeuralSSIMLossGradientHook = nil;
+
+  // Global A/B toggle for the fused multi-head attention layer
+  // (TNNetFusedSDPA). True (default) makes TNNet.AddGQAAttentionFromSources
+  // build ONE fused attention layer wherever the architecture allows it;
+  // False forces the per-head SplitChannels/SDPA/DeepConcat wiring instead -
+  // bit-identical output, so this is purely a performance A/B (ChatTerminal's
+  // --no-fused-attn sets it False before BuildFromPretrained).
+  // Coded by Claude (AI).
+  NeuralAllowFusedAttention: boolean = true;
 
   procedure RebuildPatternOnPreviousPatterns
   (
@@ -76383,11 +76410,8 @@ end;
 function TNNet.AddMultiHeadGroupedQueryAttention(QueryHeads,
   KVHeads: integer; CausalMask: boolean = false): TNNetLayer;
 var
-  d_model, d_k, d_kv, GroupSize, HeadCnt, KVGroup, d, QueryHeadsM1, d_kM1: integer;
+  d_model, d_k, d_kv: integer;
   SourceLayer, QProj, KProj, VProj: TNNetLayer;
-  QSlice, KSlice, VSlice, HeadPack: TNNetLayer;
-  HeadOutputs: array of TNNetLayer;
-  QChannels, KVChannels: array of integer;
 begin
   SourceLayer := GetLastLayer();
   d_model := SourceLayer.Output.Depth;  // inferred stream width
@@ -76407,41 +76431,72 @@ begin
       ', KVHeads=' + IntToStr(KVHeads));
   d_k := d_model div QueryHeads;       // per-head dim
   d_kv := KVHeads * d_k;               // total K/V projection width (shrunken)
-  GroupSize := QueryHeads div KVHeads; // query heads sharing one KV head
   // Token-wise projections (1x1 conv preserves the sequence axis). Q keeps the
   // full d_model width; K and V are projected to only d_kv channels -- this is
   // where GQA saves K/V parameters (factor QueryHeads/KVHeads vs full MHA).
   QProj := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_model), SourceLayer);
   KProj := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_kv), SourceLayer);
   VProj := AddLayerAfter(TNNetPointwiseConvLinear.Create(d_kv), SourceLayer);
-  SetLength(HeadOutputs, QueryHeads);
-  SetLength(QChannels, d_k);
-  SetLength(KVChannels, d_k);
-  QueryHeadsM1 := QueryHeads - 1;
-  d_kM1 := d_k - 1;
-  for HeadCnt := 0 to QueryHeadsM1 do
-  begin
-    // This query head owns its own d_k slice of Q, but shares the KV head of
-    // its group (replicating that KV head across the GroupSize query heads).
-    KVGroup := HeadCnt div GroupSize;
-    for d := 0 to d_kM1 do
-    begin
-      QChannels[d]  := HeadCnt * d_k + d;
-      KVChannels[d] := KVGroup * d_k + d;
-    end;
-    QSlice := AddLayerAfter(TNNetSplitChannels.Create(QChannels), QProj);
-    KSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), KProj);
-    VSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), VProj);
-    // Pack [Q_h | K_group | V_group] (width 3*d_k) as SDPA expects.
-    HeadPack := AddLayer(TNNetDeepConcat.Create([QSlice, KSlice, VSlice]));
-    HeadOutputs[HeadCnt] :=
-      AddLayerAfter(TNNetScaledDotProductAttention.Create(d_k, CausalMask),
-        HeadPack);
-  end;
-  AddLayer(TNNetDeepConcat.Create(HeadOutputs));
+  AddGQAAttentionFromSources(QProj, KProj, VProj, QueryHeads, KVHeads, d_k,
+    CausalMask);
   // Token-wise linear out-projection (FullConnectLinear would flatten the
   // sequence axis; see AddMultiHeadSelfAttention header note).
   Result := AddLayer(TNNetPointwiseConvLinear.Create(d_model));
+end;
+
+function TNNet.AddGQAAttentionFromSources(QSrc, KSrc, VSrc: TNNetLayer;
+  QHeads, KVHeads, HeadDim: integer; CausalMask: boolean = false;
+  Window: integer = 0; ScoreSoftCap: TNeuralFloat = 0): TNNetLayer;
+var
+  GroupSize, HeadCnt, KVGroup, d, QHeadsM1, HeadDimM1: integer;
+  QSlice, KSlice, VSlice, HeadPack: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  QChannels, KVChannels: array of integer;
+begin
+  if QHeads < 1 then
+    FErrorProc('AddGQAAttentionFromSources requires QHeads >= 1. QHeads=' +
+      IntToStr(QHeads));
+  if KVHeads < 1 then
+    FErrorProc('AddGQAAttentionFromSources requires KVHeads >= 1. KVHeads=' +
+      IntToStr(KVHeads));
+  if (QHeads mod KVHeads) <> 0 then
+    FErrorProc('AddGQAAttentionFromSources requires QHeads divisible by' +
+      ' KVHeads. QHeads=' + IntToStr(QHeads) +
+      ', KVHeads=' + IntToStr(KVHeads));
+  if NeuralAllowFusedAttention then
+  begin
+    // FUSED: ONE attention layer over the packed [allQ|allK|allV] concat.
+    AddLayer( TNNetDeepConcat.Create([QSrc, KSrc, VSrc]) );
+    Result := AddLayer( TNNetFusedSDPA.Create(QHeads, KVHeads, HeadDim,
+      CausalMask, Window, ScoreSoftCap) );
+    exit;
+  end;
+  GroupSize := QHeads div KVHeads; // query heads sharing one KV head
+  SetLength(HeadOutputs, QHeads);
+  SetLength(QChannels, HeadDim);
+  SetLength(KVChannels, HeadDim);
+  QHeadsM1 := QHeads - 1;
+  HeadDimM1 := HeadDim - 1;
+  for HeadCnt := 0 to QHeadsM1 do
+  begin
+    // This query head owns its own HeadDim slice of Q, but shares the KV head
+    // of its group (replicating that KV head across the GroupSize query heads).
+    KVGroup := HeadCnt div GroupSize;
+    for d := 0 to HeadDimM1 do
+    begin
+      QChannels[d]  := HeadCnt * HeadDim + d;
+      KVChannels[d] := KVGroup * HeadDim + d;
+    end;
+    QSlice := AddLayerAfter(TNNetSplitChannels.Create(QChannels), QSrc);
+    KSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), KSrc);
+    VSlice := AddLayerAfter(TNNetSplitChannels.Create(KVChannels), VSrc);
+    // Pack [Q_h | K_group | V_group] (width 3*HeadDim) as SDPA expects.
+    HeadPack := AddLayer(TNNetDeepConcat.Create([QSlice, KSlice, VSlice]));
+    HeadOutputs[HeadCnt] :=
+      AddLayerAfter(TNNetScaledDotProductAttention.Create(HeadDim, CausalMask,
+        Window, ScoreSoftCap), HeadPack);
+  end;
+  Result := AddLayer(TNNetDeepConcat.Create(HeadOutputs));
   SetLength(HeadOutputs, 0);
   SetLength(QChannels, 0);
   SetLength(KVChannels, 0);

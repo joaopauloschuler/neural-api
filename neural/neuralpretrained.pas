@@ -12401,14 +12401,9 @@ function BuildGRUFromSafeTensors(const FileName, Prefix: string;
   InputSize, Hidden, NumLayers, SeqLen: integer;
   Bidirectional: boolean): TNNet;
 
-var
-  // Global A/B toggle for the fused multi-head attention layer
-  // (TNNetFusedSDPA). True (default) builds ONE fused attention layer per
-  // block wherever the architecture allows it; False forces the per-head
-  // SplitChannels/SDPA/DeepConcat wiring instead - bit-identical output, so
-  // this is purely a performance A/B (ChatTerminal's --no-fused-attn sets it
-  // False before BuildFromPretrained). Coded by Claude (AI).
-  NeuralAllowFusedAttention: boolean = true;
+// NeuralAllowFusedAttention (the global fused-attention A/B toggle) lives in
+// neuralnetwork, next to TNNet.AddGQAAttentionFromSources which reads it, and
+// reaches this unit through the uses clause above.
 
 implementation
 
@@ -16238,12 +16233,11 @@ begin
         // op order) because everything per-head was hoisted above.
         if Plan.Fused then
         begin
-          NN.AddLayer( TNNetDeepConcat.Create(
-            [QSource, KSource, Blocks[BlockCnt].VProj]) );
-          AttnConcat := NN.AddLayer( TNNetFusedSDPA.Create(
+          AttnConcat := NN.AddGQAAttentionFromSources(
+            QSource, KSource, Blocks[BlockCnt].VProj,
             Config.NumHeads, Config.NumKVHeads, HeadDim, {CausalMask=}true,
-            {pWindow=}LayerWindow,
-            {pScoreSoftCap=}Config.AttnLogitSoftCap) );
+            {Window=}LayerWindow,
+            {ScoreSoftCap=}Config.AttnLogitSoftCap);
         end
         else
         begin
