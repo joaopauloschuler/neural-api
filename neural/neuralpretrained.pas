@@ -15801,15 +15801,21 @@ begin
   //  - Llama-4's QK-L2 norm: applied AFTER RoPE, per head.
   PerHeadOnly := Config.MRoPEEnabled or Config.Llama4QKL2Norm;
   FullRotary := RotaryDims >= HeadDim;
-  // PARTIAL rotary (Phi-3, Qwen3.5) hoists too: the head-tiled rotary layer
-  // takes the rotary width and zeroes the pass-through pairs' theta, which is
-  // an exact identity on those channels. The one thing that identity cannot
-  // survive is an output SCALE on the rotated pairs, so mirror exactly what
-  // TNNetRotaryEmbedding's constructor rejects - LongRoPE (long_mscale, and a
-  // long_factor table indexed over the full head) and YaRN with an mscale - and
-  // leave those on the per-head split/concat path.
-  PartialOK := (S.Mode <> rsmLongRoPE) and
-    (not ((S.Mode = rsmYaRN) and ((S.YarnAttnFactor > 0) or (S.Factor > 1))));
+  // LongRoPE can NEVER be hoisted, at any rotary width: CreateRoPEFromScaling
+  // routes it to CreateLongRoPE, whose signature carries no head dim, so a
+  // hoisted layer would run its frequency schedule over the WHOLE projection
+  // width instead of one head - and, because the long_factor table is then
+  // shorter than the half-depth, silently fall back to an all-ones table.
+  // Neither failure raises; the logits just come out wrong.
+  if S.Mode = rsmLongRoPE then PerHeadOnly := true;
+  // PARTIAL rotary (Phi-3, Qwen3.5) hoists: the head-tiled rotary layer takes
+  // the rotary width and zeroes the pass-through pairs' theta, which is an
+  // exact identity on those channels. The one thing that identity cannot
+  // survive is an output SCALE on the rotated pairs, so mirror what
+  // TNNetRotaryEmbedding's constructor rejects - YaRN with an mscale - and
+  // leave that on the per-head split/concat path.
+  PartialOK :=
+    not ((S.Mode = rsmYaRN) and ((S.YarnAttnFactor > 0) or (S.Factor > 1)));
   if not (FullRotary or PartialOK) then PerHeadOnly := true;
   // Config.QKNormFullWidth (OLMo-2) is NOT a blocker: that norm is already
   // whole-width and precedes RoPE. Per-head QKNorm over a PARTIAL rotary head

@@ -274,6 +274,7 @@ type
     procedure TestPhiLogitParity;
     procedure TestPhi3LogitParity;
     procedure TestPhi3LongRoPELogitParity;
+    procedure TestPhi3LongRoPEFullRotaryLogitParity;
     procedure TestBitNetConfigParity;
     procedure TestBitNetLogitParity;
     procedure TestInternLM2ConfigParity;
@@ -10553,6 +10554,68 @@ begin
     finally
       NN2.Free;
     end;
+  finally
+    NN.Free;
+  end;
+end;
+
+// LongRoPE over a FULL rotary (tests/fixtures/tiny_phi3_longrope_full.*, from
+// tools/phi3_longrope_full_tiny_fixture.py): the config omits
+// partial_rotary_factor exactly as the released Phi-3-mini-128k checkpoints do,
+// so the reader's 1.0 default makes rotary_dim = head_dim and long_factor
+// carries head_dim/2 entries.
+//
+// This is the case the PARTIAL fixture cannot reach: a full rotary is what lets
+// the builder hoist ONE head-tiled rotary layer ahead of the head split, and
+// LongRoPE is precisely the mode that cannot be hoisted - CreateLongRoPE takes
+// no head dim, so a hoisted layer would run its frequency schedule over the
+// whole projection width and silently fall back to an all-ones factor table.
+// LlamaAttnHoistPlan therefore keeps this combination per-head, and the
+// per-head rotary count below pins that; the logit parity proves the
+// per-frequency division and the attention scaling still land.
+procedure TTestNeuralPretrained.TestPhi3LongRoPEFullRotaryLogitParity;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+  LayerCnt, RoPECnt, SDPACnt, FusedCnt: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildPhi3FromSafeTensorsEx(
+    FixturePath('tiny_phi3_longrope_full.safetensors'),
+    Config, {SeqLen=}16, {pTrainable=}true,
+    FixturePath('tiny_phi3_longrope_full_config.json'));
+  try
+    AssertEquals('model_type', 'phi3', Config.ModelType);
+    AssertEquals('rope mode = longrope', Ord(rsmLongRoPE),
+      Ord(Config.RopeScaling.Mode));
+    // No partial_rotary_factor in the config -> the 1.0 default -> the whole
+    // head rotates, so long_factor has head_dim/2 = 4 entries (not 3).
+    AssertEquals('full rotary', 1.0, Config.PartialRotaryFactor, 1e-9);
+    AssertEquals('long_factor count', 4,
+      Length(Config.RopeScaling.LongFactors));
+    AssertEquals('long_factor[3]', 2.4,
+      Config.RopeScaling.LongFactors[3], 1e-6);
+    AssertEquals('long attention scaling', 1.290994,
+      Config.RopeScaling.LongAttnFactor, 1e-5);
+    // LongRoPE must NOT be hoisted or fused: one rotary per q head + one per
+    // kv head per block (2 layers * (4 + 2) = 12) and one SDPA per q head
+    // (2 * 4 = 8), with no fused attention layer anywhere.
+    RoPECnt := 0;
+    SDPACnt := 0;
+    FusedCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetRotaryEmbedding then Inc(RoPECnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+        Inc(SDPACnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then Inc(FusedCnt);
+    end;
+    AssertEquals('per-head rotary layers (q + kv heads per block)', 12, RoPECnt);
+    AssertEquals('per-head SDPA layers', 8, SDPACnt);
+    AssertEquals('LongRoPE must not fuse', 0, FusedCnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_phi3_longrope_full_logits.json'), {SeqLen=}16,
+      Config.VocabSize);
   finally
     NN.Free;
   end;
