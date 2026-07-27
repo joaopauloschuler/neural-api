@@ -439,7 +439,7 @@ begin
 end;
 
 procedure TTestNeuralVolume.TestVolumeExpShiftSumParity;
-// VectorExpShiftSum is one fused AVX2/64-bit kernel (broadcast subtract,
+// ExpShiftSum is one fused AVX2/64-bit kernel (broadcast subtract,
 // 8-wide exp, in-register reduction) and a plain scalar loop on every other
 // build; both must reproduce the stable-softmax numerator/denominator the
 // attention layers used to compute element by element. Sizes straddle the
@@ -478,7 +478,7 @@ begin
     end;
 
     Tag := ' (N=' + IntToStr(N) + ')';
-    GotSum := TNNetVolume.VectorExpShiftSum(TNeuralFloatArrPtr(@Dst[0]),
+    GotSum := TNNetVolume.ExpShiftSum(TNeuralFloatArrPtr(@Dst[0]),
       TNeuralFloatArrPtr(@Src[0]), cShift, N);
     for K := 0 to N - 1 do
       AssertEquals('exp[' + IntToStr(K) + ']' + Tag, Ref[K], Dst[K],
@@ -492,7 +492,7 @@ begin
 
     // In place: dst = src must give the same answer.
     for K := 0 to N - 1 do Dst[K] := Src[K];
-    GotSum := TNNetVolume.VectorExpShiftSum(TNeuralFloatArrPtr(@Dst[0]),
+    GotSum := TNNetVolume.ExpShiftSum(TNeuralFloatArrPtr(@Dst[0]),
       TNeuralFloatArrPtr(@Dst[0]), cShift, N);
     for K := 0 to N - 1 do
     begin
@@ -503,7 +503,7 @@ begin
     AssertEquals('in-place sum' + Tag, RefSum, GotSum, 1e-5 * RefSum);
   end;
   // A zero-length run is a no-op that sums to zero.
-  AssertEquals('empty run', 0.0, TNNetVolume.VectorExpShiftSum(
+  AssertEquals('empty run', 0.0, TNNetVolume.ExpShiftSum(
     TNeuralFloatArrPtr(@Src[0]), TNeuralFloatArrPtr(@Src[0]), cShift, 0), 0.0);
 end;
 

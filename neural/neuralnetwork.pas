@@ -1350,7 +1350,7 @@ type
   // as opposed to "gelu_new"/"gelu_pytorch_tanh" which is the tanh approximation
   // implemented by TNNetGELU. erf is evaluated via pcr_erff. Derivative:
   //   GELU_erf'(x) = Phi(x) + x * phi(x), phi(x) = exp(-x^2/2)/sqrt(2*pi)
-  // erf is evaluated via the vectorized TNNetVolume.VectorErf (A&S 7.1.26,
+  // erf is evaluated via the vectorized TNNetVolume.Erf (A&S 7.1.26,
   // |err| < 1.5e-7, AVX2-accelerated) in a two-pass forward.
   // Coded by Claude (AI).
   TNNetGELUErf = class(TNNetReLUBase)
@@ -1464,7 +1464,7 @@ type
   TNNetPenalizedTanh = class(TNNetReLUBase)
   {$IFDEF AVXANY}
   private
-    FTanhBuf: array of TNeuralFloat; // persistent, lazily-sized scratch for VectorTanh (rule #17)
+    FTanhBuf: array of TNeuralFloat; // persistent, lazily-sized scratch for Tanh (rule #17)
   {$ENDIF}
   public
     procedure Compute(); override;
@@ -22832,7 +22832,7 @@ begin
   begin
     // Vectorize sigmoid(x) 8-wide into FOutputErrorDeriv (used as scratch here),
     // then finish output and derivative elementwise; the <6 clamp stays scalar.
-    TNNetVolume.VectorSigmoid(FOutputErrorDeriv.DataPtr, LocalPrevOutput.DataPtr, SizeM1 + 1);
+    TNNetVolume.Sigmoid(FOutputErrorDeriv.DataPtr, LocalPrevOutput.DataPtr, SizeM1 + 1);
     for OutputCnt := 0 to SizeM1 do
     begin
       PrevValue := LocalPrevOutput.FData[OutputCnt];
@@ -22854,7 +22854,7 @@ begin
   begin
     // can't calculate error on input layers. Forward-only path: sigmoid(x) 8-wide
     // into FOutput, multiply by x in place, then clamp to 6 in a scalar pass.
-    TNNetVolume.VectorSigmoid(FOutput.DataPtr, LocalPrevOutput.DataPtr, SizeM1 + 1);
+    TNNetVolume.Sigmoid(FOutput.DataPtr, LocalPrevOutput.DataPtr, SizeM1 + 1);
     TNNetVolume.Mul(FOutput.DataPtr, LocalPrevOutput.DataPtr, SizeM1 + 1);
     for OutputCnt := 0 to SizeM1 do
       if FOutput.FData[OutputCnt] > 6 then FOutput.FData[OutputCnt] := 6;
@@ -22928,9 +22928,9 @@ begin
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     // Vectorize sigmoid(x) 8-wide into FOutputErrorDeriv (used as scratch here),
-    // then finish output and derivative elementwise. Using the same VectorSigmoid
+    // then finish output and derivative elementwise. Using the same Sigmoid
     // as the forward-only branch keeps the two paths bit-identical.
-    TNNetVolume.VectorSigmoid(FOutputErrorDeriv.DataPtr, LocalPrevOutput.DataPtr, SizeM1 + 1);
+    TNNetVolume.Sigmoid(FOutputErrorDeriv.DataPtr, LocalPrevOutput.DataPtr, SizeM1 + 1);
     for OutputCnt := 0 to SizeM1 do
     begin
       PrevValue := LocalPrevOutput.FData[OutputCnt];
@@ -22945,7 +22945,7 @@ begin
     // can't calculate error on input layers. Forward-only path: compute
     // sigmoid(x) 8-wide into FOutput, then multiply by x in place. Parity with
     // the scalar pcr_expf form is within ~1e-6 (well under the 1e-4 target).
-    TNNetVolume.VectorSigmoid(FOutput.DataPtr, LocalPrevOutput.DataPtr, SizeM1 + 1);
+    TNNetVolume.Sigmoid(FOutput.DataPtr, LocalPrevOutput.DataPtr, SizeM1 + 1);
     TNNetVolume.Mul(FOutput.DataPtr, LocalPrevOutput.DataPtr, SizeM1 + 1);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -23065,7 +23065,7 @@ begin
     // 8-wide in place; finish output and derivative elementwise reading sig back.
     FOutputErrorDeriv.Copy(LocalPrevOutput, SizeM1 + 1);
     TNNetVolume.Mul(FOutputErrorDeriv.DataPtr, beta, SizeM1 + 1);
-    TNNetVolume.VectorSigmoid(FOutputErrorDeriv.DataPtr, FOutputErrorDeriv.DataPtr, SizeM1 + 1);
+    TNNetVolume.Sigmoid(FOutputErrorDeriv.DataPtr, FOutputErrorDeriv.DataPtr, SizeM1 + 1);
     for i := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[i];
@@ -23081,7 +23081,7 @@ begin
     // then multiply by x to give x*sigmoid(beta*x) = x / (1 + exp(-beta*x)).
     FOutput.Copy(LocalPrevOutput, SizeM1 + 1);
     TNNetVolume.Mul(FOutput.DataPtr, beta, SizeM1 + 1);
-    TNNetVolume.VectorSigmoid(FOutput.DataPtr, FOutput.DataPtr, SizeM1 + 1);
+    TNNetVolume.Sigmoid(FOutput.DataPtr, FOutput.DataPtr, SizeM1 + 1);
     TNNetVolume.Mul(FOutput.DataPtr, LocalPrevOutput.DataPtr, SizeM1 + 1);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -23449,16 +23449,16 @@ begin
   // Let s = sigmoid(x), L = ln(1 + s), t = tanh(L)
   //   dL/dx = s*(1-s) / (1+s)
   //   dy/dx = t + x * (1 - t^2) * dL/dx
-  // Two-pass: VectorSigmoid -> s, then VectorTanh(log1p(s)) -> t, then a scalar
+  // Two-pass: Sigmoid -> s, then Tanh(log1p(s)) -> t, then a scalar
   // finishing pass combines them (and the derivative).
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     // s = sigmoid(x) into FOutputErrorDeriv (reused as scratch, overwritten below).
-    TNNetVolume.VectorSigmoid(@FOutputErrorDeriv.FData[0], @LocalPrevOutput.FData[0],
+    TNNetVolume.Sigmoid(@FOutputErrorDeriv.FData[0], @LocalPrevOutput.FData[0],
       LocalPrevOutput.Size);
     for OutputCnt := 0 to SizeM1 do
       FOutput.FData[OutputCnt] := pcr_log1pf(FOutputErrorDeriv.FData[OutputCnt]);
-    TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+    TNNetVolume.Tanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
@@ -23472,11 +23472,11 @@ begin
   else
   begin
     // can't calculate error on input layers: s in FOutput, then log1p, then tanh.
-    TNNetVolume.VectorSigmoid(@FOutput.FData[0], @LocalPrevOutput.FData[0],
+    TNNetVolume.Sigmoid(@FOutput.FData[0], @LocalPrevOutput.FData[0],
       LocalPrevOutput.Size);
     for OutputCnt := 0 to SizeM1 do
       FOutput.FData[OutputCnt] := pcr_log1pf(FOutput.FData[OutputCnt]);
-    TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+    TNNetVolume.Tanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
     for OutputCnt := 0 to SizeM1 do
       FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt] * FOutput.FData[OutputCnt];
   end;
@@ -23528,7 +23528,7 @@ begin
   if Size > 0 then
   begin
     if Length(FExpBuf) <> Size then SetLength(FExpBuf, Size); // rule #17: lazy amortized resize
-    TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpBuf[0]),
+    TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpBuf[0]),
       TNeuralFloatArrPtr(@LocalPrevOutput.FData[0]), Size);
     if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
     begin
@@ -23656,14 +23656,14 @@ begin
   //   x <= 0: y = 0.25 * tanh(x), dy/dx = 0.25 * (1 - tanh(x)^2)
   {$IFDEF AVXANY}
   // The input is a single depth-contiguous elementwise segment, so tanh(x) is
-  // batched 8-wide via VectorTanh (built on AVXExp, the vector exp PointwiseSoftMax
+  // batched 8-wide via Tanh (built on AVXExp, the vector exp PointwiseSoftMax
   // uses; ~1e-6 vs scalar pcr_tanhf with the same +/-1 saturation). The cheap
   // x>0 alpha-select and the derivative stay in a scalar finishing pass.
   Size := LocalPrevOutput.Size;
   if Size > 0 then
   begin
     if Length(FTanhBuf) <> Size then SetLength(FTanhBuf, Size); // rule #17: lazy amortized resize
-    TNNetVolume.VectorTanh(TNeuralFloatArrPtr(@FTanhBuf[0]),
+    TNNetVolume.Tanh(TNeuralFloatArrPtr(@FTanhBuf[0]),
       TNeuralFloatArrPtr(@LocalPrevOutput.FData[0]), Size);
     if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
     begin
@@ -23802,7 +23802,7 @@ begin
   SizeM1 := LocalSize - 1;
 
   // Two-pass: fill FOutput with the tanh argument, vectorize tanh in place
-  // (VectorTanh), then a scalar finishing pass reads tanhVal back from FOutput.
+  // (Tanh), then a scalar finishing pass reads tanhVal back from FOutput.
   // The argument sqrt(2/pi) * (x + 0.044715*x^3) is itself a short sequence of
   // bulk ops rather than a scalar map (#13, appendix D): x^2, then *x, then the
   // cubic coefficient, with the linear term folded in by one MulAdd. That
@@ -23815,7 +23815,7 @@ begin
   TNNetVolume.Mul(@FOutput.FData[0], SQRT_2_OVER_PI * GELU_CONST, LocalSize);
   TNNetVolume.MulAdd(@FOutput.FData[0], @LocalPrevOutput.FData[0],
     SQRT_2_OVER_PI, LocalSize);
-  TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalSize);
+  TNNetVolume.Tanh(@FOutput.FData[0], @FOutput.FData[0], LocalSize);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
@@ -23877,12 +23877,12 @@ begin
   StartTime := Now();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
-  // Two-pass: fill FOutput with x/sqrt(2), vectorize erf in place (VectorErf),
+  // Two-pass: fill FOutput with x/sqrt(2), vectorize erf in place (Erf),
   // then a scalar finishing pass reads erf(x/sqrt(2)) back from FOutput.
   // #13: seed = scale-copy of prev output by 1/sqrt(2); Move then vectorized Mul.
   Move(LocalPrevOutput.FData[0], FOutput.FData[0], (SizeM1 + 1) * csNeuralFloatSize);
   TNNetVolume.Mul(@FOutput.FData[0], INV_SQRT_2, SizeM1 + 1);
-  TNNetVolume.VectorErf(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+  TNNetVolume.Erf(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
@@ -24026,7 +24026,7 @@ begin
   {$ELSE}
   // GEGLU = A*gelu_tanh(B) = A*B*0.5*(1+tanh(arg)). The B (offset HalfDepth) and
   // A (offset 0) depth-halves are each contiguous, so the tanh ride is AVX-
-  // vectorized via TNNetVolume.VectorTanh (built on AVXExp): write the tanh
+  // vectorized via TNNetVolume.Tanh (built on AVXExp): write the tanh
   // argument into the output row, vectorize tanh in place, then a scalar finish
   // (no transcendental) folds in B and A.
   for X := 0 to MaxX do
@@ -24045,7 +24045,7 @@ begin
       TNNetVolume.Mul(outPtr, bPtr, HalfDepth);                          // b^3
       TNNetVolume.Mul(outPtr, SQRT_2_OVER_PI * GELU_CONST, HalfDepth);
       TNNetVolume.MulAdd(outPtr, bPtr, SQRT_2_OVER_PI, HalfDepth);
-      TNNetVolume.VectorTanh(outPtr, outPtr, HalfDepth); // out := tanh(arg)
+      TNNetVolume.Tanh(outPtr, outPtr, HalfDepth); // out := tanh(arg)
       for D := 0 to MaxD do
       begin
         a := aPtr^[D];
@@ -24206,7 +24206,7 @@ begin
   {$ELSE}
   // GEGLUErf = A*gelu_erf(B) = A*B*0.5*(1+erf(B/sqrt(2))). The B (offset
   // HalfDepth) and A (offset 0) depth-halves are each contiguous, so the erf
-  // ride is AVX-vectorized via TNNetVolume.VectorErf (built on AVXExp): write
+  // ride is AVX-vectorized via TNNetVolume.Erf (built on AVXExp): write
   // B/sqrt(2) into the output row, vectorize erf in place, then a scalar finish
   // (no transcendental) folds in B and A.
   for X := 0 to MaxX do
@@ -24220,7 +24220,7 @@ begin
       // (AVX) - the scalar seed loop was the guide's named GEGLU anti-example.
       Move(bPtr^[0], outPtr^[0], HalfDepth * csNeuralFloatSize);
       TNNetVolume.Mul(outPtr, INV_SQRT_2, HalfDepth);
-      TNNetVolume.VectorErf(outPtr, outPtr, HalfDepth); // out := erf(B/sqrt(2))
+      TNNetVolume.Erf(outPtr, outPtr, HalfDepth); // out := erf(B/sqrt(2))
       for D := 0 to MaxD do
       begin
         a := aPtr^[D];
@@ -24503,7 +24503,7 @@ begin
   // SwiGLU = A*swish(B) = A*B*sigmoid(B). Token t's A half lives at prev raw
   // offset t*2H, its B half at t*2H+H, its output at t*H - all depth-contiguous
   // - so the element range [StartRange..FinRange] is walked token by token and
-  // each covered sub-segment keeps the vectorized form: VectorSigmoid (built on
+  // each covered sub-segment keeps the vectorized form: Sigmoid (built on
   // AVXExp) writes sigmoid(B), then two elementwise Mul passes fold in B and A.
   // Reads only pass-stable FPrevLayer.FOutput; writes only [StartRange..FinRange].
   HalfDepth := FOutput.Depth;
@@ -24531,7 +24531,7 @@ begin
     aPtr := FPrevLayer.FOutput.GetRawPtr(PrevBase + D0);
     bPtr := FPrevLayer.FOutput.GetRawPtr(PrevBase + HalfDepth + D0);
     outPtr := FOutput.GetRawPtr(SegBase + D0);
-    TNNetVolume.VectorSigmoid(outPtr, bPtr, SegLen); // out := sigmoid(B)
+    TNNetVolume.Sigmoid(outPtr, bPtr, SegLen); // out := sigmoid(B)
     TNNetVolume.Mul(outPtr, bPtr, SegLen);           // out := B*sigmoid(B)
     TNNetVolume.Mul(outPtr, aPtr, SegLen);           // out := A*swish(B)
     {$ENDIF}
@@ -24801,7 +24801,7 @@ begin
   {$ELSE}
   // The A (offset 0) and B (offset HalfDepth) depth-halves are each a contiguous
   // depth-axis run, so GLU = A*sigmoid(B) maps onto the AVX vector primitives:
-  // VectorSigmoid writes sigmoid(B) into the output row (built on AVXExp), then
+  // Sigmoid writes sigmoid(B) into the output row (built on AVXExp), then
   // an AVX elementwise Mul folds in A.
   for X := 0 to MaxX do
     for Y := 0 to MaxY do
@@ -24810,7 +24810,7 @@ begin
       // #13: b-half is a's constant-offset neighbour (+HalfDepth), no 2nd accessor
       bPtr := TNeuralFloatArrPtr(@aPtr^[HalfDepth]);
       outPtr := FOutput.GetRawPtr(X, Y);
-      TNNetVolume.VectorSigmoid(outPtr, bPtr, HalfDepth); // out := sigmoid(B)
+      TNNetVolume.Sigmoid(outPtr, bPtr, HalfDepth); // out := sigmoid(B)
       TNNetVolume.Mul(outPtr, aPtr, HalfDepth);           // out := A * sigmoid(B)
     end;
   {$ENDIF}
@@ -24916,7 +24916,7 @@ begin
   {$ELSE}
   // ReGLU = ReLU(A)*B. The A (offset 0) and B (offset HalfDepth) depth-halves
   // are each a contiguous depth-axis run, so the relu ride is AVX-vectorized
-  // via TNNetVolume.VectorRelu: write ReLU(A) into the output row, then an AVX
+  // via TNNetVolume.Relu: write ReLU(A) into the output row, then an AVX
   // elementwise Mul folds in B. Bit-exact (relu is a compare-and-select).
   for X := 0 to MaxX do
     for Y := 0 to MaxY do
@@ -24925,7 +24925,7 @@ begin
       // #13: b-half is a's constant-offset neighbour (+HalfDepth), no 2nd accessor
       bPtr := TNeuralFloatArrPtr(@aPtr^[HalfDepth]);
       outPtr := FOutput.GetRawPtr(X, Y);
-      TNNetVolume.VectorRelu(outPtr, aPtr, HalfDepth); // out := ReLU(A)
+      TNNetVolume.Relu(outPtr, aPtr, HalfDepth); // out := ReLU(A)
       TNNetVolume.Mul(outPtr, bPtr, HalfDepth);        // out := ReLU(A) * B
     end;
   {$ENDIF}
@@ -25225,7 +25225,7 @@ begin
   {$ELSE}
   // ReGLUSquared = A*ReLU(B)^2. The A (offset 0) and B (offset HalfDepth)
   // depth-halves are each a contiguous depth-axis run, so the row is three AVX
-  // passes: ReLU(B) into the output via VectorRelu, an in-place elementwise
+  // passes: ReLU(B) into the output via Relu, an in-place elementwise
   // square, then an elementwise Mul by A. The products are re-associated as
   // A*(r*r) instead of (A*r)*r, so this is equivalent but not bit-identical.
   for X := 0 to MaxX do
@@ -25235,7 +25235,7 @@ begin
       // #13: b-half is a's constant-offset neighbour (+HalfDepth), no 2nd accessor
       bPtr := TNeuralFloatArrPtr(@aPtr^[HalfDepth]);
       outPtr := FOutput.GetRawPtr(X, Y);
-      TNNetVolume.VectorRelu(outPtr, bPtr, HalfDepth); // out := ReLU(B)
+      TNNetVolume.Relu(outPtr, bPtr, HalfDepth); // out := ReLU(B)
       TNNetVolume.Mul(outPtr, outPtr, HalfDepth);      // out := ReLU(B)^2
       TNNetVolume.Mul(outPtr, aPtr, HalfDepth);        // out := A * ReLU(B)^2
     end;
@@ -25342,7 +25342,7 @@ begin
   {$ELSE}
   // TanhGLU = A*tanh(B). The A (offset 0) and B (offset HalfDepth) depth-halves
   // are each a contiguous depth-axis run, so the tanh ride is AVX-vectorized via
-  // TNNetVolume.VectorTanh (built on AVXExp): write tanh(B) into the output row,
+  // TNNetVolume.Tanh (built on AVXExp): write tanh(B) into the output row,
   // then an AVX elementwise Mul folds in A.
   for X := 0 to MaxX do
     for Y := 0 to MaxY do
@@ -25351,7 +25351,7 @@ begin
       // #13: b-half is a's constant-offset neighbour (+HalfDepth), no 2nd accessor
       bPtr := TNeuralFloatArrPtr(@aPtr^[HalfDepth]);
       outPtr := FOutput.GetRawPtr(X, Y);
-      TNNetVolume.VectorTanh(outPtr, bPtr, HalfDepth); // out := tanh(B)
+      TNNetVolume.Tanh(outPtr, bPtr, HalfDepth); // out := tanh(B)
       TNNetVolume.Mul(outPtr, aPtr, HalfDepth);         // out := A * tanh(B)
     end;
   {$ENDIF}
@@ -25998,15 +25998,15 @@ begin
   InvCap := 1.0 / Cap;
 
   // The whole volume is one contiguous uniform map, so tanh runs vectorized in
-  // place (#19): copy the input, scale by 1/Cap, then VectorTanh. Gemma-2
+  // place (#19): copy the input, scale by 1/Cap, then Tanh. Gemma-2
   // applies this layer to the final logits, so LocalSize is the whole
   // vocabulary on every decoded token.
   Move(LocalPrevOutput.FData[0], FOutput.FData[0],
     LocalSize * csNeuralFloatSize);
   TNNetVolume.Mul(@FOutput.FData[0], InvCap, LocalSize);
-  TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalSize);
+  TNNetVolume.Tanh(@FOutput.FData[0], @FOutput.FData[0], LocalSize);
   // The finishing pass applies the Cap scaling and, where needed, the
-  // small-argument correction: VectorTanh evaluates
+  // small-argument correction: Tanh evaluates
   // (1 - exp(-2u)) / (1 + exp(-2u)), whose numerator has lost every significant
   // digit by the time u is small, and this layer's argument is x/Cap - tiny by
   // construction whenever the cap is large. The odd series u - u^3/3 is exact
@@ -31415,7 +31415,7 @@ begin
     // future positions are simply not in the cache yet). The live prefix is a
     // contiguous FCacheScores run, so the shift, the exp and the normalizer are
     // one fused vectorized pass (#19).
-    SumExp := TNNetVolume.VectorExpShiftSum(
+    SumExp := TNNetVolume.ExpShiftSum(
       TNeuralFloatArrPtr(@FCacheScores[jStart]),
       TNeuralFloatArrPtr(@FCacheScores[jStart]), MaxScore,
       CacheLenM1 - jStart + 1);
@@ -31663,7 +31663,7 @@ begin
       // The score row is contiguous, so the shift, the exp and the normalizer
       // are one fused vectorized pass (#19).
       AttnRowPtr := FAttn.GetRawPtr(AttnRow);
-      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+      SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
         SeqLen);
       if SumExp > 0 then
         TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
@@ -31840,7 +31840,7 @@ begin
       // exact zero the softmax would have produced.
       BandLen := jHi - jLo + 1;
       AttnRowPtr := FAttn.GetRawPtr(AttnRow + jLo);
-      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+      SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
         BandLen);
       if SumExp > 0 then
         TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, BandLen);
@@ -32232,7 +32232,7 @@ begin
         // normalizer are one fused vectorized pass (#19).
         BandLen := jHi - jLo + 1;
         AttnRowPtr := FAttn.GetRawPtr(AttnBandBase);
-        SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr,
+        SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr,
           MaxScore, BandLen);
         if SumExp > 0 then
           TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, BandLen);
@@ -32432,7 +32432,7 @@ begin
     // The live prefix of this head's score band is contiguous, so the shift,
     // the exp and the normalizer are one fused vectorized pass (#19).
     pos := ScoreBase + jStart;           // (#4)
-    SumExp := TNNetVolume.VectorExpShiftSum(
+    SumExp := TNNetVolume.ExpShiftSum(
       TNeuralFloatArrPtr(@FCacheScores[pos]),
       TNeuralFloatArrPtr(@FCacheScores[pos]), MaxScore,
       LiveLenM1 - jStart + 1);
@@ -33041,7 +33041,7 @@ begin
       // The pattern-score row is contiguous, so the shift, the exp and the
       // normalizer are one fused vectorized pass (#19).
       PRowPtr := FP.GetRawPtr(PBase);
-      SumExp := TNNetVolume.VectorExpShiftSum(PRowPtr, PRowPtr, MaxScore,
+      SumExp := TNNetVolume.ExpShiftSum(PRowPtr, PRowPtr, MaxScore,
         FNumPatterns);
       if SumExp > 0 then
         for p := 0 to NumPatternsM1 do
@@ -33307,7 +33307,7 @@ begin
     // perturbation is amplified through the SAB stack until
     // TestSABInputGradientCheck fails.
     A1RowPtr := FA1.GetRawPtr(baseA);
-    SumExp := TNNetVolume.VectorExpShiftSum(A1RowPtr, A1RowPtr, MaxScore,
+    SumExp := TNNetVolume.ExpShiftSum(A1RowPtr, A1RowPtr, MaxScore,
       SeqLen);
     if SumExp > 0 then
       for ni := 0 to SeqLenM1 do
@@ -33340,7 +33340,7 @@ begin
     // Same fused pass over the (contiguous) FM-long row; the normalize again
     // stays an exact divide for the gradient check (#21).
     A2RowPtr := FA2.GetRawPtr(baseA);
-    SumExp := TNNetVolume.VectorExpShiftSum(A2RowPtr, A2RowPtr, MaxScore, FM);
+    SumExp := TNNetVolume.ExpShiftSum(A2RowPtr, A2RowPtr, MaxScore, FM);
     if SumExp > 0 then
       for m := 0 to MM1 do
         FA2.FData[baseA + m] := FA2.FData[baseA + m] / SumExp;
@@ -34703,7 +34703,7 @@ begin
     // The score row is contiguous, so the shift, the exp and the normalizer
     // are one fused vectorized pass (#19).
     AttnRowPtr := FAttn.GetRawPtr(AttnRow);
-    SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+    SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
       KVLen);
     if SumExp > 0 then
       TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, KVLen);
@@ -34780,7 +34780,7 @@ begin
     // The score row is contiguous, so the shift, the exp and the normalizer
     // are one fused vectorized pass (#19).
     AttnRowPtr := FAttn.GetRawPtr(AttnRow);
-    SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+    SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
       KVLen);
     if SumExp > 0 then
       TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, KVLen);
@@ -38015,14 +38015,14 @@ begin
   begin
     basePrev := Prev.GetRawPos(i, 0);
     basePhi := FPhiQ.GetRawPos(i, 0);          // FPhiK shares FPhiQ shape (#4: reuse)
-    TNNetVolume.VectorExp(TNeuralFloatArrPtr(FPhiQ.GetRawPtr(basePhi)),
+    TNNetVolume.Exp(TNeuralFloatArrPtr(FPhiQ.GetRawPtr(basePhi)),
            TNeuralFloatArrPtr(Prev.GetRawPtr(basePrev)), FDk);
     for a := 0 to DkM1 do
     begin
       Q := Prev.FData[basePrev + a];
       if Q >= 0 then FPhiQ.FData[basePhi + a] := Q + 1;
     end;
-    TNNetVolume.VectorExp(TNeuralFloatArrPtr(FPhiK.GetRawPtr(basePhi)),
+    TNNetVolume.Exp(TNeuralFloatArrPtr(FPhiK.GetRawPtr(basePhi)),
            TNeuralFloatArrPtr(Prev.GetRawPtr(basePrev + FDk)), FDk);
     for a := 0 to DkM1 do
     begin
@@ -39604,7 +39604,7 @@ begin
     // Softmax (numerically stable). The score row is contiguous, so the shift,
     // the exp and the normalizer are one fused vectorized pass (#19).
     AttnRowPtr := FAttn.GetRawPtr(AttnRow);
-    SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+    SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
       SeqLen);
     if SumExp > 0 then
       TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
@@ -39735,7 +39735,7 @@ begin
       // are one fused vectorized pass (#19), and the scale is the same single
       // reciprocal-multiply the CPU forward of this layer already uses.
       AttnRowPtr := FAttn.GetRawPtr(AttnRow);
-      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+      SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
         SeqLen);
       if SumExp > 0 then
         TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
@@ -40096,7 +40096,7 @@ begin
       // The score row is contiguous, so the shift, the exp and the normalizer
       // are one fused vectorized pass (#19).
       AttnRowPtr := FAttn.GetRawPtr(AttnRow);
-      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+      SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
         SeqLen);
       if SumExp > 0 then
         TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
@@ -40192,7 +40192,7 @@ begin
     end;
     // The live prefix is a contiguous FCacheScores run, so the shift, the exp
     // and the normalizer are one fused vectorized pass (#19).
-    SumExp := TNNetVolume.VectorExpShiftSum(
+    SumExp := TNNetVolume.ExpShiftSum(
       TNeuralFloatArrPtr(@FCacheScores[jStart]),
       TNeuralFloatArrPtr(@FCacheScores[jStart]), MaxScore,
       CacheLenM1 - jStart + 1);
@@ -40499,7 +40499,7 @@ begin
       // The score row is contiguous, so the shift, the exp and the normalizer
       // are one fused vectorized pass (#19).
       AttnRowPtr := FAttn.GetRawPtr(AttnRow);
-      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+      SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
         SeqLen);
       if SumExp > 0 then
         TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
@@ -40628,7 +40628,7 @@ begin
       // The score row is contiguous, so the shift, the exp and the normalizer
       // are one fused vectorized pass (#19).
       AttnRowPtr := FAttn.GetRawPtr(AttnRow);
-      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+      SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
         SeqLen);
       if SumExp > 0 then
         TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
@@ -40880,7 +40880,7 @@ begin
       // one fused vectorized pass (#19).
       BandLen := jHi - jLo + 1;
       AttnRowPtr := FAttn.GetRawPtr(AttnRow + jLo);
-      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+      SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
         BandLen);
       if SumExp > 0 then
         TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, BandLen);
@@ -40994,7 +40994,7 @@ begin
       // are one fused vectorized pass (#19), and the scale is the same single
       // reciprocal-multiply the CPU forward of this layer already uses.
       AttnRowPtr := FAttn.GetRawPtr(AttnRow);
-      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+      SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
         SeqLen);
       if SumExp > 0 then
         TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
@@ -41221,7 +41221,7 @@ begin
       // The score row is contiguous, so the shift, the exp and the normalizer
       // are one fused vectorized pass (#19).
       AttnRowPtr := FAttn.GetRawPtr(AttnRow);
-      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+      SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
         SeqLen);
       if SumExp > 0 then
         TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
@@ -41333,7 +41333,7 @@ begin
       // are one fused vectorized pass (#19), and the scale is the same single
       // reciprocal-multiply the CPU forward of this layer already uses.
       AttnRowPtr := FAttn.GetRawPtr(AttnRow);
-      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+      SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
         SeqLen);
       if SumExp > 0 then
         TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
@@ -41410,7 +41410,7 @@ begin
     end;
     // The live prefix is a contiguous FCacheScores run, so the shift, the exp
     // and the normalizer are one fused vectorized pass (#19).
-    SumExp := TNNetVolume.VectorExpShiftSum(
+    SumExp := TNNetVolume.ExpShiftSum(
       TNeuralFloatArrPtr(@FCacheScores[jStart]),
       TNeuralFloatArrPtr(@FCacheScores[jStart]), MaxScore,
       CacheLenM1 - jStart + 1);
@@ -41545,7 +41545,7 @@ begin
       // The score row is contiguous, so the shift, the exp and the normalizer
       // are one fused vectorized pass (#19).
       AttnRowPtr := FAttn.GetRawPtr(AttnRow);
-      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+      SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
         SeqN);
       if SumExp > 0 then
         TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqN);
@@ -41674,7 +41674,7 @@ begin
       // The score row is contiguous, so the shift, the exp and the normalizer
       // are one fused vectorized pass (#19).
       AttnRowPtr := FAttn.GetRawPtr(AttnRow);
-      SumExp := TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
+      SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
         SeqN);
       if SumExp > 0 then
         TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqN);
@@ -42211,7 +42211,7 @@ begin
     // is contiguous, so the shift, the exp and the normalizer are one fused
     // vectorized pass (#19).
     RowPtr := FSinkAttn.GetRawPtr(Row);
-    SumExp := TNNetVolume.VectorExpShiftSum(RowPtr, RowPtr, MaxScore, AugLen);
+    SumExp := TNNetVolume.ExpShiftSum(RowPtr, RowPtr, MaxScore, AugLen);
     if SumExp > 0 then
       TNNetVolume.Mul(RowPtr, 1 / SumExp, AugLen);
     // 3) Output[i, d] = sum_s w_sink[s]*SinkValue[s,d] + sum_j w_real[j]*V[j,d].
@@ -42471,7 +42471,7 @@ begin
     //    (#19); the sink term seeds the denominator.
     AttnRowPtr := FAttn.GetRawPtr(AttnRow);
     SumExp := NeuralExp(Sink - MaxScore) +
-      TNNetVolume.VectorExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore, SeqLen);
+      TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore, SeqLen);
     if SumExp > 0 then
       TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
     // 3) Output[i, d] = sum_j Attn[i,j] * V[j,d] (V contiguous along depth).
@@ -42710,8 +42710,8 @@ begin
     //    neither vectorizably.
     Row1Ptr := FAttn.GetRawPtr(Row);
     Row2Ptr := FAttn2.GetRawPtr(Row);
-    Sum1 := TNNetVolume.VectorExpShiftSum(Row1Ptr, Row1Ptr, Max1, SeqLen);
-    Sum2 := TNNetVolume.VectorExpShiftSum(Row2Ptr, Row2Ptr, Max2, SeqLen);
+    Sum1 := TNNetVolume.ExpShiftSum(Row1Ptr, Row1Ptr, Max1, SeqLen);
+    Sum2 := TNNetVolume.ExpShiftSum(Row2Ptr, Row2Ptr, Max2, SeqLen);
     // Normalize each contiguous length-SeqLen row with one AVX scale (#13).
     if Sum1 > 0 then
       TNNetVolume.Mul(Row1Ptr, 1 / Sum1, SeqLen);
@@ -44286,7 +44286,7 @@ begin
   SizeM1 := LocalPrevOutput.Size - 1;
 
   // Two-pass: fill FOutput with softplus(x), vectorize tanh in place
-  // (VectorTanh), then a scalar finishing pass reads tanh(softplus(x)) back.
+  // (Tanh), then a scalar finishing pass reads tanh(softplus(x)) back.
   for OutputCnt := 0 to SizeM1 do
   begin
     x := LocalPrevOutput.FData[OutputCnt];
@@ -44298,7 +44298,7 @@ begin
     else
       FOutput.FData[OutputCnt] := pcr_log1pf(NeuralExp(x));
   end;
-  TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+  TNNetVolume.Tanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
@@ -44370,8 +44370,8 @@ begin
   SizeM1 := LocalPrevOutput.Size - 1;
 
   // Phish(x) = x * tanh(gelu(x)), where gelu uses the tanh approximation.
-  // Two nested tanh layers, each vectorized: VectorTanh on the GELU argument,
-  // then VectorTanh on g = gelu(x). Scratch passes are scalar.
+  // Two nested tanh layers, each vectorized: Tanh on the GELU argument,
+  // then Tanh on g = gelu(x). Scratch passes are scalar.
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     // Inner tanh: FOutput := tanh(gelu_arg(x)).
@@ -44381,7 +44381,7 @@ begin
       x3 := x * x * x;
       FOutput.FData[OutputCnt] := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
     end;
-    TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+    TNNetVolume.Tanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
     // FOutput := g = gelu(x); FOutputErrorDeriv := dg/dx (uses inner tanhVal).
     for OutputCnt := 0 to SizeM1 do
     begin
@@ -44393,7 +44393,7 @@ begin
         SQRT_2_OVER_PI * (1 + 3 * GELU_CONST * x * x);
     end;
     // Outer tanh: FOutput := t = tanh(g).
-    TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+    TNNetVolume.Tanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
@@ -44412,11 +44412,11 @@ begin
       x3 := x * x * x;
       FOutput.FData[OutputCnt] := SQRT_2_OVER_PI * (x + GELU_CONST * x3);
     end;
-    TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+    TNNetVolume.Tanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
     for OutputCnt := 0 to SizeM1 do
       FOutput.FData[OutputCnt] := 0.5 * LocalPrevOutput.FData[OutputCnt] *
         (1 + FOutput.FData[OutputCnt]);
-    TNNetVolume.VectorTanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+    TNNetVolume.Tanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
     TNNetVolume.Mul(FOutput.DataPtr, LocalPrevOutput.DataPtr, LocalPrevOutput.Size);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -44462,7 +44462,7 @@ begin
   SizeM1 := LocalPrevOutput.Size - 1;
   twoOverSqrtPi := 2.0 / Sqrt(Pi);
 
-  // Two-pass: fill FOutput with softplus(x), vectorize erf in place (VectorErf),
+  // Two-pass: fill FOutput with softplus(x), vectorize erf in place (Erf),
   // then a scalar finishing pass reads erf(softplus(x)) back from FOutput.
   for OutputCnt := 0 to SizeM1 do
   begin
@@ -44474,7 +44474,7 @@ begin
     else
       FOutput.FData[OutputCnt] := pcr_log1pf(NeuralExp(x));
   end;
-  TNNetVolume.VectorErf(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+  TNNetVolume.Erf(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
@@ -44627,7 +44627,7 @@ begin
     begin
       if Length(FExpNeg) <> Size then SetLength(FExpNeg, Size); // rule #17: lazy amortized resize
       // FExpNeg := exp(-x) before FExpPos := exp(x), since FExpPos currently holds -x.
-      TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpNeg[0]), TNeuralFloatArrPtr(@FExpPos[0]), Size);
+      TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpNeg[0]), TNeuralFloatArrPtr(@FExpPos[0]), Size);
       // FExpPos := exp(clamp(x)). Refill with the clamped +x argument.
       for OutputCnt := 0 to SizeM1 do
       begin
@@ -44636,7 +44636,7 @@ begin
         else if x < -88 then FExpPos[OutputCnt] := -88
         else FExpPos[OutputCnt] := x;
       end;
-      TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpPos[0]), TNeuralFloatArrPtr(@FExpPos[0]), Size);
+      TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpPos[0]), TNeuralFloatArrPtr(@FExpPos[0]), Size);
       for OutputCnt := 0 to SizeM1 do
       begin
         x := LocalPrevOutput.FData[OutputCnt];
@@ -44667,7 +44667,7 @@ begin
         else if x < -88 then FExpPos[OutputCnt] := -88
         else FExpPos[OutputCnt] := x;
       end;
-      TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpPos[0]), TNeuralFloatArrPtr(@FExpPos[0]), Size);
+      TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpPos[0]), TNeuralFloatArrPtr(@FExpPos[0]), Size);
       for OutputCnt := 0 to SizeM1 do
       begin
         x := LocalPrevOutput.FData[OutputCnt];
@@ -44784,7 +44784,7 @@ begin
     Move(LocalPrevOutput.FData[0], FBetaXBuf[0], Size * csNeuralFloatSize);
     TNNetVolume.Mul(@FBetaXBuf[0], Beta, Size);
     if Length(FExpBuf) <> Size then SetLength(FExpBuf, Size); // rule #17: lazy amortized resize
-    TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FBetaXBuf[0]), Size);
+    TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FBetaXBuf[0]), Size);
     if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
     begin
       for OutputCnt := 0 to SizeM1 do
@@ -45124,7 +45124,7 @@ begin
           if x > 88 then x := 88 else if x < -88 then x := -88;
           FExpBuf[OutputCnt] := x;
         end;
-        TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FExpBuf[0]), Size);
+        TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FExpBuf[0]), Size);
         for OutputCnt := 0 to SizeM1 do
         begin
           // y = (exp(alpha*x) - 1)/alpha + alpha; derivative = exp(alpha*x).
@@ -45172,7 +45172,7 @@ begin
           if x > 88 then x := 88 else if x < -88 then x := -88;
           FExpBuf[OutputCnt] := x;
         end;
-        TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FExpBuf[0]), Size);
+        TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FExpBuf[0]), Size);
         for OutputCnt := 0 to SizeM1 do
           FOutput.FData[OutputCnt] := (FExpBuf[OutputCnt] - 1) * InvAlpha + Alpha;
       end;
@@ -45220,7 +45220,7 @@ begin
       x := LocalPrevOutput.FData[OutputCnt];
       FExpBuf[OutputCnt] := -x * x;
     end;
-    TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FExpBuf[0]), Size);
+    TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FExpBuf[0]), Size);
     if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
     begin
       for OutputCnt := 0 to SizeM1 do
@@ -45741,14 +45741,14 @@ begin
   SizeM1 := LocalPrevOutput.Size - 1;
 
   // sin(x). Derivative is cos(x). The forward sin pass is vectorized via the AVX2
-  // TNNetVolume.VectorSin (Cephes range-reduced polynomial); the cos derivative is
+  // TNNetVolume.Sin (Cephes range-reduced polynomial); the cos derivative is
   // filled by a scalar finishing pass that reads x back from LocalPrevOutput, so the
   // backward math is byte-identical to the previous per-element pcr_sincosf path.
-  TNNetVolume.VectorSin(@FOutput.FData[0], @LocalPrevOutput.FData[0],
+  TNNetVolume.Sin(@FOutput.FData[0], @LocalPrevOutput.FData[0],
     LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
-    TNNetVolume.VectorCos(@FOutputErrorDeriv.FData[0], @LocalPrevOutput.FData[0],
+    TNNetVolume.Cos(@FOutputErrorDeriv.FData[0], @LocalPrevOutput.FData[0],
       LocalPrevOutput.Size);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -45769,14 +45769,14 @@ begin
   SizeM1 := LocalPrevOutput.Size - 1;
 
   // cos(x). Derivative is -sin(x). The forward cos pass is vectorized via the AVX2
-  // TNNetVolume.VectorCos (Cephes range-reduced polynomial); the -sin derivative is
+  // TNNetVolume.Cos (Cephes range-reduced polynomial); the -sin derivative is
   // filled by a scalar finishing pass that reads x back from LocalPrevOutput, so the
   // backward math is byte-identical to the previous per-element pcr_sincosf path.
-  TNNetVolume.VectorCos(@FOutput.FData[0], @LocalPrevOutput.FData[0],
+  TNNetVolume.Cos(@FOutput.FData[0], @LocalPrevOutput.FData[0],
     LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
-    TNNetVolume.VectorSin(@FOutputErrorDeriv.FData[0], @LocalPrevOutput.FData[0],
+    TNNetVolume.Sin(@FOutputErrorDeriv.FData[0], @LocalPrevOutput.FData[0],
       LocalPrevOutput.Size);
     TNNetVolume.Mul(@FOutputErrorDeriv.FData[0], -1.0, LocalPrevOutput.Size);
   end;
@@ -45798,10 +45798,10 @@ begin
   SizeM1 := LocalPrevOutput.Size - 1;
 
   // SinhAct(x) = sinh(x). Derivative is cosh(x).
-  // Two-pass: vectorize sinh(x) into FOutput via TNNetVolume.VectorSinh (built on
-  // the AVX2 VectorExp), then a scalar finishing pass fills the cosh derivative
+  // Two-pass: vectorize sinh(x) into FOutput via TNNetVolume.Sinh (built on
+  // the AVX2 Exp), then a scalar finishing pass fills the cosh derivative
   // (read back from LocalPrevOutput, so backward math is byte-identical).
-  TNNetVolume.VectorSinh(@FOutput.FData[0], @LocalPrevOutput.FData[0],
+  TNNetVolume.Sinh(@FOutput.FData[0], @LocalPrevOutput.FData[0],
     LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
@@ -45830,11 +45830,11 @@ begin
   SizeM1 := LocalPrevOutput.Size - 1;
 
   // arcsinh(x) = ln(x + sqrt(x^2 + 1)). Derivative is 1/sqrt(x^2 + 1).
-  // The forward ln(x+sqrt(x^2+1)) pass is vectorized via TNNetVolume.VectorArcSinh
-  // (built on the AVX2 VectorLn); the 1/sqrt(x^2+1) derivative is filled by a scalar
+  // The forward ln(x+sqrt(x^2+1)) pass is vectorized via TNNetVolume.ArcSinh
+  // (built on the AVX2 Ln); the 1/sqrt(x^2+1) derivative is filled by a scalar
   // finishing pass that reads x back from LocalPrevOutput, so the backward math is
   // byte-identical to the previous per-element path. sqrt argument is always >= 1.
-  TNNetVolume.VectorArcSinh(@FOutput.FData[0], @LocalPrevOutput.FData[0],
+  TNNetVolume.ArcSinh(@FOutput.FData[0], @LocalPrevOutput.FData[0],
     LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
@@ -45867,19 +45867,19 @@ begin
   // Numerically stable: log(cosh(x)) = |x| + ln(1 + exp(-2*|x|)) - ln(2).
   // For |x| > 15, the exp term underflows to 0 and the result is |x| - ln(2),
   // which avoids EOverflow when cosh(x) itself would explode.
-  // Derivative is tanh(x); for |x| > 15 we saturate to +/-1 (VectorTanh already
-  // saturates there). Two-pass forward: VectorExp produces exp(-2|x|) into FOutput
-  // and VectorTanh produces the derivative; scalar passes finish elementwise.
+  // Derivative is tanh(x); for |x| > 15 we saturate to +/-1 (Tanh already
+  // saturates there). Two-pass forward: Exp produces exp(-2|x|) into FOutput
+  // and Tanh produces the derivative; scalar passes finish elementwise.
   for OutputCnt := 0 to SizeM1 do
   begin
     absX := Abs(LocalPrevOutput.FData[OutputCnt]);
     if absX > 15 then absX := 15;   // exp(-2|x|) has underflowed; clamp arg
     FOutput.FData[OutputCnt] := -2.0 * absX;
   end;
-  TNNetVolume.VectorExp(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+  TNNetVolume.Exp(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
-    TNNetVolume.VectorTanh(@FOutputErrorDeriv.FData[0], @LocalPrevOutput.FData[0],
+    TNNetVolume.Tanh(@FOutputErrorDeriv.FData[0], @LocalPrevOutput.FData[0],
       LocalPrevOutput.Size);
     for OutputCnt := 0 to SizeM1 do
     begin
@@ -46288,7 +46288,7 @@ begin
   // LiSHT(x) = x * tanh(x). Derivative is tanh(x) + x * (1 - tanh(x)^2).
   // tanh(x) is computed once (vectorized) into FOutput, then reused for both
   // the activation and its derivative in a scalar finishing pass.
-  TNNetVolume.VectorTanh(@FOutput.FData[0], @LocalPrevOutput.FData[0],
+  TNNetVolume.Tanh(@FOutput.FData[0], @LocalPrevOutput.FData[0],
     LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
@@ -52499,7 +52499,7 @@ begin
   if Size > 0 then
   begin
     if Length(FExpBuf) <> Size then SetLength(FExpBuf, Size);
-    TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpBuf[0]),
+    TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpBuf[0]),
       TNeuralFloatArrPtr(@LocalPrevOutput.FData[0]), Size);
     if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
     begin
@@ -52609,7 +52609,7 @@ begin
   if Size > 0 then
   begin
     if Length(FExpBuf) <> Size then SetLength(FExpBuf, Size);
-    TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FExpBuf[0]),
+    TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpBuf[0]),
       TNeuralFloatArrPtr(@LocalPrevOutput.FData[0]), Size);
     if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
     begin
@@ -55129,11 +55129,11 @@ begin
       'at TNNetDyT.');
   {$ENDIF}
   // Y[x,y,c] = gamma[c] * tanh(alpha * X[x,y,c]) + beta[c], as a whole-volume op
-  // sequence over existing primitives (App.D). VectorTanh is the vectorized
+  // sequence over existing primitives (App.D). Tanh is the vectorized
   // approximate tanh (no bit-parity requirement); the grad-check still holds.
   FOutput.Copy(Prev);
   FOutput.Mul(alpha);
-  TNNetVolume.VectorTanh(FOutput.DataPtr, FOutput.DataPtr, FOutput.Size);
+  TNNetVolume.Tanh(FOutput.DataPtr, FOutput.DataPtr, FOutput.Size);
   FOutput.MulChannels(Wg);
   FOutput.AddToChannels(Wb);
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -67989,7 +67989,7 @@ begin
   for i := 0 to ASizeM1 do
     FExpA.FData[i] := Min(Ar.FData[i], 10);
   // Rule #19: one vectorized exp over the whole contiguous block.
-  TNNetVolume.VectorExp(FExpA.GetRawPtr(), FExpA.GetRawPtr(), ASize);
+  TNNetVolume.Exp(FExpA.GetRawPtr(), FExpA.GetRawPtr(), ASize);
   FExpAValid := true;
 end;
 
@@ -68164,7 +68164,7 @@ begin
       TNNetVolume.Mul(@FAt.FData[hbase], -FDelta.FData[tDepth + d], NS);
       Inc(hbase, NS);
     end;
-    TNNetVolume.VectorExp(@FAt.FData[tBase], @FAt.FData[tBase], DepthNS);
+    TNNetVolume.Exp(@FAt.FData[tBase], @FAt.FData[tBase], DepthNS);
     // Recurrence over (channel,state) + output sum over states. h, a_t and b_t
     // are all contiguous over the state axis, so the step is a bulk elementwise
     // multiply plus a bulk MulAdd (rule #13).
@@ -68304,7 +68304,7 @@ begin
       TNNetVolume.Mul(@FAt.FData[hbase], -FDelta.FData[tDepth + d], NS);
       Inc(hbase, NS);
     end;
-    TNNetVolume.VectorExp(@FAt.FData[tBase], @FAt.FData[tBase], DepthNS);
+    TNNetVolume.Exp(@FAt.FData[tBase], @FAt.FData[tBase], DepthNS);
     // Recurrence + output sum over states; every row is contiguous over the
     // state axis -> bulk multiply + bulk MulAdd (rule #13).
     hbase := tBase;
@@ -69295,7 +69295,7 @@ begin
     // contiguous scaled copy of FSpLog followed by one vectorized exp (#19).
     Move(FSpLog.FData[0], FDecayV.FData[pBase], Depth * csNeuralFloatSize);
     TNNetVolume.Mul(@FDecayV.FData[pBase], -pn, Depth);
-    TNNetVolume.VectorExp(@FDecayV.FData[pBase], @FDecayV.FData[pBase], Depth);
+    TNNetVolume.Exp(@FDecayV.FData[pBase], @FDecayV.FData[pBase], Depth);
     // Hidden layer: pre = W1*phi + b1, act = tanh(pre).
     // W1[j,0,f]=W1.FData[j*FNumFeat+f]; FPhi row p is contiguous -> DotProduct.
     for j := 0 to FHiddenM1 do
@@ -81330,7 +81330,7 @@ begin
 
   // Output := exp(L)  (#13: vectorized exp over the full N*N contiguous run)
   {$IFDEF AVXANY}
-  TNNetVolume.VectorExp(L.DataPtr, L.DataPtr, FN * FN);
+  TNNetVolume.Exp(L.DataPtr, L.DataPtr, FN * FN);
   {$ELSE}
   for ri := 0 to NNm1 do
     L.FData[ri] := NeuralExp(L.FData[ri]);
@@ -93593,7 +93593,7 @@ begin
         Inc(InputRawPtr);
         Inc(WinMaxPtr);
       end;
-      TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FArgBuf[0]), TNeuralFloatArrPtr(@FArgBuf[0]), Depth);
+      TNNetVolume.Exp(TNeuralFloatArrPtr(@FArgBuf[0]), TNeuralFloatArrPtr(@FArgBuf[0]), Depth);
       for CntD := 0 to MaxD do
       begin
         ExpSumPtr^ := ExpSumPtr^ + FArgBuf[CntD];
@@ -93687,7 +93687,7 @@ begin
         Inc(InputRawPtr);
         Inc(WinMaxPtr);
       end;
-      TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FArgBuf[0]), TNeuralFloatArrPtr(@FArgBuf[0]), Depth);
+      TNNetVolume.Exp(TNeuralFloatArrPtr(@FArgBuf[0]), TNeuralFloatArrPtr(@FArgBuf[0]), Depth);
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
       for CntD := 0 to MaxD do
       begin
@@ -93797,7 +93797,7 @@ begin
         Inc(InputRawPtr);
         Inc(WinMaxPtr);
       end;
-      TNNetVolume.VectorExp(TNeuralFloatArrPtr(@FArgBuf[0]), TNeuralFloatArrPtr(@FArgBuf[0]), Depth);
+      TNNetVolume.Exp(TNeuralFloatArrPtr(@FArgBuf[0]), TNeuralFloatArrPtr(@FArgBuf[0]), Depth);
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
       for CntD := 0 to MaxD do
       begin
@@ -96204,7 +96204,7 @@ begin
         // element, so it goes through the vector kernel instead of a scalar
         // NeuralExp per element; the two accumulates that follow are #13
         // primitives.
-        TNNetVolume.VectorExp(ExpPtr, FOutput.GetRawPtr(StartPos), Depth);
+        TNNetVolume.Exp(ExpPtr, FOutput.GetRawPtr(StartPos), Depth);
         TNNetVolume.Add(PrevErr.GetRawPtr(StartPos),
           FOutputError.GetRawPtr(StartPos), Depth);
         TNNetVolume.MulAdd(PrevErr.GetRawPtr(StartPos), ExpPtr, -SumDy, Depth);
@@ -124333,22 +124333,22 @@ begin
   begin
     // Batched AVX2 relu-copy over the slice (falls back to a scalar loop on
     // non-AVX builds). dst[i] := max(src[i], 0); bit-exact vs the scalar form.
-    TNNetVolume.VectorRelu(@FOutput.FData[pFirst], @FOutputRaw.FData[pFirst],
+    TNNetVolume.Relu(@FOutput.FData[pFirst], @FOutputRaw.FData[pFirst],
       pLast - pFirst + 1);
   end
   else
   if FActivationFn = @Sigmoid then
   begin
-    // Batched AVX2 kernel over the slice (VectorSigmoid falls back to a scalar
+    // Batched AVX2 kernel over the slice (Sigmoid falls back to a scalar
     // pcr-equivalent loop on non-AVX builds). Parity with scalar Sigmoid() is
     // within ~1e-6.
-    TNNetVolume.VectorSigmoid(@FOutput.FData[pFirst], @FOutputRaw.FData[pFirst],
+    TNNetVolume.Sigmoid(@FOutput.FData[pFirst], @FOutputRaw.FData[pFirst],
       pLast - pFirst + 1);
   end
   else
   if FActivationFn = @HiperbolicTangent then
   begin
-    TNNetVolume.VectorTanh(@FOutput.FData[pFirst], @FOutputRaw.FData[pFirst],
+    TNNetVolume.Tanh(@FOutput.FData[pFirst], @FOutputRaw.FData[pFirst],
       pLast - pFirst + 1);
   end
   else

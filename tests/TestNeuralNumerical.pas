@@ -10694,8 +10694,8 @@ end;
 
 // Pins the AVX-vectorized GLU-family forward (GLU/SwiGLU/GEGLU/GEGLUErf) against
 // the scalar analytic formula over a multi-row (SizeX=2,SizeY=2), HalfDepth=4
-// input -- so the depth-contiguous vector primitives (VectorSigmoid/VectorTanh/
-// VectorErf + AVX Mul) are exercised across several (X,Y) rows and a full SIMD
+// input -- so the depth-contiguous vector primitives (Sigmoid/Tanh/
+// Erf + AVX Mul) are exercised across several (X,Y) rows and a full SIMD
 // width. The expected values use the reference scalar form; the 1e-4 tolerance
 // holds on both scalar and -dAVX2 builds.
 procedure TTestNeuralNumerical.TestGLUFamilyForwardParity;

@@ -4684,17 +4684,17 @@ begin
   // element maps to (approximately) 1 and nothing overflows; with T at the
   // clamp the row degenerates to one-hot argmax (greedy).
   // Rule #13/App D: the whole body is a uniform in-place op sequence. Reproduce
-  // SafeLogProb's 1e-30 floor before VectorLn (zeros/negatives would hit the
-  // Cephes logf domain edge), then VectorLn / Add / Mul / VectorExp in place.
+  // SafeLogProb's 1e-30 floor before Ln (zeros/negatives would hit the
+  // Cephes logf domain edge), then Ln / Add / Mul / Exp in place.
   LogMaxP := SafeLogProb(MaxP);
   InvT := 1.0 / T;
   RowPtr := TNeuralFloatArrPtr(Row.GetRawPtr(0));
   for I := 0 to SizeM1 do
     if RowPtr^[I] < 1e-30 then RowPtr^[I] := 1e-30;
-  TNNetVolume.VectorLn(RowPtr, RowPtr, Row.Size);
+  TNNetVolume.Ln(RowPtr, RowPtr, Row.Size);
   Row.Add(-LogMaxP);
   Row.Mul(InvT);
-  TNNetVolume.VectorExp(RowPtr, RowPtr, Row.Size);
+  TNNetVolume.Exp(RowPtr, RowPtr, Row.Size);
   Sum := Row.GetSum();
   if Sum <= 0 then Sum := 1.0;
   Row.Mul(1.0 / Sum);
@@ -5428,7 +5428,7 @@ begin
   // Rule #13/App D: both rows are ln'd in place (UncondRow is the twin net's
   // output - mutable, the next StepForward recomputes it), combined with the
   // bulk primitives, then softmaxed back. SafeLogProb's 1e-30 floor is
-  // reproduced before VectorLn on BOTH rows (Cephes logf domain edge).
+  // reproduced before Ln on BOTH rows (Cephes logf domain edge).
   RowPtr := TNeuralFloatArrPtr(Row.GetRawPtr(0));
   UncPtr := TNeuralFloatArrPtr(UncondRow.GetRawPtr(0));
   for I := 0 to SizeM1 do
@@ -5436,8 +5436,8 @@ begin
     if RowPtr^[I] < 1e-30 then RowPtr^[I] := 1e-30;
     if UncPtr^[I] < 1e-30 then UncPtr^[I] := 1e-30;
   end;
-  TNNetVolume.VectorLn(RowPtr, RowPtr, Size);   // Row   := ln(cond)
-  TNNetVolume.VectorLn(UncPtr, UncPtr, Size);   // Uncond := ln(uncond)
+  TNNetVolume.Ln(RowPtr, RowPtr, Size);   // Row   := ln(cond)
+  TNNetVolume.Ln(UncPtr, UncPtr, Size);   // Uncond := ln(uncond)
   Row.Sub(UncondRow);                           // cond - uncond
   Row.Mul(FGuidanceScale);                       // scale*(cond - uncond)
   Row.Add(UncondRow);                            // + uncond = Combined
@@ -5445,7 +5445,7 @@ begin
   // documented domain).
   MaxL := Row.GetMax();
   Row.Add(-MaxL);
-  TNNetVolume.VectorExp(RowPtr, RowPtr, Size);
+  TNNetVolume.Exp(RowPtr, RowPtr, Size);
   Sum := Row.GetSum();
   if Sum > 0 then
     Row.Mul(1.0 / Sum);
@@ -6448,8 +6448,8 @@ begin
   // and cached beam paths stay bit-for-bit identical (the parity the file header
   // and TestBeamSearchCachedMatchesReEncode* assert): a/Total and a*(1/Total) can
   // differ by one rounding, so both paths must divide the same way. SafeLogProb
-  // keeps its own 1e-30 clamp; kept scalar (not VectorLn) precisely because the
-  // sibling uses scalar SafeLogProb - an approximate VectorLn here would REINTRODUCE
+  // keeps its own 1e-30 clamp; kept scalar (not Ln) precisely because the
+  // sibling uses scalar SafeLogProb - an approximate Ln here would REINTRODUCE
   // a divergence.
   InvTotal := 1.0 / Total;
   for I := 0 to OutSizeM1 do
@@ -9002,7 +9002,7 @@ begin
         Probs.Add(-MaxLogit);
         Probs.Mul(InvT);
         ProbsPtr := TNeuralFloatArrPtr(Probs.GetRawPtr(0));
-        TNNetVolume.VectorExp(ProbsPtr, ProbsPtr, VocabSize);
+        TNNetVolume.Exp(ProbsPtr, ProbsPtr, VocabSize);
         SumExp := Probs.GetSum();
         if SumExp <= 0 then SumExp := 1.0;
         Probs.Mul(1.0 / SumExp);

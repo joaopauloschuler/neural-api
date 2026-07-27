@@ -563,7 +563,7 @@ type
       procedure DotProductsTiledInt8(NumAs, BStart, BFinish, VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
       procedure PointwiseNorm(pNorms: TNNetVolume = nil);
       procedure PointwiseMul(pNorms: TNNetVolume);
-      // VectorExp writes dst[0..N-1] := exp(src[0..N-1]). On an AVX2 build it
+      // Exp writes dst[0..N-1] := exp(src[0..N-1]). On an AVX2 build it
       // uses an 8-wide polynomial approximation (AVXExp) with a scalar NeuralExp
       // remainder; on a non-AVX build it is a plain NeuralExp loop. Buffers may
       // alias (dst = src) since the read happens before the write per lane/element.
@@ -573,8 +573,8 @@ type
       // the value and add 32 elements per iteration; every other build runs the
       // scalar loop. Bit-exact either way: a float add is a float add.
       class procedure AddScalar(PtrA: TNeuralFloatArrPtr; Value: TNeuralFloat; pSize: integer); static;
-      class procedure VectorExp(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
-      // VectorExpShiftSum writes dst[0..N-1] := exp(src[0..N-1] - Shift) and
+      class procedure Exp(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // ExpShiftSum writes dst[0..N-1] := exp(src[0..N-1] - Shift) and
       // returns the sum of everything it wrote - the numerator and the
       // denominator of a numerically stable softmax in a single pass. On an
       // AVX2/64-bit build one fused kernel (AVXExpShiftSum) applies the
@@ -583,18 +583,18 @@ type
       // runs the equivalent scalar loop. Buffers may alias (dst = src).
       // Arguments far below -88 exponentiate to EXACTLY 0 on both paths, so an
       // additive -1e9 attention mask still yields a hard zero weight.
-      class function VectorExpShiftSum(pDst, pSrc: TNeuralFloatArrPtr; Shift: TNeuralFloat; N: integer): TNeuralFloat; static;
-      // VectorSigmoid writes dst[0..N-1] := 1/(1+exp(-src)). AVX2-accelerated
-      // path built on VectorExp; numerically stable scalar form on the tail.
-      class procedure VectorSigmoid(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
-      // VectorTanh writes dst[0..N-1] := tanh(src[0..N-1]). Built on VectorExp
-      // via tanh(x) = 1 - 2/(exp(2x)+1) so it inherits VectorExp's AVX2 path.
+      class function ExpShiftSum(pDst, pSrc: TNeuralFloatArrPtr; Shift: TNeuralFloat; N: integer): TNeuralFloat; static;
+      // Sigmoid writes dst[0..N-1] := 1/(1+exp(-src)). AVX2-accelerated
+      // path built on Exp; numerically stable scalar form on the tail.
+      class procedure Sigmoid(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // Tanh writes dst[0..N-1] := tanh(src[0..N-1]). Built on Exp
+      // via tanh(x) = 1 - 2/(exp(2x)+1) so it inherits Exp's AVX2 path.
       // Matches pcr_tanhf to ~1e-6. Buffers may alias (dst = src).
-      class procedure VectorTanh(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
-      // VectorRelu writes dst[0..N-1] := max(src[0..N-1], 0). AVX2-accelerated
+      class procedure Tanh(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // Relu writes dst[0..N-1] := max(src[0..N-1], 0). AVX2-accelerated
       // (AVXCopyRelu) with a scalar fallback on non-AVX builds. Bit-exact vs the
       // scalar relu-copy. Buffers may alias (dst = src).
-      class procedure VectorRelu(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      class procedure Relu(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
       // Largest FINITE magnitude of src[0..N-1], or 0 when nothing there is
       // finite and non-zero: NaN is skipped and +/-Inf excluded, so the result
       // is always a usable quantization range. This is the pointer-and-count
@@ -645,34 +645,34 @@ type
       // define rather than adding a third build flavour; -dNOF16C forces the
       // scalar path for anyone who needs it. Coded by Claude (AI).
       class procedure DecodeF16(pDst: TNeuralFloatArrPtr; pSrc: TNeuralHalfArrPtr; N: integer); static;
-      // VectorErf writes dst[0..N-1] := erf(src[0..N-1]) using the Abramowitz &
+      // Erf writes dst[0..N-1] := erf(src[0..N-1]) using the Abramowitz &
       // Stegun 7.1.26 approximation (|err| < 1.5e-7, i.e. matches pcr_erff to
-      // ~1e-6). Built on VectorExp so it inherits the AVX2 path. dst may alias src.
-      class procedure VectorErf(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
-      // VectorSinh writes dst[0..N-1] := sinh(src[0..N-1]) via
-      // sinh(x) = (exp(x) - exp(-x)) / 2, so it inherits VectorExp's AVX2 path.
-      // exp(x) and exp(-x) are produced by two vectorized VectorExp passes into a
+      // ~1e-6). Built on Exp so it inherits the AVX2 path. dst may alias src.
+      class procedure Erf(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // Sinh writes dst[0..N-1] := sinh(src[0..N-1]) via
+      // sinh(x) = (exp(x) - exp(-x)) / 2, so it inherits Exp's AVX2 path.
+      // exp(x) and exp(-x) are produced by two vectorized Exp passes into a
       // local scratch (NOT pDst) so pSrc is never clobbered; hence dst may alias
       // src. The clamped arg keeps exp finite; sinh stays accurate to ~1e-6 vs
       // pcr_sinhf over the activation parity range.
-      class procedure VectorSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
-      // VectorLn writes dst[0..N-1] := ln(src[0..N-1]). On an AVX2 build it uses an
+      class procedure Sinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // Ln writes dst[0..N-1] := ln(src[0..N-1]). On an AVX2 build it uses an
       // 8-wide Cephes logf polynomial (AVXLn) with a scalar pcr_logf remainder; on a
       // non-AVX build it is a plain pcr_logf loop. Matches pcr_logf to ~1e-6 over the
       // positive normal range. Buffers may alias (read-before-write per lane/element).
-      class procedure VectorLn(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
-      // VectorSin / VectorCos write dst[0..N-1] := sin/cos(src[0..N-1]). On an AVX2
+      class procedure Ln(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // Sin / Cos write dst[0..N-1] := sin/cos(src[0..N-1]). On an AVX2
       // build they use an 8-wide Cephes sinf/cosf polynomial (AVXSinCos) with a
       // 3-part Cody-Waite range reduction (accurate to large magnitudes) and a scalar
       // pcr_sinf/pcr_cosf remainder; non-AVX builds are plain RTL loops. ~1e-6 vs RTL.
       // Buffers may alias (dst = src).
-      class procedure VectorSin(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
-      class procedure VectorCos(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
-      // VectorArcSinh writes dst[0..N-1] := arcsinh(src) = ln(x + sqrt(x^2 + 1)).
-      // Built on VectorLn (and a vectorized sqrt in the prep pass) so it inherits the
+      class procedure Sin(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      class procedure Cos(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // ArcSinh writes dst[0..N-1] := arcsinh(src) = ln(x + sqrt(x^2 + 1)).
+      // Built on Ln (and a vectorized sqrt in the prep pass) so it inherits the
       // AVX2 path. The sqrt argument is always >= 1 so ln stays in its accurate range
-      // and dst may alias src (the prep pass reads src into a scratch before VectorLn).
-      class procedure VectorArcSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // and dst may alias src (the prep pass reads src into a scratch before Ln).
+      class procedure ArcSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
       procedure AddArea(DestX, DestY, OriginX, OriginY, LenX, LenY: integer; Original: TNNetVolume);
       function HasAVX: boolean; {$IFDEF Release} inline; {$ENDIF}
       function HasAVX2: boolean; {$IFDEF Release} inline; {$ENDIF}
@@ -3089,7 +3089,7 @@ begin
   if SizeM1 < 0 then exit;
   MaxV := Row.GetMax();
   Row.Sub(MaxV);
-  TNNetVolume.VectorExp(Row.DataPtr, Row.DataPtr, Row.Size);
+  TNNetVolume.Exp(Row.DataPtr, Row.DataPtr, Row.Size);
   Sum := Row.GetSum();
   if Sum > 0 then Row.Mul(1 / Sum);
 end;
@@ -9494,7 +9494,7 @@ end;
 {$ENDIF}
 {$UNDEF HASAVXADDSCALAR}
 
-class procedure TNNetVolume.VectorExp(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+class procedure TNNetVolume.Exp(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 {$IFDEF AVXANY}
 begin
   if N <= 0 then exit;
@@ -9515,11 +9515,11 @@ end;
 {$IFDEF AVX2}{$IFDEF AVX64}{$DEFINE HASAVXEXPSHIFTSUM}{$ENDIF}{$ENDIF}
 {$IFDEF HASAVXEXPSHIFTSUM}
 // AVXExpShiftSum is defined later in this file inside the AVX64 asm block;
-// forward-declare it so VectorExpShiftSum can dispatch to it from here.
+// forward-declare it so ExpShiftSum can dispatch to it from here.
 function AVXExpShiftSum(pDst, pSrc: TNeuralFloatArrPtr; Shift: TNeuralFloat;
   NumElements: integer): TNeuralFloat; forward;
 {$ENDIF}
-class function TNNetVolume.VectorExpShiftSum(pDst, pSrc: TNeuralFloatArrPtr;
+class function TNNetVolume.ExpShiftSum(pDst, pSrc: TNeuralFloatArrPtr;
   Shift: TNeuralFloat; N: integer): TNeuralFloat;
 {$IFDEF HASAVXEXPSHIFTSUM}
 begin
@@ -9545,7 +9545,7 @@ end;
 {$ENDIF}
 {$UNDEF HASAVXEXPSHIFTSUM}
 
-class procedure TNNetVolume.VectorSigmoid(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+class procedure TNNetVolume.Sigmoid(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 var
   I, NM1: integer;
   S: TNeuralFloat;
@@ -9557,7 +9557,7 @@ begin
   // the reference Sigmoid() (avoids overflow for very negative x).
   for I := 0 to NM1 do
     pDst^[I] := -pSrc^[I];
-  VectorExp(pDst, pDst, N);
+  Exp(pDst, pDst, N);
   for I := 0 to NM1 do
   begin
     S := pDst^[I]; // S = exp(-x)
@@ -9565,7 +9565,7 @@ begin
   end;
 end;
 
-class procedure TNNetVolume.VectorTanh(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+class procedure TNNetVolume.Tanh(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 var
   I, NM1: integer;
   X, E: TNeuralFloat;
@@ -9583,7 +9583,7 @@ begin
     else if X < -88 then X := -88;
     pDst^[I] := X;
   end;
-  VectorExp(pDst, pDst, N);
+  Exp(pDst, pDst, N);
   for I := 0 to NM1 do
   begin
     E := pDst^[I]; // E = exp(-2x) in [exp(-88), exp(88)]
@@ -9593,10 +9593,10 @@ end;
 
 {$IFDEF AVXANY}
 // AVXCopyRelu (dst := max(src,0)) is defined later in this section under
-// {$IFDEF AVXANY}; forward-declare it so VectorRelu can call it here.
+// {$IFDEF AVXANY}; forward-declare it so Relu can call it here.
 procedure AVXCopyRelu(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer); forward;
 {$ENDIF}
-class procedure TNNetVolume.VectorRelu(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+class procedure TNNetVolume.Relu(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 {$IFNDEF AVXANY}
 var
   I: integer;
@@ -9614,7 +9614,7 @@ begin
   {$ENDIF}
 end;
 
-class procedure TNNetVolume.VectorErf(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+class procedure TNNetVolume.Erf(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 const
   // Abramowitz & Stegun 7.1.26 coefficients (|err| < 1.5e-7).
   cErfA1: TNeuralFloat =  0.254829592;
@@ -9630,7 +9630,7 @@ var
 begin
   if N <= 0 then exit;
   // erf(x) = sign(x) * (1 - poly(t)*exp(-x^2)), t = 1/(1+p*|x|).
-  // exp(-x^2) is produced by a single vectorized VectorExp pass into a fixed
+  // exp(-x^2) is produced by a single vectorized Exp pass into a fixed
   // stack scratch buffer (NOT pDst) so that pSrc -- which still holds x for the
   // |x| and sign terms in the finishing pass -- is never clobbered. Hence dst
   // may alias src. The buffer is processed in chunks of at most 256 to stay
@@ -9646,7 +9646,7 @@ begin
       X := pSrc^[ChunkStart + J];
       ExpBuf[J] := -X * X;
     end;
-    VectorExp(TNeuralFloatArrPtr(@ExpBuf[0]), TNeuralFloatArrPtr(@ExpBuf[0]), ChunkLen);
+    Exp(TNeuralFloatArrPtr(@ExpBuf[0]), TNeuralFloatArrPtr(@ExpBuf[0]), ChunkLen);
     for J := 0 to ChunkLenM1 do
     begin
       I := ChunkStart + J;
@@ -9665,7 +9665,7 @@ begin
   end;
 end;
 
-class procedure TNNetVolume.VectorSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+class procedure TNNetVolume.Sinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 var
   I, NM1: integer;
   X, E: TNeuralFloat;
@@ -9673,7 +9673,7 @@ begin
   if N <= 0 then exit;
   NM1 := N - 1;
   // sinh(x) = (exp(x) - exp(-x)) / 2. The clamped x is written into pDst and a
-  // single in-place VectorExp pass turns it into exp(x); pSrc is not read past
+  // single in-place Exp pass turns it into exp(x); pSrc is not read past
   // that fill so dst may alias src. In [-88, 88] exp neither overflows nor
   // underflows, so exp(-x) = 1/exp(x) is exact and sinh = (E - 1/E)*0.5 (sinh
   // would overflow to +/-Inf outside the clamp anyway, matching pcr_sinhf).
@@ -9684,7 +9684,7 @@ begin
     else if X < -88 then X := -88;
     pDst^[I] := X;
   end;
-  VectorExp(pDst, pDst, N);
+  Exp(pDst, pDst, N);
   for I := 0 to NM1 do
   begin
     E := pDst^[I]; // exp(x)
@@ -9692,7 +9692,7 @@ begin
   end;
 end;
 
-class procedure TNNetVolume.VectorLn(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+class procedure TNNetVolume.Ln(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 {$IFDEF AVXANY}
 begin
   if N <= 0 then exit;
@@ -9708,7 +9708,7 @@ begin
 end;
 {$ENDIF}
 
-class procedure TNNetVolume.VectorSin(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+class procedure TNNetVolume.Sin(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 {$IFDEF AVXANY}
 begin
   if N <= 0 then exit;
@@ -9724,7 +9724,7 @@ begin
 end;
 {$ENDIF}
 
-class procedure TNNetVolume.VectorCos(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+class procedure TNNetVolume.Cos(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 {$IFDEF AVXANY}
 begin
   if N <= 0 then exit;
@@ -9740,7 +9740,7 @@ begin
 end;
 {$ENDIF}
 
-class procedure TNNetVolume.VectorArcSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+class procedure TNNetVolume.ArcSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 var
   I, NM1: integer;
   X: TNeuralFloat;
@@ -9749,14 +9749,14 @@ begin
   NM1 := N - 1;
   // arcsinh(x) = ln(x + sqrt(x^2 + 1)). The argument x + sqrt(x^2+1) is always >= 1
   // and is built directly into pDst; pSrc^[I] is read before pDst^[I] is written at
-  // the same index, so dst may alias src elementwise. VectorLn then supplies the
+  // the same index, so dst may alias src elementwise. Ln then supplies the
   // AVX2 ln pass in place.
   for I := 0 to NM1 do
   begin
     X := pSrc^[I];
     pDst^[I] := X + Sqrt(X * X + 1.0);
   end;
-  VectorLn(pDst, pDst, N);
+  Ln(pDst, pDst, N);
 end;
 
 procedure TVolume.GroupedPointwiseSoftMax(Groups: integer);

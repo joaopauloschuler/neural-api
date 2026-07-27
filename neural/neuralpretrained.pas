@@ -41955,12 +41955,12 @@ begin
         Inc(gOfs, H);
       end;
       // Gate nonlinearities on the contiguous quarter-blocks (order i,f,g,o):
-      // sigmoid on i/f/o, tanh on the cell candidate g. VectorSigmoid/VectorTanh
+      // sigmoid on i/f/o, tanh on the cell candidate g. Sigmoid/Tanh
       // run in place (dst=src) and are AVX-vectorized (parity < 1e-4).
-      TNNetVolume.VectorSigmoid(Addr(gates[0]), Addr(gates[0]), H);
-      TNNetVolume.VectorSigmoid(Addr(gates[H]), Addr(gates[H]), H);
-      TNNetVolume.VectorTanh(Addr(gates[H2]), Addr(gates[H2]), H);
-      TNNetVolume.VectorSigmoid(Addr(gates[H3]), Addr(gates[H3]), H);
+      TNNetVolume.Sigmoid(Addr(gates[0]), Addr(gates[0]), H);
+      TNNetVolume.Sigmoid(Addr(gates[H]), Addr(gates[H]), H);
+      TNNetVolume.Tanh(Addr(gates[H2]), Addr(gates[H2]), H);
+      TNNetVolume.Sigmoid(Addr(gates[H3]), Addr(gates[H3]), H);
       for ch := 0 to HM1 do
       begin
         ig := gates[ch];
@@ -42023,7 +42023,7 @@ begin
           // so the original x survives the vector pass and the guard can run
           // AFTER it as a transcendental-free select. Positive lanes may produce
           // a huge/Inf exp that is then discarded; the AVX kernel cannot raise.
-          TNNetVolume.VectorExp(Addr(OutRow[0]), Addr(InRow[0]), InSigLenM1 + 1);
+          TNNetVolume.Exp(Addr(OutRow[0]), Addr(InRow[0]), InSigLenM1 + 1);
           for t := 0 to InSigLenM1 do
             if InRow[t] > 0 then OutRow[t] := InRow[t]
             else OutRow[t] := OutRow[t] - 1;
@@ -42040,7 +42040,7 @@ begin
           InSigLenM1 := Length(InRow) - 1;
           // #19: vector exp then a select on the untouched input row (see the
           // eskELU branch above).
-          TNNetVolume.VectorExp(Addr(OutRow[0]), Addr(InRow[0]), InSigLenM1 + 1);
+          TNNetVolume.Exp(Addr(OutRow[0]), Addr(InRow[0]), InSigLenM1 + 1);
           for t := 0 to InSigLenM1 do
             if InRow[t] > 0 then OutRow[t] := InRow[t]
             else OutRow[t] := OutRow[t] - 1;
@@ -45817,7 +45817,7 @@ begin
     // gate becomes one vectorized sigmoid pass followed by an elementwise Mul.
     if InSigTLen >= 0 then
     begin
-      TNNetVolume.VectorSigmoid(Addr(OutRow[0]), Addr(GateRow[0]), InSigTLen + 1);
+      TNNetVolume.Sigmoid(Addr(OutRow[0]), Addr(GateRow[0]), InSigTLen + 1);
       TNNetVolume.Mul(Addr(OutRow[0]), Addr(InRow[0]), InSigTLen + 1);
     end;
   end;
@@ -45835,7 +45835,7 @@ begin
   begin
     Row := Sig[c];
     SigTLen := Length(Row) - 1;
-    TNNetVolume.VectorRelu(@Row[0], @Row[0], SigTLen + 1);
+    TNNetVolume.Relu(@Row[0], @Row[0], SigTLen + 1);
   end;
 end;
 
@@ -45915,10 +45915,10 @@ begin
       Inc(whhBase, Hidden);
     end;
     // Gate nonlinearities over the contiguous quarter-blocks of g (i,f,g,o).
-    TNNetVolume.VectorSigmoid(Addr(g[0]), Addr(g[0]), Hidden);
-    TNNetVolume.VectorSigmoid(Addr(g[Hidden]), Addr(g[Hidden]), Hidden);
-    TNNetVolume.VectorTanh(Addr(g[H2]), Addr(g[H2]), Hidden);
-    TNNetVolume.VectorSigmoid(Addr(g[H3]), Addr(g[H3]), Hidden);
+    TNNetVolume.Sigmoid(Addr(g[0]), Addr(g[0]), Hidden);
+    TNNetVolume.Sigmoid(Addr(g[Hidden]), Addr(g[Hidden]), Hidden);
+    TNNetVolume.Tanh(Addr(g[H2]), Addr(g[H2]), Hidden);
+    TNNetVolume.Sigmoid(Addr(g[H3]), Addr(g[H3]), Hidden);
     for k := 0 to HiddenM1 do
     begin
       gi := g[k];
@@ -46949,7 +46949,7 @@ begin
     for j := 0 to FfMidM1 do
     begin
       ReluRow := FfMid[j];
-      TNNetVolume.VectorRelu(@ReluRow[0], @ReluRow[0], TM1 + 1);
+      TNNetVolume.Relu(@ReluRow[0], @ReluRow[0], TM1 + 1);
     end;
     RunHiFiGANConv(FLayers[L].FF2, FfMid, FfOut);
     // residual + final_layer_norm (token-major).
@@ -47012,7 +47012,7 @@ begin
   for c := 0 to FM1 do
   begin
     ReluRow := C1[c];
-    TNNetVolume.VectorRelu(@ReluRow[0], @ReluRow[0], TlenM1 + 1);
+    TNNetVolume.Relu(@ReluRow[0], @ReluRow[0], TlenM1 + 1);
   end;
   SetLength(Col, F);
   for t := 0 to TlenM1 do
@@ -47026,7 +47026,7 @@ begin
   for c := 0 to FM1 do
   begin
     ReluRow := C2[c];
-    TNNetVolume.VectorRelu(@ReluRow[0], @ReluRow[0], TlenM1 + 1);
+    TNNetVolume.Relu(@ReluRow[0], @ReluRow[0], TlenM1 + 1);
   end;
   for t := 0 to TlenM1 do
   begin
@@ -48022,7 +48022,7 @@ begin
   for c := 0 to HM1 do
   begin
     ReluRow := Conv[c];
-    TNNetVolume.VectorRelu(@ReluRow[0], @ReluRow[0], TM1 + 1);
+    TNNetVolume.Relu(@ReluRow[0], @ReluRow[0], TM1 + 1);
   end;
   Hidden := Conv;
 end;
@@ -48100,7 +48100,7 @@ begin
   for c := 0 to HM1 do
   begin
     ReluRow := Conv[c];
-    TNNetVolume.VectorRelu(@ReluRow[0], @ReluRow[0], TM1 + 1);
+    TNNetVolume.Relu(@ReluRow[0], @ReluRow[0], TM1 + 1);
   end;
   RunHiFiGANConv(FDurProj, Conv, Pr);   // 1 channel
   SetLength(LogDur, Tlen);
@@ -48170,7 +48170,7 @@ begin
   for c := 0 to HM1 do
   begin
     ReluRow := Cv[c];
-    TNNetVolume.VectorRelu(@ReluRow[0], @ReluRow[0], LM1 + 1);
+    TNNetVolume.Relu(@ReluRow[0], @ReluRow[0], LM1 + 1);
   end;
   RunHiFiGANConv(Proj, Cv, Pr);
   Curve := Copy(Pr[0]);
@@ -48211,7 +48211,7 @@ begin
   for c := 0 to HM1 do
   begin
     ReluRow := Mix[c];
-    TNNetVolume.VectorRelu(@ReluRow[0], @ReluRow[0], LM1 + 1);
+    TNNetVolume.Relu(@ReluRow[0], @ReluRow[0], LM1 + 1);
   end;
   RunAdaIN(FDecAdaIN, SDec, Mix);
   // magnitude head = exp(conv), phase head = sin(conv).
@@ -48231,8 +48231,8 @@ begin
     // from the conv outputs, so the two maps are vectorized whole-row passes.
     if L > 0 then
     begin
-      TNNetVolume.VectorExp(Addr(MagRow[0]), Addr(MSrc[0]), L);
-      TNNetVolume.VectorSin(Addr(PhRow[0]), Addr(PSrc[0]), L);
+      TNNetVolume.Exp(Addr(MagRow[0]), Addr(MSrc[0]), L);
+      TNNetVolume.Sin(Addr(PhRow[0]), Addr(PSrc[0]), L);
     end;
   end;
   // ISTFT(mag, phase) -> waveform. ISTFTOverlapAdd consumes a (frames,1,bins)
@@ -72459,9 +72459,9 @@ begin
 end;
 
 // In-place GELU(erf) over A[Ofs .. Ofs+N-1]: y = x * 0.5 * (1 + erf(x/sqrt(2))).
-// The erf ride runs through the vectorized VectorErf kernel (rule #19) a tile at
+// The erf ride runs through the vectorized Erf kernel (rule #19) a tile at
 // a time via a fixed stack scratch, so an arbitrarily long run costs no heap and
-// no growth in peak RAM. VectorErf is the Abramowitz-Stegun approximation, so
+// no growth in peak RAM. Erf is the Abramowitz-Stegun approximation, so
 // this matches the scalar pcr_erff spelling to ~1e-6 rather than bit-exactly.
 procedure SAMGeluInPlace(var A: TSAMMat; Ofs, N: integer);
 const
@@ -72480,7 +72480,7 @@ begin
     Base := Ofs + Done;
     Move(A[Base], Buf[0], Len * csNeuralFloatSize);
     TNNetVolume.Mul(@Buf[0], INV_SQRT_2, Len);
-    TNNetVolume.VectorErf(@Buf[0], @Buf[0], Len);
+    TNNetVolume.Erf(@Buf[0], @Buf[0], Len);
     for j := 0 to LenM1 do
     begin
       k := Base + j;
@@ -72846,7 +72846,7 @@ begin
       // MLP (lin1 -> relu -> lin2), residual
       SAMLinear(Reader, Cache, BPfx + 'mlp.lin1.weight', BPfx + 'mlp.lin1.bias',
         H, Config.MlpDim, NTok, Queries, Mlp1);
-      TNNetVolume.VectorRelu(@Mlp1[0], @Mlp1[0], NTokMlpM1 + 1);
+      TNNetVolume.Relu(@Mlp1[0], @Mlp1[0], NTokMlpM1 + 1);
       SAMLinear(Reader, Cache, BPfx + 'mlp.lin2.weight', BPfx + 'mlp.lin2.bias',
         Config.MlpDim, H, NTok, Mlp1, Mlp2);
       TNNetVolume.Add(@Queries[0], @Mlp2[0], NTok * H);
@@ -73098,10 +73098,10 @@ begin
       BPfx := Pfx + 'mask_decoder.output_hypernetworks_mlps.' + IntToStr(mt) + '.';
       SAMLinear(Reader, Cache, BPfx + 'proj_in.weight', BPfx + 'proj_in.bias',
         H, H, 1, Hbuf, Mlp1);
-      TNNetVolume.VectorRelu(@Mlp1[0], @Mlp1[0], HM1 + 1);
+      TNNetVolume.Relu(@Mlp1[0], @Mlp1[0], HM1 + 1);
       SAMLinear(Reader, Cache, BPfx + 'layers.0.weight', BPfx + 'layers.0.bias',
         H, H, 1, Mlp1, Mlp2);
-      TNNetVolume.VectorRelu(@Mlp2[0], @Mlp2[0], HM1 + 1);
+      TNNetVolume.Relu(@Mlp2[0], @Mlp2[0], HM1 + 1);
       SAMLinear(Reader, Cache, BPfx + 'proj_out.weight', BPfx + 'proj_out.bias',
         H, Cu, 1, Mlp2, HyperIn);
       // HyperIn now holds the per-channel hypernetwork output (length Cu).
@@ -73138,10 +73138,10 @@ begin
       BPfx := Pfx + 'mask_decoder.iou_prediction_head.';
       SAMLinear(Reader, Cache, BPfx + 'proj_in.weight', BPfx + 'proj_in.bias',
         H, H, 1, Hbuf, Mlp1);
-      TNNetVolume.VectorRelu(@Mlp1[0], @Mlp1[0], HM1 + 1);
+      TNNetVolume.Relu(@Mlp1[0], @Mlp1[0], HM1 + 1);
       SAMLinear(Reader, Cache, BPfx + 'layers.0.weight', BPfx + 'layers.0.bias',
         H, H, 1, Mlp1, Mlp2);
-      TNNetVolume.VectorRelu(@Mlp2[0], @Mlp2[0], HM1 + 1);
+      TNNetVolume.Relu(@Mlp2[0], @Mlp2[0], HM1 + 1);
       SAMLinear(Reader, Cache, BPfx + 'proj_out.weight', BPfx + 'proj_out.bias',
         H, MaskTokenCount, 1, Mlp2, Hbuf);
       IoUScores.ReSize(NumMasks, 1, 1);
