@@ -31186,7 +31186,7 @@ var
   MaxAbs, RowScale: TNeuralFloat;
   CodesPtr: TNeuralInt8ArrPtr;
 begin
-  MaxAbs := TNNetVolume.VectorMaxAbsFinite(Src, FDk);
+  MaxAbs := TNNetVolume.MaxAbsFinite(Src, FDk);
   if MaxAbs > 0
     then RowScale := MaxAbs / 127
     else RowScale := 1;
@@ -31196,7 +31196,7 @@ begin
   RowBase := Slot * FDk;
   CodesPtr := Dst.DataPtr;
   if MaxAbs > 0 then
-    TNNetVolume.VectorQuantizeInt8(TNeuralInt8ArrPtr(@CodesPtr^[RowBase]),
+    TNNetVolume.QuantizeInt8(TNeuralInt8ArrPtr(@CodesPtr^[RowBase]),
       Src, FDk, MaxAbs)
   else
   begin
@@ -72714,17 +72714,17 @@ var
   i, CountM1: integer;
   MaxAbs: TNeuralFloat;
 begin
-  // Both loops are TNNetVolume primitives (rule #18): VectorMaxAbsFinite is
+  // Both loops are TNNetVolume primitives (rule #18): MaxAbsFinite is
   // the pointer-and-count max|row| that skips non-finite elements, and
-  // VectorQuantizeInt8 carries the same non-finite convention (NaN -> 0,
+  // QuantizeInt8 carries the same non-finite convention (NaN -> 0,
   // +/-Inf -> +/-127) into the codes. AVX2 builds run both 8 lanes at a time.
-  MaxAbs := TNNetVolume.VectorMaxAbsFinite(Src, Count);
+  MaxAbs := TNNetVolume.MaxAbsFinite(Src, Count);
   // Scale underflows single to 0 when MaxAbs < ~1.8e-43 - such a row
   // dequantizes to zero either way, so it takes the zero-row branch.
   Scale := MaxAbs / 127;
   Result := Scale > 0;
   if Result then
-    TNNetVolume.VectorQuantizeInt8(TNeuralInt8ArrPtr(Codes), Src, Count, MaxAbs)
+    TNNetVolume.QuantizeInt8(TNeuralInt8ArrPtr(Codes), Src, Count, MaxAbs)
   else
   begin
     // Zero row (or nothing finite): zero codes with unit scale.

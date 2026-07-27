@@ -82,11 +82,11 @@ type
     procedure TestQuant8FillAndReshapeCycles;
     procedure TestQuant8TiledDotProductMatchesArrays;
     procedure TestQuant8GroupedTiledDotProductMatchesArrays;
-    procedure TestVectorMaxAbsFinite;
-    procedure TestVectorQuantizeInt8;
-    procedure TestVectorQuantizeInt8NonFinite;
-    procedure TestVectorQuantizeInt8TinyAndDenormalRows;
-    procedure TestVectorQuantizeInt8MatchesScalarReference;
+    procedure TestMaxAbsFinite;
+    procedure TestQuantizeInt8;
+    procedure TestQuantizeInt8NonFinite;
+    procedure TestQuantizeInt8TinyAndDenormalRows;
+    procedure TestQuantizeInt8MatchesScalarReference;
   end;
 
 implementation
@@ -1876,13 +1876,13 @@ begin
   end;
 end;
 
-// VectorMaxAbsFinite is the pointer-and-count max|slice| the int8 quantizers
+// MaxAbsFinite is the pointer-and-count max|slice| the int8 quantizers
 // scan with. It must return the largest FINITE magnitude: NaN is skipped and
 // +/-Inf excluded, so a garbage row still yields a usable range. Sizes cross
 // the AVX gate (csMinAvxSize = 16) and the 8-lane block, so the vector body,
 // its fold and the scalar tail all get exercised.
 // Coded by Claude (AI).
-procedure TTestNeuralVolumeQuant8.TestVectorMaxAbsFinite;
+procedure TTestNeuralVolumeQuant8.TestMaxAbsFinite;
 const
   N = 37;                    // > 16 (AVX path) and not a multiple of 8 (tail)
 var
@@ -1894,41 +1894,41 @@ begin
   try
     P := TNeuralFloatArrPtr(@V.FData[0]);
     AssertEquals('all-zero slice has no range', 0,
-      TNNetVolume.VectorMaxAbsFinite(P, N), 0);
+      TNNetVolume.MaxAbsFinite(P, N), 0);
     // A negative element carries the max: the sign must be cleared, not
     // compared away.
     for i := 0 to N - 1 do V.FData[i] := 0.5;
     V.FData[20] := -3.25;
     AssertEquals('negative element carries the max', 3.25,
-      TNNetVolume.VectorMaxAbsFinite(P, N), 0);
+      TNNetVolume.MaxAbsFinite(P, N), 0);
     // In the tail (index >= 32), so the scalar remainder must see it too.
     V.FData[35] := -9.5;
     AssertEquals('tail element carries the max', 9.5,
-      TNNetVolume.VectorMaxAbsFinite(P, N), 0);
+      TNNetVolume.MaxAbsFinite(P, N), 0);
     // Non-finite values are excluded, not propagated.
     V.FData[3] := math.NaN;
     V.FData[9] := math.Infinity;
     V.FData[34] := math.NegInfinity;
     AssertEquals('NaN and +/-Inf excluded from the max', 9.5,
-      TNNetVolume.VectorMaxAbsFinite(P, N), 0);
+      TNNetVolume.MaxAbsFinite(P, N), 0);
     // Nothing finite non-zero at all -> 0, the zero-row signal.
     for i := 0 to N - 1 do V.FData[i] := math.NaN;
     AssertEquals('all-NaN slice reports no range', 0,
-      TNNetVolume.VectorMaxAbsFinite(P, N), 0);
+      TNNetVolume.MaxAbsFinite(P, N), 0);
     // Below the AVX gate the scalar path must agree.
     for i := 0 to N - 1 do V.FData[i] := 0;
     V.FData[5] := -2;
     AssertEquals('short slice takes the scalar path', 2,
-      TNNetVolume.VectorMaxAbsFinite(P, 8), 0);
+      TNNetVolume.MaxAbsFinite(P, 8), 0);
   finally
     V.Free;
   end;
 end;
 
-// VectorQuantizeInt8 against a known row max: the row max itself must land on
+// QuantizeInt8 against a known row max: the row max itself must land on
 // +/-127, zero on 0, and every code must dequantize back within half a step.
 // Coded by Claude (AI).
-procedure TTestNeuralVolumeQuant8.TestVectorQuantizeInt8;
+procedure TTestNeuralVolumeQuant8.TestQuantizeInt8;
 const
   N = 37;
 var
@@ -1944,11 +1944,11 @@ begin
     V.FData[11] := 2.5;     // the positive max
     V.FData[29] := -2.5;    // the negative max, in the AVX body
     V.FData[36] := 0;       // a zero in the tail
-    MaxAbs := TNNetVolume.VectorMaxAbsFinite(
+    MaxAbs := TNNetVolume.MaxAbsFinite(
       TNeuralFloatArrPtr(@V.FData[0]), N);
     AssertEquals('row max', 2.5, MaxAbs, 1e-6);
     Scale := MaxAbs / 127;
-    TNNetVolume.VectorQuantizeInt8(TNeuralInt8ArrPtr(@Codes[0]),
+    TNNetVolume.QuantizeInt8(TNeuralInt8ArrPtr(@Codes[0]),
       TNeuralFloatArrPtr(@V.FData[0]), N, MaxAbs);
     AssertEquals('positive row max codes as +127', 127, Codes[11]);
     AssertEquals('negative row max codes as -127', -127, Codes[29]);
@@ -1962,7 +1962,7 @@ begin
     end;
     // MaxAbs <= 0 is the caller's zero-row branch: nothing may be written.
     for i := 0 to N - 1 do Codes[i] := 99;
-    TNNetVolume.VectorQuantizeInt8(TNeuralInt8ArrPtr(@Codes[0]),
+    TNNetVolume.QuantizeInt8(TNeuralInt8ArrPtr(@Codes[0]),
       TNeuralFloatArrPtr(@V.FData[0]), N, 0);
     for i := 0 to N - 1 do
       AssertEquals('zero max writes nothing ' + IntToStr(i), 99, Codes[i]);
@@ -1975,7 +1975,7 @@ end;
 // and +/-Inf clamp to +/-127 (the finite row max), in both the vector body and
 // the scalar tail, without raising EInvalidOp under FPC's unmasked SSE
 // exceptions. Coded by Claude (AI).
-procedure TTestNeuralVolumeQuant8.TestVectorQuantizeInt8NonFinite;
+procedure TTestNeuralVolumeQuant8.TestQuantizeInt8NonFinite;
 const
   N = 20;
 var
@@ -1995,10 +1995,10 @@ begin
     V.FData[17] := math.NaN;           // scalar tail
     V.FData[18] := math.Infinity;
     V.FData[19] := math.NegInfinity;
-    MaxAbs := TNNetVolume.VectorMaxAbsFinite(
+    MaxAbs := TNNetVolume.MaxAbsFinite(
       TNeuralFloatArrPtr(@V.FData[0]), N);
     AssertEquals('finite max survives the non-finite lanes', 4, MaxAbs, 0);
-    TNNetVolume.VectorQuantizeInt8(TNeuralInt8ArrPtr(@Codes[0]),
+    TNNetVolume.QuantizeInt8(TNeuralInt8ArrPtr(@Codes[0]),
       TNeuralFloatArrPtr(@V.FData[0]), N, MaxAbs);
     AssertEquals('body NaN codes as 0', 0, Codes[2]);
     AssertEquals('body +Inf clamps to +127', 127, Codes[3]);
@@ -2017,7 +2017,7 @@ end;
 // value - exactly the smallest NORMAL single - quantizes on the fast path.
 // A DENORMAL row max has no finite single reciprocal at all and must route to
 // the double-precision scalar path instead of trapping. Coded by Claude (AI).
-procedure TTestNeuralVolumeQuant8.TestVectorQuantizeInt8TinyAndDenormalRows;
+procedure TTestNeuralVolumeQuant8.TestQuantizeInt8TinyAndDenormalRows;
 const
   N = 24;
   TinyV: single = 1.1754943508222875e-37;  // the actual Qwen2.5-7B pad value
@@ -2034,10 +2034,10 @@ begin
     // (a) the smallest normal single, alternating signs as the real pad rows do
     for i := 0 to N - 1 do
       if (i mod 2) = 0 then V.FData[i] := TinyV else V.FData[i] := -TinyV;
-    MaxAbs := TNNetVolume.VectorMaxAbsFinite(
+    MaxAbs := TNNetVolume.MaxAbsFinite(
       TNeuralFloatArrPtr(@V.FData[0]), N);
     AssertEquals('tiny row max', TinyV, MaxAbs, 0);
-    TNNetVolume.VectorQuantizeInt8(TNeuralInt8ArrPtr(@Codes[0]),
+    TNNetVolume.QuantizeInt8(TNeuralInt8ArrPtr(@Codes[0]),
       TNeuralFloatArrPtr(@V.FData[0]), N, MaxAbs);
     for i := 0 to N - 1 do
       if (i mod 2) = 0 then
@@ -2048,10 +2048,10 @@ begin
     // max onto +/-127 through the double-precision path.
     for i := 0 to N - 1 do
       if (i mod 2) = 0 then V.FData[i] := DenormV else V.FData[i] := -DenormV;
-    MaxAbs := TNNetVolume.VectorMaxAbsFinite(
+    MaxAbs := TNNetVolume.MaxAbsFinite(
       TNeuralFloatArrPtr(@V.FData[0]), N);
     AssertEquals('denormal row max', DenormV, MaxAbs, 0);
-    TNNetVolume.VectorQuantizeInt8(TNeuralInt8ArrPtr(@Codes[0]),
+    TNNetVolume.QuantizeInt8(TNeuralInt8ArrPtr(@Codes[0]),
       TNeuralFloatArrPtr(@V.FData[0]), N, MaxAbs);
     for i := 0 to N - 1 do
       if (i mod 2) = 0 then
@@ -2069,7 +2069,7 @@ end;
 // the tolerance at exactly that: every code within 1 of the reference, which is
 // tight enough to catch a genuine lane/order/rounding bug.
 // Coded by Claude (AI).
-procedure TTestNeuralVolumeQuant8.TestVectorQuantizeInt8MatchesScalarReference;
+procedure TTestNeuralVolumeQuant8.TestQuantizeInt8MatchesScalarReference;
 const
   N = 1024;
 var
@@ -2084,10 +2084,10 @@ begin
   SetLength(Codes, N);
   try
     for i := 0 to N - 1 do V.FData[i] := (Random - 0.5) * 7;
-    MaxAbs := TNNetVolume.VectorMaxAbsFinite(
+    MaxAbs := TNNetVolume.MaxAbsFinite(
       TNeuralFloatArrPtr(@V.FData[0]), N);
     AssertTrue('random row has a range', MaxAbs > 0);
-    TNNetVolume.VectorQuantizeInt8(TNeuralInt8ArrPtr(@Codes[0]),
+    TNNetVolume.QuantizeInt8(TNeuralInt8ArrPtr(@Codes[0]),
       TNeuralFloatArrPtr(@V.FData[0]), N, MaxAbs);
     InvScale := 127.0 / Double(MaxAbs);
     Differing := 0;

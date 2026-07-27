@@ -594,13 +594,13 @@ type
       // is always a usable quantization range. This is the pointer-and-count
       // form of GetMaxAbs (an instance method over a whole volume) that the
       // int8 quantizers need for a row slice of a caller's buffer.
-      // AVX2/64-bit builds run AVXVectorMaxAbsFinite; every other build runs
+      // AVX2/64-bit builds run AVXMaxAbsFinite; every other build runs
       // the equivalent scalar loop. Coded by Claude (AI).
-      class function VectorMaxAbsFinite(pSrc: TNeuralFloatArrPtr; N: integer): TNeuralFloat; static;
+      class function MaxAbsFinite(pSrc: TNeuralFloatArrPtr; N: integer): TNeuralFloat; static;
       // Quantizes src[0..N-1] to symmetric int8 codes against a KNOWN row max:
       // dst[i] = clamp(Round(src[i] * 127/MaxAbs), -127, 127), with NaN coding
       // as 0 and +/-Inf clamping to +/-127. MaxAbs must be the value
-      // VectorMaxAbsFinite returned for this slice; MaxAbs <= 0 writes nothing
+      // MaxAbsFinite returned for this slice; MaxAbs <= 0 writes nothing
       // (a zero row has no scale - the caller owns that convention).
       //
       // NOT bit-exact against a scalar double-precision reference: the AVX2
@@ -611,7 +611,7 @@ type
       // denormal take a double-precision scalar path instead, because the
       // single reciprocal of a denormal overflows to Inf (and would trap under
       // FPC's unmasked SSE exceptions). Coded by Claude (AI).
-      class procedure VectorQuantizeInt8(pDst: TNeuralInt8ArrPtr; pSrc: TNeuralFloatArrPtr; N: integer; MaxAbs: TNeuralFloat); static;
+      class procedure QuantizeInt8(pDst: TNeuralInt8ArrPtr; pSrc: TNeuralFloatArrPtr; N: integer; MaxAbs: TNeuralFloat); static;
       // VectorErf writes dst[0..N-1] := erf(src[0..N-1]) using the Abramowitz &
       // Stegun 7.1.26 approximation (|err| < 1.5e-7, i.e. matches pcr_erff to
       // ~1e-6). Built on VectorExp so it inherits the AVX2 path. dst may alias src.
@@ -1853,7 +1853,7 @@ end;
 // pointer (the AVXAddScalar idiom) rather than from a global const table: no
 // [rip+label] relocation means nothing here can break position-independent
 // linking of the examples. Coded by Claude (AI).
-function AVXVectorMaxAbsFinite(PtrA: TNeuralFloatArrPtr;
+function AVXMaxAbsFinite(PtrA: TNeuralFloatArrPtr;
   NumElements: integer): Single;
 var
   vMax: array[0..7] of Single;
@@ -1924,13 +1924,13 @@ end;
 // mode - the same rounding FPC's Round() emits - and the two saturating packs
 // narrow 8 dwords to 8 bytes in lane order via an xmm extract, so no
 // cross-lane fixup is needed. Coded by Claude (AI).
-procedure AVXVectorQuantizeInt8(PtrDst: TNeuralInt8ArrPtr;
+procedure AVXQuantizeInt8(PtrDst: TNeuralInt8ArrPtr;
   PtrSrc: TNeuralFloatArrPtr; NumElements: integer; MaxAbs: Single);
 var
   localNumElements, i, NumElementsM1, Code: integer;
   Recip, Scaled, v: Single;
   // [0] = 1/MaxAbs, [1] = +127, [2] = -127. One pointer, three broadcasts -
-  // locals only, so no [rip+label] relocation (see AVXVectorMaxAbsFinite).
+  // locals only, so no [rip+label] relocation (see AVXMaxAbsFinite).
   Consts: array[0..2] of Single;
   ConstsPtr: pointer;
 begin
@@ -11485,7 +11485,7 @@ begin
     Result += PtrA^[I] * PtrB^[I];
 end;
 
-class function TNNetVolume.VectorMaxAbsFinite(pSrc: TNeuralFloatArrPtr;
+class function TNNetVolume.MaxAbsFinite(pSrc: TNeuralFloatArrPtr;
   N: integer): TNeuralFloat;
 var
   I, vHigh: integer;
@@ -11497,7 +11497,7 @@ begin
   {$IFDEF AVX2}
   if N >= csMinAvxSize then
   begin
-    Result := AVXVectorMaxAbsFinite(pSrc, N);
+    Result := AVXMaxAbsFinite(pSrc, N);
     exit;
   end;
   {$ENDIF}
@@ -11515,7 +11515,7 @@ begin
   end;
 end;
 
-class procedure TNNetVolume.VectorQuantizeInt8(pDst: TNeuralInt8ArrPtr;
+class procedure TNNetVolume.QuantizeInt8(pDst: TNeuralInt8ArrPtr;
   pSrc: TNeuralFloatArrPtr; N: integer; MaxAbs: TNeuralFloat);
 var
   I, vHigh, Code: integer;
@@ -11551,7 +11551,7 @@ begin
   {$IFDEF AVX2}
   if N >= csMinAvxSize then
   begin
-    AVXVectorQuantizeInt8(pDst, pSrc, N, MaxAbs);
+    AVXQuantizeInt8(pDst, pSrc, N, MaxAbs);
     exit;
   end;
   {$ENDIF}
