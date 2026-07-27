@@ -31174,38 +31174,35 @@ end;
 // Quantize the d_k-element row Src into int8 cache row Slot, with a per-row
 // scale (mirrors the int8 WEIGHT path QuantizeWeightsInt8): scale = maxabs/127
 // (or 1 if the row is all zero), code = round(value/scale) clamped to
-// [-127,127]. maxabs is computed inline because Src is a raw pointer into a
-// caller's row - GetMaxAbs is an instance method over a whole volume and has no
-// pointer-and-count form to hand a slice to.
+// [-127,127]. Both halves are TNNetVolume primitives (rule #18) - the same
+// pointer-and-count kernels the weight import path uses, so this per-token
+// append gets the AVX2 lanes too. Their non-finite tolerance costs nothing
+// here (a KV row is finite) and removes a latent 1/0 = Inf trap on an
+// absurdly tiny row.
 procedure TNNetScaledDotProductAttention.QuantizeCacheRow(Src: TNeuralFloatArrPtr;
   Dst: TNNetVolumeQuant8; Slot: integer);
 var
-  d, RowBase, Code, DkM1: integer;
-  MaxAbs, RowScale, InvScale, AbsVal: TNeuralFloat;
+  d, RowBase, DkM1: integer;
+  MaxAbs, RowScale: TNeuralFloat;
   CodesPtr: TNeuralInt8ArrPtr;
 begin
-  DkM1 := FDk - 1;
-  MaxAbs := 0;
-  for d := 0 to DkM1 do
-  begin
-    AbsVal := Abs(Src^[d]);
-    if AbsVal > MaxAbs then MaxAbs := AbsVal;
-  end;
+  MaxAbs := TNNetVolume.VectorMaxAbsFinite(Src, FDk);
   if MaxAbs > 0
     then RowScale := MaxAbs / 127
     else RowScale := 1;
   // Slot is the flat row index, so it indexes the scale plane directly and
   // the codes at Slot*Depth - the same arithmetic the raw arrays used.
   Dst.ScalePtr^[Slot] := RowScale;
-  InvScale := 1 / RowScale;
   RowBase := Slot * FDk;
   CodesPtr := Dst.DataPtr;
-  for d := 0 to DkM1 do
+  if MaxAbs > 0 then
+    TNNetVolume.VectorQuantizeInt8(TNeuralInt8ArrPtr(@CodesPtr^[RowBase]),
+      Src, FDk, MaxAbs)
+  else
   begin
-    Code := Round(Src^[d] * InvScale);
-    if Code > 127 then Code := 127;
-    if Code < -127 then Code := -127;
-    CodesPtr^[RowBase + d] := Code;
+    // All-zero row: unit scale and zero codes, what round(0/1) produced.
+    DkM1 := FDk - 1;
+    for d := 0 to DkM1 do CodesPtr^[RowBase + d] := 0;
   end;
 end;
 
@@ -72707,64 +72704,31 @@ end;
 // per-row scale, tolerating NON-FINITE source values: real checkpoints pad
 // the vocab table with untrained rows whose bytes can decode to +/-Inf or
 // NaN (Qwen2.5-7B-Instruct does), and Round() of a non-finite value raises
-// EInvalidOp. The scale scan skips non-finite elements (Abs(NaN) fails
-// every ordered compare; +/-Inf is excluded explicitly), each code clamps
-// to the finite max magnitude BEFORE rounding (so +/-Inf lands on +/-127)
-// and NaN codes as 0. A row with no finite non-zero element returns FALSE
-// with zeroed codes and Scale 1 - the QuantizeWeightsInt8 zero-row
+// EInvalidOp. The scale scan skips non-finite elements, +/-Inf lands on
+// +/-127 and NaN codes as 0. A row with no finite non-zero element returns
+// FALSE with zeroed codes and Scale 1 - the QuantizeWeightsInt8 zero-row
 // convention. Coded by Claude (AI).
 function QuantizeInt8RowTolerant(Src: TNeuralFloatArrPtr; Count: integer;
   Codes: PShortInt; out Scale: TNeuralFloat): boolean;
 var
-  i, CountM1, Code: integer;
-  MaxAbs, AbsV, V: TNeuralFloat;
-  InvScale: double;
+  i, CountM1: integer;
+  MaxAbs: TNeuralFloat;
 begin
-  CountM1 := Count - 1;
-  // max|row| computed inline: GetMaxAbs takes no pointer-and-count slice, and
-  // more importantly it compares every element, which is what this function
-  // exists to avoid.
-  MaxAbs := 0;
-  for i := 0 to CountM1 do
-  begin
-    V := Src^[i];
-    // IsNan is a bit test - FPC emits SIGNALING float compares (comiss),
-    // so even comparing a NaN raises EInvalidOp; +/-Inf compares fine and
-    // the second condition excludes it.
-    if IsNan(V) then continue;
-    AbsV := Abs(V);
-    if (AbsV > MaxAbs) and (AbsV <= math.MaxSingle) then MaxAbs := AbsV;
-  end;
+  // Both loops are TNNetVolume primitives (rule #18): VectorMaxAbsFinite is
+  // the pointer-and-count max|row| that skips non-finite elements, and
+  // VectorQuantizeInt8 carries the same non-finite convention (NaN -> 0,
+  // +/-Inf -> +/-127) into the codes. AVX2 builds run both 8 lanes at a time.
+  MaxAbs := TNNetVolume.VectorMaxAbsFinite(Src, Count);
   // Scale underflows single to 0 when MaxAbs < ~1.8e-43 - such a row
   // dequantizes to zero either way, so it takes the zero-row branch.
   Scale := MaxAbs / 127;
   Result := Scale > 0;
   if Result then
-  begin
-    // The reciprocal and the code products run in DOUBLE: real checkpoints
-    // (Qwen2.5-7B) pad the vocab with +/-1.18e-37 rows whose 1/Scale
-    // overflows single (> 3.4e38) and traps under FPC's unmasked SSE
-    // exceptions. The Double() cast is load-bearing - FPC folds the 127.0
-    // constant to single, so without it this stays a single division.
-    InvScale := 127.0 / Double(MaxAbs);
-    for i := 0 to CountM1 do
-    begin
-      V := Src^[i];
-      if IsNan(V) then Code := 0
-      else
-      begin
-        if V > MaxAbs then V := MaxAbs
-        else if V < -MaxAbs then V := -MaxAbs;
-        Code := Round(V * InvScale);
-        if Code > 127 then Code := 127;
-        if Code < -127 then Code := -127;
-      end;
-      Codes[i] := Code;
-    end;
-  end
+    TNNetVolume.VectorQuantizeInt8(TNeuralInt8ArrPtr(Codes), Src, Count, MaxAbs)
   else
   begin
     // Zero row (or nothing finite): zero codes with unit scale.
+    CountM1 := Count - 1;
     for i := 0 to CountM1 do Codes[i] := 0;
     Scale := 1;
   end;

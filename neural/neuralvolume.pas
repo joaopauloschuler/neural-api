@@ -589,6 +589,29 @@ type
       // (AVXCopyRelu) with a scalar fallback on non-AVX builds. Bit-exact vs the
       // scalar relu-copy. Buffers may alias (dst = src).
       class procedure VectorRelu(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // Largest FINITE magnitude of src[0..N-1], or 0 when nothing there is
+      // finite and non-zero: NaN is skipped and +/-Inf excluded, so the result
+      // is always a usable quantization range. This is the pointer-and-count
+      // form of GetMaxAbs (an instance method over a whole volume) that the
+      // int8 quantizers need for a row slice of a caller's buffer.
+      // AVX2/64-bit builds run AVXVectorMaxAbsFinite; every other build runs
+      // the equivalent scalar loop. Coded by Claude (AI).
+      class function VectorMaxAbsFinite(pSrc: TNeuralFloatArrPtr; N: integer): TNeuralFloat; static;
+      // Quantizes src[0..N-1] to symmetric int8 codes against a KNOWN row max:
+      // dst[i] = clamp(Round(src[i] * 127/MaxAbs), -127, 127), with NaN coding
+      // as 0 and +/-Inf clamping to +/-127. MaxAbs must be the value
+      // VectorMaxAbsFinite returned for this slice; MaxAbs <= 0 writes nothing
+      // (a zero row has no scale - the caller owns that convention).
+      //
+      // NOT bit-exact against a scalar double-precision reference: the AVX2
+      // path scales in single precision and may differ by one code where a
+      // product lands on a rounding boundary. Quantization is lossy by
+      // construction, so this is a deliberate trade for ~8 codes per
+      // iteration - do not build a bit-parity test on it. Rows whose MaxAbs is
+      // denormal take a double-precision scalar path instead, because the
+      // single reciprocal of a denormal overflows to Inf (and would trap under
+      // FPC's unmasked SSE exceptions). Coded by Claude (AI).
+      class procedure VectorQuantizeInt8(pDst: TNeuralInt8ArrPtr; pSrc: TNeuralFloatArrPtr; N: integer; MaxAbs: TNeuralFloat); static;
       // VectorErf writes dst[0..N-1] := erf(src[0..N-1]) using the Abramowitz &
       // Stegun 7.1.26 approximation (|err| < 1.5e-7, i.e. matches pcr_erff to
       // ~1e-6). Built on VectorExp so it inherits the AVX2 path. dst may alias src.
@@ -1817,6 +1840,156 @@ begin
   NumElementsM1 := NumElements - 1;
   for i := localNumElements to NumElementsM1 do
     PtrA^[i] := PtrA^[i] + PtrCodes^[i] * PtrB^[i];
+end;
+
+// Largest FINITE magnitude of NumElements floats: the sign bit is cleared with
+// a broadcast $7FFFFFFF mask and each vector is masked against MaxSingle with
+// the NON-SIGNALING LE_OQ predicate (18), which is false for both NaN and
+// +/-Inf - so a non-finite lane contributes 0 and no compare can raise
+// EInvalidOp under FPC's unmasked SSE exceptions. Eight lanes at a time; the
+// fold and the tail repeat the same masking in Pascal.
+//
+// Both vector constants are broadcast from a LOCAL pair reached through a
+// pointer (the AVXAddScalar idiom) rather than from a global const table: no
+// [rip+label] relocation means nothing here can break position-independent
+// linking of the examples. Coded by Claude (AI).
+function AVXVectorMaxAbsFinite(PtrA: TNeuralFloatArrPtr;
+  NumElements: integer): Single;
+var
+  vMax: array[0..7] of Single;
+  // [0] = the $7FFFFFFF sign-clearing mask, [1] = MaxSingle.
+  Consts: array[0..1] of Single;
+  ConstsPtr: pointer;
+  localNumElements, i, NumElementsM1: integer;
+  v, AbsV: Single;
+begin
+  PLongWord(@Consts[0])^ := $7FFFFFFF;
+  Consts[1] := MaxSingle;
+  localNumElements := NumElements and (not 7);
+  Result := 0;
+  if localNumElements > 0 then
+  begin
+    ConstsPtr := Addr(Consts[0]);
+  asm
+  mov rax, PtrA
+  mov rdx, ConstsPtr
+  mov ecx, localNumElements
+  shr ecx, 3
+  vbroadcastss ymm3, [rdx]
+  vbroadcastss ymm2, [rdx+4]
+  vxorps    ymm4, ymm4, ymm4
+@Loop:
+  vmovups   ymm0, [rax]
+  vandps    ymm0, ymm0, ymm3   // |x|; a NaN stays a NaN
+  vcmpps    ymm1, ymm0, ymm2, 18  // LE_OQ: false for NaN and for +Inf
+  vandps    ymm0, ymm0, ymm1   // non-finite lanes -> 0
+  vmaxps    ymm4, ymm4, ymm0
+  add rax, 32
+  dec ecx
+  jnz @Loop
+  vmovups   vMax, ymm4
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4'
+  ];
+    Result := vMax[0];
+    for i := 1 to 7 do
+      if vMax[i] > Result then Result := vMax[i];
+  end;
+  NumElementsM1 := NumElements - 1;
+  for i := localNumElements to NumElementsM1 do
+  begin
+    v := PtrA^[i];
+    if IsNan(v) then continue;
+    AbsV := Abs(v);
+    if (AbsV > Result) and (AbsV <= MaxSingle) then Result := AbsV;
+  end;
+end;
+
+// Symmetric int8 quantization of NumElements floats against a known row max:
+// code = clamp(Round(v * (1/MaxAbs) * 127), -127, 127), NaN -> 0.
+// MaxAbs must be > 0 and normal (the caller routes denormal maxima to the
+// double-precision scalar path, whose reciprocal cannot overflow).
+//
+// The two multiplies are NOT folded into one 127/MaxAbs constant on purpose:
+// that product overflows single for the tiny-magnitude rows real checkpoints
+// pad their vocab with (max ~1.18e-37 -> 1.07e39). Multiplying by 1/MaxAbs
+// FIRST bounds every intermediate by 1 in magnitude, so 127*that is bounded by
+// 127 and single precision suffices throughout.
+//
+// Per 8 lanes: an ORD_Q compare (7, non-signaling) zeroes NaN, the two
+// multiplies scale, vminps/vmaxps clamp to +/-127 (which is also what turns
+// +/-Inf into +/-127), vcvtps2dq rounds to nearest-even in the default MXCSR
+// mode - the same rounding FPC's Round() emits - and the two saturating packs
+// narrow 8 dwords to 8 bytes in lane order via an xmm extract, so no
+// cross-lane fixup is needed. Coded by Claude (AI).
+procedure AVXVectorQuantizeInt8(PtrDst: TNeuralInt8ArrPtr;
+  PtrSrc: TNeuralFloatArrPtr; NumElements: integer; MaxAbs: Single);
+var
+  localNumElements, i, NumElementsM1, Code: integer;
+  Recip, Scaled, v: Single;
+  // [0] = 1/MaxAbs, [1] = +127, [2] = -127. One pointer, three broadcasts -
+  // locals only, so no [rip+label] relocation (see AVXVectorMaxAbsFinite).
+  Consts: array[0..2] of Single;
+  ConstsPtr: pointer;
+begin
+  Recip := 1 / MaxAbs;
+  localNumElements := NumElements and (not 7);
+  if localNumElements > 0 then
+  begin
+    Consts[0] := Recip;
+    Consts[1] := 127;
+    Consts[2] := -127;
+    ConstsPtr := Addr(Consts[0]);
+  asm
+  mov rax, PtrSrc
+  mov rdx, PtrDst
+  mov r8, ConstsPtr
+  mov ecx, localNumElements
+  shr ecx, 3
+  vbroadcastss ymm5, [r8]
+  vbroadcastss ymm6, [r8+4]
+  vbroadcastss ymm7, [r8+8]
+@Loop:
+  vmovups   ymm0, [rax]
+  vcmpps    ymm1, ymm0, ymm0, 7   // ORD_Q: false only for NaN
+  vandps    ymm0, ymm0, ymm1      // NaN -> 0
+  vmulps    ymm0, ymm0, ymm5      // * 1/MaxAbs  (|.| <= 1, Inf stays Inf)
+  vmulps    ymm0, ymm0, ymm6      // * 127
+  vminps    ymm0, ymm0, ymm6      // clamp +127 (+Inf -> 127)
+  vmaxps    ymm0, ymm0, ymm7      // clamp -127 (-Inf -> -127)
+  vcvtps2dq ymm0, ymm0            // round to nearest even
+  vextracti128 xmm1, ymm0, 1
+  vpackssdw xmm0, xmm0, xmm1      // 8 dwords -> 8 words, in lane order
+  vpacksswb xmm0, xmm0, xmm0      // low 8 bytes = the 8 codes
+  vmovq     [rdx], xmm0
+  add rax, 32
+  add rdx, 8
+  dec ecx
+  jnz @Loop
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'R8',
+    'ymm0', 'ymm1', 'ymm5', 'ymm6', 'ymm7'
+  ];
+  end;
+  NumElementsM1 := NumElements - 1;
+  for i := localNumElements to NumElementsM1 do
+  begin
+    v := PtrSrc^[i];
+    if IsNan(v) then
+    begin
+      PtrDst^[i] := 0;
+      continue;
+    end;
+    Scaled := v * Recip * 127;
+    if Scaled > 127 then Scaled := 127
+    else if Scaled < -127 then Scaled := -127;
+    Code := Round(Scaled);
+    PtrDst^[i] := ShortInt(Code);
+  end;
 end;
 {$ENDIF}
 {$ENDIF}
@@ -11310,6 +11483,99 @@ begin
   vHigh := NumElements - 1;
   for I := 0 to vHigh do
     Result += PtrA^[I] * PtrB^[I];
+end;
+
+class function TNNetVolume.VectorMaxAbsFinite(pSrc: TNeuralFloatArrPtr;
+  N: integer): TNeuralFloat;
+var
+  I, vHigh: integer;
+  V, AbsV: TNeuralFloat;
+begin
+  Result := 0;
+  if N <= 0 then exit;
+  {$IFDEF AVX64}
+  {$IFDEF AVX2}
+  if N >= csMinAvxSize then
+  begin
+    Result := AVXVectorMaxAbsFinite(pSrc, N);
+    exit;
+  end;
+  {$ENDIF}
+  {$ENDIF}
+  vHigh := N - 1;
+  for I := 0 to vHigh do
+  begin
+    V := pSrc^[I];
+    // IsNan is a bit test: FPC emits SIGNALING compares, so even comparing a
+    // NaN would raise EInvalidOp. +/-Inf compares fine and the MaxSingle test
+    // excludes it.
+    if IsNan(V) then continue;
+    AbsV := Abs(V);
+    if (AbsV > Result) and (AbsV <= MaxSingle) then Result := AbsV;
+  end;
+end;
+
+class procedure TNNetVolume.VectorQuantizeInt8(pDst: TNeuralInt8ArrPtr;
+  pSrc: TNeuralFloatArrPtr; N: integer; MaxAbs: TNeuralFloat);
+var
+  I, vHigh, Code: integer;
+  V, Scaled, Recip: TNeuralFloat;
+  InvScale: double;
+begin
+  if (N <= 0) or (MaxAbs <= 0) then exit;
+  if MaxAbs < MinSingle then
+  begin
+    // Denormal row max: 1/MaxAbs overflows single, so scale in DOUBLE. Real
+    // checkpoints reach here only on untrained vocab padding, so the scalar
+    // cost is irrelevant. This is the arithmetic the whole quantizer used
+    // before the vectorized path existed.
+    InvScale := 127.0 / Double(MaxAbs);
+    vHigh := N - 1;
+    for I := 0 to vHigh do
+    begin
+      V := pSrc^[I];
+      if IsNan(V) then Code := 0
+      else
+      begin
+        if V > MaxAbs then V := MaxAbs
+        else if V < -MaxAbs then V := -MaxAbs;
+        Code := Round(V * InvScale);
+        if Code > 127 then Code := 127;
+        if Code < -127 then Code := -127;
+      end;
+      pDst^[I] := ShortInt(Code);
+    end;
+    exit;
+  end;
+  {$IFDEF AVX64}
+  {$IFDEF AVX2}
+  if N >= csMinAvxSize then
+  begin
+    AVXVectorQuantizeInt8(pDst, pSrc, N, MaxAbs);
+    exit;
+  end;
+  {$ENDIF}
+  {$ENDIF}
+  // Scalar twin of the AVX2 kernel, in the same order: multiply by 1/MaxAbs
+  // FIRST so every intermediate is bounded by 1 (never form 127/MaxAbs, which
+  // overflows single for tiny rows), then by 127, then clamp - which is also
+  // what maps +/-Inf onto +/-127.
+  Recip := 1 / MaxAbs;
+  vHigh := N - 1;
+  for I := 0 to vHigh do
+  begin
+    V := pSrc^[I];
+    if IsNan(V) then
+    begin
+      pDst^[I] := 0;
+      continue;
+    end;
+    Scaled := V * Recip * 127;
+    if Scaled > 127 then Scaled := 127
+    else if Scaled < -127 then Scaled := -127;
+    Code := Round(Scaled);
+    pDst^[I] := ShortInt(Code);
+  end;
 end;
 
 class procedure TNNetVolume.MulAddInt8(PtrA, PtrB: TNeuralFloatArrPtr;
