@@ -27,6 +27,12 @@
     </RunParams>
     <RequiredPackages>
       <Item>
+        <PackageName Value="openai_agent"/>
+      </Item>
+      <Item>
+        <PackageName Value="openai_core"/>
+      </Item>
+      <Item>
         <PackageName Value="LCL"/>
       </Item>
     </RequiredPackages>
@@ -66,7 +72,7 @@
     </Target>
     <SearchPaths>
       <IncludeFiles Value="$(ProjOutDir)"/>
-      <OtherUnitFiles Value="D:\projetos\maurinsoft\CHATGPT\pacote\AI Hardware;D:\projetos\maurinsoft\CHATGPT\pacote\AI"/>
+      <OtherUnitFiles Value="D:\projetos\maurinsoft\CHATGPT\pacote\AI Hardware\;D:\projetos\maurinsoft\CHATGPT\pacote\AI\"/>
       <UnitOutputDirectory Value="lib\$(TargetCPU)-$(TargetOS)"/>
     </SearchPaths>
     <Linking>

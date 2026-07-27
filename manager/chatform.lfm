@@ -6,11 +6,12 @@ object frmChat: TfrmChat
   Caption = 'Local AI Chat'
   ClientHeight = 460
   ClientWidth = 550
+  Position = poScreenCenter
+  LCLVersion = '4.4.0.0'
   OnClose = FormClose
   OnCreate = FormCreate
   OnDestroy = FormDestroy
   OnShow = FormShow
-  Position = poScreenCenter
   object memChat: TMemo
     Left = 10
     Height = 330
@@ -48,8 +49,8 @@ object frmChat: TfrmChat
         Top = 5
         Width = 100
         Caption = 'Enviar'
-        OnClick = btnSendClick
         TabOrder = 0
+        OnClick = btnSendClick
       end
       object btnStop: TButton
         Left = 5
@@ -58,8 +59,8 @@ object frmChat: TfrmChat
         Width = 100
         Caption = 'Parar'
         Enabled = False
-        OnClick = btnStopClick
         TabOrder = 1
+        OnClick = btnStopClick
       end
       object btnAttach: TButton
         Left = 5
@@ -67,8 +68,8 @@ object frmChat: TfrmChat
         Top = 75
         Width = 100
         Caption = 'Anexar'
-        OnClick = btnAttachClick
         TabOrder = 2
+        OnClick = btnAttachClick
       end
     end
     object memQuestion: TMemo
@@ -78,10 +79,19 @@ object frmChat: TfrmChat
       Width = 430
       Align = alClient
       BorderSpacing.Around = 5
-      OnKeyDown = memQuestionKeyDown
       ScrollBars = ssAutoVertical
       TabOrder = 1
-      WantReturns = True
+      OnKeyDown = memQuestionKeyDown
     end
+  end
+  object CHATGPT1: TCHATGPT
+    Prompt = 'VocÃª Ã© um assistente.'
+    Dev = 'Voc'#195#170' '#195#169' um assistente.'
+    TipoChat = VCT_GPT4o
+    Provider = AIP_OPENAI
+    LocalIP = 'http://localhost:11434'
+    MaxTokens = 4096
+    Left = 85
+    Top = 37
   end
 end

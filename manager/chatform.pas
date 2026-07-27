@@ -6,12 +6,13 @@ interface
 
 uses
   Classes, SysUtils, Forms, Controls, Graphics, Dialogs, ExtCtrls, StdCtrls,
-  LCLType, chatgpt, aibase;
+  LCLType, chatgpt, aibase, aiagent_memorymap;
 
 type
   { TfrmChat }
 
   TfrmChat = class(TForm)
+    CHATGPT1: TCHATGPT;
     memChat: TMemo;
     pnlInput: TPanel;
     pnlRightButtons: TPanel;
