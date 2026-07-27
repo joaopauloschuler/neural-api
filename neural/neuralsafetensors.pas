@@ -843,7 +843,7 @@ end;
 
 procedure TNNetSafeTensorsReader.DecodeHalfJob(index, threadnum: integer);
 var
-  StartPos, FinishPos, i: integer;
+  StartPos, FinishPos, SpanLen: integer;
   WordPtr: PWord;
   DstPtr: PSingle;
 begin
@@ -854,24 +854,15 @@ begin
   Inc(WordPtr, StartPos);
   DstPtr := FParDecodeDst;
   Inc(DstPtr, StartPos);
+  SpanLen := FinishPos - StartPos + 1;
+  // Rule #18: the widening loops are TNNetVolume primitives, so an AVX2 build
+  // does 8 elements per iteration inside each worker's slice.
   if FParDecodeBF16 then
-  begin
-    for i := StartPos to FinishPos do
-    begin
-      DstPtr^ := DecodeBF16(WordPtr^);
-      Inc(WordPtr);
-      Inc(DstPtr);
-    end;
-  end
+    TNNetVolume.DecodeBF16(TNeuralFloatArrPtr(DstPtr),
+      TNeuralHalfArrPtr(WordPtr), SpanLen)
   else
-  begin
-    for i := StartPos to FinishPos do
-    begin
-      DstPtr^ := DecodeF16(WordPtr^);
-      Inc(WordPtr);
-      Inc(DstPtr);
-    end;
-  end;
+    TNNetVolume.DecodeF16(TNeuralFloatArrPtr(DstPtr),
+      TNeuralHalfArrPtr(WordPtr), SpanLen);
 end;
 
 procedure TNNetSafeTensorsReader.DecodeHalfBuffer(Src: PWord; Dst: PSingle;
@@ -894,24 +885,13 @@ begin
     fNTL.StartProc({$IFDEF FPC}@DecodeHalfJob{$ELSE}DecodeHalfJob{$ENDIF});
     exit;
   end;
+  // Below the fan-out threshold, but still vectorized per rule #18.
   if IsBF16 then
-  begin
-    for i := 1 to Count do
-    begin
-      Dst^ := DecodeBF16(Src^);
-      Inc(Src);
-      Inc(Dst);
-    end;
-  end
+    TNNetVolume.DecodeBF16(TNeuralFloatArrPtr(Dst), TNeuralHalfArrPtr(Src),
+      Count)
   else
-  begin
-    for i := 1 to Count do
-    begin
-      Dst^ := DecodeF16(Src^);
-      Inc(Src);
-      Inc(Dst);
-    end;
-  end;
+    TNNetVolume.DecodeF16(TNeuralFloatArrPtr(Dst), TNeuralHalfArrPtr(Src),
+      Count);
 end;
 
 procedure TNNetSafeTensorsReader.ReadElementsInto(ShardIdx: integer;

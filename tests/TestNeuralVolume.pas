@@ -87,6 +87,11 @@ type
     procedure TestQuantizeInt8NonFinite;
     procedure TestQuantizeInt8TinyAndDenormalRows;
     procedure TestQuantizeInt8MatchesScalarReference;
+    procedure TestDequantizeInt8;
+    procedure TestDequantizeInt8RoundTrip;
+    procedure TestDecodeBF16;
+    procedure TestDecodeF16;
+    procedure TestDecodeF16SpecialValues;
   end;
 
 implementation
@@ -2109,6 +2114,209 @@ begin
   finally
     V.Free;
   end;
+end;
+
+// DequantizeInt8 is one single multiply per element on both paths, so unlike
+// QuantizeInt8 it IS bit-exact and the reference below uses delta 0. N = 21
+// crosses the AVX body (16) into the scalar tail (5); N = 5 stays under
+// csMinAvxSize and exercises the pure scalar method. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestDequantizeInt8;
+const
+  N = 21;
+  // TYPED on purpose: an untyped const would keep full precision in the
+  // expectation below while the call rounds it to single, so the two would
+  // disagree in the last bit for no good reason.
+  Scale: TNeuralFloat = 0.0125;
+var
+  Codes: TInt8DynArr;
+  Dst: array of TNeuralFloat;
+  // The expectation must round to SINGLE exactly once, like the kernel does.
+  // Passing "Scale * Codes[i]" straight to AssertEquals would evaluate it in
+  // double and disagree in the last bit.
+  Expected: TNeuralFloat;
+  i: integer;
+begin
+  SetLength(Codes, N);
+  SetLength(Dst, N);
+  // A spread that includes both saturation ends and zero.
+  for i := 0 to N - 1 do Codes[i] := ShortInt(((i * 13) mod 255) - 127);
+  Codes[0] := 127;
+  Codes[1] := -127;
+  Codes[2] := 0;
+  for i := 0 to N - 1 do Dst[i] := 12345;   // poison: every slot must be written
+  TNNetVolume.DequantizeInt8(TNeuralFloatArrPtr(@Dst[0]),
+    TNeuralInt8ArrPtr(@Codes[0]), N, Scale);
+  for i := 0 to N - 1 do
+  begin
+    Expected := Scale * Codes[i];
+    AssertEquals('element ' + IntToStr(i) + ' (code ' + IntToStr(Codes[i]) + ')',
+      Expected, Dst[i], 0);
+  end;
+  // Under csMinAvxSize: the scalar method, same contract.
+  for i := 0 to 4 do Dst[i] := 12345;
+  TNNetVolume.DequantizeInt8(TNeuralFloatArrPtr(@Dst[0]),
+    TNeuralInt8ArrPtr(@Codes[0]), 5, Scale);
+  for i := 0 to 4 do
+  begin
+    Expected := Scale * Codes[i];
+    AssertEquals('short-run element ' + IntToStr(i), Expected, Dst[i], 0);
+  end;
+  // N <= 0 must write nothing at all.
+  Dst[0] := 999;
+  TNNetVolume.DequantizeInt8(TNeuralFloatArrPtr(@Dst[0]),
+    TNeuralInt8ArrPtr(@Codes[0]), 0, Scale);
+  AssertEquals('N=0 writes nothing', 999, Dst[0], 0);
+end;
+
+// QuantizeInt8 then DequantizeInt8 must land within half a code of the input,
+// which is the whole accuracy claim of the int8 weight path. Binds the two
+// primitives together so a lane-order bug in either shows up here.
+// Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestDequantizeInt8RoundTrip;
+const
+  N = 300;
+var
+  V: TNNetVolume;
+  Codes: TInt8DynArr;
+  Back: array of TNeuralFloat;
+  MaxAbs, Scale: TNeuralFloat;
+  i: integer;
+begin
+  RandSeed := 24680;
+  V := TNNetVolume.Create(N, 1, 1);
+  SetLength(Codes, N);
+  SetLength(Back, N);
+  try
+    for i := 0 to N - 1 do V.FData[i] := (Random - 0.5) * 3.2;
+    MaxAbs := TNNetVolume.MaxAbsFinite(TNeuralFloatArrPtr(@V.FData[0]), N);
+    AssertTrue('random row has a range', MaxAbs > 0);
+    Scale := MaxAbs / 127;
+    TNNetVolume.QuantizeInt8(TNeuralInt8ArrPtr(@Codes[0]),
+      TNeuralFloatArrPtr(@V.FData[0]), N, MaxAbs);
+    TNNetVolume.DequantizeInt8(TNeuralFloatArrPtr(@Back[0]),
+      TNeuralInt8ArrPtr(@Codes[0]), N, Scale);
+    for i := 0 to N - 1 do
+      AssertTrue('element ' + IntToStr(i) + ' recovers within half a code: ' +
+        FloatToStr(V.FData[i]) + ' -> ' + FloatToStr(Back[i]),
+        Abs(Back[i] - V.FData[i]) <= Scale * 0.5 + 1e-7);
+  finally
+    V.Free;
+  end;
+end;
+
+// A bfloat16 IS the high half of a single, so decoding is exactly that shift -
+// which is what the expectation below computes. Exact on every build, hence
+// delta 0. N = 21 crosses the AVX body into the tail. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestDecodeBF16;
+const
+  // 1.0, -2.0, +0.0, -0.0, ~3.14, -0.5, ~3.39e38, a denormal single, 0.1-ish,
+  // then filler - none of them Inf or NaN, so AssertEquals stays safe.
+  Pats: array[0..20] of Word = ($3F80, $C000, $0000, $8000, $4049, $BF00,
+    $7F7F, $0001, $3DCC, $4120, $C2F0, $3F00, $BE80, $4780, $C780, $3E00,
+    $B800, $4400, $C400, $3B00, $BB80);
+  N = 21;
+var
+  Dst: array of TNeuralFloat;
+  Expected: TNeuralFloat;
+  OutBits: Cardinal;
+  i: integer;
+begin
+  SetLength(Dst, N);
+  for i := 0 to N - 1 do Dst[i] := 12345;
+  TNNetVolume.DecodeBF16(TNeuralFloatArrPtr(@Dst[0]),
+    TNeuralHalfArrPtr(@Pats[0]), N);
+  for i := 0 to N - 1 do
+  begin
+    OutBits := Cardinal(Pats[i]) shl 16;
+    Expected := PSingle(@OutBits)^;
+    AssertEquals('bf16 $' + IntToHex(Pats[i], 4), Expected, Dst[i], 0);
+  end;
+  // Under csMinAvxSize: the scalar method, same answers.
+  for i := 0 to 4 do Dst[i] := 12345;
+  TNNetVolume.DecodeBF16(TNeuralFloatArrPtr(@Dst[0]),
+    TNeuralHalfArrPtr(@Pats[0]), 5);
+  for i := 0 to 4 do
+  begin
+    OutBits := Cardinal(Pats[i]) shl 16;
+    AssertEquals('short-run bf16 ' + IntToStr(i), PSingle(@OutBits)^, Dst[i], 0);
+  end;
+end;
+
+// Every IEEE half is exactly representable as a single, so these are exact
+// values, not approximations - delta 0. Includes a subnormal (2^-24) and the
+// largest finite half (65504), the two places a widening implementation
+// usually breaks. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestDecodeF16;
+const
+  N = 21;
+  Bits: array[0..20] of Word = (
+    $3C00, $BC00, $0000, $8000, $4000, $C000, $3800, $B800,
+    $7BFF, $FBFF, $0001, $8001, $03FF, $0400, $3555, $4248,
+    $5140, $D140, $1400, $6400, $E400);
+  Vals: array[0..20] of TNeuralFloat = (
+    1.0, -1.0, 0.0, -0.0, 2.0, -2.0, 0.5, -0.5,
+    65504.0, -65504.0,
+    5.9604644775390625e-8,      // smallest subnormal half, 2^-24
+    -5.9604644775390625e-8,
+    6.0975551605224609e-5,      // largest subnormal half
+    6.103515625e-5,             // smallest normal half, 2^-14
+    0.333251953125,             // nearest half to 1/3
+    3.140625,                   // nearest half to pi
+    42.0, -42.0,
+    0.0009765625,               // 2^-10
+    1024.0, -1024.0);
+var
+  Dst: array of TNeuralFloat;
+  i: integer;
+begin
+  SetLength(Dst, N);
+  for i := 0 to N - 1 do Dst[i] := 12345;
+  TNNetVolume.DecodeF16(TNeuralFloatArrPtr(@Dst[0]),
+    TNeuralHalfArrPtr(@Bits[0]), N);
+  for i := 0 to N - 1 do
+    AssertEquals('f16 $' + IntToHex(Bits[i], 4), Vals[i], Dst[i], 0);
+  // Under csMinAvxSize: the scalar method, same answers.
+  for i := 0 to 4 do Dst[i] := 12345;
+  TNNetVolume.DecodeF16(TNeuralFloatArrPtr(@Dst[0]),
+    TNeuralHalfArrPtr(@Bits[0]), 5);
+  for i := 0 to 4 do
+    AssertEquals('short-run f16 ' + IntToStr(i), Vals[i], Dst[i], 0);
+end;
+
+// Inf and NaN halves must widen to Inf and NaN singles rather than trapping -
+// FPC leaves the SSE invalid-operation exception unmasked, so a decode that
+// touched these values arithmetically would raise EInvalidOp here.
+// Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestDecodeF16SpecialValues;
+const
+  N = 20;
+  // +Inf, -Inf, quiet NaN, a NaN with a payload, then finite filler out to a
+  // length that still runs the vector body.
+  Bits: array[0..19] of Word = (
+    $7C00, $FC00, $7E00, $7DAB, $3C00, $0000, $BC00, $4000,
+    $3C00, $0000, $BC00, $4000, $3C00, $0000, $BC00, $4000,
+    $7C00, $FC00, $7E00, $3C00);
+var
+  Dst: array of TNeuralFloat;
+  i: integer;
+begin
+  SetLength(Dst, N);
+  for i := 0 to N - 1 do Dst[i] := 12345;
+  TNNetVolume.DecodeF16(TNeuralFloatArrPtr(@Dst[0]),
+    TNeuralHalfArrPtr(@Bits[0]), N);
+  for i := 0 to N - 1 do
+    case Bits[i] of
+      $7C00: AssertTrue('slot ' + IntToStr(i) + ' is +Inf',
+               IsInfinite(Dst[i]) and (Dst[i] > 0));
+      $FC00: AssertTrue('slot ' + IntToStr(i) + ' is -Inf',
+               IsInfinite(Dst[i]) and (Dst[i] < 0));
+      $7E00, $7DAB: AssertTrue('slot ' + IntToStr(i) + ' is NaN',
+               IsNan(Dst[i]));
+      $3C00: AssertEquals('slot ' + IntToStr(i), 1.0, Dst[i], 0);
+      $BC00: AssertEquals('slot ' + IntToStr(i), -1.0, Dst[i], 0);
+      $4000: AssertEquals('slot ' + IntToStr(i), 2.0, Dst[i], 0);
+      $0000: AssertEquals('slot ' + IntToStr(i), 0.0, Dst[i], 0);
+    end;
 end;
 
 // Straightforward O(pSize*pSize) box sum: the definition the summed-area-table

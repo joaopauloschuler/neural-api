@@ -82,6 +82,12 @@ type
   // TNeuralFloatArrPtr views float buffers). Coded by Claude (AI).
   TNeuralInt8Arr = array[0..Maxint div 2] of ShortInt;
   TNeuralInt8ArrPtr = ^TNeuralInt8Arr;
+  // Unbounded-view type over 16-bit half / bfloat16 source data (never
+  // allocated as such - the checkpoint readers aim it at their staging
+  // buffers, mirroring how TNeuralInt8ArrPtr views int8 codes).
+  // Coded by Claude (AI).
+  TNeuralHalfArr = array[0..Maxint div 4] of Word;
+  TNeuralHalfArrPtr = ^TNeuralHalfArr;
 
 const
   csNeuralFloatSize = SizeOf(TNeuralFloat);
@@ -612,6 +618,33 @@ type
       // single reciprocal of a denormal overflows to Inf (and would trap under
       // FPC's unmasked SSE exceptions). Coded by Claude (AI).
       class procedure QuantizeInt8(pDst: TNeuralInt8ArrPtr; pSrc: TNeuralFloatArrPtr; N: integer; MaxAbs: TNeuralFloat); static;
+      // Expands symmetric int8 codes back to floats: dst[i] := Scale*src[i].
+      // The inverse of QuantizeInt8, and the inner loop every block-quantized
+      // checkpoint reader runs (ggml Q8_0 directly; the k-quants and the legacy
+      // Q4/Q5 forms once their nibbles are unpacked into codes).
+      // Bit-exact against the scalar loop on every build - one single-precision
+      // multiply per element either way, so unlike QuantizeInt8 this one CAN be
+      // parity-tested. AVX2/64-bit builds convert 8 codes per iteration.
+      // Coded by Claude (AI).
+      class procedure DequantizeInt8(pDst: TNeuralFloatArrPtr; pSrc: TNeuralInt8ArrPtr; N: integer; Scale: TNeuralFloat); static;
+      // Widens N bfloat16 values to single. A bfloat16 IS the top half of a
+      // single, so this is a 16-bit left shift: exact for every input, Inf and
+      // NaN included, and bit-exact on all builds. AVX2/64-bit builds widen 8
+      // per iteration. Coded by Claude (AI).
+      class procedure DecodeBF16(pDst: TNeuralFloatArrPtr; pSrc: TNeuralHalfArrPtr; N: integer); static;
+      // Widens N IEEE-754 half values to single. Every half - subnormals and
+      // NaN included - is exactly representable as a single, so the conversion
+      // is lossless, and it never traps whatever the input bits say.
+      // Bit-exact across builds for every value a checkpoint can hold; the one
+      // exception is a SIGNALLING NaN, which the AVX2 path quiets (same
+      // payload, mantissa MSB set) while the scalar path passes it through.
+      //
+      // The AVX2/64-bit path is F16C's vcvtph2ps, 8 per iteration. F16C is a
+      // CPUID bit distinct from AVX2, but no shipping AVX2 part lacks it (Intel
+      // >= Haswell, AMD >= Excavator all carry both), so it rides the AVX2
+      // define rather than adding a third build flavour; -dNOF16C forces the
+      // scalar path for anyone who needs it. Coded by Claude (AI).
+      class procedure DecodeF16(pDst: TNeuralFloatArrPtr; pSrc: TNeuralHalfArrPtr; N: integer); static;
       // VectorErf writes dst[0..N-1] := erf(src[0..N-1]) using the Abramowitz &
       // Stegun 7.1.26 approximation (|err| < 1.5e-7, i.e. matches pcr_erff to
       // ~1e-6). Built on VectorExp so it inherits the AVX2 path. dst may alias src.
@@ -1558,6 +1591,45 @@ implementation
 uses
   Math, neuralbit, strutils;
 
+// Scalar IEEE-754 half -> single. Pure bit surgery, so no floating-point
+// compare happens and nothing here can trap: a signalling NaN half widens to
+// the matching signalling NaN single untouched. Used by DecodeF16's non-AVX
+// build and by the AVX tail. Coded by Claude (AI).
+function NeuralHalfToSingle(Bits: Word): Single;
+var
+  Sign, Exponent, Mantissa, OutBits: Cardinal;
+begin
+  Sign := (Bits shr 15) and $1;
+  Exponent := (Bits shr 10) and $1F;
+  Mantissa := Bits and $3FF;
+  if Exponent = 0 then
+  begin
+    if Mantissa = 0 then
+    begin
+      OutBits := Sign shl 31;                  // signed zero
+      Result := PSingle(@OutBits)^;
+    end
+    else
+    begin
+      // Subnormal half: value = (-1)^s * m * 2^-24, exact in single.
+      Result := Mantissa * 5.9604644775390625e-8;
+      if Sign <> 0 then Result := -Result;
+    end;
+  end
+  else if Exponent = $1F then
+  begin
+    // Inf / NaN: rebuild against single's all-ones exponent.
+    OutBits := (Sign shl 31) or ($FF shl 23) or (Mantissa shl 13);
+    Result := PSingle(@OutBits)^;
+  end
+  else
+  begin
+    // Normal: rebias the exponent 15 -> 127, widen the mantissa 10 -> 23 bits.
+    OutBits := (Sign shl 31) or ((Exponent + 112) shl 23) or (Mantissa shl 13);
+    Result := PSingle(@OutBits)^;
+  end;
+end;
+
 {$IFDEF AVX64}
 {$IFDEF AVX2}
 // Fused int8 x float32 dot product (raw code sum, no scale): sign-extends 8
@@ -1991,6 +2063,174 @@ begin
     PtrDst^[i] := ShortInt(Code);
   end;
 end;
+
+// dst[i] := Scale * src[i] over NumElements symmetric int8 codes. Per 8 lanes:
+// vpmovsxbd sign-extends 8 bytes to dwords, vcvtdq2ps converts, one broadcast
+// vmulps applies the scale - the same three steps AVXDotProductInt8 uses to
+// materialize weights in-register, here written out to memory instead.
+//
+// Bit-exact against the scalar tail: both round exactly one single-precision
+// product. The scale is broadcast from a LOCAL through a pointer (the
+// AVXAddScalar idiom) so no [rip+label] relocation appears and
+// position-independent linking of the examples keeps working - see
+// AVXMaxAbsFinite. Coded by Claude (AI).
+procedure AVXDequantizeInt8(PtrDst: TNeuralFloatArrPtr;
+  PtrSrc: TNeuralInt8ArrPtr; NumElements: integer; Scale: Single);
+var
+  localNumElements, i, NumElementsM1: integer;
+  localScale: Single;
+  ScalePtr: pointer;
+begin
+  localNumElements := NumElements and (not 7);
+  if localNumElements > 0 then
+  begin
+    localScale := Scale;
+    ScalePtr := Addr(localScale);
+  asm
+  mov rax, PtrSrc
+  mov rdx, PtrDst
+  mov r8, ScalePtr
+  mov ecx, localNumElements
+  shr ecx, 3
+  vbroadcastss ymm2, [r8]
+@Loop:
+  vpmovsxbd ymm0, [rax]      // 8 codes -> 8 sign-extended dwords
+  vcvtdq2ps ymm0, ymm0
+  vmulps    ymm0, ymm0, ymm2
+  vmovups   [rdx], ymm0
+  add rax, 8
+  add rdx, 32
+  dec ecx
+  jnz @Loop
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm2'
+  ];
+  end;
+  NumElementsM1 := NumElements - 1;
+  for i := localNumElements to NumElementsM1 do
+    PtrDst^[i] := Scale * PtrSrc^[i];
+end;
+
+// dst[i] := bfloat16(src[i]) widened to single. A bfloat16 is literally the
+// high 16 bits of the single, so per 8 lanes vpmovzxwd spreads the halves into
+// dwords (value in the LOW half of each) and one vpslld shifts each up into
+// place. No floating-point operation executes at all, so this cannot trap on
+// NaN payloads and is exact by construction. Coded by Claude (AI).
+procedure AVXDecodeBF16(PtrDst: TNeuralFloatArrPtr;
+  PtrSrc: TNeuralHalfArrPtr; NumElements: integer);
+var
+  localNumElements, i, NumElementsM1: integer;
+  OutBits: Cardinal;
+begin
+  localNumElements := NumElements and (not 7);
+  if localNumElements > 0 then
+  begin
+  asm
+  mov rax, PtrSrc
+  mov rdx, PtrDst
+  mov ecx, localNumElements
+  shr ecx, 3
+@Loop:
+  vpmovzxwd ymm0, [rax]      // 8 bfloat16 -> 8 dwords, value in bits 0..15
+  vpslld    ymm0, ymm0, 16   // shift into bits 16..31 = the single's bits
+  vmovups   [rdx], ymm0
+  add rax, 16
+  add rdx, 32
+  dec ecx
+  jnz @Loop
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'ymm0'
+  ];
+  end;
+  NumElementsM1 := NumElements - 1;
+  for i := localNumElements to NumElementsM1 do
+  begin
+    OutBits := Cardinal(PtrSrc^[i]) shl 16;
+    PtrDst^[i] := PSingle(@OutBits)^;
+  end;
+end;
+
+{$IFNDEF NOF16C}
+// dst[i] := half(src[i]) widened to single, 8 per iteration through F16C's
+// vcvtph2ps. Every half is exactly representable as a single, so the
+// instruction is a lossless widening and agrees bit-for-bit with the scalar
+// NeuralHalfToSingle tail.
+//
+// vcvtph2ps raises #I for a SIGNALLING NaN input, and FPC leaves the SSE
+// invalid-operation exception unmasked - so a corrupt file carrying one would
+// crash an AVX2 build while the pure bit-surgery scalar path decoded it
+// happily. The three integer ops before the conversion close that gap: any
+// half whose |value| exceeds $7C00 is a NaN (all-ones exponent, non-zero
+// mantissa), and setting its mantissa MSB makes it quiet. Inf is exactly
+// $7C00 so it is left alone, and no finite value can reach the compare.
+// The one visible consequence is that a signalling NaN decodes to the QUIET
+// NaN of the same payload here, where the scalar path preserves it verbatim.
+//
+// The conversion is emitted as raw bytes because FPC 3.2.2's assembler has no
+// F16C mnemonics at all - "Unrecognized opcode VCVTPH2PS". The five bytes are
+// "vcvtph2ps ymm0, xmm0" = VEX.256.66.0F38.W0 13 /r:
+//   C4 E2 7D   3-byte VEX - R/X/B all unset (ymm0, xmm0), mmmmm=0F38, W=0,
+//              vvvv unused, L=1 (256-bit), pp=66
+//   13         the opcode
+//   C0         ModRM mod=11 reg=000 (ymm0) rm=000 (xmm0)
+// TestDecodeF16 and TestDecodeF16SpecialValues cover the results, and the
+// encoding is verified by disassembling the built binary. Coded by Claude (AI).
+procedure AVXDecodeF16(PtrDst: TNeuralFloatArrPtr;
+  PtrSrc: TNeuralHalfArrPtr; NumElements: integer);
+var
+  localNumElements, i, NumElementsM1: integer;
+  // Three word-wide vector constants, held in LOCALS and reached through a
+  // pointer so no [rip+label] relocation appears (see AVXMaxAbsFinite):
+  // [0..7] = $7FFF sign mask, [8..15] = $7C00 (Inf), [16..23] = $0200 quiet bit.
+  Consts: array[0..23] of Word;
+  ConstsPtr: pointer;
+begin
+  localNumElements := NumElements and (not 7);
+  if localNumElements > 0 then
+  begin
+    for i := 0 to 7 do
+    begin
+      Consts[i] := $7FFF;
+      Consts[i + 8] := $7C00;
+      Consts[i + 16] := $0200;
+    end;
+    ConstsPtr := Addr(Consts[0]);
+  asm
+  mov rax, PtrSrc
+  mov rdx, PtrDst
+  mov r8, ConstsPtr
+  mov ecx, localNumElements
+  shr ecx, 3
+  vmovups   xmm2, [r8]
+  vmovups   xmm3, [r8+16]
+  vmovups   xmm4, [r8+32]
+@Loop:
+  vmovups   xmm0, [rax]          // 8 halves
+  vpand     xmm1, xmm0, xmm2     // |h|
+  vpcmpgtw  xmm1, xmm1, xmm3     // |h| > $7C00  <=>  h is NaN
+  vpand     xmm1, xmm1, xmm4     // quiet bit, only on the NaN lanes
+  vpor      xmm0, xmm0, xmm1     // signalling NaN -> quiet NaN
+  db $C4, $E2, $7D, $13, $C0     // vcvtph2ps ymm0, xmm0: 8 halves -> 8 singles
+  vmovups   [rdx], ymm0
+  add rax, 16
+  add rdx, 32
+  dec ecx
+  jnz @Loop
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4'
+  ];
+  end;
+  NumElementsM1 := NumElements - 1;
+  for i := localNumElements to NumElementsM1 do
+    PtrDst^[i] := NeuralHalfToSingle(PtrSrc^[i]);
+end;
+{$ENDIF}
 {$ENDIF}
 {$ENDIF}
 
@@ -11576,6 +11816,72 @@ begin
     Code := Round(Scaled);
     pDst^[I] := ShortInt(Code);
   end;
+end;
+
+class procedure TNNetVolume.DequantizeInt8(pDst: TNeuralFloatArrPtr;
+  pSrc: TNeuralInt8ArrPtr; N: integer; Scale: TNeuralFloat);
+var
+  I, vHigh: integer;
+begin
+  if N <= 0 then exit;
+  {$IFDEF AVX64}
+  {$IFDEF AVX2}
+  if N >= csMinAvxSize then
+  begin
+    AVXDequantizeInt8(pDst, pSrc, N, Scale);
+    exit;
+  end;
+  {$ENDIF}
+  {$ENDIF}
+  vHigh := N - 1;
+  for I := 0 to vHigh do
+    pDst^[I] := Scale * pSrc^[I];
+end;
+
+class procedure TNNetVolume.DecodeBF16(pDst: TNeuralFloatArrPtr;
+  pSrc: TNeuralHalfArrPtr; N: integer);
+var
+  I, vHigh: integer;
+  OutBits: Cardinal;
+begin
+  if N <= 0 then exit;
+  {$IFDEF AVX64}
+  {$IFDEF AVX2}
+  if N >= csMinAvxSize then
+  begin
+    AVXDecodeBF16(pDst, pSrc, N);
+    exit;
+  end;
+  {$ENDIF}
+  {$ENDIF}
+  vHigh := N - 1;
+  for I := 0 to vHigh do
+  begin
+    OutBits := Cardinal(pSrc^[I]) shl 16;
+    pDst^[I] := PSingle(@OutBits)^;
+  end;
+end;
+
+class procedure TNNetVolume.DecodeF16(pDst: TNeuralFloatArrPtr;
+  pSrc: TNeuralHalfArrPtr; N: integer);
+var
+  I, vHigh: integer;
+begin
+  if N <= 0 then exit;
+  {$IFDEF AVX64}
+  {$IFDEF AVX2}
+  {$IFNDEF NOF16C}
+  if N >= csMinAvxSize then
+  begin
+    AVXDecodeF16(pDst, pSrc, N);
+    exit;
+  end;
+  {$ENDIF}
+  {$ENDIF}
+  {$ENDIF}
+  vHigh := N - 1;
+  for I := 0 to vHigh do
+    pDst^[I] := NeuralHalfToSingle(pSrc^[I]);
 end;
 
 class procedure TNNetVolume.MulAddInt8(PtrA, PtrB: TNeuralFloatArrPtr;

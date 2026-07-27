@@ -1456,40 +1456,32 @@ end;
 procedure DecodeGGMLSpan(TypeId: integer; Raw: PByte; ElemCnt: Int64;
   Outp: PSingle);
 var
-  i, BlockCnt, NumBlocksM1, ElemCntM1, Q8ElemsM1, BlockOfs, OutBase: Int64;
+  BlockCnt, NumBlocksM1, BlockOfs, OutBase: Int64;
   Scale: single;
-  WordPtr: PWord;
-  QuantPtr: PShortInt;
 begin
-  ElemCntM1 := ElemCnt - 1;
   case TypeId of
     GGML_TYPE_F32:
       Move(Raw^, Outp^, ElemCnt * csNeuralFloatSize);
     GGML_TYPE_F16:
-    begin
-      WordPtr := PWord(Raw);
-      for i := 0 to ElemCntM1 do
-      begin
-        Outp[i] := DecodeF16(WordPtr^);
-        Inc(WordPtr);
-      end;
-    end;
+      // Rule #18: one TNNetVolume primitive over the whole span, so an AVX2
+      // build widens 8 halves per iteration instead of branching per element.
+      // ElemCnt is a whole number of rows bounded by the caller's chunking, so
+      // it always fits an integer here.
+      TNNetVolume.DecodeF16(TNeuralFloatArrPtr(Outp),
+        TNeuralHalfArrPtr(Raw), integer(ElemCnt));
     GGML_TYPE_Q8_0:
     begin
-      // f16 scale d then 32 int8 quants per block; x = d * q.
-      Q8ElemsM1 := GGUF_Q8_0_BLOCK_ELEMS - 1;
+      // f16 scale d then 32 int8 quants per block; x = d * q. DequantizeInt8
+      // is the exact inverse of the quantizer the int8 weight path uses, and
+      // one block is four AVX2 iterations.
       NumBlocksM1 := (ElemCnt div GGUF_Q8_0_BLOCK_ELEMS) - 1;
       BlockOfs := 0;
       OutBase := 0;
       for BlockCnt := 0 to NumBlocksM1 do
       begin
         Scale := DecodeF16(PWord(Raw + BlockOfs)^);
-        QuantPtr := PShortInt(Raw + BlockOfs + 2);
-        for i := 0 to Q8ElemsM1 do
-        begin
-          Outp[OutBase + i] := Scale * QuantPtr^;
-          Inc(QuantPtr);
-        end;
+        TNNetVolume.DequantizeInt8(TNeuralFloatArrPtr(@Outp[OutBase]),
+          TNeuralInt8ArrPtr(Raw + BlockOfs + 2), GGUF_Q8_0_BLOCK_ELEMS, Scale);
         Inc(BlockOfs, GGUF_Q8_0_BLOCK_BYTES);
         Inc(OutBase, GGUF_Q8_0_BLOCK_ELEMS);
       end;
