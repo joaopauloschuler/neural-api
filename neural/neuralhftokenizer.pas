@@ -1455,6 +1455,36 @@ begin
   end;
 end;
 
+// Ends a bulk fill of one of the sorted lookup lists (FVocab / FMerges).
+//
+// Those lists are kept Sorted so Find() is a binary search, but inserting into
+// a sorted TStringList is O(n) per key (binary search + a memmove of the whole
+// tail), i.e. O(n^2) over a 150k-entry vocab. The load paths therefore fill
+// with Sorted=false (plain append) and call this once at the end: the
+// Sorted:=true assignment performs a single O(n log n) sort.
+//
+// Sorted+dupIgnore silently dropped a repeated key while TStrings.AddObject
+// still overwrote the payload, so the surviving entry carried the id/rank of
+// the LAST insertion; an unsorted append keeps both, so the duplicates have to
+// be collapsed here. Every caller adds ascending ids/ranks -- so keeping the
+// highest Objects value reproduces "last insertion wins" exactly -- except the
+// tokenizer.json BPE vocab object, whose ids come from the JSON; there a
+// collision needs two distinct JSON keys to coincide after unshielding, and
+// the highest id is then a deterministic choice.
+procedure HFEndBulkFill(L: TStringList);
+var
+  Cnt: integer;
+begin
+  L.Sorted := true;
+  for Cnt := L.Count - 1 downto 1 do
+    if L[Cnt] = L[Cnt - 1] then
+    begin
+      if PtrInt(L.Objects[Cnt]) > PtrInt(L.Objects[Cnt - 1]) then
+        L.Objects[Cnt - 1] := L.Objects[Cnt];
+      L.Delete(Cnt);
+    end;
+end;
+
 function TNeuralHFTokenizer.VocabFind(const Token: string): integer;
 var
   Idx: integer;
@@ -1875,6 +1905,7 @@ begin
       FUniMinScore := 0;
       FUniMaxPieceChars := 1;
       VocabCntM1 := VocabCnt - 1;
+      FVocab.Sorted := false;
       for Cnt := 0 to VocabCntM1 do
       begin
         SubArr := TJSONArray(VocabArr.Items[Cnt]);
@@ -1887,6 +1918,7 @@ begin
         UniCPLen := CodePointCount(Content);
         if UniCPLen > FUniMaxPieceChars then FUniMaxPieceChars := UniCPLen;
       end;
+      HFEndBulkFill(FVocab);
       // unk_id is an INDEX into the vocab array (not a token string).
       Node := ModelObj.Find('unk_id');
       if (Node <> nil) and not Node.IsNull then FUnkId := Node.AsInteger;
@@ -1900,6 +1932,7 @@ begin
       for Cnt := 0 to VocabObjCntM1 do
         MaxId := Max(MaxId, VocabObj.Items[Cnt].AsInteger);
       SetLength(FIdToToken, MaxId + 1);
+      FVocab.Sorted := false;
       for Cnt := 0 to VocabObjCntM1 do
       begin
         TokenId := VocabObj.Items[Cnt].AsInteger;
@@ -1914,6 +1947,7 @@ begin
         FVocab.AddObject(Content, TObject(PtrInt(TokenId)));
         FIdToToken[TokenId] := Content;
       end;
+      HFEndBulkFill(FVocab);
     end;
 
     // merges: ["a b", ...] (old) or [["a","b"], ...] (new).
@@ -1925,6 +1959,7 @@ begin
     if MergesArr <> nil then
     begin
     MergesCnt := MergesArr.Count - 1;
+    FMerges.Sorted := false;
     for Cnt := 0 to MergesCnt do
     begin
       Node := MergesArr.Items[Cnt];
@@ -1943,6 +1978,7 @@ begin
       end;
       FMerges.AddObject(Left + csMergeSep + Right, TObject(PtrInt(Cnt)));
     end;
+    HFEndBulkFill(FMerges);
     end;
 
     // unk token
@@ -2003,6 +2039,89 @@ begin
   end;
 end;
 
+type
+  TMergeCand = record
+    Left, Right: string;
+    LeftId, RightId, PieceId, LenL, LenR, Seq: integer;
+  end;
+  TMergeCandArray = array of TMergeCand;
+
+// True when A sorts strictly before B under (PieceId, LenL, LenR, Seq).
+function MergeCandBefore(const A, B: TMergeCand): boolean; inline;
+begin
+  if A.PieceId <> B.PieceId then exit(A.PieceId < B.PieceId);
+  if A.LenL <> B.LenL then exit(A.LenL < B.LenL);
+  if A.LenR <> B.LenR then exit(A.LenR < B.LenR);
+  Result := A.Seq < B.Seq;
+end;
+
+// Median-of-three quicksort over the index permutation Order, ordering by
+// MergeCandBefore. Recursion is on the smaller partition only, so the stack
+// depth stays O(log n).
+procedure SortMergeCandOrder(const Cands: TMergeCandArray;
+  var Order: array of integer; ALo, AHi: integer);
+var
+  Lo, Hi, I, J, Mid, PivotIdx, Swap: integer;
+begin
+  Lo := ALo;
+  Hi := AHi;
+  while Lo < Hi do
+  begin
+    if Hi - Lo < 12 then
+    begin
+      // small run: insertion sort
+      for I := Lo + 1 to Hi do
+      begin
+        Swap := Order[I];
+        J := I - 1;
+        while (J >= Lo) and MergeCandBefore(Cands[Swap], Cands[Order[J]]) do
+        begin
+          Order[J + 1] := Order[J];
+          Dec(J);
+        end;
+        Order[J + 1] := Swap;
+      end;
+      exit;
+    end;
+    Mid := Lo + (Hi - Lo) div 2;
+    if MergeCandBefore(Cands[Order[Mid]], Cands[Order[Lo]]) then
+    begin
+      Swap := Order[Mid]; Order[Mid] := Order[Lo]; Order[Lo] := Swap;
+    end;
+    if MergeCandBefore(Cands[Order[Hi]], Cands[Order[Lo]]) then
+    begin
+      Swap := Order[Hi]; Order[Hi] := Order[Lo]; Order[Lo] := Swap;
+    end;
+    if MergeCandBefore(Cands[Order[Hi]], Cands[Order[Mid]]) then
+    begin
+      Swap := Order[Hi]; Order[Hi] := Order[Mid]; Order[Mid] := Swap;
+    end;
+    PivotIdx := Order[Mid];
+    I := Lo;
+    J := Hi;
+    repeat
+      while MergeCandBefore(Cands[Order[I]], Cands[PivotIdx]) do Inc(I);
+      while MergeCandBefore(Cands[PivotIdx], Cands[Order[J]]) do Dec(J);
+      if I <= J then
+      begin
+        Swap := Order[I]; Order[I] := Order[J]; Order[J] := Swap;
+        Inc(I);
+        Dec(J);
+      end;
+    until I > J;
+    if J - Lo < Hi - I then
+    begin
+      if Lo < J then SortMergeCandOrder(Cands, Order, Lo, J);
+      Lo := I;
+    end
+    else
+    begin
+      if I < Hi then SortMergeCandOrder(Cands, Order, I, Hi);
+      Hi := J;
+    end;
+  end;
+end;
+
 // Reconstructs the byte-level-BPE merge table (FMerges) from a BPE
 // SentencePiece ModelProto's scored pieces. A BPE .model carries NO explicit
 // merge list, so we derive it byte-for-byte the way HuggingFace's
@@ -2025,21 +2144,18 @@ end;
 // non-ASCII byte-fallback path; no approximation.
 procedure TNeuralHFTokenizer.ReconstructBPEMerges(
   const PieceTextV: array of string; APieceCount: integer);
-type
-  TMergeCand = record
-    Left, Right: string;
-    LeftId, RightId, PieceId, LenL, LenR, Seq: integer;
-  end;
 var
-  Cands: array of TMergeCand;
+  Cands: TMergeCandArray;
+  Order: array of integer;      // permutation produced by the final sort
   Boundaries: array of integer; // 1-based byte offsets of codepoint starts
   NumCP, Pos, CnPiece, SplitI, ByteSplit, LId, RId, NLocal, I, J, Seq: integer;
   L, R, Piece: string;
   Tmp: TMergeCand;
-  LocalStart: integer;
+  LocalStart, NCand: integer;
   APieceCountM1, NumCPM1, CandsHi: integer;
 begin
   Seq := 0;
+  NCand := 0;
   SetLength(Cands, 0);
   APieceCountM1 := APieceCount - 1;
   for CnPiece := 0 to APieceCountM1 do
@@ -2058,7 +2174,7 @@ begin
     end;
     Boundaries[NumCP] := Pos;
     if NumCP < 2 then continue;  // single codepoint -> no split
-    LocalStart := Length(Cands);
+    LocalStart := NCand;
     // Each codepoint split (1..NumCP-1) where both halves are in the vocab.
     NumCPM1 := NumCP - 1;
     for SplitI := 1 to NumCPM1 do
@@ -2070,8 +2186,10 @@ begin
       if LId < 0 then continue;
       RId := VocabFind(R);
       if RId < 0 then continue;
-      SetLength(Cands, Length(Cands) + 1);
-      with Cands[High(Cands)] do
+      // amortized growth: appending one slot at a time reallocates per merge
+      if NCand = Length(Cands) then
+        SetLength(Cands, 1024 + Length(Cands) * 2);
+      with Cands[NCand] do
       begin
         Left := L; Right := R;
         LeftId := LId; RightId := RId;
@@ -2080,10 +2198,11 @@ begin
         LenR := NumCP - SplitI;    // codepoint length of R
         Seq := 0;                  // filled after local sort
       end;
+      Inc(NCand);
     end;
     // local sort by (LeftId, RightId) -- insertion sort over this piece's run.
-    NLocal := Length(Cands) - LocalStart;
-    CandsHi := High(Cands);
+    NLocal := NCand - LocalStart;
+    CandsHi := NCand - 1;
     for I := LocalStart + 1 to CandsHi do
     begin
       Tmp := Cands[I];
@@ -2101,34 +2220,28 @@ begin
     if NLocal = 0 then ;  // silence unused-warning path
   end;
 
-  // Stamp the append/sequence order (after all local sorts) so the final
-  // sort can keep ties stable (Python's sort is stable).
-  CandsHi := High(Cands);
+  // Stamp the append/sequence order (after all local sorts) -- this is the
+  // tie-break that reproduces Python's stable sort.
+  CandsHi := NCand - 1;
   for I := 0 to CandsHi do Cands[I].Seq := I;
 
-  // Final stable sort by (PieceId, LenL, LenR, Seq) ascending -> merge rank.
-  for I := 1 to CandsHi do
-  begin
-    Tmp := Cands[I];
-    J := I - 1;
-    while (J >= 0) and
-      ((Cands[J].PieceId > Tmp.PieceId) or
-       ((Cands[J].PieceId = Tmp.PieceId) and (Cands[J].LenL > Tmp.LenL)) or
-       ((Cands[J].PieceId = Tmp.PieceId) and (Cands[J].LenL = Tmp.LenL) and
-        (Cands[J].LenR > Tmp.LenR)) or
-       ((Cands[J].PieceId = Tmp.PieceId) and (Cands[J].LenL = Tmp.LenL) and
-        (Cands[J].LenR = Tmp.LenR) and (Cands[J].Seq > Tmp.Seq))) do
-    begin
-      Cands[J + 1] := Cands[J];
-      Dec(J);
-    end;
-    Cands[J + 1] := Tmp;
-  end;
+  // Final sort by (PieceId, LenL, LenR, Seq) ascending -> merge rank. Seq is
+  // the candidate's unique append index, so the key is a TOTAL order: no two
+  // candidates compare equal and the sort needs no stability of its own. Only
+  // the permutation is sorted; the record array stays put.
+  SetLength(Order, NCand);
+  for I := 0 to CandsHi do Order[I] := I;
+  SortMergeCandOrder(Cands, Order, 0, CandsHi);
 
   // Position in the final list IS the rank (lower rank = applied first).
+  FMerges.Sorted := false;
   for I := 0 to CandsHi do
-    FMerges.AddObject(Cands[I].Left + csMergeSep + Cands[I].Right,
+  begin
+    J := Order[I];
+    FMerges.AddObject(Cands[J].Left + csMergeSep + Cands[J].Right,
       TObject(PtrInt(I)));
+  end;
+  HFEndBulkFill(FMerges);
 end;
 
 { ---------------------------------------------------------------- }
@@ -2363,6 +2476,7 @@ begin
   FUniMaxPieceChars := 1;
   FByteFallback := false;
   PieceCountM1 := PieceCount - 1;
+  FVocab.Sorted := false;
   for Cnt := 0 to PieceCountM1 do
   begin
     FVocab.AddObject(PieceTextV[Cnt], TObject(PtrInt(Cnt)));
@@ -2378,6 +2492,7 @@ begin
     // pieces reassembles the original multi-byte UTF-8 sequence.
     if PieceTypeV[Cnt] = 6 then FByteFallback := true;
   end;
+  HFEndBulkFill(FVocab);
 
   // model_type=BPE: the ModelProto stores ONLY scored pieces -- no explicit
   // merge list (unlike a tokenizer.json BPE model). Reconstruct the merges
@@ -2477,6 +2592,7 @@ begin
     // ---- vocab (the 0-based array index IS the id) ----
     SetLength(FIdToToken, TokCount);
     FUniMaxPieceChars := 1;
+    FVocab.Sorted := false;
     for Cnt := 0 to TokCountM1 do
     begin
       Content := Reader.GetMetaArrayString('tokenizer.ggml.tokens', Cnt);
@@ -2485,6 +2601,7 @@ begin
       UniCPLen := CodePointCount(Content);
       if UniCPLen > FUniMaxPieceChars then FUniMaxPieceChars := UniCPLen;
     end;
+    HFEndBulkFill(FVocab);
 
     // ---- special-token ids (authoritative scalar metadata) ----
     MetaBos := Reader.GetMetaInt('tokenizer.ggml.bos_token_id', -1);
@@ -2550,6 +2667,7 @@ begin
       FSplitDigitsMax := 3;
       MergeCount := Reader.GetMetaArrayCount('tokenizer.ggml.merges');
       MergeCountM1 := MergeCount - 1;
+      FMerges.Sorted := false;
       for Cnt := 0 to MergeCountM1 do
       begin
         MergeStr := Reader.GetMetaArrayString('tokenizer.ggml.merges', Cnt);
@@ -2559,6 +2677,7 @@ begin
         Right := Copy(MergeStr, SpacePos + 1, Length(MergeStr));
         FMerges.AddObject(Left + csMergeSep + Right, TObject(PtrInt(Cnt)));
       end;
+      HFEndBulkFill(FMerges);
 
       // Expose CONTROL / USER_DEFINED pieces as added special tokens so they
       // round-trip verbatim (e.g. <|endoftext|>); fall back to id-based

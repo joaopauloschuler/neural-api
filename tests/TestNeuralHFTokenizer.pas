@@ -58,6 +58,7 @@ type
     procedure TestNFKCNormalizerFoldsTokenIds;
     procedure TestNFCNormalizerFoldsTokenIds;
     procedure TestWordPieceSpecialTokenIds;
+    procedure TestDuplicateVocabPieceKeepsLastId;
     procedure TestByteLevelSpecialTokenIds;
     procedure TestMetaspaceSpecialTokenIds;
     procedure TestDecodeKeepsSpecialsWhenAsked;
@@ -874,6 +875,35 @@ end;
 // The WordPiece (BERT-family) fixture: [PAD]/[UNK]/[CLS]/[SEP]/[MASK]
 // specials, no BOS/EOS convention. BERT callers fetch [CLS]/[SEP] via
 // TokenToId (BertTokenizeSentence in neuralpretrained.pas).
+// A Unigram vocab is an ARRAY, so the same piece can legitimately appear
+// twice. The lookup table is filled by bulk append + one sort; this pins the
+// duplicate-collapsing rule to what the incremental sorted fill produced --
+// the LAST occurrence's id wins, and the id space still spans every entry.
+procedure TTestNeuralHFTokenizer.TestDuplicateVocabPieceKeepsLastId;
+var
+  Tok: TNeuralHFTokenizer;
+  TempFile: string;
+  SL: TStringList;
+begin
+  TempFile := GetTempDir(true) + 'dup_vocab_tokenizer.json';
+  SL := TStringList.Create();
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    SL.Text := '{"model": {"type": "Unigram", "unk_id": 0, "vocab":'
+      + ' [["<unk>", 0.0], ["a", -1.0], ["b", -2.0], ["a", -3.0]]}}';
+    SL.SaveToFile(TempFile);
+    Tok.LoadFromFile(TempFile);
+    AssertEquals('duplicate piece resolves to the last id', 3,
+      Tok.TokenToId('a'));
+    AssertEquals('non-duplicate piece is unaffected', 2, Tok.TokenToId('b'));
+    AssertEquals('id space spans every array entry', 4, Tok.GetVocabSize());
+  finally
+    Tok.Free;
+    SL.Free;
+    DeleteFile(TempFile);
+  end;
+end;
+
 procedure TTestNeuralHFTokenizer.TestWordPieceSpecialTokenIds;
 var
   Tok: TNeuralHFTokenizer;
