@@ -15782,16 +15782,21 @@ end;
 //                instead of (Hq + 2*Hkv) SplitChannels + Hq packs + Hq SDPA
 //                heads + the head concat - and ONE shared KV cache per layer,
 //                chunk-eligible over query heads for intra-layer threading.
+//   RotaryTileDims  the partial-rotary width to hand the hoisted rotary layer
+//                (0 = the whole head rotates). Non-zero ONLY when HoistRoPE is
+//                set, so the per-head fallback keeps its own split/concat.
 // Coded by Claude (AI).
 type
   TAttnHoistPlan = record
     TiledQKNorm, HoistRoPE, Fused: boolean;
+    RotaryTileDims: integer;
   end;
 
 function LlamaAttnHoistPlan(const Config: TLlamaConfig;
-  LayerUseRoPE: boolean; HeadDim, RotaryDims: integer): TAttnHoistPlan;
+  const S: TRoPEScalingConfig; LayerUseRoPE: boolean;
+  HeadDim, RotaryDims: integer): TAttnHoistPlan;
 var
-  PerHeadOnly, FullRotary: boolean;
+  PerHeadOnly, FullRotary, PartialOK: boolean;
 begin
   // The two variants that genuinely need a layer PER HEAD between the
   // projection and the SDPA, and can therefore hoist nothing:
@@ -15800,20 +15805,34 @@ begin
   //    the whole projection width (wrong frequencies);
   //  - Llama-4's QK-L2 norm: applied AFTER RoPE, per head.
   PerHeadOnly := Config.MRoPEEnabled or Config.Llama4QKL2Norm;
-  // Partial rotary (Phi-3, Qwen3.5) still cuts a per-head rotary slice.
   FullRotary := RotaryDims >= HeadDim;
+  // PARTIAL rotary (Phi-3, Qwen3.5) hoists too: the head-tiled rotary layer
+  // takes the rotary width and zeroes the pass-through pairs' theta, which is
+  // an exact identity on those channels. The one thing that identity cannot
+  // survive is an output SCALE on the rotated pairs, so mirror exactly what
+  // TNNetRotaryEmbedding's constructor rejects - LongRoPE (long_mscale, and a
+  // long_factor table indexed over the full head) and YaRN with an mscale - and
+  // leave those on the per-head split/concat path.
+  PartialOK := (S.Mode <> rsmLongRoPE) and
+    (not ((S.Mode = rsmYaRN) and ((S.YarnAttnFactor > 0) or (S.Factor > 1))));
+  if not (FullRotary or PartialOK) then PerHeadOnly := true;
   // Config.QKNormFullWidth (OLMo-2) is NOT a blocker: that norm is already
-  // whole-width and precedes RoPE.
-  Result.TiledQKNorm := Config.QKNorm and FullRotary and (not PerHeadOnly);
-  Result.HoistRoPE := LayerUseRoPE and FullRotary and (not PerHeadOnly) and
+  // whole-width and precedes RoPE. Per-head QKNorm over a PARTIAL rotary head
+  // is fine too - the norm spans the FULL head and precedes RoPE either way
+  // (HF: k_norm(k_proj) then partial apply_rotary_pos_emb).
+  Result.TiledQKNorm := Config.QKNorm and (not PerHeadOnly);
+  Result.HoistRoPE := LayerUseRoPE and (not PerHeadOnly) and
     ((not Config.QKNorm) or Result.TiledQKNorm);
-  Result.Fused := NeuralAllowFusedAttention and FullRotary and
-    (not PerHeadOnly) and
+  Result.Fused := NeuralAllowFusedAttention and (not PerHeadOnly) and
     ((not LayerUseRoPE) or Result.HoistRoPE) and
     ((not Config.QKNorm) or Result.TiledQKNorm) and
     // Llama-4 attn_temperature_tuning scales the query per position on the NoPE
     // layers only - a per-head layer between the split and the SDPA.
     (not (Config.AttnTempTuning and (not LayerUseRoPE)));
+  if Result.HoistRoPE and (not FullRotary) then
+    Result.RotaryTileDims := RotaryDims
+  else
+    Result.RotaryTileDims := 0;
 end;
 
 // The Llama builder core: builds the net and loads every weight from the
@@ -16160,7 +16179,19 @@ begin
         // What this layer can hoist out of the per-head forest (see
         // LlamaAttnHoistPlan for the reasoning behind each answer). The
         // per-head fallback below runs for whatever the plan leaves off.
-        Plan := LlamaAttnHoistPlan(Config, LayerUseRoPE, HeadDim, RotaryDims);
+        Plan := LlamaAttnHoistPlan(Config, LayerRoPEScaling, LayerUseRoPE,
+          HeadDim, RotaryDims);
+        // Config.AttnOutputGate (Qwen3.5): QProj is DOUBLE width, [query|gate].
+        // Every HOISTED whole-projection layer (the tiled q-norm, the tiled
+        // rotary, the fused pack) must therefore see the QUERY half only - the
+        // gate half is read straight off QProj further below and must reach the
+        // sigmoid unnormalized and unrotated. The per-head fallback needs no
+        // slice: its heads are cut at chBase = HeadCnt*HeadDim, which already
+        // lands inside the query half.
+        if Config.AttnOutputGate and
+           (Plan.TiledQKNorm or Plan.HoistRoPE or Plan.Fused) then
+          QSource := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(0, QWidth), QSource);
         // Config.QKNorm (Qwen3, Gemma-3): per-head RMSNorm on each q/k
         // slice AFTER the projection and BEFORE RoPE (the HF
         // modeling_qwen3 AND modeling_gemma3 ordering, both verified:
@@ -16188,13 +16219,18 @@ begin
         end;
         // Hoisted RoPE: ONE full-width TNNetRotaryEmbedding with a head-tiled
         // theta (pRotaryHeadDim = HeadDim) over the whole q/k projection.
+        // Plan.RotaryTileDims > 0 carries the partial-rotary width (Qwen3.5,
+        // Phi-3): the layer rotates the first RotaryTileDims channels of every
+        // head and passes the rest through.
         if Plan.HoistRoPE then
         begin
           QSource := NN.AddLayerAfter(
-            CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling, HeadDim),
+            CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling,
+              HeadDim, Plan.RotaryTileDims),
             QSource);
           KSource := NN.AddLayerAfter(
-            CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling, HeadDim),
+            CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling,
+              HeadDim, Plan.RotaryTileDims),
             KSource);
         end;
         // FUSED multi-head attention: ONE TNNetFusedSDPA over the packed
@@ -16217,7 +16253,11 @@ begin
           chBase := KVHeadCnt * HeadDim;
           for d := 0 to HeadDimM1 do
             SliceChannels[d] := chBase + d;
-          if RotaryDims < HeadDim then
+          // not Plan.HoistRoPE: when the tiled rotary already applied the
+          // PARTIAL rotation over the whole projection, this head is done - the
+          // plain slice below is correct and cutting a rotary slice here would
+          // rotate it twice.
+          if (RotaryDims < HeadDim) and (not Plan.HoistRoPE) then
           begin
             // PARTIAL rotary (Phi-3, Config.PartialRotaryFactor < 1):
             // RoPE on the first RotaryDims channels of the head only -
@@ -16301,7 +16341,9 @@ begin
           chBase := HeadCnt * HeadDim;
           for d := 0 to HeadDimM1 do
             SliceChannels[d] := chBase + d;
-          if RotaryDims < HeadDim then
+          // Skipped when the tiled rotary already rotated the whole projection
+          // (see the K path).
+          if (RotaryDims < HeadDim) and (not Plan.HoistRoPE) then
           begin
             // Partial rotary on the Q head - same wiring as the K path
             // (including the Qwen3.5 full-head q_norm BEFORE the split).

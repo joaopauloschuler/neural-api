@@ -8111,7 +8111,7 @@ procedure TTestNeuralPretrained.TestQwen35LogitParity;
 var
   NN: TNNet;
   Config: TLlamaConfig;
-  LayerCnt, DeltaCnt, ConvCnt, SDPACnt, SigmoidCnt: integer;
+  LayerCnt, DeltaCnt, ConvCnt, SDPACnt, FusedCnt, SigmoidCnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildQwen35FromSafeTensorsEx(
@@ -8142,10 +8142,14 @@ begin
     AssertFalse('untied', Config.TieWordEmbeddings);
     AssertEquals('multimodal prefix', 'model.language_model.', Config.Prefix);
     // Structure: one gated-DeltaNet + one depthwise conv per linear layer
-    // (6), one SDPA per head per full-attention layer (2 layers * 2 heads).
+    // (6), and ONE fused multi-head attention per full-attention layer (2).
+    // Qwen3.5 fuses despite its partial rotary: the hoisted head-tiled rotary
+    // carries the 0.25 rotary width, so nothing per-head is left between the
+    // projection and the attention math. No per-head SDPA must survive.
     DeltaCnt := 0;
     ConvCnt := 0;
     SDPACnt := 0;
+    FusedCnt := 0;
     SigmoidCnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
@@ -8155,11 +8159,13 @@ begin
         Inc(ConvCnt);
       if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
         Inc(SDPACnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then Inc(FusedCnt);
       if NN.Layers[LayerCnt].ClassType = TNNetSigmoid then Inc(SigmoidCnt);
     end;
     AssertEquals('one DeltaNet per linear layer', 6, DeltaCnt);
     AssertEquals('one depthwise conv per linear layer', 6, ConvCnt);
-    AssertEquals('one SDPA per head per full layer', 4, SDPACnt);
+    AssertEquals('one fused attention per full layer', 2, FusedCnt);
+    AssertEquals('no per-head SDPA survives the fusion', 0, SDPACnt);
     AssertEquals('one output-gate sigmoid per full layer', 2, SigmoidCnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_qwen3_5_logits.json'), Config.MaxPositions,
