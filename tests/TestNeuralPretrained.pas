@@ -3483,11 +3483,25 @@ begin
   end;
 end;
 
-// SetTrainable shrinks every neuron's Delta/BackInertia training
-// volumes; the forward pass must be bit-for-bit unaffected, whether the
-// shrink happens during construction (pTrainable=True) or on an
-// already-built net (TNNet.SetTrainable).
+// SetTrainable shrinks every neuron's Delta/BackInertia training volumes; the
+// forward pass must be unaffected, whether the shrink happens during
+// construction (pTrainable=True) or on an already-built net
+// (TNNet.SetTrainable).
+//
+// The shrink is bit-for-bit only when the forward KERNEL is held constant.
+// SetTrainable's pLowMemory argument defaults to True, which ALSO releases the
+// concatenated-weight caches so the CPU forward computes per-neuron - a
+// different accumulation order, which on an AVX build agrees with the cached
+// kernel only to FP rounding (measured ~1.3e-6 relative on this fixture; the
+// non-AVX build happens to agree exactly). So the inference-BUILT net is
+// checked within tolerance, and the post-build shrink - which is the claim
+// about Delta/BackInertia specifically - is checked bit-for-bit with
+// pLowMemory=False.
 procedure TTestNeuralPretrained.TestSetTrainableKeepsOutputs;
+const
+  // Comfortably above FP rounding on logits of order 1, far below any real
+  // kernel or weight-loading defect.
+  cLowMemoryTolerance = 1e-4;
 var
   NNTrain, NNInfer: TNNet;
   Config: TGPT2Config;
@@ -3509,11 +3523,14 @@ begin
     NNInfer.Compute(Input);
     NNInfer.GetOutput(OutInfer);
     AssertEquals('output size', OutTrain.Size, OutInfer.Size);
+    // Inference-built => low-memory per-neuron forward, so tolerance not zero.
     for i := 0 to OutTrain.Size - 1 do
       AssertEquals('pTrainable logit ' + IntToStr(i),
-        OutTrain.FData[i], OutInfer.FData[i], 0);
-    // Shrinking a finished net must not change its outputs either.
-    NNTrain.SetTrainable();
+        OutTrain.FData[i], OutInfer.FData[i], cLowMemoryTolerance);
+    // Shrinking a finished net must not change its outputs either. Keeping the
+    // cached kernel (pLowMemory=False) isolates the training-volume shrink,
+    // which is exact.
+    NNTrain.SetTrainable({pTrainable=}false, {pLowMemory=}false);
     NNTrain.Compute(Input);
     NNTrain.GetOutput(OutInfer);
     for i := 0 to OutTrain.Size - 1 do

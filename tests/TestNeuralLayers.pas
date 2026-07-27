@@ -504,7 +504,18 @@ begin
     AssertTrue('Branch2 must be chunk-eligible', Branch2.ChunkEligible());
     AssertTrue('Branch3 must be chunk-eligible', Branch3.ChunkEligible());
 
-    // Reference: trainable -> serial loop with the classic serial kernels.
+    // Pin the forward kernel BEFORE taking the reference, the same way
+    // TestConvolutionColdParallelParity and TestConvolutionLowMemoryChunkParity
+    // do. SetTrainable's pLowMemory defaults to True, which releases the
+    // concatenated-weight caches and computes per-neuron instead - a different
+    // accumulation order from the interleaved and pointwise kernels, so a
+    // reference taken while the caches were still resident matches only to FP
+    // rounding on an AVX build. Holding the kernel fixed is what makes the
+    // bit-identity below a statement about CHUNKING rather than about kernel
+    // choice.
+    NN.SetTrainable(False, {pLowMemory=}False);
+
+    // Reference: serial loop with the classic serial kernels.
     NN.Compute(Input);
     SerialOut.Copy(NN.GetLastLayer().Output);
     AssertTrue('Reference output is non-trivial', SerialOut.GetSumAbs() > 0.0);
@@ -514,7 +525,6 @@ begin
     // tiled twins). Branches use ReLU/Linear activations, which are
     // slice-invariant, so the chunked result stays BIT-IDENTICAL to the
     // single-threaded serial reference, pass after pass.
-    NN.SetTrainable(False);
     for pass := 1 to 20 do
     begin
       NN.Compute(Input, 0, True);
