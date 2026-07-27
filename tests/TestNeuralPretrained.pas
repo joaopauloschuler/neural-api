@@ -159,6 +159,7 @@ type
     procedure TestInt8QuantizeRoundTripAndForward;
     procedure TestInt8QuantizeAliasClasses;
     procedure TestInt8QuantizeRectangularConv;
+    procedure TestInt8QuantizeActivationAliasConv;
     procedure TestInt8QuantizeEmbedding;
     procedure TestInt8QuantizeNonFiniteRow;
     procedure TestInt8QuantizeTinyRow;
@@ -3772,6 +3773,68 @@ begin
     for i := 0 to OutQ.Size - 1 do
       AssertEquals('rect quantized forward = FP32-on-dequantized-weights ' +
         IntToStr(i), OutDQ.FData[i], OutQ.FData[i], 1e-6);
+  finally
+    OutDQ.Free;
+    OutQ.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+
+// TNNetConvolutionSwish and TNNetConvolutionHardSwish are activation-only
+// aliases of TNNetConvolution: their constructors set FActivationFn and add no
+// other code, and the int8 conv forward applies the activation through
+// ApplyActivationFunctionToOutput - so the shared int8 storage is valid for
+// them exactly as for TNNetConvolutionReLU. The exact-class gate in
+// NeuralInt8QuantizableClass used to exclude them, silently leaving
+// Swish/HardSwish vision nets in FP32 under an int8 build. Asserts the layers
+// flip to int8 storage and that the quantized forward (activation included)
+// equals the FP32 forward on the dequantized weights. // Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestInt8QuantizeActivationAliasConv;
+var
+  NN: TNNet;
+  AliasLayers: array[0..1] of TNNetLayer;
+  Input, OutQ, OutDQ: TNNetVolume;
+  i, n: integer;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NN.AddLayer( TNNetInput.Create(7, 6, 3) );
+  AliasLayers[0] := NN.AddLayer(
+    TNNetConvolutionSwish.Create({Features=}4, {FeatureSize=}3,
+      {Padding=}1, {Stride=}1) );
+  AliasLayers[1] := NN.AddLayer(
+    TNNetConvolutionHardSwish.Create({Features=}3, {FeatureSize=}3,
+      {Padding=}1, {Stride=}1) );
+  Input := TNNetVolume.Create(7, 6, 3);
+  OutQ := TNNetVolume.Create;
+  OutDQ := TNNetVolume.Create;
+  try
+    for i := 0 to Input.Size - 1 do
+      Input.FData[i] := Sin(0.7 * i) * 0.5;
+
+    NN.QuantizeWeightsInt8();
+    for n := 0 to High(AliasLayers) do
+    begin
+      AssertTrue('activation alias layer ' + AliasLayers[n].ClassName +
+        ' quantized',
+        TNNetLayerConcatedWeights(AliasLayers[n]).WeightsQuantizedInt8);
+      AssertEquals('activation alias layer ' + AliasLayers[n].ClassName +
+        ' FP32 weights released', 1, AliasLayers[n].Neurons[0].Weights.Size);
+    end;
+
+    NN.Compute(Input);
+    NN.GetOutput(OutQ);
+
+    for n := 0 to High(AliasLayers) do
+      TNNetLayerConcatedWeights(AliasLayers[n]).DequantizeWeightsInt8();
+    NN.Compute(Input);
+    NN.GetOutput(OutDQ);
+    AssertEquals('output size', OutQ.Size, OutDQ.Size);
+    for i := 0 to OutQ.Size - 1 do
+      AssertEquals('activation alias quantized forward = ' +
+        'FP32-on-dequantized-weights ' + IntToStr(i),
+        OutDQ.FData[i], OutQ.FData[i], 1e-6);
   finally
     OutDQ.Free;
     OutQ.Free;

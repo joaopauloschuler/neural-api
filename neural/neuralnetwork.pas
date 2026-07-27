@@ -122952,6 +122952,11 @@ begin
     // the device im2col parameterizes X/Y extents separately.
     (pLayer.ClassType = TNNetConvolutionRectangular) or
     (pLayer.ClassType = TNNetConvolutionRectangularReLU) or
+    // Activation-only conv aliases: their constructors set FActivationFn and
+    // add nothing else, and the int8 forward is activation-agnostic (it ends
+    // in ApplyActivationFunctionToOutput), so the shared storage applies.
+    (pLayer.ClassType = TNNetConvolutionSwish) or
+    (pLayer.ClassType = TNNetConvolutionHardSwish) or
     (pLayer.ClassType = TNNetPointwiseConv) or
     (pLayer.ClassType = TNNetPointwiseConvLinear) or
     (pLayer.ClassType = TNNetPointwiseConvReLU) or
