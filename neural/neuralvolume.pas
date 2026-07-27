@@ -16952,16 +16952,17 @@ end;
 procedure TNNetVolumeQuant8.DequantizeRowTo(x, y: integer;
   Dest: TNeuralFloatArrPtr);
 var
-  RowBase, DepthM1, DCnt: integer;
-  RowScale: TNeuralFloat;
+  RowIdx: integer;
 begin
-  RowBase := ((FSizeX * y) + x) * FDepth;
-  RowScale := FScaleData.FData[(FSizeX * y) + x];
-  DepthM1 := FDepth - 1;
-  for DCnt := 0 to DepthM1 do
-  begin
-    Dest^[DCnt] := FDataPtr^[RowBase + DCnt] * RowScale;
-  end;
+  RowIdx := (FSizeX * y) + x;
+  // Rule #18: the widening multiply is a TNNetVolume primitive, so an AVX2
+  // build does 8 codes per iteration. This is the inner loop of
+  // TNNetLayerConcatedWeights.DequantizeWeightsInt8 (every int8 layer an
+  // importer reopens) and of the int8 embedding row lookup, so it is both a
+  // load-time and a decode-time path.
+  TNNetVolume.DequantizeInt8(Dest,
+    TNeuralInt8ArrPtr(@FDataPtr^[RowIdx * FDepth]), FDepth,
+    FScaleData.FData[RowIdx]);
 end;
 
 procedure TNNetVolumeQuant8.DequantizeTo(Dest: TNNetVolume);
