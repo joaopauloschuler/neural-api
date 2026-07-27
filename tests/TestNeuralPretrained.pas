@@ -10132,7 +10132,7 @@ procedure TTestNeuralPretrained.TestGptBigCodeLogitParity;
 var
   NN: TNNet;
   Config: TGptBigCodeConfig;
-  LayerCnt, NormCnt, RMSCnt, PosCnt: integer;
+  LayerCnt, NormCnt, RMSCnt, PosCnt, SDPACnt, FusedCnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildGptBigCodeFromSafeTensorsEx(
@@ -10150,6 +10150,8 @@ begin
     NormCnt := 0;
     RMSCnt := 0;
     PosCnt := 0;
+    SDPACnt := 0;
+    FusedCnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
       if NN.Layers[LayerCnt].ClassType = TNNetTokenLayerNorm then
@@ -10158,11 +10160,19 @@ begin
         Inc(RMSCnt);
       if NN.Layers[LayerCnt].ClassType = TNNetLearnedPositionalEmbedding then
         Inc(PosCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+        Inc(SDPACnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then Inc(FusedCnt);
     end;
     AssertEquals('TokenLayerNorm count (2 per block + final)',
       2 * Config.NumLayers + 1, NormCnt);
     AssertEquals('no RMSNorm (GPT-BigCode is LayerNorm)', 0, RMSCnt);
     AssertEquals('one learned-position table', 1, PosCnt);
+    // Nothing per-head sits between the projections and the attention math
+    // (no RoPE, one shared K/V head), so every block collapses to a single
+    // fused attention layer.
+    AssertEquals('one fused attention per block', Config.NumLayers, FusedCnt);
+    AssertEquals('no per-head SDPA survives the fusion', 0, SDPACnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_gptbigcode_logits.json'), Config.MaxPositions,
       Config.VocabSize);

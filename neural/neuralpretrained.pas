@@ -21787,16 +21787,14 @@ function BuildGptBigCodeFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGptBigCodeConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
-  ReaderMax, chBase: integer;
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TGptBigCodeBlockLayers;
   EmbeddingLayer, PosLayer, FinalNorm, LMHead: TNNetLayer;
-  BranchInput, NormedSource, KSlice, VSlice, QSlice, HeadPack: TNNetLayer;
-  HeadOutputs: array of TNNetLayer;
-  SliceChannels: array of integer;
-  BlockCnt, SeqLen, HeadCnt, HeadDim, QWidth, SlabRows, i, j, d: integer;
-  BlockMax, HeadMax, HeadDimM1, VocabM1, HiddenM1: integer;
+  BranchInput, NormedSource: TNNetLayer;
+  BlockCnt, SeqLen, HeadDim, QWidth, SlabRows, i, j: integer;
+  BlockMax, VocabM1, HiddenM1: integer;
   Tmp, WVTied: TNNetVolume;
   TiedBase: integer;
   BlockPrefix, AttnPrefix, MlpPrefix, TensorNameStr, LMHeadName: string;
@@ -21869,11 +21867,7 @@ begin
       if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
-      SetLength(HeadOutputs, Config.NumHeads);
-      SetLength(SliceChannels, HeadDim);
       BlockMax := Config.NumLayers - 1;
-      HeadMax := Config.NumHeads - 1;
-      HeadDimM1 := HeadDim - 1;
       for BlockCnt := 0 to BlockMax do
       begin
         // Attention sub-block: x := x + c_proj(MQA-SDPA(LayerNorm(x))).
@@ -21889,22 +21883,14 @@ begin
           TNNetPointwiseConvLinear.Create(HeadDim).SetTrainable(pTrainable), NormedSource);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(HeadDim).SetTrainable(pTrainable), NormedSource);
-        // The single shared K and V slices (the WHOLE projection is one head).
-        KSlice := Blocks[BlockCnt].KProj;
-        VSlice := Blocks[BlockCnt].VProj;
-        for HeadCnt := 0 to HeadMax do
-        begin
-          chBase := HeadCnt * HeadDim;
-          for d := 0 to HeadDimM1 do
-            SliceChannels[d] := chBase + d;
-          QSlice := NN.AddLayerAfter(
-            TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].QProj);
-          HeadPack := NN.AddLayer( TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
-          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
-            TNNetScaledDotProductAttention.Create(HeadDim, {CausalMask=}true),
-            HeadPack);
-        end;
-        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        // Multi-query attention: the WHOLE K and V projections are one head,
+        // broadcast across every query head. No RoPE and no per-head norm sit
+        // between the projections and the attention math, so the shared
+        // builder can pack all heads into one attention layer.
+        // Coded by Claude (AI).
+        NN.AddGQAAttentionFromSources(Blocks[BlockCnt].QProj,
+          Blocks[BlockCnt].KProj, Blocks[BlockCnt].VProj,
+          Config.NumHeads, {KVHeads=}1, HeadDim, {CausalMask=}true);
         Blocks[BlockCnt].OProj := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
