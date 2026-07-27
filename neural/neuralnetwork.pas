@@ -33280,7 +33280,7 @@ var
   SeqLen, m, ni: integer;
   SeqLenM1, MM1, baseA, posX, posH: integer;
   Score, MaxScore, SumExp: TNeuralFloat;
-  HPtr, OutPtr, ImPtr, XniPtr: TNeuralFloatArrPtr;
+  HPtr, OutPtr, ImPtr, XniPtr, A1RowPtr, A2RowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   X := FPrevLayer.FOutput;
@@ -33304,13 +33304,14 @@ begin
       if Score > MaxScore then MaxScore := Score;
       Inc(posX, FDim);
     end;
-    SumExp := 0;
-    for ni := 0 to SeqLenM1 do
-    begin
-      Score := NeuralExp(FA1.FData[baseA + ni] - MaxScore);
-      FA1.FData[baseA + ni] := Score;
-      SumExp := SumExp + Score;
-    end;
+    // The score row is contiguous, so the shift, the exp and the normalizer
+    // are one fused vectorized pass (#19). The normalize stays an EXACT DIVIDE
+    // (NOT a reciprocal-multiply): rule #21 names this site as one whose ~1 ULP
+    // perturbation is amplified through the SAB stack until
+    // TestSABInputGradientCheck fails.
+    A1RowPtr := FA1.GetRawPtr(baseA);
+    SumExp := TNNetVolume.VectorExpShiftSum(A1RowPtr, A1RowPtr, MaxScore,
+      SeqLen);
     if SumExp > 0 then
       for ni := 0 to SeqLenM1 do
         FA1.FData[baseA + ni] := FA1.FData[baseA + ni] / SumExp;
@@ -33339,13 +33340,10 @@ begin
       if Score > MaxScore then MaxScore := Score;
       Inc(posH, FDim);
     end;
-    SumExp := 0;
-    for m := 0 to MM1 do
-    begin
-      Score := NeuralExp(FA2.FData[baseA + m] - MaxScore);
-      FA2.FData[baseA + m] := Score;
-      SumExp := SumExp + Score;
-    end;
+    // Same fused pass over the (contiguous) FM-long row; the normalize again
+    // stays an exact divide for the gradient check (#21).
+    A2RowPtr := FA2.GetRawPtr(baseA);
+    SumExp := TNNetVolume.VectorExpShiftSum(A2RowPtr, A2RowPtr, MaxScore, FM);
     if SumExp > 0 then
       for m := 0 to MM1 do
         FA2.FData[baseA + m] := FA2.FData[baseA + m] / SumExp;
