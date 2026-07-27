@@ -170,6 +170,7 @@ type
     FVersion: integer;
     FAlignment: integer;
     FMeta: array of TGGUFMetaValue;
+    FLastMetaIdx: integer;               // FindMeta one-entry memo, -1 = none
     FGGMLTypes: array of integer;        // parallel to inherited FTensors
     FDeinterleaveNames: array of string; // RegisterRowDeinterleave targets
     FDeinterleaveHeadDim: array of integer;
@@ -950,6 +951,7 @@ var
   Stream: TFileStream;
 begin
   inherited CreateBare; // Create(pFileName) would parse as safetensors
+  FLastMetaIdx := -1;
   FFileName := pFileName;
   if not FileExists(pFileName) then
     raise EGGUFError.CreateFmt('gguf: file not found: %s', [pFileName]);
@@ -1101,6 +1103,7 @@ begin
 
   // ---- metadata KV pairs ----
   SetLength(FMeta, KVCount);
+  FLastMetaIdx := -1;
   KVCountM1 := integer(KVCount) - 1;
   for i := 0 to KVCountM1 do
   begin
@@ -1216,13 +1219,25 @@ begin
          FTensors[i].DataEnd, FDataSizes[0], FFileName]);
 end;
 
+// Linear scan over the ~25 metadata keys, memoizing the last hit. The
+// vocab/merge readers call GetMetaArray* once per token against the SAME key,
+// so a one-entry memo turns a ~150k x 25 string-compare sweep into 150k
+// pointer-equal string compares. FMeta[i].Key is written exactly once (during
+// LoadFromFile, and never rewritten), so a recorded hit can never go stale;
+// LoadFromFile clears the memo when it (re)allocates FMeta.
 function TNNetGGUFReader.FindMeta(const pKey: string): integer;
 var
   i, MetaHi: integer;
 begin
+  if (FLastMetaIdx >= 0) and (FMeta[FLastMetaIdx].Key = pKey) then
+    exit(FLastMetaIdx);
   MetaHi := High(FMeta);
   for i := 0 to MetaHi do
-    if FMeta[i].Key = pKey then exit(i);
+    if FMeta[i].Key = pKey then
+    begin
+      FLastMetaIdx := i;
+      exit(i);
+    end;
   Result := -1;
 end;
 
