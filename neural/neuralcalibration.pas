@@ -178,23 +178,27 @@ procedure SoftmaxTemp(
   out Probs: array of TNeuralFloat; N: integer);
 var
   I, NM1: integer;
-  MaxV, Acc, MaxRaw, V, AccClamped: TNeuralFloat;
+  MaxV, Acc, MaxRaw, V, AccClamped, InvT, InvAcc: TNeuralFloat;
 begin
   NM1 := N - 1;
+  // Both divisors are loop-invariant: one reciprocal each, then a multiply per
+  // element instead of N divides (#5).
+  InvT := 1.0 / T;
   MaxRaw := Logits[0];
   for I := 1 to NM1 do
     if Logits[I] > MaxRaw then MaxRaw := Logits[I];
-  MaxV := MaxRaw / T;
+  MaxV := MaxRaw * InvT;
   Acc := 0;
   for I := 0 to NM1 do
   begin
-    V := Exp(Logits[I] / T - MaxV);
+    V := Exp(Logits[I] * InvT - MaxV);
     Probs[I] := V;
     Acc := Acc + V;
   end;
   AccClamped := Max(cEps, Acc);
+  InvAcc := 1.0 / AccClamped;
   for I := 0 to NM1 do
-    Probs[I] := Probs[I] / AccClamped;
+    Probs[I] := Probs[I] * InvAcc;
 end;
 
 function ComputeCalibration(

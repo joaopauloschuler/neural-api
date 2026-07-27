@@ -33465,16 +33465,12 @@ end;
 procedure TParlerTTSModel.ComputeLogits(const PromptIds: array of integer;
   const Codes: TNNetIntArr2D; EncHidden, Logits: TNNetVolume);
 var
-  InEmb, FullLogits: TNNetVolume;
+  InEmb, OutVol: TNNetVolume;
   EncStatesInput: TNNetLayer;
-  t, d, KV, CodecLenM1, KVm1: integer;
-  srcBase, dstBase: integer;
+  KV: integer;
 begin
   KV := FConfig.NumCodebooks * FConfig.VocabSize;
-  CodecLenM1 := FCodecLen - 1;
-  KVm1 := KV - 1;
   InEmb := TNNetVolume.Create;
-  FullLogits := TNNetVolume.Create;
   try
     BuildInputEmbeddings(PromptIds, Codes, InEmb);
     EncStatesInput := T5EncoderStatesInput(FDecoder);
@@ -33482,19 +33478,20 @@ begin
       ImportError('Parler ComputeLogits: encoder-states size mismatch.');
     EncStatesInput.Output.Copy(EncHidden);
     FDecoder.Compute(InEmb);
-    FullLogits.Copy(FDecoder.GetLastLayer().Output); // (DecSeqLen,1,K*Vocab)
     // Read only the CODEC-FRAME positions (drop the transcript prefix rows).
+    // The retained rows are the contiguous tail of the (DecSeqLen,1,K*Vocab)
+    // layer output (dst and src both advance by KV per frame), so this is ONE
+    // Move off the BORROWED layer output - no full-tensor copy of the whole
+    // DecSeqLen*K*Vocab logit block first.
+    OutVol := FDecoder.GetLastLayer().Output;   // borrowed, not owned
+    if OutVol.Size < (FPromptLen + FCodecLen) * KV then
+      ImportError('Parler ComputeLogits: decoder output is smaller than ' +
+        'prompt + codec frames.');
     Logits.ReSize(FCodecLen, 1, KV);
-    for t := 0 to CodecLenM1 do
-    begin
-      dstBase := t * KV;
-      srcBase := (FPromptLen + t) * KV;
-      Move(FullLogits.FData[srcBase], Logits.FData[dstBase],
-        KV * csNeuralFloatSize);
-    end;
+    Move(OutVol.FData[FPromptLen * KV], Logits.FData[0],
+      FCodecLen * KV * csNeuralFloatSize);
   finally
     InEmb.Free;
-    FullLogits.Free;
   end;
 end;
 
@@ -42982,11 +42979,11 @@ procedure TNNetMimi.RunTransformer(
   const Layers: array of TMimiTransformerLayer; var Sig: TMimiDblArr2D);
 var
   D, T, NH, NKV, Dh, FFN, L, h, t1, t2, dd, gidx, kvh, NRep, half: integer;
-  NHDh, hDh, kvhDh, gBase, dBase, hbase, t2Start: integer;
+  NHDh, hDh, kvhDh, gBase, dBase, hbase, t2Start, tBase: integer;
   TM1, DM1, halfM1, DhM1, NHM1, NKVM1, FFNM1, NHDhM1, NKVDhM1, LayersM1: integer;
   Theta, Scaling, eps, m, v, e, denom, sc, mx, qr, kr, ang: double;
   X, Hn, Q, Kk, Vv, Attn, Mlp1: array of array of double; // [T][feature]
-  cosv, sinv, invfreq: array of double;
+  CosTab, SinTab, invfreq: array of double;
   AccVec, Orig: array of double;
   // #9: per-layer field-chain binds (Data is single; Hn/Q/... are double, so
   // the mixed-precision scalar accumulation is kept - the Mimi carve-out).
@@ -43039,10 +43036,29 @@ begin
   SetLength(invfreq, half);
   for dd := 0 to halfM1 do
     invfreq[dd] := 1.0 / Power(Theta, (2.0 * dd) / Dh);
-  // RoPE scratch + rotate_half snapshot: size once (Dh is call-invariant),
-  // reused across every layer/timestep instead of re-SetLength per (L, t1).
-  SetLength(cosv, Dh);
-  SetLength(sinv, Dh);
+  // RoPE tables: cos/sin depend only on (t1, dd), never on the layer, so the
+  // whole T x Dh table is built ONCE here instead of being rebuilt inside the
+  // layer loop - all but 1/Layers of the RTL Sin/Cos calls disappear. Flat
+  // row-major [t1*Dh + dd]; the second half mirrors the first (rotate_half).
+  SetLength(CosTab, T * Dh);
+  SetLength(SinTab, T * Dh);
+  tBase := 0;
+  for t1 := 0 to TM1 do
+  begin
+    for dd := 0 to halfM1 do
+    begin
+      ang := t1 * invfreq[dd];           // #4: shared angle for Cos and Sin
+      qr := Cos(ang);
+      kr := Sin(ang);
+      CosTab[tBase + dd] := qr;
+      CosTab[tBase + dd + half] := qr;
+      SinTab[tBase + dd] := kr;
+      SinTab[tBase + dd + half] := kr;
+    end;
+    Inc(tBase, Dh);                      // #6: t1*Dh carried by addition
+  end;
+  // rotate_half snapshot: size once (Dh is call-invariant), reused across every
+  // layer/timestep instead of re-SetLength per (L, t1).
   SetLength(Orig, Dh);
 
   for L := 0 to LayersM1 do
@@ -43109,16 +43125,9 @@ begin
       end;
     end;
     // ---- apply RoPE to Q and K (per head, rotate_half convention) ----
+    tBase := 0;
     for t1 := 0 to TM1 do
     begin
-      for dd := 0 to halfM1 do
-      begin
-        ang := t1 * invfreq[dd];         // #4: shared angle for Cos and Sin
-        cosv[dd] := Cos(ang);
-        cosv[dd + half] := cosv[dd];
-        sinv[dd] := Sin(ang);
-        sinv[dd + half] := sinv[dd];
-      end;
       // rotate_half needs the ORIGINAL head values, so snapshot per head into
       // Orig before writing back (an in-place rotation would feed the already
       // rotated first half into the second half).
@@ -43129,7 +43138,8 @@ begin
         for dd := 0 to DhM1 do
         begin
           if dd < half then qr := -Orig[dd + half] else qr := Orig[dd - half];
-          Q[t1][hbase + dd] := Orig[dd] * cosv[dd] + qr * sinv[dd];
+          Q[t1][hbase + dd] :=
+            Orig[dd] * CosTab[tBase + dd] + qr * SinTab[tBase + dd];
         end;
       end;
       for h := 0 to NKVM1 do
@@ -43139,9 +43149,11 @@ begin
         for dd := 0 to DhM1 do
         begin
           if dd < half then kr := -Orig[dd + half] else kr := Orig[dd - half];
-          Kk[t1][hbase + dd] := Orig[dd] * cosv[dd] + kr * sinv[dd];
+          Kk[t1][hbase + dd] :=
+            Orig[dd] * CosTab[tBase + dd] + kr * SinTab[tBase + dd];
         end;
       end;
+      Inc(tBase, Dh);                    // #6: t1*Dh carried by addition
     end;
     // ---- causal attention per head (GQA: head h uses kv head h div NRep) ----
     SetLength(Attn, T);
@@ -45511,7 +45523,7 @@ end;
 procedure DemucsGLU(const InSig: array of TNeuralFloatDynArr;
   out OutSig: TNNetFloatDynArr2D);
 var
-  Half, c, t: integer;
+  Half, c: integer;
   HalfM1: integer;
   InSigTLen: integer;
   InRow, GateRow, OutRow: TNeuralFloatDynArr;
@@ -45526,8 +45538,13 @@ begin
     InRow := InSig[c];
     GateRow := InSig[Half + c];
     OutRow := OutSig[c];
-    for t := 0 to InSigTLen do
-      OutRow[t] := InRow[t] * (1.0 / (1.0 + NeuralExp(-GateRow[t])));
+    // #13/#18: OutRow is a freshly-sized row that aliases neither input, so the
+    // gate becomes one vectorized sigmoid pass followed by an elementwise Mul.
+    if InSigTLen >= 0 then
+    begin
+      TNNetVolume.VectorSigmoid(Addr(OutRow[0]), Addr(GateRow[0]), InSigTLen + 1);
+      TNNetVolume.Mul(Addr(OutRow[0]), Addr(InRow[0]), InSigTLen + 1);
+    end;
   end;
 end;
 
@@ -45578,14 +45595,19 @@ procedure DemucsLSTMCell(const Seq: TNNetFloatDynArr2D;
   const Wih, Whh, Bih, Bhh: array of TNeuralFloat;
   InSize, Hidden, T: integer; Reverse: boolean; out Outp: TNNetFloatDynArr2D);
 var
-  h, cstate, g: TNeuralFloatDynArr;
+  h, cstate, g, xbuf: TNeuralFloatDynArr;
   step, t0, k, j, baseR, whhBase: integer;
   gi, gf, gg, go, accg: TNeuralFloat;
   HiddenM1, Hidden4M1, TM1, InSizeM1, H2, H3: integer;
+  xptr: TNeuralFloatArrPtr;
 begin
   SetLength(h, Hidden);
   SetLength(cstate, Hidden);
   SetLength(g, 4 * Hidden);
+  SetLength(xbuf, InSize);
+  // Timestep input gathered once per step; xbuf never moves, so bind its base
+  // here (nil when InSize is 0, which DotProduct treats as an empty sum).
+  if InSize > 0 then xptr := Addr(xbuf[0]) else xptr := nil;
   HiddenM1 := Hidden - 1;
   Hidden4M1 := 4 * Hidden - 1;
   TM1 := T - 1;
@@ -45598,16 +45620,18 @@ begin
   for step := 0 to TM1 do
   begin
     if Reverse then t0 := T - 1 - step else t0 := step;
+    // Gather the strided channel-major column Seq[j][t0] into a contiguous
+    // vector once: it is the same for all 4*Hidden gate rows below.
+    for j := 0 to InSizeM1 do xbuf[j] := Seq[j][t0];
     // g = Wih*x + Bih + Whh*h + Bhh
     baseR := 0;                            // #6: k*InSize carried
     whhBase := 0;                          // #6: k*Hidden carried
     for k := 0 to Hidden4M1 do
     begin
       accg := Bih[k] + Bhh[k];             // #4: accumulate into a local
-      // Wih*x stays scalar: Seq[j][t0] is strided across j (channel-major),
-      // and this free procedure has no persistent owner for a gather buffer.
-      for j := 0 to InSizeM1 do
-        accg := accg + Wih[baseR + j] * Seq[j][t0];
+      // Wih*x over the gathered input -> one AVX DotProduct (#13).
+      accg := accg + TNNetVolume.DotProduct(
+        Addr(Wih[baseR]), xptr, InSize);
       // Whh*h is contiguous over h -> one AVX DotProduct (#13).
       accg := accg + TNNetVolume.DotProduct(
         Addr(Whh[whhBase]), Addr(h[0]), Hidden);
@@ -47921,10 +47945,12 @@ begin
     PhRow := Phase[c];
     MSrc := MagC[c];
     PSrc := PhaseC[c];
-    for t := 0 to LM1 do
+    // #13/#18: both rows are freshly-sized contiguous L-element buffers distinct
+    // from the conv outputs, so the two maps are vectorized whole-row passes.
+    if L > 0 then
     begin
-      MagRow[t] := NeuralExp(MSrc[t]);   // #16: fast trap-free exp
-      PhRow[t] := Sin(PSrc[t]);
+      TNNetVolume.VectorExp(Addr(MagRow[0]), Addr(MSrc[0]), L);
+      TNNetVolume.VectorSin(Addr(PhRow[0]), Addr(PSrc[0]), L);
     end;
   end;
   // ISTFT(mag, phase) -> waveform. ISTFTOverlapAdd consumes a (frames,1,bins)
@@ -64320,9 +64346,9 @@ procedure ClapBatchNormMelImage(Reader: TNNetSafeTensorsReader;
   RawMel: TNNetVolume; Image: TNNetVolume; const Config: TClapAudioConfig);
 var
   Gamma, Beta, Mean, Var_: TNNetVolume;
-  f, Time, Mel, FreqRatio, Spec, hh, ww, c2, srcT, SpecM1: integer;
+  f, Time, Mel, FreqRatio, Spec, hh, ww, c2, srcT, SpecM1, MelM1: integer;
   imgPos, imgStride: integer;
-  Eps, Normed: TNeuralFloat;
+  Eps: TNeuralFloat;
   EncPrefix: string;
 begin
   Mel := Config.NumMelBins;
@@ -64364,6 +64390,17 @@ begin
     // At fr = 1 this is the plain freq<->time transpose (Image[W=t, H=f]).
     Image.ReSize(Spec, Spec, 1);
     SpecM1 := Spec - 1;
+    // #5: the batch-norm affine collapses to one per-mel-bin scale+bias,
+    //   scale_f = gamma_f / sqrt(var_f + eps),  bias_f = beta_f - mean_f*scale_f,
+    // so the per-pixel Sqrt and divide (Spec*Spec of them, over only Mel
+    // distinct bins) are folded once into the already-allocated Gamma/Beta
+    // rows - no extra buffer.
+    MelM1 := Mel - 1;
+    for f := 0 to MelM1 do
+    begin
+      Gamma.FData[f] := Gamma.FData[f] / Sqrt(Var_.FData[f] + Eps);
+      Beta.FData[f] := Beta.FData[f] - Mean.FData[f] * Gamma.FData[f];
+    end;
     imgStride := Image.GetRawPos(0, 1, 0);  // = Spec; elements between consecutive hh
     for ww := 0 to SpecM1 do          // W = time // fr axis
     begin
@@ -64373,10 +64410,8 @@ begin
         f := hh mod Mel;                // mel bin
         c2 := hh div Mel;               // time chunk
         srcT := c2 * Spec + ww;         // source time frame
-        Normed := (RawMel.FData[srcT * Mel + f] - Mean.FData[f]) /
-          Sqrt(Var_.FData[f] + Eps);
-        Normed := Normed * Gamma.FData[f] + Beta.FData[f];
-        Image.FData[imgPos] := Normed;
+        Image.FData[imgPos] :=
+          RawMel.FData[srcT * Mel + f] * Gamma.FData[f] + Beta.FData[f];
         Inc(imgPos, imgStride);
       end;
     end;
@@ -72188,7 +72223,9 @@ var
   NumMasksM1, HuM1, WuM1: integer;
   rwc, posU, HuWu, wOfs, H2W2, dstCol: integer;
   ciW, ciBase, rowBase, tdst, tsrc, qBase: integer;
-  sv, bv: TNeuralFloat;
+  ocBase, wBase, dst0, dst1: integer;
+  sv, bv, w00, w01, w10, w11: TNeuralFloat;
+  Plane: TSAMMat;   // Hu*Wu hypernetwork accumulator, sized once per call
 begin
   Pfx := Prefix;
   H := Config.HiddenSize;
@@ -72461,30 +72498,35 @@ begin
           Inc(posU);
         end;
       end;
-      for ci := 0 to HM1 do
+      // Output channel OUTERMOST: the oc axis strides U1 by H2W2, so keeping it
+      // innermost touched a fresh page per iteration and blocked vectorization.
+      // With oc outside, each (oc, ci) pass walks one contiguous source plane and
+      // one contiguous destination plane, and the 2x2 kernel collapses to four
+      // scalars. Per output element the ci contributions still arrive in ascending
+      // ci order, so the result is unchanged.
+      for oc := 0 to CmidM1 do
       begin
-        ciBase := ci * NImg;              // #6/#11: src channel base, once per ci
-        ciW := ci * Cmid * 4;            // #6/#11: weight channel base, once per ci
-        for r := 0 to GridM1 do
+        ocBase := oc * H2W2;
+        for ci := 0 to HM1 do
         begin
-          rowBase := ciBase + r * Grid;
-          for c := 0 to GridM1 do
+          ciBase := ci * NImg;            // #6/#11: src channel base, once per ci
+          wBase := ci * Cmid * 4 + oc * 4;
+          w00 := C1w.FData[wBase];     w01 := C1w.FData[wBase + 1];
+          w10 := C1w.FData[wBase + 2]; w11 := C1w.FData[wBase + 3];
+          for r := 0 to GridM1 do
           begin
-            sv := ImgCHW[rowBase + c];
-            for ki := 0 to 1 do
-              for kj := 0 to 1 do
-              begin
-                oi := 2 * r + ki; oj := 2 * c + kj;
-                dstCol := oi * W2 + oj;
-                posU := dstCol;
-                wOfs := ciW + ki * 2 + kj;
-                for oc := 0 to CmidM1 do
-                begin
-                  U1[posU] := U1[posU] + sv * C1w.FData[wOfs];
-                  Inc(posU, H2W2);
-                  Inc(wOfs, 4);
-                end;
-              end;
+            rowBase := ciBase + r * Grid;
+            dst0 := ocBase + (2 * r) * W2;
+            dst1 := dst0 + W2;
+            for c := 0 to GridM1 do
+            begin
+              sv := ImgCHW[rowBase + c];
+              U1[dst0]     := U1[dst0]     + sv * w00;
+              U1[dst0 + 1] := U1[dst0 + 1] + sv * w01;
+              U1[dst1]     := U1[dst1]     + sv * w10;
+              U1[dst1 + 1] := U1[dst1 + 1] + sv * w11;
+              Inc(dst0, 2); Inc(dst1, 2);
+            end;
           end;
         end;
       end;
@@ -72548,30 +72590,30 @@ begin
           Inc(posU);
         end;
       end;
-      for ci := 0 to CmidM1 do
+      // Output channel OUTERMOST (see upscale_conv1 above for the rationale).
+      for oc := 0 to CuM1 do
       begin
-        ciBase := ci * H2W2;             // #6/#11: src channel base, once per ci
-        ciW := ci * Cu * 4;             // #6/#11: weight channel base, once per ci
-        for r := 0 to H2M1 do
+        ocBase := oc * HuWu;
+        for ci := 0 to CmidM1 do
         begin
-          rowBase := ciBase + r * W2;
-          for c := 0 to W2M1 do
+          ciBase := ci * H2W2;           // #6/#11: src channel base, once per ci
+          wBase := ci * Cu * 4 + oc * 4;
+          w00 := C2w.FData[wBase];     w01 := C2w.FData[wBase + 1];
+          w10 := C2w.FData[wBase + 2]; w11 := C2w.FData[wBase + 3];
+          for r := 0 to H2M1 do
           begin
-            sv := U1[rowBase + c];
-            for ki := 0 to 1 do
-              for kj := 0 to 1 do
-              begin
-                oi := 2 * r + ki; oj := 2 * c + kj;
-                dstCol := oi * Wu + oj;
-                posU := dstCol;
-                wOfs := ciW + ki * 2 + kj;
-                for oc := 0 to CuM1 do
-                begin
-                  U2[posU] := U2[posU] + sv * C2w.FData[wOfs];
-                  Inc(posU, HuWu);
-                  Inc(wOfs, 4);
-                end;
-              end;
+            rowBase := ciBase + r * W2;
+            dst0 := ocBase + (2 * r) * Wu;
+            dst1 := dst0 + Wu;
+            for c := 0 to W2M1 do
+            begin
+              sv := U1[rowBase + c];
+              U2[dst0]     := U2[dst0]     + sv * w00;
+              U2[dst0 + 1] := U2[dst0 + 1] + sv * w01;
+              U2[dst1]     := U2[dst1]     + sv * w10;
+              U2[dst1 + 1] := U2[dst1 + 1] + sv * w11;
+              Inc(dst0, 2); Inc(dst1, 2);
+            end;
           end;
         end;
       end;
@@ -72608,6 +72650,8 @@ begin
     NumMasksM1 := NumMasks - 1;
     MaskLogits.ReSize(Hu, Wu, NumMasks);
     SetLength(HyperIn, Cu);
+    HuWu := Hu * Wu;
+    SetLength(Plane, HuWu);   // scratch, sized once for every mask token
     for mi := 0 to NumMasksM1 do
     begin
       mt := FirstMask + mi;
@@ -72628,24 +72672,25 @@ begin
         H, Cu, 1, Mlp2, HyperIn);
       // HyperIn now holds the per-channel hypernetwork output (length Cu).
 
-      HuWu := Hu * Wu;
-      rwc := 0;                 // = r*Wu + c, increments by 1 each (r,c)
+      // The dot product over Cu channels gathers values HuWu apart, one useful
+      // float per cache line. Accumulate it channel-major instead: one contiguous
+      // MulAdd per channel over a Hu*Wu plane, then scatter the plane into the
+      // mask-logit depth slot. Per output element the oc accumulation order is
+      // unchanged (MulAdd is elementwise, not a reduction).
+      FillChar(Plane[0], HuWu * csNeuralFloatSize, 0);
+      posU := 0;                // = oc*Hu*Wu, carried over oc
+      for oc := 0 to CuM1 do
+      begin
+        TNNetVolume.MulAdd(@Plane[0], @U2[posU], HyperIn[oc], HuWu);
+        Inc(posU, HuWu);
+      end;
+      // depth axis indexes the emitted masks (HF order).
       wOfs := mi;               // = (r*Wu+c)*NumMasks + mi
-      for r := 0 to HuM1 do
-        for c := 0 to WuM1 do
-        begin
-          acc := 0;
-          posU := rwc;          // = oc*Hu*Wu + rwc, carried over oc
-          for oc := 0 to CuM1 do
-          begin
-            acc := acc + HyperIn[oc] * U2[posU];
-            Inc(posU, HuWu);
-          end;
-          // depth axis indexes the emitted masks (HF order).
-          MaskLogits.FData[wOfs] := acc;
-          Inc(rwc);
-          Inc(wOfs, NumMasks);
-        end;
+      for rwc := 0 to HuWuM1 do
+      begin
+        MaskLogits.FData[wOfs] := Plane[rwc];
+        Inc(wOfs, NumMasks);
+      end;
     end;
 
     // ----- IoU prediction head: one scalar per emitted mask -----
@@ -75826,10 +75871,10 @@ var
   q, c, p, NumPix, NumQueries, BestC: integer;
   NumQueriesM1, NumLabelsM1, NumPixM1: integer;
   clBase, mlPos, mlStride: integer;
-  MaxLogit, SumExp, prob, acc, BestVal, invSum, e: TNeuralFloat;
+  MaxLogit, SumExp, prob, sg, BestVal, invSum, e: TNeuralFloat;
   cpBase: integer;
   ClsProb: array of TNeuralFloat;
-  Sig: array of TNeuralFloat;
+  Acc: array of TNeuralFloat;
 begin
   NumQueries := ClassLogits.SizeX;
   NumPix := MaskWidth * MaskHeight;
@@ -75865,29 +75910,29 @@ begin
     TNNetVolume.Mul(@ClsProb[cpBase], invSum, NumLabels);
   end;
   // per pixel: argmax_c sum_q clsprob[q,c] * sigmoid(mask[q,p]).
-  // #5/#11: sigmoid depends only on (q,p), not c -> precompute Sig[q] once per
-  // pixel, then the (c,q) loops only accumulate. Scratch allocated once.
-  SetLength(Sig, NumQueries);
+  // #13/App.E: q drives one contiguous MulAdd over the NumLabels accumulator, so
+  // the ClsProb row for a query is walked contiguously and the sigmoid folds into
+  // the same pass. Per label the accumulation order over q is unchanged.
+  // Scratch allocated once.
+  SetLength(Acc, NumLabels);
+  if NumLabels > 0 then
   for p := 0 to NumPixM1 do
   begin
+    FillChar(Acc[0], NumLabels * csNeuralFloatSize, 0);
     mlPos := p;  // = MaskLogits.GetRawPos(0, 0, p); the q = 0 offset
+    cpBase := 0; // ClsProb[q * NumLabels]; carry the q stride (#6/#12)
     for q := 0 to NumQueriesM1 do
     begin
-      Sig[q] := 1.0 / (1.0 + NeuralExp(-MaskLogits.FData[mlPos]));
+      sg := 1.0 / (1.0 + NeuralExp(-MaskLogits.FData[mlPos]));
+      TNNetVolume.MulAdd(@Acc[0], @ClsProb[cpBase], sg, NumLabels);
       Inc(mlPos, mlStride);
+      Inc(cpBase, NumLabels);
     end;
-    BestC := 0; BestVal := -1;
-    for c := 0 to NumLabelsM1 do
-    begin
-      acc := 0;
-      cpBase := c;   // ClsProb[q * NumLabels + c]; carry the q stride (#6/#12)
-      for q := 0 to NumQueriesM1 do
-      begin
-        acc := acc + ClsProb[cpBase] * Sig[q];
-        Inc(cpBase, NumLabels);
-      end;
-      if acc > BestVal then begin BestVal := acc; BestC := c; end;
-    end;
+    // every Acc[c] is a sum of non-negative terms, so seeding with Acc[0] matches
+    // the old (BestVal = -1, strict >) scan, which always accepted c = 0 first.
+    BestC := 0; BestVal := Acc[0];
+    for c := 1 to NumLabelsM1 do
+      if Acc[c] > BestVal then begin BestVal := Acc[c]; BestC := c; end;
     Result[p] := BestC;
   end;
   if prob = 0 then ;

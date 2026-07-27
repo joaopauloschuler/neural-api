@@ -5,7 +5,10 @@ unit TestNeuralSamplers;
 interface
 
 uses
-  Classes, SysUtils, Math, fpcunit, testregistry, neuralvolume;
+  Classes, SysUtils, Math, fpcunit, testregistry, neuralvolume, pascoremath32;
+
+type
+  TRefFloatArr = array of TNeuralFloat;
 
 type
   TTestNeuralSamplers = class(TTestCase)
@@ -82,6 +85,16 @@ type
     procedure TestTopPLargeVocabFlatDistributionRetries;
     procedure TestWeightedTopKLargeVocabNeverDrawsOutsideTopK;
     procedure TestMinPLargeVocabRespectsThreshold;
+
+    // Adaptive typical-sampling path and the merged log pass.
+    procedure TestTypicalArgMinMatchesTwoLogReference;
+    procedure TestTypicalLargeVocabKeptSetMatchesReference;
+    procedure TestTypicalLargeVocabFlatDistributionRetries;
+    procedure TestTypicalZeroProbabilityTokensAreNeverDrawn;
+
+    // Mirostat v2 pre-image threshold.
+    procedure TestMirostatV2CutMatchesLogReference;
+    procedure TestMirostatV2DegenerateMuEndpoints;
   end;
 
 implementation
@@ -1552,6 +1565,316 @@ begin
   finally
     V.Free;
     Sampler.Free;
+  end;
+end;
+
+// Reference implementation of the ORIGINAL locally-typical distance, written
+// the way SampleTypical used to compute it: one pcr_logf for the entropy and a
+// SECOND pcr_logf for the surprise, with the p<=0 sentinel Surprise := 1e30.
+// The optimized sampler caches log p from the entropy pass instead, which must
+// be bit-for-bit identical to this.
+procedure BuildTypicalReferenceDist(V: TNNetVolume; var Dist: TRefFloatArr;
+  out Entropy: TNeuralFloat);
+var
+  I, VSize: integer;
+  P, Surprise: TNeuralFloat;
+begin
+  VSize := V.Size;
+  if Length(Dist) <> VSize then SetLength(Dist, VSize);
+  Entropy := 0;
+  for I := 0 to VSize - 1 do
+  begin
+    P := V.Raw[I];
+    if P > 0 then Entropy := Entropy - P * pcr_logf(P);
+  end;
+  for I := 0 to VSize - 1 do
+  begin
+    P := V.Raw[I];
+    if P > 0 then Surprise := -pcr_logf(P) else Surprise := 1e30;
+    Dist[I] := Abs(Surprise - Entropy);
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestTypicalArgMinMatchesTwoLogReference;
+const
+  SIZES: array[0..3] of integer = (7, 300, 1500, 5000);
+var
+  Sampler: TNNetSamplerTypical;
+  V: TNNetVolume;
+  Dist: TRefFloatArr;
+  Entropy, Sum: TNeuralFloat;
+  S, I, R, Best, Token, VSize: integer;
+begin
+  // With FMass far below the smallest single-token mass the typical set is
+  // exactly ONE token - the argmin of |(-log p) - H| - so the sampler's answer
+  // is deterministic. Any drift in the merged log pass, or a quickselect that
+  // fails to surface the true minimum, changes this token. Sizes straddle the
+  // 1024 adaptive threshold so both the full-sort and the partial-select
+  // branches are covered.
+  for S := 0 to 3 do
+  begin
+    VSize := SIZES[S];
+    V := TNNetVolume.Create(VSize, 1, 1);
+    Sampler := TNNetSamplerTypical.Create(1e-12);
+    SetLength(Dist, VSize);
+    try
+      for R := 0 to 19 do
+      begin
+        RandSeed := 987654 + R * 4099;
+        Sum := 0;
+        for I := 0 to VSize - 1 do
+        begin
+          V.Raw[I] := 0.01 + Random;
+          Sum := Sum + V.Raw[I];
+        end;
+        for I := 0 to VSize - 1 do V.Raw[I] := V.Raw[I] / Sum;
+        BuildTypicalReferenceDist(V, Dist, Entropy);
+        Best := 0;
+        for I := 1 to VSize - 1 do
+          if Dist[I] < Dist[Best] then Best := I;
+        Token := Sampler.GetToken(V);
+        AssertEquals('typical argmin must match the two-log reference (size ' +
+          IntToStr(VSize) + ', round ' + IntToStr(R) + ')', Best, Token);
+      end;
+    finally
+      SetLength(Dist, 0);
+      Sampler.Free;
+      V.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestTypicalLargeVocabKeptSetMatchesReference;
+const
+  V_SIZE = 5000;
+  MASS   = 0.60;
+var
+  Sampler: TNNetSamplerTypical;
+  V: TNNetVolume;
+  Dist: TRefFloatArr;
+  Entropy, KeptSum, Best: TNeuralFloat;
+  I, J, BestIdx, KeptCount, Token: integer;
+  InSet: array of boolean;
+begin
+  // The adaptive prefix must reproduce the reference typical set exactly: the
+  // smallest-distance tokens whose cumulative mass first reaches MASS. Built
+  // here by repeated argmin extraction over the reference distances.
+  RandSeed := 424242;
+  Sampler := TNNetSamplerTypical.Create(MASS);
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  SetLength(InSet, V_SIZE);
+  try
+    BuildLargePeakedRow(V, V_SIZE, 0);
+    BuildTypicalReferenceDist(V, Dist, Entropy);
+    for I := 0 to V_SIZE - 1 do InSet[I] := false;
+    KeptSum := 0;
+    KeptCount := 0;
+    for I := 0 to V_SIZE - 1 do
+    begin
+      BestIdx := -1;
+      Best := 0;
+      for J := 0 to V_SIZE - 1 do
+        if (not InSet[J]) and ((BestIdx < 0) or (Dist[J] < Best)) then
+        begin
+          Best := Dist[J];
+          BestIdx := J;
+        end;
+      InSet[BestIdx] := true;
+      Inc(KeptCount);
+      KeptSum := KeptSum + V.Raw[BestIdx];
+      if KeptSum >= MASS then Break;
+    end;
+    AssertTrue('Test setup: the typical set must be narrower than the ' +
+      'adaptive first guess (got ' + IntToStr(KeptCount) + ')',
+      KeptCount < 256);
+    for I := 0 to 299 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('large-vocab typical draw must stay inside the reference ' +
+        'typical set, got ' + IntToStr(Token),
+        (Token >= 0) and (Token < V_SIZE) and InSet[Token]);
+    end;
+  finally
+    SetLength(InSet, 0);
+    SetLength(Dist, 0);
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestTypicalLargeVocabFlatDistributionRetries;
+const
+  V_SIZE = 5000;
+var
+  Sampler: TNNetSamplerTypical;
+  V: TNNetVolume;
+  I, Token, Distinct: integer;
+  Seen: array of boolean;
+begin
+  // A UNIFORM row makes every surprise equal to the entropy, so every distance
+  // is 0 and the typical set needs 0.9*5000 = 4500 tokens - far more than the
+  // 256-token first guess. This forces the widen-and-retry path; every token
+  // must remain reachable.
+  RandSeed := 5150;
+  Sampler := TNNetSamplerTypical.Create(0.90);
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  SetLength(Seen, V_SIZE);
+  try
+    V.Fill(1.0 / V_SIZE);
+    Distinct := 0;
+    for I := 0 to 499 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('retry-path typical draw must be a valid token, got ' +
+        IntToStr(Token), (Token >= 0) and (Token < V_SIZE));
+      if not Seen[Token] then
+      begin
+        Seen[Token] := true;
+        Inc(Distinct);
+      end;
+    end;
+    AssertTrue('retry path must still draw from a wide set, distinct=' +
+      IntToStr(Distinct), Distinct > 100);
+  finally
+    SetLength(Seen, 0);
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestTypicalZeroProbabilityTokensAreNeverDrawn;
+const
+  V_SIZE = 2048;
+var
+  Sampler: TNNetSamplerTypical;
+  V: TNNetVolume;
+  I, Token: integer;
+  Sum: TNeuralFloat;
+begin
+  // p = 0 must map to an INFINITE surprise, i.e. the largest possible distance,
+  // exactly as the old Surprise := 1e30 sentinel did. A sign slip in the cached
+  // -1e30 stash would instead rank those tokens FIRST and they would dominate
+  // every draw.
+  RandSeed := 777001;
+  Sampler := TNNetSamplerTypical.Create(0.95);
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  try
+    Sum := 0;
+    for I := 0 to V_SIZE - 1 do
+    begin
+      if I < 64 then V.Raw[I] := 0.5 + I else V.Raw[I] := 0;
+      Sum := Sum + V.Raw[I];
+    end;
+    for I := 0 to V_SIZE - 1 do V.Raw[I] := V.Raw[I] / Sum;
+    for I := 0 to 499 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('a zero-probability token must never be drawn, got ' +
+        IntToStr(Token), (Token >= 0) and (Token < 64));
+    end;
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestMirostatV2CutMatchesLogReference;
+const
+  V_SIZE = 4096;
+var
+  Sampler: TNNetSamplerMirostat;
+  V: TNNetVolume;
+  I, Token, RefKept, MaxSeen: integer;
+  Mu: TNeuralFloat;
+begin
+  // v2 thresholds on the pre-image now (p >= exp(-Mu)) instead of taking a log
+  // per candidate. The kept prefix must still be the one the log form defines.
+  // Reset() before every draw pins Mu at 2*Tau so the cut is fixed.
+  RandSeed := 31337;
+  Sampler := TNNetSamplerMirostat.Create(3.0, 0.1, mvV2);
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  try
+    BuildLargePeakedRow(V, V_SIZE, 0); // already descending from index 0
+    Mu := 6.0;
+    AssertEquals('test setup: fresh Mu is 2*Tau', 6.0, Sampler.Mu, 1e-6);
+    RefKept := 0;
+    for I := 0 to V_SIZE - 1 do
+    begin
+      if V.Raw[I] <= 0 then Break;
+      if -Ln(V.Raw[I]) > Mu then Break;
+      Inc(RefKept);
+    end;
+    AssertTrue('test setup: the reference cut must keep a non-trivial prefix, ' +
+      'got ' + IntToStr(RefKept), (RefKept > 3) and (RefKept < V_SIZE));
+    MaxSeen := -1;
+    for I := 0 to 999 do
+    begin
+      Sampler.Reset();
+      Token := Sampler.GetToken(V);
+      AssertTrue('mirostat v2 drew outside the log-reference cut: token ' +
+        IntToStr(Token) + ' (kept ' + IntToStr(RefKept) + ')',
+        (Token >= 0) and (Token < RefKept));
+      if Token > MaxSeen then MaxSeen := Token;
+    end;
+    // A cut that silently collapsed would never reach the boundary token.
+    AssertTrue('mirostat v2 must reach the boundary of the kept set, ' +
+      'MaxSeen=' + IntToStr(MaxSeen) + ' kept=' + IntToStr(RefKept),
+      MaxSeen >= RefKept - 2);
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestMirostatV2DegenerateMuEndpoints;
+const
+  V_SIZE = 512;
+var
+  Sampler: TNNetSamplerMirostat;
+  V: TNNetVolume;
+  I, Token, Distinct: integer;
+  Seen: array of boolean;
+begin
+  // Huge Mu: exp(-Mu) underflows to ~0, so every positive-probability token is
+  // kept - the pre-image cut must not degenerate into "keep nothing".
+  RandSeed := 6060842;
+  Sampler := TNNetSamplerMirostat.Create(100.0, 0.0, mvV2); // Eta 0: Mu is fixed
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  SetLength(Seen, V_SIZE);
+  try
+    V.Fill(1.0 / V_SIZE);
+    Distinct := 0;
+    for I := 0 to 999 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('huge-Mu draw must be a valid token', (Token >= 0) and
+        (Token < V_SIZE));
+      if not Seen[Token] then
+      begin
+        Seen[Token] := true;
+        Inc(Distinct);
+      end;
+    end;
+    AssertTrue('huge Mu must keep the whole row, distinct=' +
+      IntToStr(Distinct), Distinct > 200);
+  finally
+    SetLength(Seen, 0);
+    Sampler.Free;
+    V.Free;
+  end;
+  // Very negative Mu: exp(-Mu) overflows to +Inf, so nothing passes the cut and
+  // the "always keep the most-likely token" fallback must fire.
+  Sampler := TNNetSamplerMirostat.Create(-50.0, 0.0, mvV2); // Mu = -100
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  try
+    for I := 0 to V_SIZE - 1 do V.Raw[I] := 1.0 / (V_SIZE + I);
+    V.Raw[7] := 0.9; // unambiguous maximum
+    for I := 0 to 49 do
+      AssertEquals('very negative Mu must fall back to the most-likely token',
+        7, Sampler.GetToken(V));
+  finally
+    Sampler.Free;
+    V.Free;
   end;
 end;
 

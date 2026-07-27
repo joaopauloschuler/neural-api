@@ -44,6 +44,7 @@ type
     procedure TestLookupFreeQuantSTEGradientCheck;
     procedure TestLookupFreeQuantCodeIndexRoundTrip;
     procedure TestLookupFreeQuantEntropy;
+    procedure TestLookupFreeQuantSoftAssignment;
     procedure TestSoftPoolGradientCheck;
     procedure TestSoftPoolGradientCheckBetaSweep;
     procedure TestSoftPoolBetaLimits;
@@ -107,6 +108,7 @@ type
     procedure TestFourierMixLoadFromString;
     procedure TestFourierMixFFTMatchesDirect;
     procedure TestFourierMixForwardKnownValue;
+    procedure TestFourierMixDirectSeparableMatchesNaive;
 
     // Activation function numerical tests
     procedure TestReLUNumericalRange;
@@ -628,6 +630,7 @@ type
     procedure TestSincConv1DInputGradientCheck;
     procedure TestSincConv1DWeightGradientCheck;
     procedure TestSincConv1DSerializationRoundTrip;
+    procedure TestSincConv1DBankFollowsWeightChanges;
     procedure TestConvLSTMCellShapeInference;
     procedure TestConvLSTMCellInputGradientCheck;
     procedure TestConvLSTMCellWeightGradientCheck;
@@ -865,9 +868,12 @@ type
     procedure TestNLLLossLoadFromString;
     procedure TestCTCLossForwardPassthrough;
     procedure TestCTCLossGradient;
+    procedure TestCTCLossGradientScatter;
     procedure TestCTCLossLoadFromString;
     procedure TestCTCDecodeGreedyRoundTrip;
     procedure TestCTCDecodeBeamSearch;
+    procedure TestCTCDecodeBeamSearchPartialSortMatchesFullSort;
+    procedure TestCTCDecodeBeamSearchMatchesReferenceStress;
     procedure TestKLDivergenceForwardPassthrough;
     procedure TestKLDivergenceGradient;
     procedure TestKLDivergenceLoadFromString;
@@ -960,6 +966,7 @@ type
     procedure TestTanhGLUSerializationRoundTrip;
     procedure TestReGLUForward;
     procedure TestReGLUGradientCheck;
+    procedure TestReGLUFamilyForwardParity;
     procedure TestCosineSimilarityForward;
     procedure TestCosineSimilarityGradientCheck;
     procedure TestSquaredReLUForward;
@@ -7747,6 +7754,55 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestFourierMixDirectSeparableMatchesNaive;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Shapes: array[0..6, 0..1] of integer =
+    ((3, 5), (6, 10), (7, 7), (12, 9), (1, 6), (5, 1), (9, 4));
+  ShapeIdx, L, D, a, b, s, h, LM1, DM1, SizeM1: integer;
+  Acc, TwoPi: Double;
+begin
+  // The direct path is SEPARABLE (cos(A+B) expansion) and reads fundamental
+  // twiddle tables with a carried, conditionally-wrapped index. Pin it against
+  // a verbatim naive sum_{s,h} x[s,h]*Cos(2*pi*(a*s/L + b*h/D)) reference over
+  // NON-power-of-two shapes (which TestFourierMixFFTMatchesDirect cannot cover)
+  // plus the degenerate L=1 and D=1 axes, so a wrong table wrap is caught.
+  TwoPi := 2 * Pi;
+  for ShapeIdx := 0 to 6 do
+  begin
+    L := Shapes[ShapeIdx][0];
+    D := Shapes[ShapeIdx][1];
+    LM1 := L - 1;
+    DM1 := D - 1;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(L, 1, D);
+    try
+      NN.AddLayer(TNNetInput.Create(L, 1, D, 1));
+      NN.AddLayer(TNNetFourierMix.Create(0)); // direct path
+      SizeM1 := Input.Size - 1;
+      for s := 0 to SizeM1 do
+        Input.Raw[s] := Sin(s * 1.1 + 0.4) * 1.7 + Cos(s * 0.23) * 0.4;
+      NN.Compute(Input);
+      for a := 0 to LM1 do
+        for b := 0 to DM1 do
+        begin
+          Acc := 0;
+          for s := 0 to LM1 do
+            for h := 0 to DM1 do
+              Acc := Acc + Input.Raw[s * D + h] *
+                Cos(TwoPi * (a * s) / L + TwoPi * (b * h) / D);
+          AssertEquals('FourierMix direct ' + IntToStr(L) + 'x' + IntToStr(D) +
+            ' at (' + IntToStr(a) + ',' + IntToStr(b) + ')',
+            Acc, NN.GetLastLayer.Output.Raw[a * D + b], 1e-3);
+        end;
+    finally
+      NN.Free;
+      Input.Free;
+    end;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestLpPoolLoadFromString;
 var
   NN, NN2: TNNet;
@@ -8090,6 +8146,58 @@ begin
     // Confident sharp assignment -> per-sample entropy near zero.
     AssertTrue('LFQ per-sample entropy small under sharp inv-temp',
       LFQ.PerSampleEntropy() < 0.05);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestLookupFreeQuantSoftAssignment;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  LFQ: TNNetLookupFreeQuant;
+  Zs: array[0..3] of TNeuralFloat;
+  I: integer;
+  P, Q, HSum, MeanPNeg, ExpPerSample, ExpCodebook: double;
+begin
+  // Pins the exact soft assignment, not just its ordering. The 2-level softmax
+  //   p = softmax(-t*[(z+1)^2, (z-1)^2])
+  // reduces to the sigmoid p(+1) = 1/(1 + exp(-4*t*z)); at t = 0.25 that is a
+  // plain sigmoid(z), so the per-sample and codebook entropies have a closed
+  // form here. A wrong temperature factor (or a lost stabilization branch)
+  // moves both numbers well outside the tolerance.
+  Zs[0] :=  0.3;
+  Zs[1] := -0.7;
+  Zs[2] :=  1.5;
+  Zs[3] :=  0.0;   // exercises the z >= 0 branch boundary: p = 0.5, H = ln 2
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1, 1));
+    LFQ := TNNetLookupFreeQuant.Create(1, 0.25, 1.0); // 4*t = 1 => sigmoid(z)
+    NN.AddLayer(LFQ);
+    for I := 0 to 3 do Input[I, 0, 0] := Zs[I];
+    NN.Compute(Input);
+
+    HSum := 0;
+    MeanPNeg := 0;
+    for I := 0 to 3 do
+    begin
+      P := 1.0 / (1.0 + Exp(-Zs[I]));   // p(+1)
+      Q := 1.0 - P;                     // p(-1)
+      HSum := HSum - (P * Ln(P) + Q * Ln(Q));
+      MeanPNeg := MeanPNeg + Q;
+    end;
+    ExpPerSample := HSum / 4;
+    MeanPNeg := MeanPNeg / 4;
+    ExpCodebook := -(MeanPNeg * Ln(MeanPNeg) +
+      (1 - MeanPNeg) * Ln(1 - MeanPNeg));
+
+    AssertEquals('LFQ per-sample entropy matches the sigmoid closed form',
+      ExpPerSample, LFQ.PerSampleEntropy(), 1e-4);
+    AssertEquals('LFQ codebook entropy matches the sigmoid closed form',
+      ExpCodebook, LFQ.CodebookEntropy(), 1e-4);
   finally
     NN.Free;
     Input.Free;
@@ -10640,6 +10748,59 @@ end;
 procedure TTestNeuralNumerical.TestReGLUGradientCheck;
 begin
   LayerInputGradientCheck(Self, TNNetReGLU.Create(), 'ReGLU', 2, 2, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestReGLUFamilyForwardParity;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, D, HalfDepth, SizeX, SizeY, FullDepth: integer;
+  a, b, reluA, reluB, expReGLU, expReGLUSq: TNeuralFloat;
+  reglu, reglusq: TNNetLayer;
+begin
+  // Pins ReGLU = ReLU(A)*B and ReGLUSquared = A*ReLU(B)^2 element by element
+  // over a half-depth of 13, so the vectorized row kernels run a full 8-wide
+  // body plus a 5-element remainder (the 2-element TestReGLUForward exercises
+  // only the remainder path). Both signs of A and B occur at every position.
+  SizeX := 2; SizeY := 2; HalfDepth := 13; FullDepth := HalfDepth * 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, FullDepth);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, FullDepth, 1));
+    reglu   := NN.AddLayerAfter(TNNetReGLU.Create(),        0);
+    reglusq := NN.AddLayerAfter(TNNetReGLUSquared.Create(), 0);
+
+    // Deterministic spread of A and B values across rows and depths.
+    for X := 0 to SizeX - 1 do
+      for Y := 0 to SizeY - 1 do
+        for D := 0 to FullDepth - 1 do
+          Input[X, Y, D] := Sin(0.7 * (X * 13 + Y * 5 + D)) * 2.5;
+
+    NN.Compute(Input);
+
+    AssertEquals('ReGLU output depth = input depth / 2', HalfDepth,
+      reglu.Output.Depth);
+    AssertEquals('ReGLUSquared output depth = input depth / 2', HalfDepth,
+      reglusq.Output.Depth);
+
+    for X := 0 to SizeX - 1 do
+      for Y := 0 to SizeY - 1 do
+        for D := 0 to HalfDepth - 1 do
+        begin
+          a := Input[X, Y, D];
+          b := Input[X, Y, D + HalfDepth];
+          if a > 0 then reluA := a else reluA := 0;
+          if b > 0 then reluB := b else reluB := 0;
+          expReGLU := reluA * b;
+          expReGLUSq := a * reluB * reluB;
+          AssertEquals('ReGLU parity', expReGLU, reglu.Output[X, Y, D], 0.0001);
+          AssertEquals('ReGLUSquared parity', expReGLUSq,
+            reglusq.Output[X, Y, D], 0.0001);
+        end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestCosineSimilarityForward;
@@ -37472,6 +37633,95 @@ begin
     TNNetSincConv1D.Create(3, 5, 2, 4000), 'SincConv1D', 16, 1, 1, 1e-5);
 end;
 
+// The forward caches the materialized filter bank and only rebuilds it when the
+// (low_freq, band) scalars actually changed. This asserts the cache can never go
+// stale: whichever way the weights are written - a direct Neurons[0].Weights
+// write from outside the layer, or a real training step - the next forward must
+// reproduce EXACTLY what a freshly built layer carrying those same weights
+// computes (and must differ from the pre-change output).
+procedure TTestNeuralNumerical.TestSincConv1DBankFollowsWeightChanges;
+var
+  NN, RefNN: TNNet;
+  Input, Out0, Out1: TNNetVolume;
+  L, RefL: TNNetSincConv1D;
+  i, T, NF, K: integer;
+  maxDiff, maxChange: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  T := 24; NF := 3; K := 5;
+  NN := TNNet.Create();
+  RefNN := TNNet.Create();
+  Input := TNNetVolume.Create(T, 1, 1);
+  Out0 := TNNetVolume.Create();
+  Out1 := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(T, 1, 1, 1));
+    L := TNNetSincConv1D.Create(NF, K, 2, 4000);
+    NN.AddLayer(L);
+    NN.SetLearningRate(1.0, 0.0);
+    RefNN.AddLayer(TNNetInput.Create(T, 1, 1, 1));
+    RefL := TNNetSincConv1D.Create(NF, K, 2, 4000);
+    RefNN.AddLayer(RefL);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.41) * 1.3 + 0.15;
+    SeedSincConv1D(L, NF);
+    NN.Compute(Input);
+    Out0.Copy(NN.GetLastLayer.Output);
+
+    // A second forward with unchanged weights must hit the cache and reproduce
+    // the first output bit for bit.
+    NN.Compute(Input);
+    for i := 0 to Out0.Size - 1 do
+      AssertTrue('SincConv1D cached forward changed the output at ' + IntToStr(i),
+        NN.GetLastLayer.Output.Raw[i] = Out0.Raw[i]);
+
+    // Direct weight write from OUTSIDE the layer, with no FlushWeightCache.
+    for i := 0 to L.Neurons[0].Weights.Size - 1 do
+      L.Neurons[0].Weights.Raw[i] := L.Neurons[0].Weights.Raw[i] * 1.35 + 3;
+    NN.Compute(Input);
+    Out1.Copy(NN.GetLastLayer.Output);
+    // Reference: a pristine layer built with those very weights.
+    for i := 0 to RefL.Neurons[0].Weights.Size - 1 do
+      RefL.Neurons[0].Weights.Raw[i] := L.Neurons[0].Weights.Raw[i];
+    RefNN.Compute(Input);
+    maxDiff := 0; maxChange := 0;
+    for i := 0 to Out1.Size - 1 do
+    begin
+      if Abs(Out1.Raw[i] - RefNN.GetLastLayer.Output.Raw[i]) > maxDiff then
+        maxDiff := Abs(Out1.Raw[i] - RefNN.GetLastLayer.Output.Raw[i]);
+      if Abs(Out1.Raw[i] - Out0.Raw[i]) > maxChange then
+        maxChange := Abs(Out1.Raw[i] - Out0.Raw[i]);
+    end;
+    AssertTrue('SincConv1D bank went stale after a direct weight write ' +
+      '(max diff vs a fresh layer = ' + FloatToStr(maxDiff) + ')',
+      maxDiff < 1e-7);
+    AssertTrue('SincConv1D output did not react to the weight change',
+      maxChange > 1e-5);
+
+    // Now the training path: one backward step moves the two scalars per filter.
+    NN.SetBatchUpdate(false);
+    NN.Compute(Input);
+    Out0.Copy(NN.GetLastLayer.Output);
+    Out1.ReSize(Out0);
+    Out1.Fill(0);                // a zero target: the error is the output itself
+    NN.Backpropagate(Out1);
+    NN.Compute(Input);
+    Out1.Copy(NN.GetLastLayer.Output);
+    for i := 0 to RefL.Neurons[0].Weights.Size - 1 do
+      RefL.Neurons[0].Weights.Raw[i] := L.Neurons[0].Weights.Raw[i];
+    RefNN.Compute(Input);
+    maxDiff := 0;
+    for i := 0 to Out1.Size - 1 do
+      if Abs(Out1.Raw[i] - RefNN.GetLastLayer.Output.Raw[i]) > maxDiff then
+        maxDiff := Abs(Out1.Raw[i] - RefNN.GetLastLayer.Output.Raw[i]);
+    AssertTrue('SincConv1D bank went stale after a training weight update ' +
+      '(max diff vs a fresh layer = ' + FloatToStr(maxDiff) + ')',
+      maxDiff < 1e-7);
+  finally
+    NN.Free; RefNN.Free; Input.Free; Out0.Free; Out1.Free;
+  end;
+end;
+
 // --- TNNetConvLSTMCell (convolutional LSTM spatiotemporal recurrent cell) -----
 
 // Deterministic, BOUNDED gate kernels + biases so every gate (i/f/o sigmoid,
@@ -47061,6 +47311,63 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestCTCLossGradientScatter;
+const
+  cT = 7;
+  cVocab = 5;
+  cBlank = 0;
+var
+  Logits, LogProbs, Grad: TNNetVolume;
+  Labels: array[0..2] of integer;
+  ti, k: integer;
+  RowSum, G: TNeuralFloat;
+begin
+  // Structural properties of dL/d(log p) that pin the per-frame occupancy
+  // scatter: a symbol absent from the extended label sequence gets EXACTLY 0,
+  // a symbol occupying several extended slots accumulates all of them, and the
+  // whole frame sums to -1 because the posteriors of one frame sum to 1.
+  // Labels [1, 2, 2] make Ext = [b,1,b,2,b,2,b]: blank appears 4x, label 2
+  // twice, and vocabulary entries 3 and 4 never.
+  Labels[0] := 1; Labels[1] := 2; Labels[2] := 2;
+  Logits := TNNetVolume.Create(cT, 1, cVocab);
+  LogProbs := TNNetVolume.Create(cT, 1, cVocab);
+  Grad := TNNetVolume.Create(1, 1, 1);
+  try
+    RandSeed := 20260724;
+    for ti := 0 to cT - 1 do
+      for k := 0 to cVocab - 1 do
+        Logits[ti, 0, k] := (Random - 0.5) * 3.0;
+    CTCLogitsToLogProbs(Logits, LogProbs);
+    // Pre-fill the gradient with garbage: the routine must resize + clear it.
+    Grad.ReSize(2, 1, 2);
+    Grad.Fill(7.0);
+    TNNetCTCLoss.ForwardBackwardLogLoss(LogProbs, Labels, cBlank, Grad);
+
+    AssertEquals('CTC grad SizeX', cT, Grad.SizeX);
+    AssertEquals('CTC grad Depth', cVocab, Grad.Depth);
+    for ti := 0 to cT - 1 do
+    begin
+      RowSum := 0;
+      for k := 0 to cVocab - 1 do
+      begin
+        G := Grad[ti, 0, k];
+        RowSum := RowSum + G;
+        AssertTrue('CTC grad is non-positive at ' + IntToStr(ti) + ',' +
+          IntToStr(k), G <= 0);
+        if k >= 3 then
+          AssertEquals('CTC grad exactly zero for unused symbol ' +
+            IntToStr(k) + ' at frame ' + IntToStr(ti), 0.0, G, 0.0);
+      end;
+      AssertEquals('CTC grad frame ' + IntToStr(ti) + ' sums to -1',
+        -1.0, RowSum, 1e-4);
+    end;
+  finally
+    Grad.Free;
+    LogProbs.Free;
+    Logits.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestCTCLossLoadFromString;
 var
   NN, NN2: TNNet;
@@ -47161,6 +47468,294 @@ begin
     Scores.Free;
     LP.Free;
   end;
+end;
+
+// Reference CTC prefix beam search: a verbatim copy of DecodeCTCBeamSearch
+// EXCEPT that the prune step runs the FULL selection sort over the whole
+// candidate list before truncating. Used to pin the partial-sort optimization
+// (which stops the sort at BeamWidth-1 when the tail is discarded) as exactly
+// equivalent, not merely approximately so.
+function RefCTCBeamSearchFullSort(Scores: TNNetVolume; BeamWidth: integer;
+  Blank: integer; LogInput: boolean): TNeuralIntegerArray;
+type
+  TCTCBeam = record
+    Prefix: TNeuralIntegerArray;
+    PB: double;
+    PNB: double;
+  end;
+var
+  NumT, Vocab, ti, k, i, j, bi, LastSym: integer;
+  NumTM1, VocabM1, BeamsHi, BeamsHiM1, NextHi, IP1, ScoreBase: integer;
+  Beams, Next: array of TCTCBeam;
+  Prob: array of double;
+  BestIdx: integer;
+  BestScore, Total, Sum: double;
+  LocalPrefix: TNeuralIntegerArray;
+  BeamPB, BeamPNB, SumPBNB: double;
+  function PrefixEqual(const A, B: TNeuralIntegerArray): boolean;
+  var LA: integer;
+  begin
+    LA := Length(A);
+    if LA <> Length(B) then Exit(false);
+    if LA = 0 then Exit(true);
+    Result := CompareMem(@A[0], @B[0], LA * csIntegerSize);
+  end;
+  function FindNext(const P: TNeuralIntegerArray): integer;
+  var n, Hi: integer;
+  begin
+    Hi := High(Next);
+    for n := 0 to Hi do
+      if PrefixEqual(Next[n].Prefix, P) then Exit(n);
+    Result := -1;
+  end;
+  procedure AddNext(const P: TNeuralIntegerArray; AddPB, AddPNB: double);
+  var n: integer;
+  begin
+    n := FindNext(P);
+    if n < 0 then
+    begin
+      SetLength(Next, Length(Next) + 1);
+      Next[High(Next)].Prefix := Copy(P, 0, Length(P));
+      Next[High(Next)].PB := AddPB;
+      Next[High(Next)].PNB := AddPNB;
+    end
+    else
+    begin
+      Next[n].PB := Next[n].PB + AddPB;
+      Next[n].PNB := Next[n].PNB + AddPNB;
+    end;
+  end;
+  function ExtendOne(const P: TNeuralIntegerArray; sym: integer): TNeuralIntegerArray;
+  var LP: integer;
+  begin
+    LP := Length(P);
+    SetLength(Result, LP + 1);
+    if LP > 0 then Move(P[0], Result[0], LP * csIntegerSize);
+    Result[LP] := sym;
+  end;
+begin
+  NumT := Scores.SizeX;
+  Vocab := Scores.Depth;
+  if Blank < 0 then Blank := Vocab - 1;
+  if BeamWidth < 1 then BeamWidth := 1;
+  NumTM1 := NumT - 1;
+  VocabM1 := Vocab - 1;
+  SetLength(Prob, Vocab);
+
+  SetLength(Beams, 1);
+  SetLength(Beams[0].Prefix, 0);
+  Beams[0].PB := 1.0;
+  Beams[0].PNB := 0.0;
+
+  for ti := 0 to NumTM1 do
+  begin
+    ScoreBase := Scores.GetRawPos(ti, 0, 0);
+    if LogInput then
+      for k := 0 to VocabM1 do Prob[k] := NeuralExp(Scores.FData[ScoreBase + k])
+    else
+      for k := 0 to VocabM1 do Prob[k] := Scores.FData[ScoreBase + k];
+
+    SetLength(Next, 0);
+    BeamsHi := High(Beams);
+    for bi := 0 to BeamsHi do
+    begin
+      LocalPrefix := Beams[bi].Prefix;
+      BeamPB := Beams[bi].PB;
+      BeamPNB := Beams[bi].PNB;
+      SumPBNB := BeamPB + BeamPNB;
+      if Length(LocalPrefix) > 0 then
+        LastSym := LocalPrefix[High(LocalPrefix)]
+      else
+        LastSym := -1;
+
+      AddNext(LocalPrefix, SumPBNB * Prob[Blank], 0.0);
+      if LastSym >= 0 then
+        AddNext(LocalPrefix, 0.0, BeamPNB * Prob[LastSym]);
+      for k := 0 to VocabM1 do
+      begin
+        if k = Blank then Continue;
+        if k = LastSym then
+          AddNext(ExtendOne(LocalPrefix, k), 0.0, BeamPB * Prob[k])
+        else
+          AddNext(ExtendOne(LocalPrefix, k), 0.0, SumPBNB * Prob[k]);
+      end;
+    end;
+
+    SetLength(Beams, Length(Next));
+    NextHi := High(Next);
+    for i := 0 to NextHi do Beams[i] := Next[i];
+    BeamsHi := High(Beams);
+    BeamsHiM1 := BeamsHi - 1;
+    // FULL sort - the reference behaviour being pinned.
+    for i := 0 to BeamsHiM1 do
+    begin
+      BestIdx := i;
+      BestScore := Beams[i].PB + Beams[i].PNB;
+      IP1 := i + 1;
+      for j := IP1 to BeamsHi do
+      begin
+        Total := Beams[j].PB + Beams[j].PNB;
+        if Total > BestScore then
+        begin
+          BestScore := Total;
+          BestIdx := j;
+        end;
+      end;
+      if BestIdx <> i then
+      begin
+        Next[0] := Beams[i];
+        Beams[i] := Beams[BestIdx];
+        Beams[BestIdx] := Next[0];
+      end;
+    end;
+    if Length(Beams) > BeamWidth then SetLength(Beams, BeamWidth);
+  end;
+
+  BestIdx := 0;
+  BestScore := -1;
+  BeamsHi := High(Beams);
+  for i := 0 to BeamsHi do
+  begin
+    Sum := Beams[i].PB + Beams[i].PNB;
+    if Sum > BestScore then
+    begin
+      BestScore := Sum;
+      BestIdx := i;
+    end;
+  end;
+  if Length(Beams) > 0 then
+    Result := Copy(Beams[BestIdx].Prefix, 0, Length(Beams[BestIdx].Prefix))
+  else
+    SetLength(Result, 0);
+end;
+
+// The pruning step only needs the top BeamWidth records ordered, because the
+// tail is dropped by the SetLength truncation. Bounding the selection sort must
+// leave the decoded label sequence bit-identical on every input, including the
+// no-truncation case (where the full sort is kept because the tail order is
+// still observable through the next frame).
+procedure TTestNeuralNumerical.TestCTCDecodeBeamSearchPartialSortMatchesFullSort;
+const
+  cT = 6;
+  cVocab = 5;
+  cBlank = 4;
+var
+  Scores: TNNetVolume;
+  Got, Ref: TNeuralIntegerArray;
+  Seed, Trial, ti, k, Widx, BW, n: integer;
+  Widths: array[0..3] of integer;
+  Msg: string;
+begin
+  Widths[0] := 1; Widths[1] := 2; Widths[2] := 5; Widths[3] := 25;
+  Scores := TNNetVolume.Create(cT, 1, cVocab);
+  try
+    for Trial := 0 to 5 do
+    begin
+      // Deterministic pseudo-random log-probs (a plain LCG, so the test is
+      // reproducible and independent of the RTL's generator).
+      Seed := 1 + Trial * 913;
+      for ti := 0 to cT - 1 do
+        for k := 0 to cVocab - 1 do
+        begin
+          Seed := (Seed * 75 + 74) mod 65537;   // Lehmer; cannot overflow
+          Scores[ti, 0, k] := -4.0 + (Seed mod 1000) * 0.004;
+        end;
+      for Widx := 0 to 3 do
+      begin
+        BW := Widths[Widx];
+        // The wide beam leaves the first frames untruncated, so the retained
+        // full-sort branch is exercised as well as the bounded one.
+        Ref := RefCTCBeamSearchFullSort(Scores, BW, cBlank, true);
+        Got := DecodeCTCBeamSearch(Scores, BW, cBlank, true);
+        Msg := 'trial ' + IntToStr(Trial) + ' beam ' + IntToStr(BW);
+        AssertEquals(Msg + ': decoded length', Length(Ref), Length(Got));
+        for n := 0 to Length(Ref) - 1 do
+          AssertEquals(Msg + ': label ' + IntToStr(n), Ref[n], Got[n]);
+      end;
+    end;
+  finally
+    Scores.Free;
+  end;
+end;
+
+// DecodeCTCBeamSearch addresses its candidate table by slot arithmetic instead
+// of searching it, so the one prefix collision the layout cannot express - a
+// live beam whose prefix IS another live beam's prefix plus one symbol (e.g.
+// "a" and "ab" both alive) - is resolved by an explicit per-frame alias pass.
+// This sweep must therefore reproduce the reference prefix-search decoder
+// EXACTLY on inputs that make that case common: a small alphabet with a wide
+// beam saturates the beam list with every prefix of the alphabet, so nearly
+// every frame carries parent/child beam pairs (and chains of them).
+//
+// Coverage: vocab 2/3/5, blank both last and first, T 4/8, blank-heavy and
+// blank-free extremes, a repeated-dominant-symbol pattern, raw-probability
+// (LogInput = false) input, and beam widths from 1 (no aliasing possible) to 40
+// (beam list saturated). Seeds are fixed, so any failure reproduces.
+procedure TTestNeuralNumerical.TestCTCDecodeBeamSearchMatchesReferenceStress;
+var
+  Scores: TNNetVolume;
+  Got, Ref: TNeuralIntegerArray;
+  Vocab, Blank, cT, Mode, Trial, Widx, BW, ti, k, n, Seed: integer;
+  VIdx, BIdx, TIdx: integer;
+  Vocabs: array[0..2] of integer;
+  Widths: array[0..5] of integer;
+  Ts: array[0..1] of integer;
+  LogIn: boolean;
+  V: TNeuralFloat;
+  Msg: string;
+begin
+  Vocabs[0] := 2; Vocabs[1] := 3; Vocabs[2] := 5;
+  Widths[0] := 1; Widths[1] := 2; Widths[2] := 3;
+  Widths[3] := 7; Widths[4] := 16; Widths[5] := 40;
+  Ts[0] := 4; Ts[1] := 8;
+  for VIdx := 0 to 2 do
+    for BIdx := 0 to 1 do
+      for TIdx := 0 to 1 do
+        for Mode := 0 to 4 do
+          for Trial := 0 to 2 do
+          begin
+            Vocab := Vocabs[VIdx];
+            if BIdx = 0 then Blank := Vocab - 1 else Blank := 0;
+            cT := Ts[TIdx];
+            // Mode 3 feeds raw probabilities instead of log-probabilities.
+            LogIn := (Mode <> 3);
+            Scores := TNNetVolume.Create(cT, 1, Vocab);
+            try
+              // Deterministic pseudo-random scores (a plain LCG, so the test is
+              // reproducible and independent of the RTL's generator).
+              Seed := 1 + Trial * 913 + VIdx * 77 + BIdx * 31 + TIdx * 13 +
+                Mode * 401;
+              for ti := 0 to cT - 1 do
+                for k := 0 to Vocab - 1 do
+                begin
+                  Seed := (Seed * 75 + 74) mod 65537;   // Lehmer; cannot overflow
+                  V := -4.0 + (Seed mod 1000) * 0.004;
+                  // Mode 1: blank dominates (nearly every frame is a blank, so
+                  // beams keep their prefix). Mode 2: blank is starved (nearly
+                  // every frame extends). Mode 4: one symbol dominates for two
+                  // consecutive frames, exercising the repeat-last-symbol merge.
+                  if (Mode = 1) and (k = Blank) then V := V + 3.0;
+                  if (Mode = 2) and (k = Blank) then V := V - 6.0;
+                  if (Mode = 4) and (k = ((ti div 2) mod Vocab)) then V := V + 4.0;
+                  if Mode = 3 then V := NeuralExp(V);
+                  Scores[ti, 0, k] := V;
+                end;
+              for Widx := 0 to 5 do
+              begin
+                BW := Widths[Widx];
+                Ref := RefCTCBeamSearchFullSort(Scores, BW, Blank, LogIn);
+                Got := DecodeCTCBeamSearch(Scores, BW, Blank, LogIn);
+                Msg := 'vocab ' + IntToStr(Vocab) + ' blank ' + IntToStr(Blank) +
+                  ' T ' + IntToStr(cT) + ' mode ' + IntToStr(Mode) +
+                  ' trial ' + IntToStr(Trial) + ' beam ' + IntToStr(BW);
+                AssertEquals(Msg + ': decoded length', Length(Ref), Length(Got));
+                for n := 0 to Length(Ref) - 1 do
+                  AssertEquals(Msg + ': label ' + IntToStr(n), Ref[n], Got[n]);
+              end;
+            finally
+              Scores.Free;
+            end;
+          end;
 end;
 
 procedure TTestNeuralNumerical.TestKLDivergenceForwardPassthrough;

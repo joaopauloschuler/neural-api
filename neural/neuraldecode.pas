@@ -2284,68 +2284,74 @@ begin
   SetLength(Result, Count);
 end;
 
+// CTC prefix beam search.
+//
+// SLOT LAYOUT INSTEAD OF A PREFIX SEARCH. Every candidate a frame produces has
+// one of exactly two shapes: beam bi's prefix unchanged (the blank and the
+// repeat-last-symbol cases), or beam bi's prefix extended by one symbol k. So
+// the candidate a contribution belongs to is addressable by arithmetic:
+//   slot bi                          -> beam bi's prefix, unchanged
+//   slot BeamCount + bi*Vocab + k    -> beam bi's prefix + [k]
+// which removes the linear FindNext scan (and with it the O((BeamWidth*Vocab)^2)
+// prefix comparisons per frame) from the hot loop entirely.
+//
+// THE ONE COLLISION. Two extension slots (bi,k) and (bj,k') denote the same
+// prefix only if k = k' and prefix(bi) = prefix(bj); beam prefixes are pairwise
+// distinct (see below), so that forces bi = bj. The remaining case is a beam bj
+// whose prefix IS some beam bi's prefix plus one symbol (e.g. "a" and "ab" both
+// alive): then extension slot (bi, lastsym(bj)) and unchanged slot bj denote the
+// same prefix. That is resolved ONCE PER FRAME - ExtAlias redirects the
+// extension slot onto the unchanged slot - so the unchanged slot is always the
+// canonical one and distinct slots always denote distinct prefixes.
+//
+// Beam prefixes stay pairwise distinct by induction: the initial beam list is a
+// single empty prefix, and each frame's beams are drawn from distinct canonical
+// slots, which denote distinct prefixes by the argument above.
+//
+// ORDER IS PRESERVED EXACTLY. A candidate is appended when its canonical slot is
+// first touched, and the traversal order over (bi, then k ascending) is the old
+// insertion order, so the candidate list is in the same order and each slot
+// accumulates its contributions in the same sequence - the pruning sort (whose
+// ties are broken by position) therefore sees an identical list.
+//
+// NO PER-FRAME ALLOCATION (rule #17). The slot arrays, the candidate array and
+// the two prefix buffers are sized once per call; prefixes live in a flat
+// BeamWidth x (NumT+1) buffer, double-buffered so a frame reads the previous
+// frame's prefixes while writing the new ones. Candidates carry only
+// (parent beam, symbol), so the <= BeamWidth survivors of the prune are the only
+// prefixes ever materialised.
 function DecodeCTCBeamSearch(Scores: TNNetVolume; BeamWidth: integer;
   Blank: integer; LogInput: boolean): TNeuralIntegerArray;
+const
+  // Rolling prefix hash: only a prefilter for the once-per-frame alias search,
+  // every hit is confirmed by CompareMem.
+  csCTCHashMul = QWord(1000003);
 type
-  TCTCBeam = record
-    Prefix: TNeuralIntegerArray;
-    PB: double;   // probability prefix ends in blank
-    PNB: double;  // probability prefix ends in a non-blank
+  TCTCCand = record
+    Parent: integer;  // beam index this candidate derives from
+    Sym: integer;     // -1: that beam's prefix unchanged; >= 0: extended by Sym
+    PB: double;       // probability prefix ends in blank
+    PNB: double;      // probability prefix ends in a non-blank
   end;
 var
-  NumT, Vocab, ti, k, i, j, bi, LastSym: integer;
-  NumTM1, VocabM1, BeamsHi, BeamsHiM1, NextHi, IP1, ScoreBase: integer;
-  Beams, Next: array of TCTCBeam;
+  NumT, Vocab, ti, k, i, j, bi, bj, LastSym: integer;
+  NumTM1, VocabM1, BeamsHi, IP1, ScoreBase: integer;
+  SortLimit, NCand, NCandHi, BeamCount, NewCount, NewCountM1: integer;
+  Stride, SlotCap, LiveSlots, ExtBase, ExtSlot, CSlot, c: integer;
+  LP, LjM1, Sym, BaseI, BaseJ, PosJ: integer;
+  Cand: array of TCTCCand;
+  TmpCand: TCTCCand;
+  SlotCand: array of integer;   // slot -> candidate index (-1: not yet created)
+  ExtAlias: array of integer;   // extension slot -> aliased unchanged slot (-1: none)
+  CurPref, NxtPref, TmpPref: array of integer;  // flat BeamWidth x Stride prefixes
+  BeamLen, NewLen, TmpLen: array of integer;
+  BeamPB, BeamPNB: array of double;
+  BeamHash, BeamPHash, NewHash, NewPHash, TmpHash: array of QWord;
   Prob: array of double; // current frame probabilities
   BestIdx: integer;
-  BestScore, Total, Sum: double;
-  LocalPrefix: TNeuralIntegerArray; // #4: this beam's prefix, bound once per bi
-  BeamPB, BeamPNB, SumPBNB: double;
-  // Rule #17: compare prefixes directly (length + CompareMem over the int ids)
-  // instead of building a comma-joined string key per pair - kills the quadratic
-  // string churn FindNext used to incur on every AddNext.
-  function PrefixEqual(const A, B: TNeuralIntegerArray): boolean;
-  var LA: integer;
-  begin
-    LA := Length(A);
-    if LA <> Length(B) then Exit(false);
-    if LA = 0 then Exit(true);
-    Result := CompareMem(@A[0], @B[0], LA * csIntegerSize);
-  end;
-  function FindNext(const P: TNeuralIntegerArray): integer;
-  var n, Hi: integer;
-  begin
-    Hi := High(Next);
-    for n := 0 to Hi do
-      if PrefixEqual(Next[n].Prefix, P) then Exit(n);
-    Result := -1;
-  end;
-  procedure AddNext(const P: TNeuralIntegerArray; AddPB, AddPNB: double);
-  var n: integer;
-  begin
-    n := FindNext(P);
-    if n < 0 then
-    begin
-      SetLength(Next, Length(Next) + 1);
-      Next[High(Next)].Prefix := Copy(P, 0, Length(P));
-      Next[High(Next)].PB := AddPB;
-      Next[High(Next)].PNB := AddPNB;
-    end
-    else
-    begin
-      Next[n].PB := Next[n].PB + AddPB;
-      Next[n].PNB := Next[n].PNB + AddPNB;
-    end;
-  end;
-  function ExtendOne(const P: TNeuralIntegerArray; sym: integer): TNeuralIntegerArray;
-  var LP: integer;
-  begin
-    LP := Length(P);
-    SetLength(Result, LP + 1);
-    // App C: bulk-copy the existing ids instead of an element-by-element loop.
-    if LP > 0 then Move(P[0], Result[0], LP * csIntegerSize);
-    Result[LP] := sym;
-  end;
+  BestScore, Total, Sum, AddV: double;
+  BeamPBv, BeamPNBv, SumPBNB: double;
+  PHashJ: QWord;
 begin
   NumT := Scores.SizeX;
   Vocab := Scores.Depth;
@@ -2353,13 +2359,32 @@ begin
   if BeamWidth < 1 then BeamWidth := 1;
   NumTM1 := NumT - 1;
   VocabM1 := Vocab - 1;
+  // A prefix grows by at most one symbol per frame, so NumT symbols is the
+  // worst case; the extra slot keeps Stride >= 1 when NumT = 0.
+  Stride := NumT + 1;
+  SlotCap := BeamWidth * (Vocab + 1);
   SetLength(Prob, Vocab);
+  SetLength(Cand, SlotCap);
+  SetLength(SlotCand, SlotCap);
+  SetLength(ExtAlias, SlotCap);
+  SetLength(CurPref, BeamWidth * Stride);
+  SetLength(NxtPref, BeamWidth * Stride);
+  SetLength(BeamLen, BeamWidth);
+  SetLength(NewLen, BeamWidth);
+  SetLength(BeamPB, BeamWidth);
+  SetLength(BeamPNB, BeamWidth);
+  SetLength(BeamHash, BeamWidth);
+  SetLength(BeamPHash, BeamWidth);
+  SetLength(NewHash, BeamWidth);
+  SetLength(NewPHash, BeamWidth);
 
   // Initial beam: empty prefix, all mass on "ends in blank".
-  SetLength(Beams, 1);
-  SetLength(Beams[0].Prefix, 0);
-  Beams[0].PB := 1.0;
-  Beams[0].PNB := 0.0;
+  BeamCount := 1;
+  BeamLen[0] := 0;
+  BeamPB[0] := 1.0;
+  BeamPNB[0] := 0.0;
+  BeamHash[0] := 0;
+  BeamPHash[0] := 0;
 
   for ti := 0 to NumTM1 do
   begin
@@ -2372,59 +2397,134 @@ begin
     else
       for k := 0 to VocabM1 do Prob[k] := Scores.FData[ScoreBase + k];
 
-    SetLength(Next, 0);
-    BeamsHi := High(Beams);
+    BeamsHi := BeamCount - 1;
+    LiveSlots := BeamCount * (Vocab + 1);
+    FillDWord(SlotCand[0], LiveSlots, DWord(-1));
+    FillDWord(ExtAlias[0], LiveSlots, DWord(-1));
+
+    // Alias pass, O(BeamCount^2): a beam bj whose prefix is beam bi's prefix
+    // plus one symbol makes extension slot (bi, lastsym) an alias of unchanged
+    // slot bj. Prefixes are pairwise distinct, so each bj has at most one such
+    // bi and each (bi, sym) at most one such bj.
+    for bj := 0 to BeamsHi do
+    begin
+      LjM1 := BeamLen[bj] - 1;
+      if LjM1 < 0 then Continue;
+      BaseJ := bj * Stride;
+      Sym := CurPref[BaseJ + LjM1];
+      PHashJ := BeamPHash[bj];   // #11: hash of bj's prefix minus its last symbol
+      for bi := 0 to BeamsHi do
+      begin
+        if (bi <> bj) and (BeamLen[bi] = LjM1) and (BeamHash[bi] = PHashJ) then
+        begin
+          BaseI := bi * Stride;
+          if (LjM1 = 0) or
+             CompareMem(@CurPref[BaseI], @CurPref[BaseJ], LjM1 * csIntegerSize) then
+          begin
+            ExtAlias[BeamCount + bi * Vocab + Sym] := bj;
+            Break;
+          end;
+        end;
+      end;
+    end;
+
+    NCand := 0;
     for bi := 0 to BeamsHi do
     begin
-      // #4: bind this beam's fields once (Beams is not modified inside the bi
-      // loop; AddNext/ExtendOne only touch Next). LocalPrefix is a cheap
-      // reference copy of the dynamic array, not a deep copy.
-      LocalPrefix := Beams[bi].Prefix;
-      BeamPB := Beams[bi].PB;
-      BeamPNB := Beams[bi].PNB;
-      SumPBNB := BeamPB + BeamPNB;
-      if Length(LocalPrefix) > 0 then
-        LastSym := LocalPrefix[High(LocalPrefix)]
+      BeamPBv := BeamPB[bi];
+      BeamPNBv := BeamPNB[bi];
+      SumPBNB := BeamPBv + BeamPNBv;
+      LP := BeamLen[bi];
+      if LP > 0 then
+        LastSym := CurPref[bi * Stride + LP - 1]
       else
         LastSym := -1;
 
-      // 1) Add blank: prefix unchanged, accrues to PB.
-      AddNext(LocalPrefix, SumPBNB * Prob[Blank], 0.0);
+      // 1) Add blank: prefix unchanged, accrues to PB. Slot bi is canonical for
+      //    this prefix, but an earlier beam's extension may have created it.
+      AddV := SumPBNB * Prob[Blank];
+      c := SlotCand[bi];
+      if c < 0 then
+      begin
+        c := NCand;
+        Inc(NCand);
+        SlotCand[bi] := c;
+        Cand[c].Parent := bi;
+        Cand[c].Sym := -1;
+        Cand[c].PB := AddV;
+        Cand[c].PNB := 0.0;
+      end
+      else
+        Cand[c].PB := Cand[c].PB + AddV;
 
       // 2) Repeat the last symbol: prefix unchanged, accrues to PNB (only the
       //    non-blank-ending mass can repeat without inserting a separator).
+      //    Slot bi exists by now - step 1 always touches it.
       if LastSym >= 0 then
-        AddNext(LocalPrefix, 0.0, BeamPNB * Prob[LastSym]);
+        Cand[c].PNB := Cand[c].PNB + BeamPNBv * Prob[LastSym];
 
       // 3) Extend by each non-blank symbol k.
+      ExtBase := BeamCount + bi * Vocab;
       for k := 0 to VocabM1 do
       begin
         if k = Blank then Continue;
         if k = LastSym then
           // Same as last: only blank-ending mass may extend (else it merges).
-          AddNext(ExtendOne(LocalPrefix, k), 0.0, BeamPB * Prob[k])
+          AddV := BeamPBv * Prob[k]
         else
-          AddNext(ExtendOne(LocalPrefix, k), 0.0, SumPBNB * Prob[k]);
+          AddV := SumPBNB * Prob[k];
+        ExtSlot := ExtBase + k;
+        CSlot := ExtAlias[ExtSlot];
+        if CSlot < 0 then
+        begin
+          // No alias: this extension slot is its own canonical slot, and no
+          // other (bi, k) pair addresses it, so it is always new.
+          SlotCand[ExtSlot] := NCand;
+          c := NCand;
+          Inc(NCand);
+          Cand[c].Parent := bi;
+          Cand[c].Sym := k;
+          Cand[c].PB := 0.0;
+          Cand[c].PNB := AddV;
+        end
+        else
+        begin
+          c := SlotCand[CSlot];
+          if c < 0 then
+          begin
+            c := NCand;
+            Inc(NCand);
+            SlotCand[CSlot] := c;
+            Cand[c].Parent := CSlot;   // the aliased beam's own prefix
+            Cand[c].Sym := -1;
+            Cand[c].PB := 0.0;
+            Cand[c].PNB := AddV;
+          end
+          else
+            Cand[c].PNB := Cand[c].PNB + AddV;
+        end;
       end;
     end;
 
-    // Prune to BeamWidth by total probability: copy Next -> Beams, sort
-    // descending by (PB+PNB) with a selection sort (BeamWidth is small), then
-    // truncate.
-    SetLength(Beams, Length(Next));
-    NextHi := High(Next);
-    for i := 0 to NextHi do Beams[i] := Next[i];
-    // Sort descending by total prob (selection sort over the whole list).
-    BeamsHi := High(Beams);
-    BeamsHiM1 := BeamsHi - 1;
-    for i := 0 to BeamsHiM1 do
+    // Prune to BeamWidth by total probability. Sort descending by (PB+PNB) with
+    // a selection sort (BeamWidth is small). Pass i fixes position i
+    // permanently, so when the list is about to be truncated to BeamWidth the
+    // passes beyond BeamWidth-1 only order records that are then discarded:
+    // bound the outer loop (partial selection sort, O(N*BeamWidth) instead of
+    // O(N^2)). When nothing is truncated the tail order is still observable
+    // through the next frame's beam iteration, so keep the full sort there.
+    NCandHi := NCand - 1;
+    SortLimit := NCandHi - 1;
+    if (NCand > BeamWidth) and (BeamWidth - 1 < SortLimit) then
+      SortLimit := BeamWidth - 1;
+    for i := 0 to SortLimit do
     begin
       BestIdx := i;
-      BestScore := Beams[i].PB + Beams[i].PNB;
+      BestScore := Cand[i].PB + Cand[i].PNB;
       IP1 := i + 1;
-      for j := IP1 to BeamsHi do
+      for j := IP1 to NCandHi do
       begin
-        Total := Beams[j].PB + Beams[j].PNB;
+        Total := Cand[j].PB + Cand[j].PNB;
         if Total > BestScore then
         begin
           BestScore := Total;
@@ -2433,29 +2533,70 @@ begin
       end;
       if BestIdx <> i then
       begin
-        Next[0] := Beams[i];        // reuse Next[0] as temp
-        Beams[i] := Beams[BestIdx];
-        Beams[BestIdx] := Next[0];
+        TmpCand := Cand[i];
+        Cand[i] := Cand[BestIdx];
+        Cand[BestIdx] := TmpCand;
       end;
     end;
-    if Length(Beams) > BeamWidth then SetLength(Beams, BeamWidth);
+
+    // Materialise only the survivors' prefixes, from the previous frame's
+    // buffer into the alternate one (so the reads above stay valid).
+    NewCount := NCand;
+    if NewCount > BeamWidth then NewCount := BeamWidth;
+    NewCountM1 := NewCount - 1;
+    for i := 0 to NewCountM1 do
+    begin
+      bi := Cand[i].Parent;
+      Sym := Cand[i].Sym;
+      LP := BeamLen[bi];
+      PosJ := i * Stride;
+      if LP > 0 then
+        Move(CurPref[bi * Stride], NxtPref[PosJ], LP * csIntegerSize);
+      {$PUSH}{$Q-}{$R-}  // rolling hash: wraparound is intended
+      if Sym >= 0 then
+      begin
+        NxtPref[PosJ + LP] := Sym;
+        NewLen[i] := LP + 1;
+        NewHash[i] := BeamHash[bi] * csCTCHashMul + QWord(Sym + 1);
+        NewPHash[i] := BeamHash[bi];
+      end
+      else
+      begin
+        NewLen[i] := LP;
+        NewHash[i] := BeamHash[bi];
+        NewPHash[i] := BeamPHash[bi];
+      end;
+      {$POP}
+      BeamPB[i] := Cand[i].PB;
+      BeamPNB[i] := Cand[i].PNB;
+    end;
+    TmpPref := CurPref; CurPref := NxtPref; NxtPref := TmpPref;
+    TmpLen := BeamLen; BeamLen := NewLen; NewLen := TmpLen;
+    TmpHash := BeamHash; BeamHash := NewHash; NewHash := TmpHash;
+    TmpHash := BeamPHash; BeamPHash := NewPHash; NewPHash := TmpHash;
+    BeamCount := NewCount;
   end;
 
   // Best prefix = highest total probability.
   BestIdx := 0;
   BestScore := -1;
-  BeamsHi := High(Beams);
+  BeamsHi := BeamCount - 1;
   for i := 0 to BeamsHi do
   begin
-    Sum := Beams[i].PB + Beams[i].PNB;
+    Sum := BeamPB[i] + BeamPNB[i];
     if Sum > BestScore then
     begin
       BestScore := Sum;
       BestIdx := i;
     end;
   end;
-  if Length(Beams) > 0 then
-    Result := Copy(Beams[BestIdx].Prefix, 0, Length(Beams[BestIdx].Prefix))
+  if BeamCount > 0 then
+  begin
+    LP := BeamLen[BestIdx];
+    SetLength(Result, LP);
+    if LP > 0 then
+      Move(CurPref[BestIdx * Stride], Result[0], LP * csIntegerSize);
+  end
   else
     SetLength(Result, 0);
 end;
@@ -3800,6 +3941,13 @@ begin
   if TokenId < 2 then exit(FMachine.IsComplete());
   S := FTokenStr[TokenId];
   if S = '' then exit(false);
+  // Rule #14/#17: FeedChar returns FScratchCount > 0, and the scratch is only
+  // ever written inside its "if ElemMatches(TopPos, C)" branch - so a char no
+  // active stack top matches can NEVER be fed. CharAllowed decides exactly that,
+  // read-only and allocation-free, on FMachine (FProbe would be its clone). The
+  // vast majority of the vocabulary dies on its first character, so this guard
+  // skips the CopyFrom deep copy and the FeedChar advance-buffer work entirely.
+  if not FMachine.CharAllowed(S[1]) then exit(false);
   // Transitive multi-character validation on a forked machine.
   FProbe.CopyFrom(FMachine);
   LenS := Length(S);

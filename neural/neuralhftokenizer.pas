@@ -149,6 +149,13 @@ type
       FMerges: TStringList;       // left#1right -> rank (Objects hold rank)
       FIdToToken: array of string;
       FAddedTokens: array of TNeuralAddedToken;
+      // id -> index into FAddedTokens (-1 = not an added token), sized
+      // MaxAddedId+1. Replaces the per-id linear scan on the detokenize path,
+      // which the chat engine re-runs for the whole sequence per emitted token.
+      // Built lazily (load-time cost only) and invalidated wherever
+      // FAddedTokens is (re)written.
+      FAddedIdToIndex: array of integer;
+      FAddedIdIndexBuilt: boolean;
       // model flags
       FByteFallback, FFuseUnk, FIgnoreMerges: boolean;
       FUnkId, FBosId, FEosId: integer;
@@ -156,6 +163,7 @@ type
       FUnigram: boolean;          // model.type = Unigram
       FUniScore: array of double; // per-id piece log-prob (score), id-indexed
       FUniMinScore: double;       // min vocab score (unk penalty base)
+      FUniMaxPieceChars: integer; // longest vocab piece in codepoints (Viterbi look-back bound)
       // WordPiece (BERT) family
       FWordPiece: boolean;        // model.type = WordPiece
       FWPPrefix: string;          // continuing_subword_prefix ('##')
@@ -263,6 +271,7 @@ type
       function FindAddedToken(const Text: string; Position: integer;
         out TokenIndex: integer): boolean;
       function IsAddedTokenId(Id: integer; out TokenIndex: integer): boolean;
+      procedure BuildAddedIdIndex();
     public
       constructor Create();
       destructor Destroy(); override;
@@ -505,6 +514,21 @@ begin
       Exit(B); // truncated/invalid sequence
     Result := (Result shl 6) or (cardinal(Ord(S[Position])) and $3F);
     Inc(Position);
+  end;
+end;
+
+// Number of Unicode codepoints in S (same segmentation NextCodePoint uses).
+function CodePointCount(const S: string): integer;
+var
+  Position, Len: integer;
+begin
+  Result := 0;
+  Position := 1;
+  Len := Length(S);
+  while Position <= Len do
+  begin
+    NextCodePoint(S, Position);
+    Inc(Result);
   end;
 end;
 
@@ -1145,6 +1169,7 @@ begin
   FMerges.Clear;
   SetLength(FIdToToken, 0);
   SetLength(FAddedTokens, 0);
+  FAddedIdIndexBuilt := false;   // added-token id map must be rebuilt
   SetLength(FNormReplaceFrom, 0);
   SetLength(FNormReplaceTo, 0);
   SetLength(FDecReplaceFrom, 0);
@@ -1154,6 +1179,7 @@ begin
   FFuseUnk := false;
   FIgnoreMerges := false;
   FUnigram := false;
+  FUniMaxPieceChars := 1;
   SetLength(FUniScore, 0);
   FUniMinScore := 0;
   FByteLevel := false;
@@ -1438,7 +1464,7 @@ var
   VocabObj: TJSONObject;
   MergesArr, AddedArr, SubArr, VocabArr: TJSONArray;
   FS: TFileStream;
-  Cnt, TokenId, MaxId: integer;
+  Cnt, TokenId, MaxId, UniCPLen: integer;
   VocabCnt, VocabObjCnt, MergesCnt, AddedCnt: integer;
   VocabCntM1, VocabObjCntM1, AddedCntM1: integer;
   Score: double;
@@ -1831,6 +1857,7 @@ begin
       SetLength(FIdToToken, VocabCnt);
       SetLength(FUniScore, VocabCnt);
       FUniMinScore := 0;
+      FUniMaxPieceChars := 1;
       VocabCntM1 := VocabCnt - 1;
       for Cnt := 0 to VocabCntM1 do
       begin
@@ -1841,6 +1868,8 @@ begin
         FIdToToken[Cnt] := Content;
         FUniScore[Cnt] := Score;
         if (Cnt = 0) or (Score < FUniMinScore) then FUniMinScore := Score;
+        UniCPLen := CodePointCount(Content);
+        if UniCPLen > FUniMaxPieceChars then FUniMaxPieceChars := UniCPLen;
       end;
       // unk_id is an INDEX into the vocab array (not a token string).
       Node := ModelObj.Find('unk_id');
@@ -1912,6 +1941,7 @@ begin
       AddedArr := TJSONArray(Node);
       AddedCnt := AddedArr.Count;
       SetLength(FAddedTokens, AddedCnt);
+      FAddedIdIndexBuilt := false;   // added-token id map must be rebuilt
       AddedCntM1 := AddedCnt - 1;
       for Cnt := 0 to AddedCntM1 do
       begin
@@ -2113,7 +2143,7 @@ var
   PieceCountM1: integer;
   ModelType: integer;           // trainer_spec.model_type (default UNIGRAM)
   SpmUnk, SpmBos, SpmEos: integer;
-  Cnt: integer;
+  Cnt, UniCPLen: integer;
   Score: single;
 
   // Reads a base-128 varint at Pos (0-based into Buf), advances Pos.
@@ -2314,6 +2344,7 @@ begin
   SetLength(FIdToToken, PieceCount);
   SetLength(FUniScore, PieceCount);
   FUniMinScore := 0;
+  FUniMaxPieceChars := 1;
   FByteFallback := false;
   PieceCountM1 := PieceCount - 1;
   for Cnt := 0 to PieceCountM1 do
@@ -2322,6 +2353,8 @@ begin
     FIdToToken[Cnt] := PieceTextV[Cnt];
     if (Cnt = 0) or (FUniScore[Cnt] < FUniMinScore) then
       FUniMinScore := FUniScore[Cnt];
+    UniCPLen := CodePointCount(PieceTextV[Cnt]);
+    if UniCPLen > FUniMaxPieceChars then FUniMaxPieceChars := UniCPLen;
     // SentencePiece BYTE pieces (type 6) are the <0x00>..<0xFF> byte-
     // fallback alphabet. Their presence means byte_fallback=true: unknown
     // bytes route through <0xNN> on encode and those pieces decode back to
@@ -2374,6 +2407,7 @@ begin
   // in the input text and Decode(skip_special_tokens) drops them, matching
   // the tokenizer.json path's added_tokens handling.
   SetLength(FAddedTokens, 0);
+  FAddedIdIndexBuilt := false;   // added-token id map must be rebuilt
   PieceCountM1 := PieceCount - 1;
   for Cnt := 0 to PieceCountM1 do
     if (PieceTypeV[Cnt] = 2) or (PieceTypeV[Cnt] = 3) then // UNKNOWN/CONTROL
@@ -2400,6 +2434,7 @@ var
   TokType: integer;
   Content, MergeStr, Left, Right: string;
   SpacePos: integer;
+  UniCPLen: integer;
   MetaBos, MetaEos, MetaUnk: Int64;
 begin
   ClearState();
@@ -2425,11 +2460,14 @@ begin
 
     // ---- vocab (the 0-based array index IS the id) ----
     SetLength(FIdToToken, TokCount);
+    FUniMaxPieceChars := 1;
     for Cnt := 0 to TokCountM1 do
     begin
       Content := Reader.GetMetaArrayString('tokenizer.ggml.tokens', Cnt);
       FVocab.AddObject(Content, TObject(PtrInt(Cnt)));
       FIdToToken[Cnt] := Content;
+      UniCPLen := CodePointCount(Content);
+      if UniCPLen > FUniMaxPieceChars then FUniMaxPieceChars := UniCPLen;
     end;
 
     // ---- special-token ids (authoritative scalar metadata) ----
@@ -2471,6 +2509,7 @@ begin
 
       // Expose CONTROL / UNKNOWN / USER_DEFINED pieces as added tokens.
       SetLength(FAddedTokens, 0);
+      FAddedIdIndexBuilt := false;   // added-token id map must be rebuilt
       for Cnt := 0 to TokCountM1 do
       begin
         if HasTypes
@@ -2509,6 +2548,7 @@ begin
       // round-trip verbatim (e.g. <|endoftext|>); fall back to id-based
       // special wiring below.
       SetLength(FAddedTokens, 0);
+      FAddedIdIndexBuilt := false;   // added-token id map must be rebuilt
       for Cnt := 0 to TokCountM1 do
       begin
         if HasTypes
@@ -2665,6 +2705,31 @@ begin
   end;
 end;
 
+// Builds the id -> FAddedTokens index map. First match wins, matching the
+// linear scan this replaces. Load-time only: never called from a decode loop
+// after the first lookup (rule #17).
+procedure TNeuralHFTokenizer.BuildAddedIdIndex();
+var
+  Cnt, AddedHi, MaxId, TokId, MapHi: integer;
+begin
+  AddedHi := High(FAddedTokens);
+  MaxId := -1;
+  for Cnt := 0 to AddedHi do
+    if FAddedTokens[Cnt].Id > MaxId then MaxId := FAddedTokens[Cnt].Id;
+  SetLength(FAddedIdToIndex, MaxId + 1);
+  MapHi := MaxId;
+  for Cnt := 0 to MapHi do FAddedIdToIndex[Cnt] := -1;
+  for Cnt := 0 to AddedHi do
+  begin
+    TokId := FAddedTokens[Cnt].Id;
+    // Negative ids (a malformed added_tokens entry) stay out of the map and
+    // fall back to the scan below.
+    if (TokId >= 0) and (FAddedIdToIndex[TokId] < 0) then
+      FAddedIdToIndex[TokId] := Cnt;
+  end;
+  FAddedIdIndexBuilt := true;
+end;
+
 function TNeuralHFTokenizer.IsAddedTokenId(Id: integer;
   out TokenIndex: integer): boolean;
 var
@@ -2672,6 +2737,17 @@ var
 begin
   Result := false;
   TokenIndex := -1;
+  if not FAddedIdIndexBuilt then BuildAddedIdIndex();
+  // O(1) for every non-negative id: the map spans 0..MaxAddedId, so an id past
+  // its end cannot be an added token at all.
+  if Id >= 0 then
+  begin
+    if Id > High(FAddedIdToIndex) then exit(false);
+    TokenIndex := FAddedIdToIndex[Id];
+    if TokenIndex >= 0 then exit(true);
+    exit(false);
+  end;
+  // Negative ids only: keep the original scan (first match wins).
   AddedHi := High(FAddedTokens);
   for Cnt := 0 to AddedHi do
     if FAddedTokens[Cnt].Id = Id then
@@ -3639,7 +3715,7 @@ var
   SegId: array of integer;    // backtracked ids, collected in reverse
   SegStart: array of integer; // backtracked start CHAR index of each segment
   Total, Position, SegCnt, I, J, BestPrev, TokenId: integer;
-  JM1, CPJ, CPI, PieceLen: integer;
+  JM1, CPJ, CPI, PieceLen, IStart: integer;
   BSI: double;
   BestScore: array of double; // best score to reach char-boundary J (0..Total)
   BackPtr: array of integer;  // start char index of the piece ending at J
@@ -3715,7 +3791,13 @@ begin
   begin
     JM1 := J - 1;
     CPJ := CPStart[J]; // #17: invariant across the inner I loop
-    for I := 0 to JM1 do
+    // A span of (J - I) chars longer than the longest vocab piece can never be
+    // found by VocabFind; the only node that fires past that width is the
+    // single-char unk at I = J-1, which stays in range since FUniMaxPieceChars
+    // >= 1. Bounding the look-back turns the DP from O(n^2) into O(n*L).
+    IStart := J - FUniMaxPieceChars;
+    if IStart < 0 then IStart := 0;
+    for I := IStart to JM1 do
     begin
       BSI := BestScore[I]; // #4: bound once per I iteration
       if BSI = NegInfinity then continue;

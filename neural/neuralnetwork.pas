@@ -793,9 +793,10 @@ type
       FAfterWeightUpdateHasBeenCalled:boolean;
       // INT8 QUANTIZED WEIGHT STORAGE (inference-only). When FQuantInt8 is
       // true the FP32 weights have been replaced by per-output-channel
-      // symmetric int8 codes: row r of the weight matrix (= neuron r's
-      // weight vector) is stored as FQuantCodes[r*VS..r*VS+VS-1] with
-      // dequantized value code*FQuantScales[r], scale = max|row|/127.
+      // symmetric int8 codes in FQuantTable, shaped (NumNeurons, 1, VS): row
+      // r of the weight matrix (= neuron r's weight vector) is the table's
+      // row r, with dequantized value code*FQuantTable.Scale[r, 0] and
+      // scale = max|row|/127.
       // The per-neuron FP32 volumes and the concatenated weight cache are
       // shrunk to a single element (the heap is genuinely released), so a
       // quantized layer holds ~1/4 of the FP32 weight bytes. The forward
@@ -806,8 +807,7 @@ type
       // Biases stay FP32. Backpropagation raises - quantized layers are
       // inference-only.
       FQuantInt8: boolean;
-      FQuantCodes: array of ShortInt;
-      FQuantScales: array of TNeuralFloat;
+      FQuantTable: TNNetVolumeQuant8;
       FQuantVectorSize: integer;
       FQuantWSizeX, FQuantWSizeY, FQuantWSizeD: integer;
       // Construction-time int8 arming (see TNNet.BuildQuantInt8): puts the
@@ -836,9 +836,9 @@ type
       // Quantizes ONE weight row straight into the armed int8 container:
       // row NeuronIdx receives codes Round(v*127/max|row|) over the
       // QuantInt8VectorSize elements of Src starting at SrcOffset, and
-      // FQuantScales[NeuronIdx] := pExtraScale*max|row|/127. These are the
-      // same codes QuantizeWeightsInt8 would produce after an FP32 fill of
-      // pExtraScale-scaled rows (a uniform row scale cancels out of the
+      // FQuantTable.Scale[NeuronIdx, 0] := pExtraScale*max|row|/127. These
+      // are the same codes QuantizeWeightsInt8 would produce after an FP32
+      // fill of pExtraScale-scaled rows (a uniform row scale cancels out of the
       // codes), so checkpoint importers can stream rows into a quantized
       // layer without ever restoring FP32 neuron volumes (no
       // DequantizeWeightsInt8/requantize cycle, no full-tensor FP32 spike).
@@ -878,8 +878,8 @@ type
       property QuantInt8VectorSize: integer read FQuantVectorSize;
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
-      // Interleaves FQuantCodes into the device layout and arms FDotCL's
-      // resident int8 mode (cai_dot_product_int8) against VBs.
+      // Interleaves FQuantTable's codes into the device layout and arms
+      // FDotCL's resident int8 mode (cai_dot_product_int8) against VBs.
       // Coded by Claude (AI).
       procedure PrepareInt8DotCL(VBs: TNNetVolume);
       {$ENDIF}
@@ -3614,6 +3614,18 @@ type
   TNNetFourierMix = class(TNNetIdentity)
   protected
     FGradVol: TNNetVolume; // persistent, lazily-sized backprop DFT scratch (rule #17)
+    // Persistent, lazily-sized DFT scratch and twiddle tables (rule #17): built
+    // once per (SeqLen, Depth) shape, never allocated per call.
+    FDirCacheL, FDirCacheD: integer;
+    FTwCosL, FTwSinL: array of Double;  // fundamental cos/sin(2*pi*t/L), t=0..L-1
+    FTwCosD, FTwSinD: array of Double;  // fundamental cos/sin(2*pi*t/D), t=0..D-1
+    FCosA, FSinA: array of Double;      // one sequence-axis row (length L)
+    FCrT, FCiT: array of Double;        // hidden-axis partial sums, [b*L + s]
+    FFFTCacheL, FFFTCacheD: integer;
+    FFFTRe, FFFTIm: array of array of Double; // [s][h] after hidden-axis FFT
+    FFFTColRe, FFFTColIm: array of Double;    // one sequence-axis column
+    procedure EnsureDirectBuffers(L, D: integer);
+    procedure EnsureFFTBuffers(L, D: integer);
     procedure ApplyRealDFT(Src, Dst: TNNetVolume);
     procedure ApplyRealDFTDirect(Src, Dst: TNNetVolume);
     procedure ApplyRealDFTFFT(Src, Dst: TNNetVolume);
@@ -3813,10 +3825,14 @@ type
     // dequantized to memory. Quantization is lossy, so the logits are
     // NOT bit-exact vs the FP32 cache (see EnableInt8KV's tolerance note).
     FKVQuantInt8: boolean;
-    FKCacheCodes: array of ShortInt;     // [MaxContext * d_k] quantized keys
-    FVCacheCodes: array of ShortInt;     // [MaxContext * d_k] quantized values
-    FKCacheScale: array of TNeuralFloat; // [MaxContext] per-row key scale
-    FVCacheScale: array of TNeuralFloat; // [MaxContext] per-row value scale
+    // (MaxContext, KVHeads, d_k): X is the cached position, Y the KV head and
+    // Depth the quantized vector, so slot s = head*MaxContext + position owns
+    // codes at s*d_k and scale (position, head). This layer has one head, so
+    // SizeY is 1 and the slot is just the position; TNNetFusedSDPA reuses the
+    // very same containers with SizeY = KVHeads, which is exactly the
+    // head-major plane layout its append and decode loops already assume.
+    FKCacheQ: TNNetVolumeQuant8;
+    FVCacheQ: TNNetVolumeQuant8;
     // --- StreamingLLM attention-sink + rolling-window eviction (opt-in) ---
     // FEvictSinks = 0 (default) => eviction OFF, the cache grows to MaxContext
     // and overflowing it is an error (the original unbounded behavior). When
@@ -3883,10 +3899,10 @@ type
     // Coded by Claude (AI).
     function ScoreIsMasked(i, j: integer; HasSeg: boolean; Seg: TNNetVolume;
       SegI: integer): boolean;
-    // Quantize Src[0..d_k-1] into the int8 cache row Slot (Codes/Scale arrays).
+    // Quantize Src[0..d_k-1] into int8 cache row Slot of Dst, where Slot is
+    // the flat (position, head) row index head*MaxContext + position.
     procedure QuantizeCacheRow(Src: TNeuralFloatArrPtr;
-      var Codes: array of ShortInt; var Scale: array of TNeuralFloat;
-      Slot: integer);
+      Dst: TNNetVolumeQuant8; Slot: integer);
     procedure ComputeIncremental();
     // FlashAttention-1 tiled online-softmax forward (opt-in, forward-only).
     // Returns true if it handled the forward; false to fall back to the naive
@@ -5630,6 +5646,8 @@ type
       // Compute scratch: per-half top-K indices (TopK) + candidate buffers (TopK*TopK).
       FSelABuf, FSelBBuf, FCandABuf, FCandBBuf: array of integer;
       FCandScoreBuf: array of TNeuralFloat;
+      // Top-K selection "already taken" marks (HalfKeys), reused per call.
+      FTopKUsed: array of boolean;
       // Backpropagate scratch (TopK): g_k and softmax-Jacobian score gradient.
       FGBuf, FdScoreBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -7161,14 +7179,17 @@ type
     // whole table in FNeurons[0].Weights (VocabSize rows of EmbeddingSize),
     // outside the TNNetLayerConcatedWeights storage the conv/FC int8 path
     // uses - so it carries its own container with the SAME convention:
-    // vocab row t is FQuantCodes[t*EmbeddingSize..] with dequantized value
-    // code*FQuantScales[t], scale = max|row|/127 (symmetric, round-to-
-    // nearest). The forward gather dequantizes the looked-up row directly
-    // into the output (the FP32 table is never rebuilt), cutting the
+    // vocab row t holds codes with dequantized value code*Scale[t,0],
+    // scale = max|row|/127 (symmetric, round-to-nearest). FQuantTable is
+    // shaped (VocabSize, 1, EmbeddingSize) - the row index on X, as
+    // everywhere else - so row t starts at t*EmbeddingSize and owns scale
+    // (t,0), the same linear layout the two raw arrays had. It mirrors the
+    // FP32 table's own (VocabSize, 1, EmbeddingSize) shape. The forward
+    // gather dequantizes the looked-up row
+    // directly into the output (the FP32 table is never rebuilt), cutting the
     // table's memory AND per-token bandwidth to ~1/4. Backpropagate raises.
     FQuantInt8: boolean;
-    FQuantCodes: array of ShortInt;
-    FQuantScales: array of TNeuralFloat;
+    FQuantTable: TNNetVolumeQuant8;
     {$IFDEF OpenCL}
     FTokenRows: array of integer;
     FEmbeddingCL: TNNetEmbeddingCL;
@@ -7212,7 +7233,7 @@ type
     procedure DequantizeWeightsInt8(); virtual;
     // Quantizes ONE vocab row straight into the int8 container: row RowIdx
     // receives codes Round(v*127/max|row|) over the EmbeddingSize elements
-    // of Src starting at SrcOffset, and FQuantScales[RowIdx] :=
+    // of Src starting at SrcOffset, and the row's scale :=
     // pExtraScale*max|row|/127 - the same codes QuantizeWeightsInt8 would
     // produce after an FP32 fill of pExtraScale-scaled rows (a uniform row
     // scale cancels), so checkpoint importers can stream the vocab table
@@ -9131,7 +9152,17 @@ type
       FWindow: TNNetVolume;   // Hamming window, (KernelSize,1,1)
       FGradS: TNNetVolume;    // (NumFilters,1,2) scalar grad accumulator
       FGBank: TNNetVolume;    // persistent per-tap kernel-grad scratch (KernelSize,1,NumFilters)
+      // Snapshot of the (NumFilters,1,2) (low,band) scalars FBank was built from.
+      // The bank is a pure function of them, so the forward only has to
+      // rematerialize when one of them differs: 2*NumFilters compares instead of
+      // 2*NumFilters*KernelSize transcendentals per call. Comparing the VALUES
+      // (rather than trusting an AfterWeightUpdate dirty flag) keeps the bank
+      // correct no matter which path wrote the weights - training, a loader, or
+      // a direct Neurons[0].Weights write from outside the layer.
+      FBankSrc: TNNetVolume;
+      FBankValid: boolean;    // false until FBank/FBankSrc have been built once
       procedure MaterializeBank();
+      procedure MaterializeBankIfStale();
     public
       constructor Create(pNumFilters, pKernelSize: integer; pStride: integer = 1;
         pSampleRate: TNeuralFloat = 16000); reintroduce; overload;
@@ -20862,7 +20893,7 @@ procedure RebuildNeuronListOnPreviousPatterns
   Threshold: TNeuralFloat = 0.5
 );
 var
-  LpBnd1: integer;
+  MaxCurrentLayerNeuronPos: integer;
   NeuronCnt: integer;
 begin
   if CurrentLayer.Count <> CalculatedLayer.Count then
@@ -20874,8 +20905,8 @@ begin
     exit;
   end;
 
-  LpBnd1 := CurrentLayer.Count - 1;
-  for NeuronCnt := 0 to LpBnd1 do
+  MaxCurrentLayerNeuronPos := CurrentLayer.Count - 1;
+  for NeuronCnt := 0 to MaxCurrentLayerNeuronPos do
   begin
     RebuildPatternOnPreviousPatterns
     (
@@ -22074,8 +22105,8 @@ end;
 
 procedure TNNetMaxPoolWithPosition.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  LpBnd2: integer;
-  LpBnd3: integer;
+  MaxPrevOutputX: integer;
+  MaxPrevOutputY: integer;
   CntSizeX, CntSizeY: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -22087,13 +22118,13 @@ begin
     SetLength(FMaxPosY, FOutput.Size);
     SetLength(FPosX, FPrevLayer.Output.SizeX);
     SetLength(FPosY, FPrevLayer.Output.SizeY);
-    LpBnd2 := FPrevLayer.Output.SizeX - 1;
-    for CntSizeX := 0 to LpBnd2 do
+    MaxPrevOutputX := FPrevLayer.Output.SizeX - 1;
+    for CntSizeX := 0 to MaxPrevOutputX do
     begin
       FPosX[CntSizeX] := CntSizeX/FPrevLayer.Output.SizeX;
     end;
-    LpBnd3 := FPrevLayer.Output.SizeY - 1;
-    for CntSizeY := 0 to LpBnd3 do
+    MaxPrevOutputY := FPrevLayer.Output.SizeY - 1;
+    for CntSizeY := 0 to MaxPrevOutputY do
     begin
       FPosY[CntSizeY] := CntSizeY/FPrevLayer.Output.SizeY;
     end;
@@ -22791,7 +22822,7 @@ end;
 
 procedure TNNetSwishLearnable.Backpropagate();
 var
-  LpBnd4: integer;
+  MaxOutputErrorPos: integer;
   PropagatesErr: boolean;
   StartTime: double;
   localNeuron: TNNetNeuron;
@@ -22811,13 +22842,13 @@ begin
   // Fused with the input-gradient pass (#4): sig is computed once per element and
   // reused for both the gradBeta accumulation and (when PropagatesErr) PrevErr.
   gradBeta := 0;
-  LpBnd4 := FOutputError.Size - 1;
+  MaxOutputErrorPos := FOutputError.Size - 1;
   PropagatesErr := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
   PrevErr := nil;
   if PropagatesErr then
     PrevErr := FPrevLayer.FOutputError;  // #9: bind the invariant chain once
-  for i := 0 to LpBnd4 do
+  for i := 0 to MaxOutputErrorPos do
   begin
     x := LocalPrevOutput.Raw[i];
     betaX := beta * x;
@@ -22943,7 +22974,7 @@ end;
 
 procedure TNNetMishLearnable.Backpropagate();
 var
-  LpBnd6: integer;
+  MaxOutputErrorPos: integer;
   PropagatesErr: boolean;
   StartTime: double;
   localNeuron: TNNetNeuron;
@@ -22964,13 +22995,13 @@ begin
   // computed once per element and reused for both the gradAlpha accumulation and
   // (when PropagatesErr) the PrevErr write.
   gradAlpha := 0;
-  LpBnd6 := FOutputError.Size - 1;
+  MaxOutputErrorPos := FOutputError.Size - 1;
   PropagatesErr := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
   PrevErr := nil;
   if PropagatesErr then
     PrevErr := FPrevLayer.FOutputError;  // #9: bind the invariant chain once
-  for i := 0 to LpBnd6 do
+  for i := 0 to MaxOutputErrorPos do
   begin
     x := LocalPrevOutput.Raw[i];
     ax := alpha * x;
@@ -24578,14 +24609,20 @@ procedure TNNetReGLU.Compute();
 var
   StartTime: double;
   MaxX, MaxY, MaxD: integer;
-  X, Y, D, HalfDepth, basePrev, basePrev0, baseOut0: integer;
+  X, Y, HalfDepth: integer;
+{$IFNDEF AVXANY}
+  D, basePrev, basePrev0, baseOut0: integer;
   a, b, reluA: TNeuralFloat;
+{$ELSE}
+  aPtr, bPtr, outPtr: TNeuralFloatArrPtr;
+{$ENDIF}
 begin
   StartTime := Now();
   HalfDepth := FOutput.Depth;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := HalfDepth - 1;
+  {$IFNDEF AVXANY}
   for X := 0 to MaxX do
     for Y := 0 to MaxY do
     begin
@@ -24600,6 +24637,22 @@ begin
         FOutput.FData[baseOut0 + D] := reluA * b;
       end;
     end;
+  {$ELSE}
+  // ReGLU = ReLU(A)*B. The A (offset 0) and B (offset HalfDepth) depth-halves
+  // are each a contiguous depth-axis run, so the relu ride is AVX-vectorized
+  // via TNNetVolume.VectorRelu: write ReLU(A) into the output row, then an AVX
+  // elementwise Mul folds in B. Bit-exact (relu is a compare-and-select).
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      aPtr := FPrevLayer.FOutput.GetRawPtr(X, Y);
+      // #13: b-half is a's constant-offset neighbour (+HalfDepth), no 2nd accessor
+      bPtr := TNeuralFloatArrPtr(@aPtr^[HalfDepth]);
+      outPtr := FOutput.GetRawPtr(X, Y);
+      TNNetVolume.VectorRelu(outPtr, aPtr, HalfDepth); // out := ReLU(A)
+      TNNetVolume.Mul(outPtr, bPtr, HalfDepth);        // out := ReLU(A) * B
+    end;
+  {$ENDIF}
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -24865,14 +24918,20 @@ procedure TNNetReGLUSquared.Compute();
 var
   StartTime: double;
   MaxX, MaxY, MaxD: integer;
-  X, Y, D, HalfDepth, basePrev, basePrev0, baseOut0: integer;
+  X, Y, HalfDepth: integer;
+{$IFNDEF AVXANY}
+  D, basePrev, basePrev0, baseOut0: integer;
   a, b, reluB: TNeuralFloat;
+{$ELSE}
+  aPtr, bPtr, outPtr: TNeuralFloatArrPtr;
+{$ENDIF}
 begin
   StartTime := Now();
   HalfDepth := FOutput.Depth;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := HalfDepth - 1;
+  {$IFNDEF AVXANY}
   for X := 0 to MaxX do
     for Y := 0 to MaxY do
     begin
@@ -24887,6 +24946,24 @@ begin
         FOutput.FData[baseOut0 + D] := a * reluB * reluB;
       end;
     end;
+  {$ELSE}
+  // ReGLUSquared = A*ReLU(B)^2. The A (offset 0) and B (offset HalfDepth)
+  // depth-halves are each a contiguous depth-axis run, so the row is three AVX
+  // passes: ReLU(B) into the output via VectorRelu, an in-place elementwise
+  // square, then an elementwise Mul by A. The products are re-associated as
+  // A*(r*r) instead of (A*r)*r, so this is equivalent but not bit-identical.
+  for X := 0 to MaxX do
+    for Y := 0 to MaxY do
+    begin
+      aPtr := FPrevLayer.FOutput.GetRawPtr(X, Y);
+      // #13: b-half is a's constant-offset neighbour (+HalfDepth), no 2nd accessor
+      bPtr := TNeuralFloatArrPtr(@aPtr^[HalfDepth]);
+      outPtr := FOutput.GetRawPtr(X, Y);
+      TNNetVolume.VectorRelu(outPtr, bPtr, HalfDepth); // out := ReLU(B)
+      TNNetVolume.Mul(outPtr, outPtr, HalfDepth);      // out := ReLU(B)^2
+      TNNetVolume.Mul(outPtr, aPtr, HalfDepth);        // out := A * ReLU(B)^2
+    end;
+  {$ENDIF}
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -26163,12 +26240,11 @@ const
   cCTCUnalignable = 1e30; // returned when L*2+1 > T (target cannot be aligned)
   cNegInf = -1e30;
 var
-  NT, Vocab, L, NS, NTM1, NSM1, VocabM1, LM1, ti, si, i, k: integer;
-  NTM2: integer;
+  NT, L, NS, NTM1, NSM1, VocabM1, LM1, ti, si, i: integer;
+  NTM2, GradBase, GradIdx: integer;
   Ext: array of integer;          // extended label l' (blank-interleaved), length NS
   Alpha, Beta: array of array of double; // [ti][si] log-space lattice
-  LogLike, av, bv, occ, lse: double;
-  Gamma: array of array of double; // [ti][si] = exp(alpha+beta-LogLike)
+  LogLike, av, bv, occ: double;
   function LP(volume: TNNetVolume; tt, kk: integer): double; inline;
   begin
     Result := volume[tt, 0, kk];
@@ -26182,10 +26258,8 @@ var
   end;
 begin
   NT := ALogProbs.SizeX;
-  Vocab := ALogProbs.Depth;
   L := Length(Labels);
   NTM1 := NT - 1;
-  VocabM1 := Vocab - 1;
   LM1 := L - 1;
   if Assigned(AGrad) then
   begin
@@ -26207,6 +26281,15 @@ begin
     Ext[2 * i + 1] := Labels[i];
   end;
   Ext[NS - 1] := Blank;
+  // Clamp the symbol ids into the vocabulary once, so both the lattice reads
+  // (LP indexes by Ext[si]) and the gradient scatter below stay in bounds
+  // without a per-element range test.
+  VocabM1 := ALogProbs.Depth - 1;
+  for i := 0 to NSM1 do
+  begin
+    if Ext[i] < 0 then Ext[i] := 0
+    else if Ext[i] > VocabM1 then Ext[i] := VocabM1;
+  end;
 
   SetLength(Alpha, NT, NS);
   SetLength(Beta, NT, NS);
@@ -26257,24 +26340,24 @@ begin
   if LogLike <= cNegInf then Exit; // degenerate, leave grad at zero
 
   // Posterior occupancy gamma[ti][si] = exp(alpha+beta-LogLike); per symbol k,
-  // dL/d(logp_{ti,k}) = -sum_{si: Ext[si]=k} gamma[ti][si].
-  SetLength(Gamma, NT, NS);
+  // dL/d(logp_{ti,k}) = -sum_{si: Ext[si]=k} gamma[ti][si]. Scatter each
+  // occupancy straight into its own symbol slot instead of scanning the whole
+  // vocabulary per frame: AGrad was zero-filled above, so a symbol that never
+  // appears in Ext keeps the 0 the empty sum would have produced, and the
+  // ascending-si accumulation order is unchanged. O(NT*NS), not O(NT*Vocab*NS).
   for ti := 0 to NTM1 do
+  begin
+    GradBase := AGrad.GetRawPos(ti, 0);
     for si := 0 to NSM1 do
     begin
       occ := Alpha[ti][si] + Beta[ti][si] - LogLike;
-      if occ <= cNegInf then Gamma[ti][si] := 0
-      else Gamma[ti][si] := NeuralExp(occ);
+      if occ > cNegInf then
+      begin
+        GradIdx := GradBase + Ext[si];
+        AGrad.FData[GradIdx] := AGrad.FData[GradIdx] - NeuralExp(occ);
+      end;
     end;
-
-  for ti := 0 to NTM1 do
-    for k := 0 to VocabM1 do
-    begin
-      lse := 0;
-      for si := 0 to NSM1 do
-        if Ext[si] = k then lse := lse + Gamma[ti][si];
-      AGrad[ti, 0, k] := -lse;
-    end;
+  end;
 end;
 
 procedure TNNetCTCLoss.Backpropagate();
@@ -27928,13 +28011,20 @@ end;
 procedure TNNetLookupFreeQuant.ComputeEntropyTerms();
 var
   DM1, X, Y, MaxX, MaxY, I, NPos, basePrev0: integer;
-  Z, DNeg, DPos, M, ENeg, EPos, S, PNeg, PPos, H, Acc: TNeuralFloat;
+  Z, E, PNeg, PPos, H, Acc, FourT: TNeuralFloat;
 const
   cEps = 1e-12;
 begin
   // Factorized binary entropy_aux_loss (lucidrains LFQ). Per channel, per
   // spatial position the soft assignment to {-1,+1} is
   //   logits = -t*[(z+1)^2, (z-1)^2];  p = softmax(logits).
+  // #14: a 2-logit softmax is a sigmoid. The logit gap collapses to
+  //   d(+1) - d(-1) = -t*[(z-1)^2 - (z+1)^2] = 4*t*z,
+  // so p(+1) = 1/(1 + exp(-4*t*z)) - one exp and one divide instead of a max,
+  // two exps and two divides. The exponent is taken on the sign of z so its
+  // argument is never positive (the role the max played) and the small
+  // probability is formed as E*P, never as 1-P, keeping both tails accurate.
+  FourT := 4 * FInvTemp;
   DM1 := FNumCh - 1;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
@@ -27949,15 +28039,18 @@ begin
       for I := 0 to DM1 do
       begin
         Z := FPrevLayer.FOutput.FData[basePrev0 + I];
-        DNeg := -FInvTemp * (Z + 1) * (Z + 1); // logit for level -1
-        DPos := -FInvTemp * (Z - 1) * (Z - 1); // logit for level +1
-        // numerically-stable softmax over the 2 logits
-        if DNeg > DPos then M := DNeg else M := DPos;
-        ENeg := NeuralExp(DNeg - M);
-        EPos := NeuralExp(DPos - M);
-        S := ENeg + EPos;
-        PNeg := ENeg / S;
-        PPos := EPos / S;
+        if Z >= 0 then
+        begin
+          E := NeuralExp(-FourT * Z);  // <= 1
+          PPos := 1.0 / (1.0 + E);
+          PNeg := E * PPos;
+        end
+        else
+        begin
+          E := NeuralExp(FourT * Z);   // <= 1
+          PNeg := 1.0 / (1.0 + E);
+          PPos := E * PNeg;
+        end;
         // per-sample entropy H(p) = -sum p*ln(p)
         H := 0;
         if PNeg > cEps then H := H - PNeg * pcr_logf(PNeg); // #16 (metric only)
@@ -29742,6 +29835,10 @@ begin
   inherited Create();
   if pUseFFT <> 0 then FStruct[0] := 1 else FStruct[0] := 0;
   FGradVol := TNNetVolume.Create();
+  FDirCacheL := -1;
+  FDirCacheD := -1;
+  FFFTCacheL := -1;
+  FFFTCacheD := -1;
 end;
 
 destructor TNNetFourierMix.Destroy();
@@ -29773,38 +29870,116 @@ begin
       '. Disable UseFFT for the direct O(n^2) path.');
 end;
 
-// Direct O(n^2) real 2D-DFT operator, valid for arbitrary L and D:
+// Lazily (re)builds the direct-path twiddle tables and separable intermediates
+// for an (L x D) transform. These are persistent layer fields resized only when
+// the shape changes (rule #17), so the compute path never allocates once warm.
+procedure TNNetFourierMix.EnsureDirectBuffers(L, D: integer);
+var
+  t, LM1, DM1: integer;
+  Step, Ang: Double;
+begin
+  if (L = FDirCacheL) and (D = FDirCacheD) then exit;
+  LM1 := L - 1;
+  DM1 := D - 1;
+  SetLength(FTwCosL, L);
+  SetLength(FTwSinL, L);
+  SetLength(FTwCosD, D);
+  SetLength(FTwSinD, D);
+  SetLength(FCosA, L);
+  SetLength(FSinA, L);
+  SetLength(FCrT, L * D);
+  SetLength(FCiT, L * D);
+  // cos/sin(2*pi*a*s/L) depends only on (a*s) mod L, so ONE fundamental L-entry
+  // table serves every (a,s) pair -- no (L x L) product table, no modulo, and
+  // L instead of L*L RTL Cos/Sin calls. Same for the hidden axis with D.
+  Step := 2 * Pi / L;
+  for t := 0 to LM1 do
+  begin
+    Ang := Step * t;
+    FTwCosL[t] := Cos(Ang);
+    FTwSinL[t] := Sin(Ang);
+  end;
+  Step := 2 * Pi / D;
+  for t := 0 to DM1 do
+  begin
+    Ang := Step * t;
+    FTwCosD[t] := Cos(Ang);
+    FTwSinD[t] := Sin(Ang);
+  end;
+  FDirCacheL := L;
+  FDirCacheD := D;
+end;
+
+// Direct real 2D-DFT operator, valid for arbitrary L and D:
 //   Dst[a,b] = sum_{s,h} Src[s,h] * cos( 2*pi*(a*s/L + b*h/D) )
 // This is both the forward map (FNet Re(DFT)) AND its own adjoint, so the same
 // routine serves Compute (Src=input) and Backpropagate (Src=dL/dy).
+//
+// The naive quadruple nest is O(L^2*D^2) with an RTL Cos per innermost step.
+// Because cos(A+B) = cos A cos B - sin A sin B, the transform is SEPARABLE:
+//   Cr[s,b] = sum_h x[s,h]*cos(2*pi*b*h/D)   Ci[s,b] = sum_h x[s,h]*sin(2*pi*b*h/D)
+//   Dst[a,b] = sum_s ( cos(2*pi*a*s/L)*Cr[s,b] - sin(2*pi*a*s/L)*Ci[s,b] )
+// which costs O(L*D^2 + L^2*D). Both stages read a fundamental twiddle table
+// with a carried index, so no Cos/Sin call remains on the compute path at all.
 procedure TNNetFourierMix.ApplyRealDFTDirect(Src, Dst: TNNetVolume);
 var
-  L, D, LM1, DM1, a, b, s, h, sD, aD: integer;
-  Acc, TwoPi, AngS, bStep, aStep: Double;
+  L, D, LM1, DM1, a, b, s, h, sD, aD, bL, pos, idx: integer;
+  Cr, Ci, Acc, V: Double;
 begin
   L := Src.SizeX;
   D := Src.Depth;
   LM1 := L - 1;
   DM1 := D - 1;
-  TwoPi := 2 * Pi;
+  EnsureDirectBuffers(L, D);
+  // ---- Stage 1: hidden axis, O(L*D^2). Cr/Ci are stored TRANSPOSED as
+  // [b*L + s] so stage 2's s-loop walks them contiguously.
+  for s := 0 to LM1 do
+  begin
+    sD := s * D;   // #11: s*D is invariant across the b and h loops
+    pos := s;      // #6: carries b*L + s; one L-step per b
+    for b := 0 to DM1 do
+    begin
+      Cr := 0;
+      Ci := 0;
+      // idx carries (b*h) mod D. The step is b <= D-1 and idx < D before each
+      // step, so idx + b < 2*D and a single conditional subtract reduces it.
+      idx := 0;
+      for h := 0 to DM1 do
+      begin
+        V := Src.FData[sD + h];
+        Cr := Cr + V * FTwCosD[idx];
+        Ci := Ci + V * FTwSinD[idx];
+        Inc(idx, b);
+        if idx >= D then Dec(idx, D);
+      end;
+      FCrT[pos] := Cr;
+      FCiT[pos] := Ci;
+      Inc(pos, L);
+    end;
+  end;
+  // ---- Stage 2: sequence axis, O(L^2*D).
   for a := 0 to LM1 do
   begin
-    // #11: TwoPi*(a*s)/L = (TwoPi*a/L)*s and a*D are a-only, invariant across b.
-    aStep := TwoPi * a / L;
+    // The a-th row of sequence-axis twiddles is invariant across b (#11), so
+    // build it once per a; idx carries (a*s) mod L with the same reduction
+    // argument (step a <= L-1, idx < L before each step).
+    idx := 0;
+    for s := 0 to LM1 do
+    begin
+      FCosA[s] := FTwCosL[idx];
+      FSinA[s] := FTwSinL[idx];
+      Inc(idx, a);
+      if idx >= L then Dec(idx, L);
+    end;
     aD := a * D;
+    bL := 0;   // #6: carries b*L, the base of Cr/Ci row b
     for b := 0 to DM1 do
     begin
       Acc := 0;
-      // #5: TwoPi*(b*h)/D = (TwoPi*b/D)*h; hoist the b-only factor out of the h loop.
-      bStep := TwoPi * b / D;
       for s := 0 to LM1 do
-      begin
-        AngS := aStep * s;
-        sD := s * D;   // #11: s*D is invariant across the h loop
-        for h := 0 to DM1 do
-          Acc := Acc + Src.FData[sD + h] * Cos(AngS + bStep * h);
-      end;
+        Acc := Acc + FCosA[s] * FCrT[bL + s] - FSinA[s] * FCiT[bL + s];
       Dst.FData[aD + b] := Acc;
+      Inc(bL, L);
     end;
   end;
 end;
@@ -29812,6 +29987,17 @@ end;
 // FFT fast path: a separable 2D FFT. We FFT along the hidden axis (length D),
 // then along the sequence axis (length L), and keep the real part. The result
 // equals Re(DFT_seq(DFT_hidden(x))) exactly. Both axes must be powers of two.
+procedure TNNetFourierMix.EnsureFFTBuffers(L, D: integer);
+begin
+  if (L = FFFTCacheL) and (D = FFFTCacheD) then exit;
+  SetLength(FFFTRe, L, D);
+  SetLength(FFFTIm, L, D);
+  SetLength(FFFTColRe, L);
+  SetLength(FFFTColIm, L);
+  FFFTCacheL := L;
+  FFFTCacheD := D;
+end;
+
 procedure TNNetFourierMix.ApplyRealDFTFFT(Src, Dst: TNNetVolume);
 var
   L, D, LM1, DM1, s, h, sD, pos: integer;
@@ -29823,8 +30009,10 @@ begin
   D := Src.Depth;
   LM1 := L - 1;
   DM1 := D - 1;
-  SetLength(reRows, L, D);
-  SetLength(imRows, L, D);
+  // Persistent, lazily-sized layer fields (rule #17) -- not a per-call SetLength.
+  EnsureFFTBuffers(L, D);
+  reRows := FFFTRe;
+  imRows := FFFTIm;
   // FFT each row across the hidden (depth) axis.
   for s := 0 to LM1 do
   begin
@@ -29839,8 +30027,8 @@ begin
     FourierMixFFT(rowRe, rowIm, D, false);
   end;
   // FFT each column across the sequence axis, keep real part.
-  SetLength(colRe, L);
-  SetLength(colIm, L);
+  colRe := FFFTColRe;
+  colIm := FFFTColIm;
   for h := 0 to DM1 do
   begin
     for s := 0 to LM1 do
@@ -29861,7 +30049,7 @@ end;
 procedure TNNetFourierMix.ApplyRealDFT(Src, Dst: TNNetVolume);
 {$IFDEF Debug}
 var
-  LpBnd8: integer;
+  MaxDstPos: integer;
   RefVol: TNNetVolume;
   i: integer;
   MaxDiff, Diff: Double;
@@ -29876,8 +30064,8 @@ begin
     try
       ApplyRealDFTDirect(Src, RefVol);
       MaxDiff := 0;
-      LpBnd8 := Dst.Size - 1;
-      for i := 0 to LpBnd8 do
+      MaxDstPos := Dst.Size - 1;
+      for i := 0 to MaxDstPos do
       begin
         Diff := Abs(Dst.FData[i] - RefVol.FData[i]);
         if Diff > MaxDiff then MaxDiff := Diff;
@@ -29988,7 +30176,7 @@ var
   CntE, MaxE, ArgMin, ArgMax: integer;
   CntD, Depth, DepthM1, Pos, NumPos, NumPosM1, Idx: integer;
   LocalPrevOutput: TNNetVolume;
-  MinV, MaxV, Denom, Eps, Xv: TNeuralFloat;
+  MinV, MaxV, Denom, InvDenom, Eps, Xv: TNeuralFloat;
 begin
   StartTime := Now();
   LocalPrevOutput := FPrevLayer.FOutput;
@@ -30023,10 +30211,14 @@ begin
       Denom := (MaxV - MinV) + Eps;
       FDenoms.FData[CntD] := Denom;
       FMaxVals.FData[CntD] := MaxV;
+      // #5: 1/Denom is loop-invariant (the backward already carries InvDenom);
+      // #6: carry Pos*Depth+CntD instead of re-multiplying it every position.
+      InvDenom := 1.0 / Denom;
+      Idx := CntD;
       for Pos := 0 to NumPosM1 do
       begin
-        Idx := Pos * Depth + CntD;
-        FOutput.FData[Idx] := (LocalPrevOutput.FData[Idx] - MinV) / Denom;
+        FOutput.FData[Idx] := (LocalPrevOutput.FData[Idx] - MinV) * InvDenom;
+        Inc(Idx, Depth);
       end;
     end;
     FForwardTime := FForwardTime + (Now() - StartTime);
@@ -30100,9 +30292,9 @@ begin
         ArgMax := Round(FArgMax.FData[CntD]);
         DotGY := 0;
         ArgMinExtra := 0;
+        Idx := CntD; // #6: carry Pos*Depth+CntD as a running offset
         for Pos := 0 to NumPosM1 do
         begin
-          Idx := Pos * Depth + CntD;
           Gi := FOutputError.FData[Idx];
           Yi := FOutput.FData[Idx];
           DotGY := DotGY + Gi * Yi;
@@ -30110,6 +30302,7 @@ begin
           ArgMinExtra := ArgMinExtra + Gi * (Yi - 1.0) * Denom;
           FPrevLayer.OutputError.FData[Idx] :=
             FPrevLayer.OutputError.FData[Idx] + Gi * InvDenom;
+          Inc(Idx, Depth);
         end;
         FPrevLayer.OutputError.FData[ArgMax] :=
           FPrevLayer.OutputError.FData[ArgMax] - InvDenom * DotGY;
@@ -30359,6 +30552,8 @@ constructor TNNetScaledDotProductAttention.Create(d_k: integer; CausalMask: bool
   pSegmentSource: TNNetLayer);
 begin
   inherited Create();
+  FKCacheQ := TNNetVolumeQuant8.Create();
+  FVCacheQ := TNNetVolumeQuant8.Create();
   FDk := d_k;
   FCausal := CausalMask;
   FWindow := pWindow;
@@ -30412,6 +30607,8 @@ end;
 
 destructor TNNetScaledDotProductAttention.Destroy();
 begin
+  FKCacheQ.Free;
+  FVCacheQ.Free;
   FKCache.Free;
   FVCache.Free;
   FAttn.Free;
@@ -30466,22 +30663,18 @@ begin
   begin
     FKCache.ReSize(1, 1, 1);
     FVCache.ReSize(1, 1, 1);
-    SetLength(FKCacheCodes, MaxContext * FDk);
-    SetLength(FVCacheCodes, MaxContext * FDk);
-    SetLength(FKCacheScale, MaxContext);
-    SetLength(FVCacheScale, MaxContext);
+    FKCacheQ.ReSize(MaxContext, 1, FDk);
+    FVCacheQ.ReSize(MaxContext, 1, FDk);
   end
   else
   begin
     FKCache.ReSize(MaxContext, 1, FDk);
     FVCache.ReSize(MaxContext, 1, FDk);
-    // Drop any code arrays left over from a previous int8 session
-    // (EnableInt8KV reallocates them). The int8 read path needs no scratch:
-    // the fused kernels stream the codes directly.
-    SetLength(FKCacheCodes, 0);
-    SetLength(FVCacheCodes, 0);
-    SetLength(FKCacheScale, 0);
-    SetLength(FVCacheScale, 0);
+    // Drop any codes left over from a previous int8 session (EnableInt8KV
+    // reallocates them). The int8 read path needs no scratch: the fused
+    // kernels stream the codes directly.
+    FKCacheQ.ReSize(0, 0, 0);
+    FVCacheQ.ReSize(0, 0, 0);
   end;
   SetLength(FCacheScores, MaxContext);
   FCacheMax := MaxContext;
@@ -30503,10 +30696,8 @@ begin
   FEvictSinks := 0;
   FEvictWindow := 0;
   FKVQuantInt8 := false;
-  SetLength(FKCacheCodes, 0);
-  SetLength(FVCacheCodes, 0);
-  SetLength(FKCacheScale, 0);
-  SetLength(FVCacheScale, 0);
+  FKCacheQ.ReSize(0, 0, 0);
+  FVCacheQ.ReSize(0, 0, 0);
 end;
 
 procedure TNNetScaledDotProductAttention.ResetCache();
@@ -30599,11 +30790,9 @@ begin
       'CacheLength=' + IntToStr(FCacheLen));
     exit;
   end;
-  // Allocate the int8 code + per-row scale arrays once (MaxContext rows).
-  SetLength(FKCacheCodes, FCacheMax * FDk);
-  SetLength(FVCacheCodes, FCacheMax * FDk);
-  SetLength(FKCacheScale, FCacheMax);
-  SetLength(FVCacheScale, FCacheMax);
+  // Allocate the int8 codes + per-row scales once (MaxContext rows).
+  FKCacheQ.ReSize(FCacheMax, 1, FDk);
+  FVCacheQ.ReSize(FCacheMax, 1, FDk);
   // Release the FP32 K/V storage: the int8 path never reads it (append
   // quantizes straight to the codes, the fused kernels stream the codes), so
   // keeping the MaxContext x d_k FP32 buffers would make "int8 KV" cost
@@ -30626,10 +30815,8 @@ begin
     // Restore the FP32 K/V storage EnableInt8KV released and drop the codes.
     FKCache.ReSize(FCacheMax, 1, FDk);
     FVCache.ReSize(FCacheMax, 1, FDk);
-    SetLength(FKCacheCodes, 0);
-    SetLength(FVCacheCodes, 0);
-    SetLength(FKCacheScale, 0);
-    SetLength(FVCacheScale, 0);
+    FKCacheQ.ReSize(0, 0, 0);
+    FVCacheQ.ReSize(0, 0, 0);
   end;
   FKVQuantInt8 := false;
 end;
@@ -30641,10 +30828,11 @@ end;
 // running max with the SIGNED first element (the documented GetMaxAbs bug) and
 // would miss a negative max-magnitude element 0.
 procedure TNNetScaledDotProductAttention.QuantizeCacheRow(Src: TNeuralFloatArrPtr;
-  var Codes: array of ShortInt; var Scale: array of TNeuralFloat; Slot: integer);
+  Dst: TNNetVolumeQuant8; Slot: integer);
 var
   d, RowBase, Code, DkM1: integer;
   MaxAbs, RowScale, InvScale, AbsVal: TNeuralFloat;
+  CodesPtr: TNeuralInt8ArrPtr;
 begin
   DkM1 := FDk - 1;
   MaxAbs := 0;
@@ -30656,15 +30844,18 @@ begin
   if MaxAbs > 0
     then RowScale := MaxAbs / 127
     else RowScale := 1;
-  Scale[Slot] := RowScale;
+  // Slot is the flat row index, so it indexes the scale plane directly and
+  // the codes at Slot*Depth - the same arithmetic the raw arrays used.
+  Dst.ScalePtr^[Slot] := RowScale;
   InvScale := 1 / RowScale;
   RowBase := Slot * FDk;
+  CodesPtr := Dst.DataPtr;
   for d := 0 to DkM1 do
   begin
     Code := Round(Src^[d] * InvScale);
     if Code > 127 then Code := 127;
     if Code < -127 then Code := -127;
-    Codes[RowBase + d] := Code;
+    CodesPtr^[RowBase + d] := Code;
   end;
 end;
 
@@ -30734,6 +30925,8 @@ var
   Score, MaxScore, SumExp, InvSumExp: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr, QueryPtr: TNeuralFloatArrPtr;
+  KCodesPtr, VCodesPtr: TNeuralInt8ArrPtr;
+  KScalePtr, VScalePtr: TNeuralFloatArrPtr;
 begin
   // The KV-cache decode attention is CPU-only (no OpenCL path here), so count
   // it as a CPU dispatch - otherwise a profiler sees neither counter and the
@@ -30741,6 +30934,13 @@ begin
   Inc(FForwardCPUCnt);
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
+  // Cache bases hoisted out of every loop below (#11). They stay valid for the
+  // whole call: the containers are preallocated at MaxContext and no ReSize
+  // happens between here and the last read.
+  KCodesPtr := FKCacheQ.DataPtr;
+  VCodesPtr := FVCacheQ.DataPtr;
+  KScalePtr := FKCacheQ.ScalePtr;
+  VScalePtr := FVCacheQ.ScalePtr;
   SeqLen := Prev.SizeX;
   SeqLenM1 := SeqLen - 1;
   // Byte size of one cached K/V row, loop-invariant for the whole call: FDk is
@@ -30784,7 +30984,7 @@ begin
       // Every per-slot store keeps FDk contiguous elements, so slot j begins at
       // flat offset j * FDk in ALL of them: FKCache/FVCache.FData (float rows,
       // since their shape MaxContext x 1 x FDk gives GetRawPos(j, 0) = j * FDk)
-      // and FKCacheCodes/FVCacheCodes (int8 rows). Carry that offset (and the
+      // and FKCacheQ/FVCacheQ.FData (int8 rows). Carry that offset (and the
       // next slot's) by addition and reuse it for K and V in both formats -
       // no per-row GetRawPtr / multiply. The one multiply below is the only one.
       jDk := FEvictSinks * FDk;
@@ -30795,10 +30995,13 @@ begin
         if FKVQuantInt8 then
         begin
           // int8 storage: shift the codes + per-row scales instead of FP32.
-          Move(FKCacheCodes[jP1Dk], FKCacheCodes[jDk], RowBytesI8);
-          Move(FVCacheCodes[jP1Dk], FVCacheCodes[jDk], RowBytesI8);
-          FKCacheScale[j] := FKCacheScale[jP1];
-          FVCacheScale[j] := FVCacheScale[jP1];
+          // Not DeleteRows: that drops whole Y rows (KV heads), whereas an
+          // eviction drops one POSITION and must stop at the live length
+          // rather than running to MaxContext.
+          Move(FKCacheQ.FData[jP1Dk], FKCacheQ.FData[jDk], RowBytesI8);
+          Move(FVCacheQ.FData[jP1Dk], FVCacheQ.FData[jDk], RowBytesI8);
+          FKCacheQ.ScalePtr^[j] := FKCacheQ.ScalePtr^[jP1];
+          FVCacheQ.ScalePtr^[j] := FVCacheQ.ScalePtr^[jP1];
         end
         else
         begin
@@ -30815,10 +31018,8 @@ begin
     // (depth is contiguous, so each slice is one Move).
     if FKVQuantInt8 then
     begin
-      QuantizeCacheRow(Prev.GetRawPtr(posPrev + FDk),
-        FKCacheCodes, FKCacheScale, FCacheLen);
-      QuantizeCacheRow(Prev.GetRawPtr(posPrev + TwoFDk),
-        FVCacheCodes, FVCacheScale, FCacheLen);
+      QuantizeCacheRow(Prev.GetRawPtr(posPrev + FDk), FKCacheQ, FCacheLen);
+      QuantizeCacheRow(Prev.GetRawPtr(posPrev + TwoFDk), FVCacheQ, FCacheLen);
     end
     else
     begin
@@ -30851,8 +31052,8 @@ begin
       // Coded by Claude (AI).
       if FKVQuantInt8 then
         Score := TNNetVolume.DotProductInt8(
-          TNeuralInt8ArrPtr(@FKCacheCodes[jDk]),
-          QueryPtr, FDk) * (FKCacheScale[j] * FInvSqrtDk)
+          TNeuralInt8ArrPtr(@KCodesPtr^[jDk]),
+          QueryPtr, FDk) * (KScalePtr^[j] * FInvSqrtDk)
       else
       Score := TNNetVolume.DotProduct(
         QueryPtr, FKCache.GetRawPtr(jDk), FDk) * FInvSqrtDk;
@@ -30887,8 +31088,8 @@ begin
           // scale all fold into the one scalar (fused int8 axpy, no
           // dequantize-to-scratch pass). Coded by Claude (AI).
           TNNetVolume.MulAddInt8Scalar(OutPtr,
-            TNeuralInt8ArrPtr(@FVCacheCodes[jDk]),
-            FCacheScores[j] * InvSumExp * FVCacheScale[j], FDk)
+            TNeuralInt8ArrPtr(@VCodesPtr^[jDk]),
+            FCacheScores[j] * InvSumExp * VScalePtr^[j], FDk)
         else
         TNNetVolume.MulAdd(OutPtr, FVCache.GetRawPtr(jDk),
           FCacheScores[j] * InvSumExp, FDk);
@@ -31125,7 +31326,7 @@ var
   SeqLenM1, DkM1: integer;
   AttnRow, AttnIdx: integer;
   RowStride, TwoFDk, posK, posV: integer;
-  Score, MaxScore, SumExp: TNeuralFloat;
+  Score, MaxScore, SumExp, A: TNeuralFloat;
   Prev, Seg: TNNetVolume;
   OutPtr, QueryPtr: TNeuralFloatArrPtr;
   SegI: integer;
@@ -31245,9 +31446,14 @@ begin
     posV := TwoFDk;                       // j=0 V offset (#12)
     for j := 0 to SeqLenM1 do
     begin
-      TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV),
-        FAttn.FData[AttnRow + j], FDk);
-      Inc(posV, RowStride);
+      // A masked key scored -1e9, whose exp underflows to EXACTLY 0 (and an
+      // all-masked row was zero-filled), so its length-FDk AVX MulAdd adds a
+      // provable zero. Under a causal mask that is about half the keys: skip
+      // them. Same idiom as the "if dS <> 0" guard in the backward pass.
+      A := FAttn.FData[AttnRow + j];
+      if A <> 0 then
+        TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV), A, FDk);
+      Inc(posV, RowStride);               // advance unconditionally (#12)
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -31289,9 +31495,9 @@ var
   SeqLen, i, j, d, j0, jEnd: integer;
   SeqLenM1, DkM1: integer;
   RowStride, TwoFDk, posK, posV: integer;
-  Score, MRun, MNew, LRun, Alpha, Eg: TNeuralFloat;
+  Score, MRun, LRun, Alpha, Eg: TNeuralFloat;
   Prev: TNNetVolume;
-  OutPtr, VPtr, QueryPtr: TNeuralFloatArrPtr;
+  OutPtr, QueryPtr: TNeuralFloatArrPtr;
 begin
   // v1 scope guard: only the plain scaled-dot-product softmax with the static
   // causal / window masks. Anything else (soft-cap, segment/document, prefix-LM,
@@ -31339,22 +31545,29 @@ begin
         begin
           Score := TNNetVolume.DotProduct(
             QueryPtr, Prev.GetRawPtr(posK), FDk) * FInvSqrtDk;
-          // Online-softmax update with this single key's score.
-          if Score > MRun then MNew := Score else MNew := MRun;
-          if MRun = -1e30 then
-            Alpha := 0            // first unmasked key: nothing to rescale yet
-          else
-            Alpha := NeuralExp(MRun - MNew);
-          Eg := NeuralExp(Score - MNew);
-          LRun := LRun * Alpha + Eg;
-          VPtr := Prev.GetRawPtr(posV);
-          // FTileAcc[d] := FTileAcc[d]*Alpha + Eg*VPtr[d] over the depth-contiguous
-          // head-dim span: an in-place AVX rescale followed by a fused
-          // multiply-add (FTileAcc += VPtr*Eg). Only this accumulate is
-          // vectorized; the exp/max transcendental work above stays scalar.
-          TNNetVolume.Mul(TNeuralFloatArrPtr(@FTileAcc[0]), Alpha, FDk);
-          TNNetVolume.MulAdd(TNeuralFloatArrPtr(@FTileAcc[0]), VPtr, Eg, FDk);
-          MRun := MNew;
+          // Online-softmax update with this single key's score. The running
+          // state only needs rescaling when this key RAISES the running max;
+          // otherwise the rescale factor is exp(0) = 1, so both the exp and the
+          // length-FDk AVX Mul by 1.0 are pure overhead. Guarding them keeps the
+          // recurrence identical and removes them from the common case.
+          if Score > MRun then
+          begin
+            if MRun = -1e30 then
+              Alpha := 0          // first unmasked key: nothing to rescale yet
+            else
+              Alpha := NeuralExp(MRun - Score);
+            LRun := LRun * Alpha;
+            // In-place AVX rescale of the running accumulator by Alpha.
+            TNNetVolume.Mul(TNeuralFloatArrPtr(@FTileAcc[0]), Alpha, FDk);
+            MRun := Score;
+          end;
+          Eg := NeuralExp(Score - MRun);
+          LRun := LRun + Eg;
+          // FTileAcc[d] += Eg*V[j,d] over the depth-contiguous head-dim span:
+          // a fused AVX multiply-add. Only this accumulate is vectorized; the
+          // exp/max transcendental work above stays scalar.
+          TNNetVolume.MulAdd(TNeuralFloatArrPtr(@FTileAcc[0]),
+            Prev.GetRawPtr(posV), Eg, FDk);
         end;
         // Advance unconditionally so masked keys keep the offsets in step (#12).
         Inc(posK, RowStride);
@@ -31426,11 +31639,21 @@ begin
       posV := 2 * FDk;                              // j=0 offset (#12)
       for j := 0 to SeqLenM1 do
       begin
+        // A masked key's attention weight is EXACTLY 0 (its -1e9 score's exp
+        // underflows; an all-masked row was zero-filled), so both the dV
+        // MulAdd and dAttn[j] are dead: the MulAdd adds zero, and dAttn[j] is
+        // only ever consumed multiplied by that same zero weight (the
+        // SumDAttnAttn dot product and dScore[j] below), so storing 0 is
+        // exact. Under a causal mask this skips about half the keys.
         A := FAttn.FData[AttnRow + j];
-        TNNetVolume.MulAdd(PrevErr.GetRawPtr(posV), dOutPtr, A, FDk);
-        FdAttnBuf[j] := TNNetVolume.DotProduct(
-          dOutPtr, Prev.GetRawPtr(posV), FDk);
-        Inc(posV, RowStride);
+        if A <> 0 then
+        begin
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(posV), dOutPtr, A, FDk);
+          FdAttnBuf[j] := TNNetVolume.DotProduct(
+            dOutPtr, Prev.GetRawPtr(posV), FDk);
+        end
+        else FdAttnBuf[j] := 0;
+        Inc(posV, RowStride);                       // unconditional (#12)
       end;
       // ---- Softmax Jacobian: dScore[j] = Attn[j] * (dAttn[j] - sum_k dAttn[k]*Attn[k]) ----
       SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[AttnRow], SeqLen);
@@ -31545,7 +31768,7 @@ var
   QOfs, KOfs, VOfs: integer;
   AttnRow, AttnIdx, HRowBase: integer;
   RowStride, posK, posV: integer;
-  Score, MaxScore, SumExp: TNeuralFloat;
+  Score, MaxScore, SumExp, A: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr, QueryPtr: TNeuralFloatArrPtr;
 begin
@@ -31613,9 +31836,14 @@ begin
       posV := VOfs;                       // j=0 V offset (#12)
       for j := 0 to SeqLenM1 do
       begin
-        TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV),
-          FAttn.FData[AttnRow + j], FDk);
-        Inc(posV, RowStride);
+        // Masked keys carry an EXACTLY zero weight (exp(-1e9 - max) underflows
+        // to 0; an all-masked row was zero-filled), so their length-FDk AVX
+        // MulAdd is provably a no-op - skip it (about half the keys under a
+        // causal mask). Same idiom as the "if dS <> 0" backward guard.
+        A := FAttn.FData[AttnRow + j];
+        if A <> 0 then
+          TNNetVolume.MulAdd(OutPtr, Prev.GetRawPtr(posV), A, FDk);
+        Inc(posV, RowStride);             // advance unconditionally (#12)
       end;
     end;
   end;
@@ -31647,9 +31875,9 @@ begin
     for g := 0 to KVHeadsM1 do
     begin
       QuantizeCacheRow(Prev.GetRawPtr(pBase + FQW + gFDk),
-        FKCacheCodes, FKCacheScale, ScaleSlot);
+        FKCacheQ, ScaleSlot);
       QuantizeCacheRow(Prev.GetRawPtr(pBase + PVBase + gFDk),
-        FVCacheCodes, FVCacheScale, ScaleSlot);
+        FVCacheQ, ScaleSlot);
       Inc(gFDk, FDk);
       Inc(ScaleSlot, FCacheMax);
     end;
@@ -31695,12 +31923,15 @@ begin
       SrcRow := DstRow + FDk;
       if FKVQuantInt8 then
       begin
-        Move(FKCacheCodes[SrcRow], FKCacheCodes[DstRow], BlockBytesI8);
-        Move(FVCacheCodes[SrcRow], FVCacheCodes[DstRow], BlockBytesI8);
-        Move(FKCacheScale[ScaleBase + 1],
-          FKCacheScale[ScaleBase], ScaleBlockBytes);
-        Move(FVCacheScale[ScaleBase + 1],
-          FVCacheScale[ScaleBase], ScaleBlockBytes);
+        // Within one Y-plane (one KV head) this slides POSITIONS left, so it
+        // is not DeleteRows (which drops whole planes) and it stops at the
+        // live length rather than running to MaxContext.
+        Move(FKCacheQ.FData[SrcRow], FKCacheQ.FData[DstRow], BlockBytesI8);
+        Move(FVCacheQ.FData[SrcRow], FVCacheQ.FData[DstRow], BlockBytesI8);
+        Move(FKCacheQ.ScaleData.FData[ScaleBase + 1],
+          FKCacheQ.ScaleData.FData[ScaleBase], ScaleBlockBytes);
+        Move(FVCacheQ.ScaleData.FData[ScaleBase + 1],
+          FVCacheQ.ScaleData.FData[ScaleBase], ScaleBlockBytes);
       end
       else
       begin
@@ -31744,8 +31975,16 @@ var
   Score, MaxScore, SumExp, InvSumExp: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr, QueryPtr: TNeuralFloatArrPtr;
+  KCodesPtr, VCodesPtr: TNeuralInt8ArrPtr;
+  KScalePtr, VScalePtr: TNeuralFloatArrPtr;
 begin
   Prev := FPrevLayer.FOutput;
+  // Cache bases hoisted above the head loop (#11); the containers are
+  // preallocated at MaxContext and never resized during a decode step.
+  KCodesPtr := FKCacheQ.DataPtr;
+  VCodesPtr := FVCacheQ.DataPtr;
+  KScalePtr := FKCacheQ.ScalePtr;
+  VScalePtr := FVCacheQ.ScalePtr;
   if (FWindow > 0) and (LiveLen > FWindow)
     then jStart := LiveLen - FWindow
     else jStart := 0;
@@ -31762,7 +32001,7 @@ begin
     // offsets advance by FDk / 1 and the key stream prefetches like the
     // per-head caches did (the whole point of the plane layout).
     // CodeBase is the flat FDk-row offset; it indexes BOTH the int8 code rows
-    // (FKCacheCodes/FVCacheCodes) and the FP32 rows (FKCache/FVCache.FData) —
+    // (FKCacheQ/FVCacheQ.FData) and the FP32 rows (FKCache/FVCache.FData) —
     // same per-slot stride, one carried offset for both formats (#3).
     ScaleSeed := g * FCacheMax + jStart;   // #4: reused by both j passes
     CodeSeed := ScaleSeed * FDk;
@@ -31772,8 +32011,8 @@ begin
     begin
       if FKVQuantInt8 then
         Score := TNNetVolume.DotProductInt8(
-          TNeuralInt8ArrPtr(@FKCacheCodes[CodeBase]),
-          QueryPtr, FDk) * (FKCacheScale[ScaleIdx] * FInvSqrtDk)
+          TNeuralInt8ArrPtr(@KCodesPtr^[CodeBase]),
+          QueryPtr, FDk) * (KScalePtr^[ScaleIdx] * FInvSqrtDk)
       else
         Score := TNNetVolume.DotProduct(QueryPtr,
           TNeuralFloatArrPtr(@FKCache.FData[CodeBase]), FDk) * FInvSqrtDk;
@@ -31804,8 +32043,8 @@ begin
       begin
         if FKVQuantInt8 then
           TNNetVolume.MulAddInt8Scalar(OutPtr,
-            TNeuralInt8ArrPtr(@FVCacheCodes[CodeBase]),
-            FCacheScores[pos] * InvSumExp * FVCacheScale[ScaleIdx],
+            TNeuralInt8ArrPtr(@VCodesPtr^[CodeBase]),
+            FCacheScores[pos] * InvSumExp * VScalePtr^[ScaleIdx],
             FDk)
         else
           TNNetVolume.MulAdd(OutPtr,
@@ -31936,19 +32175,18 @@ begin
   begin
     FKCache.ReSize(1, 1, 1);
     FVCache.ReSize(1, 1, 1);
-    SetLength(FKCacheCodes, pMaxContext * FKW);
-    SetLength(FVCacheCodes, pMaxContext * FKW);
-    SetLength(FKCacheScale, pMaxContext * FKVHeads);
-    SetLength(FVCacheScale, pMaxContext * FKVHeads);
+    // (MaxContext, KVHeads, d_k) IS the head-major plane layout: head g's
+    // rows occupy the contiguous Y-plane g, so slot g*MaxContext + position
+    // addresses both the codes and the per-(position, head) scale.
+    FKCacheQ.ReSize(pMaxContext, FKVHeads, FDk);
+    FVCacheQ.ReSize(pMaxContext, FKVHeads, FDk);
   end
   else
   begin
     FKCache.ReSize(pMaxContext, 1, FKW);
     FVCache.ReSize(pMaxContext, 1, FKW);
-    SetLength(FKCacheCodes, 0);
-    SetLength(FVCacheCodes, 0);
-    SetLength(FKCacheScale, 0);
-    SetLength(FVCacheScale, 0);
+    FKCacheQ.ReSize(0, 0, 0);
+    FVCacheQ.ReSize(0, 0, 0);
   end;
   SetLength(FCacheScores, pMaxContext * FQHeads);
   FCacheMax := pMaxContext;
@@ -31975,10 +32213,8 @@ begin
       'ResetCache. CacheLength=' + IntToStr(FCacheLen));
     exit;
   end;
-  SetLength(FKCacheCodes, FCacheMax * FKW);
-  SetLength(FVCacheCodes, FCacheMax * FKW);
-  SetLength(FKCacheScale, FCacheMax * FKVHeads);
-  SetLength(FVCacheScale, FCacheMax * FKVHeads);
+  FKCacheQ.ReSize(FCacheMax, FKVHeads, FDk);
+  FVCacheQ.ReSize(FCacheMax, FKVHeads, FDk);
   FKCache.ReSize(1, 1, 1);
   FVCache.ReSize(1, 1, 1);
   FKVQuantInt8 := true;
@@ -31996,10 +32232,8 @@ begin
   begin
     FKCache.ReSize(FCacheMax, 1, FKW);
     FVCache.ReSize(FCacheMax, 1, FKW);
-    SetLength(FKCacheCodes, 0);
-    SetLength(FVCacheCodes, 0);
-    SetLength(FKCacheScale, 0);
-    SetLength(FVCacheScale, 0);
+    FKCacheQ.ReSize(0, 0, 0);
+    FVCacheQ.ReSize(0, 0, 0);
   end;
   FKVQuantInt8 := false;
 end;
@@ -32920,6 +33154,7 @@ begin
   SetLength(FSelABuf, 0); SetLength(FSelBBuf, 0);
   SetLength(FCandABuf, 0); SetLength(FCandBBuf, 0);
   SetLength(FCandScoreBuf, 0);
+  SetLength(FTopKUsed, 0);
   FreeBackpropScratch();
   inherited Destroy();
 end;
@@ -32985,6 +33220,7 @@ begin
   SetLength(FSelABuf, FTopK); SetLength(FSelBBuf, FTopK);
   SetLength(FCandScoreBuf, FTopK * FTopK);
   SetLength(FCandABuf, FTopK * FTopK); SetLength(FCandBBuf, FTopK * FTopK);
+  SetLength(FTopKUsed, FHalfKeys);
   // Backprop-only scratch: skip on inference-only layers.
   if FIsTrainable then
   begin
@@ -32996,26 +33232,31 @@ end;
 // Fills SelIdx[0..Want-1] with the indices of the Want largest entries of
 // Scores[0..Count-1] (descending). Simple partial selection sort -- Want is
 // TopK (tiny) and Count is HalfKeys (sqrt of memory), so this is cheap.
+// Used[0..Count-1] is caller-owned scratch (a persistent layer field, sized at
+// SetPrevLayer): the routine runs per (head, token), so it must never allocate.
 procedure PKMTopKIndices(Scores: TNeuralFloatArrPtr; Count, Want: integer;
-  var SelIdx: array of integer);
+  var SelIdx: array of integer; var Used: array of boolean);
 var
   i, j, best, tmp, CountM1, WantM1, WantM2: integer;
   JStart: integer;
-  used: array of boolean;
+  bestVal: TNeuralFloat;
 begin
   CountM1 := Count - 1;
   WantM1 := Want - 1;
   WantM2 := Want - 2;
-  SetLength(used, Count);
-  for i := 0 to CountM1 do used[i] := False;
+  FillChar(Used[0], Count, 0);
+  bestVal := 0;
   for i := 0 to WantM1 do
   begin
     best := -1;
     for j := 0 to CountM1 do
-      if (not used[j]) and
-         ((best = -1) or (Scores^[j] > Scores^[best])) then
-        best := j;
-    used[best] := True;
+      if not Used[j] then
+        if (best = -1) or (Scores^[j] > bestVal) then
+        begin
+          best := j;
+          bestVal := Scores^[j];
+        end;
+    Used[best] := True;
     SelIdx[i] := best;
   end;
   // Ensure strictly descending order (selection already yields it, but keep
@@ -33059,12 +33300,13 @@ begin
     qOff := h * FHeadQueryDim;       // start of this head's sub-query in the input
     wOff := h * FTopK;               // this head's softmax-weight slots in FW Depth
     outOff := h * FValueDim;         // this head's output slot in FOutput Depth
+    base := h * SeqLen * FTopK;       // seed of (h*SeqLen+t)*FTopK; carried by +FTopK per t (#6)
     for t := 0 to SeqLenM1 do
     begin
       q1 := Prev.GetRawPtr(t, 0, qOff);            // sub-q[0..HalfQ-1]
       q2 := Prev.GetRawPtr(t, 0, qOff + FHalfQ);   // sub-q[HalfQ..2HalfQ-1]
       baseS1 := FS1.GetRawPos(t, 0);            // this row's FS1 offset (invariant across a)
-      baseS2 := FS2.GetRawPos(t, 0);            // this row's FS2 offset (invariant across b)
+      baseS2 := baseS1;                         // FS2 shares FS1's shape (SeqLen,1,FHalfKeys) => same offset (#3)
       baseW := FW.GetRawPos(t, 0, wOff);           // this head's weight slots for row t
       // Half scores.
       posK1 := 0;                          // key-row offset a*FHalfQ (#12)
@@ -33080,8 +33322,8 @@ begin
         Inc(posK2, FHalfQ);
       end;
       // Top-TopK per half.
-      PKMTopKIndices(FS1.GetRawPtr(t, 0), FHalfKeys, FTopK, FSelABuf);
-      PKMTopKIndices(FS2.GetRawPtr(t, 0), FHalfKeys, FTopK, FSelBBuf);
+      PKMTopKIndices(FS1.GetRawPtr(t, 0), FHalfKeys, FTopK, FSelABuf, FTopKUsed);
+      PKMTopKIndices(FS2.GetRawPtr(t, 0), FHalfKeys, FTopK, FSelBBuf, FTopKUsed);
       // TopK x TopK candidate combinations, scored s1[a] + s2[b].
       nCand := 0;
       for a := 0 to TopKM1 do
@@ -33093,7 +33335,6 @@ begin
           Inc(nCand);
         end;
       // Pick the global top-TopK of the candidates (partial selection sort).
-      base := (h * SeqLen + t) * FTopK;
       nCandM1 := nCand - 1;
       for kk := 0 to TopKM1 do
       begin
@@ -33132,6 +33373,7 @@ begin
         Vptr := V.GetRawPtr(keyIdx, 0);
         TNNetVolume.MulAdd(OutPtr, Vptr, w, FValueDim);
       end;
+      Inc(base, FTopK);                 // advance to next t's (h*SeqLen+t)*FTopK (#6)
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -33178,9 +33420,9 @@ begin
     FGradK1.Fill(0);
     FGradK2.Fill(0);
     FGradV.Fill(0);
+    base := h * SeqLen * FTopK;       // seed of (h*SeqLen+t)*FTopK; carried by +FTopK per t (#6)
     for t := 0 to SeqLenM1 do
     begin
-      base := (h * SeqLen + t) * FTopK;
       baseW := FW.GetRawPos(t, 0, wOff);   // this head's weight slots for row t
       dOut := FOutputError.GetRawPtr(t, 0, outOff);
       q1 := Prev.GetRawPtr(t, 0, qOff);
@@ -33233,6 +33475,7 @@ begin
           TNNetVolume.MulAdd(dq2, K2.GetRawPtr(posB), ds, FHalfQ);
         end;
       end;
+      Inc(base, FTopK);                 // advance to next t's (h*SeqLen+t)*FTopK (#6)
     end;
     // Flush this head's bank gradients into its neuron deltas (-LR scaled).
     TNNetVolume.MulAdd(N0.FDelta.GetRawPtr(), FGradK1.GetRawPtr(),
@@ -38374,8 +38617,8 @@ end;
 
 procedure TNNetHyperConv.Compute();
 var
-  LpBnd9: integer;
-  LpBnd10: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   OutChM1, FeatSzM1, InChM1: integer;
   StartTime: double;
   X, Wgt: TNNetVolume;
@@ -38388,8 +38631,8 @@ begin
   Wgt := FWeightsLayer.FOutput;
   BiasBase := FOutChannels * FFeatureSize * FFeatureSize * FInChannels;
   FOutput.Fill(0);
-  LpBnd9 := FOutput.SizeY - 1;
-  LpBnd10 := FOutput.SizeX - 1;
+  MaxOutputY := FOutput.SizeY - 1;
+  MaxOutputX := FOutput.SizeX - 1;
   OutChM1 := FOutChannels - 1;
   FeatSzM1 := FFeatureSize - 1;
   InChM1 := FInChannels - 1;
@@ -38398,8 +38641,8 @@ begin
   for o := 0 to OutChM1 do
   begin
     oFS := o * FFeatureSize;                  // #11: invariant across oy/ox
-    for oy := 0 to LpBnd9 do
-      for ox := 0 to LpBnd10 do
+    for oy := 0 to MaxOutputY do
+      for ox := 0 to MaxOutputX do
       begin
         Acc := 0;
         for ky := 0 to FeatSzM1 do
@@ -38423,8 +38666,8 @@ end;
 
 procedure TNNetHyperConv.Backpropagate();
 var
-  LpBnd11: integer;
-  LpBnd12: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   OutChM1, FeatSzM1, InChM1: integer;
   StartTime: double;
   X, Wgt, XErr, WgtErr: TNNetVolume;
@@ -38445,14 +38688,14 @@ begin
   if PropMain or PropGen then
   begin
     StartTime := Now();
-    LpBnd11 := FOutput.SizeY - 1;
-    LpBnd12 := FOutput.SizeX - 1;
+    MaxOutputY := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
     OutChM1 := FOutChannels - 1;
     FeatSzM1 := FFeatureSize - 1;
     InChM1 := FInChannels - 1;
     for o := 0 to OutChM1 do
-      for oy := 0 to LpBnd11 do
-        for ox := 0 to LpBnd12 do
+      for oy := 0 to MaxOutputY do
+        for ox := 0 to MaxOutputX do
         begin
           Dy := FOutputError.Get(ox, oy, o);
           if Dy = 0 then continue;
@@ -38608,8 +38851,8 @@ end;
 
 procedure TNNetModulatedConv2D.Compute();
 var
-  LpBnd13: integer;
-  LpBnd14: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   OutChM1, FeatSzM1, InChM1, TapsM1: integer;
   StartTime: double;
   X, Style: TNNetVolume;
@@ -38658,16 +38901,16 @@ begin
   end;
   // ---- SAME-padding stride-1 convolution with the modulated kernel ----
   FOutput.Fill(0);
-  LpBnd13 := FOutput.SizeY - 1;
-  LpBnd14 := FOutput.SizeX - 1;
+  MaxOutputY := FOutput.SizeY - 1;
+  MaxOutputX := FOutput.SizeX - 1;
   BiasW := FNeurons[FOutChannels].FWeights;
   UseBias := FSuppressBias = 0;
   for o := 0 to OutChM1 do
   begin
     oBase := o * tapsPerOut;
     if UseBias then BiasO := BiasW.FData[o] else BiasO := 0;
-    for oy := 0 to LpBnd13 do
-      for ox := 0 to LpBnd14 do
+    for oy := 0 to MaxOutputY do
+      for ox := 0 to MaxOutputX do
       begin
         Acc := 0;
         for ky := 0 to FeatSzM1 do
@@ -38694,8 +38937,8 @@ end;
 
 procedure TNNetModulatedConv2D.Backpropagate();
 var
-  LpBnd15: integer;
-  LpBnd16: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   OutChM1, FeatSzM1, InChM1, TapsM1: integer;
   StartTime: double;
   X, Style, XErr, StyleErr: TNNetVolume;
@@ -38729,13 +38972,13 @@ begin
   if FGBias.Size <> FOutChannels then FGBias.ReSize(FOutChannels, 1, 1);
     FGModW.Fill(0); FGBias.Fill(0);
     // ---- conv backward: dL/dx and dL/dw'' ----
-    LpBnd15 := FOutput.SizeY - 1;
-    LpBnd16 := FOutput.SizeX - 1;
+    MaxOutputY := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
     for o := 0 to OutChM1 do
     begin
       oBase := o * tapsPerOut;
-      for oy := 0 to LpBnd15 do
-        for ox := 0 to LpBnd16 do
+      for oy := 0 to MaxOutputY do
+        for ox := 0 to MaxOutputX do
         begin
           Dy := FOutputError.Get(ox, oy, o);
           if FSuppressBias = 0 then FGBias.FData[o] := FGBias.FData[o] + Dy;
@@ -39143,6 +39386,7 @@ var
   RawPtr: TNeuralFloatArrPtr;
   RowStride, posV, NormStride, posN, AttnRow: integer;
   dOutPtr, qnPtr, gQnPtr, knPtr, gKnPtr: pointer;
+  LearnScale: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -39165,6 +39409,12 @@ begin
     if FgQn.Size <> SeqLen * FDk then FgQn.ReSize(SeqLen, 1, FDk);
     if FgKn.Size <> SeqLen * FDk then FgKn.ReSize(SeqLen, 1, FDk);
     NormStride := FKNorm.GetRawPos(1, 0);
+    // GradScale feeds ONLY the learnable-scale step at the end of this method,
+    // which is itself guarded by exactly this condition. With a fixed scale the
+    // whole SeqLen^2 x FDk cos[i,j] pass below is computed and discarded, so
+    // hoist the guard here (#5) and skip it.
+    LearnScale := FLearnableScale and (FNeurons.Count > 0) and
+      (FNeurons[0].FWeights.Size = 1);
       FgQn.Fill(0);
       FgKn.Fill(0);
       for i := 0 to SeqLenM1 do
@@ -39205,8 +39455,12 @@ begin
         begin
           // score[i,j] = scale * cos[i,j], cos[i,j] = qn[i].kn[j].
           // d(loss)/d(scale) += dScore[j] * cos[i,j] (accumulated over i,j).
-          Cos := TNNetVolume.DotProduct(qnPtr, FKNorm.GetRawPtr(posN), FDk);
-          GradScale := GradScale + FdScoreBuf[j] * Cos;
+          // Only needed when the scale is learnable (see LearnScale above).
+          if LearnScale then
+          begin
+            Cos := TNNetVolume.DotProduct(qnPtr, FKNorm.GetRawPtr(posN), FDk);
+            GradScale := GradScale + FdScoreBuf[j] * Cos;
+          end;
           dS := FdScoreBuf[j] * LiveScale;
           if dS <> 0 then
           begin
@@ -39244,8 +39498,7 @@ begin
       end;
     // ---- Step the learnable scale like TNNetReZero ----
     // delta += -LearningRate * grad; applied now unless in batch-update mode.
-    if FLearnableScale and (FNeurons.Count > 0) and
-       (FNeurons[0].FWeights.Size = 1) then
+    if LearnScale then
     begin
       FNeurons[0].FDelta.Raw[0] := FNeurons[0].FDelta.Raw[0] +
         (-FLearningRate) * GradScale;
@@ -44252,8 +44505,8 @@ end;
 
 procedure TNNetSoftPlusBetaLearnable.Backpropagate();
 var
-  LpBnd17: integer;
-  LpBnd18: integer;
+  MaxOutputErrorPos: integer;
+  MaxPrevOutputErrorPos: integer;
   StartTime: double;
   localNeuron: TNNetNeuron;
   gradBeta, beta, invBeta, x, betaX, sig, y: TNeuralFloat;
@@ -44273,8 +44526,8 @@ begin
   // d(beta) = sum_i OutputError[i] * (1/beta) * (x_i*sigmoid(beta*x_i) - y_i),
   // where y_i = (1/beta)*ln(1+exp(beta*x_i)) is the layer output.
   gradBeta := 0;
-  LpBnd17 := FOutputError.Size - 1;
-  for i := 0 to LpBnd17 do
+  MaxOutputErrorPos := FOutputError.Size - 1;
+  for i := 0 to MaxOutputErrorPos do
   begin
     x := LocalPrevOutput.Raw[i];
     betaX := beta * x;
@@ -44306,8 +44559,8 @@ begin
   if Assigned(FPrevLayer) and (FPrevLayer.FOutputError.Size = FOutputError.Size) then
   begin
     // Gradient w.r.t. the input: dInput[i] = OutputError[i] * sigmoid(beta*x_i).
-    LpBnd18 := FOutputError.Size - 1;
-    for i := 0 to LpBnd18 do
+    MaxPrevOutputErrorPos := FOutputError.Size - 1;
+    for i := 0 to MaxPrevOutputErrorPos do
     begin
       x := LocalPrevOutput.Raw[i];
       betaX := beta * x;
@@ -47777,7 +48030,7 @@ begin
     // weight) and applies the per-row scale once per dot product - the
     // FP32 weights are never materialized (FConcatedWeights stays shrunk).
     FOutputRaw.GroupedDotProductsTiledInt8(FStruct[5], FNeurons.Count,
-      FOutputSizeX * FOutputSizeY, FVectorSize, FQuantCodes, FQuantScales,
+      FOutputSizeX * FOutputSizeY, FVectorSize, FQuantTable,
       FInputPrepared, FTileSizeD, FTileSizeX);
     if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
     ApplyActivationFunctionToOutput();
@@ -47994,8 +48247,8 @@ end;
 
 procedure TNNetGroupedConvolutionLinear.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  LpBnd19: integer;
-  LpBnd20: integer;
+  MaxPrevOutputD: integer;
+  MaxOutputD: integer;
   PrevLayerGroupDSize: integer;
   OutputGroupDSize: integer;
   OutputD: integer;
@@ -48019,8 +48272,8 @@ begin
   SetLength(FGroupIdToPrevLayerIdStart, FStruct[5]);
   SetLength(FGroupIdToOutputIdStart, FStruct[5]);
 
-  LpBnd19 := pPrevLayer.Output.Depth - 1;
-  for OutputD := 0 to LpBnd19 do
+  MaxPrevOutputD := pPrevLayer.Output.Depth - 1;
+  for OutputD := 0 to MaxPrevOutputD do
   begin
     GroupId := OutputD div PrevLayerGroupDSize;
     GroupDStart := GroupId * PrevLayerGroupDSize;
@@ -48029,8 +48282,8 @@ begin
     FArrPrevLayerGroupIdStart[OutputD] := GroupDStart;
   end;
 
-  LpBnd20 := FOutput.Depth - 1;
-  for OutputD := 0 to LpBnd20 do
+  MaxOutputD := FOutput.Depth - 1;
+  for OutputD := 0 to MaxOutputD do
   begin
     GroupId := OutputD div OutputGroupDSize;
     GroupDStart := GroupId * OutputGroupDSize;
@@ -48470,12 +48723,12 @@ end;
 
 procedure TNNetAdaIN.Backpropagate();
 var
-  LpBnd31: integer;
-  LpBnd32: integer;
-  LpBnd33: integer;
-  LpBnd34: integer;
-  LpBnd35: integer;
-  LpBnd36: integer;
+  MaxContentOutX: integer;
+  MaxContentOutY: integer;
+  MaxContentErrX: integer;
+  MaxContentErrY: integer;
+  MaxStyleOutX: integer;
+  MaxStyleOutY: integer;
   StartTime: double;
   C, ContentN, StyleM, Depth: integer;
   DepthM1: integer;
@@ -48507,14 +48760,14 @@ begin
     // Reductions of the upstream gradient over the CONTENT spatial positions.
     SumG := 0;
     SumGXHat := 0;
-    LpBnd31 := ContentOut.SizeX - 1;
-    LpBnd32 := ContentOut.SizeY - 1;
+    MaxContentOutX := ContentOut.SizeX - 1;
+    MaxContentOutY := ContentOut.SizeY - 1;
     // Row-outer walk with a carried flat offset (step = Depth per x); the
     // fixed-C accessor multiply-add is gone (rules #3/#11).
-    for CntY := 0 to LpBnd32 do
+    for CntY := 0 to MaxContentOutY do
     begin
       pos := FOutputError.GetRawPos(0, CntY, C);
-      for CntX := 0 to LpBnd31 do
+      for CntX := 0 to MaxContentOutX do
       begin
         G := FOutputError.FData[pos];
         SumG := SumG + G;
@@ -48526,12 +48779,12 @@ begin
     //   dx_i = (style_std * inv_content_std / N) *
     //          ( N*g_i - sum(g) - xhat_i * sum(g*xhat) )
     ContentFactor := StyleStd * ContentInvStd / ContentN;
-    LpBnd33 := ContentOut.SizeX - 1;
-    LpBnd34 := ContentOut.SizeY - 1;
-    for CntY := 0 to LpBnd34 do
+    MaxContentErrX := ContentOut.SizeX - 1;
+    MaxContentErrY := ContentOut.SizeY - 1;
+    for CntY := 0 to MaxContentErrY do
     begin
       pos := FOutputError.GetRawPos(0, CntY, C);
-      for CntX := 0 to LpBnd33 do
+      for CntX := 0 to MaxContentErrX do
       begin
         G := FOutputError.FData[pos];
         XHat := FNormContent.FData[pos];
@@ -48545,12 +48798,12 @@ begin
     //   where shat_j = (s_j - style_mean) / style_std.
     GMean := SumG / StyleM;
     GXHatMean := SumGXHat / StyleM;
-    LpBnd35 := StyleOut.SizeX - 1;
-    LpBnd36 := StyleOut.SizeY - 1;
-    for CntY := 0 to LpBnd36 do
+    MaxStyleOutX := StyleOut.SizeX - 1;
+    MaxStyleOutY := StyleOut.SizeY - 1;
+    for CntY := 0 to MaxStyleOutY do
     begin
       pos := StyleOut.GetRawPos(0, CntY, C);
-      for CntX := 0 to LpBnd35 do
+      for CntX := 0 to MaxStyleOutX do
       begin
         SHat := (StyleOut.FData[pos] - StyleMean) / StyleStd;
         StyleErr.FData[pos] := StyleErr.FData[pos] + GMean + GXHatMean * SHat;
@@ -52896,9 +53149,12 @@ var
   FeatureSizeXM1, FeatureSizeYM1: integer;
   InputX, InputY: integer;
   WeightDepth, WeightDepthM1: integer;
-  RowBase, TapOfs: integer;
+  TapOfs: integer;
   TapRowStride, InRowStride, InOfs: integer;
   RowScale: TNeuralFloat;
+  RowPtr: TNeuralInt8ArrPtr;
+  CodesPtr: TNeuralInt8ArrPtr;
+  ScalePtr: TNeuralFloatArrPtr;
 begin
   FOutputRaw.Fill(0.0);
   MaxX := FOutput.SizeX - 1;
@@ -52912,6 +53168,8 @@ begin
   // FQuantWSizeX*WeightDepth and the input offset by one FInputCopy row.
   TapRowStride := FQuantWSizeX * WeightDepth;
   InRowStride := FInputCopy.GetRawPos(0, 1);
+  CodesPtr := FQuantTable.DataPtr;   // #13: table bases hoisted out of the nest
+  ScalePtr := FQuantTable.ScalePtr;
   for OutputX := 0 to MaxX do
   begin
     InputX := OutputX * FStride;
@@ -52920,7 +53178,9 @@ begin
       InputY := OutputY * FStride;
       for NeuronIdx := 0 to MaxNeurons do
       begin
-        RowBase := NeuronIdx * FQuantVectorSize;
+        // Neuron row base as a pointer (#11): the tap loops then add only
+        // TapOfs instead of carrying RowBase + TapOfs.
+        RowPtr := TNeuralInt8ArrPtr(@CodesPtr^[NeuronIdx * FQuantVectorSize]);
         OutputPtr := FOutputRaw.GetRawPtr(OutputX, OutputY,
           WeightDepth * NeuronIdx);
         for CntX := 0 to FeatureSizeXM1 do
@@ -52936,7 +53196,7 @@ begin
             TNNetVolume.MulAddInt8(
               OutputPtr,
               FInputCopy.GetRawPtr(InOfs),
-              Addr(FQuantCodes[RowBase + TapOfs]),
+              TNeuralInt8ArrPtr(@RowPtr^[TapOfs]),
               WeightDepth
             );
             Inc(TapOfs, TapRowStride);
@@ -52945,7 +53205,7 @@ begin
         end;
         // Per-neuron scale applied once per output element - after every
         // spatial tap accumulated its raw code product.
-        RowScale := FQuantScales[NeuronIdx];
+        RowScale := ScalePtr^[NeuronIdx];
         TNNetVolume.Mul(OutputPtr, RowScale, WeightDepthM1 + 1);
       end;
     end;
@@ -53258,7 +53518,6 @@ end;
 
 procedure TNNetReZero.Backpropagate();
 var
-  LpBnd37: integer;
   StartTime: double;
   localNeuron: TNNetNeuron;
   gradAlpha, alpha: TNeuralFloat;
@@ -53473,8 +53732,8 @@ end;
 
 procedure TNNetSquash.Compute();
 var
-  LpBnd38: integer;
-  LpBnd39: integer;
+  MaxOutputX: integer;
+  MaxOutputY: integer;
   NumCapsM1, DimM1: integer;
   StartTime: double;
   Dim, NumCaps, x, y, c, i, baseD, baseIn, baseCap: integer;
@@ -53488,10 +53747,10 @@ begin
   Eps := 1e-12;
   NumCapsM1 := NumCaps - 1;
   DimM1 := Dim - 1;
-  LpBnd38 := FOutput.SizeX - 1;
-  LpBnd39 := FOutput.SizeY - 1;
-  for x := 0 to LpBnd38 do
-    for y := 0 to LpBnd39 do
+  MaxOutputX := FOutput.SizeX - 1;
+  MaxOutputY := FOutput.SizeY - 1;
+  for x := 0 to MaxOutputX do
+    for y := 0 to MaxOutputY do
       for c := 0 to NumCapsM1 do
       begin
         baseD := c * Dim;
@@ -53513,8 +53772,8 @@ end;
 
 procedure TNNetSquash.Backpropagate();
 var
-  LpBnd40: integer;
-  LpBnd41: integer;
+  MaxOutputX: integer;
+  MaxOutputY: integer;
   NumCapsM1, DimM1: integer;
   StartTime: double;
   Dim, NumCaps, x, y, c, i, baseD, baseIn, baseCap: integer;
@@ -53538,12 +53797,12 @@ begin
     //   d(f/n)/ds_j = ( 2/((1+n2)^2)/n - (f/n^3) ) * s_j
     // where g = dL/dv (FOutputError), n2 = ||s||^2, n = sqrt(n2+eps),
     //       f = n2/(1+n2), f/n cached in FScale.
-    LpBnd40 := FOutput.SizeX - 1;
-    LpBnd41 := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
+    MaxOutputY := FOutput.SizeY - 1;
     NumCapsM1 := NumCaps - 1;
     DimM1 := Dim - 1;
-    for x := 0 to LpBnd40 do
-      for y := 0 to LpBnd41 do
+    for x := 0 to MaxOutputX do
+      for y := 0 to MaxOutputY do
         for c := 0 to NumCapsM1 do
         begin
           baseD := c * Dim;
@@ -53648,13 +53907,13 @@ end;
 
 procedure TNNetCapsuleRouting.InitDefault();
 var
-  LpBnd42: integer;
+  MaxNeuronPos: integer;
   cnt: integer;
 begin
   if FNeurons.Count < FNumInCaps * FNumOutCaps then
     AddMissingNeurons(FNumInCaps * FNumOutCaps);
-  LpBnd42 := FNeurons.Count - 1;
-  for cnt := 0 to LpBnd42 do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for cnt := 0 to MaxNeuronPos do
     FNeurons[cnt].InitHeUniform(1);
 end;
 
@@ -53777,7 +54036,7 @@ end;
 
 procedure TNNetCapsuleRouting.Backpropagate();
 var
-  LpBnd43: integer;
+  MaxNeuronPos: integer;
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
   i, j, o, k, nIdx, sjBase, oBase, iBase, errBase: integer;
@@ -53855,8 +54114,8 @@ begin
 
   if (not FBatchUpdate) then
   begin
-    LpBnd43 := FNeurons.Count - 1;
-    for nIdx := 0 to LpBnd43 do
+    MaxNeuronPos := FNeurons.Count - 1;
+    for nIdx := 0 to MaxNeuronPos do
       FArrNeurons[nIdx].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
@@ -54557,8 +54816,8 @@ end;
 
 procedure TNNetPReLU.Backpropagate();
 var
-  LpBnd44: integer;
-  LpBnd45: integer;
+  MaxOutputErrorPos: integer;
+  MaxPrevOutputErrorPos: integer;
   StartTime: double;
   localNeuron: TNNetNeuron;
   gradAlpha, alpha, x: TNeuralFloat;
@@ -54575,8 +54834,8 @@ begin
   // Gradient w.r.t. the scalar alpha:
   // d(alpha) = sum over elements where x <= 0 of OutputError[i] * Input[i].
   gradAlpha := 0;
-  LpBnd44 := FOutputError.Size - 1;
-  for i := 0 to LpBnd44 do
+  MaxOutputErrorPos := FOutputError.Size - 1;
+  for i := 0 to MaxOutputErrorPos do
   begin
     x := LocalPrevOutput.Raw[i];
     if x <= 0 then
@@ -54593,8 +54852,8 @@ begin
   if Assigned(FPrevLayer) and (FPrevLayer.FOutputError.Size = FOutputError.Size) then
   begin
     // Gradient w.r.t. the input: dInput[i] = OutputError[i] * (1 if x>0 else alpha).
-    LpBnd45 := FOutputError.Size - 1;
-    for i := 0 to LpBnd45 do
+    MaxPrevOutputErrorPos := FOutputError.Size - 1;
+    for i := 0 to MaxPrevOutputErrorPos do
     begin
       x := LocalPrevOutput.Raw[i];
       if x > 0 then
@@ -56030,7 +56289,7 @@ end;
 
 procedure TNNetCausalConv1D.Compute();
 var
-  LpBnd46: integer;
+  MaxNeuronPos: integer;
   StartTime: double;
   Prev: TNNetVolume;
   SeqLen, InputDepth, Ksize, Dil, t, f, k, srcT: integer;
@@ -56048,8 +56307,8 @@ begin
   MaxT := SeqLen - 1;
   MaxK := Ksize - 1;
   OutDepth := FOutput.Depth;
-  LpBnd46 := FNeurons.Count - 1;
-  for f := 0 to LpBnd46 do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for f := 0 to MaxNeuronPos do
   begin
     localNeuron := FArrNeurons[f];
     W := localNeuron.FWeights;
@@ -56083,7 +56342,7 @@ end;
 
 procedure TNNetCausalConv1D.Backpropagate();
 var
-  LpBnd47: integer;
+  MaxNeuronPos: integer;
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
   SeqLen, InputDepth, Ksize, Dil, t, f, k, srcT: integer;
@@ -56117,8 +56376,8 @@ begin
   //   dL/dbias[f]   += OutErr[t,f]
   // The -FLearningRate convention is applied to the accumulated weight/bias
   // deltas (matching TNNetTokenShift).
-  LpBnd47 := FNeurons.Count - 1;
-  for f := 0 to LpBnd47 do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for f := 0 to MaxNeuronPos do
   begin
     localNeuron := FArrNeurons[f];
     W := localNeuron.FWeights;
@@ -56198,7 +56457,7 @@ end;
 
 procedure TNNetTDNNConv1D.Compute();
 var
-  LpBnd: integer;
+  MaxNeuronPos: integer;
   StartTime: double;
   Prev: TNNetVolume;
   SeqLen, InputDepth, Ksize, Dil, Half, t, f, k, srcT: integer;
@@ -56217,8 +56476,8 @@ begin
   MaxT := SeqLen - 1;
   MaxK := Ksize - 1;
   OutDepth := FOutput.Depth;
-  LpBnd := FNeurons.Count - 1;
-  for f := 0 to LpBnd do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for f := 0 to MaxNeuronPos do
   begin
     localNeuron := FArrNeurons[f];
     W := localNeuron.FWeights;
@@ -56252,7 +56511,7 @@ end;
 
 procedure TNNetTDNNConv1D.Backpropagate();
 var
-  LpBnd: integer;
+  MaxNeuronPos: integer;
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
   SeqLen, InputDepth, Ksize, Dil, Half, t, f, k, srcT: integer;
@@ -56281,8 +56540,8 @@ begin
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
 
   // Standard conv backward restricted to the centred in-range window.
-  LpBnd := FNeurons.Count - 1;
-  for f := 0 to LpBnd do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for f := 0 to MaxNeuronPos do
   begin
     localNeuron := FArrNeurons[f];
     W := localNeuron.FWeights;
@@ -56866,8 +57125,8 @@ end;
 
 procedure TNNetConvolution3D.Compute();
 var
-  LpBnd48: integer;
-  LpBnd49: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   StartTime: double;
   Prev: TNNetVolume;
   NumFeat, ot, oy, ox, f, kt, ky, kx, ix, iy: integer;
@@ -56888,11 +57147,11 @@ begin
   begin
     localNeuron := FArrNeurons[f];
     W := localNeuron.FWeights;
-    LpBnd48 := FOutput.SizeY - 1;
-    LpBnd49 := FOutput.SizeX - 1;
+    MaxOutputY := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
     for ot := 0 to MaxOT do
-    for oy := 0 to LpBnd48 do
-    for ox := 0 to LpBnd49 do
+    for oy := 0 to MaxOutputY do
+    for ox := 0 to MaxOutputX do
     begin
       if FSuppressBias = 0
         then sum := localNeuron.FBiasWeight
@@ -56924,8 +57183,8 @@ end;
 
 procedure TNNetConvolution3D.Backpropagate();
 var
-  LpBnd50: integer;
-  LpBnd51: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
   NumFeat, ot, oy, ox, f, kt, ky, kx, ix, iy: integer;
@@ -56961,11 +57220,11 @@ begin
     localNeuron := FArrNeurons[f];
     W := localNeuron.FWeights;
     GW := localNeuron.FDelta;
-    LpBnd50 := FOutput.SizeY - 1;
-    LpBnd51 := FOutput.SizeX - 1;
+    MaxOutputY := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
     for ot := 0 to MaxOT do
-    for oy := 0 to LpBnd50 do
-    for ox := 0 to LpBnd51 do
+    for oy := 0 to MaxOutputY do
+    for ox := 0 to MaxOutputX do
     begin
       gy := FOutputError[ox, oy, ot * NumFeat + f];
       if gy = 0 then continue;
@@ -57712,8 +57971,8 @@ var
   SeqLen, C, t, d: integer;
   MaxC, MaxT, basePrev, baseC, pvStride, ocStride: integer;
   raw, wv, uv, kt, vt, aprev, bprev: TNeuralFloat;
-  qprev, ww1, qmax, e1, e2, num, den, dwexp: TNeuralFloat;
-  ww2, qmax2, e3, e4: TNeuralFloat;
+  qprev, ww1, qmax, e1, e2, num, den: TNeuralFloat;
+  ww2, qmax2, e3, e4, eq: TNeuralFloat;
   anew, bnew: TNeuralFloat;
 begin
   if FDecodeEnabled then
@@ -57744,7 +58003,6 @@ begin
   begin
     wv := FW.FData[d];
     uv := Wu.FData[d];
-    dwexp := NeuralExp(-wv);             // e^{-w} in (0,1)
     aprev := 0;                    // stabilised A_{t-1}
     bprev := 0;                    // stabilised B_{t-1}
     qprev := -1e30;                // log-space running max, -inf
@@ -57774,8 +58032,9 @@ begin
       anew := e3 * aprev + e4 * vt;
       bnew := e3 * bprev + e4;
       // Cache TRUE accumulators a_t,b_t (= stabilised * e^{Q_t}).
-      FA.FData[baseC] := anew * NeuralExp(qmax2);
-      FB.FData[baseC] := bnew * NeuralExp(qmax2);
+      eq := NeuralExp(qmax2);              // one exp, two uses
+      FA.FData[baseC] := anew * eq;
+      FB.FData[baseC] := bnew * eq;
       aprev := anew;
       bprev := bnew;
       qprev := qmax2;
@@ -59013,7 +59272,7 @@ var
   MaxC, MaxT, baseKV, baseC, kvStride, ocStride: integer;
   raw, wv, uv, kt, vt, rt, aprev, bprev: TNeuralFloat;
   qprev, ww1, qmax, e1, e2, num, den: TNeuralFloat;
-  ww2, qmax2, e3, e4, anew, bnew, wkv: TNeuralFloat;
+  ww2, qmax2, e3, e4, anew, bnew, wkv, eq: TNeuralFloat;
 begin
   StartTime := Now();
   Rcp := FPrevLayer.FOutput;        // receptance source A (depth C)
@@ -59070,8 +59329,9 @@ begin
       e4 := NeuralExp(kt - qmax2);
       anew := e3 * aprev + e4 * vt;
       bnew := e3 * bprev + e4;
-      FA.FData[baseC] := anew * NeuralExp(qmax2);
-      FB.FData[baseC] := bnew * NeuralExp(qmax2);
+      eq := NeuralExp(qmax2);                          // one exp, two uses
+      FA.FData[baseC] := anew * eq;
+      FB.FData[baseC] := bnew * eq;
       aprev := anew;
       bprev := bnew;
       qprev := qmax2;
@@ -59097,7 +59357,7 @@ var
   QLen, KVLen, C, t, i, d: integer;
   MaxC, MaxKV, MaxQ, baseKV, baseC, baseLast, baseQ, kvStride, ocStride: integer;
   raw, wv, kt, vt, aprev, bprev: TNeuralFloat;
-  qprev, ww2, qmax2, e3, e4, anew, bnew, summaryWkv, rt: TNeuralFloat;
+  qprev, ww2, qmax2, e3, e4, anew, bnew, summaryWkv, rt, eq: TNeuralFloat;
 begin
   StartTime := Now();
   Rcp := FPrevLayer.FOutput;        // receptance source A (depth C), len QLen
@@ -59140,8 +59400,9 @@ begin
       anew := e3 * aprev + e4 * vt;
       bnew := e3 * bprev + e4;
       // FA, FB share (KVLen,1,C): one offset for both.
-      FA.FData[baseC] := anew * NeuralExp(qmax2);
-      FB.FData[baseC] := bnew * NeuralExp(qmax2);
+      eq := NeuralExp(qmax2);                     // one exp, two uses
+      FA.FData[baseC] := anew * eq;
+      FB.FData[baseC] := bnew * eq;
       aprev := anew;
       bprev := bnew;
       qprev := qmax2;
@@ -62131,11 +62392,14 @@ begin
   FWindow := TNNetVolume.Create();
   FGradS := TNNetVolume.Create();
   FGBank := TNNetVolume.Create();
+  FBankSrc := TNNetVolume.Create();
+  FBankValid := false;
   AddMissingNeurons(1);
 end;
 
 destructor TNNetSincConv1D.Destroy();
 begin
+  FBankSrc.Free;
   FGBank.Free;
   FGradS.Free;
   FWindow.Free;
@@ -62172,6 +62436,8 @@ begin
   FBank.ReSize(FKernelSize, 1, FNumFilters);
   FWindow.ReSize(FKernelSize, 1, 1);
   FGradS.ReSize(FNumFilters, 1, 2);
+  FBankSrc.ReSize(FNumFilters, 1, 2);
+  FBankValid := false;   // geometry changed: the cached bank no longer applies
   // Hamming window over n = 0..K-1: 0.54 - 0.46*cos(2*pi*n/(K-1)).
   half := (FKernelSize - 1) shr 1;
   KernelSizeM1 := FKernelSize - 1;
@@ -62218,6 +62484,37 @@ begin
   end;
 end;
 
+// Rebuilds the filter bank only when the (low,band) scalars it was built from
+// changed. The check is 2*NumFilters float compares; the rebuild it skips is
+// 2*NumFilters*KernelSize sin/divide evaluations.
+procedure TNNetSincConv1D.MaterializeBankIfStale();
+var
+  W: TNNetVolume;
+  i, WSize, WSizeM1: integer;
+  stale: boolean;
+begin
+  W := FNeurons[0].FWeights;
+  WSize := W.Size;
+  stale := (not FBankValid) or (FBankSrc.Size <> WSize);
+  if not stale then
+  begin
+    WSizeM1 := WSize - 1;
+    for i := 0 to WSizeM1 do
+      if FBankSrc.FData[i] <> W.FData[i] then
+      begin
+        stale := true;
+        break;
+      end;
+  end;
+  if not stale then exit;
+  // Lazy, amortized resize of a persistent field (rule #17): only on a shape
+  // change, never per call.
+  if FBankSrc.Size <> WSize then FBankSrc.ReSize(W);
+  MaterializeBank();
+  Move(W.FData[0], FBankSrc.FData[0], WSize * csNeuralFloatSize);
+  FBankValid := true;
+end;
+
 procedure TNNetSincConv1D.Compute();
 var
   StartTime: double;
@@ -62228,7 +62525,7 @@ var
   XPtr, BankPtr, OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  MaterializeBank();
+  MaterializeBankIfStale();
   Prev := FPrevLayer.FOutput;
   XPtr := Prev.GetRawPtr(0, 0);
   BankPtr := FBank.GetRawPtr(0, 0);
@@ -65772,7 +66069,7 @@ end;
 
 procedure TNNetTestTimeTraining.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  LpBnd52: integer;
+  MaxNeuronPos: integer;
   ii, SeqLen: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -65805,8 +66102,8 @@ begin
   // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
   if FIsTrainable then
   begin
-    LpBnd52 := FNeurons.Count - 1;
-    for ii := 0 to LpBnd52 do
+    MaxNeuronPos := FNeurons.Count - 1;
+    for ii := 0 to MaxNeuronPos do
     begin
       FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
       FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
@@ -66005,7 +66302,7 @@ end;
 
 procedure TNNetTestTimeTraining.Backpropagate();
 var
-  LpBnd53: integer;
+  MaxNeuronPos: integer;
   StartTime: double;
   ThK, ThV, ThQ, W1init, W2init: TNNetVolume;
   GThK, GThV, GThQ, GW1in, GW2in: TNNetVolume;
@@ -66257,8 +66554,8 @@ begin
   FNeurons[3].FDelta.FData[0] := FNeurons[3].FDelta.FData[0] + negLR * etaGrad;
   if (not FBatchUpdate) then
   begin
-    LpBnd53 := FNeurons.Count - 1;
-    for j := 0 to LpBnd53 do FNeurons[j].UpdateWeights(FInertia);
+    MaxNeuronPos := FNeurons.Count - 1;
+    for j := 0 to MaxNeuronPos do FNeurons[j].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -66267,8 +66564,8 @@ end;
 
 procedure TNNetTestTimeTraining.InitDefault();
 var
-  LpBnd54: integer;
-  LpBnd55: integer;
+  MaxW1InitPos: integer;
+  MaxW2InitPos: integer;
   WeightsSizeM1: integer;
   Depth, Hd, a, b: integer;
   oldSeed: Cardinal;
@@ -66293,11 +66590,11 @@ begin
     Hd := FHidden;
     sc1 := 1.0 / Sqrt(Depth);
     sc2 := 1.0 / Sqrt(Max(Hd, 1));
-    LpBnd54 := FNeurons[4].FWeights.Size - 1;
-    for b := 0 to LpBnd54 do
+    MaxW1InitPos := FNeurons[4].FWeights.Size - 1;
+    for b := 0 to MaxW1InitPos do
       FNeurons[4].FWeights.FData[b] := FNeurons[4].FWeights.RandomGaussianValue() * sc1;
-    LpBnd55 := FNeurons[5].FWeights.Size - 1;
-    for b := 0 to LpBnd55 do
+    MaxW2InitPos := FNeurons[5].FWeights.Size - 1;
+    for b := 0 to MaxW2InitPos do
       FNeurons[5].FWeights.FData[b] := FNeurons[5].FWeights.RandomGaussianValue() * sc2;
   end;
   RandSeed := oldSeed;
@@ -66354,7 +66651,7 @@ end;
 
 procedure TNNetTitansMemory.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  LpBnd56: integer;
+  MaxNeuronPos: integer;
   ii, SeqLen: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -66381,8 +66678,8 @@ begin
   // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
   if FIsTrainable then
   begin
-    LpBnd56 := FNeurons.Count - 1;
-    for ii := 0 to LpBnd56 do
+    MaxNeuronPos := FNeurons.Count - 1;
+    for ii := 0 to MaxNeuronPos do
     begin
       FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
       FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
@@ -66547,7 +66844,7 @@ end;
 
 procedure TNNetTitansMemory.Backpropagate();
 var
-  LpBnd57: integer;
+  MaxNeuronPos: integer;
   StartTime: double;
   ThK, ThV, ThQ, Walpha, W1init, W2init, W1pVol, W2pVol: TNNetVolume;
   GThK, GThV, GThQ, GWalpha, GW1in, GW2in: TNNetVolume;
@@ -66828,8 +67125,8 @@ begin
   TNNetVolume.MulAdd(GW2in.GetRawPtr(), @FgW2Buf[0], negLR, DHM1 + 1);
   if (not FBatchUpdate) then
   begin
-    LpBnd57 := FNeurons.Count - 1;
-    for j := 0 to LpBnd57 do FNeurons[j].UpdateWeights(FInertia);
+    MaxNeuronPos := FNeurons.Count - 1;
+    for j := 0 to MaxNeuronPos do FNeurons[j].UpdateWeights(FInertia);
     AfterWeightUpdate();
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -66838,9 +67135,9 @@ end;
 
 procedure TNNetTitansMemory.InitDefault();
 var
-  LpBnd58: integer;
-  LpBnd59: integer;
-  LpBnd60: integer;
+  MaxAlphaWeightPos: integer;
+  MaxW1InitPos: integer;
+  MaxW2InitPos: integer;
   WeightsSizeM1: integer;
   Depth, Hd, a, b: integer;
   oldSeed: Cardinal;
@@ -66871,16 +67168,16 @@ begin
     FNeurons[4].FWeights.FData[b] := 1.5;  // theta~0.82: a brisk one-shot inner write
     FNeurons[5].FWeights.FData[b] := -3.0; // alpha~0.047: gentle forgetting bounds the momentum sum
   end;
-  LpBnd58 := FNeurons[6].FWeights.Size - 1;
-  for b := 0 to LpBnd58 do
+  MaxAlphaWeightPos := FNeurons[6].FWeights.Size - 1;
+  for b := 0 to MaxAlphaWeightPos do
     FNeurons[6].FWeights.FData[b] := FNeurons[6].FWeights.RandomGaussianValue() * 0.1;
   sc1 := 1.0 / Sqrt(Depth);
   sc2 := 1.0 / Sqrt(Max(Hd, 1));
-  LpBnd59 := FNeurons[7].FWeights.Size - 1;
-  for b := 0 to LpBnd59 do
+  MaxW1InitPos := FNeurons[7].FWeights.Size - 1;
+  for b := 0 to MaxW1InitPos do
     FNeurons[7].FWeights.FData[b] := FNeurons[7].FWeights.RandomGaussianValue() * sc1;
-  LpBnd60 := FNeurons[8].FWeights.Size - 1;
-  for b := 0 to LpBnd60 do
+  MaxW2InitPos := FNeurons[8].FWeights.Size - 1;
+  for b := 0 to MaxW2InitPos do
     FNeurons[8].FWeights.FData[b] := FNeurons[8].FWeights.RandomGaussianValue() * sc2;
   RandSeed := oldSeed;
   AfterWeightUpdate();
@@ -66958,7 +67255,7 @@ end;
 
 procedure TNNetSelectiveSSM.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  LpBnd61: integer;
+  MaxNeuronPos: integer;
   Depth, NS, BCRows, ii: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -67006,8 +67303,8 @@ begin
   // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
   if FIsTrainable then
   begin
-    LpBnd61 := FNeurons.Count - 1;
-    for ii := 0 to LpBnd61 do
+    MaxNeuronPos := FNeurons.Count - 1;
+    for ii := 0 to MaxNeuronPos do
     begin
       FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
       FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
@@ -67132,12 +67429,12 @@ end;
 // channels, per-(channel,state) decay. See the class comment for the formulas.
 procedure TNNetSelectiveSSM.ComputeMultiState(pResetState: boolean = true);
 var
-  LpBnd62: integer;
+  MaxARawPos: integer;
   StartTime: double;
   Wd, WB, WC, Bd, Ar, Ee, Prev: TNNetVolume;
   SeqLen, Depth, NS, t, d, j, s, hbase, ebase: integer;
   DepthM1, SeqLenM1, NSM1, tDepth, tNS: integer;
-  pre, sp, ad, hnew, accY, xd: TNeuralFloat;
+  pre, sp, ad, hnew, accY, xd, spxd: TNeuralFloat;
   XtPtr, OutPtr, WdRow: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
@@ -67155,8 +67452,8 @@ begin
   SeqLenM1 := SeqLen - 1;
   NSM1 := NS - 1;
   // Precompute exp(A_raw[d,s]), clamped against overflow during training.
-  LpBnd62 := Ar.Size - 1;
-  for j := 0 to LpBnd62 do
+  MaxARawPos := Ar.Size - 1;
+  for j := 0 to MaxARawPos do
     FExpA.FData[j] := NeuralExp(Min(Ar.FData[j], 10));
   if pResetState then FH.Fill(0);
   for t := 0 to SeqLenM1 do
@@ -67191,13 +67488,14 @@ begin
     begin
       sp := FDelta.FData[tDepth + d];
       xd := XtPtr^[d];
+      spxd := sp * xd;   // Rule #5: sp,xd fixed across the s loop -> one mul/state.
       hbase := (tDepth + d) * NS;
       ebase := d * NS;
       for s := 0 to NSM1 do
       begin
         ad := NeuralExp(-sp * FExpA.FData[ebase + s]);
         FAt.FData[hbase + s] := ad;
-        hnew := ad * FH.FData[ebase + s] + sp * FBt.FData[tNS + s] * xd;
+        hnew := ad * FH.FData[ebase + s] + spxd * FBt.FData[tNS + s];
         FH.FData[ebase + s] := hnew;
         FState.FData[hbase + s] := hnew;
       end;
@@ -67222,12 +67520,12 @@ procedure TNNetSelectiveSSM.ComputeJambaInner(pResetState: boolean = true);
 //   y_t[d]   = sum_s c_t[s]*h_t[d,s] + D[d]*x[d]
 // rms(v) = v / sqrt(mean(v^2) + eps).  Forward-only (see Backpropagate).
 var
-  LpBnd63: integer;
+  MaxARawPos: integer;
   StartTime: double;
   WdtProj, WB, WC, Bd, Ar, Ee, WxProj, GDt, GB, GC, Prev: TNNetVolume;
   SeqLen, Depth, NS, RK, t, d, s, r, hbase, ebase: integer;
   DepthM1, SeqLenM1, NSM1, RKM1, tDepth, tNS: integer;
-  pre, sp, ad, hnew, accY, xd, ss, inv, eps: TNeuralFloat;
+  pre, sp, ad, hnew, accY, xd, ss, inv, eps, spxd: TNeuralFloat;
   XtPtr, OutPtr, WdtRow: TNeuralFloatArrPtr;
 
   function RmsScale(V: TNNetVolume; Cnt: integer): TNeuralFloat;
@@ -67261,8 +67559,8 @@ begin
   RKM1 := RK - 1;
   eps := FFloatSt[0];
   if eps <= 0 then eps := 1e-6;
-  LpBnd63 := Ar.Size - 1;
-  for s := 0 to LpBnd63 do
+  MaxARawPos := Ar.Size - 1;
+  for s := 0 to MaxARawPos do
     FExpA.FData[s] := NeuralExp(Min(Ar.FData[s], 10));
   if pResetState then FH.Fill(0);
   for t := 0 to SeqLenM1 do
@@ -67313,13 +67611,14 @@ begin
     begin
       sp := FDelta.FData[tDepth + d];
       xd := XtPtr^[d];
+      spxd := sp * xd;   // Rule #5: sp,xd fixed across the s loop -> one mul/state.
       hbase := (tDepth + d) * NS;
       ebase := d * NS;
       for s := 0 to NSM1 do
       begin
         ad := NeuralExp(-sp * FExpA.FData[ebase + s]);
         FAt.FData[hbase + s] := ad;
-        hnew := ad * FH.FData[ebase + s] + sp * FBt.FData[tNS + s] * xd;
+        hnew := ad * FH.FData[ebase + s] + spxd * FBt.FData[tNS + s];
         FH.FData[ebase + s] := hnew;
         FState.FData[hbase + s] := hnew;
       end;
@@ -67527,7 +67826,7 @@ end;
 // input gradient.
 procedure TNNetSelectiveSSM.BackpropagateMultiState();
 var
-  LpBnd64: integer;
+  MaxARawPos: integer;
   StartTime: double;
   Nd, NB, NC, NBd, NA, NE: TNNetNeuron;
   Wd, WB, WC, Ar, Ee, Prev, PrevErr: TNNetVolume;
@@ -67553,8 +67852,8 @@ begin
   DepthM1 := Depth - 1;
   NSM1 := NS - 1;
   DepthNS := Depth * NS;                 // #5: fully loop-invariant state stride
-  LpBnd64 := Ar.Size - 1;
-  for j := 0 to LpBnd64 do
+  MaxARawPos := Ar.Size - 1;
+  for j := 0 to MaxARawPos do
     FExpA.FData[j] := NeuralExp(Min(Ar.FData[j], 10));
   FGh.Fill(0);
   FGradWd.Fill(0); FGradWB.Fill(0); FGradWC.Fill(0);
@@ -67779,7 +68078,7 @@ end;
 
 procedure TNNetMamba2.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  LpBnd65: integer;
+  MaxNeuronPos: integer;
   ExpectedIn, ii: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -67807,8 +68106,8 @@ begin
   // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
   if FIsTrainable then
   begin
-    LpBnd65 := FNeurons.Count - 1;
-    for ii := 0 to LpBnd65 do
+    MaxNeuronPos := FNeurons.Count - 1;
+    for ii := 0 to MaxNeuronPos do
     begin
       FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
       FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
@@ -67837,7 +68136,7 @@ var
   dInner, P, N, NG, gw, hbase, ebase, xbase: integer;
   SeqLenM1, NumHeadsM1, PM1, NM1, dInnerM1, tHeads, tDInner: integer;
   idxH, hP, bBase, cBase, idxS, idxC: integer;
-  pre, dth, ah, xv, hnew, accY, ar, zsq, gate, msq, rstd: TNeuralFloat;
+  pre, dth, ah, xv, dtxv, hnew, accY, ar, zsq, gate, msq, rstd: TNeuralFloat;
   XtPtr, OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
@@ -67901,13 +68200,14 @@ begin
       begin
         xbase := hP + c;
         xv := XtPtr^[xbase];
+        dtxv := dth * xv;   // invariant across the s loop: one multiply per s, not two
         ebase := xbase * N;
         hbase := (tDInner + xbase) * N;
         for s := 0 to NM1 do
         begin
           idxS := ebase + s;
           hnew := ah * FH.FData[idxS] +
-            dth * XtPtr^[bBase + s] * xv;
+            dtxv * XtPtr^[bBase + s];
           FH.FData[idxS] := hnew;
           FState.FData[hbase + s] := hnew;
         end;
@@ -67948,11 +68248,12 @@ var
   SeqLen, t, h, c, s, g, hpg, bOff, cOff, dtOff, gateOff, SeqLenM1: integer;
   dInner, P, N, NG, gw, hbase, ebase, xbase: integer;
   NumHeadsM1, PM1, NM1, dInnerM1, tDInner, tHeads, idx: integer;
-  DInnerN, hbasePrev, bBase, cBase: integer;
+  DInnerN, hbasePrev, bBase, cBase, hP: integer;
   hasInputGrad: boolean;
   GyPtr, XtPtr, PrevErrPtr: TNeuralFloatArrPtr;
   rstd, gy, z, dotzg, gz, gate, sig, silu, dsilu, gdth, ght, gAlog: TNeuralFloat;
   dth, ah, ar, xv, htm1, gy_y, gpre, gxv, yval: TNeuralFloat;
+  kZ, arah, ghtdth, gyz: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -68009,18 +68310,20 @@ begin
     for c := 0 to dInnerM1 do
     begin
       z := FZ.FData[tDInner + c];
+      gyz := GyPtr^[c] * z;                      // one product, two uses
       FGradNorm.FData[c] := FGradNorm.FData[c] +
-        GyPtr^[c] * z * rstd;                    // dL/dnorm_weight
-      dotzg := dotzg + NormW.FData[c] * GyPtr^[c] * z;
+        gyz * rstd;                              // dL/dnorm_weight
+      dotzg := dotzg + NormW.FData[c] * gyz;
     end;
     // dL/dy_c and dL/dgate_c. Overwrite FY in place with dL/dy_c for the
     // recurrence pass (the forward y_t is no longer needed).
+    // rstd^3/dInner*dotzg is invariant across c: one divide per t, not per element.
+    kZ := rstd * rstd * rstd / dInner * dotzg;
     for c := 0 to dInnerM1 do
     begin
       gy := GyPtr^[c];
       idx := tDInner + c;
-      gz := NormW.FData[c] * rstd * gy
-        - FZ.FData[idx] * rstd * rstd * rstd / dInner * dotzg;
+      gz := NormW.FData[c] * rstd * gy - FZ.FData[idx] * kZ;
       gate := XtPtr^[gateOff + c];
       sig := 1 / (1 + NeuralExp(-gate));
       silu := gate * sig;
@@ -68041,11 +68344,13 @@ begin
       dth := FDt.FData[tHeads + h];
       ah := FAt.FData[tHeads + h];
       ar := FArBuf[h];   // A = -exp(A_log)
+      arah := ar * ah;   // invariant across the c/s loops below
+      hP := h * P;
       gdth := 0;
       gAlog := 0;
       for c := 0 to PM1 do
       begin
-        xbase := h * P + c;
+        xbase := hP + c;
         xv := XtPtr^[xbase];
         ebase := xbase * N;
         hbase := (tDInner + xbase) * N;
@@ -68067,16 +68372,17 @@ begin
               gy_y * FState.FData[hbase + s];
           // h_t = a*h_{t-1} + dt*B*x ; a = exp(dt*ar).
           // dt path: dh/ddt = ar*a*h_{t-1} + B*x.
-          gdth := gdth + ght * (ar * ah * htm1 +
+          gdth := gdth + ght * (arah * htm1 +
             XtPtr^[bBase + s] * xv);
           // A_log path: da/dA_log = a*dt*ar (ar=-exp(A_log)); dh/da = h_{t-1}.
           gAlog := gAlog + ght * htm1;
+          ghtdth := ght * dth;   // one product, two uses
           // B path (input grad): dh/dB = dt*x.
           if hasInputGrad then
             PrevErrPtr^[bBase + s] := PrevErrPtr^[bBase + s] +
-              ght * dth * xv;
+              ghtdth * xv;
           // x path through dt*B*x.
-          gxv := gxv + ght * dth * XtPtr^[bBase + s];
+          gxv := gxv + ghtdth * XtPtr^[bBase + s];
           // Propagate to t-1: gh_{t-1}[c,s] = a*gh_t[c,s].
           FGh.FData[ebase + s] := ah * ght;
         end;
@@ -68449,9 +68755,9 @@ end;
 
 procedure TNNetImplicitLongConv.InitDefault();
 var
-  LpBnd66: integer;
-  LpBnd67: integer;
-  LpBnd68: integer;
+  MaxW1X: integer;
+  MaxW1D: integer;
+  MaxW2D: integer;
   Depth, j, f, c: integer;
   DepthM1: integer;
   oldSeed: Cardinal;
@@ -68463,17 +68769,17 @@ begin
   // inside the residual builders / the Hyena operator block.
   oldSeed := RandSeed;
   RandSeed := 270101;
-  LpBnd66 := FNeurons[0].FWeights.SizeX - 1;
-  LpBnd67 := FNeurons[0].FWeights.Depth - 1;
-  for j := 0 to LpBnd66 do
-    for f := 0 to LpBnd67 do
+  MaxW1X := FNeurons[0].FWeights.SizeX - 1;
+  MaxW1D := FNeurons[0].FWeights.Depth - 1;
+  for j := 0 to MaxW1X do
+    for f := 0 to MaxW1D do
       FNeurons[0].FWeights[j, 0, f] := FNeurons[0].FWeights.RandomGaussianValue() * 0.1;
   FNeurons[1].FWeights.Fill(0);
   Depth := FNeurons[2].FWeights.SizeX;
   DepthM1 := Depth - 1;
-  LpBnd68 := FNeurons[2].FWeights.Depth - 1;
+  MaxW2D := FNeurons[2].FWeights.Depth - 1;
   for c := 0 to DepthM1 do
-    for j := 0 to LpBnd68 do
+    for j := 0 to MaxW2D do
       FNeurons[2].FWeights[c, 0, j] := FNeurons[2].FWeights.RandomGaussianValue() * 0.1;
   FNeurons[3].FWeights.Fill(0);
   FNeurons[4].FWeights.Fill(0);
@@ -69780,7 +70086,7 @@ begin
     // FOutput = gamma .* x_hat + beta  (elementwise over the depth segment).
     system.Move(XHatPtr^, XPtr^, Depth * csNeuralFloatSize);
     TNNetVolume.Mul(XPtr, GammaPtr, Depth);
-    TNNetVolume.MulAdd(XPtr, BetaPtr, 1, Depth);
+    TNNetVolume.Add(XPtr, BetaPtr, Depth);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -70819,8 +71125,8 @@ end;
 
 procedure TNNetPixelNorm.Compute();
 var
-  LpBnd69: integer;
-  LpBnd70: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   StartTime: double;
   x, y, PixelIdx, Depth: integer;
   SumSqr, InvRMS: TNeuralFloat;
@@ -70860,11 +71166,11 @@ begin
   // depth-contiguous TNNetVolume primitives (mirrors TNNetL2Normalize):
   //   sum-of-squares via DotProduct(ptr, ptr, Depth), rescale via Mul.
   PixelIdx := 0;
-  LpBnd69 := FOutput.SizeY - 1;
-  for y := 0 to LpBnd69 do
+  MaxOutputY := FOutput.SizeY - 1;
+  for y := 0 to MaxOutputY do
   begin
-    LpBnd70 := FOutput.SizeX - 1;
-    for x := 0 to LpBnd70 do
+    MaxOutputX := FOutput.SizeX - 1;
+    for x := 0 to MaxOutputX do
     begin
       OutPtr := FOutput.GetRawPtr(x, y);
       SumSqr := TNNetVolume.DotProduct(OutPtr, OutPtr, Depth);
@@ -70881,8 +71187,8 @@ end;
 
 procedure TNNetPixelNorm.Backpropagate();
 var
-  LpBnd71: integer;
-  LpBnd72: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   StartTime: double;
   x, y, PixelIdx, Depth: integer;
   SumDyY, InvRMS, DepthF: TNeuralFloat;
@@ -70905,11 +71211,11 @@ begin
     // mirroring TNNetL2Normalize.BackpropagatePerDepth.
     DepthF := Depth;
     PixelIdx := 0;
-    LpBnd71 := FOutput.SizeY - 1;
-    for y := 0 to LpBnd71 do
+    MaxOutputY := FOutput.SizeY - 1;
+    for y := 0 to MaxOutputY do
     begin
-      LpBnd72 := FOutput.SizeX - 1;
-      for x := 0 to LpBnd72 do
+      MaxOutputX := FOutput.SizeX - 1;
+      for x := 0 to MaxOutputX do
       begin
         YPtr := FNormalized.GetRawPtr(x, y);
         GyPtr := FOutputError.GetRawPtr(x, y);
@@ -71023,8 +71329,8 @@ end;
 
 procedure TNNetGroupNorm.Compute();
 var
-  LpBndX: integer;
-  LpBndY: integer;
+  MaxOutputX: integer;
+  MaxOutputY: integer;
   StartTime: double;
   Mean, Variance, InvStd: TNeuralFloat;
   GroupCnt, GroupSize, FGroupsM1, GroupDepth: integer;
@@ -71049,8 +71355,8 @@ begin
   GroupDepth := FChannelsPerGroup;
   GroupSize := FOutput.SizeX * FOutput.SizeY * GroupDepth;
   FGroupsM1 := FGroups - 1;
-  LpBndX := FOutput.SizeX - 1;
-  LpBndY := FOutput.SizeY - 1;
+  MaxOutputX := FOutput.SizeX - 1;
+  MaxOutputY := FOutput.SizeY - 1;
   OnesPtr := TNeuralFloatArrPtr(FOnes.GetRawPtr(0));
   if FChannelsPerGroup = 1 then
   begin
@@ -71066,8 +71372,8 @@ begin
       FInvStdDev[GroupCnt] := FInvStdScratch.FData[GroupCnt];
     MeanPtr := TNeuralFloatArrPtr(FMeanScratch.GetRawPtr(0));
     InvStdPtr := TNeuralFloatArrPtr(FInvStdScratch.GetRawPtr(0));
-    for CntX := 0 to LpBndX do
-      for CntY := 0 to LpBndY do
+    for CntX := 0 to MaxOutputX do
+      for CntY := 0 to MaxOutputY do
       begin
         ColPtr := TNeuralFloatArrPtr(FOutput.GetRawPtr(CntX, CntY));
         TNNetVolume.MulAdd(ColPtr, MeanPtr, -1.0, FOutput.Depth);
@@ -71095,8 +71401,8 @@ begin
     // is contiguous in memory, so the per-column reduction is an AVX dot
     // product against a ones vector.
     Mean := 0;
-    for CntX := 0 to LpBndX do
-      for CntY := 0 to LpBndY do
+    for CntX := 0 to MaxOutputX do
+      for CntY := 0 to MaxOutputY do
       begin
         ColPtr := TNeuralFloatArrPtr(FOutput.GetRawPtr(CntX, CntY, DStart));
         Mean := Mean + TNNetVolume.DotProduct(ColPtr, OnesPtr, GroupDepth);
@@ -71105,8 +71411,8 @@ begin
     // Subtract the mean (MulAdd with the ones vector) and accumulate the
     // variance (sum of squares = self dot product).
     Variance := 0;
-    for CntX := 0 to LpBndX do
-      for CntY := 0 to LpBndY do
+    for CntX := 0 to MaxOutputX do
+      for CntY := 0 to MaxOutputY do
       begin
         ColPtr := TNeuralFloatArrPtr(FOutput.GetRawPtr(CntX, CntY, DStart));
         TNNetVolume.MulAdd(ColPtr, OnesPtr, -Mean, GroupDepth);
@@ -71115,8 +71421,8 @@ begin
     Variance := Variance / GroupSize;
     InvStd := pcr_rsqrtf(Variance + FGroupNormEpsilon);
     FInvStdDev[GroupCnt] := InvStd;
-    for CntX := 0 to LpBndX do
-      for CntY := 0 to LpBndY do
+    for CntX := 0 to MaxOutputX do
+      for CntY := 0 to MaxOutputY do
       begin
         ColPtr := TNeuralFloatArrPtr(FOutput.GetRawPtr(CntX, CntY, DStart));
         TNNetVolume.Mul(ColPtr, InvStd, GroupDepth);
@@ -71140,8 +71446,8 @@ end;
 
 procedure TNNetGroupNorm.Backpropagate();
 var
-  LpBndX: integer;
-  LpBndY: integer;
+  MaxOutputX: integer;
+  MaxOutputY: integer;
   StartTime: double;
   GroupCnt, GroupSize, FGroupsM1, GroupDepth: integer;
   CntX, CntY, DStart: integer;
@@ -71185,8 +71491,8 @@ begin
     GroupDepth := FChannelsPerGroup;
     GroupSize := FOutput.SizeX * FOutput.SizeY * GroupDepth;
     FloatGroupSize := GroupSize;
-    LpBndX := FOutput.SizeX - 1;
-    LpBndY := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
+    MaxOutputY := FOutput.SizeY - 1;
     OnesPtr := TNeuralFloatArrPtr(FOnes.GetRawPtr(0));
     // dxhat = OutputError * gamma
     // dx = invStdDev * ( dxhat - mean(dxhat) - xhat * mean(dxhat*xhat) )
@@ -71207,8 +71513,8 @@ begin
       InvStd := FInvStdDev[GroupCnt];
       SumDxHat := 0;
       SumDxHatXHat := 0;
-      for CntX := 0 to LpBndX do
-        for CntY := 0 to LpBndY do
+      for CntX := 0 to MaxOutputX do
+        for CntY := 0 to MaxOutputY do
         begin
           ColDeriv := TNeuralFloatArrPtr(FOutputErrorDeriv.GetRawPtr(CntX, CntY, DStart));
           ColNorm := TNeuralFloatArrPtr(FNormalized.GetRawPtr(CntX, CntY, DStart));
@@ -71217,8 +71523,8 @@ begin
         end;
       SumDxHat := SumDxHat / FloatGroupSize;
       SumDxHatXHat := SumDxHatXHat / FloatGroupSize;
-      for CntX := 0 to LpBndX do
-        for CntY := 0 to LpBndY do
+      for CntX := 0 to MaxOutputX do
+        for CntY := 0 to MaxOutputY do
         begin
           ColDeriv := TNeuralFloatArrPtr(FOutputErrorDeriv.GetRawPtr(CntX, CntY, DStart));
           ColNorm := TNeuralFloatArrPtr(FNormalized.GetRawPtr(CntX, CntY, DStart));
@@ -71427,7 +71733,7 @@ begin
       // Only the concatenated weight cache is skipped:
       //  - int8: the per-neuron FP32 volumes are shrunk to a single element,
       //    so concatenating them would build a garbage cache (the fused int8
-      //    kernels consume FQuantCodes directly).
+      //    kernels consume FQuantTable directly).
       //  - low-memory: ComputeLowMemoryCPU reads per-neuron weights directly,
       //    so the persistent cache is pure overhead.
       if not FQuantInt8 and not ActiveLowMemory() then
@@ -71464,8 +71770,7 @@ end;
 function TNNetLayerConcatedWeights.ArmBuildQuantInt8Storage(
   x, y, d: integer): boolean;
 var
-  NeuronsM1: integer;
-  NeuronCnt, V: integer;
+  V: integer;
 begin
   Result := false;
   if (FNN = nil) or (not FNN.FBuildQuantInt8) then exit;
@@ -71478,15 +71783,15 @@ begin
   if not NeuralInt8QuantizableClass(Self) then exit;
   if FNeurons[0].Weights.Size > 1 then exit; // live FP32 rows: FP32 path
   if FQuantInt8 and (FQuantVectorSize = V) then exit(true);
-  if FQuantInt8 then SetLength(FQuantCodes, 0); // dim change: fresh zeros
   FQuantVectorSize := V;
   FQuantWSizeX := x;
   FQuantWSizeY := y;
   FQuantWSizeD := d;
-  SetLength(FQuantCodes, FNeurons.Count * V); // zero codes = zero weights
-  SetLength(FQuantScales, FNeurons.Count);
-  NeuronsM1 := FNeurons.Count - 1;
-  for NeuronCnt := 0 to NeuronsM1 do FQuantScales[NeuronCnt] := 1;
+  // ReSize does no zero fill, so the arming state is written explicitly:
+  // zero codes = zero weights, unit scales.
+  FQuantTable.ReSize(FNeurons.Count, 1, V);
+  FQuantTable.Fill(0);
+  FQuantTable.ScaleData.Fill(1);
   FQuantInt8 := true;
   // Parity with the inherited FP32 sizing path: refresh the fast mirror and
   // run the post-sizing hook (the FQuantInt8 guard inside AfterWeightUpdate
@@ -71579,8 +71884,8 @@ end;
 
 procedure TNNetLayerConcatedWeights.QuantizeWeightsInt8();
 var
-  LpBnd84: integer;
-  LpBnd85: integer;
+  MaxQuantNeuronPos: integer;
+  MaxShrinkNeuronPos: integer;
   NeuronCnt, RowBase: integer;
   Scale: TNeuralFloat;
   W: TNNetVolume;
@@ -71593,10 +71898,9 @@ begin
   FQuantWSizeX := FNeurons[0].Weights.SizeX;
   FQuantWSizeY := FNeurons[0].Weights.SizeY;
   FQuantWSizeD := FNeurons[0].Weights.Depth;
-  SetLength(FQuantScales, FNeurons.Count);
-  SetLength(FQuantCodes, FNeurons.Count * FQuantVectorSize);
-  LpBnd84 := FNeurons.Count - 1;
-  for NeuronCnt := 0 to LpBnd84 do
+  FQuantTable.ReSize(FNeurons.Count, 1, FQuantVectorSize);
+  MaxQuantNeuronPos := FNeurons.Count - 1;
+  for NeuronCnt := 0 to MaxQuantNeuronPos do
   begin
     W := FNeurons[NeuronCnt].Weights;
     if W.Size <> FQuantVectorSize then
@@ -71608,14 +71912,14 @@ begin
     end;
     RowBase := NeuronCnt * FQuantVectorSize;
     QuantizeInt8RowTolerant(TNeuralFloatArrPtr(@W.FData[0]),
-      FQuantVectorSize, @FQuantCodes[RowBase], Scale);
-    FQuantScales[NeuronCnt] := Scale;
+      FQuantVectorSize, @FQuantTable.FData[RowBase], Scale);
+    FQuantTable.Scale[NeuronCnt, 0] := Scale;
   end;
   // Free the FP32 storage only after every row quantized successfully.
   // (1,1,1) matches the pre-SetNumWeights state; SetLength inside ReSize
   // genuinely shrinks the heap allocations.
-  LpBnd85 := FNeurons.Count - 1;
-  for NeuronCnt := 0 to LpBnd85 do
+  MaxShrinkNeuronPos := FNeurons.Count - 1;
+  for NeuronCnt := 0 to MaxShrinkNeuronPos do
   begin
     FNeurons[NeuronCnt].Weights.ReSize(1, 1, 1);
     FNeurons[NeuronCnt].Weights.Fill(0);
@@ -71627,25 +71931,19 @@ end;
 
 procedure TNNetLayerConcatedWeights.DequantizeWeightsInt8();
 var
-  LpBnd86: integer;
-  NeuronCnt, ElementCnt, RowBase, QVSizeM1: integer;
-  Scale: TNeuralFloat;
+  MaxDequantNeuronPos: integer;
+  NeuronCnt: integer;
   W: TNNetVolume;
 begin
   if not FQuantInt8 then exit;
-  LpBnd86 := FNeurons.Count - 1;
-  QVSizeM1 := FQuantVectorSize - 1;
-  for NeuronCnt := 0 to LpBnd86 do
+  MaxDequantNeuronPos := FNeurons.Count - 1;
+  for NeuronCnt := 0 to MaxDequantNeuronPos do
   begin
     W := FNeurons[NeuronCnt].Weights;
     W.ReSize(FQuantWSizeX, FQuantWSizeY, FQuantWSizeD);
-    RowBase := NeuronCnt * FQuantVectorSize;
-    Scale := FQuantScales[NeuronCnt];
-    for ElementCnt := 0 to QVSizeM1 do
-      W.FData[ElementCnt] := FQuantCodes[RowBase + ElementCnt] * Scale;
+    FQuantTable.DequantizeRowTo(NeuronCnt, 0, TNeuralFloatArrPtr(@W.FData[0]));
   end;
-  SetLength(FQuantCodes, 0);
-  SetLength(FQuantScales, 0);
+  FQuantTable.ReSize(0, 0, 0);
   FQuantInt8 := false;
   AfterWeightUpdate(); // rebuild the concatenated cache / bias output
 end;
@@ -71676,32 +71974,29 @@ begin
   end;
   RowBase := NeuronIdx * FQuantVectorSize;
   if QuantizeInt8RowTolerant(TNeuralFloatArrPtr(@Src.FData[SrcOffset]),
-       FQuantVectorSize, @FQuantCodes[RowBase], Scale) then
-    FQuantScales[NeuronIdx] := pExtraScale * Scale
+       FQuantVectorSize, @FQuantTable.FData[RowBase], Scale) then
+    FQuantTable.Scale[NeuronIdx, 0] := pExtraScale * Scale
   else
     // Zero row: zero codes with unit scale, matching QuantizeWeightsInt8's
     // zero-row convention (pExtraScale is irrelevant - dequant is 0 either
     // way - and scale 1 keeps requantize-after-dequantize exact).
-    FQuantScales[NeuronIdx] := 1;
+    FQuantTable.Scale[NeuronIdx, 0] := 1;
 end;
 
 function TNNetLayerConcatedWeights.Int8QuantizedSizeBytes(): int64;
 begin
-  Result := int64(Length(FQuantCodes)) * csShortIntSize +
-    int64(Length(FQuantScales)) * csNeuralFloatSize;
+  Result := FQuantTable.GetMemSize();
 end;
 
 function TNNetLayerConcatedWeights.CountWeights(): int64;
 begin
   if FQuantInt8 and (not FLinkedNeurons)
-  then Result := Length(FQuantCodes)
+  then Result := FQuantTable.Size
   else Result := inherited CountWeights();
 end;
 
 function TNNetLayerConcatedWeights.GetInt8QuantData(out pCodes: TInt8DynArr;
   out pScales: TNeuralFloatDynArr; out NumRows, VS: integer): boolean;
-var
-  i, CodesMax, ScalesMax: integer;
 begin
   SetLength(pCodes, 0);
   SetLength(pScales, 0);
@@ -71711,12 +72006,7 @@ begin
   if not Result then exit;
   NumRows := FNeurons.Count;
   VS := FQuantVectorSize;
-  SetLength(pCodes, Length(FQuantCodes));
-  CodesMax := Length(FQuantCodes) - 1;
-  for i := 0 to CodesMax do pCodes[i] := FQuantCodes[i];
-  SetLength(pScales, Length(FQuantScales));
-  ScalesMax := Length(FQuantScales) - 1;
-  for i := 0 to ScalesMax do pScales[i] := FQuantScales[i];
+  FQuantTable.GetQuantData(pCodes, pScales);
 end;
 
 procedure TNNetLayerConcatedWeights.BuildBiasOutput();
@@ -71772,6 +72062,7 @@ begin
   FNeuronWeightList := TNNetVolumeList.Create(false);
   FConcatedWeights := TNNetVolume.Create();
   FConcatedWInter := TNNetVolume.Create();
+  FQuantTable := TNNetVolumeQuant8.Create();
   FBiasOutput := TNNetVolume.Create();
   FShouldConcatWeights := false;
   FShouldInterleaveWeights := false;
@@ -71783,6 +72074,7 @@ end;
 destructor TNNetLayerConcatedWeights.Destroy();
 begin
   FBiasOutput.Free;
+  FQuantTable.Free;
   FConcatedWeights.Free;
   FNeuronWeightList.Free;
   FConcatedWInter.Free;
@@ -71791,13 +72083,13 @@ end;
 
 procedure TNNetLayerConcatedWeights.RefreshNeuronWeightList();
 var
-  LpBnd87: integer;
+  MaxNeuronPos: integer;
   NeuronCnt: integer;
 begin
   FNeuronWeightList.Clear;
 
-  LpBnd87 := FNeurons.Count - 1;
-  for NeuronCnt := 0 to LpBnd87 do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for NeuronCnt := 0 to MaxNeuronPos do
   begin
     FNeuronWeightList.Add(FNeurons[NeuronCnt].Weights);
   end;
@@ -71870,19 +72162,21 @@ begin
   AfterWeightUpdate();
 end;
 
-// Interleaves FQuantCodes into the device layout (codes[a + i*NumAs], the
-// same transposed indexing cai_dot_product uses for FP32 weights, so adjacent
-// work-items read adjacent bytes) and arms FDotCL's resident int8 mode
+// Interleaves FQuantTable's codes into the device layout (codes[a + i*NumAs],
+// the same transposed indexing cai_dot_product uses for FP32 weights, so
+// adjacent work-items read adjacent bytes) and arms FDotCL's resident int8 mode
 // against VBs. One-time: the codes/scales are immutable after quantization.
 // Coded by Claude (AI).
 procedure TNNetLayerConcatedWeights.PrepareInt8DotCL(VBs: TNNetVolume);
 var
   Inter: TInt8DynArr;
+  CodesPtr: TNeuralInt8ArrPtr;
   NumAs, ACnt, ECnt, VSizeM1, NumAsM1, aBase, pos: integer;
 begin
   NumAs := FNeurons.Count;
   if (not Assigned(FDotCL)) or (NumAs = 0) or (FQuantVectorSize = 0) or
     (VBs.Size = 0) then exit;
+  CodesPtr := FQuantTable.DataPtr;   // #13: one base pointer for the transpose
   SetLength(Inter, NumAs * FQuantVectorSize);
   VSizeM1 := FQuantVectorSize - 1;
   NumAsM1 := NumAs - 1;                   // #2: hoist the arithmetic for-bound
@@ -71892,11 +72186,11 @@ begin
     pos := ACnt;                         // #6: ACnt + ECnt*NumAs carried by +NumAs
     for ECnt := 0 to VSizeM1 do
     begin
-      Inter[pos] := FQuantCodes[aBase + ECnt];
+      Inter[pos] := CodesPtr^[aBase + ECnt];
       Inc(pos, NumAs);
     end;
   end;
-  FDotCL.PrepareForComputeInt8(@Inter[0], @FQuantScales[0], NumAs,
+  FDotCL.PrepareForComputeInt8(@Inter[0], FQuantTable.ScalePtr, NumAs,
     FQuantVectorSize, VBs);
 end;
 {$ENDIF}
@@ -72082,7 +72376,7 @@ end;
 
 procedure TNNetSum.Compute();
 var
-  LpBnd88: integer;
+  MaxPrevOutputPos: integer;
   LayerCnt: integer;
   StartTime: double;
 begin
@@ -72090,8 +72384,8 @@ begin
   FOutput.Copy(FPrevOutput[0]);
   if FPrevOutput.Count > 1 then
   begin
-    LpBnd88 := FPrevOutput.Count - 1;
-    for LayerCnt := 1 to LpBnd88 do
+    MaxPrevOutputPos := FPrevOutput.Count - 1;
+    for LayerCnt := 1 to MaxPrevOutputPos do
     begin
       FOutput.Add(FPrevOutput[LayerCnt]);
     end;
@@ -72101,7 +72395,7 @@ end;
 
 procedure TNNetSum.Backpropagate();
 var
-  LpBnd89: integer;
+  MaxPrevOutputPos: integer;
   LayerCnt: integer;
   StartTime: double;
   MaxError: TNeuralFloat;
@@ -72114,8 +72408,8 @@ begin
   if MaxError > 0 then
   begin
     //FOutputError.Divi(FPrevOutput.Count);
-    LpBnd89 := FPrevOutput.Count - 1;
-    for LayerCnt := 0 to LpBnd89 do
+    MaxPrevOutputPos := FPrevOutput.Count - 1;
+    for LayerCnt := 0 to MaxPrevOutputPos do
     begin
       if FPrevOutputError[LayerCnt].Size = FOutput.Size then
       begin
@@ -72188,8 +72482,8 @@ end;
 
 procedure TNNetFiLM.Compute();
 var
-  LpBnd90: integer;
-  LpBnd91: integer;
+  MaxOutputX: integer;
+  MaxOutputY: integer;
   StartTime: double;
   Feature, Cond: TNNetVolume;
   X, Y: integer;
@@ -72202,10 +72496,10 @@ begin
   // gamma = Cond.FData[0..FDepth-1], beta = Cond.FData[FDepth..2*FDepth-1] (contiguous).
   GammaPtr := Cond.GetRawPtr(0, 0);
   BetaPtr  := Cond.GetRawPtr(0, 0, FDepth);
-  LpBnd90 := FOutput.SizeX - 1;
-  LpBnd91 := FOutput.SizeY - 1;
-  for X := 0 to LpBnd90 do
-    for Y := 0 to LpBnd91 do
+  MaxOutputX := FOutput.SizeX - 1;
+  MaxOutputY := FOutput.SizeY - 1;
+  for X := 0 to MaxOutputX do
+    for Y := 0 to MaxOutputY do
     begin
       OutPtr  := FOutput.GetRawPtr(X, Y);
       FeatPtr := Feature.GetRawPtr(X, Y);
@@ -72218,8 +72512,8 @@ end;
 
 procedure TNNetFiLM.Backpropagate();
 var
-  LpBnd92: integer;
-  LpBnd93: integer;
+  MaxOutputX: integer;
+  MaxOutputY: integer;
   StartTime: double;
   Feature, FeatureErr, Cond, CondErr: TNNetVolume;
   X, Y, C, FDepthM1, base, FeatStrideY: integer;
@@ -72243,8 +72537,8 @@ begin
     // GetRawPos(x,y,d) = ((SizeX*y)+x)*Depth + d, so stepping the inner Y loop
     // advances the flat offset by SizeX*Depth.
     FeatStrideY := Feature.SizeX * Feature.Depth;
-    LpBnd92 := FOutput.SizeX - 1;
-    LpBnd93 := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
+    MaxOutputY := FOutput.SizeY - 1;
     for C := 0 to FDepthM1 do
     begin
       Gamma     := Cond.FData[C];
@@ -72254,10 +72548,10 @@ begin
       // #12: the (X,Y) offset advances by FeatDepth down the Y axis - carry it.
       if HasFeatureGrad then
       begin
-        for X := 0 to LpBnd92 do
+        for X := 0 to MaxOutputX do
         begin
           base := Feature.GetRawPos(X, 0, C);
-          for Y := 0 to LpBnd93 do
+          for Y := 0 to MaxOutputY do
           begin
             dOut := FOutputError.FData[base];
             // dL/dinput0[x,y,c] = gamma[c] * dOut[x,y,c]
@@ -72271,10 +72565,10 @@ begin
       end
       else
       begin
-        for X := 0 to LpBnd92 do
+        for X := 0 to MaxOutputX do
         begin
           base := Feature.GetRawPos(X, 0, C);
-          for Y := 0 to LpBnd93 do
+          for Y := 0 to MaxOutputY do
           begin
             dOut := FOutputError.FData[base];
             GradGamma := GradGamma + Feature.FData[base] * dOut;
@@ -73870,7 +74164,7 @@ end;
 function TNNet.AddLoRAAdapter(FrozenLayer: TNNetLayer; Rank: integer;
   Alpha: TNeuralFloat): TNNetLayer;
 var
-  LpBnd96: integer;
+  MaxUpNeuronPos: integer;
   InputLayer, Down, Up, Scaled: TNNetLayer;
   d_out, n: integer;
 begin
@@ -73893,8 +74187,8 @@ begin
   // Zero-init B (weights AND bias) so the bypass is the exact zero map at step 0
   // and the wrapped forward equals the frozen base bit-for-bit. B trains away
   // from zero during fine-tuning; A keeps its default random init.
-  LpBnd96 := Up.Neurons.Count - 1;
-  for n := 0 to LpBnd96 do
+  MaxUpNeuronPos := Up.Neurons.Count - 1;
+  for n := 0 to MaxUpNeuronPos do
     Up.Neurons[n].Fill(0);
   Up.ClearBias();
   Up.AfterWeightUpdate(); // refresh concatenated-weight caches after manual zero
@@ -81387,8 +81681,8 @@ end;
 // start near zero so every expert begins with alpha ~ 0.5 (balanced blend).
 procedure TNNetCondConv.InitDefault();
 var
-  LpBnd97: integer;
-  LpBnd98: integer;
+  MaxExpertWeightPos: integer;
+  MaxRouterWeightPos: integer;
   iK, i, MaxNExp: integer;
   W: TNNetVolume;
   Range: TNeuralFloat;
@@ -81400,13 +81694,13 @@ begin
   for iK := 0 to MaxNExp do
   begin
     W := FArrNeurons[iK].FWeights;
-    LpBnd97 := W.Size - 1;
-    for i := 0 to LpBnd97 do
+    MaxExpertWeightPos := W.Size - 1;
+    for i := 0 to MaxExpertWeightPos do
       W.FData[i] := Range * (Random - 0.5) * 2;
   end;
   W := FArrNeurons[FNumExperts].FWeights;
-  LpBnd98 := W.Size - 1;
-  for i := 0 to LpBnd98 do
+  MaxRouterWeightPos := W.Size - 1;
+  for i := 0 to MaxRouterWeightPos do
     W.FData[i] := 0.05 * (Random - 0.5) * 2;
   FArrNeurons[FNumExperts + 1].FWeights.Fill(0);
 end;
@@ -81788,7 +82082,7 @@ end;
 // is ZERO-initialised so the layer starts identical to a plain convolution.
 procedure TNNetDeformableConv.InitDefault();
 var
-  LpBnd99: integer;
+  MaxWeightPos: integer;
   i: integer;
   W: TNNetVolume;
   Range: TNeuralFloat;
@@ -81797,8 +82091,8 @@ begin
   Range := Sqrt(2.0 / (FFeatureSizeX * FFeatureSizeY * FInDepth));
   if Range > 0.25 then Range := 0.25;  // bound for clean gradient checks
   W := FArrNeurons[0].FWeights;
-  LpBnd99 := W.Size - 1;
-  for i := 0 to LpBnd99 do
+  MaxWeightPos := W.Size - 1;
+  for i := 0 to MaxWeightPos do
     W.FData[i] := Range * (Random - 0.5) * 2;
   FArrNeurons[1].FWeights.Fill(0);  // bias starts at 0
   FArrNeurons[2].FWeights.Fill(0);  // offset-head weights: ZERO init
@@ -82523,7 +82817,7 @@ end;
 // finite-difference weight-gradient test does not suffer truncation noise).
 procedure TNNetGroupConvP4.InitDefault();
 var
-  LpBnd100: integer;
+  MaxWeightPos: integer;
   co, i, MaxFeat: integer;
   W: TNNetVolume;
   Range: TNeuralFloat;
@@ -82535,8 +82829,8 @@ begin
   for co := 0 to MaxFeat do
   begin
     W := FArrNeurons[co].FWeights;
-    LpBnd100 := W.Size - 1;
-    for i := 0 to LpBnd100 do
+    MaxWeightPos := W.Size - 1;
+    for i := 0 to MaxWeightPos do
       W.FData[i] := Range * (Random - 0.5) * 2;
   end;
 end;
@@ -83744,8 +84038,8 @@ end;
 // conditioned at init.
 procedure TNNetKroneckerLinear.InitDefault();
 var
-  LpBnd101: integer;
-  LpBnd102: integer;
+  MaxWeightAPos: integer;
+  MaxWeightBPos: integer;
   i: integer;
   scaleA, scaleB: TNeuralFloat;
   WA, WB, Bias: TNNetVolume;
@@ -83756,11 +84050,11 @@ begin
   Bias := FArrNeurons[2].FWeights;
   if FP > 0 then scaleA := 1.0 / Sqrt(FP) else scaleA := 0.1;
   if FQ > 0 then scaleB := 1.0 / Sqrt(FQ) else scaleB := 0.1;
-  LpBnd101 := WA.Size - 1;
-  for i := 0 to LpBnd101 do
+  MaxWeightAPos := WA.Size - 1;
+  for i := 0 to MaxWeightAPos do
     WA.FData[i] := scaleA * (Random - 0.5) * 2;
-  LpBnd102 := WB.Size - 1;
-  for i := 0 to LpBnd102 do
+  MaxWeightBPos := WB.Size - 1;
+  for i := 0 to MaxWeightBPos do
     WB.FData[i] := scaleB * (Random - 0.5) * 2;
   Bias.Fill(0);
 end;
@@ -84125,7 +84419,7 @@ end;
 // conditioned at init (the product of d cores stays O(1)).
 procedure TNNetTensorTrain.InitDefault();
 var
-  LpBnd103: integer;
+  MaxWeightPos: integer;
   k, i, fanIn, MaxCore: integer;
   scale: TNeuralFloat;
   W: TNNetVolume;
@@ -84137,8 +84431,8 @@ begin
     W := FArrNeurons[k].FWeights;
     fanIn := FRanks[k] * FFactors[k];
     if fanIn > 0 then scale := 1.0 / Sqrt(fanIn) else scale := 0.1;
-    LpBnd103 := W.Size - 1;
-    for i := 0 to LpBnd103 do
+    MaxWeightPos := W.Size - 1;
+    for i := 0 to MaxWeightPos do
       W.FData[i] := scale * (Random - 0.5) * 2;
   end;
   FArrNeurons[FCores].FWeights.Fill(0);
@@ -84703,7 +84997,7 @@ end;
 // scaled by 1/sigma to get N(0,1/sigma^2).
 procedure TNNetRandomFourierFeatures.InitDefault();
 var
-  LpBnd104: integer;
+  MaxWeightPos: integer;
   i: integer;
   W: TNNetVolume;
   oldSeed: Cardinal;
@@ -84716,8 +85010,8 @@ begin
   // Seed = 0 leaves the global RandSeed alone (non-reproducible draw); a non-zero
   // seed makes the random map deterministic and restorable on reload.
   if FSeed <> 0 then RandSeed := FSeed;
-  LpBnd104 := W.Size - 1;
-  for i := 0 to LpBnd104 do
+  MaxWeightPos := W.Size - 1;
+  for i := 0 to MaxWeightPos do
     W.FData[i] := W.RandomGaussianValue() * invSigma;
   if FSeed <> 0 then RandSeed := oldSeed;
 end;
@@ -88641,7 +88935,7 @@ end;
 // accumulating dL/dZ into FAggErr and the W/bias/attention gradients.
 procedure TNNetGraphAttention.BackpropagateCPU();
 var
-  LpBnd105: integer;
+  MaxNeuronPos: integer;
   OutFeat, NodeIdx, FeatOut, NbrIdx: integer;
   numNodesMax, outFeatMax, inFeatMax: integer;
   row, idx, iRow, alphaPos, errPos, aggPos: integer;
@@ -88794,8 +89088,8 @@ begin
     end;
     if not FBatchUpdate then
     begin
-      LpBnd105 := FNeurons.Count - 1;
-      for FeatOut := 0 to LpBnd105 do
+      MaxNeuronPos := FNeurons.Count - 1;
+      for FeatOut := 0 to MaxNeuronPos do
         FArrNeurons[FeatOut].UpdateWeightsWithoutInertia();
       AfterWeightUpdate();
     end;
@@ -89972,7 +90266,7 @@ end;
 { TNNetDeepConcat }
 constructor TNNetDeepConcat.Create(aL: array of TNNetLayer);
 var
-  LpBnd106: integer;
+  MaxPrevOutputD: integer;
   LayerCnt, aLHigh, aLLow: integer;
   ForDeepCnt, DeepCnt: integer;
   SizeX, SizeY: integer;
@@ -90019,8 +90313,8 @@ begin
     FPrevLayerList.Add(aL[LayerCnt]);
     aL[LayerCnt].IncDepartingBranchesCnt();
 
-    LpBnd106 := Al[LayerCnt].FOutput.Depth - 1;
-    for ForDeepCnt := 0 to LpBnd106 do
+    MaxPrevOutputD := Al[LayerCnt].FOutput.Depth - 1;
+    for ForDeepCnt := 0 to MaxPrevOutputD do
     begin
       Inc(DeepCnt);
       SetLength(FDeepsLayer, DeepCnt);
@@ -90199,13 +90493,13 @@ end;
 
 function TNNetConcatBase.SaveStructureToString(): string;
 var
-  LpBnd107: integer;
+  MaxPrevLayerPos: integer;
   I: integer;
   LayersStr: string;
 begin
   LayersStr := '';
-  LpBnd107 := FPrevLayerList.Count - 1;
-  for I := 0 to LpBnd107 do
+  MaxPrevLayerPos := FPrevLayerList.Count - 1;
+  for I := 0 to MaxPrevLayerPos do
   begin
     if I > 0 then LayersStr := LayersStr + ';';
     LayersStr := LayersStr + IntToStr(FPrevLayerList[I].FLayerIdx);
@@ -90215,12 +90509,12 @@ end;
 
 procedure TNNetConcatBase.BackpropagateConcat();
 var
-  LpBnd108: integer;
+  MaxPrevLayerPos: integer;
   LayerCnt: integer;
   LocalLayer: TNNetLayer;
 begin
-  LpBnd108 := FPrevLayerList.Count - 1;
-  for LayerCnt := 0 to LpBnd108 do
+  MaxPrevLayerPos := FPrevLayerList.Count - 1;
+  for LayerCnt := 0 to MaxPrevLayerPos do
   begin
     LocalLayer := FPrevLayerList[LayerCnt];
     if (Assigned(LocalLayer) and (LocalLayer.OutputError.Size = LocalLayer.Output.Size)) then
@@ -90400,7 +90694,7 @@ end;
 
 procedure TestDataParallelism(NN: TNNet);
 var
-  LpBnd109: integer;
+  MaxLayerPos: integer;
   I: integer;
   NN2: TNNet;
   Par: TNNetDataParallelism;
@@ -90412,8 +90706,8 @@ begin
   NN2 := NN.Clone();
   Par.SumWeights(NN2);
   AllGood := True;
-  LpBnd109 := NN.Layers.Count - 1;
-  for I := 0 to LpBnd109 do
+  MaxLayerPos := NN.Layers.Count - 1;
+  for I := 0 to MaxLayerPos do
   begin
     if NN.Layers[I].Neurons.Count <> NN2.Layers[I].Neurons.Count then
     begin
@@ -90453,7 +90747,7 @@ end;
 
 procedure CompareNNStructure(NN, NN2: TNNet);
 var
-  LpBnd110: integer;
+  MaxLayerPos: integer;
   I: integer;
   AllGood: boolean;
 begin
@@ -90470,8 +90764,8 @@ begin
     WriteLn('Saving to string has passed.');
   end;
 
-  LpBnd110 := NN.Layers.Count - 1;
-  for I := 0 to LpBnd110 do
+  MaxLayerPos := NN.Layers.Count - 1;
+  for I := 0 to MaxLayerPos do
   begin
     if NN.Layers[I].SaveDataToString() <> NN2.Layers[I].SaveDataToString() then
     begin
@@ -90772,7 +91066,7 @@ end;
 {$IFDEF OpenCL}
 procedure TestConvolutionOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
 var
-  LpBnd111: integer;
+  MaxOutputPos: integer;
   NN: TNNet;
   Input, Output, Output2: TNNetVolume;
   NRelu: TNNetConvolutionReLU;
@@ -90880,8 +91174,8 @@ begin
   NN.GetOutput(Output2);
   Output2.PrintDebug(); WriteLn;
 
-  LpBnd111 := Output.Size - 1;
-  for I := 0 to LpBnd111 do
+  MaxOutputPos := Output.Size - 1;
+  for I := 0 to MaxOutputPos do
   begin
     if Abs( Output.Raw[I] - Output2.Raw[I] ) > 0.1 then
     begin
@@ -91434,8 +91728,8 @@ end;
 
 procedure TNNetSpatialDropout2D.Compute();
 var
-  LpBnd112: integer;
-  LpBnd113: integer;
+  MaxDropMaskD: integer;
+  MaxIdentityMaskD: integer;
   StartTime: double;
   P, Keep, InvKeep: TNeuralFloat;
   d: integer;
@@ -91451,8 +91745,8 @@ begin
     Keep := 1 - P;
     if Keep <= 0 then Keep := 1e-6;
     InvKeep := 1.0 / Keep;
-    LpBnd112 := FOutput.Depth - 1;
-    for d := 0 to LpBnd112 do
+    MaxDropMaskD := FOutput.Depth - 1;
+    for d := 0 to MaxDropMaskD do
     begin
       if Random < P then
         FChannelMask.Raw[d] := 0
@@ -91464,8 +91758,8 @@ begin
   else
   begin
     // Identity at inference: fill mask with 1 so backward is a no-op.
-    LpBnd113 := FOutput.Depth - 1;
-    for d := 0 to LpBnd113 do
+    MaxIdentityMaskD := FOutput.Depth - 1;
+    for d := 0 to MaxIdentityMaskD do
       FChannelMask.Raw[d] := 1;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -91505,8 +91799,8 @@ end;
 
 procedure TNNetSpatialDropout1D.Compute();
 var
-  LpBnd114: integer;
-  LpBnd115: integer;
+  MaxDropMaskD: integer;
+  MaxIdentityMaskD: integer;
   StartTime: double;
   P, Keep, InvKeep: TNeuralFloat;
   d: integer;
@@ -91521,8 +91815,8 @@ begin
     Keep := 1 - P;
     if Keep <= 0 then Keep := 1e-6;
     InvKeep := 1.0 / Keep;
-    LpBnd114 := FOutput.Depth - 1;
-    for d := 0 to LpBnd114 do
+    MaxDropMaskD := FOutput.Depth - 1;
+    for d := 0 to MaxDropMaskD do
     begin
       if Random < P then
         FChannelMask.Raw[d] := 0
@@ -91533,8 +91827,8 @@ begin
   end
   else
   begin
-    LpBnd115 := FOutput.Depth - 1;
-    for d := 0 to LpBnd115 do
+    MaxIdentityMaskD := FOutput.Depth - 1;
+    for d := 0 to MaxIdentityMaskD do
       FChannelMask.Raw[d] := 1;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -91652,8 +91946,8 @@ end;
 
 procedure TNNetDropBlock.Compute();
 var
-  LpBnd116: integer;
-  LpBnd117: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   StartTime: double;
   x, y, OutDepthMax: integer;
   m: TNeuralFloat;
@@ -91667,11 +91961,11 @@ begin
   begin
     if not FFreezeMask then RefreshMask();
     // Apply the spatial keep mask broadcast over all channels (Depth).
-    LpBnd116 := FOutput.SizeY - 1;
-    LpBnd117 := FOutput.SizeX - 1;
+    MaxOutputY := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
     OutDepthMax := FOutput.Depth - 1;
-    for y := 0 to LpBnd116 do
-      for x := 0 to LpBnd117 do
+    for y := 0 to MaxOutputY do
+      for x := 0 to MaxOutputX do
       begin
         m := FKeepMask.Data[x, y, 0];
         if m <> 1 then
@@ -91687,8 +91981,8 @@ end;
 
 procedure TNNetDropBlock.Backpropagate();
 var
-  LpBnd118: integer;
-  LpBnd119: integer;
+  MaxOutputY: integer;
+  MaxOutputX: integer;
   StartTime: double;
   x, y, OutDepthMax: integer;
   m: TNeuralFloat;
@@ -91702,11 +91996,11 @@ begin
   if FEnabled and (FOutputError.Size = FOutput.Size) and
      (FKeepMask.SizeX = FOutput.SizeX) and (FKeepMask.SizeY = FOutput.SizeY) then
   begin
-    LpBnd118 := FOutput.SizeY - 1;
-    LpBnd119 := FOutput.SizeX - 1;
+    MaxOutputY := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
     OutDepthMax := FOutput.Depth - 1;
-    for y := 0 to LpBnd118 do
-      for x := 0 to LpBnd119 do
+    for y := 0 to MaxOutputY do
+      for x := 0 to MaxOutputX do
       begin
         m := FKeepMask.Data[x, y, 0];
         if m <> 1 then
@@ -91996,7 +92290,7 @@ end;
 
 procedure TNNetLpPool.Compute();
 var
-  LpBnd120: integer;
+  MaxOutputPos: integer;
   CntX, CntY, CntD: integer;
   MaxX, MaxY, MaxD: integer;
   OutX, OutY: integer;
@@ -92033,8 +92327,8 @@ begin
   // y = ( (1/N) * sum |x_i|^p )^(1/p)
   N := FPoolSize * FPoolSize;
   InvP := 1.0 / FP;
-  LpBnd120 := FOutput.Size - 1;
-  for OutputRawPos := 0 to LpBnd120 do
+  MaxOutputPos := FOutput.Size - 1;
+  for OutputRawPos := 0 to MaxOutputPos do
   begin
     FOutput.FData[OutputRawPos] :=
       pcr_powf(FOutput.FData[OutputRawPos] / N, InvP);
@@ -95037,7 +95331,7 @@ end;
 
 procedure TNNetTopKGate.Backpropagate;
 var
-  LpBnd122: integer;
+  MaxOutputPos: integer;
   StartTime: double;
   CntX, CntY, CntD, MaxX, MaxY, MaxD, StartPos, TopCnt: integer;
   SurvSum, Dot, gy, ErrY: TNeuralFloat;
@@ -95068,8 +95362,8 @@ begin
       // Raw mode: y_j = g_j on survivors, so the backward is a hard 0/1
       // straight-through mask (no renorm Jacobian), like
       // TNNetExpertChoiceGate. Survivors are exactly the FOutput<>0 cells.
-      LpBnd122 := FOutput.Size - 1;
-      for CntD := 0 to LpBnd122 do
+      MaxOutputPos := FOutput.Size - 1;
+      for CntD := 0 to MaxOutputPos do
         if FOutput.FData[CntD] <> 0 then
           FPrevLayer.OutputError.FData[CntD] :=
             FPrevLayer.OutputError.FData[CntD] + FOutputError.FData[CntD];
@@ -95984,7 +96278,7 @@ begin
   // it (the concatenated-weight caches it would otherwise need are released in
   // low-memory mode). Int8-quantized is NOT excluded either: ComputeRange
   // routes to the ranged fused int8 kernel on both chunk axes, which reads
-  // only the immutable FQuantCodes/FQuantScales. Coded by Claude (AI).
+  // only the immutable FQuantTable. Coded by Claude (AI).
   Result := (FNN <> nil) and FNN.FIntraLayerThreading and
     (not WillOpenCL()) and
     (not WinogradEligible())
@@ -96040,11 +96334,11 @@ begin
       // Int8-quantized: the FP32 weight storage was released at quantization
       // time, so the branches below would read freed memory. The fused int8
       // kernel restricted to this neuron slice reads only the immutable
-      // FQuantCodes/FQuantScales (checked BEFORE ActiveLowMemory, like the
+      // FQuantTable (checked BEFORE ActiveLowMemory, like the
       // serial forward: the codes are the resident storage in both memory
       // modes). Coded by Claude (AI).
       FOutputRaw.DotProductsTiledInt8(FNeurons.Count, {BStart}0,
-        {BFinish}NumPositionsM1, FVectorSize, FQuantCodes, FQuantScales,
+        {BFinish}NumPositionsM1, FVectorSize, FQuantTable,
         FInputPrepared, FTileSizeD, FTileSizeX,
         {AStart}StartRange, {AFinish}FinRange);
     end
@@ -96104,12 +96398,12 @@ begin
   begin
     // Int8-quantized: position-sliced twin of the serial fused int8 forward
     // (same kernel, B range = this chunk's output positions). Reads only the
-    // immutable FQuantCodes/FQuantScales and writes only this slice's rows,
+    // immutable FQuantTable and writes only this slice's rows,
     // so disjoint chunks stay race-free. Checked BEFORE ActiveLowMemory,
     // like the serial forward. Bias + activation run in the shared tail
     // below. Coded by Claude (AI).
     FOutputRaw.DotProductsTiledInt8(FNeurons.Count, StartRange, FinRange,
-      FVectorSize, FQuantCodes, FQuantScales, FInputPrepared,
+      FVectorSize, FQuantTable, FInputPrepared,
       FTileSizeD, FTileSizeX);
   end
   else if ActiveLowMemory() then
@@ -97017,7 +97311,7 @@ procedure TNNetConvolution.Compute();
       // weight) and applies the per-row scale once per dot product - the
       // FP32 weights are never materialized, in memory or in cache.
       FOutputRaw.DotProductsTiledInt8(FNeurons.Count,
-        FOutputSizeX * FOutputSizeY, FVectorSize, FQuantCodes, FQuantScales,
+        FOutputSizeX * FOutputSizeY, FVectorSize, FQuantTable,
         FInputPrepared, FTileSizeD, FTileSizeX);
       if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
       ApplyActivationFunctionToOutput();
@@ -98561,16 +98855,20 @@ var
   Cnt, RowBase: integer;
   Sum: TNeuralFloat;
   PrevOutputPtr: TNeuralFloatArrPtr;
+  CodesPtr: TNeuralInt8ArrPtr;
+  ScalePtr: TNeuralFloatArrPtr;
   AddBias: boolean;
 begin
   PrevOutputPtr := FPrevLayer.Output.DataPtr;
+  CodesPtr := FQuantTable.DataPtr;   // #13: table bases hoisted out of the loop
+  ScalePtr := FQuantTable.ScalePtr;
   AddBias := FSuppressBias = 0;              // #5: invariant across the loop
   RowBase := StartRange * FQuantVectorSize;  // #6: first row's int8 code offset
   for Cnt := StartRange to FinRange do
   begin
     Sum := TNNetVolume.DotProductInt8(
-      TNeuralInt8ArrPtr(@FQuantCodes[RowBase]),
-      PrevOutputPtr, FQuantVectorSize) * FQuantScales[Cnt];
+      TNeuralInt8ArrPtr(@CodesPtr^[RowBase]),
+      PrevOutputPtr, FQuantVectorSize) * ScalePtr^[Cnt];
     if AddBias then Sum := Sum + FArrNeurons[Cnt].FBiasWeight;
     FOutputRaw.FData[Cnt] := Sum;
     FOutput.FData[Cnt] := FActivationFn(Sum);
@@ -98975,10 +99273,9 @@ end;
 constructor TNNetEmbedding.Create(pVocabSize, pEmbeddingSize: integer;
   EncodeZero: integer = 0; ScaleEmbedding: TNeuralFloat = 0.02;
   pTrainable: boolean = true; pQuantizeInt8: boolean = false);
-var
-  RowCnt, VocabM1: integer;
 begin
   inherited Create();
+  FQuantTable := TNNetVolumeQuant8.Create();
   FVocabSize := pVocabSize;
   FEmbeddingSize := pEmbeddingSize;
   FEncodeZero := (EncodeZero>0);
@@ -98997,13 +99294,13 @@ begin
   if pQuantizeInt8 then
   begin
     // Arm the int8 container directly: zero codes (dequantized weight 0 -
-    // a valid forward), unit scales (the zero-row convention). The FP32
-    // table is never allocated; DequantizeWeightsInt8 can still restore
-    // writable rows for the FP32 import path.
-    SetLength(FQuantCodes, pVocabSize * pEmbeddingSize);
-    SetLength(FQuantScales, pVocabSize);
-    VocabM1 := pVocabSize - 1;
-    for RowCnt := 0 to VocabM1 do FQuantScales[RowCnt] := 1;
+    // a valid forward), unit scales (the zero-row convention). ReSize does
+    // not fill, so the scales are set explicitly. The FP32 table is never
+    // allocated; DequantizeWeightsInt8 can still restore writable rows for
+    // the FP32 import path.
+    FQuantTable.ReSize(pVocabSize, 1, pEmbeddingSize);
+    FQuantTable.Fill(0);
+    FQuantTable.ScaleData.Fill(1);
     FQuantInt8 := true;
     // Parity with the FP32 sizing path, which refreshes the fast neuron
     // mirror inside SetNumWeightsForAllNeurons.
@@ -99020,6 +99317,7 @@ end;
 
 destructor TNNetEmbedding.Destroy;
 begin
+  FQuantTable.Free;
   SetLength(FInputTokens, 0);
   {$IFDEF OpenCL}
   SetLength(FTokenRows, 0);
@@ -99112,15 +99410,14 @@ begin
       IntToStr(FVocabSize * FEmbeddingSize) + '.');
     exit;
   end;
-  SetLength(FQuantScales, FVocabSize);
-  SetLength(FQuantCodes, FVocabSize * FEmbeddingSize);
+  FQuantTable.ReSize(FVocabSize, 1, FEmbeddingSize);
   VocabM1 := FVocabSize - 1;
   for RowCnt := 0 to VocabM1 do
   begin
     RowBase := RowCnt * FEmbeddingSize;
     QuantizeInt8RowTolerant(TNeuralFloatArrPtr(@W.FData[RowBase]),
-      FEmbeddingSize, @FQuantCodes[RowBase], Scale);
-    FQuantScales[RowCnt] := Scale;
+      FEmbeddingSize, @FQuantTable.FData[RowBase], Scale);
+    FQuantTable.Scale[RowCnt, 0] := Scale;
   end;
   // Free the FP32 table only after every row quantized successfully.
   // (1,1,1) matches the pre-SetNumWeights state; SetLength inside ReSize
@@ -99133,28 +99430,22 @@ end;
 
 procedure TNNetEmbedding.DequantizeWeightsInt8();
 var
-  RowCnt, ElementCnt, RowBase, EmbSizeM1, VocabM1, idx: integer;
-  Scale: TNeuralFloat;
+  RowCnt, VocabM1: integer;
   W: TNNetVolume;
 begin
   if not FQuantInt8 then exit;
   W := FNeurons[0].Weights;
+  // W keeps its own (VocabSize, 1, EmbeddingSize) shape, which shares the
+  // table's linear layout - hence the per-row expansion rather than
+  // DequantizeTo, which would impose the table's geometry on W.
   W.ReSize(FVocabSize, 1, FEmbeddingSize);
   VocabM1 := FVocabSize - 1;
-  EmbSizeM1 := FEmbeddingSize - 1;
   for RowCnt := 0 to VocabM1 do
   begin
-    RowBase := RowCnt * FEmbeddingSize;
-    Scale := FQuantScales[RowCnt];
-    idx := RowBase;
-    for ElementCnt := 0 to EmbSizeM1 do
-    begin
-      W.FData[idx] := FQuantCodes[idx] * Scale;
-      Inc(idx);
-    end;
+    FQuantTable.DequantizeRowTo(RowCnt, 0,
+      TNeuralFloatArrPtr(@W.FData[RowCnt * FEmbeddingSize]));
   end;
-  SetLength(FQuantCodes, 0);
-  SetLength(FQuantScales, 0);
+  FQuantTable.ReSize(0, 0, 0);
   FQuantInt8 := false;
   AfterWeightUpdate();
 end;
@@ -99186,33 +99477,31 @@ begin
   end;
   RowBase := RowIdx * FEmbeddingSize;
   if QuantizeInt8RowTolerant(TNeuralFloatArrPtr(@Src.FData[SrcOffset]),
-       FEmbeddingSize, @FQuantCodes[RowBase], Scale) then
-    FQuantScales[RowIdx] := pExtraScale * Scale
+       FEmbeddingSize, @FQuantTable.FData[RowBase], Scale) then
+    FQuantTable.Scale[RowIdx, 0] := pExtraScale * Scale
   else
     // Zero row: zero codes with unit scale, matching QuantizeWeightsInt8's
     // zero-row convention (pExtraScale is irrelevant - dequant is 0 either
     // way - and scale 1 keeps requantize-after-dequantize exact).
-    FQuantScales[RowIdx] := 1;
+    FQuantTable.Scale[RowIdx, 0] := 1;
 end;
 
 function TNNetEmbedding.Int8QuantizedSizeBytes(): int64;
 begin
-  Result := int64(Length(FQuantCodes)) * csShortIntSize +
-    int64(Length(FQuantScales)) * csNeuralFloatSize;
+  Result := FQuantTable.GetMemSize();
 end;
 
 function TNNetEmbedding.CountWeights(): int64;
 begin
   if FQuantInt8 and (not FLinkedNeurons)
-  then Result := Length(FQuantCodes)
+  then Result := FQuantTable.Size
   else Result := inherited CountWeights();
 end;
 
 procedure TNNetEmbedding.Compute();
 var
   MaxToken, CntToken, CurrentToken: integer;
-  RowBase, ElementCnt, EmbSizeM1, RowBytes, RowStride, dstPos: integer;
-  RowScale: TNeuralFloat;
+  RowBytes, RowStride, dstPos: integer;
   SourcePtr, DestPtr: TNeuralFloatArrPtr;
   LocalWeights, PrevOut: TNNetVolume;
   StartTime: double;
@@ -99234,13 +99523,17 @@ begin
   {$ENDIF}
   PrevOut := FPrevLayer.Output;   // #8: invariant across the token loops
   MaxToken := PrevOut.Size - 1;
-  FOutput.Fill(0);
+  // FOutput is (PrevOut.Size, 1, FEmbeddingSize), so the token loops below write
+  // one full row per output row: only a SKIPPED token leaves a row to be zeroed,
+  // which the else branches do. A blanket Fill(0) would be overwritten entirely.
+  RowBytes := FEmbeddingSize * csNeuralFloatSize;  // #5: byte count hoisted
+  RowStride := FOutput.Depth;                       // #12: carried dst offset
+  dstPos := 0;
   if FQuantInt8 then
   begin
     // Int8 gather: dequantize the looked-up row straight into the output
     // token (code * per-row scale). The FP32 table is never rebuilt - the
     // weight stream costs 1 byte/element.
-    EmbSizeM1 := FEmbeddingSize - 1;
     for CntToken := 0 to MaxToken do
     begin
       CurrentToken := Round(PrevOut.FData[CntToken]);
@@ -99252,12 +99545,11 @@ begin
       if FEncodeZero or (CurrentToken>0) then
       begin
         FInputTokens[CntToken] := CurrentToken;
-        RowBase := CurrentToken * FEmbeddingSize;
-        RowScale := FQuantScales[CurrentToken];
-        DestPtr := FOutput.GetRawPtr(CntToken, 0);
-        for ElementCnt := 0 to EmbSizeM1 do
-          DestPtr^[ElementCnt] := FQuantCodes[RowBase + ElementCnt] * RowScale;
-      end;
+        DestPtr := FOutput.GetRawPtr(dstPos);
+        FQuantTable.DequantizeRowTo(CurrentToken, 0, DestPtr);
+      end
+      else FillChar(FOutput.FData[dstPos], RowBytes, 0);
+      Inc(dstPos, RowStride);
     end;
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
@@ -99278,9 +99570,6 @@ begin
     );
   end;
   {$ENDIF}
-  RowBytes := FEmbeddingSize * csNeuralFloatSize;  // #5: byte count hoisted
-  RowStride := FOutput.Depth;                       // #12: carried dst offset
-  dstPos := 0;
   for CntToken := 0 to MaxToken do
   begin
     CurrentToken := Round(PrevOut.FData[CntToken]);
@@ -99293,9 +99582,10 @@ begin
     begin
       FInputTokens[CntToken] := CurrentToken;
       SourcePtr := LocalWeights.GetRawPtr(CurrentToken, 0);
-      // Row lands on a zeroed FOutput (Fill(0) above), so copy == MulAdd-onto-0.
+      // The copy overwrites the whole row, so no pre-zeroing is needed here.
       Move(SourcePtr^, FOutput.FData[dstPos], RowBytes);
-    end;
+    end
+    else FillChar(FOutput.FData[dstPos], RowBytes, 0);  // skipped token: zero row
     Inc(dstPos, RowStride);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -99409,8 +99699,8 @@ end;
 
 procedure TNNetLearnedPositionalEmbedding.Compute();
 var
-  LpBnd124: integer;
-  LpBnd125: integer;
+  MaxOutputX: integer;
+  MaxOutputY: integer;
   StartTime: double;
   CntX, CntY, OutDepth: integer;
   LocalWeights: TNNetVolume;
@@ -99427,8 +99717,8 @@ begin
   {$ENDIF}
   // Out[x, y, :] += Table[x + PositionOffset, :]; the same row is broadcast
   // over Y. PositionOffset (default 0) shifts the lookup for streamed decode.
-  LpBnd124 := FOutput.SizeX - 1;
-  LpBnd125 := FOutput.SizeY - 1;
+  MaxOutputX := FOutput.SizeX - 1;
+  MaxOutputY := FOutput.SizeY - 1;
   OutDepth := FOutput.Depth;
   if FOutput.SizeY = 1 then
   begin
@@ -99437,11 +99727,11 @@ begin
       LocalWeights.GetRawPtr(FPositionOffset, 0), FOutput.SizeX * OutDepth);
   end
   else
-    for CntX := 0 to LpBnd124 do
+    for CntX := 0 to MaxOutputX do
     begin
       // #11: weights row invariant across Y; #18: MulAdd factor 1 -> Add.
       wPtr := LocalWeights.GetRawPtr(CntX + FPositionOffset, 0);
-      for CntY := 0 to LpBnd125 do
+      for CntY := 0 to MaxOutputY do
         TNNetVolume.Add(FOutput.GetRawPtr(CntX, CntY), wPtr, OutDepth);
     end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -99449,8 +99739,8 @@ end;
 
 procedure TNNetLearnedPositionalEmbedding.Backpropagate();
 var
-  LpBnd126: integer;
-  LpBnd127: integer;
+  MaxOutputX: integer;
+  MaxOutputY: integer;
   StartTime: double;
   CntX, CntY: integer;
   DestPtr: TNeuralFloatArrPtr;
@@ -99462,15 +99752,15 @@ begin
   StartTime := Now();
   // dTable[x, :] += sum_y dOut[x, y, :] (scaled by -LearningRate into Delta
   // following the repo's delta convention).
-  LpBnd126 := FOutput.SizeX - 1;
-  LpBnd127 := FOutput.SizeY - 1;   // #5: loop-invariant bound hoisted
+  MaxOutputX := FOutput.SizeX - 1;
+  MaxOutputY := FOutput.SizeY - 1;   // #5: loop-invariant bound hoisted
   if FBatchUpdate                  // #5: invariant destination selection hoisted
     then DestVol := FNeurons[0].FDelta
     else DestVol := FNeurons[0].FWeights;
-  for CntX := 0 to LpBnd126 do
+  for CntX := 0 to MaxOutputX do
   begin
     DestPtr := DestVol.GetRawPtr(CntX, 0);
-    for CntY := 0 to LpBnd127 do
+    for CntY := 0 to MaxOutputY do
       TNNetVolume.MulAdd(DestPtr, FOutputError.GetRawPtr(CntX, CntY),
         -FLearningRate, FOutput.Depth);
   end;
@@ -99520,6 +99810,7 @@ var
   MaxToken, CntToken, CurrentToken: integer;
   RowBase, ElementCnt, EmbSizeM1, RowBytes, RowStride, dstPos, posPos: integer;
   RowScale: TNeuralFloat;
+  CodesPtr: TNeuralInt8ArrPtr;
   SourcePtr, SourcePtrPos, DestPtr: TNeuralFloatArrPtr;
   LocalWeights, PrevOut: TNNetVolume;
   StartTime: double;
@@ -99527,12 +99818,21 @@ begin
   StartTime := Now();
   PrevOut := FPrevLayer.Output;   // #8: invariant across the token loops
   MaxToken := PrevOut.Size - 1;
-  FOutput.Fill(0);
+  // FOutput is (PrevOut.Size, 1, FEmbeddingSize) and FPositionalEmbedding shares
+  // its shape, so each loop iteration writes one complete output row. Only a
+  // SKIPPED token needs zeroing, which the else branches do.
+  RowBytes := FEmbeddingSize * csNeuralFloatSize;  // #5: byte count hoisted
+  RowStride := FOutput.Depth;                       // #12: carried dst/pos offsets
+  dstPos := 0;
+  posPos := 0;
   if FQuantInt8 then
   begin
     // Int8 token gather + FP32 positional add. Zero-padding semantics match
     // the FP32 path: a skipped token gets NEITHER table (output row stays 0).
+    // The dequantization is fused with the positional add rather than going
+    // through DequantizeRowTo, which would write the row twice.
     EmbSizeM1 := FEmbeddingSize - 1;
+    CodesPtr := FQuantTable.DataPtr;   // #11: base hoisted out of both loops
     for CntToken := 0 to MaxToken do
     begin
       CurrentToken := Round(PrevOut.FData[CntToken]);
@@ -99545,13 +99845,16 @@ begin
       begin
         FInputTokens[CntToken] := CurrentToken;
         RowBase := CurrentToken * FEmbeddingSize;
-        RowScale := FQuantScales[CurrentToken];
-        SourcePtrPos := FPositionalEmbedding.GetRawPtr(CntToken, 0);
-        DestPtr := FOutput.GetRawPtr(CntToken, 0);
+        RowScale := FQuantTable.Scale[CurrentToken, 0];
+        SourcePtrPos := FPositionalEmbedding.GetRawPtr(posPos);
+        DestPtr := FOutput.GetRawPtr(dstPos);
         for ElementCnt := 0 to EmbSizeM1 do
-          DestPtr^[ElementCnt] := FQuantCodes[RowBase + ElementCnt] * RowScale
+          DestPtr^[ElementCnt] := CodesPtr^[RowBase + ElementCnt] * RowScale
             + SourcePtrPos^[ElementCnt];
-      end;
+      end
+      else FillChar(FOutput.FData[dstPos], RowBytes, 0);
+      Inc(dstPos, RowStride);
+      Inc(posPos, RowStride);
     end;
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
@@ -99572,10 +99875,6 @@ begin
     );
   end;
   {$ENDIF}
-  RowBytes := FEmbeddingSize * csNeuralFloatSize;  // #5: byte count hoisted
-  RowStride := FOutput.Depth;                       // #12: carried dst/pos offsets
-  dstPos := 0;
-  posPos := 0;
   for CntToken := 0 to MaxToken do
   begin
     CurrentToken := Round(PrevOut.FData[CntToken]);
@@ -99588,12 +99887,13 @@ begin
     begin
       FInputTokens[CntToken] := CurrentToken;
       SourcePtr := LocalWeights.GetRawPtr(CurrentToken, 0);
-      // Row lands on a zeroed FOutput (Fill(0) above): copy the token row, then
-      // add the positional row (drops the per-element x1 multiply of MulAdd).
+      // The copy overwrites the whole row, then the positional row is added
+      // (drops the per-element x1 multiply of MulAdd).
       Move(SourcePtr^, FOutput.FData[dstPos], RowBytes);
       TNNetVolume.Add(@FOutput.FData[dstPos], @FPositionalEmbedding.FData[posPos],
         FEmbeddingSize);
-    end;
+    end
+    else FillChar(FOutput.FData[dstPos], RowBytes, 0);  // skipped token: zero row
     Inc(dstPos, RowStride);
     Inc(posPos, RowStride);
   end;
@@ -99632,7 +99932,7 @@ end;
 
 procedure TNNet.ComputeL2Decay(ExcludeBias: boolean);
 var
-  LpBnd128: integer;
+  MaxLayerNeuronPos: integer;
   LayerCnt, NeuronCnt, LastLayerIdx: integer;
   CurrentLayer: TNNetLayer;
   Factor: TNeuralFloat;
@@ -99654,8 +99954,8 @@ begin
     if CurrentLayer is TNNetIdentityWithoutL2 then Continue;
     if (CurrentLayer.Neurons.Count = 0) or (CurrentLayer.L2Decay <= 0) then Continue;
     Factor := 1 - (CurrentLayer.L2Decay * CurrentLayer.LearningRate);
-    LpBnd128 := CurrentLayer.Neurons.Count - 1;
-    for NeuronCnt := 0 to LpBnd128 do
+    MaxLayerNeuronPos := CurrentLayer.Neurons.Count - 1;
+    for NeuronCnt := 0 to MaxLayerNeuronPos do
     begin
       CurrentLayer.Neurons[NeuronCnt].Weights.Mul(Factor);
       // Bias deliberately untouched (excluded from weight decay).
@@ -99898,7 +100198,7 @@ type
   end;
   TSigArray = array of TLayerSig;
 var
-  LpBnd129: integer;
+  MaxLinePos: integer;
   A, B: TSigArray;
   M, N: integer;
   LCS: array of array of integer;
@@ -99991,8 +100291,8 @@ begin
   try
     Emit(M, N);
     Same := True;
-    LpBnd129 := Lines.Count - 1;
-    for I := 0 to LpBnd129 do
+    MaxLinePos := Lines.Count - 1;
+    for I := 0 to MaxLinePos do
       if (Length(Lines[I]) > 0) and (Lines[I][1] <> ' ') then
       begin
         Same := False;
@@ -100026,8 +100326,8 @@ const
   cFrozenThreshold = 1e-6;
   cRelEps = 1e-12;
 var
-  LpBnd130: integer;
-  LpBnd131: integer;
+  MaxLayerNeuronPos: integer;
+  MaxNeuronWeightPos: integer;
   NA, NB: TNNet;
   Lines: TStringList;
   LayerIdx, NeuronIdx, K, NALastIdx: integer;
@@ -100074,14 +100374,14 @@ begin
       L2A := 0;
       TotalWeights := 0;
       FrozenCount := 0;
-      LpBnd130 := LayerA.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd130 do
+      MaxLayerNeuronPos := LayerA.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxLayerNeuronPos do
       begin
         NeuronA := LayerA.Neurons[NeuronIdx];
         NeuronB := LayerB.Neurons[NeuronIdx];
         if NeuronA.Weights.Size <> NeuronB.Weights.Size then Continue;
-        LpBnd131 := NeuronA.Weights.Size - 1;
-        for K := 0 to LpBnd131 do
+        MaxNeuronWeightPos := NeuronA.Weights.Size - 1;
+        for K := 0 to MaxNeuronWeightPos do
         begin
           Diff := NeuronB.Weights.FData[K] - NeuronA.Weights.FData[K];
           L2Diff := L2Diff + Diff * Diff;
@@ -100131,7 +100431,7 @@ const
   cEps = 1e-30;
   cBins = 10;
 var
-  LpBnd132: integer;
+  MaxLayerNeuronPos: integer;
   Lines: TStringList;
   LayerIdx, NeuronIdx, BinIdx, NNLastIdx, BinsMax: integer;
   Layer, PrevLayer: TNNetLayer;
@@ -100217,8 +100517,8 @@ begin
       WGrad := 0;
       if Layer.Neurons.Count > 0 then
       begin
-        LpBnd132 := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to LpBnd132 do
+        MaxLayerNeuronPos := Layer.Neurons.Count - 1;
+        for NeuronIdx := 0 to MaxLayerNeuronPos do
         begin
           if Layer.Neurons[NeuronIdx].Delta.Size > 0 then
             WGrad := WGrad +
@@ -100380,14 +100680,14 @@ const
   cEps = 1e-12;
   cCurveWidth = 60;
 var
-  LpBnd133: integer;
-  LpBnd134: integer;
-  LpBnd135: integer;
-  LpBnd136: integer;
-  LpBnd137: integer;
-  LpBnd138: integer;
-  LpBnd139: integer;
-  LpBnd140: integer;
+  MaxDirWeightPos: integer;
+  MaxPerturbNeuronPos: integer;
+  MaxPerturbWeightPos: integer;
+  MaxSamplePos: integer;
+  MaxOutputPos: integer;
+  MaxRestoreNeuronPos: integer;
+  MaxRestoreWeightPos: integer;
+  MaxFallbackRestoreWeightPos: integer;
   Lines: TStringList;
   TrainableIdxs: array of integer;
   // Per-trainable-layer snapshots and direction tensors.
@@ -100501,8 +100801,8 @@ begin
         if (WNorm > cEps) and (DNorm > cEps) then
         begin
           Scale := WNorm / DNorm;
-          LpBnd133 := DirW[I][NIdx].Size - 1;
-          for WIdx := 0 to LpBnd133 do
+          MaxDirWeightPos := DirW[I][NIdx].Size - 1;
+          for WIdx := 0 to MaxDirWeightPos do
             DirW[I][NIdx].FData[WIdx] := DirW[I][NIdx].FData[WIdx] * Scale;
         end
         else
@@ -100538,11 +100838,11 @@ begin
       for LIdx := 0 to TMax do
       begin
         Layer := NN.Layers[TrainableIdxs[LIdx]];
-        LpBnd134 := Layer.Neurons.Count - 1;
-        for NIdx := 0 to LpBnd134 do
+        MaxPerturbNeuronPos := Layer.Neurons.Count - 1;
+        for NIdx := 0 to MaxPerturbNeuronPos do
         begin
-          LpBnd135 := Layer.Neurons[NIdx].Weights.Size - 1;
-          for WIdx := 0 to LpBnd135 do
+          MaxPerturbWeightPos := Layer.Neurons[NIdx].Weights.Size - 1;
+          for WIdx := 0 to MaxPerturbWeightPos do
             Layer.Neurons[NIdx].Weights.FData[WIdx] :=
               SnapW[LIdx][NIdx].FData[WIdx] +
               Alpha * DirW[LIdx][NIdx].FData[WIdx];
@@ -100555,8 +100855,8 @@ begin
       end;
 
       SumLoss := 0;
-      LpBnd136 := Samples.Count - 1;
-      for N := 0 to LpBnd136 do
+      MaxSamplePos := Samples.Count - 1;
+      for N := 0 to MaxSamplePos do
       begin
         Pair := Samples[N];
         if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
@@ -100566,8 +100866,8 @@ begin
         case LossKind of
           1: // Cross-entropy on (clamped) softmax-family output vs one-hot.
             begin
-              LpBnd137 := Output.Size - 1;
-              for WIdx := 0 to LpBnd137 do
+              MaxOutputPos := Output.Size - 1;
+              for WIdx := 0 to MaxOutputPos do
               begin
                 Tgt := 0;
                 if WIdx < Pair.O.Size then Tgt := Pair.O.FData[WIdx];
@@ -100605,11 +100905,11 @@ begin
     for LIdx := 0 to TMax do
     begin
       Layer := NN.Layers[TrainableIdxs[LIdx]];
-      LpBnd138 := Layer.Neurons.Count - 1;
-      for NIdx := 0 to LpBnd138 do
+      MaxRestoreNeuronPos := Layer.Neurons.Count - 1;
+      for NIdx := 0 to MaxRestoreNeuronPos do
       begin
-        LpBnd139 := Layer.Neurons[NIdx].Weights.Size - 1;
-        for WIdx := 0 to LpBnd139 do
+        MaxRestoreWeightPos := Layer.Neurons[NIdx].Weights.Size - 1;
+        for WIdx := 0 to MaxRestoreWeightPos do
           Layer.Neurons[NIdx].Weights.FData[WIdx] :=
             SnapW[LIdx][NIdx].FData[WIdx];
         Layer.Neurons[NIdx].FBiasWeight := SnapB[LIdx][NIdx];
@@ -100729,8 +101029,8 @@ begin
         begin
           if SnapW[LIdx][NIdx] <> nil then
           begin
-            LpBnd140 := Layer.Neurons[NIdx].Weights.Size - 1;
-            for WIdx := 0 to LpBnd140 do
+            MaxFallbackRestoreWeightPos := Layer.Neurons[NIdx].Weights.Size - 1;
+            for WIdx := 0 to MaxFallbackRestoreWeightPos do
               Layer.Neurons[NIdx].Weights.FData[WIdx] :=
                 SnapW[LIdx][NIdx].FData[WIdx];
             Layer.Neurons[NIdx].FBiasWeight := SnapB[LIdx][NIdx];
@@ -100769,8 +101069,8 @@ const
   cEps = 1e-30;
   cBins = 10;
 var
-  LpBnd141: integer;
-  LpBnd142: integer;
+  MaxProbeInputPos: integer;
+  MaxAttnMapX: integer;
   Lines: TStringList;
   LayerIdx, ProbeIdx, i, j, SeqLen, ValidK, BinIdx: integer;
   NNLastIdx, BinsMax, SeqLenMax, AttnDepth, pos: integer;
@@ -100839,8 +101139,8 @@ begin
       SetLength(Bins, cBins);
       for BinIdx := 0 to BinsMax do Bins[BinIdx] := 0;
 
-      LpBnd141 := ProbeInputs.Count - 1;
-      for ProbeIdx := 0 to LpBnd141 do
+      MaxProbeInputPos := ProbeInputs.Count - 1;
+      for ProbeIdx := 0 to MaxProbeInputPos do
       begin
         NN.Compute(ProbeInputs[ProbeIdx]);
         AttnMap := AttnLayer.AttentionWeights;
@@ -100852,10 +101152,10 @@ begin
         begin
           RowEntropy := 0;
           ValidK := 0;
-          LpBnd142 := AttnMap.SizeX - 1;
+          MaxAttnMapX := AttnMap.SizeX - 1;
           // #11/#12: [j,i,0] steps by Depth as j advances; carry the offset.
           pos := AttnMap.GetRawPos(0, i);
-          for j := 0 to LpBnd142 do
+          for j := 0 to MaxAttnMapX do
           begin
             P := AttnMap.FData[pos];
             if P > cEps then
@@ -101353,7 +101653,7 @@ class function TNNet.ProfileReport(
   Iterations: integer = 20
 ): string;
 var
-  LpBnd143: integer;
+  MaxLayerNeuronPos: integer;
   Lines: TStringList;
   LayerCnt, NeuronIdx, IterCnt, NNLastIdx: integer;
   Layer: TNNetLayer;
@@ -101440,8 +101740,8 @@ begin
       ParamElements := 0;
       if Layer.Neurons.Count > 0 then
       begin
-        LpBnd143 := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to LpBnd143 do
+        MaxLayerNeuronPos := Layer.Neurons.Count - 1;
+        for NeuronIdx := 0 to MaxLayerNeuronPos do
           ParamElements := ParamElements +
             Layer.Neurons[NeuronIdx].Weights.Size;
         if (ParamElements > 0) and (not Layer.LinkedNeurons) then
@@ -101491,7 +101791,7 @@ class function TNNet.DeadNeuronReport(
 const
   cBins = 10;
 var
-  LpBnd144: integer;
+  MaxSamplePos: integer;
   Lines: TStringList;
   LayerIdx, SampleIdx, UnitIdx, BinIdx, NNLastIdx: integer;
   Layer: TNNetLayer;
@@ -101581,8 +101881,8 @@ begin
       for UnitIdx := 0 to UnitsM1 do MaxAbs[UnitIdx] := 0;
       ZeroSum := 0;
 
-      LpBnd144 := Samples.Count - 1;
-      for SampleIdx := 0 to LpBnd144 do
+      MaxSamplePos := Samples.Count - 1;
+      for SampleIdx := 0 to MaxSamplePos do
       begin
         NN.Compute(Samples[SampleIdx]);
         ZeroCount := 0;
@@ -101684,10 +101984,10 @@ const
   cMaxBarWidth = 40;
   cHeavyFraction = 0.10;
 var
-  LpBnd145: integer;
-  LpBnd146: integer;
-  LpBnd147: integer;
-  LpBnd148: integer;
+  MaxParamCountNeuronPos: integer;
+  MaxSamplePos: integer;
+  MaxGradNeuronPos: integer;
+  MaxNeuronDeltaPos: integer;
   LastLayerIdx, cBinsM1, NetParamCntM1, LayerParamM1: integer;
   Lines: TStringList;
   LayerIdx, NeuronIdx, K, SampleIdx, BinIdx: integer;
@@ -101765,8 +102065,8 @@ begin
       FlatBase[LayerIdx] := NetParamCnt;
       if Layer.Neurons.Count = 0 then Continue;
       ParamsThisLayer := 0;
-      LpBnd145 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd145 do
+      MaxParamCountNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxParamCountNeuronPos do
         // +1 per neuron for the bias parameter.
         ParamsThisLayer := ParamsThisLayer +
           Layer.Neurons[NeuronIdx].Delta.Size + 1;
@@ -101802,8 +102102,8 @@ begin
     Target := TNNetVolume.Create(OutSize, 1, 1);
     ProcessedSamples := 0;
     try
-      LpBnd146 := Samples.Count - 1;
-      for SampleIdx := 0 to LpBnd146 do
+      MaxSamplePos := Samples.Count - 1;
+      for SampleIdx := 0 to MaxSamplePos do
       begin
         Pair := Samples[SampleIdx];
         if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
@@ -101831,12 +102131,12 @@ begin
           LR := Layer.LearningRate;
           if LR <= 0 then LR := 1.0;
           P := FlatBase[LayerIdx];
-          LpBnd147 := Layer.Neurons.Count - 1;
-          for NeuronIdx := 0 to LpBnd147 do
+          MaxGradNeuronPos := Layer.Neurons.Count - 1;
+          for NeuronIdx := 0 to MaxGradNeuronPos do
           begin
             Neuron := Layer.Neurons[NeuronIdx];
-            LpBnd148 := Neuron.Delta.Size - 1;
-            for K := 0 to LpBnd148 do
+            MaxNeuronDeltaPos := Neuron.Delta.Size - 1;
+            for K := 0 to MaxNeuronDeltaPos do
             begin
               G := Neuron.Delta.FData[K] / LR;
               ParamFisher[P] := ParamFisher[P] + G * G;
@@ -102061,10 +102361,10 @@ const
 type
   TFloatArray = array of TNeuralFloat;
 var
-  LpBnd149: integer;
-  LpBnd150: integer;
-  LpBnd151: integer;
-  LpBnd152: integer;
+  MaxParamCountNeuronPos: integer;
+  MaxSamplePos: integer;
+  MaxGradNeuronPos: integer;
+  MaxNeuronDeltaPos: integer;
   LastLayerIdx, cBinsM1, NumClassesM1, UsableCountM1: integer;
   ScopeParamCntM1, PairCountM1, MM1, LayerParamM1: integer;
   IP1: integer;
@@ -102149,8 +102449,8 @@ begin
       FlatBase[LIdx] := NetParamCnt;
       if Layer.Neurons.Count = 0 then Continue;
       M := 0;
-      LpBnd149 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd149 do
+      MaxParamCountNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxParamCountNeuronPos do
         // +1 per neuron for the bias parameter.
         M := M + Layer.Neurons[NeuronIdx].Delta.Size + 1;
       if M = 0 then Continue;
@@ -102234,8 +102534,8 @@ begin
     HaveLabels := true;
 
     try
-      LpBnd150 := Samples.Count - 1;
-      for SampleIdx := 0 to LpBnd150 do
+      MaxSamplePos := Samples.Count - 1;
+      for SampleIdx := 0 to MaxSamplePos do
       begin
         Pair := Samples[SampleIdx];
         if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
@@ -102263,12 +102563,12 @@ begin
           LR := Layer.LearningRate;
           if LR <= 0 then LR := 1.0;
           P := FlatBase[LIdx];
-          LpBnd151 := Layer.Neurons.Count - 1;
-          for NeuronIdx := 0 to LpBnd151 do
+          MaxGradNeuronPos := Layer.Neurons.Count - 1;
+          for NeuronIdx := 0 to MaxGradNeuronPos do
           begin
             Neuron := Layer.Neurons[NeuronIdx];
-            LpBnd152 := Neuron.Delta.Size - 1;
-            for K := 0 to LpBnd152 do
+            MaxNeuronDeltaPos := Neuron.Delta.Size - 1;
+            for K := 0 to MaxNeuronDeltaPos do
             begin
               G := Neuron.Delta.FData[K] / LR;
               Grads[UsableCount][ScopeMap[P]] := G;
@@ -102565,7 +102865,7 @@ const
   cEps = 1e-30;
   cBuckets = ' .:-=+*#%@';   // 10 intensity buckets (index 0 = blank/zero)
 var
-  LpBnd153: integer;
+  MaxProbePos: integer;
   InXM1, InYM1, InDepthM1, HeatMaxIdx, MaxRTrunc: integer;
   Lines: TStringList;
   InX, InY, InDepth: integer;
@@ -102672,8 +102972,8 @@ begin
     // Accumulate |d out_centre / d input| (summed over depth) over the probe
     // batch. Frozen: ClearDeltas before each pass, never UpdateWeights.
     Used := 0;
-    LpBnd153 := Probes.Count - 1;
-    for P := 0 to LpBnd153 do
+    MaxProbePos := Probes.Count - 1;
+    for P := 0 to MaxProbePos do
     begin
       if Used >= MaxProbes then Break;
       Probe := Probes[P];
@@ -104302,7 +104602,7 @@ const
 type
   TFloatArray = array of TNeuralFloat;
 var
-  LpBnd154: integer;
+  MaxTranslatorNeuronPos: integer;
   Lines: TStringList;
   LayerIdx, SampleIdx, I, J, L, C, It: integer;
   InVol: TNNetVolume;
@@ -104468,8 +104768,8 @@ begin
       L := CompatOrder[I];
 
       // Seed translator to identity: W = I, bias = 0.
-      LpBnd154 := Translator.Neurons.Count - 1;
-      for C := 0 to LpBnd154 do
+      MaxTranslatorNeuronPos := Translator.Neurons.Count - 1;
+      for C := 0 to MaxTranslatorNeuronPos do
       begin
         Translator.Neurons[C].Weights.Fill(0);
         if C < Translator.Neurons[C].Weights.Size then
@@ -106075,10 +106375,10 @@ const
   cZeroEps = 1e-6;
   cMaxBarWidth = 40;
 var
-  LpBnd155: integer;
-  LpBnd156: integer;
-  LpBnd157: integer;
-  LpBnd158: integer;
+  MaxStatsNeuronPos: integer;
+  MaxStatsWeightPos: integer;
+  MaxBinNeuronPos: integer;
+  MaxBinWeightPos: integer;
   Lines: TStringList;
   LayerIdx, NeuronIdx, K, BinIdx: integer;
   Layer: TNNetLayer;
@@ -106125,12 +106425,12 @@ begin
       SumSq := 0;
       NearZero := 0;
       Linf := 0;
-      LpBnd155 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd155 do
+      MaxStatsNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxStatsNeuronPos do
       begin
         Neuron := Layer.Neurons[NeuronIdx];
-        LpBnd156 := Neuron.Weights.Size - 1;
-        for K := 0 to LpBnd156 do
+        MaxStatsWeightPos := Neuron.Weights.Size - 1;
+        for K := 0 to MaxStatsWeightPos do
         begin
           W := Neuron.Weights.FData[K];
           if WCount = 0 then
@@ -106167,12 +106467,12 @@ begin
       // Second pass: bin counts over [-MaxAbs, +MaxAbs].
       SetLength(BinCounts, Bins);
       for BinIdx := 0 to BinsM1 do BinCounts[BinIdx] := 0;
-      LpBnd157 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd157 do
+      MaxBinNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxBinNeuronPos do
       begin
         Neuron := Layer.Neurons[NeuronIdx];
-        LpBnd158 := Neuron.Weights.Size - 1;
-        for K := 0 to LpBnd158 do
+        MaxBinWeightPos := Neuron.Weights.Size - 1;
+        for K := 0 to MaxBinWeightPos do
         begin
           W := Neuron.Weights.FData[K];
           BinIdx := Trunc(((W + MaxAbs) / Span) * Bins);
@@ -106239,7 +106539,7 @@ const
   cMaxBarWidth = 40;
   cHeavyFraction = 0.10;
 var
-  LpBnd159: integer;
+  MaxLayerNeuronPos: integer;
   Lines: TStringList;
   LayerIdx, NeuronIdx, NumLayers, BinIdx, BarLen, MaxBin: integer;
   Layer: TNNetLayer;
@@ -106317,8 +106617,8 @@ begin
       ParamElements := 0;
       if Layer.Neurons.Count > 0 then
       begin
-        LpBnd159 := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to LpBnd159 do
+        MaxLayerNeuronPos := Layer.Neurons.Count - 1;
+        for NeuronIdx := 0 to MaxLayerNeuronPos do
           ParamElements := ParamElements +
             Layer.Neurons[NeuronIdx].Weights.Size;
         if (ParamElements > 0) and (not Layer.LinkedNeurons) then
@@ -106739,7 +107039,7 @@ const
   cNearZero = 1e-6;
   cCollapseStd = 1e-4;
 var
-  LpBnd160: integer;
+  MaxSamplePos: integer;
   Lines: TStringList;
   Flags: TStringList;
   LayerIdx, SampleIdx, UnitIdx, BinIdx: integer;
@@ -106828,8 +107128,8 @@ begin
       SatLowCount := 0; SatHighCount := 0;
       SetLength(LastVals, Units);
 
-      LpBnd160 := Samples.Count - 1;
-      for SampleIdx := 0 to LpBnd160 do
+      MaxSamplePos := Samples.Count - 1;
+      for SampleIdx := 0 to MaxSamplePos do
       begin
         NN.Compute(Samples[SampleIdx]);
         for UnitIdx := 0 to UnitsM1 do
@@ -107231,8 +107531,8 @@ const
   cMaxBarWidth = 40;
   cStableRankCollapse = 0.95; // sigma_1/||W||_F above this ~ rank-1 collapse
 var
-  LpBnd161: integer;
-  LpBnd162: integer;
+  MaxLayerNeuronPos: integer;
+  MaxNeuronWeightPos: integer;
   LastLayerIdx, cBinsM1, RatioCountM1: integer;
   Lines: TStringList;
   Flags: TStringList;
@@ -107289,12 +107589,12 @@ begin
       WCount := 0;
       Sum := 0;
       SumSq := 0;
-      LpBnd161 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd161 do
+      MaxLayerNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxLayerNeuronPos do
       begin
         Neuron := Layer.Neurons[NeuronIdx];
-        LpBnd162 := Neuron.Weights.Size - 1;
-        for K := 0 to LpBnd162 do
+        MaxNeuronWeightPos := Neuron.Weights.Size - 1;
+        for K := 0 to MaxNeuronWeightPos do
         begin
           W := Neuron.Weights.FData[K];
           Sum := Sum + W;
@@ -107449,10 +107749,10 @@ type
   TDoubleArray = array of Double;
   TDoubleMatrix = array of TDoubleArray;
 var
-  LpBnd163: integer;
-  LpBnd164: integer;
-  LpBnd165: integer;
-  LpBnd166: integer;
+  MaxFrobNeuronPos: integer;
+  MaxFrobWeightPos: integer;
+  MaxStdNeuronPos: integer;
+  MaxStdWeightPos: integer;
   LastLayerIdx, DimM1, FanInM1, FanOutM1, AlphaCountM1, cBinsM1: integer;
   JStart: integer;
   Lines: TStringList;
@@ -107604,12 +107904,12 @@ begin
       // Frobenius norm (= sqrt of sum of squared singular values = sqrt of the
       // Gram trace) plus the weight std for the Marchenko-Pastur bulk edge.
       FrobSq := 0;
-      LpBnd163 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd163 do
+      MaxFrobNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxFrobNeuronPos do
       begin
         Neuron := Layer.Neurons[NeuronIdx];
-        LpBnd164 := Neuron.Weights.Size - 1;
-        for K := 0 to LpBnd164 do
+        MaxFrobWeightPos := Neuron.Weights.Size - 1;
+        for K := 0 to MaxFrobWeightPos do
         begin
           W := Neuron.Weights.FData[K];
           FrobSq := FrobSq + W * W;
@@ -107621,12 +107921,12 @@ begin
       SumW := 0;
       SumSqW := 0;
       Cnt := FanOut * FanIn;
-      LpBnd165 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd165 do
+      MaxStdNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxStdNeuronPos do
       begin
         Neuron := Layer.Neurons[NeuronIdx];
-        LpBnd166 := Neuron.Weights.Size - 1;
-        for K := 0 to LpBnd166 do
+        MaxStdWeightPos := Neuron.Weights.Size - 1;
+        for K := 0 to MaxStdWeightPos do
         begin
           W := Neuron.Weights.FData[K];
           SumW := SumW + W;
@@ -108460,12 +108760,12 @@ type
   TDoubleArray = array of Double;
   TDoubleMatrix = array of TDoubleArray;
 var
-  LpBnd167: integer;
-  LpBnd168: integer;
-  LpBnd169: integer;
-  LpBnd170: integer;
-  LpBnd171: integer;
-  LpBnd172: integer;
+  MaxAlignedNeuronPos: integer;
+  MaxAlignedDeltaPos: integer;
+  MaxParamCountNeuronPos: integer;
+  MaxSamplePos: integer;
+  MaxGradNeuronPos: integer;
+  MaxNeuronDeltaPos: integer;
   Lines: TStringList;
   LIdx, NeuronIdx, K, SampleIdx, BinIdx, P, I, J, N: integer;
   JStart: integer;
@@ -108564,12 +108864,12 @@ var
           lr2 := lay.LearningRate;
           if lr2 <= 0 then lr2 := 1.0;
           pp := FlatBase[li];
-          LpBnd167 := lay.Neurons.Count - 1;
-          for ni := 0 to LpBnd167 do
+          MaxAlignedNeuronPos := lay.Neurons.Count - 1;
+          for ni := 0 to MaxAlignedNeuronPos do
           begin
             neu := lay.Neurons[ni];
-            LpBnd168 := neu.Delta.Size - 1;
-            for kk := 0 to LpBnd168 do
+            MaxAlignedDeltaPos := neu.Delta.Size - 1;
+            for kk := 0 to MaxAlignedDeltaPos do
             begin
               gg := neu.Delta.FData[kk] / lr2;
               aGrads[si][pp] := gg;
@@ -108690,8 +108990,8 @@ begin
       FlatBase[LIdx] := NetParamCnt;
       if Layer.Neurons.Count = 0 then Continue;
       M := 0;
-      LpBnd169 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd169 do
+      MaxParamCountNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxParamCountNeuronPos do
         // +1 per neuron for the bias parameter.
         M := M + Layer.Neurons[NeuronIdx].Delta.Size + 1;
       if M = 0 then Continue;
@@ -108728,8 +109028,8 @@ begin
     UsableCount := 0;
 
     try
-      LpBnd170 := Samples.Count - 1;
-      for SampleIdx := 0 to LpBnd170 do
+      MaxSamplePos := Samples.Count - 1;
+      for SampleIdx := 0 to MaxSamplePos do
       begin
         Probe := Samples[SampleIdx];
         if Probe = nil then Continue;
@@ -108759,12 +109059,12 @@ begin
           LR := Layer.LearningRate;
           if LR <= 0 then LR := 1.0;
           P := FlatBase[LIdx];
-          LpBnd171 := Layer.Neurons.Count - 1;
-          for NeuronIdx := 0 to LpBnd171 do
+          MaxGradNeuronPos := Layer.Neurons.Count - 1;
+          for NeuronIdx := 0 to MaxGradNeuronPos do
           begin
             Neuron := Layer.Neurons[NeuronIdx];
-            LpBnd172 := Neuron.Delta.Size - 1;
-            for K := 0 to LpBnd172 do
+            MaxNeuronDeltaPos := Neuron.Delta.Size - 1;
+            for K := 0 to MaxNeuronDeltaPos do
             begin
               G := Neuron.Delta.FData[K] / LR;
               Grads[UsableCount][P] := G;
@@ -109197,10 +109497,10 @@ const
 type
   TFloatArray = array of TNeuralFloat;
 var
-  LpBnd173: integer;
-  LpBnd174: integer;
-  LpBnd175: integer;
-  LpBnd176: integer;
+  MaxParamCountNeuronPos: integer;
+  MaxSamplePos: integer;
+  MaxGradNeuronPos: integer;
+  MaxNeuronDeltaPos: integer;
   Lines: TStringList;
   LIdx, NeuronIdx, K, SampleIdx, BinIdx, P, I: integer;
   Layer: TNNetLayer;
@@ -109293,8 +109593,8 @@ begin
       FlatBase[LIdx] := NetParamCnt;
       if Layer.Neurons.Count = 0 then Continue;
       K := 0;
-      LpBnd173 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd173 do
+      MaxParamCountNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxParamCountNeuronPos do
         // +1 per neuron for the bias parameter.
         K := K + Layer.Neurons[NeuronIdx].Delta.Size + 1;
       if K = 0 then Continue;
@@ -109378,8 +109678,8 @@ begin
     UsableCount := 0;
 
     try
-      LpBnd174 := Samples.Count - 1;
-      for SampleIdx := 0 to LpBnd174 do
+      MaxSamplePos := Samples.Count - 1;
+      for SampleIdx := 0 to MaxSamplePos do
       begin
         Pair := Samples[SampleIdx];
         if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
@@ -109406,12 +109706,12 @@ begin
           LR := Layer.LearningRate;
           if LR <= 0 then LR := 1.0;
           P := FlatBase[LIdx];
-          LpBnd175 := Layer.Neurons.Count - 1;
-          for NeuronIdx := 0 to LpBnd175 do
+          MaxGradNeuronPos := Layer.Neurons.Count - 1;
+          for NeuronIdx := 0 to MaxGradNeuronPos do
           begin
             Neuron := Layer.Neurons[NeuronIdx];
-            LpBnd176 := Neuron.Delta.Size - 1;
-            for K := 0 to LpBnd176 do
+            MaxNeuronDeltaPos := Neuron.Delta.Size - 1;
+            for K := 0 to MaxNeuronDeltaPos do
             begin
               Grads[UsableCount][ScopeMap[P]] := Neuron.Delta.FData[K] / LR;
               Inc(P);
@@ -109680,12 +109980,12 @@ const
 type
   TFloatArray = array of TNeuralFloat;
 var
-  LpBnd177: integer;
-  LpBnd178: integer;
-  LpBnd179: integer;
-  LpBnd180: integer;
-  LpBnd181: integer;
-  LpBnd182: integer;
+  MaxPerturbNeuronPos: integer;
+  MaxPerturbWeightPos: integer;
+  MaxSamplePos: integer;
+  MaxGradNeuronPos: integer;
+  MaxNeuronDeltaPos: integer;
+  MaxParamCountNeuronPos: integer;
   Lines: TStringList;
   LIdx, NeuronIdx, K, SampleIdx, BinIdx, P, I, Iter, Probe: integer;
   Layer: TNNetLayer;
@@ -109736,12 +110036,12 @@ var
       if not LayerHasParams[LL] then Continue;
       Lay := NN.Layers[LL];
       PP := FlatBase[LL];
-      LpBnd177 := Lay.Neurons.Count - 1;
-      for NN_ := 0 to LpBnd177 do
+      MaxPerturbNeuronPos := Lay.Neurons.Count - 1;
+      for NN_ := 0 to MaxPerturbNeuronPos do
       begin
         Neu := Lay.Neurons[NN_];
-        LpBnd178 := Neu.Weights.Size - 1;
-        for KK := 0 to LpBnd178 do
+        MaxPerturbWeightPos := Neu.Weights.Size - 1;
+        for KK := 0 to MaxPerturbWeightPos do
         begin
           Neu.Weights.FData[KK] := Neu.Weights.FData[KK] + Scale * V[PP];
           Inc(PP);
@@ -109768,8 +110068,8 @@ var
     Lr2: TNeuralFloat;
   begin
     for KK := 0 to NetParamCntM1 do G[KK] := 0;
-    LpBnd179 := Samples.Count - 1;
-    for SI := 0 to LpBnd179 do
+    MaxSamplePos := Samples.Count - 1;
+    for SI := 0 to MaxSamplePos do
     begin
       Pair := Samples[SI];
       if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
@@ -109789,12 +110089,12 @@ var
         Lr2 := Lay.LearningRate;
         if Lr2 <= 0 then Lr2 := 1.0;
         PP := FlatBase[LL];
-        LpBnd180 := Lay.Neurons.Count - 1;
-        for NN_ := 0 to LpBnd180 do
+        MaxGradNeuronPos := Lay.Neurons.Count - 1;
+        for NN_ := 0 to MaxGradNeuronPos do
         begin
           Neu := Lay.Neurons[NN_];
-          LpBnd181 := Neu.Delta.Size - 1;
-          for KK := 0 to LpBnd181 do
+          MaxNeuronDeltaPos := Neu.Delta.Size - 1;
+          for KK := 0 to MaxNeuronDeltaPos do
           begin
             G[PP] := G[PP] - Neu.Delta.FData[KK] / Lr2;
             Inc(PP);
@@ -109871,8 +110171,8 @@ begin
       if Layer.Neurons[0].Weights = nil then Continue;
       if Layer.Neurons[0].Weights.Size = 0 then Continue;
       K := 0;
-      LpBnd182 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd182 do
+      MaxParamCountNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxParamCountNeuronPos do
         // +1 per neuron for the bias parameter.
         K := K + Layer.Neurons[NeuronIdx].Weights.Size + 1;
       if K = 0 then Continue;
@@ -110155,16 +110455,16 @@ const
   cVeryDegen = 0.10;
   cDegen     = 0.50;
 var
-  LpBnd183: integer;
-  LpBnd184: integer;
-  LpBnd185: integer;
-  LpBnd186: integer;
-  LpBnd187: integer;
-  LpBnd188: integer;
-  LpBnd189: integer;
-  LpBnd190: integer;
-  LpBnd191: integer;
-  LpBnd192: integer;
+  MaxLossSamplePos: integer;
+  MaxGradSamplePos: integer;
+  MaxGradNeuronPos: integer;
+  MaxGradDeltaPos: integer;
+  MaxLangevinNeuronPos: integer;
+  MaxLangevinWeightPos: integer;
+  MaxParamCountNeuronPos: integer;
+  MaxCountSamplePos: integer;
+  MaxAnchorNeuronPos: integer;
+  MaxAnchorWeightPos: integer;
   Lines: TStringList;
   LIdx, NeuronIdx, SampleIdx, P, Step, BurnIn, ChainCnt: integer;
   Layer: TNNetLayer;
@@ -110200,8 +110500,8 @@ var
   begin
     SumL := 0;
     Cnt := 0;
-    LpBnd183 := Samples.Count - 1;
-    for SI := 0 to LpBnd183 do
+    MaxLossSamplePos := Samples.Count - 1;
+    for SI := 0 to MaxLossSamplePos do
     begin
       Pr := Samples[SI];
       if (Pr = nil) or (Pr.I = nil) or (Pr.O = nil) then Continue;
@@ -110232,8 +110532,8 @@ var
   begin
     for KK := 0 to NetParamCntM1 do G[KK] := 0;
     UsedCnt := 0;
-    LpBnd184 := Samples.Count - 1;
-    for SI := 0 to LpBnd184 do
+    MaxGradSamplePos := Samples.Count - 1;
+    for SI := 0 to MaxGradSamplePos do
     begin
       Pair := Samples[SI];
       if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
@@ -110251,12 +110551,12 @@ var
         Lr2 := Lay.LearningRate;
         if Lr2 <= 0 then Lr2 := 1.0;
         PP := FlatBase[LL];
-        LpBnd185 := Lay.Neurons.Count - 1;
-        for NN_ := 0 to LpBnd185 do
+        MaxGradNeuronPos := Lay.Neurons.Count - 1;
+        for NN_ := 0 to MaxGradNeuronPos do
         begin
           Neu := Lay.Neurons[NN_];
-          LpBnd186 := Neu.Delta.Size - 1;
-          for KK := 0 to LpBnd186 do
+          MaxGradDeltaPos := Neu.Delta.Size - 1;
+          for KK := 0 to MaxGradDeltaPos do
           begin
             G[PP] := G[PP] - Neu.Delta.FData[KK] / Lr2;
             Inc(PP);
@@ -110303,12 +110603,12 @@ var
     begin
       if not LayerHasParams[LL] then Continue;
       Lay := NN.Layers[LL];
-      LpBnd187 := Lay.Neurons.Count - 1;
-      for NN_ := 0 to LpBnd187 do
+      MaxLangevinNeuronPos := Lay.Neurons.Count - 1;
+      for NN_ := 0 to MaxLangevinNeuronPos do
       begin
         Neu := Lay.Neurons[NN_];
-        LpBnd188 := Neu.Weights.Size - 1;
-        for KK := 0 to LpBnd188 do
+        MaxLangevinWeightPos := Neu.Weights.Size - 1;
+        for KK := 0 to MaxLangevinWeightPos do
         begin
           Cur := Neu.Weights.FData[KK];
           Drift := nBeta * Grad[PP] + Gamma * (Cur - WStar[PP]);
@@ -110371,8 +110671,8 @@ begin
       if Layer.Neurons[0].Weights = nil then Continue;
       if Layer.Neurons[0].Weights.Size = 0 then Continue;
       ParamCntCheck := 0;
-      LpBnd189 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd189 do
+      MaxParamCountNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxParamCountNeuronPos do
         ParamCntCheck := ParamCntCheck +
           Layer.Neurons[NeuronIdx].Weights.Size + 1;
       if ParamCntCheck = 0 then Continue;
@@ -110400,8 +110700,8 @@ begin
     Target := TNNetVolume.Create(OutSize, 1, 1);
 
     NSamples := 0;
-    LpBnd190 := Samples.Count - 1;
-    for SampleIdx := 0 to LpBnd190 do
+    MaxCountSamplePos := Samples.Count - 1;
+    for SampleIdx := 0 to MaxCountSamplePos do
     begin
       Pair := Samples[SampleIdx];
       if (Pair <> nil) and (Pair.I <> nil) and (Pair.O <> nil) then
@@ -110427,12 +110727,12 @@ begin
     begin
       if not LayerHasParams[LIdx] then Continue;
       Layer := NN.Layers[LIdx];
-      LpBnd191 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd191 do
+      MaxAnchorNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxAnchorNeuronPos do
       begin
         Neuron := Layer.Neurons[NeuronIdx];
-        LpBnd192 := Neuron.Weights.Size - 1;
-        for SampleIdx := 0 to LpBnd192 do
+        MaxAnchorWeightPos := Neuron.Weights.Size - 1;
+        for SampleIdx := 0 to MaxAnchorWeightPos do
         begin
           WStar[P] := Neuron.Weights.FData[SampleIdx];
           Inc(P);
@@ -110568,9 +110868,9 @@ const
   cSepTol  = 0.20;   // barrier <= 20% of E (plus cAbsTol) -> weak barrier
   cAbsTol  = 1e-6;   // absolute floor so a ~0-loss basin still reads connected
 var
-  LpBnd193: integer;
-  LpBnd194: integer;
-  LpBnd195: integer;
+  MaxSamplePos: integer;
+  MaxOutputPos: integer;
+  MaxLayerNeuronPos: integer;
   Lines: TStringList;
   NetB: TNNet;
   aSnap, StructStr, DiffStr: string;
@@ -110598,16 +110898,16 @@ var
     SumL := 0;
     Corr := 0;
     Tot := 0;
-    LpBnd193 := Samples.Count - 1;
-    for SI := 0 to LpBnd193 do
+    MaxSamplePos := Samples.Count - 1;
+    for SI := 0 to MaxSamplePos do
     begin
       Pr := Samples[SI];
       if (Pr = nil) or (Pr.I = nil) or (Pr.O = nil) then Continue;
       NN.Compute(Pr.I);
       Out2 := NN.GetLastLayer().Output;
       SLoss := 0;
-      LpBnd194 := Out2.Size - 1;
-      for WI := 0 to LpBnd194 do
+      MaxOutputPos := Out2.Size - 1;
+      for WI := 0 to MaxOutputPos do
       begin
         T2 := 0;
         if WI < Pr.O.Size then T2 := Pr.O.FData[WI];
@@ -110711,8 +111011,8 @@ begin
       begin
         Layer := NN.Layers[TrainableIdxs[LIdx]];
         LayerB := NetB.Layers[TrainableIdxs[LIdx]];
-        LpBnd195 := Layer.Neurons.Count - 1;
-        for NIdx := 0 to LpBnd195 do
+        MaxLayerNeuronPos := Layer.Neurons.Count - 1;
+        for NIdx := 0 to MaxLayerNeuronPos do
         begin
           // W := W*(1-alpha) + B.W*alpha  (vectorised).
           Layer.Neurons[NIdx].Weights.MulMulAdd(
@@ -110847,21 +111147,21 @@ const
   cAbsTol       = 1e-6;  // absolute floor so a ~0 barrier reads collapsed
   cInvTol       = 1e-4;  // permutation-invariance bit-for-bit tolerance
 var
-  LpBnd196: integer;
-  LpBnd197: integer;
-  LpBnd198: integer;
-  LpBnd199: integer;
-  LpBnd200: integer;
-  LpBnd201: integer;
-  LpBnd202: integer;
-  LpBnd203: integer;
-  LpBnd204: integer;
-  LpBnd205: integer;
-  LpBnd206: integer;
-  LpBnd207: integer;
-  LpBnd208: integer;
-  LpBnd209: integer;
-  LpBnd210: integer;
+  MaxLossSamplePos: integer;
+  MaxLossOutputPos: integer;
+  MaxSaveNeuronPos: integer;
+  MaxReorderNeuronPos: integer;
+  MaxPermuteNeuronPos: integer;
+  MaxBlendNeuronPos: integer;
+  MaxCacheSamplePos: integer;
+  MaxCachedOutputPos: integer;
+  MaxActASamplePos: integer;
+  MaxActBSamplePos: integer;
+  MaxANormSamplePos: integer;
+  MaxBNormSamplePos: integer;
+  MaxDotSamplePos: integer;
+  MaxCheckSamplePos: integer;
+  MaxCheckOutputPos: integer;
   LastLayerIdx, NumAlphaM1, TrIdxsHigh, TrIdxsHighM1, HiddenPosHigh, WidthM1: integer;
   Lines: TStringList;
   NetB: TNNet;
@@ -110899,16 +111199,16 @@ var
     Tot: integer;
   begin
     SumL := 0; Tot := 0;
-    LpBnd196 := Samples.Count - 1;
-    for SI := 0 to LpBnd196 do
+    MaxLossSamplePos := Samples.Count - 1;
+    for SI := 0 to MaxLossSamplePos do
     begin
       P2 := Samples[SI];
       if (P2 = nil) or (P2.I = nil) or (P2.O = nil) then Continue;
       NN.Compute(P2.I);
       O2 := NN.GetLastLayer().Output;
       SLoss := 0;
-      LpBnd197 := O2.Size - 1;
-      for WI := 0 to LpBnd197 do
+      MaxLossOutputPos := O2.Size - 1;
+      for WI := 0 to MaxLossOutputPos do
       begin
         T2 := 0;
         if WI < P2.O.Size then T2 := P2.O.FData[WI];
@@ -110931,8 +111231,8 @@ var
   begin
     SetLength(oldW, Lay.Neurons.Count);
     SetLength(oldB, Lay.Neurons.Count);
-    LpBnd198 := Lay.Neurons.Count - 1;
-    for n := 0 to LpBnd198 do
+    MaxSaveNeuronPos := Lay.Neurons.Count - 1;
+    for n := 0 to MaxSaveNeuronPos do
     begin
       sz := Lay.Neurons[n].Weights.Size;
       szM1 := sz - 1;
@@ -110940,8 +111240,8 @@ var
       for w := 0 to szM1 do oldW[n][w] := Lay.Neurons[n].Weights.FData[w];
       oldB[n] := Lay.Neurons[n].FBiasWeight;
     end;
-    LpBnd199 := Lay.Neurons.Count - 1;
-    for n := 0 to LpBnd199 do
+    MaxReorderNeuronPos := Lay.Neurons.Count - 1;
+    for n := 0 to MaxReorderNeuronPos do
     begin
       sz := Lay.Neurons[n].Weights.Size;
       szM1 := sz - 1;
@@ -110960,8 +111260,8 @@ var
     n, c, sz, szM1: integer;
     oldCol: array of TNeuralFloat;
   begin
-    LpBnd200 := Lay.Neurons.Count - 1;
-    for n := 0 to LpBnd200 do
+    MaxPermuteNeuronPos := Lay.Neurons.Count - 1;
+    for n := 0 to MaxPermuteNeuronPos do
     begin
       sz := Lay.Neurons[n].Weights.Size;
       szM1 := sz - 1;
@@ -110992,8 +111292,8 @@ var
       begin
         LayA := NN.Layers[TrainableIdxs[TI]];
         LayBb := NetB.Layers[TrainableIdxs[TI]];
-        LpBnd201 := LayA.Neurons.Count - 1;
-        for NI := 0 to LpBnd201 do
+        MaxBlendNeuronPos := LayA.Neurons.Count - 1;
+        for NI := 0 to MaxBlendNeuronPos do
         begin
           LayA.Neurons[NI].Weights.MulMulAdd(
             OneMin, Al, LayBb.Neurons[NI].Weights);
@@ -111125,8 +111425,8 @@ begin
     //     activation scoring, A's & B's per-unit hidden activations. ===
     NN.LoadDataFromString(SnapshotB);   // NN := B temporarily to read B outputs
     SetLength(PreOut, Samples.Count);
-    LpBnd202 := Samples.Count - 1;
-    for I := 0 to LpBnd202 do
+    MaxCacheSamplePos := Samples.Count - 1;
+    for I := 0 to MaxCacheSamplePos do
     begin
       pr := Samples[I];
       SetLength(PreOut[I], 0);
@@ -111134,8 +111434,8 @@ begin
       NN.Compute(pr.I);
       outV := NN.GetLastLayer().Output;
       SetLength(PreOut[I], outV.Size);
-      LpBnd203 := outV.Size - 1;
-      for J := 0 to LpBnd203 do PreOut[I][J] := outV.FData[J];
+      MaxCachedOutputPos := outV.Size - 1;
+      for J := 0 to MaxCachedOutputPos do PreOut[I][J] := outV.FData[J];
     end;
     NN.LoadDataFromString(aSnap);
 
@@ -111169,8 +111469,8 @@ begin
           SetLength(ActB[I], Samples.Count);
         end;
         // A activations (live = A).
-        LpBnd204 := Samples.Count - 1;
-        for I := 0 to LpBnd204 do
+        MaxActASamplePos := Samples.Count - 1;
+        for I := 0 to MaxActASamplePos do
         begin
           pr := Samples[I];
           if (pr = nil) or (pr.I = nil) then Continue;
@@ -111181,8 +111481,8 @@ begin
         end;
         // B activations.
         NN.LoadDataFromString(SnapshotB);
-        LpBnd205 := Samples.Count - 1;
-        for I := 0 to LpBnd205 do
+        MaxActBSamplePos := Samples.Count - 1;
+        for I := 0 to MaxActBSamplePos do
         begin
           pr := Samples[I];
           if (pr = nil) or (pr.I = nil) then Continue;
@@ -111197,20 +111497,20 @@ begin
         for I := 0 to WidthM1 do
         begin
           sVal := 0;
-          LpBnd206 := Samples.Count - 1;
-          for J := 0 to LpBnd206 do sVal := sVal + ActA[I][J]*ActA[I][J];
+          MaxANormSamplePos := Samples.Count - 1;
+          for J := 0 to MaxANormSamplePos do sVal := sVal + ActA[I][J]*ActA[I][J];
           ANorm[I] := Sqrt(sVal);
           sVal := 0;
-          LpBnd207 := Samples.Count - 1;
-          for J := 0 to LpBnd207 do sVal := sVal + ActB[I][J]*ActB[I][J];
+          MaxBNormSamplePos := Samples.Count - 1;
+          for J := 0 to MaxBNormSamplePos do sVal := sVal + ActB[I][J]*ActB[I][J];
           BNorm[I] := Sqrt(sVal);
         end;
         for I := 0 to WidthM1 do
           for J := 0 to WidthM1 do
           begin
             dotv := 0;
-            LpBnd208 := Samples.Count - 1;
-            for mI := 0 to LpBnd208 do
+            MaxDotSamplePos := Samples.Count - 1;
+            for mI := 0 to MaxDotSamplePos do
               dotv := dotv + ActA[I][mI] * ActB[J][mI];
             ScoreMat[I][J] := dotv / (ANorm[I]*BNorm[J] + cEps);
           end;
@@ -111278,16 +111578,16 @@ begin
     // === Correctness check 1: permutation invariance (B.Compute unchanged). ===
     InvErrMax := 0;
     NN.LoadDataFromString(NetB.SaveDataToString());   // NN := permuted B
-    LpBnd209 := Samples.Count - 1;
-    for I := 0 to LpBnd209 do
+    MaxCheckSamplePos := Samples.Count - 1;
+    for I := 0 to MaxCheckSamplePos do
     begin
       pr := Samples[I];
       if (pr = nil) or (pr.I = nil) then Continue;
       if Length(PreOut[I]) = 0 then Continue;
       NN.Compute(pr.I);
       outV := NN.GetLastLayer().Output;
-      LpBnd210 := outV.Size - 1;
-      for J := 0 to LpBnd210 do
+      MaxCheckOutputPos := outV.Size - 1;
+      for J := 0 to MaxCheckOutputPos do
         if J < Length(PreOut[I]) then
           if Abs(outV.FData[J] - PreOut[I][J]) > InvErrMax then
             InvErrMax := Abs(outV.FData[J] - PreOut[I][J]);
@@ -111754,12 +112054,12 @@ const
   cMaxBarWidth = 40;
   cTailFrac = 0.10;   // top/bottom 10% flagged as high/low impact
 var
-  LpBnd211: integer;
-  LpBnd212: integer;
-  LpBnd213: integer;
-  LpBnd214: integer;
-  LpBnd215: integer;
-  LpBnd216: integer;
+  MaxBaselineOutputPos: integer;
+  MaxParamCountNeuronPos: integer;
+  MaxPerturbNeuronPos: integer;
+  MaxPerturbWeightPos: integer;
+  MaxDeltaOutputPos: integer;
+  MaxLossOutputPos: integer;
   Lines: TStringList;
   Flags: TStringList;
   LayerIdx, TrIdx, SampleIdx, I, J, K, BinIdx: integer;
@@ -111893,8 +112193,8 @@ begin
       if HasTargets then
       begin
         Tgt := 0; // silence hint
-        LpBnd211 := Output.Size - 1;
-        for I := 0 to LpBnd211 do
+        MaxBaselineOutputPos := Output.Size - 1;
+        for I := 0 to MaxBaselineOutputPos do
         begin
           if I < Targets[SampleIdx].Size then Tgt := Targets[SampleIdx].Raw[I]
           else Tgt := 0;
@@ -111940,8 +112240,8 @@ begin
       Layer := NN.Layers[TrLayerIdx[TrIdx]];
       // param count = sum of weight sizes + one bias per neuron.
       TrParams[TrIdx] := 0;
-      LpBnd212 := Layer.Neurons.Count - 1;
-      for I := 0 to LpBnd212 do
+      MaxParamCountNeuronPos := Layer.Neurons.Count - 1;
+      for I := 0 to MaxParamCountNeuronPos do
         TrParams[TrIdx] := TrParams[TrIdx] + Layer.Neurons[I].Weights.Size + 1;
 
       AccDelta := 0;
@@ -111951,11 +112251,11 @@ begin
       for K := 0 to LSTrialsM1 do
       begin
         // Perturb ONE layer's weights and biases: W *= 1 + eta.
-        LpBnd213 := Layer.Neurons.Count - 1;
-        for I := 0 to LpBnd213 do
+        MaxPerturbNeuronPos := Layer.Neurons.Count - 1;
+        for I := 0 to MaxPerturbNeuronPos do
         begin
-          LpBnd214 := Layer.Neurons[I].Weights.Size - 1;
-          for J := 0 to LpBnd214 do
+          MaxPerturbWeightPos := Layer.Neurons[I].Weights.Size - 1;
+          for J := 0 to MaxPerturbWeightPos do
           begin
             Eta := Sigma * NextGaussian();
             Layer.Neurons[I].Weights.FData[J] :=
@@ -111974,8 +112274,8 @@ begin
           NN.Compute(Samples[SampleIdx]);
           Output := NN.GetLastLayer.Output;
           SumSq := 0;
-          LpBnd215 := Output.Size - 1;
-          for I := 0 to LpBnd215 do
+          MaxDeltaOutputPos := Output.Size - 1;
+          for I := 0 to MaxDeltaOutputPos do
           begin
             Diff := Output.Raw[I] - Baseline[SampleIdx].Raw[I];
             SumSq := SumSq + Diff * Diff;
@@ -111986,8 +112286,8 @@ begin
           if HasTargets then
           begin
             SampleLoss := 0;
-            LpBnd216 := Output.Size - 1;
-            for I := 0 to LpBnd216 do
+            MaxLossOutputPos := Output.Size - 1;
+            for I := 0 to MaxLossOutputPos do
             begin
               if I < Targets[SampleIdx].Size then Tgt := Targets[SampleIdx].Raw[I]
               else Tgt := 0;
@@ -112145,37 +112445,93 @@ begin
   end;
 end;
 
+// Returns the (K+1)-th smallest element of Arr[0..N-1] (0-based rank K), i.e.
+// exactly the value Arr[K] would hold after an ascending sort of the same
+// multiset - ties and duplicates included. Arr is partially permuted in place.
+// Median-of-three Hoare quickselect (same shape as PartialSelectTokenArray in
+// neuralvolume.pas), average O(N) instead of the O(N^2) full sort the magnitude
+// pruning paths used to run just to read one order statistic. The two extreme
+// ranks are a plain linear scan: cheaper and obviously exact.
+// Coded by Claude (AI).
+function SelectKthSmallest(var Arr: array of TNeuralFloat;
+  N, K: integer): TNeuralFloat;
+var
+  Lo, Hi, I, J, Mid, NM1: integer;
+  Pivot, T: TNeuralFloat;
+begin
+  Result := 0;
+  if (N <= 0) or (K < 0) or (K >= N) then Exit;
+  NM1 := N - 1;
+  if K = 0 then
+  begin
+    Result := Arr[0];
+    for I := 1 to NM1 do
+      if Arr[I] < Result then Result := Arr[I];
+    Exit;
+  end;
+  if K = NM1 then
+  begin
+    Result := Arr[0];
+    for I := 1 to NM1 do
+      if Arr[I] > Result then Result := Arr[I];
+    Exit;
+  end;
+  Lo := 0;
+  Hi := NM1;
+  while Lo < Hi do
+  begin
+    // Median of Arr[Lo], Arr[Mid], Arr[Hi] as the pivot value; it lies between
+    // Arr[Lo] and Arr[Hi], so both scans below stop inside [Lo, Hi].
+    Mid := (Lo + Hi) shr 1;
+    if Arr[Mid] < Arr[Lo] then
+    begin
+      T := Arr[Mid]; Arr[Mid] := Arr[Lo]; Arr[Lo] := T;
+    end;
+    if Arr[Hi] < Arr[Lo] then
+    begin
+      T := Arr[Hi]; Arr[Hi] := Arr[Lo]; Arr[Lo] := T;
+    end;
+    if Arr[Mid] > Arr[Hi] then
+    begin
+      T := Arr[Mid]; Arr[Mid] := Arr[Hi]; Arr[Hi] := T;
+    end;
+    Pivot := Arr[Mid];
+    I := Lo;
+    J := Hi;
+    repeat
+      while Arr[I] < Pivot do Inc(I);
+      while Arr[J] > Pivot do Dec(J);
+      if I <= J then
+      begin
+        T := Arr[I]; Arr[I] := Arr[J]; Arr[J] := T;
+        Inc(I);
+        Dec(J);
+      end;
+    until I > J;
+    // Descend into the side still holding rank K; if K falls in the
+    // equal-to-pivot gap (J < K < I) the answer is already in place.
+    if K <= J then Hi := J
+    else if K >= I then Lo := I
+    else Break;
+  end;
+  Result := Arr[K];
+end;
+
 function TNNet.PruneWeightsByMagnitude(Sparsity: TNeuralFloat;
   PerLayer: boolean = False): integer;
 var
-  LpBnd217: integer;
-  LpBnd218: integer;
-  LpBnd219: integer;
-  LpBnd220: integer;
-  LpBnd221: integer;
-  LpBnd222: integer;
+  MaxCountNeuronPos: integer;
+  MaxCollectNeuronPos: integer;
+  MaxCollectWeightPos: integer;
+  MaxLayerCountNeuronPos: integer;
+  MaxLayerCollectNeuronPos: integer;
+  MaxLayerCollectWeightPos: integer;
   LayerCnt, NeuronCnt, WeightCnt, K, CutIdx, TotalWeights: integer;
   PruneLastLayerIdx: integer;
   Layer: TNNetLayer;
   Neuron: TNNetNeuron;
   AllAbs: array of TNeuralFloat;
   Threshold: TNeuralFloat;
-
-  procedure SortAsc(var Arr: array of TNeuralFloat; N: integer);
-  var A, B, NM2, BBnd: integer; SwapF: TNeuralFloat;
-  begin
-    NM2 := N - 2;
-    for A := 0 to NM2 do
-    begin
-      BBnd := NM2 - A;
-      for B := 0 to BBnd do
-        if Arr[B] > Arr[B + 1] then
-        begin
-          SwapF := Arr[B]; Arr[B] := Arr[B + 1]; Arr[B + 1] := SwapF;
-        end;
-    end;
-  end;
-
 begin
   Result := 0;
   if Sparsity <= 0 then
@@ -112196,8 +112552,8 @@ begin
       if Layer.Neurons.Count = 0 then Continue;
       if (Layer.Neurons[0].Weights = nil) or (Layer.Neurons[0].Weights.Size = 0)
         then Continue;
-      LpBnd217 := Layer.Neurons.Count - 1;
-      for NeuronCnt := 0 to LpBnd217 do
+      MaxCountNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronCnt := 0 to MaxCountNeuronPos do
         TotalWeights := TotalWeights + Layer.Neurons[NeuronCnt].Weights.Size;
     end;
     if TotalWeights = 0 then Exit;
@@ -112209,24 +112565,23 @@ begin
       if Layer.Neurons.Count = 0 then Continue;
       if (Layer.Neurons[0].Weights = nil) or (Layer.Neurons[0].Weights.Size = 0)
         then Continue;
-      LpBnd218 := Layer.Neurons.Count - 1;
-      for NeuronCnt := 0 to LpBnd218 do
+      MaxCollectNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronCnt := 0 to MaxCollectNeuronPos do
       begin
         Neuron := Layer.Neurons[NeuronCnt];
-        LpBnd219 := Neuron.Weights.Size - 1;
-        for WeightCnt := 0 to LpBnd219 do
+        MaxCollectWeightPos := Neuron.Weights.Size - 1;
+        for WeightCnt := 0 to MaxCollectWeightPos do
         begin
           AllAbs[K] := Abs(Neuron.Weights.FData[WeightCnt]);
           Inc(K);
         end;
       end;
     end;
-    SortAsc(AllAbs, TotalWeights);
     CutIdx := Trunc(Sparsity * TotalWeights);
     if CutIdx < 1 then CutIdx := 1;
     if CutIdx > TotalWeights then CutIdx := TotalWeights;
     // Threshold = magnitude of the largest weight we still prune.
-    Threshold := AllAbs[CutIdx - 1];
+    Threshold := SelectKthSmallest(AllAbs, TotalWeights, CutIdx - 1);
     for LayerCnt := 0 to PruneLastLayerIdx do
       Result := Result +
         FLayers[LayerCnt].BuildPruneMaskFromThreshold(Threshold);
@@ -112241,28 +112596,27 @@ begin
       if (Layer.Neurons[0].Weights = nil) or (Layer.Neurons[0].Weights.Size = 0)
         then Continue;
       TotalWeights := 0;
-      LpBnd220 := Layer.Neurons.Count - 1;
-      for NeuronCnt := 0 to LpBnd220 do
+      MaxLayerCountNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronCnt := 0 to MaxLayerCountNeuronPos do
         TotalWeights := TotalWeights + Layer.Neurons[NeuronCnt].Weights.Size;
       if TotalWeights = 0 then Continue;
       SetLength(AllAbs, TotalWeights);
       K := 0;
-      LpBnd221 := Layer.Neurons.Count - 1;
-      for NeuronCnt := 0 to LpBnd221 do
+      MaxLayerCollectNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronCnt := 0 to MaxLayerCollectNeuronPos do
       begin
         Neuron := Layer.Neurons[NeuronCnt];
-        LpBnd222 := Neuron.Weights.Size - 1;
-        for WeightCnt := 0 to LpBnd222 do
+        MaxLayerCollectWeightPos := Neuron.Weights.Size - 1;
+        for WeightCnt := 0 to MaxLayerCollectWeightPos do
         begin
           AllAbs[K] := Abs(Neuron.Weights.FData[WeightCnt]);
           Inc(K);
         end;
       end;
-      SortAsc(AllAbs, TotalWeights);
       CutIdx := Trunc(Sparsity * TotalWeights);
       if CutIdx < 1 then CutIdx := 1;
       if CutIdx > TotalWeights then CutIdx := TotalWeights;
-      Threshold := AllAbs[CutIdx - 1];
+      Threshold := SelectKthSmallest(AllAbs, TotalWeights, CutIdx - 1);
       Result := Result + Layer.BuildPruneMaskFromThreshold(Threshold);
     end;
   end;
@@ -112313,7 +112667,7 @@ end;
 
 function TNNet.GetPruneSparsity(): TNeuralFloat;
 var
-  LpBnd223: integer;
+  MaxLayerNeuronPos: integer;
   LayerCnt, NeuronCnt, TotalWeights, LastIdx: integer;
   Layer: TNNetLayer;
 begin
@@ -112326,8 +112680,8 @@ begin
     if Layer.Neurons.Count = 0 then Continue;
     if (Layer.Neurons[0].Weights = nil) or (Layer.Neurons[0].Weights.Size = 0)
       then Continue;
-    LpBnd223 := Layer.Neurons.Count - 1;
-    for NeuronCnt := 0 to LpBnd223 do
+    MaxLayerNeuronPos := Layer.Neurons.Count - 1;
+    for NeuronCnt := 0 to MaxLayerNeuronPos do
       TotalWeights := TotalWeights + Layer.Neurons[NeuronCnt].Weights.Size;
   end;
   if TotalWeights > 0 then
@@ -112346,22 +112700,22 @@ const
   cMaxBarWidth = 40;
   cZeroEps = 1e-9;
 var
-  LpBnd224: integer;
-  LpBnd225: integer;
-  LpBnd226: integer;
-  LpBnd227: integer;
-  LpBnd228: integer;
-  LpBnd229: integer;
-  LpBnd230: integer;
-  LpBnd231: integer;
-  LpBnd232: integer;
-  LpBnd233: integer;
-  LpBnd234: integer;
-  LpBnd235: integer;
-  LpBnd236: integer;
-  LpBnd237: integer;
-  LpBnd238: integer;
-  LpBnd239: integer;
+  MaxCountNeuronPos: integer;
+  MaxCollectNeuronPos: integer;
+  MaxCollectWeightPos: integer;
+  MaxLayerCountNeuronPos: integer;
+  MaxLayerCollectNeuronPos: integer;
+  MaxLayerCollectWeightPos: integer;
+  MaxPruneNeuronPos: integer;
+  MaxPruneWeightPos: integer;
+  MaxLossOutputPos: integer;
+  MaxKneeCollectNeuronPos: integer;
+  MaxKneeCollectWeightPos: integer;
+  MaxKneeCountNeuronPos: integer;
+  MaxKneeLayerCollectNeuronPos: integer;
+  MaxKneeLayerCollectWeightPos: integer;
+  MaxKneeScanNeuronPos: integer;
+  MaxKneeScanWeightPos: integer;
   Lines: TStringList;
   Levels: array of TNeuralFloat;
   LevelLoss: array of TNeuralFloat;
@@ -112387,25 +112741,7 @@ var
   PredClass, TrueClass: integer;
   Bar, ShapeStr, Verdict, MetricName: string;
   KneeSparsity: TNeuralFloat;
-  SwapF: TNeuralFloat;
   LayerAbs: array of TNeuralFloat;
-
-  // Quickselect-free: collect |w| of a slice into Buf then sort ascending.
-  procedure SortAsc(var Arr: array of TNeuralFloat; N: integer);
-  var A, B, NM2, BBnd: integer;
-  begin
-    NM2 := N - 2;
-    for A := 0 to NM2 do
-    begin
-      BBnd := NM2 - A;
-      for B := 0 to BBnd do
-        if Arr[B] > Arr[B + 1] then
-        begin
-          SwapF := Arr[B]; Arr[B] := Arr[B + 1]; Arr[B + 1] := SwapF;
-        end;
-    end;
-  end;
-
 begin
   Result := '';
   Lines := TStringList.Create();
@@ -112444,8 +112780,8 @@ begin
       if Layer.Neurons[0].Weights.Size = 0 then Continue;
       SetLength(TrLayerIdx, Length(TrLayerIdx) + 1);
       TrLayerIdx[High(TrLayerIdx)] := LayerIdx;
-      LpBnd224 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd224 do
+      MaxCountNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxCountNeuronPos do
         TotalWeights := TotalWeights + Layer.Neurons[NeuronIdx].Weights.Size;
     end;
     TrainableLayers := Length(TrLayerIdx);
@@ -112522,27 +112858,27 @@ begin
         for I := 0 to MPTrainM1 do
         begin
           Layer := NN.Layers[TrLayerIdx[I]];
-          LpBnd225 := Layer.Neurons.Count - 1;
-          for NeuronIdx := 0 to LpBnd225 do
+          MaxCollectNeuronPos := Layer.Neurons.Count - 1;
+          for NeuronIdx := 0 to MaxCollectNeuronPos do
           begin
             Neuron := Layer.Neurons[NeuronIdx];
-            LpBnd226 := Neuron.Weights.Size - 1;
-            for LayerIdx := 0 to LpBnd226 do
+            MaxCollectWeightPos := Neuron.Weights.Size - 1;
+            for LayerIdx := 0 to MaxCollectWeightPos do
             begin
               AllAbs[K] := Abs(Neuron.Weights.FData[LayerIdx]);
               Inc(K);
             end;
           end;
         end;
-        SortAsc(AllAbs, TotalWeights);
         CutIdx := Trunc(S * TotalWeights);
         if CutIdx < 0 then CutIdx := 0;
         if CutIdx > TotalWeights then CutIdx := TotalWeights;
         // Threshold = the (CutIdx)-th smallest |w|; zero all <= that value.
         if CutIdx = 0 then Threshold := -1            // zero nothing
         else if CutIdx >= TotalWeights then
-          Threshold := AllAbs[TotalWeights - 1]       // zero everything
-        else Threshold := AllAbs[CutIdx - 1];
+          Threshold := SelectKthSmallest(AllAbs, TotalWeights,
+            TotalWeights - 1)                         // zero everything (max |w|)
+        else Threshold := SelectKthSmallest(AllAbs, TotalWeights, CutIdx - 1);
       end
       else
         Threshold := 0; // unused; per-layer threshold computed inside loop
@@ -112552,8 +112888,8 @@ begin
         Layer := NN.Layers[TrLayerIdx[I]];
         KneeWeights[I] := 0;
         KneeZeroed[I] := 0;
-        LpBnd227 := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to LpBnd227 do
+        MaxLayerCountNeuronPos := Layer.Neurons.Count - 1;
+        for NeuronIdx := 0 to MaxLayerCountNeuronPos do
           KneeWeights[I] := KneeWeights[I] + Layer.Neurons[NeuronIdx].Weights.Size;
 
         if PerLayer then
@@ -112562,31 +112898,32 @@ begin
           PerLayerCount := KneeWeights[I];
           SetLength(LayerAbs, PerLayerCount);
           K := 0;
-          LpBnd228 := Layer.Neurons.Count - 1;
-          for NeuronIdx := 0 to LpBnd228 do
+          MaxLayerCollectNeuronPos := Layer.Neurons.Count - 1;
+          for NeuronIdx := 0 to MaxLayerCollectNeuronPos do
           begin
             Neuron := Layer.Neurons[NeuronIdx];
-            LpBnd229 := Neuron.Weights.Size - 1;
-            for LayerIdx := 0 to LpBnd229 do
+            MaxLayerCollectWeightPos := Neuron.Weights.Size - 1;
+            for LayerIdx := 0 to MaxLayerCollectWeightPos do
             begin
               LayerAbs[K] := Abs(Neuron.Weights.FData[LayerIdx]);
               Inc(K);
             end;
           end;
-          SortAsc(LayerAbs, PerLayerCount);
           PerLayerCut := Trunc(S * PerLayerCount);
           if PerLayerCut <= 0 then Threshold := -1
           else if PerLayerCut >= PerLayerCount then
-            Threshold := LayerAbs[PerLayerCount - 1]
-          else Threshold := LayerAbs[PerLayerCut - 1];
+            Threshold := SelectKthSmallest(LayerAbs, PerLayerCount,
+              PerLayerCount - 1)
+          else Threshold := SelectKthSmallest(LayerAbs, PerLayerCount,
+            PerLayerCut - 1);
         end;
 
-        LpBnd230 := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to LpBnd230 do
+        MaxPruneNeuronPos := Layer.Neurons.Count - 1;
+        for NeuronIdx := 0 to MaxPruneNeuronPos do
         begin
           Neuron := Layer.Neurons[NeuronIdx];
-          LpBnd231 := Neuron.Weights.Size - 1;
-          for LayerIdx := 0 to LpBnd231 do
+          MaxPruneWeightPos := Neuron.Weights.Size - 1;
+          for LayerIdx := 0 to MaxPruneWeightPos do
           begin
             AbsW := Abs(Neuron.Weights.FData[LayerIdx]);
             if (Threshold >= 0) and (AbsW <= Threshold) then
@@ -112614,8 +112951,8 @@ begin
         NN.Compute(Samples[SampleIdx]);
         Output := NN.GetLastLayer.Output;
         SampleLoss := 0;
-        LpBnd232 := Output.Size - 1;
-        for I := 0 to LpBnd232 do
+        MaxLossOutputPos := Output.Size - 1;
+        for I := 0 to MaxLossOutputPos do
         begin
           if HasLabels then
           begin
@@ -112733,23 +113070,23 @@ begin
       for I := 0 to MPTrainM1 do
       begin
         Layer := NN.Layers[TrLayerIdx[I]];
-        LpBnd233 := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to LpBnd233 do
+        MaxKneeCollectNeuronPos := Layer.Neurons.Count - 1;
+        for NeuronIdx := 0 to MaxKneeCollectNeuronPos do
         begin
           Neuron := Layer.Neurons[NeuronIdx];
-          LpBnd234 := Neuron.Weights.Size - 1;
-          for LayerIdx := 0 to LpBnd234 do
+          MaxKneeCollectWeightPos := Neuron.Weights.Size - 1;
+          for LayerIdx := 0 to MaxKneeCollectWeightPos do
           begin
             AllAbs[K] := Abs(Neuron.Weights.FData[LayerIdx]);
             Inc(K);
           end;
         end;
       end;
-      SortAsc(AllAbs, TotalWeights);
       CutIdx := Trunc(S * TotalWeights);
       if CutIdx <= 0 then Threshold := -1
-      else if CutIdx >= TotalWeights then Threshold := AllAbs[TotalWeights - 1]
-      else Threshold := AllAbs[CutIdx - 1];
+      else if CutIdx >= TotalWeights then
+        Threshold := SelectKthSmallest(AllAbs, TotalWeights, TotalWeights - 1)
+      else Threshold := SelectKthSmallest(AllAbs, TotalWeights, CutIdx - 1);
     end;
     for I := 0 to MPTrainM1 do
     begin
@@ -112757,35 +113094,36 @@ begin
       if PerLayer then
       begin
         PerLayerCount := 0;
-        LpBnd235 := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to LpBnd235 do
+        MaxKneeCountNeuronPos := Layer.Neurons.Count - 1;
+        for NeuronIdx := 0 to MaxKneeCountNeuronPos do
           PerLayerCount := PerLayerCount + Layer.Neurons[NeuronIdx].Weights.Size;
         SetLength(LayerAbs, PerLayerCount);
         K := 0;
-        LpBnd236 := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to LpBnd236 do
+        MaxKneeLayerCollectNeuronPos := Layer.Neurons.Count - 1;
+        for NeuronIdx := 0 to MaxKneeLayerCollectNeuronPos do
         begin
           Neuron := Layer.Neurons[NeuronIdx];
-          LpBnd237 := Neuron.Weights.Size - 1;
-          for LayerIdx := 0 to LpBnd237 do
+          MaxKneeLayerCollectWeightPos := Neuron.Weights.Size - 1;
+          for LayerIdx := 0 to MaxKneeLayerCollectWeightPos do
           begin
             LayerAbs[K] := Abs(Neuron.Weights.FData[LayerIdx]);
             Inc(K);
           end;
         end;
-        SortAsc(LayerAbs, PerLayerCount);
         PerLayerCut := Trunc(S * PerLayerCount);
         if PerLayerCut <= 0 then Threshold := -1
         else if PerLayerCut >= PerLayerCount then
-          Threshold := LayerAbs[PerLayerCount - 1]
-        else Threshold := LayerAbs[PerLayerCut - 1];
+          Threshold := SelectKthSmallest(LayerAbs, PerLayerCount,
+            PerLayerCount - 1)
+        else Threshold := SelectKthSmallest(LayerAbs, PerLayerCount,
+          PerLayerCut - 1);
       end;
-      LpBnd238 := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to LpBnd238 do
+      MaxKneeScanNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxKneeScanNeuronPos do
       begin
         Neuron := Layer.Neurons[NeuronIdx];
-        LpBnd239 := Neuron.Weights.Size - 1;
-        for LayerIdx := 0 to LpBnd239 do
+        MaxKneeScanWeightPos := Neuron.Weights.Size - 1;
+        for LayerIdx := 0 to MaxKneeScanWeightPos do
         begin
           Inc(KneeWeights[I]);
           AbsW := Abs(Neuron.Weights.FData[LayerIdx]);
@@ -113349,8 +113687,8 @@ const
   cEps = 1e-12;          // guard for near-zero baseline output norm
   cTransformCount = 4;
 var
-  LpBnd240: integer;
-  LpBnd241: integer;
+  MaxCheckSamplePos: integer;
+  MaxCheckOutputPos: integer;
   TransformM1, EqCBinsM1, CountedM1: integer;
   Lines: TStringList;
   TName: array[0 .. cTransformCount - 1] of string;
@@ -113449,8 +113787,8 @@ begin
       SkippedZero := 0;
       UsedSamples := 0;
 
-      LpBnd240 := Samples.Count - 1;
-      for SampleIdx := 0 to LpBnd240 do
+      MaxCheckSamplePos := Samples.Count - 1;
+      for SampleIdx := 0 to MaxCheckSamplePos do
       begin
         // Baseline output f(x).
         NN.Compute(Samples[SampleIdx]);
@@ -113473,8 +113811,8 @@ begin
         BaseNorm := 0;
         if NN.GetLastLayer.Output.Size = Base.Size then
         begin
-          LpBnd241 := Base.Size - 1;
-          for I := 0 to LpBnd241 do
+          MaxCheckOutputPos := Base.Size - 1;
+          for I := 0 to MaxCheckOutputPos do
           begin
             Diff := NN.GetLastLayer.Output.Raw[I] - Base.Raw[I];
             SumSq := SumSq + Diff * Diff;
@@ -113578,7 +113916,7 @@ class function TNNet.TTAReport(
 const
   cTransformCount = 5; // identity, FlipX, FlipY, ReverseChannels, Roll(+1)
 var
-  LpBnd242: integer;
+  MaxProbeInputPos: integer;
   TTATransformM1, LabelsM1, TTANumClassesM1, OutSizeM1: integer;
   Lines: TStringList;
   TName: array[0 .. cTransformCount - 1] of string;
@@ -113687,8 +114025,8 @@ begin
     if AverageProbs then AvgMode := 'post-softmax probabilities'
     else AvgMode := 'raw logits';
 
-    LpBnd242 := pInput.Count - 1;
-    for SampleIdx := 0 to LpBnd242 do
+    MaxProbeInputPos := pInput.Count - 1;
+    for SampleIdx := 0 to MaxProbeInputPos do
     begin
       Lbl := pLabels[SampleIdx];
       if (Lbl < 0) or (Lbl >= NumClasses) then Continue; // skip bad labels
@@ -113864,8 +114202,8 @@ class function TNNet.AdversarialRobustnessReport(
   const EpsList: array of TNeuralFloat
 ): string;
 var
-  LpBnd243: integer;
-  LpBnd244: integer;
+  MaxGradPos: integer;
+  MaxAdvPos: integer;
   NM1, NEpsM1, NClassesM1, EpsListM1, EpsLenM1: integer;
   Lines: TStringList;
   N, NClasses, OutSize, NEps, MedianIdx: integer;
@@ -114041,14 +114379,14 @@ begin
       Grad.ReSize(Samples[I]);
       Adv.ReSize(Samples[I]);
       InputLossGrad(Samples[I], Labels[I], Grad);
-      LpBnd243 := Grad.Size - 1;
-      for J := 0 to LpBnd243 do Grad.Raw[J] := SignF(Grad.Raw[J]);
+      MaxGradPos := Grad.Size - 1;
+      for J := 0 to MaxGradPos do Grad.Raw[J] := SignF(Grad.Raw[J]);
 
       for E := 0 to NEpsM1 do
       begin
         // x_adv = x + eps * sign(grad); eps=0 reproduces the clean input.
-        LpBnd244 := Adv.Size - 1;
-        for J := 0 to LpBnd244 do
+        MaxAdvPos := Adv.Size - 1;
+        for J := 0 to MaxAdvPos do
           Adv.Raw[J] := Samples[I].Raw[J] + Eps[E] * Grad.Raw[J];
         NN.Compute(Adv);
         PredCls := NN.GetLastLayer.Output.GetClass();
@@ -114267,12 +114605,12 @@ const
   cEps = 1e-12;
   cBuckets = ' .:-=+*#%@';   // 10 intensity buckets (index 0 = blank/zero)
 var
-  LpBnd245: integer;
-  LpBnd246: integer;
-  LpBnd247: integer;
-  LpBnd248: integer;
-  LpBnd249: integer;
-  LpBnd250: integer;
+  MaxMapInitPos: integer;
+  MaxVanillaPos: integer;
+  MaxSmoothAccumPos: integer;
+  MaxSmoothAvgPos: integer;
+  MaxIntgPos: integer;
+  MaxIGSumPos: integer;
   Lines: TStringList;
   SizeX, SizeY, Depth, NClasses, OutSize: integer;
   PredClass: integer;
@@ -114424,8 +114762,8 @@ begin
     SetLength(Vanilla, Probe.Size);
     SetLength(Smooth, Probe.Size);
     SetLength(Intg, Probe.Size);
-    LpBnd245 := Probe.Size - 1;
-    for I := 0 to LpBnd245 do
+    MaxMapInitPos := Probe.Size - 1;
+    for I := 0 to MaxMapInitPos do
     begin
       Vanilla[I] := 0; Smooth[I] := 0; Intg[I] := 0;
     end;
@@ -114444,8 +114782,8 @@ begin
     // (a) Vanilla saliency: single forward+backward, |d logit_c / d x|.
     Grad.Fill(0);
     AccumLogitGrad(Probe, PredClass, Grad, LogitAtX, 1.0);
-    LpBnd246 := Probe.Size - 1;
-    for I := 0 to LpBnd246 do Vanilla[I] := Abs(Grad.Raw[I]);
+    MaxVanillaPos := Probe.Size - 1;
+    for I := 0 to MaxVanillaPos do Vanilla[I] := Abs(Grad.Raw[I]);
 
     // (b) SmoothGrad: average |grad| over SmoothSamples noisy copies.
     SmoothSamplesM1 := SmoothSamples - 1;
@@ -114458,11 +114796,11 @@ begin
           Noisy.Raw[I] := Noisy.Raw[I] + Sigma * NextGaussian();
       Grad.Fill(0);
       AccumLogitGrad(Noisy, PredClass, Grad, LogitAtX, 1.0);
-      LpBnd247 := Probe.Size - 1;
-      for I := 0 to LpBnd247 do Smooth[I] := Smooth[I] + Abs(Grad.Raw[I]);
+      MaxSmoothAccumPos := Probe.Size - 1;
+      for I := 0 to MaxSmoothAccumPos do Smooth[I] := Smooth[I] + Abs(Grad.Raw[I]);
     end;
-    LpBnd248 := Probe.Size - 1;
-    for I := 0 to LpBnd248 do Smooth[I] := Smooth[I] / SmoothSamples;
+    MaxSmoothAvgPos := Probe.Size - 1;
+    for I := 0 to MaxSmoothAvgPos do Smooth[I] := Smooth[I] / SmoothSamples;
     // restore the clean LogitAtX for completeness reporting below.
     NN.Compute(Probe);
     LogitAtX := NN.GetLastLayer.Output.Raw[PredClass];
@@ -114478,8 +114816,8 @@ begin
       AccumLogitGrad(Scaled, PredClass, Grad, LogitAtX, 1.0 / IntgSteps);
     end;
     // multiply the averaged path-gradient by (x_i - baseline_i) = x_i.
-    LpBnd249 := Probe.Size - 1;
-    for I := 0 to LpBnd249 do Intg[I] := Grad.Raw[I] * Probe.Raw[I];
+    MaxIntgPos := Probe.Size - 1;
+    for I := 0 to MaxIntgPos do Intg[I] := Grad.Raw[I] * Probe.Raw[I];
 
     // logit at the zero baseline, for the completeness check.
     Baseline.Fill(0);
@@ -114487,8 +114825,8 @@ begin
     LogitAtZero := NN.GetLastLayer.Output.Raw[PredClass];
 
     IGSum := 0;
-    LpBnd250 := Probe.Size - 1;
-    for I := 0 to LpBnd250 do IGSum := IGSum + Intg[I];
+    MaxIGSumPos := Probe.Size - 1;
+    for I := 0 to MaxIGSumPos do IGSum := IGSum + Intg[I];
     LogitDelta := LogitAtX - LogitAtZero;
     GapAbs := Abs(IGSum - LogitDelta);
     if Abs(LogitDelta) > cEps then RelGap := GapAbs / Abs(LogitDelta)
@@ -114938,7 +115276,7 @@ class function TNNet.LRPReport(
 const
   cBuckets = ' .:-=+*#%@';   // 10 intensity buckets (index 0 = blank/zero)
 var
-  LpBnd251: integer;
+  MaxLayerNeuronPos: integer;
   RLayerM1, RinM1: integer;
   RLIdxM1, R0M1, KeepKM1, TopCountM1, TopCountM2: integer;
   DepthM1, SizeXM1, SizeYM1: integer;
@@ -115094,8 +115432,8 @@ begin
       begin
         KindStr := RuleName;
         // For each output neuron j distribute R_out[j] back to inputs i.
-        LpBnd251 := Layer.Neurons.Count - 1;
-        for j := 0 to LpBnd251 do
+        MaxLayerNeuronPos := Layer.Neurons.Count - 1;
+        for j := 0 to MaxLayerNeuronPos do
         begin
           Neuron := Layer.Neurons[j];
           case Rule of
@@ -115575,8 +115913,8 @@ const
   cEps = 1e-9;
   cMaxGrid = 201;                // sanity clamp so art/CSV stays bounded
 var
-  LpBnd252: integer;
-  LpBnd253: integer;
+  MaxBoxProbePos: integer;
+  MaxOverlayProbePos: integer;
   Lines: TStringList;
   InVol, OutVol: TNNetVolume;
   InputSize, NumClasses: integer;
@@ -115663,8 +116001,8 @@ begin
     if HaveProbes then
     begin
       xMin := 1e30; xMax := -1e30; yMin := 1e30; yMax := -1e30;
-      LpBnd252 := Probes.Count - 1;
-      for pIdx := 0 to LpBnd252 do
+      MaxBoxProbePos := Probes.Count - 1;
+      for pIdx := 0 to MaxBoxProbePos do
       begin
         P := Probes[pIdx];
         if (P = nil) or (P.I = nil) or (P.I.Size < 2) then Continue;
@@ -115750,8 +116088,8 @@ begin
     ProbeMis := 0; ProbeTot := 0;
     if HaveProbes then
     begin
-      LpBnd253 := Probes.Count - 1;
-      for pIdx := 0 to LpBnd253 do
+      MaxOverlayProbePos := Probes.Count - 1;
+      for pIdx := 0 to MaxOverlayProbePos do
       begin
         P := Probes[pIdx];
         if (P = nil) or (P.I = nil) or (P.O = nil) or (P.I.Size < 2) then
@@ -116449,9 +116787,9 @@ const
   cBinsM1 = cBins - 1;
   cMaxBarWidth = 40;
 var
-  LpBnd254: integer;
-  LpBnd255: integer;
-  LpBnd256: integer;
+  MaxSamplePos: integer;
+  MaxTop1OutputPos: integer;
+  MaxTop2OutputPos: integer;
   NumClassesM1, SampleCountM1, KM1, KM2: integer;
   TStart: integer;
   Lines: TStringList;
@@ -116548,8 +116886,8 @@ begin
     SetLength(TrueCls, Samples.Count);
     SampleCount := 0;
 
-    LpBnd254 := Samples.Count - 1;
-    for I := 0 to LpBnd254 do
+    MaxSamplePos := Samples.Count - 1;
+    for I := 0 to MaxSamplePos do
     begin
       Pair := Samples[I];
       if (Pair = nil) or (Pair.I = nil) or (Pair.O = nil) then Continue;
@@ -116562,8 +116900,8 @@ begin
       // top1 / top2 over the raw final-layer outputs (logits)
       Top1Idx := 0;
       Top1Val := Output.FData[0];
-      LpBnd255 := Output.Size - 1;
-      for J := 1 to LpBnd255 do
+      MaxTop1OutputPos := Output.Size - 1;
+      for J := 1 to MaxTop1OutputPos do
         if Output.FData[J] > Top1Val then
         begin
           Top1Val := Output.FData[J];
@@ -116571,8 +116909,8 @@ begin
         end;
       Top2Idx := -1;
       Top2Val := 0;
-      LpBnd256 := Output.Size - 1;
-      for J := 0 to LpBnd256 do
+      MaxTop2OutputPos := Output.Size - 1;
+      for J := 0 to MaxTop2OutputPos do
       begin
         if J = Top1Idx then Continue;
         V := Output.FData[J];
@@ -117212,9 +117550,9 @@ end;
 
 function TNNet.CreateLayer(strData: string): TNNetLayer;
 var
-  LpBnd257: integer;
-  LpBnd258: integer;
-  LpBnd259: integer;
+  MaxStructParamPos: integer;
+  MaxLayerIdxPos: integer;
+  MaxFloatParamPos: integer;
   S, S2: TStringList;
   St: array [0..csNNetMaxParameterIdx] of integer;
   Ft: array [0..csNNetMaxParameterIdx] of TNeuralFloat;
@@ -117254,8 +117592,8 @@ begin
     StructCount := S2.Count;
     if S2.Count > 0 then
     begin
-      LpBnd257 := Min(S2.Count - 1, High(St));
-      for I := 0 to LpBnd257 do St[I] := StrToInt(S2[I]);
+      MaxStructParamPos := Min(S2.Count - 1, High(St));
+      for I := 0 to MaxStructParamPos do St[I] := StrToInt(S2[I]);
     end;
     if SCount >= 3 then
     begin
@@ -117266,8 +117604,8 @@ begin
         SetLength(aL, S2.Count);
         SetLength(aIdx, S2.Count);
 
-        LpBnd258 := S2.Count - 1;
-        for IdxCnt := 0 to LpBnd258 do
+        MaxLayerIdxPos := S2.Count - 1;
+        for IdxCnt := 0 to MaxLayerIdxPos do
         begin
           aIdx[IdxCnt] := StrToInt(S2[IdxCnt]);
         end;
@@ -117286,8 +117624,8 @@ begin
       S2.DelimitedText := S[3];
       if S2.Count > 0 then
       begin
-        LpBnd259 := Min(S2.Count - 1, High(St));
-        for I := 0 to LpBnd259 do Ft[I] := StrToFloat(S2[I], GetDefaultNumericFormat());
+        MaxFloatParamPos := Min(S2.Count - 1, High(St));
+        for I := 0 to MaxFloatParamPos do Ft[I] := StrToFloat(S2[I], GetDefaultNumericFormat());
       end;
     end
     else
@@ -120724,7 +121062,7 @@ end;
 // TNNetChannelZeroCenter descendants (channel normalization family).
 procedure TNNet.ApplyDecoupledWeightDecay(DecayRate: TNeuralFloat);
 var
-  LpBnd260: integer;
+  MaxLayerNeuronPos: integer;
   LayerCnt, NeuronCnt: integer;
   MaxLayerIdx: integer;
   CurrentLayer: TNNetLayer;
@@ -120740,8 +121078,8 @@ begin
     if CurrentLayer is TNNetIdentityWithoutL2 then Continue;
     if CurrentLayer is TNNetChannelZeroCenter then Continue;
     if CurrentLayer.Neurons.Count = 0 then Continue;
-    LpBnd260 := CurrentLayer.Neurons.Count - 1;
-    for NeuronCnt := 0 to LpBnd260 do
+    MaxLayerNeuronPos := CurrentLayer.Neurons.Count - 1;
+    for NeuronCnt := 0 to MaxLayerNeuronPos do
     begin
       CurrentLayer.FArrNeurons[NeuronCnt].Weights.Mul(Factor);  // #10: index the mirror
     end;
@@ -122330,7 +122668,7 @@ end;
 
 procedure TNNet.LoadStructureFromString(strData: string);
 var
-  LpBnd261: integer;
+  MaxStructureTokenPos: integer;
   S, S2: TStringList;
   Cnt: integer;
 begin
@@ -122339,8 +122677,8 @@ begin
   S2 := CreateTokenizedStringList(')');
   if S.Count > 0 then
   begin
-    LpBnd261 := S.Count - 1;
-    for Cnt := 0 to LpBnd261 do
+    MaxStructureTokenPos := S.Count - 1;
+    for Cnt := 0 to MaxStructureTokenPos do
     begin
       S2.DelimitedText := S[Cnt];
       //WriteLn(Cnt,':',S2[1],'->',S2[0]);
@@ -122588,7 +122926,7 @@ end;
 
 procedure TNNetGrokfastWrapper.AllocBuffers;
 var
-  LpBnd262: integer;
+  MaxLayerNeuronPos: integer;
   LayerIdx, NeuronIdx, MuIdx: integer;
   Layer: TNNetLayer;
   MuVol: TNNetVolume;
@@ -122612,8 +122950,8 @@ begin
   for LayerIdx := 0 to LiveLastLayerIdx do
   begin
     Layer := FLiveNet.Layers[LayerIdx];
-    LpBnd262 := Layer.Neurons.Count - 1;
-    for NeuronIdx := 0 to LpBnd262 do
+    MaxLayerNeuronPos := Layer.Neurons.Count - 1;
+    for NeuronIdx := 0 to MaxLayerNeuronPos do
     begin
       MuVol := TNNetVolume.Create();
       MuVol.ReSize(Layer.Neurons[NeuronIdx].Delta);
@@ -122625,7 +122963,7 @@ end;
 
 procedure TNNetGrokfastWrapper.Filter;
 var
-  LpBnd263: integer;
+  MaxLayerNeuronPos: integer;
   LayerIdx, NeuronIdx, MuIdx: integer;
   Layer: TNNetLayer;
   Neuron: TNNetNeuron;
@@ -122640,8 +122978,8 @@ begin
   for LayerIdx := 0 to LiveLastLayerIdx do
   begin
     Layer := FLiveNet.Layers[LayerIdx];
-    LpBnd263 := Layer.Neurons.Count - 1;
-    for NeuronIdx := 0 to LpBnd263 do
+    MaxLayerNeuronPos := Layer.Neurons.Count - 1;
+    for NeuronIdx := 0 to MaxLayerNeuronPos do
     begin
       Neuron := Layer.FArrNeurons[NeuronIdx];  // #10: index the mirror
       GradVol := Neuron.Delta;
@@ -122737,7 +123075,7 @@ end;
 
 function TNNet.ToGraphvizDot(const GraphName: string): string;
 var
-  LpBnd264: integer;
+  MaxPrevLayerPos: integer;
   SL: TStringList;
   LayerCnt: integer;
   InputCnt: integer;
@@ -122792,8 +123130,8 @@ begin
       if Layer is TNNetConcatBase then
       begin
         ConcatLayer := TNNetConcatBase(Layer);
-        LpBnd264 := ConcatLayer.FPrevLayerList.Count - 1;
-        for InputCnt := 0 to LpBnd264 do
+        MaxPrevLayerPos := ConcatLayer.FPrevLayerList.Count - 1;
+        for InputCnt := 0 to MaxPrevLayerPos do
         begin
           if Assigned(ConcatLayer.FPrevLayerList[InputCnt]) then
           begin
@@ -122817,9 +123155,9 @@ end;
 
 procedure TNNet.LoadDataFromString(strData: string);
 var
-  LpBnd265: integer;
-  LpBnd266: integer;
-  LpBnd267: integer;
+  MaxDataTokenPos: integer;
+  MaxDumpTokenPos: integer;
+  MaxLayerPos: integer;
   S: TStringList;
   Cnt: integer;
 begin
@@ -122829,8 +123167,8 @@ begin
   begin
     if S.Count > 0 then
     begin
-      LpBnd265 := S.Count - 1;
-      for Cnt := 0 to LpBnd265 do
+      MaxDataTokenPos := S.Count - 1;
+      for Cnt := 0 to MaxDataTokenPos do
       begin
         FLayers[Cnt].LoadDataFromString(S[Cnt]);
       end;
@@ -122849,8 +123187,8 @@ begin
     WriteLn('Loaded Data Layers:');
     if S.Count > 0 then
     begin
-      LpBnd266 := S.Count - 1;
-      for Cnt := 0 to LpBnd266 do
+      MaxDumpTokenPos := S.Count - 1;
+      for Cnt := 0 to MaxDumpTokenPos do
       begin
         Writeln(Cnt, ':', Copy(S[Cnt],1,20) );
       end;
@@ -122859,8 +123197,8 @@ begin
     WriteLn('Structure Layers:');
     if FLayers.Count>0 then
     begin
-      LpBnd267 := FLayers.Count - 1;
-      for Cnt := 0 to LpBnd267 do
+      MaxLayerPos := FLayers.Count - 1;
+      for Cnt := 0 to MaxLayerPos do
       begin
         Writeln(Cnt, ':', FLayers[Cnt].ClassName );
       end;
@@ -123016,12 +123354,12 @@ end;
 
 procedure TNNetLayer.BuildArrNeurons();
 var
-  LpBnd268: integer;
+  MaxNeuronPos: integer;
   NeuronIdx: integer;
 begin
   SetLength(FArrNeurons, FNeurons.Count);
-  LpBnd268 := FNeurons.Count - 1;
-  for NeuronIdx := 0 to LpBnd268 do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for NeuronIdx := 0 to MaxNeuronPos do
   begin
     FArrNeurons[NeuronIdx] := FNeurons[NeuronIdx];
   end;
@@ -123234,7 +123572,7 @@ end;
 
 function TNNetLayer.InitUniform(Value: TNeuralFloat): TNNetLayer;
 var
-  LpBnd269: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   // Inference-only layers skip random weight init (overwritten by the loader).
@@ -123242,8 +123580,8 @@ begin
   begin
     if (FNeurons.Count > 0) then
     begin
-      LpBnd269 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd269 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         FNeurons[Cnt].InitUniform(Value);
       end;
@@ -123255,7 +123593,7 @@ end;
 
 function TNNetLayer.InitLeCunUniform(Value: TNeuralFloat): TNNetLayer;
 var
-  LpBnd270: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   // Inference-only layers skip random weight init (overwritten by the loader).
@@ -123263,8 +123601,8 @@ begin
   begin
     if (FNeurons.Count > 0) then
     begin
-      LpBnd270 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd270 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         FNeurons[Cnt].InitLeCunUniform(Value);
       end;
@@ -123276,7 +123614,7 @@ end;
 
 function TNNetLayer.InitHeUniform(Value: TNeuralFloat): TNNetLayer;
 var
-  LpBnd271: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   // Inference-only layers skip random weight init (overwritten by the loader).
@@ -123284,8 +123622,8 @@ begin
   begin
     if (FNeurons.Count > 0) then
     begin
-      LpBnd271 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd271 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         FNeurons[Cnt].InitHeUniform(Value);
       end;
@@ -123297,7 +123635,7 @@ end;
 
 function TNNetLayer.InitHeUniformDepthwise(Value: TNeuralFloat): TNNetLayer;
 var
-  LpBnd272: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   // Inference-only layers skip random weight init (overwritten by the loader).
@@ -123305,8 +123643,8 @@ begin
   begin
     if (FNeurons.Count > 0) then
     begin
-      LpBnd272 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd272 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         FNeurons[Cnt].InitHeUniformDepthwise(Value);
       end;
@@ -123318,7 +123656,7 @@ end;
 
 function TNNetLayer.InitHeGaussian(Value: TNeuralFloat): TNNetLayer;
 var
-  LpBnd273: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   // Inference-only layers skip random weight init (overwritten by the loader).
@@ -123326,8 +123664,8 @@ begin
   begin
     if (FNeurons.Count > 0) then
     begin
-      LpBnd273 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd273 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         FNeurons[Cnt].InitHeGaussian(Value);
       end;
@@ -123339,7 +123677,7 @@ end;
 
 function TNNetLayer.InitHeGaussianDepthwise(Value: TNeuralFloat): TNNetLayer;
 var
-  LpBnd274: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   // Inference-only layers skip random weight init (overwritten by the loader).
@@ -123347,8 +123685,8 @@ begin
   begin
     if (FNeurons.Count > 0) then
     begin
-      LpBnd274 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd274 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         FNeurons[Cnt].InitHeGaussianDepthwise(Value);
       end;
@@ -123386,7 +123724,7 @@ end;
 
 function TNNetLayer.InitSELU(Value: TNeuralFloat): TNNetLayer;
 var
-  LpBnd275: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   // Inference-only layers skip random weight init (overwritten by the loader).
@@ -123394,8 +123732,8 @@ begin
   begin
     if (FNeurons.Count > 0) then
     begin
-      LpBnd275 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd275 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         FNeurons[Cnt].InitSELU(Value);
       end;
@@ -123407,7 +123745,7 @@ end;
 
 function TNNetLayer.InitAdam(Beta1, Beta2, Epsilon: TNeuralFloat): TNNetLayer;
 var
-  LpBnd276: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   FBeta1 := Beta1;
@@ -123421,8 +123759,8 @@ begin
   begin
     if (FNeurons.Count > 0) then
     begin
-      LpBnd276 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd276 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         FNeurons[Cnt].InitAdam(Self);
       end;
@@ -123666,13 +124004,13 @@ end;
 
 procedure TNNetLayer.Fill(value: TNeuralFloat);
 var
-  LpBnd278: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   if (FNeurons.Count > 0) then
   begin
-    LpBnd278 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd278 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       FArrNeurons[Cnt].Fill(Value);  // #10: array mirror
     end;
@@ -123682,15 +124020,15 @@ end;
 
 procedure TNNetLayer.ClearDeltas();
 var
-  LpBnd279: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   // Inference-only (SetTrainable(false)): the training volumes are freed.
   if not FIsTrainable then exit;
   if (FNeurons.Count > 0) then
   begin
-    LpBnd279 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd279 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       FArrNeurons[Cnt].ClearDelta();  // #10: array mirror
     end;
@@ -123723,13 +124061,13 @@ end;
 
 procedure TNNetLayer.SetNumWeightsForAllNeurons(NumWeights: integer);
 var
-  LpBnd280: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   if (FNeurons.Count > 0) and (FCanSetNumWeightsForAllNeurons) then
   begin
-    LpBnd280 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd280 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       FNeurons[Cnt].Weights.ReSize(NumWeights,1,1);
       // Inference-only layers skip the training-only buffers (see
@@ -123746,14 +124084,14 @@ end;
 
 procedure TNNetLayer.SetNumWeightsForAllNeurons(x, y, d: integer);
 var
-  LpBnd281: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N: TNNetNeuron;
 begin
   if (FNeurons.Count > 0) and (FCanSetNumWeightsForAllNeurons) then
   begin
-    LpBnd281 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd281 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       N := FNeurons[Cnt];  // #7: bind the list element once
       N.Weights.ReSize(x,y,d);
@@ -123795,7 +124133,7 @@ end;
 
 function TNNetLayer.GetMaxDelta(): TNeuralFloat;
 var
-  LpBnd282: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   MaxValue: TNeuralFloat;
 begin
@@ -123804,9 +124142,9 @@ begin
     Result := FArrNeurons[0].Delta.GetMax();
     if FNeurons.Count > 1 then
     begin
-      LpBnd282 := FNeurons.Count-1;
+      MaxNeuronPos := FNeurons.Count-1;
       // #4: neuron 0 is the seed above; start at 1 (max(a,a)=a, bit-identical).
-      for Cnt := 1 to LpBnd282 do
+      for Cnt := 1 to MaxNeuronPos do
       begin
         MaxValue := FArrNeurons[Cnt].Delta.GetMax();
         if MaxValue > Result then Result := MaxValue;
@@ -123921,7 +124259,7 @@ end;
 
 function TNNetLayer.GetMinDelta(): TNeuralFloat;
 var
-  LpBnd283: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   MinValue: TNeuralFloat;
 begin
@@ -123930,9 +124268,9 @@ begin
     Result := FArrNeurons[0].Delta.GetMin();
     if FNeurons.Count > 1 then
     begin
-      LpBnd283 := FNeurons.Count-1;
+      MaxNeuronPos := FNeurons.Count-1;
       // #4: neuron 0 is the seed above; start at 1 (min(a,a)=a, bit-identical).
-      for Cnt := 1 to LpBnd283 do
+      for Cnt := 1 to MaxNeuronPos do
       begin
         MinValue := FArrNeurons[Cnt].Delta.GetMin();
         if MinValue < Result then Result := MinValue;
@@ -123947,7 +124285,7 @@ end;
 
 function TNNetLayer.ForceMaxAbsoluteDelta(vMax: TNeuralFloat): TNeuralFloat;
 var
-  LpBnd284: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   MaxValue, MulValue: TNeuralFloat;
   D: TNNetVolume;
@@ -123955,8 +124293,8 @@ begin
   Result := 1;
   if FNeurons.Count > 0 then
   begin
-    LpBnd284 := FNeurons.Count - 1;
-    for Cnt := 0 to LpBnd284 do
+    MaxNeuronPos := FNeurons.Count - 1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       D := FNeurons[Cnt].Delta;  // #7: bind the Delta chain once
       MaxValue := D.GetMaxAbs();
@@ -123984,7 +124322,7 @@ end;
 
 procedure TNNetLayer.GetMinMaxAtDepth(pDepth: integer; var pMin, pMax: TNeuralFloat);
 var
-  LpBnd285: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   localMin, localMax: TNeuralFloat;
 begin
@@ -123995,8 +124333,8 @@ begin
     pMax := localMax;
     if FNeurons.Count > 1 then
     begin
-      LpBnd285 := FNeurons.Count-1;
-      for Cnt := 1 to LpBnd285 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 1 to MaxNeuronPos do
       begin
         FNeurons[Cnt].Weights.GetMinMaxAtDepth(pDepth, localMin, localMax);
         pMin := Min(pMin, localMin);
@@ -124008,14 +124346,14 @@ end;
 
 function TNNetLayer.GetWeightSum(): TNeuralFloat;
 var
-  LpBnd286: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   Result := 0;
   if FNeurons.Count > 0 then
   begin
-    LpBnd286 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd286 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       Result := Result + FNeurons[Cnt].Weights.GetSum();
     end;
@@ -124024,14 +124362,14 @@ end;
 
 function TNNetLayer.GetBiasSum(): TNeuralFloat;
 var
-  LpBnd287: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   Result := 0;
   if FNeurons.Count > 0 then
   begin
-    LpBnd287 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd287 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       Result := Result + FNeurons[Cnt].FBiasWeight;
     end;
@@ -124040,7 +124378,7 @@ end;
 
 function TNNetLayer.GetDeltaSum(): TNeuralFloat;
 var
-  LpBnd288: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   Neuron: TNNetNeuron;
 begin
@@ -124049,8 +124387,8 @@ begin
   if not FIsTrainable then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd288 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd288 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       Neuron := FNeurons[Cnt];
       Result := Result +
@@ -124063,7 +124401,7 @@ end;
 
 function TNNetLayer.GetInertiaSum(): TNeuralFloat;
 var
-  LpBnd289: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   Neuron: TNNetNeuron;
 begin
@@ -124072,8 +124410,8 @@ begin
   if not FIsTrainable then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd289 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd289 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       Neuron := FNeurons[Cnt];
       Result := Result +
@@ -124087,15 +124425,15 @@ end;
 
 function TNNetLayer.CountWeights(): int64;
 var
-  LpBnd290: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   Result := 0;
   if FLinkedNeurons then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd290 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd290 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       Result := Result + FNeurons[Cnt].Weights.Size;
     end;
@@ -124111,14 +124449,14 @@ end;
 
 function TNNetLayer.MulWeights(V: TNeuralFloat): TNNetLayer;
 var
-  LpBnd291: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N: TNNetNeuron;
 begin
   if FNeurons.Count > 0 then
   begin
-    LpBnd291 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd291 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       N := FNeurons[Cnt];  // #7: bind once
       N.Weights.Mul(V);
@@ -124135,7 +124473,7 @@ end;
 
 procedure TNNetLayer.MulInertia(V: TNeuralFloat);
 var
-  LpBnd292: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N: TNNetNeuron;
 begin
@@ -124143,8 +124481,8 @@ begin
   if not FIsTrainable then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd292 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd292 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       N := FNeurons[Cnt];  // #7: bind once
       N.BackInertia.Mul(V);
@@ -124161,7 +124499,7 @@ end;
 
 procedure TNNetLayer.MulDeltas(V: TNeuralFloat);
 var
-  LpBnd293: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N: TNNetNeuron;
 begin
@@ -124169,8 +124507,8 @@ begin
   if not FIsTrainable then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd293 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd293 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       N := FNeurons[Cnt];  // #7: bind once
       N.Delta.Mul(V);
@@ -124182,7 +124520,7 @@ end;
 
 procedure TNNetLayer.ClipDeltasToValue(MaxAbsValue: TNeuralFloat);
 var
-  LpBnd294: integer;
+  MaxNeuronPos: integer;
   Cnt, ElemCnt, MaxElem: integer;
   V: TNeuralFloat;
   D: TNNetVolume;
@@ -124193,8 +124531,8 @@ begin
   if MaxAbsValue <= 0 then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd294 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd294 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       Neuron := FNeurons[Cnt];
       D := Neuron.Delta;
@@ -124218,13 +124556,13 @@ end;
 
 procedure TNNetLayer.ClearBias();
 var
-  LpBnd295: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   if FNeurons.Count > 0 then
   begin
-    LpBnd295 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd295 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       FNeurons[Cnt].FBiasWeight := 0;
     end;
@@ -124233,7 +124571,7 @@ end;
 
 procedure TNNetLayer.ClearInertia();
 var
-  LpBnd296: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N: TNNetNeuron;
 begin
@@ -124241,8 +124579,8 @@ begin
   if not FIsTrainable then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd296 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd296 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       N := FNeurons[Cnt];  // #7: bind once
       N.BackInertia.Fill(0);
@@ -124280,7 +124618,7 @@ end;
 
 procedure TNNetLayer.MulMulAddWeights(Value1, Value2: TNeuralFloat; Origin: TNNetLayer);
 var
-  LpBnd297: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N, O: TNNetNeuron;
 begin
@@ -124289,8 +124627,8 @@ begin
   begin
     if FNeurons.Count > 0 then
     begin
-      LpBnd297 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd297 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         N := FNeurons[Cnt];  // #7: bind both once
         O := Origin.Neurons[Cnt];
@@ -124316,7 +124654,7 @@ end;
 procedure TNNetLayer.MulMulAddInertia(Value1, Value2: TNeuralFloat;
   Origin: TNNetLayer);
 var
-  LpBnd298: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N, O: TNNetNeuron;
 begin
@@ -124327,8 +124665,8 @@ begin
   begin
     if FNeurons.Count > 0 then
     begin
-      LpBnd298 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd298 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         N := FNeurons[Cnt];  // #7: bind both once
         O := Origin.Neurons[Cnt];
@@ -124354,7 +124692,7 @@ end;
 
 procedure TNNetLayer.SumWeights(Origin: TNNetLayer);
 var
-  LpBnd299: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N, O: TNNetNeuron;
 begin
@@ -124363,8 +124701,8 @@ begin
   begin
     if FNeurons.Count > 0 then
     begin
-      LpBnd299 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd299 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         N := FNeurons[Cnt];  // #7: bind both once
         O := Origin.Neurons[Cnt];
@@ -124394,7 +124732,7 @@ end;
 
 procedure TNNetLayer.SumInertia(Origin: TNNetLayer);
 var
-  LpBnd300: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N, O: TNNetNeuron;
 begin
@@ -124405,8 +124743,8 @@ begin
   begin
     if FNeurons.Count > 0 then
     begin
-      LpBnd300 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd300 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         N := FNeurons[Cnt];  // #7: bind both once
         O := Origin.Neurons[Cnt];
@@ -124483,7 +124821,7 @@ end;
 
 procedure TNNetLayer.CopyWeights(Origin: TNNetLayer);
 var
-  LpBnd301: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N, O: TNNetNeuron;
 begin
@@ -124492,8 +124830,8 @@ begin
   begin
     if FNeurons.Count > 0 then
     begin
-      LpBnd301 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd301 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         N := FNeurons[Cnt];  // #7: bind both once
         O := Origin.Neurons[Cnt];
@@ -124532,7 +124870,7 @@ end;
 
 procedure TNNetLayer.CopyInertia(Origin: TNNetLayer);
 var
-  LpBnd302: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
   N, O: TNNetNeuron;
 begin
@@ -124543,8 +124881,8 @@ begin
   begin
     if FNeurons.Count > 0 then
     begin
-      LpBnd302 := FNeurons.Count-1;
-      for Cnt := 0 to LpBnd302 do
+      MaxNeuronPos := FNeurons.Count-1;
+      for Cnt := 0 to MaxNeuronPos do
       begin
         N := FNeurons[Cnt];  // #7: bind both once
         O := Origin.Neurons[Cnt];
@@ -124582,14 +124920,14 @@ end;
 
 procedure TNNetLayer.ForceRangeWeights(V: TNeuralFloat);
 var
-  LpBnd303: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   if (FLinkedNeurons) or not(FCanNormalizeDelta) then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd303 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd303 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       FNeurons[Cnt].Weights.ForceMaxRange(V);
     end;
@@ -124599,14 +124937,14 @@ end;
 
 procedure TNNetLayer.ForcePositiveWeights();
 var
-  LpBnd304: integer;
+  MaxNeuronPos: integer;
   Cnt: integer;
 begin
   if FLinkedNeurons and not(FCanNormalizeDelta) then exit;
   if FNeurons.Count > 0 then
   begin
-    LpBnd304 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd304 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       FNeurons[Cnt].Weights.ForcePositive();
     end;
@@ -124644,7 +124982,7 @@ end;
 
 function TNNetLayer.SaveDataToString(): string;
 var
-  LpBnd305: integer;
+  MaxNeuronPos: integer;
   S: TNNetStringList;
   Cnt: integer;
 begin
@@ -124652,8 +124990,8 @@ begin
   S.SetCapacity(FNeurons.Count);
   if FNeurons.Count > 0 then
   begin
-    LpBnd305 := FNeurons.Count-1;
-    for Cnt := 0 to LpBnd305 do
+    MaxNeuronPos := FNeurons.Count-1;
+    for Cnt := 0 to MaxNeuronPos do
     begin
       S.Add(FNeurons[Cnt].SaveToString());
     end;
@@ -124665,7 +125003,7 @@ end;
 
 procedure TNNetLayer.LoadDataFromString(strData: string);
 var
-  LpBnd306: integer;
+  MaxNeuronTokenPos: integer;
   S: TStringList;
   Cnt: integer;
 begin
@@ -124675,8 +125013,8 @@ begin
   begin
     if S.Count > 0 then
     begin
-      LpBnd306 := S.Count-1;
-      for Cnt := 0 to LpBnd306 do
+      MaxNeuronTokenPos := S.Count-1;
+      for Cnt := 0 to MaxNeuronTokenPos do
       begin
         FNeurons[Cnt].LoadFromString(S[Cnt]);
       end;
@@ -125156,7 +125494,7 @@ end;
 
 function TNNetLayer.BuildPruneMaskFromThreshold(aThreshold: TNeuralFloat): integer;
 var
-  LpBnd307: integer;
+  MaxNeuronPos: integer;
   NeuronCnt, WeightCnt, WSize, WSizeM1: integer;
   Neuron: TNNetNeuron;
   Mask: TNNetVolume;
@@ -125171,8 +125509,8 @@ begin
     FPruneMask.Add(TNNetVolume.Create(1, 1, 1));
   while FPruneMask.Count > FNeurons.Count do
     FPruneMask.Delete(FPruneMask.Count - 1);
-  LpBnd307 := FNeurons.Count - 1;
-  for NeuronCnt := 0 to LpBnd307 do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for NeuronCnt := 0 to MaxNeuronPos do
   begin
     Neuron := FNeurons[NeuronCnt];
     Mask := FPruneMask[NeuronCnt];
@@ -125195,15 +125533,15 @@ end;
 
 procedure TNNetLayer.ZeroPrunedWeights();
 var
-  LpBnd308: integer;
+  MaxNeuronPos: integer;
   NeuronCnt, WSize: integer;
   Neuron: TNNetNeuron;
   Mask: TNNetVolume;
   ZeroDelta, ZeroInertia, ZeroInertia2: boolean;
 begin
   if not Assigned(FPruneMask) then Exit;
-  LpBnd308 := FNeurons.Count - 1;
-  for NeuronCnt := 0 to LpBnd308 do
+  MaxNeuronPos := FNeurons.Count - 1;
+  for NeuronCnt := 0 to MaxNeuronPos do
   begin
     if NeuronCnt >= FPruneMask.Count then Break;
     Neuron := FNeurons[NeuronCnt];
@@ -125254,19 +125592,19 @@ end;
 
 function TNNetLayer.CountPrunedWeights(): integer;
 var
-  LpBnd309: integer;
-  LpBnd310: integer;
+  MaxPruneMaskPos: integer;
+  MaxMaskPos: integer;
   NeuronCnt, WeightCnt: integer;
   Mask: TNNetVolume;
 begin
   Result := 0;
   if not Assigned(FPruneMask) then Exit;
-  LpBnd309 := FPruneMask.Count - 1;
-  for NeuronCnt := 0 to LpBnd309 do
+  MaxPruneMaskPos := FPruneMask.Count - 1;
+  for NeuronCnt := 0 to MaxPruneMaskPos do
   begin
     Mask := FPruneMask[NeuronCnt];
-    LpBnd310 := Mask.Size - 1;
-    for WeightCnt := 0 to LpBnd310 do
+    MaxMaskPos := Mask.Size - 1;
+    for WeightCnt := 0 to MaxMaskPos do
       if Mask.FData[WeightCnt] = 0 then Inc(Result);
   end;
 end;
@@ -126469,7 +126807,7 @@ end;
 function TNNetConvolution.ComputeNeuronAtOutputPosDefaultFast(NeuronIdx, x,
   y: integer): TNeuralFloat;
 var
-  LpBnd311: integer;
+  MaxWeightY: integer;
   Total: TNeuralFloat;
   LocalW: TNNetVolume;
   fi00, lo00: integer;
@@ -126481,8 +126819,8 @@ begin
 
   DepthX := FInputCopy.Depth * LocalW.SizeX;
 
-  LpBnd311 := LocalW.SizeY - 1;
-  for yCount := 0 to LpBnd311 do
+  MaxWeightY := LocalW.SizeY - 1;
+  for yCount := 0 to MaxWeightY do
   begin
     fi00 := FInputCopy.GetRawPos(x, y + yCount);
     lo00 := LocalW.GetRawPos(0, yCount);

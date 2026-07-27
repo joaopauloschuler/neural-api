@@ -417,6 +417,10 @@ type
 
   TNNetGroupInfoArray = array of TNNetGroupInfo;
 
+  // Forward: the int8 tiled kernels below take a TNNetVolumeQuant8 table
+  // (declared after TNNetVolume, since it owns one as its scale plane).
+  TNNetVolumeQuant8 = class;
+
   { TNNetVolume }
   {$IFDEF FPC}
   TNNetVolume = class (specialize TVolume<TNeuralFloat>)
@@ -531,6 +535,11 @@ type
       // fused into the output store). Same tiling and same output layout
       // (FData[CntB*NumAs + CntA]) as the FP32 version. Coded by Claude (AI).
       procedure DotProductsTiledInt8(NumAs, NumBs, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer); overload;
+      // TNNetVolumeQuant8 twin of the two calls above: one table carries the
+      // codes and the per-row scales together, shaped (NumAs, 1, VectorSize) -
+      // exactly the layout the open-array versions document, so these forward
+      // straight to them. Coded by Claude (AI).
+      procedure DotProductsTiledInt8(NumAs, NumBs, VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolume; TileSizeA, TileSizeB: integer); overload;
       // Ranged twin (same contract as the ranged DotProductsTiled): computes
       // only B columns [BStart..BFinish] and A rows [AStart..AFinish], with
       // ceil-division tiling anchored at the range start and a clamped trailing
@@ -539,6 +548,7 @@ type
       // chunk scheduler calls (position-axis chunks range B, neuron-axis
       // chunks range A). AFinish < 0 means all rows. Coded by Claude (AI).
       procedure DotProductsTiledInt8(NumAs, BStart, BFinish, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
+      procedure DotProductsTiledInt8(NumAs, BStart, BFinish, VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
       procedure PointwiseNorm(pNorms: TNNetVolume = nil);
       procedure PointwiseMul(pNorms: TNNetVolume);
       // VectorExp writes dst[0..N-1] := exp(src[0..N-1]). On an AVX2 build it
@@ -657,7 +667,98 @@ type
       // grouped B addressing (input vectors hold VectorSize*Groups, neuron r
       // reads its group's slice) and same output layout
       // (FData[CntB*NumAs + CntA]) as the FP32 version. Coded by Claude (AI).
-      procedure GroupedDotProductsTiledInt8(Groups, NumAs, NumBs, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
+      procedure GroupedDotProductsTiledInt8(Groups, NumAs, NumBs, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer); overload;
+      // TNNetVolumeQuant8 twin: same (NumAs, 1, VectorSize) table shape as the
+      // ungrouped kernel. Coded by Claude (AI).
+      procedure GroupedDotProductsTiledInt8(Groups, NumAs, NumBs, VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolume; TileSizeA, TileSizeB: integer); overload;
+  end;
+
+  { TNNetVolumeQuant8 }
+
+  // Symmetric int8 storage carrying the geometry contract of TNNetVolume:
+  // code (x,y,d) lives at ((SizeX*y) + x) * Depth + d. Every (x,y) pair owns
+  // one scale and the dequantized value is code*Scale[x,y]. The scale plane is
+  // itself a TNNetVolume of shape (SizeX, SizeY, 1), so a scale is addressed
+  // by the very same formula with d = 0.
+  //
+  // Axis convention across the int8 call sites: Depth is always the quantized
+  // vector, X the primary row index and Y a secondary grouping, 1 when there
+  // is none. So a vocab table is (VocabSize, 1, EmbeddingSize), concatenated
+  // layer weights are (NumNeurons, 1, VectorSize), a single-head KV cache is
+  // (MaxContext, 1, d_k) and a grouped-query KV cache is
+  // (MaxContext, KVHeads, d_k) - one contiguous Y-plane per KV head, which is
+  // the head-major layout that cache already had. This matches how the FP32
+  // volumes beside them are shaped and indexed (row index first,
+  // GetRawPtr(Row, 0)). Note DeleteRows works on Y, so it drops groups, not
+  // rows, under this convention.
+  //
+  // ReSize is the only member that changes lengths. SetLength may move the
+  // buffer, so a SetLength on FData anywhere else would leave DataPtr
+  // dangling. ReSize does not fill: after a growth the contents are whatever
+  // SetLength left behind, and callers wanting a known state fill it
+  // themselves. The empty state is Size = 0, a nil DataPtr and an empty (never
+  // nil) scale plane. Coded by Claude (AI).
+  TNNetVolumeQuant8 = class(TObject)
+    private
+      FScaleData: TNNetVolume;
+      FDataPtr: TNeuralInt8ArrPtr;
+      FSizeX, FSizeY, FDepth, FSize: integer;
+      function GetScale(x, y: integer): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      procedure SetScale(x, y: integer; Value: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
+      function GetScalePtr(): TNeuralFloatArrPtr; {$IFDEF Release} inline; {$ENDIF}
+      function GetScaleCount(): integer; {$IFDEF Release} inline; {$ENDIF}
+    public
+      // Exposed exactly like TNNetVolume.FData: the int8 kernels and the
+      // loaders take raw pointers into it. Never SetLength it - call ReSize.
+      FData: TInt8DynArr;
+
+      constructor Create(); {$IFNDEF FPC} overload; {$ENDIF}
+      constructor Create(pSizeX, pSizeY, pDepth: integer); {$IFNDEF FPC} overload; {$ENDIF}
+      destructor Destroy(); override;
+
+      procedure ReSize(pSizeX, pSizeY, pDepth: integer); overload;
+      procedure ReSize(Original: TNNetVolumeQuant8); overload;
+
+      function GetRawPos(x, y, d: integer): integer; overload; {$IFDEF Release} inline; {$ENDIF}
+      function GetRawPos(x, y: integer): integer; overload; {$IFDEF Release} inline; {$ENDIF}
+      // Base of the (x,y) row, or of the element (x,y,d) - convolutional taps
+      // index mid-row. Both are pure arithmetic on DataPtr.
+      function GetRawPtr(x, y: integer): TNeuralInt8ArrPtr; overload; {$IFDEF Release} inline; {$ENDIF}
+      function GetRawPtr(x, y, d: integer): TNeuralInt8ArrPtr; overload; {$IFDEF Release} inline; {$ENDIF}
+
+      function Get(x, y, d: integer): ShortInt; {$IFDEF Release} inline; {$ENDIF}
+      procedure Store(x, y, d: integer; Value: ShortInt); {$IFDEF Release} inline; {$ENDIF}
+      function GetRaw(p: integer): ShortInt; {$IFDEF Release} inline; {$ENDIF}
+      procedure SetRaw(p: integer; Value: ShortInt); {$IFDEF Release} inline; {$ENDIF}
+
+      function Dequantize(x, y, d: integer): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      // Expands the (x,y) row into Depth floats at Dest.
+      procedure DequantizeRowTo(x, y: integer; Dest: TNeuralFloatArrPtr);
+      // Expands every row into Dest, resized to (SizeX, SizeY, Depth). Leaves
+      // Dest untouched when this volume is empty.
+      procedure DequantizeTo(Dest: TNNetVolume);
+
+      procedure Fill(c: ShortInt = 0);
+      procedure CopyFrom(Original: TNNetVolumeQuant8);
+      // Drops Count rows from row StartY on and shifts the rows above them
+      // down, leaving the last Count rows stale. Capacity is untouched: this
+      // is the rolling-window eviction primitive, not a resize.
+      procedure DeleteRows(StartY: integer; Count: integer = 1);
+      // Plain copies of both planes, for callers that export or serialize.
+      procedure GetQuantData(out pCodes: TInt8DynArr; out pScales: TNeuralFloatDynArr);
+      function GetMemSize(): int64;
+
+      property SizeX: integer read FSizeX;
+      property SizeY: integer read FSizeY;
+      property Depth: integer read FDepth;
+      property Size: integer read FSize;
+      property ScaleCount: integer read GetScaleCount;
+      property DataPtr: TNeuralInt8ArrPtr read FDataPtr;
+      property ScalePtr: TNeuralFloatArrPtr read GetScalePtr;
+      // Exposed for Fill/Copy/inspection. Never ReSize it directly: ReSize
+      // keeps it in step with FData.
+      property ScaleData: TNNetVolume read FScaleData;
+      property Scale[x, y: integer]: TNeuralFloat read GetScale write SetScale;
   end;
 
   { TNNetSamplerBase }
@@ -3371,6 +3472,88 @@ begin
   if Lo < iHi then QuickSortTokenArray(A, Lo, iHi);
 end;
 
+// In-place quicksort of the index array Order so that Dist[Order[0..]] ends up
+// ascending. Sorts the caller's existing Order/Dist buffers by reference and
+// recurses on the CPU stack only, so it adds no heap allocation (rule #17). Used
+// by SampleTypical to replace an O(N^2) selection sort over the full vocab.
+procedure QuickSortOrderByDist(var Order: array of integer;
+  const Dist: array of TNeuralFloat; iLo, iHi: Integer);
+var
+  Lo, Hi, T: Integer;
+  Mid: TNeuralFloat;
+begin
+  Lo := iLo;
+  Hi := iHi;
+  Mid := Dist[Order[(Lo + Hi) shr 1]];
+  repeat
+    while Dist[Order[Lo]] < Mid do Inc(Lo);
+    while Dist[Order[Hi]] > Mid do Dec(Hi);
+    if Lo <= Hi then
+    begin
+      T := Order[Lo];
+      Order[Lo] := Order[Hi];
+      Order[Hi] := T;
+      Inc(Lo);
+      Dec(Hi);
+    end;
+  until Lo > Hi;
+  if Hi > iLo then QuickSortOrderByDist(Order, Dist, iLo, Hi);
+  if Lo < iHi then QuickSortOrderByDist(Order, Dist, Lo, iHi);
+end;
+
+// Hoare-partition quickselect over the index array: permutes Order[0..Count-1]
+// so that the K entries with the SMALLEST Dist occupy Order[0..K-1] (in no
+// particular order). Average O(Count) and, like QuickSortOrderByDist, it works
+// entirely inside the caller's buffers - no heap allocation (rule #17). The
+// median-of-three pivot keeps already-ordered and all-equal inputs off the
+// quadratic path. Coded by Claude (AI).
+procedure PartialSelectOrderByDist(var Order: array of integer;
+  const Dist: array of TNeuralFloat; Count, K: integer);
+var
+  Lo, Hi, I, J, Mid, Bound, T: integer;
+  Pivot: TNeuralFloat;
+begin
+  if (K <= 0) or (K >= Count) then exit;
+  Lo := 0;
+  Hi := Count - 1;
+  Bound := K - 1;
+  while Lo < Hi do
+  begin
+    // Median of Dist[Order[Lo]], Dist[Order[Mid]], Dist[Order[Hi]], left at Mid.
+    Mid := (Lo + Hi) shr 1;
+    if Dist[Order[Lo]] > Dist[Order[Mid]] then
+    begin
+      T := Order[Lo]; Order[Lo] := Order[Mid]; Order[Mid] := T;
+    end;
+    if Dist[Order[Lo]] > Dist[Order[Hi]] then
+    begin
+      T := Order[Lo]; Order[Lo] := Order[Hi]; Order[Hi] := T;
+    end;
+    if Dist[Order[Mid]] > Dist[Order[Hi]] then
+    begin
+      T := Order[Mid]; Order[Mid] := Order[Hi]; Order[Hi] := T;
+    end;
+    Pivot := Dist[Order[Mid]];
+    I := Lo;
+    J := Hi;
+    repeat
+      while Dist[Order[I]] < Pivot do Inc(I);
+      while Dist[Order[J]] > Pivot do Dec(J);
+      if I <= J then
+      begin
+        T := Order[I]; Order[I] := Order[J]; Order[J] := T;
+        Inc(I);
+        Dec(J);
+      end;
+    until I > J;
+    // Recurse into the side that still holds the K-th boundary; when the
+    // boundary falls inside the equal-to-pivot gap the split is already exact.
+    if Bound <= J then Hi := J
+    else if Bound >= I then Lo := I
+    else Break;
+  end;
+end;
+
 { TNNetSamplerTopP }
 
 constructor TNNetSamplerTopP.Create(TopP: TNeuralFloat);
@@ -3632,11 +3815,20 @@ begin
 end;
 
 function TNNetSamplerTypical.SampleTypical(): integer;
+const
+  // Below this window size a full sort is already cheap, so skip the
+  // partial-selection machinery entirely.
+  csTypicalAdaptiveMin = 1024;
+  // First guess at the typical-set width. Over a peaked next-token row the
+  // set that first reaches FMass is far narrower than this; when it is not,
+  // the retry below pays one full sort and is still correct.
+  csTypicalAdaptiveK = 256;
 var
-  Entropy, P, Surprise, KeptSum, Roll, Cumulative, best: TNeuralFloat;
+  Entropy, P, LogP, KeptSum, Roll, Cumulative: TNeuralFloat;
   Dist: array of TNeuralFloat; // |surprise - entropy| per FTokenArr entry
   Order: array of integer;     // FTokenArr indices sorted by ascending Dist
-  I, J, KeptCount, KeptCountM1, Tmp, N, NM1, NM2, JStart: integer;
+  I, KeptCount, KeptCountM1, N, NM1, Limit: integer;
+  Truncated: boolean;
 begin
   N := FCount;
   if N = 0 then
@@ -3645,50 +3837,62 @@ begin
     exit;
   end;
   NM1 := N - 1;
-  NM2 := N - 2;
-  // Conditional (Shannon) entropy of the row, in nats.
-  Entropy := 0;
-  for I := 0 to NM1 do
-  begin
-    P := FTokenArr[I].Score;
-    if P > 0 then Entropy := Entropy - P * pcr_logf(P);
-  end;
-  // Per-token distance |(-log p) - H|.
   // Reuse the persistent scratch fields; resize only when the vocab size
   // changes (rule #17: amortized, no per-call heap allocation).
   if Length(FDist) <> N then SetLength(FDist, N);
   if Length(FOrder) <> N then SetLength(FOrder, N);
   Dist := FDist;   // reference share (refcount bump only, no new buffer)
   Order := FOrder;
+  // Conditional (Shannon) entropy of the row, in nats. log p is stashed in
+  // Dist on the way through so the distance pass below needs no second log.
+  Entropy := 0;
   for I := 0 to NM1 do
   begin
     P := FTokenArr[I].Score;
-    if P > 0 then Surprise := -pcr_logf(P) else Surprise := 1e30; // p=0 => infinite
-    Dist[I] := Abs(Surprise - Entropy);
+    if P > 0 then
+    begin
+      LogP := pcr_logf(P);
+      Dist[I] := LogP;
+      Entropy := Entropy - P * LogP;
+    end
+    else Dist[I] := -1e30; // p = 0 => surprise +infinite
     Order[I] := I;
   end;
-  // Selection sort of Order by ascending Dist (vocab-sized but only run once
-  // per step; mirrors the simple sort style used elsewhere in this unit).
-  for I := 0 to NM2 do
-  begin
-    JStart := I + 1;
-    best := Dist[Order[I]]; // #4: pivot keyed value, refreshed on swap
-    for J := JStart to NM1 do
-      if Dist[Order[J]] < best then
-      begin
-        Tmp := Order[I]; Order[I] := Order[J]; Order[J] := Tmp;
-        best := Dist[Order[I]];
-      end;
-  end;
-  // Smallest prefix (by ascending distance) whose cumulative mass reaches FMass.
-  KeptCount := 0;
-  KeptSum := 0;
+  // Per-token distance |(-log p) - H|: surprise is -LogP, so this is purely
+  // arithmetic over the cached logs.
   for I := 0 to NM1 do
+    Dist[I] := Abs(-Dist[I] - Entropy);
+  // Sorting the whole vocabulary to consume a prefix of a few hundred entries
+  // dominates this sampler, so select a bounded prefix first (the adaptive
+  // scheme TNNetSamplerTopP already uses) and widen only if the mass was not
+  // reached. Both branches sort in place over the existing index buffer, so
+  // there is still no heap allocation (rule #17).
+  Truncated := N > csTypicalAdaptiveMin;
+  if Truncated then
   begin
-    Inc(KeptCount);
-    KeptSum := KeptSum + FTokenArr[Order[I]].Score;
-    if KeptSum >= FMass then Break;
-  end;
+    PartialSelectOrderByDist(Order, Dist, N, csTypicalAdaptiveK);
+    Limit := csTypicalAdaptiveK - 1;
+  end
+  else Limit := NM1;
+  if Limit > 0 then QuickSortOrderByDist(Order, Dist, 0, Limit);
+  // Smallest prefix (by ascending distance) whose cumulative mass reaches FMass.
+  repeat
+    KeptCount := 0;
+    KeptSum := 0;
+    for I := 0 to Limit do
+    begin
+      Inc(KeptCount);
+      KeptSum := KeptSum + FTokenArr[Order[I]].Score;
+      if KeptSum >= FMass then Break;
+    end;
+    if (KeptSum >= FMass) or (not Truncated) then Break;
+    // The prefix did not hold FMass: re-arm the identity order over the whole
+    // row and sort it in full, exactly once.
+    for I := 0 to NM1 do Order[I] := I;
+    QuickSortOrderByDist(Order, Dist, 0, NM1);
+    Truncated := false;
+    Limit := NM1;
+  until false;
   if (KeptCount = 0) or (KeptSum <= 0) then
   begin
     Result := FTokenArr[Order[0]].Token; // fallback: degenerate distribution
@@ -3742,7 +3946,7 @@ end;
 
 function TNNetSamplerMirostat.SampleAndUpdate(): integer;
 var
-  KeptSum, Roll, Cumulative, P, Surprise: TNeuralFloat;
+  KeptSum, Roll, Cumulative, P, Surprise, SurpriseCut: TNeuralFloat;
   SumLogP, SumLogRank, SumLogPLogRank, SumLogRankSq, LogRank, LogP: TNeuralFloat;
   S, Epsilon, KFloat, ChosenScore: TNeuralFloat;
   I, KeptCount, KeptCountM1, N, NM1, NumFit, NumFitM2, K: integer;
@@ -3757,14 +3961,20 @@ begin
   // FTokenArr is sorted DESCENDING: [0] is the max probability.
   if FVersion = mvV2 then
   begin
-    // v2: keep every token with surprise -log p <= Mu.
+    // v2: keep every token with surprise -log p <= Mu. Rule #14: that cut is
+    // exactly p >= exp(-Mu) (exp is strictly increasing), so one exp on the
+    // pre-image replaces a log per candidate - and a typical Tau keeps
+    // thousands of candidates. A huge Mu underflows the cut to ~0 and keeps
+    // everything; a very negative Mu overflows it to +Inf, keeps nothing, and
+    // falls through to the "always keep the most-likely token" guard below.
+    SurpriseCut := NeuralExp(-FMu);
     KeptCount := 0;
     KeptSum := 0;
     for I := 0 to NM1 do
     begin
       P := FTokenArr[I].Score;
       if P <= 0 then Break; // descending: nothing later is larger
-      if -pcr_logf(P) <= FMu then
+      if P >= SurpriseCut then
       begin
         Inc(KeptCount);
         KeptSum := KeptSum + P;
@@ -10974,6 +11184,21 @@ begin
     TileSizeA, TileSizeB);
 end;
 
+procedure TNNetVolume.DotProductsTiledInt8(NumAs, NumBs, VectorSize: integer;
+  Codes: TNNetVolumeQuant8; VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
+begin
+  DotProductsTiledInt8(NumAs, 0, NumBs - 1, VectorSize, Codes, VBs,
+    TileSizeA, TileSizeB);
+end;
+
+procedure TNNetVolume.DotProductsTiledInt8(NumAs, BStart, BFinish,
+  VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolume;
+  TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1);
+begin
+  DotProductsTiledInt8(NumAs, BStart, BFinish, VectorSize, Codes.FData,
+    Codes.ScaleData.FData, VBs, TileSizeA, TileSizeB, AStart, AFinish);
+end;
+
 procedure TNNetVolume.DotProductsTiledInt8(NumAs, BStart, BFinish,
   VectorSize: integer;
   const Codes: array of ShortInt; const Scales: array of TNeuralFloat;
@@ -11026,6 +11251,14 @@ begin
       end;
     end; // A Tiling.
   end; // B Tiling.
+end;
+
+procedure TNNetGroupedVolume.GroupedDotProductsTiledInt8(Groups, NumAs, NumBs,
+  VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolume;
+  TileSizeA, TileSizeB: integer);
+begin
+  GroupedDotProductsTiledInt8(Groups, NumAs, NumBs, VectorSize, Codes.FData,
+    Codes.ScaleData.FData, VBs, TileSizeA, TileSizeB);
 end;
 
 procedure TNNetGroupedVolume.GroupedDotProductsTiledInt8(Groups, NumAs, NumBs,
@@ -15371,6 +15604,211 @@ begin
 end;
 
 {$ENDIF} // of AVXANY
+
+{ TNNetVolumeQuant8 }
+
+constructor TNNetVolumeQuant8.Create();
+begin
+  Create(0, 0, 0);
+end;
+
+constructor TNNetVolumeQuant8.Create(pSizeX, pSizeY, pDepth: integer);
+begin
+  inherited Create();
+  FScaleData := TNNetVolume.Create(1, 1, 1);
+  FSizeX := 0;
+  FSizeY := 0;
+  FDepth := 0;
+  FSize := 0;
+  FDataPtr := nil;
+  ReSize(pSizeX, pSizeY, pDepth);
+end;
+
+destructor TNNetVolumeQuant8.Destroy();
+begin
+  SetLength(FData, 0);
+  FDataPtr := nil;
+  FScaleData.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetVolumeQuant8.ReSize(pSizeX, pSizeY, pDepth: integer);
+var
+  NewSize: integer;
+begin
+  NewSize := pSizeX * pSizeY * pDepth;
+  if (NewSize <> FSize) then
+  begin
+    FSize := NewSize;
+    SetLength(FData, FSize);
+  end;
+  FSizeX := pSizeX;
+  FSizeY := pSizeY;
+  FDepth := pDepth;
+  // One scale per (x,y). The scale plane keeps Depth 1 so that GetRawPos with
+  // d = 0 addresses both planes. It is never emptied: TNNetVolume.ReSize takes
+  // addr(FData[0]) unconditionally, which range-checks under -Cr on a
+  // zero-length array, so an empty volume parks the plane at (1,1,1). Read
+  // ScaleCount, not ScaleData.Size, for the number of live scales.
+  if (pSizeX * pSizeY) > 0
+  then FScaleData.ReSize(pSizeX, pSizeY, 1)
+  else FScaleData.ReSize(1, 1, 1);
+  if FSize > 0
+  then FDataPtr := addr(FData[0])
+  else FDataPtr := nil;
+end;
+
+procedure TNNetVolumeQuant8.ReSize(Original: TNNetVolumeQuant8);
+begin
+  ReSize(Original.SizeX, Original.SizeY, Original.Depth);
+end;
+
+function TNNetVolumeQuant8.GetRawPos(x, y, d: integer): integer;
+begin
+  Result := ((FSizeX * y) + x) * FDepth + d;
+end;
+
+function TNNetVolumeQuant8.GetRawPos(x, y: integer): integer;
+begin
+  Result := ((FSizeX * y) + x) * FDepth;
+end;
+
+function TNNetVolumeQuant8.GetRawPtr(x, y: integer): TNeuralInt8ArrPtr;
+begin
+  Result := TNeuralInt8ArrPtr(@FDataPtr^[((FSizeX * y) + x) * FDepth]);
+end;
+
+function TNNetVolumeQuant8.GetRawPtr(x, y, d: integer): TNeuralInt8ArrPtr;
+begin
+  Result := TNeuralInt8ArrPtr(@FDataPtr^[((FSizeX * y) + x) * FDepth + d]);
+end;
+
+function TNNetVolumeQuant8.Get(x, y, d: integer): ShortInt;
+begin
+  Result := FData[((FSizeX * y) + x) * FDepth + d];
+end;
+
+procedure TNNetVolumeQuant8.Store(x, y, d: integer; Value: ShortInt);
+begin
+  FData[((FSizeX * y) + x) * FDepth + d] := Value;
+end;
+
+function TNNetVolumeQuant8.GetRaw(p: integer): ShortInt;
+begin
+  Result := FData[p];
+end;
+
+procedure TNNetVolumeQuant8.SetRaw(p: integer; Value: ShortInt);
+begin
+  FData[p] := Value;
+end;
+
+function TNNetVolumeQuant8.GetScale(x, y: integer): TNeuralFloat;
+begin
+  Result := FScaleData.FData[(FSizeX * y) + x];
+end;
+
+procedure TNNetVolumeQuant8.SetScale(x, y: integer; Value: TNeuralFloat);
+begin
+  FScaleData.FData[(FSizeX * y) + x] := Value;
+end;
+
+function TNNetVolumeQuant8.GetScalePtr(): TNeuralFloatArrPtr;
+begin
+  Result := FScaleData.DataPtr;
+end;
+
+function TNNetVolumeQuant8.GetScaleCount(): integer;
+begin
+  Result := FSizeX * FSizeY;
+end;
+
+function TNNetVolumeQuant8.Dequantize(x, y, d: integer): TNeuralFloat;
+begin
+  Result := FData[((FSizeX * y) + x) * FDepth + d] *
+    FScaleData.FData[(FSizeX * y) + x];
+end;
+
+procedure TNNetVolumeQuant8.DequantizeRowTo(x, y: integer;
+  Dest: TNeuralFloatArrPtr);
+var
+  RowBase, DepthM1, DCnt: integer;
+  RowScale: TNeuralFloat;
+begin
+  RowBase := ((FSizeX * y) + x) * FDepth;
+  RowScale := FScaleData.FData[(FSizeX * y) + x];
+  DepthM1 := FDepth - 1;
+  for DCnt := 0 to DepthM1 do
+  begin
+    Dest^[DCnt] := FDataPtr^[RowBase + DCnt] * RowScale;
+  end;
+end;
+
+procedure TNNetVolumeQuant8.DequantizeTo(Dest: TNNetVolume);
+var
+  XCnt, YCnt, SizeXM1, SizeYM1: integer;
+begin
+  if FSize = 0 then exit;
+  Dest.ReSize(FSizeX, FSizeY, FDepth);
+  SizeXM1 := FSizeX - 1;
+  SizeYM1 := FSizeY - 1;
+  for YCnt := 0 to SizeYM1 do
+  begin
+    for XCnt := 0 to SizeXM1 do
+    begin
+      DequantizeRowTo(XCnt, YCnt,
+        TNeuralFloatArrPtr(Dest.GetRawPtr(XCnt, YCnt, 0)));
+    end;
+  end;
+end;
+
+procedure TNNetVolumeQuant8.Fill(c: ShortInt);
+begin
+  if FSize > 0 then FillChar(FData[0], FSize * csShortIntSize, byte(c));
+end;
+
+procedure TNNetVolumeQuant8.CopyFrom(Original: TNNetVolumeQuant8);
+begin
+  ReSize(Original.SizeX, Original.SizeY, Original.Depth);
+  if FSize > 0
+  then Move(Original.FData[0], FData[0], FSize * csShortIntSize);
+  FScaleData.Copy(Original.ScaleData);
+end;
+
+procedure TNNetVolumeQuant8.DeleteRows(StartY: integer; Count: integer);
+var
+  RowCodes, RowScales, MoveRows: integer;
+begin
+  if (Count <= 0) or (StartY < 0) or (StartY + Count > FSizeY) then exit;
+  MoveRows := FSizeY - StartY - Count;
+  if MoveRows <= 0 then exit;
+  RowCodes := FSizeX * FDepth;
+  RowScales := FSizeX;
+  Move(FData[(StartY + Count) * RowCodes], FData[StartY * RowCodes],
+    MoveRows * RowCodes * csShortIntSize);
+  Move(FScaleData.FData[(StartY + Count) * RowScales],
+    FScaleData.FData[StartY * RowScales],
+    MoveRows * RowScales * csNeuralFloatSize);
+end;
+
+procedure TNNetVolumeQuant8.GetQuantData(out pCodes: TInt8DynArr;
+  out pScales: TNeuralFloatDynArr);
+var
+  ScaleCnt: integer;
+begin
+  ScaleCnt := FSizeX * FSizeY;
+  SetLength(pCodes, FSize);
+  SetLength(pScales, ScaleCnt);
+  if FSize > 0 then Move(FData[0], pCodes[0], FSize * csShortIntSize);
+  if ScaleCnt > 0
+  then Move(FScaleData.FData[0], pScales[0], ScaleCnt * csNeuralFloatSize);
+end;
+
+function TNNetVolumeQuant8.GetMemSize(): int64;
+begin
+  Result := int64(FSize) * csShortIntSize +
+    int64(FSizeX) * int64(FSizeY) * csNeuralFloatSize;
+end;
 
 { TNNetGroupedVolume }
 

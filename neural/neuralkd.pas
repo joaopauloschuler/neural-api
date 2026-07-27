@@ -217,24 +217,27 @@ procedure TNeuralKDTrainer.SoftenLogits(Logits: TNNetVolume;
   Temp: TNeuralFloat; Dest: TNNetVolume);
 var
   I, LogitsSizeM1: integer;
-  MaxLogit, SumExp, V: TNeuralFloat;
+  MaxLogit, SumExp, V, InvTemp: TNeuralFloat;
 begin
   if Dest.Size <> Logits.Size then Dest.ReSize(Logits);
   LogitsSizeM1 := Logits.Size - 1;
-  // Numerically stable softmax over (Logits / Temp).
+  // Numerically stable softmax over (Logits / Temp). The temperature divide is
+  // loop-invariant: one reciprocal, then a multiply per element (#5).
+  InvTemp := 1.0 / Temp;
   MaxLogit := Logits.FData[0];
   for I := 1 to LogitsSizeM1 do
     if Logits.FData[I] > MaxLogit then MaxLogit := Logits.FData[I];
-  MaxLogit := MaxLogit / Temp;
+  MaxLogit := MaxLogit * InvTemp;
   SumExp := 0;
   for I := 0 to LogitsSizeM1 do
   begin
-    V := NeuralExp((Logits.FData[I] / Temp) - MaxLogit);
+    V := NeuralExp((Logits.FData[I] * InvTemp) - MaxLogit);
     Dest.FData[I] := V;
     SumExp := SumExp + V;
   end;
-  for I := 0 to LogitsSizeM1 do
-    Dest.FData[I] := Dest.FData[I] / SumExp;
+  // Dest and Logits have the same Size (ReSized above), so the normalization
+  // spans exactly the range written: one AVX scale instead of N divides (#18).
+  Dest.Mul(1.0 / SumExp);
 end;
 
 function TNeuralKDTrainer.ComputeLoss(pInput: TNNetVolume;

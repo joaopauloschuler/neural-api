@@ -37,6 +37,10 @@ type
     // Forward STFT -> ISTFTOverlapAdd round-trips the interior near-exactly
     // under a perfect-reconstruction Hann window with 75% overlap.
     procedure TestISTFTRoundTrip;
+    // ISTFTOverlapAddReIm reduces its twiddle index modulo NFFT against a
+    // single fundamental table; assert it still matches the straightforward
+    // (NumBins x NFFT) product-table reference, for even and odd NFFT.
+    procedure TestISTFTReImMatchesProductTable;
     // Resampling 16 kHz -> 16 kHz is a bit-identical passthrough.
     procedure TestResampleIdentity;
     // Output length matches the round(N * target/source) ratio (up and down).
@@ -196,6 +200,140 @@ begin
       end;
       Mag.FData[f * NumBins + k] := Sqrt(ReAcc * ReAcc + ImAcc * ImAcc);
       Phase.FData[f * NumBins + k] := ArcTan2(ImAcc, ReAcc);
+    end;
+  end;
+end;
+
+// Reference inverse overlap-add, written the straightforward way: a full
+// (NumBins x NFFT) product twiddle table indexed by BinCnt*NFFT + TapCnt. This
+// is the shape neuralaudio's ISTFTOverlapAddReIm had before the index-modulo
+// rewrite; it is the oracle for TestISTFTReImMatchesProductTable.
+procedure RefISTFTOverlapAddReIm(Re, Im, Wave: TNNetVolume;
+  NFFT: integer; HopLength: integer);
+var
+  NumFrames, NumBins, OutLen: integer;
+  FrameCnt, BinCnt, TapCnt, OutIdx, FrameStart: integer;
+  frameBase, twPos, reIdx, rowBase, twIdx: integer;
+  invNFFT, angStep, ang: double;
+  Window, Win2, BinScale, CosTab, SinTab, AccSig, AccEnv: array of double;
+  ReVal, ImVal, Sample, WinTap: double;
+const
+  csEnvEps = 1e-12;
+begin
+  NumBins := NFFT div 2 + 1;
+  invNFFT := 1.0 / NFFT;
+  NumFrames := Re.SizeX;
+  SetLength(Window, NFFT);
+  SetLength(Win2, NFFT);
+  for TapCnt := 0 to NFFT - 1 do
+  begin
+    Window[TapCnt] := 0.5 - 0.5 * Cos(2.0 * Pi * TapCnt / NFFT);
+    Win2[TapCnt] := Window[TapCnt] * Window[TapCnt];
+  end;
+  SetLength(CosTab, NumBins * NFFT);
+  SetLength(SinTab, NumBins * NFFT);
+  for BinCnt := 0 to NumBins - 1 do
+  begin
+    rowBase := BinCnt * NFFT;
+    angStep := 2.0 * Pi * BinCnt / NFFT;
+    for TapCnt := 0 to NFFT - 1 do
+    begin
+      twIdx := rowBase + TapCnt;
+      ang := angStep * TapCnt;
+      CosTab[twIdx] := Cos(ang);
+      SinTab[twIdx] := Sin(ang);
+    end;
+  end;
+  SetLength(BinScale, NumBins);
+  for BinCnt := 0 to NumBins - 1 do
+    if (BinCnt = 0) or ((BinCnt = NumBins - 1) and ((NFFT and 1) = 0)) then
+      BinScale[BinCnt] := 1.0
+    else
+      BinScale[BinCnt] := 2.0;
+  OutLen := NFFT + (NumFrames - 1) * HopLength;
+  SetLength(AccSig, OutLen);
+  SetLength(AccEnv, OutLen);
+  for OutIdx := 0 to OutLen - 1 do
+  begin
+    AccSig[OutIdx] := 0.0;
+    AccEnv[OutIdx] := 0.0;
+  end;
+  for FrameCnt := 0 to NumFrames - 1 do
+  begin
+    FrameStart := FrameCnt * HopLength;
+    frameBase := FrameCnt * NumBins;
+    for TapCnt := 0 to NFFT - 1 do
+    begin
+      Sample := 0.0;
+      twPos := TapCnt;
+      for BinCnt := 0 to NumBins - 1 do
+      begin
+        reIdx := frameBase + BinCnt;
+        ReVal := Re.FData[reIdx];
+        ImVal := Im.FData[reIdx];
+        Sample := Sample + BinScale[BinCnt] *
+          (ReVal * CosTab[twPos] + ImVal * SinTab[twPos]);
+        Inc(twPos, NFFT);
+      end;
+      Sample := Sample * invNFFT;
+      WinTap := Window[TapCnt];
+      OutIdx := FrameStart + TapCnt;
+      AccSig[OutIdx] := AccSig[OutIdx] + Sample * WinTap;
+      AccEnv[OutIdx] := AccEnv[OutIdx] + Win2[TapCnt];
+    end;
+  end;
+  Wave.ReSize(OutLen, 1, 1);
+  for OutIdx := 0 to OutLen - 1 do
+    if AccEnv[OutIdx] > csEnvEps then
+      Wave.FData[OutIdx] := AccSig[OutIdx] / AccEnv[OutIdx]
+    else
+      Wave.FData[OutIdx] := 0.0;
+end;
+
+procedure TTestNeuralAudio.TestISTFTReImMatchesProductTable;
+const
+  csFrames = 5;
+var
+  NFFTIdx, NFFT, Hop, NumBins, i: integer;
+  Re, Im, Got, Want: TNNetVolume;
+  MaxDiff, d: double;
+begin
+  // NFFT = 16 (even: the top bin is self-conjugate) and NFFT = 9 (odd: it is
+  // not, and BinCnt*TapCnt wraps at a non-power-of-two modulus).
+  for NFFTIdx := 0 to 1 do
+  begin
+    if NFFTIdx = 0 then begin NFFT := 16; Hop := 4; end
+    else begin NFFT := 9; Hop := 3; end;
+    NumBins := NFFT div 2 + 1;
+    Re := TNNetVolume.Create(csFrames, 1, NumBins);
+    Im := TNNetVolume.Create(csFrames, 1, NumBins);
+    Got := TNNetVolume.Create(1, 1, 1);
+    Want := TNNetVolume.Create(1, 1, 1);
+    try
+      // Deterministic, non-symmetric spectra so every bin/tap pair matters.
+      for i := 0 to Re.Size - 1 do
+      begin
+        Re.FData[i] := Sin(0.7 * i + 0.3) * (1.0 + 0.1 * i);
+        Im.FData[i] := Cos(1.1 * i - 0.2) * (1.0 - 0.05 * i);
+      end;
+      ISTFTOverlapAddReIm(Re, Im, Got, NFFT, Hop);
+      RefISTFTOverlapAddReIm(Re, Im, Want, NFFT, Hop);
+      AssertEquals('NFFT ' + IntToStr(NFFT) + ': output length',
+        Want.Size, Got.Size);
+      MaxDiff := 0;
+      for i := 0 to Want.Size - 1 do
+      begin
+        d := Abs(Got.FData[i] - Want.FData[i]);
+        if d > MaxDiff then MaxDiff := d;
+      end;
+      AssertTrue('NFFT ' + IntToStr(NFFT) +
+        ': fundamental-table ISTFT vs product-table reference max |diff| = ' +
+        FloatToStr(MaxDiff), MaxDiff < 1e-5);
+    finally
+      Re.Free;
+      Im.Free;
+      Got.Free;
+      Want.Free;
     end;
   end;
 end;
