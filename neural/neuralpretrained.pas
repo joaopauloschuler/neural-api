@@ -15763,6 +15763,59 @@ begin
   Consumed.Add(LinPrefix + 'out_proj.weight');
 end;
 
+// What the attention sub-block can HOIST out of the per-head forest, for one
+// layer of one model. The three answers all follow from a single question -
+// does anything PER-HEAD sit between the q/k projection and the attention math?
+// - so they are computed together rather than as three hand-kept-in-step
+// expressions: Fused is only sound when the norm and the rotary above it were
+// hoisted too, and that invariant is easy to break silently when the three
+// conditions live 60 lines apart.
+//   TiledQKNorm  ONE TNNetHeadRMSNorm over the whole q/k projection instead of
+//                NumHeads/NumKVHeads [SplitChannels -> TNNetTokenRMSNorm] pairs.
+//                The head-tiled kernel normalizes each contiguous HeadDim slice
+//                with the shared gain, bit-identical per head, and it precedes
+//                RoPE exactly as HF's q_norm(q_proj(x)) does.
+//   HoistRoPE    ONE head-tiled TNNetRotaryEmbedding over the whole projection
+//                instead of one layer per head (same per-head schedule tiled
+//                across the width, so bit-identical).
+//   Fused        ONE TNNetFusedSDPA over the packed [allQ|allK|allV] concat
+//                instead of (Hq + 2*Hkv) SplitChannels + Hq packs + Hq SDPA
+//                heads + the head concat - and ONE shared KV cache per layer,
+//                chunk-eligible over query heads for intra-layer threading.
+// Coded by Claude (AI).
+type
+  TAttnHoistPlan = record
+    TiledQKNorm, HoistRoPE, Fused: boolean;
+  end;
+
+function LlamaAttnHoistPlan(const Config: TLlamaConfig;
+  LayerUseRoPE: boolean; HeadDim, RotaryDims: integer): TAttnHoistPlan;
+var
+  PerHeadOnly, FullRotary: boolean;
+begin
+  // The two variants that genuinely need a layer PER HEAD between the
+  // projection and the SDPA, and can therefore hoist nothing:
+  //  - M-RoPE (Qwen2-VL): CreateRoPELayerForConfig ignores the head dim for it,
+  //    so a hoisted layer would spread the per-head frequency schedule across
+  //    the whole projection width (wrong frequencies);
+  //  - Llama-4's QK-L2 norm: applied AFTER RoPE, per head.
+  PerHeadOnly := Config.MRoPEEnabled or Config.Llama4QKL2Norm;
+  // Partial rotary (Phi-3, Qwen3.5) still cuts a per-head rotary slice.
+  FullRotary := RotaryDims >= HeadDim;
+  // Config.QKNormFullWidth (OLMo-2) is NOT a blocker: that norm is already
+  // whole-width and precedes RoPE.
+  Result.TiledQKNorm := Config.QKNorm and FullRotary and (not PerHeadOnly);
+  Result.HoistRoPE := LayerUseRoPE and FullRotary and (not PerHeadOnly) and
+    ((not Config.QKNorm) or Result.TiledQKNorm);
+  Result.Fused := NeuralAllowFusedAttention and FullRotary and
+    (not PerHeadOnly) and
+    ((not LayerUseRoPE) or Result.HoistRoPE) and
+    ((not Config.QKNorm) or Result.TiledQKNorm) and
+    // Llama-4 attn_temperature_tuning scales the query per position on the NoPE
+    // layers only - a per-head layer between the split and the SDPA.
+    (not (Config.AttnTempTuning and (not LayerUseRoPE)));
+end;
+
 // The Llama builder core: builds the net and loads every weight from the
 // ALREADY-OPEN pReader (whose tensor table must use the HF tensor names).
 // Takes OWNERSHIP of pReader (frees it on every path). FileName is used in
@@ -15793,7 +15846,7 @@ var
   NumLayersM1, NumKVHeadsM1, NumHeadsM1, HeadDimM1, RotaryDimsM1: integer;
   HeadDimMRotaryM1, VocabSizeM1, NumLocalExpertsM1, HalfRot: integer;
   LayerIsLocal, LayerUseRoPE: boolean;
-  DoHoistRoPE, DoTiledQKNorm, UseFusedAttn: boolean;
+  Plan: TAttnHoistPlan;
   NormGainOffset, QScale, QProjScale, LayerTheta: TNeuralFloat;
   LogitScaleFold: TNeuralFloat;
   LayerRoPEScaling: TRoPEScalingConfig;
@@ -16104,23 +16157,15 @@ begin
             Blocks[BlockCnt].KProj);
           KSource := Blocks[BlockCnt].KNormFull;
         end;
+        // What this layer can hoist out of the per-head forest (see
+        // LlamaAttnHoistPlan for the reasoning behind each answer). The
+        // per-head fallback below runs for whatever the plan leaves off.
+        Plan := LlamaAttnHoistPlan(Config, LayerUseRoPE, HeadDim, RotaryDims);
         // Config.QKNorm (Qwen3, Gemma-3): per-head RMSNorm on each q/k
         // slice AFTER the projection and BEFORE RoPE (the HF
         // modeling_qwen3 AND modeling_gemma3 ordering, both verified:
         // q_norm(q_proj(x)) then apply_rotary_pos_emb).
-        // OPTIMIZATION (Coded by Claude (AI)): when the rotary is full-width
-        // and nothing per-head-only is in play, ONE TNNetHeadRMSNorm on the
-        // WHOLE q/k projection replaces the NumHeads/NumKVHeads
-        // [SplitChannels -> TNNetTokenRMSNorm] copies - the head-tiled kernel
-        // normalizes each contiguous HeadDim slice with the shared gain,
-        // bit-identical per head - and, because the norm is now applied
-        // BEFORE the head split, it also unlocks the hoisted full-width RoPE
-        // below (same q_norm-then-rope order HF uses). Per-head fallback
-        // stays for partial rotary (Qwen3.5), M-RoPE (VL models) and
-        // Llama-4's post-RoPE QK-L2-norm.
-        DoTiledQKNorm := Config.QKNorm and (RotaryDims >= HeadDim) and
-          (not Config.MRoPEEnabled) and (not Config.Llama4QKL2Norm);
-        if DoTiledQKNorm then
+        if Plan.TiledQKNorm then
         begin
           // Stored as 1-length QNorms/KNorms arrays: the shared-gain loader
           // (LoadLlamaHeadRMSNormWeights) walks the array and the gain is
@@ -16141,25 +16186,9 @@ begin
           SetLength(Blocks[BlockCnt].QNorms, Config.NumHeads);
           SetLength(Blocks[BlockCnt].KNorms, Config.NumKVHeads);
         end;
-        // OPTIMIZATION (Coded by Claude (AI)): hoist RoPE ahead of the per-head
-        // split. RoPE rotates each head's (2k,2k+1) pairs by the SAME per-head
-        // schedule, so ONE full-width TNNetRotaryEmbedding with a head-tiled
-        // theta (pRotaryHeadDim = HeadDim) over the whole q/k projection is
-        // bit-identical to NumHeads/NumKVHeads per-head layers - but it is a
-        // single layer/dispatch instead of one per head. Only valid when
-        // nothing per-head sits between the split and RoPE and the rotary is
-        // full-width: NO per-head QKNorm (Qwen3/Gemma-3), NO Llama-4 per-head
-        // QK-L2-norm (applied AFTER RoPE), and RotaryDims = HeadDim (not the
-        // Phi-3 partial-rotary slice). QKNormFullWidth (OLMo-2) is fine - that
-        // norm is already whole-width and precedes RoPE. M-RoPE MUST keep
-        // per-head: CreateRoPELayerForConfig ignores the head dim for it, so a
-        // hoisted layer would spread the per-head frequency schedule across the
-        // whole projection width (wrong frequencies) - excluded explicitly.
-        DoHoistRoPE := LayerUseRoPE and
-          ((not Config.QKNorm) or DoTiledQKNorm) and
-          (not Config.Llama4QKL2Norm) and (RotaryDims >= HeadDim) and
-          (not Config.MRoPEEnabled);
-        if DoHoistRoPE then
+        // Hoisted RoPE: ONE full-width TNNetRotaryEmbedding with a head-tiled
+        // theta (pRotaryHeadDim = HeadDim) over the whole q/k projection.
+        if Plan.HoistRoPE then
         begin
           QSource := NN.AddLayerAfter(
             CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling, HeadDim),
@@ -16168,24 +16197,10 @@ begin
             CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling, HeadDim),
             KSource);
         end;
-        // OPTIMIZATION (Coded by Claude (AI)): FUSED multi-head attention.
-        // When nothing per-head sits between the projections and the
-        // attention math (rotary hoisted or absent, q/k norm tiled or absent,
-        // no Llama-4 per-head QK-L2 / NoPE temperature, no M-RoPE, full
-        // rotary), ONE TNNetFusedSDPA over the packed [allQ|allK|allV]
-        // concat replaces the whole per-head forest: (Hq+2*Hkv)
-        // SplitChannels + Hq packs + Hq SDPA heads + the head concat become
-        // 1 DeepConcat + 1 layer. Bit-identical per head (same kernels, same
-        // op order), one shared KV cache per sub-layer, and the fused layer
-        // is chunk-eligible over query heads for intra-layer threading. The
-        // per-head fallback below remains for every excluded variant.
-        UseFusedAttn := NeuralAllowFusedAttention and
-          ((not LayerUseRoPE) or DoHoistRoPE) and
-          ((not Config.QKNorm) or DoTiledQKNorm) and
-          (not Config.Llama4QKL2Norm) and
-          (not (Config.AttnTempTuning and (not LayerUseRoPE))) and
-          (not Config.MRoPEEnabled) and (RotaryDims >= HeadDim);
-        if UseFusedAttn then
+        // FUSED multi-head attention: ONE TNNetFusedSDPA over the packed
+        // [allQ|allK|allV] concat, bit-identical per head (same kernels, same
+        // op order) because everything per-head was hoisted above.
+        if Plan.Fused then
         begin
           NN.AddLayer( TNNetDeepConcat.Create(
             [QSource, KSource, Blocks[BlockCnt].VProj]) );
@@ -16252,8 +16267,8 @@ begin
           begin
             KSlice := NN.AddLayerAfter(
               TNNetSplitChannels.Create(SliceChannels), KSource);
-            // Skipped when DoTiledQKNorm normed the whole K projection above.
-            if Config.QKNorm and (not DoTiledQKNorm) then
+            // Skipped when Plan.TiledQKNorm normed the whole K projection above.
+            if Config.QKNorm and (not Plan.TiledQKNorm) then
             begin
               Blocks[BlockCnt].KNorms[KVHeadCnt] := NN.AddLayerAfter(
                 TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable), KSlice);
@@ -16263,10 +16278,10 @@ begin
             // positional encoding); RotaryEmbedding's native (2k,2k+1) layout
             // matches Llama-4's view_as_complex pairing (Config.InterleavedRotary
             // loads q/k straight - no rotate_half permutation).
-            // Skipped when DoHoistRoPE applied RoPE to the whole K projection
+            // Skipped when Plan.HoistRoPE applied RoPE to the whole K projection
             // above (the head-tiled full-width layer); the per-head slice is
             // already rotated.
-            if LayerUseRoPE and (not DoHoistRoPE) then
+            if LayerUseRoPE and (not Plan.HoistRoPE) then
               KSlice := NN.AddLayerAfter(
                 CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling), KSlice);
             // Config.Llama4QKL2Norm (use_qk_norm): UNWEIGHTED L2 RMS-norm over
@@ -16326,16 +16341,16 @@ begin
           begin
             QSlice := NN.AddLayerAfter(
               TNNetSplitChannels.Create(SliceChannels), QSource);
-            // Skipped when DoTiledQKNorm normed the whole Q projection above.
-            if Config.QKNorm and (not DoTiledQKNorm) then
+            // Skipped when Plan.TiledQKNorm normed the whole Q projection above.
+            if Config.QKNorm and (not Plan.TiledQKNorm) then
             begin
               Blocks[BlockCnt].QNorms[HeadCnt] := NN.AddLayerAfter(
                 TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable), QSlice);
               QSlice := Blocks[BlockCnt].QNorms[HeadCnt];
             end;
             // Llama-4 iRoPE: RoPE only on the RoPE layers (see the K path).
-            // Skipped when DoHoistRoPE rotated the whole Q projection above.
-            if LayerUseRoPE and (not DoHoistRoPE) then
+            // Skipped when Plan.HoistRoPE rotated the whole Q projection above.
+            if LayerUseRoPE and (not Plan.HoistRoPE) then
               QSlice := NN.AddLayerAfter(
                 CreateRoPELayerForConfig(Config, LayerTheta, LayerRoPEScaling), QSlice);
             if Config.Llama4QKL2Norm and LayerUseRoPE then
