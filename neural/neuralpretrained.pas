@@ -53048,14 +53048,14 @@ var
   Blocks: array of TFalconBlockLayers;
   EmbeddingLayer, FinalLN, LMHead: TNNetLayer;
   BranchInput, AttnSource, MlpSource, AttnOut, MlpOut, QKVLayer: TNNetLayer;
-  QSource, KSource, QSlice, KSlice, HeadPack: TNNetLayer;
+  QSource, KSource, VSource, QSlice, KSlice, HeadPack: TNNetLayer;
   KRotated, VSlices, HeadOutputs: array of TNNetLayer;
   SliceChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
   HeadDim, QWidth, KVWidth, i, j, d: integer;
   NumLayersM1, NumKVHeadsM1, HeadDimM1, NumHeadsM1: integer;
   VocabSizeM1, HiddenSizeM1: integer;
-  PerHeadThirds: boolean;
+  PerHeadThirds, HoistRoPE: boolean;
   Tmp: TNNetVolume;
   BlockPrefix, AttnPrefix, TensorNameStr: string;
   Consumed: TStringList;
@@ -53120,6 +53120,14 @@ begin
       // the effective num_kv_heads equals num_heads AND the new arch is off.
       PerHeadThirds := (not Config.NewDecoderArchitecture) and
         (Config.NumKVHeads = Config.NumHeads);
+      // Falcon rotates the FULL head (no partial rotary), so the head-tiled
+      // rotary layer that lets the attention collapse into one layer is exact
+      // for every scaling mode the config reader can produce - except LongRoPE,
+      // whose constructor takes no head dim (its per-frequency factor table is
+      // indexed over one head, so a whole-projection layer cannot carry it).
+      // That mode keeps the per-head rotary + per-head attention wiring.
+      // Coded by Claude (AI).
+      HoistRoPE := Config.RopeScaling.Mode <> rsmLongRoPE;
       if Reader.HasTensor('transformer.word_embeddings.weight') then
         Config.Prefix := 'transformer.'
       else if Reader.HasTensor('word_embeddings.weight') then
@@ -53191,6 +53199,37 @@ begin
         Blocks[BlockCnt].QKV := QKVLayer;
         QSource := QKVLayer;
         KSource := QKVLayer;
+        if HoistRoPE then
+        begin
+          // LoadFalconQKVWeights de-interleaves the HF slab (per-GQA-group
+          // [q..q|k|v], or per-head [q|k|v] thirds for plain MHA) into three
+          // CONTIGUOUS bands of neurons - q at 0, k at QWidth, v at
+          // QWidth+KVWidth - so each band is ONE contiguous TNNetSplitChannels
+          // and every head of a band sits at HeadCnt*HeadDim inside it.
+          // The rotary then sits AHEAD of the head split: one head-tiled
+          // TNNetRotaryEmbedding (pRotaryHeadDim = HeadDim) repeats the
+          // per-head frequency schedule across the whole band, which is
+          // bit-identical to one rotary per head. V is never rotated. With
+          // nothing per-head left between the projection and the attention
+          // math, the shared builder packs every head into one attention layer.
+          // Coded by Claude (AI).
+          QSource := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(0, QWidth), QKVLayer);
+          KSource := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(QWidth, KVWidth), QKVLayer);
+          VSource := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(QWidth + KVWidth, KVWidth), QKVLayer);
+          QSource := NN.AddLayerAfter(
+            CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling,
+              HeadDim), QSource);
+          KSource := NN.AddLayerAfter(
+            CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling,
+              HeadDim), KSource);
+          NN.AddGQAAttentionFromSources(QSource, KSource, VSource,
+            Config.NumHeads, Config.NumKVHeads, HeadDim, {CausalMask=}true);
+        end
+        else
+        begin
         // K is rotated ONCE per KV head; V (slab tail) is never rotated.
         for KVHeadCnt := 0 to NumKVHeadsM1 do
         begin
@@ -53223,6 +53262,7 @@ begin
               {CausalMask=}true), HeadPack);
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        end;
         Blocks[BlockCnt].AttnDense := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         AttnOut := NN.GetLastLayer();

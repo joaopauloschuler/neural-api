@@ -9908,6 +9908,7 @@ procedure TTestNeuralPretrained.TestFalconMultiQueryLogitParity;
 var
   NN: TNNet;
   Config: TFalconConfig;
+  LayerCnt, SDPACnt, FusedCnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildFalconFromSafeTensorsEx(
@@ -9922,6 +9923,19 @@ begin
     AssertTrue('parallel_attn', Config.ParallelAttn);
     AssertTrue('tied', Config.TieWordEmbeddings);
     AssertEquals('prefix', 'transformer.', Config.Prefix);
+    SDPACnt := 0;
+    FusedCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+        Inc(SDPACnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then Inc(FusedCnt);
+    end;
+    // The rotary is hoisted ahead of the head split (one head-tiled layer per
+    // Q/K band of the QKV slab), so nothing per-head survives and every block
+    // collapses to a single fused attention layer.
+    AssertEquals('one fused attention per block', Config.NumLayers, FusedCnt);
+    AssertEquals('no per-head SDPA survives the fusion', 0, SDPACnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_falcon_mq_logits.json'), Config.MaxPositions,
       Config.VocabSize);
@@ -9943,6 +9957,7 @@ procedure TTestNeuralPretrained.TestFalconNewArchLogitParity;
 var
   NN: TNNet;
   Config: TFalconConfig;
+  LayerCnt, SDPACnt, FusedCnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildFalconFromSafeTensorsEx(
@@ -9956,6 +9971,18 @@ begin
     AssertTrue('new_decoder_architecture', Config.NewDecoderArchitecture);
     AssertTrue('two layernorms', Config.TwoLayerNorms);
     AssertFalse('untied', Config.TieWordEmbeddings);
+    SDPACnt := 0;
+    FusedCnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+        Inc(SDPACnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then Inc(FusedCnt);
+    end;
+    // GQA groups are cut inside the contiguous K/V bands of the QKV slab, so
+    // the whole per-head forest collapses to one fused attention per block.
+    AssertEquals('one fused attention per block', Config.NumLayers, FusedCnt);
+    AssertEquals('no per-head SDPA survives the fusion', 0, SDPACnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_falcon_nda_logits.json'), Config.MaxPositions,
       Config.VocabSize);
