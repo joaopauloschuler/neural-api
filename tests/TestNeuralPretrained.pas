@@ -10041,7 +10041,7 @@ procedure TTestNeuralPretrained.TestStarCoder2LogitParity;
 var
   NN: TNNet;
   Config: TStarCoder2Config;
-  LayerCnt, NormCnt, RMSCnt: integer;
+  LayerCnt, NormCnt, RMSCnt, SDPACnt, FusedCnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildStarCoder2FromSafeTensorsEx(
@@ -10059,16 +10059,26 @@ begin
     AssertEquals('prefix', 'model.', Config.Prefix);
     NormCnt := 0;
     RMSCnt := 0;
+    SDPACnt := 0;
+    FusedCnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
       if NN.Layers[LayerCnt].ClassType = TNNetTokenLayerNorm then
         Inc(NormCnt);
       if NN.Layers[LayerCnt].ClassType = TNNetTokenRMSNorm then
         Inc(RMSCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+        Inc(SDPACnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then Inc(FusedCnt);
     end;
     AssertEquals('TokenLayerNorm count (2 per block + final)',
       2 * Config.NumLayers + 1, NormCnt);
     AssertEquals('no RMSNorm (Starcoder2 is LayerNorm)', 0, RMSCnt);
+    // The rotary is hoisted ahead of the head split (one head-tiled layer per
+    // projection), so nothing per-head survives and every block collapses to a
+    // single fused attention layer.
+    AssertEquals('one fused attention per block', Config.NumLayers, FusedCnt);
+    AssertEquals('no per-head SDPA survives the fusion', 0, SDPACnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_starcoder2_logits.json'), Config.MaxPositions,
       Config.VocabSize);

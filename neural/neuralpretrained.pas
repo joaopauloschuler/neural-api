@@ -21336,17 +21336,15 @@ function BuildStarCoder2FromSafeTensorsWithConfig(const FileName: string;
   var Config: TStarCoder2Config; pSeqLen: integer = 0;
   pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
-  ReaderMax, chBase: integer;
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TStarCoder2BlockLayers;
   EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
-  BranchInput, NormedSource, KSlice, QSlice, HeadPack: TNNetLayer;
-  KRotated, VSlices, HeadOutputs: array of TNNetLayer;
-  SliceChannels: array of integer;
-  BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
-  HeadDim, QWidth, KVWidth, i, j, d: integer;
-  BlockMax, KVHeadMax, HeadMax, HeadDimM1, VocabM1, HiddenM1: integer;
+  BranchInput, NormedSource, QSource, KSource: TNNetLayer;
+  BlockCnt, SeqLen: integer;
+  HeadDim, QWidth, KVWidth, i, j: integer;
+  BlockMax, VocabM1, HiddenM1: integer;
   Tmp, WVTied: TNNetVolume;
   TiedBase: integer;
   BlockPrefix, AttnPrefix, MlpPrefix, TensorNameStr, LMHeadName: string;
@@ -21400,7 +21398,6 @@ begin
           '(0 = full attention).');
       QWidth := Config.NumHeads * HeadDim;
       KVWidth := Config.NumKVHeads * HeadDim;
-      GroupSize := Config.NumHeads div Config.NumKVHeads;
       if Reader.HasTensor('model.embed_tokens.weight') then
         Config.Prefix := 'model.'
       else if Reader.HasTensor('embed_tokens.weight') then
@@ -21439,20 +21436,12 @@ begin
       if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
-      SetLength(KRotated, Config.NumKVHeads);
-      SetLength(VSlices, Config.NumKVHeads);
-      SetLength(HeadOutputs, Config.NumHeads);
-      SetLength(SliceChannels, HeadDim);
       BlockMax := Config.NumLayers - 1;
-      KVHeadMax := Config.NumKVHeads - 1;
-      HeadMax := Config.NumHeads - 1;
-      HeadDimM1 := HeadDim - 1;
       for BlockCnt := 0 to BlockMax do
       begin
         // Attention sub-block: x := x + o_proj(rotary-GQA(LayerNorm(x))),
-        // wired from primitives exactly like the Llama path (per-head RoPE on
-        // each Q/K slice; depth = head_dim so the frequency schedule matches
-        // HF), but with a BIASED LayerNorm pre-norm and biased projections.
+        // wired from primitives exactly like the Llama path, but with a BIASED
+        // LayerNorm pre-norm and biased projections.
         BranchInput := NN.GetLastLayer();
         Blocks[BlockCnt].AttnNorm := NN.AddLayer(
           TNNetTokenLayerNorm.Create(Config.LayerNormEps).SetTrainable(pTrainable) );
@@ -21463,39 +21452,30 @@ begin
           TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable), NormedSource);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(KVWidth).SetTrainable(pTrainable), NormedSource);
-        // K is rotated ONCE per KV head; V is never rotated.
-        for KVHeadCnt := 0 to KVHeadMax do
-        begin
-          chBase := KVHeadCnt * HeadDim;
-          for d := 0 to HeadDimM1 do
-            SliceChannels[d] := chBase + d;
-          KSlice := NN.AddLayerAfter(
-            TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].KProj);
-          KRotated[KVHeadCnt] := NN.AddLayerAfter(
-            CreateRoPEFromScaling(Config.RopeTheta, RopeScaling), KSlice);
-          VSlices[KVHeadCnt] := NN.AddLayerAfter(
-            TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].VProj);
-        end;
-        for HeadCnt := 0 to HeadMax do
-        begin
-          KVGroup := HeadCnt div GroupSize;
-          chBase := HeadCnt * HeadDim;
-          for d := 0 to HeadDimM1 do
-            SliceChannels[d] := chBase + d;
-          QSlice := NN.AddLayerAfter(
-            TNNetSplitChannels.Create(SliceChannels), Blocks[BlockCnt].QProj);
-          QSlice := NN.AddLayerAfter(
-            CreateRoPEFromScaling(Config.RopeTheta, RopeScaling), QSlice);
-          HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
-            [QSlice, KRotated[KVGroup], VSlices[KVGroup]]) );
-          // Config.SlidingWindow > 0 (when set) applies the banded causal
-          // window to EVERY layer (HF Starcoder2 has no per-layer pattern).
-          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
-            TNNetScaledDotProductAttention.Create(HeadDim, {CausalMask=}true,
-              {pWindow=}Config.SlidingWindow),
-            HeadPack);
-        end;
-        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        // RoPE hoisted AHEAD of the head split: one head-tiled
+        // TNNetRotaryEmbedding (pRotaryHeadDim = HeadDim) over the WHOLE q/k
+        // projection tiles the per-head frequency schedule across the full
+        // width, so it is bit-identical to one layer per head. The hoist is
+        // unconditional here because ReadStarCoder2ConfigFromJSONFile never
+        // parses a rope_scaling block - the schedule is always the unscaled
+        // full-head one (DefaultRoPEScaling, rsmNone), so neither of the modes
+        // the tiled layer refuses (LongRoPE, YaRN with an mscale) is
+        // reachable. V is never rotated. The q/k biases live on the
+        // TNNetPointwiseConvLinear projections below the rotary, untouched.
+        // Coded by Claude (AI).
+        QSource := NN.AddLayerAfter(
+          CreateRoPEFromScaling(Config.RopeTheta, RopeScaling, HeadDim),
+          Blocks[BlockCnt].QProj);
+        KSource := NN.AddLayerAfter(
+          CreateRoPEFromScaling(Config.RopeTheta, RopeScaling, HeadDim),
+          Blocks[BlockCnt].KProj);
+        // Nothing per-head is left between the rotary and the attention math,
+        // so the shared builder can pack every head into one attention layer.
+        // Config.SlidingWindow > 0 (when set) applies the banded causal window
+        // to EVERY layer (HF Starcoder2 has no per-layer pattern).
+        NN.AddGQAAttentionFromSources(QSource, KSource, Blocks[BlockCnt].VProj,
+          Config.NumHeads, Config.NumKVHeads, HeadDim, {CausalMask=}true,
+          {Window=}Config.SlidingWindow);
         Blocks[BlockCnt].OProj := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
