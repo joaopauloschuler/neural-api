@@ -72961,7 +72961,9 @@ begin
       // passes took a fresh cache line per channel and used a single float from
       // it. Doing cSAMPixTile consecutive pixels together turns every channel
       // pass into a contiguous run while leaving each pixel's arithmetic - and
-      // its ci accumulation order - exactly as before, so this is bit-identical.
+      // its ci accumulation order - exactly as before. The GELU that closes the
+      // pass rides the vector kernel via SAMGeluInPlace, so the erf matches the
+      // scalar pcr_erff spelling to ~1e-6 rather than bit-exactly.
       pix0 := 0;
       while pix0 < H2W2 do
       begin
@@ -72997,10 +72999,11 @@ begin
           for jp := 0 to NPixM1 do
           begin
             kp := posU + jp;
-            x := (U1[kp] - MeanB[jp]) * InvB[jp] * gw + gb;
-            cdf := 0.5 * (1.0 + pcr_erff(x * INV_SQRT_2));   // GELU(erf)
-            U1[kp] := x * cdf;
+            U1[kp] := (U1[kp] - MeanB[jp]) * InvB[jp] * gw + gb;
           end;
+          // GELU(erf) over the NPix normalized values, which are contiguous in
+          // U1: one vector-kernel run per (channel, pixel tile).
+          SAMGeluInPlace(U1, posU, NPix);
           Inc(posU, H2W2);
         end;
         Inc(pix0, NPix);
