@@ -32764,30 +32764,31 @@ begin
            (t - Off - 1 < NumFrames) then
         begin
           base := k_i * FConfig.VocabSize; // Logits holds frame `step` alone
-          best := 0;
-          // The guided logit for token v is
-          //   uncond[v] + scale * (cond[v] - uncond[v]).
-          condVal := Logits.FData[base];
+          // #20: UseGuidance is fixed for the whole decode, so the test is
+          // unswitched out of the VocabSize-wide loop. Both halves seed the
+          // running best from index 0, so the tie behaviour (first maximum) is
+          // the same either way.
           if UseGuidance then
           begin
+            // The guided logit for token v is
+            //   uncond[v] + scale * (cond[v] - uncond[v]).
+            best := 0;
+            condVal := Logits.FData[base];
             uncondVal := UncondLogits.FData[base];
             bestVal := uncondVal + GuidanceScale * (condVal - uncondVal);
-          end
-          else
-            bestVal := condVal;
-          for v := 1 to VsM1 do
-          begin
-            idx := base + v;
-            condVal := Logits.FData[idx];
-            if UseGuidance then
+            for v := 1 to VsM1 do
             begin
+              idx := base + v;
+              condVal := Logits.FData[idx];
               uncondVal := UncondLogits.FData[idx];
               vv := uncondVal + GuidanceScale * (condVal - uncondVal);
-            end
-            else
-              vv := condVal;
-            if vv > bestVal then begin bestVal := vv; best := v; end;
-          end;
+              if vv > bestVal then begin bestVal := vv; best := v; end;
+            end;
+          end
+          else
+            // #18: bare argmax; MaxPos returns the FIRST maximum, matching the
+            // scalar loop this replaces.
+            TNNetVolume.MaxPos(Addr(Logits.FData[base]), VsM1 + 1, best);
           Delayed[k_i][t] := best;
         end;
       end;
@@ -32845,41 +32846,32 @@ var
   // offset Off). nil Sampler -> exact argmax; else softmax(./Temperature) draw.
   function SelectToken(L: TNNetVolume; Off: integer): integer;
   var
-    v, best, VsM1: integer;
-    bestVal, vv, MaxLogit, SumExp, InvT, Lv, eProb: TNeuralFloat;
+    best, Vs: integer;
+    MaxLogit, SumExp, InvT: TNeuralFloat;
   begin
-    VsM1 := FConfig.VocabSize - 1;
+    Vs := FConfig.VocabSize;
     if Sampler = nil then
     begin
-      best := 0;
-      bestVal := L.FData[Off];
-      for v := 1 to VsM1 do
-      begin
-        vv := L.FData[Off + v];
-        if vv > bestVal then begin bestVal := vv; best := v; end;
-      end;
+      // #18: MaxPos returns the FIRST maximum, the same tie the scalar argmax
+      // loop resolved.
+      TNNetVolume.MaxPos(Addr(L.FData[Off]), Vs, best);
       Result := best;
     end
     else
     begin
       // Stable softmax of the VocabSize-wide row at Temperature, then draw
-      // (the same probability convention as DecodeSeq2SeqSampled).
-      MaxLogit := L.FData[Off];
-      for v := 1 to VsM1 do
-      begin
-        Lv := L.FData[Off + v];
-        if Lv > MaxLogit then MaxLogit := Lv;
-      end;
+      // (the same probability convention as DecodeSeq2SeqSampled). #19: folding
+      // the temperature into the shift - (L-Max)*InvT = L*InvT - Max*InvT -
+      // turns the scalar exp loop into copy + Mul + the fused ExpShiftSum, which
+      // exponentiates and sums in one vectorized pass.
+      MaxLogit := TNNetVolume.MaxValue(Addr(L.FData[Off]), Vs);
       InvT := 1.0 / Temperature;
-      SumExp := 0;
-      for v := 0 to VsM1 do
-      begin
-        eProb := NeuralExp((L.FData[Off + v] - MaxLogit) * InvT); // #4
-        Probs.FData[v] := eProb;
-        SumExp := SumExp + eProb;
-      end;
+      Move(L.FData[Off], Probs.FData[0], Vs * csNeuralFloatSize);
+      TNNetVolume.Mul(Addr(Probs.FData[0]), InvT, Vs);
+      SumExp := TNNetVolume.ExpShiftSum(Addr(Probs.FData[0]),
+        Addr(Probs.FData[0]), MaxLogit * InvT, Vs);
       if SumExp <= 0 then SumExp := 1.0;
-      TNNetVolume.Mul(Probs.GetRawPtr(0), 1.0 / SumExp, VsM1 + 1);
+      TNNetVolume.Mul(Addr(Probs.FData[0]), 1.0 / SumExp, Vs);
       Result := Sampler.GetToken(Probs);
     end;
   end;
@@ -33871,12 +33863,9 @@ begin
           if (t < FCodecLen) and (t >= k_i + 1) and (t - k_i - 1 < NumFrames) then
           begin
             base := k_i * FConfig.VocabSize; // StepLogits holds frame `step`
-            best := 0; bestVal := StepLogits.FData[base];
-            for v := 1 to VocabSizeM1 do
-            begin
-              vv := StepLogits.FData[base + v];
-              if vv > bestVal then begin bestVal := vv; best := v; end;
-            end;
+            // #18: MaxPos returns the FIRST maximum, as the scalar loop did.
+            TNNetVolume.MaxPos(Addr(StepLogits.FData[base]),
+              VocabSizeM1 + 1, best);
             Delayed[k_i][t] := best;
           end;
       end;
@@ -33966,12 +33955,9 @@ begin
           if (t < FCodecLen) and (t >= k_i + 1) and (t - k_i - 1 < NumFrames) then
           begin
             base := k_i * FConfig.VocabSize;
-            best := 0; bestVal := StepLogits.FData[base];
-            for v := 1 to VocabSizeM1 do
-            begin
-              vv := StepLogits.FData[base + v];
-              if vv > bestVal then begin bestVal := vv; best := v; end;
-            end;
+            // #18: MaxPos returns the FIRST maximum, as the scalar loop did.
+            TNNetVolume.MaxPos(Addr(StepLogits.FData[base]),
+              VocabSizeM1 + 1, best);
             Delayed[k_i][t] := best;
           end;
       end;
