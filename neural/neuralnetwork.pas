@@ -2636,6 +2636,13 @@ type
     // accumulators (the stated exception to rule #25).
     FAlphaFlat, FBetaFlat: array of double;
     FExtBuf: TNeuralIntegerArray;   // extended label l', length NS
+    // Persistent, lazily-sized decoded label sequence (rule #17): the backward
+    // path decodes the target into this buffer instead of allocating one.
+    FLabelsBuf: TNeuralIntegerArray;
+    // Non-allocating DecodeTarget: fills the grow-only ALabels buffer and
+    // reports how many of its entries are valid.
+    class procedure DecodeTargetInto(ATarget: TNNetVolume;
+      var ALabels: TNeuralIntegerArray; out ACount: integer);
   public
     constructor Create(); overload; override;
     constructor Create(Blank: integer); reintroduce; overload;
@@ -26527,6 +26534,21 @@ begin
     Labels[i] := Round(ATarget[0, 0, 1 + i]);
 end;
 
+class procedure TNNetCTCLoss.DecodeTargetInto(ATarget: TNNetVolume;
+  var ALabels: TNeuralIntegerArray; out ACount: integer);
+var
+  L, LM1, i: integer;
+begin
+  L := Round(ATarget[0, 0, 0]);
+  if L < 0 then L := 0;
+  LM1 := L - 1;
+  // Keep the buffer non-empty so an L=0 target still yields a valid Slice base.
+  if Length(ALabels) <= L then SetLength(ALabels, L + 1);
+  for i := 0 to LM1 do
+    ALabels[i] := Round(ATarget[0, 0, 1 + i]);
+  ACount := L;
+end;
+
 function TNNetCTCLoss.ForwardBackwardLogLoss(ALogProbs: TNNetVolume;
   const Labels: array of integer; Blank: integer; AGrad: TNNetVolume): TNeuralFloat;
 const
@@ -26589,12 +26611,16 @@ begin
     else if FExtBuf[i] > VocabM1 then FExtBuf[i] := VocabM1;
   end;
 
-  // The scratch may be larger than this call needs, so every cell in
-  // [0, NT*NS) is explicitly seeded here before it is ever read.
-  for i := 0 to Cells - 1 do
+  // Only two rows can ever be read un-written: the alpha recurrence below
+  // assigns every si of every row ti >= 1, and the beta recurrence assigns
+  // every si of every row ti <= NT-2. So seeding alpha row 0 and beta row
+  // NT-1 covers every cell the boundary inits do not set, and the remaining
+  // 2*(NT-1)*NS cells need no pre-pass.
+  Row := NTM1 * NS;
+  for i := 0 to NSM1 do
   begin
     FAlphaFlat[i] := cNegInf;
-    FBetaFlat[i] := cNegInf;
+    FBetaFlat[Row + i] := cNegInf;
   end;
 
   // Forward (alpha). Init: at ti=0 only the first blank or first label.
@@ -26680,8 +26706,7 @@ end;
 procedure TNNetCTCLoss.Backpropagate();
 var
   StartTime: double;
-  Labels: TNeuralIntegerArray;
-  Idx, SizeM1: integer;
+  Idx, SizeM1, LabelCnt: integer;
   LogP, Seeded: TNeuralFloat;
 begin
   StartTime := Now();
@@ -26699,11 +26724,12 @@ begin
     Seeded := FOutputError.FData[Idx];
     FCTCTarget.FData[Idx] := LogP - Seeded;
   end;
-  TNNetCTCLoss.DecodeTarget(FCTCTarget, Labels);
+  TNNetCTCLoss.DecodeTargetInto(FCTCTarget, FLabelsBuf, LabelCnt);
 
   // Run the log-space forward-backward and write -gamma into FOutputError.
   // ForwardBackwardLogLoss ReSizes+Fills FCTCGrad internally (rule #17 scratch).
-  ForwardBackwardLogLoss(FOutput, Labels, BlankIndex(), FCTCGrad);
+  ForwardBackwardLogLoss(FOutput, Slice(FLabelsBuf, LabelCnt), BlankIndex(),
+    FCTCGrad);
   FOutputError.Copy(FCTCGrad);
 
   FBackwardTime := FBackwardTime + (Now() - StartTime);
