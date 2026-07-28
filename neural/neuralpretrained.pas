@@ -37913,9 +37913,12 @@ function WhisperDTW(Score: TNNetVolume;
   out PathTok, PathFrame: array of integer): integer;
 var
   N, M, i, j, ti, fj, PathLen, ResultM1, sBase, jM1: integer;
-  Cost: array of array of Double;   // accumulated cost
   Trace: array of array of byte;    // 0=diag, 1=down(token), 2=right(frame)
-  CostPrev, CostRow: array of Double;
+  // The accumulated cost is consumed strictly as previous-row/current-row, so
+  // two rolling rows replace the full (N+1)x(M+1) matrix (5.4 MB -> 24 KB at
+  // 448 tokens x 1500 frames, and one allocation instead of N+1). Trace must
+  // stay full-size: the backtrace walks it.
+  CostPrev, CostRow, CostSwap: array of Double;
   TraceRow: array of byte;
   c0, c1, c2, Best: Double;
   BestMove: byte;
@@ -37923,22 +37926,19 @@ var
 begin
   N := Score.SizeY;  // text tokens
   M := Score.SizeX;  // audio frames
-  SetLength(Cost, N + 1);
   SetLength(Trace, N + 1);
-  for i := 0 to N do
-  begin
-    SetLength(Cost[i], M + 1);
-    SetLength(Trace[i], M + 1);
-    for j := 0 to M do Cost[i][j] := 1e30;
-  end;
-  Cost[0][0] := 0;
+  for i := 0 to N do SetLength(Trace[i], M + 1);
+  SetLength(CostPrev, M + 1);
+  SetLength(CostRow, M + 1);
+  // Row 0 seeds the recurrence: only (0,0) is reachable at zero cost.
+  for j := 0 to M do CostPrev[j] := 1e30;
+  CostPrev[0] := 0;
   // Local cost = -Score (openai-whisper minimizes negative attention).
   for i := 1 to N do
   begin
     sBase := Score.GetRawPos(0, i - 1);
-    CostPrev := Cost[i - 1];
-    CostRow := Cost[i];
     TraceRow := Trace[i];
+    CostRow[0] := 1e30;     // column 0 is unreachable for every token row
     jM1 := 0;
     c2 := CostRow[0];         // right (CostRow[j-1]); carried across j (#4/#6)
     for j := 1 to M do
@@ -37953,6 +37953,10 @@ begin
       TraceRow[j] := BestMove;
       jM1 := j;
     end;
+    // This row becomes the next row's predecessor; its buffer is reused.
+    CostSwap := CostPrev;
+    CostPrev := CostRow;
+    CostRow := CostSwap;
   end;
   // Backtrace from (N,M) to (1,1), then collect into ascending order.
   SetLength(TmpTok, N + M);
