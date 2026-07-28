@@ -138,6 +138,15 @@ type
   end;
   TNeuralTokenOffsetArray = array of TNeuralTokenOffset;
 
+  // One BPE merge-table entry for the pair hash: a pointer to the
+  // 'left'#1'right' key string owned by FMerges (its body is stable while the
+  // list is untouched), the key length, and the merge rank.
+  TNeuralHFMergeEntry = record
+    Key: PAnsiChar;
+    KeyLen: integer;
+    Rank: integer;
+  end;
+
   { TNeuralHFTokenizer }
   // Encoder/decoder for the HuggingFace tokenizer.json fast-tokenizer
   // format (byte-level BPE, metaspace/byte-fallback BPE and BERT
@@ -155,6 +164,13 @@ type
       // Built lazily (load-time cost only) and invalidated wherever
       // FAddedTokens is (re)written.
       FAddedIdToIndex: array of integer;
+      // First-byte gate for the added-token scan: true exactly for the bytes
+      // some added token starts with. Encode reads one array element per
+      // input byte instead of scanning every added token -- the Llama-3
+      // family carries 256+ reserved special tokens, so the scan is otherwise
+      // 256 iterations PER INPUT BYTE. Built with (and invalidated by the
+      // same flag as) FAddedIdToIndex.
+      FAddedFirstByte: array[byte] of boolean;
       FAddedIdIndexBuilt: boolean;
       // model flags
       FByteFallback, FFuseUnk, FIgnoreMerges: boolean;
@@ -242,6 +258,16 @@ type
       // pair of the word being merged. Grown lazily and reused across words,
       // so the merge loop itself never allocates.
       FBPERanks: array of integer;
+      // Open-addressed hash over FMerges, keyed on the SAME 'left'#1'right'
+      // byte sequence the sorted-list Find() matched -- but probed straight
+      // from the two symbols, so a rank lookup neither builds the temporary
+      // key string nor walks a 17-deep binary search. Slots hold the
+      // FMergeEntry index + 1; 0 is an empty slot.
+      FMergeEntry: array of TNeuralHFMergeEntry;
+      FMergeHash: array of integer;
+      FMergeHashMask: integer;
+      FMergeHashBuilt: boolean;
+      procedure BuildMergeHash();
       procedure DetectKeyMangling();
       function FixJSONKey(const Key: string): string;
       procedure BuildByteTable();
@@ -1183,6 +1209,7 @@ procedure TNeuralHFTokenizer.ClearState();
 begin
   FVocab.Clear;
   FMerges.Clear;
+  FMergeHashBuilt := false;      // merge pair hash must be rebuilt
   SetLength(FIdToToken, 0);
   SetLength(FAddedTokens, 0);
   FAddedIdIndexBuilt := false;   // added-token id map must be rebuilt
@@ -1494,13 +1521,92 @@ begin
   else Result := -1;
 end;
 
+// FNV-1a over a stored 'left'#1'right' merge key.
+function HFMergeKeyHash(P: PAnsiChar; Len: integer): cardinal;
+var
+  Cnt: integer;
+begin
+  {$PUSH}{$Q-}{$R-}
+  Result := 2166136261;
+  for Cnt := 0 to Len - 1 do
+    Result := (Result xor cardinal(byte(P[Cnt]))) * 16777619;
+  {$POP}
+end;
+
+// The same FNV-1a over the two symbols with the separator between them: the
+// hash of the concatenated key, computed WITHOUT concatenating.
+function HFMergePairHash(PA: PAnsiChar; LenA: integer;
+  PB: PAnsiChar; LenB: integer): cardinal;
+var
+  Cnt: integer;
+begin
+  {$PUSH}{$Q-}{$R-}
+  Result := 2166136261;
+  for Cnt := 0 to LenA - 1 do
+    Result := (Result xor cardinal(byte(PA[Cnt]))) * 16777619;
+  Result := (Result xor cardinal(byte(csMergeSep))) * 16777619;
+  for Cnt := 0 to LenB - 1 do
+    Result := (Result xor cardinal(byte(PB[Cnt]))) * 16777619;
+  {$POP}
+end;
+
+// Indexes the finished merge table for pair lookup. Runs once per load, from
+// the first MergeRank call; every FMerges fill site invalidates it.
+procedure TNeuralHFTokenizer.BuildMergeHash();
+var
+  Cnt, MergesCnt, MergesCntM1, Cap, Slot: integer;
+  Key: string;
+begin
+  MergesCnt := FMerges.Count;
+  SetLength(FMergeEntry, MergesCnt);
+  Cap := 16;
+  while Cap < MergesCnt * 2 do Cap := Cap shl 1;
+  SetLength(FMergeHash, Cap);
+  FillDWord(FMergeHash[0], Cap, 0);
+  FMergeHashMask := Cap - 1;
+  MergesCntM1 := MergesCnt - 1;
+  for Cnt := 0 to MergesCntM1 do
+  begin
+    Key := FMerges[Cnt];
+    FMergeEntry[Cnt].Key := PAnsiChar(Key);
+    FMergeEntry[Cnt].KeyLen := Length(Key);
+    FMergeEntry[Cnt].Rank := integer(PtrInt(FMerges.Objects[Cnt]));
+    Slot := integer(HFMergeKeyHash(PAnsiChar(Key), Length(Key))) and
+      FMergeHashMask;
+    while FMergeHash[Slot] <> 0 do Slot := (Slot + 1) and FMergeHashMask;
+    FMergeHash[Slot] := Cnt + 1;
+  end;
+  FMergeHashBuilt := true;
+end;
+
 function TNeuralHFTokenizer.MergeRank(const A, B: string): integer;
 var
-  Idx: integer;
+  Slot, Idx, LenA, LenB, KeyLen: integer;
+  PA, PB, PKey: PAnsiChar;
 begin
-  if FMerges.Find(A + csMergeSep + B, Idx)
-  then Result := integer(PtrInt(FMerges.Objects[Idx]))
-  else Result := High(integer);
+  if not FMergeHashBuilt then BuildMergeHash();
+  PA := PAnsiChar(A);
+  PB := PAnsiChar(B);
+  LenA := Length(A);
+  LenB := Length(B);
+  KeyLen := LenA + 1 + LenB;
+  Slot := integer(HFMergePairHash(PA, LenA, PB, LenB)) and FMergeHashMask;
+  while true do
+  begin
+    Idx := FMergeHash[Slot] - 1;
+    if Idx < 0 then exit(High(integer));
+    if FMergeEntry[Idx].KeyLen = KeyLen then
+    begin
+      PKey := FMergeEntry[Idx].Key;
+      // Compares the three parts in place, so a symbol that itself contains
+      // the separator byte matches exactly what the concatenated key did.
+      if (PKey[LenA] = csMergeSep) and
+        (CompareByte(PA^, PKey^, LenA) = 0) and
+        (CompareByte(PB^, PKey[LenA + 1], LenB) = 0) then
+        exit(FMergeEntry[Idx].Rank);
+    end;
+    Slot := (Slot + 1) and FMergeHashMask;
+  end;
 end;
 
 procedure TNeuralHFTokenizer.LoadFromFile(const FileName: string);
@@ -1979,6 +2085,7 @@ begin
       FMerges.AddObject(Left + csMergeSep + Right, TObject(PtrInt(Cnt)));
     end;
     HFEndBulkFill(FMerges);
+    FMergeHashBuilt := false;   // merge pair hash must be rebuilt
     end;
 
     // unk token
@@ -2242,6 +2349,7 @@ begin
       TObject(PtrInt(I)));
   end;
   HFEndBulkFill(FMerges);
+  FMergeHashBuilt := false;   // merge pair hash must be rebuilt
 end;
 
 { ---------------------------------------------------------------- }
@@ -2678,6 +2786,7 @@ begin
         FMerges.AddObject(Left + csMergeSep + Right, TObject(PtrInt(Cnt)));
       end;
       HFEndBulkFill(FMerges);
+      FMergeHashBuilt := false;   // merge pair hash must be rebuilt
 
       // Expose CONTROL / USER_DEFINED pieces as added special tokens so they
       // round-trip verbatim (e.g. <|endoftext|>); fall back to id-based
@@ -2840,14 +2949,22 @@ begin
   end;
 end;
 
-// Builds the id -> FAddedTokens index map. First match wins, matching the
-// linear scan this replaces. Load-time only: never called from a decode loop
-// after the first lookup (rule #17).
+// Builds the id -> FAddedTokens index map and the first-byte gate. First
+// match wins, matching the linear scan this replaces. Load-time only: never
+// called from a decode loop after the first lookup (rule #17).
 procedure TNeuralHFTokenizer.BuildAddedIdIndex();
 var
   Cnt, AddedHi, MaxId, TokId, MapHi: integer;
+  Content: string;
 begin
   AddedHi := High(FAddedTokens);
+  FillChar(FAddedFirstByte, SizeOf(FAddedFirstByte), 0);
+  for Cnt := 0 to AddedHi do
+  begin
+    // An empty added token can never match, so it must not open the gate.
+    Content := FAddedTokens[Cnt].Content;
+    if Content <> '' then FAddedFirstByte[byte(Content[1])] := true;
+  end;
   MaxId := -1;
   for Cnt := 0 to AddedHi do
     if FAddedTokens[Cnt].Id > MaxId then MaxId := FAddedTokens[Cnt].Id;
@@ -4462,9 +4579,13 @@ begin
   Position := 1;
   SegStart := 1;
   TextLen := Length(Text); // #2/#5: Text is const, not mutated in loop
+  if not FAddedIdIndexBuilt then BuildAddedIdIndex();
   while Position <= TextLen do
   begin
-    if FindAddedToken(Text, Position, TokenIndex) then
+    // The gate is exact: FindAddedToken only ever matches a token whose first
+    // byte equals Text[Position], so a closed gate cannot hide a match.
+    if FAddedFirstByte[byte(Text[Position])] and
+      FindAddedToken(Text, Position, TokenIndex) then
     begin
       if Position > SegStart then
         EncodeSegment(Copy(Text, SegStart, Position - SegStart), Ids,
