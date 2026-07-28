@@ -35,6 +35,16 @@ type
     procedure TestDropoutAtFixedSeedAlternativeSegmentation;
     // The dropped-merge segmentation still decodes back to the original string.
     procedure TestDropoutRoundTrips;
+    // Ids beyond the dictionary decode to '' instead of reading past
+    // FIntegerToStr.
+    procedure TestDeTokenizeIdPastDictionaryEnd;
+    // Without SaveCurrentPosition FIntegerToStr is empty, so every id is out of
+    // range.
+    procedure TestIntegerToWordWithoutSaveCurrentPosition;
+    // Negative ids reach neither Chr() nor the array.
+    procedure TestDeTokenizeNegativeId;
+    // IntegerArrayToString must use the same guarded accessor.
+    procedure TestIntegerArrayToStringSkipsOutOfRangeIds;
   end;
 
 implementation
@@ -134,6 +144,76 @@ begin
   finally
     IL.Free;
     T.Free;
+  end;
+end;
+
+procedure TTestNeuralTokenizer.TestDeTokenizeIdPastDictionaryEnd;
+var
+  T: TNeuralTokenizer;
+begin
+  T := BuildTokenizer();
+  try
+    // 12 vocab entries, so ids 128..139 are valid and 140 upwards are not.
+    AssertEquals('last valid id decodes', 'west', T.DeTokenize(139));
+    AssertEquals('first id past the end decodes to empty',
+      '', T.DeTokenize(140));
+    AssertEquals('far past the end decodes to empty',
+      '', T.DeTokenize(100000));
+  finally
+    T.Free;
+  end;
+end;
+
+procedure TTestNeuralTokenizer.TestIntegerToWordWithoutSaveCurrentPosition;
+var
+  L: TStringListInt;
+begin
+  // FIntegerToStr is sized only by SaveCurrentPosition, so skipping it leaves
+  // every id out of range.
+  L := TStringListInt.Create;
+  try
+    L.Add('alpha');
+    L.Add('beta');
+    AssertEquals('id 0 without SaveCurrentPosition', '', L.IntegerToWord(0));
+    AssertEquals('id 1 without SaveCurrentPosition', '', L.IntegerToWord(1));
+    AssertEquals('DeTokenize without SaveCurrentPosition', '', L.DeTokenize(0));
+  finally
+    L.Free;
+  end;
+end;
+
+procedure TTestNeuralTokenizer.TestDeTokenizeNegativeId;
+var
+  T: TNeuralTokenizer;
+begin
+  T := BuildTokenizer();
+  try
+    AssertEquals('negative id decodes to empty', '', T.DeTokenize(-1));
+    AssertEquals('large negative id decodes to empty', '', T.DeTokenize(-9999));
+  finally
+    T.Free;
+  end;
+end;
+
+procedure TTestNeuralTokenizer.TestIntegerArrayToStringSkipsOutOfRangeIds;
+var
+  L: TStringListInt;
+  IntArr: TNeuralIntegerArray;
+begin
+  L := TStringListInt.Create;
+  try
+    L.Add('alpha');
+    L.Add('beta');
+    L.SaveCurrentPositionAndSort();
+    SetLength(IntArr, 3);
+    IntArr[0] := 0;
+    IntArr[1] := 99;   // past the end of the dictionary
+    IntArr[2] := 1;
+    AssertEquals('out of range id contributes an empty word',
+      'alpha  beta', L.IntegerArrayToString(IntArr));
+  finally
+    SetLength(IntArr, 0);
+    L.Free;
   end;
 end;
 

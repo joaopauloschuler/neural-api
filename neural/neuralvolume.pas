@@ -5644,7 +5644,21 @@ end;
 
 function TStringListInt.IntegerToWord(pInteger: integer): string;
 begin
-  Result := FIntegerToStr[pInteger];
+  // Single guarded accessor for FIntegerToStr. The array is sized only by
+  // SaveCurrentPosition, so it is empty until that runs, and a sampled token id
+  // can exceed the dictionary whenever the net output is wider than the vocab.
+  // Generation must not die on either, so an unknown id yields no text.
+  if (pInteger >= 0) and (pInteger < Length(FIntegerToStr)) then
+  begin
+    Result := FIntegerToStr[pInteger];
+  end
+  else
+  begin
+    Result := '';
+    {$IFDEF DEBUG}
+    WriteLn('Token '+IntToStr(pInteger)+' is bigger than dictionary '+IntToStr(Length(FIntegerToStr))+' at IntegerToWord.');
+    {$ENDIF}
+  end;
 end;
 
 function TStringListInt.DeTokenize(TokenId: integer): string;
@@ -5774,7 +5788,7 @@ begin
       //WriteLn(WordIndex,':',FTokenizer[WordCount]);
       if WordInteger >= 0 then
       begin
-        FTokenizer.Add(FIntegerToStr[WordInteger]);
+        FTokenizer.Add(IntegerToWord(WordInteger));
       end;
     end;
   end;
