@@ -57,6 +57,13 @@ type
     procedure TestNFKDFoldsCompatibilityForms;
     procedure TestNFKCNormalizerFoldsTokenIds;
     procedure TestNFCNormalizerFoldsTokenIds;
+    // Encode's added-token scan is gated by a first-byte table; the gate
+    // must find a token that starts with an ordinary letter, must still
+    // prefer the LONGEST match, and must not be opened by an empty token.
+    procedure TestAddedTokenScanFindsNonBracketToken;
+    // BertNormalizer handle_chinese_chars wraps every CJK ideograph in
+    // spaces, so it is the one stage that LENGTHENS the normalized text.
+    procedure TestBertNormalizerPadsCJKAndLowercases;
     procedure TestWordPieceSpecialTokenIds;
     procedure TestDuplicateVocabPieceKeepsLastId;
     procedure TestByteLevelSpecialTokenIds;
@@ -897,6 +904,77 @@ begin
       Tok.TokenToId('a'));
     AssertEquals('non-duplicate piece is unaffected', 2, Tok.TokenToId('b'));
     AssertEquals('id space spans every array entry', 4, Tok.GetVocabSize());
+  finally
+    Tok.Free;
+    SL.Free;
+    DeleteFile(TempFile);
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestAddedTokenScanFindsNonBracketToken;
+var
+  Tok: TNeuralHFTokenizer;
+  Ids: TNeuralIntegerArray;
+  TempFile: string;
+  SL: TStringList;
+begin
+  TempFile := GetTempDir(true) + 'added_gate_tokenizer.json';
+  SL := TStringList.Create();
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    SL.Text := '{"added_tokens": ['
+      + '{"id": 3, "content": "HEY", "special": true},'
+      + '{"id": 4, "content": "HEYA", "special": true},'
+      + '{"id": 5, "content": "", "special": true}],'
+      + ' "model": {"type": "BPE", "vocab":'
+      + ' {"a": 0, "b": 1, "c": 2, "HEY": 3, "HEYA": 4}, "merges": []}}';
+    SL.SaveToFile(TempFile);
+    Tok.LoadFromFile(TempFile);
+    Ids := Tok.Encode('aHEYAb');
+    AssertEquals('token count', 3, Length(Ids));
+    AssertEquals('leading a', 0, Ids[0]);
+    AssertEquals('longest added token wins', 4, Ids[1]);
+    AssertEquals('trailing b', 1, Ids[2]);
+    // the shorter added token is still reachable on its own
+    Ids := Tok.Encode('HEYb');
+    AssertEquals('short token count', 2, Length(Ids));
+    AssertEquals('short added token', 3, Ids[0]);
+    AssertEquals('after short token', 1, Ids[1]);
+  finally
+    Tok.Free;
+    SL.Free;
+    DeleteFile(TempFile);
+  end;
+end;
+
+procedure TTestNeuralHFTokenizer.TestBertNormalizerPadsCJKAndLowercases;
+var
+  Tok: TNeuralHFTokenizer;
+  Ids: TNeuralIntegerArray;
+  TempFile: string;
+  SL: TStringList;
+begin
+  TempFile := GetTempDir(true) + 'bert_cjk_tokenizer.json';
+  SL := TStringList.Create();
+  Tok := TNeuralHFTokenizer.Create();
+  try
+    SL.Text := '{"model": {"type": "WordPiece", "unk_token": "[UNK]",'
+      + ' "continuing_subword_prefix": "##",'
+      + ' "max_input_chars_per_word": 100, "vocab":'
+      + ' {"[UNK]": 0, "ab": 1, "\u4e2d": 2, "\u6587": 3}},'
+      + ' "normalizer": {"type": "BertNormalizer", "clean_text": true,'
+      + ' "handle_chinese_chars": true, "strip_accents": false,'
+      + ' "lowercase": true},'
+      + ' "pre_tokenizer": {"type": "BertPreTokenizer"}}';
+    SL.SaveToFile(TempFile);
+    Tok.LoadFromFile(TempFile);
+    // 'AB' lowercases to a single vocab piece; each CJK ideograph is padded
+    // with spaces and so becomes a piece of its own.
+    Ids := Tok.Encode('AB' + #$E4#$B8#$AD + #$E6#$96#$87);
+    AssertEquals('token count', 3, Length(Ids));
+    AssertEquals('lowercased ab', 1, Ids[0]);
+    AssertEquals('first ideograph', 2, Ids[1]);
+    AssertEquals('second ideograph', 3, Ids[2]);
   finally
     Tok.Free;
     SL.Free;

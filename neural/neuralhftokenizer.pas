@@ -598,6 +598,40 @@ begin
       Chr($80 or ((CP shr 6) and $3F)) + Chr($80 or (CP and $3F));
 end;
 
+// Writes CP as UTF-8 into a preallocated buffer at the 0-based OutPos and
+// advances it. Same encoding as CodePointToUTF8, without that function's
+// per-codepoint string allocation.
+procedure HFWriteCodePointUTF8(P: PAnsiChar; var OutPos: integer;
+  CP: cardinal); inline;
+begin
+  if CP < $80 then
+  begin
+    P[OutPos] := Chr(CP);
+    Inc(OutPos);
+  end
+  else if CP < $800 then
+  begin
+    P[OutPos] := Chr($C0 or (CP shr 6));
+    P[OutPos + 1] := Chr($80 or (CP and $3F));
+    Inc(OutPos, 2);
+  end
+  else if CP < $10000 then
+  begin
+    P[OutPos] := Chr($E0 or (CP shr 12));
+    P[OutPos + 1] := Chr($80 or ((CP shr 6) and $3F));
+    P[OutPos + 2] := Chr($80 or (CP and $3F));
+    Inc(OutPos, 3);
+  end
+  else
+  begin
+    P[OutPos] := Chr($F0 or (CP shr 18));
+    P[OutPos + 1] := Chr($80 or ((CP shr 12) and $3F));
+    P[OutPos + 2] := Chr($80 or ((CP shr 6) and $3F));
+    P[OutPos + 3] := Chr($80 or (CP and $3F));
+    Inc(OutPos, 4);
+  end;
+end;
+
 { ---------------------------------------------------------------- }
 { Unicode canonical normalization (NFD / NFC)                       }
 {                                                                   }
@@ -1447,6 +1481,10 @@ var
 begin
   Result := Key;
   if (ShieldedKeys = nil) or (ShieldedKeys.Count = 0) then exit;
+  // Every placeholder HFShieldLongJSONKeys writes starts with the '~'-prefixed
+  // marker, so any other key -- i.e. essentially the whole vocab, one call per
+  // entry -- is rejected here without the Pos scan and Copy below.
+  if (Key = '') or (Key[1] <> '~') then exit;
   CntMax := ShieldedKeys.Count - 1;
   KeyLen := Length(Key);
   for Cnt := 0 to CntMax do
@@ -3882,7 +3920,6 @@ procedure TNeuralHFTokenizer.EmitTokenOrFallback(const Symbol: string;
   Ids: TIntegerList);
 var
   TokenId, Cnt, SymbolLen, StartCount: integer;
-  ByteToken: string;
 begin
   TokenId := VocabFind(Symbol);
   if TokenId >= 0 then
@@ -3892,16 +3929,19 @@ begin
   end;
   if FByteFallback then
   begin
+    // Byte-piece id table is built once per load (immutable vocab), so a
+    // fallback byte is an array read instead of a '<0xNN>' string build plus
+    // a 151k-entry binary search.
+    if not FBytePieceTableBuilt then BuildBytePieceTable();
     SymbolLen := Length(Symbol);
-    // #4: single pass with rollback -> VocabFind once per byte instead of
-    // twice. Emit each byte token as it is found; if any is missing, restore
-    // Ids to its entry length and fall back to <unk> (unchanged semantics:
-    // no partial byte run is ever left behind).
+    // #4: single pass with rollback -> one lookup per byte instead of two.
+    // Emit each byte token as it is found; if any is missing, restore Ids to
+    // its entry length and fall back to <unk> (unchanged semantics: no
+    // partial byte run is ever left behind).
     StartCount := Ids.Count;
     for Cnt := 1 to SymbolLen do
     begin
-      ByteToken := '<0x' + IntToHex(Ord(Symbol[Cnt]), 2) + '>';
-      TokenId := VocabFind(ByteToken);
+      TokenId := FBytePieceId[Ord(Symbol[Cnt])];
       if TokenId < 0 then
       begin
         Ids.Count := StartCount;
@@ -4193,12 +4233,20 @@ end;
 // \t\n\r to spaces; handle_chinese_chars pads CJK ideographs with spaces.
 function TNeuralHFTokenizer.BertNormalize(const Segment: string): string;
 var
-  Position, SegLen: integer;
+  Position, SegLen, OutPos: integer;
   CP, Base: cardinal;
+  PBuf: PAnsiChar;
 begin
-  Result := '';
-  Position := 1;
   SegLen := Length(Segment);
+  // #23: one SetLength to a justified bound, a carried write index, one final
+  // truncate. Only handle_chinese_chars lengthens the text -- it wraps a CJK
+  // ideograph (3 or 4 UTF-8 bytes) in two spaces -- and neither accent
+  // stripping nor lowercasing ever grows a codepoint's encoding, so 2 * SegLen
+  // bounds the output.
+  SetLength(Result, SegLen * 2);
+  PBuf := PAnsiChar(Result);
+  OutPos := 0;
+  Position := 1;
   while Position <= SegLen do
   begin
     CP := NextCodePoint(Segment, Position);
@@ -4210,7 +4258,11 @@ begin
     end;
     if FBertHandleChinese and IsCJKIdeographCP(CP) then
     begin
-      Result := Result + ' ' + CodePointToUTF8(CP) + ' ';
+      PBuf[OutPos] := ' ';
+      Inc(OutPos);
+      HFWriteCodePointUTF8(PBuf, OutPos, CP);
+      PBuf[OutPos] := ' ';
+      Inc(OutPos);
       continue;
     end;
     if FBertStripAccents then
@@ -4220,8 +4272,9 @@ begin
       if Base <> 0 then CP := Base;
     end;
     if FBertLowercase then CP := LowercaseCP(CP);
-    Result := Result + CodePointToUTF8(CP);
+    HFWriteCodePointUTF8(PBuf, OutPos, CP);
   end;
+  SetLength(Result, OutPos);
 end;
 
 // BertPreTokenizer: split on whitespace, then isolate every punctuation
@@ -4229,11 +4282,13 @@ end;
 procedure TNeuralHFTokenizer.BertPieces(const Segment: string;
   Pieces: TStringList);
 var
-  Position, RunStart, SegLen: integer;
+  Position, RunStart, RunFrom, SegLen: integer;
   CP: cardinal;
-  Current: string;
 begin
-  Current := '';
+  // #23: a word is a CONTIGUOUS run of Segment, so it is sliced with one Copy
+  // when it ends instead of being accumulated codepoint by codepoint.
+  // RunFrom = 0 means no run is open.
+  RunFrom := 0;
   Position := 1;
   SegLen := Length(Segment);
   while Position <= SegLen do
@@ -4242,19 +4297,21 @@ begin
     CP := NextCodePoint(Segment, Position);
     if IsWhitespaceCP(CP) then
     begin
-      if Current <> '' then Pieces.Add(Current);
-      Current := '';
+      if RunFrom > 0 then
+        Pieces.Add(Copy(Segment, RunFrom, RunStart - RunFrom));
+      RunFrom := 0;
     end
     else if IsBertPunctuationCP(CP) then
     begin
-      if Current <> '' then Pieces.Add(Current);
-      Current := '';
+      if RunFrom > 0 then
+        Pieces.Add(Copy(Segment, RunFrom, RunStart - RunFrom));
+      RunFrom := 0;
       Pieces.Add(Copy(Segment, RunStart, Position - RunStart));
     end
-    else
-      Current := Current + Copy(Segment, RunStart, Position - RunStart);
+    else if RunFrom = 0 then
+      RunFrom := RunStart;
   end;
-  if Current <> '' then Pieces.Add(Current);
+  if RunFrom > 0 then Pieces.Add(Copy(Segment, RunFrom, Position - RunFrom));
 end;
 
 // Greedy longest-match-first WordPiece over one pre-tokenized word:
