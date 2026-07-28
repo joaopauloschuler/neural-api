@@ -9300,10 +9300,13 @@ type
     private
       FNumFilters, FKernelSize, FStride: integer;
       FSampleRate: TNeuralFloat;
-      FBank: TNNetVolume;     // materialized kernels, (KernelSize,1,NumFilters)
+      // Materialized kernels, FILTER-major (NumFilters,1,KernelSize): filter f's
+      // KernelSize taps are contiguous at f*KernelSize. The signal they multiply
+      // is contiguous too, so every consumer is a DotProduct/MulAdd over a run.
+      FBank: TNNetVolume;
       FWindow: TNNetVolume;   // Hamming window, (KernelSize,1,1)
       FGradS: TNNetVolume;    // (NumFilters,1,2) scalar grad accumulator
-      FGBank: TNNetVolume;    // persistent per-tap kernel-grad scratch (KernelSize,1,NumFilters)
+      FGBank: TNNetVolume;    // per-tap kernel-grad scratch, FBank's layout
       // Snapshot of the (NumFilters,1,2) (low,band) scalars FBank was built from.
       // The bank is a pure function of them, so the forward only has to
       // rematerialize when one of them differs: 2*NumFilters compares instead of
@@ -63270,7 +63273,7 @@ begin
     FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
     FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
   end;
-  FBank.ReSize(FKernelSize, 1, FNumFilters);
+  FBank.ReSize(FNumFilters, 1, FKernelSize);
   FWindow.ReSize(FKernelSize, 1, 1);
   FGradS.ReSize(FNumFilters, 1, 2);
   FBankSrc.ReSize(FNumFilters, 1, 2);
@@ -63307,16 +63310,15 @@ begin
     WPtr := W.GetRawPtr(f, 0);
     fLow  := Abs(WPtr^[0]) / FSampleRate;            // cycles/sample
     fHigh := fLow + Abs(WPtr^[1]) / FSampleRate;     // f_high = f_low + band
-    // FBank is (KernelSize,1,NumFilters): tap n of filter f is at n*NumFilters+f.
-    bpos := f;
+    // Filter f's taps occupy the contiguous run at f*KernelSize.
+    bpos := f * FKernelSize;
     for n := 0 to KernelSizeM1 do
     begin
       tap := n - half;  // symmetric tap index
       // g[n] = 2*f_high*sinc(2*pi*f_high*tap) - 2*f_low*sinc(2*pi*f_low*tap)
       gv := 2 * fHigh * SincConvSinc(2 * Pi * fHigh * tap)
           - 2 * fLow  * SincConvSinc(2 * Pi * fLow  * tap);
-      FBank.FData[bpos] := gv * FWindow.FData[n];
-      Inc(bpos, FNumFilters);
+      FBank.FData[bpos + n] := gv * FWindow.FData[n];
     end;
   end;
 end;
@@ -63375,18 +63377,13 @@ begin
   begin
     baseIn := ot * FStride;
     obase := ot * FNumFilters;
+    bpos := 0;
     for f := 0 to NumFiltersM1 do
     begin
-      acc := 0;
-      // FBank is (KernelSize,1,NumFilters): tap k of filter f is at k*NumFilters+f;
-      // carry that strided offset instead of a GetRawPos per tap.
-      bpos := f;
-      for k := 0 to KernelSizeM1 do
-      begin
-        acc := acc + BankPtr^[bpos] * XPtr^[baseIn + k];
-        Inc(bpos, FNumFilters);
-      end;
-      OutPtr^[obase + f] := acc;
+      // Filter f's taps and the signal window are both contiguous runs.
+      OutPtr^[obase + f] :=
+        TNNetVolume.DotProduct(@BankPtr^[bpos], @XPtr^[baseIn], FKernelSize);
+      Inc(bpos, FKernelSize);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -63439,27 +63436,26 @@ begin
   // Accumulate per-tap kernel gradient dL/dBank[k,f] over the conv, plus the
   // input gradient (transpose of the conv) using the CURRENT materialized bank.
   if FGBank.Size <> FKernelSize * FNumFilters then
-    FGBank.ReSize(FKernelSize, 1, FNumFilters);
+    FGBank.ReSize(FNumFilters, 1, FKernelSize);
   FGBank.Fill(0);
   for ot := 0 to ToutM1 do
   begin
     baseIn := ot * FStride;
     errBase := FOutputError.GetRawPos(ot, 0);
+    bpos := 0;
     for f := 0 to NumFiltersM1 do
     begin
       gy := FOutputError.FData[errBase + f];
-      if gy = 0 then continue;
-      // FGBank/FBank share shape (KernelSize,1,NumFilters): tap k of filter f is
-      // at k*NumFilters+f; carry that strided offset.
-      bpos := f;
-      for k := 0 to KernelSizeM1 do
+      if gy <> 0 then
       begin
-        xk := baseIn + k;
-        FGBank.FData[bpos] := FGBank.FData[bpos] + gy * XPtr^[xk];
+        // FGBank shares FBank's filter-major layout, so both the kernel-grad
+        // accumulate and the input scatter run over contiguous KernelSize runs.
+        TNNetVolume.MulAdd(@FGBank.FData[bpos], @XPtr^[baseIn], gy, FKernelSize);
         if hasInputGrad then
-          PrevErrPtr^[xk] := PrevErrPtr^[xk] + gy * FBank.FData[bpos];
-        Inc(bpos, FNumFilters);
+          TNNetVolume.MulAdd(@PrevErrPtr^[baseIn], @FBank.FData[bpos], gy,
+            FKernelSize);
       end;
+      Inc(bpos, FKernelSize);
     end;
   end;
 
@@ -63473,19 +63469,18 @@ begin
     fLow  := Abs(WPtr^[0]) / FSampleRate;
     fHigh := fLow + Abs(WPtr^[1]) / FSampleRate;
     dLow := 0; dHigh := 0;
-    // FGBank is (KernelSize,1,NumFilters): element [n,0,f] at n*NumFilters+f.
-    gbpos := f;
+    // Filter f's taps occupy the contiguous run at f*KernelSize.
+    gbpos := f * FKernelSize;
     for n := 0 to KernelSizeM1 do
     begin
       tap := n - half;
       win := FWindow.FData[n];
-      gk := FGBank.FData[gbpos] * win;
+      gk := FGBank.FData[gbpos + n] * win;
       // g[n] = high_term(f_high) - low_term(f_low) (each = 2*f*sinc(2*pi*f*tap))
       dgdHighN := DTermDf(fHigh, tap);    // d g / d f_high
       dgdLowN  := -DTermDf(fLow, tap);    // d g / d f_low (negative term)
       dHigh := dHigh + gk * dgdHighN;
       dLow  := dLow  + gk * dgdLowN;
-      Inc(gbpos, FNumFilters);
     end;
     // f_high = f_low + band: dL/df_low gets BOTH paths; dL/dband only via high.
     // Both f_low and band enter as (1/sr)*|raw|, so chain 1/sr and the sign.
