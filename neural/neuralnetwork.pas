@@ -3066,7 +3066,7 @@ type
     // used) without touching the quantization math or any gradient.
     FUsageCount: array of integer;
     // Per-code ||w||^2 scratch (rule #17 persistent field, mirrors ArcFace
-    // FWNormArrBuf): recomputed once per Compute() call, not per (X,Y).
+    // FInvWNormArrBuf): recomputed once per Compute() call, not per (X,Y).
     FWSqBuf: array of TNeuralFloat;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
@@ -3245,10 +3245,10 @@ type
   // Coded by Claude (AI).
   TNNetArcFace = class(TNNetIdentity)
   private
-    // Per-instance backward scratch (CosArr/ANorm/ProbArr/WNormArr sized K =
+    // Per-instance backward scratch (CosArr/ANorm/ProbArr/InvWNormArr sized K =
     // number of classes; GradX sized D = embedding dim, set in SetPrevLayer)
     // to avoid per-pass heap allocation in the hot path.
-    FCosArrBuf, FANormBuf, FProbArrBuf, FWNormArrBuf: array of TNeuralFloat;
+    FCosArrBuf, FANormBuf, FProbArrBuf, FInvWNormArrBuf: array of TNeuralFloat;
     FGradXBuf: array of TNeuralFloat;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure FreeBackpropScratch();
@@ -28536,7 +28536,7 @@ begin
     SetLength(FCosArrBuf, K);
     SetLength(FANormBuf, K);
     SetLength(FProbArrBuf, K);
-    SetLength(FWNormArrBuf, K);
+    SetLength(FInvWNormArrBuf, K);
     SetLength(FGradXBuf, D);
   end;
 end;
@@ -28546,7 +28546,7 @@ begin
   SetLength(FCosArrBuf, 0);
   SetLength(FANormBuf, 0);
   SetLength(FProbArrBuf, 0);
-  SetLength(FWNormArrBuf, 0);
+  SetLength(FInvWNormArrBuf, 0);
   SetLength(FGradXBuf, 0);
 end;
 
@@ -28597,7 +28597,9 @@ begin
     W := FArrNeurons[Kk].FWeights;
     WNorm := Sqrt(TNNetVolume.DotProduct(W.GetRawPtr(0), W.GetRawPtr(0), D));
     if WNorm < 1e-12 then WNorm := 1e-12;
-    FWNormArrBuf[Kk] := WNorm;
+    // Store the RECIPROCAL: every consumer below divides by the norm, so the
+    // whole X/Y/class nest turns two divides per class into two multiplies.
+    FInvWNormArrBuf[Kk] := 1.0 / WNorm;
   end;
   for X := 0 to MaxX do
     for Y := 0 to MaxY do
@@ -28618,9 +28620,9 @@ begin
       for Kk := 0 to KM1 do
       begin
         W := FArrNeurons[Kk].FWeights;
-        WNorm := FWNormArrBuf[Kk];
+        InvW := FInvWNormArrBuf[Kk];
         Dot := TNNetVolume.DotProduct(xPtr, W.GetRawPtr(0), D);
-        CosT := Dot * InvXNorm / WNorm;
+        CosT := Dot * InvXNorm * InvW;
         // Clamp for numerical safety (acos/sqrt domain).
         if CosT > 1.0 then CosT := 1.0;
         if CosT < -1.0 then CosT := -1.0;
@@ -28682,8 +28684,7 @@ begin
 
         WeightNeuron := FArrNeurons[Kk];
         W := WeightNeuron.FWeights;
-        WNorm := FWNormArrBuf[Kk];
-        InvW := 1.0 / WNorm;
+        InvW := FInvWNormArrBuf[Kk];
         wPtr := W.GetRawPtr(0);
         deltaPtr := WeightNeuron.FDelta.GetRawPtr(0);
         // d(cos)/dx   = (W_hat - cos * x_hat) / ||x||
