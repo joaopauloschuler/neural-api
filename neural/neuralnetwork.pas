@@ -452,7 +452,7 @@ type
       // Newton-Schulz iteration scratch. Freed in the destructor. (Coded by
       // Claude (AI).)
       FMuonMmat, FMuonOmat: TNNetVolume;
-      FMuonX, FMuonXt, FMuonA, FMuonAX, FMuonA2X, FMuonB, FMuonQt: TNNetVolume;
+      FMuonX, FMuonA, FMuonAX, FMuonA2X, FMuonB, FMuonQt: TNNetVolume;
 
       procedure InitStruct();
     private
@@ -124449,7 +124449,7 @@ begin
   if Assigned(FMuonMmat) then
   begin
     FMuonMmat.Free; FMuonOmat.Free;
-    FMuonX.Free; FMuonXt.Free; FMuonA.Free; FMuonAX.Free;
+    FMuonX.Free; FMuonA.Free; FMuonAX.Free;
     FMuonA2X.Free; FMuonB.Free; FMuonQt.Free;
   end;
   inherited Destroy();
@@ -126232,25 +126232,33 @@ begin
   end;
 end;
 
+// Dst (R x C) := P (R x I) * Qt^T, where Qt (C x I) is the RIGHT operand already
+// transposed. DotProducts STORES out[b*NumAs + a] (it only zero-fills under its
+// NoForward flag, which is off here) and every (b,a) in range is written, so Dst
+// needs no pre-clear.
+procedure MuonMatMulT(Dst, P, Qt: TNNetVolume; R, I, C: integer);
+begin
+  Dst.ReSize(R * C, 1, 1);
+  Dst.DotProducts({NumAs=}C, {NumBs=}R, {VectorSize=}I, {VAs=}Qt, {VBs=}P);
+end;
+
 // Dst (R x C) := P (R x I) * Q (I x C). Qt scratch holds Q^T (C x I).
 procedure MuonMatMul(Dst, P, Q, Qt: TNNetVolume; R, I, C: integer);
 begin
   MuonMatTranspose(Qt, Q, I, C);
-  Dst.ReSize(R * C, 1, 1);
-  Dst.Fill(0);
-  Dst.DotProducts({NumAs=}C, {NumBs=}R, {VectorSize=}I, {VAs=}Qt, {VBs=}P);
+  MuonMatMulT(Dst, P, Qt, R, I, C);
 end;
 
 // O := NewtonSchulz5(M), both packed (Rows x Cols). Drives the singular values
 // toward 1 (semi-orthogonal) with NSIters quintic iterations on the
 // Frobenius-normalized X = M/||M||_F:  X <- a*X + b*(X X^T)X + c*(X X^T)^2 X
 // with the paper's coefficients (a,b,c) = (3.4445, -4.7750, 2.0315).
-// The seven scratch volumes (X..Qt) are caller-owned persistent buffers (see
+// The six scratch volumes (X..Qt) are caller-owned persistent buffers (see
 // TNNetLayer.FMuonX..FMuonQt) so this per-training-step routine allocates
 // nothing (guide rule #17); they are lazily resized by the Copy/ReSize calls
 // inside.
 procedure MuonNewtonSchulz5(O, M: TNNetVolume; Rows, Cols, NSIters: integer;
-  X, Xt, A, AX, A2X, B, Qt: TNNetVolume);
+  X, A, AX, A2X, B, Qt: TNNetVolume);
 const
   cNS_a = 3.4445; cNS_b = -4.7750; cNS_c = 2.0315;
 var
@@ -126264,8 +126272,9 @@ begin
 
   for Iter := 1 to NSIters do
   begin
-    MuonMatTranspose(Xt, X, Rows, Cols);          // Xt = X^T (Cols x Rows)
-    MuonMatMul(A, X, Xt, Qt, Rows, Cols, Rows);   // A = X X^T (Rows x Rows)
+    // A = X X^T. MuonMatMulT wants the RIGHT operand pre-transposed, and the
+    // right operand here is X^T -- whose transpose is X itself, already to hand.
+    MuonMatMulT(A, X, X, Rows, Cols, Rows);       // A = X X^T (Rows x Rows)
     MuonMatMul(AX, A, X, Qt, Rows, Rows, Cols);   // AX = A X
     MuonMatMul(A2X, A, AX, Qt, Rows, Rows, Cols); // A2X = A (A X)
     B.Copy(X);
@@ -126349,7 +126358,6 @@ begin
     FMuonMmat := TNNetVolume.Create();
     FMuonOmat := TNNetVolume.Create();
     FMuonX   := TNNetVolume.Create();
-    FMuonXt  := TNNetVolume.Create();
     FMuonA   := TNNetVolume.Create();
     FMuonAX  := TNNetVolume.Create();
     FMuonA2X := TNNetVolume.Create();
@@ -126374,7 +126382,7 @@ begin
   end;
 
   MuonNewtonSchulz5(Omat, Mmat, Rows, Cols, NSIters,
-    FMuonX, FMuonXt, FMuonA, FMuonAX, FMuonA2X, FMuonB, FMuonQt);
+    FMuonX, FMuonA, FMuonAX, FMuonA2X, FMuonB, FMuonQt);
 
   // FDelta <- -lr * sqrt(max(rows,cols)) * O_row, so UpdateWeightsAdam applies
   // W <- W - lr*Scale*O. Biases (1-D) get the SGD-momentum fallback.
