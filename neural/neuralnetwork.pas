@@ -8212,6 +8212,9 @@ type
       FGxBuf, FNxBuf, FCoefBuf: array of TNeuralFloat;
       FdL_dNBuf, FdL_dGBuf, FsumGyXBuf, FgradBetaBuf,
         FTermBuf: array of TNeuralFloat;
+      // Channel-mean of Gx, the one forward scalar the backward needs beyond
+      // FGxBuf/FNxBuf.
+      FMeanG: TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure FreeBackpropScratch();
     public
@@ -54897,7 +54900,7 @@ begin
   SetLength(FGxBuf, FOutput.Depth);
   SetLength(FNxBuf, FOutput.Depth);
   SetLength(FCoefBuf, FOutput.Depth);
-  // FGxBuf/FNxBuf/FCoefBuf are forward caches (also recomputed in backward); the
+  // FGxBuf/FNxBuf/FCoefBuf are forward caches read back by the backward; the
   // rest is backprop-only scratch: skip on inference-only layers.
   if FIsTrainable then
   begin
@@ -54956,6 +54959,7 @@ begin
     meanG := meanG + FGxBuf[c];
   end;
   meanG := meanG / Depth;
+  FMeanG := meanG;
   // Avoid division by zero (Gx is always >= sqrt(eps) > 0, so meanG > 0).
   // #5: hoist the reciprocal so the per-channel loop multiplies instead of divides.
   invG := 1.0 / meanG;
@@ -54981,18 +54985,16 @@ begin
 end;
 
 procedure TNNetGRN.Backpropagate();
-const
-  cEps = 1e-6;
 var
   StartTime: double;
   Ng, Nb: TNNetNeuron;
   Wg: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
-  SizeX, SizeY, Depth, SizeXM1, SizeYM1, DepthM1, x, y, c: integer;
+  SizeX, SizeY, Depth, DepthM1, c: integer;
   pos, k, NumPixM1: integer;
-  meanG, dL_dM, invG: TNeuralFloat;
+  meanG, dL_dM: TNeuralFloat;
   hasInputGrad: boolean;
-  P, GyPtr, PrevErrPtr, CoefPtr, TermPtr: TNeuralFloatArrPtr;
+  GyPtr, PrevErrPtr, CoefPtr, TermPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -55009,30 +55011,16 @@ begin
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
-  SizeXM1 := SizeX - 1;
-  SizeYM1 := SizeY - 1;
   DepthM1 := Depth - 1;
 
-  // Recompute Gx, Nx, meanG (forward state not cached).
+  // #27: Gx, Nx and meanG are exactly what the forward left in FGxBuf, FNxBuf
+  // and FMeanG. They are private fields written only by this layer's Compute
+  // and Backpropagate, the layer is not chunk-eligible and has no incremental
+  // path, and the backward already assumes FPrevLayer.FOutput still holds the
+  // input of the last forward -- so reusing them adds no assumption and saves
+  // a full pass over the volume.
   NumPixM1 := SizeX * SizeY - 1;
-  FillDWord(FGxBuf[0], DepthM1 + 1, 0);   // #13
-  for x := 0 to SizeXM1 do
-    for y := 0 to SizeYM1 do
-    begin
-      P := Prev.GetRawPtr(x, y);   // #4: bind the column pointer once
-      TNNetVolume.MulAdd(@FGxBuf[0], P, P, Depth);
-    end;
-  meanG := 0;
-  for c := 0 to DepthM1 do
-  begin
-    FGxBuf[c] := Sqrt(FGxBuf[c] + cEps);
-    meanG := meanG + FGxBuf[c];
-  end;
-  meanG := meanG / Depth;
-  // #5: hoist the reciprocal (same as forward) so the loop multiplies.
-  invG := 1.0 / meanG;
-  Move(FGxBuf[0], FNxBuf[0], Depth * csNeuralFloatSize);
-  TNNetVolume.Mul(@FNxBuf[0], invG, Depth);
+  meanG := FMeanG;
 
   // Weight gradients and helper accumulators per channel:
   //   sumGyX[c] = sum_{x,y} gy[x,y,c] * X[x,y,c]
