@@ -10473,6 +10473,7 @@ type
       FDepth: integer;            // resolved in SetPrevLayer
       FTheta: TNeuralFloat;       // fixed window length (build-time constant)
       FAbar: TNNetVolume;         // discretized transition matrix, (Order,1,Order) [i,0,j]
+      FAbarT: TNNetVolume;        // transpose of FAbar; the BPTT carry is Abar^T*g
       FBbar: TNNetVolume;         // discretized input vector, Order-long
       FM: TNNetVolume;            // cached memory m_t, (SeqLen,Depth,Order)
       FMcur, FMprev: TNNetVolume; // running memory vectors, (Depth,1,Order) scratch
@@ -65716,6 +65717,7 @@ begin
   FStruct[0] := FOrder;
   FFloatSt[0] := FTheta;
   FAbar := TNNetVolume.Create();
+  FAbarT := TNNetVolume.Create();
   FBbar := TNNetVolume.Create();
   FM := TNNetVolume.Create();
   FMcur := TNNetVolume.Create();
@@ -65736,6 +65738,7 @@ begin
   FMcur.Free;
   FM.Free;
   FBbar.Free;
+  FAbarT.Free;
   FAbar.Free;
   inherited Destroy();
 end;
@@ -65773,6 +65776,15 @@ begin
     // B[i] = (2i+1)*(-1)^i  ->  Bbar = (1/theta)*B
     if (i and 1) = 0 then sgn := 1.0 else sgn := -1.0;
     FBbar.FData[i] := scale * twoIp1 * sgn;
+  end;
+  // The BPTT carry is dL/dm_{t-1} = Abar^T * dL/dm_t, a column walk of Abar.
+  // Materialize the transpose once here so that carry is a contiguous DotProduct.
+  FAbarT.ReSize(FOrder, 1, FOrder);
+  for i := 0 to OrderM1 do
+  begin
+    iOrder := i * FOrder;
+    for j := 0 to OrderM1 do
+      FAbarT.FData[iOrder + j] := FAbar.FData[j * FOrder + i];
   end;
 end;
 
@@ -65856,11 +65868,11 @@ procedure TNNetLegendreMemoryUnit.Backpropagate();
 var
   StartTime: double;
   Wout: TNNetVolume;
-  SeqLen, t, d, n, mm, baseT, baseDN, baseW, SeqLenM1, pos, DepthOrder: integer;
+  SeqLen, t, d, mm, baseT, baseDN, baseW, SeqLenM1, pos, DepthOrder: integer;
   DepthM1, OrderM1: integer;
   hasInputGrad: boolean;
   GyPtr, PrevErrPtr: TNeuralFloatArrPtr;
-  gy, gin, gmn: TNeuralFloat;
+  gy, gin: TNeuralFloat;
   PrevErr: TNNetVolume;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -65907,17 +65919,15 @@ begin
       if hasInputGrad then PrevErrPtr^[d] := PrevErrPtr^[d] + gin;
       // Carry: dL/dm_{t-1}[d,nn] = sum_n Abar[n,nn] * dL/dm_t[d,n]  (= Abar^T g).
       if t > 0 then
+      begin
+        pos := 0;
         for mm := 0 to OrderM1 do
         begin
-          gmn := 0;
-          pos := mm;
-          for n := 0 to OrderM1 do
-          begin
-            gmn := gmn + FAbar.FData[pos] * FGm.FData[baseW + n];
-            Inc(pos, FOrder);
-          end;
-          FGmNext.FData[baseW + mm] := gmn;
+          FGmNext.FData[baseW + mm] :=
+            TNNetVolume.DotProduct(@FAbarT.FData[pos], @FGm.FData[baseW], FOrder);
+          Inc(pos, FOrder);
         end;
+      end;
     end;
   end;
   // Flush -FLearningRate-scaled grad into the read-out neuron delta.
