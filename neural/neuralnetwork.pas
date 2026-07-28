@@ -94009,8 +94009,8 @@ var
   CntX, CntY, CntD, dx, dy: integer;
   PoolSizeMax: integer;
   MaxX, MaxY, MaxD, InX, InY: integer;
-  RawPos, baseMap, baseIn: integer;
-  CurrVal, BestVal: TNeuralFloat;
+  RawPos, InPos, baseMap, baseIn: integer;
+  CurrVal: TNeuralFloat;
   Input: TNNetVolume;
 begin
   Input := FPrevLayer.Output;
@@ -94018,33 +94018,43 @@ begin
   MaxY := Input.SizeY - 1;
   MaxD := Input.Depth - 1;
   PoolSizeMax := FPoolSize - 1;
+  // Tap validity and the two window bases are invariant across the depth axis,
+  // so the tap loop sits ABOVE CntD (matching the sibling TNNetMaxBlurPool.Compute
+  // and TNNetBlurPool.Compute nests): each valid tap then walks one contiguous
+  // depth run of the input against one contiguous run of the map, instead of
+  // striding by Depth. FMaxMap is primed with the sentinel in a single bulk
+  // pass (#13) so the running maximum lives in the map itself. Tap order
+  // (dx outer, dy inner) and the strict '>' are preserved, so the recorded
+  // argmax is unchanged.
+  FMaxMap.Fill(-3.402823e38);
   for CntX := 0 to MaxX do
     for CntY := 0 to MaxY do
     begin
       baseMap := FMaxMap.GetRawPos(CntX, CntY);
-      for CntD := 0 to MaxD do
+      for dx := 0 to PoolSizeMax do
       begin
-        BestVal := -3.402823e38;
-        RawPos := baseMap + CntD;
-        for dx := 0 to PoolSizeMax do
+        InX := CntX + dx;
+        if InX > MaxX then Continue;
+        for dy := 0 to PoolSizeMax do
         begin
-          InX := CntX + dx;
-          if InX > MaxX then Continue;
-          for dy := 0 to PoolSizeMax do
+          InY := CntY + dy;
+          if InY > MaxY then Continue;
+          baseIn := Input.GetRawPos(InX, InY);
+          RawPos := baseMap;
+          InPos := baseIn;
+          for CntD := 0 to MaxD do
           begin
-            InY := CntY + dy;
-            if InY > MaxY then Continue;
-            baseIn := Input.GetRawPos(InX, InY);
-            CurrVal := Input.FData[baseIn + CntD];
-            if CurrVal > BestVal then
+            CurrVal := Input.FData[InPos];
+            if CurrVal > FMaxMap.FData[RawPos] then
             begin
-              BestVal := CurrVal;
+              FMaxMap.FData[RawPos] := CurrVal;
               FMaxMapPosX[RawPos] := InX;
               FMaxMapPosY[RawPos] := InY;
             end;
+            Inc(RawPos);
+            Inc(InPos);
           end;
         end;
-        FMaxMap.FData[RawPos] := BestVal;
       end;
     end;
 end;
