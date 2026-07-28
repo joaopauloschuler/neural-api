@@ -79,6 +79,13 @@ const
   // Coded by Claude (AI).
   csActivationOpenCLMinSize = 64*1024*1024;
 
+  // Channel count from which the bilinear-sampler backward passes
+  // (TNNetFlowWarp, TNNetBackwardWarp, TNNetAffineGridSample, TNNetGridSample)
+  // switch from the scalar depth loop to whole-column MulAdd/DotProduct over the
+  // four neighbours. Below it the columns are too short to pay for the calls,
+  // and the scalar loop keeps its zero-gradient skip.
+  csWarpBackVectorMinDepth = 8;
+
   // Channel count from which TNNetAdaIN's backward pass switches from the
   // channel-outer scalar walk to position-outer depth-column vector ops. Below
   // it the columns are too short to pay for the per-column call overhead.
@@ -36213,6 +36220,7 @@ var
   gOut, halfWm1, halfHm1: TNeuralFloat;
   dSdx, dSdy: TNeuralFloat;     // d(sampled)/d(sx), d(sampled)/d(sy)
   v00, v01, v10, v11: TNeuralFloat;
+  g00, g01, g10, g11: TNeuralFloat;
   dLdxp, dLdyp: TNeuralFloat;   // d(loss)/d(x'), d(loss)/d(y')
   inX0, inX1, inY0, inY1: boolean;
   HasSrcErr: boolean;
@@ -36264,6 +36272,26 @@ begin
       p01 := Src.GetRawPos(x0, y1);
       p11 := Src.GetRawPos(x1, y1);
       dLdxp := 0; dLdyp := 0;
+      if D >= csWarpBackVectorMinDepth then
+      begin
+        // The bilinear weights and the in-bounds flags are invariant across the
+        // depth loop, so it is linear in the four neighbour columns. An
+        // out-of-bounds corner reads as zero, so its column is simply skipped.
+        if HasSrcErr then
+        begin
+          if inX0 and inY0 then TNNetVolume.MulAdd(@SrcErr.FData[p00], @FOutputError.FData[gOutBase], w00, D);
+          if inX1 and inY0 then TNNetVolume.MulAdd(@SrcErr.FData[p10], @FOutputError.FData[gOutBase], w10, D);
+          if inX0 and inY1 then TNNetVolume.MulAdd(@SrcErr.FData[p01], @FOutputError.FData[gOutBase], w01, D);
+          if inX1 and inY1 then TNNetVolume.MulAdd(@SrcErr.FData[p11], @FOutputError.FData[gOutBase], w11, D);
+        end;
+        if inX0 and inY0 then g00 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p00], D) else g00 := 0;
+        if inX1 and inY0 then g10 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p10], D) else g10 := 0;
+        if inX0 and inY1 then g01 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p01], D) else g01 := 0;
+        if inX1 and inY1 then g11 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p11], D) else g11 := 0;
+        dLdxp := ((1 - fy) * (g10 - g00) + fy * (g11 - g01)) * halfWm1;
+        dLdyp := ((1 - fx) * (g01 - g00) + fx * (g11 - g10)) * halfHm1;
+      end
+      else
       for dd := 0 to DM1 do
       begin
         gOut := FOutputError.FData[gOutBase + dd];
@@ -36530,6 +36558,7 @@ var
   sx, sy, fx, fy, w00, w01, w10, w11: TNeuralFloat;
   gOut, dSdx, dSdy, dLdx, dLdy: TNeuralFloat;
   v00, v01, v10, v11: TNeuralFloat;
+  g00, g01, g10, g11: TNeuralFloat;
   cx0, cy0, cx1, cy1: TNeuralFloat;  // d(clamped index)/d(coord): 1 interior, 0 saturated
   HasSrcErr, HasGridErr, BorderPad, Nearest: boolean;
   inX0, inX1, inY0, inY1: boolean;
@@ -36606,6 +36635,30 @@ begin
     p01 := Src.GetRawPos(x0, y1);
     p11 := Src.GetRawPos(x1, y1);
     dLdx := 0; dLdy := 0;
+    if D >= csWarpBackVectorMinDepth then
+    begin
+      // The bilinear weights, the in-bounds flags and the per-corner clamp
+      // derivatives are all invariant across the depth loop, so it is linear in
+      // the four neighbour columns. An out-of-bounds corner reads as zero, so
+      // its column is simply skipped.
+      if HasSrcErr then
+      begin
+        if inX0 and inY0 then TNNetVolume.MulAdd(@SrcErr.FData[p00], @FOutputError.FData[gOutBase], w00, D);
+        if inX1 and inY0 then TNNetVolume.MulAdd(@SrcErr.FData[p10], @FOutputError.FData[gOutBase], w10, D);
+        if inX0 and inY1 then TNNetVolume.MulAdd(@SrcErr.FData[p01], @FOutputError.FData[gOutBase], w01, D);
+        if inX1 and inY1 then TNNetVolume.MulAdd(@SrcErr.FData[p11], @FOutputError.FData[gOutBase], w11, D);
+      end;
+      if HasGridErr then
+      begin
+        if inX0 and inY0 then g00 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p00], D) else g00 := 0;
+        if inX1 and inY0 then g10 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p10], D) else g10 := 0;
+        if inX0 and inY1 then g01 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p01], D) else g01 := 0;
+        if inX1 and inY1 then g11 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p11], D) else g11 := 0;
+        dLdx := (1 - fy) * (cx1 * g10 - cx0 * g00) + fy * (cx1 * g11 - cx0 * g01);
+        dLdy := (1 - fx) * (cy1 * g01 - cy0 * g00) + fx * (cy1 * g11 - cy0 * g10);
+      end;
+    end
+    else
     for dd := 0 to DM1 do
     begin
       gOut := FOutputError.FData[gOutBase + dd];
@@ -36840,6 +36893,7 @@ var
   sx, sy, fx, fy, w00, w01, w10, w11: TNeuralFloat;
   gOut, dSdx, dSdy, dLdx, dLdy: TNeuralFloat;
   v00, v01, v10, v11: TNeuralFloat;
+  g00, g01, g10, g11: TNeuralFloat;
   HasSrcErr, HasFlowErr: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -36881,6 +36935,29 @@ begin
     p01 := Src.GetRawPos(x0, y1);
     p11 := Src.GetRawPos(x1, y1);
     dLdx := 0; dLdy := 0;
+    if D >= csWarpBackVectorMinDepth then
+    begin
+      // Every bilinear factor is invariant across the depth loop, so that loop
+      // is linear in the four neighbour columns: four scaled accumulates for the
+      // source gradient and four dot products for the flow gradient.
+      if HasSrcErr then
+      begin
+        TNNetVolume.MulAdd(@SrcErr.FData[p00], @FOutputError.FData[gOutBase], w00, D);
+        TNNetVolume.MulAdd(@SrcErr.FData[p10], @FOutputError.FData[gOutBase], w10, D);
+        TNNetVolume.MulAdd(@SrcErr.FData[p01], @FOutputError.FData[gOutBase], w01, D);
+        TNNetVolume.MulAdd(@SrcErr.FData[p11], @FOutputError.FData[gOutBase], w11, D);
+      end;
+      if HasFlowErr then
+      begin
+        g00 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p00], D);
+        g10 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p10], D);
+        g01 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p01], D);
+        g11 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p11], D);
+        dLdx := (1 - fy) * (g10 - g00) + fy * (g11 - g01);
+        dLdy := (1 - fx) * (g01 - g00) + fx * (g11 - g10);
+      end;
+    end
+    else
     for dd := 0 to DM1 do
     begin
       gOut := FOutputError.FData[gOutBase + dd];
@@ -37103,6 +37180,7 @@ var
   sx, sy, fx, fy, w00, w01, w10, w11: TNeuralFloat;
   gOut, dSdx, dSdy, dLdx, dLdy: TNeuralFloat;
   v00, v01, v10, v11: TNeuralFloat;
+  g00, g01, g10, g11: TNeuralFloat;
   HasSrcErr, HasFlowErr: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -37144,6 +37222,29 @@ begin
     p01 := Src.GetRawPos(x0, y1);
     p11 := Src.GetRawPos(x1, y1);
     dLdx := 0; dLdy := 0;
+    if D >= csWarpBackVectorMinDepth then
+    begin
+      // Every bilinear factor is invariant across the depth loop, so that loop
+      // is linear in the four neighbour columns: four scaled accumulates for the
+      // source gradient and four dot products for the flow gradient.
+      if HasSrcErr then
+      begin
+        TNNetVolume.MulAdd(@SrcErr.FData[p00], @FOutputError.FData[gOutBase], w00, D);
+        TNNetVolume.MulAdd(@SrcErr.FData[p10], @FOutputError.FData[gOutBase], w10, D);
+        TNNetVolume.MulAdd(@SrcErr.FData[p01], @FOutputError.FData[gOutBase], w01, D);
+        TNNetVolume.MulAdd(@SrcErr.FData[p11], @FOutputError.FData[gOutBase], w11, D);
+      end;
+      if HasFlowErr then
+      begin
+        g00 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p00], D);
+        g10 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p10], D);
+        g01 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p01], D);
+        g11 := TNNetVolume.DotProduct(@FOutputError.FData[gOutBase], @Src.FData[p11], D);
+        dLdx := (1 - fy) * (g10 - g00) + fy * (g11 - g01);
+        dLdy := (1 - fx) * (g01 - g00) + fx * (g11 - g10);
+      end;
+    end
+    else
     for dd := 0 to DM1 do
     begin
       gOut := FOutputError.FData[gOutBase + dd];
