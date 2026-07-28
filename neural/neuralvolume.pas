@@ -729,6 +729,7 @@ type
       procedure MulAdd(Value: TNeuralFloat; Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure MulAdd(Original1, Original2: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure MulMulAdd(Value1, Value2: TNeuralFloat; Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
+      class procedure MulMulAdd(PtrA, PtrB: TNeuralFloatArrPtr; Value1, Value2: TNeuralFloat; pSize: integer); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure MulAdd(Value: TNeuralFloat; PtrB: TNeuralFloatArrPtr); overload; {$IFDEF Release} inline; {$ENDIF}
       class procedure MulAdd(PtrA, PtrB: TNeuralFloatArrPtr; Value: TNeuralFloat; pSize: integer); overload; {$IFDEF Release} inline; {$ENDIF}
       class procedure MulAdd(PtrA, PtrB, PtrC: TNeuralFloatArrPtr; pSize: integer); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -16604,6 +16605,15 @@ begin
       IntToStr(Self.Size) + ' and ' + IntToStr(Original.Size) + '.');
   {$ENDIF}
   AVXMulMulAdd(FDataPtr, Original.FDataPtr, Value1, Value2, FSize);
+end;
+
+// A := A*Value1 + B*Value2 over a raw run. The AVX kernel keeps two separate
+// vmulps and one vaddps (no FMA), so it is bit-identical to the inherited
+// scalar loop.
+class procedure TNNetVolume.MulMulAdd(PtrA, PtrB: TNeuralFloatArrPtr;
+  Value1, Value2: TNeuralFloat; pSize: integer);
+begin
+  AVXMulMulAdd(PtrA, PtrB, Value1, Value2, pSize);
 end;
 
 procedure TNNetVolume.MulAdd(Value: TNeuralFloat; PtrB: TNeuralFloatArrPtr);

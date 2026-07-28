@@ -68851,11 +68851,11 @@ procedure TNNetMamba2.Compute();
 var
   StartTime: double;
   Alog, Dd, DtB, NormW, Prev: TNNetVolume;
-  SeqLen, t, h, c, s, g, hpg, bOff, cOff, dtOff, gateOff: integer;
+  SeqLen, t, h, c, g, hpg, bOff, cOff, dtOff, gateOff: integer;
   dInner, P, N, NG, gw, ebase, xbase: integer;
-  SeqLenM1, NumHeadsM1, PM1, NM1, dInnerM1, tHeads, tDInner: integer;
-  idxH, hP, bBase, cBase, idxS, idxC, DInnerN, DInnerNFloatSize: integer;
-  pre, dth, ah, xv, dtxv, hnew, accY, ar, zsq, gate, msq, rstd: TNeuralFloat;
+  SeqLenM1, NumHeadsM1, PM1, dInnerM1, tHeads, tDInner: integer;
+  idxH, hP, bBase, cBase, idxC, DInnerN, DInnerNFloatSize: integer;
+  pre, dth, ah, xv, dtxv, accY, ar, zsq, gate, msq, rstd: TNeuralFloat;
   XtPtr, OutPtr: TNeuralFloatArrPtr;
   KeepState: boolean;
 begin
@@ -68876,7 +68876,6 @@ begin
   SeqLenM1 := SeqLen - 1;
   NumHeadsM1 := FNumHeads - 1;
   PM1 := P - 1;
-  NM1 := N - 1;
   dInnerM1 := dInner - 1;
   DInnerN := dInner * N;                 // #5: one timestep's state block
   DInnerNFloatSize := DInnerN * csNeuralFloatSize;
@@ -68927,13 +68926,9 @@ begin
         xv := XtPtr^[xbase];
         dtxv := dth * xv;   // invariant across the s loop: one multiply per s, not two
         ebase := xbase * N;
-        for s := 0 to NM1 do
-        begin
-          idxS := ebase + s;
-          hnew := ah * FH.FData[idxS] +
-            dtxv * XtPtr^[bBase + s];
-          FH.FData[idxS] := hnew;
-        end;
+        // #13: h := ah*h + dtxv*B over the state axis. Both runs are contiguous
+        // over s, so this is one MulMulAdd pass.
+        TNNetVolume.MulMulAdd(@FH.FData[ebase], @XtPtr^[bBase], ah, dtxv, N);
         // Read-out accY = sum_s C_t[s]*h_new[s]: the C slice of x_t and the
         // just-updated FH row are both contiguous over the state axis -> AVX dot
         // product. FH is the live (1,1,dInner*N) state, so it stays in cache;
