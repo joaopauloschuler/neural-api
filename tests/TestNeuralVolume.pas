@@ -26,6 +26,8 @@ type
     procedure TestVolumeMinMaxClassParity;
     procedure TestVolumeExpShiftSumParity;
     procedure TestVolumeAddScalarParity;
+    procedure TestVolumeMaxPosParity;
+    procedure TestVolumeAddSubValueParity;
     procedure TestVolumeFlip;
     procedure TestVolumeClassification;
     procedure TestVolumeSoftMax;
@@ -436,6 +438,112 @@ begin
   Buf[0] := 5.0;
   TNNetVolume.AddScalar(TNeuralFloatArrPtr(@Buf[0]), 1.0, 0);
   AssertEquals('empty run', 5.0, Buf[0], 0.0);
+end;
+
+procedure TTestNeuralVolume.TestVolumeMaxPosParity;
+// MaxPos is AVXGetMaxPos on an AVX2/64-bit build and a scalar loop everywhere
+// else. Both must agree exactly on the value AND on the index, and both must
+// hand ties to the FIRST occurrence - the softmax spans and the argmax callers
+// depend on that. Sizes straddle the 16-element block width and its tail.
+const
+  Sizes: array[0..11] of integer = (1, 2, 7, 15, 16, 17, 31, 32, 33, 64, 65, 517);
+var
+  Buf: array of TNeuralFloat;
+  SI, K, N, GotPos, RefPos: integer;
+  GotVal, RefVal: TNeuralFloat;
+  Tag: string;
+begin
+  RandSeed := 271828;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    Tag := ' (N=' + IntToStr(N) + ')';
+    SetLength(Buf, N);
+    for K := 0 to N - 1 do Buf[K] := (Random - 0.5) * 20;
+
+    RefVal := Buf[0];
+    RefPos := 0;
+    for K := 1 to N - 1 do
+      if Buf[K] > RefVal then
+      begin
+        RefVal := Buf[K];
+        RefPos := K;
+      end;
+
+    GotVal := TNNetVolume.MaxPos(TNeuralFloatArrPtr(@Buf[0]), N, GotPos);
+    AssertEquals('max value' + Tag, RefVal, GotVal, 0.0);
+    AssertEquals('max index' + Tag, RefPos, GotPos);
+    AssertEquals('MaxValue agrees' + Tag, RefVal,
+      TNNetVolume.MaxValue(TNeuralFloatArrPtr(@Buf[0]), N), 0.0);
+
+    // All-equal: the first index has to win on every path.
+    for K := 0 to N - 1 do Buf[K] := -3.5;
+    GotVal := TNNetVolume.MaxPos(TNeuralFloatArrPtr(@Buf[0]), N, GotPos);
+    AssertEquals('flat value' + Tag, -3.5, GotVal, 0.0);
+    AssertEquals('flat ties go to index 0' + Tag, 0, GotPos);
+
+    // A duplicated maximum: still the earlier of the two.
+    if N >= 4 then
+    begin
+      Buf[1] := 9.25;
+      Buf[N - 1] := 9.25;
+      GotVal := TNNetVolume.MaxPos(TNeuralFloatArrPtr(@Buf[0]), N, GotPos);
+      AssertEquals('duplicate max value' + Tag, 9.25, GotVal, 0.0);
+      AssertEquals('duplicate max takes the first' + Tag, 1, GotPos);
+    end;
+  end;
+  // Empty run: no element to point at.
+  AssertEquals('empty run value', 0.0,
+    TNNetVolume.MaxPos(TNeuralFloatArrPtr(@Buf[0]), 0, GotPos), 0.0);
+  AssertEquals('empty run index', -1, GotPos);
+end;
+
+procedure TTestNeuralVolume.TestVolumeAddSubValueParity;
+// TNNetVolume routes the whole-volume Add(Value)/Sub(Value) through the
+// AddScalar kernel while TVolume keeps its element loop. The two must stay
+// BIT-identical: Sub adds the negated value, and x - v equals x + (-v) exactly
+// in IEEE-754. Sizes straddle the kernel's 32-element block and its tail.
+const
+  Sizes: array[0..7] of integer = (1, 8, 31, 32, 33, 63, 100, 1000);
+  cValue = 0.7853981634;
+var
+  V: TNNetVolume;
+  RefAdd, RefBack: array of TNeuralFloat;
+  SI, K, N: integer;
+  Delta: TNeuralFloat;
+  Tag: string;
+begin
+  RandSeed := 6180339;
+  Delta := cValue;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    Tag := ' (N=' + IntToStr(N) + ')';
+    SetLength(RefAdd, N);
+    SetLength(RefBack, N);
+    V := TNNetVolume.Create(1, 1, N);
+    try
+      // Every reference value lands in a TNeuralFloat before the comparison, so
+      // the expectation is single-precision arithmetic, not the double the
+      // expression would otherwise be evaluated in.
+      for K := 0 to N - 1 do
+      begin
+        V.FData[K] := (Random - 0.5) * 40;
+        RefAdd[K] := V.FData[K] + Delta;
+        RefBack[K] := RefAdd[K] - Delta;
+      end;
+      V.Add(Delta);
+      for K := 0 to N - 1 do
+        AssertEquals('Add[' + IntToStr(K) + ']' + Tag, RefAdd[K],
+          V.FData[K], 0.0);
+      V.Sub(Delta);
+      for K := 0 to N - 1 do
+        AssertEquals('Add then Sub[' + IntToStr(K) + ']' + Tag,
+          RefBack[K], V.FData[K], 0.0);
+    finally
+      V.Free;
+    end;
+  end;
 end;
 
 procedure TTestNeuralVolume.TestVolumeExpShiftSumParity;

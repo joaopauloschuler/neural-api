@@ -584,6 +584,17 @@ type
       // Arguments far below -88 exponentiate to EXACTLY 0 on both paths, so an
       // additive -1e9 attention mask still yields a hard zero weight.
       class function ExpShiftSum(pDst, pSrc: TNeuralFloatArrPtr; Shift: TNeuralFloat; N: integer): TNeuralFloat; static;
+      // MaxPos returns the largest of src[0..N-1] and writes the index of its
+      // FIRST occurrence into Pos - the pointer-and-count form of GetMax, so a
+      // slice of a volume (a depth span, one row of a matrix) can be reduced
+      // without wrapping it in a volume. Ties go to the lower index on every
+      // build, matching the scalar loop exactly. N <= 0 yields 0 with Pos = -1.
+      // AVX2/64-bit builds run AVXGetMaxPos (sixteen elements per iteration);
+      // every other build runs the scalar loop. NaN never wins on either path.
+      class function MaxPos(pSrc: TNeuralFloatArrPtr; N: integer; out Pos: integer): TNeuralFloat; static;
+      // MaxValue is MaxPos when the caller wants only the value - the softmax
+      // shift, a range check - and does not care where it came from.
+      class function MaxValue(pSrc: TNeuralFloatArrPtr; N: integer): TNeuralFloat; static;
       // Sigmoid writes dst[0..N-1] := 1/(1+exp(-src)). AVX2-accelerated
       // path built on Exp; numerically stable scalar form on the tail.
       class procedure Sigmoid(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
@@ -702,6 +713,12 @@ type
       procedure Fill(c: Single = 0); {$IFDEF Release} inline; {$ENDIF}
       procedure Add(Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
       class procedure Add(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer); overload; {$IFDEF Release} inline; {$ENDIF}
+      // Uniform scalar accumulate over the whole volume, routed through the
+      // AddScalar kernel instead of TVolume's element loop. Sub adds -Value:
+      // x - v and x + (-v) are the same IEEE-754 result for every input, so
+      // this is bit-exact against the inherited loop.
+      procedure Add(Value: Single); overload; {$IFDEF Release} inline; {$ENDIF}
+      procedure Sub(Value: Single); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure Sub(Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
       function DotProduct(Original: TNNetVolume): TNeuralFloat; overload; {$IFDEF Release} inline; {$ENDIF}
       class function DotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; overload; {$IFDEF Release} inline; {$ENDIF}
@@ -1569,9 +1586,8 @@ type
   {$IFDEF AVXANY}
   // AVXExp writes pDst[0..N-1] := exp(pSrc[0..N-1]) using an 8-wide AVX2
   // polynomial approximation (scalar NeuralExp remainder for the N mod 8 tail).
-  // Declared at interface scope so the generic TVolume.PointwiseSoftMax may call
-  // it (a generic template cannot reference an implementation-private symbol).
-  // Implemented in the AVX32 / AVX64 asm blocks. Buffers may alias.
+  // Implemented in the AVX32 / AVX64 asm blocks. Buffers may alias. Call sites
+  // outside this unit want TNNetVolume.Exp, which dispatches on the build.
   procedure AVXExp(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer);
   // AVXLn writes pDst[0..N-1] := ln(pSrc[0..N-1]) via an 8-wide Cephes logf
   // polynomial (scalar pcr_logf remainder). Buffers may alias.
@@ -1581,8 +1597,8 @@ type
   // remainder). DoCos selects cos (true) vs sin (false). Buffers may alias.
   procedure AVXSinCos(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer; DoCos: boolean);
   // AVXGetSum returns the sum of pSrc[0..N-1] via an 8-wide AVX2 reduction
-  // (scalar tail for the N mod 4 remainder). Declared at interface scope so the
-  // generic TVolume.SoftMax / PointwiseSoftMax may reduce the exp pass with it.
+  // (scalar tail for the N mod 4 remainder). Call sites outside this unit want
+  // TNNetVolume.GetSum, which dispatches on the build.
   function AVXGetSum(PtrA: TNeuralFloatArrPtr; NumElements: integer): Single;
   {$ENDIF}
 
@@ -3088,9 +3104,10 @@ begin
   SizeM1 := Row.Size - 1;
   if SizeM1 < 0 then exit;
   MaxV := Row.GetMax();
-  Row.Sub(MaxV);
-  TNNetVolume.Exp(Row.DataPtr, Row.DataPtr, Row.Size);
-  Sum := Row.GetSum();
+  // Subtracting the row max leaves every element at <= 0, so the fused
+  // shift-exp-sum kernel covers the whole stabilized numerator and its
+  // denominator in one pass instead of subtract, exp and reduce in three.
+  Sum := TNNetVolume.ExpShiftSum(Row.DataPtr, Row.DataPtr, MaxV, Row.Size);
   if Sum > 0 then Row.Mul(1 / Sum);
 end;
 
@@ -9218,44 +9235,36 @@ end;
 
 function TVolume.SoftMax(): T;
 var
-  I: integer;
   vHigh: integer;
-  LocalValue: T;
   TotalSum: TNeuralFloat;
-  MinValue, MaxValue: T;
+  MinValue, MaxValue, ShiftedMin: T;
 begin
   MaxValue := GetMax();
-  if MaxValue <> 0 then Sub(MaxValue);
   MinValue := GetMin();
+  // Value the smallest element takes once the max is subtracted off. Reading it
+  // before the shift rather than after lets the shift itself be folded into the
+  // exponentiation below.
+  ShiftedMin := MinValue - MaxValue;
 
   TotalSum := 0;
 
   // forces range [-1000,0]
-  if MinValue <> 0 then
+  if ShiftedMin <> 0 then
   begin
-    if MinValue < -1000 then Mul( -1000/MinValue );
     vHigh := High(FData);
-
-    // Invariant reached here: Sub(MaxValue) put every element at <= 0 and the
-    // Mul above floors the smallest at -1000, so the whole buffer lies in
-    // [-1000, 0] - inside AVXExp's safe range, and already inside the +/-4000
-    // band a NeuronForceRange clamp would enforce, so no clamp is needed.
-    {$IFDEF AVXANY}
-    // Exponentiate the whole flat buffer 8-wide and sum it with the AVX
-    // reduction (parity with the scalar Exp/accumulate loop within ~1e-6).
-    AVXExp(TNeuralFloatArrPtr(@FData[0]),
-           TNeuralFloatArrPtr(@FData[0]), vHigh + 1);
-    TotalSum := AVXGetSum(TNeuralFloatArrPtr(@FData[0]), vHigh + 1);
-    {$ELSE}
-    for I := 0 to vHigh do
+    if ShiftedMin < -1000 then
     begin
-      // FData has already been shifted by Sub(MaxValue) above, so do not
-      // subtract MaxValue again here (that would underflow Exp to zero).
-      LocalValue := NeuralExp( FData[I] );
-      FData[I] := LocalValue;
-      TotalSum := TotalSum + LocalValue;
-    end;
-    {$ENDIF}
+      // The rescale has to see the shifted values, so here the subtraction is a
+      // pass of its own and the fused kernel exponentiates with a zero shift.
+      Sub(MaxValue);
+      Mul( -1000/ShiftedMin );
+      TotalSum := TNNetVolume.ExpShiftSum(Addr(FData[0]), Addr(FData[0]), 0, vHigh + 1);
+    end
+    else
+      // Everything already sits in [ShiftedMin, 0] once the max comes off, well
+      // inside exp's safe range, so subtract-and-exponentiate-and-total is one
+      // fused pass over the buffer instead of three.
+      TotalSum := TNNetVolume.ExpShiftSum(Addr(FData[0]), Addr(FData[0]), MaxValue, vHigh + 1);
 
     if TotalSum > 0 then
     begin
@@ -9268,16 +9277,13 @@ end;
 
 procedure TVolume.PointwiseSoftMax(NoForward: boolean = false);
 var
-  I, StartPointPos: integer;
+  StartPointPos: integer;
   MaxX, MaxY, MaxD, FDepthM1, MaxDP1: integer;
-  CountX, CountY, CountD: integer;
-  MaxValue: T;
-  LocalValue: T;
-  v: T;
+  CountX, CountY: integer;
+  SpanMax: TNeuralFloat;
   TotalSum: TNeuralFloat;
   RowStride, colBase: integer;
 begin
-  // TODO: This portion of code can be optimized
   MaxX := FSizeX - 1;
   MaxY := FSizeY - 1;
   MaxD := FDepth - 1;
@@ -9286,65 +9292,12 @@ begin
 
   if MaxD > 0 then
   begin
-    {$IFDEF AVXANY}
-    if not NoForward then
-    begin
-      // Whole-volume fast path (NoForward=false): every (x,y) position owns a
-      // full, contiguous FDepth-length span, so the entire FData buffer is a
-      // back-to-back sequence of equal-length depth spans. Because exp() is a
-      // pure element-wise map, the numerically-stabilized exponentiation can be
-      // dispatched to AVXExp ONCE over the whole volume instead of re-dispatching
-      // per position. Only the max-find / clamp (pass 1) and the sum+normalize
-      // (pass 2) reductions reset at each Depth boundary, preserving the exact
-      // per-position max-subtraction stabilization. This avoids FSizeX*FSizeY
-      // AVXExp/AVXGetSum dispatches per call.
-      // Pass 1: per-span max, then in-place clamp of (x - max) over the span.
-      colBase := 0; // #12: carried GetRawPos(CountX, 0)
-      for CountX := 0 to MaxX do
-      begin
-        StartPointPos := colBase;
-        for CountY := 0 to MaxY do
-        begin
-          I := StartPointPos;
-          MaxValue := FData[I];
-          for CountD := 1 to MaxD do
-          begin
-            Inc(I);
-            v := FData[I];
-            if v > MaxValue then MaxValue := v;
-          end;
-          I := StartPointPos;
-          for CountD := 0 to MaxD do
-          begin
-            FData[I] := NeuronForceRange(FData[I] - MaxValue, 4000);
-            Inc(I);
-          end;
-          Inc(StartPointPos, RowStride);
-        end;
-        Inc(colBase, FDepth);
-      end;
-      // Single whole-volume exponentiation (parity with the scalar NeuralExp loop
-      // within ~1e-6 relative error). Spatial spans are contiguous so the entire
-      // FSizeX*FSizeY*FDepth range is one AVXExp call.
-      AVXExp(TNeuralFloatArrPtr(@FData[0]),
-             TNeuralFloatArrPtr(@FData[0]), FSizeX * FSizeY * FDepth);
-      // Pass 2: per-span sum + normalize.
-      colBase := 0; // #12: carried GetRawPos(CountX, 0)
-      for CountX := 0 to MaxX do
-      begin
-        StartPointPos := colBase;
-        for CountY := 0 to MaxY do
-        begin
-          TotalSum := AVXGetSum(TNeuralFloatArrPtr(@FData[StartPointPos]), MaxD + 1);
-          if TotalSum > 0 then
-            TNNetVolume.Mul(Addr(FData[StartPointPos]), 1.0 / TotalSum, MaxD + 1);
-          Inc(StartPointPos, RowStride);
-        end;
-        Inc(colBase, FDepth);
-      end;
-      Exit;
-    end;
-    {$ENDIF}
+    // Every (x,y) position owns a contiguous depth span, so the three softmax
+    // reductions each run as one vectorized primitive over that span: find the
+    // stabilizing max, then exponentiate the shifted span and total it in the
+    // single fused pass, then normalize. Subtracting the span max leaves every
+    // element at <= 0, which is why no clamp is needed - the exp of anything
+    // far below -88 is a hard zero on both the AVX and the scalar path.
     colBase := 0; // #12: carried GetRawPos(CountX, 0)
     for CountX := 0 to MaxX do
     begin
@@ -9357,40 +9310,9 @@ begin
           MaxDP1 := MaxD + 1;
           FillChar(FData[StartPointPos + MaxDP1], (FDepthM1 - MaxDP1 + 1) * csNeuralFloatSize, 0);
         end;
-        I := StartPointPos;
-        // Find the point max value.
-        MaxValue := FData[I];
-        for CountD := 1 to MaxD do
-        begin
-          Inc(I);
-          v := FData[I];
-          if v > MaxValue
-            then MaxValue := v;
-        end;
-        TotalSum := 0;
-        I := StartPointPos;
-        {$IFDEF AVXANY}
-        // Contiguous-depth fast path: clamp (x - max) in place over the depth
-        // segment, then exponentiate it 8-wide via AVXExp (parity with the scalar
-        // pcr_expf loop within ~1e-6 relative error), then accumulate the sum.
-        for CountD := 0 to MaxD do
-        begin
-          FData[I] := NeuronForceRange(FData[I] - MaxValue, 4000);
-          Inc(I);
-        end;
-        AVXExp(TNeuralFloatArrPtr(@FData[StartPointPos]),
-               TNeuralFloatArrPtr(@FData[StartPointPos]), MaxD + 1);
-        TotalSum := AVXGetSum(TNeuralFloatArrPtr(@FData[StartPointPos]), MaxD + 1);
-        {$ELSE}
-        for CountD := 0 to MaxD do
-        begin
-          // LocalValue := pcr_expf( NeuronForceRange(FData[I] - MaxValue, 4000) );
-          LocalValue := NeuralExp( NeuronForceRange(FData[I] - MaxValue, 4000) );
-          FData[I] := LocalValue;
-          TotalSum := TotalSum + LocalValue;
-          Inc(I);
-        end;
-        {$ENDIF}
+        SpanMax := TNNetVolume.MaxValue(Addr(FData[StartPointPos]), MaxD + 1);
+        TotalSum := TNNetVolume.ExpShiftSum(Addr(FData[StartPointPos]),
+          Addr(FData[StartPointPos]), SpanMax, MaxD + 1);
         if TotalSum > 0 then
           TNNetVolume.Mul(Addr(FData[StartPointPos]), 1.0 / TotalSum, MaxD + 1);
         Inc(StartPointPos, RowStride);
@@ -9544,6 +9466,54 @@ begin
 end;
 {$ENDIF}
 {$UNDEF HASAVXEXPSHIFTSUM}
+
+// AVXGetMaxPos is assembled only in the AVX64 block, so a 32-bit AVX2 build
+// takes the scalar path like every non-AVX build.
+{$IFDEF AVX2}{$IFDEF AVX64}{$DEFINE HASAVXMAXPOS}{$ENDIF}{$ENDIF}
+{$IFDEF HASAVXMAXPOS}
+// AVXGetMaxPos is defined later in this file inside the AVX64 asm block;
+// forward-declare it so MaxPos can dispatch to it from here.
+function AVXGetMaxPos(PtrA: TNeuralFloatArrPtr; NumElements: integer;
+  out Pos: integer): Single; forward;
+{$ENDIF}
+class function TNNetVolume.MaxPos(pSrc: TNeuralFloatArrPtr; N: integer;
+  out Pos: integer): TNeuralFloat;
+{$IFNDEF HASAVXMAXPOS}
+var
+  I, NM1: integer;
+  V: TNeuralFloat;
+{$ENDIF}
+begin
+  if N <= 0 then
+  begin
+    Pos := -1;
+    exit(0);
+  end;
+  {$IFDEF HASAVXMAXPOS}
+  Result := AVXGetMaxPos(pSrc, N, Pos);
+  {$ELSE}
+  Result := pSrc^[0];
+  Pos := 0;
+  NM1 := N - 1;
+  for I := 1 to NM1 do
+  begin
+    V := pSrc^[I];
+    if V > Result then
+    begin
+      Result := V;
+      Pos := I;
+    end;
+  end;
+  {$ENDIF}
+end;
+{$UNDEF HASAVXMAXPOS}
+
+class function TNNetVolume.MaxValue(pSrc: TNeuralFloatArrPtr; N: integer): TNeuralFloat;
+var
+  Pos: integer;
+begin
+  Result := MaxPos(pSrc, N, Pos);
+end;
 
 class procedure TNNetVolume.Sigmoid(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 var
@@ -9761,22 +9731,18 @@ end;
 
 procedure TVolume.GroupedPointwiseSoftMax(Groups: integer);
 var
-  I, StartPointPos: integer;
+  StartPointPos: integer;
   MaxX, MaxY: integer;
-  CountX, CountY, CountD: integer;
-  MaxValue: T;
-  LocalValue: T;
-  v: T;
+  CountX, CountY: integer;
+  SpanMax: TNeuralFloat;
   TotalSum: TNeuralFloat;
   GroupCnt, StartD, PointBase: integer;
-  ChannelsPerGroup, ChannelsPerGroupM1, GroupsM1: integer;
+  ChannelsPerGroup, GroupsM1: integer;
   RowStride, colBase: integer;
 begin
-  // TODO: This portion of code can be optimized
   MaxX := FSizeX - 1;
   MaxY := FSizeY - 1;
   ChannelsPerGroup := FDepth div Groups;
-  ChannelsPerGroupM1 := ChannelsPerGroup - 1;
   GroupsM1 := Groups - 1;
   RowStride := FSizeX * FDepth; // #12: per-CountY GetRawPos step (carried below)
   if ChannelsPerGroup > 1 then
@@ -9792,41 +9758,12 @@ begin
         begin
           //EndD := StartD + ChannelsPerGroup - 1;
           StartPointPos := PointBase + StartD;
-          I := StartPointPos;
-          // Find the point max value.
-          MaxValue := FData[I];
-          for CountD := 1 to ChannelsPerGroupM1 do
-          begin
-            Inc(I);
-            v := FData[I];
-            if v > MaxValue
-              then MaxValue := v;
-          end;
-          TotalSum := 0;
-          I := StartPointPos;
-          {$IFDEF AVXANY}
           // A group is ChannelsPerGroup contiguous elements from StartPointPos,
-          // so the stabilized values can be clamped in place and then
-          // exponentiated 8-wide by AVXExp and reduced by the AVX sum (parity
-          // with the scalar NeuralExp loop within ~1e-6 relative error) - the
-          // same promotion PointwiseSoftMax applies to its depth spans.
-          for CountD := 0 to ChannelsPerGroupM1 do
-          begin
-            FData[I] := NeuronForceRange(FData[I] - MaxValue, 4000);
-            Inc(I);
-          end;
-          AVXExp(TNeuralFloatArrPtr(@FData[StartPointPos]),
-                 TNeuralFloatArrPtr(@FData[StartPointPos]), ChannelsPerGroup);
-          TotalSum := AVXGetSum(TNeuralFloatArrPtr(@FData[StartPointPos]), ChannelsPerGroup);
-          {$ELSE}
-          for CountD := 0 to ChannelsPerGroupM1 do
-          begin
-            LocalValue := NeuralExp( NeuronForceRange(FData[I] - MaxValue, 4000) );
-            FData[I] := LocalValue;
-            TotalSum := TotalSum + LocalValue;
-            Inc(I);
-          end;
-          {$ENDIF}
+          // so it takes the same three vectorized reductions PointwiseSoftMax
+          // applies to a depth span: span max, fused shift-exp-sum, normalize.
+          SpanMax := TNNetVolume.MaxValue(Addr(FData[StartPointPos]), ChannelsPerGroup);
+          TotalSum := TNNetVolume.ExpShiftSum(Addr(FData[StartPointPos]),
+            Addr(FData[StartPointPos]), SpanMax, ChannelsPerGroup);
           if TotalSum > 0 then
             TNNetVolume.Mul(Addr(FData[StartPointPos]), 1.0 / TotalSum, ChannelsPerGroup);
           Inc(StartD, ChannelsPerGroup);
@@ -12603,12 +12540,12 @@ end;
 
 procedure TNNetVolume.NormalizeMax(Value: TNeuralFloat);
 var
-  MaxValue: TNeuralFloat;
+  CurrentMaxAbs: TNeuralFloat;
 begin
-  MaxValue := GetMaxAbs();
-  if MaxValue > 0 then
+  CurrentMaxAbs := GetMaxAbs();
+  if CurrentMaxAbs > 0 then
   begin
-    Mul( Value/MaxValue );
+    Mul( Value/CurrentMaxAbs );
   end;
 end;
 
@@ -16736,6 +16673,16 @@ class procedure TNNetVolume.Add(PtrA, PtrB: TNeuralFloatArrPtr;
   NumElements: integer);
 begin
   AVXAdd(PtrA, PtrB, NumElements);
+end;
+
+procedure TNNetVolume.Add(Value: Single);
+begin
+  AddScalar(FDataPtr, Value, FSize);
+end;
+
+procedure TNNetVolume.Sub(Value: Single);
+begin
+  AddScalar(FDataPtr, -Value, FSize);
 end;
 
 procedure TNNetVolume.Sub(Original: TNNetVolume);
