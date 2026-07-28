@@ -483,7 +483,9 @@ type
       property LastObjective: TNeuralFloat read FLastObjective;
   end;
 
-// Char-level tokenization helper: token i is Ord(S[i+1]).
+// Char-level tokenization helper: token i is Ord(S[i+1]). The ids are raw byte
+// values 0..255, so the net must have at least 256 vocabulary entries; the
+// trainers reject any id outside their own vocabulary.
 function DPOTokens(const S: string): TNeuralDPOTokenArray;
 
 implementation
@@ -495,6 +497,37 @@ begin
   SetLength(Result, Length(S));
   LenS := Length(S);
   for I := 1 to LenS do Result[I-1] := Ord(S[I]);
+end;
+
+// Rejects token ids outside [0, VocabSize-1] at the trainer API boundary. A
+// token id is both a one-hot input channel and an index into the
+// vocabulary-sized output distribution, so an out-of-range id reads and writes
+// past the end of those volumes. Scans the caller's array in place (no
+// allocation) and fails loudly: a target token the model has no logit for is a
+// caller error, and clamping it would silently corrupt the training signal.
+procedure ValidateTokenRange(const Tokens: array of integer;
+  VocabSize: integer; const ATrainerName, AArrayName: string);
+var
+  I, TokensHi, Token: integer;
+  CharHint: string;
+begin
+  TokensHi := High(Tokens);
+  for I := 0 to TokensHi do
+  begin
+    Token := Tokens[I];
+    if (Token < 0) or (Token >= VocabSize) then
+    begin
+      if (Token >= 32) and (Token < 127)
+      then CharHint := ' (character "' + Chr(Token) + '")'
+      else CharHint := '';
+      raise Exception.Create(ATrainerName + ': ' + AArrayName + ' token #' +
+        IntToStr(I) + ' has id ' + IntToStr(Token) + CharHint +
+        ', outside this model''s vocabulary [0..' + IntToStr(VocabSize - 1) +
+        '] (vocabulary size ' + IntToStr(VocabSize) + '). DPOTokens() emits ' +
+        'raw byte values 0..255, so a char-level net must be built with at ' +
+        'least 256 vocabulary entries.');
+    end;
+  end;
 end;
 
 // Numerically stable softplus: ln(1+exp(X)).
@@ -644,6 +677,10 @@ begin
   Result := 0;
   CompletionHi := High(Completion);
   Last := NN.GetLastLayer(); // #8: fixed network structure across the loop
+  ValidateTokenRange(Prompt, NN.GetFirstLayer().Output.Depth,
+    'TNeuralDPOTrainer', 'prompt');
+  ValidateTokenRange(Completion, Last.Output.Size,
+    'TNeuralDPOTrainer', 'completion');
   for T := 0 to CompletionHi do
   begin
     EncodePrefix(NN, Prompt, Completion, T);
@@ -781,6 +818,10 @@ var
 begin
   CompletionHi := High(Completion);
   Last := FPolicy.GetLastLayer(); // #8: fixed network structure across the loop
+  ValidateTokenRange(Prompt, FPolicy.GetFirstLayer().Output.Depth,
+    'TNeuralDPOTrainer', 'prompt');
+  ValidateTokenRange(Completion, Last.Output.Size,
+    'TNeuralDPOTrainer', 'completion');
   for T := 0 to CompletionHi do
   begin
     Target := Completion[T];
@@ -882,6 +923,10 @@ begin
   FirstLayerOutput := FRewardNet.GetFirstLayer().Output;
   if FInput.Size <> FirstLayerOutput.Size then FInput.ReSize(FirstLayerOutput);
   ContextLen := FirstLayerOutput.SizeX;
+  ValidateTokenRange(Prompt, FirstLayerOutput.Depth,
+    'TNeuralRewardModelTrainer', 'prompt');
+  ValidateTokenRange(Response, FirstLayerOutput.Depth,
+    'TNeuralRewardModelTrainer', 'response');
   PromptLen := Length(Prompt);
   SeqLen := PromptLen + Length(Response);
   // Sliding window: keep only the most recent ContextLen tokens.
@@ -1057,6 +1102,10 @@ begin
   Result := 0;
   CompletionHi := High(Completion);
   Last := NN.GetLastLayer(); // #8: fixed network structure across the loop
+  ValidateTokenRange(Prompt, NN.GetFirstLayer().Output.Depth,
+    'TNeuralGRPOTrainer', 'prompt');
+  ValidateTokenRange(Completion, Last.Output.Size,
+    'TNeuralGRPOTrainer', 'completion');
   for T := 0 to CompletionHi do
   begin
     EncodePrefix(NN, Prompt, Completion, T);
@@ -1215,6 +1264,8 @@ var
 begin
   if not Assigned(FReward) then
     raise Exception.Create('TNeuralGRPOTrainer: Reward callback not assigned.');
+  ValidateTokenRange(Prompt, FPolicy.GetFirstLayer().Output.Depth,
+    'TNeuralGRPOTrainer', 'prompt');
   if FGroupSize < 1 then FGroupSize := 1;
   FGroupSizeM1 := FGroupSize - 1;
 
