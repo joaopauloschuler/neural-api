@@ -84512,14 +84512,13 @@ begin
             tapBase := (fy * FFeatureSizeX + fx) * FInDepth;
             prevBase := PrevOut.GetRawPos(prevX, prevY);
             rtBase := rBase + tapBase;
-            for ci := 0 to MaxCI do
-            begin
-              // Fold onto the BASE tap this rot-r view came from (map index once).
-              mapIdx := FRotMap[rtBase + ci];
-              WDelta.FData[mapIdx] :=
-                WDelta.FData[mapIdx] +
-                dy * PrevOut.FData[prevBase + ci];
-            end;
+            // BuildRotMap sends a ci-contiguous dstTap to a ci-contiguous srcTap,
+            // so the whole rot-r tap folds onto one contiguous FInDepth run of the
+            // base tap: take the map value once and accumulate with MulAdd, as the
+            // forward's DotProduct already does.
+            mapIdx := FRotMap[rtBase];
+            TNNetVolume.MulAdd(@WDelta.FData[mapIdx],
+              @PrevOut.FData[prevBase], dy, FInDepth);
           end;
         end;
       end;
@@ -84583,10 +84582,10 @@ begin
             tapBase := (fy * FFeatureSizeX + fx) * FInDepth;
             prevBase := LocalPrevError.GetRawPos(prevX, prevY);
             rtBase := rBase + tapBase;
-            for ci := 0 to MaxCI do
-              LocalPrevError.FData[prevBase + ci] :=
-                LocalPrevError.FData[prevBase + ci] +
-                dy * W.FData[FRotMap[rtBase + ci]];
+            // Same ci-contiguous rotation mapping as above: one map lookup, then a
+            // contiguous accumulate over the input-depth run.
+            TNNetVolume.MulAdd(@LocalPrevError.FData[prevBase],
+              @W.FData[FRotMap[rtBase]], dy, FInDepth);
           end;
         end;
       end;
