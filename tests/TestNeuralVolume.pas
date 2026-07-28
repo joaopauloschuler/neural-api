@@ -48,6 +48,7 @@ type
     procedure TestVolumeCrossEntropy;
     procedure TestVolumeOneHotEncodingOnPixel;
     procedure TestVolumeOneHotEncoding;
+    procedure TestVolumeOneHotEncodingReversedString;
     procedure TestVolumePositionalEncoding;
     procedure TestVolumeColorConversions;
     procedure TestVolumeLabRoundTrip;
@@ -1443,6 +1444,57 @@ begin
     AssertEquals('V[0,0,0] should be 0.0', 0.0, V[0, 0, 0], 0.0001);
     AssertEquals('V[1,0,0] should be 0.0', 0.0, V[1, 0, 0], 0.0001);
   finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeOneHotEncodingReversedString;
+const
+  csSizeX = 8;
+  csPrompt = 'ABCDEFGHIJKL';
+var
+  V, VRef: TNNetVolume;
+  Tail: string;
+begin
+  // The string overload keeps only the last SizeX characters. Encoding an
+  // over-long prompt must match encoding its manually truncated tail.
+  V := TNNetVolume.Create(csSizeX, 1, 256);
+  VRef := TNNetVolume.Create(csSizeX, 1, 256);
+  try
+    Tail := Copy(csPrompt, Length(csPrompt) - csSizeX + 1, csSizeX);
+    AssertEquals('Truncated tail', 'EFGHIJKL', Tail);
+
+    V.OneHotEncodingReversed(csPrompt);
+    AssertEquals('Over-long prompt must not encode to an all zero volume',
+      csSizeX, Round(V.GetSumAbs()));
+
+    VRef.OneHotEncodingReversed(Tail);
+    AssertEquals('Over-long prompt must encode as its last SizeX characters',
+      0, Round(V.SumDiff(VRef)));
+
+    // Exactly SizeX characters.
+    V.OneHotEncodingReversed(Tail);
+    AssertEquals('Exact length encodes one hit per position',
+      csSizeX, Round(V.GetSumAbs()));
+    AssertEquals('Last character lands at position 0',
+      1, Round(V[0, 0, Ord('L')]));
+    AssertEquals('First character lands at position SizeX-1',
+      1, Round(V[csSizeX - 1, 0, Ord('E')]));
+
+    // Shorter than SizeX: only the used positions are set.
+    V.OneHotEncodingReversed('XY');
+    AssertEquals('Short prompt sets one hit per character',
+      2, Round(V.GetSumAbs()));
+    AssertEquals('Short prompt last character at position 0',
+      1, Round(V[0, 0, Ord('Y')]));
+    AssertEquals('Short prompt first character at position 1',
+      1, Round(V[1, 0, Ord('X')]));
+
+    // Empty prompt clears the volume.
+    V.OneHotEncodingReversed('');
+    AssertEquals('Empty prompt yields an empty volume', 0, Round(V.GetSumAbs()));
+  finally
+    VRef.Free;
     V.Free;
   end;
 end;

@@ -10340,16 +10340,11 @@ var
   CntToken, MaxToken, Token: integer;
   LocalTokens: string;
 begin
-  MaxToken := Length(aTokens);
-  if MaxToken > SizeX then
-  begin
-    LocalTokens := GetLastChars(aTokens, SizeX);
-    MaxToken := Length(aTokens);
-  end
-  else
-  begin
-    LocalTokens := aTokens;
-  end;
+  // GetLastChars returns the input unchanged when it already fits, so a single
+  // unconditional truncation covers both cases and keeps MaxToken derived from
+  // the string that is actually encoded.
+  LocalTokens := GetLastChars(aTokens, SizeX);
+  MaxToken := Length(LocalTokens);
   Self.Fill(0);
   if MaxToken > 0 then
   begin
