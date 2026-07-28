@@ -611,6 +611,14 @@ type
       // other build runs the equivalent scalar loop. Bit-identical either way,
       // the >= 0 boundary included. Buffers may alias (dst = src).
       class procedure ReluGateMask(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // LeakyRelu writes dst[0..N-1] := src[i] when src[i] >= 0 and
+      // Slope*src[i] otherwise - the activation every HiFi-GAN / vocoder
+      // resblock applies over its whole channel x timestep signal.
+      // AVX2/64-bit builds run AVXLeakyRelu (eight elements per iteration);
+      // every other build runs the equivalent scalar loop. Bit-identical either
+      // way, the >= 0 boundary included. Buffers may alias (dst = src).
+      class procedure LeakyRelu(pDst, pSrc: TNeuralFloatArrPtr;
+        Slope: TNeuralFloat; N: integer); static;
       // Largest FINITE magnitude of src[0..N-1], or 0 when nothing there is
       // finite and non-zero: NaN is skipped and +/-Inf excluded, so the result
       // is always a usable quantization range. This is the pointer-and-count
@@ -2234,6 +2242,54 @@ begin
   NumElementsM1 := NumElements - 1;
   for i := localNumElements to NumElementsM1 do
     if PtrSrc^[i] >= 0 then PtrDst^[i] := 1 else PtrDst^[i] := 0;
+end;
+
+// dst[i] := src[i] when src[i] >= 0, else Slope * src[i] - eight elements per
+// iteration as a compare, a multiply and a blend. The slope is broadcast from a
+// local, so the kernel references no global constant and stays position
+// independent. Bit-exact against the scalar tail: the taken branch is the same
+// single-precision multiply, GE_OQ selects -0.0 as non-negative exactly as the
+// scalar >= 0 does, and NaN falls to the multiply on both paths.
+procedure AVXLeakyRelu(PtrDst, PtrSrc: TNeuralFloatArrPtr;
+  Slope: TNeuralFloat; NumElements: integer);
+var
+  localNumElements, i, NumElementsM1: integer;
+  localSlope: Single;
+  SlopePtr: pointer;
+begin
+  localNumElements := NumElements and (not 7);
+  if localNumElements > 0 then
+  begin
+    localSlope := Slope;
+    SlopePtr := Addr(localSlope);
+  asm
+  mov rax, PtrSrc
+  mov rdx, PtrDst
+  mov r8, SlopePtr
+  mov ecx, localNumElements
+  shr ecx, 3
+  vbroadcastss ymm2, [r8]
+  vxorps    ymm3, ymm3, ymm3
+@Loop:
+  vmovups   ymm0, [rax]
+  vmulps    ymm1, ymm0, ymm2       // Slope * x
+  vcmpps    ymm4, ymm0, ymm3, 29   // GE_OQ: false for NaN, true for -0.0
+  vblendvps ymm1, ymm1, ymm0, ymm4 // x where x >= 0, else Slope * x
+  vmovups   [rdx], ymm1
+  add rax, 32
+  add rdx, 32
+  dec ecx
+  jnz @Loop
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4'
+  ];
+  end;
+  NumElementsM1 := NumElements - 1;
+  for i := localNumElements to NumElementsM1 do
+    if PtrSrc^[i] >= 0 then PtrDst^[i] := PtrSrc^[i]
+    else PtrDst^[i] := Slope * PtrSrc^[i];
 end;
 
 
@@ -9739,6 +9795,32 @@ begin
   {$ELSE}
   for I := 0 to N - 1 do
     if pSrc^[I] >= 0 then pDst^[I] := 1 else pDst^[I] := 0;
+  {$ENDIF}
+end;
+
+class procedure TNNetVolume.LeakyRelu(pDst, pSrc: TNeuralFloatArrPtr;
+  Slope: TNeuralFloat; N: integer);
+{$IFNDEF AVX2}
+var
+  I: integer;
+{$ELSE}
+{$IFNDEF AVX64}
+var
+  I: integer;
+{$ENDIF}
+{$ENDIF}
+begin
+  if N <= 0 then exit;
+  {$IFDEF AVX2}
+  {$IFDEF AVX64}
+  AVXLeakyRelu(pDst, pSrc, Slope, N);
+  {$ELSE}
+  for I := 0 to N - 1 do
+    if pSrc^[I] >= 0 then pDst^[I] := pSrc^[I] else pDst^[I] := Slope * pSrc^[I];
+  {$ENDIF}
+  {$ELSE}
+  for I := 0 to N - 1 do
+    if pSrc^[I] >= 0 then pDst^[I] := pSrc^[I] else pDst^[I] := Slope * pSrc^[I];
   {$ENDIF}
 end;
 

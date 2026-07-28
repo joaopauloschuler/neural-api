@@ -28,6 +28,7 @@ type
     procedure TestVolumeAddScalarParity;
     procedure TestVolumeSumSqrCenteredParity;
     procedure TestVolumeReluGateMaskParity;
+    procedure TestVolumeLeakyReluParity;
     procedure TestVolumeMaxPosParity;
     procedure TestVolumeAddSubValueParity;
     procedure TestVolumeFlip;
@@ -544,6 +545,79 @@ begin
   Src[0] := 5.0;
   TNNetVolume.ReluGateMask(TNeuralFloatArrPtr(@Src[0]),
     TNeuralFloatArrPtr(@Src[0]), 0);
+  AssertEquals('empty run', 5.0, Src[0], 0.0);
+end;
+
+procedure TTestNeuralVolume.TestVolumeLeakyReluParity;
+// LeakyRelu is AVXLeakyRelu on an AVX2/64-bit build and a scalar loop everywhere
+// else. Both paths must agree BIT-exactly: the negative branch is the same
+// single-precision multiply, and at the boundary the contract is >= 0, so +0.0
+// and -0.0 both pass through unscaled. Sizes straddle the 8-element block width
+// and its tail.
+const
+  Sizes: array[0..10] of integer = (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 1000);
+  // TYPED: an untyped 0.1 would be a Double here, so the reference multiply
+  // would not be the Single one the kernel performs.
+  Slope: TNeuralFloat = 0.1;
+var
+  Src, Dst, Ref: array of TNeuralFloat;
+  SI, K, N: integer;
+begin
+  RandSeed := 141421;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    SetLength(Src, N);
+    SetLength(Dst, N);
+    SetLength(Ref, N);
+    for K := 0 to N - 1 do
+    begin
+      case K mod 7 of
+        0: Src[K] := 0.0;
+        1: Src[K] := -0.0;
+        2: Src[K] := -1e-30;
+        3: Src[K] := 1e-30;
+      else
+        Src[K] := (Random - 0.5) * 8;
+      end;
+      Dst[K] := 12345;
+      if Src[K] >= 0 then Ref[K] := Src[K] else Ref[K] := Slope * Src[K];
+    end;
+    TNNetVolume.LeakyRelu(TNeuralFloatArrPtr(@Dst[0]),
+      TNeuralFloatArrPtr(@Src[0]), Slope, N);
+    for K := 0 to N - 1 do
+      AssertEquals('LeakyRelu[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
+        Ref[K], Dst[K], 0.0);
+  end;
+  // In-place (dst = src) must produce the same result.
+  N := 40;
+  SetLength(Src, N);
+  for K := 0 to N - 1 do Src[K] := (Random - 0.5) * 8;
+  SetLength(Ref, N);
+  for K := 0 to N - 1 do
+    if Src[K] >= 0 then Ref[K] := Src[K] else Ref[K] := Slope * Src[K];
+  TNNetVolume.LeakyRelu(TNeuralFloatArrPtr(@Src[0]),
+    TNeuralFloatArrPtr(@Src[0]), Slope, N);
+  for K := 0 to N - 1 do
+    AssertEquals('LeakyRelu in-place[' + IntToStr(K) + ']', Ref[K], Src[K], 0.0);
+  // A slope of zero degenerates to a plain relu.
+  N := 20;
+  SetLength(Src, N);
+  for K := 0 to N - 1 do Src[K] := (Random - 0.5) * 8;
+  SetLength(Dst, N);
+  TNNetVolume.LeakyRelu(TNeuralFloatArrPtr(@Dst[0]),
+    TNeuralFloatArrPtr(@Src[0]), 0.0, N);
+  for K := 0 to N - 1 do
+    if Src[K] >= 0 then
+      AssertEquals('LeakyRelu slope 0 pos[' + IntToStr(K) + ']',
+        Src[K], Dst[K], 0.0)
+    else
+      AssertEquals('LeakyRelu slope 0 neg[' + IntToStr(K) + ']',
+        0.0, Abs(Dst[K]), 0.0);
+  // A zero-length run must leave the buffer untouched.
+  Src[0] := 5.0;
+  TNNetVolume.LeakyRelu(TNeuralFloatArrPtr(@Src[0]),
+    TNeuralFloatArrPtr(@Src[0]), Slope, 0);
   AssertEquals('empty run', 5.0, Src[0], 0.0);
 end;
 

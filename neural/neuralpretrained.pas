@@ -45248,23 +45248,22 @@ begin
   end;
 end;
 
-function HiFiGANLeakyReLU(X, Slope: TNeuralFloat): TNeuralFloat; inline;
-begin
-  if X >= 0 then Result := X else Result := Slope * X;
-end;
-
 procedure ApplyHiFiGANLeakyReLU(var Sig: TNNetFloatDynArr2D; Slope: TNeuralFloat);
 var
-  c, t: integer;
+  c: integer;
   MaxC: integer;
-  SigLenM1: integer;
+  SigLen: integer;
+  SigRow: TNeuralFloatDynArr;
 begin
   MaxC := Length(Sig) - 1;
   for c := 0 to MaxC do
   begin
-    SigLenM1 := Length(Sig[c]) - 1;
-    for t := 0 to SigLenM1 do
-      Sig[c][t] := HiFiGANLeakyReLU(Sig[c][t], Slope);
+    SigRow := Sig[c];                 // #9: bind the row once, not per element
+    SigLen := Length(SigRow);
+    // #13/#19: one contiguous kernel per channel instead of a branch and two
+    // dynamic-array derefs per timestep.
+    if SigLen > 0 then
+      TNNetVolume.LeakyRelu(@SigRow[0], @SigRow[0], Slope, SigLen);
   end;
 end;
 
@@ -45475,7 +45474,7 @@ var
   MelTLen, SigTLen, ResOneTLen, ResSumTLen: integer;
   Slope, InvK, MeanC, ScaleC: TNeuralFloat;
   DoNorm: boolean;
-  SigRow, MelRow: TNeuralFloatDynArr;
+  SigRow, MelRow, ResOneRow: TNeuralFloatDynArr;
 begin
   NumUp := Length(FConfig.UpsampleRates);
   NumKernels := Length(FConfig.ResblockKernelSizes);
@@ -45536,10 +45535,12 @@ begin
           SetLength(Tmp1, Length(ResOne));
           for c := 0 to LenResOne do
           begin
-            SetLength(Tmp1[c], Length(ResOne[c]));
-            ResOneTLen := Length(ResOne[c]) - 1;
-            for t := 0 to ResOneTLen do
-              Tmp1[c][t] := HiFiGANLeakyReLU(ResOne[c][t], Slope);
+            ResOneRow := ResOne[c];        // #9: bind both rows once
+            ResOneTLen := Length(ResOneRow);
+            SetLength(Tmp1[c], ResOneTLen);
+            if ResOneTLen > 0 then
+              TNNetVolume.LeakyRelu(@Tmp1[c][0], @ResOneRow[0], Slope,
+                ResOneTLen);
           end;
           RunHiFiGANConv(FResBlocks[rb].Convs[d], Tmp1, Tmp2);
           // ResOne := ResOne + Tmp2
@@ -45562,10 +45563,12 @@ begin
         SetLength(Tmp1, Length(ResOne));
         for c := 0 to LenResOne do
         begin
-          SetLength(Tmp1[c], Length(ResOne[c]));
-          ResOneTLen := Length(ResOne[c]) - 1;
-          for t := 0 to ResOneTLen do
-            Tmp1[c][t] := HiFiGANLeakyReLU(ResOne[c][t], Slope);
+          ResOneRow := ResOne[c];         // #9: bind both rows once
+          ResOneTLen := Length(ResOneRow);
+          SetLength(Tmp1[c], ResOneTLen);
+          if ResOneTLen > 0 then
+            TNNetVolume.LeakyRelu(@Tmp1[c][0], @ResOneRow[0], Slope,
+              ResOneTLen);
         end;
         RunHiFiGANConv(FResBlocks[rb].Convs1[d], Tmp1, Tmp2);
         ApplyHiFiGANLeakyReLU(Tmp2, Slope);
