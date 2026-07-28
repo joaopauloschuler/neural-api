@@ -15629,11 +15629,14 @@ type
     // round-trips through SaveToString / LoadFromString via FStruct[0..2]
     // (and FFloatSt[0] for beta).
     FWinMax, FExpSum: TNNetVolume;
-    // Persistent, lazily-sized (grow-only) scratch for the AVX exp arg row,
-    // shared by Compute and Backpropagate (rule #17 — never SetLength per call).
-    FArgBuf: array of TNeuralFloat;
+    // Per-INPUT-cell exp(beta*x - winMax), the single most expensive quantity
+    // this layer computes. RebuildWindowStats produces it once per forward and
+    // Compute / Backpropagate read it, so the transcendental is evaluated once
+    // per element instead of once per pass. Input-shaped, sized in SetPrevLayer
+    // and not serialized.
+    FExpVal: TNNetVolume;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
-    // Rebuilds FWinMax / FExpSum from the previous layer's output.
+    // Rebuilds FWinMax / FExpSum / FExpVal from the previous layer's output.
     procedure RebuildWindowStats();
   public
     constructor Create(pPoolSize: integer; pStride: integer = 0;
@@ -93481,6 +93484,8 @@ begin
   inherited SetPrevLayer(pPrevLayer);
   SetLength(FMaxPosX, 0);
   SetLength(FMaxPosY, 0);
+  FExpVal.ReSize(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY,
+    pPrevLayer.Output.Depth);
 end;
 
 constructor TNNetSoftPool.Create(pPoolSize: integer; pStride: integer = 0;
@@ -93491,25 +93496,28 @@ begin
   FFloatSt[0] := pBeta;
   FWinMax := TNNetVolume.Create(1, 1, 1);
   FExpSum := TNNetVolume.Create(1, 1, 1);
+  FExpVal := TNNetVolume.Create(1, 1, 1);
 end;
 
 destructor TNNetSoftPool.Destroy();
 begin
   FWinMax.Free;
   FExpSum.Free;
+  FExpVal.Free;
   inherited Destroy();
 end;
 
-// Builds the two per-output-cell window statistics the SoftPool weights are
-// made of: FWinMax (the window maximum of beta*x, the softmax max-subtraction
-// that keeps the exp in range) and FExpSum (the window sum of
-// exp(beta*x - winMax)). Both depend only on the previous layer's output.
+// Builds the window statistics the SoftPool weights are made of: FWinMax (the
+// window maximum of beta*x, the softmax max-subtraction that keeps the exp in
+// range), FExpSum (the window sum of exp(beta*x - winMax)) and FExpVal (the
+// per-input-cell exp itself, kept so Compute and Backpropagate never
+// re-exponentiate). All depend only on the previous layer's output.
 procedure TNNetSoftPool.RebuildWindowStats();
 var
   CntX, CntY, CntD: integer;
   MaxX, MaxY, MaxD: integer;
   OutX, OutY: integer;
-  OutputRawPos: integer;
+  OutputRawPos, ExpValBase: integer;
   InputRawPtr: TNeuralFloatPtr;
   BetaX: TNeuralFloat;
   {$IFDEF AVXANY}
@@ -93546,19 +93554,21 @@ begin
     end;
   end;
 
-  // Pass 2: exp-sum of (beta*x - winMax) per output cell+channel, into FExpSum.
+  // Pass 2: exp(beta*x - winMax) per INPUT cell into FExpVal, accumulated into
+  // the per-output-cell FExpSum on the way past.
   FExpSum.ReSize(FOutput);
   FExpSum.Fill(0);
+  FExpVal.ReSize(FPrevLayer.Output);
   {$IFDEF AVXANY}
-  // The depth axis is contiguous in both the input row and FWinMax/FExpSum, so
-  // each (CntX,CntY) window-channel-row builds its exp argument (beta*x - winMax)
-  // into a scratch buffer and exponentiates it 8-wide via AVXExp (the same vector
-  // exp the softmax/SoftPlus forwards use), then accumulates into FExpSum.
-  // AVXExp's scalar tail has no internal clamp, so the argument is pre-clamped to
-  // [-88,88]: the winMax subtraction already bounds it above by 0, this guards the
-  // low tail against denormal/garbage exp on extreme inputs.
+  // The depth axis is contiguous in the input row, in FWinMax/FExpSum and in
+  // FExpVal, so each (CntX,CntY) window-channel-row builds its exp argument
+  // (beta*x - winMax) straight into its FExpVal run and exponentiates it in
+  // place 8-wide via AVXExp (the same vector exp the softmax/SoftPlus forwards
+  // use), then accumulates into FExpSum. AVXExp's scalar tail has no internal
+  // clamp, so the argument is pre-clamped to [-88,88]: the winMax subtraction
+  // already bounds it above by 0, this guards the low tail against
+  // denormal/garbage exp on extreme inputs.
   Depth := MaxD + 1;
-  if Length(FArgBuf) < Depth then SetLength(FArgBuf, Depth);
   for CntX := 0 to MaxX do
   begin
     OutX := CntX div FPoolSize;
@@ -93568,19 +93578,21 @@ begin
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
       WinMaxPtr := FWinMax.GetRawPtr(OutX, OutY);
       ExpSumPtr := FExpSum.GetRawPtr(OutX, OutY);
+      ExpValBase := FExpVal.GetRawPos(CntX, CntY);
       for CntD := 0 to MaxD do
       begin
         RowArg := FBeta * InputRawPtr^ - WinMaxPtr^;
         if RowArg < cExpArgLo then RowArg := cExpArgLo
         else if RowArg > cExpArgHi then RowArg := cExpArgHi;
-        FArgBuf[CntD] := RowArg;
+        FExpVal.FData[ExpValBase + CntD] := RowArg;
         Inc(InputRawPtr);
         Inc(WinMaxPtr);
       end;
-      TNNetVolume.Exp(TNeuralFloatArrPtr(@FArgBuf[0]), TNeuralFloatArrPtr(@FArgBuf[0]), Depth);
+      TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpVal.FData[ExpValBase]),
+        TNeuralFloatArrPtr(@FExpVal.FData[ExpValBase]), Depth);
       for CntD := 0 to MaxD do
       begin
-        ExpSumPtr^ := ExpSumPtr^ + FArgBuf[CntD];
+        ExpSumPtr^ := ExpSumPtr^ + FExpVal.FData[ExpValBase + CntD];
         Inc(ExpSumPtr);
       end;
     end;
@@ -93593,11 +93605,14 @@ begin
     begin
       OutY := CntY div FPoolSize;
       OutputRawPos := FExpSum.GetRawPos(OutX, OutY);
+      ExpValBase := FExpVal.GetRawPos(CntX, CntY);
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
       for CntD := 0 to MaxD do
       begin
-        FExpSum.FData[OutputRawPos] := FExpSum.FData[OutputRawPos] +
+        FExpVal.FData[ExpValBase + CntD] :=
           NeuralExp(FBeta * InputRawPtr^ - FWinMax.FData[OutputRawPos]);
+        FExpSum.FData[OutputRawPos] := FExpSum.FData[OutputRawPos] +
+          FExpVal.FData[ExpValBase + CntD];
         Inc(OutputRawPos);
         Inc(InputRawPtr);
       end;
@@ -93612,17 +93627,12 @@ var
   MaxX, MaxY, MaxD: integer;
   OutX, OutY: integer;
   StartTime: double;
-  OutputRawPos: integer;
+  OutputRawPos, ExpValBase: integer;
   InputRawPtr: TNeuralFloatPtr;
-  ExpVal, BetaX: TNeuralFloat;
+  ExpVal: TNeuralFloat;
   {$IFDEF AVXANY}
-  WinMaxPtr, ExpSumPtr, OutPtr: TNeuralFloatPtr;
-  RowArg: TNeuralFloat;
-  Depth: integer;
+  ExpSumPtr, OutPtr: TNeuralFloatPtr;
   {$ENDIF}
-const
-  cExpArgLo = -88.0;
-  cExpArgHi = 88.0;
 begin
   StartTime := Now();
   // Per pooling window W and channel, with temperature beta (FFloatSt[0]):
@@ -93632,21 +93642,17 @@ begin
   // so large beta*x never overflows. Every cell of a window shares the same
   // window-wide max and exp-sum, so we accumulate over the input cells in three
   // passes using the (non-serialized) scratch volumes FWinMax (per-output-cell
-  // window maximum of beta*x) and FExpSum (window exp-sum). The final weighted
-  // sum is built into FOutput.
+  // window maximum of beta*x), FExpSum (window exp-sum) and FExpVal (the
+  // per-input-cell exp). The final weighted sum is built into FOutput.
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
   MaxD := FPrevLayer.Output.Depth - 1;
 
   RebuildWindowStats();
-  {$IFDEF AVXANY}
-  // Grow-only lazy resize of the persistent exp-argument row (rule #17).
-  Depth := MaxD + 1;
-  if Length(FArgBuf) < Depth then SetLength(FArgBuf, Depth);
-  {$ENDIF}
 
-  // Pass 3: weighted sum  y = sum_i x_i * exp(beta*x_i - winMax) / expSum, into
-  // FOutput.
+  // Pass 3: weighted sum  y = sum_i x_i * FExpVal_i / expSum, into FOutput. The
+  // exponentials were produced by RebuildWindowStats, so this pass only divides
+  // and accumulates.
   Output.Fill(0);
   {$IFDEF AVXANY}
   for CntX := 0 to MaxX do
@@ -93656,28 +93662,14 @@ begin
     begin
       OutY := CntY div FPoolSize;
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
-      WinMaxPtr := FWinMax.GetRawPtr(OutX, OutY);
       ExpSumPtr := FExpSum.GetRawPtr(OutX, OutY);
       OutPtr := FOutput.GetRawPtr(OutX, OutY);
-      // Rebuild exp(beta*x - winMax) 8-wide via AVXExp into ArgBuf (clamped like
-      // pass 2), then do the per-cell weighted-sum accumulate (scalar; the divide
-      // / FExpSum>0 guard is per cell).
-      for CntD := 0 to MaxD do
-      begin
-        RowArg := FBeta * InputRawPtr^ - WinMaxPtr^;
-        if RowArg < cExpArgLo then RowArg := cExpArgLo
-        else if RowArg > cExpArgHi then RowArg := cExpArgHi;
-        FArgBuf[CntD] := RowArg;
-        Inc(InputRawPtr);
-        Inc(WinMaxPtr);
-      end;
-      TNNetVolume.Exp(TNeuralFloatArrPtr(@FArgBuf[0]), TNeuralFloatArrPtr(@FArgBuf[0]), Depth);
-      InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
+      ExpValBase := FExpVal.GetRawPos(CntX, CntY);
       for CntD := 0 to MaxD do
       begin
         if ExpSumPtr^ > 0 then
         begin
-          ExpVal := FArgBuf[CntD] / ExpSumPtr^;
+          ExpVal := FExpVal.FData[ExpValBase + CntD] / ExpSumPtr^;
           OutPtr^ := OutPtr^ + ExpVal * InputRawPtr^;
         end;
         Inc(InputRawPtr);
@@ -93694,12 +93686,13 @@ begin
     begin
       OutY := CntY div FPoolSize;
       OutputRawPos := FOutput.GetRawPos(OutX, OutY);
+      ExpValBase := FExpVal.GetRawPos(CntX, CntY);
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
       for CntD := 0 to MaxD do
       begin
         if FExpSum.FData[OutputRawPos] > 0 then
         begin
-          ExpVal := NeuralExp(FBeta * InputRawPtr^ - FWinMax.FData[OutputRawPos]) /
+          ExpVal := FExpVal.FData[ExpValBase + CntD] /
             FExpSum.FData[OutputRawPos];
           FOutput.FData[OutputRawPos] :=
             FOutput.FData[OutputRawPos] + ExpVal * InputRawPtr^;
@@ -93719,17 +93712,12 @@ var
   MaxX, MaxY, MaxD: integer;
   OutX, OutY: integer;
   StartTime: double;
-  OutputRawPos, PrevRawPos: integer;
+  OutputRawPos, PrevRawPos, ExpValBase: integer;
   InputRawPtr: TNeuralFloatPtr;
-  WinMax, ExpSum, Wi, Y, XVal, Grad, BetaX: TNeuralFloat;
+  ExpSum, Wi, Y, XVal, Grad: TNeuralFloat;
   {$IFDEF AVXANY}
-  WinMaxPtr, ExpSumPtr, OutPtr, ErrPtr, PrevErrPtr: TNeuralFloatPtr;
-  RowArg: TNeuralFloat;
-  Depth: integer;
+  ExpSumPtr, OutPtr, ErrPtr, PrevErrPtr: TNeuralFloatPtr;
   {$ENDIF}
-const
-  cExpArgLo = -88.0;
-  cExpArgHi = 88.0;
 begin
   Inc(FBackPropCallCurrentCnt);
   if
@@ -93741,19 +93729,15 @@ begin
   MaxY := FPrevLayer.Output.SizeY - 1;
   MaxD := FPrevLayer.Output.Depth - 1;
 
-  // FWinMax / FExpSum are persistent layer scratch built by the matching
-  // forward from the SAME previous-layer output this backward reads, so the two
-  // full passes that produced them are not repeated here (the FVmem/FSpike and
-  // FCacheZP layers reuse their forward state the same way). The size test is
-  // the guard for a layer whose shape moved since -- or that was never computed
-  // -- in which case they are rebuilt.
-  if (FWinMax.Size <> FOutput.Size) or (FExpSum.Size <> FOutput.Size) then
+  // FWinMax / FExpSum / FExpVal are persistent layer scratch built by the
+  // matching forward from the SAME previous-layer output this backward reads,
+  // so the passes that produced them are not repeated here (the FVmem/FSpike
+  // and FCacheZP layers reuse their forward state the same way). The size test
+  // is the guard for a layer whose shape moved since -- or that was never
+  // computed -- in which case they are rebuilt.
+  if (FWinMax.Size <> FOutput.Size) or (FExpSum.Size <> FOutput.Size) or
+    (FExpVal.Size <> FPrevLayer.Output.Size) then
     RebuildWindowStats();
-  {$IFDEF AVXANY}
-  // Grow-only lazy resize of the persistent exp-argument row (rule #17).
-  Depth := MaxD + 1;
-  if Length(FArgBuf) < Depth then SetLength(FArgBuf, Depth);
-  {$ENDIF}
 
   // dy/dx_i = w_i * (1 + beta*(x_i - y)), so
   // d(loss)/dx_i = OutputError * w_i * (1 + beta*(x_i - y)).
@@ -93765,24 +93749,13 @@ begin
     begin
       OutY := CntY div FPoolSize;
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
-      WinMaxPtr := FWinMax.GetRawPtr(OutX, OutY);
       ExpSumPtr := FExpSum.GetRawPtr(OutX, OutY);
       OutPtr := FOutput.GetRawPtr(OutX, OutY);
       ErrPtr := FOutputError.GetRawPtr(OutX, OutY);
       PrevErrPtr := FPrevLayer.OutputError.GetRawPtr(CntX, CntY);
-      // Rebuild exp(beta*x - winMax) 8-wide; Wi = exp/ExpSum is then formed per
-      // cell (the divide and the gradient combine are scalar).
-      for CntD := 0 to MaxD do
-      begin
-        RowArg := FBeta * InputRawPtr^ - WinMaxPtr^;
-        if RowArg < cExpArgLo then RowArg := cExpArgLo
-        else if RowArg > cExpArgHi then RowArg := cExpArgHi;
-        FArgBuf[CntD] := RowArg;
-        Inc(InputRawPtr);
-        Inc(WinMaxPtr);
-      end;
-      TNNetVolume.Exp(TNeuralFloatArrPtr(@FArgBuf[0]), TNeuralFloatArrPtr(@FArgBuf[0]), Depth);
-      InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
+      ExpValBase := FExpVal.GetRawPos(CntX, CntY);
+      // exp(beta*x - winMax) already lives in FExpVal; Wi = exp/ExpSum is
+      // formed per cell (the divide and the gradient combine are scalar).
       for CntD := 0 to MaxD do
       begin
         ExpSum := ExpSumPtr^;
@@ -93790,7 +93763,7 @@ begin
         Y := OutPtr^;
         if ExpSum > 0 then
         begin
-          Wi := FArgBuf[CntD] / ExpSum;
+          Wi := FExpVal.FData[ExpValBase + CntD] / ExpSum;
           Grad := ErrPtr^ * Wi * (1.0 + FBeta * (XVal - Y));
           PrevErrPtr^ := PrevErrPtr^ + Grad;
         end;
@@ -93811,16 +93784,16 @@ begin
       OutY := CntY div FPoolSize;
       OutputRawPos := FOutput.GetRawPos(OutX, OutY);
       PrevRawPos := FPrevLayer.OutputError.GetRawPos(CntX, CntY);
+      ExpValBase := FExpVal.GetRawPos(CntX, CntY);
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
       for CntD := 0 to MaxD do
       begin
-        WinMax := FWinMax.FData[OutputRawPos];
         ExpSum := FExpSum.FData[OutputRawPos];
         XVal := InputRawPtr^;
         Y := FOutput.FData[OutputRawPos];
         if ExpSum > 0 then
         begin
-          Wi := NeuralExp(FBeta * XVal - WinMax) / ExpSum;
+          Wi := FExpVal.FData[ExpValBase + CntD] / ExpSum;
           Grad := FOutputError.FData[OutputRawPos] * Wi *
             (1.0 + FBeta * (XVal - Y));
           FPrevLayer.OutputError.FData[PrevRawPos] :=
