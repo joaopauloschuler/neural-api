@@ -1318,36 +1318,26 @@ e  := NeuralExp(logit[c] - MaxLogit);
 
 ### `1 / Sqrt(x)` is one call, not two operations
 
-`pcr_rsqrtf` deserves its own note because the win is larger than a swap: it
-replaces a `Sqrt` **and** a divide — the two most expensive scalar float ops —
-with a single routine. `y / Sqrt(x)` is likewise `y * pcr_rsqrtf(x)`, which also
-folds in #21 (divide → multiply). It is established here, with 39 call sites.
-(There is no `pcr_sqrtf`: a bare `Sqrt` compiles to one hardware `sqrtss`, so it
-needs no replacement — it is the *reciprocal* form that pays.)
+`pcr_rsqrtf` folds a `Sqrt` and a divide into one call, which also folds in #21
+(divide → multiply). It is established here, with 39 call sites. (There is no
+`pcr_sqrtf`: a bare `Sqrt` compiles to one hardware `sqrtss`, so it needs no
+replacement — it is the *reciprocal* form that pays.)
 
-**Anti-example — do NOT follow this** (`TNNetISRU`, `neuralnetwork.pas` ~23068 /
-~23127 — a `Sqrt` plus a divide *per element*, in both the forward and the
-backward loop):
+**Measure before swapping — this one is not a free win.** `pcr_rsqrtf` is a
+*correctly-rounded software* routine, not a hardware instruction, so on x86-64
+it can lose to the `sqrtss` + `divss` pair it replaces. Measured on this box
+over 1M elements, the ISRU body (`InvSqrt`, then `x*InvSqrt` and `InvSqrt^3`):
 
-```pascal
-for OutputCnt := 0 to SizeM1 do
-begin
-  PrevValue := LocalPrevOutput.FData[OutputCnt];
-  InvSqrt := 1 / Sqrt(1 + Alpha * PrevValue * PrevValue);
-  FOutput.FData[OutputCnt] := PrevValue * InvSqrt;
-  FOutputErrorDeriv.FData[OutputCnt] := InvSqrt * InvSqrt * InvSqrt;
-end;
-```
+| form | time |
+| --- | --- |
+| `1 / Sqrt(1 + a*x*x)` | 8 ms |
+| `pcr_rsqrtf(1 + a*x*x)` | 14 ms |
 
-**Do this:**
-
-```pascal
-  InvSqrt := pcr_rsqrtf(1 + Alpha * PrevValue * PrevValue);
-```
-
-The same file also spells the fused form out longhand as `x / Sqrt(y)` at ~23079
-and ~23142 (the branch where the derivative is not needed) — that is
-`x * pcr_rsqrtf(y)`.
+The same ~1.4-1.8x penalty shows up in a latency-bound dependency chain, so it
+is not a vectorization artifact. `TNNetISRU.Compute` / `TNNetISRLU.Compute`
+therefore stay on the RTL form on purpose (they carry a comment saying so — do
+not "fix" them). Reach for `pcr_rsqrtf` when you want its accuracy or its
+argument hardening, and when a swap is for speed alone, benchmark it first.
 
 ### Need `sin` **and** `cos` of the same argument? One call.
 

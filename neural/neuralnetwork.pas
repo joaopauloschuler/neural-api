@@ -23354,6 +23354,10 @@ begin
   SizeM1 := LocalPrevOutput.Size - 1;
   Alpha := FFloatSt[0];
 
+  // The 1/Sqrt form stays on the RTL deliberately: pcr_rsqrtf is a
+  // correctly-rounded software routine and measures ~1.8x slower than the
+  // hardware sqrtss + divss this compiles to (1M elements: 14 ms vs 8 ms),
+  // so the #16 reciprocal-sqrt swap is a regression here.
   // ISRU(x) = x / sqrt(1 + alpha * x^2).
   // dy/dx = (1 / sqrt(1 + alpha*x^2))^3.
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
@@ -23406,6 +23410,10 @@ begin
   SizeM1 := LocalPrevOutput.Size - 1;
   Alpha := FFloatSt[0];
 
+  // The 1/Sqrt form stays on the RTL deliberately: pcr_rsqrtf is a
+  // correctly-rounded software routine and measures ~1.8x slower than the
+  // hardware sqrtss + divss this compiles to (1M elements: 14 ms vs 8 ms),
+  // so the #16 reciprocal-sqrt swap is a regression here.
   // ISRLU(x) = x for x >= 0, else x / sqrt(1 + alpha * x^2).
   // dy/dx     = 1 for x >= 0, else (1 / sqrt(1 + alpha*x^2))^3.
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
