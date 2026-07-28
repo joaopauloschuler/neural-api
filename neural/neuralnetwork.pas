@@ -9765,7 +9765,7 @@ type
       // Per (time-step, integ-step) caches needed for the backward HVP, sized
       // (T*Steps, 1, .). Index it = t*Steps + s.
       FZin: TNNetVolume;    // phase vector z fed to the field at each (t,s)
-      FAct: TNNetVolume;    // pre-activation a = W1*z+b1 cache, (T*Steps,1,Hidden)
+      FAct: TNNetVolume;    // activation tanh(W1*z+b1) cache, (T*Steps,1,Hidden)
       // Separable-only second-MLP caches (T-network); the inherited FZin/FAct
       // serve the V-network. Sized at the HALF width (D inputs).
       FZinT: TNNetVolume;
@@ -61533,7 +61533,7 @@ var
   PM1, HdM1, DhalfM1, SeqLenM1, FStepsM1: integer;
 
   // Evaluate the symplectic field g = dH/dz at the current FzvBuf, caching the input
-  // and pre-activations at sub-index it2 for the backward HVP. Result into gv.
+  // and activations at sub-index it2 for the backward HVP. Result into gv.
   procedure FieldAt(it2idx: integer);
   var jj, k2, zb, bp, w1base: integer; a2, h2, t2, s2: TNeuralFloat;
   begin
@@ -61549,8 +61549,10 @@ var
       // Rule #13: dot(row, z) reduction over P.
       a2 := b1.FData[jj] +
         TNNetVolume.DotProduct(@W1.FData[w1base], @FzvBuf[0], P);
-      FAct.FData[bp + jj] := a2;
       h2 := pcr_tanhf(a2);
+      // Cache the activation, not the pre-activation: the backward HVP needs
+      // only tanh(a) and would otherwise recompute it.
+      FAct.FData[bp + jj] := h2;
       t2 := 1 - h2 * h2;
       s2 := W2.FData[jj] * t2;
       // Rule #13: FMA of row into the gradient accumulator (s2 invariant).
@@ -61581,8 +61583,9 @@ var
       // Rule #13: dot(row, hv) reduction over Dhalf.
       a2 := hb1.FData[jj] +
         TNNetVolume.DotProduct(@hW1.FData[hw1base], @hv[0], Dhalf);
-      Ac.FData[bp + jj] := a2;
       h2 := pcr_tanhf(a2);
+      // Cache the activation, not the pre-activation (see FieldAt).
+      Ac.FData[bp + jj] := h2;
       t2 := 1 - h2 * h2;
       s2 := hW2.FData[jj] * t2;
       // Rule #13: FMA of row into the half-field gradient (s2 invariant).
@@ -61686,7 +61689,7 @@ var
   // gradient against adjoint uh, accumulating that MLP's grads and returning
   // dL/d(input) (a Dhalf-vector) in dzh.
   procedure HalfHVP(nbase: integer; Zc, Ac: TNNetVolume; idx: integer);
-  var jj, k2, bp, zb, hw1base: integer; a2, h2, t2, cj, dLda, dLdc: TNeuralFloat;
+  var jj, k2, bp, zb, hw1base: integer; h2, t2, cj, dLda, dLdc: TNeuralFloat;
       hW1, hW2: TNNetVolume; hGW1, hGb1, hGW2: TNNetVolume;
   begin
     hW1 := FNeurons[nbase + 0].FWeights;
@@ -61701,8 +61704,7 @@ var
     begin
       // hW1 row jj: GetRawPos(jj,0,k2) = hw1base + k2 (k2 is the depth arg).
       hw1base := hW1.GetRawPos(jj, 0);
-      a2 := Ac.FData[bp + jj];
-      h2 := pcr_tanhf(a2);
+      h2 := Ac.FData[bp + jj];
       t2 := 1 - h2 * h2;
       cj := TNNetVolume.DotProduct(@hW1.FData[hw1base], @FuhBuf[0], Dhalf);
       dLda := hW2.FData[jj] * cj * (-2 * h2 * t2);
@@ -61721,7 +61723,7 @@ var
   // adjoint u, accumulating the (W1,b1,W2) grads and returning dL/d(field input)
   // in dz. Implemented as a second tape pass over the same MLP (no Hessian).
   procedure HVP(it2idx: integer);
-  var jj, k2, bp, zb, w1base: integer; a2, h2, t2, cj, dLda, dLdc: TNeuralFloat;
+  var jj, k2, bp, zb, w1base: integer; h2, t2, cj, dLda, dLdc: TNeuralFloat;
   begin
     bp := FAct.GetRawPos(it2idx, 0);
     zb := FZin.GetRawPos(it2idx, 0);
@@ -61730,8 +61732,7 @@ var
     begin
       // W1 row jj: GetRawPos(jj,0,k2) = w1base + k2 (k2 is the depth arg).
       w1base := W1.GetRawPos(jj, 0);
-      a2 := FAct.FData[bp + jj];
-      h2 := pcr_tanhf(a2);
+      h2 := FAct.FData[bp + jj];
       t2 := 1 - h2 * h2;
       cj := TNNetVolume.DotProduct(@W1.FData[w1base], @FuuBuf[0], P);
       // dL/dW2_j = t_j*c_j ; dL/da_j = W2_j*c_j*(-2 h_j t_j) ; dL/dc_j = W2_j*t_j
