@@ -65307,12 +65307,11 @@ function ComputePerceptualLossAndGradient(NN: TNNet;
   out GradImage: TNNetVolume;
   const StageWeights: TNeuralFloatArray = nil): TNeuralFloat;
 var
-  Stage, NumStages, Loc, c, D, NumLoc, Base, NumLocM1, DM1, Gi, GradM1: integer;
-  NumStagesM1: integer;
+  Stage, NumStages, D, NumLoc, NumStagesM1: integer;
   TapFeat: TNNetVolume;            // snapshot of tap-S features for Target
   TargetFeat: array[0..4] of TNNetVolume;
-  TapLayer, InLayer: TNNetLayer;
-  W, Diff, Scale, ScaleW, kGrad: TNeuralFloat;
+  TapLayer, DeepestTap, InLayer: TNNetLayer;
+  W, Scale, ScaleW, kGrad: TNeuralFloat;
   UseScalarW: boolean;
 begin
   Result := 0;
@@ -65358,12 +65357,21 @@ begin
       TargetFeat[Stage].Copy(NN.Layers[TapLayerIdx[Stage]].Output);
     end;
 
-    GradM1 := GradImage.Size - 1;
+    // ONE forward on Gen. Every tap's Output is live at the same time, so all
+    // the stage losses and all the gradient seeds are read off a single pass
+    // instead of re-running the whole VGG once per tap.
+    NN.Compute(Gen);
+    // Reset every layer's error buffer and backprop counter ONCE, up front:
+    // ResetBackpropCallCurrCnt zeros the OutputError the seeds land in, so it
+    // must happen before any seeding and never between the seeds.
+    NN.ResetBackpropCallCurrCnt();
+    DeepestTap := NN.Layers[TapLayerIdx[NumStagesM1]];
+    // The deepest tap is the layer the manual backward starts from; if nothing
+    // downstream consumes it, give it the one departing branch that call is.
+    if DeepestTap.GetDepartingBranchesCnt() = 0 then
+      DeepestTap.IncDepartingBranchesCnt();
     for Stage := 0 to NumStagesM1 do
     begin
-      // Fresh forward on Gen for this stage (each backward consumes the
-      // transient error buffers; recomputing is robust and cheap for <=5 taps).
-      NN.Compute(Gen);
       TapLayer := NN.Layers[TapLayerIdx[Stage]];
       TapFeat := TapLayer.Output;          // live Gen features at the tap.
       if (TapFeat.Size <> TargetFeat[Stage].Size) or
@@ -65373,13 +65381,7 @@ begin
       D := TapFeat.Depth;
       NumLoc := TapFeat.SizeX * TapFeat.SizeY;
       if (D < 1) or (NumLoc < 1) then continue;
-      NumLocM1 := NumLoc - 1;
-      DM1 := D - 1;
       UseScalarW := (Stage <= High(StageWeights));
-      // Reset all layer errors + backprop counters (zeros every OutputError).
-      NN.ResetBackpropCallCurrCnt();
-      if TapLayer.GetDepartingBranchesCnt() = 0 then
-        TapLayer.IncDepartingBranchesCnt();
       // Seed the tap output error with the analytic feature gradient and
       // accumulate the scalar stage loss with EXACTLY matching arithmetic.
       Scale := 1.0 / NumLoc;
@@ -65392,18 +65394,26 @@ begin
       // Whole tap is contiguous+uniform: bulk squared distance + bulk grad seed
       // (#13/#18). Float summation order differs from the scalar nest.
       Result := Result + ScaleW * TapFeat.GetDistanceSqr(TargetFeat[Stage]);
-      TapLayer.OutputError.Copy(TapFeat);
-      TapLayer.OutputError.Sub(TargetFeat[Stage]);
-      TapLayer.OutputError.Mul(kGrad);
-      // Backpropagate from the tap relu to the input (relu backward applies its
-      // own derivative; intermediate convs/pools scatter the gradient down).
-      TapLayer.Backpropagate();
-      // Accumulate the pixel gradient that landed on the input layer.
-      if (InLayer.OutputError <> nil) and
-         (InLayer.OutputError.Size = GradImage.Size) then
-        TNNetVolume.Add(GradImage.GetRawPtr(0),
-          InLayer.OutputError.GetRawPtr(0), GradImage.Size);
+      // ACCUMULATE the seed rather than overwrite: a shallower tap's error
+      // buffer is also where the deeper chain will deposit its gradient, and
+      // two stages are allowed to name the same layer. Two MulAdd passes do
+      // += kGrad*(Gen - Target) without a scratch volume.
+      TNNetVolume.MulAdd(TapLayer.OutputError.GetRawPtr(0),
+        TapFeat.GetRawPtr(0), kGrad, TapFeat.Size);
+      TNNetVolume.MulAdd(TapLayer.OutputError.GetRawPtr(0),
+        TargetFeat[Stage].GetRawPtr(0), -kGrad, TapFeat.Size);
     end;
+    // ONE backward, from the DEEPEST tap down to the pixels. Backprop
+    // accumulates into each layer's OutputError as it walks down, so every
+    // shallower tap's pre-seeded error is picked up when the chain reaches it
+    // and rides the rest of the way down with the deeper stages' gradient.
+    DeepestTap.Backpropagate();
+    // The pixel gradient that landed on the input layer is now the sum over
+    // all stages.
+    if (InLayer.OutputError <> nil) and
+       (InLayer.OutputError.Size = GradImage.Size) then
+      TNNetVolume.Add(GradImage.GetRawPtr(0),
+        InLayer.OutputError.GetRawPtr(0), GradImage.Size);
   finally
     for Stage := 0 to 4 do
       if TargetFeat[Stage] <> nil then TargetFeat[Stage].Free;
