@@ -90454,11 +90454,8 @@ begin
     localNeuron := FArrNeurons[NeuronCnt];
     // Standardize this neuron's weight vector: w_hat = (w - mean)/sqrt(var+eps).
     Mean := localNeuron.FWeights.GetSum() / FloatN;
-    Variance := 0;
-    for WeightCnt := 0 to MaxWeights do
-      Variance := Variance +
-        Sqr(localNeuron.FWeights.FData[WeightCnt] - Mean);
-    Variance := Variance / FloatN;
+    Variance := TNNetVolume.SumSqrCentered(
+      @localNeuron.FWeights.FData[0], Mean, NLocal) / FloatN;
     InvStd := pcr_rsqrtf(Variance + FWSEpsilon);
     Dot := TNNetVolume.DotProduct(@localNeuron.FWeights.FData[0],
       @FPrevLayer.FOutput.FData[0], NLocal);
@@ -90509,10 +90506,8 @@ begin
 
     // Recompute the per-neuron standardization statistics.
     Mean := localNeuron.FWeights.GetSum() / FloatN;
-    Variance := 0;
-    for WeightCnt := 0 to MaxWeights do
-      Variance := Variance + Sqr(localNeuron.FWeights.FData[WeightCnt] - Mean);
-    Variance := Variance / FloatN;
+    Variance := TNNetVolume.SumSqrCentered(
+      @localNeuron.FWeights.FData[0], Mean, MaxWeights + 1) / FloatN;
     InvStd := pcr_rsqrtf(Variance + FWSEpsilon);
 
     // Standardized weights w_hat (also needed for the input gradient).
@@ -90627,10 +90622,8 @@ begin
     // Keep the raw weights so they can be restored.
     FRawFilters[NeuronCnt].Copy(localNeuron.FWeights);
     Mean := localNeuron.FWeights.GetSum() / FloatN;
-    Variance := 0;
-    for WeightCnt := 0 to MaxWeights do
-      Variance := Variance + Sqr(localNeuron.FWeights.FData[WeightCnt] - Mean);
-    Variance := Variance / FloatN;
+    Variance := TNNetVolume.SumSqrCentered(
+      @localNeuron.FWeights.FData[0], Mean, MaxWeights + 1) / FloatN;
     InvStd := pcr_rsqrtf(Variance + FWSEpsilon);
     for WeightCnt := 0 to MaxWeights do
       localNeuron.FWeights.FData[WeightCnt] :=
@@ -90717,10 +90710,8 @@ begin
         // Recompute this filter's standardization statistics from the raw
         // (restored) weights.
         Mean := localNeuron.FWeights.GetSum() / FloatN;
-        Variance := 0;
-        for WeightCnt := 0 to MaxWeights do
-          Variance := Variance + Sqr(localNeuron.FWeights.FData[WeightCnt] - Mean);
-        Variance := Variance / FloatN;
+        Variance := TNNetVolume.SumSqrCentered(
+          @localNeuron.FWeights.FData[0], Mean, MaxWeights + 1) / FloatN;
         InvStd := pcr_rsqrtf(Variance + FWSEpsilon);
 
         // Standardized weights w_hat (needed by the Jacobian).

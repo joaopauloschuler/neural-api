@@ -619,6 +619,17 @@ type
       // AVX2/64-bit builds run AVXMaxAbsFinite; every other build runs
       // the equivalent scalar loop. Coded by Claude (AI).
       class function MaxAbsFinite(pSrc: TNeuralFloatArrPtr; N: integer): TNeuralFloat; static;
+      // EXACT centered sum of squares of src[0..N-1] about Mean:
+      // sum_i (src[i] - Mean)^2. Divide by N for the population variance.
+      // AVX2/64-bit builds run AVXSumSqrCentered; every other build runs the
+      // equivalent scalar loop.
+      //
+      // Deliberately NOT the algebraic sum(x^2) - N*Mean^2 shortcut, which is
+      // one pass cheaper but cancels catastrophically once |Mean| >> Std -- the
+      // regime a weight-standardization layer lives in. The vector and scalar
+      // paths differ only in summation ORDER, and every term is non-negative,
+      // so the reordering is benign (unlike that shortcut). Coded by Claude (AI).
+      class function SumSqrCentered(pSrc: TNeuralFloatArrPtr; Mean: TNeuralFloat; N: integer): TNeuralFloat; static;
       // Quantizes src[0..N-1] to symmetric int8 codes against a KNOWN row max:
       // dst[i] = clamp(Round(src[i] * 127/MaxAbs), -127, 127), with NaN coding
       // as 0 and +/-Inf clamping to +/-127. MaxAbs must be the value
@@ -2301,6 +2312,72 @@ begin
   NumElementsM1 := NumElements - 1;
   for i := localNumElements to NumElementsM1 do
     PtrDst^[i] := NeuralHalfToSingle(PtrSrc^[i]);
+end;
+
+// EXACT centered sum of squares: sum_i (PtrA[i] - Mean)^2, eight lanes at a
+// time. Each vector is loaded, the broadcast mean is subtracted and the
+// difference is FMA'd into one of two accumulators; the scalar tail repeats the
+// same subtract-then-square in Pascal.
+//
+// The centered form is the point: the algebraic shortcut sum(x^2) - N*Mean^2
+// cancels catastrophically once |Mean| >> Std, which is exactly the regime a
+// weight-standardization layer sits in.
+//
+// The mean is broadcast from a LOCAL reached through a pointer (the
+// AVXMaxAbsFinite idiom) rather than a global, so no [rip+label] relocation
+// appears and position-independent linking of the examples is unaffected.
+// Coded by Claude (AI).
+function AVXSumSqrCentered(PtrA: TNeuralFloatArrPtr; Mean: Single;
+  NumElements: integer): Single;
+var
+  vRes: array[0..7] of Single;
+  vMean: Single;
+  vMeanPtr: pointer;
+  localNumElements, i, NumElementsM1: integer;
+  Centered: Single;
+begin
+  vMean := Mean;
+  // 16 elements per iteration across two accumulators, so the FMA latency is
+  // covered; the tail (up to 15) is folded scalar below.
+  localNumElements := NumElements and (not 15);
+  Result := 0;
+  if localNumElements > 0 then
+  begin
+    vMeanPtr := Addr(vMean);
+  asm
+  mov rax, PtrA
+  mov rdx, vMeanPtr
+  mov ecx, localNumElements
+  shr ecx, 4
+  vbroadcastss ymm3, [rdx]
+  vxorps    ymm0, ymm0, ymm0
+  vxorps    ymm1, ymm1, ymm1
+@Loop:
+  vmovups   ymm2, [rax]
+  vmovups   ymm4, [rax+32]
+  vsubps    ymm2, ymm2, ymm3
+  vsubps    ymm4, ymm4, ymm3
+  vfmadd231ps ymm0, ymm2, ymm2
+  vfmadd231ps ymm1, ymm4, ymm4
+  add rax, 64
+  dec ecx
+  jnz @Loop
+  vaddps    ymm0, ymm0, ymm1
+  vmovups   vRes, ymm0
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4'
+  ];
+    Result := ((vRes[0] + vRes[1]) + (vRes[2] + vRes[3])) +
+              ((vRes[4] + vRes[5]) + (vRes[6] + vRes[7]));
+  end;
+  NumElementsM1 := NumElements - 1;
+  for i := localNumElements to NumElementsM1 do
+  begin
+    Centered := PtrA^[i] - Mean;
+    Result := Result + Centered * Centered;
+  end;
 end;
 {$ENDIF}
 {$ENDIF}
@@ -11741,6 +11818,31 @@ begin
   vHigh := NumElements - 1;
   for I := 0 to vHigh do
     Result += PtrA^[I] * PtrB^[I];
+end;
+
+class function TNNetVolume.SumSqrCentered(pSrc: TNeuralFloatArrPtr;
+  Mean: TNeuralFloat; N: integer): TNeuralFloat;
+var
+  I, vHigh: integer;
+  Centered: TNeuralFloat;
+begin
+  Result := 0;
+  if N <= 0 then exit;
+  {$IFDEF AVX64}
+  {$IFDEF AVX2}
+  if N >= csMinAvxSize then
+  begin
+    Result := AVXSumSqrCentered(pSrc, Mean, N);
+    exit;
+  end;
+  {$ENDIF}
+  {$ENDIF}
+  vHigh := N - 1;
+  for I := 0 to vHigh do
+  begin
+    Centered := pSrc^[I] - Mean;
+    Result := Result + Centered * Centered;
+  end;
 end;
 
 class function TNNetVolume.MaxAbsFinite(pSrc: TNeuralFloatArrPtr;

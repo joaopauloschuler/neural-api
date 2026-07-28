@@ -26,6 +26,7 @@ type
     procedure TestVolumeMinMaxClassParity;
     procedure TestVolumeExpShiftSumParity;
     procedure TestVolumeAddScalarParity;
+    procedure TestVolumeSumSqrCenteredParity;
     procedure TestVolumeReluGateMaskParity;
     procedure TestVolumeMaxPosParity;
     procedure TestVolumeAddSubValueParity;
@@ -439,6 +440,55 @@ begin
   Buf[0] := 5.0;
   TNNetVolume.AddScalar(TNeuralFloatArrPtr(@Buf[0]), 1.0, 0);
   AssertEquals('empty run', 5.0, Buf[0], 0.0);
+end;
+
+procedure TTestNeuralVolume.TestVolumeSumSqrCenteredParity;
+// SumSqrCentered is a 16-wide FMA reduction on an AVX2/64-bit build and a plain
+// loop everywhere else. The two differ only in summation ORDER and every term
+// is non-negative, so they cannot disagree by more than accumulated rounding --
+// checked here against a DOUBLE-precision reference, which also pins down that
+// the result really is the exact centered sum of squares. Sizes straddle the
+// 16-element block width and its tail, and the csMinAvxSize dispatch threshold.
+const
+  Sizes: array[0..11] of integer = (1, 7, 8, 15, 16, 17, 31, 32, 33, 64, 97, 1000);
+var
+  Buf: array of TNeuralFloat;
+  Ref: double;
+  Got, Mean: TNeuralFloat;
+  SI, K, N: integer;
+begin
+  RandSeed := 271828;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    SetLength(Buf, N);
+    Mean := 0;
+    for K := 0 to N - 1 do
+    begin
+      Buf[K] := (Random - 0.5) * 8;
+      Mean := Mean + Buf[K];
+    end;
+    Mean := Mean / N;
+    Ref := 0;
+    for K := 0 to N - 1 do
+      Ref := Ref + double(Buf[K] - Mean) * double(Buf[K] - Mean);
+    Got := TNNetVolume.SumSqrCentered(TNeuralFloatArrPtr(@Buf[0]), Mean, N);
+    AssertEquals('SumSqrCentered (N=' + IntToStr(N) + ')', Ref, Got, 1e-3);
+  end;
+
+  // The whole point of the centered form: with |Mean| >> Std the algebraic
+  // shortcut sum(x^2) - N*Mean^2 cancels away every significant digit, while
+  // the centered kernel stays accurate. 1e6 +/- 1 has variance 1.
+  N := 512;
+  SetLength(Buf, N);
+  for K := 0 to N - 1 do
+    if K mod 2 = 0 then Buf[K] := 1e6 + 1 else Buf[K] := 1e6 - 1;
+  Got := TNNetVolume.SumSqrCentered(TNeuralFloatArrPtr(@Buf[0]), 1e6, N);
+  AssertEquals('SumSqrCentered on a large-offset run', N * 1.0, Got, 1e-2);
+
+  // A zero-length run has no terms.
+  AssertEquals('empty run', 0.0,
+    TNNetVolume.SumSqrCentered(TNeuralFloatArrPtr(@Buf[0]), 1.0, 0), 0.0);
 end;
 
 procedure TTestNeuralVolume.TestVolumeReluGateMaskParity;
