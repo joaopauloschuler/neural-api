@@ -126937,7 +126937,7 @@ end;
 procedure TNNetNeuron.CalcAdamDelta();
 var
   PL: TNNetLayer;
-  B1, B2, LR, OmB1D, OmB2D, Eps: TNeuralFloat;
+  B1, B2, LR, OmB1D, OmB2D, Eps, InvOmB2D, kLR: TNeuralFloat;
 begin
   // #9: bind the invariant parent-layer Adam hyperparameters once.
   PL    := FParentLayer;
@@ -126961,39 +126961,17 @@ begin
   then FBiasDelta := 1000
   else if FBiasDelta < -1000 then FBiasDelta := -1000;
 *)
-  // Weights Update
-  FDelta2.Copy(FDelta);
-  FDelta2.Mul(FDelta2);
-
-  FBackInertia.MulMulAdd(B1, 1-B1, FDelta);
-  FBackInertia2.MulMulAdd(B2, 1-B2, FDelta2);
-  (*
-  if random(100)=00 then
-  WriteLn(
-    'D1:',  FDelta.GetMaxAbs():8:4,
-    ' D2:', FDelta2.GetMaxAbs():8:4,
-    ' I1:', FBackInertia.GetMaxAbs():8:4,
-    ' I2:', FBackInertia2.GetMaxAbs():8:4
-  );
-  *)
-  FDelta2.Copy(FBackInertia2);
-  // OmB2D = 1 - Beta2Decay is fixed for the whole optimizer step, so scale by
-  // its reciprocal (#21). On a build without AVX this turns one divide per
-  // weight into one divide per layer.
-  FDelta2.Mul(1.0 / OmB2D);
-  FDelta2.VSqrt();
-  FDelta2.Add(Eps);
-
-  FDelta.Fill(LR/OmB1D);
-  FDelta.Mul(FBackInertia);
-  FDelta.Divi(FDelta2);
-  (*
-  if random(100)=00 then
-  WriteLn(
-    'CALC D1:',  FDelta.GetMaxAbs():8:4,
-    ' CALC D2:', FDelta2.GetMaxAbs():8:4
-  );
-  *)
+  // Weights update, one pass. Both bias-correction denominators are fixed for
+  // the whole optimizer step, so they fold into scalars (#21): InvOmB2D scales
+  // the second moment before the square root, kLR scales the first moment.
+  // That removes the Fill / Mul / Divi passes and the FDelta2 scratch row, and
+  // leaves one kernel that reads FDelta, FBackInertia and FBackInertia2 once
+  // and writes each once instead of eleven passes over five buffers.
+  InvOmB2D := 1.0 / OmB2D;
+  kLR := LR / OmB1D;
+  TNNetVolume.AdamDelta(FDelta.DataPtr, FBackInertia.DataPtr,
+    FBackInertia2.DataPtr, B1, 1-B1, B2, 1-B2, InvOmB2D, Eps, kLR,
+    FDelta.Size);
 
   // Bias Update
   FBiasInertia  := B1 * FBiasInertia  + (1 - B1) * FBiasDelta;

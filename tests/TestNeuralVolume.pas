@@ -32,6 +32,7 @@ type
     procedure TestVolumeMaxPosParity;
     procedure TestVolumeAddSubValueParity;
     procedure TestVolumeRankOneUpdateRowParity;
+    procedure TestVolumeAdamDeltaParity;
     procedure TestVolumeFlip;
     procedure TestVolumeClassification;
     procedure TestVolumeSoftMax;
@@ -812,6 +813,109 @@ begin
     for K := 0 to N - 1 do
       AssertEquals('in-place carry[' + IntToStr(K) + ']' + Tag,
         Ref[K], Dst[K], 0.0);
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeAdamDeltaParity;
+// AdamDelta fuses the eleven-pass Adam composition that TNNetNeuron.CalcAdamDelta
+// used to run inline. The reference here is that exact composition, built from
+// the same TNNetVolume primitives in the same order, so the assertion is
+// BIT-identity at tolerance 0.0 rather than a numeric tolerance: neither path
+// uses FMA, so every multiply and every add rounds at the same point.
+// Five consecutive steps are driven with both moments accumulating and the
+// bias-correction denominators moving, so a fused kernel that got the moment
+// recurrence subtly wrong could not hide behind a single step. Sizes straddle
+// the kernel's 8-element block and its scalar tail.
+const
+  Sizes: array[0..8] of integer = (1, 3, 7, 8, 9, 16, 31, 64, 517);
+  cB1 = 0.9;
+  cB2 = 0.999;
+  cEps = 1e-8;
+  cLR = 0.01;
+  cSteps = 5;
+var
+  D, M, V, RefD, RefM, RefV, Scratch: TNNetVolume;
+  G: array of TNeuralFloat;
+  SI, K, N, Step: integer;
+  B1Decay, B2Decay, OmB1D, OmB2D: TNeuralFloat;
+  Tag: string;
+begin
+  RandSeed := 31415926;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    SetLength(G, N);
+    D := TNNetVolume.Create(1, 1, N);
+    M := TNNetVolume.Create(1, 1, N);
+    V := TNNetVolume.Create(1, 1, N);
+    RefD := TNNetVolume.Create(1, 1, N);
+    RefM := TNNetVolume.Create(1, 1, N);
+    RefV := TNNetVolume.Create(1, 1, N);
+    Scratch := TNNetVolume.Create(1, 1, N);
+    try
+      // Both moments start non-zero so the recurrence is exercised from the
+      // first step, and one gradient slot is an exact zero.
+      for K := 0 to N - 1 do
+      begin
+        M.FData[K] := (Random - 0.5) * 0.4;
+        V.FData[K] := Random * 0.3;
+        RefM.FData[K] := M.FData[K];
+        RefV.FData[K] := V.FData[K];
+      end;
+      B1Decay := 1;
+      B2Decay := 1;
+
+      for Step := 1 to cSteps do
+      begin
+        Tag := ' (N=' + IntToStr(N) + ' step ' + IntToStr(Step) + ')';
+        for K := 0 to N - 1 do
+        begin
+          if K mod 9 = 4 then G[K] := 0
+          else G[K] := ((K mod 7) - 3) * 0.25 * Step;
+          D.FData[K] := G[K];
+          RefD.FData[K] := G[K];
+        end;
+        B1Decay := B1Decay * cB1;
+        B2Decay := B2Decay * cB2;
+        OmB1D := 1 - B1Decay;
+        OmB2D := 1 - B2Decay;
+
+        // Reference: the original composition, primitive for primitive.
+        Scratch.Copy(RefD);
+        Scratch.Mul(Scratch);
+        RefM.MulMulAdd(cB1, 1 - cB1, RefD);
+        RefV.MulMulAdd(cB2, 1 - cB2, Scratch);
+        Scratch.Copy(RefV);
+        Scratch.Mul(1.0 / OmB2D);
+        Scratch.VSqrt();
+        Scratch.Add(cEps);
+        RefD.Fill(cLR / OmB1D);
+        RefD.Mul(RefM);
+        RefD.Divi(Scratch);
+
+        TNNetVolume.AdamDelta(D.DataPtr, M.DataPtr, V.DataPtr,
+          cB1, 1 - cB1, cB2, 1 - cB2, 1.0 / OmB2D, cEps, cLR / OmB1D, N);
+
+        for K := 0 to N - 1 do
+        begin
+          AssertEquals('first moment[' + IntToStr(K) + ']' + Tag,
+            RefM.FData[K], M.FData[K], 0.0);
+          AssertEquals('second moment[' + IntToStr(K) + ']' + Tag,
+            RefV.FData[K], V.FData[K], 0.0);
+          AssertEquals('delta[' + IntToStr(K) + ']' + Tag,
+            RefD.FData[K], D.FData[K], 0.0);
+        end;
+      end;
+
+      // A zero-length run must touch nothing.
+      D.FData[0] := 5;
+      TNNetVolume.AdamDelta(D.DataPtr, M.DataPtr, V.DataPtr,
+        cB1, 1 - cB1, cB2, 1 - cB2, 1.0, cEps, cLR, 0);
+      AssertEquals('empty run', 5.0, D.FData[0], 0.0);
+    finally
+      D.Free; M.Free; V.Free;
+      RefD.Free; RefM.Free; RefV.Free; Scratch.Free;
+    end;
   end;
 end;
 

@@ -602,6 +602,21 @@ type
       // via tanh(x) = 1 - 2/(exp(2x)+1) so it inherits Exp's AVX2 path.
       // Matches pcr_tanhf to ~1e-6. Buffers may alias (dst = src).
       class procedure Tanh(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // AdamDelta runs one whole Adam step over a weight row in a single pass:
+      //   m := Beta1*m + OmBeta1*g
+      //   v := Beta2*v + OmBeta2*(g*g)
+      //   g := (kLR*m) / (sqrt(v*InvOmB2D) + Epsilon)
+      // where g is PtrDelta in and the finished increment out, and the two
+      // bias-correction denominators arrive pre-folded as scalars: InvOmB2D is
+      // 1/(1-Beta2^t) and kLR is LearningRate/(1-Beta1^t). Composing this from
+      // Copy/Mul/MulMulAdd/VSqrt/Add/Fill/Divi takes eleven passes and a
+      // scratch row. AVX2/64-bit builds run AVXAdamDelta; every other build
+      // runs the equivalent scalar loop. Neither path uses FMA, so both round
+      // exactly where the composed form rounds and the results are
+      // bit-identical to it.
+      class procedure AdamDelta(PtrDelta, PtrM, PtrV: TNeuralFloatArrPtr;
+        Beta1, OmBeta1, Beta2, OmBeta2, InvOmB2D, Epsilon, kLR: TNeuralFloat;
+        N: integer); static;
       // Relu writes dst[0..N-1] := max(src[0..N-1], 0). AVX2-accelerated
       // (AVXCopyRelu) with a scalar fallback on non-AVX builds. Bit-exact vs the
       // scalar relu-copy. Buffers may alias (dst = src).
@@ -9756,6 +9771,52 @@ begin
   end;
 end;
 
+{$IFDEF AVX2}
+// AVXAdamDelta is defined later in this section under {$IFDEF AVX64};
+// forward-declare it so AdamDelta can call it here.
+procedure AVXAdamDelta(PtrDelta, PtrM, PtrV: TNeuralFloatArrPtr;
+  Beta1, OmBeta1, Beta2, OmBeta2, InvOmB2D, Epsilon, kLR: TNeuralFloat;
+  NumElements: integer); forward;
+{$ENDIF}
+class procedure TNNetVolume.AdamDelta(PtrDelta, PtrM, PtrV: TNeuralFloatArrPtr;
+  Beta1, OmBeta1, Beta2, OmBeta2, InvOmB2D, Epsilon, kLR: TNeuralFloat;
+  N: integer);
+{$IFNDEF AVX2}
+var
+  I: integer;
+  g, m, v, t1, t2: TNeuralFloat;
+{$ENDIF}
+begin
+  if N <= 0 then exit;
+  {$IFDEF AVX2}
+  AVXAdamDelta(PtrDelta, PtrM, PtrV,
+    Beta1, OmBeta1, Beta2, OmBeta2, InvOmB2D, Epsilon, kLR, N);
+  {$ELSE}
+  // Every intermediate lands in a TNeuralFloat before it is used again, so each
+  // operation rounds exactly once - the rounding sequence the composed
+  // Copy/Mul/MulMulAdd/VSqrt/Add/Fill/Divi form performs, and the one the AVX
+  // kernel performs.
+  for I := 0 to N - 1 do
+  begin
+    g  := PtrDelta^[I];
+    t1 := Beta1 * PtrM^[I];
+    t2 := OmBeta1 * g;
+    m  := t1 + t2;
+    t1 := g * g;
+    t2 := OmBeta2 * t1;
+    t1 := Beta2 * PtrV^[I];
+    v  := t2 + t1;
+    PtrM^[I] := m;
+    PtrV^[I] := v;
+    t1 := v * InvOmB2D;
+    t1 := Sqrt(t1);
+    t1 := t1 + Epsilon;
+    t2 := kLR * m;
+    PtrDelta^[I] := t2 / t1;
+  end;
+  {$ENDIF}
+end;
+
 {$IFDEF AVXANY}
 // AVXCopyRelu (dst := max(src,0)) is defined later in this section under
 // {$IFDEF AVXANY}; forward-declare it so Relu can call it here.
@@ -14788,6 +14849,114 @@ begin
   end;
 end;
 
+
+// One fused Adam step over a weight row, eight lanes at a time:
+//   m := Beta1*m + OmBeta1*g
+//   v := Beta2*v + OmBeta2*(g*g)
+//   g := (kLR*m) / (sqrt(v*InvOmB2D) + Epsilon)
+// The composed form needs eleven passes and a scratch row; this reads delta, m
+// and v once and writes each once. No FMA: every multiply and every add rounds
+// separately, which is what keeps the result bit-identical to the composed
+// kernels. The seven scalars are broadcast from their own addresses, so the
+// code stays position independent.
+procedure AVXAdamDelta(PtrDelta, PtrM, PtrV: TNeuralFloatArrPtr;
+  Beta1, OmBeta1, Beta2, OmBeta2, InvOmB2D, Epsilon, kLR: TNeuralFloat;
+  NumElements: integer);
+var
+  pB1, pOmB1, pB2, pOmB2, pInv, pEps, pLR: pointer;
+  localNumElements, MissedElements, I: integer;
+  g, m, v, t1, t2: TNeuralFloat;
+begin
+  MissedElements := NumElements and 7;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+    pB1   := Addr(Beta1);
+    pOmB1 := Addr(OmBeta1);
+    pB2   := Addr(Beta2);
+    pOmB2 := Addr(OmBeta2);
+    pInv  := Addr(InvOmB2D);
+    pEps  := Addr(Epsilon);
+    pLR   := Addr(kLR);
+  asm
+  mov rcx, pB1
+  vbroadcastss ymm9, [rcx]
+  mov rcx, pOmB1
+  vbroadcastss ymm10, [rcx]
+  mov rcx, pB2
+  vbroadcastss ymm11, [rcx]
+  mov rcx, pOmB2
+  vbroadcastss ymm12, [rcx]
+  mov rcx, pInv
+  vbroadcastss ymm13, [rcx]
+  mov rcx, pEps
+  vbroadcastss ymm14, [rcx]
+  mov rcx, pLR
+  vbroadcastss ymm15, [rcx]
+
+  mov rax, PtrDelta
+  mov rdx, PtrM
+  mov r8,  PtrV
+  mov ecx, localNumElements
+  shr ecx, 3
+
+@AdamLoop:
+  vmovups ymm0, [rax]
+  vmulps  ymm1, ymm0, ymm10
+  vmulps  ymm2, ymm9, [rdx]
+  vaddps  ymm1, ymm1, ymm2
+  vmovups [rdx], ymm1
+
+  vmulps  ymm3, ymm0, ymm0
+  vmulps  ymm3, ymm3, ymm12
+  vmulps  ymm4, ymm11, [r8]
+  vaddps  ymm3, ymm3, ymm4
+  vmovups [r8], ymm3
+
+  vmulps  ymm3, ymm3, ymm13
+  vsqrtps ymm3, ymm3
+  vaddps  ymm3, ymm3, ymm14
+  vmulps  ymm1, ymm1, ymm15
+  vdivps  ymm0, ymm1, ymm3
+  vmovups [rax], ymm0
+
+  add rax, 32
+  add rdx, 32
+  add r8, 32
+  dec ecx
+  jnz @AdamLoop
+
+  vzeroupper
+  end [
+    'RAX', 'RCX', 'RDX', 'R8',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4',
+    'ymm9', 'ymm10', 'ymm11', 'ymm12', 'ymm13', 'ymm14', 'ymm15'
+  ];
+  end; // of if
+
+  // Scalar tail. Every intermediate lands in a TNeuralFloat before it is used
+  // again, so each operation rounds exactly once - the same rounding sequence
+  // the kernel above performs.
+  if MissedElements > 0 then
+  for I := localNumElements to NumElements - 1 do
+  begin
+    g  := PtrDelta^[I];
+    t1 := Beta1 * PtrM^[I];
+    t2 := OmBeta1 * g;
+    m  := t1 + t2;
+    t1 := g * g;
+    t2 := OmBeta2 * t1;
+    t1 := Beta2 * PtrV^[I];
+    v  := t2 + t1;
+    PtrM^[I] := m;
+    PtrV^[I] := v;
+    t1 := v * InvOmB2D;
+    t1 := Sqrt(t1);
+    t1 := t1 + Epsilon;
+    t2 := kLR * m;
+    PtrDelta^[I] := t2 / t1;
+  end;
+end;
 procedure AVXMul(PtrA: TNeuralFloatArrPtr; MulOp: TNeuralFloat; NumElements: integer); overload;
 var
   MulOpPtr: pointer;
