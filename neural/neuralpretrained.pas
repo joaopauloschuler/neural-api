@@ -46362,25 +46362,33 @@ end;
 
 // VitsWaveNet fused activation: given a 2H-channel signal, returns an
 // H-channel signal acts[c] = tanh(in[c]) * sigmoid(in[H+c]).
-function VitsFusedActs(const InActs: TNNetFloatDynArr2D;
+// InActs is CONSUMED, hence the var: the sigmoid is written back over the gate
+// half (channels H..2H-1) so the promotion to the elementwise kernels needs no
+// scratch buffer, which the decode path may not allocate. The sole caller passes
+// a fresh RunHiFiGANConv output that it never reads again.
+function VitsFusedActs(var InActs: TNNetFloatDynArr2D;
   H, T: integer): TNNetFloatDynArr2D;
 var
-  c, tt: integer;
-  HM1, TM1: integer;
+  c: integer;
+  HM1: integer;
   TanhRow, GateRow, ResRow: TNeuralFloatDynArr;
 begin
   SetLength(Result, H);
   HM1 := H - 1;
-  TM1 := T - 1;
   for c := 0 to HM1 do
   begin
     SetLength(Result[c], T);
+    if T <= 0 then Continue;
     TanhRow := InActs[c];
     GateRow := InActs[H + c];
     ResRow := Result[c];
-    for tt := 0 to TM1 do
-      ResRow[tt] := pcr_tanhf(TanhRow[tt]) * // #16: fast trap-free tanh (single)
-        (1.0 / (1.0 + NeuralExp(-GateRow[tt])));
+    // #19: three uniform elementwise passes over a long contiguous run instead
+    // of a scalar tanh + exp + divide per element. Both kernels ride Exp's
+    // 8-wide polynomial on an AVX2 build; Tanh tracks pcr_tanhf to ~1e-6, well
+    // inside the 1e-4 importer-parity gate.
+    TNNetVolume.Tanh(@ResRow[0], @TanhRow[0], T);
+    TNNetVolume.Sigmoid(@GateRow[0], @GateRow[0], T);
+    TNNetVolume.Mul(@ResRow[0], @GateRow[0], T);
   end;
 end;
 
