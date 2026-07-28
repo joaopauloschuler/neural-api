@@ -5698,6 +5698,10 @@ type
     FPosTable: TNNetVolume;                // MaxPos*hidden sinusoids
     FEncToDecW: TNNetVolume;               // hidden*textDModel row-major
     FEncToDecB: TNNetVolume;               // hidden
+    // Persistent decoder-input embedding buffer. The generate loops call
+    // RunDecoderOn once per decode step, so this must not be a per-call
+    // TNNetVolume.Create.
+    FInEmb: TNNetVolume;
     FDecSeqLen, FEncSeqLen: integer;
     {$IFDEF OpenCL}
     // OpenCL offload state. When FGpuEnabled the prefill decoder (FDecoder) is
@@ -5715,6 +5719,15 @@ type
     // Builds FStepDecoderUncond (the second width-1 twin for cached CFG) on
     // first use and copies weights from FDecoder. No-op once built.
     procedure EnsureStepDecoderUncond;
+    // Builds the decoder input embeddings into FInEmb and runs FDecoder. Shared
+    // by ComputeLogits and ComputeLogitsAtRow.
+    procedure RunDecoderOn(const Codes: TNNetIntArr2D; EncHidden: TNNetVolume);
+    // Same decoder pass as ComputeLogits, but returns ONLY frame RowIdx as a
+    // (1,1,K*VocabSize) row instead of copying the whole DecSeqLen block. The
+    // autoregressive loops read exactly one frame per step, and at a realistic
+    // DecSeqLen the full copy is tens of MB per step.
+    procedure ComputeLogitsAtRow(const Codes: TNNetIntArr2D;
+      EncHidden: TNNetVolume; RowIdx: integer; RowLogits: TNNetVolume);
   public
     constructor Create(const pConfig: TMusicGenConfig;
       EncSeqLen, DecSeqLen: integer);
@@ -6020,6 +6033,9 @@ type
     FStepDecoder: TNNet;                   // lazily-built width-1 KV-cache twin
     FEmbed: array of TNNetVolume;          // [K] each (vocab+1)*hidden flat
     FPromptEmbed: TNNetVolume;             // promptVocab*hidden (embed_prompts)
+    // Persistent decoder-input embedding buffer. RunDecoderOn is called once per
+    // decode step, so this must not be a per-call TNNetVolume.Create.
+    FInEmb: TNNetVolume;
     FPosTable: TNNetVolume;                // (PromptLen+CodecLen)*hidden sinusoids
     FEncToDecW: TNNetVolume;               // hidden*textDModel row-major
     FEncToDecB: TNNetVolume;               // hidden
@@ -6027,6 +6043,10 @@ type
     // Builds FStepDecoder (the width-1 twin) on first use; copies FDecoder's
     // weights. No-op once built. Coded by Claude (AI).
     procedure EnsureStepDecoder;
+    // Builds the decoder input embeddings into FInEmb and runs FDecoder. Shared
+    // by ComputeLogits and ComputeLogitsAtRow.
+    procedure RunDecoderOn(const PromptIds: array of integer;
+      const Codes: TNNetIntArr2D; EncHidden: TNNetVolume);
   public
     constructor Create(const pConfig: TParlerConfig;
       EncSeqLen, PromptLen, CodecLen: integer);
@@ -6052,6 +6072,12 @@ type
     // in depth slot k*VocabSize..k*VocabSize+VocabSize-1.
     procedure ComputeLogits(const PromptIds: array of integer;
       const Codes: TNNetIntArr2D; EncHidden, Logits: TNNetVolume);
+    // Same decoder pass as ComputeLogits, but returns ONLY codec frame CodecRow
+    // as a (1,1,K*VocabSize) row. The autoregressive loop reads exactly one
+    // frame per step; the full Move is CodecLen*K*Vocab floats every step.
+    procedure ComputeLogitsAtRow(const PromptIds: array of integer;
+      const Codes: TNNetIntArr2D; EncHidden: TNNetVolume; CodecRow: integer;
+      RowLogits: TNNetVolume);
     // Greedy autoregressive generation of NumFrames DAC frames using the delay
     // pattern, conditioned on the description EncStates and the transcript
     // PromptIds. Returns the UNDELAYED code stack Codes[k][t] (k in [0,K-1], t in
@@ -32435,6 +32461,7 @@ begin
   FPosTable := TNNetVolume.Create;
   FEncToDecW := TNNetVolume.Create;
   FEncToDecB := TNNetVolume.Create;
+  FInEmb := TNNetVolume.Create;
   FDecoder := nil;
   FStepDecoder := nil;
   FStepDecoderUncond := nil;
@@ -32453,6 +32480,7 @@ begin
   FPosTable.Free;
   FEncToDecW.Free;
   FEncToDecB.Free;
+  FInEmb.Free;
   FDecoder.Free;
   FStepDecoder.Free;
   FStepDecoderUncond.Free;
@@ -32584,57 +32612,74 @@ begin
   end;
 end;
 
-procedure TMusicGenModel.ComputeLogits(const Codes: TNNetIntArr2D;
-  EncHidden, Logits: TNNetVolume);
+// Builds the decoder input embeddings into FInEmb and runs the transformer
+// blocks. The net's output depth-concatenates the K LM heads, so it is
+// (DecSeqLen,1,K*VocabSize): codebook k's vocab vector at frame t lives at depth
+// k*VocabSize..k*VocabSize+VocabSize-1. Shared by ComputeLogits (full block) and
+// ComputeLogitsAtRow (one frame). Coded by Claude (AI).
+procedure TMusicGenModel.RunDecoderOn(const Codes: TNNetIntArr2D;
+  EncHidden: TNNetVolume);
 var
-  InEmb: TNNetVolume;
   EncStatesInput: TNNetLayer;
-  t, k_i, c, tok, FDecSeqLenM1, NumCodebooksM1, HiddenM1: integer;
+  t, k_i, tok, FDecSeqLenM1, NumCodebooksM1: integer;
   tBase, tokBase: integer;
   pRow: TNeuralFloatArrPtr;
 begin
   FDecSeqLenM1 := FDecSeqLen - 1;
   NumCodebooksM1 := FConfig.NumCodebooks - 1;
-  HiddenM1 := FConfig.Hidden - 1;
   if Length(Codes) <> FConfig.NumCodebooks then
     ImportError('MusicGen ComputeLogits: code stack has ' +
       IntToStr(Length(Codes)) + ' codebooks, expected ' +
       IntToStr(FConfig.NumCodebooks) + '.');
-  // Precompute the decoder input embeddings: sum of the K codebook lookups
-  // plus the sinusoidal position vector, per frame.
-  InEmb := TNNetVolume.Create;
-  try
-    InEmb.ReSize(FDecSeqLen, 1, FConfig.Hidden);
-    InEmb.Fill(0);
-    for t := 0 to FDecSeqLenM1 do
+  // Sum of the K codebook lookups plus the sinusoidal position vector, per
+  // frame. FInEmb is a persistent model-owned buffer: this runs once per decode
+  // step, so it must not allocate. ReSize is a no-op once the shape settles.
+  FInEmb.ReSize(FDecSeqLen, 1, FConfig.Hidden);
+  FInEmb.Fill(0);
+  for t := 0 to FDecSeqLenM1 do
+  begin
+    tBase := t * FConfig.Hidden;
+    pRow := Addr(FInEmb.FData[tBase]); // #8: dst invariant across the k_i loop
+    for k_i := 0 to NumCodebooksM1 do
     begin
-      tBase := t * FConfig.Hidden;
-      pRow := Addr(InEmb.FData[tBase]); // #8: dst invariant across the k_i loop
-      for k_i := 0 to NumCodebooksM1 do
-      begin
-        tok := Codes[k_i][t];
-        if (tok < 0) or (tok > FConfig.VocabSize) then
-          ImportError('MusicGen ComputeLogits: code ' + IntToStr(tok) +
-            ' out of range [0, ' + IntToStr(FConfig.VocabSize) + '].');
-        tokBase := tok * FConfig.Hidden;
-        TNNetVolume.Add(pRow, Addr(FEmbed[k_i].FData[tokBase]), FConfig.Hidden);
-      end;
-      TNNetVolume.Add(pRow, Addr(FPosTable.FData[tBase]), FConfig.Hidden);
+      tok := Codes[k_i][t];
+      if (tok < 0) or (tok > FConfig.VocabSize) then
+        ImportError('MusicGen ComputeLogits: code ' + IntToStr(tok) +
+          ' out of range [0, ' + IntToStr(FConfig.VocabSize) + '].');
+      tokBase := tok * FConfig.Hidden;
+      TNNetVolume.Add(pRow, Addr(FEmbed[k_i].FData[tokBase]), FConfig.Hidden);
     end;
-    // Feed the projected encoder states into the decoder's second input.
-    EncStatesInput := T5EncoderStatesInput(FDecoder);
-    if EncStatesInput.Output.Size <> EncHidden.Size then
-      ImportError('MusicGen ComputeLogits: encoder-states size mismatch.');
-    EncStatesInput.Output.Copy(EncHidden);
-    // Run the transformer blocks from the precomputed embedding. The net's
-    // output already depth-concatenates the K LM heads, so the result is
-    // (DecSeqLen,1,K*VocabSize): codebook k's vocab vector at frame t lives at
-    // depth k*VocabSize..k*VocabSize+VocabSize-1.
-    FDecoder.Compute(InEmb);
-    Logits.Copy(FDecoder.GetLastLayer().Output);
-  finally
-    InEmb.Free;
+    TNNetVolume.Add(pRow, Addr(FPosTable.FData[tBase]), FConfig.Hidden);
   end;
+  // Feed the projected encoder states into the decoder's second input.
+  EncStatesInput := T5EncoderStatesInput(FDecoder);
+  if EncStatesInput.Output.Size <> EncHidden.Size then
+    ImportError('MusicGen ComputeLogits: encoder-states size mismatch.');
+  EncStatesInput.Output.Copy(EncHidden);
+  FDecoder.Compute(FInEmb);
+end;
+
+procedure TMusicGenModel.ComputeLogits(const Codes: TNNetIntArr2D;
+  EncHidden, Logits: TNNetVolume);
+begin
+  RunDecoderOn(Codes, EncHidden);
+  Logits.Copy(FDecoder.GetLastLayer().Output);
+end;
+
+procedure TMusicGenModel.ComputeLogitsAtRow(const Codes: TNNetIntArr2D;
+  EncHidden: TNNetVolume; RowIdx: integer; RowLogits: TNNetVolume);
+var
+  OutVol: TNNetVolume;
+  KV: integer;
+begin
+  KV := FConfig.NumCodebooks * FConfig.VocabSize;
+  RunDecoderOn(Codes, EncHidden);
+  OutVol := FDecoder.GetLastLayer().Output;  // borrowed, not owned
+  if (RowIdx < 0) or (RowIdx >= FDecSeqLen) or ((RowIdx + 1) * KV > OutVol.Size) then
+    ImportError('MusicGen ComputeLogitsAtRow: row ' + IntToStr(RowIdx) +
+      ' is outside the decoder output.');
+  RowLogits.ReSize(1, 1, KV);
+  Move(OutVol.FData[RowIdx * KV], RowLogits.FData[0], KV * csNeuralFloatSize);
 end;
 
 procedure TMusicGenModel.Generate(EncStates: TNNetVolume; NumFrames: integer;
@@ -32703,9 +32748,11 @@ begin
     // codebooks active at the NEXT step, then copy into Delayed.
     for step := 0 to StepsM1 do
     begin
-      ComputeLogits(Delayed, EncHidden, Logits);
+      // Only frame `step` of the logit block is read below, so fetch that one
+      // row rather than copying the whole (DecSeqLen,1,K*VocabSize) block.
+      ComputeLogitsAtRow(Delayed, EncHidden, step, Logits);
       if UseGuidance then
-        ComputeLogits(Delayed, UncondHidden, UncondLogits);
+        ComputeLogitsAtRow(Delayed, UncondHidden, step, UncondLogits);
       t := step + 1; // the delayed column being predicted this step
       for k_i := 0 to NumCodebooksM1 do
       begin
@@ -32716,8 +32763,7 @@ begin
         if (t < FDecSeqLen) and (t >= Off + 1) and
            (t - Off - 1 < NumFrames) then
         begin
-          base := step * (FConfig.NumCodebooks * FConfig.VocabSize) +
-            k_i * FConfig.VocabSize;
+          base := k_i * FConfig.VocabSize; // Logits holds frame `step` alone
           best := 0;
           // The guided logit for token v is
           //   uncond[v] + scale * (cond[v] - uncond[v]).
@@ -33053,7 +33099,7 @@ begin
       for step := 0 to StepsM1 do
       begin
         tStepTick := GetTickCount64;
-        ComputeLogits(Delayed, EncHidden, StepLogits);
+        ComputeLogitsAtRow(Delayed, EncHidden, step, StepLogits);
         tCondTotal := tCondTotal + (GetTickCount64 - tStepTick);
         Inc(StepCount);
         if (StepCount mod 64 = 0) then
@@ -33066,8 +33112,7 @@ begin
           if (t < FDecSeqLen) and (t >= Off + 1) and
              (t - Off - 1 < NumFrames) then
           begin
-            base := step * (FConfig.NumCodebooks * FConfig.VocabSize) +
-              k_i * FConfig.VocabSize;
+            base := k_i * FConfig.VocabSize; // StepLogits holds frame `step`
             Delayed[k_i][t] := SelectToken(StepLogits, base);
           end;
         end;
@@ -33591,6 +33636,7 @@ begin
   FPosTable := TNNetVolume.Create;
   FEncToDecW := TNNetVolume.Create;
   FEncToDecB := TNNetVolume.Create;
+  FInEmb := TNNetVolume.Create;
   FDecoder := nil;
   FStepDecoder := nil;
 end;
@@ -33606,6 +33652,7 @@ begin
   FPosTable.Free;
   FEncToDecW.Free;
   FEncToDecB.Free;
+  FInEmb.Free;
   FDecoder.Free;
   FStepDecoder.Free;
   inherited Destroy;
@@ -33709,37 +33756,62 @@ begin
     (FDecSeqLenM1 + 1) * FConfig.Hidden);
 end;
 
+// Builds the decoder input embeddings into FInEmb and runs FDecoder. Shared by
+// ComputeLogits (all codec frames) and ComputeLogitsAtRow (one frame). FInEmb is
+// a persistent model-owned buffer: the generate loop calls this once per decode
+// step, so it must not allocate. Coded by Claude (AI).
+procedure TParlerTTSModel.RunDecoderOn(const PromptIds: array of integer;
+  const Codes: TNNetIntArr2D; EncHidden: TNNetVolume);
+var
+  EncStatesInput: TNNetLayer;
+begin
+  BuildInputEmbeddings(PromptIds, Codes, FInEmb);
+  EncStatesInput := T5EncoderStatesInput(FDecoder);
+  if EncStatesInput.Output.Size <> EncHidden.Size then
+    ImportError('Parler ComputeLogits: encoder-states size mismatch.');
+  EncStatesInput.Output.Copy(EncHidden);
+  FDecoder.Compute(FInEmb);
+  if FDecoder.GetLastLayer().Output.Size <
+     (FPromptLen + FCodecLen) * FConfig.NumCodebooks * FConfig.VocabSize then
+    ImportError('Parler ComputeLogits: decoder output is smaller than ' +
+      'prompt + codec frames.');
+end;
+
 procedure TParlerTTSModel.ComputeLogits(const PromptIds: array of integer;
   const Codes: TNNetIntArr2D; EncHidden, Logits: TNNetVolume);
 var
-  InEmb, OutVol: TNNetVolume;
-  EncStatesInput: TNNetLayer;
+  OutVol: TNNetVolume;
   KV: integer;
 begin
   KV := FConfig.NumCodebooks * FConfig.VocabSize;
-  InEmb := TNNetVolume.Create;
-  try
-    BuildInputEmbeddings(PromptIds, Codes, InEmb);
-    EncStatesInput := T5EncoderStatesInput(FDecoder);
-    if EncStatesInput.Output.Size <> EncHidden.Size then
-      ImportError('Parler ComputeLogits: encoder-states size mismatch.');
-    EncStatesInput.Output.Copy(EncHidden);
-    FDecoder.Compute(InEmb);
-    // Read only the CODEC-FRAME positions (drop the transcript prefix rows).
-    // The retained rows are the contiguous tail of the (DecSeqLen,1,K*Vocab)
-    // layer output (dst and src both advance by KV per frame), so this is ONE
-    // Move off the BORROWED layer output - no full-tensor copy of the whole
-    // DecSeqLen*K*Vocab logit block first.
-    OutVol := FDecoder.GetLastLayer().Output;   // borrowed, not owned
-    if OutVol.Size < (FPromptLen + FCodecLen) * KV then
-      ImportError('Parler ComputeLogits: decoder output is smaller than ' +
-        'prompt + codec frames.');
-    Logits.ReSize(FCodecLen, 1, KV);
-    Move(OutVol.FData[FPromptLen * KV], Logits.FData[0],
-      FCodecLen * KV * csNeuralFloatSize);
-  finally
-    InEmb.Free;
-  end;
+  RunDecoderOn(PromptIds, Codes, EncHidden);
+  // Read only the CODEC-FRAME positions (drop the transcript prefix rows).
+  // The retained rows are the contiguous tail of the (DecSeqLen,1,K*Vocab)
+  // layer output (dst and src both advance by KV per frame), so this is ONE
+  // Move off the BORROWED layer output - no full-tensor copy of the whole
+  // DecSeqLen*K*Vocab logit block first.
+  OutVol := FDecoder.GetLastLayer().Output;   // borrowed, not owned
+  Logits.ReSize(FCodecLen, 1, KV);
+  Move(OutVol.FData[FPromptLen * KV], Logits.FData[0],
+    FCodecLen * KV * csNeuralFloatSize);
+end;
+
+procedure TParlerTTSModel.ComputeLogitsAtRow(const PromptIds: array of integer;
+  const Codes: TNNetIntArr2D; EncHidden: TNNetVolume; CodecRow: integer;
+  RowLogits: TNNetVolume);
+var
+  OutVol: TNNetVolume;
+  KV: integer;
+begin
+  KV := FConfig.NumCodebooks * FConfig.VocabSize;
+  if (CodecRow < 0) or (CodecRow >= FCodecLen) then
+    ImportError('Parler ComputeLogitsAtRow: codec frame ' + IntToStr(CodecRow) +
+      ' is outside [0, ' + IntToStr(FCodecLen) + ').');
+  RunDecoderOn(PromptIds, Codes, EncHidden);
+  OutVol := FDecoder.GetLastLayer().Output;   // borrowed, not owned
+  RowLogits.ReSize(1, 1, KV);
+  Move(OutVol.FData[(FPromptLen + CodecRow) * KV], RowLogits.FData[0],
+    KV * csNeuralFloatSize);
 end;
 
 procedure TParlerTTSModel.Generate(EncStates: TNNetVolume;
@@ -33791,12 +33863,14 @@ begin
       end;
       for step := 0 to StepsM1 do
       begin
-        ComputeLogits(PromptIds, Delayed, EncHidden, StepLogits);
+        // Only codec frame `step` is read below, so fetch that one row instead
+        // of Moving the whole CodecLen*K*Vocab block every step.
+        ComputeLogitsAtRow(PromptIds, Delayed, EncHidden, step, StepLogits);
         t := step + 1; // delayed column predicted this step
         for k_i := 0 to NumCodebooksM1 do
           if (t < FCodecLen) and (t >= k_i + 1) and (t - k_i - 1 < NumFrames) then
           begin
-            base := step * KV + k_i * FConfig.VocabSize;
+            base := k_i * FConfig.VocabSize; // StepLogits holds frame `step`
             best := 0; bestVal := StepLogits.FData[base];
             for v := 1 to VocabSizeM1 do
             begin
