@@ -15473,6 +15473,13 @@ type
       {$ENDIF}
       procedure ComputeDefaultStride(); virtual;
       procedure ComputeWithStride();  virtual;
+      // True when the per-channel argmax bookkeeping (FMaxPosX/FMaxPosY) has a
+      // consumer. Only the pooling backward reads it, so an inference-only
+      // layer can skip the scalar compare-and-store that runs beside the
+      // vectorized value reduction. Virtual rather than a cached field so it
+      // always tracks the CURRENT FIsTrainable, whenever SetTrainable is
+      // called relative to AddLayer.
+      function NeedsArgMax(): boolean; virtual;
       {$IFDEF OpenCL}
       procedure ComputeOpenCL();
       {$ENDIF}
@@ -15496,6 +15503,10 @@ type
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       procedure ComputeDefaultStride(); override;
       procedure ComputeWithStride(); override;
+      // This layer's FORWARD reads FMaxPosX/FMaxPosY (ComputePositions writes
+      // them into the extra output channels), so the argmax bookkeeping is
+      // required whether or not the layer is trainable.
+      function NeedsArgMax(): boolean; override;
       procedure ComputePositions();
     public
       constructor Create(pPoolSize: integer;
@@ -22282,6 +22293,11 @@ procedure TNNetMaxPoolWithPosition.ComputeWithStride;
 begin
   inherited ComputeWithStride();
   ComputePositions();
+end;
+
+function TNNetMaxPoolWithPosition.NeedsArgMax(): boolean;
+begin
+  Result := True;
 end;
 
 procedure TNNetMaxPoolWithPosition.ComputePositions;
@@ -96827,6 +96843,11 @@ begin
 end;
 {$ENDIF}
 
+function TNNetMaxPool.NeedsArgMax(): boolean;
+begin
+  Result := FIsTrainable;
+end;
+
 procedure TNNetMaxPool.ComputeDefaultStride();
 var
   CntX, CntY, CntD: integer;
@@ -96835,11 +96856,14 @@ var
   OutputRawPos, IdxRawPos: integer;
   InputRawPtr, OutputRawPtr: TNeuralFloatArrPtr;
   Depth: integer;
+  LocalNeedsArgMax: boolean;
 begin
   MaxX := FInputCopy.SizeX - 1;
   MaxY := FInputCopy.SizeY - 1;
   MaxD := FInputCopy.Depth - 1;
   Depth := FInputCopy.Depth;
+  // #20: one test per forward instead of a branch inside the depth loop.
+  LocalNeedsArgMax := NeedsArgMax();
 
   for CntY := 0 to MaxY do
   begin
@@ -96854,15 +96878,20 @@ begin
       // its own winning X,Y). Tracked here against the running max -- strict '>'
       // so the FIRST input position reaching the maximum keeps the slot, exactly
       // matching the original scalar loop -- BEFORE the vectorized value update.
-      IdxRawPos := OutputRawPos;
-      for CntD := 0 to MaxD do
+      // Only the pooling backward (and TNNetMaxPoolWithPosition's forward) reads
+      // it, so an inference-only layer skips the whole scalar pass.
+      if LocalNeedsArgMax then
       begin
-        if InputRawPtr^[CntD] > FOutput.FData[IdxRawPos] then
+        IdxRawPos := OutputRawPos;
+        for CntD := 0 to MaxD do
         begin
-          FMaxPosX[IdxRawPos] := CntX;
-          FMaxPosY[IdxRawPos] := CntY;
+          if InputRawPtr^[CntD] > FOutput.FData[IdxRawPos] then
+          begin
+            FMaxPosX[IdxRawPos] := CntX;
+            FMaxPosY[IdxRawPos] := CntY;
+          end;
+          Inc(IdxRawPos);
         end;
-        Inc(IdxRawPos);
       end;
       // Depth-contiguous vectorized value reduction:
       // FOutput[d] := max(FOutput[d], InputRawPtr[d]).
@@ -96881,11 +96910,14 @@ var
   OutputRawPtr, InputRawPtr: TNeuralFloatArrPtr;
   LocalPoolSizeM1, InputSizeXM1, InputSizeYM1: integer;
   Depth: integer;
+  LocalNeedsArgMax: boolean;
 begin
   OutputMaxX := Output.SizeX - 1;
   OutputMaxY := Output.SizeY - 1;
   MaxD := FPrevLayer.Output.Depth - 1;
   Depth := FPrevLayer.Output.Depth;
+  // #20: one test per forward instead of a branch inside the depth loop.
+  LocalNeedsArgMax := NeedsArgMax();
   LocalPoolSizeM1 := FPoolSize - 1;
   InputSizeXM1 := FInputCopy.SizeX - 1;
   InputSizeYM1 := FInputCopy.SizeY - 1;
@@ -96906,21 +96938,25 @@ begin
       // is tracked with a scalar loop against the running max BEFORE the strip
       // is folded in. Window cells are visited in the same PX-then-PY order the
       // original scalar loop used, so the strict-'>' first-winner tie-break
-      // (and hence FMaxPosX/FMaxPosY) is bit-for-bit preserved.
+      // (and hence FMaxPosX/FMaxPosY) is bit-for-bit preserved. The argmax pass
+      // is skipped entirely when nothing reads it (inference-only layer).
       for CntInputPX := InX to InXMax do
       begin
         for CntInputPY := InY to InYMax do
         begin
           InputRawPtr := FInputCopy.GetRawPtr(CntInputPX, CntInputPY);
-          IdxRawPos := OutputRawPos;
-          for CntD := 0 to MaxD do
+          if LocalNeedsArgMax then
           begin
-            if InputRawPtr^[CntD] > FOutput.FData[IdxRawPos] then
+            IdxRawPos := OutputRawPos;
+            for CntD := 0 to MaxD do
             begin
-              FMaxPosX[IdxRawPos] := CntInputPX;
-              FMaxPosY[IdxRawPos] := CntInputPY;
+              if InputRawPtr^[CntD] > FOutput.FData[IdxRawPos] then
+              begin
+                FMaxPosX[IdxRawPos] := CntInputPX;
+                FMaxPosY[IdxRawPos] := CntInputPY;
+              end;
+              Inc(IdxRawPos);
             end;
-            Inc(IdxRawPos);
           end;
           FOutput.MaxElements(OutputRawPtr, InputRawPtr, Depth);
         end;

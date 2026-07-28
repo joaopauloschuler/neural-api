@@ -26,6 +26,9 @@ type
     // DeMaxPool (Upsampling) tests
     procedure TestDeMaxPoolForward;
     procedure TestDeMaxPoolOutputSize;
+
+    // MaxPoolWithPosition tests
+    procedure TestMaxPoolWithPositionNonTrainable;
     
     // Upsample tests
     procedure TestUpsampleForward;
@@ -792,6 +795,57 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+// TNNetMaxPoolWithPosition is the one pooling layer whose FORWARD consumes the
+// inherited argmax arrays, so it must keep recording them even when the layer
+// is marked inference-only (where plain TNNetMaxPool skips the bookkeeping,
+// nothing but the pooling backward reading it). Both passes must agree.
+procedure TTestNeuralLayersExtra.TestMaxPoolWithPositionNonTrainable;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Pool: TNNetLayer;
+  X, Y, D, Pass: integer;
+begin
+  for Pass := 0 to 1 do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(4, 4, 2);
+    try
+      NN.AddLayer(TNNetInput.Create(4, 4, 2));
+      Pool := NN.AddLayer(TNNetMaxPoolWithPosition.Create(2, 2, 0, 1, 1, 0));
+      if Pass = 1 then Pool.SetTrainable(False);
+
+      for Y := 0 to 3 do
+        for X := 0 to 3 do
+          for D := 0 to 1 do
+            Input[X, Y, D] := X * 10 + Y + D * 0.5;
+
+      NN.Compute(Input);
+
+      // Output depth is 3*2: channels 0..1 hold the pooled maxima, 2..3 the
+      // logged X position and 4..5 the logged Y position (each normalised by
+      // the input spatial size). Window (X,Y) spans 2X..2X+1 by 2Y..2Y+1 and
+      // the chosen value grows with X then Y, so its argmax is always the
+      // window's far corner (2X+1, 2Y+1).
+      for Y := 0 to 1 do
+        for X := 0 to 1 do
+          for D := 0 to 1 do
+          begin
+            AssertEquals('Pooled maximum (pass ' + IntToStr(Pass) + ')',
+              (2*X + 1) * 10 + (2*Y + 1) + D * 0.5,
+              NN.GetLastLayer.Output[X, Y, D], 0.0001);
+            AssertEquals('Logged X position (pass ' + IntToStr(Pass) + ')',
+              (2*X + 1) / 4, NN.GetLastLayer.Output[X, Y, D + 2], 0.0001);
+            AssertEquals('Logged Y position (pass ' + IntToStr(Pass) + ')',
+              (2*Y + 1) / 4, NN.GetLastLayer.Output[X, Y, D + 4], 0.0001);
+          end;
+    finally
+      NN.Free;
+      Input.Free;
+    end;
   end;
 end;
 
