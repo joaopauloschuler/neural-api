@@ -4502,6 +4502,17 @@ type
     PadMode: string;            // 'reflect' (EnCodec) / 'constant' / 'replicate'
     W: array of TNeuralFloat;   // flat [OutCh, InCh, Kernel] row-major
     B: array of TNeuralFloat;   // [OutCh]
+    // Loader-built weight repacks (#27). Every Run* forward takes this record as
+    // const and is called once per audio chunk, so the layout its contraction
+    // needs is built ONCE at load time instead of being malloc'd and filled on
+    // every call; W is released as soon as a repack supersedes it.
+    // EnCodec (Single math): WT holds the ConvTranspose1d columns
+    // [(o*Kernel + k)*InCh + i]; the forward conv reads W in place.
+    // Mimi/DAC (Double math): WPack holds every weight widened to Double, in the
+    // forward-conv order [o][i][k] or, when Transpose, the per-group column
+    // order [(o*Kernel + k)*(InCh div Groups) + i] with the groups concatenated.
+    WT: array of TNeuralFloat;
+    WPack: array of Double;
   end;
 
   // One residual block: ELU -> Conv1 -> ELU -> Conv2 (+ shortcut Conv).
@@ -4969,6 +4980,11 @@ type
     W: array of TNeuralFloat;   // flat [OutCh, InCh, Kernel] (conv) /
                                 // [InCh, OutCh, Kernel] (transpose), row-major
     B: array of TNeuralFloat;   // [OutCh]
+    // Loader-built ConvTranspose1d repack (#27): columns
+    // [(o*Kernel + k)*InCh + i]. RunHiFiGANConv takes the record as const and
+    // runs once per synthesis call, so LoadHiFiGANConv builds this once and
+    // releases W. Empty for a forward conv, which reads W in place.
+    WT: array of TNeuralFloat;
   end;
 
   // One HiFi-GAN ResBlock. Type 1 (jik876 v1): per dilation tap a (Conv1
@@ -41052,6 +41068,85 @@ end;
 // dim=0). HF's safetensors store v as [Out,In,K] for Conv1d and [In,Out,K]
 // for ConvTranspose1d; the flat row-major layout is preserved verbatim into
 // Conv.W (the run-time forward indexes it accordingly).
+// Repacks a ConvTranspose1d weight [In, Out div Groups, K] into the column
+// layout the transposed-im2col forward contracts over: for each (out-channel
+// within its group o, tap k) the group's input channels become contiguous, at
+// [(o*K + k)*IPG + gi], groups concatenated. In the source layout that column is
+// strided by OPG*K, so gathering it is a cache-hostile walk of the whole weight
+// array - which is why it is done here, once per model, and not per call (#27).
+// Ungrouped callers pass Groups = 1. Coded by Claude (AI).
+procedure PackTransposeColumnsSingle(const W: TNeuralFloatDynArr;
+  InCh, OutCh, K, Groups: integer; var WT: TNeuralFloatDynArr);
+var
+  IPG, OPG, OPGK, grp, grpIPG, o, k2, gi, wpack, wpos: integer;
+begin
+  if Groups < 1 then Groups := 1;
+  IPG := InCh div Groups;
+  OPG := OutCh div Groups;
+  OPGK := OPG * K;
+  SetLength(WT, Length(W));
+  wpack := 0;
+  for grp := 0 to Groups - 1 do
+  begin
+    grpIPG := grp * IPG;
+    for o := 0 to OPG - 1 do
+      for k2 := 0 to K - 1 do
+      begin
+        wpos := grpIPG * OPGK + o * K + k2;
+        for gi := 0 to IPG - 1 do
+        begin
+          WT[wpack] := W[wpos];
+          Inc(wpack);
+          Inc(wpos, OPGK);
+        end;
+      end;
+  end;
+end;
+
+// As PackTransposeColumnsSingle, but widening to the Double accumulator layout
+// the Mimi/DAC holder math contracts over (their parity gate needs Double
+// operands; feeding Single weights to a mixed-precision dot measures 7-10x
+// SLOWER on this FPC, so the widened copy is the fast form). Coded by Claude (AI).
+procedure PackTransposeColumnsDouble(const W: TNeuralFloatDynArr;
+  InCh, OutCh, K, Groups: integer; var WD: TMimiDblArr);
+var
+  IPG, OPG, OPGK, grp, grpIPG, o, k2, gi, wpack, wpos: integer;
+begin
+  if Groups < 1 then Groups := 1;
+  IPG := InCh div Groups;
+  OPG := OutCh div Groups;
+  OPGK := OPG * K;
+  SetLength(WD, Length(W));
+  wpack := 0;
+  for grp := 0 to Groups - 1 do
+  begin
+    grpIPG := grp * IPG;
+    for o := 0 to OPG - 1 do
+      for k2 := 0 to K - 1 do
+      begin
+        wpos := grpIPG * OPGK + o * K + k2;
+        for gi := 0 to IPG - 1 do
+        begin
+          WD[wpack] := W[wpos];
+          Inc(wpack);
+          Inc(wpos, OPGK);
+        end;
+      end;
+  end;
+end;
+
+// Widens a forward-conv weight to Double in place-order: the [o][i][k] layout is
+// already the order the im2col patch is gathered in, so only the element type
+// changes. Same rationale as above - Double operands are the fast form here.
+procedure WidenWeightsToDouble(const W: TNeuralFloatDynArr; var WD: TMimiDblArr);
+var
+  i, LpMax: integer;
+begin
+  SetLength(WD, Length(W));
+  LpMax := Length(W) - 1;
+  for i := 0 to LpMax do WD[i] := W[i];
+end;
+
 procedure LoadEnCodecConv(Reader: TNNetSafeTensorsReader;
   const Prefix: string; var Conv: TEnCodecConv; pTranspose: boolean;
   pStride, pDilation: integer; Consumed: TStrings);
@@ -41120,6 +41215,12 @@ begin
         for k2 := 0 to KM1 do
           Conv.W[Base + i * K + k2] :=
             G.FData[o] * V.FData[Base + i * K + k2] / Norm;
+    end;
+    if pTranspose then
+    begin
+      // The transposed forward only ever reads the column repack, so W goes.
+      PackTransposeColumnsSingle(Conv.W, Conv.InCh, Conv.OutCh, K, 1, Conv.WT);
+      SetLength(Conv.W, 0);
     end;
     Reader.LoadTensorFlat(Prefix + '.bias', G);
     Consumed.Add(Prefix + '.bias');
@@ -41780,7 +41881,7 @@ begin
       for t := 0 to FullLenM1 do FullRow[t] := Acc;
     end;
     // Transposed-im2col overlap-add upsample. InT packs InSig as [t*InCh + i] so
-    // each t-column is InCh-contiguous; WT repacks W as [(o*K + k2)*InCh + i] so
+    // each t-column is InCh-contiguous; WT holds W as [(o*K + k2)*InCh + i] so
     // each (o,k2) tap is InCh-contiguous. The in-channel contraction then becomes
     // one AVX DotProduct per (o,t,k2). The (t,k2) overlap-add order into
     // Full[o][idx] matches the original i,t,o,k2 scatter; only the inner i-sum
@@ -41793,19 +41894,9 @@ begin
       for i := 0 to InChM1 do
         InT[tInChP + i] := InSig[i][t];
     end;
-    SetLength(WT, OutCh * K * InCh);
-    OCKp := OutCh * K;                   // App A: hoist OutCh*K
-    for o := 0 to OutChM1 do
-      for k2 := 0 to KM1 do
-      begin
-        dstBaseP := (o * K + k2) * InCh; // #11: pack column base
-        srcIdxP := o * K + k2;           // #6: carry src by OutCh*K across i
-        for i := 0 to InChM1 do
-        begin
-          WT[dstBaseP + i] := Conv.W[srcIdxP];
-          Inc(srcIdxP, OCKp);
-        end;
-      end;
+    // WT is the loader-built column repack (LoadEnCodecConv); binding it costs a
+    // refcount, not a copy or a gather.
+    WT := Conv.WT;
     {$IFDEF OpenCL}
     // Opt-in OpenCL fast path: the per-(o,t,k2) in-channel contraction is one
     // device GEMM (same shared dot-product kernel as the forward path), then the
@@ -42732,6 +42823,14 @@ begin
     SetLength(Conv.W, W.Size);
     LpMax := W.Size - 1;
     for o := 0 to LpMax do Conv.W[o] := W.FData[o];
+    // Mimi's forward contracts in Double; build that layout once and drop the
+    // Single original, which nothing reads afterwards.
+    if pTranspose then
+      PackTransposeColumnsDouble(Conv.W, Conv.InCh, Conv.OutCh, K, pGroups,
+        Conv.WPack)
+    else
+      WidenWeightsToDouble(Conv.W, Conv.WPack);
+    SetLength(Conv.W, 0);
     // Optional bias.
     if Reader.HasTensor(Prefix + '.bias') then
     begin
@@ -42806,10 +42905,9 @@ var
   Acc: double;
   Padded, Full: TMimiDblArr2D;
   Patch, WD: TMimiDblArr; // im2col gather + Double-packed weights
-  IPGK, lp: integer;
-  WDMax: integer;
+  IPGK: integer;
   grpIPG, grpOPG, oBase, tS, giK, wOfs: integer;
-  OPGK, oK, wpack, wpos: integer;
+  OPGK, wpack, grpBase: integer;
   PadRow, FullRow: TMimiDblArr;
   IsReplicate: boolean;   // #8: hoist the pad-mode string compare once
   Left, Right: double;    // #5: per-channel replicate pad values
@@ -42868,11 +42966,9 @@ begin
     IPGK := IPG * K;
     SetLength(OutSig, OutCh);
     for o := 0 to OutChM1 do SetLength(OutSig[o], OutLen);
-    // Pre-pack the (single) Conv weights into a contiguous Double buffer once so
-    // the per-output-position contraction is a contiguous Double DotProduct.
-    SetLength(WD, OutCh * IPGK);
-    WDMax := OutCh * IPGK - 1;
-    for lp := 0 to WDMax do WD[lp] := Conv.W[lp];
+    // WD is the loader-built Double weight layout (LoadMimiConv); binding it
+    // costs a refcount, not the multi-MB widening copy this used to redo per call.
+    WD := Conv.WPack;
     // im2col over the OUTPUT-TIME axis. For a fixed (group, t) the receptive-field
     // patch (ordered [gi*K + k2], matching the [Out,In/groups,K] weight layout)
     // is shared by all OPG output channels in the group, so it is gathered once
@@ -42941,34 +43037,20 @@ begin
     // scatter; only the inner gi-sum reassociates (4-wide). Coded by Claude (AI).
     SetLength(Patch, IPG);       // InSig column over the group, [gi]
     OPGK := OPG * K;
-    SetLength(WD, OPGK * IPG);    // group's weight columns pre-packed, [(o*K+k2)*IPG + gi]
+    // WD is the loader-built Double column repack (LoadMimiConv), all groups
+    // concatenated as [(o*K+k2)*IPG + gi]; binding it costs a refcount, not the
+    // per-group strided gather this used to redo per call.
+    WD := Conv.WPack;
+    grpBase := 0;                 // grp * OPGK * IPG, carried across groups
     for grp := 0 to GM1 do
     begin
       grpIPG := grp * IPG;
       grpOPG := grp * OPG;
-      // Pre-pack this group's weight columns once (all t-invariant): for each
-      // (o,k2) gather the gi-contiguous column W[(grpIPG+gi)*OPGK + o*K + k2]
-      // (otherwise strided by OPGK). Repacked once per group instead of per t.
-      wpack := 0;
-      for o := 0 to OPGM1 do
-      begin
-        oK := o * K;
-        for k2 := 0 to KM1 do
-        begin
-          wpos := grpIPG * OPGK + oK + k2;
-          for gi := 0 to IPGM1 do
-          begin
-            WD[wpack] := Conv.W[wpos];
-            Inc(wpack);
-            Inc(wpos, OPGK);
-          end;
-        end;
-      end;
       for t := 0 to InLenM1 do
       begin
         tS := t * Stride;
         for gi := 0 to IPGM1 do Patch[gi] := InSig[grpIPG + gi][t];
-        wpack := 0;
+        wpack := grpBase;
         for o := 0 to OPGM1 do
         begin
           co := grpOPG + o;
@@ -42983,6 +43065,7 @@ begin
           end;
         end;
       end;
+      Inc(grpBase, OPGK * IPG);
     end;
     // Bias was preset into Full at init; overlap-add accumulated on top.
     // Causal right-trim: padding_right = K - stride (trim_right_ratio 1.0),
@@ -44137,12 +44220,12 @@ procedure RunDACConv(const Conv: TEnCodecConv; Pad: integer;
 var
   InCh, OutCh, K, Stride, Dil, InLen, EffK, o, i, t, k2: integer;
   PaddedLen, OutLen, FullLen, idx: integer;
-  InChM1, OutChM1, KM1, InLenM1, OutLenM1, FullLenM1, lp: integer;
+  InChM1, OutChM1, KM1, InLenM1, OutLenM1, FullLenM1: integer;
   Padded, Full: TMimiDblArr2D;
   Patch, WD, WT: TMimiDblArr;
   InCK: integer;
-  PaddedLenM1, WDMax: integer;
-  tS, iK, wOfs, oK, OCK, wpos, wpack, src: integer;
+  PaddedLenM1: integer;
+  tS, iK, wOfs, wpack, src: integer;
   PadRow, FullRow: TMimiDblArr;
   Acc: double;
 begin
@@ -44174,9 +44257,9 @@ begin
     InCK := InCh * K;
     SetLength(OutSig, OutCh);
     for o := 0 to OutChM1 do SetLength(OutSig[o], OutLen);
-    SetLength(WD, OutCh * InCK);
-    WDMax := OutCh * InCK - 1;
-    for lp := 0 to WDMax do WD[lp] := Conv.W[lp];
+    // WD is the loader-built Double weight layout (LoadDACConv); binding it
+    // costs a refcount, not the multi-MB widening copy this used to redo per call.
+    WD := Conv.WPack;
     SetLength(Patch, InCK);
     for t := 0 to OutLenM1 do
     begin
@@ -44220,26 +44303,10 @@ begin
     // For each (out-channel o, tap k2) the contraction over input channels i is
     // contiguous once the weight column W[i*Out*K + o*K + k2] is repacked in i.
     SetLength(Patch, InCh);    // InSig column over channels at time t
-    OCK := OutCh * K;
-    SetLength(WD, OCK * InCh); // weight columns pre-packed, [(o*K+k2)*InCh + i]
-    // Pre-pack once (all t-invariant): for each (o,k2) gather the i-contiguous
-    // column W[i*OCK + o*K + k2] (otherwise strided by OCK). Packed once per call
-    // instead of re-gathered per t.
-    wpack := 0;
-    for o := 0 to OutChM1 do
-    begin
-      oK := o * K;
-      for k2 := 0 to KM1 do
-      begin
-        wpos := oK + k2;       // i = 0
-        for i := 0 to InChM1 do
-        begin
-          WD[wpack] := Conv.W[wpos];
-          Inc(wpack);
-          Inc(wpos, OCK);
-        end;
-      end;
-    end;
+    // WD is the loader-built Double column repack (LoadDACConv), laid out as
+    // [(o*K+k2)*InCh + i]; binding it costs a refcount, not the strided gather
+    // over the whole weight array this used to redo per call.
+    WD := Conv.WPack;
     for t := 0 to InLenM1 do
     begin
       tS := t * Stride;
@@ -44274,9 +44341,13 @@ end;
 // (.parametrizations.weight.original0/1 or legacy .weight_g/.weight_v); folds
 // w = g*v/||v|| (weight_norm dim=0) when parametrized. pTranspose selects the
 // [In,Out,K] ConvTranspose1d weight layout. Coded by Claude (AI).
+// pRawWeightOnly marks a conv that RunDACConv never sees: the RVQ in_proj /
+// out_proj are 1x1 matmuls contracted by hand inside Encode/Decode straight off
+// the Single W (out_proj deliberately multiplies Single by Single - the parity
+// gate is calibrated on that), so they keep W and get no Double repack.
 procedure LoadDACConv(Reader: TNNetSafeTensorsReader; const Prefix: string;
   var Conv: TEnCodecConv; pTranspose: boolean; pStride, pDilation: integer;
-  Consumed: TStrings);
+  Consumed: TStrings; pRawWeightOnly: boolean = False);
 var
   LpMax: integer;
   G, V: TNNetVolume;
@@ -44356,6 +44427,17 @@ begin
             Conv.W[Base + i * K + k2] :=
               G.FData[o] * V.FData[Base + i * K + k2] / Norm;
       end;
+    end;
+    // DAC's forward contracts in Double; build that layout once and drop the
+    // Single original, which nothing reads afterwards.
+    if not pRawWeightOnly then
+    begin
+      if pTranspose then
+        PackTransposeColumnsDouble(Conv.W, Conv.InCh, Conv.OutCh, Conv.Kernel,
+          1, Conv.WPack)
+      else
+        WidenWeightsToDouble(Conv.W, Conv.WPack);
+      SetLength(Conv.W, 0);
     end;
     // bias
     Reader.LoadTensorFlat(Prefix + '.bias', G);
@@ -44793,9 +44875,9 @@ begin
     begin
       QPref := 'quantizer.quantizers.' + IntToStr(q);
       LoadDACConv(Reader, QPref + '.in_proj', Model.FInProj[q], False, 1, 1,
-        Consumed);
+        Consumed, True);
       LoadDACConv(Reader, QPref + '.out_proj', Model.FOutProj[q], False, 1, 1,
-        Consumed);
+        Consumed, True);
       LoadEnCodecMat(Reader, QPref + '.codebook.weight', Model.FCodebooks[q],
         Consumed);
     end;
@@ -45144,6 +45226,12 @@ begin
       Conv.InCh := InDim;
       Conv.OutCh := OutDim;
     end;
+    if pTranspose then
+    begin
+      // The transposed forward only ever reads the column repack, so W goes.
+      PackTransposeColumnsSingle(Conv.W, Conv.InCh, Conv.OutCh, K, 1, Conv.WT);
+      SetLength(Conv.W, 0);
+    end;
     Reader.LoadTensorFlat(Prefix + '.bias', G);
     Consumed.Add(Prefix + '.bias');
     SetLength(Conv.B, G.Size);
@@ -45289,7 +45377,7 @@ begin
       for t := 0 to OutLenM1 do OutRow[t] := Acc;
     end;
     // Transposed-im2col overlap-add. InT packs InSig as [t*InCh + i] so each
-    // t-column is InCh-contiguous; WT repacks W as [(o*K + k2)*InCh + i] so each
+    // t-column is InCh-contiguous; WT holds W as [(o*K + k2)*InCh + i] so each
     // (o,k2) tap is InCh-contiguous. The in-channel contraction then becomes one
     // AVX DotProduct per (o,t,k2) that lands in OutSig. The (t,k2) overlap-add
     // order matches the original i,t,o,k2 scatter; only the inner i-sum
@@ -45302,19 +45390,9 @@ begin
       for i := 0 to InChM1 do
         InT[tInChP + i] := InSig[i][t];
     end;
-    SetLength(WT, OutCh * K * InCh);
-    OCKp := OutCh * K;                   // App A: hoist OutCh*K
-    for o := 0 to OutChM1 do
-      for k2 := 0 to KM1 do
-      begin
-        dstBaseP := (o * K + k2) * InCh; // #11: pack column base
-        srcIdxP := o * K + k2;           // #6: carry src by OutCh*K across i
-        for i := 0 to InChM1 do
-        begin
-          WT[dstBaseP + i] := Conv.W[srcIdxP];
-          Inc(srcIdxP, OCKp);
-        end;
-      end;
+    // WT is the loader-built column repack (LoadHiFiGANConv); binding it costs a
+    // refcount, not a copy or a gather.
+    WT := Conv.WT;
     {$IFDEF OpenCL}
     // Opt-in OpenCL fast path: the per-(o,t,k2) in-channel contraction is one
     // device GEMM (shared dot-product kernel), then the result scatters into the
