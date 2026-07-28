@@ -47156,28 +47156,28 @@ end;
 
 procedure TNNetFlipY.Compute();
 var
-  CntX, CntY, MaxX, MaxY, MaxD: integer;
+  CntY, MaxY, RowLen: integer;
   srcBase, dstBase: integer;
   StartTime: double;
 begin
   StartTime := Now();
-  MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
-  MaxD := FOutput.Depth - 1;
+  // A row is SizeX*Depth contiguous floats and the flip permutes whole rows,
+  // so each row is a single Move.
+  RowLen := FOutput.SizeX * FOutput.Depth;
   for CntY := 0 to MaxY do
-    for CntX := 0 to MaxX do
-    begin
-      srcBase := FPrevLayer.FOutput.GetRawPos(CntX, MaxY - CntY);
-      dstBase := FOutput.GetRawPos(CntX, CntY);
-      Move(FPrevLayer.FOutput.FData[srcBase], FOutput.FData[dstBase],
-        (MaxD + 1) * csNeuralFloatSize);
-    end;
+  begin
+    srcBase := (MaxY - CntY) * RowLen;
+    dstBase := CntY * RowLen;
+    Move(FPrevLayer.FOutput.FData[srcBase], FOutput.FData[dstBase],
+      RowLen * csNeuralFloatSize);
+  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetFlipY.Backpropagate();
 var
-  CntX, CntY, MaxX, MaxY, MaxD: integer;
+  CntY, MaxY, RowLen: integer;
   StartTime, LocalNow: double;
 begin
   StartTime := Now();
@@ -47186,16 +47186,15 @@ begin
   TestBackPropCallCurrCnt();
   if FPrevLayer.FOutputError.Size = FOutputError.Size then
   begin
-    MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
-    MaxD := FOutput.Depth - 1;
+    RowLen := FOutput.SizeX * FOutput.Depth;
     // Involution: applying the same vertical flip backwards routes the
-    // gradient for output (x, y) into source (x, MaxY - y).
+    // gradient for output row y into source row MaxY - y. Rows are contiguous,
+    // so each is a single Add.
     for CntY := 0 to MaxY do
-      for CntX := 0 to MaxX do
-        TNNetVolume.Add(
-          FPrevLayer.FOutputError.GetRawPtr(CntX, CntY),
-          FOutputError.GetRawPtr(CntX, MaxY - CntY), MaxD + 1);
+      TNNetVolume.Add(
+        FPrevLayer.FOutputError.GetRawPtr(CntY * RowLen),
+        FOutputError.GetRawPtr((MaxY - CntY) * RowLen), RowLen);
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -48290,8 +48289,8 @@ end;
 
 procedure TNNetRoll.Compute();
 var
-  CntX, CntY, CntD, MaxX, MaxY, MaxD, SizeX, SizeY, Depth, Shift, Axis, Src: integer;
-  OutBase, SrcBase, Sh: integer;
+  CntX, CntY, MaxX, MaxY, SizeX, SizeY, Depth, Shift, Axis: integer;
+  OutBase, SrcBase, Sh, RowLen, HeadLen, VolLen: integer;
   StartTime: double;
 begin
   StartTime := Now();
@@ -48300,32 +48299,51 @@ begin
   Depth := FOutput.Depth;
   MaxX := SizeX - 1;
   MaxY := SizeY - 1;
-  MaxD := Depth - 1;
   Shift := FStruct[0];
   Axis := FStruct[1];
   // Pascal's mod can be negative for negative LHS; double-mod to wrap.
   // Stored axis: 1 = X, 2 = Y, else (0) = Depth.
   case Axis of
     1:
-      for CntY := 0 to MaxY do
-        for CntX := 0 to MaxX do
-        begin
-          Src := ((CntX - Shift) mod SizeX + SizeX) mod SizeX;
-          OutBase := FOutput.GetRawPos(CntX, CntY);
-          SrcBase := FPrevLayer.FOutput.GetRawPos(Src, CntY);
-          Move(FPrevLayer.FOutput.FData[SrcBase], FOutput.FData[OutBase],
-            Depth * csNeuralFloatSize);
-        end;
-    2:
-      for CntY := 0 to MaxY do
       begin
-        Src := ((CntY - Shift) mod SizeY + SizeY) mod SizeY;  // #11: CntX-invariant
-        for CntX := 0 to MaxX do
+        // X roll: a row is SizeX*Depth contiguous floats and the rotation moves
+        // whole columns, so each row is two contiguous runs -- two Moves per row
+        // rather than one Move per cell.
+        Sh := ((Shift mod SizeX) + SizeX) mod SizeX;
+        RowLen := SizeX * Depth;
+        if Sh = 0 then
+          Move(FPrevLayer.FOutput.FData[0], FOutput.FData[0],
+            RowLen * (MaxY + 1) * csNeuralFloatSize)
+        else
         begin
-          OutBase := FOutput.GetRawPos(CntX, CntY);
-          SrcBase := FPrevLayer.FOutput.GetRawPos(CntX, Src);
-          Move(FPrevLayer.FOutput.FData[SrcBase], FOutput.FData[OutBase],
-            Depth * csNeuralFloatSize);
+          HeadLen := Sh * Depth;
+          for CntY := 0 to MaxY do
+          begin
+            OutBase := CntY * RowLen;
+            Move(FPrevLayer.FOutput.FData[OutBase + RowLen - HeadLen],
+              FOutput.FData[OutBase], HeadLen * csNeuralFloatSize);
+            Move(FPrevLayer.FOutput.FData[OutBase],
+              FOutput.FData[OutBase + HeadLen], (RowLen - HeadLen) * csNeuralFloatSize);
+          end;
+        end;
+      end;
+    2:
+      begin
+        // Y roll: rows are contiguous with each other, so rolling along Y moves
+        // two contiguous run of whole rows -- two Moves for the entire volume.
+        Sh := ((Shift mod SizeY) + SizeY) mod SizeY;
+        RowLen := SizeX * Depth;
+        HeadLen := Sh * RowLen;
+        VolLen := SizeY * RowLen;
+        if Sh = 0 then
+          Move(FPrevLayer.FOutput.FData[0], FOutput.FData[0],
+            VolLen * csNeuralFloatSize)
+        else
+        begin
+          Move(FPrevLayer.FOutput.FData[VolLen - HeadLen], FOutput.FData[0],
+            HeadLen * csNeuralFloatSize);
+          Move(FPrevLayer.FOutput.FData[0], FOutput.FData[HeadLen],
+            (VolLen - HeadLen) * csNeuralFloatSize);
         end;
       end;
   else
@@ -48348,8 +48366,8 @@ end;
 
 procedure TNNetRoll.Backpropagate();
 var
-  CntX, CntY, CntD, MaxX, MaxY, MaxD, SizeX, SizeY, Depth, Shift, Axis, Src: integer;
-  PrevBase, ErrBase, Sh: integer;
+  CntX, CntY, MaxX, MaxY, SizeX, SizeY, Depth, Shift, Axis: integer;
+  PrevBase, ErrBase, Sh, RowLen, HeadLen, VolLen: integer;
   StartTime, LocalNow: double;
 begin
   StartTime := Now();
@@ -48363,7 +48381,6 @@ begin
     Depth := FOutput.Depth;
     MaxX := SizeX - 1;
     MaxY := SizeY - 1;
-    MaxD := Depth - 1;
     Shift := FStruct[0];
     Axis := FStruct[1];
     // Inverse roll on upstream error: the +Shift direction is the inverse of
@@ -48371,26 +48388,33 @@ begin
     // the previous error tensor. Stored axis: 1 = X, 2 = Y, else (0) = Depth.
     case Axis of
       1:
-        for CntY := 0 to MaxY do
-          for CntX := 0 to MaxX do
-          begin
-            Src := ((CntX + Shift) mod SizeX + SizeX) mod SizeX;
-            PrevBase := FPrevLayer.FOutputError.GetRawPos(CntX, CntY);
-            ErrBase := FOutputError.GetRawPos(Src, CntY);
-            TNNetVolume.Add(FPrevLayer.FOutputError.GetRawPtr(PrevBase),
-              FOutputError.GetRawPtr(ErrBase), Depth);
-          end;
-      2:
-        for CntY := 0 to MaxY do
         begin
-          Src := ((CntY + Shift) mod SizeY + SizeY) mod SizeY;  // #11: CntX-invariant
-          for CntX := 0 to MaxX do
+          // X roll (inverse): each row's wrapped read is two contiguous runs.
+          Sh := ((Shift mod SizeX) + SizeX) mod SizeX;
+          RowLen := SizeX * Depth;
+          HeadLen := Sh * Depth;
+          for CntY := 0 to MaxY do
           begin
-            PrevBase := FPrevLayer.FOutputError.GetRawPos(CntX, CntY);
-            ErrBase := FOutputError.GetRawPos(CntX, Src);
+            PrevBase := CntY * RowLen;
             TNNetVolume.Add(FPrevLayer.FOutputError.GetRawPtr(PrevBase),
-              FOutputError.GetRawPtr(ErrBase), Depth);
+              FOutputError.GetRawPtr(PrevBase + HeadLen), RowLen - HeadLen);
+            TNNetVolume.Add(
+              FPrevLayer.FOutputError.GetRawPtr(PrevBase + RowLen - HeadLen),
+              FOutputError.GetRawPtr(PrevBase), HeadLen);
           end;
+        end;
+      2:
+        begin
+          // Y roll (inverse): whole rows are contiguous, so the entire volume
+          // is two Adds.
+          Sh := ((Shift mod SizeY) + SizeY) mod SizeY;
+          RowLen := SizeX * Depth;
+          HeadLen := Sh * RowLen;
+          VolLen := SizeY * RowLen;
+          TNNetVolume.Add(FPrevLayer.FOutputError.GetRawPtr(0),
+            FOutputError.GetRawPtr(HeadLen), VolLen - HeadLen);
+          TNNetVolume.Add(FPrevLayer.FOutputError.GetRawPtr(VolLen - HeadLen),
+            FOutputError.GetRawPtr(0), HeadLen);
         end;
     else
       // Depth roll (inverse): prevErr[d] += err[(d + Shift) wrapped]; the
