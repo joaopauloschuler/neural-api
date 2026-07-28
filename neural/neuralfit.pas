@@ -459,6 +459,13 @@ type
       procedure DispatchEpochEnd(Epoch: integer);
       procedure DispatchStepEnd(GlobalStep: integer);
       procedure DispatchEvaluate(Epoch: integer; ValLoss, ValAcc: TNeuralFloat);
+
+      // Locates the first layer holding a non-finite output or output error,
+      // reports it and requests a training abort. FirstLayerWithNonFinite walks
+      // every layer's Output and OutputError, so this costs about a forward
+      // pass and must not run per sample - see the tripwire at the training
+      // loops' call sites.
+      function NaNGuardTripped(pNN: TNNet): boolean;
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -1966,17 +1973,15 @@ begin
       LocalNN.Backpropagate( vOutput );
     end;
 
-    if FNaNGuard then
+    // Per-sample tripwire. A non-finite activation or gradient reaches the
+    // output layer in all but pathological cases, and SumDiff then returns
+    // NaN or an infinity, so this scalar test stands in for the full scan. The
+    // batch-level scan after the loop catches the residue - a value a pooling
+    // comparison dropped, or one confined to OutputError - and still runs
+    // before any delta leaves this thread.
+    if FNaNGuard and (IsNan(CurrentError) or IsInfinite(CurrentError)) then
     begin
-      DepthCnt := LocalNN.FirstLayerWithNonFinite();
-      if DepthCnt >= 0 then
-      begin
-        FErrorProc('NaNGuard: non-finite (NaN/Inf) value detected on layer '+
-          IntToStr(DepthCnt)+' - '+LocalNN.Layers[DepthCnt].ClassName+
-          '. Aborting training.');
-        FShouldQuit := true;
-        Break;
-      end;
+      if NaNGuardTripped(LocalNN) then Break;
     end;
 
     CurrentLoss := 0;
@@ -1999,6 +2004,10 @@ begin
       end;
     end;
   end; // of for
+
+  // Batch-level NaN guard: the expensive locating scan runs once per micro-batch
+  // instead of once per sample, still ahead of every delta merge below.
+  if FNaNGuard and Not(FShouldQuit) then NaNGuardTripped(LocalNN);
 
   // Pairwise then stride-2 delta reduction. A slot becomes non-zero only after
   // this thread has merged everything below it, so a non-zero read is the
@@ -2784,6 +2793,21 @@ begin
   CallbackCntM1 := FCallbacks.Count - 1;
   for I := 0 to CallbackCntM1 do
     TNeuralFitCallback(FCallbacks[I]).OnEvaluate(Self, Epoch, ValLoss, ValAcc);
+end;
+
+function TNeuralFitBase.NaNGuardTripped(pNN: TNNet): boolean;
+var
+  LayerIdx: integer;
+begin
+  LayerIdx := pNN.FirstLayerWithNonFinite();
+  Result := LayerIdx >= 0;
+  if Result then
+  begin
+    FErrorProc('NaNGuard: non-finite (NaN/Inf) value detected on layer '+
+      IntToStr(LayerIdx)+' - '+pNN.Layers[LayerIdx].ClassName+
+      '. Aborting training.');
+    FShouldQuit := true;
+  end;
 end;
 
 procedure TNeuralFitBase.SetAccumulationSteps(Value: integer);
@@ -3809,17 +3833,15 @@ begin
       // FTrainingSampleProcessedCnt.FData[ImgIdx] := FTrainingSampleProcessedCnt.FData[ImgIdx] + 1;
     end;
 
-    if FNaNGuard then
+    // Per-sample tripwire. A non-finite activation or gradient reaches the
+    // output layer in all but pathological cases, and SumDiff then returns
+    // NaN or an infinity, so this scalar test stands in for the full scan. The
+    // batch-level scan after the loop catches the residue - a value a pooling
+    // comparison dropped, or one confined to OutputError - and still runs
+    // before any delta leaves this thread.
+    if FNaNGuard and (IsNan(CurrentError) or IsInfinite(CurrentError)) then
     begin
-      DepthCnt := LocalNN.FirstLayerWithNonFinite();
-      if DepthCnt >= 0 then
-      begin
-        FErrorProc('NaNGuard: non-finite (NaN/Inf) value detected on layer '+
-          IntToStr(DepthCnt)+' - '+LocalNN.Layers[DepthCnt].ClassName+
-          '. Aborting training.');
-        FShouldQuit := true;
-        Break;
-      end;
+      if NaNGuardTripped(LocalNN) then Break;
     end;
 
     if (OutputValue > 0) then
@@ -3844,6 +3866,10 @@ begin
       Inc(LocalMiss);
     end;
   end; // of for
+
+  // Batch-level NaN guard: the expensive locating scan runs once per micro-batch
+  // instead of once per sample, still ahead of every delta merge below.
+  if FNaNGuard and Not(FShouldQuit) then NaNGuardTripped(LocalNN);
 
   // Pairwise then stride-2 delta reduction. A slot becomes non-zero only after
   // this thread has merged everything below it, so a non-zero read is the
