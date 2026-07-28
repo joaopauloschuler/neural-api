@@ -1199,7 +1199,11 @@ begin
     then CurrentBaseValue := CurrentStates[EnsureRange(BasePosition, 0, MaxCur)]
     else CurrentBaseValue := 0;
 
-  try
+  // Every operand below is already clamped into its array's bounds and both
+  // divisors are tested, so no arm can fault. Results are masked to a byte, so
+  // range and overflow checking are dead weight here: scope them off for the
+  // dispatch and restore the build's setting afterwards.
+  {$PUSH}{$R-}{$Q-}
     case OpCode of
       csNop:      begin { nop } end;
       csEqual:    NextState:=BoolToByte[Oper.Op1=Operand2Value];
@@ -1209,36 +1213,34 @@ begin
       csLesser:   NextState:=BoolToByte[Operand1Value<Operand2Value];
       csTrue:     NextState:=1;
       csSet:      NextState:=Oper.Op1;
-      csInc:      NextState:=(CurrentBaseValue+1) and 255{$R+};
-      csDec:      NextState:=(CurrentBaseValue-1) and 255{$R+};
-      csAdd:      NextState:=(Operand1Value+Operand2Value) and 255{$R+};
-      csSub:      NextState:=(Operand1Value-Operand2Value) and 255{$R+};
-      csMul:      NextState:=(Operand1Value*Operand2Value) and 255{$R+};
+      csInc:      NextState:=(CurrentBaseValue+1) and 255;
+      csDec:      NextState:=(CurrentBaseValue-1) and 255;
+      csAdd:      NextState:=(Operand1Value+Operand2Value) and 255;
+      csSub:      NextState:=(Operand1Value-Operand2Value) and 255;
+      csMul:      NextState:=(Operand1Value*Operand2Value) and 255;
       csDiv:      if Operand2Value<>0
-                     then{$R-}NextState:=(Operand1Value div Operand2Value) and 255{$R+};
+                     then NextState:=(Operand1Value div Operand2Value) and 255;
       csMod:      if Operand2Value<>0
-                     then {$R-}NextState:=(Operand1Value mod Operand2Value) and 255{$R+};
-      csAnd:      NextState:=(Operand1Value and Operand2Value) and 255{$R+};
-      csOr:       NextState:=(Operand1Value or Operand2Value) and 255{$R+};
-      csXor:      NextState:=(Operand1Value xor Operand2Value) and 255{$R+};
+                     then NextState:=(Operand1Value mod Operand2Value) and 255;
+      csAnd:      NextState:=(Operand1Value and Operand2Value) and 255;
+      csOr:       NextState:=(Operand1Value or Operand2Value) and 255;
+      csXor:      NextState:=(Operand1Value xor Operand2Value) and 255;
       csInj:      NextState:=CurrentBaseValue;
-      csNot:      NextState:=not(CurrentBaseValue);
-      csShl:      {$R-}NextState:=(Operand1Value shl (Operand2Value and 7)) and 255{$R+};
+      // A byte complement: the integer form is negative, so mask it back.
+      csNot:      NextState:=(not CurrentBaseValue) and 255;
+      csShl:      NextState:=(Operand1Value shl (Operand2Value and 7)) and 255;
       csShr:      NextState:=Operand1Value shr (Operand2Value and 7);
       csMin:      NextState:=Min(Operand1Value, Operand2Value);
       csMax:      NextState:=Max(Operand1Value, Operand2Value);
-      csAddS:     {$R-}NextState:=EnsureRange(Operand1Value+Operand2Value, 0, 255){$R+};
-      csSubS:     {$R-}NextState:=EnsureRange(Operand1Value-Operand2Value, 0, 255){$R+};
+      csAddS:     NextState:=EnsureRange(Operand1Value+Operand2Value, 0, 255);
+      csSubS:     NextState:=EnsureRange(Operand1Value-Operand2Value, 0, 255);
       csAbsDiff:  NextState:=Abs(Integer(Operand1Value)-Integer(Operand2Value));
       // Operands are 0..255 bytes, so the sum is non-negative: div 2 = shr 1.
       csAvg:      NextState:=(Operand1Value+Operand2Value) shr 1;
     else
       writeln('ERROR: invalid operation code:',Oper.OpCode);
     end;
-  except
-    Writeln('Error: OpCode =', OpCode, '  VOp1=', Operand1Value,
-      '  VOp2=', Operand2Value, '  BASE=', BasePosition);
-  end;
+  {$POP}
   if (OpCode in TestOperationSet) then
     OperateAndTestOperation := NextState
   else if NumberOfNextStates > 0 then

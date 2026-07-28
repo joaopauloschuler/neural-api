@@ -21,7 +21,7 @@ uses
   TestNeuralTokenizer, TestNeuralImagePreprocess,
   TestNeuralDiffusion, TestNeuralImageMetrics, TestNeuralAudio,
   TestNeuralAugment, TestNeuralRegistry, TestNeuralCallbacks,
-  TestNeuralSWA, TestNeuralFusedSDPA;
+  TestNeuralSWA, TestNeuralFusedSDPA, TestNeuralABFun;
 
 type
   TMyTestRunner = class(TTestRunner)
