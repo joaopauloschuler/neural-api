@@ -26702,11 +26702,18 @@ end;
 // flattened row-major (FData[a*d_k + dLocal]).
 procedure DebertaLoadHeadPosTables(HeadLayer: TNNetLayer;
   RelLN, Wq, Bq, Wk, Bk: TNNetVolume; HeadIdx, d_k, Hidden, twoSpan: integer);
+const
+  // Rows of RelLN held resident while the dLocal loop sweeps the head's
+  // weight slice: 128 x 768 singles = 384 KB, next to the 2 x 3 KB of weight
+  // row that dLocal advances through. The same strip idea as
+  // CopySlabColumnsToNeurons, on the position-table GEMM.
+  cTile = 128;
 var
   PosK, PosQ: TNNetVolume;
-  a, dLocal, OutRow: integer;
-  RelRow: TNeuralFloatArrPtr;
-  twoSpanM1, d_kM1, hkBase, adkBase, dstIdx, wRow: integer;
+  a, dLocal, OutRow, aTile, aLast: integer;
+  RelRow, WkRow, WqRow: TNeuralFloatArrPtr;
+  twoSpanM1, d_kM1, hkBase, dstIdx, wRow, wBase, relPos: integer;
+  BkVal, BqVal: TNeuralFloat;
 begin
   EnsureWritableImportWeights(HeadLayer);
   PosK := HeadLayer.FArrNeurons[0].Weights; // K^r
@@ -26714,21 +26721,37 @@ begin
   twoSpanM1 := twoSpan - 1;
   d_kM1 := d_k - 1;
   hkBase := HeadIdx * d_k; // invariant across a/dLocal
-  for a := 0 to twoSpanM1 do
+  wBase := hkBase * Hidden;
+  // dLocal outside a within a strip of rows: the two weight rows and the two
+  // biases are then loop-invariant across the whole strip (#5/#11), so the
+  // inner loop is d_k pairs of dots against one resident pair of weight rows.
+  aTile := 0;
+  while aTile <= twoSpanM1 do
   begin
-    RelRow := RelLN.GetRawPtr(a, 0);
-    adkBase := a * d_k;
-    wRow := hkBase * Hidden;
-    dstIdx := adkBase;
+    aLast := aTile + cTile - 1;
+    if aLast > twoSpanM1 then aLast := twoSpanM1;
+    wRow := wBase;
     OutRow := hkBase;
     for dLocal := 0 to d_kM1 do
     begin
-      PosK.FData[dstIdx] := Bk.FData[OutRow] +
-        TNNetVolume.DotProduct(RelRow, Wk.GetRawPtr(wRow), Hidden);
-      PosQ.FData[dstIdx] := Bq.FData[OutRow] +
-        TNNetVolume.DotProduct(RelRow, Wq.GetRawPtr(wRow), Hidden);
-      Inc(wRow, Hidden); Inc(dstIdx); Inc(OutRow);
+      WkRow := Wk.GetRawPtr(wRow);
+      WqRow := Wq.GetRawPtr(wRow);
+      BkVal := Bk.FData[OutRow];
+      BqVal := Bq.FData[OutRow];
+      dstIdx := aTile * d_k + dLocal; // then carried by d_k per row (#6/#12)
+      relPos := aTile * Hidden;
+      for a := aTile to aLast do
+      begin
+        RelRow := RelLN.GetRawPtr(relPos);
+        PosK.FData[dstIdx] := BkVal +
+          TNNetVolume.DotProduct(RelRow, WkRow, Hidden);
+        PosQ.FData[dstIdx] := BqVal +
+          TNNetVolume.DotProduct(RelRow, WqRow, Hidden);
+        Inc(dstIdx, d_k); Inc(relPos, Hidden);
+      end;
+      Inc(wRow, Hidden); Inc(OutRow);
     end;
+    Inc(aTile, cTile);
   end;
   HeadLayer.FlushWeightCache();
 end;
