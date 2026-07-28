@@ -44621,6 +44621,10 @@ begin
   SizeM1 := LocalPrevOutput.Size - 1;
   twoOverSqrtPi := 2.0 / Sqrt(Pi);
 
+  // Kept scalar deliberately: SerfErf is the correctly-rounded pcr_erff, while
+  // TNNetVolume.Erf is an Abramowitz-Stegun approximation (|err| < 1.5e-7).
+  // The #19 promotion was measured at 1.03x (default build) and 1.08x (AVX2),
+  // i.e. inside the noise, so it is not worth the accuracy trade here.
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
@@ -44966,8 +44970,8 @@ end;
 procedure TNNetSoftPlusBetaLearnable.Compute();
 var
   StartTime: double;
-  beta, invBeta, x, betaX, sig, y: TNeuralFloat;
-  i, SizeM1: integer;
+  beta, invBeta, x, betaX, sig, y, expBetaX: TNeuralFloat;
+  i, Size, SizeM1: integer;
   LocalPrevOutput: TNNetVolume;
   HasDeriv: boolean;
 begin
@@ -44983,28 +44987,41 @@ begin
   if beta <= 0 then beta := 1.0;
   invBeta := 1.0 / beta;
   LocalPrevOutput := FPrevLayer.Output;
-  SizeM1 := LocalPrevOutput.Size - 1;
+  Size := LocalPrevOutput.Size;
+  SizeM1 := Size - 1;
   HasDeriv := (FOutput.Size = FOutputError.Size) and
               (FOutputErrorDeriv.Size = FOutput.Size);
+  // #19, mirroring the fixed-beta twin TNNetSoftPlusBeta: exp(beta*x) -- the
+  // transcendental shared by the output ln(1+exp) and the sigmoid derivative --
+  // is batched with the elementwise kernel. The inherited Compute above already
+  // left a copy of the input in FOutput, so FOutput is the scratch and no new
+  // field is needed. The exact scalar betaX > 30 / < -30 saturation thresholds
+  // are reapplied in the finishing pass, where beta*x is one multiply; for
+  // those clamped lanes the batched exp is ignored (>30) or IS the answer
+  // (<-30, where sigmoid(z) -> e^z).
+  TNNetVolume.Mul(@FOutput.FData[0], beta, Size);
+  TNNetVolume.Exp(@FOutput.FData[0], @FOutput.FData[0], Size);
   if HasDeriv then
   begin
     for i := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[i];
       betaX := beta * x;
+      expBetaX := FOutput.FData[i];
       // Numerically stable softplus: for large beta*x, ln(1+exp(z))/beta ~= x.
       if betaX > 30 then
         y := x
       else
-        y := invBeta * pcr_logf(1 + NeuralExp(betaX));
+        y := invBeta * pcr_logf(1 + expBetaX);
       FOutput.FData[i] := y;
       // Derivative w.r.t. input is sigmoid(beta*x); sign-branch guards overflow.
+      // The safe middle lane reuses the batched exp: 1/(1+e^-z) = e^z/(1+e^z).
       if betaX > 30 then
         sig := 1.0
       else if betaX < -30 then
-        sig := NeuralExp(betaX)
+        sig := expBetaX
       else
-        sig := 1 / (1 + NeuralExp(-betaX));
+        sig := expBetaX / (1 + expBetaX);
       FOutputErrorDeriv.FData[i] := sig;
     end;
   end
@@ -45017,7 +45034,7 @@ begin
       if betaX > 30 then
         FOutput.FData[i] := x
       else
-        FOutput.FData[i] := invBeta * pcr_logf(1 + NeuralExp(betaX));
+        FOutput.FData[i] := invBeta * pcr_logf(1 + FOutput.FData[i]);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -45363,35 +45380,37 @@ end;
 
 procedure TNNetTanhShrink.Compute();
 var
-  SizeM1: integer;
+  Size, SizeM1: integer;
   LocalPrevOutput: TNNetVolume;
   OutputCnt: integer;
   StartTime: double;
-  x, tanhVal: TNeuralFloat;
+  tanhVal: TNeuralFloat;
 begin
   StartTime := Now();
   LocalPrevOutput := FPrevLayer.Output;
-  SizeM1 := LocalPrevOutput.Size - 1;
+  Size := LocalPrevOutput.Size;
+  SizeM1 := Size - 1;
 
+  // #19: the run is a uniform, branch-free tanh map, so batch it into FOutput
+  // with the elementwise kernel and finish elementwise. FOutput doubles as the
+  // scratch, so no new field is needed.
+  TNNetVolume.Tanh(@FOutput.FData[0], @LocalPrevOutput.FData[0], Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
-      x := LocalPrevOutput.FData[OutputCnt];
-      tanhVal := pcr_tanhf(x);
-      FOutput.FData[OutputCnt] := x - tanhVal;
+      tanhVal := FOutput.FData[OutputCnt];
       // d/dx (x - tanh(x)) = 1 - (1 - tanh(x)^2) = tanh(x)^2
       FOutputErrorDeriv.FData[OutputCnt] := tanhVal * tanhVal;
+      FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt] - tanhVal;
     end;
   end
   else
   begin
     // can't calculate error on input layers.
     for OutputCnt := 0 to SizeM1 do
-    begin
-      x := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := x - pcr_tanhf(x);
-    end;
+      FOutput.FData[OutputCnt] :=
+        LocalPrevOutput.FData[OutputCnt] - FOutput.FData[OutputCnt];
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -45995,24 +46014,30 @@ const
   cInvScale: TNeuralFloat = 1.0 / 1.7159;
   cTwoThirds: TNeuralFloat = 2.0 / 3.0;
 var
-  SizeM1: integer;
+  Size, SizeM1: integer;
   LocalPrevOutput: TNNetVolume;
   OutputCnt: integer;
   StartTime: double;
-  x, y: TNeuralFloat;
+  y: TNeuralFloat;
 begin
   StartTime := Now();
   LocalPrevOutput := FPrevLayer.Output;
-  SizeM1 := LocalPrevOutput.Size - 1;
+  Size := LocalPrevOutput.Size;
+  SizeM1 := Size - 1;
 
   // y = 1.7159 * tanh((2/3) * x). Derivative is (2/3) * (1.7159 - y^2/1.7159),
   // which avoids re-evaluating tanh in the backward pass.
+  // #19: seed FOutput with (2/3)*x, batch the tanh in place with the
+  // elementwise kernel, then scale and differentiate elementwise. FOutput is
+  // the scratch, so no new field is needed.
+  system.Move(LocalPrevOutput.FData[0], FOutput.FData[0], Size * csNeuralFloatSize);
+  TNNetVolume.Mul(@FOutput.FData[0], cTwoThirds, Size);
+  TNNetVolume.Tanh(@FOutput.FData[0], @FOutput.FData[0], Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
-      x := LocalPrevOutput.FData[OutputCnt];
-      y := cScale * pcr_tanhf(cTwoThirds * x);
+      y := cScale * FOutput.FData[OutputCnt];
       FOutput.FData[OutputCnt] := y;
       FOutputErrorDeriv.FData[OutputCnt] := cTwoThirds * (cScale - y * y * cInvScale);
     end;
@@ -46020,11 +46045,7 @@ begin
   else
   begin
     // can't calculate error on input layers.
-    for OutputCnt := 0 to SizeM1 do
-    begin
-      x := LocalPrevOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := cScale * pcr_tanhf(cTwoThirds * x);
-    end;
+    TNNetVolume.Mul(@FOutput.FData[0], cScale, Size);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
