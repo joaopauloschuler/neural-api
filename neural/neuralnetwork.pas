@@ -6194,6 +6194,8 @@ type
     FInvSqrtHd: TNeuralFloat;
     FAttn: TNNetVolume;   // scratch: per-window softmax row buffer (Sx1x1 reuse)
     FQ, FK, FV, FCtx: TNNetVolume; // per-window q/k/v/context [winTokens x 1 x C]
+    // scratch: the width rel-pos bias of one query row, indexed by kj
+    FBiasW: TNNetVolume;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure AllocBuffers();
   public
@@ -41751,6 +41753,7 @@ begin
   FK := TNNetVolume.Create();
   FV := TNNetVolume.Create();
   FCtx := TNNetVolume.Create();
+  FBiasW := TNNetVolume.Create();
 end;
 
 constructor TNNetSAMVisionAttention.Create();
@@ -41763,6 +41766,7 @@ begin
   FK := TNNetVolume.Create();
   FV := TNNetVolume.Create();
   FCtx := TNNetVolume.Create();
+  FBiasW := TNNetVolume.Create();
   FHeads := FStruct[0];
   FWindowSize := FStruct[1];
   FHeadDim := FStruct[2];
@@ -41777,6 +41781,7 @@ begin
   FK.Free;
   FV.Free;
   FCtx.Free;
+  FBiasW.Free;
   inherited Destroy();
 end;
 
@@ -41803,6 +41808,9 @@ begin
   FV.ReSize(WinTokens, 1, FChannels);
   FCtx.ReSize(WinTokens, 1, FChannels);
   FAttn.ReSize(WinTokens, 1, 1);
+  // One entry per window column: the width rel-pos bias of a query row.
+  if FWindowSize > 0 then FBiasW.ReSize(FWindowSize, 1, 1)
+  else FBiasW.ReSize(FOutput.SizeX, 1, 1);
 end;
 
 procedure TNNetSAMVisionAttention.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -41908,7 +41916,7 @@ var
   FWindowSizeM1, FHeadsM1, nWyM1, nWxM1, gyM1, gxM1, winTokM1: integer;
   dBase, tokBase: integer;
   QkvW, QkvB, ProjW, ProjB, RelP: TNNetVolume;
-  Score, MaxScore, SumExp, acc, biasH, biasW, InvSumExp: TNeuralFloat;
+  Score, MaxScore, SumExp, acc, biasH, InvSumExp: TNeuralFloat;
   QPtr, KPtr, OutP, ctxPtr: TNeuralFloatArrPtr;
   inRange: boolean;
 begin
@@ -42020,25 +42028,31 @@ begin
         // The key row offset j*FChannels+hOfs steps up by FChannels (#12).
         posK := hOfs;
         dwSeed := (Lh + qj + gxM1) * FHeadDim;      // #11: ki-invariant, once per query
+        // Q.rel_pos_w depends only on (qj, kj), so the whole kj row of width
+        // biases is invariant across ki (#11) -- build it once per query
+        // instead of re-dotting it gy times.
+        dwOfs := dwSeed;
+        for kj := 0 to gxM1 do
+        begin
+          FBiasW.FData[kj] := TNNetVolume.DotProduct(QPtr,
+            @RelP.FData[dwOfs], FHeadDim);
+          Dec(dwOfs, FHeadDim);
+        end;
         for ki := 0 to gyM1 do
         begin
          dhBase := (qi - ki + gyM1) * FHeadDim;
          biasH := TNNetVolume.DotProduct(QPtr,
            @RelP.FData[dhBase], FHeadDim);            // #11: Q.rel_pos_h invariant across kj
-         dwOfs := dwSeed;
          for kj := 0 to gxM1 do
          begin
           j := ki * gx + kj;
           KPtr := @FK.FData[posK];
           Score := TNNetVolume.DotProduct(QPtr, KPtr, FHeadDim);
           Score := Score * FInvSqrtHd;
-          biasW := TNNetVolume.DotProduct(QPtr,
-            @RelP.FData[dwOfs], FHeadDim);
-          Score := Score + biasH + biasW;
+          Score := Score + biasH + FBiasW.FData[kj];
           FAttn.FData[j] := Score;
           if Score > MaxScore then MaxScore := Score;
           Inc(posK, FChannels);
-          Dec(dwOfs, FHeadDim);
          end;
         end;
         SumExp := 0;
