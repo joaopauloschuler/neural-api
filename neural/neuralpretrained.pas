@@ -72524,12 +72524,9 @@ begin
         if dot > mx then mx := dot;
         Inc(kOfs, Dim);
       end;
-      s := 0;
-      for j := 0 to NKM1 do
-      begin
-        scores[j] := NeuralExp(scores[j] - mx);
-        s := s + scores[j];
-      end;
+      // exp(score - max) and its sum in one fused pass over the row (#13/#19);
+      // ExpShiftSum is aliasing-safe, so it rewrites scores in place.
+      s := TNNetVolume.ExpShiftSum(@scores[0], @scores[0], mx, NK);
       invS := 1.0 / s;
       TNNetVolume.Mul(@scores[0], invS, NK);
       // Accumulate V weighted by softmax scores, j-outer so each add is a
