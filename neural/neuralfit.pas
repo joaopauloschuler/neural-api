@@ -466,6 +466,13 @@ type
       // pass and must not run per sample - see the tripwire at the training
       // loops' call sites.
       function NaNGuardTripped(pNN: TNNet): boolean;
+
+      // Merges every worker's deltas into FThreadNN[0] over a binary tree, so
+      // the reduction costs log2(FThreadNum) sequential full-parameter adds
+      // instead of one per surviving thread. Called by each worker with its own
+      // Index right after its sample loop; on return only thread 0 holds the
+      // total. See the implementation for the completion protocol.
+      procedure ReduceThreadDeltas(Index: integer; LocalNN: TNNet);
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -2009,31 +2016,9 @@ begin
   // instead of once per sample, still ahead of every delta merge below.
   if FNaNGuard and Not(FShouldQuit) then NaNGuardTripped(LocalNN);
 
-  // Pairwise then stride-2 delta reduction. A slot becomes non-zero only after
-  // this thread has merged everything below it, so a non-zero read is the
-  // signal that the partner's deltas are complete AND visible: the atomic
-  // increment publishes them, the atomic read acquires them.
-  if (Index and 1 = 0) and Not(FShouldQuit) then
-  begin
-    if Index + 1 < FThreadNum then
-    begin
-      while (NeuralAtomicRead(FFinishedThread[Index + 1]) = 0) and
-        Not(FShouldQuit) do NeuralPause;
-      LocalNN.SumDeltasNoChecks(FThreadNN[Index + 1]);
-      NeuralAtomicIncrement(FFinishedThread[Index]);
-    end;
-  end;
-  NeuralAtomicIncrement(FFinishedThread[Index]);
-  if (Index and 3 = 0) and Not(FShouldQuit) then
-  begin
-    if Index + 2 < FThreadNum then
-    begin
-      while (NeuralAtomicRead(FFinishedThread[Index + 2]) = 0) and
-        Not(FShouldQuit) do NeuralPause;
-      LocalNN.SumDeltasNoChecks(FThreadNN[Index + 2]);
-      NeuralAtomicIncrement(FFinishedThread[Index]);
-    end;
-  end;
+  // Full binary-tree delta reduction: the atomic increment publishes a
+  // subtree's deltas and the atomic read acquires them.
+  ReduceThreadDeltas(Index, LocalNN);
   {$IFDEF DEBUG}
   FinalWeightSum := LocalNN.GetWeightSum() + LocalNN.GetBiasSum();
   FinalInertia := LocalNN.GetInertiaSum();
@@ -2054,10 +2039,13 @@ begin
 
   FNN.ForwardTime  := FNN.ForwardTime  + LocalNN.ForwardTime;
   FNN.BackwardTime := FNN.BackwardTime + LocalNN.BackwardTime;
+  // The tree above left the whole batch's deltas in thread 0, so only thread 0
+  // still has anything to add to FNN - one full-parameter pass under the lock
+  // instead of one per stride-4 thread.
   {$IFDEF Debug}
-  if Index and 3 = 0 then FNN.SumDeltas(LocalNN);
+  if Index = 0 then FNN.SumDeltas(LocalNN);
   {$ELSE}
-  if Index and 3 = 0 then FNN.SumDeltasNoChecks(LocalNN);
+  if Index = 0 then FNN.SumDeltasNoChecks(LocalNN);
   {$ENDIF}
   {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSec);{$ENDIF}
   vInputCopy.Free;
@@ -2793,6 +2781,46 @@ begin
   CallbackCntM1 := FCallbacks.Count - 1;
   for I := 0 to CallbackCntM1 do
     TNeuralFitCallback(FCallbacks[I]).OnEvaluate(Self, Epoch, ValLoss, ValAcc);
+end;
+
+procedure TNeuralFitBase.ReduceThreadDeltas(Index: integer; LocalNN: TNNet);
+var
+  Stride, Level, Partner: integer;
+begin
+  // FFinishedThread[T] counts the phases thread T has published, and is zeroed
+  // on the main thread before the workers start. The first increment means "my
+  // own deltas are final"; the increment at the end of level L means "I have
+  // merged my whole subtree up to stride 2^(L-1)".
+  //
+  // A thread merging a partner at level L needs that partner to have finished
+  // levels 1..L-1, which is exactly a published count of L or more. Counting
+  // levels rather than testing for non-zero is what makes this correct for a
+  // thread count that is not a power of two: a thread whose partner slot is off
+  // the end of the array performs no merge but still publishes its level, so
+  // the count a waiter needs never depends on how many partners happened to
+  // exist. A thread is absorbed at the first level whose stride it is not
+  // aligned to; it stops publishing there, which is precisely the level at
+  // which its own waiter reads it.
+  NeuralAtomicIncrement(FFinishedThread[Index]);
+  Stride := 1;
+  Level := 1;
+  while (Stride < FThreadNum) and Not(FShouldQuit) do
+  begin
+    // Not aligned to this level's stride: this thread has just been merged
+    // into Index - Stride and takes no further part.
+    if (Index and (Stride * 2 - 1)) <> 0 then Break;
+    Partner := Index + Stride;
+    if Partner < FThreadNum then
+    begin
+      while (NeuralAtomicRead(FFinishedThread[Partner]) < Level) and
+        Not(FShouldQuit) do NeuralPause;
+      if FShouldQuit then Break;
+      LocalNN.SumDeltasNoChecks(FThreadNN[Partner]);
+    end;
+    NeuralAtomicIncrement(FFinishedThread[Index]);
+    Inc(Level);
+    Stride := Stride * 2;
+  end;
 end;
 
 function TNeuralFitBase.NaNGuardTripped(pNN: TNNet): boolean;
@@ -3871,31 +3899,9 @@ begin
   // instead of once per sample, still ahead of every delta merge below.
   if FNaNGuard and Not(FShouldQuit) then NaNGuardTripped(LocalNN);
 
-  // Pairwise then stride-2 delta reduction. A slot becomes non-zero only after
-  // this thread has merged everything below it, so a non-zero read is the
-  // signal that the partner's deltas are complete AND visible: the atomic
-  // increment publishes them, the atomic read acquires them.
-  if (Index and 1 = 0) and Not(FShouldQuit) then
-  begin
-    if Index + 1 < FThreadNum then
-    begin
-      while (NeuralAtomicRead(FFinishedThread[Index + 1]) = 0) and
-        Not(FShouldQuit) do NeuralPause;
-      LocalNN.SumDeltasNoChecks(FThreadNN[Index + 1]);
-      NeuralAtomicIncrement(FFinishedThread[Index]);
-    end;
-  end;
-  NeuralAtomicIncrement(FFinishedThread[Index]);
-  if (Index and 3 = 0) and Not(FShouldQuit) then
-  begin
-    if Index + 2 < FThreadNum then
-    begin
-      while (NeuralAtomicRead(FFinishedThread[Index + 2]) = 0) and
-        Not(FShouldQuit) do NeuralPause;
-      LocalNN.SumDeltasNoChecks(FThreadNN[Index + 2]);
-      NeuralAtomicIncrement(FFinishedThread[Index]);
-    end;
-  end;
+  // Full binary-tree delta reduction: the atomic increment publishes a
+  // subtree's deltas and the atomic read acquires them.
+  ReduceThreadDeltas(Index, LocalNN);
 
   {$IFDEF HASTHREADS}EnterCriticalSection(FCritSec);{$ENDIF}
   FGlobalHit       := FGlobalHit + LocalHit;
@@ -3905,10 +3911,13 @@ begin
 
   FNN.ForwardTime := FNN.ForwardTime + LocalNN.ForwardTime;
   FNN.BackwardTime := FNN.BackwardTime + LocalNN.BackwardTime;
+  // The tree above left the whole batch's deltas in thread 0, so only thread 0
+  // still has anything to add to FNN - one full-parameter pass under the lock
+  // instead of one per stride-4 thread.
   {$IFDEF Debug}
-  if Index and 3 = 0 then FNN.SumDeltas(LocalNN);
+  if Index = 0 then FNN.SumDeltas(LocalNN);
   {$ELSE}
-  if Index and 3 = 0 then FNN.SumDeltasNoChecks(LocalNN);
+  if Index = 0 then FNN.SumDeltasNoChecks(LocalNN);
   {$ENDIF}
   {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSec);{$ENDIF}
   ImgInputCp.Free;
