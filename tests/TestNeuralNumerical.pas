@@ -991,6 +991,7 @@ type
     procedure TestTanhShrinkSerializationRoundTrip;
     procedure TestLogSigmoidForward;
     procedure TestLogSigmoidGradientCheck;
+    procedure TestLogSigmoidTrainableInferenceParity;
     procedure TestLogSigmoidSerializationRoundTrip;
     procedure TestLogSigmoidExtremeInputSaturation;
     procedure TestShiftedReLUForward;
@@ -11081,6 +11082,53 @@ procedure TTestNeuralNumerical.TestLogSigmoidGradientCheck;
 begin
   ActivationGradientCheck(Self, TNNetLogSigmoid.Create(), 'LogSigmoid',
     [0.5, -0.5, 1.0, -1.0, 2.0, -2.5], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestLogSigmoidTrainableInferenceParity;
+const
+  Xs: array[0..10] of TNeuralFloat =
+    (-40, -20, -17.5, -1, -1e-6, 0, 1e-6, 1, 17.5, 20, 40);
+var
+  TrainNN, InferNN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetLogSigmoid.Compute has a trainable path (error volumes sized) and an
+  // inference path (SetTrainable(False) shrinks them). Both must evaluate the
+  // very same formula, so the forward output cannot depend on trainability:
+  // the two must agree bit for bit.
+  TrainNN := TNNet.Create();
+  InferNN := TNNet.Create();
+  Input := TNNetVolume.Create(Length(Xs), 1, 1);
+  try
+    TrainNN.AddLayer(TNNetInput.Create(Length(Xs), 1, 1, 1));
+    TrainNN.AddLayer(TNNetLogSigmoid.Create());
+    TrainNN.SetLearningRate(1.0, 0.0);
+
+    InferNN.AddLayer(TNNetInput.Create(Length(Xs), 1, 1, 1));
+    InferNN.AddLayer(TNNetLogSigmoid.Create());
+    InferNN.GetLastLayer.SetTrainable(false, false);
+
+    AssertTrue('LogSigmoid trainable path has sized error volumes',
+      (TrainNN.GetLastLayer.Output.Size = TrainNN.GetLastLayer.OutputError.Size) and
+      (TrainNN.GetLastLayer.OutputErrorDeriv.Size = TrainNN.GetLastLayer.Output.Size));
+    AssertFalse('LogSigmoid inference path has shrunk error volumes',
+      (InferNN.GetLastLayer.Output.Size = InferNN.GetLastLayer.OutputError.Size) and
+      (InferNN.GetLastLayer.OutputErrorDeriv.Size = InferNN.GetLastLayer.Output.Size));
+
+    for i := 0 to Length(Xs) - 1 do Input.Raw[i] := Xs[i];
+
+    TrainNN.Compute(Input);
+    InferNN.Compute(Input);
+
+    for i := 0 to Length(Xs) - 1 do
+      AssertEquals('LogSigmoid train/inference parity at x=' + FloatToStr(Xs[i]),
+        TrainNN.GetLastLayer.Output.Raw[i], InferNN.GetLastLayer.Output.Raw[i], 0.0);
+  finally
+    TrainNN.Free;
+    InferNN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestLogSigmoidExtremeInputSaturation;

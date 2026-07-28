@@ -45555,8 +45555,12 @@ begin
 
   // LogSigmoid(x) = log(sigmoid(x)) = -softplus(-x).
   // Stable branches:
-  //   x >= 0:  y = -ln(1+exp(-x)),       deriv = exp(-x)/(1+exp(-x))
-  //   x <  0:  y =  x - ln(1+exp(x)),    deriv = 1/(1+exp(x))
+  //   x >= 0:  y = -log1p(exp(-x)),       deriv = exp(-x)/(1+exp(-x))
+  //   x <  0:  y =  x - log1p(exp(x)),    deriv = 1/(1+exp(x))
+  // log1p keeps the tails: past |x| ~ 17.3 the sum 1+exp(-|x|) rounds to
+  // exactly 1.0 in single precision and a plain log would return a hard 0.
+  // Both branches must use the same formula in the trainable and in the
+  // inference path so that a layer's output does not depend on SetTrainable.
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
@@ -45566,14 +45570,14 @@ begin
       begin
         expNegAbsX := NeuralExp(-x);
         denom := 1 + expNegAbsX;
-        FOutput.FData[OutputCnt] := -pcr_logf(denom);
+        FOutput.FData[OutputCnt] := -pcr_log1pf(expNegAbsX);
         FOutputErrorDeriv.FData[OutputCnt] := expNegAbsX / denom;
       end
       else
       begin
         expNegAbsX := NeuralExp(x);
         denom := 1 + expNegAbsX;
-        FOutput.FData[OutputCnt] := x - pcr_logf(denom);
+        FOutput.FData[OutputCnt] := x - pcr_log1pf(expNegAbsX);
         FOutputErrorDeriv.FData[OutputCnt] := 1 / denom;
       end;
     end;
@@ -45585,7 +45589,7 @@ begin
     begin
       x := LocalPrevOutput.FData[OutputCnt];
       if x >= 0 then
-        FOutput.FData[OutputCnt] := -pcr_logf(1 + NeuralExp(-x))
+        FOutput.FData[OutputCnt] := -pcr_log1pf(NeuralExp(-x))
       else
         FOutput.FData[OutputCnt] := x - pcr_log1pf(NeuralExp(x));
     end;
