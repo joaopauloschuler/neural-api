@@ -3632,8 +3632,15 @@ type
     FCosA, FSinA: array of Double;      // one sequence-axis row (length L)
     FCrT, FCiT: array of Double;        // hidden-axis partial sums, [b*L + s]
     FFFTCacheL, FFFTCacheD: integer;
+
+    {$IFDEF FPC}
     FFFTRe, FFFTIm: array of array of Double; // [s][h] after hidden-axis FFT
     FFFTColRe, FFFTColIm: array of Double;    // one sequence-axis column
+    {$ELSE}
+    FFFTRe, FFFTIm: TNeuralDoubleDynArr2D;      // [s][h] after hidden-axis FFT
+    FFFTColRe, FFFTColIm: TNeuralDoubleDynArr;  // one sequence-axis column
+    {$ENDIF}
+
     procedure EnsureDirectBuffers(L, D: integer);
     procedure EnsureFFTBuffers(L, D: integer);
     procedure ApplyRealDFT(Src, Dst: TNNetVolume);
@@ -14133,7 +14140,7 @@ type
     FStepKind: array of integer;
     FStepTapOfs: array of integer;   // index into the flat tap array for this step
     FStepTapCnt: array of integer;   // number of taps in this step
-    FStepOffs: array of array of integer; // neighbour offsets per step
+    FStepOffs: {$IFDEF FPC}array of array of integer{$ELSE}array of TNeuralIntegerArray {$ENDIF}; // neighbour offsets per step
     FScaleS, FScaleD: TNeuralFloat;  // final per-band scaling (1 if none)
     FFixedTaps: array of TNeuralFloat;   // fixed-mode tap values (flat)
     // Per-instance lifting scratch (sized FHalf in SetPrevLayer; ComputeCPU and
@@ -30308,9 +30315,15 @@ end;
 procedure TNNetFourierMix.ApplyRealDFTFFT(Src, Dst: TNNetVolume);
 var
   L, D, LM1, DM1, s, h, sD, pos: integer;
+  {$IFDEF FPC}
   reRows, imRows: array of array of Double; // [s][h] after hidden-axis FFT
   colRe, colIm: array of Double;
   rowRe, rowIm: array of Double;
+  {$ELSE}
+  reRows, imRows: TNeuralDoubleDynArr2D; // [s][h] after hidden-axis FFT
+  colRe, colIm: TNeuralDoubleDynArr;
+  rowRe, rowIm: TNeuralDoubleDynArr;
+  {$ENDIF}
 begin
   L := Src.SizeX;
   D := Src.Depth;
@@ -72729,6 +72742,7 @@ begin
   begin
     // Zero row (or nothing finite): zero codes with unit scale.
     CountM1 := Count - 1;
+    {$IFNDEF FPC} {$POINTERMATH ON} {$ENDIF}
     for i := 0 to CountM1 do Codes[i] := 0;
     Scale := 1;
   end;
@@ -80193,7 +80207,7 @@ var
   st, t, i, jj: integer;
   StepKindMax, HalfM1, TapMaxSt, tapBase: integer;
   tap, acc: Double;
-  offRow: array of integer;
+  offRow: {$IFDEF FPC}array of integer{$ELSE} TNeuralIntegerArray {$ENDIF};
 begin
   StepKindMax := Length(FStepKind) - 1;
   HalfM1 := FHalf - 1;
@@ -97537,10 +97551,10 @@ begin
   FuseAct := (not FIsTrainable);
   if FuseAct then
   begin
-    if      FActivationFn = @Identity              then ActOpcode := csActNone
-    else if FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
-    else if FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
-    else if FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
+    if      {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Identity              then ActOpcode := csActNone
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
     else FuseAct := false;
   end;
 
@@ -97607,10 +97621,10 @@ begin
   FuseAct := (not FIsTrainable);
   if FuseAct then
   begin
-    if      FActivationFn = @Identity              then ActOpcode := csActNone
-    else if FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
-    else if FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
-    else if FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
+    if      {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Identity              then ActOpcode := csActNone
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
     else FuseAct := false;
   end;
 
@@ -99939,10 +99953,10 @@ begin
   FuseAct := (not FIsTrainable);
   if FuseAct then
   begin
-    if      FActivationFn = @Identity              then ActOpcode := csActNone
-    else if FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
-    else if FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
-    else if FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
+    if      {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Identity              then ActOpcode := csActNone
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
     else FuseAct := false;
   end;
 
@@ -100005,10 +100019,10 @@ begin
   FuseAct := (not FIsTrainable);
   if FuseAct then
   begin
-    if      FActivationFn = @Identity              then ActOpcode := csActNone
-    else if FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
-    else if FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
-    else if FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
+    if      {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Identity              then ActOpcode := csActNone
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
     else FuseAct := false;
   end;
 
@@ -121856,8 +121870,7 @@ begin
   V.Free;
 end;
 
-procedure TNNet.Compute(pInput, pOutput: TNNetVolumeList; FromLayerIdx: integer
-  ; Parallel: boolean = false);
+procedure TNNet.Compute(pInput, pOutput: TNNetVolumeList; FromLayerIdx: integer = 0; Parallel: boolean = false);
 var
   AuxOutput: TNNetVolume;
   MaxIdxInput, IdxInput: integer;
@@ -121889,7 +121902,7 @@ begin
   end;
 end;
 
-procedure TNNet.Compute(pInput, pOutput: TNNetVolume; FromLayerIdx: integer; Parallel: boolean = false);
+procedure TNNet.Compute(pInput, pOutput: TNNetVolume; FromLayerIdx: integer = 0; Parallel: boolean = false);
 begin
   Self.Compute(pInput, FromLayerIdx, Parallel);
   Self.GetOutput(pOutput);

@@ -60,6 +60,15 @@ type
   TInt8DynArr = array of ShortInt;
   TNeuralFloatPtr = ^TNeuralFloat;
 
+  {$IFNDEF FPC}
+  TNeuralDouble = Double;
+  TNeuralDoubleDynArr = array of TNeuralDouble;
+  TNeuralDoublePtr = ^TNeuralDouble;
+
+  TNeuralFloatDynArr2D = array of TNeuralFloatDynArr;
+  TNeuralDoubleDynArr2D = array of TNeuralDoubleDynArr;
+  {$ENDIF}
+
   TNeuralFloat4 = array[0..3] of TNeuralFloat;
   {$IFDEF FPC}
     {$IFDEF CPU32}
@@ -992,8 +1001,13 @@ type
       // Persistent scratch, lazily sized to the vocab and reused across tokens
       // so SampleTypical allocates ~once over the sampler's lifetime, not per
       // call (rule #17 amortized-field form).
+      {$IFDEF FPC}
       FDist: array of TNeuralFloat;  // |surprise - entropy| per FTokenArr entry
       FOrder: array of integer;      // FTokenArr indices sorted by ascending FDist
+      {$ELSE}
+      FDist: TNeuralFloatDynArr;
+      FOrder: TNeuralIntegerArray;
+      {$ENDIF}
       // Build the typical set from FTokenArr (any order) and draw from it.
       function SampleTypical(): integer;
     public
@@ -2396,8 +2410,14 @@ end;
   +Inf from its bit pattern instead of a deliberate Single overflow (which
   traps under FPC's default unmasked SSE overflow exception). Every other
   input returns the identical correctly-rounded pcr_expf result. }
-{$PUSH}
-{$Q-}{$R-}
+
+{$IFDEF FPC}
+  {$PUSH}
+  {$Q-}{$R-}
+{$ELSE}
+  {$PUSHOPT}
+  {$Q-}{$R-}
+{$ENDIF}
 function NeuralExp(x: TNeuralFloat): TNeuralFloat;
 const
   c_exp_0: Double = 0.69314718055994529;
@@ -2501,7 +2521,11 @@ begin
   end;
   Result := ub_exp;
 end;
-{$POP}
+{$IFDEF FPC}
+  {$POP}
+{$ELSE}
+  {$POPOPT}
+{$ENDIF}
 
 // https://stackoverflow.com/questions/51976461/optimal-way-of-defining-a-numerically-stable-sigmoid-function-for-a-list-in-pyth
 function Sigmoid(x: TNeuralFloat): TNeuralFloat;
@@ -4290,8 +4314,13 @@ const
   csTypicalAdaptiveK = 256;
 var
   Entropy, P, LogP, KeptSum, Roll, Cumulative: TNeuralFloat;
+  {$IFDEF FPC}
   Dist: array of TNeuralFloat; // |surprise - entropy| per FTokenArr entry
   Order: array of integer;     // FTokenArr indices sorted by ascending Dist
+  {$ELSE}
+  Dist: TNeuralFloatDynArr;         // |surprise - entropy| per FTokenArr entry
+  Order: TNeuralIntegerArray;          // FTokenArr indices sorted by ascending Dist
+  {$ENDIF}
   I, KeptCount, KeptCountM1, N, NM1, Limit: integer;
   Truncated: boolean;
 begin
@@ -11722,7 +11751,7 @@ begin
   Result := 0;
   vHigh := NumElements - 1;
   for I := 0 to vHigh do
-    Result += PtrA^[I] * PtrB^[I];
+    Result := Result + PtrA^[I] * PtrB^[I];
 end;
 
 class function TNNetVolume.MaxAbsFinite(pSrc: TNeuralFloatArrPtr;
