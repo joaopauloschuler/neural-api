@@ -63842,13 +63842,15 @@ begin
         end;
 end;
 
-// Loads the per-head relative-position bias into a TNNetWindowAttention layer.
-// BiasTable is the flat [(2P-1)^2, NumHeads] table (row-major idx*NumHeads+head).
-procedure MaxViTSetWindowBias(WinAttn: TNNetLayer; BiasTable: TNNetVolume;
-  const RelPosIndex: TNeuralIntegerArray; HeadIdx, NumHeads, P: integer);
+// Gathers one head's p2 x p2 relative-position bias matrix into Mat (resized
+// here). BiasTable is the flat [(2P-1)^2, NumHeads] table (row-major
+// idx*NumHeads+head). MaxViT has no cyclic-shift mask, so the matrix depends
+// only on the head and one gather serves every window of that head.
+procedure MaxViTBuildHeadBias(BiasTable: TNNetVolume;
+  const RelPosIndex: TNeuralIntegerArray; HeadIdx, NumHeads, P: integer;
+  Mat: TNNetVolume);
 var
   p2, p2M1, i, j, idx: integer;
-  Mat: TNNetVolume;
 begin
   p2 := P * P;
   p2M1 := p2 - 1;
@@ -63859,18 +63861,13 @@ begin
       IntToStr(BiasTable.Size) + ' elements, expected at least ' +
       IntToStr(Sqr(2 * P - 1) * NumHeads) + ' for window/grid size ' +
       IntToStr(P) + ' x ' + IntToStr(NumHeads) + ' heads.');
-  Mat := TNNetVolume.Create(p2 * p2, 1, 1);
-  try
-    for i := 0 to p2M1 do
-      for j := 0 to p2M1 do
-      begin
-        idx := RelPosIndex[i * p2 + j];
-        Mat.FData[i * p2 + j] := BiasTable.FData[idx * NumHeads + HeadIdx];
-      end;
-    TNNetWindowAttention(WinAttn).SetBiasMatrix(Mat);
-  finally
-    Mat.Free;
-  end;
+  Mat.ReSize(p2 * p2, 1, 1);
+  for i := 0 to p2M1 do
+    for j := 0 to p2M1 do
+    begin
+      idx := RelPosIndex[i * p2 + j];
+      Mat.FData[i * p2 + j] := BiasTable.FData[idx * NumHeads + HeadIdx];
+    end;
 end;
 
 function BuildMaxViTFromSafeTensors(Reader: TNNetSafeTensorsReader;
@@ -63895,7 +63892,7 @@ var
     QSlice, KSlice, VSlice, QKV, HeadAttn: TNNetLayer;
     WindowOuts, HeadOuts: array of TNNetLayer;
     WinAttnLayers: array of TNNetLayer;
-    BiasTable: TNNetVolume;
+    BiasTable, HeadBias: TNNetVolume;
   begin
     MaxViTBuildPartition(AH, P, IsGrid, Perm, InvPerm, NW);
     MaxViTBuildRelPosIndex(P, RelPosIndex);
@@ -63980,13 +63977,23 @@ var
     BiasTable := TNNetVolume.Create;
     try
       Reader.LoadTensorFlat(Prefix + '.attn.rel_pos_bias_table', BiasTable);
-      for wIdx := 0 to NWM1 do
+      // Head OUTERMOST: the gathered matrix is window-invariant, so it is built
+      // once per head and handed to every window (SetBiasMatrix copies it).
+      HeadBias := TNNetVolume.Create;
+      try
         for h := 0 to NumHeadsM1 do
         begin
-          ci := wIdx * Config.NumHeads + h;
-          MaxViTSetWindowBias(WinAttnLayers[ci], BiasTable,
-            RelPosIndex, h, Config.NumHeads, P);
+          MaxViTBuildHeadBias(BiasTable, RelPosIndex, h, Config.NumHeads, P,
+            HeadBias);
+          for wIdx := 0 to NWM1 do
+          begin
+            ci := wIdx * Config.NumHeads + h;
+            TNNetWindowAttention(WinAttnLayers[ci]).SetBiasMatrix(HeadBias);
+          end;
         end;
+      finally
+        HeadBias.Free;
+      end;
     finally
       BiasTable.Free;
     end;
