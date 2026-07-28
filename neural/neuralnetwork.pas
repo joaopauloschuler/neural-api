@@ -73367,10 +73367,10 @@ var
   MaxOutputY: integer;
   StartTime: double;
   Feature, FeatureErr, Cond, CondErr: TNNetVolume;
-  X, Y, C, FDepthM1, base, FeatStrideY: integer;
-  Gamma, dOut, GradGamma, GradBeta: TNeuralFloat;
+  X, Y, base: integer;
   MaxError: TNeuralFloat;
-  HasFeatureGrad: boolean;
+  HasFeatureGrad, HasCondGrad: boolean;
+  GammaPtr, dGammaPtr, dBetaPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
@@ -73383,56 +73383,42 @@ begin
     FeatureErr := FPrevOutputError[0];
     Cond       := FPrevOutput[1];
     CondErr    := FPrevOutputError[1];
-    FDepthM1 := FDepth - 1;
     HasFeatureGrad := FeatureErr.Size = Feature.Size;
-    // GetRawPos(x,y,d) = ((SizeX*y)+x)*Depth + d, so stepping the inner Y loop
-    // advances the flat offset by SizeX*Depth.
-    FeatStrideY := Feature.SizeX * Feature.Depth;
-    MaxOutputX := FOutput.SizeX - 1;
-    MaxOutputY := FOutput.SizeY - 1;
-    for C := 0 to FDepthM1 do
+    HasCondGrad := CondErr.Size = Cond.Size;
+    // Nothing downstream consumes either gradient: the whole nest would be
+    // discarded work.
+    if HasFeatureGrad or HasCondGrad then
     begin
-      Gamma     := Cond.FData[C];
-      GradGamma := 0;
-      GradBeta  := 0;
-      // #5: lift the invariant HasFeatureGrad test out of the (X,Y) nest.
-      // #12: the (X,Y) offset advances by FeatDepth down the Y axis - carry it.
-      if HasFeatureGrad then
+      // Pixel-outer, so the depth run at each (X,Y) is CONTIGUOUS in all four
+      // buffers. gamma/beta broadcast over XY, and CondErr's first FDepth
+      // entries ARE dGamma with dBeta right after them, so the per-channel sums
+      // accumulate straight into it -- no scratch, no channel-strided walk.
+      GammaPtr := Cond.GetRawPtr(0, 0);
+      dGammaPtr := nil;
+      dBetaPtr := nil;
+      if HasCondGrad then
       begin
-        for X := 0 to MaxOutputX do
+        dGammaPtr := CondErr.GetRawPtr(0, 0);
+        dBetaPtr  := CondErr.GetRawPtr(0, 0, FDepth);
+      end;
+      MaxOutputX := FOutput.SizeX - 1;
+      MaxOutputY := FOutput.SizeY - 1;
+      for X := 0 to MaxOutputX do
+        for Y := 0 to MaxOutputY do
         begin
-          base := Feature.GetRawPos(X, 0, C);
-          for Y := 0 to MaxOutputY do
+          base := Feature.GetRawPos(X, Y);
+          // dL/dinput0[x,y,c] += gamma[c] * dOut[x,y,c]
+          if HasFeatureGrad then
+            TNNetVolume.MulAdd(@FeatureErr.FData[base],
+              @FOutputError.FData[base], GammaPtr, FDepth);
+          if HasCondGrad then
           begin
-            dOut := FOutputError.FData[base];
-            // dL/dinput0[x,y,c] = gamma[c] * dOut[x,y,c]
-            FeatureErr.FData[base] := FeatureErr.FData[base] + Gamma * dOut;
-            // dL/dgamma[c] = sum input0*dOut ; dL/dbeta[c] = sum dOut
-            GradGamma := GradGamma + Feature.FData[base] * dOut;
-            GradBeta  := GradBeta + dOut;
-            Inc(base, FeatStrideY);
+            // dL/dgamma[c] += input0*dOut ; dL/dbeta[c] += dOut
+            TNNetVolume.MulAdd(dGammaPtr, @Feature.FData[base],
+              @FOutputError.FData[base], FDepth);
+            TNNetVolume.Add(dBetaPtr, @FOutputError.FData[base], FDepth);
           end;
         end;
-      end
-      else
-      begin
-        for X := 0 to MaxOutputX do
-        begin
-          base := Feature.GetRawPos(X, 0, C);
-          for Y := 0 to MaxOutputY do
-          begin
-            dOut := FOutputError.FData[base];
-            GradGamma := GradGamma + Feature.FData[base] * dOut;
-            GradBeta  := GradBeta + dOut;
-            Inc(base, FeatStrideY);
-          end;
-        end;
-      end;
-      if CondErr.Size = Cond.Size then
-      begin
-        CondErr.FData[C]          := CondErr.FData[C] + GradGamma;
-        CondErr.FData[FDepth + C] := CondErr.FData[FDepth + C] + GradBeta;
-      end;
     end;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
