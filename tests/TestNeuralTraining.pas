@@ -31,6 +31,7 @@ type
     procedure TestAdafactorOptimizer;
     procedure TestAdafactorUsesFewerBuffersThanAdam;
     procedure TestAdamDeltaMatchesClosedForm;
+    procedure TestAdamDeltaMultiStepMatchesReference;
     procedure TestReluErrorDerivIsGated;
     procedure TestMuonOptimizer;
     procedure TestMuonOrthogonalizesUpdate;
@@ -754,6 +755,84 @@ begin
     NN.Free;
     Input.Free;
     Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestAdamDeltaMultiStepMatchesReference;
+const
+  cLR = 0.05;
+  cBeta1 = 0.9;
+  cBeta2 = 0.999;
+  cEps = 1e-8;
+  cN = 64;      // above csMinAvxSize, so the AVX volume kernels are exercised
+  cSteps = 5;
+var
+  NN: TNNet;
+  Layer: TNNetLayer;
+  N: TNNetNeuron;
+  I, Step, MaxI: integer;
+  G, Expected: double;
+  M, V: array of double;
+  B1Decay, B2Decay, OmB1D, OmB2D: double;
+begin
+  // TestAdamDeltaMatchesClosedForm pins only the FIRST step, on a 4-weight
+  // neuron -- below the AVX dispatch threshold, and with both moments still
+  // zero. This drives cSteps consecutive steps on an AVX-sized neuron and
+  // checks TNNetNeuron.CalcAdamDelta against an independent DOUBLE-precision
+  // Adam recurrence, so the momentum accumulation and the per-step bias
+  // correction are covered too:
+  //   m := B1*m + (1-B1)*g          v := B2*v + (1-B2)*g^2
+  //   delta := (LR/(1-B1^t)) * m / (sqrt(v/(1-B2^t)) + eps)
+  // Any rewrite of that composition (a fused kernel, a reciprocal, a different
+  // op order) has to keep landing here.
+  NN := TNNet.Create();
+  try
+    NN.AddLayer([
+      TNNetInput.Create(1, 1, cN),
+      TNNetFullConnectLinear.Create(2)
+    ]);
+    NN.SetLearningRate(cLR, 0);
+    Layer := NN.Layers[1];
+    Layer.InitAdam(cBeta1, cBeta2, cEps);
+
+    N := Layer.Neurons[0];
+    MaxI := N.Delta.Size - 1;
+    AssertEquals('Neuron delta has one slot per input', cN - 1, MaxI);
+
+    SetLength(M, cN);
+    SetLength(V, cN);
+    for I := 0 to MaxI do begin M[I] := 0; V[I] := 0; end;
+    B1Decay := 1;
+    B2Decay := 1;
+
+    for Step := 1 to cSteps do
+    begin
+      // A gradient pattern that changes sign and magnitude across steps, and
+      // includes an exact zero, so no slot is accidentally trivial.
+      for I := 0 to MaxI do
+      begin
+        G := ((I mod 7) - 3) * 0.25 * Step;
+        N.Delta.FData[I] := G;
+      end;
+
+      Layer.CalcAdamDelta();
+
+      B1Decay := B1Decay * cBeta1;
+      B2Decay := B2Decay * cBeta2;
+      OmB1D := 1 - B1Decay;
+      OmB2D := 1 - B2Decay;
+      for I := 0 to MaxI do
+      begin
+        G := ((I mod 7) - 3) * 0.25 * Step;
+        M[I] := cBeta1 * M[I] + (1 - cBeta1) * G;
+        V[I] := cBeta2 * V[I] + (1 - cBeta2) * G * G;
+        Expected := (cLR / OmB1D) * M[I] / (Sqrt(V[I] / OmB2D) + cEps);
+        AssertEquals('Adam delta step ' + IntToStr(Step) + ' slot ' + IntToStr(I),
+          Expected, N.Delta.FData[I], 1e-5);
+      end;
+    end;
+  finally
+    NN.Free;
   end;
 end;
 
