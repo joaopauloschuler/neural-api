@@ -31,6 +31,7 @@ type
     procedure TestVolumeLeakyReluParity;
     procedure TestVolumeMaxPosParity;
     procedure TestVolumeAddSubValueParity;
+    procedure TestVolumeRankOneUpdateRowParity;
     procedure TestVolumeFlip;
     procedure TestVolumeClassification;
     procedure TestVolumeSoftMax;
@@ -724,6 +725,93 @@ begin
     finally
       V.Free;
     end;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeRankOneUpdateRowParity;
+// TNNetVolume.RankOneUpdateRow runs the AVX kernels while TVolume composes its
+// scalar element loops. Both must land BIT-exactly on the reference rounding
+// sequence built here: round(Prev*Alpha), round(B*BScale), then round of their
+// sum -- which is what the composed scalar loops do and what the MulMulAdd
+// kernel's separate vmulps pair plus vaddps do. All three contract cases are
+// covered: no previous row (Prev = nil, and a zero Alpha), the disjoint carry,
+// and the aliased PtrPrev = PtrDst in-place carry every recurrent scan uses.
+// Sizes straddle the kernels' 32-element block, their 4-element small loop and
+// the scalar tail.
+const
+  Sizes: array[0..8] of integer = (1, 3, 4, 8, 31, 32, 33, 100, 1000);
+  cAlpha: TNeuralFloat = 0.96875;
+  cBScale: TNeuralFloat = -0.3125;
+var
+  Dst, Ref, Prev, B: array of TNeuralFloat;
+  SI, K, N, Rep: integer;
+  T1, T2: TNeuralFloat;
+  Tag: string;
+begin
+  RandSeed := 24011966;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    Tag := ' (N=' + IntToStr(N) + ')';
+    SetLength(Dst, N);
+    SetLength(Ref, N);
+    SetLength(Prev, N);
+    SetLength(B, N);
+    for K := 0 to N - 1 do
+    begin
+      Prev[K] := (Random - 0.5) * 6;
+      B[K] := (Random - 0.5) * 6;
+      Dst[K] := -999;
+    end;
+
+    // Case 1 - no previous row at all.
+    for K := 0 to N - 1 do Ref[K] := B[K] * cBScale;
+    TNNetVolume.RankOneUpdateRow(TNeuralFloatArrPtr(@Dst[0]), nil,
+      TNeuralFloatArrPtr(@B[0]), cAlpha, cBScale, N);
+    for K := 0 to N - 1 do
+      AssertEquals('nil prev[' + IntToStr(K) + ']' + Tag, Ref[K], Dst[K], 0.0);
+
+    // Case 2 - a zero carry scale takes the same branch with a real Prev.
+    TNNetVolume.RankOneUpdateRow(TNeuralFloatArrPtr(@Dst[0]),
+      TNeuralFloatArrPtr(@Prev[0]), TNeuralFloatArrPtr(@B[0]), 0, cBScale, N);
+    for K := 0 to N - 1 do
+      AssertEquals('zero alpha[' + IntToStr(K) + ']' + Tag, Ref[K], Dst[K], 0.0);
+
+    // Case 3 - disjoint Prev and Dst.
+    for K := 0 to N - 1 do
+    begin
+      T1 := Prev[K] * cAlpha;
+      T2 := B[K] * cBScale;
+      Ref[K] := T1 + T2;
+    end;
+    TNNetVolume.RankOneUpdateRow(TNeuralFloatArrPtr(@Dst[0]),
+      TNeuralFloatArrPtr(@Prev[0]), TNeuralFloatArrPtr(@B[0]),
+      cAlpha, cBScale, N);
+    for K := 0 to N - 1 do
+      AssertEquals('carry[' + IntToStr(K) + ']' + Tag, Ref[K], Dst[K], 0.0);
+
+    // Case 4 - the in-place form, run three times so a state carry that drifts
+    // from the reference cannot cancel itself out.
+    for K := 0 to N - 1 do
+    begin
+      Ref[K] := Prev[K];
+      Dst[K] := Prev[K];
+    end;
+    for Rep := 1 to 3 do
+    begin
+      for K := 0 to N - 1 do
+      begin
+        T1 := Ref[K] * cAlpha;
+        T2 := B[K] * cBScale;
+        Ref[K] := T1 + T2;
+      end;
+      TNNetVolume.RankOneUpdateRow(TNeuralFloatArrPtr(@Dst[0]),
+        TNeuralFloatArrPtr(@Dst[0]), TNeuralFloatArrPtr(@B[0]),
+        cAlpha, cBScale, N);
+    end;
+    for K := 0 to N - 1 do
+      AssertEquals('in-place carry[' + IntToStr(K) + ']' + Tag,
+        Ref[K], Dst[K], 0.0);
   end;
 end;
 

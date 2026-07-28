@@ -757,6 +757,12 @@ type
       procedure MulAdd(Value: TNeuralFloat; PtrB: TNeuralFloatArrPtr); overload; {$IFDEF Release} inline; {$ENDIF}
       class procedure MulAdd(PtrA, PtrB: TNeuralFloatArrPtr; Value: TNeuralFloat; pSize: integer); overload; {$IFDEF Release} inline; {$ENDIF}
       class procedure MulAdd(PtrA, PtrB, PtrC: TNeuralFloatArrPtr; pSize: integer); overload; {$IFDEF Release} inline; {$ENDIF}
+      // Dst := AlphaScale*Prev + BScale*B over a raw row. Same contract as
+      // TVolume.RankOneUpdateRow (Prev = nil means the zero row, Prev may alias
+      // Dst) but routed through the AVX kernels instead of the scalar element
+      // loops, which is what every recurrent-state caller needs.
+      class procedure RankOneUpdateRow(PtrDst, PtrPrev, PtrB: TNeuralFloatArrPtr;
+        AlphaScale, BScale: TNeuralFloat; pSize: integer);
       procedure Divi(Value: Single); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure Copy(Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
       procedure CopyRelu(Original: TNNetVolume); overload; {$IFDEF Release} inline; {$ENDIF}
@@ -16895,6 +16901,29 @@ class procedure TNNetVolume.MulAdd(PtrA, PtrB, PtrC: TNeuralFloatArrPtr;
   pSize: integer);
 begin
   AVXMulAdd(PtrA, PtrB, PtrC, pSize);
+end;
+
+// Dst := AlphaScale*Prev + BScale*B, the rank-one state carry every recurrent
+// scan performs per token. TVolume's version composes the scalar Mul/MulAdd
+// class methods; this one keeps the identical rounding -- round(Prev*Alpha)
+// then round(that + round(B*BScale)), which is exactly what the MulMulAdd
+// kernel emits with its separate vmulps pair and vaddps -- while running eight
+// lanes at a time. Results are bit-identical to the inherited version.
+// PtrPrev = PtrDst is the common in-place case and skips the copy.
+class procedure TNNetVolume.RankOneUpdateRow(PtrDst, PtrPrev, PtrB: TNeuralFloatArrPtr;
+  AlphaScale, BScale: TNeuralFloat; pSize: integer);
+begin
+  if (PtrPrev = nil) or (AlphaScale = 0) then
+  begin
+    Move(PtrB^, PtrDst^, pSize * SizeOf(TNeuralFloat));
+    TNNetVolume.Mul(PtrDst, BScale, pSize);
+  end
+  else
+  begin
+    if PtrPrev <> PtrDst then
+      Move(PtrPrev^, PtrDst^, pSize * SizeOf(TNeuralFloat));
+    TNNetVolume.MulMulAdd(PtrDst, PtrB, AlphaScale, BScale, pSize);
+  end;
 end;
 
 procedure TNNetVolume.Divi(Value: Single);
