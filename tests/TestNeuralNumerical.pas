@@ -1189,6 +1189,7 @@ type
     procedure TestAdaINForwardAVXParity;
     procedure TestAdaINContentGradientCheck;
     procedure TestAdaINStyleGradientCheck;
+    procedure TestAdaINWideDepthBackwardParity;
     procedure TestAdaINLoadFromString;
     procedure TestHyperLinearMainInputGradientCheck;
     procedure TestHyperLinearGeneratedWeightsGradientCheck;
@@ -20654,6 +20655,117 @@ begin
       FloatToStr(maxErr));
   finally
     NN.Free; Content.Free; Style.Free; StylePlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAdaINWideDepthBackwardParity;
+// TNNetAdaIN.Backpropagate switches from the channel-outer scalar walk to
+// position-outer depth-column vector ops at csAdaINBackVectorMinDepth channels;
+// the D=3 gradient checks above only ever reach the scalar path. This one runs a
+// WIDE depth (37, a non-multiple of 8, so the AVX tails run) with content and
+// style at different spatial sizes, and checks BOTH propagated gradients against
+// an independent element-wise scalar reference. A finite-difference check cannot
+// gate this: at these gradient magnitudes the central difference is itself the
+// inaccurate side, and it lands identically on both paths.
+var
+  NN: TNNet;
+  ContentInput, StyleInput, Ada: TNNetLayer;
+  Content, Style, Desired: TNNetVolume;
+  CW, CH, SW, SH, D, c, x, y, n, N_, M_: integer;
+  cMean, cVar, cInvStd, sMean, sVar, sStd, eps: TNeuralFloat;
+  g, xhat, shat, sumG, sumGXHat, contentFactor, refVal: TNeuralFloat;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  eps := 1e-5;          // matches TNNetAdaIN.FAdaEpsilon
+  CW := 7; CH := 3; SW := 2; SH := 9; D := 37;
+  N_ := CW * CH; M_ := SW * SH;
+  NN := TNNet.Create();
+  Content := TNNetVolume.Create(CW, CH, D);
+  Style := TNNetVolume.Create(SW, SH, D);
+  Desired := TNNetVolume.Create(CW, CH, D);
+  MaxDiff := 0;
+  try
+    ContentInput := NN.AddLayer(TNNetInput.Create(CW, CH, D, 1));
+    StyleInput   := NN.AddLayerAfter(TNNetInput.Create(SW, SH, D, 1), 0);
+    Ada := NN.AddLayerAfter(TNNetAdaIN.Create(ContentInput, StyleInput), ContentInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for n := 0 to Content.Size - 1 do Content.Raw[n] := Sin(n * 0.53) * 0.9 + 0.1;
+    for n := 0 to Style.Size - 1 do Style.Raw[n] := Cos(n * 0.37) * 1.7 - 0.4;
+    for n := 0 to Desired.Size - 1 do Desired.Raw[n] := Cos(n * 0.31);
+
+    ContentInput.Output.Copy(Content);
+    StyleInput.Output.Copy(Style);
+    NN.Compute(ContentInput.Output);
+    ContentInput.OutputError.Fill(0);
+    StyleInput.OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+
+    for c := 0 to D - 1 do
+    begin
+      // Per-channel content and style statistics, computed independently.
+      cMean := 0; cVar := 0;
+      for x := 0 to CW - 1 do
+        for y := 0 to CH - 1 do cMean := cMean + Content[x, y, c];
+      cMean := cMean / N_;
+      for x := 0 to CW - 1 do
+        for y := 0 to CH - 1 do
+          cVar := cVar + Sqr(Content[x, y, c] - cMean);
+      cVar := cVar / N_;
+      cInvStd := 1 / Sqrt(cVar + eps);
+      sMean := 0; sVar := 0;
+      for x := 0 to SW - 1 do
+        for y := 0 to SH - 1 do sMean := sMean + Style[x, y, c];
+      sMean := sMean / M_;
+      for x := 0 to SW - 1 do
+        for y := 0 to SH - 1 do
+          sVar := sVar + Sqr(Style[x, y, c] - sMean);
+      sVar := sVar / M_;
+      sStd := Sqrt(sVar + eps);
+
+      // Upstream-gradient reductions over the content positions.
+      sumG := 0; sumGXHat := 0;
+      for x := 0 to CW - 1 do
+        for y := 0 to CH - 1 do
+        begin
+          g := Ada.OutputError[x, y, c];
+          sumG := sumG + g;
+          sumGXHat := sumGXHat + g * (Content[x, y, c] - cMean) * cInvStd;
+        end;
+
+      // Content gradient: instance-norm Jacobian scaled by style_std/content_std.
+      contentFactor := sStd * cInvStd / N_;
+      for x := 0 to CW - 1 do
+        for y := 0 to CH - 1 do
+        begin
+          g := Ada.OutputError[x, y, c];
+          xhat := (Content[x, y, c] - cMean) * cInvStd;
+          refVal := contentFactor * (N_ * g - sumG - xhat * sumGXHat);
+          Diff := Abs(refVal - ContentInput.OutputError[x, y, c]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+          AssertTrue('AdaIN wide-depth content gradient at ' + IntToStr(x) + ',' +
+            IntToStr(y) + ',' + IntToStr(c) + ' ref=' + FloatToStr(refVal) +
+            ' got=' + FloatToStr(ContentInput.OutputError[x, y, c]), Diff < 1e-4);
+        end;
+
+      // Style gradient: through style_mean (1/M spread) and style_std.
+      for x := 0 to SW - 1 do
+        for y := 0 to SH - 1 do
+        begin
+          shat := (Style[x, y, c] - sMean) / sStd;
+          refVal := sumG / M_ + sumGXHat * shat / M_;
+          Diff := Abs(refVal - StyleInput.OutputError[x, y, c]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+          AssertTrue('AdaIN wide-depth style gradient at ' + IntToStr(x) + ',' +
+            IntToStr(y) + ',' + IntToStr(c) + ' ref=' + FloatToStr(refVal) +
+            ' got=' + FloatToStr(StyleInput.OutputError[x, y, c]), Diff < 1e-4);
+        end;
+    end;
+    WriteLn('  TestAdaINWideDepthBackwardParity max abs diff: ', FloatToStr(MaxDiff));
+  finally
+    NN.Free; Content.Free; Style.Free; Desired.Free;
   end;
 end;
 

@@ -79,6 +79,11 @@ const
   // Coded by Claude (AI).
   csActivationOpenCLMinSize = 64*1024*1024;
 
+  // Channel count from which TNNetAdaIN's backward pass switches from the
+  // channel-outer scalar walk to position-outer depth-column vector ops. Below
+  // it the columns are too short to pay for the per-column call overhead.
+  csAdaINBackVectorMinDepth = 8;
+
   // TNNetKANConv edge-function basis selectors (FStruct[6]).
   csKANBasisChebyshev = 0;  // default: Chebyshev-T expansion over tanh(x)
   csKANBasisBSpline   = 1;  // uniform clamped B-spline (KAN-paper parameterisation)
@@ -11254,6 +11259,12 @@ type
       // Depth-length scratch buffers for the depth-contiguous per-channel
       // mean/inv-std reductions (see NeuralPerChannelMeanInvStd).
       FSumScratch, FSumSqScratch, FStyleInvStd: TNNetVolume;
+      // Depth-length backward scratch: the upstream-gradient reductions and the
+      // per-channel coefficients that turn each backward sweep into column ops.
+      FGSum, FGXHatSum: TNNetVolume;              // (1,1,Depth)
+      FCoefA, FCoefB, FCoefD: TNNetVolume;        // content-gradient coefficients
+      FCoefP, FCoefQ: TNNetVolume;                // style-gradient coefficients
+      FNegStyleMean, FStyleTmp: TNNetVolume;      // style column staging
       {$IFDEF OpenCL}
       FAdaINCL: TNNetGroupNormCL;
       procedure ComputeOpenCL();
@@ -49215,6 +49226,15 @@ begin
   FSumScratch := TNNetVolume.Create();
   FSumSqScratch := TNNetVolume.Create();
   FStyleInvStd := TNNetVolume.Create();
+  FGSum := TNNetVolume.Create();
+  FGXHatSum := TNNetVolume.Create();
+  FCoefA := TNNetVolume.Create();
+  FCoefB := TNNetVolume.Create();
+  FCoefD := TNNetVolume.Create();
+  FCoefP := TNNetVolume.Create();
+  FCoefQ := TNNetVolume.Create();
+  FNegStyleMean := TNNetVolume.Create();
+  FStyleTmp := TNNetVolume.Create();
 end;
 
 destructor TNNetAdaIN.Destroy();
@@ -49230,6 +49250,15 @@ begin
   FSumScratch.Free;
   FSumSqScratch.Free;
   FStyleInvStd.Free;
+  FGSum.Free;
+  FGXHatSum.Free;
+  FCoefA.Free;
+  FCoefB.Free;
+  FCoefD.Free;
+  FCoefP.Free;
+  FCoefQ.Free;
+  FNegStyleMean.Free;
+  FStyleTmp.Free;
   inherited Destroy();
 end;
 
@@ -49252,6 +49281,15 @@ begin
   FContentInvStd.ReSize(1, 1, FContentLayer.Output.Depth);
   FStyleMean.ReSize(1, 1, FContentLayer.Output.Depth);
   FStyleStd.ReSize(1, 1, FContentLayer.Output.Depth);
+  FGSum.ReSize(1, 1, FContentLayer.Output.Depth);
+  FGXHatSum.ReSize(1, 1, FContentLayer.Output.Depth);
+  FCoefA.ReSize(1, 1, FContentLayer.Output.Depth);
+  FCoefB.ReSize(1, 1, FContentLayer.Output.Depth);
+  FCoefD.ReSize(1, 1, FContentLayer.Output.Depth);
+  FCoefP.ReSize(1, 1, FContentLayer.Output.Depth);
+  FCoefQ.ReSize(1, 1, FContentLayer.Output.Depth);
+  FNegStyleMean.ReSize(1, 1, FContentLayer.Output.Depth);
+  FStyleTmp.ReSize(1, 1, FContentLayer.Output.Depth);
   FNormContent.ReSize(FContentLayer.Output);
   SetOutputErrorSize(FContentLayer.Output);
   {$IFDEF OpenCL}
@@ -49328,22 +49366,20 @@ end;
 
 procedure TNNetAdaIN.Backpropagate();
 var
-  MaxContentOutX: integer;
-  MaxContentOutY: integer;
-  MaxContentErrX: integer;
-  MaxContentErrY: integer;
-  MaxStyleOutX: integer;
-  MaxStyleOutY: integer;
   StartTime: double;
   C, ContentN, StyleM, Depth: integer;
   DepthM1: integer;
-  CntX, CntY, pos: integer;
-  G, XHat, SHat: TNeuralFloat;
-  SumG, SumGXHat: TNeuralFloat;
-  ContentFactor, GMean, GXHatMean: TNeuralFloat;
-  StyleMean, StyleStd, ContentInvStd: TNeuralFloat;
+  pos, MaxContentPos, MaxStylePos: integer;
+  ContentFactor, GMean, GXHatMean, StyleInvStd: TNeuralFloat;
+  GSumPtr, GXHatSumPtr: TNeuralFloatArrPtr;
+  CoefAPtr, CoefBPtr, CoefDPtr, CoefPPtr, CoefQPtr: TNeuralFloatArrPtr;
+  NegStyleMeanPtr, StyleTmpPtr: TNeuralFloatArrPtr;
   ContentErr, StyleErr: TNNetVolume;
   ContentOut, StyleOut: TNNetVolume;
+  CntX, CntY: integer;
+  MaxContentOutX, MaxContentOutY, MaxStyleOutX, MaxStyleOutY: integer;
+  G, XHat, SHat, SumG, SumGXHat: TNeuralFloat;
+  StyleMean, StyleStd, ContentInvStd: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -49357,64 +49393,129 @@ begin
   ContentN := ContentOut.SizeX * ContentOut.SizeY;
   StyleM := StyleOut.SizeX * StyleOut.SizeY;
   DepthM1 := Depth - 1;
+  if Depth < csAdaINBackVectorMinDepth then
+  begin
+    // Too few channels for column ops to pay for their call overhead: walk
+    // channel-outer with a carried flat offset instead.
+    for C := 0 to DepthM1 do
+    begin
+      StyleMean := FStyleMean.FData[C];
+      StyleStd := FStyleStd.FData[C];
+      ContentInvStd := FContentInvStd.FData[C];
+      SumG := 0;
+      SumGXHat := 0;
+      MaxContentOutX := ContentOut.SizeX - 1;
+      MaxContentOutY := ContentOut.SizeY - 1;
+      for CntY := 0 to MaxContentOutY do
+      begin
+        pos := FOutputError.GetRawPos(0, CntY, C);
+        for CntX := 0 to MaxContentOutX do
+        begin
+          G := FOutputError.FData[pos];
+          SumG := SumG + G;
+          SumGXHat := SumGXHat + G * FNormContent.FData[pos];
+          Inc(pos, Depth);
+        end;
+      end;
+      ContentFactor := StyleStd * ContentInvStd / ContentN;
+      for CntY := 0 to MaxContentOutY do
+      begin
+        pos := FOutputError.GetRawPos(0, CntY, C);
+        for CntX := 0 to MaxContentOutX do
+        begin
+          G := FOutputError.FData[pos];
+          XHat := FNormContent.FData[pos];
+          ContentErr.FData[pos] := ContentErr.FData[pos] +
+            ContentFactor * (ContentN * G - SumG - XHat * SumGXHat);
+          Inc(pos, Depth);
+        end;
+      end;
+      GMean := SumG / StyleM;
+      GXHatMean := SumGXHat / StyleM;
+      MaxStyleOutX := StyleOut.SizeX - 1;
+      MaxStyleOutY := StyleOut.SizeY - 1;
+      for CntY := 0 to MaxStyleOutY do
+      begin
+        pos := StyleOut.GetRawPos(0, CntY, C);
+        for CntX := 0 to MaxStyleOutX do
+        begin
+          SHat := (StyleOut.FData[pos] - StyleMean) / StyleStd;
+          StyleErr.FData[pos] := StyleErr.FData[pos] + GMean + GXHatMean * SHat;
+          Inc(pos, Depth);
+        end;
+      end;
+    end;
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+    FContentLayer.Backpropagate();
+    FStyleLayer.Backpropagate();
+    exit;
+  end;
+  // Depth is the contiguous axis, so every sweep below is position-outer and
+  // operates on whole depth columns; the per-channel scalars become Depth-length
+  // coefficient vectors held in persistent scratch.
+  GSumPtr := FGSum.GetRawPtr(0);
+  GXHatSumPtr := FGXHatSum.GetRawPtr(0);
+  CoefAPtr := FCoefA.GetRawPtr(0);
+  CoefBPtr := FCoefB.GetRawPtr(0);
+  CoefDPtr := FCoefD.GetRawPtr(0);
+  CoefPPtr := FCoefP.GetRawPtr(0);
+  CoefQPtr := FCoefQ.GetRawPtr(0);
+  NegStyleMeanPtr := FNegStyleMean.GetRawPtr(0);
+  StyleTmpPtr := FStyleTmp.GetRawPtr(0);
+  MaxContentPos := ContentOut.Size - Depth;
+  MaxStylePos := StyleOut.Size - Depth;
+  // Reductions of the upstream gradient over the CONTENT spatial positions.
+  FGSum.Fill(0);
+  FGXHatSum.Fill(0);
+  pos := 0;
+  while pos <= MaxContentPos do
+  begin
+    TNNetVolume.Add(GSumPtr, @FOutputError.FData[pos], Depth);
+    TNNetVolume.MulAdd(GXHatSumPtr, @FOutputError.FData[pos],
+      @FNormContent.FData[pos], Depth);
+    Inc(pos, Depth);
+  end;
+  // d out / d content : instance-norm Jacobian scaled by style_std/content_std.
+  //   dx_i = (style_std * inv_content_std / N) *
+  //          ( N*g_i - sum(g) - xhat_i * sum(g*xhat) )
+  //        = A*g_i + B + D*xhat_i   with A,B,D per channel.
+  // d out / d style : flows through style_mean (1/M spread) and style_std.
+  //   ds_j = sum(g)/M + sum(g*xhat) * shat_j / M
+  //   where shat_j = (s_j - style_mean) / style_std,
+  //        = P + Q*(s_j - style_mean)   with P,Q per channel. The subtraction is
+  //   kept rather than distributed so the single-precision conditioning matches
+  //   the per-element form.
   for C := 0 to DepthM1 do
   begin
-    StyleMean := FStyleMean.FData[C];
-    StyleStd := FStyleStd.FData[C];
-    ContentInvStd := FContentInvStd.FData[C];
-    // Reductions of the upstream gradient over the CONTENT spatial positions.
-    SumG := 0;
-    SumGXHat := 0;
-    MaxContentOutX := ContentOut.SizeX - 1;
-    MaxContentOutY := ContentOut.SizeY - 1;
-    // Row-outer walk with a carried flat offset (step = Depth per x); the
-    // fixed-C accessor multiply-add is gone (rules #3/#11).
-    for CntY := 0 to MaxContentOutY do
-    begin
-      pos := FOutputError.GetRawPos(0, CntY, C);
-      for CntX := 0 to MaxContentOutX do
-      begin
-        G := FOutputError.FData[pos];
-        SumG := SumG + G;
-        SumGXHat := SumGXHat + G * FNormContent.FData[pos];
-        Inc(pos, Depth);
-      end;
-    end;
-    // d out / d content : instance-norm Jacobian scaled by style_std/content_std.
-    //   dx_i = (style_std * inv_content_std / N) *
-    //          ( N*g_i - sum(g) - xhat_i * sum(g*xhat) )
-    ContentFactor := StyleStd * ContentInvStd / ContentN;
-    MaxContentErrX := ContentOut.SizeX - 1;
-    MaxContentErrY := ContentOut.SizeY - 1;
-    for CntY := 0 to MaxContentErrY do
-    begin
-      pos := FOutputError.GetRawPos(0, CntY, C);
-      for CntX := 0 to MaxContentErrX do
-      begin
-        G := FOutputError.FData[pos];
-        XHat := FNormContent.FData[pos];
-        ContentErr.FData[pos] := ContentErr.FData[pos] +
-          ContentFactor * (ContentN * G - SumG - XHat * SumGXHat);
-        Inc(pos, Depth);
-      end;
-    end;
-    // d out / d style : flows through style_mean (1/M spread) and style_std.
-    //   ds_j = sum(g)/M + sum(g*xhat) * shat_j / M
-    //   where shat_j = (s_j - style_mean) / style_std.
-    GMean := SumG / StyleM;
-    GXHatMean := SumGXHat / StyleM;
-    MaxStyleOutX := StyleOut.SizeX - 1;
-    MaxStyleOutY := StyleOut.SizeY - 1;
-    for CntY := 0 to MaxStyleOutY do
-    begin
-      pos := StyleOut.GetRawPos(0, CntY, C);
-      for CntX := 0 to MaxStyleOutX do
-      begin
-        SHat := (StyleOut.FData[pos] - StyleMean) / StyleStd;
-        StyleErr.FData[pos] := StyleErr.FData[pos] + GMean + GXHatMean * SHat;
-        Inc(pos, Depth);
-      end;
-    end;
+    ContentFactor := FStyleStd.FData[C] * FContentInvStd.FData[C] / ContentN;
+    CoefAPtr^[C] := ContentFactor * ContentN;
+    CoefBPtr^[C] := -ContentFactor * GSumPtr^[C];
+    CoefDPtr^[C] := -ContentFactor * GXHatSumPtr^[C];
+    GMean := GSumPtr^[C] / StyleM;
+    GXHatMean := GXHatSumPtr^[C] / StyleM;
+    StyleInvStd := FStyleInvStd.FData[C];
+    CoefPPtr^[C] := GMean;
+    CoefQPtr^[C] := GXHatMean * StyleInvStd;
+    NegStyleMeanPtr^[C] := -FStyleMean.FData[C];
+  end;
+  pos := 0;
+  while pos <= MaxContentPos do
+  begin
+    TNNetVolume.MulAdd(@ContentErr.FData[pos], CoefAPtr,
+      @FOutputError.FData[pos], Depth);
+    TNNetVolume.Add(@ContentErr.FData[pos], CoefBPtr, Depth);
+    TNNetVolume.MulAdd(@ContentErr.FData[pos], CoefDPtr,
+      @FNormContent.FData[pos], Depth);
+    Inc(pos, Depth);
+  end;
+  pos := 0;
+  while pos <= MaxStylePos do
+  begin
+    system.Move(StyleOut.FData[pos], StyleTmpPtr^, Depth * csNeuralFloatSize);
+    TNNetVolume.Add(StyleTmpPtr, NegStyleMeanPtr, Depth);
+    TNNetVolume.Add(@StyleErr.FData[pos], CoefPPtr, Depth);
+    TNNetVolume.MulAdd(@StyleErr.FData[pos], CoefQPtr, StyleTmpPtr, Depth);
+    Inc(pos, Depth);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   FContentLayer.Backpropagate();
