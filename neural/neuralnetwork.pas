@@ -73083,17 +73083,11 @@ begin
   // via AVXCopyRelu (same VMAXPS kernel TNNetVolume.CopyRelu uses). For x = 0
   // max(x,0) = 0, matching both the training (>=0) and inference (>0) scalar
   // branches byte-for-byte. The training branch additionally derives the 1/0
-  // gate mask in a finishing scalar pass over the sign of the input.
+  // gate mask, which ReluGateMask vectorizes with the same >= 0 boundary.
   FOutput.CopyRelu(LocalPrevOutput);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
-  begin
-    for OutputCnt := 0 to SizeM1 do
-    begin
-      if LocalPrevOutput.FData[OutputCnt] >= 0
-        then FOutputErrorDeriv.FData[OutputCnt] := 1
-        else FOutputErrorDeriv.FData[OutputCnt] := 0;
-    end;
-  end;
+    TNNetVolume.ReluGateMask(FOutputErrorDeriv.DataPtr,
+      LocalPrevOutput.DataPtr, SizeM1 + 1);
   {$ELSE}
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin

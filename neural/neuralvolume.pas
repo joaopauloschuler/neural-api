@@ -606,6 +606,11 @@ type
       // (AVXCopyRelu) with a scalar fallback on non-AVX builds. Bit-exact vs the
       // scalar relu-copy. Buffers may alias (dst = src).
       class procedure Relu(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // ReluGateMask writes dst[0..N-1] := 1 where src[i] >= 0 and 0 elsewhere,
+      // the ReLU derivative gate. AVX2/64-bit builds run AVXReluGateMask; every
+      // other build runs the equivalent scalar loop. Bit-identical either way,
+      // the >= 0 boundary included. Buffers may alias (dst = src).
+      class procedure ReluGateMask(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
       // Largest FINITE magnitude of src[0..N-1], or 0 when nothing there is
       // finite and non-zero: NaN is skipped and +/-Inf excluded, so the result
       // is always a usable quantization range. This is the pointer-and-count
@@ -2170,6 +2175,56 @@ begin
     PtrDst^[i] := PSingle(@OutBits)^;
   end;
 end;
+
+// dst[i] := 1.0 when src[i] >= 0, else 0.0 -- the ReLU derivative gate mask.
+// The non-signaling GE_OQ predicate (29) is false for NaN and true for -0.0,
+// which is exactly what the scalar `src >= 0` test does, and the vandps against
+// a broadcast 1.0 leaves 1.0 and 0.0 as the only possible outputs. So this is
+// bit-identical to the scalar loop, boundary included.
+//
+// The 1.0 is broadcast from a LOCAL reached through a pointer (the AVXAddScalar
+// idiom) so no [rip+label] relocation appears and position-independent linking
+// of the examples keeps working - see AVXMaxAbsFinite. Coded by Claude (AI).
+procedure AVXReluGateMask(PtrDst, PtrSrc: TNeuralFloatArrPtr;
+  NumElements: integer);
+var
+  localNumElements, i, NumElementsM1: integer;
+  localOne: Single;
+  OnePtr: pointer;
+begin
+  localNumElements := NumElements and (not 7);
+  if localNumElements > 0 then
+  begin
+    localOne := 1.0;
+    OnePtr := Addr(localOne);
+  asm
+  mov rax, PtrSrc
+  mov rdx, PtrDst
+  mov r8, OnePtr
+  mov ecx, localNumElements
+  shr ecx, 3
+  vbroadcastss ymm2, [r8]
+  vxorps    ymm3, ymm3, ymm3
+@Loop:
+  vmovups   ymm0, [rax]
+  vcmpps    ymm1, ymm0, ymm3, 29   // GE_OQ: false for NaN, true for -0.0
+  vandps    ymm1, ymm1, ymm2
+  vmovups   [rdx], ymm1
+  add rax, 32
+  add rdx, 32
+  dec ecx
+  jnz @Loop
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm1', 'ymm2', 'ymm3'
+  ];
+  end;
+  NumElementsM1 := NumElements - 1;
+  for i := localNumElements to NumElementsM1 do
+    if PtrSrc^[i] >= 0 then PtrDst^[i] := 1 else PtrDst^[i] := 0;
+end;
+
 
 {$IFNDEF NOF16C}
 // dst[i] := half(src[i]) widened to single, 8 per iteration through F16C's
@@ -9582,6 +9637,31 @@ begin
   {$ELSE}
   for I := 0 to N - 1 do
     if pSrc^[I] > 0 then pDst^[I] := pSrc^[I] else pDst^[I] := 0;
+  {$ENDIF}
+end;
+
+class procedure TNNetVolume.ReluGateMask(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+{$IFNDEF AVX2}
+var
+  I: integer;
+{$ELSE}
+{$IFNDEF AVX64}
+var
+  I: integer;
+{$ENDIF}
+{$ENDIF}
+begin
+  if N <= 0 then exit;
+  {$IFDEF AVX2}
+  {$IFDEF AVX64}
+  AVXReluGateMask(pDst, pSrc, N);
+  {$ELSE}
+  for I := 0 to N - 1 do
+    if pSrc^[I] >= 0 then pDst^[I] := 1 else pDst^[I] := 0;
+  {$ENDIF}
+  {$ELSE}
+  for I := 0 to N - 1 do
+    if pSrc^[I] >= 0 then pDst^[I] := 1 else pDst^[I] := 0;
   {$ENDIF}
 end;
 

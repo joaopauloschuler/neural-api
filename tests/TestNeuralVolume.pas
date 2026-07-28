@@ -26,6 +26,7 @@ type
     procedure TestVolumeMinMaxClassParity;
     procedure TestVolumeExpShiftSumParity;
     procedure TestVolumeAddScalarParity;
+    procedure TestVolumeReluGateMaskParity;
     procedure TestVolumeMaxPosParity;
     procedure TestVolumeAddSubValueParity;
     procedure TestVolumeFlip;
@@ -438,6 +439,62 @@ begin
   Buf[0] := 5.0;
   TNNetVolume.AddScalar(TNeuralFloatArrPtr(@Buf[0]), 1.0, 0);
   AssertEquals('empty run', 5.0, Buf[0], 0.0);
+end;
+
+procedure TTestNeuralVolume.TestVolumeReluGateMaskParity;
+// ReluGateMask is AVXReluGateMask on an AVX2/64-bit build and a scalar loop
+// everywhere else. The output is only ever 1.0 or 0.0, so both paths must agree
+// BIT-exactly -- including at the boundary, where the contract is >= 0 (so +0.0
+// and -0.0 both gate open) and NaN gates shut. Sizes straddle the 8-element
+// block width and its tail.
+const
+  Sizes: array[0..10] of integer = (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 1000);
+var
+  Src, Dst, Ref: array of TNeuralFloat;
+  SI, K, N: integer;
+begin
+  RandSeed := 271828;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    SetLength(Src, N);
+    SetLength(Dst, N);
+    SetLength(Ref, N);
+    for K := 0 to N - 1 do
+    begin
+      case K mod 7 of
+        0: Src[K] := 0.0;
+        1: Src[K] := -0.0;
+        2: Src[K] := -1e-30;
+        3: Src[K] := 1e-30;
+      else
+        Src[K] := (Random - 0.5) * 8;
+      end;
+      Dst[K] := 12345;
+      if Src[K] >= 0 then Ref[K] := 1 else Ref[K] := 0;
+    end;
+    TNNetVolume.ReluGateMask(TNeuralFloatArrPtr(@Dst[0]),
+      TNeuralFloatArrPtr(@Src[0]), N);
+    for K := 0 to N - 1 do
+      AssertEquals('ReluGateMask[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
+        Ref[K], Dst[K], 0.0);
+  end;
+  // In-place (dst = src) must produce the same mask.
+  N := 40;
+  SetLength(Src, N);
+  for K := 0 to N - 1 do Src[K] := (Random - 0.5) * 8;
+  SetLength(Ref, N);
+  for K := 0 to N - 1 do
+    if Src[K] >= 0 then Ref[K] := 1 else Ref[K] := 0;
+  TNNetVolume.ReluGateMask(TNeuralFloatArrPtr(@Src[0]),
+    TNeuralFloatArrPtr(@Src[0]), N);
+  for K := 0 to N - 1 do
+    AssertEquals('ReluGateMask in-place[' + IntToStr(K) + ']', Ref[K], Src[K], 0.0);
+  // A zero-length run must leave the buffer untouched.
+  Src[0] := 5.0;
+  TNNetVolume.ReluGateMask(TNeuralFloatArrPtr(@Src[0]),
+    TNeuralFloatArrPtr(@Src[0]), 0);
+  AssertEquals('empty run', 5.0, Src[0], 0.0);
 end;
 
 procedure TTestNeuralVolume.TestVolumeMaxPosParity;
