@@ -8490,9 +8490,11 @@ end;
 // PROGRESS when appended to Text (the next char of any phrase given Text's
 // current longest matching prefix-of-a-phrase suffix). Used to inject
 // guaranteed-satisfying continuations into the candidate pool. Returns the
-// distinct next-chars as a string (each char at most once).
+// distinct next-chars as a string (each char at most once). Only chars the
+// model can actually emit (Ord < VocabSize) are returned, so the result doubles
+// as a set of valid logits indices and can never be longer than VocabSize.
 function NeededNextChars(const Text: string;
-  const ForceTokens: array of string): string;
+  const ForceTokens: array of string; VocabSize: integer): string;
 var
   K, P, MatchLen, PhraseLenM1: integer;
   ForceTokensHi: integer;
@@ -8519,6 +8521,12 @@ begin
         Break;
       end;
     C := Phrase[MatchLen + 1];
+    // A phrase byte outside the model's alphabet has no logit to score and can
+    // never be emitted by the vocab pass either, so the phrase is unsatisfiable:
+    // drop the char rather than index LogProbs past its end. The search then
+    // blocks EOS forever for this phrase and the caller gets the best-effort
+    // frontier from the unsatisfied-constraint fallback.
+    if Ord(C) >= VocabSize then Continue;
     Tail := Result;
     if Pos(C, Tail) = 0 then Result := Result + C;
   end;
@@ -8622,7 +8630,7 @@ var
   VocabSize, Step, I, T, B, RealForced, BestProg, KeptProg, LenB: integer;
   VocabSizeM1, ForceTokensHi, LiveHi, FinishedHi, NeededLen,
     BeamWidthM1, CandCount: integer;
-  KeepCount, MaxKeepIdx, MaxCandIdx, BestIdx, BaseProg: integer;
+  KeepCount, MaxKeepIdx, MaxCandIdx, BestIdx, BaseProg, MaxByteTok: integer;
   Live: TBeamArray;
   Finished: TBeamArray;
   NewLive: TBeamArray;
@@ -8666,6 +8674,11 @@ begin
     // candidates, i.e. <= 2*VocabSize - the pool's capacity for EVERY step.
     // Allocate it once here and carry a fill count; never resize inside a step.
     SetLength(Cand, BeamWidth * 2 * VocabSize);
+    // Highest token id that is also a byte, i.e. that a forced phrase can name.
+    // Above it the byte-indexed progress table has no entry and the token
+    // cannot advance any phrase.
+    MaxByteTok := VocabSizeM1;
+    if MaxByteTok > csByteAlphabetSizeM1 then MaxByteTok := csByteAlphabetSizeM1;
 
     for Step := 1 to MaxLen do
     begin
@@ -8684,7 +8697,7 @@ begin
         // Characters that advance an unmet phrase: each is FORCE-INJECTED as a
         // candidate (even if the model assigns it ~0 probability) so a path that
         // makes progress toward every phrase always exists in the pool.
-        Needed := NeededNextChars(BText, ForceTokens);
+        Needed := NeededNextChars(BText, ForceTokens, VocabSize);
         NeededLen := Length(Needed);
         // #5/#8: Needed is invariant across the vocab T loop below; build the
         // membership set once per beam so the dup check is O(1) set-in instead
@@ -8741,7 +8754,10 @@ begin
             PCand^.Score := NewSumLP * InvDenExt;
             PCand^.ParentIdx := B;
             PCand^.LastToken := T;
-            PCand^.Progress := BaseProg + ChildProg[Ord(Chr(T))];
+            if T <= MaxByteTok then
+              PCand^.Progress := BaseProg + ChildProg[T]
+            else
+              PCand^.Progress := BaseProg;
             Inc(PCand);
             Inc(CandCount);
           end;

@@ -144,6 +144,7 @@ type
     procedure TestConstrainedBeamForcesOverlappingPhrase;
     procedure TestConstrainedBeamForcesPhrasePresence;
     procedure TestConstrainedBeamForcesMultiplePhrases;
+    procedure TestConstrainedBeamPhraseCharOutsideVocab;
     // Contrastive search (penalty_alpha) decoding.
     procedure TestContrastiveAlphaZeroMatchesGreedy;
     procedure TestContrastiveAlphaChangesSelection;
@@ -917,6 +918,37 @@ begin
     Con := DecodeConstrainedBeamSearch(NN, 'ab', 16, 4, Force, 0.0);
     AssertTrue('first forced phrase present', Pos('xy', Con.Text) > 0);
     AssertTrue('second forced phrase present', Pos('qrs', Con.Text) > 0);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestConstrainedBeamPhraseCharOutsideVocab;
+const
+  cVocab = 64;
+var
+  NN: TNNet;
+  Con: TNNetDecodeResult;
+  Force: array of string;
+  I, TextLen: integer;
+begin
+  // A forced phrase whose bytes ('x'=120..'z'=122) lie OUTSIDE a 64-token
+  // alphabet is unsatisfiable: those chars have no logit at all. The decoder
+  // must neither read past the end of the logits array nor emit a char the
+  // model cannot produce - it returns the best-effort unconstrained frontier.
+  RandSeed := 424242;
+  SetLength(Force, 1);
+  Force[0] := 'xyz';
+  NN := BuildPeakedLogitNet(24, cVocab, 40);
+  try
+    Con := DecodeConstrainedBeamSearch(NN, 'ab', 10, 4, Force, 0.0);
+    TextLen := Length(Con.Text);
+    AssertTrue('best-effort result is non-empty', TextLen > 0);
+    for I := 1 to TextLen do
+      AssertTrue('emitted char ' + IntToStr(Ord(Con.Text[I])) +
+        ' is inside the vocabulary', Ord(Con.Text[I]) < cVocab);
+    AssertEquals('an unsatisfiable phrase is never completed',
+      0, Pos('xyz', Con.Text));
   finally
     NN.Free;
   end;
