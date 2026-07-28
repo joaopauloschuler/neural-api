@@ -14135,6 +14135,14 @@ type
     FWrPlane, FWiPlane: array of TNeuralFloat;
     // Per-mode contiguous input spectra, index (mx*FModesY + my)*FInDepth + ci.
     FxrPlane, FximPlane: array of TNeuralFloat;
+    // BackpropagateCPU contiguous input-spectrum gradient, FxrPlane's layout.
+    FdXrePlane, FdXimPlane: array of TNeuralFloat;
+    // BackpropagateCPU weight-gradient row scratch, one InDepth-long run reused
+    // per (co,mx,my). Each spectral weight is written by exactly one mode triple,
+    // so no full-size gradient plane (nor its zero/scatter passes) is needed: the
+    // row is accumulated with contiguous MulAdds over FxrPlane/FximPlane and then
+    // scattered straight into the strided interleaved WDelta.
+    FdWrRow, FdWiRow: array of TNeuralFloat;
     // Persistent FFT2D X-axis scratch (length FSizeX). The Y axis needs none:
     // the [x][y] layout makes Re[ix] the contiguous Y row, so FourierMixFFT
     // runs in place on it.
@@ -80965,6 +80973,10 @@ begin
   SetLength(FGimBuf, 0);
   SetLength(FdXreBuf, 0);
   SetLength(FdXimBuf, 0);
+  SetLength(FdXrePlane, 0);
+  SetLength(FdXimPlane, 0);
+  SetLength(FdWrRow, 0);
+  SetLength(FdWiRow, 0);
 end;
 
 function TNNetSpectralConv2D.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
@@ -81077,6 +81089,10 @@ begin
     SetLength(FGimBuf, FSizeX, FSizeY);
     SetLength(FdXreBuf, FInDepth, FModesX, FModesY);
     SetLength(FdXimBuf, FInDepth, FModesX, FModesY);
+    SetLength(FdXrePlane, FModesX * FModesY * FInDepth);
+    SetLength(FdXimPlane, FModesX * FModesY * FInDepth);
+    SetLength(FdWrRow, FInDepth);
+    SetLength(FdWiRow, FInDepth);
   end;
 
   InitDefault();
@@ -81237,13 +81253,12 @@ end;
 // Exact real adjoint of 2-D FFT -> complex matmul -> real 2-D IFFT.
 procedure TNNetSpectralConv2D.BackpropagateCPU();
 var
-  ci, co, mx, my, ix, iy: integer;
+  ci, co, mx, my, ix, iy, n: integer;
   InDepthM1, OutDepthM1, SizeXM1, SizeYM1, ModesXM1, ModesYM1: integer;
-  W, WDelta, LocalPrevError: TNNetVolume;
-  invL, a, bb, xr, xi, gyr, gyi, contrib: Double;
-  b, L: integer;
+  WDelta, LocalPrevError: TNNetVolume;
+  invL, gyr, gyi, contrib, lrGyr, lrGyi: Double;
+  b, L, wBaseIdx, xBaseIdx, planeSize: integer;
 begin
-  W := FArrNeurons[0].FWeights;
   WDelta := FArrNeurons[0].FDelta;
   L := FSizeX * FSizeY;
   invL := 1.0 / L;
@@ -81254,14 +81269,14 @@ begin
   ModesXM1 := FModesX - 1;
   ModesYM1 := FModesY - 1;
 
-  for ci := 0 to InDepthM1 do
-    for mx := 0 to ModesXM1 do
-      for my := 0 to ModesYM1 do
-      begin
-        FdXreBuf[ci][mx][my] := 0;
-        FdXimBuf[ci][mx][my] := 0;
-      end;
-
+  // Contiguous (mx,my,ci) input-spectrum gradient planes -- vectorizable AXPY
+  // target, mirroring the 1-D class.
+  planeSize := FModesX * FModesY * FInDepth;
+  for n := 0 to planeSize - 1 do
+  begin
+    FdXrePlane[n] := 0;
+    FdXimPlane[n] := 0;
+  end;
   for co := 0 to OutDepthM1 do
   begin
     // dL/dYhat[co][mx,my] = (1/L) * FFT2D(g[co])[mx,my].
@@ -81277,24 +81292,51 @@ begin
       begin
         gyr := invL * FGreBuf[mx][my];
         gyi := invL * FGimBuf[mx][my];
+        wBaseIdx := ((co * FModesX + mx) * FModesY + my) * FInDepth;
+        xBaseIdx := (mx * FModesY + my) * FInDepth;
+        // Transpose of the forward complex GEMM, with -FLearningRate folded into
+        // the scalar factors. Every reduction is contiguous over the ci axis:
+        //   dWr[ci] += -LR*gyr * xr[ci] + -LR*gyi * xi[ci]
+        //   dWi[ci] += -LR*gyi * xr[ci] +  LR*gyr * xi[ci]
+        lrGyr := -FLearningRate * gyr;
+        lrGyi := -FLearningRate * gyi;
+        for n := 0 to InDepthM1 do
+        begin
+          FdWrRow[n] := 0;
+          FdWiRow[n] := 0;
+        end;
+        TNNetVolume.MulAdd(@FdWrRow[0], @FxrPlane[xBaseIdx], lrGyr, FInDepth);
+        TNNetVolume.MulAdd(@FdWrRow[0], @FximPlane[xBaseIdx], lrGyi, FInDepth);
+        TNNetVolume.MulAdd(@FdWiRow[0], @FxrPlane[xBaseIdx], lrGyi, FInDepth);
+        TNNetVolume.MulAdd(@FdWiRow[0], @FximPlane[xBaseIdx], -lrGyr, FInDepth);
+        // This mode triple owns these weights outright, so scatter the row into
+        // the strided interleaved WDelta right here.
         for ci := 0 to InDepthM1 do
         begin
           b := WBase(mx, my, ci, co);
-          a := W.FData[b];        // Re R
-          bb := W.FData[b + 1];   // Im R
-          xr := FXre[ci][mx][my];
-          xi := FXim[ci][mx][my];
-          // Weight gradient. Yre=a*xr-bb*xi, Yim=a*xi+bb*xr.
-          WDelta.FData[b]     := WDelta.FData[b]     +
-            (-FLearningRate) * (gyr * xr + gyi * xi);
-          WDelta.FData[b + 1] := WDelta.FData[b + 1] +
-            (-FLearningRate) * (-gyr * xi + gyi * xr);
-          // Input-spectrum gradient (sum over co).
-          FdXreBuf[ci][mx][my] := FdXreBuf[ci][mx][my] + (gyr * a + gyi * bb);
-          FdXimBuf[ci][mx][my] := FdXimBuf[ci][mx][my] + (-gyr * bb + gyi * a);
+          WDelta.FData[b]     := WDelta.FData[b]     + FdWrRow[ci];
+          WDelta.FData[b + 1] := WDelta.FData[b + 1] + FdWiRow[ci];
         end;
+        // Input-spectrum gradient (sum over co):
+        //   dXre[ci] +=  gyr*Wr[ci] + gyi*Wi[ci]
+        //   dXim[ci] += -gyr*Wi[ci] + gyi*Wr[ci]
+        TNNetVolume.MulAdd(@FdXrePlane[xBaseIdx], @FWrPlane[wBaseIdx], gyr, FInDepth);
+        TNNetVolume.MulAdd(@FdXrePlane[xBaseIdx], @FWiPlane[wBaseIdx], gyi, FInDepth);
+        TNNetVolume.MulAdd(@FdXimPlane[xBaseIdx], @FWiPlane[wBaseIdx], -gyr, FInDepth);
+        TNNetVolume.MulAdd(@FdXimPlane[xBaseIdx], @FWrPlane[wBaseIdx], gyi, FInDepth);
       end;
   end;
+
+  // Scatter the contiguous (mx,my,ci) input-spectrum gradient back to the
+  // [ci][mx][my] scratch the per-channel IFFT2D below consumes.
+  for ci := 0 to InDepthM1 do
+    for mx := 0 to ModesXM1 do
+      for my := 0 to ModesYM1 do
+        begin
+          xBaseIdx := (mx * FModesY + my) * FInDepth + ci;
+          FdXreBuf[ci][mx][my] := FdXrePlane[xBaseIdx];
+          FdXimBuf[ci][mx][my] := FdXimPlane[xBaseIdx];
+        end;
 
   // Propagate the input-spectrum gradient back through the input 2-D FFT:
   //   dL/dx[ci] = L * Re( IFFT2D(dXhat[ci]) ).
