@@ -62995,46 +62995,76 @@ begin
     for i := 0 to NumWinWs2M1 do RegionId[i] := 0;
 end;
 
-// Loads the relative_position_bias_table [(2*ws-1)^2, NumHeads] for one block
-// and, for the given head, gathers + adds the cyclic-shift mask of window W to
-// produce the ws2 x ws2 bias matrix consumed by TNNetWindowAttention.
-procedure SwinSetWindowBias(WinAttn: TNNetLayer; BiasTable: TNNetVolume;
-  const RelPosIndex, RegionId: TNeuralIntegerArray;
-  HeadIdx, NumHeads, WindowSize, WindowOfs: integer);
+// Gathers one head's ws2 x ws2 relative-position bias from the block's
+// relative_position_bias_table [(2*ws-1)^2, NumHeads] into Mat (resized here).
+// The gather is window-invariant; only the cyclic-shift mask applied by
+// SwinSetWindowBiasFrom differs from window to window.
+procedure SwinBuildHeadBias(BiasTable: TNNetVolume;
+  const RelPosIndex: TNeuralIntegerArray;
+  HeadIdx, NumHeads, WindowSize: integer; Mat: TNNetVolume);
 var
-  ws2, i, j, idx: integer;
-  ws2M1: integer;
-  Mat: TNNetVolume;
-  RegBase: integer;
-  qReg, kReg: integer;
-  iBase, ij: integer;
+  ws2, ws2M1, i, j, idx, iBase, ij: integer;
+begin
+  ws2 := WindowSize * WindowSize;
+  ws2M1 := ws2 - 1;
+  Mat.ReSize(ws2 * ws2, 1, 1);
+  for i := 0 to ws2M1 do
+  begin
+    iBase := i * ws2;
+    for j := 0 to ws2M1 do
+    begin
+      ij := iBase + j;
+      idx := RelPosIndex[ij];
+      // BiasTable row = idx, column = head: flat index idx*NumHeads + head.
+      Mat.FData[ij] := BiasTable.FData[idx * NumHeads + HeadIdx];
+    end;
+  end;
+end;
+
+// Installs window WindowOfs's bias matrix for one head: the head's base gather
+// plus the cyclic-shift mask, which drives cross-region pairs to a large
+// negative sentinel (HF uses -100). In an UNSHIFTED block every token of a
+// window sits in the same image region, so the mask cannot fire and the base
+// matrix goes in as-is; only a shifted block needs the masked copy in Scratch.
+procedure SwinSetWindowBiasFrom(WinAttn: TNNetLayer; HeadBias: TNNetVolume;
+  const RegionId: TNeuralIntegerArray; WindowSize, WindowOfs: integer;
+  Scratch: TNNetVolume);
+var
+  ws2, ws2M1, i, j, RegBase, Reg0, qReg, kReg, iBase, ij: integer;
+  Masked: boolean;
 begin
   ws2 := WindowSize * WindowSize;
   ws2M1 := ws2 - 1;
   RegBase := WindowOfs * ws2;
-  Mat := TNNetVolume.Create(ws2 * ws2, 1, 1);
-  try
-    for i := 0 to ws2M1 do
+  Reg0 := RegionId[RegBase];
+  Masked := False;
+  for i := 1 to ws2M1 do
+    if RegionId[RegBase + i] <> Reg0 then
     begin
-      iBase := i * ws2;
-      qReg := RegionId[RegBase + i];
-      for j := 0 to ws2M1 do
+      Masked := True;
+      break;
+    end;
+  if not Masked then
+  begin
+    TNNetWindowAttention(WinAttn).SetBiasMatrix(HeadBias);
+    exit;
+  end;
+  Scratch.Copy(HeadBias);
+  for i := 0 to ws2M1 do
+  begin
+    iBase := i * ws2;
+    qReg := RegionId[RegBase + i];
+    for j := 0 to ws2M1 do
+    begin
+      kReg := RegionId[RegBase + j];
+      if qReg <> kReg then
       begin
         ij := iBase + j;
-        idx := RelPosIndex[ij];
-        // BiasTable row = idx, column = head: flat index idx*NumHeads + head.
-        Mat.FData[ij] := BiasTable.FData[idx * NumHeads + HeadIdx];
-        // cyclic-shift mask: -100 (HF) when the two tokens are in different
-        // image regions. We use a large negative sentinel.
-        kReg := RegionId[RegBase + j];
-        if qReg <> kReg then
-          Mat.FData[ij] := Mat.FData[ij] - 1e9;
+        Scratch.FData[ij] := Scratch.FData[ij] - 1e9;
       end;
     end;
-    TNNetWindowAttention(WinAttn).SetBiasMatrix(Mat);
-  finally
-    Mat.Free;
   end;
+  TNNetWindowAttention(WinAttn).SetBiasMatrix(Scratch);
 end;
 
 // Loads the biased patch-embedding conv bias [EmbedDim] into each neuron's
@@ -63087,7 +63117,7 @@ var
   NormAfter, Fc1, Fc2, MlpResidual: TNNetLayer;
   MergeNorm, MergeReduce: TNNetLayer;
   MergePerm: TNeuralIntegerArray;
-  BiasTable: TNNetVolume;
+  BiasTable, HeadBias, MaskedBias: TNNetVolume;
   gy, gx, ny, nx, half: integer;
   PatchGrid: integer;
   NumStagesM1, HeadsM1, HeadDimM1, NumWindowsM1, halfM1: integer;
@@ -63226,14 +63256,27 @@ begin
             BiasTable);
           // The just-added attention layers for this block are the last
           // NumWindows*Heads entries of WinAttnLayers (appended outer window,
-          // inner head).
-          for wIdx := 0 to NumWindowsM1 do
+          // inner head). Head OUTERMOST: the gather is window-invariant, so it
+          // runs once per head and each window only adds its shift mask.
+          HeadBias := TNNetVolume.Create;
+          MaskedBias := TNNetVolume.Create;
+          try
             for h := 0 to HeadsM1 do
             begin
-              ci := Length(WinAttnLayers) - NumWindows * Heads + wIdx * Heads + h;
-              SwinSetWindowBias(WinAttnLayers[ci], BiasTable,
-                RelPosIndex, RegionId, h, Heads, EffWindow, wIdx);
+              SwinBuildHeadBias(BiasTable, RelPosIndex, h, Heads, EffWindow,
+                HeadBias);
+              for wIdx := 0 to NumWindowsM1 do
+              begin
+                ci := Length(WinAttnLayers) - NumWindows * Heads +
+                  wIdx * Heads + h;
+                SwinSetWindowBiasFrom(WinAttnLayers[ci], HeadBias, RegionId,
+                  EffWindow, wIdx, MaskedBias);
+              end;
             end;
+          finally
+            HeadBias.Free;
+            MaskedBias.Free;
+          end;
         finally
           BiasTable.Free;
         end;
@@ -63374,7 +63417,10 @@ var
   Coord: array[0..1] of TNeuralFloat;
   HiddenAct: TNNetVolume;     // ReLU(MLP0) for one coord, length Hidden
   BiasTable: TNNetVolume;     // [NumCoords, NumHeads] = 16*sigmoid(cpb_mlp(coords))
-  Mat: TNNetVolume;
+  Mat: TNNetVolume;           // masked copy, only built for a shifted window
+  HeadBias: TNNetVolume;      // window-invariant gather for the current head
+  Masked: boolean;
+  Reg0: integer;
   qReg, kReg, RegBase: integer;
   side, sideM1: integer;
   HiddenM1, NumHeadsM1, ws2M1, NumWindowsM1: integer;
@@ -63450,36 +63496,61 @@ begin
 
     // ---- per (window, head): gather bias by RelPosIndex, add shift mask ----
     clampMax := Ln(1.0 / 0.01); // HF: clamp(logit_scale, max=log(1/0.01))
+    // Head OUTERMOST: the RelPosIndex gather depends only on the head, so it
+    // runs once per head; each window then only needs the shift mask, and an
+    // unshifted window does not even need that.
     Mat := TNNetVolume.Create(ws2 * ws2, 1, 1);
+    HeadBias := TNNetVolume.Create(ws2 * ws2, 1, 1);
     ws2M1 := ws2 - 1;
     NumWindowsM1 := NumWindows - 1;
     try
-      for wIdx := 0 to NumWindowsM1 do
+      for h := 0 to NumHeadsM1 do
       begin
-        RegBase := wIdx * ws2;
-        for h := 0 to NumHeadsM1 do
+        for i := 0 to ws2M1 do
+          for j := 0 to ws2M1 do
+          begin
+            idx := RelPosIndex[i * ws2 + j];
+            HeadBias.FData[i * ws2 + j] := BiasTable.FData[idx * NumHeads + h];
+          end;
+        // per-head clamped exp(logit_scale)
+        logScale := LogitRaw.FData[h];
+        if logScale > clampMax then logScale := clampMax;
+        logScale := Exp(logScale);
+        for wIdx := 0 to NumWindowsM1 do
         begin
-          for i := 0 to ws2M1 do
-            for j := 0 to ws2M1 do
+          RegBase := wIdx * ws2;
+          Masked := False;
+          Reg0 := RegionId[RegBase];
+          for i := 1 to ws2M1 do
+            if RegionId[RegBase + i] <> Reg0 then
             begin
-              idx := RelPosIndex[i * ws2 + j];
-              biasVal := BiasTable.FData[idx * NumHeads + h];
-              qReg := RegionId[RegBase + i];
-              kReg := RegionId[RegBase + j];
-              if qReg <> kReg then biasVal := biasVal - 1e9;
-              Mat.FData[i * ws2 + j] := biasVal;
+              Masked := True;
+              break;
             end;
           ci := LayersBase + wIdx * NumHeads + h;
-          TNNetSwinV2WindowAttention(WinAttnLayers[ci]).SetBiasMatrix(Mat);
-          // per-head clamped exp(logit_scale)
-          logScale := LogitRaw.FData[h];
-          if logScale > clampMax then logScale := clampMax;
-          TNNetSwinV2WindowAttention(WinAttnLayers[ci]).SetLogitScale(
-            Exp(logScale));
+          if Masked then
+          begin
+            Mat.Copy(HeadBias);
+            for i := 0 to ws2M1 do
+            begin
+              qReg := RegionId[RegBase + i];
+              for j := 0 to ws2M1 do
+              begin
+                kReg := RegionId[RegBase + j];
+                if qReg <> kReg then
+                  Mat.FData[i * ws2 + j] := Mat.FData[i * ws2 + j] - 1e9;
+              end;
+            end;
+            TNNetSwinV2WindowAttention(WinAttnLayers[ci]).SetBiasMatrix(Mat);
+          end
+          else
+            TNNetSwinV2WindowAttention(WinAttnLayers[ci]).SetBiasMatrix(HeadBias);
+          TNNetSwinV2WindowAttention(WinAttnLayers[ci]).SetLogitScale(logScale);
         end;
       end;
     finally
       Mat.Free;
+      HeadBias.Free;
     end;
   finally
     Mlp0W.Free; Mlp0B.Free; Mlp2W.Free; LogitRaw.Free;
@@ -64278,7 +64349,7 @@ var
   NormAfter, Fc1, Fc2: TNNetLayer;
   MergeNorm, MergeReduce: TNNetLayer;
   WindowOuts, HeadOuts, WinAttnLayers: array of TNNetLayer;
-  BiasTable: TNNetVolume;
+  BiasTable, HeadBias, MaskedBias: TNNetVolume;
   ny, nx, gy, gx, half, FreqRatio, PatchGrid: integer;
   NumStagesM1, HeadsM1, HeadDimM1, NumWindowsM1, halfM1: integer;
   DepthsStageM1: integer;
@@ -64399,13 +64470,27 @@ begin
         try
           Reader.LoadTensorFlat(BPrefix +
             'attention.self.relative_position_bias_table', BiasTable);
-          for wIdx := 0 to NumWindowsM1 do
+          // Head OUTERMOST: window-invariant gather once per head (see the
+          // Swin image builder), each window only adds its shift mask.
+          HeadBias := TNNetVolume.Create;
+          MaskedBias := TNNetVolume.Create;
+          try
             for h := 0 to HeadsM1 do
             begin
-              ci := Length(WinAttnLayers) - NumWindows * Heads + wIdx * Heads + h;
-              SwinSetWindowBias(WinAttnLayers[ci], BiasTable,
-                RelPosIndex, RegionId, h, Heads, EffWindow, wIdx);
+              SwinBuildHeadBias(BiasTable, RelPosIndex, h, Heads, EffWindow,
+                HeadBias);
+              for wIdx := 0 to NumWindowsM1 do
+              begin
+                ci := Length(WinAttnLayers) - NumWindows * Heads +
+                  wIdx * Heads + h;
+                SwinSetWindowBiasFrom(WinAttnLayers[ci], HeadBias, RegionId,
+                  EffWindow, wIdx, MaskedBias);
+              end;
             end;
+          finally
+            HeadBias.Free;
+            MaskedBias.Free;
+          end;
         finally
           BiasTable.Free;
         end;
@@ -69961,7 +70046,7 @@ procedure LoadSwinIRLayer(Reader: TNNetSafeTensorsReader;
   MlpRatio: TNeuralFloat);
 var
   wIdx, h, ci, MlpHidden, RefsNumWindowsM1, RefsHeadsM1: integer;
-  BiasTable: TNNetVolume;
+  BiasTable, HeadBias, MaskedBias: TNNetVolume;
 begin
   // q/k/v from the packed slab (3*Dim rows): q=[0..Dim), k=[Dim..2Dim),
   // v=[2Dim..3Dim).  bias sliced the same way.  o_proj is plain.
@@ -69979,20 +70064,29 @@ begin
       Dim, Dim, 0, -1, 0, BPrefix + 'attn.proj.bias');
   end;
   // relative position bias + shift mask per (window, head), using the window
-  // layout captured when the layer was built.
+  // layout captured when the layer was built. Head OUTERMOST: the gather is
+  // window-invariant, each window only adds its shift mask.
   BiasTable := TNNetVolume.Create;
+  HeadBias := TNNetVolume.Create;
+  MaskedBias := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(BPrefix +
       'attn.relative_position_bias_table', BiasTable);
-    for wIdx := 0 to RefsNumWindowsM1 do
-      for h := 0 to RefsHeadsM1 do
+    for h := 0 to RefsHeadsM1 do
+    begin
+      SwinBuildHeadBias(BiasTable, Refs.RelPosIndex, h, Refs.Heads,
+        Refs.EffWindow, HeadBias);
+      for wIdx := 0 to RefsNumWindowsM1 do
       begin
         ci := wIdx * Refs.Heads + h;
-        SwinSetWindowBias(Refs.Attn[ci], BiasTable,
-          Refs.RelPosIndex, Refs.RegionId, h, Refs.Heads, Refs.EffWindow, wIdx);
+        SwinSetWindowBiasFrom(Refs.Attn[ci], HeadBias, Refs.RegionId,
+          Refs.EffWindow, wIdx, MaskedBias);
       end;
+    end;
   finally
     BiasTable.Free;
+    HeadBias.Free;
+    MaskedBias.Free;
   end;
   LoadLayerNormWeights(Reader, Refs.Norm1,
     BPrefix + 'norm1.weight', BPrefix + 'norm1.bias', Dim);
