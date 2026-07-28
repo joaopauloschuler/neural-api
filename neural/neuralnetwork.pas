@@ -9005,10 +9005,27 @@ type
       FDecodeEnabled: boolean;
       FDecodeSteps: integer;   // tokens consumed since Begin/ResetState
       FDecodeH: TNNetVolume;   // persisted recurrent state h, Depth-long
+      // Set whenever something that CAN be known to change a_raw happens
+      // (construction, AfterWeightUpdate, the start of a decode session).
+      FADirty: boolean;
       procedure ComputeIncremental();
+      // Rebuild policy for the FA = sigmoid(a_raw) table, called from both
+      // forwards. Outside a decode session the table is rebuilt
+      // UNCONDITIONALLY: it costs one timestep's worth of work amortized over
+      // the whole sequence, and it keeps trainers, seeders, importers and
+      // gradient checks that write Neurons[].Weights directly (with no
+      // invalidation hook) correct by construction. Inside an
+      // incremental-decode session the step is a single token, so a rebuild
+      // would cost more than the token itself; there the table is trusted and
+      // only rebuilt when FADirty. That is sound because the session is
+      // inference-only, it starts with a forced rebuild, and AfterWeightUpdate
+      // marks the table dirty for anything going through the weight-update
+      // path.
+      procedure PrepareATable();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
+      procedure AfterWeightUpdate(); override;
       destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -10090,12 +10107,28 @@ type
       FDecAA: TNNetVolume;      // persisted stabilised numerator A, C-long
       FDecBB: TNNetVolume;      // persisted stabilised denominator B, C-long
       FDecPP: TNNetVolume;      // persisted log-space running max Q, C-long
+      // Set whenever something that CAN be known to change w_raw happens
+      // (construction, AfterWeightUpdate, the start of a decode session).
+      FWDirty: boolean;
       procedure ComputeIncremental();
+      // Rebuild policy for the FW = softplus(w_raw) table, called from both
+      // forwards. Outside a decode session it is rebuilt UNCONDITIONALLY: it
+      // costs one timestep's worth of work amortized over the sequence, and it
+      // keeps trainers, seeders, importers and gradient checks that write
+      // Neurons[].Weights directly (with no invalidation hook) correct by
+      // construction. Inside an incremental-decode session the step is a
+      // single token, so rebuilding C softplus values would cost a large
+      // fraction of the token itself; there the table is trusted and only
+      // rebuilt when FWDirty. Sound because the session is inference-only, it
+      // starts with a forced rebuild, and AfterWeightUpdate marks the table
+      // dirty for anything going through the weight-update path.
+      procedure PrepareWTable();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     protected
       procedure PrepareDecodeState(); override;
     public
       constructor Create(); override;
+      procedure AfterWeightUpdate(); override;
       destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -57924,8 +57957,31 @@ begin
   FDecodeH := TNNetVolume.Create();
   FDecodeEnabled := false;
   FDecodeSteps := 0;
+  FADirty := true;
   // Depth-dependent weight buffers are (re)allocated in SetPrevLayer.
   InitDefault();
+end;
+
+procedure TNNetDiagonalSSM.AfterWeightUpdate();
+begin
+  inherited AfterWeightUpdate();
+  FADirty := true;          // next forward rebuilds sigmoid(a_raw)
+end;
+
+procedure TNNetDiagonalSSM.PrepareATable();
+var
+  Depth, MaxD, d: integer;
+  Wa: TNNetVolume;
+begin
+  Depth := FOutput.Depth;
+  // See the declaration for why the decode session is the one case that
+  // trusts the cached table.
+  if FDecodeEnabled and (not FADirty) and (FA.Size = Depth) then exit;
+  Wa := FNeurons[0].FWeights;
+  MaxD := Depth - 1;
+  for d := 0 to MaxD do
+    FA.FData[d] := Sigmoid(Wa.FData[d]);
+  FADirty := false;
 end;
 
 destructor TNNetDiagonalSSM.Destroy();
@@ -57999,9 +58055,7 @@ begin
   MaxD := Depth - 1;
   MaxT := SeqLen - 1;
   RowBytes := Depth * csNeuralFloatSize;       // #5: once per call
-  // Precompute per-channel a = sigmoid(a_raw) once over the contiguous run.
-  for d := 0 to MaxD do
-    FA.FData[d] := Sigmoid(Wa.FData[d]);
+  PrepareATable();
   // Vectorized timestep-outer sweep: the time axis is sequential (h_t depends
   // on h_{t-1}) but the depth axis is fully parallel and contiguous, so each
   // timestep updates ALL channels at once with elementwise vector ops over the
@@ -58058,9 +58112,7 @@ begin
   MaxD := Depth - 1;
   MaxT := SeqLen - 1;
   RowBytes := Depth * csNeuralFloatSize;       // #5: once per call
-  // Precompute per-channel a = sigmoid(a_raw) once over the contiguous run.
-  for d := 0 to MaxD do
-    FA.FData[d] := Sigmoid(Wa.FData[d]);
+  PrepareATable();
   // Same vectorized timestep-outer sweep as Compute(), but h resumes from
   // the persisted state and is persisted back (it lives in FDecodeH).
   HPtr := FDecodeH.GetRawPtr();
@@ -58097,6 +58149,7 @@ begin
   FDecodeH.ReSize(1, 1, FOutput.Depth);
   FDecodeH.Fill(0);
   FDecodeSteps := 0;
+  FADirty := true;          // force one rebuild at the start of the session
   FDecodeEnabled := true;
 end;
 
@@ -58554,8 +58607,35 @@ begin
   FDecPP := TNNetVolume.Create();
   FDecodeEnabled := false;
   FDecodeSteps := 0;
+  FWDirty := true;
   // [0]=w_raw [1]=u
   AddMissingNeurons(2);
+end;
+
+procedure TNNetWKV.AfterWeightUpdate();
+begin
+  inherited AfterWeightUpdate();
+  FWDirty := true;          // next forward rebuilds softplus(w_raw)
+end;
+
+procedure TNNetWKV.PrepareWTable();
+var
+  MaxC, d: integer;
+  raw: TNeuralFloat;
+  Ww: TNNetVolume;
+begin
+  // See the declaration for why the decode session is the one case that
+  // trusts the cached table.
+  if FDecodeEnabled and (not FWDirty) and (FW.Size = FChannels) then exit;
+  Ww := FNeurons[0].FWeights;
+  MaxC := FChannels - 1;
+  for d := 0 to MaxC do
+  begin
+    raw := Ww.FData[d];
+    if raw > 30 then FW.FData[d] := raw
+    else FW.FData[d] := pcr_logf(1 + NeuralExp(raw));
+  end;
+  FWDirty := false;
 end;
 
 destructor TNNetWKV.Destroy();
@@ -58631,12 +58711,7 @@ begin
   C := FChannels;
   MaxC := C - 1;
   MaxT := SeqLen - 1;
-  // Per-channel positive decay w = softplus(w_raw).
-  for d := 0 to MaxC do
-  begin
-    raw := Ww.FData[d];
-    if raw > 30 then FW.FData[d] := raw else FW.FData[d] := pcr_logf(1 + NeuralExp(raw));
-  end;
+  PrepareWTable();
   // Numerically-stabilised RWKV-v4 WKV recurrence per channel (a_-1=b_-1=0).
   // Stabilised state (A,B,Q): true a = A*e^Q, b = B*e^Q. We additionally cache
   // the TRUE a_t,b_t (overflow-safe for bounded inputs) for the backward pass.
@@ -58719,12 +58794,7 @@ begin
   C := FChannels;
   MaxC := C - 1;
   MaxT := SeqLen - 1;
-  // Per-channel positive decay w = softplus(w_raw) (same as Compute()).
-  for d := 0 to MaxC do
-  begin
-    if Ww.FData[d] > 30 then FW.FData[d] := Ww.FData[d]
-    else FW.FData[d] := pcr_logf(1 + NeuralExp(Ww.FData[d]));
-  end;
+  PrepareWTable();
   pvStride := Prev.GetRawPos(1, 0);        // = 2C: Prev (t,d)->(t+1,d) step
   ocStride := FOutput.GetRawPos(1, 0);     // = C: FOutput step
   for d := 0 to MaxC do
@@ -58781,6 +58851,7 @@ begin
   FDecAA.ReSize(1, 1, FChannels);
   FDecBB.ReSize(1, 1, FChannels);
   FDecPP.ReSize(1, 1, FChannels);
+  FWDirty := true;          // force one rebuild at the start of the session
 end;
 
 procedure TNNetWKV.ResetState();
