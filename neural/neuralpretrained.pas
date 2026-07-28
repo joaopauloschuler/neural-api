@@ -6159,8 +6159,13 @@ type
     property Config: TBarkSubConfig read FConfig;
     property Trunk: TNNet read FTrunk;
     // Causal (semantic/coarse) forward: token ids (length SeqLen) -> per-position
-    // logits in Logits (SeqLen*OutVocab, row p*OutVocab+t). Coded by Claude (AI).
-    procedure ComputeLogits(const TokenIds: array of integer; Logits: TNNetVolume);
+    // logits in Logits (SeqLen*OutVocab, row p*OutVocab+t). LastPosOnly=true
+    // evaluates the lm_head at the LAST position only and returns that single
+    // OutVocab-long row (index it at 0, not at SeqLen-1) - what an
+    // autoregressive next-token driver reads, at 1/SeqLen of the head cost. The
+    // trunk still runs over the whole window. Coded by Claude (AI).
+    procedure ComputeLogits(const TokenIds: array of integer; Logits: TNNetVolume;
+      LastPosOnly: boolean = false);
     // Fine forward for one target codebook: Codes[t][c] are the known codebook
     // ids (c in 0..NCodesTotal-1), CodebookIdx in NCodesGiven..NCodesTotal-1 is
     // predicted. Sums embeddings of codebooks 0..CodebookIdx, runs the NON-causal
@@ -34811,15 +34816,28 @@ begin
   inherited Destroy;
 end;
 
-// Runs the trunk on a precomputed embedding tensor and applies head HeadIdx,
-// writing per-position logits to Logits (SeqLen*OutVocab). Coded by Claude (AI).
+// Runs the trunk on a precomputed embedding tensor and applies head HeadIdx.
+// LastPosOnly=false writes per-position logits (SeqLen*OutVocab, row
+// p*OutVocab); LastPosOnly=true evaluates the head at position SeqLen-1 only and
+// writes a single OutVocab-long row - what a causal autoregressive driver
+// (semantic/coarse) actually reads, at 1/SeqLen of the head's MAC count. The
+// fine sub-model is non-causal over the codebook axis and needs every row, so it
+// must keep the default.
+//
+// The vocab axis is TILED so the head weight block a position loop walks stays
+// cache-resident: the plain position-outer order re-streams the whole
+// OutVocab*Hidden matrix (41 MB for Bark semantic) once per position. Tiling is
+// bit-identical - every output element is still written once from the same
+// unchanged dot product. Coded by Claude (AI).
 procedure BarkApplyTrunkAndHead(SubModel: TBarkSubModel; Emb: TNNetVolume;
-  HeadIdx: integer; Logits: TNNetVolume);
+  HeadIdx: integer; Logits: TNNetVolume; LastPosOnly: boolean = false);
+const
+  // Target ~512 KB of head weights per tile (L2-resident on a typical core).
+  csBarkHeadTileFloats = 128 * 1024;
 var
   TrunkOut: TNNetVolume;
-  Hidden, OutVocab, SeqLen, p, t, k: integer;
-  SeqLenM1, OutVocabM1, HiddenM1, pBase, tBase, pOut: integer;
-  Acc: TNeuralFloat;
+  Hidden, OutVocab, SeqLen, p, t: integer;
+  OutVocabM1, tBase, pOut, pFirst, pLast, t0, tHi, TileVocab: integer;
   HW, HB: TNNetVolume;
   pTrunk: TNeuralFloatArrPtr;
 begin
@@ -34830,27 +34848,37 @@ begin
   TrunkOut := SubModel.FTrunk.GetLastLayer().Output; // (seq,1,hidden)
   HW := SubModel.FHeadW[HeadIdx];
   HB := SubModel.FHeadB[HeadIdx];
-  Logits.ReSize(SeqLen * OutVocab, 1, 1);
-  SeqLenM1 := SeqLen - 1;
+  pLast := SeqLen - 1;
+  if LastPosOnly then pFirst := pLast else pFirst := 0;
+  Logits.ReSize((pLast - pFirst + 1) * OutVocab, 1, 1);
   OutVocabM1 := OutVocab - 1;
-  HiddenM1 := Hidden - 1;
-  for p := 0 to SeqLenM1 do
+  TileVocab := csBarkHeadTileFloats div Hidden;
+  if TileVocab < 1 then TileVocab := 1;
+  t0 := 0;
+  while t0 <= OutVocabM1 do
   begin
-    pBase := p * Hidden;
-    pOut := p * OutVocab; // #11: hoist logits row base
-    pTrunk := Addr(TrunkOut.FData[pBase]); // #8: invariant across the t loop
-    tBase := 0;           // #6: t * Hidden by running sum (t steps by 1)
-    for t := 0 to OutVocabM1 do
+    tHi := t0 + TileVocab - 1;
+    if tHi > OutVocabM1 then tHi := OutVocabM1;
+    for p := pFirst to pLast do
     begin
-      Logits.FData[pOut + t] := HB.FData[t] +
-        TNNetVolume.DotProduct(pTrunk, Addr(HW.FData[tBase]), Hidden);
-      Inc(tBase, Hidden);
+      // #11: logits write cursor and #6: t * Hidden as running sums
+      pOut := (p - pFirst) * OutVocab + t0;
+      pTrunk := Addr(TrunkOut.FData[p * Hidden]); // #8: invariant over the tile
+      tBase := t0 * Hidden;
+      for t := t0 to tHi do
+      begin
+        Logits.FData[pOut] := HB.FData[t] +
+          TNNetVolume.DotProduct(pTrunk, Addr(HW.FData[tBase]), Hidden);
+        Inc(tBase, Hidden);
+        Inc(pOut);
+      end;
     end;
+    Inc(t0, TileVocab);
   end;
 end;
 
 procedure TBarkSubModel.ComputeLogits(const TokenIds: array of integer;
-  Logits: TNNetVolume);
+  Logits: TNNetVolume; LastPosOnly: boolean = false);
 var
   Emb: TNNetVolume;
   Hidden, p, k, tok, FSeqLenM1, HiddenM1, pBase, tokBase: integer;
@@ -34874,7 +34902,7 @@ begin
       Move(FEmbed[0].FData[tokBase], Emb.FData[pBase],
         Hidden * csNeuralFloatSize);
     end;
-    BarkApplyTrunkAndHead(Self, Emb, 0, Logits);
+    BarkApplyTrunkAndHead(Self, Emb, 0, Logits, LastPosOnly);
   finally
     Emb.Free;
   end;

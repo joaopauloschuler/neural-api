@@ -449,6 +449,7 @@ type
     // (codebook-conditioned merged input embedding sum over codebooks 0..idx,
     // bidirectional over time) is pinned per (sequence, codebook_idx) case.
     procedure TestBarkParity;
+    procedure TestBarkLastPosOnlyHead;
     procedure TestMusicGenDelayPattern;
     // STEREO (audio_channels=2) MusicGen: the decoder doubles to 2*K
     // interleaved-codebook rows (row 2c=left codebook c, 2c+1=right) sharing
@@ -17088,6 +17089,92 @@ begin
   finally
     Model.Free;
     Logits.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// The LastPosOnly head must return exactly the last row of the full-head run
+// (bit-identical: the same dot products, just fewer of them). Coded by Claude
+// (AI).
+procedure TTestNeuralPretrained.TestBarkLastPosOnlyHead;
+var
+  Model: TBarkModel;
+  Config: TBarkConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  RefObj, SubObj: TJSONObject;
+  SeqArr, RowArr: TJSONArray;
+  Full, Last: TNNetVolume;
+  TokenIds: array of integer;
+  SemSeq, CoarseSeq, FineSeq, Vocab, p, v, Base: integer;
+
+  function ReadSeqLen(const Key: string): integer;
+  var SO: TJSONObject; SA: TJSONArray;
+  begin
+    SO := TJSONObject(RefObj.Find(Key));
+    SA := TJSONArray(SO.Find('sequences'));
+    Result := TJSONArray(SA.Items[0]).Count;
+  end;
+
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Model := nil;
+  Full := TNNetVolume.Create;
+  Last := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_bark_ref.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    RefObj := TJSONObject(RefRoot);
+    SemSeq := ReadSeqLen('semantic');
+    CoarseSeq := ReadSeqLen('coarse');
+    SubObj := TJSONObject(RefObj.Find('fine'));
+    FineSeq := TJSONArray(TJSONObject(
+      TJSONArray(SubObj.Find('cases')).Items[0]).Find('codes')).Count;
+    Model := BuildBarkFromSafeTensors(
+      FixturePath('tiny_bark_semantic.safetensors'),
+      FixturePath('tiny_bark_coarse.safetensors'),
+      FixturePath('tiny_bark_fine.safetensors'),
+      Config, SemSeq, CoarseSeq, FineSeq, {pTrainable=}true,
+      FixturePath('tiny_bark_config.json'));
+
+    // ---- SEMANTIC ----
+    SubObj := TJSONObject(RefObj.Find('semantic'));
+    Vocab := SubObj.Get('vocab', 0);
+    SeqArr := TJSONArray(SubObj.Find('sequences'));
+    RowArr := TJSONArray(SeqArr.Items[0]);
+    SetLength(TokenIds, SemSeq);
+    for p := 0 to SemSeq - 1 do TokenIds[p] := RowArr.Items[p].AsInteger;
+    Model.Semantic.ComputeLogits(TokenIds, Full);
+    Model.Semantic.ComputeLogits(TokenIds, Last, {LastPosOnly=}true);
+    AssertEquals('semantic full head size', SemSeq * Vocab, Full.Size);
+    AssertEquals('semantic last-pos head size', Vocab, Last.Size);
+    Base := (SemSeq - 1) * Vocab;
+    for v := 0 to Vocab - 1 do
+      AssertEquals('semantic last-pos logit ' + IntToStr(v),
+        Full.FData[Base + v], Last.FData[v]);
+
+    // ---- COARSE ----
+    SubObj := TJSONObject(RefObj.Find('coarse'));
+    Vocab := SubObj.Get('vocab', 0);
+    SeqArr := TJSONArray(SubObj.Find('sequences'));
+    RowArr := TJSONArray(SeqArr.Items[0]);
+    SetLength(TokenIds, CoarseSeq);
+    for p := 0 to CoarseSeq - 1 do TokenIds[p] := RowArr.Items[p].AsInteger;
+    Model.Coarse.ComputeLogits(TokenIds, Full);
+    Model.Coarse.ComputeLogits(TokenIds, Last, {LastPosOnly=}true);
+    AssertEquals('coarse full head size', CoarseSeq * Vocab, Full.Size);
+    AssertEquals('coarse last-pos head size', Vocab, Last.Size);
+    Base := (CoarseSeq - 1) * Vocab;
+    for v := 0 to Vocab - 1 do
+      AssertEquals('coarse last-pos logit ' + IntToStr(v),
+        Full.FData[Base + v], Last.FData[v]);
+  finally
+    Model.Free;
+    Full.Free;
+    Last.Free;
     RefRoot.Free;
     RefJson.Free;
   end;
