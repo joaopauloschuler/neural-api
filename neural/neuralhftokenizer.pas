@@ -242,6 +242,10 @@ type
       FDecStripLeft: integer;     // decoder Strip(' ', start, 0)
       // GPT-2 bytes<->unicode table
       FByteToCP: array[0..255] of cardinal;
+      // The same table already UTF-8 encoded: the byte-level alphabet symbol
+      // for each input byte. A lookup is a refcount copy, where
+      // CodePointToUTF8(FByteToCP[b]) allocated a fresh string per byte.
+      FByteToStr: array[0..255] of string;
       FCPToByte: array[0..$143] of integer;
       // SentencePiece '<0xNN>' byte-piece ids (or -1 if absent), indexed by
       // byte value 0..255. Built once per load (immutable vocab) so the unk
@@ -258,6 +262,11 @@ type
       // pair of the word being merged. Grown lazily and reused across words,
       // so the merge loop itself never allocates.
       FBPERanks: array of integer;
+      // Reusable symbol list for the per-word BPE merge loop. BPEWord mutates
+      // its symbol list, so this is cleared and refilled per word and is never
+      // live at two places at once -- every encode branch below fills it,
+      // BPEs it, and is done with it before the next word.
+      FSymbolBuf: TStringList;
       // Open-addressed hash over FMerges, keyed on the SAME 'left'#1'right'
       // byte sequence the sorted-list Find() matched -- but probed straight
       // from the two symbols, so a rank lookup neither builds the temporary
@@ -297,7 +306,8 @@ type
         IndividualDigits: boolean; Pieces: TStringList);
       procedure SplitFalconMappedPieces(const Segment: string;
         Pieces: TStringList);
-      function MapPieceToByteLevel(const Piece: string): TStringList;
+      procedure MapPieceToByteLevel(const Piece: string;
+        Symbols: TStringList);
       function FindAddedToken(const Text: string; Position: integer;
         out TokenIndex: integer): boolean;
       function IsAddedTokenId(Id: integer; out TokenIndex: integer): boolean;
@@ -1193,6 +1203,7 @@ begin
   FMerges.CaseSensitive := true;
   FMerges.UseLocale := false;
   FMerges.Duplicates := dupIgnore;
+  FSymbolBuf := TStringList.Create();
   FDropoutProb := 0.0;
   BuildByteTable();
   ClearState();
@@ -1200,6 +1211,7 @@ end;
 
 destructor TNeuralHFTokenizer.Destroy();
 begin
+  FSymbolBuf.Free;
   FMerges.Free;
   FVocab.Free;
   inherited Destroy();
@@ -1290,6 +1302,7 @@ begin
       Inc(Shifted);
     end;
     FByteToCP[B] := CP;
+    FByteToStr[B] := CodePointToUTF8(CP);
     FCPToByte[CP] := B;
   end;
 end;
@@ -3253,19 +3266,29 @@ var
   procedure EmitRun(const Run: string);
   var
     Cnt, SubCnt, ByteCnt, SubLen, SubPiecesM1, DigitRunsM1: integer;
-    Mapped, Piece: string;
+    MapPos, EncLen: integer;
+    Mapped, Piece, Encoded: string;
   begin
     SubPieces.Clear;
     ByteLevelPieces(Run, SubPieces);
     SubPiecesM1 := SubPieces.Count - 1;
     for Cnt := 0 to SubPiecesM1 do
     begin
-      Mapped := '';
       Piece := SubPieces[Cnt];
       SubLen := Length(Piece);
+      // #23: one SetLength to a justified bound plus a carried write index.
+      // Every byte-level alphabet codepoint is <= $143, so it encodes to at
+      // most 2 UTF-8 bytes and 2 * SubLen bounds the mapped text.
+      SetLength(Mapped, SubLen * 2);
+      MapPos := 0;
       for ByteCnt := 1 to SubLen do
-        Mapped := Mapped +
-          CodePointToUTF8(FByteToCP[Ord(Piece[ByteCnt])]);
+      begin
+        Encoded := FByteToStr[Ord(Piece[ByteCnt])];
+        EncLen := Length(Encoded);
+        Move(Encoded[1], Mapped[MapPos + 1], EncLen);
+        Inc(MapPos, EncLen);
+      end;
+      SetLength(Mapped, MapPos);
       DigitRuns.Clear;
       SplitDigitsPieces(Mapped, false, DigitRuns);
       DigitRunsM1 := DigitRuns.Count - 1;
@@ -3842,17 +3865,17 @@ begin
   end;
 end;
 
-// Maps a raw piece to its byte-level alphabet symbols (one mapped
-// codepoint per input byte). Caller frees the result.
-function TNeuralHFTokenizer.MapPieceToByteLevel(
-  const Piece: string): TStringList;
+// Fills Symbols with the byte-level alphabet symbols of a raw piece (one
+// mapped codepoint per input byte).
+procedure TNeuralHFTokenizer.MapPieceToByteLevel(const Piece: string;
+  Symbols: TStringList);
 var
   Cnt, PieceLen: integer;
 begin
-  Result := TStringList.Create();
+  Symbols.Clear;
   PieceLen := Length(Piece);
   for Cnt := 1 to PieceLen do
-    Result.Add(CodePointToUTF8(FByteToCP[Ord(Piece[Cnt])]));
+    Symbols.Add(FByteToStr[Ord(Piece[Cnt])]);
 end;
 
 procedure TNeuralHFTokenizer.EmitTokenOrFallback(const Symbol: string;
@@ -4304,7 +4327,7 @@ end;
 procedure TNeuralHFTokenizer.EncodeSegment(const Segment: string;
   Ids: TIntegerList; IsFirstSegment: boolean);
 var
-  Pieces, Symbols, DigitPieces: TStringList;
+  Pieces, DigitPieces: TStringList;
   Cnt, Position, RunStart, PieceStart, PiecesCnt, NormReplaceHi: integer;
   PieceLen: integer;
   MSLen, NormLen: integer;
@@ -4314,7 +4337,6 @@ var
   // BPEs Normalized[PieceFrom..PieceTo] (1-based bytes) over codepoints.
   procedure BPECodePoints(PieceFrom, PieceTo: integer);
   var
-    CPSyms: TStringList;
     BytePos, CPStart: integer;
   begin
     if FUnigram then
@@ -4322,19 +4344,15 @@ var
       UnigramWord(Copy(Normalized, PieceFrom, PieceTo - PieceFrom + 1), Ids);
       exit;
     end;
-    CPSyms := TStringList.Create();
-    try
-      BytePos := PieceFrom;
-      while BytePos <= PieceTo do
-      begin
-        CPStart := BytePos;
-        NextCodePoint(Normalized, BytePos);
-        CPSyms.Add(Copy(Normalized, CPStart, BytePos - CPStart));
-      end;
-      BPEWord(CPSyms, Ids);
-    finally
-      CPSyms.Free;
+    FSymbolBuf.Clear;
+    BytePos := PieceFrom;
+    while BytePos <= PieceTo do
+    begin
+      CPStart := BytePos;
+      NextCodePoint(Normalized, BytePos);
+      FSymbolBuf.Add(Copy(Normalized, CPStart, BytePos - CPStart));
     end;
+    BPEWord(FSymbolBuf, Ids);
   end;
 
 begin
@@ -4375,12 +4393,8 @@ begin
       PiecesCnt := Pieces.Count - 1;
       for Cnt := 0 to PiecesCnt do
       begin
-        Symbols := MapPieceToByteLevel(Pieces[Cnt]);
-        try
-          BPEWord(Symbols, Ids);
-        finally
-          Symbols.Free;
-        end;
+        MapPieceToByteLevel(Pieces[Cnt], FSymbolBuf);
+        BPEWord(FSymbolBuf, Ids);
       end;
     finally
       Pieces.Free;
@@ -4397,12 +4411,8 @@ begin
       PiecesCnt := Pieces.Count - 1;
       for Cnt := 0 to PiecesCnt do
       begin
-        Symbols := MapPieceToByteLevel(Pieces[Cnt]);
-        try
-          BPEWord(Symbols, Ids);
-        finally
-          Symbols.Free;
-        end;
+        MapPieceToByteLevel(Pieces[Cnt], FSymbolBuf);
+        BPEWord(FSymbolBuf, Ids);
       end;
     finally
       Pieces.Free;
@@ -4419,21 +4429,17 @@ begin
       PiecesCnt := Pieces.Count - 1;
       for Cnt := 0 to PiecesCnt do
       begin
-        Symbols := TStringList.Create();
-        try
-          Piece := Pieces[Cnt];
-          PieceLen := Length(Piece);
-          Position := 1;
-          while Position <= PieceLen do
-          begin
-            RunStart := Position;
-            NextCodePoint(Piece, Position);
-            Symbols.Add(Copy(Piece, RunStart, Position - RunStart));
-          end;
-          BPEWord(Symbols, Ids);
-        finally
-          Symbols.Free;
+        FSymbolBuf.Clear;
+        Piece := Pieces[Cnt];
+        PieceLen := Length(Piece);
+        Position := 1;
+        while Position <= PieceLen do
+        begin
+          RunStart := Position;
+          NextCodePoint(Piece, Position);
+          FSymbolBuf.Add(Copy(Piece, RunStart, Position - RunStart));
         end;
+        BPEWord(FSymbolBuf, Ids);
       end;
     finally
       Pieces.Free;
@@ -4450,12 +4456,8 @@ begin
       PiecesCnt := Pieces.Count - 1;
       for Cnt := 0 to PiecesCnt do
       begin
-        Symbols := MapPieceToByteLevel(Pieces[Cnt]);
-        try
-          BPEWord(Symbols, Ids);
-        finally
-          Symbols.Free;
-        end;
+        MapPieceToByteLevel(Pieces[Cnt], FSymbolBuf);
+        BPEWord(FSymbolBuf, Ids);
       end;
     finally
       Pieces.Free;
@@ -4503,12 +4505,8 @@ begin
       PiecesCnt := Pieces.Count - 1;
       for Cnt := 0 to PiecesCnt do
       begin
-        Symbols := MapPieceToByteLevel(Pieces[Cnt]);
-        try
-          BPEWord(Symbols, Ids);
-        finally
-          Symbols.Free;
-        end;
+        MapPieceToByteLevel(Pieces[Cnt], FSymbolBuf);
+        BPEWord(FSymbolBuf, Ids);
       end;
     finally
       Pieces.Free;
@@ -4977,7 +4975,7 @@ begin
     OutPos := 0;
     for Cnt := 1 to FragmentLen do
     begin
-      Encoded := CodePointToUTF8(FByteToCP[Ord(Fragment[Cnt])]);
+      Encoded := FByteToStr[Ord(Fragment[Cnt])];
       EncLen := Length(Encoded);
       for ByteCnt := 1 to EncLen do
       begin
