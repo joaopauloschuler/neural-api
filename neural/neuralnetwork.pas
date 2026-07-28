@@ -14069,6 +14069,10 @@ type
     FWrPlane, FWiPlane: array of TNeuralFloat;
     // Per-mode contiguous input spectra, index (mx*FModesY + my)*FInDepth + ci.
     FxrPlane, FximPlane: array of TNeuralFloat;
+    // Persistent FFT2D X-axis scratch (length FSizeX). The Y axis needs none:
+    // the [x][y] layout makes Re[ix] the contiguous Y row, so FourierMixFFT
+    // runs in place on it.
+    FFftRowRe, FFftRowIm: array of Double;
     procedure ComputeCPU();
     procedure BackpropagateCPU();
     function WBase(mx, my, ci, co: integer): integer;
@@ -80670,44 +80674,28 @@ procedure TNNetSpectralConv2D.FFT2D(var Re, Im: TSpectralConv2DMatrix; Inverse: 
 var
   ix, iy: integer;
   SizeXM1, SizeYM1: integer;
-  rowRe, rowIm, colRe, colIm: array of Double;
 begin
   SizeXM1 := FSizeX - 1;
   SizeYM1 := FSizeY - 1;
-  // FFT along X for each y.
-  SetLength(rowRe, FSizeX);
-  SetLength(rowIm, FSizeX);
+  // FFT along X for each y: the X axis is the outer index, so a gather into the
+  // persistent row scratch is required.
   for iy := 0 to SizeYM1 do
   begin
     for ix := 0 to SizeXM1 do
     begin
-      rowRe[ix] := Re[ix][iy];
-      rowIm[ix] := Im[ix][iy];
+      FFftRowRe[ix] := Re[ix][iy];
+      FFftRowIm[ix] := Im[ix][iy];
     end;
-    FourierMixFFT(rowRe, rowIm, FSizeX, Inverse);
+    FourierMixFFT(FFftRowRe, FFftRowIm, FSizeX, Inverse);
     for ix := 0 to SizeXM1 do
     begin
-      Re[ix][iy] := rowRe[ix];
-      Im[ix][iy] := rowIm[ix];
+      Re[ix][iy] := FFftRowRe[ix];
+      Im[ix][iy] := FFftRowIm[ix];
     end;
   end;
-  // FFT along Y for each x.
-  SetLength(colRe, FSizeY);
-  SetLength(colIm, FSizeY);
+  // FFT along Y for each x: Re[ix]/Im[ix] already ARE the contiguous Y rows.
   for ix := 0 to SizeXM1 do
-  begin
-    for iy := 0 to SizeYM1 do
-    begin
-      colRe[iy] := Re[ix][iy];
-      colIm[iy] := Im[ix][iy];
-    end;
-    FourierMixFFT(colRe, colIm, FSizeY, Inverse);
-    for iy := 0 to SizeYM1 do
-    begin
-      Re[ix][iy] := colRe[iy];
-      Im[ix][iy] := colIm[iy];
-    end;
-  end;
+    FourierMixFFT(Re[ix], Im[ix], FSizeY, Inverse);
 end;
 
 procedure TNNetSpectralConv2D.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -80755,6 +80743,8 @@ begin
   SetLength(FWiPlane, FOutDepth * FModesX * FModesY * FInDepth);
   SetLength(FxrPlane, FModesX * FModesY * FInDepth);
   SetLength(FximPlane, FModesX * FModesY * FInDepth);
+  SetLength(FFftRowRe, FSizeX);
+  SetLength(FFftRowIm, FSizeX);
   if FIsTrainable then
   begin
     SetLength(FGreBuf, FSizeX, FSizeY);
