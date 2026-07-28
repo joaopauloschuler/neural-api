@@ -2697,7 +2697,11 @@ type
     FMarkers: TColBERTMarkers;
     FDocMats: array of TNNetVolume;
     FDocTexts: array of string;
+    // FCount is the logical length; FCapacity is the allocated length of both
+    // arrays and grows geometrically, so adding a corpus of N documents costs
+    // O(N) element copies rather than the O(N^2) of a grow-by-one.
     FCount: integer;
+    FCapacity: integer;
     function GetDocText(Index: integer): string;
     function GetDocMatrix(Index: integer): TNNetVolume;
   public
@@ -25177,6 +25181,44 @@ begin
     'Spearman: ' + FloatToStrF(Spear, ffFixed, 8, 4) + sLineBreak;
 end;
 
+// Rule #22: every ranking consumer in this unit reads only a bounded PREFIX of
+// Order (the largest requested k, or TopK), so only that prefix needs to be in
+// order - O(Count*NeedTop) instead of the O(Count^2) full insertion sort whose
+// every comparison was an indirect Scores[Order[j]] load.
+// Selecting by ROTATION rather than by swap keeps equal-scoring entries in
+// their existing relative order; callers hand in Order as the ascending
+// identity permutation, so ties still keep the LOWER index first and the
+// selected prefix is element-for-element what a stable descending sort of the
+// whole array would have produced. Entries past NeedTop are left unordered.
+procedure SelectTopScoredIndices(var Order: array of integer;
+  const Scores: TNeuralFloatDynArr; Count, NeedTop: integer);
+var
+  i, j, BestIdx, IP1, MaxKeepIdx, MaxIdx, Tmp: integer;
+  BestScore: TNeuralFloat;
+begin
+  if NeedTop > Count then NeedTop := Count;
+  MaxKeepIdx := NeedTop - 1;
+  MaxIdx := Count - 1;
+  for i := 0 to MaxKeepIdx do
+  begin
+    BestIdx := i;
+    BestScore := Scores[Order[i]];
+    IP1 := i + 1;
+    for j := IP1 to MaxIdx do
+      if Scores[Order[j]] > BestScore then
+      begin
+        BestScore := Scores[Order[j]];
+        BestIdx := j;
+      end;
+    if BestIdx <> i then
+    begin
+      Tmp := Order[BestIdx];
+      for j := BestIdx downto IP1 do Order[j] := Order[j - 1];
+      Order[i] := Tmp;
+    end;
+  end;
+end;
+
 function RetrievalReport(QueryEmb, PassageEmb: array of TNNetVolume;
   const Relevant: array of TNeuralIntegerArray;
   const KList: array of integer): string;
@@ -25184,12 +25226,13 @@ var
   NQ, NP, Qi, Pj, Ki, RankPos, RelIdx, MaxK: integer;
   Scores: TNeuralFloatDynArr;
   Order: array of integer;
-  Tmp: integer;
   IsRel: array of boolean;
-  RecallSum: TNeuralFloatDynArr;
-  NDCGSum, DCG, IDCG, Gain, Ln2: TNeuralFloat;
-  HitCount, NumRel, i, j: integer;
+  RecallSum, InvPNorm: TNeuralFloatDynArr;
+  NDCGSum, DCG, IDCG, Gain, Ln2, NormSqr: TNeuralFloat;
+  HitCount, NumRel: integer;
   KListHi, NQM1, NPM1, NumRelM1, MaxKM1, KListKiM1: integer;
+  Dim, NeedTop: integer;
+  QPtr: TNeuralFloatArrPtr;
 begin
   Ln2 := Ln(2);
   NQ := Length(QueryEmb);
@@ -25210,16 +25253,60 @@ begin
   SetLength(Scores, NP);
   SetLength(Order, NP);
   SetLength(IsRel, NP);
+  SetLength(InvPNorm, NP);
   NQM1 := NQ - 1;
   NPM1 := NP - 1;
+  // The per-pair CosineSimilarity call checked the sizes itself; with the norms
+  // pulled out of the loop the same contract is enforced once, up front.
+  Dim := QueryEmb[0].Size;
+  for Qi := 0 to NQM1 do
+    if QueryEmb[Qi].Size <> Dim then
+      ImportError('CosineSimilarity: vector size mismatch ' +
+        IntToStr(QueryEmb[Qi].Size) + ' vs ' + IntToStr(Dim) + '.');
+  // #14: rank on Dot / |P| instead of the full cosine Dot / (|Q| * |P|). The
+  // scores array below feeds EXACTLY ONE consumer - the ranking selection - and
+  // is never printed, thresholded or returned, so dropping the single positive
+  // per-query factor 1/|Q| cannot change any comparison. |P| does NOT cancel
+  // (it differs per candidate) but it is a per-passage constant, so it is
+  // computed once here instead of NQ times. Do not "restore" the query norm:
+  // it would only add NQ*NP sum-of-squares passes for the same ranking.
+  for Pj := 0 to NPM1 do
+  begin
+    if PassageEmb[Pj].Size <> Dim then
+      ImportError('CosineSimilarity: vector size mismatch ' +
+        IntToStr(Dim) + ' vs ' + IntToStr(PassageEmb[Pj].Size) + '.');
+    NormSqr := PassageEmb[Pj].GetSumSqr();
+    // A zero-norm passage scored 0 against every query; keep that exactly.
+    if NormSqr <= 0 then InvPNorm[Pj] := 0
+    else InvPNorm[Pj] := 1 / Sqrt(NormSqr);
+  end;
+  // Highest rank position any consumer below reads: the largest requested k
+  // and the nDCG cutoff. Everything past it is discarded, so it is never
+  // brought into order.
+  NeedTop := MaxK;
+  for Ki := 0 to KListHi do
+    if KList[Ki] > NeedTop then NeedTop := KList[Ki];
+  if NeedTop > NP then NeedTop := NP;
   for Qi := 0 to NQM1 do
   begin
-    for Pj := 0 to NPM1 do
-    begin
-      Scores[Pj] := CosineSimilarity(QueryEmb[Qi], PassageEmb[Pj]);
-      Order[Pj] := Pj;
-      IsRel[Pj] := False;
-    end;
+    QPtr := QueryEmb[Qi].DataPtr; // #11: one query row for the whole Pj loop
+    // A zero-norm QUERY scored 0 against every passage (all scores tied);
+    // reproduce that instead of letting an underflowed norm break the tie.
+    if QueryEmb[Qi].GetSumSqr() <= 0 then
+      for Pj := 0 to NPM1 do
+      begin
+        Scores[Pj] := 0;
+        Order[Pj] := Pj;
+        IsRel[Pj] := False;
+      end
+    else
+      for Pj := 0 to NPM1 do
+      begin
+        Scores[Pj] := TNNetVolume.DotProduct(QPtr, PassageEmb[Pj].DataPtr,
+          Dim) * InvPNorm[Pj];
+        Order[Pj] := Pj;
+        IsRel[Pj] := False;
+      end;
     NumRel := Length(Relevant[Qi]);
     NumRelM1 := NumRel - 1;
     for RelIdx := 0 to NumRelM1 do
@@ -25230,19 +25317,9 @@ begin
           IntToStr(Pj) + ' for query ' + IntToStr(Qi) + ' out of range.');
       IsRel[Pj] := True;
     end;
-    // descending sort of passage indices by score (stable insertion sort,
-    // ties keep lower index first -> deterministic ranking)
-    for i := 1 to NPM1 do
-    begin
-      Tmp := Order[i];
-      j := i - 1;
-      while (j >= 0) and (Scores[Order[j]] < Scores[Tmp]) do
-      begin
-        Order[j + 1] := Order[j];
-        Dec(j);
-      end;
-      Order[j + 1] := Tmp;
-    end;
+    // Descending ranking of passage indices by score, ties keeping the lower
+    // index first -> deterministic. #22: only the NeedTop prefix is read.
+    SelectTopScoredIndices(Order, Scores, NP, NeedTop);
     // Recall@k for each requested k
     for Ki := 0 to KListHi do
     begin
@@ -25535,12 +25612,11 @@ var
   NQ, NP, Qi, Pj, Ki, RankPos, RelIdx, MaxK: integer;
   Scores: TNeuralFloatDynArr;
   Order: array of integer;
-  Tmp: integer;
   IsRel: array of boolean;
   RecallSum: TNeuralFloatDynArr;
-  NDCGSum, DCG, IDCG, Ln2, TmpScore: TNeuralFloat;
-  HitCount, NumRel, i, j: integer;
-  KListHi, NQM1, NPM1, NumRelM1, MaxKM1, KListKiM1: integer;
+  NDCGSum, DCG, IDCG, Ln2: TNeuralFloat;
+  HitCount, NumRel: integer;
+  KListHi, NQM1, NPM1, NumRelM1, MaxKM1, KListKiM1, NeedTop: integer;
 begin
   Ln2 := Ln(2);
   NQ := Length(QueryMats);
@@ -25563,6 +25639,12 @@ begin
   SetLength(IsRel, NP);
   NQM1 := NQ - 1;
   NPM1 := NP - 1;
+  // Highest rank position the Recall@k / nDCG loops below read; the rest of
+  // the ranking is discarded, so it is never brought into order.
+  NeedTop := MaxK;
+  for Ki := 0 to KListHi do
+    if KList[Ki] > NeedTop then NeedTop := KList[Ki];
+  if NeedTop > NP then NeedTop := NP;
   for Qi := 0 to NQM1 do
   begin
     for Pj := 0 to NPM1 do
@@ -25581,18 +25663,9 @@ begin
           IntToStr(Pj) + ' for query ' + IntToStr(Qi) + ' out of range.');
       IsRel[Pj] := True;
     end;
-    // descending stable insertion sort by MaxSim (ties keep lower index)
-    for i := 1 to NPM1 do
-    begin
-      Tmp := Order[i];
-      j := i - 1;
-      while (j >= 0) and (Scores[Order[j]] < Scores[Tmp]) do
-      begin
-        Order[j + 1] := Order[j];
-        Dec(j);
-      end;
-      Order[j + 1] := Tmp;
-    end;
+    // Descending ranking by MaxSim, ties keeping the lower index. #22: only
+    // the NeedTop prefix is read by the Recall@k / nDCG loops below.
+    SelectTopScoredIndices(Order, Scores, NP, NeedTop);
     for Ki := 0 to KListHi do
     begin
       HitCount := 0;
@@ -25644,6 +25717,7 @@ begin
   FTokenizer := ATokenizer;
   FMarkers := AMarkers;
   FCount := 0;
+  FCapacity := 0;
   SetLength(FDocMats, 0);
   SetLength(FDocTexts, 0);
 end;
@@ -25659,12 +25733,15 @@ var
   i: integer;
   FCountM1: integer;
 begin
+  // Only [0, FCount) ever received a matrix: SetLength zero-fills the slack
+  // it adds, so the slots up to FCapacity are nil and own nothing.
   FCountM1 := FCount - 1;
   for i := 0 to FCountM1 do
     if FDocMats[i] <> nil then FDocMats[i].Free;
   SetLength(FDocMats, 0);
   SetLength(FDocTexts, 0);
   FCount := 0;
+  FCapacity := 0;
 end;
 
 function TColBERTIndex.GetDocText(Index: integer): string;
@@ -25695,8 +25772,12 @@ begin
     raise;
   end;
   Result := FCount;
-  SetLength(FDocMats, FCount + 1);
-  SetLength(FDocTexts, FCount + 1);
+  if FCount >= FCapacity then
+  begin
+    if FCapacity < 8 then FCapacity := 8 else FCapacity := FCapacity * 2;
+    SetLength(FDocMats, FCapacity);
+    SetLength(FDocTexts, FCapacity);
+  end;
   FDocMats[FCount] := Mat;
   FDocTexts[FCount] := Text;
   Inc(FCount);
@@ -25763,27 +25844,18 @@ function TColBERTIndex.Search(const Query: string;
 var
   Scores: TNeuralFloatDynArr;
   Order: array of integer;
-  i, j, Tmp, Oi: integer;
+  i, Oi: integer;
   FCountM1, TopKM1: integer;
-  TmpScore: TNeuralFloat;
 begin
   ScoreAll(Query, Scores);
   SetLength(Order, FCount);
   FCountM1 := FCount - 1;
   for i := 0 to FCountM1 do Order[i] := i;
-  // descending insertion sort by score (stable for the small corpora ColBERT
-  // demos use; matches the example's hand-rolled ranking exactly).
-  for i := 1 to FCountM1 do
-  begin
-    Tmp := Order[i]; j := i - 1;
-    TmpScore := Scores[Tmp]; // #8: bound once, not re-read per shift step
-    while (j >= 0) and (Scores[Order[j]] < TmpScore) do
-    begin
-      Order[j + 1] := Order[j]; Dec(j);
-    end;
-    Order[j + 1] := Tmp;
-  end;
   if (TopK <= 0) or (TopK > FCount) then TopK := FCount;
+  // Descending ranking by score, ties keeping the lower index - the same order
+  // the example's hand-rolled ranking produces. #22: only the TopK hits
+  // returned below are read, so only they are brought into order.
+  SelectTopScoredIndices(Order, Scores, FCount, TopK);
   SetLength(Result, TopK);
   TopKM1 := TopK - 1;
   for i := 0 to TopKM1 do
@@ -26404,7 +26476,7 @@ function NormalizeSquadAnswer(const S: string): string;
 var
   LpMax: integer;
   Lower, Tmp, Word: string;
-  i: integer;
+  i, w, WordLen, WriteIdx: integer;
   Words: TStringList;
   Ch: char;
   LowerLen: integer;
@@ -26412,31 +26484,51 @@ begin
   // Lowercase, strip punctuation to spaces, collapse whitespace, drop the
   // English articles a/an/the (the official SQuAD normalize_answer).
   Lower := LowerCase(S);
-  Tmp := '';
   LowerLen := Length(Lower);
+  // #23: the map is one character in, one character out (alphanumeric to
+  // itself, anything else to a separator), so the output length is exactly
+  // LowerLen. Size the buffer once and write indexed - under {$CODEPAGE UTF8}
+  // FPC cannot append in place, so `Tmp := Tmp + Ch` reallocated and copied
+  // the whole accumulated string on every character.
+  SetLength(Tmp, LowerLen);
   for i := 1 to LowerLen do
   begin
     Ch := Lower[i];
     if ((Ch >= 'a') and (Ch <= 'z')) or ((Ch >= '0') and (Ch <= '9')) then
-      Tmp := Tmp + Ch
+      Tmp[i] := Ch
     else
-      Tmp := Tmp + ' '; // punctuation and whitespace both become separators
+      Tmp[i] := ' '; // punctuation and whitespace both become separators
   end;
   Words := TStringList.Create();
   try
     Words.Delimiter := ' ';
     Words.StrictDelimiter := False; // collapse runs of spaces
     Words.DelimitedText := Tmp;
-    Result := '';
+    // The join keeps a subset of the words and puts ONE space between the kept
+    // ones. In Tmp each word is already followed by at least one separator, so
+    // kept-length + (kept-1) can never exceed LowerLen: one buffer of that
+    // bound, a carried write index, one truncate at the end.
+    SetLength(Result, LowerLen);
+    WriteIdx := 0;
     LpMax := Words.Count - 1;
     for i := 0 to LpMax do
     begin
       Word := Words[i];
       if (Word = '') or (Word = 'a') or (Word = 'an') or (Word = 'the') then
         Continue;
-      if Result <> '' then Result := Result + ' ';
-      Result := Result + Word;
+      if WriteIdx > 0 then
+      begin
+        Inc(WriteIdx);
+        Result[WriteIdx] := ' ';
+      end;
+      WordLen := Length(Word);
+      for w := 1 to WordLen do
+      begin
+        Inc(WriteIdx);
+        Result[WriteIdx] := Word[w];
+      end;
     end;
+    SetLength(Result, WriteIdx);
   finally
     Words.Free;
   end;

@@ -649,6 +649,8 @@ type
     procedure TestPearsonAndSpearmanCorrelation;
     procedure TestSTSReport;
     procedure TestRetrievalReport;
+    procedure TestRetrievalReportLargeNTieBreak;
+    procedure TestColBERTRetrievalReportLargeNTieBreak;
     procedure TestE5EmbeddingParity;
     procedure TestBertTokenizePairSegmentIds;
     procedure TestRerankerPairLogitParity;
@@ -12316,6 +12318,127 @@ begin
   finally
     for i := 0 to 0 do Q[i].Free;
     for i := 0 to 3 do P[i].Free;
+  end;
+end;
+
+// The shipped retrieval tests use 4 passages with 4 distinct scores, which
+// exercises neither the bounded top-K ranking nor its tie-break. This one uses
+// 200 passages carrying only FOUR distinct cosines, so 50 passages tie EXACTLY
+// at every level and the ranking is decided purely by the tie-break contract
+// (equal score -> lower passage index first).
+// Each passage is additionally scaled by a different factor, which leaves its
+// cosine untouched but changes its raw dot product - so a ranking that dropped
+// the passage norm instead of the query norm would order the groups wrongly.
+// The report is finally re-checked with the query scaled by 1000: the query
+// norm is a per-query positive constant that cancels out of every comparison,
+// so the report must come back byte-identical.
+procedure TTestNeuralPretrained.TestRetrievalReportLargeNTieBreak;
+const
+  cNP = 200;
+  // four exact directions against the +x query: cos 1, 0.6, 0 and -1
+  cDirX: array[0..3] of TNeuralFloat = (1, 3, 0, -1);
+  cDirY: array[0..3] of TNeuralFloat = (0, 4, 1, 0);
+var
+  Q: array[0..0] of TNNetVolume;
+  P: array[0..cNP - 1] of TNNetVolume;
+  Rel: array[0..0] of TNeuralIntegerArray;
+  Rep, Rep1000: string;
+  i, g: integer;
+  Scale, expNDCG: double;
+  KList: array[0..2] of integer;
+begin
+  KList[0] := 1; KList[1] := 5; KList[2] := 10;
+  Q[0] := TNNetVolume.Create();
+  for i := 0 to cNP - 1 do P[i] := TNNetVolume.Create();
+  try
+    Q[0].ReSize(1, 1, 2); Q[0].FData[0] := 1; Q[0].FData[1] := 0;
+    for i := 0 to cNP - 1 do
+    begin
+      g := i mod 4;
+      // Varies |P| without touching the cosine. A POWER of two, so the scale
+      // cancels bit-exactly out of dot * (1/|P|) and the passages of one group
+      // tie to the last bit - otherwise the "tie" would be a 1-ulp accident.
+      Scale := 1 shl (i mod 8);
+      P[i].ReSize(1, 1, 2);
+      P[i].FData[0] := cDirX[g] * Scale;
+      P[i].FData[1] := cDirY[g] * Scale;
+    end;
+    // Expected ranking: the whole g=0 group (indices 0,4,8,...) in ascending
+    // index, then g=1 (1,5,9,...), then g=2, then g=3.
+    // Gold = {4, 8, 1}: p=4 at rank 2, p=8 at rank 3, p=1 at rank 51.
+    SetLength(Rel[0], 3); Rel[0][0] := 4; Rel[0][1] := 8; Rel[0][2] := 1;
+    Rep := RetrievalReport(Q, P, Rel, KList);
+    AssertTrue('header', Pos('Retrieval Report', Rep) > 0);
+    AssertTrue('passage count', Pos('passages: 200', Rep) > 0);
+    // rank 1 is p=0 (tied at cos 1 but the lowest index), not relevant.
+    AssertTrue('recall@1 0.0000', Pos('Recall@1: 0.0000', Rep) > 0);
+    // ranks 1..5 = p 0,4,8,12,16 -> hits p=4 and p=8 -> 2/3
+    AssertTrue('recall@5 0.6667', Pos('Recall@5: 0.6667', Rep) > 0);
+    // ranks 1..10 = p 0,4,...,36 -> still only those two hits -> 2/3
+    AssertTrue('recall@10 0.6667', Pos('Recall@10: 0.6667', Rep) > 0);
+    // hits at ranks 2 and 3; IDCG over the 3 gold passages at ranks 1..3.
+    expNDCG := (1 / (Ln(3) / Ln(2)) + 1 / (Ln(4) / Ln(2))) /
+               (1 / (Ln(2) / Ln(2)) + 1 / (Ln(3) / Ln(2)) +
+                1 / (Ln(4) / Ln(2)));
+    AssertTrue('ndcg pinned',
+      Pos('nDCG@10:  ' + FloatToStrF(expNDCG, ffFixed, 8, 4), Rep) > 0);
+    // #14: 1/|Q| is one positive per-query factor, so scaling the query
+    // cannot move any passage.
+    Q[0].FData[0] := 1000;
+    Rep1000 := RetrievalReport(Q, P, Rel, KList);
+    AssertEquals('report is invariant to the query norm', Rep, Rep1000);
+  finally
+    Q[0].Free;
+    for i := 0 to cNP - 1 do P[i].Free;
+  end;
+end;
+
+// The MaxSim twin of the above: 200 single-row documents carrying only three
+// distinct MaxSim scores, so the ranking within each tied group is decided
+// entirely by the lower-index-first tie-break of the bounded selection.
+procedure TTestNeuralPretrained.TestColBERTRetrievalReportLargeNTieBreak;
+const
+  cNP = 200;
+  cDot: array[0..2] of TNeuralFloat = (0.5, 0.25, -0.5);
+var
+  Qm: array[0..0] of TNNetVolume;
+  Dm: array[0..cNP - 1] of TNNetVolume;
+  Rel: array[0..0] of TNeuralIntegerArray;
+  Rep: string;
+  i, g: integer;
+  expNDCG: double;
+  KList: array[0..1] of integer;
+begin
+  KList[0] := 1; KList[1] := 4;
+  Qm[0] := TNNetVolume.Create();
+  for i := 0 to cNP - 1 do Dm[i] := TNNetVolume.Create();
+  try
+    // one query row = (1,0); doc row = (cDot[g], 0) so MaxSim = cDot[g].
+    Qm[0].ReSize(1, 1, 2); Qm[0].FData[0] := 1; Qm[0].FData[1] := 0;
+    for i := 0 to cNP - 1 do
+    begin
+      g := i mod 3;
+      Dm[i].ReSize(1, 1, 2);
+      Dm[i].FData[0] := cDot[g]; Dm[i].FData[1] := 0;
+    end;
+    // Ranking: g=0 group (0,3,6,...) then g=1 (1,4,7,...) then g=2 (2,5,...).
+    // Gold = {3, 1}: p=3 at rank 2, p=1 at rank 68 (first of the g=1 group).
+    SetLength(Rel[0], 2); Rel[0][0] := 3; Rel[0][1] := 1;
+    Rep := ColBERTRetrievalReport(Qm, Dm, Rel, KList);
+    AssertTrue('header', Pos('ColBERT Retrieval Report', Rep) > 0);
+    AssertTrue('doc count', Pos('docs:     200', Rep) > 0);
+    // rank 1 is p=0 (tied at 0.5, lowest index), not relevant.
+    AssertTrue('recall@1 0.0000', Pos('Recall@1: 0.0000', Rep) > 0);
+    // ranks 1..4 = p 0,3,6,9 -> hits p=3 only -> 1/2
+    AssertTrue('recall@4 0.5000', Pos('Recall@4: 0.5000', Rep) > 0);
+    // only p=3, at rank 2, lands inside the nDCG@10 window.
+    expNDCG := (1 / (Ln(3) / Ln(2))) /
+               (1 / (Ln(2) / Ln(2)) + 1 / (Ln(3) / Ln(2)));
+    AssertTrue('ndcg pinned',
+      Pos('nDCG@10:  ' + FloatToStrF(expNDCG, ffFixed, 8, 4), Rep) > 0);
+  finally
+    Qm[0].Free;
+    for i := 0 to cNP - 1 do Dm[i].Free;
   end;
 end;
 
