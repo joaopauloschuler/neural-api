@@ -2999,11 +2999,14 @@ type
     FTargetGT: TNNetVolume;
     // Per-pass match scratch: FMatchGT[query] = matched gt row, or -1.
     FMatchGT: array of integer;
-    // Persistent, lazily-sized backprop scratch (rule #17): packed GT rows and
-    // the per-query softmax probabilities, grown only when a larger pass needs it.
+    // Persistent, lazily-sized backprop scratch (rule #17): packed GT rows,
+    // grown only when a larger pass needs them.
     FgtClass: array of integer;
     FgtCx, FgtCy, FgtW, FgtH: array of TNeuralFloat;
-    FProbs: array of TNeuralFloat;
+    // Per-query softmax cache, N rows of (LblCnt+1), filled once per
+    // SolveMatching call and consumed by both the loss and the backward pass
+    // so each query's softmax is computed once per pass, not twice.
+    FProbsCache: array of TNeuralFloat;
     // Persistent, lazily-sized greedy-match scratch (rule #17): the N*M cost
     // matrix, the query/gt "used" flags, and the per-query match map, all grown
     // only when a larger pass needs them.
@@ -27186,7 +27189,7 @@ end;
 // Reads query q's LblCnt+1 class logits from V into the caller's Probs
 // buffer as a numerically-stable softmax.
 procedure DETRSoftMaxQuery(V: TNNetVolume; X, Y, LblCnt: integer;
-  var Probs: array of TNeuralFloat);
+  var Probs: array of TNeuralFloat; DstBase: integer);
 var
   C, KM1, base: integer;
   MaxL, S, E, vv: TNeuralFloat;
@@ -27203,18 +27206,19 @@ begin
   for C := 0 to KM1 do
   begin
     E := NeuralExp(V.FData[base + C] - MaxL);
-    Probs[C] := E;
+    Probs[DstBase + C] := E;
     S := S + E;
   end;
   if S <= 0 then S := 1e-12;
+  S := 1.0 / S;
   for C := 0 to KM1 do
-    Probs[C] := Probs[C] / S;
+    Probs[DstBase + C] := Probs[DstBase + C] * S;
 end;
 
 function TNNetDETRSetPredictionLoss.SolveMatching(pOut: TNNetVolume): integer;
 var
   LblCnt, N, M, BoxBase, q, mc, gtRows, X, Y, gtCls, iter: integer;
-  qM: integer;
+  qM, K1, ProbBase: integer;
   bestQ, bestM: integer;
   NM1, MM1: integer;
   TgtSizeXM1, TgtSizeYM1, OutSizeXM1, OutSizeYM1: integer;
@@ -27227,6 +27231,19 @@ begin
   N := pOut.SizeX * pOut.SizeY;
   NM1 := N - 1;
   for q := 0 to NM1 do FMatchGT[q] := -1;
+  // Softmax every query once, before the M=0 exit: both callers read this
+  // cache for every query whether or not any ground truth survived.
+  K1 := LblCnt + 1;
+  if Length(FProbsCache) < N * K1 then SetLength(FProbsCache, N * K1); // rule #17: grow-only
+  q := 0;
+  OutSizeXM1 := pOut.SizeX - 1;
+  OutSizeYM1 := pOut.SizeY - 1;
+  for X := 0 to OutSizeXM1 do
+    for Y := 0 to OutSizeYM1 do
+    begin
+      DETRSoftMaxQuery(pOut, X, Y, LblCnt, FProbsCache, q * K1);
+      Inc(q);
+    end;
   // Collect the valid (non-padding) ground-truth objects.
   gtRows := FTargetGT.SizeX * FTargetGT.SizeY;
   // Persistent lazily-sized scratch (rule #17): grow only when a larger pass needs it.
@@ -27256,16 +27273,13 @@ begin
   if M = 0 then Exit;
   MM1 := M - 1;
   // Build the N x M cost matrix (class + L1 + GIoU terms, DETR weights).
-  if Length(FProbs) < LblCnt + 1 then SetLength(FProbs, LblCnt + 1); // rule #17: grow-only
   if Length(FCost) < N * M then SetLength(FCost, N * M); // rule #17: grow-only
   q := 0;
-  OutSizeXM1 := pOut.SizeX - 1;
-  OutSizeYM1 := pOut.SizeY - 1;
   wCls := FFloatSt[0]; wBox := FFloatSt[1]; wGiou := FFloatSt[2];
   for X := 0 to OutSizeXM1 do
     for Y := 0 to OutSizeYM1 do
     begin
-      DETRSoftMaxQuery(pOut, X, Y, LblCnt, FProbs);
+      ProbBase := q * K1;
       pCx := pOut[X, Y, BoxBase + 0];
       pCy := pOut[X, Y, BoxBase + 1];
       pW  := pOut[X, Y, BoxBase + 2];
@@ -27276,7 +27290,7 @@ begin
       for mc := 0 to MM1 do
       begin
         gcx := FgtCx[mc]; gcy := FgtCy[mc]; gw := FgtW[mc]; gh := FgtH[mc];
-        ClassTerm := -FProbs[FgtClass[mc]];
+        ClassTerm := -FProbsCache[ProbBase + FgtClass[mc]];
         L1 := Abs(pCx - gcx) + Abs(pCy - gcy) +
               Abs(pW - gw) + Abs(pH - gh);
         bx1 := gcx - gw * 0.5; by1 := gcy - gh * 0.5;
@@ -27321,8 +27335,8 @@ var
   Loss, Eos, w, p, pCx, pCy, pW, pH: TNeuralFloat;
   ax1, ay1, ax2, ay2, bx1, by1, bx2, by2, GIoU, L1: TNeuralFloat;
   gcx, gcy, gw, gh: TNeuralFloat;
-  gtRows, mi: integer;
-  TgtSizeXM1, TgtSizeYM1, OutSizeXM1, OutSizeYM1: integer;
+  mi, K1, ProbBase: integer;
+  OutSizeXM1, OutSizeYM1: integer;
 begin
   // Self-contained: capture pTarget then run the same greedy match used in
   // Backpropagate, so a finite-difference probe sees the identical loss.
@@ -27335,36 +27349,11 @@ begin
   Eos := FFloatSt[3];
   N := pOut.SizeX * pOut.SizeY;
   M := SolveMatching(pOut);
-  // Re-collect gt boxes/classes in the same packed order SolveMatching used.
-  gtRows := FTargetGT.SizeX * FTargetGT.SizeY;
-  // Persistent lazily-sized scratch (rule #17): grow only when a larger pass needs it.
-  if Length(FgtClass) < gtRows then
-  begin
-    SetLength(FgtClass, gtRows);
-    SetLength(FgtCx, gtRows); SetLength(FgtCy, gtRows);
-    SetLength(FgtW, gtRows); SetLength(FgtH, gtRows);
-  end;
-  mi := 0;
-  TgtSizeXM1 := FTargetGT.SizeX - 1;
-  TgtSizeYM1 := FTargetGT.SizeY - 1;
-  for X := 0 to TgtSizeXM1 do
-    for Y := 0 to TgtSizeYM1 do
-    begin
-      tgtCls := Round(FTargetGT[X, Y, 0]);
-      if tgtCls < 0 then Continue;
-      if tgtCls > LblCnt - 1 then tgtCls := LblCnt - 1;
-      FgtClass[mi] := tgtCls;
-      FgtCx[mi] := FTargetGT[X, Y, BoxBase + 0];
-      FgtCy[mi] := FTargetGT[X, Y, BoxBase + 1];
-      FgtW[mi]  := FTargetGT[X, Y, BoxBase + 2];
-      FgtH[mi]  := FTargetGT[X, Y, BoxBase + 3];
-      Inc(mi);
-    end;
   // Map query -> its matched gt class (or no-object).
   if Length(FqMatch) < N then SetLength(FqMatch, N); // rule #17: grow-only
   NM1 := N - 1;
   for q := 0 to NM1 do FqMatch[q] := FMatchGT[q];
-  if Length(FProbs) < LblCnt + 1 then SetLength(FProbs, LblCnt + 1); // rule #17: grow-only
+  K1 := LblCnt + 1;
   Loss := 0;
   q := 0;
   OutSizeXM1 := pOut.SizeX - 1;
@@ -27372,7 +27361,7 @@ begin
   for X := 0 to OutSizeXM1 do
     for Y := 0 to OutSizeYM1 do
     begin
-      DETRSoftMaxQuery(pOut, X, Y, LblCnt, FProbs);
+      ProbBase := q * K1;
       if FqMatch[q] >= 0 then
       begin
         // matched: CE to gt class (weight 1) + box L1 + (1-GIoU).
@@ -27380,7 +27369,7 @@ begin
         gcx := FgtCx[mi]; gcy := FgtCy[mi]; gw := FgtW[mi]; gh := FgtH[mi];
         tgtCls := FgtClass[mi];
         w := 1.0;
-        p := FProbs[tgtCls];
+        p := FProbsCache[ProbBase + tgtCls];
         if p < 1e-12 then p := 1e-12;
         Loss := Loss - w * pcr_logf(p);
         pCx := pOut[X, Y, BoxBase + 0]; pCy := pOut[X, Y, BoxBase + 1];
@@ -27399,7 +27388,7 @@ begin
       else
       begin
         // unmatched: CE to no-object class (index LblCnt), eos-weighted.
-        p := FProbs[LblCnt];
+        p := FProbsCache[ProbBase + LblCnt];
         if p < 1e-12 then p := 1e-12;
         Loss := Loss - Eos * pcr_logf(p);
       end;
@@ -27419,8 +27408,8 @@ var
   Eos, w, InvM, target, grad, wInvM, bboxInvM, giouInvM: TNeuralFloat;
   pBox: array[0..3] of TNeuralFloat;
   bx1, by1, bx2, by2, ax1, ay1, ax2, ay2, gP, gM, gGrad, half: TNeuralFloat;
-  gtRows, mi, midx: integer;
-  TgtSizeXM1, TgtSizeYM1, FOutSizeXM1, FOutSizeYM1, baseErr0, bb: integer;
+  midx, K1, ProbBase: integer;
+  FOutSizeXM1, FOutSizeYM1, baseErr0, bb: integer;
 begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
@@ -27432,33 +27421,8 @@ begin
   N := FOutput.SizeX * FOutput.SizeY;
   M := SolveMatching(FOutput);
   if M < 1 then InvM := 1.0 else InvM := 1.0 / M;
-  // Re-collect packed gt in SolveMatching order.
-  gtRows := FTargetGT.SizeX * FTargetGT.SizeY;
-  // Persistent lazily-sized scratch (rule #17): grow only when a larger pass needs it.
-  if Length(FgtClass) < gtRows then
-  begin
-    SetLength(FgtClass, gtRows);
-    SetLength(FgtCx, gtRows); SetLength(FgtCy, gtRows);
-    SetLength(FgtW, gtRows); SetLength(FgtH, gtRows);
-  end;
-  mi := 0;
-  TgtSizeXM1 := FTargetGT.SizeX - 1;
-  TgtSizeYM1 := FTargetGT.SizeY - 1;
-  for X := 0 to TgtSizeXM1 do
-    for Y := 0 to TgtSizeYM1 do
-    begin
-      tgtCls := Round(FTargetGT[X, Y, 0]);
-      if tgtCls < 0 then Continue;
-      if tgtCls > LblCnt - 1 then tgtCls := LblCnt - 1;
-      FgtClass[mi] := tgtCls;
-      FgtCx[mi] := FTargetGT[X, Y, BoxBase + 0];
-      FgtCy[mi] := FTargetGT[X, Y, BoxBase + 1];
-      FgtW[mi]  := FTargetGT[X, Y, BoxBase + 2];
-      FgtH[mi]  := FTargetGT[X, Y, BoxBase + 3];
-      Inc(mi);
-    end;
   FOutputError.Fill(0);
-  if Length(FProbs) < LblCnt + 1 then SetLength(FProbs, LblCnt + 1); // rule #17: grow-only
+  K1 := LblCnt + 1;
   bboxInvM := FFloatSt[1] * InvM;   // #5: invariant across the whole X/Y/C nest
   giouInvM := FFloatSt[2] * InvM;
   q := 0;
@@ -27467,7 +27431,7 @@ begin
   for X := 0 to FOutSizeXM1 do
     for Y := 0 to FOutSizeYM1 do
     begin
-      DETRSoftMaxQuery(FOutput, X, Y, LblCnt, FProbs);
+      ProbBase := q * K1;
       baseErr0 := FOutputError.GetRawPos(X, Y);
       midx := FMatchGT[q];
       if midx >= 0 then
@@ -27485,7 +27449,8 @@ begin
       for C := 0 to LblCnt do
       begin
         if C = tgtCls then target := 1.0 else target := 0.0;
-        FOutputError.FData[baseErr0 + C] := wInvM * (FProbs[C] - target);
+        FOutputError.FData[baseErr0 + C] :=
+          wInvM * (FProbsCache[ProbBase + C] - target);
       end;
       // Box gradient (matched queries only).
       if midx >= 0 then
