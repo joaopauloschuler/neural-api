@@ -12788,6 +12788,12 @@ type
     FT: array of TNeuralFloat;   // scratch T_k(u) buffer (length K+1)
     FU2: array of TNeuralFloat;  // scratch U_k(u) buffer (length K+1)
     FTderivBuf: array of TNeuralFloat; // scratch T_k'(u) buffer (length K+1)
+    // Assembled basis super-vector, layout i*(K+1)+k, matching the per-neuron
+    // coefficient layout exactly. The basis depends only on the input, so it is
+    // built ONCE per pass and shared across every output (see TNNetKANConv's
+    // FKanBasisVec). Length FInDim*(K+1), sized in SetPrevLayer.
+    FKanBasisVec: array of TNeuralFloat;
+    procedure BuildKanBasisVec();
     procedure ComputePreviousLayerErrorCPU(); override;
   public
     constructor Create(pSizeX, pSizeY, pDepth: integer; pSuppressBias: integer = 0); override;
@@ -88445,6 +88451,7 @@ begin
   SetLength(FT, FDegree + 1);
   SetLength(FU2, FDegree + 1);
   SetLength(FTderivBuf, FDegree + 1);
+  SetLength(FKanBasisVec, FInDim * (FDegree + 1));
   BuildArrNeurons();
   InitDefault();
 end;
@@ -88488,36 +88495,46 @@ begin
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
+// T_k(tanh(x_i)) for every input i, laid out i*(K+1)+k. Depends only on the
+// input, so one call per pass serves every output.
+procedure TNNetKANLayer.BuildKanBasisVec();
+var
+  i, k, base, inDimMax: integer;
+  u: TNeuralFloat;
+  PrevOut: TNNetVolume;
+begin
+  PrevOut := FPrevLayer.FOutput;
+  inDimMax := FInDim - 1;
+  base := 0;
+  for i := 0 to inDimMax do
+  begin
+    u := pcr_tanhf(PrevOut.FData[i]);
+    // Chebyshev T_k(u) recurrence.
+    FKanBasisVec[base] := 1;
+    if FDegree >= 1 then FKanBasisVec[base + 1] := u;
+    for k := 2 to FDegree do
+      FKanBasisVec[base + k] :=
+        2 * u * FKanBasisVec[base + k - 1] - FKanBasisVec[base + k - 2];
+    Inc(base, FDegree + 1);
+  end;
+end;
+
 // Forward: y_j = sum_i sum_k c_{ijk} * T_k(tanh(x_i)).
 procedure TNNetKANLayer.ComputeCPU();
 var
-  j, i, k, base, Dout, CoeffsPerEdge: integer;
-  DoutMax, inDimMax: integer;
-  u, acc: TNeuralFloat;
-  PrevOut, W: TNNetVolume;
+  j, Dout, VectorSize: integer;
+  DoutMax: integer;
 begin
+  if FInDim <= 0 then exit;
   Dout := FOutput.Size;
-  PrevOut := FPrevLayer.FOutput;
   DoutMax := Dout - 1;
-  inDimMax := FInDim - 1;
-  CoeffsPerEdge := FDegree + 1;
+  VectorSize := FInDim * (FDegree + 1);
+  BuildKanBasisVec();
+  // The coefficients of output j are contiguous over the whole (i,k) plane in
+  // the same order as the basis, so the double sum is ONE long dot product.
   for j := 0 to DoutMax do
-  begin
-    W := FArrNeurons[j].FWeights;
-    acc := 0;
-    base := 0;
-    for i := 0 to inDimMax do
-    begin
-      u := pcr_tanhf(PrevOut.FData[i]);
-      // Chebyshev T_k(u) recurrence.
-      FT[0] := 1;
-      if FDegree >= 1 then FT[1] := u;
-      for k := 2 to FDegree do FT[k] := 2 * u * FT[k - 1] - FT[k - 2];
-      acc := acc + TNNetVolume.DotProduct(@W.FData[base], @FT[0], CoeffsPerEdge);
-      Inc(base, CoeffsPerEdge);
-    end;
-    FOutput.FData[j] := acc;
-  end;
+    FOutput.FData[j] := TNNetVolume.DotProduct(
+      @FArrNeurons[j].FWeights.FData[0], @FKanBasisVec[0], VectorSize);
 end;
 
 procedure TNNetKANLayer.Backpropagate();
@@ -88541,32 +88558,25 @@ end;
 // (scaled by -FLearningRate so the ordinary neuron update machinery applies).
 procedure TNNetKANLayer.BackpropagateCPU();
 var
-  j, i, k, base, Dout, CoeffsPerEdge: integer;
-  DoutMax, inDimMax: integer;
-  u, gy, localErr: TNeuralFloat;
-  PrevOut, Delta: TNNetVolume;
+  j, Dout, VectorSize: integer;
+  DoutMax: integer;
+  gy, localErr: TNeuralFloat;
+  Delta: TNNetVolume;
 begin
+  if FInDim <= 0 then exit;
   Dout := FOutput.Size;
-  PrevOut := FPrevLayer.FOutput;
   DoutMax := Dout - 1;
-  inDimMax := FInDim - 1;
-  CoeffsPerEdge := FDegree + 1;
+  VectorSize := FInDim * (FDegree + 1);
+  BuildKanBasisVec();
   for j := 0 to DoutMax do
   begin
     gy := FOutputError.FData[j];
     localErr := -FLearningRate * gy;
     if localErr = 0.0 then continue;
     Delta := FArrNeurons[j].FDelta;
-    base := 0;
-    for i := 0 to inDimMax do
-    begin
-      u := pcr_tanhf(PrevOut.FData[i]);
-      FT[0] := 1;
-      if FDegree >= 1 then FT[1] := u;
-      for k := 2 to FDegree do FT[k] := 2 * u * FT[k - 1] - FT[k - 2];
-      TNNetVolume.MulAdd(@Delta.FData[base], @FT[0], localErr, CoeffsPerEdge);
-      Inc(base, CoeffsPerEdge);
-    end;
+    // Delta and the basis share the (i,k) layout, so the whole per-output
+    // gradient is ONE long MulAdd.
+    TNNetVolume.MulAdd(@Delta.FData[0], @FKanBasisVec[0], localErr, VectorSize);
   end;
   if (not FBatchUpdate) then
   begin
@@ -89187,44 +89197,53 @@ begin
   for ox := 0 to outSizeXMax do
   begin
     errBase := FOutputError.GetRawPos(ox, oy);   // #11/#18: invariant across oo
+    // The basis super-vector depends only on the input patch, NOT on the output
+    // channel, so it is assembled once per position exactly as ComputeCPU does
+    // it and then shared across every oo. Padding-clipped taps stay ZERO, which
+    // contributes nothing to Delta - the same thing the per-tap skip did.
+    FillChar(FKanBasisVec[0], FVectorSize * csNeuralFloatSize, 0);
+    for fy := 0 to featYMax do
+    begin
+      prevY := oy * FStride + fy - FPadding;
+      if (prevY < 0) or (prevY >= prevSizeY) then continue;
+      for fx := 0 to featXMax do
+      begin
+        prevX := ox * FStride + fx - FPadding;
+        if (prevX < 0) or (prevX >= prevSizeX) then continue;
+        // Rule #11: input row base invariant across ic; #12: carry base.
+        prevBase := PrevOut.GetRawPos(prevX, prevY);
+        tap0 := (fy * FFeatureSizeX + fx) * FInDepth;
+        base := tap0 * FCoeffsPerEdge;
+        for ic := 0 to inDepthMax do
+        begin
+          xv := PrevOut.FData[prevBase + ic];
+          u := pcr_tanhf(xv);
+          if FBasis = csKANBasisBSpline then
+          begin
+            EvalBSpline(u, false);
+            Move(FBVal[0], FKanBasisVec[base], FCoeffsPerEdge * csNeuralFloatSize);
+          end
+          else
+          begin
+            FKanBasisVec[base] := 1;
+            if FDegree >= 1 then FKanBasisVec[base + 1] := u;
+            for kk := 2 to FDegree do
+              FKanBasisVec[base + kk] :=
+                2 * u * FKanBasisVec[base + kk - 1] - FKanBasisVec[base + kk - 2];
+          end;
+          Inc(base, FCoeffsPerEdge);
+        end;
+      end;
+    end;
+    // Delta and the basis share the [tap*C + k] layout, so each output channel
+    // is ONE length-FVectorSize MulAdd instead of Taps separate length-C calls.
     for oo := 0 to outDepthMax do
     begin
       gy := FOutputError.FData[errBase + oo];
       localErr := -FLearningRate * gy;
       if localErr = 0.0 then continue;
       WDelta := FArrNeurons[oo].FDelta;
-      for fy := 0 to featYMax do
-      begin
-        prevY := oy * FStride + fy - FPadding;
-        if (prevY < 0) or (prevY >= prevSizeY) then continue;
-        for fx := 0 to featXMax do
-        begin
-          prevX := ox * FStride + fx - FPadding;
-          if (prevX < 0) or (prevX >= prevSizeX) then continue;
-          // Rule #11: input row base invariant across ic; #12: carry base.
-          prevBase := PrevOut.GetRawPos(prevX, prevY);
-          tap0 := (fy * FFeatureSizeX + fx) * FInDepth;
-          base := tap0 * FCoeffsPerEdge;
-          for ic := 0 to inDepthMax do
-          begin
-            xv := PrevOut.FData[prevBase + ic];
-            u := pcr_tanhf(xv);
-            if FBasis = csKANBasisBSpline then
-            begin
-              EvalBSpline(u, false);
-              TNNetVolume.MulAdd(@WDelta.FData[base], @FBVal[0], localErr, FCoeffsPerEdge);
-            end
-            else
-            begin
-              FT[0] := 1;
-              if FDegree >= 1 then FT[1] := u;
-              for kk := 2 to FDegree do FT[kk] := 2 * u * FT[kk - 1] - FT[kk - 2];
-              TNNetVolume.MulAdd(@WDelta.FData[base], @FT[0], localErr, FCoeffsPerEdge);
-            end;
-            Inc(base, FCoeffsPerEdge);
-          end;
-        end;
-      end;
+      TNNetVolume.MulAdd(@WDelta.FData[0], @FKanBasisVec[0], localErr, FVectorSize);
     end;
   end;
   if not FBatchUpdate then
