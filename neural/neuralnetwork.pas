@@ -1493,7 +1493,7 @@ type
   TNNetSoftPlus = class(TNNetReLUBase)
   {$IFDEF AVXANY}
   private
-    FExpPos, FExpNeg: array of TNeuralFloat; // persistent, lazily-sized scratch for AVXExp (rule #17)
+    FExpPos: array of TNeuralFloat; // persistent, lazily-sized scratch for AVXExp (rule #17)
   {$ENDIF}
   public
     procedure Compute(); override;
@@ -44974,7 +44974,7 @@ var
   OutputCnt: integer;
   StartTime: double;
   x: TNeuralFloat;
-  softplusVal: TNeuralFloat;
+  ExpX: TNeuralFloat;
   {$IFDEF AVXANY}
   Size: integer;
   {$ENDIF}
@@ -44984,18 +44984,19 @@ begin
   SizeM1 := LocalPrevOutput.Size - 1;
 
   {$IFDEF AVXANY}
-  // Depth-contiguous elementwise pass. The two needed exponentials -- exp(x)
-  // for the output's stable mid-branch ln(1+exp(x)) and exp(-x) for the sigmoid
-  // derivative 1/(1+exp(-x)) -- are each batched 8-wide via AVXExp (the same
-  // vector exp the GLU family / PointwiseSoftMax use) into scratch buffers. The
-  // finishing scalar pass selects the numerically-stable large-/small-x branches
-  // per element exactly as the scalar code below; ExpBuf entries are ignored on
-  // those saturated branches, so any AVXExp saturation there is irrelevant.
+  // Depth-contiguous elementwise pass. One exponential serves both halves:
+  // exp(x) feeds the output's stable mid-branch ln(1+exp(x)) and the sigmoid
+  // derivative, since 1/(1+exp(-x)) = exp(x)/(1+exp(x)). It is batched 8-wide
+  // via AVXExp (the same vector exp the GLU family / PointwiseSoftMax use) into
+  // a scratch buffer. The finishing scalar pass selects the numerically-stable
+  // large-/small-x branches per element exactly as the scalar code below;
+  // FExpPos entries are ignored on those saturated branches, so any AVXExp
+  // saturation there is irrelevant.
   Size := LocalPrevOutput.Size;
   if Size > 0 then
   begin
     if Length(FExpPos) <> Size then SetLength(FExpPos, Size); // rule #17: lazy amortized resize
-    // Clamp the exp arguments into [-88, 88] so the AVXExp scalar tail (plain
+    // Clamp the exp argument into [-88, 88] so the AVXExp scalar tail (plain
     // pcr_expf, no internal clamp) never overflows / raises a hardware FP
     // exception on extreme inputs (e.g. x = +/-1e30). The large-|x| outputs are
     // governed by the numerically-stable scalar branches below, which ignore
@@ -45003,55 +45004,38 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      if x > 88 then FExpPos[OutputCnt] := -88
-      else if x < -88 then FExpPos[OutputCnt] := 88
-      else FExpPos[OutputCnt] := -x;
+      if x > 88 then FExpPos[OutputCnt] := 88
+      else if x < -88 then FExpPos[OutputCnt] := -88
+      else FExpPos[OutputCnt] := x;
     end;
+    TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpPos[0]), TNeuralFloatArrPtr(@FExpPos[0]), Size);
     if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
     begin
-      if Length(FExpNeg) <> Size then SetLength(FExpNeg, Size); // rule #17: lazy amortized resize
-      // FExpNeg := exp(-x) before FExpPos := exp(x), since FExpPos currently holds -x.
-      TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpNeg[0]), TNeuralFloatArrPtr(@FExpPos[0]), Size);
-      // FExpPos := exp(clamp(x)). Refill with the clamped +x argument.
       for OutputCnt := 0 to SizeM1 do
       begin
         x := LocalPrevOutput.FData[OutputCnt];
-        if x > 88 then FExpPos[OutputCnt] := 88
-        else if x < -88 then FExpPos[OutputCnt] := -88
-        else FExpPos[OutputCnt] := x;
-      end;
-      TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpPos[0]), TNeuralFloatArrPtr(@FExpPos[0]), Size);
-      for OutputCnt := 0 to SizeM1 do
-      begin
-        x := LocalPrevOutput.FData[OutputCnt];
-        // Numerically stable softplus: for large x, ln(1+exp(x)) ~= x
+        ExpX := FExpPos[OutputCnt];
+        // Numerically stable softplus: for large x, ln(1+exp(x)) ~= x. The
+        // derivative is the sigmoid; for very large x it saturates to 1 and for
+        // very negative x it degenerates to exp(x).
         if x > 30 then
-          FOutput.FData[OutputCnt] := x
+        begin
+          FOutput.FData[OutputCnt] := x;
+          FOutputErrorDeriv.FData[OutputCnt] := 1.0;
+        end
         else
-          FOutput.FData[OutputCnt] := pcr_log1pf(FExpPos[OutputCnt]);
-        // Derivative of softplus is the sigmoid function.
-        // Numerically stable: for very large x, sigmoid(x) ~= 1; for very
-        // negative x, sigmoid(x) = 1/(1+exp(-x)) ~= exp(x).
-        if x > 30 then
-          FOutputErrorDeriv.FData[OutputCnt] := 1.0
-        else if x < -30 then
-          FOutputErrorDeriv.FData[OutputCnt] := FExpPos[OutputCnt]
-        else
-          FOutputErrorDeriv.FData[OutputCnt] := 1 / (1 + FExpNeg[OutputCnt]);
+        begin
+          FOutput.FData[OutputCnt] := pcr_log1pf(ExpX);
+          if x < -30 then
+            FOutputErrorDeriv.FData[OutputCnt] := ExpX
+          else
+            FOutputErrorDeriv.FData[OutputCnt] := ExpX / (1 + ExpX);
+        end;
       end;
     end
     else
     begin
-      // can't calculate error on input layers. FExpPos currently holds -clamp(x);
-      // refill with the clamped +x argument before exponentiating.
-      for OutputCnt := 0 to SizeM1 do
-      begin
-        x := LocalPrevOutput.FData[OutputCnt];
-        if x > 88 then FExpPos[OutputCnt] := 88
-        else if x < -88 then FExpPos[OutputCnt] := -88
-        else FExpPos[OutputCnt] := x;
-      end;
-      TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpPos[0]), TNeuralFloatArrPtr(@FExpPos[0]), Size);
+      // can't calculate error on input layers.
       for OutputCnt := 0 to SizeM1 do
       begin
         x := LocalPrevOutput.FData[OutputCnt];
@@ -45068,22 +45052,26 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      // Numerically stable softplus: for large x, ln(1+exp(x)) ~= x
+      // Numerically stable softplus: for large x, ln(1+exp(x)) ~= x, and the
+      // sigmoid derivative saturates to 1 -- no exponential needed at all.
       if x > 30 then
-        softplusVal := x
+      begin
+        FOutput.FData[OutputCnt] := x;
+        FOutputErrorDeriv.FData[OutputCnt] := 1.0;
+      end
       else
-        softplusVal := pcr_log1pf(NeuralExp(x));
-      FOutput.FData[OutputCnt] := softplusVal;
-      // Derivative of softplus is the sigmoid function.
-      // Numerically stable: for very large x, sigmoid(x) ~= 1; for very
-      // negative x, sigmoid(x) = 1/(1+exp(-x)) ~= exp(x). Guards against
-      // EOverflow when exp(-x) would overflow (e.g. x = -1e3).
-      if x > 30 then
-        FOutputErrorDeriv.FData[OutputCnt] := 1.0
-      else if x < -30 then
-        FOutputErrorDeriv.FData[OutputCnt] := NeuralExp(x)
-      else
-        FOutputErrorDeriv.FData[OutputCnt] := 1 / (1 + NeuralExp(-x));
+      begin
+        // One exp(x) serves both halves: the output ln(1+exp(x)) and the
+        // sigmoid derivative 1/(1+exp(-x)) = exp(x)/(1+exp(x)). Using exp(x)
+        // rather than exp(-x) also guards against EOverflow for very negative
+        // x, where the sigmoid degenerates to exp(x).
+        ExpX := NeuralExp(x);
+        FOutput.FData[OutputCnt] := pcr_log1pf(ExpX);
+        if x < -30 then
+          FOutputErrorDeriv.FData[OutputCnt] := ExpX
+        else
+          FOutputErrorDeriv.FData[OutputCnt] := ExpX / (1 + ExpX);
+      end;
     end;
   end
   else
@@ -45143,6 +45131,8 @@ var
   Beta, InvBeta, x, BetaX: TNeuralFloat;
   {$IFDEF AVXANY}
   Size: integer;
+  {$ELSE}
+  ExpBetaX: TNeuralFloat;
   {$ENDIF}
 begin
   StartTime := Now();
@@ -45211,18 +45201,25 @@ begin
     begin
       x := LocalPrevOutput.FData[OutputCnt];
       BetaX := Beta * x;
-      // Numerically stable softplus: for large beta*x, ln(1+exp(z))/beta ~= x.
+      // Numerically stable softplus: for large beta*x, ln(1+exp(z))/beta ~= x,
+      // and the sigmoid derivative saturates to 1 -- no exponential needed.
       if BetaX > 30 then
-        FOutput.FData[OutputCnt] := x
+      begin
+        FOutput.FData[OutputCnt] := x;
+        FOutputErrorDeriv.FData[OutputCnt] := 1.0;
+      end
       else
-        FOutput.FData[OutputCnt] := InvBeta * pcr_logf(1 + NeuralExp(BetaX));
-      // Derivative is sigmoid(beta*x). Sign-branch guards Exp overflow.
-      if BetaX > 30 then
-        FOutputErrorDeriv.FData[OutputCnt] := 1.0
-      else if BetaX < -30 then
-        FOutputErrorDeriv.FData[OutputCnt] := NeuralExp(BetaX)
-      else
-        FOutputErrorDeriv.FData[OutputCnt] := 1 / (1 + NeuralExp(-BetaX));
+      begin
+        // One exp(beta*x) serves both halves, as the AVX path above already
+        // does: 1/(1+e^-z) = e^z/(1+e^z). Using e^z rather than e^-z also
+        // guards Exp overflow for very negative z, where sigmoid ~= e^z.
+        ExpBetaX := NeuralExp(BetaX);
+        FOutput.FData[OutputCnt] := InvBeta * pcr_logf(1 + ExpBetaX);
+        if BetaX < -30 then
+          FOutputErrorDeriv.FData[OutputCnt] := ExpBetaX
+        else
+          FOutputErrorDeriv.FData[OutputCnt] := ExpBetaX / (1 + ExpBetaX);
+      end;
     end;
   end
   else
