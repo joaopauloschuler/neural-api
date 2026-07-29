@@ -44660,26 +44660,53 @@ var
   outputVal: TNeuralFloat;
   omega: TNeuralFloat;
   delta: TNeuralFloat;
+  HasDeriv: boolean;
 begin
   StartTime := Now();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
+  HasDeriv := (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size);
   // Two-pass: fill FOutput with softplus(x), vectorize tanh in place
   // (Tanh), then a scalar finishing pass reads tanh(softplus(x)) back.
-  for OutputCnt := 0 to SizeM1 do
+  // When the derivative pass will run, the exp(x) the first pass already
+  // computed is parked in FOutputErrorDeriv (sized to match FOutput exactly
+  // under HasDeriv) so the second pass reads it back instead of recomputing it;
+  // each slot is read before it is overwritten with the final derivative.
+  if HasDeriv then
   begin
-    x := LocalPrevOutput.FData[OutputCnt];
-    // Numerically-stable softplus; tanh saturates correctly at both extremes.
-    if x > 20 then
-      FOutput.FData[OutputCnt] := x
-    else if x < -20 then
-      FOutput.FData[OutputCnt] := NeuralExp(x)
-    else
-      FOutput.FData[OutputCnt] := pcr_log1pf(NeuralExp(x));
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      // Numerically-stable softplus; tanh saturates correctly at both extremes.
+      if x > 20 then
+        FOutput.FData[OutputCnt] := x
+      else
+      begin
+        expVal := NeuralExp(x);
+        FOutputErrorDeriv.FData[OutputCnt] := expVal;
+        if x < -20 then
+          FOutput.FData[OutputCnt] := expVal
+        else
+          FOutput.FData[OutputCnt] := pcr_log1pf(expVal);
+      end;
+    end;
+  end
+  else
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 20 then
+        FOutput.FData[OutputCnt] := x
+      else if x < -20 then
+        FOutput.FData[OutputCnt] := NeuralExp(x)
+      else
+        FOutput.FData[OutputCnt] := pcr_log1pf(NeuralExp(x));
+    end;
   end;
   TNNetVolume.Tanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
-  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  if HasDeriv then
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
@@ -44700,7 +44727,7 @@ begin
         outputVal := x * tanhSP;
         FOutput.FData[OutputCnt] := outputVal;
         // Mish'(x) = tanh(sp) + x * sech^2(sp) * sigmoid(x); sigmoid(x)=omega/delta.
-        expVal := NeuralExp(x);
+        expVal := FOutputErrorDeriv.FData[OutputCnt];   // exp(x) parked by pass 1
         omega := expVal;
         delta := 1 + expVal;
         FOutputErrorDeriv.FData[OutputCnt] := tanhSP + x * (1 - tanhSP * tanhSP) * omega / delta;
@@ -44836,26 +44863,53 @@ var
   OutputCnt: integer;
   StartTime: double;
   x, sp, sig, erfSp, twoOverSqrtPi: TNeuralFloat;
+  HasDeriv: boolean;
 begin
   StartTime := Now();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   twoOverSqrtPi := 2.0 / Sqrt(Pi);
 
+  HasDeriv := (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size);
   // Two-pass: fill FOutput with softplus(x), vectorize erf in place (Erf),
   // then a scalar finishing pass reads erf(softplus(x)) back from FOutput.
-  for OutputCnt := 0 to SizeM1 do
+  // FOutput itself is consumed by Erf, so when the derivative pass will run the
+  // first pass parks softplus(x) in FOutputErrorDeriv (sized to match FOutput
+  // exactly under HasDeriv) as well; the second pass reads each slot back
+  // before overwriting it with the final derivative, halving the mid-band
+  // transcendental count.
+  if HasDeriv then
   begin
-    x := LocalPrevOutput.FData[OutputCnt];
-    if x > 30 then
-      FOutput.FData[OutputCnt] := x
-    else if x < -30 then
-      FOutput.FData[OutputCnt] := NeuralExp(x)
-    else
-      FOutput.FData[OutputCnt] := pcr_log1pf(NeuralExp(x));
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 30 then
+        FOutput.FData[OutputCnt] := x
+      else if x < -30 then
+        FOutput.FData[OutputCnt] := NeuralExp(x)
+      else
+      begin
+        sp := pcr_log1pf(NeuralExp(x));
+        FOutputErrorDeriv.FData[OutputCnt] := sp;
+        FOutput.FData[OutputCnt] := sp;
+      end;
+    end;
+  end
+  else
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 30 then
+        FOutput.FData[OutputCnt] := x
+      else if x < -30 then
+        FOutput.FData[OutputCnt] := NeuralExp(x)
+      else
+        FOutput.FData[OutputCnt] := pcr_log1pf(NeuralExp(x));
+    end;
   end;
   TNNetVolume.Erf(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
-  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  if HasDeriv then
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
@@ -44873,7 +44927,7 @@ begin
       end
       else
       begin
-        sp := pcr_log1pf(NeuralExp(x));
+        sp := FOutputErrorDeriv.FData[OutputCnt];   // softplus(x) parked by pass 1
         sig := 1.0 / (1.0 + NeuralExp(-x));
         FOutput.FData[OutputCnt] := x * erfSp;
         // dy/dx = erf(sp) + x * (2/sqrt(pi)) * exp(-sp^2) * sigmoid(x)
