@@ -1924,8 +1924,8 @@ type
     FNN: TNNet;
     FKernel: TNeuralKernel;
     FKernelName: string;
-    constructor CreateShared(NN: TNNet; const pKernelName: string);
   public
+    constructor Create(NN: TNNet; const pKernelName: string);
     destructor Destroy(); override;
   end;
 
@@ -35408,7 +35408,7 @@ end;
 {$IFDEF OpenCL}
 { TNNetKernelCL }
 
-constructor TNNetKernelCL.CreateShared(NN: TNNet; const pKernelName: string);
+constructor TNNetKernelCL.Create(NN: TNNet; const pKernelName: string);
 begin
   inherited Create();
   FNN := NN;
@@ -35426,7 +35426,7 @@ end;
 
 constructor TNNetBilinearGatherCL.Create(NN: TNNet);
 begin
-  inherited CreateShared(NN, 'cai_bilinear_gather');
+  inherited Create(NN, 'cai_bilinear_gather');
   FSrcBuf    := TNNetVolume.Create();
   FCornerBuf := TNNetVolume.Create();
   FWeightBuf := TNNetVolume.Create();
@@ -35477,7 +35477,7 @@ end;
 
 constructor TNNetPixelShuffleCL.Create(NN: TNNet);
 begin
-  inherited CreateShared(NN, 'cai_pixel_shuffle');
+  inherited Create(NN, 'cai_pixel_shuffle');
 end;
 
 destructor TNNetPixelShuffleCL.Destroy();
@@ -35513,7 +35513,7 @@ end;
 
 constructor TNNetBicubicGatherCL.Create(NN: TNNet);
 begin
-  inherited CreateShared(NN, 'cai_bicubic_gather');
+  inherited Create(NN, 'cai_bicubic_gather');
 end;
 
 destructor TNNetBicubicGatherCL.Destroy();
@@ -35553,7 +35553,7 @@ end;
 
 constructor TNNetPixelShuffleScatterCL.Create(NN: TNNet);
 begin
-  inherited CreateShared(NN, 'cai_pixel_shuffle_scatter');
+  inherited Create(NN, 'cai_pixel_shuffle_scatter');
 end;
 
 destructor TNNetPixelShuffleScatterCL.Destroy();
@@ -35589,7 +35589,7 @@ end;
 
 constructor TNNetBicubicScatterCL.Create(NN: TNNet);
 begin
-  inherited CreateShared(NN, 'cai_bicubic_scatter');
+  inherited Create(NN, 'cai_bicubic_scatter');
 end;
 
 destructor TNNetBicubicScatterCL.Destroy();
@@ -35632,7 +35632,7 @@ end;
 
 constructor TNNetTokenNormCL.Create(NN: TNNet);
 begin
-  inherited CreateShared(NN, 'cai_token_norm');
+  inherited Create(NN, 'cai_token_norm');
   FVolKernel := NN.GetKernel('cai_volume_norm');
   FXBuf := TNNetVolume.Create();
   FYBuf := TNNetVolume.Create();
@@ -35730,7 +35730,7 @@ end;
 
 constructor TNNetGroupNormCL.Create(NN: TNNet);
 begin
-  inherited CreateShared(NN, 'cai_group_norm');
+  inherited Create(NN, 'cai_group_norm');
 end;
 
 destructor TNNetGroupNormCL.Destroy();
@@ -35782,7 +35782,7 @@ end;
 
 constructor TNNetL2NormCL.Create(NN: TNNet);
 begin
-  inherited CreateShared(NN, 'cai_l2norm_perdepth');
+  inherited Create(NN, 'cai_l2norm_perdepth');
 end;
 
 destructor TNNetL2NormCL.Destroy();
@@ -35822,7 +35822,7 @@ end;
 
 constructor TNNetPool2DCL.Create(NN: TNNet);
 begin
-  inherited CreateShared(NN, 'cai_pool2d');
+  inherited Create(NN, 'cai_pool2d');
 end;
 
 destructor TNNetPool2DCL.Destroy();
@@ -35867,7 +35867,7 @@ end;
 
 constructor TNNetDepthwiseConvCL.Create(NN: TNNet);
 begin
-  inherited CreateShared(NN, 'cai_depthwise_conv2d');
+  inherited Create(NN, 'cai_depthwise_conv2d');
 end;
 
 destructor TNNetDepthwiseConvCL.Destroy();
@@ -35914,7 +35914,7 @@ end;
 
 constructor TNNetDepthwiseConv1DCL.Create(NN: TNNet);
 begin
-  inherited CreateShared(NN, 'cai_depthwise_conv1d');
+  inherited Create(NN, 'cai_depthwise_conv1d');
 end;
 
 destructor TNNetDepthwiseConv1DCL.Destroy();
@@ -35960,7 +35960,7 @@ end;
 
 constructor TNNetSoftMaxCL.Create(NN: TNNet);
 begin
-  inherited CreateShared(NN, 'cai_softmax');
+  inherited Create(NN, 'cai_softmax');
 end;
 
 destructor TNNetSoftMaxCL.Destroy();
@@ -35998,7 +35998,7 @@ end;
 
 constructor TNNetRoPECL.Create(NN: TNNet);
 begin
-  inherited CreateShared(NN, 'cai_rope');
+  inherited Create(NN, 'cai_rope');
   FTheta := TNNetVolume.Create();
 end;
 
@@ -36051,7 +36051,7 @@ end;
 
 constructor TNNetMRoPECL.Create(NN: TNNet);
 begin
-  inherited CreateShared(NN, 'cai_mrope');
+  inherited Create(NN, 'cai_mrope');
   FAngle := TNNetVolume.Create();
 end;
 
@@ -36098,7 +36098,7 @@ end;
 
 constructor TNNetEmbeddingCL.Create(NN: TNNet);
 begin
-  inherited CreateShared(NN, 'cai_embedding_gather');
+  inherited Create(NN, 'cai_embedding_gather');
   FWeightCached := false;
 end;
 
@@ -36154,7 +36154,7 @@ end;
 
 constructor TNNetGLUGateCL.Create(NN: TNNet);
 begin
-  inherited CreateShared(NN, 'cai_glu_gate');
+  inherited Create(NN, 'cai_glu_gate');
 end;
 
 destructor TNNetGLUGateCL.Destroy();
