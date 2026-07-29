@@ -44900,7 +44900,7 @@ var
   Frames, FramesM1, Stride, Pad, Km: integer;
   Residual, NormP: TMimiDblArr;
   cbk, best: integer;
-  pn, dot, BestSim: double;
+  dot, BestSim: double;
   CBN: TMimiDblArr;             // reference bind of FCodebookNorms[q]
   WIn, BIn, WOut, BOut, CBData: TNeuralFloatDynArr; // #9 per-q field binds
   CbSize, d, CdM1: integer;
@@ -44970,14 +44970,12 @@ begin
         NormP[d] := dot;
         Inc(wBase, HiddenDim);
       end;
-      // L2-normalize the projected latent.
-      pn := 0;
-      for d := 0 to CdM1 do pn := pn + Sqr(NormP[d]);
-      pn := Sqrt(pn);
-      if pn = 0 then pn := 1e-12;
-      for d := 0 to CdM1 do NormP[d] := NormP[d] / pn;
-      // argmax cosine = argmin L2 of the normalized vectors against the
-      // normalized codebook (both unit-norm).
+      // argmax cosine against the pre-normalized codebook. #14: the projected
+      // latent is NOT L2-normalized here - its norm is one positive constant
+      // shared by every candidate, so it cannot move the argmax, and the only
+      // consumer of the score is this comparison (an all-zero latent scores 0
+      // against every row and still selects row 0, exactly as before). That
+      // drops a sum of squares, a Sqrt and Cd divides per (frame, quantizer).
       CbSize := FCodebooks[q].Rows;
       CbSizeM1 := CbSize - 1;
       best := 0; BestSim := -1e30;
