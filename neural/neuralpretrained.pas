@@ -52300,16 +52300,31 @@ var
       ImportError('Nemotron-H import: MoE expert slab "' + TName +
         '" must have shape [' + IntToStr(NumExperts) + ', ' + IntToStr(OutDim) +
         ', ' + IntToStr(InDim) + '], got ' + Reader.ShapeAsString(TName));
-    Reader.LoadTensorFlat(TName, Tmp);
+    // Stream only this expert's [OutDim, InDim] row block. LoadTensorFlat
+    // would read - and BF16/F16-decode - the whole [NumExperts, OutDim,
+    // InDim] slab once per expert, so the routed experts of one block cost
+    // NumExperts^2 row decodes and a slab-sized transient peak.
+    if Reader.CanStreamTensorRows(TName) then
+    begin
+      Reader.LoadTensorRowsFlat(TName, ExpertIdx * OutDim, OutDim, InDim, Tmp);
+      ExpertBase := 0;
+    end
+    else
+    begin
+      Reader.LoadTensorFlat(TName, Tmp);
+      ExpertBase := ExpertIdx * OutDim * InDim;
+    end;
     EnsureWritableImportWeights(Layer);
-    ExpertBase := ExpertIdx * OutDim * InDim;
     OutDimM1 := OutDim - 1;
-    InDimM1 := InDim - 1;
     for oo := 0 to OutDimM1 do
     begin
-      for ii := 0 to InDimM1 do
-        Layer.FArrNeurons[oo].Weights.FData[ii] :=
-          Tmp.FData[ExpertBase + oo * InDim + ii];
+      WV := Layer.FArrNeurons[oo].Weights;
+      if WV.Size <> InDim then
+        ImportError('Nemotron-H import: internal error - neuron ' +
+          IntToStr(oo) + ' for "' + TName + '" has ' + IntToStr(WV.Size) +
+          ' weights, expected ' + IntToStr(InDim) + '.');
+      Move(Tmp.FData[ExpertBase], WV.FData[0], InDim * csNeuralFloatSize);
+      Inc(ExpertBase, InDim);
       Layer.FArrNeurons[oo].BiasWeight := 0;
     end;
     Layer.FlushWeightCache();
@@ -54682,22 +54697,24 @@ var
   procedure LoadRows(Layer: TNNetLayer; const W: TNNetVolume;
     InDim, SrcRowBase, RowCount, DstBase: integer);
   var
-    RowCnt, ColCnt, RowCountM1, InDimM1: integer;
+    RowCnt, RowCountM1, SrcPos: integer;
+    Neuron: TNNetNeuron;
+    WV: TNNetVolume;
   begin
     EnsureWritableImportWeights(Layer);
     RowCountM1 := RowCount - 1;
-    InDimM1 := InDim - 1;
+    SrcPos := SrcRowBase * InDim;
     for RowCnt := 0 to RowCountM1 do
     begin
-      if Layer.FArrNeurons[DstBase + RowCnt].Weights.Size <> InDim then
+      Neuron := Layer.FArrNeurons[DstBase + RowCnt];
+      WV := Neuron.Weights;
+      if WV.Size <> InDim then
         ImportError('DeepSeek-V2 import: internal error - neuron ' +
-          IntToStr(DstBase + RowCnt) + ' has ' +
-          IntToStr(Layer.FArrNeurons[DstBase + RowCnt].Weights.Size) +
+          IntToStr(DstBase + RowCnt) + ' has ' + IntToStr(WV.Size) +
           ' weights, expected ' + IntToStr(InDim) + '.');
-      for ColCnt := 0 to InDimM1 do
-        Layer.FArrNeurons[DstBase + RowCnt].Weights.FData[ColCnt] :=
-          W.FData[(SrcRowBase + RowCnt) * InDim + ColCnt];
-      Layer.FArrNeurons[DstBase + RowCnt].BiasWeight := 0;
+      Move(W.FData[SrcPos], WV.FData[0], InDim * csNeuralFloatSize);
+      Inc(SrcPos, InDim);
+      Neuron.BiasWeight := 0;
     end;
   end;
 
