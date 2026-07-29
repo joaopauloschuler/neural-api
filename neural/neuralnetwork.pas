@@ -16471,6 +16471,7 @@ type
       // construction path with no importer changes. Coded by Claude (AI).
       FBuildQuantInt8: boolean;
       {$IFDEF OpenCL}
+      FSharedKernel: boolean;
       FDotProductKernel: TDotProductKernel;
       // Single net-wide cai_activation kernel, created in EnableOpenCL beside
       // FDotProductKernel and SHARED by every elementwise-activation layer -
@@ -18398,7 +18399,7 @@ type
 
       {$IFDEF OpenCL}
       procedure DisableOpenCL();
-      procedure EnableOpenCL(platform_id: cl_platform_id; device_id: cl_device_id);
+      procedure EnableOpenCL(platform_id: cl_platform_id; device_id: cl_device_id; pSharedKernel:boolean = true);
       // Returns the one net-wide helper kernel bound to the given neural.cl entry
       // point, building it lazily against FDotProductKernel's already-compiled
       // program on first request and caching it. Layers' *CL helpers borrow this
@@ -123430,11 +123431,12 @@ begin
 end;
 
 procedure TNNet.EnableOpenCL(platform_id: cl_platform_id;
-  device_id: cl_device_id);
+  device_id: cl_device_id; pSharedKernel:boolean = true);
 var
   LayerCnt: integer;
   LastLayerIdx: integer;
 begin
+  FSharedKernel := pSharedKernel;
   FDotProductKernel := TDotProductCL.Create(platform_id, device_id, 'cai_dot_product', {pHideMessages}true);
   // Guard: if neural.cl could not be found/built, the root program never compiled
   // and FDotProductKernel.Context is nil. Enabling the device path anyway makes
