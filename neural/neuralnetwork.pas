@@ -479,8 +479,9 @@ type
       FForceOpenCL: boolean; // test/diagnostic override: bypass the size verdict
       FDotCL: TDotProductSharedKernel;
       // The one cai_dot_product kernel lives on the owning net (TNNet.FDotProductKernel);
-      // layers reach it through FNN rather than caching a redundant per-layer alias -
-      // the same single-source-of-truth model as TNNet.FActivationKernel. (Coded by Claude (AI).)
+      // Every other net-wide entry point follows the TNNet.SharedKernel pattern: the
+      // net holds the single handle, the layer borrows it and never frees it.
+      // (Coded by Claude (AI).)
       {$ENDIF}
 
       procedure ComputeL2Decay(); virtual;
@@ -1015,10 +1016,16 @@ type
       // Coded by Claude (AI).
       FActivationOpcode: integer;
       {$IFDEF OpenCL}
-      // Persistent in-place device buffer for the shared cai_activation kernel
-      // (the kernel itself lives once on the owning TNNet). Allocated ONCE in
-      // EnableOpenCL and reused by every forward - like the convolution layers,
-      // no forward pass touches the OpenCL allocator. Freed in Destroy.
+      // Net-wide cai_activation handle, borrowed from FNN.SharedKernel in
+      // EnableOpenCL and shared by every elementwise-activation layer; the net
+      // owns and frees it. Non-nil only on a layer that opted in
+      // (FActivationOpcode <> csActNone) and reached a net with the device path
+      // enabled - WillOpenCL gates on it.
+      FActivationKernel: TNeuralKernel;
+      // Persistent in-place device buffer for the shared cai_activation kernel.
+      // Allocated ONCE in EnableOpenCL and reused by every forward - like the
+      // convolution layers, no forward pass touches the OpenCL allocator. Unlike
+      // the kernel above this buffer IS per-layer and IS freed in Destroy.
       FActivationBuffer: cl_mem;
       FActivationBufSize: integer; // element capacity of FActivationBuffer
       // Unconditionally runs the net's shared cai_activation kernel over
@@ -16473,12 +16480,6 @@ type
       {$IFDEF OpenCL}
       FHasSharedKernel: boolean;
       FDotProductKernel: TDotProductKernel;
-      // Single net-wide cai_activation kernel, created in EnableOpenCL beside
-      // FDotProductKernel and SHARED by every elementwise-activation layer -
-      // exactly as FDotProductKernel is the one cai_dot_product kernel shared by
-      // all conv/dense layers. Per-layer state (the device buffer) lives on each
-      // layer. Freed in Destroy. Coded by Claude (AI).
-      FActivationKernel: TNeuralKernel;
       // Net-wide cache of borrowed-program helper kernels, one TNeuralKernel per
       // distinct neural.cl entry point (cai_token_norm, cai_group_norm, ...),
       // SHARED by every layer of that type instead of one handle per layer
@@ -95940,6 +95941,7 @@ begin
   inherited Create();
   FActivationOpcode := csActNone;
   {$IFDEF OpenCL}
+  FActivationKernel := nil;
   FActivationBuffer := nil;
   FActivationBufSize := 0;
   {$ENDIF}
@@ -95963,6 +95965,7 @@ begin
   // convolution layers confine allocation to EnableOpenCL/PrepareForCompute.
   if FActivationOpcode <> csActNone then
   begin
+    if Assigned(FNN) then FActivationKernel := FNN.SharedKernel('cai_activation');
     if Assigned(FActivationBuffer) and (FActivationBufSize <> FOutput.Size) then
     begin
       clReleaseMemObject(FActivationBuffer);
@@ -95980,7 +95983,7 @@ end;
 function TNNetIdentity.WillOpenCL(): boolean;
 begin
   Result := (FActivationOpcode <> csActNone) and Assigned(FActivationBuffer)
-            and Assigned(FNN) and Assigned(FNN.FActivationKernel) and FHasOpenCL
+            and Assigned(FActivationKernel) and FHasOpenCL
             and (FShouldOpenCL or FForceOpenCL);
 end;
 
@@ -95995,7 +95998,7 @@ begin
   // args are (re)set each call because the kernel is shared in turn by every
   // activation layer (as conv resets args on the shared GEMM kernel). The
   // WillOpenCL() gate and FForwardGPUCnt bump live in the caller (Compute).
-  Kern := FNN.FActivationKernel;
+  Kern := FActivationKernel;
   k := Kern.Kernel;
   iSize := FPrevLayer.FOutput.Size;
   iOpcode := FActivationOpcode;
@@ -101854,7 +101857,6 @@ begin
   FIsTrainable := true;
   {$IFDEF OpenCL}
   FDotProductKernel := nil;
-  FActivationKernel := nil;
   FSharedKernels := nil;
   {$ENDIF}
 end;
@@ -101870,7 +101872,6 @@ begin
   // Free the shared helper kernels BEFORE FDotProductKernel: they borrowed the
   // latter's program/context (CreateFromProgram) and only own their own kernel
   // handles.
-  if FActivationKernel <> nil then FActivationKernel.Free;
   if Assigned(FSharedKernels) then
   begin
     SharedKernelsCntM1 := FSharedKernels.Count - 1;
@@ -123453,10 +123454,6 @@ begin
     FreeAndNil(FDotProductKernel);
     exit;
   end;
-  // One net-wide cai_activation kernel, bound against the same compiled program
-  // and SHARED by every elementwise-activation layer (each keeps only its own
-  // device buffer) - the same "one shared kernel" model as FDotProductKernel.
-  FActivationKernel := TNeuralKernel.CreateFromProgram(FDotProductKernel, 'cai_activation');
   LastLayerIdx := GetLastLayerIdx();
   for LayerCnt := 0 to LastLayerIdx do
   begin
