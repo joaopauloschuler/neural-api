@@ -33,6 +33,8 @@ type
     procedure TestVolumeAddSubValueParity;
     procedure TestVolumeRankOneUpdateRowParity;
     procedure TestVolumeAdamDeltaParity;
+    procedure TestVolumeAdafactorDeltaParity;
+    procedure TestVolumeClampAbsParity;
     procedure TestVolumeFlip;
     procedure TestVolumeClassification;
     procedure TestVolumeSoftMax;
@@ -919,6 +921,169 @@ begin
       D.Free; M.Free; V.Free;
       RefD.Free; RefM.Free; RefV.Free; Scratch.Free;
     end;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeAdafactorDeltaParity;
+// AdafactorDelta fuses the per-element sqrt/divide loop that
+// TNNetNeuron.CalcAdafactorDelta runs on its unfactored branch (every fully
+// connected / embedding layer). The reference here is that loop written out
+// element by element in the SAME operation order, so the assertion is
+// BIT-identity at tolerance 0.0: neither path uses FMA and every intermediate
+// is a TNeuralFloat, so both round at the same points. Five consecutive steps
+// let the second moment accumulate, so a kernel that got the recurrence wrong
+// could not hide behind one step. Sizes straddle the 8-element block and the
+// scalar tail; one delta slot per row is an exact zero.
+const
+  Sizes: array[0..8] of integer = (1, 3, 7, 8, 9, 16, 31, 64, 517);
+  cB2 = 0.999;
+  cEps = 1e-8;
+  cLR = 0.01;
+  cSteps = 5;
+var
+  D, V, RefD, RefV: TNNetVolume;
+  SI, K, N, Step: integer;
+  invNegLr, kAF, cAF, d0, t1, t2, vNew, B2, Eps: TNeuralFloat;
+  Tag: string;
+begin
+  RandSeed := 27182818;
+  // The reference loop must see the SAME single-precision scalars the kernel
+  // broadcasts; an untyped const would let FPC evaluate its multiply in Double
+  // and round once more than the kernel does.
+  B2 := cB2;
+  Eps := cEps;
+  invNegLr := -1.0 / cLR;
+  kAF := (1 - B2) * (invNegLr * invNegLr);
+  cAF := (1 - B2) * Eps;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    D := TNNetVolume.Create(1, 1, N);
+    V := TNNetVolume.Create(1, 1, N);
+    RefD := TNNetVolume.Create(1, 1, N);
+    RefV := TNNetVolume.Create(1, 1, N);
+    try
+      for K := 0 to N - 1 do
+      begin
+        V.FData[K] := Random * 0.3;
+        RefV.FData[K] := V.FData[K];
+      end;
+
+      for Step := 1 to cSteps do
+      begin
+        Tag := ' (N=' + IntToStr(N) + ' step ' + IntToStr(Step) + ')';
+        for K := 0 to N - 1 do
+        begin
+          if K mod 9 = 4 then D.FData[K] := 0
+          else D.FData[K] := ((K mod 7) - 3) * 0.25 * Step;
+          RefD.FData[K] := D.FData[K];
+        end;
+
+        // Reference: the fused recurrence, spelled out one element at a time.
+        for K := 0 to N - 1 do
+        begin
+          d0 := RefD.FData[K];
+          t1 := d0 * d0;
+          t1 := kAF * t1;
+          t1 := t1 + cAF;
+          t2 := B2 * RefV.FData[K];
+          vNew := t1 + t2;
+          RefV.FData[K] := vNew;
+          t1 := Sqrt(vNew);
+          t1 := t1 + Eps;
+          RefD.FData[K] := d0 / t1;
+        end;
+
+        TNNetVolume.AdafactorDelta(D.DataPtr, V.DataPtr,
+          B2, kAF, cAF, Eps, N);
+
+        for K := 0 to N - 1 do
+        begin
+          AssertEquals('second moment[' + IntToStr(K) + ']' + Tag,
+            RefV.FData[K], V.FData[K], 0.0);
+          AssertEquals('delta[' + IntToStr(K) + ']' + Tag,
+            RefD.FData[K], D.FData[K], 0.0);
+        end;
+      end;
+
+      // A zero-length run must touch nothing.
+      D.FData[0] := 5;
+      TNNetVolume.AdafactorDelta(D.DataPtr, V.DataPtr, B2, kAF, cAF, Eps, 0);
+      AssertEquals('empty run', 5.0, D.FData[0], 0.0);
+    finally
+      D.Free; V.Free; RefD.Free; RefV.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeClampAbsParity;
+// ClampAbs is a vmaxps/vminps pair on an AVX2/64-bit build and a two-branch
+// scalar loop everywhere else; the two must agree bit for bit, which is why the
+// kernel puts the bound in the FIRST operand of both instructions (x86 min/max
+// return the second operand when a compare is unordered, so a NaN passes
+// through untouched, exactly as the scalar "if v > b / else if v < -b" form
+// leaves it). The inputs below therefore cover: values inside the band, values
+// on both saturating sides, the exact boundaries +/-Value (which must NOT be
+// rewritten), a signed zero and an infinity on each side. Sizes straddle the
+// 8-element block and the scalar tail. NaN is deliberately NOT fed in: MAXPS
+// signals Invalid Operation on a QNaN source exactly as the scalar COMISS
+// does, so both paths raise EInvalidOp under FPC's default unmasked exceptions
+// - identical behaviour, but not something a test can assert a value for.
+const
+  Sizes: array[0..8] of integer = (1, 3, 7, 8, 9, 16, 31, 64, 517);
+  cBound = 0.75;
+var
+  Buf, Ref: array of TNeuralFloat;
+  SI, K, N: integer;
+  v: TNeuralFloat;
+  Tag: string;
+begin
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    SetLength(Buf, N);
+    SetLength(Ref, N);
+    Tag := ' (N=' + IntToStr(N) + ')';
+    for K := 0 to N - 1 do
+    begin
+      case K mod 8 of
+        0: v := 0.1;
+        1: v := -0.1;
+        2: v := 3.5;
+        3: v := -3.5;
+        4: v := cBound;         // exactly the bound: must survive untouched
+        5: v := -cBound;
+        6: v := 0.0;
+        else v := -0.0;
+      end;
+      Buf[K] := v;
+      Ref[K] := v;
+    end;
+    if N > 16 then
+    begin
+      Buf[10] := Infinity;  Ref[10] := Infinity;
+      Buf[11] := -Infinity; Ref[11] := -Infinity;
+    end;
+
+    // Reference: the scalar clamp the layer used to run inline.
+    for K := 0 to N - 1 do
+    begin
+      if Ref[K] > cBound then Ref[K] := cBound
+      else if Ref[K] < -cBound then Ref[K] := -cBound;
+    end;
+
+    TNNetVolume.ClampAbs(TNeuralFloatArrPtr(@Buf[0]), cBound, N);
+
+    for K := 0 to N - 1 do
+      AssertEquals('ClampAbs[' + IntToStr(K) + ']' + Tag,
+        Ref[K], Buf[K], 0.0);
+
+    // A non-positive bound and a zero count are both no-ops.
+    Buf[0] := 9;
+    TNNetVolume.ClampAbs(TNeuralFloatArrPtr(@Buf[0]), 0, N);
+    AssertEquals('zero bound is a no-op' + Tag, 9.0, Buf[0], 0.0);
+    TNNetVolume.ClampAbs(TNeuralFloatArrPtr(@Buf[0]), cBound, 0);
+    AssertEquals('empty run' + Tag, 9.0, Buf[0], 0.0);
   end;
 end;
 

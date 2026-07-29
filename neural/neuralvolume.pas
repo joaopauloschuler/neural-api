@@ -617,6 +617,33 @@ type
       class procedure AdamDelta(PtrDelta, PtrM, PtrV: TNeuralFloatArrPtr;
         Beta1, OmBeta1, Beta2, OmBeta2, InvOmB2D, Epsilon, kLR: TNeuralFloat;
         N: integer); static;
+      // AdafactorDelta runs Adafactor's unfactored (per-element) second-moment
+      // step over a weight row in one pass:
+      //   v := Beta2*v + (k*d*d + c)
+      //   d := d / (sqrt(v) + Epsilon)
+      // where d is PtrDelta in and the finished increment out. The caller folds
+      // Adafactor's algebra into the two scalars: with FDelta arriving as
+      // -lr*g, the recovered gradient squared is g*g = d*d/(lr*lr), so
+      // k = (1-Beta2)/(lr*lr) and c = (1-Beta2)*Eps1, and the -lr*(g/denom)
+      // store collapses to d/denom. AVX2/64-bit builds run AVXAdafactorDelta;
+      // every other build runs the equivalent scalar loop, which performs the
+      // identical rounding sequence, so the two paths are bit-identical.
+      class procedure AdafactorDelta(PtrDelta, PtrV: TNeuralFloatArrPtr;
+        Beta2, k, c, Epsilon: TNeuralFloat; N: integer); static;
+      // ClampAbs clamps dst[0..N-1] into [-Value, +Value] in place - the
+      // gradient-clipping saturate applied to every delta on every training
+      // step. AVX2/64-bit builds run AVXClampAbs (vmaxps then vminps, eight
+      // elements per iteration); every other build runs the equivalent scalar
+      // loop. Bit-identical to the scalar "if v > b / else if v < -b" form the
+      // layers used to run inline, signed zeros and infinities included. NaN:
+      // the kernel puts the bound in the FIRST operand of each vmaxps/vminps
+      // and x86 min/max return the SECOND operand on an unordered compare, so
+      // a NaN would flow through untouched - but MAXPS/MINPS signal Invalid
+      // Operation on a QNaN source just as the scalar COMISS does, so under
+      // FPC's default unmasked exceptions BOTH paths raise EInvalidOp on a NaN
+      // input, exactly like the code this replaced. Value <= 0 is a no-op.
+      class procedure ClampAbs(PtrA: TNeuralFloatArrPtr; Value: TNeuralFloat;
+        N: integer); static;
       // Relu writes dst[0..N-1] := max(src[0..N-1], 0). AVX2-accelerated
       // (AVXCopyRelu) with a scalar fallback on non-AVX builds. Bit-exact vs the
       // scalar relu-copy. Buffers may alias (dst = src).
@@ -9937,6 +9964,68 @@ begin
   {$ENDIF}
 end;
 
+{$IFDEF AVX2}
+// AVXAdafactorDelta / AVXClampAbs are defined later in this file under
+// {$IFDEF AVX64}; forward-declare them so the dispatchers below can call them.
+procedure AVXAdafactorDelta(PtrDelta, PtrV: TNeuralFloatArrPtr;
+  Beta2, k, c, Epsilon: TNeuralFloat; NumElements: integer); forward;
+procedure AVXClampAbs(PtrA: TNeuralFloatArrPtr; Value: TNeuralFloat;
+  NumElements: integer); forward;
+{$ENDIF}
+class procedure TNNetVolume.AdafactorDelta(PtrDelta, PtrV: TNeuralFloatArrPtr;
+  Beta2, k, c, Epsilon: TNeuralFloat; N: integer);
+{$IFNDEF AVX2}
+var
+  I: integer;
+  d, v, t1, t2: TNeuralFloat;
+{$ENDIF}
+begin
+  if N <= 0 then exit;
+  {$IFDEF AVX2}
+  AVXAdafactorDelta(PtrDelta, PtrV, Beta2, k, c, Epsilon, N);
+  {$ELSE}
+  // Every intermediate lands in a TNeuralFloat before it is used again, so each
+  // operation rounds exactly once - the same rounding sequence the AVX kernel
+  // performs, instruction for instruction.
+  for I := 0 to N - 1 do
+  begin
+    d  := PtrDelta^[I];
+    t1 := d * d;
+    t1 := k * t1;
+    t1 := t1 + c;
+    t2 := Beta2 * PtrV^[I];
+    v  := t1 + t2;
+    PtrV^[I] := v;
+    t1 := Sqrt(v);
+    t1 := t1 + Epsilon;
+    PtrDelta^[I] := d / t1;
+  end;
+  {$ENDIF}
+end;
+
+class procedure TNNetVolume.ClampAbs(PtrA: TNeuralFloatArrPtr;
+  Value: TNeuralFloat; N: integer);
+{$IFNDEF AVX2}
+var
+  I: integer;
+  v, NegValue: TNeuralFloat;
+{$ENDIF}
+begin
+  if (N <= 0) or (Value <= 0) then exit;
+  {$IFDEF AVX2}
+  AVXClampAbs(PtrA, Value, N);
+  {$ELSE}
+  NegValue := -Value;
+  for I := 0 to N - 1 do
+  begin
+    v := PtrA^[I];
+    // NaN satisfies neither test and is left alone, matching the kernel.
+    if v > Value then PtrA^[I] := Value
+    else if v < NegValue then PtrA^[I] := NegValue;
+  end;
+  {$ENDIF}
+end;
+
 {$IFDEF AVXANY}
 // AVXCopyRelu (dst := max(src,0)) is defined later in this section under
 // {$IFDEF AVXANY}; forward-declare it so Relu can call it here.
@@ -15091,6 +15180,148 @@ begin
     t1 := t1 + Epsilon;
     t2 := kLR * m;
     PtrDelta^[I] := t2 / t1;
+  end;
+end;
+
+// Adafactor unfactored step, eight elements per iteration:
+//   v := Beta2*v + (k*d*d + c)
+//   d := d / (sqrt(v) + Epsilon)
+// One read and one write of delta and of v; the composed form would need a
+// square, a scaled accumulate, a VSqrt, an AddScalar and a Divi - five passes
+// over the weight row plus a scratch row the caller does not otherwise want.
+// No FMA: every multiply and every add rounds separately, matching the scalar
+// fallback exactly. The four scalars are broadcast from their own addresses,
+// so the code stays position independent.
+procedure AVXAdafactorDelta(PtrDelta, PtrV: TNeuralFloatArrPtr;
+  Beta2, k, c, Epsilon: TNeuralFloat; NumElements: integer);
+var
+  pB2, pK, pC, pEps: pointer;
+  localNumElements, MissedElements, I: integer;
+  d, v, t1, t2: TNeuralFloat;
+begin
+  MissedElements := NumElements and 7;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+    pB2  := Addr(Beta2);
+    pK   := Addr(k);
+    pC   := Addr(c);
+    pEps := Addr(Epsilon);
+  asm
+  mov rcx, pB2
+  vbroadcastss ymm12, [rcx]
+  mov rcx, pK
+  vbroadcastss ymm13, [rcx]
+  mov rcx, pC
+  vbroadcastss ymm14, [rcx]
+  mov rcx, pEps
+  vbroadcastss ymm15, [rcx]
+
+  mov rax, PtrDelta
+  mov rdx, PtrV
+  mov ecx, localNumElements
+  shr ecx, 3
+
+@AdafactorLoop:
+  vmovups ymm0, [rax]
+  vmulps  ymm1, ymm0, ymm0
+  vmulps  ymm1, ymm1, ymm13
+  vaddps  ymm1, ymm1, ymm14
+  vmulps  ymm2, ymm12, [rdx]
+  vaddps  ymm1, ymm1, ymm2
+  vmovups [rdx], ymm1
+
+  vsqrtps ymm1, ymm1
+  vaddps  ymm1, ymm1, ymm15
+  vdivps  ymm0, ymm0, ymm1
+  vmovups [rax], ymm0
+
+  add rax, 32
+  add rdx, 32
+  dec ecx
+  jnz @AdafactorLoop
+
+  vzeroupper
+  end [
+    'RAX', 'RCX', 'RDX',
+    'ymm0', 'ymm1', 'ymm2',
+    'ymm12', 'ymm13', 'ymm14', 'ymm15'
+  ];
+  end; // of if
+
+  // Scalar tail, same rounding sequence as the kernel above.
+  if MissedElements > 0 then
+  for I := localNumElements to NumElements - 1 do
+  begin
+    d  := PtrDelta^[I];
+    t1 := d * d;
+    t1 := k * t1;
+    t1 := t1 + c;
+    t2 := Beta2 * PtrV^[I];
+    v  := t1 + t2;
+    PtrV^[I] := v;
+    t1 := Sqrt(v);
+    t1 := t1 + Epsilon;
+    PtrDelta^[I] := d / t1;
+  end;
+end;
+
+// In-place clamp of eight elements per iteration into [-Value, +Value].
+// The bound is the FIRST operand of both vmaxps and vminps: x86 min/max return
+// the SECOND operand on an unordered compare, so a NaN element would flow
+// through both instructions untouched - the same thing the scalar "if v > b /
+// else if v < -b" form does. Both forms nonetheless signal Invalid Operation on
+// a QNaN source (MAXPS/MINPS do; so does the scalar COMISS), so with FPC's
+// default unmasked exceptions a NaN input raises EInvalidOp on either path.
+// On everything else the two are bit-identical, signed zeros included.
+procedure AVXClampAbs(PtrA: TNeuralFloatArrPtr; Value: TNeuralFloat;
+  NumElements: integer);
+var
+  pVal, pNeg: pointer;
+  NegValue: TNeuralFloat;
+  localNumElements, MissedElements, I: integer;
+  v: TNeuralFloat;
+begin
+  NegValue := -Value;
+  MissedElements := NumElements and 7;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+    pVal := Addr(Value);
+    pNeg := Addr(NegValue);
+  asm
+  mov rcx, pVal
+  vbroadcastss ymm14, [rcx]
+  mov rcx, pNeg
+  vbroadcastss ymm15, [rcx]
+
+  mov rax, PtrA
+  mov ecx, localNumElements
+  shr ecx, 3
+
+@ClampLoop:
+  vmovups ymm0, [rax]
+  vmaxps  ymm0, ymm15, ymm0
+  vminps  ymm0, ymm14, ymm0
+  vmovups [rax], ymm0
+
+  add rax, 32
+  dec ecx
+  jnz @ClampLoop
+
+  vzeroupper
+  end [
+    'RAX', 'RCX',
+    'ymm0', 'ymm14', 'ymm15'
+  ];
+  end; // of if
+
+  if MissedElements > 0 then
+  for I := localNumElements to NumElements - 1 do
+  begin
+    v := PtrA^[I];
+    if v > Value then PtrA^[I] := Value
+    else if v < NegValue then PtrA^[I] := NegValue;
   end;
 end;
 procedure AVXMul(PtrA: TNeuralFloatArrPtr; MulOp: TNeuralFloat; NumElements: integer); overload;
