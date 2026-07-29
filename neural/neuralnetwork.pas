@@ -86142,6 +86142,9 @@ var
   k, fk, rinDim, routDim, sufSize, prefPrev, prefCur: integer;
   suf, prefIdx, jk, ik, ain, aout, gIdx, prevIdx, curIdx: integer;
   MaxCore, MaxSuf, MaxPref, MaxFk, MaxROut, MaxRIn: integer;
+  IkStep, SufStep, AinStep, IkGStep, CurSufStep, CurPrefStep: integer;
+  PrevSufBase, PrevPrefBase, PrevIkBase: integer;
+  CurSufBase, CurPrefBase, CurJkBase, GJkBase, GAoutBase, GIkBase: integer;
   PrevOut, Wk, Bias, Prev, Cur: TNNetVolume;
   acc: TNeuralFloat;
 begin
@@ -86169,27 +86172,62 @@ begin
     MaxFk := fk - 1;
     MaxROut := routDim - 1;
     MaxRIn := rinDim - 1;
+    // #6/#11: both flat indices decompose into carried offsets.
+    //   prevIdx = ik*IkStep + suf*SufStep + prefIdx*rinDim + ain
+    //   gIdx    = ain*AinStep + ik*IkGStep + jk*routDim + aout
+    //   curIdx  = suf*CurSufStep + prefIdx*CurPrefStep + jk*routDim + aout
+    // At k = 0 the general prevIdx already collapses to ik*sufSize + suf,
+    // because prefPrev = 1 and rinDim = FRanks[0] = 1 force prefIdx = ain = 0
+    // and SufStep = 1 -- so the old k = 0 special case was a no-op.
+    IkStep := sufSize * prefPrev * rinDim;
+    SufStep := prefPrev * rinDim;
+    AinStep := fk * fk * routDim;
+    IkGStep := fk * routDim;
+    CurPrefStep := fk * routDim;
+    CurSufStep := prefCur * routDim;
+    PrevSufBase := 0;
+    CurSufBase := 0;
     for suf := 0 to MaxSuf do
+    begin
+      PrevPrefBase := PrevSufBase;
+      CurPrefBase := CurSufBase;
       for prefIdx := 0 to MaxPref do
+      begin
+        CurJkBase := CurPrefBase;
+        GJkBase := 0;
         for jk := 0 to MaxFk do
+        begin
           for aout := 0 to MaxROut do
           begin
+            GAoutBase := GJkBase + aout;
             acc := 0;
+            PrevIkBase := PrevPrefBase;
+            GIkBase := GAoutBase;
             for ik := 0 to MaxFk do
+            begin
+              prevIdx := PrevIkBase;
+              gIdx := GIkBase;
               for ain := 0 to MaxRIn do
               begin
-                // previous suffix index = ik * sufSize + suf.
-                if k = 0 then
-                  // T_{-1} = x : rank dim 1, prefix dim 1 -> index = inputSuffix.
-                  prevIdx := ik * sufSize + suf
-                else
-                  prevIdx := ((ik * sufSize + suf) * prefPrev + prefIdx) * rinDim + ain;
-                gIdx := ((ain * fk + ik) * fk + jk) * routDim + aout;
                 acc := acc + Wk.FData[gIdx] * Prev.FData[prevIdx];
+                Inc(prevIdx);
+                Inc(gIdx, AinStep);
               end;
-            curIdx := (suf * prefCur + (prefIdx * fk + jk)) * routDim + aout;
+              Inc(PrevIkBase, IkStep);
+              Inc(GIkBase, IkGStep);
+            end;
+            curIdx := CurJkBase + aout;
             Cur.FData[curIdx] := acc;
           end;
+          Inc(CurJkBase, routDim);
+          Inc(GJkBase, routDim);
+        end;
+        Inc(PrevPrefBase, rinDim);
+        Inc(CurPrefBase, CurPrefStep);
+      end;
+      Inc(PrevSufBase, SufStep);
+      Inc(CurSufBase, CurSufStep);
+    end;
   end;
 
   // Final message T_{d-1}: sufSize = 1, prefCur = FDim, routDim = 1 -> y.
@@ -86228,9 +86266,12 @@ var
   k, fk, rinDim, routDim, sufSize, prefPrev, prefCur: integer;
   suf, prefIdx, jk, ik, ain, aout, gIdx, prevIdx, curIdx, ti: integer;
   MaxCore, MaxDim, MaxSuf, MaxPref, MaxFk, MaxROut, MaxRIn, MaxDPrev, FCoresM1: integer;
+  IkStep, SufStep, AinStep, IkGStep, CurSufStep, CurPrefStep: integer;
+  PrevSufBase, PrevPrefBase, PrevIkBase: integer;
+  CurSufBase, CurPrefBase, CurJkBase, GJkBase, GAoutBase, GIkBase: integer;
   PrevOut, Wk, WkDelta, BiasDelta, Prev, LocalPrevError: TNNetVolume;
   DPrevLen: integer;
-  dval, gval, tval: TNeuralFloat;
+  dval, gval, tval, lrdval: TNeuralFloat;
   HasPrevError: boolean;
 begin
   PrevOut := FPrevLayer.FOutput;
@@ -86273,30 +86314,65 @@ begin
     MaxFk := fk - 1;
     MaxROut := routDim - 1;
     MaxRIn := rinDim - 1;
+    // #6/#11: same carried-offset decomposition as the forward sweep; at k = 0
+    // the general prevIdx already collapses to ik*sufSize + suf (prefPrev = 1,
+    // rinDim = FRanks[0] = 1), so no special case is needed.
+    IkStep := sufSize * prefPrev * rinDim;
+    SufStep := prefPrev * rinDim;
+    AinStep := fk * fk * routDim;
+    IkGStep := fk * routDim;
+    CurPrefStep := fk * routDim;
+    CurSufStep := prefCur * routDim;
+    PrevSufBase := 0;
+    CurSufBase := 0;
     for suf := 0 to MaxSuf do
+    begin
+      PrevPrefBase := PrevSufBase;
+      CurPrefBase := CurSufBase;
       for prefIdx := 0 to MaxPref do
+      begin
+        CurJkBase := CurPrefBase;
+        GJkBase := 0;
         for jk := 0 to MaxFk do
+        begin
           for aout := 0 to MaxROut do
           begin
-            curIdx := (suf * prefCur + (prefIdx * fk + jk)) * routDim + aout;
+            curIdx := CurJkBase + aout;
             dval := FDCur[curIdx];
             if dval = 0 then continue;
+            // #5: the -lr*dval factor is invariant across the whole ik/ain nest.
+            lrdval := -FLearningRate * dval;
+            GAoutBase := GJkBase + aout;
+            PrevIkBase := PrevPrefBase;
+            GIkBase := GAoutBase;
             for ik := 0 to MaxFk do
+            begin
+              prevIdx := PrevIkBase;
+              gIdx := GIkBase;
               for ain := 0 to MaxRIn do
               begin
-                if k = 0 then
-                  prevIdx := ik * sufSize + suf
-                else
-                  prevIdx := ((ik * sufSize + suf) * prefPrev + prefIdx) * rinDim + ain;
-                gIdx := ((ain * fk + ik) * fk + jk) * routDim + aout;
                 tval := Prev.FData[prevIdx];
                 gval := Wk.FData[gIdx];
                 // Core gradient.
-                WkDelta.FData[gIdx] := WkDelta.FData[gIdx] - FLearningRate * dval * tval;
+                WkDelta.FData[gIdx] := WkDelta.FData[gIdx] + lrdval * tval;
                 // Back-message into dT_{k-1}.
                 FDPrev[prevIdx] := FDPrev[prevIdx] + gval * dval;
+                Inc(prevIdx);
+                Inc(gIdx, AinStep);
               end;
+              Inc(PrevIkBase, IkStep);
+              Inc(GIkBase, IkGStep);
+            end;
           end;
+          Inc(CurJkBase, routDim);
+          Inc(GJkBase, routDim);
+        end;
+        Inc(PrevPrefBase, rinDim);
+        Inc(CurPrefBase, CurPrefStep);
+      end;
+      Inc(PrevSufBase, SufStep);
+      Inc(CurSufBase, CurSufStep);
+    end;
 
     if k > 0 then
     begin
