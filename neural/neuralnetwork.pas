@@ -4436,6 +4436,7 @@ type
     // Persistent device buffers (grow-only), reused every forward.
     FBufSrc, FBufIdx, FBufDst: cl_mem;
     FCapSrc, FCapIdx, FCapDst: csize_t;
+    FNN: TNNet;
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
@@ -18408,6 +18409,7 @@ type
       function GetSharedKernel(const kernelname: string): TNeuralKernel;
       function CreateKernel(const kernelname: string): TNeuralKernel;
       function GetKernel(const kernelname: string): TNeuralKernel;
+      procedure FreeKernelIfNotShared(const kernelname: string; var KernelObject: TNeuralKernel);
       // Force (pForce=True) or release (False) the OpenCL device path on every
       // layer, bypassing each layer's per-layer size verdict (FShouldOpenCL).
       // Replaces the old global dispatch-gate override used by the GPU parity
@@ -35462,9 +35464,8 @@ end;
 constructor TNNetPixelShuffleCL.Create(NN: TNNet);
 begin
   inherited Create();
-  // Borrow the net-wide cai_pixel_shuffle handle (shared by every pixel-shuffle
-  // layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.GetSharedKernel('cai_pixel_shuffle');
+  FNN := NN;
+  FKernel := NN.GetKernel('cai_pixel_shuffle');
 end;
 
 destructor TNNetPixelShuffleCL.Destroy();
@@ -35472,7 +35473,7 @@ begin
   if Assigned(FBufSrc) then clReleaseMemObject(FBufSrc);
   if Assigned(FBufIdx) then clReleaseMemObject(FBufIdx);
   if Assigned(FBufDst) then clReleaseMemObject(FBufDst);
-  // FKernel is a net-owned shared handle - do not free here.
+  FNN.FreeKernelIfNotShared('cai_pixel_shuffle', FKernel);
   inherited Destroy();
 end;
 
@@ -123499,6 +123500,24 @@ begin
   if FHasSharedKernel
     then Result := GetSharedKernel(kernelname)
     else Result := CreateKernel(kernelname);
+end;
+
+procedure TNNet.FreeKernelIfNotShared(const kernelname: string;
+  var KernelObject: TNeuralKernel);
+var
+  ShouldFree: boolean;
+  idx: integer;
+begin
+  ShouldFree := true;
+  if Assigned(FSharedKernels) then
+  begin
+    idx := FSharedKernels.IndexOf(kernelname);
+    ShouldFree := (TNeuralKernel(FSharedKernels.Objects[idx]) <> KernelObject);
+  end;
+  if ShouldFree then
+  begin
+    FreeAndNil(KernelObject);
+  end;
 end;
 
 procedure TNNet.ForceOpenCL(pForce: boolean);
