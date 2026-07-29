@@ -24183,6 +24183,8 @@ var
   MaxX, MaxY, MaxD: integer;
   X, Y, D, HalfDepth, basePrev, basePrevH, basePrev0, baseErr0: integer;
   a, b, b3, tanhArg, tanhVal, cdf, geluVal, geluDeriv, err: TNeuralFloat;
+  HasScratch: boolean;
+  bPtr, tanhPtr: TNeuralFloatArrPtr;
 const
   SQRT_2_OVER_PI = 0.7978845608;
   GELU_CONST = 0.044715;
@@ -24198,31 +24200,77 @@ begin
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
     MaxD := HalfDepth - 1;
-    for X := 0 to MaxX do
-      for Y := 0 to MaxY do
-      begin
-        basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
-        baseErr0  := FOutputError.GetRawPos(X, Y);
-        for D := 0 to MaxD do
+    // FOutputErrorDeriv is sized alongside FOutputError by SetOutputErrorSize and
+    // is never otherwise used by this layer, so it serves as the per-row tanh
+    // scratch without any allocation. It collapses to (1,1,1) on a
+    // non-trainable layer, hence the guard and the scalar fallback below.
+    HasScratch := (FOutputErrorDeriv.Size = FOutput.Size);
+    if HasScratch then
+    begin
+      for X := 0 to MaxX do
+        for Y := 0 to MaxY do
         begin
-          basePrev := basePrev0 + D;
-          basePrevH := basePrev + HalfDepth;
-          a := FPrevLayer.FOutput.FData[basePrev];
-          b := FPrevLayer.FOutput.FData[basePrevH];
-          b3 := b * b * b;
-          tanhArg := SQRT_2_OVER_PI * (b + GELU_CONST * b3);
-          tanhVal := pcr_tanhf(tanhArg);
-          cdf := 0.5 * (1 + tanhVal);
-          geluVal := b * cdf;
-          geluDeriv := cdf + 0.5 * b * (1 - tanhVal * tanhVal) *
-            SQRT_2_OVER_PI * (1 + 3 * GELU_CONST * b * b);
-          err := FOutputError.FData[baseErr0 + D];
-          FPrevLayer.FOutputError.FData[basePrev] :=
-            FPrevLayer.FOutputError.FData[basePrev] + err * geluVal;
-          FPrevLayer.FOutputError.FData[basePrevH] :=
-            FPrevLayer.FOutputError.FData[basePrevH] + err * a * geluDeriv;
+          basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
+          baseErr0  := FOutputError.GetRawPos(X, Y);
+          bPtr := FPrevLayer.FOutput.GetRawPtr(basePrev0 + HalfDepth);
+          tanhPtr := FOutputErrorDeriv.GetRawPtr(baseErr0);
+          // Same bulk-op chain as Compute() builds the tanh argument
+          // sqrt(2/pi)*(b + 0.044715*b^3), then one vectorized tanh ride
+          // replaces HalfDepth scalar pcr_tanhf calls. Forward and backward now
+          // share the identical re-associated argument.
+          Move(bPtr^[0], tanhPtr^[0], HalfDepth * csNeuralFloatSize);
+          TNNetVolume.Mul(tanhPtr, tanhPtr, HalfDepth);                     // b^2
+          TNNetVolume.Mul(tanhPtr, bPtr, HalfDepth);                        // b^3
+          TNNetVolume.Mul(tanhPtr, SQRT_2_OVER_PI * GELU_CONST, HalfDepth);
+          TNNetVolume.MulAdd(tanhPtr, bPtr, SQRT_2_OVER_PI, HalfDepth);
+          TNNetVolume.Tanh(tanhPtr, tanhPtr, HalfDepth);
+          for D := 0 to MaxD do
+          begin
+            basePrev := basePrev0 + D;
+            basePrevH := basePrev + HalfDepth;
+            a := FPrevLayer.FOutput.FData[basePrev];
+            b := FPrevLayer.FOutput.FData[basePrevH];
+            tanhVal := tanhPtr^[D];
+            cdf := 0.5 * (1 + tanhVal);
+            geluVal := b * cdf;
+            geluDeriv := cdf + 0.5 * b * (1 - tanhVal * tanhVal) *
+              SQRT_2_OVER_PI * (1 + 3 * GELU_CONST * b * b);
+            err := FOutputError.FData[baseErr0 + D];
+            FPrevLayer.FOutputError.FData[basePrev] :=
+              FPrevLayer.FOutputError.FData[basePrev] + err * geluVal;
+            FPrevLayer.FOutputError.FData[basePrevH] :=
+              FPrevLayer.FOutputError.FData[basePrevH] + err * a * geluDeriv;
+          end;
         end;
-      end;
+    end
+    else
+    begin
+      for X := 0 to MaxX do
+        for Y := 0 to MaxY do
+        begin
+          basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
+          baseErr0  := FOutputError.GetRawPos(X, Y);
+          for D := 0 to MaxD do
+          begin
+            basePrev := basePrev0 + D;
+            basePrevH := basePrev + HalfDepth;
+            a := FPrevLayer.FOutput.FData[basePrev];
+            b := FPrevLayer.FOutput.FData[basePrevH];
+            b3 := b * b * b;
+            tanhArg := SQRT_2_OVER_PI * (b + GELU_CONST * b3);
+            tanhVal := pcr_tanhf(tanhArg);
+            cdf := 0.5 * (1 + tanhVal);
+            geluVal := b * cdf;
+            geluDeriv := cdf + 0.5 * b * (1 - tanhVal * tanhVal) *
+              SQRT_2_OVER_PI * (1 + 3 * GELU_CONST * b * b);
+            err := FOutputError.FData[baseErr0 + D];
+            FPrevLayer.FOutputError.FData[basePrev] :=
+              FPrevLayer.FOutputError.FData[basePrev] + err * geluVal;
+            FPrevLayer.FOutputError.FData[basePrevH] :=
+              FPrevLayer.FOutputError.FData[basePrevH] + err * a * geluDeriv;
+          end;
+        end;
+    end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
@@ -24358,6 +24406,8 @@ var
   MaxX, MaxY, MaxD: integer;
   X, Y, D, HalfDepth, basePrev, basePrevH, basePrev0, baseErr0: integer;
   a, b, cdf, pdf, geluVal, geluDeriv, err: TNeuralFloat;
+  HasScratch: boolean;
+  bPtr, erfPtr: TNeuralFloatArrPtr;
 const
   INV_SQRT_2 = 0.7071067811865476;
   INV_SQRT_2PI = 0.3989422804014327;
@@ -24373,30 +24423,72 @@ begin
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
     MaxD := HalfDepth - 1;
-    for X := 0 to MaxX do
-      for Y := 0 to MaxY do
-      begin
-        basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
-        baseErr0  := FOutputError.GetRawPos(X, Y);
-        for D := 0 to MaxD do
+    // FOutputErrorDeriv is sized alongside FOutputError by SetOutputErrorSize and
+    // is never otherwise used by this layer, so it serves as the per-row erf
+    // scratch without any allocation. It collapses to (1,1,1) on a
+    // non-trainable layer, hence the guard and the scalar fallback below.
+    // Only the erf is promoted: the pdf's exp(-b^2/2) would need a second row
+    // buffer, so it stays scalar.
+    HasScratch := (FOutputErrorDeriv.Size = FOutput.Size);
+    if HasScratch then
+    begin
+      for X := 0 to MaxX do
+        for Y := 0 to MaxY do
         begin
-          basePrev := basePrev0 + D;
-          basePrevH := basePrev + HalfDepth;
-          a := FPrevLayer.FOutput.FData[basePrev];
-          b := FPrevLayer.FOutput.FData[basePrevH];
-          cdf := 0.5 * (1 + pcr_erff(b * INV_SQRT_2));
-          // Gaussian PDF: phi(b) = exp(-b^2/2)/sqrt(2*pi);
-          // d/db GELU_erf(b) = Phi(b) + b*phi(b).
-          pdf := INV_SQRT_2PI * NeuralExp(-0.5 * b * b);
-          geluVal := b * cdf;
-          geluDeriv := cdf + b * pdf;
-          err := FOutputError.FData[baseErr0 + D];
-          FPrevLayer.FOutputError.FData[basePrev] :=
-            FPrevLayer.FOutputError.FData[basePrev] + err * geluVal;
-          FPrevLayer.FOutputError.FData[basePrevH] :=
-            FPrevLayer.FOutputError.FData[basePrevH] + err * a * geluDeriv;
+          basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
+          baseErr0  := FOutputError.GetRawPos(X, Y);
+          bPtr := FPrevLayer.FOutput.GetRawPtr(basePrev0 + HalfDepth);
+          erfPtr := FOutputErrorDeriv.GetRawPtr(baseErr0);
+          // Same seed as Compute(): B/sqrt(2) into the scratch row, then one
+          // vectorized erf ride over the whole row.
+          Move(bPtr^[0], erfPtr^[0], HalfDepth * csNeuralFloatSize);
+          TNNetVolume.Mul(erfPtr, INV_SQRT_2, HalfDepth);
+          TNNetVolume.Erf(erfPtr, erfPtr, HalfDepth);
+          for D := 0 to MaxD do
+          begin
+            basePrev := basePrev0 + D;
+            basePrevH := basePrev + HalfDepth;
+            a := FPrevLayer.FOutput.FData[basePrev];
+            b := FPrevLayer.FOutput.FData[basePrevH];
+            cdf := 0.5 * (1 + erfPtr^[D]);
+            // Gaussian PDF: phi(b) = exp(-b^2/2)/sqrt(2*pi);
+            // d/db GELU_erf(b) = Phi(b) + b*phi(b).
+            pdf := INV_SQRT_2PI * NeuralExp(-0.5 * b * b);
+            geluVal := b * cdf;
+            geluDeriv := cdf + b * pdf;
+            err := FOutputError.FData[baseErr0 + D];
+            FPrevLayer.FOutputError.FData[basePrev] :=
+              FPrevLayer.FOutputError.FData[basePrev] + err * geluVal;
+            FPrevLayer.FOutputError.FData[basePrevH] :=
+              FPrevLayer.FOutputError.FData[basePrevH] + err * a * geluDeriv;
+          end;
         end;
-      end;
+    end
+    else
+    begin
+      for X := 0 to MaxX do
+        for Y := 0 to MaxY do
+        begin
+          basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
+          baseErr0  := FOutputError.GetRawPos(X, Y);
+          for D := 0 to MaxD do
+          begin
+            basePrev := basePrev0 + D;
+            basePrevH := basePrev + HalfDepth;
+            a := FPrevLayer.FOutput.FData[basePrev];
+            b := FPrevLayer.FOutput.FData[basePrevH];
+            cdf := 0.5 * (1 + pcr_erff(b * INV_SQRT_2));
+            pdf := INV_SQRT_2PI * NeuralExp(-0.5 * b * b);
+            geluVal := b * cdf;
+            geluDeriv := cdf + b * pdf;
+            err := FOutputError.FData[baseErr0 + D];
+            FPrevLayer.FOutputError.FData[basePrev] :=
+              FPrevLayer.FOutputError.FData[basePrev] + err * geluVal;
+            FPrevLayer.FOutputError.FData[basePrevH] :=
+              FPrevLayer.FOutputError.FData[basePrevH] + err * a * geluDeriv;
+          end;
+        end;
+    end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
