@@ -52194,8 +52194,10 @@ type
     QProj, KProj, VProj, OProj: TNNetLayer;
     // relu2 MLP
     UpProj, DownProj: TNNetLayer;
-    // MoE ('E' block): router + per-expert up/down + shared-expert up/down
-    GateConv: TNNetLayer;
+    // MoE ('E' block): router + per-expert up/down + shared-expert up/down.
+    // GateTopK is per block: the weights pass writes this block's
+    // e_score_correction_bias onto it, so it cannot be a builder-wide local.
+    GateConv, GateTopK: TNNetLayer;
     SharedUp, SharedDown: TNNetLayer;
     ExpertUp, ExpertDown: array of TNNetLayer;
   end;
@@ -52211,7 +52213,7 @@ var
   EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
   BranchInput, NormedSrc, XBCConv, DtSplit, GateSplit: TNNetLayer;
   QSlice, HeadPack: TNNetLayer;
-  GateTopK, GateScaled, SharedOut, ExpertOut, GateE, GateEB: TNNetLayer;
+  GateScaled, SharedOut, ExpertOut, GateE, GateEB: TNNetLayer;
   KSlices, VSlices, HeadOutputs, MoEBranches: array of TNNetLayer;
   BlockCnt, SeqLen, i, j, d, ConvDim, ProjSize, ConvBiasSuppress: integer;
   QWidth, KVWidth, GroupSize, HeadCnt, KVHeadCnt, KVGroup, e: integer;
@@ -52489,16 +52491,16 @@ begin
               NormedSrc);
             NN.AddLayer( TNNetSigmoid.Create() );
             if Config.NormTopKProb then
-              GateTopK := NN.AddLayer( TNNetBiasBalancedTopKGate.Create(
+              Blocks[BlockCnt].GateTopK := NN.AddLayer( TNNetBiasBalancedTopKGate.Create(
                 Config.NumExpertsPerTok, {BalanceBiasSpeed=}0) )
             else
-              GateTopK := NN.AddLayer( TNNetTopKGate.Create(
+              Blocks[BlockCnt].GateTopK := NN.AddLayer( TNNetTopKGate.Create(
                 Config.NumExpertsPerTok, {pRenormalize=}false) );
             if Config.RoutedScalingFactor <> 1.0 then
               GateScaled := NN.AddLayer(
                 TNNetMulByConstant.Create(Config.RoutedScalingFactor) )
             else
-              GateScaled := GateTopK;
+              GateScaled := Blocks[BlockCnt].GateTopK;
             for e := 0 to NumRoutedExpertsM1 do
             begin
               Blocks[BlockCnt].ExpertUp[e] := NN.AddLayerAfter(
@@ -52642,10 +52644,11 @@ begin
                   IntToStr(Config.NumRoutedExperts) + ' elements.');
               if Config.NormTopKProb then
               begin
-                EnsureWritableImportWeights(GateTopK);
+                EnsureWritableImportWeights(Blocks[BlockCnt].GateTopK);
                 for e := 0 to NumRoutedExpertsM1 do
-                  GateTopK.FArrNeurons[0].Weights.FData[e] := BiasVec.FData[e];
-                GateTopK.FlushWeightCache();
+                  Blocks[BlockCnt].GateTopK.FArrNeurons[0].Weights.FData[e] :=
+                    BiasVec.FData[e];
+                Blocks[BlockCnt].GateTopK.FlushWeightCache();
               end
               else
               begin
