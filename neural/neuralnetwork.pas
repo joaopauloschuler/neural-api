@@ -483,6 +483,7 @@ type
       // is only the kernel object FDotCL binds its arguments on.
       F32Kernel: TNeuralKernel;
       function GetDotProductKernel(): TNeuralKernel;
+      function GetDotCLWaitBeta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       {$ENDIF}
 
       procedure ComputeL2Decay(); virtual;
@@ -98523,19 +98524,11 @@ begin
   begin
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
-    {$IFDEF Linux}
-    FDotCL.FinishAndLoadResult(FOutput, 0.75);
-    {$ELSE}
-    FDotCL.FinishAndLoadResult(FOutput, 0.0);
-    {$ENDIF}
+    FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
   end
   else
   begin
-    {$IFDEF Linux}
-    FDotCL.FinishAndLoadResult(FOutputRaw, 0.75);
-    {$ELSE}
-    FDotCL.FinishAndLoadResult(FOutputRaw, 0.0);
-    {$ENDIF}
+    FDotCL.FinishAndLoadResult(FOutputRaw, GetDotCLWaitBeta());
 
     if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
     ApplyActivationFunctionToOutput();
@@ -98582,19 +98575,11 @@ begin
   begin
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
-    {$IFDEF Linux}
-    FDotCL.FinishAndLoadResult(FOutput, 0.75);
-    {$ELSE}
-    FDotCL.FinishAndLoadResult(FOutput, 0.0);
-    {$ENDIF}
+    FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
   end
   else
   begin
-    {$IFDEF Linux}
-    FDotCL.FinishAndLoadResult(FOutputRaw, 0.75);
-    {$ELSE}
-    FDotCL.FinishAndLoadResult(FOutputRaw, 0.0);
-    {$ENDIF}
+    FDotCL.FinishAndLoadResult(FOutputRaw, GetDotCLWaitBeta());
 
     if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
     ApplyActivationFunctionToOutput();
@@ -100913,11 +100898,7 @@ begin
   begin
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
-    {$IFDEF Linux}
-    FDotCL.FinishAndLoadResult(FOutput, 0.75);
-    {$ELSE}
-    FDotCL.FinishAndLoadResult(FOutput, 0.0);
-    {$ENDIF}
+    FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
   end
   else
   begin
@@ -100933,11 +100914,7 @@ begin
       FOutputRaw.Resize(FOutput);
     end;
     {$ENDIF}
-    {$IFDEF Linux}
-    FDotCL.FinishAndLoadResult(FOutputRaw, 0.75);
-    {$ELSE}
-    FDotCL.FinishAndLoadResult(FOutputRaw, 0.0);
-    {$ENDIF}
+    FDotCL.FinishAndLoadResult(FOutputRaw, GetDotCLWaitBeta());
 
     if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
     ApplyActivationFunctionToOutput();
@@ -100977,19 +100954,11 @@ begin
   begin
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
-    {$IFDEF Linux}
-    FDotCL.FinishAndLoadResult(FOutput, 0.75);
-    {$ELSE}
-    FDotCL.FinishAndLoadResult(FOutput, 0.0);
-    {$ENDIF}
+    FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
   end
   else
   begin
-    {$IFDEF Linux}
-    FDotCL.FinishAndLoadResult(FOutputRaw, 0.75);
-    {$ELSE}
-    FDotCL.FinishAndLoadResult(FOutputRaw, 0.0);
-    {$ENDIF}
+    FDotCL.FinishAndLoadResult(FOutputRaw, GetDotCLWaitBeta());
 
     if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
     ApplyActivationFunctionToOutput();
@@ -125495,6 +125464,22 @@ function TNNetLayer.GetDotProductKernel(): TNeuralKernel;
 begin
   if not Assigned(F32Kernel) then F32Kernel := FNN.GetKernel('cai_dot_product');
   Result := F32Kernel;
+end;
+
+function TNNetLayer.GetDotCLWaitBeta(): TNeuralFloat;
+begin
+  if FIsTrainable then
+  begin
+    {$IFDEF Linux}
+    Result := 0.75;
+    {$ELSE}
+    Result :=  0.0;
+    {$ENDIF}
+  end
+  else
+  begin
+    Result := 0;
+  end;
 end;
 
 procedure TNNetLayer.DisableOpenCL();
