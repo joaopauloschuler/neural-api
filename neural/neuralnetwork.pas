@@ -88544,12 +88544,10 @@ end;
 // Padded (out-of-range) input positions contribute zero.
 procedure TNNetComplexConv.ComputeCPU();
 var
-  ox, oy, oc, fx, fy, ic, tapBase, oBase, i, j, baseOut, prevBase, inBase: integer;
+  ox, oy, oc, fx, fy, ic, tapBase, oBase, baseOut, prevBase, inBase: integer;
   prevX, prevY: integer;
   outSizeXMax, outSizeYMax, outCMax, featSizeXMax, featSizeYMax, inCMax: integer;
-  acc: TNeuralFloat;
-  x: array[0..1] of TNeuralFloat;
-  y: array[0..1] of TNeuralFloat;
+  x0, x1, y0, y1, wa, wb: TNeuralFloat;
   W, PrevOut, Bias: TNNetVolume;
   prevSizeX, prevSizeY: integer;
 begin
@@ -88570,7 +88568,8 @@ begin
     for oc := 0 to outCMax do
     begin
       W := FArrNeurons[oc].FWeights;
-      for i := 0 to 1 do y[i] := 0;
+      y0 := 0;
+      y1 := 0;
       for fy := 0 to featSizeYMax do
       begin
         prevY := oy * FStride + fy - FPadding;
@@ -88586,15 +88585,14 @@ begin
           inBase := prevBase;
           for ic := 0 to inCMax do
           begin
-            for j := 0 to 1 do
-              x[j] := PrevOut.FData[inBase + j];
-            for i := 0 to 1 do
-            begin
-              acc := 0;
-              for j := 0 to 1 do
-                acc := acc + CPX_SGN[i, j] * W.FData[tapBase + CPX_SRC[i, j]] * x[j];
-              y[i] := y[i] + acc;
-            end;
+            // M(w) = [[wa, -wb], [wb, wa]] with w = wa + wb*i: the table-driven
+            // 2x2 product IS a complex multiply, written out longhand here.
+            x0 := PrevOut.FData[inBase];
+            x1 := PrevOut.FData[inBase + 1];
+            wa := W.FData[tapBase];
+            wb := W.FData[tapBase + 1];
+            y0 := y0 + (wa * x0 - wb * x1);
+            y1 := y1 + (wb * x0 + wa * x1);
             Inc(tapBase, 2);
             Inc(inBase, 2);
           end;
@@ -88602,10 +88600,13 @@ begin
       end;
       oBase := oc * 2;
       if FSuppressBias = 0 then
-        for i := 0 to 1 do
-          y[i] := y[i] + Bias.FData[oBase + i];
-      for i := 0 to 1 do
-        FOutput.FData[baseOut + oBase + i] := y[i];
+      begin
+        y0 := y0 + Bias.FData[oBase];
+        y1 := y1 + Bias.FData[oBase + 1];
+      end;
+      Inc(oBase, baseOut);
+      FOutput.FData[oBase] := y0;
+      FOutput.FData[oBase + 1] := y1;
     end;
   end;
 end;
@@ -88632,12 +88633,10 @@ end;
 //   dL/dx[j] += sum_i CPX_SGN[i][j] * W[CPX_SRC[i][j]] * e[i].
 procedure TNNetComplexConv.ComputePreviousLayerErrorCPU();
 var
-  ox, oy, oc, fx, fy, ic, tapBase, oBase, i, j, prevBase, inBase, errBase: integer;
+  ox, oy, oc, fx, fy, ic, tapBase, oBase, prevBase, inBase, errBase: integer;
   prevX, prevY: integer;
   outSizeXMax, outSizeYMax, outCMax, featSizeXMax, featSizeYMax, inCMax: integer;
-  e: array[0..1] of TNeuralFloat;
-  allZero: boolean;
-  contrib: TNeuralFloat;
+  e0, e1, wa, wb: TNeuralFloat;
   W, LocalPrevError: TNNetVolume;
   prevSizeX, prevSizeY: integer;
 begin
@@ -88658,14 +88657,10 @@ begin
     errBase := FOutputError.GetRawPos(ox, oy);
     for oc := 0 to outCMax do
     begin
-      oBase := oc * 2;
-      allZero := True;
-      for i := 0 to 1 do
-      begin
-        e[i] := FOutputError.FData[errBase + oBase + i];
-        if e[i] <> 0 then allZero := False;
-      end;
-      if allZero then continue;
+      oBase := errBase + oc * 2;
+      e0 := FOutputError.FData[oBase];
+      e1 := FOutputError.FData[oBase + 1];
+      if (e0 = 0) and (e1 = 0) then continue;
       W := FArrNeurons[oc].FWeights;
       for fy := 0 to featSizeYMax do
       begin
@@ -88682,14 +88677,13 @@ begin
           inBase := prevBase;
           for ic := 0 to inCMax do
           begin
-            for j := 0 to 1 do
-            begin
-              contrib := 0;
-              for i := 0 to 1 do
-                contrib := contrib + CPX_SGN[i, j] * W.FData[tapBase + CPX_SRC[i, j]] * e[i];
-              LocalPrevError.FData[inBase + j] :=
-                LocalPrevError.FData[inBase + j] + contrib;
-            end;
+            // M(w)^T e with M(w) = [[wa, -wb], [wb, wa]].
+            wa := W.FData[tapBase];
+            wb := W.FData[tapBase + 1];
+            LocalPrevError.FData[inBase] :=
+              LocalPrevError.FData[inBase] + (wa * e0 + wb * e1);
+            LocalPrevError.FData[inBase + 1] :=
+              LocalPrevError.FData[inBase + 1] + (-wb * e0 + wa * e1);
             Inc(tapBase, 2);
             Inc(inBase, 2);
           end;
@@ -88704,13 +88698,10 @@ end;
 //   dL/dW[CPX_SRC[i][j]] += CPX_SGN[i][j] * x[j] * e[i].
 procedure TNNetComplexConv.BackpropagateCPU();
 var
-  ox, oy, oc, fx, fy, ic, tapBase, oBase, i, j, prevBase, inBase, errBase: integer;
+  ox, oy, oc, fx, fy, ic, tapBase, oBase, prevBase, inBase, errBase: integer;
   prevX, prevY: integer;
   outSizeXMax, outSizeYMax, outCMax, featSizeXMax, featSizeYMax, inCMax: integer;
-  x: array[0..1] of TNeuralFloat;
-  e: array[0..1] of TNeuralFloat;
-  allZero: boolean;
-  lr: TNeuralFloat;
+  x0, x1, e0, e1, d0, d1, lr: TNeuralFloat;
   WDelta, BiasDelta, PrevOut: TNNetVolume;
   prevSizeX, prevSizeY: integer;
 begin
@@ -88733,16 +88724,14 @@ begin
     for oc := 0 to outCMax do
     begin
       oBase := oc * 2;
-      allZero := True;
-      for i := 0 to 1 do
-      begin
-        e[i] := lr * FOutputError.FData[errBase + oBase + i];
-        if e[i] <> 0 then allZero := False;
-      end;
+      e0 := lr * FOutputError.FData[errBase + oBase];
+      e1 := lr * FOutputError.FData[errBase + oBase + 1];
       if FSuppressBias = 0 then
-        for i := 0 to 1 do
-          BiasDelta.FData[oBase + i] := BiasDelta.FData[oBase + i] + e[i];
-      if allZero then continue;
+      begin
+        BiasDelta.FData[oBase] := BiasDelta.FData[oBase] + e0;
+        BiasDelta.FData[oBase + 1] := BiasDelta.FData[oBase + 1] + e1;
+      end;
+      if (e0 = 0) and (e1 = 0) then continue;
       WDelta := FArrNeurons[oc].FDelta;
       for fy := 0 to featSizeYMax do
       begin
@@ -88759,13 +88748,14 @@ begin
           inBase := prevBase;
           for ic := 0 to inCMax do
           begin
-            for j := 0 to 1 do
-              x[j] := PrevOut.FData[inBase + j];
-            for i := 0 to 1 do
-              for j := 0 to 1 do
-                WDelta.FData[tapBase + CPX_SRC[i, j]] :=
-                  WDelta.FData[tapBase + CPX_SRC[i, j]]
-                  + CPX_SGN[i, j] * x[j] * e[i];
+            // dL/dwa = x0*e0 + x1*e1 ; dL/dwb = -x1*e0 + x0*e1 (the M(w) scatter
+            // with CPX_SRC = ((0,1),(1,0)) and CPX_SGN = ((1,-1),(1,1))).
+            x0 := PrevOut.FData[inBase];
+            x1 := PrevOut.FData[inBase + 1];
+            d0 := WDelta.FData[tapBase];
+            d1 := WDelta.FData[tapBase + 1];
+            WDelta.FData[tapBase] := d0 + x0 * e0 + x1 * e1;
+            WDelta.FData[tapBase + 1] := d1 - x1 * e0 + x0 * e1;
             Inc(tapBase, 2);
             Inc(inBase, 2);
           end;
