@@ -27296,28 +27296,19 @@ end;
 procedure DETRSoftMaxQuery(V: TNNetVolume; X, Y, LblCnt: integer;
   var Probs: array of TNeuralFloat; DstBase: integer);
 var
-  C, KM1, base: integer;
-  MaxL, S, E, vv: TNeuralFloat;
+  K1, base: integer;
+  MaxL, S: TNeuralFloat;
 begin
-  KM1 := LblCnt;            // last index = no-object slot (LblCnt)
+  K1 := LblCnt + 1;         // LblCnt classes + the no-object slot at index LblCnt
   base := V.GetRawPos(X, Y);
-  MaxL := V.FData[base];
-  for C := 1 to KM1 do
-  begin
-    vv := V.FData[base + C];
-    if vv > MaxL then MaxL := vv;
-  end;
-  S := 0;
-  for C := 0 to KM1 do
-  begin
-    E := NeuralExp(V.FData[base + C] - MaxL);
-    Probs[DstBase + C] := E;
-    S := S + E;
-  end;
+  // #18/#19: the LblCnt+1 class logits are contiguous along depth and the
+  // caller's destination slice is contiguous too, so the max, the fused
+  // exp-and-sum and the normalize are all vectorized passes.
+  MaxL := TNNetVolume.MaxValue(Addr(V.FData[base]), K1);
+  S := TNNetVolume.ExpShiftSum(Addr(Probs[DstBase]), Addr(V.FData[base]),
+    MaxL, K1);
   if S <= 0 then S := 1e-12;
-  S := 1.0 / S;
-  for C := 0 to KM1 do
-    Probs[DstBase + C] := Probs[DstBase + C] * S;
+  TNNetVolume.Mul(Addr(Probs[DstBase]), 1.0 / S, K1);
 end;
 
 function TNNetDETRSetPredictionLoss.SolveMatching(pOut: TNNetVolume): integer;
@@ -115301,13 +115292,13 @@ const
   cTransformCount = 5; // identity, FlipX, FlipY, ReverseChannels, Roll(+1)
 var
   MaxProbeInputPos: integer;
-  TTATransformM1, LabelsM1, TTANumClassesM1, OutSizeM1: integer;
+  TTATransformM1, LabelsM1, TTANumClassesM1: integer;
   Lines: TStringList;
   TName: array[0 .. cTransformCount - 1] of string;
   TNet: array[0 .. cTransformCount - 1 ] of TNNet;
   TIdx, SampleIdx, I, ShapeX, ShapeY, ShapeD: integer;
   NumClasses, OutSize, Lbl, Pred, BaseClass, EnsClass: integer;
-  Cur, Avg: TNNetVolume;
+  Cur, Avg, Soft: TNNetVolume;
   // per-transform top-1 correct counts.
   TransformCorrect: array[0 .. cTransformCount - 1] of integer;
   BaseCorrect, EnsCorrect, AgreeCount, UsedSamples: integer;
@@ -115315,7 +115306,7 @@ var
   ClassSupport, ClassBaseCorrect, ClassEnsCorrect: array of integer;
   BaseAcc, EnsAcc, EnsDelta, AgreeRate, ClassBaseAcc, ClassEnsAcc: TNeuralFloat;
   AvgMode, Verdict, ShapeStr, DeltaTag: string;
-  MaxV, SumExp, E: TNeuralFloat;
+  MaxV, SumExp: TNeuralFloat;
 
   // Build a tiny forward-only wrapper net: Input(shape of the probe) ->
   // Transform. WhichTransform 0 = identity, which needs NO wrapper net at all
@@ -115344,6 +115335,7 @@ begin
   Result := '';
   Lines := TStringList.Create();
   Avg := nil;
+  Soft := nil;
   TTATransformM1 := cTransformCount - 1;
   for TIdx := 0 to TTATransformM1 do TNet[TIdx] := nil;
   try
@@ -115374,7 +115366,6 @@ begin
     // NumClasses: from the final-layer output size, but at least 1 + max label.
     NN.Compute(pInput[0]);
     OutSize := NN.GetLastLayer.Output.Size;
-    OutSizeM1 := OutSize - 1;
     NumClasses := OutSize;
     LabelsM1 := Length(pLabels) - 1;
     for I := 0 to LabelsM1 do
@@ -115391,6 +115382,9 @@ begin
       TNet[TIdx] := BuildTransformNet(TIdx, ShapeX, ShapeY, ShapeD);
 
     Avg := TNNetVolume.Create(OutSize, 1, 1);
+    // Softmax scratch for the probability-averaging mode, allocated once for
+    // the whole report so the per-sample loop stays allocation-free.
+    if AverageProbs then Soft := TNNetVolume.Create(OutSize, 1, 1);
     SetLength(ClassSupport, NumClasses);
     SetLength(ClassBaseCorrect, NumClasses);
     SetLength(ClassEnsCorrect, NumClasses);
@@ -115451,24 +115445,20 @@ begin
         // Accumulate into the ensemble average (logits or softmax probs).
         if AverageProbs then
         begin
-          // numerically-stable softmax over the OutSize outputs.
-          MaxV := Cur.Raw[0];
-          for I := 1 to OutSizeM1 do
-            if Cur.Raw[I] > MaxV then MaxV := Cur.Raw[I];
-          SumExp := 0;
-          for I := 0 to OutSizeM1 do
-            SumExp := SumExp + NeuralExp(Cur.Raw[I] - MaxV);
+          // Numerically-stable softmax over the OutSize outputs. #4/#19: the
+          // exponentials go into the Soft scratch on the first (fused,
+          // vectorized) pass instead of being recomputed for the accumulate,
+          // and Cur - the net's own output volume - is left untouched.
+          MaxV := TNNetVolume.MaxValue(Cur.DataPtr, OutSize);
+          SumExp := TNNetVolume.ExpShiftSum(Soft.DataPtr, Cur.DataPtr,
+            MaxV, OutSize);
           if SumExp <= 0 then SumExp := 1;
-          for I := 0 to OutSizeM1 do
-          begin
-            E := NeuralExp(Cur.Raw[I] - MaxV) / SumExp;
-            Avg.Raw[I] := Avg.Raw[I] + E;
-          end;
+          TNNetVolume.MulAdd(Avg.DataPtr, Soft.DataPtr, 1.0 / SumExp, OutSize);
         end
         else
         begin
-          for I := 0 to OutSizeM1 do
-            Avg.Raw[I] := Avg.Raw[I] + Cur.Raw[I];
+          // #13: the whole OutSize run is one vectorized add.
+          TNNetVolume.Add(Avg.DataPtr, Cur.DataPtr, OutSize);
         end;
       end;
 
@@ -115573,6 +115563,7 @@ begin
     Result := Lines.Text;
   finally
     if Avg <> nil then Avg.Free;
+    if Soft <> nil then Soft.Free;
     for TIdx := 0 to TTATransformM1 do
       if TNet[TIdx] <> nil then TNet[TIdx].Free;
     Lines.Free;

@@ -38005,10 +38005,10 @@ function WhisperCollectCrossAttention(DecoderNet: TNNet;
 var
   CrossLeaves: array of TNNetCrossAttention;
   LeafCnt, LayerCnt, HeadCnt, EncFrames, AvgN: integer;
-  i, j, h, GlobalIdx, LayersMax, HeadsHi, TextLenM1, EncFramesM1: integer;
-  rBase, lBase, idx: integer;
+  i, h, GlobalIdx, LayersMax, HeadsHi, TextLenM1: integer;
+  rBase, lBase: integer;
   Leaf: TNNetCrossAttention;
-  RowMax, SumExp, V: TNeuralFloat;
+  RowMax, SumExp: TNeuralFloat;
   FiltRow: array of TNeuralFloat;
 begin
   // 1. Enumerate the decoder's per-head cross-attention leaves in build
@@ -38032,7 +38032,6 @@ begin
   // 2. Frame count from any leaf's attention map (X axis = audio frame).
   EncFrames := CrossLeaves[0].AttentionWeights.SizeX;
   TextLenM1 := TextLen - 1;
-  EncFramesM1 := EncFrames - 1;
 
   Result := TNNetVolume.Create;
   Result.ReSize(EncFrames, TextLen, 1);
@@ -38091,23 +38090,13 @@ begin
   rBase := 0;   // #12: carry the row base (step EncFrames, Depth=1)
   for i := 0 to TextLenM1 do
   begin
-    RowMax := Result.FData[rBase];
-    for j := 1 to EncFramesM1 do
-    begin
-      V := Result.FData[rBase + j];
-      if V > RowMax then RowMax := V;
-    end;
-    SumExp := 0;
-    idx := rBase;   // #4/#6: carry rBase + j, reused by the read and the write
-    for j := 0 to EncFramesM1 do
-    begin
-      V := NeuralExp(Result.FData[idx] - RowMax);
-      Result.FData[idx] := V;
-      SumExp := SumExp + V;
-      Inc(idx);
-    end;
+    // #18/#19: the row is EncFrames contiguous floats (Depth=1), so the max, the
+    // exp and the accumulate are all vectorized passes.
+    RowMax := TNNetVolume.MaxValue(Result.GetRawPtr(rBase), EncFrames);
+    SumExp := TNNetVolume.ExpShiftSum(Result.GetRawPtr(rBase),
+      Result.GetRawPtr(rBase), RowMax, EncFrames);
     if SumExp > 0 then
-      TNNetVolume.Mul(Result.GetRawPtr(rBase), 1.0 / SumExp, EncFramesM1 + 1);
+      TNNetVolume.Mul(Result.GetRawPtr(rBase), 1.0 / SumExp, EncFrames);
     Inc(rBase, EncFrames);
   end;
 end;
@@ -47170,14 +47159,10 @@ begin
       for t1 := 0 to TM1 do
       begin
         SRow := Scores[t1];                // #9: bind row across all 3 passes
-        MaxV := SRow[0];
-        for t2 := 1 to TM1 do if SRow[t2] > MaxV then MaxV := SRow[t2];
-        SumE := 0;
-        for t2 := 0 to TM1 do
-        begin
-          SRow[t2] := NeuralExp(SRow[t2] - MaxV); // #16
-          SumE := SumE + SRow[t2];
-        end;
+        // #18/#19: the row is T contiguous floats, so the max and the fused
+        // exp-and-sum are vectorized passes.
+        MaxV := TNNetVolume.MaxValue(Addr(SRow[0]), T);
+        SumE := TNNetVolume.ExpShiftSum(Addr(SRow[0]), Addr(SRow[0]), MaxV, T);
         // keep exact divide (not reciprocal-Mul) for softmax parity.
         for t2 := 0 to TM1 do SRow[t2] := SRow[t2] / SumE;
       end;
@@ -76747,16 +76732,12 @@ begin
       e := ClassLogits.FData[clBase + c];   // #4: read once per c
       if e > MaxLogit then MaxLogit := e;
     end;
-    // #4: store each Exp into ClsProb in the first pass (was recomputed twice);
-    // #16: NeuralExp; #5: divide-by-SumExp becomes a multiply by its reciprocal.
+    // #19: the NumLabels logits are contiguous in ClassLogits and the matching
+    // ClsProb slice is contiguous too, so one fused pass exponentiates and sums.
+    // #5: divide-by-SumExp becomes a multiply by its reciprocal.
     cpBase := q * NumLabels;
-    SumExp := 0;
-    for c := 0 to NumLabelsM1 do
-    begin
-      e := NeuralExp(ClassLogits.FData[clBase + c] - MaxLogit);
-      ClsProb[cpBase + c] := e;
-      SumExp := SumExp + e;
-    end;
+    SumExp := TNNetVolume.ExpShiftSum(Addr(ClsProb[cpBase]),
+      Addr(ClassLogits.FData[clBase]), MaxLogit, NumLabels);
     // no-object slot (c = NumLabels): contributes to the denominator only.
     SumExp := SumExp + NeuralExp(ClassLogits.FData[clBase + NumLabels] - MaxLogit);
     invSum := 1.0 / SumExp;
@@ -80870,12 +80851,13 @@ begin
             LogitVal := Logits.FData[pBase + v];
             if LogitVal > MaxLogit then MaxLogit := LogitVal;
           end;
-          SumExp := 0;
-          for v := 0 to VocabM1 do
-          begin
-            Probs[v] := NeuralExp((Logits.FData[pBase + v] - MaxLogit) * invT);
-            SumExp := SumExp + Probs[v];
-          end;
+          // #19: folding the temperature into the shift - (L-Max)*invT =
+          // L*invT - Max*invT - turns the scalar exp loop into copy + Mul plus
+          // the fused ExpShiftSum, which exponentiates and sums in one pass.
+          Move(Logits.FData[pBase], Probs[0], Config.VocabSize * csNeuralFloatSize);
+          TNNetVolume.Mul(Addr(Probs[0]), invT, Config.VocabSize);
+          SumExp := TNNetVolume.ExpShiftSum(Addr(Probs[0]), Addr(Probs[0]),
+            MaxLogit * invT, Config.VocabSize);
           Draw := Random * SumExp;
           Acc := 0;
           BestV := VocabM1;
