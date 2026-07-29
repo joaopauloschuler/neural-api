@@ -1621,6 +1621,7 @@ function TEasyOpenCL.CreateContext(): cl_context;
 var
   err: integer; // error code returned from api calls
 begin
+  err := 0;
   Result := clCreateContext(nil, 1, @FCurrentDevice, nil, nil, {$IFDEF FPC}err{$ELSE}@err{$ENDIF});
 
   if Result = nil then
