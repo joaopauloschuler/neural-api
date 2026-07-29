@@ -1060,7 +1060,7 @@ begin
           ' / ' + GpuCL.DeviceNames[Opt.GpuDevice] + ']');
         LoadStart := GetTickCount64();
         NN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
-          GpuCL.Devices[Opt.GpuDevice]);
+          GpuCL.Devices[Opt.GpuDevice], {pHasSharedKernel}false);
         Notice(Format('GPU weights uploaded in %.1fs.',
           [(GetTickCount64() - LoadStart) / 1000]));
       end;

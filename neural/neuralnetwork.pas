@@ -16246,6 +16246,9 @@ type
   TNNetExecutionPlanner = class(TMObject)
     protected
       FLayers: TNNetLayerList;
+      // One handle per neural.cl entry point, shared by all layers: that is what
+      // forces device layers onto worker 0. Set by TNNet.EnableOpenCL.
+      FHasSharedKernel: boolean;
       // When True, anomaly detection scans each layer's Output (forward) and
       // OutputError (backward) for NaN/Inf and raises on the first offender.
       // Declared here because ComputeParallel falls back to the serial
@@ -16285,8 +16288,9 @@ type
       // - FSchedW0Work: layers driving the SERIALIZED OpenCL device (WillOpenCL:
       //   two concurrent layers would race clSetKernelArg on the net-wide
       //   shared kernels). Popped ONLY by worker 0, so they run serially by
-      //   construction. Chunk-eligible layers NO LONGER go here - their chunks
-      //   ride FSchedWork.
+      //   construction. Empty when FHasSharedKernel is False - private handles
+      //   have no shared argument state, so those layers ride FSchedWork.
+      //   Chunk-eligible layers NO LONGER go here - their chunks ride FSchedWork.
       FSchedWork: TWorkQueue;
       FSchedW0Work: TWorkQueue;
       // Per-pass, per-layer outstanding-chunk countdown for chunked (wkChunk)
@@ -16514,7 +16518,6 @@ type
       // construction path with no importer changes. Coded by Claude (AI).
       FBuildQuantInt8: boolean;
       {$IFDEF OpenCL}
-      FHasSharedKernel: boolean;
       FDotProductKernel: TNeuralKernel;
       // Net-wide cache of borrowed-program helper kernels, one TNeuralKernel per
       // distinct neural.cl entry point (cai_token_norm, cai_group_norm, ...),
@@ -101972,6 +101975,7 @@ begin
   inherited Create();
   FLayers := TNNetLayerList.Create();
   FDetectAnomaly := false;
+  FHasSharedKernel := true;
   FSchedPlanLayerCount := -1;
   FSchedCpuCount := NeuralDefaultThreadCount();
   // Floor the pool width at cpu cores): a straight-line graph has
@@ -122400,10 +122404,15 @@ begin
   L.FComputeState := 1;
   if L.WillOpenCL() then
   begin
-    // Serialized OpenCL device: worker 0 is the single consumer of this queue,
-    // so device layers run one at a time (two concurrent layers would race
-    // clSetKernelArg on the net-wide shared kernels). Frozen WillOpenCL verdict.
-    WorkQueuePush(FSchedW0Work, Ord(wkLayer), pLayerIdx, 0, 0);
+    // Frozen WillOpenCL verdict. With shared handles the device is serialized:
+    // worker 0 is the single consumer of FSchedW0Work, so two layers never race
+    // clSetKernelArg on the same cl_kernel. With private handles there is no
+    // shared argument state, so the layer rides the general queue and any worker
+    // may run it. Either way it goes as a whole wkLayer - chunking it would
+    // divert the layer onto the CPU ComputeRange path.
+    if FHasSharedKernel
+      then WorkQueuePush(FSchedW0Work, Ord(wkLayer), pLayerIdx, 0, 0)
+      else WorkQueuePush(FSchedWork, Ord(wkLayer), pLayerIdx, 0, 0);
     exit;
   end;
   if L.WillThread() then
