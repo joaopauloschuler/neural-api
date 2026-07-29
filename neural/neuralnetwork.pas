@@ -2944,7 +2944,7 @@ type
   private
     // Per-instance backward scratch (sized E = number of experts in
     // SetPrevLayer) to avoid per-pass heap allocation in the hot path.
-    FPBuf, FFBuf: array of TNeuralFloat;
+    FFBuf: array of TNeuralFloat;
     FKeptBuf: array of boolean;
     FTopIdx: array of integer;        // top-k selection scratch (NeuralMarkTopK)
     FTopVal: array of TNeuralFloat;
@@ -27313,7 +27313,6 @@ var
 begin
   inherited SetPrevLayer(pPrevLayer);
   E := pPrevLayer.FOutput.Depth; // number of experts
-  SetLength(FPBuf, E);
   SetLength(FFBuf, E);
   SetLength(FKeptBuf, E);
   SetLength(FTopIdx, E);
@@ -27322,7 +27321,6 @@ end;
 
 destructor TNNetLoadBalanceLoss.Destroy();
 begin
-  SetLength(FPBuf, 0);
   SetLength(FFBuf, 0);
   SetLength(FKeptBuf, 0);
   SetLength(FTopIdx, 0);
@@ -27333,8 +27331,9 @@ end;
 procedure TNNetLoadBalanceLoss.Backpropagate();
 var
   StartTime: double;
-  Coeff, Val, BestVal, InvT, kScale: TNeuralFloat;
-  E, EM1, T, TopCnt, MaxX, MaxY, X, Y, D, CntK, BestIdx, baseOut0, baseErr0: integer;
+  Coeff, InvT, kScale: TNeuralFloat;
+  E, EM1, T, TopCnt, MaxX, MaxY, X, Y, D, baseOut0, baseErr0,
+  RowBytes: integer;
 begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
@@ -27350,15 +27349,14 @@ begin
   Coeff := FFloatSt[0];
   if T < 1 then T := 1;
   InvT := 1.0 / T;
-  FillChar(FPBuf[0], E * csNeuralFloatSize, 0);
   FillChar(FFBuf[0], E * csNeuralFloatSize, 0);
-  // Aggregate P_i (mean gate prob) and f_i (mean top-k touch fraction) over
-  // all tokens (cells).
+  // Aggregate f_i (mean top-k touch fraction) over all tokens (cells). P_i (the
+  // mean gate probability) is not aggregated: the gradient below carries only
+  // the stop-gradient f_i, so no P_i quantity is ever read.
   for X := 0 to MaxX do
     for Y := 0 to MaxY do
     begin
       baseOut0 := FOutput.GetRawPos(X, Y);
-      TNNetVolume.Add(@FPBuf[0], FOutput.GetRawPtr(baseOut0), E);
       FillChar(FKeptBuf[0], E, 0); // Boolean = 1 byte
       // Hard top-TopCnt assignment for this token (#22: one pass, not TopCnt).
       NeuralMarkTopK(FOutput.DataPtr, nil, baseOut0, 1, E, TopCnt,
@@ -27366,16 +27364,19 @@ begin
       for D := 0 to EM1 do
         if FKeptBuf[D] then FFBuf[D] := FFBuf[D] + 1;
     end;
-  TNNetVolume.Mul(@FPBuf[0], InvT, E);
   TNNetVolume.Mul(@FFBuf[0], InvT, E);
-  // dL_aux/dg_t[i] = coeff * E * f_i / T  (f_i is stop-gradient).
+  // dL_aux/dg_t[i] = coeff * E * f_i / T  (f_i is stop-gradient), the same row
+  // for every token. kScale is invariant across the nest, so fold it into FFBuf
+  // once and leave the per-token body a pure Move. FFBuf is re-zeroed at the top
+  // of every call and read nowhere after this nest, so scaling in place is safe.
   kScale := Coeff * E * InvT;
+  TNNetVolume.Mul(@FFBuf[0], kScale, E);
+  RowBytes := E * csNeuralFloatSize;
   for X := 0 to MaxX do
     for Y := 0 to MaxY do
     begin
       baseErr0 := FOutputError.GetRawPos(X, Y);
-      Move(FFBuf[0], FOutputError.FData[baseErr0], E * csNeuralFloatSize);
-      TNNetVolume.Mul(FOutputError.GetRawPtr(baseErr0), kScale, E);
+      Move(FFBuf[0], FOutputError.FData[baseErr0], RowBytes);
     end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
