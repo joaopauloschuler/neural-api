@@ -41617,7 +41617,7 @@ end;
 // Claude (AI).
 var
   FConvOpenCLEnabled: boolean = false;
-  FConvDotKernel: TDotProductKernel = nil;
+  FConvDotKernel: TNeuralKernel = nil;
   FConvDotCL: TDotProductSharedKernel = nil;
   // Scratch operands reused across stages to avoid per-call allocation.
   FConvWInter: TNNetVolume = nil;   // interleaved weights  As[i*OutCh + o]

@@ -532,7 +532,7 @@ type
 
       {$IFDEF OpenCL}
       procedure DisableOpenCL(); virtual;
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); virtual;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); virtual;
       {$ENDIF}
       // Computes the forward pass of this layer.
       procedure Compute(); virtual; abstract;
@@ -899,7 +899,7 @@ type
       // the checkpoint row width. Coded by Claude (AI).
       property QuantInt8VectorSize: integer read FQuantVectorSize;
       {$IFDEF OpenCL}
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       // Interleaves FQuantTable's codes into the device layout and arms
       // FDotCL's resident int8 mode (cai_dot_product_int8) against VBs.
@@ -1003,7 +1003,7 @@ type
       // Allocates the shared dot-product kernel (inherited FDotCL) and the
       // transpose / result scratch, then arms the Gram-GEMM offload. Mirrors
       // TNNetLinearAttention/TNNetFullConnect.
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       {$ENDIF}
   end;
 
@@ -1046,7 +1046,7 @@ type
       constructor Create(); override;
       {$IFDEF OpenCL}
       destructor Destroy(); override;
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       function WillOpenCL(): boolean; override;
       {$ENDIF}
@@ -1971,7 +1971,7 @@ type
     {$IFDEF OpenCL}
     destructor Destroy(); override;
     function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
     {$ENDIF}
     procedure Compute(); override;
@@ -1998,7 +1998,7 @@ type
     {$IFDEF OpenCL}
     destructor Destroy(); override;
     function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
     {$ENDIF}
     procedure Compute(); override;
@@ -2050,7 +2050,7 @@ type
     {$IFDEF OpenCL}
     destructor Destroy(); override;
     function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
     {$ENDIF}
     procedure Compute(); override;
@@ -2103,7 +2103,7 @@ type
     {$IFDEF OpenCL}
     destructor Destroy(); override;
     function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
     {$ENDIF}
     procedure Compute(); override;
@@ -3645,7 +3645,7 @@ type
     procedure Backpropagate(); override;
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
     {$ENDIF}
   end;
@@ -4070,7 +4070,7 @@ type
     // Allocates the shared dot-product kernel handle (inherited FDotCL) and the
     // Q/K packing buffers, then flags this layer to offload the prefill score
     // matmul. Coded by Claude (AI).
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     {$ENDIF}
     // Enable the KV-cache incremental-decode path. Preallocates the K and V
     // caches for at most MaxContext positions and starts an empty sequence.
@@ -4354,7 +4354,7 @@ type
     // Allocates the shared dot-product kernel handle (inherited FDotCL) and the
     // Q/K/V packing buffers, then flags this layer to offload the forward matmuls.
     // Coded by Claude (AI).
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     {$ENDIF}
     property AttentionWeights: TNNetVolume read FAttn;
     property Dk: integer read FDk;
@@ -4837,7 +4837,7 @@ type
     procedure AppendInputLayers(pList: TList); override;
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
     {$ENDIF}
     property ThetaSource: TNNetLayer read FThetaLayer;
@@ -4909,7 +4909,7 @@ type
     procedure AppendInputLayers(pList: TList); override;
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
     {$ENDIF}
     property GridSource: TNNetLayer read FGridLayer;
@@ -4968,7 +4968,7 @@ type
     procedure AppendInputLayers(pList: TList); override;
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
     {$ENDIF}
     property FlowSource: TNNetLayer read FFlowLayer;
@@ -5026,7 +5026,7 @@ type
     procedure AppendInputLayers(pList: TList); override;
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
     {$ENDIF}
     property FlowSource: TNNetLayer read FFlowLayer;
@@ -5081,7 +5081,7 @@ type
     {$IFDEF OpenCL}
     // Allocates the shared dot-product kernel (inherited FDotCL) plus the
     // transpose buffers, then flags this layer to offload its forward GEMM.
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     {$ENDIF}
     property F2Source: TNNetLayer read FF2Layer;
   end;
@@ -5132,7 +5132,7 @@ type
     function WillOpenCL(): boolean; override;
     // Allocates the shared bilinear-gather kernel plus the corner/weight/result
     // staging buffers, then flags this layer to offload its forward sampling.
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
     {$ENDIF}
     property Radius: integer read FRadius;
@@ -5790,7 +5790,7 @@ type
     destructor Destroy(); override;
     procedure Compute(); override;
     {$IFDEF OpenCL}
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     {$ENDIF}
     procedure Backpropagate(); override;
     procedure InitDefault(); override;
@@ -5981,7 +5981,7 @@ type
       pMaxRelPos: integer = 512); overload;
     procedure Compute(); override;
     {$IFDEF OpenCL}
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     {$ENDIF}
     procedure Backpropagate(); override;
     procedure InitDefault(); override;
@@ -6047,7 +6047,7 @@ type
       pWindow: integer = 0); overload;
     procedure Compute(); override;
     {$IFDEF OpenCL}
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     {$ENDIF}
     procedure Backpropagate(); override;
     procedure InitDefault(); override;
@@ -6105,7 +6105,7 @@ type
       pSlope: TNeuralFloat = 0.0625; pWindow: integer = 0); overload;
     procedure Compute(); override;
     {$IFDEF OpenCL}
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     {$ENDIF}
     // EXACT port of the per-head slope recipe in HF transformers'
     // build_alibi_tensor (modeling_bloom; itself the fairseq/paper recipe).
@@ -6517,7 +6517,7 @@ type
     // Allocates the shared dot-product kernel (inherited FDotCL) plus the
     // transpose buffers, then flags this layer to offload its two forward
     // GEMMs. Coded by Claude (AI).
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     {$ENDIF}
     property Dk: integer read FDk;
   end;
@@ -6772,7 +6772,7 @@ type
     destructor Destroy(); override;
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
     {$ENDIF}
     // Frozen verdict: net-wide intra-layer threading is on and the forward
@@ -6899,7 +6899,7 @@ type
     destructor Destroy(); override;
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
     // Drops the cached OpenCL angle-table prefix so the next device forward
     // rebuilds the whole table. Call it when starting a fresh sequence (the
@@ -7306,7 +7306,7 @@ type
     destructor Destroy; override;
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
     procedure AfterWeightUpdate(); override;
     {$ENDIF}
@@ -7609,7 +7609,7 @@ type
       procedure InitDefault(); override;
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
@@ -7662,7 +7662,7 @@ type
       procedure InitDefault(); override;
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
@@ -7696,7 +7696,7 @@ type
       procedure InitDefault(); override;
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
@@ -7767,7 +7767,7 @@ type
       function ChunkWorkCount(): integer; override;
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
@@ -7863,7 +7863,7 @@ type
       procedure Backpropagate(); override;
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
@@ -7912,7 +7912,7 @@ type
       procedure InitDefault(); override;
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       {$ENDIF}
       // Normalization epsilon (default 1e-5; e.g. diffusers GroupNorm uses 1e-6).
@@ -8937,7 +8937,7 @@ type
       function ChunkWorkCount(): integer; override;
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
@@ -9490,7 +9490,7 @@ type
       // Allocates the shared dot-product kernel (inherited FDotCL) and the
       // packed-weight / projection buffers, then arms the input-projection
       // offload. Mirrors TNNetFullConnect/TNNetCrossAttention.
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       {$ENDIF}
   end;
 
@@ -9563,7 +9563,7 @@ type
       // Allocates the shared dot-product kernel (inherited FDotCL) and the
       // packed-weight / projection buffers, then arms the input-projection
       // offload. Mirrors TNNetFullConnect/TNNetCrossAttention.
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       {$ENDIF}
   end;
 
@@ -11325,7 +11325,7 @@ type
       procedure AppendInputLayers(pList: TList); override;
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
@@ -12131,7 +12131,7 @@ type
       procedure BackpropagateCPU(); virtual;
       destructor Destroy(); override;
       {$IFDEF OpenCL}
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure ComputeOpenCL(); virtual;
       // Int8 device forward: the resident code/scale buffers do the GEMV via
       // cai_dot_product_int8; only the input re-uploads. Same fused
@@ -13143,7 +13143,7 @@ type
     {$IFDEF OpenCL}
     destructor Destroy(); override;
     function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
     {$ENDIF}
   end;
@@ -13473,7 +13473,7 @@ type
     procedure InitDefault(); override;
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
     {$ENDIF}
   end;
@@ -13524,7 +13524,7 @@ type
       constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload; virtual;
       destructor Destroy(); override;
       {$IFDEF OpenCL}
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       {$ENDIF}
 
@@ -14014,7 +14014,7 @@ type
     procedure InitDefault(); override;
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     {$ENDIF}
     property Degree: integer read FDegree;
     property Basis: integer read FBasis;
@@ -14878,7 +14878,7 @@ type
     procedure Backpropagate(); override;
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     {$ENDIF}
     property InDepth: integer read FInDepth;
     property OutDepth: integer read FOutDepth;
@@ -14948,7 +14948,7 @@ type
     {$IFDEF OpenCL}
     destructor Destroy(); override;
     function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     {$ENDIF}
     property InDepth: integer read FInDepth;
     property FeaturesCount: integer read FFeaturesCount;
@@ -15487,7 +15487,7 @@ type
     procedure Backpropagate(); override;
     {$IFDEF OpenCL}
     destructor Destroy(); override;
-    procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     {$ENDIF}
   end;
 
@@ -15604,7 +15604,7 @@ type
       {$IFDEF OpenCL}
       destructor Destroy(); override;
       function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       {$ENDIF}
       procedure Compute(); override;
@@ -16052,7 +16052,7 @@ type
       procedure Backpropagate(); override;
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
@@ -16087,7 +16087,7 @@ type
       procedure Backpropagate(); override;
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
@@ -16137,7 +16137,7 @@ type
       procedure Backpropagate(); override;
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
@@ -16172,7 +16172,7 @@ type
       procedure Backpropagate(); override;
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
@@ -16226,7 +16226,7 @@ type
       procedure Backpropagate(); override;
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
-      procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
@@ -16514,7 +16514,7 @@ type
       FBuildQuantInt8: boolean;
       {$IFDEF OpenCL}
       FHasSharedKernel: boolean;
-      FDotProductKernel: TDotProductKernel;
+      FDotProductKernel: TNeuralKernel;
       // Net-wide cache of borrowed-program helper kernels, one TNeuralKernel per
       // distinct neural.cl entry point (cai_token_norm, cai_group_norm, ...),
       // SHARED by every layer of that type instead of one handle per layer
@@ -21686,7 +21686,7 @@ begin
   FreeAndNil(FSoftMaxCL);
 end;
 
-procedure TNNetPointwiseSoftMax.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetPointwiseSoftMax.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FSoftMaxCL) then
@@ -22173,7 +22173,7 @@ begin
 end;
 
 {$IFDEF OpenCL}
-procedure TNNetGramMatrix.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetGramMatrix.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL
   if not Assigned(FDotCL) then
@@ -24122,7 +24122,7 @@ begin
   FreeAndNil(FGLUGateCL);
 end;
 
-procedure TNNetGEGLU.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetGEGLU.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FGLUGateCL) then
@@ -24363,7 +24363,7 @@ begin
   FreeAndNil(FGLUGateCL);
 end;
 
-procedure TNNetGEGLUErf.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetGEGLUErf.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FGLUGateCL) then
@@ -24710,7 +24710,7 @@ begin
   FreeAndNil(FGLUGateCL);
 end;
 
-procedure TNNetSwiGLU.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetSwiGLU.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FGLUGateCL) then
@@ -25055,7 +25055,7 @@ begin
   FreeAndNil(FGLUGateCL);
 end;
 
-procedure TNNetGLU.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetGLU.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FGLUGateCL) then
@@ -30396,7 +30396,7 @@ begin
   FreeAndNil(FL2NormCL);
 end;
 
-procedure TNNetL2Normalize.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetL2Normalize.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FL2NormCL) then
@@ -31957,7 +31957,7 @@ end;
 
 {$IFDEF OpenCL}
 procedure TNNetScaledDotProductAttention.EnableOpenCL(
-  DotProductKernel: TDotProductKernel);
+  DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL
   if not Assigned(FDotCL) then
@@ -35018,7 +35018,7 @@ end;
 
 {$IFDEF OpenCL}
 procedure TNNetCrossAttention.EnableOpenCL(
-  DotProductKernel: TDotProductKernel);
+  DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL
   if not Assigned(FDotCL) then
@@ -36410,7 +36410,7 @@ begin
   FreeAndNil(FGatherCL);
 end;
 
-procedure TNNetAffineGridSample.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetAffineGridSample.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FGatherCL) then
@@ -36749,7 +36749,7 @@ begin
   FreeAndNil(FGatherCL);
 end;
 
-procedure TNNetGridSample.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetGridSample.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FGatherCL) then
@@ -37105,7 +37105,7 @@ begin
   FreeAndNil(FGatherCL);
 end;
 
-procedure TNNetFlowWarp.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetFlowWarp.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   // Bare TNNetLayer arming plus our own gather kernel + scratch (the offload runs
   // through ComputeOpenCL; the scalar+AVX CPU forward is the fallback).
@@ -37403,7 +37403,7 @@ begin
   FreeAndNil(FGatherCL);
 end;
 
-procedure TNNetBackwardWarp.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetBackwardWarp.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FGatherCL) then
@@ -37602,7 +37602,7 @@ end;
 
 {$IFDEF OpenCL}
 procedure TNNetCorrelationVolume.EnableOpenCL(
-  DotProductKernel: TDotProductKernel);
+  DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL
   if not Assigned(FDotCL) then
@@ -37904,7 +37904,7 @@ begin
 end;
 
 procedure TNNetCorrelationLookup.EnableOpenCL(
-  DotProductKernel: TDotProductKernel);
+  DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FGatherCL) then
@@ -38306,7 +38306,7 @@ begin
 end;
 
 {$IFDEF OpenCL}
-procedure TNNetLinearAttention.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetLinearAttention.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL
   if not Assigned(FDotCL) then
@@ -40115,7 +40115,7 @@ end;
 
 {$IFDEF OpenCL}
 procedure TNNetCosineSimilarityAttention.EnableOpenCL(
-  DotProductKernel: TDotProductKernel);
+  DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel); // allocs FDotCL + Q/K/V buffers
   // The parent guards FShouldOpenCL by exact ClassType (false for subclasses);
@@ -41009,7 +41009,7 @@ end;
 
 {$IFDEF OpenCL}
 procedure TNNetDisentangledAttention.EnableOpenCL(
-  DotProductKernel: TDotProductKernel);
+  DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel); // allocs FDotCL + Q/K/V buffers
   // The parent guards FShouldOpenCL by exact ClassType (false for subclasses);
@@ -41385,7 +41385,7 @@ end;
 
 {$IFDEF OpenCL}
 procedure TNNetConformerRelPosAttention.EnableOpenCL(
-  DotProductKernel: TDotProductKernel);
+  DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel); // allocs FDotCL + Q/K/V buffers
   // The parent guards FShouldOpenCL by exact ClassType (false for subclasses);
@@ -41730,7 +41730,7 @@ begin
 end;
 
 {$IFDEF OpenCL}
-procedure TNNetALiBiAttention.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetALiBiAttention.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel); // allocs FDotCL + Q/K/V buffers
   // The parent guards FShouldOpenCL by exact ClassType (false for subclasses);
@@ -43704,7 +43704,7 @@ begin
   FreeAndNil(FRoPECL);
 end;
 
-procedure TNNetRotaryEmbedding.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetRotaryEmbedding.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FRoPECL) then
@@ -44303,7 +44303,7 @@ begin
   FreeAndNil(FMRoPECL);
 end;
 
-procedure TNNetMRotaryEmbedding.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetMRotaryEmbedding.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FMRoPECL) then
@@ -50022,7 +50022,7 @@ begin
   FreeAndNil(FAdaINCL);
 end;
 
-procedure TNNetAdaIN.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetAdaIN.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FAdaINCL) then
@@ -51763,7 +51763,7 @@ begin
   FreeAndNil(FScatterCL);
 end;
 
-procedure TNNetPixelShuffle.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetPixelShuffle.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FShuffleCL) then
@@ -52028,7 +52028,7 @@ begin
   FreeAndNil(FGatherCL);
 end;
 
-procedure TNNetBilinearUpsample.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetBilinearUpsample.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FGatherCL) then
@@ -52296,7 +52296,7 @@ begin
   FreeAndNil(FScatterCL);
 end;
 
-procedure TNNetBicubicUpsample.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetBicubicUpsample.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FGatherCL) then
@@ -52626,7 +52626,7 @@ begin
   FreeAndNil(FGatherCL);
 end;
 
-procedure TNNetBilinearResize.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetBilinearResize.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FGatherCL) then
@@ -52901,7 +52901,7 @@ begin
   FreeAndNil(FBicubicGatherCL);
 end;
 
-procedure TNNetResize2D.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetResize2D.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   // One gather helper per blend mode (only the active mode is ever used, but
@@ -54529,7 +54529,7 @@ begin
   FreeAndNil(FDepthwiseCL);
 end;
 
-procedure TNNetDepthwiseConv.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetDepthwiseConv.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   // Bare TNNetLayer arming only (FHasOpenCL + the shared dot-product kernel) plus
   // our dedicated true-depthwise forward helper. The depthwise per-channel sweep
@@ -58261,7 +58261,7 @@ begin
   FreeAndNil(FDepthwise1DCL);
 end;
 
-procedure TNNetDepthwiseConv1D.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetDepthwiseConv1D.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   // Bare TNNetLayer arming only (FHasOpenCL + the shared dot-product kernel) plus
   // our dedicated true-depthwise forward helper. The per-channel sweep does not
@@ -64411,7 +64411,7 @@ begin
 end;
 
 {$IFDEF OpenCL}
-procedure TNNetLSTMCell.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetLSTMCell.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL
   if not Assigned(FDotCL) then
@@ -64830,7 +64830,7 @@ begin
 end;
 
 {$IFDEF OpenCL}
-procedure TNNetGRUCell.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetGRUCell.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL
   if not Assigned(FDotCL) then
@@ -71460,7 +71460,7 @@ begin
   FreeAndNil(FTokenNormCL);
 end;
 
-procedure TNNetLayerNorm.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetLayerNorm.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FTokenNormCL) then
@@ -71705,7 +71705,7 @@ begin
   FreeAndNil(FTokenNormCL);
 end;
 
-procedure TNNetTokenLayerNorm.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetTokenLayerNorm.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FTokenNormCL) then
@@ -71913,7 +71913,7 @@ begin
   FreeAndNil(FTokenNormCL);
 end;
 
-procedure TNNetRMSNorm.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetRMSNorm.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FTokenNormCL) then
@@ -72164,7 +72164,7 @@ begin
   FreeAndNil(FTokenNormCL);
 end;
 
-procedure TNNetTokenRMSNorm.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetTokenRMSNorm.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FTokenNormCL) then
@@ -72931,7 +72931,7 @@ begin
   FreeAndNil(FL2NormCL);
 end;
 
-procedure TNNetPixelNorm.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetPixelNorm.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FL2NormCL) then
@@ -73273,7 +73273,7 @@ begin
   FreeAndNil(FGroupNormCL);
 end;
 
-procedure TNNetGroupNorm.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetGroupNorm.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FGroupNormCL) then
@@ -73792,7 +73792,7 @@ begin
     FNN.FreeKernelIfNotShared('cai_im2col', FIm2ColKernel);
 end;
 
-procedure TNNetConvolutionBase.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetConvolutionBase.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel);
   if FQuantInt8 then
@@ -73817,7 +73817,7 @@ begin
 end;
 
 procedure TNNetLayerConcatedWeights.EnableOpenCL(
-  DotProductKernel: TDotProductKernel);
+  DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel);
   (*
@@ -84151,7 +84151,7 @@ begin
 end;
 
 {$IFDEF OpenCL}
-procedure TNNetDeformableConv.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetDeformableConv.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   // Deliberately do NOT chain through TNNetConvolutionBase.EnableOpenCL: that
   // path concats/interleaves a per-feature-neuron weight bank and arms the
@@ -84806,7 +84806,7 @@ begin
   inherited Destroy();
 end;
 
-procedure TNNetGroupConvP4.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetGroupConvP4.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   // As with TNNetDeformableConv, bypass the standard conv concated-weight
   // arming (our shared-bank neuron layout is not the per-output-feature layout
@@ -89950,7 +89950,7 @@ begin
 end;
 
 {$IFDEF OpenCL}
-procedure TNNetKANConv.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetKANConv.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   // As with TNNetDepthwiseConv / TNNetGroupConvP4, bypass the standard conv
   // concated-weight arming: the KAN per-filter coefficient layout is NOT the
@@ -95605,7 +95605,7 @@ begin
   inherited Destroy();
 end;
 
-procedure TNNetDeconvolution.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetDeconvolution.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   // Deliberately do NOT chain through TNNetConvolutionBase.EnableOpenCL: that
   // path concats/interleaves a per-output-feature weight bank and arms the
@@ -96140,7 +96140,7 @@ begin
     FNN.FreeKernelIfNotShared('cai_activation', FActivationKernel);
 end;
 
-procedure TNNetIdentity.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetIdentity.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel);
   // Only the layers that opted in (FActivationOpcode <> csActNone) use the net's
@@ -97773,7 +97773,7 @@ begin
   FreeAndNil(FPool2DCL);
 end;
 
-procedure TNNetMaxPool.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetMaxPool.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FPool2DCL) then
@@ -101044,7 +101044,7 @@ begin
   if not FBatchUpdate then AfterWeightUpdate();
 end;
 
-procedure TNNetFullConnect.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetFullConnect.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel);
   FOutputRaw.Resize(FOutput);
@@ -101309,7 +101309,7 @@ begin
   FreeAndNil(FEmbeddingCL);
 end;
 
-procedure TNNetEmbedding.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetEmbedding.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FEmbeddingCL) then
@@ -125491,7 +125491,7 @@ begin
   FShouldOpenCL := false;
 end;
 
-procedure TNNetLayer.EnableOpenCL(DotProductKernel: TDotProductKernel);
+procedure TNNetLayer.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
 end;

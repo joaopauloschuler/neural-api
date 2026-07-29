@@ -210,8 +210,6 @@ type
       property Kernel: cl_kernel read FKernel;
   end;
 
-  TDotProductKernel = class(TNeuralKernel);
-
   // Do not use this class. It's under development
   TNNetVolumeCL = class(TNNetVolume)
     private
@@ -278,7 +276,7 @@ type
       /// frees it. nil on every FP32-only instance. Buffers and enqueues ride
       /// the shared in-order queue via FDotProductKernel. Coded by Claude (AI).
       FInt8Kernel: TNeuralKernel;
-      FDotProductKernel: TDotProductKernel;
+      FDotProductKernel: TNeuralKernel;
       FCodesBuffer: cl_mem;
       FScalesBuffer: cl_mem;
       FCapCodes, FCapScales: csize_t;
@@ -287,7 +285,7 @@ type
 
       function Kernel(): cl_kernel; {$IFDEF Release} inline; {$ENDIF}
     public
-      constructor Create(DotProductKernel: TDotProductKernel;
+      constructor Create(DotProductKernel: TNeuralKernel;
         pInt8Kernel: TNeuralKernel = nil);
       destructor Destroy(); override;
 
@@ -331,7 +329,7 @@ type
       /// The underlying device kernel shared by this instance. Exposed so a layer
       /// can spin up a second TDotProductSharedKernel (e.g. a dedicated backward
       /// instance) bound to the same kernel without re-deriving it.
-      property DotProductKernel: TDotProductKernel read FDotProductKernel;
+      property DotProductKernel: TNeuralKernel read FDotProductKernel;
       /// True after a successful PrepareForComputeInt8 (cleared by
       /// UnprepareForCompute). Layers gate their int8 device route on this,
       /// falling back to the fused CPU path when unarmed.
@@ -339,7 +337,7 @@ type
   end;
 
   /// Class that does dot products via OpenCL
-  TDotProductCL = class (TDotProductKernel)
+  TDotProductCL = class (TNeuralKernel)
     private
       /// Kernel parameters: number of vector As and Bs
       FNumAs, FNumBs: longint;
@@ -459,7 +457,7 @@ begin
   Kernel := FDotProductKernel.Kernel;
 end;
 
-constructor TDotProductSharedKernel.Create(DotProductKernel: TDotProductKernel;
+constructor TDotProductSharedKernel.Create(DotProductKernel: TNeuralKernel;
   pInt8Kernel: TNeuralKernel = nil);
 begin
   inherited Create();
