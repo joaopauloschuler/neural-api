@@ -26843,8 +26843,11 @@ begin
 
   // Run the log-space forward-backward and write -gamma into FOutputError.
   // ForwardBackwardLogLoss ReSizes+Fills FCTCGrad internally (rule #17 scratch).
-  ForwardBackwardLogLoss(FOutput, Slice(FLabelsBuf, LabelCnt), BlankIndex(),
-    FCTCGrad);
+  {$IFDEF FPC}
+  ForwardBackwardLogLoss(FOutput, Slice(FLabelsBuf, LabelCnt), BlankIndex(), FCTCGrad);
+  {$ELSE}
+  ForwardBackwardLogLoss(FOutput, Copy(FLabelsBuf, 0, LabelCnt), BlankIndex(), FCTCGrad);
+  {$ENDIF}
   FOutputError.Copy(FCTCGrad);
 
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -73100,8 +73103,9 @@ begin
   begin
     // Zero row (or nothing finite): zero codes with unit scale.
     CountM1 := Count - 1;
-    {$IFNDEF FPC} {$POINTERMATH ON} {$ENDIF}
+    {$IFNDEF FPC} {$PUSHOPT} {$POINTERMATH ON} {$ENDIF}
     for i := 0 to CountM1 do Codes[i] := 0;
+    {$IFNDEF FPC} {$POPOPT} {$ENDIF}
     Scale := 1;
   end;
 end;
