@@ -45527,10 +45527,13 @@ var
   InChM1, OutChM1, KM1, InLenM1, OutLenM1: integer;
   PatchLen, tSP, iK, wBase, oKInCh, tS, tInCh, wOfs: integer;
   tInChP, OCKp, dstBaseP, srcIdxP, oK: integer;
-  Acc: TNeuralFloat;
+  TileT, t0, tt, MaxTilePos, pOfs, pBase: integer;
+  Acc, Bias: TNeuralFloat;
   Patch: TNeuralFloatDynArr;
   InT, WT: TNeuralFloatDynArr;
   InRow, OutRow: TNeuralFloatDynArr;
+  InRowPtrs: array of TNeuralFloatArrPtr;
+  InRowP, OutRowP: TNeuralFloatArrPtr;
   {$IFDEF OpenCL}
   Gatherer: TConvPatchGatherer;
   InSigRef: TNNetFloatDynArr2D;
@@ -45584,32 +45587,68 @@ begin
     // (InCh*K >= csMinAvxSize on the wide synthesis stages). The SIMD
     // reassociation matches the EnCodec/LSTM AVX changes (parity < 1e-4, not
     // bit-identical to the prior k2-major scalar order). Coded by Claude (AI).
+    if OutLen = 0 then Exit;   // nothing to convolve; Patch/W stay untouched
     PatchLen := InCh * K;
-    SetLength(Patch, PatchLen);
-    for t := 0 to OutLenM1 do
+    // Tiled over t: a patch tile of TileT positions is built first, then each
+    // W row is streamed once per TILE instead of once per position. Untiled,
+    // the whole of Conv.W (768 KB on a 256x256 K=3 resblock) is re-read from
+    // memory for every output sample and each weight feeds a single MAC; the
+    // tile raises that to TileT MACs per load. Tile bytes are held near 16 KB
+    // (half of L1) but never below 4 positions, so a wide patch still
+    // amortizes the weight stream. Bit-identical: every output is still
+    // B[o] + DotProduct(the same W row, the same patch, the same length).
+    TileT := 16384 div (PatchLen * csNeuralFloatSize);
+    if TileT < 4 then TileT := 4;
+    if TileT > 16 then TileT := 16;
+    if TileT > OutLen then TileT := OutLen;
+    SetLength(Patch, TileT * PatchLen);
+    // Unmanaged row pointers: binding InSig[i] to a dynamic-array local inside
+    // the t loop is a refcounted assignment (interlocked inc/dec) run
+    // OutLen*InCh times for K taps of use - and K is 1 on every 1x1 projection.
+    SetLength(InRowPtrs, InCh);
+    for i := 0 to InChM1 do
+      InRowPtrs[i] := TNeuralFloatArrPtr(Pointer(InSig[i]));
+    t0 := 0;
+    while t0 <= OutLenM1 do
     begin
-      tSP := t * Stride - Pad;
-      for i := 0 to InChM1 do
+      MaxTilePos := TileT - 1;
+      if t0 + MaxTilePos > OutLenM1 then MaxTilePos := OutLenM1 - t0;
+      pBase := 0;
+      for tt := 0 to MaxTilePos do
       begin
-        iK := i * K;
-        InRow := InSig[i];
-        src := tSP;              // #6: k2*Dil carried (implicit zero pad)
-        for k2 := 0 to KM1 do
+        tSP := (t0 + tt) * Stride - Pad;
+        for i := 0 to InChM1 do
         begin
-          if (src >= 0) and (src < InLen) then
-            Patch[iK + k2] := InRow[src]
-          else
-            Patch[iK + k2] := 0;
-          Inc(src, Dil);
+          iK := pBase + i * K;
+          InRowP := InRowPtrs[i];
+          src := tSP;              // #6: k2*Dil carried (implicit zero pad)
+          for k2 := 0 to KM1 do
+          begin
+            if (src >= 0) and (src < InLen) then
+              Patch[iK + k2] := InRowP^[src]
+            else
+              Patch[iK + k2] := 0;
+            Inc(src, Dil);
+          end;
         end;
+        Inc(pBase, PatchLen);
       end;
       wBase := 0;
       for o := 0 to OutChM1 do
       begin
-        OutSig[o][t] := Conv.B[o] +
-          TNNetVolume.DotProduct(Addr(Conv.W[wBase]), Addr(Patch[0]), PatchLen);
+        OutRowP := TNeuralFloatArrPtr(Pointer(OutSig[o]));
+        Bias := Conv.B[o];         // #5: invariant across the tile
+        pOfs := 0;
+        for tt := 0 to MaxTilePos do
+        begin
+          OutRowP^[t0 + tt] := Bias +
+            TNNetVolume.DotProduct(Addr(Conv.W[wBase]), Addr(Patch[pOfs]),
+              PatchLen);
+          Inc(pOfs, PatchLen);
+        end;
         Inc(wBase, PatchLen);
       end;
+      Inc(t0, TileT);
     end;
   end
   else
