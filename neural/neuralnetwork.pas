@@ -1047,6 +1047,7 @@ type
       {$IFDEF OpenCL}
       destructor Destroy(); override;
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
       function WillOpenCL(): boolean; override;
       {$ENDIF}
       procedure Compute(); override;
@@ -1971,6 +1972,7 @@ type
     destructor Destroy(); override;
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure DisableOpenCL(); override;
     {$ENDIF}
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -1997,6 +1999,7 @@ type
     destructor Destroy(); override;
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure DisableOpenCL(); override;
     {$ENDIF}
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -2048,6 +2051,7 @@ type
     destructor Destroy(); override;
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure DisableOpenCL(); override;
     {$ENDIF}
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -2100,6 +2104,7 @@ type
     destructor Destroy(); override;
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure DisableOpenCL(); override;
     {$ENDIF}
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -3641,6 +3646,7 @@ type
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure DisableOpenCL(); override;
     {$ENDIF}
   end;
 
@@ -4832,6 +4838,7 @@ type
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure DisableOpenCL(); override;
     {$ENDIF}
     property ThetaSource: TNNetLayer read FThetaLayer;
   end;
@@ -4903,6 +4910,7 @@ type
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure DisableOpenCL(); override;
     {$ENDIF}
     property GridSource: TNNetLayer read FGridLayer;
   end;
@@ -4961,6 +4969,7 @@ type
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure DisableOpenCL(); override;
     {$ENDIF}
     property FlowSource: TNNetLayer read FFlowLayer;
   end;
@@ -5018,6 +5027,7 @@ type
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure DisableOpenCL(); override;
     {$ENDIF}
     property FlowSource: TNNetLayer read FFlowLayer;
   end;
@@ -5123,6 +5133,7 @@ type
     // Allocates the shared bilinear-gather kernel plus the corner/weight/result
     // staging buffers, then flags this layer to offload its forward sampling.
     procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure DisableOpenCL(); override;
     {$ENDIF}
     property Radius: integer read FRadius;
     property FlowSource: TNNetLayer read FFlowLayer;
@@ -6762,6 +6773,7 @@ type
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure DisableOpenCL(); override;
     {$ENDIF}
     // Frozen verdict: net-wide intra-layer threading is on and the forward
     // stays on the CPU (device forwards are whole-layer on worker 0).
@@ -6888,6 +6900,7 @@ type
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure DisableOpenCL(); override;
     // Drops the cached OpenCL angle-table prefix so the next device forward
     // rebuilds the whole table. Call it when starting a fresh sequence (the
     // incremental-decode prefix-reuse would otherwise assume the previous
@@ -7294,6 +7307,7 @@ type
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure DisableOpenCL(); override;
     procedure AfterWeightUpdate(); override;
     {$ENDIF}
 
@@ -7596,6 +7610,7 @@ type
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
 
@@ -7648,6 +7663,7 @@ type
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
 
@@ -7681,6 +7697,7 @@ type
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
 
@@ -7751,6 +7768,7 @@ type
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
 
@@ -7846,6 +7864,7 @@ type
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
 
@@ -7894,6 +7913,7 @@ type
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
       {$ENDIF}
       // Normalization epsilon (default 1e-5; e.g. diffusers GroupNorm uses 1e-6).
       property GroupNormEpsilon: TNeuralFloat read FGroupNormEpsilon
@@ -8918,6 +8938,7 @@ type
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
 
@@ -11305,6 +11326,7 @@ type
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
 
@@ -13122,6 +13144,7 @@ type
     destructor Destroy(); override;
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure DisableOpenCL(); override;
     {$ENDIF}
   end;
 
@@ -13451,6 +13474,7 @@ type
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+    procedure DisableOpenCL(); override;
     {$ENDIF}
   end;
 
@@ -13501,6 +13525,7 @@ type
       destructor Destroy(); override;
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
       {$ENDIF}
 
       property Pointwise: boolean read FPointwise;
@@ -15580,6 +15605,7 @@ type
       destructor Destroy(); override;
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
       {$ENDIF}
       procedure Compute(); override;
   end;
@@ -16027,6 +16053,7 @@ type
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
 
@@ -16061,6 +16088,7 @@ type
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
 
@@ -16110,6 +16138,7 @@ type
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
 
@@ -16144,6 +16173,7 @@ type
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
 
@@ -16197,6 +16227,7 @@ type
       {$IFDEF OpenCL}
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
 
@@ -21649,6 +21680,12 @@ begin
             and (FOutput.Depth > 1) and (FShouldOpenCL or FForceOpenCL);
 end;
 
+procedure TNNetPointwiseSoftMax.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FSoftMaxCL);
+end;
+
 procedure TNNetPointwiseSoftMax.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -24079,6 +24116,12 @@ begin
             and (FShouldOpenCL or FForceOpenCL);
 end;
 
+procedure TNNetGEGLU.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FGLUGateCL);
+end;
+
 procedure TNNetGEGLU.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -24312,6 +24355,12 @@ function TNNetGEGLUErf.WillOpenCL(): boolean;
 begin
   Result := Assigned(FGLUGateCL) and FHasOpenCL
             and (FShouldOpenCL or FForceOpenCL);
+end;
+
+procedure TNNetGEGLUErf.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FGLUGateCL);
 end;
 
 procedure TNNetGEGLUErf.EnableOpenCL(DotProductKernel: TDotProductKernel);
@@ -24655,6 +24704,12 @@ begin
             and (FShouldOpenCL or FForceOpenCL);
 end;
 
+procedure TNNetSwiGLU.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FGLUGateCL);
+end;
+
 procedure TNNetSwiGLU.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -24992,6 +25047,12 @@ function TNNetGLU.WillOpenCL(): boolean;
 begin
   Result := Assigned(FGLUGateCL) and FHasOpenCL
             and (FShouldOpenCL or FForceOpenCL);
+end;
+
+procedure TNNetGLU.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FGLUGateCL);
 end;
 
 procedure TNNetGLU.EnableOpenCL(DotProductKernel: TDotProductKernel);
@@ -30327,6 +30388,12 @@ function TNNetL2Normalize.WillOpenCL(): boolean;
 begin
   Result := (FStruct[0] = 0) and Assigned(FL2NormCL) and FHasOpenCL
             and (FShouldOpenCL or FForceOpenCL);
+end;
+
+procedure TNNetL2Normalize.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FL2NormCL);
 end;
 
 procedure TNNetL2Normalize.EnableOpenCL(DotProductKernel: TDotProductKernel);
@@ -36337,6 +36404,12 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetAffineGridSample.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FGatherCL);
+end;
+
 procedure TNNetAffineGridSample.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -36670,6 +36743,12 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetGridSample.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FGatherCL);
+end;
+
 procedure TNNetGridSample.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -37020,6 +37099,12 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetFlowWarp.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FGatherCL);
+end;
+
 procedure TNNetFlowWarp.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   // Bare TNNetLayer arming plus our own gather kernel + scratch (the offload runs
@@ -37312,6 +37397,12 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetBackwardWarp.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FGatherCL);
+end;
+
 procedure TNNetBackwardWarp.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -37806,6 +37897,12 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetCorrelationLookup.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FGatherCL);
+end;
+
 procedure TNNetCorrelationLookup.EnableOpenCL(
   DotProductKernel: TDotProductKernel);
 begin
@@ -43601,6 +43698,12 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetRotaryEmbedding.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FRoPECL);
+end;
+
 procedure TNNetRotaryEmbedding.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -44194,6 +44297,12 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetMRotaryEmbedding.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FMRoPECL);
+end;
+
 procedure TNNetMRotaryEmbedding.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -49907,6 +50016,12 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetAdaIN.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FAdaINCL);
+end;
+
 procedure TNNetAdaIN.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -51641,6 +51756,13 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetPixelShuffle.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FShuffleCL);
+  FreeAndNil(FScatterCL);
+end;
+
 procedure TNNetPixelShuffle.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -51900,6 +52022,12 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetBilinearUpsample.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FGatherCL);
+end;
+
 procedure TNNetBilinearUpsample.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -52161,6 +52289,13 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetBicubicUpsample.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FGatherCL);
+  FreeAndNil(FScatterCL);
+end;
+
 procedure TNNetBicubicUpsample.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -52485,6 +52620,12 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetBilinearResize.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FGatherCL);
+end;
+
 procedure TNNetBilinearResize.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -52753,6 +52894,13 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetResize2D.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FBilinearGatherCL);
+  FreeAndNil(FBicubicGatherCL);
+end;
+
 procedure TNNetResize2D.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -54375,6 +54523,12 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetDepthwiseConv.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FDepthwiseCL);
+end;
+
 procedure TNNetDepthwiseConv.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   // Bare TNNetLayer arming only (FHasOpenCL + the shared dot-product kernel) plus
@@ -58101,6 +58255,12 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetDepthwiseConv1D.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FDepthwise1DCL);
+end;
+
 procedure TNNetDepthwiseConv1D.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   // Bare TNNetLayer arming only (FHasOpenCL + the shared dot-product kernel) plus
@@ -71294,6 +71454,12 @@ begin
             and (FShouldOpenCL or FForceOpenCL);
 end;
 
+procedure TNNetLayerNorm.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FTokenNormCL);
+end;
+
 procedure TNNetLayerNorm.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -71533,6 +71699,12 @@ begin
             and (FShouldOpenCL or FForceOpenCL);
 end;
 
+procedure TNNetTokenLayerNorm.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FTokenNormCL);
+end;
+
 procedure TNNetTokenLayerNorm.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -71735,6 +71907,12 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetRMSNorm.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FTokenNormCL);
+end;
+
 procedure TNNetRMSNorm.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -71978,6 +72156,12 @@ function TNNetTokenRMSNorm.WillOpenCL(): boolean;
 begin
   Result := Assigned(FTokenNormCL) and FHasOpenCL
             and (FShouldOpenCL or FForceOpenCL);
+end;
+
+procedure TNNetTokenRMSNorm.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FTokenNormCL);
 end;
 
 procedure TNNetTokenRMSNorm.EnableOpenCL(DotProductKernel: TDotProductKernel);
@@ -72741,6 +72925,12 @@ begin
             and (FShouldOpenCL or FForceOpenCL);
 end;
 
+procedure TNNetPixelNorm.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FL2NormCL);
+end;
+
 procedure TNNetPixelNorm.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
@@ -73075,6 +73265,12 @@ function TNNetGroupNorm.WillOpenCL(): boolean;
 begin
   Result := Assigned(FGroupNormCL) and FHasOpenCL
             and (FShouldOpenCL or FForceOpenCL);
+end;
+
+procedure TNNetGroupNorm.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FGroupNormCL);
 end;
 
 procedure TNNetGroupNorm.EnableOpenCL(DotProductKernel: TDotProductKernel);
@@ -73589,6 +73785,13 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetConvolutionBase.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  if Assigned(FNN) then
+    FNN.FreeKernelIfNotShared('cai_im2col', FIm2ColKernel);
+end;
+
 procedure TNNetConvolutionBase.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   inherited EnableOpenCL(DotProductKernel);
@@ -95930,6 +96133,13 @@ begin
   inherited Destroy();
 end;
 
+procedure TNNetIdentity.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  if Assigned(FNN) then
+    FNN.FreeKernelIfNotShared('cai_activation', FActivationKernel);
+end;
+
 procedure TNNetIdentity.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   inherited EnableOpenCL(DotProductKernel);
@@ -97555,6 +97765,12 @@ destructor TNNetMaxPool.Destroy();
 begin
   if Assigned(FPool2DCL) then FreeAndNil(FPool2DCL);
   inherited Destroy();
+end;
+
+procedure TNNetMaxPool.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FPool2DCL);
 end;
 
 procedure TNNetMaxPool.EnableOpenCL(DotProductKernel: TDotProductKernel);
@@ -101087,6 +101303,12 @@ begin
 end;
 
 {$IFDEF OpenCL}
+procedure TNNetEmbedding.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FEmbeddingCL);
+end;
+
 procedure TNNetEmbedding.EnableOpenCL(DotProductKernel: TDotProductKernel);
 begin
   FHasOpenCL := true;
