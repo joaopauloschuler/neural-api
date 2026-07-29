@@ -1399,11 +1399,19 @@ begin
   if FBorrowedContext then
   begin
     FProg := nil;
+    if Assigned(FCommands) then clReleaseCommandQueue(FCommands);
+    FCommands := nil;
+    FContext := nil;
+  end
+  else
+  begin
+    if Assigned(FProg) then clReleaseProgram(FProg);
+    if Assigned(FCommands) then clReleaseCommandQueue(FCommands);
+    if Assigned(FContext) then clReleaseContext(FContext);
+    FProg := nil;
+    FCommands := nil;
     FContext := nil;
   end;
-  if Assigned(FProg) then clReleaseProgram(FProg);
-  if Assigned(FCommands) then clReleaseCommandQueue(FCommands);
-  if Assigned(FContext) then clReleaseContext(FContext);
 end;
 
 procedure TEasyOpenCL.CompileProgram();
