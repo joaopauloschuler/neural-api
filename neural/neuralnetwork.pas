@@ -66115,7 +66115,7 @@ end;
 procedure TNNetGatedLinearAttention.InitDefault();
 var
   Depth, d, j: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal;{$ELSE}Integer;{$ENDIF}
   DepthM1: integer;
   W0, W1, W2, W3, W4: TNNetVolume;
 begin
