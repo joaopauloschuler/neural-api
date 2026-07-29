@@ -46430,7 +46430,7 @@ var
   LocalPrevOutput: TNNetVolume;
   OutputCnt: integer;
   StartTime: double;
-  x, Alpha, InvAlpha, SinAx: TNeuralFloat;
+  x, Alpha, InvAlpha, SinAx, CosAx: TNeuralFloat;
 begin
   StartTime := Now();
   LocalPrevOutput := FPrevLayer.Output;
@@ -46445,9 +46445,11 @@ begin
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
-      SinAx := pcr_sinf(Alpha * x);
+      // sin(2*alpha*x) = 2*sin(alpha*x)*cos(alpha*x), and pcr_sincosf returns
+      // both from a single argument reduction -- one call instead of two sines.
+      pcr_sincosf(Alpha * x, SinAx, CosAx);
       FOutput.FData[OutputCnt] := x + InvAlpha * SinAx * SinAx;
-      FOutputErrorDeriv.FData[OutputCnt] := 1.0 + pcr_sinf(2.0 * Alpha * x);
+      FOutputErrorDeriv.FData[OutputCnt] := 1.0 + 2.0 * SinAx * CosAx;
     end;
   end
   else
