@@ -39,6 +39,8 @@ type
     procedure TestVolumeSoftMaxParity;
     procedure TestVolumePointwiseSoftMaxParity;
     procedure TestVolumeGroupedPointwiseSoftMaxParity;
+    procedure TestGroupedDotProductsTiledRebuildsOnNewSource;
+    procedure TestGroupedDotProductsTiledPartialTile;
     procedure TestVolumePadding;
     procedure TestVolumeTranspose;
     // Additional volume tests
@@ -1163,6 +1165,90 @@ begin
         Ref[K], V.Raw[K], 1e-4);
   finally
     V.Free;
+  end;
+end;
+
+// GroupedDotProductsTiled caches a raw row pointer per A row. The cache must
+// follow the source volume: a second call with a DIFFERENT VAs of the same row
+// count has to read the new rows, not the pointers cached from the first one.
+procedure TTestNeuralVolume.TestGroupedDotProductsTiledRebuildsOnNewSource;
+const
+  Groups = 2;
+  NumAs = 4;
+  NumBs = 3;
+  VectorSize = 3;
+var
+  R: TNNetGroupedVolume;
+  A1, A2, B: TNNetVolume;
+  i: integer;
+  First: array[0..NumAs * NumBs - 1] of TNeuralFloat;
+begin
+  R := TNNetGroupedVolume.Create(NumAs * NumBs, 1, 1);
+  // Both sources stay alive, so they are guaranteed to be distinct buffers.
+  A1 := TNNetVolume.Create(NumAs, 1, VectorSize);
+  A2 := TNNetVolume.Create(NumAs, 1, VectorSize);
+  B := TNNetVolume.Create(NumBs, 1, VectorSize * Groups);
+  try
+    A1.Fill(1);
+    A2.Fill(2);
+    for i := 0 to B.Size - 1 do B.FData[i] := 0.25 * (i + 1);
+    R.Fill(0);
+    R.GroupedDotProductsTiled(Groups, NumAs, NumBs, VectorSize, A1, B, 2, 3);
+    for i := 0 to NumAs * NumBs - 1 do First[i] := R.FData[i];
+    AssertTrue('First source produced non-zero output', R.GetSumAbs() > 0);
+    R.Fill(0);
+    R.GroupedDotProductsTiled(Groups, NumAs, NumBs, VectorSize, A2, B, 2, 3);
+    // A2 is exactly twice A1, so every dot product must double.
+    for i := 0 to NumAs * NumBs - 1 do
+      AssertEquals('Second source element ' + IntToStr(i),
+        2 * First[i], R.FData[i], 1e-5);
+  finally
+    B.Free;
+    A2.Free;
+    A1.Free;
+    R.Free;
+  end;
+end;
+
+// A tile size that does not divide the range leaves a partial trailing tile;
+// the kernel must still cover the trailing rows/columns (it never zero-fills,
+// so a skipped output keeps whatever was there before).
+procedure TTestNeuralVolume.TestGroupedDotProductsTiledPartialTile;
+const
+  Groups = 1;
+  NumAs = 3;
+  NumBs = 3;
+  VectorSize = 2;
+var
+  R: TNNetGroupedVolume;
+  A, B: TNNetVolume;
+  CntA, CntB, k: integer;
+  Expected: TNeuralFloat;
+begin
+  R := TNNetGroupedVolume.Create(NumAs * NumBs, 1, 1);
+  A := TNNetVolume.Create(NumAs, 1, VectorSize);
+  B := TNNetVolume.Create(NumBs, 1, VectorSize * Groups);
+  try
+    for k := 0 to A.Size - 1 do A.FData[k] := 0.5 * (k + 1);
+    for k := 0 to B.Size - 1 do B.FData[k] := 0.25 * (k + 2);
+    R.Fill(-999);
+    // 3 rows with tile 2 and 3 columns with tile 2: both axes end in a
+    // one-wide partial tile.
+    R.GroupedDotProductsTiled(Groups, NumAs, NumBs, VectorSize, A, B, 2, 2);
+    for CntB := 0 to NumBs - 1 do
+      for CntA := 0 to NumAs - 1 do
+      begin
+        Expected := 0;
+        for k := 0 to VectorSize - 1 do
+          Expected := Expected +
+            A.FData[CntA * VectorSize + k] * B.FData[CntB * VectorSize + k];
+        AssertEquals('Partial tile A=' + IntToStr(CntA) + ' B=' + IntToStr(CntB),
+          Expected, R.FData[CntB * NumAs + CntA], 1e-5);
+      end;
+  finally
+    B.Free;
+    A.Free;
+    R.Free;
   end;
 end;
 

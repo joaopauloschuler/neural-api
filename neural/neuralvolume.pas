@@ -810,7 +810,13 @@ type
 
   TNNetGroupedVolume = class(TNNetVolume)
     protected
+      // Per-A-row group id and RAW row pointer, cached across calls. The
+      // pointers belong to one particular VAs buffer, so the cache is keyed on
+      // that buffer's base address and on the shape the rows were derived from
+      // - a later call with a resized (moved) or different VAs rebuilds.
       FGrInfoArray: TNNetGroupInfoArray;
+      FGrInfoBase: pointer;
+      FGrInfoVectorSize, FGrInfoGroups: integer;
     public
       destructor Destroy(); override;
       procedure GroupedDotProductsTiled(Groups, NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
@@ -12472,6 +12478,7 @@ var
   localNumElements, MissedElements: integer;
   PtrA, PtrB: TNeuralFloatArrPtr;
   Result: TNeuralFloat;
+  VAsBase: pointer;
   // Tiling
   TileACnt, TileBCnt: integer;
   StartTileA, EndTileA, StartTileB, EndTileB: integer;
@@ -12496,7 +12503,9 @@ begin
   {$ENDIF}
 
   // is group info not cached?
-  if Length(FGrInfoArray) <> NumAs then
+  VAsBase := VAs.GetRawPtr(0);
+  if (Length(FGrInfoArray) <> NumAs) or (FGrInfoBase <> VAsBase) or
+     (FGrInfoVectorSize <> VectorSize) or (FGrInfoGroups <> Groups) then
   begin
     SetLength(FGrInfoArray, NumAs);
     for CntA := 0 to MaxA do
@@ -12506,22 +12515,28 @@ begin
       LocalGroupInfo.PtrA := VAs.GetRawPtr(CntA*VectorSize);
       FGrInfoArray[CntA] := LocalGroupInfo;
     end;
+    FGrInfoBase := VAsBase;
+    FGrInfoVectorSize := VectorSize;
+    FGrInfoGroups := Groups;
   end;
 
   //localNumElements := (VectorSize div 4) * 4;
   //MissedElements := VectorSize - localNumElements;
   MissedElements := VectorSize and 3;
   localNumElements := VectorSize xor MissedElements;
-  MaxTileA := (NumAs div TileSizeA) - 1;
-  MaxTileB := (NumBs div TileSizeB) - 1;
+  // Ceil-division tiling with a clamped trailing PARTIAL tile (same contract as
+  // DotProductsTiled and the int8 twin), so tile sizes that do not divide the
+  // ranges still cover every row and column.
+  MaxTileA := (NumAs + TileSizeA - 1) div TileSizeA - 1;
+  MaxTileB := (NumBs + TileSizeB - 1) div TileSizeB - 1;
   for TileBCnt := 0 to MaxTileB do
   begin
     StartTileB := TileBCnt * TileSizeB;
-    EndTileB := StartTileB + TileSizeB - 1;
+    EndTileB := Min(StartTileB + TileSizeB - 1, MaxB);
     for TileACnt := 0 to MaxTileA do
     begin
       StartTileA := TileACnt * TileSizeA;
-      EndTileA := StartTileA + TileSizeA - 1;
+      EndTileA := Min(StartTileA + TileSizeA - 1, MaxA);
       for CntA := StartTileA to EndTileA do
       begin
         //GroupId := CntA div GroupASize;
@@ -17571,6 +17586,7 @@ end;
 destructor TNNetGroupedVolume.Destroy;
 begin
   SetLength(FGrInfoArray, 0);
+  FGrInfoBase := nil;
   inherited Destroy;
 end;
 
