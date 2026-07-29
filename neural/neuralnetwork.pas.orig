@@ -29105,6 +29105,7 @@ function TNNetMixtureDensity.MixtureNLL(const yTarget: array of TNeuralFloat;
 var
   Kcomp, Dim, KcompM1, DimM1, kk, dd, BaseMu, BaseS, baseOut0, muBase, sBase: integer;
   LogPi, Sigma, Mu, Diff, MaxB, SumExp: TNeuralFloat;
+  LogComp: array of TNeuralFloat;
 const
   cLog2Pi = 1.8378770664093453; // ln(2*pi)
   cSigEps = 1e-6;
@@ -29115,14 +29116,13 @@ begin
   DimM1 := Dim - 1;
   BaseMu := Kcomp;
   BaseS := Kcomp + Kcomp * Dim;
-  // FLogCompBuf is the persistent per-instance scratch sized in SetPrevLayer;
-  // it is dead between calls, so this helper reuses it instead of allocating.
+  SetLength(LogComp, Kcomp);
   baseOut0 := FOutput.GetRawPos(X, Y);
   MaxB := -1e30;
   for kk := 0 to KcompM1 do
   begin
     LogPi := pcr_logf(FOutput.FData[baseOut0 + kk] + 1e-30);
-    FLogCompBuf[kk] := LogPi;
+    LogComp[kk] := LogPi;
     muBase := baseOut0 + BaseMu + kk * Dim;
     sBase := baseOut0 + BaseS + kk * Dim;
     for dd := 0 to DimM1 do
@@ -29131,14 +29131,14 @@ begin
       Sigma := FOutput.FData[sBase + dd];
       if Sigma < cSigEps then Sigma := cSigEps;
       Diff := yTarget[dd] - Mu;
-      FLogCompBuf[kk] := FLogCompBuf[kk] -
+      LogComp[kk] := LogComp[kk] -
         (0.5 * cLog2Pi + pcr_logf(Sigma) + (Diff * Diff) / (2 * Sigma * Sigma));
     end;
-    if FLogCompBuf[kk] > MaxB then MaxB := FLogCompBuf[kk];
+    if LogComp[kk] > MaxB then MaxB := LogComp[kk];
   end;
   SumExp := 0;
   for kk := 0 to KcompM1 do
-    SumExp := SumExp + NeuralExp(FLogCompBuf[kk] - MaxB);
+    SumExp := SumExp + NeuralExp(LogComp[kk] - MaxB);
   Result := -(MaxB + pcr_logf(SumExp));
 end;
 
