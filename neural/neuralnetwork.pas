@@ -464,7 +464,7 @@ type
       // Newton-Schulz iteration scratch. Freed in the destructor. (Coded by
       // Claude (AI).)
       FMuonMmat, FMuonOmat: TNNetVolume;
-      FMuonX, FMuonA, FMuonAX, FMuonA2X, FMuonB, FMuonQt: TNNetVolume;
+      FMuonX, FMuonA, FMuonAX, FMuonA2X, FMuonQt: TNNetVolume;
 
       procedure InitStruct();
     private
@@ -124809,7 +124809,7 @@ begin
   begin
     FMuonMmat.Free; FMuonOmat.Free;
     FMuonX.Free; FMuonA.Free; FMuonAX.Free;
-    FMuonA2X.Free; FMuonB.Free; FMuonQt.Free;
+    FMuonA2X.Free; FMuonQt.Free;
   end;
   inherited Destroy();
 end;
@@ -125921,8 +125921,7 @@ end;
 procedure TNNetLayer.ClipDeltasToValue(MaxAbsValue: TNeuralFloat);
 var
   MaxNeuronPos: integer;
-  Cnt, ElemCnt, MaxElem: integer;
-  V: TNeuralFloat;
+  Cnt: integer;
   D: TNNetVolume;
   Neuron: TNNetNeuron;
 begin
@@ -125936,15 +125935,9 @@ begin
     begin
       Neuron := FNeurons[Cnt];
       D := Neuron.Delta;
-      MaxElem := D.Size - 1;
-      for ElemCnt := 0 to MaxElem do
-      begin
-        V := D.FData[ElemCnt];
-        if V > MaxAbsValue then
-          D.FData[ElemCnt] := MaxAbsValue
-        else if V < -MaxAbsValue then
-          D.FData[ElemCnt] := -MaxAbsValue;
-      end;
+      // #13: the per-element saturate over the whole delta row is a bulk
+      // clamp. ClampAbs leaves a NaN alone exactly as the scalar form did.
+      TNNetVolume.ClampAbs(D.DataPtr, MaxAbsValue, D.Size);
       if Neuron.FBiasDelta > MaxAbsValue then
         Neuron.FBiasDelta := MaxAbsValue
       else if Neuron.FBiasDelta < -MaxAbsValue then
@@ -126611,12 +126604,12 @@ end;
 // toward 1 (semi-orthogonal) with NSIters quintic iterations on the
 // Frobenius-normalized X = M/||M||_F:  X <- a*X + b*(X X^T)X + c*(X X^T)^2 X
 // with the paper's coefficients (a,b,c) = (3.4445, -4.7750, 2.0315).
-// The six scratch volumes (X..Qt) are caller-owned persistent buffers (see
+// The five scratch volumes (X..Qt) are caller-owned persistent buffers (see
 // TNNetLayer.FMuonX..FMuonQt) so this per-training-step routine allocates
 // nothing (guide rule #17); they are lazily resized by the Copy/ReSize calls
 // inside.
 procedure MuonNewtonSchulz5(O, M: TNNetVolume; Rows, Cols, NSIters: integer;
-  X, A, AX, A2X, B, Qt: TNNetVolume);
+  X, A, AX, A2X, Qt: TNNetVolume);
 const
   cNS_a = 3.4445; cNS_b = -4.7750; cNS_c = 2.0315;
 var
@@ -126635,11 +126628,12 @@ begin
     MuonMatMulT(A, X, X, Rows, Cols, Rows);       // A = X X^T (Rows x Rows)
     MuonMatMul(AX, A, X, Qt, Rows, Rows, Cols);   // AX = A X
     MuonMatMul(A2X, A, AX, Qt, Rows, Rows, Cols); // A2X = A (A X)
-    B.Copy(X);
-    B.Mul(cNS_a);
-    B.MulAdd(cNS_b, AX);
-    B.MulAdd(cNS_c, A2X);
-    X.Copy(B);
+    // X is dead after A2X was formed (the two MuonMatMul calls above are its
+    // last readers), so the quintic combination lands in X directly: the copy
+    // in and the copy back out were pure buffer traffic over Rows*Cols floats.
+    X.Mul(cNS_a);
+    X.MulAdd(cNS_b, AX);
+    X.MulAdd(cNS_c, A2X);
   end;
 
   O.Copy(X);
@@ -126719,7 +126713,6 @@ begin
     FMuonA   := TNNetVolume.Create();
     FMuonAX  := TNNetVolume.Create();
     FMuonA2X := TNNetVolume.Create();
-    FMuonB   := TNNetVolume.Create();
     FMuonQt  := TNNetVolume.Create();
   end;
   Mmat := FMuonMmat;
@@ -126740,7 +126733,7 @@ begin
   end;
 
   MuonNewtonSchulz5(Omat, Mmat, Rows, Cols, NSIters,
-    FMuonX, FMuonA, FMuonAX, FMuonA2X, FMuonB, FMuonQt);
+    FMuonX, FMuonA, FMuonAX, FMuonA2X, FMuonQt);
 
   // FDelta <- -lr * sqrt(max(rows,cols)) * O_row, so UpdateWeightsAdam applies
   // W <- W - lr*Scale*O. Biases (1-D) get the SGD-momentum fallback.
@@ -127254,13 +127247,22 @@ end;
 procedure TNNetNeuron.CalcLionDelta(pLearningRate, Beta1, Beta2: TNeuralFloat);
 var
   Cnt, MaxCnt: integer;
-  lr, invNegLr, g, c, upd, m, oneMinusB1, oneMinusB2: TNeuralFloat;
+  lr, negLr, invNegLr, g, c, upd, m, oneMinusB1, oneMinusB2: TNeuralFloat;
+  k1, k2, d: TNeuralFloat;
 begin
   lr := pLearningRate;
   if lr = 0 then begin ClearDelta(); exit; end;
   invNegLr := -1.0 / lr;
+  negLr := -lr;
   oneMinusB1 := 1 - Beta1;
   oneMinusB2 := 1 - Beta2;
+  // Both EMAs consume the same recovered gradient g = d*invNegLr, so the two
+  // per-element products (1-beta_k)*g fold into one multiply each against the
+  // raw delta (#5): (1-beta_k)*invNegLr is a step constant. The sign test then
+  // runs on c, whose reassociated form differs by at most one ulp - immaterial
+  // for a sign-based optimizer, which only cares which side of zero c is on.
+  k1 := oneMinusB1 * invNegLr;
+  k2 := oneMinusB2 * invNegLr;
 
   // Lion's single momentum buffer must match the weight shape; for a layer
   // that never ran an Adam-style init it may still be at its default size.
@@ -127274,15 +127276,15 @@ begin
   MaxCnt := FDelta.Size - 1;
   for Cnt := 0 to MaxCnt do
   begin
-    g := FDelta.FData[Cnt] * invNegLr;               // recover raw gradient
+    d := FDelta.FData[Cnt];
     m := FBackInertia.FData[Cnt];
-    c := Beta1 * m + oneMinusB1 * g;
-    if c > 0 then upd := 1
-    else if c < 0 then upd := -1
-    else upd := 0;
+    c := Beta1 * m + k1 * d;
     // momentum EMA update (uses beta2), single state buffer.
-    FBackInertia.FData[Cnt] := Beta2 * m + oneMinusB2 * g;
-    FDelta.FData[Cnt] := -lr * upd;                   // final increment
+    FBackInertia.FData[Cnt] := Beta2 * m + k2 * d;
+    // final increment: -lr*sign(c), stored without the multiply.
+    if c > 0 then FDelta.FData[Cnt] := negLr
+    else if c < 0 then FDelta.FData[Cnt] := lr
+    else FDelta.FData[Cnt] := 0;
   end;
 
   // ---- Bias (scalar momentum reuses FBiasInertia) ----
@@ -127344,7 +127346,7 @@ var
   Cnt, MaxCnt, R, C, i, j, idx, rowBase: integer;
   RM1, CM1: integer;
   lr, invNegLr, g, gsq, denom, rowMean, vhat, sumR: TNeuralFloat;
-  invNegLrSq, oneMinusB2, riOverMean: TNeuralFloat;
+  invNegLrSq, oneMinusB2, riOverMean, kAF, cAF: TNeuralFloat;
   Factored: boolean;
 begin
   lr := FParentLayer.FLearningRate;
@@ -127414,18 +127416,16 @@ begin
   end
   else
   begin
-    // Non-factorable: plain per-element RMSProp-style second moment.
-    MaxCnt := FDelta.Size - 1;
-    for Cnt := 0 to MaxCnt do
-    begin
-      g := FDelta.FData[Cnt] * invNegLr;   // g still needed for gsq below
-      gsq := g * g + Eps1;
-      vhat := Beta2 * FBackInertia2.FData[Cnt] + oneMinusB2 * gsq;
-      FBackInertia2.FData[Cnt] := vhat;
-      denom := sqrt(vhat) + Epsilon;
-      // -lr*(g/denom) = d/denom since -lr*g = d (#14); avoids the -lr multiply.
-      FDelta.FData[Cnt] := FDelta.FData[Cnt] / denom;
-    end;
+    // Non-factorable: plain per-element RMSProp-style second moment. This is
+    // the branch every fully connected / embedding layer takes - such a layer's
+    // weights are sized (NumWeights,1,1), so Size = SizeX and the factored test
+    // above can never hold. Adafactor's algebra folds into two step constants
+    // (#5): g*g = d*d*invNegLrSq, so oneMinusB2*(g*g + Eps1) is kAF*d*d + cAF,
+    // and the whole per-element sqrt/divide loop becomes one kernel pass (#13).
+    kAF := oneMinusB2 * invNegLrSq;
+    cAF := oneMinusB2 * Eps1;
+    TNNetVolume.AdafactorDelta(FDelta.DataPtr, FBackInertia2.DataPtr,
+      Beta2, kAF, cAF, Epsilon, FDelta.Size);
   end;
 
   // ---- Bias (scalar, full second moment) ----
