@@ -1720,6 +1720,8 @@ begin
   shr ecx,5  // number of large iterations = number of elements / 32
   jz @SkipLargeAddLoop
   vxorps ymm1, ymm1, ymm1
+  vxorps ymm6, ymm6, ymm6
+  vxorps ymm7, ymm7, ymm7
 
 @LargeAddLoop:
   vpmovsxbd ymm2, [rax]
@@ -1734,8 +1736,8 @@ begin
 
   vfmadd231ps ymm0, ymm2, [rdx]
   vfmadd231ps ymm1, ymm3, [rdx+32]
-  vfmadd231ps ymm0, ymm4, [rdx+64]
-  vfmadd231ps ymm1, ymm5, [rdx+96]
+  vfmadd231ps ymm6, ymm4, [rdx+64]
+  vfmadd231ps ymm7, ymm5, [rdx+96]
 
   add rax, 32
   add rdx, 128
@@ -1743,6 +1745,8 @@ begin
   jnz @LargeAddLoop
 
   vaddps ymm0, ymm0, ymm1
+  vaddps ymm6, ymm6, ymm7
+  vaddps ymm0, ymm0, ymm6
   VEXTRACTF128 xmm2, ymm0, 1
   vzeroupper
   addps xmm0, xmm2
@@ -1776,7 +1780,7 @@ begin
   end
   [
     'RAX', 'RCX', 'RDX',
-    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm6', 'ymm7'
   ];
 
     Result := vRes[0];
@@ -11519,6 +11523,8 @@ begin
         vxorps zmm1, zmm1, zmm1
         {$ELSE}
         vxorps ymm1, ymm1, ymm1
+        vxorps ymm6, ymm6, ymm6
+        vxorps ymm7, ymm7, ymm7
         {$ENDIF}
 
       @LargeAddLoop:
@@ -11541,8 +11547,8 @@ begin
           {$IFDEF AVX2}
           vfmadd231ps ymm0, ymm2, [rdx]
           vfmadd231ps ymm1, ymm3, [rdx+32]
-          vfmadd231ps ymm0, ymm4, [rdx+64]
-          vfmadd231ps ymm1, ymm5, [rdx+96]
+          vfmadd231ps ymm6, ymm4, [rdx+64]
+          vfmadd231ps ymm7, ymm5, [rdx+96]
           {$ELSE}
           vmulps  ymm2, ymm2, [rdx]
           vmulps  ymm3, ymm3, [rdx+32]
@@ -11551,8 +11557,8 @@ begin
 
           vaddps  ymm0, ymm0, ymm2
           vaddps  ymm1, ymm1, ymm3
-          vaddps  ymm0, ymm0, ymm4
-          vaddps  ymm1, ymm1, ymm5
+          vaddps  ymm6, ymm6, ymm4
+          vaddps  ymm7, ymm7, ymm5
           {$ENDIF}
         {$ENDIF}
 
@@ -11572,6 +11578,8 @@ begin
         addps  xmm0, xmm4
         {$ELSE}
         vaddps ymm0, ymm0, ymm1
+        vaddps ymm6, ymm6, ymm7
+        vaddps ymm0, ymm0, ymm6
         VEXTRACTF128 xmm2, ymm0, 1
         vzeroupper
         addps  xmm0, xmm2
@@ -11606,7 +11614,7 @@ begin
         [
           'RAX', 'RCX', 'RDX',
           'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
-          {$IFDEF AVX512},'zmm0', 'zmm1'{$ENDIF}
+          {$IFDEF AVX512},'zmm0', 'zmm1'{$ELSE},'ymm6', 'ymm7'{$ENDIF}
         ];
 
           Result := vRes[0];
@@ -11831,6 +11839,8 @@ begin
           vxorps zmm1, zmm1, zmm1
           {$ELSE}
           vxorps ymm1, ymm1, ymm1
+          vxorps ymm6, ymm6, ymm6
+          vxorps ymm7, ymm7, ymm7
           {$ENDIF}
 
         @LargeAddLoop:
@@ -11853,8 +11863,8 @@ begin
             {$IFDEF AVX2}
             vfmadd231ps ymm0, ymm2, [rdx]
             vfmadd231ps ymm1, ymm3, [rdx+32]
-            vfmadd231ps ymm0, ymm4, [rdx+64]
-            vfmadd231ps ymm1, ymm5, [rdx+96]
+            vfmadd231ps ymm6, ymm4, [rdx+64]
+            vfmadd231ps ymm7, ymm5, [rdx+96]
             {$ELSE}
             vmulps  ymm2, ymm2, [rdx]
             vmulps  ymm3, ymm3, [rdx+32]
@@ -11863,8 +11873,8 @@ begin
 
             vaddps  ymm0, ymm0, ymm2
             vaddps  ymm1, ymm1, ymm3
-            vaddps  ymm0, ymm0, ymm4
-            vaddps  ymm1, ymm1, ymm5
+            vaddps  ymm6, ymm6, ymm4
+            vaddps  ymm7, ymm7, ymm5
             {$ENDIF}
           {$ENDIF}
 
@@ -11884,6 +11894,8 @@ begin
           addps  xmm0, xmm4
           {$ELSE}
           vaddps ymm0, ymm0, ymm1
+          vaddps ymm6, ymm6, ymm7
+          vaddps ymm0, ymm0, ymm6
           VEXTRACTF128 xmm2, ymm0, 1
           vzeroupper
           addps  xmm0, xmm2
@@ -11918,7 +11930,7 @@ begin
           [
             'RAX', 'RCX', 'RDX',
             'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
-            {$IFDEF AVX512},'zmm0', 'zmm1'{$ENDIF}
+            {$IFDEF AVX512},'zmm0', 'zmm1'{$ELSE},'ymm6', 'ymm7'{$ENDIF}
           ];
 
             Result := vRes[0];
@@ -12537,6 +12549,8 @@ begin
           vxorps zmm1, zmm1, zmm1
           {$ELSE}
           vxorps ymm1, ymm1, ymm1
+          vxorps ymm6, ymm6, ymm6
+          vxorps ymm7, ymm7, ymm7
           {$ENDIF}
 
         @LargeAddLoop:
@@ -12559,8 +12573,8 @@ begin
             {$IFDEF AVX2}
             vfmadd231ps ymm0, ymm2, [rdx]
             vfmadd231ps ymm1, ymm3, [rdx+32]
-            vfmadd231ps ymm0, ymm4, [rdx+64]
-            vfmadd231ps ymm1, ymm5, [rdx+96]
+            vfmadd231ps ymm6, ymm4, [rdx+64]
+            vfmadd231ps ymm7, ymm5, [rdx+96]
             {$ELSE}
             vmulps  ymm2, ymm2, [rdx]
             vmulps  ymm3, ymm3, [rdx+32]
@@ -12569,8 +12583,8 @@ begin
 
             vaddps  ymm0, ymm0, ymm2
             vaddps  ymm1, ymm1, ymm3
-            vaddps  ymm0, ymm0, ymm4
-            vaddps  ymm1, ymm1, ymm5
+            vaddps  ymm6, ymm6, ymm4
+            vaddps  ymm7, ymm7, ymm5
             {$ENDIF}
           {$ENDIF}
 
@@ -12590,6 +12604,8 @@ begin
           addps  xmm0, xmm4
           {$ELSE}
           vaddps ymm0, ymm0, ymm1
+          vaddps ymm6, ymm6, ymm7
+          vaddps ymm0, ymm0, ymm6
           VEXTRACTF128 xmm2, ymm0, 1
           vzeroupper
           addps  xmm0, xmm2
@@ -12624,7 +12640,7 @@ begin
           [
             'RAX', 'RCX', 'RDX',
             'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
-            {$IFDEF AVX512},'zmm0', 'zmm1'{$ENDIF}
+            {$IFDEF AVX512},'zmm0', 'zmm1'{$ELSE},'ymm6', 'ymm7'{$ENDIF}
           ];
 
             Result := vRes[0];
@@ -16708,6 +16724,8 @@ begin
   vxorps zmm1, zmm1, zmm1
   {$ELSE}
   vxorps ymm1, ymm1, ymm1
+  vxorps ymm6, ymm6, ymm6
+  vxorps ymm7, ymm7, ymm7
   {$ENDIF}
 
 @LargeAddLoop:
@@ -16730,8 +16748,8 @@ begin
     {$IFDEF AVX2}
     vfmadd231ps ymm0, ymm2, [rdx]
     vfmadd231ps ymm1, ymm3, [rdx+32]
-    vfmadd231ps ymm0, ymm4, [rdx+64]
-    vfmadd231ps ymm1, ymm5, [rdx+96]
+    vfmadd231ps ymm6, ymm4, [rdx+64]
+    vfmadd231ps ymm7, ymm5, [rdx+96]
     {$ELSE}
     vmulps  ymm2, ymm2, [rdx]
     vmulps  ymm3, ymm3, [rdx+32]
@@ -16740,8 +16758,8 @@ begin
 
     vaddps  ymm0, ymm0, ymm2
     vaddps  ymm1, ymm1, ymm3
-    vaddps  ymm0, ymm0, ymm4
-    vaddps  ymm1, ymm1, ymm5
+    vaddps  ymm6, ymm6, ymm4
+    vaddps  ymm7, ymm7, ymm5
     {$ENDIF}
   {$ENDIF}
 
@@ -16762,6 +16780,8 @@ begin
   addps  xmm0, xmm4
   {$ELSE}
   vaddps ymm0, ymm0, ymm1
+  vaddps ymm6, ymm6, ymm7
+  vaddps ymm0, ymm0, ymm6
   VEXTRACTF128 xmm2, ymm0, 1
   vzeroupper
   addps  xmm0, xmm2
@@ -16796,7 +16816,7 @@ begin
   [
     'RAX', 'RCX', 'RDX',
     'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
-    {$IFDEF AVX512},'zmm0', 'zmm1'{$ENDIF}
+    {$IFDEF AVX512},'zmm0', 'zmm1'{$ELSE},'ymm6', 'ymm7'{$ENDIF}
   ];
 
     Result := vRes[0];
