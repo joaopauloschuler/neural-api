@@ -43146,51 +43146,6 @@ begin
   Result := (s0 + s1) + (s2 + s3);
 end;
 
-// MIXED-precision dot product (W single, X double, accumulate in Double), for
-// the Mimi sites whose weights stay Single in TEnCodecMat.Data while the
-// activations are Double - the transformer projections and the RVQ nearest-code
-// scan. Widening the weights at load would let those reuse MimiDotProductD, but
-// that is ~+200 MB of resident memory for Mimi's ~50 M weights, so the widening
-// happens here, per element.
-// The naive form (one accumulator, the Single read used directly as a multiply
-// operand) compiles to `cvtss2sd mem,%xmmN` reusing ONE scratch register: that
-// instruction preserves the register's upper half, so every conversion carries a
-// false dependency on the previous one and the whole loop serializes at ~6-7
-// cycles/element regardless of how many accumulators are declared. Loading each
-// weight into its own Double local forces distinct destination registers and
-// breaks that chain; with four independent accumulators on top, the loop drops
-// to ~1.2 cycles/element (measured 5.3-5.9x at the Mimi q/k/v/o, fc1/fc2 and RVQ
-// shapes; rdtscp, min of 60 interleaved rounds, pinned).
-// The 4-way split reassociates the sum exactly the way MimiDotProductD does, so
-// the two helpers agree on their contract and the result is build-independent
-// (no per-config asm path). Coded by Claude (AI).
-function MimiDotProductSD(WS: PSingle; XD: PDouble; N: integer): Double;
-var
-  i, n4: integer;
-  s0, s1, s2, s3, w0, w1, w2, w3: Double;
-begin
-  s0 := 0; s1 := 0; s2 := 0; s3 := 0;
-  n4 := N and (not 3);
-  i := 0;
-  while i < n4 do
-  begin
-    w0 := WS[i];   w1 := WS[i+1];
-    w2 := WS[i+2]; w3 := WS[i+3];
-    s0 := s0 + w0 * XD[i];
-    s1 := s1 + w1 * XD[i+1];
-    s2 := s2 + w2 * XD[i+2];
-    s3 := s3 + w3 * XD[i+3];
-    Inc(i, 4);
-  end;
-  while i < N do
-  begin
-    w0 := WS[i];
-    s0 := s0 + w0 * XD[i];
-    Inc(i);
-  end;
-  Result := (s0 + s1) + (s2 + s3);
-end;
-
 // Causal Conv1d / grouped ConvTranspose1d on a channel-major signal, honoring
 // pad_mode 'constant' (zero left-pad) or 'replicate' (repeat first/last) and
 // arbitrary groups. Mirrors HF MimiConv1d / MimiConvTranspose1d forward.
@@ -43676,7 +43631,7 @@ begin
       gBase := 0;                        // gidx * D, carried (#6)
       for gidx := 0 to NHDhM1 do
       begin
-        sc := MimiDotProductSD(@WqD[gBase], @HnRow[0], D);
+        sc := DotProductSD(@WqD[gBase], @HnRow[0], D);
         if HasBq then sc := sc + BqA[gidx];
         Q[t1][gidx] := sc;
         Inc(gBase, D);
@@ -43684,10 +43639,10 @@ begin
       gBase := 0;                        // gidx * D, carried (#6)
       for gidx := 0 to NKVDhM1 do
       begin
-        sc := MimiDotProductSD(@WkD[gBase], @HnRow[0], D);
+        sc := DotProductSD(@WkD[gBase], @HnRow[0], D);
         if HasBk then sc := sc + BkA[gidx];
         Kk[t1][gidx] := sc;
-        sc := MimiDotProductSD(@WvD[gBase], @HnRow[0], D);
+        sc := DotProductSD(@WvD[gBase], @HnRow[0], D);
         if HasBv then sc := sc + BvA[gidx];
         Vv[t1][gidx] := sc;
         Inc(gBase, D);
@@ -43769,7 +43724,7 @@ begin
       dBase := 0;                        // dd * NHDh, carried (#6)
       for dd := 0 to DM1 do
       begin
-        sc := MimiDotProductSD(@WoD[dBase], @HnRow[0], NHDh);
+        sc := DotProductSD(@WoD[dBase], @HnRow[0], NHDh);
         if HasBo then sc := sc + BoA[dd];
         XRow[dd] := XRow[dd] + ASc[dd] * sc;   // #9: bound row + LayerScale
         Inc(dBase, NHDh);
@@ -43795,7 +43750,7 @@ begin
       gBase := 0;                        // gidx * D, carried (#6)
       for gidx := 0 to FFNM1 do
       begin
-        sc := MimiDotProductSD(@Fc1D[gBase], @HnRow[0], D);
+        sc := DotProductSD(@Fc1D[gBase], @HnRow[0], D);
         Mlp1Row[gidx] := MimiGELU(sc);
         Inc(gBase, D);
       end;
@@ -43803,7 +43758,7 @@ begin
       dBase := 0;                        // dd * FFN, carried (#6)
       for dd := 0 to DM1 do
       begin
-        sc := MimiDotProductSD(@Fc2D[dBase], @Mlp1Row[0], FFN);
+        sc := DotProductSD(@Fc2D[dBase], @Mlp1Row[0], FFN);
         XRow[dd] := XRow[dd] + MSc[dd] * sc;   // #9: bound row + LayerScale
         Inc(dBase, FFN);
       end;
@@ -43964,14 +43919,14 @@ begin
       sBase := 0; // s*Dm carried
       // #14: argmin ||r-c||^2 = argmin(||c||^2 - 2 r.c) since ||r||^2 is shared
       // across candidates (identical winner). Single codebook row x Double
-      // residual, so the contraction goes through MimiDotProductSD.
+      // residual, so the contraction goes through DotProductSD.
       for s := 0 to KM1 do
       begin
         CNorm := CBN[s];   // #11: invariant across the block
         rBase := 0;
         for b := 0 to BCountM1 do
         begin
-          Dist := CNorm - 2 * MimiDotProductSD(@CB[sBase], @RBuf[rBase], Dm);
+          Dist := CNorm - 2 * DotProductSD(@CB[sBase], @RBuf[rBase], Dm);
           if Dist < BestDist[b] then
           begin BestDist[b] := Dist; BestIdx[b] := s; end;
           Inc(rBase, Dm);
@@ -44024,7 +43979,7 @@ begin
         rBase := 0;
         for b := 0 to BCountM1 do
         begin
-          Dist := CNorm - 2 * MimiDotProductSD(@CB[sBase], @RBuf[rBase], Dm);
+          Dist := CNorm - 2 * DotProductSD(@CB[sBase], @RBuf[rBase], Dm);
           if Dist < BestDist[b] then
           begin BestDist[b] := Dist; BestIdx[b] := s; end;
           Inc(rBase, Dm);
@@ -44976,10 +44931,9 @@ begin
       wBase := 0; // d * HiddenDim
       for d := 0 to CdM1 do
       begin
-        dot := BIn[d];
-        for i := 0 to HiddenDimM1 do
-          dot := dot + WIn[wBase + i] * Residual[i];
-        NormP[d] := dot;
+        // Single weight row against the Double residual: the staged
+        // mixed-precision dot avoids the cvtss2sd false dependency chain.
+        NormP[d] := BIn[d] + DotProductSD(@WIn[wBase], @Residual[0], HiddenDim);
         Inc(wBase, HiddenDim);
       end;
       // argmax cosine against the pre-normalized codebook. #14: the projected
@@ -45002,8 +44956,11 @@ begin
       Codes[q][t] := best;
       // out_proj(raw codebook row) -> hidden, subtract from residual.
       // W and codebook data are both Single but the accumulator is Double for
-      // the <1e-4 codec parity gate, so the inner dot stays scalar (no
-      // MimiDotProductD, which needs Double operands). Offset bases hoisted.
+      // the <1e-4 codec parity gate. Cd is 8, and the i-loop already supplies
+      // the instruction-level parallelism a staged mixed-precision dot would
+      // add - measured 2.97 cycles/element as written against 2.40 staged, not
+      // enough to justify reassociating a sum the parity gate pins.
+      // Offset bases hoisted.
       bestBase := best * Cd; // invariant across the whole i-loop
       oBase := 0;            // i * Cd
       for i := 0 to HiddenDimM1 do
