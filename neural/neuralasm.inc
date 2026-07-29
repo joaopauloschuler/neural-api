@@ -52,6 +52,27 @@ jz @SkipLargeAddLoop
   vmovups [rdx],    zmm0
   vmovups [rdx+64], zmm1
 {$ELSE}
+  {$IFDEF AVX2}
+  vmovups ymm0, [rdx]
+  vmovups ymm1, [rdx+32]
+  vmovups ymm2, [rdx+64]
+  vmovups ymm3, [rdx+96]
+
+  vmovups ymm4, [rbx]
+  vmovups ymm5, [rbx+32]
+  vmovups ymm6, [rbx+64]
+  vmovups ymm7, [rbx+96]
+
+  vfmadd231ps ymm0, ymm4, [rax]
+  vfmadd231ps ymm1, ymm5, [rax+32]
+  vfmadd231ps ymm2, ymm6, [rax+64]
+  vfmadd231ps ymm3, ymm7, [rax+96]
+
+  vmovups [rdx],    ymm0
+  vmovups [rdx+32], ymm1
+  vmovups [rdx+64], ymm2
+  vmovups [rdx+96], ymm3
+  {$ELSE}
   vmovups ymm4, [rbx]
   vmovups ymm5, [rbx+32]
 
@@ -75,6 +96,7 @@ jz @SkipLargeAddLoop
 
   vmovups [rdx+64], ymm2
   vmovups [rdx+96], ymm3
+  {$ENDIF}
 {$ENDIF}
 
 add rax, 128
@@ -114,7 +136,7 @@ jnz @SmallAddLoop
 end  [
   'RAX', 'RBX', 'RCX', 'RDX',
   'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
-  {$IFDEF AVX512},'zmm0','zmm1','zmm4','zmm5'{$ENDIF}
+  {$IFDEF AVX512},'zmm0','zmm1','zmm4','zmm5'{$ELSE},'ymm6', 'ymm7'{$ENDIF}
 ];
 end; // of if
 
