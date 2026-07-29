@@ -1393,9 +1393,10 @@ end;
 
 procedure TEasyOpenCL.FreeContext();
 begin
-  // Borrowed context/queue/program belong to the shared kernel that compiled
+  // A borrowed context and program belong to the shared kernel that compiled
   // them; releasing them here would tear them out from under every other
-  // borrower. Just drop our references. (Coded by Claude (AI).)
+  // borrower, so just drop our references to them. The command queue is created
+  // per kernel, so it is always ours to release below. (Coded by Claude (AI).)
   if FBorrowedContext then
   begin
     FProg := nil;
