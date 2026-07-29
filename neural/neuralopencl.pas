@@ -272,21 +272,23 @@ type
       /// symmetric int8 codes + per-row FP32 scales, both RESIDENT and
       /// IMMUTABLE (quantized layers are inference-only, so unlike the FP32
       /// weights they are uploaded exactly once, at PrepareForComputeInt8
-      /// time, and never re-uploaded). FInt8Kernel binds the int8 kernel
-      /// entry point against the same compiled neural.cl program; buffers
-      /// and enqueues ride the shared in-order queue via FDotProductKernel.
-      /// Coded by Claude (AI).
+      /// time, and never re-uploaded). FInt8Kernel is the net-wide
+      /// cai_dot_product_int8 handle, INJECTED at Create time by the owning
+      /// layer (which borrows it from TNNet) and NOT owned here - the net
+      /// frees it. nil on every FP32-only instance. Buffers and enqueues ride
+      /// the shared in-order queue via FDotProductKernel. Coded by Claude (AI).
       FInt8Kernel: TNeuralKernel;
+      FDotProductKernel: TDotProductKernel;
       FCodesBuffer: cl_mem;
       FScalesBuffer: cl_mem;
       FCapCodes, FCapScales: csize_t;
       FInt8Ready: boolean;
 
-      FDotProductKernel: TDotProductKernel;
 
       function Kernel(): cl_kernel; {$IFDEF Release} inline; {$ENDIF}
     public
-      constructor Create(DotProductKernel: TDotProductKernel);
+      constructor Create(DotProductKernel: TDotProductKernel;
+        pInt8Kernel: TNeuralKernel = nil);
       destructor Destroy(); override;
 
       procedure UnprepareForCompute();
@@ -457,19 +459,19 @@ begin
   Kernel := FDotProductKernel.Kernel;
 end;
 
-constructor TDotProductSharedKernel.Create(DotProductKernel: TDotProductKernel);
+constructor TDotProductSharedKernel.Create(DotProductKernel: TDotProductKernel;
+  pInt8Kernel: TNeuralKernel = nil);
 begin
   inherited Create();
   FDotProductKernel := DotProductKernel;
+  FInt8Kernel := pInt8Kernel;
   FHostInput := False;
 end;
 
 destructor TDotProductSharedKernel.Destroy();
 begin
   UnprepareForCompute();
-  // Owns only the int8 kernel HANDLE; the program/queue behind it are the
-  // shared FDotProductKernel's (see TNeuralKernel.CreateFromProgram).
-  FInt8Kernel.Free;
+  // FInt8Kernel is a net-owned shared handle - do not free here.
   inherited Destroy();
 end;
 
@@ -771,8 +773,12 @@ var
 begin
   UnprepareForCompute();
   if not Assigned(FInt8Kernel) then
-    FInt8Kernel := TNeuralKernel.CreateFromProgram(FDotProductKernel,
-      'cai_dot_product_int8');
+  begin
+    ErrorProc('Error: PrepareForComputeInt8 - this TDotProductSharedKernel was ' +
+      'built without a cai_dot_product_int8 handle.');
+    PrepareForComputeInt8 := CL_INVALID_KERNEL;
+    exit;
+  end;
   FNumAs := NumAs;
   FNumBs := VBs.Size div pSize;
   FThreadCount := FNumAs * FNumBs;

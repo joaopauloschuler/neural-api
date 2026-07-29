@@ -73658,7 +73658,8 @@ begin
   begin
     if not Assigned(FDotCL) then
     begin
-      FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+      FDotCL := TDotProductSharedKernel.Create(DotProductKernel,
+        FNN.GetSharedKernel('cai_dot_product_int8'));
       FDotCL.HideMessages();
     end;
     if FQuantInt8 then
