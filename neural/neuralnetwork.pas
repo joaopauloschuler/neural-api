@@ -26283,7 +26283,7 @@ var
   StartTime: double;
   LocalSize, SizeM1, OutputCnt: integer;
   LocalPrevOutput: TNNetVolume;
-  Cap, InvCap, ArgVal, TanhVal: TNeuralFloat;
+  Cap, InvCap, ArgVal, TanhVal, SmallThresh: TNeuralFloat;
 begin
   StartTime := Now();
   LocalPrevOutput := FPrevLayer.FOutput;
@@ -26309,14 +26309,21 @@ begin
   // to better than 1e-11 relative below the cut, so the branch is more accurate
   // than the kernel it overrides, not just a guard. Unswitched on the training
   // test (#20), which is invariant across the volume.
+  // |x * InvCap| < cSmallArg iff |x| < cSmallArg * |Cap|, so the cut is tested
+  // on the pre-image and ArgVal is formed only inside the rare small branch
+  // (#5). Abs is required because the constructor rejects only Cap = 0, so a
+  // negative cap is legal.
+  SmallThresh := cSmallArg * Abs(Cap);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
-      ArgVal := LocalPrevOutput.FData[OutputCnt] * InvCap;
-      if Abs(ArgVal) < cSmallArg
-        then TanhVal := ArgVal * (1 - ArgVal * ArgVal * cOneThird)
-        else TanhVal := FOutput.FData[OutputCnt];
+      if Abs(LocalPrevOutput.FData[OutputCnt]) < SmallThresh then
+      begin
+        ArgVal := LocalPrevOutput.FData[OutputCnt] * InvCap;
+        TanhVal := ArgVal * (1 - ArgVal * ArgVal * cOneThird);
+      end
+      else TanhVal := FOutput.FData[OutputCnt];
       FOutput.FData[OutputCnt] := Cap * TanhVal;
       // dy/dx = 1 - tanh(x/c)^2
       FOutputErrorDeriv.FData[OutputCnt] := 1 - TanhVal * TanhVal;
@@ -26324,14 +26331,16 @@ begin
   end
   else
   begin
+    // Inference: every element is scaled by Cap, so that is one vectorized pass
+    // (#13); the follow-up scan then rewrites only the small-argument elements.
+    TNNetVolume.Mul(@FOutput.FData[0], Cap, LocalSize);
     for OutputCnt := 0 to SizeM1 do
-    begin
-      ArgVal := LocalPrevOutput.FData[OutputCnt] * InvCap;
-      if Abs(ArgVal) < cSmallArg
-        then TanhVal := ArgVal * (1 - ArgVal * ArgVal * cOneThird)
-        else TanhVal := FOutput.FData[OutputCnt];
-      FOutput.FData[OutputCnt] := Cap * TanhVal;
-    end;
+      if Abs(LocalPrevOutput.FData[OutputCnt]) < SmallThresh then
+      begin
+        ArgVal := LocalPrevOutput.FData[OutputCnt] * InvCap;
+        FOutput.FData[OutputCnt] :=
+          Cap * (ArgVal * (1 - ArgVal * ArgVal * cOneThird));
+      end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
