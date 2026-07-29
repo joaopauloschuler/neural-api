@@ -46248,7 +46248,7 @@ var
   LocalPrevOutput: TNNetVolume;
   OutputCnt: integer;
   StartTime: double;
-  x: TNeuralFloat;
+  SinhVal: TNeuralFloat;
 begin
   StartTime := Now();
   LocalPrevOutput := FPrevLayer.Output;
@@ -46256,17 +46256,23 @@ begin
 
   // SinhAct(x) = sinh(x). Derivative is cosh(x).
   // Two-pass: vectorize sinh(x) into FOutput via TNNetVolume.Sinh (built on
-  // the AVX2 Exp), then a scalar finishing pass fills the cosh derivative
-  // (read back from LocalPrevOutput, so backward math is byte-identical).
+  // the AVX2 Exp), then a scalar finishing pass derives cosh from the sinh
+  // already in FOutput -- cosh^2 - sinh^2 = 1 -- so no exponential is needed.
   TNNetVolume.Sinh(@FOutput.FData[0], @LocalPrevOutput.FData[0],
     LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
     for OutputCnt := 0 to SizeM1 do
     begin
-      x := LocalPrevOutput.FData[OutputCnt];
-      // cosh via NeuralExp: pcr_coshf traps under debug-mode overflow checks.
-      FOutputErrorDeriv.FData[OutputCnt] := (NeuralExp(x) + NeuralExp(-x)) * 0.5;
+      SinhVal := Abs(FOutput.FData[OutputCnt]);
+      // Above |sinh| = 1e10, sqrt(1+s^2) rounds to exactly |s| in Single, so the
+      // branch is not an approximation -- it only keeps s*s from overflowing
+      // Single (which it would for |sinh(x)| > 1.8e19) and turning a large
+      // finite cosh into +Inf.
+      if SinhVal > 1e10 then
+        FOutputErrorDeriv.FData[OutputCnt] := SinhVal
+      else
+        FOutputErrorDeriv.FData[OutputCnt] := Sqrt(1.0 + SinhVal * SinhVal);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
