@@ -1458,6 +1458,7 @@ type
     procedure TestSincGradientCheck;
     procedure TestSincSerializationRoundTrip;
     procedure TestSinhActGradientCheck;
+    procedure TestPowerGradientCheck;
     procedure TestArcSinhGradientCheck;
     procedure TestLeCunTanhGradientCheck;
     procedure TestLeCunTanhForward;
@@ -29973,6 +29974,16 @@ begin
   // is comfortable.
   ActivationGradientCheck(Self, TNNetSinhAct.Create(), 'SinhAct',
     [0.5, -0.5, 1.0, -1.0, 0.25, -0.25], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestPowerGradientCheck;
+begin
+  // d/dx x^p = p*x^(p-1). Covers both signs of the base and the x = 0 slot,
+  // where the derivative cannot be derived from x^p by dividing through by x.
+  ActivationGradientCheck(Self, TNNetPower.Create(3), 'Power(3)',
+    [0.5, -0.5, 1.5, -1.5, 0.0, 1.0], 0.01);
+  ActivationGradientCheck(Self, TNNetPower.Create(2), 'Power(2)',
+    [0.5, -0.5, 1.5, -1.5, 0.0, 1.0], 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestArcSinhGradientCheck;

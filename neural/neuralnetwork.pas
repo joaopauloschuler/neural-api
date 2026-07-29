@@ -50952,6 +50952,7 @@ var
   LocalPrevOutput: TNNetVolume;
   OutputCnt: integer;
   StartTime: double;
+  x, PowVal, PowerM1: TNeuralFloat;
 begin
   StartTime := Now();
   LocalPrevOutput := FPrevLayer.Output;
@@ -50959,10 +50960,19 @@ begin
 
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
+    PowerM1 := FPower - 1;
     for OutputCnt := 0 to SizeM1 do
     begin
-      FOutput.FData[OutputCnt] := pcr_powf(LocalPrevOutput.FData[OutputCnt], FPower);
-      FOutputErrorDeriv.FData[OutputCnt] := FPower*pcr_powf(LocalPrevOutput.FData[OutputCnt], FPower-1);
+      x := LocalPrevOutput.FData[OutputCnt];
+      PowVal := pcr_powf(x, FPower);
+      FOutput.FData[OutputCnt] := PowVal;
+      // x^(p-1) = x^p / x, so the derivative reuses the forward power instead of
+      // a second pcr_powf. At x = 0 the identity is 0/0 while pow(0, p-1) is a
+      // well-defined limit (+Inf for p < 1, 0 for p > 1), so keep that call.
+      if x <> 0 then
+        FOutputErrorDeriv.FData[OutputCnt] := FPower * (PowVal / x)
+      else
+        FOutputErrorDeriv.FData[OutputCnt] := FPower * pcr_powf(x, PowerM1);
     end;
   end
   else
