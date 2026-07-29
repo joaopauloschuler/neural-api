@@ -31661,7 +31661,7 @@ var
   DecTokenInput, EncStates, DecEmbed, DecPos, DecEmbLN, LMHead: TNNetLayer;
   Consumed: TStringList;
   Tmp: TNNetVolume;
-  i, j, VocabSizeM1, DModelM1B, ReaderMax, HalfC, RestC, TmpSizeM1: integer;
+  i, j, VocabSizeM1, ReaderMax, HalfC, RestC: integer;
   EmbedScale: TNeuralFloat;
   TensorNameStr: string;
   MarianShim: TMarianConfig;
@@ -31776,8 +31776,6 @@ begin
         if Config.Bart.ScaleEmbedding then EmbedScale := Sqrt(BC.DModel)
         else EmbedScale := 1.0;
         VocabSizeM1 := BC.VocabSize - 1;
-        DModelM1B := BC.DModel - 1;
-        TmpSizeM1 := Tmp.Size - 1;
         Move(Tmp.FData[0], DecEmbed.FArrNeurons[0].Weights.FData[0], Tmp.Size * csNeuralFloatSize);
         TNNetVolume.Mul(@DecEmbed.FArrNeurons[0].Weights.FData[0], EmbedScale, Tmp.Size);
         DecEmbed.FlushWeightCache();
@@ -31785,11 +31783,12 @@ begin
         // Tied head: logits = h . shared^T (Florence has NO final_logits_bias).
         EnsureWritableImportWeights(LMHead);
         for j := 0 to VocabSizeM1 do
-          for i := 0 to DModelM1B do
-            LMHead.FArrNeurons[j].Weights.FData[i] :=
-              Tmp.FData[j * BC.DModel + i];
-        for j := 0 to VocabSizeM1 do
+        begin
+          Move(Tmp.FData[j * BC.DModel],
+            LMHead.FArrNeurons[j].Weights.FData[0],
+            BC.DModel * csNeuralFloatSize);
           LMHead.FArrNeurons[j].BiasWeight := 0;
+        end;
         LMHead.FlushWeightCache();
         if Reader.HasTensor('lm_head.weight') then
           Consumed.Add('lm_head.weight');
@@ -33392,9 +33391,9 @@ begin
         EnsureWritableImportWeights(HeadLayers[k_i]);
         for j := 0 to VocabM1 do
         begin
-          for i := 0 to HiddenM1 do
-            HeadLayers[k_i].FArrNeurons[j].Weights.FData[i] :=
-              Tmp.FData[j * Config.Hidden + i];
+          Move(Tmp.FData[j * Config.Hidden],
+            HeadLayers[k_i].FArrNeurons[j].Weights.FData[0],
+            Config.Hidden * csNeuralFloatSize);
           HeadLayers[k_i].FArrNeurons[j].BiasWeight := 0;
         end;
         HeadLayers[k_i].FlushWeightCache();
@@ -34079,9 +34078,9 @@ begin
         EnsureWritableImportWeights(HeadLayers[k_i]);
         for j := 0 to VocabM1 do
         begin
-          for i := 0 to HiddenM1 do
-            HeadLayers[k_i].FArrNeurons[j].Weights.FData[i] :=
-              Tmp.FData[j * Config.Hidden + i];
+          Move(Tmp.FData[j * Config.Hidden],
+            HeadLayers[k_i].FArrNeurons[j].Weights.FData[0],
+            Config.Hidden * csNeuralFloatSize);
           HeadLayers[k_i].FArrNeurons[j].BiasWeight := 0;
         end;
         HeadLayers[k_i].FlushWeightCache();
@@ -34622,9 +34621,9 @@ begin
         EnsureWritableImportWeights(HeadLayers[k_i]);
         for j := 0 to VocabM1 do
         begin
-          for i := 0 to HiddenM1 do
-            HeadLayers[k_i].FArrNeurons[j].Weights.FData[i] :=
-              Tmp.FData[j * Config.Hidden + i];
+          Move(Tmp.FData[j * Config.Hidden],
+            HeadLayers[k_i].FArrNeurons[j].Weights.FData[0],
+            Config.Hidden * csNeuralFloatSize);
           HeadLayers[k_i].FArrNeurons[j].BiasWeight := 0;
         end;
         HeadLayers[k_i].FlushWeightCache();
@@ -35474,9 +35473,9 @@ begin
         VocabM1 := Config.VocabSize - 1;
         DModelM1 := Config.DModel - 1;
         for j := 0 to VocabM1 do
-          for i := 0 to DModelM1 do
-            LMHead.FArrNeurons[j].Weights.FData[i] :=
-              Tmp.FData[j * Config.DModel + i];
+          Move(Tmp.FData[j * Config.DModel],
+            LMHead.FArrNeurons[j].Weights.FData[0],
+            Config.DModel * csNeuralFloatSize);
         Reader.LoadTensorFlat('final_logits_bias', Tmp);
         for j := 0 to VocabM1 do
           LMHead.FArrNeurons[j].BiasWeight := Tmp.FData[j];
@@ -35831,9 +35830,9 @@ begin
         VocabM1 := Config.VocabSize - 1;
         DModelM1 := Config.DModel - 1;
         for j := 0 to VocabM1 do
-          for i := 0 to DModelM1 do
-            LMHead.FArrNeurons[j].Weights.FData[i] :=
-              Tmp.FData[j * Config.DModel + i];
+          Move(Tmp.FData[j * Config.DModel],
+            LMHead.FArrNeurons[j].Weights.FData[0],
+            Config.DModel * csNeuralFloatSize);
         Reader.LoadTensorFlat('final_logits_bias', Tmp);
         for j := 0 to VocabM1 do
           LMHead.FArrNeurons[j].BiasWeight := Tmp.FData[j];
@@ -36207,9 +36206,9 @@ begin
         VocabM1 := Config.VocabSize - 1;
         DModelM1 := Config.DModel - 1;
         for j := 0 to VocabM1 do
-          for i := 0 to DModelM1 do
-            LMHead.FArrNeurons[j].Weights.FData[i] :=
-              Tmp.FData[j * Config.DModel + i];
+          Move(Tmp.FData[j * Config.DModel],
+            LMHead.FArrNeurons[j].Weights.FData[0],
+            Config.DModel * csNeuralFloatSize);
         // final_logits_bias is optional (see the validation note above): a
         // zero head bias is the default for the bias-free transformers-5 head
         // and for the all-zero buffer of older checkpoints.
@@ -37099,9 +37098,9 @@ begin
         HiddenM1 := Hidden - 1;
         for j := 0 to VocabM1 do
         begin
-          for i := 0 to HiddenM1 do
-            LMHead.FArrNeurons[j].Weights.FData[i] :=
-              Tmp.FData[j * Hidden + i];
+          Move(Tmp.FData[j * Hidden],
+            LMHead.FArrNeurons[j].Weights.FData[0],
+            Hidden * csNeuralFloatSize);
           LMHead.FArrNeurons[j].BiasWeight := 0.0;
         end;
         LMHead.FlushWeightCache();
@@ -37771,9 +37770,9 @@ begin
         DModelM1 := Config.DModel - 1;
         for j := 0 to VocabM1 do
         begin
-          for i := 0 to DModelM1 do
-            LMHead.FArrNeurons[j].Weights.FData[i] :=
-              Tmp.FData[j * Config.DModel + i];
+          Move(Tmp.FData[j * Config.DModel],
+            LMHead.FArrNeurons[j].Weights.FData[0],
+            Config.DModel * csNeuralFloatSize);
           LMHead.FArrNeurons[j].BiasWeight := 0;
         end;
         LMHead.FlushWeightCache();
@@ -38557,12 +38556,27 @@ begin
     OutM1 := OutDim - 1;
     KernelM1 := Kernel - 1;
     InM1 := InDim - 1;
+    SrcBase := 0;
     for o := 0 to OutM1 do
     begin
-      for kk := 0 to KernelM1 do
-        for i := 0 to InM1 do
-          Layer.FArrNeurons[o].Weights.FData[kk * InDim + i] :=
-            W.FData[(o * InDim + i) * Kernel + kk];
+      WV := Layer.FArrNeurons[o].Weights;
+      if Kernel = 1 then
+        Move(W.FData[SrcBase], WV.FData[0], InDim * csNeuralFloatSize)
+      else
+      begin
+        DstBase := 0;
+        for kk := 0 to KernelM1 do
+        begin
+          SrcIdx := SrcBase + kk;
+          for i := 0 to InM1 do
+          begin
+            WV.FData[DstBase + i] := W.FData[SrcIdx];
+            Inc(SrcIdx, Kernel);
+          end;
+          Inc(DstBase, InDim);
+        end;
+      end;
+      Inc(SrcBase, InDim * Kernel);
       Layer.FArrNeurons[o].BiasWeight := 0;
     end;
   finally
@@ -40987,9 +41001,7 @@ begin
           'count ' + IntToStr(EmbedTmp.Size) + ' does not match the ' +
           'embedding table size ' +
           IntToStr(DecEmbed.FArrNeurons[0].Weights.Size) + '.');
-      LpMax := EmbedTmp.Size - 1;
-      for i := 0 to LpMax do
-        DecEmbed.FArrNeurons[0].Weights.FData[i] := EmbedTmp.FData[i];
+      DecEmbed.FArrNeurons[0].Weights.Copy(EmbedTmp);
       DecEmbed.FlushWeightCache();
       Consumed.Add('decoder.embed_tokens.weight');
 
@@ -41064,9 +41076,9 @@ begin
       begin
         for j := 0 to VocabSizeM1 do
         begin
-          for i := 0 to HiddenSizeM1 do
-            LMHead.FArrNeurons[j].Weights.FData[i] :=
-              EmbedTmp.FData[j * Config.HiddenSize + i];
+          Move(EmbedTmp.FData[j * Config.HiddenSize],
+            LMHead.FArrNeurons[j].Weights.FData[0],
+            Config.HiddenSize * csNeuralFloatSize);
           LMHead.FArrNeurons[j].BiasWeight := 0;
         end;
         LMHead.FlushWeightCache();
@@ -51202,9 +51214,9 @@ begin
       EnsureWritableImportWeights(LMHead);
       for j := 0 to VocabSizeM1 do
       begin
-        for i := 0 to HiddenSizeM1 do
-          LMHead.FArrNeurons[j].Weights.FData[i] :=
-            Tmp.FData[j * Config.HiddenSize + i];
+        Move(Tmp.FData[j * Config.HiddenSize],
+          LMHead.FArrNeurons[j].Weights.FData[0],
+          Config.HiddenSize * csNeuralFloatSize);
         LMHead.FArrNeurons[j].BiasWeight := 0;
       end;
       LMHead.FlushWeightCache();
@@ -52289,7 +52301,7 @@ var
   // into a TNNetPointwiseConvLinear (neuron o = output channel, bias-free).
   procedure LoadMoEExpertSlice(Layer: TNNetLayer; const TName: string;
     ExpertIdx, NumExperts, OutDim, InDim: integer);
-  var oo, ii, ExpertBase, OutDimM1, InDimM1: integer;
+  var oo, ExpertBase, OutDimM1: integer; WV: TNNetVolume;
   begin
     if not Reader.HasTensor(TName) then
       ImportError('Nemotron-H import: missing tensor "' + TName + '".');
@@ -53623,9 +53635,9 @@ begin
           EnsureWritableImportWeights(LMHead);
           for j := 0 to VocabSizeM1 do
           begin
-            for i := 0 to HiddenSizeM1 do
-              LMHead.FArrNeurons[j].Weights.FData[i] :=
-                Tmp.FData[j * Config.HiddenSize + i];
+            Move(Tmp.FData[j * Config.HiddenSize],
+              LMHead.FArrNeurons[j].Weights.FData[0],
+              Config.HiddenSize * csNeuralFloatSize);
             LMHead.FArrNeurons[j].BiasWeight := 0;
           end;
           LMHead.FlushWeightCache();
@@ -54964,9 +54976,9 @@ begin
           EnsureWritableImportWeights(LMHead);
           for j := 0 to VocabSizeM1 do
           begin
-            for i := 0 to HiddenSizeM1 do
-              LMHead.FArrNeurons[j].Weights.FData[i] :=
-                Tmp.FData[j * Config.HiddenSize + i];
+            Move(Tmp.FData[j * Config.HiddenSize],
+              LMHead.FArrNeurons[j].Weights.FData[0],
+              Config.HiddenSize * csNeuralFloatSize);
             LMHead.FArrNeurons[j].BiasWeight := 0;
           end;
           LMHead.FlushWeightCache();
@@ -57301,9 +57313,9 @@ begin
         DModelM1 := Config.DModel - 1;
         for j := 0 to VocabSizeM1 do
         begin
-          for i := 0 to DModelM1 do
-            LMHead.FArrNeurons[j].Weights.FData[i] :=
-              Tmp.FData[j * Config.DModel + i];
+          Move(Tmp.FData[j * Config.DModel],
+            LMHead.FArrNeurons[j].Weights.FData[0],
+            Config.DModel * csNeuralFloatSize);
           LMHead.FArrNeurons[j].BiasWeight := 0;
         end;
         LMHead.FlushWeightCache();
@@ -72625,9 +72637,8 @@ begin
       Reader.LoadTensorFlat(Prefix + 'pos_embed', Pos);
       if Pos.Size <> Grid * Grid * Config.HiddenSize then
         ImportError('SAM import: pos_embed size mismatch.');
-      LpMax := Pos.Size - 1;
-      for ci := 0 to LpMax do
-        PosEmb.FArrNeurons[0].Weights.FData[ci] := Pos.FData[ci];
+      Move(Pos.FData[0], PosEmb.FArrNeurons[0].Weights.FData[0],
+        Pos.Size * csNeuralFloatSize);
       PosEmb.FlushWeightCache();
     finally
       Pos.Free;
@@ -78456,9 +78467,8 @@ begin
       if Tmp.Size <> Config.Audio.MaxSourcePositions * Config.Audio.DModel then
         ImportError('Qwen2-Audio import: ' + Prefix +
           'embed_positions.weight element count mismatch.');
-      LpMax := Tmp.Size - 1;
-      for i := 0 to LpMax do
-        EncPos.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i];
+      Move(Tmp.FData[0], EncPos.FArrNeurons[0].Weights.FData[0],
+        Tmp.Size * csNeuralFloatSize);
       EncPos.FlushWeightCache();
     finally
       Tmp.Free;
