@@ -24756,6 +24756,8 @@ var
   MaxX, MaxY, MaxD: integer;
   X, Y, D, HalfDepth, basePrev, basePrevH, basePrev0, baseErr0: integer;
   a, b, sigmoidVal, swishVal, swishDeriv, err: TNeuralFloat;
+  HasScratch: boolean;
+  bPtr, sigPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -24768,28 +24770,65 @@ begin
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
     MaxD := HalfDepth - 1;
-    for X := 0 to MaxX do
-      for Y := 0 to MaxY do
-      begin
-        basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
-        baseErr0  := FOutputError.GetRawPos(X, Y);
-        for D := 0 to MaxD do
+    // FOutputErrorDeriv is sized alongside FOutputError by SetOutputErrorSize and
+    // is never otherwise used by this layer, so it serves as the per-row sigmoid
+    // scratch without any allocation. It collapses to (1,1,1) on a
+    // non-trainable layer, hence the guard and the scalar fallback below.
+    HasScratch := (FOutputErrorDeriv.Size = FOutput.Size);
+    if HasScratch then
+    begin
+      for X := 0 to MaxX do
+        for Y := 0 to MaxY do
         begin
-          basePrev := basePrev0 + D;
-          basePrevH := basePrev + HalfDepth;
-          a := FPrevLayer.FOutput.FData[basePrev];
-          b := FPrevLayer.FOutput.FData[basePrevH];
-          sigmoidVal := 1 / (1 + NeuralExp(-b));
-          swishVal := b * sigmoidVal;
-          // Swish'(b) = swish + sigmoid * (1 - swish)
-          swishDeriv := swishVal + sigmoidVal * (1 - swishVal);
-          err := FOutputError.FData[baseErr0 + D];
-          FPrevLayer.FOutputError.FData[basePrev] :=
-            FPrevLayer.FOutputError.FData[basePrev] + err * swishVal;
-          FPrevLayer.FOutputError.FData[basePrevH] :=
-            FPrevLayer.FOutputError.FData[basePrevH] + err * a * swishDeriv;
+          basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
+          baseErr0  := FOutputError.GetRawPos(X, Y);
+          // The B half is a contiguous depth run, so sigmoid(B) for the whole
+          // row is one vectorized pass instead of HalfDepth scalar exponentials.
+          bPtr := FPrevLayer.FOutput.GetRawPtr(basePrev0 + HalfDepth);
+          sigPtr := FOutputErrorDeriv.GetRawPtr(baseErr0);
+          TNNetVolume.Sigmoid(sigPtr, bPtr, HalfDepth);
+          for D := 0 to MaxD do
+          begin
+            basePrev := basePrev0 + D;
+            basePrevH := basePrev + HalfDepth;
+            a := FPrevLayer.FOutput.FData[basePrev];
+            b := FPrevLayer.FOutput.FData[basePrevH];
+            sigmoidVal := sigPtr^[D];
+            swishVal := b * sigmoidVal;
+            // Swish'(b) = swish + sigmoid * (1 - swish)
+            swishDeriv := swishVal + sigmoidVal * (1 - swishVal);
+            err := FOutputError.FData[baseErr0 + D];
+            FPrevLayer.FOutputError.FData[basePrev] :=
+              FPrevLayer.FOutputError.FData[basePrev] + err * swishVal;
+            FPrevLayer.FOutputError.FData[basePrevH] :=
+              FPrevLayer.FOutputError.FData[basePrevH] + err * a * swishDeriv;
+          end;
         end;
-      end;
+    end
+    else
+    begin
+      for X := 0 to MaxX do
+        for Y := 0 to MaxY do
+        begin
+          basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
+          baseErr0  := FOutputError.GetRawPos(X, Y);
+          for D := 0 to MaxD do
+          begin
+            basePrev := basePrev0 + D;
+            basePrevH := basePrev + HalfDepth;
+            a := FPrevLayer.FOutput.FData[basePrev];
+            b := FPrevLayer.FOutput.FData[basePrevH];
+            sigmoidVal := 1 / (1 + NeuralExp(-b));
+            swishVal := b * sigmoidVal;
+            swishDeriv := swishVal + sigmoidVal * (1 - swishVal);
+            err := FOutputError.FData[baseErr0 + D];
+            FPrevLayer.FOutputError.FData[basePrev] :=
+              FPrevLayer.FOutputError.FData[basePrev] + err * swishVal;
+            FPrevLayer.FOutputError.FData[basePrevH] :=
+              FPrevLayer.FOutputError.FData[basePrevH] + err * a * swishDeriv;
+          end;
+        end;
+    end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
@@ -25034,6 +25073,8 @@ var
   MaxX, MaxY, MaxD: integer;
   X, Y, D, HalfDepth, basePrev, basePrevH, basePrev0, baseErr0: integer;
   a, b, sigmoidVal, sigmoidDeriv, err: TNeuralFloat;
+  HasScratch: boolean;
+  bPtr, sigPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -25046,27 +25087,62 @@ begin
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
     MaxD := HalfDepth - 1;
-    for X := 0 to MaxX do
-      for Y := 0 to MaxY do
-      begin
-        basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
-        baseErr0  := FOutputError.GetRawPos(X, Y);
-        for D := 0 to MaxD do
+    // FOutputErrorDeriv is sized alongside FOutputError by SetOutputErrorSize and
+    // is never otherwise used by this layer, so it serves as the per-row sigmoid
+    // scratch without any allocation. It collapses to (1,1,1) on a
+    // non-trainable layer, hence the guard and the scalar fallback below.
+    HasScratch := (FOutputErrorDeriv.Size = FOutput.Size);
+    if HasScratch then
+    begin
+      for X := 0 to MaxX do
+        for Y := 0 to MaxY do
         begin
-          basePrev := basePrev0 + D;
-          basePrevH := basePrev + HalfDepth;
-          a := FPrevLayer.FOutput.FData[basePrev];
-          b := FPrevLayer.FOutput.FData[basePrevH];
-          sigmoidVal := 1 / (1 + NeuralExp(-b));
-          // sigmoid'(b) = sigmoid * (1 - sigmoid)
-          sigmoidDeriv := sigmoidVal * (1 - sigmoidVal);
-          err := FOutputError.FData[baseErr0 + D];
-          FPrevLayer.FOutputError.FData[basePrev] :=
-            FPrevLayer.FOutputError.FData[basePrev] + err * sigmoidVal;
-          FPrevLayer.FOutputError.FData[basePrevH] :=
-            FPrevLayer.FOutputError.FData[basePrevH] + err * a * sigmoidDeriv;
+          basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
+          baseErr0  := FOutputError.GetRawPos(X, Y);
+          // The B half is a contiguous depth run, so sigmoid(B) for the whole
+          // row is one vectorized pass instead of HalfDepth scalar exponentials.
+          bPtr := FPrevLayer.FOutput.GetRawPtr(basePrev0 + HalfDepth);
+          sigPtr := FOutputErrorDeriv.GetRawPtr(baseErr0);
+          TNNetVolume.Sigmoid(sigPtr, bPtr, HalfDepth);
+          for D := 0 to MaxD do
+          begin
+            basePrev := basePrev0 + D;
+            basePrevH := basePrev + HalfDepth;
+            a := FPrevLayer.FOutput.FData[basePrev];
+            sigmoidVal := sigPtr^[D];
+            // sigmoid'(b) = sigmoid * (1 - sigmoid)
+            sigmoidDeriv := sigmoidVal * (1 - sigmoidVal);
+            err := FOutputError.FData[baseErr0 + D];
+            FPrevLayer.FOutputError.FData[basePrev] :=
+              FPrevLayer.FOutputError.FData[basePrev] + err * sigmoidVal;
+            FPrevLayer.FOutputError.FData[basePrevH] :=
+              FPrevLayer.FOutputError.FData[basePrevH] + err * a * sigmoidDeriv;
+          end;
         end;
-      end;
+    end
+    else
+    begin
+      for X := 0 to MaxX do
+        for Y := 0 to MaxY do
+        begin
+          basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
+          baseErr0  := FOutputError.GetRawPos(X, Y);
+          for D := 0 to MaxD do
+          begin
+            basePrev := basePrev0 + D;
+            basePrevH := basePrev + HalfDepth;
+            a := FPrevLayer.FOutput.FData[basePrev];
+            b := FPrevLayer.FOutput.FData[basePrevH];
+            sigmoidVal := 1 / (1 + NeuralExp(-b));
+            sigmoidDeriv := sigmoidVal * (1 - sigmoidVal);
+            err := FOutputError.FData[baseErr0 + D];
+            FPrevLayer.FOutputError.FData[basePrev] :=
+              FPrevLayer.FOutputError.FData[basePrev] + err * sigmoidVal;
+            FPrevLayer.FOutputError.FData[basePrevH] :=
+              FPrevLayer.FOutputError.FData[basePrevH] + err * a * sigmoidDeriv;
+          end;
+        end;
+    end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
