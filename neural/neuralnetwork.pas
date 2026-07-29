@@ -45469,6 +45469,8 @@ var
   Alpha, InvAlpha, x: TNeuralFloat;
   {$IFDEF AVXANY}
   Size: integer;
+  {$ELSE}
+  ExpAx: TNeuralFloat;
   {$ENDIF}
 begin
   StartTime := Now();
@@ -45529,10 +45531,11 @@ begin
       {$ELSE}
       for OutputCnt := 0 to SizeM1 do
       begin
-        x := LocalPrevOutput.FData[OutputCnt];
-        // y = (exp(alpha*x) - 1)/alpha + alpha; derivative = exp(alpha*x).
-        FOutput.FData[OutputCnt] := (NeuralExp(Alpha * x) - 1) * InvAlpha + Alpha;
-        FOutputErrorDeriv.FData[OutputCnt] := NeuralExp(Alpha * x);
+        // y = (exp(alpha*x) - 1)/alpha + alpha; derivative = exp(alpha*x). One
+        // exp serves both.
+        ExpAx := NeuralExp(Alpha * LocalPrevOutput.FData[OutputCnt]);
+        FOutput.FData[OutputCnt] := (ExpAx - 1) * InvAlpha + Alpha;
+        FOutputErrorDeriv.FData[OutputCnt] := ExpAx;
       end;
       {$ENDIF}
     end;
