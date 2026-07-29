@@ -126092,7 +126092,6 @@ begin
         N.FBiasWeight += O.FBiasWeight;
         {$ELSE}
         N.FBiasWeight := N.FBiasWeight + O.FBiasWeight;
-        N.FBiasInertia := N.FBiasInertia + O.FBiasInertia;
         {$ENDIF}
       end;
     end
