@@ -36553,8 +36553,9 @@ procedure LoadSeamlessConv1D(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BiasName: string;
   InDim, OutDim, Kernel: integer; Consumed: TStringList);
 var
-  W, B: TNNetVolume;
+  W, B, WV: TNNetVolume;
   o, i, kk, OutM1, InM1, KernelM1: integer;
+  SrcBase, SrcIdx, DstBase: integer;
 begin
   if not Reader.HasTensor(WName) then
     ImportError('SeamlessM4T import: missing tensor "' + WName + '".');
@@ -36577,12 +36578,29 @@ begin
     OutM1 := OutDim - 1;
     InM1 := InDim - 1;
     KernelM1 := Kernel - 1;
+    // HF [out, in, kernel] -> neuron o, weight kk*InDim+i. A pointwise conv
+    // (Kernel=1) degenerates to a contiguous row copy.
+    SrcBase := 0;
     for o := 0 to OutM1 do
     begin
-      for kk := 0 to KernelM1 do
-        for i := 0 to InM1 do
-          Layer.FArrNeurons[o].Weights.FData[kk * InDim + i] :=
-            W.FData[(o * InDim + i) * Kernel + kk];
+      WV := Layer.FArrNeurons[o].Weights;
+      if Kernel = 1 then
+        Move(W.FData[SrcBase], WV.FData[0], InDim * csNeuralFloatSize)
+      else
+      begin
+        DstBase := 0;
+        for kk := 0 to KernelM1 do
+        begin
+          SrcIdx := SrcBase + kk;
+          for i := 0 to InM1 do
+          begin
+            WV.FData[DstBase + i] := W.FData[SrcIdx];
+            Inc(SrcIdx, Kernel);
+          end;
+          Inc(DstBase, InDim);
+        end;
+      end;
+      Inc(SrcBase, InDim * Kernel);
       Layer.FArrNeurons[o].BiasWeight := 0.0;
     end;
     Consumed.Add(WName);
@@ -36614,7 +36632,7 @@ procedure LoadSeamlessDepthwiseConv1D(Reader: TNNetSafeTensorsReader;
   Consumed: TStringList);
 var
   W: TNNetVolume;
-  c, kk, HiddenM1, KernelM1: integer;
+  c, HiddenM1, SrcBase: integer;
 begin
   if not Reader.HasTensor(WName) then
     ImportError('SeamlessM4T import: missing tensor "' + WName + '".');
@@ -36634,11 +36652,12 @@ begin
     Reader.LoadTensorFlat(WName, W);
     EnsureWritableImportWeights(Layer);
     HiddenM1 := Hidden - 1;
-    KernelM1 := Kernel - 1;
+    SrcBase := 0;
     for c := 0 to HiddenM1 do
     begin
-      for kk := 0 to KernelM1 do
-        Layer.FArrNeurons[c].Weights.FData[kk] := W.FData[c * Kernel + kk];
+      Move(W.FData[SrcBase], Layer.FArrNeurons[c].Weights.FData[0],
+        Kernel * csNeuralFloatSize);
+      Inc(SrcBase, Kernel);
       Layer.FArrNeurons[c].BiasWeight := 0.0;
     end;
     Consumed.Add(WName);
@@ -37554,8 +37573,8 @@ procedure LoadWhisperConv1D(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BName: string; InDim, OutDim: integer;
   Consumed: TStringList);
 var
-  W, B: TNNetVolume;
-  o, i, kk, OutM1, InM1: integer;
+  W, B, WV: TNNetVolume;
+  o, i, kk, OutM1, InM1, SrcBase, SrcIdx, DstBase: integer;
 begin
   if not Reader.HasTensor(WName) then
     ImportError('Whisper import: missing tensor "' + WName + '".');
@@ -37587,12 +37606,22 @@ begin
     Reader.LoadTensorFlat(BName, B);
     OutM1 := OutDim - 1;
     InM1 := InDim - 1;
+    SrcBase := 0;
     for o := 0 to OutM1 do
     begin
+      WV := Layer.FArrNeurons[o].Weights;
+      DstBase := 0;
       for kk := 0 to 2 do
+      begin
+        SrcIdx := SrcBase + kk;
         for i := 0 to InM1 do
-          Layer.FArrNeurons[o].Weights.FData[kk * InDim + i] :=
-            W.FData[(o * InDim + i) * 3 + kk];
+        begin
+          WV.FData[DstBase + i] := W.FData[SrcIdx];
+          Inc(SrcIdx, 3);
+        end;
+        Inc(DstBase, InDim);
+      end;
+      Inc(SrcBase, InDim * 3);
       Layer.FArrNeurons[o].BiasWeight := B.FData[o];
     end;
   finally
@@ -38529,8 +38558,9 @@ procedure LoadWav2Vec2FeatureConv(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName: string; InDim, OutDim, Kernel: integer;
   Consumed: TStringList);
 var
-  W: TNNetVolume;
+  W, WV: TNNetVolume;
   o, i, kk, OutM1, KernelM1, InM1: integer;
+  SrcBase, SrcIdx, DstBase: integer;
 begin
   if not Reader.HasTensor(WName) then
     ImportError('Wav2Vec2 import: missing tensor "' + WName + '".');
@@ -38598,10 +38628,11 @@ procedure LoadWav2Vec2PosConv(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const GName, VName, BName: string;
   HiddenSize, Groups, Kernel: integer; Consumed: TStringList);
 var
-  G, V, B, WEff: TNNetVolume;
-  InPerGroup, o, ic, kk: integer;
+  G, V, B, WV: TNNetVolume;
+  InPerGroup, o, ic, kk, oc, SrcIdx, SrcBase, DstBase, TapRowsM1: integer;
   InPerGroupM1, KernelM1, HiddenSizeM1: integer;
-  Norm, Acc: TNeuralFloat;
+  Norm, Acc, GTap: TNeuralFloat;
+  TapNorm: array of TNeuralFloat;
 begin
   InPerGroup := HiddenSize div Groups;
   InPerGroupM1 := InPerGroup - 1;
@@ -38636,36 +38667,50 @@ begin
   G := TNNetVolume.Create;
   V := TNNetVolume.Create;
   B := TNNetVolume.Create;
-  WEff := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(GName, G);
     Reader.LoadTensorFlat(VName, V);
     Reader.LoadTensorFlat(BName, B);
-    WEff.ReSize(HiddenSize, InPerGroup, Kernel);
     // Per kernel tap k: Frobenius norm of v[:,:,k] over (out, in/groups).
+    // Only the Kernel norms are materialized; g[k]*v/norm is then applied
+    // straight into the neurons, so no [Out, In/groups, Kernel] effective
+    // weight buffer is built and re-gathered at the same indices.
+    SetLength(TapNorm, Kernel);
+    TapRowsM1 := HiddenSize * InPerGroup - 1;
     for kk := 0 to KernelM1 do
     begin
       Acc := 0;
-      for o := 0 to HiddenSizeM1 do
-        for ic := 0 to InPerGroupM1 do
-          Acc := Acc + Sqr(V.FData[(o * InPerGroup + ic) * Kernel + kk]);
+      SrcIdx := kk;
+      for oc := 0 to TapRowsM1 do
+      begin
+        Acc := Acc + Sqr(V.FData[SrcIdx]);
+        Inc(SrcIdx, Kernel);
+      end;
       Norm := Sqrt(Acc);
       if Norm = 0 then Norm := 1;
-      for o := 0 to HiddenSizeM1 do
-        for ic := 0 to InPerGroupM1 do
-          WEff.FData[(o * InPerGroup + ic) * Kernel + kk] :=
-            G.FData[kk] * V.FData[(o * InPerGroup + ic) * Kernel + kk] / Norm;
+      TapNorm[kk] := Norm;
     end;
     for o := 0 to HiddenSizeM1 do
     begin
+      WV := Layer.FArrNeurons[o].Weights;
+      SrcBase := o * InPerGroup * Kernel;
+      DstBase := 0;
       for kk := 0 to KernelM1 do
+      begin
+        GTap := G.FData[kk];
+        Norm := TapNorm[kk];
+        SrcIdx := SrcBase + kk;
         for ic := 0 to InPerGroupM1 do
-          Layer.FArrNeurons[o].Weights.FData[kk * InPerGroup + ic] :=
-            WEff.FData[(o * InPerGroup + ic) * Kernel + kk];
+        begin
+          WV.FData[DstBase + ic] := GTap * V.FData[SrcIdx] / Norm;
+          Inc(SrcIdx, Kernel);
+        end;
+        Inc(DstBase, InPerGroup);
+      end;
       Layer.FArrNeurons[o].BiasWeight := B.FData[o];
     end;
   finally
-    WEff.Free; B.Free; V.Free; G.Free;
+    B.Free; V.Free; G.Free;
   end;
   Layer.FlushWeightCache();
   Consumed.Add(GName);
