@@ -30,6 +30,7 @@ type
     procedure TestLionOptimizer;
     procedure TestAdafactorOptimizer;
     procedure TestAdafactorUsesFewerBuffersThanAdam;
+    procedure TestAdafactorFactoredMatchesReference;
     procedure TestAdamDeltaMatchesClosedForm;
     procedure TestAdamDeltaMultiStepMatchesReference;
     procedure TestReluErrorDerivIsGated;
@@ -985,6 +986,117 @@ begin
   finally
     AdamNN.Free;
     FactorNN.Free;
+  end;
+end;
+
+procedure TTestNeuralTraining.TestAdafactorFactoredMatchesReference;
+// The FACTORED branch of CalcAdafactorDelta - the one convolution layers take -
+// against a direct transcription of the published recipe:
+//   R_t[i] = beta2*R_{t-1}[i] + (1-beta2)*( rowmean(g^2)[i] + eps1 )
+//   C_t[j] = beta2*C_{t-1}[j] + (1-beta2)*( colmean(g^2)[j] + eps1 )
+//   V[i,j] = R_t[i]*C_t[j] / mean(R_t);  update = g / sqrt(V)
+// written here in the obvious column-major, one-square-root-per-element form,
+// i.e. deliberately NOT the shape the layer computes. The implementation
+// accumulates the column sums row-major through a fused multiply-add and takes
+// the R+C row and column roots separately (sqrt(a*b) = sqrt(a)*sqrt(b)), so the
+// agreement is numerical, not bit-exact; a wrong factor, a transposed index or
+// a lost EMA term would miss by far more than the tolerance. Three consecutive
+// steps let both moment vectors accumulate.
+const
+  cB2 = 0.999;
+  cEps = 1e-8;
+  cEps1 = 1e-8;
+  cLR = 0.01;
+  cSteps = 3;
+var
+  NN: TNNet;
+  Neuron: TNNetNeuron;
+  RefRow, RefCol, RefDelta: array of TNeuralFloat;
+  R, C, I, J, Idx, Step: integer;
+  invNegLr, S, MeanR, V: TNeuralFloat;
+  Tag: string;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer([
+      TNNetInput.Create(8, 8, 3),
+      TNNetConvolutionLinear.Create(2, 3, 0, 1)   // 3x3x3 kernels: R=3, C=9
+    ]);
+    NN.SetLearningRate(cLR, 0.9);
+    NN.InitAdafactor();
+
+    Neuron := NN.Layers[1].Neurons[0];
+    R := Neuron.Weights.SizeX;
+    C := Neuron.Weights.Size div R;
+    AssertEquals('factored R', 3, R);
+    AssertEquals('factored C', 9, C);
+
+    SetLength(RefRow, R);
+    SetLength(RefCol, C);
+    SetLength(RefDelta, R * C);
+    for I := 0 to R - 1 do RefRow[I] := 0;
+    for J := 0 to C - 1 do RefCol[J] := 0;
+    invNegLr := -1.0 / cLR;
+
+    for Step := 1 to cSteps do
+    begin
+      Tag := ' (step ' + IntToStr(Step) + ')';
+      // FDelta arrives from backprop as -lr*g; seed it deterministically.
+      for Idx := 0 to R * C - 1 do
+      begin
+        RefDelta[Idx] := (((Idx * 7 + Step) mod 11) - 5) * 0.004 * Step;
+        Neuron.Delta.FData[Idx] := RefDelta[Idx];
+      end;
+
+      // --- reference, straight from the recipe ---
+      for I := 0 to R - 1 do
+      begin
+        S := 0;
+        for J := 0 to C - 1 do
+        begin
+          V := RefDelta[I * C + J] * invNegLr;
+          S := S + V * V;
+        end;
+        RefRow[I] := cB2 * RefRow[I] + (1 - cB2) * (S / C + cEps1);
+      end;
+      for J := 0 to C - 1 do
+      begin
+        S := 0;
+        for I := 0 to R - 1 do
+        begin
+          V := RefDelta[I * C + J] * invNegLr;
+          S := S + V * V;
+        end;
+        RefCol[J] := cB2 * RefCol[J] + (1 - cB2) * (S / R + cEps1);
+      end;
+      S := 0;
+      for I := 0 to R - 1 do S := S + RefRow[I];
+      MeanR := S / R;
+      if MeanR < cEps1 then MeanR := cEps1;
+      for I := 0 to R - 1 do
+        for J := 0 to C - 1 do
+        begin
+          V := (RefRow[I] / MeanR) * RefCol[J];
+          if V < 0 then V := 0;
+          // update = -lr*(g/denom) = delta/denom, since -lr*g = delta.
+          RefDelta[I * C + J] := RefDelta[I * C + J] / (Sqrt(V) + cEps);
+        end;
+
+      NN.Layers[1].CalcAdafactorDelta(cB2, cEps, cEps1);
+
+      for I := 0 to R - 1 do
+        AssertEquals('row moment[' + IntToStr(I) + ']' + Tag,
+          RefRow[I], Neuron.BackInertia.FData[I], Abs(RefRow[I]) * 1e-4 + 1e-9);
+      for J := 0 to C - 1 do
+        AssertEquals('col moment[' + IntToStr(J) + ']' + Tag,
+          RefCol[J], Neuron.BackInertia2.FData[J], Abs(RefCol[J]) * 1e-4 + 1e-9);
+      for Idx := 0 to R * C - 1 do
+        AssertEquals('delta[' + IntToStr(Idx) + ']' + Tag,
+          RefDelta[Idx], Neuron.Delta.FData[Idx],
+          Abs(RefDelta[Idx]) * 1e-4 + 1e-9);
+    end;
+  finally
+    NN.Free;
   end;
 end;
 

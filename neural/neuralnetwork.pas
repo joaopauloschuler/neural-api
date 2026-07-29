@@ -465,6 +465,10 @@ type
       // Claude (AI).)
       FMuonMmat, FMuonOmat: TNNetVolume;
       FMuonX, FMuonA, FMuonAX, FMuonA2X, FMuonQt: TNNetVolume;
+      // Adafactor column scratch, shared by every neuron of this layer
+      // (they carry the same weight shape and are stepped serially).
+      // Lazily created on the factored path only; nil otherwise.
+      FAdafactorCols: TNNetVolume;
 
       procedure InitStruct();
     private
@@ -124811,6 +124815,9 @@ begin
     FMuonX.Free; FMuonA.Free; FMuonAX.Free;
     FMuonA2X.Free; FMuonQt.Free;
   end;
+  // Adafactor column scratch (only allocated on layers whose weight shape
+  // is factorable and that actually ran an Adafactor step).
+  if Assigned(FAdafactorCols) then FAdafactorCols.Free;
   inherited Destroy();
 end;
 
@@ -127346,8 +127353,9 @@ var
   Cnt, MaxCnt, R, C, i, j, idx, rowBase: integer;
   RM1, CM1: integer;
   lr, invNegLr, g, gsq, denom, rowMean, vhat, sumR: TNeuralFloat;
-  invNegLrSq, oneMinusB2, riOverMean, kAF, cAF: TNeuralFloat;
+  invNegLrSq, oneMinusB2, riOverMean, kAF, cAF, sqrtRi: TNeuralFloat;
   Factored: boolean;
+  Cols: TNNetVolume;
 begin
   lr := FParentLayer.FLearningRate;
   if lr = 0 then begin ClearDelta(); exit; end;
@@ -127364,6 +127372,17 @@ begin
     C := FWeights.Size div R;
     RM1 := R - 1;
     CM1 := C - 1;
+    // Column scratch: one buffer per PARENT LAYER, shared by all its neurons
+    // (identical weight shapes, stepped serially by TNNetLayer), created once
+    // and resized only when the shape changes - the lazy amortized form rule
+    // #17 permits, so nothing is allocated per training step.
+    Cols := FParentLayer.FAdafactorCols;
+    if Cols = nil then
+    begin
+      Cols := TNNetVolume.Create();
+      FParentLayer.FAdafactorCols := Cols;
+    end;
+    if Cols.Size <> C then Cols.ReSize(C, 1, 1);
     // Row / column accumulators built from g^2 (interpret index as i*C + j).
     // First pass: per-row and per-column mean of g^2.
     rowBase := 0;  // #6: rowBase steps by C per row
@@ -127375,20 +127394,34 @@ begin
       FBackInertia.FData[i] := Beta2 * FBackInertia.FData[i] + oneMinusB2 * rowMean;
       Inc(rowBase, C);
     end;
+    // Column sums of d^2, accumulated ROW-major: Cols[j] += d[i][j]^2 for one
+    // whole row at a time (#13). The column-major original walked the buffer
+    // with a stride of C and could not vectorize; this adds the same terms for
+    // each j in the same ascending-i order, over contiguous memory. The AVX2
+    // MulAdd fuses its multiply-add, so a term may round once instead of
+    // twice - under one ulp on a second-moment accumulator.
+    Cols.Fill(0);
+    rowBase := 0;
+    for i := 0 to RM1 do
+    begin
+      TNNetVolume.MulAdd(@Cols.FData[0], @FDelta.FData[rowBase],
+        @FDelta.FData[rowBase], C);
+      Inc(rowBase, C);
+    end;
     for j := 0 to CM1 do
     begin
-      rowMean := 0;
-      idx := j;
-      for i := 0 to RM1 do
-      begin
-        // Accumulate d^2; g^2 = invNegLrSq*d^2, so pull invNegLrSq out (#5),
-        // matching the row pass above (one multiply after the loop).
-        g := FDelta.FData[idx];
-        rowMean := rowMean + g * g;
-        Inc(idx, C);
-      end;
-      rowMean := rowMean * invNegLrSq / R + Eps1;
-      FBackInertia2.FData[j] := Beta2 * FBackInertia2.FData[j] + oneMinusB2 * rowMean;
+      // g^2 = invNegLrSq*d^2, so pull invNegLrSq out (#5), matching the row
+      // pass above (one multiply after the accumulation).
+      rowMean := Cols.FData[j] * invNegLrSq / R + Eps1;
+      vhat := Beta2 * FBackInertia2.FData[j] + oneMinusB2 * rowMean;
+      FBackInertia2.FData[j] := vhat;
+      // The reconstruction below needs sqrt(R_i*C_j), and both factors are
+      // non-negative, so sqrt(R_i*C_j) = sqrt(R_i)*sqrt(C_j): taking the C
+      // column roots here (and the R row roots below) costs R+C square roots
+      // instead of the R*C the per-element form took. Cols is reused for them,
+      // its accumulator duty being over.
+      if vhat < 0 then vhat := 0;           // guard rounding
+      Cols.FData[j] := Sqrt(vhat);
     end;
     // mean(R_t) for the rank-1 reconstruction normalizer. FBackInertia is
     // exactly (R,1,1) on the factored path, so its AVX GetSum sums the same R
@@ -127400,12 +127433,12 @@ begin
     for i := 0 to RM1 do
     begin
       riOverMean := FBackInertia.FData[i] / rowMean;
+      if riOverMean < 0 then riOverMean := 0;   // guard rounding, as before
+      sqrtRi := Sqrt(riOverMean);
       for j := 0 to CM1 do
       begin
         idx := rowBase + j;
-        vhat := riOverMean * FBackInertia2.FData[j];
-        if vhat < 0 then vhat := 0;          // guard rounding
-        denom := sqrt(vhat) + Epsilon;
+        denom := sqrtRi * Cols.FData[j] + Epsilon;
         if denom <= 0 then denom := Epsilon;  // never divide by zero
         // update = -lr*(g/denom); g = d*invNegLr = -d/lr, so -lr*g = d and the
         // whole store collapses to d/denom (#14) - no g recovery, no -lr multiply.
