@@ -18405,7 +18405,9 @@ type
       // point, building it lazily against FDotProductKernel's already-compiled
       // program on first request and caching it. Layers' *CL helpers borrow this
       // handle rather than each creating their own. Coded by Claude (AI).
-      function SharedKernel(const kernelname: string): TNeuralKernel;
+      function GetSharedKernel(const kernelname: string): TNeuralKernel;
+      function CreateKernel(const kernelname: string): TNeuralKernel;
+      function GetKernel(const kernelname: string): TNeuralKernel;
       // Force (pForce=True) or release (False) the OpenCL device path on every
       // layer, bypassing each layer's per-layer size verdict (FShouldOpenCL).
       // Replaces the old global dispatch-gate override used by the GPU parity
@@ -35407,7 +35409,7 @@ begin
   inherited Create();
   // Borrow the net-wide cai_bilinear_gather handle (shared by every resampling
   // layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.SharedKernel('cai_bilinear_gather');
+  FKernel := NN.GetSharedKernel('cai_bilinear_gather');
   FSrcBuf    := TNNetVolume.Create();
   FCornerBuf := TNNetVolume.Create();
   FWeightBuf := TNNetVolume.Create();
@@ -35462,7 +35464,7 @@ begin
   inherited Create();
   // Borrow the net-wide cai_pixel_shuffle handle (shared by every pixel-shuffle
   // layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.SharedKernel('cai_pixel_shuffle');
+  FKernel := NN.GetSharedKernel('cai_pixel_shuffle');
 end;
 
 destructor TNNetPixelShuffleCL.Destroy();
@@ -35502,7 +35504,7 @@ begin
   inherited Create();
   // Borrow the net-wide cai_bicubic_gather handle (shared by every resampling
   // layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.SharedKernel('cai_bicubic_gather');
+  FKernel := NN.GetSharedKernel('cai_bicubic_gather');
 end;
 
 destructor TNNetBicubicGatherCL.Destroy();
@@ -35546,7 +35548,7 @@ begin
   inherited Create();
   // Borrow the net-wide cai_pixel_shuffle_scatter handle (shared by every
   // pixel-shuffle layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.SharedKernel('cai_pixel_shuffle_scatter');
+  FKernel := NN.GetSharedKernel('cai_pixel_shuffle_scatter');
 end;
 
 destructor TNNetPixelShuffleScatterCL.Destroy();
@@ -35586,7 +35588,7 @@ begin
   inherited Create();
   // Borrow the net-wide cai_bicubic_scatter handle (shared by every resampling
   // layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.SharedKernel('cai_bicubic_scatter');
+  FKernel := NN.GetSharedKernel('cai_bicubic_scatter');
 end;
 
 destructor TNNetBicubicScatterCL.Destroy();
@@ -35633,8 +35635,8 @@ begin
   inherited Create();
   // Borrow the net-wide handles for these entry points (one per net, shared by
   // every norm layer) instead of creating our own; NN owns and frees them.
-  FKernel := NN.SharedKernel('cai_token_norm');
-  FVolKernel := NN.SharedKernel('cai_volume_norm');
+  FKernel := NN.GetSharedKernel('cai_token_norm');
+  FVolKernel := NN.GetSharedKernel('cai_volume_norm');
   FXBuf := TNNetVolume.Create();
   FYBuf := TNNetVolume.Create();
 end;
@@ -35734,7 +35736,7 @@ begin
   inherited Create();
   // Borrow the net-wide cai_group_norm handle (shared by every group-norm layer)
   // instead of creating our own; NN owns and frees it.
-  FKernel := NN.SharedKernel('cai_group_norm');
+  FKernel := NN.GetSharedKernel('cai_group_norm');
 end;
 
 destructor TNNetGroupNormCL.Destroy();
@@ -35790,7 +35792,7 @@ begin
   inherited Create();
   // Borrow the net-wide cai_l2norm_perdepth handle (shared by every L2-norm
   // layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.SharedKernel('cai_l2norm_perdepth');
+  FKernel := NN.GetSharedKernel('cai_l2norm_perdepth');
 end;
 
 destructor TNNetL2NormCL.Destroy();
@@ -35834,7 +35836,7 @@ begin
   inherited Create();
   // Borrow the net-wide cai_pool2d handle (shared by every pooling layer)
   // instead of creating our own; NN owns and frees it.
-  FKernel := NN.SharedKernel('cai_pool2d');
+  FKernel := NN.GetSharedKernel('cai_pool2d');
 end;
 
 destructor TNNetPool2DCL.Destroy();
@@ -35883,7 +35885,7 @@ begin
   inherited Create();
   // Borrow the net-wide cai_depthwise_conv2d handle (shared by every depthwise
   // conv layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.SharedKernel('cai_depthwise_conv2d');
+  FKernel := NN.GetSharedKernel('cai_depthwise_conv2d');
 end;
 
 destructor TNNetDepthwiseConvCL.Destroy();
@@ -35934,7 +35936,7 @@ begin
   inherited Create();
   // Borrow the net-wide cai_depthwise_conv1d handle (shared by every depthwise
   // 1D conv layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.SharedKernel('cai_depthwise_conv1d');
+  FKernel := NN.GetSharedKernel('cai_depthwise_conv1d');
 end;
 
 destructor TNNetDepthwiseConv1DCL.Destroy();
@@ -35984,7 +35986,7 @@ begin
   inherited Create();
   // Borrow the net-wide cai_softmax handle (shared by every softmax layer)
   // instead of creating our own; NN owns and frees it.
-  FKernel := NN.SharedKernel('cai_softmax');
+  FKernel := NN.GetSharedKernel('cai_softmax');
 end;
 
 destructor TNNetSoftMaxCL.Destroy();
@@ -36026,7 +36028,7 @@ begin
   inherited Create();
   // Borrow the net-wide cai_rope handle (shared by every RoPE layer) instead of
   // creating our own; NN owns and frees it.
-  FKernel := NN.SharedKernel('cai_rope');
+  FKernel := NN.GetSharedKernel('cai_rope');
   FTheta := TNNetVolume.Create();
 end;
 
@@ -36083,7 +36085,7 @@ begin
   inherited Create();
   // Borrow the net-wide cai_mrope handle (shared by every M-RoPE layer) instead
   // of creating our own; NN owns and frees it.
-  FKernel := NN.SharedKernel('cai_mrope');
+  FKernel := NN.GetSharedKernel('cai_mrope');
   FAngle := TNNetVolume.Create();
 end;
 
@@ -36134,7 +36136,7 @@ begin
   inherited Create();
   // Borrow the net-wide cai_embedding_gather handle (shared by every embedding
   // layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.SharedKernel('cai_embedding_gather');
+  FKernel := NN.GetSharedKernel('cai_embedding_gather');
   FWeightCached := false;
 end;
 
@@ -36194,7 +36196,7 @@ begin
   inherited Create();
   // Borrow the net-wide cai_glu_gate handle (shared by every GLU-family layer)
   // instead of creating our own; NN owns and frees it.
-  FKernel := NN.SharedKernel('cai_glu_gate');
+  FKernel := NN.GetSharedKernel('cai_glu_gate');
 end;
 
 destructor TNNetGLUGateCL.Destroy();
@@ -73637,7 +73639,7 @@ begin
   // convolution: a pointwise conv has no im2col (FInputPrepared aliases the prev
   // output). The net owns and frees the handle. Coded by Claude (AI).
   if Assigned(FDotCL) and (not FPointwise) then
-    FIm2ColKernel := FNN.SharedKernel('cai_im2col');
+    FIm2ColKernel := FNN.GetSharedKernel('cai_im2col');
 end;
 
 procedure TNNetLayerConcatedWeights.EnableOpenCL(
@@ -95965,7 +95967,7 @@ begin
   // convolution layers confine allocation to EnableOpenCL/PrepareForCompute.
   if FActivationOpcode <> csActNone then
   begin
-    if Assigned(FNN) then FActivationKernel := FNN.SharedKernel('cai_activation');
+    if Assigned(FNN) then FActivationKernel := FNN.GetSharedKernel('cai_activation');
     if Assigned(FActivationBuffer) and (FActivationBufSize <> FOutput.Size) then
     begin
       clReleaseMemObject(FActivationBuffer);
@@ -123461,7 +123463,7 @@ begin
   end;
 end;
 
-function TNNet.SharedKernel(const kernelname: string): TNeuralKernel;
+function TNNet.GetSharedKernel(const kernelname: string): TNeuralKernel;
 var
   idx: integer;
 begin
@@ -123481,9 +123483,21 @@ begin
   begin
     // Bind a fresh handle against the net's already-compiled neural.cl program and
     // cache it so every later layer of this type reuses the same handle.
-    Result := TNeuralKernel.CreateFromProgram(FDotProductKernel, kernelname);
+    Result := CreateKernel(kernelname);
     FSharedKernels.AddObject(kernelname, Result);
   end;
+end;
+
+function TNNet.CreateKernel(const kernelname: string): TNeuralKernel;
+begin
+  Result := TNeuralKernel.CreateFromProgram(FDotProductKernel, kernelname);
+end;
+
+function TNNet.GetKernel(const kernelname: string): TNeuralKernel;
+begin
+  if FHasSharedKernel
+    then Result := GetSharedKernel(kernelname)
+    else Result := CreateKernel(kernelname);
 end;
 
 procedure TNNet.ForceOpenCL(pForce: boolean);
