@@ -25673,9 +25673,12 @@ begin
   begin
     // Anti-causal: mask the lower triangle, X < Y - Offset.
     // The masked cells X=0..XBnd over all D form one contiguous depth run.
+    // A negative Offset pushes X < Y - Offset past the end of the row; the
+    // whole row is masked then, so the run stops at MaxX.
     for Y := 0 to MaxY do
     begin
       XBnd := Y - Offset - 1;
+      if XBnd > MaxX then XBnd := MaxX;
       if XBnd >= 0 then
       begin
         base := FOutput.GetRawPos(0, Y);
@@ -25689,9 +25692,12 @@ begin
     // Causal: mask the upper triangle, X > Y + Offset.
     // Offset = 0 is the strictly-causal default (X > Y).
     // The masked cells X=XStart..MaxX over all D form one contiguous depth run.
+    // A negative Offset drives X > Y + Offset below column 0; the whole row is
+    // masked then, so the run starts at 0.
     for Y := 0 to MaxY do
     begin
       XStart := Y + Offset + 1;
+      if XStart < 0 then XStart := 0;
       if XStart <= MaxX then
       begin
         base := FOutput.GetRawPos(XStart, Y);
@@ -25825,7 +25831,10 @@ begin
   for Y := 0 to MaxY do
   begin
     PastLimit := Y - W + 1;
-    // Too-far-past run: X = 0 .. PastLimit-1.
+    // Too-far-past run: X = 0 .. PastLimit-1. PastLimit is derived from the
+    // query axis, so on a non-square volume (SizeY > SizeX) it can exceed the
+    // row width; masking never leaves the row.
+    if PastLimit > MaxX + 1 then PastLimit := MaxX + 1;
     if PastLimit >= 1 then
     begin
       base := FOutput.GetRawPos(0, Y);

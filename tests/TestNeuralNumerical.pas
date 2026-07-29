@@ -1016,6 +1016,7 @@ type
     procedure TestMaskedFillDefaultMatchesUpperTriangle;
     procedure TestMaskedFillOffset;
     procedure TestMaskedFillLowerTriangle;
+    procedure TestMaskedFillNegativeOffset;
     procedure TestMaskedFillGradientCheck;
     procedure TestTriangularCausalMaskForward;
     procedure TestTriangularCausalMaskGradientCheck;
@@ -1026,6 +1027,7 @@ type
     procedure TestSlidingWindowMaskedFillSerializationRoundTrip;
     procedure TestSlidingWindowMaskedFillFullWindowEqualsCausal;
     procedure TestSlidingWindowMaskedFillShapeStress;
+    procedure TestSlidingWindowMaskedFillNonSquare;
     procedure TestALiBiForward;
     procedure TestALiBiGradientCheck;
     procedure TestALiBiSerializationRoundTrip;
@@ -11636,6 +11638,57 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestMaskedFillNegativeOffset;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, Ofs: integer;
+begin
+  Ofs := -2;
+  // A negative offset shifts the band off the volume: entire rows fall inside
+  // the masked half-plane, and the run must stop at the row edge instead of
+  // walking off it (X < 0 on the causal side, X > MaxX on the anti-causal one).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 1, 1));
+    NN.AddLayer(TNNetMaskedFill.Create(-1e9, Ofs, False));
+    Input.Fill(1.0);
+    NN.Compute(Input);
+    for Y := 0 to 3 do
+      for X := 0 to 3 do
+        if X > Y + Ofs then
+          AssertTrue('Causal negative offset masked at X=' + IntToStr(X) +
+            ' Y=' + IntToStr(Y), NN.GetLastLayer.Output[X, Y, 0] < -1e8)
+        else
+          AssertEquals('Causal negative offset untouched at X=' + IntToStr(X) +
+            ' Y=' + IntToStr(Y), 1.0, NN.GetLastLayer.Output[X, Y, 0], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 1, 1));
+    NN.AddLayer(TNNetMaskedFill.Create(-1e9, Ofs, True));
+    Input.Fill(1.0);
+    NN.Compute(Input);
+    for Y := 0 to 3 do
+      for X := 0 to 3 do
+        if X < Y - Ofs then
+          AssertTrue('Anti-causal negative offset masked at X=' + IntToStr(X) +
+            ' Y=' + IntToStr(Y), NN.GetLastLayer.Output[X, Y, 0] < -1e8)
+        else
+          AssertEquals('Anti-causal negative offset untouched at X=' +
+            IntToStr(X) + ' Y=' + IntToStr(Y),
+            1.0, NN.GetLastLayer.Output[X, Y, 0], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestMaskedFillGradientCheck;
 begin
   // Adding a constant has identity gradient passthrough. A small mask
@@ -11678,6 +11731,40 @@ begin
             1.0, NN.GetLastLayer.Output[X, Y, 0], 0.0001);
       end;
     end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSlidingWindowMaskedFillNonSquare;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, W, SizeX, SizeY: integer;
+begin
+  SizeX := 3;
+  SizeY := 5;
+  W := 1;
+  // The too-far-past run length comes from the query (Y) axis, so on a taller
+  // than wide map the last rows are entirely past the window and the run must
+  // stop at the row edge rather than run off the volume.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, 1, 1));
+    NN.AddLayer(TNNetSlidingWindowMaskedFill.Create(W, -1e9));
+    Input.Fill(1.0);
+    NN.Compute(Input);
+    for Y := 0 to SizeY - 1 do
+      for X := 0 to SizeX - 1 do
+        if (X > Y) or (X < Y - W + 1) then
+          AssertTrue('Non-square sliding window masked at X=' + IntToStr(X) +
+            ' Y=' + IntToStr(Y), NN.GetLastLayer.Output[X, Y, 0] < -1e8)
+        else
+          AssertEquals('Non-square sliding window untouched at X=' +
+            IntToStr(X) + ' Y=' + IntToStr(Y),
+            1.0, NN.GetLastLayer.Output[X, Y, 0], 0.0001);
   finally
     NN.Free;
     Input.Free;
