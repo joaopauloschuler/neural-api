@@ -16471,7 +16471,7 @@ type
       // construction path with no importer changes. Coded by Claude (AI).
       FBuildQuantInt8: boolean;
       {$IFDEF OpenCL}
-      FSharedKernel: boolean;
+      FHasSharedKernel: boolean;
       FDotProductKernel: TDotProductKernel;
       // Single net-wide cai_activation kernel, created in EnableOpenCL beside
       // FDotProductKernel and SHARED by every elementwise-activation layer -
@@ -18399,7 +18399,7 @@ type
 
       {$IFDEF OpenCL}
       procedure DisableOpenCL();
-      procedure EnableOpenCL(platform_id: cl_platform_id; device_id: cl_device_id; pSharedKernel:boolean = true);
+      procedure EnableOpenCL(platform_id: cl_platform_id; device_id: cl_device_id; pHasSharedKernel:boolean = true);
       // Returns the one net-wide helper kernel bound to the given neural.cl entry
       // point, building it lazily against FDotProductKernel's already-compiled
       // program on first request and caching it. Layers' *CL helpers borrow this
@@ -123431,12 +123431,12 @@ begin
 end;
 
 procedure TNNet.EnableOpenCL(platform_id: cl_platform_id;
-  device_id: cl_device_id; pSharedKernel:boolean = true);
+  device_id: cl_device_id; pHasSharedKernel:boolean = true);
 var
   LayerCnt: integer;
   LastLayerIdx: integer;
 begin
-  FSharedKernel := pSharedKernel;
+  FHasSharedKernel := pHasSharedKernel;
   FDotProductKernel := TDotProductCL.Create(platform_id, device_id, 'cai_dot_product', {pHideMessages}true);
   // Guard: if neural.cl could not be found/built, the root program never compiled
   // and FDotProductKernel.Context is nil. Enabling the device path anyway makes
@@ -123479,12 +123479,14 @@ begin
   if idx >= 0 then
   begin
     Result := TNeuralKernel(FSharedKernels.Objects[idx]);
-    exit;
+  end
+  else
+  begin
+    // Bind a fresh handle against the net's already-compiled neural.cl program and
+    // cache it so every later layer of this type reuses the same handle.
+    Result := TNeuralKernel.CreateFromProgram(FDotProductKernel, kernelname);
+    FSharedKernels.AddObject(kernelname, Result);
   end;
-  // Bind a fresh handle against the net's already-compiled neural.cl program and
-  // cache it so every later layer of this type reuses the same handle.
-  Result := TNeuralKernel.CreateFromProgram(FDotProductKernel, kernelname);
-  FSharedKernels.AddObject(kernelname, Result);
 end;
 
 procedure TNNet.ForceOpenCL(pForce: boolean);
