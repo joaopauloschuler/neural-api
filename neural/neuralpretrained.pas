@@ -41404,11 +41404,10 @@ procedure LoadEnCodecConv(Reader: TNNetSafeTensorsReader;
   const Prefix: string; var Conv: TEnCodecConv; pTranspose: boolean;
   pStride, pDilation: integer; Consumed: TStrings);
 var
-  LpMax: integer;
   G, V: TNNetVolume;
-  OutDim, InDim, K, o, i, k2, Base, Cnt: integer;
-  OutDimM1, InDimM1, KM1: integer;
-  Norm: TNeuralFloat;
+  OutDim, InDim, K, o, Base, Cnt: integer;
+  OutDimM1, RowLen, RowBytes: integer;
+  Norm, Scale: TNeuralFloat;
   GName, VName: string;
 begin
   G := TNNetVolume.Create;
@@ -41438,8 +41437,6 @@ begin
     InDim := Reader.DimSize(VName, 1);
     K := Reader.DimSize(VName, 2);
     OutDimM1 := OutDim - 1;
-    InDimM1 := InDim - 1;
-    KM1 := K - 1;
     Conv.Transpose := pTranspose;
     Conv.Stride := pStride;
     Conv.Dilation := pDilation;
@@ -41458,16 +41455,25 @@ begin
     Cnt := OutDim * InDim * K;
     SetLength(Conv.W, Cnt);
     // weight_norm dim=0: per group-row o, w = g[o] * v[o,:,:] / ||v[o,:,:]||.
+    // The row is a uniform scale of a contiguous InDim*K run, so copy it and
+    // fire one AVX Mul (#13) with a single divide per row (#21) instead of a
+    // per-element divide. v*(g/norm) reassociates against g*v/norm; that is an
+    // import-time weight fold, well inside the 1e-4 codec parity gate.
+    RowLen := InDim * K;
+    RowBytes := RowLen * csNeuralFloatSize;
+    Base := 0;                           // #6: o * InDim * K carried
     for o := 0 to OutDimM1 do
     begin
-      Base := o * InDim * K;
-      Norm := TNNetVolume.DotProduct(@V.FData[Base], @V.FData[Base], InDim * K);
+      Norm := TNNetVolume.DotProduct(@V.FData[Base], @V.FData[Base], RowLen);
       Norm := Sqrt(Norm);
       if Norm = 0 then Norm := 1;
-      for i := 0 to InDimM1 do
-        for k2 := 0 to KM1 do
-          Conv.W[Base + i * K + k2] :=
-            G.FData[o] * V.FData[Base + i * K + k2] / Norm;
+      Scale := G.FData[o] / Norm;
+      if RowLen > 0 then
+      begin
+        Move(V.FData[Base], Conv.W[Base], RowBytes);
+        TNNetVolume.Mul(@Conv.W[Base], Scale, RowLen);
+      end;
+      Inc(Base, RowLen);
     end;
     if pTranspose then
     begin
@@ -41478,8 +41484,8 @@ begin
     Reader.LoadTensorFlat(Prefix + '.bias', G);
     Consumed.Add(Prefix + '.bias');
     SetLength(Conv.B, G.Size);
-    LpMax := G.Size - 1;
-    for o := 0 to LpMax do Conv.B[o] := G.FData[o];
+    if G.Size > 0 then                                                // #13
+      Move(G.FData[0], Conv.B[0], G.Size * csNeuralFloatSize);
   finally
     V.Free;
     G.Free;
@@ -43240,10 +43246,12 @@ begin
       PadRow := Padded[i];                        // #9: bind row once
       // Causal left pad (PadTotal frames) + extra right pad. #5: replicate edge
       // values are per-channel invariants (0 for 'constant').
-      if IsReplicate then
+      // A zero-length stage output has no edge value to replicate, so it pads
+      // with zeros; without the guard both reads would be out of bounds.
+      if IsReplicate and (InLen > 0) then
       begin
         Left := InSig[i][0];
-        Right := InSig[i][InLen - 1];
+        Right := InSig[i][InLenM1];
       end
       else
       begin
@@ -44634,11 +44642,10 @@ procedure LoadDACConv(Reader: TNNetSafeTensorsReader; const Prefix: string;
   var Conv: TEnCodecConv; pTranspose: boolean; pStride, pDilation: integer;
   Consumed: TStrings; pRawWeightOnly: boolean = False);
 var
-  LpMax: integer;
   G, V: TNNetVolume;
-  D0, D1, K, o, i, k2, Base, Cnt, OutDim, InDim: integer;
-  OutDimM1, InDimM1, KM1: integer;
-  Norm: TNeuralFloat;
+  D0, D1, K, o, Base, Cnt, OutDim, InDim: integer;
+  OutDimM1, RowLen, RowBytes: integer;
+  Norm, Scale: TNeuralFloat;
   GName, VName, WName: string;
   Parametrized: boolean;
 begin
@@ -44681,8 +44688,8 @@ begin
       if pTranspose then begin Conv.InCh := D0; Conv.OutCh := D1; end
       else begin Conv.InCh := D1; Conv.OutCh := D0; end;
       SetLength(Conv.W, V.Size);
-      LpMax := V.Size - 1;
-      for o := 0 to LpMax do Conv.W[o] := V.FData[o];
+      if V.Size > 0 then                                              // #13
+        Move(V.FData[0], Conv.W[0], V.Size * csNeuralFloatSize);
     end
     else
     begin
@@ -44694,23 +44701,28 @@ begin
       InDim := Reader.DimSize(VName, 1);
       K := Reader.DimSize(VName, 2);
       OutDimM1 := OutDim - 1;
-      InDimM1 := InDim - 1;
-      KM1 := K - 1;
       Conv.Kernel := K;
       if pTranspose then begin Conv.InCh := OutDim; Conv.OutCh := InDim; end
       else begin Conv.InCh := InDim; Conv.OutCh := OutDim; end;
       Cnt := OutDim * InDim * K;
       SetLength(Conv.W, Cnt);
+      // weight_norm dim=0: one divide per row (#21), a Move and one AVX Mul
+      // (#13) instead of a per-element divide. See LoadEnCodecConv.
+      RowLen := InDim * K;
+      RowBytes := RowLen * csNeuralFloatSize;
+      Base := 0;                         // #6: o * InDim * K carried
       for o := 0 to OutDimM1 do
       begin
-        Base := o * InDim * K;
-        Norm := TNNetVolume.DotProduct(@V.FData[Base], @V.FData[Base], InDim * K);
+        Norm := TNNetVolume.DotProduct(@V.FData[Base], @V.FData[Base], RowLen);
         Norm := Sqrt(Norm);
         if Norm = 0 then Norm := 1;
-        for i := 0 to InDimM1 do
-          for k2 := 0 to KM1 do
-            Conv.W[Base + i * K + k2] :=
-              G.FData[o] * V.FData[Base + i * K + k2] / Norm;
+        Scale := G.FData[o] / Norm;
+        if RowLen > 0 then
+        begin
+          Move(V.FData[Base], Conv.W[Base], RowBytes);
+          TNNetVolume.Mul(@Conv.W[Base], Scale, RowLen);
+        end;
+        Inc(Base, RowLen);
       end;
     end;
     // DAC's forward contracts in Double; build that layout once and drop the
@@ -44728,8 +44740,8 @@ begin
     Reader.LoadTensorFlat(Prefix + '.bias', G);
     Consumed.Add(Prefix + '.bias');
     SetLength(Conv.B, G.Size);
-    LpMax := G.Size - 1;
-    for o := 0 to LpMax do Conv.B[o] := G.FData[o];
+    if G.Size > 0 then                                                // #13
+      Move(G.FData[0], Conv.B[0], G.Size * csNeuralFloatSize);
   finally
     V.Free;
     G.Free;
