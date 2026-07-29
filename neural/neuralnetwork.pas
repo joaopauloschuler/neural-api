@@ -478,10 +478,11 @@ type
       FShouldOpenCL: boolean;
       FForceOpenCL: boolean; // test/diagnostic override: bypass the size verdict
       FDotCL: TDotProductSharedKernel;
-      // The one cai_dot_product kernel lives on the owning net (TNNet.FDotProductKernel);
-      // Every other net-wide entry point follows the TNNet.SharedKernel pattern: the
-      // net holds the single handle, the layer borrows it and never frees it.
-      // (Coded by Claude (AI).)
+      // Borrowed cai_dot_product handle backing FDotCL. TNNet.FDotProductKernel
+      // still owns the context/queue/program every handle is built against; this
+      // is only the kernel object FDotCL binds its arguments on.
+      F32Kernel: TNeuralKernel;
+      function GetDotProductKernel(): TNeuralKernel;
       {$ENDIF}
 
       procedure ComputeL2Decay(); virtual;
@@ -22178,7 +22179,7 @@ begin
   inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL
   if not Assigned(FDotCL) then
   begin
-    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL := TDotProductSharedKernel.Create(GetDotProductKernel());
     FDotCL.HideMessages();
   end;
   if not Assigned(FGramTBuf) then FGramTBuf := TNNetVolume.Create();
@@ -31962,7 +31963,7 @@ begin
   inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL
   if not Assigned(FDotCL) then
   begin
-    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL := TDotProductSharedKernel.Create(GetDotProductKernel());
     FDotCL.HideMessages();
   end;
   if not Assigned(FQRowBuf) then FQRowBuf := TNNetVolume.Create();
@@ -35023,7 +35024,7 @@ begin
   inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL
   if not Assigned(FDotCL) then
   begin
-    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL := TDotProductSharedKernel.Create(GetDotProductKernel());
     FDotCL.HideMessages();
   end;
   if not Assigned(FQRowBuf) then FQRowBuf := TNNetVolume.Create();
@@ -37607,7 +37608,7 @@ begin
   inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL
   if not Assigned(FDotCL) then
   begin
-    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL := TDotProductSharedKernel.Create(GetDotProductKernel());
     FDotCL.HideMessages();
   end;
   if not Assigned(FA1ColBuf) then FA1ColBuf := TNNetVolume.Create();
@@ -38311,7 +38312,7 @@ begin
   inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL
   if not Assigned(FDotCL) then
   begin
-    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL := TDotProductSharedKernel.Create(GetDotProductKernel());
     FDotCL.HideMessages();
   end;
   if not Assigned(FVColBuf) then FVColBuf := TNNetVolume.Create();
@@ -54540,7 +54541,7 @@ begin
   FHasOpenCL := true;
   if not Assigned(FDotCL) then
   begin
-    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL := TDotProductSharedKernel.Create(GetDotProductKernel());
     FDotCL.HideMessages();
   end;
   if not Assigned(FDepthwiseCL) then
@@ -58271,7 +58272,7 @@ begin
   FHasOpenCL := true;
   if not Assigned(FDotCL) then
   begin
-    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL := TDotProductSharedKernel.Create(GetDotProductKernel());
     FDotCL.HideMessages();
   end;
   if not Assigned(FDepthwise1DCL) then
@@ -64416,7 +64417,7 @@ begin
   inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL
   if not Assigned(FDotCL) then
   begin
-    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL := TDotProductSharedKernel.Create(GetDotProductKernel());
     FDotCL.HideMessages();
   end;
   if not Assigned(FWiPacked) then FWiPacked := TNNetVolume.Create();
@@ -64835,7 +64836,7 @@ begin
   inherited EnableOpenCL(DotProductKernel); // sets FHasOpenCL
   if not Assigned(FDotCL) then
   begin
-    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL := TDotProductSharedKernel.Create(GetDotProductKernel());
     FDotCL.HideMessages();
   end;
   if not Assigned(FWiPacked) then FWiPacked := TNNetVolume.Create();
@@ -73833,7 +73834,7 @@ begin
     if not Assigned(FDotCL) then
     begin
       FInt8Kernel := FNN.GetKernel('cai_dot_product_int8');
-      FDotCL := TDotProductSharedKernel.Create(DotProductKernel, FInt8Kernel);
+      FDotCL := TDotProductSharedKernel.Create(GetDotProductKernel(), FInt8Kernel);
       FDotCL.HideMessages();
     end;
     if FQuantInt8 then
@@ -84161,7 +84162,7 @@ begin
   FHasOpenCL := true;
   if not Assigned(FDotCL) then
   begin
-    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL := TDotProductSharedKernel.Create(GetDotProductKernel());
     FDotCL.HideMessages();
   end;
   if not Assigned(FGemmWInter) then FGemmWInter := TNNetVolume.Create();
@@ -84814,7 +84815,7 @@ begin
   FHasOpenCL := true;
   if not Assigned(FDotCL) then
   begin
-    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL := TDotProductSharedKernel.Create(GetDotProductKernel());
     FDotCL.HideMessages();
   end;
   if not Assigned(FGemmWInter) then FGemmWInter := TNNetVolume.Create();
@@ -89961,7 +89962,7 @@ begin
   FHasOpenCL := true;
   if not Assigned(FDotCL) then
   begin
-    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL := TDotProductSharedKernel.Create(GetDotProductKernel());
     FDotCL.HideMessages();
   end;
   if not Assigned(FGemmWKan)     then FGemmWKan     := TNNetVolume.Create();
@@ -95616,7 +95617,7 @@ begin
   FHasOpenCL := true;
   if not Assigned(FDotCL) then
   begin
-    FDotCL := TDotProductSharedKernel.Create(DotProductKernel);
+    FDotCL := TDotProductSharedKernel.Create(GetDotProductKernel());
     FDotCL.HideMessages();
   end;
   if not Assigned(FGemmWInter) then FGemmWInter := TNNetVolume.Create();
@@ -125458,6 +125459,8 @@ begin
     FDotCL.Free;
     FDotCL := nil;
   end;
+  if Assigned(FNN) then
+    FNN.FreeKernelIfNotShared('cai_dot_product', F32Kernel);
   {$ENDIF}
   FOutputError.Free;
   FOutputErrorDeriv.Free;
@@ -125479,6 +125482,12 @@ begin
 end;
 
 {$IFDEF OpenCL}
+function TNNetLayer.GetDotProductKernel(): TNeuralKernel;
+begin
+  if not Assigned(F32Kernel) then F32Kernel := FNN.GetKernel('cai_dot_product');
+  Result := F32Kernel;
+end;
+
 procedure TNNetLayer.DisableOpenCL();
 begin
   if Assigned(FDotCL) then
@@ -125486,6 +125495,10 @@ begin
     FDotCL.Free;
     FDotCL := nil;
   end;
+  // FDotCL bound its arguments on F32Kernel, so the handle only goes back once
+  // its borrower is gone.
+  if Assigned(FNN) then
+    FNN.FreeKernelIfNotShared('cai_dot_product', F32Kernel);
 
   FHasOpenCL := false;
   FShouldOpenCL := false;
