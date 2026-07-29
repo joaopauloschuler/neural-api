@@ -12857,6 +12857,10 @@ type
     // built ONCE per pass and shared across every output (see TNNetKANConv's
     // FKanBasisVec). Length FInDim*(K+1), sized in SetPrevLayer.
     FKanBasisVec: array of TNeuralFloat;
+    // gy-weighted coefficient super-vector sum_j gy_j*c_j, same (i,k) layout and
+    // length as FKanBasisVec. Built once per input-gradient pass; separate from
+    // FKanBasisVec, which is live in Compute/Backpropagate. Sized in SetPrevLayer.
+    FKanGradVec: array of TNeuralFloat;
     procedure BuildKanBasisVec();
     procedure ComputePreviousLayerErrorCPU(); override;
   public
@@ -13939,6 +13943,11 @@ type
     FBNprev: array of TNeuralFloat;
     FBNcur: array of TNeuralFloat;
     FKanBasisVec: array of TNeuralFloat; // per-position assembled basis super-vector (length FVectorSize = Taps*CoeffsPerEdge)
+    // gy-weighted coefficient super-vector sum_oo gy_oo*c_oo, same [tap*C + k]
+    // layout and length as FKanBasisVec. Built once per output position in the
+    // input-gradient pass; separate from FKanBasisVec, which is live in
+    // Compute/Backpropagate. Sized in SetPrevLayer.
+    FKanGradVec: array of TNeuralFloat;
     {$IFDEF OpenCL}
     // Scratch operands for the tap-diagonal coefficient-GEMV offload
     // (ComputeOpenCL): the per-edge FCoeffsPerEdge basis-coefficient reduction
@@ -89172,6 +89181,8 @@ begin
   SetLength(FT, 0);
   SetLength(FU2, 0);
   SetLength(FTderivBuf, 0);
+  SetLength(FKanBasisVec, 0);
+  SetLength(FKanGradVec, 0);
   inherited Destroy();
 end;
 
@@ -89192,6 +89203,7 @@ begin
   SetLength(FU2, FDegree + 1);
   SetLength(FTderivBuf, FDegree + 1);
   SetLength(FKanBasisVec, FInDim * (FDegree + 1));
+  SetLength(FKanGradVec, FInDim * (FDegree + 1));
   BuildArrNeurons();
   InitDefault();
 end;
@@ -89327,18 +89339,35 @@ end;
 
 // Input gradient: dL/dx_i = (1 - u_i^2) * sum_j gy_j * sum_k c_{ijk} T_k'(u_i),
 // with T_k'(u) = k*U_{k-1}(u) (second-kind Chebyshev), u_i = tanh(x_i).
+//
+// Neither gy_j nor c_{ijk} depends on the derivative order k's argument, so the
+// sums swap: sum_j gy_j sum_k c_{ijk} T_k' = sum_k T_k' * (sum_j gy_j c_{ijk}).
+// The inner bracket is one gy-weighted coefficient super-vector over the whole
+// (i,k) plane, built ONCE per pass with contiguous MulAdds; what is left per
+// input is a short dot over it, so the D_out loop (with its zero test, array
+// index and weight deref) runs once instead of once per input.
 procedure TNNetKANLayer.ComputePreviousLayerErrorCPU();
 var
-  j, i, k, base, Dout: integer;
+  j, i, k, base, Dout, VectorSize: integer;
   DoutMax, inDimMax: integer;
-  u, gy, dudx, edgeDeriv, gradAcc: TNeuralFloat;
-  PrevOut, PrevErr, W: TNNetVolume;
+  u, gy, dudx, gradAcc: TNeuralFloat;
+  PrevOut, PrevErr: TNNetVolume;
 begin
   PrevErr := FPrevLayer.OutputError;
   PrevOut := FPrevLayer.FOutput;
   Dout := FOutput.Size;
   DoutMax := Dout - 1;
   inDimMax := FInDim - 1;
+  VectorSize := FInDim * (FDegree + 1);
+  FillChar(FKanGradVec[0], VectorSize * csNeuralFloatSize, 0);
+  for j := 0 to DoutMax do
+  begin
+    gy := FOutputError.FData[j];
+    if gy = 0.0 then continue;
+    TNNetVolume.MulAdd(@FKanGradVec[0], @FArrNeurons[j].FWeights.FData[0],
+      gy, VectorSize);
+  end;
+  base := 0;
   for i := 0 to inDimMax do
   begin
     u := pcr_tanhf(PrevOut.FData[i]);
@@ -89349,19 +89378,11 @@ begin
     for k := 2 to FDegree do FU2[k] := 2 * u * FU2[k - 1] - FU2[k - 2];
     FTderivBuf[0] := 0;
     for k := 1 to FDegree do FTderivBuf[k] := k * FU2[k - 1];
-    base := i * (FDegree + 1);
     gradAcc := 0;
-    for j := 0 to DoutMax do
-    begin
-      gy := FOutputError.FData[j];
-      if gy = 0.0 then continue;
-      W := FArrNeurons[j].FWeights;
-      edgeDeriv := 0;
-      for k := 1 to FDegree do
-        edgeDeriv := edgeDeriv + W.FData[base + k] * FTderivBuf[k];
-      gradAcc := gradAcc + gy * edgeDeriv;
-    end;
+    for k := 1 to FDegree do
+      gradAcc := gradAcc + FKanGradVec[base + k] * FTderivBuf[k];
     PrevErr.FData[i] := PrevErr.FData[i] + dudx * gradAcc;
+    Inc(base, FDegree + 1);
   end;
 end;
 
@@ -89423,6 +89444,7 @@ destructor TNNetKANConv.Destroy();
 begin
   SetLength(FTderivBuf, 0);
   SetLength(FKanBasisVec, 0);
+  SetLength(FKanGradVec, 0);
   {$IFDEF OpenCL}
   if Assigned(FGemmWKan)     then FGemmWKan.Free;
   if Assigned(FGemmBasisKan) then FGemmBasisKan.Free;
@@ -89572,6 +89594,7 @@ begin
   SetLength(FU2, FDegree + 1);
   SetLength(FTderivBuf, FDegree + 1);
   SetLength(FKanBasisVec, coeffs);
+  SetLength(FKanGradVec, coeffs);
   BuildArrNeurons();
   InitDefault();
   for oo := 0 to outDepthMax do
@@ -90001,8 +90024,8 @@ procedure TNNetKANConv.ComputePreviousLayerErrorCPU();
 var
   ox, oy, oo, fx, fy, ic, kk, tap0, base, OutDepth, prevBase, errBase: integer;
   prevX, prevY, prevSizeX, prevSizeY: integer;
-  u, dudx, gy, edgeDeriv, gradAcc, xv: TNeuralFloat;
-  W, PrevOut, LocalPrevError: TNNetVolume;
+  u, dudx, gy, gradAcc, xv: TNeuralFloat;
+  PrevOut, LocalPrevError: TNNetVolume;
   outSizeYMax, outSizeXMax, featYMax, featXMax, inDepthMax, outDepthMax, coeffsMax: integer;
 begin
   if not FCalculatePrevLayerError then exit;
@@ -90023,6 +90046,20 @@ begin
   begin
     // Rule #11: output-error row base invariant across the whole inner nest.
     errBase := FOutputError.GetRawPos(ox, oy);
+    // Neither gy_oo nor c_{oo,tap,k} depends on the basis derivative, so the
+    // sums swap: sum_oo gy_oo sum_k c_{oo,tap,k} B_k' = sum_k B_k' * G[tap*C+k]
+    // with G = sum_oo gy_oo * c_oo. G spans the whole [tap*C + k] plane and is
+    // shared by every tap of this output position, so it is built ONCE here with
+    // contiguous MulAdds; each tap then only does a short dot over it, and the
+    // output-channel loop runs once per position instead of once per tap.
+    FillChar(FKanGradVec[0], FVectorSize * csNeuralFloatSize, 0);
+    for oo := 0 to outDepthMax do
+    begin
+      gy := FOutputError.FData[errBase + oo];
+      if gy = 0.0 then continue;
+      TNNetVolume.MulAdd(@FKanGradVec[0], @FArrNeurons[oo].FWeights.FData[0],
+        gy, FVectorSize);
+    end;
     for fy := 0 to featYMax do
     begin
       prevY := oy * FStride + fy - FPadding;
@@ -90046,16 +90083,8 @@ begin
             // dphi/du = sum_j c_j * B_j'(u); chain through dudx = 1-u^2.
             EvalBSpline(u, true);
             gradAcc := 0;
-            for oo := 0 to outDepthMax do
-            begin
-              gy := FOutputError.FData[errBase + oo];
-              if gy = 0.0 then continue;
-              W := FArrNeurons[oo].FWeights;
-              edgeDeriv := 0;
-              for kk := 0 to coeffsMax do
-                edgeDeriv := edgeDeriv + W.FData[base + kk] * FBDeriv[kk];
-              gradAcc := gradAcc + gy * edgeDeriv;
-            end;
+            for kk := 0 to coeffsMax do
+              gradAcc := gradAcc + FKanGradVec[base + kk] * FBDeriv[kk];
             LocalPrevError.FData[prevBase + ic] :=
               LocalPrevError.FData[prevBase + ic] + dudx * gradAcc;
             continue;
@@ -90067,16 +90096,8 @@ begin
           FTderivBuf[0] := 0;
           for kk := 1 to FDegree do FTderivBuf[kk] := kk * FU2[kk - 1];
           gradAcc := 0;
-          for oo := 0 to outDepthMax do
-          begin
-            gy := FOutputError.FData[errBase + oo];
-            if gy = 0.0 then continue;
-            W := FArrNeurons[oo].FWeights;
-            edgeDeriv := 0;
-            for kk := 1 to FDegree do
-              edgeDeriv := edgeDeriv + W.FData[base + kk] * FTderivBuf[kk];
-            gradAcc := gradAcc + gy * edgeDeriv;
-          end;
+          for kk := 1 to FDegree do
+            gradAcc := gradAcc + FKanGradVec[base + kk] * FTderivBuf[kk];
           LocalPrevError.FData[prevBase + ic] :=
             LocalPrevError.FData[prevBase + ic] + dudx * gradAcc;
         end;
