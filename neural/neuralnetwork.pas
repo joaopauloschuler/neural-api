@@ -900,6 +900,7 @@ type
       property QuantInt8VectorSize: integer read FQuantVectorSize;
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TDotProductKernel); override;
+      procedure DisableOpenCL(); override;
       // Interleaves FQuantTable's codes into the device layout and arms
       // FDotCL's resident int8 mode (cai_dot_product_int8) against VBs.
       // Coded by Claude (AI).
@@ -73595,12 +73596,21 @@ begin
     PrepareInt8DotCL(FInputPrepared)
   else
     FDotCL.PrepareForCompute(FConcatedWInter, FInputPrepared, FVectorSize);
-  // Borrow the net-wide cai_im2col handle so ComputeOpenCL can build the column
-  // matrix (FInputPrepared) on the device. Only meaningful for a real (spatial)
+  // Borrow the cai_im2col handle so ComputeOpenCL can build the column matrix
+  // (FInputPrepared) on the device. Only meaningful for a real (spatial)
   // convolution: a pointwise conv has no im2col (FInputPrepared aliases the prev
-  // output). The net owns and frees the handle. Coded by Claude (AI).
-  if Assigned(FDotCL) and (not FPointwise) then
+  // output). Acquire once: a second call would leak a private handle.
+  if Assigned(FDotCL) and (not FPointwise) and (not Assigned(FIm2ColKernel)) then
     FIm2ColKernel := FNN.GetKernel('cai_im2col');
+end;
+
+procedure TNNetLayerConcatedWeights.DisableOpenCL();
+begin
+  // FDotCL borrowed FInt8Kernel; the inherited call frees it, so the handle
+  // goes back here and a later EnableOpenCL acquires a fresh one.
+  inherited DisableOpenCL();
+  if Assigned(FNN) then
+    FNN.FreeKernelIfNotShared('cai_dot_product_int8', FInt8Kernel);
 end;
 
 procedure TNNetLayerConcatedWeights.EnableOpenCL(
@@ -95931,7 +95941,9 @@ begin
   // convolution layers confine allocation to EnableOpenCL/PrepareForCompute.
   if FActivationOpcode <> csActNone then
   begin
-    if Assigned(FNN) then FActivationKernel := FNN.GetKernel('cai_activation');
+    // Acquire once: a second call would leak a private handle.
+    if Assigned(FNN) and (not Assigned(FActivationKernel)) then
+      FActivationKernel := FNN.GetKernel('cai_activation');
     if Assigned(FActivationBuffer) and (FActivationBufSize <> FOutput.Size) then
     begin
       clReleaseMemObject(FActivationBuffer);
