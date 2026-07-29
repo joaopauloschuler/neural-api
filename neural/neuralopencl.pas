@@ -1434,6 +1434,7 @@ begin
 
   // Create a compute context
   FContext := CreateContext();
+  if FContext = nil then exit;
 
   // Create a command queue
   FCommands := CreateCommandQueue();
@@ -1635,10 +1636,15 @@ function TEasyOpenCL.CreateCommandQueue(): cl_command_queue;
 var
   err: integer; // error code returned from api calls
 begin
+  // FPC's cl.pp mistypes clCreateCommandQueue's errcode_ret as a by-value
+  // cl_int instead of a pointer, so whatever err holds is passed to the driver
+  // as the address it writes the status to. Zero means "no status wanted": any
+  // other value makes the driver write to a wild pointer and segfault.
+  err := 0;
   Result := clCreateCommandQueue(context, FCurrentDevice, 0,  {$IFDEF FPC}err{$ELSE}@err{$ENDIF});
   if Result = nil then
   begin
-    FErrorProc('Error: Failed to create a command commands:' + IntToStr(err));
+    FErrorProc('Error: Failed to create a command queue.');
     exit;
   end
   else
