@@ -115,6 +115,8 @@ type
     procedure CompileProgram(programsource: TStrings); overload;
     procedure CompileProgram(programsource: string);   overload;
 
+    function CreateContext(): cl_context;
+    function CreateCommandQueue(): cl_command_queue;
     function CreateBuffer(flags: cl_mem_flags; size: csize_t; ptr: Pointer = nil): cl_mem; overload;
     function MapBuffer(buffer: cl_mem; cb: csize_t; map_flags: cl_map_flags; blocking: cl_bool = CL_TRUE): Pointer; overload;
     function MapHostInputBuffer(buffer: cl_mem; cb: csize_t): Pointer; overload;
@@ -1011,8 +1013,8 @@ begin
   FCurrentPlatform := SharedKernel.CurrentPlatform;
   FCurrentDevice   := SharedKernel.CurrentDevice;
   FContext  := SharedKernel.Context;
-  FCommands := SharedKernel.Commands;
   FProg     := SharedKernel.Prog;
+  FCommands := CreateCommandQueue(); // the command queue is given per kernel
   // Bind our own kernel handle into the shared (already-built) program.
   PrepareKernel(kernelname);
 end;
@@ -1397,7 +1399,6 @@ begin
   if FBorrowedContext then
   begin
     FProg := nil;
-    FCommands := nil;
     FContext := nil;
     exit;
   end;
@@ -1424,25 +1425,10 @@ begin
   {$ENDIF}
 
   // Create a compute context
-  FContext := clCreateContext(nil, 1, @FCurrentDevice, nil, nil, {$IFDEF FPC}err{$ELSE}@err{$ENDIF});
+  FContext := CreateContext();
 
-  if FContext = nil then
-  begin
-    FErrorProc('Error: Failed to create a compute context:' + IntToStr(err));
-    exit;
-  end
-  else
-    FMessageProc('clCreateContext OK!');
-
-  // Create a command commands
-  FCommands := clCreateCommandQueue(context, FCurrentDevice, 0,  {$IFDEF FPC}err{$ELSE}@err{$ENDIF});
-  if FCommands = nil then
-  begin
-    FErrorProc('Error: Failed to create a command commands:' + IntToStr(err));
-    exit;
-  end
-  else
-    FMessageProc('clCreateCommandQueue OK!');
+  // Create a command queue
+  FCommands := CreateCommandQueue();
 
   // Create the compute program from the source buffer
   {$IFDEF FPC}
@@ -1620,6 +1606,35 @@ procedure TEasyOpenCL.CompileProgram(programsource: string);
 begin
   FOpenCLProgramSource.Text := programsource;
   CompileProgram();
+end;
+
+function TEasyOpenCL.CreateContext(): cl_context;
+var
+  err: integer; // error code returned from api calls
+begin
+  Result := clCreateContext(nil, 1, @FCurrentDevice, nil, nil, {$IFDEF FPC}err{$ELSE}@err{$ENDIF});
+
+  if Result = nil then
+  begin
+    FErrorProc('Error: Failed to create a compute context:' + IntToStr(err));
+    exit;
+  end
+  else
+    FMessageProc('clCreateContext OK!');
+end;
+
+function TEasyOpenCL.CreateCommandQueue(): cl_command_queue;
+var
+  err: integer; // error code returned from api calls
+begin
+  Result := clCreateCommandQueue(context, FCurrentDevice, 0,  {$IFDEF FPC}err{$ELSE}@err{$ENDIF});
+  if Result = nil then
+  begin
+    FErrorProc('Error: Failed to create a command commands:' + IntToStr(err));
+    exit;
+  end
+  else
+    FMessageProc('clCreateCommandQueue OK!');
 end;
 
 function TEasyOpenCL.CreateBuffer(flags: cl_mem_flags; size: csize_t; ptr: Pointer = nil): cl_mem;
