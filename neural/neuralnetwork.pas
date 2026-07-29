@@ -101796,7 +101796,7 @@ destructor TNNetExecutionPlanner.Destroy();
 begin
   if FSchedPool <> nil then FSchedPool.Free;
   if FSchedWake <> nil then FSchedWake.Free;
-  FLayers.Free;
+  if Assigned(FLayers) then FreeAndNil(FLayers);
   inherited Destroy();
 end;
 
@@ -101876,6 +101876,7 @@ begin
   // Free the shared helper kernels BEFORE FDotProductKernel: they borrowed the
   // latter's program/context (CreateFromProgram) and only own their own kernel
   // handles.
+  if Assigned(FLayers) then FreeAndNil(FLayers);
   if Assigned(FSharedKernels) then
   begin
     SharedKernelsCntM1 := FSharedKernels.Count - 1;
