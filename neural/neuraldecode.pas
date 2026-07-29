@@ -3254,10 +3254,17 @@ begin
   // per state, hence rebuilt exactly when the machine's version moves.
   if FFirstOKVersion <> FMachine.Version then BuildFirstOK();
   if not FFirstOK[Ord(S[1])] then exit(false);
+  // A one-character token is fully decided by that gate. FFirstOK[c] is
+  // FMachine.CharAllowed(c), CharAllowed is save-state / FeedChar / restore, so
+  // its boolean IS FeedChar's; and FProbe is an exact clone of FMachine, so
+  // FProbe.FeedChar(S[1]) would return that same boolean. Char-level
+  // constraints (CreateCharLevel) make this 100% of the vocabulary, and it
+  // skips the CopyFrom state clone plus the feed entirely.
+  LenS := Length(S);
+  if LenS = 1 then exit(true);
   // Transitive multi-character validation: clone the live state and feed the
   // token's characters one by one; ALL must be legal continuations.
   FProbe.CopyFrom(FMachine);
-  LenS := Length(S);
   for I := 1 to LenS do
     if not FProbe.FeedChar(S[I]) then exit(false);
   Result := true;
@@ -3746,7 +3753,7 @@ procedure TNNetGrammarMachine.AddStackExpanded(const Src: array of integer;
 var
   D, WLen: integer;
   TopPos, Rule, Idx, RefRule, ContPos: integer;
-  Body: TNNetGrammarElemArray;
+  Elem: TNNetGrammarElem;
 begin
   // Rule #17: this frame's work buffer comes from the persistent pool. Src is
   // always a shallower slot or an external buffer, never FWorkPool[D] itself.
@@ -3763,9 +3770,13 @@ begin
   begin
     TopPos := FWorkPool[D][WLen - 1];
     UnpackPos(TopPos, Rule, Idx);
-    Body := FGrammar.FRules[Rule];
+    // Rule #4/#7: bind the ELEMENT record, not the rule body. A
+    // TNNetGrammarElemArray local is managed, so it would cost an
+    // fpc_dynarray_assign plus the implicit try/finally frame FPC wraps around
+    // the whole (recursive) routine; the record copy is two words.
+    Elem := FGrammar.FRules[Rule][Idx];
 
-    case Body[Idx].ElemType of
+    case Elem.ElemType of
       getEnd, getAlt:
         begin
           // End of an alternate/rule: pop and continue with the parent.
@@ -3774,7 +3785,7 @@ begin
         end;
       getRuleRef:
         begin
-          RefRule := Body[Idx].Value;
+          RefRule := Elem.Value;
           ContPos := PackPos(Rule, Idx + 1);
           // Continuation replaces the ref on top.
           FWorkPool[D][WLen - 1] := ContPos;
@@ -3887,15 +3898,17 @@ end;
 function TNNetGrammarMachine.ElemMatches(Pos: integer; C: char): boolean;
 var
   Rule, Idx, SetIdx, R, RMax, SetFirst: integer;
-  Body: TNNetGrammarElemArray;
   Elem: TNNetGrammarElem;
   InSet: boolean;
 begin
   UnpackPos(Pos, Rule, Idx);
-  Body := FGrammar.FRules[Rule];
-  // Rule #4/#7: bind the element once (read up to 4x below) instead of routing
-  // every field access back through the dynamic-array index.
-  Elem := Body[Idx];
+  // Rule #4/#7: bind the ELEMENT (a plain record, read up to 4x below), never
+  // the rule body. A TNNetGrammarElemArray local is a managed dynamic array, so
+  // binding one costs an fpc_dynarray_assign plus the implicit try/finally frame
+  // (fpc_pushexceptaddr/setjmp/popaddrstack/finalize) that FPC wraps around any
+  // routine holding a managed local - on every call, in a function called once
+  // per active stack per candidate character.
+  Elem := FGrammar.FRules[Rule][Idx];
   case Elem.ElemType of
     getChar: Result := C = Chr(Elem.Value);
     getCharAny: Result := C <> #0;
@@ -4068,9 +4081,16 @@ begin
   // once per decode step instead of once per vocabulary id.
   if FFirstOKVersion <> FMachine.Version then BuildFirstOK();
   if not FFirstOK[Ord(S[1])] then exit(false);
+  // A one-character token is fully decided by that gate: FeedChar reaches
+  // AddStackExpanded exactly on the stacks whose top ElemMatches, and that call
+  // always lands at least one entry in an empty scratch set (AddStackRaw's
+  // dedupe cannot reject the first one), so FScratchCount > 0 <=> some top
+  // matched <=> CharAllowed. Char-level constraints make this 100% of the
+  // vocabulary, and it skips the CopyFrom deep copy plus the feed entirely.
+  LenS := Length(S);
+  if LenS = 1 then exit(true);
   // Transitive multi-character validation on a forked machine.
   FProbe.CopyFrom(FMachine);
-  LenS := Length(S);
   for I := 1 to LenS do
     if not FProbe.FeedChar(S[I]) then exit(false);
   Result := true;
