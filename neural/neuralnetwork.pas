@@ -123488,6 +123488,7 @@ var
   idx: integer;
 begin
   ShouldFree := true;
+  if not Assigned(KernelObject) then exit;
   if Assigned(FSharedKernels) then
   begin
     idx := FSharedKernels.IndexOf(kernelname);
