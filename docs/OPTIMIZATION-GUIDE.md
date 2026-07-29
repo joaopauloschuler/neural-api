@@ -57,7 +57,7 @@ mechanically; argument rules are where sweeps introduce bugs.
 | [24](#24-powerx-k-with-a-small-integer-k-is-a-multiply-chain-not-a-pow) | `Power(x, k)`, small integer `k` → a multiply chain | **1 — fewer ops** | pattern |
 | [13](#13-promote-a-degenerate-elementwise-inner-loop-to-a-tnnetvolume-bulk-method) | Promote a degenerate elementwise loop to a `TNNetVolume` bulk method | 2 — scalar → SIMD | pattern |
 | [25](#25-keep-hot-math-in-single--do-not-widen-to-double) | Keep hot math in `Single` — a `Double` local blocks #13/#18/#19 | 2 — unblocks SIMD | pattern |
-| [19](#19-promote-a-scalar-transcendental-loop-to-the-vector-kernels) | Promote a scalar transcendental loop to the `Vector*` kernels | 2 — scalar → SIMD | pattern + numerics |
+| [19](#19-promote-a-scalar-transcendental-loop-to-the-elementwise-kernels) | Promote a scalar transcendental loop to the elementwise kernels | 2 — scalar → SIMD | pattern + numerics |
 | [18](#18-tnnetvolume-methods-are-faster-than-pure-pascal-equivalents) | `TNNetVolume` methods beat hand-written Pascal equivalents | 2 — scalar → SIMD | pattern |
 | [23](#23-non-float-hot-paths-count-too--preallocate-string-buffers-instead-of-repeated-concatenation) | Non-float paths: preallocate string buffers, don't concatenate | 2 — O(n²) → O(n) | pattern |
 | [20](#20-unswitch-a-loop-invariant-condition--hoist-the-test-or-split-the-loop) | Unswitch a loop-invariant condition — hoist the test or split the loop | 2 — also unlocks #13/#19 | pattern |
@@ -1084,7 +1084,7 @@ TNNetVolume.Mul(outPtr, INV_SQRT_2, HalfDepth);  // AVX scale, in place
 ```
 
 (The very next lines of that same method already do exactly this for the erf ride
-via `TNNetVolume.VectorErf` — the scalar seed loop above it is the leftover.)
+via `TNNetVolume.Erf` — the scalar seed loop above it is the leftover.)
 
 **The most degenerate shape — a pure contiguous copy — is `Move`.** When the
 inner loop copies one run to another with no arithmetic at all:
@@ -1318,36 +1318,26 @@ e  := NeuralExp(logit[c] - MaxLogit);
 
 ### `1 / Sqrt(x)` is one call, not two operations
 
-`pcr_rsqrtf` deserves its own note because the win is larger than a swap: it
-replaces a `Sqrt` **and** a divide — the two most expensive scalar float ops —
-with a single routine. `y / Sqrt(x)` is likewise `y * pcr_rsqrtf(x)`, which also
-folds in #21 (divide → multiply). It is established here, with 39 call sites.
-(There is no `pcr_sqrtf`: a bare `Sqrt` compiles to one hardware `sqrtss`, so it
-needs no replacement — it is the *reciprocal* form that pays.)
+`pcr_rsqrtf` folds a `Sqrt` and a divide into one call, which also folds in #21
+(divide → multiply). It is established here, with 39 call sites. (There is no
+`pcr_sqrtf`: a bare `Sqrt` compiles to one hardware `sqrtss`, so it needs no
+replacement — it is the *reciprocal* form that pays.)
 
-**Anti-example — do NOT follow this** (`TNNetISRU`, `neuralnetwork.pas` ~23068 /
-~23127 — a `Sqrt` plus a divide *per element*, in both the forward and the
-backward loop):
+**Measure before swapping — this one is not a free win.** `pcr_rsqrtf` is a
+*correctly-rounded software* routine, not a hardware instruction, so on x86-64
+it can lose to the `sqrtss` + `divss` pair it replaces. Measured on this box
+over 1M elements, the ISRU body (`InvSqrt`, then `x*InvSqrt` and `InvSqrt^3`):
 
-```pascal
-for OutputCnt := 0 to SizeM1 do
-begin
-  PrevValue := LocalPrevOutput.FData[OutputCnt];
-  InvSqrt := 1 / Sqrt(1 + Alpha * PrevValue * PrevValue);
-  FOutput.FData[OutputCnt] := PrevValue * InvSqrt;
-  FOutputErrorDeriv.FData[OutputCnt] := InvSqrt * InvSqrt * InvSqrt;
-end;
-```
+| form | time |
+| --- | --- |
+| `1 / Sqrt(1 + a*x*x)` | 8 ms |
+| `pcr_rsqrtf(1 + a*x*x)` | 14 ms |
 
-**Do this:**
-
-```pascal
-  InvSqrt := pcr_rsqrtf(1 + Alpha * PrevValue * PrevValue);
-```
-
-The same file also spells the fused form out longhand as `x / Sqrt(y)` at ~23079
-and ~23142 (the branch where the derivative is not needed) — that is
-`x * pcr_rsqrtf(y)`.
+The same ~1.4-1.8x penalty shows up in a latency-bound dependency chain, so it
+is not a vectorization artifact. `TNNetISRU.Compute` / `TNNetISRLU.Compute`
+therefore stay on the RTL form on purpose (they carry a comment saying so — do
+not "fix" them). Reach for `pcr_rsqrtf` when you want its accuracy or its
+argument hardening, and when a swap is for speed alone, benchmark it first.
 
 ### Need `sin` **and** `cos` of the same argument? One call.
 
@@ -1358,8 +1348,8 @@ form, and the codebase already uses it at ~25 sites (`neuralnetwork.pas:21516`,
 `:43138`, `:45557`, `:58276`, …). Writing the two calls separately is the
 regression to watch for.
 
-**Note this does *not* extend to the vector kernels.** `VectorSin` and
-`VectorCos` (#19) both dispatch to `AVXSinCos(…, DoCos)`, which computes sin
+**Note this does *not* extend to the vector kernels.** `Sin` and
+`Cos` (#19) both dispatch to `AVXSinCos(…, DoCos)`, which computes sin
 **or** cos — there is no fused two-output vector kernel, so a run needing both is
 two full passes. Only the *scalar* `pcr_sincosf` fuses.
 
@@ -1531,16 +1521,16 @@ in a fresh volume is a copy, and on a compute path that is a #17 violation. So:
 
 ### Pattern 1 — one method, internal dispatch (preferred for a new primitive)
 
-Declare it **unconditionally**, and branch inside the body. `VectorRelu`
+Declare it **unconditionally**, and branch inside the body. `Relu`
 (`:8939`) is the reference:
 
 ```pascal
 {$IFDEF AVXANY}
 // AVXCopyRelu is defined later in this file under {$IFDEF AVXANY};
-// forward-declare it so VectorRelu can call it here.
+// forward-declare it so Relu can call it here.
 procedure AVXCopyRelu(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer); forward;
 {$ENDIF}
-class procedure TNNetVolume.VectorRelu(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
+class procedure TNNetVolume.Relu(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 {$IFNDEF AVXANY}
 var
   I: integer;
@@ -1557,10 +1547,10 @@ end;
 ```
 
 Note the `{$IFNDEF AVXANY}` around `var I` — an unused local is a hint on the AVX
-build. Declare it next to the other `Vector*` members (`:548`–`:587`), **outside**
+build. Declare it next to the other elementwise-kernel members (`:548`–`:587`), **outside**
 the `{$IFDEF AVXANY}` declaration block that starts at `:613`.
 
-`VectorRelu` can test `AVXANY` because `AVXCopyRelu` exists in every asm block. A
+`Relu` can test `AVXANY` because `AVXCopyRelu` exists in every asm block. A
 method built on a **new** kernel must test `AVX2` instead — same shape, swap the
 symbol in both the body and the `{$IFNDEF}` around the locals:
 
@@ -1658,7 +1648,7 @@ exit, not one at the end.
       other, so test the scalar result, not just that it runs.
 - [ ] `neuralvolume.pas` is **CRLF**; check `git diff --stat` for a whole-file rewrite.
 
-## 19. Promote a scalar transcendental loop to the `Vector*` kernels
+## 19. Promote a scalar transcendental loop to the elementwise kernels
 
 Rule #13 promotes a degenerate elementwise loop to a `TNNetVolume` bulk method, but
 its table lists only the arithmetic primitives (`Move`, `Add`, `Mul`, `MulAdd`,
@@ -1669,30 +1659,30 @@ the wrong shape entirely. `neuralvolume.pas` exports a vectorized kernel for eac
 
 | Scalar inner loop | Call |
 | --- | --- |
-| `dst[i] := NeuralExp(src[i])` | `TNNetVolume.VectorExp(dstPtr, srcPtr, N)` |
-| `dst[i] := 1/(1 + NeuralExp(-src[i]))` | `TNNetVolume.VectorSigmoid(dstPtr, srcPtr, N)` |
-| `dst[i] := pcr_tanhf(src[i])` | `TNNetVolume.VectorTanh(dstPtr, srcPtr, N)` |
-| `dst[i] := Max(src[i], 0)` | `TNNetVolume.VectorRelu(dstPtr, srcPtr, N)` |
-| `dst[i] := pcr_erff(src[i])` | `TNNetVolume.VectorErf(dstPtr, srcPtr, N)` |
-| `dst[i] := pcr_sinhf(src[i])` | `TNNetVolume.VectorSinh(dstPtr, srcPtr, N)` |
-| `dst[i] := pcr_logf(src[i])` | `TNNetVolume.VectorLn(dstPtr, srcPtr, N)` |
-| `dst[i] := pcr_sinf/pcr_cosf(src[i])` | `TNNetVolume.VectorSin/VectorCos(dstPtr, srcPtr, N)` — **two passes if you need both**, see #16 |
-| `dst[i] := arcsinh(src[i])` | `TNNetVolume.VectorArcSinh(dstPtr, srcPtr, N)` |
+| `dst[i] := NeuralExp(src[i])` | `TNNetVolume.Exp(dstPtr, srcPtr, N)` |
+| `dst[i] := 1/(1 + NeuralExp(-src[i]))` | `TNNetVolume.Sigmoid(dstPtr, srcPtr, N)` |
+| `dst[i] := pcr_tanhf(src[i])` | `TNNetVolume.Tanh(dstPtr, srcPtr, N)` |
+| `dst[i] := Max(src[i], 0)` | `TNNetVolume.Relu(dstPtr, srcPtr, N)` |
+| `dst[i] := pcr_erff(src[i])` | `TNNetVolume.Erf(dstPtr, srcPtr, N)` |
+| `dst[i] := pcr_sinhf(src[i])` | `TNNetVolume.Sinh(dstPtr, srcPtr, N)` |
+| `dst[i] := pcr_logf(src[i])` | `TNNetVolume.Ln(dstPtr, srcPtr, N)` |
+| `dst[i] := pcr_sinf/pcr_cosf(src[i])` | `TNNetVolume.Sin/Cos(dstPtr, srcPtr, N)` — **two passes if you need both**, see #16 |
+| `dst[i] := arcsinh(src[i])` | `TNNetVolume.ArcSinh(dstPtr, srcPtr, N)` |
 
 On an AVX2 build these run an 8-wide polynomial (`AVXExp`, `AVXLn`, `AVXSinCos`,
 `AVXCopyRelu`) with a scalar remainder. On a non-AVX build most degrade to exactly
 the scalar loop you replaced, so the promotion costs nothing there.
 
-`VectorErf` is the exception: its fallback is not `pcr_erff` at all but an
-Abramowitz–Stegun approximation layered over `VectorExp`, so a promotion that
+`Erf` is the exception: its fallback is not `pcr_erff` at all but an
+Abramowitz–Stegun approximation layered over `Exp`, so a promotion that
 needs a separate scale or copy pass can run ~1.3x *slower* than the scalar loop on
 a non-AVX build (measured on the SAM upscale GELU: 45 ms scalar, 59 ms promoted;
 the same change is 1.8x faster with AVX2). Almost every shipped `.lpi` builds with
 `-dAVX2`, so the promotion is still right — but if a path must be fast on a
 non-AVX target, measure both builds rather than assuming. **All of them
-allow `dst` to alias `src`**, so an in-place `VectorExp(p, p, N)` is legal — the
+allow `dst` to alias `src`**, so an in-place `Exp(p, p, N)` is legal — the
 kernels are documented to read before they write, and the ones that need a temp
-(`VectorSinh`, `VectorArcSinh`) use their own internal scratch rather than `pDst`.
+(`Sinh`, `ArcSinh`) use their own internal scratch rather than `pDst`.
 
 **Anti-example — do NOT hand-roll the map:**
 
@@ -1704,7 +1694,7 @@ for i := 0 to NM1 do
 **Do this:**
 
 ```pascal
-TNNetVolume.VectorExp(FOutput.GetRawPtr(base), FPrevLayer.FOutput.GetRawPtr(base), N);
+TNNetVolume.Exp(FOutput.GetRawPtr(base), FPrevLayer.FOutput.GetRawPtr(base), N);
 ```
 
 **The precondition is #13's, sharpened: the run must be uniform and
@@ -1734,7 +1724,7 @@ they are **not** rule #20 unswitching candidates either — they cannot be hoist
 split away. As written, this loop stays scalar.
 
 **But ask the follow-on question before you walk away.** The guards exist to keep
-`exp` in range; if `VectorExp` already saturates safely at both ends, the branch is
+`exp` in range; if `Exp` already saturates safely at both ends, the branch is
 buying nothing and the whole body collapses to two kernel calls over a scratch run.
 That is a *numerics* question, not a mechanical one: check what the kernel returns
 at the extremes, confirm the limits agree (`x·tanh(exp(x)) → x` as `x → +∞`,

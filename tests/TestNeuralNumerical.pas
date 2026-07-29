@@ -1182,6 +1182,7 @@ type
     procedure TestFlowWarpFlowGradientCheck;
     procedure TestFlowWarpLoadFromString;
     // TNNetBackwardWarp RIFE-convention (dx,dy) backward-warp sampler
+    procedure TestWarpWideDepthChannelParity;
     procedure TestBackwardWarpImageGradientCheck;
     procedure TestBackwardWarpFlowGradientCheck;
     procedure TestBackwardWarpLoadFromString;
@@ -1189,6 +1190,7 @@ type
     procedure TestAdaINForwardAVXParity;
     procedure TestAdaINContentGradientCheck;
     procedure TestAdaINStyleGradientCheck;
+    procedure TestAdaINWideDepthBackwardParity;
     procedure TestAdaINLoadFromString;
     procedure TestHyperLinearMainInputGradientCheck;
     procedure TestHyperLinearGeneratedWeightsGradientCheck;
@@ -20152,6 +20154,162 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestWarpWideDepthChannelParity;
+// The four bilinear-sampler backward passes switch from the scalar depth loop to
+// whole-column MulAdd/DotProduct over the four neighbours at
+// csWarpBackVectorMinDepth channels. Every gradient check for these layers uses
+// D=2 and so only ever reaches the scalar path.
+//
+// Bilinear sampling is independent per channel -- the source gradient of channel
+// c depends only on channel c, and the flow/grid/theta gradient is a plain sum
+// over channels -- so a single D=11 run (wide, a non-multiple of 8, so the AVX
+// tails run) must reproduce, exactly, eleven stacked D=1 runs, which take the
+// scalar path. That makes this an exact parity check between the two paths
+// rather than another finite difference.
+var
+  kind, c, i, x, y, W, H, D: integer;
+  NNWide, NN1: TNNet;
+  ImgWideIn, AuxWideIn, Img1In, Aux1In: TNNetLayer;
+  ImgWide, Aux, DesiredWide, ImgErrWide, AuxErrWide: TNNetVolume;
+  Img1, Desired1, AuxErrSum: TNNetVolume;
+  Diff, MaxDiff, sxTarget, syTarget: TNeuralFloat;
+  KindName: string;
+
+  // Builds a two-branch net of the requested kind with the given image depth.
+  procedure BuildNet(var ANN: TNNet; var AImgIn, AAuxIn: TNNetLayer; ADepth: integer);
+  begin
+    ANN := TNNet.Create();
+    AImgIn := ANN.AddLayer(TNNetInput.Create(W, H, ADepth, 1));
+    if kind = 4 then
+      AAuxIn := ANN.AddLayerAfter(TNNetInput.Create(6, 1, 1, 1), 0)
+    else
+      AAuxIn := ANN.AddLayerAfter(TNNetInput.Create(W, H, 2, 1), 0);
+    case kind of
+      0: ANN.AddLayerAfter(TNNetFlowWarp.Create(AAuxIn), AImgIn);
+      1: ANN.AddLayerAfter(TNNetBackwardWarp.Create(AAuxIn), AImgIn);
+      2: ANN.AddLayerAfter(TNNetGridSample.Create(AAuxIn, gsiBilinear, gspZeros, false), AImgIn);
+      3: ANN.AddLayerAfter(TNNetGridSample.Create(AAuxIn, gsiBilinear, gspBorder, false), AImgIn);
+      4: ANN.AddLayerAfter(TNNetAffineGridSample.Create(AAuxIn), AImgIn);
+    end;
+    ANN.SetLearningRate(1.0, 0.0);
+    ANN.SetBatchUpdate(true);
+  end;
+
+begin
+  RandSeed := 424242;
+  W := 5; H := 4; D := 11;
+  MaxDiff := 0;
+  for kind := 0 to 4 do
+  begin
+    case kind of
+      0: KindName := 'FlowWarp';
+      1: KindName := 'BackwardWarp';
+      2: KindName := 'GridSample/zeros';
+      3: KindName := 'GridSample/border';
+      4: KindName := 'AffineGridSample';
+    end;
+    ImgWide := TNNetVolume.Create(W, H, D);
+    DesiredWide := TNNetVolume.Create(W, H, D);
+    ImgErrWide := TNNetVolume.Create(W, H, D);
+    Img1 := TNNetVolume.Create(W, H, 1);
+    Desired1 := TNNetVolume.Create(W, H, 1);
+    if kind = 4 then Aux := TNNetVolume.Create(6, 1, 1)
+    else Aux := TNNetVolume.Create(W, H, 2);
+    AuxErrWide := TNNetVolume.Create();
+    AuxErrSum := TNNetVolume.Create();
+    AuxErrWide.ReSize(Aux);
+    AuxErrSum.ReSize(Aux);
+    NNWide := nil; NN1 := nil;
+    try
+      for i := 0 to ImgWide.Size - 1 do ImgWide.Raw[i] := Sin(i * 0.53) * 0.9 + 0.1;
+      for i := 0 to DesiredWide.Size - 1 do DesiredWide.Raw[i] := Cos(i * 0.31);
+      // Aux values keep every sample strictly interior and off the integer grid,
+      // exactly as the per-class gradient checks do.
+      if kind = 4 then
+      begin
+        Aux.Fill(0);
+        Aux.Raw[0] := 0.7; Aux.Raw[4] := 0.7;
+        Aux.Raw[2] := 0.2; Aux.Raw[5] := -0.15;
+      end
+      else if kind >= 2 then
+      begin
+        for y := 0 to H - 1 do
+        for x := 0 to W - 1 do
+        begin
+          sxTarget := 1.4 + 0.25 * Sin(0.6 * x + 0.8 * y);
+          syTarget := 1.3 + 0.20 * Cos(0.4 * x - 0.7 * y);
+          Aux.Store(x, y, 0, (2.0 * sxTarget + 1.0) / W - 1.0);
+          Aux.Store(x, y, 1, (2.0 * syTarget + 1.0) / H - 1.0);
+        end;
+      end
+      else
+      begin
+        for y := 0 to H - 1 do
+        for x := 0 to W - 1 do
+        begin
+          Aux.Store(x, y, 0, 0.35 * Sin(0.7 * x + 1.1 * y) + 0.15);
+          Aux.Store(x, y, 1, 0.30 * Cos(0.5 * x - 0.9 * y) - 0.12);
+        end;
+      end;
+
+      // Wide run: the vector path.
+      BuildNet(NNWide, ImgWideIn, AuxWideIn, D);
+      ImgWideIn.Output.Copy(ImgWide);
+      AuxWideIn.Output.Copy(Aux);
+      NNWide.Compute(ImgWideIn.Output);
+      ImgWideIn.OutputError.Fill(0);
+      AuxWideIn.OutputError.Fill(0);
+      NNWide.Backpropagate(DesiredWide);
+      ImgErrWide.Copy(ImgWideIn.OutputError);
+      AuxErrWide.Copy(AuxWideIn.OutputError);
+
+      // Eleven single-channel runs: the scalar path.
+      AuxErrSum.Fill(0);
+      BuildNet(NN1, Img1In, Aux1In, 1);
+      for c := 0 to D - 1 do
+      begin
+        for y := 0 to H - 1 do
+        for x := 0 to W - 1 do
+        begin
+          Img1.Store(x, y, 0, ImgWide[x, y, c]);
+          Desired1.Store(x, y, 0, DesiredWide[x, y, c]);
+        end;
+        Img1In.Output.Copy(Img1);
+        Aux1In.Output.Copy(Aux);
+        NN1.Compute(Img1In.Output);
+        Img1In.OutputError.Fill(0);
+        Aux1In.OutputError.Fill(0);
+        NN1.Backpropagate(Desired1);
+        for y := 0 to H - 1 do
+        for x := 0 to W - 1 do
+        begin
+          Diff := Abs(Img1In.OutputError[x, y, 0] - ImgErrWide[x, y, c]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+          AssertTrue(KindName + ' wide-depth source gradient at ' + IntToStr(x) +
+            ',' + IntToStr(y) + ',' + IntToStr(c) + ' scalar=' +
+            FloatToStr(Img1In.OutputError[x, y, 0]) + ' vector=' +
+            FloatToStr(ImgErrWide[x, y, c]), Diff < 1e-5);
+        end;
+        for i := 0 to AuxErrSum.Size - 1 do
+          AuxErrSum.Raw[i] := AuxErrSum.Raw[i] + Aux1In.OutputError.Raw[i];
+      end;
+      for i := 0 to AuxErrWide.Size - 1 do
+      begin
+        Diff := Abs(AuxErrSum.Raw[i] - AuxErrWide.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+        AssertTrue(KindName + ' wide-depth aux gradient at ' + IntToStr(i) +
+          ' scalar-sum=' + FloatToStr(AuxErrSum.Raw[i]) +
+          ' vector=' + FloatToStr(AuxErrWide.Raw[i]), Diff < 1e-4);
+      end;
+    finally
+      NNWide.Free; NN1.Free;
+      ImgWide.Free; Aux.Free; DesiredWide.Free; ImgErrWide.Free;
+      AuxErrWide.Free; Img1.Free; Desired1.Free; AuxErrSum.Free;
+    end;
+  end;
+  WriteLn('  TestWarpWideDepthChannelParity max abs diff: ', FloatToStr(MaxDiff));
+end;
+
 procedure TTestNeuralNumerical.TestBackwardWarpImageGradientCheck;
 // Finite-difference check of d(loss)/d(image) through the RIFE-convention
 // bilinear backward-warp. A non-integer interior per-pixel flow keeps every
@@ -20654,6 +20812,117 @@ begin
       FloatToStr(maxErr));
   finally
     NN.Free; Content.Free; Style.Free; StylePlus.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAdaINWideDepthBackwardParity;
+// TNNetAdaIN.Backpropagate switches from the channel-outer scalar walk to
+// position-outer depth-column vector ops at csAdaINBackVectorMinDepth channels;
+// the D=3 gradient checks above only ever reach the scalar path. This one runs a
+// WIDE depth (37, a non-multiple of 8, so the AVX tails run) with content and
+// style at different spatial sizes, and checks BOTH propagated gradients against
+// an independent element-wise scalar reference. A finite-difference check cannot
+// gate this: at these gradient magnitudes the central difference is itself the
+// inaccurate side, and it lands identically on both paths.
+var
+  NN: TNNet;
+  ContentInput, StyleInput, Ada: TNNetLayer;
+  Content, Style, Desired: TNNetVolume;
+  CW, CH, SW, SH, D, c, x, y, n, N_, M_: integer;
+  cMean, cVar, cInvStd, sMean, sVar, sStd, eps: TNeuralFloat;
+  g, xhat, shat, sumG, sumGXHat, contentFactor, refVal: TNeuralFloat;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  eps := 1e-5;          // matches TNNetAdaIN.FAdaEpsilon
+  CW := 7; CH := 3; SW := 2; SH := 9; D := 37;
+  N_ := CW * CH; M_ := SW * SH;
+  NN := TNNet.Create();
+  Content := TNNetVolume.Create(CW, CH, D);
+  Style := TNNetVolume.Create(SW, SH, D);
+  Desired := TNNetVolume.Create(CW, CH, D);
+  MaxDiff := 0;
+  try
+    ContentInput := NN.AddLayer(TNNetInput.Create(CW, CH, D, 1));
+    StyleInput   := NN.AddLayerAfter(TNNetInput.Create(SW, SH, D, 1), 0);
+    Ada := NN.AddLayerAfter(TNNetAdaIN.Create(ContentInput, StyleInput), ContentInput);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for n := 0 to Content.Size - 1 do Content.Raw[n] := Sin(n * 0.53) * 0.9 + 0.1;
+    for n := 0 to Style.Size - 1 do Style.Raw[n] := Cos(n * 0.37) * 1.7 - 0.4;
+    for n := 0 to Desired.Size - 1 do Desired.Raw[n] := Cos(n * 0.31);
+
+    ContentInput.Output.Copy(Content);
+    StyleInput.Output.Copy(Style);
+    NN.Compute(ContentInput.Output);
+    ContentInput.OutputError.Fill(0);
+    StyleInput.OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+
+    for c := 0 to D - 1 do
+    begin
+      // Per-channel content and style statistics, computed independently.
+      cMean := 0; cVar := 0;
+      for x := 0 to CW - 1 do
+        for y := 0 to CH - 1 do cMean := cMean + Content[x, y, c];
+      cMean := cMean / N_;
+      for x := 0 to CW - 1 do
+        for y := 0 to CH - 1 do
+          cVar := cVar + Sqr(Content[x, y, c] - cMean);
+      cVar := cVar / N_;
+      cInvStd := 1 / Sqrt(cVar + eps);
+      sMean := 0; sVar := 0;
+      for x := 0 to SW - 1 do
+        for y := 0 to SH - 1 do sMean := sMean + Style[x, y, c];
+      sMean := sMean / M_;
+      for x := 0 to SW - 1 do
+        for y := 0 to SH - 1 do
+          sVar := sVar + Sqr(Style[x, y, c] - sMean);
+      sVar := sVar / M_;
+      sStd := Sqrt(sVar + eps);
+
+      // Upstream-gradient reductions over the content positions.
+      sumG := 0; sumGXHat := 0;
+      for x := 0 to CW - 1 do
+        for y := 0 to CH - 1 do
+        begin
+          g := Ada.OutputError[x, y, c];
+          sumG := sumG + g;
+          sumGXHat := sumGXHat + g * (Content[x, y, c] - cMean) * cInvStd;
+        end;
+
+      // Content gradient: instance-norm Jacobian scaled by style_std/content_std.
+      contentFactor := sStd * cInvStd / N_;
+      for x := 0 to CW - 1 do
+        for y := 0 to CH - 1 do
+        begin
+          g := Ada.OutputError[x, y, c];
+          xhat := (Content[x, y, c] - cMean) * cInvStd;
+          refVal := contentFactor * (N_ * g - sumG - xhat * sumGXHat);
+          Diff := Abs(refVal - ContentInput.OutputError[x, y, c]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+          AssertTrue('AdaIN wide-depth content gradient at ' + IntToStr(x) + ',' +
+            IntToStr(y) + ',' + IntToStr(c) + ' ref=' + FloatToStr(refVal) +
+            ' got=' + FloatToStr(ContentInput.OutputError[x, y, c]), Diff < 1e-4);
+        end;
+
+      // Style gradient: through style_mean (1/M spread) and style_std.
+      for x := 0 to SW - 1 do
+        for y := 0 to SH - 1 do
+        begin
+          shat := (Style[x, y, c] - sMean) / sStd;
+          refVal := sumG / M_ + sumGXHat * shat / M_;
+          Diff := Abs(refVal - StyleInput.OutputError[x, y, c]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+          AssertTrue('AdaIN wide-depth style gradient at ' + IntToStr(x) + ',' +
+            IntToStr(y) + ',' + IntToStr(c) + ' ref=' + FloatToStr(refVal) +
+            ' got=' + FloatToStr(StyleInput.OutputError[x, y, c]), Diff < 1e-4);
+        end;
+    end;
+    WriteLn('  TestAdaINWideDepthBackwardParity max abs diff: ', FloatToStr(MaxDiff));
+  finally
+    NN.Free; Content.Free; Style.Free; Desired.Free;
   end;
 end;
 

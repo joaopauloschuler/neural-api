@@ -459,9 +459,9 @@ procedure SymmetricEigenJacobi(const A: TIMDoubleMatrix;
   out EigVals: TIMDoubleArray; out EigVecs: TIMDoubleMatrix;
   MaxSweeps: integer = 100);
 var
-  n, nM1, nM2, i, j, k, sweep: integer;
+  n, nM1, nM2, i, j, k, sweep, rotations: integer;
   M: TIMDoubleMatrix;
-  offdiag, theta, t, c, s, tau, g, h, aij: Double;
+  theta, t, c, s, tau, g, h, aij: Double;
   Mik, Mjk, Vik, Vjk: Double;
   Mi, Mj, Mk, Vk: TIMDoubleArray;   // bound matrix rows (#7)
 begin
@@ -487,18 +487,21 @@ begin
 
   for sweep := 1 to MaxSweeps do
   begin
-    // Sum of off-diagonal magnitudes; stop when negligible.
-    offdiag := 0;
-    for i := 0 to nM1 do
-      for j := i + 1 to nM1 do
-        offdiag := offdiag + Abs(M[i][j]);
-    if offdiag <= cEPS then Break;
+    // Convergence is decided by whether this sweep rotated anything, not by a
+    // sum of off-diagonal magnitudes: the sum is O(n^2) entries each below
+    // cEPS, so for a matrix of any size it stays above cEPS long after every
+    // individual rotation has stopped qualifying, and the loop then burns the
+    // whole MaxSweeps budget doing nothing. A sweep that rotates nothing leaves
+    // M and EigVecs untouched, so every later sweep would too - the results are
+    // identical to running the budget out.
+    rotations := 0;
 
     for i := 0 to nM2 do
       for j := i + 1 to nM1 do
       begin
         aij := M[i][j];
         if Abs(aij) <= cEPS then Continue;
+        Inc(rotations);
         // Jacobi rotation that zeros M[i][j].
         h := M[j][j] - M[i][i];
         if Abs(h) <= cEPS then
@@ -549,6 +552,8 @@ begin
           Vk[j] := Vjk + s * (Vik - tau * Vjk);
         end;
       end;
+
+    if rotations = 0 then Break;
   end;
 
   SetLength(EigVals, n);
@@ -784,6 +789,7 @@ function ISBlock(const Probs: TIMDoubleMatrix; First, Last: integer): Double;
 var
   numClass, numClassM1, i, c, n: integer;
   pbar: TIMDoubleArray;
+  lnpbar: TIMDoubleArray; // Ln of the clamped marginal, one per class (#5)
   prow: TIMDoubleArray;   // bound Probs[i] row (#7)
   klSum, kl, p, q: Double;
 begin
@@ -798,8 +804,18 @@ begin
     for c := 0 to numClassM1 do
       pbar[c] := pbar[c] + prow[c];
   end;
+  // The marginal and its logarithm are invariant across the sample loop below,
+  // so clamp and take Ln once per class instead of once per (sample, class) -
+  // half of the KL term's transcendentals. ISBlock runs once per split, not on
+  // a compute path, so the extra class-sized array is affordable.
+  SetLength(lnpbar, numClass);
   for c := 0 to numClassM1 do
-    pbar[c] := pbar[c] / n;
+  begin
+    q := pbar[c] / n;
+    pbar[c] := q;
+    if q < cEPS then q := cEPS;
+    lnpbar[c] := Ln(q);
+  end;
 
   klSum := 0;
   for i := First to Last do
@@ -810,11 +826,7 @@ begin
     begin
       p := prow[c];
       if p > cEPS then
-      begin
-        q := pbar[c];
-        if q < cEPS then q := cEPS;
-        kl := kl + p * (Ln(p) - Ln(q));
-      end;
+        kl := kl + p * (Ln(p) - lnpbar[c]);
     end;
     klSum := klSum + kl;
   end;

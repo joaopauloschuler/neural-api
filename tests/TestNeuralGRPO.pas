@@ -30,6 +30,10 @@ type
     // Learning-signal test: a few GRPO steps with a "emit the target token"
     // reward must INCREASE the policy probability of the target token.
     procedure TestGRPOIncreasesRewardedTokenProb;
+    // A prompt token id outside the vocabulary is a caller error: it is
+    // silently dropped by the one-hot encoder and its completions index past
+    // the vocabulary-sized output distribution.
+    procedure TestOutOfVocabPromptRejected;
   end;
 
 implementation
@@ -141,6 +145,33 @@ begin
 
   Trainer.Free;
   Policy.Free;
+end;
+
+procedure TTestNeuralGRPO.TestOutOfVocabPromptRejected;
+var
+  Policy: TNNet;
+  Trainer: TNeuralGRPOTrainer;
+  Msg: string;
+begin
+  RandSeed := 424242;
+  FTargetToken := 3;
+  Policy := BuildTinyLM(csContext, csVocab, csHidden);
+  Policy.SetLearningRate(0.01, 0);
+  Trainer := TNeuralGRPOTrainer.CreateWithClonedReference(Policy,
+    {GroupSize=}2, {beta=}0.01);
+  Trainer.Reward := @CountTargetReward;
+  Msg := '';
+  try
+    Trainer.TrainOnPrompt(DPOTokens('a'));   // Ord('a') = 97 >> csVocab
+  except
+    on E: Exception do Msg := E.Message;
+  end;
+  Trainer.Free;
+  Policy.Free;
+  AssertTrue('an out-of-vocabulary GRPO prompt token must be rejected',
+    Msg <> '');
+  AssertTrue('the message must name the offending id, got: ' + Msg,
+    Pos('97', Msg) > 0);
 end;
 
 initialization

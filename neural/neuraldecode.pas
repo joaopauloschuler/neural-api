@@ -7775,7 +7775,59 @@ type
   end;
   TBeamArray = array of TBeam;
 
-// Insertion sort beams in DESCENDING Score (small arrays, B is tiny).
+  // One expansion candidate: its parent beam plus the single token it appends.
+  // Deliberately free of managed fields, so the per-step pool is one plain
+  // block that can be allocated ONCE outside the step loop (rule #17) and that
+  // the top-BeamWidth selection below reorders with cheap record moves. The
+  // parent's text/token prefix is only materialised for the survivors.
+  TBeamCandidate = record
+    SumLogProb: TNeuralFloat;
+    Score: TNeuralFloat;
+    ParentIdx: integer;  // index into the CURRENT live frontier
+    LastToken: integer;  // the token this candidate appends
+    Progress: integer;   // forced-phrase progress (constrained search only)
+  end;
+  PBeamCandidate = ^TBeamCandidate;
+  TBeamCandidateArray = array of TBeamCandidate;
+
+// Rule #22: only the top KeepCount candidates survive a prune, so order just
+// those and leave the rest of Cand[0..Count-1] unordered - O(Count*KeepCount)
+// instead of the O(Count^2) full sort. Selecting by ROTATION rather than by
+// swap keeps equal-scoring records in fill order, so the kept prefix is
+// element-for-element what a stable descending sort would have produced.
+procedure SelectTopBeamCandidates(var Cand: TBeamCandidateArray;
+  Count, KeepCount: integer);
+var
+  I, J, BestIdx, IP1, MaxKeepIdx, MaxCandIdx: integer;
+  BestScore: TNeuralFloat;
+  Tmp: TBeamCandidate;
+begin
+  if KeepCount > Count then KeepCount := Count;
+  MaxKeepIdx := KeepCount - 1;
+  MaxCandIdx := Count - 1;
+  for I := 0 to MaxKeepIdx do
+  begin
+    BestIdx := I;
+    BestScore := Cand[I].Score;
+    IP1 := I + 1;
+    for J := IP1 to MaxCandIdx do
+      if Cand[J].Score > BestScore then
+      begin
+        BestScore := Cand[J].Score;
+        BestIdx := J;
+      end;
+    if BestIdx <> I then
+    begin
+      Tmp := Cand[BestIdx];
+      for J := BestIdx downto IP1 do Cand[J] := Cand[J - 1];
+      Cand[I] := Tmp;
+    end;
+  end;
+end;
+
+// Insertion sort beams in DESCENDING Score. Used for the FINISHED pool, whose
+// full order is observable in the returned result; the far larger per-step
+// candidate pool goes through SelectTopBeamCandidates instead.
 procedure SortBeamsByScore(var Beams: TBeamArray);
 var
   I, J: integer;
@@ -7803,12 +7855,14 @@ var
   InputVolume, OutputVolume: TNNetVolume;
   LogProbs: array of TNeuralFloat;
   VocabSize, Step, I, T, B, LenB, CandCount: integer;
-  VocabSizeM1, LiveHi, FinishedHi: integer;
+  VocabSizeM1, LiveHi, FinishedHi, KeepCount, MaxKeepIdx: integer;
   Live: TBeamArray;      // still-growing beams
   Finished: TBeamArray;  // beams that emitted EOS
-  Cand: TBeamArray;      // expansion candidates for this step
-  NewBeam: TBeam;
-  CutScore, InvDenFin, InvDenExt: TNeuralFloat;
+  NewLive: TBeamArray;   // next frontier, materialised from the survivors
+  Cand: TBeamCandidateArray; // expansion candidates for this step
+  PCand: PBeamCandidate;
+  FinB: TBeam;
+  CutScore, InvDenFin, InvDenExt, NewSumLP: TNeuralFloat;
   AllDominated: boolean;
   BSumLP: TNeuralFloat;
   BText: string;
@@ -7826,6 +7880,10 @@ begin
     Live[0].Score := 0;
     Live[0].Finished := False;
     SetLength(Finished, 0);
+    // #17: the live frontier never exceeds BeamWidth beams and each yields at
+    // most VocabSize candidates, so this is the pool's capacity for EVERY step.
+    // Allocate it once here and carry a fill count; never resize inside a step.
+    SetLength(Cand, BeamWidth * VocabSize);
 
     for Step := 1 to MaxLen do
     begin
@@ -7849,11 +7907,9 @@ begin
         if AllDominated then Break;
       end;
 
-      // Expand every live beam by every vocabulary token. #17: pre-size Cand to
-      // the per-step upper bound (each of Length(Live) beams yields at most
-      // VocabSize candidates) and carry a fill count, instead of grow-by-one.
-      SetLength(Cand, Length(Live) * VocabSize);
+      // Expand every live beam by every vocabulary token.
       CandCount := 0;
+      PCand := @Cand[0];
       LiveHi := High(Live);
       for B := 0 to LiveHi do
       begin
@@ -7871,31 +7927,45 @@ begin
         InvDenExt := 1.0 / LengthPenaltyDenominator(LenB + 1, LengthPenalty);
         for T := 0 to VocabSizeM1 do
         begin
-          NewBeam.SumLogProb := BSumLP + LogProbs[T];
+          NewSumLP := BSumLP + LogProbs[T];
           if T = csDecodeEOSToken then
           begin
-            NewBeam.Text := BText;
-            NewBeam.Finished := True;
-            NewBeam.Score := NewBeam.SumLogProb * InvDenFin;
+            FinB.SumLogProb := NewSumLP;
+            FinB.Text := BText;
+            FinB.Finished := True;
+            FinB.Score := NewSumLP * InvDenFin;
             SetLength(Finished, Length(Finished) + 1);
-            Finished[High(Finished)] := NewBeam;
+            Finished[High(Finished)] := FinB;
           end
           else
           begin
-            NewBeam.Text := BText + Chr(T);
-            NewBeam.Finished := False;
-            NewBeam.Score := NewBeam.SumLogProb * InvDenExt;
-            Cand[CandCount] := NewBeam;
+            // #17: no per-candidate string here - the appended char is recorded
+            // as a token id and the text is built below, for survivors only.
+            PCand^.SumLogProb := NewSumLP;
+            PCand^.Score := NewSumLP * InvDenExt;
+            PCand^.ParentIdx := B;
+            PCand^.LastToken := T;
+            Inc(PCand);
             Inc(CandCount);
           end;
         end;
       end;
 
       // Re-prune the survivors to the top BeamWidth by length-penalised score.
-      SetLength(Cand, CandCount);   // trim to the real count before ranking
-      SortBeamsByScore(Cand);
-      if Length(Cand) > BeamWidth then SetLength(Cand, BeamWidth);
-      Live := Copy(Cand, 0, Length(Cand));
+      KeepCount := BeamWidth;
+      if KeepCount > CandCount then KeepCount := CandCount;
+      SelectTopBeamCandidates(Cand, CandCount, KeepCount);
+      SetLength(NewLive, KeepCount);
+      MaxKeepIdx := KeepCount - 1;
+      for I := 0 to MaxKeepIdx do
+      begin
+        NewLive[I].Text := Live[Cand[I].ParentIdx].Text + Chr(Cand[I].LastToken);
+        NewLive[I].SumLogProb := Cand[I].SumLogProb;
+        NewLive[I].Score := Cand[I].Score;
+        NewLive[I].Finished := False;
+      end;
+      Live := NewLive;
+      NewLive := nil;
     end;
 
     // Merge any remaining live beams into the finished pool (MaxLen reached).
@@ -7954,36 +8024,6 @@ type
     LastPos: integer;                  // absolute position of LastToken
   end;
   TCachedBeamArray = array of TCachedBeam;
-  TCachedCandidate = record
-    Text: string;
-    SumLogProb: TNeuralFloat;
-    Score: TNeuralFloat;
-    ParentIdx: integer; // index into the BaseAfter array (cache through LastPos)
-    LastToken: integer; // the new char this candidate appends (its future input)
-    LastPos: integer;   // absolute position of LastToken
-  end;
-  TCachedCandidateArray = array of TCachedCandidate;
-
-// Insertion sort cached candidates in DESCENDING Score (B is tiny).
-procedure SortCachedCandidates(var C: TCachedCandidateArray);
-var
-  I, J: integer;
-  CHi: integer;
-  Tmp: TCachedCandidate;
-begin
-  CHi := High(C);
-  for I := 1 to CHi do
-  begin
-    Tmp := C[I];
-    J := I - 1;
-    while (J >= 0) and (C[J].Score < Tmp.Score) do
-    begin
-      C[J + 1] := C[J];
-      Dec(J);
-    end;
-    C[J + 1] := Tmp;
-  end;
-end;
 
 function DecodeBeamSearchCachedAll(Session: TNNetStreamingDecoder;
   const Prompt: string; MaxLen: integer; BeamWidth: integer;
@@ -7992,12 +8032,13 @@ var
   InV, Row: TNNetVolume;
   LogProbs: array of TNeuralFloat;
   VocabSize, PromptLen, Step, I, T, B, Pos, LenB, CandCount: integer;
-  VocabSizeM1, LiveHi, CandHi, FinishedHi, FinSurvivorsHi, PromptLenM2: integer;
+  VocabSizeM1, LiveHi, FinishedHi, FinSurvivorsHi, PromptLenM2: integer;
+  KeepCount, MaxKeepIdx, ParentIdx: integer;
   Live: TCachedBeamArray;      // still-growing beams (each owns a Snap)
   Finished: TBeamArray;        // finished beams (Score-ranked, cache-free)
-  Cand: TCachedCandidateArray; // expansion candidates for this step
+  Cand: TBeamCandidateArray;   // expansion candidates for this step
+  PCand: PBeamCandidate;
   BaseAfter: array of TNNetDecoderSessionSnapshot; // per-live-beam cache through LastPos
-  NewC: TCachedCandidate;
   FinB: TBeam;
   NewLive: TCachedBeamArray;
   CutScore, Total, InvTotal, InvDenFin, InvDenExt: TNeuralFloat;
@@ -8005,7 +8046,6 @@ var
   FinSurvivors: TBeamArray;
   BSumLP: TNeuralFloat;
   BText: string;
-  BLastPosP1: integer;
 
   procedure FreeLiveSnaps;
   var k, LiveHi: integer;
@@ -8073,6 +8113,10 @@ begin
     Live[0].LastToken := Ord(Prompt[PromptLen]);
     Live[0].LastPos := PromptLen - 1;
     SetLength(Finished, 0);
+    // #17: the live frontier never exceeds BeamWidth beams and each yields at
+    // most VocabSize candidates, so this is the pool's capacity for EVERY step.
+    // Allocate it once here and carry a fill count; never resize inside a step.
+    SetLength(Cand, BeamWidth * VocabSize);
 
     for Step := 1 to MaxLen do
     begin
@@ -8096,11 +8140,8 @@ begin
 
       // Expand every live beam by every vocabulary token, using its forked
       // cache instead of re-encoding the prefix.
-      // #17: pre-size Cand to the per-step upper bound (each of Length(Live)
-      // beams yields at most VocabSize non-EOS candidates) and carry a fill
-      // count, instead of grow-by-one.
-      SetLength(Cand, Length(Live) * VocabSize);
       CandCount := 0;
+      PCand := @Cand[0];
       SetLength(BaseAfter, Length(Live));
       LiveHi := High(Live);
       for B := 0 to LiveHi do BaseAfter[B] := nil;
@@ -8125,14 +8166,9 @@ begin
         // #11: Live[B] fields are invariant across the vocab (T) loop - hoist.
         BSumLP := Live[B].SumLogProb;
         BText := Live[B].Text;
-        BLastPosP1 := Live[B].LastPos + 1;
         LenB := Length(BText);
         InvDenFin := 1.0 / LengthPenaltyDenominator(LenB, LengthPenalty);
         InvDenExt := 1.0 / LengthPenaltyDenominator(LenB + 1, LengthPenalty);
-        // A1: candidate Text is materialized only for survivors (post-prune,
-        // below) from ParentIdx+LastToken; keep NewC.Text empty so the reused
-        // record never leaks a prior iteration's string into a candidate.
-        NewC.Text := '';
         for T := 0 to VocabSizeM1 do
         begin
           if T = csDecodeEOSToken then
@@ -8146,12 +8182,12 @@ begin
           end
           else
           begin
-            NewC.SumLogProb := BSumLP + LogProbs[T];
-            NewC.Score := NewC.SumLogProb * InvDenExt;
-            NewC.ParentIdx := B;
-            NewC.LastToken := T;             // future input char
-            NewC.LastPos := BLastPosP1;
-            Cand[CandCount] := NewC;
+            // A1: candidate text is materialized only for survivors, below.
+            PCand^.SumLogProb := BSumLP + LogProbs[T];
+            PCand^.Score := PCand^.SumLogProb * InvDenExt;
+            PCand^.ParentIdx := B;
+            PCand^.LastToken := T;           // future input char
+            Inc(PCand);
             Inc(CandCount);
           end;
         end;
@@ -8159,25 +8195,27 @@ begin
 
       // Re-prune survivors to the top BeamWidth by length-penalised score
       // (same ordering as DecodeBeamSearchAll).
-      SetLength(Cand, CandCount);   // trim to the real count before ranking
-      SortCachedCandidates(Cand);
-      if Length(Cand) > BeamWidth then SetLength(Cand, BeamWidth);
+      KeepCount := BeamWidth;
+      if KeepCount > CandCount then KeepCount := CandCount;
+      SelectTopBeamCandidates(Cand, CandCount, KeepCount);
 
       // Build the next live set. Each survivor gets an INDEPENDENT clone of its
       // parent's BaseAfter cache (Restore then Snapshot makes a fresh deep
       // copy), so per-beam forks never alias.
-      SetLength(NewLive, Length(Cand));
-      CandHi := High(Cand);
-      for I := 0 to CandHi do
+      SetLength(NewLive, KeepCount);
+      MaxKeepIdx := KeepCount - 1;
+      for I := 0 to MaxKeepIdx do
       begin
+        ParentIdx := Cand[I].ParentIdx;
         // A1: materialize survivor text here from parent + appended char.
-        NewLive[I].Text := Live[Cand[I].ParentIdx].Text + Chr(Cand[I].LastToken);
+        NewLive[I].Text := Live[ParentIdx].Text + Chr(Cand[I].LastToken);
         NewLive[I].SumLogProb := Cand[I].SumLogProb;
         NewLive[I].Score := Cand[I].Score;
         NewLive[I].Finished := False;
         NewLive[I].LastToken := Cand[I].LastToken;
-        NewLive[I].LastPos := Cand[I].LastPos;
-        Session.RestoreSnapshot(BaseAfter[Cand[I].ParentIdx]);
+        // The child's input sits one position after its parent's last token.
+        NewLive[I].LastPos := Live[ParentIdx].LastPos + 1;
+        Session.RestoreSnapshot(BaseAfter[ParentIdx]);
         NewLive[I].Snap := Session.Snapshot();
       end;
       FreeLiveSnaps;   // release the parents' caches
@@ -8250,13 +8288,15 @@ var
   LogProbs: array of TNeuralFloat;
   TokenTaken: array of integer;   // per-token collision count, this step
   VocabSize, Step, I, T, B, GroupSize, G, GroupLo, GroupHi, LenB: integer;
-  VocabSizeM1, NumGroupsM1, CandHi, LiveHi, FinishedHi, CandCount: integer;
+  VocabSizeM1, NumGroupsM1, LiveHi, FinishedHi, CandCount: integer;
+  KeepCount, MaxKeepIdx, NewLiveCount: integer;
   Live: TBeamArray;      // still-growing beams, contiguous by group
   NewLive: TBeamArray;   // frontier being assembled this step
   Finished: TBeamArray;  // beams that emitted EOS
-  Cand: TBeamArray;      // expansion candidates for the CURRENT group
-  NewBeam: TBeam;
-  Pen, InvDenFin, InvDenExt: TNeuralFloat;
+  Cand: TBeamCandidateArray; // expansion candidates for the CURRENT group
+  PCand: PBeamCandidate;
+  FinB: TBeam;
+  NewSumLP, Pen, InvDenFin, InvDenExt: TNeuralFloat;
   BSumLP: TNeuralFloat;
   BText: string;
 begin
@@ -8286,13 +8326,20 @@ begin
     Live[0].Score := 0;
     Live[0].Finished := False;
     SetLength(Finished, 0);
+    // #17: a group draws from at most the whole frontier (<= BeamWidth beams),
+    // each yielding at most VocabSize candidates - the pool's capacity for
+    // EVERY group of EVERY step. The frontier itself gathers NumGroups groups
+    // of GroupSize survivors, which is <= BeamWidth. Allocate both once here
+    // and carry fill counts; never resize inside the step loop.
+    SetLength(Cand, BeamWidth * VocabSize);
+    SetLength(NewLive, BeamWidth);
 
     for Step := 1 to MaxLen do
     begin
       if Length(Live) = 0 then Break;
       // #13/App C: bulk zero-fill the per-token collision counters (Integer array).
       FillChar(TokenTaken[0], VocabSize * csIntegerSize, 0);
-      SetLength(NewLive, 0);
+      NewLiveCount := 0;
 
       // Expand group-by-group; each group contributes up to GroupSize survivors
       // and its chosen first tokens raise TokenTaken so LATER groups are pushed
@@ -8313,10 +8360,8 @@ begin
         else if GroupHi > High(Live) then
           GroupHi := High(Live);
 
-        // #17: pre-size Cand to this group's upper bound (each parent yields at
-        // most VocabSize non-EOS candidates) and carry a fill count.
-        SetLength(Cand, (GroupHi - GroupLo + 1) * VocabSize);
         CandCount := 0;
+        PCand := @Cand[0];
         for B := GroupLo to GroupHi do
         begin
           // #11: Live[B] fields are invariant across the vocab (T) loop - hoist.
@@ -8331,46 +8376,54 @@ begin
           InvDenExt := 1.0 / LengthPenaltyDenominator(LenB + 1, LengthPenalty);
           for T := 0 to VocabSizeM1 do
           begin
-            NewBeam.SumLogProb := BSumLP + LogProbs[T];
+            NewSumLP := BSumLP + LogProbs[T];
             if T = csDecodeEOSToken then
             begin
-              NewBeam.Text := BText;
-              NewBeam.Finished := True;
-              NewBeam.Score := NewBeam.SumLogProb * InvDenFin;
+              FinB.SumLogProb := NewSumLP;
+              FinB.Text := BText;
+              FinB.Finished := True;
+              FinB.Score := NewSumLP * InvDenFin;
               SetLength(Finished, Length(Finished) + 1);
-              Finished[High(Finished)] := NewBeam;
+              Finished[High(Finished)] := FinB;
             end
             else
             begin
-              NewBeam.Text := BText + Chr(T);
-              NewBeam.Finished := False;
               // Length-penalised base score, minus the diversity penalty for
               // collisions with earlier groups at THIS step (g=0: no penalty).
               Pen := Diversity * TokenTaken[T];
-              NewBeam.Score := NewBeam.SumLogProb * InvDenExt - Pen;
-              Cand[CandCount] := NewBeam;
+              // #17: no per-candidate string - the text is built below, for
+              // this group's survivors only.
+              PCand^.SumLogProb := NewSumLP;
+              PCand^.Score := NewSumLP * InvDenExt - Pen;
+              PCand^.ParentIdx := B;
+              PCand^.LastToken := T;
+              Inc(PCand);
               Inc(CandCount);
             end;
           end;
         end;
 
-        SetLength(Cand, CandCount);   // trim to the real count before ranking
-        SortBeamsByScore(Cand);
-        if Length(Cand) > GroupSize then SetLength(Cand, GroupSize);
+        KeepCount := GroupSize;
+        if KeepCount > CandCount then KeepCount := CandCount;
+        SelectTopBeamCandidates(Cand, CandCount, KeepCount);
         // Register this group's chosen first tokens for the diversity penalty
         // and append the survivors to the next frontier.
-        CandHi := High(Cand);
-        for I := 0 to CandHi do
+        MaxKeepIdx := KeepCount - 1;
+        for I := 0 to MaxKeepIdx do
         begin
-          Inc(TokenTaken[Ord(Cand[I].Text[Length(Cand[I].Text)])]);
-          SetLength(NewLive, Length(NewLive) + 1);
-          NewLive[High(NewLive)] := Cand[I];
+          Inc(TokenTaken[Cand[I].LastToken]);
+          NewLive[NewLiveCount].Text :=
+            Live[Cand[I].ParentIdx].Text + Chr(Cand[I].LastToken);
+          NewLive[NewLiveCount].SumLogProb := Cand[I].SumLogProb;
+          NewLive[NewLiveCount].Score := Cand[I].Score;
+          NewLive[NewLiveCount].Finished := False;
+          Inc(NewLiveCount);
         end;
       end;
 
       // Pruning is per-group (each group keeps GroupSize); the new frontier is
       // the concatenation. No global re-prune so groups stay independent.
-      Live := Copy(NewLive, 0, Length(NewLive));
+      Live := Copy(NewLive, 0, NewLiveCount);
     end;
 
     LiveHi := High(Live);
@@ -8437,9 +8490,11 @@ end;
 // PROGRESS when appended to Text (the next char of any phrase given Text's
 // current longest matching prefix-of-a-phrase suffix). Used to inject
 // guaranteed-satisfying continuations into the candidate pool. Returns the
-// distinct next-chars as a string (each char at most once).
+// distinct next-chars as a string (each char at most once). Only chars the
+// model can actually emit (Ord < VocabSize) are returned, so the result doubles
+// as a set of valid logits indices and can never be longer than VocabSize.
 function NeededNextChars(const Text: string;
-  const ForceTokens: array of string): string;
+  const ForceTokens: array of string; VocabSize: integer): string;
 var
   K, P, MatchLen, PhraseLenM1: integer;
   ForceTokensHi: integer;
@@ -8466,6 +8521,12 @@ begin
         Break;
       end;
     C := Phrase[MatchLen + 1];
+    // A phrase byte outside the model's alphabet has no logit to score and can
+    // never be emitted by the vocab pass either, so the phrase is unsatisfiable:
+    // drop the char rather than index LogProbs past its end. The search then
+    // blocks EOS forever for this phrase and the caller gets the best-effort
+    // frontier from the unsatisfied-constraint fallback.
+    if Ord(C) >= VocabSize then Continue;
     Tail := Result;
     if Pos(C, Tail) = 0 then Result := Result + C;
   end;
@@ -8507,6 +8568,58 @@ begin
   end;
 end;
 
+const
+  csByteAlphabetSize = 256;   // Chr() alphabet: every appended char is a byte
+  csByteAlphabetSizeM1 = csByteAlphabetSize - 1;
+
+type
+  TByteProgressTable = array[0 .. csByteAlphabetSizeM1] of integer;
+
+// ForcedProgress for EVERY possible one-char extension of ParentText, built in
+// one pass over the phrases: ChildProg[c] plus the returned base is exactly
+// ForcedProgress(ParentText + Chr(c), ForceTokens). Progress decomposes because
+// a phrase already present in ParentText contributes its full length to every
+// child (the base), while a phrase that is NOT present can only reach
+// Phrase[1..p] as a suffix of ParentText + Chr(c) when Phrase[p] = c and
+// Phrase[1..p-1] is a suffix of ParentText - p = Length(Phrase) being the
+// "phrase completes on this char" case. That turns a per-candidate rescan of a
+// growing text into one per-parent table build plus a lookup per candidate.
+function BuildChildProgress(const ParentText: string;
+  const ForceTokens: array of string;
+  out ChildProg: TByteProgressTable): integer;
+var
+  K, P, C, PhraseLen, ParentLen, ForceTokensHi: integer;
+  Phrase: string;
+  PhraseVal: TByteProgressTable;
+begin
+  Result := 0;
+  FillChar(ChildProg[0], csByteAlphabetSize * csIntegerSize, 0);
+  ParentLen := Length(ParentText);
+  ForceTokensHi := High(ForceTokens);
+  for K := 0 to ForceTokensHi do
+  begin
+    Phrase := ForceTokens[K];
+    PhraseLen := Length(Phrase);
+    if PhraseLen = 0 then Continue;
+    if Pos(Phrase, ParentText) > 0 then
+    begin
+      Inc(Result, PhraseLen);
+      Continue;
+    end;
+    FillChar(PhraseVal[0], csByteAlphabetSize * csIntegerSize, 0);
+    // Ascending p, so a longer admissible prefix overwrites a shorter one and
+    // each byte ends up holding the maximum - the same value the downto scan
+    // in ForcedProgress stops at.
+    for P := 1 to PhraseLen do
+      if (P = 1) or
+         ((ParentLen >= P - 1) and
+          CompareMem(@ParentText[ParentLen - P + 2], @Phrase[1], P - 1)) then
+        PhraseVal[Ord(Phrase[P])] := P;
+    for C := 0 to csByteAlphabetSizeM1 do
+      Inc(ChildProg[C], PhraseVal[C]);
+  end;
+end;
+
 function DecodeConstrainedBeamSearchAll(NN: TNNet; const Prompt: string;
   MaxLen: integer; BeamWidth: integer;
   const ForceTokens: array of string;
@@ -8514,16 +8627,20 @@ function DecodeConstrainedBeamSearchAll(NN: TNNet; const Prompt: string;
 var
   InputVolume, OutputVolume: TNNetVolume;
   LogProbs: array of TNeuralFloat;
-  VocabSize, Step, I, T, B, RealForced, BestProg, KeptProg, LenB, Prog: integer;
-  VocabSizeM1, ForceTokensHi, LiveHi, CandHi, FinishedHi, NeededLen,
+  VocabSize, Step, I, T, B, RealForced, BestProg, KeptProg, LenB: integer;
+  VocabSizeM1, ForceTokensHi, LiveHi, FinishedHi, NeededLen,
     BeamWidthM1, CandCount: integer;
+  KeepCount, MaxKeepIdx, MaxCandIdx, BestIdx, BaseProg, MaxByteTok: integer;
   Live: TBeamArray;
   Finished: TBeamArray;
-  Cand: TBeamArray;
-  NewBeam: TBeam;
+  NewLive: TBeamArray;
+  Cand: TBeamCandidateArray;
+  PCand: PBeamCandidate;
+  FinB: TBeam;
   Needed: string;
   NeededSet: set of char;   // #5/#8: value-type set, no heap alloc
-  InvDenFin, InvDenExt: TNeuralFloat;
+  ChildProg: TByteProgressTable;
+  InvDenFin, InvDenExt, NewSumLP: TNeuralFloat;
   BSumLP: TNeuralFloat;
   BText: string;
 begin
@@ -8552,16 +8669,23 @@ begin
     Live[0].Score := 0;
     Live[0].Finished := False;
     SetLength(Finished, 0);
+    // #17: the live frontier never exceeds BeamWidth beams and each contributes
+    // at most NeededLen (<= VocabSize) force-injected plus VocabSize vocab
+    // candidates, i.e. <= 2*VocabSize - the pool's capacity for EVERY step.
+    // Allocate it once here and carry a fill count; never resize inside a step.
+    SetLength(Cand, BeamWidth * 2 * VocabSize);
+    // Highest token id that is also a byte, i.e. that a forced phrase can name.
+    // Above it the byte-indexed progress table has no entry and the token
+    // cannot advance any phrase.
+    MaxByteTok := VocabSizeM1;
+    if MaxByteTok > csByteAlphabetSizeM1 then MaxByteTok := csByteAlphabetSizeM1;
 
     for Step := 1 to MaxLen do
     begin
       if Length(Live) = 0 then Break;
 
-      // #17: pre-size Cand to the per-step upper bound - each of Length(Live)
-      // beams contributes at most NeededLen (<= VocabSize) force-injected plus
-      // VocabSize vocab candidates, i.e. <= 2*VocabSize - and carry a fill count.
-      SetLength(Cand, Length(Live) * 2 * VocabSize);
       CandCount := 0;
+      PCand := @Cand[0];
       LiveHi := High(Live);
       for B := 0 to LiveHi do
       begin
@@ -8573,7 +8697,7 @@ begin
         // Characters that advance an unmet phrase: each is FORCE-INJECTED as a
         // candidate (even if the model assigns it ~0 probability) so a path that
         // makes progress toward every phrase always exists in the pool.
-        Needed := NeededNextChars(BText, ForceTokens);
+        Needed := NeededNextChars(BText, ForceTokens, VocabSize);
         NeededLen := Length(Needed);
         // #5/#8: Needed is invariant across the vocab T loop below; build the
         // membership set once per beam so the dup check is O(1) set-in instead
@@ -8586,46 +8710,60 @@ begin
         LenB := Length(BText);
         InvDenFin := 1.0 / LengthPenaltyDenominator(LenB, LengthPenalty);
         InvDenExt := 1.0 / LengthPenaltyDenominator(LenB + 1, LengthPenalty);
+        // #5/#27: every candidate below extends THIS beam by one char, so the
+        // whole forced-phrase progress table is a per-beam invariant. Build it
+        // once and read each candidate's progress out of it, instead of
+        // rescanning each candidate's text at prune time.
+        BaseProg := BuildChildProgress(BText, ForceTokens, ChildProg);
         for I := 1 to NeededLen do
         begin
           T := Ord(Needed[I]);
-          NewBeam.SumLogProb := BSumLP + LogProbs[T];
-          NewBeam.Text := BText + Chr(T);
-          NewBeam.Finished := False;
-          NewBeam.Score := NewBeam.SumLogProb * InvDenExt;
-          Cand[CandCount] := NewBeam;
+          NewSumLP := BSumLP + LogProbs[T];
+          PCand^.SumLogProb := NewSumLP;
+          PCand^.Score := NewSumLP * InvDenExt;
+          PCand^.ParentIdx := B;
+          PCand^.LastToken := T;
+          PCand^.Progress := BaseProg + ChildProg[T];
+          Inc(PCand);
           Inc(CandCount);
         end;
         for T := 0 to VocabSizeM1 do
         begin
-          NewBeam.SumLogProb := BSumLP + LogProbs[T];
+          NewSumLP := BSumLP + LogProbs[T];
           if T = csDecodeEOSToken then
           begin
             // EOS only allowed once ALL phrases are present; otherwise the
             // hypothesis must keep generating to satisfy the constraint.
             if not AllForcedPhrasesPresent(BText, ForceTokens) then
               Continue;
-            NewBeam.Text := BText;
-            NewBeam.Finished := True;
-            NewBeam.Score := NewBeam.SumLogProb * InvDenFin;
+            FinB.SumLogProb := NewSumLP;
+            FinB.Text := BText;
+            FinB.Finished := True;
+            FinB.Score := NewSumLP * InvDenFin;
             SetLength(Finished, Length(Finished) + 1);
-            Finished[High(Finished)] := NewBeam;
+            Finished[High(Finished)] := FinB;
           end
           else
           begin
             // Skip a token already added through the force-injection pass above
             // (it is a needed next-char) to avoid a duplicate candidate.
             if Chr(T) in NeededSet then Continue;
-            NewBeam.Text := BText + Chr(T);
-            NewBeam.Finished := False;
-            NewBeam.Score := NewBeam.SumLogProb * InvDenExt;
-            Cand[CandCount] := NewBeam;
+            // #17: no per-candidate string - the text is built for survivors
+            // only, below.
+            PCand^.SumLogProb := NewSumLP;
+            PCand^.Score := NewSumLP * InvDenExt;
+            PCand^.ParentIdx := B;
+            PCand^.LastToken := T;
+            if T <= MaxByteTok then
+              PCand^.Progress := BaseProg + ChildProg[T]
+            else
+              PCand^.Progress := BaseProg;
+            Inc(PCand);
             Inc(CandCount);
           end;
         end;
       end;
 
-      SetLength(Cand, CandCount);   // #17: trim to the real count before ranking
       // Bank-aware prune. Keep the global top-BeamWidth by score, BUT GUARANTEE
       // MONOTONE PROGRESS toward the forced phrases: compute the maximum
       // ForcedProgress reachable this step (over ALL candidates, including the
@@ -8636,39 +8774,46 @@ begin
       // blocked until all phrases are present), the progress is non-decreasing
       // and reaches Sum(Length(phrase)) - i.e. full satisfaction - within
       // MaxLen (given MaxLen >= total phrase length).
-      SortBeamsByScore(Cand);
-      if Length(Cand) > BeamWidth then
+      KeepCount := BeamWidth;
+      if KeepCount > CandCount then KeepCount := CandCount;
+      SelectTopBeamCandidates(Cand, CandCount, KeepCount);
+      MaxCandIdx := CandCount - 1;
+      if CandCount > BeamWidth then
       begin
         BestProg := 0;
-        CandHi := High(Cand);
-        for I := 0 to CandHi do
-        begin
-          // Rule #4: ForcedProgress loops all phrases doing string compares;
-          // call it ONCE per candidate, not twice.
-          Prog := ForcedProgress(Cand[I].Text, ForceTokens);
-          if Prog > BestProg then BestProg := Prog;
-        end;
-        SetLength(Live, BeamWidth);
-        for I := 0 to BeamWidthM1 do Live[I] := Cand[I];
+        for I := 0 to MaxCandIdx do
+          if Cand[I].Progress > BestProg then BestProg := Cand[I].Progress;
         KeptProg := 0;
-        LiveHi := High(Live);
-        for I := 0 to LiveHi do
-        begin
-          Prog := ForcedProgress(Live[I].Text, ForceTokens);
-          if Prog > KeptProg then KeptProg := Prog;
-        end;
+        for I := 0 to BeamWidthM1 do
+          if Cand[I].Progress > KeptProg then KeptProg := Cand[I].Progress;
         if KeptProg < BestProg then
-          // Best-scoring candidate that attains the max progress (Cand is
-          // score-sorted) takes the final slot.
-          for I := BeamWidth to CandHi do
-            if ForcedProgress(Cand[I].Text, ForceTokens) = BestProg then
-            begin
-              Live[BeamWidth - 1] := Cand[I];
-              Break;
-            end;
-      end
-      else
-        Live := Copy(Cand, 0, Length(Cand));
+        begin
+          // Best-scoring dropped candidate that attains the max progress takes
+          // the final slot. The unselected tail is left unordered by the
+          // partial selection, so scan it for the maximum; the strict > keeps
+          // the earliest-filled candidate on a score tie, which is exactly
+          // where a full descending sort would have put it.
+          BestIdx := -1;
+          for I := BeamWidth to MaxCandIdx do
+            if (Cand[I].Progress = BestProg) and
+               ((BestIdx < 0) or (Cand[I].Score > Cand[BestIdx].Score)) then
+              BestIdx := I;
+          if BestIdx >= 0 then Cand[BeamWidthM1] := Cand[BestIdx];
+        end;
+      end;
+      // Materialize the surviving frontier: one string per survivor, not one
+      // per candidate.
+      SetLength(NewLive, KeepCount);
+      MaxKeepIdx := KeepCount - 1;
+      for I := 0 to MaxKeepIdx do
+      begin
+        NewLive[I].Text := Live[Cand[I].ParentIdx].Text + Chr(Cand[I].LastToken);
+        NewLive[I].SumLogProb := Cand[I].SumLogProb;
+        NewLive[I].Score := Cand[I].Score;
+        NewLive[I].Finished := False;
+      end;
+      Live := NewLive;
+      NewLive := nil;
     end;
 
     // Merge surviving live beams that SATISFY the constraint into the pool; an
@@ -9062,12 +9207,16 @@ var
   LogProbs: array of TNeuralFloat;
   Live: TNNetTokenDecodeResultArray;     // still-growing beams
   Finished: TNNetTokenDecodeResultArray; // beams that emitted EOSTokenId
-  Cand: TNNetTokenDecodeResultArray;     // expansion candidates per step
+  NewLive: TNNetTokenDecodeResultArray;  // next frontier, built from survivors
+  Cand: TBeamCandidateArray;             // expansion candidates per step
+  PCand: PBeamCandidate;
   NewBeam: TNNetTokenDecodeResult;
   EncSeqLen, DecSeqLen, VocabSize, EffMaxNew: integer;
   EncSeqLenM1, DecSeqLenM1, VocabSizeM1, LiveHi: integer;
-  Step, B, T, Pos, PrevLen, Base, CandCount: integer;
-  MaxLogit, SumExp, CutScore, V, InvDenExt: TNeuralFloat;
+  Step, B, I, T, Pos, PrevLen, Base, CandCount: integer;
+  KeepCount, MaxKeepIdx, ParentIdx, ParentLen: integer;
+  ParentToks: TNeuralIntegerArray;
+  MaxLogit, SumExp, CutScore, V, InvDenExt, NewSumLP: TNeuralFloat;
   LnSumExp, LnTiny, LP: TNeuralFloat;
   AllDominated: boolean;
   BSumLP: TNeuralFloat;
@@ -9123,6 +9272,10 @@ begin
     // StartTokenId; the shared prefix length only grows. Fill the whole row
     // ONCE, then each beam rewrites only its [1..PrevLen] prefix slots below.
     DecToks.Fill(StartTokenId);
+    // #17: the live frontier never exceeds BeamWidth beams and each yields at
+    // most VocabSize candidates, so this is the pool's capacity for EVERY step.
+    // Allocate it once here and carry a fill count; never resize inside a step.
+    SetLength(Cand, BeamWidth * VocabSize);
 
     for Step := 1 to EffMaxNew do
     begin
@@ -9143,11 +9296,9 @@ begin
         if AllDominated then Break;
       end;
 
-      // Expand every live beam by every vocabulary token. #17: pre-size Cand to
-      // the per-step upper bound (each of Length(Live) beams yields at most
-      // VocabSize non-EOS candidates) and carry a fill count.
-      SetLength(Cand, Length(Live) * VocabSize);
+      // Expand every live beam by every vocabulary token.
       CandCount := 0;
+      PCand := @Cand[0];
       LiveHi := High(Live);
       for B := 0 to LiveHi do
       begin
@@ -9193,33 +9344,57 @@ begin
         InvDenExt := 1.0 / LengthPenaltyDenominator(PrevLen + 1, LengthPenalty);
         for T := 0 to VocabSizeM1 do
         begin
-          NewBeam.SumLogProb := BSumLP + LogProbs[T];
-          // One allocation instead of Copy(PrevLen)+SetLength(PrevLen+1)'s two
-          // (rule #4/#17): size once, then Move the prefix in.
-          SetLength(NewBeam.Tokens, PrevLen + 1);
-          if PrevLen > 0 then
-            Move(BToks[0], NewBeam.Tokens[0], PrevLen * csIntegerSize);
-          NewBeam.Tokens[PrevLen] := T; // EOS included, like greedy
-          NewBeam.Finished := (T = EOSTokenId);
-          NewBeam.Score := NewBeam.SumLogProb * InvDenExt;
-          if NewBeam.Finished then
+          NewSumLP := BSumLP + LogProbs[T];
+          if T = EOSTokenId then
           begin
+            // One allocation instead of Copy(PrevLen)+SetLength(PrevLen+1)'s two
+            // (rule #4/#17): size once, then Move the prefix in.
+            SetLength(NewBeam.Tokens, PrevLen + 1);
+            if PrevLen > 0 then
+              Move(BToks[0], NewBeam.Tokens[0], PrevLen * csIntegerSize);
+            NewBeam.Tokens[PrevLen] := T; // EOS included, like greedy
+            NewBeam.SumLogProb := NewSumLP;
+            NewBeam.Finished := True;
+            NewBeam.Score := NewSumLP * InvDenExt;
             SetLength(Finished, Length(Finished) + 1);
             Finished[High(Finished)] := NewBeam;
+            NewBeam.Tokens := nil;
           end
           else
           begin
-            Cand[CandCount] := NewBeam;
+            // #17: no per-candidate token array here - the prefix is copied
+            // below, for survivors only.
+            PCand^.SumLogProb := NewSumLP;
+            PCand^.Score := NewSumLP * InvDenExt;
+            PCand^.ParentIdx := B;
+            PCand^.LastToken := T;
+            Inc(PCand);
             Inc(CandCount);
           end;
         end;
       end;
 
       // Re-prune the survivors to the top BeamWidth by penalised score.
-      SetLength(Cand, CandCount);   // trim to the real count before ranking
-      SortTokenBeamsByScore(Cand);
-      if Length(Cand) > BeamWidth then SetLength(Cand, BeamWidth);
-      Live := Copy(Cand, 0, Length(Cand));
+      KeepCount := BeamWidth;
+      if KeepCount > CandCount then KeepCount := CandCount;
+      SelectTopBeamCandidates(Cand, CandCount, KeepCount);
+      SetLength(NewLive, KeepCount);
+      MaxKeepIdx := KeepCount - 1;
+      for I := 0 to MaxKeepIdx do
+      begin
+        ParentIdx := Cand[I].ParentIdx;
+        ParentToks := Live[ParentIdx].Tokens;
+        ParentLen := Length(ParentToks);
+        SetLength(NewLive[I].Tokens, ParentLen + 1);
+        if ParentLen > 0 then
+          Move(ParentToks[0], NewLive[I].Tokens[0], ParentLen * csIntegerSize);
+        NewLive[I].Tokens[ParentLen] := Cand[I].LastToken;
+        NewLive[I].SumLogProb := Cand[I].SumLogProb;
+        NewLive[I].Score := Cand[I].Score;
+        NewLive[I].Finished := False;
+      end;
+      Live := NewLive;
+      NewLive := nil;
     end;
 
     // Merge remaining live beams into the pool (MaxNewTokens/capacity hit).

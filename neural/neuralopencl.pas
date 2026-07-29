@@ -718,9 +718,6 @@ begin
 
       if (err <> CL_SUCCESS) then ErrorProc('Failed at WriteBuffer(input):' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 4, csLongintSize, @FActFun);
-      if (err <> CL_SUCCESS) then ErrorProc('Failed at clSetKernelArg 4:' + IntToStr(err));
-
       if err = CL_SUCCESS then
       begin
 

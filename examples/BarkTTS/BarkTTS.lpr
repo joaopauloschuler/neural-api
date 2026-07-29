@@ -109,9 +109,11 @@ begin
     // forward, take the argmax at the last position as the "next" token. ----
     SetLength(SemIds, SemSeqLen);
     for i := 0 to SemSeqLen - 1 do SemIds[i] := i mod Config.Semantic.InVocab;
-    Model.Semantic.ComputeLogits(SemIds, Logits);
+    // LastPosOnly: only the next-token row is read, so the lm_head is evaluated
+    // at the last position alone and Logits holds that single row.
+    Model.Semantic.ComputeLogits(SemIds, Logits, {LastPosOnly=}true);
     WriteLn('Stage 1 SEMANTIC: next-token argmax = ',
-      ArgMaxAt(Logits, SemSeqLen - 1, Config.Semantic.OutVocab));
+      ArgMaxAt(Logits, 0, Config.Semantic.OutVocab));
 
     // ---- Stage 2: COARSE. Feed the semantic ids (clamped to coarse vocab),
     // emit per-frame coarse codebook-0 codes via argmax. ----

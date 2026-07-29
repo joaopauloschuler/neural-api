@@ -138,6 +138,15 @@ type
   end;
   TNeuralTokenOffsetArray = array of TNeuralTokenOffset;
 
+  // One BPE merge-table entry for the pair hash: a pointer to the
+  // 'left'#1'right' key string owned by FMerges (its body is stable while the
+  // list is untouched), the key length, and the merge rank.
+  TNeuralHFMergeEntry = record
+    Key: PAnsiChar;
+    KeyLen: integer;
+    Rank: integer;
+  end;
+
   { TNeuralHFTokenizer }
   // Encoder/decoder for the HuggingFace tokenizer.json fast-tokenizer
   // format (byte-level BPE, metaspace/byte-fallback BPE and BERT
@@ -155,6 +164,13 @@ type
       // Built lazily (load-time cost only) and invalidated wherever
       // FAddedTokens is (re)written.
       FAddedIdToIndex: array of integer;
+      // First-byte gate for the added-token scan: true exactly for the bytes
+      // some added token starts with. Encode reads one array element per
+      // input byte instead of scanning every added token -- the Llama-3
+      // family carries 256+ reserved special tokens, so the scan is otherwise
+      // 256 iterations PER INPUT BYTE. Built with (and invalidated by the
+      // same flag as) FAddedIdToIndex.
+      FAddedFirstByte: array[byte] of boolean;
       FAddedIdIndexBuilt: boolean;
       // model flags
       FByteFallback, FFuseUnk, FIgnoreMerges: boolean;
@@ -226,6 +242,10 @@ type
       FDecStripLeft: integer;     // decoder Strip(' ', start, 0)
       // GPT-2 bytes<->unicode table
       FByteToCP: array[0..255] of cardinal;
+      // The same table already UTF-8 encoded: the byte-level alphabet symbol
+      // for each input byte. A lookup is a refcount copy, where
+      // CodePointToUTF8(FByteToCP[b]) allocated a fresh string per byte.
+      FByteToStr: array[0..255] of string;
       FCPToByte: array[0..$143] of integer;
       // SentencePiece '<0xNN>' byte-piece ids (or -1 if absent), indexed by
       // byte value 0..255. Built once per load (immutable vocab) so the unk
@@ -242,6 +262,21 @@ type
       // pair of the word being merged. Grown lazily and reused across words,
       // so the merge loop itself never allocates.
       FBPERanks: array of integer;
+      // Reusable symbol list for the per-word BPE merge loop. BPEWord mutates
+      // its symbol list, so this is cleared and refilled per word and is never
+      // live at two places at once -- every encode branch below fills it,
+      // BPEs it, and is done with it before the next word.
+      FSymbolBuf: TStringList;
+      // Open-addressed hash over FMerges, keyed on the SAME 'left'#1'right'
+      // byte sequence the sorted-list Find() matched -- but probed straight
+      // from the two symbols, so a rank lookup neither builds the temporary
+      // key string nor walks a 17-deep binary search. Slots hold the
+      // FMergeEntry index + 1; 0 is an empty slot.
+      FMergeEntry: array of TNeuralHFMergeEntry;
+      FMergeHash: array of integer;
+      FMergeHashMask: integer;
+      FMergeHashBuilt: boolean;
+      procedure BuildMergeHash();
       procedure DetectKeyMangling();
       function FixJSONKey(const Key: string): string;
       procedure BuildByteTable();
@@ -271,7 +306,8 @@ type
         IndividualDigits: boolean; Pieces: TStringList);
       procedure SplitFalconMappedPieces(const Segment: string;
         Pieces: TStringList);
-      function MapPieceToByteLevel(const Piece: string): TStringList;
+      procedure MapPieceToByteLevel(const Piece: string;
+        Symbols: TStringList);
       function FindAddedToken(const Text: string; Position: integer;
         out TokenIndex: integer): boolean;
       function IsAddedTokenId(Id: integer; out TokenIndex: integer): boolean;
@@ -560,6 +596,40 @@ begin
   else
     Result := Chr($F0 or (CP shr 18)) + Chr($80 or ((CP shr 12) and $3F)) +
       Chr($80 or ((CP shr 6) and $3F)) + Chr($80 or (CP and $3F));
+end;
+
+// Writes CP as UTF-8 into a preallocated buffer at the 0-based OutPos and
+// advances it. Same encoding as CodePointToUTF8, without that function's
+// per-codepoint string allocation.
+procedure HFWriteCodePointUTF8(P: PAnsiChar; var OutPos: integer;
+  CP: cardinal); inline;
+begin
+  if CP < $80 then
+  begin
+    P[OutPos] := Chr(CP);
+    Inc(OutPos);
+  end
+  else if CP < $800 then
+  begin
+    P[OutPos] := Chr($C0 or (CP shr 6));
+    P[OutPos + 1] := Chr($80 or (CP and $3F));
+    Inc(OutPos, 2);
+  end
+  else if CP < $10000 then
+  begin
+    P[OutPos] := Chr($E0 or (CP shr 12));
+    P[OutPos + 1] := Chr($80 or ((CP shr 6) and $3F));
+    P[OutPos + 2] := Chr($80 or (CP and $3F));
+    Inc(OutPos, 3);
+  end
+  else
+  begin
+    P[OutPos] := Chr($F0 or (CP shr 18));
+    P[OutPos + 1] := Chr($80 or ((CP shr 12) and $3F));
+    P[OutPos + 2] := Chr($80 or ((CP shr 6) and $3F));
+    P[OutPos + 3] := Chr($80 or (CP and $3F));
+    Inc(OutPos, 4);
+  end;
 end;
 
 { ---------------------------------------------------------------- }
@@ -1167,6 +1237,7 @@ begin
   FMerges.CaseSensitive := true;
   FMerges.UseLocale := false;
   FMerges.Duplicates := dupIgnore;
+  FSymbolBuf := TStringList.Create();
   FDropoutProb := 0.0;
   BuildByteTable();
   ClearState();
@@ -1174,6 +1245,7 @@ end;
 
 destructor TNeuralHFTokenizer.Destroy();
 begin
+  FSymbolBuf.Free;
   FMerges.Free;
   FVocab.Free;
   inherited Destroy();
@@ -1183,6 +1255,7 @@ procedure TNeuralHFTokenizer.ClearState();
 begin
   FVocab.Clear;
   FMerges.Clear;
+  FMergeHashBuilt := false;      // merge pair hash must be rebuilt
   SetLength(FIdToToken, 0);
   SetLength(FAddedTokens, 0);
   FAddedIdIndexBuilt := false;   // added-token id map must be rebuilt
@@ -1263,6 +1336,7 @@ begin
       Inc(Shifted);
     end;
     FByteToCP[B] := CP;
+    FByteToStr[B] := CodePointToUTF8(CP);
     FCPToByte[CP] := B;
   end;
 end;
@@ -1407,6 +1481,10 @@ var
 begin
   Result := Key;
   if (ShieldedKeys = nil) or (ShieldedKeys.Count = 0) then exit;
+  // Every placeholder HFShieldLongJSONKeys writes starts with the '~'-prefixed
+  // marker, so any other key -- i.e. essentially the whole vocab, one call per
+  // entry -- is rejected here without the Pos scan and Copy below.
+  if (Key = '') or (Key[1] <> '~') then exit;
   CntMax := ShieldedKeys.Count - 1;
   KeyLen := Length(Key);
   for Cnt := 0 to CntMax do
@@ -1455,6 +1533,36 @@ begin
   end;
 end;
 
+// Ends a bulk fill of one of the sorted lookup lists (FVocab / FMerges).
+//
+// Those lists are kept Sorted so Find() is a binary search, but inserting into
+// a sorted TStringList is O(n) per key (binary search + a memmove of the whole
+// tail), i.e. O(n^2) over a 150k-entry vocab. The load paths therefore fill
+// with Sorted=false (plain append) and call this once at the end: the
+// Sorted:=true assignment performs a single O(n log n) sort.
+//
+// Sorted+dupIgnore silently dropped a repeated key while TStrings.AddObject
+// still overwrote the payload, so the surviving entry carried the id/rank of
+// the LAST insertion; an unsorted append keeps both, so the duplicates have to
+// be collapsed here. Every caller adds ascending ids/ranks -- so keeping the
+// highest Objects value reproduces "last insertion wins" exactly -- except the
+// tokenizer.json BPE vocab object, whose ids come from the JSON; there a
+// collision needs two distinct JSON keys to coincide after unshielding, and
+// the highest id is then a deterministic choice.
+procedure HFEndBulkFill(L: TStringList);
+var
+  Cnt: integer;
+begin
+  L.Sorted := true;
+  for Cnt := L.Count - 1 downto 1 do
+    if L[Cnt] = L[Cnt - 1] then
+    begin
+      if PtrInt(L.Objects[Cnt]) > PtrInt(L.Objects[Cnt - 1]) then
+        L.Objects[Cnt - 1] := L.Objects[Cnt];
+      L.Delete(Cnt);
+    end;
+end;
+
 function TNeuralHFTokenizer.VocabFind(const Token: string): integer;
 var
   Idx: integer;
@@ -1464,13 +1572,92 @@ begin
   else Result := -1;
 end;
 
+// FNV-1a over a stored 'left'#1'right' merge key.
+function HFMergeKeyHash(P: PAnsiChar; Len: integer): cardinal;
+var
+  Cnt: integer;
+begin
+  {$PUSH}{$Q-}{$R-}
+  Result := 2166136261;
+  for Cnt := 0 to Len - 1 do
+    Result := (Result xor cardinal(byte(P[Cnt]))) * 16777619;
+  {$POP}
+end;
+
+// The same FNV-1a over the two symbols with the separator between them: the
+// hash of the concatenated key, computed WITHOUT concatenating.
+function HFMergePairHash(PA: PAnsiChar; LenA: integer;
+  PB: PAnsiChar; LenB: integer): cardinal;
+var
+  Cnt: integer;
+begin
+  {$PUSH}{$Q-}{$R-}
+  Result := 2166136261;
+  for Cnt := 0 to LenA - 1 do
+    Result := (Result xor cardinal(byte(PA[Cnt]))) * 16777619;
+  Result := (Result xor cardinal(byte(csMergeSep))) * 16777619;
+  for Cnt := 0 to LenB - 1 do
+    Result := (Result xor cardinal(byte(PB[Cnt]))) * 16777619;
+  {$POP}
+end;
+
+// Indexes the finished merge table for pair lookup. Runs once per load, from
+// the first MergeRank call; every FMerges fill site invalidates it.
+procedure TNeuralHFTokenizer.BuildMergeHash();
+var
+  Cnt, MergesCnt, MergesCntM1, Cap, Slot: integer;
+  Key: string;
+begin
+  MergesCnt := FMerges.Count;
+  SetLength(FMergeEntry, MergesCnt);
+  Cap := 16;
+  while Cap < MergesCnt * 2 do Cap := Cap shl 1;
+  SetLength(FMergeHash, Cap);
+  FillDWord(FMergeHash[0], Cap, 0);
+  FMergeHashMask := Cap - 1;
+  MergesCntM1 := MergesCnt - 1;
+  for Cnt := 0 to MergesCntM1 do
+  begin
+    Key := FMerges[Cnt];
+    FMergeEntry[Cnt].Key := PAnsiChar(Key);
+    FMergeEntry[Cnt].KeyLen := Length(Key);
+    FMergeEntry[Cnt].Rank := integer(PtrInt(FMerges.Objects[Cnt]));
+    Slot := integer(HFMergeKeyHash(PAnsiChar(Key), Length(Key))) and
+      FMergeHashMask;
+    while FMergeHash[Slot] <> 0 do Slot := (Slot + 1) and FMergeHashMask;
+    FMergeHash[Slot] := Cnt + 1;
+  end;
+  FMergeHashBuilt := true;
+end;
+
 function TNeuralHFTokenizer.MergeRank(const A, B: string): integer;
 var
-  Idx: integer;
+  Slot, Idx, LenA, LenB, KeyLen: integer;
+  PA, PB, PKey: PAnsiChar;
 begin
-  if FMerges.Find(A + csMergeSep + B, Idx)
-  then Result := integer(PtrInt(FMerges.Objects[Idx]))
-  else Result := High(integer);
+  if not FMergeHashBuilt then BuildMergeHash();
+  PA := PAnsiChar(A);
+  PB := PAnsiChar(B);
+  LenA := Length(A);
+  LenB := Length(B);
+  KeyLen := LenA + 1 + LenB;
+  Slot := integer(HFMergePairHash(PA, LenA, PB, LenB)) and FMergeHashMask;
+  while true do
+  begin
+    Idx := FMergeHash[Slot] - 1;
+    if Idx < 0 then exit(High(integer));
+    if FMergeEntry[Idx].KeyLen = KeyLen then
+    begin
+      PKey := FMergeEntry[Idx].Key;
+      // Compares the three parts in place, so a symbol that itself contains
+      // the separator byte matches exactly what the concatenated key did.
+      if (PKey[LenA] = csMergeSep) and
+        (CompareByte(PA^, PKey^, LenA) = 0) and
+        (CompareByte(PB^, PKey[LenA + 1], LenB) = 0) then
+        exit(FMergeEntry[Idx].Rank);
+    end;
+    Slot := (Slot + 1) and FMergeHashMask;
+  end;
 end;
 
 procedure TNeuralHFTokenizer.LoadFromFile(const FileName: string);
@@ -1875,6 +2062,7 @@ begin
       FUniMinScore := 0;
       FUniMaxPieceChars := 1;
       VocabCntM1 := VocabCnt - 1;
+      FVocab.Sorted := false;
       for Cnt := 0 to VocabCntM1 do
       begin
         SubArr := TJSONArray(VocabArr.Items[Cnt]);
@@ -1887,6 +2075,7 @@ begin
         UniCPLen := CodePointCount(Content);
         if UniCPLen > FUniMaxPieceChars then FUniMaxPieceChars := UniCPLen;
       end;
+      HFEndBulkFill(FVocab);
       // unk_id is an INDEX into the vocab array (not a token string).
       Node := ModelObj.Find('unk_id');
       if (Node <> nil) and not Node.IsNull then FUnkId := Node.AsInteger;
@@ -1900,6 +2089,7 @@ begin
       for Cnt := 0 to VocabObjCntM1 do
         MaxId := Max(MaxId, VocabObj.Items[Cnt].AsInteger);
       SetLength(FIdToToken, MaxId + 1);
+      FVocab.Sorted := false;
       for Cnt := 0 to VocabObjCntM1 do
       begin
         TokenId := VocabObj.Items[Cnt].AsInteger;
@@ -1914,6 +2104,7 @@ begin
         FVocab.AddObject(Content, TObject(PtrInt(TokenId)));
         FIdToToken[TokenId] := Content;
       end;
+      HFEndBulkFill(FVocab);
     end;
 
     // merges: ["a b", ...] (old) or [["a","b"], ...] (new).
@@ -1925,6 +2116,7 @@ begin
     if MergesArr <> nil then
     begin
     MergesCnt := MergesArr.Count - 1;
+    FMerges.Sorted := false;
     for Cnt := 0 to MergesCnt do
     begin
       Node := MergesArr.Items[Cnt];
@@ -1943,6 +2135,8 @@ begin
       end;
       FMerges.AddObject(Left + csMergeSep + Right, TObject(PtrInt(Cnt)));
     end;
+    HFEndBulkFill(FMerges);
+    FMergeHashBuilt := false;   // merge pair hash must be rebuilt
     end;
 
     // unk token
@@ -2003,6 +2197,89 @@ begin
   end;
 end;
 
+type
+  TMergeCand = record
+    Left, Right: string;
+    LeftId, RightId, PieceId, LenL, LenR, Seq: integer;
+  end;
+  TMergeCandArray = array of TMergeCand;
+
+// True when A sorts strictly before B under (PieceId, LenL, LenR, Seq).
+function MergeCandBefore(const A, B: TMergeCand): boolean; inline;
+begin
+  if A.PieceId <> B.PieceId then exit(A.PieceId < B.PieceId);
+  if A.LenL <> B.LenL then exit(A.LenL < B.LenL);
+  if A.LenR <> B.LenR then exit(A.LenR < B.LenR);
+  Result := A.Seq < B.Seq;
+end;
+
+// Median-of-three quicksort over the index permutation Order, ordering by
+// MergeCandBefore. Recursion is on the smaller partition only, so the stack
+// depth stays O(log n).
+procedure SortMergeCandOrder(const Cands: TMergeCandArray;
+  var Order: array of integer; ALo, AHi: integer);
+var
+  Lo, Hi, I, J, Mid, PivotIdx, Swap: integer;
+begin
+  Lo := ALo;
+  Hi := AHi;
+  while Lo < Hi do
+  begin
+    if Hi - Lo < 12 then
+    begin
+      // small run: insertion sort
+      for I := Lo + 1 to Hi do
+      begin
+        Swap := Order[I];
+        J := I - 1;
+        while (J >= Lo) and MergeCandBefore(Cands[Swap], Cands[Order[J]]) do
+        begin
+          Order[J + 1] := Order[J];
+          Dec(J);
+        end;
+        Order[J + 1] := Swap;
+      end;
+      exit;
+    end;
+    Mid := Lo + (Hi - Lo) div 2;
+    if MergeCandBefore(Cands[Order[Mid]], Cands[Order[Lo]]) then
+    begin
+      Swap := Order[Mid]; Order[Mid] := Order[Lo]; Order[Lo] := Swap;
+    end;
+    if MergeCandBefore(Cands[Order[Hi]], Cands[Order[Lo]]) then
+    begin
+      Swap := Order[Hi]; Order[Hi] := Order[Lo]; Order[Lo] := Swap;
+    end;
+    if MergeCandBefore(Cands[Order[Hi]], Cands[Order[Mid]]) then
+    begin
+      Swap := Order[Hi]; Order[Hi] := Order[Mid]; Order[Mid] := Swap;
+    end;
+    PivotIdx := Order[Mid];
+    I := Lo;
+    J := Hi;
+    repeat
+      while MergeCandBefore(Cands[Order[I]], Cands[PivotIdx]) do Inc(I);
+      while MergeCandBefore(Cands[PivotIdx], Cands[Order[J]]) do Dec(J);
+      if I <= J then
+      begin
+        Swap := Order[I]; Order[I] := Order[J]; Order[J] := Swap;
+        Inc(I);
+        Dec(J);
+      end;
+    until I > J;
+    if J - Lo < Hi - I then
+    begin
+      if Lo < J then SortMergeCandOrder(Cands, Order, Lo, J);
+      Lo := I;
+    end
+    else
+    begin
+      if I < Hi then SortMergeCandOrder(Cands, Order, I, Hi);
+      Hi := J;
+    end;
+  end;
+end;
+
 // Reconstructs the byte-level-BPE merge table (FMerges) from a BPE
 // SentencePiece ModelProto's scored pieces. A BPE .model carries NO explicit
 // merge list, so we derive it byte-for-byte the way HuggingFace's
@@ -2025,21 +2302,18 @@ end;
 // non-ASCII byte-fallback path; no approximation.
 procedure TNeuralHFTokenizer.ReconstructBPEMerges(
   const PieceTextV: array of string; APieceCount: integer);
-type
-  TMergeCand = record
-    Left, Right: string;
-    LeftId, RightId, PieceId, LenL, LenR, Seq: integer;
-  end;
 var
-  Cands: array of TMergeCand;
+  Cands: TMergeCandArray;
+  Order: array of integer;      // permutation produced by the final sort
   Boundaries: array of integer; // 1-based byte offsets of codepoint starts
   NumCP, Pos, CnPiece, SplitI, ByteSplit, LId, RId, NLocal, I, J, Seq: integer;
   L, R, Piece: string;
   Tmp: TMergeCand;
-  LocalStart: integer;
+  LocalStart, NCand: integer;
   APieceCountM1, NumCPM1, CandsHi: integer;
 begin
   Seq := 0;
+  NCand := 0;
   SetLength(Cands, 0);
   APieceCountM1 := APieceCount - 1;
   for CnPiece := 0 to APieceCountM1 do
@@ -2058,7 +2332,7 @@ begin
     end;
     Boundaries[NumCP] := Pos;
     if NumCP < 2 then continue;  // single codepoint -> no split
-    LocalStart := Length(Cands);
+    LocalStart := NCand;
     // Each codepoint split (1..NumCP-1) where both halves are in the vocab.
     NumCPM1 := NumCP - 1;
     for SplitI := 1 to NumCPM1 do
@@ -2070,8 +2344,10 @@ begin
       if LId < 0 then continue;
       RId := VocabFind(R);
       if RId < 0 then continue;
-      SetLength(Cands, Length(Cands) + 1);
-      with Cands[High(Cands)] do
+      // amortized growth: appending one slot at a time reallocates per merge
+      if NCand = Length(Cands) then
+        SetLength(Cands, 1024 + Length(Cands) * 2);
+      with Cands[NCand] do
       begin
         Left := L; Right := R;
         LeftId := LId; RightId := RId;
@@ -2080,10 +2356,11 @@ begin
         LenR := NumCP - SplitI;    // codepoint length of R
         Seq := 0;                  // filled after local sort
       end;
+      Inc(NCand);
     end;
     // local sort by (LeftId, RightId) -- insertion sort over this piece's run.
-    NLocal := Length(Cands) - LocalStart;
-    CandsHi := High(Cands);
+    NLocal := NCand - LocalStart;
+    CandsHi := NCand - 1;
     for I := LocalStart + 1 to CandsHi do
     begin
       Tmp := Cands[I];
@@ -2101,34 +2378,29 @@ begin
     if NLocal = 0 then ;  // silence unused-warning path
   end;
 
-  // Stamp the append/sequence order (after all local sorts) so the final
-  // sort can keep ties stable (Python's sort is stable).
-  CandsHi := High(Cands);
+  // Stamp the append/sequence order (after all local sorts) -- this is the
+  // tie-break that reproduces Python's stable sort.
+  CandsHi := NCand - 1;
   for I := 0 to CandsHi do Cands[I].Seq := I;
 
-  // Final stable sort by (PieceId, LenL, LenR, Seq) ascending -> merge rank.
-  for I := 1 to CandsHi do
-  begin
-    Tmp := Cands[I];
-    J := I - 1;
-    while (J >= 0) and
-      ((Cands[J].PieceId > Tmp.PieceId) or
-       ((Cands[J].PieceId = Tmp.PieceId) and (Cands[J].LenL > Tmp.LenL)) or
-       ((Cands[J].PieceId = Tmp.PieceId) and (Cands[J].LenL = Tmp.LenL) and
-        (Cands[J].LenR > Tmp.LenR)) or
-       ((Cands[J].PieceId = Tmp.PieceId) and (Cands[J].LenL = Tmp.LenL) and
-        (Cands[J].LenR = Tmp.LenR) and (Cands[J].Seq > Tmp.Seq))) do
-    begin
-      Cands[J + 1] := Cands[J];
-      Dec(J);
-    end;
-    Cands[J + 1] := Tmp;
-  end;
+  // Final sort by (PieceId, LenL, LenR, Seq) ascending -> merge rank. Seq is
+  // the candidate's unique append index, so the key is a TOTAL order: no two
+  // candidates compare equal and the sort needs no stability of its own. Only
+  // the permutation is sorted; the record array stays put.
+  SetLength(Order, NCand);
+  for I := 0 to CandsHi do Order[I] := I;
+  SortMergeCandOrder(Cands, Order, 0, CandsHi);
 
   // Position in the final list IS the rank (lower rank = applied first).
+  FMerges.Sorted := false;
   for I := 0 to CandsHi do
-    FMerges.AddObject(Cands[I].Left + csMergeSep + Cands[I].Right,
+  begin
+    J := Order[I];
+    FMerges.AddObject(Cands[J].Left + csMergeSep + Cands[J].Right,
       TObject(PtrInt(I)));
+  end;
+  HFEndBulkFill(FMerges);
+  FMergeHashBuilt := false;   // merge pair hash must be rebuilt
 end;
 
 { ---------------------------------------------------------------- }
@@ -2363,6 +2635,7 @@ begin
   FUniMaxPieceChars := 1;
   FByteFallback := false;
   PieceCountM1 := PieceCount - 1;
+  FVocab.Sorted := false;
   for Cnt := 0 to PieceCountM1 do
   begin
     FVocab.AddObject(PieceTextV[Cnt], TObject(PtrInt(Cnt)));
@@ -2378,6 +2651,7 @@ begin
     // pieces reassembles the original multi-byte UTF-8 sequence.
     if PieceTypeV[Cnt] = 6 then FByteFallback := true;
   end;
+  HFEndBulkFill(FVocab);
 
   // model_type=BPE: the ModelProto stores ONLY scored pieces -- no explicit
   // merge list (unlike a tokenizer.json BPE model). Reconstruct the merges
@@ -2477,6 +2751,7 @@ begin
     // ---- vocab (the 0-based array index IS the id) ----
     SetLength(FIdToToken, TokCount);
     FUniMaxPieceChars := 1;
+    FVocab.Sorted := false;
     for Cnt := 0 to TokCountM1 do
     begin
       Content := Reader.GetMetaArrayString('tokenizer.ggml.tokens', Cnt);
@@ -2485,6 +2760,7 @@ begin
       UniCPLen := CodePointCount(Content);
       if UniCPLen > FUniMaxPieceChars then FUniMaxPieceChars := UniCPLen;
     end;
+    HFEndBulkFill(FVocab);
 
     // ---- special-token ids (authoritative scalar metadata) ----
     MetaBos := Reader.GetMetaInt('tokenizer.ggml.bos_token_id', -1);
@@ -2550,6 +2826,7 @@ begin
       FSplitDigitsMax := 3;
       MergeCount := Reader.GetMetaArrayCount('tokenizer.ggml.merges');
       MergeCountM1 := MergeCount - 1;
+      FMerges.Sorted := false;
       for Cnt := 0 to MergeCountM1 do
       begin
         MergeStr := Reader.GetMetaArrayString('tokenizer.ggml.merges', Cnt);
@@ -2559,6 +2836,8 @@ begin
         Right := Copy(MergeStr, SpacePos + 1, Length(MergeStr));
         FMerges.AddObject(Left + csMergeSep + Right, TObject(PtrInt(Cnt)));
       end;
+      HFEndBulkFill(FMerges);
+      FMergeHashBuilt := false;   // merge pair hash must be rebuilt
 
       // Expose CONTROL / USER_DEFINED pieces as added special tokens so they
       // round-trip verbatim (e.g. <|endoftext|>); fall back to id-based
@@ -2721,14 +3000,22 @@ begin
   end;
 end;
 
-// Builds the id -> FAddedTokens index map. First match wins, matching the
-// linear scan this replaces. Load-time only: never called from a decode loop
-// after the first lookup (rule #17).
+// Builds the id -> FAddedTokens index map and the first-byte gate. First
+// match wins, matching the linear scan this replaces. Load-time only: never
+// called from a decode loop after the first lookup (rule #17).
 procedure TNeuralHFTokenizer.BuildAddedIdIndex();
 var
   Cnt, AddedHi, MaxId, TokId, MapHi: integer;
+  Content: string;
 begin
   AddedHi := High(FAddedTokens);
+  FillChar(FAddedFirstByte, SizeOf(FAddedFirstByte), 0);
+  for Cnt := 0 to AddedHi do
+  begin
+    // An empty added token can never match, so it must not open the gate.
+    Content := FAddedTokens[Cnt].Content;
+    if Content <> '' then FAddedFirstByte[byte(Content[1])] := true;
+  end;
   MaxId := -1;
   for Cnt := 0 to AddedHi do
     if FAddedTokens[Cnt].Id > MaxId then MaxId := FAddedTokens[Cnt].Id;
@@ -3017,19 +3304,29 @@ var
   procedure EmitRun(const Run: string);
   var
     Cnt, SubCnt, ByteCnt, SubLen, SubPiecesM1, DigitRunsM1: integer;
-    Mapped, Piece: string;
+    MapPos, EncLen: integer;
+    Mapped, Piece, Encoded: string;
   begin
     SubPieces.Clear;
     ByteLevelPieces(Run, SubPieces);
     SubPiecesM1 := SubPieces.Count - 1;
     for Cnt := 0 to SubPiecesM1 do
     begin
-      Mapped := '';
       Piece := SubPieces[Cnt];
       SubLen := Length(Piece);
+      // #23: one SetLength to a justified bound plus a carried write index.
+      // Every byte-level alphabet codepoint is <= $143, so it encodes to at
+      // most 2 UTF-8 bytes and 2 * SubLen bounds the mapped text.
+      SetLength(Mapped, SubLen * 2);
+      MapPos := 0;
       for ByteCnt := 1 to SubLen do
-        Mapped := Mapped +
-          CodePointToUTF8(FByteToCP[Ord(Piece[ByteCnt])]);
+      begin
+        Encoded := FByteToStr[Ord(Piece[ByteCnt])];
+        EncLen := Length(Encoded);
+        Move(Encoded[1], Mapped[MapPos + 1], EncLen);
+        Inc(MapPos, EncLen);
+      end;
+      SetLength(Mapped, MapPos);
       DigitRuns.Clear;
       SplitDigitsPieces(Mapped, false, DigitRuns);
       DigitRunsM1 := DigitRuns.Count - 1;
@@ -3606,24 +3903,23 @@ begin
   end;
 end;
 
-// Maps a raw piece to its byte-level alphabet symbols (one mapped
-// codepoint per input byte). Caller frees the result.
-function TNeuralHFTokenizer.MapPieceToByteLevel(
-  const Piece: string): TStringList;
+// Fills Symbols with the byte-level alphabet symbols of a raw piece (one
+// mapped codepoint per input byte).
+procedure TNeuralHFTokenizer.MapPieceToByteLevel(const Piece: string;
+  Symbols: TStringList);
 var
   Cnt, PieceLen: integer;
 begin
-  Result := TStringList.Create();
+  Symbols.Clear;
   PieceLen := Length(Piece);
   for Cnt := 1 to PieceLen do
-    Result.Add(CodePointToUTF8(FByteToCP[Ord(Piece[Cnt])]));
+    Symbols.Add(FByteToStr[Ord(Piece[Cnt])]);
 end;
 
 procedure TNeuralHFTokenizer.EmitTokenOrFallback(const Symbol: string;
   Ids: TIntegerList);
 var
   TokenId, Cnt, SymbolLen, StartCount: integer;
-  ByteToken: string;
 begin
   TokenId := VocabFind(Symbol);
   if TokenId >= 0 then
@@ -3633,16 +3929,19 @@ begin
   end;
   if FByteFallback then
   begin
+    // Byte-piece id table is built once per load (immutable vocab), so a
+    // fallback byte is an array read instead of a '<0xNN>' string build plus
+    // a 151k-entry binary search.
+    if not FBytePieceTableBuilt then BuildBytePieceTable();
     SymbolLen := Length(Symbol);
-    // #4: single pass with rollback -> VocabFind once per byte instead of
-    // twice. Emit each byte token as it is found; if any is missing, restore
-    // Ids to its entry length and fall back to <unk> (unchanged semantics:
-    // no partial byte run is ever left behind).
+    // #4: single pass with rollback -> one lookup per byte instead of two.
+    // Emit each byte token as it is found; if any is missing, restore Ids to
+    // its entry length and fall back to <unk> (unchanged semantics: no
+    // partial byte run is ever left behind).
     StartCount := Ids.Count;
     for Cnt := 1 to SymbolLen do
     begin
-      ByteToken := '<0x' + IntToHex(Ord(Symbol[Cnt]), 2) + '>';
-      TokenId := VocabFind(ByteToken);
+      TokenId := FBytePieceId[Ord(Symbol[Cnt])];
       if TokenId < 0 then
       begin
         Ids.Count := StartCount;
@@ -3934,12 +4233,20 @@ end;
 // \t\n\r to spaces; handle_chinese_chars pads CJK ideographs with spaces.
 function TNeuralHFTokenizer.BertNormalize(const Segment: string): string;
 var
-  Position, SegLen: integer;
+  Position, SegLen, OutPos: integer;
   CP, Base: cardinal;
+  PBuf: PAnsiChar;
 begin
-  Result := '';
-  Position := 1;
   SegLen := Length(Segment);
+  // #23: one SetLength to a justified bound, a carried write index, one final
+  // truncate. Only handle_chinese_chars lengthens the text -- it wraps a CJK
+  // ideograph (3 or 4 UTF-8 bytes) in two spaces -- and neither accent
+  // stripping nor lowercasing ever grows a codepoint's encoding, so 2 * SegLen
+  // bounds the output.
+  SetLength(Result, SegLen * 2);
+  PBuf := PAnsiChar(Result);
+  OutPos := 0;
+  Position := 1;
   while Position <= SegLen do
   begin
     CP := NextCodePoint(Segment, Position);
@@ -3951,7 +4258,11 @@ begin
     end;
     if FBertHandleChinese and IsCJKIdeographCP(CP) then
     begin
-      Result := Result + ' ' + CodePointToUTF8(CP) + ' ';
+      PBuf[OutPos] := ' ';
+      Inc(OutPos);
+      HFWriteCodePointUTF8(PBuf, OutPos, CP);
+      PBuf[OutPos] := ' ';
+      Inc(OutPos);
       continue;
     end;
     if FBertStripAccents then
@@ -3961,8 +4272,9 @@ begin
       if Base <> 0 then CP := Base;
     end;
     if FBertLowercase then CP := LowercaseCP(CP);
-    Result := Result + CodePointToUTF8(CP);
+    HFWriteCodePointUTF8(PBuf, OutPos, CP);
   end;
+  SetLength(Result, OutPos);
 end;
 
 // BertPreTokenizer: split on whitespace, then isolate every punctuation
@@ -3970,11 +4282,13 @@ end;
 procedure TNeuralHFTokenizer.BertPieces(const Segment: string;
   Pieces: TStringList);
 var
-  Position, RunStart, SegLen: integer;
+  Position, RunStart, RunFrom, SegLen: integer;
   CP: cardinal;
-  Current: string;
 begin
-  Current := '';
+  // #23: a word is a CONTIGUOUS run of Segment, so it is sliced with one Copy
+  // when it ends instead of being accumulated codepoint by codepoint.
+  // RunFrom = 0 means no run is open.
+  RunFrom := 0;
   Position := 1;
   SegLen := Length(Segment);
   while Position <= SegLen do
@@ -3983,19 +4297,21 @@ begin
     CP := NextCodePoint(Segment, Position);
     if IsWhitespaceCP(CP) then
     begin
-      if Current <> '' then Pieces.Add(Current);
-      Current := '';
+      if RunFrom > 0 then
+        Pieces.Add(Copy(Segment, RunFrom, RunStart - RunFrom));
+      RunFrom := 0;
     end
     else if IsBertPunctuationCP(CP) then
     begin
-      if Current <> '' then Pieces.Add(Current);
-      Current := '';
+      if RunFrom > 0 then
+        Pieces.Add(Copy(Segment, RunFrom, RunStart - RunFrom));
+      RunFrom := 0;
       Pieces.Add(Copy(Segment, RunStart, Position - RunStart));
     end
-    else
-      Current := Current + Copy(Segment, RunStart, Position - RunStart);
+    else if RunFrom = 0 then
+      RunFrom := RunStart;
   end;
-  if Current <> '' then Pieces.Add(Current);
+  if RunFrom > 0 then Pieces.Add(Copy(Segment, RunFrom, Position - RunFrom));
 end;
 
 // Greedy longest-match-first WordPiece over one pre-tokenized word:
@@ -4068,7 +4384,7 @@ end;
 procedure TNeuralHFTokenizer.EncodeSegment(const Segment: string;
   Ids: TIntegerList; IsFirstSegment: boolean);
 var
-  Pieces, Symbols, DigitPieces: TStringList;
+  Pieces, DigitPieces: TStringList;
   Cnt, Position, RunStart, PieceStart, PiecesCnt, NormReplaceHi: integer;
   PieceLen: integer;
   MSLen, NormLen: integer;
@@ -4078,7 +4394,6 @@ var
   // BPEs Normalized[PieceFrom..PieceTo] (1-based bytes) over codepoints.
   procedure BPECodePoints(PieceFrom, PieceTo: integer);
   var
-    CPSyms: TStringList;
     BytePos, CPStart: integer;
   begin
     if FUnigram then
@@ -4086,19 +4401,15 @@ var
       UnigramWord(Copy(Normalized, PieceFrom, PieceTo - PieceFrom + 1), Ids);
       exit;
     end;
-    CPSyms := TStringList.Create();
-    try
-      BytePos := PieceFrom;
-      while BytePos <= PieceTo do
-      begin
-        CPStart := BytePos;
-        NextCodePoint(Normalized, BytePos);
-        CPSyms.Add(Copy(Normalized, CPStart, BytePos - CPStart));
-      end;
-      BPEWord(CPSyms, Ids);
-    finally
-      CPSyms.Free;
+    FSymbolBuf.Clear;
+    BytePos := PieceFrom;
+    while BytePos <= PieceTo do
+    begin
+      CPStart := BytePos;
+      NextCodePoint(Normalized, BytePos);
+      FSymbolBuf.Add(Copy(Normalized, CPStart, BytePos - CPStart));
     end;
+    BPEWord(FSymbolBuf, Ids);
   end;
 
 begin
@@ -4139,12 +4450,8 @@ begin
       PiecesCnt := Pieces.Count - 1;
       for Cnt := 0 to PiecesCnt do
       begin
-        Symbols := MapPieceToByteLevel(Pieces[Cnt]);
-        try
-          BPEWord(Symbols, Ids);
-        finally
-          Symbols.Free;
-        end;
+        MapPieceToByteLevel(Pieces[Cnt], FSymbolBuf);
+        BPEWord(FSymbolBuf, Ids);
       end;
     finally
       Pieces.Free;
@@ -4161,12 +4468,8 @@ begin
       PiecesCnt := Pieces.Count - 1;
       for Cnt := 0 to PiecesCnt do
       begin
-        Symbols := MapPieceToByteLevel(Pieces[Cnt]);
-        try
-          BPEWord(Symbols, Ids);
-        finally
-          Symbols.Free;
-        end;
+        MapPieceToByteLevel(Pieces[Cnt], FSymbolBuf);
+        BPEWord(FSymbolBuf, Ids);
       end;
     finally
       Pieces.Free;
@@ -4183,21 +4486,17 @@ begin
       PiecesCnt := Pieces.Count - 1;
       for Cnt := 0 to PiecesCnt do
       begin
-        Symbols := TStringList.Create();
-        try
-          Piece := Pieces[Cnt];
-          PieceLen := Length(Piece);
-          Position := 1;
-          while Position <= PieceLen do
-          begin
-            RunStart := Position;
-            NextCodePoint(Piece, Position);
-            Symbols.Add(Copy(Piece, RunStart, Position - RunStart));
-          end;
-          BPEWord(Symbols, Ids);
-        finally
-          Symbols.Free;
+        FSymbolBuf.Clear;
+        Piece := Pieces[Cnt];
+        PieceLen := Length(Piece);
+        Position := 1;
+        while Position <= PieceLen do
+        begin
+          RunStart := Position;
+          NextCodePoint(Piece, Position);
+          FSymbolBuf.Add(Copy(Piece, RunStart, Position - RunStart));
         end;
+        BPEWord(FSymbolBuf, Ids);
       end;
     finally
       Pieces.Free;
@@ -4214,12 +4513,8 @@ begin
       PiecesCnt := Pieces.Count - 1;
       for Cnt := 0 to PiecesCnt do
       begin
-        Symbols := MapPieceToByteLevel(Pieces[Cnt]);
-        try
-          BPEWord(Symbols, Ids);
-        finally
-          Symbols.Free;
-        end;
+        MapPieceToByteLevel(Pieces[Cnt], FSymbolBuf);
+        BPEWord(FSymbolBuf, Ids);
       end;
     finally
       Pieces.Free;
@@ -4267,12 +4562,8 @@ begin
       PiecesCnt := Pieces.Count - 1;
       for Cnt := 0 to PiecesCnt do
       begin
-        Symbols := MapPieceToByteLevel(Pieces[Cnt]);
-        try
-          BPEWord(Symbols, Ids);
-        finally
-          Symbols.Free;
-        end;
+        MapPieceToByteLevel(Pieces[Cnt], FSymbolBuf);
+        BPEWord(FSymbolBuf, Ids);
       end;
     finally
       Pieces.Free;
@@ -4343,9 +4634,13 @@ begin
   Position := 1;
   SegStart := 1;
   TextLen := Length(Text); // #2/#5: Text is const, not mutated in loop
+  if not FAddedIdIndexBuilt then BuildAddedIdIndex();
   while Position <= TextLen do
   begin
-    if FindAddedToken(Text, Position, TokenIndex) then
+    // The gate is exact: FindAddedToken only ever matches a token whose first
+    // byte equals Text[Position], so a closed gate cannot hide a match.
+    if FAddedFirstByte[byte(Text[Position])] and
+      FindAddedToken(Text, Position, TokenIndex) then
     begin
       if Position > SegStart then
         EncodeSegment(Copy(Text, SegStart, Position - SegStart), Ids,
@@ -4737,7 +5032,7 @@ begin
     OutPos := 0;
     for Cnt := 1 to FragmentLen do
     begin
-      Encoded := CodePointToUTF8(FByteToCP[Ord(Fragment[Cnt])]);
+      Encoded := FByteToStr[Ord(Fragment[Cnt])];
       EncLen := Length(Encoded);
       for ByteCnt := 1 to EncLen do
       begin

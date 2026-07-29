@@ -116,7 +116,7 @@ draws uniformly. `--greedy` hard-overrides everything.
 | `--presence-penalty X` | presence penalty | 0 (off) |
 | `--max-new-tokens N` | reply length cap | 8192 |
 | `--seed N` | RNG seed (reproducible sampling) | randomize |
-| `--ctx N` | context window to build (`pSeqLen`) — KV-cache memory grows ~O(ctx) | model max, capped at 2048 (the startup banner says so; raise explicitly with `--ctx`) |
+| `--ctx N` | context window to build (`pSeqLen`) — KV-cache memory grows ~O(ctx), and the cache is allocated in full when the session opens | model max, capped at 32768 (the startup banner says so; go past the cap, or below it to save RAM, with `--ctx`) |
 | `--format NAME` | `chatml`/`llama2`/`llama3`/`zephyr`/`gemma`/`phi3`/`mistral` override, or `raw` (see below) | autodetect |
 | `--system "msg"` | initial system prompt | none |
 | `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — less RAM **and** faster than fp32 on both CPU (fused AVX2 int8 kernels) and GPU: the quantized codes stay resident on the device (see below) | **on** |

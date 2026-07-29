@@ -26,6 +26,13 @@ type
     procedure TestVolumeMinMaxClassParity;
     procedure TestVolumeExpShiftSumParity;
     procedure TestVolumeAddScalarParity;
+    procedure TestVolumeSumSqrCenteredParity;
+    procedure TestVolumeReluGateMaskParity;
+    procedure TestVolumeLeakyReluParity;
+    procedure TestVolumeMaxPosParity;
+    procedure TestVolumeAddSubValueParity;
+    procedure TestVolumeRankOneUpdateRowParity;
+    procedure TestVolumeAdamDeltaParity;
     procedure TestVolumeFlip;
     procedure TestVolumeClassification;
     procedure TestVolumeSoftMax;
@@ -436,6 +443,480 @@ begin
   Buf[0] := 5.0;
   TNNetVolume.AddScalar(TNeuralFloatArrPtr(@Buf[0]), 1.0, 0);
   AssertEquals('empty run', 5.0, Buf[0], 0.0);
+end;
+
+procedure TTestNeuralVolume.TestVolumeSumSqrCenteredParity;
+// SumSqrCentered is a 16-wide FMA reduction on an AVX2/64-bit build and a plain
+// loop everywhere else. The two differ only in summation ORDER and every term
+// is non-negative, so they cannot disagree by more than accumulated rounding --
+// checked here against a DOUBLE-precision reference, which also pins down that
+// the result really is the exact centered sum of squares. Sizes straddle the
+// 16-element block width and its tail, and the csMinAvxSize dispatch threshold.
+const
+  Sizes: array[0..11] of integer = (1, 7, 8, 15, 16, 17, 31, 32, 33, 64, 97, 1000);
+var
+  Buf: array of TNeuralFloat;
+  Ref: double;
+  Got, Mean: TNeuralFloat;
+  SI, K, N: integer;
+begin
+  RandSeed := 271828;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    SetLength(Buf, N);
+    Mean := 0;
+    for K := 0 to N - 1 do
+    begin
+      Buf[K] := (Random - 0.5) * 8;
+      Mean := Mean + Buf[K];
+    end;
+    Mean := Mean / N;
+    Ref := 0;
+    for K := 0 to N - 1 do
+      Ref := Ref + double(Buf[K] - Mean) * double(Buf[K] - Mean);
+    Got := TNNetVolume.SumSqrCentered(TNeuralFloatArrPtr(@Buf[0]), Mean, N);
+    AssertEquals('SumSqrCentered (N=' + IntToStr(N) + ')', Ref, Got, 1e-3);
+  end;
+
+  // The whole point of the centered form: with |Mean| >> Std the algebraic
+  // shortcut sum(x^2) - N*Mean^2 cancels away every significant digit, while
+  // the centered kernel stays accurate. 1e6 +/- 1 has variance 1.
+  N := 512;
+  SetLength(Buf, N);
+  for K := 0 to N - 1 do
+    if K mod 2 = 0 then Buf[K] := 1e6 + 1 else Buf[K] := 1e6 - 1;
+  Got := TNNetVolume.SumSqrCentered(TNeuralFloatArrPtr(@Buf[0]), 1e6, N);
+  AssertEquals('SumSqrCentered on a large-offset run', N * 1.0, Got, 1e-2);
+
+  // A zero-length run has no terms.
+  AssertEquals('empty run', 0.0,
+    TNNetVolume.SumSqrCentered(TNeuralFloatArrPtr(@Buf[0]), 1.0, 0), 0.0);
+end;
+
+procedure TTestNeuralVolume.TestVolumeReluGateMaskParity;
+// ReluGateMask is AVXReluGateMask on an AVX2/64-bit build and a scalar loop
+// everywhere else. The output is only ever 1.0 or 0.0, so both paths must agree
+// BIT-exactly -- including at the boundary, where the contract is >= 0 (so +0.0
+// and -0.0 both gate open) and NaN gates shut. Sizes straddle the 8-element
+// block width and its tail.
+const
+  Sizes: array[0..10] of integer = (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 1000);
+var
+  Src, Dst, Ref: array of TNeuralFloat;
+  SI, K, N: integer;
+begin
+  RandSeed := 271828;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    SetLength(Src, N);
+    SetLength(Dst, N);
+    SetLength(Ref, N);
+    for K := 0 to N - 1 do
+    begin
+      case K mod 7 of
+        0: Src[K] := 0.0;
+        1: Src[K] := -0.0;
+        2: Src[K] := -1e-30;
+        3: Src[K] := 1e-30;
+      else
+        Src[K] := (Random - 0.5) * 8;
+      end;
+      Dst[K] := 12345;
+      if Src[K] >= 0 then Ref[K] := 1 else Ref[K] := 0;
+    end;
+    TNNetVolume.ReluGateMask(TNeuralFloatArrPtr(@Dst[0]),
+      TNeuralFloatArrPtr(@Src[0]), N);
+    for K := 0 to N - 1 do
+      AssertEquals('ReluGateMask[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
+        Ref[K], Dst[K], 0.0);
+  end;
+  // In-place (dst = src) must produce the same mask.
+  N := 40;
+  SetLength(Src, N);
+  for K := 0 to N - 1 do Src[K] := (Random - 0.5) * 8;
+  SetLength(Ref, N);
+  for K := 0 to N - 1 do
+    if Src[K] >= 0 then Ref[K] := 1 else Ref[K] := 0;
+  TNNetVolume.ReluGateMask(TNeuralFloatArrPtr(@Src[0]),
+    TNeuralFloatArrPtr(@Src[0]), N);
+  for K := 0 to N - 1 do
+    AssertEquals('ReluGateMask in-place[' + IntToStr(K) + ']', Ref[K], Src[K], 0.0);
+  // A zero-length run must leave the buffer untouched.
+  Src[0] := 5.0;
+  TNNetVolume.ReluGateMask(TNeuralFloatArrPtr(@Src[0]),
+    TNeuralFloatArrPtr(@Src[0]), 0);
+  AssertEquals('empty run', 5.0, Src[0], 0.0);
+end;
+
+procedure TTestNeuralVolume.TestVolumeLeakyReluParity;
+// LeakyRelu is AVXLeakyRelu on an AVX2/64-bit build and a scalar loop everywhere
+// else. Both paths must agree BIT-exactly: the negative branch is the same
+// single-precision multiply, and at the boundary the contract is >= 0, so +0.0
+// and -0.0 both pass through unscaled. Sizes straddle the 8-element block width
+// and its tail.
+const
+  Sizes: array[0..10] of integer = (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 1000);
+  // TYPED: an untyped 0.1 would be a Double here, so the reference multiply
+  // would not be the Single one the kernel performs.
+  Slope: TNeuralFloat = 0.1;
+var
+  Src, Dst, Ref: array of TNeuralFloat;
+  SI, K, N: integer;
+begin
+  RandSeed := 141421;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    SetLength(Src, N);
+    SetLength(Dst, N);
+    SetLength(Ref, N);
+    for K := 0 to N - 1 do
+    begin
+      case K mod 7 of
+        0: Src[K] := 0.0;
+        1: Src[K] := -0.0;
+        2: Src[K] := -1e-30;
+        3: Src[K] := 1e-30;
+      else
+        Src[K] := (Random - 0.5) * 8;
+      end;
+      Dst[K] := 12345;
+      if Src[K] >= 0 then Ref[K] := Src[K] else Ref[K] := Slope * Src[K];
+    end;
+    TNNetVolume.LeakyRelu(TNeuralFloatArrPtr(@Dst[0]),
+      TNeuralFloatArrPtr(@Src[0]), Slope, N);
+    for K := 0 to N - 1 do
+      AssertEquals('LeakyRelu[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
+        Ref[K], Dst[K], 0.0);
+  end;
+  // In-place (dst = src) must produce the same result.
+  N := 40;
+  SetLength(Src, N);
+  for K := 0 to N - 1 do Src[K] := (Random - 0.5) * 8;
+  SetLength(Ref, N);
+  for K := 0 to N - 1 do
+    if Src[K] >= 0 then Ref[K] := Src[K] else Ref[K] := Slope * Src[K];
+  TNNetVolume.LeakyRelu(TNeuralFloatArrPtr(@Src[0]),
+    TNeuralFloatArrPtr(@Src[0]), Slope, N);
+  for K := 0 to N - 1 do
+    AssertEquals('LeakyRelu in-place[' + IntToStr(K) + ']', Ref[K], Src[K], 0.0);
+  // A slope of zero degenerates to a plain relu.
+  N := 20;
+  SetLength(Src, N);
+  for K := 0 to N - 1 do Src[K] := (Random - 0.5) * 8;
+  SetLength(Dst, N);
+  TNNetVolume.LeakyRelu(TNeuralFloatArrPtr(@Dst[0]),
+    TNeuralFloatArrPtr(@Src[0]), 0.0, N);
+  for K := 0 to N - 1 do
+    if Src[K] >= 0 then
+      AssertEquals('LeakyRelu slope 0 pos[' + IntToStr(K) + ']',
+        Src[K], Dst[K], 0.0)
+    else
+      AssertEquals('LeakyRelu slope 0 neg[' + IntToStr(K) + ']',
+        0.0, Abs(Dst[K]), 0.0);
+  // A zero-length run must leave the buffer untouched.
+  Src[0] := 5.0;
+  TNNetVolume.LeakyRelu(TNeuralFloatArrPtr(@Src[0]),
+    TNeuralFloatArrPtr(@Src[0]), Slope, 0);
+  AssertEquals('empty run', 5.0, Src[0], 0.0);
+end;
+
+procedure TTestNeuralVolume.TestVolumeMaxPosParity;
+// MaxPos is AVXGetMaxPos on an AVX2/64-bit build and a scalar loop everywhere
+// else. Both must agree exactly on the value AND on the index, and both must
+// hand ties to the FIRST occurrence - the softmax spans and the argmax callers
+// depend on that. Sizes straddle the 16-element block width and its tail.
+const
+  Sizes: array[0..11] of integer = (1, 2, 7, 15, 16, 17, 31, 32, 33, 64, 65, 517);
+var
+  Buf: array of TNeuralFloat;
+  SI, K, N, GotPos, RefPos: integer;
+  GotVal, RefVal: TNeuralFloat;
+  Tag: string;
+begin
+  RandSeed := 271828;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    Tag := ' (N=' + IntToStr(N) + ')';
+    SetLength(Buf, N);
+    for K := 0 to N - 1 do Buf[K] := (Random - 0.5) * 20;
+
+    RefVal := Buf[0];
+    RefPos := 0;
+    for K := 1 to N - 1 do
+      if Buf[K] > RefVal then
+      begin
+        RefVal := Buf[K];
+        RefPos := K;
+      end;
+
+    GotVal := TNNetVolume.MaxPos(TNeuralFloatArrPtr(@Buf[0]), N, GotPos);
+    AssertEquals('max value' + Tag, RefVal, GotVal, 0.0);
+    AssertEquals('max index' + Tag, RefPos, GotPos);
+    AssertEquals('MaxValue agrees' + Tag, RefVal,
+      TNNetVolume.MaxValue(TNeuralFloatArrPtr(@Buf[0]), N), 0.0);
+
+    // All-equal: the first index has to win on every path.
+    for K := 0 to N - 1 do Buf[K] := -3.5;
+    GotVal := TNNetVolume.MaxPos(TNeuralFloatArrPtr(@Buf[0]), N, GotPos);
+    AssertEquals('flat value' + Tag, -3.5, GotVal, 0.0);
+    AssertEquals('flat ties go to index 0' + Tag, 0, GotPos);
+
+    // A duplicated maximum: still the earlier of the two.
+    if N >= 4 then
+    begin
+      Buf[1] := 9.25;
+      Buf[N - 1] := 9.25;
+      GotVal := TNNetVolume.MaxPos(TNeuralFloatArrPtr(@Buf[0]), N, GotPos);
+      AssertEquals('duplicate max value' + Tag, 9.25, GotVal, 0.0);
+      AssertEquals('duplicate max takes the first' + Tag, 1, GotPos);
+    end;
+  end;
+  // Empty run: no element to point at.
+  AssertEquals('empty run value', 0.0,
+    TNNetVolume.MaxPos(TNeuralFloatArrPtr(@Buf[0]), 0, GotPos), 0.0);
+  AssertEquals('empty run index', -1, GotPos);
+end;
+
+procedure TTestNeuralVolume.TestVolumeAddSubValueParity;
+// TNNetVolume routes the whole-volume Add(Value)/Sub(Value) through the
+// AddScalar kernel while TVolume keeps its element loop. The two must stay
+// BIT-identical: Sub adds the negated value, and x - v equals x + (-v) exactly
+// in IEEE-754. Sizes straddle the kernel's 32-element block and its tail.
+const
+  Sizes: array[0..7] of integer = (1, 8, 31, 32, 33, 63, 100, 1000);
+  cValue = 0.7853981634;
+var
+  V: TNNetVolume;
+  RefAdd, RefBack: array of TNeuralFloat;
+  SI, K, N: integer;
+  Delta: TNeuralFloat;
+  Tag: string;
+begin
+  RandSeed := 6180339;
+  Delta := cValue;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    Tag := ' (N=' + IntToStr(N) + ')';
+    SetLength(RefAdd, N);
+    SetLength(RefBack, N);
+    V := TNNetVolume.Create(1, 1, N);
+    try
+      // Every reference value lands in a TNeuralFloat before the comparison, so
+      // the expectation is single-precision arithmetic, not the double the
+      // expression would otherwise be evaluated in.
+      for K := 0 to N - 1 do
+      begin
+        V.FData[K] := (Random - 0.5) * 40;
+        RefAdd[K] := V.FData[K] + Delta;
+        RefBack[K] := RefAdd[K] - Delta;
+      end;
+      V.Add(Delta);
+      for K := 0 to N - 1 do
+        AssertEquals('Add[' + IntToStr(K) + ']' + Tag, RefAdd[K],
+          V.FData[K], 0.0);
+      V.Sub(Delta);
+      for K := 0 to N - 1 do
+        AssertEquals('Add then Sub[' + IntToStr(K) + ']' + Tag,
+          RefBack[K], V.FData[K], 0.0);
+    finally
+      V.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeRankOneUpdateRowParity;
+// TNNetVolume.RankOneUpdateRow runs the AVX kernels while TVolume composes its
+// scalar element loops. Both must land BIT-exactly on the reference rounding
+// sequence built here: round(Prev*Alpha), round(B*BScale), then round of their
+// sum -- which is what the composed scalar loops do and what the MulMulAdd
+// kernel's separate vmulps pair plus vaddps do. All three contract cases are
+// covered: no previous row (Prev = nil, and a zero Alpha), the disjoint carry,
+// and the aliased PtrPrev = PtrDst in-place carry every recurrent scan uses.
+// Sizes straddle the kernels' 32-element block, their 4-element small loop and
+// the scalar tail.
+const
+  Sizes: array[0..8] of integer = (1, 3, 4, 8, 31, 32, 33, 100, 1000);
+  cAlpha: TNeuralFloat = 0.96875;
+  cBScale: TNeuralFloat = -0.3125;
+var
+  Dst, Ref, Prev, B: array of TNeuralFloat;
+  SI, K, N, Rep: integer;
+  T1, T2: TNeuralFloat;
+  Tag: string;
+begin
+  RandSeed := 24011966;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    Tag := ' (N=' + IntToStr(N) + ')';
+    SetLength(Dst, N);
+    SetLength(Ref, N);
+    SetLength(Prev, N);
+    SetLength(B, N);
+    for K := 0 to N - 1 do
+    begin
+      Prev[K] := (Random - 0.5) * 6;
+      B[K] := (Random - 0.5) * 6;
+      Dst[K] := -999;
+    end;
+
+    // Case 1 - no previous row at all.
+    for K := 0 to N - 1 do Ref[K] := B[K] * cBScale;
+    TNNetVolume.RankOneUpdateRow(TNeuralFloatArrPtr(@Dst[0]), nil,
+      TNeuralFloatArrPtr(@B[0]), cAlpha, cBScale, N);
+    for K := 0 to N - 1 do
+      AssertEquals('nil prev[' + IntToStr(K) + ']' + Tag, Ref[K], Dst[K], 0.0);
+
+    // Case 2 - a zero carry scale takes the same branch with a real Prev.
+    TNNetVolume.RankOneUpdateRow(TNeuralFloatArrPtr(@Dst[0]),
+      TNeuralFloatArrPtr(@Prev[0]), TNeuralFloatArrPtr(@B[0]), 0, cBScale, N);
+    for K := 0 to N - 1 do
+      AssertEquals('zero alpha[' + IntToStr(K) + ']' + Tag, Ref[K], Dst[K], 0.0);
+
+    // Case 3 - disjoint Prev and Dst.
+    for K := 0 to N - 1 do
+    begin
+      T1 := Prev[K] * cAlpha;
+      T2 := B[K] * cBScale;
+      Ref[K] := T1 + T2;
+    end;
+    TNNetVolume.RankOneUpdateRow(TNeuralFloatArrPtr(@Dst[0]),
+      TNeuralFloatArrPtr(@Prev[0]), TNeuralFloatArrPtr(@B[0]),
+      cAlpha, cBScale, N);
+    for K := 0 to N - 1 do
+      AssertEquals('carry[' + IntToStr(K) + ']' + Tag, Ref[K], Dst[K], 0.0);
+
+    // Case 4 - the in-place form, run three times so a state carry that drifts
+    // from the reference cannot cancel itself out.
+    for K := 0 to N - 1 do
+    begin
+      Ref[K] := Prev[K];
+      Dst[K] := Prev[K];
+    end;
+    for Rep := 1 to 3 do
+    begin
+      for K := 0 to N - 1 do
+      begin
+        T1 := Ref[K] * cAlpha;
+        T2 := B[K] * cBScale;
+        Ref[K] := T1 + T2;
+      end;
+      TNNetVolume.RankOneUpdateRow(TNeuralFloatArrPtr(@Dst[0]),
+        TNeuralFloatArrPtr(@Dst[0]), TNeuralFloatArrPtr(@B[0]),
+        cAlpha, cBScale, N);
+    end;
+    for K := 0 to N - 1 do
+      AssertEquals('in-place carry[' + IntToStr(K) + ']' + Tag,
+        Ref[K], Dst[K], 0.0);
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeAdamDeltaParity;
+// AdamDelta fuses the eleven-pass Adam composition that TNNetNeuron.CalcAdamDelta
+// used to run inline. The reference here is that exact composition, built from
+// the same TNNetVolume primitives in the same order, so the assertion is
+// BIT-identity at tolerance 0.0 rather than a numeric tolerance: neither path
+// uses FMA, so every multiply and every add rounds at the same point.
+// Five consecutive steps are driven with both moments accumulating and the
+// bias-correction denominators moving, so a fused kernel that got the moment
+// recurrence subtly wrong could not hide behind a single step. Sizes straddle
+// the kernel's 8-element block and its scalar tail.
+const
+  Sizes: array[0..8] of integer = (1, 3, 7, 8, 9, 16, 31, 64, 517);
+  cB1 = 0.9;
+  cB2 = 0.999;
+  cEps = 1e-8;
+  cLR = 0.01;
+  cSteps = 5;
+var
+  D, M, V, RefD, RefM, RefV, Scratch: TNNetVolume;
+  G: array of TNeuralFloat;
+  SI, K, N, Step: integer;
+  B1Decay, B2Decay, OmB1D, OmB2D: TNeuralFloat;
+  Tag: string;
+begin
+  RandSeed := 31415926;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    SetLength(G, N);
+    D := TNNetVolume.Create(1, 1, N);
+    M := TNNetVolume.Create(1, 1, N);
+    V := TNNetVolume.Create(1, 1, N);
+    RefD := TNNetVolume.Create(1, 1, N);
+    RefM := TNNetVolume.Create(1, 1, N);
+    RefV := TNNetVolume.Create(1, 1, N);
+    Scratch := TNNetVolume.Create(1, 1, N);
+    try
+      // Both moments start non-zero so the recurrence is exercised from the
+      // first step, and one gradient slot is an exact zero.
+      for K := 0 to N - 1 do
+      begin
+        M.FData[K] := (Random - 0.5) * 0.4;
+        V.FData[K] := Random * 0.3;
+        RefM.FData[K] := M.FData[K];
+        RefV.FData[K] := V.FData[K];
+      end;
+      B1Decay := 1;
+      B2Decay := 1;
+
+      for Step := 1 to cSteps do
+      begin
+        Tag := ' (N=' + IntToStr(N) + ' step ' + IntToStr(Step) + ')';
+        for K := 0 to N - 1 do
+        begin
+          if K mod 9 = 4 then G[K] := 0
+          else G[K] := ((K mod 7) - 3) * 0.25 * Step;
+          D.FData[K] := G[K];
+          RefD.FData[K] := G[K];
+        end;
+        B1Decay := B1Decay * cB1;
+        B2Decay := B2Decay * cB2;
+        OmB1D := 1 - B1Decay;
+        OmB2D := 1 - B2Decay;
+
+        // Reference: the original composition, primitive for primitive.
+        Scratch.Copy(RefD);
+        Scratch.Mul(Scratch);
+        RefM.MulMulAdd(cB1, 1 - cB1, RefD);
+        RefV.MulMulAdd(cB2, 1 - cB2, Scratch);
+        Scratch.Copy(RefV);
+        Scratch.Mul(1.0 / OmB2D);
+        Scratch.VSqrt();
+        Scratch.Add(cEps);
+        RefD.Fill(cLR / OmB1D);
+        RefD.Mul(RefM);
+        RefD.Divi(Scratch);
+
+        TNNetVolume.AdamDelta(D.DataPtr, M.DataPtr, V.DataPtr,
+          cB1, 1 - cB1, cB2, 1 - cB2, 1.0 / OmB2D, cEps, cLR / OmB1D, N);
+
+        for K := 0 to N - 1 do
+        begin
+          AssertEquals('first moment[' + IntToStr(K) + ']' + Tag,
+            RefM.FData[K], M.FData[K], 0.0);
+          AssertEquals('second moment[' + IntToStr(K) + ']' + Tag,
+            RefV.FData[K], V.FData[K], 0.0);
+          AssertEquals('delta[' + IntToStr(K) + ']' + Tag,
+            RefD.FData[K], D.FData[K], 0.0);
+        end;
+      end;
+
+      // A zero-length run must touch nothing.
+      D.FData[0] := 5;
+      TNNetVolume.AdamDelta(D.DataPtr, M.DataPtr, V.DataPtr,
+        cB1, 1 - cB1, cB2, 1 - cB2, 1.0, cEps, cLR, 0);
+      AssertEquals('empty run', 5.0, D.FData[0], 0.0);
+    finally
+      D.Free; M.Free; V.Free;
+      RefD.Free; RefM.Free; RefV.Free; Scratch.Free;
+    end;
+  end;
 end;
 
 procedure TTestNeuralVolume.TestVolumeExpShiftSumParity;

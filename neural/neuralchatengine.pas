@@ -72,10 +72,15 @@ uses
   neuralchat, neuraldecode;
 
 const
-  // Default --ctx when the user gives none. Kept modest because build memory
-  // is O(ctx^2) (a SeqLen x SeqLen score buffer per head per layer); the full
-  // checkpoint context (e.g. 32768) would OOM at load. See the load path.
-  DefaultCtxCap = 2048;
+  // Default --ctx when the user gives none, clamped to the checkpoint's own
+  // limit. Decode is streamed at input width 1, so the cost of context is the
+  // KV cache: LINEAR in ctx, but preallocated in full when the session opens
+  // (see TNNetScaledDotProductAttention.BeginIncrementalDecode). Per token
+  // that is 2 * kv_heads * head_dim * 4 bytes per layer (a quarter of that
+  // under --kv-int8) plus an fp32 q_heads-wide score scratch, so a 7B at this
+  // cap holds a few GB of cache. Checkpoints declaring more (Llama-3 at
+  // 131072) need --ctx to go higher.
+  DefaultCtxCap = 32768;
 
   // Built-in fallback sampling defaults, used only for parameters that neither
   // an explicit flag nor the model's generation_config.json supplies. A tight
@@ -267,7 +272,7 @@ begin
   WriteLn('  --presence-penalty X    presence penalty (default 0)');
   WriteLn('  --max-new-tokens N    reply length cap (default 8192)');
   WriteLn('  --seed N              RNG seed (default: randomize)');
-  WriteLn('  --ctx N               context window (default min(model max,2048); mem ~O(ctx^2))');
+  WriteLn('  --ctx N               context window (default min(model max,32768); KV RAM ~O(ctx))');
   WriteLn('  --format NAME         chatml|llama2|llama3|zephyr|gemma|phi3|mistral|raw');
   WriteLn('                        raw = no chat template: plain text completion for');
   WriteLn('                        BASE models (gpt2, mamba-130m, ...); the model');
@@ -952,10 +957,11 @@ begin
   // Default context window. KV-cache streamed decode (below) holds K/V for up
   // to CtxLen tokens PER HEAD PER LAYER, so cache memory grows as O(CtxLen)
   // (not the O(CtxLen^2) score buffers a full-recompute decode would allocate).
-  // Using the checkpoint's full max_position_embeddings (32768 for Qwen2.5)
-  // would still be large, so when the user gives no --ctx we cap the default at
-  // DefaultCtxCap (clamped to the model's own limit). Raise it with --ctx N
-  // if you have the RAM (the default int8 weights help there too).
+  // That linear cost buys the checkpoint's own context on the common models
+  // (32768 for Qwen2.5), so with no --ctx we take max_position_embeddings
+  // clamped to DefaultCtxCap. Checkpoints declaring more (Llama-3 at 131072)
+  // stop at the cap; --ctx N goes past it if you have the RAM, and --kv-int8
+  // quarters what the cache costs at any given size.
   if Opt.CtxLen <= 0 then
   begin
     Cnt := ReadConfigInt(IncludeTrailingPathDelimiter(Opt.ModelDir) +
@@ -963,7 +969,8 @@ begin
     if (Cnt <= 0) or (Cnt > DefaultCtxCap) then Cnt := DefaultCtxCap;
     Opt.CtxLen := Cnt;
     Notice(Format('[context not set - defaulting to %d tokens; override' +
-      ' with --ctx N (memory grows ~O(ctx^2))]', [Opt.CtxLen]));
+      ' with --ctx N (KV-cache RAM grows ~O(ctx); --kv-int8 quarters it)]',
+      [Opt.CtxLen]));
   end;
 
   {$IFDEF OpenCL}

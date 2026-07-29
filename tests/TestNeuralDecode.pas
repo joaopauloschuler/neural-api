@@ -123,6 +123,14 @@ type
     procedure TestBatchGreedyEmptyAndSingle;
     procedure TestBeamSearchAllSortedDescending;
     procedure TestBeamSearchScoreNoWorseThanGreedy;
+    // The candidate pool is pruned by a PARTIAL selection (only the top
+    // BeamWidth are ordered). These pin the two properties that makes
+    // observable: the kept set/order at a realistic pool size, and the
+    // tie-break - equal scores must resolve to the earliest-filled candidate,
+    // i.e. the lowest (parent index, token id).
+    procedure TestBeamSearchFullVocabPoolRanking;
+    procedure TestBeamSearchTiesResolveToLowestTokenId;
+    procedure TestDiverseBeamTiesResolveToLowestTokenId;
     // KV-cache (cache-forking) beam search must be bit-identical to the
     // re-encoding DecodeBeamSearchAll, full ranked beam, best-first.
     procedure TestBeamSearchCachedMatchesReEncodeBigram;
@@ -133,8 +141,10 @@ type
     procedure TestDiverseBeamGroupsDifferInFirstToken;
     // Constrained beam search (force_words_ids).
     procedure TestConstrainedBeamNoForceMatchesBeam;
+    procedure TestConstrainedBeamForcesOverlappingPhrase;
     procedure TestConstrainedBeamForcesPhrasePresence;
     procedure TestConstrainedBeamForcesMultiplePhrases;
+    procedure TestConstrainedBeamPhraseCharOutsideVocab;
     // Contrastive search (penalty_alpha) decoding.
     procedure TestContrastiveAlphaZeroMatchesGreedy;
     procedure TestContrastiveAlphaChangesSelection;
@@ -573,6 +583,146 @@ begin
   end;
 end;
 
+// A FULL byte alphabet (256) with BeamWidth 5 is the widest candidate pool a
+// Chr()-alphabet decoder can build: 1280 per step. The toy nets elsewhere in
+// this suite prune from ~30, which does not exercise the partial selection's
+// bounded pass count at all.
+procedure TTestNeuralDecode.TestBeamSearchFullVocabPoolRanking;
+var
+  NN: TNNet;
+  All: TNNetDecodeResultArray;
+  I, J: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildTinyNet(4, 256);
+  try
+    All := DecodeBeamSearchAll(NN, 'ab', 6, 5, 0.0);
+    AssertTrue('full-vocab beam returns a pool', Length(All) >= 5);
+    for I := 1 to High(All) do
+      AssertTrue('full-vocab pool sorted by descending score',
+        All[I - 1].Score >= All[I].Score);
+    // A survivor's score must be its own sum-log-prob under the length
+    // penalty, i.e. the record was carried through the prune intact and not
+    // paired with another candidate's parent text. (An empty text is legal: a
+    // beam that emits EOS on step 1 finishes with the prompt continuation
+    // still empty.)
+    for I := 0 to High(All) do
+    begin
+      AssertEquals('alpha=0 score is the raw sum-log-prob',
+        All[I].SumLogProb, All[I].Score, 0.0);
+      AssertTrue('beam no longer than the length cap', Length(All[I].Text) <= 6);
+      for J := 1 to Length(All[I].Text) do
+        AssertTrue('survivor chars are inside the vocabulary',
+          Ord(All[I].Text[J]) < 256);
+    end;
+  finally
+    NN.Free;
+  end;
+end;
+
+// Uniform logits make EVERY candidate score exactly equal, so the whole result
+// is decided by the tie-break. Candidates are filled parent-major then in
+// ascending token id, and the prune must keep that order: the step-1 survivors
+// are the lowest non-EOS token ids (EOS is chr(1), so 0, 2, 3, ...) and every
+// later step extends them the same way.
+function BuildUniformLogitNet(ContextLen, Vocab: integer): TNNet;
+var
+  L1: TNNetLayer;
+  N: integer;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, Vocab));
+  L1 := Result.AddLayer(TNNetFullConnectLinear.Create(Vocab));
+  Result.AddLayer(TNNetSoftMax.Create());
+  Result.InitWeights();
+  for N := 0 to L1.Neurons.Count - 1 do
+  begin
+    L1.Neurons[N].Weights.Fill(0);
+    L1.Neurons[N].BiasWeight := 0;
+  end;
+  L1.MulWeights(1.0);
+end;
+
+procedure TTestNeuralDecode.TestBeamSearchTiesResolveToLowestTokenId;
+var
+  NN: TNNet;
+  All: TNNetDecodeResultArray;
+  I, Seen: integer;
+  Expected: array[0..2] of integer = (0, 2, 3);
+  Live: string;
+begin
+  NN := BuildUniformLogitNet(4, 16);
+  try
+    All := DecodeBeamSearchAll(NN, 'ab', 4, 3, 0.0);
+    AssertTrue('uniform-logit beam returns a pool', Length(All) >= 4);
+    // The three step-1 survivors are the three lowest non-EOS token ids, and
+    // they reach the finished pool in that order.
+    Seen := 0;
+    for I := 0 to High(All) do
+      if Length(All[I].Text) = 1 then
+      begin
+        AssertTrue('no more one-char beams than the beam width', Seen < 3);
+        AssertEquals('tie-broken step-1 survivor ' + IntToStr(Seen),
+          Expected[Seen], Ord(All[I].Text[1]));
+        Inc(Seen);
+      end;
+    AssertEquals('all three step-1 survivors are present', 3, Seen);
+    // Every later step ties too, so the surviving frontier keeps extending by
+    // the lowest id: the best live beam is token 0 repeated.
+    Live := '';
+    for I := 0 to High(All) do
+      if not All[I].Finished then
+      begin
+        Live := All[I].Text;
+        Break;
+      end;
+    AssertTrue('a live beam survived to the end', Length(Live) >= 1);
+    for I := 1 to Length(Live) do
+      AssertEquals('every char of the tie-winning beam is token 0',
+        0, Ord(Live[I]));
+  finally
+    NN.Free;
+  end;
+end;
+
+// Same contract inside the grouped (diverse) prune, which selects GroupSize
+// survivors per group rather than BeamWidth overall. Group 0 faces an all-ties
+// pool and takes the lowest ids; group 1 sees those ids penalised and is pushed
+// off them - which only happens if the per-group tie-break is stable.
+procedure TTestNeuralDecode.TestDiverseBeamTiesResolveToLowestTokenId;
+var
+  NN: TNNet;
+  All: TNNetDecodeResultArray;
+  I: integer;
+  Live, Pushed: string;
+begin
+  NN := BuildUniformLogitNet(4, 16);
+  try
+    All := DecodeDiverseBeamSearchAll(NN, 'ab', 3, 4, 2, 0.5, 0.0);
+    AssertTrue('diverse uniform-logit beam returns a pool', Length(All) >= 4);
+    Live := '';
+    Pushed := '';
+    for I := 0 to High(All) do
+      if not All[I].Finished then
+      begin
+        if Live = '' then Live := All[I].Text
+        else if (Pushed = '') and (All[I].Text[1] <> Live[1]) then
+          Pushed := All[I].Text;
+      end;
+    AssertTrue('a group-0 beam survived', Length(Live) >= 1);
+    for I := 1 to Length(Live) do
+      AssertEquals('every char of the group-0 tie winner is token 0',
+        0, Ord(Live[I]));
+    // Group 1 cannot reuse token 0 (penalised), so it takes the lowest id
+    // group 0 left alone. Tokens 0 and 2 went to group 0, 1 is EOS -> 3.
+    AssertTrue('a diversity-pushed beam survived', Length(Pushed) >= 1);
+    AssertEquals('group 1 is pushed onto the next free lowest id',
+      3, Ord(Pushed[1]));
+  finally
+    NN.Free;
+  end;
+end;
+
 // Constant-logit net: zeroed weights -> input-independent logits set purely by
 // the LM head bias, peaked on token PeakTok. Used for the diverse / constrained
 // beam planted setups where the model "prefers" one specific continuation.
@@ -723,6 +873,35 @@ begin
   end;
 end;
 
+// Forced-phrase progress is derived per PARENT beam and read off per candidate.
+// A self-overlapping phrase is where that derivation is easiest to get wrong:
+// after 'ab' the next char can either COMPLETE 'aba' or restart a 1-char
+// partial match, and the metric must take the longer of the two. Run it over
+// the full byte alphabet so the candidate pool is the widest one possible.
+procedure TTestNeuralDecode.TestConstrainedBeamForcesOverlappingPhrase;
+var
+  NN: TNNet;
+  Uncon, Con: TNNetDecodeResult;
+  Force: array of string;
+  Phrase: string;
+begin
+  RandSeed := 424242;
+  Phrase := 'aba';
+  SetLength(Force, 1);
+  Force[0] := Phrase;
+  NN := BuildPeakedLogitNet(8, 256, Ord('Z'));
+  try
+    Uncon := DecodeBeamSearch(NN, 'ab', 12, 3, 0.0);
+    AssertEquals('unconstrained beam never emits the overlapping phrase',
+      0, Pos(Phrase, Uncon.Text));
+    Con := DecodeConstrainedBeamSearch(NN, 'ab', 12, 3, Force, 0.0);
+    AssertTrue('constrained beam emits the overlapping phrase',
+      Pos(Phrase, Con.Text) > 0);
+  finally
+    NN.Free;
+  end;
+end;
+
 procedure TTestNeuralDecode.TestConstrainedBeamForcesMultiplePhrases;
 var
   NN: TNNet;
@@ -739,6 +918,37 @@ begin
     Con := DecodeConstrainedBeamSearch(NN, 'ab', 16, 4, Force, 0.0);
     AssertTrue('first forced phrase present', Pos('xy', Con.Text) > 0);
     AssertTrue('second forced phrase present', Pos('qrs', Con.Text) > 0);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestConstrainedBeamPhraseCharOutsideVocab;
+const
+  cVocab = 64;
+var
+  NN: TNNet;
+  Con: TNNetDecodeResult;
+  Force: array of string;
+  I, TextLen: integer;
+begin
+  // A forced phrase whose bytes ('x'=120..'z'=122) lie OUTSIDE a 64-token
+  // alphabet is unsatisfiable: those chars have no logit at all. The decoder
+  // must neither read past the end of the logits array nor emit a char the
+  // model cannot produce - it returns the best-effort unconstrained frontier.
+  RandSeed := 424242;
+  SetLength(Force, 1);
+  Force[0] := 'xyz';
+  NN := BuildPeakedLogitNet(24, cVocab, 40);
+  try
+    Con := DecodeConstrainedBeamSearch(NN, 'ab', 10, 4, Force, 0.0);
+    TextLen := Length(Con.Text);
+    AssertTrue('best-effort result is non-empty', TextLen > 0);
+    for I := 1 to TextLen do
+      AssertTrue('emitted char ' + IntToStr(Ord(Con.Text[I])) +
+        ' is inside the vocabulary', Ord(Con.Text[I]) < cVocab);
+    AssertEquals('an unsatisfiable phrase is never completed',
+      0, Pos('xyz', Con.Text));
   finally
     NN.Free;
   end;

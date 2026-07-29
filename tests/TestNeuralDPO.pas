@@ -19,6 +19,10 @@ type
     function BuildTinyLM(ContextLen, Vocab, Hidden: integer): TNNet;
     // Sets every weight AND bias to zero -> logits all zero -> uniform softmax.
     procedure ZeroAllWeights(NN: TNNet);
+    // Runs ComputeLoss (Mode=0) or Step (Mode=1) on the pair and returns the
+    // raised exception message, or '' when the call succeeded.
+    function CaptureError(Trainer: TNeuralDPOTrainer; Mode: integer;
+      const Prompt, Chosen, Rejected: TNeuralDPOTokenArray): string;
   published
     // Fixed, hand-knowable weights (all-zero except the LM-head biases) make
     // the next-token distribution input-independent and analytic:
@@ -41,6 +45,24 @@ type
     // Finite-difference check of dLoss/dWeight against the implemented
     // backward (LR=1, inertia=0, batch mode: gradient = -Delta).
     procedure TestFiniteDifferenceGradient;
+    // A completion token id >= VocabSize indexes past the end of the
+    // vocabulary-sized output distribution: an out-of-bounds READ in
+    // SequenceLogProb and an out-of-bounds WRITE into the pseudo-target volume
+    // in BackpropagateCompletion. Both must be rejected at the boundary.
+    procedure TestOutOfVocabTargetRejectedOnComputeLoss;
+    procedure TestOutOfVocabTargetRejectedOnStep;
+    // The skip-backprop-derivative softmax convention takes the other write
+    // branch of BackpropagateCompletion; it must be guarded too.
+    procedure TestOutOfVocabTargetRejectedOnSkipDerivativeStep;
+    // Prompt tokens are one-hot input channels; an out-of-range id there is
+    // silently dropped by the encoder, corrupting the training signal.
+    procedure TestOutOfVocabPromptRejected;
+    // Negative ids index before the start of the output volume.
+    procedure TestNegativeTokenRejected;
+    // Every preference-loss mode routes through the same read/write sites.
+    procedure TestAllLossModesRejectOutOfVocabTarget;
+    // The guard must not reject the largest valid id (VocabSize-1).
+    procedure TestLastValidTokenAccepted;
   end;
 
 implementation
@@ -346,6 +368,167 @@ begin
 
   Trainer.Free;
   Policy.Free;
+end;
+
+function TTestNeuralDPO.CaptureError(Trainer: TNeuralDPOTrainer; Mode: integer;
+  const Prompt, Chosen, Rejected: TNeuralDPOTokenArray): string;
+begin
+  Result := '';
+  try
+    if Mode = 0
+    then Trainer.ComputeLoss(Prompt, Chosen, Rejected)
+    else Trainer.Step(Prompt, Chosen, Rejected);
+  except
+    on E: Exception do Result := E.Message;
+  end;
+end;
+
+procedure TTestNeuralDPO.TestOutOfVocabTargetRejectedOnComputeLoss;
+var
+  Policy: TNNet;
+  Trainer: TNeuralDPOTrainer;
+  Msg: string;
+begin
+  RandSeed := 424242;
+  Policy := BuildTinyLM(csContext, csVocab, csHidden);
+  Trainer := TNeuralDPOTrainer.CreateWithClonedReference(Policy, {beta=}0.5);
+  // Ord('a') = 97, far past csVocab = 8: an out-of-bounds read of the output.
+  Msg := CaptureError(Trainer, 0, DPOTokens(#1#2), DPOTokens('a'),
+    DPOTokens(#5));
+  Trainer.Free;
+  Policy.Free;
+  AssertTrue('an out-of-vocabulary chosen token must be rejected', Msg <> '');
+  AssertTrue('the message must name the offending id and character, got: ' +
+    Msg, (Pos('97', Msg) > 0) and (Pos('"a"', Msg) > 0));
+  AssertTrue('the message must name the vocabulary size, got: ' + Msg,
+    Pos('vocabulary size 8', Msg) > 0);
+end;
+
+procedure TTestNeuralDPO.TestOutOfVocabTargetRejectedOnStep;
+var
+  Policy: TNNet;
+  Trainer: TNeuralDPOTrainer;
+  Msg: string;
+begin
+  RandSeed := 424242;
+  Policy := BuildTinyLM(csContext, csVocab, csHidden);
+  Policy.SetLearningRate(0.01, 0);
+  Trainer := TNeuralDPOTrainer.CreateWithClonedReference(Policy, {beta=}0.5);
+  // Step reaches BackpropagateCompletion, which WRITES at FData[Target].
+  Msg := CaptureError(Trainer, 1, DPOTokens(#1#2), DPOTokens(#3),
+    DPOTokens('z'));
+  Trainer.Free;
+  Policy.Free;
+  AssertTrue('an out-of-vocabulary rejected token must be rejected on Step',
+    Msg <> '');
+  AssertTrue('the message must name the offending id, got: ' + Msg,
+    Pos('122', Msg) > 0);
+end;
+
+procedure TTestNeuralDPO.TestOutOfVocabTargetRejectedOnSkipDerivativeStep;
+var
+  Policy: TNNet;
+  Trainer: TNeuralDPOTrainer;
+  Msg: string;
+begin
+  RandSeed := 424242;
+  Policy := TNNet.Create();
+  Policy.AddLayer(TNNetInput.Create(csContext, 1, csVocab));
+  Policy.AddLayer(TNNetFullConnectReLU.Create(csHidden));
+  Policy.AddLayer(TNNetFullConnectLinear.Create(csVocab));
+  Policy.AddLayer(TNNetPointwiseSoftMax.Create({SkipBackpropDerivative=}1));
+  Policy.SetLearningRate(0.01, 0);
+  Trainer := TNeuralDPOTrainer.CreateWithClonedReference(Policy, {beta=}0.5);
+  Msg := CaptureError(Trainer, 1, DPOTokens(#1#2), DPOTokens('a'),
+    DPOTokens(#5));
+  Trainer.Free;
+  Policy.Free;
+  AssertTrue('the skip-derivative write branch must be guarded too', Msg <> '');
+  AssertTrue('the message must name the offending id, got: ' + Msg,
+    Pos('97', Msg) > 0);
+end;
+
+procedure TTestNeuralDPO.TestOutOfVocabPromptRejected;
+var
+  Policy: TNNet;
+  Trainer: TNeuralDPOTrainer;
+  Msg: string;
+begin
+  RandSeed := 424242;
+  Policy := BuildTinyLM(csContext, csVocab, csHidden);
+  Trainer := TNeuralDPOTrainer.CreateWithClonedReference(Policy, {beta=}0.5);
+  Msg := CaptureError(Trainer, 0, DPOTokens('Q'), DPOTokens(#3),
+    DPOTokens(#5));
+  Trainer.Free;
+  Policy.Free;
+  AssertTrue('an out-of-vocabulary prompt token must be rejected', Msg <> '');
+  AssertTrue('the message must say it is the prompt, got: ' + Msg,
+    Pos('prompt', Msg) > 0);
+end;
+
+procedure TTestNeuralDPO.TestNegativeTokenRejected;
+var
+  Policy: TNNet;
+  Trainer: TNeuralDPOTrainer;
+  Chosen: TNeuralDPOTokenArray;
+  Msg: string;
+begin
+  RandSeed := 424242;
+  Policy := BuildTinyLM(csContext, csVocab, csHidden);
+  Trainer := TNeuralDPOTrainer.CreateWithClonedReference(Policy, {beta=}0.5);
+  SetLength(Chosen, 2);
+  Chosen[0] := 3; Chosen[1] := -1;
+  Msg := CaptureError(Trainer, 0, DPOTokens(#1#2), Chosen, DPOTokens(#5));
+  Trainer.Free;
+  Policy.Free;
+  AssertTrue('a negative token id must be rejected', Msg <> '');
+  AssertTrue('the message must name the offending position, got: ' + Msg,
+    Pos('#1', Msg) > 0);
+end;
+
+procedure TTestNeuralDPO.TestAllLossModesRejectOutOfVocabTarget;
+var
+  Policy: TNNet;
+  Trainer: TNeuralDPOTrainer;
+  Mode: TNeuralPreferenceLossMode;
+  Msg: string;
+begin
+  for Mode := Low(TNeuralPreferenceLossMode) to High(TNeuralPreferenceLossMode) do
+  begin
+    RandSeed := 424242;
+    Policy := BuildTinyLM(csContext, csVocab, csHidden);
+    Policy.SetLearningRate(0.01, 0);
+    // A cloned reference serves every mode (ignored by the reference-free ones).
+    Trainer := TNeuralDPOTrainer.CreateWithClonedReference(Policy, {beta=}0.5);
+    Trainer.LossMode := Mode;
+    Msg := CaptureError(Trainer, 1, DPOTokens(#1#2), DPOTokens('a'),
+      DPOTokens(#5));
+    Trainer.Free;
+    Policy.Free;
+    AssertTrue('loss mode ' + IntToStr(Ord(Mode)) +
+      ' must reject an out-of-vocabulary target', Msg <> '');
+    AssertTrue('loss mode ' + IntToStr(Ord(Mode)) +
+      ' must name the offending id, got: ' + Msg, Pos('97', Msg) > 0);
+  end;
+end;
+
+procedure TTestNeuralDPO.TestLastValidTokenAccepted;
+var
+  Policy: TNNet;
+  Trainer: TNeuralDPOTrainer;
+  Chosen: TNeuralDPOTokenArray;
+  Msg: string;
+begin
+  RandSeed := 424242;
+  Policy := BuildTinyLM(csContext, csVocab, csHidden);
+  Policy.SetLearningRate(0.01, 0);
+  Trainer := TNeuralDPOTrainer.CreateWithClonedReference(Policy, {beta=}0.5);
+  SetLength(Chosen, 1);
+  Chosen[0] := csVocab - 1;                       // the largest valid id
+  Msg := CaptureError(Trainer, 1, DPOTokens(#0#1), Chosen, DPOTokens(#5));
+  Trainer.Free;
+  Policy.Free;
+  AssertTrue('id 0 and id VocabSize-1 must be accepted, got: ' + Msg, Msg = '');
 end;
 
 initialization

@@ -32,6 +32,10 @@ type
     // A few steps on a fixed pair decrease the loss AND make the learned
     // reward order chosen > rejected on a held example.
     procedure TestStepDecreasesLossAndOrdersRewards;
+    // Out-of-vocabulary sequence tokens are silently dropped by the one-hot
+    // encoder, so they must be rejected instead of training on a mangled
+    // sequence.
+    procedure TestOutOfVocabTokenRejected;
   end;
 
 implementation
@@ -209,6 +213,28 @@ begin
 
   Trainer.Free;
   RM.Free;
+end;
+
+procedure TTestNeuralRewardModel.TestOutOfVocabTokenRejected;
+var
+  RM: TNNet;
+  Trainer: TNeuralRewardModelTrainer;
+  Msg: string;
+begin
+  RandSeed := 424242;
+  RM := BuildTinyRewardModel(csContext, csVocab, csHidden);
+  Trainer := TNeuralRewardModelTrainer.Create(RM);
+  Msg := '';
+  try
+    Trainer.Reward(DPOTokens(#1#2), DPOTokens('a'));  // Ord('a') = 97 >> 8
+  except
+    on E: Exception do Msg := E.Message;
+  end;
+  Trainer.Free;
+  RM.Free;
+  AssertTrue('an out-of-vocabulary response token must be rejected', Msg <> '');
+  AssertTrue('the message must name the offending id and array, got: ' + Msg,
+    (Pos('97', Msg) > 0) and (Pos('response', Msg) > 0));
 end;
 
 initialization
