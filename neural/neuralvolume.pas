@@ -644,6 +644,23 @@ type
       // input, exactly like the code this replaced. Value <= 0 is a no-op.
       class procedure ClampAbs(PtrA: TNeuralFloatArrPtr; Value: TNeuralFloat;
         N: integer); static;
+      // LionDelta runs one whole Lion step (Chen et al. 2023) over a weight row
+      // in a single pass:
+      //   c := Beta1*m + k1*d
+      //   m := Beta2*m + k2*d
+      //   d := NegLR if c > 0, PosLR if c < 0, 0 if c is exactly zero
+      // where d is PtrDelta in and the finished increment out and m is
+      // PtrM, Lion's single momentum buffer. The caller folds the algebra into
+      // the scalars: FDelta arrives as -lr*g, so the gradient both EMAs
+      // consume is d*invNegLr and k_i = (1-Beta_i)*invNegLr; NegLR is -lr and
+      // PosLR is +lr, so the sign select stores the finished increment with no
+      // multiply. AVX2/64-bit builds run AVXLionDelta, which selects with two
+      // vcmpps masks; every other build runs the equivalent scalar loop.
+      // Bit-identical either way, the exact-zero and signed-zero cases
+      // included; as with the scalar form, a NaN c raises Invalid Operation
+      // under FPC's default unmasked exceptions (both compares signal).
+      class procedure LionDelta(PtrDelta, PtrM: TNeuralFloatArrPtr;
+        Beta1, k1, Beta2, k2, NegLR, PosLR: TNeuralFloat; N: integer); static;
       // Relu writes dst[0..N-1] := max(src[0..N-1], 0). AVX2-accelerated
       // (AVXCopyRelu) with a scalar fallback on non-AVX builds. Bit-exact vs the
       // scalar relu-copy. Buffers may alias (dst = src).
@@ -9971,6 +9988,8 @@ procedure AVXAdafactorDelta(PtrDelta, PtrV: TNeuralFloatArrPtr;
   Beta2, k, c, Epsilon: TNeuralFloat; NumElements: integer); forward;
 procedure AVXClampAbs(PtrA: TNeuralFloatArrPtr; Value: TNeuralFloat;
   NumElements: integer); forward;
+procedure AVXLionDelta(PtrDelta, PtrM: TNeuralFloatArrPtr;
+  Beta1, k1, Beta2, k2, NegLR, PosLR: TNeuralFloat; NumElements: integer); forward;
 {$ENDIF}
 class procedure TNNetVolume.AdafactorDelta(PtrDelta, PtrV: TNeuralFloatArrPtr;
   Beta2, k, c, Epsilon: TNeuralFloat; N: integer);
@@ -10022,6 +10041,31 @@ begin
     // NaN satisfies neither test and is left alone, matching the kernel.
     if v > Value then PtrA^[I] := Value
     else if v < NegValue then PtrA^[I] := NegValue;
+  end;
+  {$ENDIF}
+end;
+
+class procedure TNNetVolume.LionDelta(PtrDelta, PtrM: TNeuralFloatArrPtr;
+  Beta1, k1, Beta2, k2, NegLR, PosLR: TNeuralFloat; N: integer);
+{$IFNDEF AVX2}
+var
+  I: integer;
+  d, m, c: TNeuralFloat;
+{$ENDIF}
+begin
+  if N <= 0 then exit;
+  {$IFDEF AVX2}
+  AVXLionDelta(PtrDelta, PtrM, Beta1, k1, Beta2, k2, NegLR, PosLR, N);
+  {$ELSE}
+  for I := 0 to N - 1 do
+  begin
+    d := PtrDelta^[I];
+    m := PtrM^[I];
+    c := Beta1 * m + k1 * d;
+    PtrM^[I] := Beta2 * m + k2 * d;
+    if c > 0 then PtrDelta^[I] := NegLR
+    else if c < 0 then PtrDelta^[I] := PosLR
+    else PtrDelta^[I] := 0;
   end;
   {$ENDIF}
 end;
@@ -15322,6 +15366,102 @@ begin
     v := PtrA^[I];
     if v > Value then PtrA^[I] := Value
     else if v < NegValue then PtrA^[I] := NegValue;
+  end;
+end;
+
+// One whole Lion step, eight elements per iteration. The three-valued sign
+// select is two vcmpps masks ANDed with the two learning-rate broadcasts and
+// ORed together, so an exactly-zero c leaves both masks clear and stores +0.0 -
+// what the scalar "if c > 0 / else if c < 0 / else 0" chain does. The compares
+// are the signaling LT_OS form with the operands swapped for the > test, which
+// is also what the scalar COMISS does, so both forms react to a NaN the same
+// way. The composed form would need Copy, two MulMulAdds, a sign extraction and
+// a scale - five passes over the weight row plus a scratch row - so this reads
+// delta and m once and writes each once. No FMA: every multiply and every add
+// rounds separately, matching the scalar fallback bit for bit. The six scalars
+// are broadcast from their own addresses, so the code stays position
+// independent.
+procedure AVXLionDelta(PtrDelta, PtrM: TNeuralFloatArrPtr;
+  Beta1, k1, Beta2, k2, NegLR, PosLR: TNeuralFloat; NumElements: integer);
+var
+  pB1, pK1, pB2, pK2, pNeg, pPos: pointer;
+  localNumElements, MissedElements, I: integer;
+  d, m, c: TNeuralFloat;
+begin
+  MissedElements := NumElements and 7;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+    pB1  := Addr(Beta1);
+    pK1  := Addr(k1);
+    pB2  := Addr(Beta2);
+    pK2  := Addr(k2);
+    pNeg := Addr(NegLR);
+    pPos := Addr(PosLR);
+  asm
+  mov rcx, pB1
+  vbroadcastss ymm10, [rcx]
+  mov rcx, pK1
+  vbroadcastss ymm11, [rcx]
+  mov rcx, pB2
+  vbroadcastss ymm12, [rcx]
+  mov rcx, pK2
+  vbroadcastss ymm13, [rcx]
+  mov rcx, pNeg
+  vbroadcastss ymm14, [rcx]
+  mov rcx, pPos
+  vbroadcastss ymm15, [rcx]
+  vxorps ymm9, ymm9, ymm9
+
+  mov rax, PtrDelta
+  mov rdx, PtrM
+  mov ecx, localNumElements
+  shr ecx, 3
+
+@LionLoop:
+  vmovups ymm0, [rax]
+  vmovups ymm1, [rdx]
+
+  vmulps  ymm2, ymm10, ymm1
+  vmulps  ymm3, ymm11, ymm0
+  vaddps  ymm2, ymm2, ymm3
+
+  vmulps  ymm3, ymm12, ymm1
+  vmulps  ymm4, ymm13, ymm0
+  vaddps  ymm3, ymm3, ymm4
+  vmovups [rdx], ymm3
+
+  vcmpps  ymm4, ymm9, ymm2, 1
+  vcmpps  ymm5, ymm2, ymm9, 1
+  vandps  ymm4, ymm4, ymm14
+  vandps  ymm5, ymm5, ymm15
+  vorps   ymm4, ymm4, ymm5
+  vmovups [rax], ymm4
+
+  add rax, 32
+  add rdx, 32
+  dec ecx
+  jnz @LionLoop
+
+  vzeroupper
+  end [
+    'RAX', 'RCX', 'RDX',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm9',
+    'ymm10', 'ymm11', 'ymm12', 'ymm13', 'ymm14', 'ymm15'
+  ];
+  end; // of if
+
+  // Scalar tail, same rounding sequence and same three-way select.
+  if MissedElements > 0 then
+  for I := localNumElements to NumElements - 1 do
+  begin
+    d := PtrDelta^[I];
+    m := PtrM^[I];
+    c := Beta1 * m + k1 * d;
+    PtrM^[I] := Beta2 * m + k2 * d;
+    if c > 0 then PtrDelta^[I] := NegLR
+    else if c < 0 then PtrDelta^[I] := PosLR
+    else PtrDelta^[I] := 0;
   end;
 end;
 procedure AVXMul(PtrA: TNeuralFloatArrPtr; MulOp: TNeuralFloat; NumElements: integer); overload;

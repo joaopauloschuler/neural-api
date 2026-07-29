@@ -35,6 +35,7 @@ type
     procedure TestVolumeAdamDeltaParity;
     procedure TestVolumeAdafactorDeltaParity;
     procedure TestVolumeClampAbsParity;
+    procedure TestVolumeLionDeltaParity;
     procedure TestVolumeFlip;
     procedure TestVolumeClassification;
     procedure TestVolumeSoftMax;
@@ -1084,6 +1085,106 @@ begin
     AssertEquals('zero bound is a no-op' + Tag, 9.0, Buf[0], 0.0);
     TNNetVolume.ClampAbs(TNeuralFloatArrPtr(@Buf[0]), cBound, 0);
     AssertEquals('empty run' + Tag, 9.0, Buf[0], 0.0);
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeLionDeltaParity;
+// LionDelta fuses the interpolation, the momentum EMA and the three-valued sign
+// select that TNNetNeuron.CalcLionDelta ran element by element. The reference
+// here is that loop in the SAME operation order, so the assertion is
+// BIT-identity at tolerance 0.0: neither path uses FMA, and the kernel's two
+// vcmpps masks reproduce the "> 0 / < 0 / else 0" chain exactly, +0.0 included.
+// The gradient pattern deliberately drives c through zero and back so all three
+// select arms fire, and one delta slot per row is an exact zero. Five
+// consecutive steps let the single momentum buffer accumulate. Sizes straddle
+// the 8-element block and the scalar tail.
+const
+  Sizes: array[0..8] of integer = (1, 3, 7, 8, 9, 16, 31, 64, 517);
+  cB1 = 0.9;
+  cB2 = 0.99;
+  cLR = 0.01;
+  cSteps = 5;
+var
+  D, M, RefD, RefM: TNNetVolume;
+  SI, K, N, Step: integer;
+  B1, B2, invNegLr, k1, k2, negLr, posLr, dv, mv, cv: TNeuralFloat;
+  Tag: string;
+begin
+  RandSeed := 16180339;
+  // Typed singles: an untyped const would let FPC evaluate the reference's
+  // multiplies in Double and round once more than the kernel does.
+  B1 := cB1;
+  B2 := cB2;
+  posLr := cLR;
+  negLr := -cLR;
+  invNegLr := -1.0 / cLR;
+  k1 := (1 - B1) * invNegLr;
+  k2 := (1 - B2) * invNegLr;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    D := TNNetVolume.Create(1, 1, N);
+    M := TNNetVolume.Create(1, 1, N);
+    RefD := TNNetVolume.Create(1, 1, N);
+    RefM := TNNetVolume.Create(1, 1, N);
+    try
+      for K := 0 to N - 1 do
+      begin
+        M.FData[K] := (Random - 0.5) * 0.4;
+        RefM.FData[K] := M.FData[K];
+      end;
+
+      for Step := 1 to cSteps do
+      begin
+        Tag := ' (N=' + IntToStr(N) + ' step ' + IntToStr(Step) + ')';
+        for K := 0 to N - 1 do
+        begin
+          if K mod 9 = 4 then D.FData[K] := 0
+          else if Step mod 2 = 0 then D.FData[K] := ((K mod 7) - 3) * 0.05
+          else D.FData[K] := (3 - (K mod 7)) * 0.05;
+          RefD.FData[K] := D.FData[K];
+        end;
+
+        // Reference: the loop this kernel replaced.
+        for K := 0 to N - 1 do
+        begin
+          dv := RefD.FData[K];
+          mv := RefM.FData[K];
+          cv := B1 * mv + k1 * dv;
+          RefM.FData[K] := B2 * mv + k2 * dv;
+          if cv > 0 then RefD.FData[K] := negLr
+          else if cv < 0 then RefD.FData[K] := posLr
+          else RefD.FData[K] := 0;
+        end;
+
+        TNNetVolume.LionDelta(D.DataPtr, M.DataPtr,
+          B1, k1, B2, k2, negLr, posLr, N);
+
+        for K := 0 to N - 1 do
+        begin
+          AssertEquals('momentum[' + IntToStr(K) + ']' + Tag,
+            RefM.FData[K], M.FData[K], 0.0);
+          AssertEquals('delta[' + IntToStr(K) + ']' + Tag,
+            RefD.FData[K], D.FData[K], 0.0);
+        end;
+      end;
+
+      // An exactly-zero c must select the zero arm, not a learning rate.
+      M.Fill(0);
+      D.Fill(0);
+      TNNetVolume.LionDelta(D.DataPtr, M.DataPtr,
+        B1, k1, B2, k2, negLr, posLr, N);
+      for K := 0 to N - 1 do
+        AssertEquals('zero c selects zero' + Tag, 0.0, D.FData[K], 0.0);
+
+      // A zero-length run must touch nothing.
+      D.FData[0] := 5;
+      TNNetVolume.LionDelta(D.DataPtr, M.DataPtr,
+        B1, k1, B2, k2, negLr, posLr, 0);
+      AssertEquals('empty run', 5.0, D.FData[0], 0.0);
+    finally
+      D.Free; M.Free; RefD.Free; RefM.Free;
+    end;
   end;
 end;
 

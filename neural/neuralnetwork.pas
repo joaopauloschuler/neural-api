@@ -127253,9 +127253,8 @@ end;
 // We rewrite FDelta to (-lr * sign(c_t)) so UpdateWeightsAdam() applies it.
 procedure TNNetNeuron.CalcLionDelta(pLearningRate, Beta1, Beta2: TNeuralFloat);
 var
-  Cnt, MaxCnt: integer;
-  lr, negLr, invNegLr, g, c, upd, m, oneMinusB1, oneMinusB2: TNeuralFloat;
-  k1, k2, d: TNeuralFloat;
+  lr, negLr, invNegLr, g, c, upd, oneMinusB1, oneMinusB2: TNeuralFloat;
+  k1, k2: TNeuralFloat;
 begin
   lr := pLearningRate;
   if lr = 0 then begin ClearDelta(); exit; end;
@@ -127280,19 +127279,11 @@ begin
   end;
 
   // ---- Weights ----
-  MaxCnt := FDelta.Size - 1;
-  for Cnt := 0 to MaxCnt do
-  begin
-    d := FDelta.FData[Cnt];
-    m := FBackInertia.FData[Cnt];
-    c := Beta1 * m + k1 * d;
-    // momentum EMA update (uses beta2), single state buffer.
-    FBackInertia.FData[Cnt] := Beta2 * m + k2 * d;
-    // final increment: -lr*sign(c), stored without the multiply.
-    if c > 0 then FDelta.FData[Cnt] := negLr
-    else if c < 0 then FDelta.FData[Cnt] := lr
-    else FDelta.FData[Cnt] := 0;
-  end;
+  // #13: the interpolation, the momentum EMA and the sign select over the
+  // whole weight row are one kernel pass; the momentum buffer is read once and
+  // written once and the final increment -lr*sign(c) is stored directly.
+  TNNetVolume.LionDelta(FDelta.DataPtr, FBackInertia.DataPtr,
+    Beta1, k1, Beta2, k2, negLr, lr, FDelta.Size);
 
   // ---- Bias (scalar momentum reuses FBiasInertia) ----
   g := FBiasDelta * invNegLr;
