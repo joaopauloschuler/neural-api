@@ -87826,9 +87826,9 @@ end;
 //   d_k = (2/s) * atanh(s * r_k), s = sqrt(c).
 procedure TNNetHyperbolicDistance.ComputeCPU();
 var
-  nIn, nProto, i, kk, rowBase, idx: integer;
+  nIn, nProto, i, kk, rowBase: integer;
   nInMax, nProtoMax: integer;
-  c, s, na2, Acoef, nb2, pco, qco, Den, r, t, dist: TNeuralFloat;
+  c, s, na2, Acoef, nb2, pco, qco, Den, r, t, dist, mv: TNeuralFloat;
   PrevOut, Pk: TNNetVolume;
 begin
   c := FCurvature;
@@ -87862,15 +87862,19 @@ begin
     if Abs(Den) < HYPERBOLIC_EPS then
       Den := HYPERBOLIC_EPS * Sign(Den + HYPERBOLIC_EPS);
     FCacheDen.FData[kk] := Den;
-    // m_k[i] = (pco*(-x_i) + qco*p_k_i)/Den.  (#11/#4: hoist row base + flat idx)
+    // m_k[i] = (pco*(-x_i) + qco*p_k_i)/Den.  (#11/#4: hoist row base, and the
+    // element itself instead of storing it and reading it back twice.) The
+    // divide stays exact and the norm stays a scalar accumulate in this same
+    // pass: splitting the row build from a bulk DotProduct norm measured
+    // 0.68-0.93x, and folding 1/Den into a bulk Mul/MulAdd row build measured
+    // slower than this loop in the plain build.
     rowBase := kk * nIn;
     r := 0;
     for i := 0 to nInMax do
     begin
-      idx := rowBase + i;
-      FCacheM.FData[idx] :=
-        (pco * (-FCacheX.FData[i]) + qco * Pk.FData[i]) / Den;
-      r := r + FCacheM.FData[idx] * FCacheM.FData[idx];
+      mv := (pco * (-FCacheX.FData[i]) + qco * Pk.FData[i]) / Den;
+      FCacheM.FData[rowBase + i] := mv;
+      r := r + mv * mv;
     end;
     r := Sqrt(r);
     FCacheR.FData[kk] := r;
