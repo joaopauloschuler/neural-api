@@ -26550,32 +26550,45 @@ end;
 procedure TNNetMultiQuantileLoss.Backpropagate();
 var
   StartTime: double;
-  Idx, SizeM1, N, Ch: integer;
+  Idx, SizeM1, N, NM1, Ch: integer;
   Q, V: TNeuralFloat;
+  // N is validated to 1..csNNetMaxParameterIdx+1 in the constructor and clamped
+  // by QuantileCount, so these fixed-size stack tables never allocate (#17).
+  QHi, QLo: array[0..csNNetMaxParameterIdx] of TNeuralFloat;
 begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
   N := QuantileCount();
+  NM1 := N - 1;
+  // Per-quantile gradient constants, resolved once instead of once per element.
+  for Ch := 0 to NM1 do
+  begin
+    Q := GetQuantile(Ch);
+    QHi[Ch] := 1.0 - Q;
+    QLo[Ch] := -Q;
+  end;
   SizeM1 := FOutputError.Size - 1;
+  // Data is depth-contiguous, so the channel (and thus the quantile) is the
+  // position within each consecutive N-wide group. Carried counter instead of
+  // Idx mod N (#6): the group index advances by 1 and wraps.
+  Ch := 0;
   for Idx := 0 to SizeM1 do
   begin
-    // Data is depth-contiguous, so the channel (and thus the quantile) is the
-    // position within each consecutive N-wide group.
-    Ch := Idx mod N;
-    Q := GetQuantile(Ch);
     // V = prediction - target = -e (e = target - prediction).
     // e > 0 (V < 0): dL/dprediction = -q_i
     // e < 0 (V > 0): dL/dprediction =  1 - q_i
     // e = 0 (V = 0): subgradient 0
     V := FOutputError.FData[Idx];
     if V > 0 then
-      FOutputError.FData[Idx] := 1.0 - Q
+      FOutputError.FData[Idx] := QHi[Ch]
     else if V < 0 then
-      FOutputError.FData[Idx] := -Q
+      FOutputError.FData[Idx] := QLo[Ch]
     else
       FOutputError.FData[Idx] := 0.0;
+    Inc(Ch);
+    if Ch > NM1 then Ch := 0;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   inherited BackpropagateNoTest();
