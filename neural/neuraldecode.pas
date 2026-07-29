@@ -2410,7 +2410,14 @@ var
   BeamLen, NewLen, TmpLen: array of integer;
   BeamPB, BeamPNB: array of double;
   BeamHash, BeamPHash, NewHash, NewPHash, TmpHash: array of QWord;
-  Prob: array of double; // current frame probabilities
+  // Current frame probabilities. Rule #25: every value stored here comes from
+  // Scores.FData (Single) through NeuralExp (Single -> Single), so Single is
+  // the exact element type - and it keeps the plain copy a Move. Each use is
+  // <double accumulator> * Prob[k], where the Single operand widens exactly,
+  // so the beam arithmetic is bit-identical. BeamPB/BeamPNB/Cand.PB/Cand.PNB
+  // stay double: those accumulate products of probabilities across frames and
+  // need the range.
+  Prob: array of TNeuralFloat;
   BestIdx: integer;
   BestScore, Total, Sum, AddV: double;
   BeamPBv, BeamPNBv, SumPBNB: double;
@@ -2456,9 +2463,17 @@ begin
     // so branch once outside instead of per element.
     ScoreBase := Scores.GetRawPos(ti, 0, 0);
     if LogInput then
+      // Kept scalar on purpose: TNNetVolume.Exp's AVX2 polynomial is not
+      // bit-identical to NeuralExp, and the reference-differential stress test
+      // compares decoded LABEL SEQUENCES, which a rank flip between two nearly
+      // tied beams would change.
       for k := 0 to VocabM1 do Prob[k] := NeuralExp(Scores.FData[ScoreBase + k])
     else
-      for k := 0 to VocabM1 do Prob[k] := Scores.FData[ScoreBase + k];
+      // Rule #13/App. C: a contiguous same-type copy is a Move. (Guarded so a
+      // depth-0 volume does not index an empty Prob, exactly as the loop it
+      // replaces ran zero times.)
+      if Vocab > 0 then
+        Move(Scores.FData[ScoreBase], Prob[0], Vocab * csNeuralFloatSize);
 
     BeamsHi := BeamCount - 1;
     LiveSlots := BeamCount * (Vocab + 1);
@@ -4686,16 +4701,21 @@ var
   I, SizeM1: integer;
   T, MaxP, LogMaxP, Sum, InvT: TNeuralFloat;
   RowPtr: TNeuralFloatArrPtr;
+  RowSize: integer;
 begin
   T := FTemperature;
   // Temperature 1.0 is a bit-for-bit no-op (p^(1/1) renormalized would
   // already be the identity, but skipping avoids float round-trips).
   if T = 1.0 then exit;
   if T < csDecodeMinTemperature then T := csDecodeMinTemperature;
-  SizeM1 := Row.Size - 1;
-  MaxP := Row.Raw[0];
-  for I := 1 to SizeM1 do
-    if Row.Raw[I] > MaxP then MaxP := Row.Raw[I];
+  RowSize := Row.Size;
+  SizeM1 := RowSize - 1;
+  RowPtr := TNeuralFloatArrPtr(Row.GetRawPtr(0));
+  // Rule #13/#18: the max scan is MaxValue - MaxPos without the index, whose
+  // scalar fallback is this loop element for element (strict >, so the first
+  // occurrence wins on both paths) and whose AVX2/64-bit path reduces sixteen
+  // elements per iteration over the whole vocabulary row.
+  MaxP := TNNetVolume.MaxValue(RowPtr, RowSize);
   // Defensive: an all-zero (or negative-degenerate) row is left untouched,
   // mirroring MaskAllowed's zero-mass fallback.
   if MaxP <= 0 then exit;
@@ -4704,18 +4724,20 @@ begin
   // element maps to (approximately) 1 and nothing overflows; with T at the
   // clamp the row degenerates to one-hot argmax (greedy).
   // Rule #13/App D: the whole body is a uniform in-place op sequence. Reproduce
-  // SafeLogProb's 1e-30 floor before Ln (zeros/negatives would hit the
-  // Cephes logf domain edge), then Ln / Add / Mul / Exp in place.
+  // SafeLogProb's 1e-30 floor before Ln (zeros/negatives would hit the Cephes
+  // logf domain edge), then Ln / Mul / ExpShiftSum in place. Distributing InvT
+  // over the shift - exp(ln p * InvT - LogMaxP * InvT) instead of
+  // exp((ln p - LogMaxP) * InvT) - is the same quantity re-associated, so that
+  // the subtract, the exponential and the renormalizing sum collapse into
+  // ExpShiftSum's single fused pass instead of an Add, an Exp and a GetSum.
+  // There is no clamp primitive, so the 1e-30 floor stays scalar.
   LogMaxP := SafeLogProb(MaxP);
   InvT := 1.0 / T;
-  RowPtr := TNeuralFloatArrPtr(Row.GetRawPtr(0));
   for I := 0 to SizeM1 do
     if RowPtr^[I] < 1e-30 then RowPtr^[I] := 1e-30;
-  TNNetVolume.Ln(RowPtr, RowPtr, Row.Size);
-  Row.Add(-LogMaxP);
+  TNNetVolume.Ln(RowPtr, RowPtr, RowSize);
   Row.Mul(InvT);
-  TNNetVolume.Exp(RowPtr, RowPtr, Row.Size);
-  Sum := Row.GetSum();
+  Sum := TNNetVolume.ExpShiftSum(RowPtr, RowPtr, LogMaxP * InvT, RowSize);
   if Sum <= 0 then Sum := 1.0;
   Row.Mul(1.0 / Sum);
 end;
