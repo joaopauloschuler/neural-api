@@ -40427,6 +40427,7 @@ begin
   RowStride := Prev.GetRawPos(1, 0);
   if Length(FdAttnBuf) <> SeqLen then SetLength(FdAttnBuf, SeqLen);
   if Length(FdScoreBuf) <> SeqLen then SetLength(FdScoreBuf, SeqLen);
+  if Length(FgBiasBuf) <> FNumBuckets then SetLength(FgBiasBuf, FNumBuckets);
   FillChar(FgBiasBuf[0], FNumBuckets * csNeuralFloatSize, 0);
   for i := 0 to SeqLenM1 do
   begin
@@ -42960,6 +42961,15 @@ begin
   hasInputGrad := (Prev.Size > 0) and (Prev.Size = PrevErr.Size);
   SeqLen := Prev.SizeX;
   SeqLenM1 := SeqLen - 1;
+  // Backprop scratch: SetPrevLayer sizes it only for a trainable layer, so
+  // size it here too rather than trusting the flag it was attached with.
+  if Length(FdAttn1Buf) <> SeqLen then
+  begin
+    SetLength(FdAttn1Buf, SeqLen);
+    SetLength(FdAttn2Buf, SeqLen);
+    SetLength(FdScore1Buf, SeqLen);
+    SetLength(FdScore2Buf, SeqLen);
+  end;
   // Row stride between consecutive j rows of Prev/PrevErr (= FDepth); the
   // j-stepped K/V pointers advance by this each iteration (#12). Invariant.
   RowStride := Prev.GetRawPos(1, 0);
