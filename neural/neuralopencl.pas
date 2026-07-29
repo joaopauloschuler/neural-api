@@ -1400,7 +1400,6 @@ begin
   begin
     FProg := nil;
     FContext := nil;
-    exit;
   end;
   if Assigned(FProg) then clReleaseProgram(FProg);
   if Assigned(FCommands) then clReleaseCommandQueue(FCommands);
