@@ -808,6 +808,11 @@ type
       FShouldConcatWeights: boolean;
       FShouldInterleaveWeights: boolean;
       FAfterWeightUpdateHasBeenCalled:boolean;
+      {$IFDEF OpenCL}
+      // Borrowed cai_dot_product_int8 handle, injected into FDotCL at Create
+      // time and released by this layer (FDotCL never owns it).
+      FInt8Kernel: TNeuralKernel;
+      {$ENDIF}
       // INT8 QUANTIZED WEIGHT STORAGE (inference-only). When FQuantInt8 is
       // true the FP32 weights have been replaced by per-output-channel
       // symmetric int8 codes in FQuantTable, shaped (NumNeurons, 1, VS): row
@@ -1910,6 +1915,20 @@ type
   end;
 
   {$IFDEF OpenCL}
+  // Base for every CL helper that drives one net-wide neural.cl entry point.
+  // Holds the borrow/release protocol - CreateShared takes the handle through
+  // TNNet.GetKernel, Destroy returns it through FreeKernelIfNotShared - so a
+  // descendant only implements its own buffers and dispatch. Coded by Claude (AI).
+  TNNetKernelCL = class(TMObject)
+  protected
+    FNN: TNNet;
+    FKernel: TNeuralKernel;
+    FKernelName: string;
+    constructor CreateShared(NN: TNNet; const pKernelName: string);
+  public
+    destructor Destroy(); override;
+  end;
+
   // OpenCL device forward for the GLU-family gated feed-forward activations
   // (TNNetGLU / TNNetSwiGLU / TNNetGEGLU / TNNetGEGLUErf). Binds the
   // cai_glu_gate entry point on the shared dot-product program's device:
@@ -1917,9 +1936,8 @@ type
   // computes A * act(B), act selected by an int flag (0=sigmoid, 1=swish,
   // 2=gelu-tanh, 3=gelu-erf). One work-item per (token, output-channel).
   // Coded by Claude (AI).
-  TNNetGLUGateCL = class(TMObject)
+  TNNetGLUGateCL = class(TNNetKernelCL)
   private
-    FKernel: TNeuralKernel;
     // Persistent device buffers (grow-only), reused every forward.
     FBufX, FBufY: cl_mem;
     FCapX, FCapY: csize_t;
@@ -3560,9 +3578,8 @@ type
   // reads the normalized result back. NO mean subtraction, NO gain/bias.
   // Forward-only (backward stays on CPU).
   {$IFDEF OpenCL}
-  TNNetL2NormCL = class(TMObject)
+  TNNetL2NormCL = class(TNNetKernelCL)
   private
-    FKernel: TNeuralKernel;
     // Persistent device buffers (grow-only), reused every forward.
     FBufX, FBufY: cl_mem;
     FCapX, FCapY: csize_t;
@@ -4402,9 +4419,8 @@ type
   // the kernel skips -- so clamp layers (warps) repeat the clamped index and
   // zero-pad layers (grid sample / upsample handle entirely in-bounds) just emit
   // valid indices, and either case is bit-faithful to the CPU forward.
-  TNNetBilinearGatherCL = class(TMObject)
+  TNNetBilinearGatherCL = class(TNNetKernelCL)
   private
-    FKernel: TNeuralKernel;
     // Host-side staging volumes (reused/resized across forwards): the source
     // feature map (raster [(y*W+x)*Depth+d]), the 4 corner offsets per output
     // pixel (stored as float, exact), the 4 blend weights, and the result.
@@ -4430,13 +4446,11 @@ type
   // the copy. Binds the cai_pixel_shuffle entry point on the shared dot-product
   // program's device. One work-item per output element. Forward-only.
   // Coded by Claude (AI).
-  TNNetPixelShuffleCL = class(TMObject)
+  TNNetPixelShuffleCL = class(TNNetKernelCL)
   private
-    FKernel: TNeuralKernel;
     // Persistent device buffers (grow-only), reused every forward.
     FBufSrc, FBufIdx, FBufDst: cl_mem;
     FCapSrc, FCapIdx, FCapDst: csize_t;
-    FNN: TNNet;
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
@@ -4456,9 +4470,8 @@ type
   // Binds the cai_bicubic_gather entry point on the shared dot-product program's
   // device. One work-item per (output pixel, depth channel). Forward-only.
   // Coded by Claude (AI).
-  TNNetBicubicGatherCL = class(TMObject)
+  TNNetBicubicGatherCL = class(TNNetKernelCL)
   private
-    FKernel: TNeuralKernel;
     // Persistent device buffers (grow-only), reused every forward.
     FBufSrc, FBufCorner, FBufWeight, FBufDst: cl_mem;
     FCapSrc, FCapCorner, FCapWeight, FCapDst: csize_t;
@@ -4480,9 +4493,8 @@ type
   // Binds the cai_pixel_shuffle_scatter entry point on the shared dot-product
   // program's device. One work-item per output element. Backward-only.
   // Coded by Claude (AI).
-  TNNetPixelShuffleScatterCL = class(TMObject)
+  TNNetPixelShuffleScatterCL = class(TNNetKernelCL)
   private
-    FKernel: TNeuralKernel;
     // Persistent device buffers (grow-only), reused every forward.
     FBufErr, FBufIdx, FBufDst: cl_mem;
     FCapErr, FCapIdx, FCapDst: csize_t;
@@ -4509,9 +4521,8 @@ type
   // Binds the cai_bicubic_scatter entry point on the shared dot-product
   // program's device. Backward-only.
   // Coded by Claude (AI).
-  TNNetBicubicScatterCL = class(TMObject)
+  TNNetBicubicScatterCL = class(TNNetKernelCL)
   private
-    FKernel: TNeuralKernel;
     // Persistent device buffers (grow-only), reused every forward.
     FBufErr, FBufRow, FBufIdx, FBufWeight, FBufDst: cl_mem;
     FCapErr, FCapRow, FCapIdx, FCapWeight, FCapDst: csize_t;
@@ -4532,9 +4543,8 @@ type
   // device, uploads the token tensor + gain (+ bias) weights, runs one
   // work-item per token and reads the normalized result back.
   // Coded by Claude (AI).
-  TNNetTokenNormCL = class(TMObject)
+  TNNetTokenNormCL = class(TNNetKernelCL)
   private
-    FKernel: TNeuralKernel;
     // Second entry point (cai_volume_norm) for the WHOLE-volume variants
     // (TNNetRMSNorm / TNNetLayerNorm): a single work-group cooperatively reduces
     // the whole sample instead of serializing it on one work-item.
@@ -4568,9 +4578,8 @@ type
   // one work-item per (sample) group (per-group mean/variance reduction + affine)
   // and reads the normalized result back. Forward-only.
   // Coded by Claude (AI).
-  TNNetGroupNormCL = class(TMObject)
+  TNNetGroupNormCL = class(TNNetKernelCL)
   private
-    FKernel: TNeuralKernel;
     // Persistent device buffers (grow-only), reused every forward.
     FBufX, FBufGain, FBufBias, FBufY: cl_mem;
     FCapX, FCapGain, FCapBias, FCapY: csize_t;
@@ -4593,9 +4602,8 @@ type
   // PoolSize*PoolSize stride window by max or sum/divisor -- and reads the pooled
   // result back. Forward-only (backward stays on CPU).
   // Coded by Claude (AI).
-  TNNetPool2DCL = class(TMObject)
+  TNNetPool2DCL = class(TNNetKernelCL)
   private
-    FKernel: TNeuralKernel;
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
@@ -4621,9 +4629,8 @@ type
   // cross-channel overspend) -- and reads the pre-activation raw output back.
   // Forward-only (backward stays on CPU).
   // Coded by Claude (AI).
-  TNNetDepthwiseConvCL = class(TMObject)
+  TNNetDepthwiseConvCL = class(TNNetKernelCL)
   private
-    FKernel: TNeuralKernel;
     // Persistent device buffers (grow-only), reused every forward.
     FBufW, FBufX, FBufY: cl_mem;
     FCapW, FCapX, FCapY: csize_t;
@@ -4647,9 +4654,8 @@ type
   // OOB taps in-kernel) -- and reads the (linear, no-activation) output back.
   // Forward-only (backward stays on CPU).
   // Coded by Claude (AI).
-  TNNetDepthwiseConv1DCL = class(TMObject)
+  TNNetDepthwiseConv1DCL = class(TNNetKernelCL)
   private
-    FKernel: TNeuralKernel;
     // Persistent device buffers (grow-only), reused every forward.
     FBufW, FBufBias, FBufX, FBufY: cl_mem;
     FCapW, FCapBias, FCapX, FCapY: csize_t;
@@ -4673,9 +4679,8 @@ type
   // rotation), runs one work-item per (token, channel-pair) and reads the
   // rotated result back. Forward-only (backward stays on the CPU).
   // Coded by Claude (AI).
-  TNNetRoPECL = class(TMObject)
+  TNNetRoPECL = class(TNNetKernelCL)
   private
-    FKernel: TNeuralKernel;
     FTheta: TNNetVolume; // host staging for the per-pair theta table
     // Persistent device buffers (grow-only), reused every forward.
     FBufX, FBufTheta, FBufY: cl_mem;
@@ -4702,9 +4707,8 @@ type
   // TNNetRoPECL, just a per-(token,pair) angle table instead of a per-pair theta.
   // Runs one work-item per (token, channel-pair). Forward-only (backward on CPU).
   // Coded by Claude (AI).
-  TNNetMRoPECL = class(TMObject)
+  TNNetMRoPECL = class(TNNetKernelCL)
   private
-    FKernel: TNeuralKernel;
     FAngle: TNNetVolume; // host staging for the per-(token,pair) angle table
     // Persistent device buffers (grow-only), reused every forward.
     FBufX, FBufAngle, FBufY: cl_mem;
@@ -4729,9 +4733,8 @@ type
   // EncodeZero / zero-padding decision (row = -1 leaves that token zero) stays on
   // the host, faithful to the scalar Compute(). Forward-only (backward on CPU).
   // Coded by Claude (AI).
-  TNNetEmbeddingCL = class(TMObject)
+  TNNetEmbeddingCL = class(TNNetKernelCL)
   private
-    FKernel: TNeuralKernel;
     // The vocab table is large (VocabSize x EmbeddingSize) and CONSTANT across
     // forwards during inference, so it is uploaded once and kept resident here
     // instead of being re-shipped every Gather (a 65MB/forward PCIe stall on a
@@ -4766,9 +4769,8 @@ type
   // divide -- and reads the result back. ApplyMinScale selects the whole-volume
   // low-end rescaling variant (TVolume.SoftMax). Forward-only (backward on CPU).
   // Coded by Claude (AI).
-  TNNetSoftMaxCL = class(TMObject)
+  TNNetSoftMaxCL = class(TNNetKernelCL)
   private
-    FKernel: TNeuralKernel;
     // Persistent device buffers (grow-only), reused every forward.
     FBufX, FBufY: cl_mem;
     FCapX, FCapY: csize_t;
@@ -35404,14 +35406,27 @@ begin
 end;
 
 {$IFDEF OpenCL}
+{ TNNetKernelCL }
+
+constructor TNNetKernelCL.CreateShared(NN: TNNet; const pKernelName: string);
+begin
+  inherited Create();
+  FNN := NN;
+  FKernelName := pKernelName;
+  FKernel := NN.GetKernel(pKernelName);
+end;
+
+destructor TNNetKernelCL.Destroy();
+begin
+  FNN.FreeKernelIfNotShared(FKernelName, FKernel);
+  inherited Destroy();
+end;
+
 { TNNetBilinearGatherCL }
 
 constructor TNNetBilinearGatherCL.Create(NN: TNNet);
 begin
-  inherited Create();
-  // Borrow the net-wide cai_bilinear_gather handle (shared by every resampling
-  // layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.GetSharedKernel('cai_bilinear_gather');
+  inherited CreateShared(NN, 'cai_bilinear_gather');
   FSrcBuf    := TNNetVolume.Create();
   FCornerBuf := TNNetVolume.Create();
   FWeightBuf := TNNetVolume.Create();
@@ -35428,7 +35443,6 @@ begin
   if Assigned(FBufCornerCL) then clReleaseMemObject(FBufCornerCL);
   if Assigned(FBufWeightCL) then clReleaseMemObject(FBufWeightCL);
   if Assigned(FBufDstCL)    then clReleaseMemObject(FBufDstCL);
-  // FKernel is a net-owned shared handle - do not free here.
   inherited Destroy();
 end;
 
@@ -35463,9 +35477,7 @@ end;
 
 constructor TNNetPixelShuffleCL.Create(NN: TNNet);
 begin
-  inherited Create();
-  FNN := NN;
-  FKernel := NN.GetKernel('cai_pixel_shuffle');
+  inherited CreateShared(NN, 'cai_pixel_shuffle');
 end;
 
 destructor TNNetPixelShuffleCL.Destroy();
@@ -35473,7 +35485,6 @@ begin
   if Assigned(FBufSrc) then clReleaseMemObject(FBufSrc);
   if Assigned(FBufIdx) then clReleaseMemObject(FBufIdx);
   if Assigned(FBufDst) then clReleaseMemObject(FBufDst);
-  FNN.FreeKernelIfNotShared('cai_pixel_shuffle', FKernel);
   inherited Destroy();
 end;
 
@@ -35502,10 +35513,7 @@ end;
 
 constructor TNNetBicubicGatherCL.Create(NN: TNNet);
 begin
-  inherited Create();
-  // Borrow the net-wide cai_bicubic_gather handle (shared by every resampling
-  // layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.GetSharedKernel('cai_bicubic_gather');
+  inherited CreateShared(NN, 'cai_bicubic_gather');
 end;
 
 destructor TNNetBicubicGatherCL.Destroy();
@@ -35514,7 +35522,6 @@ begin
   if Assigned(FBufCorner) then clReleaseMemObject(FBufCorner);
   if Assigned(FBufWeight) then clReleaseMemObject(FBufWeight);
   if Assigned(FBufDst)    then clReleaseMemObject(FBufDst);
-  // FKernel is a net-owned shared handle - do not free here.
   inherited Destroy();
 end;
 
@@ -35546,10 +35553,7 @@ end;
 
 constructor TNNetPixelShuffleScatterCL.Create(NN: TNNet);
 begin
-  inherited Create();
-  // Borrow the net-wide cai_pixel_shuffle_scatter handle (shared by every
-  // pixel-shuffle layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.GetSharedKernel('cai_pixel_shuffle_scatter');
+  inherited CreateShared(NN, 'cai_pixel_shuffle_scatter');
 end;
 
 destructor TNNetPixelShuffleScatterCL.Destroy();
@@ -35557,7 +35561,6 @@ begin
   if Assigned(FBufErr) then clReleaseMemObject(FBufErr);
   if Assigned(FBufIdx) then clReleaseMemObject(FBufIdx);
   if Assigned(FBufDst) then clReleaseMemObject(FBufDst);
-  // FKernel is a net-owned shared handle - do not free here.
   inherited Destroy();
 end;
 
@@ -35586,10 +35589,7 @@ end;
 
 constructor TNNetBicubicScatterCL.Create(NN: TNNet);
 begin
-  inherited Create();
-  // Borrow the net-wide cai_bicubic_scatter handle (shared by every resampling
-  // layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.GetSharedKernel('cai_bicubic_scatter');
+  inherited CreateShared(NN, 'cai_bicubic_scatter');
 end;
 
 destructor TNNetBicubicScatterCL.Destroy();
@@ -35599,7 +35599,6 @@ begin
   if Assigned(FBufIdx)    then clReleaseMemObject(FBufIdx);
   if Assigned(FBufWeight) then clReleaseMemObject(FBufWeight);
   if Assigned(FBufDst)    then clReleaseMemObject(FBufDst);
-  // FKernel is a net-owned shared handle - do not free here.
   inherited Destroy();
 end;
 
@@ -35633,11 +35632,8 @@ end;
 
 constructor TNNetTokenNormCL.Create(NN: TNNet);
 begin
-  inherited Create();
-  // Borrow the net-wide handles for these entry points (one per net, shared by
-  // every norm layer) instead of creating our own; NN owns and frees them.
-  FKernel := NN.GetSharedKernel('cai_token_norm');
-  FVolKernel := NN.GetSharedKernel('cai_volume_norm');
+  inherited CreateShared(NN, 'cai_token_norm');
+  FVolKernel := NN.GetKernel('cai_volume_norm');
   FXBuf := TNNetVolume.Create();
   FYBuf := TNNetVolume.Create();
 end;
@@ -35651,7 +35647,7 @@ begin
   if Assigned(FBufGain) then clReleaseMemObject(FBufGain);
   if Assigned(FBufBias) then clReleaseMemObject(FBufBias);
   if Assigned(FBufY)    then clReleaseMemObject(FBufY);
-  // FKernel/FVolKernel are net-owned shared handles - do not free here.
+  FNN.FreeKernelIfNotShared('cai_volume_norm', FVolKernel);
   inherited Destroy();
 end;
 
@@ -35734,10 +35730,7 @@ end;
 
 constructor TNNetGroupNormCL.Create(NN: TNNet);
 begin
-  inherited Create();
-  // Borrow the net-wide cai_group_norm handle (shared by every group-norm layer)
-  // instead of creating our own; NN owns and frees it.
-  FKernel := NN.GetSharedKernel('cai_group_norm');
+  inherited CreateShared(NN, 'cai_group_norm');
 end;
 
 destructor TNNetGroupNormCL.Destroy();
@@ -35746,7 +35739,6 @@ begin
   if Assigned(FBufGain) then clReleaseMemObject(FBufGain);
   if Assigned(FBufBias) then clReleaseMemObject(FBufBias);
   if Assigned(FBufY)    then clReleaseMemObject(FBufY);
-  // FKernel is a net-owned shared handle - do not free here.
   inherited Destroy();
 end;
 
@@ -35790,17 +35782,13 @@ end;
 
 constructor TNNetL2NormCL.Create(NN: TNNet);
 begin
-  inherited Create();
-  // Borrow the net-wide cai_l2norm_perdepth handle (shared by every L2-norm
-  // layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.GetSharedKernel('cai_l2norm_perdepth');
+  inherited CreateShared(NN, 'cai_l2norm_perdepth');
 end;
 
 destructor TNNetL2NormCL.Destroy();
 begin
   if Assigned(FBufX) then clReleaseMemObject(FBufX);
   if Assigned(FBufY) then clReleaseMemObject(FBufY);
-  // FKernel is a net-owned shared handle - do not free here.
   inherited Destroy();
 end;
 
@@ -35834,17 +35822,13 @@ end;
 
 constructor TNNetPool2DCL.Create(NN: TNNet);
 begin
-  inherited Create();
-  // Borrow the net-wide cai_pool2d handle (shared by every pooling layer)
-  // instead of creating our own; NN owns and frees it.
-  FKernel := NN.GetSharedKernel('cai_pool2d');
+  inherited CreateShared(NN, 'cai_pool2d');
 end;
 
 destructor TNNetPool2DCL.Destroy();
 begin
   if Assigned(FBufX) then clReleaseMemObject(FBufX);
   if Assigned(FBufY) then clReleaseMemObject(FBufY);
-  // FKernel is a net-owned shared handle - do not free here.
   inherited Destroy();
 end;
 
@@ -35883,10 +35867,7 @@ end;
 
 constructor TNNetDepthwiseConvCL.Create(NN: TNNet);
 begin
-  inherited Create();
-  // Borrow the net-wide cai_depthwise_conv2d handle (shared by every depthwise
-  // conv layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.GetSharedKernel('cai_depthwise_conv2d');
+  inherited CreateShared(NN, 'cai_depthwise_conv2d');
 end;
 
 destructor TNNetDepthwiseConvCL.Destroy();
@@ -35894,7 +35875,6 @@ begin
   if Assigned(FBufW) then clReleaseMemObject(FBufW);
   if Assigned(FBufX) then clReleaseMemObject(FBufX);
   if Assigned(FBufY) then clReleaseMemObject(FBufY);
-  // FKernel is a net-owned shared handle - do not free here.
   inherited Destroy();
 end;
 
@@ -35934,10 +35914,7 @@ end;
 
 constructor TNNetDepthwiseConv1DCL.Create(NN: TNNet);
 begin
-  inherited Create();
-  // Borrow the net-wide cai_depthwise_conv1d handle (shared by every depthwise
-  // 1D conv layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.GetSharedKernel('cai_depthwise_conv1d');
+  inherited CreateShared(NN, 'cai_depthwise_conv1d');
 end;
 
 destructor TNNetDepthwiseConv1DCL.Destroy();
@@ -35946,7 +35923,6 @@ begin
   if Assigned(FBufBias) then clReleaseMemObject(FBufBias);
   if Assigned(FBufX)    then clReleaseMemObject(FBufX);
   if Assigned(FBufY)    then clReleaseMemObject(FBufY);
-  // FKernel is a net-owned shared handle - do not free here.
   inherited Destroy();
 end;
 
@@ -35984,17 +35960,13 @@ end;
 
 constructor TNNetSoftMaxCL.Create(NN: TNNet);
 begin
-  inherited Create();
-  // Borrow the net-wide cai_softmax handle (shared by every softmax layer)
-  // instead of creating our own; NN owns and frees it.
-  FKernel := NN.GetSharedKernel('cai_softmax');
+  inherited CreateShared(NN, 'cai_softmax');
 end;
 
 destructor TNNetSoftMaxCL.Destroy();
 begin
   if Assigned(FBufX) then clReleaseMemObject(FBufX);
   if Assigned(FBufY) then clReleaseMemObject(FBufY);
-  // FKernel is a net-owned shared handle - do not free here.
   inherited Destroy();
 end;
 
@@ -36026,10 +35998,7 @@ end;
 
 constructor TNNetRoPECL.Create(NN: TNNet);
 begin
-  inherited Create();
-  // Borrow the net-wide cai_rope handle (shared by every RoPE layer) instead of
-  // creating our own; NN owns and frees it.
-  FKernel := NN.GetSharedKernel('cai_rope');
+  inherited CreateShared(NN, 'cai_rope');
   FTheta := TNNetVolume.Create();
 end;
 
@@ -36039,7 +36008,6 @@ begin
   if Assigned(FBufX)     then clReleaseMemObject(FBufX);
   if Assigned(FBufTheta) then clReleaseMemObject(FBufTheta);
   if Assigned(FBufY)     then clReleaseMemObject(FBufY);
-  // FKernel is a net-owned shared handle - do not free here.
   inherited Destroy();
 end;
 
@@ -36083,10 +36051,7 @@ end;
 
 constructor TNNetMRoPECL.Create(NN: TNNet);
 begin
-  inherited Create();
-  // Borrow the net-wide cai_mrope handle (shared by every M-RoPE layer) instead
-  // of creating our own; NN owns and frees it.
-  FKernel := NN.GetSharedKernel('cai_mrope');
+  inherited CreateShared(NN, 'cai_mrope');
   FAngle := TNNetVolume.Create();
 end;
 
@@ -36096,7 +36061,6 @@ begin
   if Assigned(FBufX)     then clReleaseMemObject(FBufX);
   if Assigned(FBufAngle) then clReleaseMemObject(FBufAngle);
   if Assigned(FBufY)     then clReleaseMemObject(FBufY);
-  // FKernel is a net-owned shared handle - do not free here.
   inherited Destroy();
 end;
 
@@ -36134,10 +36098,7 @@ end;
 
 constructor TNNetEmbeddingCL.Create(NN: TNNet);
 begin
-  inherited Create();
-  // Borrow the net-wide cai_embedding_gather handle (shared by every embedding
-  // layer) instead of creating our own; NN owns and frees it.
-  FKernel := NN.GetSharedKernel('cai_embedding_gather');
+  inherited CreateShared(NN, 'cai_embedding_gather');
   FWeightCached := false;
 end;
 
@@ -36146,7 +36107,6 @@ begin
   if FWeightCached then clReleaseMemObject(FWeightBuf);
   if Assigned(FBufRows) then clReleaseMemObject(FBufRows);
   if Assigned(FBufY)    then clReleaseMemObject(FBufY);
-  // FKernel is a net-owned shared handle - do not free here.
   inherited Destroy();
 end;
 
@@ -36194,17 +36154,13 @@ end;
 
 constructor TNNetGLUGateCL.Create(NN: TNNet);
 begin
-  inherited Create();
-  // Borrow the net-wide cai_glu_gate handle (shared by every GLU-family layer)
-  // instead of creating our own; NN owns and frees it.
-  FKernel := NN.GetSharedKernel('cai_glu_gate');
+  inherited CreateShared(NN, 'cai_glu_gate');
 end;
 
 destructor TNNetGLUGateCL.Destroy();
 begin
   if Assigned(FBufX) then clReleaseMemObject(FBufX);
   if Assigned(FBufY) then clReleaseMemObject(FBufY);
-  // FKernel is a net-owned shared handle - do not free here.
   inherited Destroy();
 end;
 
@@ -73610,6 +73566,10 @@ begin
   FConcatedWeights.Free;
   FNeuronWeightList.Free;
   FConcatedWInter.Free;
+  {$IFDEF OpenCL}
+  if Assigned(FNN) then
+    FNN.FreeKernelIfNotShared('cai_dot_product_int8', FInt8Kernel);
+  {$ENDIF}
   inherited Destroy();
 end;
 
@@ -73640,7 +73600,7 @@ begin
   // convolution: a pointwise conv has no im2col (FInputPrepared aliases the prev
   // output). The net owns and frees the handle. Coded by Claude (AI).
   if Assigned(FDotCL) and (not FPointwise) then
-    FIm2ColKernel := FNN.GetSharedKernel('cai_im2col');
+    FIm2ColKernel := FNN.GetKernel('cai_im2col');
 end;
 
 procedure TNNetLayerConcatedWeights.EnableOpenCL(
@@ -73659,8 +73619,8 @@ begin
   begin
     if not Assigned(FDotCL) then
     begin
-      FDotCL := TDotProductSharedKernel.Create(DotProductKernel,
-        FNN.GetSharedKernel('cai_dot_product_int8'));
+      FInt8Kernel := FNN.GetKernel('cai_dot_product_int8');
+      FDotCL := TDotProductSharedKernel.Create(DotProductKernel, FInt8Kernel);
       FDotCL.HideMessages();
     end;
     if FQuantInt8 then
@@ -95955,6 +95915,8 @@ end;
 destructor TNNetIdentity.Destroy();
 begin
   if Assigned(FActivationBuffer) then clReleaseMemObject(FActivationBuffer);
+  if Assigned(FNN) then
+    FNN.FreeKernelIfNotShared('cai_activation', FActivationKernel);
   inherited Destroy();
 end;
 
@@ -95969,7 +95931,7 @@ begin
   // convolution layers confine allocation to EnableOpenCL/PrepareForCompute.
   if FActivationOpcode <> csActNone then
   begin
-    if Assigned(FNN) then FActivationKernel := FNN.GetSharedKernel('cai_activation');
+    if Assigned(FNN) then FActivationKernel := FNN.GetKernel('cai_activation');
     if Assigned(FActivationBuffer) and (FActivationBufSize <> FOutput.Size) then
     begin
       clReleaseMemObject(FActivationBuffer);
@@ -98502,6 +98464,10 @@ begin
     then FInputPrepared.Free;
 
   //FDotProductResult.Free;
+  {$IFDEF OpenCL}
+  if Assigned(FNN) then
+    FNN.FreeKernelIfNotShared('cai_im2col', FIm2ColKernel);
+  {$ENDIF}
   inherited Destroy;
 end;
 
@@ -123513,7 +123479,9 @@ begin
   if Assigned(FSharedKernels) then
   begin
     idx := FSharedKernels.IndexOf(kernelname);
-    ShouldFree := (TNeuralKernel(FSharedKernels.Objects[idx]) <> KernelObject);
+    // Not cached: the handle came from CreateKernel, so the caller owns it.
+    ShouldFree := (idx < 0) or
+      (TNeuralKernel(FSharedKernels.Objects[idx]) <> KernelObject);
   end;
   if ShouldFree then
   begin
