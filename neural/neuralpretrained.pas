@@ -45396,11 +45396,10 @@ procedure LoadHiFiGANConv(Reader: TNNetSafeTensorsReader;
   const Prefix: string; var Conv: THiFiGANConv; pTranspose: boolean;
   pStride, pDilation, pPad: integer; Consumed: TStrings);
 var
-  LpMax: integer;
   G, V, W: TNNetVolume;
-  OutDim, InDim, K, o, i, k2, Base, Cnt: integer;
-  OutDimM1, InDimM1, KM1: integer;
-  Norm: TNeuralFloat;
+  OutDim, InDim, K, o, Base, Cnt: integer;
+  OutDimM1, RowLen, RowBytes: integer;
+  Norm, Scale: TNeuralFloat;
   WName, GName, VName: string;
 begin
   G := TNNetVolume.Create;
@@ -45422,8 +45421,9 @@ begin
       K := Reader.DimSize(WName, 2);
       Cnt := OutDim * InDim * K;
       SetLength(Conv.W, Cnt);
-      LpMax := Cnt - 1;
-      for i := 0 to LpMax do Conv.W[i] := W.FData[i];
+      // #13: contiguous copy, no arithmetic - one memmove.
+      if Cnt > 0 then
+        Move(W.FData[0], Conv.W[0], Cnt * csNeuralFloatSize);
     end
     else
     begin
@@ -45452,19 +45452,26 @@ begin
       Cnt := OutDim * InDim * K;
       SetLength(Conv.W, Cnt);
       // weight_norm dim=0: per group-row o, w = g[o] * v[o] / ||v[o]||_F.
+      // The row is a uniform scale of a contiguous InDim*K run, so copy it and
+      // fire one AVX Mul (#13) with a single divide per row (#21) instead of a
+      // per-element divide. v*(g/norm) reassociates against g*v/norm; that is
+      // an import-time weight fold, well inside the 1e-4 synthesis parity gate.
       OutDimM1 := OutDim - 1;
-      InDimM1 := InDim - 1;
-      KM1 := K - 1;
+      RowLen := InDim * K;
+      RowBytes := RowLen * csNeuralFloatSize;
+      Base := 0;                 // #6: o * InDim * K carried
       for o := 0 to OutDimM1 do
       begin
-        Base := o * InDim * K;
-        Norm := TNNetVolume.DotProduct(@V.FData[Base], @V.FData[Base], InDim * K);
+        Norm := TNNetVolume.DotProduct(@V.FData[Base], @V.FData[Base], RowLen);
         Norm := Sqrt(Norm);
         if Norm = 0 then Norm := 1;
-        for i := 0 to InDimM1 do
-          for k2 := 0 to KM1 do
-            Conv.W[Base + i * K + k2] :=
-              G.FData[o] * V.FData[Base + i * K + k2] / Norm;
+        Scale := G.FData[o] / Norm;
+        if RowLen > 0 then
+        begin
+          Move(V.FData[Base], Conv.W[Base], RowBytes);
+          TNNetVolume.Mul(@Conv.W[Base], Scale, RowLen);
+        end;
+        Inc(Base, RowLen);
       end;
     end;
     Conv.Kernel := K;
@@ -45488,8 +45495,8 @@ begin
     Reader.LoadTensorFlat(Prefix + '.bias', G);
     Consumed.Add(Prefix + '.bias');
     SetLength(Conv.B, G.Size);
-    LpMax := G.Size - 1;
-    for o := 0 to LpMax do Conv.B[o] := G.FData[o];
+    if G.Size > 0 then
+      Move(G.FData[0], Conv.B[0], G.Size * csNeuralFloatSize);   // #13
   finally
     W.Free;
     V.Free;
@@ -45531,7 +45538,7 @@ var
   Acc, Bias: TNeuralFloat;
   Patch: TNeuralFloatDynArr;
   InT, WT: TNeuralFloatDynArr;
-  InRow, OutRow: TNeuralFloatDynArr;
+  OutRow: TNeuralFloatDynArr;
   InRowPtrs: array of TNeuralFloatArrPtr;
   InRowP, OutRowP: TNeuralFloatArrPtr;
   {$IFDEF OpenCL}
@@ -46644,13 +46651,8 @@ begin
   Mean := 0;
   for i := 0 to CM1 do Mean := Mean + X[i];
   Mean := Mean / C;
-  Vari := 0;
-  for i := 0 to CM1 do
-  begin
-    D := X[i] - Mean;
-    Vari := Vari + D * D;
-  end;
-  Vari := Vari / C;
+  // #13/#18: the centered sum of squares has an AVX kernel.
+  Vari := TNNetVolume.SumSqrCentered(Addr(X[0]), Mean, C) / C;
   D := 1.0 / Sqrt(Vari + Eps);
   for i := 0 to CM1 do X[i] := (X[i] - Mean) * D * Gain[i] + Bias[i];
 end;
@@ -48419,9 +48421,9 @@ end;
 procedure TNNetKokoro.RunAdaIN(const AdaIN: TKokoroAdaIN;
   const S: TNeuralFloatDynArr; var Sig: TNNetFloatDynArr2D);
 var
-  H, Tlen, c, t, i, HM1, TM1: integer;
+  H, Tlen, c, t, HM1, TM1: integer;
   gBase, bBase: integer;
-  Mean, Variance, Acc, Gamma, Beta, Eps, InvStd, GIS: TNeuralFloat;
+  Mean, Variance, Gamma, Beta, Eps, InvStd, GIS: TNeuralFloat;
   SigRow: TNeuralFloatDynArr;
 begin
   H := FConfig.HiddenSize;
@@ -48431,7 +48433,7 @@ begin
   Eps := FConfig.LayerNormEps;
   for c := 0 to HM1 do
   begin
-    SigRow := Sig[c];               // #9: bind channel row once (3 passes)
+    SigRow := Sig[c];               // #9: bind channel row once (5 passes)
     // fc row gamma = FcW[c], beta = FcW[H + c] (each a length-H dot with S).
     gBase := c * H;
     bBase := (H + c) * H;
@@ -48443,17 +48445,17 @@ begin
     Mean := 0;
     for t := 0 to TM1 do Mean := Mean + SigRow[t];
     Mean := Mean / Tlen;
-    Variance := 0;
-    for t := 0 to TM1 do
-    begin
-      Acc := SigRow[t] - Mean;
-      Variance := Variance + Acc * Acc;
-    end;
-    Variance := Variance / Tlen;
+    // #13/#18: the centered sum of squares has an AVX kernel.
+    Variance := TNNetVolume.SumSqrCentered(Addr(SigRow[0]), Mean, Tlen) / Tlen;
     InvStd := 1.0 / Sqrt(Variance + Eps);
     GIS := Gamma * InvStd;          // #5: reassociate (TTS parity gate <1e-4)
-    for t := 0 to TM1 do
-      SigRow[t] := GIS * (SigRow[t] - Mean) + Beta;
+    // GIS*(x - Mean) + Beta as three AVX passes. Folding it to
+    // Mul(GIS)+AddScalar(Beta - GIS*Mean) measured the same and would trade a
+    // reassociation for nothing, so keep the shift/scale/shift order: each
+    // element sees the same three single-precision ops as the scalar loop did.
+    TNNetVolume.AddScalar(Addr(SigRow[0]), -Mean, Tlen);
+    TNNetVolume.Mul(Addr(SigRow[0]), GIS, Tlen);
+    TNNetVolume.AddScalar(Addr(SigRow[0]), Beta, Tlen);
   end;
 end;
 
@@ -49543,7 +49545,8 @@ var
     XW, DtW, WV, WB, WC: TNNetVolume;
     d, s, r, j, NS, DI, RK, NSM1, DIM1, RKM1: integer;
     dBase, xOff, idx, sBase, bBase, cBase: integer;
-    Acc: double;
+    DtVal: TNeuralFloat;
+    AccRow: array of double;
   begin
     NS := Config.StateSize;
     DI := Config.DInner;
@@ -49593,21 +49596,28 @@ var
       begin
         // W_d = dt_proj.weight @ x_proj.weight[0:dt_rank] - the low-rank
         // delta path folded exactly (double accumulation).
+        // Accumulate a whole DI-long row at a time so both operands are
+        // walked contiguously: contracting r in the innermost position made
+        // every XW read stride DI floats (6 KB at DI=1536), i.e. one cache
+        // line per multiply. Summing over r in the same order into the same
+        // double accumulator keeps the fold bit-identical. Do NOT swap the
+        // inner line for TNNetVolume.MulAdd - that would drop it to Single.
         WV := Layer.FArrNeurons[0].Weights;
+        SetLength(AccRow, DI);
         for d := 0 to DIM1 do
         begin
           dBase := d * RK;
-          for j := 0 to DIM1 do
+          for j := 0 to DIM1 do AccRow[j] := 0;
+          xOff := 0;
+          for r := 0 to RKM1 do
           begin
-            Acc := 0;
-            xOff := j;
-            for r := 0 to RKM1 do
-            begin
-              Acc := Acc + DtW.FData[dBase + r] * XW.FData[xOff];
-              Inc(xOff, DI);
-            end;
-            WV.FData[d * DI + j] := Acc;
+            DtVal := DtW.FData[dBase + r];
+            for j := 0 to DIM1 do
+              AccRow[j] := AccRow[j] + DtVal * XW.FData[xOff + j];
+            Inc(xOff, DI);
           end;
+          idx := d * DI;
+          for j := 0 to DIM1 do WV.FData[idx + j] := AccRow[j];
         end;
       end;
       // W_B / W_C: the next d_state + d_state x_proj rows (shared across
