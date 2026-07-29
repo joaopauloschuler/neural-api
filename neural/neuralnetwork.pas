@@ -86805,10 +86805,11 @@ begin
     acc := TNNetVolume.DotProduct(@W.FData[base], PrevOut.DataPtr, Din);
     FCacheProj.FData[k] := acc;
     pcr_sincosf(acc, FOutput.FData[D + k], FOutput.FData[k]);
-    FOutput.FData[k]     := FScale * FOutput.FData[k];      // cos channels 0..D-1
-    FOutput.FData[D + k] := FScale * FOutput.FData[D + k];  // sin channels D..2D-1
     Inc(base, Din);
   end;
+  // The loop writes every one of the 2*D output channels (cos in 0..D-1, sin in
+  // D..2D-1), so the common sqrt(1/D) factor is one bulk scale over the volume.
+  FOutput.Mul(FScale);
 end;
 
 procedure TNNetRandomFourierFeatures.Backpropagate();
