@@ -10,6 +10,9 @@ bin/
 *.exe
 *.compiled
 *.bak
+# Patch/merge leftovers (see the accidental neuralnetwork.pas.orig)
+*.orig
+*.rej
 backup/
 lib/
 tests/RunTests
