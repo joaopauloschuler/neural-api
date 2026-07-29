@@ -2483,49 +2483,145 @@ const
   cAVXExpP5:  Single  = 0.008333333333333333;
   cAVXExpP6:  Single  = 0.001388888888888889;
   cAVXExp127: Integer = 127;
+// Eight-wide mirrors of the last polynomial coefficients. The 64-bit kernels
+// fold these straight into a vfmadd213ps memory operand instead of broadcasting
+// a scalar per iteration; the scalars above stay because the 32-bit kernel and
+// the register-hoisted coefficients still read them. FPC cannot initialise a
+// typed constant from another typed constant, so the literals are repeated -
+// keep each row in step with the scalar of the same name.
+  cAVXExpP0V: array[0..7] of Single =
+    (1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0);
+  cAVXExpP1V: array[0..7] of Single =
+    (1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0);
+  cAVXExpP2V: array[0..7] of Single =
+    (0.5, 0.5, 0.5, 0.5,
+     0.5, 0.5, 0.5, 0.5);
 
 // Constants for the AVX2 8-wide ln() approximation (AVXLn), Cephes single-precision
 // logf. Decompose x = m * 2^e with m in [sqrt(0.5), sqrt(2)); ln(x) = ln(m) + e*ln2,
 // where ln(m) is a degree-8 minimax polynomial in (m-1). Max relative error ~2e-7
 // over the normal positive range, far below the 1e-4 parity target vs pcr_logf.
-  cAVXLnP0:   Single  =  7.0376836292E-2;
-  cAVXLnP1:   Single  = -1.1514610310E-1;
-  cAVXLnP2:   Single  =  1.1676998740E-1;
-  cAVXLnP3:   Single  = -1.2420140846E-1;
-  cAVXLnP4:   Single  =  1.4249322787E-1;
-  cAVXLnP5:   Single  = -1.6668057665E-1;
-  cAVXLnP6:   Single  =  2.0000714765E-1;
-  cAVXLnP7:   Single  = -2.4999993993E-1;
-  cAVXLnP8:   Single  =  3.3333331174E-1;
-  cAVXLnQ1:   Single  = -2.12194440E-4;     // ln2 correction tail
-  cAVXLnQ2:   Single  =  0.693359375;       // ln2 lead
-  cAVXLnSqrtHf: Single = 0.707106781186547524; // sqrt(0.5)
-  cAVXLnHalf:  Single = 0.5;
-  cAVXLnOne:   Single = 1.0;
-  cAVXLnMinNorm: Integer = $00800000;       // smallest positive normal float bits
-  cAVXLnInvMant: uInt32  = $807fffff;       // sign + mantissa mask (clears exponent)
+// Stored eight-wide: AVXLn is the only reader, and it either hoists a constant
+// into a register with one vmovups above the loop or folds it into a vfmadd213ps
+// memory operand - neither of which wants a scalar to broadcast per iteration.
+  cAVXLnP0: array[0..7] of Single =
+    (7.0376836292E-2, 7.0376836292E-2, 7.0376836292E-2, 7.0376836292E-2,
+     7.0376836292E-2, 7.0376836292E-2, 7.0376836292E-2, 7.0376836292E-2);
+  cAVXLnP1: array[0..7] of Single =
+    (-1.1514610310E-1, -1.1514610310E-1, -1.1514610310E-1, -1.1514610310E-1,
+     -1.1514610310E-1, -1.1514610310E-1, -1.1514610310E-1, -1.1514610310E-1);
+  cAVXLnP2: array[0..7] of Single =
+    (1.1676998740E-1, 1.1676998740E-1, 1.1676998740E-1, 1.1676998740E-1,
+     1.1676998740E-1, 1.1676998740E-1, 1.1676998740E-1, 1.1676998740E-1);
+  cAVXLnP3: array[0..7] of Single =
+    (-1.2420140846E-1, -1.2420140846E-1, -1.2420140846E-1, -1.2420140846E-1,
+     -1.2420140846E-1, -1.2420140846E-1, -1.2420140846E-1, -1.2420140846E-1);
+  cAVXLnP4: array[0..7] of Single =
+    (1.4249322787E-1, 1.4249322787E-1, 1.4249322787E-1, 1.4249322787E-1,
+     1.4249322787E-1, 1.4249322787E-1, 1.4249322787E-1, 1.4249322787E-1);
+  cAVXLnP5: array[0..7] of Single =
+    (-1.6668057665E-1, -1.6668057665E-1, -1.6668057665E-1, -1.6668057665E-1,
+     -1.6668057665E-1, -1.6668057665E-1, -1.6668057665E-1, -1.6668057665E-1);
+  cAVXLnP6: array[0..7] of Single =
+    (2.0000714765E-1, 2.0000714765E-1, 2.0000714765E-1, 2.0000714765E-1,
+     2.0000714765E-1, 2.0000714765E-1, 2.0000714765E-1, 2.0000714765E-1);
+  cAVXLnP7: array[0..7] of Single =
+    (-2.4999993993E-1, -2.4999993993E-1, -2.4999993993E-1, -2.4999993993E-1,
+     -2.4999993993E-1, -2.4999993993E-1, -2.4999993993E-1, -2.4999993993E-1);
+  cAVXLnP8: array[0..7] of Single =
+    (3.3333331174E-1, 3.3333331174E-1, 3.3333331174E-1, 3.3333331174E-1,
+     3.3333331174E-1, 3.3333331174E-1, 3.3333331174E-1, 3.3333331174E-1);
+  // ln2 correction tail
+  cAVXLnQ1: array[0..7] of Single =
+    (-2.12194440E-4, -2.12194440E-4, -2.12194440E-4, -2.12194440E-4,
+     -2.12194440E-4, -2.12194440E-4, -2.12194440E-4, -2.12194440E-4);
+  // ln2 lead
+  cAVXLnQ2: array[0..7] of Single =
+    (0.693359375, 0.693359375, 0.693359375, 0.693359375,
+     0.693359375, 0.693359375, 0.693359375, 0.693359375);
+  // sqrt(0.5)
+  cAVXLnSqrtHf: array[0..7] of Single =
+    (0.707106781186547524, 0.707106781186547524, 0.707106781186547524, 0.707106781186547524,
+     0.707106781186547524, 0.707106781186547524, 0.707106781186547524, 0.707106781186547524);
+  cAVXLnHalf: array[0..7] of Single =
+    (0.5, 0.5, 0.5, 0.5,
+     0.5, 0.5, 0.5, 0.5);
+  cAVXLnOne: array[0..7] of Single =
+    (1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0);
+  // smallest positive normal float bits
+  cAVXLnMinNorm: array[0..7] of longword =
+    ($00800000, $00800000, $00800000, $00800000,
+     $00800000, $00800000, $00800000, $00800000);
+  // sign + mantissa mask (clears exponent)
+  cAVXLnInvMant: array[0..7] of longword =
+    ($807fffff, $807fffff, $807fffff, $807fffff,
+     $807fffff, $807fffff, $807fffff, $807fffff);
 
 // Constants for the AVX2 8-wide sin()/cos() approximation (AVXSinCos), Cephes
 // single-precision sinf/cosf. Range-reduce x by q = round(x * 4/pi); the low 3 bits
 // of q select the octant and the sin/cos polynomial + sign. Max abs error ~1e-7 over
 // a wide range; we extend the reduction with a 3-part Cody-Waite pi/4 subtraction so
 // it stays accurate out to large magnitudes (|x| up to ~1e5).
-  cAVXSC_FOPI:  Single =  1.27323954473516;   // 4/pi
-  cAVXSC_DP1:   Single = -0.78515625;
-  cAVXSC_DP2:   Single = -2.4187564849853515625E-4;
-  cAVXSC_DP3:   Single = -3.77489497744594108E-8;
-  cAVXSC_SinP0: Single = -1.9515295891E-4;
-  cAVXSC_SinP1: Single =  8.3321608736E-3;
-  cAVXSC_SinP2: Single = -1.6666654611E-1;
-  cAVXSC_CosP0: Single =  2.443315711809948E-5;
-  cAVXSC_CosP1: Single = -1.388731625493765E-3;
-  cAVXSC_CosP2: Single =  4.166664568298827E-2;
-  cAVXSC_Half:  Single =  0.5;
-  cAVXSC_One:   Single =  1.0;
-  cAVXSC_1i:    Integer = 1;
-  cAVXSC_2i:    Integer = 2;
-  cAVXSC_4i:    Integer = 4;
-  cAVXSC_NOT1i: Integer = -2;                 // not(1) = $FFFFFFFE
+// Stored eight-wide for the same reason as the AVXLn constants above: AVXSinCos
+// consumes each of these either as a hoisted register or as a 256-bit memory
+// operand, never as a per-iteration broadcast.
+  // 4/pi
+  cAVXSC_FOPI: array[0..7] of Single =
+    (1.27323954473516, 1.27323954473516, 1.27323954473516, 1.27323954473516,
+     1.27323954473516, 1.27323954473516, 1.27323954473516, 1.27323954473516);
+  cAVXSC_DP1: array[0..7] of Single =
+    (-0.78515625, -0.78515625, -0.78515625, -0.78515625,
+     -0.78515625, -0.78515625, -0.78515625, -0.78515625);
+  cAVXSC_DP2: array[0..7] of Single =
+    (-2.4187564849853515625E-4, -2.4187564849853515625E-4, -2.4187564849853515625E-4, -2.4187564849853515625E-4,
+     -2.4187564849853515625E-4, -2.4187564849853515625E-4, -2.4187564849853515625E-4, -2.4187564849853515625E-4);
+  cAVXSC_DP3: array[0..7] of Single =
+    (-3.77489497744594108E-8, -3.77489497744594108E-8, -3.77489497744594108E-8, -3.77489497744594108E-8,
+     -3.77489497744594108E-8, -3.77489497744594108E-8, -3.77489497744594108E-8, -3.77489497744594108E-8);
+  cAVXSC_SinP0: array[0..7] of Single =
+    (-1.9515295891E-4, -1.9515295891E-4, -1.9515295891E-4, -1.9515295891E-4,
+     -1.9515295891E-4, -1.9515295891E-4, -1.9515295891E-4, -1.9515295891E-4);
+  cAVXSC_SinP1: array[0..7] of Single =
+    (8.3321608736E-3, 8.3321608736E-3, 8.3321608736E-3, 8.3321608736E-3,
+     8.3321608736E-3, 8.3321608736E-3, 8.3321608736E-3, 8.3321608736E-3);
+  cAVXSC_SinP2: array[0..7] of Single =
+    (-1.6666654611E-1, -1.6666654611E-1, -1.6666654611E-1, -1.6666654611E-1,
+     -1.6666654611E-1, -1.6666654611E-1, -1.6666654611E-1, -1.6666654611E-1);
+  cAVXSC_CosP0: array[0..7] of Single =
+    (2.443315711809948E-5, 2.443315711809948E-5, 2.443315711809948E-5, 2.443315711809948E-5,
+     2.443315711809948E-5, 2.443315711809948E-5, 2.443315711809948E-5, 2.443315711809948E-5);
+  cAVXSC_CosP1: array[0..7] of Single =
+    (-1.388731625493765E-3, -1.388731625493765E-3, -1.388731625493765E-3, -1.388731625493765E-3,
+     -1.388731625493765E-3, -1.388731625493765E-3, -1.388731625493765E-3, -1.388731625493765E-3);
+  cAVXSC_CosP2: array[0..7] of Single =
+    (4.166664568298827E-2, 4.166664568298827E-2, 4.166664568298827E-2, 4.166664568298827E-2,
+     4.166664568298827E-2, 4.166664568298827E-2, 4.166664568298827E-2, 4.166664568298827E-2);
+  cAVXSC_Half: array[0..7] of Single =
+    (0.5, 0.5, 0.5, 0.5,
+     0.5, 0.5, 0.5, 0.5);
+  cAVXSC_One: array[0..7] of Single =
+    (1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0);
+  cAVXSC_1i: array[0..7] of longword =
+    (1, 1, 1, 1,
+     1, 1, 1, 1);
+  cAVXSC_2i: array[0..7] of longword =
+    (2, 2, 2, 2,
+     2, 2, 2, 2);
+  cAVXSC_4i: array[0..7] of longword =
+    (4, 4, 4, 4,
+     4, 4, 4, 4);
+  // not(1)
+  cAVXSC_NOT1i: array[0..7] of longword =
+    ($FFFFFFFE, $FFFFFFFE, $FFFFFFFE, $FFFFFFFE,
+     $FFFFFFFE, $FFFFFFFE, $FFFFFFFE, $FFFFFFFE);
+  // sign bit of a Single
+  cAVXSC_SignMask: array[0..7] of longword =
+    ($80000000, $80000000, $80000000, $80000000,
+     $80000000, $80000000, $80000000, $80000000);
 {$ENDIF}
 
 function CreateTokenizedStringList(str: string; c:char):TNNetStringList;
@@ -16281,6 +16377,13 @@ begin
   vbroadcastss ymm13, [rip+cAVXLn2]
   vmovd xmm14, dword ptr [rip+cAVXExp127]
   vpbroadcastd ymm14, xmm14
+  // P6..P1 live in registers for the whole call; only P0 stays a memory operand.
+  vbroadcastss ymm6,  [rip+cAVXExpP6]
+  vbroadcastss ymm7,  [rip+cAVXExpP5]
+  vbroadcastss ymm8,  [rip+cAVXExpP4]
+  vbroadcastss ymm9,  [rip+cAVXExpP3]
+  vbroadcastss ymm15, [rip+cAVXExpP2]
+  vbroadcastss ymm5,  [rip+cAVXExpP1]
 @LoopAVXExp:
   vmovups ymm0, [rax]
   vminps  ymm0, ymm0, ymm10
@@ -16289,19 +16392,13 @@ begin
   vroundps ymm2, ymm1, 0           // k = round(t)
   vsubps  ymm1, ymm1, ymm2         // f = t-k in [-0.5,0.5]
   vmulps  ymm3, ymm1, ymm13        // g = f*ln2
-  vbroadcastss ymm4, [rip+cAVXExpP6]
-  vbroadcastss ymm5, [rip+cAVXExpP5]
+  vmovaps ymm4, ymm6
+  vfmadd213ps ymm4, ymm3, ymm7
+  vfmadd213ps ymm4, ymm3, ymm8
+  vfmadd213ps ymm4, ymm3, ymm9
+  vfmadd213ps ymm4, ymm3, ymm15
   vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP4]
-  vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP3]
-  vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP2]
-  vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP1]
-  vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP0]
-  vfmadd213ps ymm4, ymm3, ymm5     // ymm4 = 2^f
+  vfmadd213ps ymm4, ymm3, [rip+cAVXExpP0V]  // ymm4 = 2^f
   vcvtps2dq ymm2, ymm2             // k -> int32
   vpaddd ymm2, ymm2, ymm14
   vpslld ymm2, ymm2, 23            // 2^k as float bits
@@ -16314,8 +16411,8 @@ begin
 @DoneAVXExp:
   vzeroupper
   end ['rax','rcx','r8',
-       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5',
-       'ymm10','ymm11','ymm12','ymm13','ymm14'];
+       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6','ymm7','ymm8','ymm9',
+       'ymm10','ymm11','ymm12','ymm13','ymm14','ymm15'];
   end;
   for I := localNumElements to NumElementsM1 do
     pDst^[I] := NeuralExp(pSrc^[I]);
@@ -16381,6 +16478,12 @@ begin
   vbroadcastss ymm13, [rip+cAVXLn2]
   vmovd xmm14, dword ptr [rip+cAVXExp127]
   vpbroadcastd ymm14, xmm14
+  // ymm8 is the lane accumulator and ymm15 the shift, so only P6..P3 fit in
+  // registers here; P2..P0 stay as memory operands.
+  vbroadcastss ymm6, [rip+cAVXExpP6]
+  vbroadcastss ymm7, [rip+cAVXExpP5]
+  vbroadcastss ymm9, [rip+cAVXExpP4]
+  vbroadcastss ymm5, [rip+cAVXExpP3]
   mov rdx, ShiftPtr
   vbroadcastss ymm15, [rdx]
   vxorps ymm8, ymm8, ymm8
@@ -16393,19 +16496,13 @@ begin
   vroundps ymm2, ymm1, 0           // k = round(t)
   vsubps  ymm1, ymm1, ymm2         // f = t-k in [-0.5,0.5]
   vmulps  ymm3, ymm1, ymm13        // g = f*ln2
-  vbroadcastss ymm4, [rip+cAVXExpP6]
-  vbroadcastss ymm5, [rip+cAVXExpP5]
+  vmovaps ymm4, ymm6
+  vfmadd213ps ymm4, ymm3, ymm7
+  vfmadd213ps ymm4, ymm3, ymm9
   vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP4]
-  vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP3]
-  vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP2]
-  vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP1]
-  vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP0]
-  vfmadd213ps ymm4, ymm3, ymm5     // ymm4 = 2^f
+  vfmadd213ps ymm4, ymm3, [rip+cAVXExpP2V]
+  vfmadd213ps ymm4, ymm3, [rip+cAVXExpP1V]
+  vfmadd213ps ymm4, ymm3, [rip+cAVXExpP0V]  // ymm4 = 2^f
   vcvtps2dq ymm2, ymm2             // k -> int32
   vpaddd ymm2, ymm2, ymm14
   vpslld ymm2, ymm2, 23            // 2^k as float bits
@@ -16420,8 +16517,8 @@ begin
   vmovups [rdx], ymm8
   vzeroupper
   end ['rax','rcx','rdx','r8',
-       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5',
-       'ymm8','ymm10','ymm11','ymm12','ymm13','ymm14','ymm15'];
+       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6','ymm7',
+       'ymm8','ymm9','ymm10','ymm11','ymm12','ymm13','ymm14','ymm15'];
     for I := 0 to 7 do
       Sum := Sum + LaneSums[I];
   end;
@@ -16455,67 +16552,61 @@ begin
   mov r8d, localNumElements
   shr r8d, 3
   jz @DoneAVXLn
+  // Every constant the body needs is materialized once here: ymm7..ymm15 hold
+  // the nine reused ones, and P1..P8 are folded into the Horner FMAs as memory
+  // operands below.
+  vmovups ymm7,  [rip+cAVXLnMinNorm]   // smallest positive normal
+  vmovd   xmm8,  dword ptr [rip+cAVXExp127]
+  vpbroadcastd ymm8, xmm8              // 0x7f = 127
+  vmovups ymm9,  [rip+cAVXLnOne]
+  vmovups ymm10, [rip+cAVXLnInvMant]
+  vmovups ymm11, [rip+cAVXLnHalf]
+  vmovups ymm12, [rip+cAVXLnSqrtHf]
+  vmovups ymm13, [rip+cAVXLnP0]
+  vmovups ymm14, [rip+cAVXLnQ1]
+  vmovups ymm15, [rip+cAVXLnQ2]
 @LoopAVXLn:
   vmovups ymm0, [rax]
   // clamp to smallest positive normal so denormals/zero do not poison the bit tricks
-  vbroadcastss ymm15, [rip+cAVXLnMinNorm]
-  vmaxps  ymm0, ymm0, ymm15
+  vmaxps  ymm0, ymm0, ymm7
   // e = (float)(((bits >> 23) & 0xff) - 0x7f) + 1   (mantissa rescaled to [0.5,1))
   vpsrld  ymm2, ymm0, 23
-  vmovd   xmm15, dword ptr [rip+cAVXExp127]
-  vpbroadcastd ymm15, xmm15            // 0x7f = 127
-  vpsubd  ymm2, ymm2, ymm15            // unbiased exponent
+  vpsubd  ymm2, ymm2, ymm8             // unbiased exponent
   vcvtdq2ps ymm2, ymm2
-  vbroadcastss ymm15, [rip+cAVXLnOne]
-  vaddps  ymm2, ymm2, ymm15            // e = exp + 1 (0.5*2^e convention)
+  vaddps  ymm2, ymm2, ymm9             // e = exp + 1 (0.5*2^e convention)
   // mantissa in [0.5,1): bits = (bits & invMant) | 0.5bits
-  vbroadcastss ymm15, [rip+cAVXLnInvMant]
-  vandps  ymm0, ymm0, ymm15
-  vbroadcastss ymm15, [rip+cAVXLnHalf]
-  vorps   ymm0, ymm0, ymm15            // x = mantissa in [0.5,1)
+  vandps  ymm0, ymm0, ymm10
+  vorps   ymm0, ymm0, ymm11            // x = mantissa in [0.5,1)
   // mask: m < sqrt(0.5) ?
-  vbroadcastss ymm15, [rip+cAVXLnSqrtHf]
-  vcmpltps ymm3, ymm0, ymm15           // mask = (x < SQRTHF)
+  vcmpltps ymm3, ymm0, ymm12           // mask = (x < SQRTHF)
   vandps  ymm4, ymm0, ymm3             // tmp = (x<sqrthf)? x : 0
-  vbroadcastss ymm15, [rip+cAVXLnOne]
-  vsubps  ymm0, ymm0, ymm15            // x = x - 1
+  vsubps  ymm0, ymm0, ymm9             // x = x - 1
   vaddps  ymm0, ymm0, ymm4             // if x<sqrthf: x = 2x - 1
-  vandps  ymm5, ymm15, ymm3            // (x<sqrthf)? 1.0 : 0.0
+  vandps  ymm5, ymm9, ymm3             // (x<sqrthf)? 1.0 : 0.0
   vsubps  ymm2, ymm2, ymm5             // e -= 1 where x<sqrthf
   // z = x*x
   vmulps  ymm1, ymm0, ymm0             // z
   // Horner polynomial in x: P0..P8
-  vbroadcastss ymm4, [rip+cAVXLnP0]
-  vbroadcastss ymm5, [rip+cAVXLnP1]
-  vfmadd213ps ymm4, ymm0, ymm5
-  vbroadcastss ymm5, [rip+cAVXLnP2]
-  vfmadd213ps ymm4, ymm0, ymm5
-  vbroadcastss ymm5, [rip+cAVXLnP3]
-  vfmadd213ps ymm4, ymm0, ymm5
-  vbroadcastss ymm5, [rip+cAVXLnP4]
-  vfmadd213ps ymm4, ymm0, ymm5
-  vbroadcastss ymm5, [rip+cAVXLnP5]
-  vfmadd213ps ymm4, ymm0, ymm5
-  vbroadcastss ymm5, [rip+cAVXLnP6]
-  vfmadd213ps ymm4, ymm0, ymm5
-  vbroadcastss ymm5, [rip+cAVXLnP7]
-  vfmadd213ps ymm4, ymm0, ymm5
-  vbroadcastss ymm5, [rip+cAVXLnP8]
-  vfmadd213ps ymm4, ymm0, ymm5         // ymm4 = poly
+  vmovaps ymm4, ymm13
+  vfmadd213ps ymm4, ymm0, [rip+cAVXLnP1]
+  vfmadd213ps ymm4, ymm0, [rip+cAVXLnP2]
+  vfmadd213ps ymm4, ymm0, [rip+cAVXLnP3]
+  vfmadd213ps ymm4, ymm0, [rip+cAVXLnP4]
+  vfmadd213ps ymm4, ymm0, [rip+cAVXLnP5]
+  vfmadd213ps ymm4, ymm0, [rip+cAVXLnP6]
+  vfmadd213ps ymm4, ymm0, [rip+cAVXLnP7]
+  vfmadd213ps ymm4, ymm0, [rip+cAVXLnP8]  // ymm4 = poly
   vmulps  ymm4, ymm4, ymm0             // poly *= x
   vmulps  ymm4, ymm4, ymm1             // poly *= z   (= y)
   // y += e*Q1
-  vbroadcastss ymm5, [rip+cAVXLnQ1]
-  vfmadd231ps ymm4, ymm2, ymm5
+  vfmadd231ps ymm4, ymm2, ymm14
   // y -= 0.5*z
-  vbroadcastss ymm5, [rip+cAVXLnHalf]
-  vmulps  ymm6, ymm1, ymm5
+  vmulps  ymm6, ymm1, ymm11
   vsubps  ymm4, ymm4, ymm6
   // x = x + y
   vaddps  ymm0, ymm0, ymm4
   // x += e*Q2
-  vbroadcastss ymm5, [rip+cAVXLnQ2]
-  vfmadd231ps ymm0, ymm2, ymm5
+  vfmadd231ps ymm0, ymm2, ymm15
   vmovups [rcx], ymm0
   add rax, 32
   add rcx, 32
@@ -16524,7 +16615,8 @@ begin
 @DoneAVXLn:
   vzeroupper
   end ['rax','rcx','r8',
-       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6','ymm15'];
+       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6','ymm7','ymm8','ymm9',
+       'ymm10','ymm11','ymm12','ymm13','ymm14','ymm15'];
   end;
   for I := localNumElements to NumElementsM1 do
     pDst^[I] := pcr_logf(pSrc^[I]);
@@ -16559,57 +16651,41 @@ begin
   mov r8d, localNumElements
   shr r8d, 3
   jz @DoneAVXCos
+  // The four constants the body reads more than once, or would otherwise have
+  // to synthesize, are materialized once; the rest are memory operands below.
+  vmovups ymm9,  [rip+cAVXSC_Half]
+  vmovups ymm12, [rip+cAVXSC_4i]
+  vmovups ymm13, [rip+cAVXSC_2i]
+  vpxor   ymm14, ymm14, ymm14
+  vmovups ymm15, [rip+cAVXSC_One]
 @LoopAVXCos:
   vmovups ymm0, [rax]               // x
-  vpcmpeqd ymm14, ymm14, ymm14
-  vpsrld  ymm14, ymm14, 1           // 0x7fffffff
-  vandps  ymm1, ymm0, ymm14         // |x|
-  vbroadcastss ymm15, [rip+cAVXSC_FOPI]
-  vmulps  ymm2, ymm1, ymm15
+  vandps  ymm1, ymm0, [rip+cAVXArgAbsMask]  // |x|
+  vmulps  ymm2, ymm1, [rip+cAVXSC_FOPI]
   vcvttps2dq ymm3, ymm2             // j = trunc(|x|*4/pi)
-  vmovd   xmm15, dword ptr [rip+cAVXSC_1i]
-  vpbroadcastd ymm15, xmm15
-  vpaddd  ymm3, ymm3, ymm15         // j+1
-  vmovd   xmm15, dword ptr [rip+cAVXSC_NOT1i]
-  vpbroadcastd ymm15, xmm15
-  vpand   ymm3, ymm3, ymm15         // j &= ~1
+  vpaddd  ymm3, ymm3, [rip+cAVXSC_1i]     // j+1
+  vpand   ymm3, ymm3, [rip+cAVXSC_NOT1i]  // j &= ~1
   vcvtdq2ps ymm2, ymm3              // y = (float)j
-  vbroadcastss ymm15, [rip+cAVXSC_DP1]
-  vfmadd231ps ymm1, ymm2, ymm15
-  vbroadcastss ymm15, [rip+cAVXSC_DP2]
-  vfmadd231ps ymm1, ymm2, ymm15
-  vbroadcastss ymm15, [rip+cAVXSC_DP3]
-  vfmadd231ps ymm1, ymm2, ymm15     // reduced x
-  vmovd   xmm15, dword ptr [rip+cAVXSC_2i]
-  vpbroadcastd ymm15, xmm15
-  vpsubd  ymm4, ymm3, ymm15         // m = j-2
-  vmovd   xmm15, dword ptr [rip+cAVXSC_4i]
-  vpbroadcastd ymm15, xmm15
-  vpandn  ymm5, ymm4, ymm15         // (~m)&4   (Cephes cos sign convention)
+  vfmadd231ps ymm1, ymm2, [rip+cAVXSC_DP1]
+  vfmadd231ps ymm1, ymm2, [rip+cAVXSC_DP2]
+  vfmadd231ps ymm1, ymm2, [rip+cAVXSC_DP3]  // reduced x
+  vpsubd  ymm4, ymm3, ymm13         // m = j-2
+  vpandn  ymm5, ymm4, ymm12         // (~m)&4   (Cephes cos sign convention)
   vpslld  ymm5, ymm5, 29            // sign = ((~m)&4)<<29
-  vmovd   xmm15, dword ptr [rip+cAVXSC_2i]
-  vpbroadcastd ymm15, xmm15
-  vpand   ymm6, ymm4, ymm15
-  vpxor   ymm15, ymm15, ymm15
-  vpcmpeqd ymm6, ymm6, ymm15        // polymask: (m&2)==0 -> sin poly (Cephes cos)
+  vpand   ymm6, ymm4, ymm13
+  vpcmpeqd ymm6, ymm6, ymm14        // polymask: (m&2)==0 -> sin poly (Cephes cos)
   vmulps  ymm7, ymm1, ymm1          // z
-  vbroadcastss ymm8,  [rip+cAVXSC_CosP0]
-  vbroadcastss ymm9,  [rip+cAVXSC_CosP1]
-  vfmadd213ps ymm8, ymm7, ymm9
-  vbroadcastss ymm9,  [rip+cAVXSC_CosP2]
-  vfmadd213ps ymm8, ymm7, ymm9
+  vmovups ymm8, [rip+cAVXSC_CosP0]
+  vfmadd213ps ymm8, ymm7, [rip+cAVXSC_CosP1]
+  vfmadd213ps ymm8, ymm7, [rip+cAVXSC_CosP2]
   vmulps  ymm8, ymm8, ymm7
   vmulps  ymm8, ymm8, ymm7
-  vbroadcastss ymm9,  [rip+cAVXSC_Half]
   vmulps  ymm10, ymm7, ymm9
   vsubps  ymm8, ymm8, ymm10
-  vbroadcastss ymm9,  [rip+cAVXSC_One]
-  vaddps  ymm8, ymm8, ymm9          // cos candidate
-  vbroadcastss ymm11, [rip+cAVXSC_SinP0]
-  vbroadcastss ymm12, [rip+cAVXSC_SinP1]
-  vfmadd213ps ymm11, ymm7, ymm12
-  vbroadcastss ymm12, [rip+cAVXSC_SinP2]
-  vfmadd213ps ymm11, ymm7, ymm12
+  vaddps  ymm8, ymm8, ymm15         // cos candidate
+  vmovups ymm11, [rip+cAVXSC_SinP0]
+  vfmadd213ps ymm11, ymm7, [rip+cAVXSC_SinP1]
+  vfmadd213ps ymm11, ymm7, [rip+cAVXSC_SinP2]
   vmulps  ymm11, ymm11, ymm7
   vmulps  ymm11, ymm11, ymm1
   vaddps  ymm11, ymm11, ymm1        // sin candidate
@@ -16624,7 +16700,7 @@ begin
   vzeroupper
   end ['rax','rcx','r8',
        'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6','ymm7','ymm8',
-       'ymm9','ymm10','ymm11','ymm12','ymm14','ymm15'];
+       'ymm9','ymm10','ymm11','ymm12','ymm13','ymm14','ymm15'];
   end
   else
   begin
@@ -16634,56 +16710,40 @@ begin
   mov r8d, localNumElements
   shr r8d, 3
   jz @DoneAVXSin
+  vmovups ymm9,  [rip+cAVXSC_Half]
+  vmovups ymm12, [rip+cAVXSC_4i]
+  vmovups ymm13, [rip+cAVXSC_2i]
+  vmovups ymm14, [rip+cAVXSC_SignMask]
+  vmovups ymm15, [rip+cAVXSC_One]
 @LoopAVXSin:
   vmovups ymm0, [rax]               // x
-  vpcmpeqd ymm14, ymm14, ymm14
-  vpslld  ymm13, ymm14, 31          // 0x80000000
-  vandps  ymm5, ymm0, ymm13         // sign_x
-  vpsrld  ymm14, ymm14, 1           // 0x7fffffff
-  vandps  ymm1, ymm0, ymm14         // |x|
-  vbroadcastss ymm15, [rip+cAVXSC_FOPI]
-  vmulps  ymm2, ymm1, ymm15
+  vandps  ymm5, ymm0, ymm14         // sign_x
+  vandps  ymm1, ymm0, [rip+cAVXArgAbsMask]  // |x|
+  vmulps  ymm2, ymm1, [rip+cAVXSC_FOPI]
   vcvttps2dq ymm3, ymm2             // j
-  vmovd   xmm15, dword ptr [rip+cAVXSC_1i]
-  vpbroadcastd ymm15, xmm15
-  vpaddd  ymm3, ymm3, ymm15
-  vmovd   xmm15, dword ptr [rip+cAVXSC_NOT1i]
-  vpbroadcastd ymm15, xmm15
-  vpand   ymm3, ymm3, ymm15         // j = (j+1)&~1
+  vpaddd  ymm3, ymm3, [rip+cAVXSC_1i]
+  vpand   ymm3, ymm3, [rip+cAVXSC_NOT1i]  // j = (j+1)&~1
   vcvtdq2ps ymm2, ymm3              // y
-  vbroadcastss ymm15, [rip+cAVXSC_DP1]
-  vfmadd231ps ymm1, ymm2, ymm15
-  vbroadcastss ymm15, [rip+cAVXSC_DP2]
-  vfmadd231ps ymm1, ymm2, ymm15
-  vbroadcastss ymm15, [rip+cAVXSC_DP3]
-  vfmadd231ps ymm1, ymm2, ymm15     // reduced x
-  vmovd   xmm15, dword ptr [rip+cAVXSC_4i]
-  vpbroadcastd ymm15, xmm15
-  vpand   ymm4, ymm3, ymm15
+  vfmadd231ps ymm1, ymm2, [rip+cAVXSC_DP1]
+  vfmadd231ps ymm1, ymm2, [rip+cAVXSC_DP2]
+  vfmadd231ps ymm1, ymm2, [rip+cAVXSC_DP3]  // reduced x
+  vpand   ymm4, ymm3, ymm12
   vpslld  ymm4, ymm4, 29            // (j&4)<<29
   vxorps  ymm5, ymm5, ymm4          // combined sign
-  vmovd   xmm15, dword ptr [rip+cAVXSC_2i]
-  vpbroadcastd ymm15, xmm15
-  vpand   ymm6, ymm3, ymm15
-  vpcmpeqd ymm6, ymm6, ymm15        // polymask: (j&2)==2 -> cos poly
+  vpand   ymm6, ymm3, ymm13
+  vpcmpeqd ymm6, ymm6, ymm13        // polymask: (j&2)==2 -> cos poly
   vmulps  ymm7, ymm1, ymm1          // z
-  vbroadcastss ymm8,  [rip+cAVXSC_CosP0]
-  vbroadcastss ymm9,  [rip+cAVXSC_CosP1]
-  vfmadd213ps ymm8, ymm7, ymm9
-  vbroadcastss ymm9,  [rip+cAVXSC_CosP2]
-  vfmadd213ps ymm8, ymm7, ymm9
+  vmovups ymm8, [rip+cAVXSC_CosP0]
+  vfmadd213ps ymm8, ymm7, [rip+cAVXSC_CosP1]
+  vfmadd213ps ymm8, ymm7, [rip+cAVXSC_CosP2]
   vmulps  ymm8, ymm8, ymm7
   vmulps  ymm8, ymm8, ymm7
-  vbroadcastss ymm9,  [rip+cAVXSC_Half]
   vmulps  ymm10, ymm7, ymm9
   vsubps  ymm8, ymm8, ymm10
-  vbroadcastss ymm9,  [rip+cAVXSC_One]
-  vaddps  ymm8, ymm8, ymm9          // cos candidate
-  vbroadcastss ymm11, [rip+cAVXSC_SinP0]
-  vbroadcastss ymm12, [rip+cAVXSC_SinP1]
-  vfmadd213ps ymm11, ymm7, ymm12
-  vbroadcastss ymm12, [rip+cAVXSC_SinP2]
-  vfmadd213ps ymm11, ymm7, ymm12
+  vaddps  ymm8, ymm8, ymm15         // cos candidate
+  vmovups ymm11, [rip+cAVXSC_SinP0]
+  vfmadd213ps ymm11, ymm7, [rip+cAVXSC_SinP1]
+  vfmadd213ps ymm11, ymm7, [rip+cAVXSC_SinP2]
   vmulps  ymm11, ymm11, ymm7
   vmulps  ymm11, ymm11, ymm1
   vaddps  ymm11, ymm11, ymm1        // sin candidate
