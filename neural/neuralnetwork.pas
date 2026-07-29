@@ -28628,7 +28628,7 @@ var
   StartTime: double;
   Margin, Scale, CosM, SinM, InvXNorm: TNeuralFloat;
   XNorm, WNorm, Dot, CosT, MaxLogit, SumExp, ProbY: TNeuralFloat;
-  SinTheta, CosMargined, DMarginDCos, AK, GK, Logit, InvW: TNeuralFloat;
+  SinTheta, CosMargined, DMarginDCos, AK, GK, InvW: TNeuralFloat;
   c1, c2, d1, d2: TNeuralFloat;
   K, KM1, D, LabelIdx, ClassC, X, Y, MaxX, MaxY, Kk, baseOut0, baseErr0: integer;
   WeightNeuron: TNNetNeuron;
@@ -28702,18 +28702,15 @@ begin
       end;
 
       // Softmax over the scaled (margined) logits.
-      MaxLogit := Scale * FANormBuf[0];
-      for Kk := 1 to KM1 do
-      begin
-        Logit := Scale * FANormBuf[Kk];
-        if Logit > MaxLogit then MaxLogit := Logit;
-      end;
-      SumExp := 0;
-      for Kk := 0 to KM1 do
-      begin
-        FProbArrBuf[Kk] := NeuralExp(Scale * FANormBuf[Kk] - MaxLogit);
-        SumExp := SumExp + FProbArrBuf[Kk];
-      end;
+      // #18/#19: Scale > 0, so the max over the scaled logits is the max of
+      // FANormBuf scaled; the K-long copy plus scale then feeds one fused pass
+      // that exponentiates and sums. The normalize below stays an exact divide
+      // (#21: a gradient check watches this softmax).
+      MaxLogit := TNNetVolume.MaxValue(Addr(FANormBuf[0]), K) * Scale;
+      Move(FANormBuf[0], FProbArrBuf[0], K * csNeuralFloatSize);
+      TNNetVolume.Mul(Addr(FProbArrBuf[0]), Scale, K);
+      SumExp := TNNetVolume.ExpShiftSum(Addr(FProbArrBuf[0]),
+        Addr(FProbArrBuf[0]), MaxLogit, K);
       if SumExp < 1e-30 then SumExp := 1e-30;
       ProbY := 0;
       for Kk := 0 to KM1 do
@@ -34133,13 +34130,11 @@ begin
       if Score > MaxScore then MaxScore := Score;
       Inc(posX, RowStride);
     end;
-    SumExp := 0;
-    for ni := 0 to SeqLenM1 do
-    begin
-      Score := NeuralExp(FA.FData[baseA + ni] - MaxScore);
-      FA.FData[baseA + ni] := Score;
-      SumExp := SumExp + Score;
-    end;
+    // #19: FA is (SeqLen, FK, 1), so seed q's row is one contiguous SeqLen run
+    // and the exp and the accumulate fuse into a single vectorized pass. The
+    // normalize stays an exact divide (#21: a gradient check watches this row).
+    SumExp := TNNetVolume.ExpShiftSum(FA.GetRawPtr(baseA), FA.GetRawPtr(baseA),
+      MaxScore, SeqLen);
     if SumExp > 0 then
       for ni := 0 to SeqLenM1 do
         FA.FData[baseA + ni] := FA.FData[baseA + ni] / SumExp;
@@ -66687,13 +66682,10 @@ begin
       if WPtr^[i] > simMax then simMax := WPtr^[i];
       Inc(mOfs, FSlotWidth);
     end;
-    expSum := 0;
-    for i := 0 to NumSlotsM1 do
-    begin
-      wv := NeuralExp(WPtr^[i] - simMax);
-      WPtr^[i] := wv;
-      expSum := expSum + wv;
-    end;
+    // #19: FW's timestep row is FNumSlots contiguous floats, so the exp and the
+    // accumulate fuse into one vectorized pass. The normalize below stays an
+    // exact divide (#21: a gradient check watches this softmax).
+    expSum := TNNetVolume.ExpShiftSum(WPtr, WPtr, simMax, FNumSlots);
     for i := 0 to NumSlotsM1 do WPtr^[i] := WPtr^[i] / expSum;
     // --- Read: r_t = sum_i w[i]*M_{t-1}[i] -> output. ---
     FillChar(OutPtr^[0], FSlotWidth * csNeuralFloatSize, 0);
@@ -81780,12 +81772,11 @@ begin
       maxVal := Lin.FData[rowBase];
       for cj := 1 to FNm1 do
         if Lin.FData[rowBase + cj] > maxVal then maxVal := Lin.FData[rowBase + cj];
-      sumExp := 0;
-      for cj := 0 to FNm1 do
-      begin
-        FSoftRow[cj] := NeuralExp(Lin.FData[rowBase + cj] - maxVal);
-        sumExp := sumExp + FSoftRow[cj];
-      end;
+      // #19: the row is FN contiguous floats in Lin and FSoftRow is a plain FN
+      // buffer, so one fused pass exponentiates and sums. The normalize below
+      // stays an exact divide (#21: a gradient check watches this softmax).
+      sumExp := TNNetVolume.ExpShiftSum(Addr(FSoftRow[0]),
+        Addr(Lin.FData[rowBase]), maxVal, FN);
       dotG := 0;
       for cj := 0 to FNm1 do
       begin
@@ -96202,8 +96193,8 @@ end;
 procedure TNNetSoftMaxOne.Compute;
 var
   StartTime: double;
-  i, SizeM1: integer;
-  MaxV, S, V: TNeuralFloat;
+  SizeM1: integer;
+  MaxV, S: TNeuralFloat;
 begin
   StartTime := Now();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
@@ -96218,16 +96209,12 @@ begin
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
   end;
-  MaxV := FOutput.FData[0];
-  for i := 1 to SizeM1 do
-    if FOutput.FData[i] > MaxV then MaxV := FOutput.FData[i];
-  S := NeuralExp(-MaxV);
-  for i := 0 to SizeM1 do
-  begin
-    V := NeuralExp(FOutput.FData[i] - MaxV);
-    FOutput.FData[i] := V;
-    S := S + V;
-  end;
+  MaxV := TNNetVolume.MaxValue(FOutput.DataPtr, SizeM1 + 1);  // #18
+  // #19: the whole volume is one contiguous run, so the exp and the accumulate
+  // are a single fused vectorized pass; the "1" term stays a scalar exp.
+  S := NeuralExp(-MaxV) +
+    TNNetVolume.ExpShiftSum(FOutput.DataPtr, FOutput.DataPtr, MaxV,
+      SizeM1 + 1);
   if S > 0 then FOutput.Divi(S);  // #13/#18 (whole-volume uniform divide)
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
