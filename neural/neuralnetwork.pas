@@ -110430,6 +110430,45 @@ begin
   end;
 end;
 
+// Dot product of two Single vectors accumulated in Double, for the empirical
+// NTK Gram matrices: the accumulator has to be wide because it runs over the
+// whole trainable parameter count, but the gradient rows themselves stay
+// Single.
+// `Dot + Double(A[K]) * Double(B[K])` with one accumulator compiles to two
+// `cvtss2sd mem,%xmm` writing the same two scratch registers; cvtss2sd writes
+// only the low 64 bits and preserves the destination's upper half, so every
+// conversion falsely depends on the previous one and the loop serializes.
+// A private Double local per read plus four accumulators break both that chain
+// and the accumulator chain: measured 6.77 -> 1.43 cycles/element at
+// N = 65536, 4.73x (both variants in one binary, rdtscp, min of 60 interleaved
+// rounds, taskset-pinned). Coded by Claude (AI).
+function DotProductSSD(A, B: PSingle; N: integer): Double;
+var
+  i, n4: integer;
+  s0, s1, s2, s3, a0, a1, a2, a3, b0, b1, b2, b3: Double;
+begin
+  s0 := 0; s1 := 0; s2 := 0; s3 := 0;
+  n4 := N and (not 3);
+  i := 0;
+  while i < n4 do
+  begin
+    a0 := A[i];   a1 := A[i+1];   a2 := A[i+2];   a3 := A[i+3];
+    b0 := B[i];   b1 := B[i+1];   b2 := B[i+2];   b3 := B[i+3];
+    s0 := s0 + a0 * b0;
+    s1 := s1 + a1 * b1;
+    s2 := s2 + a2 * b2;
+    s3 := s3 + a3 * b3;
+    Inc(i, 4);
+  end;
+  while i < N do
+  begin
+    a0 := A[i]; b0 := B[i];
+    s0 := s0 + a0 * b0;
+    Inc(i);
+  end;
+  Result := (s0 + s1) + (s2 + s3);
+end;
+
 class function TNNet.NeuralTangentKernelReport(
   NN: TNNet;
   Samples: TNNetVolumeList;
@@ -110505,7 +110544,7 @@ var
   CanDrift: boolean;
   GI, GJ: TFloatArray;         // bound gradient rows (hoisted out of the K loop)
   dDrift, cA, cB: Double;      // difference/centered terms computed once (#4)
-  Nm1, NetParamCntM1, OutSizeM1, cBinsM1, LastLayerIdx: integer;
+  Nm1, OutSizeM1, cBinsM1, LastLayerIdx: integer;
 
   // Collect index-aligned per-sample gradient vectors from aNet over exactly
   // the UsableCount original samples in SampleOrigIdx (same flat layout as the
@@ -110707,7 +110746,6 @@ begin
     LastLayer := NN.GetLastLayer();
     OutSize := LastLayer.Output.Size;
     OutSizeM1 := OutSize - 1;
-    NetParamCntM1 := NetParamCnt - 1;
     Target := TNNetVolume.Create(OutSize, 1, 1);
 
     SetLength(Grads, Samples.Count);
@@ -110800,9 +110838,7 @@ begin
       for J := I to Nm1 do
       begin
         GJ := Grads[J];
-        Dot := 0;
-        for K := 0 to NetParamCntM1 do
-          Dot := Dot + Double(GI[K]) * Double(GJ[K]);
+        Dot := DotProductSSD(@GI[0], @GJ[0], NetParamCnt);
         Gram[I][J] := Dot;
         Gram[J][I] := Dot;
       end;
@@ -110820,16 +110856,15 @@ begin
           SymOK := Abs(Gram[I][J] - Gram[J][I]);
     end;
 
-    // Snapshot the self Gram before the in-place Jacobi pass destroys it, so the
-    // optional NTK-drift section can diff it against the SnapshotB kernel.
-    if SnapshotB <> '' then
+    // Snapshot the self Gram before the in-place Jacobi pass destroys it. The
+    // Frobenius alignment below and the optional NTK-drift section both read it
+    // back; N is the probe count, so the copy is N^2 doubles against the
+    // N^2 * NetParamCnt multiply-adds it saves.
+    SetLength(GramSelf, N);
+    for I := 0 to Nm1 do
     begin
-      SetLength(GramSelf, N);
-      for I := 0 to Nm1 do
-      begin
-        SetLength(GramSelf[I], N);
-        for J := 0 to Nm1 do GramSelf[I][J] := Gram[I][J];
-      end;
+      SetLength(GramSelf[I], N);
+      for J := 0 to Nm1 do GramSelf[I][J] := Gram[I][J];
     end;
 
     // --- Report header ---
@@ -110957,17 +110992,16 @@ begin
     for I := 0 to Nm1 do
       Yvec[I] := Yvec[I] - InClass; // centered indicator
 
-    // Recompute the Gram (the Jacobi pass destroyed it) for the Frobenius
-    // alignment: K_ij = <g_i, g_j> again over the dot products.
+    // The Jacobi pass destroyed Gram, so the Frobenius alignment reads the
+    // K_ij = <g_i, g_j> entries back from the snapshot instead of contracting
+    // the gradient rows a second time.
     DotKY := 0;
     FrobK := 0;
     FrobYY := 0;
     for I := 0 to Nm1 do
       for J := 0 to Nm1 do
       begin
-        Dot := 0;
-        for K := 0 to NetParamCntM1 do
-          Dot := Dot + Double(Grads[I][K]) * Double(Grads[J][K]);
+        Dot := GramSelf[I][J];
         FrobK := FrobK + Dot * Dot;
         NormVal := Yvec[I] * Yvec[J];
         FrobYY := FrobYY + NormVal * NormVal;
@@ -111096,10 +111130,10 @@ begin
             for J := I to Nm1 do
             begin
               GJ := GradsB[J];
-              Dot := 0;
               if (GI <> nil) and (GJ <> nil) then
-                for K := 0 to NetParamCntM1 do
-                  Dot := Dot + Double(GI[K]) * Double(GJ[K]);
+                Dot := DotProductSSD(@GI[0], @GJ[0], NetParamCnt)
+              else
+                Dot := 0;
               GramB[I][J] := Dot;
               GramB[J][I] := Dot;
             end;

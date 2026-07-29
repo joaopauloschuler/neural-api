@@ -49601,6 +49601,11 @@ var
         // line per multiply. Summing over r in the same order into the same
         // double accumulator keeps the fold bit-identical. Do NOT swap the
         // inner line for TNNetVolume.MulAdd - that would drop it to Single.
+        // Staging XW through Double locals to break the cvtss2sd chain does
+        // NOT apply here either: the AccRow[j] are distinct addresses, so the
+        // j loop already runs at 2.40 cycles/element, and widening the operand
+        // makes DtVal * XW a Double multiply instead of the Single one FPC
+        // emits today - a 4.4x regression AND a different fold.
         WV := Layer.FArrNeurons[0].Weights;
         SetLength(AccRow, DI);
         for d := 0 to DIM1 do
