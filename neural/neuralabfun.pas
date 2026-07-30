@@ -1203,7 +1203,11 @@ begin
   // divisors are tested, so no arm can fault. Results are masked to a byte, so
   // range and overflow checking are dead weight here: scope them off for the
   // dispatch and restore the build's setting afterwards.
-  {$PUSH}{$R-}{$Q-}
+  {$IFDEF FPC}
+    {$PUSH}{$R-}{$Q-}
+  {$ELSE}
+    {$PUSHOPT}{$R-}{$Q-}
+  {$ENDIF}
     case OpCode of
       csNop:      begin { nop } end;
       csEqual:    NextState:=BoolToByte[Oper.Op1=Operand2Value];
@@ -1240,7 +1244,11 @@ begin
     else
       writeln('ERROR: invalid operation code:',Oper.OpCode);
     end;
-  {$POP}
+  {$IFDEF FPC}
+    {$POP}
+  {$ELSE}
+    {$POPOPT}
+  {$ENDIF}
   if (OpCode in TestOperationSet) then
     OperateAndTestOperation := NextState
   else if NumberOfNextStates > 0 then
