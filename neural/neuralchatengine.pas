@@ -1114,7 +1114,13 @@ begin
   // recurrent state to carry, so position truncation is unavailable, but the
   // full session state (attention K/V AND recurrent h) can be captured and
   // resumed exactly at a turn boundary.
-  StateReuseOK := Session.SSMCount > 0;
+  // NOT with an int8 KV cache: CaptureCacheState rejects the quantized cache
+  // (it is FP32-only) through FErrorProc, which PRINTS and returns rather
+  // than raising - the snapshot would come back with empty K/V volumes and
+  // the next restore would quietly corrupt the session. Since KVInt8 follows
+  // the weight mode by default, this is the common int8 path, so it has to be
+  // an explicit gate and not an accident.
+  StateReuseOK := (Session.SSMCount > 0) and not Opt.KVInt8;
   FreeAndNil(TurnSnap);
   TurnSnapPos := 0;
   SetLength(CachedTokens, 0);
@@ -1133,6 +1139,9 @@ begin
   else if StateReuseOK then
     Notice('[turn-boundary state reuse ON (recurrent/SSM state resumed from a' +
       ' snapshot) - only the new prompt tail is prefilled each turn]')
+  else if (Session.SSMCount > 0) and Opt.KVInt8 then
+    Notice('[turn-boundary state reuse OFF - the snapshot cannot capture an' +
+      ' int8 KV cache; --kv-fp32 turns reuse on at ~4x the KV RAM]')
   else
     Notice('[cache reuse N/A for this architecture - full re-prefill each turn]');
   if Opt.Serial then
