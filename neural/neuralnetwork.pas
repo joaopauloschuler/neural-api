@@ -54,6 +54,8 @@ uses
   neuralbyteprediction, neuralcache, neuralab, neuralthread,
   pascoremath32, pascoremathhelperfuncs;
 
+  {$IFNDEF FPC} {$POINTERMATH ON} {$ENDIF}
+
 const
   csMaxInterleavedSize: integer = 95;
   csNNetMaxParameterIdx = 7;
@@ -73420,9 +73422,7 @@ begin
   begin
     // Zero row (or nothing finite): zero codes with unit scale.
     CountM1 := Count - 1;
-    {$IFNDEF FPC} {$PUSHOPT} {$POINTERMATH ON} {$ENDIF}
     for i := 0 to CountM1 do Codes[i] := 0;
-    {$IFNDEF FPC} {$POPOPT} {$ENDIF}
     Scale := 1;
   end;
 end;
