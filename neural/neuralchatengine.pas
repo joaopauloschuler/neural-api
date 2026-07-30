@@ -186,6 +186,19 @@ type
     RawMode: boolean;            // FormatName 'raw': no chat template at all
     GenCfg: TGenConfigDefaults;  // model's generation_config.json (if any)
     ReuseOK: boolean;            // KV-cache reuse sound for this architecture?
+    // Turn-boundary state reuse, the hybrid/recurrent counterpart of ReuseOK.
+    // A recurrent layer's state cannot be truncated by position (there is no
+    // per-position history to drop), so ReuseOK is false for hybrids and the
+    // whole conversation would be re-prefilled every turn - the cost grows
+    // with the transcript. But chat history is strictly APPEND-ONLY, and a
+    // snapshot resumed mid-sequence is bit-identical to a full re-prefill
+    // (TNNetDecoderSessionSnapshot's contract), so capturing the session at
+    // the end of each turn and resuming from it next turn is exact. TurnSnap
+    // is owned; TurnSnapPos is the number of tokens fed into the session when
+    // it was captured (= Length(CachedTokens) at capture time).
+    StateReuseOK: boolean;       // snapshot resume sound for this architecture?
+    TurnSnap: TNNetDecoderSessionSnapshot;  // owned; nil when none is held
+    TurnSnapPos: integer;        // tokens fed into the session at capture
     SeqLen, VocabSize: integer;
     MarkerIds: TNeuralIntegerArray;   // end-of-turn stop sequence (token ids)
     CachedTokens: TNeuralIntegerArray; // token ids resident in the KV cache
@@ -845,6 +858,9 @@ begin
   ChatFormat := cfUnknown;
   RawMode := false;
   ReuseOK := false;
+  StateReuseOK := false;
+  TurnSnap := nil;
+  TurnSnapPos := 0;
   SeqLen := 0;
   VocabSize := 0;
   SetLength(MarkerIds, 0);
@@ -865,6 +881,7 @@ end;
 
 destructor TChatEngine.Destroy();
 begin
+  FreeAndNil(TurnSnap); // owned deep copy of the session state; free it first
   FreeAndNil(Session); // before NN.Free: Destroy ends incremental decode on
                        // NN's layers
   FreeAndNil(Tokenizer);
@@ -1093,6 +1110,13 @@ begin
   // recurrent (SSM) state to rewind. Pure-attention nets qualify; NoCacheReuse
   // forces the full re-prefill at the call site.
   ReuseOK := (Session.SSMCount = 0) and (Session.SDPACount > 0);
+  // Hybrid / pure-recurrent nets take the snapshot route instead: there is
+  // recurrent state to carry, so position truncation is unavailable, but the
+  // full session state (attention K/V AND recurrent h) can be captured and
+  // resumed exactly at a turn boundary.
+  StateReuseOK := Session.SSMCount > 0;
+  FreeAndNil(TurnSnap);
+  TurnSnapPos := 0;
   SetLength(CachedTokens, 0);
   ModelType := ReadModelType(IncludeTrailingPathDelimiter(Opt.ModelDir) +
     'config.json');
@@ -1178,12 +1202,17 @@ end;
 // trimmed); streamed emission fires after every token so the host can print
 // live. The host prints its own trailing newline - the reply text is exactly
 // what the model produced.
-// Cache reuse (ReuseOK and not GenOpt.NoCacheReuse): keep the KV cache
-// across calls and only prefill the tail that diverges from CachedTokens
-// (the token-id sequence currently resident in the cache, updated here).
-// Otherwise the cache is fully reset and the whole prompt re-prefilled (the
-// SSM/recurrent path, where the cache cannot be truncated by position, and
-// NoCacheReuse).
+// Prefill reuse, two routes, both keyed on CachedTokens (the token-id
+// sequence currently resident in the session, updated here):
+//   ReuseOK (pure attention): keep the KV cache across calls, TruncateTo the
+//     common prefix and prefill only the diverging tail.
+//   StateReuseOK (hybrid/recurrent): recurrent state has no per-position
+//     history to truncate, so instead resume the WHOLE session from the
+//     snapshot captured at the end of the previous turn - exact by the
+//     TNNetDecoderSessionSnapshot contract - and prefill only the tokens
+//     added since. Requires this prompt to extend the snapshot's sequence;
+//     a divergent prompt falls back to a full reset.
+// NoCacheReuse disables both: full reset, whole prompt re-prefilled.
 function TChatEngine.GenerateFromIds(const PromptIds: TNeuralIntegerArray;
   const GenOpt: TChatOptions): string;
 var
@@ -1191,6 +1220,7 @@ var
   Penalty: TNNetTokenHistoryPenalty;
   Sampler: TNNetSamplerBase;
   CacheReuse: boolean;
+  StateReuse: boolean;
   GreedyFast: boolean;
   Tokens: TNeuralIntegerArray;
   Generated: TNeuralIntegerArray;
@@ -1235,6 +1265,10 @@ begin
     exit;
   end;
   CacheReuse := ReuseOK and not GenOpt.NoCacheReuse;
+  // The snapshot route needs a snapshot in hand; --no-cache-reuse disables
+  // both routes.
+  StateReuse := StateReuseOK and not GenOpt.NoCacheReuse and
+    Assigned(TurnSnap);
   // Distribution pipeline (TGenerationConfig order: penalty -> temperature
   // -> sampler).
   Chain := TNNetLogitsProcessorChain.Create();
@@ -1300,6 +1334,27 @@ begin
       Reused := CommonPrefixLen(CachedTokens, PromptIds);
       if Reused > Len - 1 then Reused := Len - 1;
       Session.TruncateTo(Reused);
+    end
+    else if StateReuse then
+    begin
+      // Turn-boundary resume. The snapshot is only usable WHOLE (recurrent
+      // state has no per-position history to roll back), so it resumes at
+      // exactly TurnSnapPos and only if this prompt extends the token
+      // sequence that produced it - i.e. the cached prefix still matches at
+      // least that far. Anything shorter or divergent (/reset, edited
+      // history, a different conversation on a shared engine) falls through
+      // to the full reset below.
+      Reused := CommonPrefixLen(CachedTokens, PromptIds);
+      if (Reused >= TurnSnapPos) and (TurnSnapPos <= Len - 1) then
+      begin
+        Reused := TurnSnapPos;
+        Session.RestoreSnapshot(TurnSnap);
+      end
+      else
+      begin
+        Reused := 0;
+        Session.Reset();
+      end;
     end
     else
     begin
@@ -1419,6 +1474,17 @@ begin
     // it is not.
     SetLength(CachedTokens, Len - 1);
     if Len > 1 then Move(Tokens[0], CachedTokens[0], (Len - 1) * csIntegerSize);
+    // Turn-boundary capture for the next call's resume. Taken HERE, after the
+    // decode loop, so the session holds exactly the tokens CachedTokens lists
+    // (positions 0..Len-2) - the two must agree or the prefix test above
+    // would validate a boundary the session is not actually at. Replaces the
+    // previous snapshot (one is held at a time, not a per-turn history).
+    if StateReuseOK and not GenOpt.NoCacheReuse then
+    begin
+      FreeAndNil(TurnSnap);
+      TurnSnap := Session.Snapshot();
+      TurnSnapPos := Len - 1;
+    end;
     // Per-turn timing to stderr (keeps stdout = pure model output). TTFT =
     // prefill + first decode step; tok/s measures the steady-state decode of
     // the tokens AFTER the first, so prefill cost is excluded. prompt N (reused
@@ -1461,6 +1527,8 @@ begin
   end;
   except
     SetLength(CachedTokens, 0);
+    FreeAndNil(TurnSnap); // captured at a boundary this session is no longer at
+    TurnSnapPos := 0;
     Session.Reset();
     raise;
   end;
