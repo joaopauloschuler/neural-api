@@ -1130,9 +1130,11 @@ begin
     Notice('[KV-cache reuse OFF (--no-cache-reuse) - full re-prefill each turn]')
   else if ReuseOK then
     Notice('[KV-cache reuse ON - only the new prompt tail is prefilled each turn]')
+  else if StateReuseOK then
+    Notice('[turn-boundary state reuse ON (recurrent/SSM state resumed from a' +
+      ' snapshot) - only the new prompt tail is prefilled each turn]')
   else
-    Notice('[KV-cache reuse N/A for this architecture (recurrent/SSM state)' +
-      ' - full re-prefill each turn]');
+    Notice('[cache reuse N/A for this architecture - full re-prefill each turn]');
   if Opt.Serial then
     Notice('[serial layer loop (--serial) - fully single-threaded]')
   else
