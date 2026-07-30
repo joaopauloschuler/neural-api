@@ -416,7 +416,16 @@ end;
 
 function TNeuralTokenizer.DeTokenize(TokenId: integer): string;
 begin
-  if TokenId < 128 then
+  if TokenId < 0 then
+  begin
+    // Chr() is undefined below zero. An unknown id yields no text rather than
+    // stopping generation.
+    Result := '';
+    {$IFDEF DEBUG}
+    WriteLn('Negative token '+IntToStr(TokenId)+' at DeTokenize.');
+    {$ENDIF}
+  end
+  else if TokenId < 128 then
   begin
     Result := Chr(TokenId);
   end

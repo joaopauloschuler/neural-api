@@ -1161,12 +1161,10 @@ begin
         FProbs[I] := P;
         if P > MaxLogit then MaxLogit := P;
       end;
-      Sum := 0;
-      for I := 0 to VocabM1 do
-      begin
-        FProbs[I] := NeuralExp(FProbs[I] - MaxLogit);  // #16: fast, trap-free exp
-        Sum := Sum + FProbs[I];
-      end;
+      // #19: FProbs is one Vocab-long contiguous run, so the exp and the
+      // accumulate are a single fused vectorized pass.
+      Sum := TNNetVolume.ExpShiftSum(Addr(FProbs[0]), Addr(FProbs[0]),
+        MaxLogit, Vocab);
     end;
     R := Random * Sum;
     Acc := 0; Picked := Vocab - 1;

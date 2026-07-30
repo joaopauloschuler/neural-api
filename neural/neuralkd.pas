@@ -216,25 +216,21 @@ end;
 procedure TNeuralKDTrainer.SoftenLogits(Logits: TNNetVolume;
   Temp: TNeuralFloat; Dest: TNNetVolume);
 var
-  I, LogitsSizeM1: integer;
-  MaxLogit, SumExp, V, InvTemp: TNeuralFloat;
+  MaxLogit, SumExp, InvTemp: TNeuralFloat;
 begin
   if Dest.Size <> Logits.Size then Dest.ReSize(Logits);
-  LogitsSizeM1 := Logits.Size - 1;
   // Numerically stable softmax over (Logits / Temp). The temperature divide is
   // loop-invariant: one reciprocal, then a multiply per element (#5).
   InvTemp := 1.0 / Temp;
-  MaxLogit := Logits.FData[0];
-  for I := 1 to LogitsSizeM1 do
-    if Logits.FData[I] > MaxLogit then MaxLogit := Logits.FData[I];
-  MaxLogit := MaxLogit * InvTemp;
-  SumExp := 0;
-  for I := 0 to LogitsSizeM1 do
-  begin
-    V := NeuralExp((Logits.FData[I] * InvTemp) - MaxLogit);
-    Dest.FData[I] := V;
-    SumExp := SumExp + V;
-  end;
+  // #18: Temp > 0, so scaling after the max gives the same shift.
+  MaxLogit := TNNetVolume.MaxValue(Logits.DataPtr, Logits.Size) * InvTemp;
+  // #19: the whole volume is one contiguous run and the temperature scale is
+  // already folded out of the shift, so Dest gets the scaled copy and then one
+  // fused pass exponentiates and sums it.
+  Dest.CopyNoChecks(Logits);
+  Dest.Mul(InvTemp);
+  SumExp := TNNetVolume.ExpShiftSum(Dest.DataPtr, Dest.DataPtr, MaxLogit,
+    Dest.Size);
   // Dest and Logits have the same Size (ReSized above), so the normalization
   // spans exactly the range written: one AVX scale instead of N divides (#18).
   Dest.Mul(1.0 / SumExp);

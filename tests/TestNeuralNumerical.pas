@@ -991,6 +991,7 @@ type
     procedure TestTanhShrinkSerializationRoundTrip;
     procedure TestLogSigmoidForward;
     procedure TestLogSigmoidGradientCheck;
+    procedure TestLogSigmoidTrainableInferenceParity;
     procedure TestLogSigmoidSerializationRoundTrip;
     procedure TestLogSigmoidExtremeInputSaturation;
     procedure TestShiftedReLUForward;
@@ -1015,6 +1016,7 @@ type
     procedure TestMaskedFillDefaultMatchesUpperTriangle;
     procedure TestMaskedFillOffset;
     procedure TestMaskedFillLowerTriangle;
+    procedure TestMaskedFillNegativeOffset;
     procedure TestMaskedFillGradientCheck;
     procedure TestTriangularCausalMaskForward;
     procedure TestTriangularCausalMaskGradientCheck;
@@ -1025,6 +1027,7 @@ type
     procedure TestSlidingWindowMaskedFillSerializationRoundTrip;
     procedure TestSlidingWindowMaskedFillFullWindowEqualsCausal;
     procedure TestSlidingWindowMaskedFillShapeStress;
+    procedure TestSlidingWindowMaskedFillNonSquare;
     procedure TestALiBiForward;
     procedure TestALiBiGradientCheck;
     procedure TestALiBiSerializationRoundTrip;
@@ -1455,6 +1458,7 @@ type
     procedure TestSincGradientCheck;
     procedure TestSincSerializationRoundTrip;
     procedure TestSinhActGradientCheck;
+    procedure TestPowerGradientCheck;
     procedure TestArcSinhGradientCheck;
     procedure TestLeCunTanhGradientCheck;
     procedure TestLeCunTanhForward;
@@ -11083,6 +11087,53 @@ begin
     [0.5, -0.5, 1.0, -1.0, 2.0, -2.5], 0.01);
 end;
 
+procedure TTestNeuralNumerical.TestLogSigmoidTrainableInferenceParity;
+const
+  Xs: array[0..10] of TNeuralFloat =
+    (-40, -20, -17.5, -1, -1e-6, 0, 1e-6, 1, 17.5, 20, 40);
+var
+  TrainNN, InferNN: TNNet;
+  Input: TNNetVolume;
+  i: integer;
+begin
+  // TNNetLogSigmoid.Compute has a trainable path (error volumes sized) and an
+  // inference path (SetTrainable(False) shrinks them). Both must evaluate the
+  // very same formula, so the forward output cannot depend on trainability:
+  // the two must agree bit for bit.
+  TrainNN := TNNet.Create();
+  InferNN := TNNet.Create();
+  Input := TNNetVolume.Create(Length(Xs), 1, 1);
+  try
+    TrainNN.AddLayer(TNNetInput.Create(Length(Xs), 1, 1, 1));
+    TrainNN.AddLayer(TNNetLogSigmoid.Create());
+    TrainNN.SetLearningRate(1.0, 0.0);
+
+    InferNN.AddLayer(TNNetInput.Create(Length(Xs), 1, 1, 1));
+    InferNN.AddLayer(TNNetLogSigmoid.Create());
+    InferNN.GetLastLayer.SetTrainable(false, false);
+
+    AssertTrue('LogSigmoid trainable path has sized error volumes',
+      (TrainNN.GetLastLayer.Output.Size = TrainNN.GetLastLayer.OutputError.Size) and
+      (TrainNN.GetLastLayer.OutputErrorDeriv.Size = TrainNN.GetLastLayer.Output.Size));
+    AssertFalse('LogSigmoid inference path has shrunk error volumes',
+      (InferNN.GetLastLayer.Output.Size = InferNN.GetLastLayer.OutputError.Size) and
+      (InferNN.GetLastLayer.OutputErrorDeriv.Size = InferNN.GetLastLayer.Output.Size));
+
+    for i := 0 to Length(Xs) - 1 do Input.Raw[i] := Xs[i];
+
+    TrainNN.Compute(Input);
+    InferNN.Compute(Input);
+
+    for i := 0 to Length(Xs) - 1 do
+      AssertEquals('LogSigmoid train/inference parity at x=' + FloatToStr(Xs[i]),
+        TrainNN.GetLastLayer.Output.Raw[i], InferNN.GetLastLayer.Output.Raw[i], 0.0);
+  finally
+    TrainNN.Free;
+    InferNN.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestLogSigmoidExtremeInputSaturation;
 var
   NN: TNNet;
@@ -11588,6 +11639,57 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumerical.TestMaskedFillNegativeOffset;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, Ofs: integer;
+begin
+  Ofs := -2;
+  // A negative offset shifts the band off the volume: entire rows fall inside
+  // the masked half-plane, and the run must stop at the row edge instead of
+  // walking off it (X < 0 on the causal side, X > MaxX on the anti-causal one).
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 1, 1));
+    NN.AddLayer(TNNetMaskedFill.Create(-1e9, Ofs, False));
+    Input.Fill(1.0);
+    NN.Compute(Input);
+    for Y := 0 to 3 do
+      for X := 0 to 3 do
+        if X > Y + Ofs then
+          AssertTrue('Causal negative offset masked at X=' + IntToStr(X) +
+            ' Y=' + IntToStr(Y), NN.GetLastLayer.Output[X, Y, 0] < -1e8)
+        else
+          AssertEquals('Causal negative offset untouched at X=' + IntToStr(X) +
+            ' Y=' + IntToStr(Y), 1.0, NN.GetLastLayer.Output[X, Y, 0], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 1, 1));
+    NN.AddLayer(TNNetMaskedFill.Create(-1e9, Ofs, True));
+    Input.Fill(1.0);
+    NN.Compute(Input);
+    for Y := 0 to 3 do
+      for X := 0 to 3 do
+        if X < Y - Ofs then
+          AssertTrue('Anti-causal negative offset masked at X=' + IntToStr(X) +
+            ' Y=' + IntToStr(Y), NN.GetLastLayer.Output[X, Y, 0] < -1e8)
+        else
+          AssertEquals('Anti-causal negative offset untouched at X=' +
+            IntToStr(X) + ' Y=' + IntToStr(Y),
+            1.0, NN.GetLastLayer.Output[X, Y, 0], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestMaskedFillGradientCheck;
 begin
   // Adding a constant has identity gradient passthrough. A small mask
@@ -11630,6 +11732,40 @@ begin
             1.0, NN.GetLastLayer.Output[X, Y, 0], 0.0001);
       end;
     end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSlidingWindowMaskedFillNonSquare;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, W, SizeX, SizeY: integer;
+begin
+  SizeX := 3;
+  SizeY := 5;
+  W := 1;
+  // The too-far-past run length comes from the query (Y) axis, so on a taller
+  // than wide map the last rows are entirely past the window and the run must
+  // stop at the row edge rather than run off the volume.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SizeX, SizeY, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(SizeX, SizeY, 1, 1));
+    NN.AddLayer(TNNetSlidingWindowMaskedFill.Create(W, -1e9));
+    Input.Fill(1.0);
+    NN.Compute(Input);
+    for Y := 0 to SizeY - 1 do
+      for X := 0 to SizeX - 1 do
+        if (X > Y) or (X < Y - W + 1) then
+          AssertTrue('Non-square sliding window masked at X=' + IntToStr(X) +
+            ' Y=' + IntToStr(Y), NN.GetLastLayer.Output[X, Y, 0] < -1e8)
+        else
+          AssertEquals('Non-square sliding window untouched at X=' +
+            IntToStr(X) + ' Y=' + IntToStr(Y),
+            1.0, NN.GetLastLayer.Output[X, Y, 0], 0.0001);
   finally
     NN.Free;
     Input.Free;
@@ -29838,6 +29974,16 @@ begin
   // is comfortable.
   ActivationGradientCheck(Self, TNNetSinhAct.Create(), 'SinhAct',
     [0.5, -0.5, 1.0, -1.0, 0.25, -0.25], 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestPowerGradientCheck;
+begin
+  // d/dx x^p = p*x^(p-1). Covers both signs of the base and the x = 0 slot,
+  // where the derivative cannot be derived from x^p by dividing through by x.
+  ActivationGradientCheck(Self, TNNetPower.Create(3), 'Power(3)',
+    [0.5, -0.5, 1.5, -1.5, 0.0, 1.0], 0.01);
+  ActivationGradientCheck(Self, TNNetPower.Create(2), 'Power(2)',
+    [0.5, -0.5, 1.5, -1.5, 0.0, 1.0], 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestArcSinhGradientCheck;

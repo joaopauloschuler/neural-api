@@ -33,12 +33,17 @@ type
     procedure TestVolumeAddSubValueParity;
     procedure TestVolumeRankOneUpdateRowParity;
     procedure TestVolumeAdamDeltaParity;
+    procedure TestVolumeAdafactorDeltaParity;
+    procedure TestVolumeClampAbsParity;
+    procedure TestVolumeLionDeltaParity;
     procedure TestVolumeFlip;
     procedure TestVolumeClassification;
     procedure TestVolumeSoftMax;
     procedure TestVolumeSoftMaxParity;
     procedure TestVolumePointwiseSoftMaxParity;
     procedure TestVolumeGroupedPointwiseSoftMaxParity;
+    procedure TestGroupedDotProductsTiledRebuildsOnNewSource;
+    procedure TestGroupedDotProductsTiledPartialTile;
     procedure TestVolumePadding;
     procedure TestVolumeTranspose;
     // Additional volume tests
@@ -48,6 +53,7 @@ type
     procedure TestVolumeCrossEntropy;
     procedure TestVolumeOneHotEncodingOnPixel;
     procedure TestVolumeOneHotEncoding;
+    procedure TestVolumeOneHotEncodingReversedString;
     procedure TestVolumePositionalEncoding;
     procedure TestVolumeColorConversions;
     procedure TestVolumeLabRoundTrip;
@@ -919,6 +925,269 @@ begin
   end;
 end;
 
+procedure TTestNeuralVolume.TestVolumeAdafactorDeltaParity;
+// AdafactorDelta fuses the per-element sqrt/divide loop that
+// TNNetNeuron.CalcAdafactorDelta runs on its unfactored branch (every fully
+// connected / embedding layer). The reference here is that loop written out
+// element by element in the SAME operation order, so the assertion is
+// BIT-identity at tolerance 0.0: neither path uses FMA and every intermediate
+// is a TNeuralFloat, so both round at the same points. Five consecutive steps
+// let the second moment accumulate, so a kernel that got the recurrence wrong
+// could not hide behind one step. Sizes straddle the 8-element block and the
+// scalar tail; one delta slot per row is an exact zero.
+const
+  Sizes: array[0..8] of integer = (1, 3, 7, 8, 9, 16, 31, 64, 517);
+  cB2 = 0.999;
+  cEps = 1e-8;
+  cLR = 0.01;
+  cSteps = 5;
+var
+  D, V, RefD, RefV: TNNetVolume;
+  SI, K, N, Step: integer;
+  invNegLr, kAF, cAF, d0, t1, t2, vNew, B2, Eps: TNeuralFloat;
+  Tag: string;
+begin
+  RandSeed := 27182818;
+  // The reference loop must see the SAME single-precision scalars the kernel
+  // broadcasts; an untyped const would let FPC evaluate its multiply in Double
+  // and round once more than the kernel does.
+  B2 := cB2;
+  Eps := cEps;
+  invNegLr := -1.0 / cLR;
+  kAF := (1 - B2) * (invNegLr * invNegLr);
+  cAF := (1 - B2) * Eps;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    D := TNNetVolume.Create(1, 1, N);
+    V := TNNetVolume.Create(1, 1, N);
+    RefD := TNNetVolume.Create(1, 1, N);
+    RefV := TNNetVolume.Create(1, 1, N);
+    try
+      for K := 0 to N - 1 do
+      begin
+        V.FData[K] := Random * 0.3;
+        RefV.FData[K] := V.FData[K];
+      end;
+
+      for Step := 1 to cSteps do
+      begin
+        Tag := ' (N=' + IntToStr(N) + ' step ' + IntToStr(Step) + ')';
+        for K := 0 to N - 1 do
+        begin
+          if K mod 9 = 4 then D.FData[K] := 0
+          else D.FData[K] := ((K mod 7) - 3) * 0.25 * Step;
+          RefD.FData[K] := D.FData[K];
+        end;
+
+        // Reference: the fused recurrence, spelled out one element at a time.
+        for K := 0 to N - 1 do
+        begin
+          d0 := RefD.FData[K];
+          t1 := d0 * d0;
+          t1 := kAF * t1;
+          t1 := t1 + cAF;
+          t2 := B2 * RefV.FData[K];
+          vNew := t1 + t2;
+          RefV.FData[K] := vNew;
+          t1 := Sqrt(vNew);
+          t1 := t1 + Eps;
+          RefD.FData[K] := d0 / t1;
+        end;
+
+        TNNetVolume.AdafactorDelta(D.DataPtr, V.DataPtr,
+          B2, kAF, cAF, Eps, N);
+
+        for K := 0 to N - 1 do
+        begin
+          AssertEquals('second moment[' + IntToStr(K) + ']' + Tag,
+            RefV.FData[K], V.FData[K], 0.0);
+          AssertEquals('delta[' + IntToStr(K) + ']' + Tag,
+            RefD.FData[K], D.FData[K], 0.0);
+        end;
+      end;
+
+      // A zero-length run must touch nothing.
+      D.FData[0] := 5;
+      TNNetVolume.AdafactorDelta(D.DataPtr, V.DataPtr, B2, kAF, cAF, Eps, 0);
+      AssertEquals('empty run', 5.0, D.FData[0], 0.0);
+    finally
+      D.Free; V.Free; RefD.Free; RefV.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeClampAbsParity;
+// ClampAbs is a vmaxps/vminps pair on an AVX2/64-bit build and a two-branch
+// scalar loop everywhere else; the two must agree bit for bit, which is why the
+// kernel puts the bound in the FIRST operand of both instructions (x86 min/max
+// return the second operand when a compare is unordered, so a NaN passes
+// through untouched, exactly as the scalar "if v > b / else if v < -b" form
+// leaves it). The inputs below therefore cover: values inside the band, values
+// on both saturating sides, the exact boundaries +/-Value (which must NOT be
+// rewritten), a signed zero and an infinity on each side. Sizes straddle the
+// 8-element block and the scalar tail. NaN is deliberately NOT fed in: MAXPS
+// signals Invalid Operation on a QNaN source exactly as the scalar COMISS
+// does, so both paths raise EInvalidOp under FPC's default unmasked exceptions
+// - identical behaviour, but not something a test can assert a value for.
+const
+  Sizes: array[0..8] of integer = (1, 3, 7, 8, 9, 16, 31, 64, 517);
+  cBound = 0.75;
+var
+  Buf, Ref: array of TNeuralFloat;
+  SI, K, N: integer;
+  v: TNeuralFloat;
+  Tag: string;
+begin
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    SetLength(Buf, N);
+    SetLength(Ref, N);
+    Tag := ' (N=' + IntToStr(N) + ')';
+    for K := 0 to N - 1 do
+    begin
+      case K mod 8 of
+        0: v := 0.1;
+        1: v := -0.1;
+        2: v := 3.5;
+        3: v := -3.5;
+        4: v := cBound;         // exactly the bound: must survive untouched
+        5: v := -cBound;
+        6: v := 0.0;
+        else v := -0.0;
+      end;
+      Buf[K] := v;
+      Ref[K] := v;
+    end;
+    if N > 16 then
+    begin
+      Buf[10] := Infinity;  Ref[10] := Infinity;
+      Buf[11] := -Infinity; Ref[11] := -Infinity;
+    end;
+
+    // Reference: the scalar clamp the layer used to run inline.
+    for K := 0 to N - 1 do
+    begin
+      if Ref[K] > cBound then Ref[K] := cBound
+      else if Ref[K] < -cBound then Ref[K] := -cBound;
+    end;
+
+    TNNetVolume.ClampAbs(TNeuralFloatArrPtr(@Buf[0]), cBound, N);
+
+    for K := 0 to N - 1 do
+      AssertEquals('ClampAbs[' + IntToStr(K) + ']' + Tag,
+        Ref[K], Buf[K], 0.0);
+
+    // A non-positive bound and a zero count are both no-ops.
+    Buf[0] := 9;
+    TNNetVolume.ClampAbs(TNeuralFloatArrPtr(@Buf[0]), 0, N);
+    AssertEquals('zero bound is a no-op' + Tag, 9.0, Buf[0], 0.0);
+    TNNetVolume.ClampAbs(TNeuralFloatArrPtr(@Buf[0]), cBound, 0);
+    AssertEquals('empty run' + Tag, 9.0, Buf[0], 0.0);
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeLionDeltaParity;
+// LionDelta fuses the interpolation, the momentum EMA and the three-valued sign
+// select that TNNetNeuron.CalcLionDelta ran element by element. The reference
+// here is that loop in the SAME operation order, so the assertion is
+// BIT-identity at tolerance 0.0: neither path uses FMA, and the kernel's two
+// vcmpps masks reproduce the "> 0 / < 0 / else 0" chain exactly, +0.0 included.
+// The gradient pattern deliberately drives c through zero and back so all three
+// select arms fire, and one delta slot per row is an exact zero. Five
+// consecutive steps let the single momentum buffer accumulate. Sizes straddle
+// the 8-element block and the scalar tail.
+const
+  Sizes: array[0..8] of integer = (1, 3, 7, 8, 9, 16, 31, 64, 517);
+  cB1 = 0.9;
+  cB2 = 0.99;
+  cLR = 0.01;
+  cSteps = 5;
+var
+  D, M, RefD, RefM: TNNetVolume;
+  SI, K, N, Step: integer;
+  B1, B2, invNegLr, k1, k2, negLr, posLr, dv, mv, cv: TNeuralFloat;
+  Tag: string;
+begin
+  RandSeed := 16180339;
+  // Typed singles: an untyped const would let FPC evaluate the reference's
+  // multiplies in Double and round once more than the kernel does.
+  B1 := cB1;
+  B2 := cB2;
+  posLr := cLR;
+  negLr := -cLR;
+  invNegLr := -1.0 / cLR;
+  k1 := (1 - B1) * invNegLr;
+  k2 := (1 - B2) * invNegLr;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    D := TNNetVolume.Create(1, 1, N);
+    M := TNNetVolume.Create(1, 1, N);
+    RefD := TNNetVolume.Create(1, 1, N);
+    RefM := TNNetVolume.Create(1, 1, N);
+    try
+      for K := 0 to N - 1 do
+      begin
+        M.FData[K] := (Random - 0.5) * 0.4;
+        RefM.FData[K] := M.FData[K];
+      end;
+
+      for Step := 1 to cSteps do
+      begin
+        Tag := ' (N=' + IntToStr(N) + ' step ' + IntToStr(Step) + ')';
+        for K := 0 to N - 1 do
+        begin
+          if K mod 9 = 4 then D.FData[K] := 0
+          else if Step mod 2 = 0 then D.FData[K] := ((K mod 7) - 3) * 0.05
+          else D.FData[K] := (3 - (K mod 7)) * 0.05;
+          RefD.FData[K] := D.FData[K];
+        end;
+
+        // Reference: the loop this kernel replaced.
+        for K := 0 to N - 1 do
+        begin
+          dv := RefD.FData[K];
+          mv := RefM.FData[K];
+          cv := B1 * mv + k1 * dv;
+          RefM.FData[K] := B2 * mv + k2 * dv;
+          if cv > 0 then RefD.FData[K] := negLr
+          else if cv < 0 then RefD.FData[K] := posLr
+          else RefD.FData[K] := 0;
+        end;
+
+        TNNetVolume.LionDelta(D.DataPtr, M.DataPtr,
+          B1, k1, B2, k2, negLr, posLr, N);
+
+        for K := 0 to N - 1 do
+        begin
+          AssertEquals('momentum[' + IntToStr(K) + ']' + Tag,
+            RefM.FData[K], M.FData[K], 0.0);
+          AssertEquals('delta[' + IntToStr(K) + ']' + Tag,
+            RefD.FData[K], D.FData[K], 0.0);
+        end;
+      end;
+
+      // An exactly-zero c must select the zero arm, not a learning rate.
+      M.Fill(0);
+      D.Fill(0);
+      TNNetVolume.LionDelta(D.DataPtr, M.DataPtr,
+        B1, k1, B2, k2, negLr, posLr, N);
+      for K := 0 to N - 1 do
+        AssertEquals('zero c selects zero' + Tag, 0.0, D.FData[K], 0.0);
+
+      // A zero-length run must touch nothing.
+      D.FData[0] := 5;
+      TNNetVolume.LionDelta(D.DataPtr, M.DataPtr,
+        B1, k1, B2, k2, negLr, posLr, 0);
+      AssertEquals('empty run', 5.0, D.FData[0], 0.0);
+    finally
+      D.Free; M.Free; RefD.Free; RefM.Free;
+    end;
+  end;
+end;
+
 procedure TTestNeuralVolume.TestVolumeExpShiftSumParity;
 // ExpShiftSum is one fused AVX2/64-bit kernel (broadcast subtract,
 // 8-wide exp, in-register reduction) and a plain scalar loop on every other
@@ -1162,6 +1431,90 @@ begin
         Ref[K], V.Raw[K], 1e-4);
   finally
     V.Free;
+  end;
+end;
+
+// GroupedDotProductsTiled caches a raw row pointer per A row. The cache must
+// follow the source volume: a second call with a DIFFERENT VAs of the same row
+// count has to read the new rows, not the pointers cached from the first one.
+procedure TTestNeuralVolume.TestGroupedDotProductsTiledRebuildsOnNewSource;
+const
+  Groups = 2;
+  NumAs = 4;
+  NumBs = 3;
+  VectorSize = 3;
+var
+  R: TNNetGroupedVolume;
+  A1, A2, B: TNNetVolume;
+  i: integer;
+  First: array[0..NumAs * NumBs - 1] of TNeuralFloat;
+begin
+  R := TNNetGroupedVolume.Create(NumAs * NumBs, 1, 1);
+  // Both sources stay alive, so they are guaranteed to be distinct buffers.
+  A1 := TNNetVolume.Create(NumAs, 1, VectorSize);
+  A2 := TNNetVolume.Create(NumAs, 1, VectorSize);
+  B := TNNetVolume.Create(NumBs, 1, VectorSize * Groups);
+  try
+    A1.Fill(1);
+    A2.Fill(2);
+    for i := 0 to B.Size - 1 do B.FData[i] := 0.25 * (i + 1);
+    R.Fill(0);
+    R.GroupedDotProductsTiled(Groups, NumAs, NumBs, VectorSize, A1, B, 2, 3);
+    for i := 0 to NumAs * NumBs - 1 do First[i] := R.FData[i];
+    AssertTrue('First source produced non-zero output', R.GetSumAbs() > 0);
+    R.Fill(0);
+    R.GroupedDotProductsTiled(Groups, NumAs, NumBs, VectorSize, A2, B, 2, 3);
+    // A2 is exactly twice A1, so every dot product must double.
+    for i := 0 to NumAs * NumBs - 1 do
+      AssertEquals('Second source element ' + IntToStr(i),
+        2 * First[i], R.FData[i], 1e-5);
+  finally
+    B.Free;
+    A2.Free;
+    A1.Free;
+    R.Free;
+  end;
+end;
+
+// A tile size that does not divide the range leaves a partial trailing tile;
+// the kernel must still cover the trailing rows/columns (it never zero-fills,
+// so a skipped output keeps whatever was there before).
+procedure TTestNeuralVolume.TestGroupedDotProductsTiledPartialTile;
+const
+  Groups = 1;
+  NumAs = 3;
+  NumBs = 3;
+  VectorSize = 2;
+var
+  R: TNNetGroupedVolume;
+  A, B: TNNetVolume;
+  CntA, CntB, k: integer;
+  Expected: TNeuralFloat;
+begin
+  R := TNNetGroupedVolume.Create(NumAs * NumBs, 1, 1);
+  A := TNNetVolume.Create(NumAs, 1, VectorSize);
+  B := TNNetVolume.Create(NumBs, 1, VectorSize * Groups);
+  try
+    for k := 0 to A.Size - 1 do A.FData[k] := 0.5 * (k + 1);
+    for k := 0 to B.Size - 1 do B.FData[k] := 0.25 * (k + 2);
+    R.Fill(-999);
+    // 3 rows with tile 2 and 3 columns with tile 2: both axes end in a
+    // one-wide partial tile.
+    R.GroupedDotProductsTiled(Groups, NumAs, NumBs, VectorSize, A, B, 2, 2);
+    for CntB := 0 to NumBs - 1 do
+      for CntA := 0 to NumAs - 1 do
+      begin
+        Expected := 0;
+        for k := 0 to VectorSize - 1 do
+          Expected := Expected +
+            A.FData[CntA * VectorSize + k] * B.FData[CntB * VectorSize + k];
+        AssertEquals('Partial tile A=' + IntToStr(CntA) + ' B=' + IntToStr(CntB),
+          Expected, R.FData[CntB * NumAs + CntA], 1e-5);
+      end;
+  finally
+    B.Free;
+    A.Free;
+    R.Free;
   end;
 end;
 
@@ -1443,6 +1796,57 @@ begin
     AssertEquals('V[0,0,0] should be 0.0', 0.0, V[0, 0, 0], 0.0001);
     AssertEquals('V[1,0,0] should be 0.0', 0.0, V[1, 0, 0], 0.0001);
   finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeOneHotEncodingReversedString;
+const
+  csSizeX = 8;
+  csPrompt = 'ABCDEFGHIJKL';
+var
+  V, VRef: TNNetVolume;
+  Tail: string;
+begin
+  // The string overload keeps only the last SizeX characters. Encoding an
+  // over-long prompt must match encoding its manually truncated tail.
+  V := TNNetVolume.Create(csSizeX, 1, 256);
+  VRef := TNNetVolume.Create(csSizeX, 1, 256);
+  try
+    Tail := Copy(csPrompt, Length(csPrompt) - csSizeX + 1, csSizeX);
+    AssertEquals('Truncated tail', 'EFGHIJKL', Tail);
+
+    V.OneHotEncodingReversed(csPrompt);
+    AssertEquals('Over-long prompt must not encode to an all zero volume',
+      csSizeX, Round(V.GetSumAbs()));
+
+    VRef.OneHotEncodingReversed(Tail);
+    AssertEquals('Over-long prompt must encode as its last SizeX characters',
+      0, Round(V.SumDiff(VRef)));
+
+    // Exactly SizeX characters.
+    V.OneHotEncodingReversed(Tail);
+    AssertEquals('Exact length encodes one hit per position',
+      csSizeX, Round(V.GetSumAbs()));
+    AssertEquals('Last character lands at position 0',
+      1, Round(V[0, 0, Ord('L')]));
+    AssertEquals('First character lands at position SizeX-1',
+      1, Round(V[csSizeX - 1, 0, Ord('E')]));
+
+    // Shorter than SizeX: only the used positions are set.
+    V.OneHotEncodingReversed('XY');
+    AssertEquals('Short prompt sets one hit per character',
+      2, Round(V.GetSumAbs()));
+    AssertEquals('Short prompt last character at position 0',
+      1, Round(V[0, 0, Ord('Y')]));
+    AssertEquals('Short prompt first character at position 1',
+      1, Round(V[1, 0, Ord('X')]));
+
+    // Empty prompt clears the volume.
+    V.OneHotEncodingReversed('');
+    AssertEquals('Empty prompt yields an empty volume', 0, Round(V.GetSumAbs()));
+  finally
+    VRef.Free;
     V.Free;
   end;
 end;

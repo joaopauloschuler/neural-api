@@ -626,6 +626,50 @@ type
       class procedure AdamDelta(PtrDelta, PtrM, PtrV: TNeuralFloatArrPtr;
         Beta1, OmBeta1, Beta2, OmBeta2, InvOmB2D, Epsilon, kLR: TNeuralFloat;
         N: integer); static;
+      // AdafactorDelta runs Adafactor's unfactored (per-element) second-moment
+      // step over a weight row in one pass:
+      //   v := Beta2*v + (k*d*d + c)
+      //   d := d / (sqrt(v) + Epsilon)
+      // where d is PtrDelta in and the finished increment out. The caller folds
+      // Adafactor's algebra into the two scalars: with FDelta arriving as
+      // -lr*g, the recovered gradient squared is g*g = d*d/(lr*lr), so
+      // k = (1-Beta2)/(lr*lr) and c = (1-Beta2)*Eps1, and the -lr*(g/denom)
+      // store collapses to d/denom. AVX2/64-bit builds run AVXAdafactorDelta;
+      // every other build runs the equivalent scalar loop, which performs the
+      // identical rounding sequence, so the two paths are bit-identical.
+      class procedure AdafactorDelta(PtrDelta, PtrV: TNeuralFloatArrPtr;
+        Beta2, k, c, Epsilon: TNeuralFloat; N: integer); static;
+      // ClampAbs clamps dst[0..N-1] into [-Value, +Value] in place - the
+      // gradient-clipping saturate applied to every delta on every training
+      // step. AVX2/64-bit builds run AVXClampAbs (vmaxps then vminps, eight
+      // elements per iteration); every other build runs the equivalent scalar
+      // loop. Bit-identical to the scalar "if v > b / else if v < -b" form the
+      // layers used to run inline, signed zeros and infinities included. NaN:
+      // the kernel puts the bound in the FIRST operand of each vmaxps/vminps
+      // and x86 min/max return the SECOND operand on an unordered compare, so
+      // a NaN would flow through untouched - but MAXPS/MINPS signal Invalid
+      // Operation on a QNaN source just as the scalar COMISS does, so under
+      // FPC's default unmasked exceptions BOTH paths raise EInvalidOp on a NaN
+      // input, exactly like the code this replaced. Value <= 0 is a no-op.
+      class procedure ClampAbs(PtrA: TNeuralFloatArrPtr; Value: TNeuralFloat;
+        N: integer); static;
+      // LionDelta runs one whole Lion step (Chen et al. 2023) over a weight row
+      // in a single pass:
+      //   c := Beta1*m + k1*d
+      //   m := Beta2*m + k2*d
+      //   d := NegLR if c > 0, PosLR if c < 0, 0 if c is exactly zero
+      // where d is PtrDelta in and the finished increment out and m is
+      // PtrM, Lion's single momentum buffer. The caller folds the algebra into
+      // the scalars: FDelta arrives as -lr*g, so the gradient both EMAs
+      // consume is d*invNegLr and k_i = (1-Beta_i)*invNegLr; NegLR is -lr and
+      // PosLR is +lr, so the sign select stores the finished increment with no
+      // multiply. AVX2/64-bit builds run AVXLionDelta, which selects with two
+      // vcmpps masks; every other build runs the equivalent scalar loop.
+      // Bit-identical either way, the exact-zero and signed-zero cases
+      // included; as with the scalar form, a NaN c raises Invalid Operation
+      // under FPC's default unmasked exceptions (both compares signal).
+      class procedure LionDelta(PtrDelta, PtrM: TNeuralFloatArrPtr;
+        Beta1, k1, Beta2, k2, NegLR, PosLR: TNeuralFloat; N: integer); static;
       // Relu writes dst[0..N-1] := max(src[0..N-1], 0). AVX2-accelerated
       // (AVXCopyRelu) with a scalar fallback on non-AVX builds. Bit-exact vs the
       // scalar relu-copy. Buffers may alias (dst = src).
@@ -819,7 +863,13 @@ type
 
   TNNetGroupedVolume = class(TNNetVolume)
     protected
+      // Per-A-row group id and RAW row pointer, cached across calls. The
+      // pointers belong to one particular VAs buffer, so the cache is keyed on
+      // that buffer's base address and on the shape the rows were derived from
+      // - a later call with a resized (moved) or different VAs rebuilds.
       FGrInfoArray: TNNetGroupInfoArray;
+      FGrInfoBase: pointer;
+      FGrInfoVectorSize, FGrInfoGroups: integer;
     public
       destructor Destroy(); override;
       procedure GroupedDotProductsTiled(Groups, NumAs, NumBs, VectorSize: integer; VAs, VBs: TNNetVolume; TileSizeA, TileSizeB: integer);
@@ -1734,6 +1784,8 @@ begin
   shr ecx,5  // number of large iterations = number of elements / 32
   jz @SkipLargeAddLoop
   vxorps ymm1, ymm1, ymm1
+  vxorps ymm6, ymm6, ymm6
+  vxorps ymm7, ymm7, ymm7
 
 @LargeAddLoop:
   vpmovsxbd ymm2, [rax]
@@ -1748,8 +1800,8 @@ begin
 
   vfmadd231ps ymm0, ymm2, [rdx]
   vfmadd231ps ymm1, ymm3, [rdx+32]
-  vfmadd231ps ymm0, ymm4, [rdx+64]
-  vfmadd231ps ymm1, ymm5, [rdx+96]
+  vfmadd231ps ymm6, ymm4, [rdx+64]
+  vfmadd231ps ymm7, ymm5, [rdx+96]
 
   add rax, 32
   add rdx, 128
@@ -1757,6 +1809,8 @@ begin
   jnz @LargeAddLoop
 
   vaddps ymm0, ymm0, ymm1
+  vaddps ymm6, ymm6, ymm7
+  vaddps ymm0, ymm0, ymm6
   VEXTRACTF128 xmm2, ymm0, 1
   vzeroupper
   addps xmm0, xmm2
@@ -1790,7 +1844,7 @@ begin
   end
   [
     'RAX', 'RCX', 'RDX',
-    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm6', 'ymm7'
   ];
 
     Result := vRes[0];
@@ -2493,49 +2547,145 @@ const
   cAVXExpP5:  Single  = 0.008333333333333333;
   cAVXExpP6:  Single  = 0.001388888888888889;
   cAVXExp127: Integer = 127;
+// Eight-wide mirrors of the last polynomial coefficients. The 64-bit kernels
+// fold these straight into a vfmadd213ps memory operand instead of broadcasting
+// a scalar per iteration; the scalars above stay because the 32-bit kernel and
+// the register-hoisted coefficients still read them. FPC cannot initialise a
+// typed constant from another typed constant, so the literals are repeated -
+// keep each row in step with the scalar of the same name.
+  cAVXExpP0V: array[0..7] of Single =
+    (1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0);
+  cAVXExpP1V: array[0..7] of Single =
+    (1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0);
+  cAVXExpP2V: array[0..7] of Single =
+    (0.5, 0.5, 0.5, 0.5,
+     0.5, 0.5, 0.5, 0.5);
 
 // Constants for the AVX2 8-wide ln() approximation (AVXLn), Cephes single-precision
 // logf. Decompose x = m * 2^e with m in [sqrt(0.5), sqrt(2)); ln(x) = ln(m) + e*ln2,
 // where ln(m) is a degree-8 minimax polynomial in (m-1). Max relative error ~2e-7
 // over the normal positive range, far below the 1e-4 parity target vs pcr_logf.
-  cAVXLnP0:   Single  =  7.0376836292E-2;
-  cAVXLnP1:   Single  = -1.1514610310E-1;
-  cAVXLnP2:   Single  =  1.1676998740E-1;
-  cAVXLnP3:   Single  = -1.2420140846E-1;
-  cAVXLnP4:   Single  =  1.4249322787E-1;
-  cAVXLnP5:   Single  = -1.6668057665E-1;
-  cAVXLnP6:   Single  =  2.0000714765E-1;
-  cAVXLnP7:   Single  = -2.4999993993E-1;
-  cAVXLnP8:   Single  =  3.3333331174E-1;
-  cAVXLnQ1:   Single  = -2.12194440E-4;     // ln2 correction tail
-  cAVXLnQ2:   Single  =  0.693359375;       // ln2 lead
-  cAVXLnSqrtHf: Single = 0.707106781186547524; // sqrt(0.5)
-  cAVXLnHalf:  Single = 0.5;
-  cAVXLnOne:   Single = 1.0;
-  cAVXLnMinNorm: Integer = $00800000;       // smallest positive normal float bits
-  cAVXLnInvMant: uInt32  = $807fffff;       // sign + mantissa mask (clears exponent)
+// Stored eight-wide: AVXLn is the only reader, and it either hoists a constant
+// into a register with one vmovups above the loop or folds it into a vfmadd213ps
+// memory operand - neither of which wants a scalar to broadcast per iteration.
+  cAVXLnP0: array[0..7] of Single =
+    (7.0376836292E-2, 7.0376836292E-2, 7.0376836292E-2, 7.0376836292E-2,
+     7.0376836292E-2, 7.0376836292E-2, 7.0376836292E-2, 7.0376836292E-2);
+  cAVXLnP1: array[0..7] of Single =
+    (-1.1514610310E-1, -1.1514610310E-1, -1.1514610310E-1, -1.1514610310E-1,
+     -1.1514610310E-1, -1.1514610310E-1, -1.1514610310E-1, -1.1514610310E-1);
+  cAVXLnP2: array[0..7] of Single =
+    (1.1676998740E-1, 1.1676998740E-1, 1.1676998740E-1, 1.1676998740E-1,
+     1.1676998740E-1, 1.1676998740E-1, 1.1676998740E-1, 1.1676998740E-1);
+  cAVXLnP3: array[0..7] of Single =
+    (-1.2420140846E-1, -1.2420140846E-1, -1.2420140846E-1, -1.2420140846E-1,
+     -1.2420140846E-1, -1.2420140846E-1, -1.2420140846E-1, -1.2420140846E-1);
+  cAVXLnP4: array[0..7] of Single =
+    (1.4249322787E-1, 1.4249322787E-1, 1.4249322787E-1, 1.4249322787E-1,
+     1.4249322787E-1, 1.4249322787E-1, 1.4249322787E-1, 1.4249322787E-1);
+  cAVXLnP5: array[0..7] of Single =
+    (-1.6668057665E-1, -1.6668057665E-1, -1.6668057665E-1, -1.6668057665E-1,
+     -1.6668057665E-1, -1.6668057665E-1, -1.6668057665E-1, -1.6668057665E-1);
+  cAVXLnP6: array[0..7] of Single =
+    (2.0000714765E-1, 2.0000714765E-1, 2.0000714765E-1, 2.0000714765E-1,
+     2.0000714765E-1, 2.0000714765E-1, 2.0000714765E-1, 2.0000714765E-1);
+  cAVXLnP7: array[0..7] of Single =
+    (-2.4999993993E-1, -2.4999993993E-1, -2.4999993993E-1, -2.4999993993E-1,
+     -2.4999993993E-1, -2.4999993993E-1, -2.4999993993E-1, -2.4999993993E-1);
+  cAVXLnP8: array[0..7] of Single =
+    (3.3333331174E-1, 3.3333331174E-1, 3.3333331174E-1, 3.3333331174E-1,
+     3.3333331174E-1, 3.3333331174E-1, 3.3333331174E-1, 3.3333331174E-1);
+  // ln2 correction tail
+  cAVXLnQ1: array[0..7] of Single =
+    (-2.12194440E-4, -2.12194440E-4, -2.12194440E-4, -2.12194440E-4,
+     -2.12194440E-4, -2.12194440E-4, -2.12194440E-4, -2.12194440E-4);
+  // ln2 lead
+  cAVXLnQ2: array[0..7] of Single =
+    (0.693359375, 0.693359375, 0.693359375, 0.693359375,
+     0.693359375, 0.693359375, 0.693359375, 0.693359375);
+  // sqrt(0.5)
+  cAVXLnSqrtHf: array[0..7] of Single =
+    (0.707106781186547524, 0.707106781186547524, 0.707106781186547524, 0.707106781186547524,
+     0.707106781186547524, 0.707106781186547524, 0.707106781186547524, 0.707106781186547524);
+  cAVXLnHalf: array[0..7] of Single =
+    (0.5, 0.5, 0.5, 0.5,
+     0.5, 0.5, 0.5, 0.5);
+  cAVXLnOne: array[0..7] of Single =
+    (1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0);
+  // smallest positive normal float bits
+  cAVXLnMinNorm: array[0..7] of longword =
+    ($00800000, $00800000, $00800000, $00800000,
+     $00800000, $00800000, $00800000, $00800000);
+  // sign + mantissa mask (clears exponent)
+  cAVXLnInvMant: array[0..7] of longword =
+    ($807fffff, $807fffff, $807fffff, $807fffff,
+     $807fffff, $807fffff, $807fffff, $807fffff);
 
 // Constants for the AVX2 8-wide sin()/cos() approximation (AVXSinCos), Cephes
 // single-precision sinf/cosf. Range-reduce x by q = round(x * 4/pi); the low 3 bits
 // of q select the octant and the sin/cos polynomial + sign. Max abs error ~1e-7 over
 // a wide range; we extend the reduction with a 3-part Cody-Waite pi/4 subtraction so
 // it stays accurate out to large magnitudes (|x| up to ~1e5).
-  cAVXSC_FOPI:  Single =  1.27323954473516;   // 4/pi
-  cAVXSC_DP1:   Single = -0.78515625;
-  cAVXSC_DP2:   Single = -2.4187564849853515625E-4;
-  cAVXSC_DP3:   Single = -3.77489497744594108E-8;
-  cAVXSC_SinP0: Single = -1.9515295891E-4;
-  cAVXSC_SinP1: Single =  8.3321608736E-3;
-  cAVXSC_SinP2: Single = -1.6666654611E-1;
-  cAVXSC_CosP0: Single =  2.443315711809948E-5;
-  cAVXSC_CosP1: Single = -1.388731625493765E-3;
-  cAVXSC_CosP2: Single =  4.166664568298827E-2;
-  cAVXSC_Half:  Single =  0.5;
-  cAVXSC_One:   Single =  1.0;
-  cAVXSC_1i:    Integer = 1;
-  cAVXSC_2i:    Integer = 2;
-  cAVXSC_4i:    Integer = 4;
-  cAVXSC_NOT1i: Integer = -2;                 // not(1) = $FFFFFFFE
+// Stored eight-wide for the same reason as the AVXLn constants above: AVXSinCos
+// consumes each of these either as a hoisted register or as a 256-bit memory
+// operand, never as a per-iteration broadcast.
+  // 4/pi
+  cAVXSC_FOPI: array[0..7] of Single =
+    (1.27323954473516, 1.27323954473516, 1.27323954473516, 1.27323954473516,
+     1.27323954473516, 1.27323954473516, 1.27323954473516, 1.27323954473516);
+  cAVXSC_DP1: array[0..7] of Single =
+    (-0.78515625, -0.78515625, -0.78515625, -0.78515625,
+     -0.78515625, -0.78515625, -0.78515625, -0.78515625);
+  cAVXSC_DP2: array[0..7] of Single =
+    (-2.4187564849853515625E-4, -2.4187564849853515625E-4, -2.4187564849853515625E-4, -2.4187564849853515625E-4,
+     -2.4187564849853515625E-4, -2.4187564849853515625E-4, -2.4187564849853515625E-4, -2.4187564849853515625E-4);
+  cAVXSC_DP3: array[0..7] of Single =
+    (-3.77489497744594108E-8, -3.77489497744594108E-8, -3.77489497744594108E-8, -3.77489497744594108E-8,
+     -3.77489497744594108E-8, -3.77489497744594108E-8, -3.77489497744594108E-8, -3.77489497744594108E-8);
+  cAVXSC_SinP0: array[0..7] of Single =
+    (-1.9515295891E-4, -1.9515295891E-4, -1.9515295891E-4, -1.9515295891E-4,
+     -1.9515295891E-4, -1.9515295891E-4, -1.9515295891E-4, -1.9515295891E-4);
+  cAVXSC_SinP1: array[0..7] of Single =
+    (8.3321608736E-3, 8.3321608736E-3, 8.3321608736E-3, 8.3321608736E-3,
+     8.3321608736E-3, 8.3321608736E-3, 8.3321608736E-3, 8.3321608736E-3);
+  cAVXSC_SinP2: array[0..7] of Single =
+    (-1.6666654611E-1, -1.6666654611E-1, -1.6666654611E-1, -1.6666654611E-1,
+     -1.6666654611E-1, -1.6666654611E-1, -1.6666654611E-1, -1.6666654611E-1);
+  cAVXSC_CosP0: array[0..7] of Single =
+    (2.443315711809948E-5, 2.443315711809948E-5, 2.443315711809948E-5, 2.443315711809948E-5,
+     2.443315711809948E-5, 2.443315711809948E-5, 2.443315711809948E-5, 2.443315711809948E-5);
+  cAVXSC_CosP1: array[0..7] of Single =
+    (-1.388731625493765E-3, -1.388731625493765E-3, -1.388731625493765E-3, -1.388731625493765E-3,
+     -1.388731625493765E-3, -1.388731625493765E-3, -1.388731625493765E-3, -1.388731625493765E-3);
+  cAVXSC_CosP2: array[0..7] of Single =
+    (4.166664568298827E-2, 4.166664568298827E-2, 4.166664568298827E-2, 4.166664568298827E-2,
+     4.166664568298827E-2, 4.166664568298827E-2, 4.166664568298827E-2, 4.166664568298827E-2);
+  cAVXSC_Half: array[0..7] of Single =
+    (0.5, 0.5, 0.5, 0.5,
+     0.5, 0.5, 0.5, 0.5);
+  cAVXSC_One: array[0..7] of Single =
+    (1.0, 1.0, 1.0, 1.0,
+     1.0, 1.0, 1.0, 1.0);
+  cAVXSC_1i: array[0..7] of longword =
+    (1, 1, 1, 1,
+     1, 1, 1, 1);
+  cAVXSC_2i: array[0..7] of longword =
+    (2, 2, 2, 2,
+     2, 2, 2, 2);
+  cAVXSC_4i: array[0..7] of longword =
+    (4, 4, 4, 4,
+     4, 4, 4, 4);
+  // not(1)
+  cAVXSC_NOT1i: array[0..7] of longword =
+    ($FFFFFFFE, $FFFFFFFE, $FFFFFFFE, $FFFFFFFE,
+     $FFFFFFFE, $FFFFFFFE, $FFFFFFFE, $FFFFFFFE);
+  // sign bit of a Single
+  cAVXSC_SignMask: array[0..7] of longword =
+    ($80000000, $80000000, $80000000, $80000000,
+     $80000000, $80000000, $80000000, $80000000);
 {$ENDIF}
 
 function CreateTokenizedStringList(str: string; c:char):TNNetStringList;
@@ -5673,7 +5823,21 @@ end;
 
 function TStringListInt.IntegerToWord(pInteger: integer): string;
 begin
-  Result := FIntegerToStr[pInteger];
+  // Single guarded accessor for FIntegerToStr. The array is sized only by
+  // SaveCurrentPosition, so it is empty until that runs, and a sampled token id
+  // can exceed the dictionary whenever the net output is wider than the vocab.
+  // Generation must not die on either, so an unknown id yields no text.
+  if (pInteger >= 0) and (pInteger < Length(FIntegerToStr)) then
+  begin
+    Result := FIntegerToStr[pInteger];
+  end
+  else
+  begin
+    Result := '';
+    {$IFDEF DEBUG}
+    WriteLn('Token '+IntToStr(pInteger)+' is bigger than dictionary '+IntToStr(Length(FIntegerToStr))+' at IntegerToWord.');
+    {$ENDIF}
+  end;
 end;
 
 function TStringListInt.DeTokenize(TokenId: integer): string;
@@ -5803,7 +5967,7 @@ begin
       //WriteLn(WordIndex,':',FTokenizer[WordCount]);
       if WordInteger >= 0 then
       begin
-        FTokenizer.Add(FIntegerToStr[WordInteger]);
+        FTokenizer.Add(IntegerToWord(WordInteger));
       end;
     end;
   end;
@@ -9846,6 +10010,95 @@ begin
   {$ENDIF}
 end;
 
+{$IFDEF AVX2}
+// AVXAdafactorDelta / AVXClampAbs are defined later in this file under
+// {$IFDEF AVX64}; forward-declare them so the dispatchers below can call them.
+procedure AVXAdafactorDelta(PtrDelta, PtrV: TNeuralFloatArrPtr;
+  Beta2, k, c, Epsilon: TNeuralFloat; NumElements: integer); forward;
+procedure AVXClampAbs(PtrA: TNeuralFloatArrPtr; Value: TNeuralFloat;
+  NumElements: integer); forward;
+procedure AVXLionDelta(PtrDelta, PtrM: TNeuralFloatArrPtr;
+  Beta1, k1, Beta2, k2, NegLR, PosLR: TNeuralFloat; NumElements: integer); forward;
+{$ENDIF}
+class procedure TNNetVolume.AdafactorDelta(PtrDelta, PtrV: TNeuralFloatArrPtr;
+  Beta2, k, c, Epsilon: TNeuralFloat; N: integer);
+{$IFNDEF AVX2}
+var
+  I: integer;
+  d, v, t1, t2: TNeuralFloat;
+{$ENDIF}
+begin
+  if N <= 0 then exit;
+  {$IFDEF AVX2}
+  AVXAdafactorDelta(PtrDelta, PtrV, Beta2, k, c, Epsilon, N);
+  {$ELSE}
+  // Every intermediate lands in a TNeuralFloat before it is used again, so each
+  // operation rounds exactly once - the same rounding sequence the AVX kernel
+  // performs, instruction for instruction.
+  for I := 0 to N - 1 do
+  begin
+    d  := PtrDelta^[I];
+    t1 := d * d;
+    t1 := k * t1;
+    t1 := t1 + c;
+    t2 := Beta2 * PtrV^[I];
+    v  := t1 + t2;
+    PtrV^[I] := v;
+    t1 := Sqrt(v);
+    t1 := t1 + Epsilon;
+    PtrDelta^[I] := d / t1;
+  end;
+  {$ENDIF}
+end;
+
+class procedure TNNetVolume.ClampAbs(PtrA: TNeuralFloatArrPtr;
+  Value: TNeuralFloat; N: integer);
+{$IFNDEF AVX2}
+var
+  I: integer;
+  v, NegValue: TNeuralFloat;
+{$ENDIF}
+begin
+  if (N <= 0) or (Value <= 0) then exit;
+  {$IFDEF AVX2}
+  AVXClampAbs(PtrA, Value, N);
+  {$ELSE}
+  NegValue := -Value;
+  for I := 0 to N - 1 do
+  begin
+    v := PtrA^[I];
+    // NaN satisfies neither test and is left alone, matching the kernel.
+    if v > Value then PtrA^[I] := Value
+    else if v < NegValue then PtrA^[I] := NegValue;
+  end;
+  {$ENDIF}
+end;
+
+class procedure TNNetVolume.LionDelta(PtrDelta, PtrM: TNeuralFloatArrPtr;
+  Beta1, k1, Beta2, k2, NegLR, PosLR: TNeuralFloat; N: integer);
+{$IFNDEF AVX2}
+var
+  I: integer;
+  d, m, c: TNeuralFloat;
+{$ENDIF}
+begin
+  if N <= 0 then exit;
+  {$IFDEF AVX2}
+  AVXLionDelta(PtrDelta, PtrM, Beta1, k1, Beta2, k2, NegLR, PosLR, N);
+  {$ELSE}
+  for I := 0 to N - 1 do
+  begin
+    d := PtrDelta^[I];
+    m := PtrM^[I];
+    c := Beta1 * m + k1 * d;
+    PtrM^[I] := Beta2 * m + k2 * d;
+    if c > 0 then PtrDelta^[I] := NegLR
+    else if c < 0 then PtrDelta^[I] := PosLR
+    else PtrDelta^[I] := 0;
+  end;
+  {$ENDIF}
+end;
+
 {$IFDEF AVXANY}
 // AVXCopyRelu (dst := max(src,0)) is defined later in this section under
 // {$IFDEF AVXANY}; forward-declare it so Relu can call it here.
@@ -10369,16 +10622,11 @@ var
   CntToken, MaxToken, Token: integer;
   LocalTokens: string;
 begin
-  MaxToken := Length(aTokens);
-  if MaxToken > SizeX then
-  begin
-    LocalTokens := GetLastChars(aTokens, SizeX);
-    MaxToken := Length(aTokens);
-  end
-  else
-  begin
-    LocalTokens := aTokens;
-  end;
+  // GetLastChars returns the input unchanged when it already fits, so a single
+  // unconditional truncation covers both cases and keeps MaxToken derived from
+  // the string that is actually encoded.
+  LocalTokens := GetLastChars(aTokens, SizeX);
+  MaxToken := Length(LocalTokens);
   Self.Fill(0);
   if MaxToken > 0 then
   begin
@@ -11539,6 +11787,8 @@ begin
         vxorps zmm1, zmm1, zmm1
         {$ELSE}
         vxorps ymm1, ymm1, ymm1
+        vxorps ymm6, ymm6, ymm6
+        vxorps ymm7, ymm7, ymm7
         {$ENDIF}
 
       @LargeAddLoop:
@@ -11561,8 +11811,8 @@ begin
           {$IFDEF AVX2}
           vfmadd231ps ymm0, ymm2, [rdx]
           vfmadd231ps ymm1, ymm3, [rdx+32]
-          vfmadd231ps ymm0, ymm4, [rdx+64]
-          vfmadd231ps ymm1, ymm5, [rdx+96]
+          vfmadd231ps ymm6, ymm4, [rdx+64]
+          vfmadd231ps ymm7, ymm5, [rdx+96]
           {$ELSE}
           vmulps  ymm2, ymm2, [rdx]
           vmulps  ymm3, ymm3, [rdx+32]
@@ -11571,8 +11821,8 @@ begin
 
           vaddps  ymm0, ymm0, ymm2
           vaddps  ymm1, ymm1, ymm3
-          vaddps  ymm0, ymm0, ymm4
-          vaddps  ymm1, ymm1, ymm5
+          vaddps  ymm6, ymm6, ymm4
+          vaddps  ymm7, ymm7, ymm5
           {$ENDIF}
         {$ENDIF}
 
@@ -11592,6 +11842,8 @@ begin
         addps  xmm0, xmm4
         {$ELSE}
         vaddps ymm0, ymm0, ymm1
+        vaddps ymm6, ymm6, ymm7
+        vaddps ymm0, ymm0, ymm6
         VEXTRACTF128 xmm2, ymm0, 1
         vzeroupper
         addps  xmm0, xmm2
@@ -11626,7 +11878,7 @@ begin
         [
           'RAX', 'RCX', 'RDX',
           'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
-          {$IFDEF AVX512},'zmm0', 'zmm1'{$ENDIF}
+          {$IFDEF AVX512},'zmm0', 'zmm1'{$ELSE},'ymm6', 'ymm7'{$ENDIF}
         ];
 
           Result := vRes[0];
@@ -11851,6 +12103,8 @@ begin
           vxorps zmm1, zmm1, zmm1
           {$ELSE}
           vxorps ymm1, ymm1, ymm1
+          vxorps ymm6, ymm6, ymm6
+          vxorps ymm7, ymm7, ymm7
           {$ENDIF}
 
         @LargeAddLoop:
@@ -11873,8 +12127,8 @@ begin
             {$IFDEF AVX2}
             vfmadd231ps ymm0, ymm2, [rdx]
             vfmadd231ps ymm1, ymm3, [rdx+32]
-            vfmadd231ps ymm0, ymm4, [rdx+64]
-            vfmadd231ps ymm1, ymm5, [rdx+96]
+            vfmadd231ps ymm6, ymm4, [rdx+64]
+            vfmadd231ps ymm7, ymm5, [rdx+96]
             {$ELSE}
             vmulps  ymm2, ymm2, [rdx]
             vmulps  ymm3, ymm3, [rdx+32]
@@ -11883,8 +12137,8 @@ begin
 
             vaddps  ymm0, ymm0, ymm2
             vaddps  ymm1, ymm1, ymm3
-            vaddps  ymm0, ymm0, ymm4
-            vaddps  ymm1, ymm1, ymm5
+            vaddps  ymm6, ymm6, ymm4
+            vaddps  ymm7, ymm7, ymm5
             {$ENDIF}
           {$ENDIF}
 
@@ -11904,6 +12158,8 @@ begin
           addps  xmm0, xmm4
           {$ELSE}
           vaddps ymm0, ymm0, ymm1
+          vaddps ymm6, ymm6, ymm7
+          vaddps ymm0, ymm0, ymm6
           VEXTRACTF128 xmm2, ymm0, 1
           vzeroupper
           addps  xmm0, xmm2
@@ -11938,7 +12194,7 @@ begin
           [
             'RAX', 'RCX', 'RDX',
             'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
-            {$IFDEF AVX512},'zmm0', 'zmm1'{$ENDIF}
+            {$IFDEF AVX512},'zmm0', 'zmm1'{$ELSE},'ymm6', 'ymm7'{$ENDIF}
           ];
 
             Result := vRes[0];
@@ -12384,6 +12640,7 @@ var
   localNumElements, MissedElements: integer;
   PtrA, PtrB: TNeuralFloatArrPtr;
   Result: TNeuralFloat;
+  VAsBase: pointer;
   // Tiling
   TileACnt, TileBCnt: integer;
   StartTileA, EndTileA, StartTileB, EndTileB: integer;
@@ -12408,7 +12665,9 @@ begin
   {$ENDIF}
 
   // is group info not cached?
-  if Length(FGrInfoArray) <> NumAs then
+  VAsBase := VAs.GetRawPtr(0);
+  if (Length(FGrInfoArray) <> NumAs) or (FGrInfoBase <> VAsBase) or
+     (FGrInfoVectorSize <> VectorSize) or (FGrInfoGroups <> Groups) then
   begin
     SetLength(FGrInfoArray, NumAs);
     for CntA := 0 to MaxA do
@@ -12418,22 +12677,28 @@ begin
       LocalGroupInfo.PtrA := VAs.GetRawPtr(CntA*VectorSize);
       FGrInfoArray[CntA] := LocalGroupInfo;
     end;
+    FGrInfoBase := VAsBase;
+    FGrInfoVectorSize := VectorSize;
+    FGrInfoGroups := Groups;
   end;
 
   //localNumElements := (VectorSize div 4) * 4;
   //MissedElements := VectorSize - localNumElements;
   MissedElements := VectorSize and 3;
   localNumElements := VectorSize xor MissedElements;
-  MaxTileA := (NumAs div TileSizeA) - 1;
-  MaxTileB := (NumBs div TileSizeB) - 1;
+  // Ceil-division tiling with a clamped trailing PARTIAL tile (same contract as
+  // DotProductsTiled and the int8 twin), so tile sizes that do not divide the
+  // ranges still cover every row and column.
+  MaxTileA := (NumAs + TileSizeA - 1) div TileSizeA - 1;
+  MaxTileB := (NumBs + TileSizeB - 1) div TileSizeB - 1;
   for TileBCnt := 0 to MaxTileB do
   begin
     StartTileB := TileBCnt * TileSizeB;
-    EndTileB := StartTileB + TileSizeB - 1;
+    EndTileB := Min(StartTileB + TileSizeB - 1, MaxB);
     for TileACnt := 0 to MaxTileA do
     begin
       StartTileA := TileACnt * TileSizeA;
-      EndTileA := StartTileA + TileSizeA - 1;
+      EndTileA := Min(StartTileA + TileSizeA - 1, MaxA);
       for CntA := StartTileA to EndTileA do
       begin
         //GroupId := CntA div GroupASize;
@@ -12557,6 +12822,8 @@ begin
           vxorps zmm1, zmm1, zmm1
           {$ELSE}
           vxorps ymm1, ymm1, ymm1
+          vxorps ymm6, ymm6, ymm6
+          vxorps ymm7, ymm7, ymm7
           {$ENDIF}
 
         @LargeAddLoop:
@@ -12579,8 +12846,8 @@ begin
             {$IFDEF AVX2}
             vfmadd231ps ymm0, ymm2, [rdx]
             vfmadd231ps ymm1, ymm3, [rdx+32]
-            vfmadd231ps ymm0, ymm4, [rdx+64]
-            vfmadd231ps ymm1, ymm5, [rdx+96]
+            vfmadd231ps ymm6, ymm4, [rdx+64]
+            vfmadd231ps ymm7, ymm5, [rdx+96]
             {$ELSE}
             vmulps  ymm2, ymm2, [rdx]
             vmulps  ymm3, ymm3, [rdx+32]
@@ -12589,8 +12856,8 @@ begin
 
             vaddps  ymm0, ymm0, ymm2
             vaddps  ymm1, ymm1, ymm3
-            vaddps  ymm0, ymm0, ymm4
-            vaddps  ymm1, ymm1, ymm5
+            vaddps  ymm6, ymm6, ymm4
+            vaddps  ymm7, ymm7, ymm5
             {$ENDIF}
           {$ENDIF}
 
@@ -12610,6 +12877,8 @@ begin
           addps  xmm0, xmm4
           {$ELSE}
           vaddps ymm0, ymm0, ymm1
+          vaddps ymm6, ymm6, ymm7
+          vaddps ymm0, ymm0, ymm6
           VEXTRACTF128 xmm2, ymm0, 1
           vzeroupper
           addps  xmm0, xmm2
@@ -12644,7 +12913,7 @@ begin
           [
             'RAX', 'RCX', 'RDX',
             'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
-            {$IFDEF AVX512},'zmm0', 'zmm1'{$ENDIF}
+            {$IFDEF AVX512},'zmm0', 'zmm1'{$ELSE},'ymm6', 'ymm7'{$ENDIF}
           ];
 
             Result := vRes[0];
@@ -14986,6 +15255,244 @@ begin
     PtrDelta^[I] := t2 / t1;
   end;
 end;
+
+// Adafactor unfactored step, eight elements per iteration:
+//   v := Beta2*v + (k*d*d + c)
+//   d := d / (sqrt(v) + Epsilon)
+// One read and one write of delta and of v; the composed form would need a
+// square, a scaled accumulate, a VSqrt, an AddScalar and a Divi - five passes
+// over the weight row plus a scratch row the caller does not otherwise want.
+// No FMA: every multiply and every add rounds separately, matching the scalar
+// fallback exactly. The four scalars are broadcast from their own addresses,
+// so the code stays position independent.
+procedure AVXAdafactorDelta(PtrDelta, PtrV: TNeuralFloatArrPtr;
+  Beta2, k, c, Epsilon: TNeuralFloat; NumElements: integer);
+var
+  pB2, pK, pC, pEps: pointer;
+  localNumElements, MissedElements, I: integer;
+  d, v, t1, t2: TNeuralFloat;
+begin
+  MissedElements := NumElements and 7;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+    pB2  := Addr(Beta2);
+    pK   := Addr(k);
+    pC   := Addr(c);
+    pEps := Addr(Epsilon);
+  asm
+  mov rcx, pB2
+  vbroadcastss ymm12, [rcx]
+  mov rcx, pK
+  vbroadcastss ymm13, [rcx]
+  mov rcx, pC
+  vbroadcastss ymm14, [rcx]
+  mov rcx, pEps
+  vbroadcastss ymm15, [rcx]
+
+  mov rax, PtrDelta
+  mov rdx, PtrV
+  mov ecx, localNumElements
+  shr ecx, 3
+
+@AdafactorLoop:
+  vmovups ymm0, [rax]
+  vmulps  ymm1, ymm0, ymm0
+  vmulps  ymm1, ymm1, ymm13
+  vaddps  ymm1, ymm1, ymm14
+  vmulps  ymm2, ymm12, [rdx]
+  vaddps  ymm1, ymm1, ymm2
+  vmovups [rdx], ymm1
+
+  vsqrtps ymm1, ymm1
+  vaddps  ymm1, ymm1, ymm15
+  vdivps  ymm0, ymm0, ymm1
+  vmovups [rax], ymm0
+
+  add rax, 32
+  add rdx, 32
+  dec ecx
+  jnz @AdafactorLoop
+
+  vzeroupper
+  end [
+    'RAX', 'RCX', 'RDX',
+    'ymm0', 'ymm1', 'ymm2',
+    'ymm12', 'ymm13', 'ymm14', 'ymm15'
+  ];
+  end; // of if
+
+  // Scalar tail, same rounding sequence as the kernel above.
+  if MissedElements > 0 then
+  for I := localNumElements to NumElements - 1 do
+  begin
+    d  := PtrDelta^[I];
+    t1 := d * d;
+    t1 := k * t1;
+    t1 := t1 + c;
+    t2 := Beta2 * PtrV^[I];
+    v  := t1 + t2;
+    PtrV^[I] := v;
+    t1 := Sqrt(v);
+    t1 := t1 + Epsilon;
+    PtrDelta^[I] := d / t1;
+  end;
+end;
+
+// In-place clamp of eight elements per iteration into [-Value, +Value].
+// The bound is the FIRST operand of both vmaxps and vminps: x86 min/max return
+// the SECOND operand on an unordered compare, so a NaN element would flow
+// through both instructions untouched - the same thing the scalar "if v > b /
+// else if v < -b" form does. Both forms nonetheless signal Invalid Operation on
+// a QNaN source (MAXPS/MINPS do; so does the scalar COMISS), so with FPC's
+// default unmasked exceptions a NaN input raises EInvalidOp on either path.
+// On everything else the two are bit-identical, signed zeros included.
+procedure AVXClampAbs(PtrA: TNeuralFloatArrPtr; Value: TNeuralFloat;
+  NumElements: integer);
+var
+  pVal, pNeg: pointer;
+  NegValue: TNeuralFloat;
+  localNumElements, MissedElements, I: integer;
+  v: TNeuralFloat;
+begin
+  NegValue := -Value;
+  MissedElements := NumElements and 7;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+    pVal := Addr(Value);
+    pNeg := Addr(NegValue);
+  asm
+  mov rcx, pVal
+  vbroadcastss ymm14, [rcx]
+  mov rcx, pNeg
+  vbroadcastss ymm15, [rcx]
+
+  mov rax, PtrA
+  mov ecx, localNumElements
+  shr ecx, 3
+
+@ClampLoop:
+  vmovups ymm0, [rax]
+  vmaxps  ymm0, ymm15, ymm0
+  vminps  ymm0, ymm14, ymm0
+  vmovups [rax], ymm0
+
+  add rax, 32
+  dec ecx
+  jnz @ClampLoop
+
+  vzeroupper
+  end [
+    'RAX', 'RCX',
+    'ymm0', 'ymm14', 'ymm15'
+  ];
+  end; // of if
+
+  if MissedElements > 0 then
+  for I := localNumElements to NumElements - 1 do
+  begin
+    v := PtrA^[I];
+    if v > Value then PtrA^[I] := Value
+    else if v < NegValue then PtrA^[I] := NegValue;
+  end;
+end;
+
+// One whole Lion step, eight elements per iteration. The three-valued sign
+// select is two vcmpps masks ANDed with the two learning-rate broadcasts and
+// ORed together, so an exactly-zero c leaves both masks clear and stores +0.0 -
+// what the scalar "if c > 0 / else if c < 0 / else 0" chain does. The compares
+// are the signaling LT_OS form with the operands swapped for the > test, which
+// is also what the scalar COMISS does, so both forms react to a NaN the same
+// way. The composed form would need Copy, two MulMulAdds, a sign extraction and
+// a scale - five passes over the weight row plus a scratch row - so this reads
+// delta and m once and writes each once. No FMA: every multiply and every add
+// rounds separately, matching the scalar fallback bit for bit. The six scalars
+// are broadcast from their own addresses, so the code stays position
+// independent.
+procedure AVXLionDelta(PtrDelta, PtrM: TNeuralFloatArrPtr;
+  Beta1, k1, Beta2, k2, NegLR, PosLR: TNeuralFloat; NumElements: integer);
+var
+  pB1, pK1, pB2, pK2, pNeg, pPos: pointer;
+  localNumElements, MissedElements, I: integer;
+  d, m, c: TNeuralFloat;
+begin
+  MissedElements := NumElements and 7;
+  localNumElements := NumElements xor MissedElements;
+  if localNumElements > 0 then
+  begin
+    pB1  := Addr(Beta1);
+    pK1  := Addr(k1);
+    pB2  := Addr(Beta2);
+    pK2  := Addr(k2);
+    pNeg := Addr(NegLR);
+    pPos := Addr(PosLR);
+  asm
+  mov rcx, pB1
+  vbroadcastss ymm10, [rcx]
+  mov rcx, pK1
+  vbroadcastss ymm11, [rcx]
+  mov rcx, pB2
+  vbroadcastss ymm12, [rcx]
+  mov rcx, pK2
+  vbroadcastss ymm13, [rcx]
+  mov rcx, pNeg
+  vbroadcastss ymm14, [rcx]
+  mov rcx, pPos
+  vbroadcastss ymm15, [rcx]
+  vxorps ymm9, ymm9, ymm9
+
+  mov rax, PtrDelta
+  mov rdx, PtrM
+  mov ecx, localNumElements
+  shr ecx, 3
+
+@LionLoop:
+  vmovups ymm0, [rax]
+  vmovups ymm1, [rdx]
+
+  vmulps  ymm2, ymm10, ymm1
+  vmulps  ymm3, ymm11, ymm0
+  vaddps  ymm2, ymm2, ymm3
+
+  vmulps  ymm3, ymm12, ymm1
+  vmulps  ymm4, ymm13, ymm0
+  vaddps  ymm3, ymm3, ymm4
+  vmovups [rdx], ymm3
+
+  vcmpps  ymm4, ymm9, ymm2, 1
+  vcmpps  ymm5, ymm2, ymm9, 1
+  vandps  ymm4, ymm4, ymm14
+  vandps  ymm5, ymm5, ymm15
+  vorps   ymm4, ymm4, ymm5
+  vmovups [rax], ymm4
+
+  add rax, 32
+  add rdx, 32
+  dec ecx
+  jnz @LionLoop
+
+  vzeroupper
+  end [
+    'RAX', 'RCX', 'RDX',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm9',
+    'ymm10', 'ymm11', 'ymm12', 'ymm13', 'ymm14', 'ymm15'
+  ];
+  end; // of if
+
+  // Scalar tail, same rounding sequence and same three-way select.
+  if MissedElements > 0 then
+  for I := localNumElements to NumElements - 1 do
+  begin
+    d := PtrDelta^[I];
+    m := PtrM^[I];
+    c := Beta1 * m + k1 * d;
+    PtrM^[I] := Beta2 * m + k2 * d;
+    if c > 0 then PtrDelta^[I] := NegLR
+    else if c < 0 then PtrDelta^[I] := PosLR
+    else PtrDelta^[I] := 0;
+  end;
+end;
 procedure AVXMul(PtrA: TNeuralFloatArrPtr; MulOp: TNeuralFloat; NumElements: integer); overload;
 var
   MulOpPtr: pointer;
@@ -15380,6 +15887,9 @@ begin
   push rcx
   shr ecx,5  // number of large iterations = number of elements / 32
   jz @SkipLargeAddLoop
+  vxorps ymm6, ymm6, ymm6
+  vxorps ymm7, ymm7, ymm7
+  vxorps ymm8, ymm8, ymm8
 @LargeAddLoop:
 
   vmovups ymm2, [rax]
@@ -15399,15 +15909,18 @@ begin
   vandps  ymm5, ymm5, ymm1
 
   vaddps  ymm0, ymm0, ymm2
-  vaddps  ymm0, ymm0, ymm3
-  vaddps  ymm0, ymm0, ymm4
-  vaddps  ymm0, ymm0, ymm5
+  vaddps  ymm6, ymm6, ymm3
+  vaddps  ymm7, ymm7, ymm4
+  vaddps  ymm8, ymm8, ymm5
 
   add rax, 128
   add rdx, 128
   dec ecx
   jnz @LargeAddLoop
 
+  vaddps  ymm0, ymm0, ymm6
+  vaddps  ymm7, ymm7, ymm8
+  vaddps  ymm0, ymm0, ymm7
   VEXTRACTF128 xmm2, ymm0, 1
   vzeroupper
   addps  xmm0, xmm2
@@ -15441,7 +15954,7 @@ begin
   end
   [
     'RAX', 'RCX', 'RDX',
-    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm6', 'ymm7', 'ymm8'
   ];
     Result := vRes[0];
   end else
@@ -15485,6 +15998,9 @@ begin
   push rcx
   shr ecx,5  // number of large iterations = number of elements / 32
   jz @SkipLargeAddLoop
+  vxorps ymm1, ymm1, ymm1
+  vxorps ymm6, ymm6, ymm6
+  vxorps ymm7, ymm7, ymm7
 @LargeAddLoop:
 
   vmovups ymm2, [rax]
@@ -15497,21 +16013,31 @@ begin
   vsubps  ymm4, ymm4, [rdx+64]
   vsubps  ymm5, ymm5, [rdx+96]
 
+  {$IFDEF AVX2}
+  vfmadd231ps ymm0, ymm2, ymm2
+  vfmadd231ps ymm1, ymm3, ymm3
+  vfmadd231ps ymm6, ymm4, ymm4
+  vfmadd231ps ymm7, ymm5, ymm5
+  {$ELSE}
   vmulps  ymm2, ymm2, ymm2
   vmulps  ymm3, ymm3, ymm3
   vmulps  ymm4, ymm4, ymm4
   vmulps  ymm5, ymm5, ymm5
 
   vaddps  ymm0, ymm0, ymm2
-  vaddps  ymm0, ymm0, ymm3
-  vaddps  ymm0, ymm0, ymm4
-  vaddps  ymm0, ymm0, ymm5
+  vaddps  ymm1, ymm1, ymm3
+  vaddps  ymm6, ymm6, ymm4
+  vaddps  ymm7, ymm7, ymm5
+  {$ENDIF}
 
   add rax, 128
   add rdx, 128
   dec ecx
   jnz @LargeAddLoop
 
+  vaddps  ymm0, ymm0, ymm1
+  vaddps  ymm6, ymm6, ymm7
+  vaddps  ymm0, ymm0, ymm6
   VEXTRACTF128 xmm2, ymm0, 1
   vzeroupper
   addps  xmm0, xmm2
@@ -15545,7 +16071,7 @@ begin
   end
   [
     'RAX', 'RCX', 'RDX',
-    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm6', 'ymm7'
   ];
     Result := vRes[0];
   end else
@@ -15687,6 +16213,8 @@ begin
   vxorps zmm1, zmm1, zmm1
   {$ELSE}
   vxorps ymm1, ymm1, ymm1
+  vxorps ymm6, ymm6, ymm6
+  vxorps ymm7, ymm7, ymm7
   {$ENDIF}
 
 @LargeAddLoop:
@@ -15697,8 +16225,8 @@ begin
   {$ELSE}
   vaddps  ymm0, ymm0, [rax]
   vaddps  ymm1, ymm1, [rax+32]
-  vaddps  ymm0, ymm0, [rax+64]
-  vaddps  ymm1, ymm1, [rax+96]
+  vaddps  ymm6, ymm6, [rax+64]
+  vaddps  ymm7, ymm7, [rax+96]
   {$ENDIF}
 
   add rax, 128
@@ -15716,6 +16244,8 @@ begin
   addps  xmm0, xmm4
   {$ELSE}
   vaddps ymm0, ymm0, ymm1
+  vaddps ymm6, ymm6, ymm7
+  vaddps ymm0, ymm0, ymm6
   VEXTRACTF128 xmm2, ymm0, 1
   vzeroupper
   addps  xmm0, xmm2
@@ -15747,7 +16277,7 @@ begin
   [
     'RAX', 'RCX',
     'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
-    {$IFDEF AVX512},'zmm0', 'zmm1'{$ENDIF}
+    {$IFDEF AVX512},'zmm0', 'zmm1'{$ELSE},'ymm6', 'ymm7'{$ENDIF}
   ];
 
     Result := vRes[0];
@@ -15799,6 +16329,8 @@ begin
   vxorps zmm1, zmm1, zmm1
   {$ELSE}
   vxorps ymm1, ymm1, ymm1
+  vxorps ymm6, ymm6, ymm6
+  vxorps ymm7, ymm7, ymm7
   {$ENDIF}
 
 @LargeAddLoop:
@@ -15820,8 +16352,8 @@ begin
     {$IFDEF AVX2}
     vfmadd231ps ymm0, ymm2, ymm2
     vfmadd231ps ymm1, ymm3, ymm3
-    vfmadd231ps ymm0, ymm4, ymm4
-    vfmadd231ps ymm1, ymm5, ymm5
+    vfmadd231ps ymm6, ymm4, ymm4
+    vfmadd231ps ymm7, ymm5, ymm5
     {$ELSE}
     vmulps  ymm2, ymm2, ymm2
     vmulps  ymm3, ymm3, ymm3
@@ -15830,8 +16362,8 @@ begin
 
     vaddps  ymm0, ymm0, ymm2
     vaddps  ymm1, ymm1, ymm3
-    vaddps  ymm0, ymm0, ymm4
-    vaddps  ymm1, ymm1, ymm5
+    vaddps  ymm6, ymm6, ymm4
+    vaddps  ymm7, ymm7, ymm5
     {$ENDIF}
   {$ENDIF}
 
@@ -15850,6 +16382,8 @@ begin
   addps  xmm0, xmm4
   {$ELSE}
   vaddps ymm0, ymm0, ymm1
+  vaddps ymm6, ymm6, ymm7
+  vaddps ymm0, ymm0, ymm6
   VEXTRACTF128 xmm2, ymm0, 1
   vzeroupper
   addps  xmm0, xmm2
@@ -15882,7 +16416,7 @@ begin
   [
     'RAX', 'RCX',
     'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
-    {$IFDEF AVX512},'zmm0', 'zmm1'{$ENDIF}
+    {$IFDEF AVX512},'zmm0', 'zmm1'{$ELSE},'ymm6', 'ymm7'{$ENDIF}
   ];
 
     Result := vRes[0];
@@ -16258,6 +16792,13 @@ begin
   vbroadcastss ymm13, [rip+cAVXLn2]
   vmovd xmm14, dword ptr [rip+cAVXExp127]
   vpbroadcastd ymm14, xmm14
+  // P6..P1 live in registers for the whole call; only P0 stays a memory operand.
+  vbroadcastss ymm6,  [rip+cAVXExpP6]
+  vbroadcastss ymm7,  [rip+cAVXExpP5]
+  vbroadcastss ymm8,  [rip+cAVXExpP4]
+  vbroadcastss ymm9,  [rip+cAVXExpP3]
+  vbroadcastss ymm15, [rip+cAVXExpP2]
+  vbroadcastss ymm5,  [rip+cAVXExpP1]
 @LoopAVXExp:
   vmovups ymm0, [rax]
   vminps  ymm0, ymm0, ymm10
@@ -16266,19 +16807,13 @@ begin
   vroundps ymm2, ymm1, 0           // k = round(t)
   vsubps  ymm1, ymm1, ymm2         // f = t-k in [-0.5,0.5]
   vmulps  ymm3, ymm1, ymm13        // g = f*ln2
-  vbroadcastss ymm4, [rip+cAVXExpP6]
-  vbroadcastss ymm5, [rip+cAVXExpP5]
+  vmovaps ymm4, ymm6
+  vfmadd213ps ymm4, ymm3, ymm7
+  vfmadd213ps ymm4, ymm3, ymm8
+  vfmadd213ps ymm4, ymm3, ymm9
+  vfmadd213ps ymm4, ymm3, ymm15
   vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP4]
-  vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP3]
-  vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP2]
-  vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP1]
-  vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP0]
-  vfmadd213ps ymm4, ymm3, ymm5     // ymm4 = 2^f
+  vfmadd213ps ymm4, ymm3, [rip+cAVXExpP0V]  // ymm4 = 2^f
   vcvtps2dq ymm2, ymm2             // k -> int32
   vpaddd ymm2, ymm2, ymm14
   vpslld ymm2, ymm2, 23            // 2^k as float bits
@@ -16291,8 +16826,8 @@ begin
 @DoneAVXExp:
   vzeroupper
   end ['rax','rcx','r8',
-       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5',
-       'ymm10','ymm11','ymm12','ymm13','ymm14'];
+       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6','ymm7','ymm8','ymm9',
+       'ymm10','ymm11','ymm12','ymm13','ymm14','ymm15'];
   end;
   for I := localNumElements to NumElementsM1 do
     pDst^[I] := NeuralExp(pSrc^[I]);
@@ -16358,6 +16893,12 @@ begin
   vbroadcastss ymm13, [rip+cAVXLn2]
   vmovd xmm14, dword ptr [rip+cAVXExp127]
   vpbroadcastd ymm14, xmm14
+  // ymm8 is the lane accumulator and ymm15 the shift, so only P6..P3 fit in
+  // registers here; P2..P0 stay as memory operands.
+  vbroadcastss ymm6, [rip+cAVXExpP6]
+  vbroadcastss ymm7, [rip+cAVXExpP5]
+  vbroadcastss ymm9, [rip+cAVXExpP4]
+  vbroadcastss ymm5, [rip+cAVXExpP3]
   mov rdx, ShiftPtr
   vbroadcastss ymm15, [rdx]
   vxorps ymm8, ymm8, ymm8
@@ -16370,19 +16911,13 @@ begin
   vroundps ymm2, ymm1, 0           // k = round(t)
   vsubps  ymm1, ymm1, ymm2         // f = t-k in [-0.5,0.5]
   vmulps  ymm3, ymm1, ymm13        // g = f*ln2
-  vbroadcastss ymm4, [rip+cAVXExpP6]
-  vbroadcastss ymm5, [rip+cAVXExpP5]
+  vmovaps ymm4, ymm6
+  vfmadd213ps ymm4, ymm3, ymm7
+  vfmadd213ps ymm4, ymm3, ymm9
   vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP4]
-  vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP3]
-  vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP2]
-  vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP1]
-  vfmadd213ps ymm4, ymm3, ymm5
-  vbroadcastss ymm5, [rip+cAVXExpP0]
-  vfmadd213ps ymm4, ymm3, ymm5     // ymm4 = 2^f
+  vfmadd213ps ymm4, ymm3, [rip+cAVXExpP2V]
+  vfmadd213ps ymm4, ymm3, [rip+cAVXExpP1V]
+  vfmadd213ps ymm4, ymm3, [rip+cAVXExpP0V]  // ymm4 = 2^f
   vcvtps2dq ymm2, ymm2             // k -> int32
   vpaddd ymm2, ymm2, ymm14
   vpslld ymm2, ymm2, 23            // 2^k as float bits
@@ -16397,8 +16932,8 @@ begin
   vmovups [rdx], ymm8
   vzeroupper
   end ['rax','rcx','rdx','r8',
-       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5',
-       'ymm8','ymm10','ymm11','ymm12','ymm13','ymm14','ymm15'];
+       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6','ymm7',
+       'ymm8','ymm9','ymm10','ymm11','ymm12','ymm13','ymm14','ymm15'];
     for I := 0 to 7 do
       Sum := Sum + LaneSums[I];
   end;
@@ -16432,67 +16967,61 @@ begin
   mov r8d, localNumElements
   shr r8d, 3
   jz @DoneAVXLn
+  // Every constant the body needs is materialized once here: ymm7..ymm15 hold
+  // the nine reused ones, and P1..P8 are folded into the Horner FMAs as memory
+  // operands below.
+  vmovups ymm7,  [rip+cAVXLnMinNorm]   // smallest positive normal
+  vmovd   xmm8,  dword ptr [rip+cAVXExp127]
+  vpbroadcastd ymm8, xmm8              // 0x7f = 127
+  vmovups ymm9,  [rip+cAVXLnOne]
+  vmovups ymm10, [rip+cAVXLnInvMant]
+  vmovups ymm11, [rip+cAVXLnHalf]
+  vmovups ymm12, [rip+cAVXLnSqrtHf]
+  vmovups ymm13, [rip+cAVXLnP0]
+  vmovups ymm14, [rip+cAVXLnQ1]
+  vmovups ymm15, [rip+cAVXLnQ2]
 @LoopAVXLn:
   vmovups ymm0, [rax]
   // clamp to smallest positive normal so denormals/zero do not poison the bit tricks
-  vbroadcastss ymm15, [rip+cAVXLnMinNorm]
-  vmaxps  ymm0, ymm0, ymm15
+  vmaxps  ymm0, ymm0, ymm7
   // e = (float)(((bits >> 23) & 0xff) - 0x7f) + 1   (mantissa rescaled to [0.5,1))
   vpsrld  ymm2, ymm0, 23
-  vmovd   xmm15, dword ptr [rip+cAVXExp127]
-  vpbroadcastd ymm15, xmm15            // 0x7f = 127
-  vpsubd  ymm2, ymm2, ymm15            // unbiased exponent
+  vpsubd  ymm2, ymm2, ymm8             // unbiased exponent
   vcvtdq2ps ymm2, ymm2
-  vbroadcastss ymm15, [rip+cAVXLnOne]
-  vaddps  ymm2, ymm2, ymm15            // e = exp + 1 (0.5*2^e convention)
+  vaddps  ymm2, ymm2, ymm9             // e = exp + 1 (0.5*2^e convention)
   // mantissa in [0.5,1): bits = (bits & invMant) | 0.5bits
-  vbroadcastss ymm15, [rip+cAVXLnInvMant]
-  vandps  ymm0, ymm0, ymm15
-  vbroadcastss ymm15, [rip+cAVXLnHalf]
-  vorps   ymm0, ymm0, ymm15            // x = mantissa in [0.5,1)
+  vandps  ymm0, ymm0, ymm10
+  vorps   ymm0, ymm0, ymm11            // x = mantissa in [0.5,1)
   // mask: m < sqrt(0.5) ?
-  vbroadcastss ymm15, [rip+cAVXLnSqrtHf]
-  vcmpltps ymm3, ymm0, ymm15           // mask = (x < SQRTHF)
+  vcmpltps ymm3, ymm0, ymm12           // mask = (x < SQRTHF)
   vandps  ymm4, ymm0, ymm3             // tmp = (x<sqrthf)? x : 0
-  vbroadcastss ymm15, [rip+cAVXLnOne]
-  vsubps  ymm0, ymm0, ymm15            // x = x - 1
+  vsubps  ymm0, ymm0, ymm9             // x = x - 1
   vaddps  ymm0, ymm0, ymm4             // if x<sqrthf: x = 2x - 1
-  vandps  ymm5, ymm15, ymm3            // (x<sqrthf)? 1.0 : 0.0
+  vandps  ymm5, ymm9, ymm3             // (x<sqrthf)? 1.0 : 0.0
   vsubps  ymm2, ymm2, ymm5             // e -= 1 where x<sqrthf
   // z = x*x
   vmulps  ymm1, ymm0, ymm0             // z
   // Horner polynomial in x: P0..P8
-  vbroadcastss ymm4, [rip+cAVXLnP0]
-  vbroadcastss ymm5, [rip+cAVXLnP1]
-  vfmadd213ps ymm4, ymm0, ymm5
-  vbroadcastss ymm5, [rip+cAVXLnP2]
-  vfmadd213ps ymm4, ymm0, ymm5
-  vbroadcastss ymm5, [rip+cAVXLnP3]
-  vfmadd213ps ymm4, ymm0, ymm5
-  vbroadcastss ymm5, [rip+cAVXLnP4]
-  vfmadd213ps ymm4, ymm0, ymm5
-  vbroadcastss ymm5, [rip+cAVXLnP5]
-  vfmadd213ps ymm4, ymm0, ymm5
-  vbroadcastss ymm5, [rip+cAVXLnP6]
-  vfmadd213ps ymm4, ymm0, ymm5
-  vbroadcastss ymm5, [rip+cAVXLnP7]
-  vfmadd213ps ymm4, ymm0, ymm5
-  vbroadcastss ymm5, [rip+cAVXLnP8]
-  vfmadd213ps ymm4, ymm0, ymm5         // ymm4 = poly
+  vmovaps ymm4, ymm13
+  vfmadd213ps ymm4, ymm0, [rip+cAVXLnP1]
+  vfmadd213ps ymm4, ymm0, [rip+cAVXLnP2]
+  vfmadd213ps ymm4, ymm0, [rip+cAVXLnP3]
+  vfmadd213ps ymm4, ymm0, [rip+cAVXLnP4]
+  vfmadd213ps ymm4, ymm0, [rip+cAVXLnP5]
+  vfmadd213ps ymm4, ymm0, [rip+cAVXLnP6]
+  vfmadd213ps ymm4, ymm0, [rip+cAVXLnP7]
+  vfmadd213ps ymm4, ymm0, [rip+cAVXLnP8]  // ymm4 = poly
   vmulps  ymm4, ymm4, ymm0             // poly *= x
   vmulps  ymm4, ymm4, ymm1             // poly *= z   (= y)
   // y += e*Q1
-  vbroadcastss ymm5, [rip+cAVXLnQ1]
-  vfmadd231ps ymm4, ymm2, ymm5
+  vfmadd231ps ymm4, ymm2, ymm14
   // y -= 0.5*z
-  vbroadcastss ymm5, [rip+cAVXLnHalf]
-  vmulps  ymm6, ymm1, ymm5
+  vmulps  ymm6, ymm1, ymm11
   vsubps  ymm4, ymm4, ymm6
   // x = x + y
   vaddps  ymm0, ymm0, ymm4
   // x += e*Q2
-  vbroadcastss ymm5, [rip+cAVXLnQ2]
-  vfmadd231ps ymm0, ymm2, ymm5
+  vfmadd231ps ymm0, ymm2, ymm15
   vmovups [rcx], ymm0
   add rax, 32
   add rcx, 32
@@ -16501,7 +17030,8 @@ begin
 @DoneAVXLn:
   vzeroupper
   end ['rax','rcx','r8',
-       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6','ymm15'];
+       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6','ymm7','ymm8','ymm9',
+       'ymm10','ymm11','ymm12','ymm13','ymm14','ymm15'];
   end;
   for I := localNumElements to NumElementsM1 do
     pDst^[I] := pcr_logf(pSrc^[I]);
@@ -16536,57 +17066,41 @@ begin
   mov r8d, localNumElements
   shr r8d, 3
   jz @DoneAVXCos
+  // The four constants the body reads more than once, or would otherwise have
+  // to synthesize, are materialized once; the rest are memory operands below.
+  vmovups ymm9,  [rip+cAVXSC_Half]
+  vmovups ymm12, [rip+cAVXSC_4i]
+  vmovups ymm13, [rip+cAVXSC_2i]
+  vpxor   ymm14, ymm14, ymm14
+  vmovups ymm15, [rip+cAVXSC_One]
 @LoopAVXCos:
   vmovups ymm0, [rax]               // x
-  vpcmpeqd ymm14, ymm14, ymm14
-  vpsrld  ymm14, ymm14, 1           // 0x7fffffff
-  vandps  ymm1, ymm0, ymm14         // |x|
-  vbroadcastss ymm15, [rip+cAVXSC_FOPI]
-  vmulps  ymm2, ymm1, ymm15
+  vandps  ymm1, ymm0, [rip+cAVXArgAbsMask]  // |x|
+  vmulps  ymm2, ymm1, [rip+cAVXSC_FOPI]
   vcvttps2dq ymm3, ymm2             // j = trunc(|x|*4/pi)
-  vmovd   xmm15, dword ptr [rip+cAVXSC_1i]
-  vpbroadcastd ymm15, xmm15
-  vpaddd  ymm3, ymm3, ymm15         // j+1
-  vmovd   xmm15, dword ptr [rip+cAVXSC_NOT1i]
-  vpbroadcastd ymm15, xmm15
-  vpand   ymm3, ymm3, ymm15         // j &= ~1
+  vpaddd  ymm3, ymm3, [rip+cAVXSC_1i]     // j+1
+  vpand   ymm3, ymm3, [rip+cAVXSC_NOT1i]  // j &= ~1
   vcvtdq2ps ymm2, ymm3              // y = (float)j
-  vbroadcastss ymm15, [rip+cAVXSC_DP1]
-  vfmadd231ps ymm1, ymm2, ymm15
-  vbroadcastss ymm15, [rip+cAVXSC_DP2]
-  vfmadd231ps ymm1, ymm2, ymm15
-  vbroadcastss ymm15, [rip+cAVXSC_DP3]
-  vfmadd231ps ymm1, ymm2, ymm15     // reduced x
-  vmovd   xmm15, dword ptr [rip+cAVXSC_2i]
-  vpbroadcastd ymm15, xmm15
-  vpsubd  ymm4, ymm3, ymm15         // m = j-2
-  vmovd   xmm15, dword ptr [rip+cAVXSC_4i]
-  vpbroadcastd ymm15, xmm15
-  vpandn  ymm5, ymm4, ymm15         // (~m)&4   (Cephes cos sign convention)
+  vfmadd231ps ymm1, ymm2, [rip+cAVXSC_DP1]
+  vfmadd231ps ymm1, ymm2, [rip+cAVXSC_DP2]
+  vfmadd231ps ymm1, ymm2, [rip+cAVXSC_DP3]  // reduced x
+  vpsubd  ymm4, ymm3, ymm13         // m = j-2
+  vpandn  ymm5, ymm4, ymm12         // (~m)&4   (Cephes cos sign convention)
   vpslld  ymm5, ymm5, 29            // sign = ((~m)&4)<<29
-  vmovd   xmm15, dword ptr [rip+cAVXSC_2i]
-  vpbroadcastd ymm15, xmm15
-  vpand   ymm6, ymm4, ymm15
-  vpxor   ymm15, ymm15, ymm15
-  vpcmpeqd ymm6, ymm6, ymm15        // polymask: (m&2)==0 -> sin poly (Cephes cos)
+  vpand   ymm6, ymm4, ymm13
+  vpcmpeqd ymm6, ymm6, ymm14        // polymask: (m&2)==0 -> sin poly (Cephes cos)
   vmulps  ymm7, ymm1, ymm1          // z
-  vbroadcastss ymm8,  [rip+cAVXSC_CosP0]
-  vbroadcastss ymm9,  [rip+cAVXSC_CosP1]
-  vfmadd213ps ymm8, ymm7, ymm9
-  vbroadcastss ymm9,  [rip+cAVXSC_CosP2]
-  vfmadd213ps ymm8, ymm7, ymm9
+  vmovups ymm8, [rip+cAVXSC_CosP0]
+  vfmadd213ps ymm8, ymm7, [rip+cAVXSC_CosP1]
+  vfmadd213ps ymm8, ymm7, [rip+cAVXSC_CosP2]
   vmulps  ymm8, ymm8, ymm7
   vmulps  ymm8, ymm8, ymm7
-  vbroadcastss ymm9,  [rip+cAVXSC_Half]
   vmulps  ymm10, ymm7, ymm9
   vsubps  ymm8, ymm8, ymm10
-  vbroadcastss ymm9,  [rip+cAVXSC_One]
-  vaddps  ymm8, ymm8, ymm9          // cos candidate
-  vbroadcastss ymm11, [rip+cAVXSC_SinP0]
-  vbroadcastss ymm12, [rip+cAVXSC_SinP1]
-  vfmadd213ps ymm11, ymm7, ymm12
-  vbroadcastss ymm12, [rip+cAVXSC_SinP2]
-  vfmadd213ps ymm11, ymm7, ymm12
+  vaddps  ymm8, ymm8, ymm15         // cos candidate
+  vmovups ymm11, [rip+cAVXSC_SinP0]
+  vfmadd213ps ymm11, ymm7, [rip+cAVXSC_SinP1]
+  vfmadd213ps ymm11, ymm7, [rip+cAVXSC_SinP2]
   vmulps  ymm11, ymm11, ymm7
   vmulps  ymm11, ymm11, ymm1
   vaddps  ymm11, ymm11, ymm1        // sin candidate
@@ -16601,7 +17115,7 @@ begin
   vzeroupper
   end ['rax','rcx','r8',
        'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6','ymm7','ymm8',
-       'ymm9','ymm10','ymm11','ymm12','ymm14','ymm15'];
+       'ymm9','ymm10','ymm11','ymm12','ymm13','ymm14','ymm15'];
   end
   else
   begin
@@ -16611,56 +17125,40 @@ begin
   mov r8d, localNumElements
   shr r8d, 3
   jz @DoneAVXSin
+  vmovups ymm9,  [rip+cAVXSC_Half]
+  vmovups ymm12, [rip+cAVXSC_4i]
+  vmovups ymm13, [rip+cAVXSC_2i]
+  vmovups ymm14, [rip+cAVXSC_SignMask]
+  vmovups ymm15, [rip+cAVXSC_One]
 @LoopAVXSin:
   vmovups ymm0, [rax]               // x
-  vpcmpeqd ymm14, ymm14, ymm14
-  vpslld  ymm13, ymm14, 31          // 0x80000000
-  vandps  ymm5, ymm0, ymm13         // sign_x
-  vpsrld  ymm14, ymm14, 1           // 0x7fffffff
-  vandps  ymm1, ymm0, ymm14         // |x|
-  vbroadcastss ymm15, [rip+cAVXSC_FOPI]
-  vmulps  ymm2, ymm1, ymm15
+  vandps  ymm5, ymm0, ymm14         // sign_x
+  vandps  ymm1, ymm0, [rip+cAVXArgAbsMask]  // |x|
+  vmulps  ymm2, ymm1, [rip+cAVXSC_FOPI]
   vcvttps2dq ymm3, ymm2             // j
-  vmovd   xmm15, dword ptr [rip+cAVXSC_1i]
-  vpbroadcastd ymm15, xmm15
-  vpaddd  ymm3, ymm3, ymm15
-  vmovd   xmm15, dword ptr [rip+cAVXSC_NOT1i]
-  vpbroadcastd ymm15, xmm15
-  vpand   ymm3, ymm3, ymm15         // j = (j+1)&~1
+  vpaddd  ymm3, ymm3, [rip+cAVXSC_1i]
+  vpand   ymm3, ymm3, [rip+cAVXSC_NOT1i]  // j = (j+1)&~1
   vcvtdq2ps ymm2, ymm3              // y
-  vbroadcastss ymm15, [rip+cAVXSC_DP1]
-  vfmadd231ps ymm1, ymm2, ymm15
-  vbroadcastss ymm15, [rip+cAVXSC_DP2]
-  vfmadd231ps ymm1, ymm2, ymm15
-  vbroadcastss ymm15, [rip+cAVXSC_DP3]
-  vfmadd231ps ymm1, ymm2, ymm15     // reduced x
-  vmovd   xmm15, dword ptr [rip+cAVXSC_4i]
-  vpbroadcastd ymm15, xmm15
-  vpand   ymm4, ymm3, ymm15
+  vfmadd231ps ymm1, ymm2, [rip+cAVXSC_DP1]
+  vfmadd231ps ymm1, ymm2, [rip+cAVXSC_DP2]
+  vfmadd231ps ymm1, ymm2, [rip+cAVXSC_DP3]  // reduced x
+  vpand   ymm4, ymm3, ymm12
   vpslld  ymm4, ymm4, 29            // (j&4)<<29
   vxorps  ymm5, ymm5, ymm4          // combined sign
-  vmovd   xmm15, dword ptr [rip+cAVXSC_2i]
-  vpbroadcastd ymm15, xmm15
-  vpand   ymm6, ymm3, ymm15
-  vpcmpeqd ymm6, ymm6, ymm15        // polymask: (j&2)==2 -> cos poly
+  vpand   ymm6, ymm3, ymm13
+  vpcmpeqd ymm6, ymm6, ymm13        // polymask: (j&2)==2 -> cos poly
   vmulps  ymm7, ymm1, ymm1          // z
-  vbroadcastss ymm8,  [rip+cAVXSC_CosP0]
-  vbroadcastss ymm9,  [rip+cAVXSC_CosP1]
-  vfmadd213ps ymm8, ymm7, ymm9
-  vbroadcastss ymm9,  [rip+cAVXSC_CosP2]
-  vfmadd213ps ymm8, ymm7, ymm9
+  vmovups ymm8, [rip+cAVXSC_CosP0]
+  vfmadd213ps ymm8, ymm7, [rip+cAVXSC_CosP1]
+  vfmadd213ps ymm8, ymm7, [rip+cAVXSC_CosP2]
   vmulps  ymm8, ymm8, ymm7
   vmulps  ymm8, ymm8, ymm7
-  vbroadcastss ymm9,  [rip+cAVXSC_Half]
   vmulps  ymm10, ymm7, ymm9
   vsubps  ymm8, ymm8, ymm10
-  vbroadcastss ymm9,  [rip+cAVXSC_One]
-  vaddps  ymm8, ymm8, ymm9          // cos candidate
-  vbroadcastss ymm11, [rip+cAVXSC_SinP0]
-  vbroadcastss ymm12, [rip+cAVXSC_SinP1]
-  vfmadd213ps ymm11, ymm7, ymm12
-  vbroadcastss ymm12, [rip+cAVXSC_SinP2]
-  vfmadd213ps ymm11, ymm7, ymm12
+  vaddps  ymm8, ymm8, ymm15         // cos candidate
+  vmovups ymm11, [rip+cAVXSC_SinP0]
+  vfmadd213ps ymm11, ymm7, [rip+cAVXSC_SinP1]
+  vfmadd213ps ymm11, ymm7, [rip+cAVXSC_SinP2]
   vmulps  ymm11, ymm11, ymm7
   vmulps  ymm11, ymm11, ymm1
   vaddps  ymm11, ymm11, ymm1        // sin candidate
@@ -16728,6 +17226,8 @@ begin
   vxorps zmm1, zmm1, zmm1
   {$ELSE}
   vxorps ymm1, ymm1, ymm1
+  vxorps ymm6, ymm6, ymm6
+  vxorps ymm7, ymm7, ymm7
   {$ENDIF}
 
 @LargeAddLoop:
@@ -16750,8 +17250,8 @@ begin
     {$IFDEF AVX2}
     vfmadd231ps ymm0, ymm2, [rdx]
     vfmadd231ps ymm1, ymm3, [rdx+32]
-    vfmadd231ps ymm0, ymm4, [rdx+64]
-    vfmadd231ps ymm1, ymm5, [rdx+96]
+    vfmadd231ps ymm6, ymm4, [rdx+64]
+    vfmadd231ps ymm7, ymm5, [rdx+96]
     {$ELSE}
     vmulps  ymm2, ymm2, [rdx]
     vmulps  ymm3, ymm3, [rdx+32]
@@ -16760,8 +17260,8 @@ begin
 
     vaddps  ymm0, ymm0, ymm2
     vaddps  ymm1, ymm1, ymm3
-    vaddps  ymm0, ymm0, ymm4
-    vaddps  ymm1, ymm1, ymm5
+    vaddps  ymm6, ymm6, ymm4
+    vaddps  ymm7, ymm7, ymm5
     {$ENDIF}
   {$ENDIF}
 
@@ -16782,6 +17282,8 @@ begin
   addps  xmm0, xmm4
   {$ELSE}
   vaddps ymm0, ymm0, ymm1
+  vaddps ymm6, ymm6, ymm7
+  vaddps ymm0, ymm0, ymm6
   VEXTRACTF128 xmm2, ymm0, 1
   vzeroupper
   addps  xmm0, xmm2
@@ -16816,7 +17318,7 @@ begin
   [
     'RAX', 'RCX', 'RDX',
     'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5'
-    {$IFDEF AVX512},'zmm0', 'zmm1'{$ENDIF}
+    {$IFDEF AVX512},'zmm0', 'zmm1'{$ELSE},'ymm6', 'ymm7'{$ENDIF}
   ];
 
     Result := vRes[0];
@@ -17484,6 +17986,7 @@ end;
 destructor TNNetGroupedVolume.Destroy;
 begin
   SetLength(FGrInfoArray, 0);
+  FGrInfoBase := nil;
   inherited Destroy;
 end;
 
