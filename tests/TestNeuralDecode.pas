@@ -28,6 +28,10 @@ type
     function BuildTinyLearnedPosLM(ContextLen: integer): TNNet; // GPT-2 wpe
     function BuildTinyMambaLM(ContextLen: integer): TNNet;    // conv+SelectiveSSM
     function BuildTinyRWKVLM(ContextLen: integer): TNNet;     // TokenShift+WKV
+    // Qwen3.5-shaped hybrid: a GatedDeltaNet "linear_attention" branch (with
+    // the causal depthwise conv on the q|k|v slab) followed by a RoPE
+    // attention block - the two mixer families the qwen3_5 decoder interleaves.
+    function BuildTinyQwen35HybridLM(ContextLen: integer): TNNet;
     // Streams Toks token-at-a-time through Session and asserts every step's
     // output row matches the corresponding row of Full's causal forward.
     procedure AssertStreamMatchesFull(Full: TNNet;
@@ -206,6 +210,7 @@ type
     // Prefix-cache reuse / cache fork (Snapshot / RestoreSnapshot).
     procedure TestStreamingDecoderForkContinuationBitIdenticalTransformer;
     procedure TestStreamingDecoderForkContinuationBitIdenticalSSM;
+    procedure TestStreamingDecoderForkContinuationBitIdenticalQwen35Hybrid;
     procedure TestStreamingDecoderSnapshotForksManyIndependentSessions;
     // StreamingLLM KV-cache eviction (attention sinks + rolling window).
     procedure TestStreamingEvictionWithinWindowBitIdenticalToUnbounded;
@@ -2937,6 +2942,39 @@ begin
   Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamVocab));
 end;
 
+function TTestNeuralDecode.BuildTinyQwen35HybridLM(ContextLen: integer): TNNet;
+const
+  Hk = 1; Hv = 2; Dk = 4; Dv = 4;
+var
+  Source, ConvAct, LinZ, LinB, LinA: TNNetLayer;
+begin
+  // The two stateful layer classes a qwen3_5 decoder actually carries, in the
+  // arrangement BuildQwen35DeltaNetBranch wires them: a causal depthwise conv
+  // over the q|k|v slab (TNNetDepthwiseConv1D conv state) feeding the matrix
+  // -state recurrence (TNNetGatedDeltaNet), then a RoPE attention block (KV
+  // cache). A turn-boundary fork has to restore ALL THREE kinds of state.
+  // Mixer input layout is [ q (Hk*Dk) | k (Hk*Dk) | v (Hv*Dv) | z (Hv*Dv) |
+  // b (Hv) | a (Hv) ]; only the q|k|v slab is conv'd (z/b/a bypass it).
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
+  Source := Result.AddLayer(
+    TNNetEmbedding.Create(csStreamVocab, csStreamDim, 0, 0.02));
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(2 * Hk * Dk + Hv * Dv));
+  Result.AddLayer(TNNetDepthwiseConv1D.Create({KernelSize=}3, {pCausal=}true,
+    {pSuppressBias=}1));
+  ConvAct := Result.AddLayer(TNNetSiLU.Create());
+  LinZ := Result.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Hv * Dv), Source);
+  LinB := Result.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hv), Source);
+  LinA := Result.AddLayerAfter(TNNetPointwiseConvLinear.Create(Hv), Source);
+  Result.AddLayer(TNNetDeepConcat.Create([ConvAct, LinZ, LinB, LinA]));
+  Result.AddLayer(TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv));
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamDim)); // out_proj
+  Result.AddTransformerEncoderBlock({Heads=}2, {d_ff=}8,
+    {PreNorm=}true, {CausalMask=}true, {UseRoPE=}true, {NormClass=}TNNetDyT);
+  Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamVocab));
+end;
+
 function TTestNeuralDecode.BuildTinyGQALM(ContextLen: integer): TNNet;
 begin
   // Grouped-Query Attention mixer (4 query heads sharing 2 K/V heads). The
@@ -3463,6 +3501,87 @@ begin
       ForkSession.StepForward(StepIn, T);
       for D := 0 to ForkSession.Output().Size - 1 do
         AssertTrue('SSM BIT-IDENTICAL pos ' + IntToStr(T) + ' dim ' + IntToStr(D),
+          RefOut[T][D] = ForkSession.Output().FData[D]);
+    end;
+  finally
+    Snap.Free;
+    ForkSession.Free;
+    RefSession.Free;
+    StepIn.Free;
+    Twin.Free;
+  end;
+end;
+
+// The bit-identical fork gate for the qwen3_5 layer mix specifically: a
+// GatedDeltaNet branch (matrix state + depthwise-conv state) AND a RoPE
+// attention block (KV cache) in one net. This is the gate for turn-boundary
+// cache reuse in TChatEngine - a chat turn resumes from a snapshot taken at
+// the end of the previous turn, so the continuation must be indistinguishable
+// from re-prefilling the whole conversation. RoPE is present on purpose: the
+// absolute-position contract (PositionOffset is NOT snapshot state - it comes
+// from the caller's AbsPos) is exercised across the fork boundary.
+procedure TTestNeuralDecode.TestStreamingDecoderForkContinuationBitIdenticalQwen35Hybrid;
+const
+  PromptLen = 4;
+  TotalLen  = 9;
+  Toks: array[0..8] of integer = (7, 3, 10, 1, 8, 5, 2, 9, 4);
+var
+  Twin: TNNet;
+  RefSession, ForkSession: TNNetStreamingDecoder;
+  Snap: TNNetDecoderSessionSnapshot;
+  StepIn: TNNetVolume;
+  RefOut: array[PromptLen..TotalLen - 1] of array of TNeuralFloat;
+  T, D: integer;
+begin
+  RandSeed := 424242;
+  Twin := BuildTinyQwen35HybridLM(1);
+  RefSession := nil; ForkSession := nil; Snap := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    // Reference: one session streams the WHOLE sequence, never forking.
+    RefSession := TNNetStreamingDecoder.Create(Twin, TotalLen);
+    RefSession.Reset();
+    for T := 0 to TotalLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      RefSession.StepForward(StepIn, T);
+      if T >= PromptLen then
+      begin
+        SetLength(RefOut[T], RefSession.Output().Size);
+        for D := 0 to RefSession.Output().Size - 1 do
+          RefOut[T][D] := RefSession.Output().FData[D];
+      end;
+    end;
+    RefSession.Free; RefSession := nil;
+
+    // Fork: prefill ONLY the prompt, snapshot at the turn boundary.
+    ForkSession := TNNetStreamingDecoder.Create(Twin, TotalLen);
+    ForkSession.Reset();
+    for T := 0 to PromptLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      ForkSession.StepForward(StepIn, T);
+    end;
+    Snap := ForkSession.Snapshot();
+    // Both stateful families must be captured: the conv-state layer and the
+    // DeltaNet leaf are BOTH TNNetRecurrentDecodeBase, plus the attention KV.
+    AssertEquals('snapshot captured both recurrent layers (conv + deltanet)',
+      2, Snap.SSMCount);
+    AssertEquals('snapshot captured the attention layer', ForkSession.SDPACount,
+      Snap.SDPACount);
+    ForkSession.Free; ForkSession := nil;
+
+    // Resume into a FRESH session and continue from the boundary.
+    ForkSession := TNNetStreamingDecoder.Create(Twin, TotalLen);
+    ForkSession.Reset();
+    ForkSession.RestoreSnapshot(Snap);
+    for T := PromptLen to TotalLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      ForkSession.StepForward(StepIn, T);
+      for D := 0 to ForkSession.Output().Size - 1 do
+        AssertTrue('qwen3_5 hybrid BIT-IDENTICAL pos ' + IntToStr(T) +
+          ' dim ' + IntToStr(D),
           RefOut[T][D] = ForkSession.Output().FData[D]);
     end;
   finally
