@@ -211,6 +211,7 @@ type
     procedure TestStreamingDecoderForkContinuationBitIdenticalTransformer;
     procedure TestStreamingDecoderForkContinuationBitIdenticalSSM;
     procedure TestStreamingDecoderForkContinuationBitIdenticalQwen35Hybrid;
+    procedure TestStreamingDecoderRepeatedTurnResumeBitIdenticalQwen35Hybrid;
     procedure TestStreamingDecoderSnapshotForksManyIndependentSessions;
     // StreamingLLM KV-cache eviction (attention sinks + rolling window).
     procedure TestStreamingEvictionWithinWindowBitIdenticalToUnbounded;
@@ -3587,6 +3588,81 @@ begin
   finally
     Snap.Free;
     ForkSession.Free;
+    RefSession.Free;
+    StepIn.Free;
+    Twin.Free;
+  end;
+end;
+
+// The multi-turn shape TChatEngine actually runs: capture at a turn boundary,
+// resume, extend, capture AGAIN, resume again - three turns over one session.
+// The single-fork test above proves ONE capture/restore is exact; this proves
+// the cycle does not drift when the restored state is itself re-captured,
+// which is what a long conversation does. Every position after every resume
+// must still be bit-identical to one session that streamed the whole
+// transcript without ever forking.
+procedure TTestNeuralDecode.TestStreamingDecoderRepeatedTurnResumeBitIdenticalQwen35Hybrid;
+const
+  TotalLen = 9;
+  // Turn boundaries: the session is snapshotted after feeding this many
+  // tokens, mirroring TChatEngine's TurnSnapPos = Len - 1 capture.
+  Bound1 = 3;
+  Bound2 = 6;
+  Toks: array[0..8] of integer = (2, 8, 4, 11, 6, 1, 9, 3, 7);
+var
+  Twin: TNNet;
+  RefSession, TurnSession: TNNetStreamingDecoder;
+  Snap: TNNetDecoderSessionSnapshot;
+  StepIn: TNNetVolume;
+  RefOut: array[0..TotalLen - 1] of array of TNeuralFloat;
+  T, D: integer;
+
+  // Resume from Snap (when held), feed Toks[FromPos..ToPos-1], and assert each
+  // step reproduces the reference row exactly. Re-snapshots at ToPos.
+  procedure RunTurn(FromPos, ToPos: integer);
+  var
+    P, Dim: integer;
+  begin
+    if Assigned(Snap) then TurnSession.RestoreSnapshot(Snap);
+    for P := FromPos to ToPos - 1 do
+    begin
+      StepIn.FData[0] := Toks[P];
+      TurnSession.StepForward(StepIn, P);
+      for Dim := 0 to TurnSession.Output().Size - 1 do
+        AssertTrue('turn-resume BIT-IDENTICAL pos ' + IntToStr(P) +
+          ' dim ' + IntToStr(Dim),
+          RefOut[P][Dim] = TurnSession.Output().FData[Dim]);
+    end;
+    Snap.Free;
+    Snap := TurnSession.Snapshot();
+  end;
+
+begin
+  RandSeed := 424242;
+  Twin := BuildTinyQwen35HybridLM(1);
+  RefSession := nil; TurnSession := nil; Snap := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    RefSession := TNNetStreamingDecoder.Create(Twin, TotalLen);
+    RefSession.Reset();
+    for T := 0 to TotalLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      RefSession.StepForward(StepIn, T);
+      SetLength(RefOut[T], RefSession.Output().Size);
+      for D := 0 to RefSession.Output().Size - 1 do
+        RefOut[T][D] := RefSession.Output().FData[D];
+    end;
+    RefSession.Free; RefSession := nil;
+
+    TurnSession := TNNetStreamingDecoder.Create(Twin, TotalLen);
+    TurnSession.Reset();
+    RunTurn(0, Bound1);
+    RunTurn(Bound1, Bound2);
+    RunTurn(Bound2, TotalLen);
+  finally
+    Snap.Free;
+    TurnSession.Free;
     RefSession.Free;
     StepIn.Free;
     Twin.Free;
