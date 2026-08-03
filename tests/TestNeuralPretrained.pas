@@ -228,6 +228,7 @@ type
     procedure TestQwen3MoeWindowLogitParity;
     procedure TestQwen35LogitParity;
     procedure TestQwen35StreamedDecodeParity;
+    procedure TestQwen35TurnBoundaryResumeParity;
     procedure TestQwen35MoeLogitParity;
     procedure TestGptOssLogitParity;
     procedure TestGptOssMXFP4LogitParity;
@@ -8329,6 +8330,89 @@ begin
     Session.Free;
     Twin.Free;
     Full.Free;
+  end;
+end;
+
+// Turn-boundary state reuse on the REAL qwen3_5 wiring. TChatEngine resumes a
+// hybrid chat from a snapshot taken at the end of the previous turn instead of
+// re-prefilling the whole conversation; TestNeuralDecode covers the mechanism
+// on a hand-built hybrid, but only this fixture carries what the importer
+// actually produces - the attention output gate, partial rotary
+// (partial_rotary_factor 0.25), q/k-norm, zero-centered RMSNorms, and the
+// (L L L F) layer pattern with 12 recurrent layers feeding 2 attention layers.
+// Three turns: prefill, snapshot, resume, extend, re-snapshot. Every logit
+// after every resume must match a session that streamed the whole transcript
+// (exact - both sides run the same kernels in the same order).
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35TurnBoundaryResumeParity;
+const
+  SeqLen  = 12;
+  Bound1  = 4;   // end of turn 1: tokens fed = 4
+  Bound2  = 8;   // end of turn 2
+var
+  Twin: TNNet;
+  Config: TLlamaConfig;
+  RefSession, TurnSession: TNNetStreamingDecoder;
+  Snap: TNNetDecoderSessionSnapshot;
+  StepIn: TNNetVolume;
+  RefOut: array[0..SeqLen - 1] of array of TNeuralFloat;
+  Toks: array[0..SeqLen - 1] of integer;
+  T, V, Vocab: integer;
+
+  procedure RunTurn(FromPos, ToPos: integer);
+  var
+    P, Dim: integer;
+  begin
+    if Assigned(Snap) then TurnSession.RestoreSnapshot(Snap);
+    for P := FromPos to ToPos - 1 do
+    begin
+      StepIn.FData[0] := Toks[P];
+      TurnSession.StepForward(StepIn, P);
+      for Dim := 0 to Vocab - 1 do
+        AssertEquals('qwen3_5 turn-resume logit pos ' + IntToStr(P) + ' tok ' +
+          IntToStr(Dim), RefOut[P][Dim], TurnSession.Output().FData[Dim], 0.0);
+    end;
+    Snap.Free;
+    Snap := TurnSession.Snapshot();
+  end;
+
+begin
+  RandSeed := 424242;
+  Twin := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5.safetensors'),
+    Config, {SeqLen=}1, {pTrainable=}false,
+    FixturePath('tiny_qwen3_5_config.json'));
+  RefSession := nil; TurnSession := nil; Snap := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    Vocab := Config.VocabSize;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+
+    RefSession := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    AssertTrue('recurrent layers present', RefSession.SSMCount > 0);
+    AssertTrue('attention layers present', RefSession.SDPACount > 0);
+    RefSession.Reset();
+    for T := 0 to SeqLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      RefSession.StepForward(StepIn, T);
+      SetLength(RefOut[T], Vocab);
+      for V := 0 to Vocab - 1 do
+        RefOut[T][V] := RefSession.Output().FData[V];
+    end;
+    RefSession.Free; RefSession := nil;
+
+    TurnSession := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    TurnSession.Reset();
+    RunTurn(0, Bound1);
+    RunTurn(Bound1, Bound2);
+    RunTurn(Bound2, SeqLen);
+  finally
+    Snap.Free;
+    TurnSession.Free;
+    RefSession.Free;
+    StepIn.Free;
+    Twin.Free;
   end;
 end;
 
