@@ -133,6 +133,7 @@ draws uniformly. `--greedy` hard-overrides everything.
 | `--profile` | per-layer-class forward timing to **stderr** after each turn (decode steps only — prefill is excluded), plus a `[sched]` line with the layer-graph scheduler stats (graph width, parallel vs serial passes, peak in-flight) | off |
 | `--no-cache-reuse` | re-prefill the whole prompt every turn instead of reusing the shared KV-cache prefix (A/B + debugging) | reuse on |
 | `--serial` | classic in-order serial layer loop, fully single-threaded, instead of the layer-graph parallel forward that also threads large conv/linear layers internally (see below) | parallel on |
+| `--max-threads N` | cap the parallel forward at N worker threads (the pool becomes `Min(N, cpu threads)`, and per-layer chunk counts follow it); ignored with `--serial` | all CPU threads |
 | `--selftest` | run the offline unit checks and exit | — |
 
 The model is always built with `pTrainable=false` — the REPL never trains,
@@ -207,6 +208,12 @@ forward paths; each path drives *both* levels of parallelism together:
 - **Serial (`--serial`)** runs the classic in-order layer loop through
   `TNNet.ComputeSerial`, fully single-threaded — both layer-graph parallelism
   and intra-layer threading are off.
+
+`--max-threads N` caps the worker pool on the parallel path (`TNNet.MaxThreadNum`,
+the inference twin of `TNeuralFit.MaxThreadNum`): the pool is sized
+`Min(N, cpu threads)` and each threaded layer splits into that many chunks.
+Useful when the machine is shared, or with `--gpu`, where fewer host workers
+leave more cores to the OpenCL driver.
 
 Temperature and the penalties run through a
 `TNNetLogitsProcessorChain` in the `TGenerationConfig` pipeline order

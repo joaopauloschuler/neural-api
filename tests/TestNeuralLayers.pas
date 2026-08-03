@@ -26,6 +26,7 @@ type
     procedure TestConvolutionFastMemoryNeuronChunk;
     procedure TestConvolutionSpatialNeuronChunk;
     procedure TestHotThreadWorkersStartStop;
+    procedure TestMaxThreadNumCapsThePool;
     procedure TestConvolutionForward;
     procedure TestWinogradConvolutionParity;
     procedure TestMaxPoolForward;
@@ -439,6 +440,107 @@ begin
       1, NN.HotThreadWorkers);
     for i := 0 to SerialOut.Size - 1 do
       AssertTrue('StopOnFinish pass must be BIT-IDENTICAL to serial at ' +
+        IntToStr(i), SerialOut.Raw[i] = NN.GetLastLayer().Output.Raw[i]);
+  finally
+    Input.Free;
+    SerialOut.Free;
+    NN.Free;
+  end;
+end;
+
+// MaxThreadNum caps the scheduler's worker pool: the pool is
+// Min(MaxThreadNum, cpu count), 0 restores "every CPU thread", and the cap
+// changes nothing about the result (parallel passes stay BIT-IDENTICAL to the
+// serial reference). The pool size is read back through StartThreadWorkers'
+// auto hot count (pHotThreadNum = -1 sets HotThreadWorkers to the pool size).
+// Coded by Claude (AI).
+procedure TTestNeuralLayers.TestMaxThreadNumCapsThePool;
+var
+  NN: TNNet;
+  Input, SerialOut: TNNetVolume;
+  InputLayer, Branch1, Branch2: TNNetLayer;
+  Layer: TNNetLayer;
+  i, LayerCnt, neuron, w: integer;
+  FC: TNNetFullConnect;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1024, 1, 1);
+  SerialOut := TNNetVolume.Create();
+  try
+    AssertEquals('MaxThreadNum defaults to the cpu count (no cap)',
+      NeuralDefaultThreadCount(), NN.MaxThreadNum);
+
+    InputLayer := NN.AddLayer(TNNetInput.Create(1024));
+    Branch1 := NN.AddLayerAfter(
+      TNNetFullConnectLinear.Create(1, 1, 512), InputLayer);
+    Branch2 := NN.AddLayerAfter(
+      TNNetFullConnectReLU.Create(1, 1, 256), InputLayer);
+    NN.AddLayer(TNNetDeepConcat.Create([Branch1, Branch2]));
+    for LayerCnt := 0 to NN.CountLayers() - 1 do
+    begin
+      Layer := NN.Layers[LayerCnt];
+      if Layer is TNNetFullConnect then
+      begin
+        FC := TNNetFullConnect(Layer);
+        for neuron := 0 to FC.Neurons.Count - 1 do
+        begin
+          for w := 0 to FC.Neurons[neuron].Weights.Size - 1 do
+            FC.Neurons[neuron].Weights.Raw[w] :=
+              Sin(LayerCnt * 1.3 + neuron * 0.017 + w * 0.0009) * 0.1;
+          FC.Neurons[neuron].BiasWeight := Cos(neuron * 0.019) * 0.05;
+        end;
+      end;
+    end;
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.05) - 0.3;
+
+    // Serial reference (trainable -> single-threaded serial loop).
+    NN.Compute(Input);
+    SerialOut.Copy(NN.GetLastLayer().Output);
+    AssertTrue('Reference output is non-trivial', SerialOut.GetSumAbs() > 0.0);
+
+    NN.SetTrainable(False);
+    NN.SchedulerMinGain := 0; // force the parallel scheduler on every pass
+
+    // Uncapped: the pool is the full cpu thread count (the plan floors the
+    // graph width at it so intra-layer chunking can engage).
+    NN.StartThreadWorkers({StopOnFinish=}False, {pHotThreadNum=}-1, {timeout=}5);
+    AssertEquals('Uncapped pool is the cpu thread count',
+      NeuralDefaultThreadCount(), NN.HotThreadWorkers);
+
+    // Capped at 2 (or 1 on a single-core host).
+    NN.MaxThreadNum := 2;
+    NN.StartThreadWorkers({StopOnFinish=}False, {pHotThreadNum=}-1, {timeout=}5);
+    AssertEquals('MaxThreadNum caps the pool at Min(cap, cpu count)',
+      Min(2, NeuralDefaultThreadCount()), NN.HotThreadWorkers);
+
+    // A capped pass computes the same thing, bit for bit.
+    NN.Compute(Input, 0, True);
+    AssertEquals('Capped output size', SerialOut.Size,
+      NN.GetLastLayer().Output.Size);
+    for i := 0 to SerialOut.Size - 1 do
+      AssertTrue('Capped parallel pass must be BIT-IDENTICAL to serial at ' +
+        IntToStr(i), SerialOut.Raw[i] = NN.GetLastLayer().Output.Raw[i]);
+
+    // A cap of 1 is legal: a single worker, still bit-identical.
+    NN.MaxThreadNum := 1;
+    NN.StartThreadWorkers({StopOnFinish=}False, {pHotThreadNum=}-1, {timeout=}5);
+    AssertEquals('MaxThreadNum = 1 leaves a single worker', 1,
+      NN.HotThreadWorkers);
+    NN.Compute(Input, 0, True);
+    for i := 0 to SerialOut.Size - 1 do
+      AssertTrue('Single-worker pass must be BIT-IDENTICAL to serial at ' +
+        IntToStr(i), SerialOut.Raw[i] = NN.GetLastLayer().Output.Raw[i]);
+
+    // 0 (and any non-positive value) means "no cap" again - including right
+    // after a capped pass, where the cached plan's width floor was built under
+    // the lower cap (the setter lifts it).
+    NN.MaxThreadNum := 0;
+    NN.StartThreadWorkers({StopOnFinish=}False, {pHotThreadNum=}-1, {timeout=}5);
+    AssertEquals('MaxThreadNum = 0 restores the full pool',
+      NeuralDefaultThreadCount(), NN.HotThreadWorkers);
+    NN.Compute(Input, 0, True);
+    for i := 0 to SerialOut.Size - 1 do
+      AssertTrue('Uncapped-again pass must be BIT-IDENTICAL to serial at ' +
         IntToStr(i), SerialOut.Raw[i] = NN.GetLastLayer().Output.Raw[i]);
   finally
     Input.Free;

@@ -16333,6 +16333,11 @@ type
       // /proc on EVERY call, and ComputeParallel runs once per token.
       // 0 = not read yet.
       FSchedCpuCount: integer;
+      // User cap on the worker count (MaxThreadNum), the inference-side twin of
+      // TNeuralFit.MaxThreadNum: every thread budget below is
+      // Min(FMaxThreadNum, FSchedCpuCount). Defaults to the cpu count (no cap);
+      // <= 0 also means "no cap". Coded by Claude (AI).
+      FMaxThreadNum: integer;
       // Max number of layers sharing a topological level - an upper bound on
       // useful worker parallelism. 1 = straight-line net (stay serial).
       FSchedMaxWidth: integer;
@@ -16395,6 +16400,16 @@ type
       FHotThreadWorkers: integer;   // hot workers (indices 0..N-1); default 1
       FHotThreadTimeout: integer;   // hot cool-down window, seconds; default 2
       FHotStopOnFinish: boolean;    // tear the pool down after the next pass
+      // Min(FMaxThreadNum, FSchedCpuCount), reading the cpu count lazily.
+      // Single source of truth for the pool size, the plan's width floor and
+      // the cost proxy's threaded-layer divisor. Coded by Claude (AI).
+      function SchedThreadBudget(): integer;
+      // MaxThreadNum's setter: also lifts the cached plan's width floor when
+      // the cap GROWS. BuildInferencePlan only refreshes FSchedMaxWidth when
+      // the layer count changed, so a plan built under a lower cap would
+      // otherwise keep capping the pool after the cap is raised (lowering it
+      // needs no refresh - Min() clamps). Coded by Claude (AI).
+      procedure SetMaxThreadNum(pMaxThreadNum: integer);
       // Rebuilds FSchedDeps/FSchedMaxWidth when the layer count changed since
       // the last build (no-op otherwise). Coded by Claude (AI).
       procedure BuildInferencePlan();
@@ -16506,6 +16521,14 @@ type
       // the scheduler on every pass (testing). Coded by Claude (AI).
       property SchedulerMinGain: TNeuralFloat
         read FSchedMinGain write FSchedMinGain;
+      // Upper bound on scheduler worker threads, the inference-side twin of
+      // TNeuralFit.MaxThreadNum: the pool is sized Min(MaxThreadNum, cpu
+      // count) and per-layer chunk counts follow it. Defaults to the cpu
+      // count (no cap); <= 0 restores that default. Takes effect on the next
+      // pass / StartThreadWorkers call, which resizes an existing pool.
+      // Coded by Claude (AI).
+      property MaxThreadNum: integer
+        read FMaxThreadNum write SetMaxThreadNum;
       // Number of scheduler workers kept HOT (never napping while idle within a
       // pass) - the low-index workers 0..HotThreadWorkers-1. 1 (default) keeps
       // only worker 0 hot, the classic policy. Coded by Claude (AI).
@@ -102029,11 +102052,12 @@ begin
   FHasSharedKernel := true;
   FSchedPlanLayerCount := -1;
   FSchedCpuCount := NeuralDefaultThreadCount();
+  FMaxThreadNum := FSchedCpuCount; // no cap until the caller sets one
   // Floor the pool width at cpu cores): a straight-line graph has
   // inter-layer width 1, but intra-layer chunk threading still needs several
   // workers to split one big layer - a width of 1 would force the serial path
   // and disable chunking entirely. Coded by Claude (AI).
-  FSchedMaxWidth := FSchedCpuCount;
+  FSchedMaxWidth := SchedThreadBudget();
   FSchedPool := nil;
   FSchedWake := nil;
   // Minimum Amdahl speedup bound required to engage the parallel scheduler;
@@ -102071,16 +102095,34 @@ begin
   Result := FIntraLayerThreading;
 end;
 
+function TNNetExecutionPlanner.SchedThreadBudget(): integer;
+begin
+  if FSchedCpuCount = 0 then FSchedCpuCount := NeuralDefaultThreadCount();
+  Result := FSchedCpuCount;
+  // MaxThreadNum <= 0 means "no cap" (the constructor's default IS the cpu
+  // count, so the Min below is a no-op until a caller lowers it).
+  if (FMaxThreadNum > 0) and (FMaxThreadNum < Result)
+    then Result := FMaxThreadNum;
+end;
+
+procedure TNNetExecutionPlanner.SetMaxThreadNum(pMaxThreadNum: integer);
+var
+  Budget: integer;
+begin
+  FMaxThreadNum := pMaxThreadNum;
+  Budget := SchedThreadBudget();
+  if FSchedMaxWidth < Budget then FSchedMaxWidth := Budget;
+end;
+
 procedure TNNetExecutionPlanner.StartThreadWorkers(StopOnFinish: boolean = false;
   pHotThreadNum: integer = -1; pHotThreadTimeoutSeconds: integer = 2);
 var
   ThreadCount, HotCount: integer;
 begin
-  if FSchedCpuCount = 0 then FSchedCpuCount := NeuralDefaultThreadCount();
   // Cheap when the plan is already built (O(1) count-cached); sets FSchedMaxWidth
   // so the pool is sized exactly as ComputeParallel sizes it.
   BuildInferencePlan();
-  ThreadCount := Min(FSchedMaxWidth, FSchedCpuCount);
+  ThreadCount := Min(FSchedMaxWidth, SchedThreadBudget());
   if ThreadCount < 1 then ThreadCount := 1;
   // Resolve the hot-worker count. -1 = auto (~100% of the pool). Worker 0 is hot
   // regardless (RunInferenceSchedulerWorker), so 0 leaves only worker 0 hot.
@@ -122254,10 +122296,9 @@ begin
   SetLength(FSchedDeps, FLayers.Count);
   SetLength(Levels, FLayers.Count);
   SetLength(LevelWidth, FLayers.Count + 1);
-  if FSchedCpuCount = 0 then FSchedCpuCount := NeuralDefaultThreadCount();
-  // Floor at cpu cores so a linear graph (inter-layer width 1) can still
-  // engage the pool for intra-layer chunk threading. Coded by Claude (AI).
-  FSchedMaxWidth := FSchedCpuCount;
+  // Floor at the thread budget so a linear graph (inter-layer width 1) can
+  // still engage the pool for intra-layer chunk threading. Coded by Claude (AI).
+  FSchedMaxWidth := SchedThreadBudget();
   RawDeps := TList.Create();
   try
     for LayerCnt := 0 to LastLayerIdx do
@@ -122334,7 +122375,6 @@ begin
   // work) + output size (elementwise sweep). Total work divided by the most
   // expensive dependency chain bounds the speedup ANY schedule could reach;
   // ComputeParallel stays serial below FSchedMinGain.
-  if FSchedCpuCount = 0 then FSchedCpuCount := NeuralDefaultThreadCount();
   SetLength(CritCost, FLayers.Count);
   FSchedTotalCost := 0;
   FSchedCritCost := 0;
@@ -122352,7 +122392,7 @@ begin
     // is evaluated at plan-build time; like the plan itself, it refreshes when
     // the layer count changes. Coded by Claude (AI).
     if FLayers[LayerCnt].ChunkEligible() then
-      LayerCost := LayerCost / FSchedCpuCount;
+      LayerCost := LayerCost / SchedThreadBudget();
     CritCost[LayerCnt] := 0;
     DepHigh := High(FSchedDeps[LayerCnt]);
     for DepCnt := 0 to DepHigh do
@@ -122680,8 +122720,7 @@ begin
   // callers only choose serial vs parallel. ComputeSerial does the inverse.
   EnableIntraLayerThreading(true);
   BuildInferencePlan();
-  if FSchedCpuCount = 0 then FSchedCpuCount := NeuralDefaultThreadCount();
-  ThreadCount := Min(FSchedMaxWidth, FSchedCpuCount);
+  ThreadCount := Min(FSchedMaxWidth, SchedThreadBudget());
   // Serial fallback: straight-line graphs gain nothing from the scheduler,
   // anomaly detection needs the in-order CheckForwardAnomaly report, and
   // graphs whose Amdahl bound (parallel work / critical-path work) is below
@@ -122755,7 +122794,7 @@ begin
   // Ensure/refresh the worker pool and (re)apply the stored hot-worker config.
   // Replaying it each pass keeps the pool alive and configured; the defaults
   // (FHotThreadWorkers=1) reproduce the classic single-hot-worker policy.
-  // StartThreadWorkers sizes the pool to Min(FSchedMaxWidth, FSchedCpuCount) =
+  // StartThreadWorkers sizes the pool to Min(FSchedMaxWidth, thread budget) =
   // ThreadCount = FSchedThreadCount, so pool.Count stays consistent with the
   // per-pass chunk accounting. Coded by Claude (AI).
   StartThreadWorkers(FHotStopOnFinish, FHotThreadWorkers, FHotThreadTimeout);

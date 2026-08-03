@@ -141,6 +141,10 @@ type
                                  // The parallel path also enables intra-layer
                                  // threading (big conv/linear layers split
                                  // across the pool); --serial disables both.
+    MaxThreads: integer;         // cap on scheduler worker threads
+                                 // (TNNet.MaxThreadNum); 0 = all CPU threads.
+                                 // The pool is Min(MaxThreads, cpu count), and
+                                 // per-layer chunk counts follow it
     NoFusedAttn: boolean;        // --no-fused-attn: build per-head attention
                                  // (SplitChannels/SDPA/DeepConcat) instead of
                                  // the fused TNNetFusedSDPA layer. Bit-identical
@@ -332,6 +336,10 @@ begin
   WriteLn('                        forward across independent layers; the parallel');
   WriteLn('                        path also threads large conv/linear layers');
   WriteLn('                        internally, --serial runs fully single-threaded)');
+  WriteLn('  --max-threads N       cap the parallel forward at N worker threads');
+  WriteLn('                        (default: every CPU thread). Fewer threads can');
+  WriteLn('                        be faster when the GPU/OpenCL device is busy or');
+  WriteLn('                        the machine is shared; ignored with --serial');
   WriteLn('  --no-fused-attn       build per-head attention instead of the fused');
   WriteLn('                        multi-head layer (bit-identical; performance A/B)');
   WriteLn('  --selftest            run the offline unit checks and exit');
@@ -370,6 +378,7 @@ begin
   Result.KVInt8 := false;    // resolved after parsing: follows the weight mode
   Result.KVInt8Set := false; // unless --kv-int8/--kv-fp32 picked explicitly
   Result.Serial := false; // parallel layer-graph forward by default (--serial)
+  Result.MaxThreads := 0; // 0 = every CPU thread (--max-threads N caps it)
   Result.NoFusedAttn := false; // fused multi-head attention on by default
   // OpenCL offload defaults ON when the binary is built with -dOpenCL (the
   // default compilation), OFF otherwise; --cpu forces CPU either way.
@@ -458,6 +467,16 @@ begin
       Opt.KVInt8Set := true;
     end
     else if Arg = '--serial' then Opt.Serial := true
+    else if Arg = '--max-threads' then
+    begin
+      if not NextInt(Arg, IVal) then exit(false);
+      if IVal < 1 then
+      begin
+        Opt.ErrorMsg := '--max-threads: must be at least 1';
+        exit(false);
+      end;
+      Opt.MaxThreads := IVal;
+    end
     else if Arg = '--no-fused-attn' then Opt.NoFusedAttn := true
     else if Arg = '--gpu' then Opt.Gpu := true
     else if Arg = '--cpu' then Opt.Gpu := false
@@ -1115,6 +1134,10 @@ begin
   // conv/linear layers above the MinWork threshold split across the pool via
   // worker 0), ComputeSerial runs fully single-threaded. No separate flag.
   Session.Parallel := not Opt.Serial;
+  // --max-threads: cap the scheduler pool (and with it the per-layer chunk
+  // count). Set BEFORE StartThreadWorkers so the pool is created at the capped
+  // size instead of being built wide and resized on the next pass.
+  if Opt.MaxThreads > 0 then NN.MaxThreadNum := Opt.MaxThreads;
   // Keep the scheduler's worker pool alive and HOT between decode steps (default
   // policy: ~50% of the pool hot, worker 0 always) so each token's parallel
   // forward reaches the workers without re-warming the pool every step.
@@ -1154,8 +1177,13 @@ begin
   if Opt.Serial then
     Notice('[serial layer loop (--serial) - fully single-threaded]')
   else
+  begin
     Notice('[layer-graph parallel forward (default) - independent layers and' +
       ' large conv/linear layers threaded; pass --serial for the serial loop]');
+    if Opt.MaxThreads > 0 then
+      Notice(Format('[--max-threads %d - worker pool capped at %d thread(s)]',
+        [Opt.MaxThreads, Opt.MaxThreads]));
+  end;
 
   // Sampling defaults: explicit flag > the model's generation_config.json >
   // built-in fallback (top-p 0.2 + repetition-penalty 1.05); --greedy

@@ -353,6 +353,24 @@ begin
     Args.Add('--serial');
     Check(ParseArgs(Args, Opt) and Opt.Serial, '--serial parses');
 
+    // --max-threads: 0 (every CPU thread) by default, at least 1 when given.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and (Opt.MaxThreads = 0),
+      'max threads unset by default (all CPU threads)');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--max-threads'); Args.Add('4');
+    Check(ParseArgs(Args, Opt) and (Opt.MaxThreads = 4), '--max-threads parses');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--max-threads'); Args.Add('0');
+    Check(not ParseArgs(Args, Opt), '--max-threads 0 rejected');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--max-threads');
+    Check(not ParseArgs(Args, Opt), '--max-threads without a value rejected');
+
     // Fused attention on by default; --no-fused-attn opts out (perf A/B).
     Args.Clear;
     Args.Add('/tmp/model');
