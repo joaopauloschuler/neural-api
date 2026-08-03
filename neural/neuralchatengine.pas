@@ -196,6 +196,17 @@ type
     // the end of each turn and resuming from it next turn is exact. TurnSnap
     // is owned; TurnSnapPos is the number of tokens fed into the session when
     // it was captured (= Length(CachedTokens) at capture time).
+    // MEMORY. The snapshot deep-copies the WHOLE K/V buffers, which are
+    // allocated at the full context length, not at the live cache length - so
+    // holding one costs exactly a second copy of the KV cache:
+    //   2 (K+V) * FullAttentionLayers * Ctx * KVHeads * HeadDim * 4 bytes
+    // plus the recurrent state, which is small and context-INDEPENDENT
+    // (measured on tiny_qwen3_5: 16 kB across 12 recurrent layers, flat from
+    // ctx 4k to 32k, while the KV half tracked the formula exactly at 512 kB
+    // / 2 MB / 4 MB). Only full-attention layers contribute, so a hybrid pays
+    // for the fraction of its stack that is attention (2 of 8 layers here).
+    // --no-cache-reuse is the escape hatch: it turns the reuse off and the
+    // snapshot is then never captured.
     StateReuseOK: boolean;       // snapshot resume sound for this architecture?
     TurnSnap: TNNetDecoderSessionSnapshot;  // owned; nil when none is held
     TurnSnapPos: integer;        // tokens fed into the session at capture
