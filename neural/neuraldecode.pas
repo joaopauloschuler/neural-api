@@ -1101,12 +1101,17 @@ type
   // state h, step count) pair per collected SSM layer - i.e. the FULL live state
   // a StepForward reads, including any eviction policy armed on the source
   // session. RoPE PositionOffset is NOT stored (it is set per-StepForward from
-  // the caller's AbsPos, not session state).
+  // the caller's AbsPos, not session state). A layer running the int8 KV cache
+  // contributes its quantized code/scale planes in place of the FP32 K/V
+  // volumes; the destination session must run the same cache mode.
   //
   // CORRECTNESS. Restoring a snapshot and continuing is BIT-IDENTICAL to a fresh
   // prefill of the whole prefix followed by the same continuation (the cache
   // buffers are byte-copied and the live length is restored, so the next token
-  // appends at exactly the same slot it would in the unforked session). The
+  // appends at exactly the same slot it would in the unforked session). That
+  // holds for the int8 cache too: the codes are copied verbatim rather than
+  // requantized, so the fork adds no error on top of the int8 cache's own
+  // lossiness vs FP32. The
   // shape contract is the source and destination sessions wrap the SAME
   // architecture at the SAME MaxCacheLen (the natural case: one twin built once,
   // or two twins CopyWeights'd from the same trained net). Disk persistence of a
@@ -1116,6 +1121,12 @@ type
   private
     FK: array of TNNetVolume;        // per-attention-layer cached keys (deep copy)
     FV: array of TNNetVolume;        // per-attention-layer cached values
+    // int8 KV cache: the live storage is the quantized code/scale planes, so
+    // those are captured instead and the FP32 pair above is left nil for that
+    // layer. FInt8[i] selects which pair holds layer i's cache.
+    FKQ: array of TNNetVolumeQuant8; // per-attention-layer cached keys (int8)
+    FVQ: array of TNNetVolumeQuant8; // per-attention-layer cached values (int8)
+    FInt8: array of boolean;         // per-attention-layer cache mode at capture
     FLen: array of integer;          // per-attention-layer live cache length
     FSinks: array of integer;        // per-attention-layer eviction sink count
     FWindow: array of integer;       // per-attention-layer eviction window
@@ -5515,8 +5526,15 @@ begin
   for i := 0 to HiK do FK[i].Free;
   for i := 0 to HiV do FV[i].Free;
   for i := 0 to HiH do FH[i].Free;
+  // Only one of the FP32 / int8 pairs is populated per layer; the other holds
+  // nil, and Free on nil is a no-op.
+  for i := 0 to High(FKQ) do FKQ[i].Free;
+  for i := 0 to High(FVQ) do FVQ[i].Free;
   SetLength(FK, 0);
   SetLength(FV, 0);
+  SetLength(FKQ, 0);
+  SetLength(FVQ, 0);
+  SetLength(FInt8, 0);
   SetLength(FH, 0);
   inherited Destroy();
 end;
@@ -5745,16 +5763,33 @@ begin
   Result := TNNetDecoderSessionSnapshot.Create();
   SetLength(Result.FK, Length(FSDPAs));
   SetLength(Result.FV, Length(FSDPAs));
+  SetLength(Result.FKQ, Length(FSDPAs));
+  SetLength(Result.FVQ, Length(FSDPAs));
+  SetLength(Result.FInt8, Length(FSDPAs));
   SetLength(Result.FLen, Length(FSDPAs));
   SetLength(Result.FSinks, Length(FSDPAs));
   SetLength(Result.FWindow, Length(FSDPAs));
   HiSDPA := High(FSDPAs);
   for i := 0 to HiSDPA do
   begin
-    Result.FK[i] := TNNetVolume.Create();
-    Result.FV[i] := TNNetVolume.Create();
-    FSDPAs[i].CaptureCacheState(Result.FK[i], Result.FV[i],
-      Result.FLen[i], Result.FSinks[i], Result.FWindow[i]);
+    // Capture whichever storage is live: the int8 cache keeps its codes and
+    // per-row scales, the FP32 cache its volumes. Only one pair is allocated
+    // per layer.
+    Result.FInt8[i] := FSDPAs[i].Int8KVCache;
+    if Result.FInt8[i] then
+    begin
+      Result.FKQ[i] := TNNetVolumeQuant8.Create();
+      Result.FVQ[i] := TNNetVolumeQuant8.Create();
+      FSDPAs[i].CaptureCacheStateInt8(Result.FKQ[i], Result.FVQ[i],
+        Result.FLen[i], Result.FSinks[i], Result.FWindow[i]);
+    end
+    else
+    begin
+      Result.FK[i] := TNNetVolume.Create();
+      Result.FV[i] := TNNetVolume.Create();
+      FSDPAs[i].CaptureCacheState(Result.FK[i], Result.FV[i],
+        Result.FLen[i], Result.FSinks[i], Result.FWindow[i]);
+    end;
   end;
   SetLength(Result.FH, Length(FSSMs));
   SetLength(Result.FSteps, Length(FSSMs));
@@ -5784,9 +5819,25 @@ begin
   end;
   HiSDPA := High(FSDPAs);
   HiSSM := High(FSSMs);
+  // The snapshot holds whichever storage was live when it was taken, so the
+  // destination layer must be in the SAME cache mode - restoring int8 codes
+  // into an FP32 cache (or the reverse) would install the wrong storage while
+  // leaving the other stale. The mode is fixed when the session is built, so
+  // a mismatch means the snapshot came from a differently-configured session.
   for i := 0 to HiSDPA do
-    FSDPAs[i].RestoreCacheState(Snap.FK[i], Snap.FV[i],
-      Snap.FLen[i], Snap.FSinks[i], Snap.FWindow[i]);
+    if Snap.FInt8[i] <> FSDPAs[i].Int8KVCache then
+      raise Exception.Create('TNNetStreamingDecoder.RestoreSnapshot: attention ' +
+        'layer ' + IntToStr(i) + ' was captured with the ' +
+        BoolToStr(Snap.FInt8[i], 'int8', 'FP32') + ' KV cache but this session ' +
+        'runs the ' + BoolToStr(FSDPAs[i].Int8KVCache, 'int8', 'FP32') +
+        ' cache (mismatched session configuration).');
+  for i := 0 to HiSDPA do
+    if Snap.FInt8[i] then
+      FSDPAs[i].RestoreCacheStateInt8(Snap.FKQ[i], Snap.FVQ[i],
+        Snap.FLen[i], Snap.FSinks[i], Snap.FWindow[i])
+    else
+      FSDPAs[i].RestoreCacheState(Snap.FK[i], Snap.FV[i],
+        Snap.FLen[i], Snap.FSinks[i], Snap.FWindow[i]);
   for i := 0 to HiSSM do
     StateRestore(FSSMs[i], Snap.FH[i], Snap.FSteps[i]);
 end;

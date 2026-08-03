@@ -212,6 +212,8 @@ type
     procedure TestStreamingDecoderForkContinuationBitIdenticalSSM;
     procedure TestStreamingDecoderForkContinuationBitIdenticalQwen35Hybrid;
     procedure TestStreamingDecoderRepeatedTurnResumeBitIdenticalQwen35Hybrid;
+    procedure TestStreamingDecoderForkContinuationBitIdenticalInt8KV;
+    procedure TestStreamingDecoderRestoreRejectsMismatchedKVCacheMode;
     procedure TestStreamingDecoderSnapshotForksManyIndependentSessions;
     // StreamingLLM KV-cache eviction (attention sinks + rolling window).
     procedure TestStreamingEvictionWithinWindowBitIdenticalToUnbounded;
@@ -3664,6 +3666,122 @@ begin
     Snap.Free;
     TurnSession.Free;
     RefSession.Free;
+    StepIn.Free;
+    Twin.Free;
+  end;
+end;
+
+// The fork gate for a session running the INT8 KV cache. The live storage is
+// then the quantized code/scale planes, so the snapshot captures those instead
+// of the FP32 volumes. The codes are copied verbatim rather than requantized,
+// so the fork is exact (tolerance 0) against an int8 session that never
+// forked - the int8 cache's own lossiness vs FP32 is a separate matter,
+// covered by TestStreamingEvictionInt8MatchesFP32WithinTolerance.
+procedure TTestNeuralDecode.TestStreamingDecoderForkContinuationBitIdenticalInt8KV;
+const
+  PromptLen = 4;
+  TotalLen  = 9;
+  Toks: array[0..8] of integer = (6, 2, 10, 5, 1, 8, 4, 11, 3);
+var
+  Twin: TNNet;
+  RefSession, ForkSession: TNNetStreamingDecoder;
+  Snap: TNNetDecoderSessionSnapshot;
+  StepIn: TNNetVolume;
+  RefOut: array[PromptLen..TotalLen - 1] of array of TNeuralFloat;
+  T, D: integer;
+begin
+  RandSeed := 424242;
+  Twin := BuildTinyQwen35HybridLM(1);
+  RefSession := nil; ForkSession := nil; Snap := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    RefSession := TNNetStreamingDecoder.Create(Twin, TotalLen, {pInt8KV=}true);
+    RefSession.Reset();
+    for T := 0 to TotalLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      RefSession.StepForward(StepIn, T);
+      if T >= PromptLen then
+      begin
+        SetLength(RefOut[T], RefSession.Output().Size);
+        for D := 0 to RefSession.Output().Size - 1 do
+          RefOut[T][D] := RefSession.Output().FData[D];
+      end;
+    end;
+    RefSession.Free; RefSession := nil;
+
+    ForkSession := TNNetStreamingDecoder.Create(Twin, TotalLen, {pInt8KV=}true);
+    ForkSession.Reset();
+    for T := 0 to PromptLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      ForkSession.StepForward(StepIn, T);
+    end;
+    Snap := ForkSession.Snapshot();
+    ForkSession.Free; ForkSession := nil;
+
+    ForkSession := TNNetStreamingDecoder.Create(Twin, TotalLen, {pInt8KV=}true);
+    ForkSession.Reset();
+    ForkSession.RestoreSnapshot(Snap);
+    for T := PromptLen to TotalLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      ForkSession.StepForward(StepIn, T);
+      for D := 0 to ForkSession.Output().Size - 1 do
+        AssertTrue('int8 KV fork BIT-IDENTICAL pos ' + IntToStr(T) + ' dim ' +
+          IntToStr(D), RefOut[T][D] = ForkSession.Output().FData[D]);
+    end;
+  finally
+    Snap.Free;
+    ForkSession.Free;
+    RefSession.Free;
+    StepIn.Free;
+    Twin.Free;
+  end;
+end;
+
+// A snapshot carries the cache MODE it was captured in. Restoring an FP32
+// capture into an int8 session (or the reverse) would install storage the
+// layer does not read while leaving the live storage stale - silently wrong
+// output, not an error - so RestoreSnapshot rejects the mismatch up front.
+procedure TTestNeuralDecode.TestStreamingDecoderRestoreRejectsMismatchedKVCacheMode;
+const
+  TotalLen = 6;
+var
+  Twin: TNNet;
+  FP32Session, Int8Session: TNNetStreamingDecoder;
+  Snap: TNNetDecoderSessionSnapshot;
+  StepIn: TNNetVolume;
+  T: integer;
+  Raised: boolean;
+begin
+  RandSeed := 424242;
+  Twin := BuildTinyQwen35HybridLM(1);
+  FP32Session := nil; Int8Session := nil; Snap := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    FP32Session := TNNetStreamingDecoder.Create(Twin, TotalLen, {pInt8KV=}false);
+    FP32Session.Reset();
+    for T := 0 to 2 do
+    begin
+      StepIn.FData[0] := T + 1;
+      FP32Session.StepForward(StepIn, T);
+    end;
+    Snap := FP32Session.Snapshot();
+
+    Int8Session := TNNetStreamingDecoder.Create(Twin, TotalLen, {pInt8KV=}true);
+    Int8Session.Reset();
+    Raised := false;
+    try
+      Int8Session.RestoreSnapshot(Snap);
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('FP32 snapshot into an int8 session is rejected', Raised);
+  finally
+    Snap.Free;
+    Int8Session.Free;
+    FP32Session.Free;
     StepIn.Free;
     Twin.Free;
   end;

@@ -4159,6 +4159,18 @@ type
       out Len, Sinks, Window: integer);
     procedure RestoreCacheState(SrcK, SrcV: TNNetVolume;
       Len, Sinks, Window: integer);
+    // Same fork, for a layer running the int8 KV cache: the live storage is
+    // then the quantized code/scale planes, not the FP32 volumes, so the pair
+    // above rejects the call and these carry the codes AND the per-row scales
+    // instead. Copying the codes verbatim keeps the fork EXACT - resuming
+    // reads back the same codes the unforked layer would have, so no second
+    // quantization step is applied and no extra error is introduced (the
+    // int8 cache's own lossiness vs FP32 is unchanged, see EnableInt8KV).
+    // Coded by Claude (AI).
+    procedure CaptureCacheStateInt8(DstK, DstV: TNNetVolumeQuant8;
+      out Len, Sinks, Window: integer);
+    procedure RestoreCacheStateInt8(SrcK, SrcV: TNNetVolumeQuant8;
+      Len, Sinks, Window: integer);
     // FlashAttention-style tiled online-softmax forward (opt-in, FORWARD-ONLY).
     // OFF by default: the naive full-score forward runs and is bit-identical to
     // before. EnableTiledForward(TileBc) switches the prefill Compute() to the
@@ -31666,6 +31678,58 @@ begin
   end;
   FKCache.Copy(SrcK);
   FVCache.Copy(SrcV);
+  FCacheLen := Len;
+  FEvictSinks := Sinks;
+  FEvictWindow := Window;
+end;
+
+procedure TNNetScaledDotProductAttention.CaptureCacheStateInt8(
+  DstK, DstV: TNNetVolumeQuant8; out Len, Sinks, Window: integer);
+begin
+  Len := 0; Sinks := 0; Window := 0;
+  if not FCacheEnabled then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.CaptureCacheStateInt8 requires ' +
+      'the cached path. Call BeginIncrementalDecode first.');
+    exit;
+  end;
+  if not FKVQuantInt8 then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.CaptureCacheStateInt8 requires ' +
+      'the int8 KV cache. Use CaptureCacheState for the FP32 cache.');
+    exit;
+  end;
+  DstK.CopyFrom(FKCacheQ);   // codes AND per-row scales
+  DstV.CopyFrom(FVCacheQ);
+  Len := FCacheLen;
+  Sinks := FEvictSinks;
+  Window := FEvictWindow;
+end;
+
+procedure TNNetScaledDotProductAttention.RestoreCacheStateInt8(
+  SrcK, SrcV: TNNetVolumeQuant8; Len, Sinks, Window: integer);
+begin
+  if not FCacheEnabled then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.RestoreCacheStateInt8 requires ' +
+      'the cached path. Call BeginIncrementalDecode first.');
+    exit;
+  end;
+  if not FKVQuantInt8 then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.RestoreCacheStateInt8 requires ' +
+      'the int8 KV cache. Use RestoreCacheState for the FP32 cache.');
+    exit;
+  end;
+  if (Len < 0) or (Len > FCacheMax) then
+  begin
+    FErrorProc('TNNetScaledDotProductAttention.RestoreCacheStateInt8: snapshot ' +
+      'length ' + IntToStr(Len) + ' exceeds this session''s MaxContext (' +
+      IntToStr(FCacheMax) + ').');
+    exit;
+  end;
+  FKCacheQ.CopyFrom(SrcK);
+  FVCacheQ.CopyFrom(SrcV);
   FCacheLen := Len;
   FEvictSinks := Sinks;
   FEvictWindow := Window;

@@ -206,7 +206,9 @@ type
     // / 2 MB / 4 MB). Only full-attention layers contribute, so a hybrid pays
     // for the fraction of its stack that is attention (2 of 8 layers here).
     // --no-cache-reuse is the escape hatch: it turns the reuse off and the
-    // snapshot is then never captured.
+    // snapshot is then never captured. Under --kv-int8 the captured cache is
+    // the quantized code/scale planes, so the copy costs about a quarter of
+    // the FP32 figure - the same ratio the live cache saves.
     StateReuseOK: boolean;       // snapshot resume sound for this architecture?
     TurnSnap: TNNetDecoderSessionSnapshot;  // owned; nil when none is held
     TurnSnapPos: integer;        // tokens fed into the session at capture
@@ -1125,13 +1127,10 @@ begin
   // recurrent state to carry, so position truncation is unavailable, but the
   // full session state (attention K/V AND recurrent h) can be captured and
   // resumed exactly at a turn boundary.
-  // NOT with an int8 KV cache: CaptureCacheState rejects the quantized cache
-  // (it is FP32-only) through FErrorProc, which PRINTS and returns rather
-  // than raising - the snapshot would come back with empty K/V volumes and
-  // the next restore would quietly corrupt the session. Since KVInt8 follows
-  // the weight mode by default, this is the common int8 path, so it has to be
-  // an explicit gate and not an accident.
-  StateReuseOK := (Session.SSMCount > 0) and not Opt.KVInt8;
+  // The int8 KV cache is carried too: the snapshot stores the quantized
+  // code/scale planes for a layer running it, so reuse does not depend on the
+  // cache mode.
+  StateReuseOK := Session.SSMCount > 0;
   FreeAndNil(TurnSnap);
   TurnSnapPos := 0;
   SetLength(CachedTokens, 0);
@@ -1150,9 +1149,6 @@ begin
   else if StateReuseOK then
     Notice('[turn-boundary state reuse ON (recurrent/SSM state resumed from a' +
       ' snapshot) - only the new prompt tail is prefilled each turn]')
-  else if (Session.SSMCount > 0) and Opt.KVInt8 then
-    Notice('[turn-boundary state reuse OFF - the snapshot cannot capture an' +
-      ' int8 KV cache; --kv-fp32 turns reuse on at ~4x the KV RAM]')
   else
     Notice('[cache reuse N/A for this architecture - full re-prefill each turn]');
   if Opt.Serial then
