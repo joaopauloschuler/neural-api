@@ -1309,8 +1309,8 @@ begin
   clSetKernelArg(kernel, arg_index, csCLMemSize, @Result);
 end;
 
-function TEasyOpenCLV.EnsureBuffer(var buf: cl_mem; var capBytes: PtrUInt;
-  flags: cl_mem_flags; neededBytes: PtrUInt): cl_mem;
+function TEasyOpenCLV.EnsureBuffer(var buf: cl_mem; var capBytes: {$IFDEF FPC}PtrUInt{$ELSE}UIntPtr{$ENDIF};
+  flags: cl_mem_flags; neededBytes: {$IFDEF FPC}PtrUInt{$ELSE}UIntPtr{$ENDIF}): cl_mem;
 begin
   // Grow only: reuse the existing allocation whenever it is large enough (a
   // buffer bigger than needed is harmless - WriteBuffer/ReadBuffer move exactly

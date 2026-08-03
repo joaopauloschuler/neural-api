@@ -462,7 +462,11 @@ function RemoveRandomChars(const Str: string; Count: integer): string;
 // This function randomly removes one word from the input string.
 function RemoveRandomWord(const Str: string): string;
 
+{$IFDEF FPC}
 type TNNetAAInteger = array of array of integer;
+{$ELSE}
+type TNNetAAInteger = array of TNeuralIntegerArray;
+{$ENDIF}
 
 procedure FilterCSVWithNumbersUpToMax(inputFile,outputFile: string;
   MaxInteger: integer; MaxRows: integer = 0);
@@ -1496,7 +1500,11 @@ function TNNetSequencePacker.PredictableTargetCount(WindowIdx: integer): integer
 var
   Pos: integer;
   ContextM2: integer;
+  {$IFDEF FPC}
   Win: array of integer;
+  {$ELSE}
+  Win: TNeuralIntegerArray;
+  {$ENDIF}
 begin
   RequirePacked();
   Result := 0;
@@ -1528,7 +1536,11 @@ var
   Pos, Token: integer;
   ContextM1, ContextM2, InputDepth: integer;
   IsIdInput: boolean;
+  {$IFDEF FPC}
   Win: array of integer;
+  {$ELSE}
+  Win: TNeuralIntegerArray;
+  {$ENDIF}
 begin
   RequirePacked();
   if pInput.SizeX <> FContextLen then
@@ -1568,7 +1580,11 @@ var
   Pos: integer;
   ContextM1, DepthM1, DesBase, ActBase, CopyBytes: integer;
   DesStride, ActStride: integer;
+  {$IFDEF FPC}
   Win: array of integer;
+  {$ELSE}
+  Win: TNeuralIntegerArray;
+  {$ENDIF}
 begin
   RequirePacked();
   ContextM1 := FContextLen - 1;
