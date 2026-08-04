@@ -13535,17 +13535,27 @@ type
       // scaled the expert input, the mixture combines the slots with weight 1.
       FUnitCombine: boolean;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
-      // The by-token gate-weighted mixture over the TOKEN slice
-      // [StartToken..FinToken]. The quantized variant streams FQuantTable's
-      // codes per down row with DotProductInt8; there is no inherited int8
-      // forward here either (see the gate|up bank).
-      procedure ComputeMixture(StartToken, FinToken: integer);
-      procedure ComputeMixtureQuantizedInt8(StartToken, FinToken: integer);
-      // Chunked forward over the TOKEN axis: a token's output row is written by
-      // exactly one chunk, which sums over that token's own slots, so disjoint
-      // token slices touch disjoint memory. The gate|up bank's slot map is
-      // finished before this layer is even enqueued (it is the previous layer),
-      // so every chunk reads pass-stable routing.
+      // The gate-weighted mixture over the work-item slice [StartRange..
+      // FinRange] of the (token x hidden-row-block) index space, NBlocks blocks
+      // per token, token-major. NBlocks = 1 makes an item a whole token, which
+      // is the serial Compute() case. The quantized variant streams
+      // FQuantTable's codes per down row with DotProductInt8; there is no
+      // inherited int8 forward here either (see the gate|up bank).
+      procedure ComputeMixture(StartRange, FinRange, NBlocks: integer);
+      procedure ComputeMixtureQuantizedInt8(StartRange, FinRange,
+        NBlocks: integer);
+      // Hidden-row blocks per token on the chunk path. Must be deterministic
+      // within a pass: ChunkWorkCount sizes the index space with it and every
+      // dispatched chunk decomposes its own item indices with it, so the two
+      // disagreeing would misroute rows.
+      function ChunkBlockCount(): integer;
+      // Chunked forward over the (token x hidden-row-block) axis: each output
+      // element FOutput[token, h] is summed by exactly one work item over that
+      // token's own slots, so disjoint items touch disjoint memory. Splitting
+      // hidden rows as well as tokens is what keeps the layer parallel at
+      // decode, where the token axis is one wide. The gate|up bank's slot map
+      // is finished before this layer is even enqueued (it is the previous
+      // layer), so every chunk reads pass-stable routing.
       procedure ComputeRange(StartRange, FinRange: integer); override;
       procedure PrepareChunkedForward(); override;
     public
@@ -98251,9 +98261,10 @@ begin
   if High(FArrNeurons) < MaxNeuronPos then BuildArrNeurons();
   // Quantized weights: QuantizeWeightsInt8 released the per-neuron FP32 rows,
   // so the FP32 nest would read shrunk storage.
+  // One work item per token: the serial pass has no reason to split rows.
   if FQuantInt8
-    then ComputeMixtureQuantizedInt8(0, FTokenCnt - 1)
-    else ComputeMixture(0, FTokenCnt - 1);
+    then ComputeMixtureQuantizedInt8(0, FTokenCnt - 1, 1)
+    else ComputeMixture(0, FTokenCnt - 1, 1);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -98266,36 +98277,51 @@ begin
 end;
 
 procedure TNNetMoEExpertBankDown.ComputeRange(StartRange, FinRange: integer);
+var
+  NBlocks: integer;
 begin
   if FBank = nil then exit;
+  NBlocks := ChunkBlockCount();
   if FQuantInt8
-    then ComputeMixtureQuantizedInt8(StartRange, FinRange)
-    else ComputeMixture(StartRange, FinRange);
+    then ComputeMixtureQuantizedInt8(StartRange, FinRange, NBlocks)
+    else ComputeMixture(StartRange, FinRange, NBlocks);
 end;
 
 // Frozen chunk-eligibility (see TNNetLayerThreading.ChunkEligible): a pure
 // function of the owning net's switch and of sizes fixed at SetPrevLayer. The
 // work proxy is the MAC count of a full pass, TokenCnt * TopK * HiddenSize *
-// ExpertWidth. A single-token decode step is left serial: it owns one output
-// row, so the token axis has nothing to split. Coded by Claude (AI).
+// ExpertWidth. Coded by Claude (AI).
 function TNNetMoEExpertBankDown.ChunkEligible(): boolean;
 begin
   Result := (FBank <> nil) and (FNN <> nil) and FNN.FIntraLayerThreading
     and (not WillOpenCL())
-    and (FTokenCnt > 1)
     and (FOutput.Size * FTopK * FVectorSize >= 256*256)
     ;
 end;
 
-function TNNetMoEExpertBankDown.ChunkWorkCount(): integer;
+// Rows per block are (FHiddenSize + Result - 1) div Result in every caller.
+// The row target below only has to be small enough that a single-token decode
+// step still outnumbers the worker pool; the scheduler collapses the index
+// space into Min(threads, WorkCount) contiguous chunks anyway, so a finer split
+// costs one div/mod per item and nothing else. Coded by Claude (AI).
+function TNNetMoEExpertBankDown.ChunkBlockCount(): integer;
+const
+  csChunkRows = 64;
 begin
-  Result := FTokenCnt;
+  Result := (FHiddenSize + csChunkRows - 1) div csChunkRows;
+  if Result < 1 then Result := 1;
 end;
 
-procedure TNNetMoEExpertBankDown.ComputeMixture(StartToken, FinToken: integer);
+function TNNetMoEExpertBankDown.ChunkWorkCount(): integer;
+begin
+  Result := FTokenCnt * ChunkBlockCount();
+end;
+
+procedure TNNetMoEExpertBankDown.ComputeMixture(StartRange, FinRange,
+  NBlocks: integer);
 var
-  TokenIdx, SlotIdx, HiddenIdx, ExpertIdx: integer;
-  MaxSlotPos, MaxHiddenPos: integer;
+  ItemIdx, TokenIdx, SlotIdx, HiddenIdx, ExpertIdx: integer;
+  MaxSlotPos, MaxHiddenPos, StartHidden, FinHidden, RowsPerBlock: integer;
   PairBase, OutBase, RowBase: integer;
   GateWeight: TNeuralFloat;
   HidPtr: TNeuralFloatArrPtr;
@@ -98304,12 +98330,30 @@ var
 begin
   HidVol := FPrevLayer.FOutput;
   MaxHiddenPos := FHiddenSize - 1;
-  // By token (each output row is written by exactly one token), summing that
-  // token's own slots - the routing decision the gate|up bank already made.
-  for TokenIdx := StartToken to FinToken do
+  RowsPerBlock := (FHiddenSize + NBlocks - 1) div NBlocks;
+  // By (token, hidden-row block): every output element belongs to exactly one
+  // item, summed over that token's own slots - the routing decision the gate|up
+  // bank already made.
+  for ItemIdx := StartRange to FinRange do
   begin
+    if NBlocks = 1 then
+    begin
+      TokenIdx := ItemIdx;
+      StartHidden := 0;
+      FinHidden := MaxHiddenPos;
+    end
+    else
+    begin
+      TokenIdx := ItemIdx div NBlocks;
+      StartHidden := (ItemIdx mod NBlocks) * RowsPerBlock;
+      // A rounded-up block size can push the last blocks past the final row.
+      if StartHidden > MaxHiddenPos then continue;
+      FinHidden := StartHidden + RowsPerBlock - 1;
+      if FinHidden > MaxHiddenPos then FinHidden := MaxHiddenPos;
+    end;
     OutBase := TokenIdx * FHiddenSize;
-    FillChar(FOutput.FData[OutBase], FHiddenSize * csNeuralFloatSize, 0);
+    FillChar(FOutput.FData[OutBase + StartHidden],
+      (FinHidden - StartHidden + 1) * csNeuralFloatSize, 0);
     PairBase := TokenIdx * FTopK;
     MaxSlotPos := FBank.FSlotCount[TokenIdx] - 1;
     for SlotIdx := 0 to MaxSlotPos do
@@ -98321,7 +98365,7 @@ begin
       else GateWeight := FBank.FSlotGate[PairBase + SlotIdx];
       HidPtr := HidVol.GetRawPtr((PairBase + SlotIdx) * FExpertWidth);
       RowBase := ExpertIdx * FHiddenSize;
-      for HiddenIdx := 0 to MaxHiddenPos do
+      for HiddenIdx := StartHidden to FinHidden do
       begin
         DownNeuron := FArrNeurons[RowBase + HiddenIdx];
         FOutput.FData[OutBase + HiddenIdx] :=
@@ -98336,11 +98380,11 @@ end;
 // int8 twin of ComputeMixture: DotProductInt8 streams the down row's codes
 // straight against the gate|up bank's FP32 slot hidden state, with the per-row
 // scale applied once to the raw code sum. Coded by Claude (AI).
-procedure TNNetMoEExpertBankDown.ComputeMixtureQuantizedInt8(StartToken,
-  FinToken: integer);
+procedure TNNetMoEExpertBankDown.ComputeMixtureQuantizedInt8(StartRange,
+  FinRange, NBlocks: integer);
 var
-  TokenIdx, SlotIdx, HiddenIdx, ExpertIdx: integer;
-  MaxSlotPos, MaxHiddenPos: integer;
+  ItemIdx, TokenIdx, SlotIdx, HiddenIdx, ExpertIdx: integer;
+  MaxSlotPos, MaxHiddenPos, StartHidden, FinHidden, RowsPerBlock: integer;
   PairBase, OutBase, RowBase, CodeBase, VS: integer;
   GateWeight: TNeuralFloat;
   HidPtr: TNeuralFloatArrPtr;
@@ -98353,10 +98397,27 @@ begin
   VS := FQuantVectorSize;
   HidVol := FPrevLayer.FOutput;
   MaxHiddenPos := FHiddenSize - 1;
-  for TokenIdx := StartToken to FinToken do
+  RowsPerBlock := (FHiddenSize + NBlocks - 1) div NBlocks;
+  for ItemIdx := StartRange to FinRange do
   begin
+    if NBlocks = 1 then
+    begin
+      TokenIdx := ItemIdx;
+      StartHidden := 0;
+      FinHidden := MaxHiddenPos;
+    end
+    else
+    begin
+      TokenIdx := ItemIdx div NBlocks;
+      StartHidden := (ItemIdx mod NBlocks) * RowsPerBlock;
+      // See ComputeMixture.
+      if StartHidden > MaxHiddenPos then continue;
+      FinHidden := StartHidden + RowsPerBlock - 1;
+      if FinHidden > MaxHiddenPos then FinHidden := MaxHiddenPos;
+    end;
     OutBase := TokenIdx * FHiddenSize;
-    FillChar(FOutput.FData[OutBase], FHiddenSize * csNeuralFloatSize, 0);
+    FillChar(FOutput.FData[OutBase + StartHidden],
+      (FinHidden - StartHidden + 1) * csNeuralFloatSize, 0);
     PairBase := TokenIdx * FTopK;
     MaxSlotPos := FBank.FSlotCount[TokenIdx] - 1;
     for SlotIdx := 0 to MaxSlotPos do
@@ -98367,8 +98428,9 @@ begin
       else GateWeight := FBank.FSlotGate[PairBase + SlotIdx];
       HidPtr := HidVol.GetRawPtr((PairBase + SlotIdx) * FExpertWidth);
       RowBase := ExpertIdx * FHiddenSize;
-      CodeBase := RowBase * VS;        // #6: expert's first row code offset
-      for HiddenIdx := 0 to MaxHiddenPos do
+      // #6: code offset of the block's FIRST row, not the expert's first row.
+      CodeBase := (RowBase + StartHidden) * VS;
+      for HiddenIdx := StartHidden to FinHidden do
       begin
         FOutput.FData[OutBase + HiddenIdx] :=
           FOutput.FData[OutBase + HiddenIdx] +

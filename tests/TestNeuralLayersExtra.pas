@@ -190,6 +190,7 @@ type
     procedure TestMoEExpertBankChunkedParityDecode;
     procedure TestMoEExpertBankChunkedParityInt8MultiToken;
     procedure TestMoEExpertBankChunkedParityInt8Decode;
+    procedure TestMoEExpertBankChunkedParityRaggedRowBlocks;
     procedure TestMoEExpertBankChunkEligibility;
     // The point of the bank: the routed path's LAYER COUNT and ACTIVATION
     // FOOTPRINT are independent of the expert count.
@@ -8241,6 +8242,9 @@ end;
 procedure TTestNeuralLayersExtra.RunMoEBankChunkParity(TokenCnt, HiddenSize,
   ExpertCnt, ExpertWidth, TopCnt: integer; QuantizeBanks: boolean;
   const Msg: string);
+const
+  // Mirrors TNNetMoEExpertBankDown.ChunkBlockCount's csChunkRows.
+  csDownChunkRows = 64;
 var
   SerialNN, ChunkNN: TNNet;
   Input, SerialGateUp, SerialDown: TNNetVolume;
@@ -8272,11 +8276,14 @@ begin
     AssertTrue(Msg + ' - gate|up bank is chunk-eligible', ChkGateUp.ChunkEligible());
     AssertEquals(Msg + ' - gate|up chunks over experts', ExpertCnt,
       ChkGateUp.ChunkWorkCount());
-    AssertEquals(Msg + ' - down chunks over tokens', TokenCnt,
+    // The down bank splits (token x hidden-row block), csChunkRows rows per
+    // block, so it stays parallel at a single-token decode step.
+    AssertEquals(Msg + ' - down chunks over tokens x row blocks',
+      TokenCnt * ((HiddenSize + csDownChunkRows - 1) div csDownChunkRows),
       ChkDown.ChunkWorkCount());
-    // The down bank splits the token axis, so a single-token decode step has
-    // nothing to split and stays whole.
-    AssertEquals(Msg + ' - down bank chunk eligibility', TokenCnt > 1,
+    // Eligibility is the MAC-count crossover alone - no token-count floor.
+    AssertEquals(Msg + ' - down bank chunk eligibility',
+      TokenCnt * HiddenSize * TopCnt * ExpertWidth >= 256*256,
       ChkDown.ChunkEligible());
     ChunkNN.SetTrainable(False);
     ChunkNN.SchedulerMinGain := 0;
@@ -8313,8 +8320,10 @@ end;
 
 procedure TTestNeuralLayersExtra.TestMoEExpertBankChunkedParityDecode;
 begin
-  // Decode shape: one token, so only the gate|up bank chunks (over experts).
-  RunMoEBankChunkParity(1, 256, 8, 64, 2, false, 'chunked decode');
+  // Decode shape: one token. Hidden 512 puts the down bank past the MAC
+  // crossover at TokenCnt = 1, so its hidden-row axis is genuinely exercised -
+  // the token axis alone would leave it serial here.
+  RunMoEBankChunkParity(1, 512, 8, 64, 2, false, 'chunked decode');
 end;
 
 procedure TTestNeuralLayersExtra.TestMoEExpertBankChunkedParityInt8MultiToken;
@@ -8326,7 +8335,17 @@ end;
 
 procedure TTestNeuralLayersExtra.TestMoEExpertBankChunkedParityInt8Decode;
 begin
-  RunMoEBankChunkParity(1, 256, 8, 64, 2, true, 'chunked decode int8');
+  RunMoEBankChunkParity(1, 512, 8, 64, 2, true, 'chunked decode int8');
+end;
+
+// A hidden size that is not a multiple of the row-block size: the last block is
+// short, and the int8 body has to seed its code offset from the block's first
+// row rather than the expert's, which a whole-row split would never catch.
+procedure TTestNeuralLayersExtra.TestMoEExpertBankChunkedParityRaggedRowBlocks;
+begin
+  RunMoEBankChunkParity(1, 530, 8, 64, 2, false, 'chunked ragged rows');
+  RunMoEBankChunkParity(1, 530, 8, 64, 2, true, 'chunked ragged rows int8');
+  RunMoEBankChunkParity(3, 530, 8, 64, 2, true, 'chunked ragged rows int8 x3');
 end;
 
 procedure TTestNeuralLayersExtra.TestMoEExpertBankChunkEligibility;
