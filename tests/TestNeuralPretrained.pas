@@ -4971,10 +4971,10 @@ begin
 end;
 
 // Int8 structural + drift gates for the two FUSED 3-D expert-slab MoE
-// families (LoadGraniteMoEExperts). Their experts load per expert as
-// flat-slab row blocks, so an int8-armed build streams every expert row
-// straight into its int8 codes; these gates fail if that streaming leaves a
-// layer unquantized or holding FP32 rows.
+// families (LoadGraniteMoEExperts). Their experts load as flat-slab row
+// blocks of the block's two fused expert banks, so an int8-armed build
+// streams every expert row straight into its int8 codes; these gates fail if
+// that streaming leaves a layer unquantized or holding FP32 rows.
 // The DRIFT gates here are far looser than the 5e-2 every other family uses,
 // and deliberately so: the router is itself a quantized PointwiseConvLinear,
 // and at pico width (hidden 8, 3-4 experts) int8 noise readily flips a top-k
@@ -4998,8 +4998,10 @@ begin
     {pTrainable=}false, FixturePath('tiny_qwen3_5_moe_config.json'),
     {pQuantizeInt8=}true);
   try
-    // 4 blocks x (attention + router + 4 experts x 2 + shared gate/up/down/
-    // gate-logit) plus the LM head.
+    // 4 blocks x (attention 4 + router 1 + the two fused expert banks +
+    // shared gate/up/down/gate-logit 3) = 40, plus the LM head. The expert
+    // banks are TWO quantized layers per block whatever the expert count, so
+    // this no longer scales with num_experts.
     AssertInt8DriftPair('Qwen3.5-MoE', NNFP32, NNQ, 8, Config.VocabSize,
       {MinQuantLayers=}40, {MaxRelDrift=}5e-1, {TwoChannelInput=}false);
   finally
@@ -5022,9 +5024,11 @@ begin
     {pTrainable=}false, FixturePath('tiny_granitemoe_config.json'),
     {pQuantizeInt8=}true);
   try
-    // 2 blocks x (attention + router + 3 experts x 2) plus the tied head.
+    // 2 blocks x (attention 4 + router 1 + the two fused expert banks) = 14,
+    // plus the tied head. The expert banks are TWO quantized layers per block
+    // whatever the expert count, so this no longer scales with num_experts.
     AssertInt8DriftPair('granitemoe', NNFP32, NNQ, 8, Config.VocabSize,
-      {MinQuantLayers=}16, {MaxRelDrift=}3e-1, {TwoChannelInput=}false);
+      {MinQuantLayers=}15, {MaxRelDrift=}3e-1, {TwoChannelInput=}false);
   finally
     NNQ.Free;
     NNFP32.Free;
@@ -7948,6 +7952,7 @@ var
   NN: TNNet;
   Config: TLlamaConfig;
   LayerCnt, GateCnt, SoftMaxCnt, SwiGLUCnt, NormCnt: integer;
+  BankUpCnt, BankDownCnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildOlmoeFromSafeTensorsEx(FixturePath('tiny_olmoe.safetensors'),
@@ -7979,13 +7984,17 @@ begin
     AssertFalse('untied', Config.TieWordEmbeddings);
     AssertEquals('prefix', 'model.', Config.Prefix);
     // Structure: UNIFORM all-MoE - one router (TopKGate + its PER-TOKEN
-    // softmax) per block, one SwiGLU per expert per block (no dense MLP). The
-    // pre-norm block carries 4 TokenRMSNorm (input_layernorm, full-width
-    // q_norm, full-width k_norm, post_attention_layernorm) + final norm.
+    // softmax) per block and ONE PAIR OF FUSED EXPERT BANKS per block, which
+    // hold every expert's SwiGLU internally, so no TNNetSwiGLU layer survives
+    // (there is no dense MLP either). The pre-norm block carries 4
+    // TokenRMSNorm (input_layernorm, full-width q_norm, full-width k_norm,
+    // post_attention_layernorm) + final norm.
     GateCnt := 0;
     SoftMaxCnt := 0;
     SwiGLUCnt := 0;
     NormCnt := 0;
+    BankUpCnt := 0;
+    BankDownCnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
       if NN.Layers[LayerCnt].ClassType = TNNetTopKGate then Inc(GateCnt);
@@ -7993,13 +8002,21 @@ begin
         Inc(SoftMaxCnt);
       if NN.Layers[LayerCnt].ClassType = TNNetSwiGLU then Inc(SwiGLUCnt);
       if NN.Layers[LayerCnt].ClassType = TNNetTokenRMSNorm then Inc(NormCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetMoEExpertBankGateUp then
+        Inc(BankUpCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetMoEExpertBankDown then
+        Inc(BankDownCnt);
     end;
     AssertEquals('one top-k router gate per block (uniform all-MoE)',
       Config.NumLayers, GateCnt);
     AssertEquals('one per-token router softmax per block',
       Config.NumLayers, SoftMaxCnt);
-    AssertEquals('one SwiGLU per expert per block (no dense FFN)',
-      Config.NumLocalExperts * Config.NumLayers, SwiGLUCnt);
+    AssertEquals('one gate|up expert bank per block',
+      Config.NumLayers, BankUpCnt);
+    AssertEquals('one down expert bank per block',
+      Config.NumLayers, BankDownCnt);
+    AssertEquals('no standalone SwiGLU (banks fold it, no dense FFN)',
+      0, SwiGLUCnt);
     AssertEquals('TokenRMSNorm count (4 per pre-norm block + final)',
       4 * Config.NumLayers + 1, NormCnt);
     AssertLogitParityWithFixture(NN,
@@ -8041,6 +8058,7 @@ var
   NN: TNNet;
   Config: TLlamaConfig;
   LayerCnt, GateCnt, SoftMaxCnt, SwiGLUCnt: integer;
+  BankUpCnt, BankDownCnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildMixtralFromSafeTensorsEx(FixturePath('tiny_mixtral.safetensors'),
@@ -8058,22 +8076,34 @@ begin
     AssertFalse('untied', Config.TieWordEmbeddings);
     AssertEquals('prefix', 'model.', Config.Prefix);
     // Structure: one router (TNNetTopKGate + its PER-TOKEN PointwiseSoftMax)
-    // per block, and one SwiGLU per expert per block (no dense MLP SwiGLU).
+    // per block and ONE PAIR OF FUSED EXPERT BANKS per block, which hold every
+    // expert's SwiGLU internally, so no TNNetSwiGLU layer survives (there is
+    // no dense MLP either).
     GateCnt := 0;
     SoftMaxCnt := 0;
     SwiGLUCnt := 0;
+    BankUpCnt := 0;
+    BankDownCnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
       if NN.Layers[LayerCnt].ClassType = TNNetTopKGate then Inc(GateCnt);
       if NN.Layers[LayerCnt].ClassType = TNNetPointwiseSoftMax then
         Inc(SoftMaxCnt);
       if NN.Layers[LayerCnt].ClassType = TNNetSwiGLU then Inc(SwiGLUCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetMoEExpertBankGateUp then
+        Inc(BankUpCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetMoEExpertBankDown then
+        Inc(BankDownCnt);
     end;
     AssertEquals('one top-k router gate per block', Config.NumLayers, GateCnt);
     AssertEquals('one per-token router softmax per block',
       Config.NumLayers, SoftMaxCnt);
-    AssertEquals('one SwiGLU per expert per block',
-      Config.NumLocalExperts * Config.NumLayers, SwiGLUCnt);
+    AssertEquals('one gate|up expert bank per block',
+      Config.NumLayers, BankUpCnt);
+    AssertEquals('one down expert bank per block',
+      Config.NumLayers, BankDownCnt);
+    AssertEquals('no standalone SwiGLU (banks fold it, no dense FFN)',
+      0, SwiGLUCnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_mixtral_logits.json'), Config.MaxPositions,
       Config.VocabSize);
@@ -8113,6 +8143,7 @@ var
   NN: TNNet;
   Config: TLlamaConfig;
   LayerCnt, GateCnt, SoftMaxCnt, SwiGLUCnt: integer;
+  BankUpCnt, BankDownCnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildQwen3MoeFromSafeTensorsEx(
@@ -8136,22 +8167,34 @@ begin
     AssertFalse('untied', Config.TieWordEmbeddings);
     AssertEquals('prefix', 'model.', Config.Prefix);
     // Structure: one router (TNNetTopKGate + its PER-TOKEN PointwiseSoftMax)
-    // per block, one SwiGLU per expert per block (no dense MLP SwiGLU).
+    // per block and ONE PAIR OF FUSED EXPERT BANKS per block, which hold every
+    // expert's SwiGLU internally, so no TNNetSwiGLU layer survives (there is
+    // no dense MLP either).
     GateCnt := 0;
     SoftMaxCnt := 0;
     SwiGLUCnt := 0;
+    BankUpCnt := 0;
+    BankDownCnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
       if NN.Layers[LayerCnt].ClassType = TNNetTopKGate then Inc(GateCnt);
       if NN.Layers[LayerCnt].ClassType = TNNetPointwiseSoftMax then
         Inc(SoftMaxCnt);
       if NN.Layers[LayerCnt].ClassType = TNNetSwiGLU then Inc(SwiGLUCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetMoEExpertBankGateUp then
+        Inc(BankUpCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetMoEExpertBankDown then
+        Inc(BankDownCnt);
     end;
     AssertEquals('one top-k router gate per block', Config.NumLayers, GateCnt);
     AssertEquals('one per-token router softmax per block',
       Config.NumLayers, SoftMaxCnt);
-    AssertEquals('one SwiGLU per expert per block',
-      Config.NumLocalExperts * Config.NumLayers, SwiGLUCnt);
+    AssertEquals('one gate|up expert bank per block',
+      Config.NumLayers, BankUpCnt);
+    AssertEquals('one down expert bank per block',
+      Config.NumLayers, BankDownCnt);
+    AssertEquals('no standalone SwiGLU (banks fold it, no dense FFN)',
+      0, SwiGLUCnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_qwen3_moe_logits.json'), Config.MaxPositions,
       Config.VocabSize);
@@ -8188,6 +8231,7 @@ var
   NN: TNNet;
   Config: TLlamaConfig;
   LayerCnt, GateCnt, SoftMaxCnt, SwiGLUCnt: integer;
+  BankUpCnt, BankDownCnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildQwen3MoeFromSafeTensorsEx(
@@ -8204,23 +8248,31 @@ begin
     AssertEquals('moe_intermediate_size', 5, Config.MoEIntermediateSize);
     AssertEquals('intermediate_size', 12, Config.IntermediateSize);
     // ONE MoE layer (layer 1): exactly one router (TopKGate + per-token
-    // softmax). SwiGLU count = experts on the MoE layer (4) PLUS one dense
-    // SwiGLU per dense layer (layers 0 and 2 = 2): 6 total.
+    // softmax) and one pair of fused expert banks, which fold the routed
+    // experts' SwiGLU. The surviving TNNetSwiGLU layers are therefore the
+    // DENSE ones only - one per dense layer (layers 0 and 2 = 2).
     GateCnt := 0;
     SoftMaxCnt := 0;
     SwiGLUCnt := 0;
+    BankUpCnt := 0;
+    BankDownCnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
       if NN.Layers[LayerCnt].ClassType = TNNetTopKGate then Inc(GateCnt);
       if NN.Layers[LayerCnt].ClassType = TNNetPointwiseSoftMax then
         Inc(SoftMaxCnt);
       if NN.Layers[LayerCnt].ClassType = TNNetSwiGLU then Inc(SwiGLUCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetMoEExpertBankGateUp then
+        Inc(BankUpCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetMoEExpertBankDown then
+        Inc(BankDownCnt);
     end;
     AssertEquals('one top-k router gate (single MoE layer)', 1, GateCnt);
     AssertEquals('one per-token router softmax (single MoE layer)',
       1, SoftMaxCnt);
-    AssertEquals('SwiGLUs = experts(4) on MoE layer + 1 per dense layer(2)',
-      Config.NumLocalExperts + 2, SwiGLUCnt);
+    AssertEquals('one gate|up expert bank (single MoE layer)', 1, BankUpCnt);
+    AssertEquals('one down expert bank (single MoE layer)', 1, BankDownCnt);
+    AssertEquals('SwiGLUs = the dense layers only (2)', 2, SwiGLUCnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_qwen3_moe_mixed_logits.json'), Config.MaxPositions,
       Config.VocabSize);
@@ -8654,6 +8706,7 @@ var
   NN: TNNet;
   Config: TLlamaConfig;
   LayerCnt, GateCnt, SwiGLUCnt, DeltaCnt: integer;
+  BankUpCnt, BankDownCnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildQwen35MoeFromSafeTensorsEx(
@@ -8674,22 +8727,34 @@ begin
       Config.SharedIntermediateSize);
     AssertTrue('attention output gate', Config.AttnOutputGate);
     AssertEquals('flat prefix', 'model.', Config.Prefix);
-    // Structure: one top-k router per layer; per layer 4 routed SwiGLU
-    // experts + 1 shared SwiGLU; one DeltaNet per linear layer (3).
+    // Structure: one top-k router per layer; the 4 routed experts live in
+    // one pair of fused expert banks per layer (their SwiGLU is folded in),
+    // so the only surviving TNNetSwiGLU is the SHARED expert's - one per
+    // layer; one DeltaNet per linear layer (3).
     GateCnt := 0;
     SwiGLUCnt := 0;
     DeltaCnt := 0;
+    BankUpCnt := 0;
+    BankDownCnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
       if NN.Layers[LayerCnt].ClassType = TNNetTopKGate then Inc(GateCnt);
       if NN.Layers[LayerCnt].ClassType = TNNetSwiGLU then Inc(SwiGLUCnt);
       if NN.Layers[LayerCnt].ClassType = TNNetGatedDeltaNet then
         Inc(DeltaCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetMoEExpertBankGateUp then
+        Inc(BankUpCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetMoEExpertBankDown then
+        Inc(BankDownCnt);
     end;
     AssertEquals('one top-k router gate per layer', Config.NumLayers,
       GateCnt);
-    AssertEquals('routed + shared SwiGLU per layer',
-      (Config.NumLocalExperts + 1) * Config.NumLayers, SwiGLUCnt);
+    AssertEquals('one gate|up expert bank per layer', Config.NumLayers,
+      BankUpCnt);
+    AssertEquals('one down expert bank per layer', Config.NumLayers,
+      BankDownCnt);
+    AssertEquals('the shared expert SwiGLU only, one per layer',
+      Config.NumLayers, SwiGLUCnt);
     AssertEquals('one DeltaNet per linear layer', 3, DeltaCnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_qwen3_5_moe_logits.json'), Config.MaxPositions,

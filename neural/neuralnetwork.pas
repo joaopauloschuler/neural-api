@@ -13453,6 +13453,12 @@ type
       FSourceIdx, FGateIdx: integer;
       FSourceLayer, FGateLayer: TNNetLayer;
       FNumExperts, FExpertWidth, FTopK, FTokenCnt: integer;
+      // Llama-4 routing (Config.MoEScaleInput): the gate weight scales the
+      // expert INPUT, expert(g*x), instead of the expert OUTPUT. The gate|up
+      // projection is LINEAR in x, so gateup(g*x) = g*gateup(x): the raw dot
+      // products are scaled by g BEFORE the (nonlinear) SwiGLU fold and the
+      // down bank then combines with weight 1. No scratch buffer.
+      FScaleInputByGate: boolean;
       // Slot map, rebuilt from the router at every Compute. Sized once in
       // SetPrevLayer so the compute path never touches the heap. Read directly
       // (unit scope) by TNNetMoEExpertBankDown, which needs the same routing
@@ -13494,14 +13500,19 @@ type
       function ChunkEligible(): boolean; override;
       function ChunkWorkCount(): integer; override;
       constructor Create(pNumExperts, pExpertWidth, pSourceLayerIdx,
-        pGateLayerIdx: integer); reintroduce; overload;
+        pGateLayerIdx: integer; pScaleInputByGate: boolean = false);
+        reintroduce; overload;
       constructor Create(pNumExperts, pExpertWidth: integer;
-        pSourceLayer, pGateLayer: TNNetLayer); reintroduce; overload;
+        pSourceLayer, pGateLayer: TNNetLayer;
+        pScaleInputByGate: boolean = false); reintroduce; overload;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure AppendInputLayers(pList: TList); override;
       property NumExperts: integer read FNumExperts;
       property ExpertWidth: integer read FExpertWidth;
+      // True when the gate weight scales the expert input (Llama-4) instead of
+      // the expert output; the down bank reads it to drop its combine weight.
+      property ScaleInputByGate: boolean read FScaleInputByGate;
       // Experts kept per token: the router's TopCnt, clamped to [1,NumExperts].
       property TopK: integer read FTopK;
   end;
@@ -13520,6 +13531,9 @@ type
     private
       FBank: TNNetMoEExpertBankGateUp;
       FNumExperts, FHiddenSize, FExpertWidth, FTopK, FTokenCnt: integer;
+      // Mirrors the gate|up bank's ScaleInputByGate: when the gate already
+      // scaled the expert input, the mixture combines the slots with weight 1.
+      FUnitCombine: boolean;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       // The by-token gate-weighted mixture over the TOKEN slice
       // [StartToken..FinToken]. The quantized variant streams FQuantTable's
@@ -97857,13 +97871,14 @@ end;
 
 { TNNetMoEExpertBankGateUp }
 constructor TNNetMoEExpertBankGateUp.Create(pNumExperts, pExpertWidth,
-  pSourceLayerIdx, pGateLayerIdx: integer);
+  pSourceLayerIdx, pGateLayerIdx: integer; pScaleInputByGate: boolean);
 begin
   inherited Create();
   FNumExperts := Max(pNumExperts, 1);
   FExpertWidth := Max(pExpertWidth, 1);
   FSourceIdx := pSourceLayerIdx;
   FGateIdx := pGateLayerIdx;
+  FScaleInputByGate := pScaleInputByGate;
   // Until the router is attached the bank conservatively assumes every expert
   // fires; SetPrevLayer narrows this to the router's TopCnt.
   FTopK := FNumExperts;
@@ -97873,14 +97888,15 @@ begin
   FStruct[1] := FExpertWidth;
   FStruct[2] := pSourceLayerIdx;
   FStruct[3] := pGateLayerIdx;
+  if pScaleInputByGate then FStruct[4] := 1 else FStruct[4] := 0;
   AddNeurons(FNumExperts * 2 * FExpertWidth);
 end;
 
 constructor TNNetMoEExpertBankGateUp.Create(pNumExperts, pExpertWidth: integer;
-  pSourceLayer, pGateLayer: TNNetLayer);
+  pSourceLayer, pGateLayer: TNNetLayer; pScaleInputByGate: boolean);
 begin
   Self.Create(pNumExperts, pExpertWidth, pSourceLayer.LayerIdx,
-    pGateLayer.LayerIdx);
+    pGateLayer.LayerIdx, pScaleInputByGate);
 end;
 
 procedure TNNetMoEExpertBankGateUp.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -98067,7 +98083,7 @@ var
   ExpertIdx, PairPos, PairIdx, TokenIdx, SlotIdx, WidthIdx: integer;
   MaxPairPos, MaxWidthPos: integer;
   RowBase, OutBase, SlotSize: integer;
-  UpVal, GateVal, SigVal: TNeuralFloat;
+  UpVal, GateVal, SigVal, InScale: TNeuralFloat;
   SrcPtr: TNeuralFloatArrPtr;
   SrcVol: TNNetVolume;
   UpNeuron, GateNeuron: TNNetNeuron;
@@ -98077,6 +98093,7 @@ begin
   SrcVol := FSourceLayer.FOutput;
   SlotSize := FTopK * FExpertWidth;
   MaxWidthPos := FExpertWidth - 1;
+  InScale := 1.0;
   for ExpertIdx := StartExpert to FinExpert do
   begin
     MaxPairPos := FExpertStart[ExpertIdx + 1] - 1;
@@ -98088,14 +98105,18 @@ begin
       SlotIdx := PairIdx - TokenIdx * FTopK;
       SrcPtr := SrcVol.GetRawPtr(TokenIdx * FVectorSize);
       OutBase := TokenIdx * SlotSize + SlotIdx * FExpertWidth;
+      // expert(g*x): a factor on the linear part only, folded per pair so the
+      // inner loop stays branch-free (x*1.0 is exact when the gate scales the
+      // OUTPUT instead - the down bank then carries the weight).
+      if FScaleInputByGate then InScale := FSlotGate[PairIdx];
       for WidthIdx := 0 to MaxWidthPos do
       begin
         UpNeuron := FArrNeurons[RowBase + WidthIdx];
         GateNeuron := FArrNeurons[RowBase + FExpertWidth + WidthIdx];
         UpVal := TNNetVolume.DotProduct(UpNeuron.FWeights.GetRawPtr(),
-          SrcPtr, FVectorSize) + UpNeuron.FBiasWeight;
+          SrcPtr, FVectorSize) * InScale + UpNeuron.FBiasWeight;
         GateVal := TNNetVolume.DotProduct(GateNeuron.FWeights.GetRawPtr(),
-          SrcPtr, FVectorSize) + GateNeuron.FBiasWeight;
+          SrcPtr, FVectorSize) * InScale + GateNeuron.FBiasWeight;
         // SwiGLU: up * swish(gate) - the scalar form of TNNetSwiGLU.
         SigVal := 1 / (1 + NeuralExp(-GateVal));
         FOutput.FData[OutBase + WidthIdx] := UpVal * (GateVal * SigVal);
@@ -98115,7 +98136,7 @@ var
   MaxPairPos, MaxWidthPos: integer;
   RowBase, GateRowBase, OutBase, SlotSize: integer;
   UpCodeBase, GateCodeBase, VS: integer;
-  UpVal, GateVal, SigVal: TNeuralFloat;
+  UpVal, GateVal, SigVal, InScale: TNeuralFloat;
   SrcPtr: TNeuralFloatArrPtr;
   SrcVol: TNNetVolume;
   CodesPtr: TNeuralInt8ArrPtr;
@@ -98127,6 +98148,7 @@ begin
   SrcVol := FSourceLayer.FOutput;
   SlotSize := FTopK * FExpertWidth;
   MaxWidthPos := FExpertWidth - 1;
+  InScale := 1.0;
   for ExpertIdx := StartExpert to FinExpert do
   begin
     MaxPairPos := FExpertStart[ExpertIdx + 1] - 1;
@@ -98141,15 +98163,17 @@ begin
       OutBase := TokenIdx * SlotSize + SlotIdx * FExpertWidth;
       UpCodeBase := RowBase * VS;        // #6: first up row's code offset
       GateCodeBase := GateRowBase * VS;  // #6: first gate row's code offset
+      // expert(g*x): see ComputeExperts.
+      if FScaleInputByGate then InScale := FSlotGate[PairIdx];
       for WidthIdx := 0 to MaxWidthPos do
       begin
         UpVal := TNNetVolume.DotProductInt8(
             TNeuralInt8ArrPtr(@CodesPtr^[UpCodeBase]), SrcPtr, VS) *
-          ScalePtr^[RowBase + WidthIdx] +
+          (ScalePtr^[RowBase + WidthIdx] * InScale) +
           FArrNeurons[RowBase + WidthIdx].FBiasWeight;
         GateVal := TNNetVolume.DotProductInt8(
             TNeuralInt8ArrPtr(@CodesPtr^[GateCodeBase]), SrcPtr, VS) *
-          ScalePtr^[GateRowBase + WidthIdx] +
+          (ScalePtr^[GateRowBase + WidthIdx] * InScale) +
           FArrNeurons[GateRowBase + WidthIdx].FBiasWeight;
         // SwiGLU: up * swish(gate) - the scalar form of TNNetSwiGLU.
         SigVal := 1 / (1 + NeuralExp(-GateVal));
@@ -98204,6 +98228,7 @@ begin
   FExpertWidth := FBank.ExpertWidth;
   FTopK := FBank.TopK;
   FTokenCnt := FBank.FTokenCnt;
+  FUnitCombine := FBank.ScaleInputByGate;
   FVectorSize := FExpertWidth;
   FVectorSizeBytes := FVectorSize * csNeuralFloatSize;
   SetNumWeightsForAllNeurons(FVectorSize);
@@ -98290,7 +98315,10 @@ begin
     for SlotIdx := 0 to MaxSlotPos do
     begin
       ExpertIdx := FBank.FSlotExpert[PairBase + SlotIdx];
-      GateWeight := FBank.FSlotGate[PairBase + SlotIdx];
+      // The gate|up bank already applied the gate to the expert INPUT under
+      // Llama-4 routing, so the mixture must not apply it a second time.
+      if FUnitCombine then GateWeight := 1.0
+      else GateWeight := FBank.FSlotGate[PairBase + SlotIdx];
       HidPtr := HidVol.GetRawPtr((PairBase + SlotIdx) * FExpertWidth);
       RowBase := ExpertIdx * FHiddenSize;
       for HiddenIdx := 0 to MaxHiddenPos do
@@ -98334,7 +98362,9 @@ begin
     for SlotIdx := 0 to MaxSlotPos do
     begin
       ExpertIdx := FBank.FSlotExpert[PairBase + SlotIdx];
-      GateWeight := FBank.FSlotGate[PairBase + SlotIdx];
+      // See ComputeMixture.
+      if FUnitCombine then GateWeight := 1.0
+      else GateWeight := FBank.FSlotGate[PairBase + SlotIdx];
       HidPtr := HidVol.GetRawPtr((PairBase + SlotIdx) * FExpertWidth);
       RowBase := ExpertIdx * FHiddenSize;
       CodeBase := RowBase * VS;        // #6: expert's first row code offset
@@ -120630,7 +120660,7 @@ begin
       'TNNetTopKGate' :             Result := TNNetTopKGate.Create(St[0]);
       'TNNetBiasBalancedTopKGate' : Result := TNNetBiasBalancedTopKGate.Create(St[0], Ft[0]);
       'TNNetExpertChoiceGate' :     Result := TNNetExpertChoiceGate.Create(St[0]);
-      'TNNetMoEExpertBankGateUp' :  Result := TNNetMoEExpertBankGateUp.Create(St[0], St[1], St[2], St[3]);
+      'TNNetMoEExpertBankGateUp' :  Result := TNNetMoEExpertBankGateUp.Create(St[0], St[1], St[2], St[3], St[4] > 0);
       'TNNetMoEExpertBankDown' :    Result := TNNetMoEExpertBankDown.Create(St[0], St[1]);
       'TNNetPointwiseNorm' :        Result := TNNetPointwiseNorm.Create();
       'TNNetConvolution' :          Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]);
@@ -121075,7 +121105,7 @@ begin
       if S[0] = 'TNNetTopKGate' then Result := TNNetTopKGate.Create(St[0]) else
       if S[0] = 'TNNetBiasBalancedTopKGate' then Result := TNNetBiasBalancedTopKGate.Create(St[0], Ft[0]) else
       if S[0] = 'TNNetExpertChoiceGate' then Result := TNNetExpertChoiceGate.Create(St[0]) else
-      if S[0] = 'TNNetMoEExpertBankGateUp' then Result := TNNetMoEExpertBankGateUp.Create(St[0], St[1], St[2], St[3]) else
+      if S[0] = 'TNNetMoEExpertBankGateUp' then Result := TNNetMoEExpertBankGateUp.Create(St[0], St[1], St[2], St[3], St[4] > 0) else
       if S[0] = 'TNNetMoEExpertBankDown' then Result := TNNetMoEExpertBankDown.Create(St[0], St[1]) else
       if S[0] = 'TNNetPointwiseNorm' then Result := TNNetPointwiseNorm.Create() else
       if S[0] = 'TNNetConvolution' then Result := TNNetConvolution.Create(St[0], St[1], St[2], St[3], St[4]) else

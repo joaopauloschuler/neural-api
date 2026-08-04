@@ -15266,10 +15266,12 @@ type
     QNorms, KNorms: array of TNNetLayer;
     // FULL-WIDTH q/k RMSNorm (OLMo-2 QKNormFullWidth); nil otherwise.
     QNormFull, KNormFull: TNNetLayer;
-    // Mixtral block_sparse_moe (Config.IsMoE): the router gate conv plus
-    // per-expert fused gate|up and down projections; empty otherwise.
+    // Mixtral block_sparse_moe (Config.IsMoE): the router gate conv plus the
+    // two FUSED expert banks - one [E*2I, H] gate|up neuron block and one
+    // [E*H, I] down neuron block holding EVERY expert of the block, so expert
+    // e owns rows e*2I.. and e*H.. respectively; nil otherwise.
     GateConv: TNNetLayer;
-    ExpertGateUp, ExpertDown: array of TNNetLayer;
+    ExpertBankGateUp, ExpertBankDown: TNNetLayer;
     // granitemoe shared expert (Config.SharedIntermediateSize > 0): an
     // always-on SwiGLU MLP whose output is summed with the routed output;
     // nil otherwise.
@@ -15289,14 +15291,20 @@ type
 // Wires Mixtral's block_sparse_moe FFN from primitives onto MoESource (the
 // pre-FFN-normalized residual stream): a token-wise router (gate linear ->
 // num_local_experts logits -> PER-TOKEN softmax -> hard top-k gate with the
-// surviving probs RENORMALIZED, HF's normalize_topk_prob), N independent
-// SwiGLU experts, and y = Sum_e gTopK[e] * Expert_e(x). This is the
-// AddTopKMixtureOfExperts combine specialized to SwiGLU experts so the
-// importer can drop the checkpoint's per-expert w1/w2/w3 onto named layers.
+// surviving probs RENORMALIZED, HF's normalize_topk_prob) feeding the two
+// FUSED EXPERT BANKS, which together evaluate y = Sum_e gTopK[e] * Expert_e(x)
+// over the k experts a token actually selected instead of all E of them.
+// The routed path is therefore FIVE layers wide whatever the expert count
+// (router linear, softmax/sigmoid, top-k gate, gate|up bank, down bank),
+// and every expert's w1/w2/w3 lands in a flat row block of a bank
+// (expert e: gate|up rows e*2I.., down rows e*H..), which is what the loaders
+// address.
 // The gate's PER-TOKEN softmax matches HF (the whole-volume TNNetSoftMax
 // would couple tokens); pRenormalize=true is Mixtral's top-k renorm, the
 // one routing knob that distinguishes it from DeepSeek-V2 (norm=false).
-// Leaves the combined sum as the last layer (the caller closes the residual).
+// Leaves the mixture as the last layer (the caller closes the residual).
+// INFERENCE-ONLY: the banks do not backpropagate. MoE TRAINING goes through
+// AddTopKMixtureOfExperts / AddDeepSeekMoE, which build per-expert layers.
 //
 // Per-layer dense/MoE gate for the Qwen3-MoE mixed stack. Mirrors HF
 // modeling_qwen3_moe.Qwen3MoeDecoderLayer.__init__ EXACTLY: layer LayerIdx is
@@ -15324,19 +15332,15 @@ procedure BuildMixtralMoEBranch(NN: TNNet; var Block: TLlamaBlockLayers;
   MoESource: TNNetLayer; const Config: TLlamaConfig;
   pTrainable: boolean = true);
 var
-  GateTopK, ExpertOut, GateE, GateEBroadcast, RoutedOut: TNNetLayer;
+  GateTopK, GateEBroadcast, RoutedOut: TNNetLayer;
   SharedOut: TNNetLayer;
-  MoEBranches: array of TNNetLayer;
-  ExpertCnt, ExpertWidth, NumLocalExpertsM1: integer;
+  ExpertWidth: integer;
 begin
   // Per-expert SwiGLU width: Mixtral's experts are full intermediate_size;
   // Qwen3-MoE's are the narrower moe_intermediate_size (MoEIntermediateSize,
   // 0 = fall back to IntermediateSize).
   if Config.MoEIntermediateSize > 0 then ExpertWidth := Config.MoEIntermediateSize
   else ExpertWidth := Config.IntermediateSize;
-  SetLength(Block.ExpertGateUp, Config.NumLocalExperts);
-  SetLength(Block.ExpertDown, Config.NumLocalExperts);
-  SetLength(MoEBranches, Config.NumLocalExperts);
   // Router: token-wise linear -> PER-TOKEN softmax (over ALL experts) ->
   // hard top-k gate with the top-k subset renormalized iff Config.MoENormTopK
   // (Mixtral always renormalizes; Qwen3-MoE follows norm_topk_prob).
@@ -15360,44 +15364,28 @@ begin
     GateTopK := NN.AddLayer( TNNetTopKGate.Create(
       Config.MoEExpertsPerTok, {pRenormalize=}Config.MoENormTopK) );
   end;
-  NumLocalExpertsM1 := Config.NumLocalExperts - 1;
-  for ExpertCnt := 0 to NumLocalExpertsM1 do
-  begin
-    // Slice this expert's top-k gate weight g[e] and broadcast it across
-    // d_model (zero for non-selected experts).
-    GateE := NN.AddLayerAfter(
-      TNNetSplitChannels.Create(ExpertCnt, 1), GateTopK);
-    GateEBroadcast := NN.AddLayer(
-      TNNetDeepConcat.Replicate(Config.HiddenSize, GateE) );
-    // Per-expert SwiGLU MLP. TNNetSwiGLU computes FIRSTHALF * silu(SECONDHALF):
-    // the fused projection holds w3 (up) in neurons 0..I-1 and w1 (gate) in
-    // I..2I-1; w2 is the down projection (loaded below).
-    // Config.MoEScaleInput (Llama-4): the gate scales the expert INPUT
-    // (experts(g*x)); else (Mixtral/Qwen3/granite) it scales the OUTPUT
-    // (g*expert(x)). expert(0)=0 (bias-free) so non-selected always vanish.
-    if Config.MoEScaleInput then
-      ExpertOut := NN.AddLayer(
-        TNNetCellMulByCell.Create(MoESource, GateEBroadcast) )
-    else
-      ExpertOut := MoESource;
-    Block.ExpertGateUp[ExpertCnt] := NN.AddLayerAfter(
-      TNNetPointwiseConvLinear.Create(2 * ExpertWidth).SetTrainable(pTrainable),
-      ExpertOut);
-    NN.AddLayer( TNNetSwiGLU.Create() );
-    Block.ExpertDown[ExpertCnt] := NN.AddLayer(
-      TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
-    ExpertOut := NN.GetLastLayer();
-    if Config.MoEScaleInput then
-      MoEBranches[ExpertCnt] := ExpertOut
-    else
-      MoEBranches[ExpertCnt] := NN.AddLayer(
-        TNNetCellMulByCell.Create(ExpertOut, GateEBroadcast) );
-  end;
   // y = Sum_e Expert_e(gTopK[e] * x)  (MoEScaleInput) or Sum_e gTopK[e] *
-  // Expert_e(x). (NumExpertsPerTok>=2 implies NumLocalExperts>=2; a
-  // single-expert sum is still valid for safety.)
-  RoutedOut := NN.AddLayer( TNNetSum.Create(MoEBranches) );
-  SetLength(MoEBranches, 0);
+  // Expert_e(x), evaluated by TWO FUSED EXPERT BANKS rather than one layer
+  // chain per expert. The gate|up bank reads the router directly, keeps only
+  // the k experts a token selected and emits their SwiGLU'd hidden packed by
+  // slot; the down bank projects those slots back and combines them with the
+  // gate weights. TNNetSwiGLU's FIRSTHALF*silu(SECONDHALF) convention is
+  // preserved inside the bank: expert e holds w3 (up) in rows e*2I..e*2I+I-1
+  // and w1 (gate) in e*2I+I..e*2I+2I-1; w2 is the down bank's rows e*H...
+  // Config.MoEScaleInput (Llama-4): the gate scales the expert INPUT
+  // (experts(g*x)); else (Mixtral/Qwen3/granite) it scales the OUTPUT
+  // (g*expert(x)) - one bank flag, since gate|up is linear in x.
+  // SetTrainable at construction is what arms the direct-to-int8 storage:
+  // TNNet.AddLayer does not propagate the net's trainable flag, and
+  // ArmBuildQuantInt8Storage only fires on an already-frozen layer.
+  Block.ExpertBankGateUp := NN.AddLayerAfter(
+    TNNetMoEExpertBankGateUp.Create(Config.NumLocalExperts, ExpertWidth,
+      MoESource, GateTopK, Config.MoEScaleInput).SetTrainable(pTrainable),
+    MoESource);
+  Block.ExpertBankDown := NN.AddLayer(
+    TNNetMoEExpertBankDown.Create(Config.NumLocalExperts,
+      Config.HiddenSize).SetTrainable(pTrainable) );
+  RoutedOut := Block.ExpertBankDown;
   // granitemoe shared expert (GraniteMoeShared, Config.SharedIntermediateSize
   // > 0): an always-on full-width SwiGLU MLP reading the SAME pre-FFN-normed
   // residual stream as the router, run in PARALLEL with the routed experts.
@@ -15445,6 +15433,9 @@ end;
 // expert (neuron o = output row o, the identity map). Scale folds a per-model
 // row multiplier (granite's residual_multiplier) into the loaded rows.
 // ErrPrefix names the importing family in the diagnostics.
+// This is the PER-EXPERT-LAYER form, for the builders that still wire one
+// layer chain per expert; a fused expert bank takes the whole slab at once
+// through LoadMoEExpertSlabIntoBank below.
 //
 // Expert e occupies the disjoint row block e*OutDim .. (e+1)*OutDim-1 of the
 // flat [NumExperts*OutDim, InDim] view, so a streaming reader loads it through
@@ -15513,6 +15504,35 @@ begin
   finally
     W.Free;
   end;
+end;
+
+// Bank twin of LoadMoEExpertSlab: the same 3-D slab [NumExperts, OutDim,
+// InDim] into ONE flat [NumExperts*OutDim, InDim] neuron block (a fused expert
+// bank), where expert e owns rows e*OutDim... The slab's flat row-major view IS
+// that neuron order, so the WHOLE slab is a single load with no per-expert
+// slicing at all: a streaming reader hands LoadLlamaLinearWeights the rows
+// (and an int8-armed bank quantizes them straight into its codes), while a
+// reader that cannot serve row ranges falls back - inside that loader - to the
+// one staged copy of the slab it already has. Coded by Claude (AI).
+procedure LoadMoEExpertSlabIntoBank(Reader: TNNetSafeTensorsReader;
+  Bank: TNNetLayer; const TName: string;
+  NumExperts, OutDim, InDim: integer; Scale: TNeuralFloat;
+  const ErrPrefix: string);
+begin
+  if not Reader.HasTensor(TName) then
+    ImportError(ErrPrefix + 'missing tensor "' + TName + '".');
+  if (Reader.DimCount(TName) <> 3) or
+     (Reader.DimSize(TName, 0) <> NumExperts) or
+     (Reader.DimSize(TName, 1) <> OutDim) or
+     (Reader.DimSize(TName, 2) <> InDim) then
+    ImportError(ErrPrefix + 'MoE expert slab "' + TName +
+      '" must have shape [' + IntToStr(NumExperts) + ', ' + IntToStr(OutDim) +
+      ', ' + IntToStr(InDim) + '], got ' + Reader.ShapeAsString(TName));
+  LoadLlamaLinearWeights(Reader, Bank, TName,
+    {InDim=}InDim, {OutDim=}NumExperts * OutDim, {NeuronBase=}0,
+    {ExpectedNeurons=}NumExperts * OutDim, {RotaryHeadDim=}0, {BiasName=}'',
+    {Scale=}Scale, {RotaryDims=}0,
+    {SrcRowBase=}0, {SrcRows=}NumExperts * OutDim, {pFlatSlabRows=}true);
 end;
 
 // Loads the vocab table into EmbeddingLayer and, when TieWordEmbeddings, the
@@ -15668,10 +15688,13 @@ end;
 //       and computes silu(gate)*up);
 //   block_sparse_moe.output_linear.weight [E, H, I]   (per expert down);
 //   block_sparse_moe.router.layer.weight  [E, H]      (the router gate).
-// TNNetSwiGLU computes FIRSTHALF*silu(SECONDHALF), so the UP half loads into
-// expert neurons 0..I-1 and the GATE half into I..2I-1 (the same convention
-// as the dense fused gate_up). ResidualScale folds Granite's
-// residual_multiplier into the down (output_linear) rows.
+// The destination is the block's pair of FUSED EXPERT BANKS, whose flat neuron
+// order IS the slab's flat row order: expert e owns gate|up rows e*2I.. and
+// down rows e*H... TNNetSwiGLU's FIRSTHALF*silu(SECONDHALF) convention lives
+// inside the bank, so the UP half loads into rows e*2I..e*2I+I-1 and the GATE
+// half into e*2I+I..e*2I+2I-1 (the same convention as the dense fused
+// gate_up). ResidualScale folds Granite's residual_multiplier into the down
+// (output_linear) rows.
 // pInName/pOutName/pRouterName override the FULL tensor names: Qwen3.5-MoE
 // stores the IDENTICAL slab layout ([E, 2I, H] gate-then-up, [E, H, I] down,
 // [E, H] router) under mlp.experts.gate_up_proj / mlp.experts.down_proj /
@@ -15680,10 +15703,11 @@ end;
 // Both slabs are row-major stacks of ordinary [out, in] expert matrices, so
 // every projection loads through LoadLlamaLinearWeights' flat-slab row block
 // (pFlatSlabRows) rather than a slab-sized FP32 staging buffer: an int8-armed
-// build streams each expert straight into its int8 codes and never
+// build streams the rows straight into the bank's int8 codes and never
 // materializes an FP32 expert at all, which is what keeps the peak of a
 // 256-expert block at the quantized steady state instead of adding the
-// block's FP32 experts plus a whole slab on top. Coded by Claude (AI).
+// block's FP32 experts plus a whole slab on top. The down slab needs no
+// half-swap, so it is ONE call for all E experts. Coded by Claude (AI).
 procedure LoadGraniteMoEExperts(Reader: TNNetSafeTensorsReader;
   var Block: TLlamaBlockLayers; const BlockPrefix: string;
   NumExperts, HiddenSize, ExpertWidth: integer; ResidualScale: TNeuralFloat;
@@ -15698,47 +15722,48 @@ var
 
   // Fallback for readers that cannot serve row ranges (GGUF ggml types
   // outside the row-streamable set, the synthetic view readers): fill the
-  // experts from ONE staged copy of the slab. Streaming per expert would
+  // bank from ONE staged copy of the slab. Streaming per expert would
   // otherwise re-read - and re-decode - the whole slab 2*NumExperts times
   // per block, which at real expert counts is not a slow path but a hang.
   // This is the slab-sized FP32 transient the streaming path exists to
   // avoid, so it is confined to readers that leave no alternative. The down
-  // slab has no half-swap, so LoadMoEExpertSlab carries its own copy of
-  // this fallback and only the gate|up interleave is open-coded here.
+  // slab has no half-swap, so it goes through LoadMoEExpertSlabIntoBank and
+  // only the gate|up interleave is open-coded here.
   procedure FillGateUpFromStagedSlab;
   var
     e, j: integer;
-    EG: TNNetLayer;
     WV: TNNetVolume;
-    srcUpOfs, srcGateOfs: integer;
+    srcUpOfs, srcGateOfs, DstUpBase, DstGateBase: integer;
   begin
     Reader.LoadTensorFlat(InName, W); // flat [E*2I, H]
+    EnsureWritableImportWeights(EG);
     for e := 0 to NumExpertsM1 do
     begin
-      EG := Block.ExpertGateUp[e];
-      EnsureWritableImportWeights(EG);
       srcUpOfs := (e * TwoI + ExpertWidth) * HiddenSize;
       srcGateOfs := (e * TwoI) * HiddenSize;
+      DstUpBase := e * TwoI;
+      DstGateBase := DstUpBase + ExpertWidth;
       for j := 0 to ExpertWidthM1 do
       begin
-        // UP half (input_linear rows I..2I-1) -> neurons 0..I-1.
-        WV := EG.FArrNeurons[j].Weights;
+        // UP half (input_linear rows I..2I-1) -> bank rows e*2I..e*2I+I-1.
+        WV := EG.FArrNeurons[DstUpBase + j].Weights;
         Move(W.FData[srcUpOfs], WV.FData[0], HiddenSize * csNeuralFloatSize);
-        EG.FArrNeurons[j].BiasWeight := 0;
-        // GATE half (input_linear rows 0..I-1) -> neurons I..2I-1.
-        WV := EG.FArrNeurons[ExpertWidth + j].Weights;
+        EG.FArrNeurons[DstUpBase + j].BiasWeight := 0;
+        // GATE half (input_linear rows 0..I-1) -> bank rows e*2I+I..
+        WV := EG.FArrNeurons[DstGateBase + j].Weights;
         Move(W.FData[srcGateOfs], WV.FData[0], HiddenSize * csNeuralFloatSize);
-        EG.FArrNeurons[ExpertWidth + j].BiasWeight := 0;
+        EG.FArrNeurons[DstGateBase + j].BiasWeight := 0;
         Inc(srcUpOfs, HiddenSize); Inc(srcGateOfs, HiddenSize);
       end;
-      EG.FlushWeightCache();
     end;
+    EG.FlushWeightCache();
   end;
 
 begin
   TwoI := 2 * ExpertWidth;
   NumExpertsM1 := NumExperts - 1;
   ExpertWidthM1 := ExpertWidth - 1;
+  EG := Block.ExpertBankGateUp;
   SlabInRows := NumExperts * TwoI;      // input_linear as flat [E*2I, H]
   if pInName <> '' then InName := pInName
   else InName := BlockPrefix + 'block_sparse_moe.input_linear.weight';
@@ -15768,19 +15793,19 @@ begin
   begin
     for e := 0 to NumExpertsM1 do
     begin
-      EG := Block.ExpertGateUp[e];
-      // UP half (input_linear rows I..2I-1) -> neurons 0..I-1, then GATE half
-      // (rows 0..I-1) -> neurons I..2I-1. Two DISJOINT row blocks of the same
-      // flat slab, so each is an ordinary row-streamed load.
+      // UP half (input_linear rows I..2I-1) -> bank rows e*2I.., then GATE
+      // half (rows 0..I-1) -> bank rows e*2I+I... Two DISJOINT row blocks of
+      // the same flat slab, so each is an ordinary row-streamed load.
       LoadLlamaLinearWeights(Reader, EG, InName,
-        {InDim=}HiddenSize, {OutDim=}ExpertWidth, {NeuronBase=}0,
-        {ExpectedNeurons=}TwoI, {RotaryHeadDim=}0, {BiasName=}'',
+        {InDim=}HiddenSize, {OutDim=}ExpertWidth, {NeuronBase=}e * TwoI,
+        {ExpectedNeurons=}SlabInRows, {RotaryHeadDim=}0, {BiasName=}'',
         {Scale=}1.0, {RotaryDims=}0,
         {SrcRowBase=}e * TwoI + ExpertWidth, {SrcRows=}SlabInRows,
         {pFlatSlabRows=}true);
       LoadLlamaLinearWeights(Reader, EG, InName,
-        {InDim=}HiddenSize, {OutDim=}ExpertWidth, {NeuronBase=}ExpertWidth,
-        {ExpectedNeurons=}TwoI, {RotaryHeadDim=}0, {BiasName=}'',
+        {InDim=}HiddenSize, {OutDim=}ExpertWidth,
+        {NeuronBase=}e * TwoI + ExpertWidth,
+        {ExpectedNeurons=}SlabInRows, {RotaryHeadDim=}0, {BiasName=}'',
         {Scale=}1.0, {RotaryDims=}0,
         {SrcRowBase=}e * TwoI, {SrcRows=}SlabInRows,
         {pFlatSlabRows=}true);
@@ -15795,9 +15820,10 @@ begin
       W.Free;
     end;
   end;
-  // ---- output_linear [E, H, I]: an ordinary [out, in] stack, so the shared
-  //      slab loader takes it (residual_multiplier folds through Scale) ----
-  LoadMoEExpertSlab(Reader, Block.ExpertDown, OutName,
+  // ---- output_linear [E, H, I]: an ordinary [out, in] stack whose flat rows
+  //      ARE the down bank's neurons, so the shared slab loader takes it in
+  //      one call (residual_multiplier folds through Scale) ----
+  LoadMoEExpertSlabIntoBank(Reader, Block.ExpertBankDown, OutName,
     NumExperts, {OutDim=}HiddenSize, {InDim=}ExpertWidth, ResidualScale,
     'Llama import: ');
   Consumed.Add(InName);
@@ -15813,18 +15839,23 @@ end;
 //   feed_forward.experts.down_proj     [E, I, H]   (per expert [I, H]);
 //   feed_forward.router.weight         [E, H]      (a plain nn.Linear [out=E,
 //       in=H], the only NON-transposed slab).
-// TNNetSwiGLU computes FIRSTHALF*silu(SECONDHALF), so the UP columns load into
-// expert neurons 0..I-1 and the GATE columns into I..2I-1 (matching every
-// other fused gate|up here). Llama-4 has no residual_multiplier, so the down
-// rows load straight. Coded by Claude (AI).
+// The destination is the block's pair of FUSED EXPERT BANKS: expert e owns
+// gate|up rows e*2I.. and down rows e*H... TNNetSwiGLU's
+// FIRSTHALF*silu(SECONDHALF) convention lives inside the bank, so the UP
+// columns load into rows e*2I..e*2I+I-1 and the GATE columns into
+// e*2I+I..e*2I+2I-1 (matching every other fused gate|up here). Llama-4 has no
+// residual_multiplier, so the down rows load straight.
+// The TRANSPOSED layout is entirely this loader's business - the bank has no
+// flag for it, since the transpose is resolved before any row is written.
+// Coded by Claude (AI).
 procedure LoadLlama4MoEExperts(Reader: TNNetSafeTensorsReader;
   var Block: TLlamaBlockLayers; const BlockPrefix: string;
   NumExperts, HiddenSize, ExpertWidth: integer; Consumed: TStringList);
 var
   InName, OutName, RouterName: string;
-  W, WV, WVup, WVgate: TNNetVolume;
+  W, WV: TNNetVolume;
   EG, ED: TNNetLayer;
-  e, j, i, TwoI, Base, SrcUp, SrcGate, eBase: integer;
+  e, j, TwoI, Base, DstUpBase, DstGateBase, eBase: integer;
   NumExpertsM1, HiddenSizeM1, ExpertWidthM1: integer;
 begin
   TwoI := 2 * ExpertWidth;
@@ -15865,26 +15896,29 @@ begin
         IntToStr(NumExperts) + ', ' + IntToStr(HiddenSize) + ', ' +
         IntToStr(TwoI) + '], got ' + Reader.ShapeAsString(InName));
     Reader.LoadTensorFlat(InName, W); // flat [E*H, 2I]
+    EG := Block.ExpertBankGateUp;
+    EnsureWritableImportWeights(EG);
     for e := 0 to NumExpertsM1 do
     begin
-      EG := Block.ExpertGateUp[e];
-      EnsureWritableImportWeights(EG);
       eBase := (e * HiddenSize) * TwoI; // #5/#11: invariant across the j loop
+      DstUpBase := e * TwoI;           // this expert's first bank row
+      DstGateBase := DstUpBase + ExpertWidth;
       for j := 0 to ExpertWidthM1 do
       begin
-        EG.FArrNeurons[j].BiasWeight := 0;
-        EG.FArrNeurons[ExpertWidth + j].BiasWeight := 0;
+        EG.FArrNeurons[DstUpBase + j].BiasWeight := 0;
+        EG.FArrNeurons[DstGateBase + j].BiasWeight := 0;
       end;
-      // UP column (gate_up_proj col I+j) -> neuron j; GATE column
-      // (gate_up_proj col j) -> neuron I+j. Both are columns of the flat
-      // [E*H, 2I] slab, transposed in tiles.
+      // UP column (gate_up_proj col I+j) -> bank row e*2I+j; GATE column
+      // (gate_up_proj col j) -> bank row e*2I+I+j. Both are columns of the
+      // flat [E*H, 2I] slab, transposed in tiles.
       CopySlabColumnsToNeurons(W, eBase, TwoI, HiddenSize,
-        {ColBase=}ExpertWidth, {ColCount=}ExpertWidth, EG, {NeuronBase=}0);
+        {ColBase=}ExpertWidth, {ColCount=}ExpertWidth, EG,
+        {NeuronBase=}DstUpBase);
       CopySlabColumnsToNeurons(W, eBase, TwoI, HiddenSize,
         {ColBase=}0, {ColCount=}ExpertWidth, EG,
-        {NeuronBase=}ExpertWidth);
-      EG.FlushWeightCache();
+        {NeuronBase=}DstGateBase);
     end;
+    EG.FlushWeightCache();
     Consumed.Add(InName);
     // ---- down_proj [E, I, H]: per expert [in=I, out=H] -> read COLUMNS ----
     if (Reader.DimCount(OutName) <> 3) or
@@ -15895,19 +15929,20 @@ begin
         IntToStr(NumExperts) + ', ' + IntToStr(ExpertWidth) + ', ' +
         IntToStr(HiddenSize) + '], got ' + Reader.ShapeAsString(OutName));
     Reader.LoadTensorFlat(OutName, W); // flat [E*I, H]
+    ED := Block.ExpertBankDown;
+    EnsureWritableImportWeights(ED);
     for e := 0 to NumExpertsM1 do
     begin
-      ED := Block.ExpertDown[e];
-      EnsureWritableImportWeights(ED);
       eBase := (e * ExpertWidth) * HiddenSize; // #5/#11: invariant across the j loop
+      DstUpBase := e * HiddenSize;             // this expert's first bank row
       for j := 0 to HiddenSizeM1 do
-        ED.FArrNeurons[j].BiasWeight := 0;
-      // down_proj column j of the flat [E*I, H] slab -> neuron j, transposed
-      // in tiles.
+        ED.FArrNeurons[DstUpBase + j].BiasWeight := 0;
+      // down_proj column j of the flat [E*I, H] slab -> bank row e*H+j,
+      // transposed in tiles.
       CopySlabColumnsToNeurons(W, eBase, HiddenSize, ExpertWidth,
-        {ColBase=}0, {ColCount=}HiddenSize, ED, {NeuronBase=}0);
-      ED.FlushWeightCache();
+        {ColBase=}0, {ColCount=}HiddenSize, ED, {NeuronBase=}DstUpBase);
     end;
+    ED.FlushWeightCache();
     Consumed.Add(OutName);
   finally
     W.Free;
@@ -17277,20 +17312,28 @@ begin
               Config.HiddenSize, Config.NumLocalExperts);
             MarkConsumed(BlockPrefix + 'mlp.gate.weight');
             NumLocalExpertsM1 := Config.NumLocalExperts - 1;
+            // Expert d occupies gate|up bank rows d*2I.. (up) / d*2I+I..
+            // (gate) and down bank rows d*H.., so each per-expert 2-D tensor
+            // is an ordinary row block of the flat bank.
             for d := 0 to NumLocalExpertsM1 do
             begin
               TensorNameStr := BlockPrefix + 'mlp.experts.' + IntToStr(d) + '.';
-              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertGateUp[d],
+              LoadLlamaLinearWeights(Reader,
+                Blocks[BlockCnt].ExpertBankGateUp,
                 TensorNameStr + 'up_proj.weight',
-                Config.HiddenSize, i, 0, 2 * i);
+                Config.HiddenSize, i, d * 2 * i,
+                Config.NumLocalExperts * 2 * i);
               MarkConsumed(TensorNameStr + 'up_proj.weight');
-              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertGateUp[d],
+              LoadLlamaLinearWeights(Reader,
+                Blocks[BlockCnt].ExpertBankGateUp,
                 TensorNameStr + 'gate_proj.weight',
-                Config.HiddenSize, i, i, 2 * i);
+                Config.HiddenSize, i, d * 2 * i + i,
+                Config.NumLocalExperts * 2 * i);
               MarkConsumed(TensorNameStr + 'gate_proj.weight');
-              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertDown[d],
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertBankDown,
                 TensorNameStr + 'down_proj.weight',
-                i, Config.HiddenSize);
+                i, Config.HiddenSize, d * Config.HiddenSize,
+                Config.NumLocalExperts * Config.HiddenSize);
               MarkConsumed(TensorNameStr + 'down_proj.weight');
             end;
           end
@@ -17304,21 +17347,28 @@ begin
             // HF Mixtral: w1=gate_proj, w3=up_proj, w2=down_proj;
             // y = w2(silu(w1 x) * w3 x).
             NumLocalExpertsM1 := Config.NumLocalExperts - 1;
+            // Expert d occupies gate|up bank rows d*2I.. (w3/up) / d*2I+I..
+            // (w1/gate) and down bank rows d*H...
             for d := 0 to NumLocalExpertsM1 do
             begin
               TensorNameStr := BlockPrefix + 'block_sparse_moe.experts.' +
                 IntToStr(d) + '.';
-              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertGateUp[d],
+              LoadLlamaLinearWeights(Reader,
+                Blocks[BlockCnt].ExpertBankGateUp,
                 TensorNameStr + 'w3.weight',
-                Config.HiddenSize, i, 0, 2 * i);
+                Config.HiddenSize, i, d * 2 * i,
+                Config.NumLocalExperts * 2 * i);
               MarkConsumed(TensorNameStr + 'w3.weight');
-              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertGateUp[d],
+              LoadLlamaLinearWeights(Reader,
+                Blocks[BlockCnt].ExpertBankGateUp,
                 TensorNameStr + 'w1.weight',
-                Config.HiddenSize, i, i, 2 * i);
+                Config.HiddenSize, i, d * 2 * i + i,
+                Config.NumLocalExperts * 2 * i);
               MarkConsumed(TensorNameStr + 'w1.weight');
-              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertDown[d],
+              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertBankDown,
                 TensorNameStr + 'w2.weight',
-                i, Config.HiddenSize);
+                i, Config.HiddenSize, d * Config.HiddenSize,
+                Config.NumLocalExperts * Config.HiddenSize);
               MarkConsumed(TensorNameStr + 'w2.weight');
             end;
           end;

@@ -173,6 +173,9 @@ type
     procedure TestMoEExpertBankParityTopK1;
     procedure TestMoEExpertBankParityIdleExpert;
     procedure TestMoEExpertBankParityDenseGate;
+    procedure TestMoEExpertBankParityScaleInput;
+    procedure TestMoEExpertBankParityScaleInputInt8;
+    procedure TestMoEExpertBankScaleInputRoundTrip;
     procedure TestMoEExpertBankShapesAndRoundTrip;
     procedure TestMoEExpertBankBackpropagateRaises;
     // int8 weight storage on both banks.
@@ -196,10 +199,15 @@ type
     // quantization drift. SwapBankHalves + ExpectMismatch turn the assertion
     // around: they inject the up/gate half-swap bug and require the comparison
     // to catch it, which is what keeps Tolerance honest.
+    // ScaleInputByGate is the Llama-4 routing: the reference then scales the
+    // expert INPUT and leaves the output alone, and the bank is built with the
+    // matching flag. Both sides go BIAS-FREE there, because expert(0) must
+    // vanish for the experts a token did not select.
     procedure RunMoEBankParity(TokenCnt, HiddenSize, ExpertCnt, ExpertWidth,
       TopCnt: integer; UniformRouting: boolean; const Msg: string;
       QuantizeBanks: boolean = false; SwapBankHalves: boolean = false;
-      Tolerance: TNeuralFloat = 1e-4; ExpectMismatch: boolean = false);
+      Tolerance: TNeuralFloat = 1e-4; ExpectMismatch: boolean = false;
+      ScaleInputByGate: boolean = false);
     // Serial vs scheduler-chunked A/B of the two banks alone (no reference
     // graph): same weights, same input, one net computed serially and a second,
     // never-computed net driven through ComputeParallel.
@@ -7710,6 +7718,18 @@ begin
   L.FlushWeightCache();
 end;
 
+// Drops the biases of a filled linear layer. The Llama-4 experts are
+// bias-free, which is what makes expert(gate*x) vanish for an expert no token
+// selected - the bank simply never evaluates it.
+procedure ZeroMoEBankBiases(L: TNNetLayer);
+var
+  RowIdx, MaxRowPos: integer;
+begin
+  MaxRowPos := L.Neurons.Count - 1;
+  for RowIdx := 0 to MaxRowPos do L.Neurons[RowIdx].BiasWeight := 0;
+  L.FlushWeightCache();
+end;
+
 // Exchanges the UP and GATE weight rows of every expert of a gate|up bank -
 // the half-swap bug the parity assertions must be able to see.
 procedure SwapMoEBankGateUpHalves(L: TNNetLayer; ExpertCnt, ExpertWidth: integer);
@@ -7747,12 +7767,13 @@ procedure TTestNeuralLayersExtra.RunMoEBankParity(TokenCnt, HiddenSize,
   ExpertCnt, ExpertWidth, TopCnt: integer; UniformRouting: boolean;
   const Msg: string;
   QuantizeBanks: boolean = false; SwapBankHalves: boolean = false;
-  Tolerance: TNeuralFloat = 1e-4; ExpectMismatch: boolean = false);
+  Tolerance: TNeuralFloat = 1e-4; ExpectMismatch: boolean = false;
+  ScaleInputByGate: boolean = false);
 var
   NN: TNNet;
   Input: TNNetVolume;
   InputLayer, GateConv, GateTopK, GateE, GateBroadcast: TNNetLayer;
-  RefGateUp, RefDown, RefOut, BankGateUp, BankDown: TNNetLayer;
+  RefGateUp, RefDown, RefOut, BankGateUp, BankDown, ExpertIn: TNNetLayer;
   Branches: array of TNNetLayer;
   ExpertIdx, NeuronIdx, MaxExpertPos, MaxNeuronPos, MaxOutPos, Pos: integer;
   MaxDiff, Diff: TNeuralFloat;
@@ -7773,22 +7794,40 @@ begin
     begin
       GateE := NN.AddLayerAfter(TNNetSplitChannels.Create(ExpertIdx, 1), GateTopK);
       GateBroadcast := NN.AddLayer(TNNetDeepConcat.Replicate(HiddenSize, GateE));
+      // Llama-4 scales the expert INPUT, everyone else the expert OUTPUT.
+      if ScaleInputByGate then
+        ExpertIn := NN.AddLayer(
+          TNNetCellMulByCell.Create(InputLayer, GateBroadcast))
+      else ExpertIn := InputLayer;
       RefGateUp := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(2 * ExpertWidth), InputLayer);
+        TNNetPointwiseConvLinear.Create(2 * ExpertWidth), ExpertIn);
       NN.AddLayer(TNNetSwiGLU.Create());
       RefDown := NN.AddLayer(TNNetPointwiseConvLinear.Create(HiddenSize));
-      Branches[ExpertIdx] := NN.AddLayer(
-        TNNetCellMulByCell.Create(RefDown, GateBroadcast));
+      if ScaleInputByGate then
+        Branches[ExpertIdx] := RefDown
+      else
+        Branches[ExpertIdx] := NN.AddLayer(
+          TNNetCellMulByCell.Create(RefDown, GateBroadcast));
       FillMoEBankLinear(RefGateUp, 1, ExpertIdx * 2 * ExpertWidth);
       FillMoEBankLinear(RefDown, 2, ExpertIdx * HiddenSize);
+      if ScaleInputByGate then
+      begin
+        ZeroMoEBankBiases(RefGateUp);
+        ZeroMoEBankBiases(RefDown);
+      end;
     end;
     RefOut := NN.AddLayer(TNNetSum.Create(Branches));
     // The fused bank, reading the same source and the same router.
     BankGateUp := NN.AddLayer(TNNetMoEExpertBankGateUp.Create(
-      ExpertCnt, ExpertWidth, InputLayer, GateTopK));
+      ExpertCnt, ExpertWidth, InputLayer, GateTopK, ScaleInputByGate));
     BankDown := NN.AddLayer(TNNetMoEExpertBankDown.Create(ExpertCnt, HiddenSize));
     FillMoEBankLinear(BankGateUp, 1, 0);
     FillMoEBankLinear(BankDown, 2, 0);
+    if ScaleInputByGate then
+    begin
+      ZeroMoEBankBiases(BankGateUp);
+      ZeroMoEBankBiases(BankDown);
+    end;
     if SwapBankHalves then
       SwapMoEBankGateUpHalves(BankGateUp, ExpertCnt, ExpertWidth);
     if QuantizeBanks then
@@ -7884,6 +7923,53 @@ begin
   // TopCnt = ExpertCnt: the gate degenerates to the identity and every expert
   // fires for every token.
   RunMoEBankParity(2, 5, 3, 3, 3, false, 'dense gate');
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankParityScaleInput;
+begin
+  // Llama-4 routing: expert(g*x), not g*expert(x). gate|up is linear in x, so
+  // the bank scales the raw dot products before the (nonlinear) SwiGLU fold
+  // and the down bank combines with weight 1.
+  RunMoEBankParity({TokenCnt=}3, {HiddenSize=}6, {ExpertCnt=}5,
+    {ExpertWidth=}4, {TopCnt=}2, {UniformRouting=}false, 'scale-input k<E',
+    {QuantizeBanks=}false, {SwapBankHalves=}false, {Tolerance=}1e-4,
+    {ExpectMismatch=}false, {ScaleInputByGate=}true);
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankParityScaleInputInt8;
+begin
+  RunMoEBankParity(3, 6, 5, 4, 2, false, 'scale-input int8',
+    {QuantizeBanks=}true, {SwapBankHalves=}false, {Tolerance=}3e-3,
+    {ExpectMismatch=}false, {ScaleInputByGate=}true);
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankScaleInputRoundTrip;
+var
+  NN, NN2: TNNet;
+  InputLayer, GateTopK: TNNetLayer;
+  StructA: string;
+begin
+  // The flag rides in FStruct, so a saved structure must bring it back.
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(4, 1, 8));
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    NN.AddLayer(TNNetPointwiseSoftMax.Create());
+    GateTopK := NN.AddLayer(TNNetTopKGate.Create(2));
+    NN.AddLayer(TNNetMoEExpertBankGateUp.Create(6, 5, InputLayer, GateTopK,
+      {pScaleInputByGate=}true));
+    NN.AddLayer(TNNetMoEExpertBankDown.Create(6, 8));
+    StructA := NN.SaveStructureToString();
+    NN2.LoadStructureFromString(StructA);
+    AssertEquals('scale-input structure round trip', StructA,
+      NN2.SaveStructureToString());
+    AssertTrue('reloaded gate|up keeps ScaleInputByGate',
+      TNNetMoEExpertBankGateUp(NN2.Layers[4]).ScaleInputByGate);
+  finally
+    NN.Free;
+    NN2.Free;
+  end;
 end;
 
 procedure TTestNeuralLayersExtra.TestMoEExpertBankShapesAndRoundTrip;
