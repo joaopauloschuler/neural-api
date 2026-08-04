@@ -52591,10 +52591,25 @@ begin
 
       // ---------------- Architecture (single pre-norm residual / block) ----
       NN := TNNet.Create();
+      // Arm BEFORE the first AddLayer so every eligible layer skips the FP32
+      // weight allocation from the very first block (the per-block
+      // QuantizeWeightsInt8 sweeps below would arm it anyway, but only after
+      // block 0 was built FP32). With the flag armed, attaching a
+      // projection/MLP/expert/LM-head layer allocates the int8 container
+      // directly - the process never touches the FP32 weight footprint.
+      NN.BuildQuantInt8 := pQuantizeInt8;
       NN.AddLayer( TNNetInput.Create(SeqLen) );
+      // pTrainable/pQuantizeInt8 forwarded so the constructor sizes only what
+      // this build needs: no Delta/BackInertia when inference-only, and no
+      // FP32 vocab table at all when int8-armed (the vocab table is the
+      // single largest tensor - the old create-3xFP32-then-shrink sequence
+      // set a process-lifetime allocator high-water mark).
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1,
+        {ScaleEmbedding=}0.02, pTrainable, pQuantizeInt8
+        ).SetTrainable(pTrainable) );
       if not pTrainable then NN.SetTrainable();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(KSlices, Config.NumKVHeads);
       SetLength(VSlices, Config.NumKVHeads);

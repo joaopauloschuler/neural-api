@@ -111,6 +111,14 @@ type
     procedure AssertInt8DriftSeq2Seq(const FamilyName: string;
       EncF, DecF, EncQ, DecQ: TNNet; EncSeqLen, DecSeqLen, VocabRange,
       MinQuantLayers: integer; MaxRelDrift: double);
+    // Asserts that an int8-ARMED build (weights streamed straight into the
+    // codes) holds exactly the codes and scales an FP32 build re-quantized
+    // by QuantizeWeightsInt8 holds - byte for byte, scales at delta 0. That
+    // equivalence is what lets an importer skip materializing FP32 weights.
+    // Only meaningful when the family folds no per-row scale, which would
+    // make the two paths equal only up to a rounding of the scale product.
+    procedure AssertInt8StreamCodeParity(const FamilyName: string;
+      NNStreamed, NNRoundTrip: TNNet; MinCmpLayers: integer);
     // Shared RRDBNet parity body: compares NN.Compute(io.input) against the
     // io.json oracle image (< 1e-4). PRIVATE (parameterized; not auto-run).
     procedure RunRRDBNetParity(NN: TNNet; const Config: TRRDBNetConfig;
@@ -183,6 +191,8 @@ type
     procedure TestInt8QuantizedQwen35MoeLogitDrift;
     procedure TestInt8QuantizedGraniteMoeLogitDrift;
     procedure TestQwen35MoeInt8ExpertStreamCodeParity;
+    procedure TestInt8QuantizedNemotronHMoeLogitDrift;
+    procedure TestNemotronHMoeInt8StreamCodeParity;
     procedure TestTokenRMSNormForwardAndSaveLoad;
     procedure TestRotaryHalfPermutationMatchesHFRotateHalf;
     procedure TestSwiGLUMatchesLlamaMLPGating;
@@ -5033,15 +5043,52 @@ end;
 // NOT reachable from here - every in-tree reader that reaches this loader
 // streams. It was verified by forcing CanStreamTensorRows to false and
 // re-running this suite.
-procedure TTestNeuralPretrained.TestQwen35MoeInt8ExpertStreamCodeParity;
+procedure TTestNeuralPretrained.AssertInt8StreamCodeParity(
+  const FamilyName: string; NNStreamed, NNRoundTrip: TNNet;
+  MinCmpLayers: integer);
 var
-  NNStreamed, NNRoundTrip: TNNet;
-  Config: TLlamaConfig;
   i, r, CmpLayers: integer;
   CWa, CWb: TNNetLayerConcatedWeights;
   CodesA, CodesB: TInt8DynArr;
   ScalesA, ScalesB: TNeuralFloatDynArr;
   RowsA, RowsB, VSa, VSb: integer;
+begin
+  NNRoundTrip.QuantizeWeightsInt8();
+  AssertEquals(FamilyName + ': layer count', NNStreamed.Layers.Count,
+    NNRoundTrip.Layers.Count);
+  CmpLayers := 0;
+  for i := 0 to NNStreamed.Layers.Count - 1 do
+  begin
+    if not (NNStreamed.Layers[i] is TNNetLayerConcatedWeights) then continue;
+    CWa := TNNetLayerConcatedWeights(NNStreamed.Layers[i]);
+    CWb := TNNetLayerConcatedWeights(NNRoundTrip.Layers[i]);
+    if not CWa.GetInt8QuantData(CodesA, ScalesA, RowsA, VSa) then continue;
+    AssertTrue(FamilyName + ': layer ' + IntToStr(i) +
+      ': round-trip net not quantized',
+      CWb.GetInt8QuantData(CodesB, ScalesB, RowsB, VSb));
+    AssertEquals(FamilyName + ': layer ' + IntToStr(i) + ': rows',
+      RowsA, RowsB);
+    AssertEquals(FamilyName + ': layer ' + IntToStr(i) + ': vector size',
+      VSa, VSb);
+    for r := 0 to RowsA * VSa - 1 do
+      if CodesA[r] <> CodesB[r] then
+        Fail(FamilyName + ': layer ' + IntToStr(i) + ': int8 code ' +
+          IntToStr(r) + ' streamed ' + IntToStr(CodesA[r]) +
+          ' <> round-trip ' + IntToStr(CodesB[r]));
+    for r := 0 to RowsA - 1 do
+      AssertEquals(FamilyName + ': layer ' + IntToStr(i) + ': scale ' +
+        IntToStr(r), ScalesA[r], ScalesB[r], 0);
+    Inc(CmpLayers);
+  end;
+  AssertTrue(FamilyName + ': expected >= ' + IntToStr(MinCmpLayers) +
+    ' compared int8 layers, got ' + IntToStr(CmpLayers),
+    CmpLayers >= MinCmpLayers);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35MoeInt8ExpertStreamCodeParity;
+var
+  NNStreamed, NNRoundTrip: TNNet;
+  Config: TLlamaConfig;
 begin
   RandSeed := 424242;
   NNStreamed := BuildQwen35MoeFromSafeTensorsEx(
@@ -5052,33 +5099,78 @@ begin
     FixturePath('tiny_qwen3_5_moe.safetensors'), Config, {SeqLen=}8,
     {pTrainable=}false, FixturePath('tiny_qwen3_5_moe_config.json'));
   try
-    NNRoundTrip.QuantizeWeightsInt8();
-    AssertEquals('layer count', NNStreamed.Layers.Count,
-      NNRoundTrip.Layers.Count);
-    CmpLayers := 0;
-    for i := 0 to NNStreamed.Layers.Count - 1 do
-    begin
-      if not (NNStreamed.Layers[i] is TNNetLayerConcatedWeights) then continue;
-      CWa := TNNetLayerConcatedWeights(NNStreamed.Layers[i]);
-      CWb := TNNetLayerConcatedWeights(NNRoundTrip.Layers[i]);
-      if not CWa.GetInt8QuantData(CodesA, ScalesA, RowsA, VSa) then continue;
-      AssertTrue('layer ' + IntToStr(i) + ': round-trip net not quantized',
-        CWb.GetInt8QuantData(CodesB, ScalesB, RowsB, VSb));
-      AssertEquals('layer ' + IntToStr(i) + ': rows', RowsA, RowsB);
-      AssertEquals('layer ' + IntToStr(i) + ': vector size', VSa, VSb);
-      for r := 0 to RowsA * VSa - 1 do
-        if CodesA[r] <> CodesB[r] then
-          Fail('layer ' + IntToStr(i) + ': int8 code ' + IntToStr(r) +
-            ' streamed ' + IntToStr(CodesA[r]) + ' <> round-trip ' +
-            IntToStr(CodesB[r]));
-      for r := 0 to RowsA - 1 do
-        AssertEquals('layer ' + IntToStr(i) + ': scale ' + IntToStr(r),
-          ScalesA[r], ScalesB[r], 0);
-      Inc(CmpLayers);
-    end;
     // The experts alone are 4 blocks x 4 experts x 2 layers.
-    AssertTrue('expected >= 40 compared int8 layers, got ' +
-      IntToStr(CmpLayers), CmpLayers >= 40);
+    AssertInt8StreamCodeParity('Qwen3.5-MoE', NNStreamed, NNRoundTrip,
+      {MinCmpLayers=}40);
+  finally
+    NNRoundTrip.Free;
+    NNStreamed.Free;
+  end;
+end;
+
+// Int8 gates for the Nemotron-H hybrid MoE ('E' block on the M/*/-/E
+// schedule) - the family's FIRST int8 coverage of any kind. The importer arms
+// TNNet.BuildQuantInt8 BEFORE its first AddLayer so an int8 build never sizes
+// an FP32 weight row; these tests do NOT observe that (peak RAM is invisible
+// from here, and the post-hoc QuantizeWeightsInt8 sweeps reach the same
+// quantized END state by a costlier route - measured with a temporary
+// allocation counter instead: 172 FP32 neuron rows sized before the arming,
+// 0 after). What they DO guard is that the int8 path stays correct for a
+// builder whose every layer changed storage class.
+// The drift gate is loose for the same reason as the other MoE families: the
+// router is itself a quantized PointwiseConvLinear, and at pico width
+// (hidden 8, 4 experts) int8 noise readily flips a top-k pick, which swaps a
+// whole expert MLP in or out of the sum. Measured 2026-08: 7.9e-1 relative,
+// and reproduced to the last digit (2.92986726760864 / 3.68496417999268) by
+// the pre-arming builder - so the magnitude is the fixture's quantization
+// sensitivity, not a property of the arming. The exact guard is the code
+// parity test below; this one catches a layer that stops being quantized.
+procedure TTestNeuralPretrained.TestInt8QuantizedNemotronHMoeLogitDrift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TNemotronHConfig;
+begin
+  RandSeed := 424242;
+  NNFP32 := BuildNemotronHFromSafeTensorsEx(
+    FixturePath('tiny_nemotronh_moe.safetensors'), Config, {SeqLen=}7,
+    {pTrainable=}true, FixturePath('tiny_nemotronh_moe_config.json'));
+  NNQ := BuildNemotronHFromSafeTensorsEx(
+    FixturePath('tiny_nemotronh_moe.safetensors'), Config, {SeqLen=}7,
+    {pTrainable=}false, FixturePath('tiny_nemotronh_moe_config.json'),
+    {pQuantizeInt8=}true);
+  try
+    // Schedule 'M*E-': mamba in/out (2) + attention q/k/v/o (4) + router (1)
+    // + 4 experts x 2 (8) + MLP up/down (2) + shared expert up/down (2) +
+    // the LM head (1) = 20 armed layers.
+    AssertInt8DriftPair('Nemotron-H-MoE', NNFP32, NNQ, 7, Config.VocabSize,
+      {MinQuantLayers=}18, {MaxRelDrift=}9e-1, {TwoChannelInput=}false);
+  finally
+    NNQ.Free;
+    NNFP32.Free;
+  end;
+end;
+
+// Nemotron-H folds no per-row scale anywhere (no residual_multiplier, no
+// logits_scaling), so the armed-and-streamed codes must equal the FP32
+// round-trip EXACTLY rather than up to a rounding of a scale product. This is
+// the precise guard on the streaming path; the drift gate above is the
+// structural one.
+procedure TTestNeuralPretrained.TestNemotronHMoeInt8StreamCodeParity;
+var
+  NNStreamed, NNRoundTrip: TNNet;
+  Config: TNemotronHConfig;
+begin
+  RandSeed := 424242;
+  NNStreamed := BuildNemotronHFromSafeTensorsEx(
+    FixturePath('tiny_nemotronh_moe.safetensors'), Config, {SeqLen=}7,
+    {pTrainable=}false, FixturePath('tiny_nemotronh_moe_config.json'),
+    {pQuantizeInt8=}true);
+  NNRoundTrip := BuildNemotronHFromSafeTensorsEx(
+    FixturePath('tiny_nemotronh_moe.safetensors'), Config, {SeqLen=}7,
+    {pTrainable=}false, FixturePath('tiny_nemotronh_moe_config.json'));
+  try
+    AssertInt8StreamCodeParity('Nemotron-H-MoE', NNStreamed, NNRoundTrip,
+      {MinCmpLayers=}18);
   finally
     NNRoundTrip.Free;
     NNStreamed.Free;
