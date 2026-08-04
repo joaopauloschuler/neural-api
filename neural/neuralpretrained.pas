@@ -15440,6 +15440,81 @@ begin
   end;
 end;
 
+// Loads a 3-D MoE expert slab [NumExperts, OutDim, InDim] - a row-major stack
+// of ordinary [out, in] expert matrices - into one bias-free linear layer per
+// expert (neuron o = output row o, the identity map). Scale folds a per-model
+// row multiplier (granite's residual_multiplier) into the loaded rows.
+// ErrPrefix names the importing family in the diagnostics.
+//
+// Expert e occupies the disjoint row block e*OutDim .. (e+1)*OutDim-1 of the
+// flat [NumExperts*OutDim, InDim] view, so a streaming reader loads it through
+// LoadLlamaLinearWeights' flat-slab row mode: an int8-armed build quantizes
+// each expert straight into its codes and never materializes an FP32 expert.
+//
+// Readers that cannot serve row ranges (GGUF ggml types outside the
+// row-streamable set, the synthetic view readers) fall back to ONE staged copy
+// of the slab shared by every expert. Streaming per expert there would re-read
+// - and re-decode - the whole slab NumExperts times, which at real expert
+// counts is not a slow path but a hang. Coded by Claude (AI).
+procedure LoadMoEExpertSlab(Reader: TNNetSafeTensorsReader;
+  const Layers: array of TNNetLayer; const TName: string;
+  NumExperts, OutDim, InDim: integer; Scale: TNeuralFloat;
+  const ErrPrefix: string);
+var
+  e, j, SlabRows, NumExpertsM1, OutDimM1, srcOfs: integer;
+  L: TNNetLayer;
+  WV, W: TNNetVolume;
+begin
+  if not Reader.HasTensor(TName) then
+    ImportError(ErrPrefix + 'missing tensor "' + TName + '".');
+  if (Reader.DimCount(TName) <> 3) or
+     (Reader.DimSize(TName, 0) <> NumExperts) or
+     (Reader.DimSize(TName, 1) <> OutDim) or
+     (Reader.DimSize(TName, 2) <> InDim) then
+    ImportError(ErrPrefix + 'MoE expert slab "' + TName +
+      '" must have shape [' + IntToStr(NumExperts) + ', ' + IntToStr(OutDim) +
+      ', ' + IntToStr(InDim) + '], got ' + Reader.ShapeAsString(TName));
+  SlabRows := NumExperts * OutDim;
+  NumExpertsM1 := NumExperts - 1;
+  if Reader.CanStreamTensorRows(TName) then
+  begin
+    for e := 0 to NumExpertsM1 do
+      LoadLlamaLinearWeights(Reader, Layers[e], TName,
+        {InDim=}InDim, {OutDim=}OutDim, {NeuronBase=}0,
+        {ExpectedNeurons=}OutDim, {RotaryHeadDim=}0, {BiasName=}'',
+        {Scale=}Scale, {RotaryDims=}0,
+        {SrcRowBase=}e * OutDim, {SrcRows=}SlabRows, {pFlatSlabRows=}true);
+    exit;
+  end;
+  OutDimM1 := OutDim - 1;
+  W := TNNetVolume.Create;
+  try
+    Reader.LoadTensorFlat(TName, W);
+    for e := 0 to NumExpertsM1 do
+    begin
+      L := Layers[e];
+      EnsureWritableImportWeights(L);
+      srcOfs := e * OutDim * InDim;
+      for j := 0 to OutDimM1 do
+      begin
+        WV := L.FArrNeurons[j].Weights;
+        if WV.Size <> InDim then
+          ImportError(ErrPrefix + 'internal error - neuron ' + IntToStr(j) +
+            ' for "' + TName + '" has ' + IntToStr(WV.Size) +
+            ' weights, expected ' + IntToStr(InDim) + '.');
+        Move(W.FData[srcOfs], WV.FData[0], InDim * csNeuralFloatSize);
+        if Scale <> 1.0 then
+          TNNetVolume.Mul(WV.GetRawPtr(0), Scale, InDim);
+        L.FArrNeurons[j].BiasWeight := 0;
+        Inc(srcOfs, InDim);
+      end;
+      L.FlushWeightCache();
+    end;
+  finally
+    W.Free;
+  end;
+end;
+
 // Loads granitemoe's FUSED 3-D expert slab for one block (no Mixtral-style
 // per-expert 2-D tensors). HF GraniteMoeParallelExperts stack every expert
 // into one tensor:
@@ -15471,24 +15546,26 @@ procedure LoadGraniteMoEExperts(Reader: TNNetSafeTensorsReader;
   const pOutName: string = ''; const pRouterName: string = '');
 var
   InName, OutName, RouterName: string;
-  EG, ED: TNNetLayer;
-  e, TwoI, SlabInRows, SlabOutRows: integer;
-  NumExpertsM1, ExpertWidthM1, HiddenSizeM1: integer;
+  EG: TNNetLayer;
+  e, TwoI, SlabInRows: integer;
+  NumExpertsM1, ExpertWidthM1: integer;
   W: TNNetVolume;
 
   // Fallback for readers that cannot serve row ranges (GGUF ggml types
   // outside the row-streamable set, the synthetic view readers): fill the
   // experts from ONE staged copy of the slab. Streaming per expert would
-  // otherwise re-read - and re-decode - the whole slab 3*NumExperts times
+  // otherwise re-read - and re-decode - the whole slab 2*NumExperts times
   // per block, which at real expert counts is not a slow path but a hang.
   // This is the slab-sized FP32 transient the streaming path exists to
-  // avoid, so it is confined to readers that leave no alternative.
-  procedure FillExpertsFromStagedSlab;
+  // avoid, so it is confined to readers that leave no alternative. The down
+  // slab has no half-swap, so LoadMoEExpertSlab carries its own copy of
+  // this fallback and only the gate|up interleave is open-coded here.
+  procedure FillGateUpFromStagedSlab;
   var
     e, j: integer;
-    EG, ED: TNNetLayer;
+    EG: TNNetLayer;
     WV: TNNetVolume;
-    srcUpOfs, srcGateOfs, srcOfs: integer;
+    srcUpOfs, srcGateOfs: integer;
   begin
     Reader.LoadTensorFlat(InName, W); // flat [E*2I, H]
     for e := 0 to NumExpertsM1 do
@@ -15511,32 +15588,13 @@ var
       end;
       EG.FlushWeightCache();
     end;
-    Reader.LoadTensorFlat(OutName, W); // flat [E*H, I]
-    for e := 0 to NumExpertsM1 do
-    begin
-      ED := Block.ExpertDown[e];
-      EnsureWritableImportWeights(ED);
-      srcOfs := (e * HiddenSize) * ExpertWidth;
-      for j := 0 to HiddenSizeM1 do
-      begin
-        WV := ED.FArrNeurons[j].Weights;
-        Move(W.FData[srcOfs], WV.FData[0], ExpertWidth * csNeuralFloatSize);
-        if ResidualScale <> 1.0 then
-          TNNetVolume.Mul(WV.GetRawPtr(0), ResidualScale, ExpertWidth);
-        ED.FArrNeurons[j].BiasWeight := 0;
-        Inc(srcOfs, ExpertWidth);
-      end;
-      ED.FlushWeightCache();
-    end;
   end;
 
 begin
   TwoI := 2 * ExpertWidth;
   NumExpertsM1 := NumExperts - 1;
   ExpertWidthM1 := ExpertWidth - 1;
-  HiddenSizeM1 := HiddenSize - 1;
   SlabInRows := NumExperts * TwoI;      // input_linear as flat [E*2I, H]
-  SlabOutRows := NumExperts * HiddenSize; // output_linear as flat [E*H, I]
   if pInName <> '' then InName := pInName
   else InName := BlockPrefix + 'block_sparse_moe.input_linear.weight';
   if pOutName <> '' then OutName := pOutName
@@ -15561,54 +15619,42 @@ begin
     ImportError('Llama import: "' + InName + '" must have shape [' +
       IntToStr(NumExperts) + ', ' + IntToStr(TwoI) + ', ' +
       IntToStr(HiddenSize) + '], got ' + Reader.ShapeAsString(InName));
-  if (Reader.DimCount(OutName) <> 3) or
-     (Reader.DimSize(OutName, 0) <> NumExperts) or
-     (Reader.DimSize(OutName, 1) <> HiddenSize) or
-     (Reader.DimSize(OutName, 2) <> ExpertWidth) then
-    ImportError('Llama import: "' + OutName + '" must have shape [' +
-      IntToStr(NumExperts) + ', ' + IntToStr(HiddenSize) + ', ' +
-      IntToStr(ExpertWidth) + '], got ' + Reader.ShapeAsString(OutName));
-  if not (Reader.CanStreamTensorRows(InName) and
-          Reader.CanStreamTensorRows(OutName)) then
+  if Reader.CanStreamTensorRows(InName) then
+  begin
+    for e := 0 to NumExpertsM1 do
+    begin
+      EG := Block.ExpertGateUp[e];
+      // UP half (input_linear rows I..2I-1) -> neurons 0..I-1, then GATE half
+      // (rows 0..I-1) -> neurons I..2I-1. Two DISJOINT row blocks of the same
+      // flat slab, so each is an ordinary row-streamed load.
+      LoadLlamaLinearWeights(Reader, EG, InName,
+        {InDim=}HiddenSize, {OutDim=}ExpertWidth, {NeuronBase=}0,
+        {ExpectedNeurons=}TwoI, {RotaryHeadDim=}0, {BiasName=}'',
+        {Scale=}1.0, {RotaryDims=}0,
+        {SrcRowBase=}e * TwoI + ExpertWidth, {SrcRows=}SlabInRows,
+        {pFlatSlabRows=}true);
+      LoadLlamaLinearWeights(Reader, EG, InName,
+        {InDim=}HiddenSize, {OutDim=}ExpertWidth, {NeuronBase=}ExpertWidth,
+        {ExpectedNeurons=}TwoI, {RotaryHeadDim=}0, {BiasName=}'',
+        {Scale=}1.0, {RotaryDims=}0,
+        {SrcRowBase=}e * TwoI, {SrcRows=}SlabInRows,
+        {pFlatSlabRows=}true);
+    end;
+  end
+  else
   begin
     W := TNNetVolume.Create;
     try
-      FillExpertsFromStagedSlab;
+      FillGateUpFromStagedSlab;
     finally
       W.Free;
     end;
-    Consumed.Add(InName);
-    Consumed.Add(OutName);
-    exit;
   end;
-  for e := 0 to NumExpertsM1 do
-  begin
-    EG := Block.ExpertGateUp[e];
-    // UP half (input_linear rows I..2I-1) -> neurons 0..I-1, then GATE half
-    // (rows 0..I-1) -> neurons I..2I-1. Two DISJOINT row blocks of the same
-    // flat slab, so each is an ordinary row-streamed load.
-    LoadLlamaLinearWeights(Reader, EG, InName,
-      {InDim=}HiddenSize, {OutDim=}ExpertWidth, {NeuronBase=}0,
-      {ExpectedNeurons=}TwoI, {RotaryHeadDim=}0, {BiasName=}'',
-      {Scale=}1.0, {RotaryDims=}0,
-      {SrcRowBase=}e * TwoI + ExpertWidth, {SrcRows=}SlabInRows,
-      {pFlatSlabRows=}true);
-    LoadLlamaLinearWeights(Reader, EG, InName,
-      {InDim=}HiddenSize, {OutDim=}ExpertWidth, {NeuronBase=}ExpertWidth,
-      {ExpectedNeurons=}TwoI, {RotaryHeadDim=}0, {BiasName=}'',
-      {Scale=}1.0, {RotaryDims=}0,
-      {SrcRowBase=}e * TwoI, {SrcRows=}SlabInRows,
-      {pFlatSlabRows=}true);
-    // ---- output_linear [E, H, I]: this expert's down (residual_multiplier
-    //      folds into the rows through Scale) ----
-    ED := Block.ExpertDown[e];
-    LoadLlamaLinearWeights(Reader, ED, OutName,
-      {InDim=}ExpertWidth, {OutDim=}HiddenSize, {NeuronBase=}0,
-      {ExpectedNeurons=}HiddenSize, {RotaryHeadDim=}0, {BiasName=}'',
-      {Scale=}ResidualScale, {RotaryDims=}0,
-      {SrcRowBase=}e * HiddenSize, {SrcRows=}SlabOutRows,
-      {pFlatSlabRows=}true);
-  end;
+  // ---- output_linear [E, H, I]: an ordinary [out, in] stack, so the shared
+  //      slab loader takes it (residual_multiplier folds through Scale) ----
+  LoadMoEExpertSlab(Reader, Block.ExpertDown, OutName,
+    NumExperts, {OutDim=}HiddenSize, {InDim=}ExpertWidth, ResidualScale,
+    'Llama import: ');
   Consumed.Add(InName);
   Consumed.Add(OutName);
 end;
@@ -52495,52 +52541,6 @@ var
     Layer.FlushWeightCache();
   end;
 
-  // Loads expert ExpertIdx's [OutDim, InDim] slice from a 3D MoE expert slab
-  // [NumExperts, OutDim, InDim] (PyTorch nn.Parameter, weight rows = outputs)
-  // into a TNNetPointwiseConvLinear (neuron o = output channel, bias-free).
-  procedure LoadMoEExpertSlice(Layer: TNNetLayer; const TName: string;
-    ExpertIdx, NumExperts, OutDim, InDim: integer);
-  var oo, ExpertBase, OutDimM1: integer; WV: TNNetVolume;
-  begin
-    if not Reader.HasTensor(TName) then
-      ImportError('Nemotron-H import: missing tensor "' + TName + '".');
-    if (Reader.DimCount(TName) <> 3) or
-       (Reader.DimSize(TName, 0) <> NumExperts) or
-       (Reader.DimSize(TName, 1) <> OutDim) or
-       (Reader.DimSize(TName, 2) <> InDim) then
-      ImportError('Nemotron-H import: MoE expert slab "' + TName +
-        '" must have shape [' + IntToStr(NumExperts) + ', ' + IntToStr(OutDim) +
-        ', ' + IntToStr(InDim) + '], got ' + Reader.ShapeAsString(TName));
-    // Stream only this expert's [OutDim, InDim] row block. LoadTensorFlat
-    // would read - and BF16/F16-decode - the whole [NumExperts, OutDim,
-    // InDim] slab once per expert, so the routed experts of one block cost
-    // NumExperts^2 row decodes and a slab-sized transient peak.
-    if Reader.CanStreamTensorRows(TName) then
-    begin
-      Reader.LoadTensorRowsFlat(TName, ExpertIdx * OutDim, OutDim, InDim, Tmp);
-      ExpertBase := 0;
-    end
-    else
-    begin
-      Reader.LoadTensorFlat(TName, Tmp);
-      ExpertBase := ExpertIdx * OutDim * InDim;
-    end;
-    EnsureWritableImportWeights(Layer);
-    OutDimM1 := OutDim - 1;
-    for oo := 0 to OutDimM1 do
-    begin
-      WV := Layer.FArrNeurons[oo].Weights;
-      if WV.Size <> InDim then
-        ImportError('Nemotron-H import: internal error - neuron ' +
-          IntToStr(oo) + ' for "' + TName + '" has ' + IntToStr(WV.Size) +
-          ' weights, expected ' + IntToStr(InDim) + '.');
-      Move(Tmp.FData[ExpertBase], WV.FData[0], InDim * csNeuralFloatSize);
-      Inc(ExpertBase, InDim);
-      Layer.FArrNeurons[oo].BiasWeight := 0;
-    end;
-    Layer.FlushWeightCache();
-  end;
-
 begin
   Reader := CreatePretrainedTensorReader(FileName);
   NN := nil;
@@ -52886,16 +52886,16 @@ begin
               end;
               MarkConsumed(MoeP + 'gate.e_score_correction_bias');
             end;
-            // Routed experts: 3D slabs [E, *, *].
-            for e := 0 to NumRoutedExpertsM1 do
-            begin
-              LoadMoEExpertSlice(Blocks[BlockCnt].ExpertUp[e],
-                MoeP + 'experts.up_proj', e, Config.NumRoutedExperts,
-                Config.MoEIntermediateSize, Config.HiddenSize);
-              LoadMoEExpertSlice(Blocks[BlockCnt].ExpertDown[e],
-                MoeP + 'experts.down_proj', e, Config.NumRoutedExperts,
-                Config.HiddenSize, Config.MoEIntermediateSize);
-            end;
+            // Routed experts: 3D slabs [E, *, *] of ordinary [out, in] expert
+            // matrices, split up/down (no fused gate|up half-swap).
+            LoadMoEExpertSlab(Reader, Blocks[BlockCnt].ExpertUp,
+              MoeP + 'experts.up_proj', Config.NumRoutedExperts,
+              {OutDim=}Config.MoEIntermediateSize, {InDim=}Config.HiddenSize,
+              {Scale=}1.0, 'Nemotron-H import: ');
+            LoadMoEExpertSlab(Reader, Blocks[BlockCnt].ExpertDown,
+              MoeP + 'experts.down_proj', Config.NumRoutedExperts,
+              {OutDim=}Config.HiddenSize, {InDim=}Config.MoEIntermediateSize,
+              {Scale=}1.0, 'Nemotron-H import: ');
             MarkConsumed(MoeP + 'experts.up_proj');
             MarkConsumed(MoeP + 'experts.down_proj');
             // Shared expert (a plain non-gated relu2 MLP).
