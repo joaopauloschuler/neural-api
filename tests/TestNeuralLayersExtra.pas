@@ -182,6 +182,12 @@ type
     procedure TestMoEExpertBankInt8QuantizeSweep;
     procedure TestMoEExpertBankInt8ConstructionArming;
     procedure TestMoEExpertBankInt8BackpropagateRaises;
+    // Intra-layer chunking: the banks under a real parallel scheduler pass.
+    procedure TestMoEExpertBankChunkedParityMultiToken;
+    procedure TestMoEExpertBankChunkedParityDecode;
+    procedure TestMoEExpertBankChunkedParityInt8MultiToken;
+    procedure TestMoEExpertBankChunkedParityInt8Decode;
+    procedure TestMoEExpertBankChunkEligibility;
   private
     // Builds ONE net holding both the per-expert reference graph and the fused
     // bank behind the SAME router, then asserts the two outputs agree.
@@ -194,6 +200,11 @@ type
       TopCnt: integer; UniformRouting: boolean; const Msg: string;
       QuantizeBanks: boolean = false; SwapBankHalves: boolean = false;
       Tolerance: TNeuralFloat = 1e-4; ExpectMismatch: boolean = false);
+    // Serial vs scheduler-chunked A/B of the two banks alone (no reference
+    // graph): same weights, same input, one net computed serially and a second,
+    // never-computed net driven through ComputeParallel.
+    procedure RunMoEBankChunkParity(TokenCnt, HiddenSize, ExpertCnt,
+      ExpertWidth, TopCnt: integer; QuantizeBanks: boolean; const Msg: string);
   end;
 
 implementation
@@ -8097,6 +8108,161 @@ begin
       on E: Exception do RaisedDown := true;
     end;
     AssertTrue('int8 down bank is inference-only', RaisedDown);
+  finally
+    NN.Free;
+  end;
+end;
+
+// Builds the bank-only graph (router -> gate|up bank -> down bank) with
+// deterministic weights. Used twice per case so the serial reference and the
+// chunked run are separate nets holding identical weights.
+function BuildMoEBankChunkNet(TokenCnt, HiddenSize, ExpertCnt, ExpertWidth,
+  TopCnt: integer; QuantizeBanks: boolean;
+  out BankGateUp, BankDown: TNNetLayer): TNNet;
+var
+  InputLayer, GateConv, GateTopK: TNNetLayer;
+begin
+  Result := TNNet.Create();
+  InputLayer := Result.AddLayer(TNNetInput.Create(TokenCnt, 1, HiddenSize));
+  GateConv := Result.AddLayer(TNNetPointwiseConvLinear.Create(ExpertCnt));
+  Result.AddLayer(TNNetPointwiseSoftMax.Create());
+  GateTopK := Result.AddLayer(TNNetTopKGate.Create(TopCnt, {pRenormalize=}true));
+  BankGateUp := Result.AddLayer(TNNetMoEExpertBankGateUp.Create(
+    ExpertCnt, ExpertWidth, InputLayer, GateTopK));
+  BankDown := Result.AddLayer(TNNetMoEExpertBankDown.Create(ExpertCnt, HiddenSize));
+  FillMoEBankLinear(GateConv, 4, 0);
+  FillMoEBankLinear(BankGateUp, 1, 0);
+  FillMoEBankLinear(BankDown, 2, 0);
+  if QuantizeBanks then
+  begin
+    TNNetLayerConcatedWeights(BankGateUp).QuantizeWeightsInt8();
+    TNNetLayerConcatedWeights(BankDown).QuantizeWeightsInt8();
+  end;
+end;
+
+// Serial vs scheduler-chunked A/B. The comparison is BIT-EXACT on purpose:
+// chunking only partitions the expert axis (gate|up) and the token axis
+// (down), and every output element keeps the very same operand sequence it has
+// serially - no summation is redistributed across chunks. (The repo does not
+// require parallel forwards to be bit-identical in general; this pair simply
+// is, so anything weaker would hide a slicing bug.)
+// The chunked net is NEVER computed serially first: if PrepareChunkedForward
+// stopped building the slot map, its FSlotCount would still be all zeros and
+// the down bank would emit zeros, so the prep hook is genuinely under test.
+procedure TTestNeuralLayersExtra.RunMoEBankChunkParity(TokenCnt, HiddenSize,
+  ExpertCnt, ExpertWidth, TopCnt: integer; QuantizeBanks: boolean;
+  const Msg: string);
+var
+  SerialNN, ChunkNN: TNNet;
+  Input, SerialGateUp, SerialDown: TNNetVolume;
+  SerGateUp, SerDown, ChkGateUp, ChkDown: TNNetLayer;
+  Pos, MaxOutPos: integer;
+begin
+  Input := TNNetVolume.Create(TokenCnt, 1, HiddenSize);
+  SerialGateUp := TNNetVolume.Create();
+  SerialDown := TNNetVolume.Create();
+  SerialNN := nil;
+  ChunkNN := nil;
+  try
+    MaxOutPos := Input.Size - 1;
+    for Pos := 0 to MaxOutPos do Input.FData[Pos] := Sin(Pos * 0.37) * 0.8;
+
+    SerialNN := BuildMoEBankChunkNet(TokenCnt, HiddenSize, ExpertCnt,
+      ExpertWidth, TopCnt, QuantizeBanks, SerGateUp, SerDown);
+    SerialNN.Compute(Input);
+    SerialGateUp.Copy(SerGateUp.Output);
+    SerialDown.Copy(SerDown.Output);
+    AssertTrue(Msg + ' - serial reference is non-trivial',
+      SerialDown.GetMaxAbs() > 1e-3);
+
+    ChunkNN := BuildMoEBankChunkNet(TokenCnt, HiddenSize, ExpertCnt,
+      ExpertWidth, TopCnt, QuantizeBanks, ChkGateUp, ChkDown);
+    // Assert the chunk verdict BEFORE the pass: a serial fallback (single-core
+    // box) would switch intra-layer threading back off.
+    ChunkNN.EnableIntraLayerThreading(true);
+    AssertTrue(Msg + ' - gate|up bank is chunk-eligible', ChkGateUp.ChunkEligible());
+    AssertEquals(Msg + ' - gate|up chunks over experts', ExpertCnt,
+      ChkGateUp.ChunkWorkCount());
+    AssertEquals(Msg + ' - down chunks over tokens', TokenCnt,
+      ChkDown.ChunkWorkCount());
+    // The down bank splits the token axis, so a single-token decode step has
+    // nothing to split and stays whole.
+    AssertEquals(Msg + ' - down bank chunk eligibility', TokenCnt > 1,
+      ChkDown.ChunkEligible());
+    ChunkNN.SetTrainable(False);
+    ChunkNN.SchedulerMinGain := 0;
+    ChunkNN.Compute(Input, 0, {pParallel=}True);
+
+    AssertEquals(Msg + ' - gate|up slot output size', SerialGateUp.Size,
+      ChkGateUp.Output.Size);
+    MaxOutPos := SerialGateUp.Size - 1;
+    for Pos := 0 to MaxOutPos do
+      AssertTrue(Msg + ' - chunked gate|up must be bit-identical at ' +
+        IntToStr(Pos), SerialGateUp.FData[Pos] = ChkGateUp.Output.FData[Pos]);
+    AssertEquals(Msg + ' - down output size', SerialDown.Size,
+      ChkDown.Output.Size);
+    MaxOutPos := SerialDown.Size - 1;
+    for Pos := 0 to MaxOutPos do
+      AssertTrue(Msg + ' - chunked down bank must be bit-identical at ' +
+        IntToStr(Pos), SerialDown.FData[Pos] = ChkDown.Output.FData[Pos]);
+  finally
+    SerialNN.Free;
+    ChunkNN.Free;
+    Input.Free;
+    SerialGateUp.Free;
+    SerialDown.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankChunkedParityMultiToken;
+begin
+  // Sized past both banks' chunk-eligibility crossover: 4 tokens x 8 experts,
+  // hidden 256, expert width 64, 2 experts kept.
+  RunMoEBankChunkParity({TokenCnt=}4, {HiddenSize=}256, {ExpertCnt=}8,
+    {ExpertWidth=}64, {TopCnt=}2, {QuantizeBanks=}false, 'chunked prefill');
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankChunkedParityDecode;
+begin
+  // Decode shape: one token, so only the gate|up bank chunks (over experts).
+  RunMoEBankChunkParity(1, 256, 8, 64, 2, false, 'chunked decode');
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankChunkedParityInt8MultiToken;
+begin
+  // Same shapes with both banks quantized: the int8 bodies must slice exactly
+  // like the FP32 ones (the A/B is int8-vs-int8, so it is still bit-exact).
+  RunMoEBankChunkParity(4, 256, 8, 64, 2, true, 'chunked prefill int8');
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankChunkedParityInt8Decode;
+begin
+  RunMoEBankChunkParity(1, 256, 8, 64, 2, true, 'chunked decode int8');
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankChunkEligibility;
+var
+  NN: TNNet;
+  BankGateUp, BankDown: TNNetLayer;
+begin
+  // Threading off: the verdict is False no matter how big the bank is.
+  NN := BuildMoEBankChunkNet(4, 256, 8, 64, 2, false, BankGateUp, BankDown);
+  try
+    AssertFalse('gate|up not chunked without intra-layer threading',
+      BankGateUp.ChunkEligible());
+    AssertFalse('down not chunked without intra-layer threading',
+      BankDown.ChunkEligible());
+  finally
+    NN.Free;
+  end;
+  // A toy bank stays whole: the chunk barrier would cost more than the split.
+  NN := BuildMoEBankChunkNet(4, 6, 5, 4, 2, false, BankGateUp, BankDown);
+  try
+    NN.EnableIntraLayerThreading(true);
+    AssertFalse('tiny gate|up bank stays below the crossover',
+      BankGateUp.ChunkEligible());
+    AssertFalse('tiny down bank stays below the crossover',
+      BankDown.ChunkEligible());
   finally
     NN.Free;
   end;
