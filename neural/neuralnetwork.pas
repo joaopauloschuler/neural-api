@@ -13470,6 +13470,13 @@ type
       // for a token - the extra selections are dropped, which keeps the slot
       // writes in range because FErrorProc only prints.
       procedure BuildSlotMap();
+      // The by-expert forward proper, once the slot map is built. The banks
+      // leave FShouldConcatWeights false, so there is no inherited int8
+      // forward to fall back on: the quantized variant streams FQuantTable's
+      // codes per row with DotProductInt8 and applies the row scale once,
+      // exactly as TNNetFullConnect.ComputeQuantizedInt8Range does.
+      procedure ComputeExperts();
+      procedure ComputeExpertsQuantizedInt8();
     public
       constructor Create(pNumExperts, pExpertWidth, pSourceLayerIdx,
         pGateLayerIdx: integer); reintroduce; overload;
@@ -13499,6 +13506,11 @@ type
       FBank: TNNetMoEExpertBankGateUp;
       FNumExperts, FHiddenSize, FExpertWidth, FTopK, FTokenCnt: integer;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      // The by-token gate-weighted mixture. The quantized variant streams
+      // FQuantTable's codes per down row with DotProductInt8; there is no
+      // inherited int8 forward here either (see the gate|up bank).
+      procedure ComputeMixture();
+      procedure ComputeMixtureQuantizedInt8();
     public
       constructor Create(pNumExperts, pHiddenSize: integer); reintroduce; overload;
       procedure Compute(); override;
@@ -97958,13 +97970,9 @@ end;
 procedure TNNetMoEExpertBankGateUp.Compute();
 var
   StartTime: double;
-  ExpertIdx, PairPos, PairIdx, TokenIdx, SlotIdx, WidthIdx: integer;
-  MaxExpertPos, MaxPairPos, MaxWidthPos, MaxTokenPos, MaxNeuronPos: integer;
-  RowBase, OutBase, SlotSize: integer;
-  UpVal, GateVal, SigVal: TNeuralFloat;
-  SrcPtr: TNeuralFloatArrPtr;
-  SrcVol: TNNetVolume;
-  UpNeuron, GateNeuron: TNNetNeuron;
+  TokenIdx, SlotIdx: integer;
+  MaxTokenPos, MaxNeuronPos: integer;
+  SlotSize: integer;
 begin
   StartTime := Now();
   MaxNeuronPos := FNeurons.Count - 1;
@@ -97982,9 +97990,28 @@ begin
       FillChar(FOutput.FData[TokenIdx * SlotSize + SlotIdx * FExpertWidth],
         (FTopK - SlotIdx) * FExpertWidth * csNeuralFloatSize, 0);
   end;
+  // Quantized weights: QuantizeWeightsInt8 released the per-neuron FP32 rows,
+  // so the FP32 nest would read shrunk storage.
+  if FQuantInt8
+    then ComputeExpertsQuantizedInt8()
+    else ComputeExperts();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMoEExpertBankGateUp.ComputeExperts();
+var
+  ExpertIdx, PairPos, PairIdx, TokenIdx, SlotIdx, WidthIdx: integer;
+  MaxExpertPos, MaxPairPos, MaxWidthPos: integer;
+  RowBase, OutBase, SlotSize: integer;
+  UpVal, GateVal, SigVal: TNeuralFloat;
+  SrcPtr: TNeuralFloatArrPtr;
+  SrcVol: TNNetVolume;
+  UpNeuron, GateNeuron: TNNetNeuron;
+begin
   // By expert, so an expert's 2I weight rows are streamed once for all the
   // tokens that selected it, and an unselected expert is skipped entirely.
   SrcVol := FSourceLayer.FOutput;
+  SlotSize := FTopK * FExpertWidth;
   MaxExpertPos := FNumExperts - 1;
   MaxWidthPos := FExpertWidth - 1;
   for ExpertIdx := 0 to MaxExpertPos do
@@ -98012,7 +98039,63 @@ begin
       end;
     end;
   end;
-  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// int8 twin of ComputeExperts: DotProductInt8 streams the row's codes straight
+// against the FP32 source row (no dequantized copy, no scratch buffer) and the
+// per-row scale is applied once to the raw code sum. Biases stay FP32 and are
+// added exactly as the FP32 nest does. Coded by Claude (AI).
+procedure TNNetMoEExpertBankGateUp.ComputeExpertsQuantizedInt8();
+var
+  ExpertIdx, PairPos, PairIdx, TokenIdx, SlotIdx, WidthIdx: integer;
+  MaxExpertPos, MaxPairPos, MaxWidthPos: integer;
+  RowBase, GateRowBase, OutBase, SlotSize: integer;
+  UpCodeBase, GateCodeBase, VS: integer;
+  UpVal, GateVal, SigVal: TNeuralFloat;
+  SrcPtr: TNeuralFloatArrPtr;
+  SrcVol: TNNetVolume;
+  CodesPtr: TNeuralInt8ArrPtr;
+  ScalePtr: TNeuralFloatArrPtr;
+begin
+  CodesPtr := FQuantTable.DataPtr;   // #13: table bases hoisted out of the nest
+  ScalePtr := FQuantTable.ScalePtr;
+  VS := FQuantVectorSize;
+  SrcVol := FSourceLayer.FOutput;
+  SlotSize := FTopK * FExpertWidth;
+  MaxExpertPos := FNumExperts - 1;
+  MaxWidthPos := FExpertWidth - 1;
+  for ExpertIdx := 0 to MaxExpertPos do
+  begin
+    MaxPairPos := FExpertStart[ExpertIdx + 1] - 1;
+    RowBase := ExpertIdx * 2 * FExpertWidth;
+    GateRowBase := RowBase + FExpertWidth;
+    for PairPos := FExpertStart[ExpertIdx] to MaxPairPos do
+    begin
+      PairIdx := FExpertPairs[PairPos];
+      TokenIdx := PairIdx div FTopK;
+      SlotIdx := PairIdx - TokenIdx * FTopK;
+      SrcPtr := SrcVol.GetRawPtr(TokenIdx * FVectorSize);
+      OutBase := TokenIdx * SlotSize + SlotIdx * FExpertWidth;
+      UpCodeBase := RowBase * VS;        // #6: first up row's code offset
+      GateCodeBase := GateRowBase * VS;  // #6: first gate row's code offset
+      for WidthIdx := 0 to MaxWidthPos do
+      begin
+        UpVal := TNNetVolume.DotProductInt8(
+            TNeuralInt8ArrPtr(@CodesPtr^[UpCodeBase]), SrcPtr, VS) *
+          ScalePtr^[RowBase + WidthIdx] +
+          FArrNeurons[RowBase + WidthIdx].FBiasWeight;
+        GateVal := TNNetVolume.DotProductInt8(
+            TNeuralInt8ArrPtr(@CodesPtr^[GateCodeBase]), SrcPtr, VS) *
+          ScalePtr^[GateRowBase + WidthIdx] +
+          FArrNeurons[GateRowBase + WidthIdx].FBiasWeight;
+        // SwiGLU: up * swish(gate) - the scalar form of TNNetSwiGLU.
+        SigVal := 1 / (1 + NeuralExp(-GateVal));
+        FOutput.FData[OutBase + WidthIdx] := UpVal * (GateVal * SigVal);
+        Inc(UpCodeBase, VS);             // #6: next up row's code offset
+        Inc(GateCodeBase, VS);           // #6: next gate row's code offset
+      end;
+    end;
+  end;
 end;
 
 procedure TNNetMoEExpertBankGateUp.Backpropagate();
@@ -98072,18 +98155,30 @@ end;
 procedure TNNetMoEExpertBankDown.Compute();
 var
   StartTime: double;
+  MaxNeuronPos: integer;
+begin
+  if FBank = nil then exit;
+  StartTime := Now();
+  MaxNeuronPos := FNeurons.Count - 1;
+  if High(FArrNeurons) < MaxNeuronPos then BuildArrNeurons();
+  // Quantized weights: QuantizeWeightsInt8 released the per-neuron FP32 rows,
+  // so the FP32 nest would read shrunk storage.
+  if FQuantInt8
+    then ComputeMixtureQuantizedInt8()
+    else ComputeMixture();
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetMoEExpertBankDown.ComputeMixture();
+var
   TokenIdx, SlotIdx, HiddenIdx, ExpertIdx: integer;
-  MaxTokenPos, MaxSlotPos, MaxHiddenPos, MaxNeuronPos: integer;
+  MaxTokenPos, MaxSlotPos, MaxHiddenPos: integer;
   PairBase, OutBase, RowBase: integer;
   GateWeight: TNeuralFloat;
   HidPtr: TNeuralFloatArrPtr;
   HidVol: TNNetVolume;
   DownNeuron: TNNetNeuron;
 begin
-  if FBank = nil then exit;
-  StartTime := Now();
-  MaxNeuronPos := FNeurons.Count - 1;
-  if High(FArrNeurons) < MaxNeuronPos then BuildArrNeurons();
   HidVol := FPrevLayer.FOutput;
   MaxTokenPos := FTokenCnt - 1;
   MaxHiddenPos := FHiddenSize - 1;
@@ -98111,7 +98206,53 @@ begin
       end;
     end;
   end;
-  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+// int8 twin of ComputeMixture: DotProductInt8 streams the down row's codes
+// straight against the gate|up bank's FP32 slot hidden state, with the per-row
+// scale applied once to the raw code sum. Coded by Claude (AI).
+procedure TNNetMoEExpertBankDown.ComputeMixtureQuantizedInt8();
+var
+  TokenIdx, SlotIdx, HiddenIdx, ExpertIdx: integer;
+  MaxTokenPos, MaxSlotPos, MaxHiddenPos: integer;
+  PairBase, OutBase, RowBase, CodeBase, VS: integer;
+  GateWeight: TNeuralFloat;
+  HidPtr: TNeuralFloatArrPtr;
+  HidVol: TNNetVolume;
+  CodesPtr: TNeuralInt8ArrPtr;
+  ScalePtr: TNeuralFloatArrPtr;
+begin
+  CodesPtr := FQuantTable.DataPtr;   // #13: table bases hoisted out of the nest
+  ScalePtr := FQuantTable.ScalePtr;
+  VS := FQuantVectorSize;
+  HidVol := FPrevLayer.FOutput;
+  MaxTokenPos := FTokenCnt - 1;
+  MaxHiddenPos := FHiddenSize - 1;
+  for TokenIdx := 0 to MaxTokenPos do
+  begin
+    OutBase := TokenIdx * FHiddenSize;
+    FillChar(FOutput.FData[OutBase], FHiddenSize * csNeuralFloatSize, 0);
+    PairBase := TokenIdx * FTopK;
+    MaxSlotPos := FBank.FSlotCount[TokenIdx] - 1;
+    for SlotIdx := 0 to MaxSlotPos do
+    begin
+      ExpertIdx := FBank.FSlotExpert[PairBase + SlotIdx];
+      GateWeight := FBank.FSlotGate[PairBase + SlotIdx];
+      HidPtr := HidVol.GetRawPtr((PairBase + SlotIdx) * FExpertWidth);
+      RowBase := ExpertIdx * FHiddenSize;
+      CodeBase := RowBase * VS;        // #6: expert's first row code offset
+      for HiddenIdx := 0 to MaxHiddenPos do
+      begin
+        FOutput.FData[OutBase + HiddenIdx] :=
+          FOutput.FData[OutBase + HiddenIdx] +
+          GateWeight * (TNNetVolume.DotProductInt8(
+              TNeuralInt8ArrPtr(@CodesPtr^[CodeBase]), HidPtr, VS) *
+            ScalePtr^[RowBase + HiddenIdx] +
+            FArrNeurons[RowBase + HiddenIdx].FBiasWeight);
+        Inc(CodeBase, VS);             // #6: next row's code offset
+      end;
+    end;
+  end;
 end;
 
 procedure TNNetMoEExpertBankDown.Backpropagate();
@@ -124458,7 +124599,14 @@ begin
     (pLayer.ClassType = TNNetGroupedConvolutionReLU) or
     (pLayer.ClassType = TNNetGroupedPointwiseConvLinear) or
     (pLayer.ClassType = TNNetGroupedPointwiseConvReLU) or
-    (pLayer.ClassType = TNNetGroupedPointwiseConvHardSwish);
+    (pLayer.ClassType = TNNetGroupedPointwiseConvHardSwish) or
+    // Fused MoE expert banks. They leave FShouldConcatWeights false, so they
+    // carry their own int8 forward (ComputeExpertsQuantizedInt8 /
+    // ComputeMixtureQuantizedInt8) over the shared FQuantTable storage. Row
+    // width is the source depth for the gate|up bank and the expert width for
+    // the down bank, which is what the row-streaming importers expect.
+    (pLayer.ClassType = TNNetMoEExpertBankGateUp) or
+    (pLayer.ClassType = TNNetMoEExpertBankDown);
 end;
 
 procedure TNNet.QuantizeWeightsInt8();

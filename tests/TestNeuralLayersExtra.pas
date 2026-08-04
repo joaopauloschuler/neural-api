@@ -175,11 +175,25 @@ type
     procedure TestMoEExpertBankParityDenseGate;
     procedure TestMoEExpertBankShapesAndRoundTrip;
     procedure TestMoEExpertBankBackpropagateRaises;
+    // int8 weight storage on both banks.
+    procedure TestMoEExpertBankInt8Parity;
+    procedure TestMoEExpertBankInt8ParityDenseGate;
+    procedure TestMoEExpertBankInt8DetectsSwappedHalves;
+    procedure TestMoEExpertBankInt8QuantizeSweep;
+    procedure TestMoEExpertBankInt8ConstructionArming;
+    procedure TestMoEExpertBankInt8BackpropagateRaises;
   private
     // Builds ONE net holding both the per-expert reference graph and the fused
     // bank behind the SAME router, then asserts the two outputs agree.
+    // QuantizeBanks quantizes ONLY the two bank layers, leaving the reference
+    // graph and the router in FP32, so the difference is pure bank
+    // quantization drift. SwapBankHalves + ExpectMismatch turn the assertion
+    // around: they inject the up/gate half-swap bug and require the comparison
+    // to catch it, which is what keeps Tolerance honest.
     procedure RunMoEBankParity(TokenCnt, HiddenSize, ExpertCnt, ExpertWidth,
-      TopCnt: integer; UniformRouting: boolean; const Msg: string);
+      TopCnt: integer; UniformRouting: boolean; const Msg: string;
+      QuantizeBanks: boolean = false; SwapBankHalves: boolean = false;
+      Tolerance: TNeuralFloat = 1e-4; ExpectMismatch: boolean = false);
   end;
 
 implementation
@@ -7685,9 +7699,44 @@ begin
   L.FlushWeightCache();
 end;
 
+// Exchanges the UP and GATE weight rows of every expert of a gate|up bank -
+// the half-swap bug the parity assertions must be able to see.
+procedure SwapMoEBankGateUpHalves(L: TNNetLayer; ExpertCnt, ExpertWidth: integer);
+var
+  ExpertIdx, WidthIdx, ColIdx: integer;
+  MaxExpertPos, MaxWidthPos, MaxColPos, RowBase: integer;
+  Tmp: TNeuralFloat;
+  UpNeuron, GateNeuron: TNNetNeuron;
+begin
+  MaxExpertPos := ExpertCnt - 1;
+  MaxWidthPos := ExpertWidth - 1;
+  for ExpertIdx := 0 to MaxExpertPos do
+  begin
+    RowBase := ExpertIdx * 2 * ExpertWidth;
+    for WidthIdx := 0 to MaxWidthPos do
+    begin
+      UpNeuron := L.Neurons[RowBase + WidthIdx];
+      GateNeuron := L.Neurons[RowBase + ExpertWidth + WidthIdx];
+      MaxColPos := UpNeuron.Weights.Size - 1;
+      for ColIdx := 0 to MaxColPos do
+      begin
+        Tmp := UpNeuron.Weights.FData[ColIdx];
+        UpNeuron.Weights.FData[ColIdx] := GateNeuron.Weights.FData[ColIdx];
+        GateNeuron.Weights.FData[ColIdx] := Tmp;
+      end;
+      Tmp := UpNeuron.BiasWeight;
+      UpNeuron.BiasWeight := GateNeuron.BiasWeight;
+      GateNeuron.BiasWeight := Tmp;
+    end;
+  end;
+  L.FlushWeightCache();
+end;
+
 procedure TTestNeuralLayersExtra.RunMoEBankParity(TokenCnt, HiddenSize,
   ExpertCnt, ExpertWidth, TopCnt: integer; UniformRouting: boolean;
-  const Msg: string);
+  const Msg: string;
+  QuantizeBanks: boolean = false; SwapBankHalves: boolean = false;
+  Tolerance: TNeuralFloat = 1e-4; ExpectMismatch: boolean = false);
 var
   NN: TNNet;
   Input: TNNetVolume;
@@ -7695,6 +7744,7 @@ var
   RefGateUp, RefDown, RefOut, BankGateUp, BankDown: TNNetLayer;
   Branches: array of TNNetLayer;
   ExpertIdx, NeuronIdx, MaxExpertPos, MaxNeuronPos, MaxOutPos, Pos: integer;
+  MaxDiff, Diff: TNeuralFloat;
 begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(TokenCnt, 1, HiddenSize);
@@ -7728,6 +7778,27 @@ begin
     BankDown := NN.AddLayer(TNNetMoEExpertBankDown.Create(ExpertCnt, HiddenSize));
     FillMoEBankLinear(BankGateUp, 1, 0);
     FillMoEBankLinear(BankDown, 2, 0);
+    if SwapBankHalves then
+      SwapMoEBankGateUpHalves(BankGateUp, ExpertCnt, ExpertWidth);
+    if QuantizeBanks then
+    begin
+      TNNetLayerConcatedWeights(BankGateUp).QuantizeWeightsInt8();
+      TNNetLayerConcatedWeights(BankDown).QuantizeWeightsInt8();
+      AssertTrue(Msg + ' - gate|up bank is int8',
+        TNNetLayerConcatedWeights(BankGateUp).WeightsQuantizedInt8);
+      AssertTrue(Msg + ' - down bank is int8',
+        TNNetLayerConcatedWeights(BankDown).WeightsQuantizedInt8);
+      // The row width the row-streaming importers gate on.
+      AssertEquals(Msg + ' - gate|up int8 row width', HiddenSize,
+        TNNetLayerConcatedWeights(BankGateUp).QuantInt8VectorSize);
+      AssertEquals(Msg + ' - down int8 row width', ExpertWidth,
+        TNNetLayerConcatedWeights(BankDown).QuantInt8VectorSize);
+      // FP32 rows released: the int8 forward must not be reading them.
+      AssertEquals(Msg + ' - gate|up FP32 rows released', 1,
+        BankGateUp.Neurons[0].Weights.Size);
+      AssertEquals(Msg + ' - down FP32 rows released', 1,
+        BankDown.Neurons[0].Weights.Size);
+    end;
     if UniformRouting then
     begin
       // Zero router weights + strictly increasing biases: every token picks the
@@ -7756,9 +7827,21 @@ begin
     AssertTrue(Msg + ' - reference output is non-trivial',
       RefOut.Output.GetMaxAbs() > 1e-3);
     MaxOutPos := RefOut.Output.Size - 1;
-    for Pos := 0 to MaxOutPos do
-      AssertEquals(Msg + ' - MoE output at flat index ' + IntToStr(Pos),
-        RefOut.Output.FData[Pos], BankDown.Output.FData[Pos], 1e-4);
+    if ExpectMismatch then
+    begin
+      MaxDiff := 0;
+      for Pos := 0 to MaxOutPos do
+      begin
+        Diff := Abs(RefOut.Output.FData[Pos] - BankDown.Output.FData[Pos]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      AssertTrue(Msg + ' - the injected bank bug must exceed the tolerance ' +
+        '(max diff ' + FloatToStr(MaxDiff) + ')', MaxDiff > Tolerance);
+    end
+    else
+      for Pos := 0 to MaxOutPos do
+        AssertEquals(Msg + ' - MoE output at flat index ' + IntToStr(Pos),
+          RefOut.Output.FData[Pos], BankDown.Output.FData[Pos], Tolerance);
   finally
     NN.Free;
     Input.Free;
@@ -7863,6 +7946,157 @@ begin
       on E: Exception do RaisedDown := true;
     end;
     AssertTrue('down bank is inference-only', RaisedDown);
+  finally
+    NN.Free;
+  end;
+end;
+
+const
+  // Symmetric per-row int8 drift accumulated through the gate|up GEMM, the
+  // SwiGLU product of two quantized results and the down GEMM: ~1.3e-3 on
+  // outputs of magnitude ~1.6 here. Tight enough that
+  // TestMoEExpertBankInt8DetectsSwappedHalves fails the comparison.
+  csMoEBankInt8Tolerance = 3e-3;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankInt8Parity;
+begin
+  // Both banks int8, reference graph and router still FP32: the only
+  // difference the comparison can see is the banks' quantization drift.
+  RunMoEBankParity({TokenCnt=}3, {HiddenSize=}6, {ExpertCnt=}5,
+    {ExpertWidth=}4, {TopCnt=}2, {UniformRouting=}false, 'int8 k<E',
+    {QuantizeBanks=}true, {SwapBankHalves=}false, csMoEBankInt8Tolerance);
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankInt8ParityDenseGate;
+begin
+  RunMoEBankParity(2, 5, 3, 3, 3, false, 'int8 dense gate',
+    true, false, csMoEBankInt8Tolerance);
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankInt8DetectsSwappedHalves;
+begin
+  // Mutation check: exchanging the bank's up and gate rows must break the int8
+  // parity comparison, otherwise the tolerance above proves nothing.
+  RunMoEBankParity(3, 6, 5, 4, 2, false, 'int8 half-swap mutation',
+    true, {SwapBankHalves=}true, csMoEBankInt8Tolerance,
+    {ExpectMismatch=}true);
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankInt8QuantizeSweep;
+var
+  NN: TNNet;
+  InputLayer, GateTopK, BankGateUp, BankDown: TNNetLayer;
+begin
+  // The net-wide sweep only reaches classes listed in
+  // NeuralInt8QuantizableClass, which compares ClassType exactly.
+  NN := TNNet.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(4, 1, 8));
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    NN.AddLayer(TNNetPointwiseSoftMax.Create());
+    GateTopK := NN.AddLayer(TNNetTopKGate.Create(2));
+    BankGateUp := NN.AddLayer(
+      TNNetMoEExpertBankGateUp.Create(6, 5, InputLayer, GateTopK));
+    BankDown := NN.AddLayer(TNNetMoEExpertBankDown.Create(6, 8));
+    FillMoEBankLinear(BankGateUp, 1, 0);
+    FillMoEBankLinear(BankDown, 2, 0);
+
+    NN.QuantizeWeightsInt8();
+    AssertTrue('sweep quantizes the gate|up bank',
+      TNNetLayerConcatedWeights(BankGateUp).WeightsQuantizedInt8);
+    AssertTrue('sweep quantizes the down bank',
+      TNNetLayerConcatedWeights(BankDown).WeightsQuantizedInt8);
+    AssertEquals('swept gate|up int8 row width', 8,
+      TNNetLayerConcatedWeights(BankGateUp).QuantInt8VectorSize);
+    AssertEquals('swept down int8 row width', 5,
+      TNNetLayerConcatedWeights(BankDown).QuantInt8VectorSize);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankInt8ConstructionArming;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  InputLayer, GateTopK, BankGateUp, BankDown: TNNetLayer;
+  Pos: integer;
+begin
+  // Construction-time arming (ArmBuildQuantInt8Storage): with the net flagged
+  // and the layers inference-only, the banks go straight into the int8 state
+  // instead of sizing FP32 rows a later sweep would only shrink again.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 8);
+  try
+    NN.BuildQuantInt8 := true;
+    InputLayer := NN.AddLayer(TNNetInput.Create(4, 1, 8));
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(6).SetTrainable());
+    NN.AddLayer(TNNetPointwiseSoftMax.Create());
+    GateTopK := NN.AddLayer(TNNetTopKGate.Create(2));
+    BankGateUp := NN.AddLayer(TNNetMoEExpertBankGateUp.Create(
+      6, 5, InputLayer, GateTopK).SetTrainable());
+    BankDown := NN.AddLayer(
+      TNNetMoEExpertBankDown.Create(6, 8).SetTrainable());
+
+    AssertTrue('gate|up bank armed at construction',
+      TNNetLayerConcatedWeights(BankGateUp).WeightsQuantizedInt8);
+    AssertTrue('down bank armed at construction',
+      TNNetLayerConcatedWeights(BankDown).WeightsQuantizedInt8);
+    AssertEquals('armed gate|up int8 row width', 8,
+      TNNetLayerConcatedWeights(BankGateUp).QuantInt8VectorSize);
+    AssertEquals('armed down int8 row width', 5,
+      TNNetLayerConcatedWeights(BankDown).QuantInt8VectorSize);
+    AssertEquals('armed gate|up never sized FP32 rows', 1,
+      BankGateUp.Neurons[0].Weights.Size);
+    AssertEquals('armed down never sized FP32 rows', 1,
+      BankDown.Neurons[0].Weights.Size);
+
+    // Zero codes are the armed contract: a forward pass is valid before any
+    // checkpoint is loaded and produces zeros.
+    for Pos := 0 to Input.Size - 1 do Input.FData[Pos] := Sin(Pos * 0.37) * 0.8;
+    NN.Compute(Input);
+    AssertTrue('armed bank forward is zero', BankDown.Output.GetMaxAbs() = 0);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankInt8BackpropagateRaises;
+var
+  NN: TNNet;
+  InputLayer, GateTopK, BankGateUp, BankDown: TNNetLayer;
+  RaisedGateUp, RaisedDown: boolean;
+begin
+  NN := TNNet.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(2, 1, 4));
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(3));
+    NN.AddLayer(TNNetPointwiseSoftMax.Create());
+    GateTopK := NN.AddLayer(TNNetTopKGate.Create(2));
+    BankGateUp := NN.AddLayer(
+      TNNetMoEExpertBankGateUp.Create(3, 2, InputLayer, GateTopK));
+    BankDown := NN.AddLayer(TNNetMoEExpertBankDown.Create(3, 4));
+    FillMoEBankLinear(BankGateUp, 1, 0);
+    FillMoEBankLinear(BankDown, 2, 0);
+    TNNetLayerConcatedWeights(BankGateUp).QuantizeWeightsInt8();
+    TNNetLayerConcatedWeights(BankDown).QuantizeWeightsInt8();
+
+    RaisedGateUp := false;
+    try
+      BankGateUp.Backpropagate();
+    except
+      on E: Exception do RaisedGateUp := true;
+    end;
+    AssertTrue('int8 gate|up bank is inference-only', RaisedGateUp);
+
+    RaisedDown := false;
+    try
+      BankDown.Backpropagate();
+    except
+      on E: Exception do RaisedDown := true;
+    end;
+    AssertTrue('int8 down bank is inference-only', RaisedDown);
   finally
     NN.Free;
   end;
