@@ -15515,6 +15515,151 @@ begin
   end;
 end;
 
+// Loads the vocab table into EmbeddingLayer and, when TieWordEmbeddings, the
+// SAME rows into LMHead (logits = h . embed^T, bias-free); otherwise LMHead
+// loads from its own LMHeadName tensor. EmbedScale (Gemma: sqrt(hidden_size))
+// and EmbeddingMultiplier (Granite) scale the embedding OUTPUT, but
+// TNNetEmbedding's ScaleEmbedding is init-only, so they fold into the
+// embedding ROWS; the tied head deliberately reads the UNSCALED rows, matching
+// HF (the head ties to the raw matrix). LogitScaleFold (1/logits_scaling)
+// folds into the head rows instead. Tmp is the caller's scratch volume.
+//
+// Direct-to-int8 vocab-table streaming: the vocab table is the single largest
+// tensor of the checkpoint, and the FP32 route below briefly holds up to THREE
+// copies of it (Tmp + dequantized embedding + dequantized tied head). When the
+// embedding (and, when tied, the LM head) already sits in the armed int8
+// container and the tensor is dense F32/F16/BF16, each row chunk is read once
+// and quantized straight into BOTH containers - the codes are identical (a
+// uniform row scale cancels), only the per-row scales carry the EmbFold /
+// LogitScaleFold difference. Coded by Claude (AI).
+procedure LoadEmbeddingAndLMHead(Reader: TNNetSafeTensorsReader;
+  EmbeddingLayer, LMHead: TNNetLayer; const EmbName, LMHeadName: string;
+  VocabSize, HiddenSize: integer; TieWordEmbeddings: boolean;
+  EmbedScale, EmbeddingMultiplier, LogitScaleFold: TNeuralFloat;
+  pQuantizeInt8: boolean; Tmp: TNNetVolume; Consumed: TStringList;
+  const ErrPrefix: string);
+var
+  i, j, iHi, Base, VocabSizeM1: integer;
+  EmbChunkRows, EmbRowsInChunk: integer;
+  EmbFold: TNeuralFloat;
+  EmbDirect: boolean;
+  EmbFan: TInt8RowChunkFan;
+  QHeadCW: TNNetLayerConcatedWeights;
+  WV: TNNetVolume;
+begin
+  EmbFold := 1.0;
+  if (EmbedScale <> 0) and (EmbedScale <> 1.0) then
+    EmbFold := EmbFold * EmbedScale;
+  if (EmbeddingMultiplier <> 0) and (EmbeddingMultiplier <> 1.0) then
+    EmbFold := EmbFold * EmbeddingMultiplier;
+  EmbDirect := pQuantizeInt8 and (EmbeddingLayer is TNNetEmbedding) and
+    TNNetEmbedding(EmbeddingLayer).WeightsQuantizedInt8 and
+    (TNNetEmbedding(EmbeddingLayer).VocabSize = VocabSize) and
+    (TNNetEmbedding(EmbeddingLayer).EmbeddingSize = HiddenSize)
+    and Reader.CanStreamTensorRows(EmbName);
+  QHeadCW := nil;
+  if LMHead is TNNetLayerConcatedWeights then
+    QHeadCW := TNNetLayerConcatedWeights(LMHead);
+  if EmbDirect and TieWordEmbeddings then
+    EmbDirect := (QHeadCW <> nil) and QHeadCW.WeightsQuantizedInt8 and
+      (QHeadCW.QuantInt8VectorSize = HiddenSize) and
+      (QHeadCW.Neurons.Count = VocabSize);
+  if EmbDirect then
+  begin
+    // ~4 MB of FP32 rows per read (same chunking as LoadLlamaLinearWeights'
+    // direct path).
+    EmbChunkRows := (4 * 1024 * 1024) div (HiddenSize * 4);
+    if EmbChunkRows < 1 then EmbChunkRows := 1;
+    if EmbChunkRows > VocabSize then EmbChunkRows := VocabSize;
+    EmbFan := TInt8RowChunkFan.Create;
+    try
+      j := 0;
+      while j < VocabSize do
+      begin
+        EmbRowsInChunk := EmbChunkRows;
+        if j + EmbRowsInChunk > VocabSize then
+          EmbRowsInChunk := VocabSize - j;
+        Reader.LoadTensorRowsFlat(EmbName, j, EmbRowsInChunk, HiddenSize, Tmp);
+        // Chunk rows quantize in parallel into the embedding codes and - when
+        // tied (logits = (h . embed^T) / logits_scaling) - the LM head codes
+        // too: same codes, LogitScaleFold in the scale, bias-free.
+        if TieWordEmbeddings then
+        begin
+          EmbFan.RunEmbedding(TNNetEmbedding(EmbeddingLayer), QHeadCW,
+            Tmp, j, EmbRowsInChunk, HiddenSize, EmbFold, LogitScaleFold);
+          iHi := j + EmbRowsInChunk - 1;
+          for i := j to iHi do
+            LMHead.FArrNeurons[i].BiasWeight := 0;
+        end
+        else
+          EmbFan.RunEmbedding(TNNetEmbedding(EmbeddingLayer), nil,
+            Tmp, j, EmbRowsInChunk, HiddenSize, EmbFold, 1.0);
+        Inc(j, EmbRowsInChunk);
+      end;
+    finally
+      EmbFan.Free;
+    end;
+    EmbeddingLayer.FlushWeightCache();
+    Consumed.Add(EmbName);
+    if TieWordEmbeddings then
+    begin
+      LMHead.FlushWeightCache();
+      // A redundant serialized lm_head.weight is ignorable when tied.
+      if Reader.HasTensor(LMHeadName) then Consumed.Add(LMHeadName);
+    end
+    else
+    begin
+      LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
+        HiddenSize, VocabSize, 0, -1, 0, '', LogitScaleFold);
+      Consumed.Add(LMHeadName);
+    end;
+    exit;
+  end;
+  // Vocab table -> embedding (vocab rows of d floats, row-major both in the
+  // checkpoint and in TNNetEmbedding).
+  Reader.LoadTensorFlat(EmbName, Tmp);
+  EnsureWritableImportWeights(EmbeddingLayer);
+  if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
+    ImportError(ErrPrefix + '"' + EmbName + '" element count ' +
+      IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
+      IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
+  EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
+  // Two separate Muls (not one EmbFold multiply): keeps this FP32 path
+  // bit-identical to its historical rounding.
+  if (EmbedScale <> 0) and (EmbedScale <> 1.0) then
+    EmbeddingLayer.FArrNeurons[0].Weights.Mul(EmbedScale);
+  if (EmbeddingMultiplier <> 0) and (EmbeddingMultiplier <> 1.0) then
+    EmbeddingLayer.FArrNeurons[0].Weights.Mul(EmbeddingMultiplier);
+  EmbeddingLayer.FlushWeightCache();
+  Consumed.Add(EmbName);
+  if TieWordEmbeddings then
+  begin
+    // Tied LM head: logits = (h . embed^T) / logits_scaling (rows copied with
+    // the 1/logits_scaling fold, bias-free).
+    EnsureWritableImportWeights(LMHead);
+    VocabSizeM1 := VocabSize - 1;
+    Base := 0;
+    for j := 0 to VocabSizeM1 do
+    begin
+      WV := LMHead.FArrNeurons[j].Weights;
+      Move(Tmp.FData[Base], WV.FData[0], HiddenSize * csNeuralFloatSize);
+      if LogitScaleFold <> 1.0 then
+        TNNetVolume.Mul(WV.GetRawPtr(0), LogitScaleFold, HiddenSize);
+      LMHead.FArrNeurons[j].BiasWeight := 0;
+      Inc(Base, HiddenSize);
+    end;
+    LMHead.FlushWeightCache();
+    // A redundant serialized lm_head.weight is ignorable when tied.
+    if Reader.HasTensor(LMHeadName) then Consumed.Add(LMHeadName);
+  end
+  else
+  begin
+    LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
+      HiddenSize, VocabSize, 0, -1, 0, '', LogitScaleFold);
+    Consumed.Add(LMHeadName);
+  end;
+end;
+
 // Loads granitemoe's FUSED 3-D expert slab for one block (no Mixtral-style
 // per-expert 2-D tensors). HF GraniteMoeParallelExperts stack every expert
 // into one tensor:
@@ -16731,156 +16876,20 @@ begin
         QProjScale := 1.0
       else
         QProjScale := QScale;
+      // Config.LogitsScaling (Granite): HF DIVIDES the final logits by
+      // logits_scaling before softmax. Fold 1/logits_scaling into the LM head
+      // rows (exactly the Cohere logit_scale fold, but dividing).
+      if Config.LogitsScaling <> 0 then
+        LogitScaleFold := 1.0 / Config.LogitsScaling
+      else
+        LogitScaleFold := 1.0;
       Tmp := TNNetVolume.Create;
       try
-        EmbName := Config.Prefix + 'embed_tokens.weight';
-        // Config.EmbedScale (Gemma: sqrt(hidden_size)) scales the embedding
-        // OUTPUT; TNNetEmbedding's ScaleEmbedding is init-only, so the scale
-        // is folded into the embedding ROWS instead. ONLY the embedding copy
-        // is scaled - the tied LM head below reads the UNSCALED checkpoint
-        // rows, matching HF GemmaForCausalLM (the head ties to the raw
-        // matrix). Config.EmbeddingMultiplier (Granite) folds the same way.
-        EmbFold := 1.0;
-        if (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1.0) then
-          EmbFold := EmbFold * Config.EmbedScale;
-        if (Config.EmbeddingMultiplier <> 0) and
-           (Config.EmbeddingMultiplier <> 1.0) then
-          EmbFold := EmbFold * Config.EmbeddingMultiplier;
-        // Config.LogitsScaling (Granite): HF DIVIDES the final logits by
-        // logits_scaling before softmax. Fold 1/logits_scaling into the LM
-        // head rows (exactly the Cohere logit_scale fold, but dividing).
-        if Config.LogitsScaling <> 0 then
-          LogitScaleFold := 1.0 / Config.LogitsScaling
-        else
-          LogitScaleFold := 1.0;
-        // Direct-to-int8 vocab-table streaming: the vocab table is the
-        // single largest tensor of the checkpoint, and the FP32 route
-        // below briefly holds up to THREE copies of it (Tmp + dequantized
-        // embedding + dequantized tied head). When the embedding (and,
-        // when tied, the LM head) already sits in the armed int8 container
-        // and the tensor is dense F32/F16/BF16, each row chunk is read
-        // once and quantized straight into BOTH containers - the codes are
-        // identical (a uniform row scale cancels), only the per-row scales
-        // carry the EmbFold / LogitScaleFold difference.
-        EmbDirect := pQuantizeInt8 and (EmbeddingLayer is TNNetEmbedding) and
-          TNNetEmbedding(EmbeddingLayer).WeightsQuantizedInt8 and
-          (TNNetEmbedding(EmbeddingLayer).VocabSize = Config.VocabSize) and
-          (TNNetEmbedding(EmbeddingLayer).EmbeddingSize = Config.HiddenSize)
-          and Reader.CanStreamTensorRows(EmbName);
-        QHeadCW := nil;
-        if LMHead is TNNetLayerConcatedWeights then
-          QHeadCW := TNNetLayerConcatedWeights(LMHead);
-        if EmbDirect and Config.TieWordEmbeddings then
-          EmbDirect := (QHeadCW <> nil) and QHeadCW.WeightsQuantizedInt8 and
-            (QHeadCW.QuantInt8VectorSize = Config.HiddenSize) and
-            (QHeadCW.Neurons.Count = Config.VocabSize);
-        if EmbDirect then
-        begin
-          // ~4 MB of FP32 rows per read (same chunking as
-          // LoadLlamaLinearWeights' direct path).
-          EmbChunkRows := (4 * 1024 * 1024) div (Config.HiddenSize * 4);
-          if EmbChunkRows < 1 then EmbChunkRows := 1;
-          if EmbChunkRows > Config.VocabSize then
-            EmbChunkRows := Config.VocabSize;
-          EmbFan := TInt8RowChunkFan.Create;
-          try
-            j := 0;
-            while j < Config.VocabSize do
-            begin
-              EmbRowsInChunk := EmbChunkRows;
-              if j + EmbRowsInChunk > Config.VocabSize then
-                EmbRowsInChunk := Config.VocabSize - j;
-              Reader.LoadTensorRowsFlat(EmbName, j, EmbRowsInChunk,
-                Config.HiddenSize, Tmp);
-              // Chunk rows quantize in parallel into the embedding codes
-              // and - when tied (logits = (h . embed^T) / logits_scaling) -
-              // the LM head codes too: same codes, LogitScaleFold in the
-              // scale, bias-free.
-              if Config.TieWordEmbeddings then
-              begin
-                EmbFan.RunEmbedding(TNNetEmbedding(EmbeddingLayer), QHeadCW,
-                  Tmp, j, EmbRowsInChunk, Config.HiddenSize, EmbFold,
-                  LogitScaleFold);
-                iHi := j + EmbRowsInChunk - 1;
-                for i := j to iHi do
-                  LMHead.FArrNeurons[i].BiasWeight := 0;
-              end
-              else
-                EmbFan.RunEmbedding(TNNetEmbedding(EmbeddingLayer), nil,
-                  Tmp, j, EmbRowsInChunk, Config.HiddenSize, EmbFold, 1.0);
-              Inc(j, EmbRowsInChunk);
-            end;
-          finally
-            EmbFan.Free;
-          end;
-          EmbeddingLayer.FlushWeightCache();
-          MarkConsumed(EmbName);
-          if Config.TieWordEmbeddings then
-          begin
-            LMHead.FlushWeightCache();
-            // A redundant serialized lm_head.weight is ignorable when tied.
-            if Reader.HasTensor(LMHeadName) then MarkConsumed(LMHeadName);
-          end
-          else
-          begin
-            LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
-              Config.HiddenSize, Config.VocabSize, 0, -1, 0, '',
-              LogitScaleFold);
-            MarkConsumed(LMHeadName);
-          end;
-        end
-        else
-        begin
-          // embed_tokens -> embedding table (vocab rows of d floats,
-          // row-major both in the checkpoint and in TNNetEmbedding).
-          Reader.LoadTensorFlat(EmbName, Tmp);
-          EnsureWritableImportWeights(EmbeddingLayer);
-          if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
-            ImportError('Llama import: embed_tokens.weight element count ' +
-              IntToStr(Tmp.Size) + ' does not match the embedding table ' +
-              'size ' +
-              IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
-          EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
-          // Two separate Muls (not one EmbFold multiply): keeps this FP32
-          // path bit-identical to its historical rounding.
-          if (Config.EmbedScale <> 0) and (Config.EmbedScale <> 1.0) then
-            EmbeddingLayer.FArrNeurons[0].Weights.Mul(Config.EmbedScale);
-          if (Config.EmbeddingMultiplier <> 0) and
-             (Config.EmbeddingMultiplier <> 1.0) then
-            EmbeddingLayer.FArrNeurons[0].Weights.Mul(
-              Config.EmbeddingMultiplier);
-          EmbeddingLayer.FlushWeightCache();
-          MarkConsumed(EmbName);
-          if Config.TieWordEmbeddings then
-          begin
-            // Tied LM head: logits = (h . embed^T) / logits_scaling (rows
-            // copied with the 1/logits_scaling fold, bias-free).
-            EnsureWritableImportWeights(LMHead);
-            VocabSizeM1 := Config.VocabSize - 1;
-            Base := 0;
-            for j := 0 to VocabSizeM1 do
-            begin
-              WV := LMHead.FArrNeurons[j].Weights;
-              Move(Tmp.FData[Base], WV.FData[0],
-                Config.HiddenSize * csNeuralFloatSize);
-              if LogitScaleFold <> 1.0 then
-                TNNetVolume.Mul(WV.GetRawPtr(0), LogitScaleFold,
-                  Config.HiddenSize);
-              LMHead.FArrNeurons[j].BiasWeight := 0;
-              Inc(Base, Config.HiddenSize);
-            end;
-            LMHead.FlushWeightCache();
-            // A redundant serialized lm_head.weight is ignorable when tied.
-            if Reader.HasTensor(LMHeadName) then MarkConsumed(LMHeadName);
-          end
-          else
-          begin
-            LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
-              Config.HiddenSize, Config.VocabSize, 0, -1, 0, '',
-              LogitScaleFold);
-            MarkConsumed(LMHeadName);
-          end;
-        end;
+        LoadEmbeddingAndLMHead(Reader, EmbeddingLayer, LMHead,
+          Config.Prefix + 'embed_tokens.weight', LMHeadName,
+          Config.VocabSize, Config.HiddenSize, Config.TieWordEmbeddings,
+          Config.EmbedScale, Config.EmbeddingMultiplier, LogitScaleFold,
+          pQuantizeInt8, Tmp, Consumed, 'Llama import: ');
       finally
         Tmp.Free;
       end;
@@ -52775,31 +52784,15 @@ begin
       if not pTrainable then NN.SetTrainable();
 
       // ---------------- Weights ----------------
-      Reader.LoadTensorFlat(Config.Prefix + 'embeddings.weight', Tmp);
-      EnsureWritableImportWeights(EmbeddingLayer);
-      EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
-      EmbeddingLayer.FlushWeightCache();
-      MarkConsumed(Config.Prefix + 'embeddings.weight');
-      if Config.TieWordEmbeddings then
-      begin
-        EnsureWritableImportWeights(LMHead);
-        for j := 0 to VocabSizeM1 do
-        begin
-          Move(Tmp.FData[j * Config.HiddenSize],
-            LMHead.FArrNeurons[j].Weights.FData[0],
-            Config.HiddenSize * csNeuralFloatSize);
-          LMHead.FArrNeurons[j].BiasWeight := 0;
-        end;
-        LMHead.FlushWeightCache();
-        if Reader.HasTensor('lm_head.weight') then
-          MarkConsumed('lm_head.weight');
-      end
-      else
-      begin
-        LoadLlamaLinearWeights(Reader, LMHead, 'lm_head.weight',
-          Config.HiddenSize, Config.VocabSize);
-        MarkConsumed('lm_head.weight');
-      end;
+      // Nemotron-H folds no scale anywhere: no embedding multiplier and no
+      // logits_scaling, so all three fold factors are 1.
+      LoadEmbeddingAndLMHead(Reader, EmbeddingLayer, LMHead,
+        Config.Prefix + 'embeddings.weight', 'lm_head.weight',
+        Config.VocabSize, Config.HiddenSize, Config.TieWordEmbeddings,
+        {EmbedScale=}1.0, {EmbeddingMultiplier=}1.0, {LogitScaleFold=}1.0,
+        pQuantizeInt8, Tmp, Consumed, 'Nemotron-H import: ');
+      // Re-quantize the refilled head/embedding before streaming the blocks.
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       for BlockCnt := 0 to NumLayersM1 do
       begin
         LayerP := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
