@@ -14759,12 +14759,21 @@ end;
 // expected to have SrcRows rows (0 = OutDim, the whole tensor) and rows
 // SrcRowBase..SrcRowBase+OutDim-1 are loaded - the q/k rotate_half
 // permutation applies AFTER the slicing, within the destination block.
+// pFlatSlabRows addresses a tensor of ANY rank as the flat row-major
+// [SrcRows, InDim] matrix its elements already form, instead of demanding a
+// literal 2-D [SrcRows, InDim] shape. A 3-D MoE expert slab [E, OutRows,
+// InDim] IS such a matrix (expert e's row r is flat row e*OutRows+r), so one
+// expert's projection loads as an ordinary row block - with the row
+// streaming and direct-to-int8 paths below intact. The last dimension must
+// still equal InDim, which rejects a TRANSPOSED slab ([E, InDim, OutRows],
+// the Llama-4 layout) whose destination neurons are columns, not rows.
 procedure LoadLlamaLinearWeights(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName: string; InDim, OutDim: integer;
   NeuronBase: integer = 0; ExpectedNeurons: integer = -1;
   RotaryHeadDim: integer = 0; const BiasName: string = '';
   Scale: TNeuralFloat = 1.0; RotaryDims: integer = 0;
-  SrcRowBase: integer = 0; SrcRows: integer = 0);
+  SrcRowBase: integer = 0; SrcRows: integer = 0;
+  pFlatSlabRows: boolean = false);
 var
   W, B, WV: TNNetVolume;
   j, TargetIdx, HalfDim, SrcRow, Base, Row: integer;
@@ -14825,13 +14834,28 @@ begin
   // [out, in] shape is what the caller passes. Skip the dense shape check for
   // those and dequantize-at-load below (LoadNF4QuantizedTensorFlat validates the
   // packed byte / absmax-block counts against [SrcRows, InDim]).
-  if (not IsNF4QuantizedTensor(Reader, WName)) and
-     ((Reader.DimCount(WName) <> 2) or
-      (Reader.DimSize(WName, 0) <> SrcRows) or
-      (Reader.DimSize(WName, 1) <> InDim)) then
-    ImportError('Llama import: "' + WName + '" must have shape [' +
-      IntToStr(SrcRows) + ', ' + IntToStr(InDim) + '] (nn.Linear stores ' +
-      '[out, in]), got ' + Reader.ShapeAsString(WName));
+  if not IsNF4QuantizedTensor(Reader, WName) then
+  begin
+    if pFlatSlabRows then
+    begin
+      // Rank-agnostic: the elements must form the flat [SrcRows, InDim]
+      // matrix, and the CONTIGUOUS dimension must be InDim (a transposed
+      // slab has the same element count but stores columns).
+      if (Reader.DimCount(WName) < 2) or
+         (Reader.DimSize(WName, Reader.DimCount(WName) - 1) <> InDim) or
+         (Reader.ElementCount(WName) <> Int64(SrcRows) * InDim) then
+        ImportError('Llama import: "' + WName + '" must hold ' +
+          IntToStr(SrcRows) + ' x ' + IntToStr(InDim) + ' row-major ' +
+          'elements with a contiguous last dimension of ' + IntToStr(InDim) +
+          ', got ' + Reader.ShapeAsString(WName));
+    end
+    else if (Reader.DimCount(WName) <> 2) or
+       (Reader.DimSize(WName, 0) <> SrcRows) or
+       (Reader.DimSize(WName, 1) <> InDim) then
+      ImportError('Llama import: "' + WName + '" must have shape [' +
+        IntToStr(SrcRows) + ', ' + IntToStr(InDim) + '] (nn.Linear stores ' +
+        '[out, in]), got ' + Reader.ShapeAsString(WName));
+  end;
   if Layer.Neurons.Count <> ExpectedNeurons then
     ImportError('Llama import: internal error - layer for "' + WName +
       '" has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
@@ -15432,7 +15456,14 @@ end;
 // stores the IDENTICAL slab layout ([E, 2I, H] gate-then-up, [E, H, I] down,
 // [E, H] router) under mlp.experts.gate_up_proj / mlp.experts.down_proj /
 // mlp.gate.weight, so it reuses this loader with the names swapped ('' =
-// the granitemoe block_sparse_moe.* defaults). Coded by Claude (AI).
+// the granitemoe block_sparse_moe.* defaults).
+// Both slabs are row-major stacks of ordinary [out, in] expert matrices, so
+// every projection loads through LoadLlamaLinearWeights' flat-slab row block
+// (pFlatSlabRows) rather than a slab-sized FP32 staging buffer: an int8-armed
+// build streams each expert straight into its int8 codes and never
+// materializes an FP32 expert at all, which is what keeps the peak of a
+// 256-expert block at the quantized steady state instead of adding the
+// block's FP32 experts plus a whole slab on top. Coded by Claude (AI).
 procedure LoadGraniteMoEExperts(Reader: TNNetSafeTensorsReader;
   var Block: TLlamaBlockLayers; const BlockPrefix: string;
   NumExperts, HiddenSize, ExpertWidth: integer; ResidualScale: TNeuralFloat;
@@ -15440,16 +15471,72 @@ procedure LoadGraniteMoEExperts(Reader: TNNetSafeTensorsReader;
   const pOutName: string = ''; const pRouterName: string = '');
 var
   InName, OutName, RouterName: string;
-  W, WV: TNNetVolume;
   EG, ED: TNNetLayer;
-  e, j, SrcRow, TwoI, Base: integer;
-  srcUpOfs, srcGateOfs, srcOfs: integer;
-  NumExpertsM1, HiddenSizeM1, ExpertWidthM1: integer;
+  e, TwoI, SlabInRows, SlabOutRows: integer;
+  NumExpertsM1, ExpertWidthM1, HiddenSizeM1: integer;
+  W: TNNetVolume;
+
+  // Fallback for readers that cannot serve row ranges (GGUF ggml types
+  // outside the row-streamable set, the synthetic view readers): fill the
+  // experts from ONE staged copy of the slab. Streaming per expert would
+  // otherwise re-read - and re-decode - the whole slab 3*NumExperts times
+  // per block, which at real expert counts is not a slow path but a hang.
+  // This is the slab-sized FP32 transient the streaming path exists to
+  // avoid, so it is confined to readers that leave no alternative.
+  procedure FillExpertsFromStagedSlab;
+  var
+    e, j: integer;
+    EG, ED: TNNetLayer;
+    WV: TNNetVolume;
+    srcUpOfs, srcGateOfs, srcOfs: integer;
+  begin
+    Reader.LoadTensorFlat(InName, W); // flat [E*2I, H]
+    for e := 0 to NumExpertsM1 do
+    begin
+      EG := Block.ExpertGateUp[e];
+      EnsureWritableImportWeights(EG);
+      srcUpOfs := (e * TwoI + ExpertWidth) * HiddenSize;
+      srcGateOfs := (e * TwoI) * HiddenSize;
+      for j := 0 to ExpertWidthM1 do
+      begin
+        // UP half (input_linear rows I..2I-1) -> neurons 0..I-1.
+        WV := EG.FArrNeurons[j].Weights;
+        Move(W.FData[srcUpOfs], WV.FData[0], HiddenSize * csNeuralFloatSize);
+        EG.FArrNeurons[j].BiasWeight := 0;
+        // GATE half (input_linear rows 0..I-1) -> neurons I..2I-1.
+        WV := EG.FArrNeurons[ExpertWidth + j].Weights;
+        Move(W.FData[srcGateOfs], WV.FData[0], HiddenSize * csNeuralFloatSize);
+        EG.FArrNeurons[ExpertWidth + j].BiasWeight := 0;
+        Inc(srcUpOfs, HiddenSize); Inc(srcGateOfs, HiddenSize);
+      end;
+      EG.FlushWeightCache();
+    end;
+    Reader.LoadTensorFlat(OutName, W); // flat [E*H, I]
+    for e := 0 to NumExpertsM1 do
+    begin
+      ED := Block.ExpertDown[e];
+      EnsureWritableImportWeights(ED);
+      srcOfs := (e * HiddenSize) * ExpertWidth;
+      for j := 0 to HiddenSizeM1 do
+      begin
+        WV := ED.FArrNeurons[j].Weights;
+        Move(W.FData[srcOfs], WV.FData[0], ExpertWidth * csNeuralFloatSize);
+        if ResidualScale <> 1.0 then
+          TNNetVolume.Mul(WV.GetRawPtr(0), ResidualScale, ExpertWidth);
+        ED.FArrNeurons[j].BiasWeight := 0;
+        Inc(srcOfs, ExpertWidth);
+      end;
+      ED.FlushWeightCache();
+    end;
+  end;
+
 begin
   TwoI := 2 * ExpertWidth;
   NumExpertsM1 := NumExperts - 1;
-  HiddenSizeM1 := HiddenSize - 1;
   ExpertWidthM1 := ExpertWidth - 1;
+  HiddenSizeM1 := HiddenSize - 1;
+  SlabInRows := NumExperts * TwoI;      // input_linear as flat [E*2I, H]
+  SlabOutRows := NumExperts * HiddenSize; // output_linear as flat [E*H, I]
   if pInName <> '' then InName := pInName
   else InName := BlockPrefix + 'block_sparse_moe.input_linear.weight';
   if pOutName <> '' then OutName := pOutName
@@ -15463,82 +15550,67 @@ begin
     ImportError('Llama import: "' + RouterName + '" must have shape [' +
       IntToStr(NumExperts) + ', ' + IntToStr(HiddenSize) + '], got ' +
       Reader.ShapeAsString(RouterName));
-  W := TNNetVolume.Create;
-  try
-    EnsureWritableImportWeights(Block.GateConv);
-    Reader.LoadTensorFlat(RouterName, W);
-    Base := 0;
-    for e := 0 to NumExpertsM1 do
-    begin
-      WV := Block.GateConv.FArrNeurons[e].Weights;
-      Move(W.FData[Base], WV.FData[0], HiddenSize * csNeuralFloatSize);
-      Block.GateConv.FArrNeurons[e].BiasWeight := 0;
-      Inc(Base, HiddenSize);
-    end;
-    Block.GateConv.FlushWeightCache();
-    Consumed.Add(RouterName);
-    // ---- input_linear [E, 2I, H]: per expert gate|up -> up|gate neurons ----
-    if (Reader.DimCount(InName) <> 3) or
-       (Reader.DimSize(InName, 0) <> NumExperts) or
-       (Reader.DimSize(InName, 1) <> TwoI) or
-       (Reader.DimSize(InName, 2) <> HiddenSize) then
-      ImportError('Llama import: "' + InName + '" must have shape [' +
-        IntToStr(NumExperts) + ', ' + IntToStr(TwoI) + ', ' +
-        IntToStr(HiddenSize) + '], got ' + Reader.ShapeAsString(InName));
-    Reader.LoadTensorFlat(InName, W); // flat [E*2I, H]
-    for e := 0 to NumExpertsM1 do
-    begin
-      EG := Block.ExpertGateUp[e];
-      EnsureWritableImportWeights(EG);
-      srcUpOfs := (e * TwoI + ExpertWidth) * HiddenSize;
-      srcGateOfs := (e * TwoI) * HiddenSize;
-      for j := 0 to ExpertWidthM1 do
-      begin
-        // UP half (input_linear rows I..2I-1) -> neurons 0..I-1.
-        WV := EG.FArrNeurons[j].Weights;
-        Move(W.FData[srcUpOfs], WV.FData[0],
-          HiddenSize * csNeuralFloatSize);
-        EG.FArrNeurons[j].BiasWeight := 0;
-        // GATE half (input_linear rows 0..I-1) -> neurons I..2I-1.
-        WV := EG.FArrNeurons[ExpertWidth + j].Weights;
-        Move(W.FData[srcGateOfs], WV.FData[0],
-          HiddenSize * csNeuralFloatSize);
-        EG.FArrNeurons[ExpertWidth + j].BiasWeight := 0;
-        Inc(srcUpOfs, HiddenSize); Inc(srcGateOfs, HiddenSize);
-      end;
-      EG.FlushWeightCache();
+  LoadLlamaLinearWeights(Reader, Block.GateConv, RouterName,
+    {InDim=}HiddenSize, {OutDim=}NumExperts);
+  Consumed.Add(RouterName);
+  // ---- input_linear [E, 2I, H]: per expert gate|up -> up|gate neurons ----
+  if (Reader.DimCount(InName) <> 3) or
+     (Reader.DimSize(InName, 0) <> NumExperts) or
+     (Reader.DimSize(InName, 1) <> TwoI) or
+     (Reader.DimSize(InName, 2) <> HiddenSize) then
+    ImportError('Llama import: "' + InName + '" must have shape [' +
+      IntToStr(NumExperts) + ', ' + IntToStr(TwoI) + ', ' +
+      IntToStr(HiddenSize) + '], got ' + Reader.ShapeAsString(InName));
+  if (Reader.DimCount(OutName) <> 3) or
+     (Reader.DimSize(OutName, 0) <> NumExperts) or
+     (Reader.DimSize(OutName, 1) <> HiddenSize) or
+     (Reader.DimSize(OutName, 2) <> ExpertWidth) then
+    ImportError('Llama import: "' + OutName + '" must have shape [' +
+      IntToStr(NumExperts) + ', ' + IntToStr(HiddenSize) + ', ' +
+      IntToStr(ExpertWidth) + '], got ' + Reader.ShapeAsString(OutName));
+  if not (Reader.CanStreamTensorRows(InName) and
+          Reader.CanStreamTensorRows(OutName)) then
+  begin
+    W := TNNetVolume.Create;
+    try
+      FillExpertsFromStagedSlab;
+    finally
+      W.Free;
     end;
     Consumed.Add(InName);
-    // ---- output_linear [E, H, I]: per expert down (residual_multiplier) ----
-    if (Reader.DimCount(OutName) <> 3) or
-       (Reader.DimSize(OutName, 0) <> NumExperts) or
-       (Reader.DimSize(OutName, 1) <> HiddenSize) or
-       (Reader.DimSize(OutName, 2) <> ExpertWidth) then
-      ImportError('Llama import: "' + OutName + '" must have shape [' +
-        IntToStr(NumExperts) + ', ' + IntToStr(HiddenSize) + ', ' +
-        IntToStr(ExpertWidth) + '], got ' + Reader.ShapeAsString(OutName));
-    Reader.LoadTensorFlat(OutName, W); // flat [E*H, I]
-    for e := 0 to NumExpertsM1 do
-    begin
-      ED := Block.ExpertDown[e];
-      EnsureWritableImportWeights(ED);
-      srcOfs := (e * HiddenSize) * ExpertWidth;
-      for j := 0 to HiddenSizeM1 do
-      begin
-        WV := ED.FArrNeurons[j].Weights;
-        Move(W.FData[srcOfs], WV.FData[0],
-          ExpertWidth * csNeuralFloatSize);
-        if ResidualScale <> 1.0 then
-          TNNetVolume.Mul(WV.GetRawPtr(0), ResidualScale, ExpertWidth);
-        ED.FArrNeurons[j].BiasWeight := 0;
-        Inc(srcOfs, ExpertWidth);
-      end;
-      ED.FlushWeightCache();
-    end;
     Consumed.Add(OutName);
-  finally
-    W.Free;
+    exit;
   end;
+  for e := 0 to NumExpertsM1 do
+  begin
+    EG := Block.ExpertGateUp[e];
+    // UP half (input_linear rows I..2I-1) -> neurons 0..I-1, then GATE half
+    // (rows 0..I-1) -> neurons I..2I-1. Two DISJOINT row blocks of the same
+    // flat slab, so each is an ordinary row-streamed load.
+    LoadLlamaLinearWeights(Reader, EG, InName,
+      {InDim=}HiddenSize, {OutDim=}ExpertWidth, {NeuronBase=}0,
+      {ExpectedNeurons=}TwoI, {RotaryHeadDim=}0, {BiasName=}'',
+      {Scale=}1.0, {RotaryDims=}0,
+      {SrcRowBase=}e * TwoI + ExpertWidth, {SrcRows=}SlabInRows,
+      {pFlatSlabRows=}true);
+    LoadLlamaLinearWeights(Reader, EG, InName,
+      {InDim=}HiddenSize, {OutDim=}ExpertWidth, {NeuronBase=}ExpertWidth,
+      {ExpectedNeurons=}TwoI, {RotaryHeadDim=}0, {BiasName=}'',
+      {Scale=}1.0, {RotaryDims=}0,
+      {SrcRowBase=}e * TwoI, {SrcRows=}SlabInRows,
+      {pFlatSlabRows=}true);
+    // ---- output_linear [E, H, I]: this expert's down (residual_multiplier
+    //      folds into the rows through Scale) ----
+    ED := Block.ExpertDown[e];
+    LoadLlamaLinearWeights(Reader, ED, OutName,
+      {InDim=}ExpertWidth, {OutDim=}HiddenSize, {NeuronBase=}0,
+      {ExpectedNeurons=}HiddenSize, {RotaryHeadDim=}0, {BiasName=}'',
+      {Scale=}ResidualScale, {RotaryDims=}0,
+      {SrcRowBase=}e * HiddenSize, {SrcRows=}SlabOutRows,
+      {pFlatSlabRows=}true);
+  end;
+  Consumed.Add(InName);
+  Consumed.Add(OutName);
 end;
 
 // Loads Llama-4's FUSED 3-D expert slab for one block. HF Llama4TextExperts
@@ -18151,9 +18223,16 @@ type
       Src: TNNetVolume);
     procedure LoadTensorFlat(const pName: string;
       Dest: TNNetVolume); override;
-    // Tensors live in owned volumes, not raw stream bytes - the base
-    // reader's ranged read does not apply. Coded by Claude (AI).
+    // Tensors live in owned FP32 volumes rather than raw stream bytes, so
+    // the base reader's ranged FILE read does not apply - but the elements
+    // are already contiguous row-major singles, which is exactly what a row
+    // range is. Serving it lets importers slice a big staged tensor (a MoE
+    // expert slab) per row block instead of copying the whole thing once
+    // per slice, and keeps their direct-to-int8 paths available.
+    // Coded by Claude (AI).
     function CanStreamTensorRows(const pName: string): boolean; override;
+    procedure LoadTensorRowsFlat(const pName: string;
+      FirstRow, RowCount, RowSize: integer; Dest: TNNetVolume); override;
   end;
 
 constructor TNNetMemTensorReader.Create;
@@ -18206,7 +18285,29 @@ end;
 function TNNetMemTensorReader.CanStreamTensorRows(
   const pName: string): boolean;
 begin
-  Result := false;
+  Result := HasTensor(pName);
+end;
+
+procedure TNNetMemTensorReader.LoadTensorRowsFlat(const pName: string;
+  FirstRow, RowCount, RowSize: integer; Dest: TNNetVolume);
+var
+  Idx: integer;
+  Src: TNNetVolume;
+  ElemCount: Int64;
+begin
+  Idx := FindTensor(pName);
+  if Idx < 0 then
+    ImportError('TNNet in-memory reader: tensor "' + pName + '" not found.');
+  Src := FData[Idx];
+  ElemCount := Int64(RowCount) * RowSize;
+  if (FirstRow < 0) or (RowCount <= 0) or (RowSize <= 0) or
+     ((Int64(FirstRow) + RowCount) * RowSize > Src.Size) then
+    ImportError('TNNet in-memory reader: rows ' + IntToStr(FirstRow) + '..' +
+      IntToStr(FirstRow + RowCount - 1) + ' of RowSize=' + IntToStr(RowSize) +
+      ' exceed the ' + IntToStr(Src.Size) + ' elements of "' + pName + '".');
+  Dest.ReSize(integer(ElemCount), 1, 1);
+  Move(Src.FData[Int64(FirstRow) * RowSize], Dest.FData[0],
+    ElemCount * csNeuralFloatSize);
 end;
 
 procedure TNNetMemTensorReader.LoadTensorFlat(const pName: string;

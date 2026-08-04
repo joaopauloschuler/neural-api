@@ -180,6 +180,9 @@ type
     procedure TestInt8QuantizedDeepSeekV2LogitDrift;
     procedure TestInt8QuantizedT5LogitDrift;
     procedure TestInt8QuantizedMarianLogitDrift;
+    procedure TestInt8QuantizedQwen35MoeLogitDrift;
+    procedure TestInt8QuantizedGraniteMoeLogitDrift;
+    procedure TestQwen35MoeInt8ExpertStreamCodeParity;
     procedure TestTokenRMSNormForwardAndSaveLoad;
     procedure TestRotaryHalfPermutationMatchesHFRotateHalf;
     procedure TestSwiGLUMatchesLlamaMLPGating;
@@ -4954,6 +4957,131 @@ begin
     EncQ.Free;
     DecF.Free;
     EncF.Free;
+  end;
+end;
+
+// Int8 structural + drift gates for the two FUSED 3-D expert-slab MoE
+// families (LoadGraniteMoEExperts). Their experts load per expert as
+// flat-slab row blocks, so an int8-armed build streams every expert row
+// straight into its int8 codes; these gates fail if that streaming leaves a
+// layer unquantized or holding FP32 rows.
+// The DRIFT gates here are far looser than the 5e-2 every other family uses,
+// and deliberately so: the router is itself a quantized PointwiseConvLinear,
+// and at pico width (hidden 8, 3-4 experts) int8 noise readily flips a top-k
+// pick, which swaps a whole expert MLP in or out of the sum. Measured
+// 2026-08: Qwen3.5-MoE 3.6e-1 relative, granitemoe 1.4e-1 - and BOTH are
+// reproduced bit-for-bit by the pre-streaming slab loader, so the magnitude
+// is the fixtures' quantization sensitivity, not a property of the streaming
+// path. The exact guard on that path is the code-parity test below; these
+// gates exist to catch a layer that silently stops being quantized.
+procedure TTestNeuralPretrained.TestInt8QuantizedQwen35MoeLogitDrift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TLlamaConfig;
+begin
+  RandSeed := 424242;
+  NNFP32 := BuildQwen35MoeFromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5_moe.safetensors'), Config, {SeqLen=}8,
+    {pTrainable=}true, FixturePath('tiny_qwen3_5_moe_config.json'));
+  NNQ := BuildQwen35MoeFromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5_moe.safetensors'), Config, {SeqLen=}8,
+    {pTrainable=}false, FixturePath('tiny_qwen3_5_moe_config.json'),
+    {pQuantizeInt8=}true);
+  try
+    // 4 blocks x (attention + router + 4 experts x 2 + shared gate/up/down/
+    // gate-logit) plus the LM head.
+    AssertInt8DriftPair('Qwen3.5-MoE', NNFP32, NNQ, 8, Config.VocabSize,
+      {MinQuantLayers=}40, {MaxRelDrift=}5e-1, {TwoChannelInput=}false);
+  finally
+    NNQ.Free;
+    NNFP32.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestInt8QuantizedGraniteMoeLogitDrift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TLlamaConfig;
+begin
+  RandSeed := 424242;
+  NNFP32 := BuildLlamaFromSafeTensorsEx(
+    FixturePath('tiny_granitemoe.safetensors'), Config, {SeqLen=}8,
+    {pTrainable=}true, FixturePath('tiny_granitemoe_config.json'));
+  NNQ := BuildLlamaFromSafeTensorsEx(
+    FixturePath('tiny_granitemoe.safetensors'), Config, {SeqLen=}8,
+    {pTrainable=}false, FixturePath('tiny_granitemoe_config.json'),
+    {pQuantizeInt8=}true);
+  try
+    // 2 blocks x (attention + router + 3 experts x 2) plus the tied head.
+    AssertInt8DriftPair('granitemoe', NNFP32, NNQ, 8, Config.VocabSize,
+      {MinQuantLayers=}16, {MaxRelDrift=}3e-1, {TwoChannelInput=}false);
+  finally
+    NNQ.Free;
+    NNFP32.Free;
+  end;
+end;
+
+// The direct-to-int8 expert streaming must produce EXACTLY the codes and
+// scales the FP32 round-trip produces - that equivalence is what lets the
+// importer skip materializing an FP32 expert at all. Builds the same MoE
+// checkpoint both ways (armed int8 = streamed per expert row block; FP32 then
+// QuantizeWeightsInt8 = dequantize/fill/requantize) and compares every
+// quantized layer's raw container byte for byte. Qwen3.5-MoE carries
+// ResidualScale = 1.0, so the two paths are exactly equal rather than equal
+// up to a rounding of the scale product.
+// NOTE: the staged-slab fallback for readers that cannot serve row ranges is
+// NOT reachable from here - every in-tree reader that reaches this loader
+// streams. It was verified by forcing CanStreamTensorRows to false and
+// re-running this suite.
+procedure TTestNeuralPretrained.TestQwen35MoeInt8ExpertStreamCodeParity;
+var
+  NNStreamed, NNRoundTrip: TNNet;
+  Config: TLlamaConfig;
+  i, r, CmpLayers: integer;
+  CWa, CWb: TNNetLayerConcatedWeights;
+  CodesA, CodesB: TInt8DynArr;
+  ScalesA, ScalesB: TNeuralFloatDynArr;
+  RowsA, RowsB, VSa, VSb: integer;
+begin
+  RandSeed := 424242;
+  NNStreamed := BuildQwen35MoeFromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5_moe.safetensors'), Config, {SeqLen=}8,
+    {pTrainable=}false, FixturePath('tiny_qwen3_5_moe_config.json'),
+    {pQuantizeInt8=}true);
+  NNRoundTrip := BuildQwen35MoeFromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5_moe.safetensors'), Config, {SeqLen=}8,
+    {pTrainable=}false, FixturePath('tiny_qwen3_5_moe_config.json'));
+  try
+    NNRoundTrip.QuantizeWeightsInt8();
+    AssertEquals('layer count', NNStreamed.Layers.Count,
+      NNRoundTrip.Layers.Count);
+    CmpLayers := 0;
+    for i := 0 to NNStreamed.Layers.Count - 1 do
+    begin
+      if not (NNStreamed.Layers[i] is TNNetLayerConcatedWeights) then continue;
+      CWa := TNNetLayerConcatedWeights(NNStreamed.Layers[i]);
+      CWb := TNNetLayerConcatedWeights(NNRoundTrip.Layers[i]);
+      if not CWa.GetInt8QuantData(CodesA, ScalesA, RowsA, VSa) then continue;
+      AssertTrue('layer ' + IntToStr(i) + ': round-trip net not quantized',
+        CWb.GetInt8QuantData(CodesB, ScalesB, RowsB, VSb));
+      AssertEquals('layer ' + IntToStr(i) + ': rows', RowsA, RowsB);
+      AssertEquals('layer ' + IntToStr(i) + ': vector size', VSa, VSb);
+      for r := 0 to RowsA * VSa - 1 do
+        if CodesA[r] <> CodesB[r] then
+          Fail('layer ' + IntToStr(i) + ': int8 code ' + IntToStr(r) +
+            ' streamed ' + IntToStr(CodesA[r]) + ' <> round-trip ' +
+            IntToStr(CodesB[r]));
+      for r := 0 to RowsA - 1 do
+        AssertEquals('layer ' + IntToStr(i) + ': scale ' + IntToStr(r),
+          ScalesA[r], ScalesB[r], 0);
+      Inc(CmpLayers);
+    end;
+    // The experts alone are 4 blocks x 4 experts x 2 layers.
+    AssertTrue('expected >= 40 compared int8 layers, got ' +
+      IntToStr(CmpLayers), CmpLayers >= 40);
+  finally
+    NNRoundTrip.Free;
+    NNStreamed.Free;
   end;
 end;
 
