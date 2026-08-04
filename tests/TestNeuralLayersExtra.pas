@@ -191,6 +191,9 @@ type
     procedure TestMoEExpertBankChunkedParityInt8MultiToken;
     procedure TestMoEExpertBankChunkedParityInt8Decode;
     procedure TestMoEExpertBankChunkEligibility;
+    // The point of the bank: the routed path's LAYER COUNT and ACTIVATION
+    // FOOTPRINT are independent of the expert count.
+    procedure TestMoEExpertBankScalesWithTopKNotExperts;
   private
     // Builds ONE net holding both the per-expert reference graph and the fused
     // bank behind the SAME router, then asserts the two outputs agree.
@@ -8351,6 +8354,55 @@ begin
       BankDown.ChunkEligible());
   finally
     NN.Free;
+  end;
+end;
+
+// The routed MoE path costs one gate|up bank plus one down bank whatever the
+// expert count, where the per-expert chain cost 6 layers per expert plus a sum.
+// Both axes that used to scale with E are pinned here:
+//   layers        - 6 for the whole graph, at E = 8 and at E = 256;
+//   activations   - TokenCnt*(TopK*ExpertWidth + HiddenSize) floats, because
+//                   the gate|up bank emits only the k slots a token selected
+//                   instead of one full expert hidden per expert.
+// Only the WEIGHT ROWS still scale with E, and they must: they are the model.
+// Coded by Claude (AI).
+procedure TTestNeuralLayersExtra.TestMoEExpertBankScalesWithTopKNotExperts;
+const
+  TokenCnt = 16;
+  HiddenSize = 32;
+  ExpertWidth = 8;
+  TopCnt = 4;
+var
+  NN: TNNet;
+  BankGateUp, BankDown: TNNetLayer;
+  CaseCnt, ExpertCnt: integer;
+  BankActivations, RowCnt: integer;
+begin
+  for CaseCnt := 0 to 1 do
+  begin
+    if CaseCnt = 0 then ExpertCnt := 8 else ExpertCnt := 256;
+    NN := BuildMoEBankChunkNet(TokenCnt, HiddenSize, ExpertCnt, ExpertWidth,
+      TopCnt, {QuantizeBanks=}false, BankGateUp, BankDown);
+    try
+      AssertEquals('routed path layer count is independent of the expert ' +
+        'count (E=' + IntToStr(ExpertCnt) + ')', 6, NN.Layers.Count);
+      AssertEquals('gate|up bank emits TopK slots, not one hidden per expert ' +
+        '(E=' + IntToStr(ExpertCnt) + ')', TopCnt * ExpertWidth,
+        BankGateUp.Output.Depth);
+      AssertEquals('down bank emits the model width (E=' +
+        IntToStr(ExpertCnt) + ')', HiddenSize, BankDown.Output.Depth);
+      BankActivations := BankGateUp.Output.Size + BankDown.Output.Size;
+      AssertEquals('bank activations are TokenCnt*(TopK*Width + Hidden), ' +
+        'free of the expert count (E=' + IntToStr(ExpertCnt) + ')',
+        TokenCnt * (TopCnt * ExpertWidth + HiddenSize), BankActivations);
+      // The weights DO scale with E - one row block per expert in each bank.
+      RowCnt := BankGateUp.Neurons.Count + BankDown.Neurons.Count;
+      AssertEquals('weight rows scale with the expert count (E=' +
+        IntToStr(ExpertCnt) + ')',
+        ExpertCnt * (2 * ExpertWidth + HiddenSize), RowCnt);
+    finally
+      NN.Free;
+    end;
   end;
 end;
 

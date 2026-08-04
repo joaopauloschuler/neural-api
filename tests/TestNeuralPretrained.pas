@@ -7983,6 +7983,13 @@ begin
     AssertEquals('intermediate_size', 5, Config.IntermediateSize);
     AssertFalse('untied', Config.TieWordEmbeddings);
     AssertEquals('prefix', 'model.', Config.Prefix);
+    // GROUND TRUTH FIRST. The structural counts below describe the graph
+    // the importer happens to build; a refactor that legitimately changes
+    // that shape must not be able to abort the test before the HF logit
+    // comparison - the only assertion here that checks the MODEL.
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_olmoe_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
     // Structure: UNIFORM all-MoE - one router (TopKGate + its PER-TOKEN
     // softmax) per block and ONE PAIR OF FUSED EXPERT BANKS per block, which
     // hold every expert's SwiGLU internally, so no TNNetSwiGLU layer survives
@@ -8019,9 +8026,6 @@ begin
       0, SwiGLUCnt);
     AssertEquals('TokenRMSNorm count (4 per pre-norm block + final)',
       4 * Config.NumLayers + 1, NormCnt);
-    AssertLogitParityWithFixture(NN,
-      FixturePath('tiny_olmoe_logits.json'), Config.MaxPositions,
-      Config.VocabSize);
   finally
     NN.Free;
   end;
@@ -8075,6 +8079,13 @@ begin
     AssertEquals('num_experts_per_tok', 2, Config.MoEExpertsPerTok);
     AssertFalse('untied', Config.TieWordEmbeddings);
     AssertEquals('prefix', 'model.', Config.Prefix);
+    // GROUND TRUTH FIRST. The structural counts below describe the graph
+    // the importer happens to build; a refactor that legitimately changes
+    // that shape must not be able to abort the test before the HF logit
+    // comparison - the only assertion here that checks the MODEL.
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_mixtral_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
     // Structure: one router (TNNetTopKGate + its PER-TOKEN PointwiseSoftMax)
     // per block and ONE PAIR OF FUSED EXPERT BANKS per block, which hold every
     // expert's SwiGLU internally, so no TNNetSwiGLU layer survives (there is
@@ -8104,9 +8115,6 @@ begin
       Config.NumLayers, BankDownCnt);
     AssertEquals('no standalone SwiGLU (banks fold it, no dense FFN)',
       0, SwiGLUCnt);
-    AssertLogitParityWithFixture(NN,
-      FixturePath('tiny_mixtral_logits.json'), Config.MaxPositions,
-      Config.VocabSize);
   finally
     NN.Free;
   end;
@@ -8166,6 +8174,13 @@ begin
     AssertEquals('moe_intermediate_size', 5, Config.MoEIntermediateSize);
     AssertFalse('untied', Config.TieWordEmbeddings);
     AssertEquals('prefix', 'model.', Config.Prefix);
+    // GROUND TRUTH FIRST. The structural counts below describe the graph
+    // the importer happens to build; a refactor that legitimately changes
+    // that shape must not be able to abort the test before the HF logit
+    // comparison - the only assertion here that checks the MODEL.
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_qwen3_moe_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
     // Structure: one router (TNNetTopKGate + its PER-TOKEN PointwiseSoftMax)
     // per block and ONE PAIR OF FUSED EXPERT BANKS per block, which hold every
     // expert's SwiGLU internally, so no TNNetSwiGLU layer survives (there is
@@ -8195,9 +8210,6 @@ begin
       Config.NumLayers, BankDownCnt);
     AssertEquals('no standalone SwiGLU (banks fold it, no dense FFN)',
       0, SwiGLUCnt);
-    AssertLogitParityWithFixture(NN,
-      FixturePath('tiny_qwen3_moe_logits.json'), Config.MaxPositions,
-      Config.VocabSize);
   finally
     NN.Free;
   end;
@@ -8247,6 +8259,13 @@ begin
     AssertEquals('num_experts', 4, Config.NumLocalExperts);
     AssertEquals('moe_intermediate_size', 5, Config.MoEIntermediateSize);
     AssertEquals('intermediate_size', 12, Config.IntermediateSize);
+    // GROUND TRUTH FIRST. The structural counts below describe the graph
+    // the importer happens to build; a refactor that legitimately changes
+    // that shape must not be able to abort the test before the HF logit
+    // comparison - the only assertion here that checks the MODEL.
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_qwen3_moe_mixed_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
     // ONE MoE layer (layer 1): exactly one router (TopKGate + per-token
     // softmax) and one pair of fused expert banks, which fold the routed
     // experts' SwiGLU. The surviving TNNetSwiGLU layers are therefore the
@@ -8273,9 +8292,6 @@ begin
     AssertEquals('one gate|up expert bank (single MoE layer)', 1, BankUpCnt);
     AssertEquals('one down expert bank (single MoE layer)', 1, BankDownCnt);
     AssertEquals('SwiGLUs = the dense layers only (2)', 2, SwiGLUCnt);
-    AssertLogitParityWithFixture(NN,
-      FixturePath('tiny_qwen3_moe_mixed_logits.json'), Config.MaxPositions,
-      Config.VocabSize);
   finally
     NN.Free;
   end;
@@ -8369,6 +8385,12 @@ begin
     Config, {SeqLen=}LLAMA4_SEQ, {pTrainable=}true,
     FixturePath('tiny_llama4_config.json'));
   try
+    // GROUND TRUTH FIRST. The structural counts below describe the graph
+    // the importer happens to build; a refactor that legitimately changes
+    // that shape must not be able to abort the test before the HF logit
+    // comparison - the only assertion here that checks the MODEL.
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_llama4_logits.json'), LLAMA4_SEQ, Config.VocabSize);
     GateCnt := 0; SigmoidCnt := 0; SoftMaxCnt := 0; TempCnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
@@ -8387,8 +8409,6 @@ begin
     // (NumHeads = 2) on each NoPE layer = 4 total.
     AssertEquals('temperature layers = heads * NoPE layers (2*2)',
       4, TempCnt);
-    AssertLogitParityWithFixture(NN,
-      FixturePath('tiny_llama4_logits.json'), LLAMA4_SEQ, Config.VocabSize);
   finally
     NN.Free;
   end;
@@ -8429,6 +8449,13 @@ begin
     // rejection); HF gates the window behind use_sliding_window, so the
     // config parse must surface SlidingWindow=3 (not 0 / full attention).
     AssertEquals('sliding_window honored', 3, Config.SlidingWindow);
+    // GROUND TRUTH FIRST. The structural counts below describe the graph
+    // the importer happens to build; a refactor that legitimately changes
+    // that shape must not be able to abort the test before the HF logit
+    // comparison - the only assertion here that checks the MODEL.
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_qwen3_moe_window_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
     // EVERY attention sub-layer (now ONE fused multi-head layer per block)
     // carries Window=3.
     SDPACnt := 0;
@@ -8443,9 +8470,6 @@ begin
       end;
     end;
     AssertEquals('fused attn layers = num layers', 2, SDPACnt);
-    AssertLogitParityWithFixture(NN,
-      FixturePath('tiny_qwen3_moe_window_logits.json'), Config.MaxPositions,
-      Config.VocabSize);
   finally
     NN.Free;
   end;
@@ -8727,6 +8751,13 @@ begin
       Config.SharedIntermediateSize);
     AssertTrue('attention output gate', Config.AttnOutputGate);
     AssertEquals('flat prefix', 'model.', Config.Prefix);
+    // GROUND TRUTH FIRST. The structural counts below describe the graph
+    // the importer happens to build; a refactor that legitimately changes
+    // that shape must not be able to abort the test before the HF logit
+    // comparison - the only assertion here that checks the MODEL.
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_qwen3_5_moe_logits.json'), Config.MaxPositions,
+      Config.VocabSize);
     // Structure: one top-k router per layer; the 4 routed experts live in
     // one pair of fused expert banks per layer (their SwiGLU is folded in),
     // so the only surviving TNNetSwiGLU is the SHARED expert's - one per
@@ -8756,9 +8787,6 @@ begin
     AssertEquals('the shared expert SwiGLU only, one per layer',
       Config.NumLayers, SwiGLUCnt);
     AssertEquals('one DeltaNet per linear layer', 3, DeltaCnt);
-    AssertLogitParityWithFixture(NN,
-      FixturePath('tiny_qwen3_5_moe_logits.json'), Config.MaxPositions,
-      Config.VocabSize);
   finally
     NN.Free;
   end;
@@ -9478,6 +9506,12 @@ begin
     AssertTrue('norm_topk_prob', Config.NormTopKProb);
     AssertEquals('routed_scaling_factor', 2.5, Config.RoutedScalingFactor,
       1e-6);
+    // GROUND TRUTH FIRST. The structural counts below describe the graph
+    // the importer happens to build; a refactor that legitimately changes
+    // that shape must not be able to abort the test before the HF logit
+    // comparison - the only assertion here that checks the MODEL.
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_nemotronh_moe_logits.json'), 7, Config.VocabSize);
     // Schedule M*E-: 1 Mamba-2, 1 attention (4 SDPA heads), 1 MoE block
     // (-> 4 routed + 1 shared relu2 expert => 5 TNNetSquare), 1 dense relu2
     // MLP (-> 1 more TNNetSquare) = 6 TNNetSquare. One TNNetBiasBalancedTopKGate
@@ -9497,8 +9531,6 @@ begin
       SquareCnt);
     AssertEquals('TNNetBiasBalancedTopKGate count (1 MoE router)', 1, GateCnt);
     AssertEquals('SwiGLU count (non-gated relu2 experts => 0)', 0, SwiGLUCnt);
-    AssertLogitParityWithFixture(NN,
-      FixturePath('tiny_nemotronh_moe_logits.json'), 7, Config.VocabSize);
   finally
     NN.Free;
   end;
@@ -9942,6 +9974,10 @@ begin
     AssertFalse('norm_topk_prob', Config.NormTopKProb);
     AssertEquals('routed_scaling_factor', 1.5,
       Config.RoutedScalingFactor, 1e-6);
+    // GROUND TRUTH FIRST. The structural counts below describe the graph
+    // the importer happens to build; a refactor that legitimately changes
+    // that shape must not be able to abort the test before the HF logit
+    // comparison - the only assertion here that checks the MODEL.
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_deepseek_v2_logits.json'),
       Config.MaxPositions, Config.VocabSize);
