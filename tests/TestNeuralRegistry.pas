@@ -558,7 +558,11 @@ begin
   //      TNNetScatterToAffine, TNNetRoIAlign, TNNetAdaIN,
   //      TNNetConvolutionSharedWeights, TNNetDeepEquilibriumSharedConv,
   //      TNNetCellMulByCell, TNNetChannelMulByLayer, TNNetConvolution3D,
-  //      TNNetDisentangledAttention, TNNetGptOssGatedSwiGLU.
+  //      TNNetDisentangledAttention, TNNetGptOssGatedSwiGLU,
+  //      TNNetMoEExpertBankGateUp (source + router), TNNetMoEExpertBankDown
+  //      (its previous layer must be the gate|up bank).
+  //    Both MoE bank layers round-trip in
+  //    TTestNeuralLayersExtra.TestMoEExpertBankShapesAndRoundTrip.
   //    (These ARE in the dispatch table; covering them needs a multi-branch
   //    builder -- a worthwhile follow-up. They are exercised elsewhere by their
   //    own dedicated round-trip tests per the codebase memory notes.)

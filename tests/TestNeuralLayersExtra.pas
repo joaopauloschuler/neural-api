@@ -165,6 +165,21 @@ type
     // SplitChannels -> TokenRMSNorm -> DeepConcat wiring it replaces
     procedure TestHeadRMSNormForwardParity;
     procedure TestHeadRMSNormBackwardParity;
+
+    // Fused MoE expert bank: the two bank layers against the per-expert
+    // PointwiseConvLinear -> SwiGLU -> PointwiseConvLinear -> gate-scaled sum
+    // graph they replace.
+    procedure TestMoEExpertBankParityTopKLessThanExperts;
+    procedure TestMoEExpertBankParityTopK1;
+    procedure TestMoEExpertBankParityIdleExpert;
+    procedure TestMoEExpertBankParityDenseGate;
+    procedure TestMoEExpertBankShapesAndRoundTrip;
+    procedure TestMoEExpertBankBackpropagateRaises;
+  private
+    // Builds ONE net holding both the per-expert reference graph and the fused
+    // bank behind the SAME router, then asserts the two outputs agree.
+    procedure RunMoEBankParity(TokenCnt, HiddenSize, ExpertCnt, ExpertWidth,
+      TopCnt: integer; UniformRouting: boolean; const Msg: string);
   end;
 
 implementation
@@ -7639,6 +7654,217 @@ begin
     Input.Free;
     PerHead.Free;
     Tiled.Free;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// Fused MoE expert bank (TNNetMoEExpertBankGateUp / TNNetMoEExpertBankDown)
+// ---------------------------------------------------------------------------
+
+// Deterministic weight value. The bank and the per-expert reference graph are
+// filled from the SAME function so any output difference is the layer's doing.
+function MoEBankWeightAt(Salt, Row, Col: integer): TNeuralFloat;
+begin
+  Result := Sin(Salt * 0.77 + Row * 0.13 + Col * 0.29) * 0.5;
+end;
+
+// Fills a linear layer whose neuron r is the flat weight-matrix row RowBase+r.
+procedure FillMoEBankLinear(L: TNNetLayer; Salt, RowBase: integer);
+var
+  RowIdx, ColIdx, MaxRowPos, MaxColPos: integer;
+begin
+  MaxRowPos := L.Neurons.Count - 1;
+  for RowIdx := 0 to MaxRowPos do
+  begin
+    MaxColPos := L.Neurons[RowIdx].Weights.Size - 1;
+    for ColIdx := 0 to MaxColPos do
+      L.Neurons[RowIdx].Weights.FData[ColIdx] :=
+        MoEBankWeightAt(Salt, RowBase + RowIdx, ColIdx);
+    L.Neurons[RowIdx].BiasWeight := MoEBankWeightAt(Salt + 3, RowBase + RowIdx, 7);
+  end;
+  L.FlushWeightCache();
+end;
+
+procedure TTestNeuralLayersExtra.RunMoEBankParity(TokenCnt, HiddenSize,
+  ExpertCnt, ExpertWidth, TopCnt: integer; UniformRouting: boolean;
+  const Msg: string);
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  InputLayer, GateConv, GateTopK, GateE, GateBroadcast: TNNetLayer;
+  RefGateUp, RefDown, RefOut, BankGateUp, BankDown: TNNetLayer;
+  Branches: array of TNNetLayer;
+  ExpertIdx, NeuronIdx, MaxExpertPos, MaxNeuronPos, MaxOutPos, Pos: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(TokenCnt, 1, HiddenSize);
+  try
+    SetLength(Branches, ExpertCnt);
+    MaxExpertPos := ExpertCnt - 1;
+    InputLayer := NN.AddLayer(TNNetInput.Create(TokenCnt, 1, HiddenSize));
+    // Router shared by both graphs, so both see the exact same routing.
+    GateConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(ExpertCnt));
+    NN.AddLayer(TNNetPointwiseSoftMax.Create());
+    GateTopK := NN.AddLayer(TNNetTopKGate.Create(TopCnt, {pRenormalize=}true));
+    // Reference: one PointwiseConvLinear -> SwiGLU -> PointwiseConvLinear MLP
+    // per expert, each scaled by its broadcast gate weight and summed.
+    for ExpertIdx := 0 to MaxExpertPos do
+    begin
+      GateE := NN.AddLayerAfter(TNNetSplitChannels.Create(ExpertIdx, 1), GateTopK);
+      GateBroadcast := NN.AddLayer(TNNetDeepConcat.Replicate(HiddenSize, GateE));
+      RefGateUp := NN.AddLayerAfter(
+        TNNetPointwiseConvLinear.Create(2 * ExpertWidth), InputLayer);
+      NN.AddLayer(TNNetSwiGLU.Create());
+      RefDown := NN.AddLayer(TNNetPointwiseConvLinear.Create(HiddenSize));
+      Branches[ExpertIdx] := NN.AddLayer(
+        TNNetCellMulByCell.Create(RefDown, GateBroadcast));
+      FillMoEBankLinear(RefGateUp, 1, ExpertIdx * 2 * ExpertWidth);
+      FillMoEBankLinear(RefDown, 2, ExpertIdx * HiddenSize);
+    end;
+    RefOut := NN.AddLayer(TNNetSum.Create(Branches));
+    // The fused bank, reading the same source and the same router.
+    BankGateUp := NN.AddLayer(TNNetMoEExpertBankGateUp.Create(
+      ExpertCnt, ExpertWidth, InputLayer, GateTopK));
+    BankDown := NN.AddLayer(TNNetMoEExpertBankDown.Create(ExpertCnt, HiddenSize));
+    FillMoEBankLinear(BankGateUp, 1, 0);
+    FillMoEBankLinear(BankDown, 2, 0);
+    if UniformRouting then
+    begin
+      // Zero router weights + strictly increasing biases: every token picks the
+      // SAME TopCnt experts (the highest indices), so the lower-indexed experts
+      // are selected by no token at all.
+      MaxNeuronPos := GateConv.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxNeuronPos do
+      begin
+        GateConv.Neurons[NeuronIdx].Weights.Fill(0);
+        GateConv.Neurons[NeuronIdx].BiasWeight := NeuronIdx * 0.5;
+      end;
+      GateConv.FlushWeightCache();
+    end
+    else FillMoEBankLinear(GateConv, 4, 0);
+
+    MaxOutPos := Input.Size - 1;
+    for Pos := 0 to MaxOutPos do Input.FData[Pos] := Sin(Pos * 0.37) * 0.8;
+    NN.Compute(Input);
+
+    AssertEquals(Msg + ' - gate|up slot depth', TopCnt * ExpertWidth,
+      BankGateUp.Output.Depth);
+    AssertEquals(Msg + ' - bank output depth', HiddenSize, BankDown.Output.Depth);
+    AssertEquals(Msg + ' - bank output size', RefOut.Output.Size,
+      BankDown.Output.Size);
+    // Guard against a vacuous comparison of two all-zero tensors.
+    AssertTrue(Msg + ' - reference output is non-trivial',
+      RefOut.Output.GetMaxAbs() > 1e-3);
+    MaxOutPos := RefOut.Output.Size - 1;
+    for Pos := 0 to MaxOutPos do
+      AssertEquals(Msg + ' - MoE output at flat index ' + IntToStr(Pos),
+        RefOut.Output.FData[Pos], BankDown.Output.FData[Pos], 1e-4);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankParityTopKLessThanExperts;
+begin
+  // 3 tokens, 5 experts, 2 kept: the data-dependent router makes different
+  // tokens fill their slots with different experts, exercising the slot map.
+  RunMoEBankParity({TokenCnt=}3, {HiddenSize=}6, {ExpertCnt=}5,
+    {ExpertWidth=}4, {TopCnt=}2, {UniformRouting=}false, 'k<E multi-token');
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankParityTopK1;
+begin
+  RunMoEBankParity(4, 6, 4, 3, 1, false, 'k=1');
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankParityIdleExpert;
+begin
+  // Uniform routing pins every token to the top 2 of 5 experts, so 3 experts
+  // are selected by ZERO tokens and must contribute nothing.
+  RunMoEBankParity(3, 6, 5, 4, 2, true, 'idle experts');
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankParityDenseGate;
+begin
+  // TopCnt = ExpertCnt: the gate degenerates to the identity and every expert
+  // fires for every token.
+  RunMoEBankParity(2, 5, 3, 3, 3, false, 'dense gate');
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankShapesAndRoundTrip;
+var
+  NN, NN2: TNNet;
+  InputLayer, GateTopK, BankGateUp, BankDown: TNNetLayer;
+  StructA: string;
+begin
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(4, 1, 8));
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    NN.AddLayer(TNNetPointwiseSoftMax.Create());
+    GateTopK := NN.AddLayer(TNNetTopKGate.Create(2));
+    BankGateUp := NN.AddLayer(
+      TNNetMoEExpertBankGateUp.Create(6, 5, InputLayer, GateTopK));
+    BankDown := NN.AddLayer(TNNetMoEExpertBankDown.Create(6, 8));
+
+    AssertEquals('gate|up neuron count', 6 * 2 * 5, BankGateUp.Neurons.Count);
+    AssertEquals('gate|up weight row width', 8,
+      BankGateUp.Neurons[0].Weights.Size);
+    AssertEquals('gate|up TopK', 2, TNNetMoEExpertBankGateUp(BankGateUp).TopK);
+    AssertEquals('gate|up output depth', 2 * 5, BankGateUp.Output.Depth);
+    AssertEquals('gate|up output SizeX', 4, BankGateUp.Output.SizeX);
+    AssertEquals('down neuron count', 6 * 8, BankDown.Neurons.Count);
+    AssertEquals('down weight row width', 5, BankDown.Neurons[0].Weights.Size);
+    AssertEquals('down output depth', 8, BankDown.Output.Depth);
+
+    StructA := NN.SaveStructureToString();
+    NN2.LoadStructureFromString(StructA);
+    AssertEquals('structure round trip', StructA, NN2.SaveStructureToString());
+    AssertTrue('reloaded gate|up class',
+      NN2.Layers[4] is TNNetMoEExpertBankGateUp);
+    AssertTrue('reloaded down class',
+      NN2.Layers[5] is TNNetMoEExpertBankDown);
+  finally
+    NN.Free;
+    NN2.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestMoEExpertBankBackpropagateRaises;
+var
+  NN: TNNet;
+  InputLayer, GateTopK, BankGateUp, BankDown: TNNetLayer;
+  RaisedGateUp, RaisedDown: boolean;
+begin
+  NN := TNNet.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(2, 1, 4));
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(3));
+    NN.AddLayer(TNNetPointwiseSoftMax.Create());
+    GateTopK := NN.AddLayer(TNNetTopKGate.Create(2));
+    BankGateUp := NN.AddLayer(
+      TNNetMoEExpertBankGateUp.Create(3, 2, InputLayer, GateTopK));
+    BankDown := NN.AddLayer(TNNetMoEExpertBankDown.Create(3, 4));
+
+    RaisedGateUp := false;
+    try
+      BankGateUp.Backpropagate();
+    except
+      on E: Exception do RaisedGateUp := true;
+    end;
+    AssertTrue('gate|up bank is inference-only', RaisedGateUp);
+
+    RaisedDown := false;
+    try
+      BankDown.Backpropagate();
+    except
+      on E: Exception do RaisedDown := true;
+    end;
+    AssertTrue('down bank is inference-only', RaisedDown);
+  finally
+    NN.Free;
   end;
 end;
 
