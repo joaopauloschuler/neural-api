@@ -17,6 +17,12 @@ type
   private
     // Shared input+weight finite-difference check for an asymmetric kernel.
     procedure RectangularConvGradientCheckXY(pFeatureSizeX, pFeatureSizeY: integer; const ALabel: string);
+    // Shared CPU-vs-device forward comparison for the fused MoE expert banks.
+    // SparseRouter swaps the top-k gate for a ReLU'd linear router, whose exact
+    // zeros leave some tokens with FEWER than TopK filled slots.
+    procedure RunMoEBankDownOpenCLParity(TokenCnt, HiddenSize, ExpertCnt,
+      ExpertWidth, TopCnt: integer; Quantize, ScaleInputByGate, WithBias,
+      SparseRouter: boolean; const Msg: string; Tolerance: TNeuralFloat);
   published
     // Convolution numerical tests with known weights
     procedure TestConvolutionNumericalValues;
@@ -354,6 +360,17 @@ type
     // (feature-size x padding x stride sweep, incl. pointwise and device
     // im2col). Coded by Claude (AI).
     procedure TestInt8QuantizedOpenCLParity;
+    // OpenCL single-launch fused-mixture forward parity (vs the fused CPU
+    // forward) for TNNetMoEExpertBankDown: the whole gate-weighted expert
+    // mixture of one MoE block in one kernel, reading the gate|up bank's slot
+    // map. The gate|up bank has no device path, so its output doubles as a
+    // routing-stability check across the CPU and device runs. Coded by Claude (AI).
+    procedure MoEExpertBankDownOpenCLParity;
+    procedure MoEExpertBankDownOpenCLParityInt8;
+    procedure MoEExpertBankDownOpenCLParityDecode;
+    procedure MoEExpertBankDownOpenCLParityScaleInput;
+    procedure MoEExpertBankDownOpenCLParityDenseGate;
+    procedure MoEExpertBankDownOpenCLParitySparseRouter;
     // OpenCL backward-GEMM offload parity (vs CPU) for the general convolution.
     procedure TestConvolutionBackwardOpenCLParity;
     // OpenCL two-GEMM forward offload parity (vs CPU) for the BASE
@@ -65119,6 +65136,208 @@ begin
   AssertTrue('OpenCL not compiled in: SKIP', true);
 end;
 {$ENDIF}
+
+{$IFDEF OpenCL}
+// Deterministic weight value shared by every MoE bank the parity harness fills.
+function MoEDownWeightAt(Salt, Row, Col: integer): TNeuralFloat;
+begin
+  Result := Sin(Salt * 0.77 + Row * 0.13 + Col * 0.29) * 0.5;
+end;
+
+// Fills a linear layer (or an expert bank) whose neuron r is flat weight-matrix
+// row r. WithBias = false leaves every bias at zero, which is what pins the
+// device kernel's bias-less fast path.
+procedure FillMoEDownLayer(L: TNNetLayer; Salt: integer; WithBias: boolean);
+var
+  RowIdx, ColIdx, MaxRowPos, MaxColPos: integer;
+begin
+  MaxRowPos := L.Neurons.Count - 1;
+  for RowIdx := 0 to MaxRowPos do
+  begin
+    MaxColPos := L.Neurons[RowIdx].Weights.Size - 1;
+    for ColIdx := 0 to MaxColPos do
+      L.Neurons[RowIdx].Weights.FData[ColIdx] :=
+        MoEDownWeightAt(Salt, RowIdx, ColIdx);
+    if WithBias
+      then L.Neurons[RowIdx].BiasWeight := MoEDownWeightAt(Salt + 3, RowIdx, 7)
+      else L.Neurons[RowIdx].BiasWeight := 0;
+  end;
+  L.FlushWeightCache();
+end;
+{$ENDIF}
+
+// CPU-vs-device forward parity for the fused MoE down bank. The whole net is
+// computed once on the CPU (fused CPU mixture), then again with the device path
+// forced on, and the two down-bank outputs are compared. Two guards keep the
+// comparison honest: the gate|up bank has NO device path, so its output must be
+// bit-identical across the two runs (proving the routing did not drift), and
+// the down bank's ForwardGPUCnt must be non-zero (proving the device path was
+// actually taken instead of silently falling back). Coded by Claude (AI).
+procedure TTestNeuralNumerical.RunMoEBankDownOpenCLParity(TokenCnt, HiddenSize,
+  ExpertCnt, ExpertWidth, TopCnt: integer; Quantize, ScaleInputByGate, WithBias,
+  SparseRouter: boolean; const Msg: string; Tolerance: TNeuralFloat);
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU, GateUpCPU: TNNetVolume;
+  InputLayer, GateConv, Router, BankGateUp, BankDown: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Pos, MaxPos: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(TokenCnt, 1, HiddenSize);
+  OutCPU := TNNetVolume.Create();
+  GateUpCPU := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(TokenCnt, 1, HiddenSize));
+    GateConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(ExpertCnt));
+    if SparseRouter then
+    begin
+      // Not a TNNetTopKGate, so the bank treats the router as dense (TopK =
+      // ExpertCnt) while ReLU's EXACT zeros leave most tokens with fewer than
+      // TopK filled slots - the only configuration that exercises the kernel's
+      // partial slot loop.
+      Router := NN.AddLayer(TNNetReLU.Create());
+    end
+    else
+    begin
+      NN.AddLayer(TNNetPointwiseSoftMax.Create());
+      Router := NN.AddLayer(TNNetTopKGate.Create(TopCnt, {pRenormalize=}true));
+    end;
+    BankGateUp := NN.AddLayer(TNNetMoEExpertBankGateUp.Create(
+      ExpertCnt, ExpertWidth, InputLayer, Router, ScaleInputByGate));
+    BankDown := NN.AddLayer(TNNetMoEExpertBankDown.Create(ExpertCnt, HiddenSize));
+    FillMoEDownLayer(GateConv, 4, true);
+    FillMoEDownLayer(BankGateUp, 1, WithBias);
+    FillMoEDownLayer(BankDown, 2, WithBias);
+    if Quantize then
+    begin
+      TNNetLayerConcatedWeights(BankGateUp).QuantizeWeightsInt8();
+      TNNetLayerConcatedWeights(BankDown).QuantizeWeightsInt8();
+      AssertTrue(Msg + ' - down bank is int8',
+        TNNetLayerConcatedWeights(BankDown).WeightsQuantizedInt8);
+    end;
+    MaxPos := Input.Size - 1;
+    for Pos := 0 to MaxPos do Input.FData[Pos] := Sin(Pos * 0.37) * 0.8;
+
+    NN.Compute(Input);
+    OutCPU.Copy(BankDown.Output);
+    GateUpCPU.Copy(BankGateUp.Output);
+    AssertTrue(Msg + ' - CPU output is non-trivial',
+      OutCPU.GetMaxAbs() > 1e-3);
+
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      BankDown.ForwardGPUCnt := 0;
+      NN.Compute(Input);
+      // Second device forward with UNCHANGED weights: exercises the resident
+      // expert-bank reuse (no re-upload).
+      NN.Compute(Input);
+      AssertTrue(Msg + ' - the down bank must take the device path',
+        BankDown.ForwardGPUCnt > 0);
+      AssertEquals(Msg + ' - output size match', OutCPU.Size,
+        BankDown.Output.Size);
+      // The gate|up bank stays on the CPU, so a LARGE change here would mean a
+      // different set of experts was selected and the comparison below would be
+      // meaningless. The router itself does run on the device in the second
+      // pass, so its float noise reaches this output whenever the bank folds
+      // the gate weight into the expert input (ScaleInputByGate) - hence a
+      // tolerance rather than exact equality. A flipped expert moves this by
+      // orders of magnitude more.
+      MaxDiff := 0;
+      MaxPos := GateUpCPU.Size - 1;
+      for Pos := 0 to MaxPos do
+      begin
+        Diff := Abs(GateUpCPU.FData[Pos] - BankGateUp.Output.FData[Pos]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      AssertTrue(Msg + ' - the same experts must be selected across the two ' +
+        'runs (gate|up max |diff| = ' + FloatToStr(MaxDiff) + ')',
+        MaxDiff < 1e-5);
+      MaxDiff := 0;
+      MaxPos := OutCPU.Size - 1;
+      for Pos := 0 to MaxPos do
+      begin
+        Diff := Abs(OutCPU.FData[Pos] - BankDown.Output.FData[Pos]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    WriteLn('  MoE down bank OpenCL parity (', Msg, '): max|diff|=',
+      MaxDiff:0:9);
+    AssertTrue(Msg + ' - MoE down bank OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < ' + FloatToStr(Tolerance),
+      MaxDiff < Tolerance);
+  finally
+    GateUpCPU.Free;
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.MoEExpertBankDownOpenCLParity;
+begin
+  // 3 tokens, 5 experts, 2 kept, biases on: the data-dependent router makes
+  // different tokens select different experts.
+  RunMoEBankDownOpenCLParity({TokenCnt=}3, {HiddenSize=}6, {ExpertCnt=}5,
+    {ExpertWidth=}4, {TopCnt=}2, {Quantize=}false, {ScaleInputByGate=}false,
+    {WithBias=}true, {SparseRouter=}false, 'k<E multi-token', 1e-4);
+end;
+
+procedure TTestNeuralNumerical.MoEExpertBankDownOpenCLParityInt8;
+begin
+  // Resident int8 codes + per-row scales, compared against the fused int8 CPU
+  // mixture (both dequantize the same codes, so the gate is tight).
+  RunMoEBankDownOpenCLParity(3, 6, 5, 4, 2, {Quantize=}true, false,
+    {WithBias=}true, false, 'int8 k<E', 1e-4);
+end;
+
+procedure TTestNeuralNumerical.MoEExpertBankDownOpenCLParityDecode;
+begin
+  // One token: the decode shape, where the NDRange collapses to a single
+  // column. Bias-free, which pins the kernel's UseBias = 0 path.
+  RunMoEBankDownOpenCLParity(1, 8, 4, 5, 2, false, false, {WithBias=}false,
+    false, 'decode single token', 1e-4);
+end;
+
+procedure TTestNeuralNumerical.MoEExpertBankDownOpenCLParityScaleInput;
+begin
+  // Llama-4 routing: the gate already scaled the expert INPUT, so the mixture
+  // must combine the slots with weight 1 (UnitCombine).
+  RunMoEBankDownOpenCLParity(3, 6, 5, 4, 2, false, {ScaleInputByGate=}true,
+    {WithBias=}false, false, 'scale-input', 1e-4);
+end;
+
+procedure TTestNeuralNumerical.MoEExpertBankDownOpenCLParityDenseGate;
+begin
+  // TopCnt = ExpertCnt: every expert fires for every token.
+  RunMoEBankDownOpenCLParity(2, 5, 3, 3, 3, false, false, true, false,
+    'dense gate', 1e-4);
+end;
+
+procedure TTestNeuralNumerical.MoEExpertBankDownOpenCLParitySparseRouter;
+begin
+  // ReLU'd linear router: tokens fill FEWER slots than TopK, and a token whose
+  // gate is all-zero must produce exactly zero.
+  RunMoEBankDownOpenCLParity(4, 6, 5, 4, 5, false, false, true,
+    {SparseRouter=}true, 'sparse router / partial slots', 1e-4);
+end;
 
 // General-convolution BACKWARD device offload parity (vs CPU). Builds a small
 // multi-channel 3x3 conv, runs one CPU backward (BackpropagateFastTiledCPU) and

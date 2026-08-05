@@ -1615,3 +1615,123 @@ __kernel void cai_depthwise_conv1d
   }
   FY[gid] = acc;
 }
+
+// FUSED MIXTURE-OF-EXPERTS DOWN PROJECTION (TNNetMoEExpertBankDown).
+// Computes the whole gate-weighted expert mixture of one MoE block in a single
+// launch:
+//
+//   Out[t,h] = SUM over the slots j of token t:
+//                SlotGate[t,j] * ( W_down[SlotExpert[t,j]][h] . Hidden[t,j][:]
+//                                  + Bias[SlotExpert[t,j]][h] )
+//
+// The routing decision is made on the host (the gate|up bank's slot map) and
+// rides in as three small arrays, so this kernel never scans the router. Slots
+// a token did not fill are simply not iterated (SlotCount[t] <= TopK), and a
+// token with no slot at all yields exactly 0.
+// FUnitCombine = 1 is Llama-4 routing, where the gate already scaled the expert
+// INPUT: the mixture then combines the slots with weight 1.
+// The bias is added INSIDE the slot loop and is therefore gate-weighted, once
+// per slot - matching TNNetMoEExpertBankDown.ComputeMixture exactly.
+// One work-item per output element; global size = (FHiddenSize, FTokenCnt).
+// Deliberately unoptimized (no local memory, no tiling, no manual work-group
+// size) so the runtime picks its own configuration on every device.
+// Coded by Claude (AI).
+__kernel void cai_moe_expert_down
+(
+  const int FTokenCnt,
+  const int FTopK,
+  const int FHiddenSize,
+  const int FExpertWidth,
+  const int FUnitCombine,
+  const int FUseBias,
+  __global const int*   FSlotExpert,
+  __global const float* FSlotGate,
+  __global const int*   FSlotCount,
+  __global const float* FHidden,
+  __global const float* FWeights,
+  __global const float* FBias,
+  __global float* FOut
+)
+{
+  const int h = get_global_id(0);
+  const int t = get_global_id(1);
+  if ((h >= FHiddenSize) || (t >= FTokenCnt)) return;
+
+  const int PairBase = t * FTopK;
+  const int SlotCnt = FSlotCount[t];
+  float acc = 0.0f;
+
+  for (int j = 0; j < SlotCnt; j++)
+  {
+    const int e = FSlotExpert[PairBase + j];
+    const float g = (FUnitCombine != 0) ? 1.0f : FSlotGate[PairBase + j];
+    // Row-major weights: the layer's int8/FP32 row order, uploaded verbatim.
+    const int row = e * FHiddenSize + h;
+    const int wBase = row * FExpertWidth;
+    const int hBase = (PairBase + j) * FExpertWidth;
+    float d = 0.0f;
+    for (int i = 0; i < FExpertWidth; i++)
+    {
+      d = mad(FWeights[wBase + i], FHidden[hBase + i], d);
+    }
+    if (FUseBias != 0) d += FBias[row];
+    acc = mad(g, d, acc);
+  }
+
+  FOut[t * FHiddenSize + h] = acc;
+} // end of kernel
+
+// Int8-weight twin of cai_moe_expert_down. The weights are the layer's
+// per-row symmetric int8 codes (dequantized value = code * FScales[row]) in
+// the SAME row-major order, so the quantization table uploads verbatim. The
+// per-row scale is applied ONCE to the reduced raw code sum and BEFORE the
+// (FP32, unscaled) bias, mirroring the host fused kernel
+// (TNNetMoEExpertBankDown.ComputeMixtureQuantizedInt8) and cai_dot_product_int8
+// so device and host agree to normal float tolerance. Coded by Claude (AI).
+__kernel void cai_moe_expert_down_int8
+(
+  const int FTokenCnt,
+  const int FTopK,
+  const int FHiddenSize,
+  const int FExpertWidth,
+  const int FUnitCombine,
+  const int FUseBias,
+  __global const int*   FSlotExpert,
+  __global const float* FSlotGate,
+  __global const int*   FSlotCount,
+  __global const float* FHidden,
+  __global const char*  FCodes,
+  __global const float* FBias,
+  __global float* FOut,
+  __global const float* FScales
+)
+{
+  const int h = get_global_id(0);
+  const int t = get_global_id(1);
+  if ((h >= FHiddenSize) || (t >= FTokenCnt)) return;
+
+  const int PairBase = t * FTopK;
+  const int SlotCnt = FSlotCount[t];
+  float acc = 0.0f;
+
+  for (int j = 0; j < SlotCnt; j++)
+  {
+    const int e = FSlotExpert[PairBase + j];
+    const float g = (FUnitCombine != 0) ? 1.0f : FSlotGate[PairBase + j];
+    const int row = e * FHiddenSize + h;
+    const int wBase = row * FExpertWidth;
+    const int hBase = (PairBase + j) * FExpertWidth;
+    float d = 0.0f;
+    for (int i = 0; i < FExpertWidth; i++)
+    {
+      d = mad(convert_float(FCodes[wBase + i]), FHidden[hBase + i], d);
+    }
+    // Deferred per-row dequantization scale: once on the raw code sum, BEFORE
+    // the bias - the same order as the host fused path.
+    d *= FScales[row];
+    if (FUseBias != 0) d += FBias[row];
+    acc = mad(g, d, acc);
+  }
+
+  FOut[t * FHiddenSize + h] = acc;
+} // end of kernel
