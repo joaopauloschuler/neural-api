@@ -119,6 +119,7 @@ draws uniformly. `--greedy` hard-overrides everything.
 | `--ctx N` | context window to build (`pSeqLen`) — KV-cache memory grows ~O(ctx), and the cache is allocated in full when the session opens | model max, capped at 32768 (the startup banner says so; go past the cap, or below it to save RAM, with `--ctx`) |
 | `--format NAME` | `chatml`/`llama2`/`llama3`/`zephyr`/`gemma`/`phi3`/`mistral` override, or `raw` (see below) | autodetect |
 | `--system "msg"` | initial system prompt | none |
+| `-p "prompt"` | one-shot: answer this single prompt, print the reply and exit without opening the REPL (see below) | interactive REPL |
 | `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — less RAM **and** faster than fp32 on both CPU (fused AVX2 int8 kernels) and GPU: the quantized codes stay resident on the device (see below) | **on** |
 | `--fp32` | full-precision fp32 weights — more RAM, slower. Also switches the KV-cache default to fp32 | off |
 | `--kv-int8` | int8-quantized KV cache (per-row scale = max\|row\|/127): ~1/4 the KV RAM at long context, identical on CPU and GPU. Slightly lossy logits (drift on the order of e-2, greedy argmax stable); the FP32 K/V buffers are never allocated | **on** whenever the weights are int8 |
@@ -129,6 +130,7 @@ draws uniformly. `--greedy` hard-overrides everything.
 | `--cpu` | force CPU even when built with `-dOpenCL` | — |
 | `--gpu-platform N` | OpenCL platform index | 0 |
 | `--gpu-device N` | OpenCL device index within the platform | 0 |
+| `--no-gpu-shared-kernel` | give every layer its own OpenCL kernel handles and command queue instead of the net-wide shared ones (see below) | shared on |
 | `--stats` | per-turn timing to **stderr**: TTFT (prefill + first token), steady-state decode tok/s, and `prompt N (reused K)` from the KV-cache reuse | off |
 | `--profile` | per-layer-class forward timing to **stderr** after each turn (decode steps only — prefill is excluded), plus a `[sched]` line with the layer-graph scheduler stats (graph width, parallel vs serial passes, peak in-flight) | off |
 | `--no-cache-reuse` | re-prefill the whole prompt every turn instead of reusing the shared KV-cache prefix (A/B + debugging) | reuse on |
@@ -168,6 +170,14 @@ default compilation), the conv/linear matmuls are offloaded to the GPU by
 default; `--cpu` forces CPU, and `--gpu-platform N` / `--gpu-device N`
 select the OpenCL device. A binary built without `-dOpenCL` is CPU-only and
 ignores the `--gpu*` flags.
+
+Every accelerated layer shares one net-wide OpenCL program and kernel cache
+(`TNNet.EnableOpenCL`'s `pHasSharedKernel`), so a kernel is compiled once and
+the layers submit to a shared command queue. `--no-gpu-shared-kernel` opts
+out: each layer builds its own kernel handles and gets its own queue. That is
+measurably *slower* on the devices tested here (it is the flag that switches
+on per-layer command queues and worker-0 routing) — it exists as a
+performance A/B knob and an escape hatch for drivers that mishandle sharing.
 
 GPU offload of an fp32 layer needs its concatenated weight cache, which
 `--low-memory` (the default) drops. Combining it with `--gpu` therefore
@@ -239,6 +249,23 @@ state cannot be truncated by position, so those fall back to a full
 re-prefill each turn. `--no-cache-reuse` forces the full re-prefill (use
 `--stats` to compare: watch `prompt N (reused K)` and TTFT).
 
+**`-p "prompt"` — one-shot mode.** With `-p` the program answers that single
+prompt and exits instead of opening the REPL: stdin is never read, so it
+composes with scripts, pipes and benchmark harnesses. The reply streams to
+stdout exactly as in interactive use (same token sink), `--system` still
+applies, and under `--format raw` the prompt *is* the document and the model
+completes it verbatim. There is no history and no second turn, so the KV
+cache is filled once and never reused. The exit code is 0, or 1 when the
+chat template rejects the turn (e.g. `--system` on a format without a system
+role, such as gemma/mistral).
+
+```
+$ ChatTerminal q2/ --gpu --greedy -p "What is the capital of France?"
+...
+The capital of France is Paris.
+$ ChatTerminal q2/ --greedy --stats -p "Hi!" > /dev/null   # timings only
+```
+
 ## REPL commands
 
 ```
@@ -278,8 +305,9 @@ comfortable range.
 `ChatServer` (in this folder) is a minimal OpenAI-style HTTP server over the
 same shared engine (`neural/neuralchatengine.pas`, `TChatEngine`), so
 neural-api models can be called from any codebase that speaks the OpenAI
-REST shape. It takes the SAME command line as ChatTerminal plus `--host`
-(default `127.0.0.1`, loopback only) and `--port` (default `8080`):
+REST shape. It takes the SAME command line as ChatTerminal (minus the
+terminal-only one-shot `-p`) plus `--host` (default `127.0.0.1`, loopback
+only) and `--port` (default `8080`):
 
 ```
 $ ChatServer /path/to/model --temperature 0.7 --top-p 0.9 --port 8080
@@ -324,7 +352,7 @@ parameter-overlay checks.
 
 ## Testing
 
-`--selftest` runs 82 offline checks (argument parsing, prompt assembly
+`--selftest` runs 93 offline checks (argument parsing, prompt assembly
 against the byte-exact ChatML render, end-of-turn markers, REPL command
 parsing, the KV-cache-reuse prefix diff) without needing any model files. For an end-to-end plumbing check,
 any directory with a pico-sized random checkpoint plus a tokenizer works —

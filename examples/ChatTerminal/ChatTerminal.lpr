@@ -84,6 +84,14 @@ REPL commands: /exit, /reset (clear history), /system <msg> (set the system
 prompt; raises on formats without a system role, e.g. gemma/mistral, and is
 ignored with a notice in --format raw).
 
+-p "prompt" turns the program into a one-shot: the prompt is answered, the
+reply is streamed to stdout exactly as in the REPL, and the process exits -
+stdin is never read, so it composes with scripts, pipes and benchmark
+harnesses. --system still applies; under --format raw the prompt is the
+document and the model completes it verbatim. The exit code is 0, or 1 when
+the chat template rejects the turn (e.g. --system on a format without a
+system role).
+
 --stats prints per-turn timing to stderr (kept off stdout so piped model
 output stays clean): time-to-first-token (prefill + the first decode step)
 and the steady-state decode rate in tok/s (measured over the tokens after
@@ -138,6 +146,12 @@ begin
   WriteLn('<model-dir> holds config.json, model.safetensors (or a sharded');
   WriteLn('index / pytorch_model.bin), tokenizer.json and (for chat-format');
   WriteLn('autodetection) tokenizer_config.json.');
+  WriteLn;
+  WriteLn('Terminal options:');
+  WriteLn('  -p "prompt"           one-shot: answer this prompt, print the reply and');
+  WriteLn('                        exit - no REPL, no input read from stdin (scripting');
+  WriteLn('                        and benchmarking). Combines with --system; in');
+  WriteLn('                        --format raw the prompt is completed verbatim');
   WriteLn;
   PrintChatOptionsHelp();
   WriteLn;
@@ -342,6 +356,32 @@ begin
     Args.Add('--gpu-device'); Args.Add('2');
     Check(ParseArgs(Args, Opt) and (Opt.GpuPlatform = 1) and (Opt.GpuDevice = 2),
       '--gpu-platform/--gpu-device parse');
+
+    // Shared OpenCL kernels are the default; --no-gpu-shared-kernel opts out.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and Opt.GpuSharedKernel,
+      'shared OpenCL kernels on by default');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--no-gpu-shared-kernel');
+    Check(ParseArgs(Args, Opt) and not Opt.GpuSharedKernel,
+      '--no-gpu-shared-kernel parses');
+
+    // -p: empty (interactive REPL) by default, holds the one-shot prompt when
+    // given, and needs a value.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and (Opt.Prompt = ''),
+      'no one-shot prompt by default (interactive REPL)');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('-p'); Args.Add('Hello there!');
+    Check(ParseArgs(Args, Opt) and (Opt.Prompt = 'Hello there!'), '-p parses');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('-p');
+    Check(not ParseArgs(Args, Opt), '-p without a value rejected');
 
     // Parallel layer-graph forward is the default; --serial opts out.
     Args.Clear;
@@ -603,6 +643,7 @@ var
   PromptIds: TNeuralIntegerArray;
   Transcript: string;           // raw mode's running document (turns append)
   Cnt: integer;
+  OneShotOK: boolean;           // -p: did the single turn render and generate?
   Line, Cmd, Arg, Reply, ErrorMsg: string;
 begin
   Args := TStringList.Create();
@@ -643,6 +684,39 @@ begin
 
   SetLength(History, 0);
   Transcript := '';
+  // -p "prompt": one shot. Answer that single prompt (streamed to stdout by
+  // the same sinks the REPL uses) and exit without reading stdin - the mode
+  // for scripts, pipes and benchmark runs. There is no history to keep and no
+  // second turn, so the KV cache is used exactly once.
+  if Engine.Opt.Prompt <> '' then
+  begin
+    OneShotOK := true;
+    if Engine.RawMode then
+    begin
+      // Raw completion: the prompt is the document, continued verbatim.
+      PromptIds := Engine.Tokenizer.Encode(Engine.Opt.Prompt);
+      Reply := Engine.GenerateFromIds(PromptIds, Engine.Opt);
+    end
+    else
+    begin
+      SetLength(History, 1);
+      History[0] := ChatMessage('user', Engine.Opt.Prompt);
+      try
+        Msgs := AssembleMessages(Engine.Opt.SystemPrompt, History);
+        Reply := Engine.ChatReply(Msgs, Engine.Opt);
+      except
+        on E: ENeuralChatError do
+        begin
+          // e.g. --system on a format without a system role.
+          WriteLn('[chat template error: ', E.Message, ']');
+          OneShotOK := false;
+        end;
+      end;
+    end;
+    Engine.Free; // frees session (before the net), tokenizer, net, GPU handle
+    Sink.Free;
+    if OneShotOK then Halt(0) else Halt(1);
+  end;
   if Engine.RawMode then
     WriteLn('Type text to complete; /exit quits, /reset clears the transcript.')
   else

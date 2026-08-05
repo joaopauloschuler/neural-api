@@ -122,6 +122,9 @@ type
     Seed: integer;               // < 0 = Randomize
     FormatName: string;          // '' = autodetect
     SystemPrompt: string;
+    Prompt: string;              // ChatTerminal only: -p "text" runs this one
+                                 // prompt and exits instead of opening the REPL
+                                 // (single turn, no interactive input)
     SelfTest: boolean;
     ShowHelp: boolean;
     Stats: boolean;              // per-turn timing to stderr (TTFT, tok/s)
@@ -152,6 +155,11 @@ type
     Gpu: boolean;                // offload conv/linear matmuls via OpenCL
     GpuPlatform: integer;        // OpenCL platform index (default 0)
     GpuDevice: integer;          // OpenCL device index within the platform (0)
+    GpuSharedKernel: boolean;    // one net-wide OpenCL program/kernel cache
+                                 // shared by every layer (DEFAULT). False gives
+                                 // each layer its own kernel handles and command
+                                 // queue - measurably slower here, kept as an
+                                 // A/B knob for drivers that dislike sharing
     Host: string;                // ChatServer only: HTTP listen address
     Port: integer;               // ChatServer only: HTTP listen port
     ErrorMsg: string;
@@ -325,6 +333,9 @@ begin
   WriteLn('  --cpu                 force CPU even when built with -dOpenCL');
   WriteLn('  --gpu-platform N      OpenCL platform index (default 0)');
   WriteLn('  --gpu-device N        OpenCL device index within the platform (default 0)');
+  WriteLn('  --no-gpu-shared-kernel  give each layer private OpenCL kernels and command');
+  WriteLn('                        queue instead of the net-wide shared ones (default:');
+  WriteLn('                        shared, which is faster here; performance A/B knob)');
   WriteLn('  --stats               per-turn timing to stderr (TTFT, decode tok/s)');
   WriteLn('  --profile             per-layer-class forward timing to stderr after each');
   WriteLn('                        turn (decode steps only); ranks classes to optimize.');
@@ -370,6 +381,7 @@ begin
   Result.Seed := -1;
   Result.FormatName := '';
   Result.SystemPrompt := '';
+  Result.Prompt := ''; // '' = interactive REPL; -p "text" runs one turn
   Result.SelfTest := false;
   Result.ShowHelp := false;
   Result.Stats := false;
@@ -385,6 +397,7 @@ begin
   Result.Gpu := {$IFDEF OpenCL}true{$ELSE}false{$ENDIF};
   Result.GpuPlatform := 0;
   Result.GpuDevice := 0;
+  Result.GpuSharedKernel := true; // shared kernels/queue (--no-gpu-shared-kernel)
   Result.Host := '127.0.0.1'; // loopback-only by default: a local inference
   Result.Port := 8080;        // server, not an internet-facing one
   Result.ErrorMsg := '';
@@ -490,6 +503,7 @@ begin
       if not NextInt(Arg, IVal) then exit(false);
       Opt.GpuDevice := IVal;
     end
+    else if Arg = '--no-gpu-shared-kernel' then Opt.GpuSharedKernel := false
     else if Arg = '--selftest' then Opt.SelfTest := true
     else if (Arg = '--help') or (Arg = '-h') then Opt.ShowHelp := true
     else if Arg = '--greedy' then Opt.Greedy := true
@@ -564,6 +578,11 @@ begin
     begin
       if not NextValue(Arg, SVal) then exit(false);
       Opt.SystemPrompt := SVal;
+    end
+    else if Arg = '-p' then
+    begin
+      if not NextValue(Arg, SVal) then exit(false);
+      Opt.Prompt := SVal;
     end
     else if Arg = '--host' then
     begin
@@ -1107,9 +1126,11 @@ begin
           (Opt.GpuDevice >= GpuCL.GetDeviceCount()) then Opt.GpuDevice := 0;
         Notice('[--gpu: OpenCL on ' + GpuCL.PlatformNames[Opt.GpuPlatform] +
           ' / ' + GpuCL.DeviceNames[Opt.GpuDevice] + ']');
+        if not Opt.GpuSharedKernel then
+          Notice('[--no-gpu-shared-kernel: per-layer kernels and command queues]');
         LoadStart := GetTickCount64();
         NN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
-          GpuCL.Devices[Opt.GpuDevice], {pHasSharedKernel}true);
+          GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
         Notice(Format('GPU weights uploaded in %.1fs.',
           [(GetTickCount64() - LoadStart) / 1000]));
       end;
