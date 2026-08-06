@@ -484,6 +484,19 @@ type
       // still owns the context/queue/program every handle is built against; this
       // is only the kernel object FDotCL binds its arguments on.
       F32Kernel: TNeuralKernel;
+      // Device-residency state.
+      // The contract: a producing layer leaves its raw result in device memory
+      // and the consuming layer decides whether to bind that buffer directly or
+      // to pull it down to host lazily. While FOutputOnOpenCL is True the host
+      // FOutput.FData is STALE and every host reader must materialize it first.
+      // FError* is the backward-pass mirror of FOutput*, over FOutputError.
+      // A layer may have either, both or neither resident on a given pass.
+      // (Coded by Claude (AI).)
+      FOutputOnOpenCL: boolean;     // raw result valid in device mem; host FData may be STALE
+      FOpenCLOutputBuffer: cl_mem;  // handle holding the resident result (owned by this layer)
+      FErrorOnOpenCL: boolean;      // gradient valid in device mem; host FOutputError may be STALE
+      FOpenCLErrorBuffer: cl_mem;   // handle holding the resident gradient (owned by this layer)
+      FOpenCLDeviceTag: cl_device_id; // device the buffers live on (for same-device checks)
       function GetDotProductKernel(): TNeuralKernel;
       function GetDotCLWaitBeta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       {$ENDIF}
@@ -126647,6 +126660,11 @@ begin
   FComputeState := 0;
   {$IFDEF OpenCL}
   FDotCL := nil;
+  FOutputOnOpenCL := false;
+  FOpenCLOutputBuffer := nil;
+  FErrorOnOpenCL := false;
+  FOpenCLErrorBuffer := nil;
+  FOpenCLDeviceTag := nil;
   DisableOpenCL();
   {$ENDIF}
 end;
