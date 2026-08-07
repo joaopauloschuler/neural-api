@@ -99663,20 +99663,6 @@ begin
     and WillOpenCL() and (not WinogradEligible());
 end;
 
-function TNNetLayer.IsActivationFunctionInOpenCL(var ActOpcode: integer):boolean;
-begin
-  ActOpcode := csActNone;
-  Result := (not FIsTrainable);
-  if Result then
-  begin
-    if      {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Identity              then ActOpcode := csActNone
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
-    else Result := false;
-  end;
-end;
-
 procedure TNNetConvolution.ComputeOpenCL();
 var
   InputAVolume: TNNetVolume;
@@ -126521,6 +126507,20 @@ end;
 procedure TNNetLayer.ComputePreviousLayerError();
 begin
   // to be implemented by inherited classes
+end;
+
+function TNNetLayer.IsActivationFunctionInOpenCL(var ActOpcode: integer):boolean;
+begin
+  ActOpcode := csActNone;
+  Result := (not FIsTrainable);
+  if Result then
+  begin
+    if      {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Identity              then ActOpcode := csActNone
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
+    else Result := false;
+  end;
 end;
 
 procedure TNNetLayer.SetOutputErrorSize(pSizeX, pSizeY, pDepth: integer);
