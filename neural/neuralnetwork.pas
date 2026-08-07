@@ -33906,7 +33906,7 @@ end;
 procedure TNNetModernHopfield.InitDefault();
 var
   p, d, NumPatternsM1, DimM1: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   W: TNNetVolume;
 begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
@@ -34224,7 +34224,7 @@ end;
 procedure TNNetInducedSetAttention.InitDefault();
 var
   m, d, MM1, DimM1: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   W: TNNetVolume;
 begin
   if FNeurons.Count < 1 then AddMissingNeurons(1);
@@ -34646,7 +34646,7 @@ end;
 procedure TNNetProductKeyMemory.InitDefault();
 var
   a, b, d, h, HeadsM1: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   HalfKeysM1, HalfQM1, NumKeysM1, ValueDimM1: integer;
   i0: integer;
   W0, W1, W2: TNNetVolume;
@@ -34890,7 +34890,7 @@ end;
 procedure TNNetAttentionPooling.InitDefault();
 var
   q, d: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   KM1, DimM1: integer;
   W: TNNetVolume;
 begin
@@ -35012,7 +35012,7 @@ end;
 procedure TNNetSoftPrompt.InitDefault();
 var
   q, d: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   NumVirtualM1, DimM1: integer;
   W: TNNetVolume;
 begin
@@ -39212,7 +39212,7 @@ end;
 procedure TNNetPerformerAttention.InitDefault();
 var
   r, a, j, blockStart, blockEnd: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   MM1, DkM1, RM1: integer;
   dot, nrm: TNeuralFloat;
   SavedExMask: TFPUExceptionMask;
@@ -47147,7 +47147,7 @@ procedure TNNetFourierFeatures.SampleFrequencies();
 var
   DInputs, i, j, idx: integer;
   DInputsM1, NumFeaturesM1: integer;
-  SavedSeed: Cardinal;
+  SavedSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
 begin
   // B has shape D_in x M, stored flat with index i*M + j (i = input dim,
   // j = feature). Sampled ONCE from a SEEDED RNG: B[i,j] ~ N(0, sigma^2).
@@ -61783,7 +61783,7 @@ end;
 procedure TNNetAffineCoupling.InitDefault();
 var
   r, j: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   MaxR2B, MaxA: integer;
 begin
   if FNeurons.Count < 2 * FHalfB then exit;
@@ -61854,7 +61854,7 @@ end;
 procedure TNNetInvertible1x1Conv.BuildPermutation();
 var
   i, swapIdx, tmp: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   MaxFC: integer;
 begin
   SetLength(FPerm, FC);
@@ -62108,7 +62108,7 @@ end;
 procedure TNNetInvertible1x1Conv.InitDefault();
 var
   i, j: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   MaxFC: integer;
   LURow: TNeuralFloatArrPtr;
   LU: TNNetVolume;
@@ -62900,7 +62900,7 @@ end;
 procedure TNNetHamiltonianCell.InitDefault();
 var
   j, kk, nbase, NetCnt, InW, n4, baseW: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   NetCntM1, FHiddenM1, InWM1: integer;
   scale: TNeuralFloat;
   W0, W2: TNNetVolume;
@@ -63174,7 +63174,7 @@ end;
 procedure TNNetClosedFormContinuous.InitDefault();
 var
   Depth, d, j: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   DepthM1: integer;
 begin
   if FNeurons.Count < 4 then AddMissingNeurons(4);
@@ -63510,7 +63510,7 @@ end;
 procedure TNNetSLSTMCell.InitDefault();
 var
   Depth, d, j: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   DepthM1: integer;
   W0, W1, W2, W3, W4, W5, W6, W7: TNNetVolume;
 begin
@@ -63964,7 +63964,7 @@ end;
 procedure TNNetMLSTMCell.InitDefault();
 var
   Depth, d, j: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   DepthM1: integer;
   W0, W1, W2, W3, W4, W5: TNNetVolume;
 begin
@@ -64183,7 +64183,7 @@ end;
 procedure TNNetMinGRU.InitDefault();
 var
   Depth, d, j: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   DepthM1: integer;
   W0, W1: TNNetVolume;
 begin
@@ -64511,7 +64511,7 @@ end;
 procedure TNNetSincConv1D.InitDefault();
 var
   f: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   NumFiltersM1: integer;
   melLo, melHi, melStep, hzLo, hzHi: TNeuralFloat;
 
@@ -64758,7 +64758,7 @@ end;
 procedure TNNetMinLSTM.InitDefault();
 var
   Depth, d, j: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   DepthM1: integer;
   W0, W1, W2: TNNetVolume;
 begin
@@ -65185,7 +65185,7 @@ end;
 
 procedure TNNetLSTMCell.InitDefault();
 var Depth, d, j, ii, DepthM1: integer;
-oldSeed: Cardinal;
+oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
 begin
   if FNeurons.Count < 12 then AddMissingNeurons(12);
   Depth := FNeurons[8].FWeights.Size;
@@ -65573,7 +65573,7 @@ end;
 
 procedure TNNetGRUCell.InitDefault();
 var Depth, d, j, ii, DepthM1: integer;
-oldSeed: Cardinal;
+oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
 begin
   if FNeurons.Count < 11 then AddMissingNeurons(11);
   Depth := FNeurons[6].FWeights.Size;
@@ -65898,7 +65898,7 @@ end;
 procedure TNNetConvLSTMCell.InitDefault();
 var
   ii, oc, k, ZC: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   HiddenCM1, KCntM1: integer;
   WR: TNeuralFloatArrPtr;
 begin
@@ -66278,7 +66278,7 @@ end;
 procedure TNNetDeltaNet.InitDefault();
 var
   Depth, d, j: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   DepthM1: integer;
   W0, W1, W2, W3: TNNetVolume;
 begin
@@ -67042,7 +67042,7 @@ end;
 procedure TNNetLegendreMemoryUnit.InitDefault();
 var
   cnt, i: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   cntM1: integer;
   W: TNNetVolume;
 begin
@@ -67811,7 +67811,7 @@ end;
 procedure TNNetNTMMemory.InitDefault();
 var
   c, j: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   SlotWidthM1, InputDimM1: integer;
   W0, W2, W4, W6: TNNetVolume;
 begin
@@ -68412,7 +68412,7 @@ var
   MaxW2InitPos: integer;
   WeightsSizeM1: integer;
   Depth, Hd, a, b: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   sc1, sc2: TNeuralFloat;
 begin
   if FNeurons.Count < 4 then AddMissingNeurons(4);
@@ -69005,7 +69005,7 @@ var
   MaxW2InitPos: integer;
   WeightsSizeM1: integer;
   Depth, Hd, a, b: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   DepthM1: integer;
   sc1, sc2: TNeuralFloat;
 begin
@@ -69903,7 +69903,7 @@ end;
 procedure TNNetSelectiveSSM.InitDefault();
 var
   Depth, NS, d, j, s: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   DepthM1, NSM1: integer;
   W0, W1, W2: TNNetVolume;
 begin
@@ -70386,7 +70386,7 @@ end;
 
 procedure TNNetMamba2.InitDefault();
 var
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
 begin
   if FNeurons.Count < 4 then AddMissingNeurons(4);
   oldSeed := RandSeed;
@@ -70753,7 +70753,7 @@ var
   MaxW2D: integer;
   Depth, j, f, c: integer;
   DepthM1: integer;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
 begin
   if FNeurons.Count < 5 then AddMissingNeurons(5);
   // Small-filter (near-no-op) init: small random W1/W2 from a seeded RNG, zero
@@ -87397,7 +87397,7 @@ var
   MaxWeightPos: integer;
   i: integer;
   W: TNNetVolume;
-  oldSeed: Cardinal;
+  oldSeed: {$IFDEF FPC}Cardinal{$ELSE}Integer{$ENDIF};
   invSigma: TNeuralFloat;
 begin
   if FInSize <= 0 then exit;
