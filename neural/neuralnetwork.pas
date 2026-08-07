@@ -100514,6 +100514,7 @@ begin
     end
     else
     begin
+      FOutputOnOpenCL := false;
       Inc(FForwardCPUCnt);
       ComputeOnCPU;
     end;
@@ -101849,6 +101850,7 @@ begin
       end
       else
       begin
+        FOutputOnOpenCL := false;
         Inc(FForwardCPUCnt);
         ComputeQuantizedInt8CPU();
       end;
@@ -101883,6 +101885,7 @@ begin
     end
     else
     begin
+      FOutputOnOpenCL := false;
       Inc(FForwardCPUCnt);
       ComputeCPU();
     end;
@@ -102047,6 +102050,7 @@ var
   ActivationFunctionInOpenCL, WUpdated: boolean;
   BiasVol: TNNetVolume;
 begin
+  FOutputOnOpenCL := false;
   if FShouldInterleaveWeights then
   begin
     if FConcatedWInter.Size < FNeurons[0].Weights.Size * FNeurons.Count then
@@ -102078,6 +102082,7 @@ begin
 
   if ActivationFunctionInOpenCL then
   begin
+    FOutputOnOpenCL := true;
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
     FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
@@ -102116,6 +102121,7 @@ var
   ActivationFunctionInOpenCL: boolean;
   BiasVol: TNNetVolume;
 begin
+  FOutputOnOpenCL := false;
   ActivationFunctionInOpenCL := IsActivationFunctionInOpenCL(ActOpcode);
 
   if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
@@ -102125,6 +102131,7 @@ begin
 
   if ActivationFunctionInOpenCL then
   begin
+    FOutputOnOpenCL := true;
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
     FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
