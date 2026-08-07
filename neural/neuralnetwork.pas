@@ -484,16 +484,15 @@ type
       // still owns the context/queue/program every handle is built against; this
       // is only the kernel object FDotCL binds its arguments on.
       F32Kernel: TNeuralKernel;
-      // Device-residency state. A producing layer leaves its result in device
-      // memory; the consumer decides whether to bind that buffer or to pull it
-      // down. While FOutputOnOpenCL is True the host FOutput.FData is STALE and
-      // every host reader must materialize it first. FErrorOnOpenCL is the
-      // backward mirror, over FOutputError; either, both or neither may be
-      // resident. Buffers are not stored here: the forward one is answered by
-      // OpenCLOutputBuffer(), the backward one by its future sibling.
-      // (Coded by Claude (AI).)
-      FOutputOnOpenCL: boolean;     // raw result valid in device mem; host FData may be STALE
-      FErrorOnOpenCL: boolean;      // gradient valid in device mem; host FOutputError may be STALE
+      // Device-residency state. Each flag answers "at the end of the pass, is
+      // this value there?" for one location; they are independent, so a value
+      // can be in both, one or neither. A consumer decides whether to bind the
+      // device copy or to read the host one. Buffers are not stored here: the
+      // forward one is answered by OpenCLOutputBuffer(), the backward one by
+      // its future sibling. (Coded by Claude (AI).)
+      FOutputOnOpenCL: boolean;     // output is in device memory
+      FOutputOnRAM: boolean;        // output is in host memory (FOutput.FData)
+      FErrorOnOpenCL: boolean;      // gradient is in device memory
       FOpenCLDeviceTag: cl_device_id; // device the buffers live on (for same-device checks)
       function GetDotProductKernel(): TNeuralKernel;
       function GetDotCLWaitBeta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
@@ -126682,6 +126681,7 @@ begin
   {$IFDEF OpenCL}
   FDotCL := nil;
   FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   FErrorOnOpenCL := false;
   FOpenCLDeviceTag := nil;
   DisableOpenCL();
