@@ -500,6 +500,7 @@ type
 
       procedure ComputeL2Decay(); virtual;
       procedure ComputePreviousLayerError(); virtual;
+      function IsActivationFunctionInOpenCL(var ActOpcode: integer): boolean;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); virtual;
       procedure ApplyActivationFunctionToOutput(); virtual;
       // Applies FActivationFn to the output ELEMENT range [pFirst..pLast]
@@ -99662,11 +99663,25 @@ begin
     and WillOpenCL() and (not WinogradEligible());
 end;
 
+function TNNetLayer.IsActivationFunctionInOpenCL(var ActOpcode: integer):boolean;
+begin
+  ActOpcode := csActNone;
+  Result := (not FIsTrainable);
+  if Result then
+  begin
+    if      {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Identity              then ActOpcode := csActNone
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
+    else Result := false;
+  end;
+end;
+
 procedure TNNetConvolution.ComputeOpenCL();
 var
   InputAVolume: TNNetVolume;
   ActOpcode: integer;
-  FuseAct, WUpdated, DeviceIm2Col: boolean;
+  ActivationFunctionInOpenCL, WUpdated, DeviceIm2Col: boolean;
   BiasVol: TNNetVolume;
 begin
   FOutputOnOpenCL := false;
@@ -99700,33 +99715,9 @@ begin
     InputAVolume := FConcatedWeights;
   end;
 
-  // Device-side bias + activation fusion. The cai_dot_product kernel can add the
-  // per-feature bias AND apply the activation in-register while the reduced
-  // result is still on the device, deleting the host bias-add + the
-  // ApplyActivationFunctionToOutput sweep over the whole output volume. It is
-  // only correct - and only enabled - when the layer is inference-only
-  // (not FIsTrainable): backward never runs, so the pre-activation FOutputRaw is
-  // never needed and the already bias-added, activated result loads straight into
-  // FOutput. Bias no longer blocks the fusion: when present (FSuppressBias = 0)
-  // FBiasOutput rides along as arg 9 and the kernel computes act(W.x + b); when
-  // suppressed no bias buffer is passed (UseBias = 0). Only the opcodes the kernel
-  // implements qualify (ReLU/Sigmoid/Tanh, plus Identity = pass-through); any
-  // other activation falls back to the host path. The bias buffer stays resident
-  // and re-uploads only on a weight update (same WUpdated gate as the weights,
-  // since AfterWeightUpdate rebuilds FBiasOutput). Coded by Claude (AI).
-  ActOpcode := csActNone;
-  FuseAct := (not FIsTrainable);
-  if FuseAct then
-  begin
-    if      {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Identity              then ActOpcode := csActNone
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
-    else FuseAct := false;
-  end;
-
+  ActivationFunctionInOpenCL := IsActivationFunctionInOpenCL(ActOpcode);
   WUpdated := FAfterWeightUpdateHasBeenCalled;
-  if FuseAct and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
+  if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
 
   // Device-side im2col: when armed (inference-only, non-pointwise, non-Winograd),
   // the small padded input FInputCopy is uploaded and the cai_im2col kernel
@@ -99748,7 +99739,7 @@ begin
     {NewVBs}(not DeviceIm2Col), BiasVol, {NewVBias}WUpdated);
   FAfterWeightUpdateHasBeenCalled := false;
 
-  if FuseAct then
+  if ActivationFunctionInOpenCL then
   begin
     FOutputOnOpenCL := true;
     // Device already applied the bias-add and activation: load straight into
