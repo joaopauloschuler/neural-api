@@ -99670,6 +99670,7 @@ var
   FuseAct, WUpdated, DeviceIm2Col: boolean;
   BiasVol: TNNetVolume;
 begin
+  FOutputOnOpenCL := false;
   // Int8-quantized: the FP32 concatenated weights this body uploads do not
   // exist; the resident-code twin does the whole forward. WillOpenCL only
   // routes here when the int8 buffers are armed (FDotCL.Int8Ready).
@@ -99802,6 +99803,7 @@ begin
 
   if FuseAct then
   begin
+    FOutputOnOpenCL := true;
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
     FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
@@ -100525,7 +100527,6 @@ procedure TNNetConvolution.Compute();
 var
     StartTime: double;
 begin
-  FOutputOnOpenCL := false;
   if FNeurons.Count > 0 then
   begin
     StartTime := Now();
