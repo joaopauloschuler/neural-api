@@ -99751,21 +99751,12 @@ end;
 procedure TNNetConvolution.ComputeOpenCLInt8();
 var
   ActOpcode: integer;
-  FuseAct, DeviceIm2Col: boolean;
+  ActivationFunctionInOpenCL, DeviceIm2Col: boolean;
   BiasVol: TNNetVolume;
 begin
-  ActOpcode := csActNone;
-  FuseAct := (not FIsTrainable);
-  if FuseAct then
-  begin
-    if      {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Identity              then ActOpcode := csActNone
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
-    else FuseAct := false;
-  end;
+  ActivationFunctionInOpenCL := IsActivationFunctionInOpenCL(ActOpcode);
 
-  if FuseAct and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
+  if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
 
   DeviceIm2Col := ShouldDeviceIm2Col();
   if DeviceIm2Col then
@@ -99777,7 +99768,7 @@ begin
   FDotCL.ComputeInt8(FInputPrepared, ActOpcode, {NewVBs}(not DeviceIm2Col),
     BiasVol, {NewVBias}false);
 
-  if FuseAct then
+  if ActivationFunctionInOpenCL then
   begin
     FOutputOnOpenCL := true;
     // Device already applied the bias-add and activation: load straight into
@@ -102053,7 +102044,7 @@ procedure TNNetFullConnect.ComputeOpenCL();
 var
   InputAVolume: TNNetVolume;
   ActOpcode: integer;
-  FuseAct, WUpdated: boolean;
+  ActivationFunctionInOpenCL, WUpdated: boolean;
   BiasVol: TNNetVolume;
 begin
   if FShouldInterleaveWeights then
@@ -102070,38 +102061,22 @@ begin
     InputAVolume := FConcatedWeights;
   end;
 
-  // Device-side bias + activation fusion, identical in spirit to
-  // TNNetConvolution.ComputeOpenCL (this layer shares the same cai_dot_product
-  // FDotCL): when inference-only (not FIsTrainable) the kernel adds the
-  // per-neuron bias and applies the activation in-register, so the already
-  // bias-added, activated result loads straight into FOutput - no host bias-add,
-  // no ApplyActivationFunctionToOutput sweep. FOutputRaw (needed only by the
-  // backward derivative) is untouched, hence the not-FIsTrainable gate. For
-  // FullConnect FNumBs = 1, so the result index b_id*FNumAs + a_id collapses to
-  // a_id and FBiasOutput (built by BuildBiasOutput's TNNetFullConnect branch as
-  // bias[neuron], size = FOutput.Size = FNumAs) indexes exactly right. The bias
-  // buffer rides the same WUpdated gate as the weights. Only the opcodes the
-  // kernel implements qualify (ReLU/Sigmoid/Tanh + Identity); any other
-  // activation falls back to the host path. Coded by Claude (AI).
-  ActOpcode := csActNone;
-  FuseAct := (not FIsTrainable);
-  if FuseAct then
-  begin
-    if      {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Identity              then ActOpcode := csActNone
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
-    else FuseAct := false;
-  end;
+  // Bias rides along as a kernel argument only when the device also applies the
+  // activation. For FullConnect FNumBs = 1, so the result index b_id*FNumAs +
+  // a_id collapses to a_id and FBiasOutput (built by BuildBiasOutput's
+  // TNNetFullConnect branch as bias[neuron], size = FOutput.Size = FNumAs)
+  // indexes exactly right. It rides the same WUpdated gate as the weights.
+  // Coded by Claude (AI).
+  ActivationFunctionInOpenCL := IsActivationFunctionInOpenCL(ActOpcode);
 
   WUpdated := FAfterWeightUpdateHasBeenCalled;
-  if FuseAct and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
+  if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
 
   FDotCL.Compute(InputAVolume, FPrevLayer.FOutput, ActOpcode, {NewVAs}WUpdated, true,
     BiasVol, {NewVBias}WUpdated);
   FAfterWeightUpdateHasBeenCalled := false;
 
-  if FuseAct then
+  if ActivationFunctionInOpenCL then
   begin
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
@@ -102138,26 +102113,17 @@ end;
 procedure TNNetFullConnect.ComputeOpenCLInt8();
 var
   ActOpcode: integer;
-  FuseAct: boolean;
+  ActivationFunctionInOpenCL: boolean;
   BiasVol: TNNetVolume;
 begin
-  ActOpcode := csActNone;
-  FuseAct := (not FIsTrainable);
-  if FuseAct then
-  begin
-    if      {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Identity              then ActOpcode := csActNone
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
-    else FuseAct := false;
-  end;
+  ActivationFunctionInOpenCL := IsActivationFunctionInOpenCL(ActOpcode);
 
-  if FuseAct and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
+  if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
 
   FDotCL.ComputeInt8(FPrevLayer.FOutput, ActOpcode, {NewVBs}true,
     BiasVol, {NewVBias}false);
 
-  if FuseAct then
+  if ActivationFunctionInOpenCL then
   begin
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
@@ -126509,6 +126475,12 @@ begin
   // to be implemented by inherited classes
 end;
 
+// True when the device kernel can apply this layer's bias-add and activation
+// in-register, so the result loads straight into FOutput and both the host
+// bias-add and the ApplyActivationFunctionToOutput sweep disappear. Requires
+// inference-only (not FIsTrainable): backward reads the pre-activation
+// FOutputRaw, which the device never produces. Only the opcodes the kernel
+// implements qualify; anything else falls back to the host path.
 function TNNetLayer.IsActivationFunctionInOpenCL(var ActOpcode: integer):boolean;
 begin
   ActOpcode := csActNone;
