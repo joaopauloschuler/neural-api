@@ -99750,6 +99750,7 @@ begin
 
   if FuseAct then
   begin
+    FOutputOnOpenCL := true;
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
     FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
@@ -100524,6 +100525,7 @@ procedure TNNetConvolution.Compute();
 var
     StartTime: double;
 begin
+  FOutputOnOpenCL := false;
   if FNeurons.Count > 0 then
   begin
     StartTime := Now();
