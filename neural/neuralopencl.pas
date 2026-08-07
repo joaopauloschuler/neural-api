@@ -336,6 +336,12 @@ type
       /// UnprepareForCompute). Layers gate their int8 device route on this,
       /// falling back to the fused CPU path when unarmed.
       property Int8Ready: boolean read FInt8Ready;
+      /// The buffer Compute/ComputeInt8 leave their result in and
+      /// FinishAndLoadResult reads back from. Exposed so a layer can bind it
+      /// (device residency) instead of downloading. Still owned here: released
+      /// by UnprepareForCompute, replaced when PrepareForCompute or
+      /// ReallocateBuffersIfRequired resizes it. Read it per use, never cache.
+      property ResultBuffer: cl_mem read FResultBuffer;
   end;
 
   /// Class that does dot products via OpenCL

@@ -484,18 +484,16 @@ type
       // still owns the context/queue/program every handle is built against; this
       // is only the kernel object FDotCL binds its arguments on.
       F32Kernel: TNeuralKernel;
-      // Device-residency state.
-      // The contract: a producing layer leaves its raw result in device memory
-      // and the consuming layer decides whether to bind that buffer directly or
-      // to pull it down to host lazily. While FOutputOnOpenCL is True the host
-      // FOutput.FData is STALE and every host reader must materialize it first.
-      // FError* is the backward-pass mirror of FOutput*, over FOutputError.
-      // A layer may have either, both or neither resident on a given pass.
+      // Device-residency state. A producing layer leaves its result in device
+      // memory; the consumer decides whether to bind that buffer or to pull it
+      // down. While FOutputOnOpenCL is True the host FOutput.FData is STALE and
+      // every host reader must materialize it first. FErrorOnOpenCL is the
+      // backward mirror, over FOutputError; either, both or neither may be
+      // resident. Buffers are not stored here: the forward one is answered by
+      // OpenCLOutputBuffer(), the backward one by its future sibling.
       // (Coded by Claude (AI).)
       FOutputOnOpenCL: boolean;     // raw result valid in device mem; host FData may be STALE
-      FOpenCLOutputBuffer: cl_mem;  // handle holding the resident result (owned by this layer)
       FErrorOnOpenCL: boolean;      // gradient valid in device mem; host FOutputError may be STALE
-      FOpenCLErrorBuffer: cl_mem;   // handle holding the resident gradient (owned by this layer)
       FOpenCLDeviceTag: cl_device_id; // device the buffers live on (for same-device checks)
       function GetDotProductKernel(): TNeuralKernel;
       function GetDotCLWaitBeta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
@@ -550,6 +548,14 @@ type
       {$IFDEF OpenCL}
       procedure DisableOpenCL(); virtual;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); virtual;
+      // Device buffer holding this layer's finished forward output, or nil when
+      // it is not on the device. Borrowed for reading: owned by whoever created
+      // it (usually FDotCL), never released through this result. Return nil
+      // unless the contents ARE the output - an intermediate (Winograd, a first
+      // attention GEMM) or a pre-activation result does not qualify. A method
+      // rather than a field so it cannot go stale when FDotCL grows its buffer.
+      // Base returns nil; a layer opts in by overriding. (Coded by Claude (AI).)
+      function OpenCLOutputBuffer(): cl_mem; virtual;
       {$ENDIF}
       // Computes the forward pass of this layer.
       procedure Compute(); virtual; abstract;
@@ -860,6 +866,12 @@ type
     public
       constructor Create(); override;
       destructor Destroy(); override;
+      {$IFDEF OpenCL}
+      // Locational only: names FDotCL's result buffer. Whether it holds this
+      // layer's output is FOutputOnOpenCL's business - descendants that
+      // post-process the GEMM result never raise the flag. (Claude (AI).)
+      function OpenCLOutputBuffer(): cl_mem; override;
+      {$ENDIF}
       procedure RefreshNeuronWeightList();
       // Converts the FP32 weights to per-output-channel symmetric int8
       // (scale = max|row|/127, round-to-nearest) and frees the FP32 weight
@@ -74232,6 +74244,13 @@ begin
   inherited Destroy();
 end;
 
+{$IFDEF OpenCL}
+function TNNetLayerConcatedWeights.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FDotCL) then Result := FDotCL.ResultBuffer else Result := nil;
+end;
+{$ENDIF}
+
 procedure TNNetLayerConcatedWeights.RefreshNeuronWeightList();
 var
   MaxNeuronPos: integer;
@@ -126661,9 +126680,7 @@ begin
   {$IFDEF OpenCL}
   FDotCL := nil;
   FOutputOnOpenCL := false;
-  FOpenCLOutputBuffer := nil;
   FErrorOnOpenCL := false;
-  FOpenCLErrorBuffer := nil;
   FOpenCLDeviceTag := nil;
   DisableOpenCL();
   {$ENDIF}
@@ -126704,6 +126721,12 @@ function TNNetLayer.GetDotProductKernel(): TNeuralKernel;
 begin
   if not Assigned(F32Kernel) then F32Kernel := FNN.GetKernel('cai_dot_product');
   Result := F32Kernel;
+end;
+
+function TNNetLayer.OpenCLOutputBuffer(): cl_mem;
+begin
+  // Conservative default: this layer keeps no output on the device.
+  Result := nil;
 end;
 
 function TNNetLayer.GetDotCLWaitBeta(): TNeuralFloat;
