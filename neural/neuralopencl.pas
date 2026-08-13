@@ -635,9 +635,14 @@ begin
   if (err <> CL_SUCCESS) then
     ErrorProc('Error: BuildInputColsOnDevice - failed setting parameters: ' + IntToStr(err));
 
-  // Enqueue on the shared in-order command queue; the following Compute GEMM
-  // (same queue) is ordered after this gather, so no explicit Finish is needed.
-  Im2ColKernel.RunKernel(k, N);
+  // Enqueue the gather on the DOT-PRODUCT kernel's queue, not the im2col kernel's
+  // own one. Every TNeuralKernel carries a private command queue, and queues are
+  // unordered with respect to each other: the source upload above, this gather and
+  // the Compute GEMM that reads FInputBufferBs are only ordered while all three ride
+  // one in-order queue. Enqueued here they are, so no event or Finish is needed - and
+  // the cross-kernel enqueue is legal because both kernels share the same context
+  // (ComputeInt8 runs the int8 kernel on this queue for the same reason).
+  FDotProductKernel.RunKernel(k, N);
 end;
 
 procedure TDotProductSharedKernel.Compute
