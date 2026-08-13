@@ -126731,7 +126731,15 @@ end;
 
 procedure TNNetLayer.MoveOutputToRAM();
 begin
-  // implement on each class if required.
+  if Assigned(FDotCL) and FOutputOnOpenCL then
+  begin
+    FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
+    FOutputOnRAM := true;
+  end;
+  if not(FOutputOnRAM) then
+  begin
+    ErrorProc('Error at moving output from OpenCL to RAM at layer '+IntToStr(FLayerIdx)+':'+ClassName);
+  end;
 end;
 
 procedure TNNetLayer.DisableOpenCL();
