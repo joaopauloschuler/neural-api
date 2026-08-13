@@ -553,6 +553,11 @@ type
       // Device buffer holding this layer's finished forward output
       // Override when required.
       function OpenCLOutputBuffer(): cl_mem; virtual;
+      // The kernel whose command queue owns OpenCLOutputBuffer's contents: a
+      // read of that buffer must be enqueued here, or it races with the
+      // forward that produced it when layers hold per-layer queues.
+      // Override when required.
+      function OpenCLOutputKernel(): TNeuralKernel; virtual;
       // Force (pForce=True) or release (False) the OpenCL path on this layer,
       // bypassing the per-layer size verdict in WillOpenCL. Used by the GPU
       // parity tests to exercise the device path on tiny tensors. Coded by Claude (AI).
@@ -126683,6 +126688,11 @@ begin
   if Assigned(FDotCL) then Result := FDotCL.ResultBuffer else Result := nil;
 end;
 
+function TNNetLayer.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FDotCL) then Result := FDotCL.DotProductKernel else Result := nil;
+end;
+
 function TNNetLayer.GetDotCLWaitBeta(): TNeuralFloat;
 begin
   if FIsTrainable then
@@ -126709,11 +126719,27 @@ begin
 end;
 
 procedure TNNetLayer.MoveOutputToRAM();
+var
+  OutputBuffer: cl_mem;
+  OutputKernel: TNeuralKernel;
+  err: integer;
 begin
-  if Assigned(FDotCL) and FOutputOnOpenCL then
+  OutputBuffer := OpenCLOutputBuffer();
+  OutputKernel := OpenCLOutputKernel();
+  if FOutputOnOpenCL and (OutputBuffer <> nil) and Assigned(OutputKernel) then
   begin
-    FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
-    FOutputOnRAM := true;
+    // Blocking read on the producing in-order queue: it is ordered after the
+    // forward enqueue, so no separate clFinish is needed (this is exactly what
+    // TDotProductSharedKernel.FinishAndLoadResult does).
+    err := OutputKernel.ReadBuffer(OutputBuffer, FOutput);
+    if err = CL_SUCCESS then
+    begin
+      FOutputOnRAM := true;
+    end
+    else
+    begin
+      ErrorProc('Error reading the output buffer at layer '+IntToStr(FLayerIdx)+':'+ClassName+' error:'+IntToStr(err));
+    end;
   end;
   if not(FOutputOnRAM) then
   begin
