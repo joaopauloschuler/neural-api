@@ -868,12 +868,6 @@ type
     public
       constructor Create(); override;
       destructor Destroy(); override;
-      {$IFDEF OpenCL}
-      // Locational only: names FDotCL's result buffer. Whether it holds this
-      // layer's output is FOutputOnOpenCL's business - descendants that
-      // post-process the GEMM result never raise the flag. (Claude (AI).)
-      function OpenCLOutputBuffer(): cl_mem; override;
-      {$ENDIF}
       procedure RefreshNeuronWeightList();
       // Converts the FP32 weights to per-output-channel symmetric int8
       // (scale = max|row|/127, round-to-nearest) and frees the FP32 weight
@@ -74246,13 +74240,6 @@ begin
   inherited Destroy();
 end;
 
-{$IFDEF OpenCL}
-function TNNetLayerConcatedWeights.OpenCLOutputBuffer(): cl_mem;
-begin
-  if Assigned(FDotCL) then Result := FDotCL.ResultBuffer else Result := nil;
-end;
-{$ENDIF}
-
 procedure TNNetLayerConcatedWeights.RefreshNeuronWeightList();
 var
   MaxNeuronPos: integer;
@@ -126700,8 +126687,7 @@ end;
 
 function TNNetLayer.OpenCLOutputBuffer(): cl_mem;
 begin
-  // Conservative default: this layer keeps no output on the device.
-  Result := nil;
+  if Assigned(FDotCL) then Result := FDotCL.ResultBuffer else Result := nil;
 end;
 
 function TNNetLayer.GetDotCLWaitBeta(): TNeuralFloat;
