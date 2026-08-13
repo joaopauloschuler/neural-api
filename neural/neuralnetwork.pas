@@ -550,15 +550,15 @@ type
       {$IFDEF OpenCL}
       procedure DisableOpenCL(); virtual;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); virtual;
-      // Device buffer holding this layer's finished forward output, or nil when
-      // it is not on the device. Borrowed for reading: owned by whoever created
-      // it (usually FDotCL), never released through this result. Return nil
-      // unless the contents ARE the output - an intermediate (Winograd, a first
-      // attention GEMM) or a pre-activation result does not qualify. A method
-      // rather than a field so it cannot go stale when FDotCL grows its buffer.
-      // Base returns nil; a layer opts in by overriding. (Coded by Claude (AI).)
+      // Device buffer holding this layer's finished forward output
+      // Override when required.
       function OpenCLOutputBuffer(): cl_mem; virtual;
+      // Force (pForce=True) or release (False) the OpenCL path on this layer,
+      // bypassing the per-layer size verdict in WillOpenCL. Used by the GPU
+      // parity tests to exercise the device path on tiny tensors. Coded by Claude (AI).
+      procedure ForceOpenCL(pForce: boolean); virtual;
       {$ENDIF}
+
       // Computes the forward pass of this layer.
       procedure Compute(); virtual; abstract;
       // Computes the backward pass.
@@ -784,13 +784,6 @@ type
       // per-neuron path is used only when all three conditions hold.
       function SupportsLowMemory(): boolean; virtual;
       function ActiveLowMemory(): boolean;
-      {$IFDEF OpenCL}
-      // Force (pForce=True) or release (False) the OpenCL path on this layer,
-      // bypassing the per-layer size verdict in WillOpenCL. Used by the GPU
-      // parity tests to exercise the device path on tiny tensors. Coded by Claude (AI).
-      procedure ForceOpenCL(pForce: boolean); virtual;
-      {$ENDIF}
-
       procedure InitDefault(); virtual;
 
       property ActivationFn: TNeuralActivationFunction read FActivationFn write FActivationFn;
