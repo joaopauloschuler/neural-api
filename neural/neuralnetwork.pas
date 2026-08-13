@@ -496,6 +496,8 @@ type
       FOpenCLDeviceTag: cl_device_id; // device the buffers live on (for same-device checks)
       function GetDotProductKernel(): TNeuralKernel;
       function GetDotCLWaitBeta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      function ForceOutputOnRAM(): boolean;
+      procedure MoveOutputToRAM(); virtual;
       {$ENDIF}
 
       procedure ComputeL2Decay(); virtual;
@@ -126716,6 +126718,20 @@ begin
   begin
     Result := 0;
   end;
+end;
+
+function TNNetLayer.ForceOutputOnRAM(): boolean;
+begin
+  if FOutputOnOpenCL and not(FOutputOnRAM) then
+  begin
+    MoveOutputToRAM();
+  end;
+  Result := FOutputOnRAM;
+end;
+
+procedure TNNetLayer.MoveOutputToRAM();
+begin
+  // implement on each class if required.
 end;
 
 procedure TNNetLayer.DisableOpenCL();
