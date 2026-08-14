@@ -336,6 +336,12 @@ type
       /// UnprepareForCompute). Layers gate their int8 device route on this,
       /// falling back to the fused CPU path when unarmed.
       property Int8Ready: boolean read FInt8Ready;
+      /// The buffer Compute/ComputeInt8 leave their result in and
+      /// FinishAndLoadResult reads back from. Exposed so a layer can bind it
+      /// (device residency) instead of downloading. Still owned here: released
+      /// by UnprepareForCompute, replaced when PrepareForCompute or
+      /// ReallocateBuffersIfRequired resizes it. Read it per use, never cache.
+      property ResultBuffer: cl_mem read FResultBuffer;
   end;
 
   /// Class that does dot products via OpenCL
@@ -629,9 +635,14 @@ begin
   if (err <> CL_SUCCESS) then
     ErrorProc('Error: BuildInputColsOnDevice - failed setting parameters: ' + IntToStr(err));
 
-  // Enqueue on the shared in-order command queue; the following Compute GEMM
-  // (same queue) is ordered after this gather, so no explicit Finish is needed.
-  Im2ColKernel.RunKernel(k, N);
+  // Enqueue the gather on the DOT-PRODUCT kernel's queue, not the im2col kernel's
+  // own one. Every TNeuralKernel carries a private command queue, and queues are
+  // unordered with respect to each other: the source upload above, this gather and
+  // the Compute GEMM that reads FInputBufferBs are only ordered while all three ride
+  // one in-order queue. Enqueued here they are, so no event or Finish is needed - and
+  // the cross-kernel enqueue is legal because both kernels share the same context
+  // (ComputeInt8 runs the int8 kernel on this queue for the same reason).
+  FDotProductKernel.RunKernel(k, N);
 end;
 
 procedure TDotProductSharedKernel.Compute

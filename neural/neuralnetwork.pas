@@ -484,12 +484,25 @@ type
       // still owns the context/queue/program every handle is built against; this
       // is only the kernel object FDotCL binds its arguments on.
       F32Kernel: TNeuralKernel;
+      // Device-residency state. Each flag answers "at the end of the pass, is
+      // this value there?" for one location; they are independent, so a value
+      // can be in both, one or neither. A consumer decides whether to bind the
+      // device copy or to read the host one. Buffers are not stored here: the
+      // forward one is answered by OpenCLOutputBuffer(), the backward one by
+      // its future sibling. (Coded by Claude (AI).)
+      FOutputOnOpenCL: boolean;     // output is in device memory
+      FOutputOnRAM: boolean;        // output is in host memory (FOutput.FData)
+      FErrorOnOpenCL: boolean;      // gradient is in device memory
+      FOpenCLDeviceTag: cl_device_id; // device the buffers live on (for same-device checks)
       function GetDotProductKernel(): TNeuralKernel;
       function GetDotCLWaitBeta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
+      function ForceOutputOnRAM(): boolean;
+      procedure MoveOutputToRAM(); virtual;
       {$ENDIF}
 
       procedure ComputeL2Decay(); virtual;
       procedure ComputePreviousLayerError(); virtual;
+      function IsActivationFunctionInOpenCL(var ActOpcode: integer): boolean;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); virtual;
       procedure ApplyActivationFunctionToOutput(); virtual;
       // Applies FActivationFn to the output ELEMENT range [pFirst..pLast]
@@ -537,7 +550,20 @@ type
       {$IFDEF OpenCL}
       procedure DisableOpenCL(); virtual;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); virtual;
+      // Device buffer holding this layer's finished forward output
+      // Override when required.
+      function OpenCLOutputBuffer(): cl_mem; virtual;
+      // The kernel whose command queue owns OpenCLOutputBuffer's contents: a
+      // read of that buffer must be enqueued here, or it races with the
+      // forward that produced it when layers hold per-layer queues.
+      // Override when required.
+      function OpenCLOutputKernel(): TNeuralKernel; virtual;
+      // Force (pForce=True) or release (False) the OpenCL path on this layer,
+      // bypassing the per-layer size verdict in WillOpenCL. Used by the GPU
+      // parity tests to exercise the device path on tiny tensors. Coded by Claude (AI).
+      procedure ForceOpenCL(pForce: boolean); virtual;
       {$ENDIF}
+
       // Computes the forward pass of this layer.
       procedure Compute(); virtual; abstract;
       // Computes the backward pass.
@@ -763,13 +789,6 @@ type
       // per-neuron path is used only when all three conditions hold.
       function SupportsLowMemory(): boolean; virtual;
       function ActiveLowMemory(): boolean;
-      {$IFDEF OpenCL}
-      // Force (pForce=True) or release (False) the OpenCL path on this layer,
-      // bypassing the per-layer size verdict in WillOpenCL. Used by the GPU
-      // parity tests to exercise the device path on tiny tensors. Coded by Claude (AI).
-      procedure ForceOpenCL(pForce: boolean); virtual;
-      {$ENDIF}
-
       procedure InitDefault(); virtual;
 
       property ActivationFn: TNeuralActivationFunction read FActivationFn write FActivationFn;
@@ -22474,6 +22493,7 @@ var
   sp, iHW, iC, jCi, srcIdx, dstIdx: integer;
   norm, acc: TNeuralFloat;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   StartTime := Now();
   A := FPrevLayer.FOutput;
   C := A.Depth;
@@ -24409,6 +24429,7 @@ end;
 // Device GEGLU forward (gelu-tanh gate, ActFlag=2), bit-faithful to Compute().
 procedure TNNetGEGLU.ComputeOpenCL();
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FGLUGateCL.Gate(FPrevLayer.FOutput, FOutput,
     FOutput.SizeX * FOutput.SizeY, FOutput.Depth, {ActFlag=}2);
 end;
@@ -24650,6 +24671,7 @@ end;
 // Device GEGLUErf forward (gelu-erf gate, ActFlag=3), bit-faithful to Compute().
 procedure TNNetGEGLUErf.ComputeOpenCL();
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FGLUGateCL.Gate(FPrevLayer.FOutput, FOutput,
     FOutput.SizeX * FOutput.SizeY, FOutput.Depth, {ActFlag=}3);
 end;
@@ -24997,6 +25019,7 @@ end;
 // Device SwiGLU forward (swish gate, ActFlag=1), bit-faithful to Compute().
 procedure TNNetSwiGLU.ComputeOpenCL();
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FGLUGateCL.Gate(FPrevLayer.FOutput, FOutput,
     FOutput.SizeX * FOutput.SizeY, FOutput.Depth, {ActFlag=}1);
 end;
@@ -25342,6 +25365,7 @@ end;
 // Device GLU forward (sigmoid gate, ActFlag=0), bit-faithful to Compute().
 procedure TNNetGLU.ComputeOpenCL();
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FGLUGateCL.Gate(FPrevLayer.FOutput, FOutput,
     FOutput.SizeX * FOutput.SizeY, FOutput.Depth, {ActFlag=}0);
 end;
@@ -30691,6 +30715,7 @@ procedure TNNetL2Normalize.ComputeOpenCL();
 var
   Eps: TNeuralFloat;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Eps := FFloatSt[0];
   if Eps <= 0 then Eps := 1e-8;
   FL2NormCL.Normalize(FPrevLayer.FOutput, FOutput,
@@ -32335,6 +32360,7 @@ var
   SegI, QBase, KBase, VBase, iDk, posPack: integer;
   HasSeg: boolean;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
@@ -35385,6 +35411,7 @@ var
   AttnRowPtr: TNeuralFloatArrPtr;
   QBase, KBase, VBase, TwoFDk, VColBase, kPos: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   StartTime := Now();
   Q := FPrevLayer.FOutput;
   KV := FKVLayer.FOutput;
@@ -36889,6 +36916,7 @@ var
   xn, yn, xp, yp, sx, sy, fx, fy: TNeuralFloat;
   inX0, inX1, inY0, inY1: boolean;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Src := FPrevLayer.FOutput;
   Theta := FThetaLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
@@ -37229,6 +37257,7 @@ var
   sx, sy, fx, fy: TNeuralFloat;
   BorderPad, inX0, inX1, inY0, inY1: boolean;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Src := FPrevLayer.FOutput;
   Grid := FGridLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
@@ -37585,6 +37614,7 @@ var
   Flow, Src: TNNetVolume;
   sx, sy, fx, fy: TNeuralFloat;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Src := FPrevLayer.FOutput;
   Flow := FFlowLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
@@ -37878,6 +37908,7 @@ var
   Flow, Src: TNNetVolume;
   sx, sy, fx, fy: TNeuralFloat;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Src := FPrevLayer.FOutput;
   Flow := FFlowLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
@@ -38075,6 +38106,7 @@ var
   f1, f2: TNNetVolume;
   invSqrtC: TNeuralFloat;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   StartTime := Now();
   f1 := FPrevLayer.FOutput;
   f2 := FF2Layer.FOutput;
@@ -38388,6 +38420,7 @@ var
   gx, gy, nx, ny, sgx, sgy, fx, fy: TNeuralFloat;
   inX0, inX1, inY0, inY1: boolean;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Vol := FPrevLayer.FOutput;
   Flow := FFlowLayer.FOutput;
   FHM1 := FH - 1; FWM1 := FW - 1;
@@ -38784,6 +38817,7 @@ var
   Q, K, Den, InvDen: TNeuralFloat;
   ZPtr: TNeuralFloatArrPtr;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
@@ -40594,6 +40628,7 @@ var
   QBase, KBase, VBase, iDk, posPack, RowBytes: integer;
   qPtr, kPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
@@ -41489,6 +41524,7 @@ var
   Krow, Qrow, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
   PosK, PosQ: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
@@ -41863,6 +41899,7 @@ var
   Prow, AttnRowPtr: TNeuralFloatArrPtr;
   PosT: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
@@ -42206,6 +42243,7 @@ var
   AttnRowPtr: TNeuralFloatArrPtr;
   QBase, KBase, VBase, iDk, posPack: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
@@ -44173,6 +44211,7 @@ procedure TNNetRotaryEmbedding.ComputeOpenCL();
 var
   SeqLen, Depth, HalfD: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Depth := FPrevLayer.FOutput.Depth;
   SeqLen := FPrevLayer.FOutput.SizeX;
   HalfD := Depth shr 1; // #15: div 2, dimension is non-negative
@@ -44794,6 +44833,7 @@ var
   CanReuse: boolean;
   FAngleCacheRowsM1, SeqLenM1: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Depth := FPrevLayer.FOutput.Depth;
   SeqLen := FPrevLayer.FOutput.SizeX;
   HalfD := Depth shr 1; // #15: div 2, dimension is non-negative
@@ -49889,6 +49929,7 @@ begin
   if FNeurons.Count > 0 then
   begin
     StartTime := Now();
+    {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
     RefreshCalculatePrevLayerError();
     if FPadding > 0
       then FInputCopy.CopyPadding(FPrevLayer.Output, FPadding)
@@ -50491,6 +50532,7 @@ end;
 // CPU path.
 procedure TNNetAdaIN.ComputeOpenCL();
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Groups = Depth, ChannelsPerGroup = 1 (instance norm), per-channel affine with
   // gain = FStyleStd, bias = FStyleMean.
   FAdaINCL.Normalize(FContentLayer.Output, FStyleStd, FStyleMean,
@@ -51857,6 +51899,7 @@ var
   Product: TNeuralFloat;
   CntXYD: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := FOutput.Depth - 1;
@@ -52240,6 +52283,7 @@ var
   r, SrcX, SrcD, OutX, OutD, MaxX, MaxY, MaxD, x, y, c, i, j, InD: integer;
   rM1, OutIdx, SrcIdx: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   r := FStruct[0];
   SrcX := FPrevLayer.Output.SizeX;
   SrcD := FPrevLayer.Output.Depth;
@@ -52505,6 +52549,7 @@ var
   wx1, wy1: TNeuralFloat;
   PrevOutput: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   s := FStruct[0];
   PrevOutput := FPrevLayer.Output;
   OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
@@ -52781,6 +52826,7 @@ var
   wy, wx: array[0..3] of TNeuralFloat;
   PrevOutput: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   s := FStruct[0];
   ac := FStruct[1];
   PrevOutput := FPrevLayer.Output;
@@ -53104,6 +53150,7 @@ var
   wx1, wy1: TNeuralFloat;
   PrevOutput: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOutput := FPrevLayer.Output;
   OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
   InX := PrevOutput.SizeX; InY := PrevOutput.SizeY;
@@ -53395,6 +53442,7 @@ var
   wx1, wy1: TNeuralFloat;
   PrevOutput: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOutput := FPrevLayer.Output;
   OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
   InX := PrevOutput.SizeX; InY := PrevOutput.SizeY;
@@ -54932,6 +54980,7 @@ begin
   if FNeurons.Count > 0 then
   begin
     StartTime := Now();
+    {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
     RefreshCalculatePrevLayerError();
     if FPadding > 0
       then FInputCopy.CopyPadding(FPrevLayer.Output, FPadding)
@@ -55029,6 +55078,7 @@ var
   InDepth, Mult, FT, n, NeuronLen: integer;
   MultM1: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   InDepth := FInputCopy.Depth;
   Mult := FNeurons.Count;
   FT := FFeatureSizeX * FFeatureSizeY;
@@ -58479,6 +58529,7 @@ end;
 
 procedure TNNetDepthwiseConv1D.ComputeCPU();
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPURange(0, FNeurons.Count - 1);
 end;
 
@@ -58756,6 +58807,7 @@ var
   W: TNNetVolume;
   localNeuron: TNNetNeuron;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   Channels := FNeurons.Count;
@@ -64890,6 +64942,7 @@ var
   WhiR, WhfR, WhgR, WhoR: TNeuralFloatArrPtr;
   ixBase: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   Whi := FNeurons[4].FWeights; Whf := FNeurons[5].FWeights;
@@ -65309,6 +65362,7 @@ var
   WhrR, WhzR, WhnR: TNeuralFloatArrPtr;
   ixBase: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   StartTime := Now();
   Prev := FPrevLayer.FOutput;
   Whr := FNeurons[3].FWeights; Whz := FNeurons[4].FWeights;
@@ -71922,6 +71976,7 @@ end;
 // above except for using exact 1/sqrt vs the host pcr_rsqrtf.
 procedure TNNetLayerNorm.ComputeOpenCL();
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FTokenNormCL.NormalizeWholeVolume(FOutput, FNeurons[0].FWeights,
     FNeurons[1].FWeights, FOutput, {UseMean=}true, FLayerNormEpsilon);
 end;
@@ -72167,6 +72222,7 @@ procedure TNNetTokenLayerNorm.ComputeOpenCL();
 var
   Depth, NumTokens: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Depth := FOutput.Depth;
   NumTokens := FOutput.Size div Depth;
   FTokenNormCL.Normalize(FOutput, FNeurons[0].FWeights, FNeurons[1].FWeights,
@@ -72376,6 +72432,7 @@ end;
 // Bit-faithful to the scalar Compute() above except exact 1/sqrt vs pcr_rsqrtf.
 procedure TNNetRMSNorm.ComputeOpenCL();
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FTokenNormCL.NormalizeWholeVolume(FOutput, FNeurons[0].FWeights, nil,
     FOutput, {UseMean=}false, FRMSNormEpsilon);
 end;
@@ -72626,6 +72683,7 @@ procedure TNNetTokenRMSNorm.ComputeOpenCL();
 var
   Depth, NumTokens: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Depth := FNormDim;
   NumTokens := FOutput.Size div Depth;
   FTokenNormCL.Normalize(FOutput, FNeurons[0].FWeights, nil,
@@ -73393,6 +73451,7 @@ end;
 // shared cai_l2norm_perdepth kernel). Forward-only; backward stays on the CPU.
 procedure TNNetPixelNorm.ComputeOpenCL();
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // inherited Compute (Identity passthrough) has already filled FOutput; the
   // kernel normalizes FOutput in place (Y may alias X). InvScale = 1/Depth.
   FL2NormCL.Normalize(FOutput, FOutput,
@@ -73734,6 +73793,7 @@ end;
 // to the scalar Compute() above (TNNetInstanceNorm reuses it via Groups=Depth).
 procedure TNNetGroupNorm.ComputeOpenCL();
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FGroupNormCL.Normalize(FOutput, FNeurons[0].FWeights, FNeurons[1].FWeights,
     FOutput, FOutput.SizeX, FOutput.SizeY, FOutput.Depth, FGroups,
     FChannelsPerGroup, FPerChannelAffine, FGroupNormEpsilon);
@@ -78960,6 +79020,7 @@ var
   PrevOutput: TNNetVolume;
   N: TNNetNeuron;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxCnt := FNeurons.Count - 1;
   PrevOutput := FPrevLayer.Output;  // #8: invariant across the neuron loop
   if FSuppressBias = 0 then
@@ -79163,6 +79224,7 @@ var
   localInput: TNNetVolume;
   Acc: TNeuralFloat;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   StartTime := Now();
   localInput := EffectiveInput();
   MaterializeBankIfStale();
@@ -79317,6 +79379,7 @@ var
   InvSigma, Acc: TNeuralFloat;
   localNeuron: TNNetNeuron;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxCnt := FNeurons.Count - 1;
   EstimateSigmaIfStale();
   InvSigma := 1.0 / FSigma;
@@ -79594,6 +79657,7 @@ var
   Acc: TNeuralFloat;
   Kernel, Bias, PrevOut: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   N := FOutput.Size;
   NM1 := N - 1;
   Kernel := FArrNeurons[0].FWeights;
@@ -79972,6 +80036,7 @@ var
   y0, y1, y2, y3: TNeuralFloat;
   W, PrevOut, Bias: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   Bias := FArrNeurons[FOutQuaternions].FWeights;
   OutQM1 := FOutQuaternions - 1;
@@ -80178,6 +80243,7 @@ var
   acc: TNeuralFloat;
   PrevOut: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   vn := FN;
   vnM1 := vn - 1;
@@ -80455,6 +80521,7 @@ var
   xj: TNeuralFloat;
   W, PrevOut, Bias: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   Bias := FArrNeurons[FOutComplex].FWeights;
   OutCM1 := FOutComplex - 1;
@@ -80759,6 +80826,7 @@ var
   xj: TNeuralFloat;
   W, PrevOut, Bias: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   Bias := FArrNeurons[FOutOctonions].FWeights;
   OutOM1 := FOutOctonions - 1;
@@ -81089,6 +81157,7 @@ var
   wBaseIdx, xBaseIdx, pos: integer;
   PrevOut: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   InDepthM1 := FInDepth - 1;
   OutDepthM1 := FOutDepth - 1;
@@ -81688,6 +81757,7 @@ var
   DepthM1, HalfM1, TwoDepth, PadIdx, pos: integer;
   PrevOut: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   DepthM1 := FDepth - 1;
   HalfM1 := FHalf - 1;
@@ -82113,6 +82183,7 @@ var
   wBaseIdx, xBaseIdx: integer;
   PrevOut: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   InDepthM1 := FInDepth - 1;
   OutDepthM1 := FOutDepth - 1;
@@ -82405,6 +82476,7 @@ var
   PrevOut, W: TNNetVolume;
   cand, bestVal: TNeuralFloat;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   W := FArrNeurons[0].FWeights;
   OutDepthM1 := FOutDepth - 1;
@@ -82573,6 +82645,7 @@ var
   L: TNNetVolume;
   maxVal, sumExp, lse: TNeuralFloat;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   L := FOutput;
   NNm1 := FN * FN - 1;
   FNm1 := FN - 1;
@@ -82844,6 +82917,7 @@ var
   isA: boolean;
   pRow, aPtr: TNeuralFloatArrPtr;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Inp := FPrevLayer.FOutput;
   eps := 1e-8;
   SeqLenM1 := FSeqLen - 1;
@@ -83121,6 +83195,7 @@ var
   vPrev, sPrev, vt, current, betaD, vthD: TNeuralFloat;
   Prev: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   DepthM1 := FDepth - 1;
   SeqLenM1 := FSeqLen - 1;
@@ -83464,6 +83539,7 @@ var
   vPrev, sPrev, aPrev, vt, at, current, betaD, vthEff: TNeuralFloat;
   Prev: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   DepthM1 := FDepth - 1;
   SeqLenM1 := FSeqLen - 1;
@@ -83755,6 +83831,7 @@ var
   cand, bestVal, sgn: TNeuralFloat;
   hasCand: boolean;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   W := FArrNeurons[0].FWeights;
   prevSizeX := PrevOut.SizeX;
@@ -84046,6 +84123,7 @@ var
   baseOut: integer;
   rowPtr: TNeuralFloatArrPtr;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   prevSizeX := PrevOut.SizeX;
   prevSizeY := PrevOut.SizeY;
@@ -84487,6 +84565,7 @@ var
   baseOut, offBase, tap2, dstBase, srcPos, wOfs, pos: integer;
   rowPtr: TNeuralFloatArrPtr;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   sx := PrevOut.SizeX;
   sy := PrevOut.SizeY;
@@ -84647,6 +84726,7 @@ var
   dx, dy, px, py, offv, modM: TNeuralFloat;
   baseOut, offBase, tap2, tSz, patchOfs, resBase: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   sx := PrevOut.SizeX;
   sy := PrevOut.SizeY;
@@ -85193,6 +85273,7 @@ var
   acc, b: TNeuralFloat;
   W, PrevOut, Bias: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   Bias := FArrNeurons[FFeaturesCount].FWeights;
   prevSizeX := PrevOut.SizeX;
@@ -85298,6 +85379,7 @@ var
   b: TNeuralFloat;
   W, PrevOut, Bias: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FKSizeM1 := FKSize - 1;
   PrevOut := FPrevLayer.FOutput;
   Bias := FArrNeurons[FFeaturesCount].FWeights;
@@ -86041,6 +86123,7 @@ var
   MaxBlk, MaxM: integer;
   PrevOut, WR, WL, Bias: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   b := FBlocks;
   m := FBlockSize;
   MaxBlk := b - 1;
@@ -86400,6 +86483,7 @@ var
   MaxP, MaxQ: integer;
   PrevOut, WA, WB, Bias: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   p := FP;
   q := FQ;
   MaxP := p - 1;
@@ -86785,6 +86869,7 @@ var
   PrevOut, Wk, Bias, Prev, Cur: TNNetVolume;
   acc: TNeuralFloat;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
 
   prefCur := 1;
@@ -87186,6 +87271,7 @@ var
   zi, pp, prob: TNeuralFloat;
   PrevOut, Leaf: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
 
   // Inner-node routing probabilities.
@@ -87429,6 +87515,7 @@ var
   acc: TNeuralFloat;
   PrevOut, W: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   D := FNumFeatures;
   Din := FInSize;
   MaxD := D - 1;
@@ -87644,6 +87731,7 @@ var
   beta, dot, scale: TNeuralFloat;
   V, Bias, PrevOut: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   N := FDim;
   PrevOut := FPrevLayer.FOutput;
   Bias := FArrNeurons[FNumReflections].FWeights;
@@ -88046,6 +88134,7 @@ var
   c, A, nz2, nb2, p, qq, Den: TNeuralFloat;
   PrevOut, V, Z, B: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   c := FCurvature;
   PrevOut := FPrevLayer.FOutput;
   nIn := PrevOut.Size;
@@ -88459,6 +88548,7 @@ var
   c, s, na2, Acoef, nb2, pco, qco, Den, r, t, dist, mv: TNeuralFloat;
   PrevOut, Pk: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   c := FCurvature;
   s := Sqrt(c);
   PrevOut := FPrevLayer.FOutput;
@@ -88814,6 +88904,7 @@ var
   W, PrevOut, Bias: TNNetVolume;
   prevSizeX, prevSizeY: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   Bias := FArrNeurons[FOutQuaternions].FWeights;
   prevSizeX := PrevOut.SizeX;
@@ -89192,6 +89283,7 @@ var
   W, PrevOut, Bias: TNNetVolume;
   prevSizeX, prevSizeY: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   Bias := FArrNeurons[FOutComplex].FWeights;
   prevSizeX := PrevOut.SizeX;
@@ -89544,6 +89636,7 @@ var
   W, PrevOut, Bias: TNNetVolume;
   prevSizeX, prevSizeY: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   Bias := FArrNeurons[FOutOctonions].FWeights;
   prevSizeX := PrevOut.SizeX;
@@ -89909,6 +90002,7 @@ var
   j, Dout, VectorSize: integer;
   DoutMax: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FInDim <= 0 then exit;
   Dout := FOutput.Size;
   DoutMax := Dout - 1;
@@ -90334,6 +90428,7 @@ var
   PrevOut: TNNetVolume;
   outSizeYMax, outSizeXMax, outDepthMax, featYMax, featXMax, inDepthMax: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   prevSizeX := PrevOut.SizeX;
   prevSizeY := PrevOut.SizeY;
@@ -90452,6 +90547,7 @@ var
   u, xv: TNeuralFloat;
   W, PrevOut: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   prevSizeX := PrevOut.SizeX;
   prevSizeY := PrevOut.SizeY;
@@ -90861,6 +90957,7 @@ var
   AhatVal: TNeuralFloat;
   OutPtr: TNeuralFloatArrPtr;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if (FAhat.Size = 0) or (FNumNodes = 0) then
     FErrorProc('TNNetGraphConvolution: SetAdjacency must be called before Compute.');
   if FAhat.SizeX <> FPrevLayer.Output.SizeX then
@@ -91207,6 +91304,7 @@ var
   PrevOut: TNNetVolume;
   OutPtr: TNeuralFloatArrPtr;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if (FMask.Size = 0) or (FNumNodes = 0) then
     FErrorProc('TNNetGraphAttention: SetAdjacency must be called before Compute.');
   if FMask.SizeX <> FPrevLayer.Output.SizeX then
@@ -91658,6 +91756,7 @@ var
   PrevOut: TNNetVolume;
   nH, nT: TNNetNeuron;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   N := FOutput.Size;
   Nm1 := N - 1;
   PrevOut := FPrevLayer.FOutput;
@@ -95991,6 +96090,7 @@ var
   W: TNNetVolume;
   prevPtr: TNeuralFloatArrPtr;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   InW := Prev.SizeX; InH := Prev.SizeY; InD := Prev.Depth;
   OutW := FOutput.SizeX; OutH := FOutput.SizeY;
@@ -96103,6 +96203,7 @@ var
   raw, b: TNeuralFloat;
   W: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   InW := Prev.SizeX; InH := Prev.SizeY; InD := Prev.Depth;
   OutW := FOutput.SizeX; OutH := FOutput.SizeY;
@@ -96630,6 +96731,7 @@ var
   k: cl_kernel;
   iSize, iOpcode: longint;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Run the net's shared cai_activation kernel in place over the per-layer
   // buffer: upload prev output, run, read back into FOutput. No allocation here;
   // args are (re)set each call because the kernel is shared in turn by every
@@ -96805,6 +96907,7 @@ begin
   StartTime := Now();
   if FNeurons.Count > 0 then
   begin
+    {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
     if FPadding > 0
       then FInputCopy.CopyPadding(FPrevLayer.Output, FPadding)
       else FInputCopy := FPrevLayer.Output;
@@ -97010,6 +97113,7 @@ var
   PrevOutput: TNNetVolume;
   N: TNNetNeuron;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxCnt := FNeurons.Count - 1;
   PrevOutput := FPrevLayer.Output;  // #8: invariant across the neuron loop
   if FSuppressBias = 0 then
@@ -98244,6 +98348,12 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  // Both input edges are read on the host here: FGateLayer inside
+  // PrepareForward (BuildSlotMap) and FSourceLayer in the expert nest below.
+  {$IFDEF OpenCL}
+  if Assigned(FSourceLayer) then FSourceLayer.ForceOutputOnRAM();
+  if Assigned(FGateLayer) then FGateLayer.ForceOutputOnRAM();
+  {$ENDIF}
   PrepareForward();
   // Quantized weights: QuantizeWeightsInt8 released the per-neuron FP32 rows,
   // so the FP32 nest would read shrunk storage.
@@ -98476,6 +98586,7 @@ begin
   // Quantized weights: QuantizeWeightsInt8 released the per-neuron FP32 rows,
   // so the FP32 nest would read shrunk storage.
   // One work item per token: the serial pass has no reason to split rows.
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FQuantInt8
     then ComputeMixtureQuantizedInt8(0, FTokenCnt - 1, 1)
     else ComputeMixture(0, FTokenCnt - 1, 1);
@@ -98804,6 +98915,7 @@ procedure TNNetMoEExpertBankDown.ComputeOpenCL();
 var
   UnitCombineFlag: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FDeviceWeightsDirty or (FDeviceCLInt8 <> FQuantInt8) then
     ArmDeviceWeights();
   if FUnitCombine then UnitCombineFlag := 1 else UnitCombineFlag := 0;
@@ -98993,6 +99105,7 @@ end;
 // when padding>0, so zero-padded border cells are real window members.
 procedure TNNetMaxPool.ComputeOpenCL();
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FPool2DCL.Pool(FInputCopy, FOutput,
     FInputCopy.SizeX, FInputCopy.SizeY, FOutput.Depth,
     FOutput.SizeX, FOutput.SizeY, FPoolSize, FStride, 0, 1.0);
@@ -99635,9 +99748,11 @@ procedure TNNetConvolution.ComputeOpenCL();
 var
   InputAVolume: TNNetVolume;
   ActOpcode: integer;
-  FuseAct, WUpdated, DeviceIm2Col: boolean;
+  ActivationFunctionInOpenCL, WUpdated, DeviceIm2Col: boolean;
   BiasVol: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  FOutputOnOpenCL := false;
   // Int8-quantized: the FP32 concatenated weights this body uploads do not
   // exist; the resident-code twin does the whole forward. WillOpenCL only
   // routes here when the int8 buffers are armed (FDotCL.Int8Ready).
@@ -99668,33 +99783,9 @@ begin
     InputAVolume := FConcatedWeights;
   end;
 
-  // Device-side bias + activation fusion. The cai_dot_product kernel can add the
-  // per-feature bias AND apply the activation in-register while the reduced
-  // result is still on the device, deleting the host bias-add + the
-  // ApplyActivationFunctionToOutput sweep over the whole output volume. It is
-  // only correct - and only enabled - when the layer is inference-only
-  // (not FIsTrainable): backward never runs, so the pre-activation FOutputRaw is
-  // never needed and the already bias-added, activated result loads straight into
-  // FOutput. Bias no longer blocks the fusion: when present (FSuppressBias = 0)
-  // FBiasOutput rides along as arg 9 and the kernel computes act(W.x + b); when
-  // suppressed no bias buffer is passed (UseBias = 0). Only the opcodes the kernel
-  // implements qualify (ReLU/Sigmoid/Tanh, plus Identity = pass-through); any
-  // other activation falls back to the host path. The bias buffer stays resident
-  // and re-uploads only on a weight update (same WUpdated gate as the weights,
-  // since AfterWeightUpdate rebuilds FBiasOutput). Coded by Claude (AI).
-  ActOpcode := csActNone;
-  FuseAct := (not FIsTrainable);
-  if FuseAct then
-  begin
-    if      {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Identity              then ActOpcode := csActNone
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
-    else FuseAct := false;
-  end;
-
+  ActivationFunctionInOpenCL := IsActivationFunctionInOpenCL(ActOpcode);
   WUpdated := FAfterWeightUpdateHasBeenCalled;
-  if FuseAct and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
+  if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
 
   // Device-side im2col: when armed (inference-only, non-pointwise, non-Winograd),
   // the small padded input FInputCopy is uploaded and the cai_im2col kernel
@@ -99716,8 +99807,9 @@ begin
     {NewVBs}(not DeviceIm2Col), BiasVol, {NewVBias}WUpdated);
   FAfterWeightUpdateHasBeenCalled := false;
 
-  if FuseAct then
+  if ActivationFunctionInOpenCL then
   begin
+    FOutputOnOpenCL := true;
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
     FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
@@ -99741,21 +99833,13 @@ end;
 procedure TNNetConvolution.ComputeOpenCLInt8();
 var
   ActOpcode: integer;
-  FuseAct, DeviceIm2Col: boolean;
+  ActivationFunctionInOpenCL, DeviceIm2Col: boolean;
   BiasVol: TNNetVolume;
 begin
-  ActOpcode := csActNone;
-  FuseAct := (not FIsTrainable);
-  if FuseAct then
-  begin
-    if      {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Identity              then ActOpcode := csActNone
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
-    else FuseAct := false;
-  end;
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  ActivationFunctionInOpenCL := IsActivationFunctionInOpenCL(ActOpcode);
 
-  if FuseAct and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
+  if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
 
   DeviceIm2Col := ShouldDeviceIm2Col();
   if DeviceIm2Col then
@@ -99767,8 +99851,9 @@ begin
   FDotCL.ComputeInt8(FInputPrepared, ActOpcode, {NewVBs}(not DeviceIm2Col),
     BiasVol, {NewVBias}false);
 
-  if FuseAct then
+  if ActivationFunctionInOpenCL then
   begin
+    FOutputOnOpenCL := true;
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
     FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
@@ -100495,6 +100580,7 @@ begin
   if FNeurons.Count > 0 then
   begin
     StartTime := Now();
+    {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
     PrepareForwardPrologue();
 
     //FInputPrepared.ReSize(FOutput.SizeX, FOutput.SizeY, FInputCopy.Depth * FFeatureSizeX * FFeatureSizeY);
@@ -100512,6 +100598,7 @@ begin
     end
     else
     begin
+      FOutputOnOpenCL := false;
       Inc(FForwardCPUCnt);
       ComputeOnCPU;
     end;
@@ -101847,6 +101934,7 @@ begin
       end
       else
       begin
+        FOutputOnOpenCL := false;
         Inc(FForwardCPUCnt);
         ComputeQuantizedInt8CPU();
       end;
@@ -101881,6 +101969,7 @@ begin
     end
     else
     begin
+      FOutputOnOpenCL := false;
       Inc(FForwardCPUCnt);
       ComputeCPU();
     end;
@@ -101970,6 +102059,7 @@ var
   PrevOutput: TNNetVolume;
   N: TNNetNeuron;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxCnt := FNeurons.Count - 1;
   PrevOutput := FPrevLayer.Output;   // #8: invariant across the neuron loop
   if FSuppressBias = 0 then
@@ -101996,6 +102086,7 @@ end;
 
 procedure TNNetFullConnect.ComputeQuantizedInt8CPU();
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if High(FArrNeurons) < FNeurons.Count - 1 then BuildArrNeurons();
   ComputeQuantizedInt8Range(0, FNeurons.Count - 1);
 end;
@@ -102042,9 +102133,11 @@ procedure TNNetFullConnect.ComputeOpenCL();
 var
   InputAVolume: TNNetVolume;
   ActOpcode: integer;
-  FuseAct, WUpdated: boolean;
+  ActivationFunctionInOpenCL, WUpdated: boolean;
   BiasVol: TNNetVolume;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  FOutputOnOpenCL := false;
   if FShouldInterleaveWeights then
   begin
     if FConcatedWInter.Size < FNeurons[0].Weights.Size * FNeurons.Count then
@@ -102059,39 +102152,24 @@ begin
     InputAVolume := FConcatedWeights;
   end;
 
-  // Device-side bias + activation fusion, identical in spirit to
-  // TNNetConvolution.ComputeOpenCL (this layer shares the same cai_dot_product
-  // FDotCL): when inference-only (not FIsTrainable) the kernel adds the
-  // per-neuron bias and applies the activation in-register, so the already
-  // bias-added, activated result loads straight into FOutput - no host bias-add,
-  // no ApplyActivationFunctionToOutput sweep. FOutputRaw (needed only by the
-  // backward derivative) is untouched, hence the not-FIsTrainable gate. For
-  // FullConnect FNumBs = 1, so the result index b_id*FNumAs + a_id collapses to
-  // a_id and FBiasOutput (built by BuildBiasOutput's TNNetFullConnect branch as
-  // bias[neuron], size = FOutput.Size = FNumAs) indexes exactly right. The bias
-  // buffer rides the same WUpdated gate as the weights. Only the opcodes the
-  // kernel implements qualify (ReLU/Sigmoid/Tanh + Identity); any other
-  // activation falls back to the host path. Coded by Claude (AI).
-  ActOpcode := csActNone;
-  FuseAct := (not FIsTrainable);
-  if FuseAct then
-  begin
-    if      {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Identity              then ActOpcode := csActNone
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
-    else FuseAct := false;
-  end;
+  // Bias rides along as a kernel argument only when the device also applies the
+  // activation. For FullConnect FNumBs = 1, so the result index b_id*FNumAs +
+  // a_id collapses to a_id and FBiasOutput (built by BuildBiasOutput's
+  // TNNetFullConnect branch as bias[neuron], size = FOutput.Size = FNumAs)
+  // indexes exactly right. It rides the same WUpdated gate as the weights.
+  // Coded by Claude (AI).
+  ActivationFunctionInOpenCL := IsActivationFunctionInOpenCL(ActOpcode);
 
   WUpdated := FAfterWeightUpdateHasBeenCalled;
-  if FuseAct and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
+  if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
 
   FDotCL.Compute(InputAVolume, FPrevLayer.FOutput, ActOpcode, {NewVAs}WUpdated, true,
     BiasVol, {NewVBias}WUpdated);
   FAfterWeightUpdateHasBeenCalled := false;
 
-  if FuseAct then
+  if ActivationFunctionInOpenCL then
   begin
+    FOutputOnOpenCL := true;
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
     FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
@@ -102127,27 +102205,21 @@ end;
 procedure TNNetFullConnect.ComputeOpenCLInt8();
 var
   ActOpcode: integer;
-  FuseAct: boolean;
+  ActivationFunctionInOpenCL: boolean;
   BiasVol: TNNetVolume;
 begin
-  ActOpcode := csActNone;
-  FuseAct := (not FIsTrainable);
-  if FuseAct then
-  begin
-    if      {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Identity              then ActOpcode := csActNone
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
-    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
-    else FuseAct := false;
-  end;
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  FOutputOnOpenCL := false;
+  ActivationFunctionInOpenCL := IsActivationFunctionInOpenCL(ActOpcode);
 
-  if FuseAct and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
+  if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
 
   FDotCL.ComputeInt8(FPrevLayer.FOutput, ActOpcode, {NewVBs}true,
     BiasVol, {NewVBias}false);
 
-  if FuseAct then
+  if ActivationFunctionInOpenCL then
   begin
+    FOutputOnOpenCL := true;
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
     FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
@@ -102511,6 +102583,7 @@ procedure TNNetEmbedding.ComputeOpenCL();
 var
   MaxToken, CntToken, CurrentToken: integer;
 begin
+  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxToken := FPrevLayer.Output.Size - 1;
   for CntToken := 0 to MaxToken do
   begin
@@ -126498,6 +126571,26 @@ begin
   // to be implemented by inherited classes
 end;
 
+// True when the device kernel can apply this layer's bias-add and activation
+// in-register, so the result loads straight into FOutput and both the host
+// bias-add and the ApplyActivationFunctionToOutput sweep disappear. Requires
+// inference-only (not FIsTrainable): backward reads the pre-activation
+// FOutputRaw, which the device never produces. Only the opcodes the kernel
+// implements qualify; anything else falls back to the host path.
+function TNNetLayer.IsActivationFunctionInOpenCL(var ActOpcode: integer):boolean;
+begin
+  ActOpcode := csActNone;
+  Result := (not FIsTrainable);
+  if Result then
+  begin
+    if      {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Identity              then ActOpcode := csActNone
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @RectifiedLinearUnit   then ActOpcode := csActReLU
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Sigmoid               then ActOpcode := csActSigmoid
+    else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @HiperbolicTangent      then ActOpcode := csActTanh
+    else Result := false;
+  end;
+end;
+
 procedure TNNetLayer.SetOutputErrorSize(pSizeX, pSizeY, pDepth: integer);
 begin
   if FIsTrainable then
@@ -126647,6 +126740,10 @@ begin
   FComputeState := 0;
   {$IFDEF OpenCL}
   FDotCL := nil;
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  FErrorOnOpenCL := false;
+  FOpenCLDeviceTag := nil;
   DisableOpenCL();
   {$ENDIF}
 end;
@@ -126688,6 +126785,16 @@ begin
   Result := F32Kernel;
 end;
 
+function TNNetLayer.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FDotCL) then Result := FDotCL.ResultBuffer else Result := nil;
+end;
+
+function TNNetLayer.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FDotCL) then Result := FDotCL.DotProductKernel else Result := nil;
+end;
+
 function TNNetLayer.GetDotCLWaitBeta(): TNeuralFloat;
 begin
   if FIsTrainable then
@@ -126701,6 +126808,44 @@ begin
   else
   begin
     Result := 0;
+  end;
+end;
+
+function TNNetLayer.ForceOutputOnRAM(): boolean;
+begin
+  if FOutputOnOpenCL and not(FOutputOnRAM) then
+  begin
+    MoveOutputToRAM();
+  end;
+  Result := FOutputOnRAM;
+end;
+
+procedure TNNetLayer.MoveOutputToRAM();
+var
+  OutputBuffer: cl_mem;
+  OutputKernel: TNeuralKernel;
+  err: integer;
+begin
+  OutputBuffer := OpenCLOutputBuffer();
+  OutputKernel := OpenCLOutputKernel();
+  if FOutputOnOpenCL and (OutputBuffer <> nil) and Assigned(OutputKernel) then
+  begin
+    // Blocking read on the producing in-order queue: it is ordered after the
+    // forward enqueue, so no separate clFinish is needed (this is exactly what
+    // TDotProductSharedKernel.FinishAndLoadResult does).
+    err := OutputKernel.ReadBuffer(OutputBuffer, FOutput);
+    if err = CL_SUCCESS then
+    begin
+      FOutputOnRAM := true;
+    end
+    else
+    begin
+      ErrorProc('Error reading the output buffer at layer '+IntToStr(FLayerIdx)+':'+ClassName+' error:'+IntToStr(err));
+    end;
+  end;
+  if not(FOutputOnRAM) then
+  begin
+    ErrorProc('Error at moving output from OpenCL to RAM at layer '+IntToStr(FLayerIdx)+':'+ClassName);
   end;
 end;
 

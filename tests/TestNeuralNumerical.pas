@@ -354,6 +354,24 @@ type
     // (padded-vs-aliased input, stride>1) is exercised against the CPU reference.
     // Coded by Claude (AI).
     procedure TestConvDeviceIm2ColOpenCLParity;
+    // The two tests below are the only coverage of pHasSharedKernel=FALSE.
+    // Every other OpenCL test uses EnableOpenCL's 2-argument form, so it runs
+    // with net-wide shared handles. With private handles each layer builds its
+    // own TNeuralKernel - hence its own command queue - and TNNetExecutionPlanner
+    // lets any worker run those layers instead of funnelling them through worker
+    // 0, so several device layers dispatch at once.
+    // Both assert ForwardGPUCnt > 0: these are parity tests, so a silent fall
+    // back to the CPU would compare the reference against itself and pass while
+    // covering nothing.
+    // Scope, measured rather than assumed: these establish that the private-handle
+    // configuration runs, reaches the device and computes correct results. They do
+    // NOT reliably detect a cross-queue ordering regression - reverting the
+    // BuildInputColsOnDevice fix leaves both green (0/12 in isolation, 0/10 inside
+    // a full suite run, where the older conv parity tests caught it 8/10). That
+    // hazard needs the kernel churn of a whole suite run, which no single test
+    // reproduces. Coded by Claude (AI).
+    procedure TestPrivateKernelConvIm2ColOpenCLParity;
+    procedure TestPrivateKernelMultiLayerOpenCLParity;
     // Int8-quantized device forward parity (cai_dot_product_int8, resident
     // interleaved codes + per-row scales) vs the fused int8 CPU kernels, for
     // TNNetFullConnect (activation x bias sweep) and TNNetConvolution
@@ -65136,6 +65154,202 @@ begin
   AssertTrue('OpenCL not compiled in: SKIP', true);
 end;
 {$ENDIF}
+
+// --- pHasSharedKernel = FALSE (private per-layer kernel handles) -------------
+//
+// EnableOpenCL's third argument selects between one net-wide handle per kernel
+// name and a fresh handle per layer. Only the shared form is otherwise tested.
+// The private form is the harder one: TNeuralKernel.CreateFromProgram gives each
+// handle its own command queue, and two queues carry no ordering guarantee, so a
+// producer kernel and the consumer that reads its buffer have to be enqueued on
+// one queue. It is also the only form under which a layer may run on a worker
+// other than 0, so device dispatches genuinely overlap.
+//
+// Both tests assert ForwardGPUCnt > 0 on the layers under test. Parity tests
+// compare a device result against a CPU reference: if the device path were never
+// armed, the second pass would be another CPU compute, parity would be exact and
+// the test would pass while proving nothing.
+//
+// What these do NOT do: catch a cross-queue ordering regression. Measured against
+// the pre-fix code they stay green (0/12 in isolation, 0/10 inside a full suite
+// run). Treat them as configuration coverage, not as the guard for that bug.
+
+procedure TTestNeuralNumerical.TestPrivateKernelConvIm2ColOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Conv: TNNetConvolution;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(9, 9, 3);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(9, 9, 3, 1));
+    Conv := TNNetConvolution.Create(4, 3, 1, 1, 0);
+    Conv.ActivationFn := @HiperbolicTangent;
+    Conv.ActivationFnDerivative := @HiperbolicTangentDerivative;
+    NN.AddLayer(Conv);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.03 * i - 1.1;
+    for i := 0 to Conv.Neurons.Count - 1 do
+      Conv.Neurons[i].BiasWeight := 0.2 + 0.1 * i;
+    NN.UpdateWeights();
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    // Inference-only arms the device im2col gather: the source upload, the
+    // gather and the GEMM that reads the gathered columns are three separate
+    // enqueues that must stay ordered even though the im2col handle is now the
+    // layer's own.
+    Conv.SetTrainable(False, False);
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId, {pHasSharedKernel}false);
+    try
+      Conv.ForwardGPUCnt := 0;
+      NN.Compute(Input);
+      NN.Compute(Input); // second pass: resident weights, re-uploaded input
+      MaxDiff := 0;
+      AssertEquals('output size match', OutCPU.Size,
+        NN.GetLastLayer.Output.Size);
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      AssertTrue('the conv must take the device path, else parity is vacuous',
+        Conv.ForwardGPUCnt > 0);
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    WriteLn('  PrivateKernel ConvDeviceIm2Col parity: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards=', Conv.ForwardGPUCnt);
+    AssertTrue('PrivateKernel ConvDeviceIm2Col device vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Several device layers in one net, each holding its own kernel handles and
+// queues. A single-layer parity test cannot reach the risk that is specific to
+// private handles: concurrent dispatch of distinct layers, each running its own
+// producer/consumer buffer chain.
+procedure TTestNeuralNumerical.TestPrivateKernelMultiLayerOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  ConvA, ConvB, Conv: TNNetConvolution;
+  ActA, ActB, Act: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, GpuLayers, LayerIdx: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 990011;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(12, 12, 4);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(12, 12, 4, 1));
+    // Six convs, each with its own private im2col/GEMM handles and queues, and a
+    // ReLU between each pair carrying its own cai_activation handle. Depth is the
+    // point: the ordering hazard needs several distinct queues live at once, so a
+    // two-layer net barely exercises it.
+    ConvA := nil; ConvB := nil; ActA := nil; ActB := nil;
+    for i := 0 to 5 do
+    begin
+      Conv := TNNetConvolution.Create(8, 3, 1, 1, 0);
+      Conv.ActivationFn := @HiperbolicTangent;
+      Conv.ActivationFnDerivative := @HiperbolicTangentDerivative;
+      NN.AddLayer(Conv);
+      if i = 0 then ConvA := Conv;
+      if i = 5 then ConvB := Conv;
+      Act := NN.AddLayer(TNNetReLU.Create());
+      if i = 0 then ActA := Act;
+      if i = 5 then ActB := Act;
+    end;
+    NN.AddLayer(TNNetFullConnectLinear.Create(10));
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := 0.017 * i - 0.9;
+    for i := 0 to ConvA.Neurons.Count - 1 do
+      ConvA.Neurons[i].BiasWeight := 0.05 + 0.03 * i;
+    for i := 0 to ConvB.Neurons.Count - 1 do
+      ConvB.Neurons[i].BiasWeight := -0.04 + 0.02 * i;
+    NN.UpdateWeights();
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    NN.SetTrainable(False, False);
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId, {pHasSharedKernel}false);
+    try
+      for LayerIdx := 0 to NN.GetLastLayerIdx() do
+        NN.Layers[LayerIdx].ForwardGPUCnt := 0;
+      // Repeat: the hazard is a timing window, so one pass can easily miss it.
+      for i := 0 to 11 do NN.Compute(Input);
+      MaxDiff := 0;
+      AssertEquals('output size match', OutCPU.Size,
+        NN.GetLastLayer.Output.Size);
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      GpuLayers := 0;
+      for LayerIdx := 0 to NN.GetLastLayerIdx() do
+        if NN.Layers[LayerIdx].ForwardGPUCnt > 0 then Inc(GpuLayers);
+      // At least two layers on the device is what makes this a MULTI-layer test:
+      // one would exercise no more than the single-layer case above.
+      AssertTrue('at least two layers must take the device path, got ' +
+        IntToStr(GpuLayers), GpuLayers >= 2);
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    WriteLn('  PrivateKernel MultiLayer parity: max|diff|=', MaxDiff:0:9,
+      ' device layers=', GpuLayers, ' (convA=', ConvA.ForwardGPUCnt,
+      ' actA=', ActA.ForwardGPUCnt, ' convB=', ConvB.ForwardGPUCnt,
+      ' actB=', ActB.ForwardGPUCnt, ')');
+    AssertTrue('PrivateKernel MultiLayer device vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
 
 {$IFDEF OpenCL}
 // Deterministic weight value shared by every MoE bank the parity harness fills.
