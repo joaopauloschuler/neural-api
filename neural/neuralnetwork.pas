@@ -940,6 +940,7 @@ type
   TNNetLayerList = class (specialize TFPGObjectList<TNNetLayer>)
     public
       procedure ForceOutputOnRAM();
+      function OutputOnOpenCL(): boolean;
   end;
   {$ELSE}
   TNNetLayerList = class (TNNetList)
@@ -948,6 +949,7 @@ type
       procedure SetItem(Index: Integer; AObject: TNNetLayer); inline;
     public
       procedure ForceOutputOnRAM();
+      function OutputOnOpenCL(): boolean;
       property Items[Index: Integer]: TNNetLayer read GetItem write SetItem; default;
   end;
   {$ENDIF}
@@ -74698,6 +74700,7 @@ end;
 
 { TNNetLayerList }
 procedure TNNetLayerList.ForceOutputOnRAM();
+{$IFDEF OpenCL}
 var
   MaxLayer: integer;
   CntLayer: integer;
@@ -74707,10 +74710,37 @@ begin
   begin
     for CntLayer := 0 to MaxLayer do
     begin
-      {$IFDEF OpenCL} Self[CntLayer].ForceOutputOnRAM(); {$ENDIF}
+      Self[CntLayer].ForceOutputOnRAM();
     end;
   end;
 end;
+{$ELSE}
+begin
+end;
+{$ENDIF}
+
+// True when EVERY listed layer holds its output in device memory, so a consumer
+// can bind those buffers instead of reading Output. False for an empty list.
+function TNNetLayerList.OutputOnOpenCL(): boolean;
+{$IFDEF OpenCL}
+var
+  MaxLayer: integer;
+  CntLayer: integer;
+begin
+  MaxLayer := Count - 1;
+  Result := (MaxLayer >= 0);
+  CntLayer := 0;
+  while Result and (CntLayer <= MaxLayer) do
+  begin
+    Result := Self[CntLayer].FOutputOnOpenCL;
+    Inc(CntLayer);
+  end;
+end;
+{$ELSE}
+begin
+  Result := false;
+end;
+{$ENDIF}
 
 { TNNetReLU }
 constructor TNNetReLU.Create();
