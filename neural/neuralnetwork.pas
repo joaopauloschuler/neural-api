@@ -23525,6 +23525,7 @@ var
   HasDeriv: boolean;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   inherited Compute;
   {$IFDEF Debug}
   if FNeurons[0].FWeights.Size <> 1 then
@@ -23657,6 +23658,7 @@ var
   HasDeriv: boolean;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   inherited Compute;
   {$IFDEF Debug}
   if FNeurons[0].FWeights.Size <> 1 then
@@ -26236,6 +26238,7 @@ var
   MaskValue: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   MaskValue := FFloatSt[0];
   Offset := FStruct[0];
@@ -26350,6 +26353,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   FOutput.Add(FMask);
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -26391,6 +26395,7 @@ var
   MaskValue: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   MaskValue := FFloatSt[0];
   W := FStruct[0];
@@ -26450,6 +26455,7 @@ var
   I, MaxI: integer;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   Step := FFloatSt[0];
   if Step <= 0 then Step := 1.0;
@@ -26521,6 +26527,7 @@ var
   Training: boolean;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.FOutput;
   SizeM1 := LocalPrevOutput.Size - 1;
   QMax := FStruct[0];
@@ -26645,6 +26652,7 @@ var
   X, Y: integer;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
@@ -26689,6 +26697,7 @@ var
   Cap, InvCap, ArgVal, TanhVal, SmallThresh: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.FOutput;
   LocalSize := LocalPrevOutput.Size;
   SizeM1 := LocalSize - 1;
@@ -28579,6 +28588,7 @@ var
   zePtr, wPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Identity copy first so the input z_e is available in FOutput; we then
   // overwrite each position with its nearest codebook vector z_q.
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
@@ -28833,6 +28843,7 @@ var
   Z, T, Bounded: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Identity copy first so pass-through channels (>= D) keep their values; we
   // then overwrite the first D channels with their quantized integer level.
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
@@ -28990,6 +29001,7 @@ var
   Z: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Identity copy first so pass-through channels (>= D) keep their values; the
   // first D channels are then overwritten with their +/-1 sign code.
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
@@ -29454,6 +29466,7 @@ var
   MaxLogit, SumExp, Ex, RawS: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Start from the raw parameter vector (identity passthrough), then transform
   // the mixing logits (softmax) and raw scales (softplus) in place.
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
@@ -31136,6 +31149,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ApplyRealDFT(FPrevLayer.FOutput, FOutput);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -31237,6 +31251,7 @@ var
   MinV, MaxV, Denom, InvDenom, Eps, Xv: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.FOutput;
   Eps := FFloatSt[0];
   if Eps <= 0 then Eps := 1e-7;
@@ -31496,6 +31511,7 @@ const
   Safety = 1e-12;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.FOutput;
   Tau := FFloatSt[0];
   if Tau = 0 then Tau := 1.0;
@@ -44984,6 +45000,7 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   Depth := Prev.Depth;
@@ -45202,6 +45219,7 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   Depth := Prev.Depth;
@@ -45987,6 +46005,7 @@ var
   HasDeriv: boolean;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   inherited Compute;
   {$IFDEF Debug}
   if FNeurons[0].FWeights.Size <> 1 then
@@ -47732,6 +47751,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   MaxDepth := FOutput.Depth - 1;
   for CntDepth := 0 to MaxDepth do
   begin
@@ -47801,6 +47821,7 @@ var
   DstPos: integer;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.Output;
   Channel := FStruct[0];
   MaxX := Prev.SizeX - 1;
@@ -47910,6 +47931,7 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.Output;
   MaxX := Prev.SizeX - 1;
   MaxY := Prev.SizeY - 1;
@@ -48044,6 +48066,7 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.Output;
   MaxX := Length(FTokens) - 1;
   MaxD := Prev.Depth - 1;
@@ -48147,6 +48170,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   MaxDepth := FOutput.Depth - 1;
   for CntDepth := 0 to MaxDepth do
     FOutput.CopyFromDepthToDepth(FPrevLayer.FOutput, CntDepth, ToChannels[CntDepth]);
@@ -48184,6 +48208,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := FOutput.Depth - 1;
@@ -48234,6 +48259,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := FOutput.Depth - 1;
@@ -48284,6 +48310,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   MaxY := FOutput.SizeY - 1;
   // A row is SizeX*Depth contiguous floats and the flip permutes whole rows,
   // so each row is a single Move.
@@ -48370,6 +48397,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   P := FStruct[0];
   C := FPrevLayer.Output.Depth;
   MaxOX := FOutput.SizeX - 1;
@@ -48467,6 +48495,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   P := FStruct[0];
   C := FOutput.Depth;
   MaxIX := FPrevLayer.Output.SizeX - 1;
@@ -48826,6 +48855,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   SX := FPrevLayer.Output.SizeX;
   SY := FPrevLayer.Output.SizeY;
   D  := FPrevLayer.Output.Depth;
@@ -49047,6 +49077,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   MaxDepth := FOutput.Depth - 1;
   for CntDepth := 0 to MaxDepth do
     FOutput.CopyFromDepthToDepth(FPrevLayer.FOutput, CntDepth, MaxDepth - CntDepth);
@@ -49100,6 +49131,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   HalfDepth := FOutput.Depth;
   MaxIX := FPrevLayer.Output.SizeX - 1;
   MaxIY := FPrevLayer.Output.SizeY - 1;
@@ -49187,6 +49219,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := FOutput.Depth - 1;
@@ -49417,6 +49450,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
   Depth := FOutput.Depth;
@@ -50921,6 +50955,7 @@ var
   MinValue: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   OutDepthM1 := FByteLen*8 - 1;
@@ -51081,6 +51116,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Affine-encode each input scalar to a whole byte, run the symbolic engine,
   // then affine-decode each output byte back to a scalar.
   EncodeToBytes(FPrevLayer.Output, FByteInput);
@@ -51193,6 +51229,7 @@ var
   PrevOutBase, OutBase: integer;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   InDepthM1 := FInDepth - 1;
@@ -55565,6 +55602,7 @@ var
   SumSq, n, fOverN, Eps: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   Dim := FStruct[0];
   NumCaps := FOutput.Depth div Dim;
@@ -56213,6 +56251,7 @@ var
   P, CoefPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Do NOT call inherited Compute (which would copy input into FOutput);
   // we compute Y directly from FPrevLayer.FOutput.
   Prev := FPrevLayer.FOutput;
@@ -56438,6 +56477,7 @@ var
   alpha, xv: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Do NOT call inherited Compute (which copies the input into FOutput); we
   // compute Y directly from FPrevLayer.FOutput.
   Prev := FPrevLayer.FOutput;
@@ -56606,6 +56646,7 @@ var
   HasDeriv: boolean;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   inherited Compute;
   {$IFDEF Debug}
   if FNeurons[0].FWeights.Size <> 1 then
@@ -56737,6 +56778,7 @@ var
   AlphaPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Do NOT call inherited Compute (which would copy input to FOutput).
   Prev := FPrevLayer.FOutput;
   W := FNeurons[0].FWeights;
@@ -56894,6 +56936,7 @@ var
   TrPtr, ArPtr, TlPtr, AlPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Do NOT call inherited Compute (which would copy input to FOutput).
   Prev := FPrevLayer.FOutput;
   Wtr := FNeurons[0].FWeights;
@@ -57113,6 +57156,7 @@ var
   xv, acc, a_sd, b_sd: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Do NOT call inherited Compute (which would copy input to FOutput).
   Prev := FPrevLayer.FOutput;
   SizeX := FOutput.SizeX;
@@ -57334,6 +57378,7 @@ var
   xv, frac, y0, y1: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Do NOT call inherited Compute (which would copy input to FOutput).
   Prev := FPrevLayer.FOutput;
   SizeX := FOutput.SizeX;
@@ -57489,6 +57534,7 @@ var
   P1Ptr, P2Ptr, BetaPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Do NOT call inherited Compute (which would copy input to FOutput).
   Prev := FPrevLayer.FOutput;
   W1 := FNeurons[0].FWeights;
@@ -57660,6 +57706,7 @@ var
   P1Ptr, P2Ptr, GammaPtr, DeltaPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   W1 := FNeurons[0].FWeights;
   W2 := FNeurons[1].FWeights;
@@ -57956,6 +58003,7 @@ var
   W: TNNetVolume;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   Depth := Prev.Depth;
@@ -59351,6 +59399,7 @@ var
   HPtr, TmpPtr, XtPtr, OutPtr, APtr, BPtr, CPtr, EPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   Wa := FNeurons[0].FWeights;
   Wb := FNeurons[1].FWeights;
@@ -71131,6 +71180,7 @@ var
   xv: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Do NOT call inherited Compute (which copies the input into FOutput); we
   // compute the polynomial directly from FPrevLayer.FOutput.
   Prev := FPrevLayer.FOutput;
@@ -72887,6 +72937,7 @@ var
   Scale: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   inherited Compute; // copies FPrevLayer.FOutput into FOutput
   SeqLen := FOutput.SizeX;
   Depth := FOutput.Depth;
@@ -92703,6 +92754,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   FLRN.CalculateLocalResponseFromDepth(FOutput, FLRNSqr, FStruct[0], 0.001 / 9.0, 0.75);
   FOutput.Divi(FLRN);
@@ -94267,6 +94319,7 @@ var
   P, Keep, InvKeep, R: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Default: identity copy (used at inference and as the base path).
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   P := FFloatSt[0];
@@ -94333,6 +94386,7 @@ var
   CntOut, MaxOutput: integer;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Identity copy (used at inference and as the base path).
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   Alpha := FFloatSt[0];
@@ -94382,6 +94436,7 @@ var
   d: integer;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   P := FFloatSt[0];
   // Resize the per-channel mask to match Depth.
@@ -94453,6 +94508,7 @@ var
   d: integer;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   P := FFloatSt[0];
   if FChannelMask.Size <> FOutput.Depth then
@@ -94600,6 +94656,7 @@ var
   m: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   // Keep the spatial mask sized to the feature map (Depth = 1, broadcast).
   if (FKeepMask.SizeX <> FOutput.SizeX) or (FKeepMask.SizeY <> FOutput.SizeY) then
@@ -94673,6 +94730,7 @@ var
   Sigma: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   Sigma := FFloatSt[0];
   if FEnabled and (Sigma > 0) then
@@ -94717,6 +94775,7 @@ var
   M: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   Sigma := FFloatSt[0];
   if FNoiseMask.Size <> FOutput.Size then
@@ -97309,6 +97368,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   {$IFDEF OpenCL}
   // Device whole-volume softmax forward: the entire SizeX*SizeY*Depth sample is
@@ -97368,6 +97428,7 @@ var
   Mean: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Copy input, subtract per-sample mean (mean over the whole volume,
   // matching the softmax normalization scope), then run the standard
   // softmax. Backpropagate is inherited from TNNetSoftMax: softmax is
@@ -97386,6 +97447,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // y = softmax(-x): copy input, negate, then apply softmax in place.
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   FOutput.Mul(-1);
@@ -97445,6 +97507,7 @@ var
   MaxV, S: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   SizeM1 := FOutput.Size - 1;
   // y_i = exp(x_i) / (1 + sum_j exp(x_j))
@@ -97525,6 +97588,7 @@ var
   T: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   T := FFloatSt[0];
   if T = 0 then T := 1.0;
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
@@ -97594,6 +97658,7 @@ var
   i, SizeM1, ArgMax: integer;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Tau := FFloatSt[0];
   if Tau <= 0 then Tau := 1.0;
   InvTau := 1.0 / Tau;
@@ -97707,6 +97772,7 @@ var
   MaxVal, SumExp, LogSumExp: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
@@ -97815,6 +97881,7 @@ var
   BestVal, Val: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   K := FStruct[0];
   MaxX := FOutput.SizeX - 1;
@@ -97901,6 +97968,7 @@ var
   BestVal, Val, SurvSum: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   TopCnt := FStruct[0];
   MaxX := FOutput.SizeX - 1;
@@ -98053,6 +98121,7 @@ var
   BestVal, Val: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   Capacity := FStruct[0];
   MaxX := FOutput.SizeX - 1;
@@ -98185,6 +98254,7 @@ var
   BiasPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   TopCnt := FStruct[0];
   MaxX := FOutput.SizeX - 1;
