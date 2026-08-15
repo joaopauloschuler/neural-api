@@ -72815,6 +72815,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   // Device forward keeps the per-token activation resident on the GPU between
   // attention/FFN blocks (forward-only; training stays on the CPU path below).
@@ -79889,6 +79890,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if FUseFFT then
   begin
     RequireFFTUsable();
@@ -80291,6 +80293,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -80497,6 +80500,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -80775,6 +80779,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -81080,6 +81085,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -81414,6 +81420,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -82015,6 +82022,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -82440,6 +82448,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -82733,6 +82742,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -82902,6 +82912,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -83171,6 +83182,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -83448,6 +83460,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -83792,6 +83805,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -84085,6 +84099,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -84377,6 +84392,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -84804,6 +84820,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   // Offload the dense main-conv im2col GEMM to the device when OpenCL is armed
   // and the contraction is large enough to amortise the upload/dispatch. The
@@ -85510,6 +85527,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   // Offload the dense rotation-tied im2col GEMM to the device when OpenCL is
   // armed and the work is large enough to amortise the upload/dispatch. The
@@ -85920,6 +85938,7 @@ var
   v, acc: TNeuralFloat;
   PrevOut: TNNetVolume;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   PrevOut := FPrevLayer.FOutput;
   sizeX := PrevOut.SizeX;
   sizeY := PrevOut.SizeY;
@@ -86375,6 +86394,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -86737,6 +86757,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -87117,6 +87138,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -87525,6 +87547,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -87773,6 +87796,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -87987,6 +88011,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -88389,6 +88414,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if FLearnCurvature then SyncCurvatureFromRaw();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -88804,6 +88830,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -89156,6 +89183,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -89535,6 +89563,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -89886,6 +89915,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -90237,6 +90267,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -90665,6 +90696,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   // Offload the per-edge coefficient reduction (the FCoeffsPerEdge dot product)
   // to the device when OpenCL is armed and the work is large enough to amortise
@@ -91208,6 +91240,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -91557,6 +91590,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -92014,6 +92048,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -95836,6 +95871,7 @@ var
   WSum, Wij: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeDenseMax();
   OutMaxX := FOutput.SizeX - 1;
   OutMaxY := FOutput.SizeY - 1;
@@ -96341,6 +96377,7 @@ procedure TNNetDeconvolution.Compute();
 var
   StartTime: double;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if FNeurons.Count = 0 then
   begin
     FErrorProc('Neuronal layer contains no neuron:' + IntToStr(FNeurons.Count));
@@ -102230,6 +102267,7 @@ procedure TNNetFullConnect.Compute();
 var
   StartTime: double;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if FQuantInt8 then
   begin
     if (FNeurons.Count = FOutput.Size) and
