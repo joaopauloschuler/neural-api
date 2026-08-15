@@ -41170,6 +41170,7 @@ var
   Bias: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   SeqLenM1 := SeqLen - 1;
@@ -42403,6 +42404,7 @@ var
   OutPtr, QueryPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   SeqLenM1 := SeqLen - 1;
@@ -42545,6 +42547,7 @@ var
   OutPtr, Bias, BiasRow, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   SeqN := Prev.SizeX;
   SeqNM1 := SeqN - 1;
@@ -42660,6 +42663,7 @@ var
   OutPtr, Bias, BiasRow, QnPtr, QPtr, KPtr, KnPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   SeqN := Prev.SizeX;
   SeqNM1 := SeqN - 1;
@@ -43199,6 +43203,7 @@ var
   OutPtr, QueryPtr, RowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   AugLen := FNumSinks + SeqLen;
@@ -43483,6 +43488,7 @@ var
   OutPtr, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   SeqLenM1 := SeqLen - 1;
@@ -43707,6 +43713,7 @@ var
   OutPtr, QPtr1, QPtr2, Row1Ptr, Row2Ptr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   SeqLenM1 := SeqLen - 1;
@@ -52004,6 +52011,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if FNeurons.Count > 0 then
   begin
     if FPadding > 0
@@ -52129,6 +52137,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Output.Fill(-1000000);
 
   if FPadding > 0
@@ -52222,6 +52231,7 @@ var
   InBase, Out00, OutDepthStride, OutRowStride: integer;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Output.Fill(0);
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
@@ -60128,6 +60138,7 @@ var
   basePrev, baseC, pvStride, ocStride: integer;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   Ww := FNeurons[0].FWeights;
   Wu := FNeurons[1].FWeights;
@@ -69516,6 +69527,7 @@ var
   KeepState: boolean;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   Wd := FNeurons[0].FWeights;
   WB := FNeurons[1].FWeights;
@@ -69592,6 +69604,7 @@ var
   KeepState: boolean;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   Wd := FNeurons[0].FWeights;
   WB := FNeurons[1].FWeights;
@@ -71650,6 +71663,7 @@ var
   InputRawPtr: TNeuralFloatPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Output.Fill(1000000);
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
@@ -71796,6 +71810,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Output.Fill(1000000);
 
   if FPadding > 0
@@ -75258,6 +75273,7 @@ var
   InputRawPtr: TNeuralFloatPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Output.Fill(-1000000);
   // Channel layers never pad; reduce directly over the previous output.
   MaxX := FPrevLayer.Output.SizeX - 1;
@@ -92144,6 +92160,7 @@ var
   localNeuron: TNNetNeuron;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   MaxNeurons := FNeurons.Count - 1;
   MaxWeights := FNeurons[0].FWeights.Size - 1;
   NLocal := MaxWeights + 1;
@@ -92679,6 +92696,7 @@ var
   localNeuron: TNNetNeuron;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   MaxNeurons := FNeurons.Count - 1;
   MaxWeights := FNeurons[0].FWeights.Size - 1;
   NLocal := MaxWeights + 1;
@@ -92932,6 +92950,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if (FNeurons.Count = FOutput.Size) and
     (FPrevLayer.Output.Size = FNeurons[0].Weights.Size) then
   begin
@@ -94922,6 +94941,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   // Device avg-pool forward (exactly TNNetAvgPool; AvgChannel and other subclasses
   // keep the scalar path). Sum over the clipped window divided by the FULL
@@ -95079,6 +95099,7 @@ var
   IsP2: boolean;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Accumulate sum_i |x_i|^p into the output.
   Output.Fill(0);
   MaxX := FPrevLayer.Output.SizeX - 1;
@@ -95354,6 +95375,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Per pooling window W and channel, with temperature beta (FFloatSt[0]):
   //   w_i = exp(beta*x_i - winMax) / sum_j exp(beta*x_j - winMax)
   //   y   = sum_i w_i * x_i
@@ -95557,6 +95579,7 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Rule #9: bind the previous layer's output once, not per cell.
   Prev := FPrevLayer.Output;
   // Per square pooling window W and channel:
@@ -95919,6 +95942,7 @@ var
   Input: TNNetVolume;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Input := FPrevLayer.Output;
   OutMaxX := FOutput.SizeX - 1;
   OutMaxY := FOutput.SizeY - 1;
@@ -96065,6 +96089,7 @@ var
   Pos, RowStride: integer;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Output.Fill(0);
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
@@ -99284,6 +99309,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
 
   if FPadding > 0
     then FInputCopy.CopyPadding(FPrevLayer.Output, FPadding)
