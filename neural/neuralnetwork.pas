@@ -934,13 +934,20 @@ type
   end;
 
   {$IFDEF FPC}
-  TNNetLayerList = specialize TFPGObjectList<TNNetLayer>;
+
+  { TNNetLayerList }
+
+  TNNetLayerList = class (specialize TFPGObjectList<TNNetLayer>)
+    public
+      procedure ForceOutputOnRAM();
+  end;
   {$ELSE}
   TNNetLayerList = class (TNNetList)
     private
       function GetItem(Index: Integer): TNNetLayer; inline;
       procedure SetItem(Index: Integer; AObject: TNNetLayer); inline;
     public
+      procedure ForceOutputOnRAM();
       property Items[Index: Integer]: TNNetLayer read GetItem write SetItem; default;
   end;
   {$ENDIF}
@@ -74414,6 +74421,24 @@ begin
   FDotCL.PrepareForComputeInt8(@Inter[0], FQuantTable.ScalePtr, NumAs,
     FQuantVectorSize, VBs);
 end;
+
+{ TNNetLayerList }
+
+procedure TNNetLayerList.ForceOutputOnRAM();
+var
+  MaxLayer: integer;
+  CntLayer: integer;
+begin
+  MaxLayer := Count - 1;
+  if MaxLayer >=0 then
+  begin
+    for CntLayer := 0 to MaxLayer do
+    begin
+      Self[CntLayer].ForceOutputOnRAM();
+    end;
+  end;
+end;
+
 {$ENDIF}
 
 { TNNetReLU }
@@ -74596,6 +74621,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  FPrevLayerList.ForceOutputOnRAM();
   FOutput.Copy(FPrevOutput[0]);
   if FPrevOutput.Count > 1 then
   begin
@@ -74705,6 +74731,7 @@ var
   OutPtr, FeatPtr, GammaPtr, BetaPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  FPrevLayerList.ForceOutputOnRAM();
   Feature := FPrevOutput[0];
   Cond    := FPrevOutput[1];
   // Out[x,y,c] = gamma[c]*input0[x,y,c] + beta[c]; gamma/beta broadcast over XY.
@@ -74851,6 +74878,7 @@ var
   B1, B2, Skip: TNNetVolume;
 begin
   StartTime := Now();
+  FPrevLayerList.ForceOutputOnRAM();
   B1   := FPrevOutput[0];
   B2   := FPrevOutput[1];
   Skip := FPrevOutput[2];
@@ -74968,6 +74996,7 @@ var
   bl, Alpha: TNeuralFloat;
 begin
   StartTime := Now();
+  FPrevLayerList.ForceOutputOnRAM();
   B    := FPrevOutput[0];
   Skip := FPrevOutput[1];
   if FEnabled then
@@ -92935,6 +92964,7 @@ var
   RowSize, RowSizeBytes: integer;
 begin
   StartTime := Now();
+  FPrevLayerList.ForceOutputOnRAM();
   MaxX := Output.SizeX - 1;
   MaxY := Output.SizeY - 1;
   MaxDepth := Output.Depth - 1;
@@ -96478,6 +96508,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  FPrevLayerList.ForceOutputOnRAM();
   FPrevOutput.ConcatInto(FOutput);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
