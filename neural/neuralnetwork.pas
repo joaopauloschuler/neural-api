@@ -99752,7 +99752,6 @@ var
   BiasVol: TNNetVolume;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  FOutputOnOpenCL := false;
   // Int8-quantized: the FP32 concatenated weights this body uploads do not
   // exist; the resident-code twin does the whole forward. WillOpenCL only
   // routes here when the int8 buffers are armed (FDotCL.Int8Ready).
@@ -99810,14 +99809,16 @@ begin
   if ActivationFunctionInOpenCL then
   begin
     FOutputOnOpenCL := true;
+    FOutputOnRAM := false;
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
-    FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
+    // FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta()); // there is no need to run this anymore
   end
   else
   begin
+    FOutputOnOpenCL := false;
+    FOutputOnRAM := true;
     FDotCL.FinishAndLoadResult(FOutputRaw, GetDotCLWaitBeta());
-
     if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
     ApplyActivationFunctionToOutput();
   end;
@@ -99854,14 +99855,16 @@ begin
   if ActivationFunctionInOpenCL then
   begin
     FOutputOnOpenCL := true;
+    FOutputOnRAM := false;
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
-    FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
+    // FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta()); // there is no need to run this anymore
   end
   else
   begin
     FDotCL.FinishAndLoadResult(FOutputRaw, GetDotCLWaitBeta());
-
+    FOutputOnOpenCL := false;
+    FOutputOnRAM := true;
     if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
     ApplyActivationFunctionToOutput();
   end;
@@ -102137,7 +102140,6 @@ var
   BiasVol: TNNetVolume;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  FOutputOnOpenCL := false;
   if FShouldInterleaveWeights then
   begin
     if FConcatedWInter.Size < FNeurons[0].Weights.Size * FNeurons.Count then
@@ -102170,9 +102172,10 @@ begin
   if ActivationFunctionInOpenCL then
   begin
     FOutputOnOpenCL := true;
+    FOutputOnRAM := false;
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
-    FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
+    // FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta()); // there is no need to run this anymore
   end
   else
   begin
@@ -102189,7 +102192,8 @@ begin
     end;
     {$ENDIF}
     FDotCL.FinishAndLoadResult(FOutputRaw, GetDotCLWaitBeta());
-
+    FOutputOnOpenCL := false;
+    FOutputOnRAM := true;
     if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
     ApplyActivationFunctionToOutput();
   end;
@@ -102209,7 +102213,6 @@ var
   BiasVol: TNNetVolume;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  FOutputOnOpenCL := false;
   ActivationFunctionInOpenCL := IsActivationFunctionInOpenCL(ActOpcode);
 
   if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
@@ -102220,14 +102223,16 @@ begin
   if ActivationFunctionInOpenCL then
   begin
     FOutputOnOpenCL := true;
+    FOutputOnRAM := false;
     // Device already applied the bias-add and activation: load straight into
     // FOutput and skip both the host bias-add and the host activation sweep.
-    FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta());
+    // FDotCL.FinishAndLoadResult(FOutput, GetDotCLWaitBeta()); there is no need to run this anymore
   end
   else
   begin
     FDotCL.FinishAndLoadResult(FOutputRaw, GetDotCLWaitBeta());
-
+    FOutputOnOpenCL := false;
+    FOutputOnRAM := true;
     if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
     ApplyActivationFunctionToOutput();
   end;
