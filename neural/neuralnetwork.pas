@@ -353,15 +353,6 @@ type
       // reached for a wkChunk item, which the scheduler emits only for
       // chunk-eligible layers). Coded by Claude (AI).
       procedure ComputeRange(StartRange, FinRange: integer); virtual;
-      // Per-forward prep a chunk-eligible layer needs BEFORE its chunks run.
-      // Chunk-eligible layers are dispatched straight to ComputeRange and never
-      // call Compute() on a parallel pass, so any per-forward input transform
-      // Compute() would do (a convolution's padding copy + im2col into
-      // FInputPrepared) must be done here instead - ONCE, single-threaded,
-      // before any wkChunk of this layer is enqueued (SchedEnqueueReady). Default
-      // no-op: layers whose ComputeRange reads FPrevLayer.Output directly
-      // (FullConnect) need nothing. Coded by Claude (AI).
-      procedure PrepareChunkedForward(); virtual;
     public
       // Total size of the ComputeRange index space, i.e. ComputeRange is valid
       // over [0 .. ChunkWorkCount-1]. The scheduler splits this span into
@@ -532,6 +523,15 @@ type
       // gate, but leaves the deriv buffer untouched so trainable builds don't
       // pay for an unused buffer.
       procedure SetOutputErrorSizeNoDeriv(Original: TNNetVolume); // Coded by Claude (AI).
+      // Per-forward prep a chunk-eligible layer needs BEFORE its chunks run.
+      // Chunk-eligible layers are dispatched straight to ComputeRange and never
+      // call Compute() on a parallel pass, so any per-forward input transform
+      // Compute() would do (a convolution's padding copy + im2col into
+      // FInputPrepared) must be done here instead - ONCE, single-threaded,
+      // before any wkChunk of this layer is enqueued (SchedEnqueueReady). Default
+      // no-op: layers whose ComputeRange reads FPrevLayer.Output directly
+      // (FullConnect) need nothing. Coded by Claude (AI).
+      procedure PrepareChunkedForward(); virtual;
     public
       // Fast (array) mirror of the FNeurons list: same TNNetNeuron references,
       // indexed directly without the TNNetNeuronList method/bounds overhead.
@@ -33289,6 +33289,7 @@ end;
 
 procedure TNNetFusedSDPA.PrepareChunkedForward();
 begin
+  ForceOutputOnRAM();
   FChunkPrecomputed := false;
   if not FCacheEnabled then exit; // prefill chunks need no shared prep
   if (FEvictSinks > 0) and (FPrevLayer.FOutput.SizeX > 1) then
@@ -44649,6 +44650,7 @@ var
 begin
   // Compute() rebuilds FTheta lazily; on the chunk path that build must happen
   // here - once, single-threaded, before any wkChunk of this layer runs.
+  ForceOutputOnRAM();
   Depth := FPrevLayer.FOutput.Depth;
   if Length(FTheta) <> (Depth div 2) then BuildThetaCache(Depth);
 end;
@@ -58702,6 +58704,7 @@ begin
   // where the serial paths do this). Coded by Claude (AI).
   // The tap-major tables must likewise be built HERE: single-threaded and
   // before any chunk is published, so every worker reads a finished table.
+  ForceOutputOnRAM();
   PrepareTapTables();
   if FDecodeEnabled then Inc(FDecodeSteps, FPrevLayer.FOutput.SizeX);
 end;
@@ -66629,6 +66632,7 @@ end;
 
 procedure TNNetGatedDeltaNet.PrepareChunkedForward();
 begin
+  ForceOutputOnRAM();
   // Once per forward (the chunk path never calls Compute, where the serial
   // path does this). Coded by Claude (AI).
   if FDecodeEnabled then Inc(FDecodeSteps, FOutput.SizeX);
@@ -98367,6 +98371,7 @@ end;
 
 procedure TNNetMoEExpertBankGateUp.PrepareChunkedForward();
 begin
+  ForceOutputOnRAM();
   // The chunk path never calls Compute, so the routing decision every chunk
   // reads is built here: once, single-threaded, before any chunk is published.
   PrepareForward();
@@ -98597,6 +98602,7 @@ end;
 
 procedure TNNetMoEExpertBankDown.PrepareChunkedForward();
 begin
+  ForceOutputOnRAM();
   // The chunk path never calls Compute; only the neuron array needs building,
   // since every chunk reads the gate|up bank's already-finished slot map.
   if FBank = nil then exit;
@@ -100531,6 +100537,7 @@ end;
 
 procedure TNNetConvolution.PrepareChunkedForward();
 begin
+  ForceOutputOnRAM();
   // Parallel chunk path: the scheduler dispatches this layer's wkChunk items
   // straight to ComputeRange and never calls Compute(), so the per-forward input
   // prep must happen here, once, before any chunk runs. Chunk-eligible convs are
@@ -102101,6 +102108,7 @@ end;
 
 procedure TNNetFullConnect.PrepareChunkedForward();
 begin
+  ForceOutputOnRAM();
   if High(FArrNeurons) < FNeurons.Count - 1 then BuildArrNeurons();
 end;
 
@@ -126630,6 +126638,11 @@ begin
     else FOutputError.ReSize(1, 1, 1);
 end;
 
+procedure TNNetLayer.PrepareChunkedForward();
+begin
+  ForceOutputOnRAM();
+end;
+
 procedure TNNetLayer.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   FPrevLayer := pPrevLayer;
@@ -127433,11 +127446,6 @@ begin
   // WillThread override has no matching ComputeRange.
   raise Exception.Create(ClassName +
     '.ComputeRange is not implemented (WillThread/ComputeRange mismatch).');
-end;
-
-procedure TNNetLayerThreading.PrepareChunkedForward();
-begin
-  // Default: nothing to prepare (ComputeRange reads pass-stable inputs directly).
 end;
 
 function TNNetLayerThreading.ChunkWorkCount(): integer;
