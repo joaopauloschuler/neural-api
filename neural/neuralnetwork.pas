@@ -21822,6 +21822,8 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FA) then FA.ForceOutputOnRAM();
+  if Assigned(FB) then FB.ForceOutputOnRAM();
   FOutput.DotProductsPointwise(FA.Output, FB.Output, FNoForward);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -32539,6 +32541,7 @@ var
   HasSeg: boolean;
 begin
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FSegLayer) then FSegLayer.ForceOutputOnRAM();
   if FCacheEnabled then
   begin
     ComputeIncremental();
@@ -35578,6 +35581,7 @@ var
   OutPtr, QiPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FKVLayer) then FKVLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   // Offload to the device when OpenCL is enabled and the query sequence is long
   // enough to amortize the per-forward upload/dispatch.
@@ -35788,6 +35792,7 @@ var
 begin
   StartTime := Now();
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FLogitLayer) then FLogitLayer.ForceOutputOnRAM();
   H := FPrevLayer.FOutput;
   E := FLogitLayer.FOutput;
   T := H.SizeX;
@@ -36917,6 +36922,7 @@ var
 begin
   StartTime := Now();
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FThetaLayer) then FThetaLayer.ForceOutputOnRAM();
   Src := FPrevLayer.FOutput;
   Theta := FThetaLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
@@ -37251,6 +37257,7 @@ var
 begin
   StartTime := Now();
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FGridLayer) then FGridLayer.ForceOutputOnRAM();
   Src := FPrevLayer.FOutput;
   Grid := FGridLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
@@ -37602,6 +37609,7 @@ var
 begin
   StartTime := Now();
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FFlowLayer) then FFlowLayer.ForceOutputOnRAM();
   Src := FPrevLayer.FOutput;
   Flow := FFlowLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
@@ -37906,6 +37914,7 @@ var
 begin
   StartTime := Now();
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FFlowLayer) then FFlowLayer.ForceOutputOnRAM();
   Src := FPrevLayer.FOutput;
   Flow := FFlowLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
@@ -38270,6 +38279,7 @@ const
   csCorrVolOpenCLMinPositions = 16;
 begin
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FF2Layer) then FF2Layer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   if FHasOpenCL and FShouldOpenCL and Assigned(FDotCL) and
      (FPrevLayer.FOutput.SizeX * FPrevLayer.FOutput.SizeY
@@ -38398,6 +38408,7 @@ var
 begin
   StartTime := Now();
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FFlowLayer) then FFlowLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   // The whole (W*H*(2r+1)^2) window sampling is embarrassingly parallel: one
   // bilinear scalar lookup per output element. Offload to the shared gather
@@ -39906,6 +39917,7 @@ var
 begin
   StartTime := Now();
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FWeightsLayer) then FWeightsLayer.ForceOutputOnRAM();
   X := FPrevLayer.FOutput;
   Wgt := FWeightsLayer.FOutput;
   DoutM1 := FDout - 1;
@@ -40062,6 +40074,7 @@ var
 begin
   StartTime := Now();
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FWeightsLayer) then FWeightsLayer.ForceOutputOnRAM();
   X := FPrevLayer.FOutput;
   Wgt := FWeightsLayer.FOutput;
   BiasBase := FOutChannels * FFeatureSize * FFeatureSize * FInChannels;
@@ -40301,6 +40314,7 @@ const
 begin
   StartTime := Now();
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FStyleLayer) then FStyleLayer.ForceOutputOnRAM();
   X := FPrevLayer.FOutput;
   Style := FStyleLayer.FOutput;
   pad := FFeatureSize shr 1; // #15: div 2, dimension is non-negative
@@ -50445,6 +50459,7 @@ var
   ColIn, ColNorm, ColOut, MeanPtr, InvStdPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FStyleLayer) then FStyleLayer.ForceOutputOnRAM();
   // inherited Compute copies the content layer output into FOutput.
   inherited Compute;
   ContentOut := FContentLayer.Output;
@@ -61344,6 +61359,7 @@ end;
 procedure TNNetCrossWKV.Compute();
 begin
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FKVLayer) then FKVLayer.ForceOutputOnRAM();
   if FAsymmetric then ComputeAsym() else ComputeSym();
 end;
 
@@ -98707,6 +98723,7 @@ end;
 procedure TNNetMoEExpertBankGateUp.PrepareChunkedForward();
 begin
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  if Assigned(FGateLayer) then FGateLayer.ForceOutputOnRAM();
   // The chunk path never calls Compute, so the routing decision every chunk
   // reads is built here: once, single-threaded, before any chunk is published.
   PrepareForward();
