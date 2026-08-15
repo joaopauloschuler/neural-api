@@ -22414,6 +22414,7 @@ const
   // kernel launch + upload cost outweighs the small symmetric matmul.
   csGramOpenCLMinC = 16;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   if FHasOpenCL and (FShouldOpenCL or FForceOpenCL) and
      (FPrevLayer.FOutput.Depth >= csGramOpenCLMinC) and
@@ -25079,6 +25080,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   if WillOpenCL() then
   begin
@@ -29825,6 +29827,7 @@ var
 
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Identity passthrough, then transform nu/alpha/beta channels in place;
   // gamma channel is left linear.
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
@@ -30127,6 +30130,7 @@ var
 
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Identity passthrough, then map each raw channel to alpha = 1 + softplus.
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   Kc := FStruct[0];
@@ -30516,6 +30520,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   // Device forward for the per-depth-column mode (axis 0): the cai_l2norm_perdepth
   // kernel reduces each (x,y) position's depth run and scales by rsqrt(sum+eps),
@@ -32533,6 +32538,7 @@ var
   SegI: integer;
   HasSeg: boolean;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if FCacheEnabled then
   begin
     ComputeIncremental();
@@ -33328,6 +33334,7 @@ procedure TNNetFusedSDPA.Compute();
 var
   StartTime: double;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if FCacheEnabled then
   begin
     ComputeIncrementalFused();
@@ -35570,6 +35577,7 @@ var
   Q, KV: TNNetVolume;
   OutPtr, QiPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   // Offload to the device when OpenCL is enabled and the query sequence is long
   // enough to amortize the per-forward upload/dispatch.
@@ -35779,6 +35787,7 @@ var
   MaxE, SumExp, ex, a, mu, m2, hv, varc, ahv: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   H := FPrevLayer.FOutput;
   E := FLogitLayer.FOutput;
   T := H.SizeX;
@@ -36907,6 +36916,7 @@ var
   OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Src := FPrevLayer.FOutput;
   Theta := FThetaLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
@@ -37240,6 +37250,7 @@ var
   BorderPad: boolean;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Src := FPrevLayer.FOutput;
   Grid := FGridLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
@@ -37590,6 +37601,7 @@ var
   OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Src := FPrevLayer.FOutput;
   Flow := FFlowLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
@@ -37893,6 +37905,7 @@ var
   OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Src := FPrevLayer.FOutput;
   Flow := FFlowLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
@@ -38256,6 +38269,7 @@ const
   // OpenCL; below this the kernel launch + upload cost outweighs the matmul.
   csCorrVolOpenCLMinPositions = 16;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   if FHasOpenCL and FShouldOpenCL and Assigned(FDotCL) and
      (FPrevLayer.FOutput.SizeX * FPrevLayer.FOutput.SizeY
@@ -38383,6 +38397,7 @@ var
 
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   // The whole (W*H*(2r+1)^2) window sampling is embarrassingly parallel: one
   // bilinear scalar lookup per output element. Offload to the shared gather
@@ -39022,6 +39037,7 @@ const
   // kernel launch + upload cost outweighs the two small matmuls.
   csLinAttnOpenCLMinSeqLen = 16;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   if FHasOpenCL and FShouldOpenCL and
      (FPrevLayer.FOutput.SizeX >= csLinAttnOpenCLMinSeqLen) then
@@ -39889,6 +39905,7 @@ var
   Acc: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   X := FPrevLayer.FOutput;
   Wgt := FWeightsLayer.FOutput;
   DoutM1 := FDout - 1;
@@ -40044,6 +40061,7 @@ var
   Acc: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   X := FPrevLayer.FOutput;
   Wgt := FWeightsLayer.FOutput;
   BiasBase := FOutChannels * FFeatureSize * FFeatureSize * FInChannels;
@@ -40282,6 +40300,7 @@ const
   cDemodEps = 1e-8;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   X := FPrevLayer.FOutput;
   Style := FStyleLayer.FOutput;
   pad := FFeatureSize shr 1; // #15: div 2, dimension is non-negative
@@ -40568,6 +40587,7 @@ var
   Prev: TNNetVolume;
   OutPtr, QnPtr, QPtr, KPtr, KnPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   // Prefill matmuls on the device when OpenCL is enabled and the sequence is
   // long enough to amortize the upload/dispatch (mirrors the parent's gate).
@@ -41080,6 +41100,7 @@ var
   OutPtr, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
   Bias: TNeuralFloatArrPtr;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if FCacheEnabled then
   begin
     ComputeIncrementalT5();
@@ -41478,6 +41499,7 @@ var
   OutPtr, Krow, Qrow, QueryPtr, kPtr, AttnRowPtr: TNeuralFloatArrPtr;
   PosK, PosQ: TNNetVolume;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   if FHasOpenCL and FShouldOpenCL and (FPrevLayer.FOutput.SizeX >= 32) then
   begin
@@ -41861,6 +41883,7 @@ var
   OutPtr, Prow, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
   PosT: TNNetVolume;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   if FHasOpenCL and FShouldOpenCL and (FPrevLayer.FOutput.SizeX >= 32) then
   begin
@@ -42197,6 +42220,7 @@ var
   Prev: TNNetVolume;
   OutPtr, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if FCacheEnabled then
   begin
     ComputeIncrementalALiBi();
@@ -44684,6 +44708,7 @@ var
   SeqLen, Depth, HalfD: integer;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   SeqLen := FPrevLayer.FOutput.SizeX;
   Depth := FPrevLayer.FOutput.Depth;
   HalfD := Depth shr 1; // #15: div 2, dimension is non-negative
@@ -50833,6 +50858,7 @@ end;
 
 procedure TNNetByteProcessing.Compute();
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FPrevLayer.Output.ReadAsBits(FByteInput, 0.0);
   FByteLearning.Predict(FByteInput, FByteInput, FByteOutput);
   if FAddSkipConnection then
@@ -51376,6 +51402,7 @@ var
   MaxPos: integer;
   Value: TNeuralFloat;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   MaxPos := FPrevLayer.FOutput.Size - 1;
 
   for PosCnt := 0 to MaxPos do
@@ -57990,6 +58017,7 @@ var
   mix, one_minus_mix, xt, xtm1: TNeuralFloat;
   W: TNNetVolume;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if FDecodeEnabled then
   begin
     ComputeIncremental();
@@ -58664,6 +58692,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if FDecodeEnabled then
   begin
     // Stateful token-by-token path: the persisted history lives host-side, so
@@ -59380,6 +59409,7 @@ var
   MaxD, MaxT, RowBytes: integer;
   HPtr, TmpPtr, XtPtr, OutPtr, StatePtr, APtr, BPtr, CPtr, EPtr: TNeuralFloatArrPtr;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if FDecodeEnabled then
   begin
     ComputeIncremental();
@@ -60049,6 +60079,7 @@ var
   ww2, qmax2, e3, e4, eq: TNeuralFloat;
   anew, bnew: TNeuralFloat;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if FDecodeEnabled then
   begin
     ComputeIncremental();
@@ -61312,6 +61343,7 @@ end;
 
 procedure TNNetCrossWKV.Compute();
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if FAsymmetric then ComputeAsym() else ComputeSym();
 end;
 
@@ -62832,6 +62864,7 @@ var
   itv, itt, basePrev, baseOut: integer;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   SeqLen := FOutput.SizeX;
   P := FPhaseDim;
@@ -65228,6 +65261,7 @@ var
   XtPtr, OutPtr, HprevPtr: TNeuralFloatArrPtr;
   WiiR, WifR, WigR, WioR, WhiR, WhfR, WhgR, WhoR: TNeuralFloatArrPtr;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   if FHasOpenCL and FShouldOpenCL and
      (FOutput.Depth >= csLSTMOpenCLMinDepth) then
@@ -65639,6 +65673,7 @@ var
   XtPtr, OutPtr, HprevPtr: TNeuralFloatArrPtr;
   WirR, WizR, WinR, WhrR, WhzR, WhnR: TNeuralFloatArrPtr;
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   if FHasOpenCL and FShouldOpenCL and
      (FOutput.Depth >= csGRUOpenCLMinDepth) then
@@ -66685,6 +66720,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ComputeCPURange(0, FNumKHeads - 1);
   if FDecodeEnabled then Inc(FDecodeSteps, FOutput.SizeX);
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -69494,6 +69530,7 @@ end;
 
 procedure TNNetSelectiveSSM.Compute();
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if FDecodeEnabled then
   begin
     ComputeIncremental();
@@ -71462,6 +71499,7 @@ end;
 
 procedure TNNetSigmoid.Compute();
 begin
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   // Forward-only device path (gated off in production - see WillOpenCL). It
   // writes FOutput directly; FOutputRaw (read only by the CPU backward) is left
