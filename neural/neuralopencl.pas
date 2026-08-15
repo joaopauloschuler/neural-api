@@ -82,12 +82,15 @@ type
     FContext: cl_context;        // OpenCL compute context
     FCommands: cl_command_queue; // OpenCL compute command queue
     FProg: cl_program;           // OpenCL compute program
-    // When true the context/command-queue/program above are BORROWED from
-    // another TEasyOpenCL (the shared dot-product kernel) and must NOT be
-    // released by this instance. Set by TNeuralKernel.CreateFromProgram so a
-    // helper kernel can bind the already-compiled neural.cl program instead of
-    // recompiling it per layer. (Coded by Claude (AI).)
+    // When true the context/program above are BORROWED from another
+    // TEasyOpenCL (the shared dot-product kernel) and must NOT be released by
+    // this instance. Set by TNeuralKernel.CreateFromProgram so a helper kernel
+    // can bind the already-compiled neural.cl program instead of recompiling it
+    // per layer. (Coded by Claude (AI).)
     FBorrowedContext: boolean;
+    // Same for the command queue, which is borrowed independently: a helper
+    // kernel either shares the owner's queue or creates its own.
+    FBorrowedQueue: boolean;
     {$IFDEF FPC}
     FCompilerOptions: string[255];
     {$ELSE}
@@ -1048,11 +1051,13 @@ begin
   // Suppress the per-layer "clCreateKernel ... OK!" chatter by default: a model
   // with many transformer blocks binds the same helper kernel dozens of times.
   if pHideMessages then HideMessages();
-  // Borrow the shared kernel's context/queue/program. FBorrowedContext keeps the
-  // destructor from releasing them (they outlive this helper). No
+  // Borrow the shared kernel's context/program, and its command queue when
+  // pSharedQueue. FBorrowedContext/FBorrowedQueue keep the destructor from
+  // releasing what it does not own (they outlive this helper). No
   // CompileProgramFromFile call here: neural.cl was already built once when the
   // shared dot-product kernel was created.
   FBorrowedContext := true;
+  FBorrowedQueue := pSharedQueue;
   FCurrentPlatform := SharedKernel.CurrentPlatform;
   FCurrentDevice   := SharedKernel.CurrentDevice;
   FContext  := SharedKernel.Context;
@@ -1438,24 +1443,22 @@ end;
 
 procedure TEasyOpenCL.FreeContext();
 begin
-  // A borrowed context and program belong to the shared kernel that compiled
-  // them; releasing them here would tear them out from under every other
-  // borrower, so just drop our references to them. The command queue is created
-  // per kernel, so it is always ours to release below. (Coded by Claude (AI).)
+  // A borrowed context, program or command queue belongs to the shared kernel
+  // that created it; releasing one here would tear it out from under every other
+  // borrower, so those references are only dropped. (Coded by Claude (AI).)
+  if (not FBorrowedQueue) and Assigned(FCommands) then
+    clReleaseCommandQueue(FCommands);
+  FCommands := nil;
   if FBorrowedContext then
   begin
     FProg := nil;
-    if Assigned(FCommands) then clReleaseCommandQueue(FCommands);
-    FCommands := nil;
     FContext := nil;
   end
   else
   begin
     if Assigned(FProg) then clReleaseProgram(FProg);
-    if Assigned(FCommands) then clReleaseCommandQueue(FCommands);
     if Assigned(FContext) then clReleaseContext(FContext);
     FProg := nil;
-    FCommands := nil;
     FContext := nil;
   end;
 end;
@@ -1950,6 +1953,7 @@ begin
   FCommands := nil;       // compute command queue
   FProg := nil;           // compute program
   FBorrowedContext := false;
+  FBorrowedQueue := false;
 end;
 
 destructor TEasyOpenCL.Destroy();
