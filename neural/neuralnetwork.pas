@@ -33289,7 +33289,7 @@ end;
 
 procedure TNNetFusedSDPA.PrepareChunkedForward();
 begin
-  ForceOutputOnRAM();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FChunkPrecomputed := false;
   if not FCacheEnabled then exit; // prefill chunks need no shared prep
   if (FEvictSinks > 0) and (FPrevLayer.FOutput.SizeX > 1) then
@@ -44650,7 +44650,7 @@ var
 begin
   // Compute() rebuilds FTheta lazily; on the chunk path that build must happen
   // here - once, single-threaded, before any wkChunk of this layer runs.
-  ForceOutputOnRAM();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Depth := FPrevLayer.FOutput.Depth;
   if Length(FTheta) <> (Depth div 2) then BuildThetaCache(Depth);
 end;
@@ -58704,7 +58704,7 @@ begin
   // where the serial paths do this). Coded by Claude (AI).
   // The tap-major tables must likewise be built HERE: single-threaded and
   // before any chunk is published, so every worker reads a finished table.
-  ForceOutputOnRAM();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   PrepareTapTables();
   if FDecodeEnabled then Inc(FDecodeSteps, FPrevLayer.FOutput.SizeX);
 end;
@@ -66632,7 +66632,7 @@ end;
 
 procedure TNNetGatedDeltaNet.PrepareChunkedForward();
 begin
-  ForceOutputOnRAM();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Once per forward (the chunk path never calls Compute, where the serial
   // path does this). Coded by Claude (AI).
   if FDecodeEnabled then Inc(FDecodeSteps, FOutput.SizeX);
@@ -98371,7 +98371,7 @@ end;
 
 procedure TNNetMoEExpertBankGateUp.PrepareChunkedForward();
 begin
-  ForceOutputOnRAM();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // The chunk path never calls Compute, so the routing decision every chunk
   // reads is built here: once, single-threaded, before any chunk is published.
   PrepareForward();
@@ -98602,7 +98602,7 @@ end;
 
 procedure TNNetMoEExpertBankDown.PrepareChunkedForward();
 begin
-  ForceOutputOnRAM();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // The chunk path never calls Compute; only the neuron array needs building,
   // since every chunk reads the gate|up bank's already-finished slot map.
   if FBank = nil then exit;
@@ -100537,7 +100537,7 @@ end;
 
 procedure TNNetConvolution.PrepareChunkedForward();
 begin
-  ForceOutputOnRAM();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Parallel chunk path: the scheduler dispatches this layer's wkChunk items
   // straight to ComputeRange and never calls Compute(), so the per-forward input
   // prep must happen here, once, before any chunk runs. Chunk-eligible convs are
@@ -102108,7 +102108,7 @@ end;
 
 procedure TNNetFullConnect.PrepareChunkedForward();
 begin
-  ForceOutputOnRAM();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if High(FArrNeurons) < FNeurons.Count - 1 then BuildArrNeurons();
 end;
 
@@ -126640,7 +126640,7 @@ end;
 
 procedure TNNetLayer.PrepareChunkedForward();
 begin
-  ForceOutputOnRAM();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
 end;
 
 procedure TNNetLayer.SetPrevLayer(pPrevLayer: TNNetLayer);
