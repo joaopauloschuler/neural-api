@@ -124934,8 +124934,8 @@ begin
      (not Assigned(FDotProductKernel.Prog)) then
   begin
     FErrorProc('EnableOpenCL: OpenCL program unavailable (neural.cl not found or ' +
-      'failed to build) - staying on CPU. Run from a directory where ' +
-      'neural/neural.cl is reachable.');
+      'failed to build) - staying on CPU. Keep neural/neural.cl reachable from ' +
+      'the current directory or from the directory holding the binary.');
     FreeAndNil(FDotProductKernel);
     exit;
   end;

@@ -957,9 +957,57 @@ begin
   FKernel := nil;
 end;
 
+// Locates neural.cl, returning '' when no candidate exists. The same relative
+// candidates are tried twice: first against the current directory, then against
+// the directory holding the running binary. The executable-relative pass is what
+// lets a program be started from anywhere - the test suite run from the repo
+// root, or an example launched by an IDE with its own working directory - since
+// otherwise the kernel silently fails to build and every offload returns
+// garbage. (Coded by Claude (AI).)
+function FindNeuralKernelSource(): string;
+const
+  // Ordered from the deepest example directory outwards, matching where the
+  // binaries this library builds actually sit relative to neural/.
+  Candidates: array[0..5] of string = (
+    '../../../neural/neural.cl',
+    'neural.cl',
+    'neural-api/neural/neural.cl',
+    '../neural/neural.cl',
+    '../../neural/neural.cl',
+    'neural/neural.cl'
+  );
+var
+  I: integer;
+  ExePath: string;
+begin
+  for I := Low(Candidates) to High(Candidates) do
+  begin
+    if FileExists(Candidates[I]) then
+    begin
+      Result := Candidates[I];
+      exit;
+    end;
+  end;
+  ExePath := ExtractFilePath(ParamStr(0));
+  if ExePath <> '' then
+  begin
+    for I := Low(Candidates) to High(Candidates) do
+    begin
+      if FileExists(ExePath + Candidates[I]) then
+      begin
+        Result := ExePath + Candidates[I];
+        exit;
+      end;
+    end;
+  end;
+  Result := '';
+end;
+
 constructor TNeuralKernel.Create(pCurrentPlatform: cl_platform_id;
   pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product';
   pHideMessages: boolean = false);
+var
+  KernelSource: string;
 begin
   inherited Create();
   // Optionally suppress the routine "clCreateContext/clBuildProgram/
@@ -975,29 +1023,10 @@ begin
   SetCurrentDevice(pCurrentDevice);
 
   // Create the OpenCL Kernel Here:
-  if FileExists('../../../neural/neural.cl') then
+  KernelSource := FindNeuralKernelSource();
+  if KernelSource <> '' then
   begin
-    CompileProgramFromFile('../../../neural/neural.cl');
-  end
-  else if FileExists('neural.cl') then
-  begin
-    CompileProgramFromFile('neural.cl');
-  end
-  else if FileExists('neural-api/neural/neural.cl') then
-  begin
-    CompileProgramFromFile('neural-api/neural/neural.cl');
-  end
-  // Repo-relative fallback: the test suite (and other tools) run from the
-  // sibling tests/ or examples/<x>/ directory, where the kernel source sits one
-  // or two levels up under neural/. Without this the kernel silently fails to
-  // build and the offload returns garbage.
-  else if FileExists('../neural/neural.cl') then
-  begin
-    CompileProgramFromFile('../neural/neural.cl');
-  end
-  else if FileExists('../../neural/neural.cl') then
-  begin
-    CompileProgramFromFile('../../neural/neural.cl');
+    CompileProgramFromFile(KernelSource);
   end
   else
   begin
