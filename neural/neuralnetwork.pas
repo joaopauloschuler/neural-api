@@ -100602,6 +100602,7 @@ begin
     else
     begin
       FOutputOnOpenCL := false;
+      FOutputOnRAM := true;
       Inc(FForwardCPUCnt);
       ComputeOnCPU;
     end;
@@ -101938,6 +101939,7 @@ begin
       else
       begin
         FOutputOnOpenCL := false;
+        FOutputOnRam := true;
         Inc(FForwardCPUCnt);
         ComputeQuantizedInt8CPU();
       end;
@@ -101973,6 +101975,7 @@ begin
     else
     begin
       FOutputOnOpenCL := false;
+      FOutputOnRam := true;
       Inc(FForwardCPUCnt);
       ComputeCPU();
     end;
@@ -123398,6 +123401,9 @@ begin
       if Parallel
         then ComputeParallel(FromLayerIdx)
         else ComputeSerial(FromLayerIdx);
+      {$IFDEF OpenCL}
+      GetLastLayer().ForceOutputOnRAM();
+      {$ENDIF}
     end else
     begin
       FErrorProc
