@@ -74421,9 +74421,9 @@ begin
   FDotCL.PrepareForComputeInt8(@Inter[0], FQuantTable.ScalePtr, NumAs,
     FQuantVectorSize, VBs);
 end;
+{$ENDIF}
 
 { TNNetLayerList }
-
 procedure TNNetLayerList.ForceOutputOnRAM();
 var
   MaxLayer: integer;
@@ -74438,8 +74438,6 @@ begin
     end;
   end;
 end;
-
-{$ENDIF}
 
 { TNNetReLU }
 constructor TNNetReLU.Create();
