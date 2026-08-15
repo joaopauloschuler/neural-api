@@ -39738,6 +39738,7 @@ begin
       IntToStr(Length(Config.LayerWeights)) + ' entries, expected ' +
       IntToStr(NumStates) + '.');
   NumStatesM1 := NumStates - 1;
+  for s := 0 to NumStatesM1 do HiddenStateLayers[s].ForceOutputOnRAM();
   EncLen := HiddenStateLayers[0].Output.SizeX;
   Hidden := HiddenStateLayers[0].Output.Depth;
   EncLenM1 := EncLen - 1;

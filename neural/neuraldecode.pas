@@ -7229,9 +7229,15 @@ begin
       //     Only consulted when ExitLayer is strictly below the head input.
       if (Confidence <= 1.0) and (ResolvedExit < HeadInIdx) then
       begin
+        // Both sides of the splice must be host-resident: the source before it
+        // is read, the destination before it is overwritten (otherwise the
+        // head's own sync pulls the device copy back over the splice).
+        NN.Layers[ResolvedExit].ForceOutputOnRAM();
+        NN.Layers[HeadInIdx].ForceOutputOnRAM();
         ExitSnap.Copy(NN.Layers[ResolvedExit].Output);
         NN.Layers[HeadInIdx].Output.CopyNoChecks(ExitSnap);
         for I := HeadIdx to LastLayer do NN.Layers[I].Compute();
+        NN.GetLastLayer().ForceOutputOnRAM();
         ExitOut := NN.GetLastLayer().Output;  // invariant across the scan (#8)
         Total := ExitOut.GetSum();
         if Total <= 0 then Total := 1.0;
@@ -7447,9 +7453,12 @@ begin
         for C := 0 to NumCandM1 do
         begin
           L := Cands[C];
+          NN.Layers[L].ForceOutputOnRAM();
+          NN.Layers[HeadInIdx].ForceOutputOnRAM();
           CandSnap.Copy(NN.Layers[L].Output);
           NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
           for I := HeadIdx to LastLayer do NN.Layers[I].Compute();
+          NN.GetLastLayer().ForceOutputOnRAM();
           LensOut := NN.GetLastLayer().Output;  // invariant across the loop (#8)
           Total := LensOut.GetSum();
           if Total <= 0 then Total := 1.0;
@@ -7478,9 +7487,12 @@ begin
           end;
         end;
         // Recompute the chosen premature layer's distribution into PLens.
+        NN.Layers[BestLayer].ForceOutputOnRAM();
+        NN.Layers[HeadInIdx].ForceOutputOnRAM();
         CandSnap.Copy(NN.Layers[BestLayer].Output);
         NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
         for I := HeadIdx to LastLayer do NN.Layers[I].Compute();
+        NN.GetLastLayer().ForceOutputOnRAM();
         LensOut := NN.GetLastLayer().Output;  // invariant across the loop (#8)
         Total := LensOut.GetSum();
         if Total <= 0 then Total := 1.0;

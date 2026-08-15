@@ -496,7 +496,6 @@ type
       FOpenCLDeviceTag: cl_device_id; // device the buffers live on (for same-device checks)
       function GetDotProductKernel(): TNeuralKernel;
       function GetDotCLWaitBeta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
-      function ForceOutputOnRAM(): boolean;
       procedure MoveOutputToRAM(); virtual;
       {$ENDIF}
 
@@ -790,6 +789,9 @@ type
       function SupportsLowMemory(): boolean; virtual;
       function ActiveLowMemory(): boolean;
       procedure InitDefault(); virtual;
+      // Makes Output host-readable and reports whether it is. Every reader of
+      // Output calls this first. No-op in non-OpenCL builds.
+      function ForceOutputOnRAM(): boolean;
 
       property ActivationFn: TNeuralActivationFunction read FActivationFn write FActivationFn;
       property ActivationFnDerivative: TNeuralActivationFunction read FActivationFnDerivative write FActivationFnDerivative;
@@ -126822,15 +126824,6 @@ begin
   end;
 end;
 
-function TNNetLayer.ForceOutputOnRAM(): boolean;
-begin
-  if FOutputOnOpenCL and not(FOutputOnRAM) then
-  begin
-    MoveOutputToRAM();
-  end;
-  Result := FOutputOnRAM;
-end;
-
 procedure TNNetLayer.MoveOutputToRAM();
 var
   OutputBuffer: cl_mem;
@@ -126881,6 +126874,19 @@ begin
   FHasOpenCL := true;
 end;
 {$ENDIF}
+
+function TNNetLayer.ForceOutputOnRAM(): boolean;
+begin
+  {$IFDEF OpenCL}
+  if FOutputOnOpenCL and not(FOutputOnRAM) then
+  begin
+    MoveOutputToRAM();
+  end;
+  Result := FOutputOnRAM;
+  {$ELSE}
+  Result := true;
+  {$ENDIF}
+end;
 
 procedure TNNetLayer.ComputeL2Decay();
 begin
