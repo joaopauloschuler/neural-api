@@ -58408,6 +58408,7 @@ var
   localNeuron: TNNetNeuron;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   InputDepth := Prev.Depth;
@@ -59150,6 +59151,7 @@ var
   W: TNNetVolume;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   NumFeat := FNeurons.Count;
   MaxFeat := NumFeat - 1;
@@ -59725,6 +59727,7 @@ var
   raw, av, qv, rv, xprev, pprev, xm, pm, gv, zv: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   Wa := FNeurons[0].FWeights;
   Wq := FNeurons[1].FWeights;
@@ -60443,6 +60446,7 @@ var
   hrePrev, himPrev, hreNew, himNew, xt: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   Wnu := FNeurons[0].FWeights;
   Wtheta := FNeurons[1].FWeights;
@@ -60720,6 +60724,7 @@ var
   sp, lam, igl, agl, ig, rg, loga, a, a2, mult, xt, hPrev, hNew: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   WLam := FNeurons[0].FWeights;
   SeqLen := FOutput.SizeX;
@@ -61051,6 +61056,7 @@ var
   xPtr, hPrevPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   // Support a variable sequence length: re-size the per-step caches and output
@@ -61821,6 +61827,7 @@ var
   Nr: TNNetNeuron;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
   Depth := FOutput.Depth;
@@ -62131,6 +62138,7 @@ var
   LU: TNNetVolume;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
   MaxFC := FC - 1;
@@ -62459,6 +62467,7 @@ var
   LogSPtr, BPtr, InPtr, OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Data-dependent init on the first forward (forward map only).
   if (not FInitialised) and (not FInverse) then DataDependentInit();
   SizeX := FOutput.SizeX;
@@ -63243,6 +63252,7 @@ var
   WtRow, WgRow: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   Wt := FNeurons[0].FWeights;
   Bt := FNeurons[1].FWeights;
@@ -63487,6 +63497,7 @@ var
   WzR, WiR, WfR, WoR, RzR, RiR, RfR, RoR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   Wz := FNeurons[0].FWeights; Wi := FNeurons[1].FWeights;
   Wf := FNeurons[2].FWeights; Wo := FNeurons[3].FWeights;
@@ -63860,6 +63871,7 @@ var
   WqR, WkR, WvR, WoR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Wq := FNeurons[0].FWeights; Wk := FNeurons[1].FWeights;
   Wv := FNeurons[2].FWeights; Wo := FNeurons[3].FWeights;
   Wi := FNeurons[4].FWeights; Wf := FNeurons[5].FWeights;
@@ -64273,6 +64285,7 @@ var
   WzR, WhR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   Wz := FNeurons[0].FWeights; Wh := FNeurons[1].FWeights;
   Bz := FNeurons[2].FWeights; Bh := FNeurons[3].FWeights;
@@ -64576,6 +64589,7 @@ var
   XPtr, BankPtr, OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   MaterializeBankIfStale();
   Prev := FPrevLayer.FOutput;
   XPtr := Prev.GetRawPtr(0, 0);
@@ -64824,6 +64838,7 @@ var
   WfR, WiR, WhR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   Wf := FNeurons[0].FWeights; Wi := FNeurons[1].FWeights;
   Wh := FNeurons[2].FWeights; Bf := FNeurons[3].FWeights;
@@ -65899,6 +65914,7 @@ var
   WiR, WfR, WoR, WgR, ZPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   Wi := FNeurons[0].FWeights; Wf := FNeurons[1].FWeights;
   Wo := FNeurons[2].FWeights; Wg := FNeurons[3].FWeights;
@@ -66337,6 +66353,7 @@ var
   WqR, WkR, WvR, PrevSPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Wq := FNeurons[0].FWeights; Wk := FNeurons[1].FWeights;
   Wv := FNeurons[2].FWeights; Wb := FNeurons[3].FWeights;
   SeqLen := FOutput.SizeX;
@@ -67141,6 +67158,7 @@ var
   AbarR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Wout := FNeurons[0].FWeights;
   SeqLen := FOutput.SizeX;
   SeqLenM1 := SeqLen - 1;
@@ -67368,6 +67386,7 @@ var
   WqR, WkR, WvR, WaR, PrevRow: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Wq := FNeurons[0].FWeights; Wk := FNeurons[1].FWeights;
   Wv := FNeurons[2].FWeights; Wa := FNeurons[3].FWeights;
   Ba := FNeurons[4].FWeights;
@@ -67734,6 +67753,7 @@ var
   accK, accE, accA, accB, betaV, kn, dotv, mn, simMax, expSum, wv, ev, av: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   Wk := FNeurons[0].FWeights; Bk := FNeurons[1].FWeights;
   Wb := FNeurons[2].FWeights; Bb := FNeurons[3].FWeights;
@@ -68220,6 +68240,7 @@ var
   ThR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ThK := FNeurons[0].FWeights; ThV := FNeurons[1].FWeights;
   ThQ := FNeurons[2].FWeights;
   SeqLen := FOutput.SizeX; Depth := FDepth; Hd := FHidden;
@@ -68787,6 +68808,7 @@ var
   ThR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   ThK := FNeurons[0].FWeights; ThV := FNeurons[1].FWeights;
   ThQ := FNeurons[2].FWeights;
   EtaR := FNeurons[3].FWeights; ThetaR := FNeurons[4].FWeights;
@@ -70322,6 +70344,7 @@ var
   KeepState: boolean;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   Alog := FNeurons[0].FWeights;
   Dd := FNeurons[1].FWeights;
@@ -70788,6 +70811,7 @@ var
   sum: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   Depth := FOutput.Depth;
   DepthM1 := Depth - 1;
@@ -71058,6 +71082,7 @@ var
   VProjPtr, VmPtr, UPtr, OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.FOutput;
   W := FNeurons[0].FWeights;
   Bias := FNeurons[1].FWeights;
@@ -75326,6 +75351,7 @@ var
   OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.Output;
   MaxX := Prev.SizeX - 1;
   MaxY := Prev.SizeY - 1;
@@ -75405,6 +75431,7 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.Output;
   InSizeX := Prev.SizeX;
   InSizeY := Prev.SizeY;
@@ -75524,6 +75551,7 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.Output;
   InSizeX := Prev.SizeX;
   InSizeY := Prev.SizeY;
@@ -75641,6 +75669,7 @@ var
   OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.Output;
   MaxX := Prev.SizeX - 1;
   MaxY := Prev.SizeY - 1;
@@ -75769,6 +75798,7 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Prev := FPrevLayer.Output;
   MaxX := Prev.SizeX - 1;
   MaxY := Prev.SizeY - 1;
@@ -86011,6 +86041,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   PrevOut := FPrevLayer.FOutput;
   Depth := PrevOut.Depth;
 
@@ -93336,6 +93367,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   MaxX     := FOutput.SizeX - 1;
   MaxY     := FOutput.SizeY - 1;
   // Rule #9: bind the previous layer's output once, above the loops.
@@ -96707,6 +96739,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Len := Min(FOutput.Size, FPrevLayer.FOutput.Size);
   FOutput.Copy(FPrevLayer.FOutput, Len);
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -96758,6 +96791,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Len := Min(FOutput.Size, FPrevLayer.FOutput.Size);
   FOutput.Copy(FPrevLayer.FOutput, Len);
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -96838,6 +96872,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   Len := Min(FOutput.Size, FPrevLayer.FOutput.Size);
   FOutput.Copy(FPrevLayer.FOutput, Len);
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -102949,6 +102984,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   // Device token-gather forward keeps the embedding output resident on the GPU
   // going into the first attention block (forward-only; backward stays on CPU).
@@ -103258,6 +103294,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   PrevOut := FPrevLayer.Output;   // #8: invariant across the token loops
   MaxToken := PrevOut.Size - 1;
   // FOutput is (PrevOut.Size, 1, FEmbeddingSize) and FPositionalEmbedding shares
