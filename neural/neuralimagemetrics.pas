@@ -728,7 +728,7 @@ begin
     raise Exception.CreateFmt(
       'ExtractInceptionFeature: PoolFeatureIdx %d out of range', [PoolFeatureIdx]);
   InceptionNet.Compute(ImageVolume);
-  InceptionNet.Layers[PoolFeatureIdx].ForceOutputOnRAM();
+  {$IFDEF OpenCL} InceptionNet.Layers[PoolFeatureIdx].ForceOutputOnRAM(); {$ENDIF}
   PoolOut := InceptionNet.Layers[PoolFeatureIdx].Output;
   dim := PoolOut.Size;
   SetLength(Result, dim);

@@ -7232,12 +7232,14 @@ begin
         // Both sides of the splice must be host-resident: the source before it
         // is read, the destination before it is overwritten (otherwise the
         // head's own sync pulls the device copy back over the splice).
+        {$IFDEF OpenCL}
         NN.Layers[ResolvedExit].ForceOutputOnRAM();
         NN.Layers[HeadInIdx].ForceOutputOnRAM();
+        {$ENDIF}
         ExitSnap.Copy(NN.Layers[ResolvedExit].Output);
         NN.Layers[HeadInIdx].Output.CopyNoChecks(ExitSnap);
         for I := HeadIdx to LastLayer do NN.Layers[I].Compute();
-        NN.GetLastLayer().ForceOutputOnRAM();
+        {$IFDEF OpenCL} NN.GetLastLayer().ForceOutputOnRAM(); {$ENDIF}
         ExitOut := NN.GetLastLayer().Output;  // invariant across the scan (#8)
         Total := ExitOut.GetSum();
         if Total <= 0 then Total := 1.0;
@@ -7453,12 +7455,14 @@ begin
         for C := 0 to NumCandM1 do
         begin
           L := Cands[C];
+          {$IFDEF OpenCL}
           NN.Layers[L].ForceOutputOnRAM();
           NN.Layers[HeadInIdx].ForceOutputOnRAM();
+          {$ENDIF}
           CandSnap.Copy(NN.Layers[L].Output);
           NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
           for I := HeadIdx to LastLayer do NN.Layers[I].Compute();
-          NN.GetLastLayer().ForceOutputOnRAM();
+          {$IFDEF OpenCL} NN.GetLastLayer().ForceOutputOnRAM(); {$ENDIF}
           LensOut := NN.GetLastLayer().Output;  // invariant across the loop (#8)
           Total := LensOut.GetSum();
           if Total <= 0 then Total := 1.0;
@@ -7487,12 +7491,14 @@ begin
           end;
         end;
         // Recompute the chosen premature layer's distribution into PLens.
+        {$IFDEF OpenCL}
         NN.Layers[BestLayer].ForceOutputOnRAM();
         NN.Layers[HeadInIdx].ForceOutputOnRAM();
+        {$ENDIF}
         CandSnap.Copy(NN.Layers[BestLayer].Output);
         NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
         for I := HeadIdx to LastLayer do NN.Layers[I].Compute();
-        NN.GetLastLayer().ForceOutputOnRAM();
+        {$IFDEF OpenCL} NN.GetLastLayer().ForceOutputOnRAM(); {$ENDIF}
         LensOut := NN.GetLastLayer().Output;  // invariant across the loop (#8)
         Total := LensOut.GetSum();
         if Total <= 0 then Total := 1.0;

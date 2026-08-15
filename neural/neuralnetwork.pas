@@ -21822,8 +21822,10 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  {$IFDEF OpenCL}
   if Assigned(FA) then FA.ForceOutputOnRAM();
   if Assigned(FB) then FB.ForceOutputOnRAM();
+  {$ENDIF}
   FOutput.DotProductsPointwise(FA.Output, FB.Output, FNoForward);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -22261,7 +22263,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   t := FPrevLayer.Output.Raw[0];
   Half := FEmbeddingSize shr 1; // #15: div 2, dimension is non-negative
   HalfM1 := Half - 1;
@@ -22306,7 +22308,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyTransposingYD(FPrevLayer.FOutput);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -22345,7 +22347,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyTransposingXD(FPrevLayer.FOutput);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -22416,7 +22418,7 @@ const
   // kernel launch + upload cost outweighs the small symmetric matmul.
   csGramOpenCLMinC = 16;
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   if FHasOpenCL and (FShouldOpenCL or FForceOpenCL) and
      (FPrevLayer.FOutput.Depth >= csGramOpenCLMinC) and
@@ -22693,7 +22695,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -22911,7 +22913,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
     (FOutput.Size <> FOutputError.Size)
@@ -23028,7 +23030,7 @@ var
   RowBytes, SrcW, SrcH: integer;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
     (FOutput.Size <> FOutputError.Size)
@@ -23140,7 +23142,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -23200,7 +23202,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -23308,7 +23310,7 @@ var
   OutputValue: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -23406,7 +23408,7 @@ var
   OutputValue: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -23460,7 +23462,7 @@ var
   PrevValue, Beta, BetaX, SigmoidValue: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Beta := FFloatSt[0];
@@ -23533,7 +23535,7 @@ var
   HasDeriv: boolean;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   inherited Compute;
   {$IFDEF Debug}
   if FNeurons[0].FWeights.Size <> 1 then
@@ -23666,7 +23668,7 @@ var
   HasDeriv: boolean;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   inherited Compute;
   {$IFDEF Debug}
   if FNeurons[0].FWeights.Size <> 1 then
@@ -23828,7 +23830,7 @@ var
   PrevValue, Alpha, InvSqrt: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Alpha := FFloatSt[0];
@@ -23885,7 +23887,7 @@ var
   PrevValue, Alpha, InvSqrt: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Alpha := FFloatSt[0];
@@ -23940,7 +23942,7 @@ var
   x, s, t, dL: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -24012,7 +24014,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -24148,7 +24150,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -24246,7 +24248,7 @@ var
   PrevValue: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -24299,7 +24301,7 @@ const
   GELU_CONST = 0.044715;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   LocalSize := LocalPrevOutput.Size;
   SizeM1 := LocalSize - 1;
@@ -24378,7 +24380,7 @@ const
   INV_SQRT_2PI = 0.39894228040143268;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   // Two-pass: fill FOutput with x/sqrt(2), vectorize erf in place (Erf),
@@ -24500,7 +24502,7 @@ const
   GELU_CONST = 0.044715;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   HalfDepth := FOutput.Depth;
   {$IFDEF OpenCL}
   // Device forward keeps the FFN activation resident on the GPU between the
@@ -24740,7 +24742,7 @@ const
   INV_SQRT_2 = 0.7071067811865476;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   HalfDepth := FOutput.Depth;
   {$IFDEF OpenCL}
   if WillOpenCL() then
@@ -24941,7 +24943,7 @@ var
   v, best: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   K := FStruct[0];
   KM1 := K - 1;
   OutDepth := FOutput.Depth;
@@ -25082,7 +25084,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   if WillOpenCL() then
   begin
@@ -25279,7 +25281,7 @@ var
   alpha, limit, gate, up, sigmoidVal, glu: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   alpha := FFloatSt[0];
   limit := FFloatSt[1];
   HalfDepth := FOutput.Depth;
@@ -25437,7 +25439,7 @@ var
 {$ENDIF}
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   HalfDepth := FOutput.Depth;
   {$IFDEF OpenCL}
   if WillOpenCL() then
@@ -25600,7 +25602,7 @@ var
 {$ENDIF}
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   HalfDepth := FOutput.Depth;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
@@ -25733,7 +25735,7 @@ var
   mu, logVar, sigma, e: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   HalfDepth := FOutput.Depth;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
@@ -25911,7 +25913,7 @@ var
 {$ENDIF}
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   HalfDepth := FOutput.Depth;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
@@ -26029,7 +26031,7 @@ var
 {$ENDIF}
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   HalfDepth := FOutput.Depth;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
@@ -26143,7 +26145,7 @@ var
   aPtr, bPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   HalfDepth := FPrevLayer.FOutput.Depth shr 1; // #15: div 2, dimension is non-negative
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
@@ -26257,7 +26259,7 @@ var
   MaskValue: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   MaskValue := FFloatSt[0];
   Offset := FStruct[0];
@@ -26372,7 +26374,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   FOutput.Add(FMask);
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -26414,7 +26416,7 @@ var
   MaskValue: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   MaskValue := FFloatSt[0];
   W := FStruct[0];
@@ -26474,7 +26476,7 @@ var
   I, MaxI: integer;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   Step := FFloatSt[0];
   if Step <= 0 then Step := 1.0;
@@ -26546,7 +26548,7 @@ var
   Training: boolean;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.FOutput;
   SizeM1 := LocalPrevOutput.Size - 1;
   QMax := FStruct[0];
@@ -26671,7 +26673,7 @@ var
   X, Y: integer;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
@@ -26716,7 +26718,7 @@ var
   Cap, InvCap, ArgVal, TanhVal, SmallThresh: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.FOutput;
   LocalSize := LocalPrevOutput.Size;
   SizeM1 := LocalSize - 1;
@@ -28607,7 +28609,7 @@ var
   zePtr, wPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Identity copy first so the input z_e is available in FOutput; we then
   // overwrite each position with its nearest codebook vector z_q.
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
@@ -28862,7 +28864,7 @@ var
   Z, T, Bounded: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Identity copy first so pass-through channels (>= D) keep their values; we
   // then overwrite the first D channels with their quantized integer level.
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
@@ -29020,7 +29022,7 @@ var
   Z: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Identity copy first so pass-through channels (>= D) keep their values; the
   // first D channels are then overwritten with their +/-1 sign code.
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
@@ -29485,7 +29487,7 @@ var
   MaxLogit, SumExp, Ex, RawS: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Start from the raw parameter vector (identity passthrough), then transform
   // the mixing logits (softmax) and raw scales (softplus) in place.
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
@@ -29829,7 +29831,7 @@ var
 
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Identity passthrough, then transform nu/alpha/beta channels in place;
   // gamma channel is left linear.
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
@@ -30132,7 +30134,7 @@ var
 
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Identity passthrough, then map each raw channel to alpha = 1 + softplus.
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   Kc := FStruct[0];
@@ -30522,7 +30524,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   // Device forward for the per-depth-column mode (axis 0): the cai_l2norm_perdepth
   // kernel reduces each (x,y) position's depth run and scales by rsqrt(sum+eps),
@@ -31171,7 +31173,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ApplyRealDFT(FPrevLayer.FOutput, FOutput);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -31273,7 +31275,7 @@ var
   MinV, MaxV, Denom, InvDenom, Eps, Xv: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.FOutput;
   Eps := FFloatSt[0];
   if Eps <= 0 then Eps := 1e-7;
@@ -31533,7 +31535,7 @@ const
   Safety = 1e-12;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.FOutput;
   Tau := FFloatSt[0];
   if Tau = 0 then Tau := 1.0;
@@ -31634,7 +31636,7 @@ var
   x, MinV, MaxV: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   MinV := FFloatSt[0];
@@ -32540,8 +32542,10 @@ var
   SegI: integer;
   HasSeg: boolean;
 begin
+  {$IFDEF OpenCL}
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FSegLayer) then FSegLayer.ForceOutputOnRAM();
+  {$ENDIF}
   if FCacheEnabled then
   begin
     ComputeIncremental();
@@ -33337,7 +33341,7 @@ procedure TNNetFusedSDPA.Compute();
 var
   StartTime: double;
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FCacheEnabled then
   begin
     ComputeIncrementalFused();
@@ -33352,7 +33356,7 @@ end;
 
 procedure TNNetFusedSDPA.PrepareChunkedForward();
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FChunkPrecomputed := false;
   if not FCacheEnabled then exit; // prefill chunks need no shared prep
   if (FEvictSinks > 0) and (FPrevLayer.FOutput.SizeX > 1) then
@@ -33639,7 +33643,7 @@ var
   WeightsPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   SeqLenM1 := SeqLen - 1;
@@ -33851,7 +33855,7 @@ var
   XiCur, XiNext, PRowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   X := FNeurons[0].FWeights;
   SeqLen := FOutput.SizeX;
@@ -34121,7 +34125,7 @@ var
   HPtr, OutPtr, ImPtr, XniPtr, A1RowPtr, A2RowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   X := FPrevLayer.FOutput;
   I := FNeurons[0].FWeights;
   SeqLen := FOutput.SizeX;
@@ -34527,7 +34531,7 @@ var
   MaxScore, SumExp, sc, w: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := FOutput.SizeX;
   SeqLenM1 := SeqLen - 1;
@@ -34866,7 +34870,7 @@ var
   OutPtr, SqPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   X := FPrevLayer.FOutput;
   S := FNeurons[0].FWeights;
   SeqLen := X.SizeX;
@@ -35056,7 +35060,7 @@ var
   SeqLen: integer;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   X := FPrevLayer.FOutput;
   P := FNeurons[0].FWeights;
   SeqLen := X.SizeX;
@@ -35225,7 +35229,7 @@ var
   OutPtr, qPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   SeqLenM1 := SeqLen - 1;
@@ -35580,8 +35584,10 @@ var
   Q, KV: TNNetVolume;
   OutPtr, QiPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
+  {$IFDEF OpenCL}
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FKVLayer) then FKVLayer.ForceOutputOnRAM();
+  {$ENDIF}
   {$IFDEF OpenCL}
   // Offload to the device when OpenCL is enabled and the query sequence is long
   // enough to amortize the per-forward upload/dispatch.
@@ -35791,8 +35797,10 @@ var
   MaxE, SumExp, ex, a, mu, m2, hv, varc, ahv: TNeuralFloat;
 begin
   StartTime := Now();
+  {$IFDEF OpenCL}
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FLogitLayer) then FLogitLayer.ForceOutputOnRAM();
+  {$ENDIF}
   H := FPrevLayer.FOutput;
   E := FLogitLayer.FOutput;
   T := H.SizeX;
@@ -36921,8 +36929,10 @@ var
   OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  {$IFDEF OpenCL}
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FThetaLayer) then FThetaLayer.ForceOutputOnRAM();
+  {$ENDIF}
   Src := FPrevLayer.FOutput;
   Theta := FThetaLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
@@ -37256,8 +37266,10 @@ var
   BorderPad: boolean;
 begin
   StartTime := Now();
+  {$IFDEF OpenCL}
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FGridLayer) then FGridLayer.ForceOutputOnRAM();
+  {$ENDIF}
   Src := FPrevLayer.FOutput;
   Grid := FGridLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
@@ -37608,8 +37620,10 @@ var
   OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  {$IFDEF OpenCL}
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FFlowLayer) then FFlowLayer.ForceOutputOnRAM();
+  {$ENDIF}
   Src := FPrevLayer.FOutput;
   Flow := FFlowLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
@@ -37913,8 +37927,10 @@ var
   OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
+  {$IFDEF OpenCL}
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FFlowLayer) then FFlowLayer.ForceOutputOnRAM();
+  {$ENDIF}
   Src := FPrevLayer.FOutput;
   Flow := FFlowLayer.FOutput;
   W := Src.SizeX; H := Src.SizeY; D := Src.Depth;
@@ -38278,8 +38294,10 @@ const
   // OpenCL; below this the kernel launch + upload cost outweighs the matmul.
   csCorrVolOpenCLMinPositions = 16;
 begin
+  {$IFDEF OpenCL}
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FF2Layer) then FF2Layer.ForceOutputOnRAM();
+  {$ENDIF}
   {$IFDEF OpenCL}
   if FHasOpenCL and FShouldOpenCL and Assigned(FDotCL) and
      (FPrevLayer.FOutput.SizeX * FPrevLayer.FOutput.SizeY
@@ -38407,8 +38425,10 @@ var
 
 begin
   StartTime := Now();
+  {$IFDEF OpenCL}
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FFlowLayer) then FFlowLayer.ForceOutputOnRAM();
+  {$ENDIF}
   {$IFDEF OpenCL}
   // The whole (W*H*(2r+1)^2) window sampling is embarrassingly parallel: one
   // bilinear scalar lookup per output element. Offload to the shared gather
@@ -38692,7 +38712,7 @@ var
   zv, qv, hv: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   FHM1 := FH - 1; FWM1 := FW - 1; HiddenCM1 := FHiddenC - 1; InCM1 := FInC - 1;
   // z = sigmoid(Wz*[h;x]+bz); r = sigmoid(Wr*[h;x]+br) over the raw input.
@@ -38806,7 +38826,7 @@ var
   Src: TNNetVolume;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Src := FPrevLayer.FOutput;
   // theta = [ s_x 0 t_x ; 0 s_y t_y ] laid out as [a b c d e f]
   FOutput.FData[0] := Src.FData[0]; // a = s_x
@@ -39048,7 +39068,7 @@ const
   // kernel launch + upload cost outweighs the two small matmuls.
   csLinAttnOpenCLMinSeqLen = 16;
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   if FHasOpenCL and FShouldOpenCL and
      (FPrevLayer.FOutput.SizeX >= csLinAttnOpenCLMinSeqLen) then
@@ -39409,7 +39429,7 @@ var
   SavedExMask: TFPUExceptionMask;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   SeqLenM1 := SeqLen - 1;
@@ -39669,7 +39689,7 @@ var
   Q, K, PhiVal, Den: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   SeqLenM1 := SeqLen - 1;
@@ -39916,8 +39936,10 @@ var
   Acc: TNeuralFloat;
 begin
   StartTime := Now();
+  {$IFDEF OpenCL}
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FWeightsLayer) then FWeightsLayer.ForceOutputOnRAM();
+  {$ENDIF}
   X := FPrevLayer.FOutput;
   Wgt := FWeightsLayer.FOutput;
   DoutM1 := FDout - 1;
@@ -40073,8 +40095,10 @@ var
   Acc: TNeuralFloat;
 begin
   StartTime := Now();
+  {$IFDEF OpenCL}
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FWeightsLayer) then FWeightsLayer.ForceOutputOnRAM();
+  {$ENDIF}
   X := FPrevLayer.FOutput;
   Wgt := FWeightsLayer.FOutput;
   BiasBase := FOutChannels * FFeatureSize * FFeatureSize * FInChannels;
@@ -40313,8 +40337,10 @@ const
   cDemodEps = 1e-8;
 begin
   StartTime := Now();
+  {$IFDEF OpenCL}
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FStyleLayer) then FStyleLayer.ForceOutputOnRAM();
+  {$ENDIF}
   X := FPrevLayer.FOutput;
   Style := FStyleLayer.FOutput;
   pad := FFeatureSize shr 1; // #15: div 2, dimension is non-negative
@@ -40601,7 +40627,7 @@ var
   Prev: TNNetVolume;
   OutPtr, QnPtr, QPtr, KPtr, KnPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   // Prefill matmuls on the device when OpenCL is enabled and the sequence is
   // long enough to amortize the upload/dispatch (mirrors the parent's gate).
@@ -41114,7 +41140,7 @@ var
   OutPtr, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
   Bias: TNeuralFloatArrPtr;
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FCacheEnabled then
   begin
     ComputeIncrementalT5();
@@ -41205,7 +41231,7 @@ var
   Bias: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   SeqLenM1 := SeqLen - 1;
@@ -41513,7 +41539,7 @@ var
   OutPtr, Krow, Qrow, QueryPtr, kPtr, AttnRowPtr: TNeuralFloatArrPtr;
   PosK, PosQ: TNNetVolume;
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   if FHasOpenCL and FShouldOpenCL and (FPrevLayer.FOutput.SizeX >= 32) then
   begin
@@ -41897,7 +41923,7 @@ var
   OutPtr, Prow, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
   PosT: TNNetVolume;
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   if FHasOpenCL and FShouldOpenCL and (FPrevLayer.FOutput.SizeX >= 32) then
   begin
@@ -42234,7 +42260,7 @@ var
   Prev: TNNetVolume;
   OutPtr, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FCacheEnabled then
   begin
     ComputeIncrementalALiBi();
@@ -42442,7 +42468,7 @@ var
   OutPtr, QueryPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   SeqLenM1 := SeqLen - 1;
@@ -42585,7 +42611,7 @@ var
   OutPtr, Bias, BiasRow, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqN := Prev.SizeX;
   SeqNM1 := SeqN - 1;
@@ -42701,7 +42727,7 @@ var
   OutPtr, Bias, BiasRow, QnPtr, QPtr, KPtr, KnPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqN := Prev.SizeX;
   SeqNM1 := SeqN - 1;
@@ -42968,7 +42994,7 @@ var
   inRange: boolean;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   // CAI volume convention: GetRawPos(x,y,d) = ((SizeX*y)+x)*Depth+d, so the X
   // axis is the FAST (inner) axis. HF SAM lays out the patch grid (gridH,
@@ -43241,7 +43267,7 @@ var
   OutPtr, QueryPtr, RowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   AugLen := FNumSinks + SeqLen;
@@ -43526,7 +43552,7 @@ var
   OutPtr, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   SeqLenM1 := SeqLen - 1;
@@ -43751,7 +43777,7 @@ var
   OutPtr, QPtr1, QPtr2, Row1Ptr, Row2Ptr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   SeqLenM1 := SeqLen - 1;
@@ -44096,7 +44122,7 @@ var
   OutPtr, QueryPtr, KpPtr, VpPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ProjDimM1 := FProjDim - 1;
   SeqLenM1 := FSeqLen - 1;
   DkM1 := FDk - 1;
@@ -44722,7 +44748,7 @@ var
   SeqLen, Depth, HalfD: integer;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   SeqLen := FPrevLayer.FOutput.SizeX;
   Depth := FPrevLayer.FOutput.Depth;
   HalfD := Depth shr 1; // #15: div 2, dimension is non-negative
@@ -44762,7 +44788,7 @@ var
 begin
   // Compute() rebuilds FTheta lazily; on the chunk path that build must happen
   // here - once, single-threaded, before any wkChunk of this layer runs.
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Depth := FPrevLayer.FOutput.Depth;
   if Length(FTheta) <> (Depth div 2) then BuildThetaCache(Depth);
 end;
@@ -45074,7 +45100,7 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   Depth := Prev.Depth;
@@ -45293,7 +45319,7 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   Depth := Prev.Depth;
@@ -45408,7 +45434,7 @@ var
   HasDeriv: boolean;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -45519,7 +45545,7 @@ const
   GELU_CONST = 0.044715;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -45613,7 +45639,7 @@ var
   HasDeriv: boolean;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   twoOverSqrtPi := 2.0 / Sqrt(Pi);
@@ -45720,7 +45746,7 @@ var
   x, twoOverSqrtPi: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   twoOverSqrtPi := 2.0 / Sqrt(Pi);
@@ -45783,7 +45809,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -45940,7 +45966,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Beta := FFloatSt[0];
@@ -46079,7 +46105,7 @@ var
   HasDeriv: boolean;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   inherited Compute;
   {$IFDEF Debug}
   if FNeurons[0].FWeights.Size <> 1 then
@@ -46280,7 +46306,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   {$IFDEF AVXANY}
@@ -46407,7 +46433,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46496,7 +46522,7 @@ var
   tanhVal: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   Size := LocalPrevOutput.Size;
   SizeM1 := Size - 1;
@@ -46536,7 +46562,7 @@ var
   x, expNegAbsX, denom: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46595,7 +46621,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46643,7 +46669,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46696,7 +46722,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46746,7 +46772,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46785,7 +46811,7 @@ var
   x, y: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46827,7 +46853,7 @@ var
   x, y: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46869,7 +46895,7 @@ var
   x, g: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46910,7 +46936,7 @@ var
   x, ax, s, denom, y: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46958,7 +46984,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46987,7 +47013,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -47017,7 +47043,7 @@ var
   SinhVal: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -47056,7 +47082,7 @@ var
   x, SqrtVal: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -47092,7 +47118,7 @@ var
   x, absX, logCoshVal: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -47155,7 +47181,7 @@ var
   y: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   Size := LocalPrevOutput.Size;
   SizeM1 := Size - 1;
@@ -47209,7 +47235,7 @@ var
   x, Alpha, InvAlpha, SinAx, CosAx: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Alpha := FFloatSt[0];
@@ -47255,7 +47281,7 @@ var
   x, SinX, CosX, SincVal: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -47373,7 +47399,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   DInputs := LocalPrevOutput.Size;
   TwoPi := 2.0 * Pi;
@@ -47483,7 +47509,7 @@ var
   x, SqrtVal: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -47523,7 +47549,7 @@ var
   x, t: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -47565,7 +47591,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -47627,7 +47653,7 @@ var
   x, Lambda: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Lambda := FFloatSt[0];
@@ -47685,7 +47711,7 @@ var
   x, Lambda: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Lambda := FFloatSt[0];
@@ -47748,7 +47774,7 @@ var
   x, Theta, ValueBelow: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Theta := FFloatSt[0];
@@ -47826,7 +47852,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxDepth := FOutput.Depth - 1;
   for CntDepth := 0 to MaxDepth do
   begin
@@ -47896,7 +47922,7 @@ var
   DstPos: integer;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.Output;
   Channel := FStruct[0];
   MaxX := Prev.SizeX - 1;
@@ -48006,7 +48032,7 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.Output;
   MaxX := Prev.SizeX - 1;
   MaxY := Prev.SizeY - 1;
@@ -48141,7 +48167,7 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.Output;
   MaxX := Length(FTokens) - 1;
   MaxD := Prev.Depth - 1;
@@ -48245,7 +48271,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxDepth := FOutput.Depth - 1;
   for CntDepth := 0 to MaxDepth do
     FOutput.CopyFromDepthToDepth(FPrevLayer.FOutput, CntDepth, ToChannels[CntDepth]);
@@ -48283,7 +48309,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := FOutput.Depth - 1;
@@ -48334,7 +48360,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := FOutput.Depth - 1;
@@ -48385,7 +48411,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxY := FOutput.SizeY - 1;
   // A row is SizeX*Depth contiguous floats and the flip permutes whole rows,
   // so each row is a single Move.
@@ -48472,7 +48498,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   P := FStruct[0];
   C := FPrevLayer.Output.Depth;
   MaxOX := FOutput.SizeX - 1;
@@ -48570,7 +48596,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   P := FStruct[0];
   C := FOutput.Depth;
   MaxIX := FPrevLayer.Output.SizeX - 1;
@@ -48673,7 +48699,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   P := FStruct[0];
   C := FPrevLayer.Output.Depth;
   NPW := FPrevLayer.Output.SizeX div P;
@@ -48792,7 +48818,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   P := FStruct[0];
   C := FOutput.Depth;
   NPW := FOutput.SizeX div P;
@@ -48932,7 +48958,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   SX := FPrevLayer.Output.SizeX;
   SY := FPrevLayer.Output.SizeY;
   D  := FPrevLayer.Output.Depth;
@@ -49154,7 +49180,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxDepth := FOutput.Depth - 1;
   for CntDepth := 0 to MaxDepth do
     FOutput.CopyFromDepthToDepth(FPrevLayer.FOutput, CntDepth, MaxDepth - CntDepth);
@@ -49208,7 +49234,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   HalfDepth := FOutput.Depth;
   MaxIX := FPrevLayer.Output.SizeX - 1;
   MaxIY := FPrevLayer.Output.SizeY - 1;
@@ -49296,7 +49322,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := FOutput.Depth - 1;
@@ -49527,7 +49553,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
   Depth := FOutput.Depth;
@@ -50459,7 +50485,7 @@ var
   ColIn, ColNorm, ColOut, MeanPtr, InvStdPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FStyleLayer) then FStyleLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FStyleLayer) then FStyleLayer.ForceOutputOnRAM(); {$ENDIF}
   // inherited Compute copies the content layer output into FOutput.
   inherited Compute;
   ContentOut := FContentLayer.Output;
@@ -50873,7 +50899,7 @@ end;
 
 procedure TNNetByteProcessing.Compute();
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FPrevLayer.Output.ReadAsBits(FByteInput, 0.0);
   FByteLearning.Predict(FByteInput, FByteInput, FByteOutput);
   if FAddSkipConnection then
@@ -51034,7 +51060,7 @@ var
   MinValue: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   OutDepthM1 := FByteLen*8 - 1;
@@ -51195,7 +51221,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Affine-encode each input scalar to a whole byte, run the symbolic engine,
   // then affine-decode each output byte back to a scalar.
   EncodeToBytes(FPrevLayer.Output, FByteInput);
@@ -51308,7 +51334,7 @@ var
   PrevOutBase, OutBase: integer;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   InDepthM1 := FInDepth - 1;
@@ -51417,7 +51443,7 @@ var
   MaxPos: integer;
   Value: TNeuralFloat;
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxPos := FPrevLayer.FOutput.Size - 1;
 
   for PosCnt := 0 to MaxPos do
@@ -51534,7 +51560,7 @@ var
   OutBase, SrcBase: integer;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
     (FOutput.Size <> FOutputError.Size)
@@ -51651,7 +51677,7 @@ var
   InvCount: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.Output;
   Output.Fill(0);
   MaxD := PrevOut.Depth - 1;
@@ -51775,7 +51801,7 @@ var
   x, PowVal, PowerM1: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -51818,7 +51844,7 @@ var
   Value, ValueSqrt: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -51859,7 +51885,7 @@ var
   Value, ValueSqrt: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -51908,7 +51934,7 @@ var
   Value, ValueSqrt: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -51950,7 +51976,7 @@ var
   VSqrt: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -52053,7 +52079,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FNeurons.Count > 0 then
   begin
     if FPadding > 0
@@ -52179,7 +52205,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Output.Fill(-1000000);
 
   if FPadding > 0
@@ -52212,7 +52238,7 @@ var
   CurrValue: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -52273,7 +52299,7 @@ var
   InBase, Out00, OutDepthStride, OutRowStride: integer;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Output.Fill(0);
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
@@ -52395,7 +52421,7 @@ var
   SrcBase, OutPos, OutRowStride: integer;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   r := FStruct[0];
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
@@ -52662,7 +52688,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   s := FStruct[0];
   PrevOutput := FPrevLayer.Output;
   OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
@@ -52920,7 +52946,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   s := FStruct[0];
   ac := FStruct[1];
   PrevOutput := FPrevLayer.Output;
@@ -53265,7 +53291,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
   InX := FPrevLayer.Output.SizeX; InY := FPrevLayer.Output.SizeY;
   AC := FStruct[2];
@@ -53495,7 +53521,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOutput := FPrevLayer.Output;
   OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
   InX := PrevOutput.SizeX; InY := PrevOutput.SizeY;
@@ -53941,7 +53967,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -54050,7 +54076,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Recover alpha from FFloatSt to honour values reloaded via LoadFromString.
   FAlpha := FFloatSt[0];
   LocalPrevOutput := FPrevLayer.Output;
@@ -54156,7 +54182,7 @@ var
   PrevValue, ExpVal: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Recover alpha from FFloatSt to honour values reloaded via LoadFromString.
   FAlpha := FFloatSt[0];
   LocalPrevOutput := FPrevLayer.Output;
@@ -54205,7 +54231,7 @@ var
   PrevValue, Denom: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -54267,7 +54293,7 @@ var
   Lower, Upper, Slope, x: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Lower := FFloatSt[0];
@@ -54343,7 +54369,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -55692,7 +55718,7 @@ var
   SumSq, n, fOverN, Eps: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Dim := FStruct[0];
   NumCaps := FOutput.Depth div Dim;
@@ -55882,7 +55908,7 @@ var
   acc, sumSq, n, fOverN, Eps, maxB, sumExp, c, agree: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Eps := 1e-12;
   NumInCapsM1 := FNumInCaps - 1;
@@ -56342,7 +56368,7 @@ var
   P, CoefPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Do NOT call inherited Compute (which would copy input into FOutput);
   // we compute Y directly from FPrevLayer.FOutput.
   Prev := FPrevLayer.FOutput;
@@ -56568,7 +56594,7 @@ var
   alpha, xv: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Do NOT call inherited Compute (which copies the input into FOutput); we
   // compute Y directly from FPrevLayer.FOutput.
   Prev := FPrevLayer.FOutput;
@@ -56737,7 +56763,7 @@ var
   HasDeriv: boolean;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   inherited Compute;
   {$IFDEF Debug}
   if FNeurons[0].FWeights.Size <> 1 then
@@ -56869,7 +56895,7 @@ var
   AlphaPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Do NOT call inherited Compute (which would copy input to FOutput).
   Prev := FPrevLayer.FOutput;
   W := FNeurons[0].FWeights;
@@ -57027,7 +57053,7 @@ var
   TrPtr, ArPtr, TlPtr, AlPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Do NOT call inherited Compute (which would copy input to FOutput).
   Prev := FPrevLayer.FOutput;
   Wtr := FNeurons[0].FWeights;
@@ -57247,7 +57273,7 @@ var
   xv, acc, a_sd, b_sd: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Do NOT call inherited Compute (which would copy input to FOutput).
   Prev := FPrevLayer.FOutput;
   SizeX := FOutput.SizeX;
@@ -57469,7 +57495,7 @@ var
   xv, frac, y0, y1: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Do NOT call inherited Compute (which would copy input to FOutput).
   Prev := FPrevLayer.FOutput;
   SizeX := FOutput.SizeX;
@@ -57625,7 +57651,7 @@ var
   P1Ptr, P2Ptr, BetaPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Do NOT call inherited Compute (which would copy input to FOutput).
   Prev := FPrevLayer.FOutput;
   W1 := FNeurons[0].FWeights;
@@ -57797,7 +57823,7 @@ var
   P1Ptr, P2Ptr, GammaPtr, DeltaPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   W1 := FNeurons[0].FWeights;
   W2 := FNeurons[1].FWeights;
@@ -58032,7 +58058,7 @@ var
   mix, one_minus_mix, xt, xtm1: TNeuralFloat;
   W: TNNetVolume;
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FDecodeEnabled then
   begin
     ComputeIncremental();
@@ -58095,7 +58121,7 @@ var
   W: TNNetVolume;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   Depth := Prev.Depth;
@@ -58292,7 +58318,7 @@ var
   localNeuron: TNNetNeuron;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   InputDepth := Prev.Depth;
@@ -58461,7 +58487,7 @@ var
   localNeuron: TNNetNeuron;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   InputDepth := Prev.Depth;
@@ -58707,7 +58733,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FDecodeEnabled then
   begin
     // Stateful token-by-token path: the persisted history lives host-side, so
@@ -58913,7 +58939,7 @@ begin
   // where the serial paths do this). Coded by Claude (AI).
   // The tap-major tables must likewise be built HERE: single-threaded and
   // before any chunk is published, so every worker reads a finished table.
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrepareTapTables();
   if FDecodeEnabled then Inc(FDecodeSteps, FPrevLayer.FOutput.SizeX);
 end;
@@ -59205,7 +59231,7 @@ var
   W: TNNetVolume;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   NumFeat := FNeurons.Count;
   MaxFeat := NumFeat - 1;
@@ -59424,7 +59450,7 @@ var
   MaxD, MaxT, RowBytes: integer;
   HPtr, TmpPtr, XtPtr, OutPtr, StatePtr, APtr, BPtr, CPtr, EPtr: TNeuralFloatArrPtr;
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FDecodeEnabled then
   begin
     ComputeIncremental();
@@ -59496,7 +59522,7 @@ var
   HPtr, TmpPtr, XtPtr, OutPtr, APtr, BPtr, CPtr, EPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Wa := FNeurons[0].FWeights;
   Wb := FNeurons[1].FWeights;
@@ -59782,7 +59808,7 @@ var
   raw, av, qv, rv, xprev, pprev, xm, pm, gv, zv: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Wa := FNeurons[0].FWeights;
   Wq := FNeurons[1].FWeights;
@@ -60094,7 +60120,7 @@ var
   ww2, qmax2, e3, e4, eq: TNeuralFloat;
   anew, bnew: TNeuralFloat;
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FDecodeEnabled then
   begin
     ComputeIncremental();
@@ -60184,7 +60210,7 @@ var
   basePrev, baseC, pvStride, ocStride: integer;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Ww := FNeurons[0].FWeights;
   Wu := FNeurons[1].FWeights;
@@ -60503,7 +60529,7 @@ var
   hrePrev, himPrev, hreNew, himNew, xt: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Wnu := FNeurons[0].FWeights;
   Wtheta := FNeurons[1].FWeights;
@@ -60781,7 +60807,7 @@ var
   sp, lam, igl, agl, ig, rg, loga, a, a2, mult, xt, hPrev, hNew: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   WLam := FNeurons[0].FWeights;
   SeqLen := FOutput.SizeX;
@@ -61113,7 +61139,7 @@ var
   xPtr, hPrevPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   // Support a variable sequence length: re-size the per-step caches and output
@@ -61358,8 +61384,10 @@ end;
 
 procedure TNNetCrossWKV.Compute();
 begin
+  {$IFDEF OpenCL}
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FKVLayer) then FKVLayer.ForceOutputOnRAM();
+  {$ENDIF}
   if FAsymmetric then ComputeAsym() else ComputeSym();
 end;
 
@@ -61886,7 +61914,7 @@ var
   Nr: TNNetNeuron;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
   Depth := FOutput.Depth;
@@ -62197,7 +62225,7 @@ var
   LU: TNNetVolume;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
   MaxFC := FC - 1;
@@ -62526,7 +62554,7 @@ var
   LogSPtr, BPtr, InPtr, OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Data-dependent init on the first forward (forward map only).
   if (not FInitialised) and (not FInverse) then DataDependentInit();
   SizeX := FOutput.SizeX;
@@ -62880,7 +62908,7 @@ var
   itv, itt, basePrev, baseOut: integer;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   SeqLen := FOutput.SizeX;
   P := FPhaseDim;
@@ -63312,7 +63340,7 @@ var
   WtRow, WgRow: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Wt := FNeurons[0].FWeights;
   Bt := FNeurons[1].FWeights;
@@ -63557,7 +63585,7 @@ var
   WzR, WiR, WfR, WoR, RzR, RiR, RfR, RoR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Wz := FNeurons[0].FWeights; Wi := FNeurons[1].FWeights;
   Wf := FNeurons[2].FWeights; Wo := FNeurons[3].FWeights;
@@ -63931,7 +63959,7 @@ var
   WqR, WkR, WvR, WoR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Wq := FNeurons[0].FWeights; Wk := FNeurons[1].FWeights;
   Wv := FNeurons[2].FWeights; Wo := FNeurons[3].FWeights;
   Wi := FNeurons[4].FWeights; Wf := FNeurons[5].FWeights;
@@ -64345,7 +64373,7 @@ var
   WzR, WhR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Wz := FNeurons[0].FWeights; Wh := FNeurons[1].FWeights;
   Bz := FNeurons[2].FWeights; Bh := FNeurons[3].FWeights;
@@ -64649,7 +64677,7 @@ var
   XPtr, BankPtr, OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaterializeBankIfStale();
   Prev := FPrevLayer.FOutput;
   XPtr := Prev.GetRawPtr(0, 0);
@@ -64898,7 +64926,7 @@ var
   WfR, WiR, WhR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Wf := FNeurons[0].FWeights; Wi := FNeurons[1].FWeights;
   Wh := FNeurons[2].FWeights; Bf := FNeurons[3].FWeights;
@@ -65277,7 +65305,7 @@ var
   XtPtr, OutPtr, HprevPtr: TNeuralFloatArrPtr;
   WiiR, WifR, WigR, WioR, WhiR, WhfR, WhgR, WhoR: TNeuralFloatArrPtr;
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   if FHasOpenCL and FShouldOpenCL and
      (FOutput.Depth >= csLSTMOpenCLMinDepth) then
@@ -65689,7 +65717,7 @@ var
   XtPtr, OutPtr, HprevPtr: TNeuralFloatArrPtr;
   WirR, WizR, WinR, WhrR, WhzR, WhnR: TNeuralFloatArrPtr;
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   if FHasOpenCL and FShouldOpenCL and
      (FOutput.Depth >= csGRUOpenCLMinDepth) then
@@ -65976,7 +66004,7 @@ var
   WiR, WfR, WoR, WgR, ZPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Wi := FNeurons[0].FWeights; Wf := FNeurons[1].FWeights;
   Wo := FNeurons[2].FWeights; Wg := FNeurons[3].FWeights;
@@ -66415,7 +66443,7 @@ var
   WqR, WkR, WvR, PrevSPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Wq := FNeurons[0].FWeights; Wk := FNeurons[1].FWeights;
   Wv := FNeurons[2].FWeights; Wb := FNeurons[3].FWeights;
   SeqLen := FOutput.SizeX;
@@ -66736,7 +66764,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPURange(0, FNumKHeads - 1);
   if FDecodeEnabled then Inc(FDecodeSteps, FOutput.SizeX);
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -66867,7 +66895,7 @@ end;
 
 procedure TNNetGatedDeltaNet.PrepareChunkedForward();
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Once per forward (the chunk path never calls Compute, where the serial
   // path does this). Coded by Claude (AI).
   if FDecodeEnabled then Inc(FDecodeSteps, FOutput.SizeX);
@@ -67221,7 +67249,7 @@ var
   AbarR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Wout := FNeurons[0].FWeights;
   SeqLen := FOutput.SizeX;
   SeqLenM1 := SeqLen - 1;
@@ -67449,7 +67477,7 @@ var
   WqR, WkR, WvR, WaR, PrevRow: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Wq := FNeurons[0].FWeights; Wk := FNeurons[1].FWeights;
   Wv := FNeurons[2].FWeights; Wa := FNeurons[3].FWeights;
   Ba := FNeurons[4].FWeights;
@@ -67816,7 +67844,7 @@ var
   accK, accE, accA, accB, betaV, kn, dotv, mn, simMax, expSum, wv, ev, av: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Wk := FNeurons[0].FWeights; Bk := FNeurons[1].FWeights;
   Wb := FNeurons[2].FWeights; Bb := FNeurons[3].FWeights;
@@ -68303,7 +68331,7 @@ var
   ThR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ThK := FNeurons[0].FWeights; ThV := FNeurons[1].FWeights;
   ThQ := FNeurons[2].FWeights;
   SeqLen := FOutput.SizeX; Depth := FDepth; Hd := FHidden;
@@ -68871,7 +68899,7 @@ var
   ThR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ThK := FNeurons[0].FWeights; ThV := FNeurons[1].FWeights;
   ThQ := FNeurons[2].FWeights;
   EtaR := FNeurons[3].FWeights; ThetaR := FNeurons[4].FWeights;
@@ -69546,7 +69574,7 @@ end;
 
 procedure TNNetSelectiveSSM.Compute();
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FDecodeEnabled then
   begin
     ComputeIncremental();
@@ -69580,7 +69608,7 @@ var
   KeepState: boolean;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Wd := FNeurons[0].FWeights;
   WB := FNeurons[1].FWeights;
@@ -69657,7 +69685,7 @@ var
   KeepState: boolean;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Wd := FNeurons[0].FWeights;
   WB := FNeurons[1].FWeights;
@@ -70410,7 +70438,7 @@ var
   KeepState: boolean;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Alog := FNeurons[0].FWeights;
   Dd := FNeurons[1].FWeights;
@@ -70877,7 +70905,7 @@ var
   sum: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Depth := FOutput.Depth;
   DepthM1 := Depth - 1;
@@ -71148,7 +71176,7 @@ var
   VProjPtr, VmPtr, UPtr, OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   W := FNeurons[0].FWeights;
   Bias := FNeurons[1].FWeights;
@@ -71311,7 +71339,7 @@ var
   xv: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Do NOT call inherited Compute (which copies the input into FOutput); we
   // compute the polynomial directly from FPrevLayer.FOutput.
   Prev := FPrevLayer.FOutput;
@@ -71515,7 +71543,7 @@ end;
 
 procedure TNNetSigmoid.Compute();
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   // Forward-only device path (gated off in production - see WillOpenCL). It
   // writes FOutput directly; FOutputRaw (read only by the CPU backward) is left
@@ -71717,7 +71745,7 @@ var
   InputRawPtr: TNeuralFloatPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Output.Fill(1000000);
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
@@ -71864,7 +71892,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Output.Fill(1000000);
 
   if FPadding > 0
@@ -72831,7 +72859,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   // Device forward keeps the per-token activation resident on the GPU between
   // attention/FFN blocks (forward-only; training stays on the CPU path below).
@@ -73072,7 +73100,7 @@ var
   Scale: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   inherited Compute; // copies FPrevLayer.FOutput into FOutput
   SeqLen := FOutput.SizeX;
   Depth := FOutput.Depth;
@@ -74679,7 +74707,7 @@ begin
   begin
     for CntLayer := 0 to MaxLayer do
     begin
-      Self[CntLayer].ForceOutputOnRAM();
+      {$IFDEF OpenCL} Self[CntLayer].ForceOutputOnRAM(); {$ENDIF}
     end;
   end;
 end;
@@ -74699,7 +74727,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   // Forward-only device path (gated off in production - see WillOpenCL). It
   // writes FOutput = max(x,0) but does NOT fill the FOutputErrorDeriv gate mask,
@@ -74865,7 +74893,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  FPrevLayerList.ForceOutputOnRAM();
+  {$IFDEF OpenCL} FPrevLayerList.ForceOutputOnRAM(); {$ENDIF}
   FOutput.Copy(FPrevOutput[0]);
   if FPrevOutput.Count > 1 then
   begin
@@ -74975,7 +75003,7 @@ var
   OutPtr, FeatPtr, GammaPtr, BetaPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  FPrevLayerList.ForceOutputOnRAM();
+  {$IFDEF OpenCL} FPrevLayerList.ForceOutputOnRAM(); {$ENDIF}
   Feature := FPrevOutput[0];
   Cond    := FPrevOutput[1];
   // Out[x,y,c] = gamma[c]*input0[x,y,c] + beta[c]; gamma/beta broadcast over XY.
@@ -75122,7 +75150,7 @@ var
   B1, B2, Skip: TNNetVolume;
 begin
   StartTime := Now();
-  FPrevLayerList.ForceOutputOnRAM();
+  {$IFDEF OpenCL} FPrevLayerList.ForceOutputOnRAM(); {$ENDIF}
   B1   := FPrevOutput[0];
   B2   := FPrevOutput[1];
   Skip := FPrevOutput[2];
@@ -75240,7 +75268,7 @@ var
   bl, Alpha: TNeuralFloat;
 begin
   StartTime := Now();
-  FPrevLayerList.ForceOutputOnRAM();
+  {$IFDEF OpenCL} FPrevLayerList.ForceOutputOnRAM(); {$ENDIF}
   B    := FPrevOutput[0];
   Skip := FPrevOutput[1];
   if FEnabled then
@@ -75328,7 +75356,7 @@ var
   InputRawPtr: TNeuralFloatPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Output.Fill(-1000000);
   // Channel layers never pad; reduce directly over the previous output.
   MaxX := FPrevLayer.Output.SizeX - 1;
@@ -75422,7 +75450,7 @@ var
   OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.Output;
   MaxX := Prev.SizeX - 1;
   MaxY := Prev.SizeY - 1;
@@ -75502,7 +75530,7 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.Output;
   InSizeX := Prev.SizeX;
   InSizeY := Prev.SizeY;
@@ -75622,7 +75650,7 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.Output;
   InSizeX := Prev.SizeX;
   InSizeY := Prev.SizeY;
@@ -75740,7 +75768,7 @@ var
   OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.Output;
   MaxX := Prev.SizeX - 1;
   MaxY := Prev.SizeY - 1;
@@ -75869,7 +75897,7 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.Output;
   MaxX := Prev.SizeX - 1;
   MaxY := Prev.SizeY - 1;
@@ -79906,7 +79934,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FUseFFT then
   begin
     RequireFFTUsable();
@@ -80309,7 +80337,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -80516,7 +80544,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -80795,7 +80823,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -81101,7 +81129,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -81436,7 +81464,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -82038,7 +82066,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -82464,7 +82492,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -82758,7 +82786,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -82928,7 +82956,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -83198,7 +83226,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -83476,7 +83504,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -83821,7 +83849,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -84115,7 +84143,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -84408,7 +84436,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -84836,7 +84864,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   // Offload the dense main-conv im2col GEMM to the device when OpenCL is armed
   // and the contraction is large enough to amortise the upload/dispatch. The
@@ -85543,7 +85571,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   // Offload the dense rotation-tied im2col GEMM to the device when OpenCL is
   // armed and the work is large enough to amortise the upload/dispatch. The
@@ -85954,7 +85982,7 @@ var
   v, acc: TNeuralFloat;
   PrevOut: TNNetVolume;
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   sizeX := PrevOut.SizeX;
   sizeY := PrevOut.SizeY;
@@ -86130,7 +86158,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.FOutput;
   Depth := PrevOut.Depth;
 
@@ -86410,7 +86438,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -86773,7 +86801,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -87154,7 +87182,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -87563,7 +87591,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -87812,7 +87840,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -88027,7 +88055,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -88430,7 +88458,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FLearnCurvature then SyncCurvatureFromRaw();
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -88846,7 +88874,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -89199,7 +89227,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -89579,7 +89607,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -89931,7 +89959,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -90283,7 +90311,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -90712,7 +90740,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   // Offload the per-edge coefficient reduction (the FCoeffsPerEdge dot product)
   // to the device when OpenCL is armed and the work is large enough to amortise
@@ -91256,7 +91284,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -91606,7 +91634,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -92064,7 +92092,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeCPU();
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -92249,7 +92277,7 @@ var
   localNeuron: TNNetNeuron;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxNeurons := FNeurons.Count - 1;
   MaxWeights := FNeurons[0].FWeights.Size - 1;
   NLocal := MaxWeights + 1;
@@ -92785,7 +92813,7 @@ var
   localNeuron: TNNetNeuron;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxNeurons := FNeurons.Count - 1;
   MaxWeights := FNeurons[0].FWeights.Size - 1;
   NLocal := MaxWeights + 1;
@@ -92932,7 +92960,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   FLRN.CalculateLocalResponseFromDepth(FOutput, FLRNSqr, FStruct[0], 0.001 / 9.0, 0.75);
   FOutput.Divi(FLRN);
@@ -93039,7 +93067,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if (FNeurons.Count = FOutput.Size) and
     (FPrevLayer.Output.Size = FNeurons[0].Weights.Size) then
   begin
@@ -93253,7 +93281,7 @@ var
   RowSize, RowSizeBytes: integer;
 begin
   StartTime := Now();
-  FPrevLayerList.ForceOutputOnRAM();
+  {$IFDEF OpenCL} FPrevLayerList.ForceOutputOnRAM(); {$ENDIF}
   MaxX := Output.SizeX - 1;
   MaxY := Output.SizeY - 1;
   MaxDepth := Output.Depth - 1;
@@ -93475,7 +93503,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxX     := FOutput.SizeX - 1;
   MaxY     := FOutput.SizeY - 1;
   // Rule #9: bind the previous layer's output once, above the loops.
@@ -94499,7 +94527,7 @@ var
   P, Keep, InvKeep, R: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Default: identity copy (used at inference and as the base path).
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   P := FFloatSt[0];
@@ -94566,7 +94594,7 @@ var
   CntOut, MaxOutput: integer;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Identity copy (used at inference and as the base path).
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   Alpha := FFloatSt[0];
@@ -94616,7 +94644,7 @@ var
   d: integer;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   P := FFloatSt[0];
   // Resize the per-channel mask to match Depth.
@@ -94688,7 +94716,7 @@ var
   d: integer;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   P := FFloatSt[0];
   if FChannelMask.Size <> FOutput.Depth then
@@ -94836,7 +94864,7 @@ var
   m: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   // Keep the spatial mask sized to the feature map (Depth = 1, broadcast).
   if (FKeepMask.SizeX <> FOutput.SizeX) or (FKeepMask.SizeY <> FOutput.SizeY) then
@@ -94910,7 +94938,7 @@ var
   Sigma: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   Sigma := FFloatSt[0];
   if FEnabled and (Sigma > 0) then
@@ -94955,7 +94983,7 @@ var
   M: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   Sigma := FFloatSt[0];
   if FNoiseMask.Size <> FOutput.Size then
@@ -95030,7 +95058,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   // Device avg-pool forward (exactly TNNetAvgPool; AvgChannel and other subclasses
   // keep the scalar path). Sum over the clipped window divided by the FULL
@@ -95188,7 +95216,7 @@ var
   IsP2: boolean;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Accumulate sum_i |x_i|^p into the output.
   Output.Fill(0);
   MaxX := FPrevLayer.Output.SizeX - 1;
@@ -95464,7 +95492,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Per pooling window W and channel, with temperature beta (FFloatSt[0]):
   //   w_i = exp(beta*x_i - winMax) / sum_j exp(beta*x_j - winMax)
   //   y   = sum_i w_i * x_i
@@ -95668,7 +95696,7 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Rule #9: bind the previous layer's output once, not per cell.
   Prev := FPrevLayer.Output;
   // Per square pooling window W and channel:
@@ -95887,7 +95915,7 @@ var
   WSum, Wij: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ComputeDenseMax();
   OutMaxX := FOutput.SizeX - 1;
   OutMaxY := FOutput.SizeY - 1;
@@ -96032,7 +96060,7 @@ var
   Input: TNNetVolume;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Input := FPrevLayer.Output;
   OutMaxX := FOutput.SizeX - 1;
   OutMaxY := FOutput.SizeY - 1;
@@ -96179,7 +96207,7 @@ var
   Pos, RowStride: integer;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Output.Fill(0);
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
@@ -96393,7 +96421,7 @@ procedure TNNetDeconvolution.Compute();
 var
   StartTime: double;
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FNeurons.Count = 0 then
   begin
     FErrorProc('Neuronal layer contains no neuron:' + IntToStr(FNeurons.Count));
@@ -96813,7 +96841,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  FPrevLayerList.ForceOutputOnRAM();
+  {$IFDEF OpenCL} FPrevLayerList.ForceOutputOnRAM(); {$ENDIF}
   FPrevOutput.ConcatInto(FOutput);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -96855,7 +96883,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Len := Min(FOutput.Size, FPrevLayer.FOutput.Size);
   FOutput.Copy(FPrevLayer.FOutput, Len);
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -96907,7 +96935,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Len := Min(FOutput.Size, FPrevLayer.FOutput.Size);
   FOutput.Copy(FPrevLayer.FOutput, Len);
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -96988,7 +97016,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Len := Min(FOutput.Size, FPrevLayer.FOutput.Size);
   FOutput.Copy(FPrevLayer.FOutput, Len);
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -97140,7 +97168,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -97559,7 +97587,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   {$IFDEF OpenCL}
   // Device whole-volume softmax forward: the entire SizeX*SizeY*Depth sample is
@@ -97619,7 +97647,7 @@ var
   Mean: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Copy input, subtract per-sample mean (mean over the whole volume,
   // matching the softmax normalization scope), then run the standard
   // softmax. Backpropagate is inherited from TNNetSoftMax: softmax is
@@ -97638,7 +97666,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // y = softmax(-x): copy input, negate, then apply softmax in place.
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   FOutput.Mul(-1);
@@ -97698,7 +97726,7 @@ var
   MaxV, S: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   SizeM1 := FOutput.Size - 1;
   // y_i = exp(x_i) / (1 + sum_j exp(x_j))
@@ -97779,7 +97807,7 @@ var
   T: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   T := FFloatSt[0];
   if T = 0 then T := 1.0;
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
@@ -97849,7 +97877,7 @@ var
   i, SizeM1, ArgMax: integer;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Tau := FFloatSt[0];
   if Tau <= 0 then Tau := 1.0;
   InvTau := 1.0 / Tau;
@@ -97963,7 +97991,7 @@ var
   MaxVal, SumExp, LogSumExp: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
@@ -98072,7 +98100,7 @@ var
   BestVal, Val: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   K := FStruct[0];
   MaxX := FOutput.SizeX - 1;
@@ -98159,7 +98187,7 @@ var
   BestVal, Val, SurvSum: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   TopCnt := FStruct[0];
   MaxX := FOutput.SizeX - 1;
@@ -98312,7 +98340,7 @@ var
   BestVal, Val: TNeuralFloat;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   Capacity := FStruct[0];
   MaxX := FOutput.SizeX - 1;
@@ -98445,7 +98473,7 @@ var
   BiasPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   TopCnt := FStruct[0];
   MaxX := FOutput.SizeX - 1;
@@ -98722,8 +98750,10 @@ end;
 
 procedure TNNetMoEExpertBankGateUp.PrepareChunkedForward();
 begin
+  {$IFDEF OpenCL}
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   if Assigned(FGateLayer) then FGateLayer.ForceOutputOnRAM();
+  {$ENDIF}
   // The chunk path never calls Compute, so the routing decision every chunk
   // reads is built here: once, single-threaded, before any chunk is published.
   PrepareForward();
@@ -98954,7 +98984,7 @@ end;
 
 procedure TNNetMoEExpertBankDown.PrepareChunkedForward();
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // The chunk path never calls Compute; only the neuron array needs building,
   // since every chunk reads the gate|up bank's already-finished slot map.
   if FBank = nil then exit;
@@ -99401,7 +99431,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
 
   if FPadding > 0
     then FInputCopy.CopyPadding(FPrevLayer.Output, FPadding)
@@ -100890,7 +100920,7 @@ end;
 
 procedure TNNetConvolution.PrepareChunkedForward();
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Parallel chunk path: the scheduler dispatches this layer's wkChunk items
   // straight to ComputeRange and never calls Compute(), so the per-forward input
   // prep must happen here, once, before any chunk runs. Chunk-eligible convs are
@@ -102284,7 +102314,7 @@ procedure TNNetFullConnect.Compute();
 var
   StartTime: double;
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FQuantInt8 then
   begin
     if (FNeurons.Count = FOutput.Size) and
@@ -102462,7 +102492,7 @@ end;
 
 procedure TNNetFullConnect.PrepareChunkedForward();
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if High(FArrNeurons) < FNeurons.Count - 1 then BuildArrNeurons();
 end;
 
@@ -103103,7 +103133,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   // Device token-gather forward keeps the embedding output resident on the GPU
   // going into the first attention block (forward-only; backward stays on CPU).
@@ -103413,7 +103443,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.Output;   // #8: invariant across the token loops
   MaxToken := PrevOut.Size - 1;
   // FOutput is (PrevOut.Size, 1, FEmbeddingSize) and FPositionalEmbedding shares
@@ -126996,7 +127026,7 @@ end;
 
 procedure TNNetLayer.PrepareChunkedForward();
 begin
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
 end;
 
 procedure TNNetLayer.SetPrevLayer(pPrevLayer: TNNetLayer);
