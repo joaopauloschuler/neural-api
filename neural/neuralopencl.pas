@@ -206,7 +206,9 @@ type
       // the kernel handle and the per-instance buffers are owned here. This is
       // the shared-program form of the auxiliary helper kernels (RoPE, softmax,
       // norms, gathers, ...). (Coded by Claude (AI).)
-      constructor CreateFromProgram(SharedKernel: TEasyOpenCL; kernelname: string; pHideMessages: boolean = true);
+      constructor CreateFromProgram(SharedKernel: TEasyOpenCL;
+        kernelname: string; pHideMessages: boolean = true;
+        pSharedQueue: boolean = true);
       destructor Destroy(); override;
 
       property Kernel: cl_kernel read FKernel;
@@ -1039,7 +1041,8 @@ begin
 end;
 
 constructor TNeuralKernel.CreateFromProgram(SharedKernel: TEasyOpenCL;
-  kernelname: string; pHideMessages: boolean = true);
+  kernelname: string; pHideMessages: boolean = true;
+  pSharedQueue: boolean = true);
 begin
   inherited Create();
   // Suppress the per-layer "clCreateKernel ... OK!" chatter by default: a model
@@ -1054,7 +1057,9 @@ begin
   FCurrentDevice   := SharedKernel.CurrentDevice;
   FContext  := SharedKernel.Context;
   FProg     := SharedKernel.Prog;
-  FCommands := CreateCommandQueue(); // the command queue is given per kernel
+  if pSharedQueue
+    then FCommands := SharedKernel.Commands
+    else FCommands := CreateCommandQueue(); // the command queue is given per kernel
   // Bind our own kernel handle into the shared (already-built) program.
   PrepareKernel(kernelname);
 end;
