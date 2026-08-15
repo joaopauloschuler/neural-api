@@ -22687,6 +22687,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -23131,6 +23132,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -23190,6 +23192,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -23297,6 +23300,7 @@ var
   OutputValue: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -23394,6 +23398,7 @@ var
   OutputValue: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -23447,6 +23452,7 @@ var
   PrevValue, Beta, BetaX, SigmoidValue: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Beta := FFloatSt[0];
@@ -23812,6 +23818,7 @@ var
   PrevValue, Alpha, InvSqrt: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Alpha := FFloatSt[0];
@@ -23868,6 +23875,7 @@ var
   PrevValue, Alpha, InvSqrt: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Alpha := FFloatSt[0];
@@ -23922,6 +23930,7 @@ var
   x, s, t, dL: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -23993,6 +24002,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -24128,6 +24138,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -24225,6 +24236,7 @@ var
   PrevValue: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -24277,6 +24289,7 @@ const
   GELU_CONST = 0.044715;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   LocalSize := LocalPrevOutput.Size;
   SizeM1 := LocalSize - 1;
@@ -24355,6 +24368,7 @@ const
   INV_SQRT_2PI = 0.39894228040143268;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   // Two-pass: fill FOutput with x/sqrt(2), vectorize erf in place (Erf),
@@ -31582,6 +31596,7 @@ var
   x, MinV, MaxV: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   MinV := FFloatSt[0];
@@ -45301,6 +45316,7 @@ var
   HasDeriv: boolean;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -45411,6 +45427,7 @@ const
   GELU_CONST = 0.044715;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -45504,6 +45521,7 @@ var
   HasDeriv: boolean;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   twoOverSqrtPi := 2.0 / Sqrt(Pi);
@@ -45610,6 +45628,7 @@ var
   x, twoOverSqrtPi: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   twoOverSqrtPi := 2.0 / Sqrt(Pi);
@@ -45672,6 +45691,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -45828,6 +45848,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Beta := FFloatSt[0];
@@ -46166,6 +46187,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   {$IFDEF AVXANY}
@@ -46292,6 +46314,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46380,6 +46403,7 @@ var
   tanhVal: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   Size := LocalPrevOutput.Size;
   SizeM1 := Size - 1;
@@ -46419,6 +46443,7 @@ var
   x, expNegAbsX, denom: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46477,6 +46502,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46524,6 +46550,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46576,6 +46603,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46625,6 +46653,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46663,6 +46692,7 @@ var
   x, y: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46704,6 +46734,7 @@ var
   x, y: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46745,6 +46776,7 @@ var
   x, g: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46785,6 +46817,7 @@ var
   x, ax, s, denom, y: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46832,6 +46865,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46860,6 +46894,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46889,6 +46924,7 @@ var
   SinhVal: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46927,6 +46963,7 @@ var
   x, SqrtVal: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -46962,6 +46999,7 @@ var
   x, absX, logCoshVal: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -47024,6 +47062,7 @@ var
   y: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   Size := LocalPrevOutput.Size;
   SizeM1 := Size - 1;
@@ -47077,6 +47116,7 @@ var
   x, Alpha, InvAlpha, SinAx, CosAx: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Alpha := FFloatSt[0];
@@ -47122,6 +47162,7 @@ var
   x, SinX, CosX, SincVal: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -47348,6 +47389,7 @@ var
   x, SqrtVal: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -47387,6 +47429,7 @@ var
   x, t: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -47428,6 +47471,7 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -47489,6 +47533,7 @@ var
   x, Lambda: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Lambda := FFloatSt[0];
@@ -47546,6 +47591,7 @@ var
   x, Lambda: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Lambda := FFloatSt[0];
@@ -47608,6 +47654,7 @@ var
   x, Theta, ValueBelow: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Theta := FFloatSt[0];
@@ -51609,6 +51656,7 @@ var
   x, PowVal, PowerM1: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -51651,6 +51699,7 @@ var
   Value, ValueSqrt: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -51691,6 +51740,7 @@ var
   Value, ValueSqrt: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -51739,6 +51789,7 @@ var
   Value, ValueSqrt: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -51780,6 +51831,7 @@ var
   VSqrt: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -52039,6 +52091,7 @@ var
   CurrValue: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -53761,6 +53814,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -53869,6 +53923,7 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Recover alpha from FFloatSt to honour values reloaded via LoadFromString.
   FAlpha := FFloatSt[0];
   LocalPrevOutput := FPrevLayer.Output;
@@ -53974,6 +54029,7 @@ var
   PrevValue, ExpVal: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   // Recover alpha from FFloatSt to honour values reloaded via LoadFromString.
   FAlpha := FFloatSt[0];
   LocalPrevOutput := FPrevLayer.Output;
@@ -54022,6 +54078,7 @@ var
   PrevValue, Denom: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -54083,6 +54140,7 @@ var
   Lower, Upper, Slope, x: TNeuralFloat;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   Lower := FFloatSt[0];
@@ -54158,6 +54216,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -74454,6 +74513,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   {$IFDEF OpenCL}
   // Forward-only device path (gated off in production - see WillOpenCL). It
   // writes FOutput = max(x,0) but does NOT fill the FOutputErrorDeriv gate mask,
@@ -96830,6 +96890,7 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
   FOutput.CopyNoChecks(FPrevLayer.FOutput);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
