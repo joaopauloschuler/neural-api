@@ -357,6 +357,10 @@ type
     // Device-side channel gather (cai_split_channels) forward parity for
     // TNNetSplitChannels: contiguous slice, single channel, SplitChannelEvery.
     procedure TestSplitChannelsOpenCLParity;
+    // Device-side depth-axis scatter (cai_deep_concat) forward parity for
+    // TNNetDeepConcat: 2 and 3 equal sources, unequal depths, and a Replicate
+    // broadcast (one launch instead of one per replica).
+    procedure TestDeepConcatOpenCLParity;
     // Device-side im2col (cai_im2col) forward parity for the general convolution:
     // an inference-only conv gathers FInputPrepared on the device instead of the
     // host. Sweeps feature-size x padding x stride so the gather index math
@@ -64646,6 +64650,119 @@ begin
         '): max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
         MaxDiff < 1e-4);
     finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestDeepConcatOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  InputLayer: TNNetLayer;
+  ConcatLayer: TNNetDeepConcat;
+  Branches: array of TNNetLayer;
+  Depths: array of integer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InSize, CaseCnt, BranchPos, BranchCnt: integer;
+  Diff, MaxDiff: TNeuralFloat;
+  CaseName: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CaseCnt := 0 to 3 do
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, 8);
+    OutCPU := TNNetVolume.Create();
+    try
+      InputLayer := NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+      case CaseCnt of
+        0:
+        begin
+          CaseName := '2 sources x 8 channels';
+          SetLength(Depths, 2); Depths[0] := 8; Depths[1] := 8;
+        end;
+        1:
+        begin
+          CaseName := '3 sources x 8 channels';
+          SetLength(Depths, 3); Depths[0] := 8; Depths[1] := 8; Depths[2] := 8;
+        end;
+        2:
+        begin
+          // Unequal depths: the destination channel of each block is then not a
+          // multiple of any single source depth.
+          CaseName := 'unequal depths 8|3|5';
+          SetLength(Depths, 3); Depths[0] := 8; Depths[1] := 3; Depths[2] := 5;
+        end;
+      else
+        CaseName := 'Replicate broadcast x6';
+        SetLength(Depths, 1); Depths[0] := 1;
+      end;
+      // ReLU convolutions: cai_dot_product applies the activation on the device,
+      // which is what leaves each source output in device memory.
+      BranchCnt := Length(Depths);
+      SetLength(Branches, BranchCnt);
+      for BranchPos := 0 to BranchCnt - 1 do
+        Branches[BranchPos] := NN.AddLayerAfter(
+          TNNetConvolutionReLU.Create(Depths[BranchPos], 3, 1, 1), InputLayer);
+      if CaseCnt = 3
+        then ConcatLayer := TNNetDeepConcat.Replicate(6, Branches[0])
+        else ConcatLayer := TNNetDeepConcat.Create(Branches);
+      NN.AddLayer(ConcatLayer);
+      // The device path is inference-only, so the concat never fires without this.
+      NN.SetTrainable(False, False);
+
+      InSize := Input.Size;
+      for i := 0 to InSize - 1 do
+        Input.Raw[i] := 0.05 * i - 0.3;
+
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+      AssertEquals('concat ran on the CPU before EnableOpenCL', 0,
+        ConcatLayer.ForwardGPUCnt);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Second device forward: the concat reuses its resident result buffer.
+        NN.Compute(Input);
+        MaxDiff := 0;
+        AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  DeepConcat OpenCL parity: ', CaseName, ' max|diff|=',
+        MaxDiff:0:9, ' gpu forwards=', ConcatLayer.ForwardGPUCnt);
+      // Without this a silent fall back to the CPU would compare the reference
+      // against itself and pass while covering nothing.
+      AssertTrue('TNNetDeepConcat must reach the device (' + CaseName + ')',
+        ConcatLayer.ForwardGPUCnt > 0);
+      AssertTrue('TNNetDeepConcat OpenCL vs CPU parity (' + CaseName +
+        '): max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+        MaxDiff < 1e-4);
+    finally
+      SetLength(Branches, 0);
+      SetLength(Depths, 0);
       OutCPU.Free;
       Input.Free;
       NN.Free;

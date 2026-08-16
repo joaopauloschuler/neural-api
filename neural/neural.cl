@@ -1569,6 +1569,35 @@ __kernel void cai_split_channels
   FDst[pos * FOutDepth + d] = FSrc[pos * FInDepth + FChannelIdx[d]];
 }
 
+// CAI depth-axis scatter (TNNetDeepConcat forward). Writes one source into the
+// output channels [FDestChannel .. FDestChannel+get_global_size(1)-1], reading
+// source channel (d % FInDepth). Two ways to launch it: dim 1 = FInDepth per
+// source scatters that source's own contiguous block (the modulo is then an
+// identity), and dim 1 = FOutDepth with FDestChannel = 0 tiles ONE source across
+// the whole output depth - the broadcast a same-layer source list asks for, in a
+// single launch instead of one per replica. TNNetDeepConcat only dispatches this
+// when EVERY source output is ALREADY resident on the device, so nothing is
+// uploaded here and the result stays on the device until a host reader asks for
+// it. Dim 0 is the (X,Y) position: all sources share the output's SizeX/SizeY,
+// so pos indexes the same site in each. Coded by Claude (AI).
+__kernel void cai_deep_concat
+(
+  const int FPositionCount,
+  const int FOutDepth,
+  const int FInDepth,
+  const int FDestChannel,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int pos = get_global_id(0);
+  const int d = get_global_id(1);
+  if (pos >= FPositionCount) return;
+  const int outChannel = FDestChannel + d;
+  if (outChannel >= FOutDepth) return;
+  FDst[pos * FOutDepth + outChannel] = FSrc[pos * FInDepth + (d % FInDepth)];
+}
+
 // CAI Depthwise Convolution 2-D forward (TNNetDepthwiseConv).
 // Coded by Claude (AI).
 // A TRUE per-channel convolution: output channel (n*FInDepth + d) reduces ONLY
