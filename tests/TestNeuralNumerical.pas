@@ -361,6 +361,9 @@ type
     // TNNetDeepConcat: 2 and 3 equal sources, unequal depths, and a Replicate
     // broadcast (one launch instead of one per replica).
     procedure TestDeepConcatOpenCLParity;
+    // Device-side gated activation (cai_glu_gate) forward parity for
+    // TNNetSwiGLU over an already-resident source output, at two input depths.
+    procedure TestSwiGLUOpenCLParity;
     // Device-side im2col (cai_im2col) forward parity for the general convolution:
     // an inference-only conv gathers FInputPrepared on the device instead of the
     // host. Sweeps feature-size x padding x stride so the gather index math
@@ -64662,6 +64665,104 @@ begin
 end;
 {$ENDIF}
 
+procedure TTestNeuralNumerical.TestSwiGLUOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  InputLayer, SourceLayer: TNNetLayer;
+  SwiGLULayer: TNNetSwiGLU;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InSize, InDepth, HalfDepth, CaseCnt: integer;
+  X, Y, D, MaxXPos, MaxYPos, MaxDPos: integer;
+  a, b, Expected, Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CaseCnt := 0 to 1 do
+  begin
+    RandSeed := 424242;
+    if CaseCnt = 0 then InDepth := 8 else InDepth := 16;
+    HalfDepth := InDepth div 2;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, InDepth);
+    try
+      InputLayer := NN.AddLayer(TNNetInput.Create(6, 6, InDepth, 1));
+      // A ReLU convolution: cai_dot_product applies the activation on the
+      // device, which is what leaves the source output in device memory.
+      SourceLayer := NN.AddLayerAfter(
+        TNNetConvolutionReLU.Create(InDepth, 3, 1, 1), InputLayer);
+      SwiGLULayer := TNNetSwiGLU.Create();
+      NN.AddLayerAfter(SwiGLULayer, SourceLayer);
+      // The device path is inference-only, so the gate never fires without this.
+      NN.SetTrainable(False, False);
+
+      InSize := Input.Size;
+      for i := 0 to InSize - 1 do
+        Input.Raw[i] := 0.05 * i - 0.3;
+
+      NN.Compute(Input);
+      AssertEquals('SwiGLU ran on the CPU before EnableOpenCL', 0,
+        SwiGLULayer.ForwardGPUCnt);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Wipe the host copy the CPU forward left behind, so a device path that
+        // never writes back compares as zeros instead of as its own reference.
+        SwiGLULayer.Output.Fill(0);
+        // Second device forward: the gate reuses its resident result buffer.
+        NN.Compute(Input);
+        SourceLayer.ForceOutputOnRAM();
+        SwiGLULayer.ForceOutputOnRAM();
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      // The reference is A*swish(B) recomputed from the SAME source output the
+      // gate read, not from a whole-network CPU forward: the convolution ran on
+      // the device here, and its reassociated sums would otherwise dominate the
+      // difference and measure the GEMM instead of the gate.
+      MaxDiff := 0;
+      MaxXPos := SwiGLULayer.Output.SizeX - 1;
+      MaxYPos := SwiGLULayer.Output.SizeY - 1;
+      MaxDPos := HalfDepth - 1;
+      AssertEquals('output depth match', HalfDepth, SwiGLULayer.Output.Depth);
+      for X := 0 to MaxXPos do
+        for Y := 0 to MaxYPos do
+          for D := 0 to MaxDPos do
+          begin
+            a := SourceLayer.Output[X, Y, D];
+            b := SourceLayer.Output[X, Y, D + HalfDepth];
+            Expected := a * b / (1 + Exp(-b));
+            Diff := Abs(Expected - SwiGLULayer.Output[X, Y, D]);
+            if Diff > MaxDiff then MaxDiff := Diff;
+          end;
+      WriteLn('  SwiGLU OpenCL parity: input depth ', InDepth, ' max|diff|=',
+        MaxDiff:0:9, ' gpu forwards=', SwiGLULayer.ForwardGPUCnt);
+      // Without this a silent fall back to the CPU would compare the reference
+      // against itself and pass while covering nothing.
+      AssertTrue('TNNetSwiGLU must reach the device (input depth ' +
+        IntToStr(InDepth) + ')', SwiGLULayer.ForwardGPUCnt > 0);
+      AssertTrue('TNNetSwiGLU OpenCL vs CPU parity (input depth ' +
+        IntToStr(InDepth) + '): max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
 procedure TTestNeuralNumerical.TestDeepConcatOpenCLParity;
 {$IFDEF OpenCL}
 var
@@ -67430,7 +67531,10 @@ end;
 // A * act(B); the shared cai_glu_gate kernel is run for all four and pinned
 // against the CPU forward (< 1e-4). gpt-oss clamped SwiGLU stays CPU-only
 // (interleaved split + clamp does not fit the contiguous-half shared kernel),
-// so it is not exercised here. Coded by Claude (AI).
+// so it is not exercised here. The gate reads TNNetInput, whose output is never
+// on the device, so the SwiGLU case runs on the CPU here and only checks that
+// the CPU forward is unchanged - its device path is TestSwiGLUOpenCLParity.
+// Coded by Claude (AI).
 procedure TTestNeuralNumerical.GLUFamilyOpenCLParity;
 {$IFDEF OpenCL}
 const

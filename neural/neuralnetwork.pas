@@ -1985,6 +1985,14 @@ type
     // Y receives NumTokens*HalfDepth outputs. ActFlag selects the gate.
     procedure Gate(X, Y: TNNetVolume;
       NumTokens, HalfDepth, ActFlag: integer);
+    // Same gate over a source buffer that is ALREADY on the device: nothing is
+    // uploaded and the result stays in FBufY, sized for Y and left unread.
+    procedure GateOnDevice(SourceBuffer: cl_mem; Y: TNNetVolume;
+      NumTokens, HalfDepth, ActFlag: integer);
+    // FBufY and the queue that owns its contents - what a layer running
+    // GateOnDevice answers OpenCLOutputBuffer/OpenCLOutputKernel with.
+    function OutputBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
   end;
   {$ENDIF}
 
@@ -2080,6 +2088,9 @@ type
     // token-axis chunk (work count 1). Also the serial kernel: Compute() calls
     // ComputeRange(0, Size-1). Coded by Claude (AI).
     procedure ComputeRange(StartRange, FinRange: integer); override;
+    // The chunk path writes FOutput on the host without going through
+    // Compute(), so it owns the same residency reset. Coded by Claude (AI).
+    procedure PrepareChunkedForward(); override;
   public
     constructor Create(); override;
     {$IFDEF OpenCL}
@@ -2087,6 +2098,8 @@ type
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
     {$ENDIF}
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -25109,15 +25122,41 @@ begin
 end;
 
 function TNNetSwiGLU.WillOpenCL(): boolean;
+var
+  SourceKernel: TNeuralKernel;
 begin
-  Result := Assigned(FGLUGateCL) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL);
+  Result := false;
+  // Forward only: the device path leaves the output on the device, and the
+  // backward pass still has readers of Output that never call ForceOutputOnRAM.
+  if FIsTrainable or (not FHasOpenCL) or (not Assigned(FGLUGateCL)) then exit;
+  if (not Assigned(FPrevLayer)) or (not FPrevLayer.FOutputOnOpenCL) then exit;
+  SourceKernel := FPrevLayer.OpenCLOutputKernel();
+  // Same command queue means the gate is ordered behind the forward that
+  // produced its input with no event and no Finish. Different queues are
+  // unordered with respect to each other, so that case stays on the CPU.
+  if (not Assigned(SourceKernel)) or
+     (SourceKernel.Commands <> FGLUGateCL.OutputKernel().Commands) or
+     (not Assigned(FPrevLayer.OpenCLOutputBuffer())) then exit;
+  Result := true;
 end;
 
 procedure TNNetSwiGLU.DisableOpenCL();
 begin
+  // FGLUGateCL owns the output buffer and the queue it is read through, so the
+  // output has to come back to RAM while both are still alive.
+  ForceOutputOnRAM();
   inherited DisableOpenCL();
   FreeAndNil(FGLUGateCL);
+end;
+
+function TNNetSwiGLU.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FGLUGateCL) then Result := FGLUGateCL.OutputBuffer() else Result := nil;
+end;
+
+function TNNetSwiGLU.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FGLUGateCL) then Result := FGLUGateCL.OutputKernel() else Result := nil;
 end;
 
 procedure TNNetSwiGLU.EnableOpenCL(DotProductKernel: TNeuralKernel);
@@ -25127,12 +25166,14 @@ begin
     FGLUGateCL := TNNetGLUGateCL.Create(FNN);
 end;
 
-// Device SwiGLU forward (swish gate, ActFlag=1), bit-faithful to Compute().
+// Device SwiGLU forward (swish gate, ActFlag=1) straight over the source's
+// already-resident output buffer: nothing is uploaded, nothing is read back.
 procedure TNNetSwiGLU.ComputeOpenCL();
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  FGLUGateCL.Gate(FPrevLayer.FOutput, FOutput,
+  FGLUGateCL.GateOnDevice(FPrevLayer.OpenCLOutputBuffer(), FOutput,
     FOutput.SizeX * FOutput.SizeY, FOutput.Depth, {ActFlag=}1);
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
 end;
 {$ENDIF}
 
@@ -25148,7 +25189,9 @@ begin
     pPrevLayer.FOutput.Depth div 2);
   SetOutputErrorSize(FOutput);
   {$IFDEF OpenCL}
-  FShouldOpenCL := false; // bandwidth-bound: GPU < CPU at every size (OpenCLForwardBenchmark ~0.96x), pin to CPU. Old verdict: Int64(FOutput.Size) >= cNeuralOpenCLMinWork
+  // No size verdict: WillOpenCL runs on the device exactly when the source
+  // output is already there, which is what makes the gate free of transfers.
+  FShouldOpenCL := false;
   {$ENDIF}
 end;
 
@@ -25157,7 +25200,6 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
   if WillOpenCL() then
   begin
@@ -25165,8 +25207,13 @@ begin
     ComputeOpenCL();
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
-  end
-  else Inc(FForwardCPUCnt);
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The host wrote FOutput, so a later ForceOutputOnRAM must not read the
+  // device buffer a previous forward left behind.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   {$ENDIF}
   // One general kernel: the serial path is the full-range chunk (bit-identical
   // - only independent elements are partitioned).
@@ -25182,6 +25229,15 @@ end;
 function TNNetSwiGLU.ChunkWorkCount(): integer;
 begin
   Result := FOutput.Size;
+end;
+
+procedure TNNetSwiGLU.PrepareChunkedForward();
+begin
+  inherited PrepareChunkedForward();
+  {$IFDEF OpenCL}
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
 end;
 
 procedure TNNetSwiGLU.ComputeRange(StartRange, FinRange: integer);
@@ -36885,6 +36941,35 @@ begin
   FKernel.Finish();
   FKernel.ReadBuffer(bufY, Y, CL_TRUE);
   // Buffers are persistent (FBuf*), reused next forward - not released here.
+end;
+
+procedure TNNetGLUGateCL.GateOnDevice(SourceBuffer: cl_mem; Y: TNNetVolume;
+  NumTokens, HalfDepth, ActFlag: integer);
+var
+  bufY: cl_mem;
+  k: cl_kernel;
+begin
+  k := FKernel.Kernel;
+  bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
+  clSetKernelArg(k, 0, csLongintSize, @NumTokens);
+  clSetKernelArg(k, 1, csLongintSize, @HalfDepth);
+  clSetKernelArg(k, 2, csLongintSize, @ActFlag);
+  clSetKernelArg(k, 3, csCLMemSize, @SourceBuffer);
+  clSetKernelArg(k, 4, csCLMemSize, @bufY);
+  FKernel.RunKernel(k, NumTokens * HalfDepth);
+  // No Finish and no read back: the caller has checked that SourceBuffer was
+  // produced on this same queue, so the gate is ordered behind it, and the
+  // result stays on the device until a host reader calls ForceOutputOnRAM.
+end;
+
+function TNNetGLUGateCL.OutputBuffer(): cl_mem;
+begin
+  Result := FBufY;
+end;
+
+function TNNetGLUGateCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
 end;
 {$ENDIF}
 
