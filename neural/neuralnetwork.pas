@@ -12193,11 +12193,33 @@ type
     // can Move/Add a whole run instead of copying channel-by-channel.
     FContiguous: boolean;
     FFirstChannel: integer;
+    {$IFDEF OpenCL}
+    // Net-wide cai_split_channels handle, borrowed from FNN in EnableOpenCL; the
+    // net owns and frees it. Its queue is also the queue the source produced on.
+    FSplitKernel: TNeuralKernel;
+    // Persistent device buffer holding this layer's output. Allocated ONCE in
+    // EnableOpenCL and reused by every forward, so no forward pass allocates.
+    FSplitBuffer: cl_mem;
+    FSplitBufSize: integer; // element capacity of FSplitBuffer
+    // FChannels on the device, uploaded ONCE in EnableOpenCL: the channel list
+    // is fixed at SetPrevLayer, so no forward pass writes it.
+    FChannelIdxBuffer: cl_mem;
+    // Gathers the selected channels out of the already-resident source output
+    // into FSplitBuffer. The caller gates on WillOpenCL() and bumps FForwardGPUCnt.
+    procedure ComputeOpenCL();
+    {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(ChannelStart, ChannelLen: integer); reintroduce; overload;
     constructor Create(pChannels: array of integer); reintroduce; overload;
     destructor Destroy(); override;
+    {$IFDEF OpenCL}
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    procedure DisableOpenCL(); override;
+    function WillOpenCL(): boolean; override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
+    {$ENDIF}
 
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -93672,9 +93694,110 @@ end;
 
 destructor TNNetSplitChannels.Destroy();
 begin
+  {$IFDEF OpenCL}
+  if Assigned(FSplitBuffer) then clReleaseMemObject(FSplitBuffer);
+  if Assigned(FChannelIdxBuffer) then clReleaseMemObject(FChannelIdxBuffer);
+  if Assigned(FNN) then FNN.FreeKernelIfNotShared('cai_split_channels', FSplitKernel);
+  {$ENDIF}
   SetLength(FChannels, 0);
   inherited Destroy();
 end;
+
+{$IFDEF OpenCL}
+procedure TNNetSplitChannels.EnableOpenCL(DotProductKernel: TNeuralKernel);
+var
+  ChannelCount: integer;
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  // Acquire once: a second call would leak a private handle.
+  if Assigned(FNN) and (not Assigned(FSplitKernel)) then
+    FSplitKernel := FNN.GetKernel('cai_split_channels');
+  if Assigned(FSplitBuffer) and (FSplitBufSize <> FOutput.Size) then
+  begin
+    clReleaseMemObject(FSplitBuffer);
+    FSplitBuffer := nil;
+  end;
+  if not Assigned(FSplitBuffer) then
+  begin
+    FSplitBufSize := FOutput.Size;
+    FSplitBuffer := DotProductKernel.CreateBuffer(
+      CL_MEM_READ_WRITE, FOutput.Size * csNeuralFloatSize);
+  end;
+  ChannelCount := Length(FChannels);
+  if (not Assigned(FChannelIdxBuffer)) and (ChannelCount > 0) then
+    FChannelIdxBuffer := DotProductKernel.CreateBuffer(
+      CL_MEM_READ_ONLY or CL_MEM_COPY_HOST_PTR,
+      ChannelCount * csLongintSize, @FChannels[0]);
+end;
+
+procedure TNNetSplitChannels.DisableOpenCL();
+begin
+  // FSplitBuffer is read through FSplitKernel's queue, so the output has to come
+  // back to RAM while that handle is still alive.
+  ForceOutputOnRAM();
+  inherited DisableOpenCL();
+  if Assigned(FNN) then FNN.FreeKernelIfNotShared('cai_split_channels', FSplitKernel);
+end;
+
+function TNNetSplitChannels.WillOpenCL(): boolean;
+var
+  SourceKernel: TNeuralKernel;
+begin
+  Result := false;
+  // Forward only: this path leaves the output on the device, and the backward
+  // pass still has readers of Output that never call ForceOutputOnRAM.
+  if FIsTrainable or (not FHasOpenCL) then exit;
+  if (not Assigned(FSplitKernel)) or (not Assigned(FSplitBuffer)) or
+     (not Assigned(FChannelIdxBuffer)) then exit;
+  if not Assigned(FPrevLayer) then exit;
+  if not FPrevLayer.FOutputOnOpenCL then exit;
+  // The source is in host memory too, so the CPU gather moves nothing while the
+  // device gather would still have to download its slice.
+  if FPrevLayer.FOutputOnRAM then exit;
+  SourceKernel := FPrevLayer.OpenCLOutputKernel();
+  // Same command queue means the gather is ordered behind the forward that
+  // produced its input with no event and no Finish. Different queues are
+  // unordered with respect to each other, so that case stays on the CPU.
+  if (not Assigned(SourceKernel)) or
+     (SourceKernel.Commands <> FSplitKernel.Commands) or
+     (not Assigned(FPrevLayer.OpenCLOutputBuffer())) then exit;
+  Result := true;
+end;
+
+function TNNetSplitChannels.OpenCLOutputBuffer(): cl_mem;
+begin
+  Result := FSplitBuffer;
+end;
+
+function TNNetSplitChannels.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  Result := FSplitKernel;
+end;
+
+procedure TNNetSplitChannels.ComputeOpenCL();
+var
+  Kern: cl_kernel;
+  SourceBuffer: cl_mem;
+  iPositionCount, iOutDepth, iInDepth: longint;
+begin
+  Kern := FSplitKernel.Kernel;
+  SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+  iPositionCount := FOutput.SizeX * FOutput.SizeY;
+  iOutDepth := FOutput.Depth;
+  iInDepth := FPrevLayer.FOutput.Depth;
+  clSetKernelArg(Kern, 0, csLongintSize, @iPositionCount);
+  clSetKernelArg(Kern, 1, csLongintSize, @iOutDepth);
+  clSetKernelArg(Kern, 2, csLongintSize, @iInDepth);
+  clSetKernelArg(Kern, 3, csCLMemSize, @FChannelIdxBuffer);
+  clSetKernelArg(Kern, 4, csCLMemSize, @SourceBuffer);
+  clSetKernelArg(Kern, 5, csCLMemSize, @FSplitBuffer);
+  FSplitKernel.RunKernel2D(Kern, iPositionCount, iOutDepth);
+  // No read back here: the slice stays on the device until a host reader calls
+  // ForceOutputOnRAM, so a device consumer never pays a round trip.
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+{$ENDIF}
 
 procedure TNNetSplitChannels.Compute();
 var
@@ -93684,7 +93807,19 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
   MaxX     := FOutput.SizeX - 1;
   MaxY     := FOutput.SizeY - 1;
   // Rule #9: bind the previous layer's output once, above the loops.

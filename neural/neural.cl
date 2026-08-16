@@ -1544,6 +1544,31 @@ __kernel void cai_volume_sum
   FDst[i] = total;
 }
 
+// CAI channel gather (TNNetSplitChannels forward). Output element (pos, d) is
+// source element (pos, FChannelIdx[d]), so one kernel covers both a contiguous
+// channel run and the arbitrary channel list of TNNetSplitChannelEvery. A
+// position is an (X,Y) site: both volumes share SizeX/SizeY, so pos indexes the
+// same site in each and only the depth stride differs. TNNetSplitChannels only
+// dispatches this when the source output is ALREADY resident on the device, so
+// nothing is uploaded here and the slice stays on the device until a host reader
+// asks for it. Launched 2-D: dim 0 = position, dim 1 = output channel.
+// Coded by Claude (AI).
+__kernel void cai_split_channels
+(
+  const int FPositionCount,
+  const int FOutDepth,
+  const int FInDepth,
+  __global const int* FChannelIdx,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int pos = get_global_id(0);
+  const int d = get_global_id(1);
+  if ((pos >= FPositionCount) || (d >= FOutDepth)) return;
+  FDst[pos * FOutDepth + d] = FSrc[pos * FInDepth + FChannelIdx[d]];
+}
+
 // CAI Depthwise Convolution 2-D forward (TNNetDepthwiseConv).
 // Coded by Claude (AI).
 // A TRUE per-channel convolution: output channel (n*FInDepth + d) reduces ONLY

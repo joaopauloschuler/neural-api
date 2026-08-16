@@ -354,6 +354,9 @@ type
     // Sweeps 2, 3 and 5 sources: the last one exercises the accumulate branch
     // (4 sources, then 1 more into the same buffer). Coded by Claude (AI).
     procedure TestSumOpenCLParity;
+    // Device-side channel gather (cai_split_channels) forward parity for
+    // TNNetSplitChannels: contiguous slice, single channel, SplitChannelEvery.
+    procedure TestSplitChannelsOpenCLParity;
     // Device-side im2col (cai_im2col) forward parity for the general convolution:
     // an inference-only conv gathers FInputPrepared on the device instead of the
     // host. Sweeps feature-size x padding x stride so the gather index math
@@ -64544,6 +64547,103 @@ begin
         ' sources', SumLayer.ForwardGPUCnt > 0);
       AssertTrue('TNNetSum OpenCL vs CPU parity (' + IntToStr(BranchCnt) +
         ' sources): max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+        MaxDiff < 1e-4);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestSplitChannelsOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  InputLayer, SourceLayer: TNNetLayer;
+  SplitLayer: TNNetSplitChannels;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InSize, CaseCnt: integer;
+  Diff, MaxDiff: TNeuralFloat;
+  CaseName: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CaseCnt := 0 to 2 do
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, 8);
+    OutCPU := TNNetVolume.Create();
+    try
+      InputLayer := NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+      // A ReLU convolution: cai_dot_product applies the activation on the
+      // device, which is what leaves the source output in device memory.
+      SourceLayer := NN.AddLayerAfter(
+        TNNetConvolutionReLU.Create(8, 3, 1, 1), InputLayer);
+      case CaseCnt of
+        0:
+        begin
+          CaseName := 'contiguous 3-channel slice';
+          SplitLayer := TNNetSplitChannels.Create(2, 3);
+        end;
+        1:
+        begin
+          CaseName := 'single channel';
+          SplitLayer := TNNetSplitChannels.Create(5, 1);
+        end;
+      else
+        // Non-contiguous: exercises the uploaded channel-index buffer.
+        CaseName := 'every 2nd channel';
+        SplitLayer := TNNetSplitChannelEvery.Create(2, 0);
+      end;
+      NN.AddLayerAfter(SplitLayer, SourceLayer);
+      // The device path is inference-only, so the split never fires without this.
+      NN.SetTrainable(False, False);
+
+      InSize := Input.Size;
+      for i := 0 to InSize - 1 do
+        Input.Raw[i] := 0.05 * i - 0.3;
+
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+      AssertEquals('split ran on the CPU before EnableOpenCL', 0,
+        SplitLayer.ForwardGPUCnt);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Second device forward: the split reuses its resident result buffer.
+        NN.Compute(Input);
+        MaxDiff := 0;
+        AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  SplitChannels OpenCL parity: ', CaseName, ' max|diff|=',
+        MaxDiff:0:9, ' gpu forwards=', SplitLayer.ForwardGPUCnt);
+      // Without this a silent fall back to the CPU would compare the reference
+      // against itself and pass while covering nothing.
+      AssertTrue('TNNetSplitChannels must reach the device (' + CaseName + ')',
+        SplitLayer.ForwardGPUCnt > 0);
+      AssertTrue('TNNetSplitChannels OpenCL vs CPU parity (' + CaseName +
+        '): max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
         MaxDiff < 1e-4);
     finally
       OutCPU.Free;
