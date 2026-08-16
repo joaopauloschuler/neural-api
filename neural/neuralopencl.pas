@@ -204,10 +204,11 @@ type
       constructor Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product'; pHideMessages: boolean = false);
       // Binds a kernel entry point against the ALREADY-COMPILED program of a
       // shared kernel (e.g. the net-wide dot-product kernel) instead of
-      // recompiling neural.cl. The context, command queue and program are
-      // borrowed from SharedKernel and are not released by this instance; only
-      // the kernel handle and the per-instance buffers are owned here. This is
-      // the shared-program form of the auxiliary helper kernels (RoPE, softmax,
+      // recompiling neural.cl. The context and program are borrowed from
+      // SharedKernel, and so is its command queue unless pSharedQueue is False;
+      // borrowed handles are not released by this instance. Only the kernel
+      // handle and the per-instance buffers are owned here. This is the
+      // shared-program form of the auxiliary helper kernels (RoPE, softmax,
       // norms, gathers, ...). (Coded by Claude (AI).)
       constructor CreateFromProgram(SharedKernel: TEasyOpenCL;
         kernelname: string; pHideMessages: boolean = true;
@@ -640,11 +641,12 @@ begin
   if (err <> CL_SUCCESS) then
     ErrorProc('Error: BuildInputColsOnDevice - failed setting parameters: ' + IntToStr(err));
 
-  // Enqueue the gather on the DOT-PRODUCT kernel's queue, not the im2col kernel's
-  // own one. Every TNeuralKernel carries a private command queue, and queues are
-  // unordered with respect to each other: the source upload above, this gather and
-  // the Compute GEMM that reads FInputBufferBs are only ordered while all three ride
-  // one in-order queue. Enqueued here they are, so no event or Finish is needed - and
+  // Enqueue the gather on the DOT-PRODUCT kernel's queue rather than on whatever
+  // queue the im2col kernel holds. The source upload above, this gather and the
+  // Compute GEMM that reads FInputBufferBs are only ordered while all three ride
+  // one in-order queue; queues are unordered with respect to each other, so this
+  // stays correct even when the im2col kernel was built with its own queue
+  // (CreateFromProgram's pSharedQueue = False). No event or Finish is needed, and
   // the cross-kernel enqueue is legal because both kernels share the same context
   // (ComputeInt8 runs the int8 kernel on this queue for the same reason).
   FDotProductKernel.RunKernel(k, N);

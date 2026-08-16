@@ -796,7 +796,8 @@ type
       property ActivationFn: TNeuralActivationFunction read FActivationFn write FActivationFn;
       property ActivationFnDerivative: TNeuralActivationFunction read FActivationFnDerivative write FActivationFnDerivative;
       property Neurons: TNNetNeuronList read FNeurons;
-      // True once SetTrainable(True) has marked the layer forward-only.
+      // True by default; SetTrainable(False) clears it and marks the layer
+      // forward-only.
       property IsTrainable: boolean read FIsTrainable;
       property NN:TNNet read FNN write FNN;
       property Output: TNNetVolume read FOutput;
@@ -12040,9 +12041,29 @@ type
 
   /// This layer sums layers of same size allowing resnet style layers.
   TNNetSum = class(TNNetConcatBase)
+  protected
+    {$IFDEF OpenCL}
+    // Net-wide cai_volume_sum handle, borrowed from FNN in EnableOpenCL; the net
+    // owns and frees it. Its queue is also the queue the sources produced on.
+    FSumKernel: TNeuralKernel;
+    // Persistent device buffer holding this layer's output. Allocated ONCE in
+    // EnableOpenCL and reused by every forward, so no forward pass allocates.
+    FSumBuffer: cl_mem;
+    FSumBufSize: integer; // element capacity of FSumBuffer
+    // Adds the already-resident source outputs into FSumBuffer and leaves the
+    // result there. The caller gates on WillOpenCL() and bumps FForwardGPUCnt.
+    procedure ComputeOpenCL();
+    {$ENDIF}
   public
     constructor Create(aL: array of TNNetLayer); reintroduce; overload;
     destructor Destroy(); override;
+    {$IFDEF OpenCL}
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    procedure DisableOpenCL(); override;
+    function WillOpenCL(): boolean; override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
+    {$ENDIF}
 
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -74909,12 +74930,130 @@ begin
   end;
   FActivationFn := @Identity;
   FActivationFnDerivative := @IdentityDerivative;
+  {$IFDEF OpenCL}
+  FSumKernel := nil;
+  FSumBuffer := nil;
+  FSumBufSize := 0;
+  {$ENDIF}
 end;
 
 destructor TNNetSum.Destroy();
 begin
+  {$IFDEF OpenCL}
+  if Assigned(FSumBuffer) then clReleaseMemObject(FSumBuffer);
+  if Assigned(FNN) then FNN.FreeKernelIfNotShared('cai_volume_sum', FSumKernel);
+  {$ENDIF}
   inherited Destroy();
 end;
+
+{$IFDEF OpenCL}
+procedure TNNetSum.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  // Acquire once: a second call would leak a private handle.
+  if Assigned(FNN) and (not Assigned(FSumKernel)) then
+    FSumKernel := FNN.GetKernel('cai_volume_sum');
+  if Assigned(FSumBuffer) and (FSumBufSize <> FOutput.Size) then
+  begin
+    clReleaseMemObject(FSumBuffer);
+    FSumBuffer := nil;
+  end;
+  if not Assigned(FSumBuffer) then
+  begin
+    FSumBufSize := FOutput.Size;
+    FSumBuffer := DotProductKernel.CreateBuffer(
+      CL_MEM_READ_WRITE, FOutput.Size * csNeuralFloatSize);
+  end;
+end;
+
+procedure TNNetSum.DisableOpenCL();
+begin
+  // FSumBuffer is read through FSumKernel's queue, so the output has to come
+  // back to RAM while that handle is still alive.
+  ForceOutputOnRAM();
+  inherited DisableOpenCL();
+  if Assigned(FNN) then FNN.FreeKernelIfNotShared('cai_volume_sum', FSumKernel);
+end;
+
+function TNNetSum.WillOpenCL(): boolean;
+var
+  MaxSourcePos, SourcePos: integer;
+  SourceKernel: TNeuralKernel;
+begin
+  Result := false;
+  // Forward only: this path leaves the output on the device, and the backward
+  // pass still has readers of Output that never call ForceOutputOnRAM.
+  if FIsTrainable or (not FHasOpenCL) then exit;
+  if (not Assigned(FSumKernel)) or (not Assigned(FSumBuffer)) then exit;
+  // A single source is a copy, not a sum: nothing to win on the device.
+  if FPrevOutput.Count < 2 then exit;
+  if not FPrevLayerList.OutputOnOpenCL() then exit;
+  MaxSourcePos := FPrevLayerList.Count - 1;
+  for SourcePos := 0 to MaxSourcePos do
+  begin
+    SourceKernel := FPrevLayerList[SourcePos].OpenCLOutputKernel();
+    // Same command queue means the sum is ordered behind the forwards that
+    // produced its inputs with no event and no Finish. Different queues are
+    // unordered with respect to each other, so that case stays on the CPU.
+    if (not Assigned(SourceKernel)) or
+       (SourceKernel.Commands <> FSumKernel.Commands) or
+       (not Assigned(FPrevLayerList[SourcePos].OpenCLOutputBuffer())) then exit;
+  end;
+  Result := true;
+end;
+
+function TNNetSum.OpenCLOutputBuffer(): cl_mem;
+begin
+  Result := FSumBuffer;
+end;
+
+function TNNetSum.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  Result := FSumKernel;
+end;
+
+procedure TNNetSum.ComputeOpenCL();
+var
+  Kern: cl_kernel;
+  MaxSourcePos, SourcePos, SlotCnt, SlotPos: integer;
+  iSize, iCount, iAccumulate: longint;
+  SlotBuffer: array[0..3] of cl_mem;
+begin
+  Kern := FSumKernel.Kernel;
+  iSize := FOutput.Size;
+  MaxSourcePos := FPrevLayerList.Count - 1;
+  SourcePos := 0;
+  iAccumulate := 0;
+  // Four sources per launch: the residual (2) and the fused residual (3) take
+  // one launch, and any wider sum accumulates into FSumBuffer across launches.
+  while SourcePos <= MaxSourcePos do
+  begin
+    SlotCnt := 0;
+    while (SlotCnt < 4) and (SourcePos <= MaxSourcePos) do
+    begin
+      SlotBuffer[SlotCnt] := FPrevLayerList[SourcePos].OpenCLOutputBuffer();
+      Inc(SlotCnt);
+      Inc(SourcePos);
+    end;
+    for SlotPos := SlotCnt to 3 do SlotBuffer[SlotPos] := SlotBuffer[0];
+    iCount := SlotCnt;
+    clSetKernelArg(Kern, 0, csLongintSize, @iSize);
+    clSetKernelArg(Kern, 1, csLongintSize, @iCount);
+    clSetKernelArg(Kern, 2, csLongintSize, @iAccumulate);
+    clSetKernelArg(Kern, 3, csCLMemSize, @SlotBuffer[0]);
+    clSetKernelArg(Kern, 4, csCLMemSize, @SlotBuffer[1]);
+    clSetKernelArg(Kern, 5, csCLMemSize, @SlotBuffer[2]);
+    clSetKernelArg(Kern, 6, csCLMemSize, @SlotBuffer[3]);
+    clSetKernelArg(Kern, 7, csCLMemSize, @FSumBuffer);
+    FSumKernel.RunKernel(Kern, iSize);
+    iAccumulate := 1;
+  end;
+  // No read back here: the result stays on the device until a host reader calls
+  // ForceOutputOnRAM, so N downloads become one.
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+end;
+{$ENDIF}
 
 procedure TNNetSum.Compute();
 var
@@ -74923,7 +75062,19 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} FPrevLayerList.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  FPrevLayerList.ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
   FOutput.Copy(FPrevOutput[0]);
   if FPrevOutput.Count > 1 then
   begin

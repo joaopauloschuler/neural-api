@@ -348,6 +348,12 @@ type
     // (shares the cai_dot_product FDotCL). Sweeps the four opcodes x bias/nobias
     // on an inference-only dense layer. Coded by Claude (AI).
     procedure TestFullConnectActivationFusionOpenCLParity;
+    // Device-side multi-source sum (cai_volume_sum) forward parity for TNNetSum.
+    // The branches are fused-activation convolutions, so their outputs are ALREADY
+    // resident on the device and the sum binds them instead of downloading them.
+    // Sweeps 2, 3 and 5 sources: the last one exercises the accumulate branch
+    // (4 sources, then 1 more into the same buffer). Coded by Claude (AI).
+    procedure TestSumOpenCLParity;
     // Device-side im2col (cai_im2col) forward parity for the general convolution:
     // an inference-only conv gathers FInputPrepared on the device instead of the
     // host. Sweeps feature-size x padding x stride so the gather index math
@@ -64456,6 +64462,94 @@ begin
     OutCPU.Free;
     Input.Free;
     NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestSumOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  InputLayer: TNNetLayer;
+  SumLayer: TNNetSum;
+  Branches: array of TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  BranchCnt, BranchPos, i, InSize, CaseCnt: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  BranchCounts: array[0..2] of integer = (2, 3, 5);
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CaseCnt := Low(BranchCounts) to High(BranchCounts) do
+  begin
+    BranchCnt := BranchCounts[CaseCnt];
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, 8);
+    OutCPU := TNNetVolume.Create();
+    try
+      InputLayer := NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+      SetLength(Branches, BranchCnt);
+      for BranchPos := 0 to BranchCnt - 1 do
+      begin
+        // ReLU convolutions: cai_dot_product applies the activation on the
+        // device, which is what leaves each branch output in device memory.
+        Branches[BranchPos] := NN.AddLayerAfter(
+          TNNetConvolutionReLU.Create(8, 3, 1, 1), InputLayer);
+      end;
+      SumLayer := TNNetSum.Create(Branches);
+      NN.AddLayer(SumLayer);
+      // The device path is inference-only, so the sum never fires without this.
+      NN.SetTrainable(False, False);
+
+      InSize := Input.Size;
+      for i := 0 to InSize - 1 do
+        Input.Raw[i] := 0.05 * i - 0.3;
+
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+      AssertEquals('sum ran on the CPU before EnableOpenCL', 0, SumLayer.ForwardGPUCnt);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Second device forward: the sum reuses its resident result buffer.
+        NN.Compute(Input);
+        MaxDiff := 0;
+        AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  Sum OpenCL parity: sources=', BranchCnt, ' max|diff|=', MaxDiff:0:9,
+        ' gpu forwards=', SumLayer.ForwardGPUCnt);
+      // Without this a silent fall back to the CPU would compare the reference
+      // against itself and pass while covering nothing.
+      AssertTrue('TNNetSum must reach the device with ' + IntToStr(BranchCnt) +
+        ' sources', SumLayer.ForwardGPUCnt > 0);
+      AssertTrue('TNNetSum OpenCL vs CPU parity (' + IntToStr(BranchCnt) +
+        ' sources): max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+        MaxDiff < 1e-4);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
   end;
 end;
 {$ELSE}

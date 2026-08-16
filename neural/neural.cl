@@ -1514,6 +1514,36 @@ __kernel void cai_activation
   FY[i] = y;
 }
 
+// CAI multi-source elementwise sum (TNNetSum forward). One work-item per element
+// adds FCount (1..4) same-sized sources into FDst; with FAccumulate the sources
+// are added to what FDst already holds, so more than 4 sources finish in
+// ceil(sources/4) launches. TNNetSum only dispatches this when EVERY source
+// output is ALREADY resident on the device, so nothing is uploaded here and the
+// result stays on the device until a host reader asks for it. Slots the launch
+// does not use repeat the first source (never a NULL argument) and are kept out
+// of the sum by FCount. Coded by Claude (AI).
+__kernel void cai_volume_sum
+(
+  const int FSize,
+  const int FCount,
+  const int FAccumulate,
+  __global const float* FA,
+  __global const float* FB,
+  __global const float* FC,
+  __global const float* FD,
+  __global float* FDst
+)
+{
+  const int i = get_global_id(0);
+  if (i >= FSize) return;
+  float total = (FAccumulate != 0) ? FDst[i] : 0.0f;
+  total += FA[i];
+  if (FCount > 1) total += FB[i];
+  if (FCount > 2) total += FC[i];
+  if (FCount > 3) total += FD[i];
+  FDst[i] = total;
+}
+
 // CAI Depthwise Convolution 2-D forward (TNNetDepthwiseConv).
 // Coded by Claude (AI).
 // A TRUE per-channel convolution: output channel (n*FInDepth + d) reduces ONLY
