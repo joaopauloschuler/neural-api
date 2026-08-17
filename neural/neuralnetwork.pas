@@ -52382,42 +52382,37 @@ var
   LocalPrevOutput: TNNetVolume;
   OutputCnt: integer;
   StartTime: double;
-  CurrValue: TNeuralFloat;
+  CurrValue, CurrDeriv: TNeuralFloat;
+  HasErrorDeriv: boolean;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
+  // The clamp runs on every call; only the derivative depends on the error
+  // volumes, which SetTrainable(False, False) shrinks away at inference.
+  HasErrorDeriv :=
+    (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size);
 
-  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
+  for OutputCnt := 0 to SizeM1 do
   begin
-    for OutputCnt := 0 to SizeM1 do
+    CurrValue := LocalPrevOutput.FData[OutputCnt];
+    if (CurrValue > FHighLimit) then
     begin
-      CurrValue := LocalPrevOutput.FData[OutputCnt];
-      if (CurrValue > FHighLimit) then
-      begin
-        FOutput.FData[OutputCnt] := FHighLimit + (CurrValue-FHighLimit) * FScale;
-        FOutputErrorDeriv.FData[OutputCnt] := FScale;
-      end
-      else if (CurrValue > FLowLimit) then
-      begin
-        FOutput.FData[OutputCnt] := CurrValue;
-        FOutputErrorDeriv.FData[OutputCnt] := 1;
-      end
-      else
-      begin
-        FOutput.FData[OutputCnt] := FLowLimit + (CurrValue-FLowLimit) * FScale;
-        FOutputErrorDeriv.FData[OutputCnt] := FScale;
-      end;
-    end;
-  end
-  else
-  begin
-    // not intended for input
-    for OutputCnt := 0 to SizeM1 do
+      FOutput.FData[OutputCnt] := FHighLimit + (CurrValue-FHighLimit) * FScale;
+      CurrDeriv := FScale;
+    end
+    else if (CurrValue > FLowLimit) then
     begin
-      FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := CurrValue;
+      CurrDeriv := 1;
+    end
+    else
+    begin
+      FOutput.FData[OutputCnt] := FLowLimit + (CurrValue-FLowLimit) * FScale;
+      CurrDeriv := FScale;
     end;
+    if HasErrorDeriv then FOutputErrorDeriv.FData[OutputCnt] := CurrDeriv;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
