@@ -61,6 +61,7 @@ type
     procedure TestLayerCount;
     // Additional activation function tests
     procedure TestReLU6Activation;
+    procedure TestReLULClampsAtInference;
     procedure TestLeakyReLUActivation;
     procedure TestSwishActivation;
     procedure TestHyperbolicTangent;
@@ -2187,8 +2188,7 @@ begin
   NN := TNNet.Create();
   Input := TNNetVolume.Create(5, 1, 1);
   try
-    // TNNetReLU6: ReLU clamped to [0, 6]
-    // Note: Full activation behavior only applies during training when error derivatives are set
+    // TNNetReLU6 is a TNNetReLUL with limits [0, 6] and no leak.
     NN.AddLayer(TNNetInput.Create(5));
     NN.AddLayer(TNNetReLU6.Create());
 
@@ -2200,14 +2200,45 @@ begin
 
     NN.Compute(Input);
 
-    // Verify output is produced
     AssertEquals('Output should have 5 elements', 5, NN.GetLastLayer.Output.Size);
-    // ReLU6 should not produce NaN values
-    AssertFalse('Output 0 should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[0]));
-    AssertFalse('Output 1 should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[1]));
-    AssertFalse('Output 2 should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[2]));
-    AssertFalse('Output 3 should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[3]));
-    AssertFalse('Output 4 should not be NaN', IsNaN(NN.GetLastLayer.Output.Raw[4]));
+    AssertEquals('ReLU6(-2) should clamp to 0', 0.0, NN.GetLastLayer.Output.Raw[0], 0.0001);
+    AssertEquals('ReLU6(0) should be 0', 0.0, NN.GetLastLayer.Output.Raw[1], 0.0001);
+    AssertEquals('ReLU6(3) should pass through', 3.0, NN.GetLastLayer.Output.Raw[2], 0.0001);
+    AssertEquals('ReLU6(6) should be 6', 6.0, NN.GetLastLayer.Output.Raw[3], 0.0001);
+    AssertEquals('ReLU6(10) should clamp to 6', 6.0, NN.GetLastLayer.Output.Raw[4], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// SetTrainable(False, False) shrinks the error volumes, which used to send
+// TNNetReLUL.Compute down a branch that copied the input instead of clamping.
+procedure TTestNeuralLayers.TestReLULClampsAtInference;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(5, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(5));
+    NN.AddLayer(TNNetReLU6.Create());
+    NN.SetTrainable(False, False);
+
+    Input.Raw[0] := -2.0;
+    Input.Raw[1] := 0.0;
+    Input.Raw[2] := 3.0;
+    Input.Raw[3] := 6.0;
+    Input.Raw[4] := 10.0;
+
+    NN.Compute(Input);
+
+    AssertEquals('inference ReLU6(-2) should clamp to 0', 0.0, NN.GetLastLayer.Output.Raw[0], 0.0001);
+    AssertEquals('inference ReLU6(0) should be 0', 0.0, NN.GetLastLayer.Output.Raw[1], 0.0001);
+    AssertEquals('inference ReLU6(3) should pass through', 3.0, NN.GetLastLayer.Output.Raw[2], 0.0001);
+    AssertEquals('inference ReLU6(6) should be 6', 6.0, NN.GetLastLayer.Output.Raw[3], 0.0001);
+    AssertEquals('inference ReLU6(10) should clamp to 6', 6.0, NN.GetLastLayer.Output.Raw[4], 0.0001);
   finally
     NN.Free;
     Input.Free;
