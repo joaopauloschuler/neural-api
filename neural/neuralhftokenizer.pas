@@ -3012,7 +3012,7 @@ begin
   FillChar(FAddedFirstByte, SizeOf(FAddedFirstByte), 0);
   for Cnt := 0 to AddedHi do
   begin
-    // An empty added token can never match, so it must not open the gate.
+    // An empty added token can never match, so it must not pass the prefilter.
     Content := FAddedTokens[Cnt].Content;
     if Content <> '' then FAddedFirstByte[byte(Content[1])] := true;
   end;

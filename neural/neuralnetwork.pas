@@ -13733,16 +13733,16 @@ type
       // True once the resident expert bank has been uploaded. WillOpenCL gates
       // on it, so an unarmed layer (device unavailable, or a bank whose upload
       // failed) silently stays on the fused CPU forward.
-      FDeviceArmed: boolean;
+      FOpenCLArmed: boolean;
       // Set by AfterWeightUpdate so an FP32 bank that changed after arming
       // re-uploads before the next device forward. int8 banks are immutable.
-      FDeviceWeightsDirty: boolean;
+      FOpenCLWeightsDirty: boolean;
       // Quantization mode the resident bank (and the bound kernel entry point)
       // was armed for. A bank quantized or dequantized AFTER arming flips
       // FQuantInt8 without any weight-update notification, so the two are
       // compared before every device forward and the helper is rebuilt on a
       // mismatch - the FP32 kernel would otherwise read int8 codes as floats.
-      FDeviceCLInt8: boolean;
+      FOpenCLArmedInt8: boolean;
       // Packed per-row biases ([NumExperts*HiddenSize]) staged for the device.
       // nil when every row bias is zero - the kernel then skips the bias add.
       FDevBias: TNNetVolume;
@@ -13774,12 +13774,12 @@ type
       {$IFDEF OpenCL}
       procedure ComputeOpenCL();
       // Builds FDevBias, or leaves it nil when the bank is bias-free.
-      procedure BuildDeviceBias();
+      procedure BuildOpenCLBias();
       // Uploads the FP32 bank through a transient packed volume (the bank keeps
       // per-neuron rows and never concatenates). Only the int8 path is used in
       // production; this exists for unquantized banks and parity tests.
-      procedure ArmDeviceWeightsFP32();
-      procedure ArmDeviceWeights();
+      procedure ArmOpenCLWeightsFP32();
+      procedure ArmOpenCLWeights();
       {$ENDIF}
     public
       function ChunkEligible(): boolean; override;
@@ -13903,7 +13903,7 @@ type
       // Net-wide shared cai_im2col handle (borrowed from FNN.SharedKernel, freed
       // by the net). Non-nil only on a non-pointwise conv that enabled the device
       // path; used by ComputeOpenCL to gather FInputPrepared on the device instead
-      // of on the host, gated on inference-only (see ShouldDeviceIm2Col). Coded by
+      // of on the host, restricted to inference-only (see ShouldOpenCLIm2Col). Coded by
       // Claude (AI).
       FIm2ColKernel: TNeuralKernel;
       {$ENDIF}
@@ -14032,7 +14032,7 @@ type
       // no Winograd, and the device forward being taken. Deterministic within a
       // forward, so Compute() can rely on it to skip the host im2col. Coded by
       // Claude (AI).
-      function ShouldDeviceIm2Col(): boolean; {$IFDEF Release} inline; {$ENDIF}
+      function ShouldOpenCLIm2Col(): boolean; {$IFDEF Release} inline; {$ENDIF}
       // True when the previous layer's finished output is on the device, bound
       // to a buffer, and this layer may read it (inference only).
       function PrevOutputOnOpenCL(): boolean; // Coded by Claude (AI).
@@ -99810,7 +99810,7 @@ end;
 // Packs the per-row biases the device kernel adds inside its slot loop. A bank
 // whose every row bias is zero (the usual case for MoE checkpoints) leaves
 // FDevBias nil, which pins the kernel's FUseBias to 0. Coded by Claude (AI).
-procedure TNNetMoEExpertBankDown.BuildDeviceBias();
+procedure TNNetMoEExpertBankDown.BuildOpenCLBias();
 var
   RowIdx, MaxRowPos: integer;
   HasBias: boolean;
@@ -99841,7 +99841,7 @@ end;
 // concatenates them (FShouldConcatWeights stays false), so the packed block the
 // device needs is built here, uploaded and released again - it is a transient,
 // not a second permanent copy of the bank. Coded by Claude (AI).
-procedure TNNetMoEExpertBankDown.ArmDeviceWeightsFP32();
+procedure TNNetMoEExpertBankDown.ArmOpenCLWeightsFP32();
 var
   PackedW: TNNetVolume;
   RowIdx, MaxRowPos: integer;
@@ -99860,13 +99860,13 @@ begin
   end;
 end;
 
-procedure TNNetMoEExpertBankDown.ArmDeviceWeights();
+procedure TNNetMoEExpertBankDown.ArmOpenCLWeights();
 begin
   if not Assigned(FMoEDownCL) then exit;
   // The entry point is chosen at construction from the quantization state, so a
   // bank that changed state after arming needs a fresh helper, not just a fresh
   // upload.
-  if FDeviceArmed and (FDeviceCLInt8 <> FQuantInt8) then
+  if FOpenCLArmed and (FOpenCLArmedInt8 <> FQuantInt8) then
   begin
     FreeAndNil(FMoEDownCL);
     FMoEDownCL := TNNetMoEExpertDownCL.Create(FNN, FQuantInt8);
@@ -99875,14 +99875,14 @@ begin
   // width says otherwise must not be uploaded: stay unarmed (CPU forward).
   if FQuantInt8 and (FQuantVectorSize <> FExpertWidth) then
   begin
-    FDeviceArmed := false;
+    FOpenCLArmed := false;
     FErrorProc('TNNetMoEExpertBankDown - layer ' + IntToStr(FLayerIdx) +
       ' int8 row width ' + IntToStr(FQuantVectorSize) +
       ' does not match the expert width ' + IntToStr(FExpertWidth) +
       '. The device forward stays disabled.');
     exit;
   end;
-  BuildDeviceBias();
+  BuildOpenCLBias();
   if FQuantInt8 then
   begin
     // The quantization table is already row-major in the layout the kernel
@@ -99890,11 +99890,11 @@ begin
     FMoEDownCL.ArmWeightsInt8(FQuantTable.DataPtr, FQuantTable.ScalePtr,
       FNeurons.Count, FQuantVectorSize);
   end
-  else ArmDeviceWeightsFP32();
+  else ArmOpenCLWeightsFP32();
   FMoEDownCL.ArmBias(FDevBias);
-  FDeviceCLInt8 := FQuantInt8;
-  FDeviceWeightsDirty := false;
-  FDeviceArmed := true;
+  FOpenCLArmedInt8 := FQuantInt8;
+  FOpenCLWeightsDirty := false;
+  FOpenCLArmed := true;
 end;
 
 procedure TNNetMoEExpertBankDown.EnableOpenCL(DotProductKernel: TNeuralKernel);
@@ -99914,7 +99914,7 @@ begin
   // run AFTER the checkpoint is loaded - arming a construction-time-quantized
   // bank before its weights arrive would upload a block of zeros. The
   // AfterWeightUpdate hook below re-arms if the weights change later.
-  ArmDeviceWeights();
+  ArmOpenCLWeights();
 end;
 
 procedure TNNetMoEExpertBankDown.DisableOpenCL();
@@ -99922,12 +99922,12 @@ begin
   inherited DisableOpenCL();
   FreeAndNil(FMoEDownCL);
   FreeAndNil(FDevBias);
-  FDeviceArmed := false;
+  FOpenCLArmed := false;
 end;
 
 function TNNetMoEExpertBankDown.WillOpenCL(): boolean;
 begin
-  Result := FHasOpenCL and FDeviceArmed and (FBank <> nil)
+  Result := FHasOpenCL and FOpenCLArmed and (FBank <> nil)
     and Assigned(FMoEDownCL)
     // The slot map is indexed with FTokenCnt, frozen at SetPrevLayer: a layer
     // whose output geometry drifted from it would misroute rows, so it falls
@@ -99942,7 +99942,7 @@ begin
   // The resident bank is now stale. int8 banks are immutable in practice (the
   // layer is inference-only), but an FP32 bank can still be rewritten by a
   // loader after arming, and re-uploading is far cheaper than being wrong.
-  FDeviceWeightsDirty := true;
+  FOpenCLWeightsDirty := true;
 end;
 
 // Single-launch device forward. Everything the kernel needs beyond the resident
@@ -99953,8 +99953,8 @@ var
   UnitCombineFlag: integer;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  if FDeviceWeightsDirty or (FDeviceCLInt8 <> FQuantInt8) then
-    ArmDeviceWeights();
+  if FOpenCLWeightsDirty or (FOpenCLArmedInt8 <> FQuantInt8) then
+    ArmOpenCLWeights();
   if FUnitCombine then UnitCombineFlag := 1 else UnitCombineFlag := 0;
   FMoEDownCL.Compute(@FBank.FSlotExpert[0], @FBank.FSlotCount[0],
     TNeuralFloatArrPtr(@FBank.FSlotGate[0]),
@@ -100776,7 +100776,7 @@ begin
 end;
 
 {$IFDEF OpenCL}
-function TNNetConvolution.ShouldDeviceIm2Col(): boolean;
+function TNNetConvolution.ShouldOpenCLIm2Col(): boolean;
 begin
   Result := Assigned(FIm2ColKernel) and (not FPointwise) and (not FIsTrainable)
     and WillOpenCL() and (not WinogradEligible());
@@ -100811,14 +100811,14 @@ end;
 // host, which needs the source in host memory. Coded by Claude (AI).
 function TNNetConvolution.ShouldBindPrevOutputAsIm2ColSrc(): boolean;
 begin
-  Result := (FPadding = 0) and PrevOutputOnOpenCL() and ShouldDeviceIm2Col();
+  Result := (FPadding = 0) and PrevOutputOnOpenCL() and ShouldOpenCLIm2Col();
 end;
 
 procedure TNNetConvolution.ComputeOpenCL();
 var
   InputAVolume: TNNetVolume;
   ActOpcode: integer;
-  ActivationFunctionInOpenCL, WUpdated, DeviceIm2Col: boolean;
+  ActivationFunctionInOpenCL, WUpdated, OpenCLIm2Col: boolean;
   BiasVol: TNNetVolume;
   PrevOutputBuffer, Im2ColSrcBuffer: cl_mem;
 begin
@@ -100874,19 +100874,19 @@ begin
   // kernels share one in-order queue, so the gather is ordered before the GEMM.
   // Im2ColSrcBuffer replaces even that upload when the source is already there.
   // Coded by Claude (AI).
-  DeviceIm2Col := ShouldDeviceIm2Col();
+  OpenCLIm2Col := ShouldOpenCLIm2Col();
   // A borrowed buffer was produced on the source layer's queue, so block on that
   // queue first (a no-op when it is this layer's queue too).
   if (PrevOutputBuffer <> nil) or (Im2ColSrcBuffer <> nil) then
     FPrevLayer.OpenCLOutputFinish(FDotCL.DotProductKernel);
-  if DeviceIm2Col then
+  if OpenCLIm2Col then
     FDotCL.BuildInputColsOnDevice(FIm2ColKernel, FInputCopy,
       {OutSizeX}FOutput.SizeX, {ColDepth}FVectorSize,
       {RowSpan}FInputCopy.Depth * FFeatureSizeX, {InSizeX}FInputCopy.SizeX,
       {InDepth}FInputCopy.Depth, {Stride}FStride, {NewSrc}true, Im2ColSrcBuffer);
 
   FDotCL.Compute(InputAVolume, FInputPrepared, ActOpcode, {NewVAs}WUpdated,
-    {NewVBs}(not DeviceIm2Col), BiasVol, {NewVBias}WUpdated, PrevOutputBuffer);
+    {NewVBs}(not OpenCLIm2Col), BiasVol, {NewVBias}WUpdated, PrevOutputBuffer);
   FAfterWeightUpdateHasBeenCalled := false;
 
   if ActivationFunctionInOpenCL then
@@ -100921,23 +100921,23 @@ procedure TNNetConvolution.ComputeOpenCLInt8(pPrevOutputBuffer: cl_mem;
   pIm2ColSrcBuffer: cl_mem);
 var
   ActOpcode: integer;
-  ActivationFunctionInOpenCL, DeviceIm2Col: boolean;
+  ActivationFunctionInOpenCL, OpenCLIm2Col: boolean;
   BiasVol: TNNetVolume;
 begin
   ActivationFunctionInOpenCL := IsActivationFunctionInOpenCL(ActOpcode);
 
   if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
 
-  DeviceIm2Col := ShouldDeviceIm2Col();
+  OpenCLIm2Col := ShouldOpenCLIm2Col();
   if (pPrevOutputBuffer <> nil) or (pIm2ColSrcBuffer <> nil) then
     FPrevLayer.OpenCLOutputFinish(FDotCL.DotProductKernel);
-  if DeviceIm2Col then
+  if OpenCLIm2Col then
     FDotCL.BuildInputColsOnDevice(FIm2ColKernel, FInputCopy,
       {OutSizeX}FOutput.SizeX, {ColDepth}FVectorSize,
       {RowSpan}FInputCopy.Depth * FFeatureSizeX, {InSizeX}FInputCopy.SizeX,
       {InDepth}FInputCopy.Depth, {Stride}FStride, {NewSrc}true, pIm2ColSrcBuffer);
 
-  FDotCL.ComputeInt8(FInputPrepared, ActOpcode, {NewVBs}(not DeviceIm2Col),
+  FDotCL.ComputeInt8(FInputPrepared, ActOpcode, {NewVBs}(not OpenCLIm2Col),
     BiasVol, {NewVBias}false, pPrevOutputBuffer);
 
   if ActivationFunctionInOpenCL then
@@ -101689,7 +101689,7 @@ begin
     // FDotCL was prepared with, so its device buffer stays correctly sized. The
     // gather reads FInputCopy (built above), so padding still happens on host.
     {$IFDEF OpenCL}
-    if not ShouldDeviceIm2Col() then PrepareInputForConvolutionFast();
+    if not ShouldOpenCLIm2Col() then PrepareInputForConvolutionFast();
     if WillOpenCL() then
     begin
       Inc(FForwardGPUCnt);

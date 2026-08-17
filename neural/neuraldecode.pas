@@ -3280,7 +3280,7 @@ begin
   // per state, hence rebuilt exactly when the machine's version moves.
   if FFirstOKVersion <> FMachine.Version then BuildFirstOK();
   if not FFirstOK[Ord(S[1])] then exit(false);
-  // A one-character token is fully decided by that gate. FFirstOK[c] is
+  // A one-character token is fully decided by that prefilter. FFirstOK[c] is
   // FMachine.CharAllowed(c), CharAllowed is save-state / FeedChar / restore, so
   // its boolean IS FeedChar's; and FProbe is an exact clone of FMachine, so
   // FProbe.FeedChar(S[1]) would return that same boolean. Char-level
