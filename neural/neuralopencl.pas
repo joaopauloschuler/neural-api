@@ -314,8 +314,13 @@ type
       /// EnableOpenCL) and BEFORE the matching Compute(..., NewVBs=false), on the
       /// same in-order command queue so the gather is ordered before the GEMM.
       /// Coded by Claude (AI).
+      /// pExternalSrc BORROWS an already-resident gather source (a producing
+      /// layer's output buffer) in place of FIm2ColSrcBuffer: nothing is
+      /// uploaded and nothing is released here. SrcVol then only carries the
+      /// shape. Coded by Claude (AI).
       procedure BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel; SrcVol: TNNetVolume;
-        OutSizeX, ColDepth, RowSpan, InSizeX, InDepth, Stride: longint; NewSrc: boolean = true);
+        OutSizeX, ColDepth, RowSpan, InSizeX, InDepth, Stride: longint; NewSrc: boolean = true;
+        pExternalSrc: cl_mem = nil);
       /// pExternalVBs BORROWS a B operand that is already on the device (a
       /// producing layer's output buffer): it is bound instead of
       /// FInputBufferBs, never uploaded and never released here. VBs then only
@@ -609,29 +614,38 @@ end;
 
 procedure TDotProductSharedKernel.BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel;
   SrcVol: TNNetVolume; OutSizeX, ColDepth, RowSpan, InSizeX, InDepth, Stride: longint;
-  NewSrc: boolean = true);
+  NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
 var
   k: cl_kernel;
   N: longint;
   err: integer;
   NeededSrc: csize_t;
+  SrcBuffer: cl_mem;
 begin
   k := Im2ColKernel.Kernel;
   // Total column-matrix elements = FInputBufferBs capacity (already sized to
   // FInputPrepared by PrepareForCompute). FNumBs*FSize == FInputPrepared.Size.
   N := FNumBs * FSize;
 
-  // Resident, grow-only source buffer (same model as the operand/bias buffers).
-  NeededSrc := SrcVol.GetMemSize();
-  if (FIm2ColSrcBuffer = nil) or (NeededSrc > FCapIm2ColSrc) then
+  err := CL_SUCCESS;
+  if pExternalSrc <> nil then
   begin
-    if Assigned(FIm2ColSrcBuffer) then clReleaseMemObject(FIm2ColSrcBuffer);
-    FIm2ColSrcBuffer := FDotProductKernel.CreateInputBuffer(NeededSrc);
-    FCapIm2ColSrc := NeededSrc;
-    NewSrc := true; // fresh/grown buffer: force upload regardless of caller
+    SrcBuffer := pExternalSrc;
+  end
+  else
+  begin
+    // Resident, grow-only source buffer (same model as the operand/bias buffers).
+    NeededSrc := SrcVol.GetMemSize();
+    if (FIm2ColSrcBuffer = nil) or (NeededSrc > FCapIm2ColSrc) then
+    begin
+      if Assigned(FIm2ColSrcBuffer) then clReleaseMemObject(FIm2ColSrcBuffer);
+      FIm2ColSrcBuffer := FDotProductKernel.CreateInputBuffer(NeededSrc);
+      FCapIm2ColSrc := NeededSrc;
+      NewSrc := true; // fresh/grown buffer: force upload regardless of caller
+    end;
+    SrcBuffer := FIm2ColSrcBuffer;
+    if NewSrc then err := FDotProductKernel.WriteBuffer(FIm2ColSrcBuffer, SrcVol);
   end;
-  if NewSrc then err := FDotProductKernel.WriteBuffer(FIm2ColSrcBuffer, SrcVol)
-  else err := CL_SUCCESS;
 
   err := err or clSetKernelArg(k, 0, csLongintSize, @N);
   err := err or clSetKernelArg(k, 1, csLongintSize, @OutSizeX);
@@ -640,7 +654,7 @@ begin
   err := err or clSetKernelArg(k, 4, csLongintSize, @InSizeX);
   err := err or clSetKernelArg(k, 5, csLongintSize, @InDepth);
   err := err or clSetKernelArg(k, 6, csLongintSize, @Stride);
-  err := err or clSetKernelArg(k, 7, csCLMemSize, @FIm2ColSrcBuffer);
+  err := err or clSetKernelArg(k, 7, csCLMemSize, @SrcBuffer);
   err := err or clSetKernelArg(k, 8, csCLMemSize, @FInputBufferBs);
   if (err <> CL_SUCCESS) then
     ErrorProc('Error: BuildInputColsOnDevice - failed setting parameters: ' + IntToStr(err));

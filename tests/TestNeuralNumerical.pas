@@ -370,6 +370,11 @@ type
     // cannot tell the two apart, so the test also fills the source layer's host
     // output with a sentinel and asserts nothing overwrote it. Coded by Claude (AI).
     procedure TestPointwiseConvResidentInputOpenCLParity;
+    // The spatial twin: an unpadded conv gathers its column matrix with
+    // cai_im2col straight out of the source layer's device buffer, so the
+    // FInputCopy upload disappears too. Same sentinel probe, swept over feature
+    // size and stride. Coded by Claude (AI).
+    procedure TestConvIm2ColResidentSourceOpenCLParity;
     procedure TestActivationOpenCLParity;
     // Device-side im2col (cai_im2col) forward parity for the general convolution:
     // an inference-only conv gathers FInputPrepared on the device instead of the
@@ -64654,6 +64659,89 @@ begin
         if SourceConv.Output.Raw[i] = csSentinel then Inc(SentinelsLeft);
       AssertEquals('ForceOutputOnRAM must still recover the source output ' +
         '(case ' + IntToStr(CaseCnt) + ')', 0, SentinelsLeft);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestConvIm2ColResidentSourceOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  SourceConv, GatherConv: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, SentinelsLeft, CaseCnt: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = 999;
+  // The consumer must be unpadded: CopyPadding builds FInputCopy on the host.
+  FeatureSizes: array[0..2] of integer = (2, 3, 3);
+  Strides: array[0..2] of integer = (1, 1, 2);
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CaseCnt := Low(FeatureSizes) to High(FeatureSizes) do
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(8, 8, 4);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(8, 8, 4, 1));
+      // A fused-activation conv: its output is what stays in device memory.
+      SourceConv := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+      GatherConv := NN.AddLayer(TNNetConvolutionReLU.Create(4,
+        FeatureSizes[CaseCnt], {padding}0, Strides[CaseCnt]));
+      NN.SetTrainable(False, False);
+
+      for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.05 * i - 0.3;
+
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        SourceConv.Output.Fill(csSentinel);
+        NN.Compute(Input);
+        SentinelsLeft := 0;
+        for i := 0 to SourceConv.Output.Size - 1 do
+          if SourceConv.Output.Raw[i] = csSentinel then Inc(SentinelsLeft);
+        MaxDiff := 0;
+        AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  Conv im2col resident source: feature=', FeatureSizes[CaseCnt],
+        ' stride=', Strides[CaseCnt], ' max|diff|=', MaxDiff:0:9,
+        ' gpu forwards=', GatherConv.ForwardGPUCnt,
+        ' sentinels kept=', SentinelsLeft, '/', SourceConv.Output.Size);
+      AssertTrue('gather conv must reach the device (case ' +
+        IntToStr(CaseCnt) + ')', GatherConv.ForwardGPUCnt > 0);
+      AssertEquals('the source output must NOT be downloaded (case ' +
+        IntToStr(CaseCnt) + ')', SourceConv.Output.Size, SentinelsLeft);
+      AssertTrue('conv im2col resident-source vs CPU parity (case ' +
+        IntToStr(CaseCnt) + '): max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-4', MaxDiff < 1e-4);
     finally
       OutCPU.Free;
       Input.Free;
