@@ -97787,8 +97787,8 @@ end;
 function TNNetIdentity.WillOpenCL(): boolean;
 begin
   Result := (FActivationOpcode <> csActNone) and Assigned(FActivationBuffer)
-            and Assigned(FActivationKernel) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL);
+    and Assigned(FActivationKernel) and FHasOpenCL
+    and ((FShouldOpenCL and (FOutput.Size >= csActivationOpenCLMinSize)) or FForceOpenCL or FPrevLayer.FOutputOnOpenCL);
 end;
 
 function TNNetIdentity.ShouldStayOnOpenCL(): boolean;
@@ -97902,8 +97902,7 @@ begin
   // threshold is deliberately unreachable in production (see the constant): the
   // benchmark charts the device path via ForceOpenCL, but real nets never
   // dispatch these bandwidth-bound elementwise ops.
-  if FActivationOpcode <> csActNone then
-    FShouldOpenCL := (FOutput.Size >= csActivationOpenCLMinSize);
+  FShouldOpenCL := true;
   {$ENDIF}
 end;
 
