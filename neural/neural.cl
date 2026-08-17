@@ -1486,9 +1486,11 @@ __kernel void cai_softmax
 // CAI shared elementwise activation forward. One work-item per element applies
 // the function selected by FOpcode (kept in sync with the csAct* constants in
 // neuralnetwork.pas): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent. This single
-// kernel backs every opting-in TNNetIdentity activation descendant via
-// TNNetActivationCL, so new elementwise activations only add a case here plus an
-// opcode. Forward-only: the host keeps the backward pass (and, for ReLU, the
+// kernel backs every opting-in TNNetIdentity activation descendant, so new
+// elementwise activations only add a case here plus an opcode. FParamA and
+// FParamB carry the per-layer constants of the parameterized activations (a
+// slope, a lambda, a pair of limits); cases that take none ignore them.
+// Forward-only: the host keeps the backward pass (and, for ReLU, the
 // derivative gate mask). The sigmoid/tanh math mirrors the scalar CPU forms -
 // the two-branch stable sigmoid and the [-10,10]-clamped tanh - so the device
 // result tracks the host to ~1e-6 (exp here is more accurate than the CPU
@@ -1497,6 +1499,8 @@ __kernel void cai_activation
 (
   const int FSize,
   const int FOpcode,
+  const float FParamA,
+  const float FParamB,
   __global const float* FX,
   __global float* FY
 )

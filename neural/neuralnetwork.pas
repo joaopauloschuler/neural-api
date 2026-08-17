@@ -1075,8 +1075,15 @@ type
       // only: FOutputRaw and the ReLU derivative mask are NOT produced here, so
       // WillOpenCL keeps this off during training (it only fires above
       // csActivationOpenCLMinSize or under ForceOpenCL). Coded by Claude (AI).
-      procedure ComputeOpenCL();
+      procedure ComputeOpenCL(ParamA, ParamB: TNeuralFloat);
       {$ENDIF}
+      // True when the device ran this layer's activation, so the caller's
+      // Compute can exit. False means the CPU path follows, with the source
+      // already downloaded. Descendants whose activation takes constants pass
+      // them in, reading the same fields their CPU path reads.
+      // Coded by Claude (AI).
+      function ComputeActivationOnOpenCL(ParamA: TNeuralFloat = 0;
+        ParamB: TNeuralFloat = 0): boolean;
     public
       constructor Create(); override;
       {$IFDEF OpenCL}
@@ -71499,20 +71506,11 @@ end;
 
 procedure TNNetSigmoid.Compute();
 begin
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  {$IFDEF OpenCL}
   // Forward-only device path (gated off in production - see WillOpenCL). It
   // writes FOutput directly; FOutputRaw (read only by the CPU backward) is left
   // untouched, so the path stays inference-only. Shared by TNNetHyperbolicTangent
   // (it inherits this Compute; its FActivationOpcode selects tanh on device).
-  if WillOpenCL() then
-  begin
-    Inc(FForwardGPUCnt);
-    ComputeOpenCL();
-    exit;
-  end;
-  Inc(FForwardCPUCnt);
-  {$ENDIF}
+  if ComputeActivationOnOpenCL() then exit;
   FOutputRaw.CopyNoChecks(FPrevLayer.FOutput);
   ApplyActivationFunctionToOutput();
 end;
@@ -74711,21 +74709,15 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  {$IFDEF OpenCL}
   // Forward-only device path (gated off in production - see WillOpenCL). It
   // writes FOutput = max(x,0) but does NOT fill the FOutputErrorDeriv gate mask,
   // so it must never fire during training; WillOpenCL only allows it above the
   // (unreachable) size threshold or under ForceOpenCL, i.e. inference/benchmark.
-  if WillOpenCL() then
+  if ComputeActivationOnOpenCL() then
   begin
-    Inc(FForwardGPUCnt);
-    ComputeOpenCL();
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
   end;
-  Inc(FForwardCPUCnt);
-  {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -97459,7 +97451,7 @@ begin
             and (FShouldOpenCL or FForceOpenCL);
 end;
 
-procedure TNNetIdentity.ComputeOpenCL();
+procedure TNNetIdentity.ComputeOpenCL(ParamA, ParamB: TNeuralFloat);
 var
   Kern: TNeuralKernel;
   k: cl_kernel;
@@ -97478,13 +97470,32 @@ begin
   Kern.WriteBuffer(FActivationBuffer, FPrevLayer.FOutput);
   clSetKernelArg(k, 0, csLongintSize, @iSize);
   clSetKernelArg(k, 1, csLongintSize, @iOpcode);
-  clSetKernelArg(k, 2, csCLMemSize, @FActivationBuffer); // FX
-  clSetKernelArg(k, 3, csCLMemSize, @FActivationBuffer); // FY (in place)
+  clSetKernelArg(k, 2, csNeuralFloatSize, @ParamA);
+  clSetKernelArg(k, 3, csNeuralFloatSize, @ParamB);
+  clSetKernelArg(k, 4, csCLMemSize, @FActivationBuffer); // FX
+  clSetKernelArg(k, 5, csCLMemSize, @FActivationBuffer); // FY (in place)
   Kern.RunKernel(k, iSize);
   Kern.Finish();
   Kern.ReadBuffer(FActivationBuffer, FOutput, CL_TRUE);
 end;
 {$ENDIF}
+
+function TNNetIdentity.ComputeActivationOnOpenCL(ParamA: TNeuralFloat = 0;
+  ParamB: TNeuralFloat = 0): boolean;
+begin
+  Result := false;
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL(ParamA, ParamB);
+    Result := true;
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  {$ENDIF}
+end;
 
 procedure TNNetIdentity.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
