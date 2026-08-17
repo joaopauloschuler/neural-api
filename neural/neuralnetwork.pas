@@ -72835,9 +72835,11 @@ begin
 end;
 
 {$IFDEF OpenCL}
+// Forward only: the kernel writes FOutput without filling FNormalized, the
+// x_hat snapshot Backpropagate reads, so a trainable layer stays on the CPU.
 function TNNetRMSNorm.WillOpenCL(): boolean;
 begin
-  Result := Assigned(FTokenNormCL) and FHasOpenCL
+  Result := (not FIsTrainable) and Assigned(FTokenNormCL) and FHasOpenCL
             and (FShouldOpenCL or FForceOpenCL);
 end;
 {$ENDIF}

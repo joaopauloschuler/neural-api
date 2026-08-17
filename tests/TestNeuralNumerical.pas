@@ -68054,6 +68054,9 @@ begin
       Norm.Neurons[0].Weights.Raw[i] := 1.0 + 0.4 * Sin(i * 0.7);
     InputMax := Input.Size - 1;
     for i := 0 to InputMax do Input.Raw[i] := 0.6 * Sin(i * 0.31) - 0.15;
+    // The OpenCL path is inference-only: it writes FOutput without filling the
+    // FNormalized snapshot Backpropagate reads.
+    NN.SetTrainable(False, False);
 
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
@@ -68073,7 +68076,10 @@ begin
     finally
       NN.ForceOpenCL(False);
     end;
-    WriteLn('  WholeVolume RMSNorm OpenCL parity: max|diff|=', MaxDiff:0:9);
+    WriteLn('  WholeVolume RMSNorm OpenCL parity: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards=', Norm.ForwardGPUCnt);
+    // Without this the parity assertion below is satisfied by two CPU runs.
+    AssertTrue('the RMSNorm layer must reach the device', Norm.ForwardGPUCnt > 0);
     AssertTrue('WholeVolume RMSNorm OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
