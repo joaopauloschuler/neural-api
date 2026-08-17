@@ -1100,6 +1100,9 @@ type
       // WillOpenCL keeps this off during training (it only fires above
       // csActivationOpenCLMinSize or under ForceOpenCL). Coded by Claude (AI).
       procedure ComputeOpenCL(ParamA, ParamB, ParamC: TNeuralFloat);
+      // True when ComputeOpenCL will read the previous layer's device output in
+      // place of an upload and leave its own result there. Coded by Claude (AI).
+      function ShouldStayOnOpenCL(): boolean;
       {$ENDIF}
       // True when the device ran this layer's activation, so the caller's
       // Compute can exit. False means the CPU path follows, with the source
@@ -1115,6 +1118,8 @@ type
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       function WillOpenCL(): boolean; override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -97621,6 +97626,9 @@ end;
 
 procedure TNNetIdentity.DisableOpenCL();
 begin
+  // FActivationBuffer is read through FActivationKernel's queue, so a resident
+  // output has to come back to RAM while that handle is still alive.
+  ForceOutputOnRAM();
   inherited DisableOpenCL();
   if Assigned(FNN) then
     FNN.FreeKernelIfNotShared('cai_activation', FActivationKernel);
@@ -97644,6 +97652,8 @@ begin
     begin
       clReleaseMemObject(FActivationBuffer);
       FActivationBuffer := nil;
+      // The output this buffer held is gone with it; only the host copy is left.
+      FOutputOnOpenCL := false;
     end;
     if not Assigned(FActivationBuffer) then
     begin
@@ -97661,33 +97671,83 @@ begin
             and (FShouldOpenCL or FForceOpenCL);
 end;
 
+function TNNetIdentity.ShouldStayOnOpenCL(): boolean;
+begin
+  // Forward only: the device kernel produces neither FOutputRaw nor the
+  // derivative mask, and a resident output has no host reader in backward.
+  Result := (not FIsTrainable) and Assigned(FPrevLayer) and
+    FPrevLayer.FOutputOnOpenCL and
+    Assigned(FPrevLayer.OpenCLOutputBuffer()) and
+    Assigned(FPrevLayer.OpenCLOutputKernel()) and
+    (FPrevLayer.FOutput.Size = FOutput.Size) and
+    (FOutput.Size <= FActivationBufSize);
+end;
+
+function TNNetIdentity.OpenCLOutputBuffer(): cl_mem;
+begin
+  Result := FActivationBuffer;
+end;
+
+function TNNetIdentity.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  Result := FActivationKernel;
+end;
+
 procedure TNNetIdentity.ComputeOpenCL(ParamA, ParamB, ParamC: TNeuralFloat);
 var
   Kern: TNeuralKernel;
   k: cl_kernel;
   iSize, iOpcode: longint;
+  SourceBuffer: cl_mem;
+  StayOnDevice: boolean;
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  // Run the net's shared cai_activation kernel in place over the per-layer
-  // buffer: upload prev output, run, read back into FOutput. No allocation here;
-  // args are (re)set each call because the kernel is shared in turn by every
-  // activation layer (as conv resets args on the shared GEMM kernel). The
-  // WillOpenCL() gate and FForwardGPUCnt bump live in the caller (Compute).
+  // Run the net's shared cai_activation kernel over the per-layer buffer. No
+  // allocation here; args are (re)set each call because the kernel is shared in
+  // turn by every activation layer (as conv resets args on the shared GEMM
+  // kernel). The WillOpenCL() gate and FForwardGPUCnt bump live in the caller
+  // (Compute).
+  StayOnDevice := ShouldStayOnOpenCL();
+  if StayOnDevice then
+  begin
+    // The source is already there: read it where it lies and write the result
+    // into this layer's own buffer (FX and FY differ, so no aliasing). Blocking
+    // on the producing queue is a no-op when it is this kernel's queue too.
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLOutputFinish(FActivationKernel);
+  end
+  else
+  begin
+    // Upload prev output and run in place.
+    FPrevLayer.ForceOutputOnRAM();
+    SourceBuffer := FActivationBuffer;
+  end;
   Kern := FActivationKernel;
   k := Kern.Kernel;
   iSize := FPrevLayer.FOutput.Size;
   iOpcode := FActivationOpcode;
-  Kern.WriteBuffer(FActivationBuffer, FPrevLayer.FOutput);
+  if not StayOnDevice then Kern.WriteBuffer(FActivationBuffer, FPrevLayer.FOutput);
   clSetKernelArg(k, 0, csLongintSize, @iSize);
   clSetKernelArg(k, 1, csLongintSize, @iOpcode);
   clSetKernelArg(k, 2, csNeuralFloatSize, @ParamA);
   clSetKernelArg(k, 3, csNeuralFloatSize, @ParamB);
   clSetKernelArg(k, 4, csNeuralFloatSize, @ParamC);
-  clSetKernelArg(k, 5, csCLMemSize, @FActivationBuffer); // FX
-  clSetKernelArg(k, 6, csCLMemSize, @FActivationBuffer); // FY (in place)
+  clSetKernelArg(k, 5, csCLMemSize, @SourceBuffer);      // FX
+  clSetKernelArg(k, 6, csCLMemSize, @FActivationBuffer); // FY
   Kern.RunKernel(k, iSize);
-  Kern.Finish();
-  Kern.ReadBuffer(FActivationBuffer, FOutput, CL_TRUE);
+  if StayOnDevice then
+  begin
+    // No read back: the result waits in FActivationBuffer until a host reader
+    // calls ForceOutputOnRAM, so a chain of device layers never round trips.
+    FOutputOnOpenCL := true;
+    FOutputOnRAM := false;
+  end
+  else
+  begin
+    Kern.Finish();
+    Kern.ReadBuffer(FActivationBuffer, FOutput, CL_TRUE);
+    FOutputOnOpenCL := false;
+    FOutputOnRAM := true;
+  end;
 end;
 {$ENDIF}
 
@@ -97705,6 +97765,10 @@ begin
   end;
   Inc(FForwardCPUCnt);
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read the device buffer a previous forward left behind.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   {$ENDIF}
 end;
 

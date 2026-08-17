@@ -375,6 +375,11 @@ type
     // FInputCopy upload disappears too. Same sentinel probe, swept over feature
     // size and stride. Coded by Claude (AI).
     procedure TestConvIm2ColResidentSourceOpenCLParity;
+    // The whole chain: projection -> activation -> projection with nothing
+    // returning to host memory in between. cai_activation reads the source
+    // layer's buffer and leaves its result in its own, which the second
+    // projection then binds as its B operand. Coded by Claude (AI).
+    procedure TestActivationResidentChainOpenCLParity;
     procedure TestActivationOpenCLParity;
     // Device-side im2col (cai_im2col) forward parity for the general convolution:
     // an inference-only conv gathers FInputPrepared on the device instead of the
@@ -64742,6 +64747,102 @@ begin
       AssertTrue('conv im2col resident-source vs CPU parity (case ' +
         IntToStr(CaseCnt) + '): max |diff| = ' + FloatToStr(MaxDiff) +
         ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestActivationResidentChainOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  UpProj, Act, DownProj: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, UpKept, ActKept, CaseCnt: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = 999;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CaseCnt := 0 to 2 do
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, 8);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+      UpProj := NN.AddLayer(TNNetPointwiseConvLinear.Create(16));
+      case CaseCnt of
+        0: Act := NN.AddLayer(TNNetReLU.Create());
+        1: Act := NN.AddLayer(TNNetSwish.Create());
+        else Act := NN.AddLayer(TNNetGELU.Create());
+      end;
+      DownProj := NN.AddLayer(TNNetPointwiseConvLinear.Create(4));
+      NN.SetTrainable(False, False);
+
+      for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.05 * i - 0.3;
+
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        UpProj.Output.Fill(csSentinel);
+        Act.Output.Fill(csSentinel);
+        NN.Compute(Input);
+        UpKept := 0;
+        for i := 0 to UpProj.Output.Size - 1 do
+          if UpProj.Output.Raw[i] = csSentinel then Inc(UpKept);
+        ActKept := 0;
+        for i := 0 to Act.Output.Size - 1 do
+          if Act.Output.Raw[i] = csSentinel then Inc(ActKept);
+        MaxDiff := 0;
+        AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  Activation resident chain: ', Act.ClassName, ' max|diff|=',
+        MaxDiff:0:9, ' act gpu forwards=', Act.ForwardGPUCnt,
+        ' up kept=', UpKept, '/', UpProj.Output.Size,
+        ' act kept=', ActKept, '/', Act.Output.Size);
+      AssertTrue('the activation must reach the device (' + Act.ClassName + ')',
+        Act.ForwardGPUCnt > 0);
+      AssertEquals('the projection output must NOT be downloaded (' +
+        Act.ClassName + ')', UpProj.Output.Size, UpKept);
+      AssertEquals('the activation output must NOT be downloaded (' +
+        Act.ClassName + ')', Act.Output.Size, ActKept);
+      AssertTrue('resident chain vs CPU parity (' + Act.ClassName +
+        '): max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+        MaxDiff < 1e-4);
+      // Both intermediate outputs are still one ForceOutputOnRAM away.
+      Act.ForceOutputOnRAM();
+      ActKept := 0;
+      for i := 0 to Act.Output.Size - 1 do
+        if Act.Output.Raw[i] = csSentinel then Inc(ActKept);
+      AssertEquals('ForceOutputOnRAM must recover the activation output (' +
+        Act.ClassName + ')', 0, ActKept);
     finally
       OutCPU.Free;
       Input.Free;
