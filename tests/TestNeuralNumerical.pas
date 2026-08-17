@@ -1,4 +1,4 @@
-unit TestNeuralNumerical;
+﻿unit TestNeuralNumerical;
 
 {$mode objfpc}{$H+}
 
@@ -487,6 +487,10 @@ type
     // result on the device for the next layer, so a pointwise conv on either
     // side of it round trips through RAM neither way.
     procedure RMSNormResidentChainOpenCLParity;
+    // The same chain with ForceOpenCL off: TNNetRMSNorm's own size verdict is
+    // pinned to CPU, so a resident source is the only thing that can put it on
+    // the device.
+    procedure RMSNormResidentChainUnforcedOpenCLParity;
     // OpenCL gated FFN forward offload parity (vs CPU) for the GLU-family
     // activations TNNetGLU / TNNetSwiGLU / TNNetGEGLU / TNNetGEGLUErf.
     procedure GLUFamilyOpenCLParity;
@@ -68173,6 +68177,98 @@ begin
     AssertEquals('the consuming conv must bind the RMSNorm output, not download it',
       Norm.Output.Size, NormSentinelsLeft);
     AssertTrue('RMSNorm resident chain vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    // The host copy is still one ForceOutputOnRAM away.
+    Norm.ForceOutputOnRAM();
+    NormSentinelsLeft := 0;
+    for i := 0 to Norm.Output.Size - 1 do
+      if Norm.Output.Raw[i] = csSentinel then Inc(NormSentinelsLeft);
+    AssertEquals('ForceOutputOnRAM must still recover the RMSNorm output',
+      0, NormSentinelsLeft);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetRMSNorm.FShouldOpenCL is pinned False, so with ForceOpenCL off the only
+// route onto the device is a source that is already there. The pointwise convs
+// on either side reach the device on their own verdict; the norm between them
+// must follow them there and keep its result resident. Coded by Claude (AI).
+procedure TTestNeuralNumerical.RMSNormResidentChainUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  SourceConv, Norm, ConsumerConv: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, SourceSentinelsLeft, NormSentinelsLeft: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = 999;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 3, 16);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 3, 16, 1));
+    SourceConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(16));
+    Norm := NN.AddLayer(TNNetRMSNorm.Create());
+    ConsumerConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(8));
+    // The whole chain is inference-only: the device kernels produce no
+    // FOutputRaw, no derivative mask and no FNormalized snapshot.
+    NN.SetTrainable(False, False);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.6 * Sin(i * 0.31) - 0.15;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    AssertFalse('the norm size verdict must stay pinned to CPU', Norm.ShouldOpenCL);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    // Only a download into these two layers clears the sentinels.
+    SourceConv.Output.Fill(csSentinel);
+    Norm.Output.Fill(csSentinel);
+    NN.Compute(Input);
+    SourceSentinelsLeft := 0;
+    for i := 0 to SourceConv.Output.Size - 1 do
+      if SourceConv.Output.Raw[i] = csSentinel then Inc(SourceSentinelsLeft);
+    NormSentinelsLeft := 0;
+    for i := 0 to Norm.Output.Size - 1 do
+      if Norm.Output.Raw[i] = csSentinel then Inc(NormSentinelsLeft);
+    MaxDiff := 0;
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  RMSNorm unforced resident chain: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards norm=', Norm.ForwardGPUCnt,
+      ' consumer=', ConsumerConv.ForwardGPUCnt,
+      ' sentinels kept source=', SourceSentinelsLeft, '/', SourceConv.Output.Size,
+      ' norm=', NormSentinelsLeft, '/', Norm.Output.Size);
+    AssertTrue('a resident source alone must put the RMSNorm layer on the device',
+      Norm.ForwardGPUCnt > 0);
+    AssertTrue('the consuming pointwise conv must reach the device',
+      ConsumerConv.ForwardGPUCnt > 0);
+    AssertEquals('RMSNorm must bind its source, not download it',
+      SourceConv.Output.Size, SourceSentinelsLeft);
+    AssertEquals('the consuming conv must bind the RMSNorm output, not download it',
+      Norm.Output.Size, NormSentinelsLeft);
+    AssertTrue('RMSNorm unforced resident chain vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
     // The host copy is still one ForceOutputOnRAM away.
     Norm.ForceOutputOnRAM();

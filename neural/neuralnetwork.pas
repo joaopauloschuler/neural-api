@@ -72866,9 +72866,11 @@ begin
   else FreeBackpropScratch();
   SetOutputErrorSize(FOutput);
   {$IFDEF OpenCL}
-  // Bandwidth-bound: whole-volume RMSNorm loses to AVX2 on the device at
-  // every size (OpenCLForwardBenchmark ~0.20x), so the verdict is pinned to CPU.
-  FShouldOpenCL := false; // bandwidth-bound: GPU < CPU at every size (OpenCLForwardBenchmark ~0.20x), pin to CPU. Old verdict: Int64(FOutput.Size) >= cNeuralOpenCLMinWork
+  // Bandwidth-bound when the source has to be uploaded: whole-volume RMSNorm
+  // loses to AVX2 at every size (OpenCLForwardBenchmark ~0.20x), so the size
+  // verdict is pinned to CPU. A source that is already on the device pays no
+  // upload, and WillOpenCL takes that route on its own.
+  FShouldOpenCL := false;
   {$ENDIF}
   InitDefault();
 end;
@@ -72876,10 +72878,12 @@ end;
 {$IFDEF OpenCL}
 // Forward only: the kernel writes FOutput without filling FNormalized, the
 // x_hat snapshot Backpropagate reads, so a trainable layer stays on the CPU.
+// A bindable source is a route in by itself: ComputeOpenCL then reads it where
+// it lies, so the upload the size verdict guards against never happens.
 function TNNetRMSNorm.WillOpenCL(): boolean;
 begin
   Result := (not FIsTrainable) and Assigned(FTokenNormCL) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL);
+            and (FShouldOpenCL or FForceOpenCL or ShouldBindPrevOutputOnOpenCL());
 end;
 {$ENDIF}
 
