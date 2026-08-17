@@ -505,7 +505,6 @@ type
       FOutputOnOpenCL: boolean;     // output is in device memory
       FOutputOnRAM: boolean;        // output is in host memory (FOutput.FData)
       FErrorOnOpenCL: boolean;      // gradient is in device memory
-      FOpenCLDeviceTag: cl_device_id; // device the buffers live on (for same-device checks)
       function GetDotProductKernel(): TNeuralKernel;
       function GetDotCLWaitBeta(): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       procedure MoveOutputToRAM(); virtual;
@@ -127859,7 +127858,6 @@ begin
   FOutputOnOpenCL := false;
   FOutputOnRAM := true;
   FErrorOnOpenCL := false;
-  FOpenCLDeviceTag := nil;
   DisableOpenCL();
   {$ENDIF}
 end;
