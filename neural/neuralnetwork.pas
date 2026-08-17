@@ -577,9 +577,12 @@ type
       // forward that produced it when layers hold per-layer queues.
       // Override when required.
       function OpenCLOutputKernel(): TNeuralKernel; virtual;
-      // Blocks until this layer's device output is finished, so a consumer on
-      // ANOTHER queue can read OpenCLOutputBuffer. No-op on the same queue.
-      procedure OpenCLOutputFinish(pConsumerKernel: TNeuralKernel = nil); // Coded by Claude (AI).
+      // There is no-op when on the same queue: otherwise blocks until this
+      // layer's device output is finished, so pConsumerKernel can read it.
+      procedure OpenCLWaitOutputIfAnotherQueue(pConsumerKernel: TNeuralKernel = nil); // Coded by Claude (AI).
+      // True when the previous layer left its finished output in device memory
+      // and exposes both handles, so this layer may bind it. Coded by Claude (AI).
+      function PrevOutputOnOpenCL(): boolean;
       // Force (pForce=True) or release (False) the OpenCL path on this layer,
       // bypassing the per-layer size verdict in WillOpenCL. Used by the GPU
       // parity tests to exercise the device path on tiny tensors. Coded by Claude (AI).
@@ -965,6 +968,12 @@ type
     public
       procedure ForceOutputOnRAM();
       function OutputOnOpenCL(): boolean;
+      function OutputBindableOnOpenCL(): boolean;
+      {$IFDEF OpenCL}
+      // A source already on pKernel's queue is ordered ahead of what follows,
+      // so only the sources that are not cost a wait.
+      procedure OpenCLWaitOutputIfAnotherQueue(pKernel: TNeuralKernel);
+      {$ENDIF}
   end;
   {$ELSE}
   TNNetLayerList = class (TNNetList)
@@ -974,6 +983,12 @@ type
     public
       procedure ForceOutputOnRAM();
       function OutputOnOpenCL(): boolean;
+      function OutputBindableOnOpenCL(): boolean;
+      {$IFDEF OpenCL}
+      // A source already on pKernel's queue is ordered ahead of what follows,
+      // so only the sources that are not cost a wait.
+      procedure OpenCLWaitOutputIfAnotherQueue(pKernel: TNeuralKernel);
+      {$ENDIF}
       property Items[Index: Integer]: TNNetLayer read GetItem write SetItem; default;
   end;
   {$ENDIF}
@@ -12046,9 +12061,6 @@ type
     // True when every source output is resident on the device and bound to a
     // buffer: what a device forward reads them under.
     function SourcesReadyOnOpenCL(pKernel: TNeuralKernel): boolean;
-    // Blocks until every source produced on a queue other than pKernel's has
-    // finished. Call before the launches that read their buffers.
-    procedure FinishSourceOutputs(pKernel: TNeuralKernel); // Coded by Claude (AI).
     {$ENDIF}
   public
     constructor Create(); override;
@@ -12346,6 +12358,9 @@ type
       destructor Destroy(); override;
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      // True when the forward will bind the previous layer's device output as
+      // the B operand instead of uploading it. Coded by Claude (AI).
+      function ShouldBindPrevOutputOnOpenCL(): boolean;
       procedure ComputeOpenCL(); virtual;
       // Int8 device forward: the resident code/scale buffers do the GEMV via
       // cai_dot_product_int8; only the input re-uploads. Same fused
@@ -14032,9 +14047,6 @@ type
       // forward, so Compute() can rely on it to skip the host im2col. Coded by
       // Claude (AI).
       function ShouldOpenCLIm2Col(): boolean; {$IFDEF Release} inline; {$ENDIF}
-      // True when the previous layer's finished output is on the device, bound
-      // to a buffer, and this layer may read it (inference only).
-      function PrevOutputOnOpenCL(): boolean; // Coded by Claude (AI).
       // True when ComputeOpenCL will bind the previous layer's device output as
       // the B operand instead of uploading it. Pointwise only. Coded by Claude (AI).
       function ShouldBindPrevOutputOnOpenCL(): boolean;
@@ -24633,18 +24645,12 @@ begin
 end;
 
 function TNNetGLUGateBase.WillOpenCL(): boolean;
-var
-  SourceKernel: TNeuralKernel;
 begin
   Result := false;
   // Forward only: the device path leaves the output on the device, and the
   // backward pass still has readers of Output that never call ForceOutputOnRAM.
   if FIsTrainable or (not FHasOpenCL) or (not Assigned(FGLUGateCL)) then exit;
-  if (not Assigned(FPrevLayer)) or (not FPrevLayer.FOutputOnOpenCL) then exit;
-  SourceKernel := FPrevLayer.OpenCLOutputKernel();
-  if (not Assigned(SourceKernel)) or
-     (not Assigned(FPrevLayer.OpenCLOutputBuffer())) then exit;
-  Result := true;
+  Result := PrevOutputOnOpenCL();
 end;
 
 procedure TNNetGLUGateBase.DisableOpenCL();
@@ -24675,7 +24681,7 @@ end;
 
 procedure TNNetGLUGateBase.ComputeOpenCL();
 begin
-  FPrevLayer.OpenCLOutputFinish(FGLUGateCL.OutputKernel());
+  FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FGLUGateCL.OutputKernel());
   FGLUGateCL.GateOnOpenCL(FPrevLayer.OpenCLOutputBuffer(), FOutput,
     FOutput.SizeX * FOutput.SizeY, FOutput.Depth, FGateActFlag);
   FOutputOnOpenCL := true;
@@ -74902,6 +74908,41 @@ begin
 end;
 {$ENDIF}
 
+// OutputOnOpenCL plus the handles a consumer needs to read those buffers with.
+function TNNetLayerList.OutputBindableOnOpenCL(): boolean;
+{$IFDEF OpenCL}
+var
+  MaxLayer: integer;
+  CntLayer: integer;
+begin
+  Result := OutputOnOpenCL();
+  MaxLayer := Count - 1;
+  CntLayer := 0;
+  while Result and (CntLayer <= MaxLayer) do
+  begin
+    Result := Assigned(Self[CntLayer].OpenCLOutputBuffer()) and
+      Assigned(Self[CntLayer].OpenCLOutputKernel());
+    Inc(CntLayer);
+  end;
+end;
+{$ELSE}
+begin
+  Result := false;
+end;
+{$ENDIF}
+
+{$IFDEF OpenCL}
+procedure TNNetLayerList.OpenCLWaitOutputIfAnotherQueue(pKernel: TNeuralKernel);
+var
+  MaxLayer: integer;
+  CntLayer: integer;
+begin
+  MaxLayer := Count - 1;
+  for CntLayer := 0 to MaxLayer do
+    Self[CntLayer].OpenCLWaitOutputIfAnotherQueue(pKernel);
+end;
+{$ENDIF}
+
 { TNNetReLU }
 constructor TNNetReLU.Create();
 begin
@@ -75137,7 +75178,7 @@ var
   iSize, iCount, iAccumulate: longint;
   SlotBuffer: array[0..3] of cl_mem;
 begin
-  FinishSourceOutputs(FSumKernel);
+  FPrevLayerList.OpenCLWaitOutputIfAnotherQueue(FSumKernel);
   Kern := FSumKernel.Kernel;
   iSize := FOutput.Size;
   MaxSourcePos := FPrevLayerList.Count - 1;
@@ -93639,7 +93680,7 @@ var
   MaxSourcePos, SourcePos: integer;
   iPositionCount, iOutDepth, iInDepth, iDestChannel: longint;
 begin
-  FinishSourceOutputs(FConcatKernel);
+  FPrevLayerList.OpenCLWaitOutputIfAnotherQueue(FConcatKernel);
   Kern := FConcatKernel.Kernel;
   iPositionCount := FOutput.SizeX * FOutput.SizeY;
   iOutDepth := FOutput.Depth;
@@ -93825,32 +93866,8 @@ end;
 
 {$IFDEF OpenCL}
 function TNNetConcatBase.SourcesReadyOnOpenCL(pKernel: TNeuralKernel): boolean;
-var
-  MaxSourcePos, SourcePos: integer;
-  SourceKernel: TNeuralKernel;
 begin
-  Result := false;
-  if not Assigned(pKernel) then exit;
-  if not FPrevLayerList.OutputOnOpenCL() then exit;
-  MaxSourcePos := FPrevLayerList.Count - 1;
-  for SourcePos := 0 to MaxSourcePos do
-  begin
-    SourceKernel := FPrevLayerList[SourcePos].OpenCLOutputKernel();
-    if (not Assigned(SourceKernel)) or
-       (not Assigned(FPrevLayerList[SourcePos].OpenCLOutputBuffer())) then exit;
-  end;
-  Result := true;
-end;
-
-procedure TNNetConcatBase.FinishSourceOutputs(pKernel: TNeuralKernel);
-var
-  MaxSourcePos, SourcePos: integer;
-begin
-  // A source on pKernel's own queue is already ordered ahead of the launches
-  // below, so OpenCLOutputFinish only blocks on the sources that are not.
-  MaxSourcePos := FPrevLayerList.Count - 1;
-  for SourcePos := 0 to MaxSourcePos do
-    FPrevLayerList[SourcePos].OpenCLOutputFinish(pKernel);
+  Result := Assigned(pKernel) and FPrevLayerList.OutputBindableOnOpenCL();
 end;
 {$ENDIF}
 
@@ -93994,8 +94011,6 @@ begin
 end;
 
 function TNNetSplitChannels.WillOpenCL(): boolean;
-var
-  SourceKernel: TNeuralKernel;
 begin
   Result := false;
   // Forward only: this path leaves the output on the device, and the backward
@@ -94003,15 +94018,10 @@ begin
   if FIsTrainable or (not FHasOpenCL) then exit;
   if (not Assigned(FSplitKernel)) or (not Assigned(FSplitBuffer)) or
      (not Assigned(FChannelIdxBuffer)) then exit;
-  if not Assigned(FPrevLayer) then exit;
-  if not FPrevLayer.FOutputOnOpenCL then exit;
+  if not PrevOutputOnOpenCL() then exit;
   // The source is in host memory too, so the CPU gather moves nothing while the
   // device gather would still have to download its slice.
-  if FPrevLayer.FOutputOnRAM then exit;
-  SourceKernel := FPrevLayer.OpenCLOutputKernel();
-  if (not Assigned(SourceKernel)) or
-     (not Assigned(FPrevLayer.OpenCLOutputBuffer())) then exit;
-  Result := true;
+  Result := not FPrevLayer.FOutputOnRAM;
 end;
 
 function TNNetSplitChannels.OpenCLOutputBuffer(): cl_mem;
@@ -94030,7 +94040,7 @@ var
   SourceBuffer: cl_mem;
   iPositionCount, iOutDepth, iInDepth: longint;
 begin
-  FPrevLayer.OpenCLOutputFinish(FSplitKernel);
+  FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FSplitKernel);
   Kern := FSplitKernel.Kernel;
   SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
   iPositionCount := FOutput.SizeX * FOutput.SizeY;
@@ -97674,10 +97684,7 @@ function TNNetIdentity.ShouldStayOnOpenCL(): boolean;
 begin
   // Forward only: the device kernel produces neither FOutputRaw nor the
   // derivative mask, and a resident output has no host reader in backward.
-  Result := (not FIsTrainable) and Assigned(FPrevLayer) and
-    FPrevLayer.FOutputOnOpenCL and
-    Assigned(FPrevLayer.OpenCLOutputBuffer()) and
-    Assigned(FPrevLayer.OpenCLOutputKernel()) and
+  Result := (not FIsTrainable) and PrevOutputOnOpenCL() and
     (FPrevLayer.FOutput.Size = FOutput.Size) and
     (FOutput.Size <= FActivationBufSize);
 end;
@@ -97712,7 +97719,7 @@ begin
     // into this layer's own buffer (FX and FY differ, so no aliasing). Blocking
     // on the producing queue is a no-op when it is this kernel's queue too.
     SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
-    FPrevLayer.OpenCLOutputFinish(FActivationKernel);
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FActivationKernel);
   end
   else
   begin
@@ -100781,14 +100788,6 @@ begin
     and WillOpenCL() and (not WinogradEligible());
 end;
 
-function TNNetConvolution.PrevOutputOnOpenCL(): boolean;
-begin
-  Result := (not FIsTrainable) and Assigned(FPrevLayer) and
-    FPrevLayer.FOutputOnOpenCL and
-    Assigned(FPrevLayer.OpenCLOutputBuffer()) and
-    Assigned(FPrevLayer.OpenCLOutputKernel());
-end;
-
 // A pointwise conv needs no im2col: FInputPrepared IS FPrevLayer.Output
 // (SetPrevLayer), and cai_dot_product reads B as B[b*FSize+i] - the same
 // position-major, depth-fastest order a TNNetVolume already carries, and the
@@ -100797,7 +100796,8 @@ end;
 function TNNetConvolution.ShouldBindPrevOutputOnOpenCL(): boolean;
 begin
   Result := false;
-  if (not FPointwise) or (not PrevOutputOnOpenCL()) then exit;
+  // Forward only: the device kernels produce no FOutputRaw and no derivative mask.
+  if FIsTrainable or (not FPointwise) or (not PrevOutputOnOpenCL()) then exit;
   // The GEMM shape was fixed when EnableOpenCL prepared FDotCL against
   // FInputPrepared; a source of any other size would read past its buffer.
   if FPrevLayer.FOutput.Size <> FInputPrepared.Size then exit;
@@ -100877,7 +100877,7 @@ begin
   // A borrowed buffer was produced on the source layer's queue, so block on that
   // queue first (a no-op when it is this layer's queue too).
   if (PrevOutputBuffer <> nil) or (Im2ColSrcBuffer <> nil) then
-    FPrevLayer.OpenCLOutputFinish(FDotCL.DotProductKernel);
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDotCL.DotProductKernel);
   if OpenCLIm2Col then
     FDotCL.BuildInputColsOnDevice(FIm2ColKernel, FInputCopy,
       {OutSizeX}FOutput.SizeX, {ColDepth}FVectorSize,
@@ -100929,7 +100929,7 @@ begin
 
   OpenCLIm2Col := ShouldOpenCLIm2Col();
   if (pPrevOutputBuffer <> nil) or (pIm2ColSrcBuffer <> nil) then
-    FPrevLayer.OpenCLOutputFinish(FDotCL.DotProductKernel);
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDotCL.DotProductKernel);
   if OpenCLIm2Col then
     FDotCL.BuildInputColsOnDevice(FIm2ColKernel, FInputCopy,
       {OutSizeX}FOutput.SizeX, {ColDepth}FVectorSize,
@@ -103017,7 +103017,14 @@ procedure TNNetFullConnect.Compute();
 var
   StartTime: double;
 begin
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  // The binding verdict reads only shapes and residency flags, so it is
+  // answerable here - and it decides whether the previous output has to come
+  // back to RAM at all. The two device bodies ask it again and do the binding;
+  // both calls see the same state.
+  {$IFDEF OpenCL}
+  if Assigned(FPrevLayer) and (not ShouldBindPrevOutputOnOpenCL())
+    then FPrevLayer.ForceOutputOnRAM();
+  {$ENDIF}
   if FQuantInt8 then
   begin
     if (FNeurons.Count = FOutput.Size) and
@@ -103232,14 +103239,46 @@ begin
 end;
 
 {$IFDEF OpenCL}
+// The B operand IS FPrevLayer.Output (EnableOpenCL prepared FDotCL against it),
+// and cai_dot_product reads B in the same order a TNNetVolume carries it, so a
+// resident source binds straight in - the same case as a pointwise convolution.
+function TNNetFullConnect.ShouldBindPrevOutputOnOpenCL(): boolean;
+begin
+  Result := false;
+  // Forward only (BackpropagateOpenCL reads FPrevLayer.Output on the host), and
+  // only when Compute takes the device branch: skipping the download in front
+  // of the CPU branch would leave ComputeCPU reading a stale host output.
+  if FIsTrainable or (not FHasOpenCL) or (not FShouldOpenCL) or
+    (not Assigned(FDotCL)) then exit;
+  if FQuantInt8 and (not FDotCL.Int8Ready) then exit;
+  if not PrevOutputOnOpenCL() then exit;
+  // The GEMM shape was fixed when EnableOpenCL prepared FDotCL; a source of any
+  // other size would read past its buffer.
+  if FQuantInt8
+    then Result := (FPrevLayer.FOutput.Size = FQuantVectorSize)
+    else Result := (FPrevLayer.FOutput.Size = FVectorSize);
+end;
+
 procedure TNNetFullConnect.ComputeOpenCL();
 var
   InputAVolume: TNNetVolume;
   ActOpcode: integer;
   ActivationFunctionInOpenCL, WUpdated: boolean;
   BiasVol: TNNetVolume;
+  PrevOutputBuffer: cl_mem;
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ShouldBindPrevOutputOnOpenCL() then
+  begin
+    PrevOutputBuffer := FPrevLayer.OpenCLOutputBuffer();
+    // A borrowed buffer was produced on the source layer's queue, so block on
+    // that queue first (a no-op when it is this layer's queue too).
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDotCL.DotProductKernel);
+  end
+  else
+  begin
+    PrevOutputBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+  end;
   if FShouldInterleaveWeights then
   begin
     if FConcatedWInter.Size < FNeurons[0].Weights.Size * FNeurons.Count then
@@ -103266,7 +103305,7 @@ begin
   if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
 
   FDotCL.Compute(InputAVolume, FPrevLayer.FOutput, ActOpcode, {NewVAs}WUpdated, true,
-    BiasVol, {NewVBias}WUpdated);
+    BiasVol, {NewVBias}WUpdated, PrevOutputBuffer);
   FAfterWeightUpdateHasBeenCalled := false;
 
   if ActivationFunctionInOpenCL then
@@ -103311,14 +103350,24 @@ var
   ActOpcode: integer;
   ActivationFunctionInOpenCL: boolean;
   BiasVol: TNNetVolume;
+  PrevOutputBuffer: cl_mem;
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ShouldBindPrevOutputOnOpenCL() then
+  begin
+    PrevOutputBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDotCL.DotProductKernel);
+  end
+  else
+  begin
+    PrevOutputBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+  end;
   ActivationFunctionInOpenCL := IsActivationFunctionInOpenCL(ActOpcode);
 
   if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
 
   FDotCL.ComputeInt8(FPrevLayer.FOutput, ActOpcode, {NewVBs}true,
-    BiasVol, {NewVBias}false);
+    BiasVol, {NewVBias}false, PrevOutputBuffer);
 
   if ActivationFunctionInOpenCL then
   begin
@@ -124773,7 +124822,9 @@ begin
   L.FComputeState := 1;
   if L.WillOpenCL() then
   begin
-    // Frozen WillOpenCL verdict. With shared handles the device is serialized:
+    // The verdict is read once, here, after every dependency has completed - so
+    // a residency-dependent WillOpenCL already sees its final value for this
+    // pass. With shared handles the device is serialized:
     // worker 0 is the single consumer of FSchedW0Work, so two layers never race
     // clSetKernelArg on the same cl_kernel. With private handles there is no
     // shared argument state, so the layer rides the general queue and any worker
@@ -127909,7 +127960,7 @@ begin
   if Assigned(FDotCL) then Result := FDotCL.DotProductKernel else Result := nil;
 end;
 
-procedure TNNetLayer.OpenCLOutputFinish(pConsumerKernel: TNeuralKernel);
+procedure TNNetLayer.OpenCLWaitOutputIfAnotherQueue(pConsumerKernel: TNeuralKernel);
 var
   OutputKernel: TNeuralKernel;
 begin
@@ -127920,6 +127971,15 @@ begin
   if Assigned(pConsumerKernel) and
      (pConsumerKernel.Commands = OutputKernel.Commands) then exit;
   OutputKernel.Finish();
+end;
+
+// Says nothing about THIS layer: a consumer still adds its own conditions (the
+// device kernels are forward-only, so every caller also tests FIsTrainable).
+function TNNetLayer.PrevOutputOnOpenCL(): boolean;
+begin
+  Result := Assigned(FPrevLayer) and FPrevLayer.FOutputOnOpenCL and
+    Assigned(FPrevLayer.OpenCLOutputBuffer()) and
+    Assigned(FPrevLayer.OpenCLOutputKernel());
 end;
 
 function TNNetLayer.GetDotCLWaitBeta(): TNeuralFloat;

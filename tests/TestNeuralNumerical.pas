@@ -370,6 +370,10 @@ type
     // cannot tell the two apart, so the test also fills the source layer's host
     // output with a sentinel and asserts nothing overwrote it. Coded by Claude (AI).
     procedure TestPointwiseConvResidentInputOpenCLParity;
+    // The fully-connected case of the same bind, over both weight formats: FP32
+    // through cai_dot_product and int8 through cai_dot_product_int8. Same
+    // sentinel probe on the source layer. Coded by Claude (AI).
+    procedure TestFullConnectResidentInputOpenCLParity;
     // The spatial twin: an unpadded conv gathers its column matrix with
     // cai_im2col straight out of the source layer's device buffer, so the
     // FInputCopy upload disappears too. Same sentinel probe, swept over feature
@@ -64655,6 +64659,103 @@ begin
       AssertEquals('the source output must NOT be downloaded (case ' +
         IntToStr(CaseCnt) + ')', SourceConv.Output.Size, SentinelsLeft);
       AssertTrue('pointwise conv resident-input vs CPU parity (case ' +
+        IntToStr(CaseCnt) + '): max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-4', MaxDiff < 1e-4);
+      // The host copy is still one ForceOutputOnRAM away.
+      SourceConv.ForceOutputOnRAM();
+      SentinelsLeft := 0;
+      for i := 0 to SourceConv.Output.Size - 1 do
+        if SourceConv.Output.Raw[i] = csSentinel then Inc(SentinelsLeft);
+      AssertEquals('ForceOutputOnRAM must still recover the source output ' +
+        '(case ' + IntToStr(CaseCnt) + ')', 0, SentinelsLeft);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestFullConnectResidentInputOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  SourceConv: TNNetLayer;
+  FC: TNNetFullConnect;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, SentinelsLeft, CaseCnt: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = 999;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  // Case 0: FP32 weights. Case 1: int8-quantized, which binds the same source
+  // buffer through the resident-code kernel instead.
+  for CaseCnt := 0 to 1 do
+  begin
+    RandSeed := 20260817;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(4, 4, 8);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(4, 4, 8, 1));
+      SourceConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(8));
+      // 128 inputs / 512 neurons: both halves of the FullConnect FShouldOpenCL
+      // verdict, so EnableOpenCL allocates FDotCL. ForceOpenCL does not reach
+      // this layer - its Compute dispatches on FShouldOpenCL alone.
+      FC := TNNetFullConnectLinear.Create(512);
+      NN.AddLayer(FC);
+      for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.02 * i - 1.28;
+      for i := 0 to FC.Neurons.Count - 1 do
+        FC.Neurons[i].BiasWeight := 0.3 * Sin(i * 0.2);
+      NN.UpdateWeights();
+      // The device path is inference-only: a trainable layer keeps the host
+      // activation sweep and never leaves its output on the device.
+      NN.SetTrainable(False, False);
+      if CaseCnt = 1 then NN.QuantizeWeightsInt8();
+
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Only a download into the source layer clears these.
+        SourceConv.Output.Fill(csSentinel);
+        NN.Compute(Input);
+        SentinelsLeft := 0;
+        for i := 0 to SourceConv.Output.Size - 1 do
+          if SourceConv.Output.Raw[i] = csSentinel then Inc(SentinelsLeft);
+        MaxDiff := 0;
+        AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  FullConnect resident input: case=', CaseCnt, ' max|diff|=',
+        MaxDiff:0:9, ' gpu forwards=', FC.ForwardGPUCnt,
+        ' sentinels kept=', SentinelsLeft, '/', SourceConv.Output.Size);
+      AssertTrue('FullConnect must reach the device (case ' +
+        IntToStr(CaseCnt) + ')', FC.ForwardGPUCnt > 0);
+      AssertEquals('the source output must NOT be downloaded (case ' +
+        IntToStr(CaseCnt) + ')', SourceConv.Output.Size, SentinelsLeft);
+      AssertTrue('FullConnect resident-input vs CPU parity (case ' +
         IntToStr(CaseCnt) + '): max |diff| = ' + FloatToStr(MaxDiff) +
         ' must be < 1e-4', MaxDiff < 1e-4);
       // The host copy is still one ForceOutputOnRAM away.
