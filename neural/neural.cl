@@ -1485,9 +1485,10 @@ __kernel void cai_softmax
 
 // CAI shared elementwise activation forward. One work-item per element applies
 // the function selected by FOpcode (kept in sync with the csAct* constants in
-// neuralnetwork.pas): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent. This single
-// kernel backs every opting-in TNNetIdentity activation descendant, so new
-// elementwise activations only add a case here plus an opcode. FParamA and
+// neuralnetwork.pas): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent, 4 = Swish,
+// 5 = GELU, 6 = GELUErf, 7 = HardSwish, 8 = HardSigmoid, 9 = ELU, 10 = SELU.
+// This single kernel backs every opting-in TNNetIdentity activation descendant,
+// so new elementwise activations only add a case here plus an opcode. FParamA and
 // FParamB carry the per-layer constants of the parameterized activations (a
 // slope, a lambda, a pair of limits); cases that take none ignore them.
 // Forward-only: the host keeps the backward pass (and, for ReLU, the
@@ -1531,6 +1532,54 @@ __kernel void cai_activation
       y = (1.0f - e) / (1.0f + e);
       break;
     }
+    case 4: // Swish / SiLU: x * sigmoid(x), sigmoid in the same two-branch form
+      if (x > 0.0f)
+        y = x / (1.0f + exp(-x));
+      else
+      {
+        const float s = exp(x);
+        y = x * s / (1.0f + s);
+      }
+      break;
+    case 5: // GELU (tanh approximation): x * 0.5 * (1 + tanh(arg))
+    {
+      const float SQRT_2_OVER_PI = 0.7978845608f;
+      const float GELU_CONST = 0.044715f;
+      // The cubic term drives arg past 100 by |x| ~ 15, and tanh is already 1.0f
+      // in single precision by |arg| ~ 9, so the [-10,10] clamp changes no
+      // representable result and keeps exp(-2*arg) at exp(20).
+      float arg = SQRT_2_OVER_PI * (x + GELU_CONST * x * x * x);
+      if (arg > 10.0f) arg = 10.0f; else if (arg < -10.0f) arg = -10.0f;
+      const float e = exp(-2.0f * arg);
+      y = x * 0.5f * (1.0f + (1.0f - e) / (1.0f + e));
+      break;
+    }
+    case 6: // GELUErf (exact form): x * 0.5 * (1 + erf(x/sqrt(2)))
+    {
+      const float INV_SQRT_2 = 0.7071067811865476f;
+      y = x * 0.5f * (1.0f + erf(x * INV_SQRT_2));
+      break;
+    }
+    case 7: // HardSwish: x for x > 3, 0 for x < -3, else x*(x+3)/6
+      if (x > 3.0f) y = x;
+      else if (x < -3.0f) y = 0.0f;
+      else y = x * (x + 3.0f) / 6.0f;
+      break;
+    case 8: // HardSigmoid: 1 for x > 3, 0 for x < -3, else (x+3)/6
+      if (x > 3.0f) y = 1.0f;
+      else if (x < -3.0f) y = 0.0f;
+      else y = (x + 3.0f) / 6.0f;
+      break;
+    case 9: // ELU: x for x > 0, else alpha*(exp(x)-1). FParamA = alpha.
+      // exp is evaluated only on the negative branch, where it underflows
+      // towards zero rather than overflowing, so no clamp is needed.
+      if (x > 0.0f) y = x; else y = FParamA * (exp(x) - 1.0f);
+      break;
+    case 10: // SELU: scale*x for x > 0, else scale*alpha*exp(x) - scale*alpha.
+      // FParamA = scale*alpha and FParamB = scale, both passed in from the layer
+      // so the device uses the very floats the host multiplied.
+      if (x > 0.0f) y = FParamB * x; else y = FParamA * exp(x) - FParamA;
+      break;
     default: // csActNone / unknown: pass through
       y = x;
   }

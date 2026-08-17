@@ -365,6 +365,7 @@ type
     // already-resident source output: four gates x two depths x two input
     // scales, the large one covering the kernel's saturation clamps.
     procedure TestGLUGateResidentOpenCLParity;
+    procedure TestActivationOpenCLParity;
     // Device-side im2col (cai_im2col) forward parity for the general convolution:
     // an inference-only conv gathers FInputPrepared on the device instead of the
     // host. Sweeps feature-size x padding x stride so the gather index math
@@ -64784,6 +64785,126 @@ begin
     finally
       Input.Free;
       RefNN.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Every activation that carries a cai_activation opcode, checked against its own
+// CPU forward. One entry per opcode: adding an activation is a line in Names and
+// a line in CreateActivation. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestActivationOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Names: array[0..11] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
+    'Swish', 'SiLU', 'GELU', 'GELUErf', 'HardSwish', 'HardSigmoid',
+    'ELU', 'ELU alpha 0.5', 'SELU');
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  ActLayer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InSize, VariantCnt, ScaleCnt: integer;
+  InScale, Diff, MaxDiff, RefMagnitude: TNeuralFloat;
+
+  function CreateActivation(Variant: integer): TNNetLayer;
+  begin
+    case Variant of
+      0: Result := TNNetReLU.Create();
+      1: Result := TNNetSigmoid.Create();
+      2: Result := TNNetHyperbolicTangent.Create();
+      3: Result := TNNetSwish.Create();
+      4: Result := TNNetSiLU.Create();
+      5: Result := TNNetGELU.Create();
+      6: Result := TNNetGELUErf.Create();
+      7: Result := TNNetHardSwish.Create();
+      8: Result := TNNetHardSigmoid.Create();
+      9: Result := TNNetELU.Create();
+      10: Result := TNNetELU.Create(0.5);
+    else Result := TNNetSELU.Create();
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for VariantCnt := 0 to High(Names) do
+  for ScaleCnt := 0 to 1 do
+  begin
+    RandSeed := 424242;
+    // Scale 6 crosses every breakpoint the piecewise activations have (+-1 and
+    // +-3) and reaches the negative exponential branches of ELU and SELU. It
+    // stops well short of the range where the host TNNetVolume.Sigmoid, which
+    // evaluates exp(-x) unclamped, stops agreeing with the kernel's two-branch
+    // form - that divergence would be the host's, not the kernel's.
+    if ScaleCnt = 0 then InScale := 0.6 else InScale := 6;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, 8);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+      ActLayer := NN.AddLayer(CreateActivation(VariantCnt));
+      // The device path is inference-only: it writes FOutput but neither
+      // FOutputRaw nor the derivative mask the backward pass reads.
+      NN.SetTrainable(False, False);
+
+      InSize := Input.Size;
+      for i := 0 to InSize - 1 do
+        Input.Raw[i] := InScale * Sin(i * 0.37);
+
+      // CPU oracle: the same layer's own forward, taken before the device path
+      // overwrites FOutput. SetTrainable already ran, so both passes take the
+      // forward-only CPU branch - which is the one the kernel must match.
+      NN.Compute(Input);
+      OutCPU.Copy(ActLayer.Output);
+      AssertEquals(Names[VariantCnt] + ' ran on the CPU before EnableOpenCL', 0,
+        ActLayer.ForwardGPUCnt);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Wipe the host copy the CPU forward left behind, so a device path that
+        // never writes back compares as zeros instead of as its own reference.
+        ActLayer.Output.Fill(0);
+        NN.Compute(Input);
+      finally
+        NN.ForceOpenCL(False);
+      end;
+
+      // Relative to the reference where that exceeds 1; below 1 the divisor is
+      // 1, which is the plain absolute difference.
+      MaxDiff := 0;
+      AssertEquals(Names[VariantCnt] + ' output size match',
+        OutCPU.Size, ActLayer.Output.Size);
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        RefMagnitude := Abs(OutCPU.Raw[i]);
+        if RefMagnitude < 1 then RefMagnitude := 1;
+        Diff := Abs(OutCPU.Raw[i] - ActLayer.Output.Raw[i]) / RefMagnitude;
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      WriteLn('  ', Names[VariantCnt], ' OpenCL parity: scale ', InScale:0:1,
+        ' max rel diff=', MaxDiff:0:9, ' gpu forwards=', ActLayer.ForwardGPUCnt);
+      // Without this a silent fall back to the CPU would compare the reference
+      // against itself and pass while covering nothing.
+      AssertTrue(Names[VariantCnt] + ' must reach the device',
+        ActLayer.ForwardGPUCnt > 0);
+      AssertTrue(Names[VariantCnt] + ' OpenCL vs CPU parity (scale ' +
+        FloatToStr(InScale) + '): max relative diff = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      OutCPU.Free;
+      Input.Free;
       NN.Free;
     end;
   end;

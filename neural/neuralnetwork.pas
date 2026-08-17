@@ -71,6 +71,13 @@ const
   csActReLU    = 1;
   csActSigmoid = 2;
   csActTanh    = 3;
+  csActSwish       = 4;  // also TNNetSiLU
+  csActGELU        = 5;  // tanh approximation
+  csActGELUErf     = 6;  // exact erf form
+  csActHardSwish   = 7;
+  csActHardSigmoid = 8;
+  csActELU         = 9;  // ParamA = alpha
+  csActSELU        = 10; // ParamA = scale*alpha, ParamB = scale
   // Minimum FOutput.Size before the elementwise-activation device path is
   // considered in production. These layers are ~1 flop/word (ReLU) to ~10
   // flops/word (sigmoid/tanh) - pure PCIe round trips with no reduction to
@@ -1277,6 +1284,7 @@ type
   // https://arxiv.org/abs/1710.05941
   TNNetSwish = class(TNNetReLUBase)
   public
+    constructor Create(); override;
     procedure Compute(); override;
   end;
 
@@ -1390,6 +1398,7 @@ type
   // https://paperswithcode.com/method/hard-swish
   TNNetHardSwish = class(TNNetReLUBase)
   public
+    constructor Create(); override;
     procedure Compute(); override;
   end;
 
@@ -1400,6 +1409,7 @@ type
   // Coded by Claude (AI).
   TNNetHardSigmoid = class(TNNetReLUBase)
   public
+    constructor Create(); override;
     procedure Compute(); override;
   end;
 
@@ -1412,6 +1422,7 @@ type
   // https://arxiv.org/abs/1606.08415
   TNNetGELU = class(TNNetReLUBase)
   public
+    constructor Create(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -1427,6 +1438,7 @@ type
   // Coded by Claude (AI).
   TNNetGELUErf = class(TNNetReLUBase)
   public
+    constructor Create(); override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -23203,6 +23215,12 @@ end;
 
 { TNNetHardSwish }
 
+constructor TNNetHardSwish.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActHardSwish; // piecewise, no exp
+end;
+
 procedure TNNetHardSwish.Compute();
 var
   SizeM1: integer;
@@ -23212,7 +23230,11 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -23263,6 +23285,12 @@ end;
 
 { TNNetHardSigmoid }
 
+constructor TNNetHardSigmoid.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActHardSigmoid; // piecewise, no exp
+end;
+
 procedure TNNetHardSigmoid.Compute();
 var
   SizeM1: integer;
@@ -23272,7 +23300,11 @@ var
   x: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -23467,6 +23499,12 @@ end;
 
 { TNNetSwish }
 
+constructor TNNetSwish.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActSwish; // shared with TNNetSiLU
+end;
+
 procedure TNNetSwish.Compute();
 var
   SizeM1: integer;
@@ -23478,7 +23516,11 @@ var
   OutputValue: TNeuralFloat;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -24355,6 +24397,12 @@ end;
 
 { TNNetGELU }
 
+constructor TNNetGELU.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActGELU; // tanh approximation
+end;
+
 procedure TNNetGELU.Compute();
 var
   LocalSize, SizeM1: integer;
@@ -24371,7 +24419,11 @@ const
   GELU_CONST = 0.044715;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   LocalSize := LocalPrevOutput.Size;
   SizeM1 := LocalSize - 1;
@@ -24437,6 +24489,12 @@ end;
 
 { TNNetGELUErf }
 
+constructor TNNetGELUErf.Create();
+begin
+  inherited Create();
+  FActivationOpcode := csActGELUErf; // exact erf form
+end;
+
 procedure TNNetGELUErf.Compute();
 var
   SizeM1: integer;
@@ -24450,7 +24508,11 @@ const
   INV_SQRT_2PI = 0.39894228040143268;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
   // Two-pass: fill FOutput with x/sqrt(2), vectorize erf in place (Erf),
@@ -53916,6 +53978,7 @@ begin
   FScale := 1.0507;
   FThreshold := 0.0;
   FScaleAlpha := FAlpha * FScale;
+  FActivationOpcode := csActSELU;
 end;
 
 procedure TNNetSELU.Compute();
@@ -53930,7 +53993,11 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL(FScaleAlpha, FScale) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
@@ -54025,6 +54092,7 @@ begin
   inherited Create();
   FAlpha := pAlpha;
   FFloatSt[0] := pAlpha;
+  FActivationOpcode := csActELU;
 end;
 
 procedure TNNetELU.Compute();
@@ -54039,9 +54107,13 @@ var
   {$ENDIF}
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   // Recover alpha from FFloatSt to honour values reloaded via LoadFromString.
   FAlpha := FFloatSt[0];
+  if ComputeActivationOnOpenCL(FAlpha) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
 
