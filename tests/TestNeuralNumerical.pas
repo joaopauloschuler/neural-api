@@ -64801,9 +64801,12 @@ end;
 procedure TTestNeuralNumerical.TestActivationOpenCLParity;
 {$IFDEF OpenCL}
 const
-  Names: array[0..11] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
+  Names: array[0..26] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
     'Swish', 'SiLU', 'GELU', 'GELUErf', 'HardSwish', 'HardSigmoid',
-    'ELU', 'ELU alpha 0.5', 'SELU');
+    'ELU', 'ELU alpha 0.5', 'SELU', 'ReLUP', 'Abs', 'Sign', 'Square',
+    'SquaredReLU', 'LeakyReLU', 'VeryLeakyReLU', 'ShiftedReLU', 'HardTanh',
+    'HardShrink', 'SoftShrink', 'Threshold', 'Clamp', 'SoftSign',
+    'BentIdentity');
 var
   NN: TNNet;
   Input, OutCPU: TNNetVolume;
@@ -64827,7 +64830,22 @@ var
       8: Result := TNNetHardSigmoid.Create();
       9: Result := TNNetELU.Create();
       10: Result := TNNetELU.Create(0.5);
-    else Result := TNNetSELU.Create();
+      11: Result := TNNetSELU.Create();
+      12: Result := TNNetReLUP.Create();
+      13: Result := TNNetAbs.Create();
+      14: Result := TNNetSign.Create();
+      15: Result := TNNetSquare.Create();
+      16: Result := TNNetSquaredReLU.Create();
+      17: Result := TNNetLeakyReLU.Create();
+      18: Result := TNNetVeryLeakyReLU.Create();
+      19: Result := TNNetShiftedReLU.Create();
+      20: Result := TNNetHardTanh.Create();
+      21: Result := TNNetHardShrink.Create();
+      22: Result := TNNetSoftShrink.Create();
+      23: Result := TNNetThreshold.Create(0.5, -2);
+      24: Result := TNNetClamp.Create(-0.5, 2);
+      25: Result := TNNetSoftSign.Create();
+    else Result := TNNetBentIdentity.Create();
     end;
   end;
 

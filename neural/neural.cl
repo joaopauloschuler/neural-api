@@ -1486,7 +1486,8 @@ __kernel void cai_softmax
 // CAI shared elementwise activation forward. One work-item per element applies
 // the function selected by FOpcode (kept in sync with the csAct* constants in
 // neuralnetwork.pas): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent, 4 = Swish,
-// 5 = GELU, 6 = GELUErf, 7 = HardSwish, 8 = HardSigmoid, 9 = ELU, 10 = SELU.
+// 5 = GELU, 6 = GELUErf, 7 = HardSwish, 8 = HardSigmoid, 9 = ELU, 10 = SELU,
+// 11..23 = the branch-and-arithmetic activations (Abs through BentIdentity).
 // This single kernel backs every opting-in TNNetIdentity activation descendant,
 // so new elementwise activations only add a case here plus an opcode. FParamA and
 // FParamB carry the per-layer constants of the parameterized activations (a
@@ -1579,6 +1580,49 @@ __kernel void cai_activation
       // FParamA = scale*alpha and FParamB = scale, both passed in from the layer
       // so the device uses the very floats the host multiplied.
       if (x > 0.0f) y = FParamB * x; else y = FParamA * exp(x) - FParamA;
+      break;
+    case 11: // Abs
+      y = fabs(x);
+      break;
+    case 12: // Sign: +1 above zero, -1 below, 0 at exactly zero
+      if (x > 0.0f) y = 1.0f; else if (x < 0.0f) y = -1.0f; else y = 0.0f;
+      break;
+    case 13: // Square
+      y = x * x;
+      break;
+    case 14: // SquaredReLU: x*x for x > 0, else 0
+      y = (x > 0.0f) ? x * x : 0.0f;
+      break;
+    case 15: // LeakyReLU: x for x > 0, else slope*x. FParamA = slope.
+      y = (x > 0.0f) ? x : FParamA * x;
+      break;
+    case 16: // ShiftedReLU: max(x, -1)
+      y = (x > -1.0f) ? x : -1.0f;
+      break;
+    case 17: // HardTanh: clamp to [-1,1]
+      if (x > 1.0f) y = 1.0f; else if (x < -1.0f) y = -1.0f; else y = x;
+      break;
+    case 18: // HardShrink: x outside [-lambda,lambda], else 0. FParamA = lambda.
+      y = ((x > FParamA) || (x < -FParamA)) ? x : 0.0f;
+      break;
+    case 19: // SoftShrink: shrink towards zero by lambda. FParamA = lambda.
+      if (x > FParamA) y = x - FParamA;
+      else if (x < -FParamA) y = x + FParamA;
+      else y = 0.0f;
+      break;
+    case 20: // Threshold: x above theta, else a fixed value.
+      y = (x > FParamA) ? x : FParamB;   // FParamA = theta, FParamB = value
+      break;
+    case 21: // Clamp to [FParamA, FParamB]
+      if (x <= FParamA) y = FParamA;
+      else if (x >= FParamB) y = FParamB;
+      else y = x;
+      break;
+    case 22: // SoftSign: x / (1 + |x|)
+      y = x / (1.0f + fabs(x));
+      break;
+    case 23: // BentIdentity: (sqrt(x^2 + 1) - 1)/2 + x
+      y = (sqrt(x * x + 1.0f) - 1.0f) * 0.5f + x;
       break;
     default: // csActNone / unknown: pass through
       y = x;
