@@ -66,6 +66,14 @@ after an edit: a `MaxNeuronPos` that now bounds channels.
 - **Routines** name the effect, and the name must match the effect exactly.
   `ForceOutputOnRAM` moves data; a routine called `Get…` must not mutate.
 - **Booleans** read as a predicate: `HasSharedKernel`, `IsQuantized`.
+- **A name must not claim more than the code checks.** `PrevOutputOnDevice`
+  named a `cl_device_id` the routine never looked at — it tested
+  `FOutputOnOpenCL` and two buffer handles; it is now `PrevOutputOnOpenCL`.
+  The tell was `FOpenCLDeviceTag`, the one field that
+  would hold a device: nil'd in the constructor, never assigned, so no
+  same-device check existed anywhere. A name that promises a check nobody
+  performs is worse than no name, because it stops the next reader from
+  looking.
 
 Precision includes the type. Pick the type that states the intent —
 `TNeuralFloat` for tensor math, `integer` for counts and offsets — and do not
@@ -276,6 +284,9 @@ the document never says so. This repository is full of live collisions:
   them.
 - **head** — an attention head, and the LM head.
 - **weights** — the `TNNetVolume` of parameters, and the int8-quantized copy.
+- **device** — a `cl_device_id`, and (wrongly) "in OpenCL memory".
+- **gate** — a GLU/forget/MoE gate, and (wrongly) a control-flow guard, a
+  numeric threshold, or a covering test.
 
 **Rule.** When two meanings of one word are live in the same document or the
 same reply, name the distinction once, explicitly, at first use — then keep
@@ -284,6 +295,33 @@ here; "checkpoint file" and "the loaded `TNNet`" are not.
 
 The same holds in code: two fields that both want the name `FWeights` are the
 signal that one of them needs a qualifier (`FWeightsInt8`), not a comment.
+
+### Two counter-examples from this repository
+
+**Do not write "device" when you mean "OpenCL".** A `TNNetLayer` owns no
+`cl_device_id`, so in `neuralnetwork.pas` "device" can only mean "in OpenCL
+memory" or "in an OpenCL kernel" — which that unit already spells
+`FOutputOnOpenCL`, `OpenCLOutputBuffer`, `ForceOutputOnRAM`. Say `OpenCL`
+there and keep `Device` for the real thing. `TEasyOpenCL` and
+`TDotProductSharedKernel` in `neuralopencl.pas` *do* own a device, so
+`SetCurrentDevice`, `GetDeviceCount` and `BuildInputColsOnDevice` are correct
+as they stand. The unit boundary is the line.
+
+**Do not name everything "gate".** The word belongs to the layer concept —
+GLU gate, forget gate, MoE routing gate, `TNNetGatedResidual` — and that is
+where it must stay. It had leaked into three other jobs:
+
+| Leaked use | Say instead |
+| --- | --- |
+| "the caller gates on `WillOpenCL()`" | "the caller checks `WillOpenCL()` first" |
+| "would drift past the 1e-4 parity gate" | "past the 1e-4 parity tolerance" |
+| "Round-trip gated by `TestBartSafeTensorsRoundTrip`" | "Round-trip **covered by** `TestBartSafeTensorsRoundTrip`" |
+
+The last one is not just a synonym: nothing is gated, the test decides nothing
+at run time, and a reader who takes the word literally goes hunting for a
+condition that does not exist. The collision also runs at close range —
+`TNNetGLUGateCL.GateOnOpenCL` is declared twenty lines above a comment using
+the other sense.
 
 **Why.** A collision left unnamed does not read as ambiguous — it reads as
 clear and means the wrong thing. That is worse than obvious vagueness, because
