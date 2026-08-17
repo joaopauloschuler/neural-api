@@ -96,10 +96,11 @@ const
   // considered in production. These layers are ~1 flop/word (ReLU) to ~10
   // flops/word (sigmoid/tanh) - pure PCIe round trips with no reduction to
   // amortize the transfer - so the host AVX path wins at every realistic size.
-  // The threshold is set deliberately high so FShouldOpenCL stays False in
-  // production (verdict column reads 'no'); the OpenCLForwardBenchmark still
-  // charts the device timing via ForceOpenCL, which bypasses this verdict.
-  // Coded by Claude (AI).
+  // The threshold is set deliberately high so this term of
+  // TNNetIdentity.WillOpenCL stays False in production. The two other ways onto
+  // the device pay no transfer: ForceOpenCL, which the OpenCLForwardBenchmark
+  // uses to chart the device timing, and a previous layer that already left its
+  // output in OpenCL memory (ShouldStayOnOpenCL). Coded by Claude (AI).
   csActivationOpenCLMinSize = 64*1024*1024;
 
   // Channel count from which the bilinear-sampler backward passes
@@ -1113,8 +1114,8 @@ type
       // FPrevLayer.FOutput into FOutput. The caller checks WillOpenCL() and
       // bumps FForwardGPUCnt, exactly as TNNetConvolution.Compute does. Forward
       // only: FOutputRaw and the ReLU derivative mask are NOT produced here, so
-      // WillOpenCL keeps this off during training (it only fires above
-      // csActivationOpenCLMinSize or under ForceOpenCL). Coded by Claude (AI).
+      // WillOpenCL keeps this off while the layer is trainable, except under
+      // ForceOpenCL. Coded by Claude (AI).
       procedure ComputeOpenCL(ParamA, ParamB, ParamC: TNeuralFloat);
       // True when ComputeOpenCL will read the previous layer's device output in
       // place of an upload and leave its own result there. Coded by Claude (AI).
@@ -97788,7 +97789,8 @@ function TNNetIdentity.WillOpenCL(): boolean;
 begin
   Result := (FActivationOpcode <> csActNone) and Assigned(FActivationBuffer)
     and Assigned(FActivationKernel) and FHasOpenCL
-    and ((FShouldOpenCL and (FOutput.Size >= csActivationOpenCLMinSize)) or FForceOpenCL or FPrevLayer.FOutputOnOpenCL);
+    and ((FShouldOpenCL and (FOutput.Size >= csActivationOpenCLMinSize))
+         or FForceOpenCL or ShouldStayOnOpenCL());
 end;
 
 function TNNetIdentity.ShouldStayOnOpenCL(): boolean;
@@ -97898,11 +97900,10 @@ begin
   SetOutputErrorSize(FOutput);
   {$IFDEF OpenCL}
   // Only touch FShouldOpenCL for the opted-in activation layers so this base
-  // hook cannot disturb any other TNNetIdentity descendant's own verdict. The
-  // threshold is deliberately unreachable in production (see the constant): the
-  // benchmark charts the device path via ForceOpenCL, but real nets never
-  // dispatch these bandwidth-bound elementwise ops.
-  FShouldOpenCL := true;
+  // hook cannot disturb any other TNNetIdentity descendant's own verdict.
+  // WillOpenCL applies the size threshold against the current FOutput.Size, so
+  // the verdict is not frozen here.
+  if FActivationOpcode <> csActNone then FShouldOpenCL := true;
   {$ENDIF}
 end;
 
