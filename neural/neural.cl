@@ -1487,11 +1487,13 @@ __kernel void cai_softmax
 // the function selected by FOpcode (kept in sync with the csAct* constants in
 // neuralnetwork.pas): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent, 4 = Swish,
 // 5 = GELU, 6 = GELUErf, 7 = HardSwish, 8 = HardSigmoid, 9 = ELU, 10 = SELU,
-// 11..23 = the branch-and-arithmetic activations (Abs through BentIdentity).
+// 11..23 = the branch-and-arithmetic activations (Abs through BentIdentity),
+// 24 = ReLUL.
 // This single kernel backs every opting-in TNNetIdentity activation descendant,
-// so new elementwise activations only add a case here plus an opcode. FParamA and
-// FParamB carry the per-layer constants of the parameterized activations (a
-// slope, a lambda, a pair of limits); cases that take none ignore them.
+// so new elementwise activations only add a case here plus an opcode. FParamA,
+// FParamB and FParamC carry the per-layer constants of the parameterized
+// activations (a slope, a lambda, a pair of limits and their leak); cases that
+// take none ignore them.
 // Forward-only: the host keeps the backward pass (and, for ReLU, the
 // derivative gate mask). The sigmoid/tanh math mirrors the scalar CPU forms -
 // the two-branch stable sigmoid and the [-10,10]-clamped tanh - so the device
@@ -1503,6 +1505,7 @@ __kernel void cai_activation
   const int FOpcode,
   const float FParamA,
   const float FParamB,
+  const float FParamC,
   __global const float* FX,
   __global float* FY
 )
@@ -1623,6 +1626,11 @@ __kernel void cai_activation
       break;
     case 23: // BentIdentity: (sqrt(x^2 + 1) - 1)/2 + x
       y = (sqrt(x * x + 1.0f) - 1.0f) * 0.5f + x;
+      break;
+    case 24: // ReLUL: leaky clamp into [FParamA, FParamB]. FParamC = slope.
+      if (x > FParamB) y = FParamB + (x - FParamB) * FParamC;
+      else if (x > FParamA) y = x;
+      else y = FParamA + (x - FParamA) * FParamC;
       break;
     default: // csActNone / unknown: pass through
       y = x;

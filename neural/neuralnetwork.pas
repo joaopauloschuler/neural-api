@@ -91,6 +91,7 @@ const
   csActClamp        = 21; // ParamA = minimum, ParamB = maximum
   csActSoftSign     = 22;
   csActBentIdentity = 23;
+  csActReLUL        = 24; // ParamA = low limit, ParamB = high limit, ParamC = leak
   // Minimum FOutput.Size before the elementwise-activation device path is
   // considered in production. These layers are ~1 flop/word (ReLU) to ~10
   // flops/word (sigmoid/tanh) - pure PCIe round trips with no reduction to
@@ -1095,7 +1096,7 @@ type
       // only: FOutputRaw and the ReLU derivative mask are NOT produced here, so
       // WillOpenCL keeps this off during training (it only fires above
       // csActivationOpenCLMinSize or under ForceOpenCL). Coded by Claude (AI).
-      procedure ComputeOpenCL(ParamA, ParamB: TNeuralFloat);
+      procedure ComputeOpenCL(ParamA, ParamB, ParamC: TNeuralFloat);
       {$ENDIF}
       // True when the device ran this layer's activation, so the caller's
       // Compute can exit. False means the CPU path follows, with the source
@@ -1103,7 +1104,7 @@ type
       // them in, reading the same fields their CPU path reads.
       // Coded by Claude (AI).
       function ComputeActivationOnOpenCL(ParamA: TNeuralFloat = 0;
-        ParamB: TNeuralFloat = 0): boolean;
+        ParamB: TNeuralFloat = 0; ParamC: TNeuralFloat = 0): boolean;
     public
       constructor Create(); override;
       {$IFDEF OpenCL}
@@ -52368,6 +52369,7 @@ end;
 constructor TNNetReLUL.Create(LowLimit, HighLimit, Leakiness: integer);
 begin
   inherited Create();
+  FActivationOpcode := csActReLUL; // shared with TNNetReLU6
   FScale := 0.001*Leakiness;
   FHighLimit := HighLimit;
   FLowLimit := LowLimit;
@@ -52383,7 +52385,11 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeActivationOnOpenCL(FLowLimit, FHighLimit, FScale) then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   LocalPrevOutput := FPrevLayer.Output;
   ElementCount := LocalPrevOutput.Size;
 
@@ -97636,7 +97642,7 @@ begin
             and (FShouldOpenCL or FForceOpenCL);
 end;
 
-procedure TNNetIdentity.ComputeOpenCL(ParamA, ParamB: TNeuralFloat);
+procedure TNNetIdentity.ComputeOpenCL(ParamA, ParamB, ParamC: TNeuralFloat);
 var
   Kern: TNeuralKernel;
   k: cl_kernel;
@@ -97657,8 +97663,9 @@ begin
   clSetKernelArg(k, 1, csLongintSize, @iOpcode);
   clSetKernelArg(k, 2, csNeuralFloatSize, @ParamA);
   clSetKernelArg(k, 3, csNeuralFloatSize, @ParamB);
-  clSetKernelArg(k, 4, csCLMemSize, @FActivationBuffer); // FX
-  clSetKernelArg(k, 5, csCLMemSize, @FActivationBuffer); // FY (in place)
+  clSetKernelArg(k, 4, csNeuralFloatSize, @ParamC);
+  clSetKernelArg(k, 5, csCLMemSize, @FActivationBuffer); // FX
+  clSetKernelArg(k, 6, csCLMemSize, @FActivationBuffer); // FY (in place)
   Kern.RunKernel(k, iSize);
   Kern.Finish();
   Kern.ReadBuffer(FActivationBuffer, FOutput, CL_TRUE);
@@ -97666,14 +97673,14 @@ end;
 {$ENDIF}
 
 function TNNetIdentity.ComputeActivationOnOpenCL(ParamA: TNeuralFloat = 0;
-  ParamB: TNeuralFloat = 0): boolean;
+  ParamB: TNeuralFloat = 0; ParamC: TNeuralFloat = 0): boolean;
 begin
   Result := false;
   {$IFDEF OpenCL}
   if WillOpenCL() then
   begin
     Inc(FForwardGPUCnt);
-    ComputeOpenCL(ParamA, ParamB);
+    ComputeOpenCL(ParamA, ParamB, ParamC);
     Result := true;
     exit;
   end;

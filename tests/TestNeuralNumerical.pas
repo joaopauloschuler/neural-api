@@ -64801,12 +64801,12 @@ end;
 procedure TTestNeuralNumerical.TestActivationOpenCLParity;
 {$IFDEF OpenCL}
 const
-  Names: array[0..26] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
+  Names: array[0..29] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
     'Swish', 'SiLU', 'GELU', 'GELUErf', 'HardSwish', 'HardSigmoid',
     'ELU', 'ELU alpha 0.5', 'SELU', 'ReLUP', 'Abs', 'Sign', 'Square',
     'SquaredReLU', 'LeakyReLU', 'VeryLeakyReLU', 'ShiftedReLU', 'HardTanh',
     'HardShrink', 'SoftShrink', 'Threshold', 'Clamp', 'SoftSign',
-    'BentIdentity');
+    'ReLUL', 'ReLUL leaky', 'ReLU6', 'BentIdentity');
 var
   NN: TNNet;
   Input, OutCPU: TNNetVolume;
@@ -64845,6 +64845,9 @@ var
       23: Result := TNNetThreshold.Create(0.5, -2);
       24: Result := TNNetClamp.Create(-0.5, 2);
       25: Result := TNNetSoftSign.Create();
+      26: Result := TNNetReLUL.Create(-2, 2, 0);
+      27: Result := TNNetReLUL.Create(-2, 2, 100); // 10% leak beyond the limits
+      28: Result := TNNetReLU6.Create();
     else Result := TNNetBentIdentity.Create();
     end;
   end;
