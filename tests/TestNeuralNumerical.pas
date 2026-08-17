@@ -365,6 +365,11 @@ type
     // already-resident source output: four gates x two depths x two input
     // scales, the large one covering the kernel's saturation clamps.
     procedure TestGLUGateResidentOpenCLParity;
+    // A pointwise conv binds the previous layer's device output as the B operand
+    // of cai_dot_product instead of downloading and re-uploading it. Parity alone
+    // cannot tell the two apart, so the test also fills the source layer's host
+    // output with a sentinel and asserts nothing overwrote it. Coded by Claude (AI).
+    procedure TestPointwiseConvResidentInputOpenCLParity;
     procedure TestActivationOpenCLParity;
     // Device-side im2col (cai_im2col) forward parity for the general convolution:
     // an inference-only conv gathers FInputPrepared on the device instead of the
@@ -64557,6 +64562,98 @@ begin
       AssertTrue('TNNetSum OpenCL vs CPU parity (' + IntToStr(BranchCnt) +
         ' sources): max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
         MaxDiff < 1e-4);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestPointwiseConvResidentInputOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  SourceConv, PointwiseConv: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, SentinelsLeft, CaseCnt: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = 999;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  // Case 0: the source is another pointwise conv. Case 1: it is a spatial
+  // convolution, so the operand the consumer binds was produced by a different
+  // GEMM shape than its own.
+  for CaseCnt := 0 to 1 do
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, 8);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+      if CaseCnt = 0
+        then SourceConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(8))
+        else SourceConv := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+      PointwiseConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(4));
+      // The device path is inference-only: a trainable layer keeps the host
+      // activation sweep and never leaves its output on the device.
+      NN.SetTrainable(False, False);
+
+      for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.05 * i - 0.3;
+
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Only a download into the source layer clears these.
+        SourceConv.Output.Fill(csSentinel);
+        NN.Compute(Input);
+        SentinelsLeft := 0;
+        for i := 0 to SourceConv.Output.Size - 1 do
+          if SourceConv.Output.Raw[i] = csSentinel then Inc(SentinelsLeft);
+        MaxDiff := 0;
+        AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  Pointwise resident input: case=', CaseCnt, ' max|diff|=',
+        MaxDiff:0:9, ' gpu forwards=', PointwiseConv.ForwardGPUCnt,
+        ' sentinels kept=', SentinelsLeft, '/', SourceConv.Output.Size);
+      AssertTrue('pointwise conv must reach the device (case ' +
+        IntToStr(CaseCnt) + ')', PointwiseConv.ForwardGPUCnt > 0);
+      AssertEquals('the source output must NOT be downloaded (case ' +
+        IntToStr(CaseCnt) + ')', SourceConv.Output.Size, SentinelsLeft);
+      AssertTrue('pointwise conv resident-input vs CPU parity (case ' +
+        IntToStr(CaseCnt) + '): max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-4', MaxDiff < 1e-4);
+      // The host copy is still one ForceOutputOnRAM away.
+      SourceConv.ForceOutputOnRAM();
+      SentinelsLeft := 0;
+      for i := 0 to SourceConv.Output.Size - 1 do
+        if SourceConv.Output.Raw[i] = csSentinel then Inc(SentinelsLeft);
+      AssertEquals('ForceOutputOnRAM must still recover the source output ' +
+        '(case ' + IntToStr(CaseCnt) + ')', 0, SentinelsLeft);
     finally
       OutCPU.Free;
       Input.Free;

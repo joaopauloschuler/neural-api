@@ -14028,12 +14028,15 @@ type
       // forward, so Compute() can rely on it to skip the host im2col. Coded by
       // Claude (AI).
       function ShouldDeviceIm2Col(): boolean; {$IFDEF Release} inline; {$ENDIF}
+      // True when ComputeOpenCL will bind the previous layer's device output as
+      // the B operand instead of uploading it. Pointwise only. Coded by Claude (AI).
+      function ShouldBindPrevOutputOnDevice(): boolean;
       procedure ComputeOpenCL();
       // Int8 device forward: resident interleaved codes + per-row scales via
       // cai_dot_product_int8 (armed in EnableOpenCL); shares the fused
       // bias/activation verdict and the device-im2col path with
       // ComputeOpenCL. Coded by Claude (AI).
-      procedure ComputeOpenCLInt8();
+      procedure ComputeOpenCLInt8(pPrevOutputBuffer: cl_mem = nil);
       {$ENDIF}
       function WinogradEligible(): boolean; {$IFDEF Release} inline; {$ENDIF}
       procedure BuildWinogradKernels();
@@ -100708,20 +100711,42 @@ begin
     and WillOpenCL() and (not WinogradEligible());
 end;
 
+// A pointwise conv needs no im2col: FInputPrepared IS FPrevLayer.Output
+// (SetPrevLayer), and cai_dot_product reads B as B[b*FSize+i] - the same
+// position-major, depth-fastest order a TNNetVolume already carries, and the
+// same order every producer's buffer holds its output in. So a resident source
+// binds straight in as the B operand: no gather, no repacking, no round trip.
+function TNNetConvolution.ShouldBindPrevOutputOnDevice(): boolean;
+begin
+  Result := false;
+  if (not FPointwise) or FIsTrainable or (not Assigned(FPrevLayer)) then exit;
+  if (not FPrevLayer.FOutputOnOpenCL) or
+     (not Assigned(FPrevLayer.OpenCLOutputBuffer())) or
+     (not Assigned(FPrevLayer.OpenCLOutputKernel())) then exit;
+  // The GEMM shape was fixed when EnableOpenCL prepared FDotCL against
+  // FInputPrepared; a source of any other size would read past its buffer.
+  if FPrevLayer.FOutput.Size <> FInputPrepared.Size then exit;
+  Result := WillOpenCL();
+end;
+
 procedure TNNetConvolution.ComputeOpenCL();
 var
   InputAVolume: TNNetVolume;
   ActOpcode: integer;
   ActivationFunctionInOpenCL, WUpdated, DeviceIm2Col: boolean;
   BiasVol: TNNetVolume;
+  PrevOutputBuffer: cl_mem;
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  PrevOutputBuffer := nil;
+  if ShouldBindPrevOutputOnDevice()
+    then PrevOutputBuffer := FPrevLayer.OpenCLOutputBuffer()
+    else FPrevLayer.ForceOutputOnRAM();
   // Int8-quantized: the FP32 concatenated weights this body uploads do not
   // exist; the resident-code twin does the whole forward. WillOpenCL only
   // routes here when the int8 buffers are armed (FDotCL.Int8Ready).
   if FQuantInt8 then
   begin
-    ComputeOpenCLInt8();
+    ComputeOpenCLInt8(PrevOutputBuffer);
     Exit;
   end;
   // Winograd F(2x2,3x3) device forward: when the layer is Winograd-eligible the
@@ -100766,8 +100791,12 @@ begin
       {RowSpan}FInputCopy.Depth * FFeatureSizeX, {InSizeX}FInputCopy.SizeX,
       {InDepth}FInputCopy.Depth, {Stride}FStride, {NewSrc}true);
 
+  // Borrowed B: the source layer produced it on its own queue, so block on that
+  // queue first (a no-op when it is this layer's queue too).
+  if PrevOutputBuffer <> nil then
+    FPrevLayer.OpenCLOutputFinish(FDotCL.DotProductKernel);
   FDotCL.Compute(InputAVolume, FInputPrepared, ActOpcode, {NewVAs}WUpdated,
-    {NewVBs}(not DeviceIm2Col), BiasVol, {NewVBias}WUpdated);
+    {NewVBs}(not DeviceIm2Col), BiasVol, {NewVBias}WUpdated, PrevOutputBuffer);
   FAfterWeightUpdateHasBeenCalled := false;
 
   if ActivationFunctionInOpenCL then
@@ -100795,13 +100824,15 @@ end;
 // device-im2col option (the B side is unchanged - cai_im2col gathers into the
 // same FInputBufferBs the int8 GEMM reads), same result loading.
 // Coded by Claude (AI).
-procedure TNNetConvolution.ComputeOpenCLInt8();
+// pPrevOutputBuffer is the caller's ShouldBindPrevOutputOnDevice verdict: the
+// resident source to bind as B, or nil when ComputeOpenCL already moved the
+// previous output to RAM for the upload.
+procedure TNNetConvolution.ComputeOpenCLInt8(pPrevOutputBuffer: cl_mem);
 var
   ActOpcode: integer;
   ActivationFunctionInOpenCL, DeviceIm2Col: boolean;
   BiasVol: TNNetVolume;
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   ActivationFunctionInOpenCL := IsActivationFunctionInOpenCL(ActOpcode);
 
   if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
@@ -100813,8 +100844,10 @@ begin
       {RowSpan}FInputCopy.Depth * FFeatureSizeX, {InSizeX}FInputCopy.SizeX,
       {InDepth}FInputCopy.Depth, {Stride}FStride, {NewSrc}true);
 
+  if pPrevOutputBuffer <> nil then
+    FPrevLayer.OpenCLOutputFinish(FDotCL.DotProductKernel);
   FDotCL.ComputeInt8(FInputPrepared, ActOpcode, {NewVBs}(not DeviceIm2Col),
-    BiasVol, {NewVBias}false);
+    BiasVol, {NewVBias}false, pPrevOutputBuffer);
 
   if ActivationFunctionInOpenCL then
   begin
@@ -101548,7 +101581,13 @@ begin
   if FNeurons.Count > 0 then
   begin
     StartTime := Now();
-    {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+    // ShouldBindPrevOutputOnDevice reads only shapes and residency flags, so it
+    // is answerable before the prologue - and it decides whether the previous
+    // output has to come back to RAM at all. ComputeOpenCL asks it again and
+    // does the binding; the two calls see the same state.
+    {$IFDEF OpenCL}
+    if not ShouldBindPrevOutputOnDevice() then FPrevLayer.ForceOutputOnRAM();
+    {$ENDIF}
     PrepareForwardPrologue();
 
     //FInputPrepared.ReSize(FOutput.SizeX, FOutput.SizeY, FInputCopy.Depth * FFeatureSizeX * FFeatureSizeY);

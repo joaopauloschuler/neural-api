@@ -316,7 +316,11 @@ type
       /// Coded by Claude (AI).
       procedure BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel; SrcVol: TNNetVolume;
         OutSizeX, ColDepth, RowSpan, InSizeX, InDepth, Stride: longint; NewSrc: boolean = true);
-      procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint; NewVAs:boolean = true; NewVBs:boolean = true; VBias: TNNetVolume = nil; NewVBias: boolean = true);
+      /// pExternalVBs BORROWS a B operand that is already on the device (a
+      /// producing layer's output buffer): it is bound instead of
+      /// FInputBufferBs, never uploaded and never released here. VBs then only
+      /// carries the shape. Coded by Claude (AI).
+      procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint; NewVAs:boolean = true; NewVBs:boolean = true; VBias: TNNetVolume = nil; NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
       /// Arms the int8 weight mode: binds cai_dot_product_int8, uploads the
       /// interleaved codes (pCodes, NumAs*pSize bytes, layout
       /// codes[a + i*NumAs]) and per-row scales (pScales, NumAs floats) as
@@ -331,7 +335,7 @@ type
       /// Coded by Claude (AI).
       procedure ComputeInt8(VBs: TNNetVolume; pActFN: longint;
         NewVBs: boolean = true; VBias: TNNetVolume = nil;
-        NewVBias: boolean = true);
+        NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
 
       /// The underlying device kernel shared by this instance. Exposed so a layer
@@ -657,14 +661,17 @@ procedure TDotProductSharedKernel.Compute
   VAs, VBs: TNNetVolume;
   pActFN: longint;
   NewVAs:boolean = true; NewVBs:boolean = true;
-  VBias: TNNetVolume = nil; NewVBias: boolean = true
+  VBias: TNNetVolume = nil; NewVBias: boolean = true;
+  pExternalVBs: cl_mem = nil
 );
 var
   err: integer;
   UseBias: longint;
   NeededBias: csize_t;
+  BufferBs: cl_mem;
 begin
   FActFun := pActFN;
+  if pExternalVBs <> nil then BufferBs := pExternalVBs else BufferBs := FInputBufferBs;
 
   if (VAs.Size = FSize * FNumAs) then
   begin
@@ -688,7 +695,7 @@ begin
       err := err or clSetKernelArg(Kernel, 5, csCLMemSize,  @FInputBufferAs);
       if (err <> CL_SUCCESS) then ErrorProc('5 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 6, csCLMemSize,  @FInputBufferBs);
+      err := err or clSetKernelArg(Kernel, 6, csCLMemSize,  @BufferBs);
       if (err <> CL_SUCCESS) then ErrorProc('6 Error: Failed to set kernel arguments:' + IntToStr(err));
 
       err := err or clSetKernelArg(Kernel, 7, csCLMemSize,  @FResultBuffer);
@@ -728,12 +735,12 @@ begin
         //if NewVAs then err := err or FDotProductKernel.RefreshHostInputBufferCache(FInputBufferAs, VAs.GetMemSize());
         //if NewVBs then err := err or FDotProductKernel.RefreshHostInputBufferCache(FInputBufferBs, VBs.GetMemSize())
         if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
-        if NewVBs then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
+        if NewVBs and (pExternalVBs = nil) then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
       end
       else
       begin
         if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
-        if NewVBs then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
+        if NewVBs and (pExternalVBs = nil) then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
       end;
 
       if (err <> CL_SUCCESS) then ErrorProc('Failed at WriteBuffer(input):' + IntToStr(err));
@@ -834,12 +841,13 @@ end;
 
 procedure TDotProductSharedKernel.ComputeInt8(VBs: TNNetVolume;
   pActFN: longint; NewVBs: boolean = true; VBias: TNNetVolume = nil;
-  NewVBias: boolean = true);
+  NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
 var
   err: integer;
   UseBias: longint;
   NeededBias: csize_t;
   K: cl_kernel;
+  BufferBs: cl_mem;
 begin
   if not FInt8Ready then
   begin
@@ -856,6 +864,7 @@ begin
   end;
   FActFun := pActFN;
   K := FInt8Kernel.Kernel;
+  if pExternalVBs <> nil then BufferBs := pExternalVBs else BufferBs := FInputBufferBs;
 
   err := clSetKernelArg(K, 0, csLongintSize, @FThreadCount);
   err := err or clSetKernelArg(K, 1, csLongintSize, @FNumAs);
@@ -863,7 +872,7 @@ begin
   err := err or clSetKernelArg(K, 3, csLongintSize, @FSize);
   err := err or clSetKernelArg(K, 4, csLongintSize, @FActFun);
   err := err or clSetKernelArg(K, 5, csCLMemSize, @FCodesBuffer);
-  err := err or clSetKernelArg(K, 6, csCLMemSize, @FInputBufferBs);
+  err := err or clSetKernelArg(K, 6, csCLMemSize, @BufferBs);
   err := err or clSetKernelArg(K, 7, csCLMemSize, @FResultBuffer);
 
   // Fused bias: same contract as Compute (args 8/9 must always be set; a
@@ -890,7 +899,8 @@ begin
   err := err or clSetKernelArg(K, 9, csCLMemSize, @FBiasBuffer);
   err := err or clSetKernelArg(K, 10, csCLMemSize, @FScalesBuffer);
 
-  if NewVBs then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
+  if NewVBs and (pExternalVBs = nil) then
+    err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
 
   if err = CL_SUCCESS then
   begin
