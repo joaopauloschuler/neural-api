@@ -808,7 +808,7 @@ type
       // (declared on TNNetLayerThreading) is True when the layer will
       // dispatch to an OpenCL kernel, in which case the concatenated-weight
       // caches must be kept (default False). ActiveLowMemory is the complete
-      // gate used by call sites: low-memory weights are dropped and the
+      // guard call sites use: low-memory weights are dropped and the
       // per-neuron path is used only when all three conditions hold.
       function SupportsLowMemory(): boolean; virtual;
       function ActiveLowMemory(): boolean;
@@ -1085,7 +1085,7 @@ type
       // EnableOpenCL and shared by every elementwise-activation layer; the net
       // owns and frees it. Non-nil only on a layer that opted in
       // (FActivationOpcode <> csActNone) and reached a net with the device path
-      // enabled - WillOpenCL gates on it.
+      // enabled - WillOpenCL requires it.
       FActivationKernel: TNeuralKernel;
       // Persistent in-place device buffer for the shared cai_activation kernel.
       // Allocated ONCE in EnableOpenCL and reused by every forward - like the
@@ -1094,7 +1094,7 @@ type
       FActivationBuffer: cl_mem;
       FActivationBufSize: integer; // element capacity of FActivationBuffer
       // Unconditionally runs the net's shared cai_activation kernel over
-      // FPrevLayer.FOutput into FOutput. The caller gates on WillOpenCL() and
+      // FPrevLayer.FOutput into FOutput. The caller checks WillOpenCL() and
       // bumps FForwardGPUCnt, exactly as TNNetConvolution.Compute does. Forward
       // only: FOutputRaw and the ReLU derivative mask are NOT produced here, so
       // WillOpenCL keeps this off during training (it only fires above
@@ -2055,7 +2055,7 @@ type
     {$IFDEF OpenCL}
     FGLUGateCL: TNNetGLUGateCL;
     // Binds the source's already-resident output buffer and leaves the gated
-    // result on the device. The caller gates on WillOpenCL.
+    // result on the device. The caller checks WillOpenCL first.
     procedure ComputeOpenCL();
     {$ENDIF}
     // True when the device gate ran. False means the caller's CPU path follows,
@@ -4765,7 +4765,7 @@ type
     destructor Destroy(); override;
     // PackedW: the C channels' length-K kernels concatenated [c*K + kk].
     // Bias: the C per-channel biases (uploaded even when suppressed; the flag
-    // gates their use). X: the previous layer's output. Y receives the output.
+    // controls their use). X: the previous layer's output. Y receives the output.
     // Off = K-1 (causal) or K div 2 (SAME); SuppressBias = the layer's flag.
     // NewW=false keeps the resident kernel + bias buffers (weights unchanged).
     procedure Compute(PackedW, Bias, X, Y: TNNetVolume;
@@ -12091,7 +12091,7 @@ type
     // it across the output depth instead of one launch per replica.
     FIsBroadcast: boolean;
     // Scatters the already-resident source outputs into FConcatBuffer. The caller
-    // gates on WillOpenCL() and bumps FForwardGPUCnt.
+    // checks WillOpenCL() and bumps FForwardGPUCnt.
     procedure ComputeOpenCL();
     {$ENDIF}
   public
@@ -12122,7 +12122,7 @@ type
     FSumBuffer: cl_mem;
     FSumBufSize: integer; // element capacity of FSumBuffer
     // Adds the already-resident source outputs into FSumBuffer and leaves the
-    // result there. The caller gates on WillOpenCL() and bumps FForwardGPUCnt.
+    // result there. The caller checks WillOpenCL() and bumps FForwardGPUCnt.
     procedure ComputeOpenCL();
     {$ENDIF}
   public
@@ -12276,7 +12276,7 @@ type
     // is fixed at SetPrevLayer, so no forward pass writes it.
     FChannelIdxBuffer: cl_mem;
     // Gathers the selected channels out of the already-resident source output
-    // into FSplitBuffer. The caller gates on WillOpenCL() and bumps FForwardGPUCnt.
+    // into FSplitBuffer. The caller checks WillOpenCL() and bumps FForwardGPUCnt.
     procedure ComputeOpenCL();
     {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;

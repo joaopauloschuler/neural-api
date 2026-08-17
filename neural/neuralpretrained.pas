@@ -3133,7 +3133,7 @@ procedure BuildMarianFromSafeTensors(const FileName: string;
 // transform: the q-projection's folded sqrt(d_kv) compensation, the gated-FFN
 // wi_0|wi_1 fusion, the per-head shared relative-position-bias columns, and
 // (v1.0 tied) the d_model^-0.5 head scaling. EncoderNet/DecoderNet are the two
-// nets returned by the importer; Config the same record. Round-trip gated by
+// nets returned by the importer; Config the same record. Round-trip covered by
 // TestT5SafeTensorsRoundTrip. Coded by Claude (AI).
 procedure SaveT5ToSafeTensors(EncoderNet, DecoderNet: TNNet;
   const Config: TT5Config; const FileName: string;
@@ -3506,7 +3506,7 @@ procedure BuildMBartFromSafeTensors(const FileName: string;
 // sequence length are zero-padded; the importer only reads rows
 // 2..SeqLen+1), the two layernorm_embedding LayerNorms, the per-block biased
 // linears/post-norms, and re-derives final_logits_bias from the tied head.
-// Round-trip gated by TestBartSafeTensorsRoundTrip. Coded by Claude (AI).
+// Round-trip covered by TestBartSafeTensorsRoundTrip. Coded by Claude (AI).
 procedure SaveBartToSafeTensors(EncoderNet, DecoderNet: TNNet;
   const Config: TBartConfig; const FileName: string;
   pDType: TSafeTensorsWriteDType = stwF32);
@@ -3516,7 +3516,7 @@ procedure SaveBartToSafeTensors(EncoderNet, DecoderNet: TNNet;
 // importer. PRE-norm stack: re-emits the FINAL encoder/decoder layer_norm,
 // undoes the scale_embedding fold, and re-derives final_logits_bias. The
 // STATIC half-split sinusoidal position tables are NOT emitted (HF regenerates
-// them; they are not learned parameters). Round-trip gated by
+// them; they are not learned parameters). Round-trip covered by
 // TestPegasusSafeTensorsRoundTrip. Coded by Claude (AI).
 procedure SavePegasusToSafeTensors(EncoderNet, DecoderNet: TNNet;
   const Config: TPegasusConfig; const FileName: string;
@@ -3527,7 +3527,7 @@ procedure SavePegasusToSafeTensors(EncoderNet, DecoderNet: TNNet;
 // importer. BART embedding front-end (layernorm_embedding + +2-offset learned
 // positions) over PRE-norm stacks that close with a FINAL encoder/decoder
 // layer_norm; undoes the scale_embedding fold and re-derives final_logits_bias.
-// Round-trip gated by TestMBartSafeTensorsRoundTrip. Coded by Claude (AI).
+// Round-trip covered by TestMBartSafeTensorsRoundTrip. Coded by Claude (AI).
 procedure SaveMBartToSafeTensors(EncoderNet, DecoderNet: TNNet;
   const Config: TBartConfig; const FileName: string;
   pDType: TSafeTensorsWriteDType = stwF32);
@@ -3624,7 +3624,7 @@ procedure BuildM2M100FromSafeTensors(const FileName: string;
 // layernorm_embedding, STATIC sinusoidal positions that are regenerated on
 // import so NO position table is emitted) over PRE-norm relu stacks that close
 // with a FINAL encoder/decoder layer_norm; undoes the scale_embedding fold and
-// re-derives final_logits_bias. Round-trip gated by
+// re-derives final_logits_bias. Round-trip covered by
 // TestM2M100SafeTensorsRoundTrip. Coded by Claude (AI).
 procedure SaveM2M100ToSafeTensors(EncoderNet, DecoderNet: TNNet;
   const Config: TM2M100Config; const FileName: string;
@@ -4672,7 +4672,7 @@ function BuildEnCodecFromSafeTensors(const FileName: string;
 type
   // Mimi carries its channel-major signal in DOUBLE precision (the conv +
   // high-gain transformer + conv pipeline is deep enough that the library's
-  // single-precision storage would drift past the 1e-4 parity gate). Weights
+  // single-precision storage would drift past the 1e-4 parity tolerance). Weights
   // stay single (exact F32 checkpoint values); only accumulation is double.
   TMimiDblArr = array of double;
   TMimiDblArr2D = array of TMimiDblArr;
@@ -6130,7 +6130,7 @@ function BuildParlerTTSFromSafeTensors(const FileName: string;
 // Each sub-model is a PRE-norm GPT-2 block stack (x + out_proj(MHA(ln1(x))),
 // x + out_proj(gelu(in_proj(ln2(x))))) with a LEARNED positional embedding and
 // nn.GELU (EXACT erf). Unlike GPT-2's HF Conv1D [in,out], Bark uses nn.Linear
-// [out,in] (att_proj fused 3*hidden q|k|v, out_proj, mlp in/out), bias gated by
+// [out,in] (att_proj fused 3*hidden q|k|v, out_proj, mlp in/out), bias controlled by
 // config.bias; lm_head[s] are bias-free. The holder computes the token/codebook
 // embedding (so the fine merged-sum and per-head selection live in Pascal),
 // feeds (seq,1,hidden) into a per-sub-model trunk TNNet (pos + blocks + ln_f),
@@ -41564,7 +41564,7 @@ begin
 end;
 
 // As PackTransposeColumnsSingle, but widening to the Double accumulator layout
-// the Mimi/DAC holder math contracts over (their parity gate needs Double
+// the Mimi/DAC holder math contracts over (their parity tolerance needs Double
 // operands; feeding Single weights to a mixed-precision dot measures 7-10x
 // SLOWER on this FPC, so the widened copy is the fast form). Coded by Claude (AI).
 procedure PackTransposeColumnsDouble(const W: TNeuralFloatDynArr;
@@ -41665,7 +41665,7 @@ begin
     // The row is a uniform scale of a contiguous InDim*K run, so copy it and
     // fire one AVX Mul (#13) with a single divide per row (#21) instead of a
     // per-element divide. v*(g/norm) reassociates against g*v/norm; that is an
-    // import-time weight fold, well inside the 1e-4 codec parity gate.
+    // import-time weight fold, well inside the 1e-4 codec parity tolerance.
     RowLen := InDim * K;
     RowBytes := RowLen * csNeuralFloatSize;
     Base := 0;                           // #6: o * InDim * K carried
@@ -41848,7 +41848,7 @@ end;
 // kernel - most importantly the case where the kernel SOURCE (neural.cl) is not
 // found at runtime, so clBuildProgram/clCreateKernel never produced a working
 // kernel and the GEMM would return garbage (off by ~0.05, not the < 1e-4 the
-// parity gate demands). Returns true only if the device actually computes the
+// parity tolerance demands). Returns true only if the device actually computes the
 // dot product correctly. Coded by Claude (AI).
 function ConvOpenCLSelfTest(): boolean;
 var
@@ -43179,7 +43179,7 @@ end;
 // Near-machine-precision erf (W. J. Cody rational Chebyshev approximation, the
 // algorithm behind glibc/SciPy erf, ~1e-16) -> the exact erf-GELU used by HF
 // hidden_act "gelu". A cheaper ~1e-7 approximation amplifies through the deep
-// high-gain transformer past the 1e-4 parity gate, so full precision is needed.
+// high-gain transformer past the 1e-4 parity tolerance, so full precision is needed.
 function MimiErf(x: double): double;
 var
   y, z, num, den, res: double;
@@ -45163,10 +45163,10 @@ begin
       Codes[q][t] := best;
       // out_proj(raw codebook row) -> hidden, subtract from residual.
       // W and codebook data are both Single but the accumulator is Double for
-      // the <1e-4 codec parity gate. Cd is 8, and the i-loop already supplies
+      // the <1e-4 codec parity tolerance. Cd is 8, and the i-loop already supplies
       // the instruction-level parallelism a staged mixed-precision dot would
       // add - measured 2.97 cycles/element as written against 2.40 staged, not
-      // enough to justify reassociating a sum the parity gate pins.
+      // enough to justify reassociating a sum the parity tolerance pins.
       // Offset bases hoisted.
       bestBase := best * Cd; // invariant across the whole i-loop
       oBase := 0;            // i * Cd
@@ -45661,7 +45661,7 @@ begin
       // The row is a uniform scale of a contiguous InDim*K run, so copy it and
       // fire one AVX Mul (#13) with a single divide per row (#21) instead of a
       // per-element divide. v*(g/norm) reassociates against g*v/norm; that is
-      // an import-time weight fold, well inside the 1e-4 synthesis parity gate.
+      // an import-time weight fold, well inside the 1e-4 synthesis parity tolerance.
       OutDimM1 := OutDim - 1;
       RowLen := InDim * K;
       RowBytes := RowLen * csNeuralFloatSize;
@@ -46888,7 +46888,7 @@ begin
     // #19: three uniform elementwise passes over a long contiguous run instead
     // of a scalar tanh + exp + divide per element. Both kernels ride Exp's
     // 8-wide polynomial on an AVX2 build; Tanh tracks pcr_tanhf to ~1e-6, well
-    // inside the 1e-4 importer-parity gate.
+    // inside the 1e-4 importer-parity tolerance.
     TNNetVolume.Tanh(@ResRow[0], @TanhRow[0], T);
     TNNetVolume.Sigmoid(@GateRow[0], @GateRow[0], T);
     TNNetVolume.Mul(@ResRow[0], @GateRow[0], T);
@@ -46896,7 +46896,7 @@ begin
 end;
 
 // erf via the Abramowitz & Stegun 7.1.26 polynomial (|err| < 1.5e-7), well
-// within the 1e-4 importer-parity gate.
+// within the 1e-4 importer-parity tolerance.
 function VitsErf(X: TNeuralFloat): TNeuralFloat;
 const
   A1 = 0.254829592; A2 = -0.284496736; A3 = 1.421413741;
@@ -46960,7 +46960,7 @@ const
   MinBinHeight = 1.0e-3;
   MinDerivative = 1.0e-3;
   // #17/#5: compile-time fold of Ln(Exp(1-MinDerivative)-1) (was recomputed per
-  // call). Exact to double precision, well within the 1e-4 parity gate.
+  // call). Exact to double precision, well within the 1e-4 parity tolerance.
   ConstantD = 0.5397424172369522;
 var
   i, BinIdx: integer;
@@ -48654,7 +48654,7 @@ begin
     // #13/#18: the centered sum of squares has an AVX kernel.
     Variance := TNNetVolume.SumSqrCentered(Addr(SigRow[0]), Mean, Tlen) / Tlen;
     InvStd := 1.0 / Sqrt(Variance + Eps);
-    GIS := Gamma * InvStd;          // #5: reassociate (TTS parity gate <1e-4)
+    GIS := Gamma * InvStd;          // #5: reassociate (TTS parity tolerance <1e-4)
     // GIS*(x - Mean) + Beta as three AVX passes. Folding it to
     // Mul(GIS)+AddScalar(Beta - GIS*Mean) measured the same and would trade a
     // reassociation for nothing, so keep the shift/scale/shift order: each

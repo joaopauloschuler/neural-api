@@ -3000,7 +3000,7 @@ begin
   end;
 end;
 
-// Builds the id -> FAddedTokens index map and the first-byte gate. First
+// Builds the id -> FAddedTokens index map and the first-byte prefilter. First
 // match wins, matching the linear scan this replaces. Load-time only: never
 // called from a decode loop after the first lookup (rule #17).
 procedure TNeuralHFTokenizer.BuildAddedIdIndex();

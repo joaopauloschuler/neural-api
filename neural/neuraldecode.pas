@@ -672,7 +672,7 @@ type
       FGrammar: TNNetGrammar;
       FMachine: TNNetGrammarMachine;
       FProbe: TNNetGrammarMachine;
-      // Rule #27: see TNNetJSONConstraint.FFirstOK - the first-character gate
+      // Rule #27: see TNNetJSONConstraint.FFirstOK - the first-character prefilter
       // has 256 possible answers per decode step, not one per vocabulary id.
       FFirstOK: array[0..255] of boolean;
       FFirstOKVersion: int64;

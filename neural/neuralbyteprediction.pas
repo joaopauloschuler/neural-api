@@ -538,8 +538,8 @@ begin
   begin
     NGP := @FNN[I];
     PredictionPosition := 0;
-    // Gate on the cheap Filled/count tests first; only then compute GetF (a
-    // divide) and its probability test (#5: skip the divide when gated out).
+    // Test the cheap Filled/count conditions first; only then compute GetF (a
+    // divide) and its probability test (#5: skip the divide when that test rejects).
     if (NGP^.Filled) and
       (NGP^.CorrectNeuronPredictionCnt > 10) then
     begin
@@ -1326,10 +1326,10 @@ begin
     NGP := @FNN[I];   // bind once; avoids re-indexing the dynarray record below
     PredictionPos := NGP^.PredictionPos;
 
-    // Gate on the cheap Filled/count tests first (matching PredictClass); only
+    // Test the cheap Filled/count conditions first (matching PredictClass); only
     // then compute Probability (a divide) and the relation-probability test
-    // (#5/#8/#4: skip the divide and the pRelationProbability index when gated
-    // out; bind relP once - PredictionPos and pRelationProbability[PredictionPos]
+    // (#5/#8/#4: skip the divide and the pRelationProbability index when that test
+    // rejects; bind relP once - PredictionPos and pRelationProbability[PredictionPos]
     // are unchanged by OperateAndTestOperation).
     if (NGP^.Filled()) and
       (NGP^.CorrectNeuronPredictionCnt > MinSample) then
