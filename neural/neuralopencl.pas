@@ -183,10 +183,9 @@ type
       function EnsureBuffer(var buf: cl_mem; var capBytes: csize_t;
         flags: cl_mem_flags; neededBytes: csize_t): cl_mem;
       // Ensure a persistent buffer big enough for V, then upload V into it.
-      // DoWrite=false skips the upload (reuse the resident contents) - only safe
-      // when V is unchanged since the last write AND no reallocation happened
-      // (any size growth forces a fresh CreateBuffer, so the caller must pass
-      // DoWrite=true whenever V could have grown; see the weight-dirty callers).
+      // DoWrite=false skips the upload (reuse the resident contents) - safe when
+      // V is unchanged since the last write: a reallocation (first call or any
+      // growth) uploads regardless, because the fresh handle holds nothing.
       function EnsureWriteBuffer(var buf: cl_mem; var capBytes: csize_t;
         V: TNNetVolume; DoWrite: boolean = true): cl_mem;
       // Ensure a persistent output buffer big enough for V (no upload).
@@ -1402,12 +1401,17 @@ end;
 
 function TEasyOpenCLV.EnsureWriteBuffer(var buf: cl_mem; var capBytes: csize_t;
   V: TNNetVolume; DoWrite: boolean = true): cl_mem;
+var
+  PreviousBuffer: cl_mem;
 begin
+  PreviousBuffer := buf;
   // READ_WRITE (not READ_ONLY) so one persistent buffer can back either an
   // input or output role across shapes without flag mismatches.
   Result := EnsureBuffer(buf, capBytes, CL_MEM_READ_WRITE, V.GetMemSize());
-  // DoWrite=false leaves the resident device copy in place (weights unchanged).
-  if DoWrite then WriteBuffer(Result, V, CL_FALSE);
+  // DoWrite=false leaves the resident device copy in place (weights unchanged),
+  // but a fresh handle holds nothing, so the first call and any growth upload
+  // whatever the caller asked for.
+  if DoWrite or (Result <> PreviousBuffer) then WriteBuffer(Result, V, CL_FALSE);
 end;
 
 function TEasyOpenCLV.EnsureOutputBuffer(var buf: cl_mem; var capBytes: csize_t;

@@ -483,6 +483,9 @@ type
       // (they carry the same weight shape and are stepped serially).
       // Lazily created on the factored path only; nil otherwise.
       FAdafactorCols: TNNetVolume;
+      // Set by AfterWeightUpdate, cleared by whoever re-uploads the weights it
+      // marks stale (the concatenated weight cache, a resident device copy).
+      FAfterWeightUpdateHasBeenCalled: boolean;
 
       procedure InitStruct();
     private
@@ -859,7 +862,6 @@ type
       FBiasOutput: TNNetVolume;
       FShouldConcatWeights: boolean;
       FShouldInterleaveWeights: boolean;
-      FAfterWeightUpdateHasBeenCalled:boolean;
       {$IFDEF OpenCL}
       // Borrowed cai_dot_product_int8 handle, injected into FDotCL at Create
       // time and released by this layer (FDotCL never owns it).
@@ -4676,15 +4678,18 @@ type
     // X holds NumTokens*Depth values [t*Depth + c]; Gain/Bias are Depth long
     // (Bias may be nil when UseMean is false). Y receives the normalized output
     // in the same layout. Eps matches the layer's serialized epsilon.
+    // pWeightsDirty=false reuses the resident Gain/Bias copy (see EnsureWriteBuffer).
     procedure Normalize(X: TNNetVolume; Gain, Bias: TNNetVolume; Y: TNNetVolume;
-      NumTokens, Depth: integer; UseMean: boolean; Eps: TNeuralFloat);
+      NumTokens, Depth: integer; UseMean: boolean; Eps: TNeuralFloat;
+      pWeightsDirty: boolean = true);
     // Whole-volume normalization: X is reduced as a single sample of X.Size
     // elements (mean/variance over the whole volume) and scaled by per-ELEMENT
     // Gain/Bias (each X.Size long; Bias may be nil when UseMean is false). Used
     // by TNNetRMSNorm / TNNetLayerNorm. One cooperative work-group; far faster
     // than Normalize(...,NumTokens=1,...) which serializes on a single lane.
     procedure NormalizeWholeVolume(X: TNNetVolume; Gain, Bias: TNNetVolume;
-      Y: TNNetVolume; UseMean: boolean; Eps: TNeuralFloat);
+      Y: TNNetVolume; UseMean: boolean; Eps: TNeuralFloat;
+      pWeightsDirty: boolean = true);
   end;
 
   /// OpenCL forward helper for TNNetGroupNorm (and its Groups=Depth limit
@@ -36259,24 +36264,26 @@ begin
 end;
 
 procedure TNNetTokenNormCL.Normalize(X: TNNetVolume; Gain, Bias: TNNetVolume;
-  Y: TNNetVolume; NumTokens, Depth: integer; UseMean: boolean; Eps: TNeuralFloat);
+  Y: TNNetVolume; NumTokens, Depth: integer; UseMean: boolean; Eps: TNeuralFloat;
+  pWeightsDirty: boolean = true);
 var
   bufX, bufY, bufGain, bufBias: cl_mem;
   k: cl_kernel;
   iUseMean: longint;
   fEps: single;
-  BiasSrc: TNNetVolume;
 begin
   k := FKernel.Kernel;
   if UseMean then iUseMean := 1 else iUseMean := 0;
   fEps := Eps;
   // Upload the token tensor + the per-channel gain/bias weights; allocate the
-  // device result. The bias buffer is always created (the kernel ignores it when
-  // UseMean is false) so the argument is never an invalid handle.
+  // device result. The weights re-upload only when they changed. Without a bias
+  // the kernel never reads FBias, so the gain buffer stands in for it: the
+  // argument is a valid handle and no second buffer is allocated or uploaded.
   bufX    := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
-  bufGain := FKernel.EnsureWriteBuffer(FBufGain, FCapGain, Gain);
-  if Assigned(Bias) then BiasSrc := Bias else BiasSrc := Gain;
-  bufBias := FKernel.EnsureWriteBuffer(FBufBias, FCapBias, BiasSrc);
+  bufGain := FKernel.EnsureWriteBuffer(FBufGain, FCapGain, Gain, pWeightsDirty);
+  if Assigned(Bias)
+    then bufBias := FKernel.EnsureWriteBuffer(FBufBias, FCapBias, Bias, pWeightsDirty)
+    else bufBias := bufGain;
   bufY    := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
   clSetKernelArg(k, 0, csLongintSize, @NumTokens);
   clSetKernelArg(k, 1, csLongintSize, @Depth);
@@ -36294,7 +36301,8 @@ begin
 end;
 
 procedure TNNetTokenNormCL.NormalizeWholeVolume(X: TNNetVolume;
-  Gain, Bias: TNNetVolume; Y: TNNetVolume; UseMean: boolean; Eps: TNeuralFloat);
+  Gain, Bias: TNNetVolume; Y: TNNetVolume; UseMean: boolean; Eps: TNeuralFloat;
+  pWeightsDirty: boolean = true);
 const
   // Single cooperative work-group. Power-of-two (the tree reduction halves it)
   // and within every device's max work-group size (T4 = 1024, PoCL CPU larger).
@@ -36304,19 +36312,20 @@ var
   k: cl_kernel;
   iSize, iUseMean: longint;
   fEps: single;
-  BiasSrc: TNNetVolume;
 begin
   k := FVolKernel.Kernel;
   iSize := X.Size;
   if UseMean then iUseMean := 1 else iUseMean := 0;
   fEps := Eps;
   // Upload the volume + per-element gain/bias; allocate the device result. The
-  // bias buffer is always created (the kernel ignores it when UseMean is false)
-  // so the argument is never an invalid handle.
+  // weights re-upload only when they changed. Without a bias the kernel never
+  // reads FBias, so the gain buffer stands in for it: the argument is a valid
+  // handle and no second buffer is allocated or uploaded.
   bufX    := FVolKernel.EnsureWriteBuffer(FBufX, FCapX, X);
-  bufGain := FVolKernel.EnsureWriteBuffer(FBufGain, FCapGain, Gain);
-  if Assigned(Bias) then BiasSrc := Bias else BiasSrc := Gain;
-  bufBias := FVolKernel.EnsureWriteBuffer(FBufBias, FCapBias, BiasSrc);
+  bufGain := FVolKernel.EnsureWriteBuffer(FBufGain, FCapGain, Gain, pWeightsDirty);
+  if Assigned(Bias)
+    then bufBias := FVolKernel.EnsureWriteBuffer(FBufBias, FCapBias, Bias, pWeightsDirty)
+    else bufBias := bufGain;
   bufY    := FVolKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
   clSetKernelArg(k, 0, csLongintSize, @iSize);
   clSetKernelArg(k, 1, csLongintSize, @iUseMean);
@@ -72430,7 +72439,9 @@ procedure TNNetLayerNorm.ComputeOpenCL();
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FTokenNormCL.NormalizeWholeVolume(FOutput, FNeurons[0].FWeights,
-    FNeurons[1].FWeights, FOutput, {UseMean=}true, FLayerNormEpsilon);
+    FNeurons[1].FWeights, FOutput, {UseMean=}true, FLayerNormEpsilon,
+    {pWeightsDirty=}FAfterWeightUpdateHasBeenCalled);
+  FAfterWeightUpdateHasBeenCalled := false;
 end;
 {$ENDIF}
 
@@ -72678,7 +72689,9 @@ begin
   Depth := FOutput.Depth;
   NumTokens := FOutput.Size div Depth;
   FTokenNormCL.Normalize(FOutput, FNeurons[0].FWeights, FNeurons[1].FWeights,
-    FOutput, NumTokens, Depth, {UseMean=}true, FTokenLNEpsilon);
+    FOutput, NumTokens, Depth, {UseMean=}true, FTokenLNEpsilon,
+    {pWeightsDirty=}FAfterWeightUpdateHasBeenCalled);
+  FAfterWeightUpdateHasBeenCalled := false;
 end;
 {$ENDIF}
 
@@ -72886,7 +72899,9 @@ procedure TNNetRMSNorm.ComputeOpenCL();
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   FTokenNormCL.NormalizeWholeVolume(FOutput, FNeurons[0].FWeights, nil,
-    FOutput, {UseMean=}false, FRMSNormEpsilon);
+    FOutput, {UseMean=}false, FRMSNormEpsilon,
+    {pWeightsDirty=}FAfterWeightUpdateHasBeenCalled);
+  FAfterWeightUpdateHasBeenCalled := false;
 end;
 {$ENDIF}
 
@@ -73140,7 +73155,9 @@ begin
   Depth := FNormDim;
   NumTokens := FOutput.Size div Depth;
   FTokenNormCL.Normalize(FOutput, FNeurons[0].FWeights, nil,
-    FOutput, NumTokens, Depth, {UseMean=}false, FTokenRMSEpsilon);
+    FOutput, NumTokens, Depth, {UseMean=}false, FTokenRMSEpsilon,
+    {pWeightsDirty=}FAfterWeightUpdateHasBeenCalled);
+  FAfterWeightUpdateHasBeenCalled := false;
 end;
 {$ENDIF}
 
@@ -74427,7 +74444,6 @@ begin
       end;
     end;
   end;
-  FAfterWeightUpdateHasBeenCalled := true;
 end;
 
 // Construction-time int8 arming (TNNet.BuildQuantInt8). Instead of sizing
@@ -130121,6 +130137,11 @@ begin
   // is idempotent and does NOT recurse (it never calls AfterWeightUpdate).
   // (Coded by Claude (AI).)
   if Assigned(FPruneMask) then ZeroPrunedWeights();
+  // The weights just changed, so every resident device copy of them is stale.
+  // Set here rather than on TNNetLayerConcatedWeights so any layer that uploads
+  // its weights once - the normalization layers upload gamma/beta - can key its
+  // re-upload on this flag. Each reader clears it after re-uploading.
+  FAfterWeightUpdateHasBeenCalled := true;
 end;
 
 function TNNetLayer.BuildPruneMaskFromThreshold(aThreshold: TNeuralFloat): integer;
