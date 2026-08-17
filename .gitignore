@@ -18,6 +18,11 @@ lib/
 tests/RunTests
 tests/RunTestsAVX
 tests/RunTestsAVX2
+tests/RunTestsCL
+tests/RunTestsCLAVX2
+examples/SDPAOpenCLParity/SDPAOpenCLParity
+# Runtime copies of neural/neural.cl, placed next to an example's binary.
+examples/*/neural.cl
 examples/YoloDetect/YoloDetect
 examples/YoloDetect/*.ppm
 examples/ActivationBakeoff/ActivationBakeoff
