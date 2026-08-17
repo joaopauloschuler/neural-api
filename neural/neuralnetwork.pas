@@ -1975,18 +1975,14 @@ type
   // Coded by Claude (AI).
   TNNetGLUGateCL = class(TNNetKernelCL)
   private
-    // Persistent device buffers (grow-only), reused every forward.
-    FBufX, FBufY: cl_mem;
-    FCapX, FCapY: csize_t;
+    // Persistent device output buffer (grow-only), reused every forward.
+    FBufY: cl_mem;
+    FCapY: csize_t;
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
-    // X holds NumTokens*(2*HalfDepth) values laid out token-major as A|B halves;
-    // Y receives NumTokens*HalfDepth outputs. ActFlag selects the gate.
-    procedure Gate(X, Y: TNNetVolume;
-      NumTokens, HalfDepth, ActFlag: integer);
-    // Same gate over a source buffer that is ALREADY on the device: nothing is
-    // uploaded and the result stays in FBufY, sized for Y and left unread.
+    // Gates an ALREADY-resident source buffer laid out token-major as A|B
+    // halves; the result stays in FBufY, sized for Y and left unread.
     procedure GateOnDevice(SourceBuffer: cl_mem; Y: TNNetVolume;
       NumTokens, HalfDepth, ActFlag: integer);
     // FBufY and the queue that owns its contents - what a layer running
@@ -1996,27 +1992,46 @@ type
   end;
   {$ENDIF}
 
+  /// Shared base for the GLU-family gated activations (TNNetGLU / TNNetSwiGLU /
+  // TNNetGEGLU / TNNetGEGLUErf). Splits the input depth into two contiguous
+  // halves A|B and emits A * act(B), act selected by FGateActFlag - which a
+  // descendant sets in its constructor and which is the ONLY thing the device
+  // forward here needs. Descendants implement their own CPU Compute and
+  // Backpropagate. Coded by Claude (AI).
+  TNNetGLUGateBase = class(TNNetLayer)
+  protected
+    // cai_glu_gate selector: 0=sigmoid, 1=swish, 2=gelu-tanh, 3=gelu-erf.
+    FGateActFlag: integer;
+    {$IFDEF OpenCL}
+    FGLUGateCL: TNNetGLUGateCL;
+    // Binds the source's already-resident output buffer and leaves the gated
+    // result on the device. The caller gates on WillOpenCL.
+    procedure ComputeOpenCL();
+    {$ENDIF}
+    // True when the device gate ran. False means the caller's CPU path follows,
+    // with the source already downloaded and both residency flags reset.
+    function ComputeGateOnOpenCL(): boolean;
+    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  public
+    {$IFDEF OpenCL}
+    destructor Destroy(); override;
+    function WillOpenCL(): boolean; override;
+    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+    procedure DisableOpenCL(); override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
+    {$ENDIF}
+  end;
+
   /// GEGLU gated activation - This is an experimental layer.
   // Splits the input along the channel (depth) axis into two equal halves
   // A and B and outputs A * GELU(B). Output depth = input depth / 2.
   // This layer has no trainable parameter. The input depth must be even.
   // https://arxiv.org/abs/2002.05202
   // Coded by Claude (AI).
-  TNNetGEGLU = class(TNNetLayer)
-  private
-    {$IFDEF OpenCL}
-    FGLUGateCL: TNNetGLUGateCL;
-    procedure ComputeOpenCL();
-    {$ENDIF}
-    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  TNNetGEGLU = class(TNNetGLUGateBase)
   public
     constructor Create(); override;
-    {$IFDEF OpenCL}
-    destructor Destroy(); override;
-    function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-    procedure DisableOpenCL(); override;
-    {$ENDIF}
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -2029,21 +2044,9 @@ type
   // depth / 2; no trainable parameter; the input depth must be even.
   // TNNetGEGLU is the tanh-approximation ("gelu_pytorch_tanh") sibling.
   // Coded by Claude (AI).
-  TNNetGEGLUErf = class(TNNetLayer)
-  private
-    {$IFDEF OpenCL}
-    FGLUGateCL: TNNetGLUGateCL;
-    procedure ComputeOpenCL();
-    {$ENDIF}
-    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  TNNetGEGLUErf = class(TNNetGLUGateBase)
   public
     constructor Create(); override;
-    {$IFDEF OpenCL}
-    destructor Destroy(); override;
-    function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-    procedure DisableOpenCL(); override;
-    {$ENDIF}
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -2072,13 +2075,7 @@ type
   // This layer has no trainable parameter. The input depth must be even.
   // https://arxiv.org/abs/2002.05202
   // Coded by Claude (AI).
-  TNNetSwiGLU = class(TNNetLayer)
-  private
-    {$IFDEF OpenCL}
-    FGLUGateCL: TNNetGLUGateCL;
-    procedure ComputeOpenCL();
-    {$ENDIF}
-    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  TNNetSwiGLU = class(TNNetGLUGateBase)
   protected
     // Slice of the flattened OUTPUT-ELEMENT space [0..FOutput.Size-1] (element
     // i = token i div HalfDepth, channel i mod HalfDepth). Every output element
@@ -2093,14 +2090,6 @@ type
     procedure PrepareChunkedForward(); override;
   public
     constructor Create(); override;
-    {$IFDEF OpenCL}
-    destructor Destroy(); override;
-    function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-    procedure DisableOpenCL(); override;
-    function OpenCLOutputBuffer(): cl_mem; override;
-    function OpenCLOutputKernel(): TNeuralKernel; override;
-    {$ENDIF}
     procedure Compute(); override;
     procedure Backpropagate(); override;
     // Frozen verdict: net-wide intra-layer threading is on and the forward
@@ -2139,21 +2128,9 @@ type
   // This layer has no trainable parameter. The input depth must be even.
   // https://arxiv.org/abs/1612.08083
   // Coded by Claude (AI).
-  TNNetGLU = class(TNNetLayer)
-  private
-    {$IFDEF OpenCL}
-    FGLUGateCL: TNNetGLUGateCL;
-    procedure ComputeOpenCL();
-    {$ENDIF}
-    procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  TNNetGLU = class(TNNetGLUGateBase)
   public
     constructor Create(); override;
-    {$IFDEF OpenCL}
-    destructor Destroy(); override;
-    function WillOpenCL(): boolean; override;
-    procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-    procedure DisableOpenCL(); override;
-    {$ENDIF}
     procedure Compute(); override;
     procedure Backpropagate(); override;
   end;
@@ -24514,62 +24491,113 @@ begin
   inherited BackpropagateNoTest();
 end;
 
-{ TNNetGEGLU }
-
-constructor TNNetGEGLU.Create();
-begin
-  inherited Create();
-end;
+{ TNNetGLUGateBase }
 
 {$IFDEF OpenCL}
-destructor TNNetGEGLU.Destroy();
+destructor TNNetGLUGateBase.Destroy();
 begin
   if Assigned(FGLUGateCL) then FreeAndNil(FGLUGateCL);
   inherited Destroy();
 end;
 
-function TNNetGEGLU.WillOpenCL(): boolean;
+function TNNetGLUGateBase.WillOpenCL(): boolean;
+var
+  SourceKernel: TNeuralKernel;
 begin
-  Result := Assigned(FGLUGateCL) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL);
+  Result := false;
+  // Forward only: the device path leaves the output on the device, and the
+  // backward pass still has readers of Output that never call ForceOutputOnRAM.
+  if FIsTrainable or (not FHasOpenCL) or (not Assigned(FGLUGateCL)) then exit;
+  if (not Assigned(FPrevLayer)) or (not FPrevLayer.FOutputOnOpenCL) then exit;
+  SourceKernel := FPrevLayer.OpenCLOutputKernel();
+  // Same command queue means the gate is ordered behind the forward that
+  // produced its input with no event and no Finish. Different queues are
+  // unordered with respect to each other, so that case stays on the CPU.
+  if (not Assigned(SourceKernel)) or
+     (SourceKernel.Commands <> FGLUGateCL.OutputKernel().Commands) or
+     (not Assigned(FPrevLayer.OpenCLOutputBuffer())) then exit;
+  Result := true;
 end;
 
-procedure TNNetGEGLU.DisableOpenCL();
+procedure TNNetGLUGateBase.DisableOpenCL();
 begin
+  // FGLUGateCL owns the output buffer and the queue it is read through, so the
+  // output has to come back to RAM while both are still alive.
+  ForceOutputOnRAM();
   inherited DisableOpenCL();
   FreeAndNil(FGLUGateCL);
 end;
 
-procedure TNNetGEGLU.EnableOpenCL(DotProductKernel: TNeuralKernel);
+procedure TNNetGLUGateBase.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
   if not Assigned(FGLUGateCL) then
     FGLUGateCL := TNNetGLUGateCL.Create(FNN);
 end;
 
-// Device GEGLU forward (gelu-tanh gate, ActFlag=2), bit-faithful to Compute().
-procedure TNNetGEGLU.ComputeOpenCL();
+function TNNetGLUGateBase.OpenCLOutputBuffer(): cl_mem;
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  FGLUGateCL.Gate(FPrevLayer.FOutput, FOutput,
-    FOutput.SizeX * FOutput.SizeY, FOutput.Depth, {ActFlag=}2);
+  if Assigned(FGLUGateCL) then Result := FGLUGateCL.OutputBuffer() else Result := nil;
+end;
+
+function TNNetGLUGateBase.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FGLUGateCL) then Result := FGLUGateCL.OutputKernel() else Result := nil;
+end;
+
+procedure TNNetGLUGateBase.ComputeOpenCL();
+begin
+  FGLUGateCL.GateOnDevice(FPrevLayer.OpenCLOutputBuffer(), FOutput,
+    FOutput.SizeX * FOutput.SizeY, FOutput.Depth, FGateActFlag);
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
 end;
 {$ENDIF}
 
-procedure TNNetGEGLU.SetPrevLayer(pPrevLayer: TNNetLayer);
+function TNNetGLUGateBase.ComputeGateOnOpenCL(): boolean;
+begin
+  Result := false;
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    ComputeOpenCL();
+    Result := true;
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read the device buffer a previous forward left behind.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
+end;
+
+procedure TNNetGLUGateBase.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   if (pPrevLayer.FOutput.Depth mod 2) <> 0 then
   begin
-    FErrorProc('TNNetGEGLU requires an even input depth. Input depth: ' +
+    FErrorProc(ClassName + ' requires an even input depth. Input depth: ' +
       IntToStr(pPrevLayer.FOutput.Depth));
   end;
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
     pPrevLayer.FOutput.Depth div 2);
   SetOutputErrorSize(FOutput);
   {$IFDEF OpenCL}
-  FShouldOpenCL := (Int64(FOutput.Size) >= cNeuralOpenCLMinWork);
+  // No size verdict: WillOpenCL runs on the device exactly when the source
+  // output is already there, which is what makes the gate free of transfers.
+  FShouldOpenCL := false;
   {$ENDIF}
+end;
+
+{ TNNetGEGLU }
+
+constructor TNNetGEGLU.Create();
+begin
+  inherited Create();
+  FGateActFlag := 2; // gelu-tanh
 end;
 
 procedure TNNetGEGLU.Compute();
@@ -24588,20 +24616,14 @@ const
   GELU_CONST = 0.044715;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  HalfDepth := FOutput.Depth;
-  {$IFDEF OpenCL}
   // Device forward keeps the FFN activation resident on the GPU between the
   // up-projection and the down-projection (forward-only; training stays CPU).
-  if WillOpenCL() then
+  if ComputeGateOnOpenCL() then
   begin
-    Inc(FForwardGPUCnt);
-    ComputeOpenCL();
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
-  end
-  else Inc(FForwardCPUCnt);
-  {$ENDIF}
+  end;
+  HalfDepth := FOutput.Depth;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := HalfDepth - 1;
@@ -24762,57 +24784,7 @@ end;
 constructor TNNetGEGLUErf.Create();
 begin
   inherited Create();
-end;
-
-{$IFDEF OpenCL}
-destructor TNNetGEGLUErf.Destroy();
-begin
-  if Assigned(FGLUGateCL) then FreeAndNil(FGLUGateCL);
-  inherited Destroy();
-end;
-
-function TNNetGEGLUErf.WillOpenCL(): boolean;
-begin
-  Result := Assigned(FGLUGateCL) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL);
-end;
-
-procedure TNNetGEGLUErf.DisableOpenCL();
-begin
-  inherited DisableOpenCL();
-  FreeAndNil(FGLUGateCL);
-end;
-
-procedure TNNetGEGLUErf.EnableOpenCL(DotProductKernel: TNeuralKernel);
-begin
-  FHasOpenCL := true;
-  if not Assigned(FGLUGateCL) then
-    FGLUGateCL := TNNetGLUGateCL.Create(FNN);
-end;
-
-// Device GEGLUErf forward (gelu-erf gate, ActFlag=3), bit-faithful to Compute().
-procedure TNNetGEGLUErf.ComputeOpenCL();
-begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  FGLUGateCL.Gate(FPrevLayer.FOutput, FOutput,
-    FOutput.SizeX * FOutput.SizeY, FOutput.Depth, {ActFlag=}3);
-end;
-{$ENDIF}
-
-procedure TNNetGEGLUErf.SetPrevLayer(pPrevLayer: TNNetLayer);
-begin
-  inherited SetPrevLayer(pPrevLayer);
-  if (pPrevLayer.FOutput.Depth mod 2) <> 0 then
-  begin
-    FErrorProc('TNNetGEGLUErf requires an even input depth. Input depth: ' +
-      IntToStr(pPrevLayer.FOutput.Depth));
-  end;
-  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
-    pPrevLayer.FOutput.Depth div 2);
-  SetOutputErrorSize(FOutput);
-  {$IFDEF OpenCL}
-  FShouldOpenCL := (Int64(FOutput.Size) >= cNeuralOpenCLMinWork);
-  {$ENDIF}
+  FGateActFlag := 3; // gelu-erf
 end;
 
 procedure TNNetGEGLUErf.Compute();
@@ -24828,18 +24800,12 @@ const
   INV_SQRT_2 = 0.7071067811865476;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  HalfDepth := FOutput.Depth;
-  {$IFDEF OpenCL}
-  if WillOpenCL() then
+  if ComputeGateOnOpenCL() then
   begin
-    Inc(FForwardGPUCnt);
-    ComputeOpenCL();
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
-  end
-  else Inc(FForwardCPUCnt);
-  {$ENDIF}
+  end;
+  HalfDepth := FOutput.Depth;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := HalfDepth - 1;
@@ -25112,87 +25078,7 @@ end;
 constructor TNNetSwiGLU.Create();
 begin
   inherited Create();
-end;
-
-{$IFDEF OpenCL}
-destructor TNNetSwiGLU.Destroy();
-begin
-  if Assigned(FGLUGateCL) then FreeAndNil(FGLUGateCL);
-  inherited Destroy();
-end;
-
-function TNNetSwiGLU.WillOpenCL(): boolean;
-var
-  SourceKernel: TNeuralKernel;
-begin
-  Result := false;
-  // Forward only: the device path leaves the output on the device, and the
-  // backward pass still has readers of Output that never call ForceOutputOnRAM.
-  if FIsTrainable or (not FHasOpenCL) or (not Assigned(FGLUGateCL)) then exit;
-  if (not Assigned(FPrevLayer)) or (not FPrevLayer.FOutputOnOpenCL) then exit;
-  SourceKernel := FPrevLayer.OpenCLOutputKernel();
-  // Same command queue means the gate is ordered behind the forward that
-  // produced its input with no event and no Finish. Different queues are
-  // unordered with respect to each other, so that case stays on the CPU.
-  if (not Assigned(SourceKernel)) or
-     (SourceKernel.Commands <> FGLUGateCL.OutputKernel().Commands) or
-     (not Assigned(FPrevLayer.OpenCLOutputBuffer())) then exit;
-  Result := true;
-end;
-
-procedure TNNetSwiGLU.DisableOpenCL();
-begin
-  // FGLUGateCL owns the output buffer and the queue it is read through, so the
-  // output has to come back to RAM while both are still alive.
-  ForceOutputOnRAM();
-  inherited DisableOpenCL();
-  FreeAndNil(FGLUGateCL);
-end;
-
-function TNNetSwiGLU.OpenCLOutputBuffer(): cl_mem;
-begin
-  if Assigned(FGLUGateCL) then Result := FGLUGateCL.OutputBuffer() else Result := nil;
-end;
-
-function TNNetSwiGLU.OpenCLOutputKernel(): TNeuralKernel;
-begin
-  if Assigned(FGLUGateCL) then Result := FGLUGateCL.OutputKernel() else Result := nil;
-end;
-
-procedure TNNetSwiGLU.EnableOpenCL(DotProductKernel: TNeuralKernel);
-begin
-  FHasOpenCL := true;
-  if not Assigned(FGLUGateCL) then
-    FGLUGateCL := TNNetGLUGateCL.Create(FNN);
-end;
-
-// Device SwiGLU forward (swish gate, ActFlag=1) straight over the source's
-// already-resident output buffer: nothing is uploaded, nothing is read back.
-procedure TNNetSwiGLU.ComputeOpenCL();
-begin
-  FGLUGateCL.GateOnDevice(FPrevLayer.OpenCLOutputBuffer(), FOutput,
-    FOutput.SizeX * FOutput.SizeY, FOutput.Depth, {ActFlag=}1);
-  FOutputOnOpenCL := true;
-  FOutputOnRAM := false;
-end;
-{$ENDIF}
-
-procedure TNNetSwiGLU.SetPrevLayer(pPrevLayer: TNNetLayer);
-begin
-  inherited SetPrevLayer(pPrevLayer);
-  if (pPrevLayer.FOutput.Depth mod 2) <> 0 then
-  begin
-    FErrorProc('TNNetSwiGLU requires an even input depth. Input depth: ' +
-      IntToStr(pPrevLayer.FOutput.Depth));
-  end;
-  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
-    pPrevLayer.FOutput.Depth div 2);
-  SetOutputErrorSize(FOutput);
-  {$IFDEF OpenCL}
-  // No size verdict: WillOpenCL runs on the device exactly when the source
-  // output is already there, which is what makes the gate free of transfers.
-  FShouldOpenCL := false;
-  {$ENDIF}
+  FGateActFlag := 1; // swish
 end;
 
 procedure TNNetSwiGLU.Compute();
@@ -25200,21 +25086,11 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL}
-  if WillOpenCL() then
+  if ComputeGateOnOpenCL() then
   begin
-    Inc(FForwardGPUCnt);
-    ComputeOpenCL();
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
   end;
-  Inc(FForwardCPUCnt);
-  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
-  // The host wrote FOutput, so a later ForceOutputOnRAM must not read the
-  // device buffer a previous forward left behind.
-  FOutputOnOpenCL := false;
-  FOutputOnRAM := true;
-  {$ENDIF}
   // One general kernel: the serial path is the full-range chunk (bit-identical
   // - only independent elements are partitioned).
   ComputeRange(0, FOutput.Size - 1);
@@ -25503,57 +25379,7 @@ end;
 constructor TNNetGLU.Create();
 begin
   inherited Create();
-end;
-
-{$IFDEF OpenCL}
-destructor TNNetGLU.Destroy();
-begin
-  if Assigned(FGLUGateCL) then FreeAndNil(FGLUGateCL);
-  inherited Destroy();
-end;
-
-function TNNetGLU.WillOpenCL(): boolean;
-begin
-  Result := Assigned(FGLUGateCL) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL);
-end;
-
-procedure TNNetGLU.DisableOpenCL();
-begin
-  inherited DisableOpenCL();
-  FreeAndNil(FGLUGateCL);
-end;
-
-procedure TNNetGLU.EnableOpenCL(DotProductKernel: TNeuralKernel);
-begin
-  FHasOpenCL := true;
-  if not Assigned(FGLUGateCL) then
-    FGLUGateCL := TNNetGLUGateCL.Create(FNN);
-end;
-
-// Device GLU forward (sigmoid gate, ActFlag=0), bit-faithful to Compute().
-procedure TNNetGLU.ComputeOpenCL();
-begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  FGLUGateCL.Gate(FPrevLayer.FOutput, FOutput,
-    FOutput.SizeX * FOutput.SizeY, FOutput.Depth, {ActFlag=}0);
-end;
-{$ENDIF}
-
-procedure TNNetGLU.SetPrevLayer(pPrevLayer: TNNetLayer);
-begin
-  inherited SetPrevLayer(pPrevLayer);
-  if (pPrevLayer.FOutput.Depth mod 2) <> 0 then
-  begin
-    FErrorProc('TNNetGLU requires an even input depth. Input depth: ' +
-      IntToStr(pPrevLayer.FOutput.Depth));
-  end;
-  FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
-    pPrevLayer.FOutput.Depth div 2);
-  SetOutputErrorSize(FOutput);
-  {$IFDEF OpenCL}
-  FShouldOpenCL := false; // bandwidth-bound: GPU < CPU at every size (OpenCLForwardBenchmark ~0.95x), pin to CPU. Old verdict: Int64(FOutput.Size) >= cNeuralOpenCLMinWork
-  {$ENDIF}
+  FGateActFlag := 0; // sigmoid
 end;
 
 procedure TNNetGLU.Compute();
@@ -25568,18 +25394,12 @@ var
 {$ENDIF}
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  HalfDepth := FOutput.Depth;
-  {$IFDEF OpenCL}
-  if WillOpenCL() then
+  if ComputeGateOnOpenCL() then
   begin
-    Inc(FForwardGPUCnt);
-    ComputeOpenCL();
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
-  end
-  else Inc(FForwardCPUCnt);
-  {$ENDIF}
+  end;
+  HalfDepth := FOutput.Depth;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := HalfDepth - 1;
@@ -36917,30 +36737,8 @@ end;
 
 destructor TNNetGLUGateCL.Destroy();
 begin
-  if Assigned(FBufX) then clReleaseMemObject(FBufX);
   if Assigned(FBufY) then clReleaseMemObject(FBufY);
   inherited Destroy();
-end;
-
-procedure TNNetGLUGateCL.Gate(X, Y: TNNetVolume;
-  NumTokens, HalfDepth, ActFlag: integer);
-var
-  bufX, bufY: cl_mem;
-  k: cl_kernel;
-begin
-  k := FKernel.Kernel;
-  bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
-  bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
-  clSetKernelArg(k, 0, csLongintSize, @NumTokens);
-  clSetKernelArg(k, 1, csLongintSize, @HalfDepth);
-  clSetKernelArg(k, 2, csLongintSize, @ActFlag);
-  clSetKernelArg(k, 3, csCLMemSize, @bufX);
-  clSetKernelArg(k, 4, csCLMemSize, @bufY);
-  // One work-item per (token, output-channel).
-  FKernel.RunKernel(k, NumTokens * HalfDepth);
-  FKernel.Finish();
-  FKernel.ReadBuffer(bufY, Y, CL_TRUE);
-  // Buffers are persistent (FBuf*), reused next forward - not released here.
 end;
 
 procedure TNNetGLUGateCL.GateOnDevice(SourceBuffer: cl_mem; Y: TNNetVolume;
