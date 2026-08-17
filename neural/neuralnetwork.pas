@@ -2033,10 +2033,10 @@ type
     destructor Destroy(); override;
     // Gates an ALREADY-resident source buffer laid out token-major as A|B
     // halves; the result stays in FBufY, sized for Y and left unread.
-    procedure GateOnDevice(SourceBuffer: cl_mem; Y: TNNetVolume;
+    procedure GateOnOpenCL(SourceBuffer: cl_mem; Y: TNNetVolume;
       NumTokens, HalfDepth, ActFlag: integer);
     // FBufY and the queue that owns its contents - what a layer running
-    // GateOnDevice answers OpenCLOutputBuffer/OpenCLOutputKernel with.
+    // GateOnOpenCL answers OpenCLOutputBuffer/OpenCLOutputKernel with.
     function OutputBuffer(): cl_mem;
     function OutputKernel(): TNeuralKernel;
   end;
@@ -14035,10 +14035,10 @@ type
       function ShouldDeviceIm2Col(): boolean; {$IFDEF Release} inline; {$ENDIF}
       // True when the previous layer's finished output is on the device, bound
       // to a buffer, and this layer may read it (inference only).
-      function PrevOutputOnDevice(): boolean; // Coded by Claude (AI).
+      function PrevOutputOnOpenCL(): boolean; // Coded by Claude (AI).
       // True when ComputeOpenCL will bind the previous layer's device output as
       // the B operand instead of uploading it. Pointwise only. Coded by Claude (AI).
-      function ShouldBindPrevOutputOnDevice(): boolean;
+      function ShouldBindPrevOutputOnOpenCL(): boolean;
       // True when it will bind that output as the cai_im2col gather source
       // instead of uploading FInputCopy. Spatial, unpadded. Coded by Claude (AI).
       function ShouldBindPrevOutputAsIm2ColSrc(): boolean;
@@ -24677,7 +24677,7 @@ end;
 procedure TNNetGLUGateBase.ComputeOpenCL();
 begin
   FPrevLayer.OpenCLOutputFinish(FGLUGateCL.OutputKernel());
-  FGLUGateCL.GateOnDevice(FPrevLayer.OpenCLOutputBuffer(), FOutput,
+  FGLUGateCL.GateOnOpenCL(FPrevLayer.OpenCLOutputBuffer(), FOutput,
     FOutput.SizeX * FOutput.SizeY, FOutput.Depth, FGateActFlag);
   FOutputOnOpenCL := true;
   FOutputOnRAM := false;
@@ -36876,7 +36876,7 @@ begin
   inherited Destroy();
 end;
 
-procedure TNNetGLUGateCL.GateOnDevice(SourceBuffer: cl_mem; Y: TNNetVolume;
+procedure TNNetGLUGateCL.GateOnOpenCL(SourceBuffer: cl_mem; Y: TNNetVolume;
   NumTokens, HalfDepth, ActFlag: integer);
 var
   bufY: cl_mem;
@@ -97699,15 +97699,15 @@ var
   k: cl_kernel;
   iSize, iOpcode: longint;
   SourceBuffer: cl_mem;
-  StayOnDevice: boolean;
+  StayOnOpenCL: boolean;
 begin
   // Run the net's shared cai_activation kernel over the per-layer buffer. No
   // allocation here; args are (re)set each call because the kernel is shared in
   // turn by every activation layer (as conv resets args on the shared GEMM
   // kernel). The WillOpenCL() gate and FForwardGPUCnt bump live in the caller
   // (Compute).
-  StayOnDevice := ShouldStayOnOpenCL();
-  if StayOnDevice then
+  StayOnOpenCL := ShouldStayOnOpenCL();
+  if StayOnOpenCL then
   begin
     // The source is already there: read it where it lies and write the result
     // into this layer's own buffer (FX and FY differ, so no aliasing). Blocking
@@ -97725,7 +97725,7 @@ begin
   k := Kern.Kernel;
   iSize := FPrevLayer.FOutput.Size;
   iOpcode := FActivationOpcode;
-  if not StayOnDevice then Kern.WriteBuffer(FActivationBuffer, FPrevLayer.FOutput);
+  if not StayOnOpenCL then Kern.WriteBuffer(FActivationBuffer, FPrevLayer.FOutput);
   clSetKernelArg(k, 0, csLongintSize, @iSize);
   clSetKernelArg(k, 1, csLongintSize, @iOpcode);
   clSetKernelArg(k, 2, csNeuralFloatSize, @ParamA);
@@ -97734,7 +97734,7 @@ begin
   clSetKernelArg(k, 5, csCLMemSize, @SourceBuffer);      // FX
   clSetKernelArg(k, 6, csCLMemSize, @FActivationBuffer); // FY
   Kern.RunKernel(k, iSize);
-  if StayOnDevice then
+  if StayOnOpenCL then
   begin
     // No read back: the result waits in FActivationBuffer until a host reader
     // calls ForceOutputOnRAM, so a chain of device layers never round trips.
@@ -100782,7 +100782,7 @@ begin
     and WillOpenCL() and (not WinogradEligible());
 end;
 
-function TNNetConvolution.PrevOutputOnDevice(): boolean;
+function TNNetConvolution.PrevOutputOnOpenCL(): boolean;
 begin
   Result := (not FIsTrainable) and Assigned(FPrevLayer) and
     FPrevLayer.FOutputOnOpenCL and
@@ -100795,10 +100795,10 @@ end;
 // position-major, depth-fastest order a TNNetVolume already carries, and the
 // same order every producer's buffer holds its output in. So a resident source
 // binds straight in as the B operand: no gather, no repacking, no round trip.
-function TNNetConvolution.ShouldBindPrevOutputOnDevice(): boolean;
+function TNNetConvolution.ShouldBindPrevOutputOnOpenCL(): boolean;
 begin
   Result := false;
-  if (not FPointwise) or (not PrevOutputOnDevice()) then exit;
+  if (not FPointwise) or (not PrevOutputOnOpenCL()) then exit;
   // The GEMM shape was fixed when EnableOpenCL prepared FDotCL against
   // FInputPrepared; a source of any other size would read past its buffer.
   if FPrevLayer.FOutput.Size <> FInputPrepared.Size then exit;
@@ -100811,7 +100811,7 @@ end;
 // host, which needs the source in host memory. Coded by Claude (AI).
 function TNNetConvolution.ShouldBindPrevOutputAsIm2ColSrc(): boolean;
 begin
-  Result := (FPadding = 0) and PrevOutputOnDevice() and ShouldDeviceIm2Col();
+  Result := (FPadding = 0) and PrevOutputOnOpenCL() and ShouldDeviceIm2Col();
 end;
 
 procedure TNNetConvolution.ComputeOpenCL();
@@ -100824,7 +100824,7 @@ var
 begin
   PrevOutputBuffer := nil;
   Im2ColSrcBuffer := nil;
-  if ShouldBindPrevOutputOnDevice() then
+  if ShouldBindPrevOutputOnOpenCL() then
     PrevOutputBuffer := FPrevLayer.OpenCLOutputBuffer()
   else if ShouldBindPrevOutputAsIm2ColSrc() then
     Im2ColSrcBuffer := FPrevLayer.OpenCLOutputBuffer()
@@ -101677,7 +101677,7 @@ begin
     // previous output has to come back to RAM at all. ComputeOpenCL asks them
     // again and does the binding; the calls see the same state.
     {$IFDEF OpenCL}
-    if not (ShouldBindPrevOutputOnDevice() or ShouldBindPrevOutputAsIm2ColSrc())
+    if not (ShouldBindPrevOutputOnOpenCL() or ShouldBindPrevOutputAsIm2ColSrc())
       then FPrevLayer.ForceOutputOnRAM();
     {$ENDIF}
     PrepareForwardPrologue();
