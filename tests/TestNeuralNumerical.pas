@@ -362,7 +362,8 @@ type
     // broadcast (one launch instead of one per replica).
     procedure TestDeepConcatOpenCLParity;
     // Device-side gated activation (cai_glu_gate) forward parity over an
-    // already-resident source output, for all four GLU-family gates.
+    // already-resident source output: four gates x two depths x two input
+    // scales, the large one covering the kernel's saturation clamps.
     procedure TestGLUGateResidentOpenCLParity;
     // Device-side im2col (cai_im2col) forward parity for the general convolution:
     // an inference-only conv gathers FInputPrepared on the device instead of the
@@ -64675,8 +64676,8 @@ var
   InputLayer, SourceLayer, GateLayer, RefGate: TNNetLayer;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
-  i, InSize, InDepth, VariantCnt, DepthCnt: integer;
-  Diff, MaxDiff: TNeuralFloat;
+  i, InSize, InDepth, VariantCnt, DepthCnt, ScaleCnt: integer;
+  InScale, Diff, MaxDiff, RefMagnitude: TNeuralFloat;
 
   // One fresh gate layer of the swept variant. Both networks build the same
   // kind, so the CPU reference is the layer's OWN forward, not a second copy
@@ -64699,9 +64700,16 @@ begin
   end;
   for VariantCnt := 0 to 3 do
   for DepthCnt := 0 to 1 do
+  for ScaleCnt := 0 to 1 do
   begin
     RandSeed := 424242;
     if DepthCnt = 0 then InDepth := 8 else InDepth := 16;
+    // Scale 60 drives the convolution output - the gate's B half - to about 93.
+    // GEGLU's device branch feeds that through tanh(0.798*(B + 0.0447*B^3)),
+    // an argument near 3.5e4, and PoCL runs kernels on the host CPU where the
+    // process leaves floating-point exceptions unmasked. Before cai_glu_gate
+    // clamped, this case killed the whole suite at B ~ 18.
+    if ScaleCnt = 0 then InScale := 0.6 else InScale := 60;
     NN := TNNet.Create();
     RefNN := TNNet.Create();
     Input := TNNetVolume.Create(6, 6, InDepth);
@@ -64724,14 +64732,9 @@ begin
       RefGate := CreateGate(VariantCnt);
       RefNN.AddLayer(RefGate);
 
-      // Bounded input: the convolution output is the gate's B half, and the
-      // GEGLU device branch feeds it through tanh(0.798*(B + 0.0447*B^3)). PoCL
-      // runs kernels on the host CPU, where FPC leaves floating-point exceptions
-      // unmasked, so a B of ~18 overflows inside the library's tanh and takes the
-      // process down. |B| stays under 2 here.
       InSize := Input.Size;
       for i := 0 to InSize - 1 do
-        Input.Raw[i] := 0.6 * Sin(i * 0.37);
+        Input.Raw[i] := InScale * Sin(i * 0.37);
 
       NN.Compute(Input);
       AssertEquals(Names[VariantCnt] + ' ran on the CPU before EnableOpenCL', 0,
@@ -64753,24 +64756,31 @@ begin
       end;
       RefNN.Compute(SourceLayer.Output);
 
+      // Relative to the reference where that exceeds 1: at scale 60 the gate
+      // output reaches ~8600, and single precision alone is worth ~1e-3 there,
+      // so an absolute 1e-4 bound would measure float width, not the kernel.
+      // Below 1 the divisor is 1, which is the plain absolute difference.
       MaxDiff := 0;
       AssertEquals(Names[VariantCnt] + ' output size match',
         RefGate.Output.Size, GateLayer.Output.Size);
       for i := 0 to RefGate.Output.Size - 1 do
       begin
-        Diff := Abs(RefGate.Output.Raw[i] - GateLayer.Output.Raw[i]);
+        RefMagnitude := Abs(RefGate.Output.Raw[i]);
+        if RefMagnitude < 1 then RefMagnitude := 1;
+        Diff := Abs(RefGate.Output.Raw[i] - GateLayer.Output.Raw[i]) / RefMagnitude;
         if Diff > MaxDiff then MaxDiff := Diff;
       end;
       WriteLn('  ', Names[VariantCnt], ' resident OpenCL parity: input depth ',
-        InDepth, ' max|diff|=', MaxDiff:0:9,
+        InDepth, ' scale ', InScale:0:1, ' max rel diff=', MaxDiff:0:9,
         ' gpu forwards=', GateLayer.ForwardGPUCnt);
       // Without this a silent fall back to the CPU would compare the reference
       // against itself and pass while covering nothing.
       AssertTrue(Names[VariantCnt] + ' must reach the device (input depth ' +
         IntToStr(InDepth) + ')', GateLayer.ForwardGPUCnt > 0);
       AssertTrue(Names[VariantCnt] + ' resident OpenCL vs CPU parity (input ' +
-        'depth ' + IntToStr(InDepth) + '): max |diff| = ' + FloatToStr(MaxDiff) +
-        ' must be < 1e-4', MaxDiff < 1e-4);
+        'depth ' + IntToStr(InDepth) + ', scale ' + FloatToStr(InScale) +
+        '): max relative diff = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+        MaxDiff < 1e-4);
     finally
       Input.Free;
       RefNN.Free;

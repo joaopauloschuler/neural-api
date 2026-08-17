@@ -1072,6 +1072,10 @@ __kernel void cai_l2norm_perdepth
 //   3 = gelu-erf    -> GEGLUErf  (A * B * 0.5*(1+erf(B/sqrt(2))))
 // One work-item per (token, output-channel). Forward-only; the formulas are the
 // exact analytic forms used by the scalar CPU Compute() so parity is < 1e-4.
+// The sigmoid and tanh here are cai_activation's stable forms, not the direct
+// ones: PoCL runs kernels on the host CPU, where the host process leaves
+// floating-point exceptions unmasked, so an exp that overflows inside the
+// library kills the process instead of saturating. Coded by Claude (AI).
 __kernel void cai_glu_gate
 (
   const int FNumTokens,
@@ -1090,16 +1094,31 @@ __kernel void cai_glu_gate
   const float a = FX[inBase + d];
   const float b = FX[inBase + FHalfDepth + d];
   float gated;
-  if (FActFlag == 0)            // GLU: sigmoid(B)
-    gated = 1.0f / (1.0f + exp(-b));
-  else if (FActFlag == 1)       // SwiGLU: swish(B) = B*sigmoid(B)
-    gated = b * (1.0f / (1.0f + exp(-b)));
+  if (FActFlag <= 1)            // GLU: sigmoid(B) / SwiGLU: swish(B) = B*sigmoid(B)
+  {
+    // Two-branch sigmoid: the negative side evaluates exp(b), which UNDERFLOWS
+    // to zero instead of overflowing, so no clamp is needed on either side.
+    float sig;
+    if (b > 0.0f)
+      sig = 1.0f / (1.0f + exp(-b));
+    else
+    {
+      const float s = exp(b);
+      sig = s / (1.0f + s);
+    }
+    if (FActFlag == 0) gated = sig; else gated = b * sig;
+  }
   else if (FActFlag == 2)       // GEGLU: gelu_tanh(B)
   {
     const float SQRT_2_OVER_PI = 0.7978845608f;
     const float GELU_CONST = 0.044715f;
-    const float arg = SQRT_2_OVER_PI * (b + GELU_CONST * b * b * b);
-    gated = b * 0.5f * (1.0f + tanh(arg));
+    // The cubic term drives arg past 100 by |B| ~ 15, and tanh is already 1.0f
+    // in single precision by |arg| ~ 9, so clamping to cai_activation's [-10,10]
+    // changes no representable result and keeps exp(-2*arg) at exp(20).
+    float arg = SQRT_2_OVER_PI * (b + GELU_CONST * b * b * b);
+    if (arg > 10.0f) arg = 10.0f; else if (arg < -10.0f) arg = -10.0f;
+    const float e = exp(-2.0f * arg);
+    gated = b * 0.5f * (1.0f + (1.0f - e) / (1.0f + e));
   }
   else                          // GEGLUErf: gelu_erf(B)
   {
