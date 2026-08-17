@@ -687,6 +687,19 @@ type
       // way, the >= 0 boundary included. Buffers may alias (dst = src).
       class procedure LeakyRelu(pDst, pSrc: TNeuralFloatArrPtr;
         Slope: TNeuralFloat; N: integer); static;
+      // ReluL writes the leaky clamp of src into [LowLimit, HighLimit]: src[i]
+      // inside, and Limit + (src[i]-Limit)*Slope beyond either limit - the
+      // activation TNNetReLUL and TNNetReLU6 apply. AVX2/64-bit builds run
+      // AVXReluL; every other build runs the equivalent scalar loop.
+      // Bit-identical either way. Buffers may alias (dst = src).
+      class procedure ReluL(pDst, pSrc: TNeuralFloatArrPtr;
+        LowLimit, HighLimit, Slope: TNeuralFloat; N: integer); static;
+      // ReluLGateMask writes ReluL's derivative: 1 inside (LowLimit, HighLimit]
+      // and Slope outside it. AVX2/64-bit builds run AVXReluLGateMask; every
+      // other build runs the equivalent scalar loop. Bit-identical either way.
+      // Buffers may alias (dst = src).
+      class procedure ReluLGateMask(pDst, pSrc: TNeuralFloatArrPtr;
+        LowLimit, HighLimit, Slope: TNeuralFloat; N: integer); static;
       // Largest FINITE magnitude of src[0..N-1], or 0 when nothing there is
       // finite and non-zero: NaN is skipped and +/-Inf excluded, so the result
       // is always a usable quantization range. This is the pointer-and-count
@@ -2379,6 +2392,122 @@ begin
   for i := localNumElements to NumElementsM1 do
     if PtrSrc^[i] >= 0 then PtrDst^[i] := PtrSrc^[i]
     else PtrDst^[i] := Slope * PtrSrc^[i];
+end;
+
+// dst[i] := the leaky clamp of src[i] into [LowLimit, HighLimit] - eight
+// elements per iteration as two clamped forms and two blends. Slope and both
+// limits are broadcast from a local array, so the kernel references no global
+// constant and stays position independent. Bit-exact against the scalar tail:
+// each form is the same subtract-multiply-add in the same order (no FMA), the
+// GT_OQ compares reproduce the scalar's strict > without signalling on NaN,
+// and a NaN input falls to the low form on both paths.
+procedure AVXReluL(PtrDst, PtrSrc: TNeuralFloatArrPtr;
+  LowLimit, HighLimit, Slope: TNeuralFloat; NumElements: integer);
+var
+  localNumElements, i, NumElementsM1: integer;
+  localParams: array[0..2] of Single;
+  ParamsPtr: pointer;
+begin
+  localNumElements := NumElements and (not 7);
+  if localNumElements > 0 then
+  begin
+    localParams[0] := Slope;
+    localParams[1] := LowLimit;
+    localParams[2] := HighLimit;
+    ParamsPtr := Addr(localParams[0]);
+  asm
+  mov rax, PtrSrc
+  mov rdx, PtrDst
+  mov r8, ParamsPtr
+  mov ecx, localNumElements
+  shr ecx, 3
+  vbroadcastss ymm2, [r8]
+  vbroadcastss ymm3, [r8+4]
+  vbroadcastss ymm4, [r8+8]
+@Loop:
+  vmovups   ymm0, [rax]
+  vsubps    ymm1, ymm0, ymm4       // x - HighLimit
+  vmulps    ymm1, ymm1, ymm2
+  vaddps    ymm1, ymm1, ymm4       // HighLimit + (x-HighLimit)*Slope
+  vsubps    ymm5, ymm0, ymm3       // x - LowLimit
+  vmulps    ymm5, ymm5, ymm2
+  vaddps    ymm5, ymm5, ymm3       // LowLimit + (x-LowLimit)*Slope
+  vcmpps    ymm6, ymm0, ymm3, 30   // GT_OQ: false for NaN, no signal
+  vblendvps ymm5, ymm5, ymm0, ymm6 // x where x > LowLimit
+  vcmpps    ymm7, ymm0, ymm4, 30
+  vblendvps ymm5, ymm5, ymm1, ymm7 // the high form where x > HighLimit
+  vmovups   [rdx], ymm5
+  add rax, 32
+  add rdx, 32
+  dec ecx
+  jnz @Loop
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4',
+    'ymm5', 'ymm6', 'ymm7'
+  ];
+  end;
+  NumElementsM1 := NumElements - 1;
+  for i := localNumElements to NumElementsM1 do
+    if PtrSrc^[i] > HighLimit then
+      PtrDst^[i] := HighLimit + (PtrSrc^[i] - HighLimit) * Slope
+    else if PtrSrc^[i] > LowLimit then PtrDst^[i] := PtrSrc^[i]
+    else PtrDst^[i] := LowLimit + (PtrSrc^[i] - LowLimit) * Slope;
+end;
+
+// dst[i] := 1 inside (LowLimit, HighLimit] and Slope outside it, the leaky
+// clamp's derivative. The two GT_OQ compares and the vandnps build the same
+// interior test the scalar tail spells as two branches; a NaN input scores
+// Slope on both paths.
+procedure AVXReluLGateMask(PtrDst, PtrSrc: TNeuralFloatArrPtr;
+  LowLimit, HighLimit, Slope: TNeuralFloat; NumElements: integer);
+var
+  localNumElements, i, NumElementsM1: integer;
+  localParams: array[0..3] of Single;
+  ParamsPtr: pointer;
+begin
+  localNumElements := NumElements and (not 7);
+  if localNumElements > 0 then
+  begin
+    localParams[0] := Slope;
+    localParams[1] := LowLimit;
+    localParams[2] := HighLimit;
+    localParams[3] := 1.0;
+    ParamsPtr := Addr(localParams[0]);
+  asm
+  mov rax, PtrSrc
+  mov rdx, PtrDst
+  mov r8, ParamsPtr
+  mov ecx, localNumElements
+  shr ecx, 3
+  vbroadcastss ymm2, [r8]
+  vbroadcastss ymm3, [r8+4]
+  vbroadcastss ymm4, [r8+8]
+  vbroadcastss ymm5, [r8+12]
+@Loop:
+  vmovups   ymm0, [rax]
+  vcmpps    ymm6, ymm0, ymm3, 30   // x > LowLimit
+  vcmpps    ymm7, ymm0, ymm4, 30   // x > HighLimit
+  vandnps   ymm6, ymm7, ymm6       // inside: above the low limit, not the high
+  vblendvps ymm1, ymm2, ymm5, ymm6
+  vmovups   [rdx], ymm1
+  add rax, 32
+  add rdx, 32
+  dec ecx
+  jnz @Loop
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4',
+    'ymm5', 'ymm6', 'ymm7'
+  ];
+  end;
+  NumElementsM1 := NumElements - 1;
+  for i := localNumElements to NumElementsM1 do
+    if (PtrSrc^[i] > LowLimit) and not (PtrSrc^[i] > HighLimit) then
+      PtrDst^[i] := 1
+    else PtrDst^[i] := Slope;
 end;
 
 
@@ -10170,6 +10299,66 @@ begin
   {$ELSE}
   for I := 0 to N - 1 do
     if pSrc^[I] >= 0 then pDst^[I] := pSrc^[I] else pDst^[I] := Slope * pSrc^[I];
+  {$ENDIF}
+end;
+
+class procedure TNNetVolume.ReluL(pDst, pSrc: TNeuralFloatArrPtr;
+  LowLimit, HighLimit, Slope: TNeuralFloat; N: integer);
+{$IFNDEF AVX2}
+var
+  I: integer;
+{$ELSE}
+{$IFNDEF AVX64}
+var
+  I: integer;
+{$ENDIF}
+{$ENDIF}
+begin
+  if N <= 0 then exit;
+  {$IFDEF AVX2}
+  {$IFDEF AVX64}
+  AVXReluL(pDst, pSrc, LowLimit, HighLimit, Slope, N);
+  {$ELSE}
+  for I := 0 to N - 1 do
+    if pSrc^[I] > HighLimit then
+      pDst^[I] := HighLimit + (pSrc^[I] - HighLimit) * Slope
+    else if pSrc^[I] > LowLimit then pDst^[I] := pSrc^[I]
+    else pDst^[I] := LowLimit + (pSrc^[I] - LowLimit) * Slope;
+  {$ENDIF}
+  {$ELSE}
+  for I := 0 to N - 1 do
+    if pSrc^[I] > HighLimit then
+      pDst^[I] := HighLimit + (pSrc^[I] - HighLimit) * Slope
+    else if pSrc^[I] > LowLimit then pDst^[I] := pSrc^[I]
+    else pDst^[I] := LowLimit + (pSrc^[I] - LowLimit) * Slope;
+  {$ENDIF}
+end;
+
+class procedure TNNetVolume.ReluLGateMask(pDst, pSrc: TNeuralFloatArrPtr;
+  LowLimit, HighLimit, Slope: TNeuralFloat; N: integer);
+{$IFNDEF AVX2}
+var
+  I: integer;
+{$ELSE}
+{$IFNDEF AVX64}
+var
+  I: integer;
+{$ENDIF}
+{$ENDIF}
+begin
+  if N <= 0 then exit;
+  {$IFDEF AVX2}
+  {$IFDEF AVX64}
+  AVXReluLGateMask(pDst, pSrc, LowLimit, HighLimit, Slope, N);
+  {$ELSE}
+  for I := 0 to N - 1 do
+    if (pSrc^[I] > LowLimit) and not (pSrc^[I] > HighLimit) then pDst^[I] := 1
+    else pDst^[I] := Slope;
+  {$ENDIF}
+  {$ELSE}
+  for I := 0 to N - 1 do
+    if (pSrc^[I] > LowLimit) and not (pSrc^[I] > HighLimit) then pDst^[I] := 1
+    else pDst^[I] := Slope;
   {$ENDIF}
 end;
 
