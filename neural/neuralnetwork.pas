@@ -578,6 +578,9 @@ type
       // forward that produced it when layers hold per-layer queues.
       // Override when required.
       function OpenCLOutputKernel(): TNeuralKernel; virtual;
+      // Blocks until this layer's device output is finished, so a consumer on
+      // ANOTHER queue can read OpenCLOutputBuffer. No-op on the same queue.
+      procedure OpenCLOutputFinish(pConsumerKernel: TNeuralKernel = nil); // Coded by Claude (AI).
       // Force (pForce=True) or release (False) the OpenCL path on this layer,
       // bypassing the per-layer size verdict in WillOpenCL. Used by the GPU
       // parity tests to exercise the device path on tiny tensors. Coded by Claude (AI).
@@ -12036,9 +12039,12 @@ type
     FPrevLayerList: TNNetLayerList;
   protected
     {$IFDEF OpenCL}
-    // True when every source output is resident on the device, bound to a buffer
-    // and produced on pKernel's queue: what a device forward reads them under.
+    // True when every source output is resident on the device and bound to a
+    // buffer: what a device forward reads them under.
     function SourcesReadyOnOpenCL(pKernel: TNeuralKernel): boolean;
+    // Blocks until every source produced on a queue other than pKernel's has
+    // finished. Call before the launches that read their buffers.
+    procedure FinishSourceOutputs(pKernel: TNeuralKernel); // Coded by Claude (AI).
     {$ENDIF}
   public
     constructor Create(); override;
@@ -24622,11 +24628,7 @@ begin
   if FIsTrainable or (not FHasOpenCL) or (not Assigned(FGLUGateCL)) then exit;
   if (not Assigned(FPrevLayer)) or (not FPrevLayer.FOutputOnOpenCL) then exit;
   SourceKernel := FPrevLayer.OpenCLOutputKernel();
-  // Same command queue means the gate is ordered behind the forward that
-  // produced its input with no event and no Finish. Different queues are
-  // unordered with respect to each other, so that case stays on the CPU.
   if (not Assigned(SourceKernel)) or
-     (SourceKernel.Commands <> FGLUGateCL.OutputKernel().Commands) or
      (not Assigned(FPrevLayer.OpenCLOutputBuffer())) then exit;
   Result := true;
 end;
@@ -24659,6 +24661,7 @@ end;
 
 procedure TNNetGLUGateBase.ComputeOpenCL();
 begin
+  FPrevLayer.OpenCLOutputFinish(FGLUGateCL.OutputKernel());
   FGLUGateCL.GateOnDevice(FPrevLayer.OpenCLOutputBuffer(), FOutput,
     FOutput.SizeX * FOutput.SizeY, FOutput.Depth, FGateActFlag);
   FOutputOnOpenCL := true;
@@ -75120,6 +75123,7 @@ var
   iSize, iCount, iAccumulate: longint;
   SlotBuffer: array[0..3] of cl_mem;
 begin
+  FinishSourceOutputs(FSumKernel);
   Kern := FSumKernel.Kernel;
   iSize := FOutput.Size;
   MaxSourcePos := FPrevLayerList.Count - 1;
@@ -93621,6 +93625,7 @@ var
   MaxSourcePos, SourcePos: integer;
   iPositionCount, iOutDepth, iInDepth, iDestChannel: longint;
 begin
+  FinishSourceOutputs(FConcatKernel);
   Kern := FConcatKernel.Kernel;
   iPositionCount := FOutput.SizeX * FOutput.SizeY;
   iOutDepth := FOutput.Depth;
@@ -93817,14 +93822,21 @@ begin
   for SourcePos := 0 to MaxSourcePos do
   begin
     SourceKernel := FPrevLayerList[SourcePos].OpenCLOutputKernel();
-    // Same command queue means the reader is ordered behind the forwards that
-    // produced its inputs with no event and no Finish. Different queues are
-    // unordered with respect to each other, so that case stays on the CPU.
     if (not Assigned(SourceKernel)) or
-       (SourceKernel.Commands <> pKernel.Commands) or
        (not Assigned(FPrevLayerList[SourcePos].OpenCLOutputBuffer())) then exit;
   end;
   Result := true;
+end;
+
+procedure TNNetConcatBase.FinishSourceOutputs(pKernel: TNeuralKernel);
+var
+  MaxSourcePos, SourcePos: integer;
+begin
+  // A source on pKernel's own queue is already ordered ahead of the launches
+  // below, so OpenCLOutputFinish only blocks on the sources that are not.
+  MaxSourcePos := FPrevLayerList.Count - 1;
+  for SourcePos := 0 to MaxSourcePos do
+    FPrevLayerList[SourcePos].OpenCLOutputFinish(pKernel);
 end;
 {$ENDIF}
 
@@ -93983,11 +93995,7 @@ begin
   // device gather would still have to download its slice.
   if FPrevLayer.FOutputOnRAM then exit;
   SourceKernel := FPrevLayer.OpenCLOutputKernel();
-  // Same command queue means the gather is ordered behind the forward that
-  // produced its input with no event and no Finish. Different queues are
-  // unordered with respect to each other, so that case stays on the CPU.
   if (not Assigned(SourceKernel)) or
-     (SourceKernel.Commands <> FSplitKernel.Commands) or
      (not Assigned(FPrevLayer.OpenCLOutputBuffer())) then exit;
   Result := true;
 end;
@@ -94008,6 +94016,7 @@ var
   SourceBuffer: cl_mem;
   iPositionCount, iOutDepth, iInDepth: longint;
 begin
+  FPrevLayer.OpenCLOutputFinish(FSplitKernel);
   Kern := FSplitKernel.Kernel;
   SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
   iPositionCount := FOutput.SizeX * FOutput.SizeY;
@@ -127769,6 +127778,19 @@ end;
 function TNNetLayer.OpenCLOutputKernel(): TNeuralKernel;
 begin
   if Assigned(FDotCL) then Result := FDotCL.DotProductKernel else Result := nil;
+end;
+
+procedure TNNetLayer.OpenCLOutputFinish(pConsumerKernel: TNeuralKernel);
+var
+  OutputKernel: TNeuralKernel;
+begin
+  OutputKernel := OpenCLOutputKernel();
+  if not Assigned(OutputKernel) then exit;
+  // clFinish is a full barrier on the producing queue: everything enqueued there
+  // has completed, so an enqueue on any other queue is ordered after it.
+  if Assigned(pConsumerKernel) and
+     (pConsumerKernel.Commands = OutputKernel.Commands) then exit;
+  OutputKernel.Finish();
 end;
 
 function TNNetLayer.GetDotCLWaitBeta(): TNeuralFloat;
