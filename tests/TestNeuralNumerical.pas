@@ -345,6 +345,19 @@ type
     // still match the corresponding row of the full-sequence CPU forward - and
     // a mid-session CaptureState/RestoreState round trip must not disturb it.
     procedure DepthwiseConv1DDecodeResidentOpenCLParity;
+    // TNNetInput -> TNNetGatedDeltaNet with ForceOpenCL off: the recurrence's
+    // own size verdict is False, so only a source already in OpenCL memory can
+    // put it there, and cai_gated_delta_net must then reproduce the CPU scan.
+    procedure GatedDeltaNetResidentChainUnforcedOpenCLParity;
+    // Token-by-token decode on OpenCL: the (Hv,Dk,Dv) matrix state stays in
+    // OpenCL memory between tokens, so every step must still match the
+    // corresponding row of the full-sequence CPU forward - and a mid-session
+    // CaptureState/RestoreState round trip must not disturb it.
+    procedure GatedDeltaNetDecodeResidentOpenCLParity;
+    // A value-head dimension wider than the kernel's 256 lanes, so each lane
+    // owns several state columns and both grid-stride loops run more than one
+    // iteration - the shape the two tests above never reach.
+    procedure GatedDeltaNetWideHeadOpenCLParity;
     // OpenCL tap-diagonal coefficient-GEMV forward offload parity (vs CPU) for
     // TNNetKANConv (Chebyshev and B-spline basis).
     procedure TestKANConvOpenCLParity;
@@ -68991,6 +69004,246 @@ begin
   finally
     Snap.Free; FullOut.Free; StepIn.Free; FullIn.Free;
     NNStep.Free; NNFull.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.GatedDeltaNetResidentChainUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Hk = 2; Hv = 4; Dk = 3; Dv = 3; SeqLen = 7;
+  InDepth = 2 * Hk * Dk + 2 * Hv * Dv + 2 * Hv; // 44
+  OutDepth = Hv * Dv;
+var
+  NNCpu, NNGpu: TNNet;
+  Input, CpuOut: TNNetVolume;
+  LCpu, LGpu: TNNetGatedDeltaNet;
+  Mixer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, D, N: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260818;
+  NNCpu := TNNet.Create();
+  NNGpu := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, InDepth);
+  CpuOut := TNNetVolume.Create();
+  try
+    NNCpu.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+    LCpu := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+    NNCpu.AddLayer(LCpu);
+    NNCpu.SetTrainable(False, False);
+    SeedGatedDeltaNet(LCpu);
+
+    NNGpu.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+    LGpu := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+    Mixer := NNGpu.AddLayer(LGpu);
+    NNGpu.SetTrainable(False, False);
+    for N := 0 to 2 do LGpu.Neurons[N].Weights.Copy(LCpu.Neurons[N].Weights);
+
+    for T := 0 to SeqLen - 1 do
+      for D := 0 to InDepth - 1 do
+        Input[T, 0, D] := 1.5 * (Random - 0.5);
+    NNCpu.Compute(Input);
+    CpuOut.Copy(LCpu.Output);
+
+    AssertFalse('the recurrence size verdict must leave it on the CPU',
+      Mixer.ShouldOpenCL);
+    NNGpu.EnableOpenCL(PlatformId, DeviceId);
+    NNGpu.Compute(Input);
+    Mixer.ForceOutputOnRAM();
+    MaxDiff := 0;
+    for T := 0 to SeqLen - 1 do
+      for D := 0 to OutDepth - 1 do
+      begin
+        Diff := Abs(CpuOut[T, 0, D] - LGpu.Output[T, 0, D]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    WriteLn('  GatedDeltaNet resident chain: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards mixer=', Mixer.ForwardGPUCnt);
+    AssertEquals('a resident source must put the recurrence on OpenCL',
+      1, Mixer.ForwardGPUCnt);
+    AssertTrue('OpenCL vs CPU scan: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    CpuOut.Free; Input.Free; NNGpu.Free; NNCpu.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.GatedDeltaNetDecodeResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Hk = 2; Hv = 4; Dk = 3; Dv = 3; SeqLen = 9;
+  InDepth = 2 * Hk * Dk + 2 * Hv * Dv + 2 * Hv; // 44
+  OutDepth = Hv * Dv;
+  SnapshotStep = 4;
+var
+  NNFull, NNStep: TNNet;
+  FullIn, StepIn, FullOut, Snap: TNNetVolume;
+  LFull, LStep: TNNetGatedDeltaNet;
+  Mixer, Act: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, D, N, Steps, StepsAtSnapshot: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260818;
+  NNFull := TNNet.Create();
+  NNStep := TNNet.Create();
+  FullIn := TNNetVolume.Create(SeqLen, 1, InDepth);
+  StepIn := TNNetVolume.Create(1, 1, InDepth);
+  FullOut := TNNetVolume.Create();
+  Snap := TNNetVolume.Create();
+  try
+    NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+    LFull := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+    NNFull.AddLayer(LFull);
+    NNFull.AddLayer(TNNetSiLU.Create());
+    NNFull.SetTrainable(False, False);
+    SeedGatedDeltaNet(LFull);
+
+    NNStep.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+    LStep := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+    Mixer := NNStep.AddLayer(LStep);
+    Act := NNStep.AddLayer(TNNetSiLU.Create());
+    NNStep.SetTrainable(False, False);
+    for N := 0 to 2 do LStep.Neurons[N].Weights.Copy(LFull.Neurons[N].Weights);
+
+    for T := 0 to SeqLen - 1 do
+      for D := 0 to InDepth - 1 do
+        FullIn[T, 0, D] := 1.5 * (Random - 0.5);
+    NNFull.Compute(FullIn);
+    FullOut.Copy(NNFull.GetLastLayer.Output);
+
+    AssertFalse('the single-token size verdict must leave it on the CPU',
+      Mixer.ShouldOpenCL);
+    NNStep.EnableOpenCL(PlatformId, DeviceId);
+    LStep.BeginIncrementalDecode();
+    AssertTrue('decode enabled after Begin', LStep.DecodeEnabled);
+    MaxDiff := 0;
+    StepsAtSnapshot := 0;
+    for T := 0 to SeqLen - 1 do
+    begin
+      // A snapshot taken right after step SnapshotStep, then restored before
+      // the next one, must leave the session exactly where it was.
+      if T = SnapshotStep + 1 then LStep.RestoreState(Snap, StepsAtSnapshot);
+      for D := 0 to InDepth - 1 do StepIn[0, 0, D] := FullIn[T, 0, D];
+      NNStep.Compute(StepIn);
+      AssertEquals('decode steps track tokens', T + 1, LStep.DecodeSteps);
+      for D := 0 to OutDepth - 1 do
+      begin
+        Diff := Abs(FullOut[T, 0, D] - NNStep.GetLastLayer.Output[0, 0, D]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      if T = SnapshotStep then
+      begin
+        LStep.CaptureState(Snap, Steps);
+        StepsAtSnapshot := Steps;
+        AssertEquals('the snapshot must carry the step count', T + 1, Steps);
+      end;
+    end;
+    LStep.EndIncrementalDecode();
+    WriteLn('  GatedDeltaNet OpenCL decode: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards mixer=', Mixer.ForwardGPUCnt, ' act=', Act.ForwardGPUCnt);
+    AssertEquals('every decode step must run on OpenCL', SeqLen,
+      Mixer.ForwardGPUCnt);
+    AssertTrue('the activation must follow the read-out rows',
+      Act.ForwardGPUCnt > 0);
+    AssertTrue('OpenCL decode vs full CPU forward: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Snap.Free; FullOut.Free; StepIn.Free; FullIn.Free;
+    NNStep.Free; NNFull.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.GatedDeltaNetWideHeadOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Hk = 1; Hv = 2; Dk = 4; Dv = 300; SeqLen = 3;
+  InDepth = 2 * Hk * Dk + 2 * Hv * Dv + 2 * Hv; // 1212
+  OutDepth = Hv * Dv;
+var
+  NNCpu, NNGpu: TNNet;
+  Input, CpuOut: TNNetVolume;
+  LCpu, LGpu: TNNetGatedDeltaNet;
+  Mixer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, D, N: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260818;
+  NNCpu := TNNet.Create();
+  NNGpu := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, InDepth);
+  CpuOut := TNNetVolume.Create();
+  try
+    NNCpu.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+    LCpu := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+    NNCpu.AddLayer(LCpu);
+    NNCpu.SetTrainable(False, False);
+    SeedGatedDeltaNet(LCpu);
+
+    NNGpu.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+    LGpu := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+    Mixer := NNGpu.AddLayer(LGpu);
+    NNGpu.SetTrainable(False, False);
+    for N := 0 to 2 do LGpu.Neurons[N].Weights.Copy(LCpu.Neurons[N].Weights);
+
+    for T := 0 to SeqLen - 1 do
+      for D := 0 to InDepth - 1 do
+        Input[T, 0, D] := 1.5 * (Random - 0.5);
+    NNCpu.Compute(Input);
+    CpuOut.Copy(LCpu.Output);
+
+    NNGpu.EnableOpenCL(PlatformId, DeviceId);
+    NNGpu.Compute(Input);
+    Mixer.ForceOutputOnRAM();
+    MaxDiff := 0;
+    for T := 0 to SeqLen - 1 do
+      for D := 0 to OutDepth - 1 do
+      begin
+        Diff := Abs(CpuOut[T, 0, D] - LGpu.Output[T, 0, D]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    WriteLn('  GatedDeltaNet wide head (Dv=', Dv, '): max|diff|=', MaxDiff:0:9,
+      ' gpu forwards mixer=', Mixer.ForwardGPUCnt);
+    AssertEquals('the wide head must still run on OpenCL', 1, Mixer.ForwardGPUCnt);
+    AssertTrue('OpenCL vs CPU scan: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    CpuOut.Free; Input.Free; NNGpu.Free; NNCpu.Free;
   end;
 end;
 {$ELSE}

@@ -1932,6 +1932,182 @@ __kernel void cai_depthwise_conv1d_decode
   }
 }
 
+// GATED DELTA-RULE RECURRENCE (TNNetGatedDeltaNet), the token mixer of the
+// Qwen3.5 / Qwen3-Next "linear_attention" blocks. ONE WORK-GROUP PER VALUE
+// HEAD: the left-to-right scan is sequential in t but strictly per head, so a
+// head runs its WHOLE sequence inside one work-group and no cross-work-group
+// synchronization is ever needed. Launch 2-D with global (LocalSize,
+// FNumVHeads) and local (LocalSize, 1); LocalSize must be a power of two (the
+// tree reductions halve it). FScratch is LocalSize + 2*FHeadDimK + FHeadDimV
+// floats of __local memory.
+//
+// Input row t is [ q (Hk*Dk) | k (Hk*Dk) | v (Hv*Dv) | z (Hv*Dv) | b (Hv) |
+// a (Hv) ]; the six channel offsets arrive as arguments so this kernel never
+// restates the layout. Per t, value head h (key head h / FRep):
+//   qn = q * rsqrt(sum(q^2) + eps) * FScale;  kn = k * rsqrt(sum(k^2) + eps)
+//   beta  = sigmoid(b);  decay = exp(-exp(min(A_log,30)) * softplus(a+dt_bias))
+//   err   = v - decay * (S^T kn)
+//   S     = decay * S + kn (x) beta*err
+//   o     = S^T qn
+//   out   = o * rsqrt(mean(o^2) + eps) * w * silu(z)
+// err is folded with the decay so the state is decayed and rewritten in ONE
+// pass, and the read-out accumulates from the value just written, so a token
+// touches each state element exactly twice: once to read, once to rewrite.
+// Lane e owns column e of the (Dk,Dv) state for the whole token, which keeps
+// err and o private and makes adjacent lanes read adjacent floats.
+//
+// FResetState = 1 starts the scan from S = 0 (the full-sequence forward);
+// FResetState = 0 carries the resident state bank in, which is what lets an
+// incremental decode session step without touching RAM. Forward-only: no per-t
+// cache is written, so Backpropagate has nothing to read after this kernel.
+// Coded by Claude (AI).
+__kernel void cai_gated_delta_net
+(
+  const int FSeqLen,
+  const int FNumVHeads,
+  const int FHeadDimK,
+  const int FHeadDimV,
+  const int FRep,
+  const int FInDepth,
+  const int FQOff,
+  const int FKOff,
+  const int FVOff,
+  const int FZOff,
+  const int FBOff,
+  const int FAOff,
+  const int FResetState,
+  const float FEps,
+  const float FScale,
+  __global const float* FALog,
+  __global const float* FDtBias,
+  __global const float* FNormW,
+  __global const float* FX,
+  __global float* FS,
+  __global float* FY,
+  __local float* FScratch
+)
+{
+  const int h = get_group_id(1);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  const int Dk = FHeadDimK;
+  const int Dv = FHeadDimV;
+  const int kh = h / FRep;
+  int s, d, e, i, t;
+
+  __local float* kn = FScratch + lsize;
+  __local float* qn = kn + Dk;
+  __local float* oloc = qn + Dk;
+
+  __global float* S = FS + (h * Dk) * Dv;
+  // ea is invariant across t.
+  const float ea = exp(fmin(FALog[h], 30.0f));
+  const int qBase = FQOff + kh * Dk;
+  const int kBase = FKOff + kh * Dk;
+  const int vBase = FVOff + h * Dv;
+  const int zBase = FZOff + h * Dv;
+  const int yHead = h * Dv;
+  const int yStride = FNumVHeads * Dv;
+
+  for (t = 0; t < FSeqLen; t++)
+  {
+    const int xRow = t * FInDepth;
+    float partial;
+
+    // ---- q/k per-head L2 norm; eps INSIDE the squared sum, as HF does it ----
+    partial = 0.0f;
+    for (i = lid; i < Dk; i += lsize)
+    {
+      const float qv = FX[xRow + qBase + i];
+      partial = mad(qv, qv, partial);
+    }
+    FScratch[lid] = partial;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (s = lsize >> 1; s > 0; s >>= 1)
+    {
+      if (lid < s) FScratch[lid] += FScratch[lid + s];
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float qinv = 1.0f / sqrt(FScratch[0] + FEps);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    partial = 0.0f;
+    for (i = lid; i < Dk; i += lsize)
+    {
+      const float kv = FX[xRow + kBase + i];
+      partial = mad(kv, kv, partial);
+    }
+    FScratch[lid] = partial;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (s = lsize >> 1; s > 0; s >>= 1)
+    {
+      if (lid < s) FScratch[lid] += FScratch[lid + s];
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float kinv = 1.0f / sqrt(FScratch[0] + FEps);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (i = lid; i < Dk; i += lsize)
+    {
+      qn[i] = FX[xRow + qBase + i] * qinv * FScale;
+      kn[i] = FX[xRow + kBase + i] * kinv;
+    }
+
+    // ---- per-head scalar gates: every lane computes them, so no reduction ----
+    const float bv = FX[xRow + FBOff + h];
+    float beta;
+    if (bv > 0.0f) beta = 1.0f / (1.0f + exp(-bv));
+    else { const float sb = exp(bv); beta = sb / (1.0f + sb); }
+    const float pre = FX[xRow + FAOff + h] + FDtBias[h];
+    float sp;
+    if (pre > 30.0f) sp = pre;
+    else if (pre < -30.0f) sp = exp(pre);
+    else sp = log(1.0f + exp(pre));
+    const float decay = exp(-ea * sp);
+    // S_{-1} = 0 only at the very first step of a scan that starts from zero.
+    const int hasPrev = (t > 0) || (FResetState == 0);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // ---- the delta rule, one state column per lane ----
+    for (e = lid; e < Dv; e += lsize)
+    {
+      float acc = 0.0f;
+      if (hasPrev)
+        for (d = 0; d < Dk; d++) acc = mad(S[d * Dv + e], kn[d], acc);
+      const float bk = beta * (FX[xRow + vBase + e] - decay * acc);
+      float o = 0.0f;
+      for (d = 0; d < Dk; d++)
+      {
+        const int idx = d * Dv + e;
+        const float sn = hasPrev ? mad(decay, S[idx], kn[d] * bk) : (kn[d] * bk);
+        S[idx] = sn;
+        o = mad(qn[d], sn, o);
+      }
+      oloc[e] = o;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // ---- gated RMSNorm read-out over the head's Dv columns ----
+    partial = 0.0f;
+    for (e = lid; e < Dv; e += lsize) partial = mad(oloc[e], oloc[e], partial);
+    FScratch[lid] = partial;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (s = lsize >> 1; s > 0; s >>= 1)
+    {
+      if (lid < s) FScratch[lid] += FScratch[lid + s];
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float rinv = 1.0f / sqrt(FScratch[0] / (float)Dv + FEps);
+    const int yRow = t * yStride + yHead;
+    for (e = lid; e < Dv; e += lsize)
+    {
+      const float zv = FX[xRow + zBase + e];
+      FY[yRow + e] = oloc[e] * rinv * FNormW[e] * (zv / (1.0f + exp(-zv)));
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+}
+
 // FUSED MIXTURE-OF-EXPERTS DOWN PROJECTION (TNNetMoEExpertBankDown).
 // Computes the whole gate-weighted expert mixture of one MoE block in a single
 // launch:
