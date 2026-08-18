@@ -4722,6 +4722,8 @@ type
     // (Bias may be nil when UseMean is false). Y receives the normalized output
     // in the same layout. Eps matches the layer's serialized epsilon.
     // pWeightsDirty=false reuses the resident Gain/Bias copy (see EnsureWriteBuffer).
+    // NumTokens=1 is handed to NormalizeWholeVolume: same result, cooperative
+    // reduction instead of one work-item reading the whole Depth serially.
     procedure Normalize(X: TNNetVolume; Gain, Bias: TNNetVolume; Y: TNNetVolume;
       NumTokens, Depth: integer; UseMean: boolean; Eps: TNeuralFloat;
       pWeightsDirty: boolean = true);
@@ -36525,6 +36527,15 @@ var
   iUseMean: longint;
   fEps: single;
 begin
+  // A single token is the degenerate launch for cai_token_norm: one work-item
+  // reads the whole Depth serially. cai_volume_norm reduces the same values
+  // with one cooperative work-group, and over a single token the per-channel
+  // Gain/Bias ARE the per-element vectors that entry point wants.
+  if (NumTokens = 1) and (X.Size = Depth) then
+  begin
+    NormalizeWholeVolume(X, Gain, Bias, Y, UseMean, Eps, pWeightsDirty);
+    exit;
+  end;
   k := FKernel.Kernel;
   if UseMean then iUseMean := 1 else iUseMean := 0;
   fEps := Eps;

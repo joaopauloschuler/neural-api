@@ -472,6 +472,9 @@ type
     // OpenCL per-token depth-axis norm forward offload parity (vs CPU) for the
     // transformer norm layers TNNetTokenRMSNorm and TNNetTokenLayerNorm.
     procedure TokenRMSNormOpenCLParity;
+    // Single-token (decode) shape: TNNetTokenNormCL.Normalize hands it to the
+    // cooperative cai_volume_norm entry point, which must give the same result.
+    procedure TokenRMSNormDecodeOpenCLParity;
     procedure LayerNormOpenCLParity;
     // OpenCL interleaved-pair rotary (RoPE) forward offload parity (vs CPU).
     procedure RoPEOpenCLParity;
@@ -68094,6 +68097,72 @@ begin
       FloatToStr(MaxDiff) + ' must be < 1e-6', MaxDiff < 1e-6);
   finally
     OutCached.Free; OutRef.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Per-token RMSNorm device-forward parity at the DECODE shape: one token, so
+// TNNetTokenNormCL.Normalize delegates to the cooperative cai_volume_norm entry
+// point instead of the one-work-item cai_token_norm. d_model exceeds the 256
+// lanes of that work-group, so its strided partial loop runs. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TokenRMSNormDecodeOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Norm: TNNetTokenRMSNorm;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 320); // 1 token, d_model = 320
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 320, 1));
+    Norm := TNNetTokenRMSNorm.Create();
+    NN.AddLayer(Norm);
+    for i := 0 to Norm.Neurons[0].Weights.Size - 1 do
+      Norm.Neurons[0].Weights.Raw[i] := 1.0 + 0.4 * Sin(i * 0.7);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.6 * Sin(i * 0.31) - 0.15;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      MaxDiff := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    WriteLn('  TokenRMSNorm decode OpenCL parity: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards norm=', Norm.ForwardGPUCnt);
+    // Parity alone would also pass with the layer silently on the CPU.
+    AssertTrue('TokenRMSNorm decode must take the OpenCL path',
+      Norm.ForwardGPUCnt > 0);
+    AssertTrue('TokenRMSNorm decode OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
   end;
 end;
 {$ELSE}
