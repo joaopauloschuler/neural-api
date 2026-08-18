@@ -12382,6 +12382,9 @@ type
       destructor Destroy(); override;
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      // Mirrors the branch Compute() takes, so the scheduler routes this layer
+      // as what it actually runs. Coded by Claude (AI).
+      function WillOpenCL(): boolean; override;
       // True when the forward will bind the previous layer's device output as
       // the B operand instead of uploading it. Coded by Claude (AI).
       function ShouldBindPrevOutputOnOpenCL(): boolean;
@@ -74874,6 +74877,10 @@ end;
 procedure TNNetConvolutionBase.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel);
+  // The inherited call creates FDotCL only when the size verdict passed, while
+  // TNNet.EnableOpenCL reaches every layer: a convolution the verdict left on
+  // the CPU arrives here with nothing to prepare.
+  if not Assigned(FDotCL) then exit;
   if FQuantInt8 then
     PrepareInt8DotCL(FInputPrepared)
   else
@@ -74882,7 +74889,7 @@ begin
   // (FInputPrepared) on the device. Only meaningful for a real (spatial)
   // convolution: a pointwise conv has no im2col (FInputPrepared aliases the prev
   // output). Acquire once: a second call would leak a private handle.
-  if Assigned(FDotCL) and (not FPointwise) and (not Assigned(FIm2ColKernel)) then
+  if (not FPointwise) and (not Assigned(FIm2ColKernel)) then
     FIm2ColKernel := FNN.GetKernel('cai_im2col');
 end;
 
@@ -103354,6 +103361,15 @@ begin
 end;
 
 {$IFDEF OpenCL}
+// The same condition Compute() dispatches on, in both the int8 and the FP32
+// branch. FForceOpenCL is deliberately absent: Compute() does not read it, and a
+// verdict the forward does not honour is what this routine exists to prevent.
+function TNNetFullConnect.WillOpenCL(): boolean;
+begin
+  Result := Assigned(FDotCL) and FHasOpenCL and FShouldOpenCL
+    and ((not FQuantInt8) or FDotCL.Int8Ready);
+end;
+
 // The B operand IS FPrevLayer.Output (EnableOpenCL prepared FDotCL against it),
 // and cai_dot_product reads B in the same order a TNNetVolume carries it, so a
 // resident source binds straight in - the same case as a pointwise convolution.

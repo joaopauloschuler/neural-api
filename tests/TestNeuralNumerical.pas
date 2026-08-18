@@ -491,6 +491,12 @@ type
     // pinned to CPU, so a resident source is the only thing that can put it on
     // the device.
     procedure RMSNormResidentChainUnforcedOpenCLParity;
+    // TNNet.EnableOpenCL reaches every layer, including a convolution whose
+    // size verdict left it on the CPU and which therefore has no FDotCL.
+    procedure CpuVerdictConvolutionSurvivesEnableOpenCL;
+    // TNNetFullConnect.WillOpenCL must report the branch Compute() takes,
+    // above and below the layer's size verdict.
+    procedure FullConnectWillOpenCLMatchesForward;
     // OpenCL gated FFN forward offload parity (vs CPU) for the GLU-family
     // activations TNNetGLU / TNNetSwiGLU / TNNetGEGLU / TNNetGEGLUErf.
     procedure GLUFamilyOpenCLParity;
@@ -68279,6 +68285,112 @@ begin
       0, NormSentinelsLeft);
   finally
     OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// A pointwise convolution over a depth-100 input has FVectorSize 100 (over
+// csMaxInterleavedSize) and FOutput.Size * FVectorSize = 40000 (under the second
+// threshold), so its size verdict is False and TNNetLayerConcatedWeights
+// .EnableOpenCL never creates FDotCL - but TNNet.EnableOpenCL still calls into
+// the layer. Coded by Claude (AI).
+procedure TTestNeuralNumerical.CpuVerdictConvolutionSurvivesEnableOpenCL;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Conv: TNNetLayer;
+  Input, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(10, 10, 100);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(10, 10, 100));
+    Conv := NN.AddLayer(TNNetPointwiseConvLinear.Create(4));
+    AssertFalse('this convolution must be below the size verdict',
+      Conv.ShouldOpenCL);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.4 * Sin(i * 0.17);
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    // Before the guard this call access-violated on a nil FDotCL.
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    AssertFalse('the size verdict must survive EnableOpenCL', Conv.ShouldOpenCL);
+    AssertFalse('a layer without FDotCL must not claim the device path',
+      Conv.WillOpenCL());
+    NN.Compute(Input);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+      MaxDiff := Max(MaxDiff, Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]));
+    AssertEquals('the CPU forward must be unchanged', 0.0, MaxDiff, 0);
+    AssertEquals('the layer must have stayed on the CPU', 0, Conv.ForwardGPUCnt);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetFullConnect.Compute dispatches on FDotCL/FHasOpenCL/FShouldOpenCL, and
+// the scheduler routes the layer by WillOpenCL: the two must agree on both
+// sides of the (FNeurons.Count >= 512) and (prev >= 128) verdict.
+// Coded by Claude (AI).
+procedure TTestNeuralNumerical.FullConnectWillOpenCLMatchesForward;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Big, Small: TNNetLayer;
+  Input: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 128);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 128));
+    Big := NN.AddLayer(TNNetFullConnectLinear.Create(512));
+    Small := NN.AddLayer(TNNetFullConnectLinear.Create(8));
+    NN.SetTrainable(False, False);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.3 * Cos(i * 0.11);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    AssertTrue('the 512-neuron layer must be above the size verdict',
+      Big.ShouldOpenCL);
+    AssertFalse('the 8-neuron layer must be below the size verdict',
+      Small.ShouldOpenCL);
+    NN.Compute(Input);
+    AssertEquals('WillOpenCL must match the branch the big layer took',
+      Big.ForwardGPUCnt > 0, Big.WillOpenCL());
+    AssertEquals('WillOpenCL must match the branch the small layer took',
+      Small.ForwardGPUCnt > 0, Small.WillOpenCL());
+    AssertTrue('the big layer must have reached the device',
+      Big.ForwardGPUCnt > 0);
+    AssertEquals('the small layer must have stayed on the CPU',
+      0, Small.ForwardGPUCnt);
+  finally
+    Input.Free; NN.Free;
   end;
 end;
 {$ELSE}
