@@ -4831,16 +4831,29 @@ type
     // Persistent device buffers (grow-only), reused every forward.
     FBufW, FBufBias, FBufX, FBufY: cl_mem;
     FCapW, FCapBias, FCapX, FCapY: csize_t;
+    // The kernel of the last forward, so a layer that leaves its result in
+    // FBufY can name the queue that produced it. Nil before the first forward,
+    // which is what tells a consumer there is nothing to bind yet.
+    FOutputKernel: TNeuralKernel;
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
+    // The buffer the last call wrote Y into, and the kernel that wrote it. Read
+    // per forward: EnsureOutputBuffer replaces the handle when Y grows.
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
     // PackedW: the C channels' length-K kernels concatenated [c*K + kk].
     // Bias: the C per-channel biases (uploaded even when suppressed; the flag
     // controls their use). X: the previous layer's output. Y receives the output.
     // Off = K-1 (causal) or K div 2 (SAME); SuppressBias = the layer's flag.
     // NewW=false keeps the resident kernel + bias buffers (weights unchanged).
+    // pExternalSrc BORROWS an already-resident input in place of uploading X,
+    // which is then unread; the borrowed buffer is never released here.
+    // pKeepResultOnOpenCL leaves the result in ResultBuffer for the next layer
+    // instead of reading it back into Y.
     procedure Compute(PackedW, Bias, X, Y: TNNetVolume;
-      SeqLen, Channels, Ksize, Off, SuppressBias: integer; NewW: boolean = true);
+      SeqLen, Channels, Ksize, Off, SuppressBias: integer; NewW: boolean = true;
+      pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
   end;
 
   /// OpenCL forward helper for the rotary positional embedding layer
@@ -9179,6 +9192,9 @@ type
       procedure ComputeDecodeCPURange(FirstC, LastC: integer);
       {$IFDEF OpenCL}
       procedure ComputeOpenCL();
+      // True when the previous layer's output can be read where it lies, as the
+      // cai_depthwise_conv1d input, instead of coming back to RAM to be uploaded.
+      function ShouldBindPrevOutputOnOpenCL(): boolean;
       {$ENDIF}
       procedure AfterWeightUpdate(); override;
     protected
@@ -9217,6 +9233,10 @@ type
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
+      // The inherited pair names FDotCL's buffer, which this layer never writes:
+      // its results come out of cai_depthwise_conv1d.
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
   end;
 
@@ -36830,8 +36850,19 @@ begin
   inherited Destroy();
 end;
 
+function TNNetDepthwiseConv1DCL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufY;
+end;
+
+function TNNetDepthwiseConv1DCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FOutputKernel;
+end;
+
 procedure TNNetDepthwiseConv1DCL.Compute(PackedW, Bias, X, Y: TNNetVolume;
-  SeqLen, Channels, Ksize, Off, SuppressBias: integer; NewW: boolean = true);
+  SeqLen, Channels, Ksize, Off, SuppressBias: integer; NewW: boolean = true;
+  pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
 var
   bufW, bufBias, bufX, bufY: cl_mem;
   k: cl_kernel;
@@ -36842,7 +36873,9 @@ begin
   // fired); see TNNetDepthwiseConv1D.ComputeOpenCL / AfterWeightUpdate.
   bufW    := FKernel.EnsureWriteBuffer(FBufW, FCapW, PackedW, NewW);
   bufBias := FKernel.EnsureWriteBuffer(FBufBias, FCapBias, Bias, NewW);
-  bufX    := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+  if pExternalSrc <> nil
+    then bufX := pExternalSrc
+    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
   bufY    := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
   clSetKernelArg(k, 0, csLongintSize, @SeqLen);
   clSetKernelArg(k, 1, csLongintSize, @Channels);
@@ -36855,8 +36888,12 @@ begin
   clSetKernelArg(k, 8, csCLMemSize, @bufY);
   // One work-item per output (time, channel) element.
   FKernel.RunKernel(k, SeqLen * Channels);
-  FKernel.Finish();
-  FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  FOutputKernel := FKernel;
+  if not pKeepResultOnOpenCL then
+  begin
+    FKernel.Finish();
+    FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  end;
   // Buffers are persistent (FBuf*), reused next forward - not released here.
 end;
 
@@ -59423,14 +59460,17 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   if FDecodeEnabled then
   begin
-    // Stateful token-by-token path: the persisted history lives host-side, so
-    // the device forward never runs in decode mode (a width-1 window is far
-    // below the OpenCL work threshold anyway).
+    // Stateful token-by-token path: FDecHist lives host-side, so the OpenCL
+    // forward cannot run in decode mode however the source arrives.
     {$IFDEF OpenCL}
     Inc(FForwardCPUCnt);
+    if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+    // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+    // read whatever a previous OpenCL forward left in the helper's buffer.
+    FOutputOnOpenCL := false;
+    FOutputOnRAM := true;
     {$ENDIF}
     PrepareTapTables();
     ComputeDecodeCPU();
@@ -59438,10 +59478,10 @@ begin
     exit;
   end;
   {$IFDEF OpenCL}
-  // Offload the per-channel kernel sweep to the device when OpenCL is armed and
-  // the contraction is large enough to amortise the upload/dispatch. The CPU
-  // path (ComputeCPU) is the byte-comparable fallback whenever OpenCL is off or
-  // below the work threshold.
+  // Run the per-channel sweep in OpenCL when the layer is armed and either the
+  // size verdict or a source already in OpenCL memory calls for it. It runs
+  // BEFORE any ForceOutputOnRAM because that download is what ComputeOpenCL
+  // exists to avoid. ComputeCPU is the byte-comparable fallback.
   if WillOpenCL() then
   begin
     Inc(FForwardGPUCnt);
@@ -59450,6 +59490,8 @@ begin
     exit;
   end
   else Inc(FForwardCPUCnt);
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   {$ENDIF}
   PrepareTapTables();
   ComputeCPU();
@@ -59629,7 +59671,12 @@ begin
   // where the serial paths do this). Coded by Claude (AI).
   // The tap-major tables must likewise be built HERE: single-threaded and
   // before any chunk is published, so every worker reads a finished table.
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The chunks are about to write FOutput on the host (see Compute).
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
   PrepareTapTables();
   if FDecodeEnabled then Inc(FDecodeSteps, FPrevLayer.FOutput.SizeX);
 end;
@@ -59687,6 +59734,9 @@ end;
 {$IFDEF OpenCL}
 procedure TNNetDepthwiseConv1D.DisableOpenCL();
 begin
+  // FDepthwise1DCL owns the buffer a kept output lives in, so the host copy has
+  // to be recovered before the helper goes.
+  ForceOutputOnRAM();
   inherited DisableOpenCL();
   FreeAndNil(FDepthwise1DCL);
 end;
@@ -59712,7 +59762,35 @@ end;
 
 function TNNetDepthwiseConv1D.WillOpenCL(): boolean;
 begin
-  Result := Assigned(FDotCL) and FHasOpenCL and (FShouldOpenCL or FForceOpenCL);
+  // A source already in OpenCL memory puts the layer there whatever the size
+  // verdict says: the point is to keep the activation from coming back to RAM
+  // and going up again, not to win on contraction size.
+  Result := Assigned(FDepthwise1DCL) and FHasOpenCL
+            and (FShouldOpenCL or FForceOpenCL
+                 or ((not FIsTrainable) and PrevOutputOnOpenCL()));
+end;
+
+function TNNetDepthwiseConv1D.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FDepthwise1DCL) then Result := FDepthwise1DCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetDepthwiseConv1D.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FDepthwise1DCL) then Result := FDepthwise1DCL.OutputKernel()
+  else Result := nil;
+end;
+
+// cai_depthwise_conv1d reads its input as SeqLen contiguous Channels-wide rows,
+// the order every TNNetVolume and every producer's buffer already carries, so a
+// source in OpenCL memory binds straight in: no gather, no repacking. WillOpenCL
+// has already excluded a trainable layer, and SetPrevLayer sized FOutput from
+// the source, so the size test only guards a reshape between the two.
+function TNNetDepthwiseConv1D.ShouldBindPrevOutputOnOpenCL(): boolean;
+begin
+  Result := PrevOutputOnOpenCL() and
+    (FPrevLayer.FOutput.Size = FOutput.Size);
 end;
 
 // True-depthwise device forward via the purpose-built cai_depthwise_conv1d
@@ -59736,8 +59814,20 @@ var
   ChannelsM1, KsizeM1: integer;
   W: TNNetVolume;
   localNeuron: TNNetNeuron;
+  SourceBuffer: cl_mem;
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ShouldBindPrevOutputOnOpenCL() then
+  begin
+    // Read the source where it lies. The result goes to the helper's own output
+    // buffer, so input and output are distinct handles and never alias.
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDepthwise1DCL.OutputKernel());
+  end
+  else
+  begin
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+  end;
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   Channels := FNeurons.Count;
@@ -59763,9 +59853,16 @@ begin
     end;
   end;
 
+  // The result stays in OpenCL memory for the next layer to bind. WillOpenCL is
+  // inference-only, so no host reader is left behind: anything that wants
+  // FOutput calls ForceOutputOnRAM, which MoveOutputToRAM answers from the two
+  // accessors above.
   FDepthwise1DCL.Compute(FGemmWChan, FGemmBias, Prev, FOutput,
-    SeqLen, Channels, Ksize, off, FSuppressBias, {NewW}FGpuWeightsDirty);
+    SeqLen, Channels, Ksize, off, FSuppressBias, {NewW}FGpuWeightsDirty,
+    SourceBuffer, {pKeepResultOnOpenCL=}true);
   FGpuWeightsDirty := false;
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
 end;
 {$ENDIF}
 

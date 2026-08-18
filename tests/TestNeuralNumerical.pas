@@ -335,6 +335,11 @@ type
     // OpenCL forward offload parity (vs CPU) for the depthwise convolutions.
     procedure TestDepthwiseConvOpenCLParity;
     procedure TestDepthwiseConv1DOpenCLParity;
+    // TNNetEmbedding -> TNNetDepthwiseConv1D -> TNNetSiLU with ForceOpenCL off:
+    // the conv's own size verdict is False, so only a source already in OpenCL
+    // memory can put it there - and the activation follows only when the
+    // convolved rows stayed.
+    procedure DepthwiseConv1DResidentChainUnforcedOpenCLParity;
     // OpenCL tap-diagonal coefficient-GEMV forward offload parity (vs CPU) for
     // TNNetKANConv (Chebyshev and B-spline basis).
     procedure TestKANConvOpenCLParity;
@@ -68805,6 +68810,83 @@ begin
     AssertTrue('ForceOutputOnRAM must report the embedding readable',
       Embed.ForceOutputOnRAM());
     AssertTrue('embedding resident chain vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.DepthwiseConv1DResidentChainUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 4;
+  VocabSize = 11;
+  EmbSize = 6;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Conv, Act: TNNetLayer;
+  DW: TNNetDepthwiseConv1D;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Tokens: array[0..SeqLen-1] of integer = (3, 7, 10, 1);
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 1, 1));
+    NN.AddLayer(TNNetEmbedding.Create(VocabSize, EmbSize, {EncodeZero=}1, 0.5));
+    // Channels * SeqLen * K = 144, far under the layer's own 256*256 bar.
+    DW := TNNetDepthwiseConv1D.Create(4, {causal}true, {suppressBias}0);
+    Conv := NN.AddLayer(DW);
+    Act := NN.AddLayer(TNNetSiLU.Create());
+    NN.SetTrainable(False, False);
+    for i := 0 to DW.Neurons.Count - 1 do
+      DW.Neurons[i].BiasWeight := 0.1 * i - 0.25;
+    for i := 0 to SeqLen - 1 do Input.FData[i] := Tokens[i];
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    AssertFalse('the depthwise conv size verdict must leave it on the CPU',
+      Conv.ShouldOpenCL);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+
+    AssertTrue('the depthwise conv must expose an OpenCL buffer',
+      Assigned(Conv.OpenCLOutputBuffer()));
+    AssertTrue('the depthwise conv must expose the kernel owning that buffer',
+      Assigned(Conv.OpenCLOutputKernel()));
+    MaxDiff := 0;
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  DepthwiseConv1D resident chain: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards conv=', Conv.ForwardGPUCnt, ' act=', Act.ForwardGPUCnt);
+    AssertTrue('a source in OpenCL memory alone must put the conv there',
+      Conv.ForwardGPUCnt > 0);
+    AssertTrue('the activation must follow the convolved rows',
+      Act.ForwardGPUCnt > 0);
+    AssertTrue('ForceOutputOnRAM must report the conv readable',
+      Conv.ForceOutputOnRAM());
+    AssertTrue('depthwise conv resident chain vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
