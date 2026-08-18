@@ -2055,6 +2055,13 @@ type
     FNN: TNNet;
     FKernel: TNeuralKernel;
     FKernelName: string;
+    // Uploads a resident int8 weight table: NumRows*VS row-major codes into
+    // pCodeBuf and the NumRows per-row FP32 scales into pScaleBuf. Blocking -
+    // the caller's storage may go away on return. Coded by Claude (AI).
+    procedure UploadInt8Table(var pCodeBuf: cl_mem; var pCodeCap: csize_t;
+      var pScaleBuf: cl_mem; var pScaleCap: csize_t;
+      pCodes: TNeuralInt8ArrPtr; pScales: TNeuralFloatArrPtr;
+      NumRows, VS: integer);
   public
     constructor Create(NN: TNNet; const pKernelName: string);
     destructor Destroy(); override;
@@ -4900,10 +4907,12 @@ type
   end;
 
   /// OpenCL forward helper for the token-gather embedding layer (TNNetEmbedding).
-  // Binds the cai_embedding_gather entry point on the shared dot-product program's
-  // device, uploads the weight table (FNeurons[0].Weights) plus a host-resolved
-  // per-token source-row list and runs one work-item per (output token, depth)
-  // copying a single scalar out of the table, leaving the gathered output
+  // Binds cai_embedding_gather (FP32 vocab table) or cai_embedding_gather_int8
+  // (per-row int8 codes + scales) on the shared dot-product program's device -
+  // the entry point is chosen at construction from the layer's quantization
+  // state, as TNNetMoEExpertDownCL does. It uploads the vocab table plus a
+  // host-resolved per-token source-row list and runs one work-item per (output
+  // token, depth) producing a single scalar, leaving the gathered output
   // resident. The EncodeZero / zero-padding decision (row = -1 leaves that token
   // zero) stays on the host, faithful to the scalar Compute().
   // Coded by Claude (AI).
@@ -4914,21 +4923,31 @@ type
     // instead of being re-shipped every Gather (a 65MB/forward PCIe stall on a
     // 32k x 512 table). InvalidateWeightCache (driven by the layer's
     // AfterWeightUpdate hook) forces a re-upload after the weights change.
-    FWeightBuf: cl_mem;
+    // FBufScales is int8-only: the per-vocab-row dequantization scales.
+    FBufW, FBufScales: cl_mem;
+    FCapW, FCapScales: csize_t;
     FWeightCached: boolean;
+    // Entry point selector, fixed at Create: true binds cai_embedding_gather_int8
+    // and Gather reads QuantTable; false binds cai_embedding_gather and it reads W.
+    FInt8: boolean;
     // Persistent per-forward device buffers (grow-only): the token-row index
-    // array and the gathered result. (FWeightBuf above is the resident table.)
+    // array and the gathered result. (FBufW above is the resident table.)
     FBufRows, FBufY: cl_mem;
     FCapRows, FCapY: csize_t;
   public
-    constructor Create(NN: TNNet);
+    constructor Create(NN: TNNet; pInt8: boolean);
     destructor Destroy(); override;
-    // W is the weight table (VocabSize rows x EmbeddingSize, depth-contiguous).
-    // TokenRows[c] is the vocab row to copy into output token c, or -1 to leave
-    // that output token zero. Y only SIZES the device result buffer: the gathered
-    // NumTokens x EmbeddingSize rows are left in FBufY, unread.
-    procedure Gather(W: TNNetVolume; const TokenRows: array of integer;
-      Y: TNNetVolume; NumTokens, EmbeddingSize: integer);
+    // The vocab table arrives as W (FP32 helper) or QuantTable (int8 helper) -
+    // the other one is ignored; both are (VocabSize rows x EmbeddingSize,
+    // depth-contiguous). TokenRows[c] is the vocab row to copy into output token
+    // c, or -1 to leave that output token zero. Y only SIZES the device result
+    // buffer: the gathered NumTokens x EmbeddingSize rows are left in FBufY, unread.
+    procedure Gather(W: TNNetVolume; QuantTable: TNNetVolumeQuant8;
+      const TokenRows: array of integer; Y: TNNetVolume;
+      NumTokens, EmbeddingSize, VocabSize: integer);
+    // Which entry point this helper bound: the owning layer rebuilds it when its
+    // own quantization state no longer matches.
+    property Int8: boolean read FInt8;
     // FBufY and the queue that owns its contents - what a layer running Gather
     // answers OpenCLOutputBuffer/OpenCLOutputKernel with.
     function OutputBuffer(): cl_mem;
@@ -7526,6 +7545,9 @@ type
     FTokenRows: array of integer;
     FEmbeddingCL: TNNetEmbeddingCL;
     procedure ComputeOpenCL();
+    // Creates FEmbeddingCL, or rebuilds it when a quantize/dequantize flip left
+    // it bound to the wrong neural.cl entry point. No-op without FHasOpenCL.
+    procedure ArmEmbeddingCL();
     {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
@@ -36235,6 +36257,26 @@ begin
   inherited Destroy();
 end;
 
+procedure TNNetKernelCL.UploadInt8Table(var pCodeBuf: cl_mem;
+  var pCodeCap: csize_t; var pScaleBuf: cl_mem; var pScaleCap: csize_t;
+  pCodes: TNeuralInt8ArrPtr; pScales: TNeuralFloatArrPtr;
+  NumRows, VS: integer);
+var
+  NeededCodes, NeededScales: csize_t;
+  err: integer;
+begin
+  if (NumRows <= 0) or (VS <= 0) then exit;
+  NeededCodes := csize_t(NumRows) * csize_t(VS);   // one byte per code
+  NeededScales := csize_t(NumRows) * csNeuralFloatSize;
+  FKernel.EnsureBuffer(pCodeBuf, pCodeCap, CL_MEM_READ_WRITE, NeededCodes);
+  FKernel.EnsureBuffer(pScaleBuf, pScaleCap, CL_MEM_READ_WRITE, NeededScales);
+  err := FKernel.WriteBuffer(pCodeBuf, NeededCodes, pCodes, CL_TRUE);
+  err := err or FKernel.WriteBuffer(pScaleBuf, NeededScales, pScales, CL_TRUE);
+  if err <> CL_SUCCESS then
+    FErrorProc('TNNetKernelCL.UploadInt8Table: upload failed with ' +
+      IntToStr(err));
+end;
+
 { TNNetBilinearGatherCL }
 
 constructor TNNetBilinearGatherCL.Create(NN: TNNet);
@@ -36876,22 +36918,10 @@ end;
 
 procedure TNNetMoEExpertDownCL.ArmWeightsInt8(pCodes: TNeuralInt8ArrPtr;
   pScales: TNeuralFloatArrPtr; NumRows, VS: integer);
-var
-  NeededCodes, NeededScales: csize_t;
-  err: integer;
 begin
-  if (NumRows <= 0) or (VS <= 0) then exit;
-  NeededCodes := csize_t(NumRows) * csize_t(VS);   // one byte per code
-  NeededScales := csize_t(NumRows) * csNeuralFloatSize;
-  FKernel.EnsureBuffer(FBufW, FCapW, CL_MEM_READ_WRITE, NeededCodes);
-  FKernel.EnsureBuffer(FBufScales, FCapScales, CL_MEM_READ_WRITE, NeededScales);
-  // Blocking, one-time: the codes/scales are immutable (the bank is
-  // inference-only) and the caller's storage may go away on return.
-  err := FKernel.WriteBuffer(FBufW, NeededCodes, pCodes, CL_TRUE);
-  err := err or FKernel.WriteBuffer(FBufScales, NeededScales, pScales, CL_TRUE);
-  if err <> CL_SUCCESS then
-    FErrorProc('TNNetMoEExpertDownCL.ArmWeightsInt8: upload failed with ' +
-      IntToStr(err));
+  // One-time: the codes/scales are immutable - the bank is inference-only.
+  UploadInt8Table(FBufW, FCapW, FBufScales, FCapScales, pCodes, pScales,
+    NumRows, VS);
 end;
 
 procedure TNNetMoEExpertDownCL.ArmWeightsFP32(PackedW: TNNetVolume);
@@ -37082,28 +37112,34 @@ end;
 
 { TNNetEmbeddingCL }
 
-constructor TNNetEmbeddingCL.Create(NN: TNNet);
+constructor TNNetEmbeddingCL.Create(NN: TNNet; pInt8: boolean);
 begin
-  inherited Create(NN, 'cai_embedding_gather');
+  if pInt8
+    then inherited Create(NN, 'cai_embedding_gather_int8')
+    else inherited Create(NN, 'cai_embedding_gather');
+  FInt8 := pInt8;
   FWeightCached := false;
 end;
 
 destructor TNNetEmbeddingCL.Destroy();
 begin
-  if FWeightCached then clReleaseMemObject(FWeightBuf);
-  if Assigned(FBufRows) then clReleaseMemObject(FBufRows);
-  if Assigned(FBufY)    then clReleaseMemObject(FBufY);
+  if Assigned(FBufW)      then clReleaseMemObject(FBufW);
+  if Assigned(FBufScales) then clReleaseMemObject(FBufScales);
+  if Assigned(FBufRows)   then clReleaseMemObject(FBufRows);
+  if Assigned(FBufY)      then clReleaseMemObject(FBufY);
   inherited Destroy();
 end;
 
 procedure TNNetEmbeddingCL.InvalidateWeightCache();
 begin
-  if FWeightCached then clReleaseMemObject(FWeightBuf);
+  // The buffers stay allocated (grow-only, like every other FBuf* here): only
+  // the "its contents are current" claim is dropped.
   FWeightCached := false;
 end;
 
-procedure TNNetEmbeddingCL.Gather(W: TNNetVolume; const TokenRows: array of integer;
-  Y: TNNetVolume; NumTokens, EmbeddingSize: integer);
+procedure TNNetEmbeddingCL.Gather(W: TNNetVolume; QuantTable: TNNetVolumeQuant8;
+  const TokenRows: array of integer; Y: TNNetVolume;
+  NumTokens, EmbeddingSize, VocabSize: integer);
 var
   bufRows, bufY: cl_mem;
   k: cl_kernel;
@@ -37114,7 +37150,10 @@ begin
   // tiny per-token row list and the output volume move each call.
   if not FWeightCached then
   begin
-    FWeightBuf := FKernel.CreateAndWriteBuffer(W);
+    if FInt8
+      then UploadInt8Table(FBufW, FCapW, FBufScales, FCapScales,
+             QuantTable.DataPtr, QuantTable.ScalePtr, VocabSize, EmbeddingSize)
+      else FKernel.EnsureWriteBuffer(FBufW, FCapW, W, {DoWrite}true);
     FWeightCached := true;
   end;
   // Upload the host-resolved per-token source rows; allocate the device result.
@@ -37127,8 +37166,10 @@ begin
   clSetKernelArg(k, 0, csLongintSize, @NumTokens);
   clSetKernelArg(k, 1, csLongintSize, @EmbeddingSize);
   clSetKernelArg(k, 2, csCLMemSize, @bufRows);
-  clSetKernelArg(k, 3, csCLMemSize, @FWeightBuf);
+  clSetKernelArg(k, 3, csCLMemSize, @FBufW);
   clSetKernelArg(k, 4, csCLMemSize, @bufY);
+  // The int8 entry point takes the per-row scales after the shared prefix.
+  if FInt8 then clSetKernelArg(k, 5, csCLMemSize, @FBufScales);
   // One work-item per (output token, depth) pair. No Finish and no read back:
   // the result waits in FBufY until the layer's reader calls ForceOutputOnRAM or
   // a consumer orders itself with OpenCLWaitOutputIfAnotherQueue. Buffers are
@@ -104447,8 +104488,20 @@ end;
 procedure TNNetEmbedding.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
+  ArmEmbeddingCL();
+end;
+
+procedure TNNetEmbedding.ArmEmbeddingCL();
+begin
+  if not FHasOpenCL then exit;
+  if Assigned(FEmbeddingCL) and (FEmbeddingCL.Int8 <> FQuantInt8) then
+  begin
+    // FEmbeddingCL owns the buffer the output may still be sitting in.
+    ForceOutputOnRAM();
+    FreeAndNil(FEmbeddingCL);
+  end;
   if not Assigned(FEmbeddingCL) then
-    FEmbeddingCL := TNNetEmbeddingCL.Create(FNN);
+    FEmbeddingCL := TNNetEmbeddingCL.Create(FNN, FQuantInt8);
 end;
 
 // Three routes in, and two blocks. FShouldOpenCL is pinned False here (the
@@ -104456,13 +104509,14 @@ end;
 // route the inference stack takes is the last one: an inference-only layer
 // whose source is already in OpenCL memory is the case where the result stays
 // there and the download that pin measured is never paid.
-// Int8-quantized: the device gather reads the FP32 table in FNeurons[0].Weights,
-// which quantization freed - stay on the CPU dequantizing gather. And exactly
-// TNNetEmbedding: the positional subclass keeps the scalar path.
+// The helper must be bound to the entry point this layer's quantization state
+// needs (ArmEmbeddingCL keeps them in step; a mismatch would gather from the
+// wrong table). And exactly TNNetEmbedding: the positional subclass keeps the
+// scalar path.
 function TNNetEmbedding.WillOpenCL(): boolean;
 begin
   Result := Assigned(FEmbeddingCL) and FHasOpenCL and (Self.ClassType = TNNetEmbedding)
-            and (not FQuantInt8)
+            and (FEmbeddingCL.Int8 = FQuantInt8)
             and (FShouldOpenCL or FForceOpenCL
                  or ((not FIsTrainable) and PrevOutputOnOpenCL()));
 end;
@@ -104485,6 +104539,9 @@ end;
 procedure TNNetEmbedding.AfterWeightUpdate();
 begin
   inherited AfterWeightUpdate();
+  // QuantizeWeightsInt8 / DequantizeWeightsInt8 report through here too, and
+  // they change which entry point the gather needs.
+  ArmEmbeddingCL();
   if Assigned(FEmbeddingCL) then FEmbeddingCL.InvalidateWeightCache();
 end;
 
@@ -104516,8 +104573,8 @@ begin
     else
       FTokenRows[CntToken] := -1; // zero-padding: leave this output token zero
   end;
-  FEmbeddingCL.Gather(FNeurons[0].Weights, FTokenRows, FOutput,
-    FPrevLayer.Output.Size, FEmbeddingSize);
+  FEmbeddingCL.Gather(FNeurons[0].Weights, FQuantTable, FTokenRows, FOutput,
+    FPrevLayer.Output.Size, FEmbeddingSize, FVocabSize);
   // The gathered rows wait on the device: the first block's projections bind
   // them, and a host reader pays one download through ForceOutputOnRAM.
   FOutputOnOpenCL := true;

@@ -535,6 +535,9 @@ type
     procedure AvgPoolOpenCLParity;
     // OpenCL token-gather forward offload parity (vs CPU) for TNNetEmbedding.
     procedure EmbeddingOpenCLParity;
+    // Same, with the vocab table quantized: cai_embedding_gather_int8 must
+    // reproduce the host dequantizing gather from the same codes and scales.
+    procedure EmbeddingInt8OpenCLParity;
     // OpenCL contiguous-group softmax forward offload parity (vs CPU) for the
     // softmax head layers TNNetPointwiseSoftMax (per-token, GroupLen=Depth) and
     // TNNetSoftMax (whole-volume, GroupLen=Size).
@@ -69544,6 +69547,84 @@ begin
     end;
     WriteLn('  Embedding OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('Embedding OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Int8 device token-gather parity. The layer is quantized BEFORE the CPU
+// reference forward, so both sides read the same FQuantTable codes and per-row
+// scales: the host DequantizeRowTo and cai_embedding_gather_int8 must agree.
+// The forward counter is asserted too - a helper left on the FP32 entry point
+// would fall back to the CPU and still pass parity. Coded by Claude (AI).
+procedure TTestNeuralNumerical.EmbeddingInt8OpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 6;
+  VocabSize = 11;
+  EmbSize = 16;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Embed: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Tokens: array[0..SeqLen-1] of integer = (3, 0, 7, 1, 0, 10);
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 1, 1));
+    // EncodeZero=0 keeps a zero-padding token in the batch: the kernel's
+    // row = -1 branch must zero that output row on the int8 path too.
+    Embed := NN.AddLayer(TNNetEmbedding.Create(VocabSize, EmbSize,
+      {EncodeZero=}0, 0.5));
+    NN.SetTrainable(False, False);
+    NN.QuantizeWeightsInt8();
+    AssertTrue('the embedding must be int8 quantized',
+      TNNetEmbedding(Embed).WeightsQuantizedInt8);
+    for i := 0 to SeqLen - 1 do Input.FData[i] := Tokens[i];
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      // Inference-only, so the gather leaves its result on the device.
+      AssertTrue('ForceOutputOnRAM must report the embedding readable',
+        Embed.ForceOutputOnRAM());
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      MaxDiff := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    WriteLn('  Embedding int8 OpenCL parity: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards embed=', Embed.ForwardGPUCnt);
+    AssertTrue('the int8 gather must run on the device',
+      Embed.ForwardGPUCnt > 0);
+    AssertTrue('Embedding int8 OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;

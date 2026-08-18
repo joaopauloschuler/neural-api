@@ -1306,6 +1306,35 @@ __kernel void cai_embedding_gather
     FY[gid] = FW[row * FEmbeddingSize + e];
 }
 
+// Int8 twin of cai_embedding_gather (TNNetEmbedding under --int8). FCodes holds
+// the same row-major table as FW above with one symmetric int8 code per element,
+// and FScales one FP32 scale per vocab row: the dequantized value of element e of
+// row t is FCodes[t*FEmbeddingSize + e] * FScales[t], exactly what the host
+// TNNetVolumeQuant8.DequantizeRowTo computes. Argument order keeps the FP32
+// prefix (FScales last, as cai_moe_expert_down_int8 does) so one host call site
+// serves both entry points. Coded by Claude (AI).
+__kernel void cai_embedding_gather_int8
+(
+  const int FNumTokens,
+  const int FEmbeddingSize,
+  __global const int* FTokenRows,
+  __global const char* FCodes,
+  __global float* FY,
+  __global const float* FScales
+)
+{
+  const int gid = get_global_id(0);
+  const int total = FNumTokens * FEmbeddingSize;
+  if (gid >= total) return;
+  const int e = gid % FEmbeddingSize;
+  const int c = gid / FEmbeddingSize;
+  const int row = FTokenRows[c];
+  if (row < 0)
+    FY[gid] = 0.0f;
+  else
+    FY[gid] = convert_float(FCodes[row * FEmbeddingSize + e]) * FScales[row];
+}
+
 // Device-side im2col: builds the convolution's FInputPrepared column matrix
 // straight into device memory, so only the small (padded) input crosses the bus
 // instead of the ~FeatureSizeX*FeatureSizeY-times-larger column matrix, and the
