@@ -506,6 +506,7 @@ type
     // concat runs there only when every source stayed resident.
     procedure RoPEResidentHeadChainUnforcedOpenCLParity;
     procedure InputResidentSourceUnforcedOpenCLParity;
+    procedure SoftMaxResidentChainUnforcedOpenCLParity;
     // OpenCL gated FFN forward offload parity (vs CPU) for the GLU-family
     // activations TNNetGLU / TNNetSwiGLU / TNNetGEGLU / TNNetGEGLUErf.
     procedure GLUFamilyOpenCLParity;
@@ -68491,6 +68492,94 @@ end;
 // already there. TNNetDeepConcat runs on the device only when EVERY source is
 // bindable, so a RoPE layer that downloaded would pull the whole head back to
 // the host. Coded by Claude (AI).
+procedure TTestNeuralNumerical.SoftMaxResidentChainUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  InputLayer, Proj: TNNetLayer;
+  SoftMaxLayer: TNNetPointwiseSoftMax;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, ProjSentinelsLeft: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = -7777;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 100);
+  OutCPU := TNNetVolume.Create();
+  try
+    // The same resident chain the input layer test builds, with a per-token
+    // softmax on the end. Both consumers have a False size verdict at this size
+    // (the softmax needs 1280*512 elements), so only a resident source can put
+    // either of them on the device - no ForceOpenCL anywhere in this test.
+    InputLayer := NN.AddLayer(TNNetInput.Create(3, 1, 100));
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    SoftMaxLayer := TNNetPointwiseSoftMax.Create();
+    NN.AddLayer(SoftMaxLayer);
+    NN.SetTrainable(False, False);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.6 * Sin(i * 0.29) - 0.15;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    AssertFalse('the softmax size verdict must leave it on the CPU',
+      SoftMaxLayer.ShouldOpenCL);
+    AssertEquals('the softmax ran on the CPU before EnableOpenCL', 0,
+      SoftMaxLayer.ForwardGPUCnt);
+
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    AssertTrue('the softmax must expose a device buffer',
+      Assigned(SoftMaxLayer.OpenCLOutputBuffer()));
+    AssertTrue('the softmax must expose the kernel owning that buffer',
+      Assigned(SoftMaxLayer.OpenCLOutputKernel()));
+    // Parity cannot tell a bind from a download, so the sentinel below is what
+    // proves the softmax read its source in device memory: a second device
+    // forward must leave the projection's host copy untouched.
+    Proj.Output.Fill(csSentinel);
+    NN.Compute(Input);
+    ProjSentinelsLeft := 0;
+    for i := 0 to Proj.Output.Size - 1 do
+      if Proj.Output.Raw[i] = csSentinel then Inc(ProjSentinelsLeft);
+
+    MaxDiff := 0;
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  SoftMax resident chain: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards softmax=', SoftMaxLayer.ForwardGPUCnt,
+      ' source sentinels=', ProjSentinelsLeft, '/', Proj.Output.Size);
+    // Without this a silent fall back to the CPU would compare the reference
+    // against itself and pass while covering nothing.
+    AssertTrue('a resident source alone must put the softmax on the device',
+      SoftMaxLayer.ForwardGPUCnt > 0);
+    AssertFalse('the softmax size verdict must stay False',
+      SoftMaxLayer.ShouldOpenCL);
+    AssertEquals('the source must be read in device memory, not downloaded',
+      Proj.Output.Size, ProjSentinelsLeft);
+    AssertTrue('softmax resident chain vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
 procedure TTestNeuralNumerical.InputResidentSourceUnforcedOpenCLParity;
 {$IFDEF OpenCL}
 var

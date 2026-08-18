@@ -4946,15 +4946,28 @@ type
     // Persistent device buffers (grow-only), reused every forward.
     FBufX, FBufY: cl_mem;
     FCapX, FCapY: csize_t;
+    // The kernel of the last call, so a layer that leaves its result in FBufY
+    // can name the queue that produced it. Nil before the first forward, which
+    // is what tells a consumer there is nothing to bind yet.
+    FOutputKernel: TNeuralKernel;
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
+    // The buffer the last call wrote Y into, and the kernel that wrote it. Read
+    // per forward: EnsureOutputBuffer replaces the handle when Y grows.
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
     // X is the activation volume; Y receives the softmaxed result (may alias X).
     // The volume is tiled into NumGroups contiguous groups of GroupLen elements
     // (NumGroups * GroupLen = X.Size). ApplyMinScale = true reproduces the
     // whole-volume TVolume.SoftMax low-end (-1000/min) rescale + all-equal no-op.
+    // pExternalSrc BORROWS an already-resident input in place of uploading X,
+    // which is then read for its size only; the borrowed buffer is never
+    // released here. pKeepResultOnOpenCL leaves the result in ResultBuffer for
+    // the next layer instead of reading it back into Y.
     procedure SoftMax(X: TNNetVolume; Y: TNNetVolume;
-      NumGroups, GroupLen: integer; ApplyMinScale: boolean);
+      NumGroups, GroupLen: integer; ApplyMinScale: boolean;
+      pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
   end;
 
   // OpenCL forward helper for the fused MoE down projection
@@ -13467,6 +13480,14 @@ type
     FSoftMaxCL: TNNetSoftMaxCL;
     {$ENDIF}
     procedure PrepareNoForwardMask();
+    {$IFDEF OpenCL}
+    // True when the source left its output in OpenCL memory and this layer may
+    // read it there instead of downloading and re-uploading it.
+    function ShouldBindPrevOutputOnOpenCL(): boolean;
+    // Runs the per-token cai_softmax over the source, binding it when it is
+    // already resident. The caller checks WillOpenCL() and bumps FForwardGPUCnt.
+    procedure ComputeOpenCL();
+    {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     // Shared exact softmax-Jacobian backward, accumulated into the previous
     // layer's OutputError. The softmax is normalized over contiguous groups of
@@ -13488,6 +13509,8 @@ type
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
     {$ENDIF}
   end;
 
@@ -22192,24 +22215,23 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  inherited Compute;
   {$IFDEF OpenCL}
-  // Device per-token softmax forward: each (X,Y) position owns a contiguous
-  // group of Depth elements (the depth axis is depth-contiguous), so the volume
-  // tiles into FOutput.Size/Depth groups of GroupLen = Depth. Only the plain
-  // forward (NoForward = false, Depth > 1) is offloaded; the NoForward causal
-  // mask stays on the scalar path. Forward-only; training stays on CPU.
+  // The device branch runs BEFORE the inherited copy, because that copy opens
+  // with a ForceOutputOnRAM - the download ComputeOpenCL exists to avoid.
   if WillOpenCL() then
   begin
     Inc(FForwardGPUCnt);
-    FSoftMaxCL.SoftMax(FOutput, FOutput,
-      {NumGroups=}FOutput.Size div FOutput.Depth, {GroupLen=}FOutput.Depth,
-      {ApplyMinScale=}false);
+    ComputeOpenCL();
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
   end
   else Inc(FForwardCPUCnt);
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read whatever a previous device forward left in the helper's buffer.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   {$ENDIF}
+  inherited Compute;
   FOutput.PointwiseSoftMax(FNoForward);
   (*
   if (FNoForward and (Random(1000)=0)) then
@@ -22237,11 +22259,73 @@ end;
 function TNNetPointwiseSoftMax.WillOpenCL(): boolean;
 begin
   Result := Assigned(FSoftMaxCL) and FHasOpenCL and (not FNoForward)
-            and (FOutput.Depth > 1) and (FShouldOpenCL or FForceOpenCL);
+            and (FOutput.Depth > 1)
+            and (FShouldOpenCL or FForceOpenCL
+                 or ShouldBindPrevOutputOnOpenCL());
+end;
+
+// cai_softmax reads its input as a flat span tiled into groups, the order every
+// TNNetVolume and every producer's buffer already carries, so a resident source
+// binds straight in: no gather, no repacking. Inference only - the backward pass
+// reads FOutput on the host, and a trainable layer must keep it there.
+function TNNetPointwiseSoftMax.ShouldBindPrevOutputOnOpenCL(): boolean;
+begin
+  Result := (not FIsTrainable) and PrevOutputOnOpenCL() and
+    (FPrevLayer.FOutput.Size = FOutput.Size);
+end;
+
+// Device per-token softmax forward: each (X,Y) position owns a contiguous group
+// of Depth elements (the depth axis is depth-contiguous), so the volume tiles
+// into FOutput.Size/Depth groups of GroupLen = Depth. Only the plain forward
+// (NoForward = false, Depth > 1) is offloaded; the NoForward causal mask stays
+// on the scalar path.
+procedure TNNetPointwiseSoftMax.ComputeOpenCL();
+var
+  SourceBuffer: cl_mem;
+  KeepResultOnOpenCL: boolean;
+begin
+  if ShouldBindPrevOutputOnOpenCL() then
+  begin
+    // Read the source where it lies. The result goes to the helper's own output
+    // buffer, so input and output are distinct handles and never alias.
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FSoftMaxCL.OutputKernel());
+  end
+  else
+  begin
+    // Nothing to bind: bring the source back and stage it in FOutput, which is
+    // what the inherited Compute would have done and what the upload reads.
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+    FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  end;
+  // A trainable layer reads FOutput on the host in Backpropagate, so only an
+  // inference-only forward may leave the result in device memory.
+  KeepResultOnOpenCL := not FIsTrainable;
+  FSoftMaxCL.SoftMax(FOutput, FOutput,
+    {NumGroups=}FOutput.Size div FOutput.Depth, {GroupLen=}FOutput.Depth,
+    {ApplyMinScale=}false, SourceBuffer, KeepResultOnOpenCL);
+  FOutputOnOpenCL := KeepResultOnOpenCL;
+  FOutputOnRAM := not KeepResultOnOpenCL;
+end;
+
+function TNNetPointwiseSoftMax.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FSoftMaxCL) then Result := FSoftMaxCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetPointwiseSoftMax.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FSoftMaxCL) then Result := FSoftMaxCL.OutputKernel()
+  else Result := nil;
 end;
 
 procedure TNNetPointwiseSoftMax.DisableOpenCL();
 begin
+  // FSoftMaxCL owns the buffer a resident output lives in, so the host copy has
+  // to be recovered before the helper goes.
+  ForceOutputOnRAM();
   inherited DisableOpenCL();
   FreeAndNil(FSoftMaxCL);
 end;
@@ -36715,8 +36799,19 @@ begin
   inherited Destroy();
 end;
 
+function TNNetSoftMaxCL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufY;
+end;
+
+function TNNetSoftMaxCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FOutputKernel;
+end;
+
 procedure TNNetSoftMaxCL.SoftMax(X: TNNetVolume; Y: TNNetVolume;
-  NumGroups, GroupLen: integer; ApplyMinScale: boolean);
+  NumGroups, GroupLen: integer; ApplyMinScale: boolean;
+  pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
 var
   bufX, bufY: cl_mem;
   k: cl_kernel;
@@ -36725,7 +36820,9 @@ begin
   k := FKernel.Kernel;
   if ApplyMinScale then iApplyMinScale := 1 else iApplyMinScale := 0;
   // Upload the activation volume; allocate the device result.
-  bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+  if pExternalSrc <> nil
+    then bufX := pExternalSrc
+    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
   bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
   clSetKernelArg(k, 0, csLongintSize, @NumGroups);
   clSetKernelArg(k, 1, csLongintSize, @GroupLen);
@@ -36734,8 +36831,14 @@ begin
   clSetKernelArg(k, 4, csCLMemSize, @bufY);
   // One work-item per normalization group.
   FKernel.RunKernel(k, NumGroups);
-  FKernel.Finish();
-  FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  FOutputKernel := FKernel;
+  // Keeping the result means no read back: it waits in FBufY until a consumer
+  // binds it or a host reader calls ForceOutputOnRAM.
+  if not pKeepResultOnOpenCL then
+  begin
+    FKernel.Finish();
+    FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  end;
   // Buffers are persistent (FBuf*), reused next forward - not released here.
 end;
 
