@@ -507,6 +507,11 @@ type
     procedure RoPEResidentHeadChainUnforcedOpenCLParity;
     procedure InputResidentSourceUnforcedOpenCLParity;
     procedure SoftMaxResidentChainUnforcedOpenCLParity;
+    // TNNetInput -> TNNetEmbedding -> TNNetPointwiseConvLinear with ForceOpenCL
+    // off: the embedding's own size verdict is pinned False, so only a resident
+    // source can put it on the device - and the projection follows only when the
+    // gathered rows stayed there.
+    procedure EmbeddingResidentChainUnforcedOpenCLParity;
     // OpenCL gated FFN forward offload parity (vs CPU) for the GLU-family
     // activations TNNetGLU / TNNetSwiGLU / TNNetGEGLU / TNNetGEGLUErf.
     procedure GLUFamilyOpenCLParity;
@@ -68644,6 +68649,85 @@ begin
     AssertTrue('ForceOutputOnRAM must report the input readable',
       InputLayer.ForceOutputOnRAM());
     AssertTrue('input resident source vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.EmbeddingResidentChainUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 3;
+  VocabSize = 11;
+  EmbSize = 100;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Embed, Proj: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Tokens: array[0..SeqLen-1] of integer = (3, 7, 10);
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 1, 1));
+    Embed := NN.AddLayer(TNNetEmbedding.Create(VocabSize, EmbSize,
+      {EncodeZero=}1, 0.5));
+    // EmbSize 100 puts the projection's FVectorSize over csMaxInterleavedSize
+    // and FOutput.Size * FVectorSize = 1800 under the second threshold, so its
+    // size verdict is False too: it reaches the device only behind a resident
+    // embedding output.
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    NN.SetTrainable(False, False);
+    for i := 0 to SeqLen - 1 do Input.FData[i] := Tokens[i];
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    AssertFalse('the embedding size verdict must leave it on the CPU',
+      Embed.ShouldOpenCL);
+    AssertFalse('the projection size verdict must leave it on the CPU',
+      Proj.ShouldOpenCL);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+
+    AssertTrue('the embedding must expose a device buffer',
+      Assigned(Embed.OpenCLOutputBuffer()));
+    AssertTrue('the embedding must expose the kernel owning that buffer',
+      Assigned(Embed.OpenCLOutputKernel()));
+    MaxDiff := 0;
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  Embedding resident chain: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards embed=', Embed.ForwardGPUCnt,
+      ' proj=', Proj.ForwardGPUCnt);
+    AssertTrue('a resident input alone must put the embedding on the device',
+      Embed.ForwardGPUCnt > 0);
+    AssertTrue('the projection must follow the resident embedding output',
+      Proj.ForwardGPUCnt > 0);
+    AssertTrue('ForceOutputOnRAM must report the embedding readable',
+      Embed.ForceOutputOnRAM());
+    AssertTrue('embedding resident chain vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;

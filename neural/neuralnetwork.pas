@@ -4902,10 +4902,10 @@ type
   /// OpenCL forward helper for the token-gather embedding layer (TNNetEmbedding).
   // Binds the cai_embedding_gather entry point on the shared dot-product program's
   // device, uploads the weight table (FNeurons[0].Weights) plus a host-resolved
-  // per-token source-row list, runs one work-item per (output token, depth) copying
-  // a single scalar out of the table, and reads the gathered output back. The
-  // EncodeZero / zero-padding decision (row = -1 leaves that token zero) stays on
-  // the host, faithful to the scalar Compute(). Forward-only (backward on CPU).
+  // per-token source-row list and runs one work-item per (output token, depth)
+  // copying a single scalar out of the table, leaving the gathered output
+  // resident. The EncodeZero / zero-padding decision (row = -1 leaves that token
+  // zero) stays on the host, faithful to the scalar Compute().
   // Coded by Claude (AI).
   TNNetEmbeddingCL = class(TNNetKernelCL)
   private
@@ -4925,10 +4925,14 @@ type
     destructor Destroy(); override;
     // W is the weight table (VocabSize rows x EmbeddingSize, depth-contiguous).
     // TokenRows[c] is the vocab row to copy into output token c, or -1 to leave
-    // that output token zero. Y receives the gathered NumTokens x EmbeddingSize
-    // result. NumTokens = Length(TokenRows).
+    // that output token zero. Y only SIZES the device result buffer: the gathered
+    // NumTokens x EmbeddingSize rows are left in FBufY, unread.
     procedure Gather(W: TNNetVolume; const TokenRows: array of integer;
       Y: TNNetVolume; NumTokens, EmbeddingSize: integer);
+    // FBufY and the queue that owns its contents - what a layer running Gather
+    // answers OpenCLOutputBuffer/OpenCLOutputKernel with.
+    function OutputBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
     // Drop the resident weight buffer so the next Gather re-uploads the table.
     // Called whenever the layer's weights change (training step / importer load).
     procedure InvalidateWeightCache();
@@ -7545,6 +7549,8 @@ type
     procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
     procedure AfterWeightUpdate(); override;
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
     {$ENDIF}
 
     procedure InitDefault(); override;
@@ -37123,11 +37129,21 @@ begin
   clSetKernelArg(k, 2, csCLMemSize, @bufRows);
   clSetKernelArg(k, 3, csCLMemSize, @FWeightBuf);
   clSetKernelArg(k, 4, csCLMemSize, @bufY);
-  // One work-item per (output token, depth) pair.
+  // One work-item per (output token, depth) pair. No Finish and no read back:
+  // the result waits in FBufY until the layer's reader calls ForceOutputOnRAM or
+  // a consumer orders itself with OpenCLWaitOutputIfAnotherQueue. Buffers are
+  // persistent (FBuf*), reused next forward - not released here.
   FKernel.RunKernel(k, NumTokens * EmbeddingSize);
-  FKernel.Finish();
-  FKernel.ReadBuffer(bufY, Y, CL_TRUE);
-  // Buffers are persistent (FBuf*), reused next forward - not released here.
+end;
+
+function TNNetEmbeddingCL.OutputBuffer(): cl_mem;
+begin
+  Result := FBufY;
+end;
+
+function TNNetEmbeddingCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
 end;
 
 { TNNetGLUGateCL }
@@ -104421,6 +104437,9 @@ end;
 {$IFDEF OpenCL}
 procedure TNNetEmbedding.DisableOpenCL();
 begin
+  // FEmbeddingCL owns the buffer the output may still be sitting in, so bring it
+  // back to RAM while that handle is alive.
+  ForceOutputOnRAM();
   inherited DisableOpenCL();
   FreeAndNil(FEmbeddingCL);
 end;
@@ -104432,13 +104451,32 @@ begin
     FEmbeddingCL := TNNetEmbeddingCL.Create(FNN);
 end;
 
+// Three routes in, and two blocks. FShouldOpenCL is pinned False here (the
+// gather loses to the CPU whenever it has to move its result back), so the
+// route the inference stack takes is the last one: an inference-only layer
+// whose source is already in OpenCL memory is the case where the result stays
+// there and the download that pin measured is never paid.
+// Int8-quantized: the device gather reads the FP32 table in FNeurons[0].Weights,
+// which quantization freed - stay on the CPU dequantizing gather. And exactly
+// TNNetEmbedding: the positional subclass keeps the scalar path.
 function TNNetEmbedding.WillOpenCL(): boolean;
 begin
-  // Int8-quantized: the device gather reads the FP32 table in
-  // FNeurons[0].Weights, which quantization freed - stay on the CPU
-  // dequantizing gather.
   Result := Assigned(FEmbeddingCL) and FHasOpenCL and (Self.ClassType = TNNetEmbedding)
-            and (FShouldOpenCL or FForceOpenCL) and (not FQuantInt8);
+            and (not FQuantInt8)
+            and (FShouldOpenCL or FForceOpenCL
+                 or ((not FIsTrainable) and PrevOutputOnOpenCL()));
+end;
+
+function TNNetEmbedding.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FEmbeddingCL) then Result := FEmbeddingCL.OutputBuffer()
+  else Result := nil;
+end;
+
+function TNNetEmbedding.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FEmbeddingCL) then Result := FEmbeddingCL.OutputKernel()
+  else Result := nil;
 end;
 
 // The device gather keeps the vocab table resident across forwards; whenever
@@ -104458,6 +104496,8 @@ procedure TNNetEmbedding.ComputeOpenCL();
 var
   MaxToken, CntToken, CurrentToken: integer;
 begin
+  // The token ids are read here on the host, so the source comes back to RAM
+  // even when it is also resident (TNNetInput offers both).
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxToken := FPrevLayer.Output.Size - 1;
   for CntToken := 0 to MaxToken do
@@ -104478,6 +104518,13 @@ begin
   end;
   FEmbeddingCL.Gather(FNeurons[0].Weights, FTokenRows, FOutput,
     FPrevLayer.Output.Size, FEmbeddingSize);
+  // The gathered rows wait on the device: the first block's projections bind
+  // them, and a host reader pays one download through ForceOutputOnRAM.
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+  // Forward-only residency: a trainable net's backward pass has readers of the
+  // previous layer's Output that never move it back, so settle the host copy now.
+  if FIsTrainable then ForceOutputOnRAM();
 end;
 {$ENDIF}
 
@@ -104608,18 +104655,22 @@ begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
-  // Device token-gather forward keeps the embedding output resident on the GPU
-  // going into the first attention block (forward-only; backward stays on CPU).
-  // Restricted to exactly TNNetEmbedding: the positional subclass keeps the
-  // scalar path. Gated on output size like the other offloaded layers.
+  // Device token-gather forward: it leaves the gathered rows in OpenCL memory
+  // for the first block's projections, and moves them back only when the layer
+  // is trainable. Restricted to exactly TNNetEmbedding: the positional subclass
+  // keeps the scalar path.
   if WillOpenCL() then
   begin
     Inc(FForwardGPUCnt);
     ComputeOpenCL();
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
-  end
-  else Inc(FForwardCPUCnt);
+  end;
+  Inc(FForwardCPUCnt);
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read the buffer a previous device forward left resident.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   {$ENDIF}
   PrevOut := FPrevLayer.Output;   // #8: invariant across the token loops
   MaxToken := PrevOut.Size - 1;
