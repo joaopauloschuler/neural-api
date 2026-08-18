@@ -498,6 +498,11 @@ type
     // layer below the size verdict must still follow a resident source onto the
     // device.
     procedure FullConnectWillOpenCLMatchesForward;
+    // The per-head attention chain TNNetSplitChannels -> TNNetRotaryEmbedding
+    // -> TNNetDeepConcat with ForceOpenCL off: RoPE is below its own size
+    // verdict, so only a resident source can put it on the device - and the
+    // concat runs there only when every source stayed resident.
+    procedure RoPEResidentHeadChainUnforcedOpenCLParity;
     // OpenCL gated FFN forward offload parity (vs CPU) for the GLU-family
     // activations TNNetGLU / TNNetSwiGLU / TNNetGEGLU / TNNetGEGLUErf.
     procedure GLUFamilyOpenCLParity;
@@ -68285,6 +68290,120 @@ begin
     AssertEquals('ForceOutputOnRAM must still recover the RMSNorm output',
       0, NormSentinelsLeft);
   finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetRotaryEmbedding.FShouldOpenCL is False below 256*128 output elements, so
+// with ForceOpenCL off the only route onto the device is a source that is
+// already there. TNNetDeepConcat runs on the device only when EVERY source is
+// bindable, so a RoPE layer that downloaded would pull the whole head back to
+// the host. Coded by Claude (AI).
+procedure TTestNeuralNumerical.RoPEResidentHeadChainUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Proj, QSlice, KSlice, VSlice, QRope, KRope, Concat: TNNetLayer;
+  QChannels, KChannels, VChannels: array of integer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, QSliceSentinelsLeft, QRopeSentinelsLeft: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = 999;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 24);
+  OutCPU := TNNetVolume.Create();
+  SetLength(QChannels, 8);
+  SetLength(KChannels, 8);
+  SetLength(VChannels, 8);
+  try
+    for i := 0 to 7 do
+    begin
+      QChannels[i] := i;
+      KChannels[i] := 8 + i;
+      VChannels[i] := 16 + i;
+    end;
+    // The shape AddMultiHeadSelfAttention builds per head: one projection, the
+    // three channel slices, RoPE on Q and K, then the concat that packs them.
+    NN.AddLayer(TNNetInput.Create(6, 1, 24, 1));
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(24));
+    QSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), Proj);
+    QRope := NN.AddLayerAfter(TNNetRotaryEmbedding.Create(), QSlice);
+    KSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(KChannels), Proj);
+    KRope := NN.AddLayerAfter(TNNetRotaryEmbedding.Create(), KSlice);
+    VSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(VChannels), Proj);
+    Concat := NN.AddLayer(TNNetDeepConcat.Create([QRope, KRope, VSlice]));
+    // The whole chain is inference-only: every device path here is forward-only
+    // and leaves a resident output no backward reader recovers.
+    NN.SetTrainable(False, False);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.6 * Sin(i * 0.29) - 0.15;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    AssertFalse('the RoPE size verdict must leave it on the CPU',
+      QRope.ShouldOpenCL);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    // Only a download into these two layers clears the sentinels.
+    QSlice.Output.Fill(csSentinel);
+    QRope.Output.Fill(csSentinel);
+    NN.Compute(Input);
+    QSliceSentinelsLeft := 0;
+    for i := 0 to QSlice.Output.Size - 1 do
+      if QSlice.Output.Raw[i] = csSentinel then Inc(QSliceSentinelsLeft);
+    QRopeSentinelsLeft := 0;
+    for i := 0 to QRope.Output.Size - 1 do
+      if QRope.Output.Raw[i] = csSentinel then Inc(QRopeSentinelsLeft);
+    MaxDiff := 0;
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  RoPE unforced resident head chain: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards qrope=', QRope.ForwardGPUCnt,
+      ' krope=', KRope.ForwardGPUCnt,
+      ' concat=', Concat.ForwardGPUCnt,
+      ' sentinels kept qslice=', QSliceSentinelsLeft, '/', QSlice.Output.Size,
+      ' qrope=', QRopeSentinelsLeft, '/', QRope.Output.Size);
+    AssertTrue('a resident source alone must put the Q RoPE layer on the device',
+      QRope.ForwardGPUCnt > 0);
+    AssertTrue('a resident source alone must put the K RoPE layer on the device',
+      KRope.ForwardGPUCnt > 0);
+    AssertTrue('the consuming concat must reach the device',
+      Concat.ForwardGPUCnt > 0);
+    AssertEquals('RoPE must bind its source slice, not download it',
+      QSlice.Output.Size, QSliceSentinelsLeft);
+    AssertEquals('the concat must bind the RoPE output, not download it',
+      QRope.Output.Size, QRopeSentinelsLeft);
+    AssertTrue('RoPE unforced resident head chain vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    // The host copy is still one ForceOutputOnRAM away.
+    QRope.ForceOutputOnRAM();
+    QRopeSentinelsLeft := 0;
+    for i := 0 to QRope.Output.Size - 1 do
+      if QRope.Output.Raw[i] = csSentinel then Inc(QRopeSentinelsLeft);
+    AssertEquals('ForceOutputOnRAM must still recover the RoPE output',
+      0, QRopeSentinelsLeft);
+  finally
+    SetLength(QChannels, 0); SetLength(KChannels, 0); SetLength(VChannels, 0);
     OutCPU.Free; Input.Free; NN.Free;
   end;
 end;

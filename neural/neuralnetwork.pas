@@ -4819,17 +4819,30 @@ type
     // Persistent device buffers (grow-only), reused every forward.
     FBufX, FBufTheta, FBufY: cl_mem;
     FCapX, FCapTheta, FCapY: csize_t;
+    // The kernel of the last forward, so a layer that leaves its result in
+    // FBufY can name the queue that produced it. Nil before the first forward,
+    // which is what tells a consumer there is nothing to bind yet.
+    FOutputKernel: TNeuralKernel;
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
+    // The buffer the last call wrote Y into, and the kernel that wrote it. Read
+    // per forward: EnsureOutputBuffer replaces the handle when Y grows.
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
     // X holds SeqLen*Depth values [t*Depth + c] (the previous layer's output);
     // Theta is the HalfDepth-long precomputed per-pair frequency array (already
     // RoPE-scaled). Y receives the rotated output in the same layout.
     // PositionOffset shifts the token index into the angle table; OutScale is the
     // YaRN/LongRoPE output multiplier (1.0 on the default path).
+    // pExternalSrc BORROWS an already-resident input in place of uploading X,
+    // which is then read for its dimensions only; the borrowed buffer is never
+    // released here. pKeepResultOnOpenCL leaves the result in FBufY instead of
+    // reading it back, for the next layer to bind.
     procedure Rotate(X: TNNetVolume; const Theta: array of TNeuralFloat;
       Y: TNNetVolume; SeqLen, Depth, HalfDepth, PositionOffset: integer;
-      OutScale: TNeuralFloat);
+      OutScale: TNeuralFloat; pExternalSrc: cl_mem = nil;
+      pKeepResultOnOpenCL: boolean = false);
   end;
 
   /// OpenCL forward helper for the multimodal rotary embedding layer
@@ -6926,6 +6939,10 @@ type
     FLongFactors: array of TNeuralFloat;
     {$IFDEF OpenCL}
     FRoPECL: TNNetRoPECL;
+    // True when the source can be read where it lies instead of uploaded:
+    // cai_rope reads the flat [t*Depth + c] span every producer's buffer
+    // already carries. Coded by Claude (AI).
+    function ShouldBindPrevOutputOnOpenCL(): boolean;
     procedure ComputeOpenCL();
     {$ENDIF}
     procedure BuildThetaCache(pDepth: integer);
@@ -6949,6 +6966,10 @@ type
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
+    // The rotated result stays in FRoPECL's own buffer for the next layer to
+    // bind; both are nil until EnableOpenCL and the first device forward.
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
     {$ENDIF}
     // Frozen verdict: net-wide intra-layer threading is on and the forward
     // stays on the CPU (device forwards are whole-layer on worker 0).
@@ -36780,9 +36801,20 @@ begin
   inherited Destroy();
 end;
 
+function TNNetRoPECL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufY;
+end;
+
+function TNNetRoPECL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FOutputKernel;
+end;
+
 procedure TNNetRoPECL.Rotate(X: TNNetVolume; const Theta: array of TNeuralFloat;
   Y: TNNetVolume; SeqLen, Depth, HalfDepth, PositionOffset: integer;
-  OutScale: TNeuralFloat);
+  OutScale: TNeuralFloat; pExternalSrc: cl_mem = nil;
+  pKeepResultOnOpenCL: boolean = false);
 var
   bufX, bufY, bufTheta: cl_mem;
   k: cl_kernel;
@@ -36798,7 +36830,9 @@ begin
   HalfDepthM1 := HalfDepth - 1;
   for i := 0 to HalfDepthM1 do FTheta.FData[i] := Theta[i];
   // Upload the token tensor + the theta table; allocate the device result.
-  bufX     := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+  if pExternalSrc <> nil
+    then bufX := pExternalSrc
+    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
   bufTheta := FKernel.EnsureWriteBuffer(FBufTheta, FCapTheta, FTheta);
   bufY     := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
   clSetKernelArg(k, 0, csLongintSize, @SeqLen);
@@ -36811,8 +36845,14 @@ begin
   clSetKernelArg(k, 7, csCLMemSize, @bufY);
   // One work-item per (token, channel-pair).
   FKernel.RunKernel(k, SeqLen * HalfDepth);
-  FKernel.Finish();
-  FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  FOutputKernel := FKernel;
+  // Keeping the result means no read back: it waits in FBufY until a consumer
+  // binds it or a host reader calls ForceOutputOnRAM.
+  if not pKeepResultOnOpenCL then
+  begin
+    FKernel.Finish();
+    FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  end;
   // Buffers are persistent (FBuf*), reused next forward - not released here.
 end;
 
@@ -44474,6 +44514,9 @@ end;
 {$IFDEF OpenCL}
 procedure TNNetRotaryEmbedding.DisableOpenCL();
 begin
+  // FRoPECL owns the buffer a resident output lives in, so the host copy has to
+  // be recovered before the helper goes.
+  ForceOutputOnRAM();
   inherited DisableOpenCL();
   FreeAndNil(FRoPECL);
 end;
@@ -44485,10 +44528,33 @@ begin
     FRoPECL := TNNetRoPECL.Create(FNN);
 end;
 
+// A bindable source is a route in by itself: ComputeOpenCL then reads it where
+// it lies, so the upload the size verdict guards against never happens.
 function TNNetRotaryEmbedding.WillOpenCL(): boolean;
 begin
   Result := Assigned(FRoPECL) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL);
+            and (FShouldOpenCL or FForceOpenCL or ShouldBindPrevOutputOnOpenCL());
+end;
+
+function TNNetRotaryEmbedding.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FRoPECL) then Result := FRoPECL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetRotaryEmbedding.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FRoPECL) then Result := FRoPECL.OutputKernel()
+  else Result := nil;
+end;
+
+// No size test: ComputeOpenCL takes SeqLen from the source itself and the
+// kernel reads exactly SeqLen*Depth from it, so the read is in range of the
+// source's own buffer by construction. Forward only - the device kernel leaves
+// a resident output no backward reader recovers.
+function TNNetRotaryEmbedding.ShouldBindPrevOutputOnOpenCL(): boolean;
+begin
+  Result := (not FIsTrainable) and PrevOutputOnOpenCL();
 end;
 
 // Device rotary forward: the interleaved (2k, 2k+1) pair rotation using the
@@ -44497,8 +44563,20 @@ end;
 procedure TNNetRotaryEmbedding.ComputeOpenCL();
 var
   SeqLen, Depth, HalfD: integer;
+  SourceBuffer: cl_mem;
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ShouldBindPrevOutputOnOpenCL() then
+  begin
+    // Read the source where it lies. The result goes to the helper's own output
+    // buffer, so input and output are distinct handles and never alias.
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FRoPECL.OutputKernel());
+  end
+  else
+  begin
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+  end;
   Depth := FPrevLayer.FOutput.Depth;
   SeqLen := FPrevLayer.FOutput.SizeX;
   HalfD := Depth shr 1; // #15: div 2, dimension is non-negative
@@ -44506,8 +44584,14 @@ begin
   // reads uninitialized tail memory back into it (see TNNetMRotaryEmbedding.
   // ComputeOpenCL for the full rationale). No-op when SeqLen is the full length.
   FOutput.ReSize(SeqLen, 1, Depth);
+  // The result stays on the device for the next layer to bind; anything that
+  // wants FOutput calls ForceOutputOnRAM, which MoveOutputToRAM answers from
+  // the two accessors above.
   FRoPECL.Rotate(FPrevLayer.FOutput, FTheta, FOutput,
-    SeqLen, Depth, HalfD, FPositionOffset, FOutScale);
+    SeqLen, Depth, HalfD, FPositionOffset, FOutScale, SourceBuffer,
+    {pKeepResultOnOpenCL=}true);
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
 end;
 {$ENDIF}
 
@@ -44895,7 +44979,8 @@ var
   SeqLen, Depth, HalfD: integer;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  // The source's dimensions and FTheta are host-side: nothing above the device
+  // branch reads source DATA, so the download stays below it.
   SeqLen := FPrevLayer.FOutput.SizeX;
   Depth := FPrevLayer.FOutput.Depth;
   HalfD := Depth shr 1; // #15: div 2, dimension is non-negative
@@ -44912,6 +44997,11 @@ begin
     exit;
   end
   else Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read whatever a previous device forward left in the helper's buffer.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   {$ENDIF}
   // One general kernel: the serial path is the full-range chunk (bit-identical
   // - only independent pairs are partitioned).
@@ -44935,7 +45025,13 @@ var
 begin
   // Compute() rebuilds FTheta lazily; on the chunk path that build must happen
   // here - once, single-threaded, before any wkChunk of this layer runs.
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The chunk workers bypass Compute() entirely and write FOutput on the host,
+  // so this is the only place the residency flags can be cleared for them.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
   Depth := FPrevLayer.FOutput.Depth;
   if Length(FTheta) <> (Depth div 2) then BuildThetaCache(Depth);
 end;
