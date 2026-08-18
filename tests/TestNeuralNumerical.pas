@@ -355,6 +355,7 @@ type
     // (4 sources, then 1 more into the same buffer). Coded by Claude (AI).
     procedure TestSumOpenCLParity;
     procedure TestCellMulByCellOpenCLParity;
+    procedure TestChannelMulByLayerOpenCLParity;
     // Device-side channel gather (cai_split_channels) forward parity for
     // TNNetSplitChannels: contiguous slice, single channel, SplitChannelEvery.
     procedure TestSplitChannelsOpenCLParity;
@@ -64510,6 +64511,100 @@ begin
     end;
     WriteLn('  DepthwiseConv OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('DepthwiseConv OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestChannelMulByLayerOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  InputLayer, ChannelSource, PerChannelOperand: TNNetLayer;
+  MulLayer: TNNetChannelMulByLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InSize, SentinelSurvivors, SentinelCount: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = -7777;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 6, 8);
+  OutCPU := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+    // ReLU convolutions: cai_dot_product applies the activation on the device,
+    // which is what leaves each source output in device memory. The 6x6 feature
+    // with no padding reduces the second branch to the (1,1,8) per-channel
+    // operand MulChannels expects.
+    ChannelSource := NN.AddLayerAfter(TNNetConvolutionReLU.Create(8, 3, 1, 1), InputLayer);
+    PerChannelOperand := NN.AddLayerAfter(TNNetConvolutionReLU.Create(8, 6, 0, 1), InputLayer);
+    MulLayer := TNNetChannelMulByLayer.Create(ChannelSource, PerChannelOperand);
+    NN.AddLayer(MulLayer);
+    // The device path is inference-only, so the product never fires without this.
+    NN.SetTrainable(False, False);
+
+    InSize := Input.Size;
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := 0.05 * i - 0.3;
+
+    NN.Compute(Input);
+    AssertEquals('per-channel operand size', MulLayer.Output.Depth,
+      PerChannelOperand.Output.Size);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    AssertEquals('product ran on the CPU before EnableOpenCL', 0, MulLayer.ForwardGPUCnt);
+
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      // Parity cannot tell a bind from a download, so the sentinel below is what
+      // proves the sources were read in device memory: a second device forward
+      // must leave both host copies untouched.
+      ChannelSource.Output.Fill(csSentinel);
+      PerChannelOperand.Output.Fill(csSentinel);
+      NN.Compute(Input);
+      SentinelSurvivors := 0;
+      for i := 0 to ChannelSource.Output.Size - 1 do
+        if ChannelSource.Output.Raw[i] = csSentinel then Inc(SentinelSurvivors);
+      for i := 0 to PerChannelOperand.Output.Size - 1 do
+        if PerChannelOperand.Output.Raw[i] = csSentinel then Inc(SentinelSurvivors);
+      SentinelCount := ChannelSource.Output.Size + PerChannelOperand.Output.Size;
+      MaxDiff := 0;
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    WriteLn('  ChannelMulByLayer OpenCL parity: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards=', MulLayer.ForwardGPUCnt,
+      ' source sentinels=', SentinelSurvivors, '/', SentinelCount);
+    // Without this a silent fall back to the CPU would compare the reference
+    // against itself and pass while covering nothing.
+    AssertTrue('TNNetChannelMulByLayer must reach the device', MulLayer.ForwardGPUCnt > 0);
+    AssertEquals('both sources must be read in device memory, not downloaded',
+      SentinelCount, SentinelSurvivors);
+    AssertTrue('TNNetChannelMulByLayer OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free;

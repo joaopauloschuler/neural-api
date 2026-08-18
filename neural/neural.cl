@@ -1668,14 +1668,19 @@ __kernel void cai_volume_sum
   FDst[i] = total;
 }
 
-// CAI two-source elementwise product (TNNetCellMulByCell forward). One work-item
-// per element writes FDst[i] = FA[i] * FB[i] over three same-sized volumes.
-// TNNetCellMulByCell only dispatches this when BOTH source outputs are ALREADY
-// resident on the device, so nothing is uploaded here and the product stays on
-// the device until a host reader asks for it. Coded by Claude (AI).
+// CAI two-source elementwise product, one work-item per element. FB is either
+// the same length as FA (FBSize = FSize: TNNetCellMulByCell, a plain cellwise
+// product) or one value per channel (FBSize = Depth: TNNetChannelMulByLayer,
+// broadcast over the (X,Y) positions - a volume is depth-contiguous, so channel
+// i % FBSize). The comparison below is uniform across the work-items, so the
+// cellwise case never evaluates the modulo. Both layers only dispatch this when
+// BOTH source outputs are ALREADY resident on the device, so nothing is uploaded
+// here and the product stays on the device until a host reader asks for it.
+// Coded by Claude (AI).
 __kernel void cai_cell_mul
 (
   const int FSize,
+  const int FBSize,
   __global const float* FA,
   __global const float* FB,
   __global float* FDst
@@ -1683,7 +1688,8 @@ __kernel void cai_cell_mul
 {
   const int i = get_global_id(0);
   if (i >= FSize) return;
-  FDst[i] = FA[i] * FB[i];
+  const int j = (FBSize == FSize) ? i : (i % FBSize);
+  FDst[i] = FA[i] * FB[j];
 }
 
 // CAI channel gather (TNNetSplitChannels forward). Output element (pos, d) is
