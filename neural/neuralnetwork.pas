@@ -4724,9 +4724,11 @@ type
     // pWeightsDirty=false reuses the resident Gain/Bias copy (see EnsureWriteBuffer).
     // NumTokens=1 is handed to NormalizeWholeVolume: same result, cooperative
     // reduction instead of one work-item reading the whole Depth serially.
+    // pExternalSrc and pKeepResultOnOpenCL work as they do there.
     procedure Normalize(X: TNNetVolume; Gain, Bias: TNNetVolume; Y: TNNetVolume;
       NumTokens, Depth: integer; UseMean: boolean; Eps: TNeuralFloat;
-      pWeightsDirty: boolean = true);
+      pWeightsDirty: boolean = true; pExternalSrc: cl_mem = nil;
+      pKeepResultOnOpenCL: boolean = false);
     // Whole-volume normalization: X is reduced as a single sample of X.Size
     // elements (mean/variance over the whole volume) and scaled by per-ELEMENT
     // Gain/Bias (each X.Size long; Bias may be nil when UseMean is false). Used
@@ -7996,6 +7998,9 @@ type
       {$IFDEF OpenCL}
       FTokenNormCL: TNNetTokenNormCL;
       procedure ComputeOpenCL();
+      // True when the previous layer's output can be read where it lies, as the
+      // cai_token_norm input, instead of coming back to RAM to be uploaded.
+      function ShouldBindPrevOutputOnOpenCL(): boolean;
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       // Releases FNormalized / FInvRMS / FGainGradScratch: they are read only
@@ -8040,6 +8045,8 @@ type
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
   end;
 
@@ -36520,7 +36527,8 @@ end;
 
 procedure TNNetTokenNormCL.Normalize(X: TNNetVolume; Gain, Bias: TNNetVolume;
   Y: TNNetVolume; NumTokens, Depth: integer; UseMean: boolean; Eps: TNeuralFloat;
-  pWeightsDirty: boolean = true);
+  pWeightsDirty: boolean = true; pExternalSrc: cl_mem = nil;
+  pKeepResultOnOpenCL: boolean = false);
 var
   bufX, bufY, bufGain, bufBias: cl_mem;
   k: cl_kernel;
@@ -36533,7 +36541,8 @@ begin
   // Gain/Bias ARE the per-element vectors that entry point wants.
   if (NumTokens = 1) and (X.Size = Depth) then
   begin
-    NormalizeWholeVolume(X, Gain, Bias, Y, UseMean, Eps, pWeightsDirty);
+    NormalizeWholeVolume(X, Gain, Bias, Y, UseMean, Eps, pWeightsDirty,
+      pExternalSrc, pKeepResultOnOpenCL);
     exit;
   end;
   k := FKernel.Kernel;
@@ -36543,7 +36552,9 @@ begin
   // device result. The weights re-upload only when they changed. Without a bias
   // the kernel never reads FBias, so the gain buffer stands in for it: the
   // argument is a valid handle and no second buffer is allocated or uploaded.
-  bufX    := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+  if pExternalSrc <> nil
+    then bufX := pExternalSrc
+    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
   bufGain := FKernel.EnsureWriteBuffer(FBufGain, FCapGain, Gain, pWeightsDirty);
   if Assigned(Bias)
     then bufBias := FKernel.EnsureWriteBuffer(FBufBias, FCapBias, Bias, pWeightsDirty)
@@ -36560,8 +36571,11 @@ begin
   // One work-item per token.
   FKernel.RunKernel(k, NumTokens);
   FOutputKernel := FKernel;
-  FKernel.Finish();
-  FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  if not pKeepResultOnOpenCL then
+  begin
+    FKernel.Finish();
+    FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  end;
   // Buffers are persistent (FBuf*), reused next forward - not released here.
 end;
 
@@ -73706,21 +73720,24 @@ var
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
-  // Device forward keeps the per-token activation resident on the GPU between
+  // OpenCL forward keeps the per-token activation in OpenCL memory between
   // attention/FFN blocks (forward-only; training stays on the CPU path below).
-  // The device kernel normalizes FOutput IN PLACE, so it still needs the
-  // identity copy of the input the CPU kernel below no longer does.
+  // It runs BEFORE any ForceOutputOnRAM because that download is what
+  // ComputeOpenCL exists to avoid.
   if WillOpenCL() then
   begin
-    inherited Compute;
     Inc(FForwardGPUCnt);
     ComputeOpenCL();
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
   end
   else Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read whatever a previous OpenCL forward left in the helper's buffer.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   {$ENDIF}
   // One general kernel: the serial path is the full-range chunk (and both skip
   // the whole-volume identity copy the old body paid before normalizing).
@@ -73793,11 +73810,15 @@ end;
 function TNNetTokenRMSNorm.WillOpenCL(): boolean;
 begin
   Result := Assigned(FTokenNormCL) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL);
+            and (FShouldOpenCL or FForceOpenCL
+                 or ((not FIsTrainable) and PrevOutputOnOpenCL()));
 end;
 
 procedure TNNetTokenRMSNorm.DisableOpenCL();
 begin
+  // FTokenNormCL owns the buffer a kept output lives in, so the host copy has
+  // to be recovered before the helper goes.
+  ForceOutputOnRAM();
   inherited DisableOpenCL();
   FreeAndNil(FTokenNormCL);
 end;
@@ -73809,19 +73830,66 @@ begin
     FTokenNormCL := TNNetTokenNormCL.Create(FNN);
 end;
 
-// Device per-token RMSNorm forward (sum-of-squares reduction over the Depth axis,
-// no mean subtraction, then gain .* x_hat), bit-faithful to the scalar Compute().
+function TNNetTokenRMSNorm.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FTokenNormCL) then Result := FTokenNormCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetTokenRMSNorm.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FTokenNormCL) then Result := FTokenNormCL.OutputKernel()
+  else Result := nil;
+end;
+
+// cai_token_norm reads its input as NumTokens contiguous FNormDim segments, the
+// order every TNNetVolume and every producer's buffer already carries, so a
+// source in OpenCL memory binds straight in: no gather, no repacking.
+// WillOpenCL has already excluded a trainable layer, and SetPrevLayer sized
+// FOutput from the source, so the size test only guards a reshape between the
+// two.
+function TNNetTokenRMSNorm.ShouldBindPrevOutputOnOpenCL(): boolean;
+begin
+  Result := PrevOutputOnOpenCL() and
+    (FPrevLayer.FOutput.Size = FOutput.Size);
+end;
+
+// OpenCL per-token RMSNorm forward (sum-of-squares reduction over the FNormDim
+// segment, no mean subtraction, then gain .* x_hat), bit-faithful to the scalar
+// Compute() above.
 procedure TNNetTokenRMSNorm.ComputeOpenCL();
 var
   Depth, NumTokens: integer;
+  SourceBuffer: cl_mem;
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ShouldBindPrevOutputOnOpenCL() then
+  begin
+    // Read the source where it lies. The result goes to the helper's own output
+    // buffer, so input and output are distinct handles and never alias.
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FTokenNormCL.OutputKernel());
+  end
+  else
+  begin
+    // Nothing to bind: bring the source back and stage it in FOutput, which is
+    // what the inherited Compute would have done and what the upload reads.
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+    FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  end;
   Depth := FNormDim;
   NumTokens := FOutput.Size div Depth;
+  // The result stays in OpenCL memory for the next layer to bind. WillOpenCL is
+  // inference-only, so no host reader is left behind: anything that wants
+  // FOutput calls ForceOutputOnRAM, which MoveOutputToRAM answers from the two
+  // accessors above.
   FTokenNormCL.Normalize(FOutput, FNeurons[0].FWeights, nil,
     FOutput, NumTokens, Depth, {UseMean=}false, FTokenRMSEpsilon,
-    {pWeightsDirty=}FAfterWeightUpdateHasBeenCalled);
+    {pWeightsDirty=}FAfterWeightUpdateHasBeenCalled, SourceBuffer,
+    {pKeepResultOnOpenCL=}true);
   FAfterWeightUpdateHasBeenCalled := false;
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
 end;
 {$ENDIF}
 

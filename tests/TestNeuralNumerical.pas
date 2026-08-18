@@ -515,6 +515,11 @@ type
     // source can put it on the device - and the projection follows only when the
     // gathered rows stayed there.
     procedure EmbeddingResidentChainUnforcedOpenCLParity;
+    // TNNetEmbedding -> TNNetTokenRMSNorm -> TNNetPointwiseConvLinear with
+    // ForceOpenCL off: the norm's own size verdict is pinned False, so only a
+    // source in OpenCL memory can put it there - and the projection follows
+    // only when the normalized tokens stayed.
+    procedure TokenRMSNormResidentChainUnforcedOpenCLParity;
     // OpenCL gated FFN forward offload parity (vs CPU) for the GLU-family
     // activations TNNetGLU / TNNetSwiGLU / TNNetGEGLU / TNNetGEGLUErf.
     procedure GLUFamilyOpenCLParity;
@@ -68800,6 +68805,86 @@ begin
     AssertTrue('ForceOutputOnRAM must report the embedding readable',
       Embed.ForceOutputOnRAM());
     AssertTrue('embedding resident chain vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TokenRMSNormResidentChainUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 3;
+  VocabSize = 11;
+  EmbSize = 100;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Norm, Proj: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Tokens: array[0..SeqLen-1] of integer = (3, 7, 10);
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 1, 1));
+    NN.AddLayer(TNNetEmbedding.Create(VocabSize, EmbSize, {EncodeZero=}1, 0.5));
+    Norm := NN.AddLayer(TNNetTokenRMSNorm.Create(1e-6));
+    // EmbSize 100 keeps the projection's own size verdict False as well (see
+    // EmbeddingResidentChainUnforcedOpenCLParity), so it reaches OpenCL only
+    // behind a normalized output that stayed there.
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    NN.SetTrainable(False, False);
+    // Non-trivial per-channel gain so the multiply is meaningfully tested.
+    for i := 0 to Norm.Neurons[0].Weights.Size - 1 do
+      Norm.Neurons[0].Weights.Raw[i] := 1.0 + 0.4 * Sin(i * 0.7);
+    for i := 0 to SeqLen - 1 do Input.FData[i] := Tokens[i];
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    AssertFalse('the token norm size verdict must leave it on the CPU',
+      Norm.ShouldOpenCL);
+    AssertFalse('the projection size verdict must leave it on the CPU',
+      Proj.ShouldOpenCL);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+
+    AssertTrue('the token norm must expose an OpenCL buffer',
+      Assigned(Norm.OpenCLOutputBuffer()));
+    AssertTrue('the token norm must expose the kernel owning that buffer',
+      Assigned(Norm.OpenCLOutputKernel()));
+    MaxDiff := 0;
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  TokenRMSNorm resident chain: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards norm=', Norm.ForwardGPUCnt, ' proj=', Proj.ForwardGPUCnt);
+    AssertTrue('a source in OpenCL memory alone must put the norm there',
+      Norm.ForwardGPUCnt > 0);
+    AssertTrue('the projection must follow the normalized tokens',
+      Proj.ForwardGPUCnt > 0);
+    AssertTrue('ForceOutputOnRAM must report the norm readable',
+      Norm.ForceOutputOnRAM());
+    AssertTrue('token norm resident chain vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
