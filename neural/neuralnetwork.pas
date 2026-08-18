@@ -420,7 +420,9 @@ type
       // increments these (Convolution + its grouped/KAN/cross-correlation
       // variants, FullConnect, SDPA, RoPE/MRoPE, softmax, RMSNorm/Group/L2
       // norms, GLU gates, pooling, grid/resize gathers, embedding); layers with
-      // no GPU path leave both at zero (reported as "-"). Counted only inside
+      // no GPU path leave both at zero (reported as "-"). TNNetInput runs no
+      // kernel, so there the GPU count means "the output was uploaded and is
+      // offered on the device", not "a kernel ran". Counted only inside
       // {$IFDEF OpenCL}, so a non-OpenCL build leaves them zero ("-") too.
       // Reset by ClearTimes alongside the timers, so they
       // cover the same window. Lets a profiler answer "are these layers really
@@ -104327,12 +104329,22 @@ begin
   // Forward only: every consumer's binding test is forward only, so a trainable
   // net would pay an upload nobody is allowed to read.
   if FIsTrainable or (not FHasOpenCL) or (not Assigned(FInputBuffer)) or
-    (FOutput.Size > FInputBufSize) then exit;
+    (FOutput.Size > FInputBufSize) then
+  begin
+    // Host-only forward: the output is offered in RAM alone, as on a
+    // non-OpenCL build.
+    Inc(FForwardCPUCnt);
+    exit;
+  end;
   // Non-blocking: the write and its consumers share the net-wide in-order
   // queue, and a consumer holding another queue waits for it through
   // OpenCLWaitOutputIfAnotherQueue.
   if FInputKernel.WriteBuffer(FInputBuffer, FOutput) = CL_SUCCESS then
+  begin
     FOutputOnOpenCL := true;
+    Inc(FForwardGPUCnt);
+  end
+  else Inc(FForwardCPUCnt);
   {$ENDIF}
 end;
 
@@ -106721,6 +106733,8 @@ begin
     Lines.Add('FullConnect, SDPA, RoPE/MRoPE, softmax, RMSNorm/Group/L2 norms,');
     Lines.Add('GLU gates, pooling, grid/resize gathers and embedding all have a');
     Lines.Add('GPU forward path; "-" = no GPU path here / never dispatched.');
+    Lines.Add('TNNetInput runs no kernel: its GPU share is how often it uploaded');
+    Lines.Add('its output and offered it on the device.');
     Lines.Add(Format('%-28s %5s %14s %14s %6s %8s',
       ['Layer class', 'Count', 'total us', 'us/instance', '%', 'GPU']));
     Lines.Add(StringOfChar('-', 86));
