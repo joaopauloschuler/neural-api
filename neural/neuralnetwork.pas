@@ -74914,7 +74914,12 @@ begin
     ' Current layer:', Self.LayerIdx
   );
   *)
-  if (FHasOpenCL and FShouldOpenCL) then
+  // Armed whatever the size verdict says: a layer whose source is already in
+  // OpenCL memory binds it and runs there, and it can only do that if the
+  // kernel, the prepared shapes and the uploaded weights exist. The verdict then
+  // decides one case only - whether to run on the device when the source has to
+  // be uploaded first.
+  if FHasOpenCL then
   begin
     if not Assigned(FDotCL) then
     begin
@@ -100923,7 +100928,11 @@ begin
   // The GEMM shape was fixed when EnableOpenCL prepared FDotCL against
   // FInputPrepared; a source of any other size would read past its buffer.
   if FPrevLayer.FOutput.Size <> FInputPrepared.Size then exit;
-  Result := WillOpenCL();
+  // The arming half of WillOpenCL, spelled out rather than called: WillOpenCL
+  // asks this routine in turn, and the size verdict is what a resident source
+  // is allowed to override.
+  Result := Assigned(FDotCL) and FHasOpenCL
+    and ((not FQuantInt8) or FDotCL.Int8Ready);
 end;
 
 // The spatial twin. Here the B operand is the column matrix, which cai_im2col
@@ -103156,7 +103165,7 @@ begin
       {$IFDEF OpenCL}
       // Device route only when the resident int8 buffers were armed (EnableOpenCL
       // ran AFTER quantization); otherwise the fused CPU kernel is the fallback.
-      if Assigned(FDotCL) and FHasOpenCL and FShouldOpenCL and FDotCL.Int8Ready then
+      if WillOpenCL() then
       begin
         Inc(FForwardGPUCnt);
         ComputeOpenCLInt8();
@@ -103192,7 +103201,7 @@ begin
   begin
     StartTime := Now();
     {$IFDEF OpenCL}
-    if Assigned(FDotCL) and FHasOpenCL and FShouldOpenCL then
+    if WillOpenCL() then
     begin
       Inc(FForwardGPUCnt);
       ComputeOpenCL();
@@ -103366,7 +103375,8 @@ end;
 // verdict the forward does not honour is what this routine exists to prevent.
 function TNNetFullConnect.WillOpenCL(): boolean;
 begin
-  Result := Assigned(FDotCL) and FHasOpenCL and FShouldOpenCL
+  Result := Assigned(FDotCL) and FHasOpenCL
+    and (FShouldOpenCL or ShouldBindPrevOutputOnOpenCL())
     and ((not FQuantInt8) or FDotCL.Int8Ready);
 end;
 
@@ -103376,11 +103386,10 @@ end;
 function TNNetFullConnect.ShouldBindPrevOutputOnOpenCL(): boolean;
 begin
   Result := false;
-  // Forward only (BackpropagateOpenCL reads FPrevLayer.Output on the host), and
-  // only when Compute takes the device branch: skipping the download in front
-  // of the CPU branch would leave ComputeCPU reading a stale host output.
-  if FIsTrainable or (not FHasOpenCL) or (not FShouldOpenCL) or
-    (not Assigned(FDotCL)) then exit;
+  // Forward only: BackpropagateOpenCL reads FPrevLayer.Output on the host.
+  // WillOpenCL asks this routine in turn, so the size verdict is deliberately
+  // absent here - a resident source is what overrides it.
+  if FIsTrainable or (not FHasOpenCL) or (not Assigned(FDotCL)) then exit;
   if FQuantInt8 and (not FDotCL.Int8Ready) then exit;
   if not PrevOutputOnOpenCL() then exit;
   // The GEMM shape was fixed when EnableOpenCL prepared FDotCL; a source of any
@@ -131069,7 +131078,8 @@ end;
 {$IFDEF OpenCL}
 function TNNetConvolution.WillOpenCL(): boolean;
 begin
-  Result := Assigned(FDotCL) and FHasOpenCL and (FShouldOpenCL or FForceOpenCL)
+  Result := Assigned(FDotCL) and FHasOpenCL
+    and (FShouldOpenCL or FForceOpenCL or ShouldBindPrevOutputOnOpenCL())
     // int8-quantized: the device route needs the resident code/scale buffers,
     // armed only when EnableOpenCL ran AFTER quantization. Unarmed quantized
     // layers stay on the fused int8 CPU path.

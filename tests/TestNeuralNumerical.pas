@@ -494,8 +494,9 @@ type
     // TNNet.EnableOpenCL reaches every layer, including a convolution whose
     // size verdict left it on the CPU and which therefore has no FDotCL.
     procedure CpuVerdictConvolutionSurvivesEnableOpenCL;
-    // TNNetFullConnect.WillOpenCL must report the branch Compute() takes,
-    // above and below the layer's size verdict.
+    // TNNetFullConnect.WillOpenCL must report the branch Compute() takes, and a
+    // layer below the size verdict must still follow a resident source onto the
+    // device.
     procedure FullConnectWillOpenCLMatchesForward;
     // OpenCL gated FFN forward offload parity (vs CPU) for the GLU-family
     // activations TNNetGLU / TNNetSwiGLU / TNNetGEGLU / TNNetGEGLUErf.
@@ -68347,19 +68348,23 @@ begin
 end;
 {$ENDIF}
 
-// TNNetFullConnect.Compute dispatches on FDotCL/FHasOpenCL/FShouldOpenCL, and
-// the scheduler routes the layer by WillOpenCL: the two must agree on both
-// sides of the (FNeurons.Count >= 512) and (prev >= 128) verdict.
-// Coded by Claude (AI).
+// TNNetFullConnect.Compute dispatches on WillOpenCL, and the scheduler routes
+// the layer by the same routine: the two cannot disagree. The 8-neuron layer is
+// below the (FNeurons.Count >= 512) and (prev >= 128) size verdict, so the only
+// thing that can put it on the device is the 512-neuron layer in front of it
+// leaving its output there. Coded by Claude (AI).
 procedure TTestNeuralNumerical.FullConnectWillOpenCLMatchesForward;
 {$IFDEF OpenCL}
 var
   NN: TNNet;
   Big, Small: TNNetLayer;
-  Input: TNNetVolume;
+  Input, OutCPU: TNNetVolume;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
-  i: integer;
+  i, BigSentinelsLeft: integer;
+  MaxDiff: TNeuralFloat;
+const
+  csSentinel = 999;
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
@@ -68369,28 +68374,48 @@ begin
   RandSeed := 424242;
   NN := TNNet.Create();
   Input := TNNetVolume.Create(1, 1, 128);
+  OutCPU := TNNetVolume.Create();
   try
     NN.AddLayer(TNNetInput.Create(1, 1, 128));
     Big := NN.AddLayer(TNNetFullConnectLinear.Create(512));
     Small := NN.AddLayer(TNNetFullConnectLinear.Create(8));
     NN.SetTrainable(False, False);
     for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.3 * Cos(i * 0.11);
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
     NN.EnableOpenCL(PlatformId, DeviceId);
     AssertTrue('the 512-neuron layer must be above the size verdict',
       Big.ShouldOpenCL);
     AssertFalse('the 8-neuron layer must be below the size verdict',
       Small.ShouldOpenCL);
     NN.Compute(Input);
+    // Only a download into the big layer clears its sentinels.
+    Big.Output.Fill(csSentinel);
+    NN.Compute(Input);
+    BigSentinelsLeft := 0;
+    for i := 0 to Big.Output.Size - 1 do
+      if Big.Output.Raw[i] = csSentinel then Inc(BigSentinelsLeft);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+      MaxDiff := Max(MaxDiff, Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]));
+    WriteLn('  FullConnect resident chain: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards big=', Big.ForwardGPUCnt, ' small=', Small.ForwardGPUCnt,
+      ' sentinels kept big=', BigSentinelsLeft, '/', Big.Output.Size);
     AssertEquals('WillOpenCL must match the branch the big layer took',
       Big.ForwardGPUCnt > 0, Big.WillOpenCL());
     AssertEquals('WillOpenCL must match the branch the small layer took',
       Small.ForwardGPUCnt > 0, Small.WillOpenCL());
     AssertTrue('the big layer must have reached the device',
       Big.ForwardGPUCnt > 0);
-    AssertEquals('the small layer must have stayed on the CPU',
-      0, Small.ForwardGPUCnt);
+    AssertTrue('a resident source alone must put the below-verdict layer on ' +
+      'the device', Small.ForwardGPUCnt > 0);
+    AssertEquals('the small layer must bind its source, not download it',
+      Big.Output.Size, BigSentinelsLeft);
+    AssertTrue('FullConnect resident chain vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
-    Input.Free; NN.Free;
+    OutCPU.Free; Input.Free; NN.Free;
   end;
 end;
 {$ELSE}
