@@ -50520,6 +50520,9 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  // FLayerA is the previous layer, which inherited Compute brings back; FLayerB
+  // is the second input edge and is read on the host by the Mul below.
+  {$IFDEF OpenCL} if Assigned(FLayerB) then FLayerB.ForceOutputOnRAM(); {$ENDIF}
   inherited Compute;
   {$IFDEF Debug}
   if FLayerA.Output.Size <> FLayerB.Output.Size then
@@ -71857,6 +71860,9 @@ var
   StartTime: double;
 begin
   StartTime := Now();
+  // FLayerWithChannels is the previous layer, which inherited Compute brings
+  // back; FLayerMul is the second input edge, read on the host by MulChannels.
+  {$IFDEF OpenCL} if Assigned(FLayerMul) then FLayerMul.ForceOutputOnRAM(); {$ENDIF}
   inherited Compute;
   {$IFDEF Debug}
   if FLayerWithChannels.Output.Depth <> FLayerMul.Output.Size then
