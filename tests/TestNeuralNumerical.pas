@@ -503,6 +503,7 @@ type
     // verdict, so only a resident source can put it on the device - and the
     // concat runs there only when every source stayed resident.
     procedure RoPEResidentHeadChainUnforcedOpenCLParity;
+    procedure InputResidentSourceUnforcedOpenCLParity;
     // OpenCL gated FFN forward offload parity (vs CPU) for the GLU-family
     // activations TNNetGLU / TNNetSwiGLU / TNNetGEGLU / TNNetGEGLUErf.
     procedure GLUFamilyOpenCLParity;
@@ -68304,6 +68305,81 @@ end;
 // already there. TNNetDeepConcat runs on the device only when EVERY source is
 // bindable, so a RoPE layer that downloaded would pull the whole head back to
 // the host. Coded by Claude (AI).
+procedure TTestNeuralNumerical.InputResidentSourceUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  InputLayer, Proj: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InputDiffCount: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 100);
+  OutCPU := TNNetVolume.Create();
+  try
+    // A pointwise convolution reads its source in the same order a resident
+    // buffer holds it, so it is the shortest consumer of an input layer. Depth
+    // 100 puts FVectorSize over csMaxInterleavedSize and FOutput.Size *
+    // FVectorSize = 1800 under the second threshold, so its size verdict is
+    // False and only a resident source can put it on the device.
+    InputLayer := NN.AddLayer(TNNetInput.Create(3, 1, 100));
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    NN.SetTrainable(False, False);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.6 * Sin(i * 0.29) - 0.15;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    AssertFalse('the projection size verdict must leave it on the CPU',
+      Proj.ShouldOpenCL);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    AssertTrue('the input layer must expose a device buffer',
+      Assigned(InputLayer.OpenCLOutputBuffer()));
+    AssertTrue('the input layer must expose the kernel owning that buffer',
+      Assigned(InputLayer.OpenCLOutputKernel()));
+    NN.Compute(Input);
+
+    MaxDiff := 0;
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    // The input layer offers both locations, so its host copy stays readable.
+    InputDiffCount := 0;
+    for i := 0 to Input.Size - 1 do
+      if InputLayer.Output.Raw[i] <> Input.Raw[i] then Inc(InputDiffCount);
+    WriteLn('  Input resident source: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards proj=', Proj.ForwardGPUCnt,
+      ' host copy mismatches=', InputDiffCount, '/', Input.Size);
+    AssertTrue('a resident input alone must put the projection on the device',
+      Proj.ForwardGPUCnt > 0);
+    AssertEquals('the input host copy must survive the upload', 0, InputDiffCount);
+    AssertTrue('ForceOutputOnRAM must report the input readable',
+      InputLayer.ForceOutputOnRAM());
+    AssertTrue('input resident source vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
 procedure TTestNeuralNumerical.RoPEResidentHeadChainUnforcedOpenCLParity;
 {$IFDEF OpenCL}
 var

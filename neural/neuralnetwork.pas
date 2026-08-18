@@ -1008,10 +1008,32 @@ type
   /// This is an ideal layer to be used as input layer. In the case that you
   // need to backpropagate errors up to the input, call EnableErrorCollection.
   TNNetInput = class(TNNetInputBase)
+    {$IFDEF OpenCL}
+    private
+      // Net-wide cai_dot_product handle, borrowed from the EnableOpenCL
+      // parameter; the net owns and frees it. Only its context and its command
+      // queue are used - this layer runs no kernel of its own.
+      FInputKernel: TNeuralKernel;
+      // Persistent device copy of FOutput, allocated ONCE in EnableOpenCL and
+      // rewritten by every forward, so no forward pass touches the OpenCL
+      // allocator. Owned here and freed in Destroy. Coded by Claude (AI).
+      FInputBuffer: cl_mem;
+      FInputBufSize: integer; // element capacity of FInputBuffer
+    {$ENDIF}
     public
       constructor Create(pSize: integer); reintroduce; overload;
       constructor Create(pSizeX, pSizeY, pDepth: integer); reintroduce; overload;
       constructor Create(pSizeX, pSizeY, pDepth, pError: integer); reintroduce; overload;
+      {$IFDEF OpenCL}
+      destructor Destroy(); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+      {$ENDIF}
+      // Uploads FOutput and leaves the host copy valid, so both locations hold
+      // it and a consumer that declines to bind pays nothing.
+      procedure Compute(); override;
 
       function EnableErrorCollection: TNNetInput;
       function DisableErrorCollection: TNNetInput;
@@ -103838,6 +103860,11 @@ begin
   FStruct[0] := pSizeX;
   FStruct[1] := pSizeY;
   FStruct[2] := pDepth;
+  {$IFDEF OpenCL}
+  FInputKernel := nil;
+  FInputBuffer := nil;
+  FInputBufSize := 0;
+  {$ENDIF}
 end;
 
 constructor TNNetInput.Create(pSizeX, pSizeY, pDepth, pError: integer);
@@ -103867,6 +103894,80 @@ begin
   FOutputError.ReSize(1,1,1);
   FOutputErrorDeriv.ReSize(1,1,1);
   Result := Self;
+end;
+
+{$IFDEF OpenCL}
+destructor TNNetInput.Destroy();
+begin
+  if Assigned(FInputBuffer) then clReleaseMemObject(FInputBuffer);
+  inherited Destroy();
+end;
+
+procedure TNNetInput.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  inherited EnableOpenCL(DotProductKernel);
+  // The upload runs no kernel, so only the context and the queue are wanted.
+  // Putting it on the net-wide queue orders it ahead of every consumer that
+  // enqueues there, which is what lets the write below stay non-blocking.
+  FInputKernel := DotProductKernel;
+  if Assigned(FInputBuffer) and (FInputBufSize <> FOutput.Size) then
+  begin
+    clReleaseMemObject(FInputBuffer);
+    FInputBuffer := nil;
+    FOutputOnOpenCL := false;
+  end;
+  if (not Assigned(FInputBuffer)) and Assigned(FInputKernel) then
+  begin
+    FInputBufSize := FOutput.Size;
+    // Read-only: consumers bind it as a kernel source and never write it.
+    FInputBuffer := FInputKernel.CreateBuffer(CL_MEM_READ_ONLY,
+      FOutput.Size * csNeuralFloatSize);
+  end;
+end;
+
+procedure TNNetInput.DisableOpenCL();
+begin
+  // No ForceOutputOnRAM first, unlike every other resident producer: FOutputOnRAM
+  // never went false here, so dropping the device copy loses nothing.
+  FOutputOnOpenCL := false;
+  if Assigned(FInputBuffer) then
+  begin
+    clReleaseMemObject(FInputBuffer);
+    FInputBuffer := nil;
+    FInputBufSize := 0;
+  end;
+  FInputKernel := nil;
+  inherited DisableOpenCL();
+end;
+
+function TNNetInput.OpenCLOutputBuffer(): cl_mem;
+begin
+  Result := FInputBuffer;
+end;
+
+function TNNetInput.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  Result := FInputKernel;
+end;
+{$ENDIF}
+
+procedure TNNetInput.Compute();
+begin
+  inherited Compute();
+  {$IFDEF OpenCL}
+  // TNNet.Compute wrote FOutput from the host just before this call.
+  FOutputOnRAM := true;
+  FOutputOnOpenCL := false;
+  // Forward only: every consumer's binding test is forward only, so a trainable
+  // net would pay an upload nobody is allowed to read.
+  if FIsTrainable or (not FHasOpenCL) or (not Assigned(FInputBuffer)) or
+    (FOutput.Size > FInputBufSize) then exit;
+  // Non-blocking: the write and its consumers share the net-wide in-order
+  // queue, and a consumer holding another queue waits for it through
+  // OpenCLWaitOutputIfAnotherQueue.
+  if FInputKernel.WriteBuffer(FInputBuffer, FOutput) = CL_SUCCESS then
+    FOutputOnOpenCL := true;
+  {$ENDIF}
 end;
 
 { TNNetEmbedding }
