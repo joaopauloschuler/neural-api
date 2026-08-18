@@ -340,6 +340,11 @@ type
     // memory can put it there - and the activation follows only when the
     // convolved rows stayed.
     procedure DepthwiseConv1DResidentChainUnforcedOpenCLParity;
+    // Token-by-token decode on OpenCL: cai_depthwise_conv1d_decode keeps the
+    // K-1 history rows in OpenCL memory between tokens, so every step must
+    // still match the corresponding row of the full-sequence CPU forward - and
+    // a mid-session CaptureState/RestoreState round trip must not disturb it.
+    procedure DepthwiseConv1DDecodeResidentOpenCLParity;
     // OpenCL tap-diagonal coefficient-GEMV forward offload parity (vs CPU) for
     // TNNetKANConv (Chebyshev and B-spline basis).
     procedure TestKANConvOpenCLParity;
@@ -68890,6 +68895,102 @@ begin
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.DepthwiseConv1DDecodeResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 9;
+  VocabSize = 11;
+  EmbSize = 6;
+  KernelSize = 4;
+  SnapshotStep = 4;
+var
+  NNFull, NNStep: TNNet;
+  FullIn, StepIn, FullOut, Snap: TNNetVolume;
+  ConvStep: TNNetDepthwiseConv1D;
+  Conv, Act: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Tokens: array[0..SeqLen-1] of integer = (3, 7, 10, 1, 0, 5, 5, 9, 2);
+  T, D, Steps, StepsAtSnapshot: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260818;
+  NNFull := TNNet.Create();
+  NNStep := TNNet.Create();
+  FullIn := TNNetVolume.Create(SeqLen, 1, 1);
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  FullOut := TNNetVolume.Create();
+  Snap := TNNetVolume.Create();
+  try
+    NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, 1, 1));
+    NNFull.AddLayer(TNNetEmbedding.Create(VocabSize, EmbSize, {EncodeZero=}1, 0.5));
+    NNFull.AddLayer(TNNetDepthwiseConv1D.Create(KernelSize, {causal}true, {suppressBias}0));
+    NNFull.AddLayer(TNNetSiLU.Create());
+    NNFull.SetTrainable(False, False);
+
+    NNStep.AddLayer(TNNetInput.Create(1, 1, 1, 1));
+    NNStep.AddLayer(TNNetEmbedding.Create(VocabSize, EmbSize, {EncodeZero=}1, 0.5));
+    ConvStep := TNNetDepthwiseConv1D.Create(KernelSize, {causal}true, {suppressBias}0);
+    Conv := NNStep.AddLayer(ConvStep);
+    Act := NNStep.AddLayer(TNNetSiLU.Create());
+    NNStep.SetTrainable(False, False);
+    NNStep.CopyWeights(NNFull);
+
+    for T := 0 to SeqLen - 1 do FullIn.FData[T] := Tokens[T];
+    NNFull.Compute(FullIn);
+    FullOut.Copy(NNFull.GetLastLayer.Output);
+
+    AssertFalse('the single-token conv size verdict must leave it on the CPU',
+      Conv.ShouldOpenCL);
+    NNStep.EnableOpenCL(PlatformId, DeviceId);
+    ConvStep.BeginIncrementalDecode();
+    AssertTrue('decode enabled after Begin', ConvStep.DecodeEnabled);
+    MaxDiff := 0;
+    StepsAtSnapshot := 0;
+    for T := 0 to SeqLen - 1 do
+    begin
+      // A snapshot taken right after step SnapshotStep, then restored before
+      // the next one, must leave the session exactly where it was.
+      if T = SnapshotStep + 1 then ConvStep.RestoreState(Snap, StepsAtSnapshot);
+      StepIn.FData[0] := Tokens[T];
+      NNStep.Compute(StepIn);
+      AssertEquals('decode steps track tokens', T + 1, ConvStep.DecodeSteps);
+      for D := 0 to EmbSize - 1 do
+      begin
+        Diff := Abs(FullOut[T, 0, D] - NNStep.GetLastLayer.Output[0, 0, D]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      if T = SnapshotStep then
+      begin
+        ConvStep.CaptureState(Snap, Steps);
+        StepsAtSnapshot := Steps;
+        AssertEquals('the snapshot must carry the step count', T + 1, Steps);
+      end;
+    end;
+    ConvStep.EndIncrementalDecode();
+    WriteLn('  DepthwiseConv1D OpenCL decode: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards conv=', Conv.ForwardGPUCnt, ' act=', Act.ForwardGPUCnt);
+    AssertEquals('every decode step must run on OpenCL', SeqLen, Conv.ForwardGPUCnt);
+    AssertTrue('the activation must follow the convolved rows',
+      Act.ForwardGPUCnt > 0);
+    AssertTrue('OpenCL decode vs full CPU forward: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Snap.Free; FullOut.Free; StepIn.Free; FullIn.Free;
+    NNStep.Free; NNFull.Free;
   end;
 end;
 {$ELSE}

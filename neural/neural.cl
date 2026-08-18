@@ -1877,6 +1877,61 @@ __kernel void cai_depthwise_conv1d
   FY[gid] = acc;
 }
 
+// CAI DEPTHWISE 1-D CONVOLUTION, INCREMENTAL DECODE (TNNetDepthwiseConv1D
+// inside a decode session). The same causal per-channel sweep as
+// cai_depthwise_conv1d, except that the K-1 rows preceding the window are read
+// from FHistIn instead of being zero-padded, and this kernel ALSO writes the
+// K-1 rows that follow the window into FHistOut -- so the history never travels
+// back to the host between tokens.
+// Concatenated rows: 0..K-2 are FHistIn, K-1..K-2+FSeqLen are FX. Then
+//   out[t,c] = (FSuppressBias ? 0 : FBias[c])
+//              + sum_kk FW[c*FKsize + kk] * row(t + kk)[c]
+// which is the causal read [t-(K-1) .. t] with FHistIn filling srcT < 0 --
+// matching TNNetDepthwiseConv1D.ComputeDecodeCPURange tap for tap.
+// FHistOut MUST be a different buffer from FHistIn (the host ping-pongs the
+// two): work-items write it while others are still reading FHistIn.
+// One work-item per (row, channel) over max(FSeqLen, K-1) rows; a work-item
+// past both row counts writes nothing, so no explicit total guard is needed.
+__kernel void cai_depthwise_conv1d_decode
+(
+  const int FSeqLen,
+  const int FChannels,
+  const int FKsize,
+  const int FSuppressBias,
+  __global const float* FW,
+  __global const float* FBias,
+  __global const float* FHistIn,
+  __global const float* FX,
+  __global float* FY,
+  __global float* FHistOut
+)
+{
+  const int gid = get_global_id(0);
+  const int c = gid % FChannels;
+  const int t = gid / FChannels;
+  const int HistLen = FKsize - 1;
+  if (t < FSeqLen)
+  {
+    float acc = (FSuppressBias == 0) ? FBias[c] : 0.0f;
+    const int wBase = c * FKsize;
+    for (int kk = 0; kk < FKsize; kk++)
+    {
+      const int srcT = t - HistLen + kk;
+      const float xv = (srcT >= 0) ? FX[srcT * FChannels + c]
+                                   : FHistIn[(HistLen + srcT) * FChannels + c];
+      acc = mad(FW[wBase + kk], xv, acc);
+    }
+    FY[t * FChannels + c] = acc;
+  }
+  if (t < HistLen)
+  {
+    // New history row t is concatenated row FSeqLen + t.
+    const int r = FSeqLen + t;
+    FHistOut[gid] = (r < HistLen) ? FHistIn[r * FChannels + c]
+                                  : FX[(r - HistLen) * FChannels + c];
+  }
+}
+
 // FUSED MIXTURE-OF-EXPERTS DOWN PROJECTION (TNNetMoEExpertBankDown).
 // Computes the whole gate-weighted expert mixture of one MoE block in a single
 // launch:

@@ -4831,10 +4831,25 @@ type
     // Persistent device buffers (grow-only), reused every forward.
     FBufW, FBufBias, FBufX, FBufY: cl_mem;
     FCapW, FCapBias, FCapX, FCapY: csize_t;
+    // The two incremental-decode history buffers: a decode launch reads the
+    // live one and writes the advanced history into the other, then FHistIsA
+    // flips. The K-1 history rows therefore never leave OpenCL memory.
+    FBufHistA, FBufHistB: cl_mem;
+    FCapHistA, FCapHistB: csize_t;
+    FHistIsA: boolean;
+    // The cai_depthwise_conv1d_decode entry point, bound beside the full-sequence
+    // one so both share the resident weight, bias and output buffers.
+    FDecodeKernel: TNeuralKernel;
     // The kernel of the last forward, so a layer that leaves its result in
     // FBufY can name the queue that produced it. Nil before the first forward,
     // which is what tells a consumer there is nothing to bind yet.
     FOutputKernel: TNeuralKernel;
+    // The history buffer a decode launch reads, and the one it writes.
+    function LiveHistoryBuffer(): cl_mem;
+    function SpareHistoryBuffer(): cl_mem;
+    // FBufY is shared by the two entry points, which own separate command
+    // queues, so a switch between them waits for the queue that last wrote it.
+    procedure WaitOutputIfAnotherQueue(pNextKernel: TNeuralKernel);
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
@@ -4853,6 +4868,23 @@ type
     // instead of reading it back into Y.
     procedure Compute(PackedW, Bias, X, Y: TNNetVolume;
       SeqLen, Channels, Ksize, Off, SuppressBias: integer; NewW: boolean = true;
+      pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+    // The kernel each entry point runs on. A source layer is told which of the
+    // two is about to read its buffer, so it waits on the right queue - which
+    // kernel produced the LAST result is a different question.
+    function ForwardKernel(): TNeuralKernel;
+    function DecodeForwardKernel(): TNeuralKernel;
+    // Sizes both history buffers for Hist and uploads Hist into the live one.
+    // Call once per decode session, not once per token.
+    procedure UploadHistory(Hist: TNNetVolume);
+    // Reads the live history buffer back into Hist (blocking). Nothing to read
+    // before the first UploadHistory, which the caller tracks.
+    procedure DownloadHistory(Hist: TNNetVolume);
+    // Incremental-decode forward: same arguments as Compute (Off is always
+    // K-1, the causal offset), plus the resident history the launch reads and
+    // advances. UploadHistory must have run for this session.
+    procedure ComputeDecode(PackedW, Bias, X, Y: TNNetVolume;
+      SeqLen, Channels, Ksize, SuppressBias: integer; NewW: boolean = true;
       pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
   end;
 
@@ -9156,6 +9188,11 @@ type
       // True once weights change; the device forward re-packs + re-uploads the
       // kernels/biases only then, keeping the resident copy across forwards.
       FGpuWeightsDirty: boolean;
+      // True while the live incremental-decode history sits in FDepthwise1DCL's
+      // buffers rather than in FDecHist. Every host reader of FDecHist calls
+      // ForceDecodeHistoryOnRAM first; the OpenCL decode forward calls
+      // EnsureDecodeHistoryOnOpenCL.
+      FDecHistOnOpenCL: boolean;
       {$ENDIF}
       // Rebuilds both tables from the neurons.
       procedure BuildTapTables();
@@ -9192,6 +9229,14 @@ type
       procedure ComputeDecodeCPURange(FirstC, LastC: integer);
       {$IFDEF OpenCL}
       procedure ComputeOpenCL();
+      procedure ComputeDecodeOpenCL();
+      // Packs the C per-channel kernels contiguously [c*K + kk] into FGemmWChan
+      // and the C biases into FGemmBias, but only when FGpuWeightsDirty.
+      procedure PackChannelKernels();
+      // Move the incremental-decode history between FDecHist and the helper's
+      // buffers. Both are no-ops when the history is already where it is wanted.
+      procedure EnsureDecodeHistoryOnOpenCL();
+      procedure ForceDecodeHistoryOnRAM();
       // True when the previous layer's output can be read where it lies, as the
       // cai_depthwise_conv1d input, instead of coming back to RAM to be uploaded.
       function ShouldBindPrevOutputOnOpenCL(): boolean;
@@ -36839,14 +36884,19 @@ end;
 constructor TNNetDepthwiseConv1DCL.Create(NN: TNNet);
 begin
   inherited Create(NN, 'cai_depthwise_conv1d');
+  FDecodeKernel := NN.GetKernel('cai_depthwise_conv1d_decode');
+  FHistIsA := true;
 end;
 
 destructor TNNetDepthwiseConv1DCL.Destroy();
 begin
-  if Assigned(FBufW)    then clReleaseMemObject(FBufW);
-  if Assigned(FBufBias) then clReleaseMemObject(FBufBias);
-  if Assigned(FBufX)    then clReleaseMemObject(FBufX);
-  if Assigned(FBufY)    then clReleaseMemObject(FBufY);
+  if Assigned(FBufW)     then clReleaseMemObject(FBufW);
+  if Assigned(FBufBias)  then clReleaseMemObject(FBufBias);
+  if Assigned(FBufX)     then clReleaseMemObject(FBufX);
+  if Assigned(FBufY)     then clReleaseMemObject(FBufY);
+  if Assigned(FBufHistA) then clReleaseMemObject(FBufHistA);
+  if Assigned(FBufHistB) then clReleaseMemObject(FBufHistB);
+  FNN.FreeKernelIfNotShared('cai_depthwise_conv1d_decode', FDecodeKernel);
   inherited Destroy();
 end;
 
@@ -36860,6 +36910,97 @@ begin
   Result := FOutputKernel;
 end;
 
+function TNNetDepthwiseConv1DCL.ForwardKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
+end;
+
+function TNNetDepthwiseConv1DCL.DecodeForwardKernel(): TNeuralKernel;
+begin
+  Result := FDecodeKernel;
+end;
+
+function TNNetDepthwiseConv1DCL.LiveHistoryBuffer(): cl_mem;
+begin
+  if FHistIsA then Result := FBufHistA else Result := FBufHistB;
+end;
+
+function TNNetDepthwiseConv1DCL.SpareHistoryBuffer(): cl_mem;
+begin
+  if FHistIsA then Result := FBufHistB else Result := FBufHistA;
+end;
+
+procedure TNNetDepthwiseConv1DCL.WaitOutputIfAnotherQueue(pNextKernel: TNeuralKernel);
+begin
+  if not Assigned(FOutputKernel) then exit;
+  if FOutputKernel.Commands = pNextKernel.Commands then exit;
+  FOutputKernel.Finish();
+end;
+
+procedure TNNetDepthwiseConv1DCL.UploadHistory(Hist: TNNetVolume);
+begin
+  // Both buffers are sized here: the ping-pong writes whichever is spare, and a
+  // buffer that grew holds nothing until a launch or an upload fills it.
+  FDecodeKernel.EnsureOutputBuffer(FBufHistA, FCapHistA, Hist);
+  FDecodeKernel.EnsureOutputBuffer(FBufHistB, FCapHistB, Hist);
+  FHistIsA := true;
+  FDecodeKernel.WriteBuffer(FBufHistA, Hist, CL_TRUE);
+end;
+
+procedure TNNetDepthwiseConv1DCL.DownloadHistory(Hist: TNNetVolume);
+var
+  HistBuffer: cl_mem;
+begin
+  HistBuffer := LiveHistoryBuffer();
+  if not Assigned(HistBuffer) then exit;
+  FDecodeKernel.Finish();
+  FDecodeKernel.ReadBuffer(HistBuffer, Hist, CL_TRUE);
+end;
+
+procedure TNNetDepthwiseConv1DCL.ComputeDecode(PackedW, Bias, X, Y: TNNetVolume;
+  SeqLen, Channels, Ksize, SuppressBias: integer; NewW: boolean = true;
+  pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+var
+  bufW, bufBias, bufX, bufY, bufHistIn, bufHistOut: cl_mem;
+  k: cl_kernel;
+  HistLen, Rows: integer;
+begin
+  k := FDecodeKernel.Kernel;
+  WaitOutputIfAnotherQueue(FDecodeKernel);
+  bufW    := FDecodeKernel.EnsureWriteBuffer(FBufW, FCapW, PackedW, NewW);
+  bufBias := FDecodeKernel.EnsureWriteBuffer(FBufBias, FCapBias, Bias, NewW);
+  if pExternalSrc <> nil
+    then bufX := pExternalSrc
+    else bufX := FDecodeKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+  bufY := FDecodeKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
+  bufHistIn  := LiveHistoryBuffer();
+  bufHistOut := SpareHistoryBuffer();
+  clSetKernelArg(k, 0, csLongintSize, @SeqLen);
+  clSetKernelArg(k, 1, csLongintSize, @Channels);
+  clSetKernelArg(k, 2, csLongintSize, @Ksize);
+  clSetKernelArg(k, 3, csLongintSize, @SuppressBias);
+  clSetKernelArg(k, 4, csCLMemSize, @bufW);
+  clSetKernelArg(k, 5, csCLMemSize, @bufBias);
+  clSetKernelArg(k, 6, csCLMemSize, @bufHistIn);
+  clSetKernelArg(k, 7, csCLMemSize, @bufX);
+  clSetKernelArg(k, 8, csCLMemSize, @bufY);
+  clSetKernelArg(k, 9, csCLMemSize, @bufHistOut);
+  // One work-item per (row, channel) over the longer of the two row counts: the
+  // window rows produce output, the first K-1 rows produce the new history.
+  HistLen := Ksize - 1;
+  if SeqLen > HistLen then Rows := SeqLen else Rows := HistLen;
+  FDecodeKernel.RunKernel(k, Rows * Channels);
+  // The advanced history is now the live one for the next token.
+  FHistIsA := not FHistIsA;
+  FOutputKernel := FDecodeKernel;
+  if not pKeepResultOnOpenCL then
+  begin
+    FDecodeKernel.Finish();
+    FDecodeKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  end;
+  // Buffers are persistent (FBuf*), reused next forward - not released here.
+end;
+
 procedure TNNetDepthwiseConv1DCL.Compute(PackedW, Bias, X, Y: TNNetVolume;
   SeqLen, Channels, Ksize, Off, SuppressBias: integer; NewW: boolean = true;
   pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
@@ -36868,6 +37009,7 @@ var
   k: cl_kernel;
 begin
   k := FKernel.Kernel;
+  WaitOutputIfAnotherQueue(FKernel);
   // Upload the input; allocate the result. The packed kernels + per-channel
   // biases are kept resident and only re-uploaded when NewW (a weight update
   // fired); see TNNetDepthwiseConv1D.ComputeOpenCL / AfterWeightUpdate.
@@ -59372,6 +59514,7 @@ begin
   FTapDirty := true;
   {$IFDEF OpenCL}
   FGpuWeightsDirty := true; // force the first device forward to upload weights
+  FDecHistOnOpenCL := false;
   {$ENDIF}
 end;
 
@@ -59462,11 +59605,20 @@ begin
   StartTime := Now();
   if FDecodeEnabled then
   begin
-    // Stateful token-by-token path: FDecHist lives host-side, so the OpenCL
-    // forward cannot run in decode mode however the source arrives.
+    // Stateful token-by-token path. cai_depthwise_conv1d_decode reads the K-1
+    // history rows where they lie and writes the advanced history back there,
+    // so a decode session runs in OpenCL memory from one token to the next.
     {$IFDEF OpenCL}
-    Inc(FForwardCPUCnt);
+    if WillOpenCL() then
+    begin
+      Inc(FForwardGPUCnt);
+      ComputeDecodeOpenCL();
+      FForwardTime := FForwardTime + (Now() - StartTime);
+      exit;
+    end
+    else Inc(FForwardCPUCnt);
     if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+    ForceDecodeHistoryOnRAM();
     // The host is about to write FOutput, so a later ForceOutputOnRAM must not
     // read whatever a previous OpenCL forward left in the helper's buffer.
     FOutputOnOpenCL := false;
@@ -59673,7 +59825,9 @@ begin
   // before any chunk is published, so every worker reads a finished table.
   {$IFDEF OpenCL}
   if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
-  // The chunks are about to write FOutput on the host (see Compute).
+  // The chunks are about to write FOutput on the host (see Compute), and in a
+  // decode session they also read and advance FDecHist there.
+  ForceDecodeHistoryOnRAM();
   FOutputOnOpenCL := false;
   FOutputOnRAM := true;
   {$ENDIF}
@@ -59716,10 +59870,13 @@ procedure TNNetDepthwiseConv1D.ResetState();
 begin
   FDecHist.Fill(0);          // empty history = the full-sweep left zero-pad
   FDecodeSteps := 0;
+  // FDecHist is authoritative again; the next OpenCL decode step uploads it.
+  {$IFDEF OpenCL} FDecHistOnOpenCL := false; {$ENDIF}
 end;
 
 procedure TNNetDepthwiseConv1D.CaptureState(Dst: TNNetVolume; out Steps: integer);
 begin
+  {$IFDEF OpenCL} ForceDecodeHistoryOnRAM(); {$ENDIF}
   Dst.ReSize(1, 1, FDecHist.Size);
   Dst.Copy(FDecHist);
   Steps := FDecodeSteps;
@@ -59729,14 +59886,16 @@ procedure TNNetDepthwiseConv1D.RestoreState(Src: TNNetVolume; Steps: integer);
 begin
   FDecHist.Copy(Src);
   FDecodeSteps := Steps;
+  {$IFDEF OpenCL} FDecHistOnOpenCL := false; {$ENDIF}
 end;
 
 {$IFDEF OpenCL}
 procedure TNNetDepthwiseConv1D.DisableOpenCL();
 begin
-  // FDepthwise1DCL owns the buffer a kept output lives in, so the host copy has
-  // to be recovered before the helper goes.
+  // FDepthwise1DCL owns the buffers a kept output and a live decode history
+  // live in, so both host copies have to be recovered before the helper goes.
   ForceOutputOnRAM();
+  ForceDecodeHistoryOnRAM();
   inherited DisableOpenCL();
   FreeAndNil(FDepthwise1DCL);
 end;
@@ -59768,6 +59927,12 @@ begin
   Result := Assigned(FDepthwise1DCL) and FHasOpenCL
             and (FShouldOpenCL or FForceOpenCL
                  or ((not FIsTrainable) and PrevOutputOnOpenCL()));
+  // cai_depthwise_conv1d_decode reads the history as the tokens BEFORE the
+  // window, which is the causal read only. PrepareDecodeState reports a
+  // non-causal decode session through FErrorProc, which prints and returns, so
+  // the mode is tested again here rather than assumed. The kernel is also
+  // forward-only, like every other OpenCL path in this layer.
+  if Result and FDecodeEnabled then Result := FCausal and (not FIsTrainable);
 end;
 
 function TNNetDepthwiseConv1D.OpenCLOutputBuffer(): cl_mem;
@@ -59810,10 +59975,7 @@ end;
 procedure TNNetDepthwiseConv1D.ComputeOpenCL();
 var
   Prev: TNNetVolume;
-  SeqLen, Channels, Ksize, c, kk, off: integer;
-  ChannelsM1, KsizeM1: integer;
-  W: TNNetVolume;
-  localNeuron: TNNetNeuron;
+  SeqLen, Channels, Ksize, off: integer;
   SourceBuffer: cl_mem;
 begin
   if ShouldBindPrevOutputOnOpenCL() then
@@ -59821,7 +59983,7 @@ begin
     // Read the source where it lies. The result goes to the helper's own output
     // buffer, so input and output are distinct handles and never alias.
     SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
-    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDepthwise1DCL.OutputKernel());
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDepthwise1DCL.ForwardKernel());
   end
   else
   begin
@@ -59832,26 +59994,9 @@ begin
   SeqLen := Prev.SizeX;
   Channels := FNeurons.Count;
   Ksize := FKernelSize;
-  ChannelsM1 := Channels - 1;
-  KsizeM1 := Ksize - 1;
   if FCausal then off := Ksize - 1 else off := Ksize shr 1;
 
-  // Pack the C per-channel kernels contiguously [c*K + kk] and gather the biases.
-  // Only when the weights changed (FGpuWeightsDirty); otherwise the resident
-  // device kernel/bias buffers are reused (NewW=false).
-  if FGpuWeightsDirty then
-  begin
-    FGemmWChan.ReSize(Channels * Ksize, 1, 1);
-    FGemmBias.ReSize(Channels, 1, 1);
-    for c := 0 to ChannelsM1 do
-    begin
-      localNeuron := FArrNeurons[c];
-      W := localNeuron.FWeights;
-      // #13: the per-channel kernel is a contiguous copy of W into slot c*Ksize.
-      Move(W.FData[0], FGemmWChan.FData[c * Ksize], Ksize * csNeuralFloatSize);
-      FGemmBias.FData[c] := localNeuron.FBiasWeight;
-    end;
-  end;
+  PackChannelKernels();
 
   // The result stays in OpenCL memory for the next layer to bind. WillOpenCL is
   // inference-only, so no host reader is left behind: anything that wants
@@ -59863,6 +60008,81 @@ begin
   FGpuWeightsDirty := false;
   FOutputOnOpenCL := true;
   FOutputOnRAM := false;
+end;
+
+// Packs the C per-channel kernels contiguously [c*K + kk] and gathers the
+// biases, only when the weights changed. Otherwise the resident kernel/bias
+// buffers are reused and the helper is called with NewW=false.
+procedure TNNetDepthwiseConv1D.PackChannelKernels();
+var
+  Channels, Ksize, c, ChannelsM1: integer;
+  W: TNNetVolume;
+  localNeuron: TNNetNeuron;
+begin
+  if not FGpuWeightsDirty then exit;
+  Channels := FNeurons.Count;
+  Ksize := FKernelSize;
+  ChannelsM1 := Channels - 1;
+  FGemmWChan.ReSize(Channels * Ksize, 1, 1);
+  FGemmBias.ReSize(Channels, 1, 1);
+  for c := 0 to ChannelsM1 do
+  begin
+    localNeuron := FArrNeurons[c];
+    W := localNeuron.FWeights;
+    // #13: the per-channel kernel is a contiguous copy of W into slot c*Ksize.
+    Move(W.FData[0], FGemmWChan.FData[c * Ksize], Ksize * csNeuralFloatSize);
+    FGemmBias.FData[c] := localNeuron.FBiasWeight;
+  end;
+end;
+
+procedure TNNetDepthwiseConv1D.EnsureDecodeHistoryOnOpenCL();
+begin
+  if FDecHistOnOpenCL or (not Assigned(FDepthwise1DCL)) then exit;
+  FDepthwise1DCL.UploadHistory(FDecHist);
+  FDecHistOnOpenCL := true;
+end;
+
+procedure TNNetDepthwiseConv1D.ForceDecodeHistoryOnRAM();
+begin
+  if (not FDecHistOnOpenCL) or (not Assigned(FDepthwise1DCL)) then exit;
+  FDepthwise1DCL.DownloadHistory(FDecHist);
+  FDecHistOnOpenCL := false;
+end;
+
+// Incremental-decode forward in OpenCL memory (causal only - see WillOpenCL).
+// cai_depthwise_conv1d_decode reads the K-1 history rows as the tokens before
+// the window and writes the advanced history into the helper's spare buffer, so
+// FDecHist stays untouched for the whole session: nothing but the kernel
+// arguments crosses to the host per token.
+procedure TNNetDepthwiseConv1D.ComputeDecodeOpenCL();
+var
+  Prev: TNNetVolume;
+  SeqLen, Channels, Ksize: integer;
+  SourceBuffer: cl_mem;
+begin
+  if ShouldBindPrevOutputOnOpenCL() then
+  begin
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDepthwise1DCL.DecodeForwardKernel());
+  end
+  else
+  begin
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+  end;
+  Prev := FPrevLayer.FOutput;
+  SeqLen := Prev.SizeX;
+  Channels := FNeurons.Count;
+  Ksize := FKernelSize;
+  PackChannelKernels();
+  EnsureDecodeHistoryOnOpenCL();
+  FDepthwise1DCL.ComputeDecode(FGemmWChan, FGemmBias, Prev, FOutput,
+    SeqLen, Channels, Ksize, FSuppressBias, {NewW}FGpuWeightsDirty,
+    SourceBuffer, {pKeepResultOnOpenCL=}true);
+  FGpuWeightsDirty := false;
+  FOutputOnOpenCL := true;
+  FOutputOnRAM := false;
+  Inc(FDecodeSteps, SeqLen);
 end;
 {$ENDIF}
 
