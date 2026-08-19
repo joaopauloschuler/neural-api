@@ -225,6 +225,8 @@ TEMPLATES = {
         "template": QWEN3_5_TEMPLATE,
         "bos": "",
         "eos": "<|im_end|>",
+        # no reasoning_effort in this template: only 'off' changes the render
+        "reasoning": True,
         # think-handling cases specific to this template (appended to the
         # shared CONVERSATIONS battery):
         "extra_conversations": [
@@ -251,6 +253,7 @@ TEMPLATES = {
         "template": QWEN3_8_TEMPLATE,
         "bos": "",
         "eos": "<|im_end|>",
+        "reasoning": True,
         "extra_conversations": [
             # earlier assistant turn carries a <think> block -> NOT split out
             # of the content and NOT stripped (the 3.6 behaviour reversed)
@@ -300,6 +303,32 @@ CONVERSATIONS = [
 ]
 
 
+# (messages, add_generation_prompt, reasoning_effort) conversations rendered
+# ONLY for the formats that carry a reasoning control. 'off' is
+# enable_thinking=False; the other three are the template's reasoning_effort
+# values. The default effort (xhigh) is already covered by CONVERSATIONS.
+EFFORT_CONVERSATIONS = [
+    ([{"role": "user", "content": "Hello, how are you?"}], True, "off"),
+    ([{"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "What is the capital of France?"}],
+     True, "off"),
+    ([{"role": "user", "content": "Hello, how are you?"}], True, "low"),
+    ([{"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "What is the capital of France?"}],
+     True, "low"),
+    ([{"role": "user", "content": "Hello, how are you?"}], True, "medium"),
+    ([{"role": "system", "content": "You are a helpful assistant."},
+      {"role": "user", "content": "What is the capital of France?"}],
+     True, "medium"),
+    # thinking off with a full exchange: the assistant history framing must
+    # not change with the effort, only the generation prompt does
+    ([{"role": "user", "content": "2+2?"},
+      {"role": "assistant", "content":
+       "<think>\nSimple arithmetic.\n</think>\n\n4"},
+      {"role": "user", "content": "And 3+3?"}], True, "off"),
+]
+
+
 def jinja_env():
     def raise_exception(message):
         raise ValueError(message)
@@ -318,13 +347,24 @@ def main():
     for name, spec in TEMPLATES.items():
         compiled = env.from_string(spec["template"])
         cases = []
-        for messages, add_gen in (
-                CONVERSATIONS + spec.get("extra_conversations", [])):
+        battery = [(messages, add_gen, None) for messages, add_gen in
+                   CONVERSATIONS + spec.get("extra_conversations", [])]
+        if spec.get("reasoning"):
+            battery += EFFORT_CONVERSATIONS
+        for messages, add_gen, effort in battery:
             case = {"messages": messages, "add_generation_prompt": add_gen}
+            kwargs = {}
+            if effort is not None:
+                case["reasoning_effort"] = effort
+                if effort == "off":
+                    kwargs["enable_thinking"] = False
+                else:
+                    kwargs["enable_thinking"] = True
+                    kwargs["reasoning_effort"] = effort
             try:
                 case["expected"] = compiled.render(
                     messages=messages, add_generation_prompt=add_gen,
-                    bos_token=spec["bos"], eos_token=spec["eos"])
+                    bos_token=spec["bos"], eos_token=spec["eos"], **kwargs)
             except ValueError as exc:
                 case["raises"] = True
                 case["error"] = str(exc)

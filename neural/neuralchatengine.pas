@@ -121,6 +121,10 @@ type
     RepPenaltySet: boolean;
     Seed: integer;               // < 0 = Randomize
     FormatName: string;          // '' = autodetect
+    // How much reasoning the chat template asks for. Only the formats with a
+    // reasoning control react (FormatHasReasoningControl): Qwen3.8 to all
+    // four values, Qwen3.5/3.6 to reOff. reXHigh is the HF default of both.
+    ReasoningEffort: TChatReasoningEffort;
     SystemPrompt: string;
     Prompt: string;              // ChatTerminal only: -p "text" runs this one
                                  // prompt and exits instead of opening the REPL
@@ -311,12 +315,17 @@ begin
   WriteLn('  --max-new-tokens N    reply length cap (default 8192)');
   WriteLn('  --seed N              RNG seed (default: randomize)');
   WriteLn('  --ctx N               context window (default min(model max,32768); KV RAM ~O(ctx))');
-  WriteLn('  --format NAME         chatml|llama2|llama3|zephyr|gemma|phi3|mistral|raw');
+  WriteLn('  --format NAME         chatml|qwen|qwen3_5|qwen3_8|llama2|llama3|zephyr|gemma|');
+  WriteLn('                        phi3|mistral|deepseek|phi4mini|llava|raw');
   WriteLn('                        raw = no chat template: plain text completion for');
   WriteLn('                        BASE models (gpt2, mamba-130m, ...); the model');
   WriteLn('                        continues a running transcript of what you type.');
   WriteLn('                        No end-of-turn marker - stops on EOS or the');
   WriteLn('                        --max-new-tokens cap (use a small cap, e.g. 128)');
+  WriteLn('  --reasoning-effort E  off|low|medium|xhigh (default xhigh). Qwen3.8 turns');
+  WriteLn('                        this into its reasoning_effort system instruction;');
+  WriteLn('                        Qwen3.5/3.6 only honour off (thinking disabled);');
+  WriteLn('                        every other format ignores it');
   WriteLn('  --system "msg"        initial system prompt');
   WriteLn('  --int8                int8 weight-only quantized inference (DEFAULT; less');
   WriteLn('                        RAM and faster on CPU and GPU: resident int8 codes)');
@@ -380,6 +389,7 @@ begin
   Result.RepPenaltySet := false;
   Result.Seed := -1;
   Result.FormatName := '';
+  Result.ReasoningEffort := reXHigh;
   Result.SystemPrompt := '';
   Result.Prompt := ''; // '' = interactive REPL; -p "text" runs one turn
   Result.SelfTest := false;
@@ -573,6 +583,15 @@ begin
     begin
       if not NextValue(Arg, SVal) then exit(false);
       Opt.FormatName := SVal;
+    end
+    else if Arg = '--reasoning-effort' then
+    begin
+      if not NextValue(Arg, SVal) then exit(false);
+      if not ReasoningEffortFromName(SVal, Opt.ReasoningEffort) then
+      begin
+        Opt.ErrorMsg := Arg + ': not off|low|medium|xhigh: ' + SVal;
+        exit(false);
+      end;
     end
     else if Arg = '--system' then
     begin
@@ -1187,6 +1206,16 @@ begin
   if RawMode then Line := Line + 'raw (completion)'
   else Line := Line + ChatFormatName(ChatFormat);
   Notice(Line + ', ' + BoolToStr(Opt.Int8, 'int8', 'fp32') + ' weights.');
+  // The reasoning effort is a no-op on a template without a reasoning
+  // control, so say which of the two happened rather than dropping it
+  // silently.
+  if FormatHasReasoningControl(ChatFormat) then
+    Notice('[reasoning effort ' + ReasoningEffortName(Opt.ReasoningEffort) +
+      ']')
+  else if Opt.ReasoningEffort <> reXHigh then
+    Notice('[reasoning effort ' + ReasoningEffortName(Opt.ReasoningEffort) +
+      ' ignored - ' + BoolToStr(RawMode, 'raw mode',
+      ChatFormatName(ChatFormat)) + ' has no reasoning control]');
   if Opt.NoCacheReuse then
     Notice('[KV-cache reuse OFF (--no-cache-reuse) - full re-prefill each turn]')
   else if ReuseOK then
@@ -1251,7 +1280,8 @@ var
   PromptIds: TNeuralIntegerArray;
 begin
   PromptIds := EncodeChat(Tokenizer, ChatFormat, Msgs,
-    {AddGenerationPrompt=}true);
+    ChatTemplateOptions({AddGenerationPrompt=}true,
+      {ContinueFinalMessage=}false, GenOpt.ReasoningEffort));
   Result := GenerateFromIds(PromptIds, GenOpt);
 end;
 

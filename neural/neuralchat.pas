@@ -159,6 +159,13 @@ type
   end;
   TChatMessages = array of TChatMessage;
 
+  // How much reasoning the prompt asks for. reLow/reMedium/reXHigh are the
+  // HF reasoning_effort values of the Qwen3.8 template; reOff is what Qwen
+  // spells enable_thinking=false (the generation prompt closes the reasoning
+  // block immediately instead of opening it). A template with no reasoning
+  // control renders the same for every value.
+  TChatReasoningEffort = (reOff, reLow, reMedium, reXHigh);
+
   // Optional knobs for the apply_chat_template overload (all default to the
   // v1 behavior, so existing callers are unaffected).
   TChatTemplateOptions = record
@@ -168,12 +175,18 @@ type
     // exclusive with AddGenerationPrompt (HF raises; here ContinueFinalMessage
     // wins and the generation prompt is suppressed).
     ContinueFinalMessage: boolean;
+    // Reasoning effort for the formats that carry a reasoning control
+    // (cfQwen3_8 for all four values, cfQwen3_5 for reOff); inert elsewhere.
+    // reXHigh is the HF default of both templates.
+    ReasoningEffort: TChatReasoningEffort;
   end;
 
-// Default options: AddGenerationPrompt as given, ContinueFinalMessage off.
+// Default options: AddGenerationPrompt as given, ContinueFinalMessage off,
+// reasoning effort at the HF default.
 function ChatTemplateOptions(
   AddGenerationPrompt: boolean = true;
-  ContinueFinalMessage: boolean = false): TChatTemplateOptions;
+  ContinueFinalMessage: boolean = false;
+  ReasoningEffort: TChatReasoningEffort = reXHigh): TChatTemplateOptions;
 
 // Convenience constructor: ChatMessage('user', 'Hi!').
 function ChatMessage(const Role, Content: string): TChatMessage;
@@ -211,6 +224,18 @@ function ApplyChatTemplateString(const ChatTemplate: string;
 // unrecognized names.
 function ChatFormatName(ChatFormat: TNeuralChatFormat): string;
 function ChatFormatFromName(const Name: string): TNeuralChatFormat;
+
+// 'off' | 'low' | 'medium' | 'xhigh' <-> TChatReasoningEffort.
+// ReasoningEffortFromName returns false and leaves Effort untouched when the
+// name is none of the four.
+function ReasoningEffortName(ReasoningEffort: TChatReasoningEffort): string;
+function ReasoningEffortFromName(const Name: string;
+  out ReasoningEffort: TChatReasoningEffort): boolean;
+
+// True when ChatFormat's template reacts to the reasoning effort at all:
+// cfQwen3_8 to all four values, cfQwen3_5 to reOff only. Every other format
+// renders identically whatever the effort, so a caller can say so.
+function FormatHasReasoningControl(ChatFormat: TNeuralChatFormat): boolean;
 
 // Fingerprints a chat_template Jinja string (no Jinja interpretation --
 // substring matching on the distinctive control tokens). cfUnknown when
@@ -272,6 +297,12 @@ function EncodeChat(Tokenizer: TNeuralHFTokenizer;
   ChatFormat: TNeuralChatFormat; const Messages: array of TChatMessage;
   AddGenerationPrompt: boolean = true): TNeuralIntegerArray; overload;
 
+// Options overload: EncodeChat carrying the reasoning effort (and the other
+// TChatTemplateOptions knobs) through to the renderer.
+function EncodeChat(Tokenizer: TNeuralHFTokenizer;
+  ChatFormat: TNeuralChatFormat; const Messages: array of TChatMessage;
+  const Options: TChatTemplateOptions): TNeuralIntegerArray; overload;
+
 // EncodeChat that also returns a parallel 0/1 assistant-tokens mask: mask[i]=1
 // iff token i belongs to the CONTENT of an assistant message (HF's
 // return_assistant_tokens_mask / {% generation %} span), so it can drive SFT
@@ -331,10 +362,41 @@ end;
 
 function ChatTemplateOptions(
   AddGenerationPrompt: boolean = true;
-  ContinueFinalMessage: boolean = false): TChatTemplateOptions;
+  ContinueFinalMessage: boolean = false;
+  ReasoningEffort: TChatReasoningEffort = reXHigh): TChatTemplateOptions;
 begin
   Result.AddGenerationPrompt := AddGenerationPrompt;
   Result.ContinueFinalMessage := ContinueFinalMessage;
+  Result.ReasoningEffort := ReasoningEffort;
+end;
+
+function ReasoningEffortName(ReasoningEffort: TChatReasoningEffort): string;
+begin
+  case ReasoningEffort of
+    reOff: Result := 'off';
+    reLow: Result := 'low';
+    reMedium: Result := 'medium';
+    else Result := 'xhigh';
+  end;
+end;
+
+function ReasoningEffortFromName(const Name: string;
+  out ReasoningEffort: TChatReasoningEffort): boolean;
+var
+  Lowered: string;
+begin
+  Lowered := LowerCase(Trim(Name));
+  Result := true;
+  if Lowered = 'off' then ReasoningEffort := reOff
+  else if Lowered = 'low' then ReasoningEffort := reLow
+  else if Lowered = 'medium' then ReasoningEffort := reMedium
+  else if Lowered = 'xhigh' then ReasoningEffort := reXHigh
+  else Result := false;
+end;
+
+function FormatHasReasoningControl(ChatFormat: TNeuralChatFormat): boolean;
+begin
+  Result := (ChatFormat = cfQwen3_5) or (ChatFormat = cfQwen3_8);
 end;
 
 // The Qwen2.5/Qwen default system message, injected verbatim when the
@@ -576,11 +638,19 @@ type
 
 const
   // The reasoning_effort='xhigh' sentence of the Qwen3.8 template, which is
-  // the effort it defaults to.
+  // the effort it defaults to. 'medium' resolves to no sentence at all.
   csQwen3_8XHighReasoning =
     'Reasoning effort is set to xhigh. Please think carefully through the ' +
     'task, validate key assumptions, consider plausible alternatives, and ' +
     'prioritize correctness, consistency, and clarity in the final answer.';
+  csQwen3_8LowReasoning =
+    'Reasoning effort is set to low. Keep your thinking brief and focused, ' +
+    'moving directly to the conclusion without unnecessary elaboration.';
+  // Generation-prompt suffix of the Qwen thinking templates: reasoning
+  // OPENED (every effort but reOff) versus closed empty (enable_thinking
+  // false).
+  csQwenThinkOpen = '<think>' + #10;
+  csQwenThinkClosed = '<think>' + #10#10 + '</think>' + #10#10;
 
 // Plain-ChatML defaults (cfChatML with InjectQwenDefaultSystem=false,
 // cfQwen with true).
@@ -595,25 +665,47 @@ begin
 end;
 
 // The Qwen3.5/Qwen3.6 option set (see the chat_template.jinja pinned in
-// tests/fixtures/qwen3_5_chat_template.jinja).
-function Qwen3_5CoreOptions: TChatMLCoreOptions;
+// tests/fixtures/qwen3_5_chat_template.jinja). That template has no
+// reasoning_effort, so only reOff (its enable_thinking=false) changes it.
+function Qwen3_5CoreOptions(
+  ReasoningEffort: TChatReasoningEffort): TChatMLCoreOptions;
 begin
   Result := ChatMLCoreOptions({InjectQwenDefaultSystem=}false);
   Result.TrimContents := true;
-  Result.GenPromptSuffix := '<think>' + #10;
+  if ReasoningEffort = reOff then
+    Result.GenPromptSuffix := csQwenThinkClosed
+  else
+    Result.GenPromptSuffix := csQwenThinkOpen;
   Result.ThinkStyle := tsSplitBeforeLastQuery;
 end;
 
 // The Qwen3.8 option set (see the chat_template.jinja pinned in
-// tests/fixtures/qwen3_8_chat_template.jinja).
-function Qwen3_8CoreOptions: TChatMLCoreOptions;
+// tests/fixtures/qwen3_8_chat_template.jinja). Thinking off also drops the
+// effort sentence: the template resolves the instructions only when
+// enable_thinking is on.
+function Qwen3_8CoreOptions(
+  ReasoningEffort: TChatReasoningEffort): TChatMLCoreOptions;
 begin
   Result := ChatMLCoreOptions({InjectQwenDefaultSystem=}false);
   Result.TrimContents := true;
-  Result.GenPromptSuffix := '<think>' + #10;
   Result.ThinkStyle := tsEmptyFrameAlways;
   Result.ReasoningSystemHeader := true;
-  Result.ReasoningInstructions := csQwen3_8XHighReasoning;
+  case ReasoningEffort of
+    reOff:
+      Result.GenPromptSuffix := csQwenThinkClosed;
+    reLow:
+      begin
+        Result.GenPromptSuffix := csQwenThinkOpen;
+        Result.ReasoningInstructions := csQwen3_8LowReasoning;
+      end;
+    reMedium:
+      Result.GenPromptSuffix := csQwenThinkOpen;
+    else
+      begin
+        Result.GenPromptSuffix := csQwenThinkOpen;
+        Result.ReasoningInstructions := csQwen3_8XHighReasoning;
+      end;
+  end;
 end;
 
 // Removes leading (Lead=true) / trailing (Lead=false) newline chars ONLY --
@@ -1901,10 +1993,12 @@ begin
   end;
 end;
 
-// Dispatches to the per-format renderer for a plain (no options) render.
+// Dispatches to the per-format renderer. ReasoningEffort reaches only the
+// formats that have a reasoning control (FormatHasReasoningControl).
 function RenderFormat(ChatFormat: TNeuralChatFormat;
   const Messages: array of TChatMessage;
-  AddGenerationPrompt: boolean): string;
+  AddGenerationPrompt: boolean;
+  ReasoningEffort: TChatReasoningEffort = reXHigh): string;
 var
   Spans: TChatSpanArray;
 begin
@@ -1913,9 +2007,9 @@ begin
     cfQwen: Result := RenderChatMLCore(Messages, AddGenerationPrompt,
       ChatMLCoreOptions({InjectQwenDefaultSystem=}true), Spans);
     cfQwen3_5: Result := RenderChatMLCore(Messages, AddGenerationPrompt,
-      Qwen3_5CoreOptions, Spans);
+      Qwen3_5CoreOptions(ReasoningEffort), Spans);
     cfQwen3_8: Result := RenderChatMLCore(Messages, AddGenerationPrompt,
-      Qwen3_8CoreOptions, Spans);
+      Qwen3_8CoreOptions(ReasoningEffort), Spans);
     cfLlama2: Result := RenderLlama2(Messages);
     cfLlama3: Result := RenderLlama3(Messages, AddGenerationPrompt);
     cfZephyr: Result := RenderZephyr(Messages, AddGenerationPrompt);
@@ -1941,7 +2035,8 @@ end;
 // from a moving cursor (content substrings are matched left to right).
 function RenderFormatWithSpans(ChatFormat: TNeuralChatFormat;
   const Messages: array of TChatMessage;
-  AddGenerationPrompt: boolean; out Spans: TChatSpanArray): string;
+  AddGenerationPrompt: boolean; out Spans: TChatSpanArray;
+  ReasoningEffort: TChatReasoningEffort = reXHigh): string;
 var
   Cnt, FoundAt, Cursor, MessagesHi, L: integer;
   C: string;
@@ -1952,17 +2047,18 @@ begin
   begin
     if ChatFormat = cfQwen3_5 then
       Result := RenderChatMLCore(Messages, AddGenerationPrompt,
-        Qwen3_5CoreOptions, Spans)
+        Qwen3_5CoreOptions(ReasoningEffort), Spans)
     else if ChatFormat = cfQwen3_8 then
       Result := RenderChatMLCore(Messages, AddGenerationPrompt,
-        Qwen3_8CoreOptions, Spans)
+        Qwen3_8CoreOptions(ReasoningEffort), Spans)
     else
       Result := RenderChatMLCore(Messages, AddGenerationPrompt,
         ChatMLCoreOptions({InjectQwenDefaultSystem=}ChatFormat = cfQwen),
         Spans);
     exit;
   end;
-  Result := RenderFormat(ChatFormat, Messages, AddGenerationPrompt);
+  Result := RenderFormat(ChatFormat, Messages, AddGenerationPrompt,
+    ReasoningEffort);
   // Generic span recovery: locate each assistant message's content in order.
   Cursor := 1;
   MessagesHi := High(Messages);
@@ -1988,7 +2084,8 @@ end;
 // content and rstrip. We compute it directly by rendering with the final
 // message empty so we can find exactly where its content ends.
 function RenderContinueFinal(ChatFormat: TNeuralChatFormat;
-  const Messages: array of TChatMessage): string;
+  const Messages: array of TChatMessage;
+  ReasoningEffort: TChatReasoningEffort = reXHigh): string;
 var
   Sentinel, Rendered: string;
   Tagged: TChatMessages;
@@ -2004,7 +2101,8 @@ begin
   MessagesHi := High(Messages);
   for Cnt := 0 to MessagesHi do Tagged[Cnt] := Messages[Cnt];
   Tagged[High(Tagged)].Content := Tagged[High(Tagged)].Content + Sentinel;
-  Rendered := RenderFormat(ChatFormat, Tagged, {AddGenerationPrompt=}false);
+  Rendered := RenderFormat(ChatFormat, Tagged, {AddGenerationPrompt=}false,
+    ReasoningEffort);
   TagLoc := Pos(Trim(Sentinel), Rendered);
   if TagLoc = 0 then
     raise ENeuralChatError.Create(
@@ -2025,9 +2123,11 @@ function ApplyChatTemplate(ChatFormat: TNeuralChatFormat;
   const Options: TChatTemplateOptions): string;
 begin
   if Options.ContinueFinalMessage then
-    Result := RenderContinueFinal(ChatFormat, Messages)
+    Result := RenderContinueFinal(ChatFormat, Messages,
+      Options.ReasoningEffort)
   else
-    Result := RenderFormat(ChatFormat, Messages, Options.AddGenerationPrompt);
+    Result := RenderFormat(ChatFormat, Messages, Options.AddGenerationPrompt,
+      Options.ReasoningEffort);
 end;
 
 function ApplyChatTemplateString(const ChatTemplate: string;
@@ -2065,6 +2165,14 @@ function EncodeChat(Tokenizer: TNeuralHFTokenizer;
 begin
   Result := Tokenizer.Encode(
     ApplyChatTemplate(ChatFormat, Messages, AddGenerationPrompt));
+end;
+
+function EncodeChat(Tokenizer: TNeuralHFTokenizer;
+  ChatFormat: TNeuralChatFormat; const Messages: array of TChatMessage;
+  const Options: TChatTemplateOptions): TNeuralIntegerArray;
+begin
+  Result := Tokenizer.Encode(
+    ApplyChatTemplate(ChatFormat, Messages, Options));
 end;
 
 function EncodeChatWithMask(Tokenizer: TNeuralHFTokenizer;

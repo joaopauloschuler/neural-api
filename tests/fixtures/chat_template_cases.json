@@ -1105,6 +1105,103 @@
     ],
     "add_generation_prompt": false,
     "expected": "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n<think>\nSimple arithmetic.\n</think>\n\n4<|im_end|>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello, how are you?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "reasoning_effort": "off",
+    "expected": "<|im_start|>user\nHello, how are you?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "reasoning_effort": "off",
+    "expected": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello, how are you?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "reasoning_effort": "low",
+    "expected": "<|im_start|>user\nHello, how are you?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "reasoning_effort": "low",
+    "expected": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello, how are you?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "reasoning_effort": "medium",
+    "expected": "<|im_start|>user\nHello, how are you?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "reasoning_effort": "medium",
+    "expected": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "2+2?"
+     },
+     {
+      "role": "assistant",
+      "content": "<think>\nSimple arithmetic.\n</think>\n\n4"
+     },
+     {
+      "role": "user",
+      "content": "And 3+3?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "reasoning_effort": "off",
+    "expected": "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
    }
   ]
  },
@@ -1258,6 +1355,103 @@
     ],
     "add_generation_prompt": true,
     "expected": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nPing<|im_end|>\n<|im_start|>assistant\n<think>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello, how are you?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "reasoning_effort": "off",
+    "expected": "<|im_start|>user\nHello, how are you?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "reasoning_effort": "off",
+    "expected": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello, how are you?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "reasoning_effort": "low",
+    "expected": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\nHello, how are you?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "reasoning_effort": "low",
+    "expected": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "Hello, how are you?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "reasoning_effort": "medium",
+    "expected": "<|im_start|>user\nHello, how are you?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "system",
+      "content": "You are a helpful assistant."
+     },
+     {
+      "role": "user",
+      "content": "What is the capital of France?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "reasoning_effort": "medium",
+    "expected": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is the capital of France?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+   },
+   {
+    "messages": [
+     {
+      "role": "user",
+      "content": "2+2?"
+     },
+     {
+      "role": "assistant",
+      "content": "<think>\nSimple arithmetic.\n</think>\n\n4"
+     },
+     {
+      "role": "user",
+      "content": "And 3+3?"
+     }
+    ],
+    "add_generation_prompt": true,
+    "reasoning_effort": "off",
+    "expected": "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<think>\nSimple arithmetic.\n</think>\n\n4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
    }
   ]
  }

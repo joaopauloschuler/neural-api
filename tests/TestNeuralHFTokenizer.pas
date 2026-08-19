@@ -1979,6 +1979,7 @@ var
   Cases, MsgArr: TJSONArray;
   Messages: TChatMessages;
   ChatFormat: TNeuralChatFormat;
+  Effort: TChatReasoningEffort;
   CaseCnt, MsgCnt: integer;
   Context, Rendered: string;
   Raised: boolean;
@@ -2005,12 +2006,17 @@ begin
         Messages[MsgCnt] := ChatMessage(MsgObj.Get('role', ''),
           MsgObj.Get('content', ''));
       end;
+      // Cases without a pinned reasoning_effort are the template default.
+      AssertTrue(Context + ': reasoning effort name',
+        ReasoningEffortFromName(CaseObj.Get('reasoning_effort', 'xhigh'),
+          Effort));
       if CaseObj.Get('raises', false) then
       begin
         Raised := false;
         try
-          ApplyChatTemplate(ChatFormat, Messages,
-            CaseObj.Get('add_generation_prompt', true));
+          ApplyChatTemplate(ChatFormat, Messages, ChatTemplateOptions(
+            CaseObj.Get('add_generation_prompt', true),
+            {ContinueFinalMessage=}false, Effort));
         except
           on E: ENeuralChatError do Raised := true;
         end;
@@ -2019,7 +2025,8 @@ begin
       else
       begin
         Rendered := ApplyChatTemplate(ChatFormat, Messages,
-          CaseObj.Get('add_generation_prompt', true));
+          ChatTemplateOptions(CaseObj.Get('add_generation_prompt', true),
+            {ContinueFinalMessage=}false, Effort));
         AssertEquals(Context, CaseObj.Get('expected', ''), Rendered);
       end;
     end;
