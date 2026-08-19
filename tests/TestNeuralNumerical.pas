@@ -65602,7 +65602,7 @@ var
   Depths: array of integer;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
-  i, InSize, CaseCnt, BranchPos, BranchCnt: integer;
+  i, InSize, CaseCnt, BranchPos, BranchCnt, ReplicaCount: integer;
   Diff, MaxDiff: TNeuralFloat;
   CaseName: string;
 begin
@@ -65611,9 +65611,10 @@ begin
     AssertTrue('no OpenCL device: SKIP', true);
     Exit;
   end;
-  for CaseCnt := 0 to 3 do
+  for CaseCnt := 0 to 6 do
   begin
     RandSeed := 424242;
+    ReplicaCount := 0;
     NN := TNNet.Create();
     Input := TNNetVolume.Create(6, 6, 8);
     OutCPU := TNNetVolume.Create();
@@ -65637,9 +65638,29 @@ begin
           CaseName := 'unequal depths 8|3|5';
           SetLength(Depths, 3); Depths[0] := 8; Depths[1] := 3; Depths[2] := 5;
         end;
+        3:
+        begin
+          CaseName := 'Replicate broadcast x6';
+          SetLength(Depths, 1); Depths[0] := 1;
+          ReplicaCount := 6;
+        end;
+        4:
+        begin
+          CaseName := 'unequal depths 5|11';
+          SetLength(Depths, 2); Depths[0] := 5; Depths[1] := 11;
+        end;
+        5:
+        begin
+          CaseName := 'unequal depths 8|3|5|4';
+          SetLength(Depths, 4);
+          Depths[0] := 8; Depths[1] := 3; Depths[2] := 5; Depths[3] := 4;
+        end;
       else
-        CaseName := 'Replicate broadcast x6';
-        SetLength(Depths, 1); Depths[0] := 1;
+        // A replica count the fused kernels cover: every FSrc slot binds the SAME
+        // buffer, so this checks that path instead of the broadcast launch.
+        CaseName := 'Replicate broadcast x3';
+        SetLength(Depths, 1); Depths[0] := 4;
+        ReplicaCount := 3;
       end;
       // ReLU convolutions: cai_dot_product applies the activation on the device,
       // which is what leaves each source output in device memory.
@@ -65648,8 +65669,8 @@ begin
       for BranchPos := 0 to BranchCnt - 1 do
         Branches[BranchPos] := NN.AddLayerAfter(
           TNNetConvolutionReLU.Create(Depths[BranchPos], 3, 1, 1), InputLayer);
-      if CaseCnt = 3
-        then ConcatLayer := TNNetDeepConcat.Replicate(6, Branches[0])
+      if ReplicaCount > 0
+        then ConcatLayer := TNNetDeepConcat.Replicate(ReplicaCount, Branches[0])
         else ConcatLayer := TNNetDeepConcat.Create(Branches);
       NN.AddLayer(ConcatLayer);
       // The device path is inference-only, so the concat never fires without this.

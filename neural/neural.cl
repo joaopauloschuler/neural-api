@@ -1775,6 +1775,100 @@ __kernel void cai_deep_concat
   FDst[pos * FOutDepth + outChannel] = FSrc[pos * FInDepth + (d % FInDepth)];
 }
 
+// CAI depth-axis concat fused over ALL sources (TNNetDeepConcat forward with 2,
+// 3 or 4 sources). One launch writes every output channel exactly once: the
+// source is chosen per channel from the FDepth* split points, which replaces
+// cai_deep_concat's one-launch-per-source loop. The source depths sum to
+// FOutDepth, so the last source's depth is derived and needs no argument.
+// Grid is (FOutDepth, FPositionCount) -- dim 0 is the CHANNEL here, not the
+// position as in cai_deep_concat. Dim 0 varies fastest across work-items and
+// the channel axis is the contiguous one, so both the read and the write
+// coalesce. The nested ?: chains compile to selects, so every work-item follows
+// one instruction stream and no wavefront diverges at a split point. A source
+// list whose entries are all the same layer needs no special case: the same
+// buffer simply binds to every FSrc slot. TNNetDeepConcat only dispatches these
+// when EVERY source output is ALREADY resident on the device, so nothing is
+// uploaded here and the result stays on the device until a host reader asks for
+// it. Coded by Claude (AI).
+__kernel void cai_deep_concat2
+(
+  const int FPositionCount,
+  const int FOutDepth,
+  const int FDepth0,
+  __global const float* FSrc0,
+  __global const float* FSrc1,
+  __global float* FDst
+)
+{
+  const int d = get_global_id(0);
+  const int pos = get_global_id(1);
+  if ((d >= FOutDepth) || (pos >= FPositionCount)) return;
+  const bool inFirst = (d < FDepth0);
+  __global const float* src = inFirst ? FSrc0 : FSrc1;
+  const int base = inFirst ? 0 : FDepth0;
+  const int inDepth = inFirst ? FDepth0 : (FOutDepth - FDepth0);
+  FDst[pos * FOutDepth + d] = src[pos * inDepth + (d - base)];
+}
+
+// Three-source form of cai_deep_concat2.
+__kernel void cai_deep_concat3
+(
+  const int FPositionCount,
+  const int FOutDepth,
+  const int FDepth0,
+  const int FDepth1,
+  __global const float* FSrc0,
+  __global const float* FSrc1,
+  __global const float* FSrc2,
+  __global float* FDst
+)
+{
+  const int d = get_global_id(0);
+  const int pos = get_global_id(1);
+  if ((d >= FOutDepth) || (pos >= FPositionCount)) return;
+  const int split1 = FDepth0 + FDepth1;
+  const bool inFirst = (d < FDepth0);
+  const bool inSecond = (d < split1);
+  __global const float* src = inFirst ? FSrc0 : (inSecond ? FSrc1 : FSrc2);
+  const int base = inFirst ? 0 : (inSecond ? FDepth0 : split1);
+  const int inDepth =
+    inFirst ? FDepth0 : (inSecond ? FDepth1 : (FOutDepth - split1));
+  FDst[pos * FOutDepth + d] = src[pos * inDepth + (d - base)];
+}
+
+// Four-source form of cai_deep_concat2.
+__kernel void cai_deep_concat4
+(
+  const int FPositionCount,
+  const int FOutDepth,
+  const int FDepth0,
+  const int FDepth1,
+  const int FDepth2,
+  __global const float* FSrc0,
+  __global const float* FSrc1,
+  __global const float* FSrc2,
+  __global const float* FSrc3,
+  __global float* FDst
+)
+{
+  const int d = get_global_id(0);
+  const int pos = get_global_id(1);
+  if ((d >= FOutDepth) || (pos >= FPositionCount)) return;
+  const int split1 = FDepth0 + FDepth1;
+  const int split2 = split1 + FDepth2;
+  const bool inFirst = (d < FDepth0);
+  const bool inSecond = (d < split1);
+  const bool inThird = (d < split2);
+  __global const float* src =
+    inFirst ? FSrc0 : (inSecond ? FSrc1 : (inThird ? FSrc2 : FSrc3));
+  const int base =
+    inFirst ? 0 : (inSecond ? FDepth0 : (inThird ? split1 : split2));
+  const int inDepth =
+    inFirst ? FDepth0 :
+      (inSecond ? FDepth1 : (inThird ? FDepth2 : (FOutDepth - split2)));
+  FDst[pos * FOutDepth + d] = src[pos * inDepth + (d - base)];
+}
+
 // CAI Depthwise Convolution 2-D forward (TNNetDepthwiseConv).
 // Coded by Claude (AI).
 // A TRUE per-channel convolution: output channel (n*FInDepth + d) reduces ONLY

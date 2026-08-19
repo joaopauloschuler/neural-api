@@ -12526,16 +12526,22 @@ type
     FDeepsChannel: TNeuralIntegerArray;
     FRemainingChannels: TNeuralIntegerArray;
     {$IFDEF OpenCL}
-    // Net-wide cai_deep_concat handle, borrowed from FNN in EnableOpenCL; the net
+    // Net-wide cai_deep_concat* handle, borrowed from FNN in EnableOpenCL; the net
     // owns and frees it. Its queue is also the queue the sources produced on.
     FConcatKernel: TNeuralKernel;
     // Persistent device buffer holding this layer's output. Allocated ONCE in
     // EnableOpenCL and reused by every forward, so no forward pass allocates.
     FConcatBuffer: cl_mem;
     FConcatBufSize: integer; // element capacity of FConcatBuffer
+    // 2..4 when a fused kernel binds every source and writes the whole output in
+    // one launch; 0 when the source count needs the per-source launch loop.
+    FFusedSlotCount: integer;
     // Every source is the SAME layer (what Replicate builds), so one launch tiles
-    // it across the output depth instead of one launch per replica.
+    // it across the output depth instead of one launch per replica. Only read on
+    // the per-source path: the fused kernels bind the same buffer to every slot.
     FIsBroadcast: boolean;
+    // Kernel name matching FFusedSlotCount, so acquire and free name the same one.
+    function ConcatKernelName(): string;
     // Scatters the already-resident source outputs into FConcatBuffer. The caller
     // checks WillOpenCL() and bumps FForwardGPUCnt.
     procedure ComputeOpenCL();
@@ -95662,7 +95668,7 @@ destructor TNNetDeepConcat.Destroy();
 begin
   {$IFDEF OpenCL}
   if Assigned(FConcatBuffer) then clReleaseMemObject(FConcatBuffer);
-  if Assigned(FNN) then FNN.FreeKernelIfNotShared('cai_deep_concat', FConcatKernel);
+  if Assigned(FNN) then FNN.FreeKernelIfNotShared(ConcatKernelName(), FConcatKernel);
   {$ENDIF}
   SetLength(FRemainingChannels, 0);
   SetLength(FDeepsLayer, 0);
@@ -95671,14 +95677,30 @@ begin
 end;
 
 {$IFDEF OpenCL}
+function TNNetDeepConcat.ConcatKernelName(): string;
+begin
+  case FFusedSlotCount of
+    2: Result := 'cai_deep_concat2';
+    3: Result := 'cai_deep_concat3';
+    4: Result := 'cai_deep_concat4';
+    else Result := 'cai_deep_concat';
+  end;
+end;
+
 procedure TNNetDeepConcat.EnableOpenCL(DotProductKernel: TNeuralKernel);
 var
-  MaxSourcePos, SourcePos: integer;
+  MaxSourcePos, SourcePos, SourceCount: integer;
 begin
   inherited EnableOpenCL(DotProductKernel);
+  // The source list is fixed at construction, so the arity verdict is too, and it
+  // has to precede the acquire below: it picks which kernel name to bind.
+  SourceCount := FPrevLayerList.Count;
+  if (SourceCount >= 2) and (SourceCount <= 4)
+    then FFusedSlotCount := SourceCount
+    else FFusedSlotCount := 0;
   // Acquire once: a second call would leak a private handle.
   if Assigned(FNN) and (not Assigned(FConcatKernel)) then
-    FConcatKernel := FNN.GetKernel('cai_deep_concat');
+    FConcatKernel := FNN.GetKernel(ConcatKernelName());
   if Assigned(FConcatBuffer) and (FConcatBufSize <> FOutput.Size) then
   begin
     clReleaseMemObject(FConcatBuffer);
@@ -95707,7 +95729,7 @@ begin
   // come back to RAM while that handle is still alive.
   ForceOutputOnRAM();
   inherited DisableOpenCL();
-  if Assigned(FNN) then FNN.FreeKernelIfNotShared('cai_deep_concat', FConcatKernel);
+  if Assigned(FNN) then FNN.FreeKernelIfNotShared(ConcatKernelName(), FConcatKernel);
 end;
 
 function TNNetDeepConcat.WillOpenCL(): boolean;
@@ -95734,7 +95756,7 @@ procedure TNNetDeepConcat.ComputeOpenCL();
 var
   Kern: cl_kernel;
   SourceBuffer: cl_mem;
-  MaxSourcePos, SourcePos: integer;
+  MaxSourcePos, SourcePos, FirstSourceArg: integer;
   iPositionCount, iOutDepth, iInDepth, iDestChannel: longint;
 begin
   FPrevLayerList.OpenCLWaitOutputIfAnotherQueue(FConcatKernel);
@@ -95743,34 +95765,61 @@ begin
   iOutDepth := FOutput.Depth;
   clSetKernelArg(Kern, 0, csLongintSize, @iPositionCount);
   clSetKernelArg(Kern, 1, csLongintSize, @iOutDepth);
-  clSetKernelArg(Kern, 5, csCLMemSize, @FConcatBuffer);
-  if FIsBroadcast then
+  if FFusedSlotCount > 0 then
   begin
-    // One launch over the whole output depth: the kernel's modulo tiles the
-    // single source across it.
-    iInDepth := FPrevOutput[0].Depth;
-    iDestChannel := 0;
-    SourceBuffer := FPrevLayerList[0].OpenCLOutputBuffer();
-    clSetKernelArg(Kern, 2, csLongintSize, @iInDepth);
-    clSetKernelArg(Kern, 3, csLongintSize, @iDestChannel);
-    clSetKernelArg(Kern, 4, csCLMemSize, @SourceBuffer);
-    FConcatKernel.RunKernel2D(Kern, iPositionCount, iOutDepth);
+    // One launch for every source: cai_deep_concat2/3/4 pick each output
+    // channel's source from the split points, so every channel is written once
+    // and the last source's depth stays implicit (the depths sum to iOutDepth).
+    // Argument order is (positions, outDepth, depth0..depthK-2, src0..srcK-1, dst).
+    MaxSourcePos := FFusedSlotCount - 1;
+    FirstSourceArg := 2 + MaxSourcePos;
+    for SourcePos := 0 to MaxSourcePos do
+    begin
+      SourceBuffer := FPrevLayerList[SourcePos].OpenCLOutputBuffer();
+      clSetKernelArg(Kern, FirstSourceArg + SourcePos, csCLMemSize, @SourceBuffer);
+      if SourcePos < MaxSourcePos then
+      begin
+        iInDepth := FPrevOutput[SourcePos].Depth;
+        clSetKernelArg(Kern, 2 + SourcePos, csLongintSize, @iInDepth);
+      end;
+    end;
+    clSetKernelArg(Kern, FirstSourceArg + FFusedSlotCount, csCLMemSize, @FConcatBuffer);
+    // Dim 0 is the channel, not the position: it varies fastest across
+    // work-items and the channel axis is the contiguous one, so the read and the
+    // write both coalesce.
+    FConcatKernel.RunKernel2D(Kern, iOutDepth, iPositionCount);
   end
   else
   begin
-    // One launch per source. The sources' depths sum to the output depth, so the
-    // blocks tile it exactly and every output channel is written once.
-    iDestChannel := 0;
-    MaxSourcePos := FPrevLayerList.Count - 1;
-    for SourcePos := 0 to MaxSourcePos do
+    clSetKernelArg(Kern, 5, csCLMemSize, @FConcatBuffer);
+    if FIsBroadcast then
     begin
-      iInDepth := FPrevOutput[SourcePos].Depth;
-      SourceBuffer := FPrevLayerList[SourcePos].OpenCLOutputBuffer();
+      // One launch over the whole output depth: the kernel's modulo tiles the
+      // single source across it.
+      iInDepth := FPrevOutput[0].Depth;
+      iDestChannel := 0;
+      SourceBuffer := FPrevLayerList[0].OpenCLOutputBuffer();
       clSetKernelArg(Kern, 2, csLongintSize, @iInDepth);
       clSetKernelArg(Kern, 3, csLongintSize, @iDestChannel);
       clSetKernelArg(Kern, 4, csCLMemSize, @SourceBuffer);
-      FConcatKernel.RunKernel2D(Kern, iPositionCount, iInDepth);
-      Inc(iDestChannel, iInDepth);
+      FConcatKernel.RunKernel2D(Kern, iPositionCount, iOutDepth);
+    end
+    else
+    begin
+      // One launch per source. The sources' depths sum to the output depth, so
+      // the blocks tile it exactly and every output channel is written once.
+      iDestChannel := 0;
+      MaxSourcePos := FPrevLayerList.Count - 1;
+      for SourcePos := 0 to MaxSourcePos do
+      begin
+        iInDepth := FPrevOutput[SourcePos].Depth;
+        SourceBuffer := FPrevLayerList[SourcePos].OpenCLOutputBuffer();
+        clSetKernelArg(Kern, 2, csLongintSize, @iInDepth);
+        clSetKernelArg(Kern, 3, csLongintSize, @iDestChannel);
+        clSetKernelArg(Kern, 4, csCLMemSize, @SourceBuffer);
+        FConcatKernel.RunKernel2D(Kern, iPositionCount, iInDepth);
+        Inc(iDestChannel, iInDepth);
+      end;
     end;
   end;
   // No read back here: the result stays on the device until a host reader calls
