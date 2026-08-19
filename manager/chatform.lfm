@@ -1,0 +1,97 @@
+object frmChat: TfrmChat
+  Left = 350
+  Height = 460
+  Top = 250
+  Width = 550
+  Caption = 'Local AI Chat'
+  ClientHeight = 460
+  ClientWidth = 550
+  Position = poScreenCenter
+  LCLVersion = '4.4.0.0'
+  OnClose = FormClose
+  OnCreate = FormCreate
+  OnDestroy = FormDestroy
+  OnShow = FormShow
+  object memChat: TMemo
+    Left = 10
+    Height = 330
+    Top = 10
+    Width = 530
+    Align = alClient
+    BorderSpacing.Around = 10
+    ReadOnly = True
+    ScrollBars = ssAutoVertical
+    TabOrder = 0
+  end
+  object pnlInput: TPanel
+    Left = 0
+    Height = 110
+    Top = 350
+    Width = 550
+    Align = alBottom
+    BevelOuter = bvNone
+    ClientHeight = 110
+    ClientWidth = 550
+    TabOrder = 1
+    object pnlRightButtons: TPanel
+      Left = 440
+      Height = 110
+      Top = 0
+      Width = 110
+      Align = alRight
+      BevelOuter = bvNone
+      ClientHeight = 110
+      ClientWidth = 110
+      TabOrder = 0
+      object btnSend: TButton
+        Left = 5
+        Height = 30
+        Top = 5
+        Width = 100
+        Caption = 'Enviar'
+        TabOrder = 0
+        OnClick = btnSendClick
+      end
+      object btnStop: TButton
+        Left = 5
+        Height = 30
+        Top = 40
+        Width = 100
+        Caption = 'Parar'
+        Enabled = False
+        TabOrder = 1
+        OnClick = btnStopClick
+      end
+      object btnAttach: TButton
+        Left = 5
+        Height = 30
+        Top = 75
+        Width = 100
+        Caption = 'Anexar'
+        TabOrder = 2
+        OnClick = btnAttachClick
+      end
+    end
+    object memQuestion: TMemo
+      Left = 5
+      Height = 100
+      Top = 5
+      Width = 430
+      Align = alClient
+      BorderSpacing.Around = 5
+      ScrollBars = ssAutoVertical
+      TabOrder = 1
+      OnKeyDown = memQuestionKeyDown
+    end
+  end
+  object CHATGPT1: TCHATGPT
+    Prompt = 'VocÃª Ã© um assistente.'
+    Dev = 'Voc'#195#170' '#195#169' um assistente.'
+    TipoChat = VCT_GPT4o
+    Provider = AIP_OPENAI
+    LocalIP = 'http://localhost:11434'
+    MaxTokens = 4096
+    Left = 85
+    Top = 37
+  end
+end
