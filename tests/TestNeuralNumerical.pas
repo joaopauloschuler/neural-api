@@ -358,6 +358,17 @@ type
     // owns several state columns and both grid-stride loops run more than one
     // iteration - the shape the two tests above never reach.
     procedure GatedDeltaNetWideHeadOpenCLParity;
+    // Token-by-token cached decode on OpenCL: the KV cache stays in OpenCL
+    // memory between tokens, appended in place, so every step must match the
+    // CPU cached path - and a mid-session CaptureCacheState/RestoreCacheState
+    // round trip must bring the cache home and put it back untouched.
+    procedure FusedSDPADecodeResidentOpenCLParity;
+    // The same decode with a sliding window and a Gemma-2 score soft-cap live,
+    // so the kernel's jStart and its tanh branch both run.
+    procedure FusedSDPAWindowedDecodeOpenCLParity;
+    // A cache built by the CPU path first, then handed to OpenCL mid-session:
+    // the live prefix must go up intact and the following steps must agree.
+    procedure FusedSDPAHandoffDecodeOpenCLParity;
     // OpenCL tap-diagonal coefficient-GEMV forward offload parity (vs CPU) for
     // TNNetKANConv (Chebyshev and B-spline basis).
     procedure TestKANConvOpenCLParity;
@@ -69245,6 +69256,192 @@ begin
   finally
     CpuOut.Free; Input.Free; NNGpu.Free; NNCpu.Free;
   end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Shared body of the three cached-decode parity tests: runs StepCnt single
+// token steps through a CPU network and an OpenCL network built the same way
+// and returns the largest output difference. CaptureAt >= 0 takes a cache
+// snapshot after that step on the OpenCL side and restores it before the next.
+function RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, Window,
+  CpuWarmupSteps, CaptureAt: integer; SoftCap: TNeuralFloat;
+  out GpuForwards: integer): TNeuralFloat;
+{$IFDEF OpenCL}
+var
+  NNCpu, NNGpu: TNNet;
+  StepIn, SnapK, SnapV: TNNetVolume;
+  LCpu, LGpu: TNNetFusedSDPA;
+  Mixer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  InDepth, OutDepth, T, D, SnapLen, SnapSinks, SnapWindow: integer;
+  Diff: TNeuralFloat;
+begin
+  Result := 0;
+  GpuForwards := 0;
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then Exit;
+  InDepth := (QHeads + 2 * KVHeads) * Dk;
+  OutDepth := QHeads * Dk;
+  NNCpu := TNNet.Create();
+  NNGpu := TNNet.Create();
+  StepIn := TNNetVolume.Create(1, 1, InDepth);
+  SnapK := TNNetVolume.Create();
+  SnapV := TNNetVolume.Create();
+  try
+    NNCpu.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+    LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, Window, SoftCap);
+    NNCpu.AddLayer(LCpu);
+    NNCpu.AddLayer(TNNetSiLU.Create());
+    NNCpu.SetTrainable(False, False);
+
+    NNGpu.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+    LGpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, Window, SoftCap);
+    Mixer := NNGpu.AddLayer(LGpu);
+    NNGpu.AddLayer(TNNetSiLU.Create());
+    NNGpu.SetTrainable(False, False);
+
+    LCpu.BeginIncrementalDecode(StepCnt);
+    LGpu.BeginIncrementalDecode(StepCnt);
+    for T := 0 to StepCnt - 1 do
+    begin
+      // The CPU network warms the OpenCL network's cache too: both run the same
+      // rows, so arming OpenCL late leaves a cache the host built.
+      if T = CpuWarmupSteps then
+        NNGpu.EnableOpenCL(PlatformId, DeviceId);
+      if (CaptureAt >= 0) and (T = CaptureAt + 1) then
+        LGpu.RestoreCacheState(SnapK, SnapV, SnapLen, SnapSinks, SnapWindow);
+      for D := 0 to InDepth - 1 do StepIn[0, 0, D] := 1.5 * (Random - 0.5);
+      NNCpu.Compute(StepIn);
+      NNGpu.Compute(StepIn);
+      for D := 0 to OutDepth - 1 do
+      begin
+        Diff := Abs(NNCpu.GetLastLayer.Output[0, 0, D] -
+                    NNGpu.GetLastLayer.Output[0, 0, D]);
+        if Diff > Result then Result := Diff;
+      end;
+      if (CaptureAt >= 0) and (T = CaptureAt) then
+        LGpu.CaptureCacheState(SnapK, SnapV, SnapLen, SnapSinks, SnapWindow);
+    end;
+    GpuForwards := Mixer.ForwardGPUCnt;
+    LGpu.EndIncrementalDecode();
+    LCpu.EndIncrementalDecode();
+  finally
+    SnapV.Free; SnapK.Free; StepIn.Free; NNGpu.Free; NNCpu.Free;
+  end;
+end;
+{$ELSE}
+begin
+  Result := 0;
+  GpuForwards := 0;
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPADecodeResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 3; StepCnt = 9; SnapshotStep = 4;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  NNProbe: TNNet;
+  Probe: TNNetLayer;
+  MaxDiff: TNeuralFloat;
+  GpuForwards: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260819;
+  // Only a resident source may put this layer on OpenCL, so the size verdict
+  // has to say no first - otherwise the test would pass without proving it.
+  NNProbe := TNNet.Create();
+  try
+    NNProbe.AddLayer(TNNetInput.Create(1, 1, (QHeads + 2 * KVHeads) * Dk, 1));
+    Probe := NNProbe.AddLayer(
+      TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, 0, 0));
+    NNProbe.SetTrainable(False, False);
+    NNProbe.EnableOpenCL(PlatformId, DeviceId);
+    AssertFalse('the single-token size verdict must leave it on the CPU',
+      Probe.ShouldOpenCL);
+  finally
+    NNProbe.Free;
+  end;
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
+    {CpuWarmupSteps=}0, SnapshotStep, {SoftCap=}0, GpuForwards);
+  WriteLn('  FusedSDPA OpenCL decode: max|diff|=', MaxDiff:0:9,
+    ' gpu forwards=', GpuForwards);
+  AssertEquals('every decode step must run on OpenCL', StepCnt, GpuForwards);
+  AssertTrue('OpenCL cached decode vs CPU cached decode: max |diff| = ' +
+    FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAWindowedDecodeOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 3; StepCnt = 9; Window = 3;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxDiff: TNeuralFloat;
+  GpuForwards: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260820;
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, Window,
+    {CpuWarmupSteps=}0, {CaptureAt=}-1, {SoftCap=}5.0, GpuForwards);
+  WriteLn('  FusedSDPA OpenCL windowed decode: max|diff|=', MaxDiff:0:9,
+    ' gpu forwards=', GpuForwards);
+  AssertEquals('every decode step must run on OpenCL', StepCnt, GpuForwards);
+  AssertTrue('windowed soft-capped decode: max |diff| = ' +
+    FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAHandoffDecodeOpenCLParity;
+{$IFDEF OpenCL}
+const
+  // Dk is deliberately not a divisor of the kernel's 256 lanes, so the
+  // grid-stride loops run a partial last iteration.
+  QHeads = 6; KVHeads = 3; Dk = 5; StepCnt = 8; WarmupSteps = 3;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxDiff: TNeuralFloat;
+  GpuForwards: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260821;
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
+    WarmupSteps, {CaptureAt=}-1, {SoftCap=}0, GpuForwards);
+  WriteLn('  FusedSDPA OpenCL cache handoff: max|diff|=', MaxDiff:0:9,
+    ' gpu forwards=', GpuForwards);
+  AssertEquals('only the steps after the handoff run on OpenCL',
+    StepCnt - WarmupSteps, GpuForwards);
+  AssertTrue('a cache built on the CPU then handed to OpenCL: max |diff| = ' +
+    FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
 end;
 {$ELSE}
 begin

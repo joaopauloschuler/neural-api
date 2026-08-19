@@ -127,6 +127,11 @@ type
     function RefreshHostInputBufferCache(buffer: cl_mem; cb: csize_t): cl_int;
     function WriteBuffer(buffer: cl_mem; cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_FALSE): integer; overload;
     function ReadBuffer(buffer: cl_mem; cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_TRUE): integer; overload;
+    // Partial transfer: moves cb bytes into/out of the buffer starting at
+    // offsetBytes, so a caller can refresh one live slice of a large
+    // persistent buffer without moving the whole allocation.
+    function WriteBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_FALSE): integer;
+    function ReadBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_TRUE): integer;
 
     function CreateInputBuffer(size: csize_t): cl_mem; overload; {$IFDEF Release} inline; {$ENDIF}
     function CreateHostInputBuffer(size: csize_t; ptr: Pointer): cl_mem; overload; {$IFDEF Release} inline; {$ENDIF}
@@ -1799,6 +1804,26 @@ begin
     then FErrorProc('ERROR: Out of computing resources - probably out of memory.')
     else FErrorProc('ERROR: Failed to read output array: ' + IntToStr(Result));
   end
+end;
+
+function TEasyOpenCL.WriteBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool): integer;
+begin
+  Result := clEnqueueWriteBuffer(FCommands, buffer, blocking, offsetBytes, cb, ptr, 0, nil, nil);
+  if (Result <> CL_SUCCESS) then
+  begin
+    FErrorProc('ERROR: Failed to write buffer slice: ' + IntToStr(Result) +
+      ' Offset:' + IntToStr(offsetBytes) + ' Size:' + IntToStr(cb) + ' bytes.');
+  end;
+end;
+
+function TEasyOpenCL.ReadBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool): integer;
+begin
+  Result := clEnqueueReadBuffer(FCommands, buffer, blocking, offsetBytes, cb, ptr, 0, nil, nil);
+  if (Result <> CL_SUCCESS) then
+  begin
+    FErrorProc('ERROR: Failed to read buffer slice: ' + IntToStr(Result) +
+      ' Offset:' + IntToStr(offsetBytes) + ' Size:' + IntToStr(cb) + ' bytes.');
+  end;
 end;
 
 function TEasyOpenCL.CreateInputBuffer(size: csize_t): cl_mem;

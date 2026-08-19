@@ -2108,6 +2108,168 @@ __kernel void cai_gated_delta_net
   }
 }
 
+// KV-CACHE APPEND FOR THE FUSED MULTI-HEAD ATTENTION DECODE (TNNetFusedSDPA).
+// Writes the current token's K and V rows, one per KV head, into cache slot
+// FCacheSlot. ONE WORK-GROUP PER KV HEAD; the lanes split the head dimension.
+//
+// The cache is HEAD-MAJOR: head g's rows are the contiguous block starting at
+// g*FCacheMax*FDk, so slot (g*FCacheMax + position) addresses one row and the
+// decode kernel below reads each head's key stream contiguously. This is the
+// layout TNNetFusedSDPA.AppendRow already writes on the host side.
+//
+// The token row is [ Q (FQW) | K (FKW) | V (FKW) ], so head g's key slice
+// starts at FQW + g*FDk and its value slice at FQW + FKW + g*FDk.
+// This kernel and cai_sdpa_decode share one command queue and are enqueued in
+// that order, so the in-order queue is what makes the appended row visible -
+// there is no cross-work-group synchronization and none is needed.
+// Coded by Claude (AI).
+__kernel void cai_sdpa_append_kv
+(
+  const int FKVHeads,
+  const int FDk,
+  const int FCacheMax,
+  const int FCacheSlot,
+  const int FQW,
+  const int FKW,
+  __global const float* FX,
+  __global float* FKCache,
+  __global float* FVCache
+)
+{
+  const int g = get_group_id(1);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  if (g >= FKVHeads) return;
+  const int dst = (g * FCacheMax + FCacheSlot) * FDk;
+  const int kSrc = FQW + g * FDk;
+  const int vSrc = FQW + FKW + g * FDk;
+  for (int d = lid; d < FDk; d += lsize)
+  {
+    FKCache[dst + d] = FX[kSrc + d];
+    FVCache[dst + d] = FX[vSrc + d];
+  }
+}
+
+// CACHED-DECODE SCALED DOT-PRODUCT ATTENTION (TNNetFusedSDPA), one token over
+// the resident KV cache. ONE WORK-GROUP PER QUERY HEAD: the head's score band
+// is private to its work-group, so every synchronization this kernel needs is
+// an intra-work-group barrier and no cross-work-group ordering is ever
+// required. Launch 2-D with global (LocalSize, FQHeads) and local (LocalSize,
+// 1); LocalSize must be a power of two (the tree reductions halve it).
+// FScratch is LocalSize + FDk floats of __local memory.
+//
+// Query head h reads KV head h/FGroupSize (grouped-query attention) and runs
+// three phases over the live cache [jStart..FCacheLen-1]:
+//   1. lanes split the key axis: score j = dot(q, K[j]) * FInvSqrtDk, the
+//      Gemma-2 soft-cap when FScoreSoftCap > 0, then a tree max;
+//   2. the same partition exponentiates in place and tree-sums the normalizer;
+//   3. lanes split the head dimension: out[d] = sum_j P[j] * V[j][d], each lane
+//      accumulating over the whole key range and dividing once at the end.
+// The score band lives in global memory (FScores, FQHeads*FCacheMax floats)
+// rather than __local because a long context does not fit in a work-group's
+// local memory; it is written and read only by the one work-group that owns
+// it, so the barrier between phases 2 and 3 carries a global memory fence.
+//
+// FWindow > 0 is the sliding-window mask: jStart = FCacheLen - FWindow. The
+// causal mask needs no code at all - the cache holds only committed tokens, so
+// every live row is attendable. Forward-only, and the caller restricts it to a
+// single-token step: prefill, eviction, segment masking and the int8 cache all
+// stay on the host path. Coded by Claude (AI).
+__kernel void cai_sdpa_decode
+(
+  const int FQHeads,
+  const int FGroupSize,
+  const int FDk,
+  const int FCacheMax,
+  const int FCacheLen,
+  const int FWindow,
+  const float FInvSqrtDk,
+  const float FScoreSoftCap,
+  const float FInvScoreSoftCap,
+  __global const float* FX,
+  __global const float* FKCache,
+  __global const float* FVCache,
+  __global float* FScores,
+  __global float* FY,
+  __local float* FScratch
+)
+{
+  const int h = get_group_id(1);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  int s, d, j;
+  if (h >= FQHeads) return;
+
+  __local float* qloc = FScratch + lsize;
+
+  const int g = h / FGroupSize;
+  const int qBase = h * FDk;
+  const int plane = g * FCacheMax * FDk;
+  const int scoreBase = h * FCacheMax;
+  const int jStart = ((FWindow > 0) && (FCacheLen > FWindow))
+                     ? (FCacheLen - FWindow) : 0;
+
+  for (d = lid; d < FDk; d += lsize) qloc[d] = FX[qBase + d];
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  // ---- phase 1: scores over the live cache, then the row max ----
+  float m = -1e30f;
+  for (j = jStart + lid; j < FCacheLen; j += lsize)
+  {
+    __global const float* krow = FKCache + plane + j * FDk;
+    float acc = 0.0f;
+    for (d = 0; d < FDk; d++) acc = mad(qloc[d], krow[d], acc);
+    float sc = acc * FInvSqrtDk;
+    if (FScoreSoftCap > 0.0f)
+      sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
+    FScores[scoreBase + j] = sc;
+    m = fmax(m, sc);
+  }
+  FScratch[lid] = m;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] = fmax(FScratch[lid], FScratch[lid + s]);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float MaxScore = FScratch[0];
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  // ---- phase 2: shifted exp in place (same lane owns the same j), then the
+  // normalizer ----
+  float partial = 0.0f;
+  for (j = jStart + lid; j < FCacheLen; j += lsize)
+  {
+    const float e = exp(FScores[scoreBase + j] - MaxScore);
+    FScores[scoreBase + j] = e;
+    partial += e;
+  }
+  FScratch[lid] = partial;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] += FScratch[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float SumExp = FScratch[0];
+  // Phase 3 reads score entries written by OTHER lanes, so the fence spans
+  // global memory too.
+  barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+  // ---- phase 3: the value sum, one output dimension per lane ----
+  // SumExp = 0 cannot arise here (the live range is never empty and exp of the
+  // shifted max is 1), but the host path zeroes the row in that case and this
+  // matches it.
+  const float InvSumExp = (SumExp > 0.0f) ? (1.0f / SumExp) : 0.0f;
+  for (d = lid; d < FDk; d += lsize)
+  {
+    float acc = 0.0f;
+    for (j = jStart; j < FCacheLen; j++)
+      acc = mad(FScores[scoreBase + j], FVCache[plane + j * FDk + d], acc);
+    FY[qBase + d] = acc * InvSumExp;
+  }
+}
+
 // FUSED MIXTURE-OF-EXPERTS DOWN PROJECTION (TNNetMoEExpertBankDown).
 // Computes the whole gate-weighted expert mixture of one MoE block in a single
 // launch:
