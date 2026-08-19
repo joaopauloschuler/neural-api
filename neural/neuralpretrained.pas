@@ -15282,10 +15282,10 @@ type
     SharedGate: TNNetLayer;
     // Qwen3.5 "linear_attention" gated-DeltaNet mixer layers
     // (Config.LinearAttnLayers[i] = True; see BuildQwen35DeltaNetBranch):
-    // in_proj_qkv / depthwise conv1d / in_proj_z / in_proj_b / in_proj_a /
+    // in_proj_qkv / depthwise conv1d / the FUSED in_proj_z|b|a projection /
     // the TNNetGatedDeltaNet leaf / out_proj. nil on full-attention layers
     // and for every other family.
-    LinQKV, LinConv, LinZ, LinB, LinA, LinDelta, LinOut: TNNetLayer;
+    LinQKV, LinConv, LinZBA, LinDelta, LinOut: TNNetLayer;
   end;
 
 // Wires Mixtral's block_sparse_moe FFN from primitives onto MoESource (the
@@ -15968,8 +15968,10 @@ end;
 //   mixed = SiLU(causal depthwise conv-K(in_proj_qkv(u)))  [the q|k|v slab,
 //           conv_dim = 2*key_dim + value_dim; the conv is BIAS-FREE and
 //           reuses TNNetDepthwiseConv1D's conv-state incremental decode]
-//   z     = in_proj_z(u); b = in_proj_b(u); a = in_proj_a(u)  [NOT conv'd]
-//   mixer input = [ mixed(q|k|v) | z | b | a ]  (TNNetDeepConcat - exactly
+//   z|b|a = in_proj_zba(u)  [NOT conv'd; ONE projection holding the
+//           in_proj_{z,b,a} rows stacked in that order, which is already the
+//           channel order the concat below wants, so no split is needed]
+//   mixer input = [ mixed(q|k|v) | z|b|a ]  (TNNetDeepConcat - exactly
 //           the channel order TNNetGatedDeltaNet's contract requires; q/k go
 //           in RAW, the leaf does the L2 norm + 1/sqrt(Dk) query scale and
 //           the repeat_interleave q/k head broadcast internally)
@@ -15992,17 +15994,11 @@ begin
   Block.LinConv := NN.AddLayer( TNNetDepthwiseConv1D.Create(
     Config.LinearConvKernel, {pCausal=}true, {pSuppressBias=}1) );
   ConvAct := NN.AddLayer( TNNetSiLU.Create() );
-  Block.LinZ := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(ValueDim).SetTrainable(pTrainable),
+  Block.LinZBA := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(
+      ValueDim + 2 * Config.LinearNumVHeads).SetTrainable(pTrainable),
     Source);
-  Block.LinB := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Config.LinearNumVHeads).SetTrainable(pTrainable),
-    Source);
-  Block.LinA := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(Config.LinearNumVHeads).SetTrainable(pTrainable),
-    Source);
-  NN.AddLayer( TNNetDeepConcat.Create(
-    [ConvAct, Block.LinZ, Block.LinB, Block.LinA]) );
+  NN.AddLayer( TNNetDeepConcat.Create([ConvAct, Block.LinZBA]) );
   Block.LinDelta := NN.AddLayer( TNNetGatedDeltaNet.Create(
     Config.LinearNumKHeads, Config.LinearNumVHeads,
     Config.LinearKeyHeadDim, Config.LinearValueHeadDim,
@@ -16014,7 +16010,8 @@ end;
 // Loads one Qwen3.5 linear_attn.* tensor set into the DeltaNet branch wired
 // by BuildQwen35DeltaNetBranch. The in_proj_{qkv,z,b,a} and out_proj weights
 // are plain bias-free nn.Linear rows (NO rotary permutation - the leaf
-// consumes the raw channel order); conv1d.weight is the depthwise
+// consumes the raw channel order); in_proj_{z,b,a} stack into the single
+// Block.LinZBA projection at neuron offsets 0 / ValueDim / ValueDim+Hv; conv1d.weight is the depthwise
 // [conv_dim, 1, K] slab with NO bias (HF ships conv1d bias=False; the tap
 // order maps DIRECTLY onto TNNetDepthwiseConv1D's causal read, the Mamba
 // convention); A_log [Hv], dt_bias [Hv] and norm.weight [Dv] land in
@@ -16027,7 +16024,7 @@ procedure LoadQwen35DeltaNetWeights(Reader: TNNetSafeTensorsReader;
   const Config: TLlamaConfig; Consumed: TStringList);
 var
   LinPrefix, TName: string;
-  KeyDim, ValueDim, ConvDim, d, Base: integer;
+  KeyDim, ValueDim, ConvDim, ZBADim, d, Base: integer;
   ConvDimM1: integer;
   Tmp, WV: TNNetVolume;
 
@@ -16050,20 +16047,25 @@ begin
   KeyDim := Config.LinearNumKHeads * Config.LinearKeyHeadDim;
   ValueDim := Config.LinearNumVHeads * Config.LinearValueHeadDim;
   ConvDim := 2 * KeyDim + ValueDim;
+  ZBADim := ValueDim + 2 * Config.LinearNumVHeads;
   LinPrefix := BlockPrefix + 'linear_attn.';
   LoadLlamaLinearWeights(Reader, Block.LinQKV,
     LinPrefix + 'in_proj_qkv.weight', Config.HiddenSize, ConvDim);
   Consumed.Add(LinPrefix + 'in_proj_qkv.weight');
-  LoadLlamaLinearWeights(Reader, Block.LinZ,
-    LinPrefix + 'in_proj_z.weight', Config.HiddenSize, ValueDim);
+  LoadLlamaLinearWeights(Reader, Block.LinZBA,
+    LinPrefix + 'in_proj_z.weight', Config.HiddenSize, ValueDim,
+    {NeuronBase=}0, {ExpectedNeurons=}ZBADim);
   Consumed.Add(LinPrefix + 'in_proj_z.weight');
-  LoadLlamaLinearWeights(Reader, Block.LinB,
+  LoadLlamaLinearWeights(Reader, Block.LinZBA,
     LinPrefix + 'in_proj_b.weight', Config.HiddenSize,
-    Config.LinearNumVHeads);
+    Config.LinearNumVHeads,
+    {NeuronBase=}ValueDim, {ExpectedNeurons=}ZBADim);
   Consumed.Add(LinPrefix + 'in_proj_b.weight');
-  LoadLlamaLinearWeights(Reader, Block.LinA,
+  LoadLlamaLinearWeights(Reader, Block.LinZBA,
     LinPrefix + 'in_proj_a.weight', Config.HiddenSize,
-    Config.LinearNumVHeads);
+    Config.LinearNumVHeads,
+    {NeuronBase=}ValueDim + Config.LinearNumVHeads,
+    {ExpectedNeurons=}ZBADim);
   Consumed.Add(LinPrefix + 'in_proj_a.weight');
   // conv1d.weight [conv_dim, 1, K] depthwise, NO bias. HF left-pads K-1
   // zeros and truncates to seq_len: y[t] = sum_k w[k]*x[t-(K-1)+k] -

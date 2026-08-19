@@ -5009,12 +5009,14 @@ begin
     {pTrainable=}false, FixturePath('tiny_qwen3_5_moe_config.json'),
     {pQuantizeInt8=}true);
   try
-    // 4 blocks x (attention 4 + router 1 + the two fused expert banks +
-    // shared gate/up/down/gate-logit 3) = 40, plus the LM head. The expert
-    // banks are TWO quantized layers per block whatever the expert count, so
-    // this no longer scales with num_experts.
+    // 4 blocks x (router 1 + the two fused expert banks + shared
+    // gate/up/down/gate-logit 3) = 24, plus the token mixers (3
+    // linear_attention x in_proj_qkv|in_proj_zba|out_proj = 9, 1
+    // full_attention x q|k|v|o = 4) and the LM head = 38. The expert banks
+    // are TWO quantized layers per block whatever the expert count, so this
+    // no longer scales with num_experts.
     AssertInt8DriftPair('Qwen3.5-MoE', NNFP32, NNQ, 8, Config.VocabSize,
-      {MinQuantLayers=}40, {MaxRelDrift=}5e-1, {TwoChannelInput=}false);
+      {MinQuantLayers=}38, {MaxRelDrift=}5e-1, {TwoChannelInput=}false);
   finally
     NNQ.Free;
     NNFP32.Free;
@@ -5116,7 +5118,7 @@ begin
   try
     // The experts alone are 4 blocks x 4 experts x 2 layers.
     AssertInt8StreamCodeParity('Qwen3.5-MoE', NNStreamed, NNRoundTrip,
-      {MinCmpLayers=}40);
+      {MinCmpLayers=}38);
   finally
     NNRoundTrip.Free;
     NNStreamed.Free;
