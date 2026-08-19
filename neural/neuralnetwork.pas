@@ -73525,14 +73525,22 @@ begin
 end;
 
 procedure TNNetSigmoid.Compute();
+var
+  StartTime: double;
 begin
+  StartTime := Now();
   // Forward-only device path (gated off in production - see WillOpenCL). It
   // writes FOutput directly; FOutputRaw (read only by the CPU backward) is left
   // untouched, so the path stays inference-only. Shared by TNNetHyperbolicTangent
   // (it inherits this Compute; its FActivationOpcode selects tanh on device).
-  if ComputeActivationOnOpenCL() then exit;
+  if ComputeActivationOnOpenCL() then
+  begin
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   FOutputRaw.CopyNoChecks(FPrevLayer.FOutput);
   ApplyActivationFunctionToOutput();
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetSigmoid.Backpropagate();
@@ -105749,7 +105757,12 @@ end;
 {$ENDIF}
 
 procedure TNNetInput.Compute();
+var
+  StartTime: double;
 begin
+  // The inherited Compute does not time itself, so the whole body is timed here
+  // and the upload below is part of what this layer costs.
+  StartTime := Now();
   inherited Compute();
   {$IFDEF OpenCL}
   // TNNet.Compute wrote FOutput from the host just before this call.
@@ -105763,6 +105776,7 @@ begin
     // Host-only forward: the output is offered in RAM alone, as on a
     // non-OpenCL build.
     Inc(FForwardCPUCnt);
+    FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
   end;
   // Non-blocking: the write and its consumers share the net-wide in-order
@@ -105775,6 +105789,7 @@ begin
   end
   else Inc(FForwardCPUCnt);
   {$ENDIF}
+  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 { TNNetEmbedding }
