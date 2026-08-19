@@ -1072,6 +1072,10 @@ __kernel void cai_l2norm_perdepth
 //   3 = gelu-erf    -> GEGLUErf  (A * B * 0.5*(1+erf(B/sqrt(2))))
 // One work-item per (token, output-channel). Forward-only; the formulas are the
 // exact analytic forms used by the scalar CPU Compute() so parity is < 1e-4.
+// The sigmoid and tanh here are cai_activation's stable forms, not the direct
+// ones: PoCL runs kernels on the host CPU, where the host process leaves
+// floating-point exceptions unmasked, so an exp that overflows inside the
+// library kills the process instead of saturating. Coded by Claude (AI).
 __kernel void cai_glu_gate
 (
   const int FNumTokens,
@@ -1090,16 +1094,31 @@ __kernel void cai_glu_gate
   const float a = FX[inBase + d];
   const float b = FX[inBase + FHalfDepth + d];
   float gated;
-  if (FActFlag == 0)            // GLU: sigmoid(B)
-    gated = 1.0f / (1.0f + exp(-b));
-  else if (FActFlag == 1)       // SwiGLU: swish(B) = B*sigmoid(B)
-    gated = b * (1.0f / (1.0f + exp(-b)));
+  if (FActFlag <= 1)            // GLU: sigmoid(B) / SwiGLU: swish(B) = B*sigmoid(B)
+  {
+    // Two-branch sigmoid: the negative side evaluates exp(b), which UNDERFLOWS
+    // to zero instead of overflowing, so no clamp is needed on either side.
+    float sig;
+    if (b > 0.0f)
+      sig = 1.0f / (1.0f + exp(-b));
+    else
+    {
+      const float s = exp(b);
+      sig = s / (1.0f + s);
+    }
+    if (FActFlag == 0) gated = sig; else gated = b * sig;
+  }
   else if (FActFlag == 2)       // GEGLU: gelu_tanh(B)
   {
     const float SQRT_2_OVER_PI = 0.7978845608f;
     const float GELU_CONST = 0.044715f;
-    const float arg = SQRT_2_OVER_PI * (b + GELU_CONST * b * b * b);
-    gated = b * 0.5f * (1.0f + tanh(arg));
+    // The cubic term drives arg past 100 by |B| ~ 15, and tanh is already 1.0f
+    // in single precision by |arg| ~ 9, so clamping to cai_activation's [-10,10]
+    // changes no representable result and keeps exp(-2*arg) at exp(20).
+    float arg = SQRT_2_OVER_PI * (b + GELU_CONST * b * b * b);
+    if (arg > 10.0f) arg = 10.0f; else if (arg < -10.0f) arg = -10.0f;
+    const float e = exp(-2.0f * arg);
+    gated = b * 0.5f * (1.0f + (1.0f - e) / (1.0f + e));
   }
   else                          // GEGLUErf: gelu_erf(B)
   {
@@ -1287,6 +1306,35 @@ __kernel void cai_embedding_gather
     FY[gid] = FW[row * FEmbeddingSize + e];
 }
 
+// Int8 twin of cai_embedding_gather (TNNetEmbedding under --int8). FCodes holds
+// the same row-major table as FW above with one symmetric int8 code per element,
+// and FScales one FP32 scale per vocab row: the dequantized value of element e of
+// row t is FCodes[t*FEmbeddingSize + e] * FScales[t], exactly what the host
+// TNNetVolumeQuant8.DequantizeRowTo computes. Argument order keeps the FP32
+// prefix (FScales last, as cai_moe_expert_down_int8 does) so one host call site
+// serves both entry points. Coded by Claude (AI).
+__kernel void cai_embedding_gather_int8
+(
+  const int FNumTokens,
+  const int FEmbeddingSize,
+  __global const int* FTokenRows,
+  __global const char* FCodes,
+  __global float* FY,
+  __global const float* FScales
+)
+{
+  const int gid = get_global_id(0);
+  const int total = FNumTokens * FEmbeddingSize;
+  if (gid >= total) return;
+  const int e = gid % FEmbeddingSize;
+  const int c = gid / FEmbeddingSize;
+  const int row = FTokenRows[c];
+  if (row < 0)
+    FY[gid] = 0.0f;
+  else
+    FY[gid] = convert_float(FCodes[row * FEmbeddingSize + e]) * FScales[row];
+}
+
 // Device-side im2col: builds the convolution's FInputPrepared column matrix
 // straight into device memory, so only the small (padded) input crosses the bus
 // instead of the ~FeatureSizeX*FeatureSizeY-times-larger column matrix, and the
@@ -1466,10 +1514,16 @@ __kernel void cai_softmax
 
 // CAI shared elementwise activation forward. One work-item per element applies
 // the function selected by FOpcode (kept in sync with the csAct* constants in
-// neuralnetwork.pas): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent. This single
-// kernel backs every opting-in TNNetIdentity activation descendant via
-// TNNetActivationCL, so new elementwise activations only add a case here plus an
-// opcode. Forward-only: the host keeps the backward pass (and, for ReLU, the
+// neuralnetwork.pas): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent, 4 = Swish,
+// 5 = GELU, 6 = GELUErf, 7 = HardSwish, 8 = HardSigmoid, 9 = ELU, 10 = SELU,
+// 11..23 = the branch-and-arithmetic activations (Abs through BentIdentity),
+// 24 = ReLUL.
+// This single kernel backs every opting-in TNNetIdentity activation descendant,
+// so new elementwise activations only add a case here plus an opcode. FParamA,
+// FParamB and FParamC carry the per-layer constants of the parameterized
+// activations (a slope, a lambda, a pair of limits and their leak); cases that
+// take none ignore them.
+// Forward-only: the host keeps the backward pass (and, for ReLU, the
 // derivative gate mask). The sigmoid/tanh math mirrors the scalar CPU forms -
 // the two-branch stable sigmoid and the [-10,10]-clamped tanh - so the device
 // result tracks the host to ~1e-6 (exp here is more accurate than the CPU
@@ -1478,6 +1532,9 @@ __kernel void cai_activation
 (
   const int FSize,
   const int FOpcode,
+  const float FParamA,
+  const float FParamB,
+  const float FParamC,
   __global const float* FX,
   __global float* FY
 )
@@ -1508,10 +1565,308 @@ __kernel void cai_activation
       y = (1.0f - e) / (1.0f + e);
       break;
     }
+    case 4: // Swish / SiLU: x * sigmoid(x), sigmoid in the same two-branch form
+      if (x > 0.0f)
+        y = x / (1.0f + exp(-x));
+      else
+      {
+        const float s = exp(x);
+        y = x * s / (1.0f + s);
+      }
+      break;
+    case 5: // GELU (tanh approximation): x * 0.5 * (1 + tanh(arg))
+    {
+      const float SQRT_2_OVER_PI = 0.7978845608f;
+      const float GELU_CONST = 0.044715f;
+      // The cubic term drives arg past 100 by |x| ~ 15, and tanh is already 1.0f
+      // in single precision by |arg| ~ 9, so the [-10,10] clamp changes no
+      // representable result and keeps exp(-2*arg) at exp(20).
+      float arg = SQRT_2_OVER_PI * (x + GELU_CONST * x * x * x);
+      if (arg > 10.0f) arg = 10.0f; else if (arg < -10.0f) arg = -10.0f;
+      const float e = exp(-2.0f * arg);
+      y = x * 0.5f * (1.0f + (1.0f - e) / (1.0f + e));
+      break;
+    }
+    case 6: // GELUErf (exact form): x * 0.5 * (1 + erf(x/sqrt(2)))
+    {
+      const float INV_SQRT_2 = 0.7071067811865476f;
+      y = x * 0.5f * (1.0f + erf(x * INV_SQRT_2));
+      break;
+    }
+    case 7: // HardSwish: x for x > 3, 0 for x < -3, else x*(x+3)/6
+      if (x > 3.0f) y = x;
+      else if (x < -3.0f) y = 0.0f;
+      else y = x * (x + 3.0f) / 6.0f;
+      break;
+    case 8: // HardSigmoid: 1 for x > 3, 0 for x < -3, else (x+3)/6
+      if (x > 3.0f) y = 1.0f;
+      else if (x < -3.0f) y = 0.0f;
+      else y = (x + 3.0f) / 6.0f;
+      break;
+    case 9: // ELU: x for x > 0, else alpha*(exp(x)-1). FParamA = alpha.
+      // exp is evaluated only on the negative branch, where it underflows
+      // towards zero rather than overflowing, so no clamp is needed.
+      if (x > 0.0f) y = x; else y = FParamA * (exp(x) - 1.0f);
+      break;
+    case 10: // SELU: scale*x for x > 0, else scale*alpha*exp(x) - scale*alpha.
+      // FParamA = scale*alpha and FParamB = scale, both passed in from the layer
+      // so the device uses the very floats the host multiplied.
+      if (x > 0.0f) y = FParamB * x; else y = FParamA * exp(x) - FParamA;
+      break;
+    case 11: // Abs
+      y = fabs(x);
+      break;
+    case 12: // Sign: +1 above zero, -1 below, 0 at exactly zero
+      if (x > 0.0f) y = 1.0f; else if (x < 0.0f) y = -1.0f; else y = 0.0f;
+      break;
+    case 13: // Square
+      y = x * x;
+      break;
+    case 14: // SquaredReLU: x*x for x > 0, else 0
+      y = (x > 0.0f) ? x * x : 0.0f;
+      break;
+    case 15: // LeakyReLU: x for x > 0, else slope*x. FParamA = slope.
+      y = (x > 0.0f) ? x : FParamA * x;
+      break;
+    case 16: // ShiftedReLU: max(x, -1)
+      y = (x > -1.0f) ? x : -1.0f;
+      break;
+    case 17: // HardTanh: clamp to [-1,1]
+      if (x > 1.0f) y = 1.0f; else if (x < -1.0f) y = -1.0f; else y = x;
+      break;
+    case 18: // HardShrink: x outside [-lambda,lambda], else 0. FParamA = lambda.
+      y = ((x > FParamA) || (x < -FParamA)) ? x : 0.0f;
+      break;
+    case 19: // SoftShrink: shrink towards zero by lambda. FParamA = lambda.
+      if (x > FParamA) y = x - FParamA;
+      else if (x < -FParamA) y = x + FParamA;
+      else y = 0.0f;
+      break;
+    case 20: // Threshold: x above theta, else a fixed value.
+      y = (x > FParamA) ? x : FParamB;   // FParamA = theta, FParamB = value
+      break;
+    case 21: // Clamp to [FParamA, FParamB]
+      if (x <= FParamA) y = FParamA;
+      else if (x >= FParamB) y = FParamB;
+      else y = x;
+      break;
+    case 22: // SoftSign: x / (1 + |x|)
+      y = x / (1.0f + fabs(x));
+      break;
+    case 23: // BentIdentity: (sqrt(x^2 + 1) - 1)/2 + x
+      y = (sqrt(x * x + 1.0f) - 1.0f) * 0.5f + x;
+      break;
+    case 24: // ReLUL: leaky clamp into [FParamA, FParamB]. FParamC = slope.
+      if (x > FParamB) y = FParamB + (x - FParamB) * FParamC;
+      else if (x > FParamA) y = x;
+      else y = FParamA + (x - FParamA) * FParamC;
+      break;
     default: // csActNone / unknown: pass through
       y = x;
   }
   FY[i] = y;
+}
+
+// CAI multi-source elementwise sum (TNNetSum forward). One work-item per element
+// adds FCount (1..4) same-sized sources into FDst; with FAccumulate the sources
+// are added to what FDst already holds, so more than 4 sources finish in
+// ceil(sources/4) launches. TNNetSum only dispatches this when EVERY source
+// output is ALREADY resident on the device, so nothing is uploaded here and the
+// result stays on the device until a host reader asks for it. Slots the launch
+// does not use repeat the first source (never a NULL argument) and are kept out
+// of the sum by FCount. Coded by Claude (AI).
+__kernel void cai_volume_sum
+(
+  const int FSize,
+  const int FCount,
+  const int FAccumulate,
+  __global const float* FA,
+  __global const float* FB,
+  __global const float* FC,
+  __global const float* FD,
+  __global float* FDst
+)
+{
+  const int i = get_global_id(0);
+  if (i >= FSize) return;
+  float total = (FAccumulate != 0) ? FDst[i] : 0.0f;
+  total += FA[i];
+  if (FCount > 1) total += FB[i];
+  if (FCount > 2) total += FC[i];
+  if (FCount > 3) total += FD[i];
+  FDst[i] = total;
+}
+
+// CAI two-source elementwise product, one work-item per element. FB is either
+// the same length as FA (FBSize = FSize: TNNetCellMulByCell, a plain cellwise
+// product) or one value per channel (FBSize = Depth: TNNetChannelMulByLayer,
+// broadcast over the (X,Y) positions - a volume is depth-contiguous, so channel
+// i % FBSize). The comparison below is uniform across the work-items, so the
+// cellwise case never evaluates the modulo. Both layers only dispatch this when
+// BOTH source outputs are ALREADY resident on the device, so nothing is uploaded
+// here and the product stays on the device until a host reader asks for it.
+// Coded by Claude (AI).
+__kernel void cai_cell_mul
+(
+  const int FSize,
+  const int FBSize,
+  __global const float* FA,
+  __global const float* FB,
+  __global float* FDst
+)
+{
+  const int i = get_global_id(0);
+  if (i >= FSize) return;
+  const int j = (FBSize == FSize) ? i : (i % FBSize);
+  FDst[i] = FA[i] * FB[j];
+}
+
+// CAI channel gather (TNNetSplitChannels forward). Output element (pos, d) is
+// source element (pos, FChannelIdx[d]), so one kernel covers both a contiguous
+// channel run and the arbitrary channel list of TNNetSplitChannelEvery. A
+// position is an (X,Y) site: both volumes share SizeX/SizeY, so pos indexes the
+// same site in each and only the depth stride differs. TNNetSplitChannels only
+// dispatches this when the source output is ALREADY resident on the device, so
+// nothing is uploaded here and the slice stays on the device until a host reader
+// asks for it. Launched 2-D: dim 0 = position, dim 1 = output channel.
+// Coded by Claude (AI).
+__kernel void cai_split_channels
+(
+  const int FPositionCount,
+  const int FOutDepth,
+  const int FInDepth,
+  __global const int* FChannelIdx,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int pos = get_global_id(0);
+  const int d = get_global_id(1);
+  if ((pos >= FPositionCount) || (d >= FOutDepth)) return;
+  FDst[pos * FOutDepth + d] = FSrc[pos * FInDepth + FChannelIdx[d]];
+}
+
+// CAI depth-axis scatter (TNNetDeepConcat forward). Writes one source into the
+// output channels [FDestChannel .. FDestChannel+get_global_size(1)-1], reading
+// source channel (d % FInDepth). Two ways to launch it: dim 1 = FInDepth per
+// source scatters that source's own contiguous block (the modulo is then an
+// identity), and dim 1 = FOutDepth with FDestChannel = 0 tiles ONE source across
+// the whole output depth - the broadcast a same-layer source list asks for, in a
+// single launch instead of one per replica. TNNetDeepConcat only dispatches this
+// when EVERY source output is ALREADY resident on the device, so nothing is
+// uploaded here and the result stays on the device until a host reader asks for
+// it. Dim 0 is the (X,Y) position: all sources share the output's SizeX/SizeY,
+// so pos indexes the same site in each. Coded by Claude (AI).
+__kernel void cai_deep_concat
+(
+  const int FPositionCount,
+  const int FOutDepth,
+  const int FInDepth,
+  const int FDestChannel,
+  __global const float* FSrc,
+  __global float* FDst
+)
+{
+  const int pos = get_global_id(0);
+  const int d = get_global_id(1);
+  if (pos >= FPositionCount) return;
+  const int outChannel = FDestChannel + d;
+  if (outChannel >= FOutDepth) return;
+  FDst[pos * FOutDepth + outChannel] = FSrc[pos * FInDepth + (d % FInDepth)];
+}
+
+// CAI depth-axis concat fused over ALL sources (TNNetDeepConcat forward with 2,
+// 3 or 4 sources). One launch writes every output channel exactly once: the
+// source is chosen per channel from the FDepth* split points, which replaces
+// cai_deep_concat's one-launch-per-source loop. The source depths sum to
+// FOutDepth, so the last source's depth is derived and needs no argument.
+// Grid is (FOutDepth, FPositionCount) -- dim 0 is the CHANNEL here, not the
+// position as in cai_deep_concat. Dim 0 varies fastest across work-items and
+// the channel axis is the contiguous one, so both the read and the write
+// coalesce. The nested ?: chains compile to selects, so every work-item follows
+// one instruction stream and no wavefront diverges at a split point. A source
+// list whose entries are all the same layer needs no special case: the same
+// buffer simply binds to every FSrc slot. TNNetDeepConcat only dispatches these
+// when EVERY source output is ALREADY resident on the device, so nothing is
+// uploaded here and the result stays on the device until a host reader asks for
+// it. Coded by Claude (AI).
+__kernel void cai_deep_concat2
+(
+  const int FPositionCount,
+  const int FOutDepth,
+  const int FDepth0,
+  __global const float* FSrc0,
+  __global const float* FSrc1,
+  __global float* FDst
+)
+{
+  const int d = get_global_id(0);
+  const int pos = get_global_id(1);
+  if ((d >= FOutDepth) || (pos >= FPositionCount)) return;
+  const bool inFirst = (d < FDepth0);
+  __global const float* src = inFirst ? FSrc0 : FSrc1;
+  const int base = inFirst ? 0 : FDepth0;
+  const int inDepth = inFirst ? FDepth0 : (FOutDepth - FDepth0);
+  FDst[pos * FOutDepth + d] = src[pos * inDepth + (d - base)];
+}
+
+// Three-source form of cai_deep_concat2.
+__kernel void cai_deep_concat3
+(
+  const int FPositionCount,
+  const int FOutDepth,
+  const int FDepth0,
+  const int FDepth1,
+  __global const float* FSrc0,
+  __global const float* FSrc1,
+  __global const float* FSrc2,
+  __global float* FDst
+)
+{
+  const int d = get_global_id(0);
+  const int pos = get_global_id(1);
+  if ((d >= FOutDepth) || (pos >= FPositionCount)) return;
+  const int split1 = FDepth0 + FDepth1;
+  const bool inFirst = (d < FDepth0);
+  const bool inSecond = (d < split1);
+  __global const float* src = inFirst ? FSrc0 : (inSecond ? FSrc1 : FSrc2);
+  const int base = inFirst ? 0 : (inSecond ? FDepth0 : split1);
+  const int inDepth =
+    inFirst ? FDepth0 : (inSecond ? FDepth1 : (FOutDepth - split1));
+  FDst[pos * FOutDepth + d] = src[pos * inDepth + (d - base)];
+}
+
+// Four-source form of cai_deep_concat2.
+__kernel void cai_deep_concat4
+(
+  const int FPositionCount,
+  const int FOutDepth,
+  const int FDepth0,
+  const int FDepth1,
+  const int FDepth2,
+  __global const float* FSrc0,
+  __global const float* FSrc1,
+  __global const float* FSrc2,
+  __global const float* FSrc3,
+  __global float* FDst
+)
+{
+  const int d = get_global_id(0);
+  const int pos = get_global_id(1);
+  if ((d >= FOutDepth) || (pos >= FPositionCount)) return;
+  const int split1 = FDepth0 + FDepth1;
+  const int split2 = split1 + FDepth2;
+  const bool inFirst = (d < FDepth0);
+  const bool inSecond = (d < split1);
+  const bool inThird = (d < split2);
+  __global const float* src =
+    inFirst ? FSrc0 : (inSecond ? FSrc1 : (inThird ? FSrc2 : FSrc3));
+  const int base =
+    inFirst ? 0 : (inSecond ? FDepth0 : (inThird ? split1 : split2));
+  const int inDepth =
+    inFirst ? FDepth0 :
+      (inSecond ? FDepth1 : (inThird ? FDepth2 : (FOutDepth - split2)));
+  FDst[pos * FOutDepth + d] = src[pos * inDepth + (d - base)];
 }
 
 // CAI Depthwise Convolution 2-D forward (TNNetDepthwiseConv).
@@ -1614,6 +1969,587 @@ __kernel void cai_depthwise_conv1d
     acc = mad(FW[wBase + kk], FX[srcT * FChannels + c], acc);
   }
   FY[gid] = acc;
+}
+
+// CAI DEPTHWISE 1-D CONVOLUTION, INCREMENTAL DECODE (TNNetDepthwiseConv1D
+// inside a decode session). The same causal per-channel sweep as
+// cai_depthwise_conv1d, except that the K-1 rows preceding the window are read
+// from FHistIn instead of being zero-padded, and this kernel ALSO writes the
+// K-1 rows that follow the window into FHistOut -- so the history never travels
+// back to the host between tokens.
+// Concatenated rows: 0..K-2 are FHistIn, K-1..K-2+FSeqLen are FX. Then
+//   out[t,c] = (FSuppressBias ? 0 : FBias[c])
+//              + sum_kk FW[c*FKsize + kk] * row(t + kk)[c]
+// which is the causal read [t-(K-1) .. t] with FHistIn filling srcT < 0 --
+// matching TNNetDepthwiseConv1D.ComputeDecodeCPURange tap for tap.
+// FHistOut MUST be a different buffer from FHistIn (the host ping-pongs the
+// two): work-items write it while others are still reading FHistIn.
+// One work-item per (row, channel) over max(FSeqLen, K-1) rows; a work-item
+// past both row counts writes nothing, so no explicit total guard is needed.
+__kernel void cai_depthwise_conv1d_decode
+(
+  const int FSeqLen,
+  const int FChannels,
+  const int FKsize,
+  const int FSuppressBias,
+  __global const float* FW,
+  __global const float* FBias,
+  __global const float* FHistIn,
+  __global const float* FX,
+  __global float* FY,
+  __global float* FHistOut
+)
+{
+  const int gid = get_global_id(0);
+  const int c = gid % FChannels;
+  const int t = gid / FChannels;
+  const int HistLen = FKsize - 1;
+  if (t < FSeqLen)
+  {
+    float acc = (FSuppressBias == 0) ? FBias[c] : 0.0f;
+    const int wBase = c * FKsize;
+    for (int kk = 0; kk < FKsize; kk++)
+    {
+      const int srcT = t - HistLen + kk;
+      const float xv = (srcT >= 0) ? FX[srcT * FChannels + c]
+                                   : FHistIn[(HistLen + srcT) * FChannels + c];
+      acc = mad(FW[wBase + kk], xv, acc);
+    }
+    FY[t * FChannels + c] = acc;
+  }
+  if (t < HistLen)
+  {
+    // New history row t is concatenated row FSeqLen + t.
+    const int r = FSeqLen + t;
+    FHistOut[gid] = (r < HistLen) ? FHistIn[r * FChannels + c]
+                                  : FX[(r - HistLen) * FChannels + c];
+  }
+}
+
+// GATED DELTA-RULE RECURRENCE (TNNetGatedDeltaNet), the token mixer of the
+// Qwen3.5 / Qwen3-Next "linear_attention" blocks. ONE WORK-GROUP PER VALUE
+// HEAD: the left-to-right scan is sequential in t but strictly per head, so a
+// head runs its WHOLE sequence inside one work-group and no cross-work-group
+// synchronization is ever needed. Launch 2-D with global (LocalSize,
+// FNumVHeads) and local (LocalSize, 1); LocalSize must be a power of two (the
+// tree reductions halve it). FScratch is LocalSize + 2*FHeadDimK + FHeadDimV
+// floats of __local memory.
+//
+// Input row t is [ q (Hk*Dk) | k (Hk*Dk) | v (Hv*Dv) | z (Hv*Dv) | b (Hv) |
+// a (Hv) ]; the six channel offsets arrive as arguments so this kernel never
+// restates the layout. Per t, value head h (key head h / FRep):
+//   qn = q * rsqrt(sum(q^2) + eps) * FScale;  kn = k * rsqrt(sum(k^2) + eps)
+//   beta  = sigmoid(b);  decay = exp(-exp(min(A_log,30)) * softplus(a+dt_bias))
+//   err   = v - decay * (S^T kn)
+//   S     = decay * S + kn (x) beta*err
+//   o     = S^T qn
+//   out   = o * rsqrt(mean(o^2) + eps) * w * silu(z)
+// err is folded with the decay so the state is decayed and rewritten in ONE
+// pass, and the read-out accumulates from the value just written, so a token
+// touches each state element exactly twice: once to read, once to rewrite.
+// Lane e owns column e of the (Dk,Dv) state for the whole token, which keeps
+// err and o private and makes adjacent lanes read adjacent floats.
+//
+// FResetState = 1 starts the scan from S = 0 (the full-sequence forward);
+// FResetState = 0 carries the resident state bank in, which is what lets an
+// incremental decode session step without touching RAM. Forward-only: no per-t
+// cache is written, so Backpropagate has nothing to read after this kernel.
+// Coded by Claude (AI).
+__kernel void cai_gated_delta_net
+(
+  const int FSeqLen,
+  const int FNumVHeads,
+  const int FHeadDimK,
+  const int FHeadDimV,
+  const int FRep,
+  const int FInDepth,
+  const int FQOff,
+  const int FKOff,
+  const int FVOff,
+  const int FZOff,
+  const int FBOff,
+  const int FAOff,
+  const int FResetState,
+  const float FEps,
+  const float FScale,
+  __global const float* FALog,
+  __global const float* FDtBias,
+  __global const float* FNormW,
+  __global const float* FX,
+  __global float* FS,
+  __global float* FY,
+  __local float* FScratch
+)
+{
+  const int h = get_group_id(1);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  const int Dk = FHeadDimK;
+  const int Dv = FHeadDimV;
+  const int kh = h / FRep;
+  int s, d, e, i, t;
+
+  __local float* kn = FScratch + lsize;
+  __local float* qn = kn + Dk;
+  __local float* oloc = qn + Dk;
+
+  __global float* S = FS + (h * Dk) * Dv;
+  // ea is invariant across t.
+  const float ea = exp(fmin(FALog[h], 30.0f));
+  const int qBase = FQOff + kh * Dk;
+  const int kBase = FKOff + kh * Dk;
+  const int vBase = FVOff + h * Dv;
+  const int zBase = FZOff + h * Dv;
+  const int yHead = h * Dv;
+  const int yStride = FNumVHeads * Dv;
+
+  for (t = 0; t < FSeqLen; t++)
+  {
+    const int xRow = t * FInDepth;
+    float partial;
+
+    // ---- q/k per-head L2 norm; eps INSIDE the squared sum, as HF does it ----
+    partial = 0.0f;
+    for (i = lid; i < Dk; i += lsize)
+    {
+      const float qv = FX[xRow + qBase + i];
+      partial = mad(qv, qv, partial);
+    }
+    FScratch[lid] = partial;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (s = lsize >> 1; s > 0; s >>= 1)
+    {
+      if (lid < s) FScratch[lid] += FScratch[lid + s];
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float qinv = 1.0f / sqrt(FScratch[0] + FEps);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    partial = 0.0f;
+    for (i = lid; i < Dk; i += lsize)
+    {
+      const float kv = FX[xRow + kBase + i];
+      partial = mad(kv, kv, partial);
+    }
+    FScratch[lid] = partial;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (s = lsize >> 1; s > 0; s >>= 1)
+    {
+      if (lid < s) FScratch[lid] += FScratch[lid + s];
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float kinv = 1.0f / sqrt(FScratch[0] + FEps);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (i = lid; i < Dk; i += lsize)
+    {
+      qn[i] = FX[xRow + qBase + i] * qinv * FScale;
+      kn[i] = FX[xRow + kBase + i] * kinv;
+    }
+
+    // ---- per-head scalar gates: every lane computes them, so no reduction ----
+    const float bv = FX[xRow + FBOff + h];
+    float beta;
+    if (bv > 0.0f) beta = 1.0f / (1.0f + exp(-bv));
+    else { const float sb = exp(bv); beta = sb / (1.0f + sb); }
+    const float pre = FX[xRow + FAOff + h] + FDtBias[h];
+    float sp;
+    if (pre > 30.0f) sp = pre;
+    else if (pre < -30.0f) sp = exp(pre);
+    else sp = log(1.0f + exp(pre));
+    const float decay = exp(-ea * sp);
+    // S_{-1} = 0 only at the very first step of a scan that starts from zero.
+    const int hasPrev = (t > 0) || (FResetState == 0);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // ---- the delta rule, one state column per lane ----
+    for (e = lid; e < Dv; e += lsize)
+    {
+      float acc = 0.0f;
+      if (hasPrev)
+        for (d = 0; d < Dk; d++) acc = mad(S[d * Dv + e], kn[d], acc);
+      const float bk = beta * (FX[xRow + vBase + e] - decay * acc);
+      float o = 0.0f;
+      for (d = 0; d < Dk; d++)
+      {
+        const int idx = d * Dv + e;
+        const float sn = hasPrev ? mad(decay, S[idx], kn[d] * bk) : (kn[d] * bk);
+        S[idx] = sn;
+        o = mad(qn[d], sn, o);
+      }
+      oloc[e] = o;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // ---- gated RMSNorm read-out over the head's Dv columns ----
+    partial = 0.0f;
+    for (e = lid; e < Dv; e += lsize) partial = mad(oloc[e], oloc[e], partial);
+    FScratch[lid] = partial;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (s = lsize >> 1; s > 0; s >>= 1)
+    {
+      if (lid < s) FScratch[lid] += FScratch[lid + s];
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float rinv = 1.0f / sqrt(FScratch[0] / (float)Dv + FEps);
+    const int yRow = t * yStride + yHead;
+    for (e = lid; e < Dv; e += lsize)
+    {
+      const float zv = FX[xRow + zBase + e];
+      FY[yRow + e] = oloc[e] * rinv * FNormW[e] * (zv / (1.0f + exp(-zv)));
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+}
+
+// KV-CACHE APPEND FOR THE FUSED MULTI-HEAD ATTENTION DECODE (TNNetFusedSDPA).
+// Writes the current token's K and V rows, one per KV head, into cache slot
+// FCacheSlot. ONE WORK-GROUP PER KV HEAD; the lanes split the head dimension.
+//
+// The cache is HEAD-MAJOR: head g's rows are the contiguous block starting at
+// g*FCacheMax*FDk, so slot (g*FCacheMax + position) addresses one row and the
+// decode kernel below reads each head's key stream contiguously. This is the
+// layout TNNetFusedSDPA.AppendRow already writes on the host side.
+//
+// The token row is [ Q (FQW) | K (FKW) | V (FKW) ], so head g's key slice
+// starts at FQW + g*FDk and its value slice at FQW + FKW + g*FDk.
+// This kernel and cai_sdpa_decode share one command queue and are enqueued in
+// that order, so the in-order queue is what makes the appended row visible -
+// there is no cross-work-group synchronization and none is needed.
+// Coded by Claude (AI).
+__kernel void cai_sdpa_append_kv
+(
+  const int FKVHeads,
+  const int FDk,
+  const int FCacheMax,
+  const int FCacheSlot,
+  const int FQW,
+  const int FKW,
+  __global const float* FX,
+  __global float* FKCache,
+  __global float* FVCache
+)
+{
+  const int g = get_group_id(1);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  if (g >= FKVHeads) return;
+  const int dst = (g * FCacheMax + FCacheSlot) * FDk;
+  const int kSrc = FQW + g * FDk;
+  const int vSrc = FQW + FKW + g * FDk;
+  for (int d = lid; d < FDk; d += lsize)
+  {
+    FKCache[dst + d] = FX[kSrc + d];
+    FVCache[dst + d] = FX[vSrc + d];
+  }
+}
+
+// CACHED-DECODE SCALED DOT-PRODUCT ATTENTION (TNNetFusedSDPA), one token over
+// the resident KV cache. ONE WORK-GROUP PER QUERY HEAD: the head's score band
+// is private to its work-group, so every synchronization this kernel needs is
+// an intra-work-group barrier and no cross-work-group ordering is ever
+// required. Launch 2-D with global (LocalSize, FQHeads) and local (LocalSize,
+// 1); LocalSize must be a power of two (the tree reductions halve it).
+// FScratch is LocalSize + FDk floats of __local memory.
+//
+// Query head h reads KV head h/FGroupSize (grouped-query attention) and runs
+// three phases over the live cache [jStart..FCacheLen-1]:
+//   1. lanes split the key axis: score j = dot(q, K[j]) * FInvSqrtDk, the
+//      Gemma-2 soft-cap when FScoreSoftCap > 0, then a tree max;
+//   2. the same partition exponentiates in place and tree-sums the normalizer;
+//   3. lanes split the head dimension: out[d] = sum_j P[j] * V[j][d], each lane
+//      accumulating over the whole key range and dividing once at the end.
+// The score band lives in global memory (FScores, FQHeads*FCacheMax floats)
+// rather than __local because a long context does not fit in a work-group's
+// local memory; it is written and read only by the one work-group that owns
+// it, so the barrier between phases 2 and 3 carries a global memory fence.
+//
+// FWindow > 0 is the sliding-window mask: jStart = FCacheLen - FWindow. The
+// causal mask needs no code at all - the cache holds only committed tokens, so
+// every live row is attendable. Forward-only, and the caller restricts it to a
+// single-token step: prefill, eviction, segment masking and the int8 cache all
+// stay on the host path. Coded by Claude (AI).
+__kernel void cai_sdpa_decode
+(
+  const int FQHeads,
+  const int FGroupSize,
+  const int FDk,
+  const int FCacheMax,
+  const int FCacheLen,
+  const int FWindow,
+  const float FInvSqrtDk,
+  const float FScoreSoftCap,
+  const float FInvScoreSoftCap,
+  __global const float* FX,
+  __global const float* FKCache,
+  __global const float* FVCache,
+  __global float* FScores,
+  __global float* FY,
+  __local float* FScratch
+)
+{
+  const int h = get_group_id(1);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  int s, d, j;
+  if (h >= FQHeads) return;
+
+  __local float* qloc = FScratch + lsize;
+
+  const int g = h / FGroupSize;
+  const int qBase = h * FDk;
+  const int plane = g * FCacheMax * FDk;
+  const int scoreBase = h * FCacheMax;
+  const int jStart = ((FWindow > 0) && (FCacheLen > FWindow))
+                     ? (FCacheLen - FWindow) : 0;
+
+  for (d = lid; d < FDk; d += lsize) qloc[d] = FX[qBase + d];
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  // ---- phase 1: scores over the live cache, then the row max ----
+  float m = -1e30f;
+  for (j = jStart + lid; j < FCacheLen; j += lsize)
+  {
+    __global const float* krow = FKCache + plane + j * FDk;
+    float acc = 0.0f;
+    for (d = 0; d < FDk; d++) acc = mad(qloc[d], krow[d], acc);
+    float sc = acc * FInvSqrtDk;
+    if (FScoreSoftCap > 0.0f)
+      sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
+    FScores[scoreBase + j] = sc;
+    m = fmax(m, sc);
+  }
+  FScratch[lid] = m;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] = fmax(FScratch[lid], FScratch[lid + s]);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float MaxScore = FScratch[0];
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  // ---- phase 2: shifted exp in place (same lane owns the same j), then the
+  // normalizer ----
+  float partial = 0.0f;
+  for (j = jStart + lid; j < FCacheLen; j += lsize)
+  {
+    const float e = exp(FScores[scoreBase + j] - MaxScore);
+    FScores[scoreBase + j] = e;
+    partial += e;
+  }
+  FScratch[lid] = partial;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] += FScratch[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float SumExp = FScratch[0];
+  // Phase 3 reads score entries written by OTHER lanes, so the fence spans
+  // global memory too.
+  barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+  // ---- phase 3: the value sum, one output dimension per lane ----
+  // SumExp = 0 cannot arise here (the live range is never empty and exp of the
+  // shifted max is 1), but the host path zeroes the row in that case and this
+  // matches it.
+  const float InvSumExp = (SumExp > 0.0f) ? (1.0f / SumExp) : 0.0f;
+  for (d = lid; d < FDk; d += lsize)
+  {
+    float acc = 0.0f;
+    for (j = jStart; j < FCacheLen; j++)
+      acc = mad(FScores[scoreBase + j], FVCache[plane + j * FDk + d], acc);
+    FY[qBase + d] = acc * InvSumExp;
+  }
+}
+
+// INT8 KV-CACHE APPEND (TNNetFusedSDPA, int8 cache). Quantizes the token's K
+// and V slices into the resident int8 cache at slot FCacheSlot, one work-group
+// per KV head, lanes splitting FDk. The format is the host's, unchanged: one
+// symmetric FP32 scale per row, scale = maxabs/127, codes in [-127,127], laid
+// out exactly as TNNetScaledDotProductAttention.QuantizeCacheRow writes them,
+// so the cache stays byte-comparable with FKCacheQ/FVCacheQ.
+//
+// Three deliberate choices:
+//   - rint, not round: OpenCL's round is half-away-from-zero while FPC's Round
+//     is half-to-even, and rint is half-to-even under the default rounding mode.
+//   - multiply by 1/maxabs FIRST and by 127 second, like TNNetVolume.QuantizeInt8:
+//     forming 127/maxabs overflows single precision for a tiny row.
+//   - a denormal row maximum (below MinSingle) emits zero codes and unit scale.
+//     The host scales in double there; a kernel cannot, and the values involved
+//     are below 1e-38.
+// Finiteness is tested on the bit pattern rather than with isnan, because
+// -cl-fast-relaxed-math implies -cl-finite-math-only and may fold isnan away.
+// FScratch is LocalSize floats. Coded by Claude (AI).
+__kernel void cai_sdpa_append_kv_int8
+(
+  const int FKVHeads,
+  const int FDk,
+  const int FCacheMax,
+  const int FCacheSlot,
+  const int FQW,
+  const int FKW,
+  __global const float* FX,
+  __global char* FKCodes,
+  __global float* FKScales,
+  __global char* FVCodes,
+  __global float* FVScales,
+  __local float* FScratch
+)
+{
+  const int g = get_group_id(1);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  int s, d, part;
+  if (g >= FKVHeads) return;
+  const int slot = g * FCacheMax + FCacheSlot;
+  const int dst = slot * FDk;
+
+  for (part = 0; part < 2; part++)
+  {
+    const int base = (part == 0) ? (FQW + g * FDk) : (FQW + FKW + g * FDk);
+    __global char* codes = (part == 0) ? FKCodes : FVCodes;
+    __global float* scales = (part == 0) ? FKScales : FVScales;
+
+    // ---- the row maximum over finite magnitudes, MaxAbsFinite's rule ----
+    float m = 0.0f;
+    for (d = lid; d < FDk; d += lsize)
+    {
+      const float a = fabs(FX[base + d]);
+      if (as_uint(a) <= 0x7F7FFFFFu) m = fmax(m, a);
+    }
+    FScratch[lid] = m;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (s = lsize >> 1; s > 0; s >>= 1)
+    {
+      if (lid < s) FScratch[lid] = fmax(FScratch[lid], FScratch[lid + s]);
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float MaxAbs = FScratch[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int Usable = (as_uint(MaxAbs) >= 0x00800000u);
+    const float RowScale = Usable ? (MaxAbs / 127.0f) : 1.0f;
+    const float Recip = Usable ? (1.0f / MaxAbs) : 0.0f;
+    if (lid == 0) scales[slot] = RowScale;
+    for (d = lid; d < FDk; d += lsize)
+    {
+      const float v = FX[base + d];
+      float scaled = v * Recip * 127.0f;
+      // NaN maps to code 0 and an infinity clamps to +/-127, both matching the
+      // host quantizer.
+      if (as_uint(fabs(v)) > 0x7F800000u) scaled = 0.0f;
+      codes[dst + d] = (char)clamp(rint(scaled), -127.0f, 127.0f);
+    }
+  }
+}
+
+// CACHED-DECODE SCALED DOT-PRODUCT ATTENTION OVER AN INT8 KV CACHE
+// (TNNetFusedSDPA). Phase for phase the same kernel as cai_sdpa_decode above -
+// one work-group per query head, the score band in global memory, a
+// CLK_GLOBAL_MEM_FENCE barrier between phases 2 and 3 - and only the loads
+// differ: the codes stream straight into the accumulator and the row scale is
+// folded in as one scalar OUTSIDE the element loop, so the cache is never
+// dequantized into memory. That is what makes an int8 cache a bandwidth saving
+// rather than a bandwidth cost, and it mirrors what
+// TNNetFusedSDPA.ComputeCachedToken already does on the host.
+// char is signed in OpenCL C, so (float)code sign-extends with no mask.
+// FScratch is LocalSize + FDk floats. Coded by Claude (AI).
+__kernel void cai_sdpa_decode_int8
+(
+  const int FQHeads,
+  const int FGroupSize,
+  const int FDk,
+  const int FCacheMax,
+  const int FCacheLen,
+  const int FWindow,
+  const float FInvSqrtDk,
+  const float FScoreSoftCap,
+  const float FInvScoreSoftCap,
+  __global const float* FX,
+  __global const char* FKCodes,
+  __global const float* FKScales,
+  __global const char* FVCodes,
+  __global const float* FVScales,
+  __global float* FScores,
+  __global float* FY,
+  __local float* FScratch
+)
+{
+  const int h = get_group_id(1);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  int s, d, j;
+  if (h >= FQHeads) return;
+
+  __local float* qloc = FScratch + lsize;
+
+  const int g = h / FGroupSize;
+  const int qBase = h * FDk;
+  const int scalePlane = g * FCacheMax;
+  const int plane = scalePlane * FDk;
+  const int scoreBase = h * FCacheMax;
+  const int jStart = ((FWindow > 0) && (FCacheLen > FWindow))
+                     ? (FCacheLen - FWindow) : 0;
+
+  for (d = lid; d < FDk; d += lsize) qloc[d] = FX[qBase + d];
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  // ---- phase 1: scores over the live cache, then the row max ----
+  float m = -1e30f;
+  for (j = jStart + lid; j < FCacheLen; j += lsize)
+  {
+    __global const char* krow = FKCodes + plane + j * FDk;
+    float acc = 0.0f;
+    for (d = 0; d < FDk; d++) acc = mad(qloc[d], (float)krow[d], acc);
+    float sc = acc * (FKScales[scalePlane + j] * FInvSqrtDk);
+    if (FScoreSoftCap > 0.0f)
+      sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
+    FScores[scoreBase + j] = sc;
+    m = fmax(m, sc);
+  }
+  FScratch[lid] = m;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] = fmax(FScratch[lid], FScratch[lid + s]);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float MaxScore = FScratch[0];
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  // ---- phase 2: shifted exp in place (same lane owns the same j), then the
+  // normalizer ----
+  float partial = 0.0f;
+  for (j = jStart + lid; j < FCacheLen; j += lsize)
+  {
+    const float e = exp(FScores[scoreBase + j] - MaxScore);
+    FScores[scoreBase + j] = e;
+    partial += e;
+  }
+  FScratch[lid] = partial;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] += FScratch[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float SumExp = FScratch[0];
+  // Phase 3 reads score entries written by OTHER lanes, so the fence spans
+  // global memory too.
+  barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+  // ---- phase 3: the value sum, one output dimension per lane ----
+  const float InvSumExp = (SumExp > 0.0f) ? (1.0f / SumExp) : 0.0f;
+  for (d = lid; d < FDk; d += lsize)
+  {
+    float acc = 0.0f;
+    for (j = jStart; j < FCacheLen; j++)
+      acc = mad(FScores[scoreBase + j] * FVScales[scalePlane + j],
+                (float)FVCodes[plane + j * FDk + d], acc);
+    FY[qBase + d] = acc * InvSumExp;
+  }
 }
 
 // FUSED MIXTURE-OF-EXPERTS DOWN PROJECTION (TNNetMoEExpertBankDown).

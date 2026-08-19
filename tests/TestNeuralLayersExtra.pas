@@ -1195,14 +1195,17 @@ begin
 
     Input.Raw[0] := 2.0;
     Input.Raw[1] := -2.0;
-    Input.Raw[2] := 0.0;
-    Input.Raw[3] := 5.0;
+    Input.Raw[2] := 600.0;
+    Input.Raw[3] := -600.0;
 
     NN.Compute(Input);
 
-    // ReLUL with leaky factor
-    AssertEquals('ReLUL(2) should be 2', 2.0, NN.GetLastLayer.Output.Raw[0], 0.01);
-    AssertEquals('ReLUL(0) should be 0', 0.0, NN.GetLastLayer.Output.Raw[2], 0.01);
+    // Inside the limits the input passes through; beyond them the excess is
+    // scaled by the 1% leak, so 600 gives 500 + 100*0.01.
+    AssertEquals('ReLUL(2) should be 2', 2.0, NN.GetLastLayer.Output.Raw[0], 0.0001);
+    AssertEquals('ReLUL(-2) should be -2', -2.0, NN.GetLastLayer.Output.Raw[1], 0.0001);
+    AssertEquals('ReLUL(600) should be 501', 501.0, NN.GetLastLayer.Output.Raw[2], 0.0001);
+    AssertEquals('ReLUL(-600) should be -501', -501.0, NN.GetLastLayer.Output.Raw[3], 0.0001);
   finally
     NN.Free;
     Input.Free;

@@ -29,6 +29,7 @@ type
     procedure TestVolumeSumSqrCenteredParity;
     procedure TestVolumeReluGateMaskParity;
     procedure TestVolumeLeakyReluParity;
+    procedure TestVolumeReluLParity;
     procedure TestVolumeMaxPosParity;
     procedure TestVolumeAddSubValueParity;
     procedure TestVolumeRankOneUpdateRowParity;
@@ -626,6 +627,94 @@ begin
   Src[0] := 5.0;
   TNNetVolume.LeakyRelu(TNeuralFloatArrPtr(@Src[0]),
     TNeuralFloatArrPtr(@Src[0]), Slope, 0);
+  AssertEquals('empty run', 5.0, Src[0], 0.0);
+end;
+
+procedure TTestNeuralVolume.TestVolumeReluLParity;
+// ReluL and ReluLGateMask are AVXReluL / AVXReluLGateMask on an AVX2/64-bit
+// build and scalar loops everywhere else. Both paths must agree BIT-exactly:
+// each clamped form is the same subtract-multiply-add, and the boundary
+// contract is strict >, so LowLimit itself takes the low form while HighLimit
+// passes through. Sizes straddle the 8-element block width and its tail.
+const
+  Sizes: array[0..10] of integer = (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 1000);
+  // TYPED: an untyped literal would be a Double here, so the reference
+  // arithmetic would not be the Single the kernel performs.
+  LowLimit: TNeuralFloat = -3.0;
+  HighLimit: TNeuralFloat = 3.0;
+  Slope: TNeuralFloat = 0.01;
+var
+  Src, Dst, Ref, RefDeriv: array of TNeuralFloat;
+  SI, K, N: integer;
+begin
+  RandSeed := 271828;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    SetLength(Src, N);
+    SetLength(Dst, N);
+    SetLength(Ref, N);
+    SetLength(RefDeriv, N);
+    for K := 0 to N - 1 do
+    begin
+      case K mod 8 of
+        0: Src[K] := LowLimit;   // exactly on the low limit: takes the low form
+        1: Src[K] := HighLimit;  // exactly on the high limit: passes through
+        2: Src[K] := 0.0;
+        3: Src[K] := -0.0;
+      else
+        Src[K] := (Random - 0.5) * 16; // spans both limits comfortably
+      end;
+      Dst[K] := 12345;
+      if Src[K] > HighLimit then
+        Ref[K] := HighLimit + (Src[K] - HighLimit) * Slope
+      else if Src[K] > LowLimit then Ref[K] := Src[K]
+      else Ref[K] := LowLimit + (Src[K] - LowLimit) * Slope;
+      if (Src[K] > LowLimit) and not (Src[K] > HighLimit) then RefDeriv[K] := 1
+      else RefDeriv[K] := Slope;
+    end;
+    TNNetVolume.ReluL(TNeuralFloatArrPtr(@Dst[0]),
+      TNeuralFloatArrPtr(@Src[0]), LowLimit, HighLimit, Slope, N);
+    for K := 0 to N - 1 do
+      AssertEquals('ReluL[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
+        Ref[K], Dst[K], 0.0);
+    TNNetVolume.ReluLGateMask(TNeuralFloatArrPtr(@Dst[0]),
+      TNeuralFloatArrPtr(@Src[0]), LowLimit, HighLimit, Slope, N);
+    for K := 0 to N - 1 do
+      AssertEquals('ReluLGateMask[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
+        RefDeriv[K], Dst[K], 0.0);
+  end;
+  // In-place (dst = src) must produce the same result.
+  N := 40;
+  SetLength(Src, N);
+  SetLength(Ref, N);
+  for K := 0 to N - 1 do Src[K] := (Random - 0.5) * 16;
+  for K := 0 to N - 1 do
+    if Src[K] > HighLimit then Ref[K] := HighLimit + (Src[K] - HighLimit) * Slope
+    else if Src[K] > LowLimit then Ref[K] := Src[K]
+    else Ref[K] := LowLimit + (Src[K] - LowLimit) * Slope;
+  TNNetVolume.ReluL(TNeuralFloatArrPtr(@Src[0]),
+    TNeuralFloatArrPtr(@Src[0]), LowLimit, HighLimit, Slope, N);
+  for K := 0 to N - 1 do
+    AssertEquals('ReluL in-place[' + IntToStr(K) + ']', Ref[K], Src[K], 0.0);
+  // A slope of zero degenerates to a hard clamp.
+  N := 20;
+  SetLength(Src, N);
+  SetLength(Dst, N);
+  for K := 0 to N - 1 do Src[K] := (Random - 0.5) * 16;
+  TNNetVolume.ReluL(TNeuralFloatArrPtr(@Dst[0]),
+    TNeuralFloatArrPtr(@Src[0]), LowLimit, HighLimit, 0.0, N);
+  for K := 0 to N - 1 do
+  begin
+    AssertTrue('ReluL slope 0 not above high[' + IntToStr(K) + ']',
+      Dst[K] <= HighLimit);
+    AssertTrue('ReluL slope 0 not below low[' + IntToStr(K) + ']',
+      Dst[K] >= LowLimit);
+  end;
+  // A zero-length run must leave the buffer untouched.
+  Src[0] := 5.0;
+  TNNetVolume.ReluL(TNeuralFloatArrPtr(@Src[0]),
+    TNeuralFloatArrPtr(@Src[0]), LowLimit, HighLimit, Slope, 0);
   AssertEquals('empty run', 5.0, Src[0], 0.0);
 end;
 

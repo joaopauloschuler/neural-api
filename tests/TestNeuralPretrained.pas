@@ -1,4 +1,4 @@
-unit TestNeuralPretrained;
+﻿unit TestNeuralPretrained;
 // Tests for the safetensors reader (neuralsafetensors.pas) and the GPT-2
 // and Llama pretrained-checkpoint importers (neuralpretrained.pas).
 //
@@ -28,6 +28,15 @@ type
   TTestNeuralPretrained = class(TTestCase)
   private
     function FixturePath(const FileName: string): string;
+    {$IFDEF OpenCL}
+    // First OpenCL platform/device on the box; false when there is none, which
+    // every caller reports as a SKIP.
+    function AcquireFirstOpenCLDevice(out APlatform: cl_platform_id;
+      out ADevice: cl_device_id): boolean;
+    // CPU-vs-OpenCL streamed decode: two inference twins of the same
+    // checkpoint at SeqLen=1, one armed for OpenCL, stepped side by side.
+    procedure RunStreamedDecodeOpenCLParity(const Stem: string);
+    {$ENDIF}
     procedure RunConvNeXtParity(const Base: string);
     procedure RunResNetParity(const Base: string);
     procedure RunRegNetParity(const Base: string);
@@ -241,6 +250,8 @@ type
     procedure TestQwen3MoeWindowLogitParity;
     procedure TestQwen35LogitParity;
     procedure TestQwen35StreamedDecodeParity;
+    procedure TestQwen35StreamedDecodeOpenCLParity;
+    procedure TestQwen2StreamedDecodeOpenCLParity;
     procedure TestQwen35TurnBoundaryResumeParity;
     procedure TestQwen35MoeLogitParity;
     procedure TestGptOssLogitParity;
@@ -4998,12 +5009,14 @@ begin
     {pTrainable=}false, FixturePath('tiny_qwen3_5_moe_config.json'),
     {pQuantizeInt8=}true);
   try
-    // 4 blocks x (attention 4 + router 1 + the two fused expert banks +
-    // shared gate/up/down/gate-logit 3) = 40, plus the LM head. The expert
-    // banks are TWO quantized layers per block whatever the expert count, so
-    // this no longer scales with num_experts.
+    // 4 blocks x (router 1 + the two fused expert banks + shared
+    // gate/up/down/gate-logit 3) = 24, plus the token mixers (3
+    // linear_attention x in_proj_qkv|in_proj_zba|out_proj = 9, 1
+    // full_attention x q|k|v|o = 4) and the LM head = 38. The expert banks
+    // are TWO quantized layers per block whatever the expert count, so this
+    // no longer scales with num_experts.
     AssertInt8DriftPair('Qwen3.5-MoE', NNFP32, NNQ, 8, Config.VocabSize,
-      {MinQuantLayers=}40, {MaxRelDrift=}5e-1, {TwoChannelInput=}false);
+      {MinQuantLayers=}38, {MaxRelDrift=}5e-1, {TwoChannelInput=}false);
   finally
     NNQ.Free;
     NNFP32.Free;
@@ -5105,7 +5118,7 @@ begin
   try
     // The experts alone are 4 blocks x 4 experts x 2 layers.
     AssertInt8StreamCodeParity('Qwen3.5-MoE', NNStreamed, NNRoundTrip,
-      {MinCmpLayers=}40);
+      {MinCmpLayers=}38);
   finally
     NNRoundTrip.Free;
     NNStreamed.Free;
@@ -8627,6 +8640,122 @@ begin
     Twin.Free;
     Full.Free;
   end;
+end;
+
+{$IFDEF OpenCL}
+function TTestNeuralPretrained.AcquireFirstOpenCLDevice(
+  out APlatform: cl_platform_id; out ADevice: cl_device_id): boolean;
+var
+  EasyCL: TEasyOpenCL;
+begin
+  Result := false;
+  EasyCL := TEasyOpenCL.Create();
+  try
+    if EasyCL.GetPlatformCount() = 0 then Exit;
+    EasyCL.SetCurrentPlatform(EasyCL.PlatformIds[0]);
+    if EasyCL.GetDeviceCount() = 0 then Exit;
+    EasyCL.SetCurrentDevice(EasyCL.Devices[0]);
+    APlatform := EasyCL.PlatformIds[0];
+    ADevice := EasyCL.Devices[0];
+    Result := true;
+  finally
+    EasyCL.Free;
+  end;
+end;
+
+// Two inference twins of one checkpoint at SeqLen=1: one on the CPU, one armed
+// with EnableOpenCL exactly as ChatTerminal arms it (no ForceOpenCL, so only
+// the layers production would offload go to the device). Both are stepped
+// token by token through TNNetStreamingDecoder and their logits must match.
+// This is the shape that catches a consumer reading a source that a producer
+// left in OpenCL memory: a layer that multiplies by a second input edge without
+// forcing it back reads stale host values, and only decode shows it - the
+// prefill forward writes every host buffer on the way through.
+// The device-layer count is asserted so the test cannot pass by never
+// offloading. Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunStreamedDecodeOpenCLParity(
+  const Stem: string);
+const
+  StepCnt = 8;
+var
+  TwinCPU, TwinCL: TNNet;
+  SessionCPU, SessionCL: TNNetStreamingDecoder;
+  StepIn: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, V, Vocab, LayerCnt, GPULayerCnt: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  TwinCPU := nil; TwinCL := nil;
+  SessionCPU := nil; SessionCL := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    TwinCPU := BuildFromPretrained(FixturePath(Stem + '.safetensors'),
+      {SeqLen=}1, {pTrainable=}false,
+      FixturePath(Stem + '_config.json'));
+    TwinCL := BuildFromPretrained(FixturePath(Stem + '.safetensors'),
+      {SeqLen=}1, {pTrainable=}false,
+      FixturePath(Stem + '_config.json'));
+    TwinCL.EnableOpenCL(PlatformId, DeviceId);
+    SessionCPU := TNNetStreamingDecoder.Create(TwinCPU, StepCnt);
+    SessionCL := TNNetStreamingDecoder.Create(TwinCL, StepCnt);
+    SessionCPU.Reset();
+    SessionCL.Reset();
+    Vocab := TwinCPU.GetLastLayer.Output.Size;
+    for T := 0 to StepCnt - 1 do
+    begin
+      StepIn.FData[0] := (5 * T + 2) mod Vocab;
+      SessionCPU.StepForward(StepIn, T);
+      StepIn.FData[0] := (5 * T + 2) mod Vocab;
+      SessionCL.StepForward(StepIn, T);
+      for V := 0 to Vocab - 1 do
+        AssertEquals(Stem + ' OpenCL decode logit pos ' + IntToStr(T) +
+          ' tok ' + IntToStr(V), SessionCPU.Output().FData[V],
+          SessionCL.Output().FData[V], 1e-3);
+    end;
+    GPULayerCnt := 0;
+    for LayerCnt := 0 to TwinCL.CountLayers() - 1 do
+      if TwinCL.Layers[LayerCnt].ForwardGPUCnt > 0 then Inc(GPULayerCnt);
+    AssertTrue(Stem + ' reached the device on at least one layer (' +
+      IntToStr(GPULayerCnt) + ' of ' + IntToStr(TwinCL.CountLayers()) + ')',
+      GPULayerCnt > 0);
+  finally
+    SessionCL.Free;
+    SessionCPU.Free;
+    StepIn.Free;
+    TwinCL.Free;
+    TwinCPU.Free;
+  end;
+end;
+{$ENDIF}
+
+// The qwen3_5 hybrid decode on the device: the attention output gate makes this
+// the only committed fixture with a TNNetCellMulByCell fed by a resident
+// TNNetSigmoid.
+procedure TTestNeuralPretrained.TestQwen35StreamedDecodeOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  RunStreamedDecodeOpenCLParity('tiny_qwen3_5');
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+// The same check on the plain qwen2 attention stack, which has no output gate:
+// it pins that the dense family really is unaffected rather than never
+// reaching the device.
+procedure TTestNeuralPretrained.TestQwen2StreamedDecodeOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  RunStreamedDecodeOpenCLParity('tiny_qwen2');
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
 end;
 
 // Turn-boundary state reuse on the REAL qwen3_5 wiring. TChatEngine resumes a

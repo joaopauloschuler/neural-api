@@ -82,12 +82,15 @@ type
     FContext: cl_context;        // OpenCL compute context
     FCommands: cl_command_queue; // OpenCL compute command queue
     FProg: cl_program;           // OpenCL compute program
-    // When true the context/command-queue/program above are BORROWED from
-    // another TEasyOpenCL (the shared dot-product kernel) and must NOT be
-    // released by this instance. Set by TNeuralKernel.CreateFromProgram so a
-    // helper kernel can bind the already-compiled neural.cl program instead of
-    // recompiling it per layer. (Coded by Claude (AI).)
+    // When true the context/program above are BORROWED from another
+    // TEasyOpenCL (the shared dot-product kernel) and must NOT be released by
+    // this instance. Set by TNeuralKernel.CreateFromProgram so a helper kernel
+    // can bind the already-compiled neural.cl program instead of recompiling it
+    // per layer. (Coded by Claude (AI).)
     FBorrowedContext: boolean;
+    // Same for the command queue, which is borrowed independently: a helper
+    // kernel either shares the owner's queue or creates its own.
+    FBorrowedQueue: boolean;
     {$IFDEF FPC}
     FCompilerOptions: string[255];
     {$ELSE}
@@ -124,6 +127,11 @@ type
     function RefreshHostInputBufferCache(buffer: cl_mem; cb: csize_t): cl_int;
     function WriteBuffer(buffer: cl_mem; cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_FALSE): integer; overload;
     function ReadBuffer(buffer: cl_mem; cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_TRUE): integer; overload;
+    // Partial transfer: moves cb bytes into/out of the buffer starting at
+    // offsetBytes, so a caller can refresh one live slice of a large
+    // persistent buffer without moving the whole allocation.
+    function WriteBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_FALSE): integer;
+    function ReadBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_TRUE): integer;
 
     function CreateInputBuffer(size: csize_t): cl_mem; overload; {$IFDEF Release} inline; {$ENDIF}
     function CreateHostInputBuffer(size: csize_t; ptr: Pointer): cl_mem; overload; {$IFDEF Release} inline; {$ENDIF}
@@ -180,10 +188,9 @@ type
       function EnsureBuffer(var buf: cl_mem; var capBytes: csize_t;
         flags: cl_mem_flags; neededBytes: csize_t): cl_mem;
       // Ensure a persistent buffer big enough for V, then upload V into it.
-      // DoWrite=false skips the upload (reuse the resident contents) - only safe
-      // when V is unchanged since the last write AND no reallocation happened
-      // (any size growth forces a fresh CreateBuffer, so the caller must pass
-      // DoWrite=true whenever V could have grown; see the weight-dirty callers).
+      // DoWrite=false skips the upload (reuse the resident contents) - safe when
+      // V is unchanged since the last write: a reallocation (first call or any
+      // growth) uploads regardless, because the fresh handle holds nothing.
       function EnsureWriteBuffer(var buf: cl_mem; var capBytes: csize_t;
         V: TNNetVolume; DoWrite: boolean = true): cl_mem;
       // Ensure a persistent output buffer big enough for V (no upload).
@@ -201,12 +208,15 @@ type
       constructor Create(pCurrentPlatform: cl_platform_id; pCurrentDevice: cl_device_id; kernelname: string = 'cai_dot_product'; pHideMessages: boolean = false);
       // Binds a kernel entry point against the ALREADY-COMPILED program of a
       // shared kernel (e.g. the net-wide dot-product kernel) instead of
-      // recompiling neural.cl. The context, command queue and program are
-      // borrowed from SharedKernel and are not released by this instance; only
-      // the kernel handle and the per-instance buffers are owned here. This is
-      // the shared-program form of the auxiliary helper kernels (RoPE, softmax,
+      // recompiling neural.cl. The context and program are borrowed from
+      // SharedKernel, and so is its command queue unless pSharedQueue is False;
+      // borrowed handles are not released by this instance. Only the kernel
+      // handle and the per-instance buffers are owned here. This is the
+      // shared-program form of the auxiliary helper kernels (RoPE, softmax,
       // norms, gathers, ...). (Coded by Claude (AI).)
-      constructor CreateFromProgram(SharedKernel: TEasyOpenCL; kernelname: string; pHideMessages: boolean = true);
+      constructor CreateFromProgram(SharedKernel: TEasyOpenCL;
+        kernelname: string; pHideMessages: boolean = true;
+        pSharedQueue: boolean = true);
       destructor Destroy(); override;
 
       property Kernel: cl_kernel read FKernel;
@@ -308,9 +318,18 @@ type
       /// EnableOpenCL) and BEFORE the matching Compute(..., NewVBs=false), on the
       /// same in-order command queue so the gather is ordered before the GEMM.
       /// Coded by Claude (AI).
+      /// pExternalSrc BORROWS an already-resident gather source (a producing
+      /// layer's output buffer) in place of FIm2ColSrcBuffer: nothing is
+      /// uploaded and nothing is released here. SrcVol then only carries the
+      /// shape. Coded by Claude (AI).
       procedure BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel; SrcVol: TNNetVolume;
-        OutSizeX, ColDepth, RowSpan, InSizeX, InDepth, Stride: longint; NewSrc: boolean = true);
-      procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint; NewVAs:boolean = true; NewVBs:boolean = true; VBias: TNNetVolume = nil; NewVBias: boolean = true);
+        OutSizeX, ColDepth, RowSpan, InSizeX, InDepth, Stride: longint; NewSrc: boolean = true;
+        pExternalSrc: cl_mem = nil);
+      /// pExternalVBs BORROWS a B operand that is already on the device (a
+      /// producing layer's output buffer): it is bound instead of
+      /// FInputBufferBs, never uploaded and never released here. VBs then only
+      /// carries the shape. Coded by Claude (AI).
+      procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint; NewVAs:boolean = true; NewVBs:boolean = true; VBias: TNNetVolume = nil; NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
       /// Arms the int8 weight mode: binds cai_dot_product_int8, uploads the
       /// interleaved codes (pCodes, NumAs*pSize bytes, layout
       /// codes[a + i*NumAs]) and per-row scales (pScales, NumAs floats) as
@@ -325,7 +344,7 @@ type
       /// Coded by Claude (AI).
       procedure ComputeInt8(VBs: TNNetVolume; pActFN: longint;
         NewVBs: boolean = true; VBias: TNNetVolume = nil;
-        NewVBias: boolean = true);
+        NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
 
       /// The underlying device kernel shared by this instance. Exposed so a layer
@@ -599,29 +618,38 @@ end;
 
 procedure TDotProductSharedKernel.BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel;
   SrcVol: TNNetVolume; OutSizeX, ColDepth, RowSpan, InSizeX, InDepth, Stride: longint;
-  NewSrc: boolean = true);
+  NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
 var
   k: cl_kernel;
   N: longint;
   err: integer;
   NeededSrc: csize_t;
+  SrcBuffer: cl_mem;
 begin
   k := Im2ColKernel.Kernel;
   // Total column-matrix elements = FInputBufferBs capacity (already sized to
   // FInputPrepared by PrepareForCompute). FNumBs*FSize == FInputPrepared.Size.
   N := FNumBs * FSize;
 
-  // Resident, grow-only source buffer (same model as the operand/bias buffers).
-  NeededSrc := SrcVol.GetMemSize();
-  if (FIm2ColSrcBuffer = nil) or (NeededSrc > FCapIm2ColSrc) then
+  err := CL_SUCCESS;
+  if pExternalSrc <> nil then
   begin
-    if Assigned(FIm2ColSrcBuffer) then clReleaseMemObject(FIm2ColSrcBuffer);
-    FIm2ColSrcBuffer := FDotProductKernel.CreateInputBuffer(NeededSrc);
-    FCapIm2ColSrc := NeededSrc;
-    NewSrc := true; // fresh/grown buffer: force upload regardless of caller
+    SrcBuffer := pExternalSrc;
+  end
+  else
+  begin
+    // Resident, grow-only source buffer (same model as the operand/bias buffers).
+    NeededSrc := SrcVol.GetMemSize();
+    if (FIm2ColSrcBuffer = nil) or (NeededSrc > FCapIm2ColSrc) then
+    begin
+      if Assigned(FIm2ColSrcBuffer) then clReleaseMemObject(FIm2ColSrcBuffer);
+      FIm2ColSrcBuffer := FDotProductKernel.CreateInputBuffer(NeededSrc);
+      FCapIm2ColSrc := NeededSrc;
+      NewSrc := true; // fresh/grown buffer: force upload regardless of caller
+    end;
+    SrcBuffer := FIm2ColSrcBuffer;
+    if NewSrc then err := FDotProductKernel.WriteBuffer(FIm2ColSrcBuffer, SrcVol);
   end;
-  if NewSrc then err := FDotProductKernel.WriteBuffer(FIm2ColSrcBuffer, SrcVol)
-  else err := CL_SUCCESS;
 
   err := err or clSetKernelArg(k, 0, csLongintSize, @N);
   err := err or clSetKernelArg(k, 1, csLongintSize, @OutSizeX);
@@ -630,16 +658,17 @@ begin
   err := err or clSetKernelArg(k, 4, csLongintSize, @InSizeX);
   err := err or clSetKernelArg(k, 5, csLongintSize, @InDepth);
   err := err or clSetKernelArg(k, 6, csLongintSize, @Stride);
-  err := err or clSetKernelArg(k, 7, csCLMemSize, @FIm2ColSrcBuffer);
+  err := err or clSetKernelArg(k, 7, csCLMemSize, @SrcBuffer);
   err := err or clSetKernelArg(k, 8, csCLMemSize, @FInputBufferBs);
   if (err <> CL_SUCCESS) then
     ErrorProc('Error: BuildInputColsOnDevice - failed setting parameters: ' + IntToStr(err));
 
-  // Enqueue the gather on the DOT-PRODUCT kernel's queue, not the im2col kernel's
-  // own one. Every TNeuralKernel carries a private command queue, and queues are
-  // unordered with respect to each other: the source upload above, this gather and
-  // the Compute GEMM that reads FInputBufferBs are only ordered while all three ride
-  // one in-order queue. Enqueued here they are, so no event or Finish is needed - and
+  // Enqueue the gather on the DOT-PRODUCT kernel's queue rather than on whatever
+  // queue the im2col kernel holds. The source upload above, this gather and the
+  // Compute GEMM that reads FInputBufferBs are only ordered while all three ride
+  // one in-order queue; queues are unordered with respect to each other, so this
+  // stays correct even when the im2col kernel was built with its own queue
+  // (CreateFromProgram's pSharedQueue = False). No event or Finish is needed, and
   // the cross-kernel enqueue is legal because both kernels share the same context
   // (ComputeInt8 runs the int8 kernel on this queue for the same reason).
   FDotProductKernel.RunKernel(k, N);
@@ -650,14 +679,17 @@ procedure TDotProductSharedKernel.Compute
   VAs, VBs: TNNetVolume;
   pActFN: longint;
   NewVAs:boolean = true; NewVBs:boolean = true;
-  VBias: TNNetVolume = nil; NewVBias: boolean = true
+  VBias: TNNetVolume = nil; NewVBias: boolean = true;
+  pExternalVBs: cl_mem = nil
 );
 var
   err: integer;
   UseBias: longint;
   NeededBias: csize_t;
+  BufferBs: cl_mem;
 begin
   FActFun := pActFN;
+  if pExternalVBs <> nil then BufferBs := pExternalVBs else BufferBs := FInputBufferBs;
 
   if (VAs.Size = FSize * FNumAs) then
   begin
@@ -681,7 +713,7 @@ begin
       err := err or clSetKernelArg(Kernel, 5, csCLMemSize,  @FInputBufferAs);
       if (err <> CL_SUCCESS) then ErrorProc('5 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 6, csCLMemSize,  @FInputBufferBs);
+      err := err or clSetKernelArg(Kernel, 6, csCLMemSize,  @BufferBs);
       if (err <> CL_SUCCESS) then ErrorProc('6 Error: Failed to set kernel arguments:' + IntToStr(err));
 
       err := err or clSetKernelArg(Kernel, 7, csCLMemSize,  @FResultBuffer);
@@ -721,12 +753,12 @@ begin
         //if NewVAs then err := err or FDotProductKernel.RefreshHostInputBufferCache(FInputBufferAs, VAs.GetMemSize());
         //if NewVBs then err := err or FDotProductKernel.RefreshHostInputBufferCache(FInputBufferBs, VBs.GetMemSize())
         if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
-        if NewVBs then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
+        if NewVBs and (pExternalVBs = nil) then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
       end
       else
       begin
         if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
-        if NewVBs then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
+        if NewVBs and (pExternalVBs = nil) then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
       end;
 
       if (err <> CL_SUCCESS) then ErrorProc('Failed at WriteBuffer(input):' + IntToStr(err));
@@ -827,12 +859,13 @@ end;
 
 procedure TDotProductSharedKernel.ComputeInt8(VBs: TNNetVolume;
   pActFN: longint; NewVBs: boolean = true; VBias: TNNetVolume = nil;
-  NewVBias: boolean = true);
+  NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
 var
   err: integer;
   UseBias: longint;
   NeededBias: csize_t;
   K: cl_kernel;
+  BufferBs: cl_mem;
 begin
   if not FInt8Ready then
   begin
@@ -849,6 +882,7 @@ begin
   end;
   FActFun := pActFN;
   K := FInt8Kernel.Kernel;
+  if pExternalVBs <> nil then BufferBs := pExternalVBs else BufferBs := FInputBufferBs;
 
   err := clSetKernelArg(K, 0, csLongintSize, @FThreadCount);
   err := err or clSetKernelArg(K, 1, csLongintSize, @FNumAs);
@@ -856,7 +890,7 @@ begin
   err := err or clSetKernelArg(K, 3, csLongintSize, @FSize);
   err := err or clSetKernelArg(K, 4, csLongintSize, @FActFun);
   err := err or clSetKernelArg(K, 5, csCLMemSize, @FCodesBuffer);
-  err := err or clSetKernelArg(K, 6, csCLMemSize, @FInputBufferBs);
+  err := err or clSetKernelArg(K, 6, csCLMemSize, @BufferBs);
   err := err or clSetKernelArg(K, 7, csCLMemSize, @FResultBuffer);
 
   // Fused bias: same contract as Compute (args 8/9 must always be set; a
@@ -883,7 +917,8 @@ begin
   err := err or clSetKernelArg(K, 9, csCLMemSize, @FBiasBuffer);
   err := err or clSetKernelArg(K, 10, csCLMemSize, @FScalesBuffer);
 
-  if NewVBs then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
+  if NewVBs and (pExternalVBs = nil) then
+    err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
 
   if err = CL_SUCCESS then
   begin
@@ -1039,22 +1074,27 @@ begin
 end;
 
 constructor TNeuralKernel.CreateFromProgram(SharedKernel: TEasyOpenCL;
-  kernelname: string; pHideMessages: boolean = true);
+  kernelname: string; pHideMessages: boolean = true;
+  pSharedQueue: boolean = true);
 begin
   inherited Create();
   // Suppress the per-layer "clCreateKernel ... OK!" chatter by default: a model
   // with many transformer blocks binds the same helper kernel dozens of times.
   if pHideMessages then HideMessages();
-  // Borrow the shared kernel's context/queue/program. FBorrowedContext keeps the
-  // destructor from releasing them (they outlive this helper). No
+  // Borrow the shared kernel's context/program, and its command queue when
+  // pSharedQueue. FBorrowedContext/FBorrowedQueue keep the destructor from
+  // releasing what it does not own (they outlive this helper). No
   // CompileProgramFromFile call here: neural.cl was already built once when the
   // shared dot-product kernel was created.
   FBorrowedContext := true;
+  FBorrowedQueue := pSharedQueue;
   FCurrentPlatform := SharedKernel.CurrentPlatform;
   FCurrentDevice   := SharedKernel.CurrentDevice;
   FContext  := SharedKernel.Context;
   FProg     := SharedKernel.Prog;
-  FCommands := CreateCommandQueue(); // the command queue is given per kernel
+  if pSharedQueue
+    then FCommands := SharedKernel.Commands
+    else FCommands := CreateCommandQueue(); // the command queue is given per kernel
   // Bind our own kernel handle into the shared (already-built) program.
   PrepareKernel(kernelname);
 end;
@@ -1366,12 +1406,17 @@ end;
 
 function TEasyOpenCLV.EnsureWriteBuffer(var buf: cl_mem; var capBytes: csize_t;
   V: TNNetVolume; DoWrite: boolean = true): cl_mem;
+var
+  PreviousBuffer: cl_mem;
 begin
+  PreviousBuffer := buf;
   // READ_WRITE (not READ_ONLY) so one persistent buffer can back either an
   // input or output role across shapes without flag mismatches.
   Result := EnsureBuffer(buf, capBytes, CL_MEM_READ_WRITE, V.GetMemSize());
-  // DoWrite=false leaves the resident device copy in place (weights unchanged).
-  if DoWrite then WriteBuffer(Result, V, CL_FALSE);
+  // DoWrite=false leaves the resident device copy in place (weights unchanged),
+  // but a fresh handle holds nothing, so the first call and any growth upload
+  // whatever the caller asked for.
+  if DoWrite or (Result <> PreviousBuffer) then WriteBuffer(Result, V, CL_FALSE);
 end;
 
 function TEasyOpenCLV.EnsureOutputBuffer(var buf: cl_mem; var capBytes: csize_t;
@@ -1433,24 +1478,22 @@ end;
 
 procedure TEasyOpenCL.FreeContext();
 begin
-  // A borrowed context and program belong to the shared kernel that compiled
-  // them; releasing them here would tear them out from under every other
-  // borrower, so just drop our references to them. The command queue is created
-  // per kernel, so it is always ours to release below. (Coded by Claude (AI).)
+  // A borrowed context, program or command queue belongs to the shared kernel
+  // that created it; releasing one here would tear it out from under every other
+  // borrower, so those references are only dropped. (Coded by Claude (AI).)
+  if (not FBorrowedQueue) and Assigned(FCommands) then
+    clReleaseCommandQueue(FCommands);
+  FCommands := nil;
   if FBorrowedContext then
   begin
     FProg := nil;
-    if Assigned(FCommands) then clReleaseCommandQueue(FCommands);
-    FCommands := nil;
     FContext := nil;
   end
   else
   begin
     if Assigned(FProg) then clReleaseProgram(FProg);
-    if Assigned(FCommands) then clReleaseCommandQueue(FCommands);
     if Assigned(FContext) then clReleaseContext(FContext);
     FProg := nil;
-    FCommands := nil;
     FContext := nil;
   end;
 end;
@@ -1763,6 +1806,26 @@ begin
   end
 end;
 
+function TEasyOpenCL.WriteBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool): integer;
+begin
+  Result := clEnqueueWriteBuffer(FCommands, buffer, blocking, offsetBytes, cb, ptr, 0, nil, nil);
+  if (Result <> CL_SUCCESS) then
+  begin
+    FErrorProc('ERROR: Failed to write buffer slice: ' + IntToStr(Result) +
+      ' Offset:' + IntToStr(offsetBytes) + ' Size:' + IntToStr(cb) + ' bytes.');
+  end;
+end;
+
+function TEasyOpenCL.ReadBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool): integer;
+begin
+  Result := clEnqueueReadBuffer(FCommands, buffer, blocking, offsetBytes, cb, ptr, 0, nil, nil);
+  if (Result <> CL_SUCCESS) then
+  begin
+    FErrorProc('ERROR: Failed to read buffer slice: ' + IntToStr(Result) +
+      ' Offset:' + IntToStr(offsetBytes) + ' Size:' + IntToStr(cb) + ' bytes.');
+  end;
+end;
+
 function TEasyOpenCL.CreateInputBuffer(size: csize_t): cl_mem;
 begin
   Result := CreateBuffer(CL_MEM_READ_ONLY,size);
@@ -1945,6 +2008,7 @@ begin
   FCommands := nil;       // compute command queue
   FProg := nil;           // compute program
   FBorrowedContext := false;
+  FBorrowedQueue := false;
 end;
 
 destructor TEasyOpenCL.Destroy();

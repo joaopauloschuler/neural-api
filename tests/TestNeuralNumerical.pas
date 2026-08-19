@@ -1,4 +1,4 @@
-unit TestNeuralNumerical;
+﻿unit TestNeuralNumerical;
 
 {$mode objfpc}{$H+}
 
@@ -335,6 +335,50 @@ type
     // OpenCL forward offload parity (vs CPU) for the depthwise convolutions.
     procedure TestDepthwiseConvOpenCLParity;
     procedure TestDepthwiseConv1DOpenCLParity;
+    // TNNetEmbedding -> TNNetDepthwiseConv1D -> TNNetSiLU with ForceOpenCL off:
+    // the conv's own size verdict is False, so only a source already in OpenCL
+    // memory can put it there - and the activation follows only when the
+    // convolved rows stayed.
+    procedure DepthwiseConv1DResidentChainUnforcedOpenCLParity;
+    // Token-by-token decode on OpenCL: cai_depthwise_conv1d_decode keeps the
+    // K-1 history rows in OpenCL memory between tokens, so every step must
+    // still match the corresponding row of the full-sequence CPU forward - and
+    // a mid-session CaptureState/RestoreState round trip must not disturb it.
+    procedure DepthwiseConv1DDecodeResidentOpenCLParity;
+    // TNNetInput -> TNNetGatedDeltaNet with ForceOpenCL off: the recurrence's
+    // own size verdict is False, so only a source already in OpenCL memory can
+    // put it there, and cai_gated_delta_net must then reproduce the CPU scan.
+    procedure GatedDeltaNetResidentChainUnforcedOpenCLParity;
+    // Token-by-token decode on OpenCL: the (Hv,Dk,Dv) matrix state stays in
+    // OpenCL memory between tokens, so every step must still match the
+    // corresponding row of the full-sequence CPU forward - and a mid-session
+    // CaptureState/RestoreState round trip must not disturb it.
+    procedure GatedDeltaNetDecodeResidentOpenCLParity;
+    // A value-head dimension wider than the kernel's 256 lanes, so each lane
+    // owns several state columns and both grid-stride loops run more than one
+    // iteration - the shape the two tests above never reach.
+    procedure GatedDeltaNetWideHeadOpenCLParity;
+    // Token-by-token cached decode on OpenCL: the KV cache stays in OpenCL
+    // memory between tokens, appended in place, so every step must match the
+    // CPU cached path - and a mid-session CaptureCacheState/RestoreCacheState
+    // round trip must bring the cache home and put it back untouched.
+    procedure FusedSDPADecodeResidentOpenCLParity;
+    // The same decode with a sliding window and a Gemma-2 score soft-cap live,
+    // so the kernel's jStart and its tanh branch both run.
+    procedure FusedSDPAWindowedDecodeOpenCLParity;
+    // A cache built by the CPU path first, then handed to OpenCL mid-session:
+    // the live prefix must go up intact and the following steps must agree.
+    procedure FusedSDPAHandoffDecodeOpenCLParity;
+    // The same three shapes over the INT8 KV cache, which is what a ChatTerminal
+    // run with int8 weights uses by default: the codes and the row scales stay
+    // in OpenCL memory and the append quantizes each token there.
+    procedure FusedSDPAInt8DecodeResidentOpenCLParity;
+    procedure FusedSDPAInt8WindowedDecodeOpenCLParity;
+    procedure FusedSDPAInt8HandoffDecodeOpenCLParity;
+    // The int8 append kernel against QuantizeCacheRow: row scales within one
+    // ulp, codes within one step, and codes exactly equal on rows built to
+    // stress the quantizer - all zeros, one outlier, flat, exact midpoints.
+    procedure FusedSDPAInt8AppendOpenCLParity;
     // OpenCL tap-diagonal coefficient-GEMV forward offload parity (vs CPU) for
     // TNNetKANConv (Chebyshev and B-spline basis).
     procedure TestKANConvOpenCLParity;
@@ -348,6 +392,45 @@ type
     // (shares the cai_dot_product FDotCL). Sweeps the four opcodes x bias/nobias
     // on an inference-only dense layer. Coded by Claude (AI).
     procedure TestFullConnectActivationFusionOpenCLParity;
+    // Device-side multi-source sum (cai_volume_sum) forward parity for TNNetSum.
+    // The branches are fused-activation convolutions, so their outputs are ALREADY
+    // resident on the device and the sum binds them instead of downloading them.
+    // Sweeps 2, 3 and 5 sources: the last one exercises the accumulate branch
+    // (4 sources, then 1 more into the same buffer). Coded by Claude (AI).
+    procedure TestSumOpenCLParity;
+    procedure TestCellMulByCellOpenCLParity;
+    procedure TestChannelMulByLayerOpenCLParity;
+    // Device-side channel gather (cai_split_channels) forward parity for
+    // TNNetSplitChannels: contiguous slice, single channel, SplitChannelEvery.
+    procedure TestSplitChannelsOpenCLParity;
+    // Device-side depth-axis scatter (cai_deep_concat) forward parity for
+    // TNNetDeepConcat: 2 and 3 equal sources, unequal depths, and a Replicate
+    // broadcast (one launch instead of one per replica).
+    procedure TestDeepConcatOpenCLParity;
+    // Device-side gated activation (cai_glu_gate) forward parity over an
+    // already-resident source output: four gates x two depths x two input
+    // scales, the large one covering the kernel's saturation clamps.
+    procedure TestGLUGateResidentOpenCLParity;
+    // A pointwise conv binds the previous layer's device output as the B operand
+    // of cai_dot_product instead of downloading and re-uploading it. Parity alone
+    // cannot tell the two apart, so the test also fills the source layer's host
+    // output with a sentinel and asserts nothing overwrote it. Coded by Claude (AI).
+    procedure TestPointwiseConvResidentInputOpenCLParity;
+    // The fully-connected case of the same bind, over both weight formats: FP32
+    // through cai_dot_product and int8 through cai_dot_product_int8. Same
+    // sentinel probe on the source layer. Coded by Claude (AI).
+    procedure TestFullConnectResidentInputOpenCLParity;
+    // The spatial twin: an unpadded conv gathers its column matrix with
+    // cai_im2col straight out of the source layer's device buffer, so the
+    // FInputCopy upload disappears too. Same sentinel probe, swept over feature
+    // size and stride. Coded by Claude (AI).
+    procedure TestConvIm2ColResidentSourceOpenCLParity;
+    // The whole chain: projection -> activation -> projection with nothing
+    // returning to host memory in between. cai_activation reads the source
+    // layer's buffer and leaves its result in its own, which the second
+    // projection then binds as its B operand. Coded by Claude (AI).
+    procedure TestActivationResidentChainOpenCLParity;
+    procedure TestActivationOpenCLParity;
     // Device-side im2col (cai_im2col) forward parity for the general convolution:
     // an inference-only conv gathers FInputPrepared on the device instead of the
     // host. Sweeps feature-size x padding x stride so the gather index math
@@ -433,6 +516,9 @@ type
     // OpenCL per-token depth-axis norm forward offload parity (vs CPU) for the
     // transformer norm layers TNNetTokenRMSNorm and TNNetTokenLayerNorm.
     procedure TokenRMSNormOpenCLParity;
+    // Single-token (decode) shape: TNNetTokenNormCL.Normalize hands it to the
+    // cooperative cai_volume_norm entry point, which must give the same result.
+    procedure TokenRMSNormDecodeOpenCLParity;
     procedure LayerNormOpenCLParity;
     // OpenCL interleaved-pair rotary (RoPE) forward offload parity (vs CPU).
     procedure RoPEOpenCLParity;
@@ -446,6 +532,38 @@ type
     // collapse the whole SizeX*SizeY*Depth sample into one cai_token_norm token.
     procedure WholeVolumeLayerNormOpenCLParity;
     procedure WholeVolumeRMSNormOpenCLParity;
+    // TNNetRMSNorm reads a resident source where it lies and leaves its own
+    // result on the device for the next layer, so a pointwise conv on either
+    // side of it round trips through RAM neither way.
+    procedure RMSNormResidentChainOpenCLParity;
+    // The same chain with ForceOpenCL off: TNNetRMSNorm's own size verdict is
+    // pinned to CPU, so a resident source is the only thing that can put it on
+    // the device.
+    procedure RMSNormResidentChainUnforcedOpenCLParity;
+    // TNNet.EnableOpenCL reaches every layer, including a convolution whose
+    // size verdict left it on the CPU and which therefore has no FDotCL.
+    procedure CpuVerdictConvolutionSurvivesEnableOpenCL;
+    // TNNetFullConnect.WillOpenCL must report the branch Compute() takes, and a
+    // layer below the size verdict must still follow a resident source onto the
+    // device.
+    procedure FullConnectWillOpenCLMatchesForward;
+    // The per-head attention chain TNNetSplitChannels -> TNNetRotaryEmbedding
+    // -> TNNetDeepConcat with ForceOpenCL off: RoPE is below its own size
+    // verdict, so only a resident source can put it on the device - and the
+    // concat runs there only when every source stayed resident.
+    procedure RoPEResidentHeadChainUnforcedOpenCLParity;
+    procedure InputResidentSourceUnforcedOpenCLParity;
+    procedure SoftMaxResidentChainUnforcedOpenCLParity;
+    // TNNetInput -> TNNetEmbedding -> TNNetPointwiseConvLinear with ForceOpenCL
+    // off: the embedding's own size verdict is pinned False, so only a resident
+    // source can put it on the device - and the projection follows only when the
+    // gathered rows stayed there.
+    procedure EmbeddingResidentChainUnforcedOpenCLParity;
+    // TNNetEmbedding -> TNNetTokenRMSNorm -> TNNetPointwiseConvLinear with
+    // ForceOpenCL off: the norm's own size verdict is pinned False, so only a
+    // source in OpenCL memory can put it there - and the projection follows
+    // only when the normalized tokens stayed.
+    procedure TokenRMSNormResidentChainUnforcedOpenCLParity;
     // OpenCL gated FFN forward offload parity (vs CPU) for the GLU-family
     // activations TNNetGLU / TNNetSwiGLU / TNNetGEGLU / TNNetGEGLUErf.
     procedure GLUFamilyOpenCLParity;
@@ -469,6 +587,9 @@ type
     procedure AvgPoolOpenCLParity;
     // OpenCL token-gather forward offload parity (vs CPU) for TNNetEmbedding.
     procedure EmbeddingOpenCLParity;
+    // Same, with the vocab table quantized: cai_embedding_gather_int8 must
+    // reproduce the host dequantizing gather from the same codes and scales.
+    procedure EmbeddingInt8OpenCLParity;
     // OpenCL contiguous-group softmax forward offload parity (vs CPU) for the
     // softmax head layers TNNetPointwiseSoftMax (per-token, GroupLen=Depth) and
     // TNNetSoftMax (whole-volume, GroupLen=Size).
@@ -64464,6 +64585,1146 @@ begin
 end;
 {$ENDIF}
 
+procedure TTestNeuralNumerical.TestChannelMulByLayerOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  InputLayer, ChannelSource, PerChannelOperand: TNNetLayer;
+  MulLayer: TNNetChannelMulByLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InSize, SentinelSurvivors, SentinelCount: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = -7777;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 6, 8);
+  OutCPU := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+    // ReLU convolutions: cai_dot_product applies the activation on the device,
+    // which is what leaves each source output in device memory. The 6x6 feature
+    // with no padding reduces the second branch to the (1,1,8) per-channel
+    // operand MulChannels expects.
+    ChannelSource := NN.AddLayerAfter(TNNetConvolutionReLU.Create(8, 3, 1, 1), InputLayer);
+    PerChannelOperand := NN.AddLayerAfter(TNNetConvolutionReLU.Create(8, 6, 0, 1), InputLayer);
+    MulLayer := TNNetChannelMulByLayer.Create(ChannelSource, PerChannelOperand);
+    NN.AddLayer(MulLayer);
+    // The device path is inference-only, so the product never fires without this.
+    NN.SetTrainable(False, False);
+
+    InSize := Input.Size;
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := 0.05 * i - 0.3;
+
+    NN.Compute(Input);
+    AssertEquals('per-channel operand size', MulLayer.Output.Depth,
+      PerChannelOperand.Output.Size);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    AssertEquals('product ran on the CPU before EnableOpenCL', 0, MulLayer.ForwardGPUCnt);
+
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      // Parity cannot tell a bind from a download, so the sentinel below is what
+      // proves the sources were read in device memory: a second device forward
+      // must leave both host copies untouched.
+      ChannelSource.Output.Fill(csSentinel);
+      PerChannelOperand.Output.Fill(csSentinel);
+      NN.Compute(Input);
+      SentinelSurvivors := 0;
+      for i := 0 to ChannelSource.Output.Size - 1 do
+        if ChannelSource.Output.Raw[i] = csSentinel then Inc(SentinelSurvivors);
+      for i := 0 to PerChannelOperand.Output.Size - 1 do
+        if PerChannelOperand.Output.Raw[i] = csSentinel then Inc(SentinelSurvivors);
+      SentinelCount := ChannelSource.Output.Size + PerChannelOperand.Output.Size;
+      MaxDiff := 0;
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    WriteLn('  ChannelMulByLayer OpenCL parity: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards=', MulLayer.ForwardGPUCnt,
+      ' source sentinels=', SentinelSurvivors, '/', SentinelCount);
+    // Without this a silent fall back to the CPU would compare the reference
+    // against itself and pass while covering nothing.
+    AssertTrue('TNNetChannelMulByLayer must reach the device', MulLayer.ForwardGPUCnt > 0);
+    AssertEquals('both sources must be read in device memory, not downloaded',
+      SentinelCount, SentinelSurvivors);
+    AssertTrue('TNNetChannelMulByLayer OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestCellMulByCellOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  InputLayer, BranchA, BranchB: TNNetLayer;
+  MulLayer: TNNetCellMulByCell;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InSize, SentinelSurvivors: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = -7777;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 6, 8);
+  OutCPU := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+    // ReLU convolutions: cai_dot_product applies the activation on the device,
+    // which is what leaves each source output in device memory.
+    BranchA := NN.AddLayerAfter(TNNetConvolutionReLU.Create(8, 3, 1, 1), InputLayer);
+    BranchB := NN.AddLayerAfter(TNNetConvolutionReLU.Create(8, 3, 1, 1), InputLayer);
+    MulLayer := TNNetCellMulByCell.Create(BranchA, BranchB);
+    NN.AddLayer(MulLayer);
+    // The device path is inference-only, so the product never fires without this.
+    NN.SetTrainable(False, False);
+
+    InSize := Input.Size;
+    for i := 0 to InSize - 1 do
+      Input.Raw[i] := 0.05 * i - 0.3;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    AssertEquals('product ran on the CPU before EnableOpenCL', 0, MulLayer.ForwardGPUCnt);
+
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      // Parity cannot tell a bind from a download, so the sentinel below is what
+      // proves the sources were read in device memory: a second device forward
+      // must leave both host copies untouched.
+      BranchA.Output.Fill(csSentinel);
+      BranchB.Output.Fill(csSentinel);
+      NN.Compute(Input);
+      SentinelSurvivors := 0;
+      for i := 0 to BranchA.Output.Size - 1 do
+      begin
+        if BranchA.Output.Raw[i] = csSentinel then Inc(SentinelSurvivors);
+        if BranchB.Output.Raw[i] = csSentinel then Inc(SentinelSurvivors);
+      end;
+      MaxDiff := 0;
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    WriteLn('  CellMulByCell OpenCL parity: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards=', MulLayer.ForwardGPUCnt,
+      ' source sentinels=', SentinelSurvivors, '/', 2 * BranchA.Output.Size);
+    // Without this a silent fall back to the CPU would compare the reference
+    // against itself and pass while covering nothing.
+    AssertTrue('TNNetCellMulByCell must reach the device', MulLayer.ForwardGPUCnt > 0);
+    AssertEquals('both sources must be read in device memory, not downloaded',
+      2 * BranchA.Output.Size, SentinelSurvivors);
+    AssertTrue('TNNetCellMulByCell OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestSumOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  InputLayer: TNNetLayer;
+  SumLayer: TNNetSum;
+  Branches: array of TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  BranchCnt, BranchPos, i, InSize, CaseCnt: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  BranchCounts: array[0..2] of integer = (2, 3, 5);
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CaseCnt := Low(BranchCounts) to High(BranchCounts) do
+  begin
+    BranchCnt := BranchCounts[CaseCnt];
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, 8);
+    OutCPU := TNNetVolume.Create();
+    try
+      InputLayer := NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+      SetLength(Branches, BranchCnt);
+      for BranchPos := 0 to BranchCnt - 1 do
+      begin
+        // ReLU convolutions: cai_dot_product applies the activation on the
+        // device, which is what leaves each branch output in device memory.
+        Branches[BranchPos] := NN.AddLayerAfter(
+          TNNetConvolutionReLU.Create(8, 3, 1, 1), InputLayer);
+      end;
+      SumLayer := TNNetSum.Create(Branches);
+      NN.AddLayer(SumLayer);
+      // The device path is inference-only, so the sum never fires without this.
+      NN.SetTrainable(False, False);
+
+      InSize := Input.Size;
+      for i := 0 to InSize - 1 do
+        Input.Raw[i] := 0.05 * i - 0.3;
+
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+      AssertEquals('sum ran on the CPU before EnableOpenCL', 0, SumLayer.ForwardGPUCnt);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Second device forward: the sum reuses its resident result buffer.
+        NN.Compute(Input);
+        MaxDiff := 0;
+        AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  Sum OpenCL parity: sources=', BranchCnt, ' max|diff|=', MaxDiff:0:9,
+        ' gpu forwards=', SumLayer.ForwardGPUCnt);
+      // Without this a silent fall back to the CPU would compare the reference
+      // against itself and pass while covering nothing.
+      AssertTrue('TNNetSum must reach the device with ' + IntToStr(BranchCnt) +
+        ' sources', SumLayer.ForwardGPUCnt > 0);
+      AssertTrue('TNNetSum OpenCL vs CPU parity (' + IntToStr(BranchCnt) +
+        ' sources): max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+        MaxDiff < 1e-4);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestPointwiseConvResidentInputOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  SourceConv, PointwiseConv: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, SentinelsLeft, CaseCnt: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = 999;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  // Case 0: the source is another pointwise conv. Case 1: it is a spatial
+  // convolution, so the operand the consumer binds was produced by a different
+  // GEMM shape than its own.
+  for CaseCnt := 0 to 1 do
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, 8);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+      if CaseCnt = 0
+        then SourceConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(8))
+        else SourceConv := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+      PointwiseConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(4));
+      // The device path is inference-only: a trainable layer keeps the host
+      // activation sweep and never leaves its output on the device.
+      NN.SetTrainable(False, False);
+
+      for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.05 * i - 0.3;
+
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Only a download into the source layer clears these.
+        SourceConv.Output.Fill(csSentinel);
+        NN.Compute(Input);
+        SentinelsLeft := 0;
+        for i := 0 to SourceConv.Output.Size - 1 do
+          if SourceConv.Output.Raw[i] = csSentinel then Inc(SentinelsLeft);
+        MaxDiff := 0;
+        AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  Pointwise resident input: case=', CaseCnt, ' max|diff|=',
+        MaxDiff:0:9, ' gpu forwards=', PointwiseConv.ForwardGPUCnt,
+        ' sentinels kept=', SentinelsLeft, '/', SourceConv.Output.Size);
+      AssertTrue('pointwise conv must reach the device (case ' +
+        IntToStr(CaseCnt) + ')', PointwiseConv.ForwardGPUCnt > 0);
+      AssertEquals('the source output must NOT be downloaded (case ' +
+        IntToStr(CaseCnt) + ')', SourceConv.Output.Size, SentinelsLeft);
+      AssertTrue('pointwise conv resident-input vs CPU parity (case ' +
+        IntToStr(CaseCnt) + '): max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-4', MaxDiff < 1e-4);
+      // The host copy is still one ForceOutputOnRAM away.
+      SourceConv.ForceOutputOnRAM();
+      SentinelsLeft := 0;
+      for i := 0 to SourceConv.Output.Size - 1 do
+        if SourceConv.Output.Raw[i] = csSentinel then Inc(SentinelsLeft);
+      AssertEquals('ForceOutputOnRAM must still recover the source output ' +
+        '(case ' + IntToStr(CaseCnt) + ')', 0, SentinelsLeft);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestFullConnectResidentInputOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  SourceConv: TNNetLayer;
+  FC: TNNetFullConnect;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, SentinelsLeft, CaseCnt: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = 999;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  // Case 0: FP32 weights. Case 1: int8-quantized, which binds the same source
+  // buffer through the resident-code kernel instead.
+  for CaseCnt := 0 to 1 do
+  begin
+    RandSeed := 20260817;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(4, 4, 8);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(4, 4, 8, 1));
+      SourceConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(8));
+      // 128 inputs / 512 neurons: both halves of the FullConnect FShouldOpenCL
+      // verdict, so EnableOpenCL allocates FDotCL. ForceOpenCL does not reach
+      // this layer - its Compute dispatches on FShouldOpenCL alone.
+      FC := TNNetFullConnectLinear.Create(512);
+      NN.AddLayer(FC);
+      for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.02 * i - 1.28;
+      for i := 0 to FC.Neurons.Count - 1 do
+        FC.Neurons[i].BiasWeight := 0.3 * Sin(i * 0.2);
+      NN.UpdateWeights();
+      // The device path is inference-only: a trainable layer keeps the host
+      // activation sweep and never leaves its output on the device.
+      NN.SetTrainable(False, False);
+      if CaseCnt = 1 then NN.QuantizeWeightsInt8();
+
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Only a download into the source layer clears these.
+        SourceConv.Output.Fill(csSentinel);
+        NN.Compute(Input);
+        SentinelsLeft := 0;
+        for i := 0 to SourceConv.Output.Size - 1 do
+          if SourceConv.Output.Raw[i] = csSentinel then Inc(SentinelsLeft);
+        MaxDiff := 0;
+        AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  FullConnect resident input: case=', CaseCnt, ' max|diff|=',
+        MaxDiff:0:9, ' gpu forwards=', FC.ForwardGPUCnt,
+        ' sentinels kept=', SentinelsLeft, '/', SourceConv.Output.Size);
+      AssertTrue('FullConnect must reach the device (case ' +
+        IntToStr(CaseCnt) + ')', FC.ForwardGPUCnt > 0);
+      AssertEquals('the source output must NOT be downloaded (case ' +
+        IntToStr(CaseCnt) + ')', SourceConv.Output.Size, SentinelsLeft);
+      AssertTrue('FullConnect resident-input vs CPU parity (case ' +
+        IntToStr(CaseCnt) + '): max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-4', MaxDiff < 1e-4);
+      // The host copy is still one ForceOutputOnRAM away.
+      SourceConv.ForceOutputOnRAM();
+      SentinelsLeft := 0;
+      for i := 0 to SourceConv.Output.Size - 1 do
+        if SourceConv.Output.Raw[i] = csSentinel then Inc(SentinelsLeft);
+      AssertEquals('ForceOutputOnRAM must still recover the source output ' +
+        '(case ' + IntToStr(CaseCnt) + ')', 0, SentinelsLeft);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestConvIm2ColResidentSourceOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  SourceConv, GatherConv: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, SentinelsLeft, CaseCnt: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = 999;
+  // The consumer must be unpadded: CopyPadding builds FInputCopy on the host.
+  FeatureSizes: array[0..2] of integer = (2, 3, 3);
+  Strides: array[0..2] of integer = (1, 1, 2);
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CaseCnt := Low(FeatureSizes) to High(FeatureSizes) do
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(8, 8, 4);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(8, 8, 4, 1));
+      // A fused-activation conv: its output is what stays in device memory.
+      SourceConv := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+      GatherConv := NN.AddLayer(TNNetConvolutionReLU.Create(4,
+        FeatureSizes[CaseCnt], {padding}0, Strides[CaseCnt]));
+      NN.SetTrainable(False, False);
+
+      for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.05 * i - 0.3;
+
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        SourceConv.Output.Fill(csSentinel);
+        NN.Compute(Input);
+        SentinelsLeft := 0;
+        for i := 0 to SourceConv.Output.Size - 1 do
+          if SourceConv.Output.Raw[i] = csSentinel then Inc(SentinelsLeft);
+        MaxDiff := 0;
+        AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  Conv im2col resident source: feature=', FeatureSizes[CaseCnt],
+        ' stride=', Strides[CaseCnt], ' max|diff|=', MaxDiff:0:9,
+        ' gpu forwards=', GatherConv.ForwardGPUCnt,
+        ' sentinels kept=', SentinelsLeft, '/', SourceConv.Output.Size);
+      AssertTrue('gather conv must reach the device (case ' +
+        IntToStr(CaseCnt) + ')', GatherConv.ForwardGPUCnt > 0);
+      AssertEquals('the source output must NOT be downloaded (case ' +
+        IntToStr(CaseCnt) + ')', SourceConv.Output.Size, SentinelsLeft);
+      AssertTrue('conv im2col resident-source vs CPU parity (case ' +
+        IntToStr(CaseCnt) + '): max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestActivationResidentChainOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  UpProj, Act, DownProj: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, UpKept, ActKept, CaseCnt: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = 999;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CaseCnt := 0 to 2 do
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, 8);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+      UpProj := NN.AddLayer(TNNetPointwiseConvLinear.Create(16));
+      case CaseCnt of
+        0: Act := NN.AddLayer(TNNetReLU.Create());
+        1: Act := NN.AddLayer(TNNetSwish.Create());
+        else Act := NN.AddLayer(TNNetGELU.Create());
+      end;
+      DownProj := NN.AddLayer(TNNetPointwiseConvLinear.Create(4));
+      NN.SetTrainable(False, False);
+
+      for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.05 * i - 0.3;
+
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        UpProj.Output.Fill(csSentinel);
+        Act.Output.Fill(csSentinel);
+        NN.Compute(Input);
+        UpKept := 0;
+        for i := 0 to UpProj.Output.Size - 1 do
+          if UpProj.Output.Raw[i] = csSentinel then Inc(UpKept);
+        ActKept := 0;
+        for i := 0 to Act.Output.Size - 1 do
+          if Act.Output.Raw[i] = csSentinel then Inc(ActKept);
+        MaxDiff := 0;
+        AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  Activation resident chain: ', Act.ClassName, ' max|diff|=',
+        MaxDiff:0:9, ' act gpu forwards=', Act.ForwardGPUCnt,
+        ' up kept=', UpKept, '/', UpProj.Output.Size,
+        ' act kept=', ActKept, '/', Act.Output.Size);
+      AssertTrue('the activation must reach the device (' + Act.ClassName + ')',
+        Act.ForwardGPUCnt > 0);
+      AssertEquals('the projection output must NOT be downloaded (' +
+        Act.ClassName + ')', UpProj.Output.Size, UpKept);
+      AssertEquals('the activation output must NOT be downloaded (' +
+        Act.ClassName + ')', Act.Output.Size, ActKept);
+      AssertTrue('resident chain vs CPU parity (' + Act.ClassName +
+        '): max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+        MaxDiff < 1e-4);
+      // Both intermediate outputs are still one ForceOutputOnRAM away.
+      Act.ForceOutputOnRAM();
+      ActKept := 0;
+      for i := 0 to Act.Output.Size - 1 do
+        if Act.Output.Raw[i] = csSentinel then Inc(ActKept);
+      AssertEquals('ForceOutputOnRAM must recover the activation output (' +
+        Act.ClassName + ')', 0, ActKept);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestSplitChannelsOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  InputLayer, SourceLayer: TNNetLayer;
+  SplitLayer: TNNetSplitChannels;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InSize, CaseCnt: integer;
+  Diff, MaxDiff: TNeuralFloat;
+  CaseName: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CaseCnt := 0 to 2 do
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, 8);
+    OutCPU := TNNetVolume.Create();
+    try
+      InputLayer := NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+      // A ReLU convolution: cai_dot_product applies the activation on the
+      // device, which is what leaves the source output in device memory.
+      SourceLayer := NN.AddLayerAfter(
+        TNNetConvolutionReLU.Create(8, 3, 1, 1), InputLayer);
+      case CaseCnt of
+        0:
+        begin
+          CaseName := 'contiguous 3-channel slice';
+          SplitLayer := TNNetSplitChannels.Create(2, 3);
+        end;
+        1:
+        begin
+          CaseName := 'single channel';
+          SplitLayer := TNNetSplitChannels.Create(5, 1);
+        end;
+      else
+        // Non-contiguous: exercises the uploaded channel-index buffer.
+        CaseName := 'every 2nd channel';
+        SplitLayer := TNNetSplitChannelEvery.Create(2, 0);
+      end;
+      NN.AddLayerAfter(SplitLayer, SourceLayer);
+      // The device path is inference-only, so the split never fires without this.
+      NN.SetTrainable(False, False);
+
+      InSize := Input.Size;
+      for i := 0 to InSize - 1 do
+        Input.Raw[i] := 0.05 * i - 0.3;
+
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+      AssertEquals('split ran on the CPU before EnableOpenCL', 0,
+        SplitLayer.ForwardGPUCnt);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Second device forward: the split reuses its resident result buffer.
+        NN.Compute(Input);
+        MaxDiff := 0;
+        AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  SplitChannels OpenCL parity: ', CaseName, ' max|diff|=',
+        MaxDiff:0:9, ' gpu forwards=', SplitLayer.ForwardGPUCnt);
+      // Without this a silent fall back to the CPU would compare the reference
+      // against itself and pass while covering nothing.
+      AssertTrue('TNNetSplitChannels must reach the device (' + CaseName + ')',
+        SplitLayer.ForwardGPUCnt > 0);
+      AssertTrue('TNNetSplitChannels OpenCL vs CPU parity (' + CaseName +
+        '): max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+        MaxDiff < 1e-4);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestGLUGateResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Names: array[0..3] of string = ('GLU', 'SwiGLU', 'GEGLU', 'GEGLUErf');
+var
+  NN, RefNN: TNNet;
+  Input: TNNetVolume;
+  InputLayer, SourceLayer, GateLayer, RefGate: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InSize, InDepth, VariantCnt, DepthCnt, ScaleCnt: integer;
+  InScale, Diff, MaxDiff, RefMagnitude: TNeuralFloat;
+
+  // One fresh gate layer of the swept variant. Both networks build the same
+  // kind, so the CPU reference is the layer's OWN forward, not a second copy
+  // of its activation formula.
+  function CreateGate(Variant: integer): TNNetLayer;
+  begin
+    case Variant of
+      0: Result := TNNetGLU.Create();
+      1: Result := TNNetSwiGLU.Create();
+      2: Result := TNNetGEGLU.Create();
+    else Result := TNNetGEGLUErf.Create();
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for VariantCnt := 0 to 3 do
+  for DepthCnt := 0 to 1 do
+  for ScaleCnt := 0 to 1 do
+  begin
+    RandSeed := 424242;
+    if DepthCnt = 0 then InDepth := 8 else InDepth := 16;
+    // Scale 60 drives the convolution output - the gate's B half - to about 93.
+    // GEGLU's device branch feeds that through tanh(0.798*(B + 0.0447*B^3)),
+    // an argument near 3.5e4, and PoCL runs kernels on the host CPU where the
+    // process leaves floating-point exceptions unmasked. Before cai_glu_gate
+    // clamped, this case killed the whole suite at B ~ 18.
+    if ScaleCnt = 0 then InScale := 0.6 else InScale := 60;
+    NN := TNNet.Create();
+    RefNN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, InDepth);
+    try
+      InputLayer := NN.AddLayer(TNNetInput.Create(6, 6, InDepth, 1));
+      // A ReLU convolution: cai_dot_product applies the activation on the
+      // device, which is what leaves the source output in device memory.
+      SourceLayer := NN.AddLayerAfter(
+        TNNetConvolutionReLU.Create(InDepth, 3, 1, 1), InputLayer);
+      GateLayer := CreateGate(VariantCnt);
+      NN.AddLayerAfter(GateLayer, SourceLayer);
+      // The device path is inference-only, so the gate never fires without this.
+      NN.SetTrainable(False, False);
+
+      // CPU oracle: the same gate class fed straight from the source output the
+      // device gate read. Comparing against a whole-network CPU forward instead
+      // would measure the convolution - its device GEMM reassociates the sums,
+      // and the gate amplifies that to ~2e-4.
+      RefNN.AddLayer(TNNetInput.Create(6, 6, InDepth, 1));
+      RefGate := CreateGate(VariantCnt);
+      RefNN.AddLayer(RefGate);
+
+      InSize := Input.Size;
+      for i := 0 to InSize - 1 do
+        Input.Raw[i] := InScale * Sin(i * 0.37);
+
+      NN.Compute(Input);
+      AssertEquals(Names[VariantCnt] + ' ran on the CPU before EnableOpenCL', 0,
+        GateLayer.ForwardGPUCnt);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Wipe the host copy the CPU forward left behind, so a device path that
+        // never writes back compares as zeros instead of as its own reference.
+        GateLayer.Output.Fill(0);
+        // Second device forward: the gate reuses its resident result buffer.
+        NN.Compute(Input);
+        SourceLayer.ForceOutputOnRAM();
+        GateLayer.ForceOutputOnRAM();
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      RefNN.Compute(SourceLayer.Output);
+
+      // Relative to the reference where that exceeds 1: at scale 60 the gate
+      // output reaches ~8600, and single precision alone is worth ~1e-3 there,
+      // so an absolute 1e-4 bound would measure float width, not the kernel.
+      // Below 1 the divisor is 1, which is the plain absolute difference.
+      MaxDiff := 0;
+      AssertEquals(Names[VariantCnt] + ' output size match',
+        RefGate.Output.Size, GateLayer.Output.Size);
+      for i := 0 to RefGate.Output.Size - 1 do
+      begin
+        RefMagnitude := Abs(RefGate.Output.Raw[i]);
+        if RefMagnitude < 1 then RefMagnitude := 1;
+        Diff := Abs(RefGate.Output.Raw[i] - GateLayer.Output.Raw[i]) / RefMagnitude;
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      WriteLn('  ', Names[VariantCnt], ' resident OpenCL parity: input depth ',
+        InDepth, ' scale ', InScale:0:1, ' max rel diff=', MaxDiff:0:9,
+        ' gpu forwards=', GateLayer.ForwardGPUCnt);
+      // Without this a silent fall back to the CPU would compare the reference
+      // against itself and pass while covering nothing.
+      AssertTrue(Names[VariantCnt] + ' must reach the device (input depth ' +
+        IntToStr(InDepth) + ')', GateLayer.ForwardGPUCnt > 0);
+      AssertTrue(Names[VariantCnt] + ' resident OpenCL vs CPU parity (input ' +
+        'depth ' + IntToStr(InDepth) + ', scale ' + FloatToStr(InScale) +
+        '): max relative diff = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+        MaxDiff < 1e-4);
+    finally
+      Input.Free;
+      RefNN.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Every activation that carries a cai_activation opcode, checked against its own
+// CPU forward. One entry per opcode: adding an activation is a line in Names and
+// a line in CreateActivation. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestActivationOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Names: array[0..29] of string = ('ReLU', 'Sigmoid', 'HyperbolicTangent',
+    'Swish', 'SiLU', 'GELU', 'GELUErf', 'HardSwish', 'HardSigmoid',
+    'ELU', 'ELU alpha 0.5', 'SELU', 'ReLUP', 'Abs', 'Sign', 'Square',
+    'SquaredReLU', 'LeakyReLU', 'VeryLeakyReLU', 'ShiftedReLU', 'HardTanh',
+    'HardShrink', 'SoftShrink', 'Threshold', 'Clamp', 'SoftSign',
+    'ReLUL', 'ReLUL leaky', 'ReLU6', 'BentIdentity');
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  ActLayer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InSize, VariantCnt, ScaleCnt: integer;
+  InScale, Diff, MaxDiff, RefMagnitude: TNeuralFloat;
+
+  function CreateActivation(Variant: integer): TNNetLayer;
+  begin
+    case Variant of
+      0: Result := TNNetReLU.Create();
+      1: Result := TNNetSigmoid.Create();
+      2: Result := TNNetHyperbolicTangent.Create();
+      3: Result := TNNetSwish.Create();
+      4: Result := TNNetSiLU.Create();
+      5: Result := TNNetGELU.Create();
+      6: Result := TNNetGELUErf.Create();
+      7: Result := TNNetHardSwish.Create();
+      8: Result := TNNetHardSigmoid.Create();
+      9: Result := TNNetELU.Create();
+      10: Result := TNNetELU.Create(0.5);
+      11: Result := TNNetSELU.Create();
+      12: Result := TNNetReLUP.Create();
+      13: Result := TNNetAbs.Create();
+      14: Result := TNNetSign.Create();
+      15: Result := TNNetSquare.Create();
+      16: Result := TNNetSquaredReLU.Create();
+      17: Result := TNNetLeakyReLU.Create();
+      18: Result := TNNetVeryLeakyReLU.Create();
+      19: Result := TNNetShiftedReLU.Create();
+      20: Result := TNNetHardTanh.Create();
+      21: Result := TNNetHardShrink.Create();
+      22: Result := TNNetSoftShrink.Create();
+      23: Result := TNNetThreshold.Create(0.5, -2);
+      24: Result := TNNetClamp.Create(-0.5, 2);
+      25: Result := TNNetSoftSign.Create();
+      26: Result := TNNetReLUL.Create(-2, 2, 0);
+      27: Result := TNNetReLUL.Create(-2, 2, 100); // 10% leak beyond the limits
+      28: Result := TNNetReLU6.Create();
+    else Result := TNNetBentIdentity.Create();
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for VariantCnt := 0 to High(Names) do
+  for ScaleCnt := 0 to 1 do
+  begin
+    RandSeed := 424242;
+    // Scale 6 crosses every breakpoint the piecewise activations have (+-1 and
+    // +-3) and reaches the negative exponential branches of ELU and SELU. It
+    // stops well short of the range where the host TNNetVolume.Sigmoid, which
+    // evaluates exp(-x) unclamped, stops agreeing with the kernel's two-branch
+    // form - that divergence would be the host's, not the kernel's.
+    if ScaleCnt = 0 then InScale := 0.6 else InScale := 6;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, 8);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+      ActLayer := NN.AddLayer(CreateActivation(VariantCnt));
+      // The device path is inference-only: it writes FOutput but neither
+      // FOutputRaw nor the derivative mask the backward pass reads.
+      NN.SetTrainable(False, False);
+
+      InSize := Input.Size;
+      for i := 0 to InSize - 1 do
+        Input.Raw[i] := InScale * Sin(i * 0.37);
+
+      // CPU oracle: the same layer's own forward, taken before the device path
+      // overwrites FOutput. SetTrainable already ran, so both passes take the
+      // forward-only CPU branch - which is the one the kernel must match.
+      NN.Compute(Input);
+      OutCPU.Copy(ActLayer.Output);
+      AssertEquals(Names[VariantCnt] + ' ran on the CPU before EnableOpenCL', 0,
+        ActLayer.ForwardGPUCnt);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Wipe the host copy the CPU forward left behind, so a device path that
+        // never writes back compares as zeros instead of as its own reference.
+        ActLayer.Output.Fill(0);
+        NN.Compute(Input);
+      finally
+        NN.ForceOpenCL(False);
+      end;
+
+      // Relative to the reference where that exceeds 1; below 1 the divisor is
+      // 1, which is the plain absolute difference.
+      MaxDiff := 0;
+      AssertEquals(Names[VariantCnt] + ' output size match',
+        OutCPU.Size, ActLayer.Output.Size);
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        RefMagnitude := Abs(OutCPU.Raw[i]);
+        if RefMagnitude < 1 then RefMagnitude := 1;
+        Diff := Abs(OutCPU.Raw[i] - ActLayer.Output.Raw[i]) / RefMagnitude;
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      WriteLn('  ', Names[VariantCnt], ' OpenCL parity: scale ', InScale:0:1,
+        ' max rel diff=', MaxDiff:0:9, ' gpu forwards=', ActLayer.ForwardGPUCnt);
+      // Without this a silent fall back to the CPU would compare the reference
+      // against itself and pass while covering nothing.
+      AssertTrue(Names[VariantCnt] + ' must reach the device',
+        ActLayer.ForwardGPUCnt > 0);
+      AssertTrue(Names[VariantCnt] + ' OpenCL vs CPU parity (scale ' +
+        FloatToStr(InScale) + '): max relative diff = ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestDeepConcatOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  InputLayer: TNNetLayer;
+  ConcatLayer: TNNetDeepConcat;
+  Branches: array of TNNetLayer;
+  Depths: array of integer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InSize, CaseCnt, BranchPos, BranchCnt, ReplicaCount: integer;
+  Diff, MaxDiff: TNeuralFloat;
+  CaseName: string;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CaseCnt := 0 to 6 do
+  begin
+    RandSeed := 424242;
+    ReplicaCount := 0;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, 8);
+    OutCPU := TNNetVolume.Create();
+    try
+      InputLayer := NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+      case CaseCnt of
+        0:
+        begin
+          CaseName := '2 sources x 8 channels';
+          SetLength(Depths, 2); Depths[0] := 8; Depths[1] := 8;
+        end;
+        1:
+        begin
+          CaseName := '3 sources x 8 channels';
+          SetLength(Depths, 3); Depths[0] := 8; Depths[1] := 8; Depths[2] := 8;
+        end;
+        2:
+        begin
+          // Unequal depths: the destination channel of each block is then not a
+          // multiple of any single source depth.
+          CaseName := 'unequal depths 8|3|5';
+          SetLength(Depths, 3); Depths[0] := 8; Depths[1] := 3; Depths[2] := 5;
+        end;
+        3:
+        begin
+          CaseName := 'Replicate broadcast x6';
+          SetLength(Depths, 1); Depths[0] := 1;
+          ReplicaCount := 6;
+        end;
+        4:
+        begin
+          CaseName := 'unequal depths 5|11';
+          SetLength(Depths, 2); Depths[0] := 5; Depths[1] := 11;
+        end;
+        5:
+        begin
+          CaseName := 'unequal depths 8|3|5|4';
+          SetLength(Depths, 4);
+          Depths[0] := 8; Depths[1] := 3; Depths[2] := 5; Depths[3] := 4;
+        end;
+      else
+        // A replica count the fused kernels cover: every FSrc slot binds the SAME
+        // buffer, so this checks that path instead of the broadcast launch.
+        CaseName := 'Replicate broadcast x3';
+        SetLength(Depths, 1); Depths[0] := 4;
+        ReplicaCount := 3;
+      end;
+      // ReLU convolutions: cai_dot_product applies the activation on the device,
+      // which is what leaves each source output in device memory.
+      BranchCnt := Length(Depths);
+      SetLength(Branches, BranchCnt);
+      for BranchPos := 0 to BranchCnt - 1 do
+        Branches[BranchPos] := NN.AddLayerAfter(
+          TNNetConvolutionReLU.Create(Depths[BranchPos], 3, 1, 1), InputLayer);
+      if ReplicaCount > 0
+        then ConcatLayer := TNNetDeepConcat.Replicate(ReplicaCount, Branches[0])
+        else ConcatLayer := TNNetDeepConcat.Create(Branches);
+      NN.AddLayer(ConcatLayer);
+      // The device path is inference-only, so the concat never fires without this.
+      NN.SetTrainable(False, False);
+
+      InSize := Input.Size;
+      for i := 0 to InSize - 1 do
+        Input.Raw[i] := 0.05 * i - 0.3;
+
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+      AssertEquals('concat ran on the CPU before EnableOpenCL', 0,
+        ConcatLayer.ForwardGPUCnt);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        // Second device forward: the concat reuses its resident result buffer.
+        NN.Compute(Input);
+        MaxDiff := 0;
+        AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  DeepConcat OpenCL parity: ', CaseName, ' max|diff|=',
+        MaxDiff:0:9, ' gpu forwards=', ConcatLayer.ForwardGPUCnt);
+      // Without this a silent fall back to the CPU would compare the reference
+      // against itself and pass while covering nothing.
+      AssertTrue('TNNetDeepConcat must reach the device (' + CaseName + ')',
+        ConcatLayer.ForwardGPUCnt > 0);
+      AssertTrue('TNNetDeepConcat OpenCL vs CPU parity (' + CaseName +
+        '): max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+        MaxDiff < 1e-4);
+    finally
+      SetLength(Branches, 0);
+      SetLength(Depths, 0);
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
 // Depthwise 1-D causal conv (TNNetDepthwiseConv1D) true-depthwise device-kernel parity.
 procedure TTestNeuralNumerical.TestDepthwiseConv1DOpenCLParity;
 {$IFDEF OpenCL}
@@ -66914,6 +68175,72 @@ begin
 end;
 {$ENDIF}
 
+// Per-token RMSNorm device-forward parity at the DECODE shape: one token, so
+// TNNetTokenNormCL.Normalize delegates to the cooperative cai_volume_norm entry
+// point instead of the one-work-item cai_token_norm. d_model exceeds the 256
+// lanes of that work-group, so its strided partial loop runs. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TokenRMSNormDecodeOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Norm: TNNetTokenRMSNorm;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 320); // 1 token, d_model = 320
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 320, 1));
+    Norm := TNNetTokenRMSNorm.Create();
+    NN.AddLayer(Norm);
+    for i := 0 to Norm.Neurons[0].Weights.Size - 1 do
+      Norm.Neurons[0].Weights.Raw[i] := 1.0 + 0.4 * Sin(i * 0.7);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.6 * Sin(i * 0.31) - 0.15;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      MaxDiff := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    WriteLn('  TokenRMSNorm decode OpenCL parity: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards norm=', Norm.ForwardGPUCnt);
+    // Parity alone would also pass with the layer silently on the CPU.
+    AssertTrue('TokenRMSNorm decode must take the OpenCL path',
+      Norm.ForwardGPUCnt > 0);
+    AssertTrue('TokenRMSNorm decode OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
 // Per-token LayerNorm device-forward parity (mean+variance reduction plus the
 // gamma .* x_hat + beta affine), same harness as TokenRMSNormOpenCLParity with
 // randomized gamma AND beta. Coded by Claude (AI).
@@ -67082,6 +68409,9 @@ begin
       Norm.Neurons[0].Weights.Raw[i] := 1.0 + 0.4 * Sin(i * 0.7);
     InputMax := Input.Size - 1;
     for i := 0 to InputMax do Input.Raw[i] := 0.6 * Sin(i * 0.31) - 0.15;
+    // The OpenCL path is inference-only: it writes FOutput without filling the
+    // FNormalized snapshot Backpropagate reads.
+    NN.SetTrainable(False, False);
 
     NN.Compute(Input);
     OutCPU.Copy(NN.GetLastLayer.Output);
@@ -67101,8 +68431,1641 @@ begin
     finally
       NN.ForceOpenCL(False);
     end;
-    WriteLn('  WholeVolume RMSNorm OpenCL parity: max|diff|=', MaxDiff:0:9);
+    WriteLn('  WholeVolume RMSNorm OpenCL parity: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards=', Norm.ForwardGPUCnt);
+    // Without this the parity assertion below is satisfied by two CPU runs.
+    AssertTrue('the RMSNorm layer must reach the device', Norm.ForwardGPUCnt > 0);
     AssertTrue('WholeVolume RMSNorm OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetPointwiseConvLinear -> TNNetRMSNorm -> TNNetPointwiseConvLinear, the
+// transformer shape. Parity alone cannot tell a bind from an upload (both give
+// the same numbers), so each middle layer's host Output is filled with a
+// sentinel that only a download would clear.
+procedure TTestNeuralNumerical.RMSNormResidentChainOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  SourceConv, Norm, ConsumerConv: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, SourceSentinelsLeft, NormSentinelsLeft: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = 999;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 3, 16);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 3, 16, 1));
+    SourceConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(16));
+    Norm := NN.AddLayer(TNNetRMSNorm.Create());
+    ConsumerConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(8));
+    // The whole chain is inference-only: the device kernels produce no
+    // FOutputRaw, no derivative mask and no FNormalized snapshot.
+    NN.SetTrainable(False, False);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.6 * Sin(i * 0.31) - 0.15;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      // Only a download into these two layers clears the sentinels.
+      SourceConv.Output.Fill(csSentinel);
+      Norm.Output.Fill(csSentinel);
+      NN.Compute(Input);
+      SourceSentinelsLeft := 0;
+      for i := 0 to SourceConv.Output.Size - 1 do
+        if SourceConv.Output.Raw[i] = csSentinel then Inc(SourceSentinelsLeft);
+      NormSentinelsLeft := 0;
+      for i := 0 to Norm.Output.Size - 1 do
+        if Norm.Output.Raw[i] = csSentinel then Inc(NormSentinelsLeft);
+      MaxDiff := 0;
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    WriteLn('  RMSNorm resident chain: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards norm=', Norm.ForwardGPUCnt,
+      ' consumer=', ConsumerConv.ForwardGPUCnt,
+      ' sentinels kept source=', SourceSentinelsLeft, '/', SourceConv.Output.Size,
+      ' norm=', NormSentinelsLeft, '/', Norm.Output.Size);
+    AssertTrue('the RMSNorm layer must reach the device', Norm.ForwardGPUCnt > 0);
+    AssertTrue('the consuming pointwise conv must reach the device',
+      ConsumerConv.ForwardGPUCnt > 0);
+    AssertEquals('RMSNorm must bind its source, not download it',
+      SourceConv.Output.Size, SourceSentinelsLeft);
+    AssertEquals('the consuming conv must bind the RMSNorm output, not download it',
+      Norm.Output.Size, NormSentinelsLeft);
+    AssertTrue('RMSNorm resident chain vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    // The host copy is still one ForceOutputOnRAM away.
+    Norm.ForceOutputOnRAM();
+    NormSentinelsLeft := 0;
+    for i := 0 to Norm.Output.Size - 1 do
+      if Norm.Output.Raw[i] = csSentinel then Inc(NormSentinelsLeft);
+    AssertEquals('ForceOutputOnRAM must still recover the RMSNorm output',
+      0, NormSentinelsLeft);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetRMSNorm.FShouldOpenCL is pinned False, so with ForceOpenCL off the only
+// route onto the device is a source that is already there. The pointwise convs
+// on either side reach the device on their own verdict; the norm between them
+// must follow them there and keep its result resident. Coded by Claude (AI).
+procedure TTestNeuralNumerical.RMSNormResidentChainUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  SourceConv, Norm, ConsumerConv: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, SourceSentinelsLeft, NormSentinelsLeft: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = 999;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 3, 16);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 3, 16, 1));
+    SourceConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(16));
+    Norm := NN.AddLayer(TNNetRMSNorm.Create());
+    ConsumerConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(8));
+    // The whole chain is inference-only: the device kernels produce no
+    // FOutputRaw, no derivative mask and no FNormalized snapshot.
+    NN.SetTrainable(False, False);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.6 * Sin(i * 0.31) - 0.15;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    AssertFalse('the norm size verdict must stay pinned to CPU', Norm.ShouldOpenCL);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    // Only a download into these two layers clears the sentinels.
+    SourceConv.Output.Fill(csSentinel);
+    Norm.Output.Fill(csSentinel);
+    NN.Compute(Input);
+    SourceSentinelsLeft := 0;
+    for i := 0 to SourceConv.Output.Size - 1 do
+      if SourceConv.Output.Raw[i] = csSentinel then Inc(SourceSentinelsLeft);
+    NormSentinelsLeft := 0;
+    for i := 0 to Norm.Output.Size - 1 do
+      if Norm.Output.Raw[i] = csSentinel then Inc(NormSentinelsLeft);
+    MaxDiff := 0;
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  RMSNorm unforced resident chain: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards norm=', Norm.ForwardGPUCnt,
+      ' consumer=', ConsumerConv.ForwardGPUCnt,
+      ' sentinels kept source=', SourceSentinelsLeft, '/', SourceConv.Output.Size,
+      ' norm=', NormSentinelsLeft, '/', Norm.Output.Size);
+    AssertTrue('a resident source alone must put the RMSNorm layer on the device',
+      Norm.ForwardGPUCnt > 0);
+    AssertTrue('the consuming pointwise conv must reach the device',
+      ConsumerConv.ForwardGPUCnt > 0);
+    AssertEquals('RMSNorm must bind its source, not download it',
+      SourceConv.Output.Size, SourceSentinelsLeft);
+    AssertEquals('the consuming conv must bind the RMSNorm output, not download it',
+      Norm.Output.Size, NormSentinelsLeft);
+    AssertTrue('RMSNorm unforced resident chain vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    // The host copy is still one ForceOutputOnRAM away.
+    Norm.ForceOutputOnRAM();
+    NormSentinelsLeft := 0;
+    for i := 0 to Norm.Output.Size - 1 do
+      if Norm.Output.Raw[i] = csSentinel then Inc(NormSentinelsLeft);
+    AssertEquals('ForceOutputOnRAM must still recover the RMSNorm output',
+      0, NormSentinelsLeft);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetRotaryEmbedding.FShouldOpenCL is False below 256*128 output elements, so
+// with ForceOpenCL off the only route onto the device is a source that is
+// already there. TNNetDeepConcat runs on the device only when EVERY source is
+// bindable, so a RoPE layer that downloaded would pull the whole head back to
+// the host. Coded by Claude (AI).
+procedure TTestNeuralNumerical.SoftMaxResidentChainUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  InputLayer, Proj: TNNetLayer;
+  SoftMaxLayer: TNNetPointwiseSoftMax;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, ProjSentinelsLeft: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = -7777;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 100);
+  OutCPU := TNNetVolume.Create();
+  try
+    // The same resident chain the input layer test builds, with a per-token
+    // softmax on the end. Both consumers have a False size verdict at this size
+    // (the softmax needs 1280*512 elements), so only a resident source can put
+    // either of them on the device - no ForceOpenCL anywhere in this test.
+    InputLayer := NN.AddLayer(TNNetInput.Create(3, 1, 100));
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    SoftMaxLayer := TNNetPointwiseSoftMax.Create();
+    NN.AddLayer(SoftMaxLayer);
+    NN.SetTrainable(False, False);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.6 * Sin(i * 0.29) - 0.15;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    AssertFalse('the softmax size verdict must leave it on the CPU',
+      SoftMaxLayer.ShouldOpenCL);
+    AssertEquals('the softmax ran on the CPU before EnableOpenCL', 0,
+      SoftMaxLayer.ForwardGPUCnt);
+
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    AssertTrue('the softmax must expose a device buffer',
+      Assigned(SoftMaxLayer.OpenCLOutputBuffer()));
+    AssertTrue('the softmax must expose the kernel owning that buffer',
+      Assigned(SoftMaxLayer.OpenCLOutputKernel()));
+    // Parity cannot tell a bind from a download, so the sentinel below is what
+    // proves the softmax read its source in device memory: a second device
+    // forward must leave the projection's host copy untouched.
+    Proj.Output.Fill(csSentinel);
+    NN.Compute(Input);
+    ProjSentinelsLeft := 0;
+    for i := 0 to Proj.Output.Size - 1 do
+      if Proj.Output.Raw[i] = csSentinel then Inc(ProjSentinelsLeft);
+
+    MaxDiff := 0;
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  SoftMax resident chain: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards softmax=', SoftMaxLayer.ForwardGPUCnt,
+      ' source sentinels=', ProjSentinelsLeft, '/', Proj.Output.Size);
+    // Without this a silent fall back to the CPU would compare the reference
+    // against itself and pass while covering nothing.
+    AssertTrue('a resident source alone must put the softmax on the device',
+      SoftMaxLayer.ForwardGPUCnt > 0);
+    AssertFalse('the softmax size verdict must stay False',
+      SoftMaxLayer.ShouldOpenCL);
+    AssertEquals('the source must be read in device memory, not downloaded',
+      Proj.Output.Size, ProjSentinelsLeft);
+    AssertTrue('softmax resident chain vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.InputResidentSourceUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  InputLayer, Proj: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InputDiffCount: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 100);
+  OutCPU := TNNetVolume.Create();
+  try
+    // A pointwise convolution reads its source in the same order a resident
+    // buffer holds it, so it is the shortest consumer of an input layer. Depth
+    // 100 puts FVectorSize over csMaxInterleavedSize and FOutput.Size *
+    // FVectorSize = 1800 under the second threshold, so its size verdict is
+    // False and only a resident source can put it on the device.
+    InputLayer := NN.AddLayer(TNNetInput.Create(3, 1, 100));
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    NN.SetTrainable(False, False);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.6 * Sin(i * 0.29) - 0.15;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    AssertFalse('the projection size verdict must leave it on the CPU',
+      Proj.ShouldOpenCL);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    AssertTrue('the input layer must expose a device buffer',
+      Assigned(InputLayer.OpenCLOutputBuffer()));
+    AssertTrue('the input layer must expose the kernel owning that buffer',
+      Assigned(InputLayer.OpenCLOutputKernel()));
+    NN.Compute(Input);
+
+    MaxDiff := 0;
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    // The input layer offers both locations, so its host copy stays readable.
+    InputDiffCount := 0;
+    for i := 0 to Input.Size - 1 do
+      if InputLayer.Output.Raw[i] <> Input.Raw[i] then Inc(InputDiffCount);
+    WriteLn('  Input resident source: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards proj=', Proj.ForwardGPUCnt,
+      ' host copy mismatches=', InputDiffCount, '/', Input.Size);
+    AssertTrue('a resident input alone must put the projection on the device',
+      Proj.ForwardGPUCnt > 0);
+    AssertEquals('the input host copy must survive the upload', 0, InputDiffCount);
+    AssertTrue('ForceOutputOnRAM must report the input readable',
+      InputLayer.ForceOutputOnRAM());
+    AssertTrue('input resident source vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.EmbeddingResidentChainUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 3;
+  VocabSize = 11;
+  EmbSize = 100;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Embed, Proj: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Tokens: array[0..SeqLen-1] of integer = (3, 7, 10);
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 1, 1));
+    Embed := NN.AddLayer(TNNetEmbedding.Create(VocabSize, EmbSize,
+      {EncodeZero=}1, 0.5));
+    // EmbSize 100 puts the projection's FVectorSize over csMaxInterleavedSize
+    // and FOutput.Size * FVectorSize = 1800 under the second threshold, so its
+    // size verdict is False too: it reaches the device only behind a resident
+    // embedding output.
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    NN.SetTrainable(False, False);
+    for i := 0 to SeqLen - 1 do Input.FData[i] := Tokens[i];
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    AssertFalse('the embedding size verdict must leave it on the CPU',
+      Embed.ShouldOpenCL);
+    AssertFalse('the projection size verdict must leave it on the CPU',
+      Proj.ShouldOpenCL);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+
+    AssertTrue('the embedding must expose a device buffer',
+      Assigned(Embed.OpenCLOutputBuffer()));
+    AssertTrue('the embedding must expose the kernel owning that buffer',
+      Assigned(Embed.OpenCLOutputKernel()));
+    MaxDiff := 0;
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  Embedding resident chain: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards embed=', Embed.ForwardGPUCnt,
+      ' proj=', Proj.ForwardGPUCnt);
+    AssertTrue('a resident input alone must put the embedding on the device',
+      Embed.ForwardGPUCnt > 0);
+    AssertTrue('the projection must follow the resident embedding output',
+      Proj.ForwardGPUCnt > 0);
+    AssertTrue('ForceOutputOnRAM must report the embedding readable',
+      Embed.ForceOutputOnRAM());
+    AssertTrue('embedding resident chain vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.DepthwiseConv1DResidentChainUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 4;
+  VocabSize = 11;
+  EmbSize = 6;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Conv, Act: TNNetLayer;
+  DW: TNNetDepthwiseConv1D;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Tokens: array[0..SeqLen-1] of integer = (3, 7, 10, 1);
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 1, 1));
+    NN.AddLayer(TNNetEmbedding.Create(VocabSize, EmbSize, {EncodeZero=}1, 0.5));
+    // Channels * SeqLen * K = 144, far under the layer's own 256*256 bar.
+    DW := TNNetDepthwiseConv1D.Create(4, {causal}true, {suppressBias}0);
+    Conv := NN.AddLayer(DW);
+    Act := NN.AddLayer(TNNetSiLU.Create());
+    NN.SetTrainable(False, False);
+    for i := 0 to DW.Neurons.Count - 1 do
+      DW.Neurons[i].BiasWeight := 0.1 * i - 0.25;
+    for i := 0 to SeqLen - 1 do Input.FData[i] := Tokens[i];
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    AssertFalse('the depthwise conv size verdict must leave it on the CPU',
+      Conv.ShouldOpenCL);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+
+    AssertTrue('the depthwise conv must expose an OpenCL buffer',
+      Assigned(Conv.OpenCLOutputBuffer()));
+    AssertTrue('the depthwise conv must expose the kernel owning that buffer',
+      Assigned(Conv.OpenCLOutputKernel()));
+    MaxDiff := 0;
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  DepthwiseConv1D resident chain: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards conv=', Conv.ForwardGPUCnt, ' act=', Act.ForwardGPUCnt);
+    AssertTrue('a source in OpenCL memory alone must put the conv there',
+      Conv.ForwardGPUCnt > 0);
+    AssertTrue('the activation must follow the convolved rows',
+      Act.ForwardGPUCnt > 0);
+    AssertTrue('ForceOutputOnRAM must report the conv readable',
+      Conv.ForceOutputOnRAM());
+    AssertTrue('depthwise conv resident chain vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.DepthwiseConv1DDecodeResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 9;
+  VocabSize = 11;
+  EmbSize = 6;
+  KernelSize = 4;
+  SnapshotStep = 4;
+var
+  NNFull, NNStep: TNNet;
+  FullIn, StepIn, FullOut, Snap: TNNetVolume;
+  ConvStep: TNNetDepthwiseConv1D;
+  Conv, Act: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Tokens: array[0..SeqLen-1] of integer = (3, 7, 10, 1, 0, 5, 5, 9, 2);
+  T, D, Steps, StepsAtSnapshot: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260818;
+  NNFull := TNNet.Create();
+  NNStep := TNNet.Create();
+  FullIn := TNNetVolume.Create(SeqLen, 1, 1);
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  FullOut := TNNetVolume.Create();
+  Snap := TNNetVolume.Create();
+  try
+    NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, 1, 1));
+    NNFull.AddLayer(TNNetEmbedding.Create(VocabSize, EmbSize, {EncodeZero=}1, 0.5));
+    NNFull.AddLayer(TNNetDepthwiseConv1D.Create(KernelSize, {causal}true, {suppressBias}0));
+    NNFull.AddLayer(TNNetSiLU.Create());
+    NNFull.SetTrainable(False, False);
+
+    NNStep.AddLayer(TNNetInput.Create(1, 1, 1, 1));
+    NNStep.AddLayer(TNNetEmbedding.Create(VocabSize, EmbSize, {EncodeZero=}1, 0.5));
+    ConvStep := TNNetDepthwiseConv1D.Create(KernelSize, {causal}true, {suppressBias}0);
+    Conv := NNStep.AddLayer(ConvStep);
+    Act := NNStep.AddLayer(TNNetSiLU.Create());
+    NNStep.SetTrainable(False, False);
+    NNStep.CopyWeights(NNFull);
+
+    for T := 0 to SeqLen - 1 do FullIn.FData[T] := Tokens[T];
+    NNFull.Compute(FullIn);
+    FullOut.Copy(NNFull.GetLastLayer.Output);
+
+    AssertFalse('the single-token conv size verdict must leave it on the CPU',
+      Conv.ShouldOpenCL);
+    NNStep.EnableOpenCL(PlatformId, DeviceId);
+    ConvStep.BeginIncrementalDecode();
+    AssertTrue('decode enabled after Begin', ConvStep.DecodeEnabled);
+    MaxDiff := 0;
+    StepsAtSnapshot := 0;
+    for T := 0 to SeqLen - 1 do
+    begin
+      // A snapshot taken right after step SnapshotStep, then restored before
+      // the next one, must leave the session exactly where it was.
+      if T = SnapshotStep + 1 then ConvStep.RestoreState(Snap, StepsAtSnapshot);
+      StepIn.FData[0] := Tokens[T];
+      NNStep.Compute(StepIn);
+      AssertEquals('decode steps track tokens', T + 1, ConvStep.DecodeSteps);
+      for D := 0 to EmbSize - 1 do
+      begin
+        Diff := Abs(FullOut[T, 0, D] - NNStep.GetLastLayer.Output[0, 0, D]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      if T = SnapshotStep then
+      begin
+        ConvStep.CaptureState(Snap, Steps);
+        StepsAtSnapshot := Steps;
+        AssertEquals('the snapshot must carry the step count', T + 1, Steps);
+      end;
+    end;
+    ConvStep.EndIncrementalDecode();
+    WriteLn('  DepthwiseConv1D OpenCL decode: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards conv=', Conv.ForwardGPUCnt, ' act=', Act.ForwardGPUCnt);
+    AssertEquals('every decode step must run on OpenCL', SeqLen, Conv.ForwardGPUCnt);
+    AssertTrue('the activation must follow the convolved rows',
+      Act.ForwardGPUCnt > 0);
+    AssertTrue('OpenCL decode vs full CPU forward: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Snap.Free; FullOut.Free; StepIn.Free; FullIn.Free;
+    NNStep.Free; NNFull.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.GatedDeltaNetResidentChainUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Hk = 2; Hv = 4; Dk = 3; Dv = 3; SeqLen = 7;
+  InDepth = 2 * Hk * Dk + 2 * Hv * Dv + 2 * Hv; // 44
+  OutDepth = Hv * Dv;
+var
+  NNCpu, NNGpu: TNNet;
+  Input, CpuOut: TNNetVolume;
+  LCpu, LGpu: TNNetGatedDeltaNet;
+  Mixer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, D, N: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260818;
+  NNCpu := TNNet.Create();
+  NNGpu := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, InDepth);
+  CpuOut := TNNetVolume.Create();
+  try
+    NNCpu.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+    LCpu := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+    NNCpu.AddLayer(LCpu);
+    NNCpu.SetTrainable(False, False);
+    SeedGatedDeltaNet(LCpu);
+
+    NNGpu.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+    LGpu := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+    Mixer := NNGpu.AddLayer(LGpu);
+    NNGpu.SetTrainable(False, False);
+    for N := 0 to 2 do LGpu.Neurons[N].Weights.Copy(LCpu.Neurons[N].Weights);
+
+    for T := 0 to SeqLen - 1 do
+      for D := 0 to InDepth - 1 do
+        Input[T, 0, D] := 1.5 * (Random - 0.5);
+    NNCpu.Compute(Input);
+    CpuOut.Copy(LCpu.Output);
+
+    AssertFalse('the recurrence size verdict must leave it on the CPU',
+      Mixer.ShouldOpenCL);
+    NNGpu.EnableOpenCL(PlatformId, DeviceId);
+    NNGpu.Compute(Input);
+    Mixer.ForceOutputOnRAM();
+    MaxDiff := 0;
+    for T := 0 to SeqLen - 1 do
+      for D := 0 to OutDepth - 1 do
+      begin
+        Diff := Abs(CpuOut[T, 0, D] - LGpu.Output[T, 0, D]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    WriteLn('  GatedDeltaNet resident chain: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards mixer=', Mixer.ForwardGPUCnt);
+    AssertEquals('a resident source must put the recurrence on OpenCL',
+      1, Mixer.ForwardGPUCnt);
+    AssertTrue('OpenCL vs CPU scan: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    CpuOut.Free; Input.Free; NNGpu.Free; NNCpu.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.GatedDeltaNetDecodeResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Hk = 2; Hv = 4; Dk = 3; Dv = 3; SeqLen = 9;
+  InDepth = 2 * Hk * Dk + 2 * Hv * Dv + 2 * Hv; // 44
+  OutDepth = Hv * Dv;
+  SnapshotStep = 4;
+var
+  NNFull, NNStep: TNNet;
+  FullIn, StepIn, FullOut, Snap: TNNetVolume;
+  LFull, LStep: TNNetGatedDeltaNet;
+  Mixer, Act: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, D, N, Steps, StepsAtSnapshot: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260818;
+  NNFull := TNNet.Create();
+  NNStep := TNNet.Create();
+  FullIn := TNNetVolume.Create(SeqLen, 1, InDepth);
+  StepIn := TNNetVolume.Create(1, 1, InDepth);
+  FullOut := TNNetVolume.Create();
+  Snap := TNNetVolume.Create();
+  try
+    NNFull.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+    LFull := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+    NNFull.AddLayer(LFull);
+    NNFull.AddLayer(TNNetSiLU.Create());
+    NNFull.SetTrainable(False, False);
+    SeedGatedDeltaNet(LFull);
+
+    NNStep.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+    LStep := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+    Mixer := NNStep.AddLayer(LStep);
+    Act := NNStep.AddLayer(TNNetSiLU.Create());
+    NNStep.SetTrainable(False, False);
+    for N := 0 to 2 do LStep.Neurons[N].Weights.Copy(LFull.Neurons[N].Weights);
+
+    for T := 0 to SeqLen - 1 do
+      for D := 0 to InDepth - 1 do
+        FullIn[T, 0, D] := 1.5 * (Random - 0.5);
+    NNFull.Compute(FullIn);
+    FullOut.Copy(NNFull.GetLastLayer.Output);
+
+    AssertFalse('the single-token size verdict must leave it on the CPU',
+      Mixer.ShouldOpenCL);
+    NNStep.EnableOpenCL(PlatformId, DeviceId);
+    LStep.BeginIncrementalDecode();
+    AssertTrue('decode enabled after Begin', LStep.DecodeEnabled);
+    MaxDiff := 0;
+    StepsAtSnapshot := 0;
+    for T := 0 to SeqLen - 1 do
+    begin
+      // A snapshot taken right after step SnapshotStep, then restored before
+      // the next one, must leave the session exactly where it was.
+      if T = SnapshotStep + 1 then LStep.RestoreState(Snap, StepsAtSnapshot);
+      for D := 0 to InDepth - 1 do StepIn[0, 0, D] := FullIn[T, 0, D];
+      NNStep.Compute(StepIn);
+      AssertEquals('decode steps track tokens', T + 1, LStep.DecodeSteps);
+      for D := 0 to OutDepth - 1 do
+      begin
+        Diff := Abs(FullOut[T, 0, D] - NNStep.GetLastLayer.Output[0, 0, D]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      if T = SnapshotStep then
+      begin
+        LStep.CaptureState(Snap, Steps);
+        StepsAtSnapshot := Steps;
+        AssertEquals('the snapshot must carry the step count', T + 1, Steps);
+      end;
+    end;
+    LStep.EndIncrementalDecode();
+    WriteLn('  GatedDeltaNet OpenCL decode: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards mixer=', Mixer.ForwardGPUCnt, ' act=', Act.ForwardGPUCnt);
+    AssertEquals('every decode step must run on OpenCL', SeqLen,
+      Mixer.ForwardGPUCnt);
+    AssertTrue('the activation must follow the read-out rows',
+      Act.ForwardGPUCnt > 0);
+    AssertTrue('OpenCL decode vs full CPU forward: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    Snap.Free; FullOut.Free; StepIn.Free; FullIn.Free;
+    NNStep.Free; NNFull.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.GatedDeltaNetWideHeadOpenCLParity;
+{$IFDEF OpenCL}
+const
+  Hk = 1; Hv = 2; Dk = 4; Dv = 300; SeqLen = 3;
+  InDepth = 2 * Hk * Dk + 2 * Hv * Dv + 2 * Hv; // 1212
+  OutDepth = Hv * Dv;
+var
+  NNCpu, NNGpu: TNNet;
+  Input, CpuOut: TNNetVolume;
+  LCpu, LGpu: TNNetGatedDeltaNet;
+  Mixer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, D, N: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260818;
+  NNCpu := TNNet.Create();
+  NNGpu := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, InDepth);
+  CpuOut := TNNetVolume.Create();
+  try
+    NNCpu.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+    LCpu := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+    NNCpu.AddLayer(LCpu);
+    NNCpu.SetTrainable(False, False);
+    SeedGatedDeltaNet(LCpu);
+
+    NNGpu.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth, 1));
+    LGpu := TNNetGatedDeltaNet.Create(Hk, Hv, Dk, Dv);
+    Mixer := NNGpu.AddLayer(LGpu);
+    NNGpu.SetTrainable(False, False);
+    for N := 0 to 2 do LGpu.Neurons[N].Weights.Copy(LCpu.Neurons[N].Weights);
+
+    for T := 0 to SeqLen - 1 do
+      for D := 0 to InDepth - 1 do
+        Input[T, 0, D] := 1.5 * (Random - 0.5);
+    NNCpu.Compute(Input);
+    CpuOut.Copy(LCpu.Output);
+
+    NNGpu.EnableOpenCL(PlatformId, DeviceId);
+    NNGpu.Compute(Input);
+    Mixer.ForceOutputOnRAM();
+    MaxDiff := 0;
+    for T := 0 to SeqLen - 1 do
+      for D := 0 to OutDepth - 1 do
+      begin
+        Diff := Abs(CpuOut[T, 0, D] - LGpu.Output[T, 0, D]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    WriteLn('  GatedDeltaNet wide head (Dv=', Dv, '): max|diff|=', MaxDiff:0:9,
+      ' gpu forwards mixer=', Mixer.ForwardGPUCnt);
+    AssertEquals('the wide head must still run on OpenCL', 1, Mixer.ForwardGPUCnt);
+    AssertTrue('OpenCL vs CPU scan: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    CpuOut.Free; Input.Free; NNGpu.Free; NNCpu.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Shared body of the cached-decode parity tests: runs StepCnt single token
+// steps through a CPU network and an OpenCL network built the same way and
+// returns the largest output difference. CaptureAt >= 0 takes a cache snapshot
+// after that step on the OpenCL side and restores it before the next.
+// Int8KV picks the int8 KV cache, and with it the int8 snapshot API.
+function RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, Window,
+  CpuWarmupSteps, CaptureAt: integer; Int8KV: boolean; SoftCap: TNeuralFloat;
+  out GpuForwards: integer): TNeuralFloat;
+{$IFDEF OpenCL}
+var
+  NNCpu, NNGpu: TNNet;
+  StepIn, SnapK, SnapV: TNNetVolume;
+  SnapKQ, SnapVQ: TNNetVolumeQuant8;
+  LCpu, LGpu: TNNetFusedSDPA;
+  Mixer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  InDepth, OutDepth, T, D, SnapLen, SnapSinks, SnapWindow: integer;
+  Diff: TNeuralFloat;
+begin
+  Result := 0;
+  GpuForwards := 0;
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then Exit;
+  InDepth := (QHeads + 2 * KVHeads) * Dk;
+  OutDepth := QHeads * Dk;
+  NNCpu := TNNet.Create();
+  NNGpu := TNNet.Create();
+  StepIn := TNNetVolume.Create(1, 1, InDepth);
+  SnapK := TNNetVolume.Create();
+  SnapV := TNNetVolume.Create();
+  SnapKQ := TNNetVolumeQuant8.Create();
+  SnapVQ := TNNetVolumeQuant8.Create();
+  try
+    NNCpu.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+    LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, Window, SoftCap);
+    NNCpu.AddLayer(LCpu);
+    NNCpu.AddLayer(TNNetSiLU.Create());
+    NNCpu.SetTrainable(False, False);
+
+    NNGpu.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+    LGpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, Window, SoftCap);
+    Mixer := NNGpu.AddLayer(LGpu);
+    NNGpu.AddLayer(TNNetSiLU.Create());
+    NNGpu.SetTrainable(False, False);
+
+    LCpu.BeginIncrementalDecode(StepCnt, Int8KV);
+    LGpu.BeginIncrementalDecode(StepCnt, Int8KV);
+    for T := 0 to StepCnt - 1 do
+    begin
+      // The CPU network warms the OpenCL network's cache too: both run the same
+      // rows, so arming OpenCL late leaves a cache the host built.
+      if T = CpuWarmupSteps then
+        NNGpu.EnableOpenCL(PlatformId, DeviceId);
+      if (CaptureAt >= 0) and (T = CaptureAt + 1) then
+      begin
+        if Int8KV
+          then LGpu.RestoreCacheStateInt8(SnapKQ, SnapVQ, SnapLen, SnapSinks,
+            SnapWindow)
+          else LGpu.RestoreCacheState(SnapK, SnapV, SnapLen, SnapSinks,
+            SnapWindow);
+      end;
+      for D := 0 to InDepth - 1 do StepIn[0, 0, D] := 1.5 * (Random - 0.5);
+      NNCpu.Compute(StepIn);
+      NNGpu.Compute(StepIn);
+      for D := 0 to OutDepth - 1 do
+      begin
+        Diff := Abs(NNCpu.GetLastLayer.Output[0, 0, D] -
+                    NNGpu.GetLastLayer.Output[0, 0, D]);
+        if Diff > Result then Result := Diff;
+      end;
+      if (CaptureAt >= 0) and (T = CaptureAt) then
+      begin
+        if Int8KV
+          then LGpu.CaptureCacheStateInt8(SnapKQ, SnapVQ, SnapLen, SnapSinks,
+            SnapWindow)
+          else LGpu.CaptureCacheState(SnapK, SnapV, SnapLen, SnapSinks,
+            SnapWindow);
+      end;
+    end;
+    GpuForwards := Mixer.ForwardGPUCnt;
+    LGpu.EndIncrementalDecode();
+    LCpu.EndIncrementalDecode();
+  finally
+    SnapVQ.Free; SnapKQ.Free;
+    SnapV.Free; SnapK.Free; StepIn.Free; NNGpu.Free; NNCpu.Free;
+  end;
+end;
+{$ELSE}
+begin
+  Result := 0;
+  GpuForwards := 0;
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPADecodeResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 3; StepCnt = 9; SnapshotStep = 4;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  NNProbe: TNNet;
+  Probe: TNNetLayer;
+  MaxDiff: TNeuralFloat;
+  GpuForwards: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260819;
+  // Only a resident source may put this layer on OpenCL, so the size verdict
+  // has to say no first - otherwise the test would pass without proving it.
+  NNProbe := TNNet.Create();
+  try
+    NNProbe.AddLayer(TNNetInput.Create(1, 1, (QHeads + 2 * KVHeads) * Dk, 1));
+    Probe := NNProbe.AddLayer(
+      TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, 0, 0));
+    NNProbe.SetTrainable(False, False);
+    NNProbe.EnableOpenCL(PlatformId, DeviceId);
+    AssertFalse('the single-token size verdict must leave it on the CPU',
+      Probe.ShouldOpenCL);
+  finally
+    NNProbe.Free;
+  end;
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
+    {CpuWarmupSteps=}0, SnapshotStep, {Int8KV=}False, {SoftCap=}0, GpuForwards);
+  WriteLn('  FusedSDPA OpenCL decode: max|diff|=', MaxDiff:0:9,
+    ' gpu forwards=', GpuForwards);
+  AssertEquals('every decode step must run on OpenCL', StepCnt, GpuForwards);
+  AssertTrue('OpenCL cached decode vs CPU cached decode: max |diff| = ' +
+    FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAWindowedDecodeOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 3; StepCnt = 9; Window = 3;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxDiff: TNeuralFloat;
+  GpuForwards: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260820;
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, Window,
+    {CpuWarmupSteps=}0, {CaptureAt=}-1, {Int8KV=}False, {SoftCap=}5.0,
+    GpuForwards);
+  WriteLn('  FusedSDPA OpenCL windowed decode: max|diff|=', MaxDiff:0:9,
+    ' gpu forwards=', GpuForwards);
+  AssertEquals('every decode step must run on OpenCL', StepCnt, GpuForwards);
+  AssertTrue('windowed soft-capped decode: max |diff| = ' +
+    FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAHandoffDecodeOpenCLParity;
+{$IFDEF OpenCL}
+const
+  // Dk is deliberately not a divisor of the kernel's 256 lanes, so the
+  // grid-stride loops run a partial last iteration.
+  QHeads = 6; KVHeads = 3; Dk = 5; StepCnt = 8; WarmupSteps = 3;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxDiff: TNeuralFloat;
+  GpuForwards: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260821;
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
+    WarmupSteps, {CaptureAt=}-1, {Int8KV=}False, {SoftCap=}0, GpuForwards);
+  WriteLn('  FusedSDPA OpenCL cache handoff: max|diff|=', MaxDiff:0:9,
+    ' gpu forwards=', GpuForwards);
+  AssertEquals('only the steps after the handoff run on OpenCL',
+    StepCnt - WarmupSteps, GpuForwards);
+  AssertTrue('a cache built on the CPU then handed to OpenCL: max |diff| = ' +
+    FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+// The int8 tolerance is 1e-3 rather than the FP32 path's 1e-4 because the two
+// quantizers are independent: the host divides exactly and the kernel is built
+// with -cl-fast-relaxed-math, so a value sitting within a few ulp of a rounding
+// boundary may land on a code one step away. A structural fault - a wrong head,
+// cache slot or scale index - moves the output by order 1, not by 1e-3.
+// FusedSDPAInt8AppendOpenCLParity below compares the codes themselves.
+procedure TTestNeuralNumerical.FusedSDPAInt8DecodeResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 3; StepCnt = 9; SnapshotStep = 4;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxDiff: TNeuralFloat;
+  GpuForwards: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260822;
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
+    {CpuWarmupSteps=}0, SnapshotStep, {Int8KV=}True, {SoftCap=}0, GpuForwards);
+  WriteLn('  FusedSDPA OpenCL int8 decode: max|diff|=', MaxDiff:0:9,
+    ' gpu forwards=', GpuForwards);
+  AssertEquals('every int8 decode step must run on OpenCL', StepCnt,
+    GpuForwards);
+  AssertTrue('OpenCL int8 cached decode vs CPU int8 cached decode: max |diff| = '
+    + FloatToStr(MaxDiff) + ' must be < 1e-3', MaxDiff < 1e-3);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAInt8WindowedDecodeOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 3; StepCnt = 9; Window = 3;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxDiff: TNeuralFloat;
+  GpuForwards: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260823;
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, Window,
+    {CpuWarmupSteps=}0, {CaptureAt=}-1, {Int8KV=}True, {SoftCap=}5.0,
+    GpuForwards);
+  WriteLn('  FusedSDPA OpenCL int8 windowed decode: max|diff|=', MaxDiff:0:9,
+    ' gpu forwards=', GpuForwards);
+  AssertEquals('every int8 decode step must run on OpenCL', StepCnt,
+    GpuForwards);
+  AssertTrue('windowed soft-capped int8 decode: max |diff| = ' +
+    FloatToStr(MaxDiff) + ' must be < 1e-3', MaxDiff < 1e-3);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAInt8HandoffDecodeOpenCLParity;
+{$IFDEF OpenCL}
+const
+  // Dk is deliberately not a divisor of the kernel's 256 lanes, so the
+  // grid-stride loops run a partial last iteration.
+  QHeads = 6; KVHeads = 3; Dk = 5; StepCnt = 8; WarmupSteps = 3;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxDiff: TNeuralFloat;
+  GpuForwards: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260824;
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
+    WarmupSteps, {CaptureAt=}-1, {Int8KV=}True, {SoftCap=}0, GpuForwards);
+  WriteLn('  FusedSDPA OpenCL int8 cache handoff: max|diff|=', MaxDiff:0:9,
+    ' gpu forwards=', GpuForwards);
+  AssertEquals('only the steps after the handoff run on OpenCL',
+    StepCnt - WarmupSteps, GpuForwards);
+  AssertTrue('an int8 cache built on the CPU then handed to OpenCL: max |diff| '
+    + '= ' + FloatToStr(MaxDiff) + ' must be < 1e-3', MaxDiff < 1e-3);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAInt8AppendOpenCLParity;
+{$IFDEF OpenCL}
+const
+  // Dk stays under csMinAvxSize so the host quantizes with its scalar kernel,
+  // which is the arithmetic the OpenCL append was written against.
+  QHeads = 2; KVHeads = 2; Dk = 6; StepCnt = 5;
+  cZeroStep = 0; cOutlierStep = 1; cFlatStep = 2; cMidpointStep = 3;
+  // One ulp of single precision, the most the two scales may differ by.
+  cScaleUlp = 1.2e-7;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  NNCpu, NNGpu: TNNet;
+  LCpu, LGpu: TNNetFusedSDPA;
+  StepIn: TNNetVolume;
+  CpuK, CpuV, GpuK, GpuV: TNNetVolumeQuant8;
+  InDepth, T, D, G, Slot, Base, Cand, MidpointCnt: integer;
+  CpuLen, CpuSinks, CpuWindow, GpuLen, GpuSinks, GpuWindow: integer;
+  MaxCodeDiff, ExactDiff: integer;
+  V, Scaled: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260825;
+  InDepth := (QHeads + 2 * KVHeads) * Dk;
+  MidpointCnt := 0;
+  MaxCodeDiff := 0;
+  ExactDiff := 0;
+  NNCpu := TNNet.Create();
+  NNGpu := TNNet.Create();
+  StepIn := TNNetVolume.Create(1, 1, InDepth);
+  CpuK := TNNetVolumeQuant8.Create();
+  CpuV := TNNetVolumeQuant8.Create();
+  GpuK := TNNetVolumeQuant8.Create();
+  GpuV := TNNetVolumeQuant8.Create();
+  try
+    NNCpu.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+    LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, 0, 0);
+    NNCpu.AddLayer(LCpu);
+    NNCpu.SetTrainable(False, False);
+    NNGpu.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+    LGpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, 0, 0);
+    NNGpu.AddLayer(LGpu);
+    NNGpu.SetTrainable(False, False);
+    NNGpu.EnableOpenCL(PlatformId, DeviceId);
+    LCpu.BeginIncrementalDecode(StepCnt, {pInt8KV=}True);
+    LGpu.BeginIncrementalDecode(StepCnt, {pInt8KV=}True);
+    for T := 0 to StepCnt - 1 do
+    begin
+      // The query slice never reaches the cache, so it stays random throughout;
+      // the K and V slices carry the row the quantizer has to handle.
+      for D := 0 to InDepth - 1 do StepIn[0, 0, D] := 1.5 * (Random - 0.5);
+      for G := 0 to 2 * KVHeads - 1 do
+      begin
+        Base := QHeads * Dk + G * Dk;
+        case T of
+          cZeroStep:
+            for D := 0 to Dk - 1 do StepIn[0, 0, Base + D] := 0;
+          cOutlierStep:
+            begin
+              for D := 0 to Dk - 1 do StepIn[0, 0, Base + D] := 1e-4;
+              StepIn[0, 0, Base] := 100;
+            end;
+          cFlatStep:
+            for D := 0 to Dk - 1 do StepIn[0, 0, Base + D] := 0.75;
+          cMidpointStep:
+            begin
+              // A row maximum of exactly 1 makes the reciprocal exact on both
+              // sides, so every other element scales to exactly x.5 and the
+              // half-to-even rule alone decides its code. OpenCL's round() is
+              // half-AWAY-from-zero and would differ here; rint() is not.
+              StepIn[0, 0, Base + Dk - 1] := 1;
+              D := 0;
+              Cand := 0;
+              while (D < Dk - 1) and (Cand < 127) do
+              begin
+                V := (Cand + 0.5) / 127;
+                Scaled := V * 127;
+                if Scaled = Cand + 0.5 then
+                begin
+                  StepIn[0, 0, Base + D] := V;
+                  Inc(MidpointCnt);
+                  Inc(D);
+                end;
+                Inc(Cand);
+              end;
+              while D < Dk - 1 do
+              begin
+                StepIn[0, 0, Base + D] := 0.5;
+                Inc(D);
+              end;
+            end;
+        end;
+      end;
+      NNCpu.Compute(StepIn);
+      NNGpu.Compute(StepIn);
+    end;
+    AssertEquals('every append must have run on OpenCL', StepCnt,
+      LGpu.ForwardGPUCnt);
+    AssertTrue('the exact-midpoint row must have been built',
+      MidpointCnt >= 2 * KVHeads);
+    // Both snapshots bring the cache home first, so this compares what the
+    // OpenCL append wrote against what QuantizeCacheRow wrote.
+    LCpu.CaptureCacheStateInt8(CpuK, CpuV, CpuLen, CpuSinks, CpuWindow);
+    LGpu.CaptureCacheStateInt8(GpuK, GpuV, GpuLen, GpuSinks, GpuWindow);
+    AssertEquals('both caches must hold the same number of rows', CpuLen,
+      GpuLen);
+    for G := 0 to KVHeads - 1 do
+      for T := 0 to StepCnt - 1 do
+      begin
+        Slot := G * StepCnt + T;
+        // The row maximum itself is exact on both sides - fabs and comparison
+        // are exact operations - so the scales may differ only by the rounding
+        // of the divide by 127, which -cl-fast-relaxed-math lowers to a
+        // reciprocal multiply. Anything past one rounding step means the kernel
+        // reduced over the wrong elements.
+        AssertTrue('K row scale, head ' + IntToStr(G) + ' slot ' + IntToStr(T) +
+          ' cpu=' + FloatToStr(CpuK.ScalePtr^[Slot]) +
+          ' gpu=' + FloatToStr(GpuK.ScalePtr^[Slot]),
+          Abs(CpuK.ScalePtr^[Slot] - GpuK.ScalePtr^[Slot]) <=
+            cScaleUlp * Abs(CpuK.ScalePtr^[Slot]));
+        AssertTrue('V row scale, head ' + IntToStr(G) + ' slot ' + IntToStr(T) +
+          ' cpu=' + FloatToStr(CpuV.ScalePtr^[Slot]) +
+          ' gpu=' + FloatToStr(GpuV.ScalePtr^[Slot]),
+          Abs(CpuV.ScalePtr^[Slot] - GpuV.ScalePtr^[Slot]) <=
+            cScaleUlp * Abs(CpuV.ScalePtr^[Slot]));
+        for D := 0 to Dk - 1 do
+        begin
+          Cand := Abs(CpuK.DataPtr^[Slot * Dk + D] - GpuK.DataPtr^[Slot * Dk + D]);
+          if Cand > MaxCodeDiff then MaxCodeDiff := Cand;
+          if T <> StepCnt - 1 then
+            if Cand > ExactDiff then ExactDiff := Cand;
+          Cand := Abs(CpuV.DataPtr^[Slot * Dk + D] - GpuV.DataPtr^[Slot * Dk + D]);
+          if Cand > MaxCodeDiff then MaxCodeDiff := Cand;
+          if T <> StepCnt - 1 then
+            if Cand > ExactDiff then ExactDiff := Cand;
+        end;
+      end;
+    LGpu.EndIncrementalDecode();
+    LCpu.EndIncrementalDecode();
+  finally
+    GpuV.Free; GpuK.Free; CpuV.Free; CpuK.Free;
+    StepIn.Free; NNGpu.Free; NNCpu.Free;
+  end;
+  WriteLn('  FusedSDPA OpenCL int8 append: max|code diff|=', MaxCodeDiff,
+    ' on the built rows=', ExactDiff, ' midpoints=', MidpointCnt);
+  AssertEquals('the built rows must quantize identically', 0, ExactDiff);
+  AssertTrue('no code may differ by more than one step, saw ' +
+    IntToStr(MaxCodeDiff), MaxCodeDiff <= 1);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TokenRMSNormResidentChainUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 3;
+  VocabSize = 11;
+  EmbSize = 100;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Norm, Proj: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Tokens: array[0..SeqLen-1] of integer = (3, 7, 10);
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 1, 1));
+    NN.AddLayer(TNNetEmbedding.Create(VocabSize, EmbSize, {EncodeZero=}1, 0.5));
+    Norm := NN.AddLayer(TNNetTokenRMSNorm.Create(1e-6));
+    // EmbSize 100 keeps the projection's own size verdict False as well (see
+    // EmbeddingResidentChainUnforcedOpenCLParity), so it reaches OpenCL only
+    // behind a normalized output that stayed there.
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(6));
+    NN.SetTrainable(False, False);
+    // Non-trivial per-channel gain so the multiply is meaningfully tested.
+    for i := 0 to Norm.Neurons[0].Weights.Size - 1 do
+      Norm.Neurons[0].Weights.Raw[i] := 1.0 + 0.4 * Sin(i * 0.7);
+    for i := 0 to SeqLen - 1 do Input.FData[i] := Tokens[i];
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    AssertFalse('the token norm size verdict must leave it on the CPU',
+      Norm.ShouldOpenCL);
+    AssertFalse('the projection size verdict must leave it on the CPU',
+      Proj.ShouldOpenCL);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+
+    AssertTrue('the token norm must expose an OpenCL buffer',
+      Assigned(Norm.OpenCLOutputBuffer()));
+    AssertTrue('the token norm must expose the kernel owning that buffer',
+      Assigned(Norm.OpenCLOutputKernel()));
+    MaxDiff := 0;
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  TokenRMSNorm resident chain: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards norm=', Norm.ForwardGPUCnt, ' proj=', Proj.ForwardGPUCnt);
+    AssertTrue('a source in OpenCL memory alone must put the norm there',
+      Norm.ForwardGPUCnt > 0);
+    AssertTrue('the projection must follow the normalized tokens',
+      Proj.ForwardGPUCnt > 0);
+    AssertTrue('ForceOutputOnRAM must report the norm readable',
+      Norm.ForceOutputOnRAM());
+    AssertTrue('token norm resident chain vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.RoPEResidentHeadChainUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Proj, QSlice, KSlice, VSlice, QRope, KRope, Concat: TNNetLayer;
+  QChannels, KChannels, VChannels: array of integer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, QSliceSentinelsLeft, QRopeSentinelsLeft: integer;
+  Diff, MaxDiff: TNeuralFloat;
+const
+  csSentinel = 999;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(6, 1, 24);
+  OutCPU := TNNetVolume.Create();
+  SetLength(QChannels, 8);
+  SetLength(KChannels, 8);
+  SetLength(VChannels, 8);
+  try
+    for i := 0 to 7 do
+    begin
+      QChannels[i] := i;
+      KChannels[i] := 8 + i;
+      VChannels[i] := 16 + i;
+    end;
+    // The shape AddMultiHeadSelfAttention builds per head: one projection, the
+    // three channel slices, RoPE on Q and K, then the concat that packs them.
+    NN.AddLayer(TNNetInput.Create(6, 1, 24, 1));
+    Proj := NN.AddLayer(TNNetPointwiseConvLinear.Create(24));
+    QSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), Proj);
+    QRope := NN.AddLayerAfter(TNNetRotaryEmbedding.Create(), QSlice);
+    KSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(KChannels), Proj);
+    KRope := NN.AddLayerAfter(TNNetRotaryEmbedding.Create(), KSlice);
+    VSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(VChannels), Proj);
+    Concat := NN.AddLayer(TNNetDeepConcat.Create([QRope, KRope, VSlice]));
+    // The whole chain is inference-only: every device path here is forward-only
+    // and leaves a resident output no backward reader recovers.
+    NN.SetTrainable(False, False);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.6 * Sin(i * 0.29) - 0.15;
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    AssertFalse('the RoPE size verdict must leave it on the CPU',
+      QRope.ShouldOpenCL);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    // Only a download into these two layers clears the sentinels.
+    QSlice.Output.Fill(csSentinel);
+    QRope.Output.Fill(csSentinel);
+    NN.Compute(Input);
+    QSliceSentinelsLeft := 0;
+    for i := 0 to QSlice.Output.Size - 1 do
+      if QSlice.Output.Raw[i] = csSentinel then Inc(QSliceSentinelsLeft);
+    QRopeSentinelsLeft := 0;
+    for i := 0 to QRope.Output.Size - 1 do
+      if QRope.Output.Raw[i] = csSentinel then Inc(QRopeSentinelsLeft);
+    MaxDiff := 0;
+    AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+    for i := 0 to OutCPU.Size - 1 do
+    begin
+      Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    WriteLn('  RoPE unforced resident head chain: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards qrope=', QRope.ForwardGPUCnt,
+      ' krope=', KRope.ForwardGPUCnt,
+      ' concat=', Concat.ForwardGPUCnt,
+      ' sentinels kept qslice=', QSliceSentinelsLeft, '/', QSlice.Output.Size,
+      ' qrope=', QRopeSentinelsLeft, '/', QRope.Output.Size);
+    AssertTrue('a resident source alone must put the Q RoPE layer on the device',
+      QRope.ForwardGPUCnt > 0);
+    AssertTrue('a resident source alone must put the K RoPE layer on the device',
+      KRope.ForwardGPUCnt > 0);
+    AssertTrue('the consuming concat must reach the device',
+      Concat.ForwardGPUCnt > 0);
+    AssertEquals('RoPE must bind its source slice, not download it',
+      QSlice.Output.Size, QSliceSentinelsLeft);
+    AssertEquals('the concat must bind the RoPE output, not download it',
+      QRope.Output.Size, QRopeSentinelsLeft);
+    AssertTrue('RoPE unforced resident head chain vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    // The host copy is still one ForceOutputOnRAM away.
+    QRope.ForceOutputOnRAM();
+    QRopeSentinelsLeft := 0;
+    for i := 0 to QRope.Output.Size - 1 do
+      if QRope.Output.Raw[i] = csSentinel then Inc(QRopeSentinelsLeft);
+    AssertEquals('ForceOutputOnRAM must still recover the RoPE output',
+      0, QRopeSentinelsLeft);
+  finally
+    SetLength(QChannels, 0); SetLength(KChannels, 0); SetLength(VChannels, 0);
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// A pointwise convolution over a depth-100 input has FVectorSize 100 (over
+// csMaxInterleavedSize) and FOutput.Size * FVectorSize = 40000 (under the second
+// threshold), so its size verdict is False and TNNetLayerConcatedWeights
+// .EnableOpenCL never creates FDotCL - but TNNet.EnableOpenCL still calls into
+// the layer. Coded by Claude (AI).
+procedure TTestNeuralNumerical.CpuVerdictConvolutionSurvivesEnableOpenCL;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Conv: TNNetLayer;
+  Input, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i: integer;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(10, 10, 100);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(10, 10, 100));
+    Conv := NN.AddLayer(TNNetPointwiseConvLinear.Create(4));
+    AssertFalse('this convolution must be below the size verdict',
+      Conv.ShouldOpenCL);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.4 * Sin(i * 0.17);
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    // Before the guard this call access-violated on a nil FDotCL.
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    AssertFalse('the size verdict must survive EnableOpenCL', Conv.ShouldOpenCL);
+    AssertFalse('a layer without FDotCL must not claim the device path',
+      Conv.WillOpenCL());
+    NN.Compute(Input);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+      MaxDiff := Max(MaxDiff, Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]));
+    AssertEquals('the CPU forward must be unchanged', 0.0, MaxDiff, 0);
+    AssertEquals('the layer must have stayed on the CPU', 0, Conv.ForwardGPUCnt);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNetFullConnect.Compute dispatches on WillOpenCL, and the scheduler routes
+// the layer by the same routine: the two cannot disagree. The 8-neuron layer is
+// below the (FNeurons.Count >= 512) and (prev >= 128) size verdict, so the only
+// thing that can put it on the device is the 512-neuron layer in front of it
+// leaving its output there. Coded by Claude (AI).
+procedure TTestNeuralNumerical.FullConnectWillOpenCLMatchesForward;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Big, Small: TNNetLayer;
+  Input, OutCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, BigSentinelsLeft: integer;
+  MaxDiff: TNeuralFloat;
+const
+  csSentinel = 999;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 128);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 128));
+    Big := NN.AddLayer(TNNetFullConnectLinear.Create(512));
+    Small := NN.AddLayer(TNNetFullConnectLinear.Create(8));
+    NN.SetTrainable(False, False);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.3 * Cos(i * 0.11);
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    AssertTrue('the 512-neuron layer must be above the size verdict',
+      Big.ShouldOpenCL);
+    AssertFalse('the 8-neuron layer must be below the size verdict',
+      Small.ShouldOpenCL);
+    NN.Compute(Input);
+    // Only a download into the big layer clears its sentinels.
+    Big.Output.Fill(csSentinel);
+    NN.Compute(Input);
+    BigSentinelsLeft := 0;
+    for i := 0 to Big.Output.Size - 1 do
+      if Big.Output.Raw[i] = csSentinel then Inc(BigSentinelsLeft);
+    MaxDiff := 0;
+    for i := 0 to OutCPU.Size - 1 do
+      MaxDiff := Max(MaxDiff, Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]));
+    WriteLn('  FullConnect resident chain: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards big=', Big.ForwardGPUCnt, ' small=', Small.ForwardGPUCnt,
+      ' sentinels kept big=', BigSentinelsLeft, '/', Big.Output.Size);
+    AssertEquals('WillOpenCL must match the branch the big layer took',
+      Big.ForwardGPUCnt > 0, Big.WillOpenCL());
+    AssertEquals('WillOpenCL must match the branch the small layer took',
+      Small.ForwardGPUCnt > 0, Small.WillOpenCL());
+    AssertTrue('the big layer must have reached the device',
+      Big.ForwardGPUCnt > 0);
+    AssertTrue('a resident source alone must put the below-verdict layer on ' +
+      'the device', Small.ForwardGPUCnt > 0);
+    AssertEquals('the small layer must bind its source, not download it',
+      Big.Output.Size, BigSentinelsLeft);
+    AssertTrue('FullConnect resident chain vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
@@ -67119,7 +70082,11 @@ end;
 // A * act(B); the shared cai_glu_gate kernel is run for all four and pinned
 // against the CPU forward (< 1e-4). gpt-oss clamped SwiGLU stays CPU-only
 // (interleaved split + clamp does not fit the contiguous-half shared kernel),
-// so it is not exercised here. Coded by Claude (AI).
+// so it is not exercised here. All four gates now run on the device only when
+// their source output is already there, and the gate reads TNNetInput, whose
+// output never is - so every case runs on the CPU here and only checks that the
+// CPU forward is unchanged. The device path is
+// TestGLUGateResidentOpenCLParity. Coded by Claude (AI).
 procedure TTestNeuralNumerical.GLUFamilyOpenCLParity;
 {$IFDEF OpenCL}
 const
@@ -67676,6 +70643,84 @@ begin
     end;
     WriteLn('  Embedding OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('Embedding OpenCL vs CPU parity: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Int8 device token-gather parity. The layer is quantized BEFORE the CPU
+// reference forward, so both sides read the same FQuantTable codes and per-row
+// scales: the host DequantizeRowTo and cai_embedding_gather_int8 must agree.
+// The forward counter is asserted too - a helper left on the FP32 entry point
+// would fall back to the CPU and still pass parity. Coded by Claude (AI).
+procedure TTestNeuralNumerical.EmbeddingInt8OpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 6;
+  VocabSize = 11;
+  EmbSize = 16;
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Embed: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Tokens: array[0..SeqLen-1] of integer = (3, 0, 7, 1, 0, 10);
+  i: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 1, 1));
+    // EncodeZero=0 keeps a zero-padding token in the batch: the kernel's
+    // row = -1 branch must zero that output row on the int8 path too.
+    Embed := NN.AddLayer(TNNetEmbedding.Create(VocabSize, EmbSize,
+      {EncodeZero=}0, 0.5));
+    NN.SetTrainable(False, False);
+    NN.QuantizeWeightsInt8();
+    AssertTrue('the embedding must be int8 quantized',
+      TNNetEmbedding(Embed).WeightsQuantizedInt8);
+    for i := 0 to SeqLen - 1 do Input.FData[i] := Tokens[i];
+
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      // Inference-only, so the gather leaves its result on the device.
+      AssertTrue('ForceOutputOnRAM must report the embedding readable',
+        Embed.ForceOutputOnRAM());
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      MaxDiff := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    WriteLn('  Embedding int8 OpenCL parity: max|diff|=', MaxDiff:0:9,
+      ' gpu forwards embed=', Embed.ForwardGPUCnt);
+    AssertTrue('the int8 gather must run on the device',
+      Embed.ForwardGPUCnt > 0);
+    AssertTrue('Embedding int8 OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
