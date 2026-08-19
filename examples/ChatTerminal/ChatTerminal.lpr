@@ -576,6 +576,7 @@ begin
     // End-of-turn markers.
     Check(EndOfTurnMarker(cfChatML) = '<|im_end|>', 'ChatML end marker');
     Check(EndOfTurnMarker(cfQwen3_5) = '<|im_end|>', 'Qwen3.5 end marker');
+    Check(EndOfTurnMarker(cfQwen3_8) = '<|im_end|>', 'Qwen3.8 end marker');
     Check(EndOfTurnMarker(cfLlama3) = '<|eot_id|>', 'Llama-3 end marker');
     Check(EndOfTurnMarker(cfGemma) = '<end_of_turn>', 'Gemma end marker');
     Check(EndOfTurnMarker(cfPhi3) = '<|end|>', 'Phi-3 end marker');

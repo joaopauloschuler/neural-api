@@ -35,6 +35,14 @@ with open(os.path.join(ROOT, "tests", "fixtures",
           encoding="utf-8") as _f:
     QWEN3_5_TEMPLATE = _f.read()
 
+# Qwen/Qwen3.8-27B ships its own chat_template.jinja: the Qwen3.6 frame plus
+# the reasoning_effort system header, preserve-thinking-by-default assistant
+# history and no content-side <think> split.
+with open(os.path.join(ROOT, "tests", "fixtures",
+                       "qwen3_8_chat_template.jinja"),
+          encoding="utf-8") as _f:
+    QWEN3_8_TEMPLATE = _f.read()
+
 # (name, template, bos_token, eos_token) -- template strings verbatim from
 # the published tokenizer_config.json files.
 TEMPLATES = {
@@ -231,6 +239,34 @@ TEMPLATES = {
             ([{"role": "user", "content": "2+2?"},
               {"role": "assistant", "content":
                "<think>\nSimple arithmetic.\n</think>\n\n4"}], False),
+        ],
+    },
+    "qwen3_8": {
+        # Qwen/Qwen3.8-27B chat_template.jinja, verbatim (see the
+        # module-level read above). The Qwen3.6 ChatML frame plus: a
+        # reasoning_effort system header (default 'xhigh'), thinking
+        # PRESERVED in every assistant history turn, and reasoning taken
+        # only from message.reasoning_content -- a plain content string
+        # therefore renders under an EMPTY <think> block.
+        "template": QWEN3_8_TEMPLATE,
+        "bos": "",
+        "eos": "<|im_end|>",
+        "extra_conversations": [
+            # earlier assistant turn carries a <think> block -> NOT split out
+            # of the content and NOT stripped (the 3.6 behaviour reversed)
+            ([{"role": "user", "content": "Hi!"},
+              {"role": "assistant", "content":
+               "<think>\nLet me think about greetings.\n</think>\n\n"
+               "Hello! How can I help?"},
+              {"role": "user", "content": "Tell me a joke."}], True),
+            # assistant turn AFTER the last user query
+            ([{"role": "user", "content": "2+2?"},
+              {"role": "assistant", "content":
+               "<think>\nSimple arithmetic.\n</think>\n\n4"}], False),
+            # empty system message: dropped, and the reasoning header stands
+            # in for it
+            ([{"role": "system", "content": "   "},
+              {"role": "user", "content": "Ping"}], True),
         ],
     },
 }

@@ -153,6 +153,7 @@ type
     procedure TestDeepSeekParityWithJinja;
     procedure TestPhi4MiniParityWithJinja;
     procedure TestQwen3_5ParityWithJinja;
+    procedure TestQwen3_8ParityWithJinja;
     procedure TestDetectDeepSeekAndPhi4Mini;
     procedure TestLoadChatTemplateFromSiblingJinja;
     procedure TestDetectFormatOnAuthenticTemplates;
@@ -2076,6 +2077,15 @@ begin
   RunChatBattery('qwen3_5');
 end;
 
+// Qwen3.8: the Qwen3.6 frame plus the reasoning-effort system header, an
+// EMPTY <think> block on every assistant turn and no content-side <think>
+// split, pinned byte for byte against the authentic Qwen3.8-27B
+// chat_template.jinja render.
+procedure TTestNeuralChat.TestQwen3_8ParityWithJinja;
+begin
+  RunChatBattery('qwen3_8');
+end;
+
 procedure TTestNeuralChat.TestPhi4MiniParityWithJinja;
 begin
   RunChatBattery('phi4mini');
@@ -2203,7 +2213,7 @@ procedure TTestNeuralChat.TestFormatNameRoundTrip;
 var
   ChatFormat: TNeuralChatFormat;
 begin
-  for ChatFormat := cfChatML to cfPhi4Mini do
+  for ChatFormat := cfChatML to cfQwen3_8 do
     AssertTrue('round trip ' + ChatFormatName(ChatFormat),
       ChatFormatFromName(ChatFormatName(ChatFormat)) = ChatFormat);
   AssertTrue('unknown name', ChatFormatFromName('vicuna') = cfUnknown);

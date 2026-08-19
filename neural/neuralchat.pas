@@ -81,6 +81,13 @@ Coded by Claude (AI).
 //             user query has its <think>...</think> stripped while later
 //             assistant turns keep the reasoning re-framed as '<think>\n' +
 //             reasoning + '\n</think>\n\n' + content. No default system.
+//   cfQwen3_8 Qwen3.8 ChatML variant (Qwen3.8-27B): the cfQwen3_5 frame with
+//             three template changes. A reasoning-effort instruction leads
+//             the system message (or stands in for it when the conversation
+//             has none), thinking is PRESERVED in every assistant history
+//             turn, and reasoning is read only from a reasoning_content
+//             field - so a plain content string renders under an EMPTY
+//             '<think>\n\n</think>\n\n' block.
 //
 // Two HF apply_chat_template options are also reproduced (additively, via the
 // TChatTemplateOptions record overload + EncodeChatWithMask):
@@ -131,13 +138,19 @@ type
                 // turn carries the "<image>\n" placeholder (the importer's
                 // image_token); EncodeChat / the demo expand it to the
                 // projected visual tokens. Coded by Claude (AI).
-    cfQwen3_5   // Qwen3.5/Qwen3.6 ChatML variant: every content is |trim'ed,
+    cfQwen3_5,  // Qwen3.5/Qwen3.6 ChatML variant: every content is |trim'ed,
                 // the generation prompt pre-opens the reasoning block
                 // ('<|im_start|>assistant\n<think>\n'), and assistant history
                 // BEFORE the last user query has its <think>...</think> block
                 // stripped while assistant turns AFTER it keep the reasoning
                 // re-framed as '<think>\n' + reasoning + '\n</think>\n\n' +
                 // content. No default system message. Coded by Claude (AI).
+    cfQwen3_8   // Qwen3.8 ChatML variant: the cfQwen3_5 frame plus the
+                // reasoning-effort system header, thinking PRESERVED in
+                // every assistant history turn, and an EMPTY <think> block
+                // framing every assistant content (reasoning comes from a
+                // reasoning_content field, never from the content itself).
+                // Coded by Claude (AI).
   );
 
   TChatMessage = record
@@ -354,6 +367,7 @@ begin
     cfQwen: Result := 'qwen';
     cfLlava: Result := 'llava';
     cfQwen3_5: Result := 'qwen3_5';
+    cfQwen3_8: Result := 'qwen3_8';
     else Result := 'unknown';
   end;
 end;
@@ -375,6 +389,7 @@ begin
   else if Lowered = 'qwen' then Result := cfQwen
   else if Lowered = 'llava' then Result := cfLlava
   else if Lowered = 'qwen3_5' then Result := cfQwen3_5
+  else if Lowered = 'qwen3_8' then Result := cfQwen3_8
   else Result := cfUnknown;
 end;
 
@@ -393,7 +408,12 @@ begin
   // '<function=' tool-call literal), so that pair is tested before both the
   // cfQwen literal and the generic '<|im_start|>' branch. Older Qwen2/2.5/3
   // templates contain neither, so their detection is unchanged.
+  // Qwen3.8 keeps 'preserve_thinking' and adds the 'reasoning_effort'
+  // identifier, which no earlier Qwen template has, so it is tested first.
   if (Pos('<|im_start|>', ChatTemplate) > 0) and
+    (Pos('reasoning_effort', ChatTemplate) > 0) then
+    Result := cfQwen3_8
+  else if (Pos('<|im_start|>', ChatTemplate) > 0) and
     (Pos('preserve_thinking', ChatTemplate) > 0) then
     Result := cfQwen3_5
   else if (Pos('<|im_start|>', ChatTemplate) > 0) and
@@ -517,9 +537,23 @@ begin
 end;
 
 // Options for the shared ChatML core renderer. Every ChatML-family format
-// (cfChatML, cfQwen, cfQwen3_5) is this ONE renderer with different options;
-// the defaults (ChatMLCoreOptions) reproduce plain cfChatML byte for byte.
+// (cfChatML, cfQwen, cfQwen3_5, cfQwen3_8) is this ONE renderer with
+// different options; the defaults (ChatMLCoreOptions) reproduce plain
+// cfChatML byte for byte.
 type
+  // How an assistant turn's reasoning block is rendered.
+  TChatThinkStyle = (
+    // Classic ChatML / cfQwen: the content is emitted as written.
+    tsContentAsIs,
+    // Qwen3.5/3.6: <think>...</think> is parsed OUT of the content; turns at
+    // or before the last user query lose it, later turns keep it re-framed
+    // as '<think>\n' + reasoning + '\n</think>\n\n' + content.
+    tsSplitBeforeLastQuery,
+    // Qwen3.8: reasoning is never taken from the content, so every assistant
+    // turn is framed by an EMPTY '<think>\n\n</think>\n\n' block and the
+    // content follows verbatim.
+    tsEmptyFrameAlways);
+
   TChatMLCoreOptions = record
     // cfQwen: prepend the Qwen default-system header when the conversation
     // has no leading system message.
@@ -527,15 +561,26 @@ type
     // Qwen3.5/3.6: Jinja |trim on every message content.
     TrimContents: boolean;
     // Appended right after the '<|im_start|>assistant\n' generation prompt
-    // ('' for classic ChatML; '<think>\n' for Qwen3.5/3.6, which pre-opens
-    // the reasoning block).
+    // ('' for classic ChatML; '<think>\n' for Qwen3.5/3.6 and Qwen3.8,
+    // which pre-open the reasoning block).
     GenPromptSuffix: string;
-    // Qwen3.5/3.6 assistant-history thinking handling: assistant turns at or
-    // before the last user query get their <think>...</think> block stripped;
-    // assistant turns after it keep the reasoning re-framed as
-    // '<think>\n' + reasoning + '\n</think>\n\n' + content.
-    ThinkHistory: boolean;
+    ThinkStyle: TChatThinkStyle;
+    // Qwen3.8: the leading system message is rendered as a header led by
+    // ReasoningInstructions, and a system message whose trimmed content is
+    // empty is dropped. False = the system message is an ordinary turn.
+    ReasoningSystemHeader: boolean;
+    // Qwen3.8 reasoning-effort sentence; '' emits no instruction (what the
+    // template's 'medium' effort produces).
+    ReasoningInstructions: string;
   end;
+
+const
+  // The reasoning_effort='xhigh' sentence of the Qwen3.8 template, which is
+  // the effort it defaults to.
+  csQwen3_8XHighReasoning =
+    'Reasoning effort is set to xhigh. Please think carefully through the ' +
+    'task, validate key assumptions, consider plausible alternatives, and ' +
+    'prioritize correctness, consistency, and clarity in the final answer.';
 
 // Plain-ChatML defaults (cfChatML with InjectQwenDefaultSystem=false,
 // cfQwen with true).
@@ -544,7 +589,9 @@ begin
   Result.InjectQwenDefaultSystem := InjectQwenDefaultSystem;
   Result.TrimContents := false;
   Result.GenPromptSuffix := '';
-  Result.ThinkHistory := false;
+  Result.ThinkStyle := tsContentAsIs;
+  Result.ReasoningSystemHeader := false;
+  Result.ReasoningInstructions := '';
 end;
 
 // The Qwen3.5/Qwen3.6 option set (see the chat_template.jinja pinned in
@@ -554,7 +601,19 @@ begin
   Result := ChatMLCoreOptions({InjectQwenDefaultSystem=}false);
   Result.TrimContents := true;
   Result.GenPromptSuffix := '<think>' + #10;
-  Result.ThinkHistory := true;
+  Result.ThinkStyle := tsSplitBeforeLastQuery;
+end;
+
+// The Qwen3.8 option set (see the chat_template.jinja pinned in
+// tests/fixtures/qwen3_8_chat_template.jinja).
+function Qwen3_8CoreOptions: TChatMLCoreOptions;
+begin
+  Result := ChatMLCoreOptions({InjectQwenDefaultSystem=}false);
+  Result.TrimContents := true;
+  Result.GenPromptSuffix := '<think>' + #10;
+  Result.ThinkStyle := tsEmptyFrameAlways;
+  Result.ReasoningSystemHeader := true;
+  Result.ReasoningInstructions := csQwen3_8XHighReasoning;
 end;
 
 // Removes leading (Lead=true) / trailing (Lead=false) newline chars ONLY --
@@ -596,14 +655,14 @@ begin
     Copy(Content, LastClose + Length('</think>'), MaxInt), {Lead=}true);
 end;
 
-// Shared ChatML body used by cfChatML, cfQwen and cfQwen3_5 (see
+// Shared ChatML body used by cfChatML, cfQwen, cfQwen3_5 and cfQwen3_8 (see
 // TChatMLCoreOptions). Records assistant-content spans into Spans (1-based
 // offsets into Result) for return_assistant_tokens_mask.
 function RenderChatMLCore(const Messages: array of TChatMessage;
   AddGenerationPrompt: boolean; const Opts: TChatMLCoreOptions;
   var Spans: TChatSpanArray): string;
 var
-  Cnt, ContentStart, MessagesHi, LastQueryIdx: integer;
+  Cnt, ContentStart, FirstMessage, MessagesHi, LastQueryIdx: integer;
   Content, Reasoning: string;
 begin
   Result := '';
@@ -613,12 +672,32 @@ begin
     Result := Result + '<|im_start|>system' + #10 + csQwenDefaultSystem +
       '<|im_end|>' + #10;
   MessagesHi := High(Messages);
+  FirstMessage := 0;
+  // Qwen3.8: the leading system message is consumed here, led by the
+  // reasoning-effort instruction; an empty one leaves the instruction
+  // standing alone as the system turn.
+  if Opts.ReasoningSystemHeader then
+  begin
+    Content := '';
+    if (Length(Messages) > 0) and (Messages[0].Role = 'system') then
+    begin
+      Content := PyStrip(Messages[0].Content);
+      FirstMessage := 1;
+    end;
+    if (Content <> '') and (Opts.ReasoningInstructions <> '') then
+      Content := Opts.ReasoningInstructions + #10#10 + Content
+    else if Content = '' then
+      Content := Opts.ReasoningInstructions;
+    if Content <> '' then
+      Result := Result + '<|im_start|>system' + #10 + Content +
+        '<|im_end|>' + #10;
+  end;
   // Qwen3.5/3.6: index of the last real user query -- the last user turn
   // whose trimmed content is not a <tool_response>...</tool_response>
   // wrapper (the template's ns.last_query_index backward scan). Assistant
   // turns AFTER it keep their reasoning; earlier ones are stripped.
   LastQueryIdx := MessagesHi;
-  if Opts.ThinkHistory then
+  if Opts.ThinkStyle = tsSplitBeforeLastQuery then
     for Cnt := MessagesHi downto 0 do
       if Messages[Cnt].Role = 'user' then
       begin
@@ -630,18 +709,23 @@ begin
           break;
         end;
       end;
-  for Cnt := 0 to MessagesHi do
+  for Cnt := FirstMessage to MessagesHi do
   begin
     Content := Messages[Cnt].Content;
     if Opts.TrimContents then Content := PyStrip(Content);
     Result := Result + '<|im_start|>' + Messages[Cnt].Role + #10;
-    if Opts.ThinkHistory and (Messages[Cnt].Role = 'assistant') then
-    begin
-      SplitQwenThink(Content, Reasoning);
-      if Cnt > LastQueryIdx then
-        Result := Result + '<think>' + #10 + Reasoning + #10 + '</think>' +
-          #10#10;
-    end;
+    if Messages[Cnt].Role = 'assistant' then
+      case Opts.ThinkStyle of
+        tsSplitBeforeLastQuery:
+          begin
+            SplitQwenThink(Content, Reasoning);
+            if Cnt > LastQueryIdx then
+              Result := Result + '<think>' + #10 + Reasoning + #10 +
+                '</think>' + #10#10;
+          end;
+        tsEmptyFrameAlways:
+          Result := Result + '<think>' + #10#10 + '</think>' + #10#10;
+      end;
     ContentStart := Length(Result) + 1;
     Result := Result + Content;
     if Messages[Cnt].Role = 'assistant' then
@@ -1830,6 +1914,8 @@ begin
       ChatMLCoreOptions({InjectQwenDefaultSystem=}true), Spans);
     cfQwen3_5: Result := RenderChatMLCore(Messages, AddGenerationPrompt,
       Qwen3_5CoreOptions, Spans);
+    cfQwen3_8: Result := RenderChatMLCore(Messages, AddGenerationPrompt,
+      Qwen3_8CoreOptions, Spans);
     cfLlama2: Result := RenderLlama2(Messages);
     cfLlama3: Result := RenderLlama3(Messages, AddGenerationPrompt);
     cfZephyr: Result := RenderZephyr(Messages, AddGenerationPrompt);
@@ -1842,7 +1928,7 @@ begin
     else
       raise ENeuralChatError.Create('Unknown chat format. Pass one of ' +
         'cfChatML/cfLlama2/cfLlama3/cfZephyr/cfGemma/cfPhi3/cfMistral/' +
-        'cfDeepSeek/cfPhi4Mini/cfQwen/cfLlava/cfQwen3_5 ' +
+        'cfDeepSeek/cfPhi4Mini/cfQwen/cfLlava/cfQwen3_5/cfQwen3_8 ' +
         '(auto-detection via DetectChatFormat did not recognize the ' +
         'model''s chat_template).');
   end;
@@ -1862,11 +1948,14 @@ var
 begin
   SetLength(Spans, 0);
   if (ChatFormat = cfChatML) or (ChatFormat = cfQwen) or
-    (ChatFormat = cfQwen3_5) then
+    (ChatFormat = cfQwen3_5) or (ChatFormat = cfQwen3_8) then
   begin
     if ChatFormat = cfQwen3_5 then
       Result := RenderChatMLCore(Messages, AddGenerationPrompt,
         Qwen3_5CoreOptions, Spans)
+    else if ChatFormat = cfQwen3_8 then
+      Result := RenderChatMLCore(Messages, AddGenerationPrompt,
+        Qwen3_8CoreOptions, Spans)
     else
       Result := RenderChatMLCore(Messages, AddGenerationPrompt,
         ChatMLCoreOptions({InjectQwenDefaultSystem=}ChatFormat = cfQwen),

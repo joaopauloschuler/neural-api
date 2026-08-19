@@ -627,6 +627,7 @@ begin
   case ChatFormat of
     cfChatML:  Result := '<|im_end|>';
     cfQwen3_5: Result := '<|im_end|>'; // Qwen3.5/3.6 ChatML variant
+    cfQwen3_8: Result := '<|im_end|>'; // Qwen3.8 ChatML variant
     cfLlama2:  Result := '</s>';
     cfLlama3:  Result := '<|eot_id|>';
     cfZephyr:  Result := '</s>';
