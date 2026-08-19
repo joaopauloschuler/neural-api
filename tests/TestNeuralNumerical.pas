@@ -369,6 +369,16 @@ type
     // A cache built by the CPU path first, then handed to OpenCL mid-session:
     // the live prefix must go up intact and the following steps must agree.
     procedure FusedSDPAHandoffDecodeOpenCLParity;
+    // The same three shapes over the INT8 KV cache, which is what a ChatTerminal
+    // run with int8 weights uses by default: the codes and the row scales stay
+    // in OpenCL memory and the append quantizes each token there.
+    procedure FusedSDPAInt8DecodeResidentOpenCLParity;
+    procedure FusedSDPAInt8WindowedDecodeOpenCLParity;
+    procedure FusedSDPAInt8HandoffDecodeOpenCLParity;
+    // The int8 append kernel against QuantizeCacheRow: row scales within one
+    // ulp, codes within one step, and codes exactly equal on rows built to
+    // stress the quantizer - all zeros, one outlier, flat, exact midpoints.
+    procedure FusedSDPAInt8AppendOpenCLParity;
     // OpenCL tap-diagonal coefficient-GEMV forward offload parity (vs CPU) for
     // TNNetKANConv (Chebyshev and B-spline basis).
     procedure TestKANConvOpenCLParity;
@@ -69263,17 +69273,19 @@ begin
 end;
 {$ENDIF}
 
-// Shared body of the three cached-decode parity tests: runs StepCnt single
-// token steps through a CPU network and an OpenCL network built the same way
-// and returns the largest output difference. CaptureAt >= 0 takes a cache
-// snapshot after that step on the OpenCL side and restores it before the next.
+// Shared body of the cached-decode parity tests: runs StepCnt single token
+// steps through a CPU network and an OpenCL network built the same way and
+// returns the largest output difference. CaptureAt >= 0 takes a cache snapshot
+// after that step on the OpenCL side and restores it before the next.
+// Int8KV picks the int8 KV cache, and with it the int8 snapshot API.
 function RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, Window,
-  CpuWarmupSteps, CaptureAt: integer; SoftCap: TNeuralFloat;
+  CpuWarmupSteps, CaptureAt: integer; Int8KV: boolean; SoftCap: TNeuralFloat;
   out GpuForwards: integer): TNeuralFloat;
 {$IFDEF OpenCL}
 var
   NNCpu, NNGpu: TNNet;
   StepIn, SnapK, SnapV: TNNetVolume;
+  SnapKQ, SnapVQ: TNNetVolumeQuant8;
   LCpu, LGpu: TNNetFusedSDPA;
   Mixer: TNNetLayer;
   PlatformId: cl_platform_id;
@@ -69291,6 +69303,8 @@ begin
   StepIn := TNNetVolume.Create(1, 1, InDepth);
   SnapK := TNNetVolume.Create();
   SnapV := TNNetVolume.Create();
+  SnapKQ := TNNetVolumeQuant8.Create();
+  SnapVQ := TNNetVolumeQuant8.Create();
   try
     NNCpu.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
     LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, Window, SoftCap);
@@ -69304,8 +69318,8 @@ begin
     NNGpu.AddLayer(TNNetSiLU.Create());
     NNGpu.SetTrainable(False, False);
 
-    LCpu.BeginIncrementalDecode(StepCnt);
-    LGpu.BeginIncrementalDecode(StepCnt);
+    LCpu.BeginIncrementalDecode(StepCnt, Int8KV);
+    LGpu.BeginIncrementalDecode(StepCnt, Int8KV);
     for T := 0 to StepCnt - 1 do
     begin
       // The CPU network warms the OpenCL network's cache too: both run the same
@@ -69313,7 +69327,13 @@ begin
       if T = CpuWarmupSteps then
         NNGpu.EnableOpenCL(PlatformId, DeviceId);
       if (CaptureAt >= 0) and (T = CaptureAt + 1) then
-        LGpu.RestoreCacheState(SnapK, SnapV, SnapLen, SnapSinks, SnapWindow);
+      begin
+        if Int8KV
+          then LGpu.RestoreCacheStateInt8(SnapKQ, SnapVQ, SnapLen, SnapSinks,
+            SnapWindow)
+          else LGpu.RestoreCacheState(SnapK, SnapV, SnapLen, SnapSinks,
+            SnapWindow);
+      end;
       for D := 0 to InDepth - 1 do StepIn[0, 0, D] := 1.5 * (Random - 0.5);
       NNCpu.Compute(StepIn);
       NNGpu.Compute(StepIn);
@@ -69324,12 +69344,19 @@ begin
         if Diff > Result then Result := Diff;
       end;
       if (CaptureAt >= 0) and (T = CaptureAt) then
-        LGpu.CaptureCacheState(SnapK, SnapV, SnapLen, SnapSinks, SnapWindow);
+      begin
+        if Int8KV
+          then LGpu.CaptureCacheStateInt8(SnapKQ, SnapVQ, SnapLen, SnapSinks,
+            SnapWindow)
+          else LGpu.CaptureCacheState(SnapK, SnapV, SnapLen, SnapSinks,
+            SnapWindow);
+      end;
     end;
     GpuForwards := Mixer.ForwardGPUCnt;
     LGpu.EndIncrementalDecode();
     LCpu.EndIncrementalDecode();
   finally
+    SnapVQ.Free; SnapKQ.Free;
     SnapV.Free; SnapK.Free; StepIn.Free; NNGpu.Free; NNCpu.Free;
   end;
 end;
@@ -69373,7 +69400,7 @@ begin
     NNProbe.Free;
   end;
   MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
-    {CpuWarmupSteps=}0, SnapshotStep, {SoftCap=}0, GpuForwards);
+    {CpuWarmupSteps=}0, SnapshotStep, {Int8KV=}False, {SoftCap=}0, GpuForwards);
   WriteLn('  FusedSDPA OpenCL decode: max|diff|=', MaxDiff:0:9,
     ' gpu forwards=', GpuForwards);
   AssertEquals('every decode step must run on OpenCL', StepCnt, GpuForwards);
@@ -69403,7 +69430,8 @@ begin
   end;
   RandSeed := 20260820;
   MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, Window,
-    {CpuWarmupSteps=}0, {CaptureAt=}-1, {SoftCap=}5.0, GpuForwards);
+    {CpuWarmupSteps=}0, {CaptureAt=}-1, {Int8KV=}False, {SoftCap=}5.0,
+    GpuForwards);
   WriteLn('  FusedSDPA OpenCL windowed decode: max|diff|=', MaxDiff:0:9,
     ' gpu forwards=', GpuForwards);
   AssertEquals('every decode step must run on OpenCL', StepCnt, GpuForwards);
@@ -69435,13 +69463,273 @@ begin
   end;
   RandSeed := 20260821;
   MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
-    WarmupSteps, {CaptureAt=}-1, {SoftCap=}0, GpuForwards);
+    WarmupSteps, {CaptureAt=}-1, {Int8KV=}False, {SoftCap=}0, GpuForwards);
   WriteLn('  FusedSDPA OpenCL cache handoff: max|diff|=', MaxDiff:0:9,
     ' gpu forwards=', GpuForwards);
   AssertEquals('only the steps after the handoff run on OpenCL',
     StepCnt - WarmupSteps, GpuForwards);
   AssertTrue('a cache built on the CPU then handed to OpenCL: max |diff| = ' +
     FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+// The int8 tolerance is 1e-3 rather than the FP32 path's 1e-4 because the two
+// quantizers are independent: the host divides exactly and the kernel is built
+// with -cl-fast-relaxed-math, so a value sitting within a few ulp of a rounding
+// boundary may land on a code one step away. A structural fault - a wrong head,
+// cache slot or scale index - moves the output by order 1, not by 1e-3.
+// FusedSDPAInt8AppendOpenCLParity below compares the codes themselves.
+procedure TTestNeuralNumerical.FusedSDPAInt8DecodeResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 3; StepCnt = 9; SnapshotStep = 4;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxDiff: TNeuralFloat;
+  GpuForwards: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260822;
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
+    {CpuWarmupSteps=}0, SnapshotStep, {Int8KV=}True, {SoftCap=}0, GpuForwards);
+  WriteLn('  FusedSDPA OpenCL int8 decode: max|diff|=', MaxDiff:0:9,
+    ' gpu forwards=', GpuForwards);
+  AssertEquals('every int8 decode step must run on OpenCL', StepCnt,
+    GpuForwards);
+  AssertTrue('OpenCL int8 cached decode vs CPU int8 cached decode: max |diff| = '
+    + FloatToStr(MaxDiff) + ' must be < 1e-3', MaxDiff < 1e-3);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAInt8WindowedDecodeOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 3; StepCnt = 9; Window = 3;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxDiff: TNeuralFloat;
+  GpuForwards: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260823;
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, Window,
+    {CpuWarmupSteps=}0, {CaptureAt=}-1, {Int8KV=}True, {SoftCap=}5.0,
+    GpuForwards);
+  WriteLn('  FusedSDPA OpenCL int8 windowed decode: max|diff|=', MaxDiff:0:9,
+    ' gpu forwards=', GpuForwards);
+  AssertEquals('every int8 decode step must run on OpenCL', StepCnt,
+    GpuForwards);
+  AssertTrue('windowed soft-capped int8 decode: max |diff| = ' +
+    FloatToStr(MaxDiff) + ' must be < 1e-3', MaxDiff < 1e-3);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAInt8HandoffDecodeOpenCLParity;
+{$IFDEF OpenCL}
+const
+  // Dk is deliberately not a divisor of the kernel's 256 lanes, so the
+  // grid-stride loops run a partial last iteration.
+  QHeads = 6; KVHeads = 3; Dk = 5; StepCnt = 8; WarmupSteps = 3;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxDiff: TNeuralFloat;
+  GpuForwards: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260824;
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
+    WarmupSteps, {CaptureAt=}-1, {Int8KV=}True, {SoftCap=}0, GpuForwards);
+  WriteLn('  FusedSDPA OpenCL int8 cache handoff: max|diff|=', MaxDiff:0:9,
+    ' gpu forwards=', GpuForwards);
+  AssertEquals('only the steps after the handoff run on OpenCL',
+    StepCnt - WarmupSteps, GpuForwards);
+  AssertTrue('an int8 cache built on the CPU then handed to OpenCL: max |diff| '
+    + '= ' + FloatToStr(MaxDiff) + ' must be < 1e-3', MaxDiff < 1e-3);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAInt8AppendOpenCLParity;
+{$IFDEF OpenCL}
+const
+  // Dk stays under csMinAvxSize so the host quantizes with its scalar kernel,
+  // which is the arithmetic the OpenCL append was written against.
+  QHeads = 2; KVHeads = 2; Dk = 6; StepCnt = 5;
+  cZeroStep = 0; cOutlierStep = 1; cFlatStep = 2; cMidpointStep = 3;
+  // One ulp of single precision, the most the two scales may differ by.
+  cScaleUlp = 1.2e-7;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  NNCpu, NNGpu: TNNet;
+  LCpu, LGpu: TNNetFusedSDPA;
+  StepIn: TNNetVolume;
+  CpuK, CpuV, GpuK, GpuV: TNNetVolumeQuant8;
+  InDepth, T, D, G, Slot, Base, Cand, MidpointCnt: integer;
+  CpuLen, CpuSinks, CpuWindow, GpuLen, GpuSinks, GpuWindow: integer;
+  MaxCodeDiff, ExactDiff: integer;
+  V, Scaled: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260825;
+  InDepth := (QHeads + 2 * KVHeads) * Dk;
+  MidpointCnt := 0;
+  MaxCodeDiff := 0;
+  ExactDiff := 0;
+  NNCpu := TNNet.Create();
+  NNGpu := TNNet.Create();
+  StepIn := TNNetVolume.Create(1, 1, InDepth);
+  CpuK := TNNetVolumeQuant8.Create();
+  CpuV := TNNetVolumeQuant8.Create();
+  GpuK := TNNetVolumeQuant8.Create();
+  GpuV := TNNetVolumeQuant8.Create();
+  try
+    NNCpu.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+    LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, 0, 0);
+    NNCpu.AddLayer(LCpu);
+    NNCpu.SetTrainable(False, False);
+    NNGpu.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+    LGpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, 0, 0);
+    NNGpu.AddLayer(LGpu);
+    NNGpu.SetTrainable(False, False);
+    NNGpu.EnableOpenCL(PlatformId, DeviceId);
+    LCpu.BeginIncrementalDecode(StepCnt, {pInt8KV=}True);
+    LGpu.BeginIncrementalDecode(StepCnt, {pInt8KV=}True);
+    for T := 0 to StepCnt - 1 do
+    begin
+      // The query slice never reaches the cache, so it stays random throughout;
+      // the K and V slices carry the row the quantizer has to handle.
+      for D := 0 to InDepth - 1 do StepIn[0, 0, D] := 1.5 * (Random - 0.5);
+      for G := 0 to 2 * KVHeads - 1 do
+      begin
+        Base := QHeads * Dk + G * Dk;
+        case T of
+          cZeroStep:
+            for D := 0 to Dk - 1 do StepIn[0, 0, Base + D] := 0;
+          cOutlierStep:
+            begin
+              for D := 0 to Dk - 1 do StepIn[0, 0, Base + D] := 1e-4;
+              StepIn[0, 0, Base] := 100;
+            end;
+          cFlatStep:
+            for D := 0 to Dk - 1 do StepIn[0, 0, Base + D] := 0.75;
+          cMidpointStep:
+            begin
+              // A row maximum of exactly 1 makes the reciprocal exact on both
+              // sides, so every other element scales to exactly x.5 and the
+              // half-to-even rule alone decides its code. OpenCL's round() is
+              // half-AWAY-from-zero and would differ here; rint() is not.
+              StepIn[0, 0, Base + Dk - 1] := 1;
+              D := 0;
+              Cand := 0;
+              while (D < Dk - 1) and (Cand < 127) do
+              begin
+                V := (Cand + 0.5) / 127;
+                Scaled := V * 127;
+                if Scaled = Cand + 0.5 then
+                begin
+                  StepIn[0, 0, Base + D] := V;
+                  Inc(MidpointCnt);
+                  Inc(D);
+                end;
+                Inc(Cand);
+              end;
+              while D < Dk - 1 do
+              begin
+                StepIn[0, 0, Base + D] := 0.5;
+                Inc(D);
+              end;
+            end;
+        end;
+      end;
+      NNCpu.Compute(StepIn);
+      NNGpu.Compute(StepIn);
+    end;
+    AssertEquals('every append must have run on OpenCL', StepCnt,
+      LGpu.ForwardGPUCnt);
+    AssertTrue('the exact-midpoint row must have been built',
+      MidpointCnt >= 2 * KVHeads);
+    // Both snapshots bring the cache home first, so this compares what the
+    // OpenCL append wrote against what QuantizeCacheRow wrote.
+    LCpu.CaptureCacheStateInt8(CpuK, CpuV, CpuLen, CpuSinks, CpuWindow);
+    LGpu.CaptureCacheStateInt8(GpuK, GpuV, GpuLen, GpuSinks, GpuWindow);
+    AssertEquals('both caches must hold the same number of rows', CpuLen,
+      GpuLen);
+    for G := 0 to KVHeads - 1 do
+      for T := 0 to StepCnt - 1 do
+      begin
+        Slot := G * StepCnt + T;
+        // The row maximum itself is exact on both sides - fabs and comparison
+        // are exact operations - so the scales may differ only by the rounding
+        // of the divide by 127, which -cl-fast-relaxed-math lowers to a
+        // reciprocal multiply. Anything past one rounding step means the kernel
+        // reduced over the wrong elements.
+        AssertTrue('K row scale, head ' + IntToStr(G) + ' slot ' + IntToStr(T) +
+          ' cpu=' + FloatToStr(CpuK.ScalePtr^[Slot]) +
+          ' gpu=' + FloatToStr(GpuK.ScalePtr^[Slot]),
+          Abs(CpuK.ScalePtr^[Slot] - GpuK.ScalePtr^[Slot]) <=
+            cScaleUlp * Abs(CpuK.ScalePtr^[Slot]));
+        AssertTrue('V row scale, head ' + IntToStr(G) + ' slot ' + IntToStr(T) +
+          ' cpu=' + FloatToStr(CpuV.ScalePtr^[Slot]) +
+          ' gpu=' + FloatToStr(GpuV.ScalePtr^[Slot]),
+          Abs(CpuV.ScalePtr^[Slot] - GpuV.ScalePtr^[Slot]) <=
+            cScaleUlp * Abs(CpuV.ScalePtr^[Slot]));
+        for D := 0 to Dk - 1 do
+        begin
+          Cand := Abs(CpuK.DataPtr^[Slot * Dk + D] - GpuK.DataPtr^[Slot * Dk + D]);
+          if Cand > MaxCodeDiff then MaxCodeDiff := Cand;
+          if T <> StepCnt - 1 then
+            if Cand > ExactDiff then ExactDiff := Cand;
+          Cand := Abs(CpuV.DataPtr^[Slot * Dk + D] - GpuV.DataPtr^[Slot * Dk + D]);
+          if Cand > MaxCodeDiff then MaxCodeDiff := Cand;
+          if T <> StepCnt - 1 then
+            if Cand > ExactDiff then ExactDiff := Cand;
+        end;
+      end;
+    LGpu.EndIncrementalDecode();
+    LCpu.EndIncrementalDecode();
+  finally
+    GpuV.Free; GpuK.Free; CpuV.Free; CpuK.Free;
+    StepIn.Free; NNGpu.Free; NNCpu.Free;
+  end;
+  WriteLn('  FusedSDPA OpenCL int8 append: max|code diff|=', MaxCodeDiff,
+    ' on the built rows=', ExactDiff, ' midpoints=', MidpointCnt);
+  AssertEquals('the built rows must quantize identically', 0, ExactDiff);
+  AssertTrue('no code may differ by more than one step, saw ' +
+    IntToStr(MaxCodeDiff), MaxCodeDiff <= 1);
 end;
 {$ELSE}
 begin

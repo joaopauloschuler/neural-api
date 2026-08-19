@@ -2270,6 +2270,194 @@ __kernel void cai_sdpa_decode
   }
 }
 
+// INT8 KV-CACHE APPEND (TNNetFusedSDPA, int8 cache). Quantizes the token's K
+// and V slices into the resident int8 cache at slot FCacheSlot, one work-group
+// per KV head, lanes splitting FDk. The format is the host's, unchanged: one
+// symmetric FP32 scale per row, scale = maxabs/127, codes in [-127,127], laid
+// out exactly as TNNetScaledDotProductAttention.QuantizeCacheRow writes them,
+// so the cache stays byte-comparable with FKCacheQ/FVCacheQ.
+//
+// Three deliberate choices:
+//   - rint, not round: OpenCL's round is half-away-from-zero while FPC's Round
+//     is half-to-even, and rint is half-to-even under the default rounding mode.
+//   - multiply by 1/maxabs FIRST and by 127 second, like TNNetVolume.QuantizeInt8:
+//     forming 127/maxabs overflows single precision for a tiny row.
+//   - a denormal row maximum (below MinSingle) emits zero codes and unit scale.
+//     The host scales in double there; a kernel cannot, and the values involved
+//     are below 1e-38.
+// Finiteness is tested on the bit pattern rather than with isnan, because
+// -cl-fast-relaxed-math implies -cl-finite-math-only and may fold isnan away.
+// FScratch is LocalSize floats. Coded by Claude (AI).
+__kernel void cai_sdpa_append_kv_int8
+(
+  const int FKVHeads,
+  const int FDk,
+  const int FCacheMax,
+  const int FCacheSlot,
+  const int FQW,
+  const int FKW,
+  __global const float* FX,
+  __global char* FKCodes,
+  __global float* FKScales,
+  __global char* FVCodes,
+  __global float* FVScales,
+  __local float* FScratch
+)
+{
+  const int g = get_group_id(1);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  int s, d, part;
+  if (g >= FKVHeads) return;
+  const int slot = g * FCacheMax + FCacheSlot;
+  const int dst = slot * FDk;
+
+  for (part = 0; part < 2; part++)
+  {
+    const int base = (part == 0) ? (FQW + g * FDk) : (FQW + FKW + g * FDk);
+    __global char* codes = (part == 0) ? FKCodes : FVCodes;
+    __global float* scales = (part == 0) ? FKScales : FVScales;
+
+    // ---- the row maximum over finite magnitudes, MaxAbsFinite's rule ----
+    float m = 0.0f;
+    for (d = lid; d < FDk; d += lsize)
+    {
+      const float a = fabs(FX[base + d]);
+      if (as_uint(a) <= 0x7F7FFFFFu) m = fmax(m, a);
+    }
+    FScratch[lid] = m;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (s = lsize >> 1; s > 0; s >>= 1)
+    {
+      if (lid < s) FScratch[lid] = fmax(FScratch[lid], FScratch[lid + s]);
+      barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float MaxAbs = FScratch[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int Usable = (as_uint(MaxAbs) >= 0x00800000u);
+    const float RowScale = Usable ? (MaxAbs / 127.0f) : 1.0f;
+    const float Recip = Usable ? (1.0f / MaxAbs) : 0.0f;
+    if (lid == 0) scales[slot] = RowScale;
+    for (d = lid; d < FDk; d += lsize)
+    {
+      const float v = FX[base + d];
+      float scaled = v * Recip * 127.0f;
+      // NaN maps to code 0 and an infinity clamps to +/-127, both matching the
+      // host quantizer.
+      if (as_uint(fabs(v)) > 0x7F800000u) scaled = 0.0f;
+      codes[dst + d] = (char)clamp(rint(scaled), -127.0f, 127.0f);
+    }
+  }
+}
+
+// CACHED-DECODE SCALED DOT-PRODUCT ATTENTION OVER AN INT8 KV CACHE
+// (TNNetFusedSDPA). Phase for phase the same kernel as cai_sdpa_decode above -
+// one work-group per query head, the score band in global memory, a
+// CLK_GLOBAL_MEM_FENCE barrier between phases 2 and 3 - and only the loads
+// differ: the codes stream straight into the accumulator and the row scale is
+// folded in as one scalar OUTSIDE the element loop, so the cache is never
+// dequantized into memory. That is what makes an int8 cache a bandwidth saving
+// rather than a bandwidth cost, and it mirrors what
+// TNNetFusedSDPA.ComputeCachedToken already does on the host.
+// char is signed in OpenCL C, so (float)code sign-extends with no mask.
+// FScratch is LocalSize + FDk floats. Coded by Claude (AI).
+__kernel void cai_sdpa_decode_int8
+(
+  const int FQHeads,
+  const int FGroupSize,
+  const int FDk,
+  const int FCacheMax,
+  const int FCacheLen,
+  const int FWindow,
+  const float FInvSqrtDk,
+  const float FScoreSoftCap,
+  const float FInvScoreSoftCap,
+  __global const float* FX,
+  __global const char* FKCodes,
+  __global const float* FKScales,
+  __global const char* FVCodes,
+  __global const float* FVScales,
+  __global float* FScores,
+  __global float* FY,
+  __local float* FScratch
+)
+{
+  const int h = get_group_id(1);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  int s, d, j;
+  if (h >= FQHeads) return;
+
+  __local float* qloc = FScratch + lsize;
+
+  const int g = h / FGroupSize;
+  const int qBase = h * FDk;
+  const int scalePlane = g * FCacheMax;
+  const int plane = scalePlane * FDk;
+  const int scoreBase = h * FCacheMax;
+  const int jStart = ((FWindow > 0) && (FCacheLen > FWindow))
+                     ? (FCacheLen - FWindow) : 0;
+
+  for (d = lid; d < FDk; d += lsize) qloc[d] = FX[qBase + d];
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  // ---- phase 1: scores over the live cache, then the row max ----
+  float m = -1e30f;
+  for (j = jStart + lid; j < FCacheLen; j += lsize)
+  {
+    __global const char* krow = FKCodes + plane + j * FDk;
+    float acc = 0.0f;
+    for (d = 0; d < FDk; d++) acc = mad(qloc[d], (float)krow[d], acc);
+    float sc = acc * (FKScales[scalePlane + j] * FInvSqrtDk);
+    if (FScoreSoftCap > 0.0f)
+      sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
+    FScores[scoreBase + j] = sc;
+    m = fmax(m, sc);
+  }
+  FScratch[lid] = m;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] = fmax(FScratch[lid], FScratch[lid + s]);
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float MaxScore = FScratch[0];
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  // ---- phase 2: shifted exp in place (same lane owns the same j), then the
+  // normalizer ----
+  float partial = 0.0f;
+  for (j = jStart + lid; j < FCacheLen; j += lsize)
+  {
+    const float e = exp(FScores[scoreBase + j] - MaxScore);
+    FScores[scoreBase + j] = e;
+    partial += e;
+  }
+  FScratch[lid] = partial;
+  barrier(CLK_LOCAL_MEM_FENCE);
+  for (s = lsize >> 1; s > 0; s >>= 1)
+  {
+    if (lid < s) FScratch[lid] += FScratch[lid + s];
+    barrier(CLK_LOCAL_MEM_FENCE);
+  }
+  const float SumExp = FScratch[0];
+  // Phase 3 reads score entries written by OTHER lanes, so the fence spans
+  // global memory too.
+  barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+  // ---- phase 3: the value sum, one output dimension per lane ----
+  const float InvSumExp = (SumExp > 0.0f) ? (1.0f / SumExp) : 0.0f;
+  for (d = lid; d < FDk; d += lsize)
+  {
+    float acc = 0.0f;
+    for (j = jStart; j < FCacheLen; j++)
+      acc = mad(FScores[scoreBase + j] * FVScales[scalePlane + j],
+                (float)FVCodes[plane + j * FDk + d], acc);
+    FY[qBase + d] = acc * InvSumExp;
+  }
+}
+
 // FUSED MIXTURE-OF-EXPERTS DOWN PROJECTION (TNNetMoEExpertBankDown).
 // Computes the whole gate-weighted expert mixture of one MoE block in a single
 // launch:

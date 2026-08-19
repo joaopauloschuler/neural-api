@@ -4358,23 +4358,38 @@ type
   // them. Two cl_kernel handles rather than one launched twice, because
   // clSetKernelArg on a kernel with a launch still in flight is undefined.
   // The KV cache is resident and appended to in place, so a decode session
-  // steps without moving the cache. Forward-only, FP32 cache only.
+  // steps without moving the cache. Forward-only; the cache is FP32 or int8,
+  // one entry-point pair each, and only one format is resident at a time.
   // Coded by Claude (AI).
   TNNetFusedSDPACL = class(TNNetKernelCL)
   private
-    // Second entry point on FKernel's program and queue (the append). Owned
-    // here: clReleaseKernel in the destructor.
-    FAppendKernel: cl_kernel;
+    // Further entry points on FKernel's program and queue: the FP32 append and
+    // the int8 append/decode pair. Owned here: clReleaseKernel in the destructor.
+    FAppendKernel, FAppendInt8Kernel, FDecodeInt8Kernel: cl_kernel;
     // Persistent device buffers (grow-only), reused every forward. FBufK/FBufV
     // are the resident cache, sized once at MaxContext and advanced in place;
     // FBufScores is the per-head score band, written and read inside one
     // launch and never moved to RAM.
     FBufX, FBufK, FBufV, FBufScores, FBufY: cl_mem;
     FCapX, FCapK, FCapV, FCapScores, FCapY: csize_t;
+    // The int8 cache, code plane and scale plane apart, laid out exactly as
+    // FKCacheQ/FVCacheQ are in RAM. Only one format is ever resident: the layer
+    // may not switch formats with a non-empty cache.
+    FBufKCodes, FBufKScales, FBufVCodes, FBufVScales: cl_mem;
+    FCapKCodes, FCapKScales, FCapVCodes, FCapVScales: csize_t;
     // The kernel of the last forward, so a layer that leaves its result in
     // FBufY can name the queue that produced it. Nil before the first forward,
     // which is what tells a consumer there is nothing to bind yet.
     FOutputKernel: TNeuralKernel;
+    // Size the four int8 cache buffers for the whole MaxContext allocation.
+    // Grow-only, so a decode session sizes them once.
+    procedure EnsureCacheBuffersInt8(KVHeads, CacheMax, Dk: integer);
+    // The score band and the result, shared by both cache formats.
+    procedure PrepareResultBuffers(Y: TNNetVolume; QHeads, CacheMax: integer;
+      out bufScores, bufY: cl_mem);
+    // Name the queue that produced Y, and read Y back unless the caller keeps it.
+    procedure FinishForward(bufY: cl_mem; Y: TNNetVolume;
+      pKeepResultOnOpenCL: boolean);
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
@@ -4392,6 +4407,12 @@ type
       KVHeads, CacheMax, CacheLen, Dk: integer);
     procedure DownloadCache(K, V: TNNetVolume;
       KVHeads, CacheMax, CacheLen, Dk: integer);
+    // The int8 twins: same live-prefix rule, two planes per container because
+    // the codes and the row scales are separate arrays.
+    procedure UploadCacheInt8(K, V: TNNetVolumeQuant8;
+      KVHeads, CacheMax, CacheLen, Dk: integer);
+    procedure DownloadCacheInt8(K, V: TNNetVolumeQuant8;
+      KVHeads, CacheMax, CacheLen, Dk: integer);
     // One cached decode step: append the token's KV rows at slot CacheSlot,
     // then attend over the live cache [.. CacheSlot] and write Y. X is the
     // single packed [Q|K|V] token row, K and V size the resident cache.
@@ -4403,6 +4424,14 @@ type
     // pKeepResultOnOpenCL leaves the result in ResultBuffer for the next layer
     // instead of reading it back into Y.
     procedure Compute(X, Y, K, V: TNNetVolume;
+      QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheLen, CacheSlot,
+      QW, KW, Window: integer;
+      InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
+      pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+    // The same decode step over the int8 cache: the append quantizes the token's
+    // KV rows into K and V rather than copying them, and the attention reads the
+    // codes with the row scale folded in. Same arguments otherwise.
+    procedure ComputeInt8(X, Y: TNNetVolume; K, V: TNNetVolumeQuant8;
       QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheLen, CacheSlot,
       QW, KW, Window: integer;
       InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
@@ -34057,15 +34086,15 @@ begin
             and (FShouldOpenCL or FForceOpenCL
                  or ((not FIsTrainable) and PrevOutputOnOpenCL()));
   if not Result then exit;
-  // Scope: ONE committed token over an FP32 cache with only the causal and
-  // sliding-window masks live. Prefill, eviction, the int8 cache, segment
-  // masking, prefix-LM, the bidirectional window and a full cache all keep the
-  // host path, which stays exactly as it was. The exact-class test mirrors the
+  // Scope: ONE committed token over the FP32 or the int8 cache, with only the
+  // causal and sliding-window masks live. Prefill, eviction, segment masking,
+  // prefix-LM, the bidirectional window and a full cache all keep the host
+  // path, which stays exactly as it was. The exact-class test mirrors the
   // inherited one: a subclass with different score math would inherit this
   // path and silently lose its extra term.
   Result := (not FIsTrainable) and (Self.ClassType = TNNetFusedSDPA)
     and Assigned(FPrevLayer) and (FPrevLayer.FOutput.SizeX = 1)
-    and (not FKVQuantInt8) and (FEvictSinks = 0)
+    and (FEvictSinks = 0)
     and (not Assigned(FSegLayer)) and (FPrefixLen = 0)
     and (not FBidirectionalWindow) and (FCacheLen < FCacheMax);
 end;
@@ -34082,19 +34111,28 @@ begin
   else Result := nil;
 end;
 
+// One boolean covers both cache formats because a format flip needs an empty
+// cache: EnableInt8KV and DisableInt8KV both refuse unless FCacheLen = 0, so
+// the format cannot change while anything is resident.
 procedure TNNetFusedSDPA.EnsureCacheOnOpenCL();
 begin
   if FCacheOnOpenCL or (not Assigned(FFusedSDPACL)) then exit;
-  FFusedSDPACL.UploadCache(FKCache, FVCache, FKVHeads, FCacheMax,
-    FCacheLen, FDk);
+  if FKVQuantInt8
+    then FFusedSDPACL.UploadCacheInt8(FKCacheQ, FVCacheQ, FKVHeads, FCacheMax,
+      FCacheLen, FDk)
+    else FFusedSDPACL.UploadCache(FKCache, FVCache, FKVHeads, FCacheMax,
+      FCacheLen, FDk);
   FCacheOnOpenCL := true;
 end;
 
 procedure TNNetFusedSDPA.ForceCacheOnRAM();
 begin
   if (not FCacheOnOpenCL) or (not Assigned(FFusedSDPACL)) then exit;
-  FFusedSDPACL.DownloadCache(FKCache, FVCache, FKVHeads, FCacheMax,
-    FCacheLen, FDk);
+  if FKVQuantInt8
+    then FFusedSDPACL.DownloadCacheInt8(FKCacheQ, FVCacheQ, FKVHeads, FCacheMax,
+      FCacheLen, FDk)
+    else FFusedSDPACL.DownloadCache(FKCache, FVCache, FKVHeads, FCacheMax,
+      FCacheLen, FDk);
   FCacheOnOpenCL := false;
 end;
 
@@ -34122,11 +34160,18 @@ begin
   // inference-only, so no host reader is left behind: anything that wants
   // FOutput calls ForceOutputOnRAM, which MoveOutputToRAM answers from the two
   // accessors above.
-  FFusedSDPACL.Compute(FPrevLayer.FOutput, FOutput, FKCache, FVCache,
-    FQHeads, FKVHeads, FGroupSize, FDk, FCacheMax,
-    {CacheLen=}FCacheLen + 1, {CacheSlot=}FCacheLen, FQW, FKW, FWindow,
-    FInvSqrtDk, FScoreSoftCap, FInvScoreSoftCap,
-    SourceBuffer, {pKeepResultOnOpenCL=}true);
+  if FKVQuantInt8 then
+    FFusedSDPACL.ComputeInt8(FPrevLayer.FOutput, FOutput, FKCacheQ, FVCacheQ,
+      FQHeads, FKVHeads, FGroupSize, FDk, FCacheMax,
+      {CacheLen=}FCacheLen + 1, {CacheSlot=}FCacheLen, FQW, FKW, FWindow,
+      FInvSqrtDk, FScoreSoftCap, FInvScoreSoftCap,
+      SourceBuffer, {pKeepResultOnOpenCL=}true)
+  else
+    FFusedSDPACL.Compute(FPrevLayer.FOutput, FOutput, FKCache, FVCache,
+      FQHeads, FKVHeads, FGroupSize, FDk, FCacheMax,
+      {CacheLen=}FCacheLen + 1, {CacheSlot=}FCacheLen, FQW, FKW, FWindow,
+      FInvSqrtDk, FScoreSoftCap, FInvScoreSoftCap,
+      SourceBuffer, {pKeepResultOnOpenCL=}true);
   Inc(FCacheLen);
   FOutputOnOpenCL := true;
   FOutputOnRAM := false;
@@ -37501,16 +37546,24 @@ begin
   // Second entry point on the SAME TNeuralKernel, so both launches land on one
   // in-order queue and the append is complete before the decode reads it.
   FAppendKernel := FKernel.CreateKernel('cai_sdpa_append_kv');
+  FAppendInt8Kernel := FKernel.CreateKernel('cai_sdpa_append_kv_int8');
+  FDecodeInt8Kernel := FKernel.CreateKernel('cai_sdpa_decode_int8');
 end;
 
 destructor TNNetFusedSDPACL.Destroy();
 begin
-  if Assigned(FAppendKernel) then clReleaseKernel(FAppendKernel);
-  if Assigned(FBufX)      then clReleaseMemObject(FBufX);
-  if Assigned(FBufK)      then clReleaseMemObject(FBufK);
-  if Assigned(FBufV)      then clReleaseMemObject(FBufV);
-  if Assigned(FBufScores) then clReleaseMemObject(FBufScores);
-  if Assigned(FBufY)      then clReleaseMemObject(FBufY);
+  if Assigned(FAppendKernel)     then clReleaseKernel(FAppendKernel);
+  if Assigned(FAppendInt8Kernel) then clReleaseKernel(FAppendInt8Kernel);
+  if Assigned(FDecodeInt8Kernel) then clReleaseKernel(FDecodeInt8Kernel);
+  if Assigned(FBufX)       then clReleaseMemObject(FBufX);
+  if Assigned(FBufK)       then clReleaseMemObject(FBufK);
+  if Assigned(FBufV)       then clReleaseMemObject(FBufV);
+  if Assigned(FBufScores)  then clReleaseMemObject(FBufScores);
+  if Assigned(FBufY)       then clReleaseMemObject(FBufY);
+  if Assigned(FBufKCodes)  then clReleaseMemObject(FBufKCodes);
+  if Assigned(FBufKScales) then clReleaseMemObject(FBufKScales);
+  if Assigned(FBufVCodes)  then clReleaseMemObject(FBufVCodes);
+  if Assigned(FBufVScales) then clReleaseMemObject(FBufVScales);
   inherited Destroy();
 end;
 
@@ -37527,6 +37580,38 @@ end;
 function TNNetFusedSDPACL.ForwardKernel(): TNeuralKernel;
 begin
   Result := FKernel;
+end;
+
+procedure TNNetFusedSDPACL.EnsureCacheBuffersInt8(KVHeads, CacheMax, Dk: integer);
+var
+  CodeBytes, ScaleBytes: integer;
+begin
+  CodeBytes := KVHeads * CacheMax * Dk * csShortIntSize;
+  ScaleBytes := KVHeads * CacheMax * csNeuralFloatSize;
+  FKernel.EnsureBuffer(FBufKCodes, FCapKCodes, CL_MEM_READ_WRITE, CodeBytes);
+  FKernel.EnsureBuffer(FBufVCodes, FCapVCodes, CL_MEM_READ_WRITE, CodeBytes);
+  FKernel.EnsureBuffer(FBufKScales, FCapKScales, CL_MEM_READ_WRITE, ScaleBytes);
+  FKernel.EnsureBuffer(FBufVScales, FCapVScales, CL_MEM_READ_WRITE, ScaleBytes);
+end;
+
+procedure TNNetFusedSDPACL.PrepareResultBuffers(Y: TNNetVolume;
+  QHeads, CacheMax: integer; out bufScores, bufY: cl_mem);
+begin
+  bufScores := FKernel.EnsureBuffer(FBufScores, FCapScores, CL_MEM_READ_WRITE,
+    QHeads * CacheMax * csNeuralFloatSize);
+  bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
+end;
+
+procedure TNNetFusedSDPACL.FinishForward(bufY: cl_mem; Y: TNNetVolume;
+  pKeepResultOnOpenCL: boolean);
+begin
+  FOutputKernel := FKernel;
+  if not pKeepResultOnOpenCL then
+  begin
+    FKernel.Finish();
+    FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  end;
+  // Buffers are persistent (FBuf*), reused next forward - not released here.
 end;
 
 procedure TNNetFusedSDPACL.UploadCache(K, V: TNNetVolume;
@@ -37600,9 +37685,7 @@ begin
   // its contents across every forward of the session.
   bufK := FKernel.EnsureOutputBuffer(FBufK, FCapK, K);
   bufV := FKernel.EnsureOutputBuffer(FBufV, FCapV, V);
-  bufScores := FKernel.EnsureBuffer(FBufScores, FCapScores, CL_MEM_READ_WRITE,
-    QHeads * CacheMax * csNeuralFloatSize);
-  bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
+  PrepareResultBuffers(Y, QHeads, CacheMax, bufScores, bufY);
   clSetKernelArg(kAppend, 0, csLongintSize, @KVHeads);
   clSetKernelArg(kAppend, 1, csLongintSize, @Dk);
   clSetKernelArg(kAppend, 2, csLongintSize, @CacheMax);
@@ -37631,13 +37714,134 @@ begin
   clSetKernelArg(kDecode, 14, (cLocalSize + Dk) * csNeuralFloatSize, nil);
   // One work-group of cLocalSize lanes per query head.
   FKernel.RunKernel2D(kDecode, cLocalSize, QHeads, cLocalSize, 1);
-  FOutputKernel := FKernel;
-  if not pKeepResultOnOpenCL then
+  FinishForward(bufY, Y, pKeepResultOnOpenCL);
+end;
+
+procedure TNNetFusedSDPACL.UploadCacheInt8(K, V: TNNetVolumeQuant8;
+  KVHeads, CacheMax, CacheLen, Dk: integer);
+var
+  g, KVHeadsM1: integer;
+  CodePlaneBytes, CodePrefixBytes, CodePlaneBase: integer;
+  ScalePlaneBytes, ScalePrefixBytes, ScalePlaneBase: integer;
+begin
+  // Full MaxContext allocation, live prefix only on the wire - the same rule
+  // UploadCache follows, applied to the code plane and the scale plane.
+  EnsureCacheBuffersInt8(KVHeads, CacheMax, Dk);
+  if CacheLen < 1 then exit;
+  KVHeadsM1 := KVHeads - 1;
+  CodePlaneBytes := CacheMax * Dk * csShortIntSize;
+  CodePrefixBytes := CacheLen * Dk * csShortIntSize;
+  ScalePlaneBytes := CacheMax * csNeuralFloatSize;
+  ScalePrefixBytes := CacheLen * csNeuralFloatSize;
+  CodePlaneBase := 0;
+  ScalePlaneBase := 0;
+  for g := 0 to KVHeadsM1 do
   begin
-    FKernel.Finish();
-    FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+    FKernel.WriteBufferAt(FBufKCodes, CodePlaneBase, CodePrefixBytes,
+      @K.DataPtr^[g * CacheMax * Dk], CL_TRUE);
+    FKernel.WriteBufferAt(FBufVCodes, CodePlaneBase, CodePrefixBytes,
+      @V.DataPtr^[g * CacheMax * Dk], CL_TRUE);
+    FKernel.WriteBufferAt(FBufKScales, ScalePlaneBase, ScalePrefixBytes,
+      @K.ScalePtr^[g * CacheMax], CL_TRUE);
+    FKernel.WriteBufferAt(FBufVScales, ScalePlaneBase, ScalePrefixBytes,
+      @V.ScalePtr^[g * CacheMax], CL_TRUE);
+    Inc(CodePlaneBase, CodePlaneBytes);
+    Inc(ScalePlaneBase, ScalePlaneBytes);
   end;
-  // Buffers are persistent (FBuf*), reused next forward - not released here.
+end;
+
+procedure TNNetFusedSDPACL.DownloadCacheInt8(K, V: TNNetVolumeQuant8;
+  KVHeads, CacheMax, CacheLen, Dk: integer);
+var
+  g, KVHeadsM1: integer;
+  CodePlaneBytes, CodePrefixBytes, CodePlaneBase: integer;
+  ScalePlaneBytes, ScalePrefixBytes, ScalePlaneBase: integer;
+begin
+  if (not Assigned(FBufKCodes)) or (CacheLen < 1) then exit;
+  FKernel.Finish();
+  KVHeadsM1 := KVHeads - 1;
+  CodePlaneBytes := CacheMax * Dk * csShortIntSize;
+  CodePrefixBytes := CacheLen * Dk * csShortIntSize;
+  ScalePlaneBytes := CacheMax * csNeuralFloatSize;
+  ScalePrefixBytes := CacheLen * csNeuralFloatSize;
+  CodePlaneBase := 0;
+  ScalePlaneBase := 0;
+  for g := 0 to KVHeadsM1 do
+  begin
+    FKernel.ReadBufferAt(FBufKCodes, CodePlaneBase, CodePrefixBytes,
+      @K.DataPtr^[g * CacheMax * Dk], CL_TRUE);
+    FKernel.ReadBufferAt(FBufVCodes, CodePlaneBase, CodePrefixBytes,
+      @V.DataPtr^[g * CacheMax * Dk], CL_TRUE);
+    FKernel.ReadBufferAt(FBufKScales, ScalePlaneBase, ScalePrefixBytes,
+      @K.ScalePtr^[g * CacheMax], CL_TRUE);
+    FKernel.ReadBufferAt(FBufVScales, ScalePlaneBase, ScalePrefixBytes,
+      @V.ScalePtr^[g * CacheMax], CL_TRUE);
+    Inc(CodePlaneBase, CodePlaneBytes);
+    Inc(ScalePlaneBase, ScalePlaneBytes);
+  end;
+end;
+
+procedure TNNetFusedSDPACL.ComputeInt8(X, Y: TNNetVolume; K, V: TNNetVolumeQuant8;
+  QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheLen, CacheSlot,
+  QW, KW, Window: integer;
+  InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
+  pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+const
+  // Lanes per head, as in Compute: a power of two, because both the append's
+  // max-abs reduction and the decode's tree reductions halve it.
+  cLocalSize = 256;
+var
+  bufX, bufScores, bufY: cl_mem;
+  kAppend, kDecode: cl_kernel;
+  fInvSqrtDk, fSoftCap, fInvSoftCap: single;
+begin
+  kAppend := FAppendInt8Kernel;
+  kDecode := FDecodeInt8Kernel;
+  fInvSqrtDk := InvSqrtDk;
+  fSoftCap := ScoreSoftCap;
+  fInvSoftCap := InvScoreSoftCap;
+  if pExternalSrc <> nil
+    then bufX := pExternalSrc
+    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+  // Grow-only and never written here, so a cache uploaded by UploadCacheInt8
+  // keeps its contents across every forward of the session.
+  EnsureCacheBuffersInt8(KVHeads, CacheMax, Dk);
+  PrepareResultBuffers(Y, QHeads, CacheMax, bufScores, bufY);
+  clSetKernelArg(kAppend,  0, csLongintSize, @KVHeads);
+  clSetKernelArg(kAppend,  1, csLongintSize, @Dk);
+  clSetKernelArg(kAppend,  2, csLongintSize, @CacheMax);
+  clSetKernelArg(kAppend,  3, csLongintSize, @CacheSlot);
+  clSetKernelArg(kAppend,  4, csLongintSize, @QW);
+  clSetKernelArg(kAppend,  5, csLongintSize, @KW);
+  clSetKernelArg(kAppend,  6, csCLMemSize, @bufX);
+  clSetKernelArg(kAppend,  7, csCLMemSize, @FBufKCodes);
+  clSetKernelArg(kAppend,  8, csCLMemSize, @FBufKScales);
+  clSetKernelArg(kAppend,  9, csCLMemSize, @FBufVCodes);
+  clSetKernelArg(kAppend, 10, csCLMemSize, @FBufVScales);
+  // Reduction scratch for the row maximum.
+  clSetKernelArg(kAppend, 11, cLocalSize * csNeuralFloatSize, nil);
+  FKernel.RunKernel2D(kAppend, cLocalSize, KVHeads, cLocalSize, 1);
+  clSetKernelArg(kDecode,  0, csLongintSize, @QHeads);
+  clSetKernelArg(kDecode,  1, csLongintSize, @GroupSize);
+  clSetKernelArg(kDecode,  2, csLongintSize, @Dk);
+  clSetKernelArg(kDecode,  3, csLongintSize, @CacheMax);
+  clSetKernelArg(kDecode,  4, csLongintSize, @CacheLen);
+  clSetKernelArg(kDecode,  5, csLongintSize, @Window);
+  clSetKernelArg(kDecode,  6, csNeuralFloatSize, @fInvSqrtDk);
+  clSetKernelArg(kDecode,  7, csNeuralFloatSize, @fSoftCap);
+  clSetKernelArg(kDecode,  8, csNeuralFloatSize, @fInvSoftCap);
+  clSetKernelArg(kDecode,  9, csCLMemSize, @bufX);
+  clSetKernelArg(kDecode, 10, csCLMemSize, @FBufKCodes);
+  clSetKernelArg(kDecode, 11, csCLMemSize, @FBufKScales);
+  clSetKernelArg(kDecode, 12, csCLMemSize, @FBufVCodes);
+  clSetKernelArg(kDecode, 13, csCLMemSize, @FBufVScales);
+  clSetKernelArg(kDecode, 14, csCLMemSize, @bufScores);
+  clSetKernelArg(kDecode, 15, csCLMemSize, @bufY);
+  // Reduction scratch, then the head's query row.
+  clSetKernelArg(kDecode, 16, (cLocalSize + Dk) * csNeuralFloatSize, nil);
+  // One work-group of cLocalSize lanes per query head.
+  FKernel.RunKernel2D(kDecode, cLocalSize, QHeads, cLocalSize, 1);
+  FinishForward(bufY, Y, pKeepResultOnOpenCL);
 end;
 
 { TNNetSoftMaxCL }
