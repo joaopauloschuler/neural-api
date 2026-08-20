@@ -1232,6 +1232,8 @@ type
       out Steps: integer);
     class procedure StateRestore(L: TNNetLayer; Src: TNNetVolume;
       Steps: integer);
+    class procedure StateMarkCheckpoint(L: TNNetLayer);
+    class procedure StateRollbackToCheckpoint(L: TNNetLayer);
   public
     // pInt8KV = true arms the int8-quantized KV cache at construction: the
     // attention layers allocate the int8 code/scale storage directly and the
@@ -1254,6 +1256,19 @@ type
     // attention layer, discarding the K/V of rejected/pad tokens. No-op when
     // the net has no attention layers.
     procedure TruncateTo(CommittedLen: integer);
+    // ONE-STEP recurrent-state checkpoint for speculative decode, the rollback
+    // TruncateTo cannot do: TruncateTo drops rejected K/V from the attention
+    // layers, but a recurrent layer's state has already absorbed the rejected
+    // token and cannot be undone by position. MarkStateCheckpoint copies every
+    // recurrent layer's state aside (call it BEFORE the speculative step);
+    // RollbackToStateCheckpoint copies it back (call it when the draft is
+    // rejected). Only the LAST mark is kept, and a rollback may be repeated.
+    // A rollback with no preceding mark in this session leaves the state
+    // untouched; a mark with no rollback only costs the copy. Both are no-ops
+    // when the net has no recurrent layers. The attention layers are NOT
+    // covered - pair these with TruncateTo for a hybrid net.
+    procedure MarkStateCheckpoint();
+    procedure RollbackToStateCheckpoint();
     // StreamingLLM unbounded streaming: turn on the attention-sink + rolling-
     // window KV-cache eviction policy on EVERY collected attention layer, so a
     // stream can run forever in constant memory. SinkTokens (the first tokens,
@@ -5611,6 +5626,24 @@ begin
   else TNNetTokenShift(L).RestoreState(Src, Steps);
 end;
 
+class procedure TNNetStreamingDecoder.StateMarkCheckpoint(L: TNNetLayer);
+begin
+  if L is TNNetRecurrentDecodeBase then
+    TNNetRecurrentDecodeBase(L).MarkStateCheckpoint()
+  else if L is TNNetDiagonalSSM then
+    TNNetDiagonalSSM(L).MarkStateCheckpoint()
+  else TNNetTokenShift(L).MarkStateCheckpoint();
+end;
+
+class procedure TNNetStreamingDecoder.StateRollbackToCheckpoint(L: TNNetLayer);
+begin
+  if L is TNNetRecurrentDecodeBase then
+    TNNetRecurrentDecodeBase(L).RollbackToStateCheckpoint()
+  else if L is TNNetDiagonalSSM then
+    TNNetDiagonalSSM(L).RollbackToStateCheckpoint()
+  else TNNetTokenShift(L).RollbackToStateCheckpoint();
+end;
+
 constructor TNNetStreamingDecoder.Create(pNet: TNNet; pMaxCacheLen: integer;
   pInt8KV: boolean);
 var
@@ -5717,6 +5750,22 @@ var
 begin
   HiSDPA := High(FSDPAs);
   for i := 0 to HiSDPA do FSDPAs[i].TruncateCache(CommittedLen);
+end;
+
+procedure TNNetStreamingDecoder.MarkStateCheckpoint();
+var
+  i, HiSSM: integer;
+begin
+  HiSSM := High(FSSMs);
+  for i := 0 to HiSSM do StateMarkCheckpoint(FSSMs[i]);
+end;
+
+procedure TNNetStreamingDecoder.RollbackToStateCheckpoint();
+var
+  i, HiSSM: integer;
+begin
+  HiSSM := High(FSSMs);
+  for i := 0 to HiSSM do StateRollbackToCheckpoint(FSSMs[i]);
 end;
 
 procedure TNNetStreamingDecoder.EnableEviction(SinkTokens, RecentWindow: integer);

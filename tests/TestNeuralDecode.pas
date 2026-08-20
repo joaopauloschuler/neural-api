@@ -9,6 +9,16 @@ uses
   neuralvolume, neuralnetwork, neuraldecode;
 
 type
+  // One-step recurrent-state checkpoint scenarios driven by
+  // RunStateCheckpointScenario (see its declaration below).
+  TStateCheckpointScenario = (
+    scNoCheckpoint,        // clean reference: no mark, no rejected token
+    scMarkRollbackDetour,  // mark, step the rejected token, roll back
+    scSnapshotRestoreDetour, // same detour undone by Snapshot/RestoreSnapshot
+    scRollbackWithoutMark, // roll back with no preceding mark
+    scMarkWithoutRollback  // mark and never roll back
+  );
+
   TTestNeuralDecode = class(TTestCase)
   private
     // Builds a tiny char-level next-token net: Input(ContextLen,1,Vocab) ->
@@ -31,7 +41,15 @@ type
     // Qwen3.5-shaped hybrid: a GatedDeltaNet "linear_attention" branch (with
     // the causal depthwise conv on the q|k|v slab) followed by a RoPE
     // attention block - the two mixer families the qwen3_5 decoder interleaves.
-    function BuildTinyQwen35HybridLM(ContextLen: integer): TNNet;
+    // pWithChannelTransformState inserts TNNetTokenShift + TNNetDiagonalSSM
+    // after the embedding, so the net carries all four recurrent-state classes.
+    function BuildTinyQwen35HybridLM(ContextLen: integer;
+      pWithChannelTransformState: boolean = false): TNNet;
+    // Streams Toks[0..PrefixLen-1] through a fresh session on Twin, applies the
+    // checkpoint scenario around DetourTok, steps FinalTok, returns its logits.
+    function RunStateCheckpointScenario(Twin: TNNet;
+      const Toks: array of integer; PrefixLen, DetourTok, FinalTok: integer;
+      Scenario: TStateCheckpointScenario): TNeuralFloatDynArr;
     // Streams Toks token-at-a-time through Session and asserts every step's
     // output row matches the corresponding row of Full's causal forward.
     procedure AssertStreamMatchesFull(Full: TNNet;
@@ -214,6 +232,13 @@ type
     procedure TestStreamingDecoderRepeatedTurnResumeBitIdenticalQwen35Hybrid;
     procedure TestStreamingDecoderForkContinuationBitIdenticalInt8KV;
     procedure TestStreamingDecoderRestoreRejectsMismatchedKVCacheMode;
+    // One-step recurrent-state checkpoint (MarkStateCheckpoint /
+    // RollbackToStateCheckpoint) - the speculative-decode rollback TruncateTo
+    // cannot do for recurrent layers.
+    procedure TestStreamingDecoderRollbackToStateCheckpointMatchesCleanRun;
+    procedure TestStreamingDecoderRollbackAgreesWithSnapshotRestore;
+    procedure TestStreamingDecoderRollbackWithoutMarkIsNoOp;
+    procedure TestStreamingDecoderMarkWithoutRollbackIsNoOp;
     procedure TestStreamingDecoderSnapshotForksManyIndependentSessions;
     // StreamingLLM KV-cache eviction (attention sinks + rolling window).
     procedure TestStreamingEvictionWithinWindowBitIdenticalToUnbounded;
@@ -2945,7 +2970,8 @@ begin
   Result.AddLayer(TNNetPointwiseConvLinear.Create(csStreamVocab));
 end;
 
-function TTestNeuralDecode.BuildTinyQwen35HybridLM(ContextLen: integer): TNNet;
+function TTestNeuralDecode.BuildTinyQwen35HybridLM(ContextLen: integer;
+  pWithChannelTransformState: boolean = false): TNNet;
 const
   Hk = 1; Hv = 2; Dk = 4; Dv = 4;
 var
@@ -2962,6 +2988,11 @@ begin
   Result.AddLayer(TNNetInput.Create(ContextLen, 1, 1));
   Source := Result.AddLayer(
     TNNetEmbedding.Create(csStreamVocab, csStreamDim, 0, 0.02));
+  if pWithChannelTransformState then
+  begin
+    Result.AddLayer(TNNetTokenShift.Create());
+    Source := Result.AddLayer(TNNetDiagonalSSM.Create());
+  end;
   Result.AddLayer(TNNetPointwiseConvLinear.Create(2 * Hk * Dk + Hv * Dv));
   Result.AddLayer(TNNetDepthwiseConv1D.Create({KernelSize=}3, {pCausal=}true,
     {pSuppressBias=}1));
@@ -3677,6 +3708,183 @@ end;
 // so the fork is exact (tolerance 0) against an int8 session that never
 // forked - the int8 cache's own lossiness vs FP32 is a separate matter,
 // covered by TestStreamingEvictionInt8MatchesFP32WithinTolerance.
+function TTestNeuralDecode.RunStateCheckpointScenario(Twin: TNNet;
+  const Toks: array of integer; PrefixLen, DetourTok, FinalTok: integer;
+  Scenario: TStateCheckpointScenario): TNeuralFloatDynArr;
+var
+  Session: TNNetStreamingDecoder;
+  Snap: TNNetDecoderSessionSnapshot;
+  StepIn: TNNetVolume;
+  T, D: integer;
+begin
+  Session := nil; Snap := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    // One slot past the prefix holds the rejected token before it is dropped.
+    Session := TNNetStreamingDecoder.Create(Twin, PrefixLen + 2);
+    Session.Reset();
+    for T := 0 to PrefixLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      Session.StepForward(StepIn, T);
+    end;
+    case Scenario of
+      scMarkRollbackDetour: Session.MarkStateCheckpoint();
+      scSnapshotRestoreDetour: Snap := Session.Snapshot();
+      scRollbackWithoutMark: Session.RollbackToStateCheckpoint();
+      scMarkWithoutRollback: Session.MarkStateCheckpoint();
+    end;
+    if Scenario in [scMarkRollbackDetour, scSnapshotRestoreDetour] then
+    begin
+      StepIn.FData[0] := DetourTok;            // the rejected speculative token
+      Session.StepForward(StepIn, PrefixLen);
+      if Scenario = scMarkRollbackDetour then
+      begin
+        Session.RollbackToStateCheckpoint();   // recurrent state
+        Session.TruncateTo(PrefixLen);         // attention KV
+      end
+      else Session.RestoreSnapshot(Snap);
+    end;
+    StepIn.FData[0] := FinalTok;
+    Session.StepForward(StepIn, PrefixLen);
+    SetLength(Result, Session.Output().Size);
+    for D := 0 to Session.Output().Size - 1 do
+      Result[D] := Session.Output().FData[D];
+  finally
+    Snap.Free;
+    Session.Free;
+    StepIn.Free;
+  end;
+end;
+
+// The speculative-decode shape MarkStateCheckpoint / RollbackToStateCheckpoint
+// exist for: draft a token, run it, reject it, then step a DIFFERENT token. The
+// rolled-back step must be indistinguishable from a run that never drafted.
+// Equality is EXACT (not a tolerance): the rollback copies the same floats back
+// and the step recomputes from them, so no arithmetic differs.
+procedure TTestNeuralDecode.TestStreamingDecoderRollbackToStateCheckpointMatchesCleanRun;
+const
+  PrefixLen = 4;
+  Toks: array[0..3] of integer = (7, 3, 10, 1);
+  DetourTok = 5;
+  FinalTok  = 2;
+var
+  Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  CleanOut, RollbackOut: TNeuralFloatDynArr;
+  D: integer;
+begin
+  RandSeed := 424242;
+  Twin := BuildTinyQwen35HybridLM(1, {pWithChannelTransformState=}true);
+  try
+    Session := TNNetStreamingDecoder.Create(Twin, PrefixLen + 2);
+    try
+      // TNNetTokenShift, TNNetDiagonalSSM, TNNetDepthwiseConv1D and
+      // TNNetGatedDeltaNet - every class the checkpoint has to cover.
+      AssertEquals('all four recurrent-state classes collected', 4,
+        Session.SSMCount);
+    finally
+      Session.Free;
+    end;
+    CleanOut := RunStateCheckpointScenario(Twin, Toks, PrefixLen, DetourTok,
+      FinalTok, scNoCheckpoint);
+    RollbackOut := RunStateCheckpointScenario(Twin, Toks, PrefixLen, DetourTok,
+      FinalTok, scMarkRollbackDetour);
+    AssertEquals('logit row width', Length(CleanOut), Length(RollbackOut));
+    for D := 0 to Length(CleanOut) - 1 do
+      AssertTrue('rolled-back step BIT-IDENTICAL to the clean run, dim ' +
+        IntToStr(D), CleanOut[D] = RollbackOut[D]);
+  finally
+    Twin.Free;
+  end;
+end;
+
+// Cross-check against the existing reference mechanism: undoing the same
+// rejected token with Snapshot/RestoreSnapshot (a deep copy of the WHOLE
+// session) must land on exactly the same logits as the cheap checkpoint.
+procedure TTestNeuralDecode.TestStreamingDecoderRollbackAgreesWithSnapshotRestore;
+const
+  PrefixLen = 4;
+  Toks: array[0..3] of integer = (2, 8, 4, 11);
+  DetourTok = 9;
+  FinalTok  = 6;
+var
+  Twin: TNNet;
+  SnapOut, RollbackOut: TNeuralFloatDynArr;
+  D: integer;
+begin
+  RandSeed := 424242;
+  Twin := BuildTinyQwen35HybridLM(1, {pWithChannelTransformState=}true);
+  try
+    SnapOut := RunStateCheckpointScenario(Twin, Toks, PrefixLen, DetourTok,
+      FinalTok, scSnapshotRestoreDetour);
+    RollbackOut := RunStateCheckpointScenario(Twin, Toks, PrefixLen, DetourTok,
+      FinalTok, scMarkRollbackDetour);
+    for D := 0 to Length(SnapOut) - 1 do
+      AssertTrue('checkpoint rollback BIT-IDENTICAL to Snapshot/RestoreSnapshot'
+        + ', dim ' + IntToStr(D), SnapOut[D] = RollbackOut[D]);
+  finally
+    Twin.Free;
+  end;
+end;
+
+// RollbackToStateCheckpoint with no preceding MarkStateCheckpoint leaves the
+// live state alone (it does NOT reset the sequence), so decoding continues as
+// if it had never been called.
+procedure TTestNeuralDecode.TestStreamingDecoderRollbackWithoutMarkIsNoOp;
+const
+  PrefixLen = 4;
+  Toks: array[0..3] of integer = (7, 3, 10, 1);
+  DetourTok = 5;
+  FinalTok  = 2;
+var
+  Twin: TNNet;
+  CleanOut, NoMarkOut: TNeuralFloatDynArr;
+  D: integer;
+begin
+  RandSeed := 424242;
+  Twin := BuildTinyQwen35HybridLM(1, {pWithChannelTransformState=}true);
+  try
+    CleanOut := RunStateCheckpointScenario(Twin, Toks, PrefixLen, DetourTok,
+      FinalTok, scNoCheckpoint);
+    NoMarkOut := RunStateCheckpointScenario(Twin, Toks, PrefixLen, DetourTok,
+      FinalTok, scRollbackWithoutMark);
+    for D := 0 to Length(CleanOut) - 1 do
+      AssertTrue('rollback without mark left the state untouched, dim ' +
+        IntToStr(D), CleanOut[D] = NoMarkOut[D]);
+  finally
+    Twin.Free;
+  end;
+end;
+
+// MarkStateCheckpoint that is never rolled back costs a copy and nothing else:
+// the next step reads the live state, not the checkpoint.
+procedure TTestNeuralDecode.TestStreamingDecoderMarkWithoutRollbackIsNoOp;
+const
+  PrefixLen = 4;
+  Toks: array[0..3] of integer = (7, 3, 10, 1);
+  DetourTok = 5;
+  FinalTok  = 2;
+var
+  Twin: TNNet;
+  CleanOut, MarkedOut: TNeuralFloatDynArr;
+  D: integer;
+begin
+  RandSeed := 424242;
+  Twin := BuildTinyQwen35HybridLM(1, {pWithChannelTransformState=}true);
+  try
+    CleanOut := RunStateCheckpointScenario(Twin, Toks, PrefixLen, DetourTok,
+      FinalTok, scNoCheckpoint);
+    MarkedOut := RunStateCheckpointScenario(Twin, Toks, PrefixLen, DetourTok,
+      FinalTok, scMarkWithoutRollback);
+    for D := 0 to Length(CleanOut) - 1 do
+      AssertTrue('mark without rollback changed nothing, dim ' + IntToStr(D),
+        CleanOut[D] = MarkedOut[D]);
+  finally
+    Twin.Free;
+  end;
+end;
+
 procedure TTestNeuralDecode.TestStreamingDecoderForkContinuationBitIdenticalInt8KV;
 const
   PromptLen = 4;

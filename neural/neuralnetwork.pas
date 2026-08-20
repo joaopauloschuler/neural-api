@@ -9144,6 +9144,11 @@ type
       FDecodeEnabled: boolean;
       FDecodeSteps: integer;    // tokens consumed since Begin/ResetState
       FDecPrev: TNNetVolume;    // persisted previous token x_{t-1}, Depth-long
+      // --- one-step speculative checkpoint (inference only) ---
+      // Sized by BeginIncrementalDecode so Mark/Rollback never allocate.
+      FStateCheckpoint: TNNetVolume;
+      FStateCheckpointSteps: integer;
+      FStateCheckpointMarked: boolean;
       procedure ComputeIncremental();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
@@ -9171,6 +9176,12 @@ type
       // (1,1,Depth). A deep copy, so one snapshot forks many sessions.
       procedure CaptureState(Dst: TNNetVolume; out Steps: integer);
       procedure RestoreState(Src: TNNetVolume; Steps: integer);
+      // One-step speculative checkpoint, same shape as
+      // TNNetRecurrentDecodeBase: MarkStateCheckpoint copies the current state
+      // aside; RollbackToStateCheckpoint copies it back, and does nothing when
+      // no Mark happened in this decode session. Repeatable.
+      procedure MarkStateCheckpoint();
+      procedure RollbackToStateCheckpoint();
       property DecodeEnabled: boolean read FDecodeEnabled;
   end;
 
@@ -9271,10 +9282,16 @@ type
       // --- incremental-decode state (inference only, not serialized) ---
       FDecodeEnabled: boolean;
       FDecodeSteps: integer;   // tokens consumed since Begin/ResetState
+      // --- one-step speculative checkpoint (inference only) ---
+      // Sized by BeginIncrementalDecode so Mark/Rollback never allocate.
+      FStateCheckpoint: TNNetVolume;
+      FStateCheckpointSteps: integer;
+      FStateCheckpointMarked: boolean;
       // Size/allocate the persisted decode state (and validate the layer mode
       // supports streaming). Called by BeginIncrementalDecode.
       procedure PrepareDecodeState(); virtual; abstract;
     public
+      destructor Destroy(); override;
       // Enable the O(1)-per-step incremental-decode path. The persisted state
       // is fixed-size, so there is no MaxContext budget (contrast
       // TNNetScaledDotProductAttention.BeginIncrementalDecode). The sequence
@@ -9290,6 +9307,13 @@ type
       // Snapshot / fork: copy the persisted state and step count out / back.
       procedure CaptureState(Dst: TNNetVolume; out Steps: integer); virtual; abstract;
       procedure RestoreState(Src: TNNetVolume; Steps: integer); virtual; abstract;
+      // One-step speculative checkpoint: MarkStateCheckpoint copies the current
+      // state aside; RollbackToStateCheckpoint copies it back (see the note
+      // below). Both are no-ops outside a decode session.
+      procedure MarkStateCheckpoint();
+      // Restores the state of the last MarkStateCheckpoint of this decode
+      // session; does nothing when no Mark happened. Repeatable.
+      procedure RollbackToStateCheckpoint();
       property DecodeEnabled: boolean read FDecodeEnabled;
       property DecodeSteps: integer read FDecodeSteps;
   end;
@@ -9570,6 +9594,11 @@ type
       FDecodeEnabled: boolean;
       FDecodeSteps: integer;   // tokens consumed since Begin/ResetState
       FDecodeH: TNNetVolume;   // persisted recurrent state h, Depth-long
+      // --- one-step speculative checkpoint (inference only) ---
+      // Sized by BeginIncrementalDecode so Mark/Rollback never allocate.
+      FStateCheckpoint: TNNetVolume;
+      FStateCheckpointSteps: integer;
+      FStateCheckpointMarked: boolean;
       // Set whenever something that CAN be known to change a_raw happens
       // (construction, AfterWeightUpdate, the start of a decode session).
       FADirty: boolean;
@@ -9611,6 +9640,12 @@ type
       // sessions. Coded by Claude (AI).
       procedure CaptureState(Dst: TNNetVolume; out Steps: integer);
       procedure RestoreState(Src: TNNetVolume; Steps: integer);
+      // One-step speculative checkpoint, same shape as
+      // TNNetRecurrentDecodeBase: MarkStateCheckpoint copies the current state
+      // aside; RollbackToStateCheckpoint copies it back, and does nothing when
+      // no Mark happened in this decode session. Repeatable.
+      procedure MarkStateCheckpoint();
+      procedure RollbackToStateCheckpoint();
       property DecodeEnabled: boolean read FDecodeEnabled;
       property DecodeSteps: integer read FDecodeSteps;
   end;
@@ -59722,6 +59757,7 @@ end;
 
 destructor TNNetTokenShift.Destroy();
 begin
+  FStateCheckpoint.Free;
   FDecPrev.Free;
   inherited Destroy();
 end;
@@ -59846,6 +59882,11 @@ begin
   // sized by SetPrevLayer; ReSize is a safety net for layers wired manually.
   FDecPrev.ReSize(1, 1, FOutput.Depth);
   ResetState();
+  // One CaptureState sizes the checkpoint buffer here, so MarkStateCheckpoint
+  // never allocates inside a decode step.
+  if not Assigned(FStateCheckpoint) then FStateCheckpoint := TNNetVolume.Create();
+  CaptureState(FStateCheckpoint, FStateCheckpointSteps);
+  FStateCheckpointMarked := false;
   FDecodeEnabled := true;
 end;
 
@@ -59853,6 +59894,21 @@ procedure TNNetTokenShift.EndIncrementalDecode();
 begin
   FDecodeEnabled := false;
   FDecodeSteps := 0;
+  FStateCheckpointMarked := false;
+  FreeAndNil(FStateCheckpoint);
+end;
+
+procedure TNNetTokenShift.MarkStateCheckpoint();
+begin
+  if not Assigned(FStateCheckpoint) then exit;
+  CaptureState(FStateCheckpoint, FStateCheckpointSteps);
+  FStateCheckpointMarked := true;
+end;
+
+procedure TNNetTokenShift.RollbackToStateCheckpoint();
+begin
+  if FStateCheckpointMarked then
+    RestoreState(FStateCheckpoint, FStateCheckpointSteps);
 end;
 
 procedure TNNetTokenShift.ResetState();
@@ -60304,6 +60360,12 @@ procedure TNNetRecurrentDecodeBase.BeginIncrementalDecode();
 begin
   PrepareDecodeState();
   ResetState();
+  // One CaptureState here sizes the checkpoint buffer to this layer's state, so
+  // MarkStateCheckpoint later copies into a volume that is already the right
+  // shape and never allocates inside a decode step.
+  if not Assigned(FStateCheckpoint) then FStateCheckpoint := TNNetVolume.Create();
+  CaptureState(FStateCheckpoint, FStateCheckpointSteps);
+  FStateCheckpointMarked := false;
   FDecodeEnabled := true;
 end;
 
@@ -60311,6 +60373,27 @@ procedure TNNetRecurrentDecodeBase.EndIncrementalDecode();
 begin
   FDecodeEnabled := false;
   FDecodeSteps := 0;
+  FStateCheckpointMarked := false;
+  FreeAndNil(FStateCheckpoint);
+end;
+
+destructor TNNetRecurrentDecodeBase.Destroy();
+begin
+  FStateCheckpoint.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetRecurrentDecodeBase.MarkStateCheckpoint();
+begin
+  if not Assigned(FStateCheckpoint) then exit;
+  CaptureState(FStateCheckpoint, FStateCheckpointSteps);
+  FStateCheckpointMarked := true;
+end;
+
+procedure TNNetRecurrentDecodeBase.RollbackToStateCheckpoint();
+begin
+  if FStateCheckpointMarked then
+    RestoreState(FStateCheckpoint, FStateCheckpointSteps);
 end;
 
 procedure TNNetRecurrentDecodeBase.ResetCache();
@@ -61231,6 +61314,7 @@ end;
 
 destructor TNNetDiagonalSSM.Destroy();
 begin
+  FStateCheckpoint.Free;
   FDecodeH.Free;
   FGradE.Free;
   FGradC.Free;
@@ -61397,6 +61481,11 @@ begin
   FDecodeH.Fill(0);
   FDecodeSteps := 0;
   FADirty := true;          // force one rebuild at the start of the session
+  // One CaptureState sizes the checkpoint buffer here, so MarkStateCheckpoint
+  // never allocates inside a decode step.
+  if not Assigned(FStateCheckpoint) then FStateCheckpoint := TNNetVolume.Create();
+  CaptureState(FStateCheckpoint, FStateCheckpointSteps);
+  FStateCheckpointMarked := false;
   FDecodeEnabled := true;
 end;
 
@@ -61404,6 +61493,21 @@ procedure TNNetDiagonalSSM.EndIncrementalDecode();
 begin
   FDecodeEnabled := false;
   FDecodeSteps := 0;
+  FStateCheckpointMarked := false;
+  FreeAndNil(FStateCheckpoint);
+end;
+
+procedure TNNetDiagonalSSM.MarkStateCheckpoint();
+begin
+  if not Assigned(FStateCheckpoint) then exit;
+  CaptureState(FStateCheckpoint, FStateCheckpointSteps);
+  FStateCheckpointMarked := true;
+end;
+
+procedure TNNetDiagonalSSM.RollbackToStateCheckpoint();
+begin
+  if FStateCheckpointMarked then
+    RestoreState(FStateCheckpoint, FStateCheckpointSteps);
 end;
 
 procedure TNNetDiagonalSSM.ResetState();
