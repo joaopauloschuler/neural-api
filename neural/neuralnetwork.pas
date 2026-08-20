@@ -19602,8 +19602,9 @@ type
       // view is what you want when deciding which TNNetLayer class to optimize
       // next (e.g. OpenCL): it ranks classes by aggregate cost rather than
       // individual layer instances. Pure read-only diagnostic; leaves all timing
-      // accumulators untouched. Returns a short message (never crashes) when NN
-      // is nil or has no layers.
+      // accumulators untouched. On an OpenCL build a trailing line reports
+      // NN.NNetForwardTimeQueueOpenCL, the queue drain the layer rows exclude.
+      // Returns a short message (never crashes) when NN is nil or has no layers.
       class function LayerClassTimingReport(NN: TNNet): string;
       // ProfileReport is a torch.profiler-lite: a single per-layer table that
       // fuses LayerTimingReport's wall-clock timing with
@@ -19620,7 +19621,10 @@ type
       // (Output.Size * csNeuralFloatSize, single-sample batch=1). A TOTAL
       // row sums the timing, parameter and activation columns. Wall-clock
       // numbers are inherently machine/run dependent; the param/activation
-      // byte counts are exact and deterministic. Pure diagnostic that leaves
+      // byte counts are exact and deterministic. On an OpenCL build a trailing
+      // line reports the mean us/forward of the queue drain
+      // (NN.NNetForwardTimeQueueOpenCL), which the us/fwd column excludes.
+      // Pure diagnostic that leaves
       // no training state behind (gradients computed during the optional
       // backward pass are not applied). Returns a short message (never
       // crashes) when NN is nil, has no layers, or Sample is nil.
@@ -21421,6 +21425,9 @@ type
     published
       property NNetBackwardTime: double read FNNetBackwardTime write FNNetBackwardTime;
       property NNetForwardTime: double read FNNetForwardTime write FNNetForwardTime;
+      // Wall-clock spent inside GetLastLayer().ForceOutputOnRAM(): the OpenCL
+      // queue only executes there, so this is the queue drain, not the copy.
+      property NNetForwardTimeQueueOpenCL: double read FNNetForwardTimeQueueOpenCL write FNNetForwardTimeQueueOpenCL;
       property Layers: TNNetLayerList read FLayers;
       property LearningRate: TNeuralFloat read FLearningRate;
       property MaxDeltaLayer: integer read FMaxDeltaLayer;
@@ -108193,6 +108200,9 @@ var
   TotalUs, Pct, MeanUs: double;
   GpuPct: double;
   GpuStr: string;
+  {$IFDEF OpenCL}
+  QueueOpenCLUs, ForwardWallUs, QueueOpenCLPct: double;
+  {$ENDIF}
   TmpUsD: double;
   TmpQty: integer;
   TmpI64: Int64;
@@ -108280,6 +108290,9 @@ begin
     Lines.Add('GPU forward path; "-" = no GPU path here / never dispatched.');
     Lines.Add('TNNetInput runs no kernel: its GPU share is how often it uploaded');
     Lines.Add('its output and offered it on the device.');
+    Lines.Add('A layer that enqueues an OpenCL kernel returns before the kernel');
+    Lines.Add('runs, so its row charges the enqueue only; the kernels execute in');
+    Lines.Add('the queue drain reported under the table.');
     Lines.Add(Format('%-28s %5s %14s %14s %6s %8s',
       ['Layer class', 'Count', 'total us', 'us/instance', '%', 'GPU']));
     Lines.Add(StringOfChar('-', 86));
@@ -108307,6 +108320,15 @@ begin
     Lines.Add(StringOfChar('-', 86));
     Lines.Add(Format('TOTAL: %.2f us across %d layer(s) in %d class(es)',
       [TotalUs, NNLastIdx + 1, ClassQty]));
+    {$IFDEF OpenCL}
+    QueueOpenCLUs := NN.NNetForwardTimeQueueOpenCL * cUsPerDay;
+    ForwardWallUs := TotalUs + QueueOpenCLUs;
+    QueueOpenCLPct := 0;
+    if ForwardWallUs > 0 then
+      QueueOpenCLPct := 100.0 * QueueOpenCLUs / ForwardWallUs;
+    Lines.Add(Format('OpenCL queue drain: %.2f us (%.1f%% of %.2f us forward wall-clock)',
+      [QueueOpenCLUs, QueueOpenCLPct, ForwardWallUs]));
+    {$ENDIF}
     Result := Lines.Text;
   finally
     Lines.Free;
@@ -108332,6 +108354,9 @@ var
   DoBackward: boolean;
   BytesPerElem: integer;
   ShapeStr, PassStr: string;
+  {$IFDEF OpenCL}
+  MeanQueueOpenCLUs: double;
+  {$ENDIF}
 const
   // FNNetForwardTime / FNNetBackwardTime are TDateTime spans measured in days; this
   // converts to microseconds.
@@ -108444,6 +108469,13 @@ begin
       ['TOT', '', '', TotalFwdUs / Iterations, BwdStr,
        TotalParamElements, TotalParamElements * BytesPerElem,
        TotalActElements, TotalActElements * BytesPerElem]));
+    {$IFDEF OpenCL}
+    // A layer that enqueues an OpenCL kernel returns before the kernel runs, so
+    // its us/fwd row charges the enqueue only. The kernels execute here.
+    MeanQueueOpenCLUs := (NN.NNetForwardTimeQueueOpenCL * cUsPerDay) / Iterations;
+    Lines.Add(Format('OpenCL queue drain: %.2f us/fwd (not counted in the us/fwd column above)',
+      [MeanQueueOpenCLUs]));
+    {$ENDIF}
     Result := Lines.Text;
   finally
     Lines.Free;
