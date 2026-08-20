@@ -59882,10 +59882,10 @@ begin
   // sized by SetPrevLayer; ReSize is a safety net for layers wired manually.
   FDecPrev.ReSize(1, 1, FOutput.Depth);
   ResetState();
-  // One CaptureState sizes the checkpoint buffer here, so MarkStateCheckpoint
-  // never allocates inside a decode step.
-  if not Assigned(FStateCheckpoint) then FStateCheckpoint := TNNetVolume.Create();
-  CaptureState(FStateCheckpoint, FStateCheckpointSteps);
+  // The FIRST MarkStateCheckpoint allocates the checkpoint buffer, not this
+  // routine: a session that never speculates must not pay for it (3 MB per
+  // gated-DeltaNet layer, 144 MB across the 48 of Qwen3.8-27B).
+  FreeAndNil(FStateCheckpoint);
   FStateCheckpointMarked := false;
   FDecodeEnabled := true;
 end;
@@ -59900,7 +59900,9 @@ end;
 
 procedure TNNetTokenShift.MarkStateCheckpoint();
 begin
-  if not Assigned(FStateCheckpoint) then exit;
+  if not FDecodeEnabled then exit;
+  // Allocated once per decode session, on the first mark - never per step.
+  if not Assigned(FStateCheckpoint) then FStateCheckpoint := TNNetVolume.Create();
   CaptureState(FStateCheckpoint, FStateCheckpointSteps);
   FStateCheckpointMarked := true;
 end;
@@ -60360,11 +60362,10 @@ procedure TNNetRecurrentDecodeBase.BeginIncrementalDecode();
 begin
   PrepareDecodeState();
   ResetState();
-  // One CaptureState here sizes the checkpoint buffer to this layer's state, so
-  // MarkStateCheckpoint later copies into a volume that is already the right
-  // shape and never allocates inside a decode step.
-  if not Assigned(FStateCheckpoint) then FStateCheckpoint := TNNetVolume.Create();
-  CaptureState(FStateCheckpoint, FStateCheckpointSteps);
+  // The FIRST MarkStateCheckpoint allocates the checkpoint buffer, not this
+  // routine: a session that never speculates must not pay for it (3 MB per
+  // gated-DeltaNet layer, 144 MB across the 48 of Qwen3.8-27B).
+  FreeAndNil(FStateCheckpoint);
   FStateCheckpointMarked := false;
   FDecodeEnabled := true;
 end;
@@ -60385,7 +60386,9 @@ end;
 
 procedure TNNetRecurrentDecodeBase.MarkStateCheckpoint();
 begin
-  if not Assigned(FStateCheckpoint) then exit;
+  if not FDecodeEnabled then exit;
+  // Allocated once per decode session, on the first mark - never per step.
+  if not Assigned(FStateCheckpoint) then FStateCheckpoint := TNNetVolume.Create();
   CaptureState(FStateCheckpoint, FStateCheckpointSteps);
   FStateCheckpointMarked := true;
 end;
@@ -61481,10 +61484,10 @@ begin
   FDecodeH.Fill(0);
   FDecodeSteps := 0;
   FADirty := true;          // force one rebuild at the start of the session
-  // One CaptureState sizes the checkpoint buffer here, so MarkStateCheckpoint
-  // never allocates inside a decode step.
-  if not Assigned(FStateCheckpoint) then FStateCheckpoint := TNNetVolume.Create();
-  CaptureState(FStateCheckpoint, FStateCheckpointSteps);
+  // The FIRST MarkStateCheckpoint allocates the checkpoint buffer, not this
+  // routine: a session that never speculates must not pay for it (3 MB per
+  // gated-DeltaNet layer, 144 MB across the 48 of Qwen3.8-27B).
+  FreeAndNil(FStateCheckpoint);
   FStateCheckpointMarked := false;
   FDecodeEnabled := true;
 end;
@@ -61499,7 +61502,9 @@ end;
 
 procedure TNNetDiagonalSSM.MarkStateCheckpoint();
 begin
-  if not Assigned(FStateCheckpoint) then exit;
+  if not FDecodeEnabled then exit;
+  // Allocated once per decode session, on the first mark - never per step.
+  if not Assigned(FStateCheckpoint) then FStateCheckpoint := TNNetVolume.Create();
   CaptureState(FStateCheckpoint, FStateCheckpointSteps);
   FStateCheckpointMarked := true;
 end;
