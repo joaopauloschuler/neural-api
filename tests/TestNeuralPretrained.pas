@@ -250,6 +250,7 @@ type
     procedure TestQwen3MoeWindowLogitParity;
     procedure TestQwen35LogitParity;
     procedure TestQwen35StreamedDecodeParity;
+    procedure TestQwen35MTPModuleParity;
     procedure TestQwen35StreamedDecodeOpenCLParity;
     procedure TestQwen2StreamedDecodeOpenCLParity;
     procedure TestQwen35TurnBoundaryResumeParity;
@@ -8578,6 +8579,170 @@ begin
       FixturePath('tiny_qwen3_5_logits.json'), 16, 13);
   finally
     NN.Free;
+  end;
+end;
+
+// Pins the Qwen3.5/3.8 MULTI-TOKEN PREDICTION module (BuildQwen35MTPFrom-
+// SafeTensors) against the float64 oracle in tests/fixtures/
+// tiny_qwen3_5_mtp_oracle.json (tools/qwen3_5_mtp_tiny_fixture.py, which
+// follows vLLM's Qwen3_5MultiTokenPredictor - HF ships no MTP module).
+// Three claims, in the order a failure is easiest to read:
+//   1. the trunk's POST-final-norm output is the h_t the module consumes
+//      (compared against the oracle's trunk_hidden);
+//   2. the module reproduces the oracle's h' from [embedding | h_t], which
+//      pins the fc column order, the rotary position convention (row r uses
+//      position r+1) and the whole block;
+//   3. the module carries NEITHER the embedding table NOR the LM head - no
+//      layer in it is vocab-wide, so it shares the trunk's copies.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35MTPModuleParity;
+const
+  SeqLen = 16;
+  MTPRows = SeqLen - 1;
+  Hidden = 8;
+var
+  Trunk, MTP: TNNet;
+  Config: TLlamaConfig;
+  RefRoot: TJSONData;
+  RefJson: TStringList;
+  Sequences, TrunkHiddenArr, MTPHiddenArr: TJSONArray;
+  SeqArr, PosArr, RowArr: TJSONArray;
+  Input, MTPInput, Output: TNNetVolume;
+  EmbLayer, TrunkNorm: TNNetLayer;
+  i, SeqCnt, PosCnt, ChanCnt: integer;
+  SigmoidCnt, GateMulCnt, SwiGLUCnt, LinearCnt, NormCnt, VocabWideCnt: integer;
+  Diff, MaxTrunkDiff, MaxMTPDiff: double;
+begin
+  RandSeed := 424242;
+  RefJson := TStringList.Create;
+  Input := TNNetVolume.Create;
+  MTPInput := TNNetVolume.Create;
+  Output := TNNetVolume.Create;
+  RefRoot := nil;
+  MTP := nil;
+  Trunk := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5_mtp.safetensors'), Config, {SeqLen=}0,
+    {pTrainable=}true, FixturePath('tiny_qwen3_5_mtp_config.json'));
+  try
+    AssertEquals('mtp_num_hidden_layers', 1, Config.MTPNumLayers);
+    AssertFalse('mtp_use_dedicated_embeddings',
+      Config.MTPDedicatedEmbeddings);
+    MTP := BuildQwen35MTPFromSafeTensors(
+      FixturePath('tiny_qwen3_5_mtp.safetensors'), Config, MTPRows);
+    // ---- Structure: one full-attention block, no vocab-wide layer --------
+    SigmoidCnt := 0;
+    GateMulCnt := 0;
+    SwiGLUCnt := 0;
+    LinearCnt := 0;
+    NormCnt := 0;
+    VocabWideCnt := 0;
+    for i := 0 to MTP.Layers.Count - 1 do
+    begin
+      if MTP.Layers[i].ClassType = TNNetSigmoid then Inc(SigmoidCnt);
+      if MTP.Layers[i].ClassType = TNNetCellMulByCell then Inc(GateMulCnt);
+      if MTP.Layers[i].ClassType = TNNetSwiGLU then Inc(SwiGLUCnt);
+      if MTP.Layers[i].ClassType = TNNetPointwiseConvLinear then
+        Inc(LinearCnt);
+      if MTP.Layers[i].ClassType = TNNetTokenRMSNorm then Inc(NormCnt);
+      if MTP.Layers[i].Output.Depth = Config.VocabSize then Inc(VocabWideCnt);
+    end;
+    AssertEquals('one attention output gate', 1, SigmoidCnt);
+    AssertEquals('one per-token gate product', 1, GateMulCnt);
+    AssertEquals('one SwiGLU FFN', 1, SwiGLUCnt);
+    // fc + q + k + v + o + gate_up + down
+    AssertEquals('seven linear projections', 7, LinearCnt);
+    // pre_fc_norm_embedding + pre_fc_norm_hidden + input_layernorm +
+    // post_attention_layernorm + mtp.norm
+    AssertEquals('five token RMSNorms', 5, NormCnt);
+    AssertEquals('no vocab-wide layer (head and embedding stay the ' +
+      'trunk''s)', 0, VocabWideCnt);
+    // Row r of a contiguous run carries the position of the EMBEDDED token.
+    for i := 0 to MTP.Layers.Count - 1 do
+      if MTP.Layers[i] is TNNetRotaryEmbedding then
+        TNNetRotaryEmbedding(MTP.Layers[i]).PositionOffset := 1;
+
+    EmbLayer := nil;
+    TrunkNorm := nil;
+    for i := 0 to Trunk.Layers.Count - 1 do
+    begin
+      if Trunk.Layers[i].ClassType = TNNetEmbedding then
+        EmbLayer := Trunk.Layers[i];
+      if Trunk.Layers[i].ClassType = TNNetTokenRMSNorm then
+        TrunkNorm := Trunk.Layers[i]; // the LAST one is the final norm
+    end;
+    AssertTrue('trunk embedding layer found', EmbLayer <> nil);
+    AssertTrue('trunk final norm found', TrunkNorm <> nil);
+
+    RefJson.LoadFromFile(FixturePath('tiny_qwen3_5_mtp_oracle.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Sequences := TJSONArray(TJSONObject(RefRoot).Find('sequences'));
+    TrunkHiddenArr := TJSONArray(TJSONObject(RefRoot).Find('trunk_hidden'));
+    MTPHiddenArr := TJSONArray(TJSONObject(RefRoot).Find('mtp_hidden'));
+    AssertTrue('sequences present', Sequences <> nil);
+    AssertTrue('trunk_hidden present', TrunkHiddenArr <> nil);
+    AssertTrue('mtp_hidden present', MTPHiddenArr <> nil);
+    MaxTrunkDiff := 0;
+    MaxMTPDiff := 0;
+    Input.ReSize(SeqLen, 1, 1);
+    MTPInput.ReSize(MTPRows, 1, 2 * Hidden);
+    for SeqCnt := 0 to Sequences.Count - 1 do
+    begin
+      SeqArr := TJSONArray(Sequences.Items[SeqCnt]);
+      AssertEquals('sequence length', SeqLen, SeqArr.Count);
+      for PosCnt := 0 to SeqLen - 1 do
+        Input.FData[PosCnt] := SeqArr.Items[PosCnt].AsInteger;
+      Trunk.Compute(Input);
+      // Claim 1: h_t is the post-final-norm hidden state, the tensor the
+      // trunk's LM head consumes.
+      PosArr := TJSONArray(TrunkHiddenArr.Items[SeqCnt]);
+      for PosCnt := 0 to SeqLen - 1 do
+      begin
+        RowArr := TJSONArray(PosArr.Items[PosCnt]);
+        for ChanCnt := 0 to Hidden - 1 do
+        begin
+          Diff := Abs(TrunkNorm.Output.FData[PosCnt * Hidden + ChanCnt] -
+            RowArr.Items[ChanCnt].AsFloat);
+          if Diff > MaxTrunkDiff then MaxTrunkDiff := Diff;
+        end;
+      end;
+      // Claim 2: [ embed_tokens[x_{r+1}] | h_r ] -> h'_r. The embedding half
+      // is read off the TRUNK's embedding layer - the module has none.
+      for PosCnt := 0 to MTPRows - 1 do
+        for ChanCnt := 0 to Hidden - 1 do
+        begin
+          MTPInput.FData[PosCnt * 2 * Hidden + ChanCnt] :=
+            EmbLayer.Output.FData[(PosCnt + 1) * Hidden + ChanCnt];
+          MTPInput.FData[PosCnt * 2 * Hidden + Hidden + ChanCnt] :=
+            TrunkNorm.Output.FData[PosCnt * Hidden + ChanCnt];
+        end;
+      MTP.Compute(MTPInput);
+      MTP.GetOutput(Output);
+      AssertEquals('mtp output size', MTPRows * Hidden, Output.Size);
+      PosArr := TJSONArray(MTPHiddenArr.Items[SeqCnt]);
+      AssertEquals('oracle mtp rows', MTPRows, PosArr.Count);
+      for PosCnt := 0 to MTPRows - 1 do
+      begin
+        RowArr := TJSONArray(PosArr.Items[PosCnt]);
+        for ChanCnt := 0 to Hidden - 1 do
+        begin
+          Diff := Abs(Output.FData[PosCnt * Hidden + ChanCnt] -
+            RowArr.Items[ChanCnt].AsFloat);
+          if Diff > MaxMTPDiff then MaxMTPDiff := Diff;
+        end;
+      end;
+    end;
+    AssertTrue('trunk hidden parity: max |diff| = ' +
+      FloatToStr(MaxTrunkDiff) + ' must be < 1e-4', MaxTrunkDiff < 1e-4);
+    AssertTrue('MTP hidden parity: max |diff| = ' +
+      FloatToStr(MaxMTPDiff) + ' must be < 1e-4', MaxMTPDiff < 1e-4);
+  finally
+    RefRoot.Free;
+    Output.Free;
+    MTPInput.Free;
+    Input.Free;
+    RefJson.Free;
+    MTP.Free;
+    Trunk.Free;
   end;
 end;
 

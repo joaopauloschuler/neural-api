@@ -936,6 +936,16 @@ type
                                // the concatenated head outputs are multiplied
                                // by sigmoid(gate) BEFORE o_proj (HF
                                // Qwen3_5Attention: attn * sigmoid(gate))
+    MTPNumLayers: integer;     // mtp_num_hidden_layers: how many blocks the
+                               // checkpoint's MULTI-TOKEN PREDICTION module
+                               // (the "mtp.*" tensors) carries. 0 = none.
+                               // The trunk import IGNORES it; only
+                               // BuildQwen35MTPFromSafeTensors reads it.
+    MTPDedicatedEmbeddings: boolean; // mtp_use_dedicated_embeddings: whether
+                               // the MTP module ships its OWN embedding
+                               // table. False in every released checkpoint -
+                               // the module shares the trunk's embed_tokens
+                               // and lm_head.
     MoESharedExpertGate: boolean; // qwen2_moe/Qwen3.5-MoE shared-expert gate:
                                // the always-on shared expert's output is
                                // scaled by sigmoid(shared_expert_gate(x)) - a
@@ -1327,6 +1337,33 @@ function BuildQwen35MoeFromSafeTensorsEx(const FileName: string;
 function BuildQwen35MoeFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
+
+// Qwen3.5/3.8 MULTI-TOKEN PREDICTION module (the checkpoint's "mtp.*"
+// tensors, mtp_num_hidden_layers >= 1) as a STANDALONE TNNet, for
+// self-speculative decoding: it predicts the token at t+2 from the trunk's
+// hidden state at t and the embedding of the already-committed token at t+1
+// (DeepSeek-V3's sequential MTP, as vLLM's Qwen3_5MultiTokenPredictor
+// implements it).
+//   input  (SeqLen,1,2*hidden) = depth-concat [ embed_tokens[x_{t+1}] |
+//          h_t ] - the EMBEDDING half FIRST, which is the column order
+//          mtp.fc.weight expects;
+//   h      = mtp.fc( [pre_fc_norm_embedding(emb) | pre_fc_norm_hidden(h_t)] )
+//   output (SeqLen,1,hidden) = mtp.norm( one full-attention Qwen3.5 block(h) ).
+// The module owns NEITHER the embedding table NOR the LM head: released
+// checkpoints set mtp_use_dedicated_embeddings=false and ship no mtp lm_head,
+// so the caller embeds the token with the trunk's TNNetEmbedding and feeds
+// this output to the trunk's LM head. Its rotary carries the position of the
+// EMBEDDED token (row r of a SeqLen run is position r+1, i.e.
+// PositionOffset=1 for a contiguous prefill).
+// Reads ONLY "mtp.*" tensors and refuses a partial import if any is left
+// unconsumed. Coded by Claude (AI).
+function BuildQwen35MTPFromTensorReader(pReader: TNNetSafeTensorsReader;
+  const FileName: string; const Config: TLlamaConfig; pSeqLen: integer = 0;
+  pTrainable: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+
+function BuildQwen35MTPFromSafeTensors(const FileName: string;
+  const Config: TLlamaConfig; pSeqLen: integer = 0;
+  pTrainable: boolean = false; pQuantizeInt8: boolean = false): TNNet;
 
 // Llama-4 text decoder (model_type "llama4" / "llama4_text",
 // meta-llama/Llama-4-Scout-17B-16E and the community redistills). Text-only -
@@ -13684,6 +13721,8 @@ begin
     Result.LinearValueHeadDim := 0;
     Result.LinearConvKernel := 0;
     Result.AttnOutputGate := False;
+    Result.MTPNumLayers := 0;
+    Result.MTPDedicatedEmbeddings := False;
     Result.MoESharedExpertGate := False;
     Result.MoEQwen35FusedExperts := False;
     if ModelType = 'mixtral' then
@@ -13858,6 +13897,13 @@ begin
       Result.QKNorm := True;
       Result.RMSNormAddOne := True; // zero-centered RMSNorm gains (1 + w)
       Result.AttnOutputGate := True;
+      // Multi-token prediction: Qwen3.8 ships ONE extra full-attention block
+      // under "mtp.*" that predicts t+2 from (h_t, embed[x_{t+1}]). The
+      // trunk build skips those tensors; BuildQwen35MTPFromSafeTensors
+      // builds the module from them when a caller asks for it.
+      Result.MTPNumLayers := Obj.Get('mtp_num_hidden_layers', 0);
+      Result.MTPDedicatedEmbeddings :=
+        Obj.Get('mtp_use_dedicated_embeddings', False);
       if Result.HeadDim = 0 then Result.HeadDim := 256; // HF default
       HiddenAct := Obj.Get('hidden_act', 'silu');
       if HiddenAct <> 'silu' then
@@ -27562,6 +27608,265 @@ begin
     pTrainable, '', pQuantizeInt8);
 end;
 
+
+function BuildQwen35MTPFromTensorReader(pReader: TNNetSafeTensorsReader;
+  const FileName: string; const Config: TLlamaConfig; pSeqLen: integer = 0;
+  pTrainable: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Consumed: TStringList;
+  Plan: TAttnHoistPlan;
+  InputLayer, EmbNorm, HidNorm, FC: TNNetLayer;
+  AttnNorm, QProj, KProj, VProj, OProj, MlpNorm, GateUp, Down: TNNetLayer;
+  QSource, KSource, AttnConcat, BranchInput, FinalNorm: TNNetLayer;
+  QNorms, KNorms: array of TNNetLayer;
+  SeqLen, HeadDim, QWidth, KVWidth, RotaryDims, FfnWidth: integer;
+  HeadCnt, NumHeadsM1, ReaderMax, i: integer;
+  NormGainOffset: TNeuralFloat;
+  TensorNameStr: string;
+
+  procedure MarkConsumed(const TName: string);
+  begin
+    Consumed.Add(TName);
+  end;
+
+begin
+  Reader := pReader; // ownership taken: freed in the finally below
+  NN := nil;
+  Consumed := TStringList.Create;
+  Consumed.Sorted := True;
+  Consumed.Duplicates := dupIgnore;
+  try
+    try
+      // ---------------- Config validation ----------------
+      if Config.MTPNumLayers <> 1 then
+        ImportError('Qwen3.5 MTP import: mtp_num_hidden_layers=' +
+          IntToStr(Config.MTPNumLayers) + ' - this importer wires exactly ' +
+          'ONE MTP block (every released Qwen3.5/3.8 checkpoint ships one).');
+      if Config.MTPDedicatedEmbeddings then
+        ImportError('Qwen3.5 MTP import: mtp_use_dedicated_embeddings=true ' +
+          'is not wired - the module is built to SHARE the trunk''s ' +
+          'embed_tokens and lm_head.');
+      if not (Config.AttnOutputGate and Config.QKNorm and
+              Config.RMSNormAddOne) then
+        ImportError('Qwen3.5 MTP import: the MTP block is wired to the ' +
+          'Qwen3.5 full-attention shape - attention output gate, per-head ' +
+          'q/k RMSNorm and zero-centered norm gains are all required.');
+      // The query-scale folds ride W_q / the q-side norm gains in the trunk
+      // builder. No qwen3_5 config sets either, and folding them here
+      // silently would be invisible in the logits until a family that does
+      // arrives, so refuse instead.
+      if (Config.AttentionMultiplier > 0) or (Config.QueryPreAttnScalar > 0) then
+        ImportError('Qwen3.5 MTP import: attention_multiplier / ' +
+          'query_pre_attn_scalar query-scale folds are not wired into the ' +
+          'MTP block.');
+      if Config.HeadDim > 0 then HeadDim := Config.HeadDim
+      else HeadDim := Config.HiddenSize div Config.NumHeads;
+      if (Config.PartialRotaryFactor > 0) and
+         (Config.PartialRotaryFactor < 1) then
+        RotaryDims := Trunc(HeadDim * Config.PartialRotaryFactor)
+      else RotaryDims := HeadDim;
+      QWidth := Config.NumHeads * HeadDim;
+      KVWidth := Config.NumKVHeads * HeadDim;
+      FfnWidth := Config.IntermediateSize;
+      if pSeqLen <= 0 then SeqLen := Config.MaxPositions
+      else SeqLen := pSeqLen;
+      if Config.RMSNormAddOne then NormGainOffset := 1.0
+      else NormGainOffset := 0;
+      // The MTP block reuses the trunk's hoisted attention wiring (one tiled
+      // q/k RMSNorm and one head-tiled rotary over the whole projection).
+      // LlamaAttnHoistPlan answers True for both on every qwen3_5 config;
+      // the per-head fallback is deliberately NOT duplicated here.
+      Plan := LlamaAttnHoistPlan(Config, Config.RopeScaling,
+        {LayerUseRoPE=}true, HeadDim, RotaryDims);
+      if not (Plan.TiledQKNorm and Plan.HoistRoPE) then
+        ImportError('Qwen3.5 MTP import: this config cannot hoist the ' +
+          'per-head q/k RMSNorm and rotary out of the attention, which the ' +
+          'MTP block requires (see LlamaAttnHoistPlan).');
+
+      // ---------------- Build ----------------
+      NN := TNNet.Create();
+      // Input is the depth-concat the CALLER writes: embedding half first
+      // (channels 0..hidden-1), trunk hidden second - the column order
+      // mtp.fc.weight expects.
+      InputLayer := NN.AddLayer(
+        TNNetInput.Create(SeqLen, 1, 2 * Config.HiddenSize) );
+      NN.AddLayerAfter(
+        TNNetSplitChannels.Create(0, Config.HiddenSize), InputLayer);
+      EmbNorm := NN.AddLayer(
+        TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
+      NN.AddLayerAfter(
+        TNNetSplitChannels.Create(Config.HiddenSize, Config.HiddenSize),
+        InputLayer);
+      HidNorm := NN.AddLayer(
+        TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
+      NN.AddLayer( TNNetDeepConcat.Create([EmbNorm, HidNorm]) );
+      FC := NN.AddLayer( TNNetPointwiseConvLinear.Create(
+        Config.HiddenSize).SetTrainable(pTrainable) );
+
+      // Attention sub-block: x := x + o_proj(gate * GQA(RMSNorm(x))).
+      BranchInput := FC;
+      AttnNorm := NN.AddLayer(
+        TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
+      QProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(
+        2 * QWidth).SetTrainable(pTrainable), AttnNorm);
+      KProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(
+        KVWidth).SetTrainable(pTrainable), AttnNorm);
+      VProj := NN.AddLayerAfter( TNNetPointwiseConvLinear.Create(
+        KVWidth).SetTrainable(pTrainable), AttnNorm);
+      // The q_proj slab is DOUBLE width: the query half feeds the norm and
+      // the rotary, the gate half is read raw further below.
+      QSource := NN.AddLayerAfter(
+        TNNetSplitChannels.Create(0, QWidth), QProj);
+      SetLength(QNorms, 1);
+      SetLength(KNorms, 1);
+      QNorms[0] := NN.AddLayerAfter( TNNetHeadRMSNorm.Create(
+        HeadDim, Config.RmsNormEps).SetTrainable(pTrainable), QSource);
+      KNorms[0] := NN.AddLayerAfter( TNNetHeadRMSNorm.Create(
+        HeadDim, Config.RmsNormEps).SetTrainable(pTrainable), KProj);
+      QSource := NN.AddLayerAfter( CreateRoPELayerForConfig(Config,
+        Config.RopeTheta, Config.RopeScaling, HeadDim, Plan.RotaryTileDims),
+        QNorms[0]);
+      KSource := NN.AddLayerAfter( CreateRoPELayerForConfig(Config,
+        Config.RopeTheta, Config.RopeScaling, HeadDim, Plan.RotaryTileDims),
+        KNorms[0]);
+      AttnConcat := NN.AddGQAAttentionFromSources(QSource, KSource, VProj,
+        Config.NumHeads, Config.NumKVHeads, HeadDim, {CausalMask=}true,
+        {Window=}0, {ScoreSoftCap=}Config.AttnLogitSoftCap);
+      NN.AddLayerAfter( TNNetSplitChannels.Create(QWidth, QWidth), QProj );
+      NN.AddLayer( TNNetSigmoid.Create() );
+      NN.AddLayer( TNNetCellMulByCell.Create(AttnConcat, NN.GetLastLayer()) );
+      OProj := NN.AddLayer( TNNetPointwiseConvLinear.Create(
+        Config.HiddenSize).SetTrainable(pTrainable) );
+      NN.AddLayer( TNNetSum.Create([OProj, BranchInput]) );
+
+      // Feed-forward sub-block: x := x + down(SwiGLU(gate_up(RMSNorm(x)))).
+      BranchInput := NN.GetLastLayer();
+      MlpNorm := NN.AddLayer(
+        TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
+      GateUp := NN.AddLayer( TNNetPointwiseConvLinear.Create(
+        2 * FfnWidth).SetTrainable(pTrainable) );
+      NN.AddLayer( TNNetSwiGLU.Create() );
+      Down := NN.AddLayer( TNNetPointwiseConvLinear.Create(
+        Config.HiddenSize).SetTrainable(pTrainable) );
+      NN.AddLayer( TNNetSum.Create([Down, BranchInput]) );
+      FinalNorm := NN.AddLayer(
+        TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
+      if not pTrainable then NN.SetTrainable();
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // ---------------- Load ----------------
+      LoadLlamaRMSNormWeights(Reader, EmbNorm,
+        'mtp.pre_fc_norm_embedding.weight', Config.HiddenSize,
+        NormGainOffset);
+      MarkConsumed('mtp.pre_fc_norm_embedding.weight');
+      LoadLlamaRMSNormWeights(Reader, HidNorm,
+        'mtp.pre_fc_norm_hidden.weight', Config.HiddenSize, NormGainOffset);
+      MarkConsumed('mtp.pre_fc_norm_hidden.weight');
+      LoadLlamaLinearWeights(Reader, FC, 'mtp.fc.weight',
+        2 * Config.HiddenSize, Config.HiddenSize);
+      MarkConsumed('mtp.fc.weight');
+      LoadLlamaRMSNormWeights(Reader, AttnNorm,
+        'mtp.layers.0.input_layernorm.weight', Config.HiddenSize,
+        NormGainOffset);
+      MarkConsumed('mtp.layers.0.input_layernorm.weight');
+      // DOUBLE-width q_proj, per head [query(Dh)|gate(Dh)]: the query rows
+      // take the rotate_half permutation over the rotary slice, the gate rows
+      // load straight (they multiply the attention output, which stays in HF
+      // channel order) - the trunk's q_proj convention.
+      TensorNameStr := 'mtp.layers.0.self_attn.q_proj.weight';
+      NumHeadsM1 := Config.NumHeads - 1;
+      for HeadCnt := 0 to NumHeadsM1 do
+      begin
+        LoadLlamaLinearWeights(Reader, QProj, TensorNameStr,
+          Config.HiddenSize, HeadDim, {NeuronBase=}HeadCnt * HeadDim,
+          {ExpectedNeurons=}2 * QWidth, {RotaryHeadDim=}HeadDim,
+          {BiasName=}'', {Scale=}1.0, {RotaryDims=}RotaryDims,
+          {SrcRowBase=}HeadCnt * 2 * HeadDim, {SrcRows=}2 * QWidth);
+        LoadLlamaLinearWeights(Reader, QProj, TensorNameStr,
+          Config.HiddenSize, HeadDim,
+          {NeuronBase=}QWidth + HeadCnt * HeadDim,
+          {ExpectedNeurons=}2 * QWidth, {RotaryHeadDim=}0,
+          {BiasName=}'', {Scale=}1.0, {RotaryDims=}0,
+          {SrcRowBase=}HeadCnt * 2 * HeadDim + HeadDim, {SrcRows=}2 * QWidth);
+      end;
+      MarkConsumed(TensorNameStr);
+      LoadLlamaLinearWeights(Reader, KProj,
+        'mtp.layers.0.self_attn.k_proj.weight', Config.HiddenSize, KVWidth,
+        0, -1, {RotaryHeadDim=}HeadDim, '', 1.0, RotaryDims);
+      MarkConsumed('mtp.layers.0.self_attn.k_proj.weight');
+      LoadLlamaLinearWeights(Reader, VProj,
+        'mtp.layers.0.self_attn.v_proj.weight', Config.HiddenSize, KVWidth);
+      MarkConsumed('mtp.layers.0.self_attn.v_proj.weight');
+      LoadLlamaHeadRMSNormWeights(Reader, QNorms,
+        'mtp.layers.0.self_attn.q_norm.weight', HeadDim, NormGainOffset,
+        {Scale=}1.0, RotaryDims);
+      MarkConsumed('mtp.layers.0.self_attn.q_norm.weight');
+      LoadLlamaHeadRMSNormWeights(Reader, KNorms,
+        'mtp.layers.0.self_attn.k_norm.weight', HeadDim, NormGainOffset,
+        {Scale=}1.0, RotaryDims);
+      MarkConsumed('mtp.layers.0.self_attn.k_norm.weight');
+      LoadLlamaLinearWeights(Reader, OProj,
+        'mtp.layers.0.self_attn.o_proj.weight', QWidth, Config.HiddenSize);
+      MarkConsumed('mtp.layers.0.self_attn.o_proj.weight');
+      LoadLlamaRMSNormWeights(Reader, MlpNorm,
+        'mtp.layers.0.post_attention_layernorm.weight', Config.HiddenSize,
+        NormGainOffset);
+      MarkConsumed('mtp.layers.0.post_attention_layernorm.weight');
+      // Fused gate/up: up_proj -> neurons 0..I-1, gate_proj -> I..2I-1
+      // (TNNetSwiGLU computes FIRSTHALF * silu(SECONDHALF)).
+      LoadLlamaLinearWeights(Reader, GateUp, 'mtp.layers.0.mlp.up_proj.weight',
+        Config.HiddenSize, FfnWidth, 0, 2 * FfnWidth);
+      MarkConsumed('mtp.layers.0.mlp.up_proj.weight');
+      LoadLlamaLinearWeights(Reader, GateUp,
+        'mtp.layers.0.mlp.gate_proj.weight', Config.HiddenSize, FfnWidth,
+        FfnWidth, 2 * FfnWidth);
+      MarkConsumed('mtp.layers.0.mlp.gate_proj.weight');
+      LoadLlamaLinearWeights(Reader, Down, 'mtp.layers.0.mlp.down_proj.weight',
+        FfnWidth, Config.HiddenSize);
+      MarkConsumed('mtp.layers.0.mlp.down_proj.weight');
+      LoadLlamaRMSNormWeights(Reader, FinalNorm, 'mtp.norm.weight',
+        Config.HiddenSize, NormGainOffset);
+      MarkConsumed('mtp.norm.weight');
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+
+      // Every mtp.* tensor must be consumed: a checkpoint whose MTP module
+      // carries a tensor this build ignores would decode from a module that
+      // is not the one the checkpoint describes.
+      ReaderMax := Reader.Count - 1;
+      for i := 0 to ReaderMax do
+      begin
+        TensorNameStr := Reader.TensorName(i);
+        if Pos('mtp.', TensorNameStr) <> 1 then continue;
+        if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
+        ImportError('Qwen3.5 MTP import: unexpected tensor "' +
+          TensorNameStr + '" (shape ' + Reader.ShapeAsString(TensorNameStr) +
+          ') in ' + FileName + ' - refusing a partial import.');
+      end;
+      Result := NN;
+      NN := nil; // ownership transferred to the caller
+    except
+      on E: ESafeTensorsError do
+        raise EPretrainedImportError.Create(E.Message);
+    end;
+  finally
+    NN.Free; // non-nil only if an exception unwound the build
+    SetLength(QNorms, 0);
+    SetLength(KNorms, 0);
+    Consumed.Free;
+    Reader.Free;
+  end;
+end;
+
+function BuildQwen35MTPFromSafeTensors(const FileName: string;
+  const Config: TLlamaConfig; pSeqLen: integer = 0;
+  pTrainable: boolean = false; pQuantizeInt8: boolean = false): TNNet;
+begin
+  Result := BuildQwen35MTPFromTensorReader(
+    CreatePretrainedTensorReader(FileName), FileName, Config, pSeqLen,
+    pTrainable, pQuantizeInt8);
+end;
 function ReadLlama4ConfigFromJSONFile(const FileName: string): TLlamaConfig;
 var
   LpMax: integer;
