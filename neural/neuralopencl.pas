@@ -2096,11 +2096,11 @@ begin
   work_dim := 3;
   dim_sizes[0] := d1size;
   dim_sizes[1] := d2size;
-  dim_sizes[2] := d2size;
+  dim_sizes[2] := d3size;
 
   group_sizes[0] := d1groupsize;
   group_sizes[1] := d2groupsize;
-  group_sizes[2] := d2groupsize;
+  group_sizes[2] := d3groupsize;
 
   Result := clEnqueueNDRangeKernel(FCommands, pkernel, work_dim, nil, @dim_sizes[0], @group_sizes[0], 0, nil, nil);
 
