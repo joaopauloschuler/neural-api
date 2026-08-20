@@ -128432,7 +128432,10 @@ end;
 
 function TNNet.CreateKernel(const kernelname: string): TNeuralKernel;
 begin
-  Result := TNeuralKernel.CreateFromProgram(FDotProductKernel, kernelname);
+  // Private handles get a private queue: that is what makes a consumer's
+  // OpenCLWaitOutputIfAnotherQueue see a queue of its own and actually wait.
+  Result := TNeuralKernel.CreateFromProgram(FDotProductKernel, kernelname,
+    {pHideMessages=}true, {pSharedQueue=}FHasSharedKernel);
 end;
 
 function TNNet.GetKernel(const kernelname: string): TNeuralKernel;

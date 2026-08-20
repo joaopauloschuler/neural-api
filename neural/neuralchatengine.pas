@@ -344,7 +344,9 @@ begin
   WriteLn('  --gpu-device N        OpenCL device index within the platform (default 0)');
   WriteLn('  --no-gpu-shared-kernel  give each layer private OpenCL kernels and command');
   WriteLn('                        queue instead of the net-wide shared ones (default:');
-  WriteLn('                        shared, which is faster here; performance A/B knob)');
+  WriteLn('                        shared, which is faster). Each layer then waits for');
+  WriteLn('                        its sources, so --profile charges GPU time per layer');
+  WriteLn('                        instead of the queue drain: a profiling mode.');
   WriteLn('  --stats               per-turn timing to stderr (TTFT, decode tok/s)');
   WriteLn('  --profile             per-layer-class forward timing to stderr after each');
   WriteLn('                        turn (decode steps only); ranks classes to optimize.');
@@ -1147,7 +1149,9 @@ begin
         Notice('[--gpu: OpenCL on ' + GpuCL.PlatformNames[Opt.GpuPlatform] +
           ' / ' + GpuCL.DeviceNames[Opt.GpuDevice] + ']');
         if not Opt.GpuSharedKernel then
-          Notice('[--no-gpu-shared-kernel: per-layer kernels and command queues]');
+          Notice('[--no-gpu-shared-kernel: per-layer kernels and command queues - ' +
+            'each layer waits for its sources, so --profile charges GPU time to ' +
+            'layers instead of the queue drain; slower than shared]');
         LoadStart := GetTickCount64();
         NN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
           GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
