@@ -1557,8 +1557,8 @@ begin
           ' Error: ' + FloatToStrF(CurrentError,ffFixed,10,5) +
           ' Loss: ' + FloatToStrF(CurrentLoss,ffFixed,7,5) +
           ' Threads: ' + IntToStr(FThreadNum) +
-          ' Forward time: ' + FloatToStrF(FNN.ForwardTime * 24 * 60 * 60,ffFixed,6,2)+'s' +
-          ' Backward time: ' + FloatToStrF(FNN.BackwardTime * 24 * 60 * 60,ffFixed,6,2)+'s'+
+          ' Forward time: ' + FloatToStrF(FNN.NNetForwardTime * 24 * 60 * 60,ffFixed,6,2)+'s' +
+          ' Backward time: ' + FloatToStrF(FNN.NNetBackwardTime * 24 * 60 * 60,ffFixed,6,2)+'s'+
           ' Step time: ' + FloatToStrF(totalTimeSeconds,ffFixed,6,2) + 's'
         );
 
@@ -2037,8 +2037,8 @@ begin
   FGlobalTotalLoss := FGlobalTotalLoss + LocalTotalLoss;
   FGlobalErrorSum  := FGlobalErrorSum  + LocalErrorSum;
 
-  FNN.ForwardTime  := FNN.ForwardTime  + LocalNN.ForwardTime;
-  FNN.BackwardTime := FNN.BackwardTime + LocalNN.BackwardTime;
+  FNN.NNetForwardTime  := FNN.NNetForwardTime  + LocalNN.NNetForwardTime;
+  FNN.NNetBackwardTime := FNN.NNetBackwardTime + LocalNN.NNetBackwardTime;
   // The tree above left the whole batch's deltas in thread 0, so only thread 0
   // still has anything to add to FNN - one full-parameter pass under the lock
   // instead of one per stride-4 thread.
@@ -3406,8 +3406,8 @@ begin
           ' Error: ' + FloatToStrF(CurrentError,ffFixed,10,5) +
           ' Loss: ' + FloatToStrF(CurrentLoss,ffFixed,7,5) +
           ' Threads: ' + IntToStr(FThreadNum) +
-          ' Forward time: ' + FloatToStrF(FNN.ForwardTime * 24 * 60 * 60,ffFixed,6,2)+'s' +
-          ' Backward time: ' + FloatToStrF(FNN.BackwardTime * 24 * 60 * 60,ffFixed,6,2)+'s' +
+          ' Forward time: ' + FloatToStrF(FNN.NNetForwardTime * 24 * 60 * 60,ffFixed,6,2)+'s' +
+          ' Backward time: ' + FloatToStrF(FNN.NNetBackwardTime * 24 * 60 * 60,ffFixed,6,2)+'s' +
           ' Step time: ' + FloatToStrF(totalTimeSeconds,ffFixed,6,2) + 's'
         );
 
@@ -3909,8 +3909,8 @@ begin
   FGlobalTotalLoss := FGlobalTotalLoss + LocalTotalLoss;
   FGlobalErrorSum  := FGlobalErrorSum + LocalErrorSum;
 
-  FNN.ForwardTime := FNN.ForwardTime + LocalNN.ForwardTime;
-  FNN.BackwardTime := FNN.BackwardTime + LocalNN.BackwardTime;
+  FNN.NNetForwardTime := FNN.NNetForwardTime + LocalNN.NNetForwardTime;
+  FNN.NNetBackwardTime := FNN.NNetBackwardTime + LocalNN.NNetBackwardTime;
   // The tree above left the whole batch's deltas in thread 0, so only thread 0
   // still has anything to add to FNN - one full-parameter pass under the lock
   // instead of one per stride-4 thread.

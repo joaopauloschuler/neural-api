@@ -17391,8 +17391,9 @@ type
   TNNet = class(TNNetExecutionPlanner)
     protected
       FLearningRate: TNeuralFloat;
-      FForwardTime: double;
-      FBackwardTime: double;
+      FNNetForwardTime: double;
+      FNNetForwardTimeQueueOpenCL: double;
+      FNNetBackwardTime: double;
       //Layer with Max Delta. You can read after calling GetMaxAbsoluteDelta.
       FMaxDeltaLayer: integer;
       // Net-level mirror of the per-layer FIsTrainable flags: True on Create,
@@ -19572,7 +19573,7 @@ type
       ): string;
       // LayerTimingReport runs Iterations forward passes of Sample through NN
       // and returns a human-readable table of per-layer forward-pass wall-clock
-      // cost. It calls NN.ClearTime to zero the per-layer FForwardTime
+      // cost. It calls NN.ClearTime to zero the per-layer FNNetForwardTime
       // accumulators, runs Iterations full forward passes (NN.Compute(Sample)),
       // then reads each layer's accumulated ForwardTime (a TDateTime span in
       // days) and divides by Iterations to get the mean. Each row reports the
@@ -21418,8 +21419,8 @@ type
       procedure CheckBackwardAnomaly();
 
     published
-      property BackwardTime: double read FBackwardTime write FBackwardTime;
-      property ForwardTime: double read FForwardTime write FForwardTime;
+      property NNetBackwardTime: double read FNNetBackwardTime write FNNetBackwardTime;
+      property NNetForwardTime: double read FNNetForwardTime write FNNetForwardTime;
       property Layers: TNNetLayerList read FLayers;
       property LearningRate: TNeuralFloat read FLearningRate;
       property MaxDeltaLayer: integer read FMaxDeltaLayer;
@@ -108136,7 +108137,7 @@ begin
     Exit;
   end;
   if Iterations < 1 then Iterations := 1;
-  // Zero the per-layer FForwardTime accumulators, then run Iterations full
+  // Zero the per-layer FNNetForwardTime accumulators, then run Iterations full
   // forward passes so each layer's ForwardTime sums its own Compute cost.
   NN.ClearTime();
   for IterCnt := 1 to Iterations do
@@ -108197,7 +108198,7 @@ var
   TmpI64: Int64;
   TmpName: string;
 const
-  // FForwardTime is a TDateTime span measured in days; convert to microseconds.
+  // FNNetForwardTime is a TDateTime span measured in days; convert to microseconds.
   cUsPerDay = 24.0 * 60.0 * 60.0 * 1000.0 * 1000.0;
 begin
   Result := '';
@@ -108332,7 +108333,7 @@ var
   BytesPerElem: integer;
   ShapeStr, PassStr: string;
 const
-  // FForwardTime / FBackwardTime are TDateTime spans measured in days; this
+  // FNNetForwardTime / FNNetBackwardTime are TDateTime spans measured in days; this
   // converts to microseconds.
   cUsPerDay = 24.0 * 60.0 * 60.0 * 1000.0 * 1000.0;
 begin
@@ -108357,7 +108358,7 @@ begin
 
   BytesPerElem := csNeuralFloatSize;
 
-  // Zero the per-layer FForwardTime / FBackwardTime accumulators, then run
+  // Zero the per-layer FNNetForwardTime / FNNetBackwardTime accumulators, then run
   // Iterations full forward (and optional backward) passes so each layer
   // sums its own Compute / Backpropagate cost.
   NN.ClearTime();
@@ -126803,6 +126804,9 @@ end;
 procedure TNNet.Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0; Parallel: boolean = false);
 var
   StartTime: double;
+  {$IFDEF OpenCL}
+  StartOpenCLQueueTime: double;
+  {$ENDIF}
 begin
   StartTime := Now();
   if FLayers.Count > FromLayerIdx + 1 then
@@ -126817,7 +126821,9 @@ begin
         then ComputeParallel(FromLayerIdx)
         else ComputeSerial(FromLayerIdx);
       {$IFDEF OpenCL}
+      StartOpenCLQueueTime := Now();
       GetLastLayer().ForceOutputOnRAM();
+      FNNetForwardTimeQueueOpenCL := FNNetForwardTimeQueueOpenCL + (Now() - StartOpenCLQueueTime);
       {$ENDIF}
     end else
     begin
@@ -126832,7 +126838,7 @@ begin
   begin
     FErrorProc('Compute - Neural Network doesn''t have suficcient layers.');
   end;
-  FForwardTime := FForwardTime + (Now() - StartTime);
+  FNNetForwardTime := FNNetForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNet.ComputeSerial(FromLayerIdx: integer = 0);
@@ -127603,7 +127609,7 @@ begin
   begin
     FErrorProc('Backpropagate - Neural Network doesn''t have suficcient layers.');
   end;
-  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FNNetBackwardTime := FNNetBackwardTime + (Now() - StartTime);
 end;
 
 procedure TNNet.BackpropagateForIdx(pOutput: TNNetVolume;
@@ -127624,7 +127630,7 @@ begin
   begin
     FErrorProc('Backpropagate - Neural Network doesn''t have suficcient layers.');
   end;
-  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  FNNetBackwardTime := FNNetBackwardTime + (Now() - StartTime);
 end;
 
 procedure TNNet.BackpropagateFromLayerAndNeuron(LayerIdx, NeuronIdx: integer; Error: TNeuralFloat);
@@ -127814,8 +127820,9 @@ var
   LastLayerIdx: integer;
   L: TNNetLayer;
 begin
-  FForwardTime := FForwardTime + Origin.FForwardTime;
-  FBackwardTime := FBackwardTime + Origin.FBackwardTime;
+  FNNetForwardTime := FNNetForwardTime + Origin.FNNetForwardTime;
+  FNNetBackwardTime := FNNetBackwardTime + Origin.FNNetBackwardTime;
+  FNNetForwardTimeQueueOpenCL := FNNetForwardTimeQueueOpenCL + Origin.FNNetForwardTimeQueueOpenCL;
   if FLayers.Count = Origin.Layers.Count then
   begin
     if FLayers.Count > 1 then
@@ -127843,8 +127850,9 @@ var
   LastLayerIdx: integer;
   L: TNNetLayer;
 begin
-  FForwardTime := FForwardTime + Origin.FForwardTime;
-  FBackwardTime := FBackwardTime + Origin.FBackwardTime;
+  FNNetForwardTime := FNNetForwardTime + Origin.FNNetForwardTime;
+  FNNetBackwardTime := FNNetBackwardTime + Origin.FNNetBackwardTime;
+  FNNetForwardTimeQueueOpenCL := FNNetForwardTimeQueueOpenCL + Origin.FNNetForwardTimeQueueOpenCL;
   if FLayers.Count = Origin.Layers.Count then
   begin
     if FLayers.Count > 1 then
@@ -127876,8 +127884,9 @@ begin
   begin
     if FLayers.Count > 1 then
     begin
-      FForwardTime := FForwardTime + Origin.FForwardTime;
-      FBackwardTime := FBackwardTime + Origin.FBackwardTime;
+      FNNetForwardTime := FNNetForwardTime + Origin.FNNetForwardTime;
+      FNNetBackwardTime := FNNetBackwardTime + Origin.FNNetBackwardTime;
+      FNNetForwardTimeQueueOpenCL := FNNetForwardTimeQueueOpenCL + Origin.FNNetForwardTimeQueueOpenCL;
       MaxLayerIdx := GetLastLayerIdx();
       for LayerCnt := 0 to MaxLayerIdx do
       begin
@@ -127906,8 +127915,9 @@ var
   MaxLayerIdx: integer;
   L, OL: TNNetLayer;
 begin
-  FForwardTime := FForwardTime + Origin.FForwardTime;
-  FBackwardTime := FBackwardTime + Origin.FBackwardTime;
+  FNNetForwardTime := FNNetForwardTime + Origin.FNNetForwardTime;
+  FNNetBackwardTime := FNNetBackwardTime + Origin.FNNetBackwardTime;
+  FNNetForwardTimeQueueOpenCL := FNNetForwardTimeQueueOpenCL + Origin.FNNetForwardTimeQueueOpenCL;
   MaxLayerIdx := GetLastLayerIdx();
   for LayerCnt := 0 to MaxLayerIdx do
   begin
@@ -127927,8 +127937,10 @@ var
   MaxLayerIdx: integer;
   L, OL: TNNetLayer;
 begin
-  FForwardTime := Origin.FForwardTime;
-  FBackwardTime := Origin.FBackwardTime;
+  FNNetForwardTime := Origin.FNNetForwardTime;
+  FNNetBackwardTime := Origin.FNNetBackwardTime;
+  FNNetForwardTimeQueueOpenCL := Origin.FNNetForwardTimeQueueOpenCL;
+
   if FLayers.Count = Origin.Layers.Count then
   begin
     if FLayers.Count > 1 then
@@ -129014,8 +129026,9 @@ var
   LayerCnt: integer;
   LastLayerIdx: integer;
 begin
-  FForwardTime := 0;
-  FBackwardTime := 0;
+  FNNetForwardTime := 0;
+  FNNetForwardTimeQueueOpenCL := 0;
+  FNNetBackwardTime := 0;
   LastLayerIdx := GetLastLayerIdx();
   for LayerCnt := 0 to LastLayerIdx do
   begin
@@ -129313,8 +129326,10 @@ var
   LayerCnt: integer;
   LastLayerIdx: integer;
 begin
-  FForwardTime := FForwardTime * Value1 + Origin.FForwardTime * Value2;
-  FBackwardTime := FBackwardTime * Value1 + Origin.FBackwardTime * Value2;
+  FNNetForwardTime := FNNetForwardTime * Value1 + Origin.FNNetForwardTime * Value2;
+  FNNetBackwardTime := FNNetBackwardTime * Value1 + Origin.FNNetBackwardTime * Value2;
+  FNNetForwardTimeQueueOpenCL := FNNetForwardTimeQueueOpenCL * Value1 + Origin.FNNetForwardTimeQueueOpenCL * Value2;
+
   if FLayers.Count = Origin.Layers.Count then
   begin
     if FLayers.Count > 1 then
