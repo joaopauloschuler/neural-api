@@ -461,6 +461,12 @@ type
     // (feature-size x padding x stride sweep, incl. pointwise and device
     // im2col). Coded by Claude (AI).
     procedure TestInt8QuantizedOpenCLParity;
+    // OpenCL split-K int8 parity: a long reduction axis with few output
+    // neurons is the decode GEMV shape that makes TDotProductSharedKernel
+    // .Int8SplitCount cut the axis into slabs, so this covers the two-pass
+    // cai_dot_product_int8_splitk path the sweep above never reaches.
+    // Coded by Claude (AI).
+    procedure TestInt8SplitKOpenCLParity;
     // OpenCL single-launch fused-mixture forward parity (vs the fused CPU
     // forward) for TNNetMoEExpertBankDown: the whole gate-weighted expert
     // mixture of one MoE block in one kernel, reading the gate|up bank's slot
@@ -66409,6 +66415,104 @@ begin
   // A bias-suppressed + ReLU case to vary the fused opcode/bias combination.
   RunOne('3x3 pad1 s1 relu nobias', 3, 1, 1, @RectifiedLinearUnit,
     @RectifiedLinearUnitDerivative, 1);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// --- split-K int8 (long reduction axis, few output neurons) ------------------
+//
+// TDotProductSharedKernel.ComputeInt8 keeps the single-pass
+// cai_dot_product_int8 whenever FNumAs*FNumBs already fills the device. The
+// decode GEMV does not: one sample and a few thousand output neurons leave most
+// of a GPU idle, so Int8SplitCount cuts the reduction axis into slabs and
+// ComputeInt8 runs the two-pass split-K kernels instead. 2048 inputs / 512
+// neurons is that shape - FSize/csInt8SplitKMinSlab allows 16 slabs, and 512
+// rows sit far below any device's thread target, so the split path is taken on
+// every OpenCL device. 512 is also the smallest neuron count that arms
+// TNNetFullConnect's FShouldOpenCL verdict. The single-pass sweep in TestInt8QuantizedOpenCLParity
+// never reaches it: its longest FSize is 128, one slab.
+//
+// Parity is against the fused CPU int8 forward, so it covers the whole two-pass
+// contract at once: slab boundaries that do not divide FSize, the partial-sum
+// layout shared by both kernels, and the deferred scale/bias/activation order
+// that only pass 2 applies.
+
+procedure TTestNeuralNumerical.TestInt8SplitKOpenCLParity;
+{$IFDEF OpenCL}
+  procedure RunFC(const aName: string; pInputSize, pNeurons: integer;
+    ActFn: TNeuralActivationFunction; ActDeriv: TNeuralActivationFunction;
+    pSuppressBias: integer);
+  var
+    NN: TNNet;
+    Input, OutCPU: TNNetVolume;
+    FC: TNNetFullConnect;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i: integer;
+    Diff, MaxDiff: TNeuralFloat;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    RandSeed := 20260820;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(1, 1, pInputSize);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(1, 1, pInputSize, 1));
+      FC := TNNetFullConnect.Create(pNeurons, pSuppressBias);
+      FC.ActivationFn := ActFn;
+      FC.ActivationFnDerivative := ActDeriv;
+      NN.AddLayer(FC);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.7 * Sin(i * 0.013) - 0.2;
+      for i := 0 to FC.Neurons.Count - 1 do
+        FC.Neurons[i].BiasWeight := 0.25 * Cos(i * 0.11);
+      NN.UpdateWeights();
+      FC.SetTrainable(False, False);
+
+      NN.QuantizeWeightsInt8();
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      NN.Compute(Input); // resident codes/scales/bias + partial buffer reuse
+      MaxDiff := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      WriteLn('  Int8SplitK ', aName, ' OpenCL parity: max|diff|=', MaxDiff:0:9,
+        ' gpu forwards=', FC.ForwardGPUCnt);
+      // Without this the device path could be unarmed and parity would be a
+      // CPU-vs-CPU comparison that proves nothing.
+      AssertTrue('Int8SplitK ' + aName + ' ran on the device: ForwardGPUCnt = ' +
+        IntToStr(FC.ForwardGPUCnt) + ' must be > 0', FC.ForwardGPUCnt > 0);
+      AssertTrue('Int8SplitK ' + aName + ' device vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+begin
+  // 2048 inputs: 16 slabs of 128. Bias present and absent, and an activation
+  // opcode, so pass 2's whole tail is covered.
+  RunFC('2048x512 identity nobias', 2048, 512, @Identity, @IdentityDerivative, 1);
+  RunFC('2048x512 relu bias', 2048, 512, @RectifiedLinearUnit,
+    @RectifiedLinearUnitDerivative, 0);
+  // 1500 inputs does NOT divide by the slab count: the last slab is short and
+  // pass 1 must clamp it to FSize rather than read past the row.
+  RunFC('1500x512 tanh bias', 1500, 512, @HiperbolicTangent,
+    @HiperbolicTangentDerivative, 0);
 end;
 {$ELSE}
 begin

@@ -139,6 +139,9 @@ type
     function CreateBuffer(size: csize_t): cl_mem;  overload; {$IFDEF Release} inline; {$ENDIF}
 
     function CreateKernel(kernelname: string): cl_kernel;
+    // CL_DEVICE_MAX_COMPUTE_UNITS of the current device, 1 when the query
+    // fails. Sizes launches that must fill the device to run at speed.
+    function DeviceMaxComputeUnits(): integer;
     function RunKernel(pkernel:cl_kernel; ThreadCount: integer): integer;
     function RunKernel2D(pkernel:cl_kernel; d1size, d2size: csize_t): integer; overload;
     function RunKernel2D(pkernel:cl_kernel; d1size, d2size, d1groupsize, d2groupsize: csize_t): integer; overload;
@@ -293,6 +296,27 @@ type
       FScalesBuffer: cl_mem;
       FCapCodes, FCapScales: csize_t;
       FInt8Ready: boolean;
+      /// SPLIT-K INT8 MODE. cai_dot_product_int8 gives one work-item per
+      /// (output row, sample), so a decode GEMV (FNumBs=1) launches only
+      /// FNumAs work-items - far too few to fill a GPU. These two entry points
+      /// are bound against FInt8Kernel's already-compiled program (so they ride
+      /// the same queue) and split the reduction across a third grid axis:
+      /// pass 1 writes raw slab sums into FPartialBuffer, pass 2 reduces them
+      /// and applies scale/bias/activation. Owned here (raw cl_kernel handles),
+      /// created lazily on the first split launch. Coded by Claude (AI).
+      FSplitKKernel: cl_kernel;
+      FSplitKReduceKernel: cl_kernel;
+      FPartialBuffer: cl_mem;
+      FCapPartial: csize_t;
+
+      /// How many slabs to cut the reduction axis into for the current shape:
+      /// 1 means the launch already fills the device, so ComputeInt8 keeps the
+      /// single-pass kernel. Coded by Claude (AI).
+      function Int8SplitCount(): integer;
+      /// Binds the two split-K entry points and sizes FPartialBuffer for
+      /// pSplits. False when the device rejected either kernel, which sends
+      /// ComputeInt8 back to the single-pass path. Coded by Claude (AI).
+      function PrepareSplitK(pSplits: integer): boolean;
 
 
       function Kernel(): cl_kernel; {$IFDEF Release} inline; {$ENDIF}
@@ -509,6 +533,15 @@ begin
   if Assigned(FIm2ColSrcBuffer) then clReleaseMemObject(FIm2ColSrcBuffer);
   if Assigned(FCodesBuffer)   then clReleaseMemObject(FCodesBuffer);
   if Assigned(FScalesBuffer)  then clReleaseMemObject(FScalesBuffer);
+  if Assigned(FPartialBuffer) then clReleaseMemObject(FPartialBuffer);
+  // Owned here, unlike FInt8Kernel: these two came from CreateKernel against
+  // the net's program, so this instance releases them.
+  if Assigned(FSplitKKernel)       then clReleaseKernel(FSplitKKernel);
+  if Assigned(FSplitKReduceKernel) then clReleaseKernel(FSplitKReduceKernel);
+  FPartialBuffer := nil;
+  FSplitKKernel := nil;
+  FSplitKReduceKernel := nil;
+  FCapPartial := 0;
 
   FInputBufferAs := nil;
   FInputBufferBs := nil;
@@ -857,6 +890,59 @@ begin
   PrepareForComputeInt8 := err;
 end;
 
+const
+  /// Work-items per compute unit the int8 launch aims for before it stops
+  /// splitting. Enough to cover memory latency without cutting rows so thin
+  /// that the reduce pass and the extra round trip dominate.
+  csInt8SplitKThreadsPerUnit = 1024;
+  /// Never cut a row into slabs shorter than this: below it the per-work-item
+  /// setup outweighs the reduction work.
+  csInt8SplitKMinSlab = 128;
+  csInt8SplitKMaxSplits = 64;
+
+function TDotProductSharedKernel.Int8SplitCount(): integer;
+var
+  Rows, TargetThreads, MaxSplitsBySize: integer;
+begin
+  Result := 1;
+  Rows := FNumAs * FNumBs;
+  if (Rows < 1) or (FSize < 1) then exit;
+  TargetThreads := FDotProductKernel.DeviceMaxComputeUnits() *
+    csInt8SplitKThreadsPerUnit;
+  // Already fills the device (prefill, or a vocab-sized head): one pass wins,
+  // because splitting would only add a partial buffer and a second launch.
+  if Rows >= TargetThreads then exit;
+  MaxSplitsBySize := FSize div csInt8SplitKMinSlab;
+  if MaxSplitsBySize < 2 then exit;
+  Result := (TargetThreads + Rows - 1) div Rows;
+  if Result > MaxSplitsBySize then Result := MaxSplitsBySize;
+  if Result > csInt8SplitKMaxSplits then Result := csInt8SplitKMaxSplits;
+end;
+
+function TDotProductSharedKernel.PrepareSplitK(pSplits: integer): boolean;
+var
+  NeededPartial: csize_t;
+begin
+  Result := false;
+  if not Assigned(FInt8Kernel) then exit;
+  if not Assigned(FSplitKKernel) then
+    FSplitKKernel := FInt8Kernel.CreateKernel('cai_dot_product_int8_splitk');
+  if not Assigned(FSplitKReduceKernel) then
+    FSplitKReduceKernel :=
+      FInt8Kernel.CreateKernel('cai_dot_product_int8_splitk_reduce');
+  if (not Assigned(FSplitKKernel)) or (not Assigned(FSplitKReduceKernel)) then
+    exit;
+
+  NeededPartial := csize_t(FNumAs) * FNumBs * pSplits * SizeOf(TNeuralFloat);
+  if (FPartialBuffer = nil) or (NeededPartial > FCapPartial) then
+  begin
+    if Assigned(FPartialBuffer) then clReleaseMemObject(FPartialBuffer);
+    FPartialBuffer := FDotProductKernel.CreateBuffer(NeededPartial);
+    FCapPartial := NeededPartial;
+  end;
+  Result := Assigned(FPartialBuffer);
+end;
+
 procedure TDotProductSharedKernel.ComputeInt8(VBs: TNNetVolume;
   pActFN: longint; NewVBs: boolean = true; VBias: TNNetVolume = nil;
   NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
@@ -864,8 +950,9 @@ var
   err: integer;
   UseBias: longint;
   NeededBias: csize_t;
-  K: cl_kernel;
+  K, KReduce: cl_kernel;
   BufferBs: cl_mem;
+  Splits: longint;
 begin
   if not FInt8Ready then
   begin
@@ -881,22 +968,12 @@ begin
     exit;
   end;
   FActFun := pActFN;
-  K := FInt8Kernel.Kernel;
   if pExternalVBs <> nil then BufferBs := pExternalVBs else BufferBs := FInputBufferBs;
 
-  err := clSetKernelArg(K, 0, csLongintSize, @FThreadCount);
-  err := err or clSetKernelArg(K, 1, csLongintSize, @FNumAs);
-  err := err or clSetKernelArg(K, 2, csLongintSize, @FNumBs);
-  err := err or clSetKernelArg(K, 3, csLongintSize, @FSize);
-  err := err or clSetKernelArg(K, 4, csLongintSize, @FActFun);
-  err := err or clSetKernelArg(K, 5, csCLMemSize, @FCodesBuffer);
-  err := err or clSetKernelArg(K, 6, csCLMemSize, @BufferBs);
-  err := err or clSetKernelArg(K, 7, csCLMemSize, @FResultBuffer);
-
-  // Fused bias: same contract as Compute (args 8/9 must always be set; a
-  // bias-less caller passes UseBias=0 and a NULL buffer the kernel never
-  // reads). Resident grow-only buffer, re-uploaded only when NewVBias or
-  // just (re)allocated.
+  // Fused bias: same contract as Compute (a bias-less caller passes UseBias=0
+  // and a NULL buffer the kernel never reads). Resident grow-only buffer,
+  // re-uploaded only when NewVBias or just (re)allocated.
+  err := CL_SUCCESS;
   if VBias <> nil then
   begin
     NeededBias := VBias.GetMemSize();
@@ -913,12 +990,59 @@ begin
   else
     UseBias := 0;
 
+  if NewVBs and (pExternalVBs = nil) then
+    err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
+
+  Splits := Int8SplitCount();
+  if (Splits > 1) and PrepareSplitK(Splits) then
+  begin
+    // Pass 1: raw slab sums. Pass 2: reduce, scale, bias, activation. Both on
+    // the same in-order queue, so pass 2 is ordered after pass 1 with no wait.
+    K := FSplitKKernel;
+    err := err or clSetKernelArg(K, 0, csLongintSize, @FNumAs);
+    err := err or clSetKernelArg(K, 1, csLongintSize, @FNumBs);
+    err := err or clSetKernelArg(K, 2, csLongintSize, @FSize);
+    err := err or clSetKernelArg(K, 3, csLongintSize, @Splits);
+    err := err or clSetKernelArg(K, 4, csCLMemSize, @FCodesBuffer);
+    err := err or clSetKernelArg(K, 5, csCLMemSize, @BufferBs);
+    err := err or clSetKernelArg(K, 6, csCLMemSize, @FPartialBuffer);
+
+    KReduce := FSplitKReduceKernel;
+    err := err or clSetKernelArg(KReduce, 0, csLongintSize, @FNumAs);
+    err := err or clSetKernelArg(KReduce, 1, csLongintSize, @FNumBs);
+    err := err or clSetKernelArg(KReduce, 2, csLongintSize, @Splits);
+    err := err or clSetKernelArg(KReduce, 3, csLongintSize, @FActFun);
+    err := err or clSetKernelArg(KReduce, 4, csCLMemSize, @FPartialBuffer);
+    err := err or clSetKernelArg(KReduce, 5, csCLMemSize, @FResultBuffer);
+    err := err or clSetKernelArg(KReduce, 6, csLongintSize, @UseBias);
+    err := err or clSetKernelArg(KReduce, 7, csCLMemSize, @FBiasBuffer);
+    err := err or clSetKernelArg(KReduce, 8, csCLMemSize, @FScalesBuffer);
+
+    if err = CL_SUCCESS then
+    begin
+      FDotProductKernel.RunKernel3D(K, FNumAs, FNumBs, Splits);
+      FDotProductKernel.RunKernel2D(KReduce, FNumAs, FNumBs);
+    end
+    else
+    begin
+      ErrorProc('Error: TDotProductSharedKernel.ComputeInt8 - ' +
+        'failed setting split-K parameters: ' + IntToStr(err));
+    end;
+    exit;
+  end;
+
+  K := FInt8Kernel.Kernel;
+  err := err or clSetKernelArg(K, 0, csLongintSize, @FThreadCount);
+  err := err or clSetKernelArg(K, 1, csLongintSize, @FNumAs);
+  err := err or clSetKernelArg(K, 2, csLongintSize, @FNumBs);
+  err := err or clSetKernelArg(K, 3, csLongintSize, @FSize);
+  err := err or clSetKernelArg(K, 4, csLongintSize, @FActFun);
+  err := err or clSetKernelArg(K, 5, csCLMemSize, @FCodesBuffer);
+  err := err or clSetKernelArg(K, 6, csCLMemSize, @BufferBs);
+  err := err or clSetKernelArg(K, 7, csCLMemSize, @FResultBuffer);
   err := err or clSetKernelArg(K, 8, csLongintSize, @UseBias);
   err := err or clSetKernelArg(K, 9, csCLMemSize, @FBiasBuffer);
   err := err or clSetKernelArg(K, 10, csCLMemSize, @FScalesBuffer);
-
-  if NewVBs and (pExternalVBs = nil) then
-    err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
 
   if err = CL_SUCCESS then
   begin
@@ -1866,6 +1990,21 @@ begin
     FMessageProc('clCreateKernel '+kernelname+' OK!');
   end;
   {$IFDEF FPC}StrDispose{$ELSE}AnsiStrings.StrDispose{$ENDIF}(localKernelName);
+end;
+
+function TEasyOpenCL.DeviceMaxComputeUnits(): integer;
+var
+  Units: cl_uint;
+  BytesWritten: csize_t;
+begin
+  Result := 1;
+  if FCurrentDevice = nil then exit;
+  Units := 0;
+  if clGetDeviceInfo(FCurrentDevice, CL_DEVICE_MAX_COMPUTE_UNITS,
+    SizeOf(Units), @Units, {$IFDEF FPC}BytesWritten{$ELSE}@BytesWritten{$ENDIF}) = CL_SUCCESS then
+  begin
+    if Units > 0 then Result := Units;
+  end;
 end;
 
 function TEasyOpenCL.RunKernel(pkernel: cl_kernel; ThreadCount: integer): integer;
