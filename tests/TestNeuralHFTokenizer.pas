@@ -153,6 +153,7 @@ type
     procedure TestDeepSeekParityWithJinja;
     procedure TestPhi4MiniParityWithJinja;
     procedure TestQwen3_5ParityWithJinja;
+    procedure TestQwen3_8ParityWithJinja;
     procedure TestDetectDeepSeekAndPhi4Mini;
     procedure TestLoadChatTemplateFromSiblingJinja;
     procedure TestDetectFormatOnAuthenticTemplates;
@@ -1978,6 +1979,7 @@ var
   Cases, MsgArr: TJSONArray;
   Messages: TChatMessages;
   ChatFormat: TNeuralChatFormat;
+  Effort: TChatReasoningEffort;
   CaseCnt, MsgCnt: integer;
   Context, Rendered: string;
   Raised: boolean;
@@ -2004,12 +2006,17 @@ begin
         Messages[MsgCnt] := ChatMessage(MsgObj.Get('role', ''),
           MsgObj.Get('content', ''));
       end;
+      // Cases without a pinned reasoning_effort are the template default.
+      AssertTrue(Context + ': reasoning effort name',
+        ReasoningEffortFromName(CaseObj.Get('reasoning_effort', 'xhigh'),
+          Effort));
       if CaseObj.Get('raises', false) then
       begin
         Raised := false;
         try
-          ApplyChatTemplate(ChatFormat, Messages,
-            CaseObj.Get('add_generation_prompt', true));
+          ApplyChatTemplate(ChatFormat, Messages, ChatTemplateOptions(
+            CaseObj.Get('add_generation_prompt', true),
+            {ContinueFinalMessage=}false, Effort));
         except
           on E: ENeuralChatError do Raised := true;
         end;
@@ -2018,7 +2025,8 @@ begin
       else
       begin
         Rendered := ApplyChatTemplate(ChatFormat, Messages,
-          CaseObj.Get('add_generation_prompt', true));
+          ChatTemplateOptions(CaseObj.Get('add_generation_prompt', true),
+            {ContinueFinalMessage=}false, Effort));
         AssertEquals(Context, CaseObj.Get('expected', ''), Rendered);
       end;
     end;
@@ -2074,6 +2082,15 @@ end;
 procedure TTestNeuralChat.TestQwen3_5ParityWithJinja;
 begin
   RunChatBattery('qwen3_5');
+end;
+
+// Qwen3.8: the Qwen3.6 frame plus the reasoning-effort system header, an
+// EMPTY <think> block on every assistant turn and no content-side <think>
+// split, pinned byte for byte against the authentic Qwen3.8-27B
+// chat_template.jinja render.
+procedure TTestNeuralChat.TestQwen3_8ParityWithJinja;
+begin
+  RunChatBattery('qwen3_8');
 end;
 
 procedure TTestNeuralChat.TestPhi4MiniParityWithJinja;
@@ -2203,7 +2220,7 @@ procedure TTestNeuralChat.TestFormatNameRoundTrip;
 var
   ChatFormat: TNeuralChatFormat;
 begin
-  for ChatFormat := cfChatML to cfPhi4Mini do
+  for ChatFormat := cfChatML to cfQwen3_8 do
     AssertTrue('round trip ' + ChatFormatName(ChatFormat),
       ChatFormatFromName(ChatFormatName(ChatFormat)) = ChatFormat);
   AssertTrue('unknown name', ChatFormatFromName('vicuna') = cfUnknown);

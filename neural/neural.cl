@@ -290,6 +290,140 @@ __kernel void cai_dot_product_int8
   }
 } // end of kernel
 
+// Fused bias/activation tail shared by the split-K reduce kernel: the opcode
+// set and the math are identical to cai_dot_product's inline tail.
+static inline float cai_fused_act(float v, const int ActFN)
+{
+  if (ActFN == 1)
+  {
+    return (v < 0.0f) ? 0.0f : v;
+  }
+  else if (ActFN == 2) // Sigmoid: numerically-stable two-branch 1/(1+exp(-x))
+  {
+    if (v > 0.0f) return 1.0f / (1.0f + exp(-v));
+    const float s = exp(v);
+    return s / (1.0f + s);
+  }
+  else if (ActFN == 3) // HyperbolicTangent: clamp [-10,10], (1-e)/(1+e), e=exp(-2x)
+  {
+    float xc = v;
+    if (xc > 10.0f) xc = 10.0f; else if (xc < -10.0f) xc = -10.0f;
+    const float e = exp(-2.0f * xc);
+    return (1.0f - e) / (1.0f + e);
+  }
+  return v;
+}
+
+// SPLIT-K PASS 1. cai_dot_product_int8 gives one work-item per (output row,
+// sample), so a decode GEMV (FNumBs=1) launches only FNumAs work-items and
+// leaves a large device mostly idle. This kernel adds a third grid axis over
+// the reduction: work-item (a_id, b_id, s) sums the slab
+// [s*KChunk, (s+1)*KChunk) of row a_id and writes its RAW code sum (no scale,
+// no bias, no activation) to FPartialBuffer. The A operand keeps the
+// codes[a + i*FNumAs] layout, so consecutive a_id lanes still read consecutive
+// bytes; splitting across work-GROUPS rather than lanes is what preserves that.
+// cai_dot_product_int8_splitk_reduce finishes the job. Coded by Claude (AI).
+__kernel void cai_dot_product_int8_splitk
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int KSplits,
+  __global const char* FInputBufferAs,
+  __global const float* FInputBufferBs,
+  __global float* FPartialBuffer
+)
+{
+  const int a_id = get_global_id(0);
+  const int b_id = get_global_id(1);
+  const int s    = get_global_id(2);
+
+  if ( (a_id < FNumAs) && (b_id < FNumBs) && (s < KSplits) )
+  {
+    const int KChunk = (FSize + KSplits - 1) / KSplits;
+    const int kStart = s * KChunk;
+    int kEnd = kStart + KChunk;
+    if (kEnd > FSize) kEnd = FSize;
+
+    float PartialResult = 0;
+    int i = kStart;
+
+    if (i < kEnd)
+    {
+      const int VectBPos = b_id * FSize;
+      const int kEndMinus8 = kEnd - 8;
+
+      while (i < kEndMinus8)
+      {
+        const int startBPos = i + VectBPos;
+
+        PartialResult =
+          mad(convert_float(FInputBufferAs[a_id + (i+0)*FNumAs]), FInputBufferBs[startBPos + 0],
+          mad(convert_float(FInputBufferAs[a_id + (i+1)*FNumAs]), FInputBufferBs[startBPos + 1],
+          mad(convert_float(FInputBufferAs[a_id + (i+2)*FNumAs]), FInputBufferBs[startBPos + 2],
+          mad(convert_float(FInputBufferAs[a_id + (i+3)*FNumAs]), FInputBufferBs[startBPos + 3],
+          mad(convert_float(FInputBufferAs[a_id + (i+4)*FNumAs]), FInputBufferBs[startBPos + 4],
+          mad(convert_float(FInputBufferAs[a_id + (i+5)*FNumAs]), FInputBufferBs[startBPos + 5],
+          mad(convert_float(FInputBufferAs[a_id + (i+6)*FNumAs]), FInputBufferBs[startBPos + 6],
+          mad(convert_float(FInputBufferAs[a_id + (i+7)*FNumAs]), FInputBufferBs[startBPos + 7],
+          PartialResult))))))));
+        i += 8;
+      }
+
+      while (i < kEnd)
+      {
+        PartialResult =
+          mad(convert_float(FInputBufferAs[a_id + i*FNumAs]), FInputBufferBs[i + VectBPos], PartialResult);
+        i += 1;
+      }
+    }
+
+    // Slab-major layout: pass 1 writes and pass 2 reads with consecutive a_id
+    // lanes hitting consecutive floats, so both passes stay coalesced.
+    FPartialBuffer[s * FNumAs * FNumBs + b_id * FNumAs + a_id] = PartialResult;
+  }
+} // end of kernel
+
+// SPLIT-K PASS 2. Sums the KSplits raw partials of one (a_id, b_id), then
+// applies the deferred per-row scale, the fused bias and the fused activation
+// in cai_dot_product_int8's order, and writes the final result. One work-item
+// per output element. Coded by Claude (AI).
+__kernel void cai_dot_product_int8_splitk_reduce
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int KSplits,
+  const int ActFN,
+  __global const float* FPartialBuffer,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FBiasOutput,
+  __global const float* FScales
+)
+{
+  const int a_id = get_global_id(0);
+  const int b_id = get_global_id(1);
+
+  if ( (a_id < FNumAs) && (b_id < FNumBs) )
+  {
+    const int RowStride = FNumAs * FNumBs;
+    const int BasePos = b_id * FNumAs + a_id;
+
+    float DotProductResult = 0;
+    for (int s = 0; s < KSplits; s++)
+    {
+      DotProductResult += FPartialBuffer[s * RowStride + BasePos];
+    }
+
+    // Deferred per-row dequantization scale, then the (FP32, unscaled) bias -
+    // same order as cai_dot_product_int8 and as the host fused path.
+    DotProductResult *= FScales[a_id];
+    if (UseBias != 0) DotProductResult += FBiasOutput[BasePos];
+
+    FResultBuffer[BasePos] = cai_fused_act(DotProductResult, ActFN);
+  }
+} // end of kernel
+
 __kernel void cai_dot_product2
 (
   const int FThreadCount,

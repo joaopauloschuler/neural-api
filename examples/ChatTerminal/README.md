@@ -175,9 +175,19 @@ Every accelerated layer shares one net-wide OpenCL program and kernel cache
 (`TNNet.EnableOpenCL`'s `pHasSharedKernel`), so a kernel is compiled once and
 the layers submit to a shared command queue. `--no-gpu-shared-kernel` opts
 out: each layer builds its own kernel handles and gets its own queue. That is
-measurably *slower* on the devices tested here (it is the flag that switches
-on per-layer command queues and worker-0 routing) — it exists as a
-performance A/B knob and an escape hatch for drivers that mishandle sharing.
+measurably *slower* on the devices tested here (it also switches the scheduler
+off worker-0 routing) — it exists as a performance A/B knob, an escape hatch
+for drivers that mishandle sharing, and a profiling mode.
+
+The profiling use follows from the queues. On the shared queue, a layer that
+enqueues a kernel returns before the kernel runs, so `--profile` charges it the
+enqueue only and every kernel's real cost lands in the `OpenCL queue drain`
+line under the table. With private queues, a consumer whose source sits on
+another queue calls `TNNetLayer.OpenCLWaitOutputIfAnotherQueue`, which blocks
+until that source is done — so the GPU time moves out of the drain and into the
+per-layer rows, charged to the layer that waited rather than the layer that
+computed. Read the ranking, not the total: the private-queue run is a slower
+program than the one you are profiling.
 
 GPU offload of an fp32 layer needs its concatenated weight cache, which
 `--low-memory` (the default) drops. Combining it with `--gpu` therefore

@@ -576,6 +576,26 @@ begin
     // End-of-turn markers.
     Check(EndOfTurnMarker(cfChatML) = '<|im_end|>', 'ChatML end marker');
     Check(EndOfTurnMarker(cfQwen3_5) = '<|im_end|>', 'Qwen3.5 end marker');
+    Check(EndOfTurnMarker(cfQwen3_8) = '<|im_end|>', 'Qwen3.8 end marker');
+
+    // Reasoning effort: flag parsing, the REPL command, and the two formats
+    // that react to it.
+    Args.Clear;
+    Args.Add('--reasoning-effort'); Args.Add('low');
+    Check(ParseArgs(Args, Opt) and (Opt.ReasoningEffort = reLow),
+      '--reasoning-effort low');
+    Args.Clear;
+    Args.Add('--reasoning-effort'); Args.Add('sideways');
+    Check(not ParseArgs(Args, Opt), '--reasoning-effort rejects a bad value');
+    Args.Clear;
+    Check(ParseArgs(Args, Opt) and (Opt.ReasoningEffort = reXHigh),
+      'reasoning effort defaults to xhigh');
+    Check(ParseReplCommand('/reasoning off', Cmd, Arg) and
+      (Cmd = 'reasoning') and (Arg = 'off'), '/reasoning parses its argument');
+    Check(FormatHasReasoningControl(cfQwen3_8) and
+      FormatHasReasoningControl(cfQwen3_5) and
+      not FormatHasReasoningControl(cfChatML),
+      'only the Qwen thinking formats have a reasoning control');
     Check(EndOfTurnMarker(cfLlama3) = '<|eot_id|>', 'Llama-3 end marker');
     Check(EndOfTurnMarker(cfGemma) = '<end_of_turn>', 'Gemma end marker');
     Check(EndOfTurnMarker(cfPhi3) = '<|end|>', 'Phi-3 end marker');
@@ -644,6 +664,7 @@ var
   Transcript: string;           // raw mode's running document (turns append)
   Cnt: integer;
   OneShotOK: boolean;           // -p: did the single turn render and generate?
+  Effort: TChatReasoningEffort; // /reasoning target
   Line, Cmd, Arg, Reply, ErrorMsg: string;
 begin
   Args := TStringList.Create();
@@ -722,7 +743,9 @@ begin
   else
   begin
     WriteLn('Type your message; /exit quits, /reset clears the history,');
-    WriteLn('/system <msg> sets the system prompt.');
+    WriteLn('/system <msg> sets the system prompt, /reasoning ' +
+      '<off|low|medium|xhigh>');
+    WriteLn('sets the reasoning effort.');
   end;
   while true do
   begin
@@ -752,7 +775,22 @@ begin
           WriteLn('[system prompt set]');
         end;
       end
-      else WriteLn('[unknown command /', Cmd, ' - /exit, /reset, /system]');
+      else if Cmd = 'reasoning' then
+      begin
+        if not ReasoningEffortFromName(Arg, Effort) then
+          WriteLn('[/reasoning needs off|low|medium|xhigh]')
+        else
+        begin
+          Engine.Opt.ReasoningEffort := Effort;
+          if FormatHasReasoningControl(Engine.ChatFormat) then
+            WriteLn('[reasoning effort ', ReasoningEffortName(Effort), ']')
+          else
+            WriteLn('[reasoning effort ', ReasoningEffortName(Effort),
+              ' ignored - this chat format has no reasoning control]');
+        end;
+      end
+      else WriteLn('[unknown command /', Cmd,
+        ' - /exit, /reset, /system, /reasoning]');
       continue;
     end;
     if Engine.RawMode then
