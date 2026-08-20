@@ -2061,7 +2061,10 @@ begin
   if (Result <> CL_SUCCESS) then
   begin
     if (Result = CL_INVALID_WORK_GROUP_SIZE)
-    then FErrorProc('ERROR: Invalid work group size.')
+    then FErrorProc('ERROR: Invalid work group size. Global (' +
+      IntToStr(Int64(d1size)) + ', ' + IntToStr(Int64(d2size)) +
+      ') group (' + IntToStr(Int64(d1groupsize)) + ', ' +
+      IntToStr(Int64(d2groupsize)) + ').')
     else FErrorProc('ERROR: Failed to execute kernel. Error:' + IntToStr(Result));
   end;
 end;
@@ -2107,7 +2110,11 @@ begin
   if (Result <> CL_SUCCESS) then
   begin
     if (Result = CL_INVALID_WORK_GROUP_SIZE)
-    then FErrorProc('ERROR: Invalid work group size.')
+    then FErrorProc('ERROR: Invalid work group size. Global (' +
+      IntToStr(Int64(d1size)) + ', ' + IntToStr(Int64(d2size)) + ', ' +
+      IntToStr(Int64(d3size)) + ') group (' + IntToStr(Int64(d1groupsize)) +
+      ', ' + IntToStr(Int64(d2groupsize)) + ', ' +
+      IntToStr(Int64(d3groupsize)) + ').')
     else FErrorProc('ERROR: Failed to execute kernel. Error:' + IntToStr(Result));
   end;
 end;
