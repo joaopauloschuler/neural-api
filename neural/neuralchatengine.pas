@@ -292,6 +292,13 @@ type
     function GenerateFromIds(const PromptIds: TNeuralIntegerArray;
       const GenOpt: TChatOptions): string;
   private
+    // Committed ids of the reply being decoded through the --mtp path, and
+    // the driver's per-token callback that watches them for the end-of-turn
+    // marker (the driver stops on EOS ids by itself, but knows nothing about
+    // the chat format).
+    MTPCommitted: TNeuralIntegerArray;
+    MTPCommittedCount: integer;
+    procedure MTPTokenCommitted(Token: integer; var Stop: boolean);
     // The --mtp decode path: one reply through GenerateTokensMTPSpeculative.
     // Greedy, non-streamed (the driver has no per-token callback).
     function GenerateFromIdsMTP(const PromptIds: TNeuralIntegerArray;
@@ -1516,10 +1523,22 @@ end;
 //     added since. Requires this prompt to extend the snapshot's sequence;
 //     a divergent prompt falls back to a full reset.
 // NoCacheReuse disables both: full reset, whole prompt re-prefilled.
+// Watches the tokens GenerateTokensMTPSpeculative commits for the chat
+// format's end-of-turn marker, which the driver cannot recognize itself.
+// Coded by Claude (AI).
+procedure TChatEngine.MTPTokenCommitted(Token: integer; var Stop: boolean);
+begin
+  if MTPCommittedCount >= Length(MTPCommitted) then exit;
+  MTPCommitted[MTPCommittedCount] := Token;
+  Inc(MTPCommittedCount);
+  if Length(MarkerIds) > 0 then
+    Stop := TailMatches(MTPCommitted, MTPCommittedCount, MarkerIds);
+end;
+
 function TChatEngine.GenerateFromIdsMTP(const PromptIds: TNeuralIntegerArray;
   const GenOpt: TChatOptions): string;
 var
-  Tokens, Generated: TNeuralIntegerArray;
+  Tokens, Generated, EOSIds: TNeuralIntegerArray;
   PromptLen, TotalLen, Produced, GenCount, MarkerLen, Cnt: integer;
   TStart, TEnd: QWord;
   DecodeSecs: double;
@@ -1552,11 +1571,23 @@ begin
   SetLength(CachedTokens, 0);
   FreeAndNil(TurnSnap);
   TurnSnapPos := 0;
+  // The driver's default EOS rule is "token id < 2", which no real vocabulary
+  // satisfies: without the tokenizer's own id it would decode the whole
+  // --max-new-tokens budget every turn, and any tok/s figure measured that way
+  // would be meaningless.
+  if Tokenizer.EosId >= 0 then
+  begin
+    SetLength(EOSIds, 1);
+    EOSIds[0] := Tokenizer.EosId;
+  end
+  else SetLength(EOSIds, 0);
+  SetLength(MTPCommitted, SeqLen);
+  MTPCommittedCount := 0;
   TStart := GetTickCount64();
   try
     TotalLen := GenerateTokensMTPSpeculative(Session, MTPSession,
       MTPEmbedding, Tokens, PromptLen, GenOpt.MaxNewTokens, SeqLen,
-      LastMTPStats);
+      LastMTPStats, {pDraft=}true, EOSIds, @MTPTokenCommitted);
   except
     Session.Reset();
     MTPSession.Reset();
@@ -1568,11 +1599,8 @@ begin
   SetLength(Generated, Produced);
   if Produced > 0 then
     Move(Tokens[PromptLen], Generated[0], Produced * csIntegerSize);
-  // Stop-token trimming happens HERE, after the fact. The driver's own EOS
-  // rule is "token id < 2", which no Qwen end-of-turn id satisfies, and it
-  // knows nothing about the chat format's marker - so it always decodes the
-  // whole --max-new-tokens budget and the reply is cut at the first EOS id or
-  // marker match.
+  // The driver stops ON the EOS id or the marker's last token, so this pass
+  // only TRIMS the stopping tokens off the reply text.
   MarkerLen := Length(MarkerIds);
   GenCount := Produced;
   for Cnt := 1 to Produced do

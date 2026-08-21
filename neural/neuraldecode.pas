@@ -227,6 +227,12 @@ type
     TokensPerTrunkForward: TNeuralFloat; // Generated / max(1, TrunkForwards)
   end;
 
+  // Fired by GenerateTokensMTPSpeculative as each token is COMMITTED, in
+  // order, so a host can print a reply as it decodes. Set Stop to finish
+  // after this token (an end-of-turn marker the driver cannot see).
+  TNNetTokenCommitEvent = procedure(Token: integer;
+    var Stop: boolean) of object;
+
   // -------------------------------------------------------------------------
   // NEEDLE-IN-A-HAYSTACK long-context evaluation (NeedleInHaystackReport).
   //
@@ -1922,6 +1928,11 @@ function GenerateTokensStreamed(Session: TNNetStreamingDecoder;
 // own KV cache is kept DENSE - a row is run for the second committed token of
 // every window too, without the LM-head splice - so the drafter never attends
 // over a gapped history. Coded by Claude (AI).
+//   EOSTokens lists the terminating ids; EMPTY falls back to the codebase
+// "token < 2" rule, which NO real tokenizer's end-of-turn id satisfies - a
+// caller with a real vocabulary must pass its ids or the run will decode the
+// whole MaxNewTokens budget. OnCommit (may be nil) fires per committed token
+// and can stop the run.
 //   pDraft=false is the MEASUREMENT BASELINE: the module still runs (its cache
 // stays dense) but its draft is never trusted, so every window is the certain
 // one and the run costs one trunk forward per token. It is the correct A/B
@@ -1931,7 +1942,9 @@ function GenerateTokensStreamed(Session: TNNetStreamingDecoder;
 function GenerateTokensMTPSpeculative(Trunk, MTPModule: TNNetStreamingDecoder;
   Embedding: TNNetEmbedding; var Tokens: TNeuralIntegerArray;
   PromptLen, MaxNewTokens, MaxTotalLen: integer;
-  out Stats: TNNetMTPSpecStats; pDraft: boolean = true): integer;
+  out Stats: TNNetMTPSpecStats; pDraft: boolean = true;
+  const EOSTokens: TNeuralIntegerArray = nil;
+  OnCommit: TNNetTokenCommitEvent = nil): integer;
 
 // STRING-LEVEL WRAPPER mirroring GenerateStringFromCasualNN's shape
 // (dict/tokenizer + prompt + optional sampler; TNeuralTokenizer is a
@@ -7269,7 +7282,9 @@ end;
 function GenerateTokensMTPSpeculative(Trunk, MTPModule: TNNetStreamingDecoder;
   Embedding: TNNetEmbedding; var Tokens: TNeuralIntegerArray;
   PromptLen, MaxNewTokens, MaxTotalLen: integer;
-  out Stats: TNNetMTPSpecStats; pDraft: boolean = true): integer;
+  out Stats: TNNetMTPSpecStats; pDraft: boolean = true;
+  const EOSTokens: TNeuralIntegerArray = nil;
+  OnCommit: TNNetTokenCommitEvent = nil): integer;
 var
   InV2, MTPIn, EmbRow, HPrev, HRow0, HRow1: TNNetVolume;
   TrunkRow: TNNetVolume;
@@ -7277,8 +7292,7 @@ var
   HeadIdx, HeadInIdx, MaxTrunkLayerPos, HiddenSize: integer;
   NextPos, CapLen, NextTok, DraftTok, TrueTok, BonusTok: integer;
   PairPos, MaxPairPos, PrevPairPos: integer;
-  HasRecurrent, Accepted: boolean;
-  NoEOSTokens: TNeuralIntegerArray;
+  HasRecurrent, Accepted, StopRequested: boolean;
 
   // Dst := the hidden state of row RowIdx of the trunk's last forward.
   procedure ReadTrunkHiddenRow(RowIdx: integer; Dst: TNNetVolume);
@@ -7392,7 +7406,6 @@ begin
       'head); got ' + IntToStr(MTPLayers.GetLastLayer().Output.Depth) + '.');
   CapLen := Min(PromptLen + MaxNewTokens, MaxTotalLen);
   if Length(Tokens) < CapLen then SetLength(Tokens, CapLen);
-  SetLength(NoEOSTokens, 0);
   HasRecurrent := Trunk.SSMCount > 0;
   InV2 := TNNetVolume.Create(2, 1, 1);
   MTPIn := TNNetVolume.Create(MTPLayers.GetFirstLayer().Output);
@@ -7442,7 +7455,9 @@ begin
       // or a prompt token) but has not been consumed by the trunk yet.
       Tokens[NextPos] := NextTok;
       Inc(Stats.Generated);
-      if TokenIsEOS(NextTok, NoEOSTokens) then
+      StopRequested := false;
+      if Assigned(OnCommit) then OnCommit(NextTok, StopRequested);
+      if StopRequested or TokenIsEOS(NextTok, EOSTokens) then
       begin
         Inc(NextPos);
         Break;
@@ -7481,12 +7496,14 @@ begin
       BonusTok := TrunkRow.GetClassOnPixel(1, 0);
       Tokens[NextPos + 1] := TrueTok;
       Inc(Stats.Generated);
+      StopRequested := false;
+      if Assigned(OnCommit) then OnCommit(TrueTok, StopRequested);
       // The module row for the second committed token, so its cache stays
       // dense; no draft is read from it.
       RunMTPRow(TrueTok, NextPos + 1, HRow0, {WantDraft=}false);
       HPrev.Copy(HRow1);
       NextPos := NextPos + 2;
-      if TokenIsEOS(TrueTok, NoEOSTokens) then Break;
+      if StopRequested or TokenIsEOS(TrueTok, EOSTokens) then Break;
       NextTok := BonusTok;
     end;
     if Stats.Drafts > 0 then

@@ -27,6 +27,11 @@ uses
 type
   TTestNeuralPretrained = class(TTestCase)
   private
+    // Commit-callback probe for TestQwen35MTPSpeculativeStopsOnEOSAndCallback.
+    MTPCommitCount: integer;
+    MTPCommitStopAfter: integer;
+    MTPCommitLog: array[0..63] of integer;
+    procedure MTPCommitProbe(Token: integer; var Stop: boolean);
     function FixturePath(const FileName: string): string;
     {$IFDEF OpenCL}
     // First OpenCL platform/device on the box; false when there is none, which
@@ -252,6 +257,7 @@ type
     procedure TestQwen35StreamedDecodeParity;
     procedure TestQwen35MTPModuleParity;
     procedure TestQwen35MTPSpeculativeDecodeMatchesGreedy;
+    procedure TestQwen35MTPSpeculativeStopsOnEOSAndCallback;
     procedure TestQwen35WindowedDecodeParity;
     procedure TestQwen35StreamedDecodeOpenCLParity;
     procedure TestQwen2StreamedDecodeOpenCLParity;
@@ -8881,6 +8887,116 @@ end;
 // draft in a two-token window, so a window that drifts would flip an argmax
 // and silently change the decoded text. Compares both window widths against
 // the same full forward. Coded by Claude (AI).
+procedure TTestNeuralPretrained.MTPCommitProbe(Token: integer;
+  var Stop: boolean);
+begin
+  if MTPCommitCount <= High(MTPCommitLog) then
+    MTPCommitLog[MTPCommitCount] := Token;
+  Inc(MTPCommitCount);
+  if (MTPCommitStopAfter > 0) and (MTPCommitCount >= MTPCommitStopAfter) then
+    Stop := true;
+end;
+
+// The driver's DEFAULT end-of-sequence rule is the codebase "token id < 2",
+// which no real vocabulary satisfies - a caller that does not pass its own ids
+// decodes the whole MaxNewTokens budget, and any tokens/second measured that
+// way is meaningless. Pins both escapes: an EOSTokens id stops the run at that
+// token, and the commit callback sees every committed token in order and can
+// stop the run itself (how TChatEngine ends a turn on the chat format's
+// end-of-turn marker). Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35MTPSpeculativeStopsOnEOSAndCallback;
+const
+  PromptLen = 4;
+  MaxNewTokens = 8;
+  MaxTotalLen = 16;
+var
+  SpecNet, MTPNet: TNNet;
+  Config: TLlamaConfig;
+  SpecSession, MTPSession: TNNetStreamingDecoder;
+  Stats: TNNetMTPSpecStats;
+  Toks, RefToks, EOSIds: TNeuralIntegerArray;
+  EmbLayer: TNNetLayer;
+  i, RefLen, EOSLen, StopLen, EOSTok: integer;
+
+  procedure FreshRun(out Len: integer; const StopIds: TNeuralIntegerArray;
+    UseProbe: boolean; StopAfter: integer);
+  var
+    T: integer;
+  begin
+    SetLength(Toks, MaxTotalLen);
+    for T := 0 to PromptLen - 1 do Toks[T] := RefToks[T];
+    MTPCommitCount := 0;
+    MTPCommitStopAfter := StopAfter;
+    SpecSession.Free;
+    MTPSession.Free;
+    SpecSession := TNNetStreamingDecoder.Create(SpecNet, MaxTotalLen);
+    MTPSession := TNNetStreamingDecoder.Create(MTPNet, MaxTotalLen);
+    if UseProbe then
+      Len := GenerateTokensMTPSpeculative(SpecSession, MTPSession,
+        TNNetEmbedding(EmbLayer), Toks, PromptLen, MaxNewTokens, MaxTotalLen,
+        Stats, {pDraft=}true, StopIds, @MTPCommitProbe)
+    else
+      Len := GenerateTokensMTPSpeculative(SpecSession, MTPSession,
+        TNNetEmbedding(EmbLayer), Toks, PromptLen, MaxNewTokens, MaxTotalLen,
+        Stats, {pDraft=}true, StopIds, nil);
+  end;
+
+begin
+  RandSeed := 424242;
+  SpecNet := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5_mtp.safetensors'), Config, {SeqLen=}2,
+    {pTrainable=}true, FixturePath('tiny_qwen3_5_mtp_config.json'));
+  MTPNet := nil;
+  SpecSession := nil;
+  MTPSession := nil;
+  try
+    MTPNet := BuildQwen35MTPFromSafeTensors(
+      FixturePath('tiny_qwen3_5_mtp.safetensors'), Config, {SeqLen=}1);
+    EmbLayer := nil;
+    for i := 0 to SpecNet.Layers.Count - 1 do
+      if SpecNet.Layers[i].ClassType = TNNetEmbedding then
+        EmbLayer := SpecNet.Layers[i];
+    AssertTrue('trunk embedding layer found', EmbLayer <> nil);
+    SetLength(RefToks, MaxTotalLen);
+    for i := 0 to PromptLen - 1 do
+      RefToks[i] := (5 * i + 2) mod Config.VocabSize;
+
+    // Reference run: no stop ids, no callback - it must fill the budget.
+    SetLength(EOSIds, 0);
+    FreshRun(RefLen, EOSIds, {UseProbe=}false, 0);
+    AssertEquals('the reference run fills the whole budget',
+      PromptLen + MaxNewTokens, RefLen);
+    for i := 0 to RefLen - 1 do RefToks[i] := Toks[i];
+
+    // The token committed third becomes an end-of-sequence id: the run must
+    // stop right after it instead of decoding the rest of the budget.
+    EOSTok := RefToks[PromptLen + 2];
+    SetLength(EOSIds, 1);
+    EOSIds[0] := EOSTok;
+    FreshRun(EOSLen, EOSIds, {UseProbe=}false, 0);
+    AssertTrue('the EOS id stopped the run early', EOSLen < RefLen);
+    AssertEquals('the run stopped ON the EOS token', EOSTok,
+      Toks[EOSLen - 1]);
+    for i := 0 to EOSLen - 1 do
+      AssertEquals('token ' + IntToStr(i) + ' is unchanged by stopping',
+        RefToks[i], Toks[i]);
+
+    // The callback sees every committed token in order and can stop the run.
+    SetLength(EOSIds, 0);
+    FreshRun(StopLen, EOSIds, {UseProbe=}true, 3);
+    AssertEquals('the callback stopped the run', PromptLen + 3, StopLen);
+    AssertEquals('one callback per committed token', 3, MTPCommitCount);
+    for i := 0 to 2 do
+      AssertEquals('callback token ' + IntToStr(i) + ' in commit order',
+        RefToks[PromptLen + i], MTPCommitLog[i]);
+  finally
+    MTPSession.Free;
+    SpecSession.Free;
+    MTPNet.Free;
+    SpecNet.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestQwen35WindowedDecodeParity;
 const
   SeqLen = 16;
