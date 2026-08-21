@@ -212,6 +212,21 @@ type
     AcceptanceRate: TNeuralFloat; // Accepted / max(1, DraftProposals)
   end;
 
+  // Counters for one GenerateTokensMTPSpeculative run (Qwen3.5/3.8
+  // multi-token-prediction self-speculative decoding).
+  TNNetMTPSpecStats = record
+    TrunkForwards: integer;  // trunk Compute calls: verify windows + redos
+    Drafts: integer;         // MTP-module drafts proposed (one per verify)
+    Accepted: integer;       // drafts that matched the trunk's own argmax
+    Rejected: integer;       // drafts that disagreed
+    Redos: integer;          // width-1 re-steps a rejected draft forced on a
+                             // net with recurrent layers (see the note on
+                             // GenerateTokensMTPSpeculative)
+    Generated: integer;      // tokens appended (EOS included)
+    AcceptanceRate: TNeuralFloat;        // Accepted / max(1, Drafts)
+    TokensPerTrunkForward: TNeuralFloat; // Generated / max(1, TrunkForwards)
+  end;
+
   // -------------------------------------------------------------------------
   // NEEDLE-IN-A-HAYSTACK long-context evaluation (NeedleInHaystackReport).
   //
@@ -1875,6 +1890,48 @@ function GenerateTokensStreamed(Session: TNNetStreamingDecoder;
   Penalty: TNNetTokenHistoryPenalty;
   const StopSequences: TNNetTokenSequences;
   Constraint: TNNetTokenConstraint): integer; overload;
+
+
+// MULTI-TOKEN-PREDICTION SELF-SPECULATIVE DECODING (Qwen3.5/3.8 "mtp.*"
+// module; DeepSeek-V3's sequential MTP as vLLM's Qwen3_5MultiTokenPredictor
+// implements it). One model, no draft checkpoint: the MTP module proposes the
+// token AFTER the one the trunk just produced, and the trunk verifies it in a
+// WIDTH-2 window, so an accepted draft commits two tokens for one trunk
+// forward.
+//   Trunk is a streaming session over the trunk net, which must be at least
+// WIDTH-2 (the verify window); MTPModule is a WIDTH-1 session over
+// BuildQwen35MTPFromSafeTensors' net, whose input is the depth-concat
+// [ embed_tokens[x_t+1] | h_t ]; Embedding is the TRUNK's embedding layer -
+// the module has none, and the draft needs the embedding of a token the trunk
+// has NOT consumed yet, which is why the row is read directly (CopyRowTo)
+// instead of from a forward. The module's output is spliced through the
+// TRUNK's LM head, so the head is not duplicated either.
+//   GREEDY and EXACT: every committed token is the trunk's own argmax over
+// fully-committed context, so the returned sequence is IDENTICAL to
+// GenerateTokensStreamed's greedy output. Token contract, EOS rule ("< 2")
+// and return value match GenerateTokensStreamed.
+//   EVERY trunk window carries TWO REAL tokens and is never zero-padded: a pad
+// row would advance every recurrent layer's state (Qwen3.8 is 48 gated-
+// DeltaNet layers out of 64) and TruncateTo can only undo attention K/V. So a
+// rejected draft is not patched up with a width-1 step - the window is RERUN
+// with the token the trunk itself named (Stats.Redos), which needs no
+// verification and commits two tokens either way. Tokens per trunk forward is
+// therefore 2/(2-a) for accept rate a: 1.0 when nothing is ever accepted (no
+// worse than plain decoding) up to 2.0.
+//   PromptLen must be >= 2, and the prompt is prefilled in PAIRS. The module's
+// own KV cache is kept DENSE - a row is run for the second committed token of
+// every window too, without the LM-head splice - so the drafter never attends
+// over a gapped history. Coded by Claude (AI).
+//   pDraft=false is the MEASUREMENT BASELINE: the module still runs (its cache
+// stays dense) but its draft is never trusted, so every window is the certain
+// one and the run costs one trunk forward per token. It is the correct A/B
+// partner for a speculative run - identical arithmetic, same session width -
+// and the oracle the exactness test uses, because a WIDTH-1 greedy run is a
+// numerically different path whose argmax can differ on a near-tie.
+function GenerateTokensMTPSpeculative(Trunk, MTPModule: TNNetStreamingDecoder;
+  Embedding: TNNetEmbedding; var Tokens: TNeuralIntegerArray;
+  PromptLen, MaxNewTokens, MaxTotalLen: integer;
+  out Stats: TNNetMTPSpecStats; pDraft: boolean = true): integer;
 
 // STRING-LEVEL WRAPPER mirroring GenerateStringFromCasualNN's shape
 // (dict/tokenizer + prompt + optional sampler; TNeuralTokenizer is a
@@ -7207,6 +7264,244 @@ begin
     Result := HeadStartIdx;
   if Result < 1 then Result := 1;
   if Result > LastLayer then Result := LastLayer;
+end;
+
+function GenerateTokensMTPSpeculative(Trunk, MTPModule: TNNetStreamingDecoder;
+  Embedding: TNNetEmbedding; var Tokens: TNeuralIntegerArray;
+  PromptLen, MaxNewTokens, MaxTotalLen: integer;
+  out Stats: TNNetMTPSpecStats; pDraft: boolean = true): integer;
+var
+  InV2, MTPIn, EmbRow, HPrev, HRow0, HRow1: TNNetVolume;
+  TrunkRow: TNNetVolume;
+  TrunkLayers, MTPLayers: TNNet;
+  HeadIdx, HeadInIdx, MaxTrunkLayerPos, HiddenSize: integer;
+  NextPos, CapLen, NextTok, DraftTok, TrueTok, BonusTok: integer;
+  PairPos, MaxPairPos, PrevPairPos: integer;
+  HasRecurrent, Accepted: boolean;
+  NoEOSTokens: TNeuralIntegerArray;
+
+  // Dst := the hidden state of row RowIdx of the trunk's last forward.
+  procedure ReadTrunkHiddenRow(RowIdx: integer; Dst: TNNetVolume);
+  var
+    ChanCnt, SrcBase: integer;
+    HiddenAll: TNNetVolume;
+  begin
+    HiddenAll := Trunk.HiddenState();
+    SrcBase := RowIdx * HiddenSize;
+    for ChanCnt := 0 to HiddenSize - 1 do
+      Dst.FData[ChanCnt] := HiddenAll.FData[SrcBase + ChanCnt];
+  end;
+
+  // One MTP-module row: h' = MTP( [ embed[TokenId] | Hidden ] ) at AbsPos,
+  // where Hidden is the trunk hidden state of the PRECEDING position. With
+  // WantDraft the row is spliced through the TRUNK's LM head and its argmax
+  // is returned (the drafted token at AbsPos+1); otherwise the row only keeps
+  // the module's own KV cache dense and the result is -1.
+  function RunMTPRow(TokenId, AbsPos: integer; Hidden: TNNetVolume;
+    WantDraft: boolean): integer;
+  var
+    ChanCnt, LayerCnt: integer;
+  begin
+    Embedding.CopyRowTo(TokenId, EmbRow);
+    for ChanCnt := 0 to HiddenSize - 1 do
+    begin
+      MTPIn.FData[ChanCnt] := EmbRow.FData[ChanCnt];
+      MTPIn.FData[HiddenSize + ChanCnt] := Hidden.FData[ChanCnt];
+    end;
+    MTPModule.StepForward(MTPIn, AbsPos);
+    Result := -1;
+    if not WantDraft then exit;
+    // Both sides of the splice must be host-resident: the module's output
+    // before it is read, the head-input slot before it is overwritten.
+    {$IFDEF OpenCL}
+    MTPLayers.GetLastLayer().ForceOutputOnRAM();
+    TrunkLayers.Layers[HeadInIdx].ForceOutputOnRAM();
+    {$ENDIF}
+    // The slot keeps the WIDTH-2 shape every trunk window gave it - resizing
+    // it would leave the next window writing into a shrunken buffer, because
+    // a layer sizes its output when it is wired, not per Compute. The module's
+    // single row goes into row 0 and the head's row 0 is the one read back;
+    // row 1 is recomputed by the next window before anyone reads it.
+    for ChanCnt := 0 to HiddenSize - 1 do
+      TrunkLayers.Layers[HeadInIdx].Output.FData[ChanCnt] :=
+        MTPLayers.GetLastLayer().Output.FData[ChanCnt];
+    for LayerCnt := HeadIdx to MaxTrunkLayerPos do
+      TrunkLayers.Layers[LayerCnt].Compute();
+    {$IFDEF OpenCL} TrunkLayers.GetLastLayer().ForceOutputOnRAM(); {$ENDIF}
+    Result := TrunkLayers.GetLastLayer().Output.GetClassOnPixel(0, 0);
+  end;
+
+  // One trunk window of TWO REAL tokens at absolute position AbsPos. Never
+  // padded: a pad row would advance every recurrent layer's state, and
+  // TruncateTo can only undo attention K/V.
+  procedure TrunkWindow(TokenA, TokenB, AbsPos: integer);
+  begin
+    InV2.FData[0] := TokenA;
+    InV2.FData[1] := TokenB;
+    Trunk.StepForward(InV2, AbsPos);
+    Inc(Stats.TrunkForwards);
+    TrunkRow := Trunk.Output();
+    ReadTrunkHiddenRow(0, HRow0);
+    ReadTrunkHiddenRow(1, HRow1);
+  end;
+
+begin
+  Stats.TrunkForwards := 0;
+  Stats.Drafts := 0;
+  Stats.Accepted := 0;
+  Stats.Rejected := 0;
+  Stats.Redos := 0;
+  Stats.Generated := 0;
+  Stats.AcceptanceRate := 0;
+  Stats.TokensPerTrunkForward := 0;
+  if not Assigned(Embedding) then
+    raise EArgumentException.Create(
+      'GenerateTokensMTPSpeculative: Embedding is required - the MTP module ' +
+      'has no embedding table of its own.');
+  TrunkLayers := Trunk.Net;
+  MTPLayers := MTPModule.Net;
+  if TrunkLayers.GetFirstLayer().Output.SizeX <> 2 then
+    raise EArgumentException.Create(
+      'GenerateTokensMTPSpeculative: the trunk session must be a WIDTH-2 ' +
+      'twin (input SizeX=2, the verify window); got SizeX=' +
+      IntToStr(TrunkLayers.GetFirstLayer().Output.SizeX) + '.');
+  if MTPLayers.GetFirstLayer().Output.SizeX <> 1 then
+    raise EArgumentException.Create(
+      'GenerateTokensMTPSpeculative: the MTP module session must be ' +
+      'WIDTH-1 (input SizeX=1); got SizeX=' +
+      IntToStr(MTPLayers.GetFirstLayer().Output.SizeX) + '.');
+  if PromptLen < 2 then
+    raise EArgumentException.Create(
+      'GenerateTokensMTPSpeculative: PromptLen must be >= 2 (a width-2 ' +
+      'window needs two real tokens, and the first draft needs a hidden ' +
+      'state); got ' + IntToStr(PromptLen) + '.');
+  HeadIdx := ResolveHeadStartIdx(TrunkLayers, -1);
+  HeadInIdx := HeadIdx - 1;
+  MaxTrunkLayerPos := TrunkLayers.GetLastLayerIdx();
+  HiddenSize := TrunkLayers.Layers[HeadInIdx].Output.Depth;
+  if MTPLayers.GetFirstLayer().Output.Depth <> 2 * HiddenSize then
+    raise EArgumentException.Create(
+      'GenerateTokensMTPSpeculative: the MTP module input must be ' +
+      IntToStr(2 * HiddenSize) + ' deep (the concat of the embedding and ' +
+      'the trunk hidden state); got ' +
+      IntToStr(MTPLayers.GetFirstLayer().Output.Depth) + '.');
+  if MTPLayers.GetLastLayer().Output.Depth <> HiddenSize then
+    raise EArgumentException.Create(
+      'GenerateTokensMTPSpeculative: the MTP module output must be ' +
+      IntToStr(HiddenSize) + ' deep (it is spliced through the trunk LM ' +
+      'head); got ' + IntToStr(MTPLayers.GetLastLayer().Output.Depth) + '.');
+  CapLen := Min(PromptLen + MaxNewTokens, MaxTotalLen);
+  if Length(Tokens) < CapLen then SetLength(Tokens, CapLen);
+  SetLength(NoEOSTokens, 0);
+  HasRecurrent := Trunk.SSMCount > 0;
+  InV2 := TNNetVolume.Create(2, 1, 1);
+  MTPIn := TNNetVolume.Create(MTPLayers.GetFirstLayer().Output);
+  EmbRow := TNNetVolume.Create(1, 1, HiddenSize);
+  HPrev := TNNetVolume.Create(1, 1, HiddenSize);
+  HRow0 := TNNetVolume.Create(1, 1, HiddenSize);
+  HRow1 := TNNetVolume.Create(1, 1, HiddenSize);
+  try
+    MTPIn.Fill(0);
+    Trunk.Reset();
+    MTPModule.Reset();
+    // ---- Prefill: the prompt in PAIRS of real tokens. An odd prompt leaves
+    // its last token to enter the loop as the first uncommitted input.
+    MaxPairPos := PromptLen - 2;      // last pair start (PromptLen >= 2)
+    if Odd(PromptLen) then Dec(MaxPairPos);
+    PairPos := 0;
+    PrevPairPos := -1;
+    while PairPos <= MaxPairPos do
+    begin
+      TrunkWindow(Tokens[PairPos], Tokens[PairPos + 1], PairPos);
+      // Keep the module's KV cache dense: row p reads (h_{p-1}, x_p), so the
+      // first token of this pair is only reachable once the PREVIOUS pair's
+      // trailing hidden state is known.
+      if PrevPairPos >= 0 then
+        RunMTPRow(Tokens[PairPos], PairPos, HPrev, {WantDraft=}false);
+      RunMTPRow(Tokens[PairPos + 1], PairPos + 1, HRow0, {WantDraft=}false);
+      HPrev.Copy(HRow1);
+      PrevPairPos := PairPos;
+      PairPos := PairPos + 2;
+    end;
+    if Odd(PromptLen) then
+    begin
+      // The trailing prompt token is committed but not yet consumed.
+      NextTok := Tokens[PromptLen - 1];
+      NextPos := PromptLen - 1;
+    end
+    else
+    begin
+      // Every prompt token is consumed; the last window's row 1 predicts the
+      // first new token.
+      NextTok := TrunkRow.GetClassOnPixel(1, 0);
+      NextPos := PromptLen;
+    end;
+    while NextPos < CapLen do
+    begin
+      // NextTok is committed (the trunk's own argmax over committed context,
+      // or a prompt token) but has not been consumed by the trunk yet.
+      Tokens[NextPos] := NextTok;
+      Inc(Stats.Generated);
+      if TokenIsEOS(NextTok, NoEOSTokens) then
+      begin
+        Inc(NextPos);
+        Break;
+      end;
+      // A window commits two tokens; without room for the second, stop here
+      // rather than run a window whose result cannot be stored.
+      if NextPos + 1 >= CapLen then
+      begin
+        Inc(NextPos);
+        Break;
+      end;
+      // DRAFT the token after NextTok from (h_{NextPos-1}, NextTok).
+      DraftTok := RunMTPRow(NextTok, NextPos, HPrev, {WantDraft=}pDraft);
+      if pDraft then Inc(Stats.Drafts);
+      // VERIFY: row 0 is the true successor of NextTok whatever the draft was.
+      if HasRecurrent then Trunk.MarkStateCheckpoint();
+      // Without a draft the window still needs two real tokens; token 0 is a
+      // placeholder that is always rerun below.
+      if not pDraft then DraftTok := Tokens[0];
+      TrunkWindow(NextTok, DraftTok, NextPos);
+      TrueTok := TrunkRow.GetClassOnPixel(0, 0);
+      Accepted := pDraft and (DraftTok = TrueTok);
+      if Accepted then Inc(Stats.Accepted)
+      else
+      begin
+        if pDraft then Inc(Stats.Rejected);
+        // The window's second row consumed a token the trunk did not choose.
+        // Attention K/V is positional, but a recurrent layer folded both rows
+        // into one summary, so the whole window is rerun - this time with the
+        // token the trunk itself named, which needs no verification.
+        if HasRecurrent then Trunk.RollbackToStateCheckpoint();
+        Trunk.TruncateTo(NextPos);
+        TrunkWindow(NextTok, TrueTok, NextPos);
+        Inc(Stats.Redos);
+      end;
+      BonusTok := TrunkRow.GetClassOnPixel(1, 0);
+      Tokens[NextPos + 1] := TrueTok;
+      Inc(Stats.Generated);
+      // The module row for the second committed token, so its cache stays
+      // dense; no draft is read from it.
+      RunMTPRow(TrueTok, NextPos + 1, HRow0, {WantDraft=}false);
+      HPrev.Copy(HRow1);
+      NextPos := NextPos + 2;
+      if TokenIsEOS(TrueTok, NoEOSTokens) then Break;
+      NextTok := BonusTok;
+    end;
+    if Stats.Drafts > 0 then
+      Stats.AcceptanceRate := Stats.Accepted / Stats.Drafts;
+    if Stats.TrunkForwards > 0 then
+      Stats.TokensPerTrunkForward := Stats.Generated / Stats.TrunkForwards;
+    Result := NextPos;
+  finally
+    HRow1.Free;
+    HRow0.Free;
+    HPrev.Free;
+    EmbRow.Free;
+    MTPIn.Free;
+    InV2.Free;
+  end;
 end;
 
 function DecodeEarlyExitSelfSpeculative(NN: TNNet; const Prompt: string;

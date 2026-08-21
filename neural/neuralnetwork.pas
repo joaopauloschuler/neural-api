@@ -7825,6 +7825,12 @@ type
     // Coded by Claude (AI).
     procedure ImportInt8QuantRow(RowIdx: integer; Src: TNNetVolume;
       SrcOffset: integer; pExtraScale: TNeuralFloat);
+    // Copies vocab row RowIdx into Dst (resized to (1,1,EmbeddingSize)),
+    // dequantizing when the table is int8 - a lookup WITHOUT a forward, for a
+    // caller that needs one token's embedding outside the layer's own Compute
+    // (speculative decode drafts the embedding of a token the network has not
+    // consumed yet). Coded by Claude (AI).
+    procedure CopyRowTo(RowIdx: integer; Dst: TNNetVolume);
     // Bytes held by the int8 container (codes + scales).
     // Coded by Claude (AI).
     function Int8QuantizedSizeBytes(): int64; virtual;
@@ -106350,6 +106356,23 @@ begin
     Inc(dstPos, RowStride);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetEmbedding.CopyRowTo(RowIdx: integer; Dst: TNNetVolume);
+begin
+  if (RowIdx < 0) or (RowIdx >= FVocabSize) then
+  begin
+    FErrorProc('TNNetEmbedding.CopyRowTo: token ' + IntToStr(RowIdx) +
+      ' is outside the vocab (' + IntToStr(FVocabSize) + ').');
+    exit;
+  end;
+  if (Dst.SizeX <> 1) or (Dst.SizeY <> 1) or (Dst.Depth <> FEmbeddingSize) then
+    Dst.ReSize(1, 1, FEmbeddingSize);
+  if FQuantInt8 then
+    FQuantTable.DequantizeRowTo(RowIdx, 0, Dst.GetRawPtr(0))
+  else
+    Move(FNeurons[0].Weights.GetRawPtr(RowIdx, 0)^, Dst.FData[0],
+      FEmbeddingSize * csNeuralFloatSize);
 end;
 
 procedure TNNetEmbedding.Backpropagate();

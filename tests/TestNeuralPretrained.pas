@@ -251,6 +251,8 @@ type
     procedure TestQwen35LogitParity;
     procedure TestQwen35StreamedDecodeParity;
     procedure TestQwen35MTPModuleParity;
+    procedure TestQwen35MTPSpeculativeDecodeMatchesGreedy;
+    procedure TestQwen35WindowedDecodeParity;
     procedure TestQwen35StreamedDecodeOpenCLParity;
     procedure TestQwen2StreamedDecodeOpenCLParity;
     procedure TestQwen35TurnBoundaryResumeParity;
@@ -8752,6 +8754,219 @@ end;
 // TNNetGatedDeltaNet recurrent state + RoPE PositionOffset) must reproduce
 // every position of the full-sequence forward. This pins the streaming path
 // the ChatTerminal decode driver uses. Coded by Claude (AI).
+// MTP self-speculative decoding must be EXACT: every token it commits is the
+// trunk's own greedy argmax over committed context, so drafting must not
+// change the output at all. The oracle is the SAME driver with pDraft=false
+// (drafts never trusted, one trunk forward per token) on the same width-2
+// session - NOT a width-1 greedy run, which is a numerically different path:
+// both track the full forward to within 2e-4 (TestQwen35WindowedDecodeParity)
+// but on this randomly-initialized pico fixture two logits can sit closer
+// than that, and the argmax then flips. Also pins the counter bookkeeping,
+// including the rerun window a rejected draft costs on this hybrid stack
+// (6 recurrent layers of 8 here; 48 of 64 in the real model).
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35MTPSpeculativeDecodeMatchesGreedy;
+const
+  PromptLen = 4;
+  MaxNewTokens = 8;
+  MaxTotalLen = 16;
+var
+  GreedyNet, SpecNet, MTPNet: TNNet;
+  ConfigGreedy, ConfigSpec: TLlamaConfig;
+  GreedyMTPNet: TNNet;
+  GreedySession, SpecSession, MTPSession: TNNetStreamingDecoder;
+  GreedyMTPSession: TNNetStreamingDecoder;
+  Stats, BaselineStats: TNNetMTPSpecStats;
+  BaselineEmb: TNNetLayer;
+  GreedyToks, SpecToks: TNeuralIntegerArray;
+  EmbLayer: TNNetLayer;
+  i, GreedyLen, SpecLen, PrefillWindows: integer;
+begin
+  RandSeed := 424242;
+  GreedyNet := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5_mtp.safetensors'), ConfigGreedy, {SeqLen=}2,
+    {pTrainable=}true, FixturePath('tiny_qwen3_5_mtp_config.json'));
+  SpecNet := nil;
+  MTPNet := nil;
+  GreedyMTPNet := nil;
+  GreedyMTPSession := nil;
+  GreedySession := nil;
+  SpecSession := nil;
+  MTPSession := nil;
+  try
+    SpecNet := BuildQwen35FromSafeTensorsEx(
+      FixturePath('tiny_qwen3_5_mtp.safetensors'), ConfigSpec, {SeqLen=}2,
+      {pTrainable=}true, FixturePath('tiny_qwen3_5_mtp_config.json'));
+    MTPNet := BuildQwen35MTPFromSafeTensors(
+      FixturePath('tiny_qwen3_5_mtp.safetensors'), ConfigSpec, {SeqLen=}1);
+    GreedyMTPNet := BuildQwen35MTPFromSafeTensors(
+      FixturePath('tiny_qwen3_5_mtp.safetensors'), ConfigSpec, {SeqLen=}1);
+    BaselineEmb := nil;
+    for i := 0 to GreedyNet.Layers.Count - 1 do
+      if GreedyNet.Layers[i].ClassType = TNNetEmbedding then
+        BaselineEmb := GreedyNet.Layers[i];
+    AssertTrue('baseline embedding layer found', BaselineEmb <> nil);
+    EmbLayer := nil;
+    for i := 0 to SpecNet.Layers.Count - 1 do
+      if SpecNet.Layers[i].ClassType = TNNetEmbedding then
+        EmbLayer := SpecNet.Layers[i];
+    AssertTrue('trunk embedding layer found', EmbLayer <> nil);
+
+    SetLength(GreedyToks, MaxTotalLen);
+    SetLength(SpecToks, MaxTotalLen);
+    for i := 0 to PromptLen - 1 do
+    begin
+      GreedyToks[i] := (5 * i + 2) mod ConfigGreedy.VocabSize;
+      SpecToks[i] := GreedyToks[i];
+    end;
+
+    // The prompt is prefilled in pairs; an odd prompt keeps its last token
+    // for the loop.
+    PrefillWindows := PromptLen div 2;
+    GreedySession := TNNetStreamingDecoder.Create(GreedyNet, MaxTotalLen);
+    GreedyMTPSession := TNNetStreamingDecoder.Create(GreedyMTPNet, MaxTotalLen);
+    GreedyLen := GenerateTokensMTPSpeculative(GreedySession, GreedyMTPSession,
+      TNNetEmbedding(BaselineEmb), GreedyToks, PromptLen, MaxNewTokens,
+      MaxTotalLen, BaselineStats, {pDraft=}false);
+    AssertEquals('the baseline never drafts', 0, BaselineStats.Drafts);
+    AssertEquals('the baseline commits one token per trunk forward',
+      BaselineStats.Generated, BaselineStats.TrunkForwards - PrefillWindows);
+
+    SpecSession := TNNetStreamingDecoder.Create(SpecNet, MaxTotalLen);
+    MTPSession := TNNetStreamingDecoder.Create(MTPNet, MaxTotalLen);
+    AssertTrue('trunk has recurrent layers', SpecSession.SSMCount > 0);
+    SpecLen := GenerateTokensMTPSpeculative(SpecSession, MTPSession,
+      TNNetEmbedding(EmbLayer), SpecToks, PromptLen, MaxNewTokens,
+      MaxTotalLen, Stats);
+
+    AssertEquals('speculative length equals the no-draft baseline',
+      GreedyLen, SpecLen);
+    for i := 0 to GreedyLen - 1 do
+      AssertEquals('token ' + IntToStr(i) + ' matches the no-draft baseline',
+        GreedyToks[i], SpecToks[i]);
+    AssertTrue('speculation is not slower than the baseline',
+      Stats.TrunkForwards <= BaselineStats.TrunkForwards);
+    // Counters: every verify window carries exactly one draft, and on this
+    // hybrid stack every rejected draft costs one width-1 redo.
+    // Both branches must be covered, or half the driver is untested: an
+    // accepted draft commits two tokens on one window, a rejected one reruns
+    // the window with the token the trunk named.
+    AssertTrue('drafts were accepted', Stats.Accepted > 0);
+    AssertTrue('drafts were rejected', Stats.Rejected > 0);
+    AssertEquals('accepted + rejected = drafts', Stats.Drafts,
+      Stats.Accepted + Stats.Rejected);
+    AssertEquals('one rerun window per rejected draft', Stats.Rejected,
+      Stats.Redos);
+    AssertEquals('one window per draft, two per rejected draft',
+      Stats.Drafts + Stats.Rejected, Stats.TrunkForwards - PrefillWindows);
+    AssertTrue('speculation beat the baseline on trunk forwards',
+      Stats.TrunkForwards < BaselineStats.TrunkForwards);
+    AssertEquals('generated tokens', SpecLen - PromptLen, Stats.Generated);
+    AssertEquals('acceptance rate', Stats.Accepted / Stats.Drafts,
+      Stats.AcceptanceRate, 1e-6);
+  finally
+    MTPSession.Free;
+    SpecSession.Free;
+    GreedyMTPSession.Free;
+    GreedySession.Free;
+    GreedyMTPNet.Free;
+    MTPNet.Free;
+    SpecNet.Free;
+    GreedyNet.Free;
+  end;
+end;
+
+// Width-2 WINDOWED cached decode must reproduce the full-sequence forward as
+// closely as width-1 streaming does: MTP self-speculative decoding verifies a
+// draft in a two-token window, so a window that drifts would flip an argmax
+// and silently change the decoded text. Compares both window widths against
+// the same full forward. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35WindowedDecodeParity;
+const
+  SeqLen = 16;
+var
+  Full, TwinW1, TwinW2: TNNet;
+  ConfigFull, Config1, Config2: TLlamaConfig;
+  Session1, Session2: TNNetStreamingDecoder;
+  FullIn, StepIn1, StepIn2, FullOut: TNNetVolume;
+  StepOut: TNNetVolume;
+  T, V, Vocab: integer;
+  Diff, MaxDiff1, MaxDiff2: double;
+begin
+  RandSeed := 424242;
+  Full := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5_mtp.safetensors'), ConfigFull, {SeqLen=}0,
+    {pTrainable=}true, FixturePath('tiny_qwen3_5_mtp_config.json'));
+  TwinW1 := nil;
+  TwinW2 := nil;
+  Session1 := nil;
+  Session2 := nil;
+  FullIn := TNNetVolume.Create(SeqLen, 1, 1);
+  StepIn1 := TNNetVolume.Create(1, 1, 1);
+  StepIn2 := TNNetVolume.Create(2, 1, 1);
+  FullOut := TNNetVolume.Create();
+  try
+    TwinW1 := BuildQwen35FromSafeTensorsEx(
+      FixturePath('tiny_qwen3_5_mtp.safetensors'), Config1, {SeqLen=}1,
+      {pTrainable=}true, FixturePath('tiny_qwen3_5_mtp_config.json'));
+    TwinW2 := BuildQwen35FromSafeTensorsEx(
+      FixturePath('tiny_qwen3_5_mtp.safetensors'), Config2, {SeqLen=}2,
+      {pTrainable=}true, FixturePath('tiny_qwen3_5_mtp_config.json'));
+    Vocab := ConfigFull.VocabSize;
+    for T := 0 to SeqLen - 1 do FullIn.FData[T] := (5 * T + 2) mod Vocab;
+    Full.Compute(FullIn);
+    Full.GetOutput(FullOut);
+    Session1 := TNNetStreamingDecoder.Create(TwinW1, SeqLen);
+    Session2 := TNNetStreamingDecoder.Create(TwinW2, SeqLen);
+    Session1.Reset();
+    Session2.Reset();
+    MaxDiff1 := 0;
+    MaxDiff2 := 0;
+    for T := 0 to SeqLen - 1 do
+    begin
+      StepIn1.FData[0] := FullIn.FData[T];
+      Session1.StepForward(StepIn1, T);
+      StepOut := Session1.Output();
+      for V := 0 to Vocab - 1 do
+      begin
+        Diff := Abs(FullOut.FData[T * Vocab + V] - StepOut.FData[V]);
+        if Diff > MaxDiff1 then MaxDiff1 := Diff;
+      end;
+    end;
+    T := 0;
+    while T < SeqLen do
+    begin
+      StepIn2.FData[0] := FullIn.FData[T];
+      StepIn2.FData[1] := FullIn.FData[T + 1];
+      Session2.StepForward(StepIn2, T);
+      StepOut := Session2.Output();
+      for V := 0 to Vocab - 1 do
+      begin
+        Diff := Abs(FullOut.FData[T * Vocab + V] - StepOut.FData[V]);
+        if Diff > MaxDiff2 then MaxDiff2 := Diff;
+        Diff := Abs(FullOut.FData[(T + 1) * Vocab + V] -
+          StepOut.FData[Vocab + V]);
+        if Diff > MaxDiff2 then MaxDiff2 := Diff;
+      end;
+      T := T + 2;
+    end;
+    AssertTrue('width-1 streamed vs full: max |diff| = ' +
+      FloatToStr(MaxDiff1) + ' must be < 2e-4', MaxDiff1 < 2e-4);
+    AssertTrue('width-2 windowed vs full: max |diff| = ' +
+      FloatToStr(MaxDiff2) + ' must be < 2e-4', MaxDiff2 < 2e-4);
+  finally
+    FullOut.Free;
+    StepIn2.Free;
+    StepIn1.Free;
+    FullIn.Free;
+    Session2.Free;
+    Session1.Free;
+    TwinW2.Free;
+    TwinW1.Free;
+    Full.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestQwen35StreamedDecodeParity;
 const
   SeqLen = 16;
