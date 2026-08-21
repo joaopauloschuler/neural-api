@@ -827,6 +827,11 @@ type
       // Makes Output host-readable and reports whether it is. Every reader of
       // Output calls this first. No-op in non-OpenCL builds.
       function ForceOutputOnRAM(): boolean;
+      // Declares the HOST copy of FOutput authoritative after the CALLER wrote
+      // it directly: ForceOutputOnRAM downloads but leaves the layer still
+      // advertising a resident buffer, which a consumer would bind instead -
+      // silently ignoring the write. No-op without OpenCL.
+      procedure MarkOutputWrittenOnRAM();
 
       property ActivationFn: TNeuralActivationFunction read FActivationFn write FActivationFn;
       property ActivationFnDerivative: TNeuralActivationFunction read FActivationFnDerivative write FActivationFnDerivative;
@@ -130501,6 +130506,14 @@ begin
   FHasOpenCL := true;
 end;
 {$ENDIF}
+
+procedure TNNetLayer.MarkOutputWrittenOnRAM();
+begin
+  {$IFDEF OpenCL}
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
+end;
 
 function TNNetLayer.ForceOutputOnRAM(): boolean;
 begin

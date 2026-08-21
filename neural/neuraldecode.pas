@@ -7339,6 +7339,11 @@ var
     for ChanCnt := 0 to HiddenSize - 1 do
       TrunkLayers.Layers[HeadInIdx].Output.FData[ChanCnt] :=
         MTPLayers.GetLastLayer().Output.FData[ChanCnt];
+    // The host just wrote the slot. Without this the LM head binds the buffer
+    // the last device forward left resident and drafts from the TRUNK's own
+    // hidden state instead of the module's - which costs no correctness (the
+    // draft is verified) but drives the acceptance rate to nothing.
+    TrunkLayers.Layers[HeadInIdx].MarkOutputWrittenOnRAM();
     for LayerCnt := HeadIdx to MaxTrunkLayerPos do
       TrunkLayers.Layers[LayerCnt].Compute();
     {$IFDEF OpenCL} TrunkLayers.GetLastLayer().ForceOutputOnRAM(); {$ENDIF}
@@ -7599,6 +7604,11 @@ begin
         {$ENDIF}
         ExitSnap.Copy(NN.Layers[ResolvedExit].Output);
         NN.Layers[HeadInIdx].Output.CopyNoChecks(ExitSnap);
+        // Same trap as the MTP splice: ForceOutputOnRAM downloads but leaves
+        // the slot advertising its resident buffer, so the head would bind the
+        // pre-splice copy and the "early exit" would read the full-depth
+        // hidden state.
+        NN.Layers[HeadInIdx].MarkOutputWrittenOnRAM();
         for I := HeadIdx to LastLayer do NN.Layers[I].Compute();
         {$IFDEF OpenCL} NN.GetLastLayer().ForceOutputOnRAM(); {$ENDIF}
         ExitOut := NN.GetLastLayer().Output;  // invariant across the scan (#8)
