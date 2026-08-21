@@ -152,6 +152,14 @@ type
                                  // (TNNet.MaxThreadNum); 0 = all CPU threads.
                                  // The pool is Min(MaxThreads, cpu count), and
                                  // per-layer chunk counts follow it
+    MTP: boolean;                // --mtp: Qwen3.5/3.8 multi-token-prediction
+                                 // self-speculative decoding (GREEDY ONLY,
+                                 // default off). Builds the trunk at input
+                                 // WIDTH 2 and loads the checkpoint's "mtp.*"
+                                 // module as a second net; LoadModel falls
+                                 // back to ordinary decoding, with a notice,
+                                 // whenever the checkpoint or the sampling
+                                 // settings cannot honour it
     NoFusedAttn: boolean;        // --no-fused-attn: build per-head attention
                                  // (SplitChannels/SDPA/DeepConcat) instead of
                                  // the fused TNNetFusedSDPA layer. Bit-identical
@@ -242,6 +250,19 @@ type
     LastCompletionTokens: integer;
     LastFinishReason: string;
     Loaded: boolean;
+    // --mtp: multi-token-prediction self-speculative decoding. MTPActive is
+    // the RESOLVED verdict - true only when LoadModel built the width-2 trunk
+    // AND the "mtp.*" module AND the run is greedy; every other case notices
+    // why and leaves the ordinary width-1 decode path in place. When it is
+    // true, GenerateFromIds routes through GenerateTokensMTPSpeculative, which
+    // resets both sessions per call: no turn-boundary cache reuse.
+    MTPActive: boolean;
+    MTPNet: TNNet;               // owned; the checkpoint's "mtp.*" module
+    MTPSession: TNNetStreamingDecoder; // owned; width-1 session over MTPNet
+    MTPEmbedding: TNNetEmbedding;      // the TRUNK's embedding layer, borrowed
+    LastMTPRan: boolean;         // last GenerateFromIds took the MTP path
+    LastMTPStats: TNNetMTPSpecStats;   // its counters (acceptance rate, tokens
+                                 // per trunk forward) - valid when LastMTPRan
     {$IFDEF OpenCL}
     GpuCL: TEasyOpenCL;          // platform/device handle for OpenCL offload
     {$ENDIF}
@@ -271,6 +292,10 @@ type
     function GenerateFromIds(const PromptIds: TNeuralIntegerArray;
       const GenOpt: TChatOptions): string;
   private
+    // The --mtp decode path: one reply through GenerateTokensMTPSpeculative.
+    // Greedy, non-streamed (the driver has no per-token callback).
+    function GenerateFromIdsMTP(const PromptIds: TNeuralIntegerArray;
+      const GenOpt: TChatOptions): string;
     procedure Notice(const S: string);
     procedure EmitToken(const S: string);
   end;
@@ -364,6 +389,17 @@ begin
   WriteLn('                        the machine is shared; ignored with --serial');
   WriteLn('  --no-fused-attn       build per-head attention instead of the fused');
   WriteLn('                        multi-head layer (bit-identical; performance A/B)');
+  WriteLn('  --mtp                 Qwen3.5/3.8 multi-token-prediction self-speculative');
+  WriteLn('                        decoding: the checkpoint''s own mtp.* module drafts');
+  WriteLn('                        the next token and a width-2 trunk window verifies');
+  WriteLn('                        it, so an accepted draft commits two tokens for one');
+  WriteLn('                        trunk forward. GREEDY ONLY - pass --greedy too, or');
+  WriteLn('                        the sampler wins and --mtp is ignored with a notice.');
+  WriteLn('                        Any checkpoint without an mtp.* module also falls');
+  WriteLn('                        back to ordinary decoding. --stats then reports the');
+  WriteLn('                        acceptance rate and tokens per trunk forward');
+  WriteLn('                        (default off)');
+  WriteLn('  --no-mtp              ordinary token-by-token decoding (DEFAULT)');
   WriteLn('  --selftest            run the offline unit checks and exit');
   WriteLn('  --help                this text');
 end;
@@ -404,6 +440,7 @@ begin
   Result.Serial := false; // parallel layer-graph forward by default (--serial)
   Result.MaxThreads := 0; // 0 = every CPU thread (--max-threads N caps it)
   Result.NoFusedAttn := false; // fused multi-head attention on by default
+  Result.MTP := false; // MTP self-speculative decoding off by default (--mtp)
   // OpenCL offload defaults ON when the binary is built with -dOpenCL (the
   // default compilation), OFF otherwise; --cpu forces CPU either way.
   Result.Gpu := {$IFDEF OpenCL}true{$ELSE}false{$ENDIF};
@@ -503,6 +540,8 @@ begin
       Opt.MaxThreads := IVal;
     end
     else if Arg = '--no-fused-attn' then Opt.NoFusedAttn := true
+    else if Arg = '--mtp' then Opt.MTP := true
+    else if Arg = '--no-mtp' then Opt.MTP := false
     else if Arg = '--gpu' then Opt.Gpu := true
     else if Arg = '--cpu' then Opt.Gpu := false
     else if Arg = '--gpu-platform' then
@@ -944,6 +983,11 @@ begin
   LastCompletionTokens := 0;
   LastFinishReason := '';
   Loaded := false;
+  MTPActive := false;
+  MTPNet := nil;
+  MTPSession := nil;
+  MTPEmbedding := nil;
+  LastMTPRan := false;
   {$IFDEF OpenCL}
   GpuCL := nil;
   {$ENDIF}
@@ -955,9 +999,11 @@ end;
 destructor TChatEngine.Destroy();
 begin
   FreeAndNil(TurnSnap); // owned deep copy of the session state; free it first
+  FreeAndNil(MTPSession); // before MTPNet.Free, as Session is before NN.Free
   FreeAndNil(Session); // before NN.Free: Destroy ends incremental decode on
                        // NN's layers
   FreeAndNil(Tokenizer);
+  FreeAndNil(MTPNet);
   FreeAndNil(NN);
   {$IFDEF OpenCL}
   FreeAndNil(GpuCL); // after NN.Free; nil when GPU was off or fell back to CPU
@@ -982,6 +1028,10 @@ var
   LoadStart: QWord;             // per-phase load wall clock (tokenizer,
                                 // checkpoint + caches, GPU weight upload)
   Cnt, LastIdx: integer;
+  TrunkWidth: integer;          // input width the trunk is BUILT at: 2 for
+                                // the --mtp verify window, 1 otherwise
+  MTPWeightsPath, MTPConfigPath, MTPModelType, SamplerDesc: string;
+  MTPConfig: TLlamaConfig;      // only read when --mtp is on
 begin
   Result := false;
   ErrorMsg := '';
@@ -1063,6 +1113,78 @@ begin
       [Opt.CtxLen]));
   end;
 
+  // Sampling defaults resolve HERE, before anything is built: --mtp needs to
+  // know whether this run samples (the speculative driver is greedy-only)
+  // before it can pick the trunk's input width. The notice they produce is
+  // printed further down, in load-report order.
+  GenCfg := ReadGenerationConfig(
+    IncludeTrailingPathDelimiter(Opt.ModelDir) + 'generation_config.json');
+  ApplySamplingDefaults(Opt, GenCfg);
+
+  // --mtp: Qwen3.5/3.8 multi-token-prediction self-speculative decoding. Every
+  // reason it cannot run is decided HERE, before the trunk is built, because
+  // GenerateTokensMTPSpeculative needs a WIDTH-2 trunk while the ordinary
+  // decode loop needs a width-1 one - the two cannot be swapped afterwards.
+  MTPActive := false;
+  TrunkWidth := 1;
+  if Opt.MTP then
+  begin
+    SamplerDesc := '';
+    if not Opt.Greedy then
+    begin
+      if Opt.TopK > 0 then SamplerDesc := Format('top-k %d', [Opt.TopK])
+      else if Opt.TopP > 0 then SamplerDesc := Format('top-p %.2f', [Opt.TopP])
+      else if Opt.MinP > 0 then SamplerDesc := Format('min-p %.2f', [Opt.MinP]);
+      if Opt.Temperature <> 1.0 then SamplerDesc := SamplerDesc +
+        Format(', temperature %.2f', [Opt.Temperature]);
+      if Opt.RepetitionPenalty <> 1.0 then SamplerDesc := SamplerDesc +
+        Format(', repetition-penalty %.2f', [Opt.RepetitionPenalty]);
+      if Opt.FrequencyPenalty <> 0 then SamplerDesc := SamplerDesc +
+        Format(', frequency-penalty %.2f', [Opt.FrequencyPenalty]);
+      if Opt.PresencePenalty <> 0 then SamplerDesc := SamplerDesc +
+        Format(', presence-penalty %.2f', [Opt.PresencePenalty]);
+      if (SamplerDesc <> '') and (SamplerDesc[1] = ',') then
+        SamplerDesc := Copy(SamplerDesc, 3, Length(SamplerDesc) - 2);
+    end;
+    MTPWeightsPath := '';
+    MTPConfigPath := '';
+    try
+      ResolvePretrainedPaths(Opt.ModelDir, MTPWeightsPath, MTPConfigPath);
+    except
+      on E: Exception do MTPWeightsPath := '';
+    end;
+    MTPModelType := '';
+    if MTPConfigPath <> '' then MTPModelType := ReadModelType(MTPConfigPath);
+    MTPConfig.MTPNumLayers := 0;
+    if (MTPModelType = 'qwen3_5') or (MTPModelType = 'qwen3_5_moe') then
+      try
+        MTPConfig := ReadLlamaConfigFromJSONFile(MTPConfigPath);
+      except
+        on E: Exception do MTPConfig.MTPNumLayers := 0;
+      end;
+    if SamplerDesc <> '' then
+      Notice('[--mtp ignored: speculative decoding is greedy-only and this' +
+        ' run samples (' + SamplerDesc + ') - pass --greedy to use --mtp;' +
+        ' decoding normally]')
+    else if MTPWeightsPath = '' then
+      Notice('[--mtp ignored: no checkpoint weights file found under ' +
+        Opt.ModelDir + ' - decoding normally]')
+    else if (MTPModelType <> 'qwen3_5') and (MTPModelType <> 'qwen3_5_moe') then
+      Notice('[--mtp ignored: multi-token prediction is a Qwen3.5/3.8' +
+        ' feature and this checkpoint is model_type "' + MTPModelType +
+        '" - decoding normally]')
+    else if (LowerCase(ExtractFileExt(MTPWeightsPath)) <> '.safetensors') and
+      (LowerCase(ExtractFileName(MTPWeightsPath)) <>
+        'model.safetensors.index.json') then
+      Notice('[--mtp ignored: the mtp.* module is read from the' +
+        ' checkpoint''s safetensors, and this checkpoint loads from ' +
+        ExtractFileName(MTPWeightsPath) + ' - decoding normally]')
+    else if MTPConfig.MTPNumLayers < 1 then
+      Notice('[--mtp ignored: config.json declares no mtp_num_hidden_layers,' +
+        ' so this checkpoint ships no MTP module - decoding normally]')
+    else TrunkWidth := 2; // the verify window; the module is built below
+  end;
+
   {$IFDEF OpenCL}
   GpuCL := nil;
   if Opt.Gpu and Opt.LowMemory then
@@ -1102,7 +1224,7 @@ begin
   // Built at INPUT WIDTH 1 (pSeqLen=1): streamed decode feeds one token per
   // forward and the KV cache (budget = CtxLen, set on the session below) holds
   // the context. SeqLen is the cache budget, NOT the built input width.
-  NN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}1,
+  NN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}TrunkWidth,
     {pTrainable=}false, '', {pQuantizeInt8=}Opt.Int8);
   NeuralAllowFusedAttention := true; // restore the global default post-build
   // Low-memory forward path, set independently of trainability. The importer
@@ -1115,6 +1237,61 @@ begin
     NN.Layers[Cnt].FlushWeightCache();
   Notice(Format('Model loaded in %.1fs.',
     [(GetTickCount64() - LoadStart) / 1000]));
+
+  // The MTP module itself: ONE Qwen3.5 block plus its two pre-fc norms and the
+  // fc projection, read from the same weights file. It owns neither the
+  // embedding table nor the LM head, so the driver borrows the trunk's
+  // TNNetEmbedding and splices the module's output through the trunk's head.
+  if TrunkWidth = 2 then
+  begin
+    LoadStart := GetTickCount64();
+    try
+      MTPNet := BuildQwen35MTPFromSafeTensors(MTPWeightsPath, MTPConfig,
+        {pSeqLen=}1, {pTrainable=}false, {pQuantizeInt8=}Opt.Int8);
+    except
+      on E: Exception do
+      begin
+        FreeAndNil(MTPNet);
+        Notice('[--mtp ignored: the mtp.* module failed to import (' +
+          E.Message + ') - decoding normally]');
+      end;
+    end;
+    if Assigned(MTPNet) then
+    begin
+      MTPNet.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
+      LastIdx := MTPNet.GetLastLayerIdx();
+      for Cnt := 0 to LastIdx do MTPNet.Layers[Cnt].FlushWeightCache();
+      MTPEmbedding := nil;
+      LastIdx := NN.GetLastLayerIdx();
+      for Cnt := 0 to LastIdx do
+        if NN.Layers[Cnt] is TNNetEmbedding then
+          MTPEmbedding := TNNetEmbedding(NN.Layers[Cnt]);
+      if MTPEmbedding = nil then
+      begin
+        FreeAndNil(MTPNet);
+        Notice('[--mtp ignored: the trunk has no embedding layer to embed a' +
+          ' drafted token - decoding normally]');
+      end
+      else
+        Notice(Format('MTP module loaded in %.1fs.',
+          [(GetTickCount64() - LoadStart) / 1000]));
+    end;
+    // The trunk was built at width 2 for the driver. Without the module the
+    // only decode path left is the width-1 loop, and TNNet.Compute refuses a
+    // size mismatch, so the trunk has to be rebuilt at width 1.
+    if not Assigned(MTPNet) then
+    begin
+      Notice('[--mtp: rebuilding the trunk at input width 1 for ordinary' +
+        ' decoding]');
+      FreeAndNil(NN);
+      NN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}1,
+        {pTrainable=}false, '', {pQuantizeInt8=}Opt.Int8);
+      NN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
+      LastIdx := NN.GetLastLayerIdx();
+      for Cnt := 0 to LastIdx do NN.Layers[Cnt].FlushWeightCache();
+    end
+    else MTPActive := true;
+  end;
 
   {$IFDEF OpenCL}
   // OpenCL offload of the conv/linear matmuls. Enabling it rebuilds each
@@ -1155,6 +1332,9 @@ begin
         LoadStart := GetTickCount64();
         NN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
           GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
+        if MTPActive then
+          MTPNet.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
+            GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
         Notice(Format('GPU weights uploaded in %.1fs.',
           [(GetTickCount64() - LoadStart) / 1000]));
       end;
@@ -1169,6 +1349,8 @@ begin
   // keep the pages). Reset and cache-reuse truncation keep the int8 mode
   // (they only rewind the cache length).
   Session := TNNetStreamingDecoder.Create(NN, SeqLen, Opt.KVInt8);
+  if MTPActive then
+    MTPSession := TNNetStreamingDecoder.Create(MTPNet, SeqLen, Opt.KVInt8);
   if Opt.KVInt8 then
     Notice('[int8 KV cache (default with int8 weights) - ~1/4 the KV RAM, ' +
       'logits not bit-exact; --kv-fp32 opts out]');
@@ -1187,6 +1369,11 @@ begin
   // policy: ~50% of the pool hot, worker 0 always) so each token's parallel
   // forward reaches the workers without re-warming the pool every step.
   if Session.Parallel then NN.StartThreadWorkers();
+  if MTPActive then
+  begin
+    MTPSession.Parallel := Session.Parallel;
+    if MTPSession.Parallel then MTPNet.StartThreadWorkers();
+  end;
   // KV-cache reuse across turns needs position-truncatable attention K/V and no
   // recurrent (SSM) state to rewind. Pure-attention nets qualify; NoCacheReuse
   // forces the full re-prefill at the call site.
@@ -1199,6 +1386,17 @@ begin
   // code/scale planes for a layer running it, so reuse does not depend on the
   // cache mode.
   StateReuseOK := Session.SSMCount > 0;
+  // GenerateTokensMTPSpeculative resets BOTH sessions at the start of every
+  // call, so neither a cached prefix nor a snapshot survives a turn boundary.
+  // Two sessions that must stay in step across turns is more machinery than a
+  // first --mtp is worth, so the flag takes the simple correct route: a full
+  // re-prefill per turn. Turning the engine's own reuse off here keeps
+  // CachedTokens/TurnSnap from claiming a reuse that never happens.
+  if MTPActive then
+  begin
+    ReuseOK := false;
+    StateReuseOK := false;
+  end;
   FreeAndNil(TurnSnap);
   TurnSnapPos := 0;
   SetLength(CachedTokens, 0);
@@ -1220,7 +1418,12 @@ begin
     Notice('[reasoning effort ' + ReasoningEffortName(Opt.ReasoningEffort) +
       ' ignored - ' + BoolToStr(RawMode, 'raw mode',
       ChatFormatName(ChatFormat)) + ' has no reasoning control]');
-  if Opt.NoCacheReuse then
+  if MTPActive then
+    Notice('[--mtp ON - the mtp.* module drafts and a width-2 trunk window' +
+      ' verifies; greedy and exact; no cache reuse across turns (the driver' +
+      ' resets both sessions, so every turn re-prefills in full); --stats' +
+      ' reports the acceptance rate and tokens per trunk forward]')
+  else if Opt.NoCacheReuse then
     Notice('[KV-cache reuse OFF (--no-cache-reuse) - full re-prefill each turn]')
   else if ReuseOK then
     Notice('[KV-cache reuse ON - only the new prompt tail is prefilled each turn]')
@@ -1240,12 +1443,10 @@ begin
         [Opt.MaxThreads, Opt.MaxThreads]));
   end;
 
-  // Sampling defaults: explicit flag > the model's generation_config.json >
-  // built-in fallback (top-p 0.2 + repetition-penalty 1.05); --greedy
-  // overrides everything (deterministic argmax, the CPU/GPU parity mode).
-  GenCfg := ReadGenerationConfig(
-    IncludeTrailingPathDelimiter(Opt.ModelDir) + 'generation_config.json');
-  ApplySamplingDefaults(Opt, GenCfg);
+  // Sampling report (the defaults themselves were resolved before the build):
+  // explicit flag > the model's generation_config.json > built-in fallback
+  // (top-p 0.2 + repetition-penalty 1.05); --greedy overrides everything
+  // (deterministic argmax, the CPU/GPU parity mode).
   if Opt.Greedy then
     Notice('[sampling: greedy argmax (--greedy) - deterministic]')
   else
@@ -1315,6 +1516,119 @@ end;
 //     added since. Requires this prompt to extend the snapshot's sequence;
 //     a divergent prompt falls back to a full reset.
 // NoCacheReuse disables both: full reset, whole prompt re-prefilled.
+function TChatEngine.GenerateFromIdsMTP(const PromptIds: TNeuralIntegerArray;
+  const GenOpt: TChatOptions): string;
+var
+  Tokens, Generated: TNeuralIntegerArray;
+  PromptLen, TotalLen, Produced, GenCount, MarkerLen, Cnt: integer;
+  TStart, TEnd: QWord;
+  DecodeSecs: double;
+begin
+  Result := '';
+  PromptLen := Length(PromptIds);
+  // The driver prefills in PAIRS and its first draft needs a hidden state
+  // from a completed window, so a one-token prompt has nothing to start from.
+  if PromptLen < 2 then
+  begin
+    Notice('[--mtp: the speculative driver needs at least 2 prompt tokens -' +
+      ' nothing to decode]');
+    exit;
+  end;
+  // Sampling parameters can still arrive PER CALL (a server overlaying request
+  // parameters on the launch defaults). This session's trunk is built at
+  // width 2, so the ordinary sampled loop is not available to fall back to -
+  // say so rather than sample silently.
+  if (not GenOpt.Greedy) and ((GenOpt.TopK > 0) or (GenOpt.TopP > 0) or
+    (GenOpt.MinP > 0) or (GenOpt.Temperature <> 1.0) or
+    (GenOpt.RepetitionPenalty <> 1.0) or (GenOpt.FrequencyPenalty <> 0) or
+    (GenOpt.PresencePenalty <> 0)) then
+    Notice('[--mtp: the trunk of this session is built at width 2 for greedy' +
+      ' speculative decoding, so the per-request sampling parameters cannot' +
+      ' be honoured - decoding greedily]');
+  SetLength(Tokens, SeqLen);
+  Move(PromptIds[0], Tokens[0], PromptLen * csIntegerSize);
+  // No cache reuse across turns: the driver resets both sessions itself, so
+  // whatever they held is gone the moment it starts.
+  SetLength(CachedTokens, 0);
+  FreeAndNil(TurnSnap);
+  TurnSnapPos := 0;
+  TStart := GetTickCount64();
+  try
+    TotalLen := GenerateTokensMTPSpeculative(Session, MTPSession,
+      MTPEmbedding, Tokens, PromptLen, GenOpt.MaxNewTokens, SeqLen,
+      LastMTPStats);
+  except
+    Session.Reset();
+    MTPSession.Reset();
+    raise;
+  end;
+  TEnd := GetTickCount64();
+  LastMTPRan := true;
+  Produced := TotalLen - PromptLen;
+  SetLength(Generated, Produced);
+  if Produced > 0 then
+    Move(Tokens[PromptLen], Generated[0], Produced * csIntegerSize);
+  // Stop-token trimming happens HERE, after the fact. The driver's own EOS
+  // rule is "token id < 2", which no Qwen end-of-turn id satisfies, and it
+  // knows nothing about the chat format's marker - so it always decodes the
+  // whole --max-new-tokens budget and the reply is cut at the first EOS id or
+  // marker match.
+  MarkerLen := Length(MarkerIds);
+  GenCount := Produced;
+  for Cnt := 1 to Produced do
+  begin
+    if (Tokenizer.EosId >= 0) and (Generated[Cnt - 1] = Tokenizer.EosId) then
+    begin
+      GenCount := Cnt - 1;
+      LastFinishReason := 'stop';
+      break;
+    end;
+    if TailMatches(Generated, Cnt, MarkerIds) then
+    begin
+      GenCount := Cnt - MarkerLen;
+      LastFinishReason := 'stop';
+      break;
+    end;
+  end;
+  LastCompletionTokens := GenCount;
+  Result := Tokenizer.DecodeCount(Generated, GenCount,
+    {SkipSpecialTokens=}true);
+  // One emission, not a stream: GenerateTokensMTPSpeculative has no per-token
+  // callback, so the whole reply reaches OnToken at once.
+  if Result <> '' then EmitToken(Result);
+  if Assigned(OnReplyDone) then OnReplyDone();
+  if GenOpt.Stats and (GenCount > 0) then
+  begin
+    DecodeSecs := (TEnd - TStart) / 1000.0;
+    Write(StdErr, Format('[stats] %d tokens, wall %d ms, prompt %d' +
+      ' (--mtp: emitted at once, so no TTFT)',
+      [GenCount, TEnd - TStart, PromptLen]));
+    if DecodeSecs > 0 then
+      Write(StdErr, Format(', %.1f tok/s', [Produced / DecodeSecs]));
+    WriteLn(StdErr);
+    // The two numbers that decide whether --mtp pays on this machine:
+    // acceptance rate and tokens committed per trunk forward (1.0 = no gain,
+    // 2.0 = every draft accepted).
+    WriteLn(StdErr, Format('[stats] mtp acceptance %.3f, %.2f tokens per' +
+      ' trunk forward (drafts %d, accepted %d, rejected %d, redos %d,' +
+      ' trunk forwards %d, generated %d)',
+      [LastMTPStats.AcceptanceRate, LastMTPStats.TokensPerTrunkForward,
+       LastMTPStats.Drafts, LastMTPStats.Accepted, LastMTPStats.Rejected,
+       LastMTPStats.Redos, LastMTPStats.TrunkForwards,
+       LastMTPStats.Generated]));
+    Flush(StdErr);
+  end;
+  // --profile: unlike the ordinary path this report INCLUDES the prefill, as
+  // the driver prefills inside the same call.
+  if GenOpt.Profile and (Produced > 0) then
+  begin
+    WriteLn(StdErr);
+    Write(StdErr, TNNet.LayerClassTimingReport(NN));
+    WriteLn(StdErr, '[sched] ', NN.SchedulerStatsReport());
+    Flush(StdErr);
+  end;
+end;
+
 function TChatEngine.GenerateFromIds(const PromptIds: TNeuralIntegerArray;
   const GenOpt: TChatOptions): string;
 var
@@ -1349,6 +1663,7 @@ begin
   LastPromptTokens := Length(PromptIds);
   LastCompletionTokens := 0;
   LastFinishReason := 'length';
+  LastMTPRan := false;
   Len := Length(PromptIds);
   // An empty prompt has no last token to feed as the first decode step's
   // input (a BOS-less tokenizer encodes '' to zero ids): decoding cannot
@@ -1366,6 +1681,7 @@ begin
       ' conversation or rebuild with a larger --ctx]', [Len, SeqLen]));
     exit;
   end;
+  if MTPActive then exit(GenerateFromIdsMTP(PromptIds, GenOpt));
   CacheReuse := ReuseOK and not GenOpt.NoCacheReuse;
   // The snapshot route needs a snapshot in hand; --no-cache-reuse disables
   // both routes.

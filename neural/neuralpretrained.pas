@@ -12279,6 +12279,12 @@ function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
 // (SeqLen,1,num_labels) class logits (row 0 / last non-pad row, see the
 // SEQUENCE CLASSIFICATION IMPORT section); the LM/encoder stays the
 // default for every other architectures value.
+// Resolves a checkpoint path - a HuggingFace directory or a single weights
+// file - to the weights file and the config.json BuildFromPretrained would
+// use. Raises ImportError when neither exists.
+procedure ResolvePretrainedPaths(const Path: string;
+  out WeightsPath, ConfigPath: string);
+
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
@@ -79974,6 +79980,36 @@ begin
   end;
 end;
 
+procedure ResolvePretrainedPaths(const Path: string;
+  out WeightsPath, ConfigPath: string);
+begin
+  if DirectoryExists(Path) then
+  begin
+    ConfigPath := IncludeTrailingPathDelimiter(Path) + 'config.json';
+    WeightsPath := IncludeTrailingPathDelimiter(Path) +
+      'model.safetensors.index.json';
+    if not FileExists(WeightsPath) then
+      WeightsPath := IncludeTrailingPathDelimiter(Path) + 'model.safetensors';
+    if not FileExists(WeightsPath) then
+      WeightsPath := IncludeTrailingPathDelimiter(Path) +
+        'pytorch_model.bin'; // torch.save fallback (TNNetTorchBinReader)
+    if not FileExists(WeightsPath) then
+      WeightsPath := IncludeTrailingPathDelimiter(Path) +
+        'pytorch_model.bin.index.json'; // sharded torch.save fallback
+    if not FileExists(WeightsPath) then
+      ImportError('BuildFromPretrained: none of "model.safetensors", ' +
+        '"model.safetensors.index.json", "pytorch_model.bin" or ' +
+        '"pytorch_model.bin.index.json" found in directory ' + Path + '.');
+  end
+  else if FileExists(Path) then
+  begin
+    WeightsPath := Path;
+    ConfigPath := ExtractFilePath(Path) + 'config.json';
+  end
+  else
+    ImportError('BuildFromPretrained: path not found: ' + Path);
+end;
+
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pTrainable: boolean = true;
   const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
@@ -80009,32 +80045,7 @@ var
   IgnoredDeepSeekV2Config: TDeepSeekV2Config;
   IgnoredWav2Vec2Config: TWav2Vec2Config;
 begin
-  // ---- resolve the weights file and the config.json ----
-  if DirectoryExists(Path) then
-  begin
-    ConfigPath := IncludeTrailingPathDelimiter(Path) + 'config.json';
-    WeightsPath := IncludeTrailingPathDelimiter(Path) +
-      'model.safetensors.index.json';
-    if not FileExists(WeightsPath) then
-      WeightsPath := IncludeTrailingPathDelimiter(Path) + 'model.safetensors';
-    if not FileExists(WeightsPath) then
-      WeightsPath := IncludeTrailingPathDelimiter(Path) +
-        'pytorch_model.bin'; // torch.save fallback (TNNetTorchBinReader)
-    if not FileExists(WeightsPath) then
-      WeightsPath := IncludeTrailingPathDelimiter(Path) +
-        'pytorch_model.bin.index.json'; // sharded torch.save fallback
-    if not FileExists(WeightsPath) then
-      ImportError('BuildFromPretrained: none of "model.safetensors", ' +
-        '"model.safetensors.index.json", "pytorch_model.bin" or ' +
-        '"pytorch_model.bin.index.json" found in directory ' + Path + '.');
-  end
-  else if FileExists(Path) then
-  begin
-    WeightsPath := Path;
-    ConfigPath := ExtractFilePath(Path) + 'config.json';
-  end
-  else
-    ImportError('BuildFromPretrained: path not found: ' + Path);
+  ResolvePretrainedPaths(Path, WeightsPath, ConfigPath);
   if ConfigFileName <> '' then ConfigPath := ConfigFileName;
   if not FileExists(ConfigPath) then
     ImportError('BuildFromPretrained: config file not found: ' + ConfigPath);

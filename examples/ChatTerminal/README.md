@@ -31,6 +31,7 @@ These models have been run/verified through this REPL:
 | Qwen/Qwen3-0.6B | qwen3 |
 | Qwen/Qwen3-30B-A3B-Thinking-2507 | qwen3_moe |
 | Qwen/Qwen3.6-27B | qwen3_5 |
+| Qwen/Qwen3.8-27B | qwen3_5 |
 | TinyLlama/TinyLlama-1.1B-Chat-v1.0 | llama |
 | mistralai/Mistral-7B-Instruct-v0.3 | mistral |
 | HuggingFaceTB/SmolLM2-1.7B-Instruct | llama |
@@ -133,6 +134,8 @@ draws uniformly. `--greedy` hard-overrides everything.
 | `--no-gpu-shared-kernel` | give every layer its own OpenCL kernel handles and command queue instead of the net-wide shared ones (see below) | shared on |
 | `--stats` | per-turn timing to **stderr**: TTFT (prefill + first token), steady-state decode tok/s, and `prompt N (reused K)` from the KV-cache reuse | off |
 | `--profile` | per-layer-class forward timing to **stderr** after each turn (decode steps only — prefill is excluded), plus a `[sched]` line with the layer-graph scheduler stats (graph width, parallel vs serial passes, peak in-flight) | off |
+| `--mtp` | Qwen3.5/3.8 **multi-token-prediction self-speculative decoding**: the checkpoint's own `mtp.*` module drafts the next token and a width-2 trunk window verifies it, so an accepted draft commits two tokens for one trunk forward. **Greedy only** — pass `--greedy` too. See below | off |
+| `--no-mtp` | ordinary token-by-token decoding | **on** |
 | `--no-cache-reuse` | re-prefill the whole prompt every turn instead of reusing the shared KV-cache prefix (A/B + debugging) | reuse on |
 | `--serial` | classic in-order serial layer loop, fully single-threaded, instead of the layer-graph parallel forward that also threads large conv/linear layers internally (see below) | parallel on |
 | `--max-threads N` | cap the parallel forward at N worker threads (the pool becomes `Min(N, cpu threads)`, and per-layer chunk counts follow it); ignored with `--serial` | all CPU threads |
@@ -259,6 +262,42 @@ state cannot be truncated by position, so those fall back to a full
 re-prefill each turn. `--no-cache-reuse` forces the full re-prefill (use
 `--stats` to compare: watch `prompt N (reused K)` and TTFT).
 
+**`--mtp` — multi-token-prediction self-speculative decoding (Qwen3.5/3.8).**
+Qwen3.5 and Qwen3.8 checkpoints ship an extra one-block module under the
+`mtp.*` tensor prefix that predicts the token at *t+2* from the trunk's hidden
+state at *t* and the embedding of the committed token at *t+1*. With `--mtp`
+the engine loads that module as a second net and decodes through
+`GenerateTokensMTPSpeculative`: the module drafts, and a **width-2** trunk
+window verifies the draft and produces the next token in the same forward, so
+an accepted draft commits two tokens for one trunk forward. It is exact — every
+committed token is the trunk's own argmax over fully committed context — and
+the payoff is `2/(2-a)` tokens per trunk forward at acceptance rate `a`, 1.0 at
+the worst case and 2.0 at the best. `--stats` prints the measured acceptance
+rate and tokens per trunk forward, which is how you decide whether it pays on
+your GPU.
+
+The flag is **off by default** and it never fails a chat: whenever it cannot be
+honoured the engine prints a one-line notice and decodes normally. The reasons
+are a non-Qwen3.5 checkpoint, a `config.json` with no `mtp_num_hidden_layers`,
+a weights file that is not safetensors, an `mtp.*` import error, and — the one
+that hits by default — **sampling**. The driver is greedy only, and
+ChatTerminal's sampling defaults (top-p 0.2 + repetition-penalty 1.05) count as
+sampling, so `--mtp` on its own is ignored with a notice. Use it as:
+
+```
+$ ChatTerminal qwen3.8-27b/ --gpu --greedy --mtp --stats -p "Explain RoPE."
+```
+
+Two limits worth knowing before you measure. First, there is **no cache reuse
+across turns** under `--mtp`: the driver resets both sessions on every call, so
+each turn re-prefills the whole transcript. Second, the driver stops only on
+token ids below 2, so it always decodes the full `--max-new-tokens` budget and
+the reply is trimmed at the first EOS / end-of-turn token afterwards — keep
+`--max-new-tokens` small (e.g. 128) or every turn costs the whole budget.
+Extra memory while it is on: the trunk is built at input width 2 (the layer
+activations double; weights and KV cache are unchanged) plus one transformer
+block for the module and its own small KV cache.
+
 **`-p "prompt"` — one-shot mode.** With `-p` the program answers that single
 prompt and exits instead of opening the REPL: stdin is never read, so it
 composes with scripts, pipes and benchmark harnesses. The reply streams to
@@ -362,7 +401,7 @@ parameter-overlay checks.
 
 ## Testing
 
-`--selftest` runs 93 offline checks (argument parsing, prompt assembly
+`--selftest` runs 105 offline checks (argument parsing, prompt assembly
 against the byte-exact ChatML render, end-of-turn markers, REPL command
 parsing, the KV-cache-reuse prefix diff) without needing any model files. For an end-to-end plumbing check,
 any directory with a pico-sized random checkpoint plus a tokenizer works —

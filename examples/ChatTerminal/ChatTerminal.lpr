@@ -339,6 +339,35 @@ begin
     Check(ParseArgs(Args, Opt) and Opt.KVInt8,
       'explicit --kv-int8 beats the --fp32 default in any order (2)');
 
+    // MTP self-speculative decoding is off by default; --mtp turns it on and
+    // --no-mtp turns it back off, last flag wins.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and not Opt.MTP, 'mtp off by default');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--mtp');
+    Check(ParseArgs(Args, Opt) and Opt.MTP, '--mtp enables MTP decoding');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--no-mtp');
+    Check(ParseArgs(Args, Opt) and not Opt.MTP, '--no-mtp keeps it off');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--mtp'); Args.Add('--no-mtp');
+    Check(ParseArgs(Args, Opt) and not Opt.MTP, '--no-mtp wins when it is last');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--no-mtp'); Args.Add('--mtp');
+    Check(ParseArgs(Args, Opt) and Opt.MTP, '--mtp wins when it is last');
+    // --mtp is orthogonal to --greedy at PARSE time; LoadModel is where the
+    // greedy-only requirement is enforced.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--mtp'); Args.Add('--greedy');
+    Check(ParseArgs(Args, Opt) and Opt.MTP and Opt.Greedy,
+      '--mtp and --greedy combine');
+
     // OpenCL offload: --gpu/--cpu toggle, platform/device indices parse.
     // (The default depends on the -dOpenCL build define, so only toggles are
     // asserted here.)
