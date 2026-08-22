@@ -761,6 +761,10 @@ type
       // define rather than adding a third build flavour; -dNOF16C forces the
       // scalar path for anyone who needs it. Coded by Claude (AI).
       class procedure DecodeF16(pDst: TNeuralFloatArrPtr; pSrc: TNeuralHalfArrPtr; N: integer); static;
+      // Narrows N singles to IEEE-754 halves, round-to-nearest-even, saturating
+      // to +/-Inf. Bit-exact across builds; AVX2/64-bit builds convert 8 per
+      // iteration through F16C's vcvtps2ph. Coded by Claude (AI).
+      class procedure EncodeF16(pDst: TNeuralHalfArrPtr; pSrc: TNeuralFloatArrPtr; N: integer); static;
       // Erf writes dst[0..N-1] := erf(src[0..N-1]) using the Abramowitz &
       // Stegun 7.1.26 approximation (|err| < 1.5e-7, i.e. matches pcr_erff to
       // ~1e-6). Built on Exp so it inherits the AVX2 path. dst may alias src.
@@ -1769,6 +1773,64 @@ begin
   end;
 end;
 
+// Scalar single -> IEEE-754 half, round-to-nearest-even, saturating to +/-Inf
+// on overflow. Pure bit surgery, so nothing here can trap. Used by EncodeF16's
+// non-F16C build and by the AVX tail, and written to agree with vcvtps2ph
+// bit-for-bit on every input, NaN payloads and subnormal ties included.
+// Coded by Claude (AI).
+function NeuralSingleToHalf(Value: Single): Word;
+var
+  Bits, Sign, Mantissa, Half, Dropped, Halfway: Cardinal;
+  Exponent, E, Shift: integer;
+begin
+  Bits := PCardinal(@Value)^;
+  Sign := (Bits shr 16) and $8000;
+  Exponent := integer((Bits shr 23) and $FF);
+  Mantissa := Bits and $7FFFFF;
+  if Exponent = $FF then
+  begin
+    if Mantissa <> 0 then
+      // NaN: vcvtps2ph keeps the top 10 payload bits and forces the quiet bit,
+      // so a signalling NaN narrows to the quiet NaN of the same payload.
+      Result := Word(Sign or $7C00 or $0200 or (Mantissa shr 13))
+    else
+      Result := Word(Sign or $7C00);
+    exit;
+  end;
+  E := Exponent - 127 + 15; // rebias 127 -> 15
+  if E >= $1F then
+  begin
+    Result := Word(Sign or $7C00); // past the half range -> Inf
+    exit;
+  end;
+  if E > 0 then
+  begin
+    // Normal half: the 10-bit mantissa is the top 10 of the 23-bit mantissa.
+    Half := (Cardinal(E) shl 10) or (Mantissa shr 13);
+    Dropped := Mantissa and $1FFF;
+    if (Dropped > $1000) or ((Dropped = $1000) and ((Half and 1) = 1)) then
+      Inc(Half); // may carry into the exponent, which is the correct result
+    Result := Word(Sign or Half);
+    exit;
+  end;
+  if E < -10 then
+  begin
+    // Below half the smallest subnormal (2^-25), so nearest-even gives zero.
+    Result := Word(Sign);
+    exit;
+  end;
+  // Subnormal half: restore the implicit leading 1 and shift the 24-bit
+  // significand down into the fixed 2^-24 grid, rounding to nearest even.
+  Shift := 14 - E;
+  Mantissa := Mantissa or $800000;
+  Half := Mantissa shr Shift;
+  Halfway := Cardinal(1) shl (Shift - 1);
+  Dropped := Mantissa and ((Cardinal(1) shl Shift) - 1);
+  if (Dropped > Halfway) or ((Dropped = Halfway) and ((Half and 1) = 1)) then
+    Inc(Half); // may carry up to the smallest normal half, $0400
+  Result := Word(Sign or Half);
+end;
+
 {$IFDEF AVX64}
 {$IFDEF AVX2}
 // Fused int8 x float32 dot product (raw code sum, no scale): sign-extends 8
@@ -2586,6 +2648,64 @@ begin
   NumElementsM1 := NumElements - 1;
   for i := localNumElements to NumElementsM1 do
     PtrDst^[i] := NeuralHalfToSingle(PtrSrc^[i]);
+end;
+
+// dst[i] := half(src[i]), 8 per iteration through F16C's vcvtps2ph with imm8=0
+// (round-to-nearest-even, the mode NeuralSingleToHalf implements).
+//
+// The loop runs with every SSE exception MASKED and the caller's MXCSR
+// restored afterwards. FPC leaves overflow and invalid-operation unmasked, and
+// unlike the widening vcvtph2ps this conversion narrows: any |value| past
+// 65519.99 raises #O and any signalling NaN raises #I, so an unmasked loop
+// would crash on data the scalar path encodes happily. Masked, the hardware
+// gives exactly the saturating-to-Inf, NaN-quieting result the scalar tail
+// produces. The dropped-precision (#P) and underflow (#U) flags fire on almost
+// every real tensor and are masked by FPC already.
+//
+// The conversion is emitted as raw bytes because FPC 3.2.2's assembler has no
+// F16C mnemonics (see AVXDecodeF16). The six bytes are
+// "vcvtps2ph xmm0, ymm0, 0" = VEX.256.66.0F3A.W0 1D /r ib:
+//   C4 E3 7D   3-byte VEX - R/X/B all unset, mmmmm=0F3A, W=0, vvvv unused,
+//              L=1 (256-bit source), pp=66
+//   1D         the opcode
+//   C0         ModRM mod=11 reg=000 (ymm0, the source) rm=000 (xmm0, the dest)
+//   00         imm8: rounding from the immediate, mode 00 = nearest-even
+// TestEncodeF16 and TestEncodeF16SpecialValues cover the results, and the
+// encoding is verified by disassembling the built binary. Coded by Claude (AI).
+procedure AVXEncodeF16(PtrDst: TNeuralHalfArrPtr;
+  PtrSrc: TNeuralFloatArrPtr; NumElements: integer);
+var
+  localNumElements, i, NumElementsM1: integer;
+  SavedMXCSR: DWord;
+begin
+  localNumElements := NumElements and (not 7);
+  if localNumElements > 0 then
+  begin
+    SavedMXCSR := pcr_get_mxcsr;
+    pcr_set_mxcsr(SavedMXCSR or $1F80); // mask all six SSE exceptions
+  asm
+  mov rax, PtrSrc
+  mov rdx, PtrDst
+  mov ecx, localNumElements
+  shr ecx, 3
+@Loop:
+  vmovups   ymm0, [rax]                // 8 singles
+  db $C4, $E3, $7D, $1D, $C0, $00      // vcvtps2ph xmm0, ymm0, 0: -> 8 halves
+  vmovups   [rdx], xmm0
+  add rax, 32
+  add rdx, 16
+  dec ecx
+  jnz @Loop
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'ymm0'
+  ];
+    pcr_set_mxcsr(SavedMXCSR);
+  end;
+  NumElementsM1 := NumElements - 1;
+  for i := localNumElements to NumElementsM1 do
+    PtrDst^[i] := NeuralSingleToHalf(PtrSrc^[i]);
 end;
 
 // EXACT centered sum of squares: sum_i (PtrA[i] - Mean)^2, eight lanes at a
@@ -12625,6 +12745,28 @@ begin
   vHigh := N - 1;
   for I := 0 to vHigh do
     pDst^[I] := NeuralHalfToSingle(pSrc^[I]);
+end;
+
+class procedure TNNetVolume.EncodeF16(pDst: TNeuralHalfArrPtr;
+  pSrc: TNeuralFloatArrPtr; N: integer);
+var
+  I, vHigh: integer;
+begin
+  if N <= 0 then exit;
+  {$IFDEF AVX64}
+  {$IFDEF AVX2}
+  {$IFNDEF NOF16C}
+  if N >= csMinAvxSize then
+  begin
+    AVXEncodeF16(pDst, pSrc, N);
+    exit;
+  end;
+  {$ENDIF}
+  {$ENDIF}
+  {$ENDIF}
+  vHigh := N - 1;
+  for I := 0 to vHigh do
+    pDst^[I] := NeuralSingleToHalf(pSrc^[I]);
 end;
 
 class procedure TNNetVolume.MulAddInt8(PtrA, PtrB: TNeuralFloatArrPtr;

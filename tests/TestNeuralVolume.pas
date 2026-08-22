@@ -106,6 +106,9 @@ type
     procedure TestDecodeBF16;
     procedure TestDecodeF16;
     procedure TestDecodeF16SpecialValues;
+    procedure TestEncodeF16;
+    procedure TestEncodeF16SpecialValues;
+    procedure TestEncodeF16MatchesScalar;
   end;
 
 implementation
@@ -3291,6 +3294,126 @@ begin
       $4000: AssertEquals('slot ' + IntToStr(i), 2.0, Dst[i], 0);
       $0000: AssertEquals('slot ' + IntToStr(i), 0.0, Dst[i], 0);
     end;
+end;
+
+// Narrowing is lossy, so these are the exact half bit patterns IEEE
+// round-to-nearest-even produces. The interesting rows are the ties: 65520 is
+// halfway between the largest finite half and the next power of two and must
+// round UP to Inf, 2^-25 is halfway between zero and the smallest subnormal
+// and must round DOWN to zero, and 1.5*2^-24 must round to the EVEN
+// subnormal $0002. 1e30 overflows the half range, which is also the input
+// that traps a vcvtps2ph loop running with FPC's default MXCSR.
+// Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestEncodeF16;
+const
+  N = 21;
+  Vals: array[0..20] of TNeuralFloat = (
+    1.0, -1.0, 0.0, -0.0, 2.0, 0.5,
+    65504.0,                    // largest finite half
+    65520.0,                    // tie above it -> Inf
+    1e30, -1e30,                // overflow -> +/-Inf
+    0.333251953125,             // nearest half to 1/3
+    3.140625,                   // nearest half to pi
+    5.9604644775390625e-8,      // smallest subnormal half, 2^-24
+    2.98023223876953125e-8,     // 2^-25: tie to even -> zero
+    8.940696716308594e-8,       // 1.5 * 2^-24: tie to even -> $0002
+    6.0975551605224609e-5,      // largest subnormal half
+    6.103515625e-5,             // smallest normal half, 2^-14
+    1e-10,                      // far below the subnormal range -> zero
+    42.0, -42.0, 1024.0);
+  Bits: array[0..20] of Word = (
+    $3C00, $BC00, $0000, $8000, $4000, $3800,
+    $7BFF, $7C00, $7C00, $FC00,
+    $3555, $4248,
+    $0001, $0000, $0002, $03FF, $0400, $0000,
+    $5140, $D140, $6400);
+var
+  Dst: array of Word;
+  i: integer;
+begin
+  SetLength(Dst, N);
+  for i := 0 to N - 1 do Dst[i] := $DEAD;
+  TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@Dst[0]),
+    TNeuralFloatArrPtr(@Vals[0]), N);
+  for i := 0 to N - 1 do
+    AssertEquals('half of ' + FloatToStr(Vals[i]),
+      IntToHex(Bits[i], 4), IntToHex(Dst[i], 4));
+  // Under csMinAvxSize: the scalar method, same answers.
+  for i := 0 to 4 do Dst[i] := $DEAD;
+  TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@Dst[0]),
+    TNeuralFloatArrPtr(@Vals[0]), 5);
+  for i := 0 to 4 do
+    AssertEquals('short-run half ' + IntToStr(i),
+      IntToHex(Bits[i], 4), IntToHex(Dst[i], 4));
+end;
+
+// Inf and NaN singles must narrow to Inf and NaN halves rather than trapping.
+// FPC leaves the SSE invalid-operation exception unmasked, so a signalling NaN
+// reaching vcvtps2ph unmasked would raise EInvalidOp here. A NaN narrows to the
+// quiet NaN of the same top-10 payload bits, so the assertion checks the class
+// (all-ones exponent, non-zero mantissa) rather than one pattern.
+// Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestEncodeF16SpecialValues;
+const
+  N = 20;
+var
+  Vals: array[0..19] of TNeuralFloat;
+  Dst: array of Word;
+  SrcBits: Cardinal;
+  i: integer;
+begin
+  for i := 0 to N - 1 do Vals[i] := 1.0;
+  SrcBits := $7F800000; Vals[0] := PSingle(@SrcBits)^;   // +Inf
+  SrcBits := $FF800000; Vals[1] := PSingle(@SrcBits)^;   // -Inf
+  SrcBits := $7FC00000; Vals[2] := PSingle(@SrcBits)^;   // quiet NaN
+  SrcBits := $7F800001; Vals[3] := PSingle(@SrcBits)^;   // signalling NaN
+  SrcBits := $FFABCDEF; Vals[4] := PSingle(@SrcBits)^;   // NaN with a payload
+  Vals[5] := -0.0;
+  Vals[6] := 1e-45;                                      // subnormal single
+  Vals[7] := 3.4028235e38;                               // largest finite single
+  SetLength(Dst, N);
+  for i := 0 to N - 1 do Dst[i] := $DEAD;
+  TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@Dst[0]),
+    TNeuralFloatArrPtr(@Vals[0]), N);
+  AssertEquals('+Inf', IntToHex($7C00, 4), IntToHex(Dst[0], 4));
+  AssertEquals('-Inf', IntToHex($FC00, 4), IntToHex(Dst[1], 4));
+  for i := 2 to 4 do
+    AssertTrue('slot ' + IntToStr(i) + ' is a NaN half',
+      ((Dst[i] and $7C00) = $7C00) and ((Dst[i] and $03FF) <> 0));
+  AssertEquals('-0.0', IntToHex($8000, 4), IntToHex(Dst[5], 4));
+  AssertEquals('subnormal single', IntToHex($0000, 4), IntToHex(Dst[6], 4));
+  AssertEquals('largest single', IntToHex($7C00, 4), IntToHex(Dst[7], 4));
+  for i := 8 to N - 1 do
+    AssertEquals('filler ' + IntToStr(i), IntToHex($3C00, 4), IntToHex(Dst[i], 4));
+end;
+
+// The vectorized run and the scalar run must agree bit-for-bit: the same 1024
+// values are encoded once in bulk (which takes the F16C path on an AVX2 build)
+// and once one element at a time (always the scalar path, being under
+// csMinAvxSize). The values sweep nine decades so the sweep crosses the
+// overflow, normal, subnormal and flush-to-zero regions. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestEncodeF16MatchesScalar;
+const
+  N = 1024;
+var
+  Vals: array of TNeuralFloat;
+  Bulk, OneByOne: array of Word;
+  i, Mismatches: integer;
+begin
+  SetLength(Vals, N);
+  SetLength(Bulk, N);
+  SetLength(OneByOne, N);
+  for i := 0 to N - 1 do
+    Vals[i] := (i - 512) * 0.0011 * Power(10, (i mod 19) - 9);
+  TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@Bulk[0]),
+    TNeuralFloatArrPtr(@Vals[0]), N);
+  for i := 0 to N - 1 do
+    TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@OneByOne[i]),
+      TNeuralFloatArrPtr(@Vals[i]), 1);
+  Mismatches := 0;
+  for i := 0 to N - 1 do
+    if Bulk[i] <> OneByOne[i] then Inc(Mismatches);
+  AssertEquals('bulk vs scalar half mismatches', 0, Mismatches);
 end;
 
 // Straightforward O(pSize*pSize) box sum: the definition the summed-area-table
