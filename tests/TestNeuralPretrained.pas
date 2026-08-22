@@ -33,6 +33,13 @@ type
     MTPCommitLog: array[0..63] of integer;
     procedure MTPCommitProbe(Token: integer; var Stop: boolean);
     function FixturePath(const FileName: string): string;
+    // Largest absolute difference between two volumes of the same size.
+    function MaxAbsVolumeDiff(A, B: TNNetVolume): double;
+    // Steps Session over Tokens in windows of StepTokens tokens and collects
+    // every token's logits into Logits (SizeX = token count, Depth = vocab).
+    procedure RunWindowedDecodeStream(Session: TNNetStreamingDecoder;
+      const Tokens: array of integer; StepTokens: integer;
+      Logits: TNNetVolume);
     {$IFDEF OpenCL}
     // First OpenCL platform/device on the box; false when there is none, which
     // every caller reports as a SKIP.
@@ -259,6 +266,7 @@ type
     procedure TestQwen35MTPSpeculativeDecodeMatchesGreedy;
     procedure TestQwen35MTPSpeculativeStopsOnEOSAndCallback;
     procedure TestQwen35WindowedDecodeParity;
+    procedure TestQwen35WindowedDecodeOpenCLParity;
     procedure TestQwen35StreamedDecodeOpenCLParity;
     procedure TestQwen35HiddenStateReadsTheDeviceCopy;
     procedure TestQwen35SpeculativeCheckpointStaysInOpenCLMemory;
@@ -8999,6 +9007,57 @@ begin
   end;
 end;
 
+function TTestNeuralPretrained.MaxAbsVolumeDiff(A, B: TNNetVolume): double;
+var
+  i, MaxPos: integer;
+  Diff: double;
+begin
+  AssertEquals('compared volumes have the same size', A.Size, B.Size);
+  Result := 0;
+  MaxPos := A.Size - 1;
+  for i := 0 to MaxPos do
+  begin
+    Diff := Abs(A.FData[i] - B.FData[i]);
+    if Diff > Result then Result := Diff;
+  end;
+end;
+
+// One streamed decode of the whole token list, StepTokens tokens per forward.
+// The window's logits are copied out row by row, so a width-K run and a
+// width-1 run of the same tokens produce directly comparable volumes.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunWindowedDecodeStream(
+  Session: TNNetStreamingDecoder; const Tokens: array of integer;
+  StepTokens: integer; Logits: TNNetVolume);
+var
+  StepIn, StepOut: TNNetVolume;
+  Pos, Row, V, Vocab, MaxTokenPos, MaxRowPos, MaxVocabPos: integer;
+begin
+  Vocab := Session.Output().Depth;
+  MaxTokenPos := High(Tokens);
+  MaxRowPos := StepTokens - 1;
+  MaxVocabPos := Vocab - 1;
+  Logits.ReSize(MaxTokenPos + 1, 1, Vocab);
+  StepIn := TNNetVolume.Create(StepTokens, 1, 1);
+  try
+    Session.Reset();
+    Pos := 0;
+    while Pos <= MaxTokenPos do
+    begin
+      for Row := 0 to MaxRowPos do StepIn.FData[Row] := Tokens[Pos + Row];
+      Session.StepForward(StepIn, Pos);
+      StepOut := Session.Output();
+      for Row := 0 to MaxRowPos do
+        for V := 0 to MaxVocabPos do
+          Logits.FData[(Pos + Row) * Vocab + V] :=
+            StepOut.FData[Row * Vocab + V];
+      Inc(Pos, StepTokens);
+    end;
+  finally
+    StepIn.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestQwen35WindowedDecodeParity;
 const
   SeqLen = 16;
@@ -9006,10 +9065,10 @@ var
   Full, TwinW1, TwinW2: TNNet;
   ConfigFull, Config1, Config2: TLlamaConfig;
   Session1, Session2: TNNetStreamingDecoder;
-  FullIn, StepIn1, StepIn2, FullOut: TNNetVolume;
-  StepOut: TNNetVolume;
-  T, V, Vocab: integer;
-  Diff, MaxDiff1, MaxDiff2: double;
+  FullIn, FullOut, LogitsW1, LogitsW2: TNNetVolume;
+  Toks: array[0..SeqLen - 1] of integer;
+  T, Vocab: integer;
+  MaxDiff1, MaxDiff2: double;
 begin
   RandSeed := 424242;
   Full := BuildQwen35FromSafeTensorsEx(
@@ -9020,9 +9079,9 @@ begin
   Session1 := nil;
   Session2 := nil;
   FullIn := TNNetVolume.Create(SeqLen, 1, 1);
-  StepIn1 := TNNetVolume.Create(1, 1, 1);
-  StepIn2 := TNNetVolume.Create(2, 1, 1);
   FullOut := TNNetVolume.Create();
+  LogitsW1 := TNNetVolume.Create();
+  LogitsW2 := TNNetVolume.Create();
   try
     TwinW1 := BuildQwen35FromSafeTensorsEx(
       FixturePath('tiny_qwen3_5_mtp.safetensors'), Config1, {SeqLen=}1,
@@ -9031,51 +9090,27 @@ begin
       FixturePath('tiny_qwen3_5_mtp.safetensors'), Config2, {SeqLen=}2,
       {pTrainable=}true, FixturePath('tiny_qwen3_5_mtp_config.json'));
     Vocab := ConfigFull.VocabSize;
-    for T := 0 to SeqLen - 1 do FullIn.FData[T] := (5 * T + 2) mod Vocab;
+    for T := 0 to SeqLen - 1 do
+    begin
+      Toks[T] := (5 * T + 2) mod Vocab;
+      FullIn.FData[T] := Toks[T];
+    end;
     Full.Compute(FullIn);
     Full.GetOutput(FullOut);
     Session1 := TNNetStreamingDecoder.Create(TwinW1, SeqLen);
     Session2 := TNNetStreamingDecoder.Create(TwinW2, SeqLen);
-    Session1.Reset();
-    Session2.Reset();
-    MaxDiff1 := 0;
-    MaxDiff2 := 0;
-    for T := 0 to SeqLen - 1 do
-    begin
-      StepIn1.FData[0] := FullIn.FData[T];
-      Session1.StepForward(StepIn1, T);
-      StepOut := Session1.Output();
-      for V := 0 to Vocab - 1 do
-      begin
-        Diff := Abs(FullOut.FData[T * Vocab + V] - StepOut.FData[V]);
-        if Diff > MaxDiff1 then MaxDiff1 := Diff;
-      end;
-    end;
-    T := 0;
-    while T < SeqLen do
-    begin
-      StepIn2.FData[0] := FullIn.FData[T];
-      StepIn2.FData[1] := FullIn.FData[T + 1];
-      Session2.StepForward(StepIn2, T);
-      StepOut := Session2.Output();
-      for V := 0 to Vocab - 1 do
-      begin
-        Diff := Abs(FullOut.FData[T * Vocab + V] - StepOut.FData[V]);
-        if Diff > MaxDiff2 then MaxDiff2 := Diff;
-        Diff := Abs(FullOut.FData[(T + 1) * Vocab + V] -
-          StepOut.FData[Vocab + V]);
-        if Diff > MaxDiff2 then MaxDiff2 := Diff;
-      end;
-      T := T + 2;
-    end;
+    RunWindowedDecodeStream(Session1, Toks, 1, LogitsW1);
+    RunWindowedDecodeStream(Session2, Toks, 2, LogitsW2);
+    MaxDiff1 := MaxAbsVolumeDiff(FullOut, LogitsW1);
+    MaxDiff2 := MaxAbsVolumeDiff(FullOut, LogitsW2);
     AssertTrue('width-1 streamed vs full: max |diff| = ' +
       FloatToStr(MaxDiff1) + ' must be < 2e-4', MaxDiff1 < 2e-4);
     AssertTrue('width-2 windowed vs full: max |diff| = ' +
       FloatToStr(MaxDiff2) + ' must be < 2e-4', MaxDiff2 < 2e-4);
   finally
+    LogitsW2.Free;
+    LogitsW1.Free;
     FullOut.Free;
-    StepIn2.Free;
-    StepIn1.Free;
     FullIn.Free;
     Session2.Free;
     Session1.Free;
@@ -9243,6 +9278,138 @@ begin
   AssertTrue('OpenCL not compiled in: SKIP', true);
   {$ENDIF}
 end;
+
+// The width-2 verify window of speculative decoding, in OpenCL memory.
+// cai_sdpa_decode runs one work-group per (query head, token row) and token row
+// t attends the resident cache only up to its OWN slot, so a window has to
+// agree BOTH with the host's width-2 windowed decode and with a width-1 stream
+// of the same tokens: a row that saw the next row's key would still look
+// greedy and exact to a speculative decoder, which verifies its own drafts.
+// The layer counts keep the test from passing by never offloading, and the
+// last block asserts the intra-window causal bound directly - row 0 may not
+// move when row 1's token changes. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35WindowedDecodeOpenCLParity;
+{$IFDEF OpenCL}
+const
+  TokenCnt = 8;
+var
+  TwinCPU1, TwinCPU2, TwinCL2: TNNet;
+  SessionCPU1, SessionCPU2, SessionCL2: TNNetStreamingDecoder;
+  LogitsCPU1, LogitsCPU2, LogitsCL2, Win, RowZero: TNNetVolume;
+  Toks: array[0..TokenCnt - 1] of integer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, V, Vocab, MaxVocabPos, OtherTok: integer;
+  SDPATotal, SDPAOnDevice, MulTotal, MulOnDevice: integer;
+  DiffHost, DiffWidth1: double;
+
+  // Layers of AClass in TwinCL2, and how many of them ran a forward on the
+  // device.
+  procedure CountOnDevice(AClass: TClass; out Total, OnDevice: integer);
+  var
+    L, MaxLayerPos: integer;
+  begin
+    Total := 0;
+    OnDevice := 0;
+    MaxLayerPos := TwinCL2.CountLayers() - 1;
+    for L := 0 to MaxLayerPos do
+      if TwinCL2.Layers[L].ClassType = AClass then
+      begin
+        Inc(Total);
+        if TwinCL2.Layers[L].ForwardGPUCnt > 0 then Inc(OnDevice);
+      end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  TwinCPU1 := nil; TwinCPU2 := nil; TwinCL2 := nil;
+  SessionCPU1 := nil; SessionCPU2 := nil; SessionCL2 := nil;
+  LogitsCPU1 := TNNetVolume.Create();
+  LogitsCPU2 := TNNetVolume.Create();
+  LogitsCL2 := TNNetVolume.Create();
+  RowZero := TNNetVolume.Create();
+  Win := TNNetVolume.Create(2, 1, 1);
+  try
+    TwinCPU1 := BuildFromPretrained(FixturePath('tiny_qwen3_5.safetensors'),
+      {SeqLen=}1, {pTrainable=}false,
+      FixturePath('tiny_qwen3_5_config.json'));
+    TwinCPU2 := BuildFromPretrained(FixturePath('tiny_qwen3_5.safetensors'),
+      {SeqLen=}2, {pTrainable=}false,
+      FixturePath('tiny_qwen3_5_config.json'));
+    TwinCL2 := BuildFromPretrained(FixturePath('tiny_qwen3_5.safetensors'),
+      {SeqLen=}2, {pTrainable=}false,
+      FixturePath('tiny_qwen3_5_config.json'));
+    TwinCL2.EnableOpenCL(PlatformId, DeviceId);
+    Vocab := TwinCPU1.GetLastLayer.Output.Depth;
+    for T := 0 to TokenCnt - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    SessionCPU1 := TNNetStreamingDecoder.Create(TwinCPU1, TokenCnt);
+    SessionCPU2 := TNNetStreamingDecoder.Create(TwinCPU2, TokenCnt);
+    SessionCL2 := TNNetStreamingDecoder.Create(TwinCL2, TokenCnt);
+    RunWindowedDecodeStream(SessionCPU1, Toks, 1, LogitsCPU1);
+    RunWindowedDecodeStream(SessionCPU2, Toks, 2, LogitsCPU2);
+    RunWindowedDecodeStream(SessionCL2, Toks, 2, LogitsCL2);
+    DiffHost := MaxAbsVolumeDiff(LogitsCPU2, LogitsCL2);
+    DiffWidth1 := MaxAbsVolumeDiff(LogitsCPU1, LogitsCL2);
+
+    CountOnDevice(TNNetFusedSDPA, SDPATotal, SDPAOnDevice);
+    CountOnDevice(TNNetCellMulByCell, MulTotal, MulOnDevice);
+    AssertTrue('the fixture has fused attention layers', SDPATotal > 0);
+    AssertEquals('width-2 attention layers that reached the device',
+      SDPATotal, SDPAOnDevice);
+    AssertTrue('the fixture has attention output gates', MulTotal > 0);
+    AssertEquals('width-2 output-gate products that reached the device',
+      MulTotal, MulOnDevice);
+    AssertTrue('width-2 device vs width-2 host: max |diff| = ' +
+      FloatToStr(DiffHost) + ' must be < 1e-3', DiffHost < 1e-3);
+    AssertTrue('width-2 device vs width-1 host: max |diff| = ' +
+      FloatToStr(DiffWidth1) + ' must be < 1e-3', DiffWidth1 < 1e-3);
+
+    // The intra-window causal bound, read directly off the device: row 0 is
+    // computed before row 1 exists, so changing row 1's token may not move it.
+    OtherTok := (Toks[1] + 7) mod Vocab;
+    AssertTrue('the second window token really changes', OtherTok <> Toks[1]);
+    SessionCL2.Reset();
+    Win.FData[0] := Toks[0];
+    Win.FData[1] := Toks[1];
+    SessionCL2.StepForward(Win, 0);
+    RowZero.Copy(SessionCL2.Output());
+    SessionCL2.Reset();
+    Win.FData[0] := Toks[0];
+    Win.FData[1] := OtherTok;
+    SessionCL2.StepForward(Win, 0);
+    // Same kernels in the same order for row 0's work-group, so any difference
+    // is row 1 leaking backwards - exact, not a tolerance.
+    MaxVocabPos := Vocab - 1;
+    for V := 0 to MaxVocabPos do
+      AssertEquals('row 0 logit ' + IntToStr(V) +
+        ' must not depend on the row 1 token', RowZero.FData[V],
+        SessionCL2.Output().FData[V], 0.0);
+  finally
+    Win.Free;
+    RowZero.Free;
+    LogitsCL2.Free;
+    LogitsCPU2.Free;
+    LogitsCPU1.Free;
+    SessionCL2.Free;
+    SessionCPU2.Free;
+    SessionCPU1.Free;
+    TwinCL2.Free;
+    TwinCPU2.Free;
+    TwinCPU1.Free;
+  end;
+end;
+{$ELSE}
+begin
+  // Built without -dOpenCL: the host path is the only path, and
+  // TestQwen35WindowedDecodeParity already covers it.
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 // TNNetStreamingDecoder.HiddenState must answer with the value the DEVICE just
 // computed. TNNet.Compute forces only the last layer to RAM, so the LM-head

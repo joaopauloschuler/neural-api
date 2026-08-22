@@ -375,6 +375,12 @@ type
     procedure FusedSDPAInt8DecodeResidentOpenCLParity;
     procedure FusedSDPAInt8WindowedDecodeOpenCLParity;
     procedure FusedSDPAInt8HandoffDecodeOpenCLParity;
+    // A decode step that carries TWO token rows - the speculative verify
+    // window. Both rows are appended before the attention runs, so row 0 must
+    // still stop at its own cache slot; the sliding window and the soft cap
+    // ride along on the int8 twin.
+    procedure FusedSDPAMultiTokenStepOpenCLParity;
+    procedure FusedSDPAInt8MultiTokenStepOpenCLParity;
     // The int8 append kernel against QuantizeCacheRow: row scales within one
     // ulp, codes within one step, and codes exactly equal on rows built to
     // stress the quantizer - all zeros, one outlier, flat, exact midpoints.
@@ -69398,14 +69404,17 @@ begin
 end;
 {$ENDIF}
 
-// Shared body of the cached-decode parity tests: runs StepCnt single token
-// steps through a CPU network and an OpenCL network built the same way and
-// returns the largest output difference. CaptureAt >= 0 takes a cache snapshot
-// after that step on the OpenCL side and restores it before the next.
-// Int8KV picks the int8 KV cache, and with it the int8 snapshot API.
-function RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, Window,
-  CpuWarmupSteps, CaptureAt: integer; Int8KV: boolean; SoftCap: TNeuralFloat;
-  out GpuForwards: integer): TNeuralFloat;
+// Shared body of the cached-decode parity tests: runs StepCnt decode steps of
+// StepTokens token rows each through a CPU network and an OpenCL network built
+// the same way and returns the largest output difference. StepTokens > 1 is the
+// speculative verify window, where every row of the step is appended before the
+// attention runs and row t may attend only up to its own slot. CaptureAt >= 0
+// takes a cache snapshot after that step on the OpenCL side and restores it
+// before the next. Int8KV picks the int8 KV cache, and with it the int8
+// snapshot API.
+function RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, StepTokens,
+  Window, CpuWarmupSteps, CaptureAt: integer; Int8KV: boolean;
+  SoftCap: TNeuralFloat; out GpuForwards: integer): TNeuralFloat;
 {$IFDEF OpenCL}
 var
   NNCpu, NNGpu: TNNet;
@@ -69415,7 +69424,7 @@ var
   Mixer: TNNetLayer;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
-  InDepth, OutDepth, T, D, SnapLen, SnapSinks, SnapWindow: integer;
+  InDepth, OutDepth, T, D, Row, SnapLen, SnapSinks, SnapWindow: integer;
   Diff: TNeuralFloat;
 begin
   Result := 0;
@@ -69425,26 +69434,26 @@ begin
   OutDepth := QHeads * Dk;
   NNCpu := TNNet.Create();
   NNGpu := TNNet.Create();
-  StepIn := TNNetVolume.Create(1, 1, InDepth);
+  StepIn := TNNetVolume.Create(StepTokens, 1, InDepth);
   SnapK := TNNetVolume.Create();
   SnapV := TNNetVolume.Create();
   SnapKQ := TNNetVolumeQuant8.Create();
   SnapVQ := TNNetVolumeQuant8.Create();
   try
-    NNCpu.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+    NNCpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
     LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, Window, SoftCap);
     NNCpu.AddLayer(LCpu);
     NNCpu.AddLayer(TNNetSiLU.Create());
     NNCpu.SetTrainable(False, False);
 
-    NNGpu.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+    NNGpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
     LGpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, Window, SoftCap);
     Mixer := NNGpu.AddLayer(LGpu);
     NNGpu.AddLayer(TNNetSiLU.Create());
     NNGpu.SetTrainable(False, False);
 
-    LCpu.BeginIncrementalDecode(StepCnt, Int8KV);
-    LGpu.BeginIncrementalDecode(StepCnt, Int8KV);
+    LCpu.BeginIncrementalDecode(StepCnt * StepTokens, Int8KV);
+    LGpu.BeginIncrementalDecode(StepCnt * StepTokens, Int8KV);
     for T := 0 to StepCnt - 1 do
     begin
       // The CPU network warms the OpenCL network's cache too: both run the same
@@ -69459,15 +69468,18 @@ begin
           else LGpu.RestoreCacheState(SnapK, SnapV, SnapLen, SnapSinks,
             SnapWindow);
       end;
-      for D := 0 to InDepth - 1 do StepIn[0, 0, D] := 1.5 * (Random - 0.5);
+      for Row := 0 to StepTokens - 1 do
+        for D := 0 to InDepth - 1 do
+          StepIn[Row, 0, D] := 1.5 * (Random - 0.5);
       NNCpu.Compute(StepIn);
       NNGpu.Compute(StepIn);
-      for D := 0 to OutDepth - 1 do
-      begin
-        Diff := Abs(NNCpu.GetLastLayer.Output[0, 0, D] -
-                    NNGpu.GetLastLayer.Output[0, 0, D]);
-        if Diff > Result then Result := Diff;
-      end;
+      for Row := 0 to StepTokens - 1 do
+        for D := 0 to OutDepth - 1 do
+        begin
+          Diff := Abs(NNCpu.GetLastLayer.Output[Row, 0, D] -
+                      NNGpu.GetLastLayer.Output[Row, 0, D]);
+          if Diff > Result then Result := Diff;
+        end;
       if (CaptureAt >= 0) and (T = CaptureAt) then
       begin
         if Int8KV
@@ -69524,8 +69536,9 @@ begin
   finally
     NNProbe.Free;
   end;
-  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
-    {CpuWarmupSteps=}0, SnapshotStep, {Int8KV=}False, {SoftCap=}0, GpuForwards);
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt,
+    {StepTokens=}1, {Window=}0, {CpuWarmupSteps=}0, SnapshotStep,
+    {Int8KV=}False, {SoftCap=}0, GpuForwards);
   WriteLn('  FusedSDPA OpenCL decode: max|diff|=', MaxDiff:0:9,
     ' gpu forwards=', GpuForwards);
   AssertEquals('every decode step must run on OpenCL', StepCnt, GpuForwards);
@@ -69554,9 +69567,9 @@ begin
     Exit;
   end;
   RandSeed := 20260820;
-  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, Window,
-    {CpuWarmupSteps=}0, {CaptureAt=}-1, {Int8KV=}False, {SoftCap=}5.0,
-    GpuForwards);
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt,
+    {StepTokens=}1, Window, {CpuWarmupSteps=}0, {CaptureAt=}-1,
+    {Int8KV=}False, {SoftCap=}5.0, GpuForwards);
   WriteLn('  FusedSDPA OpenCL windowed decode: max|diff|=', MaxDiff:0:9,
     ' gpu forwards=', GpuForwards);
   AssertEquals('every decode step must run on OpenCL', StepCnt, GpuForwards);
@@ -69587,8 +69600,9 @@ begin
     Exit;
   end;
   RandSeed := 20260821;
-  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
-    WarmupSteps, {CaptureAt=}-1, {Int8KV=}False, {SoftCap=}0, GpuForwards);
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt,
+    {StepTokens=}1, {Window=}0, WarmupSteps, {CaptureAt=}-1, {Int8KV=}False,
+    {SoftCap=}0, GpuForwards);
   WriteLn('  FusedSDPA OpenCL cache handoff: max|diff|=', MaxDiff:0:9,
     ' gpu forwards=', GpuForwards);
   AssertEquals('only the steps after the handoff run on OpenCL',
@@ -69623,8 +69637,9 @@ begin
     Exit;
   end;
   RandSeed := 20260822;
-  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
-    {CpuWarmupSteps=}0, SnapshotStep, {Int8KV=}True, {SoftCap=}0, GpuForwards);
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt,
+    {StepTokens=}1, {Window=}0, {CpuWarmupSteps=}0, SnapshotStep,
+    {Int8KV=}True, {SoftCap=}0, GpuForwards);
   WriteLn('  FusedSDPA OpenCL int8 decode: max|diff|=', MaxDiff:0:9,
     ' gpu forwards=', GpuForwards);
   AssertEquals('every int8 decode step must run on OpenCL', StepCnt,
@@ -69654,9 +69669,9 @@ begin
     Exit;
   end;
   RandSeed := 20260823;
-  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, Window,
-    {CpuWarmupSteps=}0, {CaptureAt=}-1, {Int8KV=}True, {SoftCap=}5.0,
-    GpuForwards);
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt,
+    {StepTokens=}1, Window, {CpuWarmupSteps=}0, {CaptureAt=}-1,
+    {Int8KV=}True, {SoftCap=}5.0, GpuForwards);
   WriteLn('  FusedSDPA OpenCL int8 windowed decode: max|diff|=', MaxDiff:0:9,
     ' gpu forwards=', GpuForwards);
   AssertEquals('every int8 decode step must run on OpenCL', StepCnt,
@@ -69688,14 +69703,80 @@ begin
     Exit;
   end;
   RandSeed := 20260824;
-  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
-    WarmupSteps, {CaptureAt=}-1, {Int8KV=}True, {SoftCap=}0, GpuForwards);
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt,
+    {StepTokens=}1, {Window=}0, WarmupSteps, {CaptureAt=}-1, {Int8KV=}True,
+    {SoftCap=}0, GpuForwards);
   WriteLn('  FusedSDPA OpenCL int8 cache handoff: max|diff|=', MaxDiff:0:9,
     ' gpu forwards=', GpuForwards);
   AssertEquals('only the steps after the handoff run on OpenCL',
     StepCnt - WarmupSteps, GpuForwards);
   AssertTrue('an int8 cache built on the CPU then handed to OpenCL: max |diff| '
     + '= ' + FloatToStr(MaxDiff) + ' must be < 1e-3', MaxDiff < 1e-3);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAMultiTokenStepOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 3; StepCnt = 5; StepTokens = 2;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxDiff: TNeuralFloat;
+  GpuForwards: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260825;
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, StepTokens,
+    {Window=}0, {CpuWarmupSteps=}0, {CaptureAt=}-1, {Int8KV=}False,
+    {SoftCap=}0, GpuForwards);
+  WriteLn('  FusedSDPA OpenCL 2-token step: max|diff|=', MaxDiff:0:9,
+    ' gpu forwards=', GpuForwards);
+  AssertEquals('every 2-token step must run on OpenCL', StepCnt, GpuForwards);
+  AssertTrue('OpenCL 2-token step vs CPU: max |diff| = ' +
+    FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAInt8MultiTokenStepOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 3; StepCnt = 5; StepTokens = 2; Window = 3;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxDiff: TNeuralFloat;
+  GpuForwards: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260826;
+  // Window = 3 over 10 committed tokens, so the mask slides WITHIN a step: the
+  // two rows of one forward have different jStart values.
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, StepTokens,
+    Window, {CpuWarmupSteps=}0, {CaptureAt=}-1, {Int8KV=}True, {SoftCap=}5.0,
+    GpuForwards);
+  WriteLn('  FusedSDPA OpenCL int8 2-token step: max|diff|=', MaxDiff:0:9,
+    ' gpu forwards=', GpuForwards);
+  AssertEquals('every int8 2-token step must run on OpenCL', StepCnt,
+    GpuForwards);
+  AssertTrue('windowed soft-capped int8 2-token step: max |diff| = ' +
+    FloatToStr(MaxDiff) + ' must be < 1e-3', MaxDiff < 1e-3);
 end;
 {$ELSE}
 begin
