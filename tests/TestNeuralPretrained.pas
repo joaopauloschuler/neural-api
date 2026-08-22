@@ -260,6 +260,7 @@ type
     procedure TestQwen35MTPSpeculativeStopsOnEOSAndCallback;
     procedure TestQwen35WindowedDecodeParity;
     procedure TestQwen35StreamedDecodeOpenCLParity;
+    procedure TestQwen35HiddenStateReadsTheDeviceCopy;
     procedure TestQwen2StreamedDecodeOpenCLParity;
     procedure TestQwen35TurnBoundaryResumeParity;
     procedure TestQwen35MoeLogitParity;
@@ -9241,6 +9242,90 @@ begin
   AssertTrue('OpenCL not compiled in: SKIP', true);
   {$ENDIF}
 end;
+
+// TNNetStreamingDecoder.HiddenState must answer with the value the DEVICE just
+// computed. TNNet.Compute forces only the last layer to RAM, so the LM-head
+// input slot stays resident, and the MTP draft splice writes that slot by hand
+// and marks the host copy authoritative - so a reader that trusts the host copy
+// gets the spliced row back instead of the next window's hidden state.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35HiddenStateReadsTheDeviceCopy;
+{$IFDEF OpenCL}
+const
+  SpliceMarker = -12345.0;
+var
+  NN: TNNet;
+  Session: TNNetStreamingDecoder;
+  StepIn, Expected: TNNetVolume;
+  HiddenLayer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Vocab, Dim, MaxDimPos: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := nil;
+  Session := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  Expected := TNNetVolume.Create();
+  try
+    NN := BuildFromPretrained(FixturePath('tiny_qwen3_5.safetensors'),
+      {SeqLen=}1, {pTrainable=}false,
+      FixturePath('tiny_qwen3_5_config.json'));
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    Session := TNNetStreamingDecoder.Create(NN, 8);
+    Vocab := NN.GetLastLayer.Output.Size;
+    HiddenLayer := NN.Layers[NN.GetLastLayerIdx() - 1];
+
+    // Reference run: two clean steps, keeping the hidden state of step 1.
+    Session.Reset();
+    StepIn.FData[0] := 2 mod Vocab;
+    Session.StepForward(StepIn, 0);
+    AssertTrue('HiddenState is the LM-head input slot',
+      Session.HiddenState() = HiddenLayer.Output);
+    if HiddenLayer.ForwardGPUCnt = 0 then
+    begin
+      AssertTrue('the LM-head input layer never offloaded: SKIP', true);
+      Exit;
+    end;
+    StepIn.FData[0] := 7 mod Vocab;
+    Session.StepForward(StepIn, 1);
+    Expected.Copy(Session.HiddenState());
+
+    // Same two steps, with the MTP draft splice standing between them.
+    Session.Reset();
+    StepIn.FData[0] := 2 mod Vocab;
+    Session.StepForward(StepIn, 0);
+    HiddenLayer.Output.Fill(SpliceMarker);
+    HiddenLayer.MarkOutputWrittenOnRAM();
+    StepIn.FData[0] := 7 mod Vocab;
+    Session.StepForward(StepIn, 1);
+
+    // Same kernels in the same order, so the two runs are bit-identical - any
+    // difference is the host copy leaking through.
+    MaxDimPos := Expected.Size - 1;
+    for Dim := 0 to MaxDimPos do
+      AssertEquals('hidden state channel ' + IntToStr(Dim) +
+        ' after a host splice', Expected.FData[Dim],
+        Session.HiddenState().FData[Dim], 0.0);
+  finally
+    Session.Free;
+    Expected.Free;
+    StepIn.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  // Built without -dOpenCL: the host copy is the only copy, so there is no
+  // residency question to answer.
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 // The same check on the plain qwen2 attention stack, which has no output gate:
 // it pins that the dense family really is unaffected rather than never

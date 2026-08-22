@@ -5972,6 +5972,10 @@ begin
   // path) and return its output - the hidden state of the token in the window
   // just stepped.
   if FHiddenLayer = nil then FHiddenLayer := ContrastiveHiddenLayer(FNet);
+  // TNNet.Compute forces only the LAST layer to RAM, and this one is not it:
+  // under OpenCL it stays resident and its host copy holds whatever the last
+  // host touch left there. Every caller reads FData.
+  FHiddenLayer.ForceOutputOnRAM();
   Result := FHiddenLayer.Output;
 end;
 
