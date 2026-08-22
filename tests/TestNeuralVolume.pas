@@ -107,6 +107,7 @@ type
     procedure TestDequantizeInt8;
     procedure TestDequantizeInt8RoundTrip;
     procedure TestDecodeBF16;
+    procedure TestDecodeBF16LengthSweep;
     procedure TestDecodeF16;
     procedure TestDecodeF16SpecialValues;
     procedure TestEncodeF16;
@@ -3346,6 +3347,47 @@ begin
   begin
     OutBits := Cardinal(Pats[i]) shl 16;
     AssertEquals('short-run bf16 ' + IntToStr(i), PSingle(@OutBits)^, Dst[i], 0);
+  end;
+end;
+
+// The length sweep TestDecodeBF16 lacks: its single N = 21 never reaches the
+// 32-element unrolled body. Every length here is checked against the same shift
+// the scalar tail performs, so the delta is 0. The patterns keep bit 7 clear,
+// so the exponent is never all ones and no Inf or NaN reaches AssertEquals.
+// Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestDecodeBF16LengthSweep;
+const
+  cLengths: array[0..14] of integer =
+    (1, 7, 8, 16, 24, 31, 32, 33, 39, 40, 47, 64, 128, 1000, 1024);
+  N = 1024;
+var
+  Bits: array of Word;
+  Bulk: array of TNeuralFloat;
+  Expected: TNeuralFloat;
+  OutBits: Cardinal;
+  i, L, Len: integer;
+begin
+  SetLength(Bits, N);
+  SetLength(Bulk, N + 1);   // one guard slot past the longest run
+  for i := 0 to N - 1 do
+  begin
+    Bits[i] := Word((i * 61) and $7F7F);       // exponent never all ones
+    if (i and 1) = 1 then Bits[i] := Bits[i] or $8000;
+  end;
+  for L := 0 to High(cLengths) do
+  begin
+    Len := cLengths[L];
+    for i := 0 to N do Bulk[i] := 12345;
+    TNNetVolume.DecodeBF16(TNeuralFloatArrPtr(@Bulk[0]),
+      TNeuralHalfArrPtr(@Bits[0]), Len);
+    for i := 0 to Len - 1 do
+    begin
+      OutBits := Cardinal(Bits[i]) shl 16;
+      Expected := PSingle(@OutBits)^;
+      AssertEquals('element ' + IntToStr(i) + ' at N=' + IntToStr(Len),
+        Expected, Bulk[i], 0);
+    end;
+    AssertEquals('wrote past N=' + IntToStr(Len), 12345.0, Bulk[Len], 0);
   end;
 end;
 

@@ -2485,7 +2485,10 @@ end;
 // high 16 bits of the single, so per 8 lanes vpmovzxwd spreads the halves into
 // dwords (value in the LOW half of each) and one vpslld shifts each up into
 // place. No floating-point operation executes at all, so this cannot trap on
-// NaN payloads and is exact by construction. Coded by Claude (AI).
+// NaN payloads and is exact by construction. The loop shape is
+// DotProductsTiled's: an unrolled body doing 32 elements per iteration through
+// four independent register chains, then an 8-at-a-time loop for the 8..31
+// remainder, then the Pascal tail for the last 1..7. Coded by Claude (AI).
 procedure AVXDecodeBF16(PtrDst: TNeuralFloatArrPtr;
   PtrSrc: TNeuralHalfArrPtr; NumElements: integer);
 var
@@ -2499,19 +2502,50 @@ begin
   mov rax, PtrSrc
   mov rdx, PtrDst
   mov ecx, localNumElements
-  shr ecx, 3
-@Loop:
-  vpmovzxwd ymm0, [rax]      // 8 bfloat16 -> 8 dwords, value in bits 0..15
+
+  push rcx
+  shr ecx, 5                 // large iterations = elements / 32
+  jz @SkipLargeDecodeBF16Loop
+@LargeDecodeBF16Loop:
+  vpmovzxwd ymm0, [rax]      // 4 x 8 bfloat16, four independent chains
+  vpmovzxwd ymm1, [rax+16]
+  vpmovzxwd ymm2, [rax+32]
+  vpmovzxwd ymm3, [rax+48]
+
   vpslld    ymm0, ymm0, 16   // shift into bits 16..31 = the single's bits
+  vpslld    ymm1, ymm1, 16
+  vpslld    ymm2, ymm2, 16
+  vpslld    ymm3, ymm3, 16
+
+  vmovups   [rdx], ymm0
+  vmovups   [rdx+32], ymm1
+  vmovups   [rdx+64], ymm2
+  vmovups   [rdx+96], ymm3
+
+  add rax, 64
+  add rdx, 128
+  dec ecx
+  jnz @LargeDecodeBF16Loop
+
+@SkipLargeDecodeBF16Loop:
+  pop rcx
+  and ecx, $0000001F
+  jz @EndDecodeBF16
+  shr ecx, 3                 // small iterations = (elements mod 32) / 8
+@SmallDecodeBF16Loop:
+  vpmovzxwd ymm0, [rax]      // 8 bfloat16 -> 8 dwords, value in bits 0..15
+  vpslld    ymm0, ymm0, 16
   vmovups   [rdx], ymm0
   add rax, 16
   add rdx, 32
   dec ecx
-  jnz @Loop
+  jnz @SmallDecodeBF16Loop
+
+@EndDecodeBF16:
   vzeroupper
   end
   [
-    'RAX', 'RCX', 'RDX', 'ymm0'
+    'RAX', 'RCX', 'RDX', 'ymm0', 'ymm1', 'ymm2', 'ymm3'
   ];
   end;
   NumElementsM1 := NumElements - 1;
