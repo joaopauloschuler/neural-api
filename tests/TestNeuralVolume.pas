@@ -97,7 +97,10 @@ type
     procedure TestQuant8TiledDotProductMatchesArrays;
     procedure TestQuant8GroupedTiledDotProductMatchesArrays;
     procedure TestMaxAbsFinite;
+    procedure TestMaxAbsFiniteLengthSweep;
     procedure TestQuantizeInt8;
+    procedure TestQuantizeInt8LengthSweep;
+    procedure TestDequantizeInt8LengthSweep;
     procedure TestQuantizeInt8NonFinite;
     procedure TestQuantizeInt8TinyAndDenormalRows;
     procedure TestQuantizeInt8MatchesScalarReference;
@@ -509,10 +512,12 @@ procedure TTestNeuralVolume.TestVolumeReluGateMaskParity;
 // ReluGateMask is AVXReluGateMask on an AVX2/64-bit build and a scalar loop
 // everywhere else. The output is only ever 1.0 or 0.0, so both paths must agree
 // BIT-exactly -- including at the boundary, where the contract is >= 0 (so +0.0
-// and -0.0 both gate open) and NaN gates shut. Sizes straddle the 8-element
-// block width and its tail.
+// and -0.0 both gate open) and NaN gates shut. The sizes separate the three
+// parts of the vectorized routine - the 32-element unrolled body, the
+// 8-element remainder loop and the scalar tail - and combine them.
 const
-  Sizes: array[0..10] of integer = (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 1000);
+  Sizes: array[0..15] of integer =
+    (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 39, 40, 47, 64, 128, 1000);
 var
   Src, Dst, Ref: array of TNeuralFloat;
   SI, K, N: integer;
@@ -522,7 +527,7 @@ begin
   begin
     N := Sizes[SI];
     SetLength(Src, N);
-    SetLength(Dst, N);
+    SetLength(Dst, N + 1);   // one guard slot past the run
     SetLength(Ref, N);
     for K := 0 to N - 1 do
     begin
@@ -537,11 +542,14 @@ begin
       Dst[K] := 12345;
       if Src[K] >= 0 then Ref[K] := 1 else Ref[K] := 0;
     end;
+    Dst[N] := 12345;
     TNNetVolume.ReluGateMask(TNeuralFloatArrPtr(@Dst[0]),
       TNeuralFloatArrPtr(@Src[0]), N);
     for K := 0 to N - 1 do
       AssertEquals('ReluGateMask[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
         Ref[K], Dst[K], 0.0);
+    AssertEquals('ReluGateMask wrote past N=' + IntToStr(N), 12345.0,
+      Dst[N], 0.0);
   end;
   // In-place (dst = src) must produce the same mask.
   N := 40;
@@ -565,10 +573,12 @@ procedure TTestNeuralVolume.TestVolumeLeakyReluParity;
 // LeakyRelu is AVXLeakyRelu on an AVX2/64-bit build and a scalar loop everywhere
 // else. Both paths must agree BIT-exactly: the negative branch is the same
 // single-precision multiply, and at the boundary the contract is >= 0, so +0.0
-// and -0.0 both pass through unscaled. Sizes straddle the 8-element block width
-// and its tail.
+// and -0.0 both pass through unscaled. The sizes separate the three parts of
+// the vectorized routine - the 32-element unrolled body, the 8-element
+// remainder loop and the scalar tail - and combine them.
 const
-  Sizes: array[0..10] of integer = (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 1000);
+  Sizes: array[0..15] of integer =
+    (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 39, 40, 47, 64, 128, 1000);
   // TYPED: an untyped 0.1 would be a Double here, so the reference multiply
   // would not be the Single one the kernel performs.
   Slope: TNeuralFloat = 0.1;
@@ -581,7 +591,7 @@ begin
   begin
     N := Sizes[SI];
     SetLength(Src, N);
-    SetLength(Dst, N);
+    SetLength(Dst, N + 1);   // one guard slot past the run
     SetLength(Ref, N);
     for K := 0 to N - 1 do
     begin
@@ -596,11 +606,13 @@ begin
       Dst[K] := 12345;
       if Src[K] >= 0 then Ref[K] := Src[K] else Ref[K] := Slope * Src[K];
     end;
+    Dst[N] := 12345;
     TNNetVolume.LeakyRelu(TNeuralFloatArrPtr(@Dst[0]),
       TNeuralFloatArrPtr(@Src[0]), Slope, N);
     for K := 0 to N - 1 do
       AssertEquals('LeakyRelu[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
         Ref[K], Dst[K], 0.0);
+    AssertEquals('LeakyRelu wrote past N=' + IntToStr(N), 12345.0, Dst[N], 0.0);
   end;
   // In-place (dst = src) must produce the same result.
   N := 40;
@@ -639,9 +651,12 @@ procedure TTestNeuralVolume.TestVolumeReluLParity;
 // build and scalar loops everywhere else. Both paths must agree BIT-exactly:
 // each clamped form is the same subtract-multiply-add, and the boundary
 // contract is strict >, so LowLimit itself takes the low form while HighLimit
-// passes through. Sizes straddle the 8-element block width and its tail.
+// passes through. The sizes separate the three parts of the vectorized routines
+// - the 32-element unrolled body, the 8-element remainder loop and the scalar
+// tail - and combine them.
 const
-  Sizes: array[0..10] of integer = (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 1000);
+  Sizes: array[0..15] of integer =
+    (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 39, 40, 47, 64, 128, 1000);
   // TYPED: an untyped literal would be a Double here, so the reference
   // arithmetic would not be the Single the kernel performs.
   LowLimit: TNeuralFloat = -3.0;
@@ -656,7 +671,7 @@ begin
   begin
     N := Sizes[SI];
     SetLength(Src, N);
-    SetLength(Dst, N);
+    SetLength(Dst, N + 1);   // one guard slot past the run
     SetLength(Ref, N);
     SetLength(RefDeriv, N);
     for K := 0 to N - 1 do
@@ -677,16 +692,21 @@ begin
       if (Src[K] > LowLimit) and not (Src[K] > HighLimit) then RefDeriv[K] := 1
       else RefDeriv[K] := Slope;
     end;
+    Dst[N] := 12345;
     TNNetVolume.ReluL(TNeuralFloatArrPtr(@Dst[0]),
       TNeuralFloatArrPtr(@Src[0]), LowLimit, HighLimit, Slope, N);
     for K := 0 to N - 1 do
       AssertEquals('ReluL[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
         Ref[K], Dst[K], 0.0);
+    AssertEquals('ReluL wrote past N=' + IntToStr(N), 12345.0, Dst[N], 0.0);
+    Dst[N] := 12345;
     TNNetVolume.ReluLGateMask(TNeuralFloatArrPtr(@Dst[0]),
       TNeuralFloatArrPtr(@Src[0]), LowLimit, HighLimit, Slope, N);
     for K := 0 to N - 1 do
       AssertEquals('ReluLGateMask[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
         RefDeriv[K], Dst[K], 0.0);
+    AssertEquals('ReluLGateMask wrote past N=' + IntToStr(N), 12345.0,
+      Dst[N], 0.0);
   end;
   // In-place (dst = src) must produce the same result.
   N := 40;
@@ -2908,6 +2928,36 @@ begin
   end;
 end;
 
+// AVXMaxAbsFinite folds 32 floats per iteration into four accumulators, then 8
+// at a time, then a scalar tail. The lengths below take each part alone and in
+// combination, and the max is planted at every position in turn, so a lane the
+// fold drops or an accumulator it forgets shows up wherever it hides. The slot
+// past the run holds a larger value that must not be read. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestMaxAbsFiniteLengthSweep;
+const
+  cLengths: array[0..12] of integer =
+    (16, 24, 31, 32, 33, 39, 40, 47, 64, 65, 128, 1000, 1024);
+  N = 1024;
+var
+  Buf: array of TNeuralFloat;
+  i, L, Len, Plant: integer;
+begin
+  SetLength(Buf, N + 1);
+  for L := 0 to High(cLengths) do
+  begin
+    Len := cLengths[L];
+    for Plant := 0 to Len - 1 do
+    begin
+      for i := 0 to Len - 1 do Buf[i] := 0.25;
+      Buf[Plant] := -7.5;
+      Buf[Len] := 1000;   // past the run: reading it would win the max
+      AssertEquals('max planted at ' + IntToStr(Plant) + ' of N=' +
+        IntToStr(Len), 7.5,
+        TNNetVolume.MaxAbsFinite(TNeuralFloatArrPtr(@Buf[0]), Len), 0);
+    end;
+  end;
+end;
+
 // QuantizeInt8 against a known row max: the row max itself must land on
 // +/-127, zero on 0, and every code must dequantize back within half a step.
 // Coded by Claude (AI).
@@ -3144,6 +3194,85 @@ begin
   TNNetVolume.DequantizeInt8(TNeuralFloatArrPtr(@Dst[0]),
     TNeuralInt8ArrPtr(@Codes[0]), 0, Scale);
   AssertEquals('N=0 writes nothing', 999, Dst[0], 0);
+end;
+
+// The vectorized run and the scalar run must produce the same codes: the same
+// values are quantized once in bulk (the AVX2 path) and once one element at a
+// time (always scalar, being under csMinAvxSize). The lengths take the
+// 32-element unrolled body, the 8-element remainder loop and the scalar tail
+// alone and in combination. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestQuantizeInt8LengthSweep;
+const
+  cLengths: array[0..12] of integer =
+    (16, 24, 31, 32, 33, 39, 40, 47, 64, 65, 128, 1000, 1024);
+  N = 1024;
+var
+  V: TNNetVolume;
+  Bulk, OneByOne: TInt8DynArr;
+  MaxAbs: TNeuralFloat;
+  i, L, Len: integer;
+begin
+  RandSeed := 313131;
+  V := TNNetVolume.Create(N, 1, 1);
+  SetLength(Bulk, N + 1);      // one guard slot past the longest run
+  SetLength(OneByOne, N);
+  try
+    for i := 0 to N - 1 do V.FData[i] := (Random - 0.5) * 7;
+    MaxAbs := TNNetVolume.MaxAbsFinite(TNeuralFloatArrPtr(@V.FData[0]), N);
+    AssertTrue('random row has a range', MaxAbs > 0);
+    for i := 0 to N - 1 do
+      TNNetVolume.QuantizeInt8(TNeuralInt8ArrPtr(@OneByOne[i]),
+        TNeuralFloatArrPtr(@V.FData[i]), 1, MaxAbs);
+    for L := 0 to High(cLengths) do
+    begin
+      Len := cLengths[L];
+      for i := 0 to N do Bulk[i] := 99;
+      TNNetVolume.QuantizeInt8(TNeuralInt8ArrPtr(@Bulk[0]),
+        TNeuralFloatArrPtr(@V.FData[0]), Len, MaxAbs);
+      for i := 0 to Len - 1 do
+        AssertEquals('code ' + IntToStr(i) + ' at N=' + IntToStr(Len),
+          OneByOne[i], Bulk[i]);
+      AssertEquals('wrote past N=' + IntToStr(Len), 99, Bulk[Len]);
+    end;
+  finally
+    V.Free;
+  end;
+end;
+
+// The DequantizeInt8 twin of TestQuantizeInt8LengthSweep. One single-precision
+// multiply per element on both paths, so the reference below is exact and the
+// delta is 0. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestDequantizeInt8LengthSweep;
+const
+  cLengths: array[0..12] of integer =
+    (16, 24, 31, 32, 33, 39, 40, 47, 64, 65, 128, 1000, 1024);
+  N = 1024;
+  // TYPED on purpose: an untyped const would keep full precision in the
+  // expectation below while the call rounds it to single.
+  Scale: TNeuralFloat = 0.0125;
+var
+  Codes: TInt8DynArr;
+  Dst: array of TNeuralFloat;
+  Expected: TNeuralFloat;
+  i, L, Len: integer;
+begin
+  SetLength(Codes, N);
+  SetLength(Dst, N + 1);       // one guard slot past the longest run
+  for i := 0 to N - 1 do Codes[i] := ShortInt(((i * 13) mod 255) - 127);
+  for L := 0 to High(cLengths) do
+  begin
+    Len := cLengths[L];
+    for i := 0 to N do Dst[i] := 12345;
+    TNNetVolume.DequantizeInt8(TNeuralFloatArrPtr(@Dst[0]),
+      TNeuralInt8ArrPtr(@Codes[0]), Len, Scale);
+    for i := 0 to Len - 1 do
+    begin
+      Expected := Scale * Codes[i];
+      AssertEquals('element ' + IntToStr(i) + ' at N=' + IntToStr(Len),
+        Expected, Dst[i], 0);
+    end;
+    AssertEquals('wrote past N=' + IntToStr(Len), 12345.0, Dst[Len], 0);
+  end;
 end;
 
 // QuantizeInt8 then DequantizeInt8 must land within half a code of the input,

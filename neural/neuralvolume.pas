@@ -682,7 +682,7 @@ type
       // LeakyRelu writes dst[0..N-1] := src[i] when src[i] >= 0 and
       // Slope*src[i] otherwise - the activation every HiFi-GAN / vocoder
       // resblock applies over its whole channel x timestep signal.
-      // AVX2/64-bit builds run AVXLeakyRelu (eight elements per iteration);
+      // AVX2/64-bit builds run AVXLeakyRelu;
       // every other build runs the equivalent scalar loop. Bit-identical either
       // way, the >= 0 boundary included. Buffers may alias (dst = src).
       class procedure LeakyRelu(pDst, pSrc: TNeuralFloatArrPtr;
@@ -2123,8 +2123,12 @@ end;
 // a broadcast $7FFFFFFF mask and each vector is masked against MaxSingle with
 // the NON-SIGNALING LE_OQ predicate (18), which is false for both NaN and
 // +/-Inf - so a non-finite lane contributes 0 and no compare can raise
-// EInvalidOp under FPC's unmasked SSE exceptions. Eight lanes at a time; the
-// fold and the tail repeat the same masking in Pascal.
+// EInvalidOp under FPC's unmasked SSE exceptions. The fold and the tail repeat
+// the same masking in Pascal.
+//
+// The loop shape is DotProductsTiled's: an unrolled body folding 32 floats per
+// iteration into four independent accumulators, then an 8-at-a-time loop for
+// the 8..31 remainder, then the Pascal tail for the last 1..7.
 //
 // Both vector constants are broadcast from a LOCAL pair reached through a
 // pointer (the AVXAddScalar idiom) rather than from a global const table: no
@@ -2151,24 +2155,72 @@ begin
   mov rax, PtrA
   mov rdx, ConstsPtr
   mov ecx, localNumElements
-  shr ecx, 3
   vbroadcastss ymm3, [rdx]
   vbroadcastss ymm2, [rdx+4]
   vxorps    ymm4, ymm4, ymm4
-@Loop:
-  vmovups   ymm0, [rax]
+
+  push rcx
+  shr ecx, 5                   // large iterations = elements / 32
+  jz @SkipLargeMaxLoop
+  vxorps    ymm11, ymm11, ymm11
+  vxorps    ymm12, ymm12, ymm12
+  vxorps    ymm13, ymm13, ymm13
+@LargeMaxLoop:
+  vmovups   ymm0, [rax]        // 4 x 8 floats, four independent chains
+  vmovups   ymm1, [rax+32]
+  vmovups   ymm5, [rax+64]
+  vmovups   ymm6, [rax+96]
+
   vandps    ymm0, ymm0, ymm3   // |x|; a NaN stays a NaN
-  vcmpps    ymm1, ymm0, ymm2, 18  // LE_OQ: false for NaN and for +Inf
-  vandps    ymm0, ymm0, ymm1   // non-finite lanes -> 0
+  vandps    ymm1, ymm1, ymm3
+  vandps    ymm5, ymm5, ymm3
+  vandps    ymm6, ymm6, ymm3
+
+  vcmpps    ymm7, ymm0, ymm2, 18   // LE_OQ: false for NaN and for +Inf
+  vcmpps    ymm8, ymm1, ymm2, 18
+  vcmpps    ymm9, ymm5, ymm2, 18
+  vcmpps    ymm10, ymm6, ymm2, 18
+
+  vandps    ymm0, ymm0, ymm7   // non-finite lanes -> 0
+  vandps    ymm1, ymm1, ymm8
+  vandps    ymm5, ymm5, ymm9
+  vandps    ymm6, ymm6, ymm10
+
+  vmaxps    ymm4, ymm4, ymm0
+  vmaxps    ymm11, ymm11, ymm1
+  vmaxps    ymm12, ymm12, ymm5
+  vmaxps    ymm13, ymm13, ymm6
+
+  add rax, 128
+  dec ecx
+  jnz @LargeMaxLoop
+
+  vmaxps    ymm4, ymm4, ymm11
+  vmaxps    ymm12, ymm12, ymm13
+  vmaxps    ymm4, ymm4, ymm12
+
+@SkipLargeMaxLoop:
+  pop rcx
+  and ecx, $0000001F
+  jz @EndMax
+  shr ecx, 3                   // small iterations = (elements mod 32) / 8
+@SmallMaxLoop:
+  vmovups   ymm0, [rax]
+  vandps    ymm0, ymm0, ymm3
+  vcmpps    ymm1, ymm0, ymm2, 18
+  vandps    ymm0, ymm0, ymm1
   vmaxps    ymm4, ymm4, ymm0
   add rax, 32
   dec ecx
-  jnz @Loop
+  jnz @SmallMaxLoop
+
+@EndMax:
   vmovups   vMax, ymm4
   vzeroupper
   end
   [
-    'RAX', 'RCX', 'RDX', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4'
+    'RAX', 'RCX', 'RDX', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5',
+    'ymm6', 'ymm7', 'ymm8', 'ymm9', 'ymm10', 'ymm11', 'ymm12', 'ymm13'
   ];
     Result := vMax[0];
     for i := 1 to 7 do
@@ -2200,7 +2252,12 @@ end;
 // +/-Inf into +/-127), vcvtps2dq rounds to nearest-even in the default MXCSR
 // mode - the same rounding FPC's Round() emits - and the two saturating packs
 // narrow 8 dwords to 8 bytes in lane order via an xmm extract, so no
-// cross-lane fixup is needed. Coded by Claude (AI).
+// cross-lane fixup is needed.
+//
+// The loop shape is DotProductsTiled's: an unrolled body quantizing 32 floats
+// per iteration through four independent register chains (whose byte results
+// pair up into two 16-byte stores), then an 8-at-a-time loop for the 8..31
+// remainder, then the Pascal tail for the last 1..7. Coded by Claude (AI).
 procedure AVXQuantizeInt8(PtrDst: TNeuralInt8ArrPtr;
   PtrSrc: TNeuralFloatArrPtr; NumElements: integer; MaxAbs: Single);
 var
@@ -2224,32 +2281,99 @@ begin
   mov rdx, PtrDst
   mov r8, ConstsPtr
   mov ecx, localNumElements
-  shr ecx, 3
   vbroadcastss ymm5, [r8]
   vbroadcastss ymm6, [r8+4]
   vbroadcastss ymm7, [r8+8]
-@Loop:
-  vmovups   ymm0, [rax]
-  vcmpps    ymm1, ymm0, ymm0, 7   // ORD_Q: false only for NaN
-  vandps    ymm0, ymm0, ymm1      // NaN -> 0
+
+  push rcx
+  shr ecx, 5                      // large iterations = elements / 32
+  jz @SkipLargeQuantLoop
+@LargeQuantLoop:
+  vmovups   ymm0, [rax]           // 4 x 8 floats, four independent chains
+  vmovups   ymm1, [rax+32]
+  vmovups   ymm2, [rax+64]
+  vmovups   ymm3, [rax+96]
+
+  vcmpps    ymm4, ymm0, ymm0, 7   // ORD_Q: false only for NaN
+  vcmpps    ymm8, ymm1, ymm1, 7
+  vcmpps    ymm9, ymm2, ymm2, 7
+  vcmpps    ymm10, ymm3, ymm3, 7
+  vandps    ymm0, ymm0, ymm4      // NaN -> 0
+  vandps    ymm1, ymm1, ymm8
+  vandps    ymm2, ymm2, ymm9
+  vandps    ymm3, ymm3, ymm10
+
   vmulps    ymm0, ymm0, ymm5      // * 1/MaxAbs  (|.| <= 1, Inf stays Inf)
+  vmulps    ymm1, ymm1, ymm5
+  vmulps    ymm2, ymm2, ymm5
+  vmulps    ymm3, ymm3, ymm5
   vmulps    ymm0, ymm0, ymm6      // * 127
+  vmulps    ymm1, ymm1, ymm6
+  vmulps    ymm2, ymm2, ymm6
+  vmulps    ymm3, ymm3, ymm6
+
   vminps    ymm0, ymm0, ymm6      // clamp +127 (+Inf -> 127)
+  vminps    ymm1, ymm1, ymm6
+  vminps    ymm2, ymm2, ymm6
+  vminps    ymm3, ymm3, ymm6
   vmaxps    ymm0, ymm0, ymm7      // clamp -127 (-Inf -> -127)
+  vmaxps    ymm1, ymm1, ymm7
+  vmaxps    ymm2, ymm2, ymm7
+  vmaxps    ymm3, ymm3, ymm7
+
   vcvtps2dq ymm0, ymm0            // round to nearest even
+  vcvtps2dq ymm1, ymm1
+  vcvtps2dq ymm2, ymm2
+  vcvtps2dq ymm3, ymm3
+
+  vextracti128 xmm4, ymm0, 1
+  vextracti128 xmm8, ymm1, 1
+  vextracti128 xmm9, ymm2, 1
+  vextracti128 xmm10, ymm3, 1
+  vpackssdw xmm0, xmm0, xmm4      // 8 dwords -> 8 words, in lane order
+  vpackssdw xmm1, xmm1, xmm8
+  vpackssdw xmm2, xmm2, xmm9
+  vpackssdw xmm3, xmm3, xmm10
+  vpacksswb xmm0, xmm0, xmm1      // 16 codes: chain 0 low, chain 1 high
+  vpacksswb xmm2, xmm2, xmm3
+  vmovups   [rdx], xmm0
+  vmovups   [rdx+16], xmm2
+
+  add rax, 128
+  add rdx, 32
+  dec ecx
+  jnz @LargeQuantLoop
+
+@SkipLargeQuantLoop:
+  pop rcx
+  and ecx, $0000001F
+  jz @EndQuant
+  shr ecx, 3                      // small iterations = (elements mod 32) / 8
+@SmallQuantLoop:
+  vmovups   ymm0, [rax]
+  vcmpps    ymm1, ymm0, ymm0, 7
+  vandps    ymm0, ymm0, ymm1
+  vmulps    ymm0, ymm0, ymm5
+  vmulps    ymm0, ymm0, ymm6
+  vminps    ymm0, ymm0, ymm6
+  vmaxps    ymm0, ymm0, ymm7
+  vcvtps2dq ymm0, ymm0
   vextracti128 xmm1, ymm0, 1
-  vpackssdw xmm0, xmm0, xmm1      // 8 dwords -> 8 words, in lane order
+  vpackssdw xmm0, xmm0, xmm1
   vpacksswb xmm0, xmm0, xmm0      // low 8 bytes = the 8 codes
   vmovq     [rdx], xmm0
   add rax, 32
   add rdx, 8
   dec ecx
-  jnz @Loop
+  jnz @SmallQuantLoop
+
+@EndQuant:
   vzeroupper
   end
   [
     'RAX', 'RCX', 'RDX', 'R8',
-    'ymm0', 'ymm1', 'ymm5', 'ymm6', 'ymm7'
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm6', 'ymm7',
+    'ymm8', 'ymm9', 'ymm10'
   ];
   end;
   NumElementsM1 := NumElements - 1;
@@ -2272,7 +2396,10 @@ end;
 // dst[i] := Scale * src[i] over NumElements symmetric int8 codes. Per 8 lanes:
 // vpmovsxbd sign-extends 8 bytes to dwords, vcvtdq2ps converts, one broadcast
 // vmulps applies the scale - the same three steps AVXDotProductInt8 uses to
-// materialize weights in-register, here written out to memory instead.
+// materialize weights in-register, here written out to memory instead. The
+// loop shape is DotProductsTiled's: an unrolled body converting 32 codes per
+// iteration through four independent register chains, then an 8-at-a-time loop
+// for the 8..31 remainder, then the Pascal tail for the last 1..7.
 //
 // Bit-exact against the scalar tail: both round exactly one single-precision
 // product. The scale is broadcast from a LOCAL through a pointer (the
@@ -2296,9 +2423,43 @@ begin
   mov rdx, PtrDst
   mov r8, ScalePtr
   mov ecx, localNumElements
-  shr ecx, 3
   vbroadcastss ymm2, [r8]
-@Loop:
+
+  push rcx
+  shr ecx, 5                 // large iterations = elements / 32
+  jz @SkipLargeDequantLoop
+@LargeDequantLoop:
+  vpmovsxbd ymm0, [rax]      // 4 x 8 codes -> 8 sign-extended dwords each
+  vpmovsxbd ymm1, [rax+8]
+  vpmovsxbd ymm3, [rax+16]
+  vpmovsxbd ymm4, [rax+24]
+
+  vcvtdq2ps ymm0, ymm0
+  vcvtdq2ps ymm1, ymm1
+  vcvtdq2ps ymm3, ymm3
+  vcvtdq2ps ymm4, ymm4
+
+  vmulps    ymm0, ymm0, ymm2
+  vmulps    ymm1, ymm1, ymm2
+  vmulps    ymm3, ymm3, ymm2
+  vmulps    ymm4, ymm4, ymm2
+
+  vmovups   [rdx], ymm0
+  vmovups   [rdx+32], ymm1
+  vmovups   [rdx+64], ymm3
+  vmovups   [rdx+96], ymm4
+
+  add rax, 32
+  add rdx, 128
+  dec ecx
+  jnz @LargeDequantLoop
+
+@SkipLargeDequantLoop:
+  pop rcx
+  and ecx, $0000001F
+  jz @EndDequant
+  shr ecx, 3                 // small iterations = (elements mod 32) / 8
+@SmallDequantLoop:
   vpmovsxbd ymm0, [rax]      // 8 codes -> 8 sign-extended dwords
   vcvtdq2ps ymm0, ymm0
   vmulps    ymm0, ymm0, ymm2
@@ -2306,11 +2467,13 @@ begin
   add rax, 8
   add rdx, 32
   dec ecx
-  jnz @Loop
+  jnz @SmallDequantLoop
+
+@EndDequant:
   vzeroupper
   end
   [
-    'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm2'
+    'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4'
   ];
   end;
   NumElementsM1 := NumElements - 1;
@@ -2363,7 +2526,10 @@ end;
 // The non-signaling GE_OQ predicate (29) is false for NaN and true for -0.0,
 // which is exactly what the scalar `src >= 0` test does, and the vandps against
 // a broadcast 1.0 leaves 1.0 and 0.0 as the only possible outputs. So this is
-// bit-identical to the scalar loop, boundary included.
+// bit-identical to the scalar loop, boundary included. The loop shape is
+// DotProductsTiled's: an unrolled body doing 32 elements per iteration through
+// four independent register chains, then an 8-at-a-time loop for the 8..31
+// remainder, then the Pascal tail for the last 1..7.
 //
 // The 1.0 is broadcast from a LOCAL reached through a pointer (the AVXAddScalar
 // idiom) so no [rip+label] relocation appears and position-independent linking
@@ -2385,22 +2551,59 @@ begin
   mov rdx, PtrDst
   mov r8, OnePtr
   mov ecx, localNumElements
-  shr ecx, 3
   vbroadcastss ymm2, [r8]
   vxorps    ymm3, ymm3, ymm3
-@Loop:
+
+  push rcx
+  shr ecx, 5                       // large iterations = elements / 32
+  jz @SkipLargeGateLoop
+@LargeGateLoop:
+  vmovups   ymm0, [rax]            // 4 x 8 floats, four independent chains
+  vmovups   ymm1, [rax+32]
+  vmovups   ymm4, [rax+64]
+  vmovups   ymm5, [rax+96]
+
+  vcmpps    ymm0, ymm0, ymm3, 29   // GE_OQ: false for NaN, true for -0.0
+  vcmpps    ymm1, ymm1, ymm3, 29
+  vcmpps    ymm4, ymm4, ymm3, 29
+  vcmpps    ymm5, ymm5, ymm3, 29
+
+  vandps    ymm0, ymm0, ymm2
+  vandps    ymm1, ymm1, ymm2
+  vandps    ymm4, ymm4, ymm2
+  vandps    ymm5, ymm5, ymm2
+
+  vmovups   [rdx], ymm0
+  vmovups   [rdx+32], ymm1
+  vmovups   [rdx+64], ymm4
+  vmovups   [rdx+96], ymm5
+
+  add rax, 128
+  add rdx, 128
+  dec ecx
+  jnz @LargeGateLoop
+
+@SkipLargeGateLoop:
+  pop rcx
+  and ecx, $0000001F
+  jz @EndGate
+  shr ecx, 3                       // small iterations = (elements mod 32) / 8
+@SmallGateLoop:
   vmovups   ymm0, [rax]
-  vcmpps    ymm1, ymm0, ymm3, 29   // GE_OQ: false for NaN, true for -0.0
+  vcmpps    ymm1, ymm0, ymm3, 29
   vandps    ymm1, ymm1, ymm2
   vmovups   [rdx], ymm1
   add rax, 32
   add rdx, 32
   dec ecx
-  jnz @Loop
+  jnz @SmallGateLoop
+
+@EndGate:
   vzeroupper
   end
   [
-    'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm1', 'ymm2', 'ymm3'
+    'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4',
+    'ymm5'
   ];
   end;
   NumElementsM1 := NumElements - 1;
@@ -2408,12 +2611,16 @@ begin
     if PtrSrc^[i] >= 0 then PtrDst^[i] := 1 else PtrDst^[i] := 0;
 end;
 
-// dst[i] := src[i] when src[i] >= 0, else Slope * src[i] - eight elements per
-// iteration as a compare, a multiply and a blend. The slope is broadcast from a
-// local, so the kernel references no global constant and stays position
-// independent. Bit-exact against the scalar tail: the taken branch is the same
+// dst[i] := src[i] when src[i] >= 0, else Slope * src[i] - a compare, a
+// multiply and a blend per vector. The slope is broadcast from a local, so the
+// kernel references no global constant and stays position independent.
+// Bit-exact against the scalar tail: the taken branch is the same
 // single-precision multiply, GE_OQ selects -0.0 as non-negative exactly as the
 // scalar >= 0 does, and NaN falls to the multiply on both paths.
+//
+// The loop shape is DotProductsTiled's: an unrolled body doing 32 elements per
+// iteration through four independent register chains, then an 8-at-a-time loop
+// for the 8..31 remainder, then the Pascal tail for the last 1..7.
 procedure AVXLeakyRelu(PtrDst, PtrSrc: TNeuralFloatArrPtr;
   Slope: TNeuralFloat; NumElements: integer);
 var
@@ -2431,23 +2638,66 @@ begin
   mov rdx, PtrDst
   mov r8, SlopePtr
   mov ecx, localNumElements
-  shr ecx, 3
   vbroadcastss ymm2, [r8]
   vxorps    ymm3, ymm3, ymm3
-@Loop:
+
+  push rcx
+  shr ecx, 5                          // large iterations = elements / 32
+  jz @SkipLargeLeakyLoop
+@LargeLeakyLoop:
+  vmovups   ymm0, [rax]               // 4 x 8 floats, four independent chains
+  vmovups   ymm4, [rax+32]
+  vmovups   ymm6, [rax+64]
+  vmovups   ymm8, [rax+96]
+
+  vmulps    ymm1, ymm0, ymm2          // Slope * x
+  vmulps    ymm5, ymm4, ymm2
+  vmulps    ymm7, ymm6, ymm2
+  vmulps    ymm9, ymm8, ymm2
+
+  vcmpps    ymm10, ymm0, ymm3, 29     // GE_OQ: false for NaN, true for -0.0
+  vcmpps    ymm11, ymm4, ymm3, 29
+  vcmpps    ymm12, ymm6, ymm3, 29
+  vcmpps    ymm13, ymm8, ymm3, 29
+
+  vblendvps ymm1, ymm1, ymm0, ymm10   // x where x >= 0, else Slope * x
+  vblendvps ymm5, ymm5, ymm4, ymm11
+  vblendvps ymm7, ymm7, ymm6, ymm12
+  vblendvps ymm9, ymm9, ymm8, ymm13
+
+  vmovups   [rdx], ymm1
+  vmovups   [rdx+32], ymm5
+  vmovups   [rdx+64], ymm7
+  vmovups   [rdx+96], ymm9
+
+  add rax, 128
+  add rdx, 128
+  dec ecx
+  jnz @LargeLeakyLoop
+
+@SkipLargeLeakyLoop:
+  pop rcx
+  and ecx, $0000001F
+  jz @EndLeaky
+  shr ecx, 3                          // small iterations = (elements mod 32) / 8
+@SmallLeakyLoop:
   vmovups   ymm0, [rax]
-  vmulps    ymm1, ymm0, ymm2       // Slope * x
-  vcmpps    ymm4, ymm0, ymm3, 29   // GE_OQ: false for NaN, true for -0.0
-  vblendvps ymm1, ymm1, ymm0, ymm4 // x where x >= 0, else Slope * x
+  vmulps    ymm1, ymm0, ymm2
+  vcmpps    ymm4, ymm0, ymm3, 29
+  vblendvps ymm1, ymm1, ymm0, ymm4
   vmovups   [rdx], ymm1
   add rax, 32
   add rdx, 32
   dec ecx
-  jnz @Loop
+  jnz @SmallLeakyLoop
+
+@EndLeaky:
   vzeroupper
   end
   [
-    'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4'
+    'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4',
+    'ymm5', 'ymm6', 'ymm7', 'ymm8', 'ymm9', 'ymm10', 'ymm11', 'ymm12',
+    'ymm13'
   ];
   end;
   NumElementsM1 := NumElements - 1;
@@ -2456,13 +2706,19 @@ begin
     else PtrDst^[i] := Slope * PtrSrc^[i];
 end;
 
-// dst[i] := the leaky clamp of src[i] into [LowLimit, HighLimit] - eight
-// elements per iteration as two clamped forms and two blends. Slope and both
-// limits are broadcast from a local array, so the kernel references no global
-// constant and stays position independent. Bit-exact against the scalar tail:
-// each form is the same subtract-multiply-add in the same order (no FMA), the
-// GT_OQ compares reproduce the scalar's strict > without signalling on NaN,
-// and a NaN input falls to the low form on both paths.
+// dst[i] := the leaky clamp of src[i] into [LowLimit, HighLimit] - two clamped
+// forms and two blends per vector. Slope and both limits are broadcast from a
+// local array, so the kernel references no global constant and stays position
+// independent. Bit-exact against the scalar tail: each form is the same
+// subtract-multiply-add in the same order (no FMA), the GT_OQ compares
+// reproduce the scalar's strict > without signalling on NaN, and a NaN input
+// falls to the low form on both paths.
+//
+// The loop shape is DotProductsTiled's: an unrolled body doing 32 elements per
+// iteration through four independent register chains, then an 8-at-a-time loop
+// for the 8..31 remainder, then the Pascal tail for the last 1..7. The four
+// chains share one compare temporary; the write is a WAR hazard the register
+// renamer removes, so the chains still issue independently.
 procedure AVXReluL(PtrDst, PtrSrc: TNeuralFloatArrPtr;
   LowLimit, HighLimit, Slope: TNeuralFloat; NumElements: integer);
 var
@@ -2482,32 +2738,102 @@ begin
   mov rdx, PtrDst
   mov r8, ParamsPtr
   mov ecx, localNumElements
-  shr ecx, 3
   vbroadcastss ymm2, [r8]
   vbroadcastss ymm3, [r8+4]
   vbroadcastss ymm4, [r8+8]
-@Loop:
-  vmovups   ymm0, [rax]
-  vsubps    ymm1, ymm0, ymm4       // x - HighLimit
+
+  push rcx
+  shr ecx, 5                          // large iterations = elements / 32
+  jz @SkipLargeReluLLoop
+@LargeReluLLoop:
+  vmovups   ymm0, [rax]               // 4 x 8 floats, four independent chains
+  vmovups   ymm5, [rax+32]
+  vmovups   ymm8, [rax+64]
+  vmovups   ymm11, [rax+96]
+
+  vsubps    ymm1, ymm0, ymm4          // x - HighLimit
+  vsubps    ymm6, ymm5, ymm4
+  vsubps    ymm9, ymm8, ymm4
+  vsubps    ymm12, ymm11, ymm4
   vmulps    ymm1, ymm1, ymm2
-  vaddps    ymm1, ymm1, ymm4       // HighLimit + (x-HighLimit)*Slope
-  vsubps    ymm5, ymm0, ymm3       // x - LowLimit
+  vmulps    ymm6, ymm6, ymm2
+  vmulps    ymm9, ymm9, ymm2
+  vmulps    ymm12, ymm12, ymm2
+  vaddps    ymm1, ymm1, ymm4          // HighLimit + (x-HighLimit)*Slope
+  vaddps    ymm6, ymm6, ymm4
+  vaddps    ymm9, ymm9, ymm4
+  vaddps    ymm12, ymm12, ymm4
+
+  vsubps    ymm7, ymm0, ymm3          // x - LowLimit
+  vsubps    ymm10, ymm5, ymm3
+  vsubps    ymm13, ymm8, ymm3
+  vsubps    ymm14, ymm11, ymm3
+  vmulps    ymm7, ymm7, ymm2
+  vmulps    ymm10, ymm10, ymm2
+  vmulps    ymm13, ymm13, ymm2
+  vmulps    ymm14, ymm14, ymm2
+  vaddps    ymm7, ymm7, ymm3          // LowLimit + (x-LowLimit)*Slope
+  vaddps    ymm10, ymm10, ymm3
+  vaddps    ymm13, ymm13, ymm3
+  vaddps    ymm14, ymm14, ymm3
+
+  vcmpps    ymm15, ymm0, ymm3, 30     // GT_OQ: false for NaN, no signal
+  vblendvps ymm7, ymm7, ymm0, ymm15   // x where x > LowLimit
+  vcmpps    ymm15, ymm0, ymm4, 30
+  vblendvps ymm7, ymm7, ymm1, ymm15   // the high form where x > HighLimit
+  vcmpps    ymm15, ymm5, ymm3, 30
+  vblendvps ymm10, ymm10, ymm5, ymm15
+  vcmpps    ymm15, ymm5, ymm4, 30
+  vblendvps ymm10, ymm10, ymm6, ymm15
+  vcmpps    ymm15, ymm8, ymm3, 30
+  vblendvps ymm13, ymm13, ymm8, ymm15
+  vcmpps    ymm15, ymm8, ymm4, 30
+  vblendvps ymm13, ymm13, ymm9, ymm15
+  vcmpps    ymm15, ymm11, ymm3, 30
+  vblendvps ymm14, ymm14, ymm11, ymm15
+  vcmpps    ymm15, ymm11, ymm4, 30
+  vblendvps ymm14, ymm14, ymm12, ymm15
+
+  vmovups   [rdx], ymm7
+  vmovups   [rdx+32], ymm10
+  vmovups   [rdx+64], ymm13
+  vmovups   [rdx+96], ymm14
+
+  add rax, 128
+  add rdx, 128
+  dec ecx
+  jnz @LargeReluLLoop
+
+@SkipLargeReluLLoop:
+  pop rcx
+  and ecx, $0000001F
+  jz @EndReluL
+  shr ecx, 3                          // small iterations = (elements mod 32) / 8
+@SmallReluLLoop:
+  vmovups   ymm0, [rax]
+  vsubps    ymm1, ymm0, ymm4
+  vmulps    ymm1, ymm1, ymm2
+  vaddps    ymm1, ymm1, ymm4
+  vsubps    ymm5, ymm0, ymm3
   vmulps    ymm5, ymm5, ymm2
-  vaddps    ymm5, ymm5, ymm3       // LowLimit + (x-LowLimit)*Slope
-  vcmpps    ymm6, ymm0, ymm3, 30   // GT_OQ: false for NaN, no signal
-  vblendvps ymm5, ymm5, ymm0, ymm6 // x where x > LowLimit
+  vaddps    ymm5, ymm5, ymm3
+  vcmpps    ymm6, ymm0, ymm3, 30
+  vblendvps ymm5, ymm5, ymm0, ymm6
   vcmpps    ymm7, ymm0, ymm4, 30
-  vblendvps ymm5, ymm5, ymm1, ymm7 // the high form where x > HighLimit
+  vblendvps ymm5, ymm5, ymm1, ymm7
   vmovups   [rdx], ymm5
   add rax, 32
   add rdx, 32
   dec ecx
-  jnz @Loop
+  jnz @SmallReluLLoop
+
+@EndReluL:
   vzeroupper
   end
   [
     'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4',
-    'ymm5', 'ymm6', 'ymm7'
+    'ymm5', 'ymm6', 'ymm7', 'ymm8', 'ymm9', 'ymm10', 'ymm11', 'ymm12',
+    'ymm13', 'ymm14', 'ymm15'
   ];
   end;
   NumElementsM1 := NumElements - 1;
@@ -2522,6 +2848,10 @@ end;
 // clamp's derivative. The two GT_OQ compares and the vandnps build the same
 // interior test the scalar tail spells as two branches; a NaN input scores
 // Slope on both paths.
+//
+// The loop shape is DotProductsTiled's: an unrolled body doing 32 elements per
+// iteration through four independent register chains, then an 8-at-a-time loop
+// for the 8..31 remainder, then the Pascal tail for the last 1..7.
 procedure AVXReluLGateMask(PtrDst, PtrSrc: TNeuralFloatArrPtr;
   LowLimit, HighLimit, Slope: TNeuralFloat; NumElements: integer);
 var
@@ -2542,27 +2872,73 @@ begin
   mov rdx, PtrDst
   mov r8, ParamsPtr
   mov ecx, localNumElements
-  shr ecx, 3
   vbroadcastss ymm2, [r8]
   vbroadcastss ymm3, [r8+4]
   vbroadcastss ymm4, [r8+8]
   vbroadcastss ymm5, [r8+12]
-@Loop:
+
+  push rcx
+  shr ecx, 5                        // large iterations = elements / 32
+  jz @SkipLargeReluLGateLoop
+@LargeReluLGateLoop:
+  vmovups   ymm0, [rax]             // 4 x 8 floats, four independent chains
+  vmovups   ymm6, [rax+32]
+  vmovups   ymm9, [rax+64]
+  vmovups   ymm12, [rax+96]
+
+  vcmpps    ymm1, ymm0, ymm3, 30    // x > LowLimit
+  vcmpps    ymm7, ymm6, ymm3, 30
+  vcmpps    ymm10, ymm9, ymm3, 30
+  vcmpps    ymm13, ymm12, ymm3, 30
+  vcmpps    ymm8, ymm0, ymm4, 30    // x > HighLimit
+  vcmpps    ymm11, ymm6, ymm4, 30
+  vcmpps    ymm14, ymm9, ymm4, 30
+  vcmpps    ymm15, ymm12, ymm4, 30
+
+  vandnps   ymm1, ymm8, ymm1        // inside: above the low limit, not the high
+  vandnps   ymm7, ymm11, ymm7
+  vandnps   ymm10, ymm14, ymm10
+  vandnps   ymm13, ymm15, ymm13
+
+  vblendvps ymm0, ymm2, ymm5, ymm1
+  vblendvps ymm6, ymm2, ymm5, ymm7
+  vblendvps ymm9, ymm2, ymm5, ymm10
+  vblendvps ymm12, ymm2, ymm5, ymm13
+
+  vmovups   [rdx], ymm0
+  vmovups   [rdx+32], ymm6
+  vmovups   [rdx+64], ymm9
+  vmovups   [rdx+96], ymm12
+
+  add rax, 128
+  add rdx, 128
+  dec ecx
+  jnz @LargeReluLGateLoop
+
+@SkipLargeReluLGateLoop:
+  pop rcx
+  and ecx, $0000001F
+  jz @EndReluLGate
+  shr ecx, 3                        // small iterations = (elements mod 32) / 8
+@SmallReluLGateLoop:
   vmovups   ymm0, [rax]
-  vcmpps    ymm6, ymm0, ymm3, 30   // x > LowLimit
-  vcmpps    ymm7, ymm0, ymm4, 30   // x > HighLimit
-  vandnps   ymm6, ymm7, ymm6       // inside: above the low limit, not the high
+  vcmpps    ymm6, ymm0, ymm3, 30
+  vcmpps    ymm7, ymm0, ymm4, 30
+  vandnps   ymm6, ymm7, ymm6
   vblendvps ymm1, ymm2, ymm5, ymm6
   vmovups   [rdx], ymm1
   add rax, 32
   add rdx, 32
   dec ecx
-  jnz @Loop
+  jnz @SmallReluLGateLoop
+
+@EndReluLGate:
   vzeroupper
   end
   [
     'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4',
-    'ymm5', 'ymm6', 'ymm7'
+    'ymm5', 'ymm6', 'ymm7', 'ymm8', 'ymm9', 'ymm10', 'ymm11', 'ymm12',
+    'ymm13', 'ymm14', 'ymm15'
   ];
   end;
   NumElementsM1 := NumElements - 1;
