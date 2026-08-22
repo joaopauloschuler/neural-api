@@ -2574,10 +2574,13 @@ end;
 
 
 {$IFNDEF NOF16C}
-// dst[i] := half(src[i]) widened to single, 8 per iteration through F16C's
-// vcvtph2ps. Every half is exactly representable as a single, so the
-// instruction is a lossless widening and agrees bit-for-bit with the scalar
-// NeuralHalfToSingle tail.
+// dst[i] := half(src[i]) widened to single through F16C's vcvtph2ps. Every
+// half is exactly representable as a single, so the instruction is a lossless
+// widening and agrees bit-for-bit with the scalar NeuralHalfToSingle tail.
+//
+// The loop shape is DotProductsTiled's: an unrolled body converting 32 halves
+// per iteration through four independent register chains, then an 8-at-a-time
+// loop for the 8..31 remainder, then the Pascal tail for the last 1..7.
 //
 // vcvtph2ps raises #I for a SIGNALLING NaN input, and FPC leaves the SSE
 // invalid-operation exception unmasked - so a corrupt file carrying one would
@@ -2623,26 +2626,75 @@ begin
   mov rdx, PtrDst
   mov r8, ConstsPtr
   mov ecx, localNumElements
-  shr ecx, 3
   vmovups   xmm2, [r8]
   vmovups   xmm3, [r8+16]
   vmovups   xmm4, [r8+32]
-@Loop:
+
+  push rcx
+  shr ecx, 5                     // large iterations = elements / 32
+  jz @SkipLargeDecodeLoop
+@LargeDecodeLoop:
+  vmovups   xmm0, [rax]          // 4 x 8 halves, four independent chains
+  vmovups   xmm1, [rax+16]
+  vmovups   xmm5, [rax+32]
+  vmovups   xmm6, [rax+48]
+
+  vpand     xmm7, xmm0, xmm2     // |h|
+  vpcmpgtw  xmm7, xmm7, xmm3     // |h| > $7C00  <=>  h is NaN
+  vpand     xmm7, xmm7, xmm4     // quiet bit, only on the NaN lanes
+  vpor      xmm0, xmm0, xmm7     // signalling NaN -> quiet NaN
+  vpand     xmm7, xmm1, xmm2
+  vpcmpgtw  xmm7, xmm7, xmm3
+  vpand     xmm7, xmm7, xmm4
+  vpor      xmm1, xmm1, xmm7
+  vpand     xmm7, xmm5, xmm2
+  vpcmpgtw  xmm7, xmm7, xmm3
+  vpand     xmm7, xmm7, xmm4
+  vpor      xmm5, xmm5, xmm7
+  vpand     xmm7, xmm6, xmm2
+  vpcmpgtw  xmm7, xmm7, xmm3
+  vpand     xmm7, xmm7, xmm4
+  vpor      xmm6, xmm6, xmm7
+
+  db $C4, $E2, $7D, $13, $C0     // vcvtph2ps ymm0, xmm0
+  db $C4, $E2, $7D, $13, $C9     // vcvtph2ps ymm1, xmm1
+  db $C4, $E2, $7D, $13, $ED     // vcvtph2ps ymm5, xmm5
+  db $C4, $E2, $7D, $13, $F6     // vcvtph2ps ymm6, xmm6
+
+  vmovups   [rdx], ymm0
+  vmovups   [rdx+32], ymm1
+  vmovups   [rdx+64], ymm5
+  vmovups   [rdx+96], ymm6
+
+  add rax, 64
+  add rdx, 128
+  dec ecx
+  jnz @LargeDecodeLoop
+
+@SkipLargeDecodeLoop:
+  pop rcx
+  and ecx, $0000001F
+  jz @EndDecode
+  shr ecx, 3                     // small iterations = (elements mod 32) / 8
+@SmallDecodeLoop:
   vmovups   xmm0, [rax]          // 8 halves
-  vpand     xmm1, xmm0, xmm2     // |h|
-  vpcmpgtw  xmm1, xmm1, xmm3     // |h| > $7C00  <=>  h is NaN
-  vpand     xmm1, xmm1, xmm4     // quiet bit, only on the NaN lanes
-  vpor      xmm0, xmm0, xmm1     // signalling NaN -> quiet NaN
+  vpand     xmm1, xmm0, xmm2
+  vpcmpgtw  xmm1, xmm1, xmm3
+  vpand     xmm1, xmm1, xmm4
+  vpor      xmm0, xmm0, xmm1
   db $C4, $E2, $7D, $13, $C0     // vcvtph2ps ymm0, xmm0: 8 halves -> 8 singles
   vmovups   [rdx], ymm0
   add rax, 16
   add rdx, 32
   dec ecx
-  jnz @Loop
+  jnz @SmallDecodeLoop
+
+@EndDecode:
   vzeroupper
   end
   [
-    'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4'
+    'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4',
+    'ymm5', 'ymm6', 'ymm7'
   ];
   end;
   NumElementsM1 := NumElements - 1;
@@ -2650,8 +2702,9 @@ begin
     PtrDst^[i] := NeuralHalfToSingle(PtrSrc^[i]);
 end;
 
-// dst[i] := half(src[i]), 8 per iteration through F16C's vcvtps2ph with imm8=0
-// (round-to-nearest-even, the mode NeuralSingleToHalf implements).
+// dst[i] := half(src[i]) through F16C's vcvtps2ph with imm8=0 (round-to-
+// nearest-even, the mode NeuralSingleToHalf implements). Unrolled like
+// AVXDecodeF16: 32 singles per iteration, then 8, then the Pascal tail.
 //
 // The loop runs with every SSE exception MASKED and the caller's MXCSR
 // restored afterwards. FPC leaves overflow and invalid-operation unmasked, and
@@ -2687,19 +2740,50 @@ begin
   mov rax, PtrSrc
   mov rdx, PtrDst
   mov ecx, localNumElements
-  shr ecx, 3
-@Loop:
+
+  push rcx
+  shr ecx, 5                           // large iterations = elements / 32
+  jz @SkipLargeEncodeLoop
+@LargeEncodeLoop:
+  vmovups   ymm0, [rax]                // 4 x 8 singles, four independent chains
+  vmovups   ymm1, [rax+32]
+  vmovups   ymm2, [rax+64]
+  vmovups   ymm3, [rax+96]
+
+  db $C4, $E3, $7D, $1D, $C0, $00      // vcvtps2ph xmm0, ymm0, 0
+  db $C4, $E3, $7D, $1D, $C9, $00      // vcvtps2ph xmm1, ymm1, 0
+  db $C4, $E3, $7D, $1D, $D2, $00      // vcvtps2ph xmm2, ymm2, 0
+  db $C4, $E3, $7D, $1D, $DB, $00      // vcvtps2ph xmm3, ymm3, 0
+
+  vmovups   [rdx], xmm0
+  vmovups   [rdx+16], xmm1
+  vmovups   [rdx+32], xmm2
+  vmovups   [rdx+48], xmm3
+
+  add rax, 128
+  add rdx, 64
+  dec ecx
+  jnz @LargeEncodeLoop
+
+@SkipLargeEncodeLoop:
+  pop rcx
+  and ecx, $0000001F
+  jz @EndEncode
+  shr ecx, 3                           // small iterations = (elements mod 32) / 8
+@SmallEncodeLoop:
   vmovups   ymm0, [rax]                // 8 singles
   db $C4, $E3, $7D, $1D, $C0, $00      // vcvtps2ph xmm0, ymm0, 0: -> 8 halves
   vmovups   [rdx], xmm0
   add rax, 32
   add rdx, 16
   dec ecx
-  jnz @Loop
+  jnz @SmallEncodeLoop
+
+@EndEncode:
   vzeroupper
   end
   [
-    'RAX', 'RCX', 'RDX', 'ymm0'
+    'RAX', 'RCX', 'RDX', 'ymm0', 'ymm1', 'ymm2', 'ymm3'
   ];
     pcr_set_mxcsr(SavedMXCSR);
   end;

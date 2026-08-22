@@ -109,6 +109,7 @@ type
     procedure TestEncodeF16;
     procedure TestEncodeF16SpecialValues;
     procedure TestEncodeF16MatchesScalar;
+    procedure TestDecodeF16MatchesScalar;
   end;
 
 implementation
@@ -3387,33 +3388,89 @@ begin
     AssertEquals('filler ' + IntToStr(i), IntToHex($3C00, 4), IntToHex(Dst[i], 4));
 end;
 
-// The vectorized run and the scalar run must agree bit-for-bit: the same 1024
-// values are encoded once in bulk (which takes the F16C path on an AVX2 build)
-// and once one element at a time (always the scalar path, being under
-// csMinAvxSize). The values sweep nine decades so the sweep crosses the
-// overflow, normal, subnormal and flush-to-zero regions. Coded by Claude (AI).
+// The vectorized run and the scalar run must agree bit-for-bit: the same values
+// are encoded once in bulk (which takes the F16C path on an AVX2 build) and
+// once one element at a time (always the scalar path, being under
+// csMinAvxSize). The values sweep nine decades, so they cross the overflow,
+// normal, subnormal and flush-to-zero regions.
+//
+// The lengths are the ones that separate the three parts of the vectorized
+// routine: under 32 uses only the 8-at-a-time loop, a multiple of 32 uses only
+// the unrolled body, and the rest exercise a body-plus-remainder-plus-tail
+// combination. Coded by Claude (AI).
 procedure TTestNeuralVolumeQuant8.TestEncodeF16MatchesScalar;
 const
+  cLengths: array[0..12] of integer =
+    (1, 7, 8, 16, 31, 32, 33, 39, 40, 47, 128, 1000, 1024);
   N = 1024;
 var
   Vals: array of TNeuralFloat;
   Bulk, OneByOne: array of Word;
-  i, Mismatches: integer;
+  i, L, Len, Mismatches: integer;
 begin
   SetLength(Vals, N);
-  SetLength(Bulk, N);
+  SetLength(Bulk, N + 1);   // one guard slot past the longest run
   SetLength(OneByOne, N);
   for i := 0 to N - 1 do
     Vals[i] := (i - 512) * 0.0011 * Power(10, (i mod 19) - 9);
-  TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@Bulk[0]),
-    TNeuralFloatArrPtr(@Vals[0]), N);
   for i := 0 to N - 1 do
     TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@OneByOne[i]),
       TNeuralFloatArrPtr(@Vals[i]), 1);
-  Mismatches := 0;
+  for L := 0 to High(cLengths) do
+  begin
+    Len := cLengths[L];
+    for i := 0 to N do Bulk[i] := $DEAD;
+    TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@Bulk[0]),
+      TNeuralFloatArrPtr(@Vals[0]), Len);
+    Mismatches := 0;
+    for i := 0 to Len - 1 do
+      if Bulk[i] <> OneByOne[i] then Inc(Mismatches);
+    AssertEquals('bulk vs scalar half mismatches at N=' + IntToStr(Len),
+      0, Mismatches);
+    AssertEquals('write past N=' + IntToStr(Len),
+      IntToHex($DEAD, 4), IntToHex(Bulk[Len], 4));
+  end;
+end;
+
+// The decode twin of TestEncodeF16MatchesScalar, over the same lengths. The
+// patterns walk the half range with the all-ones exponent excluded: a
+// signalling NaN is the one input where the two paths legitimately differ (the
+// F16C path quiets it, the scalar path passes it through), and
+// TestDecodeF16SpecialValues covers that case instead. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestDecodeF16MatchesScalar;
+const
+  cLengths: array[0..12] of integer =
+    (1, 7, 8, 16, 31, 32, 33, 39, 40, 47, 128, 1000, 1024);
+  N = 1024;
+var
+  Bits: array of Word;
+  Bulk, OneByOne: array of TNeuralFloat;
+  i, L, Len, Mismatches: integer;
+begin
+  SetLength(Bits, N);
+  SetLength(Bulk, N + 1);   // one guard slot past the longest run
+  SetLength(OneByOne, N);
   for i := 0 to N - 1 do
-    if Bulk[i] <> OneByOne[i] then Inc(Mismatches);
-  AssertEquals('bulk vs scalar half mismatches', 0, Mismatches);
+  begin
+    Bits[i] := Word((i * 61) and $7BFF);       // exponent never all ones
+    if (i and 1) = 1 then Bits[i] := Bits[i] or $8000;
+  end;
+  for i := 0 to N - 1 do
+    TNNetVolume.DecodeF16(TNeuralFloatArrPtr(@OneByOne[i]),
+      TNeuralHalfArrPtr(@Bits[i]), 1);
+  for L := 0 to High(cLengths) do
+  begin
+    Len := cLengths[L];
+    for i := 0 to N do Bulk[i] := 12345;
+    TNNetVolume.DecodeF16(TNeuralFloatArrPtr(@Bulk[0]),
+      TNeuralHalfArrPtr(@Bits[0]), Len);
+    Mismatches := 0;
+    for i := 0 to Len - 1 do
+      if Bulk[i] <> OneByOne[i] then Inc(Mismatches);
+    AssertEquals('bulk vs scalar single mismatches at N=' + IntToStr(Len),
+      0, Mismatches);
+    AssertEquals('write past N=' + IntToStr(Len), 12345.0, Bulk[Len], 0);
+  end;
 end;
 
 // Straightforward O(pSize*pSize) box sum: the definition the summed-area-table
