@@ -2707,6 +2707,7 @@ begin
   for i := localNumElements to NumElementsM1 do
     PtrDst^[i] := NeuralSingleToHalf(PtrSrc^[i]);
 end;
+{$ENDIF}
 
 // EXACT centered sum of squares: sum_i (PtrA[i] - Mean)^2, eight lanes at a
 // time. Each vector is loaded, the broadcast mean is subtracted and the
@@ -2773,7 +2774,6 @@ begin
     Result := Result + Centered * Centered;
   end;
 end;
-{$ENDIF}
 {$ENDIF}
 {$ENDIF}
 
