@@ -4964,6 +4964,13 @@ type
     FBufHistA, FBufHistB: cl_mem;
     FCapHistA, FCapHistB: csize_t;
     FHistIsA: boolean;
+    // The one-step speculative checkpoint of the decode history, held beside
+    // the ping-pong pair so a mark and a rollback never leave OpenCL memory.
+    FBufHistCheckpoint: cl_mem;
+    FCapHistCheckpoint: csize_t;
+    // Live history bytes, as UploadHistory sized them: the checkpoint moves
+    // exactly that much, not the grow-only capacity of the buffers.
+    FHistBytes: csize_t;
     // The cai_depthwise_conv1d_decode entry point, bound beside the full-sequence
     // one so both share the resident weight, bias and output buffers.
     FDecodeKernel: TNeuralKernel;
@@ -5007,6 +5014,14 @@ type
     // Reads the live history buffer back into Hist (blocking). Nothing to read
     // before the first UploadHistory, which the caller tracks.
     procedure DownloadHistory(Hist: TNNetVolume);
+    // One-step speculative checkpoint, entirely in OpenCL memory: copy the live
+    // history aside, and copy it back into the CURRENT live buffer, so the
+    // ping-pong side is left alone. False when nothing is resident to copy.
+    function CopyHistoryToCheckpoint(): boolean;
+    function CopyCheckpointToHistory(): boolean;
+    // Reads the checkpoint buffer into Hist (blocking), for a caller about to
+    // lose the buffer or the residency. False when no checkpoint is held.
+    function DownloadCheckpoint(Hist: TNNetVolume): boolean;
     // Incremental-decode forward: same arguments as Compute (Off is always
     // K-1, the causal offset), plus the resident history the launch reads and
     // advances. UploadHistory must have run for this session.
@@ -5030,6 +5045,12 @@ type
     // never uploaded per token - only when a decode session starts.
     FBufALog, FBufDtBias, FBufNormW, FBufX, FBufY, FBufS: cl_mem;
     FCapALog, FCapDtBias, FCapNormW, FCapX, FCapY, FCapS: csize_t;
+    // The one-step speculative checkpoint of the state bank, held beside it so
+    // a mark and a rollback never leave OpenCL memory. FStateBytes is the live
+    // bank size UploadState sized, not the grow-only capacity of FBufS.
+    FBufSCheckpoint: cl_mem;
+    FCapSCheckpoint: csize_t;
+    FStateBytes: csize_t;
     // The kernel of the last forward, so a layer that leaves its result in
     // FBufY can name the queue that produced it. Nil before the first forward,
     // which is what tells a consumer there is nothing to bind yet.
@@ -5050,6 +5071,13 @@ type
     // Reads the state bank back into S (blocking). Nothing to read before the
     // first UploadState, which the caller tracks.
     procedure DownloadState(S: TNNetVolume);
+    // One-step speculative checkpoint, entirely in OpenCL memory: copy the live
+    // state bank aside, and copy it back. False when nothing is resident.
+    function CopyStateToCheckpoint(): boolean;
+    function CopyCheckpointToState(): boolean;
+    // Reads the checkpoint buffer into S (blocking), for a caller about to lose
+    // the buffer or the residency. False when no checkpoint is held.
+    function DownloadCheckpoint(S: TNNetVolume): boolean;
     // ALog / DtBias / NormW are Neurons[0..2]'s weights; X is the packed
     // [q|k|v|z|b|a] input and Y receives the gated read-out. S sizes the
     // resident state bank. The six channel offsets come from the layer so the
@@ -9298,9 +9326,27 @@ type
       FStateCheckpoint: TNNetVolume;
       FStateCheckpointSteps: integer;
       FStateCheckpointMarked: boolean;
+      {$IFDEF OpenCL}
+      // True while the marked checkpoint lives in OpenCL memory instead of in
+      // FStateCheckpoint.
+      FStateCheckpointOnOpenCL: boolean;
+      {$ENDIF}
       // Size/allocate the persisted decode state (and validate the layer mode
       // supports streaming). Called by BeginIncrementalDecode.
       procedure PrepareDecodeState(); virtual; abstract;
+      {$IFDEF OpenCL}
+      // Copy the decode state to / from a checkpoint held in OpenCL memory.
+      // False - the default, so every descendant without a device state path
+      // keeps the host CaptureState/RestoreState route unchanged.
+      function MarkStateCheckpointOnOpenCL(): boolean; virtual;
+      function RollbackStateCheckpointOnOpenCL(): boolean; virtual;
+      // Reads a checkpoint held in OpenCL memory into Dst, which the descendant
+      // sizes. False when there is nothing to read.
+      function DownloadStateCheckpointFromOpenCL(Dst: TNNetVolume): boolean; virtual;
+      // Brings such a checkpoint home into FStateCheckpoint so the host
+      // rollback serves it. Call BEFORE freeing the helper that owns the buffer.
+      procedure MigrateStateCheckpointToRAM();
+      {$ENDIF}
     public
       destructor Destroy(); override;
       // Enable the O(1)-per-step incremental-decode path. The persisted state
@@ -9453,6 +9499,13 @@ type
       procedure AfterWeightUpdate(); override;
     protected
       procedure PrepareDecodeState(); override;
+      {$IFDEF OpenCL}
+      // The decode history is already resident, so the speculative checkpoint
+      // is a copy inside OpenCL memory (see TNNetRecurrentDecodeBase).
+      function MarkStateCheckpointOnOpenCL(): boolean; override;
+      function RollbackStateCheckpointOnOpenCL(): boolean; override;
+      function DownloadStateCheckpointFromOpenCL(Dst: TNNetVolume): boolean; override;
+      {$ENDIF}
       // Threaded slice: one contiguous block of CHANNELS, dispatched to the
       // ranged kernel matching the current mode (full sweep vs incremental
       // decode - FDecodeEnabled is pass-stable). Coded by Claude (AI).
@@ -9491,6 +9544,9 @@ type
       // its results come out of cai_depthwise_conv1d.
       function OpenCLOutputBuffer(): cl_mem; override;
       function OpenCLOutputKernel(): TNeuralKernel; override;
+      // True while the live decode history sits in the helper's buffers rather
+      // than in FDecHist. Read-only: the layer decides when it moves.
+      property DecodeHistoryOnOpenCL: boolean read FDecHistOnOpenCL;
       {$ENDIF}
   end;
 
@@ -10597,6 +10653,13 @@ type
       procedure AfterWeightUpdate(); override;
     protected
       procedure PrepareDecodeState(); override;
+      {$IFDEF OpenCL}
+      // The decode state bank is already resident, so the speculative
+      // checkpoint is a copy inside OpenCL memory (see TNNetRecurrentDecodeBase).
+      function MarkStateCheckpointOnOpenCL(): boolean; override;
+      function RollbackStateCheckpointOnOpenCL(): boolean; override;
+      function DownloadStateCheckpointFromOpenCL(Dst: TNNetVolume): boolean; override;
+      {$ENDIF}
       // Threaded slice: one contiguous block of K-HEADS dispatched to the
       // ranged kernel (FDecodeEnabled is pass-stable and handled inside).
       // Coded by Claude (AI).
@@ -10636,6 +10699,9 @@ type
       // its results come out of cai_gated_delta_net.
       function OpenCLOutputBuffer(): cl_mem; override;
       function OpenCLOutputKernel(): TNeuralKernel; override;
+      // True while the live decode state sits in the helper's bank rather than
+      // in FDecS. Read-only: the layer decides when it moves.
+      property DecodeStateOnOpenCL: boolean read FDecSOnOpenCL;
       {$ENDIF}
   end;
 
@@ -37342,6 +37408,7 @@ begin
   if Assigned(FBufY)     then clReleaseMemObject(FBufY);
   if Assigned(FBufHistA) then clReleaseMemObject(FBufHistA);
   if Assigned(FBufHistB) then clReleaseMemObject(FBufHistB);
+  if Assigned(FBufHistCheckpoint) then clReleaseMemObject(FBufHistCheckpoint);
   FNN.FreeKernelIfNotShared('cai_depthwise_conv1d_decode', FDecodeKernel);
   inherited Destroy();
 end;
@@ -37389,6 +37456,7 @@ begin
   // buffer that grew holds nothing until a launch or an upload fills it.
   FDecodeKernel.EnsureOutputBuffer(FBufHistA, FCapHistA, Hist);
   FDecodeKernel.EnsureOutputBuffer(FBufHistB, FCapHistB, Hist);
+  FHistBytes := Hist.GetMemSize();
   FHistIsA := true;
   FDecodeKernel.WriteBuffer(FBufHistA, Hist, CL_TRUE);
 end;
@@ -37401,6 +37469,33 @@ begin
   if not Assigned(HistBuffer) then exit;
   FDecodeKernel.Finish();
   FDecodeKernel.ReadBuffer(HistBuffer, Hist, CL_TRUE);
+end;
+
+function TNNetDepthwiseConv1DCL.CopyHistoryToCheckpoint(): boolean;
+begin
+  Result := Assigned(FDecodeKernel.EnsureCopyBuffer(FBufHistCheckpoint,
+    FCapHistCheckpoint, LiveHistoryBuffer(), FHistBytes));
+end;
+
+function TNNetDepthwiseConv1DCL.CopyCheckpointToHistory(): boolean;
+var
+  LiveBuffer: cl_mem;
+begin
+  LiveBuffer := LiveHistoryBuffer();
+  Result := Assigned(FBufHistCheckpoint) and Assigned(LiveBuffer)
+            and (FHistBytes > 0);
+  if not Result then exit;
+  // Into the CURRENT live buffer, so the ping-pong side FHistIsA names stays
+  // whatever the last decode launch made it.
+  FDecodeKernel.CopyBuffer(LiveBuffer, FBufHistCheckpoint, FHistBytes);
+end;
+
+function TNNetDepthwiseConv1DCL.DownloadCheckpoint(Hist: TNNetVolume): boolean;
+begin
+  Result := Assigned(FBufHistCheckpoint) and (FHistBytes > 0);
+  if not Result then exit;
+  FDecodeKernel.Finish();
+  FDecodeKernel.ReadBuffer(FBufHistCheckpoint, Hist, CL_TRUE);
 end;
 
 procedure TNNetDepthwiseConv1DCL.ComputeDecode(PackedW, Bias, X, Y: TNNetVolume;
@@ -37500,6 +37595,7 @@ begin
   if Assigned(FBufX)      then clReleaseMemObject(FBufX);
   if Assigned(FBufY)      then clReleaseMemObject(FBufY);
   if Assigned(FBufS)      then clReleaseMemObject(FBufS);
+  if Assigned(FBufSCheckpoint) then clReleaseMemObject(FBufSCheckpoint);
   inherited Destroy();
 end;
 
@@ -37521,7 +37617,29 @@ end;
 procedure TNNetGatedDeltaNetCL.UploadState(S: TNNetVolume);
 begin
   FKernel.EnsureOutputBuffer(FBufS, FCapS, S);
+  FStateBytes := S.GetMemSize();
   FKernel.WriteBuffer(FBufS, S, CL_TRUE);
+end;
+
+function TNNetGatedDeltaNetCL.CopyStateToCheckpoint(): boolean;
+begin
+  Result := Assigned(FKernel.EnsureCopyBuffer(FBufSCheckpoint, FCapSCheckpoint,
+    FBufS, FStateBytes));
+end;
+
+function TNNetGatedDeltaNetCL.CopyCheckpointToState(): boolean;
+begin
+  Result := Assigned(FBufSCheckpoint) and Assigned(FBufS) and (FStateBytes > 0);
+  if not Result then exit;
+  FKernel.CopyBuffer(FBufS, FBufSCheckpoint, FStateBytes);
+end;
+
+function TNNetGatedDeltaNetCL.DownloadCheckpoint(S: TNNetVolume): boolean;
+begin
+  Result := Assigned(FBufSCheckpoint) and (FStateBytes > 0);
+  if not Result then exit;
+  FKernel.Finish();
+  FKernel.ReadBuffer(FBufSCheckpoint, S, CL_TRUE);
 end;
 
 procedure TNNetGatedDeltaNetCL.DownloadState(S: TNNetVolume);
@@ -60378,6 +60496,7 @@ begin
   // gated-DeltaNet layer, 144 MB across the 48 of Qwen3.8-27B).
   FreeAndNil(FStateCheckpoint);
   FStateCheckpointMarked := false;
+  {$IFDEF OpenCL} FStateCheckpointOnOpenCL := false; {$ENDIF}
   FDecodeEnabled := true;
 end;
 
@@ -60386,6 +60505,7 @@ begin
   FDecodeEnabled := false;
   FDecodeSteps := 0;
   FStateCheckpointMarked := false;
+  {$IFDEF OpenCL} FStateCheckpointOnOpenCL := false; {$ENDIF}
   FreeAndNil(FStateCheckpoint);
 end;
 
@@ -60398,6 +60518,18 @@ end;
 procedure TNNetRecurrentDecodeBase.MarkStateCheckpoint();
 begin
   if not FDecodeEnabled then exit;
+  {$IFDEF OpenCL}
+  // A state that is already resident is checkpointed where it lies: one
+  // device-to-device copy, against the queue drain + blocking read the host
+  // route costs here plus the blocking write back on the next step.
+  FStateCheckpointOnOpenCL := MarkStateCheckpointOnOpenCL();
+  if FStateCheckpointOnOpenCL then
+  begin
+    FStateCheckpointSteps := FDecodeSteps;
+    FStateCheckpointMarked := true;
+    exit;
+  end;
+  {$ENDIF}
   // Allocated once per decode session, on the first mark - never per step.
   if not Assigned(FStateCheckpoint) then FStateCheckpoint := TNNetVolume.Create();
   CaptureState(FStateCheckpoint, FStateCheckpointSteps);
@@ -60406,9 +60538,44 @@ end;
 
 procedure TNNetRecurrentDecodeBase.RollbackToStateCheckpoint();
 begin
-  if FStateCheckpointMarked then
-    RestoreState(FStateCheckpoint, FStateCheckpointSteps);
+  if not FStateCheckpointMarked then exit;
+  {$IFDEF OpenCL}
+  if FStateCheckpointOnOpenCL and RollbackStateCheckpointOnOpenCL() then
+  begin
+    FDecodeSteps := FStateCheckpointSteps;
+    exit;
+  end;
+  {$ENDIF}
+  RestoreState(FStateCheckpoint, FStateCheckpointSteps);
 end;
+
+{$IFDEF OpenCL}
+function TNNetRecurrentDecodeBase.MarkStateCheckpointOnOpenCL(): boolean;
+begin
+  Result := false;
+end;
+
+function TNNetRecurrentDecodeBase.RollbackStateCheckpointOnOpenCL(): boolean;
+begin
+  Result := false;
+end;
+
+function TNNetRecurrentDecodeBase.DownloadStateCheckpointFromOpenCL(
+  Dst: TNNetVolume): boolean;
+begin
+  Result := false;
+end;
+
+procedure TNNetRecurrentDecodeBase.MigrateStateCheckpointToRAM();
+begin
+  if not (FStateCheckpointMarked and FStateCheckpointOnOpenCL) then exit;
+  if not Assigned(FStateCheckpoint) then FStateCheckpoint := TNNetVolume.Create();
+  // A checkpoint that cannot be read back is dropped rather than left naming a
+  // buffer its owner is about to free.
+  FStateCheckpointMarked := DownloadStateCheckpointFromOpenCL(FStateCheckpoint);
+  FStateCheckpointOnOpenCL := false;
+end;
+{$ENDIF}
 
 procedure TNNetRecurrentDecodeBase.ResetCache();
 begin
@@ -60808,12 +60975,39 @@ end;
 {$IFDEF OpenCL}
 procedure TNNetDepthwiseConv1D.DisableOpenCL();
 begin
-  // FDepthwise1DCL owns the buffers a kept output and a live decode history
-  // live in, so both host copies have to be recovered before the helper goes.
+  // FDepthwise1DCL owns the buffers a kept output, a live decode history and a
+  // speculative checkpoint live in, so all three host copies have to be
+  // recovered before the helper goes.
   ForceOutputOnRAM();
   ForceDecodeHistoryOnRAM();
+  MigrateStateCheckpointToRAM();
   inherited DisableOpenCL();
   FreeAndNil(FDepthwise1DCL);
+end;
+
+function TNNetDepthwiseConv1D.MarkStateCheckpointOnOpenCL(): boolean;
+begin
+  Result := FDecHistOnOpenCL and Assigned(FDepthwise1DCL)
+            and FDepthwise1DCL.CopyHistoryToCheckpoint();
+end;
+
+function TNNetDepthwiseConv1D.RollbackStateCheckpointOnOpenCL(): boolean;
+begin
+  Result := false;
+  if not Assigned(FDepthwise1DCL) then exit;
+  if FDecHistOnOpenCL then Result := FDepthwise1DCL.CopyCheckpointToHistory()
+  // The live history came home since the mark (a snapshot, a reset, a restore),
+  // so the checkpoint follows it: FDecHist is the live state again.
+  else Result := FDepthwise1DCL.DownloadCheckpoint(FDecHist);
+end;
+
+function TNNetDepthwiseConv1D.DownloadStateCheckpointFromOpenCL(
+  Dst: TNNetVolume): boolean;
+begin
+  Result := false;
+  if not Assigned(FDepthwise1DCL) then exit;
+  Dst.ReSize(1, 1, FDecHist.Size);
+  Result := FDepthwise1DCL.DownloadCheckpoint(Dst);
 end;
 
 procedure TNNetDepthwiseConv1D.EnableOpenCL(DotProductKernel: TNeuralKernel);
@@ -69114,12 +69308,39 @@ end;
 {$IFDEF OpenCL}
 procedure TNNetGatedDeltaNet.DisableOpenCL();
 begin
-  // FGatedDeltaNetCL owns the buffers a kept output and a live decode state
-  // live in, so both host copies have to be recovered before the helper goes.
+  // FGatedDeltaNetCL owns the buffers a kept output, a live decode state and a
+  // speculative checkpoint live in, so all three host copies have to be
+  // recovered before the helper goes.
   ForceOutputOnRAM();
   ForceDecodeStateOnRAM();
+  MigrateStateCheckpointToRAM();
   inherited DisableOpenCL();
   FreeAndNil(FGatedDeltaNetCL);
+end;
+
+function TNNetGatedDeltaNet.MarkStateCheckpointOnOpenCL(): boolean;
+begin
+  Result := FDecSOnOpenCL and Assigned(FGatedDeltaNetCL)
+            and FGatedDeltaNetCL.CopyStateToCheckpoint();
+end;
+
+function TNNetGatedDeltaNet.RollbackStateCheckpointOnOpenCL(): boolean;
+begin
+  Result := false;
+  if not Assigned(FGatedDeltaNetCL) then exit;
+  if FDecSOnOpenCL then Result := FGatedDeltaNetCL.CopyCheckpointToState()
+  // The live state came home since the mark (a snapshot, a reset, a restore),
+  // so the checkpoint follows it: FDecS is the live state again.
+  else Result := FGatedDeltaNetCL.DownloadCheckpoint(FDecS);
+end;
+
+function TNNetGatedDeltaNet.DownloadStateCheckpointFromOpenCL(
+  Dst: TNNetVolume): boolean;
+begin
+  Result := false;
+  if not Assigned(FGatedDeltaNetCL) then exit;
+  Dst.ReSize(1, 1, FDecS.Size);
+  Result := FGatedDeltaNetCL.DownloadCheckpoint(Dst);
 end;
 
 procedure TNNetGatedDeltaNet.EnableOpenCL(DotProductKernel: TNeuralKernel);

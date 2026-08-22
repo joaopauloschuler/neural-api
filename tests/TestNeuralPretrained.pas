@@ -261,6 +261,7 @@ type
     procedure TestQwen35WindowedDecodeParity;
     procedure TestQwen35StreamedDecodeOpenCLParity;
     procedure TestQwen35HiddenStateReadsTheDeviceCopy;
+    procedure TestQwen35SpeculativeCheckpointStaysInOpenCLMemory;
     procedure TestQwen2StreamedDecodeOpenCLParity;
     procedure TestQwen35TurnBoundaryResumeParity;
     procedure TestQwen35MoeLogitParity;
@@ -9323,6 +9324,125 @@ end;
 begin
   // Built without -dOpenCL: the host copy is the only copy, so there is no
   // residency question to answer.
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// The one-step speculative checkpoint of a recurrent decode state must be taken
+// and undone INSIDE OpenCL memory. The host route (CaptureState ->
+// ForceDecodeHistoryOnRAM) drains the queue and reads the state back on every
+// mark, then writes it up again inside the next step's forward - once per
+// recurrent layer per verify window, which is 96 layers per Qwen3.8-27B trunk
+// forward. The rollback itself is already correct on either route, so what this
+// test pins is the residency: no recurrent layer may report its state back in
+// host RAM across the mark or across the rollback.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35SpeculativeCheckpointStaysInOpenCLMemory;
+{$IFDEF OpenCL}
+const
+  PrefixLen = 3;
+  DetourTok = 5;   // the rejected speculative token
+  FinalTok  = 2;   // the token the trunk itself names
+var
+  NN: TNNet;
+  Session: TNNetStreamingDecoder;
+  StepIn, CleanOut: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, V, Vocab, MaxVocabPos: integer;
+  ResidentBeforeMark, ResidentAfterMark, ResidentAfterRollback: integer;
+
+  // Recurrent layers whose decode state is in OpenCL memory right now.
+  function ResidentStateLayerCount(): integer;
+  var
+    L, MaxLayerPos: integer;
+    Layer: TNNetLayer;
+  begin
+    Result := 0;
+    MaxLayerPos := NN.CountLayers() - 1;
+    for L := 0 to MaxLayerPos do
+    begin
+      Layer := NN.Layers[L];
+      if (Layer is TNNetDepthwiseConv1D) then
+      begin
+        if TNNetDepthwiseConv1D(Layer).DecodeHistoryOnOpenCL then Inc(Result);
+      end
+      else if (Layer is TNNetGatedDeltaNet) then
+      begin
+        if TNNetGatedDeltaNet(Layer).DecodeStateOnOpenCL then Inc(Result);
+      end;
+    end;
+  end;
+
+  procedure StepToken(Token, Pos: integer);
+  begin
+    StepIn.FData[0] := Token;
+    Session.StepForward(StepIn, Pos);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := nil;
+  Session := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  CleanOut := TNNetVolume.Create();
+  try
+    NN := BuildFromPretrained(FixturePath('tiny_qwen3_5.safetensors'),
+      {SeqLen=}1, {pTrainable=}false,
+      FixturePath('tiny_qwen3_5_config.json'));
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    Session := TNNetStreamingDecoder.Create(NN, PrefixLen + 2);
+    Vocab := NN.GetLastLayer.Output.Size;
+
+    // Reference run: the prefix, then the final token, with no speculation.
+    Session.Reset();
+    for T := 0 to PrefixLen - 1 do StepToken((5 * T + 2) mod Vocab, T);
+    StepToken(FinalTok mod Vocab, PrefixLen);
+    CleanOut.Copy(Session.Output());
+
+    // Same tokens, with a rejected token marked, consumed and rolled back.
+    Session.Reset();
+    for T := 0 to PrefixLen - 1 do StepToken((5 * T + 2) mod Vocab, T);
+    ResidentBeforeMark := ResidentStateLayerCount();
+    if ResidentBeforeMark = 0 then
+    begin
+      AssertTrue('no recurrent layer decoded in OpenCL memory: SKIP', true);
+      Exit;
+    end;
+    Session.MarkStateCheckpoint();
+    ResidentAfterMark := ResidentStateLayerCount();
+    StepToken(DetourTok mod Vocab, PrefixLen);
+    Session.RollbackToStateCheckpoint();
+    ResidentAfterRollback := ResidentStateLayerCount();
+    Session.TruncateTo(PrefixLen);
+    StepToken(FinalTok mod Vocab, PrefixLen);
+
+    AssertEquals('recurrent states still in OpenCL memory after the mark',
+      ResidentBeforeMark, ResidentAfterMark);
+    AssertEquals('recurrent states still in OpenCL memory after the rollback',
+      ResidentBeforeMark, ResidentAfterRollback);
+    // Same kernels in the same order on both runs, so any difference is the
+    // rollback itself - exact, not a tolerance.
+    MaxVocabPos := Vocab - 1;
+    for V := 0 to MaxVocabPos do
+      AssertEquals('rolled-back logit ' + IntToStr(V), CleanOut.FData[V],
+        Session.Output().FData[V], 0.0);
+  finally
+    Session.Free;
+    CleanOut.Free;
+    StepIn.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  // Built without -dOpenCL: the state never leaves host RAM, so there is no
+  // round trip to remove.
   AssertTrue('OpenCL not compiled in: SKIP', true);
 end;
 {$ENDIF}

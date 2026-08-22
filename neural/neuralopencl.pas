@@ -132,6 +132,10 @@ type
     // persistent buffer without moving the whole allocation.
     function WriteBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_FALSE): integer;
     function ReadBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_TRUE): integer;
+    // Device-to-device transfer of cb bytes: the copy is enqueued on this
+    // object's in-order queue, so it is already ordered after the launch that
+    // wrote SrcBuffer and costs no Finish() and no host round trip.
+    function CopyBuffer(DstBuffer, SrcBuffer: cl_mem; cb: csize_t): integer;
 
     function CreateInputBuffer(size: csize_t): cl_mem; overload; {$IFDEF Release} inline; {$ENDIF}
     function CreateHostInputBuffer(size: csize_t; ptr: Pointer): cl_mem; overload; {$IFDEF Release} inline; {$ENDIF}
@@ -199,6 +203,11 @@ type
       // Ensure a persistent output buffer big enough for V (no upload).
       function EnsureOutputBuffer(var buf: cl_mem; var capBytes: csize_t;
         V: TNNetVolume): cl_mem;
+      // Ensure a persistent buffer of Bytes bytes and copy Src into it without
+      // going through host memory (see CopyBuffer). Src=nil or Bytes=0 copies
+      // nothing and returns nil - the caller has nothing resident to save yet.
+      function EnsureCopyBuffer(var buf: cl_mem; var capBytes: csize_t;
+        Src: cl_mem; Bytes: csize_t): cl_mem;
   end;
 
   TNeuralKernel = class(TEasyOpenCLV)
@@ -1549,6 +1558,15 @@ begin
   Result := EnsureBuffer(buf, capBytes, CL_MEM_READ_WRITE, V.GetMemSize());
 end;
 
+function TEasyOpenCLV.EnsureCopyBuffer(var buf: cl_mem; var capBytes: csize_t;
+  Src: cl_mem; Bytes: csize_t): cl_mem;
+begin
+  Result := nil;
+  if (Src = nil) or (Bytes = 0) then exit;
+  Result := EnsureBuffer(buf, capBytes, CL_MEM_READ_WRITE, Bytes);
+  CopyBuffer(Result, Src, Bytes);
+end;
+
 { TEasyOpenCL }
 procedure TEasyOpenCL.LoadPlatforms();
 var
@@ -1947,6 +1965,16 @@ begin
   begin
     FErrorProc('ERROR: Failed to read buffer slice: ' + IntToStr(Result) +
       ' Offset:' + IntToStr(offsetBytes) + ' Size:' + IntToStr(cb) + ' bytes.');
+  end;
+end;
+
+function TEasyOpenCL.CopyBuffer(DstBuffer, SrcBuffer: cl_mem; cb: csize_t): integer;
+begin
+  Result := clEnqueueCopyBuffer(FCommands, SrcBuffer, DstBuffer, 0, 0, cb, 0, nil, nil);
+  if (Result <> CL_SUCCESS) then
+  begin
+    FErrorProc('ERROR: Failed to copy buffer: ' + IntToStr(Result) +
+      ' Size:' + IntToStr(cb) + ' bytes.');
   end;
 end;
 
