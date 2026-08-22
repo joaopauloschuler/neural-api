@@ -4481,10 +4481,14 @@ type
   /// Qwen3-0.6B stack. The cache append runs once, single-threaded, in
   /// PrepareChunkedForward.
   ///
-  /// Scope v1: causal / sliding-window masks and the Gemma-2 score soft-cap;
-  /// NO segment masking, prefix-LM, bidirectional window, tiled forward or
-  /// OpenCL offload (CPU only - per-head SDPA remains for those). Training
-  /// backward IS implemented (per-head mirror of the single-head backward).
+  /// Scope: causal / sliding-window masks and the Gemma-2 score soft-cap;
+  /// NO segment masking, prefix-LM, bidirectional window or tiled forward
+  /// (per-head SDPA remains for those). Training backward IS implemented
+  /// (per-head mirror of the single-head backward).
+  /// OpenCL covers the CACHED-DECODE step only, forward only: a short window
+  /// of committed tokens over the resident FP32 or int8 KV cache. Prefill,
+  /// eviction and each mask excluded above keep the host path - WillOpenCL
+  /// spells out the whole condition.
   /// Serialization: FStruct[5] = QHeads, FStruct[6] = KVHeads on top of the
   /// inherited [0]=HeadDim, [1]=causal, [2]=window, FFloatSt[0]=soft-cap.
   // Coded by Claude (AI).
