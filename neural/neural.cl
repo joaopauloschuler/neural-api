@@ -5,12 +5,12 @@
 // The activation applied in-register by the GEMM kernels after their fused
 // bias-add, and by cai_activation for the same opcodes. Opcodes are the csAct*
 // constants: 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent, 4 = Swish/SiLU,
-// 5 = GELU (tanh approximation), 7 = HardSwish; 0/other = pass-through. Only
-// the opcodes that need NO parameter live here, because the GEMM kernels carry
-// no FParamA/B/C - the host gate TNNetLayer.IsActivationFunctionInOpenCL passes
-// them nothing else. cai_activation keeps its own cases for the parameterized
-// ones, and for 6 (GELUErf) and 8 (HardSigmoid), which are parameterless too
-// and can move here when a layer needs them fused. Coded by Claude (AI).
+// 5 = GELU (tanh approximation), 6 = GELUErf, 7 = HardSwish, 8 = HardSigmoid;
+// 0/other = pass-through. This is every parameterless opcode, which is what the
+// GEMM kernels can fuse: they carry no FParamA/B/C, so the host gate
+// TNNetLayer.IsActivationFunctionInOpenCL passes them nothing else.
+// cai_activation keeps its own cases only for the parameterized activations
+// (9, 10, 15, 18-21, 24). Coded by Claude (AI).
 static inline float cai_fused_act(float v, const int ActFN)
 {
   if (ActFN == 1) // ReLU: max(x, 0)
@@ -48,11 +48,22 @@ static inline float cai_fused_act(float v, const int ActFN)
     const float e = exp(-2.0f * arg);
     return v * 0.5f * (1.0f + (1.0f - e) / (1.0f + e));
   }
+  else if (ActFN == 6) // GELUErf (exact form): x * 0.5 * (1 + erf(x/sqrt(2)))
+  {
+    const float INV_SQRT_2 = 0.7071067811865476f;
+    return v * 0.5f * (1.0f + erf(v * INV_SQRT_2));
+  }
   else if (ActFN == 7) // HardSwish: x for x > 3, 0 for x < -3, else x*(x+3)/6
   {
     if (v > 3.0f) return v;
     if (v < -3.0f) return 0.0f;
     return v * (v + 3.0f) / 6.0f;
+  }
+  else if (ActFN == 8) // HardSigmoid: 1 for x > 3, 0 for x < -3, else (x+3)/6
+  {
+    if (v > 3.0f) return 1.0f;
+    if (v < -3.0f) return 0.0f;
+    return (v + 3.0f) / 6.0f;
   }
   return v;
 }
@@ -1668,27 +1679,19 @@ __kernel void cai_activation
   float y;
   switch (FOpcode)
   {
-    // 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent, 4 = Swish/SiLU,
-    // 5 = GELU (tanh approximation), 7 = HardSwish. These take no parameter, so
-    // the GEMM kernels fuse them too and cai_fused_act is where the math lives.
+    // Opcodes 1-8 take no parameter, so the GEMM kernels fuse them too and
+    // cai_fused_act is where their math lives: 1 = ReLU, 2 = Sigmoid,
+    // 3 = HyperbolicTangent, 4 = Swish/SiLU, 5 = GELU (tanh approximation),
+    // 6 = GELUErf, 7 = HardSwish, 8 = HardSigmoid.
     case 1:
     case 2:
     case 3:
     case 4:
     case 5:
+    case 6:
     case 7:
+    case 8:
       y = cai_fused_act(x, FOpcode);
-      break;
-    case 6: // GELUErf (exact form): x * 0.5 * (1 + erf(x/sqrt(2)))
-    {
-      const float INV_SQRT_2 = 0.7071067811865476f;
-      y = x * 0.5f * (1.0f + erf(x * INV_SQRT_2));
-      break;
-    }
-    case 8: // HardSigmoid: 1 for x > 3, 0 for x < -3, else (x+3)/6
-      if (x > 3.0f) y = 1.0f;
-      else if (x < -3.0f) y = 0.0f;
-      else y = (x + 3.0f) / 6.0f;
       break;
     case 9: // ELU: x for x > 0, else alpha*(exp(x)-1). FParamA = alpha.
       // exp is evaluated only on the negative branch, where it underflows

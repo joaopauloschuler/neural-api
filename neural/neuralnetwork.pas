@@ -130055,8 +130055,11 @@ end;
 // inference-only (not FIsTrainable): backward reads the pre-activation
 // FOutputRaw, which the device never produces. Saying false here does more than
 // skip the fusion - the caller then downloads FOutputRaw and finishes on the
-// host, ending the layer's device residency - so an activation belongs in
-// cai_fused_act rather than outside this list whenever it needs no parameter.
+// host, ending the layer's device residency. cai_fused_act implements every
+// PARAMETERLESS opcode (1-8), so this list is bounded by the activation
+// functions a layer can actually carry, not by the kernel: GELU, GELUErf and
+// HardSigmoid exist only as standalone layers, which reach the same math
+// through cai_activation. @DiffAct is the one pointer with no opcode.
 function TNNetLayer.IsActivationFunctionInOpenCL(var ActOpcode: integer):boolean;
 begin
   ActOpcode := csActNone;

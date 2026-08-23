@@ -1991,11 +1991,18 @@ cannot pay for its own transfer.
       there is no `@GELU` activation-function pointer, so the complete set a
       layer can carry is Identity/ReLU/Sigmoid/Tanh/Swish/HardSwish/DiffAct.
   - [x] `@HardSwish` (opcode 7) landed the same way in a follow-up, so
-        `TNNetConvolutionHardSwish` fuses and stays resident too. That leaves
-        `@DiffAct` as the only activation-function pointer a layer can carry
-        that the tail does not implement. Opcodes 6 (GELUErf) and 8
-        (HardSigmoid) are parameterless as well and can move into
-        `cai_fused_act` whenever a layer needs them fused.
+        `TNNetConvolutionHardSwish` fuses and stays resident too. Opcodes 6
+        (GELUErf) and 8 (HardSigmoid) followed, so `cai_fused_act` now holds
+        EVERY parameterless opcode (1-8) and `cai_activation` keeps only the
+        parameterized cases (9, 10, 15, 18-21, 24). The remaining limit is on
+        the host, not in the kernel: GELU, GELUErf and HardSigmoid exist only as
+        standalone layers with no activation-function pointer, so no layer can
+        request them fused, and `@DiffAct` is the one pointer with no opcode.
+        Fused parity cases for Swish and HardSwish (bias and bias-suppressed)
+        live in `TestConvActivationFusionOpenCLParity` and
+        `TestFullConnectActivationFusionOpenCLParity`;
+        `TestActivationOpenCLParity` already sweeps all 30 standalone variants,
+        which covers the delegation for 6 and 8.
 - [ ] The 34 elementwise activations with no `cai_activation` opcode, all
       `TNNetReLUBase` descendants: `TNNetErf`, `TNNetExp`, `TNNetLog`,
       `TNNetSqrt`, `TNNetSin`, `TNNetCos`, `TNNetArcSinh`, `TNNetSinhAct`,

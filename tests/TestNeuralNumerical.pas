@@ -66050,6 +66050,12 @@ begin
   RunOne('ReLU bias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0);
   RunOne('Sigmoid bias', @Sigmoid, @SigmoidDerivative, 0);
   RunOne('Tanh bias', @HiperbolicTangent, @HiperbolicTangentDerivative, 0);
+  // The two opcodes the tail gained after ReLU/Sigmoid/Tanh. Their host and
+  // device forms are separate implementations, so parity is not self-evident.
+  RunOne('Swish nobias', @Swish, @SwishDerivative, 1);
+  RunOne('Swish bias', @Swish, @SwishDerivative, 0);
+  RunOne('HardSwish nobias', @HardSwish, @HardSwishDerivative, 1);
+  RunOne('HardSwish bias', @HardSwish, @HardSwishDerivative, 0);
 end;
 {$ELSE}
 begin
@@ -66149,6 +66155,12 @@ begin
   RunOne('ReLU bias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0);
   RunOne('Sigmoid bias', @Sigmoid, @SigmoidDerivative, 0);
   RunOne('Tanh bias', @HiperbolicTangent, @HiperbolicTangentDerivative, 0);
+  // The two opcodes the tail gained after ReLU/Sigmoid/Tanh. Their host and
+  // device forms are separate implementations, so parity is not self-evident.
+  RunOne('Swish nobias', @Swish, @SwishDerivative, 1);
+  RunOne('Swish bias', @Swish, @SwishDerivative, 0);
+  RunOne('HardSwish nobias', @HardSwish, @HardSwishDerivative, 1);
+  RunOne('HardSwish bias', @HardSwish, @HardSwishDerivative, 0);
 end;
 {$ELSE}
 begin
