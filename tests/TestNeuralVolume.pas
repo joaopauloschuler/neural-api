@@ -114,6 +114,9 @@ type
     procedure TestEncodeF16SpecialValues;
     procedure TestEncodeF16MatchesScalar;
     procedure TestDecodeF16MatchesScalar;
+    procedure TestEncodeBF16;
+    procedure TestEncodeBF16SpecialValues;
+    procedure TestEncodeBF16MatchesScalar;
   end;
 
 implementation
@@ -3641,6 +3644,133 @@ begin
     AssertEquals('bulk vs scalar single mismatches at N=' + IntToStr(Len),
       0, Mismatches);
     AssertEquals('write past N=' + IntToStr(Len), 12345.0, Bulk[Len], 0);
+  end;
+end;
+
+// Narrowing to bfloat16 drops the low 16 bits of the single, so these are the
+// exact words round-to-nearest-even produces. The values are built from bit
+// patterns rather than decimal literals so the ties are exact. The interesting
+// rows are the three ties (low half exactly $8000), which must go to the EVEN
+// kept word in both directions, and the largest finite single, whose round-up
+// leaves the bfloat16 range and lands on Inf. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestEncodeBF16;
+const
+  N = 21;
+  SrcBits: array[0..20] of Cardinal = (
+    $3F800000, $BF800000, $00000000, $80000000, $40000000, $3F000000,
+    $3EAAAAAB,                  // nearest single to 1/3, rounds up
+    $40490FDB,                  // nearest single to pi, rounds down
+    $3F808000,                  // tie, kept word even -> stays
+    $3F818000,                  // tie, kept word odd  -> rounds up
+    $7F7FFFFF, $FF7FFFFF,       // largest finite singles -> +/-Inf
+    $7F800000, $FF800000,       // +/-Inf
+    $00000001,                  // smallest subnormal single -> zero
+    $00008000,                  // tie at zero, rounds down
+    $00018000,                  // tie, kept word odd -> $0002
+    $42280000, $C2280000, $44800000,
+    $3F7FFFFF);                 // just under 1.0, rounds up to it
+  Bits: array[0..20] of Word = (
+    $3F80, $BF80, $0000, $8000, $4000, $3F00,
+    $3EAB, $4049, $3F80, $3F82, $7F80, $FF80,
+    $7F80, $FF80, $0000, $0000, $0002,
+    $4228, $C228, $4480, $3F80);
+var
+  Vals: array[0..20] of TNeuralFloat;
+  Dst: array of Word;
+  i: integer;
+begin
+  for i := 0 to N - 1 do Vals[i] := PSingle(@SrcBits[i])^;
+  SetLength(Dst, N);
+  for i := 0 to N - 1 do Dst[i] := $DEAD;
+  TNNetVolume.EncodeBF16(TNeuralHalfArrPtr(@Dst[0]),
+    TNeuralFloatArrPtr(@Vals[0]), N);
+  for i := 0 to N - 1 do
+    AssertEquals('bfloat16 of ' + IntToHex(SrcBits[i], 8),
+      IntToHex(Bits[i], 4), IntToHex(Dst[i], 4));
+  // Under csMinAvxSize: the scalar method, same answers.
+  for i := 0 to 4 do Dst[i] := $DEAD;
+  TNNetVolume.EncodeBF16(TNeuralHalfArrPtr(@Dst[0]),
+    TNeuralFloatArrPtr(@Vals[0]), 5);
+  for i := 0 to 4 do
+    AssertEquals('short-run bfloat16 ' + IntToStr(i),
+      IntToHex(Bits[i], 4), IntToHex(Dst[i], 4));
+end;
+
+// A NaN must stay a NaN. Rounding alone would carry $7F800001 up to $7F80,
+// which DecodeBF16 reads back as an Inf, so both paths force the quiet bit
+// instead. Nothing here may trap either: the AVX2 kernel is integer-only, so
+// unlike EncodeF16 it runs with FPC's default MXCSR untouched.
+// Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestEncodeBF16SpecialValues;
+const
+  N = 20;
+var
+  Vals: array[0..19] of TNeuralFloat;
+  Dst: array of Word;
+  SrcBits: Cardinal;
+  i: integer;
+begin
+  for i := 0 to N - 1 do Vals[i] := 1.0;
+  SrcBits := $7F800000; Vals[0] := PSingle(@SrcBits)^;   // +Inf
+  SrcBits := $FF800000; Vals[1] := PSingle(@SrcBits)^;   // -Inf
+  SrcBits := $7FC00000; Vals[2] := PSingle(@SrcBits)^;   // quiet NaN
+  SrcBits := $7F800001; Vals[3] := PSingle(@SrcBits)^;   // signalling NaN
+  SrcBits := $FFABCDEF; Vals[4] := PSingle(@SrcBits)^;   // NaN with a payload
+  Vals[5] := -0.0;
+  Vals[6] := 1e-45;                                      // subnormal single
+  Vals[7] := 3.4028235e38;                               // largest finite single
+  SetLength(Dst, N);
+  for i := 0 to N - 1 do Dst[i] := $DEAD;
+  TNNetVolume.EncodeBF16(TNeuralHalfArrPtr(@Dst[0]),
+    TNeuralFloatArrPtr(@Vals[0]), N);
+  AssertEquals('+Inf', IntToHex($7F80, 4), IntToHex(Dst[0], 4));
+  AssertEquals('-Inf', IntToHex($FF80, 4), IntToHex(Dst[1], 4));
+  for i := 2 to 4 do
+    AssertTrue('slot ' + IntToStr(i) + ' is a NaN bfloat16',
+      ((Dst[i] and $7F80) = $7F80) and ((Dst[i] and $007F) <> 0));
+  AssertEquals('-0.0', IntToHex($8000, 4), IntToHex(Dst[5], 4));
+  AssertEquals('subnormal single', IntToHex($0000, 4), IntToHex(Dst[6], 4));
+  AssertEquals('largest single', IntToHex($7F80, 4), IntToHex(Dst[7], 4));
+  for i := 8 to N - 1 do
+    AssertEquals('filler ' + IntToStr(i), IntToHex($3F80, 4), IntToHex(Dst[i], 4));
+end;
+
+// The vectorized run and the scalar run must agree bit-for-bit, over the same
+// lengths TestEncodeF16MatchesScalar uses: under 32 exercises only the
+// 8-at-a-time loop, a multiple of 32 only the unrolled body, and the rest a
+// body-plus-remainder-plus-tail combination. The values sweep nine decades in
+// both signs. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestEncodeBF16MatchesScalar;
+const
+  cLengths: array[0..12] of integer =
+    (1, 7, 8, 16, 31, 32, 33, 39, 40, 47, 128, 1000, 1024);
+  N = 1024;
+var
+  Vals: array of TNeuralFloat;
+  Bulk, OneByOne: array of Word;
+  i, L, Len, Mismatches: integer;
+begin
+  SetLength(Vals, N);
+  SetLength(Bulk, N + 1);   // one guard slot past the longest run
+  SetLength(OneByOne, N);
+  for i := 0 to N - 1 do
+    Vals[i] := (i - 512) * 0.0011 * Power(10, (i mod 19) - 9);
+  for i := 0 to N - 1 do
+    TNNetVolume.EncodeBF16(TNeuralHalfArrPtr(@OneByOne[i]),
+      TNeuralFloatArrPtr(@Vals[i]), 1);
+  for L := 0 to High(cLengths) do
+  begin
+    Len := cLengths[L];
+    for i := 0 to N do Bulk[i] := $DEAD;
+    TNNetVolume.EncodeBF16(TNeuralHalfArrPtr(@Bulk[0]),
+      TNeuralFloatArrPtr(@Vals[0]), Len);
+    Mismatches := 0;
+    for i := 0 to Len - 1 do
+      if Bulk[i] <> OneByOne[i] then Inc(Mismatches);
+    AssertEquals('bulk vs scalar bfloat16 mismatches at N=' + IntToStr(Len),
+      0, Mismatches);
+    AssertEquals('write past N=' + IntToStr(Len),
+      IntToHex($DEAD, 4), IntToHex(Bulk[Len], 4));
   end;
 end;
 

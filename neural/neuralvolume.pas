@@ -748,6 +748,12 @@ type
       // NaN included, and bit-exact on all builds. AVX2/64-bit builds widen 8
       // per iteration. Coded by Claude (AI).
       class procedure DecodeBF16(pDst: TNeuralFloatArrPtr; pSrc: TNeuralHalfArrPtr; N: integer); static;
+      // Narrows N singles to bfloat16, round-to-nearest-even, keeping NaN a
+      // NaN. Only the low 16 bits are dropped, so no value can overflow to Inf
+      // and nothing can trap. Bit-exact across builds - the AVX2/64-bit path
+      // does the same integer arithmetic as the scalar one, 8 per iteration.
+      // Coded by Claude (AI).
+      class procedure EncodeBF16(pDst: TNeuralHalfArrPtr; pSrc: TNeuralFloatArrPtr; N: integer); static;
       // Widens N IEEE-754 half values to single. Every half - subnormals and
       // NaN included - is exactly representable as a single, so the conversion
       // is lossless, and it never traps whatever the input bits say.
@@ -1831,6 +1837,28 @@ begin
   Result := Word(Sign or Half);
 end;
 
+// Scalar single -> bfloat16, round-to-nearest-even. Pure bit surgery, so
+// nothing here can trap. Used by EncodeBF16's non-AVX build and by the AVX
+// tail. Coded by Claude (AI).
+function NeuralSingleToBFloat16(Value: Single): Word;
+var
+  Bits, Rounded: Cardinal;
+begin
+  Bits := PCardinal(@Value)^;
+  if (Bits and $7FFFFFFF) > $7F800000 then
+  begin
+    // NaN: keep the sign and force a non-zero mantissa, so the zero-extending
+    // DecodeBF16 cannot read the result back as an Inf.
+    Result := Word((Bits shr 16) or $0040);
+    exit;
+  end;
+  // Add half an ULP plus the round-bias (bit 16, the low bit of the kept part)
+  // before truncating - the standard round-to-nearest-even-by-bias trick. The
+  // largest finite input is $FF7FFFFF, so the addition cannot wrap.
+  Rounded := Bits + $7FFF + ((Bits shr 16) and 1);
+  Result := Word(Rounded shr 16);
+end;
+
 {$IFDEF AVX64}
 {$IFDEF AVX2}
 // Fused int8 x float32 dot product (raw code sum, no scale): sign-extends 8
@@ -2554,6 +2582,158 @@ begin
     OutBits := Cardinal(PtrSrc^[i]) shl 16;
     PtrDst^[i] := PSingle(@OutBits)^;
   end;
+end;
+
+// dst[i] := bfloat16(src[i]), round-to-nearest-even. A bfloat16 is the high 16
+// bits of the single, so each lane adds half an ULP plus the round-bias to the
+// dropped low half and takes the top word - the same integer arithmetic the
+// scalar NeuralSingleToBFloat16 does, hence bit-exact against it on every
+// input, NaN payloads included. NaN lanes take the quieted top word instead,
+// selected by a vpblendvb on a vpcmpgtd against $7F800000. No floating-point
+// operation executes, so nothing here can trap and the MXCSR is untouched.
+//
+// Two converted vectors pack into one 32-byte store: vpackusdw works per
+// 128-bit lane, so the following vpermq with $D8 puts the 16 words back in
+// source order. The loop shape is DotProductsTiled's: an unrolled body doing 32
+// elements per iteration through four independent register chains, then an
+// 8-at-a-time loop for the 8..31 remainder, then the Pascal tail for the last
+// 1..7.
+//
+// The five vector constants are held in LOCALS and reached through a pointer
+// (the AVXMaxAbsFinite idiom) so no [rip+label] relocation appears and
+// position-independent linking of the examples keeps working.
+// Coded by Claude (AI).
+procedure AVXEncodeBF16(PtrDst: TNeuralHalfArrPtr;
+  PtrSrc: TNeuralFloatArrPtr; NumElements: integer);
+var
+  localNumElements, i, NumElementsM1: integer;
+  // [0] = $7FFFFFFF sign mask, [1] = $7F800000 (Inf), [2] = the round-bias
+  // low bit, [3] = $7FFF half an ULP, [4] = $0040 the bfloat16 quiet bit.
+  Consts: array[0..4] of Cardinal;
+  ConstsPtr: pointer;
+begin
+  localNumElements := NumElements and (not 7);
+  if localNumElements > 0 then
+  begin
+    Consts[0] := $7FFFFFFF;
+    Consts[1] := $7F800000;
+    Consts[2] := $00000001;
+    Consts[3] := $00007FFF;
+    Consts[4] := $00000040;
+    ConstsPtr := Addr(Consts[0]);
+  asm
+  mov rax, PtrSrc
+  mov rdx, PtrDst
+  mov r8, ConstsPtr
+  mov ecx, localNumElements
+  vpbroadcastd ymm10, dword ptr [r8]
+  vpbroadcastd ymm11, dword ptr [r8+4]
+  vpbroadcastd ymm12, dword ptr [r8+8]
+  vpbroadcastd ymm13, dword ptr [r8+12]
+  vpbroadcastd ymm14, dword ptr [r8+16]
+
+  push rcx
+  shr ecx, 5                       // large iterations = elements / 32
+  jz @SkipLargeEncodeBF16Loop
+@LargeEncodeBF16Loop:
+  vmovups   ymm0, [rax]            // 4 x 8 singles, four independent chains
+  vmovups   ymm1, [rax+32]
+  vmovups   ymm2, [rax+64]
+  vmovups   ymm3, [rax+96]
+
+  vpsrld    ymm4, ymm0, 16         // the kept top half of each single
+  vpsrld    ymm5, ymm1, 16
+  vpsrld    ymm6, ymm2, 16
+  vpsrld    ymm7, ymm3, 16
+
+  vpand     ymm8, ymm4, ymm12      // + $7FFF + (kept and 1) = round to nearest
+  vpaddd    ymm8, ymm8, ymm13
+  vpaddd    ymm8, ymm8, ymm0
+  vpsrld    ymm8, ymm8, 16
+  vpand     ymm9, ymm0, ymm10      // |bits| > $7F800000  <=>  bits is NaN
+  vpcmpgtd  ymm9, ymm9, ymm11
+  vpor      ymm0, ymm4, ymm14      // the quieted NaN word
+  vpblendvb ymm0, ymm8, ymm0, ymm9
+
+  vpand     ymm8, ymm5, ymm12
+  vpaddd    ymm8, ymm8, ymm13
+  vpaddd    ymm8, ymm8, ymm1
+  vpsrld    ymm8, ymm8, 16
+  vpand     ymm9, ymm1, ymm10
+  vpcmpgtd  ymm9, ymm9, ymm11
+  vpor      ymm1, ymm5, ymm14
+  vpblendvb ymm1, ymm8, ymm1, ymm9
+
+  vpand     ymm8, ymm6, ymm12
+  vpaddd    ymm8, ymm8, ymm13
+  vpaddd    ymm8, ymm8, ymm2
+  vpsrld    ymm8, ymm8, 16
+  vpand     ymm9, ymm2, ymm10
+  vpcmpgtd  ymm9, ymm9, ymm11
+  vpor      ymm2, ymm6, ymm14
+  vpblendvb ymm2, ymm8, ymm2, ymm9
+
+  vpand     ymm8, ymm7, ymm12
+  vpaddd    ymm8, ymm8, ymm13
+  vpaddd    ymm8, ymm8, ymm3
+  vpsrld    ymm8, ymm8, 16
+  vpand     ymm9, ymm3, ymm10
+  vpcmpgtd  ymm9, ymm9, ymm11
+  vpor      ymm3, ymm7, ymm14
+  vpblendvb ymm3, ymm8, ymm3, ymm9
+
+  vpackusdw ymm0, ymm0, ymm1       // 16 dwords -> 16 words, lane-interleaved
+  vpermq    ymm0, ymm0, $D8        // back to source order
+  vpackusdw ymm2, ymm2, ymm3
+  vpermq    ymm2, ymm2, $D8
+
+  vmovups   [rdx], ymm0
+  vmovups   [rdx+32], ymm2
+
+  add rax, 128
+  add rdx, 64
+  dec ecx
+  jnz @LargeEncodeBF16Loop
+
+@SkipLargeEncodeBF16Loop:
+  pop rcx
+  and ecx, $0000001F
+  jz @EndEncodeBF16
+  shr ecx, 3                       // small iterations = (elements mod 32) / 8
+@SmallEncodeBF16Loop:
+  vmovups   ymm0, [rax]            // 8 singles
+  vpsrld    ymm4, ymm0, 16
+  vpand     ymm8, ymm4, ymm12
+  vpaddd    ymm8, ymm8, ymm13
+  vpaddd    ymm8, ymm8, ymm0
+  vpsrld    ymm8, ymm8, 16
+  vpand     ymm9, ymm0, ymm10
+  vpcmpgtd  ymm9, ymm9, ymm11
+  vpor      ymm0, ymm4, ymm14
+  vpblendvb ymm0, ymm8, ymm0, ymm9
+
+  vpackusdw ymm0, ymm0, ymm0       // 8 words, duplicated inside each lane
+  vextracti128 xmm1, ymm0, 1
+  vpunpcklqdq xmm0, xmm0, xmm1     // the two lanes' halves, in source order
+  vmovups   [rdx], xmm0
+
+  add rax, 32
+  add rdx, 16
+  dec ecx
+  jnz @SmallEncodeBF16Loop
+
+@EndEncodeBF16:
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4',
+    'ymm5', 'ymm6', 'ymm7', 'ymm8', 'ymm9', 'ymm10', 'ymm11', 'ymm12',
+    'ymm13', 'ymm14'
+  ];
+  end;
+  NumElementsM1 := NumElements - 1;
+  for i := localNumElements to NumElementsM1 do
+    PtrDst^[i] := NeuralSingleToBFloat16(PtrSrc^[i]);
 end;
 
 // dst[i] := 1.0 when src[i] >= 0, else 0.0 -- the ReLU derivative gate mask.
@@ -13217,6 +13397,26 @@ begin
     OutBits := Cardinal(pSrc^[I]) shl 16;
     pDst^[I] := PSingle(@OutBits)^;
   end;
+end;
+
+class procedure TNNetVolume.EncodeBF16(pDst: TNeuralHalfArrPtr;
+  pSrc: TNeuralFloatArrPtr; N: integer);
+var
+  I, vHigh: integer;
+begin
+  if N <= 0 then exit;
+  {$IFDEF AVX64}
+  {$IFDEF AVX2}
+  if N >= csMinAvxSize then
+  begin
+    AVXEncodeBF16(pDst, pSrc, N);
+    exit;
+  end;
+  {$ENDIF}
+  {$ENDIF}
+  vHigh := N - 1;
+  for I := 0 to vHigh do
+    pDst^[I] := NeuralSingleToBFloat16(pSrc^[I]);
 end;
 
 class procedure TNNetVolume.DecodeF16(pDst: TNeuralFloatArrPtr;
