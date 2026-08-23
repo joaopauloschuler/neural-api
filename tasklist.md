@@ -1957,7 +1957,7 @@ keeps the standalone kernel off the device unless the source is already
 resident or `ForceOpenCL` is set — deliberate, since a 1-flop-per-word kernel
 cannot pay for its own transfer.
 
-- [ ] Widen the fused GEMM tail beyond ReLU/Sigmoid/Tanh, starting with
+- [x] Widen the fused GEMM tail beyond ReLU/Sigmoid/Tanh, starting with
       Swish/SiLU and GELU. The math already exists as `cai_activation` opcodes
       4 and 5, parity-tested, so this is mostly moving code: extend the tail's
       switch, widen `IsActivationFunctionInOpenCL` to match, and dedup the
@@ -1973,6 +1973,29 @@ cannot pay for its own transfer.
       activation, since the importers build Linear convolutions with separate
       activation layers — so measure before assuming a win, and treat the
       residency break as the reason rather than the launch count.
+      DONE: `cai_fused_act` moved to the top of `neural.cl` and gained opcodes
+      4, 5 and 7, and it is now the ONLY copy of that math — `cai_dot_product`,
+      `cai_dot_product_int8`, the split-K reduce and `cai_activation`'s own
+      cases for those opcodes all call it (four copies collapsed into one).
+      `IsActivationFunctionInOpenCL` accepts `@Swish` and `@HardSwish`, so
+      those convolutions and FullConnects now fuse and stay resident.
+      Device-vs-CPU parity cases added to all three harnesses — `TestConvDeviceIm2ColOpenCLParity` (FP32,
+      9.5e-7), `TestInt8QuantizedOpenCLParity` (int8 GEMM, 3.9e-7) and
+      `TestInt8SplitKOpenCLParity` (split-K, 2.0e-6) — and the conv harness now
+      asserts `OutputBindableOnOpenCL` so a silent fallback to the host can no
+      longer pass as parity. Suite 2837/0/0 on both the scalar and the
+      `-dOpenCL` build. Two notes: the tail's ReLU is now `(v > 0) ? v : 0`
+      like `cai_activation`, which differs from the old `if (v < 0) v = 0` only
+      in returning +0.0f for a -0.0f input; and GELU rides in the kernel but no
+      host layer can request it yet — `TNNetGELU` is a standalone layer and
+      there is no `@GELU` activation-function pointer, so the complete set a
+      layer can carry is Identity/ReLU/Sigmoid/Tanh/Swish/HardSwish/DiffAct.
+  - [x] `@HardSwish` (opcode 7) landed the same way in a follow-up, so
+        `TNNetConvolutionHardSwish` fuses and stays resident too. That leaves
+        `@DiffAct` as the only activation-function pointer a layer can carry
+        that the tail does not implement. Opcodes 6 (GELUErf) and 8
+        (HardSigmoid) are parameterless as well and can move into
+        `cai_fused_act` whenever a layer needs them fused.
 - [ ] The 34 elementwise activations with no `cai_activation` opcode, all
       `TNNetReLUBase` descendants: `TNNetErf`, `TNNetExp`, `TNNetLog`,
       `TNNetSqrt`, `TNNetSin`, `TNNetCos`, `TNNetArcSinh`, `TNNetSinhAct`,
