@@ -1762,6 +1762,87 @@ rather than acted on.
       single native binary, reusing the diffusion + VAE + Qwen-VL infrastructure already
       in the repo.
 
+## OpenCL forward coverage — layers still on the host
+
+Forward pass only; a device backward is a separate project (nothing in the tree
+has one today). 52 of the 487 `TNNet*` classes in `neuralnetwork.pas` declare a
+`ComputeOpenCL`, and `cai_activation` covers 24 elementwise opcodes on top of
+that. `csActivationOpenCLMinSize` is 64 MB, so a small layer reaches the device
+only when its source is ALREADY resident — which is why the ranking below is by
+"does this layer evict a resident chain to RAM", not by FLOPs.
+
+Every item: guard behind the existing `WillOpenCL()`/`FShouldOpenCL` verdict,
+bind the resident source instead of downloading it (`ShouldBindPrevOutputOnOpenCL`)
+and leave the result in OpenCL memory, keep the host path as the fallback, and
+pin an exact-vs-CPU parity test that skips cleanly with no device. PoCL on the
+dev box proves parity; throughput numbers have to come from the GPU box.
+
+### Residency breakers on the decode path (small kernels, largest payoff)
+
+- [ ] `TNNetMoEExpertBankGateUp` single-launch device forward. The clearest
+      single gap: `TNNetMoEExpertBankDown` got one (commit d105047c) but its
+      sibling did not, so every MoE block downloads the expert activations
+      between the two banks. Mirror the down-bank kernel (one launch over the
+      selected experts, resident int8 or FP32 weight slab) so gate/up -> down
+      stays device-side end to end. Hits Qwen3.5-MoE, Nemotron-H-MoE, Mixtral,
+      OLMoE and GPT-OSS.
+- [ ] Reshape/gather glue: `TNNetReshape`, `TNNetCrop`, `TNNetPadXY`,
+      `TNNetTransposeXD`, `TNNetDepthToSpace`, `TNNetGatherTokens`,
+      `TNNetConcat`. None has a device path, and several sit between attention
+      and FFN in the importers, so each one evicts the chain. For most of these
+      a kernel is the wrong answer: the bytes do not change, only the shape, so
+      the layer should re-label the resident buffer (a view) rather than copy
+      it. Scope `TNNetReshape` FIRST as the test case for that view mechanism —
+      whether `OpenCLOutputBuffer()` can hand back the source's buffer with a
+      different declared shape — then apply the outcome to the rest.
+      `TNNetCrop`/`TNNetPadXY`/`TNNetTransposeXD` DO move bytes and need a real
+      copy/gather kernel; keep the two halves separate.
+- [ ] `TNNetReGLU` (and BitNet's `TNNetReGLUSquared`) device forward.
+      `TNNetSwiGLU` and `TNNetGEGLU` inherit `TNNetGLUGateBase.ComputeOpenCL`;
+      `TNNetReGLU` descends straight from `TNNetLayer` and misses it. Check
+      whether re-parenting onto `TNNetGLUGateBase` (with the ReLU gate as the
+      activation opcode) is the whole fix before writing a kernel.
+- [ ] Per-channel affine glue: `TNNetChannelBias`, `TNNetChannelMul`,
+      `TNNetFiLM`, `TNNetMulByConstant`, `TNNetAddConstant`, `TNNetAvgChannel`.
+      All are one scale/shift per channel over a resident volume.
+      `TNNetChannelMulByLayer` and `TNNetCellMulByCell` already show the
+      two-source resident pattern, and `TNNetFiLM` is that same shape, so it
+      follows them directly; the constant-parameter ones fit the
+      `cai_activation` ParamA/ParamB convention.
+- [ ] `TNNetTopKGate` / `TNNetBiasBalancedTopKGate` device forward. Tiny work
+      per token, but the router sits between two resident MoE banks, so running
+      it on the host costs two transfers per token. Only worth landing together
+      with the gate/up bank item above.
+
+### Real device-side work still running on the host
+
+- [ ] `TNNetSelectiveSSM` device forward. The Mamba-1/2, Jamba, Nemotron-H and
+      falcon_mamba trunks are majority-SSM and run entirely on the CPU.
+      `TNNetGatedDeltaNet` already proved the recipe (commit 63047d0f: one
+      work-group per head, the whole scan in OpenCL memory, state carried on the
+      device across decode steps); `TNNetSelectiveSSM` is the same shape. Cover
+      both the prefill scan and the `TNNetRecurrentDecodeBase` one-token path.
+- [ ] `TNNetWKV`, `TNNetTokenShift` and `TNNetDiagonalSSM` device forward — the
+      RWKV trunk, same per-head-recurrence recipe as `TNNetSelectiveSSM`. Lower
+      priority only because fewer tested checkpoints use it.
+- [ ] Attention subclasses that override `Compute` and so lose
+      `TNNetScaledDotProductAttention`'s device path:
+      `TNNetGptOssSinkAttention` (GPT-OSS is a live importer, and the sink is
+      `TNNetFusedSDPA` plus one per-head scalar, so it should reuse the fused
+      decode kernels), `TNNetDifferentialAttention` and `TNNetWindowAttention`
+      (Swin). Take the sink first.
+- [ ] `TNNetDeltaNet`, `TNNetGatedLinearAttention`, `TNNetRetention` and the
+      CAUSAL half of `TNNetLinearAttention`. COUPLED, not independent: each is a
+      strict per-token scan today, so there is no GEMM-shaped kernel to offload
+      until the chunked/parallel forward tasks in "Layer follow-ups that fix real
+      limitations" land. Sequence them after those, or fold the device path into
+      each chunked rewrite.
+- [ ] `TNNetTokenAndPositionalEmbedding` device gather. `TNNetEmbedding` got the
+      int8 device gather (`cai_embedding_gather_int8`) and leaves its rows
+      resident; its sibling still gathers on the host. Reuse the same entry
+      point, adding the positional table as a second resident source.
+
+
 ## Layer follow-ups that fix real limitations
 
 - [~] Bidirectional + multi-layer stacking for `TNNetLSTMCell` / `TNNetGRUCell`
