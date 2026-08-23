@@ -1170,14 +1170,12 @@ begin
           end;
         end;
       stwF16:
-        begin
-          WordPtr := PWord(@FTensors[Idx].Data[0]);
-          for i := 0 to MaxIdx do
-          begin
-            WordPtr^ := EncodeF16(Src.FData[i]);
-            Inc(WordPtr);
-          end;
-        end;
+        // Rule #18: one TNNetVolume primitive over the whole tensor, so an
+        // AVX2 build narrows 8 singles per iteration through F16C instead of
+        // calling the scalar encoder per element. NumElements is bounded by
+        // High(integer) above.
+        TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@FTensors[Idx].Data[0]),
+          TNeuralFloatArrPtr(@Src.FData[0]), integer(NumElements));
       stwBF16:
         begin
           WordPtr := PWord(@FTensors[Idx].Data[0]);

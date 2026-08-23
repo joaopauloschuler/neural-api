@@ -1888,13 +1888,12 @@ var
   Idx, i, ContigDim: integer;
   NumElements, NumBlocks, b, e: Int64;
   ElemBase, ByteBase: Int64;
-  WordPtr: PWord;
   QuantPtr: PShortInt;
   ScalePtr: PWord;
   AbsMax, V, Scale, InvScale, Q: single;
   Pending: TGGUFPendingTensor;
   pShapeHi: integer;
-  NumElementsM1, NumBlocksM1, Q8ElemsM1: Int64;
+  NumBlocksM1, Q8ElemsM1: Int64;
 begin
   if FSaved then
     raise EGGUFError.Create('gguf writer: AddTensorFlat after SaveToFile.');
@@ -1920,7 +1919,6 @@ begin
     raise EGGUFError.CreateFmt(
       'gguf writer: tensor "%s" shape implies %d elements but the source ' +
       'holds %d.', [pName, NumElements, Src.Size]);
-  NumElementsM1 := NumElements - 1;
   Q8ElemsM1 := GGUF_Q8_0_BLOCK_ELEMS - 1;
 
   Pending := Default(TGGUFPendingTensor);
@@ -1940,12 +1938,11 @@ begin
     begin
       Pending.GGMLType := GGML_TYPE_F16;
       SetLength(Pending.Data, NumElements * 2);
-      WordPtr := PWord(@Pending.Data[0]);
-      for i := 0 to NumElementsM1 do
-      begin
-        WordPtr^ := EncodeF16(Src.FData[i]);
-        Inc(WordPtr);
-      end;
+      // Rule #18: one TNNetVolume primitive over the whole tensor, so an AVX2
+      // build narrows 8 singles per iteration through F16C. NumElements is
+      // checked equal to Src.Size above, so it fits an integer.
+      TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@Pending.Data[0]),
+        TNeuralFloatArrPtr(@Src.FData[0]), integer(NumElements));
     end;
     gwQ8_0:
     begin

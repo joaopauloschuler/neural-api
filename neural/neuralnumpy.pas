@@ -376,9 +376,11 @@ begin
   end
   else if DType = 'f2' then
   begin
-    pu16 := PWord(@Raw[0]);
-    for i := 0 to NumElementsM1 do
-      begin Dst[i] := DecodeF16(pu16^); Inc(pu16); end;
+    // Rule #18: one TNNetVolume primitive over the whole span, so an AVX2
+    // build widens 8 halves per iteration through F16C. NumElements fits an
+    // integer - the caller pre-sized Dest, whose Size is an integer.
+    TNNetVolume.DecodeF16(TNeuralFloatArrPtr(Dst),
+      TNeuralHalfArrPtr(@Raw[0]), integer(NumElements));
   end
   else if DType = 'i1' then
   begin
@@ -725,12 +727,19 @@ begin
 
   DataPos := PreambleLen + HeaderLen;
   // f4 (the common/default case) is a byte-identical contiguous copy on a LE
-  // host, so it skips AppendElement's per-element dtype string-dispatch. Other
-  // dtypes keep the per-element encode (genuine format conversion).
+  // host, and f2 is one vectorized narrow into the same LE byte order, so both
+  // skip AppendElement's per-element walk. Other dtypes keep the per-element
+  // encode (genuine format conversion).
   if DType = 'f4' then
   begin
     if NumElements > 0 then
       Move(Src.FData[0], Result[DataPos], NumElements * csNeuralFloatSize);
+  end
+  else if DType = 'f2' then
+  begin
+    if NumElements > 0 then
+      TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@Result[DataPos]),
+        TNeuralFloatArrPtr(@Src.FData[0]), integer(NumElements));
   end
   else
   begin
