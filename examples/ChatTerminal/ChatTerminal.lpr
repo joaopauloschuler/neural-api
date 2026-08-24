@@ -368,6 +368,16 @@ begin
     Check(ParseArgs(Args, Opt) and not Opt.GpuSharedKernel,
       '--no-gpu-shared-kernel parses');
 
+    // FP32 activations in the int8 matmuls unless --gpu-fp16 asks for halves.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and not Opt.GpuFP16,
+      'FP32 activations by default');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--gpu-fp16');
+    Check(ParseArgs(Args, Opt) and Opt.GpuFP16, '--gpu-fp16 parses');
+
     // -p: empty (interactive REPL) by default, holds the one-shot prompt when
     // given, and needs a value.
     Args.Clear;
