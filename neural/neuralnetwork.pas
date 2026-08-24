@@ -573,6 +573,11 @@ type
       procedure BuildArrNeurons();
 
       {$IFDEF OpenCL}
+      // Frees FDotCL and only then returns the cai_dot_product handle it
+      // borrowed. Idempotent and NOT virtual, so a descendant destructor can
+      // call it to free the borrower before returning its own borrowed
+      // handles. Coded by Claude (AI).
+      procedure ReleaseDotProductCL();
       procedure DisableOpenCL(); virtual;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); virtual;
       // Device buffer holding this layer's finished forward output
@@ -76835,6 +76840,10 @@ begin
   FNeuronWeightList.Free;
   FConcatedWInter.Free;
   {$IFDEF OpenCL}
+  // FDotCL borrows FInt8Kernel and FFP16Kernel, so the borrower goes first -
+  // the order DisableOpenCL already uses. The inherited destructor frees FDotCL
+  // too, but it runs LAST, which is after these handles would have gone back.
+  ReleaseDotProductCL();
   ReleaseInt8Kernels();
   {$ENDIF}
   inherited Destroy();
@@ -130328,13 +130337,7 @@ end;
 destructor TNNetLayer.Destroy();
 begin
   {$IFDEF OpenCL}
-  if Assigned(FDotCL) then
-  begin
-    FDotCL.Free;
-    FDotCL := nil;
-  end;
-  if Assigned(FNN) then
-    FNN.FreeKernelIfNotShared('cai_dot_product', F32Kernel);
+  ReleaseDotProductCL();
   {$ENDIF}
   FOutputError.Free;
   FOutputErrorDeriv.Free;
@@ -130443,7 +130446,7 @@ begin
   end;
 end;
 
-procedure TNNetLayer.DisableOpenCL();
+procedure TNNetLayer.ReleaseDotProductCL();
 begin
   if Assigned(FDotCL) then
   begin
@@ -130454,7 +130457,11 @@ begin
   // its borrower is gone.
   if Assigned(FNN) then
     FNN.FreeKernelIfNotShared('cai_dot_product', F32Kernel);
+end;
 
+procedure TNNetLayer.DisableOpenCL();
+begin
+  ReleaseDotProductCL();
   FHasOpenCL := false;
   FShouldOpenCL := false;
 end;
