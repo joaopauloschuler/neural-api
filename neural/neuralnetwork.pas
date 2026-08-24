@@ -1160,11 +1160,11 @@ type
       // the kernel above this buffer IS per-layer and IS freed in Destroy.
       FActivationBuffer: cl_mem;
       FActivationBufSize: integer; // element capacity of FActivationBuffer
-      // Returns the borrowed FActivationKernel handle to the net. Called from
-      // DisableOpenCL AND from Destroy: a layer is destroyed without a
-      // DisableOpenCL first, so neither may be the only caller.
-      // Coded by Claude (AI).
-      procedure ReleaseActivationKernel();
+      // Releases this layer's OpenCL resources: the device buffer, then the
+      // borrowed FActivationKernel handle. Called from DisableOpenCL AND from Destroy -
+      // a layer is destroyed without a DisableOpenCL first, so neither may be
+      // the only caller. Coded by Claude (AI).
+      procedure ReleaseActivationOpenCL();
       // Unconditionally runs the net's shared cai_activation kernel over
       // FPrevLayer.FOutput into FOutput. The caller checks WillOpenCL() and
       // bumps FForwardGPUCnt, exactly as TNNetConvolution.Compute does. Forward
@@ -11840,11 +11840,11 @@ type
       // EnableOpenCL and reused by every forward, so no forward pass allocates.
       FMulBuffer: cl_mem;
       FMulBufSize: integer; // element capacity of FMulBuffer
-      // Returns the borrowed FMulKernel handle to the net. Called from
-      // DisableOpenCL AND from Destroy: a layer is destroyed without a
-      // DisableOpenCL first, so neither may be the only caller.
-      // Coded by Claude (AI).
-      procedure ReleaseMulKernel();
+      // Releases this layer's OpenCL resources: the device buffer, then the
+      // borrowed FMulKernel handle. Called from DisableOpenCL AND from Destroy -
+      // a layer is destroyed without a DisableOpenCL first, so neither may be
+      // the only caller. Coded by Claude (AI).
+      procedure ReleaseMulOpenCL();
       // Multiplies the already-resident source by the already-resident
       // per-channel operand into FMulBuffer and leaves the product there. The
       // caller checks WillOpenCL().
@@ -11881,11 +11881,11 @@ type
       // EnableOpenCL and reused by every forward, so no forward pass allocates.
       FMulBuffer: cl_mem;
       FMulBufSize: integer; // element capacity of FMulBuffer
-      // Returns the borrowed FMulKernel handle to the net. Called from
-      // DisableOpenCL AND from Destroy: a layer is destroyed without a
-      // DisableOpenCL first, so neither may be the only caller.
-      // Coded by Claude (AI).
-      procedure ReleaseMulKernel();
+      // Releases this layer's OpenCL resources: the device buffer, then the
+      // borrowed FMulKernel handle. Called from DisableOpenCL AND from Destroy -
+      // a layer is destroyed without a DisableOpenCL first, so neither may be
+      // the only caller. Coded by Claude (AI).
+      procedure ReleaseMulOpenCL();
       // Multiplies the two already-resident source outputs into FMulBuffer and
       // leaves the product there. The caller checks WillOpenCL().
       procedure ComputeOpenCL();
@@ -12580,11 +12580,11 @@ type
     FIsBroadcast: boolean;
     // Kernel name matching FFusedSlotCount, so acquire and free name the same one.
     function ConcatKernelName(): string;
-    // Returns the borrowed FConcatKernel handle to the net. Called from
-    // DisableOpenCL AND from Destroy: a layer is destroyed without a
-    // DisableOpenCL first, so neither may be the only caller.
-    // Coded by Claude (AI).
-    procedure ReleaseConcatKernel();
+    // Releases this layer's OpenCL resources: the device buffer, then the
+    // borrowed FConcatKernel handle. Called from DisableOpenCL AND from Destroy -
+    // a layer is destroyed without a DisableOpenCL first, so neither may be
+    // the only caller. Coded by Claude (AI).
+    procedure ReleaseConcatOpenCL();
     // Scatters the already-resident source outputs into FConcatBuffer. The caller
     // checks WillOpenCL() and bumps FForwardGPUCnt.
     procedure ComputeOpenCL();
@@ -12616,11 +12616,11 @@ type
     // EnableOpenCL and reused by every forward, so no forward pass allocates.
     FSumBuffer: cl_mem;
     FSumBufSize: integer; // element capacity of FSumBuffer
-    // Returns the borrowed FSumKernel handle to the net. Called from
-    // DisableOpenCL AND from Destroy: a layer is destroyed without a
-    // DisableOpenCL first, so neither may be the only caller.
-    // Coded by Claude (AI).
-    procedure ReleaseSumKernel();
+    // Releases this layer's OpenCL resources: the device buffer, then the
+    // borrowed FSumKernel handle. Called from DisableOpenCL AND from Destroy -
+    // a layer is destroyed without a DisableOpenCL first, so neither may be
+    // the only caller. Coded by Claude (AI).
+    procedure ReleaseSumOpenCL();
     // Adds the already-resident source outputs into FSumBuffer and leaves the
     // result there. The caller checks WillOpenCL() and bumps FForwardGPUCnt.
     procedure ComputeOpenCL();
@@ -12775,11 +12775,11 @@ type
     // FChannels on the device, uploaded ONCE in EnableOpenCL: the channel list
     // is fixed at SetPrevLayer, so no forward pass writes it.
     FChannelIdxBuffer: cl_mem;
-    // Returns the borrowed FSplitKernel handle to the net. Called from
-    // DisableOpenCL AND from Destroy: a layer is destroyed without a
-    // DisableOpenCL first, so neither may be the only caller.
-    // Coded by Claude (AI).
-    procedure ReleaseSplitKernel();
+    // Releases this layer's OpenCL resources: the device buffer, then the
+    // borrowed FSplitKernel handle. Called from DisableOpenCL AND from Destroy -
+    // a layer is destroyed without a DisableOpenCL first, so neither may be
+    // the only caller. Coded by Claude (AI).
+    procedure ReleaseSplitOpenCL();
     // Gathers the selected channels out of the already-resident source output
     // into FSplitBuffer. The caller checks WillOpenCL() and bumps FForwardGPUCnt.
     procedure ComputeOpenCL();
@@ -51950,8 +51950,7 @@ end;
 {$IFDEF OpenCL}
 destructor TNNetCellMulByCell.Destroy();
 begin
-  if Assigned(FMulBuffer) then clReleaseMemObject(FMulBuffer);
-  ReleaseMulKernel();
+  ReleaseMulOpenCL();
   inherited Destroy();
 end;
 
@@ -51976,8 +51975,17 @@ begin
   end;
 end;
 
-procedure TNNetCellMulByCell.ReleaseMulKernel();
+procedure TNNetCellMulByCell.ReleaseMulOpenCL();
 begin
+  if Assigned(FMulBuffer) then
+  begin
+    clReleaseMemObject(FMulBuffer);
+    FMulBuffer := nil;
+    FMulBufSize := 0;
+  end;
+  // With the buffer gone nothing of this layer's output is in OpenCL
+  // memory: leaving the flag set would hand a consumer a released buffer.
+  FOutputOnOpenCL := false;
   if Assigned(FNN) then FNN.FreeKernelIfNotShared('cai_cell_mul', FMulKernel);
 end;
 
@@ -51987,7 +51995,7 @@ begin
   // back to RAM while that handle is still alive.
   ForceOutputOnRAM();
   inherited DisableOpenCL();
-  ReleaseMulKernel();
+  ReleaseMulOpenCL();
 end;
 
 function TNNetCellMulByCell.WillOpenCL(): boolean;
@@ -73722,8 +73730,7 @@ end;
 {$IFDEF OpenCL}
 destructor TNNetChannelMulByLayer.Destroy();
 begin
-  if Assigned(FMulBuffer) then clReleaseMemObject(FMulBuffer);
-  ReleaseMulKernel();
+  ReleaseMulOpenCL();
   inherited Destroy();
 end;
 
@@ -73748,8 +73755,17 @@ begin
   end;
 end;
 
-procedure TNNetChannelMulByLayer.ReleaseMulKernel();
+procedure TNNetChannelMulByLayer.ReleaseMulOpenCL();
 begin
+  if Assigned(FMulBuffer) then
+  begin
+    clReleaseMemObject(FMulBuffer);
+    FMulBuffer := nil;
+    FMulBufSize := 0;
+  end;
+  // With the buffer gone nothing of this layer's output is in OpenCL
+  // memory: leaving the flag set would hand a consumer a released buffer.
+  FOutputOnOpenCL := false;
   if Assigned(FNN) then FNN.FreeKernelIfNotShared('cai_cell_mul', FMulKernel);
 end;
 
@@ -73759,7 +73775,7 @@ begin
   // back to RAM while that handle is still alive.
   ForceOutputOnRAM();
   inherited DisableOpenCL();
-  ReleaseMulKernel();
+  ReleaseMulOpenCL();
 end;
 
 function TNNetChannelMulByLayer.WillOpenCL(): boolean;
@@ -77323,8 +77339,7 @@ end;
 destructor TNNetSum.Destroy();
 begin
   {$IFDEF OpenCL}
-  if Assigned(FSumBuffer) then clReleaseMemObject(FSumBuffer);
-  ReleaseSumKernel();
+  ReleaseSumOpenCL();
   {$ENDIF}
   inherited Destroy();
 end;
@@ -77349,8 +77364,17 @@ begin
   end;
 end;
 
-procedure TNNetSum.ReleaseSumKernel();
+procedure TNNetSum.ReleaseSumOpenCL();
 begin
+  if Assigned(FSumBuffer) then
+  begin
+    clReleaseMemObject(FSumBuffer);
+    FSumBuffer := nil;
+    FSumBufSize := 0;
+  end;
+  // With the buffer gone nothing of this layer's output is in OpenCL
+  // memory: leaving the flag set would hand a consumer a released buffer.
+  FOutputOnOpenCL := false;
   if Assigned(FNN) then FNN.FreeKernelIfNotShared('cai_volume_sum', FSumKernel);
 end;
 
@@ -77360,7 +77384,7 @@ begin
   // back to RAM while that handle is still alive.
   ForceOutputOnRAM();
   inherited DisableOpenCL();
-  ReleaseSumKernel();
+  ReleaseSumOpenCL();
 end;
 
 function TNNetSum.WillOpenCL(): boolean;
@@ -95818,8 +95842,7 @@ end;
 destructor TNNetDeepConcat.Destroy();
 begin
   {$IFDEF OpenCL}
-  if Assigned(FConcatBuffer) then clReleaseMemObject(FConcatBuffer);
-  ReleaseConcatKernel();
+  ReleaseConcatOpenCL();
   {$ENDIF}
   SetLength(FRemainingChannels, 0);
   SetLength(FDeepsLayer, 0);
@@ -95874,8 +95897,17 @@ begin
     end;
 end;
 
-procedure TNNetDeepConcat.ReleaseConcatKernel();
+procedure TNNetDeepConcat.ReleaseConcatOpenCL();
 begin
+  if Assigned(FConcatBuffer) then
+  begin
+    clReleaseMemObject(FConcatBuffer);
+    FConcatBuffer := nil;
+    FConcatBufSize := 0;
+  end;
+  // With the buffer gone nothing of this layer's output is in OpenCL
+  // memory: leaving the flag set would hand a consumer a released buffer.
+  FOutputOnOpenCL := false;
   if Assigned(FNN) then FNN.FreeKernelIfNotShared(ConcatKernelName(), FConcatKernel);
 end;
 
@@ -95885,7 +95917,7 @@ begin
   // come back to RAM while that handle is still alive.
   ForceOutputOnRAM();
   inherited DisableOpenCL();
-  ReleaseConcatKernel();
+  ReleaseConcatOpenCL();
 end;
 
 function TNNetDeepConcat.WillOpenCL(): boolean;
@@ -96228,9 +96260,7 @@ end;
 destructor TNNetSplitChannels.Destroy();
 begin
   {$IFDEF OpenCL}
-  if Assigned(FSplitBuffer) then clReleaseMemObject(FSplitBuffer);
-  if Assigned(FChannelIdxBuffer) then clReleaseMemObject(FChannelIdxBuffer);
-  ReleaseSplitKernel();
+  ReleaseSplitOpenCL();
   {$ENDIF}
   SetLength(FChannels, 0);
   inherited Destroy();
@@ -96263,8 +96293,22 @@ begin
       ChannelCount * csLongintSize, @FChannels[0]);
 end;
 
-procedure TNNetSplitChannels.ReleaseSplitKernel();
+procedure TNNetSplitChannels.ReleaseSplitOpenCL();
 begin
+  if Assigned(FSplitBuffer) then
+  begin
+    clReleaseMemObject(FSplitBuffer);
+    FSplitBuffer := nil;
+    FSplitBufSize := 0;
+  end;
+  if Assigned(FChannelIdxBuffer) then
+  begin
+    clReleaseMemObject(FChannelIdxBuffer);
+    FChannelIdxBuffer := nil;
+  end;
+  // With the buffer gone nothing of this layer's output is in OpenCL
+  // memory: leaving the flag set would hand a consumer a released buffer.
+  FOutputOnOpenCL := false;
   if Assigned(FNN) then FNN.FreeKernelIfNotShared('cai_split_channels', FSplitKernel);
 end;
 
@@ -96274,7 +96318,7 @@ begin
   // back to RAM while that handle is still alive.
   ForceOutputOnRAM();
   inherited DisableOpenCL();
-  ReleaseSplitKernel();
+  ReleaseSplitOpenCL();
 end;
 
 function TNNetSplitChannels.WillOpenCL(): boolean;
@@ -99894,13 +99938,21 @@ end;
 {$IFDEF OpenCL}
 destructor TNNetIdentity.Destroy();
 begin
-  if Assigned(FActivationBuffer) then clReleaseMemObject(FActivationBuffer);
-  ReleaseActivationKernel();
+  ReleaseActivationOpenCL();
   inherited Destroy();
 end;
 
-procedure TNNetIdentity.ReleaseActivationKernel();
+procedure TNNetIdentity.ReleaseActivationOpenCL();
 begin
+  if Assigned(FActivationBuffer) then
+  begin
+    clReleaseMemObject(FActivationBuffer);
+    FActivationBuffer := nil;
+    FActivationBufSize := 0;
+  end;
+  // With the buffer gone nothing of this layer's output is in OpenCL
+  // memory: leaving the flag set would hand a consumer a released buffer.
+  FOutputOnOpenCL := false;
   if Assigned(FNN) then
     FNN.FreeKernelIfNotShared('cai_activation', FActivationKernel);
 end;
@@ -99911,7 +99963,7 @@ begin
   // output has to come back to RAM while that handle is still alive.
   ForceOutputOnRAM();
   inherited DisableOpenCL();
-  ReleaseActivationKernel();
+  ReleaseActivationOpenCL();
 end;
 
 procedure TNNetIdentity.EnableOpenCL(DotProductKernel: TNeuralKernel);
@@ -128519,16 +128571,33 @@ begin
 end;
 
 {$IFDEF OpenCL}
+// Undoes EnableOpenCL completely: every layer first, then the shared helper
+// kernels, then the root kernel that owns their context and program - the order
+// Destroy uses, and the reverse of how they were built. Tearing the context down
+// is what makes a later EnableOpenCL correct: it builds a NEW context, so any
+// buffer or kernel handle surviving from this one would belong to the old one
+// and every enqueue mixing the two fails with CL_INVALID_CONTEXT.
+// Coded by Claude (AI).
 procedure TNNet.DisableOpenCL();
 var
   LayerCnt: integer;
   LastLayerIdx: integer;
+  KernelIdx: integer;
+  SharedKernelsCntM1: integer;
 begin
   LastLayerIdx := GetLastLayerIdx();
   for LayerCnt := 0 to LastLayerIdx do
   begin
     FLayers[LayerCnt].DisableOpenCL();
   end;
+  if Assigned(FSharedKernels) then
+  begin
+    SharedKernelsCntM1 := FSharedKernels.Count - 1;
+    for KernelIdx := 0 to SharedKernelsCntM1 do
+      FSharedKernels.Objects[KernelIdx].Free;
+    FreeAndNil(FSharedKernels);
+  end;
+  if Assigned(FDotProductKernel) then FreeAndNil(FDotProductKernel);
 end;
 
 procedure TNNet.EnableOpenCL(platform_id: cl_platform_id;
@@ -128601,6 +128670,10 @@ begin
     else Result := CreateKernel(kernelname);
 end;
 
+// Returns a borrowed handle: frees it when the caller owned it, and ALWAYS
+// drops the caller's reference. A shared handle stays alive in FSharedKernels,
+// but the borrower must stop pointing at it - DisableOpenCL rebuilds the cache
+// on a fresh context, so a kept pointer would be a stale-context handle.
 procedure TNNet.FreeKernelIfNotShared(const kernelname: string;
   var KernelObject: TNeuralKernel);
 var
@@ -128616,10 +128689,9 @@ begin
     ShouldFree := (idx < 0) or
       (TNeuralKernel(FSharedKernels.Objects[idx]) <> KernelObject);
   end;
-  if ShouldFree then
-  begin
-    FreeAndNil(KernelObject);
-  end;
+  if ShouldFree
+    then FreeAndNil(KernelObject)
+    else KernelObject := nil;
 end;
 
 procedure TNNet.ForceOpenCL(pForce: boolean);

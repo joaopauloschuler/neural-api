@@ -467,6 +467,13 @@ type
     // Single. Asserts the FP16 route was actually taken, then checks parity at
     // half's own tolerance rather than the FP32 path's. Coded by Claude (AI).
     procedure TestInt8ConvFP16OpenCLParity;
+    // EnableOpenCL -> forward -> DisableOpenCL, three times over a net of the
+    // layers that own a device buffer AND a borrowed kernel handle. Guards the
+    // teardown: every cycle must still run ON the device and still match the
+    // CPU, which only holds if DisableOpenCL drops the whole context - buffers,
+    // shared handles and the root kernel - so the next EnableOpenCL rebuilds
+    // them together. Coded by Claude (AI).
+    procedure TestOpenCLDisableEnableCycle;
     // OpenCL split-K int8 parity: a long reduction axis with few output
     // neurons is the decode GEMV shape that makes TDotProductSharedKernel
     // .Int8SplitCount cut the axis into slabs, so this covers the two-pass
@@ -66336,6 +66343,88 @@ begin
   RunConv('rect 3x1 pad1 s1 relu', 3, 1, 1, 1, true);
   RunConv('rect 1x3 pad0 s1 linear', 1, 3, 0, 1, false);
   RunConv('rect 5x3 pad2 s2 relu', 5, 3, 2, 2, true);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Repeated EnableOpenCL/DisableOpenCL cycles. A buffer or kernel handle that
+// survives a DisableOpenCL belongs to the context that call tore down, so the
+// next EnableOpenCL - which builds a NEW context - would mix the two and every
+// enqueue would fail with CL_INVALID_CONTEXT. The device path then silently
+// falls back to the CPU, which is why this checks ForwardGPUCnt as well as
+// parity: a CPU fallback matches the reference EXACTLY and would otherwise
+// read as a pass. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestOpenCLDisableEnableCycle;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, Ref: TNNetVolume;
+  A, B, SumLayer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, Cycle, GPUCntBefore: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260824;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 4);
+  Ref := TNNetVolume.Create();
+  try
+    // One layer of each kind that owns a device buffer AND a borrowed handle.
+    NN.AddLayer(TNNetInput.Create(8, 8, 4, 1));
+    A := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+    B := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+    SumLayer := NN.AddLayer(TNNetSum.Create([A, B]));
+    NN.AddLayer(TNNetReLU.Create());
+    NN.AddLayer(TNNetSplitChannels.Create(0, 4));
+    NN.AddLayerAfter(TNNetDeepConcat.Create([A, B]), B);
+    NN.AddLayer(TNNetCellMulByCell.Create(A, B));
+    NN.AddLayer(TNNetReLU.Create());
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.013 * i - 1.1;
+    NN.UpdateWeights();
+    for i := 0 to NN.GetLastLayerIdx() do
+      NN.Layers[i].SetTrainable(False, False);
+
+    NN.Compute(Input);
+    Ref.Copy(NN.GetLastLayer.Output);
+
+    for Cycle := 1 to 3 do
+    begin
+      GPUCntBefore := SumLayer.ForwardGPUCnt;
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.ForceOpenCL(True);
+      NN.Compute(Input);
+      NN.GetLastLayer.ForceOutputOnRAM();
+      MaxDiff := 0;
+      for i := 0 to Ref.Size - 1 do
+      begin
+        Diff := Abs(Ref.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      WriteLn('  OpenCL cycle ', Cycle, ': max|diff|=', MaxDiff:0:9,
+        ' gpu forwards=', SumLayer.ForwardGPUCnt);
+      AssertTrue('cycle ' + IntToStr(Cycle) + ' ran on the device',
+        SumLayer.ForwardGPUCnt > GPUCntBefore);
+      AssertTrue('cycle ' + IntToStr(Cycle) + ' parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+      NN.ForceOpenCL(False);
+      NN.DisableOpenCL();
+      // The CPU forward must still work once the device path is gone.
+      NN.Compute(Input);
+    end;
+  finally
+    Ref.Free;
+    Input.Free;
+    NN.Free;
+  end;
 end;
 {$ELSE}
 begin
