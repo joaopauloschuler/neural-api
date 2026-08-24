@@ -314,6 +314,126 @@ __kernel void cai_dot_product_int8
   }
 } // end of kernel
 
+// HALF-ACTIVATION twin of cai_dot_product_int8. The A operand is unchanged
+// (per-row symmetric int8 codes + per-row FP32 scales); only B - the im2col
+// column matrix, the operand every one of the FNumAs output rows re-reads -
+// is stored as half, halving the device read traffic that dominates a
+// convolution GEMM. half is used as a STORAGE format only: every element is
+// read through vload_half, which is core OpenCL (no cl_khr_fp16, no half
+// arithmetic anywhere) and returns a float, so the mad chain, the accumulator,
+// the deferred per-row scale, the fused bias and the fused activation are
+// bit-for-bit the same code as cai_dot_product_int8. The result buffer stays
+// FP32. B carries ~5e-4 relative error, so this kernel does NOT hold the 1e-4
+// parity tolerance the FP32 path is tested at. Coded by Claude (AI).
+__kernel void cai_dot_product_int8_h
+(
+  const int FThreadCount,
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  int ActFN,
+  __global const char* FInputBufferAs,
+  __global const half* FInputBufferBs,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FBiasOutput,
+  __global const float* FScales
+)
+{
+  const int a_id = get_global_id(0);
+  const int b_id = get_global_id(1);
+
+  if ( (a_id < FNumAs) && (b_id < FNumBs) )
+  {
+    const int VectBPos = b_id * FSize;
+
+    float DotProductResult = 0;
+    int i = 0;
+
+    const int FSizeMinus8  = FSize -  8;
+    const int FSizeMinus32 = FSize - 32;
+
+    while (i < FSizeMinus32)
+    {
+      const int startBPos = i + VectBPos;
+
+      DotProductResult =
+        mad(convert_float(FInputBufferAs[a_id + (i+ 0)*FNumAs]), vload_half(startBPos +  0, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+ 1)*FNumAs]), vload_half(startBPos +  1, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+ 2)*FNumAs]), vload_half(startBPos +  2, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+ 3)*FNumAs]), vload_half(startBPos +  3, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+ 4)*FNumAs]), vload_half(startBPos +  4, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+ 5)*FNumAs]), vload_half(startBPos +  5, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+ 6)*FNumAs]), vload_half(startBPos +  6, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+ 7)*FNumAs]), vload_half(startBPos +  7, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+ 8)*FNumAs]), vload_half(startBPos +  8, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+ 9)*FNumAs]), vload_half(startBPos +  9, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+10)*FNumAs]), vload_half(startBPos + 10, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+11)*FNumAs]), vload_half(startBPos + 11, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+12)*FNumAs]), vload_half(startBPos + 12, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+13)*FNumAs]), vload_half(startBPos + 13, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+14)*FNumAs]), vload_half(startBPos + 14, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+15)*FNumAs]), vload_half(startBPos + 15, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+16)*FNumAs]), vload_half(startBPos + 16, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+17)*FNumAs]), vload_half(startBPos + 17, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+18)*FNumAs]), vload_half(startBPos + 18, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+19)*FNumAs]), vload_half(startBPos + 19, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+20)*FNumAs]), vload_half(startBPos + 20, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+21)*FNumAs]), vload_half(startBPos + 21, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+22)*FNumAs]), vload_half(startBPos + 22, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+23)*FNumAs]), vload_half(startBPos + 23, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+24)*FNumAs]), vload_half(startBPos + 24, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+25)*FNumAs]), vload_half(startBPos + 25, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+26)*FNumAs]), vload_half(startBPos + 26, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+27)*FNumAs]), vload_half(startBPos + 27, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+28)*FNumAs]), vload_half(startBPos + 28, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+29)*FNumAs]), vload_half(startBPos + 29, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+30)*FNumAs]), vload_half(startBPos + 30, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+31)*FNumAs]), vload_half(startBPos + 31, FInputBufferBs),
+        DotProductResult
+        ))))))))
+        ))))))))
+        ))))))))
+        ))))))));
+
+      i += 32;
+    }
+
+    while (i < FSizeMinus8)
+    {
+      const int startBPos = i + VectBPos;
+
+      DotProductResult =
+        mad(convert_float(FInputBufferAs[a_id + (i+ 0)*FNumAs]), vload_half(startBPos +  0, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+ 1)*FNumAs]), vload_half(startBPos +  1, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+ 2)*FNumAs]), vload_half(startBPos +  2, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+ 3)*FNumAs]), vload_half(startBPos +  3, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+ 4)*FNumAs]), vload_half(startBPos +  4, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+ 5)*FNumAs]), vload_half(startBPos +  5, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+ 6)*FNumAs]), vload_half(startBPos +  6, FInputBufferBs),
+        mad(convert_float(FInputBufferAs[a_id + (i+ 7)*FNumAs]), vload_half(startBPos +  7, FInputBufferBs),
+        DotProductResult))))))));
+      i += 8;
+    }
+
+    while (i < FSize)
+    {
+      DotProductResult =
+        mad(convert_float(FInputBufferAs[a_id + i*FNumAs]),
+          vload_half(i + VectBPos, FInputBufferBs), DotProductResult);
+        i += 1;
+    }
+
+    // Deferred per-row dequantization scale, the fused bias and the fused
+    // activation, in cai_dot_product_int8's order.
+    DotProductResult *= FScales[a_id];
+    if (UseBias != 0) DotProductResult += FBiasOutput[b_id * FNumAs + a_id];
+    DotProductResult = cai_fused_act(DotProductResult, ActFN);
+
+    FResultBuffer[b_id * FNumAs + a_id] = DotProductResult;
+  }
+} // end of kernel
+
 // SPLIT-K PASS 1. cai_dot_product_int8 gives one work-item per (output row,
 // sample), so a decode GEMV (FNumBs=1) launches only FNumAs work-items and
 // leaves a large device mostly idle. This kernel adds a third grid axis over
@@ -380,6 +500,74 @@ __kernel void cai_dot_product_int8_splitk
 
     // Slab-major layout: pass 1 writes and pass 2 reads with consecutive a_id
     // lanes hitting consecutive floats, so both passes stay coalesced.
+    FPartialBuffer[s * FNumAs * FNumBs + b_id * FNumAs + a_id] = PartialResult;
+  }
+} // end of kernel
+
+// SPLIT-K PASS 1, HALF-ACTIVATION twin. Identical to
+// cai_dot_product_int8_splitk - same slab decomposition, same raw code sums,
+// same slab-major FPartialBuffer layout - except that B is read through
+// vload_half. FPartialBuffer stays FP32, so pass 2
+// (cai_dot_product_int8_splitk_reduce) never touches B and needs no half twin.
+// Coded by Claude (AI).
+__kernel void cai_dot_product_int8_splitk_h
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int KSplits,
+  __global const char* FInputBufferAs,
+  __global const half* FInputBufferBs,
+  __global float* FPartialBuffer
+)
+{
+  const int a_id = get_global_id(0);
+  const int b_id = get_global_id(1);
+  const int s    = get_global_id(2);
+
+  if ( (a_id < FNumAs) && (b_id < FNumBs) && (s < KSplits) )
+  {
+    const int KChunk = (FSize + KSplits - 1) / KSplits;
+    const int kStart = s * KChunk;
+    int kEnd = kStart + KChunk;
+    if (kEnd > FSize) kEnd = FSize;
+
+    float PartialResult = 0;
+    int i = kStart;
+
+    if (i < kEnd)
+    {
+      const int VectBPos = b_id * FSize;
+      const int kEndMinus8 = kEnd - 8;
+
+      while (i < kEndMinus8)
+      {
+        const int startBPos = i + VectBPos;
+
+        PartialResult =
+          mad(convert_float(FInputBufferAs[a_id + (i+ 0)*FNumAs]), vload_half(startBPos +  0, FInputBufferBs),
+          mad(convert_float(FInputBufferAs[a_id + (i+ 1)*FNumAs]), vload_half(startBPos +  1, FInputBufferBs),
+          mad(convert_float(FInputBufferAs[a_id + (i+ 2)*FNumAs]), vload_half(startBPos +  2, FInputBufferBs),
+          mad(convert_float(FInputBufferAs[a_id + (i+ 3)*FNumAs]), vload_half(startBPos +  3, FInputBufferBs),
+          mad(convert_float(FInputBufferAs[a_id + (i+ 4)*FNumAs]), vload_half(startBPos +  4, FInputBufferBs),
+          mad(convert_float(FInputBufferAs[a_id + (i+ 5)*FNumAs]), vload_half(startBPos +  5, FInputBufferBs),
+          mad(convert_float(FInputBufferAs[a_id + (i+ 6)*FNumAs]), vload_half(startBPos +  6, FInputBufferBs),
+          mad(convert_float(FInputBufferAs[a_id + (i+ 7)*FNumAs]), vload_half(startBPos +  7, FInputBufferBs),
+          PartialResult))))))));
+        i += 8;
+      }
+
+      while (i < kEnd)
+      {
+        PartialResult =
+          mad(convert_float(FInputBufferAs[a_id + i*FNumAs]),
+            vload_half(i + VectBPos, FInputBufferBs), PartialResult);
+        i += 1;
+      }
+    }
+
+    // Slab-major layout, same as cai_dot_product_int8_splitk: both passes stay
+    // coalesced over a_id.
     FPartialBuffer[s * FNumAs * FNumBs + b_id * FNumAs + a_id] = PartialResult;
   }
 } // end of kernel
@@ -1503,6 +1691,55 @@ __kernel void cai_im2col
   const int rem      = col_elem % RowSpan;
   const int src = ((InSizeX * (oy * Stride + yCount)) + ox * Stride) * InDepth + rem;
   FCols[gid] = FInput[src];
+}
+
+// HALF-ACTIVATION twin of cai_im2col. The gather is unchanged - same closed-form
+// conv geometry, same source element per output element - only the WRITE narrows
+// to half via vstore_half (round-to-nearest-even, core OpenCL, no cl_khr_fp16).
+// FInput, the already-padded convolution input, stays FP32 and is what crosses
+// the bus; the FeatureSizeX*FeatureSizeY-larger column matrix it expands into
+// exists only on the device and only in half, which is where the traffic saving
+// comes from. Feeds cai_dot_product_int8_h. Coded by Claude (AI).
+__kernel void cai_im2col_h
+(
+  const int N,          // total elements = OutSizeX*OutSizeY*ColDepth
+  const int OutSizeX,   // FOutput.SizeX
+  const int ColDepth,   // FInputPrepared depth = InDepth*FeatX*FeatY
+  const int RowSpan,    // one feature-row width = InDepth*FeatX
+  const int InSizeX,    // FInputCopy.SizeX (padded)
+  const int InDepth,    // FInputCopy.Depth
+  const int Stride,
+  __global const float* FInput,
+  __global half* FCols
+)
+{
+  const int gid = get_global_id(0);
+  if (gid >= N) return;
+  const int col_elem = gid % ColDepth;
+  const int pos      = gid / ColDepth;
+  const int ox       = pos % OutSizeX;
+  const int oy       = pos / OutSizeX;
+  const int yCount   = col_elem / RowSpan;
+  const int rem      = col_elem % RowSpan;
+  const int src = ((InSizeX * (oy * Stride + yCount)) + ox * Stride) * InDepth + rem;
+  vstore_half(FInput[src], gid, FCols);
+}
+
+// Narrows an FP32 device buffer to half, element for element. This is the
+// fallback B-operand producer for the half path: a pointwise convolution has no
+// im2col to fold the conversion into (cai_im2col_h), and a B operand bound from
+// a producing layer's resident output is FP32 because every other consumer of
+// that buffer reads it as FP32. One work-item per element. Coded by Claude (AI).
+__kernel void cai_f32_to_half
+(
+  const int N,
+  __global const float* FSrc,
+  __global half* FDst
+)
+{
+  const int gid = get_global_id(0);
+  if (gid >= N) return;
+  vstore_half(FSrc[gid], gid, FDst);
 }
 
 // Rotary positional embedding (RoPE) forward. The input is FSeqLen tokens of
