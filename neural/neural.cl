@@ -323,8 +323,11 @@ __kernel void cai_dot_product_int8
 // arithmetic anywhere) and returns a float, so the mad chain, the accumulator,
 // the deferred per-row scale, the fused bias and the fused activation are
 // bit-for-bit the same code as cai_dot_product_int8. The result buffer stays
-// FP32. B carries ~5e-4 relative error, so this kernel does NOT hold the 1e-4
-// parity tolerance the FP32 path is tested at. Coded by Claude (AI).
+// FP32. The int8 code needs no convert_float: OpenCL's scalar implicit
+// conversion picks the float mad overload, and every char is exactly
+// representable in float, so the cast would be a no-op. B carries ~5e-4
+// relative error, so this kernel does NOT hold the 1e-4 parity tolerance the
+// FP32 path is tested at. Coded by Claude (AI).
 __kernel void cai_dot_product_int8_h
 (
   const int FThreadCount,
@@ -358,38 +361,38 @@ __kernel void cai_dot_product_int8_h
       const int startBPos = i + VectBPos;
 
       DotProductResult =
-        mad(convert_float(FInputBufferAs[a_id + (i+ 0)*FNumAs]), vload_half(startBPos +  0, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+ 1)*FNumAs]), vload_half(startBPos +  1, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+ 2)*FNumAs]), vload_half(startBPos +  2, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+ 3)*FNumAs]), vload_half(startBPos +  3, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+ 4)*FNumAs]), vload_half(startBPos +  4, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+ 5)*FNumAs]), vload_half(startBPos +  5, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+ 6)*FNumAs]), vload_half(startBPos +  6, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+ 7)*FNumAs]), vload_half(startBPos +  7, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+ 8)*FNumAs]), vload_half(startBPos +  8, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+ 9)*FNumAs]), vload_half(startBPos +  9, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+10)*FNumAs]), vload_half(startBPos + 10, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+11)*FNumAs]), vload_half(startBPos + 11, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+12)*FNumAs]), vload_half(startBPos + 12, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+13)*FNumAs]), vload_half(startBPos + 13, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+14)*FNumAs]), vload_half(startBPos + 14, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+15)*FNumAs]), vload_half(startBPos + 15, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+16)*FNumAs]), vload_half(startBPos + 16, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+17)*FNumAs]), vload_half(startBPos + 17, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+18)*FNumAs]), vload_half(startBPos + 18, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+19)*FNumAs]), vload_half(startBPos + 19, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+20)*FNumAs]), vload_half(startBPos + 20, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+21)*FNumAs]), vload_half(startBPos + 21, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+22)*FNumAs]), vload_half(startBPos + 22, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+23)*FNumAs]), vload_half(startBPos + 23, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+24)*FNumAs]), vload_half(startBPos + 24, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+25)*FNumAs]), vload_half(startBPos + 25, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+26)*FNumAs]), vload_half(startBPos + 26, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+27)*FNumAs]), vload_half(startBPos + 27, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+28)*FNumAs]), vload_half(startBPos + 28, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+29)*FNumAs]), vload_half(startBPos + 29, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+30)*FNumAs]), vload_half(startBPos + 30, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+31)*FNumAs]), vload_half(startBPos + 31, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 0)*FNumAs], vload_half(startBPos +  0, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 1)*FNumAs], vload_half(startBPos +  1, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 2)*FNumAs], vload_half(startBPos +  2, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 3)*FNumAs], vload_half(startBPos +  3, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 4)*FNumAs], vload_half(startBPos +  4, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 5)*FNumAs], vload_half(startBPos +  5, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 6)*FNumAs], vload_half(startBPos +  6, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 7)*FNumAs], vload_half(startBPos +  7, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 8)*FNumAs], vload_half(startBPos +  8, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 9)*FNumAs], vload_half(startBPos +  9, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+10)*FNumAs], vload_half(startBPos + 10, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+11)*FNumAs], vload_half(startBPos + 11, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+12)*FNumAs], vload_half(startBPos + 12, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+13)*FNumAs], vload_half(startBPos + 13, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+14)*FNumAs], vload_half(startBPos + 14, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+15)*FNumAs], vload_half(startBPos + 15, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+16)*FNumAs], vload_half(startBPos + 16, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+17)*FNumAs], vload_half(startBPos + 17, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+18)*FNumAs], vload_half(startBPos + 18, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+19)*FNumAs], vload_half(startBPos + 19, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+20)*FNumAs], vload_half(startBPos + 20, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+21)*FNumAs], vload_half(startBPos + 21, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+22)*FNumAs], vload_half(startBPos + 22, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+23)*FNumAs], vload_half(startBPos + 23, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+24)*FNumAs], vload_half(startBPos + 24, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+25)*FNumAs], vload_half(startBPos + 25, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+26)*FNumAs], vload_half(startBPos + 26, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+27)*FNumAs], vload_half(startBPos + 27, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+28)*FNumAs], vload_half(startBPos + 28, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+29)*FNumAs], vload_half(startBPos + 29, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+30)*FNumAs], vload_half(startBPos + 30, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+31)*FNumAs], vload_half(startBPos + 31, FInputBufferBs),
         DotProductResult
         ))))))))
         ))))))))
@@ -404,14 +407,14 @@ __kernel void cai_dot_product_int8_h
       const int startBPos = i + VectBPos;
 
       DotProductResult =
-        mad(convert_float(FInputBufferAs[a_id + (i+ 0)*FNumAs]), vload_half(startBPos +  0, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+ 1)*FNumAs]), vload_half(startBPos +  1, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+ 2)*FNumAs]), vload_half(startBPos +  2, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+ 3)*FNumAs]), vload_half(startBPos +  3, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+ 4)*FNumAs]), vload_half(startBPos +  4, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+ 5)*FNumAs]), vload_half(startBPos +  5, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+ 6)*FNumAs]), vload_half(startBPos +  6, FInputBufferBs),
-        mad(convert_float(FInputBufferAs[a_id + (i+ 7)*FNumAs]), vload_half(startBPos +  7, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 0)*FNumAs], vload_half(startBPos +  0, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 1)*FNumAs], vload_half(startBPos +  1, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 2)*FNumAs], vload_half(startBPos +  2, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 3)*FNumAs], vload_half(startBPos +  3, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 4)*FNumAs], vload_half(startBPos +  4, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 5)*FNumAs], vload_half(startBPos +  5, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 6)*FNumAs], vload_half(startBPos +  6, FInputBufferBs),
+        mad(FInputBufferAs[a_id + (i+ 7)*FNumAs], vload_half(startBPos +  7, FInputBufferBs),
         DotProductResult))))))));
       i += 8;
     }
@@ -419,7 +422,7 @@ __kernel void cai_dot_product_int8_h
     while (i < FSize)
     {
       DotProductResult =
-        mad(convert_float(FInputBufferAs[a_id + i*FNumAs]),
+        mad(FInputBufferAs[a_id + i*FNumAs],
           vload_half(i + VectBPos, FInputBufferBs), DotProductResult);
         i += 1;
     }
@@ -545,14 +548,14 @@ __kernel void cai_dot_product_int8_splitk_h
         const int startBPos = i + VectBPos;
 
         PartialResult =
-          mad(convert_float(FInputBufferAs[a_id + (i+ 0)*FNumAs]), vload_half(startBPos +  0, FInputBufferBs),
-          mad(convert_float(FInputBufferAs[a_id + (i+ 1)*FNumAs]), vload_half(startBPos +  1, FInputBufferBs),
-          mad(convert_float(FInputBufferAs[a_id + (i+ 2)*FNumAs]), vload_half(startBPos +  2, FInputBufferBs),
-          mad(convert_float(FInputBufferAs[a_id + (i+ 3)*FNumAs]), vload_half(startBPos +  3, FInputBufferBs),
-          mad(convert_float(FInputBufferAs[a_id + (i+ 4)*FNumAs]), vload_half(startBPos +  4, FInputBufferBs),
-          mad(convert_float(FInputBufferAs[a_id + (i+ 5)*FNumAs]), vload_half(startBPos +  5, FInputBufferBs),
-          mad(convert_float(FInputBufferAs[a_id + (i+ 6)*FNumAs]), vload_half(startBPos +  6, FInputBufferBs),
-          mad(convert_float(FInputBufferAs[a_id + (i+ 7)*FNumAs]), vload_half(startBPos +  7, FInputBufferBs),
+          mad(FInputBufferAs[a_id + (i+ 0)*FNumAs], vload_half(startBPos +  0, FInputBufferBs),
+          mad(FInputBufferAs[a_id + (i+ 1)*FNumAs], vload_half(startBPos +  1, FInputBufferBs),
+          mad(FInputBufferAs[a_id + (i+ 2)*FNumAs], vload_half(startBPos +  2, FInputBufferBs),
+          mad(FInputBufferAs[a_id + (i+ 3)*FNumAs], vload_half(startBPos +  3, FInputBufferBs),
+          mad(FInputBufferAs[a_id + (i+ 4)*FNumAs], vload_half(startBPos +  4, FInputBufferBs),
+          mad(FInputBufferAs[a_id + (i+ 5)*FNumAs], vload_half(startBPos +  5, FInputBufferBs),
+          mad(FInputBufferAs[a_id + (i+ 6)*FNumAs], vload_half(startBPos +  6, FInputBufferBs),
+          mad(FInputBufferAs[a_id + (i+ 7)*FNumAs], vload_half(startBPos +  7, FInputBufferBs),
           PartialResult))))))));
         i += 8;
       }
@@ -560,7 +563,7 @@ __kernel void cai_dot_product_int8_splitk_h
       while (i < kEnd)
       {
         PartialResult =
-          mad(convert_float(FInputBufferAs[a_id + i*FNumAs]),
+          mad(FInputBufferAs[a_id + i*FNumAs],
             vload_half(i + VectBPos, FInputBufferBs), PartialResult);
         i += 1;
       }
