@@ -461,6 +461,12 @@ type
     // (feature-size x padding x stride sweep, incl. pointwise and device
     // im2col). Coded by Claude (AI).
     procedure TestInt8QuantizedOpenCLParity;
+    // Same int8 convolution forward run with TNNet.OpenCLFP16, so the B
+    // operand narrows to half (cai_dot_product_int8_h, cai_im2col_h,
+    // cai_f32_to_half) while the weights stay int8 and the result stays
+    // Single. Asserts the FP16 route was actually taken, then checks parity at
+    // half's own tolerance rather than the FP32 path's. Coded by Claude (AI).
+    procedure TestInt8ConvFP16OpenCLParity;
     // OpenCL split-K int8 parity: a long reduction axis with few output
     // neurons is the decode GEMV shape that makes TDotProductSharedKernel
     // .Int8SplitCount cut the axis into slabs, so this covers the two-pass
@@ -66330,6 +66336,95 @@ begin
   RunConv('rect 3x1 pad1 s1 relu', 3, 1, 1, 1, true);
   RunConv('rect 1x3 pad0 s1 linear', 1, 3, 0, 1, false);
   RunConv('rect 5x3 pad2 s2 relu', 5, 3, 2, 2, true);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// FP16-activation int8 convolution parity. Identical setup to the RunConv sweep
+// above, with TNNet.OpenCLFP16 set BEFORE EnableOpenCL (it is EnableOpenCL that
+// sizes the B buffer, so setting it afterwards would do nothing). Two things are
+// asserted, and the first matters more: TNNetConvolutionBase.FP16Active proves
+// the half kernels ran, because a silent fallback to the FP32 B operand would
+// pass a parity check trivially. Tolerance is half's, not the FP32 path's - the
+// B operand carries ~5e-4 relative error by construction. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestInt8ConvFP16OpenCLParity;
+{$IFDEF OpenCL}
+  procedure RunConvFP16(const aName: string; pFeatureSize, pPadding,
+    pStride: integer; UseReLU: boolean);
+  var
+    NN: TNNet;
+    Input, OutCPU: TNNetVolume;
+    Conv: TNNetConvolutionBase;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i: integer;
+    Diff, MaxDiff, MaxAbs: TNeuralFloat;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    RandSeed := 20260706;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(8, 8, 3);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(8, 8, 3, 1));
+      if UseReLU
+        then Conv := TNNetConvolutionReLU.Create(16, pFeatureSize, pPadding, pStride)
+        else Conv := TNNetConvolutionLinear.Create(16, pFeatureSize, pPadding, pStride);
+      NN.AddLayer(Conv);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.011 * i - 1.05;
+      for i := 0 to Conv.Neurons.Count - 1 do
+        Conv.Neurons[i].BiasWeight := 0.25 * Sin(i * 0.3);
+      NN.UpdateWeights();
+      Conv.SetTrainable(False, False);
+
+      NN.QuantizeWeightsInt8();
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.OpenCLFP16 := True; // before EnableOpenCL: it sizes the half B buffer
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        AssertTrue('Int8ConvFP16 ' + aName + ' took the FP16 route',
+          Conv.FP16Active);
+        NN.Compute(Input);
+        NN.Compute(Input); // resident codes/scales/bias reuse path
+        MaxDiff := 0;
+        MaxAbs := 0;
+        AssertEquals('Int8ConvFP16 ' + aName + ' output size match', OutCPU.Size,
+          NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+          if Abs(OutCPU.Raw[i]) > MaxAbs then MaxAbs := Abs(OutCPU.Raw[i]);
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  Int8ConvFP16 ', aName, ' OpenCL parity: max|diff|=', MaxDiff:0:9,
+        ' max|ref|=', MaxAbs:0:6, ' gpu forwards=', Conv.ForwardGPUCnt);
+      AssertTrue('Int8ConvFP16 ' + aName + ' device vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-2', MaxDiff < 1e-2);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+begin
+  RunConvFP16('3x3 pad1 s1 relu', 3, 1, 1, true);      // device im2col_h
+  RunConvFP16('3x3 pad0 s1 linear', 3, 0, 1, false);   // device im2col_h
+  RunConvFP16('5x5 pad2 s2 relu', 5, 2, 2, true);      // device im2col_h
+  RunConvFP16('1x1 pointwise linear', 1, 0, 1, false); // cai_f32_to_half
 end;
 {$ELSE}
 begin

@@ -872,6 +872,14 @@ type
       // Borrowed cai_dot_product_int8 handle, injected into FDotCL at Create
       // time and released by this layer (FDotCL never owns it).
       FInt8Kernel: TNeuralKernel;
+      // Borrowed cai_dot_product_int8_h handle, injected into FDotCL beside
+      // FInt8Kernel and released by this layer. Acquired only when
+      // ShouldOpenCLFP16 passed. FFP16Active is the RESOLVED verdict for this
+      // layer - the request survived and the handle bound - and every FP16
+      // decision downstream reads it, so the GEMM and the im2col gather cannot
+      // disagree about which B buffer they use. Coded by Claude (AI).
+      FFP16Kernel: TNeuralKernel;
+      FFP16Active: boolean;
       {$ENDIF}
       // INT8 QUANTIZED WEIGHT STORAGE (inference-only). When FQuantInt8 is
       // true the FP32 weights have been replaced by per-output-channel
@@ -959,12 +967,22 @@ type
       // the checkpoint row width. Coded by Claude (AI).
       property QuantInt8VectorSize: integer read FQuantVectorSize;
       {$IFDEF OpenCL}
+      // Returns both borrowed dot-product handles to the net. Called from
+      // DisableOpenCL AND from Destroy, which is why it is a routine: a layer
+      // is destroyed without a DisableOpenCL first. Coded by Claude (AI).
+      procedure ReleaseInt8Kernels();
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
+      // Whether this layer wants the FP16 activation kernels. False here: the
+      // half B operand is only wired for the int8 convolution, which overrides
+      // this. Coded by Claude (AI).
+      function ShouldOpenCLFP16(): boolean; virtual;
       // Interleaves FQuantTable's codes into the device layout and arms
       // FDotCL's resident int8 mode (cai_dot_product_int8) against VBs.
       // Coded by Claude (AI).
       procedure PrepareInt8DotCL(VBs: TNNetVolume);
+      // True when this layer runs its int8 forward with the FP16 B operand.
+      property FP16Active: boolean read FFP16Active;
       {$ENDIF}
   end;
 
@@ -14374,6 +14392,14 @@ type
       // of on the host, restricted to inference-only (see ShouldOpenCLIm2Col). Coded by
       // Claude (AI).
       FIm2ColKernel: TNeuralKernel;
+      // Which gather FIm2ColKernel holds: 'cai_im2col' or, under FP16, the
+      // half-writing 'cai_im2col_h'. Stored rather than re-derived so
+      // DisableOpenCL releases it under the name it was acquired with, even if
+      // TNNet.OpenCLFP16 changed meanwhile. Coded by Claude (AI).
+      FIm2ColKernelName: string;
+      // Returns FIm2ColKernel to the net under the name it was acquired with.
+      // Called from DisableOpenCL AND from Destroy. Coded by Claude (AI).
+      procedure ReleaseIm2ColKernel();
       {$ENDIF}
 
       {$IFDEF Debug}
@@ -14389,6 +14415,9 @@ type
       {$IFDEF OpenCL}
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
+      // The int8 convolution is the one layer wired for the FP16 B operand.
+      // Coded by Claude (AI).
+      function ShouldOpenCLFP16(): boolean; override;
       {$ENDIF}
 
       property Pointwise: boolean read FPointwise;
@@ -17411,6 +17440,16 @@ type
       // construction path with no importer changes. Coded by Claude (AI).
       FBuildQuantInt8: boolean;
       {$IFDEF OpenCL}
+      // FP16 ACTIVATION MODE. When true, an int8 convolution runs its device
+      // forward with the half B operand (cai_dot_product_int8_h and friends)
+      // instead of the FP32 one. Weights stay int8, and the result the layer
+      // hands back to the CPU stays Single - only the column matrix inside
+      // OpenCL memory narrows. Read by TNNetLayerConcatedWeights.EnableOpenCL,
+      // so it must be set BEFORE TNNet.EnableOpenCL: that is what allocates the
+      // B buffer, and setting the flag afterwards does nothing. Runtime device
+      // choice, not model structure - never saved with the network.
+      // Coded by Claude (AI).
+      FOpenCLFP16: boolean;
       FDotProductKernel: TNeuralKernel;
       // Net-wide cache of borrowed-program helper kernels, one TNeuralKernel per
       // distinct neural.cl entry point (cai_token_norm, cai_group_norm, ...),
@@ -19224,6 +19263,12 @@ type
       // QuantizeWeightsInt8 sweep sets it automatically otherwise.
       property BuildQuantInt8: boolean
         read FBuildQuantInt8 write FBuildQuantInt8; // Coded by Claude (AI).
+      {$IFDEF OpenCL}
+      // FP16 activation mode for int8 convolutions (see FOpenCLFP16). Set it
+      // BEFORE EnableOpenCL; afterwards it has no effect.
+      property OpenCLFP16: boolean
+        read FOpenCLFP16 write FOpenCLFP16; // Coded by Claude (AI).
+      {$ENDIF}
       // HF resize_token_embeddings equivalent: grows/shrinks the token
       // vocabulary of an imported causal LM IN PLACE. The FIRST
       // TNNetEmbedding in the net gets NewVocabSize rows (existing rows are
@@ -76790,8 +76835,7 @@ begin
   FNeuronWeightList.Free;
   FConcatedWInter.Free;
   {$IFDEF OpenCL}
-  if Assigned(FNN) then
-    FNN.FreeKernelIfNotShared('cai_dot_product_int8', FInt8Kernel);
+  ReleaseInt8Kernels();
   {$ENDIF}
   inherited Destroy();
 end;
@@ -76811,11 +76855,27 @@ begin
 end;
 
 {$IFDEF OpenCL}
+// The name matters: under FP16 the handle is cai_im2col_h, and returning it
+// under the literal 'cai_im2col' makes TNNet.FreeKernelIfNotShared miss the
+// shared-list entry and free a handle the net still owns. Coded by Claude (AI).
+procedure TNNetConvolutionBase.ReleaseIm2ColKernel();
+begin
+  if Assigned(FNN) and (FIm2ColKernelName <> '') then
+    FNN.FreeKernelIfNotShared(FIm2ColKernelName, FIm2ColKernel);
+  FIm2ColKernelName := '';
+end;
+
 procedure TNNetConvolutionBase.DisableOpenCL();
 begin
   inherited DisableOpenCL();
-  if Assigned(FNN) then
-    FNN.FreeKernelIfNotShared('cai_im2col', FIm2ColKernel);
+  ReleaseIm2ColKernel();
+end;
+
+// The FP16 B operand is wired for the int8 convolution only, and only when the
+// owning net asked for it. Coded by Claude (AI).
+function TNNetConvolutionBase.ShouldOpenCLFP16(): boolean;
+begin
+  Result := FQuantInt8 and Assigned(FNN) and FNN.FOpenCLFP16;
 end;
 
 procedure TNNetConvolutionBase.EnableOpenCL(DotProductKernel: TNeuralKernel);
@@ -76833,17 +76893,36 @@ begin
   // (FInputPrepared) on the device. Only meaningful for a real (spatial)
   // convolution: a pointwise conv has no im2col (FInputPrepared aliases the prev
   // output). Acquire once: a second call would leak a private handle.
+  // Under FP16 the gather must write halves, which is a different entry point:
+  // FFP16Active is the same verdict FDotCL was armed with just above, so the
+  // gather and the GEMM always agree on the B buffer.
   if (not FPointwise) and (not Assigned(FIm2ColKernel)) then
-    FIm2ColKernel := FNN.GetKernel('cai_im2col');
+  begin
+    if FFP16Active then FIm2ColKernelName := 'cai_im2col_h'
+    else FIm2ColKernelName := 'cai_im2col';
+    FIm2ColKernel := FNN.GetKernel(FIm2ColKernelName);
+  end;
+end;
+
+procedure TNNetLayerConcatedWeights.ReleaseInt8Kernels();
+begin
+  if not Assigned(FNN) then exit;
+  FNN.FreeKernelIfNotShared('cai_dot_product_int8', FInt8Kernel);
+  FNN.FreeKernelIfNotShared('cai_dot_product_int8_h', FFP16Kernel);
 end;
 
 procedure TNNetLayerConcatedWeights.DisableOpenCL();
 begin
-  // FDotCL borrowed FInt8Kernel; the inherited call frees it, so the handle
-  // goes back here and a later EnableOpenCL acquires a fresh one.
+  // FDotCL borrowed FInt8Kernel and FFP16Kernel; the inherited call frees it, so
+  // the handles go back here and a later EnableOpenCL acquires fresh ones.
   inherited DisableOpenCL();
-  if Assigned(FNN) then
-    FNN.FreeKernelIfNotShared('cai_dot_product_int8', FInt8Kernel);
+  ReleaseInt8Kernels();
+  FFP16Active := false;
+end;
+
+function TNNetLayerConcatedWeights.ShouldOpenCLFP16(): boolean;
+begin
+  Result := false;
 end;
 
 procedure TNNetLayerConcatedWeights.EnableOpenCL(
@@ -76868,7 +76947,17 @@ begin
     if not Assigned(FDotCL) then
     begin
       FInt8Kernel := FNN.GetKernel('cai_dot_product_int8');
-      FDotCL := TDotProductSharedKernel.Create(GetDotProductKernel(), FInt8Kernel);
+      // Resolve the FP16 verdict ONCE, here, before anything reads it: the
+      // request only survives if cai_dot_product_int8_h actually bound.
+      if ShouldOpenCLFP16() then
+      begin
+        FFP16Kernel := FNN.GetKernel('cai_dot_product_int8_h');
+        FFP16Active := Assigned(FFP16Kernel) and Assigned(FFP16Kernel.Kernel);
+        if not FFP16Active then
+          FNN.FreeKernelIfNotShared('cai_dot_product_int8_h', FFP16Kernel);
+      end;
+      FDotCL := TDotProductSharedKernel.Create(GetDotProductKernel(), FInt8Kernel,
+        FFP16Kernel);
       FDotCL.HideMessages();
     end;
     if FQuantInt8 then
@@ -76932,7 +77021,7 @@ begin
     end;
   end;
   FDotCL.PrepareForComputeInt8(@Inter[0], FQuantTable.ScalePtr, NumAs,
-    FQuantVectorSize, VBs);
+    FQuantVectorSize, VBs, FFP16Active);
 end;
 {$ENDIF}
 
@@ -103170,8 +103259,7 @@ begin
 
   //FDotProductResult.Free;
   {$IFDEF OpenCL}
-  if Assigned(FNN) then
-    FNN.FreeKernelIfNotShared('cai_im2col', FIm2ColKernel);
+  ReleaseIm2ColKernel();
   {$ENDIF}
   inherited Destroy;
 end;
