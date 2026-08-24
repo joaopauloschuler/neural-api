@@ -474,6 +474,7 @@ type
     // shared handles and the root kernel - so the next EnableOpenCL rebuilds
     // them together. Coded by Claude (AI).
     procedure TestOpenCLDisableEnableCycle;
+    procedure TestOpenCLDisableEnableCycleTraining;
     // OpenCL split-K int8 parity: a long reduction axis with few output
     // neurons is the decode GEMV shape that makes TDotProductSharedKernel
     // .Int8SplitCount cut the axis into slabs, so this covers the two-pass
@@ -66423,6 +66424,112 @@ begin
   finally
     Ref.Free;
     Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// The same Enable/Disable cycling as TestOpenCLDisableEnableCycle, but on a
+// TRAINABLE net that backpropagates and updates its weights inside each cycle.
+// Two paths only this test reaches: the backward passes that own device buffers
+// of their own, and re-arming a layer whose weights CHANGED while the previous
+// context was alive - TNNetConvolutionBase.EnableOpenCL re-uploads them, so a
+// resident copy left over from the torn-down context would show up as drift.
+// A CPU-only twin built from the same seed is the reference, and the device
+// forward count is asserted for the reason the forward-only cycle test asserts
+// it: a silent CPU fallback matches the twin EXACTLY. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestOpenCLDisableEnableCycleTraining;
+{$IFDEF OpenCL}
+  procedure BuildTrainingNet(NN: TNNet);
+  var
+    A, B: TNNetLayer;
+  begin
+    RandSeed := 20260824;
+    NN.AddLayer(TNNetInput.Create(8, 8, 4, 1));
+    A := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+    B := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+    NN.AddLayer(TNNetSum.Create([A, B]));
+    NN.AddLayer(TNNetPixelShuffle.Create(2));
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+    NN.AddLayer(TNNetReLU.Create());
+  end;
+
+  // Device forwards over the whole net: which layer takes the device path
+  // depends on that layer's own size verdict, so no single layer is a reliable
+  // witness that the cycle ran on OpenCL at all.
+  function TotalForwardGPUCnt(NN: TNNet): integer;
+  var
+    LayerCnt: integer;
+  begin
+    Result := 0;
+    for LayerCnt := 0 to NN.GetLastLayerIdx() do
+      Result := Result + NN.Layers[LayerCnt].ForwardGPUCnt;
+  end;
+var
+  NN, NNRef: TNNet;
+  Input, Desired: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, Cycle, GPUCntBefore, GPUCnt: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NN := TNNet.Create();
+  NNRef := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 4);
+  Desired := TNNetVolume.Create();
+  try
+    BuildTrainingNet(NN);
+    BuildTrainingNet(NNRef);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.013 * i - 1.1;
+    NN.Compute(Input);
+    Desired.ReSize(NN.GetLastLayer.Output);
+    Desired.Fill(0.5);
+
+    for Cycle := 1 to 3 do
+    begin
+      GPUCntBefore := TotalForwardGPUCnt(NN);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.ForceOpenCL(True);
+      NN.Compute(Input);
+      NN.GetLastLayer.ForceOutputOnRAM();
+      NNRef.Compute(Input);
+      MaxDiff := 0;
+      for i := 0 to NNRef.GetLastLayer.Output.Size - 1 do
+      begin
+        Diff := Abs(NNRef.GetLastLayer.Output.Raw[i] -
+          NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      GPUCnt := TotalForwardGPUCnt(NN);
+      WriteLn('  OpenCL training cycle ', Cycle, ': max|diff|=', MaxDiff:0:9,
+        ' gpu forwards=', GPUCnt);
+      AssertTrue('training cycle ' + IntToStr(Cycle) + ' ran on the device',
+        GPUCnt > GPUCntBefore);
+      AssertTrue('training cycle ' + IntToStr(Cycle) + ' parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-3', MaxDiff < 1e-3);
+      // Backpropagate with the device still armed, so every backward path that
+      // owns device buffers runs inside the context this cycle tears down.
+      NN.Backpropagate(Desired);
+      NN.UpdateWeights();
+      NNRef.Backpropagate(Desired);
+      NNRef.UpdateWeights();
+      NN.ForceOpenCL(False);
+      NN.DisableOpenCL();
+      NN.Compute(Input);
+    end;
+  finally
+    Desired.Free;
+    Input.Free;
+    NNRef.Free;
     NN.Free;
   end;
 end;
