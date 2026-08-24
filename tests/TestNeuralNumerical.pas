@@ -461,6 +461,20 @@ type
     // (feature-size x padding x stride sweep, incl. pointwise and device
     // im2col). Coded by Claude (AI).
     procedure TestInt8QuantizedOpenCLParity;
+    // Same int8 convolution forward run with TNNet.OpenCLFP16, so the B
+    // operand narrows to half (cai_dot_product_int8_h, cai_im2col_h,
+    // cai_f32_to_half) while the weights stay int8 and the result stays
+    // Single. Asserts the FP16 route was actually taken, then checks parity at
+    // half's own tolerance rather than the FP32 path's. Coded by Claude (AI).
+    procedure TestInt8ConvFP16OpenCLParity;
+    // EnableOpenCL -> forward -> DisableOpenCL, three times over a net of the
+    // layers that own a device buffer AND a borrowed kernel handle. Guards the
+    // teardown: every cycle must still run ON the device and still match the
+    // CPU, which only holds if DisableOpenCL drops the whole context - buffers,
+    // shared handles and the root kernel - so the next EnableOpenCL rebuilds
+    // them together. Coded by Claude (AI).
+    procedure TestOpenCLDisableEnableCycle;
+    procedure TestOpenCLDisableEnableCycleTraining;
     // OpenCL split-K int8 parity: a long reduction axis with few output
     // neurons is the decode GEMV shape that makes TDotProductSharedKernel
     // .Int8SplitCount cut the axis into slabs, so this covers the two-pass
@@ -66330,6 +66344,292 @@ begin
   RunConv('rect 3x1 pad1 s1 relu', 3, 1, 1, 1, true);
   RunConv('rect 1x3 pad0 s1 linear', 1, 3, 0, 1, false);
   RunConv('rect 5x3 pad2 s2 relu', 5, 3, 2, 2, true);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Repeated EnableOpenCL/DisableOpenCL cycles. A buffer or kernel handle that
+// survives a DisableOpenCL belongs to the context that call tore down, so the
+// next EnableOpenCL - which builds a NEW context - would mix the two and every
+// enqueue would fail with CL_INVALID_CONTEXT. The device path then silently
+// falls back to the CPU, which is why this checks ForwardGPUCnt as well as
+// parity: a CPU fallback matches the reference EXACTLY and would otherwise
+// read as a pass. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestOpenCLDisableEnableCycle;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, Ref: TNNetVolume;
+  A, B, SumLayer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, Cycle, GPUCntBefore: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260824;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 4);
+  Ref := TNNetVolume.Create();
+  try
+    // One layer of each kind that owns a device buffer AND a borrowed handle.
+    NN.AddLayer(TNNetInput.Create(8, 8, 4, 1));
+    A := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+    B := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+    SumLayer := NN.AddLayer(TNNetSum.Create([A, B]));
+    NN.AddLayer(TNNetReLU.Create());
+    NN.AddLayer(TNNetSplitChannels.Create(0, 4));
+    NN.AddLayerAfter(TNNetDeepConcat.Create([A, B]), B);
+    NN.AddLayer(TNNetCellMulByCell.Create(A, B));
+    NN.AddLayer(TNNetReLU.Create());
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.013 * i - 1.1;
+    NN.UpdateWeights();
+    for i := 0 to NN.GetLastLayerIdx() do
+      NN.Layers[i].SetTrainable(False, False);
+
+    NN.Compute(Input);
+    Ref.Copy(NN.GetLastLayer.Output);
+
+    for Cycle := 1 to 3 do
+    begin
+      GPUCntBefore := SumLayer.ForwardGPUCnt;
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.ForceOpenCL(True);
+      NN.Compute(Input);
+      NN.GetLastLayer.ForceOutputOnRAM();
+      MaxDiff := 0;
+      for i := 0 to Ref.Size - 1 do
+      begin
+        Diff := Abs(Ref.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      WriteLn('  OpenCL cycle ', Cycle, ': max|diff|=', MaxDiff:0:9,
+        ' gpu forwards=', SumLayer.ForwardGPUCnt);
+      AssertTrue('cycle ' + IntToStr(Cycle) + ' ran on the device',
+        SumLayer.ForwardGPUCnt > GPUCntBefore);
+      AssertTrue('cycle ' + IntToStr(Cycle) + ' parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+      NN.ForceOpenCL(False);
+      NN.DisableOpenCL();
+      // The CPU forward must still work once the device path is gone.
+      NN.Compute(Input);
+    end;
+  finally
+    Ref.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// The same Enable/Disable cycling as TestOpenCLDisableEnableCycle, but on a
+// TRAINABLE net that backpropagates and updates its weights inside each cycle.
+// Two paths only this test reaches: the backward passes that own device buffers
+// of their own, and re-arming a layer whose weights CHANGED while the previous
+// context was alive - TNNetConvolutionBase.EnableOpenCL re-uploads them, so a
+// resident copy left over from the torn-down context would show up as drift.
+// A CPU-only twin built from the same seed is the reference, and the device
+// forward count is asserted for the reason the forward-only cycle test asserts
+// it: a silent CPU fallback matches the twin EXACTLY. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestOpenCLDisableEnableCycleTraining;
+{$IFDEF OpenCL}
+  procedure BuildTrainingNet(NN: TNNet);
+  var
+    A, B: TNNetLayer;
+  begin
+    RandSeed := 20260824;
+    NN.AddLayer(TNNetInput.Create(8, 8, 4, 1));
+    A := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+    B := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
+    NN.AddLayer(TNNetSum.Create([A, B]));
+    NN.AddLayer(TNNetPixelShuffle.Create(2));
+    NN.AddLayer(TNNetConvolutionReLU.Create(4, 3, 1, 1));
+    NN.AddLayer(TNNetReLU.Create());
+  end;
+
+  // Device forwards over the whole net: which layer takes the device path
+  // depends on that layer's own size verdict, so no single layer is a reliable
+  // witness that the cycle ran on OpenCL at all.
+  function TotalForwardGPUCnt(NN: TNNet): integer;
+  var
+    LayerCnt: integer;
+  begin
+    Result := 0;
+    for LayerCnt := 0 to NN.GetLastLayerIdx() do
+      Result := Result + NN.Layers[LayerCnt].ForwardGPUCnt;
+  end;
+var
+  NN, NNRef: TNNet;
+  Input, Desired: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, Cycle, GPUCntBefore, GPUCnt: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NN := TNNet.Create();
+  NNRef := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 4);
+  Desired := TNNetVolume.Create();
+  try
+    BuildTrainingNet(NN);
+    BuildTrainingNet(NNRef);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.013 * i - 1.1;
+    NN.Compute(Input);
+    Desired.ReSize(NN.GetLastLayer.Output);
+    Desired.Fill(0.5);
+
+    for Cycle := 1 to 3 do
+    begin
+      GPUCntBefore := TotalForwardGPUCnt(NN);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.ForceOpenCL(True);
+      NN.Compute(Input);
+      NN.GetLastLayer.ForceOutputOnRAM();
+      NNRef.Compute(Input);
+      MaxDiff := 0;
+      for i := 0 to NNRef.GetLastLayer.Output.Size - 1 do
+      begin
+        Diff := Abs(NNRef.GetLastLayer.Output.Raw[i] -
+          NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      GPUCnt := TotalForwardGPUCnt(NN);
+      WriteLn('  OpenCL training cycle ', Cycle, ': max|diff|=', MaxDiff:0:9,
+        ' gpu forwards=', GPUCnt);
+      AssertTrue('training cycle ' + IntToStr(Cycle) + ' ran on the device',
+        GPUCnt > GPUCntBefore);
+      AssertTrue('training cycle ' + IntToStr(Cycle) + ' parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-3', MaxDiff < 1e-3);
+      // Backpropagate with the device still armed, so every backward path that
+      // owns device buffers runs inside the context this cycle tears down.
+      NN.Backpropagate(Desired);
+      NN.UpdateWeights();
+      NNRef.Backpropagate(Desired);
+      NNRef.UpdateWeights();
+      NN.ForceOpenCL(False);
+      NN.DisableOpenCL();
+      NN.Compute(Input);
+    end;
+  finally
+    Desired.Free;
+    Input.Free;
+    NNRef.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// FP16-activation int8 convolution parity. Identical setup to the RunConv sweep
+// above, with TNNet.OpenCLFP16 set BEFORE EnableOpenCL (it is EnableOpenCL that
+// sizes the B buffer, so setting it afterwards would do nothing). Two things are
+// asserted, and the first matters more: TNNetConvolutionBase.FP16Active proves
+// the half kernels ran, because a silent fallback to the FP32 B operand would
+// pass a parity check trivially. Tolerance is half's, not the FP32 path's - the
+// B operand carries ~5e-4 relative error by construction, and the split-K cases
+// add half-rounded slab partials on top. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestInt8ConvFP16OpenCLParity;
+{$IFDEF OpenCL}
+  procedure RunConvFP16(const aName: string; pInputSize, pInputDepth,
+    pNeurons, pFeatureSize, pPadding, pStride: integer; UseReLU: boolean);
+  var
+    NN: TNNet;
+    Input, OutCPU: TNNetVolume;
+    Conv: TNNetConvolutionBase;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i: integer;
+    Diff, MaxDiff, MaxAbs: TNeuralFloat;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    RandSeed := 20260706;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(pInputSize, pInputSize, pInputDepth);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(pInputSize, pInputSize, pInputDepth, 1));
+      if UseReLU
+        then Conv := TNNetConvolutionReLU.Create(pNeurons, pFeatureSize, pPadding, pStride)
+        else Conv := TNNetConvolutionLinear.Create(pNeurons, pFeatureSize, pPadding, pStride);
+      NN.AddLayer(Conv);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.011 * i - 1.05;
+      for i := 0 to Conv.Neurons.Count - 1 do
+        Conv.Neurons[i].BiasWeight := 0.25 * Sin(i * 0.3);
+      NN.UpdateWeights();
+      Conv.SetTrainable(False, False);
+
+      NN.QuantizeWeightsInt8();
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.OpenCLFP16 := True; // before EnableOpenCL: it sizes the half B buffer
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        AssertTrue('Int8ConvFP16 ' + aName + ' took the FP16 route',
+          Conv.FP16Active);
+        NN.Compute(Input);
+        NN.Compute(Input); // resident codes/scales/bias reuse path
+        MaxDiff := 0;
+        MaxAbs := 0;
+        AssertEquals('Int8ConvFP16 ' + aName + ' output size match', OutCPU.Size,
+          NN.GetLastLayer.Output.Size);
+        for i := 0 to OutCPU.Size - 1 do
+        begin
+          Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+          if Abs(OutCPU.Raw[i]) > MaxAbs then MaxAbs := Abs(OutCPU.Raw[i]);
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  Int8ConvFP16 ', aName, ' OpenCL parity: max|diff|=', MaxDiff:0:9,
+        ' max|ref|=', MaxAbs:0:6, ' gpu forwards=', Conv.ForwardGPUCnt);
+      AssertTrue('Int8ConvFP16 ' + aName + ' device vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-2', MaxDiff < 1e-2);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+begin
+  RunConvFP16('3x3 pad1 s1 relu', 8, 3, 16, 3, 1, 1, true);      // device im2col_h
+  RunConvFP16('3x3 pad0 s1 linear', 8, 3, 16, 3, 0, 1, false);   // device im2col_h
+  RunConvFP16('5x5 pad2 s2 relu', 8, 3, 16, 5, 2, 2, true);      // device im2col_h
+  RunConvFP16('1x1 pointwise linear', 8, 3, 16, 1, 0, 1, false); // cai_f32_to_half
+  // Split-K in FP16 (cai_dot_product_int8_splitk_h + its reduce twin). The
+  // cases above all have FSize <= 75, one slab, so they never reach it. Depth
+  // 64 over 3x3 makes FSize 576 - four slabs of 128 - while 16 neurons over a
+  // 4x4 output leave 256 work-items, below the thread target of any device
+  // including a 1-unit one. Both passes now carry half partials, so this is
+  // also the only case that reads FPartialBuffer as half.
+  RunConvFP16('splitk 3x3 d64 relu', 4, 64, 16, 3, 1, 1, true);
+  RunConvFP16('splitk 3x3 d64 linear', 4, 64, 16, 3, 1, 1, false);
 end;
 {$ELSE}
 begin

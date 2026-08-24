@@ -61,6 +61,9 @@ type
 
 const
   csCLMemSize = SizeOf(cl_mem);
+  /// Bytes per OpenCL half. There is no Pascal type for it: the FP16 B
+  /// operand is only ever written and read by device kernels.
+  csHalfSize = 2;
 
 type
   TPlatformNames = array of string;
@@ -308,6 +311,31 @@ type
       FSplitKReduceKernel: cl_kernel;
       FPartialBuffer: cl_mem;
       FCapPartial: csize_t;
+      /// FP16 ACTIVATION MODE (cai_dot_product_int8_h and its split-K twin).
+      /// The A operand is unchanged - int8 codes and FP32 scales; only B, the
+      /// column matrix every one of the FNumAs output rows re-reads, narrows to
+      /// half and lives in FInputBufferBsFP16 instead of FInputBufferBs. half is
+      /// a STORAGE format here: the kernels read it with vload_half and
+      /// accumulate in float, so the result buffer, the scales and the bias stay
+      /// FP32 and the round trip to the CPU is Single-precision in both modes.
+      /// The split-K partials narrow the same way (see FSplitKFP16Kernel).
+      /// FFP16Kernel is net-owned and INJECTED at Create time like FInt8Kernel;
+      /// the cl_kernel handles below are bound against its program and released
+      /// here. FFP16Activations is the resolved verdict - PrepareForComputeInt8
+      /// only sets it when the caller asked AND the kernel bound, so a device
+      /// that rejected cai_dot_product_int8_h falls back to the FP32 B operand.
+      /// Coded by Claude (AI).
+      FFP16Kernel: TNeuralKernel;
+      FFP16Activations: boolean;
+      FInputBufferBsFP16: cl_mem;
+      FCapBsFP16: csize_t;
+      /// Both split-K passes have a half twin: pass 1 writes its raw slab sums
+      /// as half, so pass 2 must read FPartialBuffer as half too. The buffer is
+      /// sized in half bytes in that mode, which is why PrepareSplitK derives
+      /// its element size from FFP16Activations. Coded by Claude (AI).
+      FSplitKFP16Kernel: cl_kernel;
+      FSplitKReduceFP16Kernel: cl_kernel;
+      FCastFP16Kernel: cl_kernel;
 
       /// How many slabs to cut the reduction axis into for the current shape:
       /// 1 means the launch already fills the device, so ComputeInt8 keeps the
@@ -317,12 +345,21 @@ type
       /// pSplits. False when the device rejected either kernel, which sends
       /// ComputeInt8 back to the single-pass path. Coded by Claude (AI).
       function PrepareSplitK(pSplits: integer): boolean;
+      /// Narrows ElementCount floats of pSrcFP32 into FInputBufferBsFP16 with
+      /// cai_f32_to_half, on the shared in-order queue. Coded by Claude (AI).
+      function CastBOperandToFP16(pSrcFP32: cl_mem; ElementCount: longint): integer;
+      /// The B operand ComputeInt8 binds. In FP16 mode this narrows whatever the
+      /// caller supplied into FInputBufferBsFP16 first; NewVBs = false means the
+      /// caller's cai_im2col_h already wrote that buffer, so nothing is done.
+      /// Coded by Claude (AI).
+      function PrepareInt8BOperand(VBs: TNNetVolume; NewVBs: boolean;
+        pExternalVBs: cl_mem; var err: integer): cl_mem;
 
 
       function Kernel(): cl_kernel; {$IFDEF Release} inline; {$ENDIF}
     public
       constructor Create(DotProductKernel: TNeuralKernel;
-        pInt8Kernel: TNeuralKernel = nil);
+        pInt8Kernel: TNeuralKernel = nil; pFP16Kernel: TNeuralKernel = nil);
       destructor Destroy(); override;
 
       procedure UnprepareForCompute();
@@ -361,7 +398,8 @@ type
       /// Blocking uploads: the caller's staging arrays may be freed on
       /// return. Coded by Claude (AI).
       function PrepareForComputeInt8(pCodes, pScales: Pointer;
-        NumAs, pSize: longint; VBs: TNNetVolume): integer;
+        NumAs, pSize: longint; VBs: TNNetVolume;
+        pFP16: boolean = false): integer;
       /// Int8 twin of Compute: same B upload, fused bias and activation
       /// semantics, but the A operand is the resident code buffer and the
       /// per-row scales ride as kernel arg 10 (deferred dequantization).
@@ -509,18 +547,19 @@ begin
 end;
 
 constructor TDotProductSharedKernel.Create(DotProductKernel: TNeuralKernel;
-  pInt8Kernel: TNeuralKernel = nil);
+  pInt8Kernel: TNeuralKernel = nil; pFP16Kernel: TNeuralKernel = nil);
 begin
   inherited Create();
   FDotProductKernel := DotProductKernel;
   FInt8Kernel := pInt8Kernel;
+  FFP16Kernel := pFP16Kernel;
   FHostInput := False;
 end;
 
 destructor TDotProductSharedKernel.Destroy();
 begin
   UnprepareForCompute();
-  // FInt8Kernel is a net-owned shared handle - do not free here.
+  // FInt8Kernel and FFP16Kernel are net-owned shared handles - not freed here.
   inherited Destroy();
 end;
 
@@ -534,14 +573,25 @@ begin
   if Assigned(FCodesBuffer)   then clReleaseMemObject(FCodesBuffer);
   if Assigned(FScalesBuffer)  then clReleaseMemObject(FScalesBuffer);
   if Assigned(FPartialBuffer) then clReleaseMemObject(FPartialBuffer);
-  // Owned here, unlike FInt8Kernel: these two came from CreateKernel against
-  // the net's program, so this instance releases them.
+  if Assigned(FInputBufferBsFP16) then clReleaseMemObject(FInputBufferBsFP16);
+  // Owned here, unlike FInt8Kernel and FFP16Kernel: these came from CreateKernel
+  // against the net's program, so this instance releases them.
   if Assigned(FSplitKKernel)       then clReleaseKernel(FSplitKKernel);
   if Assigned(FSplitKReduceKernel) then clReleaseKernel(FSplitKReduceKernel);
+  if Assigned(FSplitKFP16Kernel)   then clReleaseKernel(FSplitKFP16Kernel);
+  if Assigned(FSplitKReduceFP16Kernel) then
+    clReleaseKernel(FSplitKReduceFP16Kernel);
+  if Assigned(FCastFP16Kernel)     then clReleaseKernel(FCastFP16Kernel);
   FPartialBuffer := nil;
+  FInputBufferBsFP16 := nil;
   FSplitKKernel := nil;
   FSplitKReduceKernel := nil;
+  FSplitKFP16Kernel := nil;
+  FSplitKReduceFP16Kernel := nil;
+  FCastFP16Kernel := nil;
   FCapPartial := 0;
+  FCapBsFP16 := 0;
+  FFP16Activations := false;
 
   FInputBufferAs := nil;
   FInputBufferBs := nil;
@@ -657,9 +707,15 @@ var
   N: longint;
   err: integer;
   NeededSrc: csize_t;
-  SrcBuffer: cl_mem;
+  SrcBuffer, ColsBuffer: cl_mem;
 begin
   k := Im2ColKernel.Kernel;
+  // The caller must pass cai_im2col_h whenever this instance is in FP16 mode:
+  // the gather writes whichever B buffer the GEMM will read, and both verdicts
+  // come from the one layer flag so they cannot disagree.
+  if FFP16Activations
+    then ColsBuffer := FInputBufferBsFP16
+    else ColsBuffer := FInputBufferBs;
   // Total column-matrix elements = FInputBufferBs capacity (already sized to
   // FInputPrepared by PrepareForCompute). FNumBs*FSize == FInputPrepared.Size.
   N := FNumBs * FSize;
@@ -692,7 +748,7 @@ begin
   err := err or clSetKernelArg(k, 5, csLongintSize, @InDepth);
   err := err or clSetKernelArg(k, 6, csLongintSize, @Stride);
   err := err or clSetKernelArg(k, 7, csCLMemSize, @SrcBuffer);
-  err := err or clSetKernelArg(k, 8, csCLMemSize, @FInputBufferBs);
+  err := err or clSetKernelArg(k, 8, csCLMemSize, @ColsBuffer);
   if (err <> CL_SUCCESS) then
     ErrorProc('Error: BuildInputColsOnDevice - failed setting parameters: ' + IntToStr(err));
 
@@ -842,7 +898,7 @@ begin
 end;
 
 function TDotProductSharedKernel.PrepareForComputeInt8(pCodes, pScales: Pointer;
-  NumAs, pSize: longint; VBs: TNNetVolume): integer;
+  NumAs, pSize: longint; VBs: TNNetVolume; pFP16: boolean = false): integer;
 var
   NeededCodes, NeededScales, NeededResult: csize_t;
   err: integer;
@@ -862,18 +918,38 @@ begin
   FGroupSizeA := 0;
   FGroupSizeB := 0;
 
+  // Asked for AND available: a device that rejected cai_dot_product_int8_h
+  // keeps the FP32 B operand rather than failing the layer.
+  FFP16Activations := pFP16 and Assigned(FFP16Kernel) and
+    Assigned(FFP16Kernel.Kernel);
+
   NeededCodes := FNumAs * FSize; // 1 byte per code
   NeededScales := FNumAs * csNeuralFloatSize;
   NeededResult := FNumAs * FNumBs * csNeuralFloatSize;
 
   FCodesBuffer := FDotProductKernel.CreateInputBuffer(NeededCodes);
   FScalesBuffer := FDotProductKernel.CreateInputBuffer(NeededScales);
-  FInputBufferBs := FDotProductKernel.CreateInputBuffer(VBs);
   FResultBuffer := FDotProductKernel.CreateOutputBuffer(NeededResult);
   FCapCodes := NeededCodes;
   FCapScales := NeededScales;
-  FCapBs := VBs.GetMemSize();
   FCapResult := NeededResult;
+
+  if FFP16Activations then
+  begin
+    // READ_WRITE, not CreateInputBuffer: cai_im2col_h and cai_f32_to_half write
+    // this buffer and cai_dot_product_int8_h reads it.
+    FCapBsFP16 := csize_t(FNumBs) * FSize * csHalfSize;
+    FInputBufferBsFP16 := FDotProductKernel.CreateBuffer(FCapBsFP16);
+    // The FP32 staging copy exists only on the host-upload path, so
+    // PrepareInt8BOperand allocates it there instead of here.
+    FInputBufferBs := nil;
+    FCapBs := 0;
+  end
+  else
+  begin
+    FInputBufferBs := FDotProductKernel.CreateInputBuffer(VBs);
+    FCapBs := VBs.GetMemSize();
+  end;
 
   // One-time blocking uploads: the codes/scales never change afterwards
   // (quantized layers are inference-only) and the caller's staging arrays
@@ -921,19 +997,37 @@ end;
 
 function TDotProductSharedKernel.PrepareSplitK(pSplits: integer): boolean;
 var
-  NeededPartial: csize_t;
+  NeededPartial, PartialElementSize: csize_t;
 begin
   Result := false;
   if not Assigned(FInt8Kernel) then exit;
-  if not Assigned(FSplitKKernel) then
-    FSplitKKernel := FInt8Kernel.CreateKernel('cai_dot_product_int8_splitk');
-  if not Assigned(FSplitKReduceKernel) then
-    FSplitKReduceKernel :=
-      FInt8Kernel.CreateKernel('cai_dot_product_int8_splitk_reduce');
-  if (not Assigned(FSplitKKernel)) or (not Assigned(FSplitKReduceKernel)) then
-    exit;
+  // Both passes have an FP16 twin: pass 1 stores its raw slab sums as half, so
+  // pass 2 must read them as half and FPartialBuffer is sized in half bytes.
+  if FFP16Activations then
+  begin
+    if not Assigned(FSplitKFP16Kernel) then
+      FSplitKFP16Kernel :=
+        FFP16Kernel.CreateKernel('cai_dot_product_int8_splitk_h');
+    if not Assigned(FSplitKFP16Kernel) then exit;
+    if not Assigned(FSplitKReduceFP16Kernel) then
+      FSplitKReduceFP16Kernel :=
+        FFP16Kernel.CreateKernel('cai_dot_product_int8_splitk_reduce_h');
+    if not Assigned(FSplitKReduceFP16Kernel) then exit;
+    PartialElementSize := csHalfSize;
+  end
+  else
+  begin
+    if not Assigned(FSplitKKernel) then
+      FSplitKKernel := FInt8Kernel.CreateKernel('cai_dot_product_int8_splitk');
+    if not Assigned(FSplitKKernel) then exit;
+    if not Assigned(FSplitKReduceKernel) then
+      FSplitKReduceKernel :=
+        FInt8Kernel.CreateKernel('cai_dot_product_int8_splitk_reduce');
+    if not Assigned(FSplitKReduceKernel) then exit;
+    PartialElementSize := SizeOf(TNeuralFloat);
+  end;
 
-  NeededPartial := csize_t(FNumAs) * FNumBs * pSplits * SizeOf(TNeuralFloat);
+  NeededPartial := csize_t(FNumAs) * FNumBs * pSplits * PartialElementSize;
   if (FPartialBuffer = nil) or (NeededPartial > FCapPartial) then
   begin
     if Assigned(FPartialBuffer) then clReleaseMemObject(FPartialBuffer);
@@ -941,6 +1035,69 @@ begin
     FCapPartial := NeededPartial;
   end;
   Result := Assigned(FPartialBuffer);
+end;
+
+function TDotProductSharedKernel.CastBOperandToFP16(pSrcFP32: cl_mem;
+  ElementCount: longint): integer;
+var
+  k: cl_kernel;
+begin
+  if not Assigned(FCastFP16Kernel) then
+    FCastFP16Kernel := FFP16Kernel.CreateKernel('cai_f32_to_half');
+  k := FCastFP16Kernel;
+  if not Assigned(k) then
+  begin
+    ErrorProc('Error: CastBOperandToFP16 - cai_f32_to_half is not available.');
+    Result := CL_INVALID_KERNEL;
+    exit;
+  end;
+  Result := clSetKernelArg(k, 0, csLongintSize, @ElementCount);
+  Result := Result or clSetKernelArg(k, 1, csCLMemSize, @pSrcFP32);
+  Result := Result or clSetKernelArg(k, 2, csCLMemSize, @FInputBufferBsFP16);
+  // Same in-order queue as the GEMM that reads it, so no wait is needed.
+  if Result = CL_SUCCESS then FDotProductKernel.RunKernel(k, ElementCount);
+end;
+
+function TDotProductSharedKernel.PrepareInt8BOperand(VBs: TNNetVolume;
+  NewVBs: boolean; pExternalVBs: cl_mem; var err: integer): cl_mem;
+var
+  NeededBs: csize_t;
+begin
+  if not FFP16Activations then
+  begin
+    if pExternalVBs <> nil then Result := pExternalVBs
+    else
+    begin
+      Result := FInputBufferBs;
+      if NewVBs then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
+    end;
+    exit;
+  end;
+
+  Result := FInputBufferBsFP16;
+  // Nothing borrowed and nothing new: cai_im2col_h already wrote the half
+  // buffer during this same forward.
+  if (pExternalVBs = nil) and (not NewVBs) then exit;
+
+  if pExternalVBs <> nil then
+  begin
+    // A borrowed resident source is FP32 - every other consumer of a producing
+    // layer's output reads it as FP32 - so it is narrowed rather than bound.
+    err := err or CastBOperandToFP16(pExternalVBs, VBs.Size);
+    exit;
+  end;
+
+  // Host-supplied B: upload FP32, then narrow on the device. This staging copy
+  // is reached only here, which is why PrepareForComputeInt8 does not size it.
+  NeededBs := VBs.GetMemSize();
+  if (FInputBufferBs = nil) or (NeededBs > FCapBs) then
+  begin
+    if Assigned(FInputBufferBs) then clReleaseMemObject(FInputBufferBs);
+    FInputBufferBs := FDotProductKernel.CreateInputBuffer(NeededBs);
+    FCapBs := NeededBs;
+  end;
+  err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
+  err := err or CastBOperandToFP16(FInputBufferBs, VBs.Size);
 end;
 
 procedure TDotProductSharedKernel.ComputeInt8(VBs: TNNetVolume;
@@ -968,7 +1125,6 @@ begin
     exit;
   end;
   FActFun := pActFN;
-  if pExternalVBs <> nil then BufferBs := pExternalVBs else BufferBs := FInputBufferBs;
 
   // Fused bias: same contract as Compute (a bias-less caller passes UseBias=0
   // and a NULL buffer the kernel never reads). Resident grow-only buffer,
@@ -990,15 +1146,15 @@ begin
   else
     UseBias := 0;
 
-  if NewVBs and (pExternalVBs = nil) then
-    err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
+  // Binds (FP32) or narrows into (FP16) the B operand the GEMM below reads.
+  BufferBs := PrepareInt8BOperand(VBs, NewVBs, pExternalVBs, err);
 
   Splits := Int8SplitCount();
   if (Splits > 1) and PrepareSplitK(Splits) then
   begin
     // Pass 1: raw slab sums. Pass 2: reduce, scale, bias, activation. Both on
     // the same in-order queue, so pass 2 is ordered after pass 1 with no wait.
-    K := FSplitKKernel;
+    if FFP16Activations then K := FSplitKFP16Kernel else K := FSplitKKernel;
     err := err or clSetKernelArg(K, 0, csLongintSize, @FNumAs);
     err := err or clSetKernelArg(K, 1, csLongintSize, @FNumBs);
     err := err or clSetKernelArg(K, 2, csLongintSize, @FSize);
@@ -1007,7 +1163,9 @@ begin
     err := err or clSetKernelArg(K, 5, csCLMemSize, @BufferBs);
     err := err or clSetKernelArg(K, 6, csCLMemSize, @FPartialBuffer);
 
-    KReduce := FSplitKReduceKernel;
+    if FFP16Activations
+      then KReduce := FSplitKReduceFP16Kernel
+      else KReduce := FSplitKReduceKernel;
     err := err or clSetKernelArg(KReduce, 0, csLongintSize, @FNumAs);
     err := err or clSetKernelArg(KReduce, 1, csLongintSize, @FNumBs);
     err := err or clSetKernelArg(KReduce, 2, csLongintSize, @Splits);
@@ -1031,7 +1189,7 @@ begin
     exit;
   end;
 
-  K := FInt8Kernel.Kernel;
+  if FFP16Activations then K := FFP16Kernel.Kernel else K := FInt8Kernel.Kernel;
   err := err or clSetKernelArg(K, 0, csLongintSize, @FThreadCount);
   err := err or clSetKernelArg(K, 1, csLongintSize, @FNumAs);
   err := err or clSetKernelArg(K, 2, csLongintSize, @FNumBs);

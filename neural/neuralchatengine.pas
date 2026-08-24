@@ -164,6 +164,12 @@ type
                                  // each layer its own kernel handles and command
                                  // queue - measurably slower here, kept as an
                                  // A/B knob for drivers that dislike sharing
+    GpuFP16: boolean;            // --gpu-fp16: half-precision B operand for the
+                                 // int8 OpenCL matmuls (TNNet.OpenCLFP16).
+                                 // Weights stay int8 and the logits are not
+                                 // bit-exact. Needs OpenCL AND int8 weights:
+                                 // TNNetConvolutionBase.ShouldOpenCLFP16 tests
+                                 // FQuantInt8, so --fp32 ignores it
     Host: string;                // ChatServer only: HTTP listen address
     Port: integer;               // ChatServer only: HTTP listen port
     ErrorMsg: string;
@@ -342,6 +348,10 @@ begin
   WriteLn('  --cpu                 force CPU even when built with -dOpenCL');
   WriteLn('  --gpu-platform N      OpenCL platform index (default 0)');
   WriteLn('  --gpu-device N        OpenCL device index within the platform (default 0)');
+  WriteLn('  --gpu-fp16            experimental and under construction half-precision');
+  WriteLn('                        activations for the int8 OpenCL matmuls (weights stay');
+  WriteLn('                        int8; logits not bit-exact). Needs --gpu and int8');
+  WriteLn('                        weights; ignored otherwise');
   WriteLn('  --no-gpu-shared-kernel  give each layer private OpenCL kernels and command');
   WriteLn('                        queue instead of the net-wide shared ones (default:');
   WriteLn('                        shared, which is faster). Each layer then waits for');
@@ -410,6 +420,7 @@ begin
   Result.GpuPlatform := 0;
   Result.GpuDevice := 0;
   Result.GpuSharedKernel := true; // shared kernels/queue (--no-gpu-shared-kernel)
+  Result.GpuFP16 := false; // FP32 activations; --gpu-fp16 opts into the halves
   Result.Host := '127.0.0.1'; // loopback-only by default: a local inference
   Result.Port := 8080;        // server, not an internet-facing one
   Result.ErrorMsg := '';
@@ -516,6 +527,7 @@ begin
       Opt.GpuDevice := IVal;
     end
     else if Arg = '--no-gpu-shared-kernel' then Opt.GpuSharedKernel := false
+    else if Arg = '--gpu-fp16' then Opt.GpuFP16 := true
     else if Arg = '--selftest' then Opt.SelfTest := true
     else if (Arg = '--help') or (Arg = '-h') then Opt.ShowHelp := true
     else if Arg = '--greedy' then Opt.Greedy := true
@@ -1071,6 +1083,20 @@ begin
     Opt.LowMemory := false;
   end;
   {$ENDIF}
+  // The half B operand exists only inside the int8 OpenCL matmuls, so both
+  // conditions must hold. Reported and cleared here rather than left to do
+  // nothing silently at EnableOpenCL.
+  if Opt.GpuFP16 and (not Opt.Gpu) then
+  begin
+    Notice('[--gpu-fp16 ignored: OpenCL offload is off]');
+    Opt.GpuFP16 := false;
+  end;
+  if Opt.GpuFP16 and (not Opt.Int8) then
+  begin
+    Notice('[--gpu-fp16 ignored: the half activations are wired for int8' +
+      ' weights only, and --fp32 was requested]');
+    Opt.GpuFP16 := false;
+  end;
 
   // Model: generic architecture dispatch, inference-only, int8 by default.
   // Weight precision. Int8 is the default (less RAM and faster on CPU and
@@ -1152,7 +1178,16 @@ begin
           Notice('[--no-gpu-shared-kernel: per-layer kernels and command queues - ' +
             'each layer waits for its sources, so --profile charges GPU time to ' +
             'layers instead of the queue drain; slower than shared]');
+        if Opt.GpuFP16 then
+          Notice('[--gpu-fp16: experimental and under construction -' +
+            ' half-precision activations in the int8 matmuls; weights stay' +
+            ' int8, logits are not bit-exact. A device that rejects' +
+            ' cai_dot_product_int8_h keeps the FP32 activations]');
         LoadStart := GetTickCount64();
+        // Read by TNNetLayerConcatedWeights.EnableOpenCL when it acquires the
+        // half kernel, so it must be assigned before the call below: that is
+        // what sizes the half B buffer, and a later write does nothing.
+        NN.OpenCLFP16 := Opt.GpuFP16;
         NN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
           GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
         Notice(Format('GPU weights uploaded in %.1fs.',
