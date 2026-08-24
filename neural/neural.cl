@@ -2,6 +2,72 @@
 // located at:
 // https://sourceforge.net/projects/cai/
 
+// The activation applied in-register by the GEMM kernels after their fused
+// bias-add, and by cai_activation for the same opcodes. Opcodes are the csAct*
+// constants: 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent, 4 = Swish/SiLU,
+// 5 = GELU (tanh approximation), 6 = GELUErf, 7 = HardSwish, 8 = HardSigmoid;
+// 0/other = pass-through. This is every parameterless opcode, which is what the
+// GEMM kernels can fuse: they carry no FParamA/B/C, so the host gate
+// TNNetLayer.IsActivationFunctionInOpenCL passes them nothing else.
+// cai_activation keeps its own cases only for the parameterized activations
+// (9, 10, 15, 18-21, 24). Coded by Claude (AI).
+static inline float cai_fused_act(float v, const int ActFN)
+{
+  if (ActFN == 1) // ReLU: max(x, 0)
+  {
+    return (v > 0.0f) ? v : 0.0f;
+  }
+  else if (ActFN == 2) // Sigmoid: numerically-stable two-branch 1/(1+exp(-x))
+  {
+    if (v > 0.0f) return 1.0f / (1.0f + exp(-v));
+    const float s = exp(v);
+    return s / (1.0f + s);
+  }
+  else if (ActFN == 3) // HyperbolicTangent: clamp [-10,10], (1-e)/(1+e), e=exp(-2x)
+  {
+    float xc = v;
+    if (xc > 10.0f) xc = 10.0f; else if (xc < -10.0f) xc = -10.0f;
+    const float e = exp(-2.0f * xc);
+    return (1.0f - e) / (1.0f + e);
+  }
+  else if (ActFN == 4) // Swish / SiLU: x * sigmoid(x), sigmoid in the same two-branch form
+  {
+    if (v > 0.0f) return v / (1.0f + exp(-v));
+    const float s = exp(v);
+    return v * s / (1.0f + s);
+  }
+  else if (ActFN == 5) // GELU (tanh approximation): x * 0.5 * (1 + tanh(arg))
+  {
+    const float SQRT_2_OVER_PI = 0.7978845608f;
+    const float GELU_CONST = 0.044715f;
+    // The cubic term drives arg past 100 by |x| ~ 15, and tanh is already 1.0f
+    // in single precision by |arg| ~ 9, so the [-10,10] clamp changes no
+    // representable result and keeps exp(-2*arg) at exp(20).
+    float arg = SQRT_2_OVER_PI * (v + GELU_CONST * v * v * v);
+    if (arg > 10.0f) arg = 10.0f; else if (arg < -10.0f) arg = -10.0f;
+    const float e = exp(-2.0f * arg);
+    return v * 0.5f * (1.0f + (1.0f - e) / (1.0f + e));
+  }
+  else if (ActFN == 6) // GELUErf (exact form): x * 0.5 * (1 + erf(x/sqrt(2)))
+  {
+    const float INV_SQRT_2 = 0.7071067811865476f;
+    return v * 0.5f * (1.0f + erf(v * INV_SQRT_2));
+  }
+  else if (ActFN == 7) // HardSwish: x for x > 3, 0 for x < -3, else x*(x+3)/6
+  {
+    if (v > 3.0f) return v;
+    if (v < -3.0f) return 0.0f;
+    return v * (v + 3.0f) / 6.0f;
+  }
+  else if (ActFN == 8) // HardSigmoid: 1 for x > 3, 0 for x < -3, else (x+3)/6
+  {
+    if (v > 3.0f) return 1.0f;
+    if (v < -3.0f) return 0.0f;
+    return (v + 3.0f) / 6.0f;
+  }
+  return v;
+}
+
 // CAI Dot Product
 // A vectors (A1, A2, A3, ...) are operated with a number of
 // B vectors (B1, B2, B3, ...) via dot product. There is a resulting vector
@@ -115,33 +181,11 @@ __kernel void cai_dot_product
     if (UseBias != 0) DotProductResult += FBiasOutput[b_id * FNumAs + a_id];
 
     // Optional fused activation, applied in-register to the reduced dot product
-    // before it is written back. Opcodes match the csAct* constants (and the
-    // cai_activation switch): 1 = ReLU, 2 = Sigmoid, 3 = HyperbolicTangent;
-    // 0/other = pass-through. This lets an inference forward skip the host-side
-    // bias-add + activation sweep over the whole output volume. The sigmoid/tanh
-    // math mirrors cai_activation exactly so device and host agree to ~1e-6.
-    // Coded by Claude (AI).
-    if (ActFN == 1)
-    {
-      if (DotProductResult < 0.0f) { DotProductResult = 0.0f; }
-    }
-    else if (ActFN == 2) // Sigmoid: numerically-stable two-branch 1/(1+exp(-x))
-    {
-      if (DotProductResult > 0.0f)
-        DotProductResult = 1.0f / (1.0f + exp(-DotProductResult));
-      else
-      {
-        const float s = exp(DotProductResult);
-        DotProductResult = s / (1.0f + s);
-      }
-    }
-    else if (ActFN == 3) // HyperbolicTangent: clamp [-10,10], (1-e)/(1+e), e=exp(-2x)
-    {
-      float xc = DotProductResult;
-      if (xc > 10.0f) xc = 10.0f; else if (xc < -10.0f) xc = -10.0f;
-      const float e = exp(-2.0f * xc);
-      DotProductResult = (1.0f - e) / (1.0f + e);
-    }
+    // before it is written back, so an inference forward skips the host-side
+    // bias-add + activation sweep over the whole output volume. cai_fused_act
+    // holds the math (shared with cai_activation), so device and host agree to
+    // ~1e-6. Coded by Claude (AI).
+    DotProductResult = cai_fused_act(DotProductResult, ActFN);
 
     FResultBuffer[b_id * FNumAs + a_id] = DotProductResult;
   }
@@ -156,8 +200,8 @@ __kernel void cai_dot_product
 // to the reduced raw code sum, before the fused bias-add, mirroring the host
 // fused kernel (TNNetVolume.DotProductInt8 + deferred scale) so device and
 // host agree to normal float tolerance. B, the result layout, and the fused
-// bias/activation tail (args 8/9, opcodes 1=ReLU 2=Sigmoid 3=Tanh) are
-// identical to cai_dot_product; FScales rides as arg 10. Coded by Claude (AI).
+// bias/activation tail (args 8/9, the cai_fused_act opcodes) are identical to
+// cai_dot_product; FScales rides as arg 10. Coded by Claude (AI).
 __kernel void cai_dot_product_int8
 (
   const int FThreadCount,
@@ -263,56 +307,12 @@ __kernel void cai_dot_product_int8
     // Fused bias-add (see cai_dot_product): act must see W.x + b.
     if (UseBias != 0) DotProductResult += FBiasOutput[b_id * FNumAs + a_id];
 
-    // Fused activation, identical opcode set and math as cai_dot_product.
-    if (ActFN == 1)
-    {
-      if (DotProductResult < 0.0f) { DotProductResult = 0.0f; }
-    }
-    else if (ActFN == 2) // Sigmoid: numerically-stable two-branch 1/(1+exp(-x))
-    {
-      if (DotProductResult > 0.0f)
-        DotProductResult = 1.0f / (1.0f + exp(-DotProductResult));
-      else
-      {
-        const float s = exp(DotProductResult);
-        DotProductResult = s / (1.0f + s);
-      }
-    }
-    else if (ActFN == 3) // HyperbolicTangent: clamp [-10,10], (1-e)/(1+e), e=exp(-2x)
-    {
-      float xc = DotProductResult;
-      if (xc > 10.0f) xc = 10.0f; else if (xc < -10.0f) xc = -10.0f;
-      const float e = exp(-2.0f * xc);
-      DotProductResult = (1.0f - e) / (1.0f + e);
-    }
+    // Fused activation, the same cai_fused_act call as cai_dot_product.
+    DotProductResult = cai_fused_act(DotProductResult, ActFN);
 
     FResultBuffer[b_id * FNumAs + a_id] = DotProductResult;
   }
 } // end of kernel
-
-// Fused bias/activation tail shared by the split-K reduce kernel: the opcode
-// set and the math are identical to cai_dot_product's inline tail.
-static inline float cai_fused_act(float v, const int ActFN)
-{
-  if (ActFN == 1)
-  {
-    return (v < 0.0f) ? 0.0f : v;
-  }
-  else if (ActFN == 2) // Sigmoid: numerically-stable two-branch 1/(1+exp(-x))
-  {
-    if (v > 0.0f) return 1.0f / (1.0f + exp(-v));
-    const float s = exp(v);
-    return s / (1.0f + s);
-  }
-  else if (ActFN == 3) // HyperbolicTangent: clamp [-10,10], (1-e)/(1+e), e=exp(-2x)
-  {
-    float xc = v;
-    if (xc > 10.0f) xc = 10.0f; else if (xc < -10.0f) xc = -10.0f;
-    const float e = exp(-2.0f * xc);
-    return (1.0f - e) / (1.0f + e);
-  }
-  return v;
-}
 
 // SPLIT-K PASS 1. cai_dot_product_int8 gives one work-item per (output row,
 // sample), so a decode GEMV (FNumBs=1) launches only FNumAs work-items and
@@ -1679,63 +1679,19 @@ __kernel void cai_activation
   float y;
   switch (FOpcode)
   {
-    case 1: // ReLU: max(x, 0)
-      y = (x > 0.0f) ? x : 0.0f;
-      break;
-    case 2: // Sigmoid: numerically-stable two-branch 1/(1+exp(-x))
-      if (x > 0.0f)
-        y = 1.0f / (1.0f + exp(-x));
-      else
-      {
-        const float s = exp(x);
-        y = s / (1.0f + s);
-      }
-      break;
-    case 3: // HyperbolicTangent: clamp to [-10,10], (1-exp(-2x))/(1+exp(-2x))
-    {
-      float xc = x;
-      if (xc > 10.0f) xc = 10.0f; else if (xc < -10.0f) xc = -10.0f;
-      const float e = exp(-2.0f * xc);
-      y = (1.0f - e) / (1.0f + e);
-      break;
-    }
-    case 4: // Swish / SiLU: x * sigmoid(x), sigmoid in the same two-branch form
-      if (x > 0.0f)
-        y = x / (1.0f + exp(-x));
-      else
-      {
-        const float s = exp(x);
-        y = x * s / (1.0f + s);
-      }
-      break;
-    case 5: // GELU (tanh approximation): x * 0.5 * (1 + tanh(arg))
-    {
-      const float SQRT_2_OVER_PI = 0.7978845608f;
-      const float GELU_CONST = 0.044715f;
-      // The cubic term drives arg past 100 by |x| ~ 15, and tanh is already 1.0f
-      // in single precision by |arg| ~ 9, so the [-10,10] clamp changes no
-      // representable result and keeps exp(-2*arg) at exp(20).
-      float arg = SQRT_2_OVER_PI * (x + GELU_CONST * x * x * x);
-      if (arg > 10.0f) arg = 10.0f; else if (arg < -10.0f) arg = -10.0f;
-      const float e = exp(-2.0f * arg);
-      y = x * 0.5f * (1.0f + (1.0f - e) / (1.0f + e));
-      break;
-    }
-    case 6: // GELUErf (exact form): x * 0.5 * (1 + erf(x/sqrt(2)))
-    {
-      const float INV_SQRT_2 = 0.7071067811865476f;
-      y = x * 0.5f * (1.0f + erf(x * INV_SQRT_2));
-      break;
-    }
-    case 7: // HardSwish: x for x > 3, 0 for x < -3, else x*(x+3)/6
-      if (x > 3.0f) y = x;
-      else if (x < -3.0f) y = 0.0f;
-      else y = x * (x + 3.0f) / 6.0f;
-      break;
-    case 8: // HardSigmoid: 1 for x > 3, 0 for x < -3, else (x+3)/6
-      if (x > 3.0f) y = 1.0f;
-      else if (x < -3.0f) y = 0.0f;
-      else y = (x + 3.0f) / 6.0f;
+    // Opcodes 1-8 take no parameter, so the GEMM kernels fuse them too and
+    // cai_fused_act is where their math lives: 1 = ReLU, 2 = Sigmoid,
+    // 3 = HyperbolicTangent, 4 = Swish/SiLU, 5 = GELU (tanh approximation),
+    // 6 = GELUErf, 7 = HardSwish, 8 = HardSigmoid.
+    case 1:
+    case 2:
+    case 3:
+    case 4:
+    case 5:
+    case 6:
+    case 7:
+    case 8:
+      y = cai_fused_act(x, FOpcode);
       break;
     case 9: // ELU: x for x > 0, else alpha*(exp(x)-1). FParamA = alpha.
       // exp is evaluated only on the negative branch, where it underflows

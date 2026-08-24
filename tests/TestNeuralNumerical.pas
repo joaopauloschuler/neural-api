@@ -66050,6 +66050,12 @@ begin
   RunOne('ReLU bias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0);
   RunOne('Sigmoid bias', @Sigmoid, @SigmoidDerivative, 0);
   RunOne('Tanh bias', @HiperbolicTangent, @HiperbolicTangentDerivative, 0);
+  // The two opcodes the tail gained after ReLU/Sigmoid/Tanh. Their host and
+  // device forms are separate implementations, so parity is not self-evident.
+  RunOne('Swish nobias', @Swish, @SwishDerivative, 1);
+  RunOne('Swish bias', @Swish, @SwishDerivative, 0);
+  RunOne('HardSwish nobias', @HardSwish, @HardSwishDerivative, 1);
+  RunOne('HardSwish bias', @HardSwish, @HardSwishDerivative, 0);
 end;
 {$ELSE}
 begin
@@ -66149,6 +66155,12 @@ begin
   RunOne('ReLU bias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0);
   RunOne('Sigmoid bias', @Sigmoid, @SigmoidDerivative, 0);
   RunOne('Tanh bias', @HiperbolicTangent, @HiperbolicTangentDerivative, 0);
+  // The two opcodes the tail gained after ReLU/Sigmoid/Tanh. Their host and
+  // device forms are separate implementations, so parity is not self-evident.
+  RunOne('Swish nobias', @Swish, @SwishDerivative, 1);
+  RunOne('Swish bias', @Swish, @SwishDerivative, 0);
+  RunOne('HardSwish nobias', @HardSwish, @HardSwishDerivative, 1);
+  RunOne('HardSwish bias', @HardSwish, @HardSwishDerivative, 0);
 end;
 {$ELSE}
 begin
@@ -66309,6 +66321,8 @@ begin
   RunFC('ReLU bias', @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0);
   RunFC('Sigmoid bias', @Sigmoid, @SigmoidDerivative, 0);
   RunFC('Tanh nobias', @HiperbolicTangent, @HiperbolicTangentDerivative, 1);
+  RunFC('Swish bias', @Swish, @SwishDerivative, 0);
+  RunFC('HardSwish nobias', @HardSwish, @HardSwishDerivative, 1);
   RunConv('3x3 pad1 s1 relu', 3, 0, 1, 1, true);
   RunConv('3x3 pad0 s1 linear', 3, 0, 0, 1, false);
   RunConv('5x5 pad2 s2 relu', 5, 0, 2, 2, true);
@@ -66391,6 +66405,11 @@ procedure TTestNeuralNumerical.TestConvDeviceIm2ColOpenCLParity;
           Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
           if Diff > MaxDiff then MaxDiff := Diff;
         end;
+        // Without this, an activation the fused tail does NOT implement would
+        // still pass: ComputeOpenCL would download FOutputRaw and finish on the
+        // host, so the comparison would be CPU against CPU.
+        AssertTrue(aName + ' fused activation left the output on the device',
+          Conv.OutputBindableOnOpenCL());
       finally
         NN.ForceOpenCL(False);
       end;
@@ -66415,6 +66434,11 @@ begin
   // A bias-suppressed + ReLU case to vary the fused opcode/bias combination.
   RunOne('3x3 pad1 s1 relu nobias', 3, 1, 1, @RectifiedLinearUnit,
     @RectifiedLinearUnitDerivative, 1);
+  // Swish is the opcode the fused tail gained last; it is also the one whose
+  // host and device forms are separate implementations (VectorSwish vs
+  // cai_fused_act case 4), so parity here is not self-evident.
+  RunOne('3x3 pad1 s1 swish', 3, 1, 1, @Swish, @SwishDerivative, 0);
+  RunOne('3x3 pad1 s1 hardswish', 3, 1, 1, @HardSwish, @HardSwishDerivative, 0);
 end;
 {$ELSE}
 begin
@@ -66513,6 +66537,9 @@ begin
   // pass 1 must clamp it to FSize rather than read past the row.
   RunFC('1500x512 tanh bias', 1500, 512, @HiperbolicTangent,
     @HiperbolicTangentDerivative, 0);
+  RunFC('1500x512 swish bias', 1500, 512, @Swish, @SwishDerivative, 0);
+  RunFC('1500x512 hardswish bias', 1500, 512, @HardSwish,
+    @HardSwishDerivative, 0);
 end;
 {$ELSE}
 begin

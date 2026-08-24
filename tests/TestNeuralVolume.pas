@@ -97,15 +97,26 @@ type
     procedure TestQuant8TiledDotProductMatchesArrays;
     procedure TestQuant8GroupedTiledDotProductMatchesArrays;
     procedure TestMaxAbsFinite;
+    procedure TestMaxAbsFiniteLengthSweep;
     procedure TestQuantizeInt8;
+    procedure TestQuantizeInt8LengthSweep;
+    procedure TestDequantizeInt8LengthSweep;
     procedure TestQuantizeInt8NonFinite;
     procedure TestQuantizeInt8TinyAndDenormalRows;
     procedure TestQuantizeInt8MatchesScalarReference;
     procedure TestDequantizeInt8;
     procedure TestDequantizeInt8RoundTrip;
     procedure TestDecodeBF16;
+    procedure TestDecodeBF16LengthSweep;
     procedure TestDecodeF16;
     procedure TestDecodeF16SpecialValues;
+    procedure TestEncodeF16;
+    procedure TestEncodeF16SpecialValues;
+    procedure TestEncodeF16MatchesScalar;
+    procedure TestDecodeF16MatchesScalar;
+    procedure TestEncodeBF16;
+    procedure TestEncodeBF16SpecialValues;
+    procedure TestEncodeBF16MatchesScalar;
   end;
 
 implementation
@@ -505,10 +516,12 @@ procedure TTestNeuralVolume.TestVolumeReluGateMaskParity;
 // ReluGateMask is AVXReluGateMask on an AVX2/64-bit build and a scalar loop
 // everywhere else. The output is only ever 1.0 or 0.0, so both paths must agree
 // BIT-exactly -- including at the boundary, where the contract is >= 0 (so +0.0
-// and -0.0 both gate open) and NaN gates shut. Sizes straddle the 8-element
-// block width and its tail.
+// and -0.0 both gate open) and NaN gates shut. The sizes separate the three
+// parts of the vectorized routine - the 32-element unrolled body, the
+// 8-element remainder loop and the scalar tail - and combine them.
 const
-  Sizes: array[0..10] of integer = (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 1000);
+  Sizes: array[0..15] of integer =
+    (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 39, 40, 47, 64, 128, 1000);
 var
   Src, Dst, Ref: array of TNeuralFloat;
   SI, K, N: integer;
@@ -518,7 +531,7 @@ begin
   begin
     N := Sizes[SI];
     SetLength(Src, N);
-    SetLength(Dst, N);
+    SetLength(Dst, N + 1);   // one guard slot past the run
     SetLength(Ref, N);
     for K := 0 to N - 1 do
     begin
@@ -533,11 +546,14 @@ begin
       Dst[K] := 12345;
       if Src[K] >= 0 then Ref[K] := 1 else Ref[K] := 0;
     end;
+    Dst[N] := 12345;
     TNNetVolume.ReluGateMask(TNeuralFloatArrPtr(@Dst[0]),
       TNeuralFloatArrPtr(@Src[0]), N);
     for K := 0 to N - 1 do
       AssertEquals('ReluGateMask[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
         Ref[K], Dst[K], 0.0);
+    AssertEquals('ReluGateMask wrote past N=' + IntToStr(N), 12345.0,
+      Dst[N], 0.0);
   end;
   // In-place (dst = src) must produce the same mask.
   N := 40;
@@ -561,10 +577,12 @@ procedure TTestNeuralVolume.TestVolumeLeakyReluParity;
 // LeakyRelu is AVXLeakyRelu on an AVX2/64-bit build and a scalar loop everywhere
 // else. Both paths must agree BIT-exactly: the negative branch is the same
 // single-precision multiply, and at the boundary the contract is >= 0, so +0.0
-// and -0.0 both pass through unscaled. Sizes straddle the 8-element block width
-// and its tail.
+// and -0.0 both pass through unscaled. The sizes separate the three parts of
+// the vectorized routine - the 32-element unrolled body, the 8-element
+// remainder loop and the scalar tail - and combine them.
 const
-  Sizes: array[0..10] of integer = (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 1000);
+  Sizes: array[0..15] of integer =
+    (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 39, 40, 47, 64, 128, 1000);
   // TYPED: an untyped 0.1 would be a Double here, so the reference multiply
   // would not be the Single one the kernel performs.
   Slope: TNeuralFloat = 0.1;
@@ -577,7 +595,7 @@ begin
   begin
     N := Sizes[SI];
     SetLength(Src, N);
-    SetLength(Dst, N);
+    SetLength(Dst, N + 1);   // one guard slot past the run
     SetLength(Ref, N);
     for K := 0 to N - 1 do
     begin
@@ -592,11 +610,13 @@ begin
       Dst[K] := 12345;
       if Src[K] >= 0 then Ref[K] := Src[K] else Ref[K] := Slope * Src[K];
     end;
+    Dst[N] := 12345;
     TNNetVolume.LeakyRelu(TNeuralFloatArrPtr(@Dst[0]),
       TNeuralFloatArrPtr(@Src[0]), Slope, N);
     for K := 0 to N - 1 do
       AssertEquals('LeakyRelu[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
         Ref[K], Dst[K], 0.0);
+    AssertEquals('LeakyRelu wrote past N=' + IntToStr(N), 12345.0, Dst[N], 0.0);
   end;
   // In-place (dst = src) must produce the same result.
   N := 40;
@@ -635,9 +655,12 @@ procedure TTestNeuralVolume.TestVolumeReluLParity;
 // build and scalar loops everywhere else. Both paths must agree BIT-exactly:
 // each clamped form is the same subtract-multiply-add, and the boundary
 // contract is strict >, so LowLimit itself takes the low form while HighLimit
-// passes through. Sizes straddle the 8-element block width and its tail.
+// passes through. The sizes separate the three parts of the vectorized routines
+// - the 32-element unrolled body, the 8-element remainder loop and the scalar
+// tail - and combine them.
 const
-  Sizes: array[0..10] of integer = (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 1000);
+  Sizes: array[0..15] of integer =
+    (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 39, 40, 47, 64, 128, 1000);
   // TYPED: an untyped literal would be a Double here, so the reference
   // arithmetic would not be the Single the kernel performs.
   LowLimit: TNeuralFloat = -3.0;
@@ -652,7 +675,7 @@ begin
   begin
     N := Sizes[SI];
     SetLength(Src, N);
-    SetLength(Dst, N);
+    SetLength(Dst, N + 1);   // one guard slot past the run
     SetLength(Ref, N);
     SetLength(RefDeriv, N);
     for K := 0 to N - 1 do
@@ -673,16 +696,21 @@ begin
       if (Src[K] > LowLimit) and not (Src[K] > HighLimit) then RefDeriv[K] := 1
       else RefDeriv[K] := Slope;
     end;
+    Dst[N] := 12345;
     TNNetVolume.ReluL(TNeuralFloatArrPtr(@Dst[0]),
       TNeuralFloatArrPtr(@Src[0]), LowLimit, HighLimit, Slope, N);
     for K := 0 to N - 1 do
       AssertEquals('ReluL[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
         Ref[K], Dst[K], 0.0);
+    AssertEquals('ReluL wrote past N=' + IntToStr(N), 12345.0, Dst[N], 0.0);
+    Dst[N] := 12345;
     TNNetVolume.ReluLGateMask(TNeuralFloatArrPtr(@Dst[0]),
       TNeuralFloatArrPtr(@Src[0]), LowLimit, HighLimit, Slope, N);
     for K := 0 to N - 1 do
       AssertEquals('ReluLGateMask[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
         RefDeriv[K], Dst[K], 0.0);
+    AssertEquals('ReluLGateMask wrote past N=' + IntToStr(N), 12345.0,
+      Dst[N], 0.0);
   end;
   // In-place (dst = src) must produce the same result.
   N := 40;
@@ -2904,6 +2932,36 @@ begin
   end;
 end;
 
+// AVXMaxAbsFinite folds 32 floats per iteration into four accumulators, then 8
+// at a time, then a scalar tail. The lengths below take each part alone and in
+// combination, and the max is planted at every position in turn, so a lane the
+// fold drops or an accumulator it forgets shows up wherever it hides. The slot
+// past the run holds a larger value that must not be read. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestMaxAbsFiniteLengthSweep;
+const
+  cLengths: array[0..12] of integer =
+    (16, 24, 31, 32, 33, 39, 40, 47, 64, 65, 128, 1000, 1024);
+  N = 1024;
+var
+  Buf: array of TNeuralFloat;
+  i, L, Len, Plant: integer;
+begin
+  SetLength(Buf, N + 1);
+  for L := 0 to High(cLengths) do
+  begin
+    Len := cLengths[L];
+    for Plant := 0 to Len - 1 do
+    begin
+      for i := 0 to Len - 1 do Buf[i] := 0.25;
+      Buf[Plant] := -7.5;
+      Buf[Len] := 1000;   // past the run: reading it would win the max
+      AssertEquals('max planted at ' + IntToStr(Plant) + ' of N=' +
+        IntToStr(Len), 7.5,
+        TNNetVolume.MaxAbsFinite(TNeuralFloatArrPtr(@Buf[0]), Len), 0);
+    end;
+  end;
+end;
+
 // QuantizeInt8 against a known row max: the row max itself must land on
 // +/-127, zero on 0, and every code must dequantize back within half a step.
 // Coded by Claude (AI).
@@ -3142,6 +3200,85 @@ begin
   AssertEquals('N=0 writes nothing', 999, Dst[0], 0);
 end;
 
+// The vectorized run and the scalar run must produce the same codes: the same
+// values are quantized once in bulk (the AVX2 path) and once one element at a
+// time (always scalar, being under csMinAvxSize). The lengths take the
+// 32-element unrolled body, the 8-element remainder loop and the scalar tail
+// alone and in combination. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestQuantizeInt8LengthSweep;
+const
+  cLengths: array[0..12] of integer =
+    (16, 24, 31, 32, 33, 39, 40, 47, 64, 65, 128, 1000, 1024);
+  N = 1024;
+var
+  V: TNNetVolume;
+  Bulk, OneByOne: TInt8DynArr;
+  MaxAbs: TNeuralFloat;
+  i, L, Len: integer;
+begin
+  RandSeed := 313131;
+  V := TNNetVolume.Create(N, 1, 1);
+  SetLength(Bulk, N + 1);      // one guard slot past the longest run
+  SetLength(OneByOne, N);
+  try
+    for i := 0 to N - 1 do V.FData[i] := (Random - 0.5) * 7;
+    MaxAbs := TNNetVolume.MaxAbsFinite(TNeuralFloatArrPtr(@V.FData[0]), N);
+    AssertTrue('random row has a range', MaxAbs > 0);
+    for i := 0 to N - 1 do
+      TNNetVolume.QuantizeInt8(TNeuralInt8ArrPtr(@OneByOne[i]),
+        TNeuralFloatArrPtr(@V.FData[i]), 1, MaxAbs);
+    for L := 0 to High(cLengths) do
+    begin
+      Len := cLengths[L];
+      for i := 0 to N do Bulk[i] := 99;
+      TNNetVolume.QuantizeInt8(TNeuralInt8ArrPtr(@Bulk[0]),
+        TNeuralFloatArrPtr(@V.FData[0]), Len, MaxAbs);
+      for i := 0 to Len - 1 do
+        AssertEquals('code ' + IntToStr(i) + ' at N=' + IntToStr(Len),
+          OneByOne[i], Bulk[i]);
+      AssertEquals('wrote past N=' + IntToStr(Len), 99, Bulk[Len]);
+    end;
+  finally
+    V.Free;
+  end;
+end;
+
+// The DequantizeInt8 twin of TestQuantizeInt8LengthSweep. One single-precision
+// multiply per element on both paths, so the reference below is exact and the
+// delta is 0. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestDequantizeInt8LengthSweep;
+const
+  cLengths: array[0..12] of integer =
+    (16, 24, 31, 32, 33, 39, 40, 47, 64, 65, 128, 1000, 1024);
+  N = 1024;
+  // TYPED on purpose: an untyped const would keep full precision in the
+  // expectation below while the call rounds it to single.
+  Scale: TNeuralFloat = 0.0125;
+var
+  Codes: TInt8DynArr;
+  Dst: array of TNeuralFloat;
+  Expected: TNeuralFloat;
+  i, L, Len: integer;
+begin
+  SetLength(Codes, N);
+  SetLength(Dst, N + 1);       // one guard slot past the longest run
+  for i := 0 to N - 1 do Codes[i] := ShortInt(((i * 13) mod 255) - 127);
+  for L := 0 to High(cLengths) do
+  begin
+    Len := cLengths[L];
+    for i := 0 to N do Dst[i] := 12345;
+    TNNetVolume.DequantizeInt8(TNeuralFloatArrPtr(@Dst[0]),
+      TNeuralInt8ArrPtr(@Codes[0]), Len, Scale);
+    for i := 0 to Len - 1 do
+    begin
+      Expected := Scale * Codes[i];
+      AssertEquals('element ' + IntToStr(i) + ' at N=' + IntToStr(Len),
+        Expected, Dst[i], 0);
+    end;
+    AssertEquals('wrote past N=' + IntToStr(Len), 12345.0, Dst[Len], 0);
+  end;
+end;
+
 // QuantizeInt8 then DequantizeInt8 must land within half a code of the input,
 // which is the whole accuracy claim of the int8 weight path. Binds the two
 // primitives together so a lane-order bug in either shows up here.
@@ -3213,6 +3350,47 @@ begin
   begin
     OutBits := Cardinal(Pats[i]) shl 16;
     AssertEquals('short-run bf16 ' + IntToStr(i), PSingle(@OutBits)^, Dst[i], 0);
+  end;
+end;
+
+// The length sweep TestDecodeBF16 lacks: its single N = 21 never reaches the
+// 32-element unrolled body. Every length here is checked against the same shift
+// the scalar tail performs, so the delta is 0. The patterns keep bit 7 clear,
+// so the exponent is never all ones and no Inf or NaN reaches AssertEquals.
+// Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestDecodeBF16LengthSweep;
+const
+  cLengths: array[0..14] of integer =
+    (1, 7, 8, 16, 24, 31, 32, 33, 39, 40, 47, 64, 128, 1000, 1024);
+  N = 1024;
+var
+  Bits: array of Word;
+  Bulk: array of TNeuralFloat;
+  Expected: TNeuralFloat;
+  OutBits: Cardinal;
+  i, L, Len: integer;
+begin
+  SetLength(Bits, N);
+  SetLength(Bulk, N + 1);   // one guard slot past the longest run
+  for i := 0 to N - 1 do
+  begin
+    Bits[i] := Word((i * 61) and $7F7F);       // exponent never all ones
+    if (i and 1) = 1 then Bits[i] := Bits[i] or $8000;
+  end;
+  for L := 0 to High(cLengths) do
+  begin
+    Len := cLengths[L];
+    for i := 0 to N do Bulk[i] := 12345;
+    TNNetVolume.DecodeBF16(TNeuralFloatArrPtr(@Bulk[0]),
+      TNeuralHalfArrPtr(@Bits[0]), Len);
+    for i := 0 to Len - 1 do
+    begin
+      OutBits := Cardinal(Bits[i]) shl 16;
+      Expected := PSingle(@OutBits)^;
+      AssertEquals('element ' + IntToStr(i) + ' at N=' + IntToStr(Len),
+        Expected, Bulk[i], 0);
+    end;
+    AssertEquals('wrote past N=' + IntToStr(Len), 12345.0, Bulk[Len], 0);
   end;
 end;
 
@@ -3291,6 +3469,309 @@ begin
       $4000: AssertEquals('slot ' + IntToStr(i), 2.0, Dst[i], 0);
       $0000: AssertEquals('slot ' + IntToStr(i), 0.0, Dst[i], 0);
     end;
+end;
+
+// Narrowing is lossy, so these are the exact half bit patterns IEEE
+// round-to-nearest-even produces. The interesting rows are the ties: 65520 is
+// halfway between the largest finite half and the next power of two and must
+// round UP to Inf, 2^-25 is halfway between zero and the smallest subnormal
+// and must round DOWN to zero, and 1.5*2^-24 must round to the EVEN
+// subnormal $0002. 1e30 overflows the half range, which is also the input
+// that traps a vcvtps2ph loop running with FPC's default MXCSR.
+// Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestEncodeF16;
+const
+  N = 21;
+  Vals: array[0..20] of TNeuralFloat = (
+    1.0, -1.0, 0.0, -0.0, 2.0, 0.5,
+    65504.0,                    // largest finite half
+    65520.0,                    // tie above it -> Inf
+    1e30, -1e30,                // overflow -> +/-Inf
+    0.333251953125,             // nearest half to 1/3
+    3.140625,                   // nearest half to pi
+    5.9604644775390625e-8,      // smallest subnormal half, 2^-24
+    2.98023223876953125e-8,     // 2^-25: tie to even -> zero
+    8.940696716308594e-8,       // 1.5 * 2^-24: tie to even -> $0002
+    6.0975551605224609e-5,      // largest subnormal half
+    6.103515625e-5,             // smallest normal half, 2^-14
+    1e-10,                      // far below the subnormal range -> zero
+    42.0, -42.0, 1024.0);
+  Bits: array[0..20] of Word = (
+    $3C00, $BC00, $0000, $8000, $4000, $3800,
+    $7BFF, $7C00, $7C00, $FC00,
+    $3555, $4248,
+    $0001, $0000, $0002, $03FF, $0400, $0000,
+    $5140, $D140, $6400);
+var
+  Dst: array of Word;
+  i: integer;
+begin
+  SetLength(Dst, N);
+  for i := 0 to N - 1 do Dst[i] := $DEAD;
+  TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@Dst[0]),
+    TNeuralFloatArrPtr(@Vals[0]), N);
+  for i := 0 to N - 1 do
+    AssertEquals('half of ' + FloatToStr(Vals[i]),
+      IntToHex(Bits[i], 4), IntToHex(Dst[i], 4));
+  // Under csMinAvxSize: the scalar method, same answers.
+  for i := 0 to 4 do Dst[i] := $DEAD;
+  TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@Dst[0]),
+    TNeuralFloatArrPtr(@Vals[0]), 5);
+  for i := 0 to 4 do
+    AssertEquals('short-run half ' + IntToStr(i),
+      IntToHex(Bits[i], 4), IntToHex(Dst[i], 4));
+end;
+
+// Inf and NaN singles must narrow to Inf and NaN halves rather than trapping.
+// FPC leaves the SSE invalid-operation exception unmasked, so a signalling NaN
+// reaching vcvtps2ph unmasked would raise EInvalidOp here. A NaN narrows to the
+// quiet NaN of the same top-10 payload bits, so the assertion checks the class
+// (all-ones exponent, non-zero mantissa) rather than one pattern.
+// Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestEncodeF16SpecialValues;
+const
+  N = 20;
+var
+  Vals: array[0..19] of TNeuralFloat;
+  Dst: array of Word;
+  SrcBits: Cardinal;
+  i: integer;
+begin
+  for i := 0 to N - 1 do Vals[i] := 1.0;
+  SrcBits := $7F800000; Vals[0] := PSingle(@SrcBits)^;   // +Inf
+  SrcBits := $FF800000; Vals[1] := PSingle(@SrcBits)^;   // -Inf
+  SrcBits := $7FC00000; Vals[2] := PSingle(@SrcBits)^;   // quiet NaN
+  SrcBits := $7F800001; Vals[3] := PSingle(@SrcBits)^;   // signalling NaN
+  SrcBits := $FFABCDEF; Vals[4] := PSingle(@SrcBits)^;   // NaN with a payload
+  Vals[5] := -0.0;
+  Vals[6] := 1e-45;                                      // subnormal single
+  Vals[7] := 3.4028235e38;                               // largest finite single
+  SetLength(Dst, N);
+  for i := 0 to N - 1 do Dst[i] := $DEAD;
+  TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@Dst[0]),
+    TNeuralFloatArrPtr(@Vals[0]), N);
+  AssertEquals('+Inf', IntToHex($7C00, 4), IntToHex(Dst[0], 4));
+  AssertEquals('-Inf', IntToHex($FC00, 4), IntToHex(Dst[1], 4));
+  for i := 2 to 4 do
+    AssertTrue('slot ' + IntToStr(i) + ' is a NaN half',
+      ((Dst[i] and $7C00) = $7C00) and ((Dst[i] and $03FF) <> 0));
+  AssertEquals('-0.0', IntToHex($8000, 4), IntToHex(Dst[5], 4));
+  AssertEquals('subnormal single', IntToHex($0000, 4), IntToHex(Dst[6], 4));
+  AssertEquals('largest single', IntToHex($7C00, 4), IntToHex(Dst[7], 4));
+  for i := 8 to N - 1 do
+    AssertEquals('filler ' + IntToStr(i), IntToHex($3C00, 4), IntToHex(Dst[i], 4));
+end;
+
+// The vectorized run and the scalar run must agree bit-for-bit: the same values
+// are encoded once in bulk (which takes the F16C path on an AVX2 build) and
+// once one element at a time (always the scalar path, being under
+// csMinAvxSize). The values sweep nine decades, so they cross the overflow,
+// normal, subnormal and flush-to-zero regions.
+//
+// The lengths are the ones that separate the three parts of the vectorized
+// routine: under 32 uses only the 8-at-a-time loop, a multiple of 32 uses only
+// the unrolled body, and the rest exercise a body-plus-remainder-plus-tail
+// combination. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestEncodeF16MatchesScalar;
+const
+  cLengths: array[0..12] of integer =
+    (1, 7, 8, 16, 31, 32, 33, 39, 40, 47, 128, 1000, 1024);
+  N = 1024;
+var
+  Vals: array of TNeuralFloat;
+  Bulk, OneByOne: array of Word;
+  i, L, Len, Mismatches: integer;
+begin
+  SetLength(Vals, N);
+  SetLength(Bulk, N + 1);   // one guard slot past the longest run
+  SetLength(OneByOne, N);
+  for i := 0 to N - 1 do
+    Vals[i] := (i - 512) * 0.0011 * Power(10, (i mod 19) - 9);
+  for i := 0 to N - 1 do
+    TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@OneByOne[i]),
+      TNeuralFloatArrPtr(@Vals[i]), 1);
+  for L := 0 to High(cLengths) do
+  begin
+    Len := cLengths[L];
+    for i := 0 to N do Bulk[i] := $DEAD;
+    TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@Bulk[0]),
+      TNeuralFloatArrPtr(@Vals[0]), Len);
+    Mismatches := 0;
+    for i := 0 to Len - 1 do
+      if Bulk[i] <> OneByOne[i] then Inc(Mismatches);
+    AssertEquals('bulk vs scalar half mismatches at N=' + IntToStr(Len),
+      0, Mismatches);
+    AssertEquals('write past N=' + IntToStr(Len),
+      IntToHex($DEAD, 4), IntToHex(Bulk[Len], 4));
+  end;
+end;
+
+// The decode twin of TestEncodeF16MatchesScalar, over the same lengths. The
+// patterns walk the half range with the all-ones exponent excluded: a
+// signalling NaN is the one input where the two paths legitimately differ (the
+// F16C path quiets it, the scalar path passes it through), and
+// TestDecodeF16SpecialValues covers that case instead. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestDecodeF16MatchesScalar;
+const
+  cLengths: array[0..12] of integer =
+    (1, 7, 8, 16, 31, 32, 33, 39, 40, 47, 128, 1000, 1024);
+  N = 1024;
+var
+  Bits: array of Word;
+  Bulk, OneByOne: array of TNeuralFloat;
+  i, L, Len, Mismatches: integer;
+begin
+  SetLength(Bits, N);
+  SetLength(Bulk, N + 1);   // one guard slot past the longest run
+  SetLength(OneByOne, N);
+  for i := 0 to N - 1 do
+  begin
+    Bits[i] := Word((i * 61) and $7BFF);       // exponent never all ones
+    if (i and 1) = 1 then Bits[i] := Bits[i] or $8000;
+  end;
+  for i := 0 to N - 1 do
+    TNNetVolume.DecodeF16(TNeuralFloatArrPtr(@OneByOne[i]),
+      TNeuralHalfArrPtr(@Bits[i]), 1);
+  for L := 0 to High(cLengths) do
+  begin
+    Len := cLengths[L];
+    for i := 0 to N do Bulk[i] := 12345;
+    TNNetVolume.DecodeF16(TNeuralFloatArrPtr(@Bulk[0]),
+      TNeuralHalfArrPtr(@Bits[0]), Len);
+    Mismatches := 0;
+    for i := 0 to Len - 1 do
+      if Bulk[i] <> OneByOne[i] then Inc(Mismatches);
+    AssertEquals('bulk vs scalar single mismatches at N=' + IntToStr(Len),
+      0, Mismatches);
+    AssertEquals('write past N=' + IntToStr(Len), 12345.0, Bulk[Len], 0);
+  end;
+end;
+
+// Narrowing to bfloat16 drops the low 16 bits of the single, so these are the
+// exact words round-to-nearest-even produces. The values are built from bit
+// patterns rather than decimal literals so the ties are exact. The interesting
+// rows are the three ties (low half exactly $8000), which must go to the EVEN
+// kept word in both directions, and the largest finite single, whose round-up
+// leaves the bfloat16 range and lands on Inf. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestEncodeBF16;
+const
+  N = 21;
+  SrcBits: array[0..20] of Cardinal = (
+    $3F800000, $BF800000, $00000000, $80000000, $40000000, $3F000000,
+    $3EAAAAAB,                  // nearest single to 1/3, rounds up
+    $40490FDB,                  // nearest single to pi, rounds down
+    $3F808000,                  // tie, kept word even -> stays
+    $3F818000,                  // tie, kept word odd  -> rounds up
+    $7F7FFFFF, $FF7FFFFF,       // largest finite singles -> +/-Inf
+    $7F800000, $FF800000,       // +/-Inf
+    $00000001,                  // smallest subnormal single -> zero
+    $00008000,                  // tie at zero, rounds down
+    $00018000,                  // tie, kept word odd -> $0002
+    $42280000, $C2280000, $44800000,
+    $3F7FFFFF);                 // just under 1.0, rounds up to it
+  Bits: array[0..20] of Word = (
+    $3F80, $BF80, $0000, $8000, $4000, $3F00,
+    $3EAB, $4049, $3F80, $3F82, $7F80, $FF80,
+    $7F80, $FF80, $0000, $0000, $0002,
+    $4228, $C228, $4480, $3F80);
+var
+  Vals: array[0..20] of TNeuralFloat;
+  Dst: array of Word;
+  i: integer;
+begin
+  for i := 0 to N - 1 do Vals[i] := PSingle(@SrcBits[i])^;
+  SetLength(Dst, N);
+  for i := 0 to N - 1 do Dst[i] := $DEAD;
+  TNNetVolume.EncodeBF16(TNeuralHalfArrPtr(@Dst[0]),
+    TNeuralFloatArrPtr(@Vals[0]), N);
+  for i := 0 to N - 1 do
+    AssertEquals('bfloat16 of ' + IntToHex(SrcBits[i], 8),
+      IntToHex(Bits[i], 4), IntToHex(Dst[i], 4));
+  // Under csMinAvxSize: the scalar method, same answers.
+  for i := 0 to 4 do Dst[i] := $DEAD;
+  TNNetVolume.EncodeBF16(TNeuralHalfArrPtr(@Dst[0]),
+    TNeuralFloatArrPtr(@Vals[0]), 5);
+  for i := 0 to 4 do
+    AssertEquals('short-run bfloat16 ' + IntToStr(i),
+      IntToHex(Bits[i], 4), IntToHex(Dst[i], 4));
+end;
+
+// A NaN must stay a NaN. Rounding alone would carry $7F800001 up to $7F80,
+// which DecodeBF16 reads back as an Inf, so both paths force the quiet bit
+// instead. Nothing here may trap either: the AVX2 kernel is integer-only, so
+// unlike EncodeF16 it runs with FPC's default MXCSR untouched.
+// Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestEncodeBF16SpecialValues;
+const
+  N = 20;
+var
+  Vals: array[0..19] of TNeuralFloat;
+  Dst: array of Word;
+  SrcBits: Cardinal;
+  i: integer;
+begin
+  for i := 0 to N - 1 do Vals[i] := 1.0;
+  SrcBits := $7F800000; Vals[0] := PSingle(@SrcBits)^;   // +Inf
+  SrcBits := $FF800000; Vals[1] := PSingle(@SrcBits)^;   // -Inf
+  SrcBits := $7FC00000; Vals[2] := PSingle(@SrcBits)^;   // quiet NaN
+  SrcBits := $7F800001; Vals[3] := PSingle(@SrcBits)^;   // signalling NaN
+  SrcBits := $FFABCDEF; Vals[4] := PSingle(@SrcBits)^;   // NaN with a payload
+  Vals[5] := -0.0;
+  Vals[6] := 1e-45;                                      // subnormal single
+  Vals[7] := 3.4028235e38;                               // largest finite single
+  SetLength(Dst, N);
+  for i := 0 to N - 1 do Dst[i] := $DEAD;
+  TNNetVolume.EncodeBF16(TNeuralHalfArrPtr(@Dst[0]),
+    TNeuralFloatArrPtr(@Vals[0]), N);
+  AssertEquals('+Inf', IntToHex($7F80, 4), IntToHex(Dst[0], 4));
+  AssertEquals('-Inf', IntToHex($FF80, 4), IntToHex(Dst[1], 4));
+  for i := 2 to 4 do
+    AssertTrue('slot ' + IntToStr(i) + ' is a NaN bfloat16',
+      ((Dst[i] and $7F80) = $7F80) and ((Dst[i] and $007F) <> 0));
+  AssertEquals('-0.0', IntToHex($8000, 4), IntToHex(Dst[5], 4));
+  AssertEquals('subnormal single', IntToHex($0000, 4), IntToHex(Dst[6], 4));
+  AssertEquals('largest single', IntToHex($7F80, 4), IntToHex(Dst[7], 4));
+  for i := 8 to N - 1 do
+    AssertEquals('filler ' + IntToStr(i), IntToHex($3F80, 4), IntToHex(Dst[i], 4));
+end;
+
+// The vectorized run and the scalar run must agree bit-for-bit, over the same
+// lengths TestEncodeF16MatchesScalar uses: under 32 exercises only the
+// 8-at-a-time loop, a multiple of 32 only the unrolled body, and the rest a
+// body-plus-remainder-plus-tail combination. The values sweep nine decades in
+// both signs. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestEncodeBF16MatchesScalar;
+const
+  cLengths: array[0..12] of integer =
+    (1, 7, 8, 16, 31, 32, 33, 39, 40, 47, 128, 1000, 1024);
+  N = 1024;
+var
+  Vals: array of TNeuralFloat;
+  Bulk, OneByOne: array of Word;
+  i, L, Len, Mismatches: integer;
+begin
+  SetLength(Vals, N);
+  SetLength(Bulk, N + 1);   // one guard slot past the longest run
+  SetLength(OneByOne, N);
+  for i := 0 to N - 1 do
+    Vals[i] := (i - 512) * 0.0011 * Power(10, (i mod 19) - 9);
+  for i := 0 to N - 1 do
+    TNNetVolume.EncodeBF16(TNeuralHalfArrPtr(@OneByOne[i]),
+      TNeuralFloatArrPtr(@Vals[i]), 1);
+  for L := 0 to High(cLengths) do
+  begin
+    Len := cLengths[L];
+    for i := 0 to N do Bulk[i] := $DEAD;
+    TNNetVolume.EncodeBF16(TNeuralHalfArrPtr(@Bulk[0]),
+      TNeuralFloatArrPtr(@Vals[0]), Len);
+    Mismatches := 0;
+    for i := 0 to Len - 1 do
+      if Bulk[i] <> OneByOne[i] then Inc(Mismatches);
+    AssertEquals('bulk vs scalar bfloat16 mismatches at N=' + IntToStr(Len),
+      0, Mismatches);
+    AssertEquals('write past N=' + IntToStr(Len),
+      IntToHex($DEAD, 4), IntToHex(Bulk[Len], 4));
+  end;
 end;
 
 // Straightforward O(pSize*pSize) box sum: the definition the summed-area-table

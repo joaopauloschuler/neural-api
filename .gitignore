@@ -20,6 +20,7 @@ tests/RunTestsAVX
 tests/RunTestsAVX2
 tests/RunTestsCL
 tests/RunTestsCLAVX2
+tests/RunTestsNoF16C
 examples/SDPAOpenCLParity/SDPAOpenCLParity
 # Runtime copies of neural/neural.cl, placed next to an example's binary.
 examples/*/neural.cl

@@ -73,12 +73,18 @@ rather than acted on.
 
 ## Bugs
 
-- [ ] `TestSetTrainableKeepsOutputs` fails ONLY on `-dAVX2` builds (~1e-7 logit
+- [x] `TestSetTrainableKeepsOutputs` fails ONLY on `-dAVX2` builds (~1e-7 logit
       drift) — pre-existing, unrelated to audio/Mimi (confirmed by `git stash`
       during the RunMimiConv AVX work, commit 30c2342). The scalar build passes.
       Likely an AVX-vs-scalar reassociation crossing the test's exact-equality
       tolerance; either loosen that one assertion to a small epsilon or pin the
       reassociation. Whole suite is otherwise 0/0 on both builds.
+      FIXED (commit b04218db): the two forwards did not use the same kernel.
+      SetTrainable's pLowMemory defaults to True, which drops the concatenated-
+      weight caches and computes per-neuron - a different accumulation order from
+      the interleaved/pointwise kernels (5.6e-7 relative on the conv diamond,
+      1.3e-6 on tiny GPT-2). The test now compares the low-memory build at 1e-4
+      and pins pLowMemory=False for the exact-equality half. Both builds green.
 - [X] BUG (FIXED): `MRoPEOpenCLIncrementalCacheParity` (TestNeuralNumerical.pas, proc at
       ~line 63088) fails NONDETERMINISTICALLY — `max|diff|` swings between
       `0.000000000` (pass) and garbage like `1.86e34` (fail, asserted `< 1e-6`).
@@ -195,7 +201,13 @@ rather than acted on.
         gpt2/neox, MoE families) once each has an offline parity oracle.
 - [ ] ONNX import
 - [ ] Gemma 4 import
-- [ ] Qwen 3.5 import
+- [x] Qwen 3.5 import
+      DONE (commit bfe209ed): BuildQwen35FromSafeTensors[Ex] /
+      BuildQwen35MoeFromSafeTensors[Ex] import model_type qwen3_5 / qwen3_5_moe
+      (the Qwen3.5/3.6 hybrid GatedDeltaNet + MoE trunk). neuralchat.pas renders
+      the family's chat template as cfQwen3_5, and Qwen3.8 as cfQwen3_8 with the
+      reasoning-effort spans; Qwen3.6-27B and Qwen3.8-27B are user-tested in
+      ChatTerminal.
 - [ ] MiniCPM importer follow-ups (`BuildMiniCPMFromSafeTensors[Ex]` LANDED,
       model_type `minicpm`; OpenBMB μP-style scale_emb / per-sublayer
       scale_depth / dim_model_base logits folds on the core Llama path +
@@ -765,7 +777,7 @@ rather than acted on.
       tolerance on a fixed fixture. Distinct from the int8 work (this is a
       GPU compute path, not CPU storage) and from FP16 weight storage (this
       is the missing compute half).
-- [ ] Keep activations resident on the OpenCL device across consecutive offloaded
+- [x] Keep activations resident on the OpenCL device across consecutive offloaded
       matmul/SDPA layers (eliminate the per-layer host round-trip during decode).
       Today each offloaded layer copies its input host->device, runs the kernel, and
       reads the result device->host (`FInputPrepared` in, `FOutput` out); the next
@@ -786,6 +798,15 @@ rather than acted on.
       so removing the redundant copies should lift tokens/sec materially. Guard
       everything behind the existing `FShouldOpenCL`, keep the host round-trip as the
       fallback, and pin parity with the SDPAOpenCLParity-style exact-vs-CPU test.
+      DONE: TNNetLayer carries FOutputOnOpenCL / FOutputOnRAM plus
+      OpenCLOutputBuffer(), so a producer offers its result in OpenCL memory and
+      the consumer binds that buffer instead of downloading it. Wired through
+      TNNetInput, the convolution/fullconnect GEMM family (whatever the size
+      verdict), TNNetRMSNorm, TNNetTokenRMSNorm, TNNetRotaryEmbedding, the
+      activation layers, TNNetPointwiseSoftMax, TNNetCellMulByCell,
+      TNNetChannelMulByLayer, TNNetEmbedding (int8 device gather),
+      TNNetDepthwiseConv1D, TNNetGatedDeltaNet and TNNetFusedSDPA (FP32 and int8
+      resident KV cache). ForceOutputOnRAM stays the fallback for a host reader.
 - [ ] Tokenizer follow-ups for neuralhftokenizer.pas:
       (b) DONE — raw SentencePiece .model protobuf path landed
       (LoadSentencePieceModel; hand-decoded ModelProto wire format, no
@@ -971,7 +992,7 @@ rather than acted on.
       hook; the Trainer-callbacks task above is the natural home. Test:
       weights survive a width hop bit-for-bit, loss continuous across the
       hop.
-- [ ] Streaming/lazy tensor materialization with load-time quantization:
+- [x] Streaming/lazy tensor materialization with load-time quantization:
       the import path materializes full FP32 tensor buffers before copying
       into layers, so PEAK import memory, not steady-state, can be the gate
       on commodity RAM (the TinyLlama ~4.4GB case). Read one tensor at a
@@ -979,6 +1000,10 @@ rather than acted on.
       destination layer — or straight into the landed int8 storage —
       keeping only one tensor-sized scratch buffer. Assert peak RSS during import
       stays within tensor-size + model-size on the parity fixture.
+      DONE: TNNetSafeTensorsReader.CanStreamTensorRows plus the row-streaming
+      loaders in neuralpretrained.pas read one tensor row at a time straight into
+      the layer's int8 storage, so no FP32 copy of the checkpoint is ever
+      allocated. Qwen2.5-7B peak import RSS dropped from 2431 MB to 1018 MB.
 - [ ] NumPy .npz follow-up (neural/neuralnumpy.pas reader/writer landed; WRITER
       is STORED-only): DEFLATE-compressed .npz WRITER (savez_compressed) +
       zip64 / >4GB archive support (reader currently rejects zip64).
@@ -1011,15 +1036,24 @@ rather than acted on.
       TokenShift/WKV/SelectiveSSM/DiagonalSSM LANDED, commits 62165c1/cc1bfcb):
   - [ ] TNNetCrossWKV incremental path (two-source + asymmetric modes + receptance
         gate — non-trivial, deferred).
-  - [ ] Wire the net-wide recurrent driver INTO TNNetStreamingDecoder so GenerateTokens*
+  - [x] Wire the net-wide recurrent driver INTO TNNetStreamingDecoder so GenerateTokens*
         drives TokenShift/WKV/SSM uniformly alongside the SDPA KV-cache (decoder
         currently only collects SDPA + TNNetDiagonalSSM, not TokenShift/WKV/SelectiveSSM).
-- [ ] Mamba decode follow-up (O(1) incremental TNNetSelectiveSSM state-carry decode
+        DONE: TNNetStreamingDecoder.IsRecurrentStateLayer collects every
+        TNNetRecurrentDecodeBase descendant plus TNNetDiagonalSSM and
+        TNNetTokenShift, and drives Begin/End/Reset/Capture/RestoreState on them
+        alongside the SDPA KV-cache.
+- [x] Mamba decode follow-up (O(1) incremental TNNetSelectiveSSM state-carry decode
       LANDED, commit 27ba256):
-  - [ ] Full Mamba-BLOCK token-by-token decode: causal DepthwiseConv1D must carry
+      DONE (see the sub-item).
+  - [x] Full Mamba-BLOCK token-by-token decode: causal DepthwiseConv1D must carry
         its (kernel-1)-token ring buffer + in/out projections driven one token at a
         time, then wire into TNNetStreamingDecoder (mirrors the RWKV TokenShift
         block-integration follow-up).
+        DONE: TNNetDepthwiseConv1D is a TNNetRecurrentDecodeBase descendant that
+        carries its (kernel-1)-token history ring buffer across steps, and
+        TNNetStreamingDecoder drives it, so a whole Mamba block decodes one token
+        at a time. Verified end-to-end against HF on a real mamba-130m checkpoint.
 - [ ] Refactor examples/WhisperTranscribe to USE the landed cached forced-prefix
       seq2seq decode helper (`DecodeSeq2SeqForcedPrefixCached`, neural/neuraldecode.pas).
       NOT a clean drop-in today: the word-timestamp cross-attention alignment step
@@ -1103,7 +1137,7 @@ rather than acted on.
       EnCodec round-trip) staying `< 1e-4`, and re-profile decode wall-clock
       before/after.
 
-- [ ] Single-sample `TNNetFullConnect` forward threading follow-ups (opt-in
+- [x] Single-sample `TNNetFullConnect` forward threading follow-ups (opt-in
       `EnableFullConnectThreading` multi-core `ComputeCPU` v1 LANDED for
       FullConnect/FullConnectLinear/FullConnectReLU — off by default, bit-identical
       to serial, work-thresholded via `SetFullConnectThreadingMinWork`):
@@ -1114,6 +1148,12 @@ rather than acted on.
       imported decoder to tune the default threshold; (c) the int8-quantized
       `ComputeQuantizedInt8CPU` and `TNNetFullConnectSigmoid`/other activation
       siblings are still serial.
+      DONE: EnableFullConnectThreading is gone - the inference scheduler chunks
+      any layer that overrides ComputeRange, and TNNetFullConnect,
+      TNNetFullConnectLinear and TNNetFullConnectReLU all do, int8 included
+      (ComputeQuantizedInt8Range is the body of both the serial and the chunked
+      path). ChatTerminal computes parallel by default (--serial opts out);
+      measured ~2x fast-memory / ~1.3x low-memory on real Qwen decode.
 - [ ] Parler-TTS importer end-to-end follow-up (`BuildParlerTTSFromSafeTensors[Ex]`
       + `TParlerConfig` + `TParlerTTSModel` holder + `examples/ParlerTTS` LANDED,
       model_type `parler_tts`; (By)T5 description encoder cross-attention + shared
@@ -1722,6 +1762,280 @@ rather than acted on.
       single native binary, reusing the diffusion + VAE + Qwen-VL infrastructure already
       in the repo.
 
+## OpenCL forward coverage — layers still on the host
+
+Forward pass only; a device backward is a separate project (nothing in the tree
+has one today). 52 of the 487 `TNNet*` classes in `neuralnetwork.pas` declare a
+`ComputeOpenCL`, and `cai_activation` covers 24 elementwise opcodes on top of
+that. `csActivationOpenCLMinSize` is 64 MB, so a small layer reaches the device
+only when its source is ALREADY resident — which is why the ranking below is by
+"does this layer evict a resident chain to RAM", not by FLOPs.
+
+Every item: guard behind the existing `WillOpenCL()`/`FShouldOpenCL` verdict,
+bind the resident source instead of downloading it (`ShouldBindPrevOutputOnOpenCL`)
+and leave the result in OpenCL memory, keep the host path as the fallback, and
+pin an exact-vs-CPU parity test that skips cleanly with no device. PoCL on the
+dev box proves parity; throughput numbers have to come from the GPU box.
+
+### Residency breakers on the decode path (small kernels, largest payoff)
+
+- [ ] `TNNetMoEExpertBankGateUp` single-launch device forward. The clearest
+      single gap: `TNNetMoEExpertBankDown` got one (commit d105047c) but its
+      sibling did not, so every MoE block downloads the expert activations
+      between the two banks. Mirror the down-bank kernel (one launch over the
+      selected experts, resident int8 or FP32 weight slab) so gate/up -> down
+      stays device-side end to end. Hits Qwen3.5-MoE, Nemotron-H-MoE, Mixtral,
+      OLMoE and GPT-OSS.
+- [ ] Reshape/gather glue: `TNNetReshape`, `TNNetCrop`, `TNNetPadXY`,
+      `TNNetTransposeXD`, `TNNetDepthToSpace`, `TNNetGatherTokens`,
+      `TNNetConcat`. None has a device path, and several sit between attention
+      and FFN in the importers, so each one evicts the chain. For most of these
+      a kernel is the wrong answer: the bytes do not change, only the shape, so
+      the layer should re-label the resident buffer (a view) rather than copy
+      it. Scope `TNNetReshape` FIRST as the test case for that view mechanism —
+      whether `OpenCLOutputBuffer()` can hand back the source's buffer with a
+      different declared shape — then apply the outcome to the rest.
+      `TNNetCrop`/`TNNetPadXY`/`TNNetTransposeXD` DO move bytes and need a real
+      copy/gather kernel; keep the two halves separate.
+- [ ] `TNNetReGLU` (and BitNet's `TNNetReGLUSquared`) device forward.
+      `TNNetSwiGLU` and `TNNetGEGLU` inherit `TNNetGLUGateBase.ComputeOpenCL`;
+      `TNNetReGLU` descends straight from `TNNetLayer` and misses it. Check
+      whether re-parenting onto `TNNetGLUGateBase` (with the ReLU gate as the
+      activation opcode) is the whole fix before writing a kernel.
+- [ ] Per-channel affine glue: `TNNetChannelBias`, `TNNetChannelMul`,
+      `TNNetFiLM`, `TNNetMulByConstant`, `TNNetAddConstant`, `TNNetAvgChannel`.
+      All are one scale/shift per channel over a resident volume.
+      `TNNetChannelMulByLayer` and `TNNetCellMulByCell` already show the
+      two-source resident pattern, and `TNNetFiLM` is that same shape, so it
+      follows them directly; the constant-parameter ones fit the
+      `cai_activation` ParamA/ParamB convention.
+- [ ] `TNNetTopKGate` / `TNNetBiasBalancedTopKGate` device forward. Tiny work
+      per token, but the router sits between two resident MoE banks, so running
+      it on the host costs two transfers per token. Only worth landing together
+      with the gate/up bank item above.
+
+### Real device-side work still running on the host
+
+- [ ] `TNNetSelectiveSSM` device forward. The Mamba-1/2, Jamba, Nemotron-H and
+      falcon_mamba trunks are majority-SSM and run entirely on the CPU.
+      `TNNetGatedDeltaNet` already proved the recipe (commit 63047d0f: one
+      work-group per head, the whole scan in OpenCL memory, state carried on the
+      device across decode steps); `TNNetSelectiveSSM` is the same shape. Cover
+      both the prefill scan and the `TNNetRecurrentDecodeBase` one-token path.
+- [ ] `TNNetWKV`, `TNNetTokenShift` and `TNNetDiagonalSSM` device forward — the
+      RWKV trunk, same per-head-recurrence recipe as `TNNetSelectiveSSM`. Lower
+      priority only because fewer tested checkpoints use it.
+- [ ] Attention subclasses that override `Compute` and so lose
+      `TNNetScaledDotProductAttention`'s device path:
+      `TNNetGptOssSinkAttention` (GPT-OSS is a live importer, and the sink is
+      `TNNetFusedSDPA` plus one per-head scalar, so it should reuse the fused
+      decode kernels), `TNNetDifferentialAttention` and `TNNetWindowAttention`
+      (Swin). Take the sink first.
+- [ ] `TNNetDeltaNet`, `TNNetGatedLinearAttention`, `TNNetRetention` and the
+      CAUSAL half of `TNNetLinearAttention`. COUPLED, not independent: each is a
+      strict per-token scan today, so there is no GEMM-shaped kernel to offload
+      until the chunked/parallel forward tasks in "Layer follow-ups that fix real
+      limitations" land. Sequence them after those, or fold the device path into
+      each chunked rewrite.
+- [ ] `TNNetTokenAndPositionalEmbedding` device gather. `TNNetEmbedding` got the
+      int8 device gather (`cai_embedding_gather_int8`) and leaves its rows
+      resident; its sibling still gathers on the host. Reuse the same entry
+      point, adding the positional table as a second resident source.
+
+
+### Vision and audio layers with no device forward
+
+Companion to the two groups above, same contract (forward only, bind the
+resident source, leave the result resident, host fallback, exact-vs-CPU parity
+test). The ranking differs though: a vision or audio forward runs over large
+tensors, so here the FLOPs matter alongside the transfers, and a kernel can pay
+for itself even when it sits between two host layers.
+
+Derived by walking the class graph: a layer counts as covered if it declares
+`ComputeOpenCL`, sets an `FActivationOpcode`, dispatches to OpenCL inside its
+own `Compute`, or inherits one of those without overriding `Compute`. 310 of
+the 487 classes fail that test; the ones below are the subset the vision and
+audio builders actually instantiate. Note the third case: a class that
+overrides `Compute` with no device branch silently loses its parent's kernel,
+which is how `TNNetMaxPoolPortable` lost `TNNetMaxPool`'s.
+
+Training-only layers (`TNNetDropout`, `TNNetDropPath`) are out of scope.
+
+- [ ] `TNNetConvolution3D` (VideoMAE, 3-D VAEs) and `TNNetCausalConv1D` (the
+      CogVideoX VAE decoder) device forward. Both are the existing conv
+      contraction with one extra axis, so the question to answer first is
+      whether `cai_dot_product`'s im2col can be fed a 3-D receptive field
+      instead of a new kernel.
+- [ ] `TNNetModulatedConv2D` device forward — the core operator of
+      `BuildStyleGAN2Generator`, and the layer the whole generator stack waits
+      on. The per-sample weight modulation/demodulation folds into the column
+      gather, so this is a conv kernel with a scaled weight slab, not a new
+      contraction.
+- [ ] The decoder upsample inverses: `TNNetDeMaxPool`, `TNNetDeAvgPool`,
+      `TNNetUpsample`, plus `TNNetMaxPoolPortable`. `TNNetMaxPool` and
+      `TNNetAvgPool` have kernels but their inverses do not, so UNet, SD UNet,
+      the VAE decoder, RRDBNet, StyleGAN2, Mask R-CNN and SuperResolution all
+      drop to the host on every upsample step. `TNNetMaxPoolPortable` is a
+      different fault - it overrides `Compute` and loses the pooling kernel it
+      inherits - and it sits in the ResNet, Inception-V3 and DETR stems.
+- [ ] Vision attention subclasses that override `Compute` and so lose
+      `TNNetScaledDotProductAttention`'s device path:
+      `TNNetSAMVisionAttention` (SAM), `TNNetSwinV2WindowAttention`,
+      `TNNetWindowAttention` (Swin / MaxViT / BEiT / SwinIR / the CLAP audio
+      tower) and `TNNetT5RelPosBiasAttention`. `TNNetDotProducts`, the raw
+      contraction behind the CAI self-attention builders, has the same problem.
+      `TNNetSinkAttention` and `TNNetDifferentialAttention` are named in the
+      decode-path group above; landing them there covers the vision builders
+      that also use them.
+- [ ] The long tail of one-model vision layers: `TNNetRoIAlign` (Mask R-CNN),
+      `TNNetConvGRUCell` (RAFT), `TNNetSpectralConv2D` (FNO - coordinate with
+      the open FFT denormal-trap item, since the device path would move that
+      math off the host FPU entirely) and `TNNetLocalResponseNormDepth`
+      (AlexNet, minor). Rank these by which importer gets used, not by size.
+- [ ] Extend the reshape/gather glue item above to its vision members. Pure
+      re-label, so they want the view mechanism `TNNetReshape` is scoping:
+      `TNNetDepthToSpace`, `TNNetSpaceToDepth`, `TNNetInterleaveChannels` and
+      the MobileViT trio (`TNNetMobileViTFold`, `TNNetMobileViTUnfold`,
+      `TNNetMobileViTPatchSegments`, which are three reshapes wearing a
+      model-specific name). Real byte movement, so a kernel: `TNNetTransposeYD`
+      beside the already-listed `TNNetTransposeXD`, `TNNetCrop` and
+      `TNNetPadXY`.
+- [ ] Extend the per-channel affine item above to the conv-stack members:
+      `TNNetCellBias`, `TNNetReZero`, `TNNetPReLUChannel`, `TNNetGRN` and
+      `TNNetMovingStdNormalization` (ConvNeXt, RIFE, StyleGAN2, SAM, the moving
+      -norm blocks). Same one-scale-and-shift-per-channel shape as the
+      `TNNetChannelBias`/`TNNetChannelMul`/`TNNetFiLM` group.
+- [ ] Activations with no `cai_activation` opcode, all reachable from the
+      vision and audio towers: `TNNetErf`, `TNNetGEGLU`, `TNNetGEGLUErf`,
+      `TNNetGLU` (Conformer) and `TNNetSwishLearnable`. `TNNetReGLU` is listed
+      above. Each is an opcode plus a `neural.cl` switch case, except the
+      gated ones, which need the `TNNetGLUGateBase` split-and-multiply shape.
+      These are the vision and audio members of the full opcode gap; the
+      activation subsection below carries the whole list and the two cautions
+      that come with it.
+- [ ] Diffusion-step conditioning recomputed on every denoise step:
+      `TNNetSinusoidalTimeEmbedding`, `TNNetLearnedPositionalEmbedding` and
+      `TNNetSoftPrompt`. Individually small; they matter because a sampler runs
+      them 20-50 times per image, each time bouncing the conditioning vector
+      through the host.
+- [ ] `TNNetSincConv1D` and `TNNetTDNNConv1D` device forward — the pyannote
+      segmentation frontend and the ECAPA-TDNN trunk. Both are convolutions
+      whose kernel is generated (sinc band-pass) or dilated, so the existing
+      conv offload applies once the kernel slab is materialized; the closest
+      thing to a free win on the audio side.
+- [ ] `TNNetAttentiveStatsPooling` (ECAPA-TDNN), `TNNetGLU` (Conformer, also
+      listed with the activations) and `TNNetFlipX`. `TNNetFlipX` is the one
+      host hop inside an otherwise device-capable bidirectional stack -
+      `TNNetLSTMCell` and `TNNetGRUCell` both have kernels - and reversing a
+      sequence is a copy kernel or, better, an index flip in the consumer.
+
+The channel-major audio holders (`TEnCodecModel`, `TNNetHiFiGAN`, `TNNetVits`,
+`TNNetMimi`, `TNNetDAC`, `TNNetDemucs`, `TNNetKokoro`) are NOT TNNet layers and
+are deliberately absent from this list: they run conv1d directly on
+channel-major arrays through `RunEnCodecConv` / `RunHiFiGANConv` /
+`RunMimiConv` / `RunDACConv`. EnCodec and HiFiGAN already have the
+`EnableConvOpenCL` GEMM route and Demucs and Kokoro inherit it by calling them;
+Mimi and DAC are the remaining gap and are already tracked in the audio section
+above (blocked on a Double-precision shared dot-product kernel).
+
+
+### Activation coverage — the fused GEMM tail and the standalone kernel
+
+Two separate mechanisms, easy to confuse. (1) The FUSED tail inside the matmul
+kernels: `cai_dot_product` applies `ActFN` in-register after the bias add, and
+it implements exactly three opcodes — 1=ReLU, 2=Sigmoid, 3=Tanh — with the same
+three copied into `cai_dot_product_int8` and into `cai_fused_act` (the split-K
+reduce helper). `TNNetLayer.IsActivationFunctionInOpenCL` mirrors that set on
+the host and returns false for everything else. (2) The STANDALONE
+`cai_activation` kernel, which has 24 opcodes and 25 layer classes wired to it
+through `ComputeActivationOnOpenCL()`.
+
+Both are forward-only by construction: neither produces `FOutputRaw` or the
+derivative mask, so `IsActivationFunctionInOpenCL` requires `not FIsTrainable`
+and the standalone path requires it too. `csActivationOpenCLMinSize` (64 MB)
+keeps the standalone kernel off the device unless the source is already
+resident or `ForceOpenCL` is set — deliberate, since a 1-flop-per-word kernel
+cannot pay for its own transfer.
+
+- [x] Widen the fused GEMM tail beyond ReLU/Sigmoid/Tanh, starting with
+      Swish/SiLU and GELU. The math already exists as `cai_activation` opcodes
+      4 and 5, parity-tested, so this is mostly moving code: extend the tail's
+      switch, widen `IsActivationFunctionInOpenCL` to match, and dedup the
+      THREE copies of the tail (`cai_dot_product` inline,
+      `cai_dot_product_int8` inline, `cai_fused_act`) through the helper that
+      already exists. Why it matters beyond one saved kernel launch: when the
+      verdict is false, `TNNetConvolution.ComputeOpenCL` does not merely skip
+      the fusion — it sets `FOutputOnOpenCL := false`, downloads `FOutputRaw`
+      and runs the bias add and the activation sweep on the host, so the whole
+      residency chain breaks at the GEMM. Today only
+      `TNNetConvolutionSwish`, `TNNetConvolutionHardSwish` (the CAI CIFAR
+      examples) and `TNNetFullConnectDiff` carry a non-fusable fused
+      activation, since the importers build Linear convolutions with separate
+      activation layers — so measure before assuming a win, and treat the
+      residency break as the reason rather than the launch count.
+      DONE: `cai_fused_act` moved to the top of `neural.cl` and gained opcodes
+      4, 5 and 7, and it is now the ONLY copy of that math — `cai_dot_product`,
+      `cai_dot_product_int8`, the split-K reduce and `cai_activation`'s own
+      cases for those opcodes all call it (four copies collapsed into one).
+      `IsActivationFunctionInOpenCL` accepts `@Swish` and `@HardSwish`, so
+      those convolutions and FullConnects now fuse and stay resident.
+      Device-vs-CPU parity cases added to all three harnesses — `TestConvDeviceIm2ColOpenCLParity` (FP32,
+      9.5e-7), `TestInt8QuantizedOpenCLParity` (int8 GEMM, 3.9e-7) and
+      `TestInt8SplitKOpenCLParity` (split-K, 2.0e-6) — and the conv harness now
+      asserts `OutputBindableOnOpenCL` so a silent fallback to the host can no
+      longer pass as parity. Suite 2837/0/0 on both the scalar and the
+      `-dOpenCL` build. Two notes: the tail's ReLU is now `(v > 0) ? v : 0`
+      like `cai_activation`, which differs from the old `if (v < 0) v = 0` only
+      in returning +0.0f for a -0.0f input; and GELU rides in the kernel but no
+      host layer can request it yet — `TNNetGELU` is a standalone layer and
+      there is no `@GELU` activation-function pointer, so the complete set a
+      layer can carry is Identity/ReLU/Sigmoid/Tanh/Swish/HardSwish/DiffAct.
+  - [x] `@HardSwish` (opcode 7) landed the same way in a follow-up, so
+        `TNNetConvolutionHardSwish` fuses and stays resident too. Opcodes 6
+        (GELUErf) and 8 (HardSigmoid) followed, so `cai_fused_act` now holds
+        EVERY parameterless opcode (1-8) and `cai_activation` keeps only the
+        parameterized cases (9, 10, 15, 18-21, 24). The remaining limit is on
+        the host, not in the kernel: GELU, GELUErf and HardSigmoid exist only as
+        standalone layers with no activation-function pointer, so no layer can
+        request them fused, and `@DiffAct` is the one pointer with no opcode.
+        Fused parity cases for Swish and HardSwish (bias and bias-suppressed)
+        live in `TestConvActivationFusionOpenCLParity` and
+        `TestFullConnectActivationFusionOpenCLParity`;
+        `TestActivationOpenCLParity` already sweeps all 30 standalone variants,
+        which covers the delegation for 6 and 8.
+- [ ] The 34 elementwise activations with no `cai_activation` opcode, all
+      `TNNetReLUBase` descendants: `TNNetErf`, `TNNetExp`, `TNNetLog`,
+      `TNNetSqrt`, `TNNetSin`, `TNNetCos`, `TNNetArcSinh`, `TNNetSinhAct`,
+      `TNNetReciprocal`, `TNNetPower`, `TNNetMish`, `TNNetSerf`, `TNNetSmish`,
+      `TNNetPhish`, `TNNetSnake`, `TNNetSinc`, `TNNetLisht`,
+      `TNNetLogCoshActivation`, `TNNetLogSigmoid`, `TNNetTanhExp`,
+      `TNNetTanhShrink`, `TNNetLeCunTanh`, `TNNetPenalizedTanh`,
+      `TNNetSoftPlus`, `TNNetSoftPlusBeta`, `TNNetSoftExponential`,
+      `TNNetGaussianActivation`, `TNNetISRU`, `TNNetISRLU`, `TNNetCELU`,
+      `TNNetESwish`, `TNNetSwish6`, `TNNetReLUSqrt`, `TNNetRReLU`. Each is one
+      `case` in the `cai_activation` switch plus one constant and the
+      `ComputeActivationOnOpenCL()` call at the top of `Compute`. Take
+      `TNNetErf` first — it is on the ModernBERT, CLIP, Whisper and BART paths.
+      Two cautions: `TNNetRReLU` draws a random slope, so its device form must
+      reproduce the host draw or stay inference-frozen; and `TNNetSoftSign`
+      and `TNNetESwish` raise hardware FP exceptions at far-extreme inputs on
+      the host (see the FP-exception item in the test section), so pick the
+      clamping policy there BEFORE pinning device parity. The gated
+      activations (`TNNetGEGLU`, `TNNetGLU`, `TNNetReGLU`, `TNNetGEGLUErf`)
+      are a different shape and stay with the `TNNetGLUGateBase` items above.
+- [ ] The 11 per-channel LEARNABLE activations, which need a kernel shape the
+      current one does not have — a parameter VECTOR indexed by channel rather
+      than the scalar `FParamA`/`FParamB`/`FParamC`: `TNNetPReLU`,
+      `TNNetPReLUChannel`, `TNNetAPL`, `TNNetAconC`, `TNNetMetaAconC`,
+      `TNNetSReLU`, `TNNetSplineActivation`, `TNNetSwishLearnable`,
+      `TNNetMishLearnable`, `TNNetSoftPlusBetaLearnable`,
+      `TNNetPolynomialActivation`. All descend from
+      `TNNetChannelTransformBase`, so one kernel taking a `__global const
+      float*` parameter table plus an opcode covers the family; the per-channel
+      broadcast is the same indexing `cai_group_norm`'s affine tail already
+      does. Forward only — the learnable parameters' gradients stay on the host.
+
+
 ## Layer follow-ups that fix real limitations
 
 - [~] Bidirectional + multi-layer stacking for `TNNetLSTMCell` / `TNNetGRUCell`
@@ -2040,13 +2354,16 @@ SoftPlus/Gaussian/SoftExponential forwards via `AVXExp` — note `AVXExp`'s scal
 remainder tail has NO internal clamp so extreme inputs must be pre-clamped to
 [-88,88] before the call, commit 3e5e649d. Open follow-ups surfaced by this batch:)
 
-- [ ] Keep the softmax-head activation resident on the OpenCL device across the
+- [x] Keep the softmax-head activation resident on the OpenCL device across the
       SDPA score-matrix producer -> `cai_softmax` -> consumer chain. The new
       `cai_softmax` offload (e8042aa0) still uploads/downloads the volume per call;
       when the producer is already device-resident this is a wasted round-trip.
       Tie into the existing "keep activations resident across consecutive offloaded
       layers" follow-up in the vision/generative section so attention blocks chain
       device-side. Forward-only, parity-tested, skip-clean when no device.
+      DONE: TNNetPointwiseSoftMax binds a resident source and leaves its result in
+      OpenCL memory, so the SDPA producer -> cai_softmax -> consumer chain stays
+      device-side; TNNetSoftMax shares the same helper.
 
 ## Lucky-day batch 2026-06-28f (follow-ups surfaced by 28e landings)
 

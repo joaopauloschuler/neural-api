@@ -2061,7 +2061,10 @@ begin
   if (Result <> CL_SUCCESS) then
   begin
     if (Result = CL_INVALID_WORK_GROUP_SIZE)
-    then FErrorProc('ERROR: Invalid work group size.')
+    then FErrorProc('ERROR: Invalid work group size. Global (' +
+      IntToStr(Int64(d1size)) + ', ' + IntToStr(Int64(d2size)) +
+      ') group (' + IntToStr(Int64(d1groupsize)) + ', ' +
+      IntToStr(Int64(d2groupsize)) + ').')
     else FErrorProc('ERROR: Failed to execute kernel. Error:' + IntToStr(Result));
   end;
 end;
@@ -2096,18 +2099,22 @@ begin
   work_dim := 3;
   dim_sizes[0] := d1size;
   dim_sizes[1] := d2size;
-  dim_sizes[2] := d2size;
+  dim_sizes[2] := d3size;
 
   group_sizes[0] := d1groupsize;
   group_sizes[1] := d2groupsize;
-  group_sizes[2] := d2groupsize;
+  group_sizes[2] := d3groupsize;
 
   Result := clEnqueueNDRangeKernel(FCommands, pkernel, work_dim, nil, @dim_sizes[0], @group_sizes[0], 0, nil, nil);
 
   if (Result <> CL_SUCCESS) then
   begin
     if (Result = CL_INVALID_WORK_GROUP_SIZE)
-    then FErrorProc('ERROR: Invalid work group size.')
+    then FErrorProc('ERROR: Invalid work group size. Global (' +
+      IntToStr(Int64(d1size)) + ', ' + IntToStr(Int64(d2size)) + ', ' +
+      IntToStr(Int64(d3size)) + ') group (' + IntToStr(Int64(d1groupsize)) +
+      ', ' + IntToStr(Int64(d2groupsize)) + ', ' +
+      IntToStr(Int64(d3groupsize)) + ').')
     else FErrorProc('ERROR: Failed to execute kernel. Error:' + IntToStr(Result));
   end;
 end;
