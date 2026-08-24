@@ -66545,11 +66545,12 @@ end;
 // asserted, and the first matters more: TNNetConvolutionBase.FP16Active proves
 // the half kernels ran, because a silent fallback to the FP32 B operand would
 // pass a parity check trivially. Tolerance is half's, not the FP32 path's - the
-// B operand carries ~5e-4 relative error by construction. Coded by Claude (AI).
+// B operand carries ~5e-4 relative error by construction, and the split-K cases
+// add half-rounded slab partials on top. Coded by Claude (AI).
 procedure TTestNeuralNumerical.TestInt8ConvFP16OpenCLParity;
 {$IFDEF OpenCL}
-  procedure RunConvFP16(const aName: string; pFeatureSize, pPadding,
-    pStride: integer; UseReLU: boolean);
+  procedure RunConvFP16(const aName: string; pInputSize, pInputDepth,
+    pNeurons, pFeatureSize, pPadding, pStride: integer; UseReLU: boolean);
   var
     NN: TNNet;
     Input, OutCPU: TNNetVolume;
@@ -66566,13 +66567,13 @@ procedure TTestNeuralNumerical.TestInt8ConvFP16OpenCLParity;
     end;
     RandSeed := 20260706;
     NN := TNNet.Create();
-    Input := TNNetVolume.Create(8, 8, 3);
+    Input := TNNetVolume.Create(pInputSize, pInputSize, pInputDepth);
     OutCPU := TNNetVolume.Create();
     try
-      NN.AddLayer(TNNetInput.Create(8, 8, 3, 1));
+      NN.AddLayer(TNNetInput.Create(pInputSize, pInputSize, pInputDepth, 1));
       if UseReLU
-        then Conv := TNNetConvolutionReLU.Create(16, pFeatureSize, pPadding, pStride)
-        else Conv := TNNetConvolutionLinear.Create(16, pFeatureSize, pPadding, pStride);
+        then Conv := TNNetConvolutionReLU.Create(pNeurons, pFeatureSize, pPadding, pStride)
+        else Conv := TNNetConvolutionLinear.Create(pNeurons, pFeatureSize, pPadding, pStride);
       NN.AddLayer(Conv);
       for i := 0 to Input.Size - 1 do
         Input.Raw[i] := 0.011 * i - 1.05;
@@ -66617,10 +66618,18 @@ procedure TTestNeuralNumerical.TestInt8ConvFP16OpenCLParity;
     end;
   end;
 begin
-  RunConvFP16('3x3 pad1 s1 relu', 3, 1, 1, true);      // device im2col_h
-  RunConvFP16('3x3 pad0 s1 linear', 3, 0, 1, false);   // device im2col_h
-  RunConvFP16('5x5 pad2 s2 relu', 5, 2, 2, true);      // device im2col_h
-  RunConvFP16('1x1 pointwise linear', 1, 0, 1, false); // cai_f32_to_half
+  RunConvFP16('3x3 pad1 s1 relu', 8, 3, 16, 3, 1, 1, true);      // device im2col_h
+  RunConvFP16('3x3 pad0 s1 linear', 8, 3, 16, 3, 0, 1, false);   // device im2col_h
+  RunConvFP16('5x5 pad2 s2 relu', 8, 3, 16, 5, 2, 2, true);      // device im2col_h
+  RunConvFP16('1x1 pointwise linear', 8, 3, 16, 1, 0, 1, false); // cai_f32_to_half
+  // Split-K in FP16 (cai_dot_product_int8_splitk_h + its reduce twin). The
+  // cases above all have FSize <= 75, one slab, so they never reach it. Depth
+  // 64 over 3x3 makes FSize 576 - four slabs of 128 - while 16 neurons over a
+  // 4x4 output leave 256 work-items, below the thread target of any device
+  // including a 1-unit one. Both passes now carry half partials, so this is
+  // also the only case that reads FPartialBuffer as half.
+  RunConvFP16('splitk 3x3 d64 relu', 4, 64, 16, 3, 1, 1, true);
+  RunConvFP16('splitk 3x3 d64 linear', 4, 64, 16, 3, 1, 1, false);
 end;
 {$ELSE}
 begin

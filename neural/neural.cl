@@ -510,9 +510,11 @@ __kernel void cai_dot_product_int8_splitk
 // SPLIT-K PASS 1, HALF-ACTIVATION twin. Identical to
 // cai_dot_product_int8_splitk - same slab decomposition, same raw code sums,
 // same slab-major FPartialBuffer layout - except that B is read through
-// vload_half. FPartialBuffer stays FP32, so pass 2
-// (cai_dot_product_int8_splitk_reduce) never touches B and needs no half twin.
-// Coded by Claude (AI).
+// vload_half AND the slab sum is stored as half, which halves the partial
+// traffic pass 2 reads back. Accumulation stays float; half is the storage
+// format on both operands. The sums are RAW (no per-row scale), so their
+// magnitude is the slab length times the code-activation product - see
+// cai_dot_product_int8_splitk_reduce_h. Coded by Claude (AI).
 __kernel void cai_dot_product_int8_splitk_h
 (
   const int FNumAs,
@@ -521,7 +523,7 @@ __kernel void cai_dot_product_int8_splitk_h
   const int KSplits,
   __global const char* FInputBufferAs,
   __global const half* FInputBufferBs,
-  __global float* FPartialBuffer
+  __global half* FPartialBuffer
 )
 {
   const int a_id = get_global_id(0);
@@ -571,7 +573,8 @@ __kernel void cai_dot_product_int8_splitk_h
 
     // Slab-major layout, same as cai_dot_product_int8_splitk: both passes stay
     // coalesced over a_id.
-    FPartialBuffer[s * FNumAs * FNumBs + b_id * FNumAs + a_id] = PartialResult;
+    vstore_half(PartialResult, s * FNumAs * FNumBs + b_id * FNumAs + a_id,
+      FPartialBuffer);
   }
 } // end of kernel
 
@@ -608,6 +611,49 @@ __kernel void cai_dot_product_int8_splitk_reduce
 
     // Deferred per-row dequantization scale, then the (FP32, unscaled) bias -
     // same order as cai_dot_product_int8 and as the host fused path.
+    DotProductResult *= FScales[a_id];
+    if (UseBias != 0) DotProductResult += FBiasOutput[BasePos];
+
+    FResultBuffer[BasePos] = cai_fused_act(DotProductResult, ActFN);
+  }
+} // end of kernel
+
+// SPLIT-K PASS 2, HALF-PARTIAL twin. Identical to
+// cai_dot_product_int8_splitk_reduce - same slab-major read order, same
+// deferred scale/bias/activation - except that the partials
+// cai_dot_product_int8_splitk_h wrote are read through vload_half. The
+// accumulator, the scales, the bias and the result stay FP32.
+//
+// The partials are raw code sums, so a slab of length L carries about
+// sqrt(L)*127*|activation|: half's 65504 ceiling is the shape limit of this
+// kernel, not its rounding. Coded by Claude (AI).
+__kernel void cai_dot_product_int8_splitk_reduce_h
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int KSplits,
+  const int ActFN,
+  __global const half* FPartialBuffer,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FBiasOutput,
+  __global const float* FScales
+)
+{
+  const int a_id = get_global_id(0);
+  const int b_id = get_global_id(1);
+
+  if ( (a_id < FNumAs) && (b_id < FNumBs) )
+  {
+    const int RowStride = FNumAs * FNumBs;
+    const int BasePos = b_id * FNumAs + a_id;
+
+    float DotProductResult = 0;
+    for (int s = 0; s < KSplits; s++)
+    {
+      DotProductResult += vload_half(s * RowStride + BasePos, FPartialBuffer);
+    }
+
     DotProductResult *= FScales[a_id];
     if (UseBias != 0) DotProductResult += FBiasOutput[BasePos];
 

@@ -318,8 +318,9 @@ type
       /// a STORAGE format here: the kernels read it with vload_half and
       /// accumulate in float, so the result buffer, the scales and the bias stay
       /// FP32 and the round trip to the CPU is Single-precision in both modes.
+      /// The split-K partials narrow the same way (see FSplitKFP16Kernel).
       /// FFP16Kernel is net-owned and INJECTED at Create time like FInt8Kernel;
-      /// the two cl_kernel handles are bound against its program and released
+      /// the cl_kernel handles below are bound against its program and released
       /// here. FFP16Activations is the resolved verdict - PrepareForComputeInt8
       /// only sets it when the caller asked AND the kernel bound, so a device
       /// that rejected cai_dot_product_int8_h falls back to the FP32 B operand.
@@ -328,7 +329,12 @@ type
       FFP16Activations: boolean;
       FInputBufferBsFP16: cl_mem;
       FCapBsFP16: csize_t;
+      /// Both split-K passes have a half twin: pass 1 writes its raw slab sums
+      /// as half, so pass 2 must read FPartialBuffer as half too. The buffer is
+      /// sized in half bytes in that mode, which is why PrepareSplitK derives
+      /// its element size from FFP16Activations. Coded by Claude (AI).
       FSplitKFP16Kernel: cl_kernel;
+      FSplitKReduceFP16Kernel: cl_kernel;
       FCastFP16Kernel: cl_kernel;
 
       /// How many slabs to cut the reduction axis into for the current shape:
@@ -573,12 +579,15 @@ begin
   if Assigned(FSplitKKernel)       then clReleaseKernel(FSplitKKernel);
   if Assigned(FSplitKReduceKernel) then clReleaseKernel(FSplitKReduceKernel);
   if Assigned(FSplitKFP16Kernel)   then clReleaseKernel(FSplitKFP16Kernel);
+  if Assigned(FSplitKReduceFP16Kernel) then
+    clReleaseKernel(FSplitKReduceFP16Kernel);
   if Assigned(FCastFP16Kernel)     then clReleaseKernel(FCastFP16Kernel);
   FPartialBuffer := nil;
   FInputBufferBsFP16 := nil;
   FSplitKKernel := nil;
   FSplitKReduceKernel := nil;
   FSplitKFP16Kernel := nil;
+  FSplitKReduceFP16Kernel := nil;
   FCastFP16Kernel := nil;
   FCapPartial := 0;
   FCapBsFP16 := 0;
@@ -988,31 +997,37 @@ end;
 
 function TDotProductSharedKernel.PrepareSplitK(pSplits: integer): boolean;
 var
-  NeededPartial: csize_t;
+  NeededPartial, PartialElementSize: csize_t;
 begin
   Result := false;
   if not Assigned(FInt8Kernel) then exit;
-  // Pass 2 reads the FP32 FPartialBuffer and never touches B, so it is the same
-  // entry point in both modes; only pass 1 has an FP16 twin.
+  // Both passes have an FP16 twin: pass 1 stores its raw slab sums as half, so
+  // pass 2 must read them as half and FPartialBuffer is sized in half bytes.
   if FFP16Activations then
   begin
     if not Assigned(FSplitKFP16Kernel) then
       FSplitKFP16Kernel :=
         FFP16Kernel.CreateKernel('cai_dot_product_int8_splitk_h');
     if not Assigned(FSplitKFP16Kernel) then exit;
+    if not Assigned(FSplitKReduceFP16Kernel) then
+      FSplitKReduceFP16Kernel :=
+        FFP16Kernel.CreateKernel('cai_dot_product_int8_splitk_reduce_h');
+    if not Assigned(FSplitKReduceFP16Kernel) then exit;
+    PartialElementSize := csHalfSize;
   end
   else
   begin
     if not Assigned(FSplitKKernel) then
       FSplitKKernel := FInt8Kernel.CreateKernel('cai_dot_product_int8_splitk');
     if not Assigned(FSplitKKernel) then exit;
+    if not Assigned(FSplitKReduceKernel) then
+      FSplitKReduceKernel :=
+        FInt8Kernel.CreateKernel('cai_dot_product_int8_splitk_reduce');
+    if not Assigned(FSplitKReduceKernel) then exit;
+    PartialElementSize := SizeOf(TNeuralFloat);
   end;
-  if not Assigned(FSplitKReduceKernel) then
-    FSplitKReduceKernel :=
-      FInt8Kernel.CreateKernel('cai_dot_product_int8_splitk_reduce');
-  if not Assigned(FSplitKReduceKernel) then exit;
 
-  NeededPartial := csize_t(FNumAs) * FNumBs * pSplits * SizeOf(TNeuralFloat);
+  NeededPartial := csize_t(FNumAs) * FNumBs * pSplits * PartialElementSize;
   if (FPartialBuffer = nil) or (NeededPartial > FCapPartial) then
   begin
     if Assigned(FPartialBuffer) then clReleaseMemObject(FPartialBuffer);
@@ -1148,7 +1163,9 @@ begin
     err := err or clSetKernelArg(K, 5, csCLMemSize, @BufferBs);
     err := err or clSetKernelArg(K, 6, csCLMemSize, @FPartialBuffer);
 
-    KReduce := FSplitKReduceKernel;
+    if FFP16Activations
+      then KReduce := FSplitKReduceFP16Kernel
+      else KReduce := FSplitKReduceKernel;
     err := err or clSetKernelArg(KReduce, 0, csLongintSize, @FNumAs);
     err := err or clSetKernelArg(KReduce, 1, csLongintSize, @FNumBs);
     err := err or clSetKernelArg(KReduce, 2, csLongintSize, @Splits);
