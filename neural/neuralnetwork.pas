@@ -51605,13 +51605,13 @@ end;
 
 procedure TNNetGroupedConvolutionLinear.PrepareInputForGroupedConvolutionFast();
 var
-  OutputCntX, OutputCntY, OutputD: integer;
+  OutputCntX, OutputCntY: integer;
   MaxX, MaxY: integer;
   ChannelsPerGroup, ChannelsPerGroupSize: integer;
   yCount, xCount, groupCount: integer;
   GroupMax: integer;
   InputX, InputY: integer;
-  SrcBase, DestBase: integer;
+  DestBase, SrcPos, DestPos, TapOfs: integer;
   {$IFDEF AVXANY} RowSize: integer; {$ENDIF}
   FeatureSizeXYD: integer;
   {$IFDEF AVXANY}
@@ -51650,37 +51650,42 @@ begin
     begin
       for OutputCntY := 0 to MaxY do
       begin
+        // The destination column depends only on the output position, so it is
+        // hoisted above the whole feature window (#11).
+        DestBase := FInputPrepared.GetRawPos(OutputCntX, OutputCntY);
         for yCount := 0 to FFeatureSizeYMinus1 do
         begin
           InputY := OutputCntY * FStride + yCount;
+          // Tap offset in weight-volume layout, computed from the layer geometry
+          // (NOT FArrNeurons[0].Weights.GetRawPos: the int8-quantized forward
+          // shrinks that volume to one element, which would collapse the gather
+          // indices). It advances by one tap per xCount (#6).
+          TapOfs := FFeatureSizeX * yCount * ChannelsPerGroup;
           for xCount := 0 to FFeatureSizeXMinus1 do
           begin
             InputX := OutputCntX * FStride + xCount;
             // Non-depth indices are invariant across the groupCount loop; the
-            // group only shifts the depth slot. Hoist each volume's base offset
-            // (at depth 0) once, then add the per-group depth offset inside.
-            SrcBase := FInputCopy.GetRawPos(InputX, InputY);
-            DestBase := FInputPrepared.GetRawPos(OutputCntX, OutputCntY);
+            // group only shifts the depth slot on both sides, by a constant
+            // stride, so both offsets are carried by addition (#6/#12).
+            SrcPos := FInputCopy.GetRawPos(InputX, InputY);
+            DestPos := DestBase + TapOfs;
             for groupCount := 0 to GroupMax do
             begin
-              // Tap offset in weight-volume layout, computed from the layer
-              // geometry (NOT FArrNeurons[0].Weights.GetRawPos: the int8-
-              // quantized forward shrinks that volume to one element, which
-              // would collapse the gather indices).
-              OutputD := FeatureSizeXYD * groupCount +
-                ((FFeatureSizeX * yCount) + xCount) * ChannelsPerGroup;
               {$IFDEF AVXANY}
-              SourceRawPos := FInputCopy.GetRawPtr(SrcBase + ChannelsPerGroup*groupCount);
-              DestRawPos := FInputPrepared.GetRawPtr(DestBase + OutputD);
+              SourceRawPos := FInputCopy.GetRawPtr(SrcPos);
+              DestRawPos := FInputPrepared.GetRawPtr(DestPos);
               asm_dword_copy;
               {$ELSE}
               Move(
-                FInputCopy.FData[SrcBase + ChannelsPerGroup*groupCount],
-                FInputPrepared.FData[DestBase + OutputD],
+                FInputCopy.FData[SrcPos],
+                FInputPrepared.FData[DestPos],
                 ChannelsPerGroupSize
               );
               {$ENDIF}
+              Inc(SrcPos, ChannelsPerGroup);
+              Inc(DestPos, FeatureSizeXYD);
             end;
+            Inc(TapOfs, ChannelsPerGroup);
           end;
         end;
       end;
@@ -54432,56 +54437,52 @@ end;
 
 procedure TNNetUpsample.Compute();
 var
-  CntX, CntY, CntD, OutX, OutD: integer;
+  CntX, CntY, OutD: integer;
   MaxX, MaxY, MaxD: integer;
   StartTime: double;
-  InBase, Out00, OutDepthStride, OutRowStride: integer;
-  PrevRowStride, OutTwoRowStride: integer;
+  InBase, Out00, Out10, Out01, Out11: integer;
+  OutDepthStride, OutRowStride: integer;
   PrevOutput: TNNetVolume;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  Output.Fill(0);
   PrevOutput := FPrevLayer.Output;
   MaxX := PrevOutput.SizeX - 1;
   MaxY := PrevOutput.SizeY - 1;
   MaxD := Output.Depth - 1;
   OutDepthStride := Output.Depth;
   OutRowStride := Output.SizeX * Output.Depth;
-  // Advancing one source row moves both cursors by a constant stride, so the
-  // two GetRawPos calls collapse into carried offsets (#12).
-  PrevRowStride := PrevOutput.SizeX * PrevOutput.Depth;
-  OutTwoRowStride := OutRowStride shl 1;
-
-  for OutD := 0 to MaxD do
-  begin
-    CntD := OutD shl 2;
+  // Every output cell takes exactly one source channel (the four depth-to-space
+  // corners tile the doubled grid), so the output needs no pre-fill. Walking the
+  // source positions outermost keeps each corner's writes contiguous along the
+  // output depth run and the reads inside one source column.
+  for CntY := 0 to MaxY do
     for CntX := 0 to MaxX do
     begin
-      OutX := CntX shl 1;
-      InBase := PrevOutput.GetRawPos(CntX, 0, CntD);
-      Out00  := Output.GetRawPos(OutX, 0, OutD);
-      for CntY := 0 to MaxY do
+      InBase := PrevOutput.GetRawPos(CntX, CntY);
+      Out00  := Output.GetRawPos(CntX shl 1, CntY shl 1);
+      Out10  := Out00 + OutDepthStride;
+      Out01  := Out00 + OutRowStride;
+      Out11  := Out01 + OutDepthStride;
+      for OutD := 0 to MaxD do
       begin
-        Output.FData[Out00]                                := PrevOutput.FData[InBase];
-        Output.FData[Out00 + OutDepthStride]               := PrevOutput.FData[InBase + 1];
-        Output.FData[Out00 + OutRowStride]                 := PrevOutput.FData[InBase + 2];
-        Output.FData[Out00 + OutRowStride + OutDepthStride] := PrevOutput.FData[InBase + 3];
-        Inc(InBase, PrevRowStride);
-        Inc(Out00, OutTwoRowStride);
+        Output.FData[Out00 + OutD] := PrevOutput.FData[InBase];
+        Output.FData[Out10 + OutD] := PrevOutput.FData[InBase + 1];
+        Output.FData[Out01 + OutD] := PrevOutput.FData[InBase + 2];
+        Output.FData[Out11 + OutD] := PrevOutput.FData[InBase + 3];
+        Inc(InBase, 4);
       end;
     end;
-  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetUpsample.ComputePreviousLayerError();
 var
-  CntX, CntY, CntD, OutX, OutD: integer;
+  CntX, CntY, OutD: integer;
   MaxX, MaxY, MaxD: integer;
   StartTime: double;
-  PrevBase, Out00, OutDepthStride, OutRowStride: integer;
-  PrevRowStride, OutTwoRowStride: integer;
+  PrevBase, Out00, Out10, Out01, Out11: integer;
+  OutDepthStride, OutRowStride: integer;
   PrevError: TNNetVolume;
 begin
   StartTime := Now();
@@ -54491,30 +54492,25 @@ begin
   MaxD := Output.Depth - 1;
   OutDepthStride := OutputError.Depth;
   OutRowStride := OutputError.SizeX * OutputError.Depth;
-  // Advancing one source row moves both cursors by a constant stride, so the
-  // two GetRawPos calls collapse into carried offsets (#12).
-  PrevRowStride := PrevError.SizeX * PrevError.Depth;
-  OutTwoRowStride := OutRowStride shl 1;
-
-  for OutD := 0 to MaxD do
-  begin
-    CntD := OutD shl 2;
+  // Transpose of Compute, in the same source-position-outermost order: the four
+  // corners read contiguous output-error depth runs into one source column.
+  for CntY := 0 to MaxY do
     for CntX := 0 to MaxX do
     begin
-      OutX := CntX shl 1;
-      PrevBase := PrevError.GetRawPos(CntX, 0, CntD);
-      Out00    := OutputError.GetRawPos(OutX, 0, OutD);
-      for CntY := 0 to MaxY do
+      PrevBase := PrevError.GetRawPos(CntX, CntY);
+      Out00    := OutputError.GetRawPos(CntX shl 1, CntY shl 1);
+      Out10    := Out00 + OutDepthStride;
+      Out01    := Out00 + OutRowStride;
+      Out11    := Out01 + OutDepthStride;
+      for OutD := 0 to MaxD do
       begin
-        PrevError.FData[PrevBase]   := PrevError.FData[PrevBase]   + OutputError.FData[Out00];
-        PrevError.FData[PrevBase+1] := PrevError.FData[PrevBase+1] + OutputError.FData[Out00 + OutDepthStride];
-        PrevError.FData[PrevBase+2] := PrevError.FData[PrevBase+2] + OutputError.FData[Out00 + OutRowStride];
-        PrevError.FData[PrevBase+3] := PrevError.FData[PrevBase+3] + OutputError.FData[Out00 + OutRowStride + OutDepthStride];
-        Inc(PrevBase, PrevRowStride);
-        Inc(Out00, OutTwoRowStride);
+        PrevError.FData[PrevBase]   := PrevError.FData[PrevBase]   + OutputError.FData[Out00 + OutD];
+        PrevError.FData[PrevBase+1] := PrevError.FData[PrevBase+1] + OutputError.FData[Out10 + OutD];
+        PrevError.FData[PrevBase+2] := PrevError.FData[PrevBase+2] + OutputError.FData[Out01 + OutD];
+        PrevError.FData[PrevBase+3] := PrevError.FData[PrevBase+3] + OutputError.FData[Out11 + OutD];
+        Inc(PrevBase, 4);
       end;
     end;
-  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -54544,6 +54540,8 @@ begin
   SetOutputErrorSize(FOutput);
   {$IFDEF OpenCL}
   FShouldOpenCL := false; // bandwidth-bound: GPU < CPU on the device (OpenCLForwardBenchmark), pin to CPU. Old verdict: Int64(FOutput.Size) >= cNeuralOpenCLMinWork
+  // Empty the cached device index map: the new geometry needs a new one.
+  if Assigned(FIdxBuf) then FIdxBuf.ReSize(0, 0, 0);
   {$ENDIF}
 end;
 
@@ -54670,21 +54668,26 @@ begin
   MaxY := FPrevLayer.Output.SizeY - 1;
   MaxD := OutD - 1;
   rM1 := r - 1;
-  FIdxBuf.ReSize(FOutput.Size, 1, 1);
   FDstFlat.ReSize(FOutput.Size, 1, 1);
-  for c := 0 to MaxD do
-    for x := 0 to MaxX do
-      for y := 0 to MaxY do
-        for i := 0 to rM1 do
-          for j := 0 to rM1 do
-          begin
-            InD := c * r * r + i * r + j;
-            // Output raw index of FOutput[r*x+i, r*y+j, c] and the matching
-            // source raw index of FPrevLayer.Output[x, y, InD].
-            OutIdx := ((r * y + j) * OutX + (r * x + i)) * OutD + c;
-            SrcIdx := (y * SrcX + x) * SrcD + InD;
-            FIdxBuf.FData[OutIdx] := SrcIdx;
-          end;
+  // The map depends only on the layer geometry, so it survives every token;
+  // SetPrevLayer empties FIdxBuf so a reshape rebuilds it (#27).
+  if FIdxBuf.Size <> FOutput.Size then
+  begin
+    FIdxBuf.ReSize(FOutput.Size, 1, 1);
+    for c := 0 to MaxD do
+      for x := 0 to MaxX do
+        for y := 0 to MaxY do
+          for i := 0 to rM1 do
+            for j := 0 to rM1 do
+            begin
+              InD := c * r * r + i * r + j;
+              // Output raw index of FOutput[r*x+i, r*y+j, c] and the matching
+              // source raw index of FPrevLayer.Output[x, y, InD].
+              OutIdx := ((r * y + j) * OutX + (r * x + i)) * OutD + c;
+              SrcIdx := (y * SrcX + x) * SrcD + InD;
+              FIdxBuf.FData[OutIdx] := SrcIdx;
+            end;
+  end;
   FShuffleCL.Gather(FPrevLayer.Output, FIdxBuf, FDstFlat, FOutput.Size);
   Move(FDstFlat.FData[0], FOutput.FData[0], FOutput.Size * csNeuralFloatSize);
 end;
@@ -54773,24 +54776,27 @@ begin
   MaxY := FPrevLayer.Output.SizeY - 1;
   MaxD := OutD - 1;
   rM1 := r - 1;
-  FIdxBuf.ReSize(FOutput.Size, 1, 1);
   FBackErrFlat.ReSize(FOutput.Size, 1, 1);
   FBackOutFlat.ReSize(FPrevLayer.Output.Size, 1, 1);
   // Flatten the output error into the [outpix*OutD + c] raw order the device
   // gather indexes (FOutputError is already in that raw layout).
   Move(FOutputError.FData[0], FBackErrFlat.FData[0],
     FOutput.Size * csNeuralFloatSize);
-  for c := 0 to MaxD do
-    for x := 0 to MaxX do
-      for y := 0 to MaxY do
-        for i := 0 to rM1 do
-          for j := 0 to rM1 do
-          begin
-            InD := c * r * r + i * r + j;
-            OutIdx := ((r * y + j) * OutX + (r * x + i)) * OutD + c;
-            SrcIdx := (y * SrcX + x) * SrcD + InD;
-            FIdxBuf.FData[OutIdx] := SrcIdx;
-          end;
+  if FIdxBuf.Size <> FOutput.Size then
+  begin
+    FIdxBuf.ReSize(FOutput.Size, 1, 1);
+    for c := 0 to MaxD do
+      for x := 0 to MaxX do
+        for y := 0 to MaxY do
+          for i := 0 to rM1 do
+            for j := 0 to rM1 do
+            begin
+              InD := c * r * r + i * r + j;
+              OutIdx := ((r * y + j) * OutX + (r * x + i)) * OutD + c;
+              SrcIdx := (y * SrcX + x) * SrcD + InD;
+              FIdxBuf.FData[OutIdx] := SrcIdx;
+            end;
+  end;
   FScatterCL.Scatter(FBackErrFlat, FIdxBuf, FBackOutFlat, FOutput.Size);
   // Accumulate (the permutation writes every source element exactly once).
   FPrevLayer.OutputError.Add(FBackOutFlat);
