@@ -120335,10 +120335,15 @@ var
   // single-pass accumulators (per layer)
   Sum: array of TNeuralFloat;        // sum of each neuron's activation
   SumSq: array of TNeuralFloat;      // sum of squares
-  Cross: array of array of TNeuralFloat; // pairwise sum of products (i<=j)
+  Cross: array of TNeuralFloatDynArr; // pairwise sum of products (i<=j)
   Mean: array of TNeuralFloat;
   Std: array of TNeuralFloat;
   V: TNeuralFloat;
+  OutVol: TNNetVolume;
+  OutPtr: TNeuralFloatArrPtr;
+  CrossRow: TNeuralFloatDynArr;
+  InvUsed, StdI, MeanI: TNeuralFloat;
+  IsConstI: boolean;
   Rho, Cov, Denom, AbsRho, FrobSq, EffCount: TNeuralFloat;
   ConstCount, PairCount: integer;
   // off-diagonal |rho| histogram
@@ -120435,17 +120440,19 @@ begin
         for J := I to NM1 do Cross[I][J] := 0;
       end;
 
+      OutVol := Layer.Output;
+      OutPtr := OutVol.DataPtr;
       for SampleIdx := 0 to UsedSamplesM1 do
       begin
         NN.Compute(Samples[SampleIdx]);
         // Sum += Output ; SumSq += Output.*Output  (vectorized, once per sample)
-        TNNetVolume.Add(@Sum[0], Layer.Output.DataPtr, N);
-        TNNetVolume.MulAdd(@SumSq[0], Layer.Output.DataPtr, Layer.Output.DataPtr, N);
+        TNNetVolume.Add(@Sum[0], OutPtr, N);
+        TNNetVolume.MulAdd(@SumSq[0], OutPtr, OutPtr, N);
         for I := 0 to NM1 do
         begin
-          V := Layer.Output.FData[I];
+          V := OutVol.FData[I];
           // Cross[I][J] += V * Output[J] for J = I..NM1  (contiguous run)
-          TNNetVolume.MulAdd(@Cross[I][I], @Layer.Output.FData[I], V, N - I);
+          TNNetVolume.MulAdd(@Cross[I][I], @OutVol.FData[I], V, N - I);
         end;
       end;
 
@@ -120477,20 +120484,25 @@ begin
       FrobSq := 0;
       HasNearDup := False;
 
+      InvUsed := 1.0 / UsedSamples;
       for I := 0 to NM1 do
       begin
         // diagonal: rho_ii = 1 for a varying neuron, 0 for a constant one.
-        if Std[I] >= cConstStd then FrobSq := FrobSq + 1.0;
+        StdI := Std[I];
+        MeanI := Mean[I];
+        IsConstI := StdI < cConstStd;
+        if not IsConstI then FrobSq := FrobSq + 1.0;
+        CrossRow := Cross[I];
         JStart := I + 1;
         for J := JStart to NM1 do
         begin
-          if (Std[I] < cConstStd) or (Std[J] < cConstStd) then
+          if IsConstI or (Std[J] < cConstStd) then
             Rho := 0
           else
           begin
             // cov = E[xy] - E[x]E[y]
-            Cov := Cross[I][J] / UsedSamples - Mean[I] * Mean[J];
-            Denom := Std[I] * Std[J];
+            Cov := CrossRow[J] * InvUsed - MeanI * Mean[J];
+            Denom := StdI * Std[J];
             if Denom > 1e-30 then
               Rho := Cov / Denom
             else
@@ -120515,6 +120527,9 @@ begin
           // maintain the top-K by |rho|.
           if TopPairsPerLayer > 0 then
           begin
+            // MinPos / SmallestAbs track the weakest kept pair, so the common
+            // case (this pair does not make the top-K) is one comparison; the
+            // K-long rescan runs only when an entry is actually replaced.
             if Filled < TopPairsPerLayer then
             begin
               TopI[Filled] := I;
@@ -120522,10 +120537,24 @@ begin
               TopRho[Filled] := Rho;
               TopAbs[Filled] := AbsRho;
               Inc(Filled);
+              if Filled = TopPairsPerLayer then
+              begin
+                MinPos := 0;
+                SmallestAbs := TopAbs[0];
+                for K := 1 to TopPairsM1 do
+                  if TopAbs[K] < SmallestAbs then
+                  begin
+                    SmallestAbs := TopAbs[K];
+                    MinPos := K;
+                  end;
+              end;
             end
-            else
+            else if AbsRho > SmallestAbs then
             begin
-              // replace the current smallest-|rho| entry if this is larger.
+              TopI[MinPos] := I;
+              TopJ[MinPos] := J;
+              TopRho[MinPos] := Rho;
+              TopAbs[MinPos] := AbsRho;
               MinPos := 0;
               SmallestAbs := TopAbs[0];
               for K := 1 to TopPairsM1 do
@@ -120534,13 +120563,6 @@ begin
                   SmallestAbs := TopAbs[K];
                   MinPos := K;
                 end;
-              if AbsRho > SmallestAbs then
-              begin
-                TopI[MinPos] := I;
-                TopJ[MinPos] := J;
-                TopRho[MinPos] := Rho;
-                TopAbs[MinPos] := AbsRho;
-              end;
             end;
           end;
         end;
@@ -120662,7 +120684,6 @@ var
   MaxParamCountNeuronPos: integer;
   MaxPerturbNeuronPos: integer;
   MaxPerturbWeightPos: integer;
-  MaxDeltaOutputPos: integer;
   MaxLossOutputPos: integer;
   Lines: TStringList;
   Flags: TStringList;
@@ -120687,7 +120708,7 @@ var
   MaxDelta: array of TNeuralFloat;
   MeanLossDelta: array of TNeuralFloat;
   Output: TNNetVolume;
-  Diff, SumSq, SampleLoss, Tgt, DeltaL2, AccDelta, AccLoss, TrialDelta: TNeuralFloat;
+  Diff, SampleLoss, Tgt, DeltaL2, AccDelta, AccLoss, TrialDelta: TNeuralFloat;
   // histogram of per-layer mean output-delta
   Bins: array of integer;
   MinMean, MaxMean, Width, V: TNeuralFloat;
@@ -120696,6 +120717,10 @@ var
   // scratch copy of MeanDelta for percentile thresholds + median
   Sorted: array of TNeuralFloat;
   HighThr, LowThr, Median, MaxSens, FragRatio: TNeuralFloat;
+  // flat copy of the ONE layer under test, restored between trials
+  LayerSnap: array of TNeuralFloat;
+  SnapPos, WeightCount: integer;
+  Wv, TgtVol, BaseVol: TNNetVolume;
 
   // Local LCG -> uniform (0,1], so this report never disturbs the caller's
   // global RNG sequence (RandSeed is also saved/restored as a safeguard).
@@ -120795,13 +120820,19 @@ begin
       if HasTargets then
       begin
         Tgt := 0; // silence hint
-        MaxBaselineOutputPos := Output.Size - 1;
-        for I := 0 to MaxBaselineOutputPos do
+        TgtVol := Targets[SampleIdx];
+        if TgtVol.Size = Output.Size then
+          SampleLoss := Output.GetDistanceSqr(TgtVol)
+        else
         begin
-          if I < Targets[SampleIdx].Size then Tgt := Targets[SampleIdx].Raw[I]
-          else Tgt := 0;
-          Diff := Output.Raw[I] - Tgt;
-          SampleLoss := SampleLoss + Diff * Diff;
+          MaxBaselineOutputPos := Output.Size - 1;
+          for I := 0 to MaxBaselineOutputPos do
+          begin
+            if I < TgtVol.Size then Tgt := TgtVol.Raw[I]
+            else Tgt := 0;
+            Diff := Output.Raw[I] - Tgt;
+            SampleLoss := SampleLoss + Diff * Diff;
+          end;
         end;
         if Output.Size > 0 then SampleLoss := SampleLoss / Output.Size;
       end;
@@ -120849,18 +120880,34 @@ begin
       AccLoss := 0;
       MaxDelta[TrIdx] := 0;
 
+      // Only this layer is perturbed, so a flat copy of its weights and biases
+      // is the whole restore - no whole-net text round trip per trial.
+      SetLength(LayerSnap, TrParams[TrIdx]);
+      MaxPerturbNeuronPos := Layer.Neurons.Count - 1;
+      SnapPos := 0;
+      for I := 0 to MaxPerturbNeuronPos do
+      begin
+        Wv := Layer.Neurons[I].Weights;
+        WeightCount := Wv.Size;
+        if WeightCount > 0 then
+          Move(Wv.FData[0], LayerSnap[SnapPos],
+            WeightCount * csNeuralFloatSize);
+        Inc(SnapPos, WeightCount);
+        LayerSnap[SnapPos] := Layer.Neurons[I].FBiasWeight;
+        Inc(SnapPos);
+      end;
+
       for K := 0 to LSTrialsM1 do
       begin
         // Perturb ONE layer's weights and biases: W *= 1 + eta.
-        MaxPerturbNeuronPos := Layer.Neurons.Count - 1;
         for I := 0 to MaxPerturbNeuronPos do
         begin
-          MaxPerturbWeightPos := Layer.Neurons[I].Weights.Size - 1;
+          Wv := Layer.Neurons[I].Weights;
+          MaxPerturbWeightPos := Wv.Size - 1;
           for J := 0 to MaxPerturbWeightPos do
           begin
             Eta := Sigma * NextGaussian();
-            Layer.Neurons[I].Weights.FData[J] :=
-              Layer.Neurons[I].Weights.FData[J] * (1.0 + Eta);
+            Wv.FData[J] := Wv.FData[J] * (1.0 + Eta);
           end;
           Eta := Sigma * NextGaussian();
           Layer.Neurons[I].FBiasWeight :=
@@ -120874,26 +120921,27 @@ begin
         begin
           NN.Compute(Samples[SampleIdx]);
           Output := NN.GetLastLayer.Output;
-          SumSq := 0;
-          MaxDeltaOutputPos := Output.Size - 1;
-          for I := 0 to MaxDeltaOutputPos do
-          begin
-            Diff := Output.Raw[I] - Baseline[SampleIdx].Raw[I];
-            SumSq := SumSq + Diff * Diff;
-          end;
-          DeltaL2 := Sqrt(SumSq);
+          BaseVol := Baseline[SampleIdx];
+          DeltaL2 := Sqrt(Output.GetDistanceSqr(BaseVol));
           TrialDelta := TrialDelta + DeltaL2;
 
           if HasTargets then
           begin
-            SampleLoss := 0;
-            MaxLossOutputPos := Output.Size - 1;
-            for I := 0 to MaxLossOutputPos do
+            TgtVol := Targets[SampleIdx];
+            if TgtVol.Size = Output.Size then
+              SampleLoss := Output.GetDistanceSqr(TgtVol)
+            else
             begin
-              if I < Targets[SampleIdx].Size then Tgt := Targets[SampleIdx].Raw[I]
-              else Tgt := 0;
-              Diff := Output.Raw[I] - Tgt;
-              SampleLoss := SampleLoss + Diff * Diff;
+              // shorter/longer target: the missing entries read as 0.
+              SampleLoss := 0;
+              MaxLossOutputPos := Output.Size - 1;
+              for I := 0 to MaxLossOutputPos do
+              begin
+                if I < TgtVol.Size then Tgt := TgtVol.Raw[I]
+                else Tgt := 0;
+                Diff := Output.Raw[I] - Tgt;
+                SampleLoss := SampleLoss + Diff * Diff;
+              end;
             end;
             if Output.Size > 0 then SampleLoss := SampleLoss / Output.Size;
             AccLoss := AccLoss + Abs(SampleLoss - BaseLoss[SampleIdx]);
@@ -120904,7 +120952,19 @@ begin
         if TrialDelta > MaxDelta[TrIdx] then MaxDelta[TrIdx] := TrialDelta;
 
         // Restore exact weights before the next trial / layer.
-        NN.LoadDataFromString(Snapshot);
+        SnapPos := 0;
+        for I := 0 to MaxPerturbNeuronPos do
+        begin
+          Wv := Layer.Neurons[I].Weights;
+          WeightCount := Wv.Size;
+          if WeightCount > 0 then
+            Move(LayerSnap[SnapPos], Wv.FData[0],
+              WeightCount * csNeuralFloatSize);
+          Inc(SnapPos, WeightCount);
+          Layer.Neurons[I].FBiasWeight := LayerSnap[SnapPos];
+          Inc(SnapPos);
+        end;
+        Layer.AfterWeightUpdate();
       end;
 
       MeanDelta[TrIdx] := AccDelta / Trials;
