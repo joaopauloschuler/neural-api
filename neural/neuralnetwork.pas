@@ -10986,7 +10986,8 @@ type
   //   [0]=Lambda (Depth)   recurrent_param (init so softplus(Lambda)~=0.5)
   // FStruct[0]=Depth (3*Depth input -> Depth output, resolved in SetPrevLayer).
   // The real state h re-inits per sweep (NOT persisted). FORWARD is a
-  // left-to-right scan caching h_t, a_t, the gates and the multiplier. BACKWARD
+  // left-to-right scan caching a_t, the gates and the multiplier; h_t IS the
+  // output, so the backward scan reads h_{t-1} out of FOutput. BACKWARD
   // is the EXACT BPTT adjoint scan (right-to-left, carrying dL/dh_t), folding the
   // input gradients into the x / i_logits / a_logits blocks and the per-channel
   // Lambda gradient (chaining through sigmoid, softplus, exp and the
@@ -10995,12 +10996,14 @@ type
   TNNetRGLRU = class(TNNetLayer)
     private
       FDepth: integer;          // resolved in SetPrevLayer (output depth)
-      FH: TNNetVolume;          // cached state h_t, (SeqLen,1,Depth)
       FA: TNNetVolume;          // cached per-step decay a_t
       FIg: TNNetVolume;         // cached input gate sigmoid(i_logits)
       FRg: TNNetVolume;         // cached recurrence gate sigmoid(a_logits)
       FMult: TNNetVolume;       // cached sqrt(1 - a_t^2)
       FGradLambda: TNNetVolume;
+      // Per-channel -c*softplus(Lambda), rebuilt once per Compute(); it is the
+      // whole d(log a)/d(recurrence gate) factor. FZeroRow is the h_{-1}=0 operand.
+      FNegCSoftplus, FZeroRow: TNNetVolume;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
@@ -63314,24 +63317,26 @@ begin
   inherited Create();
   FDepth := 0;
   FStruct[0] := 0;
-  FH := TNNetVolume.Create();
   FA := TNNetVolume.Create();
   FIg := TNNetVolume.Create();
   FRg := TNNetVolume.Create();
   FMult := TNNetVolume.Create();
   FGradLambda := TNNetVolume.Create();
+  FNegCSoftplus := TNNetVolume.Create();
+  FZeroRow := TNNetVolume.Create();
   // [0]=Lambda (recurrent_param)
   AddMissingNeurons(1);
 end;
 
 destructor TNNetRGLRU.Destroy();
 begin
+  FZeroRow.Free;
+  FNegCSoftplus.Free;
   FGradLambda.Free;
   FMult.Free;
   FRg.Free;
   FIg.Free;
   FA.Free;
-  FH.Free;
   inherited Destroy();
 end;
 
@@ -63356,12 +63361,14 @@ begin
     FNeurons[0].FDelta.ReSize(FNeurons[0].FWeights);
     FNeurons[0].FBackInertia.ReSize(FNeurons[0].FWeights);
   end;
-  FH.ReSize(FOutput.SizeX, 1, FDepth);
   FA.ReSize(FOutput.SizeX, 1, FDepth);
   FIg.ReSize(FOutput.SizeX, 1, FDepth);
   FRg.ReSize(FOutput.SizeX, 1, FDepth);
   FMult.ReSize(FOutput.SizeX, 1, FDepth);
   FGradLambda.ReSize(1, 1, FDepth);
+  FNegCSoftplus.ReSize(1, 1, FDepth);
+  FZeroRow.ReSize(1, 1, FDepth);
+  FZeroRow.Fill(0);
   InitDefault();
 end;
 
@@ -63372,8 +63379,10 @@ var
   StartTime: double;
   Prev, WLam: TNNetVolume;
   SeqLen, Dn, t, d: integer;
-  MaxDn, MaxT, basePrev, baseC, pvStride, ocStride, TwoDn: integer;
-  sp, lam, igl, agl, ig, rg, loga, a, a2, mult, xt, hPrev, hNew: TNeuralFloat;
+  MaxDn, MaxT, TwoDn, RowBytes, i: integer;
+  sp, lam, av: TNeuralFloat;
+  NegCSpPtr, ZeroPtr, XtPtr, IglPtr, AglPtr: TNeuralFloatArrPtr;
+  IgPtr, RgPtr, APtr, MultPtr, HPtr, HPrevPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -63383,50 +63392,63 @@ begin
   Dn := FDepth;
   MaxDn := Dn - 1;
   MaxT := SeqLen - 1;
-  pvStride := Prev.GetRawPos(1, 0);        // = 3Dn: Prev (t,d)->(t+1,d) step
-  ocStride := FA.GetRawPos(1, 0);          // = Dn: FA/FIg/FRg/FMult/FH/FOutput step
   TwoDn := 2 * Dn;                          // #5
+  RowBytes := Dn * csNeuralFloatSize;
+  // log a_t = -c * r_t * softplus(Lambda): only the recurrence gate varies with
+  // t, so the per-channel factor is one table built once per forward.
   for d := 0 to MaxDn do
   begin
     lam := WLam.FData[d];
     // softplus(Lambda) with the usual large-x shortcut.
     if lam > 30 then sp := lam else sp := pcr_logf(1 + NeuralExp(lam));
-    hPrev := 0;
-    // Prev (depth 3Dn): x at basePrev, i_logits at +Dn, a_logits at +2Dn; basePrev
-    // steps by pvStride. FA/FIg/FRg/FMult/FH/FOutput share (SeqLen,1,Dn): baseC step.
-    basePrev := Prev.GetRawPos(0, 0, d);
-    baseC := FA.GetRawPos(0, 0, d);
-    for t := 0 to MaxT do
-    begin
-      xt  := Prev.FData[basePrev];
-      igl := Prev.FData[basePrev + Dn];
-      agl := Prev.FData[basePrev + TwoDn];
-      ig := 1 / (1 + NeuralExp(-igl));
-      rg := 1 / (1 + NeuralExp(-agl));
-      loga := -cDecay * rg * sp;
-      a := NeuralExp(loga);
-      a2 := a * a;              // = exp(2*loga); a still holds exp(loga) here
+    FNegCSoftplus.FData[d] := -cDecay * sp;
+  end;
+  NegCSpPtr := FNegCSoftplus.GetRawPtr();
+  ZeroPtr := FZeroRow.GetRawPtr();
+  // Timestep-outer sweep: the time axis is sequential (h_t depends on h_{t-1})
+  // but the channel axis is parallel and contiguous, so each timestep runs the
+  // gates, the decay and the state update as elementwise kernels over the
+  // Dn-long run. Prev (depth 3Dn) holds x, i_logits and a_logits as three
+  // contiguous Dn-long blocks per timestep. h_{t-1} is row t-1 of FOutput.
+  HPrevPtr := ZeroPtr;
+  for t := 0 to MaxT do
+  begin
+    XtPtr := Prev.GetRawPtr(t, 0);
+    IglPtr := Prev.GetRawPtr(t, 0, Dn);
+    AglPtr := Prev.GetRawPtr(t, 0, TwoDn);
+    IgPtr := FIg.GetRawPtr(t, 0);
+    RgPtr := FRg.GetRawPtr(t, 0);
+    APtr := FA.GetRawPtr(t, 0);
+    MultPtr := FMult.GetRawPtr(t, 0);
+    HPtr := FOutput.GetRawPtr(t, 0);
+    TNNetVolume.Sigmoid(IgPtr, IglPtr, Dn);       // i_t
+    TNNetVolume.Sigmoid(RgPtr, AglPtr, Dn);       // r_t
+    // a_t = exp(-c * r_t * softplus(Lambda))
+    system.Move(RgPtr^, APtr^, RowBytes);
+    TNNetVolume.Mul(APtr, NegCSpPtr, Dn);
+    TNNetVolume.Exp(APtr, APtr, Dn);
+    if t = 0 then
       // Sequence-start reset (HF Griffin: at position 0 the recurrence gate is
       // masked to 0 and the input multiplier is 1 instead of sqrt(1-a^2);
       // h_{-1}=0 so the masked gate is moot, only the multiplier matters).
-      if t = 0 then
+      for i := 0 to MaxDn do
       begin
-        a := 0;
-        mult := 1;
+        APtr^[i] := 0;
+        MultPtr^[i] := 1;
       end
-      else
-        mult := Sqrt(1 - a2);
-      hNew := a * hPrev + mult * (ig * xt);
-      FA.FData[baseC] := a;
-      FIg.FData[baseC] := ig;
-      FRg.FData[baseC] := rg;
-      FMult.FData[baseC] := mult;
-      FH.FData[baseC] := hNew;
-      FOutput.FData[baseC] := hNew;
-      hPrev := hNew;
-      Inc(basePrev, pvStride);
-      Inc(baseC, ocStride);
-    end;
+    else
+      // No vector Sqrt kernel exists; the run is at least contiguous now.
+      for i := 0 to MaxDn do
+      begin
+        av := APtr^[i];
+        MultPtr^[i] := Sqrt(1 - av * av);
+      end;
+    // h_t = a_t .* h_{t-1} + mult_t .* i_t .* x_t
+    system.Move(MultPtr^, HPtr^, RowBytes);
+    TNNetVolume.Mul(HPtr, IgPtr, Dn);
+    TNNetVolume.Mul(HPtr, XtPtr, Dn);
+    TNNetVolume.MulAdd(HPtr, APtr, HPrevPtr, Dn);
+    HPrevPtr := HPtr;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -63463,7 +63485,7 @@ begin
   //   h_t  = a * h_{t-1} + mult * ig * x_t;   y_t = h_t
   MaxDn := Dn - 1;
   pvStride := Prev.GetRawPos(1, 0);        // = 3Dn: Prev/PrevErr row step
-  ocStride := FIg.GetRawPos(1, 0);         // = Dn: FIg/FRg/FA/FMult/FOutputError/FH step
+  ocStride := FIg.GetRawPos(1, 0);         // = Dn: FIg/FRg/FA/FMult/FOutputError/FOutput step
   for d := 0 to MaxDn do
   begin
     lam := WLam.FData[d];
@@ -63484,8 +63506,9 @@ begin
     // of it (#5).
     dLoga_dRg := -cDecay * sp;
     // Prev/PrevErr share (SeqLen,1,3Dn): x at basePrev, gate logits at +Dn/+2Dn;
-    // basePrev steps by -pvStride. FIg/FRg/FA/FMult/FOutputError (and FH at t-1)
-    // share (SeqLen,1,Dn): baseC steps by -ocStride, FH at t-1 = baseC-ocStride.
+    // basePrev steps by -pvStride. FIg/FRg/FA/FMult/FOutputError (and FOutput,
+    // which holds h) share (SeqLen,1,Dn): baseC steps by -ocStride, so h_{t-1}
+    // sits at baseC-ocStride.
     basePrev := Prev.GetRawPos(SeqLenM1, 0, d);
     baseC := FIg.GetRawPos(SeqLenM1, 0, d);
     for t := SeqLenM1 downto 0 do
@@ -63496,7 +63519,7 @@ begin
       a  := FA.FData[baseC];
       a2 := a * a;
       mult := FMult.FData[baseC];
-      if t > 0 then hPrev := FH.FData[baseC - ocStride]
+      if t > 0 then hPrev := FOutput.FData[baseC - ocStride]
       else hPrev := 0;
       // dL/dh_t = carried adjoint + read-out (y_t = h_t).
       dh := ph + FOutputError.FData[baseC];
