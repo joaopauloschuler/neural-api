@@ -102,15 +102,18 @@ end;
 procedure LoadRGBVolumeIntoTImage(V:TNNetVolume; Image:TImage);
 var
   I, J, MaxX, MaxY: integer;
+  LocalCanvas: TCanvas;
 begin
   MaxX := V.SizeX - 1;
   MaxY := V.SizeY - 1;
+  // Image.Canvas is a property getter, and it does not change across the sweep.
+  LocalCanvas := Image.Canvas;
 
   for I := 0 to MaxX do
   begin
     for J := 0 to MaxY do
     begin
-      Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(V.AsByte[J,I,0], V.AsByte[J,I,1], V.AsByte[J,I,2]);
+      LocalCanvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(V.AsByte[J,I,0], V.AsByte[J,I,1], V.AsByte[J,I,2]);
     end;
   end;
 end;
@@ -145,16 +148,20 @@ begin
 
   Vol.ReSize(MaxX + 1, MaxY + 1, 3);
 
-  for CountX := 0 to MaxX do
+  // CountX is the inner loop so the volume is written down one contiguous row
+  // at a time, and the row offset advances by the depth instead of being
+  // recomputed. The pixel each slot receives is unchanged.
+  for CountY := 0 to MaxY do
   begin
-    for CountY := 0 to MaxY do
+    RawPos := Vol.GetRawPos(0, CountY, 0);
+    for CountX := 0 to MaxX do
     begin
       LocalColor := LocalCanvas.Pixels[CountX, CountY];
-      RawPos := Vol.GetRawPos(CountX, CountY, 0);
 
       Vol.FData[RawPos]     := LocalColor          and $000000ff; // red
       Vol.FData[RawPos + 1] := (LocalColor shr 8)  and $000000ff; // green
       Vol.FData[RawPos + 2] := (LocalColor shr 16) and $000000ff; // blue
+      Inc(RawPos, 3);
     end;
   end;
 end;
@@ -165,12 +172,15 @@ var
   MaxX, MaxY: integer;
   bG: byte;
   H,S,A,B,R,G: TNeuralFloat;
+  LocalCanvas: TCanvas;
 begin
   R := 0;
   G := 0;
   B := 0;
   MaxX := V.SizeX - 1;
   MaxY := V.SizeY - 1;
+  // Image.Canvas is a property getter, and it does not change across the sweep.
+  LocalCanvas := Image.Canvas;
 
   if V.Depth = 1 then
   begin
@@ -191,7 +201,7 @@ begin
           // RGB and Gray
           bG := RoundAsByte(V[J,I,0]);
         end;
-        Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(bG, bG, bG);
+        LocalCanvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(bG, bG, bG);
       end;
     end;
   end
@@ -225,7 +235,7 @@ begin
           G := 0;
           B := V[J,I,1];
         end;
-        Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(RoundAsByte(R), RoundAsByte(G), RoundAsByte(B));
+        LocalCanvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(RoundAsByte(R), RoundAsByte(G), RoundAsByte(B));
       end;
     end;
   end
@@ -254,7 +264,7 @@ begin
           B := V[J,I,2];
         end;
         //WriteLn(V[J,I,0]:10:5, ' ', V[J,I,1]:10:5, ' ', V[J,I,2]:10:5, ' - ', R:10:5, ' ', G:10:5, ' ', B:10:5);
-        Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(RoundAsByte(R), RoundAsByte(G), RoundAsByte(B));
+        LocalCanvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(RoundAsByte(R), RoundAsByte(G), RoundAsByte(B));
       end;
     end;
   end;
