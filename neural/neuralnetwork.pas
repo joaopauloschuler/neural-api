@@ -117193,11 +117193,9 @@ type
   TDoubleMatrix = array of TDoubleArray;
 var
   MaxAlignedNeuronPos: integer;
-  MaxAlignedDeltaPos: integer;
   MaxParamCountNeuronPos: integer;
   MaxSamplePos: integer;
   MaxGradNeuronPos: integer;
-  MaxNeuronDeltaPos: integer;
   Lines: TStringList;
   LIdx, NeuronIdx, K, SampleIdx, BinIdx, P, I, J, N: integer;
   JStart: integer;
@@ -117206,7 +117204,7 @@ var
   Probe: TNNetVolume;
   LastLayer: TNNetLayer;
   ClassUsed, OutSize: integer;
-  LR, G: TNeuralFloat;
+  LR: TNeuralFloat;
   Target: TNNetVolume;
   // per-trainable-layer flat-index bookkeeping over the whole net
   LayerHasParams: array of boolean;
@@ -117217,12 +117215,15 @@ var
   Grads: array of TFloatArray;
   SampleOrigIdx: array of integer;
   SampleClassUsed: array of integer; // decoded TargetClass actually used
+  SamplePredicted: array of integer; // this probe's own predicted argmax
   UsableCount: integer;
   SumSq: TNeuralFloat;
+  PredictedClass, DeltaCount: integer;
+  InvLr: TNeuralFloat;
   // empirical NTK Gram (Double) + eigenspectrum
   Gram: TDoubleMatrix;
   Eig: TDoubleArray;
-  Dot, MaxAbs, NormVal: Double;
+  Dot, MaxAbs: Double;
   EigSum, EigSqSum, LambdaMax, LambdaMin, CondNum, EffRank: Double;
   // alignment scratch
   Yvec: TDoubleArray;          // centered target-class indicator
@@ -117247,7 +117248,9 @@ var
   OffMeanA, OffMeanB, OffCovAB, OffVarA, OffVarB, OffCorr: Double;
   OffCnt: integer;
   CanDrift: boolean;
-  GI, GJ: TFloatArray;         // bound gradient rows (hoisted out of the K loop)
+  GI, GJ, GRow: TFloatArray;   // bound gradient rows (hoisted out of the K loop)
+  GSRow: TDoubleArray;         // bound GramSelf row
+  RowDotY, SumY2: Double;
   dDrift, cA, cB: Double;      // difference/centered terms computed once (#4)
   Nm1, OutSizeM1, cBinsM1, LastLayerIdx: integer;
 
@@ -117259,12 +117262,13 @@ var
   function CollectGradsAligned(aNet: TNNet;
     out aGrads: array of TFloatArray): integer;
   var
-    si, li, ni, kk, pp, cu: integer;
+    si, li, ni, pp, cu, dsz: integer;
     Nm1, LastIdxA: integer;
-    sq, lr2, gg: TNeuralFloat;
+    sq, lr2, invlr2: TNeuralFloat;
     lay: TNNetLayer;
     neu: TNNetNeuron;
     tgt: TNNetVolume;
+    row: TFloatArray;
     filled: integer;
   begin
     aNet.SetBatchUpdate(true);
@@ -117288,32 +117292,34 @@ var
         tgt.Raw[cu] := 1.0;
         aNet.Backpropagate(tgt);
         SetLength(aGrads[si], NetParamCnt);
-        sq := 0;
+        row := aGrads[si];
         for li := 0 to LastIdxA do
         begin
           if not LayerHasParams[li] then Continue;
           lay := aNet.Layers[li];
           lr2 := lay.LearningRate;
           if lr2 <= 0 then lr2 := 1.0;
+          invlr2 := 1.0 / lr2;
           pp := FlatBase[li];
           MaxAlignedNeuronPos := lay.Neurons.Count - 1;
           for ni := 0 to MaxAlignedNeuronPos do
           begin
             neu := lay.Neurons[ni];
-            MaxAlignedDeltaPos := neu.Delta.Size - 1;
-            for kk := 0 to MaxAlignedDeltaPos do
+            dsz := neu.Delta.Size;
+            if dsz > 0 then
             begin
-              gg := neu.Delta.FData[kk] / lr2;
-              aGrads[si][pp] := gg;
-              sq := sq + gg * gg;
-              Inc(pp);
+              Move(neu.Delta.FData[0], row[pp], dsz * csNeuralFloatSize);
+              TNNetVolume.Mul(TNeuralFloatArrPtr(@row[pp]), invlr2, dsz);
             end;
-            gg := neu.FBiasDelta / lr2;
-            aGrads[si][pp] := gg;
-            sq := sq + gg * gg;
+            Inc(pp, dsz);
+            row[pp] := neu.FBiasDelta * invlr2;
             Inc(pp);
           end;
         end;
+        // Every flat slot belongs to some trainable layer, so ||g||^2 is one
+        // contraction of the whole row.
+        sq := TNNetVolume.DotProduct(TNeuralFloatArrPtr(@row[0]),
+          TNeuralFloatArrPtr(@row[0]), NetParamCnt);
         if sq <= cEps then aGrads[si] := nil else Inc(filled);
       end;
     finally
@@ -117492,6 +117498,7 @@ begin
     SetLength(Grads, Samples.Count);
     SetLength(SampleOrigIdx, Samples.Count);
     SetLength(SampleClassUsed, Samples.Count);
+    SetLength(SamplePredicted, Samples.Count);
     UsableCount := 0;
 
     try
@@ -117506,10 +117513,14 @@ begin
 
         // TargetClass logit the gradient is taken w.r.t.: an explicit in-range
         // class, else this sample's own predicted argmax (a per-sample default).
+        // The argmax is read here in both modes: the alignment block below
+        // scores membership against it, and re-deriving it there would cost a
+        // second forward pass per probe.
+        PredictedClass := LastLayer.Output.GetClass();
         if (TargetClass >= 0) and (TargetClass < OutSize) then
           ClassUsed := TargetClass
         else
-          ClassUsed := LastLayer.Output.GetClass();
+          ClassUsed := PredictedClass;
         if (ClassUsed < 0) or (ClassUsed >= OutSize) then Continue;
 
         Target.Fill(0);
@@ -117518,33 +117529,36 @@ begin
 
         // Flatten this sample's per-parameter weight-gradient vector g_i.
         SetLength(Grads[UsableCount], NetParamCnt);
-        SumSq := 0;
+        GRow := Grads[UsableCount];
         for LIdx := 0 to LastLayerIdx do
         begin
           if not LayerHasParams[LIdx] then Continue;
           Layer := NN.Layers[LIdx];
           LR := Layer.LearningRate;
           if LR <= 0 then LR := 1.0;
+          InvLr := 1.0 / LR;
           P := FlatBase[LIdx];
           MaxGradNeuronPos := Layer.Neurons.Count - 1;
           for NeuronIdx := 0 to MaxGradNeuronPos do
           begin
             Neuron := Layer.Neurons[NeuronIdx];
-            MaxNeuronDeltaPos := Neuron.Delta.Size - 1;
-            for K := 0 to MaxNeuronDeltaPos do
+            DeltaCount := Neuron.Delta.Size;
+            if DeltaCount > 0 then
             begin
-              G := Neuron.Delta.FData[K] / LR;
-              Grads[UsableCount][P] := G;
-              SumSq := SumSq + G * G;
-              Inc(P);
+              Move(Neuron.Delta.FData[0], GRow[P],
+                DeltaCount * csNeuralFloatSize);
+              TNNetVolume.Mul(TNeuralFloatArrPtr(@GRow[P]), InvLr, DeltaCount);
             end;
+            Inc(P, DeltaCount);
             // bias parameter
-            G := Neuron.FBiasDelta / LR;
-            Grads[UsableCount][P] := G;
-            SumSq := SumSq + G * G;
+            GRow[P] := Neuron.FBiasDelta * InvLr;
             Inc(P);
           end;
         end;
+        // Every flat slot belongs to some trainable layer, so ||g_i||^2 is one
+        // contraction of the whole row.
+        SumSq := TNNetVolume.DotProduct(TNeuralFloatArrPtr(@GRow[0]),
+          TNeuralFloatArrPtr(@GRow[0]), NetParamCnt);
 
         // Drop degenerate (exactly-zero) gradient vectors.
         if SumSq <= cEps then
@@ -117554,6 +117568,7 @@ begin
         end;
         SampleOrigIdx[UsableCount] := SampleIdx;
         SampleClassUsed[UsableCount] := ClassUsed;
+        SamplePredicted[UsableCount] := PredictedClass;
         Inc(UsableCount);
       end;
     finally
@@ -117605,7 +117620,7 @@ begin
     for I := 0 to Nm1 do
     begin
       SetLength(GramSelf[I], N);
-      for J := 0 to Nm1 do GramSelf[I][J] := Gram[I][J];
+      Move(Gram[I][0], GramSelf[I][0], N * csDoubleSize);
     end;
 
     // --- Report header ---
@@ -117695,10 +117710,9 @@ begin
     begin
       if (TargetClass >= 0) and (TargetClass < OutSize) then
       begin
-        // Re-derive each probe's predicted argmax to score membership.
-        // (cheap: one more forward; kept simple and frozen.)
-        NN.Compute(Samples[SampleOrigIdx[I]]);
-        if NN.GetLastLayer().Output.GetClass() = TargetClass then
+        // Membership = this probe's own predicted argmax, recorded when its
+        // gradient was collected (the net is frozen, so it cannot have moved).
+        if SamplePredicted[I] = TargetClass then
           Yvec[I] := 1.0
         else
           Yvec[I] := 0.0;
@@ -117712,15 +117726,22 @@ begin
     // a one-vs-rest indicator on the MAJORITY class so it stays a {0,1} vector.
     if not ((TargetClass >= 0) and (TargetClass < OutSize)) then
     begin
-      // pick the most frequent class id as the positive class
-      // (simple mode-of-array via a bounded scan over OutSize buckets).
+      // Pick the most frequent class id as the positive class. Only ids the
+      // probes actually carry can win, so this counts over the N probes rather
+      // than over the whole OutSize-wide output; ties still resolve to the
+      // LOWEST id, as a bucket scan from 0 upwards would.
       BinIdx := -1; MaxBin := -1;
-      for K := 0 to OutSizeM1 do
+      for I := 0 to Nm1 do
       begin
+        K := Trunc(Yvec[I]);
         J := 0;
-        for I := 0 to Nm1 do
-          if Trunc(Yvec[I]) = K then Inc(J);
-        if J > MaxBin then begin MaxBin := J; BinIdx := K; end;
+        for P := 0 to Nm1 do
+          if Trunc(Yvec[P]) = K then Inc(J);
+        if (J > MaxBin) or ((J = MaxBin) and (K < BinIdx)) then
+        begin
+          MaxBin := J;
+          BinIdx := K;
+        end;
       end;
       InClass := 0;
       for I := 0 to Nm1 do
@@ -117738,16 +117759,23 @@ begin
     // the gradient rows a second time.
     DotKY := 0;
     FrobK := 0;
-    FrobYY := 0;
+    SumY2 := 0;
+    for I := 0 to Nm1 do SumY2 := SumY2 + Yvec[I] * Yvec[I];
+    // ||yy^T||_F^2 = sum_ij (y_i y_j)^2 = (sum_i y_i^2)^2 - no N^2 pass.
+    FrobYY := SumY2 * SumY2;
     for I := 0 to Nm1 do
+    begin
+      GSRow := GramSelf[I];
+      RowDotY := 0;
       for J := 0 to Nm1 do
       begin
-        Dot := GramSelf[I][J];
+        Dot := GSRow[J];
         FrobK := FrobK + Dot * Dot;
-        NormVal := Yvec[I] * Yvec[J];
-        FrobYY := FrobYY + NormVal * NormVal;
-        DotKY := DotKY + Dot * NormVal;
+        RowDotY := RowDotY + Dot * Yvec[J];
       end;
+      // <K, yy^T>_F = sum_i y_i * (sum_j K_ij y_j)
+      DotKY := DotKY + Yvec[I] * RowDotY;
+    end;
     if (FrobK > 0) and (FrobYY > 0) then
       Align := DotKY / (Sqrt(FrobK) * Sqrt(FrobYY))
     else
