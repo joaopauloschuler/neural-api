@@ -7477,6 +7477,9 @@ type
   TNNetPower = class(TNNetReLUBase)
     private
       FPower: TNeuralFloat;
+      // The constructor's exponent kept as an integer so Compute can replace
+      // pcr_powf with a multiply chain for the small exponents.
+      FIntPower: integer;
     public
       constructor Create(iPower: integer); reintroduce; overload;
       procedure Compute(); override;
@@ -53554,50 +53557,55 @@ procedure TNNetGridAvgPool.Compute();
 var
   StartTime: double;
   PrevOut: TNNetVolume;
-  MaxD, MaxOutX, MaxOutY: integer;
+  Depth, MaxInX, MaxInY, MaxOutX, MaxOutY: integer;
   FPoolSizeM1: integer;
-  OutX, OutY, KX, KY: integer;
-  InX0, InY0, InX, InY, Count: integer;
+  OutX, OutY: integer;
+  InX0, InY0, InX, InY: integer;
+  InXLo, InXHi, InYLo, InYHi, Count: integer;
   OutPtr: pointer;
-  InvCount: TNeuralFloat;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOut := FPrevLayer.Output;
   Output.Fill(0);
-  MaxD := PrevOut.Depth - 1;
+  Depth := PrevOut.Depth;
+  MaxInX := PrevOut.SizeX - 1;
+  MaxInY := PrevOut.SizeY - 1;
   MaxOutX := FOutput.SizeX - 1;
   MaxOutY := FOutput.SizeY - 1;
   FPoolSizeM1 := FPoolSize - 1;
   for OutY := 0 to MaxOutY do
   begin
     InY0 := OutY * FStride - FPadding;
+    // The window clamped to the real input gives both the iteration bounds and,
+    // as its area, the count_include_pad=False divisor - no test per cell and no
+    // counting pass.
+    InYLo := InY0;
+    if InYLo < 0 then InYLo := 0;
+    InYHi := InY0 + FPoolSizeM1;
+    if InYHi > MaxInY then InYHi := MaxInY;
+    if InYHi < InYLo then continue;
     for OutX := 0 to MaxOutX do
     begin
       InX0 := OutX * FStride - FPadding;
-      // count_include_pad=False: divisor is the number of REAL cells in window.
-      Count := 0;
-      // Rule #5: output row pointer is invariant across the KX/KY window.
+      InXLo := InX0;
+      if InXLo < 0 then InXLo := 0;
+      InXHi := InX0 + FPoolSizeM1;
+      if InXHi > MaxInX then InXHi := MaxInX;
+      if InXHi < InXLo then continue;
+      Count := (InYHi - InYLo + 1) * (InXHi - InXLo + 1);
+      // Rule #5: output row pointer is invariant across the window.
       OutPtr := FOutput.GetRawPtr(OutX, OutY);
-      for KY := 0 to FPoolSizeM1 do
+      for InY := InYLo to InYHi do
       begin
-        InY := InY0 + KY;
-        if (InY < 0) or (InY >= PrevOut.SizeY) then continue;
-        for KX := 0 to FPoolSizeM1 do
+        for InX := InXLo to InXHi do
         begin
-          InX := InX0 + KX;
-          if (InX < 0) or (InX >= PrevOut.SizeX) then continue;
-          Inc(Count);
           // Rule #13: accumulate D channels of one input cell.
-          TNNetVolume.Add(OutPtr, PrevOut.GetRawPtr(InX, InY), MaxD + 1);
+          TNNetVolume.Add(OutPtr, PrevOut.GetRawPtr(InX, InY), Depth);
         end;
       end;
-      if Count > 0 then
-      begin
-        InvCount := 1.0 / Count;
-        // Rule #13: scale the pooled window by 1/Count.
-        TNNetVolume.Mul(OutPtr, InvCount, MaxD + 1);
-      end;
+      // Rule #13: scale the pooled window by 1/Count.
+      TNNetVolume.Mul(OutPtr, 1.0 / Count, Depth);
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -53607,10 +53615,11 @@ procedure TNNetGridAvgPool.Backpropagate();
 var
   StartTime: double;
   PrevErr, PrevOut: TNNetVolume;
-  MaxD, MaxOutX, MaxOutY: integer;
+  Depth, MaxInX, MaxInY, MaxOutX, MaxOutY: integer;
   FPoolSizeM1: integer;
-  OutX, OutY, KX, KY: integer;
-  InX0, InY0, InX, InY, Count: integer;
+  OutX, OutY: integer;
+  InX0, InY0, InX, InY: integer;
+  InXLo, InXHi, InYLo, InYHi, Count: integer;
   OutErrPtr: pointer;
   InvCount: TNeuralFloat;
 begin
@@ -53622,43 +53631,42 @@ begin
   if (PrevOut.Size > 0) and (PrevOut.Size = PrevErr.Size) then
   begin
     StartTime := Now();
-    MaxD := PrevOut.Depth - 1;
+    Depth := PrevOut.Depth;
+    MaxInX := PrevOut.SizeX - 1;
+    MaxInY := PrevOut.SizeY - 1;
     MaxOutX := FOutput.SizeX - 1;
     MaxOutY := FOutput.SizeY - 1;
     FPoolSizeM1 := FPoolSize - 1;
     for OutY := 0 to MaxOutY do
     begin
       InY0 := OutY * FStride - FPadding;
+      // The window clamped to the real input gives both the iteration bounds and,
+      // as its area, the divisor the forward pass used - no test per cell and no
+      // counting pass.
+      InYLo := InY0;
+      if InYLo < 0 then InYLo := 0;
+      InYHi := InY0 + FPoolSizeM1;
+      if InYHi > MaxInY then InYHi := MaxInY;
+      if InYHi < InYLo then continue;
       for OutX := 0 to MaxOutX do
       begin
         InX0 := OutX * FStride - FPadding;
-        // Recompute the real-cell count so the gradient is split evenly.
-        Count := 0;
-        for KY := 0 to FPoolSizeM1 do
-        begin
-          InY := InY0 + KY;
-          if (InY < 0) or (InY >= PrevOut.SizeY) then continue;
-          for KX := 0 to FPoolSizeM1 do
-          begin
-            InX := InX0 + KX;
-            if (InX >= 0) and (InX < PrevOut.SizeX) then Inc(Count);
-          end;
-        end;
-        if Count = 0 then continue;
+        InXLo := InX0;
+        if InXLo < 0 then InXLo := 0;
+        InXHi := InX0 + FPoolSizeM1;
+        if InXHi > MaxInX then InXHi := MaxInX;
+        if InXHi < InXLo then continue;
+        Count := (InYHi - InYLo + 1) * (InXHi - InXLo + 1);
         InvCount := 1.0 / Count;
         // Rule #5: output-error row pointer is invariant across the window.
         OutErrPtr := FOutputError.GetRawPtr(OutX, OutY);
-        for KY := 0 to FPoolSizeM1 do
+        for InY := InYLo to InYHi do
         begin
-          InY := InY0 + KY;
-          if (InY < 0) or (InY >= PrevOut.SizeY) then continue;
-          for KX := 0 to FPoolSizeM1 do
+          for InX := InXLo to InXHi do
           begin
-            InX := InX0 + KX;
-            if (InX < 0) or (InX >= PrevOut.SizeX) then continue;
             // Rule #13: split the pooled gradient across window cells.
             TNNetVolume.MulAdd(PrevErr.GetRawPtr(InX, InY), OutErrPtr,
-              InvCount, MaxD + 1);
+              InvCount, Depth);
           end;
         end;
       end;
@@ -53674,6 +53682,7 @@ constructor TNNetPower.Create(iPower: integer);
 begin
   inherited Create();
   FPower := iPower;
+  FIntPower := iPower;
   FStruct[0] := iPower;
 end;
 
@@ -53683,7 +53692,7 @@ var
   LocalPrevOutput: TNNetVolume;
   OutputCnt: integer;
   StartTime: double;
-  x, PowVal, PowerM1: TNeuralFloat;
+  x, xx, PowVal, PowerM1: TNeuralFloat;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -53692,27 +53701,80 @@ begin
 
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
-    PowerM1 := FPower - 1;
-    for OutputCnt := 0 to SizeM1 do
-    begin
-      x := LocalPrevOutput.FData[OutputCnt];
-      PowVal := pcr_powf(x, FPower);
-      FOutput.FData[OutputCnt] := PowVal;
-      // x^(p-1) = x^p / x, so the derivative reuses the forward power instead of
-      // a second pcr_powf. At x = 0 the identity is 0/0 while pow(0, p-1) is a
-      // well-defined limit (+Inf for p < 1, 0 for p > 1), so keep that call.
-      if x <> 0 then
-        FOutputErrorDeriv.FData[OutputCnt] := FPower * (PowVal / x)
+    // The exponent is a small positive integer in the common case, so the whole
+    // pow/exp/ln machinery collapses to one or two multiplies that the
+    // derivative shares.
+    case FIntPower of
+      2:
+        for OutputCnt := 0 to SizeM1 do
+        begin
+          x := LocalPrevOutput.FData[OutputCnt];
+          FOutput.FData[OutputCnt] := x * x;
+          FOutputErrorDeriv.FData[OutputCnt] := 2 * x;
+        end;
+      3:
+        for OutputCnt := 0 to SizeM1 do
+        begin
+          x := LocalPrevOutput.FData[OutputCnt];
+          xx := x * x;
+          FOutput.FData[OutputCnt] := xx * x;
+          FOutputErrorDeriv.FData[OutputCnt] := 3 * xx;
+        end;
+      4:
+        for OutputCnt := 0 to SizeM1 do
+        begin
+          x := LocalPrevOutput.FData[OutputCnt];
+          xx := x * x;
+          FOutput.FData[OutputCnt] := xx * xx;
+          FOutputErrorDeriv.FData[OutputCnt] := 4 * (xx * x);
+        end;
       else
-        FOutputErrorDeriv.FData[OutputCnt] := FPower * pcr_powf(x, PowerM1);
+      begin
+        PowerM1 := FPower - 1;
+        for OutputCnt := 0 to SizeM1 do
+        begin
+          x := LocalPrevOutput.FData[OutputCnt];
+          PowVal := pcr_powf(x, FPower);
+          FOutput.FData[OutputCnt] := PowVal;
+          // x^(p-1) = x^p / x, so the derivative reuses the forward power instead of
+          // a second pcr_powf. At x = 0 the identity is 0/0 while pow(0, p-1) is a
+          // well-defined limit (+Inf for p < 1, 0 for p > 1), so keep that call.
+          if x <> 0 then
+            FOutputErrorDeriv.FData[OutputCnt] := FPower * (PowVal / x)
+          else
+            FOutputErrorDeriv.FData[OutputCnt] := FPower * pcr_powf(x, PowerM1);
+        end;
+      end;
     end;
   end
   else
   begin
     // can't calculate error on input layers.
-    for OutputCnt := 0 to SizeM1 do
-    begin
-      FOutput.FData[OutputCnt] := pcr_powf(LocalPrevOutput.FData[OutputCnt], FPower);
+    case FIntPower of
+      2:
+        for OutputCnt := 0 to SizeM1 do
+        begin
+          x := LocalPrevOutput.FData[OutputCnt];
+          FOutput.FData[OutputCnt] := x * x;
+        end;
+      3:
+        for OutputCnt := 0 to SizeM1 do
+        begin
+          x := LocalPrevOutput.FData[OutputCnt];
+          FOutput.FData[OutputCnt] := x * x * x;
+        end;
+      4:
+        for OutputCnt := 0 to SizeM1 do
+        begin
+          x := LocalPrevOutput.FData[OutputCnt];
+          xx := x * x;
+          FOutput.FData[OutputCnt] := xx * xx;
+        end;
+      else
+        for OutputCnt := 0 to SizeM1 do
+        begin
+          FOutput.FData[OutputCnt] := pcr_powf(LocalPrevOutput.FData[OutputCnt], FPower);
+        end;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -53910,7 +53972,7 @@ var
   LocalOutputError: TNeuralFloat;
   LocalPrevError: TNNetVolume;
   OutputIdx: integer;
-  OutputSize, Derivative: TNeuralFloat;
+  Delta: TNeuralFloat;
   DestPos, DestBase: integer;
 begin
   OutputIdx := FOutput.GetRawPos(OutputX, OutputY, OutputD);
@@ -53924,14 +53986,11 @@ begin
 
     FSmoothErrorPropagation := true;
 
-    if FSmoothErrorPropagation then
-    begin
-      OutputSize := FFeatureSizeX * FFeatureSizeY * FOutput.Depth;
-    end
-    else
-    begin
-      OutputSize := 1;
-    end;
+    // The error is smoothed over the whole feature window with a unit
+    // derivative, so every destination gets the same share: compute it once
+    // instead of dividing per element.
+    Delta := LocalOutputError /
+      (FFeatureSizeX * FFeatureSizeY * FOutput.Depth);
 
     if
       (OutputX >= FPadding) and (OutputY >= FPadding) and
@@ -53946,8 +54005,7 @@ begin
         for CntX := 0 to MaxX do
         begin
           DestPos := DestBase + CntX;
-          Derivative := 1; //(FOutput.FData[OutputIdx] / FPrevLayer.FOutput.FData[DestPos]);
-          LocalPrevError.FData[DestPos] := LocalPrevError.FData[DestPos] + LocalOutputError*Derivative/OutputSize;
+          LocalPrevError.FData[DestPos] := LocalPrevError.FData[DestPos] + Delta;
         end;
       end;
     end;

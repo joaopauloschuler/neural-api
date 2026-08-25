@@ -38,6 +38,8 @@ type
     // Pooling numerical tests with edge cases
     procedure TestMaxPoolOverlapping;
     procedure TestAvgPoolNumericalPrecision;
+    procedure TestGridAvgPoolPaddedForward;
+    procedure TestGridAvgPoolPaddedGradientCheck;
     procedure TestMinPoolWithNegatives;
     procedure TestPoolingWithOddDimensions;
     procedure TestMinChannelGradientCheck;
@@ -2084,6 +2086,62 @@ begin
     AssertEquals('Avg of region 2 should be 0.25', 0.25, NN.GetLastLayer.Output[1, 0, 0], 0.0001);
     AssertEquals('Avg of region 3 should be -2.5', -2.5, NN.GetLastLayer.Output[0, 1, 0], 0.0001);
     AssertEquals('Avg of region 4 should be 25', 25.0, NN.GetLastLayer.Output[1, 1, 0], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGridAvgPoolPaddedForward;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y: integer;
+  Value: TNeuralFloat;
+begin
+  // TNNetGridAvgPool(3, stride 1, padding 1) over a 4x4 grid: every window is
+  // clipped by the border, so the divisor is the number of REAL cells
+  // (count_include_pad=False) - 4 at the corners, 6 at the edges, 9 inside.
+  // The second channel is -2x the first, pinning the depth handling too.
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 2));
+    NN.AddLayer(TNNetGridAvgPool.Create(3, 1, 1));
+
+    for Y := 0 to 3 do
+    begin
+      for X := 0 to 3 do
+      begin
+        Value := Y * 4 + X + 1;
+        Input[X, Y, 0] := Value;
+        Input[X, Y, 1] := -2 * Value;
+      end;
+    end;
+
+    NN.Compute(Input);
+
+    AssertEquals('Padded grid pool output SizeX', 4, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Padded grid pool output SizeY', 4, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('Padded grid pool output Depth', 2, NN.GetLastLayer.Output.Depth);
+
+    // Corner (0,0): cells 1, 2, 5, 6 over 4 real cells.
+    AssertEquals('Grid pool corner (0,0)', 3.5,
+      NN.GetLastLayer.Output[0, 0, 0], 0.0001);
+    // Edge (3,0): cells 3, 4, 7, 8 over 4 real cells.
+    AssertEquals('Grid pool corner (3,0)', 5.5,
+      NN.GetLastLayer.Output[3, 0, 0], 0.0001);
+    // Interior (1,1): the full 3x3 window 1..11 sums to 54 over 9 real cells.
+    AssertEquals('Grid pool interior (1,1)', 6.0,
+      NN.GetLastLayer.Output[1, 1, 0], 0.0001);
+    // Corner (3,3): cells 11, 12, 15, 16 over 4 real cells.
+    AssertEquals('Grid pool corner (3,3)', 13.5,
+      NN.GetLastLayer.Output[3, 3, 0], 0.0001);
+    // Depth 1 mirrors depth 0 scaled by -2.
+    AssertEquals('Grid pool corner (0,0) depth 1', -7.0,
+      NN.GetLastLayer.Output[0, 0, 1], 0.0001);
+    AssertEquals('Grid pool interior (1,1) depth 1', -12.0,
+      NN.GetLastLayer.Output[1, 1, 1], 0.0001);
   finally
     NN.Free;
     Input.Free;
@@ -8486,6 +8544,16 @@ begin
     NN.Free;
     Input.Free;
   end;
+end;
+
+procedure TTestNeuralNumerical.TestGridAvgPoolPaddedGradientCheck;
+begin
+  // TNNetGridAvgPool(3, stride 1, padding 1): each output spreads its error over
+  // the REAL cells of its clipped window, so the per-cell share differs between
+  // corner, edge and interior windows. A wrong clipped range (or a divisor that
+  // counts padding) shows up as a mismatch against central differences.
+  LayerInputGradientCheck(Self, TNNetGridAvgPool.Create(3, 1, 1),
+    'GridAvgPool padded', 4, 4, 2, 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestSoftPoolGradientCheck;
