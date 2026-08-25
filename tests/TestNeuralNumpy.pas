@@ -32,6 +32,7 @@ type
     procedure TestNpyInt32RoundTrip;
     procedure TestNpyInt8RoundTrip;
     procedure TestNpy2DShapeMapping;
+    procedure TestNpyInt16AndInt64RoundTrip;
     procedure TestNpzNamedSetRoundTrip;
     procedure TestCrc32KnownVectorsAndTailLengths;
     procedure TestRejectFortranOrder;
@@ -183,6 +184,42 @@ begin
         AssertEquals('elem', rr * 10 + cc, Res.Get(cc, rr, 0), 0.0);
   finally
     V.Free; Res.Free; DeleteFile(fn);
+  end;
+end;
+
+procedure TTestNeuralNumpy.TestNpyInt16AndInt64RoundTrip;
+var
+  V, R: TNNetVolume;
+  fn: string;
+  i: integer;
+begin
+  // i2 and i8, both signed extremes, through the writer's typed-store arms.
+  V := TNNetVolume.Create(5, 1, 1);
+  V.FData[0] := -32768; V.FData[1] := -1; V.FData[2] := 0;
+  V.FData[3] := 1; V.FData[4] := 32767;
+  R := nil;
+  fn := TmpName('i16.npy');
+  try
+    SaveVolumeToNpy(fn, V, [], 'i2');
+    R := LoadVolumeFromNpy(fn);
+    for i := 0 to 4 do
+      AssertEquals('i16 element ' + IntToStr(i), V.FData[i], R.FData[i], 0.0);
+  finally
+    V.Free; R.Free; DeleteFile(fn);
+  end;
+  // i8: values a single can hold exactly, including a large negative one.
+  V := TNNetVolume.Create(4, 1, 1);
+  V.FData[0] := -2097152; V.FData[1] := -1; V.FData[2] := 0;
+  V.FData[3] := 2097152;
+  R := nil;
+  fn := TmpName('i64.npy');
+  try
+    SaveVolumeToNpy(fn, V, [], 'i8');
+    R := LoadVolumeFromNpy(fn);
+    for i := 0 to 3 do
+      AssertEquals('i64 element ' + IntToStr(i), V.FData[i], R.FData[i], 0.0);
+  finally
+    V.Free; R.Free; DeleteFile(fn);
   end;
 end;
 

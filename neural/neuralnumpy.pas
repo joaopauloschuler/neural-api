@@ -600,68 +600,6 @@ begin
     raise ENumpyError.CreateFmt('numpy: cannot write dtype "%s"', [DType]);
 end;
 
-procedure AppendElement(var Buf: TBytes; var Pos: integer;
-  Tag: integer; Value: Single);
-var
-  u: Cardinal;
-  d: Double;
-  pd: PCardinal;
-  w: Word;
-  i64: Int64;
-begin
-  case Tag of
-  0: // f4
-  begin
-    u := PCardinal(@Value)^;
-    Buf[Pos] := u and $FF; Buf[Pos+1] := (u shr 8) and $FF;
-    Buf[Pos+2] := (u shr 16) and $FF; Buf[Pos+3] := (u shr 24) and $FF;
-    Inc(Pos, 4);
-  end;
-  1: // f8
-  begin
-    d := Value;
-    pd := PCardinal(@d);
-    Buf[Pos] := pd^ and $FF; Buf[Pos+1] := (pd^ shr 8) and $FF;
-    Buf[Pos+2] := (pd^ shr 16) and $FF; Buf[Pos+3] := (pd^ shr 24) and $FF;
-    Inc(pd);
-    Buf[Pos+4] := pd^ and $FF; Buf[Pos+5] := (pd^ shr 8) and $FF;
-    Buf[Pos+6] := (pd^ shr 16) and $FF; Buf[Pos+7] := (pd^ shr 24) and $FF;
-    Inc(Pos, 8);
-  end;
-  2: // f2
-  begin
-    w := EncodeF16(Value);
-    Buf[Pos] := w and $FF; Buf[Pos+1] := (w shr 8) and $FF;
-    Inc(Pos, 2);
-  end;
-  3: // i1/u1
-  begin
-    Buf[Pos] := Round(Value) and $FF; Inc(Pos);
-  end;
-  4: // i2/u2
-  begin
-    i64 := Round(Value);
-    Buf[Pos] := i64 and $FF; Buf[Pos+1] := (i64 shr 8) and $FF; Inc(Pos, 2);
-  end;
-  5: // i4/u4
-  begin
-    i64 := Round(Value);
-    Buf[Pos] := i64 and $FF; Buf[Pos+1] := (i64 shr 8) and $FF;
-    Buf[Pos+2] := (i64 shr 16) and $FF; Buf[Pos+3] := (i64 shr 24) and $FF;
-    Inc(Pos, 4);
-  end;
-  6: // i8/u8
-  begin
-    i64 := Round(Value);
-    Buf[Pos]   := i64 and $FF;        Buf[Pos+1] := (i64 shr 8) and $FF;
-    Buf[Pos+2] := (i64 shr 16) and $FF; Buf[Pos+3] := (i64 shr 24) and $FF;
-    Buf[Pos+4] := (i64 shr 32) and $FF; Buf[Pos+5] := (i64 shr 40) and $FF;
-    Buf[Pos+6] := (i64 shr 48) and $FF; Buf[Pos+7] := (i64 shr 56) and $FF;
-    Inc(Pos, 8);
-  end;
-  end;
-end;
-
 function BuildNpyBlob(Src: TNNetVolume; const pShape: array of Int64;
   const pDType: string): TBytes;
 var
@@ -672,8 +610,13 @@ var
   HeaderLen, TotalHeader, PadTo: integer;
   PreambleLen: integer;
   DataPos: integer;
-  pShapeHi, ShapeHi, HeaderTextLen, Tag: integer;
+  pShapeHi, ShapeHi, HeaderTextLen: integer;
   NumElementsM1: Int64;
+  pf8: PDouble;
+  pu1: PByte;
+  pu2: PWord;
+  pu4: PCardinal;
+  pi8: PInt64;
 begin
   // normalize dtype (lower, strip byte-order if caller passed one)
   DType := LowerCase(pDType);
@@ -732,27 +675,52 @@ begin
     Result[PreambleLen + i - 1] := Ord(HeaderText[i]);
 
   DataPos := PreambleLen + HeaderLen;
+  if NumElements = 0 then Exit;
   // f4 (the common/default case) is a byte-identical contiguous copy on a LE
-  // host, and f2 is one vectorized narrow into the same LE byte order, so both
-  // skip AppendElement's per-element walk. Other dtypes keep the per-element
-  // encode (genuine format conversion).
-  if DType = 'f4' then
-  begin
-    if NumElements > 0 then
-      Move(Src.FData[0], Result[DataPos], NumElements * csNeuralFloatSize);
-  end
-  else if DType = 'f2' then
-  begin
-    if NumElements > 0 then
-      TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@Result[DataPos]),
-        TNeuralFloatArrPtr(@Src.FData[0]), integer(NumElements));
-  end
-  else
-  begin
-    NumElementsM1 := NumElements - 1;
-    Tag := DTypeTag(DType);   // resolve dtype dispatch once, not per element (#5)
-    for i := 0 to NumElementsM1 do
-      AppendElement(Result, DataPos, Tag, Src.FData[i]);
+  // host, and f2 is one vectorized narrow into the same LE byte order. The
+  // remaining dtypes are a genuine conversion, but the dtype is invariant
+  // across the elements, so the dispatch is unswitched out of the loop (#20)
+  // and each arm stores whole elements through a typed pointer instead of
+  // splitting them into bytes by hand (LE host, as the reader's decode
+  // already assumes). Truncation to the low bytes is what the byte-splitting
+  // did, and is what a narrower typed store does.
+  NumElementsM1 := NumElements - 1;
+  case DTypeTag(DType) of
+  0: // f4
+    Move(Src.FData[0], Result[DataPos], NumElements * csNeuralFloatSize);
+  2: // f2
+    TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@Result[DataPos]),
+      TNeuralFloatArrPtr(@Src.FData[0]), integer(NumElements));
+  1: // f8
+    begin
+      pf8 := PDouble(@Result[DataPos]);
+      for i := 0 to NumElementsM1 do
+      begin pf8^ := Src.FData[i]; Inc(pf8); end;
+    end;
+  3: // i1/u1
+    begin
+      pu1 := PByte(@Result[DataPos]);
+      for i := 0 to NumElementsM1 do
+      begin pu1^ := Byte(Round(Src.FData[i])); Inc(pu1); end;
+    end;
+  4: // i2/u2
+    begin
+      pu2 := PWord(@Result[DataPos]);
+      for i := 0 to NumElementsM1 do
+      begin pu2^ := Word(Round(Src.FData[i])); Inc(pu2); end;
+    end;
+  5: // i4/u4
+    begin
+      pu4 := PCardinal(@Result[DataPos]);
+      for i := 0 to NumElementsM1 do
+      begin pu4^ := Cardinal(Round(Src.FData[i])); Inc(pu4); end;
+    end;
+  6: // i8/u8
+    begin
+      pi8 := PInt64(@Result[DataPos]);
+      for i := 0 to NumElementsM1 do
+      begin pi8^ := Round(Src.FData[i]); Inc(pi8); end;
+    end;
   end;
 end;
 
