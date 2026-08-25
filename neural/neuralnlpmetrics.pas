@@ -398,12 +398,12 @@ type
   end;
 
 // MMLU answer-letter scoring harness. For every question the four answer-letter
-// tokens (LetterTokens[0..3], typically the ids of " A".." D") are each scored
-// as a single-token completion of PromptTokens via ScoreCompletion; the highest
-// log-probability letter is the prediction. NumSubjects sizes the per-subject
-// table (questions with SubjectIndex outside 0..NumSubjects-1 are skipped).
-// LastWindow forwards to ScoreCompletion (over-context prompts score over the
-// trailing window instead of raising). Reports per-subject accuracy plus the
+// tokens (LetterTokens[0..3], typically the ids of " A".." D") are scored as
+// single-token completions of PromptTokens by ONE forward of the prompt; the
+// highest log-probability letter is the prediction. NumSubjects sizes the
+// per-subject table (questions with SubjectIndex outside 0..NumSubjects-1 are
+// skipped). LastWindow scores over-context prompts over the trailing window
+// instead of raising. Reports per-subject accuracy plus the
 // macro (mean-over-subjects) and micro (pooled) averages.
 function EvaluateMMLU(NN: TNNet;
   const Questions: array of TNNetMMLUQuestion;
@@ -1191,6 +1191,111 @@ end;
 // MMLU few-shot accuracy harness
 // ---------------------------------------------------------------------------
 
+// Log-probability of each single-token candidate at the position that follows
+// ContextTokens, from ONE forward. Branch selection, windowing and the
+// re-normalised SafeLogProb math mirror ScoreSequenceFrom for a sequence of
+// length Length(ContextTokens)+1 scored at its last position.
+function ScoreSingleTokenCandidates(NN: TNNet;
+  const ContextTokens: TNeuralIntegerArray;
+  const CandidateTokens: array of integer;
+  LastWindow: boolean): TNeuralFloatDynArr;
+var
+  InV: TNNetVolume;
+  Last, FirstLayer: TNNetLayer;
+  Prefix: TNeuralIntegerArray;
+  ContextLen, InDepth, VocabSize, CtxLen, SampleLen: integer;
+  Cand, CandHi, Tgt, WinStart, WinLen, Row, RowBase: integer;
+  PerPosition, Overflows: boolean;
+  RowSum: TNeuralFloat;
+  LO: TNNetVolume;
+begin
+  CandHi := High(CandidateTokens);
+  SetLength(Result, CandHi + 1);
+  for Cand := 0 to CandHi do Result[Cand] := 0;
+  if NN = nil then Exit;
+  if NN.CountLayers() < 2 then Exit;
+  if CandHi < 0 then Exit;
+  CtxLen := Length(ContextTokens);
+  if CtxLen < 1 then
+    raise EArgumentException.Create(
+      'ScoreSingleTokenCandidates: ContextTokens must be non-empty (the ' +
+      'candidate token is scored from the last context position)');
+  SampleLen := CtxLen + 1;                  // context + the candidate token
+  FirstLayer := NN.GetFirstLayer();
+  ContextLen := FirstLayer.Output.SizeX;
+  InDepth := FirstLayer.Output.Depth;
+  Last := NN.GetLastLayer();
+  // Same head-shape auto-detection as ScoreSequenceFrom (see unit header).
+  PerPosition := (ContextLen > 1) and (Last.Output.SizeX = ContextLen) and
+    (Last.Output.Depth >= 2);
+  if PerPosition
+  then VocabSize := Last.Output.Depth
+  else VocabSize := Last.Output.Size;
+  if VocabSize < 2 then Exit;
+  Overflows := (PerPosition and (SampleLen > ContextLen)) or
+               ((not PerPosition) and (SampleLen - 1 > ContextLen));
+  if Overflows and (not LastWindow) then
+    raise EArgumentException.CreateFmt(
+      'ScoreSequence: sequence length %d exceeds the model context window %d',
+      [SampleLen, ContextLen]);
+  InV := TNNetVolume.Create(FirstLayer.Output);
+  try
+    if PerPosition then
+    begin
+      // The window holds context tokens only; the row predicting the candidate
+      // position is its last row. A causal head makes that row independent of
+      // the candidate token itself, which is what lets every candidate share
+      // this one forward (the same causal shift the whole unit scores by).
+      WinStart := 0;
+      if Overflows then
+      begin
+        WinStart := CtxLen - ContextLen + 1;
+        if WinStart < 0 then WinStart := 0;
+      end;
+      WinLen := CtxLen - WinStart;
+      Prefix := Copy(ContextTokens, WinStart, WinLen);
+      InV.Fill(0);
+      if InDepth = 1
+      then InV.CopyNoChecksIntArr(Prefix)
+      else InV.OneHotEncoding(Prefix);
+      NN.Compute(InV);
+      LO := Last.Output;
+      Row := WinLen - 1;
+      RowBase := LO.GetRawPos(Row, 0);
+      RowSum := TNNetVolume.Sum(TNeuralFloatArrPtr(@LO.FData[RowBase]), VocabSize);
+    end
+    else
+    begin
+      // Single next-token head: the reversed right-aligned prefix is the
+      // context alone, so every candidate reads the same output row exactly.
+      WinStart := 0;
+      if LastWindow and (CtxLen > ContextLen) then WinStart := CtxLen - ContextLen;
+      Prefix := Copy(ContextTokens, WinStart, CtxLen - WinStart);
+      if InDepth = 1 then
+      begin
+        InV.Fill(0);
+        InV.CopyReversedNoChecksIntArr(Prefix);
+      end
+      else InV.OneHotEncodingReversed(Prefix);
+      NN.Compute(InV);
+      LO := Last.Output;
+      RowBase := 0;
+      RowSum := LO.GetSum();
+    end;
+    if RowSum <= 0 then RowSum := 1.0;
+    for Cand := 0 to CandHi do
+    begin
+      Tgt := CandidateTokens[Cand];
+      if (Tgt < 0) or (Tgt >= VocabSize)
+      then Result[Cand] := SafeLogProb(0)   // out-of-vocab: clamped, not skipped
+      else Result[Cand] := SafeLogProb(LO.FData[RowBase + Tgt] / RowSum);
+    end;
+  finally
+    InV.Free;
+  end;
+  SetLength(Prefix, 0);
+end;
+
 function EvaluateMMLU(NN: TNNet;
   const Questions: array of TNNetMMLUQuestion;
   const LetterTokens: array of integer;
@@ -1199,8 +1304,7 @@ function EvaluateMMLU(NN: TNNet;
 var
   QIdx, L, NumLetters, Best, Subj, NonEmpty: integer;
   NumSubjectsM1, QuestionsHi, NumLettersM1: integer;
-  Letter: TNeuralIntegerArray;
-  Score: TNNetCompletionScore;
+  LetterLogProbs: TNeuralFloatDynArr;
   BestLP, MacroSum: TNeuralFloat;
 begin
   Result.MacroAccuracy := 0;
@@ -1221,7 +1325,6 @@ begin
   NumLetters := Length(LetterTokens);
   if NumLetters = 0 then Exit;
   NumLettersM1 := NumLetters - 1;
-  SetLength(Letter, 1); // each candidate is the SINGLE answer-letter token
 
   QuestionsHi := High(Questions);
   for QIdx := 0 to QuestionsHi do
@@ -1229,21 +1332,19 @@ begin
     Subj := Questions[QIdx].SubjectIndex;
     if (Subj < 0) or (Subj >= NumSubjects) then continue;
     if Length(Questions[QIdx].PromptTokens) = 0 then continue;
-    // Score every answer-letter token as a single-token completion; the
-    // highest single-token log-prob letter is the prediction (first-max).
+    // All answer letters are single-token completions of the SAME prompt, so
+    // one forward scores them all; the highest log-prob letter is the
+    // prediction (first-max).
+    LetterLogProbs := ScoreSingleTokenCandidates(NN,
+      Questions[QIdx].PromptTokens, LetterTokens, LastWindow);
     Best := 0;
-    BestLP := 0;
-    for L := 0 to NumLettersM1 do
-    begin
-      Letter[0] := LetterTokens[L];
-      Score := ScoreCompletionCore(NN, Questions[QIdx].PromptTokens,
-        Letter, LastWindow);
-      if (L = 0) or (Score.SumLogProb > BestLP) then
+    BestLP := LetterLogProbs[0];
+    for L := 1 to NumLettersM1 do
+      if LetterLogProbs[L] > BestLP then
       begin
-        BestLP := Score.SumLogProb;
+        BestLP := LetterLogProbs[L];
         Best := L;
       end;
-    end;
     Inc(Result.ItemCount);
     Inc(Result.PerSubject[Subj].Total);
     if Best = Questions[QIdx].GoldLetter then

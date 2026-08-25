@@ -139,6 +139,9 @@ type
     // macro / micro accuracy) are analytic. Verifies the answer-letter argmax,
     // the per-subject buckets, and macro != micro on unbalanced subjects.
     procedure TestMMLUAnswerLetterArgmaxAndAggregation;
+    // EvaluateMMLU scores all answer letters from ONE forward; its winner must
+    // match the per-letter ScoreCompletion reference on both head shapes.
+    procedure TestMMLUOneForwardMatchesPerLetterScoreCompletion;
     // MMLUReport formatting contains the headline macro/micro lines.
     procedure TestMMLUReportFormatting;
     // ARC/PIQA/WinoGrande reuse EvaluateMultipleChoice (acc vs acc_norm).
@@ -1452,6 +1455,65 @@ begin
     AssertEquals('out-of-range subject skipped', 0, Stats.ItemCount);
   finally
     NN.Free;
+  end;
+end;
+
+procedure TTestNeuralNLPMetrics.TestMMLUOneForwardMatchesPerLetterScoreCompletion;
+var
+  NN: TNNet;
+  Questions: array of TNNetMMLUQuestion;
+  LetterTokens: array[0..3] of integer;
+  Letter: TNeuralIntegerArray;
+  Stats: TNNetMMLUStats;
+  NetIdx, QIdx, L, RefBest: integer;
+  RefLP, LP: TNeuralFloat;
+  Msg: string;
+begin
+  SetLength(Letter, 1);
+  LetterTokens[0] := 2; LetterTokens[1] := 5;
+  LetterTokens[2] := 9; LetterTokens[3] := 3;
+  // NetIdx 0: per-position teacher-forced head. NetIdx 1: single next-token
+  // head (reversed prefix). Both branches of the one-forward letter scoring.
+  for NetIdx := 0 to 1 do
+  begin
+    if NetIdx = 0
+    then NN := BuildPerPositionLM(csCtx, csVocab)
+    else NN := BuildCharLM(csCtx, csVocab);
+    try
+      if NetIdx = 0
+      then SetLinearScorerWeights(NN)
+      else SetCopyPreviousWeights(NN);
+      SetLength(Questions, 3);
+      Questions[0].PromptTokens := TNeuralIntegerArray.Create(2, 6);
+      Questions[1].PromptTokens := TNeuralIntegerArray.Create(4, 9, 5);
+      Questions[2].PromptTokens := TNeuralIntegerArray.Create(3);
+      for QIdx := 0 to 2 do
+      begin
+        Questions[QIdx].SubjectIndex := 0;
+        // Reference: one ScoreCompletion forward per letter, first-max.
+        RefBest := 0;
+        RefLP := 0;
+        for L := 0 to 3 do
+        begin
+          Letter[0] := LetterTokens[L];
+          LP := ScoreCompletion(NN, Questions[QIdx].PromptTokens,
+            Letter).SumLogProb;
+          if (L = 0) or (LP > RefLP) then
+          begin
+            RefLP := LP;
+            RefBest := L;
+          end;
+        end;
+        Questions[QIdx].GoldLetter := RefBest;
+      end;
+      Stats := EvaluateMMLU(NN, Questions, LetterTokens, 1);
+      Msg := 'net ' + IntToStr(NetIdx);
+      AssertEquals(Msg + ': questions scored', 3, Stats.ItemCount);
+      AssertEquals(Msg + ': one forward picks the per-letter winner',
+        3, Stats.CorrectCount);
+    finally
+      NN.Free;
+    end;
   end;
 end;
 
