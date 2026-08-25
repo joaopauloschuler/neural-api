@@ -451,7 +451,6 @@ var
   Major, Minor: byte;
   HeaderLen: Cardinal;
   Lo16: Word;
-  HeaderBytes: TBytes;
   Header: string;
   Descr: string;
   FortranOrder: boolean;
@@ -460,7 +459,7 @@ var
   i: integer;
   ElemSize: integer;
   Raw: TBytes;
-  HeaderLenM1, ShapeHi: integer;
+  ShapeHi: integer;
   ElemsPerChunk, Done, ThisElems, ChunkBytes: Int64;
 begin
   if Stream.Read(Magic, 6) <> 6 then
@@ -486,14 +485,12 @@ begin
       raise ENumpyError.Create('numpy: truncated header length');
     HeaderLen := LEtoN(HeaderLen);
   end;
-  SetLength(HeaderBytes, HeaderLen);
-  if HeaderLen > 0 then
-    if Stream.Read(HeaderBytes[0], HeaderLen) <> integer(HeaderLen) then
-      raise ENumpyError.Create('numpy: truncated header dict');
+  // The header dict is ASCII, so it is read straight into the string instead
+  // of through a byte buffer and a per-character Chr loop.
   SetLength(Header, HeaderLen);
-  HeaderLenM1 := integer(HeaderLen) - 1;
-  for i := 0 to HeaderLenM1 do
-    Header[i + 1] := Chr(HeaderBytes[i]);
+  if HeaderLen > 0 then
+    if Stream.Read(Header[1], HeaderLen) <> integer(HeaderLen) then
+      raise ENumpyError.Create('numpy: truncated header dict');
 
   ParseHeaderDict(Header, Descr, FortranOrder, Shape);
   OutDType := NormalizeDescr(Descr);
@@ -659,20 +656,23 @@ begin
   HeaderLen := ((PreambleLen + TotalHeader + PadTo - 1) div PadTo) * PadTo
     - PreambleLen;
   // pad HeaderText with spaces up to HeaderLen-1, then newline
-  while Length(HeaderText) < HeaderLen - 1 do HeaderText := HeaderText + ' ';
+  // One padded append instead of a reallocating concatenation per space (#23).
+  if Length(HeaderText) < HeaderLen - 1 then
+    HeaderText := HeaderText +
+      StringOfChar(' ', HeaderLen - 1 - Length(HeaderText));
   HeaderText := HeaderText + #10;
   if Length(HeaderText) <> HeaderLen then
     HeaderLen := Length(HeaderText); // safety (should match)
 
   SetLength(Result, PreambleLen + HeaderLen + NumElements * ElemSize);
-  for i := 0 to 5 do Result[i] := NPY_MAGIC[i];
+  Move(NPY_MAGIC[0], Result[0], 6);
   Result[6] := 1; // major
   Result[7] := 0; // minor
   Result[8] := HeaderLen and $FF;
   Result[9] := (HeaderLen shr 8) and $FF;
   HeaderTextLen := Length(HeaderText);
-  for i := 1 to HeaderTextLen do
-    Result[PreambleLen + i - 1] := Ord(HeaderText[i]);
+  if HeaderTextLen > 0 then
+    Move(HeaderText[1], Result[PreambleLen], HeaderTextLen);
 
   DataPos := PreambleLen + HeaderLen;
   if NumElements = 0 then Exit;
@@ -844,7 +844,6 @@ var
   CompSize, USize, LocalOfs: Cardinal;
   EntryName: string;
   i: integer;
-  NameLenM1: integer;
 begin
   if FStream.Size < 22 then
     raise ENumpyError.Create('numpy: .npz too small to be a ZIP');
@@ -892,9 +891,7 @@ begin
     CommentLen := ReadWordAt(CdBytes, Pos + 32);
     LocalOfs := ReadDWordAt(CdBytes, Pos + 42);
     SetLength(EntryName, NameLen);
-    NameLenM1 := NameLen - 1;
-    for i := 0 to NameLenM1 do
-      EntryName[i + 1] := Chr(CdBytes[Pos + 46 + i]);
+    if NameLen > 0 then Move(CdBytes[Pos + 46], EntryName[1], NameLen);
     // strip trailing ".npy" to form the dict key
     if (Length(EntryName) > 4) and
        (LowerCase(Copy(EntryName, Length(EntryName) - 3, 4)) = '.npy') then
@@ -1093,7 +1090,7 @@ procedure TNNetNpzWriter.Save;
 var
   Stream: TFileStream;
   i, n: integer;
-  nM1, EntryNameLenM1: integer;
+  nM1, EntryNameLen: integer;
   EntryName: string;
   NameBytes: TBytes;
   Crc, CompSize: Cardinal;
@@ -1127,10 +1124,9 @@ begin
     begin
       LocalOfs[i] := Stream.Position;
       EntryName := FKeys[i] + '.npy';
-      SetLength(NameBytes, Length(EntryName));
-      EntryNameLenM1 := Length(EntryName) - 1;
-      for P := 0 to EntryNameLenM1 do
-        NameBytes[P] := Ord(EntryName[P + 1]);
+      EntryNameLen := Length(EntryName);
+      SetLength(NameBytes, EntryNameLen);
+      if EntryNameLen > 0 then Move(EntryName[1], NameBytes[0], EntryNameLen);
       Crc := Crc32Of(FBlobs[i]);   // computed once here, reused in central dir
       Crcs[i] := Crc;
       CompSize := Length(FBlobs[i]);
@@ -1157,10 +1153,9 @@ begin
     for i := 0 to nM1 do
     begin
       EntryName := FKeys[i] + '.npy';
-      SetLength(NameBytes, Length(EntryName));
-      EntryNameLenM1 := Length(EntryName) - 1;
-      for P := 0 to EntryNameLenM1 do
-        NameBytes[P] := Ord(EntryName[P + 1]);
+      EntryNameLen := Length(EntryName);
+      SetLength(NameBytes, EntryNameLen);
+      if EntryNameLen > 0 then Move(EntryName[1], NameBytes[0], EntryNameLen);
       Crc := Crcs[i];              // reuse first-loop CRC (no second byte pass)
       CompSize := Length(FBlobs[i]);
       SetLength(Hdr, 46);
