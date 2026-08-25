@@ -1061,8 +1061,9 @@ end;
 
 procedure TTestNeuralNLPMetrics.TestSelfBLEU;
 var
-  Gens: array of TNeuralIntegerArray;
-  Expected: TNeuralFloat;
+  Gens, Cand, Ref: array of TNeuralIntegerArray;
+  Expected, PerCand: TNeuralFloat;
+  I, J: integer;
 begin
   // Three IDENTICAL generations: every candidate-vs-other BLEU is 1.0, so
   // self-BLEU = 1.0 (maximal redundancy / zero diversity).
@@ -1085,6 +1086,53 @@ begin
   // Fewer than two generations -> 0 (nothing to compare against).
   AssertEquals('self-BLEU of a single generation is 0',
     0.0, SelfBLEU(['a b c'], 4, true), 1e-9);
+
+  // Self-BLEU builds every generation's n-gram maps once and reuses them for
+  // both roles of each ordered pair. Pin the result BIT-EXACTLY against the
+  // naive "one CorpusBLEU call per ordered pair" formulation it replaces, on a
+  // set with a repeat, a shorter generation and an exact duplicate.
+  SetLength(Gens, 4);
+  Gens[0] := TNeuralIntegerArray.Create(0, 1, 2, 3, 1);
+  Gens[1] := TNeuralIntegerArray.Create(0, 1, 4, 3);
+  Gens[2] := TNeuralIntegerArray.Create(5, 1, 2, 3, 1, 2);
+  Gens[3] := TNeuralIntegerArray.Create(0, 1, 2, 3, 1);
+  SetLength(Cand, 1);
+  SetLength(Ref, 1);
+  Expected := 0;
+  for I := 0 to 3 do
+  begin
+    PerCand := 0;
+    Cand[0] := Gens[I];
+    for J := 0 to 3 do
+    begin
+      if J = I then continue;
+      Ref[0] := Gens[J];
+      PerCand := PerCand + CorpusBLEU(Cand, Ref, 4, true);
+    end;
+    Expected := Expected + PerCand / 3;
+  end;
+  Expected := Expected / 4;
+  AssertEquals('self-BLEU equals the pairwise CorpusBLEU mean (smoothed)',
+    Expected, SelfBLEU(Gens, 4, true), 0.0);
+
+  // Same pin unsmoothed, which also exercises the zero-precision early exit
+  // (no 4-gram of Gens[1] survives against most references).
+  Expected := 0;
+  for I := 0 to 3 do
+  begin
+    PerCand := 0;
+    Cand[0] := Gens[I];
+    for J := 0 to 3 do
+    begin
+      if J = I then continue;
+      Ref[0] := Gens[J];
+      PerCand := PerCand + CorpusBLEU(Cand, Ref, 4, false);
+    end;
+    Expected := Expected + PerCand / 3;
+  end;
+  Expected := Expected / 4;
+  AssertEquals('self-BLEU equals the pairwise CorpusBLEU mean (unsmoothed)',
+    Expected, SelfBLEU(Gens, 4, false), 0.0);
 end;
 
 procedure TTestNeuralNLPMetrics.TestDecodeBIOEntities;

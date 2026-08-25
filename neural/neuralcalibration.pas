@@ -126,7 +126,7 @@ procedure ForwardProbsAndLogits(
 var
   Output: TNNetVolume;
   I, N, NM1: integer;
-  Sum, MaxV, Acc, V, AccClamped: TNeuralFloat;
+  Sum, MaxV, Acc: TNeuralFloat;
   IsProb: boolean;
 begin
   NN.Compute(Input);
@@ -134,69 +134,57 @@ begin
   N := Output.Size;
   NM1 := N - 1;
   // Detect whether the output already looks like a probability simplex
-  // (non-negative entries summing to ~1) -> softmax head.
-  Sum := 0;
-  IsProb := True;
-  for I := 0 to NM1 do
-  begin
-    if Output.FData[I] < -cEps then IsProb := False;
-    Sum := Sum + Output.FData[I];
-  end;
-  if Abs(Sum - 1.0) > 1e-3 then IsProb := False;
+  // (non-negative entries summing to ~1) -> softmax head. Both reductions are
+  // whole-volume, so they run the vectorised volume kernels (#13).
+  Sum := Output.GetSum();
+  IsProb := (Output.GetMin() >= -cEps) and (Abs(Sum - 1.0) <= 1e-3);
 
   if IsProb then
   begin
     for I := 0 to NM1 do
-    begin
-      Probs[I]  := Max(cEps, Output.FData[I]);
-      Logits[I] := Ln(Probs[I]); // pseudo-logits, see unit header
-    end;
+      Probs[I] := Max(cEps, Output.FData[I]);
+    // pseudo-logits, see unit header
+    TNNetVolume.Ln(TNeuralFloatArrPtr(@Logits[0]),
+      TNeuralFloatArrPtr(@Probs[0]), N);
   end
   else
   begin
     // Treat raw output as logits; softmax it into Probs.
-    MaxV := Output.FData[0];
-    for I := 1 to NM1 do
-      if Output.FData[I] > MaxV then MaxV := Output.FData[I];
-    Acc := 0;
-    for I := 0 to NM1 do
-    begin
-      Logits[I] := Output.FData[I];
-      V := Exp(Output.FData[I] - MaxV);
-      Probs[I] := V;
-      Acc := Acc + V;
-    end;
-    AccClamped := Max(cEps, Acc);
-    for I := 0 to NM1 do
-      Probs[I] := Probs[I] / AccClamped;
+    Move(Output.FData[0], Logits[0], N * csNeuralFloatSize);
+    MaxV := Output.GetMax();
+    Acc := TNNetVolume.ExpShiftSum(TNeuralFloatArrPtr(@Probs[0]),
+      TNeuralFloatArrPtr(@Output.FData[0]), MaxV, N);
+    TNNetVolume.Mul(TNeuralFloatArrPtr(@Probs[0]), 1.0 / Max(cEps, Acc), N);
   end;
 end;
 
-// -ln(softmax(Logits/T)[K]) for one sample. Only the label's probability is
-// ever consumed, so the normalize pass and the N probability stores of a full
-// softmax are skipped: the sum is accumulated and the single needed term is
-// divided out afterwards. MaxRaw is max(Logits), supplied by the caller because
-// it does not depend on T (T > 0, and scaling by a positive constant does not
-// move the argmax).
+// -ln(softmax(Logits/T)[K]) for one sample, evaluated as the log-sum-exp
+// identity so no probability is ever normalised and the label's exponential
+// never has to be taken. Scratch is a caller-owned row of at least N floats,
+// reused across every (sample, temperature) evaluation. MaxRaw is max(Logits),
+// supplied by the caller because it does not depend on T (T > 0, and scaling
+// by a positive constant does not move the argmax).
 function NLLAtTemp(
-  const Logits: array of TNeuralFloat; MaxRaw, T: TNeuralFloat;
-  K, N: integer): TNeuralFloat;
+  const Logits: array of TNeuralFloat; Scratch: TNeuralFloatArrPtr;
+  MaxRaw, T: TNeuralFloat; K, N: integer): TNeuralFloat;
 var
-  I, NM1: integer;
-  MaxV, Acc, AccClamped, InvT, InvAcc, P: TNeuralFloat;
+  MaxV, Acc, InvT: TNeuralFloat;
 begin
-  NM1 := N - 1;
-  // Both divisors are loop-invariant: one reciprocal each, then a multiply
-  // instead of a divide (#21).
+  // The divisor is loop-invariant: one reciprocal, then a multiply instead of
+  // a divide (#21).
   InvT := 1.0 / T;
   MaxV := MaxRaw * InvT;
-  Acc := 0;
-  for I := 0 to NM1 do
-    Acc := Acc + Exp(Logits[I] * InvT - MaxV);
-  AccClamped := Max(cEps, Acc);
-  InvAcc := 1.0 / AccClamped;
-  P := Exp(Logits[K] * InvT - MaxV) * InvAcc;
-  Result := -Ln(Max(cEps, P));
+  // Scaled logits into the caller's scratch row, then one fused shift-exp-sum
+  // (#13/#19) instead of N scalar RTL Exp calls.
+  Move(Logits[0], Scratch^[0], N * csNeuralFloatSize);
+  TNNetVolume.Mul(Scratch, InvT, N);
+  Acc := TNNetVolume.ExpShiftSum(Scratch, Scratch, MaxV, N);
+  // -ln(exp(z_K - MaxV) / Acc) = ln(Acc) - (z_K - MaxV), which drops the
+  // exponential of the label term entirely (#14). Rounding is monotone, so
+  // MaxV is the largest scaled logit and its term is exactly exp(0) = 1:
+  // Acc >= 1, ln(Acc) >= 0, and no clamp on Acc or on the probability is
+  // reachable.
+  Result := Ln(Acc) - (Logits[K] * InvT - MaxV);
 end;
 
 function ComputeCalibration(
@@ -269,20 +257,22 @@ begin
         PredClass := J;
       end;
 
-    // Brier: sum over classes of (p_j - onehot_j)^2.
-    for J := 0 to NM1 do
-    begin
-      if J = TrueClass then Diff := Probs[J] - 1.0
-      else Diff := Probs[J];
-      BrierAcc := BrierAcc + Diff * Diff;
-    end;
+    // Brier: sum over classes of (p_j - onehot_j)^2. Expanding the one-hot
+    // term gives sum(p^2) - 2*p[TrueClass] + 1, which drops the per-class
+    // branch and lets the sum of squares run the vectorised kernel (#13).
+    // The expansion is exactly non-negative in real arithmetic; a perfect
+    // prediction can still round a hair below zero, so the term is floored.
+    Diff := TNNetVolume.DotProduct(TNeuralFloatArrPtr(@Probs[0]),
+      TNeuralFloatArrPtr(@Probs[0]), N) - 2.0 * Probs[TrueClass] + 1.0;
+    if Diff < 0 then Diff := 0;
+    BrierAcc := BrierAcc + Diff;
 
     Inc(Total);
     if PredClass = TrueClass then Inc(Correct);
 
     // bin by top-1 confidence; clamp the p=1.0 edge into the last bin.
     B := Trunc(Conf * BinCount);
-    if B >= BinCount then B := BinCount - 1;
+    if B >= BinCount then B := BinCountM1;
     if B < 0 then B := 0;
     Inc(Result.BinCount_[B]);
     BinSumConf[B] := BinSumConf[B] + Conf;
@@ -412,6 +402,8 @@ var
   // max(Logits) per sample: temperature-invariant, so it is computed once here
   // instead of once per (sample, grid point).
   AllMax: array of TNeuralFloat;
+  // one row of scaled logits, reused by every (sample, grid point) evaluation.
+  Scratch: array of TNeuralFloat;
   MaxRaw: TNeuralFloat;
   T, BestT, NLL, BestNLL, Lo, Hi, GridStep: TNeuralFloat;
 begin
@@ -429,6 +421,7 @@ begin
   SetLength(AllLogits, InputCount);
   SetLength(AllLabel, InputCount);
   SetLength(AllMax, InputCount);
+  SetLength(Scratch, N);
 
   // Single forward pass over the set; cache logits so the grid scan is pure
   // arithmetic (the backbone is touched exactly once and never mutated).
@@ -466,7 +459,8 @@ begin
     begin
       NLL := 0;
       for I := 0 to TotalM1 do
-        NLL := NLL + NLLAtTemp(AllLogits[I], AllMax[I], T, AllLabel[I], N);
+        NLL := NLL + NLLAtTemp(AllLogits[I], TNeuralFloatArrPtr(@Scratch[0]),
+          AllMax[I], T, AllLabel[I], N);
       NLL := NLL / Total;
       if NLL < BestNLL then
       begin
@@ -496,9 +490,9 @@ var
   F: TextFile;
   Img: array of array of integer; // [row][col], 0=black .. 255=white
   X, Y, B, Col, BarTop, RefRow: integer;
-  BinW, BinWM1, ReportBinCountM1: integer;
+  BinW, BinWM1, ReportBinCountM1, OutPos, PieceLen: integer;
   Acc: TNeuralFloat;
-  Line: string;
+  Line, Piece: string;
 begin
   Result := False;
   if Report.BinCount <= 0 then Exit;
@@ -545,15 +539,26 @@ begin
     WriteLn(F, '# reliability diagram: per-bin accuracy bars vs y=x reference');
     WriteLn(F, cW, ' ', cH);
     WriteLn(F, cMax);
+    // One row of up to cW values is at most 4 characters each ("255" + the
+    // separator). Presize the row once and write through an index instead of
+    // reallocating the string per pixel (#23).
+    SetLength(Line, cW * 4);
     for Y := 0 to cHM1 do
     begin
-      Line := '';
+      OutPos := 0;
       for X := 0 to cWM1 do
       begin
-        if Line <> '' then Line := Line + ' ';
-        Line := Line + IntToStr(Img[Y][X]);
+        if X > 0 then
+        begin
+          Inc(OutPos);
+          Line[OutPos] := ' ';
+        end;
+        Piece := IntToStr(Img[Y][X]);
+        PieceLen := Length(Piece);
+        Move(Piece[1], Line[OutPos + 1], PieceLen);
+        Inc(OutPos, PieceLen);
       end;
-      WriteLn(F, Line);
+      WriteLn(F, Copy(Line, 1, OutPos));
     end;
     CloseFile(F);
     Result := True;

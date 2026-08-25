@@ -719,6 +719,11 @@ type
       // paths differ only in summation ORDER, and every term is non-negative,
       // so the reordering is benign (unlike that shortcut). Coded by Claude (AI).
       class function SumSqrCentered(pSrc: TNeuralFloatArrPtr; Mean: TNeuralFloat; N: integer): TNeuralFloat; static;
+      // Sum of src[0..N-1]. AVX builds run the 8-wide AVXGetSum reduction once
+      // the slice is long enough to pay for it; every other build runs the
+      // equivalent scalar loop. The two paths differ only in summation ORDER,
+      // so results may differ in the last ulp. Coded by Claude (AI).
+      class function Sum(pSrc: TNeuralFloatArrPtr; N: integer): TNeuralFloat; static;
       // Quantizes src[0..N-1] to symmetric int8 codes against a KNOWN row max:
       // dst[i] = clamp(Round(src[i] * 127/MaxAbs), -127, 127), with NaN coding
       // as 0 and +/-Inf clamping to +/-127. MaxAbs must be the value
@@ -10777,18 +10782,18 @@ end;
 {$ELSE}
 var
   I, NM1: integer;
-  V, Sum: TNeuralFloat;
+  V, Acc: TNeuralFloat;
 begin
   if N <= 0 then exit(0);
   NM1 := N - 1;
-  Sum := 0;
+  Acc := 0;
   for I := 0 to NM1 do
   begin
     V := NeuralExp(pSrc^[I] - Shift);
     pDst^[I] := V;
-    Sum := Sum + V;
+    Acc := Acc + V;
   end;
-  Result := Sum;
+  Result := Acc;
 end;
 {$ENDIF}
 {$UNDEF HASAVXEXPSHIFTSUM}
@@ -13260,6 +13265,25 @@ begin
     Centered := pSrc^[I] - Mean;
     Result := Result + Centered * Centered;
   end;
+end;
+
+class function TNNetVolume.Sum(pSrc: TNeuralFloatArrPtr;
+  N: integer): TNeuralFloat;
+var
+  I, vHigh: integer;
+begin
+  Result := 0;
+  if N <= 0 then exit;
+  {$IFDEF AVXANY}
+  if N >= csMinAvxSize then
+  begin
+    Result := AVXGetSum(pSrc, N);
+    exit;
+  end;
+  {$ENDIF}
+  vHigh := N - 1;
+  for I := 0 to vHigh do
+    Result := Result + pSrc^[I];
 end;
 
 class function TNNetVolume.MaxAbsFinite(pSrc: TNeuralFloatArrPtr;
