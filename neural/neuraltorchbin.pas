@@ -1056,6 +1056,7 @@ begin
         NumElements := NumElements * Node.Shape[j];
       end;
       FTensors[TensorCnt].Name := Root.Keys[i].StrVal;
+      AddTensorToIndex(TensorCnt);
       FTensors[TensorCnt].Shard := FCurShard;
       FTensors[TensorCnt].DType :=
         DTypeOfStorageClass(Node.StorageDType, ElemSize);

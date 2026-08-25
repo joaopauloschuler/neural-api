@@ -18397,6 +18397,7 @@ begin
   FTensors[Idx].DataBegin := 0;
   FTensors[Idx].DataEnd := Elems * 4;
   FTensors[Idx].Shard := 0;
+  AddTensorToIndex(Idx);
 end;
 
 function TNNetMemTensorReader.CanStreamTensorRows(
@@ -27949,6 +27950,7 @@ begin
   SetLength(FTensors[Idx].Shape, Length(Shape));
   ShapeHi := High(Shape);
   for i := 0 to ShapeHi do FTensors[Idx].Shape[i] := Shape[i];
+  AddTensorToIndex(Idx);
   FSrcNames[Idx] := SrcName;
   FKinds[Idx] := Kind;
 end;
@@ -55928,6 +55930,7 @@ begin
   SetLength(FTensors[Idx].Shape, Length(Shape));
   ShapeHi := High(Shape);
   for i := 0 to ShapeHi do FTensors[Idx].Shape[i] := Shape[i];
+  AddTensorToIndex(Idx);
   FSrcNames[Idx] := SrcName;
   FKinds[Idx] := Kind;
 end;

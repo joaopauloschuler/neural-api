@@ -1244,6 +1244,9 @@ begin
   // ---- tensor infos ----
   SetLength(FTensors, TensorCount);
   SetLength(FGGMLTypes, TensorCount);
+  // The name index is filled entry by entry below so the duplicate check
+  // stays a hash lookup instead of a scan of everything read so far.
+  ResetTensorIndex(integer(TensorCount));
   Dims := nil;
   TensorCountM1 := integer(TensorCount) - 1;
   for i := 0 to TensorCountM1 do
@@ -1253,10 +1256,11 @@ begin
     if FTensors[i].Name = '' then
       raise EGGUFError.CreateFmt(
         'gguf: empty tensor name (tensor %d): %s', [i, FFileName]);
-    if FindTensor(FTensors[i].Name) <> i then
+    if FindTensor(FTensors[i].Name) >= 0 then
       raise EGGUFError.CreateFmt(
         'gguf: duplicate tensor name "%s": %s',
         [FTensors[i].Name, FFileName]);
+    AddTensorToIndex(i);
     Stream.ReadBuffer(U32, 4);
     NDims := integer(U32);
     if (NDims < 1) or (NDims > 8) then
@@ -1523,7 +1527,9 @@ begin
     raise EGGUFError.CreateFmt(
       'gguf: cannot rename "%s" to "%s" - the target name already exists: %s',
       [pOldName, pNewName, FFileName]);
+  RemoveTensorFromIndex(pOldName);
   FTensors[Idx].Name := pNewName;
+  AddTensorToIndex(Idx);
 end;
 
 procedure TNNetGGUFReader.RegisterRowDeinterleave(const pName: string;
