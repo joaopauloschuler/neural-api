@@ -13159,6 +13159,10 @@ type
     // ComputeFFT (forward) and the two backward FFT helpers never run on the
     // stack simultaneously for one instance, so they share these by name.
     FcReBuf, FcImBuf, FxReBuf, FxImBuf, FeReBuf, FeImBuf: array of Double;
+    // Reversed copy of the input (FxRevBuf[0] = x[0], FxRevBuf[p] = x[n-p]),
+    // sized N in SetPrevLayer. It makes the direct forward's kernel index
+    // ascend, so each output is two contiguous dot products.
+    FxRevBuf: array of TNeuralFloat;
     procedure ComputePreviousLayerErrorCPU(); override;
     procedure ComputeFFT();
     procedure ComputePreviousLayerErrorFFT();
@@ -13313,10 +13317,17 @@ type
   private
     FN: integer;        // half the input Depth (vector length n)
     FUnbind: integer;   // 0 = bind (convolution), 1 = unbind (correlation)
+    // Reversed copy of b: FBRev[0] = b[0], FBRev[i] = b[n-i]. It turns the
+    // DESCENDING cyclic index of the bind forward (and of the unbind da
+    // gradient) into an ascending walk, so both become two contiguous dot
+    // products. Sized once in SetPrevLayer, never per call (#17).
+    FBRev: array of TNeuralFloat;
+    procedure BuildBRev();
     procedure ComputeCPU();
     procedure ComputePreviousLayerErrorCPU();
   public
     constructor Create(pUnbind: integer = 0); reintroduce; overload;
+    destructor Destroy(); override;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); reintroduce; override;
     procedure Compute(); override;
     procedure Backpropagate(); override;
@@ -15532,9 +15543,13 @@ type
     FDepth: integer;        // D
     FVmem: TNNetVolume;     // cached membrane potential V[t] per (t,d)
     FSpike: TNNetVolume;    // cached binary spikes S[t] per (t,d) (== Output)
+    // Per-channel beta/V_th materialized once per forward (Depth-sized, allocated
+    // in SetPrevLayer) so the time-major forward reads them by index.
+    FBetaBuf, FVthBuf: array of TNeuralFloat;
     // Per-channel effective dynamics (== scalar FBeta/FVth when not learning).
     function EffBeta(d: integer): TNeuralFloat;
     function EffVth(d: integer): TNeuralFloat;
+    procedure BuildDynamics();
     procedure ComputeCPU();
     procedure BackpropagateCPU();
   public
@@ -15617,8 +15632,12 @@ type
     FVmem: TNNetVolume;       // cached membrane potential V[t] per (t,d)
     FAdapt: TNNetVolume;      // cached adaptation trace a[t] per (t,d)
     FSpike: TNNetVolume;      // cached binary spikes S[t] per (t,d) (== Output)
+    // Per-channel beta/base V_th materialized once per forward (Depth-sized,
+    // allocated in SetPrevLayer) so the O(T*D) body indexes them.
+    FBetaBuf, FVthBuf: array of TNeuralFloat;
     function EffBeta(d: integer): TNeuralFloat;
     function EffVth(d: integer): TNeuralFloat;
+    procedure BuildDynamics();
     procedure ComputeCPU();
     procedure BackpropagateCPU();
   public
@@ -83062,6 +83081,7 @@ begin
   SetLength(FcReBuf, N); SetLength(FcImBuf, N);
   SetLength(FxReBuf, N); SetLength(FxImBuf, N);
   SetLength(FeReBuf, N); SetLength(FeImBuf, N);
+  SetLength(FxRevBuf, N);
   InitDefault();
   // The kernel c is the only learned operator; keep the bias neuron at 0 so the
   // layer starts as a (near-)identity-magnitude circular convolution.
@@ -83077,6 +83097,7 @@ begin
   SetLength(FcReBuf, 0); SetLength(FcImBuf, 0);
   SetLength(FxReBuf, 0); SetLength(FxImBuf, 0);
   SetLength(FeReBuf, 0); SetLength(FeImBuf, 0);
+  SetLength(FxRevBuf, 0);
   inherited Destroy();
 end;
 
@@ -83121,41 +83142,49 @@ end;
 //   y[i] = bias[i] + sum_k c[(i-k) mod n] * x[k].
 procedure TNNetCirculantLinear.ComputeCPU();
 var
-  N, OutIdx, InIdx, KernelIdx: integer;
+  N, OutIdx, p: integer;
   NM1: integer;
   Acc: TNeuralFloat;
   Kernel, Bias, PrevOut: TNNetVolume;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   N := FOutput.Size;
+  if N <= 0 then exit;
   NM1 := N - 1;
   Kernel := FArrNeurons[0].FWeights;
   Bias := FArrNeurons[1].FWeights;
   PrevOut := FPrevLayer.FOutput;
+  // #13: reversing the INPUT once (O(n)) rewrites y[i] = sum_k c[(i-k) mod n]
+  // x[k] as y[i] = sum_p c[(i+p) mod n] xr[p]. The kernel index then ASCENDS
+  // and wraps exactly once, so every output is two contiguous dot products
+  // instead of n scalar multiply-adds with a wrap test. Reversing the input
+  // rather than the kernel keeps the fast path correct for hand-edited weights
+  // (no mirror to rebuild after an update).
+  FxRevBuf[0] := PrevOut.FData[0];
+  for p := 1 to NM1 do
+    FxRevBuf[p] := PrevOut.FData[N - p];
   for OutIdx := 0 to NM1 do
   begin
-    Acc := 0;
-    for InIdx := 0 to NM1 do
-    begin
-      KernelIdx := OutIdx - InIdx;
-      if KernelIdx < 0 then KernelIdx := KernelIdx + N;
-      Acc := Acc + Kernel.FData[KernelIdx] * PrevOut.FData[InIdx];
-    end;
-    if FSuppressBias = 0 then
-      FOutput.FData[OutIdx] := Acc + Bias.FData[OutIdx]
-    else
-      FOutput.FData[OutIdx] := Acc;
+    Acc := TNNetVolume.DotProduct
+      (Addr(FxRevBuf[0]), Kernel.GetRawPtr(OutIdx), N - OutIdx);
+    if OutIdx > 0 then
+      Acc := Acc + TNNetVolume.DotProduct
+        (Addr(FxRevBuf[N - OutIdx]), Kernel.GetRawPtr(0), OutIdx);
+    FOutput.FData[OutIdx] := Acc;
   end;
+  // #13: the per-output bias test is loop-invariant; one vector add replaces N
+  // scalar adds and N branches.
+  if FSuppressBias = 0 then FOutput.Add(Bias);
 end;
 
 // Input gradient: dL/dx[k] = sum_i outErr[i] * c[(i-k) mod n]
 // (circular correlation of the output error with the kernel c).
 procedure TNNetCirculantLinear.ComputePreviousLayerErrorCPU();
 var
-  N, OutIdx, InIdx, KernelIdx: integer;
+  N, InIdx: integer;
   NM1: integer;
   LocalPrevError, Kernel: TNNetVolume;
-  Err: TNeuralFloat;
+  Acc: TNeuralFloat;
 begin
   if FUseFFT then
   begin
@@ -83166,19 +83195,16 @@ begin
   Kernel := FArrNeurons[0].FWeights;
   N := FOutput.Size;
   NM1 := N - 1;
-  for OutIdx := 0 to NM1 do
+  // #13: dL/dx[k] = sum_i e[i] c[(i-k) mod n] already ascends in i, so gather
+  // per input (two contiguous dot products) instead of scattering per output.
+  for InIdx := 0 to NM1 do
   begin
-    Err := FOutputError.FData[OutIdx];
-    if Err <> 0.0 then
-    begin
-      for InIdx := 0 to NM1 do
-      begin
-        KernelIdx := OutIdx - InIdx;
-        if KernelIdx < 0 then KernelIdx := KernelIdx + N;
-        LocalPrevError.FData[InIdx] :=
-          LocalPrevError.FData[InIdx] + Err * Kernel.FData[KernelIdx];
-      end;
-    end;
+    Acc := TNNetVolume.DotProduct
+      (FOutputError.GetRawPtr(InIdx), Kernel.GetRawPtr(0), N - InIdx);
+    if InIdx > 0 then
+      Acc := Acc + TNNetVolume.DotProduct
+        (FOutputError.GetRawPtr(0), Kernel.GetRawPtr(N - InIdx), InIdx);
+    LocalPrevError.FData[InIdx] := LocalPrevError.FData[InIdx] + Acc;
   end;
 end;
 
@@ -83188,10 +83214,10 @@ end;
 // (both scaled by -FLearningRate so the ordinary update machinery applies).
 procedure TNNetCirculantLinear.BackpropagateCPU();
 var
-  N, OutIdx, InIdx, KernelIdx: integer;
+  N, KernelIdx: integer;
   NM1: integer;
   KernelDelta, BiasDelta, PrevOut: TNNetVolume;
-  localErrorDeriv, Err: TNeuralFloat;
+  NegLR, Acc: TNeuralFloat;
 begin
   N := FOutput.Size;
   NM1 := N - 1;
@@ -83211,46 +83237,24 @@ begin
     end;
     exit;
   end;
-  if (FBatchUpdate) then
+  // #13: dL/dc[j] = sum_i e[i] x[(i-j) mod n] ascends in i, so each kernel tap
+  // is two contiguous dot products; -FLearningRate scales the finished tap once
+  // (#5) and the bias delta is one vector MulAdd. Batch and per-sample updates
+  // accumulate identically -- only the update tail differs.
+  NegLR := -FLearningRate;
+  for KernelIdx := 0 to NM1 do
   begin
-    for OutIdx := 0 to NM1 do
-    begin
-      Err := FOutputError.FData[OutIdx];
-      localErrorDeriv := -FLearningRate * Err;
-      if localErrorDeriv <> 0.0 then
-      begin
-        for InIdx := 0 to NM1 do
-        begin
-          KernelIdx := OutIdx - InIdx;
-          if KernelIdx < 0 then KernelIdx := KernelIdx + N;
-          KernelDelta.FData[KernelIdx] :=
-            KernelDelta.FData[KernelIdx] + localErrorDeriv * PrevOut.FData[InIdx];
-        end;
-        if FSuppressBias = 0 then
-          BiasDelta.FData[OutIdx] := BiasDelta.FData[OutIdx] + localErrorDeriv;
-      end;
-    end;
-  end
-  else
+    Acc := TNNetVolume.DotProduct
+      (FOutputError.GetRawPtr(KernelIdx), PrevOut.GetRawPtr(0), N - KernelIdx);
+    if KernelIdx > 0 then
+      Acc := Acc + TNNetVolume.DotProduct
+        (FOutputError.GetRawPtr(0), PrevOut.GetRawPtr(N - KernelIdx), KernelIdx);
+    KernelDelta.FData[KernelIdx] := KernelDelta.FData[KernelIdx] + NegLR * Acc;
+  end;
+  if FSuppressBias = 0 then BiasDelta.MulAdd(NegLR, FOutputError);
+  if not FBatchUpdate then
   begin
     // Per-sample update: fold the gradient through the neurons' inertia path.
-    for OutIdx := 0 to NM1 do
-    begin
-      Err := FOutputError.FData[OutIdx];
-      localErrorDeriv := -FLearningRate * Err;
-      if localErrorDeriv <> 0.0 then
-      begin
-        for InIdx := 0 to NM1 do
-        begin
-          KernelIdx := OutIdx - InIdx;
-          if KernelIdx < 0 then KernelIdx := KernelIdx + N;
-          KernelDelta.FData[KernelIdx] :=
-            KernelDelta.FData[KernelIdx] + localErrorDeriv * PrevOut.FData[InIdx];
-        end;
-        if FSuppressBias = 0 then
-          BiasDelta.FData[OutIdx] := BiasDelta.FData[OutIdx] + localErrorDeriv;
-      end;
-    end;
     FArrNeurons[0].UpdateWeightsWithoutInertia();
     FArrNeurons[1].UpdateWeightsWithoutInertia();
     AfterWeightUpdate();
@@ -83692,6 +83696,28 @@ begin
   FN := InSize shr 1; // #15: div 2, size is non-negative
   FOutput.ReSize(1, 1, FN);
   SetOutputErrorSize(1, 1, FN);
+  SetLength(FBRev, FN);
+end;
+
+destructor TNNetHolographicBinding.Destroy();
+begin
+  SetLength(FBRev, 0);
+  inherited Destroy();
+end;
+
+// FBRev[i] = b[(-i) mod n], so b[(p - q) mod n] = FBRev[(q - p) mod n].
+procedure TNNetHolographicBinding.BuildBRev();
+var
+  i, vn, vnM1: integer;
+  PrevOut: TNNetVolume;
+begin
+  vn := FN;
+  if vn <= 0 then exit;
+  PrevOut := FPrevLayer.FOutput;
+  vnM1 := vn - 1;
+  FBRev[0] := PrevOut.FData[vn];
+  for i := 1 to vnM1 do
+    FBRev[i] := PrevOut.FData[vn + vn - i];
 end;
 
 procedure TNNetHolographicBinding.Compute();
@@ -83709,8 +83735,7 @@ end;
 //   UNBIND : c[k] = sum_j a[j] * b[(j-k) mod n]      (circular correlation)
 procedure TNNetHolographicBinding.ComputeCPU();
 var
-  k, j, idx, vn: integer;
-  vnM1: integer;
+  k, vn, vnM1: integer;
   acc: TNeuralFloat;
   PrevOut: TNNetVolume;
 begin
@@ -83718,34 +83743,33 @@ begin
   PrevOut := FPrevLayer.FOutput;
   vn := FN;
   vnM1 := vn - 1;
-  // #20/#12: FUnbind is loop-invariant, so unswitch it out of the O(n^2) body;
-  // the cyclic index then walks by +-1 with a wrap test instead of costing two
-  // integer divisions per element.
+  // #20/#13: FUnbind is loop-invariant, so unswitch it out of the O(n^2) body.
+  // In both modes the second factor is read with an ASCENDING cyclic index that
+  // wraps exactly once, so each output is two contiguous dot products over
+  // vectorized memory instead of n scalar multiply-adds with a wrap test.
   if FUnbind = 0 then
+  begin
+    // BIND: c[k] = sum_j a[j] b[(k-j) mod n] = sum_j a[j] FBRev[(j-k) mod n].
+    BuildBRev();
     for k := 0 to vnM1 do
     begin
       acc := 0;
-      idx := k;                              // (k - j) mod vn at j = 0
-      for j := 0 to vnM1 do
-      begin
-        acc := acc + PrevOut.FData[j] * PrevOut.FData[vn + idx];
-        Dec(idx);
-        if idx < 0 then idx := vnM1;
-      end;
-      FOutput.FData[k] := acc;
-    end
+      if k > 0 then
+        acc := TNNetVolume.DotProduct(PrevOut.GetRawPtr(0), Addr(FBRev[vn - k]), k);
+      FOutput.FData[k] := acc +
+        TNNetVolume.DotProduct(PrevOut.GetRawPtr(k), Addr(FBRev[0]), vn - k);
+    end;
+  end
   else
+    // UNBIND: c[k] = sum_j a[j] b[(j-k) mod n], ascending directly over b.
     for k := 0 to vnM1 do
     begin
       acc := 0;
-      if k = 0 then idx := 0 else idx := vn - k;  // (j - k) mod vn at j = 0
-      for j := 0 to vnM1 do
-      begin
-        acc := acc + PrevOut.FData[j] * PrevOut.FData[vn + idx];
-        Inc(idx);
-        if idx = vn then idx := 0;
-      end;
-      FOutput.FData[k] := acc;
+      if k > 0 then
+        acc := TNNetVolume.DotProduct
+          (PrevOut.GetRawPtr(0), PrevOut.GetRawPtr(vn + vn - k), k);
+      FOutput.FData[k] := acc +
+        TNNetVolume.DotProduct(PrevOut.GetRawPtr(k), PrevOut.GetRawPtr(vn), vn - k);
     end;
 end;
 
@@ -83776,73 +83800,62 @@ end;
 // Input gradient is packed into the same 2n layout (first n = da, last n = db).
 procedure TNNetHolographicBinding.ComputePreviousLayerErrorCPU();
 var
-  k, j, m, idx, vn: integer;
-  vnM1: integer;
-  e, daj, dbm: TNeuralFloat;
+  j, m, vn, vnM1: integer;
+  daj, dbm: TNeuralFloat;
+  ePtr: TNeuralFloatArrPtr;
   PrevOut, PrevErr: TNNetVolume;
 begin
   PrevOut := FPrevLayer.FOutput;
   PrevErr := FPrevLayer.OutputError;
   vn := FN;
   vnM1 := vn - 1;
-  // da. #20/#12 as in the forward: the mode test leaves the O(n^2) body and the
-  // cyclic index is carried with a wrap test instead of two divisions.
+  ePtr := FOutputError.GetRawPtr(0);
+  // da. #20/#13 as in the forward: the mode test leaves the O(n^2) body and
+  // each row is two contiguous dot products of e with the other input.
   if FUnbind = 0 then
+    // BIND: dL/da[j] = sum_k e[k] b[(k-j) mod n], ascending over b.
     for j := 0 to vnM1 do
     begin
       daj := 0;
-      if j = 0 then idx := 0 else idx := vn - j;  // (k - j) mod vn at k = 0
-      for k := 0 to vnM1 do
-      begin
-        e := FOutputError.FData[k];
-        if e <> 0 then daj := daj + e * PrevOut.FData[vn + idx];
-        Inc(idx);
-        if idx = vn then idx := 0;
-      end;
-      PrevErr.FData[j] := PrevErr.FData[j] + daj;
+      if j > 0 then
+        daj := TNNetVolume.DotProduct(ePtr, PrevOut.GetRawPtr(vn + vn - j), j);
+      PrevErr.FData[j] := PrevErr.FData[j] + daj +
+        TNNetVolume.DotProduct(FOutputError.GetRawPtr(j), PrevOut.GetRawPtr(vn), vn - j);
     end
   else
+  begin
+    // UNBIND: dL/da[j] = sum_k e[k] b[(j-k) mod n] = sum_k e[k] FBRev[(k-j) mod n].
+    BuildBRev();
     for j := 0 to vnM1 do
     begin
       daj := 0;
-      idx := j;                                   // (j - k) mod vn at k = 0
-      for k := 0 to vnM1 do
-      begin
-        e := FOutputError.FData[k];
-        if e <> 0 then daj := daj + e * PrevOut.FData[vn + idx];
-        Dec(idx);
-        if idx < 0 then idx := vnM1;
-      end;
-      PrevErr.FData[j] := PrevErr.FData[j] + daj;
+      if j > 0 then
+        daj := TNNetVolume.DotProduct(ePtr, Addr(FBRev[vn - j]), j);
+      PrevErr.FData[j] := PrevErr.FData[j] + daj +
+        TNNetVolume.DotProduct(FOutputError.GetRawPtr(j), Addr(FBRev[0]), vn - j);
     end;
-  // db
+  end;
+  // db. Both modes read a with an ascending index; only the split point differs.
   if FUnbind = 0 then
+    // BIND: dL/db[m] = sum_k e[k] a[(k-m) mod n].
     for m := 0 to vnM1 do
     begin
       dbm := 0;
-      if m = 0 then idx := 0 else idx := vn - m;  // a[(k-m) mod vn] at k = 0
-      for k := 0 to vnM1 do
-      begin
-        e := FOutputError.FData[k];
-        if e <> 0 then dbm := dbm + e * PrevOut.FData[idx];
-        Inc(idx);
-        if idx = vn then idx := 0;
-      end;
-      PrevErr.FData[vn + m] := PrevErr.FData[vn + m] + dbm;
+      if m > 0 then
+        dbm := TNNetVolume.DotProduct(ePtr, PrevOut.GetRawPtr(vn - m), m);
+      PrevErr.FData[vn + m] := PrevErr.FData[vn + m] + dbm +
+        TNNetVolume.DotProduct(FOutputError.GetRawPtr(m), PrevOut.GetRawPtr(0), vn - m);
     end
   else
+    // UNBIND: dL/db[m] = sum_k e[k] a[(m+k) mod n].
     for m := 0 to vnM1 do
     begin
       dbm := 0;
-      idx := m;                                   // a[(m+k) mod vn] at k = 0
-      for k := 0 to vnM1 do
-      begin
-        e := FOutputError.FData[k];
-        if e <> 0 then dbm := dbm + e * PrevOut.FData[idx];
-        Inc(idx);
-        if idx = vn then idx := 0;
-      end;
-      PrevErr.FData[vn + m] := PrevErr.FData[vn + m] + dbm;
+      if m > 0 then
+        dbm := TNNetVolume.DotProduct
+          (FOutputError.GetRawPtr(vn - m), PrevOut.GetRawPtr(0), m);
+      PrevErr.FData[vn + m] := PrevErr.FData[vn + m] + dbm +
+        TNNetVolume.DotProduct(ePtr, PrevOut.GetRawPtr(m), vn - m);
     end;
 end;
 
@@ -86575,6 +86588,8 @@ end;
 
 destructor TNNetLIFNeuron.Destroy();
 begin
+  SetLength(FBetaBuf, 0);
+  SetLength(FVthBuf, 0);
   FSpike.Free;
   FVmem.Free;
   inherited Destroy();
@@ -86628,6 +86643,8 @@ begin
   SetOutputErrorSize(FSeqLen, 1, FDepth);
   FVmem.ReSize(FSeqLen, 1, FDepth);
   FSpike.ReSize(FSeqLen, 1, FDepth);
+  SetLength(FBetaBuf, FDepth);
+  SetLength(FVthBuf, FDepth);
   // Learnable variant: two per-channel weight neurons (threshold, leak) of width
   // Depth. Wired like TNNetRetention's learnable gamma so they round-trip via the
   // base per-neuron save/load and are stepped by UpdateWeights.
@@ -86668,42 +86685,58 @@ end;
 // current I[t] (the previous layer's output) with a leak and a hard
 // reset-by-subtraction encoded through the (1 - S[t-1]) coupling, then emits a
 // binary spike when V[t] crosses the threshold. Caches V[t] and S[t] for BPTT.
+// Materializes the per-channel dynamics once per forward, so the O(T*D) body
+// indexes two arrays instead of calling EffBeta/EffVth per element (#5/#8).
+procedure TNNetLIFNeuron.BuildDynamics();
+var
+  d, DepthM1: integer;
+begin
+  DepthM1 := FDepth - 1;
+  for d := 0 to DepthM1 do
+  begin
+    FBetaBuf[d] := EffBeta(d);
+    FVthBuf[d] := EffVth(d);
+  end;
+end;
+
 procedure TNNetLIFNeuron.ComputeCPU();
 var
-  t, d, idx: integer;
+  t, d, base, prevBase, b, pb: integer;
   DepthM1, SeqLenM1: integer;
-  vPrev, sPrev, vt, current, betaD, vthD: TNeuralFloat;
+  vt, sp: TNeuralFloat;
   Prev: TNNetVolume;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if (FDepth <= 0) or (FSeqLen <= 0) then exit;
   Prev := FPrevLayer.FOutput;
   DepthM1 := FDepth - 1;
   SeqLenM1 := FSeqLen - 1;
+  BuildDynamics();
+  // App. E: time outer / channel inner. The recurrence needs only row t-1,
+  // which FVmem/FSpike already hold, so every volume is walked contiguously
+  // instead of striding by Depth. Row 0 starts from rest (V[0] = I[0]).
   for d := 0 to DepthM1 do
   begin
-    betaD := EffBeta(d);
-    vthD := EffVth(d);
-    vPrev := 0;
-    sPrev := 0;
-    idx := d;
-    for t := 0 to SeqLenM1 do
+    vt := Prev.FData[d];
+    FVmem.FData[d] := vt;
+    if vt >= FVthBuf[d] then sp := 1 else sp := 0;
+    FSpike.FData[d] := sp;
+    FOutput.FData[d] := sp;
+  end;
+  base := 0;
+  for t := 1 to SeqLenM1 do
+  begin
+    prevBase := base;
+    Inc(base, FDepth);
+    for d := 0 to DepthM1 do
     begin
-      current := Prev.FData[idx];
-      vt := betaD * vPrev * (1 - sPrev) + current;
-      FVmem.FData[idx] := vt;
-      if vt >= vthD then
-      begin
-        FSpike.FData[idx] := 1;
-        FOutput.FData[idx] := 1;
-      end
-      else
-      begin
-        FSpike.FData[idx] := 0;
-        FOutput.FData[idx] := 0;
-      end;
-      vPrev := vt;
-      sPrev := FSpike.FData[idx];
-      Inc(idx, FDepth);
+      pb := prevBase + d;
+      b := base + d;
+      vt := FBetaBuf[d] * FVmem.FData[pb] * (1 - FSpike.FData[pb]) + Prev.FData[b];
+      FVmem.FData[b] := vt;
+      if vt >= FVthBuf[d] then sp := 1 else sp := 0;
+      FSpike.FData[b] := sp;
+      FOutput.FData[b] := sp;
     end;
   end;
 end;
@@ -86723,39 +86756,52 @@ end;
 // call immediately after differentiates this surrogate forward.
 procedure TNNetLIFNeuron.ComputeSurrogate(ADst: TNNetVolume);
 var
-  t, d, idx: integer;
+  t, d, base, prevBase, b, pb: integer;
   DepthM1, SeqLenM1: integer;
-  vPrev, sPrev, vt, current, u, denom, gate, betaD, vthD: TNeuralFloat;
+  vt, u, denom, gate: TNeuralFloat;
   Prev: TNNetVolume;
 begin
   Prev := FPrevLayer.FOutput;
   ADst.ReSize(FSeqLen, 1, FDepth);
+  if (FDepth <= 0) or (FSeqLen <= 0) then exit;
   DepthM1 := FDepth - 1;
   SeqLenM1 := FSeqLen - 1;
+  BuildDynamics();
+  // App. E: time outer / channel inner, as in the hard forward.
   for d := 0 to DepthM1 do
   begin
-    betaD := EffBeta(d);
-    vthD := EffVth(d);
-    vPrev := 0;
-    sPrev := 0;
-    idx := d;
-    for t := 0 to SeqLenM1 do
+    vt := Prev.FData[d];
+    u := vt - FVthBuf[d];
+    denom := 1 + FAlpha * Abs(u);
+    // g(v): antiderivative of the SuperSpike kernel, so g'(v)=1/denom^2.
+    if u >= 0
+      then gate := 0.5 + (1 - 1 / denom) / FAlpha
+      else gate := 0.5 - (1 - 1 / denom) / FAlpha;
+    FVmem.FData[d] := vt;
+    FSpike.FData[d] := gate;
+    FOutput.FData[d] := gate;
+    ADst.FData[d] := gate;
+  end;
+  base := 0;
+  for t := 1 to SeqLenM1 do
+  begin
+    prevBase := base;
+    Inc(base, FDepth);
+    for d := 0 to DepthM1 do
     begin
-      current := Prev.FData[idx];
-      vt := betaD * vPrev * (1 - sPrev) + current;
-      u := vt - vthD;
+      pb := prevBase + d;
+      b := base + d;
+      // The smooth gate cached in FSpike is the reset coupling of the next step.
+      vt := FBetaBuf[d] * FVmem.FData[pb] * (1 - FSpike.FData[pb]) + Prev.FData[b];
+      u := vt - FVthBuf[d];
       denom := 1 + FAlpha * Abs(u);
-      // g(v): antiderivative of the SuperSpike kernel, so g'(v)=1/denom^2.
       if u >= 0
         then gate := 0.5 + (1 - 1 / denom) / FAlpha
         else gate := 0.5 - (1 - 1 / denom) / FAlpha;
-      FVmem.FData[idx] := vt;
-      FSpike.FData[idx] := gate;
-      FOutput.FData[idx] := gate;
-      ADst.FData[idx] := gate;
-      vPrev := vt;
-      sPrev := gate;   // smooth reset coupling uses the smooth gate
-      Inc(idx, FDepth);
+      FVmem.FData[b] := vt;
+      FSpike.FData[b] := gate;
+      FOutput.FData[b] := gate;
+      ADst.FData[b] := gate;
     end;
   end;
 end;
@@ -86923,6 +86969,8 @@ end;
 
 destructor TNNetALIFNeuron.Destroy();
 begin
+  SetLength(FBetaBuf, 0);
+  SetLength(FVthBuf, 0);
   FSpike.Free;
   FAdapt.Free;
   FVmem.Free;
@@ -86976,6 +87024,8 @@ begin
   FVmem.ReSize(FSeqLen, 1, FDepth);
   FAdapt.ReSize(FSeqLen, 1, FDepth);
   FSpike.ReSize(FSeqLen, 1, FDepth);
+  SetLength(FBetaBuf, FDepth);
+  SetLength(FVthBuf, FDepth);
   if FLearnDynamics then
   begin
     while FNeurons.Count > 2 do
@@ -87013,46 +87063,64 @@ end;
 // input current with a leak and a hard reset; a slow adaptation trace a[t]
 // (decay rho, incremented by the PREVIOUS spike) raises the effective threshold
 // V_th + adaptBeta*a[t]. Caches V[t], a[t], S[t] for BPTT.
+// Materializes the per-channel dynamics once per forward, so the O(T*D) body
+// indexes two arrays instead of calling EffBeta/EffVth per element (#5/#8).
+procedure TNNetALIFNeuron.BuildDynamics();
+var
+  d, DepthM1: integer;
+begin
+  DepthM1 := FDepth - 1;
+  for d := 0 to DepthM1 do
+  begin
+    FBetaBuf[d] := EffBeta(d);
+    FVthBuf[d] := EffVth(d);
+  end;
+end;
+
 procedure TNNetALIFNeuron.ComputeCPU();
 var
-  ti, d, idx: integer;
+  ti, d, base, prevBase, b, pb: integer;
   DepthM1, SeqLenM1: integer;
-  vPrev, sPrev, aPrev, vt, at, current, betaD, vthEff: TNeuralFloat;
+  sPrev, vt, at, sp: TNeuralFloat;
   Prev: TNNetVolume;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if (FDepth <= 0) or (FSeqLen <= 0) then exit;
   Prev := FPrevLayer.FOutput;
   DepthM1 := FDepth - 1;
   SeqLenM1 := FSeqLen - 1;
+  BuildDynamics();
+  // App. E: time outer / channel inner. Both recurrences need only row t-1,
+  // already cached in FVmem/FAdapt/FSpike, so every volume is walked
+  // contiguously instead of striding by Depth. Row 0 starts from rest, where
+  // V[0] = I[0] and a[0] = 0.
   for d := 0 to DepthM1 do
   begin
-    betaD := EffBeta(d);
-    vPrev := 0;
-    sPrev := 0;
-    aPrev := 0;
-    idx := d;
-    for ti := 0 to SeqLenM1 do
+    vt := Prev.FData[d];
+    FVmem.FData[d] := vt;
+    FAdapt.FData[d] := 0;
+    if vt >= FVthBuf[d] then sp := 1 else sp := 0;
+    FSpike.FData[d] := sp;
+    FOutput.FData[d] := sp;
+  end;
+  base := 0;
+  for ti := 1 to SeqLenM1 do
+  begin
+    prevBase := base;
+    Inc(base, FDepth);
+    for d := 0 to DepthM1 do
     begin
-      current := Prev.FData[idx];
-      vt := betaD * vPrev * (1 - sPrev) + current;       // fast membrane
-      at := FRho * aPrev + sPrev;                         // slow adaptation trace
-      vthEff := EffVth(d) + FAdaptBeta * at;              // rising threshold
-      FVmem.FData[idx] := vt;
-      FAdapt.FData[idx] := at;
-      if vt >= vthEff then
-      begin
-        FSpike.FData[idx] := 1;
-        FOutput.FData[idx] := 1;
-      end
-      else
-      begin
-        FSpike.FData[idx] := 0;
-        FOutput.FData[idx] := 0;
-      end;
-      vPrev := vt;
-      sPrev := FSpike.FData[idx];
-      aPrev := at;
-      Inc(idx, FDepth);
+      pb := prevBase + d;
+      b := base + d;
+      sPrev := FSpike.FData[pb];
+      vt := FBetaBuf[d] * FVmem.FData[pb] * (1 - sPrev) + Prev.FData[b]; // membrane
+      at := FRho * FAdapt.FData[pb] + sPrev;                             // adaptation
+      FVmem.FData[b] := vt;
+      FAdapt.FData[b] := at;
+      // Rising threshold V_th[d] + adaptBeta * a[t].
+      if vt >= FVthBuf[d] + FAdaptBeta * at then sp := 1 else sp := 0;
+      FSpike.FData[b] := sp;
+      FOutput.FData[b] := sp;
     end;
   end;
 end;
@@ -87064,43 +87132,57 @@ end;
 // the SuperSpike kernel so g'(u)=1/(1+alpha*|u|)^2 matches the backward EXACTLY.
 procedure TNNetALIFNeuron.ComputeSurrogate(ADst: TNNetVolume);
 var
-  ti, d, idx: integer;
+  ti, d, base, prevBase, b, pb: integer;
   DepthM1, SeqLenM1: integer;
-  vPrev, sPrev, aPrev, vt, at, current, u, denom, gate, betaD,
-    vthEff: TNeuralFloat;
+  sPrev, vt, at, u, denom, gate, vthEff: TNeuralFloat;
   Prev: TNNetVolume;
 begin
   Prev := FPrevLayer.FOutput;
   ADst.ReSize(FSeqLen, 1, FDepth);
+  if (FDepth <= 0) or (FSeqLen <= 0) then exit;
   DepthM1 := FDepth - 1;
   SeqLenM1 := FSeqLen - 1;
+  BuildDynamics();
+  // App. E: time outer / channel inner, as in the hard forward.
   for d := 0 to DepthM1 do
   begin
-    betaD := EffBeta(d);
-    vPrev := 0;
-    sPrev := 0;
-    aPrev := 0;
-    idx := d;
-    for ti := 0 to SeqLenM1 do
+    vt := Prev.FData[d];
+    u := vt - FVthBuf[d];
+    denom := 1 + FAlpha * Abs(u);
+    if u >= 0
+      then gate := 0.5 + (1 - 1 / denom) / FAlpha
+      else gate := 0.5 - (1 - 1 / denom) / FAlpha;
+    FVmem.FData[d] := vt;
+    FAdapt.FData[d] := 0;
+    FSpike.FData[d] := gate;
+    FOutput.FData[d] := gate;
+    ADst.FData[d] := gate;
+  end;
+  base := 0;
+  for ti := 1 to SeqLenM1 do
+  begin
+    prevBase := base;
+    Inc(base, FDepth);
+    for d := 0 to DepthM1 do
     begin
-      current := Prev.FData[idx];
-      vt := betaD * vPrev * (1 - sPrev) + current;
-      at := FRho * aPrev + sPrev;
-      vthEff := EffVth(d) + FAdaptBeta * at;
+      pb := prevBase + d;
+      b := base + d;
+      // The smooth gate cached in FSpike couples both the reset and the
+      // adaptation increment of the next step.
+      sPrev := FSpike.FData[pb];
+      vt := FBetaBuf[d] * FVmem.FData[pb] * (1 - sPrev) + Prev.FData[b];
+      at := FRho * FAdapt.FData[pb] + sPrev;
+      vthEff := FVthBuf[d] + FAdaptBeta * at;
       u := vt - vthEff;
       denom := 1 + FAlpha * Abs(u);
       if u >= 0
         then gate := 0.5 + (1 - 1 / denom) / FAlpha
         else gate := 0.5 - (1 - 1 / denom) / FAlpha;
-      FVmem.FData[idx] := vt;
-      FAdapt.FData[idx] := at;
-      FSpike.FData[idx] := gate;
-      FOutput.FData[idx] := gate;
-      ADst.FData[idx] := gate;
-      vPrev := vt;
-      sPrev := gate;   // smooth coupling for reset AND adaptation
-      aPrev := at;
-      Inc(idx, FDepth);
+      FVmem.FData[b] := vt;
+      FAdapt.FData[b] := at;
+      FSpike.FData[b] := gate;
+      FOutput.FData[b] := gate;
+      ADst.FData[b] := gate;
     end;
   end;
 end;
