@@ -6953,7 +6953,7 @@ var
   GGUFPath: string;
   Tokens: array of string;
   Scores: array of single;
-  Types: array of integer;
+  Types: array of Int64;
   Dummy: TNNetVolume;
   SavedStage, StageCnt, i: integer;
 begin
