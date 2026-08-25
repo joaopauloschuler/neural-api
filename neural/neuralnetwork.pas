@@ -117896,10 +117896,20 @@ begin
           for I := 0 to Nm1 do
           begin
             GI := GradsB[I];
+            if GI = nil then
+            begin
+              // a dropped probe contributes a zero row and column
+              for J := I to Nm1 do
+              begin
+                GramB[I][J] := 0;
+                GramB[J][I] := 0;
+              end;
+              Continue;
+            end;
             for J := I to Nm1 do
             begin
               GJ := GradsB[J];
-              if (GI <> nil) and (GJ <> nil) then
+              if GJ <> nil then
                 Dot := DotProductSSD(@GI[0], @GJ[0], NetParamCnt)
               else
                 Dot := 0;
