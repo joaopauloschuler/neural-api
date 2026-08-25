@@ -16778,8 +16778,8 @@ begin
   and ecx,$0000001F
   jz @EndAdd
   shr ecx, 2 // number of small iterations = (number of elements modulo 16) / 4
-@SmallAddLoop:
   vzeroupper
+@SmallAddLoop:
 
   movups xmm2, [rax]
   movups xmm3, [rdx]
@@ -16867,8 +16867,8 @@ begin
   and ecx,$0000001F
   jz @EndMax
   shr ecx, 2 // number of small iterations = (number of elements modulo 16) / 4
-@SmallMaxLoop:
   vzeroupper
+@SmallMaxLoop:
 
   movups xmm2, [rax]
   movups xmm3, [rdx]
@@ -16979,8 +16979,8 @@ begin
   and ecx,$0000001F
   jz @EndAdd
   shr ecx, 2 // number of small iterations = (number of elements modulo 16) / 4
-@SmallAddLoop:
   vzeroupper
+@SmallAddLoop:
 
   movups xmm2, [rax]
   movups xmm3, [rdx]
@@ -17096,8 +17096,8 @@ begin
   and ecx,$0000001F
   jz @EndAdd
   shr ecx, 2 // number of small iterations = (number of elements modulo 16) / 4
-@SmallAddLoop:
   vzeroupper
+@SmallAddLoop:
 
   movups xmm2, [rax]
   movups xmm3, [rdx]
@@ -17201,8 +17201,8 @@ begin
   and ecx,$0000001F
   jz @EndAdd
   shr ecx, 2 // number of small iterations = (number of elements modulo 16) / 4
-@SmallAddLoop:
   vzeroupper
+@SmallAddLoop:
 
   movups xmm2, [rax]
   movups xmm3, [rdx]
@@ -17305,8 +17305,8 @@ begin
   and ecx,$0000001F
   jz @EndAdd
   shr ecx, 2 // number of small iterations = (number of elements modulo 16) / 4
-@SmallAddLoop:
   vzeroupper
+@SmallAddLoop:
 
   movups xmm2, [rax]
   addps xmm0, xmm2
@@ -17443,8 +17443,8 @@ begin
   and ecx,$0000001F
   jz @EndAdd
   shr ecx, 2 // number of small iterations = (number of elements modulo 16) / 4
-@SmallAddLoop:
   vzeroupper
+@SmallAddLoop:
 
   movups xmm2, [rax]
   mulps xmm2, xmm2
@@ -18343,8 +18343,8 @@ begin
   and ecx,$0000001F
   jz @EndAdd
   shr ecx, 2 // number of small iterations = (number of elements modulo 16) / 4
-@SmallAddLoop:
   vzeroupper
+@SmallAddLoop:
 
   movups xmm2, [rax]
   movups xmm3, [rdx]
@@ -18763,6 +18763,7 @@ var
   NewSizeX, NewSizeY: integer;
   MaxY: integer;
   RowSize: integer;
+  RowStride, RowBase, MarginSize, MarginBytes, BandBytes: integer;
   SourceRawPos, DestRawPos: pointer;
 begin
   NewSizeX := Original.SizeX + Padding * 2;
@@ -18771,13 +18772,30 @@ begin
   RowSize := Original.SizeX * Original.Depth;
 
   Resize(NewSizeX, NewSizeY, Original.Depth);
-  Fill(0);
+  // The row copies below rewrite every interior element, so only the border
+  // needs zeroing: the top and bottom bands plus each interior row's margins.
+  RowStride := NewSizeX * FDepth;
+  MarginSize := Padding * FDepth;
+  MarginBytes := MarginSize * csNeuralFloatSize;
+  BandBytes := Padding * RowStride * csNeuralFloatSize;
+  if BandBytes > 0 then
+  begin
+    FillChar(FData[0], BandBytes, 0);
+    FillChar(FData[(NewSizeY - Padding) * RowStride], BandBytes, 0);
+  end;
 
+  RowBase := Padding * RowStride;
   for CntY := 0 to MaxY do
   begin
     SourceRawPos := Original.GetRawPtr(0, CntY);
-    DestRawPos := GetRawPtr(Padding, CntY + Padding);
+    DestRawPos := Addr(FData[RowBase + MarginSize]);
     asm_dword_copy;
+    if MarginBytes > 0 then
+    begin
+      FillChar(FData[RowBase], MarginBytes, 0);
+      FillChar(FData[RowBase + MarginSize + RowSize], MarginBytes, 0);
+    end;
+    Inc(RowBase, RowStride);
   end;
 end;
 
@@ -18788,6 +18806,7 @@ var
   NewSizeX, NewSizeY: integer;
   MaxY: integer;
   RowSize: integer;
+  RowStride, RowBase, MarginSize, MarginBytes, BandBytes: integer;
   SourceRawPos, DestRawPos: pointer;
 begin
   NewSizeX := Original.SizeX + PaddingX * 2;
@@ -18796,13 +18815,30 @@ begin
   RowSize := Original.SizeX * Original.Depth;
 
   Resize(NewSizeX, NewSizeY, Original.Depth);
-  Fill(0);
+  // The row copies below rewrite every interior element, so only the border
+  // needs zeroing: the top and bottom bands plus each interior row's margins.
+  RowStride := NewSizeX * FDepth;
+  MarginSize := PaddingX * FDepth;
+  MarginBytes := MarginSize * csNeuralFloatSize;
+  BandBytes := PaddingY * RowStride * csNeuralFloatSize;
+  if BandBytes > 0 then
+  begin
+    FillChar(FData[0], BandBytes, 0);
+    FillChar(FData[(NewSizeY - PaddingY) * RowStride], BandBytes, 0);
+  end;
 
+  RowBase := PaddingY * RowStride;
   for CntY := 0 to MaxY do
   begin
     SourceRawPos := Original.GetRawPtr(0, CntY);
-    DestRawPos := GetRawPtr(PaddingX, CntY + PaddingY);
+    DestRawPos := Addr(FData[RowBase + MarginSize]);
     asm_dword_copy;
+    if MarginBytes > 0 then
+    begin
+      FillChar(FData[RowBase], MarginBytes, 0);
+      FillChar(FData[RowBase + MarginSize + RowSize], MarginBytes, 0);
+    end;
+    Inc(RowBase, RowStride);
   end;
 end;
 
@@ -18966,19 +19002,19 @@ end;
 
 procedure TNNetVolumeQuant8.DequantizeTo(Dest: TNNetVolume);
 var
-  XCnt, YCnt, SizeXM1, SizeYM1: integer;
+  RowIdx, MaxRowIdx, Ofs: integer;
 begin
   if FSize = 0 then exit;
   Dest.ReSize(FSizeX, FSizeY, FDepth);
-  SizeXM1 := FSizeX - 1;
-  SizeYM1 := FSizeY - 1;
-  for YCnt := 0 to SizeYM1 do
+  MaxRowIdx := FSizeX * FSizeY - 1;
+  // Dest carries this volume's shape, so one flat offset walks both row sets;
+  // it advances by FDepth per row instead of a per-row multiply.
+  Ofs := 0;
+  for RowIdx := 0 to MaxRowIdx do
   begin
-    for XCnt := 0 to SizeXM1 do
-    begin
-      DequantizeRowTo(XCnt, YCnt,
-        TNeuralFloatArrPtr(Dest.GetRawPtr(XCnt, YCnt, 0)));
-    end;
+    TNNetVolume.DequantizeInt8(TNeuralFloatArrPtr(@Dest.FDataPtr^[Ofs]),
+      TNeuralInt8ArrPtr(@FDataPtr^[Ofs]), FDepth, FScaleData.FData[RowIdx]);
+    Inc(Ofs, FDepth);
   end;
 end;
 

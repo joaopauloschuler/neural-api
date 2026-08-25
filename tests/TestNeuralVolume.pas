@@ -46,6 +46,7 @@ type
     procedure TestGroupedDotProductsTiledRebuildsOnNewSource;
     procedure TestGroupedDotProductsTiledPartialTile;
     procedure TestVolumePadding;
+    procedure TestVolumePaddingBorderIsZeroed;
     procedure TestVolumeTranspose;
     // Additional volume tests
     procedure TestVolumeNormalization;
@@ -1726,6 +1727,51 @@ begin
     Original.Free;
     Padded.Free;
   end;
+end;
+
+// CopyPadding zeroes only the border and lets the row copies rewrite the
+// interior, so a destination that already holds data must come back with every
+// border cell zeroed and every interior cell taken from the source.
+procedure TTestNeuralVolume.TestVolumePaddingBorderIsZeroed;
+var
+  Original, Padded: TNNetVolume;
+  X, Y, D, PadX, PadY: integer;
+  Expected: TNeuralFloat;
+begin
+  for PadX := 0 to 2 do
+    for PadY := 0 to 2 do
+    begin
+      Original := TNNetVolume.Create(4, 3, 2);
+      // Sized to the padded result up front so ReSize keeps the dirty content.
+      Padded := TNNetVolume.Create(4 + PadX * 2, 3 + PadY * 2, 2);
+      try
+        for X := 0 to Original.SizeX - 1 do
+          for Y := 0 to Original.SizeY - 1 do
+            for D := 0 to Original.Depth - 1 do
+              Original[X, Y, D] := 1 + X + Y * 10 + D * 100;
+        Padded.Fill(-7.0);
+
+        if PadX = PadY
+          then Padded.CopyPadding(Original, PadX)
+          else Padded.CopyPadding(Original, PadX, PadY);
+
+        AssertEquals('Padded SizeX', 4 + PadX * 2, Padded.SizeX);
+        AssertEquals('Padded SizeY', 3 + PadY * 2, Padded.SizeY);
+        for X := 0 to Padded.SizeX - 1 do
+          for Y := 0 to Padded.SizeY - 1 do
+            for D := 0 to Padded.Depth - 1 do
+            begin
+              if (X < PadX) or (Y < PadY) or
+                 (X >= PadX + Original.SizeX) or (Y >= PadY + Original.SizeY)
+                then Expected := 0
+                else Expected := Original[X - PadX, Y - PadY, D];
+              AssertEquals('Padded cell', Expected, Padded[X, Y, D], 0.0001);
+            end;
+      finally
+        Original.Free;
+        Padded.Free;
+      end;
+    end;
 end;
 
 procedure TTestNeuralVolume.TestVolumeTranspose;
