@@ -221,6 +221,7 @@ type
     procedure TestBuildFromGGUFGemma2RoundTrip;
     procedure TestGGUFGemma2Q8AndF16ImportDrift;
     procedure TestBuildFromGGUFRejectsUnknownArch;
+    procedure TestGGUFMetaArrayStaging;
     procedure TestGGUFWriterGpt2TokenizerRoundTrip;
     procedure TestTNNetGGUFWriterRoundTrip;
     procedure TestGGUFWriterQ8FromInt8;
@@ -5828,8 +5829,9 @@ procedure TTestNeuralPretrained.TestGGUFTensorDecodeParity;
 var
   GGUF: TNNetGGUFReader;
   ST: TNNetSafeTensorsReader;
-  VG, VS: TNNetVolume;
+  VG, VS, VSlice: TNNetVolume;
   MaxDiff: double;
+  k: integer;
 
   function MaxAbsDiff(const GGUFName, STName: string): double;
   var
@@ -5867,6 +5869,22 @@ begin
       AssertTrue('q_proj de-interleaved rows exact',
         MaxAbsDiff('blk.0.attn_q.weight',
           'model.layers.0.self_attn.q_proj.weight') = 0);
+      // A row SLICE of the same tensor must serve the same de-interleaved
+      // rows. Rows 1..6 of the 8-row (2-head, HeadDim 4) matrix start and
+      // end mid-head, so the reader cannot lean on head-aligned requests.
+      // VG still holds the whole de-interleaved tensor from the assert
+      // above.
+      VSlice := TNNetVolume.Create;
+      try
+        GGUF.LoadTensorRowsFlat('blk.0.attn_q.weight', {FirstRow=}1,
+          {RowCount=}6, {RowSize=}8, VSlice);
+        AssertEquals('q_proj slice size', 48, VSlice.Size);
+        for k := 0 to 47 do
+          AssertEquals('q_proj de-interleaved slice element ' + IntToStr(k),
+            VG.FData[8 + k], VSlice.FData[k], 0);
+      finally
+        VSlice.Free;
+      end;
     finally
       GGUF.Free;
     end;
@@ -6915,6 +6933,95 @@ begin
   // soft-capping does not amplify it. Gated < 3e-3 like the Llama F16 arm.
   AssertTrue('F16 gemma2 GGUF logit drift = ' + FloatToStr(Drift) +
     ' must be < 3e-3 relative', Drift < 3e-3);
+end;
+
+// The metadata ARRAY reader pulls the header through a staging block
+// (NeuralGGUFMetaStageBytes) instead of one stream read per element. Every
+// element must arrive identical whatever the staging size is, including
+// sizes small enough that a single string straddles a refill and that the
+// block holds less than one numeric element. The fixture carries all three
+// array kinds the writer emits (strings of mixed length, f32, i32), plus a
+// scalar key AFTER the arrays so the restored stream position is pinned.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestGGUFMetaArrayStaging;
+const
+  cCount = 40;
+  cStages: array[0..4] of integer = (7, 16, 64, 4096, 64 * 1024);
+var
+  Reader: TNNetGGUFReader;
+  Writer: TNNetGGUFWriter;
+  GGUFPath: string;
+  Tokens: array of string;
+  Scores: array of single;
+  Types: array of integer;
+  Dummy: TNNetVolume;
+  SavedStage, StageCnt, i: integer;
+begin
+  SetLength(Tokens, cCount);
+  SetLength(Scores, cCount);
+  SetLength(Types, cCount);
+  for i := 0 to cCount - 1 do
+  begin
+    // Lengths sweep 1..40 bytes so refills land inside a string body and
+    // inside the 8-byte length prefix.
+    Tokens[i] := StringOfChar(Chr(Ord('a') + (i mod 26)), i + 1);
+    Scores[i] := -0.5 * i;
+    Types[i] := i - 7;
+  end;
+  GGUFPath := GetTempDir(false) + 'cai_gguf_meta_stage_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Writer := TNNetGGUFWriter.Create(GGUFPath);
+  Dummy := TNNetVolume.Create(4, 1, 1);
+  try
+    Writer.AddMetaString('general.architecture', 'llama');
+    Writer.AddMetaStringArray('tokenizer.ggml.tokens', Tokens);
+    Writer.AddMetaFloat32Array('tokenizer.ggml.scores', Scores);
+    Writer.AddMetaInt32Array('tokenizer.ggml.token_type', Types);
+    // Read after the arrays: a staged reader that leaves the stream at the
+    // wrong offset corrupts this key (or the tensor table below).
+    Writer.AddMetaUInt32('llama.block_count', 123);
+    Writer.AddTensorFlat('token_embd.weight', [2, 2], Dummy, gwF32);
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+    Dummy.Free;
+  end;
+  SavedStage := NeuralGGUFMetaStageBytes;
+  try
+    for StageCnt := Low(cStages) to High(cStages) do
+    begin
+      NeuralGGUFMetaStageBytes := cStages[StageCnt];
+      Reader := TNNetGGUFReader.Create(GGUFPath);
+      try
+        AssertEquals('token count at stage ' + IntToStr(cStages[StageCnt]),
+          cCount, integer(Reader.GetMetaArrayCount('tokenizer.ggml.tokens')));
+        for i := 0 to cCount - 1 do
+        begin
+          AssertEquals('token ' + IntToStr(i) + ' at stage ' +
+            IntToStr(cStages[StageCnt]), Tokens[i],
+            Reader.GetMetaArrayString('tokenizer.ggml.tokens', i));
+          AssertEquals('score ' + IntToStr(i) + ' at stage ' +
+            IntToStr(cStages[StageCnt]), Scores[i],
+            Reader.GetMetaArrayNumber('tokenizer.ggml.scores', i), 0);
+          AssertEquals('token type ' + IntToStr(i) + ' at stage ' +
+            IntToStr(cStages[StageCnt]), Types[i],
+            integer(Round(
+              Reader.GetMetaArrayNumber('tokenizer.ggml.token_type', i))));
+        end;
+        AssertEquals('key after the arrays at stage ' +
+          IntToStr(cStages[StageCnt]), 123,
+          integer(Reader.GetMetaInt('llama.block_count', -1)));
+        AssertEquals('tensor table after the arrays at stage ' +
+          IntToStr(cStages[StageCnt]), 4,
+          integer(Reader.ElementCount('token_embd.weight')));
+      finally
+        Reader.Free;
+      end;
+    end;
+  finally
+    NeuralGGUFMetaStageBytes := SavedStage;
+  end;
+  DeleteFile(GGUFPath);
 end;
 
 // BuildFromGGUF must reject an unsupported architecture with a clear error

@@ -558,6 +558,7 @@ var
   Node, ValNode: TPickleNode;
   EntryName: string;
   MemoHi, LongLenM1, NodeItemsHi, RootKeysHi, NodeShapeHi, OwnedMax: integer;
+  PairCnt, KeyBase: integer;
 
   procedure Fail(const Msg: string);
   begin
@@ -940,12 +941,19 @@ begin
             if Length(Node.Items) mod 2 <> 0 then
               Fail('SETITEMS with an odd number of stack entries');
             if StackTop < 0 then Fail('SETITEMS on an empty stack');
-            i := 0;
-            while i < Length(Node.Items) do
+            ValNode := Stack[StackTop];
+            if ValNode.Kind <> pkDict then Fail('SETITEM(S) on a non-dict');
+            // The whole batch is sized once: a state_dict arrives as one
+            // SETITEMS of every tensor, so appending pair by pair would
+            // regrow both arrays per key.
+            PairCnt := Length(Node.Items) shr 1;
+            KeyBase := Length(ValNode.Keys);
+            SetLength(ValNode.Keys, KeyBase + PairCnt);
+            SetLength(ValNode.Vals, KeyBase + PairCnt);
+            for i := 0 to PairCnt - 1 do
             begin
-              DictSetItem(Stack[StackTop], Node.Items[i],
-                Node.Items[i + 1]);
-              i := i + 2;
+              ValNode.Keys[KeyBase + i] := Node.Items[2 * i];
+              ValNode.Vals[KeyBase + i] := Node.Items[2 * i + 1];
             end;
           end;
         $61: // APPEND 'a'
