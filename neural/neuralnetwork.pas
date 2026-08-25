@@ -13159,11 +13159,19 @@ type
     // ComputeFFT (forward) and the two backward FFT helpers never run on the
     // stack simultaneously for one instance, so they share these by name.
     FcReBuf, FcImBuf, FxReBuf, FxImBuf, FeReBuf, FeImBuf: array of Double;
+    // Cached FFT of the kernel c, valid while FcSpecW still mirrors the kernel
+    // weights. Guarded by a value snapshot rather than an AfterWeightUpdate hook
+    // so a directly hand-edited weight (a finite-difference perturbation, a
+    // freshly loaded net) is honoured.
+    FcSpecRe, FcSpecIm: array of Double;
+    FcSpecW: array of TNeuralFloat;
+    FcSpecValid: boolean;
     // Reversed copy of the input (FxRevBuf[0] = x[0], FxRevBuf[p] = x[n-p]),
     // sized N in SetPrevLayer. It makes the direct forward's kernel index
     // ascend, so each output is two contiguous dot products.
     FxRevBuf: array of TNeuralFloat;
     procedure ComputePreviousLayerErrorCPU(); override;
+    procedure EnsureKernelSpectrum(N: integer);
     procedure ComputeFFT();
     procedure ComputePreviousLayerErrorFFT();
     procedure BackpropagateKernelBiasFFT();
@@ -82965,10 +82973,10 @@ end;
 // the direct path to < 1e-5 even when TNeuralFloat is single.
 procedure CirculantFFT(var Re, Im: array of Double; N: integer; Inverse: boolean);
 var
-  i, j, len, half, k: integer;
+  i, j, len, half, k, p, q: integer;
   NM1, halfM1: integer;
-  ang, wRe, wIm, wpRe, wpIm, tmp: Double;
-  uRe, uIm, vRe, vIm: Double;
+  ang, wRe, wIm, wpRe, wpIm, tmp, InvN: Double;
+  uRe, uIm, vRe, vIm, pRe, pIm: Double;
 begin
   NM1 := N - 1;
   // Bit-reversal permutation.
@@ -83006,17 +83014,23 @@ begin
     begin
       wRe := 1.0;
       wIm := 0.0;
+      p := i;                     // #12: carries i + k
+      q := i + half;              // #12: carries i + k + half
       for k := 0 to halfM1 do
       begin
-        uRe := Re[i + k];
-        uIm := Im[i + k];
+        uRe := Re[p];
+        uIm := Im[p];
+        pRe := Re[q];             // #4: each partner is read twice below
+        pIm := Im[q];
         // v = w * x[i+k+half]
-        vRe := wRe * Re[i + k + half] - wIm * Im[i + k + half];
-        vIm := wRe * Im[i + k + half] + wIm * Re[i + k + half];
-        Re[i + k]        := uRe + vRe;
-        Im[i + k]        := uIm + vIm;
-        Re[i + k + half] := uRe - vRe;
-        Im[i + k + half] := uIm - vIm;
+        vRe := wRe * pRe - wIm * pIm;
+        vIm := wRe * pIm + wIm * pRe;
+        Re[p] := uRe + vRe;
+        Im[p] := uIm + vIm;
+        Re[q] := uRe - vRe;
+        Im[q] := uIm - vIm;
+        Inc(p);
+        Inc(q);
         // advance w *= wp
         tmp := wRe * wpRe - wIm * wpIm;
         wIm := wRe * wpIm + wIm * wpRe;
@@ -83027,11 +83041,16 @@ begin
     len := len shl 1;
   end;
   if Inverse then
+  begin
+    // #21: N is a power of two here (RequireFFTUsable), so 1/N is exact and the
+    // multiply gives the same result as the divide.
+    InvN := 1.0 / N;
     for i := 0 to NM1 do
     begin
-      Re[i] := Re[i] / N;
-      Im[i] := Im[i] / N;
+      Re[i] := Re[i] * InvN;
+      Im[i] := Im[i] * InvN;
     end;
+  end;
 end;
 
 // True iff x is a power of two (and > 0).
@@ -83089,6 +83108,9 @@ begin
   SetLength(FxReBuf, N); SetLength(FxImBuf, N);
   SetLength(FeReBuf, N); SetLength(FeImBuf, N);
   SetLength(FxRevBuf, N);
+  SetLength(FcSpecRe, N); SetLength(FcSpecIm, N);
+  SetLength(FcSpecW, N);
+  FcSpecValid := False;
   InitDefault();
   // The kernel c is the only learned operator; keep the bias neuron at 0 so the
   // layer starts as a (near-)identity-magnitude circular convolution.
@@ -83105,6 +83127,8 @@ begin
   SetLength(FxReBuf, 0); SetLength(FxImBuf, 0);
   SetLength(FeReBuf, 0); SetLength(FeImBuf, 0);
   SetLength(FxRevBuf, 0);
+  SetLength(FcSpecRe, 0); SetLength(FcSpecIm, 0);
+  SetLength(FcSpecW, 0);
   inherited Destroy();
 end;
 
@@ -83279,42 +83303,69 @@ begin
     );
 end;
 
+// FFT(c) is reused by every FFT path until the kernel weights actually change,
+// so it is transformed once per weight state instead of once per pass (#27). The
+// snapshot compare is O(n) against an O(n log n) transform.
+procedure TNNetCirculantLinear.EnsureKernelSpectrum(N: integer);
+var
+  i, NM1: integer;
+  Stale: boolean;
+  Kernel: TNNetVolume;
+begin
+  Kernel := FArrNeurons[0].FWeights;
+  NM1 := N - 1;
+  Stale := not FcSpecValid;
+  if not Stale then
+    for i := 0 to NM1 do
+      if FcSpecW[i] <> Kernel.FData[i] then
+      begin
+        Stale := True;
+        break;
+      end;
+  if not Stale then exit;
+  for i := 0 to NM1 do
+  begin
+    FcSpecRe[i] := Kernel.FData[i];
+    FcSpecIm[i] := 0;
+  end;
+  CirculantFFT(FcSpecRe, FcSpecIm, N, false);
+  Move(Kernel.FData[0], FcSpecW[0], N * csNeuralFloatSize);
+  FcSpecValid := True;
+end;
+
 // FFT forward: y = IFFT( FFT(c) .* FFT(x) ) + bias. This equals the direct
 // circular convolution y[i] = sum_k c[(i-k) mod n] * x[k] to < 1e-5.
 procedure TNNetCirculantLinear.ComputeFFT();
 var
   N, i: integer;
   NM1: integer;
-  Kernel, Bias, PrevOut: TNNetVolume;
+  Bias, PrevOut: TNNetVolume;
   yRe, yIm: Double;
 begin
   N := FOutput.Size;
   NM1 := N - 1;
-  Kernel := FArrNeurons[0].FWeights;
   Bias := FArrNeurons[1].FWeights;
   PrevOut := FPrevLayer.FOutput;
+  EnsureKernelSpectrum(N);
   for i := 0 to NM1 do
   begin
-    FcReBuf[i] := Kernel.FData[i]; FcImBuf[i] := 0;
     FxReBuf[i] := PrevOut.FData[i]; FxImBuf[i] := 0;
   end;
-  CirculantFFT(FcReBuf, FcImBuf, N, false);
   CirculantFFT(FxReBuf, FxImBuf, N, false);
   // Pointwise complex product C .* X.
   for i := 0 to NM1 do
   begin
-    yRe := FcReBuf[i] * FxReBuf[i] - FcImBuf[i] * FxImBuf[i];
-    yIm := FcReBuf[i] * FxImBuf[i] + FcImBuf[i] * FxReBuf[i];
+    yRe := FcSpecRe[i] * FxReBuf[i] - FcSpecIm[i] * FxImBuf[i];
+    yIm := FcSpecRe[i] * FxImBuf[i] + FcSpecIm[i] * FxReBuf[i];
     FcReBuf[i] := yRe; FcImBuf[i] := yIm;
   end;
   CirculantFFT(FcReBuf, FcImBuf, N, true);
-  for i := 0 to NM1 do
-  begin
-    if FSuppressBias = 0 then
+  if FSuppressBias = 0 then
+    for i := 0 to NM1 do
       FOutput.FData[i] := FcReBuf[i] + Bias.FData[i]
-    else
+  else
+    for i := 0 to NM1 do
       FOutput.FData[i] := FcReBuf[i];
-  end;
 end;
 
 // FFT input gradient: dL/dx[k] = sum_i outErr[i] * c[(i-k) mod n] is the circular
@@ -83325,25 +83376,23 @@ procedure TNNetCirculantLinear.ComputePreviousLayerErrorFFT();
 var
   N, i: integer;
   NM1: integer;
-  Kernel, LocalPrevError: TNNetVolume;
+  LocalPrevError: TNNetVolume;
   gRe, gIm: Double;
 begin
   N := FOutput.Size;
   NM1 := N - 1;
-  Kernel := FArrNeurons[0].FWeights;
   LocalPrevError := FPrevLayer.OutputError;
+  EnsureKernelSpectrum(N);
   for i := 0 to NM1 do
   begin
-    FcReBuf[i] := Kernel.FData[i]; FcImBuf[i] := 0;
     FeReBuf[i] := FOutputError.FData[i]; FeImBuf[i] := 0;
   end;
-  CirculantFFT(FcReBuf, FcImBuf, N, false);
   CirculantFFT(FeReBuf, FeImBuf, N, false);
   // conj(C) .* E
   for i := 0 to NM1 do
   begin
-    gRe := FcReBuf[i] * FeReBuf[i] + FcImBuf[i] * FeImBuf[i];
-    gIm := FcReBuf[i] * FeImBuf[i] - FcImBuf[i] * FeReBuf[i];
+    gRe := FcSpecRe[i] * FeReBuf[i] + FcSpecIm[i] * FeImBuf[i];
+    gIm := FcSpecRe[i] * FeImBuf[i] - FcSpecIm[i] * FeReBuf[i];
     FcReBuf[i] := gRe; FcImBuf[i] := gIm;
   end;
   CirculantFFT(FcReBuf, FcImBuf, N, true);
@@ -84007,10 +84056,9 @@ end;
 //   y[i] = sum_j CPX_SGN[i][j] * W[CPX_SRC[i][j]] * x[j].
 procedure TNNetComplexLinear.ComputeCPU();
 var
-  oc, ic, oBase, base, i, j: integer;
+  oc, ic, oBase, base: integer;
   OutCM1, InCM1: integer;
-  acc: array[0..1] of TNeuralFloat;
-  xj: TNeuralFloat;
+  accRe, accIm, wRe, wIm, xRe, xIm: TNeuralFloat;
   W, PrevOut, Bias: TNNetVolume;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -84024,24 +84072,31 @@ begin
     oBase := oc * 2;
     // Both output components share the same weight row: block loop outermost,
     // components accumulated in registers, so the row is traversed once instead
-    // of twice. Per component the additions still run in (ic, j) order.
-    for i := 0 to 1 do acc[i] := 0;
+    // of twice. The 2x2 table is the plain complex multiply, written out (as the
+    // quaternion layer does) so no sign/index table is read per term.
+    accRe := 0;
+    accIm := 0;
+    base := 0;                                   // #6/#9: carries ic * 2
     for ic := 0 to InCM1 do
     begin
-      base := ic * 2;                            // #9: one base for W and input
-      for j := 0 to 1 do
-      begin
-        xj := PrevOut.FData[base + j];
-        for i := 0 to 1 do
-          acc[i] := acc[i] + CPX_SGN[i, j] * W.FData[base + CPX_SRC[i, j]] * xj;
-      end;
+      wRe := W.FData[base];
+      wIm := W.FData[base + 1];
+      xRe := PrevOut.FData[base];
+      xIm := PrevOut.FData[base + 1];
+      accRe := accRe + wRe * xRe - wIm * xIm;
+      accIm := accIm + wIm * xRe + wRe * xIm;
+      Inc(base, 2);
     end;
     if FSuppressBias = 0 then
-      for i := 0 to 1 do
-        FOutput.FData[oBase + i] := acc[i] + Bias.FData[oBase + i]
+    begin
+      FOutput.FData[oBase]     := accRe + Bias.FData[oBase];
+      FOutput.FData[oBase + 1] := accIm + Bias.FData[oBase + 1];
+    end
     else
-      for i := 0 to 1 do
-        FOutput.FData[oBase + i] := acc[i];
+    begin
+      FOutput.FData[oBase]     := accRe;
+      FOutput.FData[oBase + 1] := accIm;
+    end;
   end;
 end;
 
@@ -84066,11 +84121,9 @@ end;
 //   dL/dx[j] += sum_i CPX_SGN[i][j] * W[CPX_SRC[i][j]] * e[i].
 procedure TNNetComplexLinear.ComputePreviousLayerErrorCPU();
 var
-  oc, ic, oBase, base, pj, i, j: integer;
+  oc, ic, oBase, base: integer;
   OutCM1, InCM1: integer;
-  e: array[0..1] of TNeuralFloat;
-  allZero: boolean;
-  contrib: TNeuralFloat;
+  eRe, eIm, wRe, wIm: TNeuralFloat;
   W, LocalPrevError: TNNetVolume;
 begin
   LocalPrevError := FPrevLayer.OutputError;
@@ -84080,24 +84133,21 @@ begin
   begin
     W := FArrNeurons[oc].FWeights;
     oBase := oc * 2;
-    allZero := True;
-    for i := 0 to 1 do
-    begin
-      e[i] := FOutputError.FData[oBase + i];
-      if e[i] <> 0 then allZero := False;
-    end;
-    if allZero then continue;
+    eRe := FOutputError.FData[oBase];
+    eIm := FOutputError.FData[oBase + 1];
+    if (eRe = 0) and (eIm = 0) then continue;
+    // M(w)^T is the conjugate multiply: dx = conj(w) . e, written out so no
+    // sign/index table is read per term.
+    base := 0;                                   // #6/#9: carries ic * 2
     for ic := 0 to InCM1 do
     begin
-      base := ic * 2;                            // #9: one base
-      for j := 0 to 1 do
-      begin
-        contrib := 0;
-        for i := 0 to 1 do
-          contrib := contrib + CPX_SGN[i, j] * W.FData[base + CPX_SRC[i, j]] * e[i];
-        pj := base + j;                          // #10: (base + j) once
-        LocalPrevError.FData[pj] := LocalPrevError.FData[pj] + contrib;
-      end;
+      wRe := W.FData[base];
+      wIm := W.FData[base + 1];
+      LocalPrevError.FData[base] :=
+        LocalPrevError.FData[base] + wRe * eRe + wIm * eIm;
+      LocalPrevError.FData[base + 1] :=
+        LocalPrevError.FData[base + 1] - wIm * eRe + wRe * eIm;
+      Inc(base, 2);
     end;
   end;
 end;
@@ -84107,10 +84157,9 @@ end;
 //   dL/dW[CPX_SRC[i][j]] += CPX_SGN[i][j] * x[j] * e[i].
 procedure TNNetComplexLinear.BackpropagateCPU();
 var
-  oc, ic, oBase, base, p, i, j: integer;
+  oc, ic, oBase, base: integer;
   OutCM1, InCM1: integer;
-  e: array[0..1] of TNeuralFloat;
-  allZero: boolean;
+  eRe, eIm, xRe, xIm: TNeuralFloat;
   WDelta, BiasDelta, PrevOut: TNNetVolume;
 begin
   PrevOut := FPrevLayer.FOutput;
@@ -84121,27 +84170,25 @@ begin
   begin
     WDelta := FArrNeurons[oc].FDelta;
     oBase := oc * 2;
-    allZero := True;
-    for i := 0 to 1 do
-    begin
-      e[i] := -FLearningRate * FOutputError.FData[oBase + i];
-      if e[i] <> 0 then allZero := False;
-    end;
+    eRe := -FLearningRate * FOutputError.FData[oBase];
+    eIm := -FLearningRate * FOutputError.FData[oBase + 1];
     if FSuppressBias = 0 then
-      for i := 0 to 1 do
-        BiasDelta.FData[oBase + i] := BiasDelta.FData[oBase + i] + e[i];
-    if allZero then continue;
+    begin
+      BiasDelta.FData[oBase]     := BiasDelta.FData[oBase]     + eRe;
+      BiasDelta.FData[oBase + 1] := BiasDelta.FData[oBase + 1] + eIm;
+    end;
+    if (eRe = 0) and (eIm = 0) then continue;
+    // dW = e . conj(x), written out so no sign/index table is read per term.
+    base := 0;                                   // #6/#9: carries ic * 2
     for ic := 0 to InCM1 do
     begin
-      base := ic * 2;                            // #9: one base
-      for i := 0 to 1 do
-        for j := 0 to 1 do
-        begin
-          p := base + CPX_SRC[i, j];             // #10: weight index once
-          WDelta.FData[p] :=
-            WDelta.FData[p]
-            + CPX_SGN[i, j] * PrevOut.FData[base + j] * e[i];
-        end;
+      xRe := PrevOut.FData[base];
+      xIm := PrevOut.FData[base + 1];
+      WDelta.FData[base] :=
+        WDelta.FData[base] + xRe * eRe + xIm * eIm;
+      WDelta.FData[base + 1] :=
+        WDelta.FData[base + 1] - xIm * eRe + xRe * eIm;
+      Inc(base, 2);
     end;
   end;
   if not FBatchUpdate then
