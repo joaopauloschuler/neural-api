@@ -5920,7 +5920,12 @@ type
     FPosTable: TNNetVolume;                // (PrefixLen+MaxFrames)*hidden
     FEncToDecW, FEncToDecB: TNNetVolume;   // text enc_to_dec_proj
     FAudioW, FAudioB: TNNetVolume;         // chroma audio_enc_to_dec_proj
+    FInSeq: TNNetVolume;                   // decoder input (FullLen,1,Hidden)
     FDecSeqLen, FEncSeqLen, FPrefixLen: integer;
+    // Fills FInSeq (prefix rows + embedded delayed codes + sinusoidal
+    // positions) and runs the decoder over it. The logits then live in the
+    // last layer's output, one row per full-sequence position.
+    procedure RunDecoderOn(const Codes: TNNetIntArr2D; Prefix: TNNetVolume);
   public
     constructor Create(const pConfig: TMusicGenMelodyConfig;
       EncSeqLen, DecSeqLen: integer);
@@ -5944,6 +5949,11 @@ type
     // depth slot k*VocabSize..k*VocabSize+VocabSize-1.
     procedure ComputeLogits(const Codes: TNNetIntArr2D;
       Prefix, Logits: TNNetVolume);
+    // Single-row twin of ComputeLogits: fills RowLogits (1,1,K*VocabSize) with
+    // the logits at decoder frame DecRow only, skipping the whole-block copy
+    // when the caller reads one frame per step. Coded by Claude (AI).
+    procedure ComputeLogitsAtRow(const Codes: TNNetIntArr2D;
+      Prefix: TNNetVolume; DecRow: integer; RowLogits: TNNetVolume);
     // Greedy autoregressive generation of NumFrames audio frames using the delay
     // pattern, conditioned on Prefix. Returns the UNDELAYED code stack
     // Codes[k][t]. Coded by Claude (AI).
@@ -33517,7 +33527,8 @@ var
   Consumed: TStringList;
   k_i, j, i, BlockCnt, Half, PosCnt, ChCnt: integer;
   NumCbM1, VocabM1, HiddenM1, DecSeqLenM1, HalfM1, BlocksHi: integer;
-  EmbConst, Angle: double;
+  ColSin, RowBase: integer;
+  EmbConst, Angle, Factor: double;
   TName, BP: string;
 begin
   if EncSeqLen < 1 then
@@ -33617,15 +33628,22 @@ begin
     EmbConst := Ln(10000.0) / (Half - 1);
     DecSeqLenM1 := DecSeqLen - 1;
     HalfM1 := Half - 1;
-    for PosCnt := 0 to DecSeqLenM1 do
-      for ChCnt := 0 to HalfM1 do
+    // ChCnt-outer so the per-channel Exp runs once per column; Angle stays the
+    // exact same PosCnt*Factor product (bit-for-bit identical).
+    // cos in the FIRST half, sin in the second (HF MusicGen layout).
+    for ChCnt := 0 to HalfM1 do
+    begin
+      Factor := Exp(-ChCnt * EmbConst);
+      ColSin := Half + ChCnt;
+      RowBase := 0;   // #12: carry the row base (step Config.Hidden)
+      for PosCnt := 0 to DecSeqLenM1 do
       begin
-        Angle := PosCnt * Exp(-ChCnt * EmbConst);
-        // cos in the FIRST half, sin in the second (HF MusicGen layout).
-        Model.FPosTable.FData[PosCnt * Config.Hidden + ChCnt] := Cos(Angle);
-        Model.FPosTable.FData[PosCnt * Config.Hidden + Half + ChCnt] :=
-          Sin(Angle);
+        Angle := PosCnt * Factor;
+        Model.FPosTable.FData[RowBase + ChCnt] := Cos(Angle);
+        Model.FPosTable.FData[RowBase + ColSin] := Sin(Angle);
+        Inc(RowBase, Config.Hidden);
       end;
+    end;
 
     // ----- per-block weights (BIAS-FREE q/k/v/out and fc1/fc2) -----
     BlocksHi := High(Blocks);
@@ -34017,7 +34035,7 @@ procedure TParlerTTSModel.Generate(EncStates: TNNetVolume;
   const PromptIds: array of integer; NumFrames: integer; UseCache: boolean;
   out Codes: TNNetIntArr2D);
 var
-  EncHidden, FrameEmb, StepLogits: TNNetVolume;
+  EncHidden, FrameEmb, StepLogits, StepOut: TNNetVolume;
   Delayed: TNNetIntArr2D;
   EncStatesInput, Lay: TNNetLayer;
   SDPAs: array of TNNetScaledDotProductAttention;
@@ -34093,7 +34111,6 @@ begin
   EnsureStepDecoder;
   EncHidden := TNNetVolume.Create;
   FrameEmb := TNNetVolume.Create;
-  StepLogits := TNNetVolume.Create;
   SetLength(SDPAs, 0);
   try
     ProjectEncoderStates(EncStates, EncHidden);
@@ -34152,7 +34169,9 @@ begin
         end;
       end;
       FStepDecoder.Compute(FrameEmb);
-      StepLogits.Copy(FStepDecoder.GetLastLayer().Output); // (1,1,K*Vocab)
+      // The step logits (1,1,K*Vocab) are read straight off the BORROWED last
+      // layer output - no per-step copy into a scratch volume.
+      StepOut := FStepDecoder.GetLastLayer().Output;
       // Logits at a codec position seqpos predict delayed codec column
       // (seqpos-PromptLen)+1.
       if seqpos >= FPromptLen then
@@ -34163,7 +34182,7 @@ begin
           begin
             base := k_i * FConfig.VocabSize;
             // #18: MaxPos returns the FIRST maximum, as the scalar loop did.
-            TNNetVolume.MaxPos(Addr(StepLogits.FData[base]),
+            TNNetVolume.MaxPos(Addr(StepOut.FData[base]),
               VocabSizeM1 + 1, best);
             Delayed[k_i][t] := best;
           end;
@@ -34180,7 +34199,6 @@ begin
     for i := 0 to SDPAsHi do SDPAs[i].EndIncrementalDecode();
     EncHidden.Free;
     FrameEmb.Free;
-    StepLogits.Free;
   end;
 end;
 
@@ -34197,7 +34215,8 @@ var
   Tmp: TNNetVolume;
   k_i, j, i, BlockCnt, Half, PosCnt, ChCnt: integer;
   NumCbM1, VocabM1, HiddenM1, DecSeqLen, DecSeqLenM1, HalfM1, BlocksHi: integer;
-  EmbConst, Angle: double;
+  ColSin, RowBase: integer;
+  EmbConst, Angle, Factor: double;
   TName, BP: string;
 begin
   if EncSeqLen < 1 then ImportError('Parler-TTS import: EncSeqLen must be >= 1.');
@@ -34303,14 +34322,21 @@ begin
     EmbConst := Ln(10000.0) / (Half - 1);
     DecSeqLenM1 := DecSeqLen - 1;
     HalfM1 := Half - 1;
-    for PosCnt := 0 to DecSeqLenM1 do
-      for ChCnt := 0 to HalfM1 do
+    // ChCnt-outer so the per-channel Exp runs once per column; Angle stays the
+    // exact same PosCnt*Factor product (bit-for-bit identical).
+    for ChCnt := 0 to HalfM1 do
+    begin
+      Factor := Exp(-ChCnt * EmbConst);
+      ColSin := Half + ChCnt;
+      RowBase := 0;   // #12: carry the row base (step Config.Hidden)
+      for PosCnt := 0 to DecSeqLenM1 do
       begin
-        Angle := PosCnt * Exp(-ChCnt * EmbConst);
-        Model.FPosTable.FData[PosCnt * Config.Hidden + ChCnt] := Cos(Angle);
-        Model.FPosTable.FData[PosCnt * Config.Hidden + Half + ChCnt] :=
-          Sin(Angle);
+        Angle := PosCnt * Factor;
+        Model.FPosTable.FData[RowBase + ChCnt] := Cos(Angle);
+        Model.FPosTable.FData[RowBase + ColSin] := Sin(Angle);
+        Inc(RowBase, Config.Hidden);
       end;
+    end;
 
     // ----- per-block weights (BIAS-FREE q/k/v/out and fc1/fc2) -----
     BlocksHi := High(Blocks);
@@ -34500,6 +34526,7 @@ begin
   FEncToDecB := TNNetVolume.Create;
   FAudioW := TNNetVolume.Create;
   FAudioB := TNNetVolume.Create;
+  FInSeq := TNNetVolume.Create;
   FDecoder := nil;
 end;
 
@@ -34515,6 +34542,7 @@ begin
   FEncToDecB.Free;
   FAudioW.Free;
   FAudioB.Free;
+  FInSeq.Free;
   FDecoder.Free;
   inherited Destroy;
 end;
@@ -34524,7 +34552,7 @@ procedure TMusicGenMelodyModel.BuildConditioningPrefix(
 var
   t, o, i, c, srcT, nIn: integer;
   HiddenM1, NumChromaM1, TextDModelM1, ChromaLenM1, EncSeqLenM1: integer;
-  oBase, srcBase, tBase, rowBase: integer;
+  oBase, srcBase, tBase, rowBase, BaseRows, BaseRowsM1, RowBytes: integer;
   Acc: TNeuralFloat;
 begin
   HiddenM1 := FConfig.Hidden - 1;
@@ -34541,11 +34569,16 @@ begin
     ImportError('MusicGen Melody: chroma conditioning has zero frames.');
   if ChromaCond.Depth <> FConfig.NumChroma then
     ImportError('MusicGen Melody: chroma conditioning depth must be num_chroma.');
-  for t := 0 to ChromaLenM1 do
+  // The tiling repeats every nIn frames, so only the first nIn prefix rows are
+  // projected; the rest are byte copies of the row they repeat (#5: the whole
+  // projection is invariant in t beyond t mod nIn).
+  BaseRows := nIn;
+  if BaseRows > FConfig.ChromaLength then BaseRows := FConfig.ChromaLength;
+  BaseRowsM1 := BaseRows - 1;
+  srcBase := 0;   // #12: carry the chroma source row base (step NumChroma)
+  rowBase := 0;   // #12: carry the prefix row base (step Hidden)
+  for t := 0 to BaseRowsM1 do
   begin
-    srcT := t mod nIn;
-    srcBase := srcT * FConfig.NumChroma;
-    rowBase := t * FConfig.Hidden;
     oBase := 0; // o * NumChroma
     for o := 0 to HiddenM1 do
     begin
@@ -34554,6 +34587,15 @@ begin
           Addr(ChromaCond.FData[srcBase]), FConfig.NumChroma);
       Inc(oBase, FConfig.NumChroma);
     end;
+    Inc(srcBase, FConfig.NumChroma);
+    Inc(rowBase, FConfig.Hidden);
+  end;
+  RowBytes := FConfig.Hidden * csNeuralFloatSize;
+  for t := BaseRows to ChromaLenM1 do
+  begin
+    srcT := t mod nIn;
+    Move(Prefix.FData[srcT * FConfig.Hidden], Prefix.FData[rowBase], RowBytes);
+    Inc(rowBase, FConfig.Hidden);
   end;
   // ---- text rows: enc_to_dec_proj(EncStates), placed AFTER the chroma rows ----
   if EncStates.Depth <> FConfig.TextDModel then
@@ -34574,77 +34616,90 @@ begin
   end;
 end;
 
-procedure TMusicGenMelodyModel.ComputeLogits(const Codes: TNNetIntArr2D;
-  Prefix, Logits: TNNetVolume);
+procedure TMusicGenMelodyModel.RunDecoderOn(const Codes: TNNetIntArr2D;
+  Prefix: TNNetVolume);
 var
-  InSeq: TNNetVolume;
-  OutVol: TNNetVolume;
-  FullLen, t, k_i, c, tok: integer;
-  NumCodebooksM1, HiddenM1, FDecSeqLenM1, PrefixLenM1, KV, KVm1: integer;
-  tBase, tokBase, srcBase, dstBase: integer;
+  FullLen, t, k_i, tok: integer;
+  NumCodebooksM1, FDecSeqLenM1, PrefixElems: integer;
+  tBase, tokBase: integer;
   pRow: TNeuralFloatArrPtr;
 begin
   NumCodebooksM1 := FConfig.NumCodebooks - 1;
-  HiddenM1 := FConfig.Hidden - 1;
   FDecSeqLenM1 := FDecSeqLen - 1;
-  PrefixLenM1 := FPrefixLen - 1;
   FullLen := FPrefixLen + FDecSeqLen;
+  PrefixElems := FPrefixLen * FConfig.Hidden;
   if Length(Codes) <> FConfig.NumCodebooks then
     ImportError('MusicGen Melody ComputeLogits: wrong codebook count.');
-  if Prefix.Size <> FPrefixLen * FConfig.Hidden then
+  if Prefix.Size <> PrefixElems then
     ImportError('MusicGen Melody ComputeLogits: prefix size mismatch.');
-  InSeq := TNNetVolume.Create;
-  try
-    InSeq.ReSize(FullLen, 1, FConfig.Hidden);
-    // ---- prefix rows (conditioning) + their sinusoidal positions ----
-    // Prefix and the first PrefixLen rows of FPosTable are contiguous: copy the
-    // whole prefix block then add the position block in two AVX passes.
-    Move(Prefix.FData[0], InSeq.FData[0],
-      (PrefixLenM1 + 1) * FConfig.Hidden * csNeuralFloatSize);
-    TNNetVolume.Add(Addr(InSeq.FData[0]), Addr(FPosTable.FData[0]),
-      (PrefixLenM1 + 1) * FConfig.Hidden);
-    // ---- decoder frame rows: sum of K codebook lookups + sinusoidal pos ----
-    for t := 0 to FDecSeqLenM1 do
+  // #17: FInSeq is a persistent field; ReSize is a no-op once it holds shape.
+  FInSeq.ReSize(FullLen, 1, FConfig.Hidden);
+  // ---- prefix rows (conditioning) + their sinusoidal positions ----
+  // Prefix and the first PrefixLen rows of FPosTable are contiguous: copy the
+  // whole prefix block then add the position block in two AVX passes.
+  Move(Prefix.FData[0], FInSeq.FData[0], PrefixElems * csNeuralFloatSize);
+  TNNetVolume.Add(Addr(FInSeq.FData[0]), Addr(FPosTable.FData[0]), PrefixElems);
+  // ---- decoder frame rows: sum of K codebook lookups + sinusoidal pos ----
+  tBase := PrefixElems;   // #12: carry the row base (step Hidden)
+  for t := 0 to FDecSeqLenM1 do
+  begin
+    Move(FPosTable.FData[tBase], FInSeq.FData[tBase],
+      FConfig.Hidden * csNeuralFloatSize);
+    pRow := Addr(FInSeq.FData[tBase]); // #8: dst invariant across the k_i loop
+    for k_i := 0 to NumCodebooksM1 do
     begin
-      tBase := (FPrefixLen + t) * FConfig.Hidden;
-      Move(FPosTable.FData[tBase], InSeq.FData[tBase],
-        FConfig.Hidden * csNeuralFloatSize);
-      pRow := Addr(InSeq.FData[tBase]); // #8: dst invariant across the k_i loop
-      for k_i := 0 to NumCodebooksM1 do
-      begin
-        tok := Codes[k_i][t];
-        if (tok < 0) or (tok > FConfig.VocabSize) then
-          ImportError('MusicGen Melody ComputeLogits: code out of range.');
-        tokBase := tok * FConfig.Hidden;
-        TNNetVolume.Add(pRow, Addr(FEmbed[k_i].FData[tokBase]), FConfig.Hidden);
-      end;
+      tok := Codes[k_i][t];
+      if (tok < 0) or (tok > FConfig.VocabSize) then
+        ImportError('MusicGen Melody ComputeLogits: code out of range.');
+      tokBase := tok * FConfig.Hidden;
+      TNNetVolume.Add(pRow, Addr(FEmbed[k_i].FData[tokBase]), FConfig.Hidden);
     end;
-    FDecoder.Compute(InSeq);
-    // The net emits logits over the WHOLE sequence; copy the last DecSeqLen
-    // (decoder-frame) positions into Logits (DecSeqLen,1,K*VocabSize).
-    KV := FConfig.NumCodebooks * FConfig.VocabSize;
-    KVm1 := KV - 1;
-    Logits.ReSize(FDecSeqLen, 1, KV);
-    OutVol := FDecoder.GetLastLayer().Output;
-    for t := 0 to FDecSeqLenM1 do
-    begin
-      dstBase := t * KV;
-      srcBase := (FPrefixLen + t) * KV;
-      Move(OutVol.FData[srcBase], Logits.FData[dstBase], KV * csNeuralFloatSize);
-    end;
-  finally
-    InSeq.Free;
+    Inc(tBase, FConfig.Hidden);
   end;
+  FDecoder.Compute(FInSeq);
+end;
+
+procedure TMusicGenMelodyModel.ComputeLogits(const Codes: TNNetIntArr2D;
+  Prefix, Logits: TNNetVolume);
+var
+  OutVol: TNNetVolume;
+  KV: integer;
+begin
+  KV := FConfig.NumCodebooks * FConfig.VocabSize;
+  RunDecoderOn(Codes, Prefix);
+  // The net emits logits over the WHOLE sequence; the retained decoder-frame
+  // rows are its contiguous tail (dst and src both advance by KV per frame),
+  // so this is ONE Move off the BORROWED layer output.
+  OutVol := FDecoder.GetLastLayer().Output;   // borrowed, not owned
+  Logits.ReSize(FDecSeqLen, 1, KV);
+  Move(OutVol.FData[FPrefixLen * KV], Logits.FData[0],
+    FDecSeqLen * KV * csNeuralFloatSize);
+end;
+
+procedure TMusicGenMelodyModel.ComputeLogitsAtRow(const Codes: TNNetIntArr2D;
+  Prefix: TNNetVolume; DecRow: integer; RowLogits: TNNetVolume);
+var
+  OutVol: TNNetVolume;
+  KV: integer;
+begin
+  KV := FConfig.NumCodebooks * FConfig.VocabSize;
+  if (DecRow < 0) or (DecRow >= FDecSeqLen) then
+    ImportError('MusicGen Melody ComputeLogitsAtRow: decoder frame ' +
+      IntToStr(DecRow) + ' is outside [0, ' + IntToStr(FDecSeqLen) + ').');
+  RunDecoderOn(Codes, Prefix);
+  OutVol := FDecoder.GetLastLayer().Output;   // borrowed, not owned
+  RowLogits.ReSize(1, 1, KV);
+  Move(OutVol.FData[(FPrefixLen + DecRow) * KV], RowLogits.FData[0],
+    KV * csNeuralFloatSize);
 end;
 
 procedure TMusicGenMelodyModel.Generate(Prefix: TNNetVolume;
   NumFrames: integer; out Codes: TNNetIntArr2D);
 var
-  Logits: TNNetVolume;
+  StepLogits: TNNetVolume;
   Delayed: TNNetIntArr2D;
-  PadId, Steps, step, k_i, v, best, t, base, NumCodebooksM1, VsM1: integer;
+  PadId, Steps, step, k_i, best, t, base, NumCodebooksM1, VsM1: integer;
   StepsM1, NumFramesM1, Off, FDecSeqLenM1: integer;
-  bestVal, vv: TNeuralFloat;
 begin
   PadId := FConfig.VocabSize;
   Steps := NumFrames + FConfig.NumCodebooks - 1;  // mono: offset k for row k
@@ -34655,7 +34710,7 @@ begin
   FDecSeqLenM1 := FDecSeqLen - 1;
   if Steps >= FDecSeqLen then
     ImportError('MusicGen Melody Generate: NumFrames + K exceeds DecSeqLen.');
-  Logits := TNNetVolume.Create;
+  StepLogits := TNNetVolume.Create;
   try
     SetLength(Delayed, FConfig.NumCodebooks);
     for k_i := 0 to NumCodebooksM1 do
@@ -34665,25 +34720,22 @@ begin
     end;
     for step := 0 to StepsM1 do
     begin
-      ComputeLogits(Delayed, Prefix, Logits);
+      // Only decoder frame `step` is read below, so fetch that one row instead
+      // of Moving the whole DecSeqLen*K*Vocab block every step.
+      ComputeLogitsAtRow(Delayed, Prefix, step, StepLogits);
       t := step + 1;
+      base := 0;   // #12: carry codebook k_i's slot base (step VocabSize)
       for k_i := 0 to NumCodebooksM1 do
       begin
         Off := k_i;  // mono delay offset
         if (t < FDecSeqLen) and (t >= Off + 1) and
            (t - Off - 1 < NumFrames) then
         begin
-          base := step * (FConfig.NumCodebooks * FConfig.VocabSize) +
-            k_i * FConfig.VocabSize;
-          best := 0;
-          bestVal := Logits.FData[base];
-          for v := 1 to VsM1 do
-          begin
-            vv := Logits.FData[base + v];
-            if vv > bestVal then begin bestVal := vv; best := v; end;
-          end;
+          // #18: MaxPos returns the FIRST maximum, as the scalar loop did.
+          TNNetVolume.MaxPos(Addr(StepLogits.FData[base]), VsM1 + 1, best);
           Delayed[k_i][t] := best;
         end;
+        Inc(base, FConfig.VocabSize);
       end;
     end;
     SetLength(Codes, FConfig.NumCodebooks);
@@ -34695,7 +34747,7 @@ begin
       Move(Delayed[k_i][Off + 1], Codes[k_i][0], NumFrames * csIntegerSize);
     end;
   finally
-    Logits.Free;
+    StepLogits.Free;
   end;
 end;
 
@@ -34748,7 +34800,8 @@ var
   Tmp: TNNetVolume;
   k_i, j, i, BlockCnt, Half, PosCnt, ChCnt, FullSeqLen: integer;
   NumCbM1, VocabM1, HiddenM1, FullSeqM1, HalfM1, BlocksHi: integer;
-  EmbConst, Angle: double;
+  ColSin, RowBase: integer;
+  EmbConst, Angle, Factor: double;
   TName, BP: string;
 begin
   if EncSeqLen < 1 then ImportError('MusicGen Melody: EncSeqLen must be >= 1.');
@@ -34846,14 +34899,21 @@ begin
     EmbConst := Ln(10000.0) / (Half - 1);
     FullSeqM1 := FullSeqLen - 1;
     HalfM1 := Half - 1;
-    for PosCnt := 0 to FullSeqM1 do
-      for ChCnt := 0 to HalfM1 do
+    // ChCnt-outer so the per-channel Exp runs once per column; Angle stays the
+    // exact same PosCnt*Factor product (bit-for-bit identical).
+    for ChCnt := 0 to HalfM1 do
+    begin
+      Factor := Exp(-ChCnt * EmbConst);
+      ColSin := Half + ChCnt;
+      RowBase := 0;   // #12: carry the row base (step Config.Hidden)
+      for PosCnt := 0 to FullSeqM1 do
       begin
-        Angle := PosCnt * Exp(-ChCnt * EmbConst);
-        Model.FPosTable.FData[PosCnt * Config.Hidden + ChCnt] := Cos(Angle);
-        Model.FPosTable.FData[PosCnt * Config.Hidden + Half + ChCnt] :=
-          Sin(Angle);
+        Angle := PosCnt * Factor;
+        Model.FPosTable.FData[RowBase + ChCnt] := Cos(Angle);
+        Model.FPosTable.FData[RowBase + ColSin] := Sin(Angle);
+        Inc(RowBase, Config.Hidden);
       end;
+    end;
 
     // ----- per-block weights (BIAS-FREE q/k/v/out + fc1/fc2; self-attn only) --
     BlocksHi := High(Blocks);
@@ -34924,7 +34984,7 @@ procedure LoadLinearWeights(Reader: TNNetSafeTensorsReader;
   HasBias: boolean);
 var
   W, B: TNNetVolume;
-  i, j, InDimM1, OutDimM1: integer;
+  j, OutDimM1, SrcBase, RowBytes: integer;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -34952,12 +35012,14 @@ begin
           IntToStr(OutDim) + '], got ' + Reader.ShapeAsString(BName));
       Reader.LoadTensorFlat(BName, B);
     end;
-    InDimM1 := InDim - 1;
     OutDimM1 := OutDim - 1;
+    RowBytes := InDim * csNeuralFloatSize;
+    SrcBase := 0;   // #12: carry the source row base (step InDim)
     for j := 0 to OutDimM1 do
     begin
-      for i := 0 to InDimM1 do
-        Layer.FArrNeurons[j].Weights.FData[i] := W.FData[j * InDim + i];
+      // #13: neuron j's weights are HF row j verbatim - one contiguous copy.
+      Move(W.FData[SrcBase], Layer.FArrNeurons[j].Weights.FData[0], RowBytes);
+      Inc(SrcBase, InDim);
       if HasBias then
         Layer.FArrNeurons[j].BiasWeight := B.FData[j]
       else
@@ -38180,27 +38242,33 @@ begin
   // call site (Length(Result) = 0).
 end;
 
-// Replaces each Row[0..Len-1] sample with the median of a centered window
-// of width Kernel (rounded up to odd), reflecting at the boundaries - the
-// openai-whisper median_filter along the time axis. Kernel <= 1 is a no-op.
-procedure WhisperMedianFilterRow(var Row: array of TNeuralFloat;
+// Writes into Dst[0..Len-1] the median of a centered window of width Kernel
+// (rounded up to odd) over Src, reflecting at the boundaries - the
+// openai-whisper median_filter along the time axis. Kernel <= 1 copies Src
+// through. Src holds the caller's unfiltered row and Win is a caller-owned
+// scratch window of at least Len elements, so the per-row call allocates
+// nothing.
+procedure WhisperMedianFilterRow(var Dst, Src, Win: array of TNeuralFloat;
   Len, Kernel: integer);
 var
   Half, i, k, SrcIdx, w, a, b: integer;
   LenM1, KernelM1, TwoLenM2, iMH: integer;
-  Win: array of TNeuralFloat;
-  Orig: array of TNeuralFloat;
   Tmp: TNeuralFloat;
 begin
-  if (Kernel <= 1) or (Len <= 1) then Exit;
+  LenM1 := Len - 1;
+  if (Kernel <= 1) or (Len <= 1) then
+  begin
+    Move(Src[0], Dst[0], Len * csNeuralFloatSize);
+    Exit;
+  end;
   if (Kernel and 1) = 0 then Inc(Kernel);  // force odd
   if Kernel > Len then Kernel := Len - ((Len + 1) and 1);  // <= Len, odd
-  if Kernel <= 1 then Exit;
+  if Kernel <= 1 then
+  begin
+    Move(Src[0], Dst[0], Len * csNeuralFloatSize);
+    Exit;
+  end;
   Half := Kernel div 2;
-  SetLength(Orig, Len);
-  LenM1 := Len - 1;
-  Move(Row[0], Orig[0], Len * csNeuralFloatSize); // #13: snapshot copy
-  SetLength(Win, Kernel);
   KernelM1 := Kernel - 1;
   TwoLenM2 := 2 * (Len - 1); // #5: reflect clamp constant hoisted out of nest
   for i := 0 to LenM1 do
@@ -38215,7 +38283,7 @@ begin
         if SrcIdx < 0 then SrcIdx := -SrcIdx
         else if SrcIdx >= Len then SrcIdx := TwoLenM2 - SrcIdx;
       end;
-      Win[k] := Orig[SrcIdx];
+      Win[k] := Src[SrcIdx];
     end;
     // insertion sort (Kernel is small)
     for a := 1 to KernelM1 do
@@ -38230,7 +38298,7 @@ begin
       Win[b + 1] := Tmp;
     end;
     w := Half;  // middle element = median (Kernel is odd)
-    Row[i] := Win[w];
+    Dst[i] := Win[w];
   end;
 end;
 
@@ -38245,7 +38313,7 @@ var
   rBase, lBase: integer;
   Leaf: TNNetCrossAttention;
   RowMax, SumExp: TNeuralFloat;
-  FiltRow: array of TNeuralFloat;
+  FiltRow, FiltSrc, FiltWin: array of TNeuralFloat;
 begin
   // 1. Enumerate the decoder's per-head cross-attention leaves in build
   //    order: DecoderHeads of them per decode block, in head order.
@@ -38310,12 +38378,17 @@ begin
   //     single-frame attention spikes before the DTW. Disabled for k<=1.
   if MedianKernel > 1 then
   begin
+    // #17: the row snapshot and the sort window are allocated ONCE here, not
+    // per filtered token row.
     SetLength(FiltRow, EncFrames);
+    SetLength(FiltSrc, EncFrames);
+    SetLength(FiltWin, EncFrames);
     rBase := 0;   // #12: carry the row base (step EncFrames, Depth=1)
     for i := 0 to TextLenM1 do
     begin
-      Move(Result.FData[rBase], FiltRow[0], EncFrames * csNeuralFloatSize);
-      WhisperMedianFilterRow(FiltRow, EncFrames, MedianKernel);
+      Move(Result.FData[rBase], FiltSrc[0], EncFrames * csNeuralFloatSize);
+      WhisperMedianFilterRow(FiltRow, FiltSrc, FiltWin, EncFrames,
+        MedianKernel);
       Move(FiltRow[0], Result.FData[rBase], EncFrames * csNeuralFloatSize);
       Inc(rBase, EncFrames);
     end;
@@ -38341,21 +38414,23 @@ function WhisperDTW(Score: TNNetVolume;
   out PathTok, PathFrame: array of integer): integer;
 var
   N, M, i, j, ti, fj, PathLen, ResultM1, sBase, jM1: integer;
-  Trace: array of array of byte;    // 0=diag, 1=down(token), 2=right(frame)
+  TraceStride, TraceBase: integer;
+  // 0=diag, 1=down(token), 2=right(frame). One flat (N+1)*(M+1) block: the
+  // backtrace needs the whole table, but a ragged array costs N+1 allocations
+  // and an indirection per probe.
+  Trace: array of byte;
   // The accumulated cost is consumed strictly as previous-row/current-row, so
   // two rolling rows replace the full (N+1)x(M+1) matrix (5.4 MB -> 24 KB at
-  // 448 tokens x 1500 frames, and one allocation instead of N+1). Trace must
-  // stay full-size: the backtrace walks it.
+  // 448 tokens x 1500 frames, and one allocation instead of N+1).
   CostPrev, CostRow, CostSwap: array of Double;
-  TraceRow: array of byte;
   c0, c1, c2, Best: Double;
   BestMove: byte;
   TmpTok, TmpFrame: array of integer;
 begin
   N := Score.SizeY;  // text tokens
   M := Score.SizeX;  // audio frames
-  SetLength(Trace, N + 1);
-  for i := 0 to N do SetLength(Trace[i], M + 1);
+  TraceStride := M + 1;
+  SetLength(Trace, (N + 1) * TraceStride);
   SetLength(CostPrev, M + 1);
   SetLength(CostRow, M + 1);
   // Row 0 seeds the recurrence: only (0,0) is reachable at zero cost.
@@ -38365,7 +38440,7 @@ begin
   for i := 1 to N do
   begin
     sBase := Score.GetRawPos(0, i - 1);
-    TraceRow := Trace[i];
+    TraceBase := i * TraceStride;   // #12: row base into the flat trace
     CostRow[0] := 1e30;     // column 0 is unreachable for every token row
     jM1 := 0;
     c2 := CostRow[0];         // right (CostRow[j-1]); carried across j (#4/#6)
@@ -38378,7 +38453,7 @@ begin
       if c2 < Best then begin Best := c2; BestMove := 2; end;
       c2 := Best - Score.FData[sBase + jM1];  // new CostRow[j] = next j's c2
       CostRow[j] := c2;
-      TraceRow[j] := BestMove;
+      Trace[TraceBase + j] := BestMove;
       jM1 := j;
     end;
     // This row becomes the next row's predecessor; its buffer is reused.
@@ -38396,7 +38471,7 @@ begin
     TmpTok[PathLen] := i - 1;
     TmpFrame[PathLen] := j - 1;
     Inc(PathLen);
-    case Trace[i][j] of
+    case Trace[i * TraceStride + j] of
       0: begin Dec(i); Dec(j); end;
       1: Dec(i);
       2: Dec(j);
@@ -38840,7 +38915,7 @@ var
   InPerGroup, o, ic, kk, oc, SrcIdx, SrcBase, DstBase, TapRowsM1: integer;
   InPerGroupM1, KernelM1, HiddenSizeM1: integer;
   Norm, Acc, GTap: TNeuralFloat;
-  TapNorm: array of TNeuralFloat;
+  TapScale: array of TNeuralFloat;
 begin
   InPerGroup := HiddenSize div Groups;
   InPerGroupM1 := InPerGroup - 1;
@@ -38883,7 +38958,7 @@ begin
     // Only the Kernel norms are materialized; g[k]*v/norm is then applied
     // straight into the neurons, so no [Out, In/groups, Kernel] effective
     // weight buffer is built and re-gathered at the same indices.
-    SetLength(TapNorm, Kernel);
+    SetLength(TapScale, Kernel);
     TapRowsM1 := HiddenSize * InPerGroup - 1;
     for kk := 0 to KernelM1 do
     begin
@@ -38896,7 +38971,9 @@ begin
       end;
       Norm := Sqrt(Acc);
       if Norm = 0 then Norm := 1;
-      TapNorm[kk] := Norm;
+      // #21: fold g[k]/norm[k] into one per-tap scale so the neuron loop
+      // multiplies instead of dividing by a value invariant over (o, ic).
+      TapScale[kk] := G.FData[kk] / Norm;
     end;
     for o := 0 to HiddenSizeM1 do
     begin
@@ -38905,12 +38982,11 @@ begin
       DstBase := 0;
       for kk := 0 to KernelM1 do
       begin
-        GTap := G.FData[kk];
-        Norm := TapNorm[kk];
+        GTap := TapScale[kk];
         SrcIdx := SrcBase + kk;
         for ic := 0 to InPerGroupM1 do
         begin
-          WV.FData[DstBase + ic] := GTap * V.FData[SrcIdx] / Norm;
+          WV.FData[DstBase + ic] := GTap * V.FData[SrcIdx];
           Inc(SrcIdx, Kernel);
         end;
         Inc(DstBase, InPerGroup);
@@ -71639,7 +71715,7 @@ procedure LoadStyleGAN2Linear(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BName: string; OutDim, InDim: integer);
 var
   W, B: TNNetVolume;
-  j, i, OutDimM1, InDimM1: integer;
+  j, OutDimM1, SrcBase, RowBytes: integer;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -71668,11 +71744,13 @@ begin
           IntToStr(OutDim) + ' elements, got ' + IntToStr(B.Size) + '.');
     end;
     OutDimM1 := OutDim - 1;
-    InDimM1 := InDim - 1;
+    RowBytes := InDim * csNeuralFloatSize;
+    SrcBase := 0;   // #12: carry the source row base (step InDim)
     for j := 0 to OutDimM1 do
     begin
-      for i := 0 to InDimM1 do
-        Layer.FArrNeurons[j].Weights.FData[i] := W.FData[j * InDim + i];
+      // #13: neuron j's weights are HF row j verbatim - one contiguous copy.
+      Move(W.FData[SrcBase], Layer.FArrNeurons[j].Weights.FData[0], RowBytes);
+      Inc(SrcBase, InDim);
       if BName <> '' then Layer.FArrNeurons[j].BiasWeight := B.FData[j]
       else Layer.FArrNeurons[j].BiasWeight := 0;
     end;

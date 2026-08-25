@@ -18492,7 +18492,8 @@ var
   RefObj: TJSONObject;
   WaveFreqs, WaveAmps, EncStatesArr, RowArr, CondArr, CodesArr, LogitsArr,
     KArr, TArr, ChromaArr: TJSONArray;
-  Samples, Chroma, EncStates, ChromaCond, Prefix, Logits: TNNetVolume;
+  Samples, Chroma, EncStates, ChromaCond, Prefix, Logits,
+    RowLogits: TNNetVolume;
   Codes: TNNetIntArr2D;
   EncSeq, DecSeq, K, Vocab, TextD, NumChroma, ChromaLen, NSamp, SR: integer;
   NumFrames, t, k_i, v, i, c, expArg, gotArg: integer;
@@ -18509,6 +18510,7 @@ begin
   ChromaCond := TNNetVolume.Create;
   Prefix := TNNetVolume.Create;
   Logits := TNNetVolume.Create;
+  RowLogits := TNNetVolume.Create;
   try
     RefJson.LoadFromFile(FixturePath('tiny_musicgen_melody_ref.json'));
     RefRoot := GetJSON(RefJson.Text);
@@ -18629,6 +18631,22 @@ begin
     end;
     AssertTrue('MusicGen Melody decoder logit parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // ---- (3) the single-row twin returns the same row as the block read ----
+    MaxDiff := 0;
+    for t := 0 to DecSeq - 1 do
+    begin
+      Model.ComputeLogitsAtRow(Codes, Prefix, t, RowLogits);
+      AssertEquals('row logits depth = K*vocab', K * Vocab, RowLogits.Depth);
+      AssertEquals('row logits length = 1', 1, RowLogits.SizeX);
+      for i := 0 to K * Vocab - 1 do
+      begin
+        Diff := Abs(RowLogits.FData[i] - Logits.FData[t * (K * Vocab) + i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('MusicGen Melody ComputeLogitsAtRow matches ComputeLogits: ' +
+      'max |diff| = ' + FloatToStr(MaxDiff), MaxDiff = 0);
   finally
     Model.Free;
     Samples.Free;
@@ -18637,6 +18655,7 @@ begin
     ChromaCond.Free;
     Prefix.Free;
     Logits.Free;
+    RowLogits.Free;
     RefRoot.Free;
     RefJson.Free;
   end;
