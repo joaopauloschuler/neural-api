@@ -8502,6 +8502,16 @@ type
       FAuxDepth: TNNetVolume;
       FOutputChannelSize: TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    protected
+      // Depth-long scratch for ComputeAconMap: the per-channel gain (p1-p2),
+      // beta*(p1-p2), and the current pixel row's sigmoid. Sized by the ACON
+      // layers' SetPrevLayer; left empty on the other descendants.
+      FAconGain, FAconBetaGain, FAconSigmoid: TNNetVolume;
+      procedure SizeAconScratch();
+      // Writes the shared ACON map y = d*sigmoid(beta*d) + p2*x, d = (p1-p2)*x,
+      // over the whole of FOutput. beta is per-channel (fixed or data-dependent).
+      procedure ComputeAconMap(Prev: TNNetVolume;
+        P1Ptr, P2Ptr, BetaPtr: TNeuralFloatArrPtr);
     public
       constructor Create(); override;
       destructor Destroy(); override;
@@ -60011,6 +60021,7 @@ begin
   // need FNeurons[1] (p2, Depth weights) and FNeurons[2] (beta, Depth weights).
   if FNeurons.Count < 3 then AddMissingNeurons(3);
   SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  SizeAconScratch();
   // Backprop-only scratch: skip on inference-only layers.
   if FIsTrainable then
   begin
@@ -60026,10 +60037,7 @@ var
   StartTime: double;
   W1, W2, Wb: TNNetVolume;
   Prev: TNNetVolume;
-  SizeX, SizeY, Depth, DepthM1, d, k, NumPixM1: integer;
-  pos: integer;
-  p1_d, p2_d, beta_d, xv, dv, s: TNeuralFloat;
-  P1Ptr, P2Ptr, BetaPtr: TNeuralFloatArrPtr;
+  Depth: integer;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -60038,36 +60046,15 @@ begin
   W1 := FNeurons[0].FWeights;
   W2 := FNeurons[1].FWeights;
   Wb := FNeurons[2].FWeights;
-  SizeX := FOutput.SizeX;
-  SizeY := FOutput.SizeY;
   Depth := FOutput.Depth;
   {$IFDEF Debug}
   if (W1.Size <> Depth) or (W2.Size <> Depth) or (Wb.Size <> Depth) then
     FErrorProc('Neuron weight count isn''t compatible with output depth ' +
       'at TNNetAconC.');
   {$ENDIF}
-  // d = (p1[c]-p2[c])*x;  y = d*sigmoid(beta[c]*d) + p2[c]*x.
-  // App.E: pixel-outer / channel-inner, so the volume is swept once with the
-  // contiguous depth axis innermost instead of once per channel with a Depth
-  // stride. The per-element sigmoid keeps the body scalar.
-  DepthM1 := Depth - 1;
-  NumPixM1 := SizeX * SizeY - 1;
-  P1Ptr := W1.GetRawPtr(0);   // #8: the three parameter row bases, once
-  P2Ptr := W2.GetRawPtr(0);
-  BetaPtr := Wb.GetRawPtr(0);
-  pos := 0;
-  for k := 0 to NumPixM1 do
-    for d := 0 to DepthM1 do
-    begin
-      p1_d := P1Ptr^[d];
-      p2_d := P2Ptr^[d];
-      beta_d := BetaPtr^[d];
-      xv := Prev.FData[pos];
-      dv := (p1_d - p2_d) * xv;
-      s := 1 / (1 + NeuralExp(-beta_d * dv));
-      FOutput.FData[pos] := dv * s + p2_d * xv;
-      Inc(pos);
-    end;
+  // d = (p1[c]-p2[c])*x;  y = d*sigmoid(beta[c]*d) + p2[c]*x, with beta fixed
+  // per channel.
+  ComputeAconMap(Prev, W1.GetRawPtr(0), W2.GetRawPtr(0), Wb.GetRawPtr(0));
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -60079,7 +60066,7 @@ var
   Prev, PrevErr: TNNetVolume;
   SizeX, SizeY, Depth, DepthM1, d, k, NumPixM1: integer;
   pos: integer;
-  p1_d, p2_d, beta_d, xv, gy, dv, s, sds, phi: TNeuralFloat;
+  p2_d, gain, bd, gyxv, xv, gy, dv, s, sds, phi: TNeuralFloat;
   hasInputGrad: boolean;
   P1Ptr, P2Ptr, BetaPtr: TNeuralFloatArrPtr;
 begin
@@ -60121,21 +60108,21 @@ begin
   for k := 0 to NumPixM1 do
     for d := 0 to DepthM1 do
     begin
-      p1_d := P1Ptr^[d];
       p2_d := P2Ptr^[d];
-      beta_d := BetaPtr^[d];
+      gain := P1Ptr^[d] - p2_d;              // #4: the p1-p2 gain, once
       xv := Prev.FData[pos];
       gy := FOutputError.FData[pos];
-      dv := (p1_d - p2_d) * xv;
-      s := 1 / (1 + NeuralExp(-beta_d * dv));
+      dv := gain * xv;
+      bd := BetaPtr^[d] * dv;                // #4: beta*d, once
+      s := 1 / (1 + NeuralExp(-bd));
       sds := s * (1 - s);
-      phi := s + beta_d * dv * sds;
-      FgradP1Buf[d] := FgradP1Buf[d] + gy * xv * phi;
-      FgradP2Buf[d] := FgradP2Buf[d] + gy * xv * (1 - phi);
+      phi := s + bd * sds;
+      gyxv := gy * xv;                       // #4: shared by both p gradients
+      FgradP1Buf[d] := FgradP1Buf[d] + gyxv * phi;
+      FgradP2Buf[d] := FgradP2Buf[d] + gyxv * (1 - phi);
       FgradBetaBuf[d] := FgradBetaBuf[d] + gy * dv * dv * sds;
       if hasInputGrad then
-        PrevErr.FData[pos] := PrevErr.FData[pos] +
-          gy * ((p1_d - p2_d) * phi + p2_d);
+        PrevErr.FData[pos] := PrevErr.FData[pos] + gy * (gain * phi + p2_d);
       Inc(pos);
     end;
   for d := 0 to DepthM1 do
@@ -60179,6 +60166,7 @@ begin
   // FNeurons[2] (gamma) and FNeurons[3] (delta), each Depth weights.
   if FNeurons.Count < 4 then AddMissingNeurons(4);
   SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
+  SizeAconScratch();
   // m[c] and beta[c] are forward state (recomputed in the backward); the grad
   // accumulators are backprop-only.
   SetLength(FmBuf, FOutput.Depth);
@@ -60200,7 +60188,6 @@ var
   Prev: TNNetVolume;
   SizeX, SizeY, Depth, d, k, N: integer;
   MaxD, NumPixM1, pos: integer;
-  p1_d, p2_d, beta_d, xv, dv, s: TNeuralFloat;
   P1Ptr, P2Ptr, GammaPtr, DeltaPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
@@ -60237,26 +60224,14 @@ begin
     TNNetVolume.Add(@FmBuf[0], Prev.GetRawPtr(pos), Depth);
     Inc(pos, Depth);
   end;
-  // Data-dependent beta.
+  // Data-dependent beta. The squeeze divides every channel by the same pixel
+  // count, so that is one reciprocal and a bulk scale (#21/#13).
+  TNNetVolume.Mul(@FmBuf[0], 1 / N, Depth);
   for d := 0 to MaxD do
-  begin
-    FmBuf[d] := FmBuf[d] / N;
     FBetaBuf[d] := 1 / (1 + NeuralExp(-(GammaPtr^[d] * FmBuf[d] +
       DeltaPtr^[d])));
-  end;
-  pos := 0;
-  for k := 0 to NumPixM1 do
-    for d := 0 to MaxD do
-    begin
-      p1_d := P1Ptr^[d];
-      p2_d := P2Ptr^[d];
-      beta_d := FBetaBuf[d];
-      xv := Prev.FData[pos];
-      dv := (p1_d - p2_d) * xv;
-      s := 1 / (1 + NeuralExp(-beta_d * dv));
-      FOutput.FData[pos] := dv * s + p2_d * xv;
-      Inc(pos);
-    end;
+  // Same ACON map as TNNetAconC, with the data-dependent beta just computed.
+  ComputeAconMap(Prev, P1Ptr, P2Ptr, @FBetaBuf[0]);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -60268,7 +60243,7 @@ var
   Prev, PrevErr: TNNetVolume;
   SizeX, SizeY, Depth, d, k, N: integer;
   MaxD, NumPixM1, pos: integer;
-  p1_d, p2_d, beta_d, betaSig: TNeuralFloat;
+  p2_d, gain, bd, gyxv, beta_d, betaSig, InvN: TNeuralFloat;
   xv, gy, dv, s, sds, phi: TNeuralFloat;
   hasInputGrad: boolean;
   P1Ptr, P2Ptr, GammaPtr, DeltaPtr: TNeuralFloatArrPtr;
@@ -60296,6 +60271,7 @@ begin
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
+  InvN := 1 / N;                                // #5/#21: the pixel-count divide
   // App.E: pixel-outer / channel-inner, so each of the three volume sweeps runs
   // once over the contiguous depth axis instead of once per channel. The
   // per-channel scalars become vectors (#17); the squeeze and the beta-path
@@ -60313,12 +60289,10 @@ begin
     TNNetVolume.Add(@FmBuf[0], Prev.GetRawPtr(pos), Depth);
     Inc(pos, Depth);
   end;
+  TNNetVolume.Mul(@FmBuf[0], InvN, Depth);      // #21/#13: one reciprocal
   for d := 0 to MaxD do
-  begin
-    FmBuf[d] := FmBuf[d] / N;
     FBetaBuf[d] := 1 / (1 + NeuralExp(-(GammaPtr^[d] * FmBuf[d] +
       DeltaPtr^[d])));
-  end;
   FillDWord(FgradP1Buf[0], Depth, 0);
   FillDWord(FgradP2Buf[0], Depth, 0);
   // FgradBetaBuf[c] = dL/dbeta[c], summed over all positions of the channel.
@@ -60329,21 +60303,21 @@ begin
   for k := 0 to NumPixM1 do
     for d := 0 to MaxD do
     begin
-      p1_d := P1Ptr^[d];
       p2_d := P2Ptr^[d];
-      beta_d := FBetaBuf[d];
+      gain := P1Ptr^[d] - p2_d;              // #4: the p1-p2 gain, once
       xv := Prev.FData[pos];
       gy := FOutputError.FData[pos];
-      dv := (p1_d - p2_d) * xv;
-      s := 1 / (1 + NeuralExp(-beta_d * dv));
+      dv := gain * xv;
+      bd := FBetaBuf[d] * dv;                // #4: beta*d, once
+      s := 1 / (1 + NeuralExp(-bd));
       sds := s * (1 - s);
-      phi := s + beta_d * dv * sds;
-      FgradP1Buf[d] := FgradP1Buf[d] + gy * xv * phi;
-      FgradP2Buf[d] := FgradP2Buf[d] + gy * xv * (1 - phi);
+      phi := s + bd * sds;
+      gyxv := gy * xv;                       // #4: shared by both p gradients
+      FgradP1Buf[d] := FgradP1Buf[d] + gyxv * phi;
+      FgradP2Buf[d] := FgradP2Buf[d] + gyxv * (1 - phi);
       FgradBetaBuf[d] := FgradBetaBuf[d] + gy * dv * dv * sds;
       if hasInputGrad then
-        PrevErr.FData[pos] := PrevErr.FData[pos] +
-          gy * ((p1_d - p2_d) * phi + p2_d);
+        PrevErr.FData[pos] := PrevErr.FData[pos] + gy * (gain * phi + p2_d);
       Inc(pos);
     end;
   // Second pass: distribute the beta-path input gradient. beta[c] depends on
@@ -60357,7 +60331,7 @@ begin
     begin
       beta_d := FBetaBuf[d];
       FBetaPathBuf[d] := beta_d * (1 - beta_d) * GammaPtr^[d] *
-        FgradBetaBuf[d] / N;
+        FgradBetaBuf[d] * InvN;
     end;
     pos := 0;
     for k := 0 to NumPixM1 do
@@ -74982,14 +74956,65 @@ constructor TNNetChannelTransformBase.Create();
 begin
   inherited Create();
   FAuxDepth := TNNetVolume.Create();
+  FAconGain := TNNetVolume.Create();
+  FAconBetaGain := TNNetVolume.Create();
+  FAconSigmoid := TNNetVolume.Create();
   FOutputChannelSize := 1;
   InitDefault();
 end;
 
 destructor TNNetChannelTransformBase.Destroy();
 begin
+  FAconSigmoid.Free;
+  FAconBetaGain.Free;
+  FAconGain.Free;
   FAuxDepth.Free;
   inherited Destroy();
+end;
+
+procedure TNNetChannelTransformBase.SizeAconScratch();
+begin
+  FAconGain.ReSize(1, 1, FOutput.Depth);
+  FAconBetaGain.ReSize(1, 1, FOutput.Depth);
+  FAconSigmoid.ReSize(1, 1, FOutput.Depth);
+end;
+
+procedure TNNetChannelTransformBase.ComputeAconMap(Prev: TNNetVolume;
+  P1Ptr, P2Ptr, BetaPtr: TNeuralFloatArrPtr);
+var
+  Depth, MaxD, MaxPixPos, d, k, pos, RowBytes: integer;
+  GainPtr, BetaGainPtr, SigPtr, XPtr, OutPtr: TNeuralFloatArrPtr;
+begin
+  Depth := FOutput.Depth;
+  MaxD := Depth - 1;
+  MaxPixPos := FOutput.SizeX * FOutput.SizeY - 1;
+  RowBytes := Depth * csNeuralFloatSize;
+  GainPtr := FAconGain.GetRawPtr();
+  BetaGainPtr := FAconBetaGain.GetRawPtr();
+  SigPtr := FAconSigmoid.GetRawPtr();
+  // d = (p1-p2)*x and beta*d = beta*(p1-p2)*x, so both per-channel factors are
+  // built once and the pixel rows are then pure elementwise runs.
+  for d := 0 to MaxD do
+  begin
+    GainPtr^[d] := P1Ptr^[d] - P2Ptr^[d];
+    BetaGainPtr^[d] := BetaPtr^[d] * GainPtr^[d];
+  end;
+  // App.E: pixel-outer / channel-inner, so each pixel's depth run is contiguous
+  // and the sigmoid runs as a vector kernel instead of a scalar exp per element.
+  pos := 0;                    // #6: the pixel's flat base, carried by addition
+  for k := 0 to MaxPixPos do
+  begin
+    XPtr := Prev.GetRawPtr(pos);
+    OutPtr := FOutput.GetRawPtr(pos);
+    system.Move(GainPtr^, OutPtr^, RowBytes);
+    TNNetVolume.Mul(OutPtr, XPtr, Depth);            // out = d
+    system.Move(BetaGainPtr^, SigPtr^, RowBytes);
+    TNNetVolume.Mul(SigPtr, XPtr, Depth);            // sig = beta*d
+    TNNetVolume.Sigmoid(SigPtr, SigPtr, Depth);
+    TNNetVolume.Mul(OutPtr, SigPtr, Depth);          // out = d*sigmoid(beta*d)
+    TNNetVolume.MulAdd(OutPtr, P2Ptr, XPtr, Depth);  // out += p2*x
+    Inc(pos, Depth);
+  end;
 end;
 
 procedure TNNetChannelShiftBase.Compute();
