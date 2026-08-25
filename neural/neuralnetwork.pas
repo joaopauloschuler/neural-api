@@ -116611,10 +116611,12 @@ var
   LayerIdx, ProbeIdx, SampleIdx, I, J, K, N, NumProbed, FlatSz, D: integer;
   Layer: TNNetLayer;
   Probes2: array of TLayerProbe;
-  FeatRow: TDoubleArray;
+  AllFeats: array of TDoubleMatrix; // per probed layer: N x D activation rows
   Feats: TDoubleMatrix;        // N x D activation rows for the current layer
   ColMean: TDoubleArray;       // D column means (for covariance centering)
-  RowI, RowJ: TDoubleArray;    // bound feature rows (hoisted out of the K loop)
+  RowI, RowJ, GRow: TDoubleArray; // bound rows (hoisted out of the K loop)
+  R1Arr, R2Arr: TDoubleArray;  // per-sample nearest / 2nd-nearest squared dist
+  Vi: Double;
   Gram: TDoubleMatrix;         // smaller of (N x N) or (D x D)
   Eig: TDoubleArray;
   GramDim, EffDim: integer;
@@ -116636,9 +116638,10 @@ var
   FeatDM1, GramDimM1, NMuM1, NMuM2, ChartCountM1: integer;
   SavedSeed: longword;
 
-  // Fill FeatRow (length FeatDim) from a probed layer Output, applying the
+  // Fill Row (length Pr.FeatDim) from a probed layer Output, applying the
   // sign-random projection when this layer was capped.
-  procedure ReadFeatures(const Pr: TLayerProbe; OutVol: TNNetVolume);
+  procedure ReadFeatures(const Pr: TLayerProbe; OutVol: TNNetVolume;
+    var Row: TDoubleArray);
   var
     F: integer;
     FeatDimM1: integer;
@@ -116647,12 +116650,12 @@ var
     if Pr.Projected then
     begin
       for F := 0 to FeatDimM1 do
-        FeatRow[F] := Pr.ProjSign[F] * OutVol.FData[Pr.ProjSrc[F]];
+        Row[F] := Pr.ProjSign[F] * OutVol.FData[Pr.ProjSrc[F]];
     end
     else
     begin
       for F := 0 to FeatDimM1 do
-        FeatRow[F] := OutVol.FData[F];
+        Row[F] := OutVol.FData[F];
     end;
   end;
 
@@ -116839,24 +116842,33 @@ begin
     ChartCount := 0;
     NumProbedM1 := NumProbed - 1;
 
+    // --- One forward pass per probe sample feeds EVERY probed layer: the
+    //     activation rows of all layers are harvested from the same Compute.
+    //     Costs NumProbed * N * FeatDim doubles of residency, and saves
+    //     (NumProbed - 1) * N whole-network forward passes. ---
+    SetLength(AllFeats, NumProbed);
+    for ProbeIdx := 0 to NumProbedM1 do
+    begin
+      SetLength(AllFeats[ProbeIdx], N);
+      for SampleIdx := 0 to Nm1 do
+        SetLength(AllFeats[ProbeIdx][SampleIdx], Probes2[ProbeIdx].FeatDim);
+    end;
+    for SampleIdx := 0 to Nm1 do
+    begin
+      NN.Compute(Probes[SampleIdx]);
+      for ProbeIdx := 0 to NumProbedM1 do
+        ReadFeatures(Probes2[ProbeIdx],
+          NN.Layers[Probes2[ProbeIdx].LayerIdx].Output,
+          AllFeats[ProbeIdx][SampleIdx]);
+    end;
+
     for ProbeIdx := 0 to NumProbedM1 do
     begin
       LayerIdx := Probes2[ProbeIdx].LayerIdx;
-      Layer := NN.Layers[LayerIdx];
       D := Probes2[ProbeIdx].FeatDim;
       FeatDM1 := D - 1;
       ShapeStr := Probes2[ProbeIdx].Name;
-
-      // --- Forward pass: build the N x D activation matrix. ---
-      SetLength(FeatRow, D);
-      SetLength(Feats, N);
-      for SampleIdx := 0 to Nm1 do
-      begin
-        SetLength(Feats[SampleIdx], D);
-        NN.Compute(Probes[SampleIdx]);
-        ReadFeatures(Probes2[ProbeIdx], Layer.Output);
-        for I := 0 to FeatDM1 do Feats[SampleIdx][I] := FeatRow[I];
-      end;
+      Feats := AllFeats[ProbeIdx];
 
       // ===================== (1) Linear / PCA ID ======================
       // Centre the columns, then form the SMALLER of the (D x D) covariance
@@ -116864,12 +116876,21 @@ begin
       SetLength(ColMean, D);
       for I := 0 to FeatDM1 do ColMean[I] := 0;
       for SampleIdx := 0 to Nm1 do
+      begin
+        RowI := Feats[SampleIdx];
         for I := 0 to FeatDM1 do
-          ColMean[I] := ColMean[I] + Feats[SampleIdx][I];
+          ColMean[I] := ColMean[I] + RowI[I];
+      end;
+      // The exact divide matters: the participation ratio below is scale-free,
+      // so a mean that does not cancel exactly turns an identical-sample cloud
+      // into pure rounding noise with a non-zero PCA_ID.
       for I := 0 to FeatDM1 do ColMean[I] := ColMean[I] / N;
       for SampleIdx := 0 to Nm1 do
+      begin
+        RowI := Feats[SampleIdx];
         for I := 0 to FeatDM1 do
-          Feats[SampleIdx][I] := Feats[SampleIdx][I] - ColMean[I];
+          RowI[I] := RowI[I] - ColMean[I];
+      end;
 
       if D <= N then GramDim := D else GramDim := N;
       GramDimM1 := GramDim - 1;
@@ -116883,30 +116904,44 @@ begin
       begin
         // covariance C[i][j] = (1/N) sum_n Xc[n,i]*Xc[n,j]   (D x D)
         for SampleIdx := 0 to Nm1 do
+        begin
+          RowI := Feats[SampleIdx];
           for I := 0 to FeatDM1 do
+          begin
+            GRow := Gram[I];
+            Vi := RowI[I];
             for J := I to FeatDM1 do
-              Gram[I][J] := Gram[I][J] +
-                Feats[SampleIdx][I] * Feats[SampleIdx][J];
+              GRow[J] := GRow[J] + Vi * RowI[J];
+          end;
+        end;
         for I := 0 to FeatDM1 do
+        begin
+          GRow := Gram[I];
           for J := I to FeatDM1 do
           begin
-            Gram[I][J] := Gram[I][J] / N;
-            Gram[J][I] := Gram[I][J];
+            GRow[J] := GRow[J] / N;
+            Gram[J][I] := GRow[J];
           end;
+        end;
       end
       else
       begin
         // Gram G[a][b] = (1/N) sum_i Xc[a,i]*Xc[b,i]   (N x N); shares the
         // same non-zero eigenvalues as the D x D covariance.
         for I := 0 to Nm1 do
+        begin
+          RowI := Feats[I];
+          GRow := Gram[I];
           for J := I to Nm1 do
           begin
+            RowJ := Feats[J];
             Tmp := 0;
             for K := 0 to FeatDM1 do
-              Tmp := Tmp + Feats[I][K] * Feats[J][K];
-            Gram[I][J] := Tmp / N;
-            Gram[J][I] := Gram[I][J];
+              Tmp := Tmp + RowI[K] * RowJ[K];
+            GRow[J] := Tmp / N;
+            Gram[J][I] := GRow[J];
           end;
+        end;
       end;
 
       JacobiEigenvalues(Gram, GramDim, Eig);
@@ -116941,14 +116976,24 @@ begin
       NMu := 0;
       if N >= 3 then
       begin
+        // The distance matrix is symmetric, so each pair is measured once and
+        // updates BOTH endpoints' two smallest. Ranking on the SQUARED distance
+        // is order-equivalent, so the only square root left is the one inside
+        // mu = sqrt(r2sq/r1sq), one per sample instead of one per pair.
+        SetLength(R1Arr, N);
+        SetLength(R2Arr, N);
         for I := 0 to Nm1 do
         begin
-          R1 := 1e300;
-          R2 := 1e300;
+          R1Arr[I] := 1e300;
+          R2Arr[I] := 1e300;
+        end;
+        for I := 0 to Nm1 do
+        begin
           RowI := Feats[I];
-          for J := 0 to Nm1 do
+          R1 := R1Arr[I];
+          R2 := R2Arr[I];
+          for J := I + 1 to Nm1 do
           begin
-            if J = I then Continue;
             RowJ := Feats[J];
             Dist := 0;
             for K := 0 to FeatDM1 do
@@ -116958,7 +117003,6 @@ begin
               DiffV := RowI[K] - RowJ[K];
               Dist := Dist + DiffV * DiffV;
             end;
-            Dist := Sqrt(Dist);
             if Dist < R1 then
             begin
               R2 := R1;
@@ -116966,10 +117010,25 @@ begin
             end
             else if Dist < R2 then
               R2 := Dist;
+            if Dist < R1Arr[J] then
+            begin
+              R2Arr[J] := R1Arr[J];
+              R1Arr[J] := Dist;
+            end
+            else if Dist < R2Arr[J] then
+              R2Arr[J] := Dist;
           end;
-          if (R1 > 1e-12) and (R2 > R1) then
+          R1Arr[I] := R1;
+          R2Arr[I] := R2;
+        end;
+        for I := 0 to Nm1 do
+        begin
+          R1 := R1Arr[I];
+          R2 := R2Arr[I];
+          // r1 > 1e-12 and r2 > r1, both squared.
+          if (R1 > 1e-24) and (R2 > R1) then
           begin
-            MuI := R2 / R1;
+            MuI := Sqrt(R2 / R1);
             if MuI > 1.0 then
             begin
               Mu[NMu] := MuI;
