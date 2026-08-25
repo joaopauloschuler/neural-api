@@ -115739,7 +115739,9 @@ var
             T := 1.0 / (Theta + Sqrt(Theta * Theta + 1.0))
           else
             T := -1.0 / (-Theta + Sqrt(Theta * Theta + 1.0));
-          C := pcr_rsqrtf(T * T + 1.0);
+          // Exact Double 1/Sqrt: pcr_rsqrtf is single-precision, which caps the
+          // eigenvalues at ~1e-7 accuracy inside this Double solver.
+          C := 1.0 / Sqrt(T * T + 1.0);
           S := T * C;
           Tau := S / (1.0 + C);
           // update diagonal
@@ -116323,7 +116325,9 @@ var
             T := 1.0 / (Theta + Sqrt(Theta * Theta + 1.0))
           else
             T := -1.0 / (-Theta + Sqrt(Theta * Theta + 1.0));
-          C := pcr_rsqrtf(T * T + 1.0);
+          // Exact Double 1/Sqrt: pcr_rsqrtf is single-precision, which caps the
+          // eigenvalues at ~1e-7 accuracy inside this Double solver.
+          C := 1.0 / Sqrt(T * T + 1.0);
           S := T * C;
           Tau := S / (1.0 + C);
           AP[P] := App - T * Apq;
@@ -116993,7 +116997,9 @@ var
             T := 1.0 / (Theta + Sqrt(Theta * Theta + 1.0))
           else
             T := -1.0 / (-Theta + Sqrt(Theta * Theta + 1.0));
-          C := pcr_rsqrtf(T * T + 1.0);
+          // Exact Double 1/Sqrt: pcr_rsqrtf is single-precision, which caps the
+          // eigenvalues at ~1e-7 accuracy inside this Double solver.
+          C := 1.0 / Sqrt(T * T + 1.0);
           S := T * C;
           Tau := S / (1.0 + C);
           AP[P] := App - T * Apq;
