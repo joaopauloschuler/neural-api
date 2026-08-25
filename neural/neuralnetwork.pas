@@ -11176,6 +11176,10 @@ type
       // bound once per r in Compute, invariant across the x,y sweep.
       FSWPtrs, FTWPtrs: array of TNeuralFloatArrPtr;
       FSBias, FTBias: array of TNeuralFloat;
+      // Backward mirrors of the same tables: conditioner delta rows and the
+      // neuron objects whose bias deltas the sweep accumulates into.
+      FSDPtrs, FTDPtrs: array of TNeuralFloatArrPtr;
+      FSNr, FTNr: array of TNNetNeuron;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); overload; override;
@@ -62721,7 +62725,7 @@ var
   Ww, Wu, Prev, PrevErr: TNNetVolume;
   SeqLen, C, t, d: integer;
   MaxC, SeqLenM1, basePrev, baseC, baseCm1, pvStride, ocStride: integer;
-  wv, uv, dwexp, kt, vt: TNeuralFloat;
+  wv, uv, dwexp, euv, kt, vt: TNeuralFloat;
   aprev, bprev, Ek, Eu, dyt, denT, yt, numT: TNeuralFloat;
   pa, pb, dnum, dden, dEu, dEk, dDk, dDw, dkt, dvt: TNeuralFloat;
   gradW, gradU, paPrev, pbPrev: TNeuralFloat;
@@ -62763,6 +62767,7 @@ begin
     wv := FW.FData[d];
     uv := Wu.FData[d];
     dwexp := NeuralExp(-wv);
+    euv := NeuralExp(uv);          // e^{u+k} = e^u * e^k: e^u is per-channel (#5)
     pa := 0;
     pb := 0;
     gradW := 0;
@@ -62777,7 +62782,7 @@ begin
       kt := Prev.FData[basePrev];
       vt := Prev.FData[basePrev + C];
       Ek := NeuralExp(kt);
-      Eu := NeuralExp(uv + kt);
+      Eu := Ek * euv;
       if t > 0 then
       begin
         baseCm1 := baseC - ocStride;
@@ -63530,10 +63535,9 @@ var
   Prev: TNNetVolume;
   SeqLen, t, i: integer;
   MaxT, MaxN: integer;
-  leak, oneMinusLeak, preAct, tanhVal: TNeuralFloat;
-  hPrevPos, hCurPos: integer;
-  prevBaseT, hPrevBaseT: integer;
-  xPtr, hPrevPtr: TNeuralFloatArrPtr;
+  leak, oneMinusLeak: TNeuralFloat;
+  prevBaseT, rowBaseT, winRow, wRow, RowBytes: integer;
+  xPtr, hPrevPtr, preRowPtr, hRowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -63552,38 +63556,54 @@ begin
   oneMinusLeak := 1 - leak;
   MaxT := SeqLen - 1;
   MaxN := FN - 1;
+  RowBytes := FN * csNeuralFloatSize;
+  // FPre, FH and FOutput all share (SeqLen,1,FN), so one carried row offset
+  // addresses all three; Prev rows advance by FInputDim (#12).
+  prevBaseT := 0;
+  rowBaseT := 0;
   hPrevPtr := nil;
   for t := 0 to MaxT do
   begin
-    prevBaseT := Prev.GetRawPos(t, 0);            // Prev row t; +j indexes depth
     xPtr := Prev.GetRawPtr(prevBaseT);            // #11: invariant across i
-    if t > 0 then
+    preRowPtr := FPre.GetRawPtr(rowBaseT);
+    hRowPtr := FH.GetRawPtr(rowBaseT);
+    // pre_t[i] = W_in[i] . x_t + W[i] . h_{t-1}; both weight rows are
+    // contiguous, so both terms are dot products (#13). t = 0 uses h_{-1} = 0,
+    // so the recurrent term is peeled off that step entirely (#20).
+    winRow := 0;
+    if t = 0 then
     begin
-      hPrevBaseT := FH.GetRawPos(t - 1, 0);       // FH row t-1; +j indexes depth
-      hPrevPtr := FH.GetRawPtr(hPrevBaseT);       // #11: invariant across i
-    end;
-    for i := 0 to MaxN do
-    begin
-      // preAct = W_in[i] . x_t + W[i] . h_{t-1}; both weight rows are contiguous,
-      // so both terms are dot products (#13).
-      preAct := TNNetVolume.DotProduct(FWin.GetRawPtr(i, 0), xPtr, FInputDim);
-      if t > 0 then
-        preAct := preAct +
-          TNNetVolume.DotProduct(FW.GetRawPtr(i, 0), hPrevPtr, FN);
-      // (t = 0 uses h_{-1} = 0, so no recurrent term.)
-      tanhVal := pcr_tanhf(preAct);
-      // FPre, FH and FOutput all share (SeqLen,1,FN): one offset addresses all.
-      hCurPos := FH.GetRawPos(t, 0, i);
-      FPre.FData[hCurPos] := tanhVal;  // cache for backward
-      if t > 0 then
+      for i := 0 to MaxN do
       begin
-        hPrevPos := FH.GetRawPos(t - 1, 0, i);
-        FH.FData[hCurPos] := oneMinusLeak * FH.FData[hPrevPos] + leak * tanhVal;
-      end
-      else
-        FH.FData[hCurPos] := leak * tanhVal;
-      FOutput.FData[hCurPos] := FH.FData[hCurPos];
+        preRowPtr^[i] := TNNetVolume.DotProduct(FWin.GetRawPtr(winRow), xPtr,
+          FInputDim);
+        Inc(winRow, FInputDim);
+      end;
+    end
+    else
+    begin
+      hPrevPtr := FH.GetRawPtr(rowBaseT - FN);    // FH row t-1
+      wRow := 0;
+      for i := 0 to MaxN do
+      begin
+        preRowPtr^[i] :=
+          TNNetVolume.DotProduct(FWin.GetRawPtr(winRow), xPtr, FInputDim) +
+          TNNetVolume.DotProduct(FW.GetRawPtr(wRow), hPrevPtr, FN);
+        Inc(winRow, FInputDim);
+        Inc(wRow, FN);
+      end;
     end;
+    // tanh over the whole row in one elementwise pass (#19); FPre keeps the
+    // tanh value the backward pass reads.
+    TNNetVolume.Tanh(preRowPtr, preRowPtr, FN);
+    // h_t = (1-a)*h_{t-1} + a*tanh(pre_t), row at a time (#13).
+    Move(preRowPtr^[0], hRowPtr^[0], RowBytes);
+    TNNetVolume.Mul(hRowPtr, leak, FN);
+    if t > 0 then
+      TNNetVolume.MulAdd(hRowPtr, hPrevPtr, oneMinusLeak, FN);
+    Move(hRowPtr^[0], FOutput.FData[rowBaseT], RowBytes);
+    Inc(prevBaseT, FInputDim);
+    Inc(rowBaseT, FN);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -63881,7 +63901,8 @@ var
   QLen, KVLen, C, t, i, d: integer;
   MaxC, MaxKV, MaxQ, baseKV, baseC, baseLast, baseQ, kvStride, ocStride: integer;
   raw, wv, kt, vt, aprev, bprev: TNeuralFloat;
-  qprev, ww2, qmax2, e3, e4, anew, bnew, summaryWkv, rt, eq: TNeuralFloat;
+  qprev, ww2, qmax2, e3, e4, anew, bnew, summaryWkv, eq: TNeuralFloat;
+  summaryPtr, outRowPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Rcp := FPrevLayer.FOutput;        // receptance source A (depth C), len QLen
@@ -63936,16 +63957,20 @@ begin
     // Full-context summary state (true accumulators). b>0 always (>= e4 term).
     baseLast := FA.GetRawPos(KVLen - 1, 0, d);   // FA, FB share this offset
     summaryWkv := FA.FData[baseLast] / FB.FData[baseLast];
-    FWKV.FData[FWKV.GetRawPos(0, 0, d)] := summaryWkv; // cache for backward
-    // PHASE 2: every query position reads the SAME summary, receptance-gated.
-    // Rcp and FOutput share (QLen,1,C): baseQ steps by ocStride per query i.
-    baseQ := Rcp.GetRawPos(0, 0, d);
-    for i := 0 to MaxQ do
-    begin
-      rt := Rcp.FData[baseQ];
-      FOutput.FData[baseQ] := Sigmoid(rt) * summaryWkv;
-      Inc(baseQ, ocStride);
-    end;
+    FWKV.FData[d] := summaryWkv;                 // cache for backward
+  end;
+  // PHASE 2: every query position reads the SAME summary vector,
+  // receptance-gated. Rcp and FOutput share (QLen,1,C), and the summary is the
+  // contiguous C-run at FWKV row 0, so each query is one elementwise sigmoid
+  // plus one elementwise multiply over a contiguous row (#13, App. E).
+  summaryPtr := FWKV.GetRawPtr(0);
+  baseQ := 0;
+  for i := 0 to MaxQ do
+  begin
+    outRowPtr := FOutput.GetRawPtr(baseQ);
+    TNNetVolume.Sigmoid(outRowPtr, Rcp.GetRawPtr(baseQ), C);
+    TNNetVolume.Mul(outRowPtr, summaryPtr, C);
+    Inc(baseQ, ocStride);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -63962,7 +63987,7 @@ var
   Ww, Wu, Rcp, KVv, RcpErr, KVErr: TNNetVolume;
   SeqLen, C, t, d: integer;
   MaxC, SeqLenM1, baseKV, baseC, baseCm1, kvStride, ocStride: integer;
-  wv, uv, dwexp, kt, vt, rt, sg: TNeuralFloat;
+  wv, uv, dwexp, euv, kt, vt, rt, sg: TNeuralFloat;
   aprev, bprev, Ek, Eu, dyt, dwkv, denT, yt, numT: TNeuralFloat;
   pa, pb, dnum, dden, dEu, dDk, dDw, dkt, dvt: TNeuralFloat;
   gradW, gradU, paPrev, pbPrev: TNeuralFloat;
@@ -64008,6 +64033,7 @@ begin
     wv := FW.FData[d];
     uv := Wu.FData[d];
     dwexp := NeuralExp(-wv);
+    euv := NeuralExp(uv);          // e^{u+k} = e^u * e^k: e^u is per-channel (#5)
     pa := 0;
     pb := 0;
     gradW := 0;
@@ -64023,7 +64049,7 @@ begin
       vt := KVv.FData[baseKV + C];
       rt := Rcp.FData[baseC];
       Ek := NeuralExp(kt);
-      Eu := NeuralExp(uv + kt);
+      Eu := Ek * euv;
       if t > 0 then
       begin
         baseCm1 := baseC - ocStride;
@@ -64306,7 +64332,8 @@ var
   StartTime: double;
   SizeX, SizeY, Depth, x, y, r, j, aOfs, bOfs: integer;
   MaxX, MaxY, MaxA, MaxB: integer;
-  spre, sval, tval, xa_j, xb, accS, accT: TNeuralFloat;
+  spre, sval, tval, xa_j, xb, accS, accT, invClamp: TNeuralFloat;
+  HalfABytes: integer;
   InPtr, OutPtr, SPtr, TPtr, SPrePtr: TNeuralFloatArrPtr;
   Nr: TNNetNeuron;
 begin
@@ -64323,6 +64350,8 @@ begin
   if FTransformSecond then begin aOfs := 0; bOfs := FHalfA; end
   else begin aOfs := FHalfB; bOfs := 0; end;
   FLogDet := 0;
+  invClamp := 1 / FClamp;
+  HalfABytes := FHalfA * csNeuralFloatSize;
   // The conditioner weight-row pointers and biases depend only on r (the s-row
   // in FArrNeurons[r], the t-row in FArrNeurons[FHalfB+r]); they are invariant
   // across the whole x,y sweep, so bind them once per r via the array mirror.
@@ -64348,7 +64377,7 @@ begin
       TPtr := FT.GetRawPtr(x, y);
       SPrePtr := FSPre.GetRawPtr(x, y);
       // Identity (conditioning) half passes through unchanged.
-      Move(InPtr^[aOfs], OutPtr^[aOfs], FHalfA * csNeuralFloatSize);
+      Move(InPtr^[aOfs], OutPtr^[aOfs], HalfABytes);
       // Conditioner: per-row s_pre, t from the linear map over x_a.
       for r := 0 to MaxB do
       begin
@@ -64358,7 +64387,7 @@ begin
           TNNetVolume.DotProduct(FTWPtrs[r], @InPtr^[aOfs], FHalfA);
         spre := accS;
         // Glow tanh clamp: s = clamp * tanh(s_pre / clamp).
-        sval := FClamp * pcr_tanhf(spre / FClamp);
+        sval := FClamp * pcr_tanhf(spre * invClamp);
         tval := accT;
         SPrePtr^[r] := spre;
         SPtr^[r] := sval;
@@ -64384,11 +64413,11 @@ var
   SizeX, SizeY, x, y, r, aOfs, bOfs: integer;
   MaxX, MaxY, MaxA, MaxB, MaxR2B: integer;
   hasInputGrad: boolean;
-  sval, tval, spre, es, xb, gyb, gs, gt, gspre, dtanh: TNeuralFloat;
-  InPtr, GyPtr, PrevErrPtr, SPtr, TPtr, SPrePtr, WsR, WtR: TNeuralFloatArrPtr;
+  sval, tval, spre, es, xb, gyb, gs, gt, gspre, dtanh, sc: TNeuralFloat;
+  InPtr, GyPtr, PrevErrPtr, SPtr, TPtr, SPrePtr, XaPtr: TNeuralFloatArrPtr;
   Nr, NrT: TNNetNeuron;
-  DeltaR, DeltaT: TNNetVolume;
-  lr: TNeuralFloat;
+  lr, invClamp, logDetW: TNeuralFloat;
+  isInverse: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -64408,6 +64437,29 @@ begin
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
     (FPrevLayer.FOutput.Size > 0);
   PrevErrPtr := nil;
+  invClamp := 1 / FClamp;
+  logDetW := FLogDetLossWeight;
+  isInverse := FInverse;
+  // Same tables Compute binds: the conditioner rows depend only on r, so the
+  // weight rows, the delta rows and the neuron objects are all bound once here
+  // instead of being re-resolved at every pixel (#9).
+  if Length(FSWPtrs) <> FHalfB then SetLength(FSWPtrs, FHalfB);
+  if Length(FTWPtrs) <> FHalfB then SetLength(FTWPtrs, FHalfB);
+  if Length(FSDPtrs) <> FHalfB then SetLength(FSDPtrs, FHalfB);
+  if Length(FTDPtrs) <> FHalfB then SetLength(FTDPtrs, FHalfB);
+  if Length(FSNr)    <> FHalfB then SetLength(FSNr, FHalfB);
+  if Length(FTNr)    <> FHalfB then SetLength(FTNr, FHalfB);
+  for r := 0 to MaxB do
+  begin
+    Nr := FArrNeurons[r];
+    NrT := FArrNeurons[FHalfB + r];
+    FSNr[r] := Nr;
+    FTNr[r] := NrT;
+    FSWPtrs[r] := Nr.FWeights.GetRawPtr(0, 0);
+    FTWPtrs[r] := NrT.FWeights.GetRawPtr(0, 0);
+    FSDPtrs[r] := Nr.FDelta.GetRawPtr(0);
+    FTDPtrs[r] := NrT.FDelta.GetRawPtr(0);
+  end;
   for y := 0 to MaxY do
     for x := 0 to MaxX do
     begin
@@ -64421,13 +64473,14 @@ begin
       // conditioner contribution accumulated below).
       if hasInputGrad then
         TNNetVolume.Add(@PrevErrPtr^[aOfs], @GyPtr^[aOfs], FHalfA);
+      XaPtr := @InPtr^[aOfs];          // conditioning half, invariant across r
       for r := 0 to MaxB do
       begin
         sval := SPtr^[r];
         tval := TPtr^[r];
         spre := SPrePtr^[r];
         gyb := GyPtr^[bOfs + r];
-        if FInverse then
+        if isInverse then
         begin
           // x_b = (y_b - t)*exp(-s); here "input" plays the role of y_b.
           es := NeuralExp(-sval);
@@ -64449,28 +64502,25 @@ begin
           gt := gyb;
           gs := gyb * xb * es;
           // Negative log-det (-sum s) term of the ML loss folds straight into ds.
-          gs := gs - FLogDetLossWeight;
+          gs := gs - logDetW;
         end;
         // s = clamp*tanh(s_pre/clamp) -> ds/ds_pre = 1 - tanh^2 = 1-(s/clamp)^2.
-        dtanh := 1 - (sval / FClamp) * (sval / FClamp);
+        sc := sval * invClamp;
+        dtanh := 1 - sc * sc;
         gspre := gs * dtanh;
         // Accumulate conditioner grads and route into x_a (the conditioning half).
-        Nr := FArrNeurons[r];
-        NrT := FArrNeurons[FHalfB + r];
-        DeltaR := Nr.FDelta;
-        DeltaT := NrT.FDelta;
-        WsR := Nr.FWeights.GetRawPtr(0, 0);          // s-row weights
-        WtR := NrT.FWeights.GetRawPtr(0, 0);         // t-row weights
+        Nr := FSNr[r];
+        NrT := FTNr[r];
         Nr.FBiasDelta := Nr.FBiasDelta + (-lr) * gspre;
         NrT.FBiasDelta := NrT.FBiasDelta + (-lr) * gt;
         // Conditioner weight grads over x_a (contiguous run of FHalfA).
-        TNNetVolume.MulAdd(DeltaR.GetRawPtr(0), @InPtr^[aOfs], (-lr) * gspre, FHalfA);
-        TNNetVolume.MulAdd(DeltaT.GetRawPtr(0), @InPtr^[aOfs], (-lr) * gt, FHalfA);
+        TNNetVolume.MulAdd(FSDPtrs[r], XaPtr, (-lr) * gspre, FHalfA);
+        TNNetVolume.MulAdd(FTDPtrs[r], XaPtr, (-lr) * gt, FHalfA);
         // Conditioner depends on x_a -> route gspre and gt back into x_a.
         if hasInputGrad then
         begin
-          TNNetVolume.MulAdd(@PrevErrPtr^[aOfs], WsR, gspre, FHalfA);
-          TNNetVolume.MulAdd(@PrevErrPtr^[aOfs], WtR, gt, FHalfA);
+          TNNetVolume.MulAdd(@PrevErrPtr^[aOfs], FSWPtrs[r], gspre, FHalfA);
+          TNNetVolume.MulAdd(@PrevErrPtr^[aOfs], FTWPtrs[r], gt, FHalfA);
         end;
       end;
     end;
@@ -67005,30 +67055,38 @@ end;
 
 procedure TNNetSincConv1D.MaterializeBank();
 var
-  f, n, half, bpos: integer;
+  f, n, half, bpos, tap: integer;
   NumFiltersM1, KernelSizeM1: integer;
-  fLow, fHigh, tap, gv: TNeuralFloat;
+  fLow, fHigh, gv, invSR: TNeuralFloat;
+  twoFLow, twoFHigh, argLow, argHigh: TNeuralFloat;
   WPtr: TNeuralFloatArrPtr;
   W: TNNetVolume;
 begin
   half := (FKernelSize - 1) shr 1;
   NumFiltersM1 := FNumFilters - 1;
   KernelSizeM1 := FKernelSize - 1;
+  invSR := 1.0 / FSampleRate;
   W := FNeurons[0].FWeights;
   for f := 0 to NumFiltersM1 do
   begin
     WPtr := W.GetRawPtr(f, 0);
-    fLow  := Abs(WPtr^[0]) / FSampleRate;            // cycles/sample
-    fHigh := fLow + Abs(WPtr^[1]) / FSampleRate;     // f_high = f_low + band
+    fLow  := Abs(WPtr^[0]) * invSR;                  // cycles/sample
+    fHigh := fLow + Abs(WPtr^[1]) * invSR;           // f_high = f_low + band
+    // Both band edges enter every tap through the same two factors (#5).
+    twoFLow  := 2 * fLow;
+    twoFHigh := 2 * fHigh;
+    argLow   := 2 * Pi * fLow;
+    argHigh  := 2 * Pi * fHigh;
     // Filter f's taps occupy the contiguous run at f*KernelSize.
     bpos := f * FKernelSize;
+    tap := -half;       // symmetric tap index, carried (#6)
     for n := 0 to KernelSizeM1 do
     begin
-      tap := n - half;  // symmetric tap index
       // g[n] = 2*f_high*sinc(2*pi*f_high*tap) - 2*f_low*sinc(2*pi*f_low*tap)
-      gv := 2 * fHigh * SincConvSinc(2 * Pi * fHigh * tap)
-          - 2 * fLow  * SincConvSinc(2 * Pi * fLow  * tap);
+      gv := twoFHigh * SincConvSinc(argHigh * tap)
+          - twoFLow  * SincConvSinc(argLow  * tap);
       FBank.FData[bpos + n] := gv * FWindow.FData[n];
+      Inc(tap);
     end;
   end;
 end;
@@ -67104,24 +67162,23 @@ procedure TNNetSincConv1D.Backpropagate();
 var
   StartTime: double;
   Prev, PrevErr, W: TNNetVolume;
-  TOut, f, ot, k, n, half, baseIn: integer;
+  TOut, f, ot, k, n, half, baseIn, tap: integer;
   ToutM1, NumFiltersM1, KernelSizeM1: integer;
   errBase, bpos, xk, gbpos, gsBase: integer;
   hasInputGrad: boolean;
-  gy, gk, tap, fLow, fHigh, win, invSR: TNeuralFloat;
+  gy, gk, tapArg, fLow, fHigh, win, invSR: TNeuralFloat;
   dLow, dHigh, dgdLowN, dgdHighN: TNeuralFloat;
   signLow, signBand: TNeuralFloat;
   XPtr, PrevErrPtr, WPtr: TNeuralFloatArrPtr;
 
-  // d/df [ 2*f*sinc(2*pi*f*tap) ] w.r.t. f, evaluated at tap (samples).
-  // Let a = 2*pi*tap. term = 2*f*sin(a*f)/(a*f) = 2*sin(a*f)/a   (for tap<>0)
-  //   d/df = 2*cos(a*f)               (tap<>0)
-  // For tap=0: term = 2*f*1 = 2*f  -> d/df = 2.
-  function DTermDf(fval, tapv: TNeuralFloat): TNeuralFloat;
-  var a: TNeuralFloat;
+  // d/df [ 2*f*sinc(a*f/(2*pi)) ] w.r.t. f, taking the caller's a = 2*pi*tap
+  // (invariant in f, so it is built once per tap). term = 2*f*sin(a*f)/(a*f)
+  // = 2*sin(a*f)/a (a<>0) -> d/df = 2*cos(a*f). For tap=0 (a=0): term = 2*f
+  // -> d/df = 2.
+  function DTermDf(fval, a: TNeuralFloat): TNeuralFloat;
   begin
-    if Abs(tapv) < 1e-12 then Result := 2.0
-    else begin a := 2 * Pi * tapv; Result := 2 * pcr_cosf(a * fval); end;
+    if Abs(a) < 1e-12 then Result := 2.0
+    else Result := 2 * pcr_cosf(a * fval);
   end;
 
 begin
@@ -67177,21 +67234,23 @@ begin
   for f := 0 to NumFiltersM1 do
   begin
     WPtr := W.GetRawPtr(f, 0);
-    fLow  := Abs(WPtr^[0]) / FSampleRate;
-    fHigh := fLow + Abs(WPtr^[1]) / FSampleRate;
+    fLow  := Abs(WPtr^[0]) * invSR;
+    fHigh := fLow + Abs(WPtr^[1]) * invSR;
     dLow := 0; dHigh := 0;
     // Filter f's taps occupy the contiguous run at f*KernelSize.
     gbpos := f * FKernelSize;
+    tap := -half;                  // symmetric tap index, carried (#6)
     for n := 0 to KernelSizeM1 do
     begin
-      tap := n - half;
+      tapArg := 2 * Pi * tap;      // a = 2*pi*tap: one build, two DTermDf uses
       win := FWindow.FData[n];
       gk := FGBank.FData[gbpos + n] * win;
       // g[n] = high_term(f_high) - low_term(f_low) (each = 2*f*sinc(2*pi*f*tap))
-      dgdHighN := DTermDf(fHigh, tap);    // d g / d f_high
-      dgdLowN  := -DTermDf(fLow, tap);    // d g / d f_low (negative term)
+      dgdHighN := DTermDf(fHigh, tapArg);    // d g / d f_high
+      dgdLowN  := -DTermDf(fLow, tapArg);    // d g / d f_low (negative term)
       dHigh := dHigh + gk * dgdHighN;
       dLow  := dLow  + gk * dgdLowN;
+      Inc(tap);
     end;
     // f_high = f_low + band: dL/df_low gets BOTH paths; dL/dband only via high.
     // Both f_low and band enter as (1/sr)*|raw|, so chain 1/sr and the sign.
