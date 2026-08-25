@@ -666,10 +666,12 @@ var
   RowSum, Prob: TNeuralFloat;
   LO: TNNetVolume;
 begin
-  InV.Fill(0);
-  if InDepth = 1
-  then InV.CopyNoChecksIntArr(WindowToks)   // token ids -> embedding
-  else InV.OneHotEncoding(WindowToks);       // one-hot, left-aligned
+  if InDepth = 1 then
+  begin
+    InV.Fill(0);
+    InV.CopyNoChecksIntArr(WindowToks);      // token ids -> embedding
+  end
+  else InV.OneHotEncoding(WindowToks);       // one-hot, left-aligned (self-fills)
   NN.Compute(InV);
   LO := Last.Output;
   for Pos := FirstTgt to LastTgt do
@@ -989,10 +991,12 @@ begin
     if PerPosition and (not Overflows) then
     begin
       // ONE teacher-forced forward scores every position at once.
-      InV.Fill(0);
-      if InDepth = 1
-      then InV.CopyNoChecksIntArr(Tokens)       // token ids -> embedding
-      else InV.OneHotEncoding(Tokens);          // one-hot, left-aligned
+      if InDepth = 1 then
+      begin
+        InV.Fill(0);
+        InV.CopyNoChecksIntArr(Tokens);         // token ids -> embedding
+      end
+      else InV.OneHotEncoding(Tokens);          // one-hot, left-aligned (self-fills)
       NN.Compute(InV);
       LO := Last.Output;
       for Pos := FirstPos to SampleLenM1 do
@@ -1035,9 +1039,11 @@ begin
         if WinStart < 0 then WinStart := 0;
         WinLen := Pos - WinStart + 1;           // tokens [WinStart..Pos]
         Prefix := Copy(Tokens, WinStart, WinLen);
-        InV.Fill(0);
-        if InDepth = 1
-        then InV.CopyNoChecksIntArr(Prefix)
+        if InDepth = 1 then
+        begin
+          InV.Fill(0);
+          InV.CopyNoChecksIntArr(Prefix);
+        end
         else InV.OneHotEncoding(Prefix);
         NN.Compute(InV);
         LO := Last.Output;
@@ -1304,9 +1310,11 @@ begin
       end;
       WinLen := CtxLen - WinStart;
       Prefix := Copy(ContextTokens, WinStart, WinLen);
-      InV.Fill(0);
-      if InDepth = 1
-      then InV.CopyNoChecksIntArr(Prefix)
+      if InDepth = 1 then
+      begin
+        InV.Fill(0);
+        InV.CopyNoChecksIntArr(Prefix);
+      end
       else InV.OneHotEncoding(Prefix);
       NN.Compute(InV);
       LO := Last.Output;
