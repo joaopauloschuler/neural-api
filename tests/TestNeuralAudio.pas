@@ -304,14 +304,16 @@ const
 var
   NFFTIdx, NFFT, Hop, NumBins, i: integer;
   Re, Im, Got, Want: TNNetVolume;
-  MaxDiff, d: double;
+  MaxDiff, MaxAbs, d: double;
 begin
-  // NFFT = 16 (even: the top bin is self-conjugate) and NFFT = 9 (odd: it is
-  // not, and BinCnt*TapCnt wraps at a non-power-of-two modulus).
-  for NFFTIdx := 0 to 1 do
+  // NFFT = 16 and 64 (powers of two: the radix-2 inverse path, top bin
+  // self-conjugate) and NFFT = 9 (odd: not self-conjugate, no radix-2
+  // decomposition, and BinCnt*TapCnt wraps at a non-power-of-two modulus).
+  for NFFTIdx := 0 to 2 do
   begin
     if NFFTIdx = 0 then begin NFFT := 16; Hop := 4; end
-    else begin NFFT := 9; Hop := 3; end;
+    else if NFFTIdx = 1 then begin NFFT := 9; Hop := 3; end
+    else begin NFFT := 64; Hop := 16; end;
     NumBins := NFFT div 2 + 1;
     Re := TNNetVolume.Create(csFrames, 1, NumBins);
     Im := TNNetVolume.Create(csFrames, 1, NumBins);
@@ -329,14 +331,20 @@ begin
       AssertEquals('NFFT ' + IntToStr(NFFT) + ': output length',
         Want.Size, Got.Size);
       MaxDiff := 0;
+      MaxAbs := 0;
       for i := 0 to Want.Size - 1 do
       begin
         d := Abs(Got.FData[i] - Want.FData[i]);
         if d > MaxDiff then MaxDiff := d;
+        d := Abs(Want.FData[i]);
+        if d > MaxAbs then MaxAbs := d;
       end;
+      // Relative to the reference's own scale: both sides are double-precision
+      // DSP landing in float32 storage, so the bound must track the signal.
       AssertTrue('NFFT ' + IntToStr(NFFT) +
-        ': fundamental-table ISTFT vs product-table reference max |diff| = ' +
-        FloatToStr(MaxDiff), MaxDiff < 1e-5);
+        ': radix-2/fundamental-table ISTFT vs product-table reference ' +
+        'max |diff| = ' + FloatToStr(MaxDiff) + ' vs max |want| = ' +
+        FloatToStr(MaxAbs), MaxDiff < 1e-5 * (1.0 + MaxAbs));
     finally
       Re.Free;
       Im.Free;
