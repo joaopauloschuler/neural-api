@@ -17098,13 +17098,13 @@ type
   // Coded by Claude (AI).
   TNNetBilinearUpsample = class(TNNetLayer)
     private
+      // Per-shape X-axis sampling map (rule #27).
+      FXMap: TNNetAxisMap;
       {$IFDEF OpenCL}
       FGatherCL: TNNetBilinearGatherCL;
       FCornerBuf, FWeightBuf, FDstFlat: TNNetVolume;
       procedure ComputeOpenCL();
       {$ENDIF}
-      // Per-shape X-axis sampling map (rule #27).
-      FXMap: TNNetAxisMap;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(pFactor: integer = 2); reintroduce; overload;
@@ -17142,6 +17142,8 @@ type
   // Coded by Claude (AI).
   TNNetBicubicUpsample = class(TNNetLayer)
     private
+      // Per-shape X-axis sampling map (rule #27).
+      FXMap: TNNetAxisMap;
       {$IFDEF OpenCL}
       FGatherCL: TNNetBicubicGatherCL;
       FScatterCL: TNNetBicubicScatterCL;
@@ -17152,8 +17154,6 @@ type
       procedure ComputeOpenCL();
       procedure BackpropagateOpenCL();
       {$ENDIF}
-      // Per-shape X-axis sampling map (rule #27).
-      FXMap: TNNetAxisMap;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(pFactor: integer = 2;
@@ -17186,13 +17186,13 @@ type
   // Coded by Claude (AI).
   TNNetBilinearResize = class(TNNetLayer)
     private
+      // Per-shape X-axis sampling map (rule #27).
+      FXMap: TNNetAxisMap;
       {$IFDEF OpenCL}
       FGatherCL: TNNetBilinearGatherCL;
       FCornerBuf, FWeightBuf, FDstFlat: TNNetVolume;
       procedure ComputeOpenCL();
       {$ENDIF}
-      // Per-shape X-axis sampling map (rule #27).
-      FXMap: TNNetAxisMap;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(pOutW: integer = 2; pOutH: integer = 2;
@@ -17235,6 +17235,8 @@ type
   // Coded by Claude (AI).
   TNNetResize2D = class(TNNetLayer)
     private
+      // Per-shape X-axis sampling map (rule #27).
+      FXMap: TNNetAxisMap;
       {$IFDEF OpenCL}
       // Forward-only device offload reusing the shared gather kernels: the
       // bilinear path drives TNNetBilinearGatherCL (4 corners, same kernel as
@@ -17246,8 +17248,6 @@ type
       FCornerBuf, FWeightBuf, FDstFlat: TNNetVolume;
       procedure ComputeOpenCL();
       {$ENDIF}
-      // Per-shape X-axis sampling map (rule #27).
-      FXMap: TNNetAxisMap;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       // pMode: 0=nearest, 1=bilinear, 2=bicubic.
