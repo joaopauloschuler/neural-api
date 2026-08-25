@@ -923,27 +923,32 @@ end;
 // Token-level logprob scoring + multiple-choice harness
 // ---------------------------------------------------------------------------
 
-// Internal worker behind ScoreSequence / ScoreCompletionsBatch. Fills Result
-// for scored positions in [max(1,FirstScored) .. High(Tokens)] and leaves all
-// earlier entries at 0. FirstScored lets the shared-prefix batch path skip the
-// (unused) context positions for single next-token heads, scoring ONLY the
+// Internal worker behind ScoreSequence / ScoreCompletionsBatch / LAMBADA. Fills
+// Result for scored positions in [max(1,FirstScored) .. High(Tokens)] and leaves
+// all earlier entries at 0. FirstScored lets the shared-prefix batch path skip
+// the (unused) context positions for single next-token heads, scoring ONLY the
 // completion tokens while producing identical per-token log-probs. LastWindow
 // switches over-context sequences from raising to trailing-window scoring.
-function ScoreSequenceFrom(NN: TNNet;
+// WantArgmax additionally fills Preds[Pos] with the model's argmax next token at
+// every scored position, read off the SAME forward as the log-probability (-1
+// where nothing was scored), so a greedy harness needs no second forward.
+function ScoreSequenceArgmaxFrom(NN: TNNet;
   const Tokens: TNeuralIntegerArray; FirstScored: integer;
-  LastWindow: boolean): TNeuralFloatDynArr;
+  LastWindow, WantArgmax: boolean;
+  var Preds: TNeuralIntegerArray): TNeuralFloatDynArr;
 var
   InV: TNNetVolume;
   Last: TNNetLayer;
   Prefix: TNeuralIntegerArray;
   ContextLen, InDepth, VocabSize: integer;
-  PerPosition, Overflows: boolean;
-  SampleLen, Pos, Tgt, FirstPos, WinStart, WinLen, Row: integer;
+  PerPosition, Overflows, TgtInVocab: boolean;
+  SampleLen, Pos, Tgt, FirstPos, WinStart, WinLen, Row, Best: integer;
   SampleLenM1, RowBase: integer;
   RowSum, Prob: TNeuralFloat;
   LO: TNNetVolume;
 begin
   SetLength(Result, 0);
+  SetLength(Preds, 0);
   if NN = nil then Exit;
   if NN.CountLayers() < 2 then Exit;
   SampleLen := Length(Tokens);
@@ -971,6 +976,11 @@ begin
   SetLength(Result, SampleLen);
   SampleLenM1 := SampleLen - 1;
   for Pos := 0 to SampleLenM1 do Result[Pos] := 0;
+  if WantArgmax then
+  begin
+    SetLength(Preds, SampleLen);
+    for Pos := 0 to SampleLenM1 do Preds[Pos] := -1;
+  end;
   if SampleLen < 2 then Exit;
   FirstPos := FirstScored;
   if FirstPos < 1 then FirstPos := 1;
@@ -988,14 +998,20 @@ begin
       for Pos := FirstPos to SampleLenM1 do
       begin
         Tgt := Tokens[Pos];
+        // Output row Pos-1 predicts token Pos (the causal shift). Defensive
+        // re-normalisation, exactly like Perplexity.
+        RowBase := LO.GetRawPos(Pos - 1, 0);
+        if WantArgmax then
+        begin
+          TNNetVolume.MaxPos(TNeuralFloatArrPtr(@LO.FData[RowBase]),
+            VocabSize, Best);
+          Preds[Pos] := Best;
+        end;
         if (Tgt < 0) or (Tgt >= VocabSize) then
         begin
           Result[Pos] := SafeLogProb(0); // out-of-vocab: clamped, not skipped
           continue;
         end;
-        // Output row Pos-1 predicts token Pos (the causal shift). Defensive
-        // re-normalisation, exactly like Perplexity.
-        RowBase := LO.GetRawPos(Pos - 1, 0);
         RowSum := TNNetVolume.Sum(TNeuralFloatArrPtr(@LO.FData[RowBase]), VocabSize);
         if RowSum <= 0 then RowSum := 1.0;
         Prob := LO.FData[RowBase + Tgt] / RowSum;
@@ -1009,7 +1025,8 @@ begin
       for Pos := FirstPos to SampleLenM1 do
       begin
         Tgt := Tokens[Pos];
-        if (Tgt < 0) or (Tgt >= VocabSize) then
+        TgtInVocab := (Tgt >= 0) and (Tgt < VocabSize);
+        if not (TgtInVocab or WantArgmax) then
         begin
           Result[Pos] := SafeLogProb(0);
           continue;
@@ -1026,6 +1043,17 @@ begin
         LO := Last.Output;
         Row := WinLen - 2;                       // row predicting the last token
         RowBase := LO.GetRawPos(Row, 0);
+        if WantArgmax then
+        begin
+          TNNetVolume.MaxPos(TNeuralFloatArrPtr(@LO.FData[RowBase]),
+            VocabSize, Best);
+          Preds[Pos] := Best;
+        end;
+        if not TgtInVocab then
+        begin
+          Result[Pos] := SafeLogProb(0);
+          continue;
+        end;
         RowSum := TNNetVolume.Sum(TNeuralFloatArrPtr(@LO.FData[RowBase]), VocabSize);
         if RowSum <= 0 then RowSum := 1.0;
         Prob := LO.FData[RowBase + Tgt] / RowSum;
@@ -1039,7 +1067,8 @@ begin
       for Pos := FirstPos to SampleLenM1 do
       begin
         Tgt := Tokens[Pos];
-        if (Tgt < 0) or (Tgt >= VocabSize) then
+        TgtInVocab := (Tgt >= 0) and (Tgt < VocabSize);
+        if not (TgtInVocab or WantArgmax) then
         begin
           Result[Pos] := SafeLogProb(0);
           continue;
@@ -1055,9 +1084,20 @@ begin
         end
         else InV.OneHotEncodingReversed(Prefix);
         NN.Compute(InV);
-        RowSum := Last.Output.GetSum();
+        LO := Last.Output;
+        if WantArgmax then
+        begin
+          TNNetVolume.MaxPos(TNeuralFloatArrPtr(@LO.FData[0]), VocabSize, Best);
+          Preds[Pos] := Best;
+        end;
+        if not TgtInVocab then
+        begin
+          Result[Pos] := SafeLogProb(0);
+          continue;
+        end;
+        RowSum := LO.GetSum();
         if RowSum <= 0 then RowSum := 1.0;
-        Prob := Last.Output.FData[Tgt] / RowSum;
+        Prob := LO.FData[Tgt] / RowSum;
         Result[Pos] := SafeLogProb(Prob);
       end;
     end;
@@ -1065,6 +1105,16 @@ begin
     InV.Free;
   end;
   SetLength(Prefix, 0);
+end;
+
+function ScoreSequenceFrom(NN: TNNet;
+  const Tokens: TNeuralIntegerArray; FirstScored: integer;
+  LastWindow: boolean): TNeuralFloatDynArr;
+var
+  Preds: TNeuralIntegerArray;
+begin
+  Result := ScoreSequenceArgmaxFrom(NN, Tokens, FirstScored, LastWindow,
+    false, Preds);
 end;
 
 function ScoreSequence(NN: TNNet;
@@ -1458,102 +1508,13 @@ end;
 // LAMBADA last-word accuracy
 // ---------------------------------------------------------------------------
 
-// Internal: model's argmax next-token prediction for position Pos of Tokens
-// (conditioned on Tokens[0..Pos-1]). Mirrors the forward in ScoreSequenceFrom
-// EXACTLY - including the reversed-prefix encoding for single next-token heads -
-// so the greedy LAMBADA prediction matches the scorer's conditioning. Returns
-// -1 on a degenerate model / out-of-range Pos.
-function PredictArgmaxAt(NN: TNNet;
-  const Tokens: TNeuralIntegerArray; Pos: integer;
-  LastWindow: boolean): integer;
-var
-  InV: TNNetVolume;
-  Last: TNNetLayer;
-  Prefix: TNeuralIntegerArray;
-  ContextLen, InDepth, VocabSize, WinStart, WinLen, Row, Best: integer;
-  RowBase: integer;
-  PerPosition: boolean;
-  LO: TNNetVolume;
-begin
-  Result := -1;
-  if NN = nil then Exit;
-  if NN.CountLayers() < 2 then Exit;
-  if (Pos < 1) or (Pos > High(Tokens)) then Exit;
-  ContextLen := NN.GetFirstLayer().Output.SizeX;
-  InDepth := NN.GetFirstLayer().Output.Depth;
-  Last := NN.GetLastLayer();
-  PerPosition := (ContextLen > 1) and (Last.Output.SizeX = ContextLen) and
-    (Last.Output.Depth >= 2);
-  if PerPosition
-  then VocabSize := Last.Output.Depth
-  else VocabSize := Last.Output.Size;
-  if VocabSize < 2 then Exit;
-  InV := TNNetVolume.Create(NN.GetFirstLayer().Output);
-  try
-    if PerPosition then
-    begin
-      // Window of context tokens [WinStart..Pos-1]; the row predicting Pos is
-      // the last row of that window (length-1). Over-context: trailing window.
-      WinStart := 0;
-      if Pos > ContextLen then
-      begin
-        if not LastWindow then
-          raise EArgumentException.CreateFmt(
-            'EvaluateLAMBADA: position %d exceeds the model context window %d',
-            [Pos, ContextLen]);
-        WinStart := Pos - ContextLen;
-      end;
-      WinLen := Pos - WinStart;                 // tokens [WinStart..Pos-1]
-      Prefix := Copy(Tokens, WinStart, WinLen);
-      InV.Fill(0);
-      if InDepth = 1
-      then InV.CopyNoChecksIntArr(Prefix)
-      else InV.OneHotEncoding(Prefix);
-      NN.Compute(InV);
-      Row := WinLen - 1;                         // row predicting token at Pos
-      LO := Last.Output;
-      RowBase := LO.GetRawPos(Row, 0);
-      TNNetVolume.MaxPos(TNeuralFloatArrPtr(@LO.FData[RowBase]),
-        VocabSize, Best);
-      Result := Best;
-    end
-    else
-    begin
-      // Single next-token head: reversed right-aligned prefix [WinStart..Pos-1].
-      WinStart := 0;
-      if Pos > ContextLen then
-      begin
-        if not LastWindow then
-          raise EArgumentException.CreateFmt(
-            'EvaluateLAMBADA: position %d exceeds the model context window %d',
-            [Pos, ContextLen]);
-        WinStart := Pos - ContextLen;
-      end;
-      Prefix := Copy(Tokens, WinStart, Pos - WinStart);
-      if InDepth = 1 then
-      begin
-        InV.Fill(0);
-        InV.CopyReversedNoChecksIntArr(Prefix);
-      end
-      else InV.OneHotEncodingReversed(Prefix);
-      NN.Compute(InV);
-      TNNetVolume.MaxPos(TNeuralFloatArrPtr(@Last.Output.FData[0]),
-        VocabSize, Best);
-      Result := Best;
-    end;
-  finally
-    InV.Free;
-  end;
-  SetLength(Prefix, 0);
-end;
-
 function EvaluateLAMBADA(NN: TNNet;
   const Examples: array of TNNetLambadaExample;
   LastWindow: boolean): TNNetLambadaStats;
 var
-  ExIdx, CtxLen, WordLen, I, Pos, Pred: integer;
-  ExamplesHi, WordLenM1, FullLastIdx: integer;
-  Full: TNeuralIntegerArray;
+  ExIdx, CtxLen, WordLen, I, FullLen: integer;
+  ExamplesHi, FullLastIdx: integer;
+  Full, Preds: TNeuralIntegerArray;
   LogProbs: TNeuralFloatDynArr;
   AllCorrect: boolean;
   SumNLL: TNeuralFloat;
@@ -1572,29 +1533,28 @@ begin
     CtxLen := Length(Examples[ExIdx].ContextTokens);
     WordLen := Length(Examples[ExIdx].FinalWordTokens);
     if (CtxLen < 1) or (WordLen < 1) then continue;
-    WordLenM1 := WordLen - 1;
+    FullLen := CtxLen + WordLen;
     // Build the full passage (context + gold final word). Greedy prediction is
     // teacher-forced on the gold tokens: position CtxLen+i predicts the i-th
     // final-word token from Full[0..CtxLen+i-1].
-    SetLength(Full, CtxLen + WordLen);
+    SetLength(Full, FullLen);
     Move(Examples[ExIdx].ContextTokens[0], Full[0], CtxLen * csIntegerSize);
     Move(Examples[ExIdx].FinalWordTokens[0], Full[CtxLen],
       WordLen * csIntegerSize);
-    AllCorrect := true;
-    for I := 0 to WordLenM1 do
-    begin
-      Pos := CtxLen + I;
-      Pred := PredictArgmaxAt(NN, Full, Pos, LastWindow);
-      if Pred <> Full[Pos] then
-      begin
-        AllCorrect := false;
-        break; // word is already wrong; remaining argmaxes don't matter
-      end;
-    end;
-    // Teacher-forced final-word NLL for the co-reported perplexity.
-    LogProbs := ScoreSequenceFrom(NN, Full, CtxLen, LastWindow);
-    FullLastIdx := CtxLen + WordLen - 1;
-    if Length(LogProbs) = CtxLen + WordLen then
+    // ONE scoring pass yields both the greedy argmax and the teacher-forced NLL
+    // of every final-word position - they read the same forward's output rows.
+    LogProbs := ScoreSequenceArgmaxFrom(NN, Full, CtxLen, LastWindow, true,
+      Preds);
+    FullLastIdx := FullLen - 1;
+    AllCorrect := Length(Preds) = FullLen;   // degenerate model: never correct
+    if AllCorrect then
+      for I := CtxLen to FullLastIdx do
+        if Preds[I] <> Full[I] then
+        begin
+          AllCorrect := false;
+          break; // word is already wrong; remaining argmaxes don't matter
+        end;
+    if Length(LogProbs) = FullLen then
       for I := CtxLen to FullLastIdx do
       begin
         SumNLL := SumNLL - LogProbs[I];
