@@ -518,6 +518,10 @@ type
     Lo, Hi: char;
   end;
 
+  // Membership of one compiled character class, one entry per byte value: the
+  // run-time answer to "is C in this class?" without walking the ranges.
+  TNNetGrammarCharSetTable = array[0..255] of boolean;
+
   { TNNetGrammar }
   // A GBNF-subset grammar COMPILED to a flat pushdown representation. Supported
   // subset (llama.cpp-style, v1):
@@ -541,6 +545,12 @@ type
       FRules: array of TNNetGrammarElemArray; // index -> compiled body
       FRanges: array of TNNetGrammarRange;    // pooled char-class ranges
       FCharSets: array of record First, Count: integer; end; // run in FRanges
+      // Rule #27: per-class membership and per-rule alternate positions, both
+      // fixed once the grammar is compiled. They answer at run time what
+      // ElemMatches and PushRuleAlternates used to rescan the ranges and the
+      // rule body for, on every candidate character of every decode step.
+      FSetTable: array of TNNetGrammarCharSetTable;
+      FRuleAlts: array of TNeuralIntegerArray;
       FRootRule: integer;
       // --- parser state (over FSource) ---
       FPos: integer;
@@ -570,6 +580,9 @@ type
         var Elems: TNNetGrammarElemArray);
       procedure BuildPlusRule(AtomRule: integer;
         var Elems: TNNetGrammarElemArray);
+      // Records the start element index of every top-level alternate of every
+      // rule; run once the last rule body (helper rules included) is in place.
+      procedure BuildRuleAlternates();
       procedure Compile();
     public
       // Builds and compiles the grammar from GBNF text. Raises EAssertionFailed
@@ -601,15 +614,11 @@ type
       FScratch: array of array of integer;
       FScratchLen: array of integer;
       FScratchCount: integer;
-      // Persistent per-char advance buffer (rule #17): FeedChar is not
-      // re-entrant, so one lazily-sized buffer serves every matched stack
-      // instead of a fresh SetLength per (stack, char, probed token).
-      FAdvBuf: array of integer;
       // Persistent per-recursion-depth work buffers (rule #17). Every entry
       // into AddStackExpanded / PushRuleAlternates takes FWorkPool[FWorkDepth]
       // and increments the depth, so a recursive expansion reuses buffers
-      // instead of SetLength-ing a fresh dynamic array per frame. Like FScratch
-      // and FAdvBuf, this makes the expansion non-reentrant per machine
+      // instead of SetLength-ing a fresh dynamic array per frame. Like
+      // FScratch, this makes the expansion non-reentrant per machine
       // instance - FMachine and FProbe are separate objects, so a probed token
       // never shares these with the live automaton.
       FWorkPool: array of array of integer;
@@ -621,10 +630,21 @@ type
       FVersion: int64;
       function PackPos(Rule, Idx: integer): integer; {$IFDEF Release} inline; {$ENDIF}
       procedure UnpackPos(Pos: integer; out Rule, Idx: integer); {$IFDEF Release} inline; {$ENDIF}
+      // Copies Src[0..Len-1] into a fresh pooled work frame holding room for
+      // Capacity entries; returns the frame depth the caller restores after use.
+      function BeginWorkFrame(const Src: array of integer;
+        Len, Capacity: integer): integer;
+      // Walks the pooled frame's top down to a resting state: getEnd/getAlt pop
+      // in place, a rule ref forks into its alternates, a terminal comes to rest.
+      procedure ExpandWorkFrame(D, Len: integer);
       // Pushes a stack (copy of Src[0..Len-1] then descends rule refs so the
       // new top is a terminal or the stack is empty) into the scratch set,
       // expanding alternates. Dedups against what's already in scratch.
       procedure AddStackExpanded(const Src: array of integer; Len: integer);
+      // AddStackExpanded with the copied stack's top element replaced by NewTop,
+      // which is the advance FeedChar needs without a second buffer and copy.
+      procedure AddStackAdvanced(const Src: array of integer;
+        Len, NewTop: integer);
       // Forks Base into every alternate of RuleIdx (used by Reset and ruleref
       // expansion).
       procedure PushRuleAlternates(const Base: array of integer;
@@ -3391,7 +3411,7 @@ end;
 function TNNetGrammar.AddCharSet(
   const ARanges: array of TNNetGrammarRange): integer;
 var
-  I, Base, ARangesHi: integer;
+  I, C, Base, ARangesHi: integer;
 begin
   Base := Length(FRanges);
   SetLength(FRanges, Base + Length(ARanges));
@@ -3401,6 +3421,13 @@ begin
   SetLength(FCharSets, Result + 1);
   FCharSets[Result].First := Base;
   FCharSets[Result].Count := Length(ARanges);
+  // Rule #27: expand the ranges into a byte-indexed membership table here, once
+  // per class, instead of walking them per candidate character at run time.
+  SetLength(FSetTable, Result + 1);
+  for C := 0 to 255 do FSetTable[Result][C] := false;
+  for I := 0 to ARangesHi do
+    for C := Ord(ARanges[I].Lo) to Ord(ARanges[I].Hi) do
+      FSetTable[Result][C] := true;
 end;
 
 // Appends one element to a growing element array.
@@ -3638,6 +3665,40 @@ begin
   end;
 end;
 
+procedure TNNetGrammar.BuildRuleAlternates();
+var
+  R, K, AltIdx, AltCount, MaxRulePos, MaxElemPos: integer;
+begin
+  MaxRulePos := Length(FRules) - 1;
+  SetLength(FRuleAlts, MaxRulePos + 1);
+  for R := 0 to MaxRulePos do
+  begin
+    MaxElemPos := Length(FRules[R]) - 1;
+    if MaxElemPos < 0 then
+    begin
+      // A rule that is referenced but never defined has an empty body. Its
+      // single out-of-range alternate keeps the run-time behaviour of the body
+      // scan this table replaces.
+      SetLength(FRuleAlts[R], 1);
+      FRuleAlts[R][0] := 0;
+      continue;
+    end;
+    AltCount := 0;
+    AltIdx := 0;
+    while true do
+    begin
+      SetLength(FRuleAlts[R], AltCount + 1);
+      FRuleAlts[R][AltCount] := AltIdx;
+      Inc(AltCount);
+      K := AltIdx;
+      while (FRules[R][K].ElemType <> getAlt) and
+            (FRules[R][K].ElemType <> getEnd) do Inc(K);
+      if FRules[R][K].ElemType = getEnd then break;
+      AltIdx := K + 1;
+    end;
+  end;
+end;
+
 procedure TNNetGrammar.Compile();
 // Splits the source into 'name ::= body' definitions (continuation lines fold
 // into the previous def), pre-registers names so forward refs resolve, parses
@@ -3718,6 +3779,9 @@ begin
     Defs.Free;
   end;
 
+  // Every rule body, helper rules included, is in place by now.
+  BuildRuleAlternates();
+
   FRootRule := FRuleNames.IndexOf('root');
   if FRootRule < 0 then
     raise EAssertionFailed.Create('TNNetGrammar: no ''root'' rule defined');
@@ -3777,59 +3841,89 @@ begin
   Inc(FScratchCount);
 end;
 
-procedure TNNetGrammarMachine.AddStackExpanded(const Src: array of integer;
-  Len: integer);
-// Descends the stack top: rule-refs are expanded (forking on each alternate),
-// getEnd/getAlt pop, terminals (or empty stacks) come to rest in the scratch
-// set. Recursion depth is bounded by the grammar nesting + recursion depth of
-// the partial parse.
-var
-  D, WLen: integer;
-  TopPos, Rule, Idx, RefRule, ContPos: integer;
-  Elem: TNNetGrammarElem;
+function TNNetGrammarMachine.BeginWorkFrame(const Src: array of integer;
+  Len, Capacity: integer): integer;
 begin
   // Rule #17: this frame's work buffer comes from the persistent pool. Src is
-  // always a shallower slot or an external buffer, never FWorkPool[D] itself.
-  D := FWorkDepth;
-  if D >= Length(FWorkPool) then SetLength(FWorkPool, D + 8);
-  if Length(FWorkPool[D]) < Len then SetLength(FWorkPool[D], Len + 8);
+  // always a shallower slot or an external buffer, never FWorkPool[Result].
+  Result := FWorkDepth;
+  if Result >= Length(FWorkPool) then SetLength(FWorkPool, Result + 8);
+  if Length(FWorkPool[Result]) < Capacity then
+    SetLength(FWorkPool[Result], Capacity + 8);
   // Contiguous integer copy -> Move (rule #13 / App. C).
-  if Len > 0 then Move(Src[0], FWorkPool[D][0], Len * csIntegerSize);
-  WLen := Len;
+  if Len > 0 then Move(Src[0], FWorkPool[Result][0], Len * csIntegerSize);
   Inc(FWorkDepth);
+end;
 
-  if WLen = 0 then AddStackRaw(FWorkPool[D], 0)
-  else
+procedure TNNetGrammarMachine.ExpandWorkFrame(D, Len: integer);
+// Descends the stack top: rule-refs are expanded (forking on each alternate),
+// getEnd/getAlt pop, terminals (or empty stacks) come to rest in the scratch
+// set. A pop only shortens the same frame, so it iterates here instead of
+// recursing; recursion is left to the rule-ref fork, whose depth is bounded by
+// the grammar nesting + recursion depth of the partial parse.
+var
+  WLen, TopPos, Rule, Idx: integer;
+  Elem: TNNetGrammarElem;
+begin
+  WLen := Len;
+  while true do
   begin
+    if WLen = 0 then
+    begin
+      AddStackRaw(FWorkPool[D], 0);
+      exit;
+    end;
     TopPos := FWorkPool[D][WLen - 1];
     UnpackPos(TopPos, Rule, Idx);
     // Rule #4/#7: bind the ELEMENT record, not the rule body. A
     // TNNetGrammarElemArray local is managed, so it would cost an
     // fpc_dynarray_assign plus the implicit try/finally frame FPC wraps around
-    // the whole (recursive) routine; the record copy is two words.
+    // the whole routine; the record copy is two words.
     Elem := FGrammar.FRules[Rule][Idx];
 
     case Elem.ElemType of
       getEnd, getAlt:
-        begin
-          // End of an alternate/rule: pop and continue with the parent.
-          Dec(WLen);
-          AddStackExpanded(FWorkPool[D], WLen);
-        end;
+        // End of an alternate/rule: pop and continue with the parent.
+        Dec(WLen);
       getRuleRef:
         begin
-          RefRule := Elem.Value;
-          ContPos := PackPos(Rule, Idx + 1);
-          // Continuation replaces the ref on top.
-          FWorkPool[D][WLen - 1] := ContPos;
+          // The continuation replaces the ref on top. PackPos(Rule, Idx + 1) is
+          // TopPos + 1: the element index is the low field of the packed
+          // position and cannot carry into the rule field for any rule body
+          // shorter than KGrammarStride.
+          FWorkPool[D][WLen - 1] := TopPos + 1;
           // Fork into each alternate of the referenced rule.
-          PushRuleAlternates(FWorkPool[D], WLen, RefRule);
+          PushRuleAlternates(FWorkPool[D], WLen, Elem.Value);
+          exit;
         end;
       else
-        // Terminal top: a valid resting state.
-        AddStackRaw(FWorkPool[D], WLen);
+        begin
+          // Terminal top: a valid resting state.
+          AddStackRaw(FWorkPool[D], WLen);
+          exit;
+        end;
     end;
   end;
+end;
+
+procedure TNNetGrammarMachine.AddStackExpanded(const Src: array of integer;
+  Len: integer);
+var
+  D: integer;
+begin
+  D := BeginWorkFrame(Src, Len, Len);
+  ExpandWorkFrame(D, Len);
+  FWorkDepth := D;
+end;
+
+procedure TNNetGrammarMachine.AddStackAdvanced(const Src: array of integer;
+  Len, NewTop: integer);
+var
+  D: integer;
+begin
+  D := BeginWorkFrame(Src, Len, Len);
+  FWorkPool[D][Len - 1] := NewTop;
+  ExpandWorkFrame(D, Len);
   FWorkDepth := D;
 end;
 
@@ -3839,54 +3933,45 @@ procedure TNNetGrammarMachine.PushRuleAlternates(const Base: array of integer;
 // Base[0..BaseLen-1] and expand. An empty alternate's first position is its
 // getEnd, which AddStackExpanded pops to continue with Base.
 var
-  D, AltIdx, K, BaseLenP1: integer;
-  RefBody: TNNetGrammarElemArray;
+  D, A, MaxAltPos, BaseLenP1: integer;
 begin
-  RefBody := FGrammar.FRules[RuleIdx];
-  // Rule #17: this frame's work buffer comes from the persistent pool (see
-  // AddStackExpanded). The base bytes never change across alternates, so they
-  // are copied once; only the top slot is rewritten per alternate.
-  D := FWorkDepth;
+  // The base entries never change across alternates, so they are copied once
+  // into this frame's pooled buffer; only the top slot is rewritten per
+  // alternate.
   BaseLenP1 := BaseLen + 1;
-  if D >= Length(FWorkPool) then SetLength(FWorkPool, D + 8);
-  if Length(FWorkPool[D]) < BaseLenP1 then
-    SetLength(FWorkPool[D], BaseLenP1 + 8);
-  // Contiguous integer copy -> Move (rule #13 / App. C).
-  if BaseLen > 0 then Move(Base[0], FWorkPool[D][0], BaseLen * csIntegerSize);
-  Inc(FWorkDepth);
-  AltIdx := 0;
-  while true do
+  D := BeginWorkFrame(Base, BaseLen, BaseLenP1);
+  // Rule #27: the alternates' start indices come from the table the grammar
+  // built at compile time, so the body is not rescanned for its separators on
+  // every fork. Indexed in place: binding the row to a managed local would cost
+  // an fpc_dynarray_assign plus a try/finally frame per call.
+  MaxAltPos := Length(FGrammar.FRuleAlts[RuleIdx]) - 1;
+  for A := 0 to MaxAltPos do
   begin
-    FWorkPool[D][BaseLen] := PackPos(RuleIdx, AltIdx);
+    FWorkPool[D][BaseLen] := PackPos(RuleIdx, FGrammar.FRuleAlts[RuleIdx][A]);
+    // Expansion pops and rewrites its frame's entries, so it must run on its
+    // own copy - this frame still has to serve the remaining alternates.
     AddStackExpanded(FWorkPool[D], BaseLenP1);
-    K := AltIdx;
-    while (RefBody[K].ElemType <> getAlt) and
-          (RefBody[K].ElemType <> getEnd) do Inc(K);
-    if RefBody[K].ElemType = getEnd then break;
-    AltIdx := K + 1;
   end;
   FWorkDepth := D;
 end;
 
 procedure TNNetGrammarMachine.CommitScratchToActive();
 var
-  I, FScratchCountM1: integer;
+  TmpStacks: array of array of integer;
+  TmpLen: array of integer;
 begin
-  if Length(FStacks) < FScratchCount then
-  begin
-    SetLength(FStacks, FScratchCount);
-    SetLength(FStackLen, FScratchCount);
-  end;
-  FScratchCountM1 := FScratchCount - 1;
-  for I := 0 to FScratchCountM1 do
-  begin
-    if Length(FStacks[I]) < FScratchLen[I] then
-      SetLength(FStacks[I], FScratchLen[I] + 8);
-    // Contiguous integer copy -> Move (rule #13 / App. C).
-    if FScratchLen[I] > 0 then
-      Move(FScratch[I][0], FStacks[I][0], FScratchLen[I] * csIntegerSize);
-    FStackLen[I] := FScratchLen[I];
-  end;
+  // Swap the buffer references instead of copying every stack: the retired
+  // active buffers become the next call's scratch. Safe because the builder
+  // only ever READS the active set (FeedChar walks FStacks while AddStackRaw
+  // fills FScratch) and resets FScratchCount to 0 before reusing it, so no live
+  // stack is ever aliased. This is the ping-pong DecodeCTCBeamSearch uses for
+  // its prefix buffers.
+  TmpStacks := FStacks;
+  FStacks := FScratch;
+  FScratch := TmpStacks;
+  TmpLen := FStackLen;
+  FStackLen := FScratchLen;
+  FScratchLen := TmpLen;
   FStackCount := FScratchCount;
 end;
 
@@ -3930,7 +4015,7 @@ end;
 
 function TNNetGrammarMachine.ElemMatches(Pos: integer; C: char): boolean;
 var
-  Rule, Idx, SetIdx, R, RMax, SetFirst: integer;
+  Rule, Idx: integer;
   Elem: TNNetGrammarElem;
   InSet: boolean;
 begin
@@ -3947,15 +4032,8 @@ begin
     getCharAny: Result := C <> #0;
     getCharSet, getCharSetNot:
       begin
-        SetIdx := Elem.Value;
-        InSet := false;
-        // FGrammar.FCharSets[SetIdx] resolved once for both First and Count.
-        SetFirst := FGrammar.FCharSets[SetIdx].First;
-        RMax := SetFirst + FGrammar.FCharSets[SetIdx].Count - 1;
-        for R := SetFirst to RMax do
-          if (C >= FGrammar.FRanges[R].Lo) and
-             (C <= FGrammar.FRanges[R].Hi) then
-          begin InSet := true; break; end;
+        // Rule #27: one table read instead of a walk over the class's ranges.
+        InSet := FGrammar.FSetTable[Elem.Value][Ord(C)];
         if Elem.ElemType = getCharSet
         then Result := InSet
         else Result := (not InSet) and (C <> #0);
@@ -3966,7 +4044,7 @@ end;
 
 function TNNetGrammarMachine.FeedChar(C: char): boolean;
 var
-  I, TopPos, Rule, Idx, FStackCountM1, StkLen: integer;
+  I, TopPos, FStackCountM1, StkLen: integer;
 begin
   Inc(FVersion);
   FScratchCount := 0;
@@ -3977,15 +4055,12 @@ begin
     if StkLen = 0 then continue; // a completed stack accepts nothing
     TopPos := FStacks[I][StkLen - 1];
     if ElemMatches(TopPos, C) then
-    begin
-      UnpackPos(TopPos, Rule, Idx);
-      // Rule #17: reuse the persistent advance buffer (FeedChar is not
-      // re-entrant) instead of a fresh SetLength per matched stack.
-      if Length(FAdvBuf) < StkLen then SetLength(FAdvBuf, StkLen + 8);
-      Move(FStacks[I][0], FAdvBuf[0], StkLen * csIntegerSize);
-      FAdvBuf[StkLen - 1] := PackPos(Rule, Idx + 1);
-      AddStackExpanded(FAdvBuf, StkLen);
-    end;
+      // The matched element is consumed, so the stack advances to the next
+      // element of the same rule - the packed position plus one (the element
+      // index is the low field and cannot carry into the rule field). The
+      // advance lands directly in the expansion's own work frame, so no
+      // intermediate buffer and no second copy.
+      AddStackAdvanced(FStacks[I], StkLen, TopPos + 1);
   end;
   Result := FScratchCount > 0;
   CommitScratchToActive();
