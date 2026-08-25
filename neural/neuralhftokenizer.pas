@@ -5053,8 +5053,10 @@ end;
 function TNeuralHFTokenizer.PrefixScanVocab(
   const Fragment: string): TNeuralIntegerArray;
 var
-  Surface, Cand: string;
-  SurfLen, Id, Count, IdToTokenHi: integer;
+  Surface: string;
+  SurfLen, Id, Count, IdToTokenHi, CandLen: integer;
+  SurfFirst: char;
+  SurfPtr: pointer;
 begin
   SetLength(Result, 0);
   if Fragment = '' then exit;
@@ -5064,15 +5066,19 @@ begin
   SetLength(Result, Length(FIdToToken));
   Count := 0;
   IdToTokenHi := High(FIdToToken);
+  SurfFirst := Surface[1];
+  SurfPtr := @Surface[1];
+  // #16: prefix-match without a Copy() allocation per vocab entry, and #8: the
+  // candidate is tested where it sits rather than assigned to a local, which on
+  // a 150k vocab is 150k refcount pairs the scan does not need. SurfLen >= 1
+  // here, so the length guard also rules out the empty candidate and keeps
+  // FIdToToken[Id][1..SurfLen] in range for the first-byte and CompareMem tests.
   for Id := 0 to IdToTokenHi do
   begin
-    Cand := FIdToToken[Id];
-    // #16: prefix-match without a Copy() allocation per vocab entry. The
-    // length + first-byte guards short-circuit before CompareMem (SurfLen >= 1
-    // here, and Length(Cand) >= SurfLen guarantees Cand[1..SurfLen] is in range).
-    if (Cand <> '') and (Length(Cand) >= SurfLen) and
-       (Cand[1] = Surface[1]) and
-       CompareMem(@Cand[1], @Surface[1], SurfLen) then
+    CandLen := Length(FIdToToken[Id]);
+    if (CandLen >= SurfLen) and
+       (FIdToToken[Id][1] = SurfFirst) and
+       CompareMem(@FIdToToken[Id][1], SurfPtr, SurfLen) then
     begin
       Result[Count] := Id;
       Inc(Count);
