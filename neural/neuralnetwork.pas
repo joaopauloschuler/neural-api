@@ -63822,7 +63822,7 @@ var
   StartTime: double;
   PrevErr: TNNetVolume;
   SeqLen, t, i: integer;
-  MaxN, SeqLenM1, base, peBaseT: integer;
+  MaxN, SeqLenM1, idx, preBaseT, winRow, wRow, RowBytes: integer;
   peRowPtr: TNeuralFloatArrPtr;
   leak, oneMinusLeak, tanhVal, dTanh, dPre, gh: TNeuralFloat;
   hasInputGrad: boolean;
@@ -63850,41 +63850,54 @@ begin
   if Length(FphBuf) <> FN then SetLength(FphBuf, FN);
   if Length(FphPrevBuf) <> FN then SetLength(FphPrevBuf, FN);
   FillDWord(FphBuf[0], FN, 0);       // #13
+  RowBytes := FN * csNeuralFloatSize;
 
+  // Per unit i: pre_t = sum_j W_in[i,j]*x_t[j] + sum_j W[i,j]*h_{t-1}[j], so
+  //   dL/dx_t[j]     += dPre * W_in[i,j]
+  //   dL/dh_{t-1}[j] += dPre * W[i,j]
+  // Both weight rows are contiguous, so both scatters are one scaled
+  // accumulate over the row (#13), and both row bases advance by a fixed
+  // stride across i (#12). t = 0 has no h_{-1}, so that step is peeled (#20).
   peRowPtr := nil;
   for t := SeqLenM1 downto 0 do
   begin
     if hasInputGrad then
-    begin
-      peBaseT := PrevErr.GetRawPos(t, 0);   // PrevErr row t; +j depth
-      peRowPtr := PrevErr.GetRawPtr(peBaseT);
-    end;
+      peRowPtr := PrevErr.GetRawPtr(t, 0);   // PrevErr row t; +j depth
     FillDWord(FphPrevBuf[0], FN, 0);       // #13
-    // ph_t += incoming output-error at this timestep.
-    for i := 0 to MaxN do
-    begin
-      // FOutputError and FPre share (SeqLen,1,FN): one offset for both reads.
-      base := FPre.GetRawPos(t, 0, i);
-      gh := FphBuf[i] + FOutputError.FData[base];
-      // h_t = (1-a)*h_{t-1} + a*tanh(pre_t)
-      // (1-a)*h_{t-1} term -> contributes to ph_{t-1}.
-      if t > 0 then
+    // FOutputError and FPre share (SeqLen,1,FN): one row base for both reads.
+    preBaseT := FPre.GetRawPos(t, 0);
+    winRow := 0;
+    wRow := 0;
+    if t > 0 then
+      for i := 0 to MaxN do
+      begin
+        idx := preBaseT + i;
+        // ph_t = carried adjoint + incoming output-error at this timestep.
+        gh := FphBuf[i] + FOutputError.FData[idx];
+        // h_t = (1-a)*h_{t-1} + a*tanh(pre_t): the (1-a) term feeds ph_{t-1}.
         FphPrevBuf[i] := FphPrevBuf[i] + oneMinusLeak * gh;
-      // a*tanh(pre_t) term.
-      tanhVal := FPre.FData[base];
-      dTanh := 1 - tanhVal * tanhVal;        // d tanh / d pre
-      dPre := gh * leak * dTanh;             // dL/dpre_t for unit i
-      // pre_t = sum_j W_in[i,j]*x_t[j] + sum_j W[i,j]*h_{t-1}[j]
-      // -> dL/dx_t[j] += dPre * W_in[i,j]
-      // Both weight rows are contiguous, so both scatters are one scaled
-      // accumulate over the row (#13).
-      if hasInputGrad then
-        TNNetVolume.MulAdd(peRowPtr, FWin.GetRawPtr(i, 0), dPre, FInputDim);
-      // -> dL/dh_{t-1}[j] += dPre * W[i,j]
-      if t > 0 then
-        TNNetVolume.MulAdd(@FphPrevBuf[0], FW.GetRawPtr(i, 0), dPre, FN);
-    end;
-    Move(FphPrevBuf[0], FphBuf[0], FN * csNeuralFloatSize);   // #13
+        tanhVal := FPre.FData[idx];
+        dTanh := 1 - tanhVal * tanhVal;        // d tanh / d pre
+        dPre := gh * leak * dTanh;             // dL/dpre_t for unit i
+        if hasInputGrad then
+          TNNetVolume.MulAdd(peRowPtr, FWin.GetRawPtr(winRow), dPre, FInputDim);
+        TNNetVolume.MulAdd(@FphPrevBuf[0], FW.GetRawPtr(wRow), dPre, FN);
+        Inc(winRow, FInputDim);
+        Inc(wRow, FN);
+      end
+    else
+      for i := 0 to MaxN do
+      begin
+        idx := preBaseT + i;
+        gh := FphBuf[i] + FOutputError.FData[idx];
+        tanhVal := FPre.FData[idx];
+        dTanh := 1 - tanhVal * tanhVal;
+        dPre := gh * leak * dTanh;
+        if hasInputGrad then
+          TNNetVolume.MulAdd(peRowPtr, FWin.GetRawPtr(winRow), dPre, FInputDim);
+        Inc(winRow, FInputDim);
+      end;
+    Move(FphPrevBuf[0], FphBuf[0], RowBytes);   // #13
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if hasInputGrad then FPrevLayer.Backpropagate();
@@ -64539,11 +64552,11 @@ end;
 procedure TNNetAffineCoupling.Compute();
 var
   StartTime: double;
-  SizeX, SizeY, Depth, x, y, r, j, aOfs, bOfs: integer;
+  SizeX, SizeY, Depth, x, y, r, j, aOfs, bOfs, idxB: integer;
   MaxX, MaxY, MaxA, MaxB: integer;
   spre, sval, tval, xa_j, xb, accS, accT, invClamp: TNeuralFloat;
   HalfABytes: integer;
-  InPtr, OutPtr, SPtr, TPtr, SPrePtr: TNeuralFloatArrPtr;
+  InPtr, OutPtr, SPtr, TPtr, SPrePtr, XaPtr: TNeuralFloatArrPtr;
   Nr: TNNetNeuron;
 begin
   StartTime := Now();
@@ -64587,13 +64600,12 @@ begin
       SPrePtr := FSPre.GetRawPtr(x, y);
       // Identity (conditioning) half passes through unchanged.
       Move(InPtr^[aOfs], OutPtr^[aOfs], HalfABytes);
+      XaPtr := @InPtr^[aOfs];          // conditioning half, invariant across r
       // Conditioner: per-row s_pre, t from the linear map over x_a.
       for r := 0 to MaxB do
       begin
-        accS := FSBias[r] +
-          TNNetVolume.DotProduct(FSWPtrs[r], @InPtr^[aOfs], FHalfA);
-        accT := FTBias[r] +
-          TNNetVolume.DotProduct(FTWPtrs[r], @InPtr^[aOfs], FHalfA);
+        accS := FSBias[r] + TNNetVolume.DotProduct(FSWPtrs[r], XaPtr, FHalfA);
+        accT := FTBias[r] + TNNetVolume.DotProduct(FTWPtrs[r], XaPtr, FHalfA);
         spre := accS;
         // Glow tanh clamp: s = clamp * tanh(s_pre / clamp).
         sval := FClamp * pcr_tanhf(spre * invClamp);
@@ -64601,14 +64613,15 @@ begin
         SPrePtr^[r] := spre;
         SPtr^[r] := sval;
         TPtr^[r] := tval;
-        xb := InPtr^[bOfs + r];
+        idxB := bOfs + r;              // #4: the transformed half's slot, once
+        xb := InPtr^[idxB];
         if FInverse then
           // Sampling map: x_b = (y_b - t) * exp(-s).
-          OutPtr^[bOfs + r] := (xb - tval) * NeuralExp(-sval)
+          OutPtr^[idxB] := (xb - tval) * NeuralExp(-sval)
         else
         begin
           // Forward map: y_b = x_b * exp(s) + t.
-          OutPtr^[bOfs + r] := xb * NeuralExp(sval) + tval;
+          OutPtr^[idxB] := xb * NeuralExp(sval) + tval;
           FLogDet := FLogDet + sval;
         end;
       end;
@@ -64619,13 +64632,15 @@ end;
 procedure TNNetAffineCoupling.Backpropagate();
 var
   StartTime: double;
-  SizeX, SizeY, x, y, r, aOfs, bOfs: integer;
+  SizeX, SizeY, x, y, r, aOfs, bOfs, idxB: integer;
   MaxX, MaxY, MaxA, MaxB, MaxR2B: integer;
   hasInputGrad: boolean;
   sval, tval, spre, es, xb, gyb, gs, gt, gspre, dtanh, sc: TNeuralFloat;
-  InPtr, GyPtr, PrevErrPtr, SPtr, TPtr, SPrePtr, XaPtr: TNeuralFloatArrPtr;
+  negLRgspre, negLRgt: TNeuralFloat;
+  InPtr, GyPtr, PrevErrPtr, SPtr, TPtr, SPrePtr, XaPtr,
+    PrevErrAPtr: TNeuralFloatArrPtr;
   Nr, NrT: TNNetNeuron;
-  lr, invClamp, logDetW: TNeuralFloat;
+  lr, negLR, invClamp, logDetW: TNeuralFloat;
   isInverse: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -64640,6 +64655,7 @@ begin
   MaxB := FHalfB - 1;
   MaxR2B := 2 * FHalfB - 1;
   lr := FLearningRate;
+  negLR := -lr;                        // #5: formed four times per conditioner row
   if FTransformSecond then begin aOfs := 0; bOfs := FHalfA; end
   else begin aOfs := FHalfB; bOfs := 0; end;
   hasInputGrad := Assigned(FPrevLayer) and
@@ -64677,26 +64693,31 @@ begin
       SPtr := FS.GetRawPtr(x, y);
       TPtr := FT.GetRawPtr(x, y);
       SPrePtr := FSPre.GetRawPtr(x, y);
-      if hasInputGrad then PrevErrPtr := FPrevLayer.FOutputError.GetRawPtr(x, y);
-      // Identity half: gradient passes straight through to x_a (plus the
-      // conditioner contribution accumulated below).
+      PrevErrAPtr := nil;
       if hasInputGrad then
-        TNNetVolume.Add(@PrevErrPtr^[aOfs], @GyPtr^[aOfs], FHalfA);
+      begin
+        PrevErrPtr := FPrevLayer.FOutputError.GetRawPtr(x, y);
+        PrevErrAPtr := @PrevErrPtr^[aOfs];   // #11: invariant across r
+        // Identity half: gradient passes straight through to x_a (plus the
+        // conditioner contribution accumulated below).
+        TNNetVolume.Add(PrevErrAPtr, @GyPtr^[aOfs], FHalfA);
+      end;
       XaPtr := @InPtr^[aOfs];          // conditioning half, invariant across r
       for r := 0 to MaxB do
       begin
         sval := SPtr^[r];
         tval := TPtr^[r];
         spre := SPrePtr^[r];
-        gyb := GyPtr^[bOfs + r];
+        idxB := bOfs + r;              // #4: the transformed half's slot, once
+        gyb := GyPtr^[idxB];
+        xb := InPtr^[idxB];
         if isInverse then
         begin
           // x_b = (y_b - t)*exp(-s); here "input" plays the role of y_b.
           es := NeuralExp(-sval);
-          xb := InPtr^[bOfs + r];
           // d/d(y_b): es ; routes to input b-half.
           if hasInputGrad then
-            PrevErrPtr^[bOfs + r] := PrevErrPtr^[bOfs + r] + gyb * es;
+            PrevErrPtr^[idxB] := PrevErrPtr^[idxB] + gyb * es;
           // d/dt = -es ; d/ds = -(y_b - t)*es = -x_b_out.
           gt := -gyb * es;
           gs := -gyb * (xb - tval) * es;
@@ -64705,9 +64726,8 @@ begin
         begin
           // y_b = x_b*exp(s)+t.
           es := NeuralExp(sval);
-          xb := InPtr^[bOfs + r];
           if hasInputGrad then
-            PrevErrPtr^[bOfs + r] := PrevErrPtr^[bOfs + r] + gyb * es;
+            PrevErrPtr^[idxB] := PrevErrPtr^[idxB] + gyb * es;
           gt := gyb;
           gs := gyb * xb * es;
           // Negative log-det (-sum s) term of the ML loss folds straight into ds.
@@ -64720,16 +64740,18 @@ begin
         // Accumulate conditioner grads and route into x_a (the conditioning half).
         Nr := FSNr[r];
         NrT := FTNr[r];
-        Nr.FBiasDelta := Nr.FBiasDelta + (-lr) * gspre;
-        NrT.FBiasDelta := NrT.FBiasDelta + (-lr) * gt;
+        negLRgspre := negLR * gspre;   // #4: the bias and the weight row share it
+        negLRgt := negLR * gt;
+        Nr.FBiasDelta := Nr.FBiasDelta + negLRgspre;
+        NrT.FBiasDelta := NrT.FBiasDelta + negLRgt;
         // Conditioner weight grads over x_a (contiguous run of FHalfA).
-        TNNetVolume.MulAdd(FSDPtrs[r], XaPtr, (-lr) * gspre, FHalfA);
-        TNNetVolume.MulAdd(FTDPtrs[r], XaPtr, (-lr) * gt, FHalfA);
+        TNNetVolume.MulAdd(FSDPtrs[r], XaPtr, negLRgspre, FHalfA);
+        TNNetVolume.MulAdd(FTDPtrs[r], XaPtr, negLRgt, FHalfA);
         // Conditioner depends on x_a -> route gspre and gt back into x_a.
         if hasInputGrad then
         begin
-          TNNetVolume.MulAdd(@PrevErrPtr^[aOfs], FSWPtrs[r], gspre, FHalfA);
-          TNNetVolume.MulAdd(@PrevErrPtr^[aOfs], FTWPtrs[r], gt, FHalfA);
+          TNNetVolume.MulAdd(PrevErrAPtr, FSWPtrs[r], gspre, FHalfA);
+          TNNetVolume.MulAdd(PrevErrAPtr, FTWPtrs[r], gt, FHalfA);
         end;
       end;
     end;
@@ -64891,7 +64913,10 @@ begin
   SPtr := FNeurons[1].FWeights.GetRawPtr(0, 0);
   sumLogS := 0;
   for i := 0 to MaxFC do sumLogS := sumLogS + pcr_logf(Abs(SPtr^[i]) + 1e-12);
-  FLogDet := 0;
+  // Every pixel contributes the same sum(log|s|), and the inverse direction
+  // contributes none, so the whole log-determinant is one product (#5).
+  if FInverse then FLogDet := 0
+  else FLogDet := sumLogS * SizeX * SizeY;
   SizeXM1 := SizeX - 1;
   SizeYM1 := SizeY - 1;
   for y := 0 to SizeYM1 do
@@ -64926,7 +64951,6 @@ begin
         end;
         // y = P * t2 : output row FPerm[i] gets t2[i].
         for i := 0 to MaxFC do OutPtr^[FPerm[i]] := T2Ptr^[i];
-        FLogDet := FLogDet + sumLogS;
       end
       else
       begin
