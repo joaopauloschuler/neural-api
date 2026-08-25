@@ -15238,6 +15238,7 @@ type
     // Per-instance lifting scratch (sized FHalf in SetPrevLayer; ComputeCPU and
     // BackpropagateCPU never share the stack, so each gets distinct fields).
     FsBuf, FdBuf: array of Double;                 // ComputeCPU split bands
+    FIlsBuf, FIldBuf: array of Double;             // InverseChannel working bands
     FgsBuf, FgdBuf, FsFBuf, FdFBuf, FoddInBuf: array of Double; // BackpropagateCPU
     FhistSBuf, FhistDBuf: array of array of Double; // [step][FHalf] pre-step forward state
     procedure BuildFilter();
@@ -84927,6 +84928,8 @@ destructor TNNetDWT1D.Destroy();
 begin
   SetLength(FsBuf, 0);
   SetLength(FdBuf, 0);
+  SetLength(FIlsBuf, 0);
+  SetLength(FIldBuf, 0);
   FreeBackpropScratch();
   inherited Destroy();
 end;
@@ -85029,9 +85032,9 @@ end;
 // each length FHalf. Walks the step list in order.
 procedure TNNetDWT1D.ForwardLift(var s, d: array of Double);
 var
-  st, t, i, jj: integer;
+  st, t, i, jj, off: integer;
   StepKindMax, HalfM1, TapMaxSt, tapBase: integer;
-  tap, acc: Double;
+  tap: Double;
   offRow: {$IFDEF FPC}array of integer{$ELSE} TNeuralIntegerArray {$ENDIF};
 begin
   StepKindMax := Length(FStepKind) - 1;
@@ -85040,39 +85043,40 @@ begin
   begin
     TapMaxSt := FStepTapCnt[st] - 1;
     // Bind the step's flat tap base and neighbour-offset row (reference, no copy)
-    // once per step so the i/t nest stops re-indexing the outer step arrays.
+    // once per step so the t/i nest stops re-indexing the outer step arrays.
     tapBase := FStepTapOfs[st];
     offRow := FStepOffs[st];
+    // App. E: a predict step reads only s and writes only d (an update step, the
+    // other way round), so the tap loop moves outside the sample loop. The tap
+    // value and its offset are then fetched once per tap instead of once per
+    // (tap, sample), and the reflection collapses to a range test that fails
+    // only at the two edges.
     if FStepKind[st] = 0 then
-    begin
       // predict: d[i] -= sum_t tap[t] * s[i + off[t]]
-      for i := 0 to HalfM1 do
+      for t := 0 to TapMaxSt do
       begin
-        acc := 0;
-        for t := 0 to TapMaxSt do
+        tap := GetTap(tapBase + t);
+        off := offRow[t];
+        for i := 0 to HalfM1 do
         begin
-          tap := GetTap(tapBase + t);
-          jj := DWT1DReflect(i + offRow[t], FHalf);
-          acc := acc + tap * s[jj];
+          jj := i + off;
+          if (jj < 0) or (jj > HalfM1) then jj := DWT1DReflect(jj, FHalf);
+          d[i] := d[i] - tap * s[jj];
         end;
-        d[i] := d[i] - acc;
-      end;
-    end
+      end
     else
-    begin
       // update: s[i] += sum_t tap[t] * d[i + off[t]]
-      for i := 0 to HalfM1 do
+      for t := 0 to TapMaxSt do
       begin
-        acc := 0;
-        for t := 0 to TapMaxSt do
+        tap := GetTap(tapBase + t);
+        off := offRow[t];
+        for i := 0 to HalfM1 do
         begin
-          tap := GetTap(tapBase + t);
-          jj := DWT1DReflect(i + offRow[t], FHalf);
-          acc := acc + tap * d[jj];
+          jj := i + off;
+          if (jj < 0) or (jj > HalfM1) then jj := DWT1DReflect(jj, FHalf);
+          s[i] := s[i] + tap * d[jj];
         end;
-        s[i] := s[i] + acc;
       end;
-    end;
   end;
   // final band scaling
   for i := 0 to HalfM1 do
@@ -85087,59 +85091,67 @@ end;
 // predict/update sign flipped. Invertibility holds for ANY tap values.
 procedure TNNetDWT1D.InverseChannel(const s, d: array of Double; var x: array of Double);
 var
-  st, t, i, jj: integer;
-  HalfM1, TapMaxSt, StepKindM1: integer;
-  tap, acc: Double;
-  ls, ld: array of Double;
+  st, t, i, jj, off, pos: integer;
+  HalfM1, TapMaxSt, StepKindM1, tapBase: integer;
+  tap: Double;
+  offRow: {$IFDEF FPC}array of integer{$ELSE} TNeuralIntegerArray {$ENDIF};
 begin
-  SetLength(ls, FHalf);
-  SetLength(ld, FHalf);
+  // Persistent working bands, grown once per shape (#17): this helper is public
+  // and may be driven channel by channel over a whole sequence.
+  if Length(FIlsBuf) <> FHalf then
+  begin
+    SetLength(FIlsBuf, FHalf);
+    SetLength(FIldBuf, FHalf);
+  end;
   HalfM1 := FHalf - 1;
   for i := 0 to HalfM1 do
   begin
-    ls[i] := s[i] / FScaleS;
-    ld[i] := d[i] / FScaleD;
+    FIlsBuf[i] := s[i] / FScaleS;
+    FIldBuf[i] := d[i] / FScaleD;
   end;
   StepKindM1 := Length(FStepKind) - 1;
   for st := StepKindM1 downto 0 do
   begin
     TapMaxSt := FStepTapCnt[st] - 1;
+    tapBase := FStepTapOfs[st];
+    offRow := FStepOffs[st];
+    // App. E, as in ForwardLift: each step reads one band and writes the other,
+    // so the tap loop moves outside and the tap/offset lookups leave the sample
+    // loop.
     if FStepKind[st] = 0 then
-    begin
       // inverse of predict: d[i] += sum_t tap[t] * s[i + off[t]]
-      for i := 0 to HalfM1 do
+      for t := 0 to TapMaxSt do
       begin
-        acc := 0;
-        for t := 0 to TapMaxSt do
+        tap := GetTap(tapBase + t);
+        off := offRow[t];
+        for i := 0 to HalfM1 do
         begin
-          tap := GetTap(FStepTapOfs[st] + t);
-          jj := DWT1DReflect(i + FStepOffs[st][t], FHalf);
-          acc := acc + tap * ls[jj];
+          jj := i + off;
+          if (jj < 0) or (jj > HalfM1) then jj := DWT1DReflect(jj, FHalf);
+          FIldBuf[i] := FIldBuf[i] + tap * FIlsBuf[jj];
         end;
-        ld[i] := ld[i] + acc;
-      end;
-    end
+      end
     else
-    begin
       // inverse of update: s[i] -= sum_t tap[t] * d[i + off[t]]
-      for i := 0 to HalfM1 do
+      for t := 0 to TapMaxSt do
       begin
-        acc := 0;
-        for t := 0 to TapMaxSt do
+        tap := GetTap(tapBase + t);
+        off := offRow[t];
+        for i := 0 to HalfM1 do
         begin
-          tap := GetTap(FStepTapOfs[st] + t);
-          jj := DWT1DReflect(i + FStepOffs[st][t], FHalf);
-          acc := acc + tap * ld[jj];
+          jj := i + off;
+          if (jj < 0) or (jj > HalfM1) then jj := DWT1DReflect(jj, FHalf);
+          FIlsBuf[i] := FIlsBuf[i] - tap * FIldBuf[jj];
         end;
-        ls[i] := ls[i] - acc;
       end;
-    end;
   end;
   // merge even/odd back into x (length FExtLen)
+  pos := 0;                               // #12: carries 2*i
   for i := 0 to HalfM1 do
   begin
-    x[2 * i] := ls[i];
-    x[2 * i + 1] := ld[i];
+    x[pos] := FIlsBuf[i];
+    x[pos + 1] := FIldBuf[i];
+    Inc(pos, 2);
   end;
 end;
 
@@ -85298,10 +85310,13 @@ end;
 // scaling and each step (predict/update transpose scatters), then dL/d(taps).
 procedure TNNetDWT1D.BackpropagateCPU();
 var
-  c, i, st, t, jj: integer;
-  DepthM1, HalfM1, StepKindMax, TapMaxSt: integer;
+  c, i, st, t, jj, off, pos: integer;
+  DepthM1, HalfM1, StepKindMax, TapMaxSt, tapBase: integer;
+  TwoDepth, PadIdx, HalfBytes: integer;
   PrevOut, LocalPrevError, W, WDelta: TNNetVolume;
-  tap, g, contrib: Double;
+  tap, g, dsum: Double;
+  histRow: array of Double;
+  offRow: {$IFDEF FPC}array of integer{$ELSE} TNeuralIntegerArray {$ENDIF};
   haveTapGrad, havePrev: boolean;
 begin
   PrevOut := FPrevLayer.FOutput;
@@ -85313,103 +85328,120 @@ begin
   DepthM1 := FDepth - 1;
   HalfM1 := FHalf - 1;
   StepKindMax := Length(FStepKind) - 1;
+  TwoDepth := 2 * FDepth;                 // #5: stride between token pairs
+  PadIdx := (FSeqLen - 2) * FDepth;       // #5: odd-length padding row base
+  HalfBytes := FHalf * csDoubleSize;      // #5: one band in bytes
 
   for c := 0 to DepthM1 do
   begin
     // --- recompute forward, caching pre-step state for weight gradients ---
+    pos := 0;                             // #12: carries (2*i)*FDepth
     for i := 0 to HalfM1 do
     begin
-      FsFBuf[i] := PrevOut.FData[(2 * i) * FDepth + c];
+      FsFBuf[i] := PrevOut.FData[pos + c];
       if 2 * i + 1 < FSeqLen then
-        FoddInBuf[i] := PrevOut.FData[(2 * i + 1) * FDepth + c]
+        FoddInBuf[i] := PrevOut.FData[pos + FDepth + c]
       else
-        FoddInBuf[i] := PrevOut.FData[(FSeqLen - 2) * FDepth + c];
+        FoddInBuf[i] := PrevOut.FData[PadIdx + c];
       FdFBuf[i] := FoddInBuf[i];
+      Inc(pos, TwoDepth);
     end;
     for st := 0 to StepKindMax do
     begin
       TapMaxSt := FStepTapCnt[st] - 1;
-      Move(FsFBuf[0], FhistSBuf[st][0], FHalf * SizeOf(Double)); // #13 (Double buffers)
-      Move(FdFBuf[0], FhistDBuf[st][0], FHalf * SizeOf(Double));
+      tapBase := FStepTapOfs[st];
+      offRow := FStepOffs[st];
+      Move(FsFBuf[0], FhistSBuf[st][0], HalfBytes); // #13 (Double buffers)
+      Move(FdFBuf[0], FhistDBuf[st][0], HalfBytes);
+      // App. E, as in ForwardLift: each step reads one band and writes the
+      // other, so the tap loop moves outside the sample loop.
       if FStepKind[st] = 0 then
-        for i := 0 to HalfM1 do
+        for t := 0 to TapMaxSt do
         begin
-          contrib := 0;
-          for t := 0 to TapMaxSt do
+          tap := GetTap(tapBase + t);
+          off := offRow[t];
+          for i := 0 to HalfM1 do
           begin
-            tap := GetTap(FStepTapOfs[st] + t);
-            jj := DWT1DReflect(i + FStepOffs[st][t], FHalf);
-            contrib := contrib + tap * FsFBuf[jj];
+            jj := i + off;
+            if (jj < 0) or (jj > HalfM1) then jj := DWT1DReflect(jj, FHalf);
+            FdFBuf[i] := FdFBuf[i] - tap * FsFBuf[jj];
           end;
-          FdFBuf[i] := FdFBuf[i] - contrib;
         end
       else
-        for i := 0 to HalfM1 do
+        for t := 0 to TapMaxSt do
         begin
-          contrib := 0;
-          for t := 0 to TapMaxSt do
+          tap := GetTap(tapBase + t);
+          off := offRow[t];
+          for i := 0 to HalfM1 do
           begin
-            tap := GetTap(FStepTapOfs[st] + t);
-            jj := DWT1DReflect(i + FStepOffs[st][t], FHalf);
-            contrib := contrib + tap * FdFBuf[jj];
+            jj := i + off;
+            if (jj < 0) or (jj > HalfM1) then jj := DWT1DReflect(jj, FHalf);
+            FsFBuf[i] := FsFBuf[i] + tap * FdFBuf[jj];
           end;
-          FsFBuf[i] := FsFBuf[i] + contrib;
         end;
     end;
 
-    // --- seed gradient from output error (approx then detail bands) ---
+    // --- seed gradient from output error, adjoint of the final scaling ---
+    pos := 0;                             // #12: carries i*(2*FDepth)
     for i := 0 to HalfM1 do
     begin
-      FgsBuf[i] := FOutputError.FData[i * (2 * FDepth) + c];
-      FgdBuf[i] := FOutputError.FData[i * (2 * FDepth) + FDepth + c];
-    end;
-    // adjoint of final scaling
-    for i := 0 to HalfM1 do
-    begin
-      FgsBuf[i] := FgsBuf[i] * FScaleS;
-      FgdBuf[i] := FgdBuf[i] * FScaleD;
+      FgsBuf[i] := FOutputError.FData[pos + c] * FScaleS;
+      FgdBuf[i] := FOutputError.FData[pos + FDepth + c] * FScaleD;
+      Inc(pos, TwoDepth);
     end;
 
     // --- walk steps in reverse, transposing each ---
     for st := StepKindMax downto 0 do
     begin
       TapMaxSt := FStepTapCnt[st] - 1;
+      tapBase := FStepTapOfs[st];
+      offRow := FStepOffs[st];
       if FStepKind[st] = 0 then
       begin
         // forward: d[i] -= sum_t tap*s[refl(i+off)]
         // wrt taps: dL/dtap += sum_i gd[i]*(-s_pre[refl(i+off)])
         // wrt s   : gs[refl(i+off)] += gd[i]*(-tap)   (gd unchanged for d row)
-        for i := 0 to HalfM1 do
+        // The transpose reads gd and writes gs, so the tap loop moves outside
+        // and one tap's whole weight gradient accumulates in a register.
+        histRow := FhistSBuf[st];
+        for t := 0 to TapMaxSt do
         begin
-          g := FgdBuf[i];
-          for t := 0 to TapMaxSt do
+          tap := GetTap(tapBase + t);
+          off := offRow[t];
+          dsum := 0;
+          for i := 0 to HalfM1 do
           begin
-            tap := GetTap(FStepTapOfs[st] + t);
-            jj := DWT1DReflect(i + FStepOffs[st][t], FHalf);
+            jj := i + off;
+            if (jj < 0) or (jj > HalfM1) then jj := DWT1DReflect(jj, FHalf);
+            g := FgdBuf[i];
             FgsBuf[jj] := FgsBuf[jj] - g * tap;
-            if haveTapGrad then
-              WDelta.FData[FStepTapOfs[st] + t] :=
-                WDelta.FData[FStepTapOfs[st] + t] +
-                (-FLearningRate) * (-g * FhistSBuf[st][jj]);
+            dsum := dsum + g * histRow[jj];
           end;
+          if haveTapGrad then
+            WDelta.FData[tapBase + t] :=
+              WDelta.FData[tapBase + t] + FLearningRate * dsum;
         end;
       end
       else
       begin
         // forward: s[i] += sum_t tap*d[refl(i+off)]
-        for i := 0 to HalfM1 do
+        histRow := FhistDBuf[st];
+        for t := 0 to TapMaxSt do
         begin
-          g := FgsBuf[i];
-          for t := 0 to TapMaxSt do
+          tap := GetTap(tapBase + t);
+          off := offRow[t];
+          dsum := 0;
+          for i := 0 to HalfM1 do
           begin
-            tap := GetTap(FStepTapOfs[st] + t);
-            jj := DWT1DReflect(i + FStepOffs[st][t], FHalf);
+            jj := i + off;
+            if (jj < 0) or (jj > HalfM1) then jj := DWT1DReflect(jj, FHalf);
+            g := FgsBuf[i];
             FgdBuf[jj] := FgdBuf[jj] + g * tap;
-            if haveTapGrad then
-              WDelta.FData[FStepTapOfs[st] + t] :=
-                WDelta.FData[FStepTapOfs[st] + t] +
-                (-FLearningRate) * (g * FhistDBuf[st][jj]);
+            dsum := dsum + g * histRow[jj];
           end;
+          if haveTapGrad then
+            WDelta.FData[tapBase + t] :=
+              WDelta.FData[tapBase + t] - FLearningRate * dsum;
         end;
       end;
     end;
@@ -85417,17 +85449,19 @@ begin
     // --- scatter gs (even), gd (odd) back to the input error ---
     if havePrev then
     begin
+      pos := 0;                           // #12: carries (2*i)*FDepth
       for i := 0 to HalfM1 do
       begin
-        LocalPrevError.FData[(2 * i) * FDepth + c] :=
-          LocalPrevError.FData[(2 * i) * FDepth + c] + FgsBuf[i];
+        LocalPrevError.FData[pos + c] :=
+          LocalPrevError.FData[pos + c] + FgsBuf[i];
         if 2 * i + 1 < FSeqLen then
-          LocalPrevError.FData[(2 * i + 1) * FDepth + c] :=
-            LocalPrevError.FData[(2 * i + 1) * FDepth + c] + FgdBuf[i]
+          LocalPrevError.FData[pos + FDepth + c] :=
+            LocalPrevError.FData[pos + FDepth + c] + FgdBuf[i]
         else
           // odd padding folded back onto x[FSeqLen-2]
-          LocalPrevError.FData[(FSeqLen - 2) * FDepth + c] :=
-            LocalPrevError.FData[(FSeqLen - 2) * FDepth + c] + FgdBuf[i];
+          LocalPrevError.FData[PadIdx + c] :=
+            LocalPrevError.FData[PadIdx + c] + FgdBuf[i];
+        Inc(pos, TwoDepth);
       end;
     end;
   end;
