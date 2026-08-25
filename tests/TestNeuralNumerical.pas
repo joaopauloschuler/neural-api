@@ -99,6 +99,11 @@ type
     procedure TestPadReflectGradientCheck;
     procedure TestPadXYPadModeLoadFromString;
 
+    // Spatial/channel rearrangement layers: the routing must be the exact
+    // adjoint of the forward permutation.
+    procedure TestMobileViTUnfoldGradientCheck;
+    procedure TestMobileViTFoldGradientCheck;
+
     // Single-channel gather layer (TNNetGather)
     procedure TestGatherForward;
     procedure TestGatherGradientCheck;
@@ -9812,7 +9817,9 @@ end;
 // loosened to the point of being meaningless, so this uses a combined
 // relative+absolute bound which still pins a mis-routed scatter (those land on
 // the WRONG cell and differ by O(magnitude), not O(0.5%)).
-procedure PadLayerInputGradientCheck(ATestCase: TTestCase; ALayer: TNNetLayer;
+// Central-difference check of the input gradient of ONE layer placed after a
+// TNNetInput of the given shape. Takes ownership of ALayer.
+procedure SingleLayerInputGradientCheck(ATestCase: TTestCase; ALayer: TNNetLayer;
   const AName: string; ASizeX, ASizeY, ASizeD: integer);
 var
   NN: TNNet;
@@ -9987,27 +9994,42 @@ begin
   // cells scatter onto the same interior cell, so the accumulated gradient (and
   // hence the FP32 central-difference truncation error) is a few times larger
   // than for an identity layer, so this uses the relative-tolerance helper.
-  PadLayerInputGradientCheck(Self, TNNetPadXY.Create(2, 1, pmReflect),
+  SingleLayerInputGradientCheck(Self, TNNetPadXY.Create(2, 1, pmReflect),
     'PadXY reflect', 4, 3, 2);
 end;
 
 procedure TTestNeuralNumerical.TestPadXYReplicateGradientCheck;
 begin
-  PadLayerInputGradientCheck(Self, TNNetPadXY.Create(2, 1, pmReplicate),
+  SingleLayerInputGradientCheck(Self, TNNetPadXY.Create(2, 1, pmReplicate),
     'PadXY replicate', 4, 3, 2);
 end;
 
 procedure TTestNeuralNumerical.TestPadXYCircularGradientCheck;
 begin
-  PadLayerInputGradientCheck(Self, TNNetPadXY.Create(2, 1, pmCircular),
+  SingleLayerInputGradientCheck(Self, TNNetPadXY.Create(2, 1, pmCircular),
     'PadXY circular', 4, 3, 2);
 end;
 
 procedure TTestNeuralNumerical.TestPadReflectGradientCheck;
 begin
   // Same scatter-adjoint check for the square-padding sibling TNNetPad.
-  PadLayerInputGradientCheck(Self, TNNetPad.Create(2, pmReflect),
+  SingleLayerInputGradientCheck(Self, TNNetPad.Create(2, pmReflect),
     'Pad reflect', 4, 4, 2);
+end;
+
+procedure TTestNeuralNumerical.TestMobileViTUnfoldGradientCheck;
+begin
+  // 2x2 patches over a 4x4 grid: every grid cell lands in exactly one patch
+  // slot, so the backward routing is a pure permutation adjoint.
+  SingleLayerInputGradientCheck(Self, TNNetMobileViTUnfold.Create(2),
+    'MobileViT unfold', 4, 4, 2);
+end;
+
+procedure TTestNeuralNumerical.TestMobileViTFoldGradientCheck;
+begin
+  // Inverse of the unfold above: 4 patches of 4 slots feed a 4x4 grid.
+  SingleLayerInputGradientCheck(Self, TNNetMobileViTFold.Create(2, 4, 4),
+    'MobileViT fold', 16, 1, 2);
 end;
 
 procedure TTestNeuralNumerical.TestPadXYPadModeLoadFromString;

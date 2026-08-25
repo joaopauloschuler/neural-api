@@ -50736,45 +50736,61 @@ end;
 
 procedure TNNetMobileViTUnfold.Compute();
 var
-  P, C, NPW, NumPatches: integer;
-  X, Y, IC, PW, DX, PH, DY, Pidx, A, S: integer;
-  MaxX, MaxY, MaxC: integer;
-  basePrev0, baseOut0: integer;
+  P, C, NPW, NPH, NumPatches, PM1, NPWM1, NPHM1: integer;
+  IC: integer;
+  PW, DX, PH, DY: integer;
+  MaxC, CBytes, NumPatchesC: integer;
+  PatchRowBase, GridRowBase, PatchPos, GridPos: integer;
+  LocalPrevOutput: TNNetVolume;
   StartTime: double;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  LocalPrevOutput := FPrevLayer.FOutput;
   P := FStruct[0];
-  C := FPrevLayer.Output.Depth;
-  NPW := FPrevLayer.Output.SizeX div P;
-  NumPatches := NPW * (FPrevLayer.Output.SizeY div P);
-  MaxX := FPrevLayer.Output.SizeX - 1;
-  MaxY := FPrevLayer.Output.SizeY - 1;
+  C := LocalPrevOutput.Depth;
+  NPW := LocalPrevOutput.SizeX div P;
+  NPH := LocalPrevOutput.SizeY div P;
+  NumPatches := NPW * NPH;
+  PM1 := P - 1;
+  NPHM1 := NPH - 1;
+  NPWM1 := NPW - 1;
   MaxC := C - 1;
-  for X := 0 to MaxX do
-  begin
-    PW := X div P; DX := X mod P;
-    for Y := 0 to MaxY do
+  CBytes := C * csNeuralFloatSize;
+  NumPatchesC := NumPatches * C;
+  // Walking the patch grid (PH, PW) and the offset inside a patch (DY, DX)
+  // directly gives the source row and both destination strides without the
+  // div/mod pair the (X, Y) form needed: the patch slot
+  // S = (DY*P + DX)*NumPatches + PH*NPW + PW advances by NumPatches per DX and
+  // by one per PW, while the grid side runs along the row (#6/#12).
+  for PH := 0 to NPHM1 do
+    for DY := 0 to PM1 do
     begin
-      PH := Y div P; DY := Y mod P;
-      Pidx := PH * NPW + PW;
-      A := DY * P + DX;
-      S := A * NumPatches + Pidx;
-      baseOut0  := FOutput.GetRawPos(S, 0);
-      basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
-      Move(FPrevLayer.FOutput.FData[basePrev0], FOutput.FData[baseOut0],
-        (MaxC + 1) * csNeuralFloatSize);
+      GridRowBase := LocalPrevOutput.GetRawPos(0, PH * P + DY);
+      PatchRowBase := (DY * P * NumPatches + PH * NPW) * C;
+      GridPos := GridRowBase;
+      for PW := 0 to NPWM1 do
+      begin
+        PatchPos := PatchRowBase;
+        for DX := 0 to PM1 do
+        begin
+          Move(LocalPrevOutput.FData[GridPos], FOutput.FData[PatchPos], CBytes);
+          Inc(GridPos, C);
+          Inc(PatchPos, NumPatchesC);
+        end;
+        Inc(PatchRowBase, C);
+      end;
     end;
-  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetMobileViTUnfold.Backpropagate();
 var
-  P, C, NPW, NumPatches: integer;
-  X, Y, IC, PW, DX, PH, DY, Pidx, A, S: integer;
-  MaxX, MaxY, MaxC: integer;
-  basePrevErr0, baseOutErr0: integer;
+  P, C, NPW, NPH, NumPatches, PM1, NPWM1, NPHM1: integer;
+  IC: integer;
+  PW, DX, PH, DY: integer;
+  MaxC, CBytes, NumPatchesC: integer;
+  PatchRowBase, GridRowBase, PatchPos, GridPos: integer;
   PrevErr: TNNetVolume;
   StartTime, LocalNow: double;
 begin
@@ -50785,29 +50801,38 @@ begin
   if (FPrevLayer.FOutputError.Size > 0) and
      (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) then
   begin
+    PrevErr := FPrevLayer.FOutputError;
     P := FStruct[0];
-    C := FPrevLayer.Output.Depth;
-    NPW := FPrevLayer.Output.SizeX div P;
-    NumPatches := NPW * (FPrevLayer.Output.SizeY div P);
-    MaxX := FPrevLayer.Output.SizeX - 1;
-    MaxY := FPrevLayer.Output.SizeY - 1;
+    C := PrevErr.Depth;
+    NPW := PrevErr.SizeX div P;
+    NPH := PrevErr.SizeY div P;
+    NumPatches := NPW * NPH;
+    PM1 := P - 1;
+    NPHM1 := NPH - 1;
+    NPWM1 := NPW - 1;
     MaxC := C - 1;
-    PrevErr := FPrevLayer.OutputError;
-    for X := 0 to MaxX do
-    begin
-      PW := X div P; DX := X mod P;
-      for Y := 0 to MaxY do
+    CBytes := C * csNeuralFloatSize;
+    NumPatchesC := NumPatches * C;
+    // Same patch-grid walk as Compute, accumulating into the grid side.
+    for PH := 0 to NPHM1 do
+      for DY := 0 to PM1 do
       begin
-        PH := Y div P; DY := Y mod P;
-        Pidx := PH * NPW + PW;
-        A := DY * P + DX;
-        S := A * NumPatches + Pidx;
-        basePrevErr0 := PrevErr.GetRawPos(X, Y);
-        baseOutErr0  := FOutputError.GetRawPos(S, 0);
-        TNNetVolume.Add(PrevErr.GetRawPtr(basePrevErr0),
-          FOutputError.GetRawPtr(baseOutErr0), MaxC + 1);
+        GridRowBase := PrevErr.GetRawPos(0, PH * P + DY);
+        PatchRowBase := (DY * P * NumPatches + PH * NPW) * C;
+        GridPos := GridRowBase;
+        for PW := 0 to NPWM1 do
+        begin
+          PatchPos := PatchRowBase;
+          for DX := 0 to PM1 do
+          begin
+            TNNetVolume.Add(PrevErr.GetRawPtr(GridPos),
+              FOutputError.GetRawPtr(PatchPos), C);
+            Inc(GridPos, C);
+            Inc(PatchPos, NumPatchesC);
+          end;
+          Inc(PatchRowBase, C);
+        end;
       end;
-    end;
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -50855,45 +50880,59 @@ end;
 
 procedure TNNetMobileViTFold.Compute();
 var
-  P, C, NPW, NumPatches: integer;
-  X, Y, IC, PW, DX, PH, DY, Pidx, A, S: integer;
-  MaxX, MaxY, MaxC: integer;
-  basePrev0, baseOut0: integer;
+  P, C, NPW, NPH, NumPatches, PM1, NPWM1, NPHM1: integer;
+  IC: integer;
+  PW, DX, PH, DY: integer;
+  MaxC, CBytes, NumPatchesC: integer;
+  PatchRowBase, GridRowBase, PatchPos, GridPos: integer;
+  LocalPrevOutput: TNNetVolume;
   StartTime: double;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  LocalPrevOutput := FPrevLayer.FOutput;
   P := FStruct[0];
   C := FOutput.Depth;
   NPW := FOutput.SizeX div P;
-  NumPatches := NPW * (FOutput.SizeY div P);
-  MaxX := FOutput.SizeX - 1;
-  MaxY := FOutput.SizeY - 1;
+  NPH := FOutput.SizeY div P;
+  NumPatches := NPW * NPH;
+  PM1 := P - 1;
+  NPHM1 := NPH - 1;
+  NPWM1 := NPW - 1;
   MaxC := C - 1;
-  for X := 0 to MaxX do
-  begin
-    PW := X div P; DX := X mod P;
-    for Y := 0 to MaxY do
+  CBytes := C * csNeuralFloatSize;
+  NumPatchesC := NumPatches * C;
+  // Inverse of TNNetMobileViTUnfold.Compute, walked the same way: the patch
+  // grid and the in-patch offset replace the per-cell div/mod, and both sides'
+  // offsets are carried (#6/#12).
+  for PH := 0 to NPHM1 do
+    for DY := 0 to PM1 do
     begin
-      PH := Y div P; DY := Y mod P;
-      Pidx := PH * NPW + PW;
-      A := DY * P + DX;
-      S := A * NumPatches + Pidx;
-      baseOut0  := FOutput.GetRawPos(X, Y);
-      basePrev0 := FPrevLayer.FOutput.GetRawPos(S, 0);
-      Move(FPrevLayer.FOutput.FData[basePrev0], FOutput.FData[baseOut0],
-        (MaxC + 1) * csNeuralFloatSize);
+      GridRowBase := FOutput.GetRawPos(0, PH * P + DY);
+      PatchRowBase := (DY * P * NumPatches + PH * NPW) * C;
+      GridPos := GridRowBase;
+      for PW := 0 to NPWM1 do
+      begin
+        PatchPos := PatchRowBase;
+        for DX := 0 to PM1 do
+        begin
+          Move(LocalPrevOutput.FData[PatchPos], FOutput.FData[GridPos], CBytes);
+          Inc(GridPos, C);
+          Inc(PatchPos, NumPatchesC);
+        end;
+        Inc(PatchRowBase, C);
+      end;
     end;
-  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetMobileViTFold.Backpropagate();
 var
-  P, C, NPW, NumPatches: integer;
-  X, Y, IC, PW, DX, PH, DY, Pidx, A, S: integer;
-  MaxX, MaxY, MaxC: integer;
-  basePrevErr0, baseOutErr0: integer;
+  P, C, NPW, NPH, NumPatches, PM1, NPWM1, NPHM1: integer;
+  IC: integer;
+  PW, DX, PH, DY: integer;
+  MaxC, CBytes, NumPatchesC: integer;
+  PatchRowBase, GridRowBase, PatchPos, GridPos: integer;
   PrevErr: TNNetVolume;
   StartTime, LocalNow: double;
 begin
@@ -50904,29 +50943,38 @@ begin
   if (FPrevLayer.FOutputError.Size > 0) and
      (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) then
   begin
+    PrevErr := FPrevLayer.FOutputError;
     P := FStruct[0];
     C := FOutput.Depth;
     NPW := FOutput.SizeX div P;
-    NumPatches := NPW * (FOutput.SizeY div P);
-    MaxX := FOutput.SizeX - 1;
-    MaxY := FOutput.SizeY - 1;
+    NPH := FOutput.SizeY div P;
+    NumPatches := NPW * NPH;
+    PM1 := P - 1;
+    NPHM1 := NPH - 1;
+    NPWM1 := NPW - 1;
     MaxC := C - 1;
-    PrevErr := FPrevLayer.OutputError;
-    for X := 0 to MaxX do
-    begin
-      PW := X div P; DX := X mod P;
-      for Y := 0 to MaxY do
+    CBytes := C * csNeuralFloatSize;
+    NumPatchesC := NumPatches * C;
+    // Same patch-grid walk as Compute, accumulating into the patch side.
+    for PH := 0 to NPHM1 do
+      for DY := 0 to PM1 do
       begin
-        PH := Y div P; DY := Y mod P;
-        Pidx := PH * NPW + PW;
-        A := DY * P + DX;
-        S := A * NumPatches + Pidx;
-        basePrevErr0 := PrevErr.GetRawPos(S, 0);
-        baseOutErr0  := FOutputError.GetRawPos(X, Y);
-        TNNetVolume.Add(PrevErr.GetRawPtr(basePrevErr0),
-          FOutputError.GetRawPtr(baseOutErr0), MaxC + 1);
+        GridRowBase := FOutputError.GetRawPos(0, PH * P + DY);
+        PatchRowBase := (DY * P * NumPatches + PH * NPW) * C;
+        GridPos := GridRowBase;
+        for PW := 0 to NPWM1 do
+        begin
+          PatchPos := PatchRowBase;
+          for DX := 0 to PM1 do
+          begin
+            TNNetVolume.Add(PrevErr.GetRawPtr(PatchPos),
+              FOutputError.GetRawPtr(GridPos), C);
+            Inc(GridPos, C);
+            Inc(PatchPos, NumPatchesC);
+          end;
+          Inc(PatchRowBase, C);
+        end;
       end;
-    end;
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
