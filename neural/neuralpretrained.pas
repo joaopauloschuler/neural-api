@@ -55854,6 +55854,8 @@ procedure LoadClipPatchConv(Reader: TNNetSafeTensorsReader;
 var
   W: TNNetVolume;
   o, c, ky, kx, HiddenM1, PatchM1, NumChannelsM1: integer;
+  kBase, srcIdx, PatchSq: integer;
+  WVol: TNNetVolume;
 begin
   if not Reader.HasTensor(WName) then
     ImportError('CLIP import: missing tensor "' + WName + '".');
@@ -55880,14 +55882,22 @@ begin
   NumChannelsM1 := NumChannels - 1;
   try
     Reader.LoadTensorFlat(WName, W);
+    PatchSq := Patch * Patch;
     for o := 0 to HiddenM1 do
     begin
+      WVol := Layer.FArrNeurons[o].Weights;
       for ky := 0 to PatchM1 do
         for kx := 0 to PatchM1 do
+        begin
+          kBase := (ky * Patch + kx) * NumChannels;
+          // The source walks c with a fixed Patch*Patch stride.
+          srcIdx := (o * NumChannels * Patch + ky) * Patch + kx;
           for c := 0 to NumChannelsM1 do
-            Layer.FArrNeurons[o].Weights.FData[
-              (ky * Patch + kx) * NumChannels + c] :=
-              W.FData[((o * NumChannels + c) * Patch + ky) * Patch + kx];
+          begin
+            WVol.FData[kBase + c] := W.FData[srcIdx];
+            Inc(srcIdx, PatchSq);
+          end;
+        end;
       Layer.FArrNeurons[o].BiasWeight := 0; // bias=False in CLIP's patch conv
     end;
   finally
@@ -57715,8 +57725,8 @@ var
   DecTokenInput, EncStates, DecEmbed, DecPos, DecEmbLN, LMHead: TNNetLayer;
   Consumed: TStringList;
   Tmp: TNNetVolume;
-  SeqLen, NumTokens, Grid, i, j, PosCnt, ElementCnt: integer;
-  VocabSizeM1, DModelM1, SeqLenM1: integer;
+  SeqLen, NumTokens, Grid, i, j: integer;
+  VocabSizeM1: integer;
   EmbedScale: TNeuralFloat;
   TensorNameStr: string;
   BartShim: TBartConfig;
@@ -57797,7 +57807,6 @@ begin
         // Tied head: logits = h . embed_tokens^T, NO final_logits_bias.
         EnsureWritableImportWeights(LMHead);
         VocabSizeM1 := Config.VocabSize - 1;
-        DModelM1 := Config.DModel - 1;
         for j := 0 to VocabSizeM1 do
         begin
           Move(Tmp.FData[j * Config.DModel],
@@ -57822,12 +57831,11 @@ begin
           ImportError('TrOCR import: embed_positions must have ' +
             IntToStr((Config.MaxPositions + TrOCRPosOffset) * Config.DModel) +
             ' elements, got ' + IntToStr(Tmp.Size) + '.');
-        SeqLenM1 := SeqLen - 1;
-        for PosCnt := 0 to SeqLenM1 do
-          for ElementCnt := 0 to DModelM1 do
-            DecPos.FArrNeurons[0].Weights.FData[PosCnt * Config.DModel +
-              ElementCnt] := Tmp.FData[(PosCnt + TrOCRPosOffset) *
-                Config.DModel + ElementCnt];
+        // The window is rows TrOCRPosOffset..TrOCRPosOffset+SeqLen-1 of the
+        // source table, contiguous at the same DModel stride as the target.
+        Move(Tmp.FData[TrOCRPosOffset * Config.DModel],
+          DecPos.FArrNeurons[0].Weights.FData[0],
+          SeqLen * Config.DModel * csNeuralFloatSize);
         DecPos.FlushWeightCache();
         Consumed.Add('decoder.model.decoder.embed_positions.weight');
       finally
@@ -58152,14 +58160,14 @@ function DecodeOwlViTDetections(VisionOutput, QueryEmbeds: TNNetVolume;
   TextDim, GridH, GridW: integer;
   Threshold: TNeuralFloat): TOwlViTDetectionArray;
 var
-  NumPatches, NumQueries, p, q, c, Cnt: integer;
-  NumPatchesM1, NumQueriesM1, TextDimM1: integer;
+  NumPatches, NumQueries, p, q, Cnt: integer;
+  NumPatchesM1, NumQueriesM1: integer;
   ShiftBase, ScaleBase, BoxBase, voBase, qeBase, qeStride: integer;
-  Norm, Shift, ScaleRaw, ScaleVal, Cos, Logit, Score, LogitThr: TNeuralFloat;
+  InvNorm, Shift, ScaleRaw, ScaleVal, Cos, Logit, Score, LogitThr: TNeuralFloat;
   BiasCx, BiasCy, BiasW, BiasH: TNeuralFloat;
   BoxCx, BoxCy, BoxW, BoxH: TNeuralFloat;
   BoxDone: boolean;
-  ImgEmb: array of TNeuralFloat;
+  ImgPtr: pointer;
 begin
   NumPatches := VisionOutput.SizeX;
   NumQueries := QueryEmbeds.SizeX;
@@ -58171,21 +58179,20 @@ begin
   if Threshold <= 0 then LogitThr := -1e30
   else if Threshold >= 1 then LogitThr := 1e30
   else LogitThr := Ln(Threshold / (1.0 - Threshold));
-  SetLength(ImgEmb, TextDim);
   SetLength(Result, NumPatches * NumQueries);
   Cnt := 0;
   NumPatchesM1 := NumPatches - 1;
   NumQueriesM1 := NumQueries - 1;
-  TextDimM1 := TextDim - 1;
   qeStride := QueryEmbeds.GetRawPos(1, 0, 0);  // elements between consecutive q
   for p := 0 to NumPatchesM1 do
   begin
-    // L2-normalize the per-patch image_class_embeds (norm + 1e-6, as HF).
-    // Contiguous copy + AVX sum-of-squares + reciprocal scale (#13/#18/#12).
+    // The per-patch image_class_embeds are L2-normalized (norm + 1e-6, as HF).
+    // dot(v/|v|, q) = dot(v, q)/|v|, so the row is scored where it lies and the
+    // normalization rides along as one scalar per query.
     voBase := VisionOutput.GetRawPos(p, 0, 0);
-    Move(VisionOutput.FData[voBase], ImgEmb[0], TextDim * csNeuralFloatSize);
-    Norm := Sqrt(TNNetVolume.DotProduct(@ImgEmb[0], @ImgEmb[0], TextDim)) + 1e-6;
-    TNNetVolume.Mul(@ImgEmb[0], 1.0 / Norm, TextDim);
+    ImgPtr := VisionOutput.GetRawPtr(voBase);
+    InvNorm := 1.0 /
+      (Sqrt(TNNetVolume.DotProduct(ImgPtr, ImgPtr, TextDim)) + 1e-6);
     Shift := VisionOutput.FData[voBase + ShiftBase];
     ScaleRaw := VisionOutput.FData[voBase + ScaleBase];
     // elu(x) + 1
@@ -58199,7 +58206,7 @@ begin
     for q := 0 to NumQueriesM1 do
     begin
       Cos := TNNetVolume.DotProduct(
-        @ImgEmb[0], QueryEmbeds.GetRawPtr(qeBase), TextDim);
+        ImgPtr, QueryEmbeds.GetRawPtr(qeBase), TextDim) * InvNorm;
       Logit := (Cos + Shift) * ScaleVal;
       if Logit >= LogitThr then
       begin
