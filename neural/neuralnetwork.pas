@@ -60667,7 +60667,7 @@ var
   StartTime: double;
   Prev: TNNetVolume;
   SeqLen, InputDepth, Ksize, Dil, t, f, k, srcT: integer;
-  MaxT, MaxK, OutDepth, outPos, wOfs: integer;
+  MaxT, MaxK, OutDepth, outPos, wOfs, DilSpan: integer;
   W: TNNetVolume;
   sum, biasInit: TNeuralFloat;
   localNeuron: TNNetNeuron;
@@ -60683,6 +60683,7 @@ begin
   MaxK := Ksize - 1;
   OutDepth := FOutput.Depth;
   MaxNeuronPos := FNeurons.Count - 1;
+  DilSpan := Dil * MaxK;             // #5: the left-padding span, once per call
   for f := 0 to MaxNeuronPos do
   begin
     localNeuron := FArrNeurons[f];
@@ -60698,7 +60699,7 @@ begin
       // Positions < 0 are the (zero) left padding -> skipped. The depth axis is
       // contiguous, so each tap is an AVX dot product over InputDepth floats.
       // #6: srcT steps by +Dil per tap; the weight row by +InputDepth.
-      srcT := t - Dil * MaxK;
+      srcT := t - DilSpan;
       wOfs := 0;
       for k := 0 to MaxK do
       begin
@@ -60721,11 +60722,11 @@ var
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
   SeqLen, InputDepth, Ksize, Dil, t, f, k, srcT: integer;
-  MaxT, MaxK, OutDepth, outPos, wOfs: integer;
+  MaxT, MaxK, OutDepth, outPos, wOfs, DilSpan: integer;
   W, GW: TNNetVolume;
-  gy, negLRgy: TNeuralFloat;
+  gy, negLRgy, negLR: TNeuralFloat;
   localNeuron: TNNetNeuron;
-  hasInputGrad: boolean;
+  hasInputGrad, AddBias: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -60752,6 +60753,9 @@ begin
   // The -FLearningRate convention is applied to the accumulated weight/bias
   // deltas (matching TNNetTokenShift).
   MaxNeuronPos := FNeurons.Count - 1;
+  negLR := -FLearningRate;           // #5
+  AddBias := FSuppressBias = 0;      // #20: a layer flag, not a per-t condition
+  DilSpan := Dil * MaxK;             // #5: the left-padding span, once per call
   for f := 0 to MaxNeuronPos do
   begin
     localNeuron := FArrNeurons[f];
@@ -60763,13 +60767,13 @@ begin
       gy := FOutputError.FData[outPos];
       Inc(outPos, OutDepth);
       if gy = 0 then continue;
-      if FSuppressBias = 0 then
-        localNeuron.FBiasDelta := localNeuron.FBiasDelta + (-FLearningRate) * gy;
-      negLRgy := (-FLearningRate) * gy;
+      negLRgy := negLR * gy;         // #4: the bias delta uses the same product
+      if AddBias then
+        localNeuron.FBiasDelta := localNeuron.FBiasDelta + negLRgy;
       // Depth axis is contiguous: accumulate each tap with AVX MulAdd
       //   (PtrA[i] += PtrB[i] * Value) over InputDepth floats.
       // #6: srcT steps by +Dil per tap; the weight rows by +InputDepth.
-      srcT := t - Dil * MaxK;
+      srcT := t - DilSpan;
       wOfs := 0;
       for k := 0 to MaxK do
       begin
@@ -60836,7 +60840,7 @@ var
   StartTime: double;
   Prev: TNNetVolume;
   SeqLen, InputDepth, Ksize, Dil, Half, t, f, k, srcT: integer;
-  MaxT, MaxK, OutDepth, outPos, wOfs: integer;
+  MaxT, MaxK, OutDepth, outPos, wOfs, DilHalf: integer;
   W: TNNetVolume;
   sum, biasInit: TNeuralFloat;
   localNeuron: TNNetNeuron;
@@ -60853,6 +60857,7 @@ begin
   MaxK := Ksize - 1;
   OutDepth := FOutput.Depth;
   MaxNeuronPos := FNeurons.Count - 1;
+  DilHalf := Dil * Half;             // #5: the left half-window, once per call
   for f := 0 to MaxNeuronPos do
   begin
     localNeuron := FArrNeurons[f];
@@ -60868,7 +60873,7 @@ begin
       // Out-of-range positions on either side are the (zero) padding.
       // #12: srcT steps by +Dil per tap; the weight row by +InputDepth. The
       // carries advance unconditionally, so the range guard stays correct.
-      srcT := t - Dil * Half;
+      srcT := t - DilHalf;
       wOfs := 0;
       for k := 0 to MaxK do
       begin
@@ -60891,11 +60896,11 @@ var
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
   SeqLen, InputDepth, Ksize, Dil, Half, t, f, k, srcT: integer;
-  MaxT, MaxK, OutDepth, outPos, wOfs: integer;
+  MaxT, MaxK, OutDepth, outPos, wOfs, DilHalf: integer;
   W, GW: TNNetVolume;
-  gy, negLRgy: TNeuralFloat;
+  gy, negLRgy, negLR: TNeuralFloat;
   localNeuron: TNNetNeuron;
-  hasInputGrad: boolean;
+  hasInputGrad, AddBias: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -60917,6 +60922,9 @@ begin
 
   // Standard conv backward restricted to the centred in-range window.
   MaxNeuronPos := FNeurons.Count - 1;
+  negLR := -FLearningRate;           // #5
+  AddBias := FSuppressBias = 0;      // #20: a layer flag, not a per-t condition
+  DilHalf := Dil * Half;             // #5: the left half-window, once per call
   for f := 0 to MaxNeuronPos do
   begin
     localNeuron := FArrNeurons[f];
@@ -60928,12 +60936,12 @@ begin
       gy := FOutputError.FData[outPos];
       Inc(outPos, OutDepth);
       if gy = 0 then continue;
-      if FSuppressBias = 0 then
-        localNeuron.FBiasDelta := localNeuron.FBiasDelta + (-FLearningRate) * gy;
-      negLRgy := (-FLearningRate) * gy;
+      negLRgy := negLR * gy;         // #4: the bias delta uses the same product
+      if AddBias then
+        localNeuron.FBiasDelta := localNeuron.FBiasDelta + negLRgy;
       // #12: srcT steps by +Dil per tap; the weight rows by +InputDepth. The
       // carries advance unconditionally, so the range guard stays correct.
-      srcT := t - Dil * Half;
+      srcT := t - DilHalf;
       wOfs := 0;
       for k := 0 to MaxK do
       begin
@@ -61590,11 +61598,11 @@ var
   StartTime: double;
   Prev, PrevErr: TNNetVolume;
   SeqLen, Channels, Ksize, t, c, kk, srcT, off: integer;
-  MaxC, MaxT, MaxK, pePos: integer;
+  MaxC, MaxT, MaxK, MaxTapPos, MinTapPos, prevPos, oePos, RowStride: integer;
   W, GW: TNNetVolume;
-  gy: TNeuralFloat;
+  gy, negLRgy, negLR: TNeuralFloat;
   localNeuron: TNNetNeuron;
-  hasInputGrad: boolean;
+  hasInputGrad, AddBias: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -61620,27 +61628,38 @@ begin
   //   dL/dbias[c]    += OutErr[t,c]
   // The -FLearningRate convention is applied to the accumulated weight/bias
   // deltas (matching TNNetCausalConv1D).
+  negLR := -FLearningRate;             // #5
+  AddBias := FSuppressBias = 0;        // #20: a layer flag, not a per-t condition
+  RowStride := Prev.GetRawPos(1, 0);   // = Depth: the (t,c)->(t+1,c) step
   for c := 0 to MaxC do
   begin
     localNeuron := FArrNeurons[c];
     W := localNeuron.FWeights;
     GW := localNeuron.FDelta;
+    oePos := FOutputError.GetRawPos(0, 0, c);   // #12: carried, stride RowStride
     for t := 0 to MaxT do
     begin
-      gy := FOutputError[t, 0, c];
+      gy := FOutputError.FData[oePos];
+      Inc(oePos, RowStride);
       if gy = 0 then continue;
-      if FSuppressBias = 0 then
-        localNeuron.FBiasDelta := localNeuron.FBiasDelta + (-FLearningRate) * gy;
-      for kk := 0 to MaxK do
+      negLRgy := negLR * gy;           // #5: was rebuilt on every tap
+      if AddBias then
+        localNeuron.FBiasDelta := localNeuron.FBiasDelta + negLRgy;
+      // srcT = t-off+kk must land in [0, SeqLen-1], so clamp the tap range
+      // once instead of testing every tap. Prev and PrevErr share a shape, so
+      // one carried offset addresses both (#12).
+      MinTapPos := off - t;
+      if MinTapPos < 0 then MinTapPos := 0;
+      MaxTapPos := off - t + MaxT;
+      if MaxTapPos > MaxK then MaxTapPos := MaxK;
+      srcT := t - off + MinTapPos;
+      prevPos := Prev.GetRawPos(srcT, 0, c);
+      for kk := MinTapPos to MaxTapPos do
       begin
-        srcT := t - off + kk;
-        if (srcT < 0) or (srcT >= SeqLen) then continue;
-        GW.FData[kk] := GW.FData[kk] + (-FLearningRate) * gy * Prev[srcT, 0, c];
+        GW.FData[kk] := GW.FData[kk] + negLRgy * Prev.FData[prevPos];
         if hasInputGrad then
-        begin
-          pePos := PrevErr.GetRawPos(srcT, 0, c);
-          PrevErr.FData[pePos] := PrevErr.FData[pePos] + gy * W.FData[kk];
-        end;
+          PrevErr.FData[prevPos] := PrevErr.FData[prevPos] + gy * W.FData[kk];
+        Inc(prevPos, RowStride);
       end;
     end;
     if (not FBatchUpdate) then localNeuron.UpdateWeights(FInertia);
@@ -61718,8 +61737,8 @@ var
   Prev: TNNetVolume;
   NumFeat, ot, oy, ox, f, kt, ky, kx, ix, iy: integer;
   MaxFeat, MaxOT, MaxFST, MaxFXY: integer;
-  inDepthBase, wDepthBase: integer;
-  sum: TNeuralFloat;
+  inDepthBase, wDepthBase, inFrameBase, outDepth, iyBase, ixBase: integer;
+  sum, BiasInit: TNeuralFloat;
   localNeuron: TNNetNeuron;
   W: TNNetVolume;
 begin
@@ -61731,39 +61750,50 @@ begin
   MaxOT := FOutputT - 1;
   MaxFST := FFeatureSizeT - 1;
   MaxFXY := FFeatureSizeXY - 1;
+  MaxOutputY := FOutput.SizeY - 1;
+  MaxOutputX := FOutput.SizeX - 1;
   for f := 0 to MaxFeat do
   begin
     localNeuron := FArrNeurons[f];
     W := localNeuron.FWeights;
-    MaxOutputY := FOutput.SizeY - 1;
-    MaxOutputX := FOutput.SizeX - 1;
+    if FSuppressBias = 0
+      then BiasInit := localNeuron.FBiasWeight
+      else BiasInit := 0;
     for ot := 0 to MaxOT do
-    for oy := 0 to MaxOutputY do
-    for ox := 0 to MaxOutputX do
     begin
-      if FSuppressBias = 0
-        then sum := localNeuron.FBiasWeight
-        else sum := 0;
-      for kt := 0 to MaxFST do
+      outDepth := ot * NumFeat + f;
+      inFrameBase := ot * FChannels;              // input frame ot, tap kt=0
+      for oy := 0 to MaxOutputY do
       begin
-        inDepthBase := (ot + kt) * FChannels;     // input frame ot+kt
-        wDepthBase := kt * FChannels;             // weight tap kt
-        for ky := 0 to MaxFXY do
+        iyBase := oy * FStride - FPadding;
+        for ox := 0 to MaxOutputX do
         begin
-          iy := oy * FStride - FPadding + ky;
-          if (iy < 0) or (iy >= FInputH) then continue;
-          for kx := 0 to MaxFXY do
+          ixBase := ox * FStride - FPadding;
+          sum := BiasInit;
+          inDepthBase := inFrameBase;             // #6: both advance by FChannels
+          wDepthBase := 0;
+          for kt := 0 to MaxFST do
           begin
-            ix := ox * FStride - FPadding + kx;
-            if (ix < 0) or (ix >= FInputW) then continue;
-            // Contiguous C-channel dot product (AVX).
-            sum := sum + TNNetVolume.DotProduct(
-              W.GetRawPtr(kx, ky, wDepthBase),
-              Prev.GetRawPtr(ix, iy, inDepthBase), FChannels);
+            for ky := 0 to MaxFXY do
+            begin
+              iy := iyBase + ky;
+              if (iy < 0) or (iy >= FInputH) then continue;
+              for kx := 0 to MaxFXY do
+              begin
+                ix := ixBase + kx;
+                if (ix < 0) or (ix >= FInputW) then continue;
+                // Contiguous C-channel dot product (AVX).
+                sum := sum + TNNetVolume.DotProduct(
+                  W.GetRawPtr(kx, ky, wDepthBase),
+                  Prev.GetRawPtr(ix, iy, inDepthBase), FChannels);
+              end;
+            end;
+            Inc(inDepthBase, FChannels);
+            Inc(wDepthBase, FChannels);
           end;
+          FOutput[ox, oy, outDepth] := sum;
         end;
       end;
-      FOutput[ox, oy, ot * NumFeat + f] := sum;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -61777,8 +61807,8 @@ var
   Prev, PrevErr: TNNetVolume;
   NumFeat, ot, oy, ox, f, kt, ky, kx, ix, iy: integer;
   MaxFeat, MaxOT, MaxFST, MaxFXY: integer;
-  inDepthBase, wDepthBase: integer;
-  gy: TNeuralFloat;
+  inDepthBase, wDepthBase, inFrameBase, outDepth, iyBase, ixBase: integer;
+  gy, negLRgy, negLR: TNeuralFloat;
   localNeuron: TNNetNeuron;
   W, GW: TNNetVolume;
   hasInputGrad: boolean;
@@ -61803,39 +61833,50 @@ begin
   //   dL/dx[ix,iy,(ot+kt)*C+c] += OutErr[ox,oy,ot] * W[f][kx,ky,kt*C+c]
   //   dL/dbias[f] += OutErr[ox,oy,ot]
   // -FLearningRate convention on the accumulated weight/bias deltas.
+  negLR := -FLearningRate;                        // #5
+  MaxOutputY := FOutput.SizeY - 1;
+  MaxOutputX := FOutput.SizeX - 1;
   for f := 0 to MaxFeat do
   begin
     localNeuron := FArrNeurons[f];
     W := localNeuron.FWeights;
     GW := localNeuron.FDelta;
-    MaxOutputY := FOutput.SizeY - 1;
-    MaxOutputX := FOutput.SizeX - 1;
     for ot := 0 to MaxOT do
-    for oy := 0 to MaxOutputY do
-    for ox := 0 to MaxOutputX do
     begin
-      gy := FOutputError[ox, oy, ot * NumFeat + f];
-      if gy = 0 then continue;
-      if FSuppressBias = 0 then
-        localNeuron.FBiasDelta := localNeuron.FBiasDelta + (-FLearningRate) * gy;
-      for kt := 0 to MaxFST do
+      outDepth := ot * NumFeat + f;
+      inFrameBase := ot * FChannels;              // input frame ot, tap kt=0
+      for oy := 0 to MaxOutputY do
       begin
-        inDepthBase := (ot + kt) * FChannels;
-        wDepthBase := kt * FChannels;
-        for ky := 0 to MaxFXY do
+        iyBase := oy * FStride - FPadding;
+        for ox := 0 to MaxOutputX do
         begin
-          iy := oy * FStride - FPadding + ky;
-          if (iy < 0) or (iy >= FInputH) then continue;
-          for kx := 0 to MaxFXY do
+          gy := FOutputError[ox, oy, outDepth];
+          if gy = 0 then continue;
+          negLRgy := negLR * gy;                  // #5: the weight-delta scale
+          if FSuppressBias = 0 then
+            localNeuron.FBiasDelta := localNeuron.FBiasDelta + negLRgy;
+          ixBase := ox * FStride - FPadding;
+          inDepthBase := inFrameBase;             // #6: both advance by FChannels
+          wDepthBase := 0;
+          for kt := 0 to MaxFST do
           begin
-            ix := ox * FStride - FPadding + kx;
-            if (ix < 0) or (ix >= FInputW) then continue;
-            TNNetVolume.MulAdd(GW.GetRawPtr(kx, ky, wDepthBase),
-              Prev.GetRawPtr(ix, iy, inDepthBase),
-              (-FLearningRate) * gy, FChannels);
-            if hasInputGrad then
-              TNNetVolume.MulAdd(PrevErr.GetRawPtr(ix, iy, inDepthBase),
-                W.GetRawPtr(kx, ky, wDepthBase), gy, FChannels);
+            for ky := 0 to MaxFXY do
+            begin
+              iy := iyBase + ky;
+              if (iy < 0) or (iy >= FInputH) then continue;
+              for kx := 0 to MaxFXY do
+              begin
+                ix := ixBase + kx;
+                if (ix < 0) or (ix >= FInputW) then continue;
+                TNNetVolume.MulAdd(GW.GetRawPtr(kx, ky, wDepthBase),
+                  Prev.GetRawPtr(ix, iy, inDepthBase), negLRgy, FChannels);
+                if hasInputGrad then
+                  TNNetVolume.MulAdd(PrevErr.GetRawPtr(ix, iy, inDepthBase),
+                    W.GetRawPtr(kx, ky, wDepthBase), gy, FChannels);
+              end;
+            end;
+            Inc(inDepthBase, FChannels);
+            Inc(wDepthBase, FChannels);
           end;
         end;
       end;
