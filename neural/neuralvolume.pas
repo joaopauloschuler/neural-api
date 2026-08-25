@@ -799,6 +799,11 @@ type
       // Buffers may alias (dst = src).
       class procedure Sin(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
       class procedure Cos(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // SinCos writes both dst[0..N-1] := sin(src) and dstCos[0..N-1] := cos(src)
+      // from one range reduction and one polynomial pair, so a site needing both
+      // pays one pass over src instead of two. Bit-identical to calling Sin then
+      // Cos. Either destination may alias src.
+      class procedure SinCos(pDstSin, pDstCos, pSrc: TNeuralFloatArrPtr; N: integer); static;
       // ArcSinh writes dst[0..N-1] := arcsinh(src) = ln(x + sqrt(x^2 + 1)).
       // Built on Ln (and a vectorized sqrt in the prep pass) so it inherits the
       // AVX2 path. The sqrt argument is always >= 1 so ln stays in its accurate range
@@ -1734,6 +1739,11 @@ type
   // sinf/cosf polynomial with 3-part Cody-Waite range reduction (scalar RTL
   // remainder). DoCos selects cos (true) vs sin (false). Buffers may alias.
   procedure AVXSinCos(pDst, pSrc: TNeuralFloatArrPtr; NumElements: integer; DoCos: boolean);
+  // AVXSinCosBoth writes pDstSin[0..N-1] := sin(pSrc) and pDstCos[0..N-1] :=
+  // cos(pSrc) in one pass. The AVXSinCos body already builds both polynomial
+  // candidates and throws one away, so the pair costs a second selection and a
+  // second store rather than a second reduction. Buffers may alias pSrc.
+  procedure AVXSinCosBoth(pDstSin, pDstCos, pSrc: TNeuralFloatArrPtr; NumElements: integer);
   // AVXGetSum returns the sum of pSrc[0..N-1] via an 8-wide AVX2 reduction
   // (scalar tail for the N mod 4 remainder). Call sites outside this unit want
   // TNNetVolume.GetSum, which dispatches on the build.
@@ -11287,6 +11297,28 @@ begin
 end;
 {$ENDIF}
 
+class procedure TNNetVolume.SinCos(pDstSin, pDstCos, pSrc: TNeuralFloatArrPtr;
+  N: integer);
+{$IFDEF AVXANY}
+begin
+  if N <= 0 then exit;
+  AVXSinCosBoth(pDstSin, pDstCos, pSrc, N);
+end;
+{$ELSE}
+var
+  I, NM1: integer;
+  S, C: TNeuralFloat;
+begin
+  NM1 := N - 1;
+  for I := 0 to NM1 do
+  begin
+    pcr_sincosf(pSrc^[I], S, C);
+    pDstSin^[I] := S;
+    pDstCos^[I] := C;
+  end;
+end;
+{$ENDIF}
+
 class procedure TNNetVolume.ArcSinh(pDst, pSrc: TNeuralFloatArrPtr; N: integer);
 var
   I, NM1: integer;
@@ -15668,6 +15700,21 @@ begin
       pDst^[I] := pcr_sinf(pSrc^[I]);
 end;
 
+{ AVXSinCosBoth (32-bit): scalar loop, one shared argument reduction per element. }
+procedure AVXSinCosBoth(pDstSin, pDstCos, pSrc: TNeuralFloatArrPtr; NumElements: integer);
+var
+  I, NumElementsM1: integer;
+  S, C: Single;
+begin
+  NumElementsM1 := NumElements - 1;
+  for I := 0 to NumElementsM1 do
+  begin
+    pcr_sincosf(pSrc^[I], S, C);
+    pDstSin^[I] := S;
+    pDstCos^[I] := C;
+  end;
+end;
+
 function AVXDotProduct(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
 var
   vRes: array[0..3] of Single;
@@ -18243,6 +18290,119 @@ begin
   else
     for I := 0 to NumElementsM1 do
       pDst^[I] := pcr_sinf(pSrc^[I]);
+end;
+{$ENDIF}
+
+{ AVXSinCosBoth: sin and cos of the same src in one pass. The loop body is the
+  AVXSinCos body up to the two polynomial candidates, which that kernel builds
+  in full and then discards one of; here both are selected and stored, so a
+  caller needing the pair pays one range reduction instead of two. The two
+  selections use the (j & 2) == 2 form for both outputs, which is the exact
+  complement of AVXSinCos's cos-branch compare against zero with the blend
+  sources swapped, so the results are bit-identical to Sin followed by Cos. }
+procedure AVXSinCosBoth(pDstSin, pDstCos, pSrc: TNeuralFloatArrPtr; NumElements: integer);
+{$IFDEF AVX2}
+var
+  localNumElements, MissedElements, I, NumElementsM1: integer;
+  S, C: Single;
+begin
+  MissedElements := NumElements and 7;
+  localNumElements := NumElements xor MissedElements;
+  NumElementsM1 := NumElements - 1;
+  if localNumElements > 0 then
+  begin
+  asm
+  mov rax, pSrc
+  mov rcx, pDstSin
+  mov rdx, pDstCos
+  mov r8d, localNumElements
+  shr r8d, 3
+  jz @DoneAVXSinCosBoth
+  vmovups ymm9,  [rip+cAVXSC_Half]
+  vmovups ymm12, [rip+cAVXSC_4i]
+  vmovups ymm13, [rip+cAVXSC_2i]
+  vmovups ymm14, [rip+cAVXSC_SignMask]
+  vmovups ymm15, [rip+cAVXSC_One]
+@LoopAVXSinCosBoth:
+  vmovups ymm0, [rax]               // x
+  vandps  ymm5, ymm0, ymm14         // sign_x
+  vandps  ymm1, ymm0, [rip+cAVXArgAbsMask]  // |x|
+  vmulps  ymm2, ymm1, [rip+cAVXSC_FOPI]
+  vcvttps2dq ymm3, ymm2             // j = trunc(|x|*4/pi)
+  vpaddd  ymm3, ymm3, [rip+cAVXSC_1i]
+  vpand   ymm3, ymm3, [rip+cAVXSC_NOT1i]  // j = (j+1)&~1
+  vcvtdq2ps ymm2, ymm3              // y = (float)j
+  vfmadd231ps ymm1, ymm2, [rip+cAVXSC_DP1]
+  vfmadd231ps ymm1, ymm2, [rip+cAVXSC_DP2]
+  vfmadd231ps ymm1, ymm2, [rip+cAVXSC_DP3]  // reduced x
+  vmulps  ymm7, ymm1, ymm1          // z
+  vmovups ymm8, [rip+cAVXSC_CosP0]
+  vfmadd213ps ymm8, ymm7, [rip+cAVXSC_CosP1]
+  vfmadd213ps ymm8, ymm7, [rip+cAVXSC_CosP2]
+  vmulps  ymm8, ymm8, ymm7
+  vmulps  ymm8, ymm8, ymm7
+  vmulps  ymm10, ymm7, ymm9
+  vsubps  ymm8, ymm8, ymm10
+  vaddps  ymm8, ymm8, ymm15         // cos candidate
+  vmovups ymm11, [rip+cAVXSC_SinP0]
+  vfmadd213ps ymm11, ymm7, [rip+cAVXSC_SinP1]
+  vfmadd213ps ymm11, ymm7, [rip+cAVXSC_SinP2]
+  vmulps  ymm11, ymm11, ymm7
+  vmulps  ymm11, ymm11, ymm1
+  vaddps  ymm11, ymm11, ymm1        // sin candidate
+
+  // sin(x): sign is sign_x xor ((j&4)<<29); (j&2)==2 selects the cos poly.
+  vpand   ymm4, ymm3, ymm12
+  vpslld  ymm4, ymm4, 29
+  vxorps  ymm4, ymm4, ymm5
+  vpand   ymm6, ymm3, ymm13
+  vpcmpeqd ymm6, ymm6, ymm13
+  vblendvps ymm0, ymm11, ymm8, ymm6
+  vxorps  ymm0, ymm0, ymm4
+  vmovups [rcx], ymm0
+
+  // cos(x): m = j-2, sign is ((~m)&4)<<29; (m&2)==2 selects the cos poly.
+  vpsubd  ymm4, ymm3, ymm13
+  vpandn  ymm5, ymm4, ymm12
+  vpslld  ymm5, ymm5, 29
+  vpand   ymm6, ymm4, ymm13
+  vpcmpeqd ymm6, ymm6, ymm13
+  vblendvps ymm0, ymm11, ymm8, ymm6
+  vxorps  ymm0, ymm0, ymm5
+  vmovups [rdx], ymm0
+
+  add rax, 32
+  add rcx, 32
+  add rdx, 32
+  dec r8d
+  jnz @LoopAVXSinCosBoth
+@DoneAVXSinCosBoth:
+  vzeroupper
+  end ['rax','rcx','rdx','r8',
+       'ymm0','ymm1','ymm2','ymm3','ymm4','ymm5','ymm6','ymm7','ymm8',
+       'ymm9','ymm10','ymm11','ymm12','ymm13','ymm14','ymm15'];
+  end;
+  for I := localNumElements to NumElementsM1 do
+  begin
+    // The AVXSinCos remainders are pcr_sinf / pcr_cosf; pcr_sincosf shares their
+    // reduction and returns the same pair.
+    pcr_sincosf(pSrc^[I], S, C);
+    pDstSin^[I] := S;
+    pDstCos^[I] := C;
+  end;
+end;
+{$ELSE}
+var
+  I, NumElementsM1: integer;
+  S, C: Single;
+begin
+  NumElementsM1 := NumElements - 1;
+  for I := 0 to NumElementsM1 do
+  begin
+    pcr_sincosf(pSrc^[I], S, C);
+    pDstSin^[I] := S;
+    pDstCos^[I] := C;
+  end;
 end;
 {$ENDIF}
 

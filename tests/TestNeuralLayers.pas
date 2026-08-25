@@ -39,6 +39,7 @@ type
     procedure TestLnScalarParity;
     procedure TestSinScalarParity;
     procedure TestCosScalarParity;
+    procedure TestSinCosMatchesSeparateSinAndCos;
     procedure TestArcSinhScalarParity;
     procedure TestPointwiseSoftMaxVectorizedParity;
     procedure TestNetworkSaveLoad;
@@ -1490,6 +1491,69 @@ begin
       ' must be < ' + FloatToStr(AbsTol), maxErr < AbsTol);
   finally
     Src.Free; Dst.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestSinCosMatchesSeparateSinAndCos;
+// The fused SinCos shares one range reduction and one polynomial pair between
+// its two outputs, so it must agree bit-for-bit with Sin followed by Cos. N is
+// swept across the 8-wide body boundary so the scalar tail is covered at every
+// remainder, and the two aliasing cases (each destination over the source) are
+// checked separately because the kernel reads x before either store.
+const
+  AbsTol = 0;
+var
+  Src, RefSin, RefCos, DstSin, DstCos: TNNetVolume;
+  I, N: integer;
+begin
+  for N := 1 to 20 do
+  begin
+    Src := TNNetVolume.Create(N, 1, 1);
+    RefSin := TNNetVolume.Create(N, 1, 1);
+    RefCos := TNNetVolume.Create(N, 1, 1);
+    DstSin := TNNetVolume.Create(N, 1, 1);
+    DstCos := TNNetVolume.Create(N, 1, 1);
+    try
+      for I := 0 to N - 1 do
+        Src.FData[I] := -40.0 + 4.3 * I;
+      Src.FData[0] := 1000.0;
+      if N > 1 then Src.FData[N - 1] := -9999.9;
+
+      TNNetVolume.Sin(RefSin.DataPtr, Src.DataPtr, N);
+      TNNetVolume.Cos(RefCos.DataPtr, Src.DataPtr, N);
+      TNNetVolume.SinCos(DstSin.DataPtr, DstCos.DataPtr, Src.DataPtr, N);
+      for I := 0 to N - 1 do
+      begin
+        AssertEquals('SinCos sin at N=' + IntToStr(N) + ' idx ' + IntToStr(I),
+          RefSin.FData[I], DstSin.FData[I], AbsTol);
+        AssertEquals('SinCos cos at N=' + IntToStr(N) + ' idx ' + IntToStr(I),
+          RefCos.FData[I], DstCos.FData[I], AbsTol);
+      end;
+
+      // The sin destination aliasing the source.
+      DstSin.Copy(Src);
+      TNNetVolume.SinCos(DstSin.DataPtr, DstCos.DataPtr, DstSin.DataPtr, N);
+      for I := 0 to N - 1 do
+      begin
+        AssertEquals('SinCos aliased sin idx ' + IntToStr(I),
+          RefSin.FData[I], DstSin.FData[I], AbsTol);
+        AssertEquals('SinCos aliased sin, cos idx ' + IntToStr(I),
+          RefCos.FData[I], DstCos.FData[I], AbsTol);
+      end;
+
+      // The cos destination aliasing the source.
+      DstCos.Copy(Src);
+      TNNetVolume.SinCos(DstSin.DataPtr, DstCos.DataPtr, DstCos.DataPtr, N);
+      for I := 0 to N - 1 do
+      begin
+        AssertEquals('SinCos aliased cos, sin idx ' + IntToStr(I),
+          RefSin.FData[I], DstSin.FData[I], AbsTol);
+        AssertEquals('SinCos aliased cos idx ' + IntToStr(I),
+          RefCos.FData[I], DstCos.FData[I], AbsTol);
+      end;
+    finally
+      Src.Free; RefSin.Free; RefCos.Free; DstSin.Free; DstCos.Free;
+    end;
   end;
 end;
 

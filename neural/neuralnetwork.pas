@@ -48865,28 +48865,21 @@ end;
 
 procedure TNNetSin.Compute();
 var
-  SizeM1: integer;
   LocalPrevOutput: TNNetVolume;
-  OutputCnt: integer;
   StartTime: double;
-  x: TNeuralFloat;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
-  SizeM1 := LocalPrevOutput.Size - 1;
 
-  // sin(x). Derivative is cos(x). The forward sin pass is vectorized via the AVX2
-  // TNNetVolume.Sin (Cephes range-reduced polynomial); the cos derivative is
-  // filled by a scalar finishing pass that reads x back from LocalPrevOutput, so the
-  // backward math is byte-identical to the previous per-element pcr_sincosf path.
-  TNNetVolume.Sin(@FOutput.FData[0], @LocalPrevOutput.FData[0],
-    LocalPrevOutput.Size);
-  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
-  begin
-    TNNetVolume.Cos(@FOutputErrorDeriv.FData[0], @LocalPrevOutput.FData[0],
-      LocalPrevOutput.Size);
-  end;
+  // sin(x), whose derivative is cos(x). Both come out of one TNNetVolume.SinCos
+  // pass: the Cephes body builds the sin and cos candidates either way, so the
+  // derivative costs a second selection rather than a second range reduction.
+  if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size)
+  then TNNetVolume.SinCos(@FOutput.FData[0], @FOutputErrorDeriv.FData[0],
+         @LocalPrevOutput.FData[0], LocalPrevOutput.Size)
+  else TNNetVolume.Sin(@FOutput.FData[0], @LocalPrevOutput.FData[0],
+         LocalPrevOutput.Size);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -48894,29 +48887,23 @@ end;
 
 procedure TNNetCos.Compute();
 var
-  SizeM1: integer;
   LocalPrevOutput: TNNetVolume;
-  OutputCnt: integer;
   StartTime: double;
-  x: TNeuralFloat;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   LocalPrevOutput := FPrevLayer.Output;
-  SizeM1 := LocalPrevOutput.Size - 1;
 
-  // cos(x). Derivative is -sin(x). The forward cos pass is vectorized via the AVX2
-  // TNNetVolume.Cos (Cephes range-reduced polynomial); the -sin derivative is
-  // filled by a scalar finishing pass that reads x back from LocalPrevOutput, so the
-  // backward math is byte-identical to the previous per-element pcr_sincosf path.
-  TNNetVolume.Cos(@FOutput.FData[0], @LocalPrevOutput.FData[0],
-    LocalPrevOutput.Size);
+  // cos(x), whose derivative is -sin(x). One TNNetVolume.SinCos pass yields both
+  // (the sin lands in the derivative slot and is then negated in place).
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
-    TNNetVolume.Sin(@FOutputErrorDeriv.FData[0], @LocalPrevOutput.FData[0],
-      LocalPrevOutput.Size);
+    TNNetVolume.SinCos(@FOutputErrorDeriv.FData[0], @FOutput.FData[0],
+      @LocalPrevOutput.FData[0], LocalPrevOutput.Size);
     TNNetVolume.Mul(@FOutputErrorDeriv.FData[0], -1.0, LocalPrevOutput.Size);
-  end;
+  end
+  else TNNetVolume.Cos(@FOutput.FData[0], @LocalPrevOutput.FData[0],
+         LocalPrevOutput.Size);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
