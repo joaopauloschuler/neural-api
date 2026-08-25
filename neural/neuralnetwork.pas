@@ -10926,6 +10926,11 @@ type
       FHre: TNNetVolume;        // cached real part of h_t, (SeqLen,1,Depth)
       FHim: TNNetVolume;        // cached imag part of h_t, (SeqLen,1,Depth)
       FGradNu, FGradTheta, FGradB, FGradCre, FGradCim, FGradD: TNNetVolume;
+      // Per-channel forward constants, rebuilt once per Compute() and consumed
+      // by the elementwise kernels: lambda's real/imag parts (and -imag, for the
+      // cross term), gamma*B, and -Cim. FZeroRow is the h_{-1}=0 operand.
+      FLambdaRe, FLambdaIm, FNegLambdaIm, FGammaB, FNegCim, FZeroRow: TNNetVolume;
+      procedure PrepareChannelConstants();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
@@ -62983,12 +62988,24 @@ begin
   FGradCre := TNNetVolume.Create();
   FGradCim := TNNetVolume.Create();
   FGradD := TNNetVolume.Create();
+  FLambdaRe := TNNetVolume.Create();
+  FLambdaIm := TNNetVolume.Create();
+  FNegLambdaIm := TNNetVolume.Create();
+  FGammaB := TNNetVolume.Create();
+  FNegCim := TNNetVolume.Create();
+  FZeroRow := TNNetVolume.Create();
   // [0]=nu [1]=theta [2]=B [3]=Cre [4]=Cim [5]=D
   AddMissingNeurons(6);
 end;
 
 destructor TNNetLRU.Destroy();
 begin
+  FZeroRow.Free;
+  FNegCim.Free;
+  FGammaB.Free;
+  FNegLambdaIm.Free;
+  FLambdaIm.Free;
+  FLambdaRe.Free;
   FGradD.Free;
   FGradCim.Free;
   FGradCre.Free;
@@ -63030,62 +63047,98 @@ begin
   FGradCre.ReSize(1, 1, FDepth);
   FGradCim.ReSize(1, 1, FDepth);
   FGradD.ReSize(1, 1, FDepth);
+  FLambdaRe.ReSize(1, 1, FDepth);
+  FLambdaIm.ReSize(1, 1, FDepth);
+  FNegLambdaIm.ReSize(1, 1, FDepth);
+  FGammaB.ReSize(1, 1, FDepth);
+  FNegCim.ReSize(1, 1, FDepth);
+  FZeroRow.ReSize(1, 1, FDepth);
+  FZeroRow.Fill(0);
   InitDefault();
+end;
+
+// Maps the six raw per-channel weights onto the constants the timestep sweep
+// consumes. Rebuilt on every forward: the weights can be written directly by
+// trainers, importers and gradient checks with no invalidation hook, and the
+// cost is one timestep's worth of work amortized over the sequence.
+procedure TNNetLRU.PrepareChannelConstants();
+var
+  Wnu, Wtheta, Wb, Wcim: TNNetVolume;
+  MaxDn, d: integer;
+  absLam, angle, cAng, sAng: TNeuralFloat;
+begin
+  Wnu := FNeurons[0].FWeights;
+  Wtheta := FNeurons[1].FWeights;
+  Wb := FNeurons[2].FWeights;
+  Wcim := FNeurons[4].FWeights;
+  MaxDn := FDepth - 1;
+  for d := 0 to MaxDn do
+  begin
+    absLam := NeuralExp(-NeuralExp(Wnu.FData[d]));    // |lambda| in (0,1)
+    angle := NeuralExp(Wtheta.FData[d]);              // rotation rate
+    pcr_sincosf(angle, sAng, cAng);
+    FLambdaRe.FData[d] := absLam * cAng;
+    FLambdaIm.FData[d] := absLam * sAng;
+    FNegLambdaIm.FData[d] := -absLam * sAng;
+    // gamma = sqrt(1-|lambda|^2) is the input normalisation.
+    FGammaB.FData[d] := Sqrt(1 - absLam * absLam) * Wb.FData[d];
+    FNegCim.FData[d] := -Wcim.FData[d];
+  end;
 end;
 
 procedure TNNetLRU.Compute();
 var
   StartTime: double;
-  Wnu, Wtheta, Wb, Wcre, Wcim, Wd, Prev: TNNetVolume;
-  SeqLen, Dn, t, d: integer;
-  MaxDn, MaxT, base, RowStride: integer;
-  absLam, angle, lr, li, gamma, gB, cre, cim, dd: TNeuralFloat;
-  hrePrev, himPrev, hreNew, himNew, xt: TNeuralFloat;
+  Prev: TNNetVolume;
+  SeqLen, Dn, t: integer;
+  MaxT, RowBytes: integer;
+  LrPtr, LiPtr, NegLiPtr, GBPtr, CrePtr, NegCimPtr, DdPtr: TNeuralFloatArrPtr;
+  HrePtr, HimPtr, HrePrevPtr, HimPrevPtr, XtPtr, OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
-  Wnu := FNeurons[0].FWeights;
-  Wtheta := FNeurons[1].FWeights;
-  Wb := FNeurons[2].FWeights;
-  Wcre := FNeurons[3].FWeights;
-  Wcim := FNeurons[4].FWeights;
-  Wd := FNeurons[5].FWeights;
   SeqLen := FOutput.SizeX;
   Dn := FDepth;
-  MaxDn := Dn - 1;
   MaxT := SeqLen - 1;
-  RowStride := Prev.GetRawPos(1, 0);         // = Dn: (t,d)->(t+1,d) step
-  for d := 0 to MaxDn do
+  RowBytes := Dn * csNeuralFloatSize;        // #5: once per call
+  PrepareChannelConstants();
+  LrPtr := FLambdaRe.GetRawPtr();
+  LiPtr := FLambdaIm.GetRawPtr();
+  NegLiPtr := FNegLambdaIm.GetRawPtr();
+  GBPtr := FGammaB.GetRawPtr();
+  CrePtr := FNeurons[3].FWeights.GetRawPtr();
+  NegCimPtr := FNegCim.GetRawPtr();
+  DdPtr := FNeurons[5].FWeights.GetRawPtr();
+  // Timestep-outer sweep: the time axis is sequential (h_t depends on h_{t-1})
+  // but the channel axis is fully parallel and contiguous, so each timestep
+  // updates ALL channels at once with elementwise vector ops over the Dn-long
+  // run. h_{-1}=0 comes from FZeroRow, and h_{t-1} is just row t-1 of the
+  // FHre/FHim caches the sweep is writing anyway.
+  HrePrevPtr := FZeroRow.GetRawPtr();
+  HimPrevPtr := HrePrevPtr;
+  for t := 0 to MaxT do
   begin
-    absLam := NeuralExp(-NeuralExp(Wnu.FData[d]));          // |lambda| in (0,1)
-    angle := NeuralExp(Wtheta.FData[d]);              // rotation rate
-    pcr_sincosf(angle, li, lr);
-    lr := absLam * lr;
-    li := absLam * li;
-    gamma := Sqrt(1 - absLam * absLam);         // input normalisation
-    gB := gamma * Wb.FData[d];
-    cre := Wcre.FData[d];
-    cim := Wcim.FData[d];
-    dd := Wd.FData[d];
-    hrePrev := 0;
-    himPrev := 0;
-    // Prev, FHre, FHim and FOutput all share (SeqLen,1,Dn): one offset for all,
-    // stepping by RowStride per t.
-    base := Prev.GetRawPos(0, 0, d);
-    for t := 0 to MaxT do
-    begin
-      xt := Prev.FData[base];
-      hreNew := lr * hrePrev - li * himPrev + gB * xt;
-      himNew := lr * himPrev + li * hrePrev;
-      FHre.FData[base] := hreNew;
-      FHim.FData[base] := himNew;
-      FOutput.FData[base] :=
-        cre * hreNew - cim * himNew + dd * xt;
-      hrePrev := hreNew;
-      himPrev := himNew;
-      Inc(base, RowStride);
-    end;
+    XtPtr := Prev.GetRawPtr(t, 0);
+    HrePtr := FHre.GetRawPtr(t, 0);
+    HimPtr := FHim.GetRawPtr(t, 0);
+    OutPtr := FOutput.GetRawPtr(t, 0);
+    // hre_t = lr .* hre_{t-1} - li .* him_{t-1} + gamma*B .* x_t
+    system.Move(LrPtr^, HrePtr^, RowBytes);
+    TNNetVolume.Mul(HrePtr, HrePrevPtr, Dn);
+    TNNetVolume.MulAdd(HrePtr, NegLiPtr, HimPrevPtr, Dn);
+    TNNetVolume.MulAdd(HrePtr, GBPtr, XtPtr, Dn);
+    // him_t = lr .* him_{t-1} + li .* hre_{t-1}
+    system.Move(LrPtr^, HimPtr^, RowBytes);
+    TNNetVolume.Mul(HimPtr, HimPrevPtr, Dn);
+    TNNetVolume.MulAdd(HimPtr, LiPtr, HrePrevPtr, Dn);
+    // y_t = Cre .* hre_t - Cim .* him_t + D .* x_t
+    system.Move(CrePtr^, OutPtr^, RowBytes);
+    TNNetVolume.Mul(OutPtr, HrePtr, Dn);
+    TNNetVolume.MulAdd(OutPtr, NegCimPtr, HimPtr, Dn);
+    TNNetVolume.MulAdd(OutPtr, DdPtr, XtPtr, Dn);
+    HrePrevPtr := HrePtr;
+    HimPrevPtr := HimPtr;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
