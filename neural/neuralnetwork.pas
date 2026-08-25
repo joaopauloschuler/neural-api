@@ -23913,7 +23913,7 @@ var
   LocalPrevOutput: TNNetVolume;
   OutputCnt: integer;
   StartTime: double;
-  x: TNeuralFloat;
+  x, OneSixth: TNeuralFloat;
 begin
   StartTime := Now();
   if ComputeActivationOnOpenCL() then
@@ -23923,6 +23923,8 @@ begin
   end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
+  // Single-typed reciprocal: the linear segment is a multiply, not a divide (#21).
+  OneSixth := 1/6;
 
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
@@ -23941,7 +23943,7 @@ begin
       end
       else
       begin
-        FOutput.FData[OutputCnt] := x*(x + 3)/6;
+        FOutput.FData[OutputCnt] := x*(x + 3)*OneSixth;
         FOutputErrorDeriv.FData[OutputCnt] := 0.3333*x + 0.5;
       end;
     end;
@@ -23962,7 +23964,7 @@ begin
       end
       else
       begin
-        FOutput.FData[OutputCnt] := x*(x + 3)/6;
+        FOutput.FData[OutputCnt] := x*(x + 3)*OneSixth;
       end;
     end;
   end;
@@ -23983,7 +23985,7 @@ var
   LocalPrevOutput: TNNetVolume;
   OutputCnt: integer;
   StartTime: double;
-  x: TNeuralFloat;
+  x, OneSixth: TNeuralFloat;
 begin
   StartTime := Now();
   if ComputeActivationOnOpenCL() then
@@ -23993,6 +23995,8 @@ begin
   end;
   LocalPrevOutput := FPrevLayer.Output;
   SizeM1 := LocalPrevOutput.Size - 1;
+  // Single-typed reciprocal: the linear segment is a multiply, not a divide (#21).
+  OneSixth := 1/6;
 
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
@@ -24011,8 +24015,8 @@ begin
       end
       else
       begin
-        FOutput.FData[OutputCnt] := (x + 3)/6;
-        FOutputErrorDeriv.FData[OutputCnt] := 1/6;
+        FOutput.FData[OutputCnt] := (x + 3)*OneSixth;
+        FOutputErrorDeriv.FData[OutputCnt] := OneSixth;
       end;
     end;
   end
@@ -24027,7 +24031,7 @@ begin
       else if x < -3 then
         FOutput.FData[OutputCnt] := 0
       else
-        FOutput.FData[OutputCnt] := (x + 3)/6;
+        FOutput.FData[OutputCnt] := (x + 3)*OneSixth;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -24380,9 +24384,10 @@ var
   PropagatesErr: boolean;
   StartTime: double;
   localNeuron: TNNetNeuron;
-  gradBeta, beta, x, betaX, sig: TNeuralFloat;
+  gradBeta, beta, x, betaX, sig, err: TNeuralFloat;
   i: integer;
   LocalPrevOutput, PrevErr: TNNetVolume;
+  ScalarPrevErr: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -24393,8 +24398,6 @@ begin
   beta := localNeuron.FWeights.Raw[0];
   // Gradient w.r.t. the scalar beta:
   // d(beta) = sum_i OutputError[i] * x_i^2 * sigmoid(beta*x_i) * (1 - sigmoid(beta*x_i)).
-  // Fused with the input-gradient pass (#4): sig is computed once per element and
-  // reused for both the gradBeta accumulation and (when PropagatesErr) PrevErr.
   gradBeta := 0;
   MaxOutputErrorPos := FOutputError.Size - 1;
   PropagatesErr := Assigned(FPrevLayer) and
@@ -24402,16 +24405,28 @@ begin
   PrevErr := nil;
   if PropagatesErr then
     PrevErr := FPrevLayer.FOutputError;  // #9: bind the invariant chain once
+  // dInput[i] = OutputError[i] * dy/dx[i], and Compute already cached dy/dx in
+  // FOutputErrorDeriv whenever it took its scratch path, so the whole input
+  // gradient is one vectorized MulAdd. The elementwise form below stays for the
+  // forward-only path, where that cache holds nothing.
+  ScalarPrevErr := PropagatesErr;
+  if PropagatesErr and (FOutput.Size = FOutputError.Size) and
+     (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    TNNetVolume.MulAdd(PrevErr.DataPtr, FOutputError.DataPtr,
+      FOutputErrorDeriv.DataPtr, MaxOutputErrorPos + 1);
+    ScalarPrevErr := False;
+  end;
   for i := 0 to MaxOutputErrorPos do
   begin
-    x := LocalPrevOutput.Raw[i];
+    x := LocalPrevOutput.FData[i];
     betaX := beta * x;
     sig := 1 / (1 + NeuralExp(-betaX));
-    gradBeta := gradBeta + FOutputError.Raw[i] * x * x * sig * (1 - sig);
-    if PropagatesErr then
-      // dInput[i] = OutputError[i] * (sig + x * beta * sig * (1 - sig)).
+    err := FOutputError.FData[i];
+    gradBeta := gradBeta + err * x * x * sig * (1 - sig);
+    if ScalarPrevErr then
       PrevErr.FData[i] := PrevErr.FData[i] +
-        FOutputError.Raw[i] * (sig + x * beta * sig * (1 - sig));
+        err * (sig + x * beta * sig * (1 - sig));
   end;
   localNeuron.FDelta.Raw[0] := localNeuron.FDelta.Raw[0] +
     (-FLearningRate) * gradBeta;
@@ -24460,7 +24475,7 @@ end;
 procedure TNNetMishLearnable.Compute();
 var
   StartTime: double;
-  alpha, x, ax, sp, expVal, t, sig: TNeuralFloat;
+  alpha, x, ax, sp, expVal, onePlusExp, t, sig: TNeuralFloat;
   i, SizeM1: integer;
   LocalPrevOutput: TNNetVolume;
   HasDeriv: boolean;
@@ -24500,8 +24515,9 @@ begin
       else
       begin
         expVal := NeuralExp(ax);
-        sp := pcr_logf(1 + expVal);
-        sig := expVal / (1 + expVal);
+        onePlusExp := 1 + expVal;
+        sp := pcr_logf(onePlusExp);
+        sig := expVal / onePlusExp;
       end;
       t := pcr_tanhf(sp);
       FOutput.FData[i] := x * t;
@@ -24533,9 +24549,10 @@ var
   PropagatesErr: boolean;
   StartTime: double;
   localNeuron: TNNetNeuron;
-  gradAlpha, alpha, x, ax, sp, expVal, t, sig: TNeuralFloat;
+  gradAlpha, alpha, x, ax, sp, expVal, onePlusExp, t, sig, err: TNeuralFloat;
   i: integer;
   LocalPrevOutput, PrevErr: TNNetVolume;
+  ScalarPrevErr: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -24546,9 +24563,6 @@ begin
   alpha := localNeuron.FWeights.Raw[0];
   // Gradient w.r.t. the scalar alpha:
   // d(alpha) = sum_i OutputError[i] * x_i^2 * (1 - t_i^2) * sig_i.
-  // Fused with the input-gradient pass (#4): the softplus/sigmoid/tanh chain is
-  // computed once per element and reused for both the gradAlpha accumulation and
-  // (when PropagatesErr) the PrevErr write.
   gradAlpha := 0;
   MaxOutputErrorPos := FOutputError.Size - 1;
   PropagatesErr := Assigned(FPrevLayer) and
@@ -24556,9 +24570,21 @@ begin
   PrevErr := nil;
   if PropagatesErr then
     PrevErr := FPrevLayer.FOutputError;  // #9: bind the invariant chain once
+  // dInput[i] = OutputError[i] * dy/dx[i], and Compute already cached dy/dx in
+  // FOutputErrorDeriv whenever it took its scratch path, so the whole input
+  // gradient is one vectorized MulAdd. The elementwise form below stays for the
+  // forward-only path, where that cache holds nothing.
+  ScalarPrevErr := PropagatesErr;
+  if PropagatesErr and (FOutput.Size = FOutputError.Size) and
+     (FOutputErrorDeriv.Size = FOutput.Size) then
+  begin
+    TNNetVolume.MulAdd(PrevErr.DataPtr, FOutputError.DataPtr,
+      FOutputErrorDeriv.DataPtr, MaxOutputErrorPos + 1);
+    ScalarPrevErr := False;
+  end;
   for i := 0 to MaxOutputErrorPos do
   begin
-    x := LocalPrevOutput.Raw[i];
+    x := LocalPrevOutput.FData[i];
     ax := alpha * x;
     if ax > 30 then
     begin
@@ -24574,15 +24600,16 @@ begin
     else
     begin
       expVal := NeuralExp(ax);
-      sp := pcr_logf(1 + expVal);
-      sig := expVal / (1 + expVal);
+      onePlusExp := 1 + expVal;
+      sp := pcr_logf(onePlusExp);
+      sig := expVal / onePlusExp;
     end;
     t := pcr_tanhf(sp);
-    gradAlpha := gradAlpha + FOutputError.Raw[i] * x * x * (1 - t * t) * sig;
-    if PropagatesErr then
-      // dInput[i] = OutputError[i] * (t + x*(1 - t^2)*(alpha*sig)).
+    err := FOutputError.FData[i];
+    gradAlpha := gradAlpha + err * x * x * (1 - t * t) * sig;
+    if ScalarPrevErr then
       PrevErr.FData[i] := PrevErr.FData[i] +
-        FOutputError.Raw[i] * (t + x * (1 - t * t) * (alpha * sig));
+        err * (t + x * (1 - t * t) * (alpha * sig));
   end;
   localNeuron.FDelta.Raw[0] := localNeuron.FDelta.Raw[0] +
     (-FLearningRate) * gradAlpha;
@@ -24755,8 +24782,12 @@ begin
     // s = sigmoid(x) into FOutputErrorDeriv (reused as scratch, overwritten below).
     TNNetVolume.Sigmoid(@FOutputErrorDeriv.FData[0], @LocalPrevOutput.FData[0],
       LocalPrevOutput.Size);
-    for OutputCnt := 0 to SizeM1 do
-      FOutput.FData[OutputCnt] := pcr_log1pf(FOutputErrorDeriv.FData[OutputCnt]);
+    // s lies in (0,1), so 1+s stays in (1,2) and ln(1+s) needs none of log1p's
+    // small-argument compensation: the vectorized AddScalar/Ln pair replaces the
+    // scalar log1p loop between two already-vectorized passes.
+    FOutput.Copy(FOutputErrorDeriv, LocalPrevOutput.Size);
+    TNNetVolume.AddScalar(@FOutput.FData[0], 1, LocalPrevOutput.Size);
+    TNNetVolume.Ln(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
     TNNetVolume.Tanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
     for OutputCnt := 0 to SizeM1 do
     begin
@@ -24773,8 +24804,8 @@ begin
     // can't calculate error on input layers: s in FOutput, then log1p, then tanh.
     TNNetVolume.Sigmoid(@FOutput.FData[0], @LocalPrevOutput.FData[0],
       LocalPrevOutput.Size);
-    for OutputCnt := 0 to SizeM1 do
-      FOutput.FData[OutputCnt] := pcr_log1pf(FOutput.FData[OutputCnt]);
+    TNNetVolume.AddScalar(@FOutput.FData[0], 1, LocalPrevOutput.Size);
+    TNNetVolume.Ln(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
     TNNetVolume.Tanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
     for OutputCnt := 0 to SizeM1 do
       FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt] * FOutput.FData[OutputCnt];
@@ -25384,8 +25415,8 @@ begin
   MaxY := FOutput.SizeY - 1;
   MaxD := HalfDepth - 1;
   {$IFNDEF AVXANY}
-  for X := 0 to MaxX do
-    for Y := 0 to MaxY do
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
       basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
       baseOut0  := FOutput.GetRawPos(X, Y);
@@ -25407,8 +25438,8 @@ begin
   // vectorized via TNNetVolume.Tanh (built on AVXExp): write the tanh
   // argument into the output row, vectorize tanh in place, then a scalar finish
   // (no transcendental) folds in B and A.
-  for X := 0 to MaxX do
-    for Y := 0 to MaxY do
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
       aPtr := FPrevLayer.FOutput.GetRawPtr(X, Y);
       // #13: b-half is a's constant-offset neighbour (+HalfDepth), no 2nd accessor
@@ -25466,8 +25497,8 @@ begin
     HasScratch := (FOutputErrorDeriv.Size = FOutput.Size);
     if HasScratch then
     begin
-      for X := 0 to MaxX do
-        for Y := 0 to MaxY do
+      for Y := 0 to MaxY do
+        for X := 0 to MaxX do
         begin
           basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
           baseErr0  := FOutputError.GetRawPos(X, Y);
@@ -25504,8 +25535,8 @@ begin
     end
     else
     begin
-      for X := 0 to MaxX do
-        for Y := 0 to MaxY do
+      for Y := 0 to MaxY do
+        for X := 0 to MaxX do
         begin
           basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
           baseErr0  := FOutputError.GetRawPos(X, Y);
@@ -25566,8 +25597,8 @@ begin
   MaxY := FOutput.SizeY - 1;
   MaxD := HalfDepth - 1;
   {$IFNDEF AVXANY}
-  for X := 0 to MaxX do
-    for Y := 0 to MaxY do
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
       basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
       baseOut0  := FOutput.GetRawPos(X, Y);
@@ -25587,8 +25618,8 @@ begin
   // ride is AVX-vectorized via TNNetVolume.Erf (built on AVXExp): write
   // B/sqrt(2) into the output row, vectorize erf in place, then a scalar finish
   // (no transcendental) folds in B and A.
-  for X := 0 to MaxX do
-    for Y := 0 to MaxY do
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
       aPtr := FPrevLayer.FOutput.GetRawPtr(X, Y);
       // #13: b-half is a's constant-offset neighbour (+HalfDepth), no 2nd accessor
@@ -25643,8 +25674,8 @@ begin
     HasScratch := (FOutputErrorDeriv.Size = FOutput.Size);
     if HasScratch then
     begin
-      for X := 0 to MaxX do
-        for Y := 0 to MaxY do
+      for Y := 0 to MaxY do
+        for X := 0 to MaxX do
         begin
           basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
           baseErr0  := FOutputError.GetRawPos(X, Y);
@@ -25677,8 +25708,8 @@ begin
     end
     else
     begin
-      for X := 0 to MaxX do
-        for Y := 0 to MaxY do
+      for Y := 0 to MaxY do
+        for X := 0 to MaxX do
         begin
           basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
           baseErr0  := FOutputError.GetRawPos(X, Y);
@@ -25758,8 +25789,8 @@ begin
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := OutDepth - 1;
-  for X := 0 to MaxX do
-    for Y := 0 to MaxY do
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
       basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
       baseOut0  := FOutput.GetRawPos(X, Y);
@@ -25806,8 +25837,8 @@ begin
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
     MaxD := OutDepth - 1;
-    for X := 0 to MaxX do
-      for Y := 0 to MaxY do
+    for Y := 0 to MaxY do
+      for X := 0 to MaxX do
       begin
         // FOutputError shares FOutput's shape (#13 equal-dims => one base).
         base0 := FOutput.GetRawPos(X, Y);
@@ -25950,8 +25981,8 @@ begin
     HasScratch := (FOutputErrorDeriv.Size = FOutput.Size);
     if HasScratch then
     begin
-      for X := 0 to MaxX do
-        for Y := 0 to MaxY do
+      for Y := 0 to MaxY do
+        for X := 0 to MaxX do
         begin
           basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
           baseErr0  := FOutputError.GetRawPos(X, Y);
@@ -25980,8 +26011,8 @@ begin
     end
     else
     begin
-      for X := 0 to MaxX do
-        for Y := 0 to MaxY do
+      for Y := 0 to MaxY do
+        for X := 0 to MaxX do
         begin
           basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
           baseErr0  := FOutputError.GetRawPos(X, Y);
@@ -26039,7 +26070,12 @@ var
   StartTime: double;
   MaxX, MaxY, MaxD: integer;
   X, Y, D, HalfDepth, gateIdx, basePrev0, baseOut0: integer;
-  alpha, limit, gate, up, sigmoidVal, glu: TNeuralFloat;
+  alpha, limit, gate, up: TNeuralFloat;
+  {$IFNDEF AVXANY}
+  sigmoidVal, glu: TNeuralFloat;
+  {$ELSE}
+  outPtr: TNeuralFloatArrPtr;
+  {$ENDIF}
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -26049,13 +26085,14 @@ begin
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := HalfDepth - 1;
-  for X := 0 to MaxX do
-    for Y := 0 to MaxY do
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
       basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
       baseOut0  := FOutput.GetRawPos(X, Y);
       // Interleaved: gate = even channel 2D, up = odd channel 2D+1.
       gateIdx := basePrev0;
+      {$IFNDEF AVXANY}
       for D := 0 to MaxD do
       begin
         gate := FPrevLayer.FOutput.FData[gateIdx];
@@ -26068,6 +26105,33 @@ begin
         FOutput.FData[baseOut0 + D] := (up + 1) * glu;
         Inc(gateIdx, 2);
       end;
+      {$ELSE}
+      // The gate half is strided, so it is gathered (upper-clamped and scaled
+      // by alpha) into the output row first; the row then feeds one vectorized
+      // Sigmoid instead of HalfDepth scalar exponentials, and a second scalar
+      // pass folds in the clamped gate and up halves.
+      for D := 0 to MaxD do
+      begin
+        gate := FPrevLayer.FOutput.FData[gateIdx];
+        if gate > limit then gate := limit;          // upper-clamp only
+        FOutput.FData[baseOut0 + D] := alpha * gate;
+        Inc(gateIdx, 2);
+      end;
+      outPtr := FOutput.GetRawPtr(baseOut0);
+      TNNetVolume.Sigmoid(outPtr, outPtr, HalfDepth);
+      gateIdx := basePrev0;
+      for D := 0 to MaxD do
+      begin
+        gate := FPrevLayer.FOutput.FData[gateIdx];
+        up   := FPrevLayer.FOutput.FData[gateIdx + 1];
+        if gate > limit then gate := limit;
+        if up >  limit then up :=  limit;
+        if up < -limit then up := -limit;
+        FOutput.FData[baseOut0 + D] :=
+          (up + 1) * gate * FOutput.FData[baseOut0 + D];
+        Inc(gateIdx, 2);
+      end;
+      {$ENDIF}
     end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -26079,6 +26143,8 @@ var
   X, Y, D, HalfDepth, gateIdx, upIdx, basePrev0, baseErr0: integer;
   alpha, limit, gateRaw, upRaw, gate, up: TNeuralFloat;
   sigmoidVal, glu, gluDeriv, err: TNeuralFloat;
+  HasScratch: boolean;
+  sigPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -26093,12 +26159,34 @@ begin
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
     MaxD := HalfDepth - 1;
-    for X := 0 to MaxX do
-      for Y := 0 to MaxY do
+    // FOutputErrorDeriv is sized alongside FOutputError by SetOutputErrorSize and
+    // is never otherwise used by this layer, so it serves as the per-row sigmoid
+    // scratch without any allocation. It collapses to (1,1,1) on a
+    // non-trainable layer, hence the guard and the scalar sigmoid below.
+    HasScratch := (FOutputErrorDeriv.Size = FOutput.Size);
+    sigPtr := nil;
+    for Y := 0 to MaxY do
+      for X := 0 to MaxX do
       begin
         basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
         baseErr0  := FOutputError.GetRawPos(X, Y);
         gateIdx := basePrev0;
+        if HasScratch then
+        begin
+          // The gate half is strided, so it is gathered (upper-clamped and
+          // scaled by alpha) into the scratch row, which then feeds one
+          // vectorized Sigmoid instead of HalfDepth scalar exponentials.
+          sigPtr := FOutputErrorDeriv.GetRawPtr(baseErr0);
+          for D := 0 to MaxD do
+          begin
+            gate := FPrevLayer.FOutput.FData[gateIdx];
+            if gate > limit then gate := limit;
+            sigPtr^[D] := alpha * gate;
+            Inc(gateIdx, 2);
+          end;
+          TNNetVolume.Sigmoid(sigPtr, sigPtr, HalfDepth);
+          gateIdx := basePrev0;
+        end;
         for D := 0 to MaxD do
         begin
           upIdx   := gateIdx + 1;
@@ -26109,7 +26197,9 @@ begin
           if gate > limit then gate := limit;
           if up >  limit then up :=  limit;
           if up < -limit then up := -limit;
-          sigmoidVal := 1 / (1 + NeuralExp(-alpha * gate));
+          if HasScratch
+            then sigmoidVal := sigPtr^[D]
+            else sigmoidVal := 1 / (1 + NeuralExp(-alpha * gate));
           glu := gate * sigmoidVal;
           // d glu / d gate = sigmoid + gate*alpha*sigmoid*(1-sigmoid).
           gluDeriv := sigmoidVal +
@@ -26160,8 +26250,8 @@ begin
   MaxY := FOutput.SizeY - 1;
   MaxD := HalfDepth - 1;
   {$IFNDEF AVXANY}
-  for X := 0 to MaxX do
-    for Y := 0 to MaxY do
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
       basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
       baseOut0  := FOutput.GetRawPos(X, Y);
@@ -26179,8 +26269,8 @@ begin
   // depth-axis run, so GLU = A*sigmoid(B) maps onto the AVX vector primitives:
   // Sigmoid writes sigmoid(B) into the output row (built on AVXExp), then
   // an AVX elementwise Mul folds in A.
-  for X := 0 to MaxX do
-    for Y := 0 to MaxY do
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
       aPtr := FPrevLayer.FOutput.GetRawPtr(X, Y);
       // #13: b-half is a's constant-offset neighbour (+HalfDepth), no 2nd accessor
@@ -26220,8 +26310,8 @@ begin
     HasScratch := (FOutputErrorDeriv.Size = FOutput.Size);
     if HasScratch then
     begin
-      for X := 0 to MaxX do
-        for Y := 0 to MaxY do
+      for Y := 0 to MaxY do
+        for X := 0 to MaxX do
         begin
           basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
           baseErr0  := FOutputError.GetRawPos(X, Y);
@@ -26248,8 +26338,8 @@ begin
     end
     else
     begin
-      for X := 0 to MaxX do
-        for Y := 0 to MaxY do
+      for Y := 0 to MaxY do
+        for X := 0 to MaxX do
         begin
           basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
           baseErr0  := FOutputError.GetRawPos(X, Y);
@@ -26313,8 +26403,8 @@ begin
   MaxY := FOutput.SizeY - 1;
   MaxD := HalfDepth - 1;
   {$IFNDEF AVXANY}
-  for X := 0 to MaxX do
-    for Y := 0 to MaxY do
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
       basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
       baseOut0  := FOutput.GetRawPos(X, Y);
@@ -26332,8 +26422,8 @@ begin
   // are each a contiguous depth-axis run, so the relu ride is AVX-vectorized
   // via TNNetVolume.Relu: write ReLU(A) into the output row, then an AVX
   // elementwise Mul folds in B. Bit-exact (relu is a compare-and-select).
-  for X := 0 to MaxX do
-    for Y := 0 to MaxY do
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
       aPtr := FPrevLayer.FOutput.GetRawPtr(X, Y);
       // #13: b-half is a's constant-offset neighbour (+HalfDepth), no 2nd accessor
@@ -26364,8 +26454,8 @@ begin
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
     MaxD := HalfDepth - 1;
-    for X := 0 to MaxX do
-      for Y := 0 to MaxY do
+    for Y := 0 to MaxY do
+      for X := 0 to MaxX do
       begin
         basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
         baseErr0  := FOutputError.GetRawPos(X, Y);
@@ -26445,8 +26535,8 @@ begin
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := HalfDepth - 1;
-  for X := 0 to MaxX do
-    for Y := 0 to MaxY do
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
       basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
       // FEps mirrors FOutput's shape (#13 equal-dims => one base indexes both).
@@ -26498,8 +26588,8 @@ begin
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
     MaxD := HalfDepth - 1;
-    for X := 0 to MaxX do
-      for Y := 0 to MaxY do
+    for Y := 0 to MaxY do
+      for X := 0 to MaxX do
       begin
         basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
         // FOutputError and FEps share FOutput's shape (#13 equal-dims => one base).
@@ -26545,39 +26635,39 @@ end;
 procedure TNNetVAEKLDivergence.Backpropagate();
 var
   StartTime: double;
-  MaxX, MaxY, MaxD: integer;
-  X, Y, D, HalfDepth, base0, idx, idxHi: integer;
-  mu, logVar, beta: TNeuralFloat;
+  MaxX, MaxY: integer;
+  X, Y, HalfDepth, base0: integer;
+  beta, betaHalf: TNeuralFloat;
+  errPtr, errHiPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
   beta := FFloatSt[0];
+  betaHalf := beta * 0.5;
   HalfDepth := FOutput.Depth shr 1; // #15: div 2, dimension is non-negative
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
-  MaxD := HalfDepth - 1;
   // Self-contained penalty head: IGNORE the framework-seeded residual and
   // overwrite FOutputError with the analytic KL gradient over (mu | log_var).
   if HalfDepth >= 1 then
   begin
-    for X := 0 to MaxX do
-      for Y := 0 to MaxY do
+    for Y := 0 to MaxY do
+      for X := 0 to MaxX do
       begin
         // FOutputError shares FOutput's shape (#13 equal-dims => one base).
         base0 := FOutput.GetRawPos(X, Y);
-        for D := 0 to MaxD do
-        begin
-          idx   := base0 + D;          // #4: formed once per iteration
-          idxHi := idx + HalfDepth;
-          mu     := FOutput.FData[idx];
-          logVar := FOutput.FData[idxHi];
-          // dKL/dmu = mu ; dKL/dlog_var = 0.5*(exp(log_var) - 1)
-          FOutputError.FData[idx] := beta * mu;
-          FOutputError.FData[idxHi] :=
-            beta * 0.5 * (NeuralExp(logVar) - 1.0);
-        end;
+        // Both halves are contiguous depth runs, so each analytic gradient is a
+        // sequence of bulk passes (#13): dKL/dmu = mu and
+        // dKL/dlog_var = 0.5*(exp(log_var) - 1), both scaled by beta.
+        errPtr := FOutputError.GetRawPtr(base0);
+        errHiPtr := FOutputError.GetRawPtr(base0 + HalfDepth);
+        Move(FOutput.FData[base0], errPtr^, HalfDepth * csNeuralFloatSize);
+        TNNetVolume.Mul(errPtr, beta, HalfDepth);
+        TNNetVolume.Exp(errHiPtr, FOutput.GetRawPtr(base0 + HalfDepth), HalfDepth);
+        TNNetVolume.AddScalar(errHiPtr, -1.0, HalfDepth);
+        TNNetVolume.Mul(errHiPtr, betaHalf, HalfDepth);
       end;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -26624,8 +26714,8 @@ begin
   MaxY := FOutput.SizeY - 1;
   MaxD := HalfDepth - 1;
   {$IFNDEF AVXANY}
-  for X := 0 to MaxX do
-    for Y := 0 to MaxY do
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
       basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
       baseOut0  := FOutput.GetRawPos(X, Y);
@@ -26644,8 +26734,8 @@ begin
   // passes: ReLU(B) into the output via Relu, an in-place elementwise
   // square, then an elementwise Mul by A. The products are re-associated as
   // A*(r*r) instead of (A*r)*r, so this is equivalent but not bit-identical.
-  for X := 0 to MaxX do
-    for Y := 0 to MaxY do
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
       aPtr := FPrevLayer.FOutput.GetRawPtr(X, Y);
       // #13: b-half is a's constant-offset neighbour (+HalfDepth), no 2nd accessor
@@ -26677,8 +26767,8 @@ begin
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
     MaxD := HalfDepth - 1;
-    for X := 0 to MaxX do
-      for Y := 0 to MaxY do
+    for Y := 0 to MaxY do
+      for X := 0 to MaxX do
       begin
         basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
         baseErr0  := FOutputError.GetRawPos(X, Y);
@@ -26742,8 +26832,8 @@ begin
   MaxY := FOutput.SizeY - 1;
   MaxD := HalfDepth - 1;
   {$IFNDEF AVXANY}
-  for X := 0 to MaxX do
-    for Y := 0 to MaxY do
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
       basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
       baseOut0  := FOutput.GetRawPos(X, Y);
@@ -26761,8 +26851,8 @@ begin
   // are each a contiguous depth-axis run, so the tanh ride is AVX-vectorized via
   // TNNetVolume.Tanh (built on AVXExp): write tanh(B) into the output row,
   // then an AVX elementwise Mul folds in A.
-  for X := 0 to MaxX do
-    for Y := 0 to MaxY do
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
       aPtr := FPrevLayer.FOutput.GetRawPtr(X, Y);
       // #13: b-half is a's constant-offset neighbour (+HalfDepth), no 2nd accessor
@@ -26793,8 +26883,8 @@ begin
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
     MaxD := HalfDepth - 1;
-    for X := 0 to MaxX do
-      for Y := 0 to MaxY do
+    for Y := 0 to MaxY do
+      for X := 0 to MaxX do
       begin
         basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
         baseErr0  := FOutputError.GetRawPos(X, Y);
@@ -26858,8 +26948,8 @@ begin
   // a contiguous depth-axis run, so the three scalar reductions map 1:1 onto
   // the depth-contiguous TNNetVolume.DotProduct primitive (mirrors
   // TNNetPixelNorm / TNNetCosineSimilarityAttention).
-  for X := 0 to MaxX do
-    for Y := 0 to MaxY do
+  for Y := 0 to MaxY do
+    for X := 0 to MaxX do
     begin
       aPtr := FPrevLayer.FOutput.GetRawPtr(X, Y);
       // #13: b-half is a's constant-offset neighbour (+HalfDepth), no 2nd accessor
@@ -26894,8 +26984,8 @@ begin
     HalfDepth := FPrevLayer.FOutput.Depth shr 1; // #15: div 2, dimension is non-negative
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
-    for X := 0 to MaxX do
-      for Y := 0 to MaxY do
+    for Y := 0 to MaxY do
+      for X := 0 to MaxX do
       begin
         aPtr := FPrevLayer.FOutput.GetRawPtr(X, Y);
         // #13: b-half is a's constant-offset neighbour (+HalfDepth)
