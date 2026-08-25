@@ -64819,8 +64819,9 @@ begin
 end;
 
 // LUm[i][j] for i = row (output channel), j = column (input channel), stored as
-// FWeights.Get(j, 0, i) so that the i-th row is contiguous in the C-block.
-// Helpers below index it as Ptr := FWeights.GetRawPtr(0,0,i)^[j].
+// FWeights.Get(i, 0, j): the (C,1,C) volume keeps the Depth axis contiguous, so
+// putting the row on the X axis makes row i the contiguous C-block at i*C.
+// Helpers below index it as Ptr := FWeights.GetRawPtr(i,0)^[j].
 procedure TNNetInvertible1x1Conv.Compute();
 var
   StartTime: double;
@@ -64860,7 +64861,7 @@ begin
         // t1 = (U + diag(s)) * x : U strictly upper, diag = s.
         for i := 0 to MaxFC do
         begin
-          LURow := LU.GetRawPtr(0, 0, i);
+          LURow := LU.GetRawPtr(i, 0);
           acc := SPtr^[i] * InPtr^[i];
           iP1 := i + 1;
           if i < MaxFC then
@@ -64871,7 +64872,7 @@ begin
         // t2 = L * t1 : L unit-lower (diag implicit 1).
         for i := 0 to MaxFC do
         begin
-          LURow := LU.GetRawPtr(0, 0, i);
+          LURow := LU.GetRawPtr(i, 0);
           acc := T1Ptr^[i];
           if i > 0 then
             acc := acc + TNNetVolume.DotProduct(LURow, T1Ptr, i);
@@ -64888,7 +64889,7 @@ begin
         // Solve L * t1 = t2 (forward substitution, unit diagonal).
         for i := 0 to MaxFC do
         begin
-          LURow := LU.GetRawPtr(0, 0, i);
+          LURow := LU.GetRawPtr(i, 0);
           acc := T2Ptr^[i];
           if i > 0 then
             acc := acc - TNNetVolume.DotProduct(LURow, T1Ptr, i);
@@ -64897,7 +64898,7 @@ begin
         // Solve (U + diag(s)) * x = t1 (back substitution).
         for i := MaxFC downto 0 do
         begin
-          LURow := LU.GetRawPtr(0, 0, i);
+          LURow := LU.GetRawPtr(i, 0);
           acc := T1Ptr^[i];
           iP1 := i + 1;
           if i < MaxFC then
@@ -64978,8 +64979,8 @@ begin
       for j := 0 to MaxFC do FgT1ArrBuf[j] := FgT2ArrBuf[j];
       for i := 0 to MaxFC do
       begin
-        LURow := LU.GetRawPtr(0, 0, i);
-        dLURow := dLU.GetRawPtr(0, 0, i);
+        LURow := LU.GetRawPtr(i, 0);
+        dLURow := dLU.GetRawPtr(i, 0);
         gt2 := FgT2ArrBuf[i];
         if i > 0 then
         begin
@@ -64992,8 +64993,8 @@ begin
       // dL/ds[i] = gT1[i]*x[i] ; dL/dU[i][j] = gT1[i]*x[j] (j>i).
       for i := 0 to MaxFC do
       begin
-        LURow := LU.GetRawPtr(0, 0, i);
-        dLURow := dLU.GetRawPtr(0, 0, i);
+        LURow := LU.GetRawPtr(i, 0);
+        dLURow := dLU.GetRawPtr(i, 0);
         gt1 := FgT1ArrBuf[i];
         dSPtr^[i] := dSPtr^[i] + (-lr) * gt1 * InPtr^[i];
         if hasInputGrad then
@@ -65040,7 +65041,7 @@ begin
   LU.Fill(0);
   for i := 0 to MaxFC do
   begin
-    LURow := LU.GetRawPtr(0, 0, i);
+    LURow := LU.GetRawPtr(i, 0);
     for j := 0 to MaxFC do
       if j <> i then
         LURow^[j] := LU.RandomGaussianValue() * 0.05;

@@ -906,6 +906,7 @@ type
     procedure TestInvertible1x1ConvLogDetGradientCheck;
     procedure TestInvertible1x1ConvInverseIdentity;
     procedure TestInvertible1x1ConvLogDetValue;
+    procedure TestInvertible1x1ConvMatrixProduct;
     procedure TestInvertible1x1ConvSerializationRoundTrip;
     procedure TestActNormInputGradientCheck;
     procedure TestActNormWeightGradientCheck;
@@ -34914,12 +34915,12 @@ procedure SeedInvertible1x1Conv(L: TNNetInvertible1x1Conv);
 var i, c, row, col: integer;
 begin
   c := L.Neurons[1].Weights.Size; // == C
-  // Neuron 0: packed LU matrix stored FWeights.Get(col,0,row).
+  // Neuron 0: packed LU matrix stored FWeights.Get(row,0,col).
   for row := 0 to c - 1 do
     for col := 0 to c - 1 do
       if row <> col then
-        L.Neurons[0].Weights.Add(col, 0, row,
-          Sin(row * 0.9 + col * 1.7) * 0.25 - L.Neurons[0].Weights.Get(col, 0, row));
+        L.Neurons[0].Weights.Add(row, 0, col,
+          Sin(row * 0.9 + col * 1.7) * 0.25 - L.Neurons[0].Weights.Get(row, 0, col));
   // Neuron 1: log-scale vector s, bounded away from 0 in (0.5, 1.5).
   for i := 0 to c - 1 do
     L.Neurons[1].Weights.Raw[i] := 1.0 + Sin(i * 1.1) * 0.4;
@@ -35182,6 +35183,95 @@ begin
       ' expected=', expected:0:6);
     AssertEquals('Invertible1x1Conv LogDetJacobian == SizeX*SizeY*sum(ln|s|)',
       expected, L.LogDetJacobian, 1e-4);
+  finally
+    NN.Free; X.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestInvertible1x1ConvMatrixProduct;
+// The realized C x C matrix must be a row permutation of L*(U+diag(s)) rebuilt
+// independently from the packed LU weights. A packing where L and U entries
+// shared storage cells would stay self-consistent -- passing the gradient,
+// inverse and log-det checks -- while realizing a degenerate matrix, so this is
+// the check that pins the packed layout down.
+const
+  C = 5;
+var
+  NN: TNNet;
+  L: TNNetInvertible1x1Conv;
+  X, LUw, Sw: TNNetVolume;
+  Mref, Wobs: array[0..C-1, 0..C-1] of TNeuralFloat;
+  used: array[0..C-1] of boolean;
+  i, j, k, col, best, matched: integer;
+  lik, ukj, acc, rowErr, bestErr, maxErr: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  X := TNNetVolume.Create(C, 1, C);
+  matched := 0;
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(C, 1, C, 1));
+    L := TNNetInvertible1x1Conv.Create(false, 3);
+    NN.AddLayer(L);
+    SeedInvertible1x1Conv(L);
+    LUw := L.Neurons[0].Weights;
+    Sw := L.Neurons[1].Weights;
+    // Column x of the input is the basis vector e_x, so output column x is W[:,x].
+    X.Fill(0);
+    for i := 0 to C - 1 do X.Raw[X.GetRawPos(i, 0, i)] := 1;
+    NN.Compute(X);
+    for i := 0 to C - 1 do
+      for col := 0 to C - 1 do
+        Wobs[i, col] := NN.GetLastLayer.Output.Get(col, 0, i);
+    // Mref = L * (U + diag(s)): L unit-lower, U strictly upper, diagonal = s.
+    for i := 0 to C - 1 do
+      for j := 0 to C - 1 do
+      begin
+        acc := 0;
+        for k := 0 to C - 1 do
+        begin
+          if k = i then lik := 1
+          else if k < i then lik := LUw.Get(i, 0, k)
+          else lik := 0;
+          if lik = 0 then continue;
+          if k = j then ukj := Sw.Raw[k]
+          else if j > k then ukj := LUw.Get(k, 0, j)
+          else ukj := 0;
+          acc := acc + lik * ukj;
+        end;
+        Mref[i, j] := acc;
+      end;
+    // P only permutes rows, so pair each realized row with a distinct Mref row.
+    for i := 0 to C - 1 do used[i] := false;
+    for i := 0 to C - 1 do
+    begin
+      best := -1;
+      bestErr := 0;
+      for k := 0 to C - 1 do
+        if not used[k] then
+        begin
+          rowErr := 0;
+          for j := 0 to C - 1 do
+            if Abs(Wobs[i, j] - Mref[k, j]) > rowErr then
+              rowErr := Abs(Wobs[i, j] - Mref[k, j]);
+          if (best < 0) or (rowErr < bestErr) then
+          begin
+            best := k;
+            bestErr := rowErr;
+          end;
+        end;
+      if bestErr < 1e-5 then
+      begin
+        used[best] := true;
+        Inc(matched);
+        if bestErr > maxErr then maxErr := bestErr;
+      end;
+    end;
+    WriteLn('Invertible1x1Conv W = P*L*(U+diag(s)) matched rows: ', matched,
+      '/', C, ' max abs error: ', maxErr:0:8);
+    AssertEquals('Invertible1x1Conv realized W is a row permutation of L*(U+diag(s))',
+      C, matched);
   finally
     NN.Free; X.Free;
   end;
