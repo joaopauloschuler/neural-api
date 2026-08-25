@@ -65477,19 +65477,18 @@ var
 
   procedure LoadEmbTable(Layer: TNNetLayer; const TName: string;
     Rows, Cols, SrcRowOffset: integer);
-  var Tmp: TNNetVolume; ElementCnt, UsedSize, UsedSizeM1: integer;
+  var Tmp: TNNetVolume; UsedSize: integer;
   begin
     Tmp := TNNetVolume.Create;
     try
       Reader.LoadTensorFlat(TName, Tmp);
       EnsureWritableImportWeights(Layer);
       UsedSize := (Rows - SrcRowOffset) * Cols;
-      UsedSizeM1 := UsedSize - 1;
       if SrcRowOffset = 0 then Layer.FArrNeurons[0].Weights.Copy(Tmp)
       else
-        for ElementCnt := 0 to UsedSizeM1 do
-          Layer.FArrNeurons[0].Weights.FData[ElementCnt] :=
-            Tmp.FData[SrcRowOffset * Cols + ElementCnt];
+        // The skipped rows are a prefix, so the kept rows are one contiguous run.
+        Move(Tmp.FData[SrcRowOffset * Cols],
+          Layer.FArrNeurons[0].Weights.FData[0], UsedSize * csNeuralFloatSize);
       Layer.FlushWeightCache();
     finally
       Tmp.Free;
@@ -65653,9 +65652,9 @@ procedure ClapBatchNormMelImage(Reader: TNNetSafeTensorsReader;
   RawMel: TNNetVolume; Image: TNNetVolume; const Config: TClapAudioConfig);
 var
   Gamma, Beta, Mean, Var_: TNNetVolume;
-  f, Time, Mel, FreqRatio, Spec, hh, ww, c2, srcT, SpecM1, MelM1: integer;
-  imgPos, imgStride: integer;
-  Eps: TNeuralFloat;
+  f, Time, Mel, FreqRatio, Spec, hh, ww, c2, srcPos, SpecM1, MelM1: integer;
+  imgPos: integer;
+  Eps, ScaleF, BiasF: TNeuralFloat;
   EncPrefix: string;
 begin
   Mel := Config.NumMelBins;
@@ -65708,18 +65707,22 @@ begin
       Gamma.FData[f] := Gamma.FData[f] / Sqrt(Var_.FData[f] + Eps);
       Beta.FData[f] := Beta.FData[f] - Mean.FData[f] * Gamma.FData[f];
     end;
-    imgStride := Image.GetRawPos(0, 1, 0);  // = Spec; elements between consecutive hh
-    for ww := 0 to SpecM1 do          // W = time // fr axis
+    // H outer: the mel bin, the time chunk and the folded affine pair depend
+    // only on hh (#11), and both the Image row and the RawMel column walk
+    // forward by a constant step across ww (#6/#12).
+    for hh := 0 to SpecM1 do          // H = freq * fr axis
     begin
-      imgPos := ww;                   // = Image.GetRawPos(ww, 0, 0); the hh = 0 offset
-      for hh := 0 to SpecM1 do        // H = freq * fr axis
+      f := hh mod Mel;                // mel bin
+      c2 := hh div Mel;               // time chunk
+      ScaleF := Gamma.FData[f];
+      BiasF := Beta.FData[f];
+      imgPos := Image.GetRawPos(0, hh);   // depth 1: one element per ww
+      srcPos := (c2 * Spec) * Mel + f;    // source frame c2*Spec+ww, mel bin f
+      for ww := 0 to SpecM1 do        // W = time // fr axis
       begin
-        f := hh mod Mel;                // mel bin
-        c2 := hh div Mel;               // time chunk
-        srcT := c2 * Spec + ww;         // source time frame
-        Image.FData[imgPos] :=
-          RawMel.FData[srcT * Mel + f] * Gamma.FData[f] + Beta.FData[f];
-        Inc(imgPos, imgStride);
+        Image.FData[imgPos] := RawMel.FData[srcPos] * ScaleF + BiasF;
+        Inc(imgPos);
+        Inc(srcPos, Mel);
       end;
     end;
   finally
@@ -66080,6 +66083,7 @@ procedure LPIPSUnitNormalize(Feat: TNNetVolume; Eps: TNeuralFloat = 1e-10);
 var
   Loc, c, D, NumLoc: integer;
   Base, NumLocM1, DM1: integer;
+  LocPtr: TNeuralFloatArrPtr;
   SumSq, InvNorm: TNeuralFloat;
 begin
   D := Feat.Depth;
@@ -66091,9 +66095,10 @@ begin
   Base := 0;
   for Loc := 0 to NumLocM1 do
   begin
-    SumSq := TNNetVolume.DotProduct(Feat.GetRawPtr(Base), Feat.GetRawPtr(Base), D);
+    LocPtr := Feat.GetRawPtr(Base);
+    SumSq := TNNetVolume.DotProduct(LocPtr, LocPtr, D);
     InvNorm := 1.0 / Sqrt(SumSq + Eps);
-    TNNetVolume.Mul(Feat.GetRawPtr(Base), InvNorm, D);
+    TNNetVolume.Mul(LocPtr, InvNorm, D);
     Inc(Base, D);
   end;
 end;
@@ -66127,15 +66132,17 @@ begin
   end
   else
   begin
+    // The depth axis is contiguous, so the location base advances by D (#6).
+    Base := 0;
     for Loc := 0 to NumLocM1 do
     begin
-      Base := Loc * D;
       for c := 0 to DM1 do
       begin
         idx := Base + c;
         Diff := A.FData[idx] - B.FData[idx];
         Acc := Acc + LinWeights[c] * Diff * Diff;
       end;
+      Inc(Base, D);
     end;
   end;
   // Spatial mean over H*W (channel weighting already applied per location).
@@ -67852,6 +67859,39 @@ begin
   ImportError('SD UNet: net has no TNNetInput #' + IntToStr(N) + '.');
 end;
 
+// Copies Vols[0..Count-1] into the Count consecutive TNNetInput layers starting
+// at input index StartIdx, in ONE pass over the layer list. What names the
+// caller's slot in the size-mismatch message.
+procedure SDUNetCopyIntoInputs(Net: TNNet; StartIdx, Count: integer;
+  const Vols: array of TNNetVolume; const What: string);
+var
+  LayerIdx, InputCnt, Slot, LayersM1: integer;
+  InLayer: TNNetLayer;
+begin
+  if Count <= 0 then Exit;
+  InputCnt := 0;
+  Slot := 0;
+  LayersM1 := Net.CountLayers() - 1;
+  for LayerIdx := 0 to LayersM1 do
+    if Net.Layers[LayerIdx] is TNNetInput then
+    begin
+      if InputCnt >= StartIdx then
+      begin
+        InLayer := Net.Layers[LayerIdx];
+        if Vols[Slot].Size <> InLayer.Output.Size then
+          ImportError(What + ' ' + IntToStr(Slot) + ' size ' +
+            IntToStr(Vols[Slot].Size) + ' <> net input #' + IntToStr(InputCnt) +
+            ' size ' + IntToStr(InLayer.Output.Size) + '.');
+        InLayer.Output.Copy(Vols[Slot]);
+        Inc(Slot);
+        if Slot = Count then Exit;
+      end;
+      Inc(InputCnt);
+    end;
+  ImportError(What + ': net has ' + IntToStr(InputCnt) +
+    ' TNNetInput layers, needs ' + IntToStr(StartIdx + Count) + '.');
+end;
+
 function SDUNetTimestepInput(Net: TNNet): TNNetLayer;
 begin
   Result := SDUNetNthInput(Net, 1);
@@ -68029,8 +68069,7 @@ procedure SDUNetDenoiseWithControl(Net: TNNet; const Config: TSDUNetConfig;
   Noise: TNNetVolume);
 var
   TextIn, CtrlLayer: TNNetLayer;
-  DownCnt, i, InputIdx: integer;
-  DownCntM1: integer;
+  DownCnt, SkipBase: integer;
 begin
   DownCnt := SDUNetControlDownCount(Config);
   if Length(DownResiduals) < DownCnt then
@@ -68046,18 +68085,10 @@ begin
   TextIn.Output.Copy(EncStates);
   // Control inputs are TNNetInputs #3.. : the DownCnt skip inputs (build order:
   // conv_in, per down resnet, per downsampler) then the mid input LAST.
-  DownCntM1 := DownCnt - 1;
-  for i := 0 to DownCntM1 do
-  begin
-    InputIdx := SDUNetSkipInputBase(Config) + i;
-    CtrlLayer := SDUNetNthInput(Net, InputIdx);
-    if DownResiduals[i].Size <> CtrlLayer.Output.Size then
-      ImportError('SDUNetDenoiseWithControl: down residual ' + IntToStr(i) +
-        ' size ' + IntToStr(DownResiduals[i].Size) + ' <> skip control input #' +
-        IntToStr(InputIdx) + ' size ' + IntToStr(CtrlLayer.Output.Size) + '.');
-    CtrlLayer.Output.Copy(DownResiduals[i]);
-  end;
-  CtrlLayer := SDUNetNthInput(Net, SDUNetSkipInputBase(Config) + DownCnt); // mid control input (last)
+  SkipBase := SDUNetSkipInputBase(Config);
+  SDUNetCopyIntoInputs(Net, SkipBase, DownCnt, DownResiduals,
+    'SDUNetDenoiseWithControl: down residual');
+  CtrlLayer := SDUNetNthInput(Net, SkipBase + DownCnt); // mid control input (last)
   if MidResidual.Size <> CtrlLayer.Output.Size then
     ImportError('SDUNetDenoiseWithControl: mid residual size ' +
       IntToStr(MidResidual.Size) + ' <> mid control input size ' +
@@ -68076,9 +68107,8 @@ procedure SDUNetDenoiseWithAdapter(Net: TNNet; const Config: TSDUNetConfig;
   Latent, EncStates: TNNetVolume; t: TNeuralFloat;
   AdapterFeatures: array of TNNetVolume; Noise: TNNetVolume);
 var
-  TextIn, AdpLayer: TNNetLayer;
-  Cnt, i, InputIdx: integer;
-  CntM1: integer;
+  TextIn: TNNetLayer;
+  Cnt: integer;
 begin
   Cnt := SDUNetAdapterFeatureCount(Config);
   if Length(AdapterFeatures) < Cnt then
@@ -68094,17 +68124,8 @@ begin
       IntToStr(TextIn.Output.Size) + '.');
   TextIn.Output.Copy(EncStates);
   // Adapter inputs are TNNetInputs #3.. : one per down block, in build order.
-  CntM1 := Cnt - 1;
-  for i := 0 to CntM1 do
-  begin
-    InputIdx := SDUNetSkipInputBase(Config) + i;
-    AdpLayer := SDUNetNthInput(Net, InputIdx);
-    if AdapterFeatures[i].Size <> AdpLayer.Output.Size then
-      ImportError('SDUNetDenoiseWithAdapter: adapter feature ' + IntToStr(i) +
-        ' size ' + IntToStr(AdapterFeatures[i].Size) + ' <> adapter input #' +
-        IntToStr(InputIdx) + ' size ' + IntToStr(AdpLayer.Output.Size) + '.');
-    AdpLayer.Output.Copy(AdapterFeatures[i]);
-  end;
+  SDUNetCopyIntoInputs(Net, SDUNetSkipInputBase(Config), Cnt, AdapterFeatures,
+    'SDUNetDenoiseWithAdapter: adapter feature');
   Net.Compute(Latent);
   Net.GetOutput(Noise);
 end;
@@ -68590,9 +68611,8 @@ procedure ControlNetResiduals(Net: TNNet; const Config: TControlNetConfig;
   DownResiduals: array of TNNetVolume; MidResidual: TNNetVolume);
 var
   TextIn, CondIn: TNNetLayer;
-  Taps: array of TNNetLayer;
-  TapCount, i: integer;
-  TapCountM1, NumDownResidualsM1: integer;
+  TapBase, i: integer;
+  NumDownResidualsM1: integer;
 begin
   if Length(DownResiduals) < Config.NumDownResiduals then
     ImportError('ControlNetResiduals: DownResiduals has ' +
@@ -68614,15 +68634,11 @@ begin
   Net.Compute(Latent);
   // The residual taps are the LAST NumDownResiduals+1 layers of the net, built
   // CONSECUTIVELY as [down taps..., mid tap] (no sink layer follows them).
-  TapCount := Config.NumDownResiduals + 1;
-  SetLength(Taps, TapCount);
-  TapCountM1 := TapCount - 1;
-  for i := 0 to TapCountM1 do
-    Taps[i] := Net.Layers[Net.CountLayers() - TapCount + i];
+  TapBase := Net.CountLayers() - (Config.NumDownResiduals + 1);
   NumDownResidualsM1 := Config.NumDownResiduals - 1;
   for i := 0 to NumDownResidualsM1 do
-    DownResiduals[i].Copy(Taps[i].Output);
-  MidResidual.Copy(Taps[Config.NumDownResiduals].Output);
+    DownResiduals[i].Copy(Net.Layers[TapBase + i].Output);
+  MidResidual.Copy(Net.Layers[TapBase + Config.NumDownResiduals].Output);
 end;
 
 // ===========================================================================
@@ -68956,7 +68972,8 @@ begin
   if Cond.Size <> CondIn.Output.Size then
     ImportError('T2IAdapterFeatures: hint image size ' + IntToStr(Cond.Size) +
       ' <> net cond input size ' + IntToStr(CondIn.Output.Size) + '.');
-  CondIn.Output.Copy(Cond);
+  // TNNet.Compute copies Cond into layer 0 (the cond TNNetInput) itself; the
+  // size test above only exists to report the mismatch by name.
   Net.Compute(Cond);
   // The feature outputs are the LAST TNNetSum of each block. Each block ends with
   // the residual-add of its final adapter ResnetBlock; collect the per-block
