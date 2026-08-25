@@ -306,7 +306,7 @@ type
     // creates a random binary test from action array
     function CreateActionRandomBinaryTest(): TOperation;
 
-    function OperateAndTestOperation(Oper: TOperation; BasePosition: integer;
+    function OperateAndTestOperation(const Oper: TOperation; BasePosition: integer;
       var NextState: byte): byte;
     function TestTests(var Tests: TTestsClass): integer;
   end;
@@ -729,8 +729,8 @@ end;
 procedure TCreateValidOperations.Create(Tests, FullEqual: boolean;
   var ERRORS: array of byte);
 var
-  LocalNonZeroPrevStates, NonZeroErrors: TPositionArray;
-  LocalNonZeroPrevStatesCount, NonZeroErrorsCount: integer;
+  LocalNonZeroPrevStates: TPositionArray;
+  LocalNonZeroPrevStatesCount: integer;
   LocalNumberOfPreviousStates: integer;
   LocalPreviousStates: array of byte;
   OnAction: boolean;
@@ -895,13 +895,9 @@ var
 
 
 var
-  NumberOfErrors: integer;
   RunOnActionFlag: integer;
 begin
   Clear;
-  SetLength(NonZeroErrors,Self.NumberOfCurrentStates);
-  NumberOfErrors := NumberOfNextStates;
-  NonZeroErrorsCount := getNonZeroElementsPos(NumberOfErrors, ERRORS, NonZeroErrors);
 
   if not(FCS.TestOnStates) then RunOnActionFlag := 1
   else if not(FCS.TestOnActions) then RunOnActionFlag := 0
@@ -912,9 +908,9 @@ begin
   begin
     // using LocalPreviousStates
     LocalNumberOfPreviousStates := NumberOfActions;
-    SetLength(LocalPreviousStates, NumberOfActions);
     SetLength(LocalNonZeroPrevStates, NumberOfActions);
-    ABCopy(LocalPreviousStates, Actions);
+    // Read-only alias (a dynamic-array reference), not a copy of the bytes.
+    LocalPreviousStates := Actions;
     LocalNonZeroPrevStatesCount := getNonZeroElementsPos(LocalNumberOfPreviousStates, LocalPreviousStates,
       LocalNonZeroPrevStates);
     OnAction := True;
@@ -926,8 +922,7 @@ begin
     LocalNonZeroPrevStatesCount := getNonZeroElementsPos(NumberOfCurrentStates, CurrentStates, LocalNonZeroPrevStates);
     OnAction := False;
     LocalNumberOfPreviousStates := NumberOfCurrentStates;
-    SetLength(LocalPreviousStates, NumberOfCurrentStates);
-    ABCopy(LocalPreviousStates, CurrentStates);
+    LocalPreviousStates := CurrentStates;
   end;
 
   FBasePosition := FPredictedBytePos;
@@ -967,7 +962,6 @@ begin
   end;
 
   SetLength(LocalNonZeroPrevStates, 0);
-  SetLength(NonZeroErrors, 0);
   SetLength(LocalPreviousStates, 0);
 
 end;
@@ -1047,8 +1041,8 @@ var
   efeito: byte;
   PermissibleErrors: ShortInt;
   N, BasePos: integer;   // #8: Tests is a var param; its fields would reload each
-                         // iteration. OperateAndTestOperation takes Oper/Base by
-                         // value and never mutates Tests, so both are invariant.
+                         // iteration. OperateAndTestOperation takes Oper as const
+                         // and never mutates Tests, so both are invariant.
 begin
   // Initialised so the Tests.N = 0 case below does not read it uninitialised.
   PermissibleErrors := 0;
@@ -1119,7 +1113,7 @@ begin
 end;
 
 function TRunOperation.OperateAndTestOperation(
-  {input} Oper: TOperation; BasePosition: integer;
+  {input} const Oper: TOperation; BasePosition: integer;
   {output}var NextState: byte): byte;
 var
   RelativeOperandPosition1,         //Operand position is relative
