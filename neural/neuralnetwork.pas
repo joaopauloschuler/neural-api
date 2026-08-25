@@ -50106,7 +50106,7 @@ end;
 procedure TNNetGatherTokens.Backpropagate();
 var
   StartTime: double;
-  X, D, MaxX, MaxD: integer;
+  X, D, MaxX, Depth: integer;
   basePrevErr0, baseOutErr0: integer;
   PrevErr: TNNetVolume;
 begin
@@ -50120,15 +50120,17 @@ begin
   begin
     PrevErr := FPrevLayer.OutputError;
     MaxX := FOutput.SizeX - 1;
-    MaxD := FOutput.Depth - 1;
+    Depth := FOutput.Depth;
     // Scatter each output position's error back to its source position. Add (not
     // assign) so repeated indices correctly accumulate onto the shared source.
+    // Consecutive output positions are one depth run apart (#12).
+    baseOutErr0 := 0;
     for X := 0 to MaxX do
     begin
       basePrevErr0 := PrevErr.GetRawPos(FTokens[X], 0);
-      baseOutErr0  := FOutputError.GetRawPos(X, 0);
       TNNetVolume.Add(PrevErr.GetRawPtr(basePrevErr0),
-        FOutputError.GetRawPtr(baseOutErr0), MaxD + 1);
+        FOutputError.GetRawPtr(baseOutErr0), Depth);
+      Inc(baseOutErr0, Depth);
     end;
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -50418,26 +50420,43 @@ var
   PM1: integer;
   OX, OY, SX, SY: integer;
   MaxOX, MaxOY: integer;
+  CBytes, PrevRowStride, SrcColBase, SrcPos, DestPos: integer;
+  LocalPrevOutput: TNNetVolume;
   StartTime: double;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  LocalPrevOutput := FPrevLayer.FOutput;
   P := FStruct[0];
-  C := FPrevLayer.Output.Depth;
+  C := LocalPrevOutput.Depth;
   MaxOX := FOutput.SizeX - 1;
   MaxOY := FOutput.SizeY - 1;
-  //MaxC := C - 1;
   PM1 := P - 1;
-  for OX := 0 to MaxOX do
-    for OY := 0 to MaxOY do
+  CBytes := C * csNeuralFloatSize;
+  PrevRowStride := LocalPrevOutput.SizeX * C;
+  // The IC run is contiguous in depth in BOTH source and destination (depth is
+  // the fastest axis), so each block cell is one Move of C floats. The
+  // destination slots (SX*P + SY)*C walk the output column continuously, and one
+  // source step of SY is a row stride, one of SX a depth run, so all three
+  // offsets are carried by addition (#6/#12).
+  for OY := 0 to MaxOY do
+    for OX := 0 to MaxOX do
+    begin
+      DestPos := FOutput.GetRawPos(OX, OY);
+      SrcColBase := LocalPrevOutput.GetRawPos(OX * P, OY * P);
       for SX := 0 to PM1 do
+      begin
+        SrcPos := SrcColBase;
         for SY := 0 to PM1 do
-          // The IC run is contiguous in depth in BOTH source and destination
-          // (depth is the fastest axis), so copy all C floats at once.
-          system.Move(
-            FPrevLayer.FOutput.GetRawPtr(OX * P + SX, OY * P + SY)^,
-            FOutput.GetRawPtr(OX, OY, (SX * P + SY) * C)^,
-            C * csNeuralFloatSize);
+        begin
+          system.Move(LocalPrevOutput.FData[SrcPos], FOutput.FData[DestPos],
+            CBytes);
+          Inc(SrcPos, PrevRowStride);
+          Inc(DestPos, C);
+        end;
+        Inc(SrcColBase, C);
+      end;
+    end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -50447,6 +50466,8 @@ var
   PM1: integer;
   OX, OY, SX, SY: integer;
   MaxOX, MaxOY: integer;
+  PrevRowStride, SrcColBase, SrcPos, DestPos: integer;
+  LocalPrevError: TNNetVolume;
   StartTime, LocalNow: double;
 begin
   StartTime := Now();
@@ -50456,23 +50477,34 @@ begin
   if (FPrevLayer.FOutputError.Size > 0) and
      (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) then
   begin
+    LocalPrevError := FPrevLayer.FOutputError;
     P := FStruct[0];
     C := FPrevLayer.Output.Depth;
     MaxOX := FOutput.SizeX - 1;
     MaxOY := FOutput.SizeY - 1;
-    //MaxC := C - 1;
     PM1 := P - 1;
-    for OX := 0 to MaxOX do
-      for OY := 0 to MaxOY do
+    PrevRowStride := LocalPrevError.SizeX * C;
+    // Bijective routing: the contiguous depth run is accumulated once (no
+    // overlap), so the per-element Add over C floats is an AVX vector accumulate
+    // that preserves exact += semantics. Offsets are carried as in Compute.
+    for OY := 0 to MaxOY do
+      for OX := 0 to MaxOX do
+      begin
+        DestPos := FOutputError.GetRawPos(OX, OY);
+        SrcColBase := LocalPrevError.GetRawPos(OX * P, OY * P);
         for SX := 0 to PM1 do
+        begin
+          SrcPos := SrcColBase;
           for SY := 0 to PM1 do
-            // Bijective routing: the contiguous depth run is accumulated once
-            // (no overlap), so the per-element Add over C floats is an AVX
-            // vector accumulate that preserves exact += semantics.
-            TNNetVolume.Add(
-              FPrevLayer.OutputError.GetRawPtr(OX * P + SX, OY * P + SY),
-              FOutputError.GetRawPtr(OX, OY, (SX * P + SY) * C),
-              C);
+          begin
+            TNNetVolume.Add(LocalPrevError.GetRawPtr(SrcPos),
+              FOutputError.GetRawPtr(DestPos), C);
+            Inc(SrcPos, PrevRowStride);
+            Inc(DestPos, C);
+          end;
+          Inc(SrcColBase, C);
+        end;
+      end;
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -50516,26 +50548,41 @@ var
   PM1: integer;
   IX, IY, SX, SY: integer;
   MaxIX, MaxIY: integer;
+  CBytes, OutRowStride, DestColBase, SrcPos, DestPos: integer;
+  LocalPrevOutput: TNNetVolume;
   StartTime: double;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  LocalPrevOutput := FPrevLayer.FOutput;
   P := FStruct[0];
   C := FOutput.Depth;
-  MaxIX := FPrevLayer.Output.SizeX - 1;
-  MaxIY := FPrevLayer.Output.SizeY - 1;
-  //MaxC := C - 1;
+  MaxIX := LocalPrevOutput.SizeX - 1;
+  MaxIY := LocalPrevOutput.SizeY - 1;
   PM1 := P - 1;
-  for IX := 0 to MaxIX do
-    for IY := 0 to MaxIY do
+  CBytes := C * csNeuralFloatSize;
+  OutRowStride := FOutput.SizeX * C;
+  // Inverse of TNNetSpaceToDepth.Compute with the roles swapped: the source
+  // depth slots walk one input column continuously, and the destination steps by
+  // an output row per SY and by a depth run per SX (#6/#12).
+  for IY := 0 to MaxIY do
+    for IX := 0 to MaxIX do
+    begin
+      SrcPos := LocalPrevOutput.GetRawPos(IX, IY);
+      DestColBase := FOutput.GetRawPos(IX * P, IY * P);
       for SX := 0 to PM1 do
+      begin
+        DestPos := DestColBase;
         for SY := 0 to PM1 do
-          // The IC run is contiguous in depth in BOTH source and destination
-          // (depth is the fastest axis), so copy all C floats at once.
-          system.Move(
-            FPrevLayer.FOutput.GetRawPtr(IX, IY, (SX * P + SY) * C)^,
-            FOutput.GetRawPtr(IX * P + SX, IY * P + SY)^,
-            C * csNeuralFloatSize);
+        begin
+          system.Move(LocalPrevOutput.FData[SrcPos], FOutput.FData[DestPos],
+            CBytes);
+          Inc(SrcPos, C);
+          Inc(DestPos, OutRowStride);
+        end;
+        Inc(DestColBase, C);
+      end;
+    end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -50545,6 +50592,8 @@ var
   PM1: integer;
   IX, IY, SX, SY: integer;
   MaxIX, MaxIY: integer;
+  OutRowStride, DestColBase, SrcPos, DestPos: integer;
+  LocalPrevError: TNNetVolume;
   StartTime, LocalNow: double;
 begin
   StartTime := Now();
@@ -50554,23 +50603,34 @@ begin
   if (FPrevLayer.FOutputError.Size > 0) and
      (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) then
   begin
+    LocalPrevError := FPrevLayer.FOutputError;
     P := FStruct[0];
     C := FOutput.Depth;
     MaxIX := FPrevLayer.Output.SizeX - 1;
     MaxIY := FPrevLayer.Output.SizeY - 1;
-    //MaxC := C - 1;
     PM1 := P - 1;
-    for IX := 0 to MaxIX do
-      for IY := 0 to MaxIY do
+    OutRowStride := FOutputError.SizeX * C;
+    // Bijective routing: the contiguous depth run is accumulated once (no
+    // overlap), so the per-element Add over C floats is an AVX vector accumulate
+    // that preserves exact += semantics. Offsets are carried as in Compute.
+    for IY := 0 to MaxIY do
+      for IX := 0 to MaxIX do
+      begin
+        SrcPos := LocalPrevError.GetRawPos(IX, IY);
+        DestColBase := FOutputError.GetRawPos(IX * P, IY * P);
         for SX := 0 to PM1 do
+        begin
+          DestPos := DestColBase;
           for SY := 0 to PM1 do
-            // Bijective routing: the contiguous depth run is accumulated once
-            // (no overlap), so the per-element Add over C floats is an AVX
-            // vector accumulate that preserves exact += semantics.
-            TNNetVolume.Add(
-              FPrevLayer.OutputError.GetRawPtr(IX, IY, (SX * P + SY) * C),
-              FOutputError.GetRawPtr(IX * P + SX, IY * P + SY),
-              C);
+          begin
+            TNNetVolume.Add(LocalPrevError.GetRawPtr(SrcPos),
+              FOutputError.GetRawPtr(DestPos), C);
+            Inc(SrcPos, C);
+            Inc(DestPos, OutRowStride);
+          end;
+          Inc(DestColBase, C);
+        end;
+      end;
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -50875,39 +50935,56 @@ procedure TNNetCoordConv.Compute();
 var
   SX, SY, D, X, Y: integer;
   SXM1, SYM1: integer;
-  basePrev0, baseOut0: integer;
-  DenomX, DenomY: TNeuralFloat;
-  CoordX, CoordY: TNeuralFloat;
+  basePrev0, baseOut0, DepthBytes: integer;
+  DenomX, DenomY, OriginX, OriginY: TNeuralFloat;
+  CoordY: TNeuralFloat;
+  LocalPrevOutput: TNNetVolume;
   StartTime: double;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  SX := FPrevLayer.Output.SizeX;
-  SY := FPrevLayer.Output.SizeY;
-  D  := FPrevLayer.Output.Depth;
+  LocalPrevOutput := FPrevLayer.FOutput;
+  SX := LocalPrevOutput.SizeX;
+  SY := LocalPrevOutput.SizeY;
+  D  := LocalPrevOutput.Depth;
   SXM1 := SX - 1;
   SYM1 := SY - 1;
-  // Copy the original Depth channels through unchanged.
-  for X := 0 to SXM1 do
-    for Y := 0 to SYM1 do
+  DepthBytes := D * csNeuralFloatSize;
+  // A degenerate axis has a single coordinate 0 rather than the -1..1 ramp; a
+  // zero slope with a zero origin says that without a per-pixel test (#20).
+  if SX > 1 then
+  begin
+    DenomX := 2.0 / (SX - 1);
+    OriginX := -1.0;
+  end
+  else
+  begin
+    DenomX := 0.0;
+    OriginX := 0.0;
+  end;
+  if SY > 1 then
+  begin
+    DenomY := 2.0 / (SY - 1);
+    OriginY := -1.0;
+  end
+  else
+  begin
+    DenomY := 0.0;
+    OriginY := 0.0;
+  end;
+  // One row-major pass: the passthrough copy and the two appended coordinate
+  // channels share the output column base (#13 for the copy, appendix B for the
+  // two fixed depth slots).
+  for Y := 0 to SYM1 do
+  begin
+    CoordY := DenomY * Y + OriginY;
+    for X := 0 to SXM1 do
     begin
       baseOut0  := FOutput.GetRawPos(X, Y);
-      basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
-      // Rule #13: contiguous passthrough copy of D channels -> Move.
-      Move(FPrevLayer.FOutput.FData[basePrev0], FOutput.FData[baseOut0],
-        D * csNeuralFloatSize);
-    end;
-  // Fill the two appended coordinate channels.
-  if SX > 1 then DenomX := 2.0 / (SX - 1) else DenomX := 0.0;
-  if SY > 1 then DenomY := 2.0 / (SY - 1) else DenomY := 0.0;
-  for X := 0 to SXM1 do
-  begin
-    if SX > 1 then CoordX := DenomX * X - 1.0 else CoordX := 0.0;
-    for Y := 0 to SYM1 do
-    begin
-      if SY > 1 then CoordY := DenomY * Y - 1.0 else CoordY := 0.0;
-      FOutput[X, Y, D    ] := CoordX;
-      FOutput[X, Y, D + 1] := CoordY;
+      basePrev0 := LocalPrevOutput.GetRawPos(X, Y);
+      Move(LocalPrevOutput.FData[basePrev0], FOutput.FData[baseOut0], DepthBytes);
+      FOutput.FData[baseOut0 + D    ] := DenomX * X + OriginX;
+      FOutput.FData[baseOut0 + D + 1] := CoordY;
     end;
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -51154,7 +51231,9 @@ procedure TNNetSimpleGate.Compute();
 var
   IX, IY: integer;
   MaxIX, MaxIY, HalfDepth: integer;
+  PrevBase, HalfDepthBytes: integer;
   OutPtr, FirstPtr, SecondPtr: TNeuralFloatArrPtr;
+  LocalPrevOutput: TNNetVolume;
   StartTime: double;
 begin
   StartTime := Now();
@@ -51167,13 +51246,18 @@ begin
   // [HalfDepth..2*HalfDepth-1] are each a contiguous run of HalfDepth floats.
   // Copy the first half into the output column, then multiply it in place by
   // the second half with the AVX-vectorized element-wise product.
-  for IX := 0 to MaxIX do
-    for IY := 0 to MaxIY do
+  LocalPrevOutput := FPrevLayer.FOutput;
+  HalfDepthBytes := HalfDepth * csNeuralFloatSize;
+  for IY := 0 to MaxIY do
+    for IX := 0 to MaxIX do
     begin
       OutPtr := FOutput.GetRawPtr(IX, IY);
-      FirstPtr := FPrevLayer.FOutput.GetRawPtr(IX, IY);
-      SecondPtr := FPrevLayer.FOutput.GetRawPtr(IX, IY, HalfDepth);
-      system.Move(FirstPtr^, OutPtr^, HalfDepth * csNeuralFloatSize);
+      // The two halves of one input column differ by a constant depth offset,
+      // so one base addresses both.
+      PrevBase := LocalPrevOutput.GetRawPos(IX, IY);
+      FirstPtr := LocalPrevOutput.GetRawPtr(PrevBase);
+      SecondPtr := LocalPrevOutput.GetRawPtr(PrevBase + HalfDepth);
+      system.Move(FirstPtr^, OutPtr^, HalfDepthBytes);
       TNNetVolume.Mul(OutPtr, SecondPtr, HalfDepth);
     end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -51183,7 +51267,9 @@ procedure TNNetSimpleGate.Backpropagate();
 var
   IX, IY: integer;
   MaxIX, MaxIY, HalfDepth: integer;
+  PrevBase, PrevBaseHigh: integer;
   ErrPtr, FirstPtr, SecondPtr, DErrFirstPtr, DErrSecondPtr: TNeuralFloatArrPtr;
+  LocalPrevOutput, LocalPrevError: TNNetVolume;
   StartTime, LocalNow: double;
 begin
   StartTime := Now();
@@ -51200,14 +51286,20 @@ begin
     //   dIn[c]            += Err[c] * In[HalfDepth+c]
     //   dIn[HalfDepth+c]  += Err[c] * In[c]
     // MulAdd(A, B, C, n) computes A[i] += B[i]*C[i] with AVX.
-    for IX := 0 to MaxIX do
-      for IY := 0 to MaxIY do
+    LocalPrevOutput := FPrevLayer.FOutput;
+    LocalPrevError := FPrevLayer.FOutputError;
+    // Input and input error share a shape, so one column base addresses both,
+    // and each half sits a constant depth offset from it.
+    for IY := 0 to MaxIY do
+      for IX := 0 to MaxIX do
       begin
         ErrPtr := FOutputError.GetRawPtr(IX, IY);
-        FirstPtr := FPrevLayer.FOutput.GetRawPtr(IX, IY);
-        SecondPtr := FPrevLayer.FOutput.GetRawPtr(IX, IY, HalfDepth);
-        DErrFirstPtr := FPrevLayer.OutputError.GetRawPtr(IX, IY);
-        DErrSecondPtr := FPrevLayer.OutputError.GetRawPtr(IX, IY, HalfDepth);
+        PrevBase := LocalPrevOutput.GetRawPos(IX, IY);
+        PrevBaseHigh := PrevBase + HalfDepth;
+        FirstPtr := LocalPrevOutput.GetRawPtr(PrevBase);
+        SecondPtr := LocalPrevOutput.GetRawPtr(PrevBaseHigh);
+        DErrFirstPtr := LocalPrevError.GetRawPtr(PrevBase);
+        DErrSecondPtr := LocalPrevError.GetRawPtr(PrevBaseHigh);
         TNNetVolume.MulAdd(DErrFirstPtr, ErrPtr, SecondPtr, HalfDepth);
         TNNetVolume.MulAdd(DErrSecondPtr, ErrPtr, FirstPtr, HalfDepth);
       end;
