@@ -2370,46 +2370,32 @@ function ContrastiveCosine(A, B: TNNetVolume): TNeuralFloat; forward;
 
 function DecodeCTCGreedy(Scores: TNNetVolume; Blank: integer): TNeuralIntegerArray;
 var
-  NumT, Vocab, ti, k, ArgMax, Prev, Count: integer;
-  NumTM1, VocabM1, base: integer;
-  Best, V: TNeuralFloat;
-  Path: TNeuralIntegerArray;
+  NumT, Vocab, ti, ArgMax, Prev, Count, FrameBase: integer;
+  NumTM1: integer;
 begin
   NumT := Scores.SizeX;
   Vocab := Scores.Depth;
   NumTM1 := NumT - 1;
-  VocabM1 := Vocab - 1;
   if Blank < 0 then Blank := Vocab - 1;
-  SetLength(Path, NumT);
-  // Argmax per frame.
-  for ti := 0 to NumTM1 do
-  begin
-    ArgMax := 0;
-    base := Scores.GetRawPos(ti, 0, 0);
-    Best := Scores.FData[base];
-    for k := 1 to VocabM1 do
-    begin
-      V := Scores.FData[base + k];
-      if V > Best then
-      begin
-        Best := V;
-        ArgMax := k;
-      end;
-    end;
-    Path[ti] := ArgMax;
-  end;
-  // Collapse adjacent repeats, then drop blanks.
   SetLength(Result, NumT);
   Count := 0;
   Prev := -1;
+  // Rule #13/#18: the per-frame argmax is TNNetVolume.MaxPos, whose scalar
+  // fallback is this scan element for element (strict >, so the first maximum
+  // wins on both paths) and whose AVX2 path reduces the frame in vector steps.
+  // The collapse-and-drop-blanks pass folds into the same loop, so no path
+  // array is materialised.
+  FrameBase := 0;   // #12: GetRawPos(ti, 0, 0) = ti * Vocab, carried by addition
   for ti := 0 to NumTM1 do
   begin
-    if (Path[ti] <> Prev) and (Path[ti] <> Blank) then
+    TNNetVolume.MaxPos(Scores.GetRawPtr(FrameBase), Vocab, ArgMax);
+    if (ArgMax <> Prev) and (ArgMax <> Blank) then
     begin
-      Result[Count] := Path[ti];
+      Result[Count] := ArgMax;
       Inc(Count);
     end;
-    Prev := Path[ti];
+    Prev := ArgMax;
+    Inc(FrameBase, Vocab);
   end;
   SetLength(Result, Count);
 end;
@@ -2485,8 +2471,13 @@ var
   // stay double: those accumulate products of probabilities across frames and
   // need the range.
   Prob: array of TNeuralFloat;
+  // Each candidate's total probability, alongside Cand and kept in step with it
+  // through the selection swaps: the pruning pass compares it O(NCand *
+  // BeamWidth) times, so it is materialised once per frame instead of being
+  // re-added out of the 24-byte records on every comparison.
+  CandTot: array of double;
   BestIdx: integer;
-  BestScore, Total, Sum, AddV: double;
+  BestScore, TmpTot, Sum, AddV: double;
   BeamPBv, BeamPNBv, SumPBNB: double;
   PHashJ: QWord;
 begin
@@ -2502,6 +2493,7 @@ begin
   SlotCap := BeamWidth * (Vocab + 1);
   SetLength(Prob, Vocab);
   SetLength(Cand, SlotCap);
+  SetLength(CandTot, SlotCap);
   SetLength(SlotCand, SlotCap);
   SetLength(ExtAlias, SlotCap);
   SetLength(CurPref, BeamWidth * Stride);
@@ -2544,8 +2536,14 @@ begin
 
     BeamsHi := BeamCount - 1;
     LiveSlots := BeamCount * (Vocab + 1);
-    FillDWord(SlotCand[0], LiveSlots, DWord(-1));
-    FillDWord(ExtAlias[0], LiveSlots, DWord(-1));
+    // Only the unchanged slots of SlotCand are ever read: an extension slot is
+    // consulted through ExtAlias, which redirects it to an unchanged slot, and
+    // an unaliased extension slot is always a fresh candidate. Conversely
+    // ExtAlias is only read at extension slots, which start at BeamCount. So
+    // each array is cleared over the range it is read from, not over all
+    // BeamCount * (Vocab + 1) slots.
+    FillDWord(SlotCand[0], BeamCount, DWord(-1));
+    FillDWord(ExtAlias[BeamCount], LiveSlots - BeamCount, DWord(-1));
 
     // Alias pass, O(BeamCount^2): a beam bj whose prefix is beam bi's prefix
     // plus one symbol makes extension slot (bi, lastsym) an alias of unchanged
@@ -2623,8 +2621,8 @@ begin
         if CSlot < 0 then
         begin
           // No alias: this extension slot is its own canonical slot, and no
-          // other (bi, k) pair addresses it, so it is always new.
-          SlotCand[ExtSlot] := NCand;
+          // other (bi, k) pair addresses it, so it is always new - and nothing
+          // reads SlotCand there, which is why it is not recorded.
           c := NCand;
           Inc(NCand);
           Cand[c].Parent := bi;
@@ -2662,25 +2660,26 @@ begin
     SortLimit := NCandHi - 1;
     if (NCand > BeamWidth) and (BeamWidth - 1 < SortLimit) then
       SortLimit := BeamWidth - 1;
+    for i := 0 to NCandHi do CandTot[i] := Cand[i].PB + Cand[i].PNB;
     for i := 0 to SortLimit do
     begin
       BestIdx := i;
-      BestScore := Cand[i].PB + Cand[i].PNB;
+      BestScore := CandTot[i];
       IP1 := i + 1;
       for j := IP1 to NCandHi do
-      begin
-        Total := Cand[j].PB + Cand[j].PNB;
-        if Total > BestScore then
+        if CandTot[j] > BestScore then
         begin
-          BestScore := Total;
+          BestScore := CandTot[j];
           BestIdx := j;
         end;
-      end;
       if BestIdx <> i then
       begin
         TmpCand := Cand[i];
         Cand[i] := Cand[BestIdx];
         Cand[BestIdx] := TmpCand;
+        TmpTot := CandTot[i];
+        CandTot[i] := CandTot[BestIdx];
+        CandTot[BestIdx] := TmpTot;
       end;
     end;
 
