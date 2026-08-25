@@ -15405,9 +15405,15 @@ type
     FTau: TNeuralFloat;    // temperature (>0); smaller -> sharper / more permutation-like
     FLogTape: array of TNNetVolume; // cached input log-matrix per normalization step
     FTapeLen: integer;     // = 2*FKIter (row+col per iteration)
-    // Persistent, lazily-sized (grow-only) softmax scratch rows for the backward
+    // Persistent, lazily-sized (grow-only) softmax scratch row for the row
     // adjoint (rule #17 — never SetLength per call).
-    FSoftRow, FSoftCol: array of TNeuralFloat;
+    FSoftRow: array of TNeuralFloat;
+    // Per-column accumulators (length N, sized in SetPrevLayer) that let the
+    // column log-sum-exp and its adjoint run row-major instead of striding by N.
+    FColMax, FColSum, FColDotG: array of TNeuralFloat;
+    // Backward-only column softmax, one full matrix; sized on first use so an
+    // inference-only layer never allocates it.
+    FColSoft: TNNetVolume;
     procedure ComputeCPU();
     procedure BackpropagateCPU();
   public
@@ -86101,6 +86107,7 @@ begin
   FTapeLen := 0;
   FStruct[0] := FKIter;
   FFloatSt[0] := FTau;
+  FColSoft := TNNetVolume.Create();
   // No weight neurons: Sinkhorn is parameter-free.
   while FNeurons.Count > 0 do
     FNeurons.Delete(FNeurons.Count - 1);
@@ -86115,6 +86122,11 @@ begin
   for iStep := 0 to TapeMax do
     if Assigned(FLogTape[iStep]) then FLogTape[iStep].Free;
   SetLength(FLogTape, 0);
+  SetLength(FSoftRow, 0);
+  SetLength(FColMax, 0);
+  SetLength(FColSum, 0);
+  SetLength(FColDotG, 0);
+  FColSoft.Free;
   inherited Destroy();
 end;
 
@@ -86144,6 +86156,11 @@ begin
   TapeLenM1 := FTapeLen - 1;
   for iStep := 0 to TapeLenM1 do
     FLogTape[iStep] := TNNetVolume.Create(FN, 1, FN);
+
+  SetLength(FSoftRow, FN);
+  SetLength(FColMax, FN);
+  SetLength(FColSum, FN);
+  SetLength(FColDotG, FN);
 end;
 
 procedure TNNetSinkhorn.SetTau(pTau: TNeuralFloat);
@@ -86184,47 +86201,51 @@ begin
   begin
     // ---- ROW normalize: each row i is a log-simplex over columns j ----
     FLogTape[step].Copy(L);  // cache input of this step
+    rowBase := 0;                 // #12: carries ri * FN
     for ri := 0 to FNm1 do
     begin
-      rowBase := ri * FN;
       maxVal := L.FData[rowBase];
       for cj := 1 to FNm1 do
         if L.FData[rowBase + cj] > maxVal then maxVal := L.FData[rowBase + cj];
-      sumExp := 0;
-      for cj := 0 to FNm1 do
-        sumExp := sumExp + NeuralExp(L.FData[rowBase + cj] - maxVal);
+      // #19: the row is FN contiguous floats, so one fused pass exponentiates
+      // (into scratch we only need for its sum) and sums.
+      sumExp := TNNetVolume.ExpShiftSum(Addr(FSoftRow[0]),
+        Addr(L.FData[rowBase]), maxVal, FN);
       lse := maxVal + pcr_logf(sumExp);
       for cj := 0 to FNm1 do
         L.FData[rowBase + cj] := L.FData[rowBase + cj] - lse;
+      Inc(rowBase, FN);
     end;
     Inc(step);
 
     // ---- COLUMN normalize: each column j is a log-simplex over rows i ----
+    // App. E: the max / sum / subtract passes used to walk one column at a
+    // time, striding by FN. With per-column accumulators they run row-major,
+    // so every read is contiguous and the max and subtract passes vectorize.
     FLogTape[step].Copy(L);
-    for cj := 0 to FNm1 do
+    Move(L.FData[0], FColMax[0], FN * csNeuralFloatSize);
+    pos := FN;
+    for ri := 1 to FNm1 do
     begin
-      maxVal := L.FData[cj];
-      pos := cj;
+      TNNetVolume.MaxElements(Addr(FColMax[0]), Addr(L.FData[pos]), FN);
       Inc(pos, FN);
-      for ri := 1 to FNm1 do
-      begin
-        if L.FData[pos] > maxVal then maxVal := L.FData[pos];
-        Inc(pos, FN);
-      end;
-      sumExp := 0;
-      pos := cj;
-      for ri := 0 to FNm1 do
-      begin
-        sumExp := sumExp + NeuralExp(L.FData[pos] - maxVal);
-        Inc(pos, FN);
-      end;
-      lse := maxVal + pcr_logf(sumExp);
-      pos := cj;
-      for ri := 0 to FNm1 do
-      begin
-        L.FData[pos] := L.FData[pos] - lse;
-        Inc(pos, FN);
-      end;
+    end;
+    FillChar(FColSum[0], FN * csNeuralFloatSize, 0);
+    pos := 0;
+    for ri := 0 to FNm1 do
+    begin
+      for cj := 0 to FNm1 do
+        FColSum[cj] := FColSum[cj] + NeuralExp(L.FData[pos + cj] - FColMax[cj]);
+      Inc(pos, FN);
+    end;
+    // FColMax becomes the per-column log-sum-exp subtracted from every row.
+    for cj := 0 to FNm1 do
+      FColMax[cj] := FColMax[cj] + pcr_logf(FColSum[cj]);
+    pos := 0;
+    for ri := 0 to FNm1 do
+    begin
+      TNNetVolume.MulAdd(Addr(L.FData[pos]), Addr(FColMax[0]), -1.0, FN);
+      Inc(pos, FN);
     end;
     Inc(step);
   end;
@@ -86275,8 +86296,9 @@ begin
   g.Copy(FOutputError);
   TNNetVolume.Mul(g.DataPtr, FOutput.DataPtr, FN * FN);
 
-  if Length(FSoftRow) < FN then SetLength(FSoftRow, FN);
-  if Length(FSoftCol) < FN then SetLength(FSoftCol, FN);
+  // Grow-only scratch (#17): the column softmax matrix exists only once a
+  // backward pass actually runs.
+  if FColSoft.Size <> FN * FN then FColSoft.ReSize(FN, 1, FN);
 
   // Walk the tape in reverse: order was row(step) then col(step+1) per iter.
   FKIterM1 := FKIter - 1;
@@ -86285,46 +86307,46 @@ begin
     // ---- adjoint of the COLUMN normalize (the later step) ----
     step := 2 * iter + 1;
     Lin := FLogTape[step];
-    for cj := 0 to FNm1 do
+    // App. E: the four column passes striding by FN become three row-major
+    // passes over per-column accumulators. The per-element arithmetic is
+    // unchanged -- the softmax still divides by the column sum before scaling
+    // by dotG (#21: a gradient check watches this softmax).
+    Move(Lin.FData[0], FColMax[0], FN * csNeuralFloatSize);
+    pos := FN;
+    for ri := 1 to FNm1 do
     begin
-      maxVal := Lin.FData[cj];
-      pos := cj;
+      TNNetVolume.MaxElements(Addr(FColMax[0]), Addr(Lin.FData[pos]), FN);
       Inc(pos, FN);
-      for ri := 1 to FNm1 do
+    end;
+    FillChar(FColSum[0], FN * csNeuralFloatSize, 0);
+    FillChar(FColDotG[0], FN * csNeuralFloatSize, 0);
+    pos := 0;
+    for ri := 0 to FNm1 do
+    begin
+      for cj := 0 to FNm1 do
       begin
-        if Lin.FData[pos] > maxVal then maxVal := Lin.FData[pos];
-        Inc(pos, FN);
+        sm := NeuralExp(Lin.FData[pos + cj] - FColMax[cj]);
+        FColSoft.FData[pos + cj] := sm;
+        FColSum[cj] := FColSum[cj] + sm;
       end;
-      sumExp := 0;
-      pos := cj;
-      for ri := 0 to FNm1 do
-      begin
-        FSoftCol[ri] := NeuralExp(Lin.FData[pos] - maxVal);
-        sumExp := sumExp + FSoftCol[ri];
-        Inc(pos, FN);
-      end;
-      dotG := 0;
-      pos := cj;
-      for ri := 0 to FNm1 do
-      begin
-        FSoftCol[ri] := FSoftCol[ri] / sumExp;
-        dotG := dotG + g.FData[pos];
-        Inc(pos, FN);
-      end;
-      pos := cj;
-      for ri := 0 to FNm1 do
-      begin
-        g.FData[pos] := g.FData[pos] - FSoftCol[ri] * dotG;
-        Inc(pos, FN);
-      end;
+      TNNetVolume.Add(Addr(FColDotG[0]), Addr(g.FData[pos]), FN);
+      Inc(pos, FN);
+    end;
+    pos := 0;
+    for ri := 0 to FNm1 do
+    begin
+      for cj := 0 to FNm1 do
+        g.FData[pos + cj] := g.FData[pos + cj] -
+          (FColSoft.FData[pos + cj] / FColSum[cj]) * FColDotG[cj];
+      Inc(pos, FN);
     end;
 
     // ---- adjoint of the ROW normalize (the earlier step) ----
     step := 2 * iter;
     Lin := FLogTape[step];
+    rowBase := 0;                 // #12: carries ri * FN
     for ri := 0 to FNm1 do
     begin
-      rowBase := ri * FN;
       maxVal := Lin.FData[rowBase];
       for cj := 1 to FNm1 do
         if Lin.FData[rowBase + cj] > maxVal then maxVal := Lin.FData[rowBase + cj];
@@ -86340,6 +86362,7 @@ begin
         dotG := dotG + g.FData[rowBase + cj];
       end;
       TNNetVolume.MulAdd(@g.FData[rowBase], @FSoftRow[0], -dotG, FN);
+      Inc(rowBase, FN);
     end;
   end;
 
@@ -86437,23 +86460,28 @@ procedure TNNetTokenMerging.ComputeCPU();
 var
   Inp: TNNetVolume;
   // input token idx -> output token idx; built after we know which A merge
-  t, a, b, d, i, oIdx, picks, bestA, posB, iDk: integer;
-  SeqLenM1, DepthM1, OutSizeMax: integer;
-  dot, sim, denom, eps, curBest, normA: TNeuralFloat;
-  isA: boolean;
+  t, a, b, i, oIdx, picks, bestA, bestB, posB, iDk: integer;
+  SeqLenM1, OutSizeMax, AStart, BStart, TwoDepth: integer;
+  sim, denom, eps, curBest, bestSim, invNormA: TNeuralFloat;
   pRow, aPtr: TNeuralFloatArrPtr;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Inp := FPrevLayer.FOutput;
   eps := 1e-8;
   SeqLenM1 := FSeqLen - 1;
-  DepthM1 := FDepth - 1;
   OutSizeMax := Length(FOutSize) - 1;
+  // A tokens are the ones whose index parity is FParity; B tokens are the rest.
+  // Walking each set by 2 halves both loops and drops the per-token mod test
+  // (#20).
+  AStart := FParity;
+  BStart := 1 - FParity;
+  TwoDepth := 2 * FDepth;         // #5: flat stride between same-set tokens
 
   for t := 0 to SeqLenM1 do
   begin
     pRow := Inp.GetRawPtr(t, 0);  // #4: computed once, used twice
-    FNormBuf[t] := Sqrt(TNNetVolume.DotProduct(pRow, pRow, FDepth)) + eps;
+    // #21: kept as a reciprocal, so the O(T^2/4) similarity scan multiplies.
+    FNormBuf[t] := 1.0 / (Sqrt(TNNetVolume.DotProduct(pRow, pRow, FDepth)) + eps);
   end;
 
   // ---- For each A token, find its most-similar B token (cosine) ----
@@ -86464,25 +86492,31 @@ begin
     FMergedBuf[t] := False;
   end;
 
-  for a := 0 to SeqLenM1 do
+  a := AStart;
+  while a <= SeqLenM1 do
   begin
-    isA := (a mod 2) = FParity;
-    if not isA then continue;
     aPtr := Inp.GetRawPtr(a, 0);  // #11: invariant across the inner b scan
-    normA := FNormBuf[a];
-    posB := 0;                    // #12: carry the b-row flat offset
-    for b := 0 to SeqLenM1 do
+    invNormA := FNormBuf[a];
+    bestSim := -1e30;
+    bestB := -1;
+    // #14: 1/|a| is a positive constant over the scan, so rank on dot * 1/|b|
+    // and scale the winner once.
+    posB := BStart * FDepth;      // #12: carry the b-row flat offset
+    b := BStart;
+    while b <= SeqLenM1 do
     begin
-      if (b mod 2) = FParity then begin Inc(posB, FDepth); continue; end; // b must be in B set
-      dot := TNNetVolume.DotProduct(aPtr, @Inp.FData[posB], FDepth);
-      sim := dot / (normA * FNormBuf[b]);
-      Inc(posB, FDepth);
-      if sim > FBestSimBuf[a] then
+      sim := TNNetVolume.DotProduct(aPtr, @Inp.FData[posB], FDepth) * FNormBuf[b];
+      if sim > bestSim then
       begin
-        FBestSimBuf[a] := sim;
-        FBestBBuf[a] := b;
+        bestSim := sim;
+        bestB := b;
       end;
+      Inc(posB, TwoDepth);
+      Inc(b, 2);
     end;
+    FBestBBuf[a] := bestB;
+    if bestB >= 0 then FBestSimBuf[a] := bestSim * invNormA;
+    Inc(a, 2);
   end;
 
   // ---- Pick the top-R A->B edges by similarity (frozen selection) ----
@@ -86492,16 +86526,16 @@ begin
   begin
     bestA := -1;
     curBest := -1e30;
-    for a := 0 to SeqLenM1 do
+    a := AStart;
+    while a <= SeqLenM1 do
     begin
-      if (a mod 2) <> FParity then continue;
-      if FMergedBuf[a] then continue;
-      if FBestBBuf[a] < 0 then continue;
-      if FBestSimBuf[a] > curBest then
+      if (not FMergedBuf[a]) and (FBestBBuf[a] >= 0) and
+         (FBestSimBuf[a] > curBest) then
       begin
         curBest := FBestSimBuf[a];
         bestA := a;
       end;
+      Inc(a, 2);
     end;
     if bestA < 0 then break; // not enough A tokens with partners (R<SeqLen guards this normally)
     FMergedBuf[bestA] := True;
@@ -86519,10 +86553,14 @@ begin
     FSrcToOut[t] := oIdx;
     Inc(oIdx);
   end;
-  // Map each merged A token to its B partner's output slot.
-  for a := 0 to SeqLenM1 do
-    if FMergedBuf[a] then
-      FSrcToOut[a] := FSrcToOut[FBestBBuf[a]];
+  // Map each merged A token to its B partner's output slot (only A tokens can
+  // be merged away, so the scan steps by 2).
+  a := AStart;
+  while a <= SeqLenM1 do
+  begin
+    if FMergedBuf[a] then FSrcToOut[a] := FSrcToOut[FBestBBuf[a]];
+    Inc(a, 2);
+  end;
 
   // ---- Count fused tokens per output slot (size) ----
   FillDWord(FOutSize[0], OutSizeMax + 1, 0);
