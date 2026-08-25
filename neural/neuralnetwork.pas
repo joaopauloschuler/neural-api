@@ -11190,6 +11190,7 @@ type
       FS: TNNetVolume;           // cached s = clamp*tanh(s_pre/clamp), (SizeX,SizeY,HalfB)
       FT: TNNetVolume;           // cached shift t, (SizeX,SizeY,HalfB)
       FSPre: TNNetVolume;        // cached pre-clamp s_pre, (SizeX,SizeY,HalfB)
+      FExpS: TNNetVolume;        // one pixel's exp(+/-s), HalfB-long forward scratch
       // Persistent, lazily-sized conditioner row pointer/bias tables (rule #17):
       // bound once per r in Compute, invariant across the x,y sweep.
       FSWPtrs, FTWPtrs: array of TNeuralFloatArrPtr;
@@ -64504,10 +64505,12 @@ begin
   FS := TNNetVolume.Create();
   FT := TNNetVolume.Create();
   FSPre := TNNetVolume.Create();
+  FExpS := TNNetVolume.Create();
 end;
 
 destructor TNNetAffineCoupling.Destroy();
 begin
+  FExpS.Free;
   FSPre.Free;
   FT.Free;
   FS.Free;
@@ -64546,6 +64549,7 @@ begin
   FS.ReSize(FOutput.SizeX, FOutput.SizeY, FHalfB);
   FT.ReSize(FOutput.SizeX, FOutput.SizeY, FHalfB);
   FSPre.ReSize(FOutput.SizeX, FOutput.SizeY, FHalfB);
+  FExpS.ReSize(1, 1, FHalfB);
   InitDefault();
 end;
 
@@ -64555,8 +64559,9 @@ var
   SizeX, SizeY, Depth, x, y, r, j, aOfs, bOfs, idxB: integer;
   MaxX, MaxY, MaxA, MaxB: integer;
   spre, sval, tval, xa_j, xb, accS, accT, invClamp: TNeuralFloat;
-  HalfABytes: integer;
-  InPtr, OutPtr, SPtr, TPtr, SPrePtr, XaPtr: TNeuralFloatArrPtr;
+  HalfABytes, HalfBBytes: integer;
+  InPtr, OutPtr, SPtr, TPtr, SPrePtr, XaPtr,
+    ExpSPtr, InBPtr, OutBPtr: TNeuralFloatArrPtr;
   Nr: TNNetNeuron;
 begin
   StartTime := Now();
@@ -64574,6 +64579,8 @@ begin
   FLogDet := 0;
   invClamp := 1 / FClamp;
   HalfABytes := FHalfA * csNeuralFloatSize;
+  HalfBBytes := FHalfB * csNeuralFloatSize;
+  ExpSPtr := FExpS.GetRawPtr();
   // The conditioner weight-row pointers and biases depend only on r (the s-row
   // in FArrNeurons[r], the t-row in FArrNeurons[FHalfB+r]); they are invariant
   // across the whole x,y sweep, so bind them once per r via the array mirror.
@@ -64604,26 +64611,37 @@ begin
       // Conditioner: per-row s_pre, t from the linear map over x_a.
       for r := 0 to MaxB do
       begin
-        accS := FSBias[r] + TNNetVolume.DotProduct(FSWPtrs[r], XaPtr, FHalfA);
-        accT := FTBias[r] + TNNetVolume.DotProduct(FTWPtrs[r], XaPtr, FHalfA);
-        spre := accS;
-        // Glow tanh clamp: s = clamp * tanh(s_pre / clamp).
-        sval := FClamp * pcr_tanhf(spre * invClamp);
-        tval := accT;
-        SPrePtr^[r] := spre;
-        SPtr^[r] := sval;
-        TPtr^[r] := tval;
-        idxB := bOfs + r;              // #4: the transformed half's slot, once
-        xb := InPtr^[idxB];
-        if FInverse then
-          // Sampling map: x_b = (y_b - t) * exp(-s).
-          OutPtr^[idxB] := (xb - tval) * NeuralExp(-sval)
-        else
-        begin
-          // Forward map: y_b = x_b * exp(s) + t.
-          OutPtr^[idxB] := xb * NeuralExp(sval) + tval;
-          FLogDet := FLogDet + sval;
-        end;
+        SPrePtr^[r] := FSBias[r] +
+          TNNetVolume.DotProduct(FSWPtrs[r], XaPtr, FHalfA);
+        TPtr^[r] := FTBias[r] +
+          TNNetVolume.DotProduct(FTWPtrs[r], XaPtr, FHalfA);
+      end;
+      // Glow tanh clamp s = clamp*tanh(s_pre/clamp), then exp(s) (exp(-s) for
+      // the sampling map): both run over the whole HalfB row as vector kernels
+      // (#19) instead of a scalar tanh and exp per row.
+      system.Move(SPrePtr^, SPtr^, HalfBBytes);
+      TNNetVolume.Mul(SPtr, invClamp, FHalfB);
+      TNNetVolume.Tanh(SPtr, SPtr, FHalfB);
+      TNNetVolume.Mul(SPtr, FClamp, FHalfB);
+      system.Move(SPtr^, ExpSPtr^, HalfBBytes);
+      if FInverse then TNNetVolume.Mul(ExpSPtr, -1, FHalfB);
+      TNNetVolume.Exp(ExpSPtr, ExpSPtr, FHalfB);
+      // The transformed half is a contiguous HalfB run in both volumes.
+      InBPtr := @InPtr^[bOfs];
+      OutBPtr := @OutPtr^[bOfs];
+      system.Move(InBPtr^, OutBPtr^, HalfBBytes);
+      if FInverse then
+      begin
+        // Sampling map: x_b = (y_b - t) * exp(-s).
+        TNNetVolume.MulAdd(OutBPtr, TPtr, -1, FHalfB);
+        TNNetVolume.Mul(OutBPtr, ExpSPtr, FHalfB);
+      end
+      else
+      begin
+        // Forward map: y_b = x_b * exp(s) + t.
+        TNNetVolume.Mul(OutBPtr, ExpSPtr, FHalfB);
+        TNNetVolume.Add(OutBPtr, TPtr, FHalfB);
+        for r := 0 to MaxB do FLogDet := FLogDet + SPtr^[r];
       end;
     end;
   FForwardTime := FForwardTime + (Now() - StartTime);
