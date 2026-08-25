@@ -2176,17 +2176,16 @@ begin
   Result := RepetitionRate(Text, 1);
 end;
 
-// BLEU of ONE candidate/reference pair from n-gram count maps that were built
-// beforehand. Both rows are indexed by order (0..MaxN, slot 0 unused) and hold
-// a map for every order, empty when the sequence is shorter than the order -
-// the shape CountNGrams returns. Clipping, smoothing, the excluded-order rule
-// and the brevity penalty are the single-pair case of CorpusBLEU evaluated in
-// the same order on the same integers, so the result is bit-identical to it.
-function PairBLEUFromCounts(const CandCounts, RefCounts: array of TStringList;
+// BLEU of ONE candidate/reference pair from the per-order clipped overlaps
+// (Matches[Order], slot 0 unused) of maps built beforehand. Clipping,
+// smoothing, the excluded-order rule and the brevity penalty are the
+// single-pair case of CorpusBLEU evaluated in the same order on the same
+// integers, so the result is bit-identical to it.
+function PairBLEUFromMatches(const Matches: TNeuralIntegerArray;
   CandLen, RefLen, MaxN: integer; Smooth: boolean): TNeuralFloat;
 var
   Order, UsedOrders: integer;
-  Matches, Totals: int64;
+  Totals: int64;
   Precision, SumLogP, BrevityPenalty: TNeuralFloat;
 begin
   Result := 0;
@@ -2199,13 +2198,12 @@ begin
     // order is not measurable and is excluded from the geometric mean.
     if CandLen < Order then continue;
     Totals := CandLen - Order + 1;
-    Matches := ClippedOverlap(CandCounts[Order], RefCounts[Order]);
     if Smooth and (Order >= 2) then
       // Lin & Och (2004) smoothing-1: add-1 to numerator and denominator
       // for every order above unigrams.
-      Precision := (Matches + 1) / (Totals + 1)
+      Precision := (Matches[Order] + 1) / (Totals + 1)
     else
-      Precision := Matches / Totals;
+      Precision := Matches[Order] / Totals;
     if Precision <= 0 then Exit; // unsmoothed zero precision -> BLEU = 0
     SumLogP := SumLogP + Ln(Precision);
     Inc(UsedOrders);
@@ -2220,45 +2218,53 @@ end;
 function SelfBLEU(const Generations: array of TNeuralIntegerArray;
   MaxN: integer = 4; Smooth: boolean = true): TNeuralFloat;
 var
-  I, J, NumOthers, GenerationsHi, Order, GenCount: integer;
-  PerCand: TNeuralFloat;
+  I, J, NumOthers, GenerationsHi, GenerationsHiM1, Order, GenCount: integer;
   // Counts[Gen][Order] and the length of each generation. Every generation is
   // both a candidate and a reference of every other one, so its n-gram maps
   // are built ONCE here instead of once per ordered pair (#28): G*MaxN builds
   // instead of 2*G*(G-1)*MaxN.
   Counts: array of array of TStringList;
-  Lens: array of integer;
+  Lens, Matches: TNeuralIntegerArray;
+  PerCand: TNeuralFloatDynArr;
 begin
   Result := 0;
   GenCount := Length(Generations);
   if GenCount < 2 then Exit; // need at least one "other" reference
   if MaxN < 1 then Exit;
   GenerationsHi := GenCount - 1;
+  GenerationsHiM1 := GenerationsHi - 1;
   SetLength(Counts, GenCount, MaxN + 1);
   SetLength(Lens, GenCount);
+  SetLength(Matches, MaxN + 1);
+  SetLength(PerCand, GenCount);
   try
     for I := 0 to GenerationsHi do
     begin
       Lens[I] := Length(Generations[I]);
+      PerCand[I] := 0;
       for Order := 1 to MaxN do
         Counts[I][Order] := CountNGrams(Generations[I], Order);
     end;
-    for I := 0 to GenerationsHi do
-    begin
-      // Mean single-reference BLEU of generation I against every OTHER one
-      // (v1: CorpusBLEU is single-reference, so average instead of multi-ref
-      // clipping - documented in the unit header).
-      PerCand := 0;
-      NumOthers := 0;
-      for J := 0 to GenerationsHi do
+    // Mean single-reference BLEU of each generation against every OTHER one
+    // (v1: CorpusBLEU is single-reference, so average instead of multi-ref
+    // clipping - documented in the unit header). ClippedOverlap sums
+    // min(candidate count, reference count) over the shared n-gram types, so
+    // it is symmetric: one pass per UNORDERED pair feeds both directions,
+    // halving the n-gram matching. Each PerCand[I] still accumulates its
+    // others in increasing index order, as the ordered-pair loop did.
+    for I := 0 to GenerationsHiM1 do
+      for J := I + 1 to GenerationsHi do
       begin
-        if J = I then continue;
-        PerCand := PerCand + PairBLEUFromCounts(Counts[I], Counts[J],
-          Lens[I], Lens[J], MaxN, Smooth);
-        Inc(NumOthers);
+        for Order := 1 to MaxN do
+          Matches[Order] := ClippedOverlap(Counts[I][Order], Counts[J][Order]);
+        PerCand[I] := PerCand[I] +
+          PairBLEUFromMatches(Matches, Lens[I], Lens[J], MaxN, Smooth);
+        PerCand[J] := PerCand[J] +
+          PairBLEUFromMatches(Matches, Lens[J], Lens[I], MaxN, Smooth);
       end;
-      if NumOthers > 0 then Result := Result + PerCand / NumOthers;
-    end;
+    NumOthers := GenCount - 1;
+    for I := 0 to GenerationsHi do
+      Result := Result + PerCand[I] / NumOthers;
   finally
     for I := 0 to GenerationsHi do
       for Order := 1 to MaxN do
