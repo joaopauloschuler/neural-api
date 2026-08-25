@@ -115665,17 +115665,19 @@ var
   FanOut, FanIn, N, K, Iter: integer;
   FanInM1, FanOutM1: integer;
   V, U: array of TNeuralFloat;
-  Acc, NormV, Sigma: TNeuralFloat;
+  NormV, Sigma: TNeuralFloat;
   RngState: longword;
-  Neuron: TNNetNeuron;
+  Neurons: TNNetNeuronList;
+  VPtr, UPtr: TNeuralFloatArrPtr;
 begin
   Result := 0;
   if Layer = nil then Exit;
-  if Layer.Neurons.Count = 0 then Exit;
-  if Layer.Neurons[0].Weights.Size = 0 then Exit;
+  Neurons := Layer.Neurons;
+  if Neurons.Count = 0 then Exit;
+  if Neurons[0].Weights.Size = 0 then Exit;
 
-  FanOut := Layer.Neurons.Count;          // rows of W (one per neuron)
-  FanIn  := Layer.Neurons[0].Weights.Size; // cols of W (weights per neuron)
+  FanOut := Neurons.Count;          // rows of W (one per neuron)
+  FanIn  := Neurons[0].Weights.Size; // cols of W (weights per neuron)
   if (FanOut = 0) or (FanIn = 0) then Exit;
   if Iters < 1 then Iters := 1;
   FanInM1 := FanIn - 1;
@@ -115683,6 +115685,8 @@ begin
 
   SetLength(V, FanIn);
   SetLength(U, FanOut);
+  VPtr := TNeuralFloatArrPtr(@V[0]);
+  UPtr := TNeuralFloatArrPtr(@U[0]);
 
   // Deterministic LCG-seeded random unit start vector (independent of the
   // global RandSeed so the report is fully reproducible).
@@ -115702,42 +115706,27 @@ begin
     for K := 0 to FanInM1 do V[K] := 1.0;
     NormV := Sqrt(FanIn);
   end;
-  for K := 0 to FanInM1 do V[K] := V[K] / NormV;
+  TNNetVolume.Mul(VPtr, 1.0 / NormV, FanIn);
 
   Sigma := 0;
   for Iter := 1 to Iters do
   begin
     // u = W v   (row n = Neurons[n].Weights)
     for N := 0 to FanOutM1 do
-    begin
-      Neuron := Layer.Neurons[N];
-      Acc := 0;
-      for K := 0 to FanInM1 do
-        Acc := Acc + Neuron.Weights.FData[K] * V[K];
-      U[N] := Acc;
-    end;
+      U[N] := TNNetVolume.DotProduct(Neurons[N].Weights.GetRawPtr(), VPtr, FanIn);
 
     // sigma_1 ~= ||W v|| = ||u||
-    Sigma := 0;
-    for N := 0 to FanOutM1 do Sigma := Sigma + U[N] * U[N];
-    Sigma := Sqrt(Sigma);
+    Sigma := Sqrt(TNNetVolume.DotProduct(UPtr, UPtr, FanOut));
 
     // v = W^T u
-    for K := 0 to FanInM1 do V[K] := 0;
+    FillChar(V[0], FanIn * csNeuralFloatSize, 0);
     for N := 0 to FanOutM1 do
-    begin
-      Neuron := Layer.Neurons[N];
-      Acc := U[N];
-      for K := 0 to FanInM1 do
-        V[K] := V[K] + Neuron.Weights.FData[K] * Acc;
-    end;
+      TNNetVolume.MulAdd(VPtr, Neurons[N].Weights.GetRawPtr(), U[N], FanIn);
 
     // v := v / ||v||
-    NormV := 0;
-    for K := 0 to FanInM1 do NormV := NormV + V[K] * V[K];
-    NormV := Sqrt(NormV);
+    NormV := Sqrt(TNNetVolume.DotProduct(VPtr, VPtr, FanIn));
     if NormV <= 1e-30 then Break; // all-zero matrix => sigma_1 = 0
-    for K := 0 to FanInM1 do V[K] := V[K] / NormV;
+    TNNetVolume.Mul(VPtr, 1.0 / NormV, FanIn);
   end;
 
   Result := Sigma;
@@ -115752,17 +115741,19 @@ var
   FanOut, FanIn, N, Col, Iter: integer;
   FanInM1, FanOutM1: integer;
   V, U: array of TNeuralFloat;
-  Acc, NormV, NormU, Rho: TNeuralFloat;
+  NormV, NormU, Rho: TNeuralFloat;
   RngState: longword;
-  Neuron: TNNetNeuron;
+  Neurons: TNNetNeuronList;
+  VPtr, UPtr: TNeuralFloatArrPtr;
 begin
   Result := 0;
   if Layer = nil then Exit;
-  if Layer.Neurons.Count = 0 then Exit;
-  if Layer.Neurons[0].Weights.Size = 0 then Exit;
+  Neurons := Layer.Neurons;
+  if Neurons.Count = 0 then Exit;
+  if Neurons[0].Weights.Size = 0 then Exit;
 
-  FanOut := Layer.Neurons.Count;          // rows of W (one per neuron)
-  FanIn  := Layer.Neurons[0].Weights.Size; // cols of W (weights per neuron)
+  FanOut := Neurons.Count;          // rows of W (one per neuron)
+  FanIn  := Neurons[0].Weights.Size; // cols of W (weights per neuron)
   if (FanOut = 0) or (FanIn = 0) then Exit;
   // Eigenvalues are only defined for a SQUARE matrix. A reservoir matrix W is
   // N x N; anything else has no spectral radius — bail out (return 0).
@@ -115773,6 +115764,8 @@ begin
 
   SetLength(V, FanIn);
   SetLength(U, FanOut);
+  VPtr := TNeuralFloatArrPtr(@V[0]);
+  UPtr := TNeuralFloatArrPtr(@U[0]);
 
   // Deterministic LCG-seeded random unit start vector (independent of the
   // global RandSeed so the estimate is fully reproducible).
@@ -115792,30 +115785,23 @@ begin
     for Col := 0 to FanInM1 do V[Col] := 1.0;
     NormV := Sqrt(FanIn);
   end;
-  for Col := 0 to FanInM1 do V[Col] := V[Col] / NormV;
+  TNNetVolume.Mul(VPtr, 1.0 / NormV, FanIn);
 
   Rho := 0;
   for Iter := 1 to Iters do
   begin
     // u = W v   (row n = Neurons[n].Weights). NO transpose step — this is the
     // eigenvector recurrence, not the singular-vector one.
-    NormU := 0;
     for N := 0 to FanOutM1 do
-    begin
-      Neuron := Layer.Neurons[N];
-      Acc := 0;
-      for Col := 0 to FanInM1 do
-        Acc := Acc + Neuron.Weights.FData[Col] * V[Col];
-      U[N] := Acc;
-      NormU := NormU + Acc * Acc;
-    end;
-    NormU := Sqrt(NormU);
+      U[N] := TNNetVolume.DotProduct(Neurons[N].Weights.GetRawPtr(), VPtr, FanIn);
+    NormU := Sqrt(TNNetVolume.DotProduct(UPtr, UPtr, FanOut));
 
     // Rayleigh-flavoured ratio estimate: with ||v|| = 1, rho ~= ||W v||.
     Rho := NormU;
     if NormU <= 1e-30 then Break; // nilpotent / all-zero direction => rho = 0
     // v := u / ||u||  (re-normalise the new dominant-eigenvector estimate).
-    for Col := 0 to FanInM1 do V[Col] := U[Col] / NormU;
+    Move(U[0], V[0], FanIn * csNeuralFloatSize);
+    TNNetVolume.Mul(VPtr, 1.0 / NormU, FanIn);
   end;
 
   Result := Rho;
@@ -115832,14 +115818,13 @@ const
   cStableRankCollapse = 0.95; // sigma_1/||W||_F above this ~ rank-1 collapse
 var
   MaxLayerNeuronPos: integer;
-  MaxNeuronWeightPos: integer;
   LastLayerIdx, cBinsM1, RatioCountM1: integer;
   Lines: TStringList;
   Flags: TStringList;
   LayerIdx, NeuronIdx, K, BinIdx: integer;
   Layer: TNNetLayer;
-  Neuron: TNNetNeuron;
-  W, Sum, SumSq, Mean, Std, Frob, Sigma: TNeuralFloat;
+  Wv: TNNetVolume;
+  Sum, SumSq, Mean, Std, Frob, Sigma: TNeuralFloat;
   FanIn, FanOut, WCount, TrainableLayers: integer;
   StableRank, MPBaseline, MPRatio, FanInBaseline, FanInRatio: TNeuralFloat;
   ShapeStr, Bar: string;
@@ -115892,15 +115877,10 @@ begin
       MaxLayerNeuronPos := Layer.Neurons.Count - 1;
       for NeuronIdx := 0 to MaxLayerNeuronPos do
       begin
-        Neuron := Layer.Neurons[NeuronIdx];
-        MaxNeuronWeightPos := Neuron.Weights.Size - 1;
-        for K := 0 to MaxNeuronWeightPos do
-        begin
-          W := Neuron.Weights.FData[K];
-          Sum := Sum + W;
-          SumSq := SumSq + W * W;
-          Inc(WCount);
-        end;
+        Wv := Layer.Neurons[NeuronIdx].Weights;
+        Sum := Sum + Wv.GetSum();
+        SumSq := SumSq + Wv.GetSumSqr();
+        WCount := WCount + Wv.Size;
       end;
       if WCount = 0 then Continue;
 
@@ -116031,6 +116011,10 @@ begin
   end;
 end;
 
+// Double-accumulating dot product over two Single rows; implemented further
+// down this unit and forward-declared here for the Gram builders above it.
+function DotProductSSD(A, B: PSingle; N: integer): Double; forward;
+
 class function TNNet.WeightSpectralTailReport(
   NN: TNNet;
   MaxMatrixDim: integer = 512
@@ -116049,10 +116033,7 @@ type
   TDoubleArray = array of Double;
   TDoubleMatrix = array of TDoubleArray;
 var
-  MaxFrobNeuronPos: integer;
-  MaxFrobWeightPos: integer;
   MaxStdNeuronPos: integer;
-  MaxStdWeightPos: integer;
   LastLayerIdx, DimM1, FanInM1, FanOutM1, AlphaCountM1, cBinsM1: integer;
   JStart: integer;
   Lines: TStringList;
@@ -116061,7 +116042,7 @@ var
   Layer: TNNetLayer;
   Neuron: TNNetNeuron;
   FanIn, FanOut, Dim, TrainableLayers: integer;
-  Frob, FrobSq, Sigma, W: TNeuralFloat;
+  Frob, FrobSq, Sigma: TNeuralFloat;
   // Gram matrix (the SMALLER of W^T W / W W^T), its eigenvalues, scratch.
   Gram: TDoubleMatrix;
   Eig: TDoubleArray;
@@ -116081,7 +116062,7 @@ var
   MaxBin, BarLen: integer;
   MaxAlphaForChart: Double;
   // hoisted scratch (mode objfpc has no inline var declarations)
-  SumW, SumSqW, Acc, Key: Double;
+  SumW, SumSqW, Key: Double;
   GRow: TDoubleArray;
   WVol, WVolJ: TNNetVolume;
   WiVal: TNeuralFloat;
@@ -116098,8 +116079,10 @@ var
     out OutEig: TDoubleArray);
   var
     Sweep, P, Q, R: integer;
-    Dm1, Dm2, QStart: integer;
+    Dm1, Dm2, QStart, PM1, QM1, QP1: integer;
     Off, Theta, T, C, S, Tau, Apq, App, Aqq, Aip, Aiq: Double;
+    NewAip, NewAiq: Double;
+    AP, AQ, AR: TDoubleArray;
   begin
     Dm1 := D - 1;
     Dm2 := D - 2;
@@ -116109,21 +116092,25 @@ var
       Off := 0;
       for P := 0 to Dm2 do
       begin
+        AP := A[P];
         QStart := P + 1;
         for Q := QStart to Dm1 do
-          Off := Off + A[P][Q] * A[P][Q];
+          Off := Off + AP[Q] * AP[Q];
       end;
       if Off <= cJacobiTol then Break;
 
       for P := 0 to Dm2 do
       begin
+        AP := A[P];
+        PM1 := P - 1;
         QStart := P + 1;
         for Q := QStart to Dm1 do
         begin
-          Apq := A[P][Q];
+          Apq := AP[Q];
           if Abs(Apq) <= 1e-300 then Continue;
-          App := A[P][P];
-          Aqq := A[Q][Q];
+          AQ := A[Q];
+          App := AP[P];
+          Aqq := AQ[Q];
           // Jacobi rotation angle that zeroes A[P][Q].
           Theta := (Aqq - App) / (2.0 * Apq);
           if Theta >= 0 then
@@ -116134,20 +116121,49 @@ var
           S := T * C;
           Tau := S / (1.0 + C);
           // update diagonal
-          A[P][P] := App - T * Apq;
-          A[Q][Q] := Aqq + T * Apq;
-          A[P][Q] := 0.0;
-          A[Q][P] := 0.0;
-          // rotate the remaining entries of rows/cols P and Q
-          for R := 0 to Dm1 do
+          AP[P] := App - T * Apq;
+          AQ[Q] := Aqq + T * Apq;
+          AP[Q] := 0.0;
+          AQ[P] := 0.0;
+          // Rotate the remaining entries of rows/cols P and Q. The R range is
+          // split around P and Q so the skip test leaves the loop body.
+          QM1 := Q - 1;
+          QP1 := Q + 1;
+          for R := 0 to PM1 do
           begin
-            if (R = P) or (R = Q) then Continue;
-            Aip := A[R][P];
-            Aiq := A[R][Q];
-            A[R][P] := Aip - S * (Aiq + Tau * Aip);
-            A[R][Q] := Aiq + S * (Aip - Tau * Aiq);
-            A[P][R] := A[R][P];
-            A[Q][R] := A[R][Q];
+            AR := A[R];
+            Aip := AR[P];
+            Aiq := AR[Q];
+            NewAip := Aip - S * (Aiq + Tau * Aip);
+            NewAiq := Aiq + S * (Aip - Tau * Aiq);
+            AR[P] := NewAip;
+            AR[Q] := NewAiq;
+            AP[R] := NewAip;
+            AQ[R] := NewAiq;
+          end;
+          for R := QStart to QM1 do
+          begin
+            AR := A[R];
+            Aip := AR[P];
+            Aiq := AR[Q];
+            NewAip := Aip - S * (Aiq + Tau * Aip);
+            NewAiq := Aiq + S * (Aip - Tau * Aiq);
+            AR[P] := NewAip;
+            AR[Q] := NewAiq;
+            AP[R] := NewAip;
+            AQ[R] := NewAiq;
+          end;
+          for R := QP1 to Dm1 do
+          begin
+            AR := A[R];
+            Aip := AR[P];
+            Aiq := AR[Q];
+            NewAip := Aip - S * (Aiq + Tau * Aip);
+            NewAiq := Aiq + S * (Aip - Tau * Aiq);
+            AR[P] := NewAip;
+            AR[Q] := NewAiq;
+            AP[R] := NewAip;
+            AQ[R] := NewAiq;
           end;
         end;
       end;
@@ -116201,22 +116217,9 @@ begin
       FanInM1 := FanIn - 1;
       FanOutM1 := FanOut - 1;
 
-      // Frobenius norm (= sqrt of sum of squared singular values = sqrt of the
-      // Gram trace) plus the weight std for the Marchenko-Pastur bulk edge.
-      FrobSq := 0;
-      MaxFrobNeuronPos := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to MaxFrobNeuronPos do
-      begin
-        Neuron := Layer.Neurons[NeuronIdx];
-        MaxFrobWeightPos := Neuron.Weights.Size - 1;
-        for K := 0 to MaxFrobWeightPos do
-        begin
-          W := Neuron.Weights.FData[K];
-          FrobSq := FrobSq + W * W;
-        end;
-      end;
-      Frob := Sqrt(FrobSq);
-      // population std over the FanOut*FanIn weights (mean usually ~0).
+      // One pass over the weights: the Frobenius norm (= sqrt of the sum of
+      // squared singular values = sqrt of the Gram trace) is sqrt(SumSqW), and
+      // the same two sums give the std for the Marchenko-Pastur bulk edge.
       Std := 0;
       SumW := 0;
       SumSqW := 0;
@@ -116224,15 +116227,12 @@ begin
       MaxStdNeuronPos := Layer.Neurons.Count - 1;
       for NeuronIdx := 0 to MaxStdNeuronPos do
       begin
-        Neuron := Layer.Neurons[NeuronIdx];
-        MaxStdWeightPos := Neuron.Weights.Size - 1;
-        for K := 0 to MaxStdWeightPos do
-        begin
-          W := Neuron.Weights.FData[K];
-          SumW := SumW + W;
-          SumSqW := SumSqW + W * W;
-        end;
+        WVol := Layer.Neurons[NeuronIdx].Weights;
+        SumW := SumW + WVol.GetSum();
+        SumSqW := SumSqW + WVol.GetSumSqr();
       end;
+      FrobSq := SumSqW;
+      Frob := Sqrt(FrobSq);
       if Cnt > 0 then
       begin
         Std := SumSqW / Cnt - (SumW / Cnt) * (SumW / Cnt);
@@ -116291,10 +116291,8 @@ begin
           for J := I to DimM1 do
           begin
             WVolJ := Layer.Neurons[J].Weights;
-            Acc := 0;
-            for K := 0 to FanInM1 do
-              Acc := Acc + WVol.FData[K] * WVolJ.FData[K];
-            Gram[I][J] := Acc;
+            Gram[I][J] := DotProductSSD(
+              PSingle(WVol.GetRawPtr()), PSingle(WVolJ.GetRawPtr()), FanIn);
           end;
         end;
       end;
@@ -116665,8 +116663,10 @@ var
     out OutEig: TDoubleArray);
   var
     Sweep, P, Q, R: integer;
-    Dm1, Dm2, QStart: integer;
+    Dm1, Dm2, QStart, PM1, QM1, QP1: integer;
     Off, Theta, T, C, S, Tau, Apq, App, Aqq, Aip, Aiq: Double;
+    NewAip, NewAiq: Double;
+    AP, AQ, AR: TDoubleArray;
   begin
     Dm1 := Dm - 1;
     Dm2 := Dm - 2;
@@ -116675,20 +116675,24 @@ var
       Off := 0;
       for P := 0 to Dm2 do
       begin
+        AP := A[P];
         QStart := P + 1;
         for Q := QStart to Dm1 do
-          Off := Off + A[P][Q] * A[P][Q];
+          Off := Off + AP[Q] * AP[Q];
       end;
       if Off <= cJacobiTol then Break;
       for P := 0 to Dm2 do
       begin
+        AP := A[P];
+        PM1 := P - 1;
         QStart := P + 1;
         for Q := QStart to Dm1 do
         begin
-          Apq := A[P][Q];
+          Apq := AP[Q];
           if Abs(Apq) <= 1e-300 then Continue;
-          App := A[P][P];
-          Aqq := A[Q][Q];
+          AQ := A[Q];
+          App := AP[P];
+          Aqq := AQ[Q];
           Theta := (Aqq - App) / (2.0 * Apq);
           if Theta >= 0 then
             T := 1.0 / (Theta + Sqrt(Theta * Theta + 1.0))
@@ -116697,19 +116701,49 @@ var
           C := pcr_rsqrtf(T * T + 1.0);
           S := T * C;
           Tau := S / (1.0 + C);
-          A[P][P] := App - T * Apq;
-          A[Q][Q] := Aqq + T * Apq;
-          A[P][Q] := 0.0;
-          A[Q][P] := 0.0;
-          for R := 0 to Dm1 do
+          AP[P] := App - T * Apq;
+          AQ[Q] := Aqq + T * Apq;
+          AP[Q] := 0.0;
+          AQ[P] := 0.0;
+          // The R range is split around P and Q so the skip test leaves the
+          // loop body.
+          QM1 := Q - 1;
+          QP1 := Q + 1;
+          for R := 0 to PM1 do
           begin
-            if (R = P) or (R = Q) then Continue;
-            Aip := A[R][P];
-            Aiq := A[R][Q];
-            A[R][P] := Aip - S * (Aiq + Tau * Aip);
-            A[R][Q] := Aiq + S * (Aip - Tau * Aiq);
-            A[P][R] := A[R][P];
-            A[Q][R] := A[R][Q];
+            AR := A[R];
+            Aip := AR[P];
+            Aiq := AR[Q];
+            NewAip := Aip - S * (Aiq + Tau * Aip);
+            NewAiq := Aiq + S * (Aip - Tau * Aiq);
+            AR[P] := NewAip;
+            AR[Q] := NewAiq;
+            AP[R] := NewAip;
+            AQ[R] := NewAiq;
+          end;
+          for R := QStart to QM1 do
+          begin
+            AR := A[R];
+            Aip := AR[P];
+            Aiq := AR[Q];
+            NewAip := Aip - S * (Aiq + Tau * Aip);
+            NewAiq := Aiq + S * (Aip - Tau * Aiq);
+            AR[P] := NewAip;
+            AR[Q] := NewAiq;
+            AP[R] := NewAip;
+            AQ[R] := NewAiq;
+          end;
+          for R := QP1 to Dm1 do
+          begin
+            AR := A[R];
+            Aip := AR[P];
+            Aiq := AR[Q];
+            NewAip := Aip - S * (Aiq + Tau * Aip);
+            NewAiq := Aiq + S * (Aip - Tau * Aiq);
+            AR[P] := NewAip;
+            AR[Q] := NewAiq;
+            AP[R] := NewAip;
+            AQ[R] := NewAiq;
           end;
         end;
       end;
@@ -117237,8 +117271,10 @@ var
     out OutEig: TDoubleArray);
   var
     Sweep, P, Q, R: integer;
-    Dm1, Dm2, QStart: integer;
+    Dm1, Dm2, QStart, PM1, QM1, QP1: integer;
     Off, Theta, T, C, S, Tau, Apq, App, Aqq, Aip, Aiq: Double;
+    NewAip, NewAiq: Double;
+    AP, AQ, AR: TDoubleArray;
   begin
     Dm1 := Dm - 1;
     Dm2 := Dm - 2;
@@ -117247,20 +117283,24 @@ var
       Off := 0;
       for P := 0 to Dm2 do
       begin
+        AP := A[P];
         QStart := P + 1;
         for Q := QStart to Dm1 do
-          Off := Off + A[P][Q] * A[P][Q];
+          Off := Off + AP[Q] * AP[Q];
       end;
       if Off <= cJacobiTol then Break;
       for P := 0 to Dm2 do
       begin
+        AP := A[P];
+        PM1 := P - 1;
         QStart := P + 1;
         for Q := QStart to Dm1 do
         begin
-          Apq := A[P][Q];
+          Apq := AP[Q];
           if Abs(Apq) <= 1e-300 then Continue;
-          App := A[P][P];
-          Aqq := A[Q][Q];
+          AQ := A[Q];
+          App := AP[P];
+          Aqq := AQ[Q];
           Theta := (Aqq - App) / (2.0 * Apq);
           if Theta >= 0 then
             T := 1.0 / (Theta + Sqrt(Theta * Theta + 1.0))
@@ -117269,19 +117309,49 @@ var
           C := pcr_rsqrtf(T * T + 1.0);
           S := T * C;
           Tau := S / (1.0 + C);
-          A[P][P] := App - T * Apq;
-          A[Q][Q] := Aqq + T * Apq;
-          A[P][Q] := 0.0;
-          A[Q][P] := 0.0;
-          for R := 0 to Dm1 do
+          AP[P] := App - T * Apq;
+          AQ[Q] := Aqq + T * Apq;
+          AP[Q] := 0.0;
+          AQ[P] := 0.0;
+          // The R range is split around P and Q so the skip test leaves the
+          // loop body.
+          QM1 := Q - 1;
+          QP1 := Q + 1;
+          for R := 0 to PM1 do
           begin
-            if (R = P) or (R = Q) then Continue;
-            Aip := A[R][P];
-            Aiq := A[R][Q];
-            A[R][P] := Aip - S * (Aiq + Tau * Aip);
-            A[R][Q] := Aiq + S * (Aip - Tau * Aiq);
-            A[P][R] := A[R][P];
-            A[Q][R] := A[R][Q];
+            AR := A[R];
+            Aip := AR[P];
+            Aiq := AR[Q];
+            NewAip := Aip - S * (Aiq + Tau * Aip);
+            NewAiq := Aiq + S * (Aip - Tau * Aiq);
+            AR[P] := NewAip;
+            AR[Q] := NewAiq;
+            AP[R] := NewAip;
+            AQ[R] := NewAiq;
+          end;
+          for R := QStart to QM1 do
+          begin
+            AR := A[R];
+            Aip := AR[P];
+            Aiq := AR[Q];
+            NewAip := Aip - S * (Aiq + Tau * Aip);
+            NewAiq := Aiq + S * (Aip - Tau * Aiq);
+            AR[P] := NewAip;
+            AR[Q] := NewAiq;
+            AP[R] := NewAip;
+            AQ[R] := NewAiq;
+          end;
+          for R := QP1 to Dm1 do
+          begin
+            AR := A[R];
+            Aip := AR[P];
+            Aiq := AR[Q];
+            NewAip := Aip - S * (Aiq + Tau * Aip);
+            NewAiq := Aiq + S * (Aip - Tau * Aiq);
+            AR[P] := NewAip;
+            AR[Q] := NewAiq;
+            AP[R] := NewAip;
+            AQ[R] := NewAiq;
           end;
         end;
       end;
