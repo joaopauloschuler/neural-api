@@ -118012,6 +118012,11 @@ var
   ScopeFlat: integer;
   // per-sample flattened gradient vectors (only over in-scope params)
   Grads: array of TFloatArray;      // [usable sample] -> scope-flat gradient
+  GRow, DiffRow: TFloatArray;       // bound gradient row / centered scratch row
+  SumSqDev: TFloatArray;            // sum_i (g_ik - g_bar_k)^2
+  GRowPtr, GBarPtr, DiffPtr: TNeuralFloatArrPtr;
+  DeltaCount: integer;
+  InvLr: TNeuralFloat;
   UsableCount: integer;
   // accumulated batch statistics over the scope-flat parameter axis
   GBar: TFloatArray;                // mean gradient g_bar_k
@@ -118188,27 +118193,33 @@ begin
         Target.Raw[LabelClass] := 1.0;
         NN.Backpropagate(Target);
 
-        // Flatten this sample's in-scope per-parameter gradient vector.
+        // Flatten this sample's in-scope per-parameter gradient vector. An
+        // in-scope layer owns one contiguous scope-flat slab, so only its base
+        // needs the ScopeMap lookup.
         SetLength(Grads[UsableCount], ScopeParamCnt);
+        GRow := Grads[UsableCount];
         for LIdx := 0 to LastLayerIdx do
         begin
           if not LayerInScope[LIdx] then Continue;
           Layer := NN.Layers[LIdx];
           LR := Layer.LearningRate;
           if LR <= 0 then LR := 1.0;
-          P := FlatBase[LIdx];
+          InvLr := 1.0 / LR;
+          P := ScopeMap[FlatBase[LIdx]];
           MaxGradNeuronPos := Layer.Neurons.Count - 1;
           for NeuronIdx := 0 to MaxGradNeuronPos do
           begin
             Neuron := Layer.Neurons[NeuronIdx];
-            MaxNeuronDeltaPos := Neuron.Delta.Size - 1;
-            for K := 0 to MaxNeuronDeltaPos do
+            DeltaCount := Neuron.Delta.Size;
+            if DeltaCount > 0 then
             begin
-              Grads[UsableCount][ScopeMap[P]] := Neuron.Delta.FData[K] / LR;
-              Inc(P);
+              Move(Neuron.Delta.FData[0], GRow[P],
+                DeltaCount * csNeuralFloatSize);
+              TNNetVolume.Mul(TNeuralFloatArrPtr(@GRow[P]), InvLr, DeltaCount);
             end;
+            Inc(P, DeltaCount);
             // bias parameter
-            Grads[UsableCount][ScopeMap[P]] := Neuron.FBiasDelta / LR;
+            GRow[P] := Neuron.FBiasDelta * InvLr;
             Inc(P);
           end;
         end;
@@ -118229,45 +118240,53 @@ begin
     UsableCountM1 := UsableCount - 1;
 
     // --- Per-parameter mean, variance and SNR over the batch. ---
+    // Sample-major: every pass walks one gradient row contiguously, where the
+    // per-parameter walk strode by ScopeParamCnt and missed cache on every
+    // element. The variance keeps its two-pass (centered) form, so it stays
+    // independent of the mean_i||g_i||^2 cross-check below.
     SetLength(GBar, ScopeParamCnt);
     SetLength(GStd, ScopeParamCnt);
     SetLength(GSnr, ScopeParamCnt);
+    SetLength(SumSqDev, ScopeParamCnt);
+    SetLength(DiffRow, ScopeParamCnt);
+    GBarPtr := TNeuralFloatArrPtr(@GBar[0]);
+    DiffPtr := TNeuralFloatArrPtr(@DiffRow[0]);
+    FillChar(GBar[0], ScopeParamCnt * csNeuralFloatSize, 0);
+    FillChar(SumSqDev[0], ScopeParamCnt * csNeuralFloatSize, 0);
+    for I := 0 to UsableCountM1 do
+      TNNetVolume.Add(GBarPtr, TNeuralFloatArrPtr(@Grads[I][0]),
+        ScopeParamCnt);
+    for K := 0 to ScopeParamCntM1 do GBar[K] := GBar[K] / UsableCount;
+
+    MeanGiSq := 0;
+    for I := 0 to UsableCountM1 do
+    begin
+      GRowPtr := TNeuralFloatArrPtr(@Grads[I][0]);
+      Move(Grads[I][0], DiffRow[0], ScopeParamCnt * csNeuralFloatSize);
+      TNNetVolume.MulAdd(DiffPtr, GBarPtr, -1.0, ScopeParamCnt);
+      TNNetVolume.MulAdd(TNeuralFloatArrPtr(@SumSqDev[0]), DiffPtr, DiffPtr,
+        ScopeParamCnt);
+      // mean_i ||g_i||^2 (a second, independent estimator of tr(Sigma) via
+      // tr(Sigma) = mean_i||g_i||^2 - ||g_bar||^2, reported as a cross-check).
+      MeanGiSq := MeanGiSq +
+        TNNetVolume.DotProduct(GRowPtr, GRowPtr, ScopeParamCnt);
+    end;
+    MeanGiSq := MeanGiSq / UsableCount;
+
     TrSigma := 0;
     GBarSq := 0;
     for K := 0 to ScopeParamCntM1 do
     begin
-      Mean := 0;
-      for I := 0 to UsableCountM1 do
-        Mean := Mean + Grads[I][K];
-      Mean := Mean / UsableCount;
+      Mean := GBar[K];
       // unbiased per-parameter variance across samples
-      Var_ := 0;
-      for I := 0 to UsableCountM1 do
-      begin
-        V := Grads[I][K] - Mean;
-        Var_ := Var_ + V * V;
-      end;
-      Var_ := Var_ / (UsableCount - 1);
+      Var_ := SumSqDev[K] / (UsableCount - 1);
       if Var_ < 0 then Var_ := 0;
       Sd := Sqrt(Var_);
-      GBar[K] := Mean;
       GStd[K] := Sd;
       GSnr[K] := Abs(Mean) / (Sd + cSnrEps);
       TrSigma := TrSigma + Var_;     // tr(Sigma) = sum_k Var_k
       GBarSq := GBarSq + Mean * Mean; // ||g_bar||^2
     end;
-
-    // mean_i ||g_i||^2 (a second, independent estimator of tr(Sigma) via
-    // tr(Sigma) = mean_i||g_i||^2 - ||g_bar||^2, reported as a cross-check).
-    MeanGiSq := 0;
-    for I := 0 to UsableCountM1 do
-    begin
-      GiSq := 0;
-      for K := 0 to ScopeParamCntM1 do
-        GiSq := GiSq + Grads[I][K] * Grads[I][K];
-      MeanGiSq := MeanGiSq + GiSq;
-    end;
-    MeanGiSq := MeanGiSq / UsableCount;
 
     // McCandlish simple noise scale B_simple = tr(Sigma) / ||g_bar||^2.
     if GBarSq > cEps then
@@ -119708,9 +119727,6 @@ var
   MaxCachedOutputPos: integer;
   MaxActASamplePos: integer;
   MaxActBSamplePos: integer;
-  MaxANormSamplePos: integer;
-  MaxBNormSamplePos: integer;
-  MaxDotSamplePos: integer;
   MaxCheckSamplePos: integer;
   MaxCheckOutputPos: integer;
   LastLayerIdx, NumAlphaM1, TrIdxsHigh, TrIdxsHighM1, HiddenPosHigh, WidthM1: integer;
@@ -119730,13 +119746,19 @@ var
   InvOK, MonoOK, SelfMode, Restored, AllIdentity: boolean;
   Bar, MarkStr: string;
   Width, AWidth: integer;
-  ScoreMat: array of array of TNeuralFloat; // [A-unit, B-unit]
+  ScoreMat: array of TNeuralFloatDynArr;      // [A-unit, B-unit]
+  SRow: TNeuralFloatDynArr;                   // bound score row
+  RowA, RowB: TNeuralFloatDynArr;             // bound activation rows
   ANorm, BNorm: array of TNeuralFloat;
   UsedA, UsedB: array of boolean;
-  ActA, ActB: array of array of TNeuralFloat; // [unit, sample] activations
+  // per-A-unit best unmatched B unit, refreshed only when that unit is taken
+  RowBestJ: array of integer;
+  RowBestVal: array of TNeuralFloat;
+  ActA, ActB: array of TNeuralFloatDynArr;    // [unit, sample] activations
   PreOut: array of array of TNeuralFloat;     // cached B outputs pre-permutation
-  bestI, bestJ, mI, mJ: integer;
+  bestI, bestJ, mI, mJ, SampleCount: integer;
   bestScore, sVal, dotv: TNeuralFloat;
+  WVol: TNNetVolume;
   outV: TNNetVolume;
   pr: TNNetVolumePair;
 
@@ -119776,8 +119798,9 @@ var
   // Perm[i]) — moving each neuron's full weight ROW and its bias together.
   procedure ReorderLayerOutputNeurons(Lay: TNNetLayer; const P: array of integer);
   var
-    n, w, sz, szM1: integer;
-    oldW: array of array of TNeuralFloat;
+    n, sz: integer;
+    Wv: TNNetVolume;
+    oldW: array of TNeuralFloatDynArr;
     oldB: array of TNeuralFloat;
   begin
     SetLength(oldW, Lay.Neurons.Count);
@@ -119785,19 +119808,19 @@ var
     MaxSaveNeuronPos := Lay.Neurons.Count - 1;
     for n := 0 to MaxSaveNeuronPos do
     begin
-      sz := Lay.Neurons[n].Weights.Size;
-      szM1 := sz - 1;
+      Wv := Lay.Neurons[n].Weights;
+      sz := Wv.Size;
       SetLength(oldW[n], sz);
-      for w := 0 to szM1 do oldW[n][w] := Lay.Neurons[n].Weights.FData[w];
+      if sz > 0 then Move(Wv.FData[0], oldW[n][0], sz * csNeuralFloatSize);
       oldB[n] := Lay.Neurons[n].FBiasWeight;
     end;
     MaxReorderNeuronPos := Lay.Neurons.Count - 1;
     for n := 0 to MaxReorderNeuronPos do
     begin
-      sz := Lay.Neurons[n].Weights.Size;
-      szM1 := sz - 1;
-      for w := 0 to szM1 do
-        Lay.Neurons[n].Weights.FData[w] := oldW[P[n]][w];
+      Wv := Lay.Neurons[n].Weights;
+      sz := Wv.Size;
+      if sz > Length(oldW[P[n]]) then sz := Length(oldW[P[n]]);
+      if sz > 0 then Move(oldW[P[n]][0], Wv.FData[0], sz * csNeuralFloatSize);
       Lay.Neurons[n].FBiasWeight := oldB[P[n]];
     end;
     Lay.AfterWeightUpdate();
@@ -119809,18 +119832,21 @@ var
   procedure PermuteNextLayerInputColumns(Lay: TNNetLayer; const P: array of integer);
   var
     n, c, sz, szM1: integer;
+    Wv: TNNetVolume;
     oldCol: array of TNeuralFloat;
   begin
     MaxPermuteNeuronPos := Lay.Neurons.Count - 1;
     for n := 0 to MaxPermuteNeuronPos do
     begin
-      sz := Lay.Neurons[n].Weights.Size;
+      Wv := Lay.Neurons[n].Weights;
+      sz := Wv.Size;
       szM1 := sz - 1;
       SetLength(oldCol, sz);
-      for c := 0 to szM1 do oldCol[c] := Lay.Neurons[n].Weights.FData[c];
+      if sz > 0 then Move(Wv.FData[0], oldCol[0], sz * csNeuralFloatSize);
+      // the read side is a gather through P, so it stays scalar
       for c := 0 to szM1 do
         if (P[c] >= 0) and (P[c] < sz) then
-          Lay.Neurons[n].Weights.FData[c] := oldCol[P[c]];
+          Wv.FData[c] := oldCol[P[c]];
     end;
     Lay.AfterWeightUpdate();
   end;
@@ -120045,26 +120071,29 @@ begin
         NN.LoadDataFromString(aSnap);
         // Cosine over the sample axis.
         SetLength(ANorm, Width); SetLength(BNorm, Width);
+        SampleCount := Samples.Count;
         for I := 0 to WidthM1 do
         begin
-          sVal := 0;
-          MaxANormSamplePos := Samples.Count - 1;
-          for J := 0 to MaxANormSamplePos do sVal := sVal + ActA[I][J]*ActA[I][J];
-          ANorm[I] := Sqrt(sVal);
-          sVal := 0;
-          MaxBNormSamplePos := Samples.Count - 1;
-          for J := 0 to MaxBNormSamplePos do sVal := sVal + ActB[I][J]*ActB[I][J];
-          BNorm[I] := Sqrt(sVal);
+          RowA := ActA[I];
+          RowB := ActB[I];
+          ANorm[I] := Sqrt(TNNetVolume.DotProduct(TNeuralFloatArrPtr(@RowA[0]),
+            TNeuralFloatArrPtr(@RowA[0]), SampleCount));
+          BNorm[I] := Sqrt(TNNetVolume.DotProduct(TNeuralFloatArrPtr(@RowB[0]),
+            TNeuralFloatArrPtr(@RowB[0]), SampleCount));
         end;
         for I := 0 to WidthM1 do
+        begin
+          RowA := ActA[I];
+          SRow := ScoreMat[I];
+          sVal := ANorm[I];
           for J := 0 to WidthM1 do
           begin
-            dotv := 0;
-            MaxDotSamplePos := Samples.Count - 1;
-            for mI := 0 to MaxDotSamplePos do
-              dotv := dotv + ActA[I][mI] * ActB[J][mI];
-            ScoreMat[I][J] := dotv / (ANorm[I]*BNorm[J] + cEps);
+            RowB := ActB[J];
+            dotv := TNNetVolume.DotProduct(TNeuralFloatArrPtr(@RowA[0]),
+              TNeuralFloatArrPtr(@RowB[0]), SampleCount);
+            SRow[J] := dotv / (sVal * BNorm[J] + cEps);
           end;
+        end;
       end
       else
       begin
@@ -120072,39 +120101,61 @@ begin
         SetLength(ANorm, Width); SetLength(BNorm, Width);
         for I := 0 to WidthM1 do
         begin
-          sVal := Layer.Neurons[I].Weights.GetSumSqr();
-          ANorm[I] := Sqrt(sVal);
-          sVal := LayerB.Neurons[I].Weights.GetSumSqr();
-          BNorm[I] := Sqrt(sVal);
+          ANorm[I] := Sqrt(Layer.Neurons[I].Weights.GetSumSqr());
+          BNorm[I] := Sqrt(LayerB.Neurons[I].Weights.GetSumSqr());
         end;
         for I := 0 to WidthM1 do
+        begin
+          WVol := Layer.Neurons[I].Weights;
+          SRow := ScoreMat[I];
+          sVal := ANorm[I];
           for J := 0 to WidthM1 do
           begin
-            dotv := Layer.Neurons[I].Weights.DotProduct(LayerB.Neurons[J].Weights);
-            ScoreMat[I][J] := dotv / (ANorm[I]*BNorm[J] + cEps);
+            dotv := WVol.DotProduct(LayerB.Neurons[J].Weights);
+            SRow[J] := dotv / (sVal * BNorm[J] + cEps);
           end;
+        end;
       end;
 
       // Greedy correlation-descent: repeatedly take the best unmatched pair.
       SetLength(UsedA, Width); SetLength(UsedB, Width);
+      SetLength(RowBestJ, Width); SetLength(RowBestVal, Width);
       for I := 0 to WidthM1 do begin UsedA[I] := false; UsedB[I] := false; Perm[HCount][I] := -1; end;
+      // Each A-unit caches its best UNMATCHED B-unit. A pick can only
+      // invalidate the rows that pointed at the B-unit it took, so the whole
+      // score matrix is rescanned once instead of once per pick. Scanning J
+      // then I with a strict '>' keeps the original lowest-(I,J) tie-break.
+      for I := 0 to WidthM1 do
+      begin
+        SRow := ScoreMat[I];
+        mJ := -1; sVal := -1e30;
+        for J := 0 to WidthM1 do
+          if SRow[J] > sVal then begin sVal := SRow[J]; mJ := J; end;
+        RowBestVal[I] := sVal; RowBestJ[I] := mJ;
+      end;
       for mI := 0 to WidthM1 do
       begin
         bestScore := -1e30; bestI := -1; bestJ := -1;
         for I := 0 to WidthM1 do
         begin
           if UsedA[I] then Continue;
-          for J := 0 to WidthM1 do
+          if (RowBestJ[I] >= 0) and (RowBestVal[I] > bestScore) then
           begin
-            if UsedB[J] then Continue;
-            if ScoreMat[I][J] > bestScore then
-            begin
-              bestScore := ScoreMat[I][J]; bestI := I; bestJ := J;
-            end;
+            bestScore := RowBestVal[I]; bestI := I; bestJ := RowBestJ[I];
           end;
         end;
         if (bestI < 0) or (bestJ < 0) then Break;
         UsedA[bestI] := true; UsedB[bestJ] := true;
+        for I := 0 to WidthM1 do
+        begin
+          if UsedA[I] or (RowBestJ[I] <> bestJ) then Continue;
+          SRow := ScoreMat[I];
+          mJ := -1; sVal := -1e30;
+          for J := 0 to WidthM1 do
+            if (not UsedB[J]) and (SRow[J] > sVal) then
+            begin sVal := SRow[J]; mJ := J; end;
+          RowBestVal[I] := sVal; RowBestJ[I] := mJ;
+        end;
         // A-unit bestI is matched by B-unit bestJ: after permutation, B's
         // output position bestI should hold B-unit bestJ. Perm maps NEW position
         // -> OLD B-unit index.
@@ -120128,7 +120179,9 @@ begin
 
     // === Correctness check 1: permutation invariance (B.Compute unchanged). ===
     InvErrMax := 0;
-    NN.LoadDataFromString(NetB.SaveDataToString());   // NN := permuted B
+    // NN := permuted B. CopyWeights moves the weights AND the biases and ends
+    // in AfterWeightUpdate, so it replaces a whole-net text round trip.
+    NN.CopyWeights(NetB);
     MaxCheckSamplePos := Samples.Count - 1;
     for I := 0 to MaxCheckSamplePos do
     begin
