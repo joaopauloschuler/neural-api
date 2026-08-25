@@ -62271,7 +62271,7 @@ var
   MaxD, SeqLenM1, base, baseP, RowStride: integer;
   av, qv, rv: TNeuralFloat;
   gx, gp, xm, pm, gv, zv, xprev, pprev: TNeuralFloat;
-  dxm, dpm, dgFromUpd, dg, dz, denom: TNeuralFloat;
+  dxm, dpm, dgFromUpd, dg, dz, pmr, invDenom: TNeuralFloat;
   gradA, gradQ, gradR, dAraw, dQraw, dRraw: TNeuralFloat;
   hasInputGrad: boolean;
 begin
@@ -62357,15 +62357,17 @@ begin
       end;
       // Incoming adjoint on x_t from the output (plus recurrence already in gx).
       gx := gx + FOutputError.FData[base];
-      denom := (pm + rv) * (pm + rv);
+      pmr := pm + rv;
+      // Both g-derivatives divide by the same (pm+R)^2: one reciprocal (#21).
+      invDenom := 1 / (pmr * pmr);
       // UPDATE adjoints.
       dxm := gx * (1 - gv);
       dgFromUpd := gx * (zv - xm) + gp * (-pm);
       dz := gx * gv;
       // dg/dpm = R/(pm+R)^2 ; dpm gets gp's direct (1-g) term plus via g.
-      dpm := gp * (1 - gv) + dgFromUpd * (rv / denom);
+      dpm := gp * (1 - gv) + dgFromUpd * (rv * invDenom);
       // dg/dR = -pm/(pm+R)^2.
-      gradR := gradR + dgFromUpd * (-pm / denom);
+      gradR := gradR - dgFromUpd * pm * invDenom;
       // PREDICT adjoints (xm=a*x_{t-1}, pm=a^2*P_{t-1}+Q).
       gradQ := gradQ + dpm;
       gradA := gradA + dxm * xprev + dpm * (2 * av * pprev);
@@ -62989,7 +62991,7 @@ var
   phre, phim, phrePrev, phimPrev: TNeuralFloat;
   dlr, dli, dgB, dxt: TNeuralFloat;
   gNu, gTheta, gB_, gCre, gCim, gD: TNeuralFloat;
-  dAbs, dAngle, dGamma, cAng, sAng: TNeuralFloat;
+  dAbs, dAngle, dGamma, cAng, sAng, expNu: TNeuralFloat;
   hasInputGrad: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -63025,11 +63027,14 @@ begin
   RowStride := Prev.GetRawPos(1, 0);         // = Dn: (t,d)->(t+1,d) step
   for d := 0 to MaxDn do
   begin
-    absLam := NeuralExp(-NeuralExp(Wnu.FData[d]));
+    expNu := NeuralExp(Wnu.FData[d]);
+    absLam := NeuralExp(-expNu);
     angle := NeuralExp(Wtheta.FData[d]);
-    pcr_sincosf(angle, li, lr);
-    lr := absLam * lr;
-    li := absLam * li;
+    // The raw sin/cos pair is needed again by the parameterisation chain below,
+    // so keep it instead of evaluating the angle twice (#4).
+    pcr_sincosf(angle, sAng, cAng);
+    lr := absLam * cAng;
+    li := absLam * sAng;
     gamma := Sqrt(1 - absLam * absLam);
     gB := gamma * Wb.FData[d];
     cre := Wcre.FData[d];
@@ -63085,7 +63090,6 @@ begin
     end;
     // ---- Chain through the parameterisation ----
     // lr = absLam*cos(angle); li = absLam*sin(angle).
-    pcr_sincosf(angle, sAng, cAng);
     dAbs := dlr * cAng + dli * sAng;
     dAngle := -dlr * absLam * sAng + dli * absLam * cAng;
     // gB = gamma*B, gamma = sqrt(1-absLam^2) -> dgamma/dabsLam = -absLam/gamma.
@@ -63094,7 +63098,7 @@ begin
     if gamma > 1e-12 then
       dAbs := dAbs + dGamma * (-absLam / gamma);
     // absLam = exp(-exp(nu)) -> dabsLam/dnu = absLam * (-exp(nu)).
-    gNu := dAbs * absLam * (-NeuralExp(Wnu.FData[d]));
+    gNu := dAbs * absLam * (-expNu);
     // angle = exp(theta) -> dangle/dtheta = angle.
     gTheta := dAngle * angle;
     FGradNu.FData[d] := gNu;
@@ -63274,7 +63278,7 @@ var
   MaxDn, SeqLenM1, basePrev, baseC, pvStride, ocStride, idx1, idx2: integer;
   sp, dSpdLam, lam, ig, rg, a, a2, mult, xt, hPrev: TNeuralFloat;
   ph, dh, dnx, dmult, da2, da, dloga, drg, dig, dxt, gLam: TNeuralFloat;
-  dLoga_dRg, dLoga_dSp: TNeuralFloat;
+  dLoga_dRg: TNeuralFloat;
   hasInputGrad: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -63312,6 +63316,10 @@ begin
     end;
     ph := 0;
     gLam := 0;
+    // loga = -c*rg*sp: the sp factor is per-channel, so d loga/d rg is fixed for
+    // the whole scan and the d loga/d sp chain is one factor applied at the end
+    // of it (#5).
+    dLoga_dRg := -cDecay * sp;
     // Prev/PrevErr share (SeqLen,1,3Dn): x at basePrev, gate logits at +Dn/+2Dn;
     // basePrev steps by -pvStride. FIg/FRg/FA/FMult/FOutputError (and FH at t-1)
     // share (SeqLen,1,Dn): baseC steps by -ocStride, FH at t-1 = baseC-ocStride.
@@ -63346,10 +63354,8 @@ begin
       // a = exp(loga) -> da/dloga = a.
       dloga := da * a;
       // loga = -c * rg * sp.
-      dLoga_dRg := -cDecay * sp;
-      dLoga_dSp := -cDecay * rg;
       drg := dloga * dLoga_dRg;
-      gLam := gLam + dloga * dLoga_dSp * dSpdLam;
+      gLam := gLam + dloga * rg;
       // ---- gate sigmoids: ig = sigmoid(igl), rg = sigmoid(agl) ----
       if hasInputGrad then
       begin
@@ -63363,7 +63369,9 @@ begin
       Dec(basePrev, pvStride);
       Dec(baseC, ocStride);
     end;
-    FGradLambda.FData[d] := gLam;
+    // d loga/d sp = -c*rg, chained through d sp/d lambda: one factor for the
+    // whole accumulated sum.
+    FGradLambda.FData[d] := gLam * (-cDecay * dSpdLam);
   end;
   TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(), FGradLambda.GetRawPtr(), -FLearningRate, Dn);
   if (not FBatchUpdate) then
@@ -65293,13 +65301,14 @@ var
   // Evaluate the symplectic field g = dH/dz at the current FzvBuf, caching the input
   // and activations at sub-index it2 for the backward HVP. Result into gv.
   procedure FieldAt(it2idx: integer);
-  var jj, k2, zb, bp, w1base: integer; a2, h2, t2, s2: TNeuralFloat;
+  var jj, zb, bp, w1base: integer; a2, h2, t2, s2: TNeuralFloat;
   begin
     zb := FZin.GetRawPos(it2idx, 0);
     bp := FAct.GetRawPos(it2idx, 0);
     // Rule #13: contiguous copy of the P-wide phase vector into the cache.
     Move(FzvBuf[0], FZin.FData[zb], P * csNeuralFloatSize);
-    for k2 := 0 to PM1 do FgvBuf[k2] := 0;
+    FillDWord(FgvBuf[0], P, 0);            // #13
+
     for jj := 0 to HdM1 do
     begin
       // W1 row jj: GetRawPos(jj,0,k2) = w1base + k2 (k2 is the depth arg).
@@ -65321,19 +65330,15 @@ var
   // Separable half-field: evaluate the gradient of a HALF Hamiltonian (T or V)
   // at the Dhalf-vector hv, using neuron base nbase, caching into Zc/Ac at idx.
   // Returns dH_half/d(input) (a Dhalf-vector) into outg.
-  procedure HalfFieldAt(nbase: integer; Zc, Ac: TNNetVolume; idx: integer;
+  procedure HalfFieldAt(hW1, hb1, hW2, Zc, Ac: TNNetVolume; idx: integer;
     const hv: array of TNeuralFloat; var outg: array of TNeuralFloat);
-  var jj, k2, zb, bp, hw1base: integer; a2, h2, t2, s2: TNeuralFloat;
-      hW1, hb1, hW2: TNNetVolume;
+  var jj, zb, bp, hw1base: integer; a2, h2, t2, s2: TNeuralFloat;
   begin
-    hW1 := FNeurons[nbase + 0].FWeights;
-    hb1 := FNeurons[nbase + 1].FWeights;
-    hW2 := FNeurons[nbase + 2].FWeights;
     zb := Zc.GetRawPos(idx, 0);
     bp := Ac.GetRawPos(idx, 0);
     // Rule #13: contiguous copy of the Dhalf-wide input into the cache.
     Move(hv[0], Zc.FData[zb], Dhalf * csNeuralFloatSize);
-    for k2 := 0 to DhalfM1 do outg[k2] := 0;
+    FillDWord(outg[0], Dhalf, 0);          // #13
     for jj := 0 to HdM1 do
     begin
       // hW1 row jj: GetRawPos(jj,0,k2) = hw1base + k2 (k2 is the depth arg).
@@ -65353,6 +65358,8 @@ var
 
 var
   itv, itt, basePrev, baseOut: integer;
+  halfNegDt: TNeuralFloat;
+  VW1, Vb1, VW2, TW1, Tb1, TW2: TNNetVolume;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -65368,6 +65375,13 @@ begin
   FStepsM1 := FSteps - 1;
   if FSeparable then
   begin
+    // The V half-MLP (neurons 0..2) and the T half-MLP (neurons 4..6) are the
+    // same tensors at every step (#9), and the half-kick scale is fixed (#5).
+    VW1 := FNeurons[0].FWeights; Vb1 := FNeurons[1].FWeights;
+    VW2 := FNeurons[2].FWeights;
+    TW1 := FNeurons[4].FWeights; Tb1 := FNeurons[5].FWeights;
+    TW2 := FNeurons[6].FWeights;
+    halfNegDt := -0.5 * Fdt;
     // Exact leapfrog (Stormer-Verlet) with H=T(p)+V(q).
     for t := 0 to SeqLenM1 do
     begin
@@ -65381,14 +65395,14 @@ begin
         itv := (t * FSteps + s) * 2;   // two V evals per step
         itt := (t * FSteps + s);       // one T eval per step
         // p_half = p - (dt/2) dV/dq(q)  (#13: scaled accumulate, invariant scalar)
-        HalfFieldAt(0, FZin, FAct, itv, FqvBuf, FgqvBuf);
-        TNNetVolume.MulAdd(@FpvBuf[0], @FgqvBuf[0], -0.5 * Fdt, Dhalf);
+        HalfFieldAt(VW1, Vb1, VW2, FZin, FAct, itv, FqvBuf, FgqvBuf);
+        TNNetVolume.MulAdd(@FpvBuf[0], @FgqvBuf[0], halfNegDt, Dhalf);
         // q_new = q + dt dT/dp(p_half)
-        HalfFieldAt(4, FZinT, FActT, itt, FpvBuf, FgpvBuf);
+        HalfFieldAt(TW1, Tb1, TW2, FZinT, FActT, itt, FpvBuf, FgpvBuf);
         TNNetVolume.MulAdd(@FqvBuf[0], @FgpvBuf[0], Fdt, Dhalf);
         // p_new = p_half - (dt/2) dV/dq(q_new)
-        HalfFieldAt(0, FZin, FAct, itv + 1, FqvBuf, FgqvBuf);
-        TNNetVolume.MulAdd(@FpvBuf[0], @FgqvBuf[0], -0.5 * Fdt, Dhalf);
+        HalfFieldAt(VW1, Vb1, VW2, FZin, FAct, itv + 1, FqvBuf, FgqvBuf);
+        TNNetVolume.MulAdd(@FpvBuf[0], @FgqvBuf[0], halfNegDt, Dhalf);
       end;
       baseOut := FOutput.GetRawPos(t, 0);   // FOutput row t (depth P)
       // #13: contiguous q/p emits.
@@ -65435,8 +65449,10 @@ var
   GW1, Gb1, GW2: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
   SeqLen, P, Hd, Dhalf, t, s, kk, it2: integer;
-  PM1, HdM1, DhalfM1, SeqLenM1, FStepsM1, basePE, baseOE: integer;
-  negLR: TNeuralFloat;
+  PM1, HdM1, DhalfM1, SeqLenM1, FStepsM1, basePE, baseOE, HalfBytes: integer;
+  negLR, halfNegDt: TNeuralFloat;
+  VW1, VW2, GVW1, GVb1, GVW2: TNNetVolume;
+  TW1, TW2, GTW1, GTb1, GTW2: TNNetVolume;
   hasInputGrad: boolean;
   // Per-pass scratch now lives in the F...Buf fields (sized in SetPrevLayer):
   //   FgzpBuf adjoint dL/dz'; FuuBuf adjoint on field g; FdzBuf dL/d(field input);
@@ -65447,18 +65463,13 @@ var
   // cached in (Zc,Ac) at idx, neurons based at nbase. Contracts the half-field
   // gradient against adjoint uh, accumulating that MLP's grads and returning
   // dL/d(input) (a Dhalf-vector) in dzh.
-  procedure HalfHVP(nbase: integer; Zc, Ac: TNNetVolume; idx: integer);
-  var jj, k2, bp, zb, hw1base: integer; h2, t2, cj, dLda, dLdc: TNeuralFloat;
-      hW1, hW2: TNNetVolume; hGW1, hGb1, hGW2: TNNetVolume;
+  procedure HalfHVP(hW1, hW2, hGW1, hGb1, hGW2, Zc, Ac: TNNetVolume;
+    idx: integer);
+  var jj, bp, zb, hw1base: integer; h2, t2, cj, dLda, dLdc: TNeuralFloat;
   begin
-    hW1 := FNeurons[nbase + 0].FWeights;
-    hW2 := FNeurons[nbase + 2].FWeights;
-    hGW1 := FNeurons[nbase + 0].FDelta;
-    hGb1 := FNeurons[nbase + 1].FDelta;
-    hGW2 := FNeurons[nbase + 2].FDelta;
     bp := Ac.GetRawPos(idx, 0);
     zb := Zc.GetRawPos(idx, 0);
-    for k2 := 0 to DhalfM1 do FdzhBuf[k2] := 0;
+    FillDWord(FdzhBuf[0], Dhalf, 0);       // #13
     for jj := 0 to HdM1 do
     begin
       // hW1 row jj: GetRawPos(jj,0,k2) = hw1base + k2 (k2 is the depth arg).
@@ -65482,11 +65493,11 @@ var
   // adjoint u, accumulating the (W1,b1,W2) grads and returning dL/d(field input)
   // in dz. Implemented as a second tape pass over the same MLP (no Hessian).
   procedure HVP(it2idx: integer);
-  var jj, k2, bp, zb, w1base: integer; h2, t2, cj, dLda, dLdc: TNeuralFloat;
+  var jj, bp, zb, w1base: integer; h2, t2, cj, dLda, dLdc: TNeuralFloat;
   begin
     bp := FAct.GetRawPos(it2idx, 0);
     zb := FZin.GetRawPos(it2idx, 0);
-    for k2 := 0 to PM1 do FdzBuf[k2] := 0;
+    FillDWord(FdzBuf[0], P, 0);            // #13
     for jj := 0 to HdM1 do
     begin
       // W1 row jj: GetRawPos(jj,0,k2) = w1base + k2 (k2 is the depth arg).
@@ -65523,12 +65534,22 @@ begin
   SeqLenM1 := SeqLen - 1;
   FStepsM1 := FSteps - 1;
   negLR := -FLearningRate;
+  HalfBytes := Dhalf * csNeuralFloatSize;
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FOutputError.Size);
   PrevErr := nil;
   if hasInputGrad then PrevErr := FPrevLayer.FOutputError;
   if FSeparable then
   begin
+    // Both half-MLPs and their delta tensors are the same at every step (#9),
+    // and both half-kick scales are fixed (#5).
+    VW1 := FNeurons[0].FWeights; VW2 := FNeurons[2].FWeights;
+    GVW1 := FNeurons[0].FDelta;  GVb1 := FNeurons[1].FDelta;
+    GVW2 := FNeurons[2].FDelta;
+    TW1 := FNeurons[4].FWeights; TW2 := FNeurons[6].FWeights;
+    GTW1 := FNeurons[4].FDelta;  GTb1 := FNeurons[5].FDelta;
+    GTW2 := FNeurons[6].FDelta;
+    halfNegDt := -0.5 * Fdt;
     for t := 0 to SeqLenM1 do
     begin
       // Seed (gq_new, gp_new) from this time-step's output error. FOutputError
@@ -65546,20 +65567,24 @@ begin
         //   gqc=dV/dq(q_new);  p_new  = p_half - (dt/2) gqc
         // adjoints in (gqh,gph) = (dL/dq_new, dL/dp_new).
         // (3) p_new = p_half - (dt/2) gqc(q_new) [V eval at it2+1]
-        for kk := 0 to DhalfM1 do FuhBuf[kk] := -0.5 * Fdt * FgphBuf[kk]; // adj on gqc
-        HalfHVP(0, FZin, FAct, it2 + 1);
+        // adj on gqc: a scaled copy of the half-width adjoint (#13).
+        Move(FgphBuf[0], FuhBuf[0], HalfBytes);
+        TNNetVolume.Mul(@FuhBuf[0], halfNegDt, Dhalf);
+        HalfHVP(VW1, VW2, GVW1, GVb1, GVW2, FZin, FAct, it2 + 1);
         // gp_half += gp_new ; gq_new += dzh  (#13: accumulate)
         TNNetVolume.Add(@FgqhBuf[0], @FdzhBuf[0], Dhalf);
         // (2) q_new = q + dt gpb(p_half) [T eval at it2 div 2 = t*Steps+s]
-        for kk := 0 to DhalfM1 do FuhBuf[kk] := Fdt * FgqhBuf[kk];        // adj on gpb
-        HalfHVP(4, FZinT, FActT, t * FSteps + s);
+        Move(FgqhBuf[0], FuhBuf[0], HalfBytes);          // adj on gpb (#13)
+        TNNetVolume.Mul(@FuhBuf[0], Fdt, Dhalf);
+        HalfHVP(TW1, TW2, GTW1, GTb1, GTW2, FZinT, FActT, t * FSteps + s);
         // gq += gq_new (direct) ; gp_half += dzh
         // gph currently holds dL/dp_new == dL/dp_half (direct from step 3),
         // now add the T contribution.
         TNNetVolume.Add(@FgphBuf[0], @FdzhBuf[0], Dhalf);   // #13: accumulate
         // (1) p_half = p - (dt/2) gqa(q) [V eval at it2]
-        for kk := 0 to DhalfM1 do FuhBuf[kk] := -0.5 * Fdt * FgphBuf[kk]; // adj on gqa
-        HalfHVP(0, FZin, FAct, it2);
+        Move(FgphBuf[0], FuhBuf[0], HalfBytes);          // adj on gqa (#13)
+        TNNetVolume.Mul(@FuhBuf[0], halfNegDt, Dhalf);
+        HalfHVP(VW1, VW2, GVW1, GVb1, GVW2, FZin, FAct, it2);
         // gq += dzh ; gp = gp_half (direct). gqh already = dL/dq (direct from
         // step 2) + step-3 V contribution; add step-1 V contribution.
         TNNetVolume.Add(@FgqhBuf[0], @FdzhBuf[0], Dhalf);   // #13: accumulate
@@ -65610,26 +65635,23 @@ begin
       // ----- reverse sub1 (q_new = q + dt*g_b[p-part]) -----
       // direct: dL/dq += gq_new ; adjoint on g_b only on its p-part.
       FillChar(FuuBuf[0], P * csNeuralFloatSize, 0);   // #13: zero-fill
-      for kk := 0 to DhalfM1 do
-      begin
-        FgzBuf[kk] := FgzBuf[kk] + FgzpBuf[kk];        // q_new -> q direct
-        FuuBuf[kk + Dhalf] := Fdt * FgzpBuf[kk];       // u_b on g_b p-part
-      end;
+      // q_new -> q direct, then u_b = dt*gq_new on g_b's p-part (#13).
+      TNNetVolume.Add(@FgzBuf[0], @FgzpBuf[0], Dhalf);
+      Move(FgzpBuf[0], FuuBuf[Dhalf], HalfBytes);
+      TNNetVolume.Mul(@FuuBuf[Dhalf], Fdt, Dhalf);
       HVP(it2 + 1);                               // field at (q, p_mid)
       // dz = dL/dz_b where z_b=(q, p_mid): q-part -> dL/dq, p-part -> dL/dp_mid.
-      for kk := 0 to DhalfM1 do
-      begin
-        FgzBuf[kk] := FgzBuf[kk] + FdzBuf[kk];                // q contribution from z_b
-        FgpmidBuf[kk] := FgzpBuf[kk + Dhalf] + FdzBuf[kk + Dhalf]; // total adjoint on p_mid
-      end;
+      // q contribution from z_b, then the total adjoint on p_mid (#13).
+      TNNetVolume.Add(@FgzBuf[0], @FdzBuf[0], Dhalf);
+      Move(FgzpBuf[Dhalf], FgpmidBuf[0], HalfBytes);
+      TNNetVolume.Add(@FgpmidBuf[0], @FdzBuf[Dhalf], Dhalf);
       // ----- reverse sub0 (p_mid = p - dt*g_a[q-part]) -----
       // direct: dL/dp += gpmid ; adjoint on g_a only on its q-part.
       FillChar(FuuBuf[0], P * csNeuralFloatSize, 0);   // #13: zero-fill
-      for kk := 0 to DhalfM1 do
-      begin
-        FgzBuf[kk + Dhalf] := FgzBuf[kk + Dhalf] + FgpmidBuf[kk]; // p_mid -> p direct
-        FuuBuf[kk] := -Fdt * FgpmidBuf[kk];                   // u_a on g_a q-part
-      end;
+      // p_mid -> p direct, then u_a = -dt*gpmid on g_a's q-part (#13).
+      TNNetVolume.Add(@FgzBuf[Dhalf], @FgpmidBuf[0], Dhalf);
+      Move(FgpmidBuf[0], FuuBuf[0], HalfBytes);
+      TNNetVolume.Mul(@FuuBuf[0], -Fdt, Dhalf);
       HVP(it2);                                   // field at (q, p)
       TNNetVolume.Add(@FgzBuf[0], @FdzBuf[0], P);   // #13: z0 contribution
       // Carry dL/dz0 to the previous integration step.
@@ -66401,9 +66423,10 @@ var
   SeqLen, Depth, t, d, e, j, baseT, baseC, idx, rowOfs: integer;
   SeqLenM1, DepthM1, DepthSq, RowBytes, dRow, baseCPrev: integer;
   liv, lfv, mPrev, mv, ip, fp, accQ, accK, accV, accO: TNeuralFloat;
-  accLi, accLf, fpv, ipv, cqv, rawDen, den: TNeuralFloat;
+  accLi, accLf, fpv, ipv, cqv, rawDen, den, invDen: TNeuralFloat;
+  biasI, biasF: TNeuralFloat;
   XtPtr, OutPtr, KeyPtr, QPtr, NvPtr, CRowPtr, CPrevRowPtr: TNeuralFloatArrPtr;
-  WqR, WkR, WvR, WoR: TNeuralFloatArrPtr;
+  WqR, WkR, WvR, WoR, WiPtr, WfPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -66417,6 +66440,11 @@ begin
   DepthM1 := Depth - 1;
   DepthSq := Depth * Depth;                 // #5
   RowBytes := Depth * csNeuralFloatSize;    // #5
+  // The two scalar-gate rows and their biases do not depend on t (#11).
+  WiPtr := Wi.GetRawPtr(0, 0);
+  WfPtr := Wf.GetRawPtr(0, 0);
+  biasI := FNeurons[7].FWeights.FData[0];
+  biasF := FNeurons[8].FWeights.FData[0];
   for t := 0 to SeqLenM1 do
   begin
     XtPtr := FPrevLayer.FOutput.GetRawPtr(t, 0);
@@ -66426,10 +66454,8 @@ begin
     // q_t, k_t, v_t, o_t (per output channel d) and the two scalar gate args.
     // w_i/w_f and each W_* row are depth-contiguous, so every projection is a
     // single AVX dot product over the depth-contiguous x_t.
-    accLi := FNeurons[7].FWeights.FData[0]                          // b_i
-           + TNNetVolume.DotProduct(Wi.GetRawPtr(0, 0), XtPtr, Depth);
-    accLf := FNeurons[8].FWeights.FData[0]                          // b_f
-           + TNNetVolume.DotProduct(Wf.GetRawPtr(0, 0), XtPtr, Depth);
+    accLi := biasI + TNNetVolume.DotProduct(WiPtr, XtPtr, Depth);
+    accLf := biasF + TNNetVolume.DotProduct(WfPtr, XtPtr, Depth);
     rowOfs := 0;
     for d := 0 to DepthM1 do
     begin
@@ -66488,13 +66514,14 @@ begin
     den := Abs(rawDen);
     if den < 1.0 then den := 1.0;
     FDen.FData[t] := den;
+    invDen := 1 / den;               // den >= 1: one reciprocal per step (#21)
     rowOfs := baseC;
     for d := 0 to DepthM1 do
     begin
       idx := baseT + d;
       cqv := TNNetVolume.DotProduct(FC.GetRawPtr(rowOfs), QPtr, Depth);
       FCq.FData[idx] := cqv;
-      OutPtr^[d] := FO.FData[idx] * (cqv / den);
+      OutPtr^[d] := FO.FData[idx] * (cqv * invDen);
       Inc(rowOfs, Depth);
     end;
   end;
@@ -66516,6 +66543,8 @@ var
   GqBufPtr, GkvBufPtr, GvvBufPtr: TNeuralFloatArrPtr;
   vv: TNeuralFloat;
   ov, cqv, den, rawDen, ip, fp, fpv, gden, gdenRaw, gli, glf: TNeuralFloat;
+  invDen, negInvDen2: TNeuralFloat;
+  WiPtr, WfPtr, GWiPtr, GWfPtr: TNeuralFloatArrPtr;
   gov, gcq, gov_pre, gip, gfp, gscat, cPrevVal, nPrevVal: TNeuralFloat;
   gm, gmNext, mPrev, dotGK: TNeuralFloat;
   forgetBranch: boolean;
@@ -66549,6 +66578,11 @@ begin
   // scalar dL/dm_t (gmNext) is carried back through the running max.
   gmNext := 0;
   SeqLenM1 := SeqLen - 1;
+  // Scalar-gate weight and grad rows are invariant across the whole BPTT (#11).
+  WiPtr := Wi.GetRawPtr(0, 0);
+  WfPtr := Wf.GetRawPtr(0, 0);
+  GWiPtr := FGradWi.GetRawPtr(0, 0);
+  GWfPtr := FGradWf.GetRawPtr(0, 0);
   for t := SeqLenM1 downto 0 do
   begin
     GyPtr := FOutputError.GetRawPtr(t, 0);
@@ -66563,8 +66597,13 @@ begin
     KeyPtr := FKey.GetRawPtr(baseT);
     NvPtr := FNv.GetRawPtr(baseT);
     GqBufPtr := @FgqBuf[0]; GkvBufPtr := @FgkvBuf[0]; GvvBufPtr := @FgvvBuf[0];
-    for d := 0 to DepthM1 do begin FgqBuf[d] := 0; FgkvBuf[d] := 0; FgvvBuf[d] := 0; end;
-    // Read-out: h[d] = o[d] * Cq[d] / den.
+    FillDWord(FgqBuf[0], Depth, 0);          // #13
+    FillDWord(FgkvBuf[0], Depth, 0);
+    FillDWord(FgvvBuf[0], Depth, 0);
+    // Read-out: h[d] = o[d] * Cq[d] / den. den >= 1, so the three per-channel
+    // divides by it become one reciprocal (#21).
+    invDen := 1 / den;
+    negInvDen2 := -invDen * invDen;
     gden := 0;
     rowOfs := 0;
     for d := 0 to DepthM1 do
@@ -66572,9 +66611,9 @@ begin
       idx := baseT + d;
       ov := FO.FData[idx];
       cqv := FCq.FData[idx];
-      gov := GyPtr^[d] * (cqv / den);          // dL/do[d]
-      gcq := GyPtr^[d] * (ov / den);           // dL/dCq[d]
-      gden := gden + GyPtr^[d] * ov * cqv * (-1.0 / (den * den));
+      gov := GyPtr^[d] * (cqv * invDen);       // dL/do[d]
+      gcq := GyPtr^[d] * (ov * invDen);        // dL/dCq[d]
+      gden := gden + GyPtr^[d] * ov * cqv * negInvDen2;
       // o[d] = sigmoid(pre_o) -> bias and Wo grads.
       gov_pre := gov * ov * (1 - ov);
       FGradBo.FData[d] := FGradBo.FData[d] + gov_pre;
@@ -66670,12 +66709,12 @@ begin
     FNeurons[8].FDelta.FData[0] := FNeurons[8].FDelta.FData[0] - FLearningRate * glf; // b_f
     // scalar-gate input-weight grads (depth-contiguous MulAdd over x_t) and the
     // two-row dL/dx contribution (two MulAdds).
-    TNNetVolume.MulAdd(FGradWi.GetRawPtr(0, 0), XtPtr, gli, Depth);
-    TNNetVolume.MulAdd(FGradWf.GetRawPtr(0, 0), XtPtr, glf, Depth);
+    TNNetVolume.MulAdd(GWiPtr, XtPtr, gli, Depth);
+    TNNetVolume.MulAdd(GWfPtr, XtPtr, glf, Depth);
     if hasInputGrad then
     begin
-      TNNetVolume.MulAdd(PrevErrPtr, Wi.GetRawPtr(0, 0), gli, Depth);
-      TNNetVolume.MulAdd(PrevErrPtr, Wf.GetRawPtr(0, 0), glf, Depth);
+      TNNetVolume.MulAdd(PrevErrPtr, WiPtr, gli, Depth);
+      TNNetVolume.MulAdd(PrevErrPtr, WfPtr, glf, Depth);
     end;
     // q_t = W_q x_t ; k_t = scale*(W_k x_t) ; v_t = W_v x_t.
     rowOfs := 0;
