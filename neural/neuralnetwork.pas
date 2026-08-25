@@ -84606,7 +84606,7 @@ end;
 // save/load layout are untouched; these planes are a pure read-only mirror.
 procedure TNNetSpectralConv1D.RebuildWeightPlanes();
 var
-  ci, co, m, b, dst: integer;
+  ci, co, m, b, dst, OutStride: integer;
   InDepthM1, OutDepthM1, ModesM1: integer;
   W: TNNetVolume;
 begin
@@ -84615,16 +84615,21 @@ begin
   InDepthM1 := FInDepth - 1;
   OutDepthM1 := FOutDepth - 1;
   ModesM1 := FModes - 1;
+  // #12: ci is the minor axis of both layouts, so both bases are carried --
+  // the mirror steps by 1 and the interleaved source by one (out, Re/Im) pair.
+  OutStride := FOutDepth * 2;
+  dst := 0;
   for co := 0 to OutDepthM1 do
     for m := 0 to ModesM1 do
     begin
-      dst := (co * FModes + m) * FInDepth;
+      b := ((m * FInDepth) * FOutDepth + co) * 2;
       for ci := 0 to InDepthM1 do
       begin
-        b := WBase(m, ci, co);
         FWrPlane[dst + ci] := W.FData[b];
         FWiPlane[dst + ci] := W.FData[b + 1];
+        Inc(b, OutStride);
       end;
+      Inc(dst, FInDepth);
     end;
 end;
 
@@ -84648,7 +84653,7 @@ procedure TNNetSpectralConv1D.ComputeCPU();
 var
   ci, co, m, n: integer;
   InDepthM1, OutDepthM1, SeqLenM1, ModesM1: integer;
-  wBaseIdx, xBaseIdx, pos: integer;
+  wBaseIdx, xBaseIdx, pos, TailLen: integer;
   PrevOut: TNNetVolume;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -84689,12 +84694,15 @@ begin
   // The InDepth complex contraction is the 4-multiply complex GEMM, each real
   // reduction an AVX DotProduct over the contiguous ci axis:
   //   Yre = Wr.xr - Wi.xi ;  Yim = Wr.xi + Wi.xr.
+  TailLen := (FSeqLen - FModes) * csDoubleSize;  // #5: high modes stay zero
   for co := 0 to OutDepthM1 do
   begin
-    for m := 0 to SeqLenM1 do
+    // Modes 0..FModes-1 are overwritten below, so only the truncated tail needs
+    // clearing (#13: one FillChar instead of a scalar loop).
+    if TailLen > 0 then
     begin
-      FSreBuf[m] := 0;
-      FSimBuf[m] := 0;
+      FillChar(FSreBuf[FModes], TailLen, 0);
+      FillChar(FSimBuf[FModes], TailLen, 0);
     end;
     for m := 0 to ModesM1 do
     begin
@@ -84740,7 +84748,7 @@ var
   WDelta, LocalPrevError: TNNetVolume;
   invL, gyr, gyi, contrib, lrGyr, lrGyi: Double;
   InDepthM1, OutDepthM1, SeqLenM1, ModesM1: integer;
-  wBaseIdx, xBaseIdx, planeSize, wPlaneSize, planeSizeM1, wPlaneSizeM1, pos: integer;
+  wBaseIdx, xBaseIdx, planeSize, wPlaneSize, pos, OutStride, TailLen: integer;
 begin
   WDelta := FArrNeurons[0].FDelta;
   invL := 1.0 / FSeqLen;
@@ -84750,22 +84758,14 @@ begin
   ModesM1 := FModes - 1;
   // Contiguous (m,ci) input-spectrum gradient planes -- vectorizable AXPY target.
   planeSize := FModes * FInDepth;
-  planeSizeM1 := planeSize - 1;
-  for n := 0 to planeSizeM1 do
-  begin
-    FdXrePlane[n] := 0;
-    FdXimPlane[n] := 0;
-  end;
+  FillChar(FdXrePlane[0], planeSize * csNeuralFloatSize, 0);   // #13
+  FillChar(FdXimPlane[0], planeSize * csNeuralFloatSize, 0);
   // Contiguous weight-gradient planes (co,m)-major, ci-minor -- the AVX MulAdd
   // accumulation target mirroring FWrPlane/FWiPlane. Scattered into the strided
   // interleaved WDelta after the pass.
   wPlaneSize := FOutDepth * FModes * FInDepth;
-  wPlaneSizeM1 := wPlaneSize - 1;
-  for n := 0 to wPlaneSizeM1 do
-  begin
-    FdWrPlane[n] := 0;
-    FdWiPlane[n] := 0;
-  end;
+  FillChar(FdWrPlane[0], wPlaneSize * csNeuralFloatSize, 0);   // #13
+  FillChar(FdWiPlane[0], wPlaneSize * csNeuralFloatSize, 0);
 
   for co := 0 to OutDepthM1 do
   begin
@@ -84810,38 +84810,47 @@ begin
   // Scatter the contiguous weight-gradient planes back into the strided
   // interleaved persistent WDelta ([m][ci][co][Re,Im]) so the saved-weight
   // gradient layout is unchanged.
+  OutStride := FOutDepth * 2;   // #12: ci step in the interleaved layout
+  wBaseIdx := 0;
   for co := 0 to OutDepthM1 do
     for m := 0 to ModesM1 do
     begin
-      wBaseIdx := (co * FModes + m) * FInDepth;
+      b := ((m * FInDepth) * FOutDepth + co) * 2;
       for ci := 0 to InDepthM1 do
       begin
-        b := WBase(m, ci, co);
         WDelta.FData[b]     := WDelta.FData[b]     + FdWrPlane[wBaseIdx + ci];
         WDelta.FData[b + 1] := WDelta.FData[b + 1] + FdWiPlane[wBaseIdx + ci];
+        Inc(b, OutStride);
       end;
+      Inc(wBaseIdx, FInDepth);
     end;
 
   // Scatter the contiguous (m,ci) input-spectrum gradient back to the [ci][m]
   // scratch the per-channel IFFT below consumes.
   for ci := 0 to InDepthM1 do
+  begin
+    xBaseIdx := ci;             // #12: carries m * FInDepth + ci
     for m := 0 to ModesM1 do
     begin
-      FdXreBuf[ci][m] := FdXrePlane[m * FInDepth + ci];
-      FdXimBuf[ci][m] := FdXimPlane[m * FInDepth + ci];
+      FdXreBuf[ci][m] := FdXrePlane[xBaseIdx];
+      FdXimBuf[ci][m] := FdXimPlane[xBaseIdx];
+      Inc(xBaseIdx, FInDepth);
     end;
+  end;
 
   // Propagate the input-spectrum gradient back through the input FFT:
   //   dL/dx[ci][n] = L * Re( IFFT(dXhat[ci]) )[n].
   if (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
   begin
     LocalPrevError := FPrevLayer.OutputError;
+    TailLen := (FSeqLen - FModes) * csDoubleSize;  // #5: high modes stay zero
     for ci := 0 to InDepthM1 do
     begin
-      for m := 0 to SeqLenM1 do
+      // Modes 0..FModes-1 are overwritten next, so only the tail is cleared.
+      if TailLen > 0 then
       begin
-        FGreBuf[m] := 0;
-        FGimBuf[m] := 0;
+        FillChar(FGreBuf[FModes], TailLen, 0);
+        FillChar(FGimBuf[FModes], TailLen, 0);
       end;
       for m := 0 to ModesM1 do
       begin
@@ -85665,7 +85674,7 @@ end;
 // read-only mirror.
 procedure TNNetSpectralConv2D.RebuildWeightPlanes();
 var
-  ci, co, mx, my, b, dst: integer;
+  ci, co, mx, my, b, dst, OutStride: integer;
   InDepthM1, OutDepthM1, ModesXM1, ModesYM1: integer;
   W: TNNetVolume;
 begin
@@ -85675,17 +85684,22 @@ begin
   OutDepthM1 := FOutDepth - 1;
   ModesXM1 := FModesX - 1;
   ModesYM1 := FModesY - 1;
+  // #12: ci is the minor axis of both layouts, so both bases are carried --
+  // the mirror steps by 1 and the interleaved source by one (out, Re/Im) pair.
+  OutStride := FOutDepth * 2;
+  dst := 0;
   for co := 0 to OutDepthM1 do
     for mx := 0 to ModesXM1 do
       for my := 0 to ModesYM1 do
       begin
-        dst := ((co * FModesX + mx) * FModesY + my) * FInDepth;
+        b := (((mx * FModesY + my) * FInDepth) * FOutDepth + co) * 2;
         for ci := 0 to InDepthM1 do
         begin
-          b := WBase(mx, my, ci, co);
           FWrPlane[dst + ci] := W.FData[b];
           FWiPlane[dst + ci] := W.FData[b + 1];
+          Inc(b, OutStride);
         end;
+        Inc(dst, FInDepth);
       end;
 end;
 
@@ -85709,7 +85723,7 @@ procedure TNNetSpectralConv2D.ComputeCPU();
 var
   ci, co, mx, my, ix, iy: integer;
   InDepthM1, OutDepthM1, SizeXM1, SizeYM1, ModesXM1, ModesYM1: integer;
-  wBaseIdx, xBaseIdx: integer;
+  wBaseIdx, xBaseIdx, pos, InRowStride, OutRowStride, RowBytes, TailBytes: integer;
   PrevOut: TNNetVolume;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -85726,14 +85740,19 @@ begin
   // weight-sized copy -- cheap next to the FFTs and the vectorized contraction.
   RebuildWeightPlanes();
   // 1. 2-D FFT of every input channel.
+  InRowStride := FSizeX * FInDepth;       // #5: one grid row of the input
   for ci := 0 to InDepthM1 do
   begin
     for ix := 0 to SizeXM1 do
+    begin
+      pos := ix * FInDepth + ci;          // #12: carries ((FSizeX*iy)+ix)*FInDepth+ci
       for iy := 0 to SizeYM1 do
       begin
-        FXre[ci][ix][iy] := PrevOut.FData[((FSizeX * iy) + ix) * FInDepth + ci];
+        FXre[ci][ix][iy] := PrevOut.FData[pos];
         FXim[ci][ix][iy] := 0;
+        Inc(pos, InRowStride);
       end;
+    end;
     FFT2D(FXre[ci], FXim[ci], false);
   end;
   // Pack the kept-mode input spectra into contiguous (mx,my,ci) Single planes so
@@ -85752,14 +85771,24 @@ begin
   // The InDepth complex contraction is the 4-multiply complex GEMM, each real
   // reduction an AVX DotProduct over the contiguous ci axis:
   //   Yre = Wr.xr - Wi.xi ;  Yim = Wr.xi + Wi.xr.
+  OutRowStride := FSizeX * FOutDepth;     // #5: one grid row of the output
+  RowBytes := FSizeY * csDoubleSize;      // #5: one FSreBuf row
+  TailBytes := (FSizeY - FModesY) * csDoubleSize;
   for co := 0 to OutDepthM1 do
   begin
-    for ix := 0 to SizeXM1 do
-      for iy := 0 to SizeYM1 do
+    // Only the truncated part of the spectrum stays zero: the kept mode block
+    // [0..ModesX-1][0..ModesY-1] is overwritten below (#13: FillChar per row).
+    for ix := 0 to ModesXM1 do
+      if TailBytes > 0 then
       begin
-        FSreBuf[ix][iy] := 0;
-        FSimBuf[ix][iy] := 0;
+        FillChar(FSreBuf[ix][FModesY], TailBytes, 0);
+        FillChar(FSimBuf[ix][FModesY], TailBytes, 0);
       end;
+    for ix := FModesX to SizeXM1 do
+    begin
+      FillChar(FSreBuf[ix][0], RowBytes, 0);
+      FillChar(FSimBuf[ix][0], RowBytes, 0);
+    end;
     for mx := 0 to ModesXM1 do
       for my := 0 to ModesYM1 do
       begin
@@ -85774,8 +85803,14 @@ begin
       end;
     FFT2D(FSreBuf, FSimBuf, true);  // inverse 2-D FFT (includes 1/(FSizeX*FSizeY))
     for ix := 0 to SizeXM1 do
+    begin
+      pos := ix * FOutDepth + co;         // #12: carries the output grid address
       for iy := 0 to SizeYM1 do
-        FOutput.FData[((FSizeX * iy) + ix) * FOutDepth + co] := FSreBuf[ix][iy];  // real part
+      begin
+        FOutput.FData[pos] := FSreBuf[ix][iy];  // real part
+        Inc(pos, OutRowStride);
+      end;
+    end;
   end;
 end;
 
@@ -85802,7 +85837,8 @@ var
   InDepthM1, OutDepthM1, SizeXM1, SizeYM1, ModesXM1, ModesYM1: integer;
   WDelta, LocalPrevError: TNNetVolume;
   invL, gyr, gyi, contrib, lrGyr, lrGyi: Double;
-  b, L, wBaseIdx, xBaseIdx, planeSize: integer;
+  b, L, wBaseIdx, xBaseIdx, planeSize, OutStride, pos: integer;
+  InRowStride, OutRowStride, RowBytes, TailBytes: integer;
 begin
   WDelta := FArrNeurons[0].FDelta;
   L := FSizeX * FSizeY;
@@ -85817,20 +85853,26 @@ begin
   // Contiguous (mx,my,ci) input-spectrum gradient planes -- vectorizable AXPY
   // target, mirroring the 1-D class.
   planeSize := FModesX * FModesY * FInDepth;
-  for n := 0 to planeSize - 1 do
-  begin
-    FdXrePlane[n] := 0;
-    FdXimPlane[n] := 0;
-  end;
+  FillChar(FdXrePlane[0], planeSize * csNeuralFloatSize, 0);   // #13
+  FillChar(FdXimPlane[0], planeSize * csNeuralFloatSize, 0);
+  InRowStride := FSizeX * FInDepth;       // #5: one grid row of the input
+  OutRowStride := FSizeX * FOutDepth;     // #5: one grid row of the output
+  RowBytes := FSizeY * csDoubleSize;      // #5: one FGreBuf row
+  TailBytes := (FSizeY - FModesY) * csDoubleSize;
+  OutStride := FOutDepth * 2;             // #12: ci step in the interleaved layout
   for co := 0 to OutDepthM1 do
   begin
     // dL/dYhat[co][mx,my] = (1/L) * FFT2D(g[co])[mx,my].
     for ix := 0 to SizeXM1 do
+    begin
+      pos := ix * FOutDepth + co;         // #12: carries the output grid address
       for iy := 0 to SizeYM1 do
       begin
-        FGreBuf[ix][iy] := FOutputError.FData[((FSizeX * iy) + ix) * FOutDepth + co];
+        FGreBuf[ix][iy] := FOutputError.FData[pos];
         FGimBuf[ix][iy] := 0;
+        Inc(pos, OutRowStride);
       end;
+    end;
     FFT2D(FGreBuf, FGimBuf, false);
     for mx := 0 to ModesXM1 do
       for my := 0 to ModesYM1 do
@@ -85845,22 +85887,20 @@ begin
         //   dWi[ci] += -LR*gyi * xr[ci] +  LR*gyr * xi[ci]
         lrGyr := -FLearningRate * gyr;
         lrGyi := -FLearningRate * gyi;
-        for n := 0 to InDepthM1 do
-        begin
-          FdWrRow[n] := 0;
-          FdWiRow[n] := 0;
-        end;
+        FillChar(FdWrRow[0], FInDepth * csNeuralFloatSize, 0);   // #13
+        FillChar(FdWiRow[0], FInDepth * csNeuralFloatSize, 0);
         TNNetVolume.MulAdd(@FdWrRow[0], @FxrPlane[xBaseIdx], lrGyr, FInDepth);
         TNNetVolume.MulAdd(@FdWrRow[0], @FximPlane[xBaseIdx], lrGyi, FInDepth);
         TNNetVolume.MulAdd(@FdWiRow[0], @FxrPlane[xBaseIdx], lrGyi, FInDepth);
         TNNetVolume.MulAdd(@FdWiRow[0], @FximPlane[xBaseIdx], -lrGyr, FInDepth);
         // This mode triple owns these weights outright, so scatter the row into
         // the strided interleaved WDelta right here.
+        b := (((mx * FModesY + my) * FInDepth) * FOutDepth + co) * 2;
         for ci := 0 to InDepthM1 do
         begin
-          b := WBase(mx, my, ci, co);
           WDelta.FData[b]     := WDelta.FData[b]     + FdWrRow[ci];
           WDelta.FData[b + 1] := WDelta.FData[b + 1] + FdWiRow[ci];
+          Inc(b, OutStride);
         end;
         // Input-spectrum gradient (sum over co):
         //   dXre[ci] +=  gyr*Wr[ci] + gyi*Wi[ci]
@@ -85875,13 +85915,16 @@ begin
   // Scatter the contiguous (mx,my,ci) input-spectrum gradient back to the
   // [ci][mx][my] scratch the per-channel IFFT2D below consumes.
   for ci := 0 to InDepthM1 do
+  begin
+    xBaseIdx := ci;         // #12: carries (mx*FModesY+my)*FInDepth + ci
     for mx := 0 to ModesXM1 do
       for my := 0 to ModesYM1 do
-        begin
-          xBaseIdx := (mx * FModesY + my) * FInDepth + ci;
-          FdXreBuf[ci][mx][my] := FdXrePlane[xBaseIdx];
-          FdXimBuf[ci][mx][my] := FdXimPlane[xBaseIdx];
-        end;
+      begin
+        FdXreBuf[ci][mx][my] := FdXrePlane[xBaseIdx];
+        FdXimBuf[ci][mx][my] := FdXimPlane[xBaseIdx];
+        Inc(xBaseIdx, FInDepth);
+      end;
+  end;
 
   // Propagate the input-spectrum gradient back through the input 2-D FFT:
   //   dL/dx[ci] = L * Re( IFFT2D(dXhat[ci]) ).
@@ -85890,12 +85933,19 @@ begin
     LocalPrevError := FPrevLayer.OutputError;
     for ci := 0 to InDepthM1 do
     begin
-      for ix := 0 to SizeXM1 do
-        for iy := 0 to SizeYM1 do
+      // Only the truncated part stays zero: the kept mode block is overwritten
+      // right below (#13: FillChar per row).
+      for ix := 0 to ModesXM1 do
+        if TailBytes > 0 then
         begin
-          FGreBuf[ix][iy] := 0;
-          FGimBuf[ix][iy] := 0;
+          FillChar(FGreBuf[ix][FModesY], TailBytes, 0);
+          FillChar(FGimBuf[ix][FModesY], TailBytes, 0);
         end;
+      for ix := FModesX to SizeXM1 do
+      begin
+        FillChar(FGreBuf[ix][0], RowBytes, 0);
+        FillChar(FGimBuf[ix][0], RowBytes, 0);
+      end;
       for mx := 0 to ModesXM1 do
         for my := 0 to ModesYM1 do
         begin
@@ -85904,12 +85954,15 @@ begin
         end;
       FFT2D(FGreBuf, FGimBuf, true);  // IFFT2D (includes 1/L)
       for ix := 0 to SizeXM1 do
+      begin
+        pos := ix * FInDepth + ci;      // #12/#4: one address, built once
         for iy := 0 to SizeYM1 do
         begin
           contrib := L * FGreBuf[ix][iy];  // undo the IFFT's 1/L -> real adjoint
-          LocalPrevError.FData[((FSizeX * iy) + ix) * FInDepth + ci] :=
-            LocalPrevError.FData[((FSizeX * iy) + ix) * FInDepth + ci] + contrib;
+          LocalPrevError.FData[pos] := LocalPrevError.FData[pos] + contrib;
+          Inc(pos, InRowStride);
         end;
+      end;
     end;
   end;
 
