@@ -265,6 +265,7 @@ type
     procedure TestGenerateTokensStreamedNilConstraintMatchesPlain;
     procedure TestGenerateTokensStreamedWhitelistOnlyEmitsAllowed;
     procedure TestForcedSequenceConstraintFollowsCandidate;
+    procedure TestForcedSequenceMaskMatchesUnguardedReference;
     // Token healing (guidance-style BPE boundary repair).
     procedure TestPrepareTokenHealingBuildsPrefixSetAndTrims;
     procedure TestTokenHealingChangesFirstTokenVsUnhealed;
@@ -6179,6 +6180,108 @@ begin
     Session.Free;
     Twin.Free;
     Full.Free;
+  end;
+end;
+
+// TNNetForcedSequenceConstraint.MaskAllowed masks from the trie's handful of
+// allowed ids instead of asking TokenAllowed per vocabulary id. It must agree
+// element for element with the base-class algorithm (mask by TokenAllowed, then
+// renormalize the survivors) at every trie depth, including the two untouched-
+// row fallbacks: nothing blocked, and zero allowed mass.
+procedure TTestNeuralDecode.TestForcedSequenceMaskMatchesUnguardedReference;
+const
+  cVocab = 8;
+var
+  Seqs: TNNetTokenSequences;
+  C: TNNetForcedSequenceConstraint;
+  V, Ref: TNNetVolume;
+  I, Step: integer;
+
+  // The base TNNetTokenConstraint.MaskAllowed, spelled out over Ref.
+  procedure ReferenceMask();
+  var
+    J: integer;
+    Mass, InvMass: TNeuralFloat;
+    AnyBlocked: boolean;
+  begin
+    Mass := 0;
+    AnyBlocked := false;
+    for J := 0 to cVocab - 1 do
+      if C.TokenAllowed(J)
+      then Mass := Mass + Ref.Raw[J]
+      else AnyBlocked := true;
+    if (not AnyBlocked) or (Mass <= 0) then exit;
+    InvMass := 1.0 / Mass;
+    for J := 0 to cVocab - 1 do
+      if C.TokenAllowed(J)
+      then Ref.Raw[J] := Ref.Raw[J] * InvMass
+      else Ref.Raw[J] := 0;
+  end;
+
+begin
+  // Two candidates share a head (id 3), so the mask's dedup path runs; the
+  // third starts elsewhere.
+  SetLength(Seqs, 3);
+  SetLength(Seqs[0], 2); Seqs[0][0] := 3; Seqs[0][1] := 4;
+  SetLength(Seqs[1], 2); Seqs[1][0] := 3; Seqs[1][1] := 5;
+  SetLength(Seqs[2], 1); Seqs[2][0] := 7;
+  V := TNNetVolume.Create(cVocab, 1, 1);
+  Ref := TNNetVolume.Create(cVocab, 1, 1);
+  C := TNNetForcedSequenceConstraint.Create(Seqs);
+  try
+    for Step := 0 to 2 do
+    begin
+      for I := 0 to cVocab - 1 do
+      begin
+        V.Raw[I] := 0.05 * (I + 1);
+        Ref.Raw[I] := 0.05 * (I + 1);
+      end;
+      ReferenceMask();
+      C.MaskAllowed(V);
+      for I := 0 to cVocab - 1 do
+        AssertEquals('depth ' + IntToStr(Step) + ' element ' + IntToStr(I),
+          Ref.Raw[I], V.Raw[I], 1e-6);
+      // Guard against a vacuous comparison: at the trie root only ids 3 and 7
+      // survive, with mass 0.2 + 0.4.
+      if Step = 0 then
+      begin
+        AssertEquals('root masks a non-candidate id', 0.0, V.Raw[5], 1e-9);
+        AssertEquals('root renormalizes id 3', 0.2 / 0.6, V.Raw[3], 1e-6);
+      end;
+      C.Commit(3 + Step * 1); // walks 3 -> 4 (a live candidate), then off-trie
+    end;
+
+    // Zero allowed mass: rewind, then give every trie-allowed id probability 0.
+    C.Reset([]);
+    for I := 0 to cVocab - 1 do V.Raw[I] := 0.25;
+    V.Raw[3] := 0;
+    V.Raw[7] := 0;
+    C.MaskAllowed(V);
+    AssertEquals('zero-mass fallback leaves an allowed id', 0.0, V.Raw[3], 1e-9);
+    AssertEquals('zero-mass fallback leaves a blocked id', 0.25, V.Raw[5], 1e-6);
+  finally
+    C.Free;
+    Ref.Free;
+    V.Free;
+  end;
+
+  // Nothing blocked: a two-element row whose only ids are the specials, with a
+  // candidate fully emitted so both are allowed. The row must be untouched.
+  SetLength(Seqs, 1);
+  SetLength(Seqs[0], 1); Seqs[0][0] := 5;
+  V := TNNetVolume.Create(2, 1, 1);
+  C := TNNetForcedSequenceConstraint.Create(Seqs);
+  try
+    C.Commit(5);
+    AssertTrue('candidate completed', C.Completed());
+    V.Raw[0] := 0.3;
+    V.Raw[1] := 0.2;
+    C.MaskAllowed(V);
+    AssertEquals('nothing blocked leaves element 0', 0.3, V.Raw[0], 1e-6);
+    AssertEquals('nothing blocked leaves element 1', 0.2, V.Raw[1], 1e-6);
+  finally
+    C.Free;
+    V.Free;
   end;
 end;
 

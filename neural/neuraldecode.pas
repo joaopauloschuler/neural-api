@@ -298,6 +298,12 @@ type
       // vocab-size membership buffer, grown only when a larger row is seen,
       // never re-allocated per token.
       FAllowedBuf: array of boolean;
+    protected
+      // Applies the membership a MaskAllowed implementation recorded in
+      // FAllowedBuf[0..Probs.Size-1], including both fallbacks above: nothing
+      // blocked or zero allowed mass leave the row untouched.
+      procedure ApplyAllowedMask(Probs: TNNetVolume; AnyBlocked: boolean;
+        AllowedMass: TNeuralFloat);
     public
       // Called once at the start of generation with the prompt token ids so
       // stateful constraints can start a fresh sequence. Default: no-op.
@@ -368,12 +374,21 @@ type
       FCandidates: TNNetTokenSequences;
       FActive: array of boolean;
       FDepth: integer;
+      // The allowed ids of one step and their probabilities: at most one per
+      // candidate plus the two special ids, sized once in Create (rule #17).
+      FStepIds: TNeuralIntegerArray;
+      FStepProbs: array of TNeuralFloat;
+      // Collects this step's distinct allowed ids into FStepIds/FStepProbs and
+      // returns how many; marks them in FAllowedBuf and clears the marks again.
+      function CollectAllowedIds(Probs: TNNetVolume;
+        out AllowedMass: TNeuralFloat): integer;
     public
       constructor Create(const Candidates: TNNetTokenSequences); overload;
       constructor Create(Dict: TStringListInt;
         const Candidates: array of string); overload;
       procedure Reset(const PromptTokens: array of integer); override;
       function TokenAllowed(TokenId: integer): boolean; override;
+      procedure MaskAllowed(Probs: TNNetVolume); override;
       procedure Commit(TokenId: integer); override;
       // True when some still-active candidate has been emitted in full.
       function Completed(): boolean;
@@ -481,13 +496,25 @@ type
       // TokenAllowed after the state moves, keyed on the machine's version.
       FFirstOK: array[0..255] of boolean;
       FFirstOKVersion: int64;
+      // Rule #27: the same reasoning one field up, for the token text itself.
+      // A vocabulary-sized array of strings is a pointer chase per id, while
+      // the gates only ever ask for the first byte and whether the text is
+      // empty, one character, or longer - so both answers are precomputed into
+      // flat byte tables. FTokTextKind is 0, 1 or 2 for those three cases.
+      FTokFirstByte: array of byte;
+      FTokTextKind: array of byte;
       procedure BuildFirstOK();
+      procedure BuildTokenTables();
+      // Decides a token that carries text (2 <= TokenId <= High(FTokenStr));
+      // the caller must have refreshed FFirstOK for the machine's version.
+      function TextTokenAllowed(TokenId: integer): boolean;
     public
       constructor Create(Dict: TStringListInt); overload;
       constructor CreateCharLevel(VocabSize: integer);
       destructor Destroy(); override;
       procedure Reset(const PromptTokens: array of integer); override;
       function TokenAllowed(TokenId: integer): boolean; override;
+      procedure MaskAllowed(Probs: TNNetVolume); override;
       procedure Commit(TokenId: integer); override;
       // The live automaton (after the committed tokens) for inspection.
       property Machine: TNNetJSONStateMachine read FMachine;
@@ -696,13 +723,22 @@ type
       // has 256 possible answers per decode step, not one per vocabulary id.
       FFirstOK: array[0..255] of boolean;
       FFirstOKVersion: int64;
+      // Rule #27: see TNNetJSONConstraint.FTokFirstByte - the per-id gates read
+      // these flat tables instead of chasing the string table's pointers.
+      FTokFirstByte: array of byte;
+      FTokTextKind: array of byte;
       procedure BuildFirstOK();
+      procedure BuildTokenTables();
+      // Decides a token that carries text (2 <= TokenId <= High(FTokenStr));
+      // the caller must have refreshed FFirstOK for the machine's version.
+      function TextTokenAllowed(TokenId: integer): boolean;
     public
       constructor Create(const GBNFText: string; Dict: TStringListInt); overload;
       constructor CreateCharLevel(const GBNFText: string; VocabSize: integer);
       destructor Destroy(); override;
       procedure Reset(const PromptTokens: array of integer); override;
       function TokenAllowed(TokenId: integer): boolean; override;
+      procedure MaskAllowed(Probs: TNNetVolume); override;
       procedure Commit(TokenId: integer); override;
       // The live machine (after the committed tokens) for inspection.
       property Machine: TNNetGrammarMachine read FMachine;
@@ -2759,7 +2795,7 @@ end;
 procedure TNNetTokenConstraint.MaskAllowed(Probs: TNNetVolume);
 var
   I, SizeM1: integer;
-  AllowedMass, InvMass: TNeuralFloat;
+  AllowedMass: TNeuralFloat;
   AnyBlocked, A: boolean;
 begin
   // Rule #17: lazily grow the persistent membership buffer, never per call.
@@ -2775,6 +2811,15 @@ begin
     then AllowedMass := AllowedMass + Probs.Raw[I]
     else AnyBlocked := true;
   end;
+  ApplyAllowedMask(Probs, AnyBlocked, AllowedMass);
+end;
+
+procedure TNNetTokenConstraint.ApplyAllowedMask(Probs: TNNetVolume;
+  AnyBlocked: boolean; AllowedMass: TNeuralFloat);
+var
+  I, SizeM1: integer;
+  InvMass: TNeuralFloat;
+begin
   // Nothing to mask: every token is allowed.
   if not AnyBlocked then exit;
   // FALLBACK (documented in the class header): zero allowed mass - leave the
@@ -2786,6 +2831,7 @@ begin
   // entries. Bit-identical: allowed entries get the same single multiply;
   // disallowed are scaled-then-zeroed = 0.
   Probs.Mul(InvMass);
+  SizeM1 := Probs.Size - 1;
   for I := 0 to SizeM1 do
     if not FAllowedBuf[I] then Probs.Raw[I] := 0;
 end;
@@ -2876,6 +2922,9 @@ begin
       Copy(Candidates[I], 0, Length(Candidates[I]));
   end;
   SetLength(FActive, Length(FCandidates));
+  // One allowed id per candidate at most, plus the two special ids.
+  SetLength(FStepIds, Length(FCandidates) + 2);
+  SetLength(FStepProbs, Length(FCandidates) + 2);
   Reset([]);
 end;
 
@@ -2922,6 +2971,70 @@ begin
   for I := 0 to Hi do
     if FActive[I] and (FDepth < Length(FCandidates[I])) and
       (FCandidates[I][FDepth] = TokenId) then exit(true);
+end;
+
+function TNNetForcedSequenceConstraint.CollectAllowedIds(Probs: TNNetVolume;
+  out AllowedMass: TNeuralFloat): integer;
+var
+  I, T, MaxCandPos, SizeM1: integer;
+
+  procedure TakeId(Id: integer);
+  begin
+    if FAllowedBuf[Id] then exit;   // the same id may head several candidates
+    FAllowedBuf[Id] := true;
+    FStepIds[Result] := Id;
+    FStepProbs[Result] := Probs.Raw[Id];
+    AllowedMass := AllowedMass + Probs.Raw[Id];
+    Inc(Result);
+  end;
+
+begin
+  Result := 0;
+  AllowedMass := 0;
+  SizeM1 := Probs.Size - 1;
+  // Special/EOS ids follow the Completed() rule exactly as TokenAllowed does -
+  // which is also why a candidate token below 2 is not taken by the trie branch
+  // below: TokenAllowed answers those from Completed(), never from the trie.
+  if Completed() then
+  begin
+    if SizeM1 >= 0 then TakeId(0);
+    if SizeM1 >= 1 then TakeId(1);
+  end;
+  MaxCandPos := High(FCandidates);
+  for I := 0 to MaxCandPos do
+    if FActive[I] and (FDepth < Length(FCandidates[I])) then
+    begin
+      T := FCandidates[I][FDepth];
+      if (T >= 2) and (T <= SizeM1) then TakeId(T);
+    end;
+  // Leave the shared membership buffer clear for the next call.
+  for I := 0 to Result - 1 do FAllowedBuf[FStepIds[I]] := false;
+end;
+
+procedure TNNetForcedSequenceConstraint.MaskAllowed(Probs: TNNetVolume);
+var
+  I, AllowedCount, MaxAllowedPos: integer;
+  AllowedMass, InvMass: TNeuralFloat;
+begin
+  // The trie allows at most one token per candidate, so the row is masked from
+  // that handful of ids instead of running TokenAllowed - itself a scan over the
+  // candidates - once per vocabulary id.
+  if Length(FAllowedBuf) < Probs.Size then SetLength(FAllowedBuf, Probs.Size);
+  AllowedCount := CollectAllowedIds(Probs, AllowedMass);
+  // The collected ids are distinct and all inside the row, so a count short of
+  // the row size is exactly "some token is disallowed". Both fallbacks of the
+  // base class hold: nothing blocked, and zero allowed mass, leave the row
+  // untouched.
+  if AllowedCount >= Probs.Size then exit;
+  if AllowedMass <= 0 then exit;
+  InvMass := 1.0 / AllowedMass;
+  // Same arithmetic as the base class - one multiply per allowed entry, zero
+  // everywhere else - written sparsely, so the disallowed entries are cleared in
+  // one bulk fill rather than tested one by one.
+  Probs.Fill(0);
+  MaxAllowedPos := AllowedCount - 1;
+  for I := 0 to MaxAllowedPos do
+    Probs.Raw[FStepIds[I]] := FStepProbs[I] * InvMass;
 end;
 
 procedure TNNetForcedSequenceConstraint.Commit(TokenId: integer);
@@ -3241,6 +3354,7 @@ begin
     if I < 2
     then FTokenStr[I] := '' // special ids carry no text
     else FTokenStr[I] := Dict.DeTokenize(I);
+  BuildTokenTables();
 end;
 
 constructor TNNetJSONConstraint.CreateCharLevel(VocabSize: integer);
@@ -3257,6 +3371,7 @@ begin
     if I < 2
     then FTokenStr[I] := ''
     else FTokenStr[I] := Chr(I);
+  BuildTokenTables();
 end;
 
 destructor TNNetJSONConstraint.Destroy();
@@ -3283,40 +3398,97 @@ begin
   FFirstOKVersion := FMachine.Version;
 end;
 
-function TNNetJSONConstraint.TokenAllowed(TokenId: integer): boolean;
+procedure TNNetJSONConstraint.BuildTokenTables();
+var
+  I, Hi: integer;
+begin
+  Hi := High(FTokenStr);
+  SetLength(FTokFirstByte, Hi + 1);
+  SetLength(FTokTextKind, Hi + 1);
+  for I := 0 to Hi do
+    if FTokenStr[I] = '' then
+    begin
+      FTokFirstByte[I] := 0;
+      FTokTextKind[I] := 0;
+    end
+    else
+    begin
+      FTokFirstByte[I] := Ord(FTokenStr[I][1]);
+      if Length(FTokenStr[I]) = 1
+      then FTokTextKind[I] := 1
+      else FTokTextKind[I] := 2;
+    end;
+end;
+
+function TNNetJSONConstraint.TextTokenAllowed(TokenId: integer): boolean;
 var
   S: string;
-  I, LenS: integer;
+  I, LenS, Kind: integer;
 begin
-  if (TokenId < 0) or (TokenId > High(FTokenStr)) then exit(false);
-  // Special/EOS ids: legal exactly when a complete top-level value stands.
-  if TokenId < 2 then exit(FMachine.IsComplete());
-  // #23: the gates below index FTokenStr in place; binding the row to a local
-  // string costs a reference-count pair per vocabulary id, so the local is
-  // taken only on the rare multi-character path that actually needs it.
-  LenS := Length(FTokenStr[TokenId]);
-  if LenS = 0 then exit(false); // would not advance generation
+  Kind := FTokTextKind[TokenId];
+  if Kind = 0 then exit(false); // empty token: would not advance generation
   // First-character gate: the probe's first FeedChar starts from exactly the
   // state FFirstOK was built from, so a token whose first byte the machine
   // rejects can never be fed - and this skips the CopyFrom deep copy plus the
-  // per-character feed for the vast majority of the vocabulary. The table is
-  // per state, hence rebuilt exactly when the machine's version moves.
-  if FFirstOKVersion <> FMachine.Version then BuildFirstOK();
-  if not FFirstOK[Ord(FTokenStr[TokenId][1])] then exit(false);
+  // per-character feed for the vast majority of the vocabulary.
+  if not FFirstOK[FTokFirstByte[TokenId]] then exit(false);
   // A one-character token is fully decided by that prefilter. FFirstOK[c] is
   // FMachine.CharAllowed(c), CharAllowed is save-state / FeedChar / restore, so
   // its boolean IS FeedChar's; and FProbe is an exact clone of FMachine, so
   // FProbe.FeedChar(S[1]) would return that same boolean. Char-level
   // constraints (CreateCharLevel) make this 100% of the vocabulary, and it
   // skips the CopyFrom state clone plus the feed entirely.
-  if LenS = 1 then exit(true);
+  if Kind = 1 then exit(true);
   // Transitive multi-character validation: clone the live state and feed the
   // token's characters one by one; ALL must be legal continuations.
   S := FTokenStr[TokenId];
+  LenS := Length(S);
   FProbe.CopyFrom(FMachine);
   for I := 1 to LenS do
     if not FProbe.FeedChar(S[I]) then exit(false);
   Result := true;
+end;
+
+function TNNetJSONConstraint.TokenAllowed(TokenId: integer): boolean;
+begin
+  if (TokenId < 0) or (TokenId > High(FTokenStr)) then exit(false);
+  // Special/EOS ids: legal exactly when a complete top-level value stands.
+  if TokenId < 2 then exit(FMachine.IsComplete());
+  // The first-character table is per state, hence rebuilt exactly when the
+  // machine's version moves.
+  if FFirstOKVersion <> FMachine.Version then BuildFirstOK();
+  Result := TextTokenAllowed(TokenId);
+end;
+
+procedure TNNetJSONConstraint.MaskAllowed(Probs: TNNetVolume);
+var
+  I, SizeM1, MaxTokenPos: integer;
+  AllowedMass: TNeuralFloat;
+  AnyBlocked, A, SpecialOK: boolean;
+begin
+  // Rule #5: nothing in the row scan feeds FMachine, so TokenAllowed's two
+  // per-call machine queries - the first-character table's version check and
+  // the special-id completion verdict - are invariant across the whole row and
+  // are taken once here instead of once per vocabulary id, along with the
+  // virtual dispatch itself.
+  if Length(FAllowedBuf) < Probs.Size then SetLength(FAllowedBuf, Probs.Size);
+  if FFirstOKVersion <> FMachine.Version then BuildFirstOK();
+  SpecialOK := FMachine.IsComplete();
+  MaxTokenPos := High(FTokenStr);
+  SizeM1 := Probs.Size - 1;
+  AllowedMass := 0;
+  AnyBlocked := false;
+  for I := 0 to SizeM1 do
+  begin
+    if I > MaxTokenPos then A := false
+    else if I < 2 then A := SpecialOK
+    else A := TextTokenAllowed(I);
+    FAllowedBuf[I] := A;
+    if A
+    then AllowedMass := AllowedMass + Probs.Raw[I]
+    else AnyBlocked := true;
+  end;
+  ApplyAllowedMask(Probs, AnyBlocked, AllowedMass);
 end;
 
 procedure TNNetJSONConstraint.Commit(TokenId: integer);
@@ -4123,6 +4295,7 @@ begin
     if I < 2
     then FTokenStr[I] := ''
     else FTokenStr[I] := Dict.DeTokenize(I);
+  BuildTokenTables();
 end;
 
 constructor TNNetGrammarConstraint.CreateCharLevel(const GBNFText: string;
@@ -4141,6 +4314,7 @@ begin
     if I < 2
     then FTokenStr[I] := ''
     else FTokenStr[I] := Chr(I);
+  BuildTokenTables();
 end;
 
 destructor TNNetGrammarConstraint.Destroy();
@@ -4168,43 +4342,99 @@ begin
   FFirstOKVersion := FMachine.Version;
 end;
 
-function TNNetGrammarConstraint.TokenAllowed(TokenId: integer): boolean;
+procedure TNNetGrammarConstraint.BuildTokenTables();
+var
+  I, Hi: integer;
+begin
+  Hi := High(FTokenStr);
+  SetLength(FTokFirstByte, Hi + 1);
+  SetLength(FTokTextKind, Hi + 1);
+  for I := 0 to Hi do
+    if FTokenStr[I] = '' then
+    begin
+      FTokFirstByte[I] := 0;
+      FTokTextKind[I] := 0;
+    end
+    else
+    begin
+      FTokFirstByte[I] := Ord(FTokenStr[I][1]);
+      if Length(FTokenStr[I]) = 1
+      then FTokTextKind[I] := 1
+      else FTokTextKind[I] := 2;
+    end;
+end;
+
+function TNNetGrammarConstraint.TextTokenAllowed(TokenId: integer): boolean;
 var
   S: string;
-  I, LenS: integer;
+  I, LenS, Kind: integer;
 begin
-  if (TokenId < 0) or (TokenId > High(FTokenStr)) then exit(false);
-  // Special/EOS ids: legal exactly when the grammar is in a complete state.
-  if TokenId < 2 then exit(FMachine.IsComplete());
-  // #23: the gates below index FTokenStr in place; binding the row to a local
-  // string costs a reference-count pair per vocabulary id, so the local is
-  // taken only on the rare multi-character path that actually needs it.
-  LenS := Length(FTokenStr[TokenId]);
-  if LenS = 0 then exit(false);
+  Kind := FTokTextKind[TokenId];
+  if Kind = 0 then exit(false);
   // Rule #14/#17: FeedChar returns FScratchCount > 0, and the scratch is only
   // ever written inside its "if ElemMatches(TopPos, C)" branch - so a char no
   // active stack top matches can NEVER be fed. CharAllowed decides exactly that,
   // read-only and allocation-free, on FMachine (FProbe would be its clone). The
   // vast majority of the vocabulary dies on its first character, so this guard
-  // skips the CopyFrom deep copy and the FeedChar advance-buffer work entirely.
-  // Rule #27: that verdict depends only on the machine state, so it is answered
-  // from a 256-entry table rebuilt exactly when the machine's version moves -
-  // once per decode step instead of once per vocabulary id.
-  if FFirstOKVersion <> FMachine.Version then BuildFirstOK();
-  if not FFirstOK[Ord(FTokenStr[TokenId][1])] then exit(false);
+  // skips the CopyFrom deep copy and the FeedChar expansion work entirely.
+  if not FFirstOK[FTokFirstByte[TokenId]] then exit(false);
   // A one-character token is fully decided by that gate: FeedChar reaches
-  // AddStackExpanded exactly on the stacks whose top ElemMatches, and that call
+  // AddStackAdvanced exactly on the stacks whose top ElemMatches, and that call
   // always lands at least one entry in an empty scratch set (AddStackRaw's
   // dedupe cannot reject the first one), so FScratchCount > 0 <=> some top
   // matched <=> CharAllowed. Char-level constraints make this 100% of the
   // vocabulary, and it skips the CopyFrom deep copy plus the feed entirely.
-  if LenS = 1 then exit(true);
+  if Kind = 1 then exit(true);
   // Transitive multi-character validation on a forked machine.
   S := FTokenStr[TokenId];
+  LenS := Length(S);
   FProbe.CopyFrom(FMachine);
   for I := 1 to LenS do
     if not FProbe.FeedChar(S[I]) then exit(false);
   Result := true;
+end;
+
+function TNNetGrammarConstraint.TokenAllowed(TokenId: integer): boolean;
+begin
+  if (TokenId < 0) or (TokenId > High(FTokenStr)) then exit(false);
+  // Special/EOS ids: legal exactly when the grammar is in a complete state.
+  if TokenId < 2 then exit(FMachine.IsComplete());
+  // Rule #27: the first-character verdict depends only on the machine state, so
+  // it is answered from a 256-entry table rebuilt exactly when the machine's
+  // version moves - once per decode step instead of once per vocabulary id.
+  if FFirstOKVersion <> FMachine.Version then BuildFirstOK();
+  Result := TextTokenAllowed(TokenId);
+end;
+
+procedure TNNetGrammarConstraint.MaskAllowed(Probs: TNNetVolume);
+var
+  I, SizeM1, MaxTokenPos: integer;
+  AllowedMass: TNeuralFloat;
+  AnyBlocked, A, SpecialOK: boolean;
+begin
+  // Rule #5: nothing in the row scan feeds FMachine, so TokenAllowed's two
+  // per-call machine queries - the first-character table's version check and
+  // the special-id completion verdict - are invariant across the whole row and
+  // are taken once here instead of once per vocabulary id, along with the
+  // virtual dispatch itself.
+  if Length(FAllowedBuf) < Probs.Size then SetLength(FAllowedBuf, Probs.Size);
+  if FFirstOKVersion <> FMachine.Version then BuildFirstOK();
+  SpecialOK := FMachine.IsComplete();
+  MaxTokenPos := High(FTokenStr);
+  SizeM1 := Probs.Size - 1;
+  AllowedMass := 0;
+  AnyBlocked := false;
+  for I := 0 to SizeM1 do
+  begin
+    if I > MaxTokenPos then A := false
+    else if I < 2 then A := SpecialOK
+    else A := TextTokenAllowed(I);
+    FAllowedBuf[I] := A;
+    if A
+    then AllowedMass := AllowedMass + Probs.Raw[I]
+    else AnyBlocked := true;
+  end;
+  ApplyAllowedMask(Probs, AnyBlocked, AllowedMass);
 end;
 
 procedure TNNetGrammarConstraint.Commit(TokenId: integer);
