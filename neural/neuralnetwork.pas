@@ -11973,6 +11973,9 @@ type
       FCoefA, FCoefB, FCoefD: TNNetVolume;        // content-gradient coefficients
       FCoefP, FCoefQ: TNNetVolume;                // style-gradient coefficients
       FNegStyleMean, FStyleTmp: TNNetVolume;      // style column staging
+      // Folded forward affine out = gain*content + bias, used when no backward
+      // pass needs the normalized-content cache.
+      FFwdGain, FFwdBias: TNNetVolume;            // (1,1,Depth)
       {$IFDEF OpenCL}
       FAdaINCL: TNNetGroupNormCL;
       procedure ComputeOpenCL();
@@ -16538,6 +16541,9 @@ type
   // This is an experimental layer. Do not use it yet.
   TNNetLocalProduct = class(TNNetConvolutionBase)
   private
+    // Reciprocal of the feature-window volume: the share of the output error
+    // that each destination cell receives (rules #21/#27).
+    FInvWindowVolume: TNeuralFloat;
     procedure BackpropagateAtOutputPos(OutputX, OutputY, OutputD: integer); {$IFDEF Release} inline; {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
@@ -51742,6 +51748,9 @@ var
   StartTileX, EndTileX, StartTileD, EndTileD: integer;
   PrevErrBase, InPrepBase: integer;
   PrevErrPos, WeightPos, PrevErrDepth, WeightDepth: integer;
+  {$IFDEF FPC}
+  IsReLU, IsIdentity: boolean;
+  {$ENDIF}
 begin
   MaxX := OutputError.SizeX - 1;
   MaxY := OutputError.SizeY - 1;
@@ -51771,6 +51780,12 @@ begin
   // out of the OutputD branch that formerly recomputed them (rules #5/#8).
   PrevErrDepth := LocalPrevError.Depth;
   WeightDepth := FArrNeurons[0].Weights.Depth;
+  // #20: the activation kind is invariant for the whole backward pass, so it is
+  // resolved once instead of re-reading FActivationFn per output element.
+  {$IFDEF FPC}
+  IsReLU := FActivationFn = @RectifiedLinearUnit;
+  IsIdentity := FActivationFn = @Identity;
+  {$ENDIF}
 
   for OutputY := 0 to MaxY do
   begin
@@ -51810,7 +51825,7 @@ begin
               if (FCalculatePrevLayerError and CanBackpropOnPos)
                 then LocalDestPtr := LocalPrevError.GetRawPtr(PrevErrBase + PrevLayerGroupDStart);
               {$IFDEF FPC}
-              if FActivationFn = @RectifiedLinearUnit then
+              if IsReLU then
               begin
                 if FOutputRaw.FData[OutputRawPos] >= 0 then
                 begin
@@ -51821,7 +51836,7 @@ begin
                   LocalOutputErrorDeriv := 0;
                 end;
               end
-              else if FActivationFn = @Identity then
+              else if IsIdentity then
               begin
                 LocalOutputErrorDeriv := FOutputError.FData[OutputRawPos];
               end
@@ -52337,8 +52352,8 @@ procedure NeuralPerChannelMeanInvStd(V: TNNetVolume;
 var
   CntX, CntY, CntD, MaxX, MaxY, Depth: integer;
   DepthM1: integer;
-  InvN: TNeuralFloat;
-  ColPtr, SumPtr, SumSqPtr, MeanPtr: TNeuralFloatArrPtr;
+  InvN, Mean, Variance: TNeuralFloat;
+  ColPtr, SumPtr, SumSqPtr: TNeuralFloatArrPtr;
 begin
   Depth := V.Depth;
   DepthM1 := Depth - 1;
@@ -52351,34 +52366,28 @@ begin
   OutMean.ReSize(1, 1, Depth);
   OutInvStd.ReSize(1, 1, Depth);
   SumScratch.Fill(0);
+  SumSqScratch.Fill(0);
   SumPtr := SumScratch.GetRawPtr(0);
-  MeanPtr := OutMean.GetRawPtr(0);
-  // Pass 1: per-channel sum -> mean. SumScratch[d] += col[d] over the depth run.
+  SumSqPtr := SumSqScratch.GetRawPtr(0);
+  // One pass over the volume accumulates both per-channel moments along the
+  // contiguous depth run: sum for the mean, raw sum of squares for the
+  // variance via Var = E[x^2] - mean^2. Cancellation in that identity can push
+  // the variance slightly below zero, so it is clamped before the inverse root.
   for CntX := 0 to MaxX do
     for CntY := 0 to MaxY do
     begin
       ColPtr := V.GetRawPtr(CntX, CntY);
       TNNetVolume.Add(SumPtr, ColPtr, Depth);
+      TNNetVolume.MulAdd(SumSqPtr, ColPtr, ColPtr, Depth);
     end;
   for CntD := 0 to DepthM1 do
-    OutMean.FData[CntD] := SumScratch.FData[CntD] * InvN;
-  // Pass 2: per-channel centered sum of squares -> variance -> inv-std. Reuse
-  // SumScratch as the centered (col - mean) buffer, then self-MulAdd accumulates
-  // the squared deviation, all along the contiguous depth run.
-  SumSqScratch.Fill(0);
-  SumSqPtr := SumSqScratch.GetRawPtr(0);
-  for CntX := 0 to MaxX do
-    for CntY := 0 to MaxY do
-    begin
-      ColPtr := V.GetRawPtr(CntX, CntY);
-      // SumScratch := col - mean
-      system.Move(ColPtr^, SumPtr^, Depth * csNeuralFloatSize);
-      TNNetVolume.MulAdd(SumPtr, MeanPtr, -1.0, Depth);
-      // SumSqScratch[d] += centered[d]*centered[d]
-      TNNetVolume.MulAdd(SumSqPtr, SumPtr, SumPtr, Depth);
-    end;
-  for CntD := 0 to DepthM1 do
-    OutInvStd.FData[CntD] := pcr_rsqrtf(SumSqScratch.FData[CntD] * InvN + Eps);
+  begin
+    Mean := SumScratch.FData[CntD] * InvN;
+    OutMean.FData[CntD] := Mean;
+    Variance := SumSqScratch.FData[CntD] * InvN - Mean * Mean;
+    if Variance < 0 then Variance := 0;
+    OutInvStd.FData[CntD] := pcr_rsqrtf(Variance + Eps);
+  end;
 end;
 
 { TNNetAdaIN }
@@ -52412,6 +52421,8 @@ begin
   FCoefQ := TNNetVolume.Create();
   FNegStyleMean := TNNetVolume.Create();
   FStyleTmp := TNNetVolume.Create();
+  FFwdGain := TNNetVolume.Create();
+  FFwdBias := TNNetVolume.Create();
 end;
 
 destructor TNNetAdaIN.Destroy();
@@ -52424,6 +52435,8 @@ begin
   FStyleMean.Free;
   FStyleStd.Free;
   FNormContent.Free;
+  FFwdGain.Free;
+  FFwdBias.Free;
   FSumScratch.Free;
   FSumSqScratch.Free;
   FStyleInvStd.Free;
@@ -52467,6 +52480,8 @@ begin
   FCoefQ.ReSize(1, 1, FContentLayer.Output.Depth);
   FNegStyleMean.ReSize(1, 1, FContentLayer.Output.Depth);
   FStyleTmp.ReSize(1, 1, FContentLayer.Output.Depth);
+  FFwdGain.ReSize(1, 1, FContentLayer.Output.Depth);
+  FFwdBias.ReSize(1, 1, FContentLayer.Output.Depth);
   FNormContent.ReSize(FContentLayer.Output);
   SetOutputErrorSize(FContentLayer.Output);
   {$IFDEF OpenCL}
@@ -52482,7 +52497,8 @@ var
   CntX, CntY: integer;
   ContentOut, StyleOut: TNNetVolume;
   ColIn, ColNorm, ColOut, MeanPtr, InvStdPtr: TNeuralFloatArrPtr;
-  StyleStdPtr, StyleMeanPtr: TNeuralFloatArrPtr;
+  StyleStdPtr, StyleMeanPtr, GainPtr, BiasPtr: TNeuralFloatArrPtr;
+  Gain: TNeuralFloat;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FStyleLayer) then FStyleLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -52527,6 +52543,29 @@ begin
   InvStdPtr := FContentInvStd.GetRawPtr(0);
   StyleStdPtr := FStyleStd.GetRawPtr(0);
   StyleMeanPtr := FStyleMean.GetRawPtr(0);
+  // Only the backward pass consumes xhat. Without it the whole map collapses to
+  // one per-channel affine, and inherited Compute has already copied the content
+  // into FOutput, so each column is a scale plus a bias in place.
+  if FContentLayer.OutputError.Size <> ContentOut.Size then
+  begin
+    GainPtr := FFwdGain.GetRawPtr(0);
+    BiasPtr := FFwdBias.GetRawPtr(0);
+    for C := 0 to DepthM1 do
+    begin
+      Gain := FStyleStd.FData[C] * FContentInvStd.FData[C];
+      GainPtr^[C] := Gain;
+      BiasPtr^[C] := FStyleMean.FData[C] - Gain * FContentMean.FData[C];
+    end;
+    for CntX := 0 to MaxX do
+      for CntY := 0 to MaxY do
+      begin
+        ColOut := FOutput.GetRawPtr(CntX, CntY);
+        TNNetVolume.Mul(ColOut, GainPtr, Depth);
+        TNNetVolume.Add(ColOut, BiasPtr, Depth);
+      end;
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
   for CntX := 0 to MaxX do
     for CntY := 0 to MaxY do
     begin
@@ -54159,10 +54198,9 @@ begin
     FSmoothErrorPropagation := true;
 
     // The error is smoothed over the whole feature window with a unit
-    // derivative, so every destination gets the same share: compute it once
-    // instead of dividing per element.
-    Delta := LocalOutputError /
-      (FFeatureSizeX * FFeatureSizeY * FOutput.Depth);
+    // derivative, so every destination gets the same share, and the share is
+    // the output error times the window reciprocal fixed at SetPrevLayer.
+    Delta := LocalOutputError * FInvWindowVolume;
 
     if
       (OutputX >= FPadding) and (OutputY >= FPadding) and
@@ -54185,8 +54223,14 @@ begin
 end;
 
 procedure TNNetLocalProduct.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  WindowVolume: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
+  WindowVolume := FFeatureSizeX * FFeatureSizeY * FOutput.Depth;
+  if WindowVolume > 0
+    then FInvWindowVolume := 1 / WindowVolume
+    else FInvWindowVolume := 0;
 end;
 
 procedure TNNetLocalProduct.Compute();
@@ -54214,19 +54258,23 @@ end;
 
 procedure TNNetLocalProduct.ComputeCPU();
 var
-  OutputCntX, OutputCntY, OutputCntD: integer;
+  OutputCntX, OutputCntY: integer;
   InputCntX, InputCntY: integer;
   MaxX, MaxY, MaxD: integer;
   LocalSize: integer;
   PtrA: TNeuralFloatArrPtr;
   OutputIdx: integer;
   Product: TNeuralFloat;
+  ProductBits: LongWord;
+  Depth, DepthBytes: integer;
   CntXYD: integer;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
   MaxD := FOutput.Depth - 1;
+  Depth := FOutput.Depth;
+  DepthBytes := Depth * csNeuralFloatSize;
 
   LocalSize := FFeatureSizeX*FFeatureSizeY*FInputCopy.Depth;
   InputCntX := 0;
@@ -54238,20 +54286,16 @@ begin
     OutputCntY := 0;
     while OutputCntY <= MaxY do
     begin
-      OutputCntD := 0;
       PtrA := FInputPrepared.GetRawPtr(OutputCntX, OutputCntY);
       OutputIdx := FOutput.GetRawPos(OutputCntX, OutputCntY);
-      // #5: the reduction reads only the (X,Y) patch - it does not depend on
-      // OutputCntD, so it runs once per position and fills the Depth slots.
+      // #5: the reduction reads only the (X,Y) patch - it is the same for every
+      // depth slot, so it runs once per position. #13: the Depth slots are then
+      // one broadcast fill plus a contiguous copy into the raw output.
       Product := TNNetVolume.Product(PtrA, LocalSize);
-      while OutputCntD <= MaxD do
-      begin
-        FOutputRaw.FData[OutputIdx] := Product;
-        FOutput.FData[OutputIdx] := Product;
-        Inc(OutputIdx);
-        Inc(OutputCntD);
-        Inc(CntXYD);
-      end;
+      ProductBits := PLongWord(@Product)^;
+      FillDWord(FOutput.FData[OutputIdx], Depth, ProductBits);
+      Move(FOutput.FData[OutputIdx], FOutputRaw.FData[OutputIdx], DepthBytes);
+      Inc(CntXYD, Depth);
       Inc(InputCntY, FStride);
       Inc(OutputCntY);
     end;
