@@ -975,9 +975,10 @@ begin
     raise EArgumentException.CreateFmt(
       'ScoreSequence: sequence length %d exceeds the model context window %d',
       [SampleLen, ContextLen]);
+  // Result was released above, so SetLength allocates it fresh and FPC zeroes
+  // the new elements: unscored positions are already 0.
   SetLength(Result, SampleLen);
   SampleLenM1 := SampleLen - 1;
-  for Pos := 0 to SampleLenM1 do Result[Pos] := 0;
   if WantArgmax then
   begin
     SetLength(Preds, SampleLen);
