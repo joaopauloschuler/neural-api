@@ -41646,7 +41646,7 @@ begin
 end;
 
 // --- ELU activation (alpha = 1), elementwise. ---
-function EnCodecELU(X: TNeuralFloat): TNeuralFloat;
+function EnCodecELU(X: TNeuralFloat): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
 begin
   if X > 0 then Result := X else Result := NeuralExp(X) - 1;
 end;
@@ -42307,7 +42307,8 @@ var
   tS, iK, PatchLen, wBase, tInCh, wOfs, wBaseO: integer;
   oK, OCK, srcBase: integer;
   tInChP, OCKp, dstBaseP, srcIdxP: integer;
-  PadRow, FullRow: TNeuralFloatDynArr;
+  PadRow, FullRow, InRow: TNeuralFloatDynArr;
+  RightBase: integer;
   Acc: TNeuralFloat;
   Padded: TNNetFloatDynArr2D;
   Full: TNNetFloatDynArr2D;
@@ -42363,21 +42364,26 @@ begin
     for i := 0 to InChM1 do
     begin
       SetLength(Padded[i], PadLeft + InLen + PadRight);
+      PadRow := Padded[i];                        // #9: bind both rows once
+      InRow := InSig[i];
       // Left reflect pad: mirror around index 0 WITHOUT repeating sample 0
       // (PyTorch 'reflect': padded[PadLeft-1-j] = x[1+j]).
       for t := 0 to PadLeftM1 do
       begin
         RefIdx := PadLeft - t; // distance from the first real sample
         if RefIdx >= InLen then RefIdx := InLen - 1;
-        Padded[i][t] := InSig[i][RefIdx];
+        PadRow[t] := InRow[RefIdx];
       end;
-      for t := 0 to InLenM1 do Padded[i][PadLeft + t] := InSig[i][t];
+      // #13: the middle section is a contiguous copy of the whole channel row.
+      if InLen > 0 then
+        Move(InRow[0], PadRow[PadLeft], InLen * csNeuralFloatSize);
       // Right reflect pad around the last index.
+      RightBase := PadLeft + InLen;               // #5: invariant across t
       for t := 0 to PadRightM1 do
       begin
         RefIdx := InLen - 2 - t;
         if RefIdx < 0 then RefIdx := 0;
-        Padded[i][PadLeft + InLen + t] := InSig[i][RefIdx];
+        PadRow[RightBase + t] := InRow[RefIdx];
       end;
     end;
     OutLen := (Length(Padded[0]) - EffK) div Stride + 1;
@@ -42482,11 +42488,17 @@ begin
     // reassociates (parity < 1e-4, matches the forward AVX change). Coded by
     // Claude (AI).
     SetLength(InT, InLen * InCh);
-    for t := 0 to InLenM1 do
+    // App.E/#9: channel-outer, so each source row is bound once (#9) and read
+    // contiguously; the destination advances by the carried InCh stride (#6).
+    for i := 0 to InChM1 do
     begin
-      tInChP := t * InCh;                // #11: hoist t*InCh
-      for i := 0 to InChM1 do
-        InT[tInChP + i] := InSig[i][t];
+      InRow := InSig[i];
+      tInChP := i;                       // t*InCh + i, carried
+      for t := 0 to InLenM1 do
+      begin
+        InT[tInChP] := InRow[t];
+        Inc(tInChP, InCh);
+      end;
     end;
     // WT is the loader-built column repack (LoadEnCodecConv); binding it costs a
     // refcount, not a copy or a gather.
@@ -42783,7 +42795,8 @@ begin
   SetLength(Sig, FConfig.AudioChannels);
   SetLength(Sig[0], Length(Waveform));
   WaveformMax := Length(Waveform) - 1;
-  for t := 0 to WaveformMax do Sig[0][t] := Waveform[t];
+  if WaveformMax >= 0 then                                            // #13
+    Move(Waveform[0], Sig[0][0], (WaveformMax + 1) * csNeuralFloatSize);
   // Run the encoder stages in order; the LSTM stage is applied in place.
   EncStagesMax := Length(FEncStages) - 1;
   for s := 0 to EncStagesMax do
@@ -42875,6 +42888,7 @@ var
   DmM1, FramesM1, NQM1, DecStagesM1, SigLenM1: integer;
   codeBase, tBase: integer;
   CB: TNeuralFloatDynArr;
+  SigRow: TNeuralFloatDynArr;
   Acc: TNeuralFloatDynArr;   // frame-major [t*Dm + d] RVQ accumulator
   tStageTick: QWord;   // per-stage wall clock (always-on instrumentation)
 begin
@@ -42916,13 +42930,19 @@ begin
       Inc(tBase, Dm);
     end;
   end;
+  // App.E/#9: channel-outer, so each channel row is sized and bound once and
+  // written contiguously; the frame-major source advances by the carried Dm (#6).
   SetLength(Sig, Dm);
-  for d := 0 to DmM1 do SetLength(Sig[d], Frames);
-  tBase := 0;
-  for t := 0 to FramesM1 do
+  for d := 0 to DmM1 do
   begin
-    for d := 0 to DmM1 do Sig[d][t] := Acc[tBase + d];
-    Inc(tBase, Dm);
+    SetLength(Sig[d], Frames);
+    SigRow := Sig[d];
+    tBase := d;                      // t*Dm + d, carried
+    for t := 0 to FramesM1 do
+    begin
+      SigRow[t] := Acc[tBase];
+      Inc(tBase, Dm);
+    end;
   end;
   // Run the decoder stages.
   DecStagesM1 := Length(FDecStages) - 1;
@@ -43481,6 +43501,31 @@ begin
   Result := (s0 + s1) + (s2 + s3);
 end;
 
+// Scaled accumulate over a contiguous Double run: Acc[i] := Acc[i] + Scale*Src[i].
+// Double, so no Single TNNetVolume primitive applies (see MimiDotProductD); the
+// 4-way unroll lets FPC vectorize into packed-double FMA, and each element keeps
+// its own accumulation order, so the result is identical to the scalar loop.
+procedure MimiAxpyD(AccD, SrcD: PDouble; Scale: Double; N: integer);
+var
+  i, n4: integer;
+begin
+  n4 := N and (not 3);
+  i := 0;
+  while i < n4 do
+  begin
+    AccD[i]     := AccD[i]     + Scale * SrcD[i];
+    AccD[i + 1] := AccD[i + 1] + Scale * SrcD[i + 1];
+    AccD[i + 2] := AccD[i + 2] + Scale * SrcD[i + 2];
+    AccD[i + 3] := AccD[i + 3] + Scale * SrcD[i + 3];
+    Inc(i, 4);
+  end;
+  while i < N do
+  begin
+    AccD[i] := AccD[i] + Scale * SrcD[i];
+    Inc(i);
+  end;
+end;
+
 // Causal Conv1d / grouped ConvTranspose1d on a channel-major signal, honoring
 // pad_mode 'constant' (zero left-pad) or 'replicate' (repeat first/last) and
 // arbitrary groups. Mirrors HF MimiConv1d / MimiConvTranspose1d forward.
@@ -43502,7 +43547,8 @@ var
   IPGK: integer;
   grpIPG, grpOPG, oBase, tS, giK, wOfs: integer;
   OPGK, wpack, grpBase: integer;
-  PadRow, FullRow: TMimiDblArr;
+  PadRow, FullRow, InRow: TMimiDblArr;
+  RightBase: integer;
   IsReplicate: boolean;   // #8: hoist the pad-mode string compare once
   Left, Right: double;    // #5: per-channel replicate pad values
 begin
@@ -43548,9 +43594,13 @@ begin
         Left := 0;
         Right := 0;
       end;
+      InRow := InSig[i];                          // #9: bind the source row once
       for t := 0 to PadTotalM1 do PadRow[t] := Left;
-      for t := 0 to InLenM1 do PadRow[PadTotal + t] := InSig[i][t];
-      for t := 0 to ExtraM1 do PadRow[PadTotal + InLen + t] := Right;
+      // #13: the middle section is a contiguous copy of the whole channel row.
+      if InLen > 0 then
+        Move(InRow[0], PadRow[PadTotal], InLen * csDoubleSize);
+      RightBase := PadTotal + InLen;              // #5: invariant across t
+      for t := 0 to ExtraM1 do PadRow[RightBase + t] := Right;
     end;
     OutLen := (Length(Padded[0]) - EffK) div Stride + 1;
     if OutLen < 0 then OutLen := 0;
@@ -43845,6 +43895,7 @@ var
   // #9: per-layer LayerNorm / LayerScale chain binds (invariant across t1/dd).
   LnG, LnB, LnPG, LnPB, ASc, MSc: TNeuralFloatDynArr;
   HnRow, Mlp1Row, VRow, XRow: array of double;
+  QRow, KRow, AttnRow: array of double;
   QPtr: PDouble;
   HasBq, HasBk, HasBv, HasBo: boolean;
   // #8/#5: sliding-window guard hoisted once for the whole call.
@@ -43962,13 +44013,14 @@ begin
     // ---- Q,K,V projections (rows = out, cols = in) ----
     for t1 := 0 to TM1 do
     begin
-      HnRow := Hn[t1];                    // #9: bind row once
+      HnRow := Hn[t1];                    // #9: bind rows once
+      QRow := Q[t1]; KRow := Kk[t1]; VRow := Vv[t1];
       gBase := 0;                        // gidx * D, carried (#6)
       for gidx := 0 to NHDhM1 do
       begin
         sc := DotProductSD(@WqD[gBase], @HnRow[0], D);
         if HasBq then sc := sc + BqA[gidx];
-        Q[t1][gidx] := sc;
+        QRow[gidx] := sc;
         Inc(gBase, D);
       end;
       gBase := 0;                        // gidx * D, carried (#6)
@@ -43976,10 +44028,10 @@ begin
       begin
         sc := DotProductSD(@WkD[gBase], @HnRow[0], D);
         if HasBk then sc := sc + BkA[gidx];
-        Kk[t1][gidx] := sc;
+        KRow[gidx] := sc;
         sc := DotProductSD(@WvD[gBase], @HnRow[0], D);
         if HasBv then sc := sc + BvA[gidx];
-        Vv[t1][gidx] := sc;
+        VRow[gidx] := sc;
         Inc(gBase, D);
       end;
     end;
@@ -43990,25 +44042,42 @@ begin
       // rotate_half needs the ORIGINAL head values, so snapshot per head into
       // Orig before writing back (an in-place rotation would feed the already
       // rotated first half into the second half).
+      QRow := Q[t1];                       // #9: bind the rows above the head loops
+      KRow := Kk[t1];
+      // #20: the rotate_half partner is selected by the index alone, so each head
+      // loop splits into two branch-free halves. Both halves keep the original
+      // multiply/add association (the Double parity tolerance is ~1e-12).
       for h := 0 to NHM1 do
       begin
         hbase := h * Dh;                                  // #11: h*Dh once per head
-        Move(Q[t1][hbase], Orig[0], Dh * csDoubleSize); // #13: contiguous snapshot
-        for dd := 0 to DhM1 do
+        Move(QRow[hbase], Orig[0], Dh * csDoubleSize); // #13: contiguous snapshot
+        for dd := 0 to halfM1 do
         begin
-          if dd < half then qr := -Orig[dd + half] else qr := Orig[dd - half];
-          Q[t1][hbase + dd] :=
+          qr := -Orig[dd + half];
+          QRow[hbase + dd] :=
+            Orig[dd] * CosTab[tBase + dd] + qr * SinTab[tBase + dd];
+        end;
+        for dd := half to DhM1 do
+        begin
+          qr := Orig[dd - half];
+          QRow[hbase + dd] :=
             Orig[dd] * CosTab[tBase + dd] + qr * SinTab[tBase + dd];
         end;
       end;
       for h := 0 to NKVM1 do
       begin
         hbase := h * Dh;
-        Move(Kk[t1][hbase], Orig[0], Dh * csDoubleSize);
-        for dd := 0 to DhM1 do
+        Move(KRow[hbase], Orig[0], Dh * csDoubleSize);
+        for dd := 0 to halfM1 do
         begin
-          if dd < half then kr := -Orig[dd + half] else kr := Orig[dd - half];
-          Kk[t1][hbase + dd] :=
+          kr := -Orig[dd + half];
+          KRow[hbase + dd] :=
+            Orig[dd] * CosTab[tBase + dd] + kr * SinTab[tBase + dd];
+        end;
+        for dd := half to DhM1 do
+        begin
+          kr := Orig[dd - half];
+          KRow[hbase + dd] :=
             Orig[dd] * CosTab[tBase + dd] + kr * SinTab[tBase + dd];
         end;
       end;
@@ -44042,13 +44111,13 @@ begin
           sc := FAttnScores[t2];   // #4: reuse the score computed in the max pass
           e := Exp(sc - mx);
           denom := denom + e;
-          VRow := Vv[t2];          // #9: bind the V row once (double, stays scalar)
-          for dd := 0 to DhM1 do
-            AccVec[dd] := AccVec[dd] + e * VRow[kvhDh + dd];
+          VRow := Vv[t2];          // #9: bind the V row once
+          MimiAxpyD(@AccVec[0], @VRow[kvhDh], e, Dh);
         end;
         InvDenom := 1.0 / denom;           // #21
+        AttnRow := Attn[t1];               // #9: bind the output row once
         for dd := 0 to DhM1 do
-          Attn[t1][hDh + dd] := AccVec[dd] * InvDenom;
+          AttnRow[hDh + dd] := AccVec[dd] * InvDenom;
       end;
     end;
     // ---- output projection + LayerScale residual ----
@@ -44191,11 +44260,13 @@ var
   RBuf: TMimiDblArr;             // csMimiRvqFrameBlock residuals, frame-major
   BestDist: TMimiDblArr;         // per blocked frame
   BestIdx: TNeuralIntegerArray;  // per blocked frame
+  SigRow: TMimiDblArr;
 begin
   SetLength(Sig, FConfig.AudioChannels);
   SetLength(Sig[0], Length(Waveform));
   WaveLenM1 := Length(Waveform) - 1;
-  for t := 0 to WaveLenM1 do Sig[0][t] := Waveform[t];
+  SigRow := Sig[0];                 // #9: bind the row once (Single -> Double)
+  for t := 0 to WaveLenM1 do SigRow[t] := Waveform[t];
   // conv encoder
   EncStagesM1 := Length(FEncStages) - 1;
   for s := 0 to EncStagesM1 do
@@ -44376,13 +44447,19 @@ begin
       Inc(tBase, Dm);
     end;
   end;
+  // App.E/#9: channel-outer, so each channel row is sized and bound once and
+  // written contiguously; the frame-major source advances by the carried Dm (#6).
   SetLength(Zsem, Dm);
-  for d := 0 to DmM1 do SetLength(Zsem[d], Frames);
-  tBase := 0;
-  for t := 0 to FramesM1 do
+  for d := 0 to DmM1 do
   begin
-    for d := 0 to DmM1 do Zsem[d][t] := Acc[tBase + d];
-    Inc(tBase, Dm);
+    SetLength(Zsem[d], Frames);
+    SigRow := Zsem[d];
+    tBase := d;                      // t*Dm + d, carried
+    for t := 0 to FramesM1 do
+    begin
+      SigRow[t] := Acc[tBase];
+      Inc(tBase, Dm);
+    end;
   end;
   RunMimiConv(FSemOutProj, Zsem, Sig); // Sig now [hidden][frames]
   // acoustic RVQ decode
@@ -44403,12 +44480,16 @@ begin
       end;
     end;
     SetLength(Zaco, Dm);
-    for d := 0 to DmM1 do SetLength(Zaco[d], Frames);
-    tBase := 0;
-    for t := 0 to FramesM1 do
+    for d := 0 to DmM1 do
     begin
-      for d := 0 to DmM1 do Zaco[d][t] := Acc[tBase + d];
-      Inc(tBase, Dm);
+      SetLength(Zaco[d], Frames);
+      SigRow := Zaco[d];
+      tBase := d;                    // t*Dm + d, carried
+      for t := 0 to FramesM1 do
+      begin
+        SigRow[t] := Acc[tBase];
+        Inc(tBase, Dm);
+      end;
     end;
     RunMimiConv(FAcoOutProj, Zaco, Zh);
     SigM1 := Length(Sig) - 1;
@@ -44432,7 +44513,8 @@ begin
   end;
   SetLength(Waveform, Length(Sig[0]));
   Sig0M1 := Length(Sig[0]) - 1;
-  for t := 0 to Sig0M1 do Waveform[t] := Sig[0][t];
+  SigRow := Sig[0];                 // #9: bind the row once (Double -> Single)
+  for t := 0 to Sig0M1 do Waveform[t] := SigRow[t];
 end;
 
 procedure TNNetMimi.Reconstruct(const Waveform: array of TNeuralFloat;
@@ -44809,7 +44891,7 @@ var
   InCK: integer;
   PaddedLenM1: integer;
   tS, iK, wOfs, wpack, src: integer;
-  PadRow, FullRow: TMimiDblArr;
+  PadRow, FullRow, InRow: TMimiDblArr;
   Acc: double;
 begin
   InCh := Conv.InCh;
@@ -44831,8 +44913,16 @@ begin
     for i := 0 to InChM1 do
     begin
       SetLength(Padded[i], PaddedLen);
-      FillChar(Padded[i][0], PaddedLen * csDoubleSize, 0);
-      for t := 0 to InLenM1 do Padded[i][Pad + t] := InSig[i][t];
+      PadRow := Padded[i];               // #9: bind both rows once
+      InRow := InSig[i];
+      // #13: only the two zero-pad edges need filling - the middle is a
+      // contiguous copy of the whole channel row.
+      if Pad > 0 then
+      begin
+        FillChar(PadRow[0], Pad * csDoubleSize, 0);
+        FillChar(PadRow[Pad + InLen], Pad * csDoubleSize, 0);
+      end;
+      if InLen > 0 then Move(InRow[0], PadRow[Pad], InLen * csDoubleSize);
     end;
     OutLen := (PaddedLen - EffK) div Stride + 1;
     if OutLen < 0 then OutLen := 0;
