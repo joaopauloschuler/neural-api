@@ -33,6 +33,7 @@ type
     procedure TestNpyInt8RoundTrip;
     procedure TestNpy2DShapeMapping;
     procedure TestNpzNamedSetRoundTrip;
+    procedure TestCrc32KnownVectorsAndTailLengths;
     procedure TestRejectFortranOrder;
     procedure TestRejectObjectDtype;
     procedure TestNumpyCrossCheckFixture;
@@ -220,6 +221,40 @@ begin
   finally
     W.Free; Reader.Free;
     A.Free; B.Free; RA.Free; RB.Free; DeleteFile(fn);
+  end;
+end;
+
+procedure TTestNeuralNumpy.TestCrc32KnownVectorsAndTailLengths;
+// Reference CRC-32: the textbook byte-at-a-time loop, independent of the
+// slice-by-4 tables the writer uses.
+  function RefCrc32(const B: TBytes): Cardinal;
+  var i, j: integer; c, t: Cardinal;
+  begin
+    c := $FFFFFFFF;
+    for i := 0 to High(B) do
+    begin
+      t := (c xor B[i]) and $FF;
+      for j := 0 to 7 do
+        if (t and 1) <> 0 then t := $EDB88320 xor (t shr 1) else t := t shr 1;
+      c := t xor (c shr 8);
+    end;
+    Result := c xor $FFFFFFFF;
+  end;
+var
+  B: TBytes;
+  Len, i: integer;
+begin
+  // The canonical CRC-32 check value: crc32("123456789") = $CBF43926.
+  SetLength(B, 9);
+  for i := 0 to 8 do B[i] := Ord('1') + i;
+  AssertEquals('crc32("123456789")', $CBF43926, Crc32Of(B));
+  AssertEquals('empty buffer', 0, Crc32Of(nil));
+  // Every tail length 0..3 past the four-byte bulk step.
+  for Len := 0 to 37 do
+  begin
+    SetLength(B, Len);
+    for i := 0 to Len - 1 do B[i] := (i * 37 + 11) and $FF;
+    AssertEquals('length ' + IntToStr(Len), RefCrc32(B), Crc32Of(B));
   end;
 end;
 

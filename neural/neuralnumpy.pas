@@ -104,6 +104,8 @@ type
     FSize: array of QWord;
     FLocalOfs: array of QWord;
     procedure ParseZipDirectory;
+    // Absolute file offset of the entry's payload (past its local header).
+    function EntryDataOffset(Index: integer): Int64;
     function EntryRawBytes(Index: integer): TBytes;
   public
     constructor Create(const pFileName: string);
@@ -149,6 +151,9 @@ function EncodeF16(Value: Single): Word;
 // Builds a complete .npy blob (header + raw data) in memory.
 function BuildNpyBlob(Src: TNNetVolume; const pShape: array of Int64;
   const pDType: string): TBytes;
+// CRC-32 (the ZIP/PNG polynomial, $EDB88320 reflected) of a byte buffer, as
+// written into the .npz local and central-directory headers.
+function Crc32Of(const B: TBytes): Cardinal;
 
 implementation
 
@@ -351,7 +356,6 @@ var
   i: Int64;
   pf8: PDouble;
   pu16: PWord;
-  pi1: PShortInt;
   pu1: PByte;
   pi2: PSmallInt;
   pi4: PLongInt;
@@ -384,8 +388,10 @@ begin
   end
   else if DType = 'i1' then
   begin
-    pi1 := PShortInt(@Raw[0]);
-    for i := 0 to NumElementsM1 do begin Dst[i] := pi1^; Inc(pi1); end;
+    // Rule #18, like the 'f2' arm above: a scale of 1.0 makes DequantizeInt8 a
+    // plain int8 -> Single widening (an exact multiply), vectorized on AVX2.
+    TNNetVolume.DequantizeInt8(TNeuralFloatArrPtr(Dst),
+      TNeuralInt8ArrPtr(@Raw[0]), integer(NumElements), 1.0);
   end
   else if (DType = 'u1') or (DType = 'b1') then
   begin
@@ -769,7 +775,9 @@ end;
 // ZIP CRC-32 (for the writer's central directory)
 // ---------------------------------------------------------------------------
 var
-  CrcTable: array[0..255] of Cardinal;
+  // Slice-by-4 tables: CrcTable[0] is the classic byte table, CrcTable[k] is it
+  // advanced by k further zero bytes, which is what lets one step consume four.
+  CrcTable: array[0..3, 0..255] of Cardinal;
   CrcReady: boolean = false;
 
 procedure InitCrcTable;
@@ -781,19 +789,44 @@ begin
     for j := 0 to 7 do
       if (c and 1) <> 0 then c := $EDB88320 xor (c shr 1)
       else c := c shr 1;
-    CrcTable[i] := c;
+    CrcTable[0][i] := c;
+  end;
+  for i := 0 to 255 do
+  begin
+    c := CrcTable[0][i];
+    for j := 1 to 3 do
+    begin
+      c := CrcTable[0][c and $FF] xor (c shr 8);
+      CrcTable[j][i] := c;
+    end;
   end;
   CrcReady := true;
 end;
 
 function Crc32Of(const B: TBytes): Cardinal;
-var i: integer; c: Cardinal; BHi: integer;
+var
+  i, BLen, QuadEnd: integer;
+  c: Cardinal;
 begin
   if not CrcReady then InitCrcTable;
   c := $FFFFFFFF;
-  BHi := High(B);
-  for i := 0 to BHi do
-    c := CrcTable[(c xor B[i]) and $FF] xor (c shr 8);
+  BLen := Length(B);
+  // Four bytes per step over the bulk, then the 0-3 byte tail. LE host: the
+  // four bytes are read as one Cardinal in the order the byte loop would.
+  QuadEnd := BLen - 4;
+  i := 0;
+  while i <= QuadEnd do
+  begin
+    c := c xor PCardinal(@B[i])^;
+    c := CrcTable[3][c and $FF] xor CrcTable[2][(c shr 8) and $FF] xor
+         CrcTable[1][(c shr 16) and $FF] xor CrcTable[0][c shr 24];
+    Inc(i, 4);
+  end;
+  while i < BLen do
+  begin
+    c := CrcTable[0][(c xor B[i]) and $FF] xor (c shr 8);
+    Inc(i);
+  end;
   Result := c xor $FFFFFFFF;
 end;
 
@@ -914,10 +947,23 @@ begin
   SetLength(FLocalOfs, EntryCnt);
 end;
 
-function TNNetNpzReader.EntryRawBytes(Index: integer): TBytes;
+function TNNetNpzReader.EntryDataOffset(Index: integer): Int64;
 var
   LocalHdr: array[0..29] of byte;
   NameLen, ExtraLen: integer;
+begin
+  FStream.Position := FLocalOfs[Index];
+  FStream.ReadBuffer(LocalHdr, 30);
+  if (LocalHdr[0] or (LocalHdr[1] shl 8) or (LocalHdr[2] shl 16) or
+      (LocalHdr[3] shl 24)) <> $04034B50 then
+    raise ENumpyError.Create('numpy: bad local-header signature in .npz');
+  NameLen := LocalHdr[26] or (LocalHdr[27] shl 8);
+  ExtraLen := LocalHdr[28] or (LocalHdr[29] shl 8);
+  Result := Int64(FLocalOfs[Index]) + 30 + NameLen + ExtraLen;
+end;
+
+function TNNetNpzReader.EntryRawBytes(Index: integer): TBytes;
+var
   DataOfs: Int64;
   Comp: TBytes;
   {$IFDEF FPC}
@@ -927,14 +973,7 @@ var
   ChunkBuf: array[0..65535] of byte;
   {$ENDIF}
 begin
-  FStream.Position := FLocalOfs[Index];
-  FStream.ReadBuffer(LocalHdr, 30);
-  if (LocalHdr[0] or (LocalHdr[1] shl 8) or (LocalHdr[2] shl 16) or
-      (LocalHdr[3] shl 24)) <> $04034B50 then
-    raise ENumpyError.Create('numpy: bad local-header signature in .npz');
-  NameLen := LocalHdr[26] or (LocalHdr[27] shl 8);
-  ExtraLen := LocalHdr[28] or (LocalHdr[29] shl 8);
-  DataOfs := FLocalOfs[Index] + 30 + NameLen + ExtraLen;
+  DataOfs := EntryDataOffset(Index);
   SetLength(Comp, FCompSize[Index]);
   FStream.Position := DataOfs;
   if FCompSize[Index] > 0 then FStream.ReadBuffer(Comp[0], FCompSize[Index]);
@@ -1011,10 +1050,24 @@ var
   Raw: TBytes;
   MemStream: TMemoryStream;
   DType: string;
+  DataOfs: Int64;
 begin
   Idx := IndexOfKey(pKey);
   if Idx < 0 then
     raise ENumpyError.CreateFmt('numpy: key "%s" not in %s', [pKey, FFileName]);
+  if FMethod[Idx] = 0 then
+  begin
+    // STORED: the entry payload IS the .npy blob, so decode it straight out of
+    // the archive. LoadNpyFromStream stages through a fixed chunk, so neither
+    // the raw entry nor a memory-stream copy of the whole tensor is needed.
+    DataOfs := EntryDataOffset(Idx);
+    FStream.Position := DataOfs;
+    LoadNpyFromStream(FStream, Dest, Result, DType);
+    if FStream.Position > DataOfs + Int64(FCompSize[Idx]) then
+      raise ENumpyError.CreateFmt('numpy: entry "%s" is truncated in %s',
+        [pKey, FFileName]);
+    Exit;
+  end;
   Raw := EntryRawBytes(Idx);
   MemStream := TMemoryStream.Create;
   try
