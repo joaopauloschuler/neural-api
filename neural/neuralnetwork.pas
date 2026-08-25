@@ -50192,20 +50192,34 @@ end;
 
 procedure TNNetChannelShuffle.Compute();
 var
-  CntDepth, MaxDepth: integer;
+  CntDepth, MaxDepth, CntPos, MaxPos, Depth, ColBase: integer;
+  LocalPrevOutput: TNNetVolume;
   StartTime: double;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  LocalPrevOutput := FPrevLayer.FOutput;
   MaxDepth := FOutput.Depth - 1;
-  for CntDepth := 0 to MaxDepth do
-    FOutput.CopyFromDepthToDepth(FPrevLayer.FOutput, CntDepth, ToChannels[CntDepth]);
+  Depth := FOutput.Depth;
+  // Position-outer: one pass over the volume permutes each depth column in
+  // place of one strided whole-volume sweep per channel. Input and output share
+  // a shape, so one column base indexes both.
+  MaxPos := FOutput.SizeX * FOutput.SizeY - 1;
+  ColBase := 0;
+  for CntPos := 0 to MaxPos do
+  begin
+    for CntDepth := 0 to MaxDepth do
+      FOutput.FData[ColBase + ToChannels[CntDepth]] :=
+        LocalPrevOutput.FData[ColBase + CntDepth];
+    Inc(ColBase, Depth);
+  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetChannelShuffle.Backpropagate();
 var
-  CntDepth, MaxDepth: integer;
+  CntDepth, MaxDepth, CntPos, MaxPos, Depth, ColBase: integer;
+  LocalPrevError: TNNetVolume;
   StartTime, LocalNow: double;
 begin
   StartTime := Now();
@@ -50214,11 +50228,21 @@ begin
   TestBackPropCallCurrCnt();
   if FPrevLayer.FOutputError.Size = FOutputError.Size then
   begin
+    LocalPrevError := FPrevLayer.FOutputError;
     MaxDepth := FOutput.Depth - 1;
-    // Inverse permutation: gradient on source channel c comes from
-    // the output channel ToChannels[c].
-    for CntDepth := 0 to MaxDepth do
-      FPrevLayer.OutputError.AddFromDepthToDepth(FOutputError, ToChannels[CntDepth], CntDepth);
+    Depth := FOutput.Depth;
+    // Inverse permutation: gradient on source channel c comes from the output
+    // channel ToChannels[c]. Position-outer, one pass, one shared column base.
+    MaxPos := FOutput.SizeX * FOutput.SizeY - 1;
+    ColBase := 0;
+    for CntPos := 0 to MaxPos do
+    begin
+      for CntDepth := 0 to MaxDepth do
+        LocalPrevError.FData[ColBase + CntDepth] :=
+          LocalPrevError.FData[ColBase + CntDepth] +
+          FOutputError.FData[ColBase + ToChannels[CntDepth]];
+      Inc(ColBase, Depth);
+    end;
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -50229,29 +50253,36 @@ end;
 
 procedure TNNetReverseXY.Compute();
 var
-  CntX, CntY, MaxX, MaxY, MaxD: integer;
+  CntPos, MaxPos, Depth, DepthBytes: integer;
   srcBase, dstBase: integer;
+  LocalPrevOutput: TNNetVolume;
   StartTime: double;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  MaxX := FOutput.SizeX - 1;
-  MaxY := FOutput.SizeY - 1;
-  MaxD := FOutput.Depth - 1;
-  for CntY := 0 to MaxY do
-    for CntX := 0 to MaxX do
-    begin
-      srcBase := FPrevLayer.FOutput.GetRawPos(MaxX - CntX, MaxY - CntY);
-      dstBase := FOutput.GetRawPos(CntX, CntY);
-      Move(FPrevLayer.FOutput.FData[srcBase], FOutput.FData[dstBase],
-        (MaxD + 1) * csNeuralFloatSize);
-    end;
+  LocalPrevOutput := FPrevLayer.FOutput;
+  Depth := FOutput.Depth;
+  DepthBytes := Depth * csNeuralFloatSize;
+  // Reversing both spatial axes reverses the raw position order outright, so the
+  // destination walks the volume forwards and the source backwards, one depth
+  // run per step (#12).
+  MaxPos := FOutput.SizeX * FOutput.SizeY - 1;
+  dstBase := 0;
+  srcBase := MaxPos * Depth;
+  for CntPos := 0 to MaxPos do
+  begin
+    Move(LocalPrevOutput.FData[srcBase], FOutput.FData[dstBase], DepthBytes);
+    Inc(dstBase, Depth);
+    Dec(srcBase, Depth);
+  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetReverseXY.Backpropagate();
 var
-  CntX, CntY, MaxX, MaxY, MaxD: integer;
+  CntPos, MaxPos, Depth: integer;
+  srcBase, dstBase: integer;
+  LocalPrevError: TNNetVolume;
   StartTime, LocalNow: double;
 begin
   StartTime := Now();
@@ -50260,16 +50291,21 @@ begin
   TestBackPropCallCurrCnt();
   if FPrevLayer.FOutputError.Size = FOutputError.Size then
   begin
-    MaxX := FOutput.SizeX - 1;
-    MaxY := FOutput.SizeY - 1;
-    MaxD := FOutput.Depth - 1;
-    // Involution: applying the same spatial flip backwards routes the
-    // gradient for output (x, y) into source (MaxX - x, MaxY - y).
-    for CntY := 0 to MaxY do
-      for CntX := 0 to MaxX do
-        TNNetVolume.Add(
-          FPrevLayer.FOutputError.GetRawPtr(CntX, CntY),
-          FOutputError.GetRawPtr(MaxX - CntX, MaxY - CntY), MaxD + 1);
+    LocalPrevError := FPrevLayer.FOutputError;
+    Depth := FOutput.Depth;
+    // Involution: applying the same spatial flip backwards routes the gradient
+    // for output (x, y) into source (MaxX - x, MaxY - y), which is again a
+    // forward walk on one side and a backward walk on the other.
+    MaxPos := FOutput.SizeX * FOutput.SizeY - 1;
+    dstBase := 0;
+    srcBase := MaxPos * Depth;
+    for CntPos := 0 to MaxPos do
+    begin
+      TNNetVolume.Add(LocalPrevError.GetRawPtr(dstBase),
+        FOutputError.GetRawPtr(srcBase), Depth);
+      Inc(dstBase, Depth);
+      Dec(srcBase, Depth);
+    end;
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -50280,29 +50316,42 @@ end;
 
 procedure TNNetFlipX.Compute();
 var
-  CntX, CntY, MaxX, MaxY, MaxD: integer;
-  srcBase, dstBase: integer;
+  CntX, CntY, MaxX, MaxY, Depth, DepthBytes: integer;
+  srcBase, dstBase, srcRowEnd, RowStride: integer;
+  LocalPrevOutput: TNNetVolume;
   StartTime: double;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  LocalPrevOutput := FPrevLayer.FOutput;
   MaxX := FOutput.SizeX - 1;
   MaxY := FOutput.SizeY - 1;
-  MaxD := FOutput.Depth - 1;
+  Depth := FOutput.Depth;
+  DepthBytes := Depth * csNeuralFloatSize;
+  RowStride := FOutput.SizeX * Depth;
+  // Within a row the destination runs forwards and the source backwards, one
+  // depth run per column; the row start advances by one row stride (#12).
+  dstBase := 0;
+  srcRowEnd := MaxX * Depth;
   for CntY := 0 to MaxY do
+  begin
+    srcBase := srcRowEnd;
     for CntX := 0 to MaxX do
     begin
-      srcBase := FPrevLayer.FOutput.GetRawPos(MaxX - CntX, CntY);
-      dstBase := FOutput.GetRawPos(CntX, CntY);
-      Move(FPrevLayer.FOutput.FData[srcBase], FOutput.FData[dstBase],
-        (MaxD + 1) * csNeuralFloatSize);
+      Move(LocalPrevOutput.FData[srcBase], FOutput.FData[dstBase], DepthBytes);
+      Inc(dstBase, Depth);
+      Dec(srcBase, Depth);
     end;
+    Inc(srcRowEnd, RowStride);
+  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetFlipX.Backpropagate();
 var
-  CntX, CntY, MaxX, MaxY, MaxD: integer;
+  CntX, CntY, MaxX, MaxY, Depth: integer;
+  srcBase, dstBase, srcRowEnd, RowStride: integer;
+  LocalPrevError: TNNetVolume;
   StartTime, LocalNow: double;
 begin
   StartTime := Now();
@@ -50311,16 +50360,28 @@ begin
   TestBackPropCallCurrCnt();
   if FPrevLayer.FOutputError.Size = FOutputError.Size then
   begin
+    LocalPrevError := FPrevLayer.FOutputError;
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
-    MaxD := FOutput.Depth - 1;
+    Depth := FOutput.Depth;
+    RowStride := FOutput.SizeX * Depth;
     // Involution: applying the same horizontal flip backwards routes the
-    // gradient for output (x, y) into source (MaxX - x, y).
+    // gradient for output (x, y) into source (MaxX - x, y), so the offsets are
+    // carried exactly as in Compute.
+    dstBase := 0;
+    srcRowEnd := MaxX * Depth;
     for CntY := 0 to MaxY do
+    begin
+      srcBase := srcRowEnd;
       for CntX := 0 to MaxX do
-        TNNetVolume.Add(
-          FPrevLayer.FOutputError.GetRawPtr(CntX, CntY),
-          FOutputError.GetRawPtr(MaxX - CntX, CntY), MaxD + 1);
+      begin
+        TNNetVolume.Add(LocalPrevError.GetRawPtr(dstBase),
+          FOutputError.GetRawPtr(srcBase), Depth);
+        Inc(dstBase, Depth);
+        Dec(srcBase, Depth);
+      end;
+      Inc(srcRowEnd, RowStride);
+    end;
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -51177,20 +51238,34 @@ end;
 
 procedure TNNetReverseChannels.Compute();
 var
-  CntDepth, MaxDepth: integer;
+  CntDepth, MaxDepth, CntPos, MaxPos, Depth, ColBase: integer;
+  LocalPrevOutput: TNNetVolume;
   StartTime: double;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  LocalPrevOutput := FPrevLayer.FOutput;
   MaxDepth := FOutput.Depth - 1;
-  for CntDepth := 0 to MaxDepth do
-    FOutput.CopyFromDepthToDepth(FPrevLayer.FOutput, CntDepth, MaxDepth - CntDepth);
+  Depth := FOutput.Depth;
+  // Position-outer: one pass over the volume reverses each depth column in
+  // place of one strided whole-volume sweep per channel. Input and output share
+  // a shape, so one column base indexes both.
+  MaxPos := FOutput.SizeX * FOutput.SizeY - 1;
+  ColBase := 0;
+  for CntPos := 0 to MaxPos do
+  begin
+    for CntDepth := 0 to MaxDepth do
+      FOutput.FData[ColBase + MaxDepth - CntDepth] :=
+        LocalPrevOutput.FData[ColBase + CntDepth];
+    Inc(ColBase, Depth);
+  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 procedure TNNetReverseChannels.Backpropagate();
 var
-  CntDepth, MaxDepth: integer;
+  CntDepth, MaxDepth, CntPos, MaxPos, Depth, ColBase: integer;
+  LocalPrevError: TNNetVolume;
   StartTime, LocalNow: double;
 begin
   StartTime := Now();
@@ -51199,11 +51274,22 @@ begin
   TestBackPropCallCurrCnt();
   if FPrevLayer.FOutputError.Size = FOutputError.Size then
   begin
+    LocalPrevError := FPrevLayer.FOutputError;
     MaxDepth := FOutput.Depth - 1;
-    // Involution: applying the same flip backwards routes the gradient
-    // for output channel d into source channel Depth - 1 - d.
-    for CntDepth := 0 to MaxDepth do
-      FPrevLayer.OutputError.AddFromDepthToDepth(FOutputError, CntDepth, MaxDepth - CntDepth);
+    Depth := FOutput.Depth;
+    // Involution: applying the same flip backwards routes the gradient for
+    // output channel d into source channel Depth - 1 - d. Position-outer, one
+    // pass, one shared column base.
+    MaxPos := FOutput.SizeX * FOutput.SizeY - 1;
+    ColBase := 0;
+    for CntPos := 0 to MaxPos do
+    begin
+      for CntDepth := 0 to MaxDepth do
+        LocalPrevError.FData[ColBase + MaxDepth - CntDepth] :=
+          LocalPrevError.FData[ColBase + MaxDepth - CntDepth] +
+          FOutputError.FData[ColBase + CntDepth];
+      Inc(ColBase, Depth);
+    end;
   end;
   LocalNow := Now();
   FBackwardTime := FBackwardTime + (LocalNow - StartTime);
@@ -53870,6 +53956,7 @@ var
   OutX, OutY: integer;
   InX0, InY0, InX, InY: integer;
   InXLo, InXHi, InYLo, InYHi, Count: integer;
+  InRowBase, InPos, PrevRowStride: integer;
   OutPtr: pointer;
 begin
   StartTime := Now();
@@ -53877,6 +53964,7 @@ begin
   PrevOut := FPrevLayer.Output;
   Output.Fill(0);
   Depth := PrevOut.Depth;
+  PrevRowStride := PrevOut.SizeX * Depth;
   MaxInX := PrevOut.SizeX - 1;
   MaxInY := PrevOut.SizeY - 1;
   MaxOutX := FOutput.SizeX - 1;
@@ -53904,13 +53992,19 @@ begin
       Count := (InYHi - InYLo + 1) * (InXHi - InXLo + 1);
       // Rule #5: output row pointer is invariant across the window.
       OutPtr := FOutput.GetRawPtr(OutX, OutY);
+      // One window step is a depth run across X and a row stride down Y, so the
+      // input cell offset is carried instead of recomputed (#12).
+      InRowBase := PrevOut.GetRawPos(InXLo, InYLo);
       for InY := InYLo to InYHi do
       begin
+        InPos := InRowBase;
         for InX := InXLo to InXHi do
         begin
           // Rule #13: accumulate D channels of one input cell.
-          TNNetVolume.Add(OutPtr, PrevOut.GetRawPtr(InX, InY), Depth);
+          TNNetVolume.Add(OutPtr, PrevOut.GetRawPtr(InPos), Depth);
+          Inc(InPos, Depth);
         end;
+        Inc(InRowBase, PrevRowStride);
       end;
       // Rule #13: scale the pooled window by 1/Count.
       TNNetVolume.Mul(OutPtr, 1.0 / Count, Depth);
@@ -53928,6 +54022,7 @@ var
   OutX, OutY: integer;
   InX0, InY0, InX, InY: integer;
   InXLo, InXHi, InYLo, InYHi, Count: integer;
+  InRowBase, InPos, PrevRowStride: integer;
   OutErrPtr: pointer;
   InvCount: TNeuralFloat;
 begin
@@ -53940,6 +54035,7 @@ begin
   begin
     StartTime := Now();
     Depth := PrevOut.Depth;
+    PrevRowStride := PrevOut.SizeX * Depth;
     MaxInX := PrevOut.SizeX - 1;
     MaxInY := PrevOut.SizeY - 1;
     MaxOutX := FOutput.SizeX - 1;
@@ -53968,14 +54064,19 @@ begin
         InvCount := 1.0 / Count;
         // Rule #5: output-error row pointer is invariant across the window.
         OutErrPtr := FOutputError.GetRawPtr(OutX, OutY);
+        // Window offsets carried exactly as in Compute (#12).
+        InRowBase := PrevErr.GetRawPos(InXLo, InYLo);
         for InY := InYLo to InYHi do
         begin
+          InPos := InRowBase;
           for InX := InXLo to InXHi do
           begin
             // Rule #13: split the pooled gradient across window cells.
-            TNNetVolume.MulAdd(PrevErr.GetRawPtr(InX, InY), OutErrPtr,
+            TNNetVolume.MulAdd(PrevErr.GetRawPtr(InPos), OutErrPtr,
               InvCount, Depth);
+            Inc(InPos, Depth);
           end;
+          Inc(InRowBase, PrevRowStride);
         end;
       end;
     end;
