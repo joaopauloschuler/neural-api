@@ -40732,7 +40732,8 @@ procedure LoadMoonshineConv(Reader: TNNetSafeTensorsReader;
   InDim, OutDim, Kernel: integer; Consumed: TStringList);
 var
   W, B: TNNetVolume;
-  o, i, kk: integer;
+  Wo: TNNetVolume;
+  o, i, kk, srcBase, srcPos, dstBase: integer;
   OutDimM1, InDimM1, KernelM1: integer;
 begin
   OutDimM1 := OutDim - 1;
@@ -40766,14 +40767,24 @@ begin
           IntToStr(OutDim) + '], got ' + Reader.ShapeAsString(BName));
       Reader.LoadTensorFlat(BName, B);
     end;
+    srcBase := 0;                      // #6: o*InDim*Kernel carried
     for o := 0 to OutDimM1 do
     begin
+      Wo := Layer.FArrNeurons[o].Weights;   // #9: bind the chain once per o
+      dstBase := 0;                    // kk*InDim carried
       for kk := 0 to KernelM1 do
+      begin
+        srcPos := srcBase + kk;        // (o*InDim + i)*Kernel + kk, +Kernel per i
         for i := 0 to InDimM1 do
-          Layer.FArrNeurons[o].Weights.FData[kk * InDim + i] :=
-            W.FData[(o * InDim + i) * Kernel + kk];
+        begin
+          Wo.FData[dstBase + i] := W.FData[srcPos];
+          Inc(srcPos, Kernel);
+        end;
+        Inc(dstBase, InDim);
+      end;
       if BName <> '' then Layer.FArrNeurons[o].BiasWeight := B.FData[o]
       else Layer.FArrNeurons[o].BiasWeight := 0;
+      Inc(srcBase, InDim * Kernel);
     end;
   finally
     B.Free;
@@ -41831,9 +41842,7 @@ end;
 procedure LoadEnCodecMat(Reader: TNNetSafeTensorsReader;
   const Name: string; var Mat: TEnCodecMat; Consumed: TStrings);
 var
-  LpMax: integer;
   T: TNNetVolume;
-  I: integer;
 begin
   T := TNNetVolume.Create;
   try
@@ -41841,8 +41850,8 @@ begin
     Mat.Rows := Reader.DimSize(Name, 0);
     Mat.Cols := Reader.DimSize(Name, 1);
     SetLength(Mat.Data, T.Size);
-    LpMax := T.Size - 1;
-    for I := 0 to LpMax do Mat.Data[I] := T.FData[I];
+    if T.Size > 0 then                                                  // #13
+      Move(T.FData[0], Mat.Data[0], T.Size * csNeuralFloatSize);
     Consumed.Add(Name);
   finally
     T.Free;
@@ -41852,16 +41861,14 @@ end;
 procedure LoadEnCodecVec(Reader: TNNetSafeTensorsReader;
   const Name: string; out Vec: TNeuralFloatDynArr; Consumed: TStrings);
 var
-  LpMax: integer;
   T: TNNetVolume;
-  I: integer;
 begin
   T := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(Name, T);
     SetLength(Vec, T.Size);
-    LpMax := T.Size - 1;
-    for I := 0 to LpMax do Vec[I] := T.FData[I];
+    if T.Size > 0 then                                                  // #13
+      Move(T.FData[0], Vec[0], T.Size * csNeuralFloatSize);
     Consumed.Add(Name);
   finally
     T.Free;
@@ -43405,7 +43412,6 @@ procedure LoadMimiConv(Reader: TNNetSafeTensorsReader;
   const Prefix: string; var Conv: TEnCodecConv; pTranspose: boolean;
   pStride, pDilation, pGroups: integer; pPadMode: string; Consumed: TStrings);
 var
-  LpMax: integer;
   W: TNNetVolume;
   D0, D1, K, o, i, OutChM1: integer;
 begin
@@ -43435,8 +43441,8 @@ begin
       Conv.OutCh := D0;
     end;
     SetLength(Conv.W, W.Size);
-    LpMax := W.Size - 1;
-    for o := 0 to LpMax do Conv.W[o] := W.FData[o];
+    if W.Size > 0 then                                                  // #13
+      Move(W.FData[0], Conv.W[0], W.Size * csNeuralFloatSize);
     // Mimi's forward contracts in Double; build that layout once and drop the
     // Single original, which nothing reads afterwards.
     if pTranspose then
@@ -43451,8 +43457,8 @@ begin
       Reader.LoadTensorFlat(Prefix + '.bias', W);
       Consumed.Add(Prefix + '.bias');
       SetLength(Conv.B, W.Size);
-      LpMax := W.Size - 1;
-      for o := 0 to LpMax do Conv.B[o] := W.FData[o];
+      if W.Size > 0 then                                                // #13
+        Move(W.FData[0], Conv.B[0], W.Size * csNeuralFloatSize);
     end
     else
     begin
@@ -43732,9 +43738,7 @@ end;
 procedure LoadMimiMat(Reader: TNNetSafeTensorsReader;
   const Name: string; var Mat: TEnCodecMat; Consumed: TStrings);
 var
-  LpMax: integer;
   T: TNNetVolume;
-  I: integer;
 begin
   T := TNNetVolume.Create;
   try
@@ -43742,8 +43746,8 @@ begin
     Mat.Rows := Reader.DimSize(Name, 0);
     Mat.Cols := Reader.DimSize(Name, 1);
     SetLength(Mat.Data, T.Size);
-    LpMax := T.Size - 1;
-    for I := 0 to LpMax do Mat.Data[I] := T.FData[I];
+    if T.Size > 0 then                                                  // #13
+      Move(T.FData[0], Mat.Data[0], T.Size * csNeuralFloatSize);
     Consumed.Add(Name);
   finally
     T.Free;
@@ -43753,16 +43757,14 @@ end;
 procedure LoadMimiVec(Reader: TNNetSafeTensorsReader;
   const Name: string; out Vec: TNeuralFloatDynArr; Consumed: TStrings);
 var
-  LpMax: integer;
   T: TNNetVolume;
-  I: integer;
 begin
   T := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(Name, T);
     SetLength(Vec, T.Size);
-    LpMax := T.Size - 1;
-    for I := 0 to LpMax do Vec[I] := T.FData[I];
+    if T.Size > 0 then                                                  // #13
+      Move(T.FData[0], Vec[0], T.Size * csNeuralFloatSize);
     Consumed.Add(Name);
   finally
     T.Free;
@@ -43775,8 +43777,8 @@ procedure LoadMimiCodebook(Reader: TNNetSafeTensorsReader;
   Consumed: TStrings);
 var
   ES, CU: TNNetVolume;
-  K, D, r, c, rBase: integer;
-  KM1, DM1: integer;
+  K, D, r, rBase, RowBytes: integer;
+  KM1: integer;
   denom: TNeuralFloat;
 begin
   ES := TNNetVolume.Create;
@@ -43795,14 +43797,22 @@ begin
     Mat.Cols := D;
     SetLength(Mat.Data, K * D);
     KM1 := K - 1;
-    DM1 := D - 1;
+    // Each centroid row is a uniform scale of a contiguous D-long run, so copy it
+    // and fire one AVX Mul (#13) with a single reciprocal per row (#21). The
+    // reciprocal reassociates against the per-element divide; that is an
+    // import-time weight fold, well inside the codec parity tolerance.
+    RowBytes := D * csNeuralFloatSize;
+    rBase := 0;                        // #6: r*D carried
     for r := 0 to KM1 do
     begin
       denom := CU.FData[r];
       if denom < Eps then denom := Eps;
-      rBase := r * D; // #11: hoist row base
-      for c := 0 to DM1 do
-        Mat.Data[rBase + c] := ES.FData[rBase + c] / denom;
+      if D > 0 then
+      begin
+        Move(ES.FData[rBase], Mat.Data[rBase], RowBytes);
+        TNNetVolume.Mul(@Mat.Data[rBase], 1.0 / denom, D);
+      end;
+      Inc(rBase, D);
     end;
   finally
     CU.Free;
