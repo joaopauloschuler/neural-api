@@ -118444,19 +118444,16 @@ type
   TFloatArray = array of TNeuralFloat;
 var
   MaxPerturbNeuronPos: integer;
-  MaxPerturbWeightPos: integer;
   MaxSamplePos: integer;
   MaxGradNeuronPos: integer;
-  MaxNeuronDeltaPos: integer;
   MaxParamCountNeuronPos: integer;
   Lines: TStringList;
   LIdx, NeuronIdx, K, SampleIdx, BinIdx, P, I, Iter, Probe: integer;
   Layer: TNNetLayer;
-  Neuron: TNNetNeuron;
   Pair: TNNetVolumePair;
   LastLayer: TNNetLayer;
   OutSize: integer;
-  LR, NormV: TNeuralFloat;
+  NormV: TNeuralFloat;
   Target: TNNetVolume;
   Snapshot: string;
   SavedRandSeed: longword;
@@ -118467,8 +118464,8 @@ var
   NetParamCnt, TrainableLayers: integer;
   // working vectors over the net-flat parameter axis
   GradPlus, GradMinus, Hv, Vprobe: TFloatArray;
-  // scope -> owning trainable-layer index (for the per-layer trace)
-  ParamLayer: array of integer;
+  WSnapshot: TFloatArray;           // net-flat weight snapshot for HVP restore
+  InvTwoEps: TNeuralFloat;
   // Hutchinson trace accumulation
   VHv, TrAcc, TraceMean, MeanPerParam, Concentration: TNeuralFloat;
   Quad: TFloatArray;                // per-probe v^T H v samples
@@ -118477,7 +118474,7 @@ var
   LayerName: array of string;
   LayerVHv: TNeuralFloat;
   // power iteration for lambda_max
-  LambdaMax, Dot: TNeuralFloat;
+  LambdaMax: TNeuralFloat;
   // histogram of per-probe v^T H v
   Bins: array of integer;
   HistMin, HistMax, Span, BinLo, BinHi: TNeuralFloat;
@@ -118485,12 +118482,12 @@ var
   Bar, Verdict: string;
   PsdOk, NonFinite: boolean;
   LastLayerIdx, NetParamCntM1, LayerCntM1, NumProbesM1: integer;
-  cBinsM1, LayerParamCntM1: integer;
+  cBinsM1: integer;
 
   // Add 'Scale * v_k' to every trainable weight (k walks the net-flat axis).
   procedure PerturbWeights(const V: TFloatArray; Scale: TNeuralFloat);
   var
-    LL, NN_, KK, PP: integer;
+    LL, NN_, PP, Sz: integer;
     Lay: TNNetLayer;
     Neu: TNNetNeuron;
   begin
@@ -118503,14 +118500,67 @@ var
       for NN_ := 0 to MaxPerturbNeuronPos do
       begin
         Neu := Lay.Neurons[NN_];
-        MaxPerturbWeightPos := Neu.Weights.Size - 1;
-        for KK := 0 to MaxPerturbWeightPos do
-        begin
-          Neu.Weights.FData[KK] := Neu.Weights.FData[KK] + Scale * V[PP];
-          Inc(PP);
-        end;
+        Sz := Neu.Weights.Size;
+        if Sz > 0 then
+          TNNetVolume.MulAdd(Neu.Weights.GetRawPtr(),
+            TNeuralFloatArrPtr(@V[PP]), Scale, Sz);
+        Inc(PP, Sz);
         // bias parameter
         Neu.FBiasWeight := Neu.FBiasWeight + Scale * V[PP];
+        Inc(PP);
+      end;
+      Lay.AfterWeightUpdate();
+    end;
+  end;
+
+  // Copy every trainable weight (and bias) out to / back from the net-flat
+  // axis. The restore is bit-for-bit, so it replaces a SaveDataToString text
+  // round-trip on the twice-per-probe HVP path.
+  procedure SaveWeightsFlat(var W: TFloatArray);
+  var
+    LL, NN_, PP, Sz, MaxNeuronPos: integer;
+    Lay: TNNetLayer;
+    Neu: TNNetNeuron;
+  begin
+    for LL := 0 to LastLayerIdx do
+    begin
+      if not LayerHasParams[LL] then Continue;
+      Lay := NN.Layers[LL];
+      PP := FlatBase[LL];
+      MaxNeuronPos := Lay.Neurons.Count - 1;
+      for NN_ := 0 to MaxNeuronPos do
+      begin
+        Neu := Lay.Neurons[NN_];
+        Sz := Neu.Weights.Size;
+        if Sz > 0 then
+          Move(Neu.Weights.FData[0], W[PP], Sz * csNeuralFloatSize);
+        Inc(PP, Sz);
+        W[PP] := Neu.FBiasWeight;
+        Inc(PP);
+      end;
+    end;
+  end;
+
+  procedure RestoreWeightsFlat(const W: TFloatArray);
+  var
+    LL, NN_, PP, Sz, MaxNeuronPos: integer;
+    Lay: TNNetLayer;
+    Neu: TNNetNeuron;
+  begin
+    for LL := 0 to LastLayerIdx do
+    begin
+      if not LayerHasParams[LL] then Continue;
+      Lay := NN.Layers[LL];
+      PP := FlatBase[LL];
+      MaxNeuronPos := Lay.Neurons.Count - 1;
+      for NN_ := 0 to MaxNeuronPos do
+      begin
+        Neu := Lay.Neurons[NN_];
+        Sz := Neu.Weights.Size;
+        if Sz > 0 then
+          Move(W[PP], Neu.Weights.FData[0], Sz * csNeuralFloatSize);
+        Inc(PP, Sz);
+        Neu.FBiasWeight := W[PP];
         Inc(PP);
       end;
       Lay.AfterWeightUpdate();
@@ -118525,12 +118575,12 @@ var
   // and hence v^T H v carry the correct sign (positive curvature at a minimum).
   procedure ComputeGradient(var G: TFloatArray);
   var
-    SI, LL, NN_, KK, PP, LblClass: integer;
+    SI, LL, NN_, PP, Sz, LblClass: integer;
     Lay: TNNetLayer;
     Neu: TNNetNeuron;
-    Lr2: TNeuralFloat;
+    Lr2, NegInvLr: TNeuralFloat;
   begin
-    for KK := 0 to NetParamCntM1 do G[KK] := 0;
+    FillChar(G[0], NetParamCnt * csNeuralFloatSize, 0);
     MaxSamplePos := Samples.Count - 1;
     for SI := 0 to MaxSamplePos do
     begin
@@ -118551,18 +118601,18 @@ var
         Lay := NN.Layers[LL];
         Lr2 := Lay.LearningRate;
         if Lr2 <= 0 then Lr2 := 1.0;
+        NegInvLr := -1.0 / Lr2;
         PP := FlatBase[LL];
         MaxGradNeuronPos := Lay.Neurons.Count - 1;
         for NN_ := 0 to MaxGradNeuronPos do
         begin
           Neu := Lay.Neurons[NN_];
-          MaxNeuronDeltaPos := Neu.Delta.Size - 1;
-          for KK := 0 to MaxNeuronDeltaPos do
-          begin
-            G[PP] := G[PP] - Neu.Delta.FData[KK] / Lr2;
-            Inc(PP);
-          end;
-          G[PP] := G[PP] - Neu.FBiasDelta / Lr2;
+          Sz := Neu.Delta.Size;
+          if Sz > 0 then
+            TNNetVolume.MulAdd(TNeuralFloatArrPtr(@G[PP]),
+              Neu.Delta.GetRawPtr(), NegInvLr, Sz);
+          Inc(PP, Sz);
+          G[PP] := G[PP] + Neu.FBiasDelta * NegInvLr;
           Inc(PP);
         end;
       end;
@@ -118570,7 +118620,7 @@ var
   end;
 
   // Hessian-vector product Hv ~= (grad(theta+eps*v) - grad(theta-eps*v))/(2 eps)
-  // via central differencing. Weights are restored bit-for-bit from Snapshot
+  // via central differencing. Weights are restored bit-for-bit from WSnapshot
   // after each probe so the net is unchanged on return.
   procedure HessianVectorProduct(const V: TFloatArray; var OutHv: TFloatArray);
   var
@@ -118578,14 +118628,14 @@ var
   begin
     PerturbWeights(V, Eps);
     ComputeGradient(GradPlus);
-    NN.LoadDataFromString(Snapshot);
+    RestoreWeightsFlat(WSnapshot);
 
     PerturbWeights(V, -Eps);
     ComputeGradient(GradMinus);
-    NN.LoadDataFromString(Snapshot);
+    RestoreWeightsFlat(WSnapshot);
 
     for KK := 0 to NetParamCntM1 do
-      OutHv[KK] := (GradPlus[KK] - GradMinus[KK]) / (2.0 * Eps);
+      OutHv[KK] := (GradPlus[KK] - GradMinus[KK]) * InvTwoEps;
   end;
 
 begin
@@ -118654,22 +118704,14 @@ begin
     end;
     NetParamCntM1 := NetParamCnt - 1;
 
-    // Map each net-flat parameter to its owning trainable-layer index.
-    SetLength(ParamLayer, NetParamCnt);
+    // Each trainable layer owns one contiguous slab of the net-flat axis,
+    // [FlatBase[LIdx] .. +LayerParamCnt[LIdx]), so the per-layer trace below
+    // reads a slab directly instead of a per-parameter owner lookup.
     SetLength(LayerName, NN.CountLayers());
     for LIdx := 0 to LayerCntM1 do LayerName[LIdx] := '';
     for LIdx := 0 to LastLayerIdx do
-    begin
-      if not LayerHasParams[LIdx] then Continue;
-      LayerName[LIdx] := NN.Layers[LIdx].ClassName;
-      P := FlatBase[LIdx];
-      LayerParamCntM1 := LayerParamCnt[LIdx] - 1;
-      for K := 0 to LayerParamCntM1 do
-      begin
-        ParamLayer[P] := LIdx;
-        Inc(P);
-      end;
-    end;
+      if LayerHasParams[LIdx] then
+        LayerName[LIdx] := NN.Layers[LIdx].ClassName;
 
     // Why batch update: Delta accumulates -LR*gradient only with batch update
     // on; otherwise the gradient is consumed inline and never lands in Delta.
@@ -118681,13 +118723,17 @@ begin
     OutSize := LastLayer.Output.Size;
     Target := TNNetVolume.Create(OutSize, 1, 1);
 
-    // Whole-net snapshot for exact restore between perturbations.
+    // Whole-net snapshot for the final exact restore; the net-flat WSnapshot
+    // is what the per-probe HVP restores from.
     Snapshot := NN.SaveDataToString();
+    InvTwoEps := 1.0 / (2.0 * Eps);
 
     SetLength(GradPlus, NetParamCnt);
     SetLength(GradMinus, NetParamCnt);
     SetLength(Hv, NetParamCnt);
     SetLength(Vprobe, NetParamCnt);
+    SetLength(WSnapshot, NetParamCnt);
+    SaveWeightsFlat(WSnapshot);
     SetLength(Quad, NumProbes);
     SetLength(LayerQuadAcc, NN.CountLayers());
     for LIdx := 0 to LayerCntM1 do LayerQuadAcc[LIdx] := 0;
@@ -118724,20 +118770,22 @@ begin
 
         HessianVectorProduct(Vprobe, Hv);
 
-        VHv := 0;
-        for K := 0 to NetParamCntM1 do
-          VHv := VHv + Vprobe[K] * Hv[K];
-        Quad[Probe] := VHv;
-        TrAcc := TrAcc + VHv;
-
         // Per-layer trace contribution: restrict the v^T H v dot to one layer's
         // parameter slab (Rademacher v^2 = 1, so this estimates that slab's
-        // diagonal Hessian sum, i.e. its share of the trace).
-        for K := 0 to NetParamCntM1 do
+        // diagonal Hessian sum, i.e. its share of the trace). The slabs
+        // partition the flat axis, so their sum IS v^T H v — no second pass.
+        VHv := 0;
+        for LIdx := 0 to LastLayerIdx do
         begin
-          LIdx := ParamLayer[K];
-          LayerQuadAcc[LIdx] := LayerQuadAcc[LIdx] + Vprobe[K] * Hv[K];
+          if not LayerHasParams[LIdx] then Continue;
+          P := FlatBase[LIdx];
+          LayerVHv := TNNetVolume.DotProduct(TNeuralFloatArrPtr(@Vprobe[P]),
+            TNeuralFloatArrPtr(@Hv[P]), LayerParamCnt[LIdx]);
+          LayerQuadAcc[LIdx] := LayerQuadAcc[LIdx] + LayerVHv;
+          VHv := VHv + LayerVHv;
         end;
+        Quad[Probe] := VHv;
+        TrAcc := TrAcc + VHv;
       end;
       TraceMean := TrAcc / NumProbes;
       for LIdx := 0 to LayerCntM1 do
@@ -118753,22 +118801,22 @@ begin
       end;
       NormV := Sqrt(NormV);
       if NormV <= cNormEps then NormV := 1.0;
-      for K := 0 to NetParamCntM1 do Vprobe[K] := Vprobe[K] / NormV;
+      TNNetVolume.Mul(TNeuralFloatArrPtr(@Vprobe[0]), 1.0 / NormV, NetParamCnt);
 
       LambdaMax := 0;
       for Iter := 1 to cPowerIters do
       begin
         HessianVectorProduct(Vprobe, Hv);
         // Rayleigh quotient (v is unit): lambda ~= v^T H v.
-        Dot := 0;
-        for K := 0 to NetParamCntM1 do Dot := Dot + Vprobe[K] * Hv[K];
-        LambdaMax := Dot;
+        LambdaMax := TNNetVolume.DotProduct(TNeuralFloatArrPtr(@Vprobe[0]),
+          TNeuralFloatArrPtr(@Hv[0]), NetParamCnt);
         // v <- Hv / ||Hv||.
-        NormV := 0;
-        for K := 0 to NetParamCntM1 do NormV := NormV + Hv[K] * Hv[K];
-        NormV := Sqrt(NormV);
+        NormV := Sqrt(TNNetVolume.DotProduct(TNeuralFloatArrPtr(@Hv[0]),
+          TNeuralFloatArrPtr(@Hv[0]), NetParamCnt));
         if NormV <= cNormEps then Break;   // flat direction -> H v = 0
-        for K := 0 to NetParamCntM1 do Vprobe[K] := Hv[K] / NormV;
+        Move(Hv[0], Vprobe[0], NetParamCnt * csNeuralFloatSize);
+        TNNetVolume.Mul(TNeuralFloatArrPtr(@Vprobe[0]), 1.0 / NormV,
+          NetParamCnt);
       end;
     finally
       // Restore exact weights (also done after every probe inside the HVP).
@@ -118921,13 +118969,12 @@ var
   MaxLossSamplePos: integer;
   MaxGradSamplePos: integer;
   MaxGradNeuronPos: integer;
-  MaxGradDeltaPos: integer;
   MaxLangevinNeuronPos: integer;
   MaxLangevinWeightPos: integer;
   MaxParamCountNeuronPos: integer;
   MaxCountSamplePos: integer;
   MaxAnchorNeuronPos: integer;
-  MaxAnchorWeightPos: integer;
+  AnchorWeightCount: integer;
   Lines: TStringList;
   LIdx, NeuronIdx, SampleIdx, P, Step, BurnIn, ChainCnt: integer;
   Layer: TNNetLayer;
@@ -118944,6 +118991,8 @@ var
   LayerParamCnt: array of integer;
   WStar, Grad: array of TNeuralFloat;
   Beta, nBeta, LStar, LCur, ChainSum, ChainMean, LLCHat, Ratio: TNeuralFloat;
+  HaveSpareGaussian: boolean;
+  SpareGaussian: TNeuralFloat;
   ParamCntCheck: integer;
   NonFinite: boolean;
   Verdict: string;
@@ -118988,12 +119037,12 @@ var
   // is sample-count-stable.
   procedure ComputeGradient(var G: array of TNeuralFloat);
   var
-    SI, LL, NN_, KK, PP, Cls, UsedCnt: integer;
+    SI, LL, NN_, PP, Sz, Cls, UsedCnt: integer;
     Lay: TNNetLayer;
     Neu: TNNetNeuron;
-    Lr2: TNeuralFloat;
+    Lr2, NegInvLr: TNeuralFloat;
   begin
-    for KK := 0 to NetParamCntM1 do G[KK] := 0;
+    FillChar(G[0], NetParamCnt * csNeuralFloatSize, 0);
     UsedCnt := 0;
     MaxGradSamplePos := Samples.Count - 1;
     for SI := 0 to MaxGradSamplePos do
@@ -119013,32 +119062,39 @@ var
         Lay := NN.Layers[LL];
         Lr2 := Lay.LearningRate;
         if Lr2 <= 0 then Lr2 := 1.0;
+        NegInvLr := -1.0 / Lr2;
         PP := FlatBase[LL];
         MaxGradNeuronPos := Lay.Neurons.Count - 1;
         for NN_ := 0 to MaxGradNeuronPos do
         begin
           Neu := Lay.Neurons[NN_];
-          MaxGradDeltaPos := Neu.Delta.Size - 1;
-          for KK := 0 to MaxGradDeltaPos do
-          begin
-            G[PP] := G[PP] - Neu.Delta.FData[KK] / Lr2;
-            Inc(PP);
-          end;
-          G[PP] := G[PP] - Neu.FBiasDelta / Lr2;
+          Sz := Neu.Delta.Size;
+          if Sz > 0 then
+            TNNetVolume.MulAdd(TNeuralFloatArrPtr(@G[PP]),
+              Neu.Delta.GetRawPtr(), NegInvLr, Sz);
+          Inc(PP, Sz);
+          G[PP] := G[PP] + Neu.FBiasDelta * NegInvLr;
           Inc(PP);
         end;
       end;
       Inc(UsedCnt);
     end;
     if UsedCnt > 1 then
-      for KK := 0 to NetParamCntM1 do G[KK] := G[KK] / UsedCnt;
+      TNNetVolume.Mul(TNeuralFloatArrPtr(@G[0]), 1.0 / UsedCnt, NetParamCnt);
   end;
 
-  // Standard-normal sample via polar Box-Muller on the global RNG.
+  // Standard-normal sample via polar Box-Muller on the global RNG. The polar
+  // pair yields TWO independent variates; the second is cached for the next call.
   function NextGaussian(): TNeuralFloat;
   var
-    rr, xx, yy: TNeuralFloat;
+    rr, xx, yy, Scale: TNeuralFloat;
   begin
+    if HaveSpareGaussian then
+    begin
+      HaveSpareGaussian := false;
+      Result := SpareGaussian;
+      Exit;
+    end;
     rr := 0;
     while (rr > 1) or (rr = 0) do
     begin
@@ -119046,7 +119102,10 @@ var
       yy := 2.0 * Random() - 1.0;
       rr := xx * xx + yy * yy;
     end;
-    Result := xx * Sqrt(-2.0 * pcr_logf(rr) / rr);
+    Scale := Sqrt(-2.0 * pcr_logf(rr) / rr);
+    SpareGaussian := yy * Scale;
+    HaveSpareGaussian := true;
+    Result := xx * Scale;
   end;
 
   // One anchored-Langevin (SGLD) step IN PLACE on the live weights:
@@ -119057,10 +119116,11 @@ var
     Lay: TNNetLayer;
     Neu: TNNetNeuron;
     Cur, Drift, Noise: TNeuralFloat;
-    NoiseSd: TNeuralFloat;
+    NoiseSd, HalfEps: TNeuralFloat;
   begin
     ComputeGradient(Grad);
     NoiseSd := Sqrt(Eps);
+    HalfEps := 0.5 * Eps;
     PP := 0;
     for LL := 0 to LastLayerIdx do
     begin
@@ -119076,13 +119136,13 @@ var
           Cur := Neu.Weights.FData[KK];
           Drift := nBeta * Grad[PP] + Gamma * (Cur - WStar[PP]);
           Noise := NoiseSd * NextGaussian();
-          Neu.Weights.FData[KK] := Cur - 0.5 * Eps * Drift + Noise;
+          Neu.Weights.FData[KK] := Cur - HalfEps * Drift + Noise;
           Inc(PP);
         end;
         Cur := Neu.FBiasWeight;
         Drift := nBeta * Grad[PP] + Gamma * (Cur - WStar[PP]);
         Noise := NoiseSd * NextGaussian();
-        Neu.FBiasWeight := Cur - 0.5 * Eps * Drift + Noise;
+        Neu.FBiasWeight := Cur - HalfEps * Drift + Noise;
         Inc(PP);
       end;
       Lay.AfterWeightUpdate();
@@ -119194,12 +119254,11 @@ begin
       for NeuronIdx := 0 to MaxAnchorNeuronPos do
       begin
         Neuron := Layer.Neurons[NeuronIdx];
-        MaxAnchorWeightPos := Neuron.Weights.Size - 1;
-        for SampleIdx := 0 to MaxAnchorWeightPos do
-        begin
-          WStar[P] := Neuron.Weights.FData[SampleIdx];
-          Inc(P);
-        end;
+        AnchorWeightCount := Neuron.Weights.Size;
+        if AnchorWeightCount > 0 then
+          Move(Neuron.Weights.FData[0], WStar[P],
+            AnchorWeightCount * csNeuralFloatSize);
+        Inc(P, AnchorWeightCount);
         WStar[P] := Neuron.FBiasWeight;
         Inc(P);
       end;
@@ -119226,6 +119285,7 @@ begin
 
       // --- Anchored SGLD chain; average L(w) over the post-burn-in samples. ---
       RandSeed := 987654;
+      HaveSpareGaussian := false;
       BurnIn := Trunc(ChainLen * cBurnFrac);
       if BurnIn >= ChainLen then BurnIn := ChainLen - 1;
       ChainSum := 0;
