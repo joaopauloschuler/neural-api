@@ -4715,6 +4715,20 @@ type
   end;
 
   {$IFDEF OpenCL}
+  /// Common interface of the per-output-pixel corner-gather forward helpers
+  // (bilinear: 4 corners, bicubic: 16). All of them take the SAME host-filled
+  // arrays - corner offsets into the source raster and their blend weights - so
+  // the resize / upsample layers can drive either kernel through one field.
+  // Coded by Claude (AI).
+  TNNetGatherCL = class(TNNetKernelCL)
+  public
+    // Corners/Weights hold NumOut*TapCnt entries filled by the caller; Src is the
+    // source feature map; Dst receives the NumOut*Depth output as
+    // [outpix*Depth + d].
+    procedure Gather(Src: TNNetVolume; Corners, Weights: TNNetVolume;
+      Dst: TNNetVolume; NumOut, Depth: integer); virtual; abstract;
+  end;
+
   /// Shared OpenCL forward offload for the bilinear-gather sampler layers
   // (TNNetFlowWarp / TNNetBackwardWarp / TNNetAffineGridSample /
   // TNNetBilinearUpsample). Every one of those layers reduces to the SAME
@@ -4728,7 +4742,7 @@ type
   // the kernel skips -- so clamp layers (warps) repeat the clamped index and
   // zero-pad layers (grid sample / upsample handle entirely in-bounds) just emit
   // valid indices, and either case is bit-faithful to the CPU forward.
-  TNNetBilinearGatherCL = class(TNNetKernelCL)
+  TNNetBilinearGatherCL = class(TNNetGatherCL)
   private
     // Host-side staging volumes (reused/resized across forwards): the source
     // feature map (raster [(y*W+x)*Depth+d]), the 4 corner offsets per output
@@ -4744,7 +4758,7 @@ type
     // the caller; Src is the source feature map; Dst receives the NumOut*Depth
     // output column-major as [outpix*Depth + d]. NumOut = output pixel count.
     procedure Gather(Src: TNNetVolume; Corners, Weights: TNNetVolume;
-      Dst: TNNetVolume; NumOut, Depth: integer);
+      Dst: TNNetVolume; NumOut, Depth: integer); override;
   end;
 
   /// OpenCL forward helper for TNNetPixelShuffle (depth-to-space). The shuffle is
@@ -4779,7 +4793,7 @@ type
   // Binds the cai_bicubic_gather entry point on the shared dot-product program's
   // device. One work-item per (output pixel, depth channel). Forward-only.
   // Coded by Claude (AI).
-  TNNetBicubicGatherCL = class(TNNetKernelCL)
+  TNNetBicubicGatherCL = class(TNNetGatherCL)
   private
     // Persistent device buffers (grow-only), reused every forward.
     FBufSrc, FBufCorner, FBufWeight, FBufDst: cl_mem;
@@ -4791,7 +4805,7 @@ type
     // Src is the source feature map; Dst receives the NumOut*Depth output as
     // [outpix*Depth + d]. NumOut = output pixel count.
     procedure Gather(Src: TNNetVolume; Corners, Weights: TNNetVolume;
-      Dst: TNNetVolume; NumOut, Depth: integer);
+      Dst: TNNetVolume; NumOut, Depth: integer); override;
   end;
 
   /// OpenCL BACKWARD helper for TNNetPixelShuffle (space-to-depth scatter). The
@@ -17083,6 +17097,44 @@ type
     TapCnt, Kind, OutSize, InSize, AlignCorners: integer;
   end;
 
+  /// Shared scaffolding of the separable resize / upsample layers
+  // (TNNetBilinearUpsample, TNNetBicubicUpsample, TNNetBilinearResize,
+  // TNNetResize2D). All of them differ ONLY in how the per-axis source geometry
+  // is derived (integer factor vs absolute target size, align_corners
+  // convention, linear vs cubic taps); once both axis maps are built the actual
+  // work - the per-pixel blend of Depth-long contiguous source columns, its
+  // exact transpose, and the device gather offload - is identical, so it lives
+  // here. Descendants build FXMap/FYMap with the map builder that matches their
+  // convention and then call the shared kernels. Not registered as a layer type:
+  // it is abstract scaffolding, every concrete class keeps its own name and
+  // FStruct layout for serialization. Coded by Claude (AI).
+  TNNetResizeBase = class(TNNetLayer)
+    protected
+      // Cached per-shape sampling geometry of each axis (rule #27): built once
+      // per shape by the descendant, then read as a table by the kernels below.
+      FXMap, FYMap: TNNetAxisMap;
+      {$IFDEF OpenCL}
+      // Forward device offload: the gather helper matching this layer's blend
+      // (4 or 16 corners) plus the host staging buffers handed to it.
+      FGatherCL: TNNetGatherCL;
+      FCornerBuf, FWeightBuf, FDstFlat: TNNetVolume;
+      {$ENDIF}
+      procedure BilinearForward(Src: TNNetVolume);
+      procedure BilinearBackward(PrevError: TNNetVolume);
+      procedure BicubicForward(Src: TNNetVolume);
+      procedure BicubicBackward(PrevError: TNNetVolume);
+      {$IFDEF OpenCL}
+      procedure CreateGatherBuffers();
+      procedure GatherOpenCL(Src: TNNetVolume);
+      {$ENDIF}
+    public
+      destructor Destroy(); override;
+      {$IFDEF OpenCL}
+      function WillOpenCL(): boolean; override;
+      procedure DisableOpenCL(); override;
+      {$ENDIF}
+  end;
+
   /// Spatial BILINEAR upsample by an INTEGER factor, matching PyTorch's
   // nn.functional.interpolate(mode='bilinear', align_corners=False). Given an
   // input (W,H,C) and factor s it produces (W*s, H*s, C). For an output pixel
@@ -17096,25 +17148,15 @@ type
   // Backward scatters each output error back to its 4 source corners weighted by
   // the same bilinear weights (the exact adjoint).
   // Coded by Claude (AI).
-  TNNetBilinearUpsample = class(TNNetLayer)
+  TNNetBilinearUpsample = class(TNNetResizeBase)
     private
-      // Per-shape X-axis sampling map (rule #27).
-      FXMap: TNNetAxisMap;
-      {$IFDEF OpenCL}
-      FGatherCL: TNNetBilinearGatherCL;
-      FCornerBuf, FWeightBuf, FDstFlat: TNNetVolume;
-      procedure ComputeOpenCL();
-      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(pFactor: integer = 2); reintroduce; overload;
-      destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       {$IFDEF OpenCL}
-      function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-      procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
 
@@ -17140,18 +17182,13 @@ type
   // Depth-long contiguous run, and backward is the transpose scatter (the exact
   // adjoint) accumulating grad*weight into each of the 16 source columns.
   // Coded by Claude (AI).
-  TNNetBicubicUpsample = class(TNNetLayer)
+  TNNetBicubicUpsample = class(TNNetResizeBase)
     private
-      // Per-shape X-axis sampling map (rule #27).
-      FXMap: TNNetAxisMap;
       {$IFDEF OpenCL}
-      FGatherCL: TNNetBicubicGatherCL;
       FScatterCL: TNNetBicubicScatterCL;
-      FCornerBuf, FWeightBuf, FDstFlat: TNNetVolume;
       FRowOffBuf, FOutIdxBuf, FEntWeightBuf, FBackErrFlat, FBackOutFlat: TNNetVolume;
       // Persistent, lazily-sized per-source-pixel CSR count/cursor scratch (rule #17).
       FCountsBuf, FCursorBuf: array of integer;
-      procedure ComputeOpenCL();
       procedure BackpropagateOpenCL();
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -17164,7 +17201,6 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       {$IFDEF OpenCL}
-      function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
       {$ENDIF}
@@ -17184,26 +17220,16 @@ type
   // Backward scatters each output error back to its 4 source corners by the same
   // bilinear weights (the exact adjoint).
   // Coded by Claude (AI).
-  TNNetBilinearResize = class(TNNetLayer)
+  TNNetBilinearResize = class(TNNetResizeBase)
     private
-      // Per-shape X-axis sampling map (rule #27).
-      FXMap: TNNetAxisMap;
-      {$IFDEF OpenCL}
-      FGatherCL: TNNetBilinearGatherCL;
-      FCornerBuf, FWeightBuf, FDstFlat: TNNetVolume;
-      procedure ComputeOpenCL();
-      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(pOutW: integer = 2; pOutH: integer = 2;
         pAlignCorners: integer = 0); reintroduce; overload;
-      destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       {$IFDEF OpenCL}
-      function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-      procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
 
@@ -17233,33 +17259,19 @@ type
   // model expects a fixed input resolution (ViT/SigLIP/DINOv2 towers, super-res
   // pre/post resize) and for general vision preprocessing.
   // Coded by Claude (AI).
-  TNNetResize2D = class(TNNetLayer)
+  TNNetResize2D = class(TNNetResizeBase)
     private
-      // Per-shape X-axis sampling map (rule #27).
-      FXMap: TNNetAxisMap;
-      {$IFDEF OpenCL}
-      // Forward-only device offload reusing the shared gather kernels: the
-      // bilinear path drives TNNetBilinearGatherCL (4 corners, same kernel as
-      // TNNetBilinearResize) and the bicubic path drives TNNetBicubicGatherCL
-      // (16 corners, same kernel as TNNetBicubicUpsample). Nearest stays on the
-      // CPU (pure Move, no blend kernel). Backward stays on the CPU.
-      FBilinearGatherCL: TNNetBilinearGatherCL;
-      FBicubicGatherCL: TNNetBicubicGatherCL;
-      FCornerBuf, FWeightBuf, FDstFlat: TNNetVolume;
-      procedure ComputeOpenCL();
-      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      // Fills FXMap/FYMap with the geometry of the configured mode.
+      procedure EnsureAxisMaps(Src: TNNetVolume);
     public
       // pMode: 0=nearest, 1=bilinear, 2=bicubic.
       constructor Create(pOutW: integer = 2; pOutH: integer = 2;
         pMode: integer = 1; pAlignCorners: integer = 0); reintroduce; overload;
-      destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       {$IFDEF OpenCL}
-      function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
-      procedure DisableOpenCL(); override;
       {$ENDIF}
   end;
 
@@ -55031,15 +55043,8 @@ begin
 end;
 {$ENDIF}
 
-{ TNNetBilinearUpsample }
-constructor TNNetBilinearUpsample.Create(pFactor: integer);
-begin
-  inherited Create();
-  if pFactor < 1 then pFactor := 1;
-  FStruct[0] := pFactor;
-end;
-
-destructor TNNetBilinearUpsample.Destroy();
+{ TNNetResizeBase }
+destructor TNNetResizeBase.Destroy();
 begin
   {$IFDEF OpenCL}
   if Assigned(FGatherCL)  then FreeAndNil(FGatherCL);
@@ -55050,21 +55055,270 @@ begin
   inherited Destroy();
 end;
 
-procedure TNNetBilinearUpsample.SetPrevLayer(pPrevLayer: TNNetLayer);
-var
-  s: integer;
+{$IFDEF OpenCL}
+procedure TNNetResizeBase.DisableOpenCL();
 begin
-  inherited SetPrevLayer(pPrevLayer);
-  s := FStruct[0];
-  if s < 1 then s := 1;
-  FOutput.ReSize(pPrevLayer.Output.SizeX * s,
-                 pPrevLayer.Output.SizeY * s,
-                 pPrevLayer.Output.Depth);
-  SetOutputErrorSize(FOutput);
-  {$IFDEF OpenCL}
-  FShouldOpenCL := false; // bandwidth-bound: GPU < CPU at every size (OpenCLForwardBenchmark ~0.37x), pin to CPU. Old verdict: Int64(FOutput.SizeX) * FOutput.SizeY * FOutput.Depth >= cNeuralOpenCLMinWork
-  {$ENDIF}
+  inherited DisableOpenCL();
+  FreeAndNil(FGatherCL);
 end;
+
+function TNNetResizeBase.WillOpenCL(): boolean;
+begin
+  Result := Assigned(FGatherCL) and FHasOpenCL
+            and (FShouldOpenCL or FForceOpenCL);
+end;
+
+// Host staging for the device gather. The gather helper itself is created by the
+// descendant, which knows how many corners its blend reads (and creates none
+// when the layer has no blend to offload).
+procedure TNNetResizeBase.CreateGatherBuffers();
+begin
+  if not Assigned(FCornerBuf) then FCornerBuf := TNNetVolume.Create();
+  if not Assigned(FWeightBuf) then FWeightBuf := TNNetVolume.Create();
+  if not Assigned(FDstFlat)   then FDstFlat   := TNNetVolume.Create();
+end;
+
+// Device per-pixel gather driven by the cached axis maps. The separable weights
+// (FYMap tap r times FXMap tap c) and the corner offsets into the SOURCE raster
+// are built on the CPU bit-identically to the scalar kernels below; only the
+// depth-blend runs on the device. Serves both tap counts: 4 corners for the
+// linear maps, 16 for the cubic ones. NumOut = OutX*OutY.
+procedure TNNetResizeBase.GatherOpenCL(Src: TNNetVolume);
+var
+  D, ox, oy, SrcW, NumOut, TapX, TapY, cb, r, cc: integer;
+  XBase, YBase, RowOff, MaxOutXPos, MaxOutYPos: integer;
+  RowW: TNeuralFloat;
+begin
+  D := FOutput.Depth;
+  SrcW := Src.SizeX;
+  MaxOutXPos := FOutput.SizeX - 1;
+  MaxOutYPos := FOutput.SizeY - 1;
+  TapX := FXMap.TapCnt;
+  TapY := FYMap.TapCnt;
+  NumOut := FOutput.SizeX * FOutput.SizeY;
+  FCornerBuf.ReSize(NumOut * TapX * TapY, 1, 1);
+  FWeightBuf.ReSize(NumOut * TapX * TapY, 1, 1);
+  FDstFlat.ReSize(NumOut * D, 1, 1);
+  cb := 0;
+  for oy := 0 to MaxOutYPos do
+  begin
+    YBase := oy * TapY;
+    for ox := 0 to MaxOutXPos do
+    begin
+      XBase := ox * TapX;
+      for r := 0 to TapY - 1 do
+      begin
+        RowW := FYMap.W[YBase + r];
+        RowOff := FYMap.Idx[YBase + r] * SrcW;
+        for cc := 0 to TapX - 1 do
+        begin
+          FWeightBuf.FData[cb] := RowW * FXMap.W[XBase + cc];
+          FCornerBuf.FData[cb] := RowOff + FXMap.Idx[XBase + cc];
+          Inc(cb);
+        end;
+      end;
+    end;
+  end;
+  FGatherCL.Gather(Src, FCornerBuf, FWeightBuf, FDstFlat, NumOut, D);
+  Move(FDstFlat.FData[0], FOutput.FData[0], NumOut * D * csNeuralFloatSize);
+end;
+{$ENDIF}
+
+// Four-corner bilinear blend from the cached axis maps. The depth axis is
+// contiguous, so each source column is a Depth-long run and the per-channel
+// blend becomes a Move + Mul + up to 3 AVX MulAdd accumulations. A far-corner
+// weight is exactly zero whenever the sample lands on a source centre (every
+// pixel at factor 1, every s-th pixel at odd s, and the clamped border), so
+// those taps are skipped instead of blending a Depth-long run of zeros.
+procedure TNNetResizeBase.BilinearForward(Src: TNNetVolume);
+var
+  D, ox, oy, XBase, YBase, MaxOutXPos, MaxOutYPos: integer;
+  ix0, ix1, iy0, iy1: integer;
+  wx0, wx1, wy0, wy1: TNeuralFloat;
+  HasX1, HasY1: boolean;
+  OutPtr: TNeuralFloatArrPtr;
+begin
+  D := FOutput.Depth;
+  MaxOutXPos := FOutput.SizeX - 1;
+  MaxOutYPos := FOutput.SizeY - 1;
+  for oy := 0 to MaxOutYPos do
+  begin
+    YBase := oy * 2;
+    iy0 := FYMap.Idx[YBase];
+    iy1 := FYMap.Idx[YBase + 1];
+    wy0 := FYMap.W[YBase];
+    wy1 := FYMap.W[YBase + 1];
+    HasY1 := wy1 <> 0;
+    for ox := 0 to MaxOutXPos do
+    begin
+      XBase := ox * 2;
+      ix0 := FXMap.Idx[XBase];
+      ix1 := FXMap.Idx[XBase + 1];
+      wx0 := FXMap.W[XBase];
+      wx1 := FXMap.W[XBase + 1];
+      HasX1 := wx1 <> 0;
+      OutPtr := FOutput.GetRawPtr(ox, oy);
+      // OutCol := w00*src00; then += w10*src10 + w01*src01 + w11*src11.
+      Move(Src.GetRawPtr(ix0, iy0)^, OutPtr^, D * csNeuralFloatSize);
+      TNNetVolume.Mul(OutPtr, wy0 * wx0, D);
+      if HasX1 then
+        TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(ix1, iy0), wy0 * wx1, D);
+      if HasY1 then
+      begin
+        TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(ix0, iy1), wy1 * wx0, D);
+        if HasX1 then
+          TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(ix1, iy1), wy1 * wx1, D);
+      end;
+    end;
+  end;
+end;
+
+// Transpose of BilinearForward (the exact adjoint): each output pixel's
+// depth-vector gradient is scattered back into its four source corners with the
+// same weights, again as AVX MulAdd accumulations over the Depth-long runs. The
+// zero-weight far corners are skipped exactly as in the forward.
+procedure TNNetResizeBase.BilinearBackward(PrevError: TNNetVolume);
+var
+  D, ox, oy, XBase, YBase, MaxOutXPos, MaxOutYPos: integer;
+  ix0, ix1, iy0, iy1: integer;
+  wx0, wx1, wy0, wy1: TNeuralFloat;
+  HasX1, HasY1: boolean;
+  GradPtr: TNeuralFloatArrPtr;
+begin
+  D := FOutput.Depth;
+  MaxOutXPos := FOutput.SizeX - 1;
+  MaxOutYPos := FOutput.SizeY - 1;
+  for oy := 0 to MaxOutYPos do
+  begin
+    YBase := oy * 2;
+    iy0 := FYMap.Idx[YBase];
+    iy1 := FYMap.Idx[YBase + 1];
+    wy0 := FYMap.W[YBase];
+    wy1 := FYMap.W[YBase + 1];
+    HasY1 := wy1 <> 0;
+    for ox := 0 to MaxOutXPos do
+    begin
+      XBase := ox * 2;
+      ix0 := FXMap.Idx[XBase];
+      ix1 := FXMap.Idx[XBase + 1];
+      wx0 := FXMap.W[XBase];
+      wx1 := FXMap.W[XBase + 1];
+      HasX1 := wx1 <> 0;
+      GradPtr := FOutputError.GetRawPtr(ox, oy);
+      TNNetVolume.MulAdd(PrevError.GetRawPtr(ix0, iy0), GradPtr, wy0 * wx0, D);
+      if HasX1 then
+        TNNetVolume.MulAdd(PrevError.GetRawPtr(ix1, iy0), GradPtr, wy0 * wx1, D);
+      if HasY1 then
+      begin
+        TNNetVolume.MulAdd(PrevError.GetRawPtr(ix0, iy1), GradPtr, wy1 * wx0, D);
+        if HasX1 then
+          TNNetVolume.MulAdd(PrevError.GetRawPtr(ix1, iy1), GradPtr, wy1 * wx1, D);
+      end;
+    end;
+  end;
+end;
+
+// Separable cubic blend from the cached axis maps: for each of the 4 source rows
+// combine its 4 columns and accumulate with the row weight. Each source column
+// is a Depth-long contiguous run, so the whole 4x4 neighbourhood is a Move + 15
+// AVX MulAdd accumulations. Clamped (edge-replicate) indices simply repeat a
+// column.
+procedure TNNetResizeBase.BicubicForward(Src: TNNetVolume);
+var
+  D, ox, oy, r, XBase, YBase, MaxOutXPos, MaxOutYPos: integer;
+  ix, iy: array[0..3] of integer;
+  wx, wy: array[0..3] of TNeuralFloat;
+  OutPtr: TNeuralFloatArrPtr;
+begin
+  D := FOutput.Depth;
+  MaxOutXPos := FOutput.SizeX - 1;
+  MaxOutYPos := FOutput.SizeY - 1;
+  for oy := 0 to MaxOutYPos do
+  begin
+    YBase := oy * 4;
+    for r := 0 to 3 do
+    begin
+      iy[r] := FYMap.Idx[YBase + r];
+      wy[r] := FYMap.W[YBase + r];
+    end;
+    for ox := 0 to MaxOutXPos do
+    begin
+      XBase := ox * 4;
+      ix[0] := FXMap.Idx[XBase];
+      ix[1] := FXMap.Idx[XBase + 1];
+      ix[2] := FXMap.Idx[XBase + 2];
+      ix[3] := FXMap.Idx[XBase + 3];
+      wx[0] := FXMap.W[XBase];
+      wx[1] := FXMap.W[XBase + 1];
+      wx[2] := FXMap.W[XBase + 2];
+      wx[3] := FXMap.W[XBase + 3];
+      OutPtr := FOutput.GetRawPtr(ox, oy);
+      // Initialise the output column from the FIRST (row 0) cubic combination
+      // scaled by wy[0], then accumulate the remaining 3 rows.
+      Move(Src.GetRawPtr(ix[0], iy[0])^, OutPtr^, D * csNeuralFloatSize);
+      TNNetVolume.Mul(OutPtr, wx[0] * wy[0], D);
+      TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(ix[1], iy[0]), wx[1] * wy[0], D);
+      TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(ix[2], iy[0]), wx[2] * wy[0], D);
+      TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(ix[3], iy[0]), wx[3] * wy[0], D);
+      for r := 1 to 3 do
+      begin
+        TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(ix[0], iy[r]), wx[0] * wy[r], D);
+        TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(ix[1], iy[r]), wx[1] * wy[r], D);
+        TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(ix[2], iy[r]), wx[2] * wy[r], D);
+        TNNetVolume.MulAdd(OutPtr, Src.GetRawPtr(ix[3], iy[r]), wx[3] * wy[r], D);
+      end;
+    end;
+  end;
+end;
+
+// Transpose of BicubicForward (the exact adjoint): scatter each output pixel's
+// depth-vector gradient into all 16 source columns weighted by wy[r]*wx[c].
+// Clamped border indices naturally accumulate several taps into the same column.
+procedure TNNetResizeBase.BicubicBackward(PrevError: TNNetVolume);
+var
+  D, ox, oy, r, cc, XBase, YBase, MaxOutXPos, MaxOutYPos: integer;
+  ix, iy: array[0..3] of integer;
+  wx, wy: array[0..3] of TNeuralFloat;
+  GradPtr: TNeuralFloatArrPtr;
+begin
+  D := FOutput.Depth;
+  MaxOutXPos := FOutput.SizeX - 1;
+  MaxOutYPos := FOutput.SizeY - 1;
+  for oy := 0 to MaxOutYPos do
+  begin
+    YBase := oy * 4;
+    for r := 0 to 3 do
+    begin
+      iy[r] := FYMap.Idx[YBase + r];
+      wy[r] := FYMap.W[YBase + r];
+    end;
+    for ox := 0 to MaxOutXPos do
+    begin
+      XBase := ox * 4;
+      ix[0] := FXMap.Idx[XBase];
+      ix[1] := FXMap.Idx[XBase + 1];
+      ix[2] := FXMap.Idx[XBase + 2];
+      ix[3] := FXMap.Idx[XBase + 3];
+      wx[0] := FXMap.W[XBase];
+      wx[1] := FXMap.W[XBase + 1];
+      wx[2] := FXMap.W[XBase + 2];
+      wx[3] := FXMap.W[XBase + 3];
+      GradPtr := FOutputError.GetRawPtr(ox, oy);
+      for r := 0 to 3 do
+        for cc := 0 to 3 do
+          TNNetVolume.MulAdd(PrevError.GetRawPtr(ix[cc], iy[r]),
+            GradPtr, wy[r] * wx[cc], D);
+    end;
+  end;
+end;
+
+const
+  // TNNetAxisMap.Kind: which builder filled the cached axis geometry.
+  csAxisMapBilinearFactor = 1;
+  csAxisMapBicubicFactor  = 2;
+  csAxisMapBilinearSize   = 3;
+  csAxisMapBicubicSize    = 4;
+  csAxisMapNearestSize    = 5;
 
 // Bilinear sampling shared geometry: for output index o on an axis of input
 // size InSize, returns the two source corner indices i0,i1 and the weight w1 of
@@ -55083,14 +55337,6 @@ begin
   if i0 > InSize - 1 then i0 := InSize - 1;
   w1 := ff;
 end;
-
-const
-  // TNNetAxisMap.Kind: which builder filled the cached axis geometry.
-  csAxisMapBilinearFactor = 1;
-  csAxisMapBicubicFactor  = 2;
-  csAxisMapBilinearSize   = 3;
-  csAxisMapBicubicSize    = 4;
-  csAxisMapNearestSize    = 5;
 
 // Fills the cached bilinear geometry of one axis for an INTEGER upsample factor
 // (BilinearMap). The map only depends on the axis sizes, so the per-pixel
@@ -55119,237 +55365,6 @@ begin
   M.OutSize := OutSize;
   M.InSize := InSize;
   M.AlignCorners := 0;
-end;
-
-procedure TNNetBilinearUpsample.Compute();
-var
-  s, OutX, OutY, D, ox, oy: integer;
-  OutXM1, OutYM1, MapBase: integer;
-  ix0, ix1, iy0, iy1: integer;
-  wx0, wx1, wy0, wy1: TNeuralFloat;
-  HasX1, HasY1: boolean;
-  OutPtr: TNeuralFloatArrPtr;
-  PrevOutput: TNNetVolume;
-  StartTime: double;
-begin
-  StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  s := FStruct[0];
-  PrevOutput := FPrevLayer.Output;
-  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
-  OutXM1 := OutX - 1; OutYM1 := OutY - 1;
-  {$IFDEF OpenCL}
-  if WillOpenCL() then
-  begin
-    Inc(FForwardGPUCnt);
-    ComputeOpenCL();
-    FForwardTime := FForwardTime + (Now() - StartTime);
-    exit;
-  end
-  else Inc(FForwardCPUCnt);
-  {$ENDIF}
-  EnsureBilinearFactorMap(FXMap, OutX, PrevOutput.SizeX, s);
-  for oy := 0 to OutYM1 do
-  begin
-    BilinearMap(oy, s, PrevOutput.SizeY, iy0, iy1, wy1);
-    wy0 := 1 - wy1;
-    HasY1 := wy1 <> 0;
-    for ox := 0 to OutXM1 do
-    begin
-      // The X geometry is invariant across rows, so it comes from the cached
-      // per-shape map.
-      MapBase := ox * 2;
-      ix0 := FXMap.Idx[MapBase];
-      ix1 := FXMap.Idx[MapBase + 1];
-      wx0 := FXMap.W[MapBase];
-      wx1 := FXMap.W[MapBase + 1];
-      // Bilinear corner weights computed once per output pixel; the depth axis
-      // is contiguous so each source column is a Depth-long contiguous run and
-      // the per-channel blend becomes an AVX MulAdd accumulation. A far-corner
-      // weight is exactly zero whenever the sample lands on a source centre (all
-      // pixels at s = 1, every s-th pixel at odd s, and the clamped border), so
-      // those taps are skipped instead of blending a Depth-long run of zeros.
-      HasX1 := wx1 <> 0;
-      OutPtr := FOutput.GetRawPtr(ox, oy);
-      // OutCol := w00*src00; then += w10*src10 + w01*src01 + w11*src11.
-      Move(PrevOutput.GetRawPtr(ix0, iy0)^, OutPtr^, D * csNeuralFloatSize);
-      TNNetVolume.Mul(OutPtr, wy0 * wx0, D);
-      if HasX1 then
-        TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ix1, iy0), wy0 * wx1, D);
-      if HasY1 then
-      begin
-        TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ix0, iy1), wy1 * wx0, D);
-        if HasX1 then
-          TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ix1, iy1), wy1 * wx1, D);
-      end;
-    end;
-  end;
-  FForwardTime := FForwardTime + (Now() - StartTime);
-end;
-
-{$IFDEF OpenCL}
-procedure TNNetBilinearUpsample.DisableOpenCL();
-begin
-  inherited DisableOpenCL();
-  FreeAndNil(FGatherCL);
-end;
-
-procedure TNNetBilinearUpsample.EnableOpenCL(DotProductKernel: TNeuralKernel);
-begin
-  FHasOpenCL := true;
-  if not Assigned(FGatherCL) then
-    FGatherCL := TNNetBilinearGatherCL.Create(FNN);
-  if not Assigned(FCornerBuf) then FCornerBuf := TNNetVolume.Create();
-  if not Assigned(FWeightBuf) then FWeightBuf := TNNetVolume.Create();
-  if not Assigned(FDstFlat)   then FDstFlat   := TNNetVolume.Create();
-end;
-
-function TNNetBilinearUpsample.WillOpenCL(): boolean;
-begin
-  Result := Assigned(FGatherCL) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL);
-end;
-
-// Device per-pixel bilinear-gather. The clamped corner indices (BilinearMap, all
-// in-bounds) and the four corner weights are computed on the CPU bit-identically
-// to Compute(); the depth-blend runs on the device. Corner offsets index the
-// SOURCE grid (SrcW = PrevOutput.SizeX); NumOut = OutX*OutY.
-procedure TNNetBilinearUpsample.ComputeOpenCL();
-var
-  s, OutX, OutY, D, ox, oy, SrcW, NumOut, cb: integer;
-  OutXM1, OutYM1: integer;
-  ix0, ix1, iy0, iy1: integer;
-  wx1, wy1: TNeuralFloat;
-  PrevOutput: TNNetVolume;
-begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  s := FStruct[0];
-  PrevOutput := FPrevLayer.Output;
-  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
-  SrcW := PrevOutput.SizeX;
-  OutXM1 := OutX - 1; OutYM1 := OutY - 1;
-  NumOut := OutX * OutY;
-  FCornerBuf.ReSize(NumOut * 4, 1, 1);
-  FWeightBuf.ReSize(NumOut * 4, 1, 1);
-  FDstFlat.ReSize(NumOut * D, 1, 1);
-  for oy := 0 to OutYM1 do
-  begin
-    BilinearMap(oy, s, PrevOutput.SizeY, iy0, iy1, wy1);
-    for ox := 0 to OutXM1 do
-    begin
-      BilinearMap(ox, s, SrcW, ix0, ix1, wx1);
-      cb := (oy * OutX + ox) * 4;
-      FWeightBuf.FData[cb + 0] := (1 - wy1) * (1 - wx1);
-      FWeightBuf.FData[cb + 1] := (1 - wy1) * wx1;
-      FWeightBuf.FData[cb + 2] := wy1 * (1 - wx1);
-      FWeightBuf.FData[cb + 3] := wy1 * wx1;
-      FCornerBuf.FData[cb + 0] := iy0 * SrcW + ix0;
-      FCornerBuf.FData[cb + 1] := iy0 * SrcW + ix1;
-      FCornerBuf.FData[cb + 2] := iy1 * SrcW + ix0;
-      FCornerBuf.FData[cb + 3] := iy1 * SrcW + ix1;
-    end;
-  end;
-  FGatherCL.Gather(PrevOutput, FCornerBuf, FWeightBuf, FDstFlat, NumOut, D);
-  Move(FDstFlat.FData[0], FOutput.FData[0], NumOut * D * csNeuralFloatSize);
-end;
-{$ENDIF}
-
-procedure TNNetBilinearUpsample.Backpropagate();
-var
-  s, OutX, OutY, D, ox, oy: integer;
-  OutXM1, OutYM1, MapBase: integer;
-  ix0, ix1, iy0, iy1: integer;
-  wx0, wx1, wy0, wy1: TNeuralFloat;
-  HasX1, HasY1: boolean;
-  GradPtr: TNeuralFloatArrPtr;
-  PrevError: TNNetVolume;
-  StartTime: double;
-begin
-  StartTime := Now();
-  Inc(FBackPropCallCurrentCnt);
-  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  TestBackPropCallCurrCnt();
-  s := FStruct[0];
-  PrevError := FPrevLayer.OutputError;
-  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
-  OutXM1 := OutX - 1; OutYM1 := OutY - 1;
-  EnsureBilinearFactorMap(FXMap, OutX, FPrevLayer.Output.SizeX, s);
-  for oy := 0 to OutYM1 do
-  begin
-    BilinearMap(oy, s, FPrevLayer.Output.SizeY, iy0, iy1, wy1);
-    wy0 := 1 - wy1;
-    HasY1 := wy1 <> 0;
-    for ox := 0 to OutXM1 do
-    begin
-      // The X geometry is invariant across rows, so it comes from the cached
-      // per-shape map.
-      MapBase := ox * 2;
-      ix0 := FXMap.Idx[MapBase];
-      ix1 := FXMap.Idx[MapBase + 1];
-      wx0 := FXMap.W[MapBase];
-      wx1 := FXMap.W[MapBase + 1];
-      // Transpose of the forward four-corner weighted read: each output pixel's
-      // depth vector is the same Depth-long contiguous run as the forward source
-      // columns, so the per-channel scatter into the four source corners becomes
-      // an AVX MulAdd accumulation (prevError += grad * cornerWeight). The
-      // zero-weight far corners are skipped exactly as in Compute.
-      HasX1 := wx1 <> 0;
-      GradPtr := FOutputError.GetRawPtr(ox, oy);
-      TNNetVolume.MulAdd(PrevError.GetRawPtr(ix0, iy0), GradPtr, wy0 * wx0, D);
-      if HasX1 then
-        TNNetVolume.MulAdd(PrevError.GetRawPtr(ix1, iy0), GradPtr, wy0 * wx1, D);
-      if HasY1 then
-      begin
-        TNNetVolume.MulAdd(PrevError.GetRawPtr(ix0, iy1), GradPtr, wy1 * wx0, D);
-        if HasX1 then
-          TNNetVolume.MulAdd(PrevError.GetRawPtr(ix1, iy1), GradPtr, wy1 * wx1, D);
-      end;
-    end;
-  end;
-  FBackwardTime := FBackwardTime + (Now() - StartTime);
-  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
-end;
-
-{ TNNetBicubicUpsample }
-constructor TNNetBicubicUpsample.Create(pFactor, pAlignCorners: integer);
-begin
-  inherited Create();
-  if pFactor < 1 then pFactor := 1;
-  FStruct[0] := pFactor;
-  if pAlignCorners <> 0 then FStruct[1] := 1 else FStruct[1] := 0;
-end;
-
-{$IFDEF OpenCL}
-destructor TNNetBicubicUpsample.Destroy();
-begin
-  if Assigned(FGatherCL)     then FreeAndNil(FGatherCL);
-  if Assigned(FScatterCL)    then FreeAndNil(FScatterCL);
-  if Assigned(FCornerBuf)    then FreeAndNil(FCornerBuf);
-  if Assigned(FWeightBuf)    then FreeAndNil(FWeightBuf);
-  if Assigned(FDstFlat)      then FreeAndNil(FDstFlat);
-  if Assigned(FRowOffBuf)    then FreeAndNil(FRowOffBuf);
-  if Assigned(FOutIdxBuf)    then FreeAndNil(FOutIdxBuf);
-  if Assigned(FEntWeightBuf) then FreeAndNil(FEntWeightBuf);
-  if Assigned(FBackErrFlat)  then FreeAndNil(FBackErrFlat);
-  if Assigned(FBackOutFlat)  then FreeAndNil(FBackOutFlat);
-  inherited Destroy();
-end;
-{$ENDIF}
-
-procedure TNNetBicubicUpsample.SetPrevLayer(pPrevLayer: TNNetLayer);
-var
-  s: integer;
-begin
-  inherited SetPrevLayer(pPrevLayer);
-  s := FStruct[0];
-  if s < 1 then s := 1;
-  FOutput.ReSize(pPrevLayer.Output.SizeX * s,
-                 pPrevLayer.Output.SizeY * s,
-                 pPrevLayer.Output.Depth);
-  SetOutputErrorSize(FOutput);
-  {$IFDEF OpenCL}
-  FShouldOpenCL := false; // bandwidth-bound: GPU < CPU at every size (OpenCLForwardBenchmark ~0.72x), pin to CPU. Old verdict: Int64(FOutput.SizeX) * FOutput.SizeY * FOutput.Depth >= cNeuralOpenCLMinWork
-  {$ENDIF}
 end;
 
 // Keys cubic-convolution kernel with A=-0.75 (PyTorch bicubic). For fractional
@@ -55430,345 +55445,6 @@ begin
   M.AlignCorners := AlignCorners;
 end;
 
-procedure TNNetBicubicUpsample.Compute();
-var
-  s, OutX, OutY, D, ox, oy, ac, r: integer;
-  OutXM1, OutYM1, MapBase: integer;
-  iy: array[0..3] of integer;
-  wx0, wx1, wx2, wx3, wy0, wy1, wy2, wy3: TNeuralFloat;
-  wy: array[0..3] of TNeuralFloat;
-  ixc: array[0..3] of integer;
-  OutPtr: TNeuralFloatArrPtr;
-  PrevOutput: TNNetVolume;
-  StartTime: double;
-begin
-  StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  s := FStruct[0];
-  ac := FStruct[1];
-  PrevOutput := FPrevLayer.Output;
-  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
-  {$IFDEF OpenCL}
-  if WillOpenCL() then
-  begin
-    Inc(FForwardGPUCnt);
-    ComputeOpenCL();
-    FForwardTime := FForwardTime + (Now() - StartTime);
-    exit;
-  end
-  else Inc(FForwardCPUCnt);
-  {$ENDIF}
-  OutYM1 := OutY - 1;
-  OutXM1 := OutX - 1;
-  EnsureBicubicFactorMap(FXMap, OutX, PrevOutput.SizeX, s, ac);
-  for oy := 0 to OutYM1 do
-  begin
-    BicubicMap(oy, s, PrevOutput.SizeY, OutY, ac,
-      iy[0], iy[1], iy[2], iy[3], wy0, wy1, wy2, wy3);
-    wy[0] := wy0; wy[1] := wy1; wy[2] := wy2; wy[3] := wy3;
-    for ox := 0 to OutXM1 do
-    begin
-      // The X geometry is invariant across rows, so it comes from the cached
-      // per-shape map.
-      MapBase := ox * 4;
-      ixc[0] := FXMap.Idx[MapBase];
-      ixc[1] := FXMap.Idx[MapBase + 1];
-      ixc[2] := FXMap.Idx[MapBase + 2];
-      ixc[3] := FXMap.Idx[MapBase + 3];
-      wx0 := FXMap.W[MapBase];
-      wx1 := FXMap.W[MapBase + 1];
-      wx2 := FXMap.W[MapBase + 2];
-      wx3 := FXMap.W[MapBase + 3];
-      // Separable cubic: for each of the 4 source rows, blend its 4 columns into
-      // a temporary then accumulate with the row weight. The depth axis is
-      // contiguous, so each source column is a Depth-long run and the per-channel
-      // blend becomes a Move + 3x MulAdd over Depth (AVX MulAdd accumulation).
-      OutPtr := FOutput.GetRawPtr(ox, oy);
-      // Initialise the output column from the FIRST (row 0) cubic combination
-      // scaled by wy[0], then accumulate the remaining 3 rows.
-      Move(PrevOutput.GetRawPtr(ixc[0], iy[0])^, OutPtr^, D * csNeuralFloatSize);
-      TNNetVolume.Mul(OutPtr, wx0 * wy[0], D);
-      TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ixc[1], iy[0]), wx1 * wy[0], D);
-      TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ixc[2], iy[0]), wx2 * wy[0], D);
-      TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ixc[3], iy[0]), wx3 * wy[0], D);
-      for r := 1 to 3 do
-      begin
-        TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ixc[0], iy[r]), wx0 * wy[r], D);
-        TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ixc[1], iy[r]), wx1 * wy[r], D);
-        TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ixc[2], iy[r]), wx2 * wy[r], D);
-        TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ixc[3], iy[r]), wx3 * wy[r], D);
-      end;
-    end;
-  end;
-  FForwardTime := FForwardTime + (Now() - StartTime);
-end;
-
-{$IFDEF OpenCL}
-procedure TNNetBicubicUpsample.DisableOpenCL();
-begin
-  inherited DisableOpenCL();
-  FreeAndNil(FGatherCL);
-  FreeAndNil(FScatterCL);
-end;
-
-procedure TNNetBicubicUpsample.EnableOpenCL(DotProductKernel: TNeuralKernel);
-begin
-  FHasOpenCL := true;
-  if not Assigned(FGatherCL) then
-    FGatherCL := TNNetBicubicGatherCL.Create(FNN);
-  if not Assigned(FScatterCL) then
-    FScatterCL := TNNetBicubicScatterCL.Create(FNN);
-  if not Assigned(FCornerBuf)    then FCornerBuf    := TNNetVolume.Create();
-  if not Assigned(FWeightBuf)    then FWeightBuf    := TNNetVolume.Create();
-  if not Assigned(FDstFlat)      then FDstFlat      := TNNetVolume.Create();
-  if not Assigned(FRowOffBuf)    then FRowOffBuf    := TNNetVolume.Create();
-  if not Assigned(FOutIdxBuf)    then FOutIdxBuf    := TNNetVolume.Create();
-  if not Assigned(FEntWeightBuf) then FEntWeightBuf := TNNetVolume.Create();
-  if not Assigned(FBackErrFlat)  then FBackErrFlat  := TNNetVolume.Create();
-  if not Assigned(FBackOutFlat)  then FBackOutFlat  := TNNetVolume.Create();
-end;
-
-function TNNetBicubicUpsample.WillOpenCL(): boolean;
-begin
-  Result := Assigned(FGatherCL) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL);
-end;
-
-// Device per-pixel separable bicubic-gather. The 16 clamped corner indices
-// (BicubicMap, all in-bounds via edge replicate) and the 16 separable cubic
-// weights (wy[r]*wx[c]) are computed on the CPU bit-identically to Compute();
-// the depth-blend runs on the device. Corner offsets index the SOURCE grid
-// (SrcW = PrevOutput.SizeX); NumOut = OutX*OutY.
-procedure TNNetBicubicUpsample.ComputeOpenCL();
-var
-  s, OutX, OutY, D, ox, oy, ac, SrcW, NumOut, cb, r, cc: integer;
-  OutXM1, OutYM1: integer;
-  iy, ix: array[0..3] of integer;
-  wy, wx: array[0..3] of TNeuralFloat;
-  PrevOutput: TNNetVolume;
-begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  s := FStruct[0];
-  ac := FStruct[1];
-  PrevOutput := FPrevLayer.Output;
-  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
-  SrcW := PrevOutput.SizeX;
-  NumOut := OutX * OutY;
-  FCornerBuf.ReSize(NumOut * 16, 1, 1);
-  FWeightBuf.ReSize(NumOut * 16, 1, 1);
-  FDstFlat.ReSize(NumOut * D, 1, 1);
-  OutYM1 := OutY - 1;
-  OutXM1 := OutX - 1;
-  for oy := 0 to OutYM1 do
-  begin
-    BicubicMap(oy, s, PrevOutput.SizeY, OutY, ac,
-      iy[0], iy[1], iy[2], iy[3], wy[0], wy[1], wy[2], wy[3]);
-    for ox := 0 to OutXM1 do
-    begin
-      BicubicMap(ox, s, SrcW, OutX, ac,
-        ix[0], ix[1], ix[2], ix[3], wx[0], wx[1], wx[2], wx[3]);
-      cb := (oy * OutX + ox) * 16;
-      for r := 0 to 3 do
-        for cc := 0 to 3 do
-        begin
-          FWeightBuf.FData[cb + r * 4 + cc] := wy[r] * wx[cc];
-          FCornerBuf.FData[cb + r * 4 + cc] := iy[r] * SrcW + ix[cc];
-        end;
-    end;
-  end;
-  FGatherCL.Gather(PrevOutput, FCornerBuf, FWeightBuf, FDstFlat, NumOut, D);
-  Move(FDstFlat.FData[0], FOutput.FData[0], NumOut * D * csNeuralFloatSize);
-end;
-{$ENDIF}
-
-procedure TNNetBicubicUpsample.Backpropagate();
-var
-  s, OutX, OutY, D, ox, oy, ac, r: integer;
-  OutXM1, OutYM1, MapBase: integer;
-  iy: array[0..3] of integer;
-  wx: array[0..3] of TNeuralFloat;
-  wy: array[0..3] of TNeuralFloat;
-  ixc: array[0..3] of integer;
-  GradPtr: TNeuralFloatArrPtr;
-  PrevError: TNNetVolume;
-  StartTime: double;
-  cc: integer;
-begin
-  StartTime := Now();
-  Inc(FBackPropCallCurrentCnt);
-  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  TestBackPropCallCurrCnt();
-  {$IFDEF OpenCL}
-  if WillOpenCL() then
-  begin
-    BackpropagateOpenCL();
-    FBackwardTime := FBackwardTime + (Now() - StartTime);
-    if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
-    exit;
-  end;
-  {$ENDIF}
-  s := FStruct[0];
-  ac := FStruct[1];
-  PrevError := FPrevLayer.OutputError;
-  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
-  OutYM1 := OutY - 1;
-  OutXM1 := OutX - 1;
-  EnsureBicubicFactorMap(FXMap, OutX, FPrevLayer.Output.SizeX, s, ac);
-  for oy := 0 to OutYM1 do
-  begin
-    BicubicMap(oy, s, FPrevLayer.Output.SizeY, OutY, ac,
-      iy[0], iy[1], iy[2], iy[3], wy[0], wy[1], wy[2], wy[3]);
-    for ox := 0 to OutXM1 do
-    begin
-      // The X geometry is invariant across rows, so it comes from the cached
-      // per-shape map.
-      MapBase := ox * 4;
-      ixc[0] := FXMap.Idx[MapBase];
-      ixc[1] := FXMap.Idx[MapBase + 1];
-      ixc[2] := FXMap.Idx[MapBase + 2];
-      ixc[3] := FXMap.Idx[MapBase + 3];
-      wx[0] := FXMap.W[MapBase];
-      wx[1] := FXMap.W[MapBase + 1];
-      wx[2] := FXMap.W[MapBase + 2];
-      wx[3] := FXMap.W[MapBase + 3];
-      // Transpose of the forward 4x4 weighted read: scatter the output pixel's
-      // depth-vector grad into all 16 source columns weighted by wy[r]*wx[c].
-      // Each source column is the same Depth-long contiguous run, so the scatter
-      // is an AVX MulAdd accumulation (prevError += grad * (wy*wx)). Clamped
-      // border indices naturally accumulate multiple taps into the same column.
-      GradPtr := FOutputError.GetRawPtr(ox, oy);
-      for r := 0 to 3 do
-        for cc := 0 to 3 do
-          TNNetVolume.MulAdd(PrevError.GetRawPtr(ixc[cc], iy[r]),
-            GradPtr, wy[r] * wx[cc], D);
-    end;
-  end;
-  FBackwardTime := FBackwardTime + (Now() - StartTime);
-  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
-end;
-
-{$IFDEF OpenCL}
-// Device transpose of ComputeOpenCL's bicubic gather. The forward reads a 4x4
-// clamped source neighbourhood per output pixel; the backward scatters each
-// output pixel's gradient into those same 16 corners with the same wy[r]*wx[c]
-// weights. Border clamping makes several output pixels (and even several taps
-// of one output pixel) land on the SAME source pixel, so a per-output scatter
-// would race. To keep the atomic-free gather style we build a CSR contribution
-// table per SOURCE pixel on the CPU (offsets + flat (outpix,weight) entries,
-// the SAME wy*wx weights and clamped indices as the scalar backward) and let
-// the device gather every landing contribution per (source pixel, depth). The
-// result is ADDED into FPrevLayer.OutputError (accumulate semantics).
-procedure TNNetBicubicUpsample.BackpropagateOpenCL();
-var
-  s, OutX, OutY, D, ox, oy, ac, r, cc: integer;
-  SrcW, SrcH, NumSrc, NumOut, NumEnt, srcpix, e: integer;
-  OutXM1, OutYM1, NumSrcM1: integer;
-  iy, ix: array[0..3] of integer;
-  wy, wx: array[0..3] of TNeuralFloat;
-  PrevOutput: TNNetVolume;
-begin
-  s := FStruct[0];
-  ac := FStruct[1];
-  PrevOutput := FPrevLayer.Output;
-  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
-  SrcW := PrevOutput.SizeX; SrcH := PrevOutput.SizeY;
-  NumSrc := SrcW * SrcH;
-  NumOut := OutX * OutY;
-  NumEnt := NumOut * 16; // every output pixel emits exactly 16 corner taps.
-  OutYM1 := OutY - 1;
-  OutXM1 := OutX - 1;
-  NumSrcM1 := NumSrc - 1;
-  FRowOffBuf.ReSize(NumSrc + 1, 1, 1);
-  FOutIdxBuf.ReSize(NumEnt, 1, 1);
-  FEntWeightBuf.ReSize(NumEnt, 1, 1);
-  FBackErrFlat.ReSize(NumOut * D, 1, 1);
-  FBackOutFlat.ReSize(NumSrc * D, 1, 1);
-  // Output error flattened to the [outpix*D + d] raw order the device indexes.
-  Move(FOutputError.FData[0], FBackErrFlat.FData[0],
-    NumOut * D * csNeuralFloatSize);
-  // Pass 1: count entries per source pixel (byte-identical clamped indices).
-  if Length(FCountsBuf) <> NumSrc then SetLength(FCountsBuf, NumSrc);
-  FillDWord(FCountsBuf[0], NumSrc, 0);   // #13 (integer counts)
-  for oy := 0 to OutYM1 do
-  begin
-    BicubicMap(oy, s, SrcH, OutY, ac,
-      iy[0], iy[1], iy[2], iy[3], wy[0], wy[1], wy[2], wy[3]);
-    for ox := 0 to OutXM1 do
-    begin
-      BicubicMap(ox, s, SrcW, OutX, ac,
-        ix[0], ix[1], ix[2], ix[3], wx[0], wx[1], wx[2], wx[3]);
-      for r := 0 to 3 do
-        for cc := 0 to 3 do
-          Inc(FCountsBuf[iy[r] * SrcW + ix[cc]]);
-    end;
-  end;
-  // Prefix sum -> CSR row offsets; seed per-row write cursors.
-  if Length(FCursorBuf) <> NumSrc then SetLength(FCursorBuf, NumSrc);
-  e := 0;
-  for srcpix := 0 to NumSrcM1 do
-  begin
-    FRowOffBuf.FData[srcpix] := e;
-    FCursorBuf[srcpix] := e;
-    e := e + FCountsBuf[srcpix];
-  end;
-  FRowOffBuf.FData[NumSrc] := e;
-  // Pass 2: scatter (outpix, weight) entries into their source-pixel rows.
-  for oy := 0 to OutYM1 do
-  begin
-    BicubicMap(oy, s, SrcH, OutY, ac,
-      iy[0], iy[1], iy[2], iy[3], wy[0], wy[1], wy[2], wy[3]);
-    for ox := 0 to OutXM1 do
-    begin
-      BicubicMap(ox, s, SrcW, OutX, ac,
-        ix[0], ix[1], ix[2], ix[3], wx[0], wx[1], wx[2], wx[3]);
-      for r := 0 to 3 do
-        for cc := 0 to 3 do
-        begin
-          srcpix := iy[r] * SrcW + ix[cc];
-          FOutIdxBuf.FData[FCursorBuf[srcpix]] := oy * OutX + ox;
-          FEntWeightBuf.FData[FCursorBuf[srcpix]] := wy[r] * wx[cc];
-          Inc(FCursorBuf[srcpix]);
-        end;
-    end;
-  end;
-  FScatterCL.Scatter(FBackErrFlat, FRowOffBuf, FOutIdxBuf, FEntWeightBuf,
-    FBackOutFlat, NumSrc, D);
-  FPrevLayer.OutputError.Add(FBackOutFlat);
-end;
-{$ENDIF}
-
-{ TNNetBilinearResize }
-constructor TNNetBilinearResize.Create(pOutW, pOutH, pAlignCorners: integer);
-begin
-  inherited Create();
-  if pOutW < 1 then pOutW := 1;
-  if pOutH < 1 then pOutH := 1;
-  FStruct[0] := pOutW;
-  FStruct[1] := pOutH;
-  if pAlignCorners <> 0 then FStruct[2] := 1 else FStruct[2] := 0;
-end;
-
-destructor TNNetBilinearResize.Destroy();
-begin
-  {$IFDEF OpenCL}
-  if Assigned(FGatherCL)  then FreeAndNil(FGatherCL);
-  if Assigned(FCornerBuf) then FreeAndNil(FCornerBuf);
-  if Assigned(FWeightBuf) then FreeAndNil(FWeightBuf);
-  if Assigned(FDstFlat)   then FreeAndNil(FDstFlat);
-  {$ENDIF}
-  inherited Destroy();
-end;
-
-procedure TNNetBilinearResize.SetPrevLayer(pPrevLayer: TNNetLayer);
-begin
-  inherited SetPrevLayer(pPrevLayer);
-  FOutput.ReSize(FStruct[0], FStruct[1], pPrevLayer.Output.Depth);
-  SetOutputErrorSize(FOutput);
-  {$IFDEF OpenCL}
-  FShouldOpenCL := (Int64(FOutput.SizeX) * FOutput.SizeY * FOutput.Depth >= cNeuralOpenCLMinWork);
-  {$ENDIF}
-end;
-
 // Resize sampling geometry: for output index o on an axis of input size InSize
 // resized to OutSize, returns the two source corner indices i0,i1 and the FAR
 // (i1) corner weight w1 (near corner i0 weight is 1-w1).
@@ -55824,204 +55500,6 @@ begin
   M.AlignCorners := AlignCorners;
 end;
 
-procedure TNNetBilinearResize.Compute();
-var
-  OutX, OutY, D, InX, InY, AC, ox, oy, c: integer;
-  OutXM1, OutYM1, DM1, MapBase: integer;
-  ix0, ix1, iy0, iy1: integer;
-  wx0, wx1, wy0, wy1, w00, w10, w01, w11: TNeuralFloat;
-  OutPtr: TNeuralFloatArrPtr;
-  StartTime: double;
-begin
-  StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
-  InX := FPrevLayer.Output.SizeX; InY := FPrevLayer.Output.SizeY;
-  AC := FStruct[2];
-  OutXM1 := OutX - 1; OutYM1 := OutY - 1; DM1 := D - 1;
-  {$IFDEF OpenCL}
-  if WillOpenCL() then
-  begin
-    Inc(FForwardGPUCnt);
-    ComputeOpenCL();
-    FForwardTime := FForwardTime + (Now() - StartTime);
-    exit;
-  end
-  else Inc(FForwardCPUCnt);
-  {$ENDIF}
-  EnsureBilinearSizeMap(FXMap, OutX, InX, AC);
-  for oy := 0 to OutYM1 do
-  begin
-    BilinearResizeMap(oy, OutY, InY, AC, iy0, iy1, wy1);
-    wy0 := 1 - wy1;
-    for ox := 0 to OutXM1 do
-    begin
-      // The X geometry is invariant across rows, so it comes from the cached
-      // per-shape map.
-      MapBase := ox * 2;
-      ix0 := FXMap.Idx[MapBase];
-      ix1 := FXMap.Idx[MapBase + 1];
-      wx0 := FXMap.W[MapBase];
-      wx1 := FXMap.W[MapBase + 1];
-      // Corner weights computed once per output pixel; the depth axis is
-      // contiguous so each source column is a Depth-long run and the blend is
-      // Move + Mul + 3x MulAdd (mirrors TNNetBilinearUpsample.Compute).
-      w00 := wy0 * wx0;
-      w10 := wy0 * wx1;
-      w01 := wy1 * wx0;
-      w11 := wy1 * wx1;
-      OutPtr := FOutput.GetRawPtr(ox, oy);
-      Move(FPrevLayer.FOutput.GetRawPtr(ix0, iy0)^, OutPtr^, D * csNeuralFloatSize);
-      TNNetVolume.Mul(OutPtr, w00, D);
-      TNNetVolume.MulAdd(OutPtr, FPrevLayer.FOutput.GetRawPtr(ix1, iy0), w10, D);
-      TNNetVolume.MulAdd(OutPtr, FPrevLayer.FOutput.GetRawPtr(ix0, iy1), w01, D);
-      TNNetVolume.MulAdd(OutPtr, FPrevLayer.FOutput.GetRawPtr(ix1, iy1), w11, D);
-    end;
-  end;
-  FForwardTime := FForwardTime + (Now() - StartTime);
-end;
-
-{$IFDEF OpenCL}
-procedure TNNetBilinearResize.DisableOpenCL();
-begin
-  inherited DisableOpenCL();
-  FreeAndNil(FGatherCL);
-end;
-
-procedure TNNetBilinearResize.EnableOpenCL(DotProductKernel: TNeuralKernel);
-begin
-  FHasOpenCL := true;
-  if not Assigned(FGatherCL) then
-    FGatherCL := TNNetBilinearGatherCL.Create(FNN);
-  if not Assigned(FCornerBuf) then FCornerBuf := TNNetVolume.Create();
-  if not Assigned(FWeightBuf) then FWeightBuf := TNNetVolume.Create();
-  if not Assigned(FDstFlat)   then FDstFlat   := TNNetVolume.Create();
-end;
-
-function TNNetBilinearResize.WillOpenCL(): boolean;
-begin
-  Result := Assigned(FGatherCL) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL);
-end;
-
-// Device per-pixel bilinear-gather (reuses TNNetBilinearGatherCL, the same kernel
-// driving TNNetBilinearUpsample). The clamped corner indices (BilinearResizeMap,
-// all in-bounds) and the four corner weights are computed on the CPU bit-
-// identically to Compute(); the depth-blend runs on the device. Corner offsets
-// index the SOURCE grid (SrcW = PrevOutput.SizeX); NumOut = OutX*OutY.
-procedure TNNetBilinearResize.ComputeOpenCL();
-var
-  OutX, OutY, D, InX, InY, AC, ox, oy, SrcW, NumOut, cb: integer;
-  OutXM1, OutYM1: integer;
-  ix0, ix1, iy0, iy1: integer;
-  wx1, wy1: TNeuralFloat;
-  PrevOutput: TNNetVolume;
-begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  PrevOutput := FPrevLayer.Output;
-  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
-  InX := PrevOutput.SizeX; InY := PrevOutput.SizeY;
-  SrcW := InX;
-  AC := FStruct[2];
-  OutXM1 := OutX - 1; OutYM1 := OutY - 1;
-  NumOut := OutX * OutY;
-  FCornerBuf.ReSize(NumOut * 4, 1, 1);
-  FWeightBuf.ReSize(NumOut * 4, 1, 1);
-  FDstFlat.ReSize(NumOut * D, 1, 1);
-  for oy := 0 to OutYM1 do
-  begin
-    BilinearResizeMap(oy, OutY, InY, AC, iy0, iy1, wy1);
-    for ox := 0 to OutXM1 do
-    begin
-      BilinearResizeMap(ox, OutX, InX, AC, ix0, ix1, wx1);
-      cb := (oy * OutX + ox) * 4;
-      FWeightBuf.FData[cb + 0] := (1 - wy1) * (1 - wx1);
-      FWeightBuf.FData[cb + 1] := (1 - wy1) * wx1;
-      FWeightBuf.FData[cb + 2] := wy1 * (1 - wx1);
-      FWeightBuf.FData[cb + 3] := wy1 * wx1;
-      FCornerBuf.FData[cb + 0] := iy0 * SrcW + ix0;
-      FCornerBuf.FData[cb + 1] := iy0 * SrcW + ix1;
-      FCornerBuf.FData[cb + 2] := iy1 * SrcW + ix0;
-      FCornerBuf.FData[cb + 3] := iy1 * SrcW + ix1;
-    end;
-  end;
-  FGatherCL.Gather(PrevOutput, FCornerBuf, FWeightBuf, FDstFlat, NumOut, D);
-  Move(FDstFlat.FData[0], FOutput.FData[0], NumOut * D * csNeuralFloatSize);
-end;
-{$ENDIF}
-
-procedure TNNetBilinearResize.Backpropagate();
-var
-  OutX, OutY, D, InX, InY, AC, ox, oy: integer;
-  OutXM1, OutYM1, DM1, MapBase: integer;
-  ix0, ix1, iy0, iy1: integer;
-  wx0, wx1, wy0, wy1, w00, w10, w01, w11: TNeuralFloat;
-  GradPtr: TNeuralFloatArrPtr;
-  StartTime: double;
-begin
-  StartTime := Now();
-  Inc(FBackPropCallCurrentCnt);
-  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  TestBackPropCallCurrCnt();
-  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
-  InX := FPrevLayer.Output.SizeX; InY := FPrevLayer.Output.SizeY;
-  AC := FStruct[2];
-  OutXM1 := OutX - 1; OutYM1 := OutY - 1; DM1 := D - 1;
-  EnsureBilinearSizeMap(FXMap, OutX, InX, AC);
-  for oy := 0 to OutYM1 do
-  begin
-    BilinearResizeMap(oy, OutY, InY, AC, iy0, iy1, wy1);
-    wy0 := 1 - wy1;
-    for ox := 0 to OutXM1 do
-    begin
-      // The X geometry is invariant across rows, so it comes from the cached
-      // per-shape map.
-      MapBase := ox * 2;
-      ix0 := FXMap.Idx[MapBase];
-      ix1 := FXMap.Idx[MapBase + 1];
-      wx0 := FXMap.W[MapBase];
-      wx1 := FXMap.W[MapBase + 1];
-      // Transpose of the forward four-corner blend: corner weights once per
-      // pixel, then scatter the depth-contiguous gradient run with 4x MulAdd
-      // (mirrors TNNetBilinearUpsample.Backpropagate).
-      w00 := wy0 * wx0;
-      w10 := wy0 * wx1;
-      w01 := wy1 * wx0;
-      w11 := wy1 * wx1;
-      GradPtr := FOutputError.GetRawPtr(ox, oy);
-      TNNetVolume.MulAdd(FPrevLayer.FOutputError.GetRawPtr(ix0, iy0), GradPtr, w00, D);
-      TNNetVolume.MulAdd(FPrevLayer.FOutputError.GetRawPtr(ix1, iy0), GradPtr, w10, D);
-      TNNetVolume.MulAdd(FPrevLayer.FOutputError.GetRawPtr(ix0, iy1), GradPtr, w01, D);
-      TNNetVolume.MulAdd(FPrevLayer.FOutputError.GetRawPtr(ix1, iy1), GradPtr, w11, D);
-    end;
-  end;
-  FBackwardTime := FBackwardTime + (Now() - StartTime);
-  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
-end;
-
-{ TNNetResize2D }
-constructor TNNetResize2D.Create(pOutW, pOutH, pMode, pAlignCorners: integer);
-begin
-  inherited Create();
-  if pOutW < 1 then pOutW := 1;
-  if pOutH < 1 then pOutH := 1;
-  if (pMode < 0) or (pMode > 2) then pMode := 1;
-  FStruct[0] := pOutW;
-  FStruct[1] := pOutH;
-  FStruct[2] := pMode;
-  if pAlignCorners <> 0 then FStruct[3] := 1 else FStruct[3] := 0;
-end;
-
-procedure TNNetResize2D.SetPrevLayer(pPrevLayer: TNNetLayer);
-begin
-  inherited SetPrevLayer(pPrevLayer);
-  FOutput.ReSize(FStruct[0], FStruct[1], pPrevLayer.Output.Depth);
-  SetOutputErrorSize(FOutput);
-  {$IFDEF OpenCL}
-  FShouldOpenCL := false; // bandwidth-bound: GPU < CPU at every size (OpenCLForwardBenchmark ~0.37x), pin to CPU. Old verdict: Int64(FOutput.SizeX) * FOutput.SizeY * FOutput.Depth >= cNeuralOpenCLMinWork
-  {$ENDIF}
-end;
-
 // Nearest-neighbour source index along one axis (PyTorch convention:
 // src = o*InSize/OutSize, floored, clamped). align_corners is ignored for
 // nearest (matching torch).
@@ -56030,6 +55508,24 @@ begin
   Result := Trunc(o * (InSize / OutSize));
   if Result > InSize - 1 then Result := InSize - 1;
   if Result < 0 then Result := 0;
+end;
+
+// Fills the cached nearest-neighbour geometry of one axis (ResizeNearestIdx),
+// built once per shape instead of once per output row (rule #27).
+procedure EnsureNearestSizeMap(var M: TNNetAxisMap; OutSize, InSize: integer);
+var
+  o: integer;
+begin
+  if (M.Kind = csAxisMapNearestSize) and (M.OutSize = OutSize) and
+     (M.InSize = InSize) then exit;
+  SetLength(M.Idx, OutSize);
+  SetLength(M.W, 0);
+  for o := 0 to OutSize - 1 do M.Idx[o] := ResizeNearestIdx(o, OutSize, InSize);
+  M.TapCnt := 1;
+  M.Kind := csAxisMapNearestSize;
+  M.OutSize := OutSize;
+  M.InSize := InSize;
+  M.AlignCorners := 0;
 end;
 
 // Bicubic source geometry along one axis for an ABSOLUTE target (size based, not
@@ -56065,24 +55561,6 @@ begin
   i3 := Clamp(ib + 2, InSize);
 end;
 
-// Fills the cached nearest-neighbour geometry of one axis (ResizeNearestIdx),
-// built once per shape instead of once per output row (rule #27).
-procedure EnsureNearestSizeMap(var M: TNNetAxisMap; OutSize, InSize: integer);
-var
-  o: integer;
-begin
-  if (M.Kind = csAxisMapNearestSize) and (M.OutSize = OutSize) and
-     (M.InSize = InSize) then exit;
-  SetLength(M.Idx, OutSize);
-  SetLength(M.W, 0);
-  for o := 0 to OutSize - 1 do M.Idx[o] := ResizeNearestIdx(o, OutSize, InSize);
-  M.TapCnt := 1;
-  M.Kind := csAxisMapNearestSize;
-  M.OutSize := OutSize;
-  M.InSize := InSize;
-  M.AlignCorners := 0;
-end;
-
 // Fills the cached bicubic geometry of one axis for an ABSOLUTE target size
 // (BicubicResizeMap), built once per shape instead of once per output row
 // (rule #27).
@@ -56109,262 +55587,473 @@ begin
   M.AlignCorners := AlignCorners;
 end;
 
+{ TNNetBilinearUpsample }
+constructor TNNetBilinearUpsample.Create(pFactor: integer);
+begin
+  inherited Create();
+  if pFactor < 1 then pFactor := 1;
+  FStruct[0] := pFactor;
+end;
+
+procedure TNNetBilinearUpsample.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  s: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  s := FStruct[0];
+  if s < 1 then s := 1;
+  FOutput.ReSize(pPrevLayer.Output.SizeX * s,
+                 pPrevLayer.Output.SizeY * s,
+                 pPrevLayer.Output.Depth);
+  SetOutputErrorSize(FOutput);
+  {$IFDEF OpenCL}
+  FShouldOpenCL := false; // bandwidth-bound: GPU < CPU at every size (OpenCLForwardBenchmark ~0.37x), pin to CPU. Old verdict: Int64(FOutput.SizeX) * FOutput.SizeY * FOutput.Depth >= cNeuralOpenCLMinWork
+  {$ENDIF}
+end;
+
+procedure TNNetBilinearUpsample.Compute();
+var
+  s: integer;
+  PrevOutput: TNNetVolume;
+  StartTime: double;
+begin
+  StartTime := Now();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  s := FStruct[0];
+  PrevOutput := FPrevLayer.Output;
+  EnsureBilinearFactorMap(FXMap, FOutput.SizeX, PrevOutput.SizeX, s);
+  EnsureBilinearFactorMap(FYMap, FOutput.SizeY, PrevOutput.SizeY, s);
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    GatherOpenCL(PrevOutput);
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end
+  else Inc(FForwardCPUCnt);
+  {$ENDIF}
+  BilinearForward(PrevOutput);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{$IFDEF OpenCL}
+procedure TNNetBilinearUpsample.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  FHasOpenCL := true;
+  if not Assigned(FGatherCL) then
+    FGatherCL := TNNetBilinearGatherCL.Create(FNN);
+  CreateGatherBuffers();
+end;
+{$ENDIF}
+
+procedure TNNetBilinearUpsample.Backpropagate();
+var
+  s: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  s := FStruct[0];
+  EnsureBilinearFactorMap(FXMap, FOutput.SizeX, FPrevLayer.Output.SizeX, s);
+  EnsureBilinearFactorMap(FYMap, FOutput.SizeY, FPrevLayer.Output.SizeY, s);
+  BilinearBackward(FPrevLayer.OutputError);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetBicubicUpsample }
+constructor TNNetBicubicUpsample.Create(pFactor, pAlignCorners: integer);
+begin
+  inherited Create();
+  if pFactor < 1 then pFactor := 1;
+  FStruct[0] := pFactor;
+  if pAlignCorners <> 0 then FStruct[1] := 1 else FStruct[1] := 0;
+end;
+
+{$IFDEF OpenCL}
+destructor TNNetBicubicUpsample.Destroy();
+begin
+  if Assigned(FScatterCL)    then FreeAndNil(FScatterCL);
+  if Assigned(FRowOffBuf)    then FreeAndNil(FRowOffBuf);
+  if Assigned(FOutIdxBuf)    then FreeAndNil(FOutIdxBuf);
+  if Assigned(FEntWeightBuf) then FreeAndNil(FEntWeightBuf);
+  if Assigned(FBackErrFlat)  then FreeAndNil(FBackErrFlat);
+  if Assigned(FBackOutFlat)  then FreeAndNil(FBackOutFlat);
+  inherited Destroy();
+end;
+{$ENDIF}
+
+procedure TNNetBicubicUpsample.SetPrevLayer(pPrevLayer: TNNetLayer);
+var
+  s: integer;
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  s := FStruct[0];
+  if s < 1 then s := 1;
+  FOutput.ReSize(pPrevLayer.Output.SizeX * s,
+                 pPrevLayer.Output.SizeY * s,
+                 pPrevLayer.Output.Depth);
+  SetOutputErrorSize(FOutput);
+  {$IFDEF OpenCL}
+  FShouldOpenCL := false; // bandwidth-bound: GPU < CPU at every size (OpenCLForwardBenchmark ~0.72x), pin to CPU. Old verdict: Int64(FOutput.SizeX) * FOutput.SizeY * FOutput.Depth >= cNeuralOpenCLMinWork
+  {$ENDIF}
+end;
+
+procedure TNNetBicubicUpsample.Compute();
+var
+  s, ac: integer;
+  PrevOutput: TNNetVolume;
+  StartTime: double;
+begin
+  StartTime := Now();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  s := FStruct[0];
+  ac := FStruct[1];
+  PrevOutput := FPrevLayer.Output;
+  EnsureBicubicFactorMap(FXMap, FOutput.SizeX, PrevOutput.SizeX, s, ac);
+  EnsureBicubicFactorMap(FYMap, FOutput.SizeY, PrevOutput.SizeY, s, ac);
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    GatherOpenCL(PrevOutput);
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end
+  else Inc(FForwardCPUCnt);
+  {$ENDIF}
+  BicubicForward(PrevOutput);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{$IFDEF OpenCL}
+procedure TNNetBicubicUpsample.DisableOpenCL();
+begin
+  inherited DisableOpenCL();
+  FreeAndNil(FScatterCL);
+end;
+
+procedure TNNetBicubicUpsample.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  FHasOpenCL := true;
+  if not Assigned(FGatherCL) then
+    FGatherCL := TNNetBicubicGatherCL.Create(FNN);
+  if not Assigned(FScatterCL) then
+    FScatterCL := TNNetBicubicScatterCL.Create(FNN);
+  CreateGatherBuffers();
+  if not Assigned(FRowOffBuf)    then FRowOffBuf    := TNNetVolume.Create();
+  if not Assigned(FOutIdxBuf)    then FOutIdxBuf    := TNNetVolume.Create();
+  if not Assigned(FEntWeightBuf) then FEntWeightBuf := TNNetVolume.Create();
+  if not Assigned(FBackErrFlat)  then FBackErrFlat  := TNNetVolume.Create();
+  if not Assigned(FBackOutFlat)  then FBackOutFlat  := TNNetVolume.Create();
+end;
+{$ENDIF}
+
+procedure TNNetBicubicUpsample.Backpropagate();
+var
+  s, ac: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  s := FStruct[0];
+  ac := FStruct[1];
+  EnsureBicubicFactorMap(FXMap, FOutput.SizeX, FPrevLayer.Output.SizeX, s, ac);
+  EnsureBicubicFactorMap(FYMap, FOutput.SizeY, FPrevLayer.Output.SizeY, s, ac);
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    BackpropagateOpenCL();
+    FBackwardTime := FBackwardTime + (Now() - StartTime);
+    if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+    exit;
+  end;
+  {$ENDIF}
+  BicubicBackward(FPrevLayer.OutputError);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{$IFDEF OpenCL}
+// Device transpose of the bicubic gather. The forward reads a 4x4 clamped source
+// neighbourhood per output pixel; the backward scatters each output pixel's
+// gradient into those same 16 corners with the same wy[r]*wx[c] weights. Border
+// clamping makes several output pixels (and even several taps of one output
+// pixel) land on the SAME source pixel, so a per-output scatter would race. To
+// keep the atomic-free gather style we build a CSR contribution table per SOURCE
+// pixel on the CPU (offsets + flat (outpix,weight) entries, the SAME weights and
+// clamped indices as the scalar backward) and let the device gather every
+// landing contribution per (source pixel, depth). The result is ADDED into
+// FPrevLayer.OutputError (accumulate semantics).
+procedure TNNetBicubicUpsample.BackpropagateOpenCL();
+var
+  OutX, D, ox, oy, r, cc: integer;
+  SrcW, SrcH, NumSrc, NumOut, NumEnt, srcpix, e: integer;
+  XBase, YBase, MaxOutXPos, MaxOutYPos, MaxSrcPos: integer;
+  iy: array[0..3] of integer;
+  wy: array[0..3] of TNeuralFloat;
+  PrevOutput: TNNetVolume;
+begin
+  PrevOutput := FPrevLayer.Output;
+  OutX := FOutput.SizeX; D := FOutput.Depth;
+  SrcW := PrevOutput.SizeX; SrcH := PrevOutput.SizeY;
+  NumSrc := SrcW * SrcH;
+  NumOut := OutX * FOutput.SizeY;
+  NumEnt := NumOut * 16; // every output pixel emits exactly 16 corner taps.
+  MaxOutYPos := FOutput.SizeY - 1;
+  MaxOutXPos := OutX - 1;
+  MaxSrcPos := NumSrc - 1;
+  FRowOffBuf.ReSize(NumSrc + 1, 1, 1);
+  FOutIdxBuf.ReSize(NumEnt, 1, 1);
+  FEntWeightBuf.ReSize(NumEnt, 1, 1);
+  FBackErrFlat.ReSize(NumOut * D, 1, 1);
+  FBackOutFlat.ReSize(NumSrc * D, 1, 1);
+  // Output error flattened to the [outpix*D + d] raw order the device indexes.
+  Move(FOutputError.FData[0], FBackErrFlat.FData[0],
+    NumOut * D * csNeuralFloatSize);
+  // Pass 1: count entries per source pixel (the cached maps hold the same
+  // clamped indices the scalar backward scatters into).
+  if Length(FCountsBuf) <> NumSrc then SetLength(FCountsBuf, NumSrc);
+  FillDWord(FCountsBuf[0], NumSrc, 0);   // #13 (integer counts)
+  for oy := 0 to MaxOutYPos do
+  begin
+    YBase := oy * 4;
+    for ox := 0 to MaxOutXPos do
+    begin
+      XBase := ox * 4;
+      for r := 0 to 3 do
+        for cc := 0 to 3 do
+          Inc(FCountsBuf[FYMap.Idx[YBase + r] * SrcW + FXMap.Idx[XBase + cc]]);
+    end;
+  end;
+  // Prefix sum -> CSR row offsets; seed per-row write cursors.
+  if Length(FCursorBuf) <> NumSrc then SetLength(FCursorBuf, NumSrc);
+  e := 0;
+  for srcpix := 0 to MaxSrcPos do
+  begin
+    FRowOffBuf.FData[srcpix] := e;
+    FCursorBuf[srcpix] := e;
+    e := e + FCountsBuf[srcpix];
+  end;
+  FRowOffBuf.FData[NumSrc] := e;
+  // Pass 2: scatter (outpix, weight) entries into their source-pixel rows.
+  for oy := 0 to MaxOutYPos do
+  begin
+    YBase := oy * 4;
+    for r := 0 to 3 do
+    begin
+      iy[r] := FYMap.Idx[YBase + r];
+      wy[r] := FYMap.W[YBase + r];
+    end;
+    for ox := 0 to MaxOutXPos do
+    begin
+      XBase := ox * 4;
+      for r := 0 to 3 do
+        for cc := 0 to 3 do
+        begin
+          srcpix := iy[r] * SrcW + FXMap.Idx[XBase + cc];
+          FOutIdxBuf.FData[FCursorBuf[srcpix]] := oy * OutX + ox;
+          FEntWeightBuf.FData[FCursorBuf[srcpix]] := wy[r] * FXMap.W[XBase + cc];
+          Inc(FCursorBuf[srcpix]);
+        end;
+    end;
+  end;
+  FScatterCL.Scatter(FBackErrFlat, FRowOffBuf, FOutIdxBuf, FEntWeightBuf,
+    FBackOutFlat, NumSrc, D);
+  FPrevLayer.OutputError.Add(FBackOutFlat);
+end;
+{$ENDIF}
+
+{ TNNetBilinearResize }
+constructor TNNetBilinearResize.Create(pOutW, pOutH, pAlignCorners: integer);
+begin
+  inherited Create();
+  if pOutW < 1 then pOutW := 1;
+  if pOutH < 1 then pOutH := 1;
+  FStruct[0] := pOutW;
+  FStruct[1] := pOutH;
+  if pAlignCorners <> 0 then FStruct[2] := 1 else FStruct[2] := 0;
+end;
+
+procedure TNNetBilinearResize.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FOutput.ReSize(FStruct[0], FStruct[1], pPrevLayer.Output.Depth);
+  SetOutputErrorSize(FOutput);
+  {$IFDEF OpenCL}
+  FShouldOpenCL := (Int64(FOutput.SizeX) * FOutput.SizeY * FOutput.Depth >= cNeuralOpenCLMinWork);
+  {$ENDIF}
+end;
+
+procedure TNNetBilinearResize.Compute();
+var
+  AC: integer;
+  PrevOutput: TNNetVolume;
+  StartTime: double;
+begin
+  StartTime := Now();
+  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  AC := FStruct[2];
+  PrevOutput := FPrevLayer.Output;
+  EnsureBilinearSizeMap(FXMap, FOutput.SizeX, PrevOutput.SizeX, AC);
+  EnsureBilinearSizeMap(FYMap, FOutput.SizeY, PrevOutput.SizeY, AC);
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    GatherOpenCL(PrevOutput);
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end
+  else Inc(FForwardCPUCnt);
+  {$ENDIF}
+  BilinearForward(PrevOutput);
+  FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+{$IFDEF OpenCL}
+procedure TNNetBilinearResize.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  FHasOpenCL := true;
+  if not Assigned(FGatherCL) then
+    FGatherCL := TNNetBilinearGatherCL.Create(FNN);
+  CreateGatherBuffers();
+end;
+{$ENDIF}
+
+procedure TNNetBilinearResize.Backpropagate();
+var
+  AC: integer;
+  StartTime: double;
+begin
+  StartTime := Now();
+  Inc(FBackPropCallCurrentCnt);
+  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
+  TestBackPropCallCurrCnt();
+  AC := FStruct[2];
+  EnsureBilinearSizeMap(FXMap, FOutput.SizeX, FPrevLayer.Output.SizeX, AC);
+  EnsureBilinearSizeMap(FYMap, FOutput.SizeY, FPrevLayer.Output.SizeY, AC);
+  BilinearBackward(FPrevLayer.OutputError);
+  FBackwardTime := FBackwardTime + (Now() - StartTime);
+  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetResize2D }
+constructor TNNetResize2D.Create(pOutW, pOutH, pMode, pAlignCorners: integer);
+begin
+  inherited Create();
+  if pOutW < 1 then pOutW := 1;
+  if pOutH < 1 then pOutH := 1;
+  if (pMode < 0) or (pMode > 2) then pMode := 1;
+  FStruct[0] := pOutW;
+  FStruct[1] := pOutH;
+  FStruct[2] := pMode;
+  if pAlignCorners <> 0 then FStruct[3] := 1 else FStruct[3] := 0;
+end;
+
+procedure TNNetResize2D.SetPrevLayer(pPrevLayer: TNNetLayer);
+begin
+  inherited SetPrevLayer(pPrevLayer);
+  FOutput.ReSize(FStruct[0], FStruct[1], pPrevLayer.Output.Depth);
+  SetOutputErrorSize(FOutput);
+  {$IFDEF OpenCL}
+  FShouldOpenCL := false; // bandwidth-bound: GPU < CPU at every size (OpenCLForwardBenchmark ~0.37x), pin to CPU. Old verdict: Int64(FOutput.SizeX) * FOutput.SizeY * FOutput.Depth >= cNeuralOpenCLMinWork
+  {$ENDIF}
+end;
+
+// The three modes read three different source-coordinate conventions, so each
+// one has its own SIZE-based map builder; everything downstream is shared.
+procedure TNNetResize2D.EnsureAxisMaps(Src: TNNetVolume);
+var
+  Mode, AC: integer;
+begin
+  Mode := FStruct[2];
+  AC := FStruct[3];
+  if Mode = 0 then
+  begin
+    EnsureNearestSizeMap(FXMap, FOutput.SizeX, Src.SizeX);
+    EnsureNearestSizeMap(FYMap, FOutput.SizeY, Src.SizeY);
+  end
+  else if Mode = 2 then
+  begin
+    EnsureBicubicSizeMap(FXMap, FOutput.SizeX, Src.SizeX, AC);
+    EnsureBicubicSizeMap(FYMap, FOutput.SizeY, Src.SizeY, AC);
+  end
+  else
+  begin
+    EnsureBilinearSizeMap(FXMap, FOutput.SizeX, Src.SizeX, AC);
+    EnsureBilinearSizeMap(FYMap, FOutput.SizeY, Src.SizeY, AC);
+  end;
+end;
+
 procedure TNNetResize2D.Compute();
 var
-  OutX, OutY, D, InX, InY, AC, Mode, ox, oy, r: integer;
-  OutXM1, OutYM1, MapBase: integer;
-  ix0, ix1, iy0, iy1: integer;
-  ix: array[0..3] of integer;
-  iyc: array[0..3] of integer;
-  wx: array[0..3] of TNeuralFloat;
-  wy: array[0..3] of TNeuralFloat;
-  wx0, wx1, wy0, wy1, w00, w10, w01, w11: TNeuralFloat;
-  OutPtr: TNeuralFloatArrPtr;
+  D, ox, oy, iy0, MaxOutXPos, MaxOutYPos: integer;
   PrevOutput: TNNetVolume;
   StartTime: double;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   PrevOutput := FPrevLayer.Output;
-  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
-  InX := PrevOutput.SizeX; InY := PrevOutput.SizeY;
-  Mode := FStruct[2]; AC := FStruct[3];
-  OutYM1 := OutY - 1;
-  OutXM1 := OutX - 1;
+  EnsureAxisMaps(PrevOutput);
   {$IFDEF OpenCL}
   // Device offload for the blend modes (bilinear/bicubic). Nearest is a pure
-  // Move so the host path already wins; the gather kernels only blend.
+  // Move so the host path already wins; the gather kernels only blend, so no
+  // gather helper is created for it and WillOpenCL stays false.
   if WillOpenCL() then
   begin
     Inc(FForwardGPUCnt);
-    ComputeOpenCL();
+    GatherOpenCL(PrevOutput);
     FForwardTime := FForwardTime + (Now() - StartTime);
     exit;
   end
   else Inc(FForwardCPUCnt);
   {$ENDIF}
-  if Mode = 0 then
-  begin
-    // Nearest: copy the single picked Depth-long source column.
-    EnsureNearestSizeMap(FXMap, OutX, InX);
-    for oy := 0 to OutYM1 do
+  case FStruct[2] of
+    0:
     begin
-      iy0 := ResizeNearestIdx(oy, OutY, InY);
-      for ox := 0 to OutXM1 do
+      // Nearest: copy the single picked Depth-long source column.
+      D := FOutput.Depth;
+      MaxOutXPos := FOutput.SizeX - 1;
+      MaxOutYPos := FOutput.SizeY - 1;
+      for oy := 0 to MaxOutYPos do
       begin
-        ix0 := FXMap.Idx[ox];
-        Move(PrevOutput.GetRawPtr(ix0, iy0)^,
-             FOutput.GetRawPtr(ox, oy)^, D * csNeuralFloatSize);
+        iy0 := FYMap.Idx[oy];
+        for ox := 0 to MaxOutXPos do
+          Move(PrevOutput.GetRawPtr(FXMap.Idx[ox], iy0)^,
+               FOutput.GetRawPtr(ox, oy)^, D * csNeuralFloatSize);
       end;
     end;
-  end
-  else if Mode = 2 then
-  begin
-    // Separable bicubic: 4x4 clamped neighbourhood, Depth-contiguous Move+MulAdd.
-    EnsureBicubicSizeMap(FXMap, OutX, InX, AC);
-    for oy := 0 to OutYM1 do
-    begin
-      BicubicResizeMap(oy, OutY, InY, AC, iyc[0], iyc[1], iyc[2], iyc[3],
-        wy[0], wy[1], wy[2], wy[3]);
-      for ox := 0 to OutXM1 do
-      begin
-        // The X geometry is invariant across rows, so it comes from the cached
-        // per-shape map.
-        MapBase := ox * 4;
-        ix[0] := FXMap.Idx[MapBase];
-        ix[1] := FXMap.Idx[MapBase + 1];
-        ix[2] := FXMap.Idx[MapBase + 2];
-        ix[3] := FXMap.Idx[MapBase + 3];
-        wx[0] := FXMap.W[MapBase];
-        wx[1] := FXMap.W[MapBase + 1];
-        wx[2] := FXMap.W[MapBase + 2];
-        wx[3] := FXMap.W[MapBase + 3];
-        OutPtr := FOutput.GetRawPtr(ox, oy);
-        Move(PrevOutput.GetRawPtr(ix[0], iyc[0])^, OutPtr^, D * csNeuralFloatSize);
-        TNNetVolume.Mul(OutPtr, wx[0] * wy[0], D);
-        TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ix[1], iyc[0]), wx[1] * wy[0], D);
-        TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ix[2], iyc[0]), wx[2] * wy[0], D);
-        TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ix[3], iyc[0]), wx[3] * wy[0], D);
-        for r := 1 to 3 do
-        begin
-          TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ix[0], iyc[r]), wx[0] * wy[r], D);
-          TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ix[1], iyc[r]), wx[1] * wy[r], D);
-          TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ix[2], iyc[r]), wx[2] * wy[r], D);
-          TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ix[3], iyc[r]), wx[3] * wy[r], D);
-        end;
-      end;
-    end;
-  end
-  else
-  begin
-    // Bilinear: 4-corner blend (reuses BilinearResizeMap geometry).
-    EnsureBilinearSizeMap(FXMap, OutX, InX, AC);
-    for oy := 0 to OutYM1 do
-    begin
-      BilinearResizeMap(oy, OutY, InY, AC, iy0, iy1, wy1);
-      wy0 := 1 - wy1;
-      for ox := 0 to OutXM1 do
-      begin
-        // The X geometry is invariant across rows, so it comes from the cached
-        // per-shape map.
-        MapBase := ox * 2;
-        ix0 := FXMap.Idx[MapBase];
-        ix1 := FXMap.Idx[MapBase + 1];
-        wx0 := FXMap.W[MapBase];
-        wx1 := FXMap.W[MapBase + 1];
-        w00 := wy0 * wx0;
-        w10 := wy0 * wx1;
-        w01 := wy1 * wx0;
-        w11 := wy1 * wx1;
-        OutPtr := FOutput.GetRawPtr(ox, oy);
-        Move(PrevOutput.GetRawPtr(ix0, iy0)^, OutPtr^, D * csNeuralFloatSize);
-        TNNetVolume.Mul(OutPtr, w00, D);
-        TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ix1, iy0), w10, D);
-        TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ix0, iy1), w01, D);
-        TNNetVolume.MulAdd(OutPtr, PrevOutput.GetRawPtr(ix1, iy1), w11, D);
-      end;
-    end;
+    2: BicubicForward(PrevOutput);
+    else BilinearForward(PrevOutput);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 {$IFDEF OpenCL}
-procedure TNNetResize2D.DisableOpenCL();
-begin
-  inherited DisableOpenCL();
-  FreeAndNil(FBilinearGatherCL);
-  FreeAndNil(FBicubicGatherCL);
-end;
-
 procedure TNNetResize2D.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
-  // One gather helper per blend mode (only the active mode is ever used, but
-  // the layer is constructed mode-fixed so we just create both lazily).
-  if not Assigned(FBilinearGatherCL) then
-    FBilinearGatherCL := TNNetBilinearGatherCL.Create(FNN);
-  if not Assigned(FBicubicGatherCL) then
-    FBicubicGatherCL := TNNetBicubicGatherCL.Create(FNN);
-  if not Assigned(FCornerBuf) then FCornerBuf := TNNetVolume.Create();
-  if not Assigned(FWeightBuf) then FWeightBuf := TNNetVolume.Create();
-  if not Assigned(FDstFlat)   then FDstFlat   := TNNetVolume.Create();
-end;
-
-function TNNetResize2D.WillOpenCL(): boolean;
-var
-  Mode: integer;
-begin
-  Mode := FStruct[2];
-  Result := FHasOpenCL and (Mode <> 0)
-            and (((Mode = 1) and Assigned(FBilinearGatherCL)) or
-                 ((Mode = 2) and Assigned(FBicubicGatherCL)))
-            and (FShouldOpenCL or FForceOpenCL);
-end;
-
-// Device per-pixel resize-gather (forward only). The clamped corner indices and
-// the separable blend weights are computed on the CPU bit-identically to
-// Compute() (BilinearResizeMap / BicubicResizeMap, the same SIZE-based source
-// maps), then the depth-blend runs on the device via the shared gather kernels:
-// 4 corners for bilinear (TNNetBilinearGatherCL, also driving TNNetBilinearResize)
-// and 16 corners for bicubic (TNNetBicubicGatherCL, also driving
-// TNNetBicubicUpsample). Corner offsets index the SOURCE grid (SrcW =
-// PrevOutput.SizeX); NumOut = OutX*OutY. Backward stays on the CPU.
-procedure TNNetResize2D.ComputeOpenCL();
-var
-  OutX, OutY, D, InX, InY, AC, Mode, ox, oy, SrcW, NumOut, cb, r, cc: integer;
-  OutXM1, OutYM1: integer;
-  ix0, ix1, iy0, iy1: integer;
-  ix: array[0..3] of integer;
-  iyc: array[0..3] of integer;
-  wx: array[0..3] of TNeuralFloat;
-  wy: array[0..3] of TNeuralFloat;
-  wx1, wy1: TNeuralFloat;
-  PrevOutput: TNNetVolume;
-begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  PrevOutput := FPrevLayer.Output;
-  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
-  InX := PrevOutput.SizeX; InY := PrevOutput.SizeY;
-  SrcW := InX;
-  Mode := FStruct[2]; AC := FStruct[3];
-  NumOut := OutX * OutY;
-  OutYM1 := OutY - 1;
-  OutXM1 := OutX - 1;
-  FDstFlat.ReSize(NumOut * D, 1, 1);
-  if Mode = 2 then
+  // One gather helper for the configured blend: 4 corners for bilinear (the same
+  // kernel as TNNetBilinearResize), 16 for bicubic (the same kernel as
+  // TNNetBicubicUpsample). Nearest gets none - it has nothing to blend.
+  if not Assigned(FGatherCL) then
   begin
-    FCornerBuf.ReSize(NumOut * 16, 1, 1);
-    FWeightBuf.ReSize(NumOut * 16, 1, 1);
-    for oy := 0 to OutYM1 do
-    begin
-      BicubicResizeMap(oy, OutY, InY, AC, iyc[0], iyc[1], iyc[2], iyc[3],
-        wy[0], wy[1], wy[2], wy[3]);
-      for ox := 0 to OutXM1 do
-      begin
-        BicubicResizeMap(ox, OutX, InX, AC, ix[0], ix[1], ix[2], ix[3],
-          wx[0], wx[1], wx[2], wx[3]);
-        cb := (oy * OutX + ox) * 16;
-        for r := 0 to 3 do
-          for cc := 0 to 3 do
-          begin
-            FWeightBuf.FData[cb + r * 4 + cc] := wy[r] * wx[cc];
-            FCornerBuf.FData[cb + r * 4 + cc] := iyc[r] * SrcW + ix[cc];
-          end;
-      end;
-    end;
-    FBicubicGatherCL.Gather(PrevOutput, FCornerBuf, FWeightBuf, FDstFlat, NumOut, D);
-  end
-  else
-  begin
-    // Bilinear: 4-corner blend, geometry bit-identical to the CPU path.
-    FCornerBuf.ReSize(NumOut * 4, 1, 1);
-    FWeightBuf.ReSize(NumOut * 4, 1, 1);
-    for oy := 0 to OutYM1 do
-    begin
-      BilinearResizeMap(oy, OutY, InY, AC, iy0, iy1, wy1);
-      for ox := 0 to OutXM1 do
-      begin
-        BilinearResizeMap(ox, OutX, InX, AC, ix0, ix1, wx1);
-        cb := (oy * OutX + ox) * 4;
-        FWeightBuf.FData[cb + 0] := (1 - wy1) * (1 - wx1);
-        FWeightBuf.FData[cb + 1] := (1 - wy1) * wx1;
-        FWeightBuf.FData[cb + 2] := wy1 * (1 - wx1);
-        FWeightBuf.FData[cb + 3] := wy1 * wx1;
-        FCornerBuf.FData[cb + 0] := iy0 * SrcW + ix0;
-        FCornerBuf.FData[cb + 1] := iy0 * SrcW + ix1;
-        FCornerBuf.FData[cb + 2] := iy1 * SrcW + ix0;
-        FCornerBuf.FData[cb + 3] := iy1 * SrcW + ix1;
-      end;
-    end;
-    FBilinearGatherCL.Gather(PrevOutput, FCornerBuf, FWeightBuf, FDstFlat, NumOut, D);
+    if FStruct[2] = 1 then FGatherCL := TNNetBilinearGatherCL.Create(FNN)
+    else if FStruct[2] = 2 then FGatherCL := TNNetBicubicGatherCL.Create(FNN);
   end;
-  Move(FDstFlat.FData[0], FOutput.FData[0], NumOut * D * csNeuralFloatSize);
+  if Assigned(FGatherCL) then CreateGatherBuffers();
 end;
 {$ENDIF}
 
-destructor TNNetResize2D.Destroy();
-begin
-  {$IFDEF OpenCL}
-  if Assigned(FBilinearGatherCL) then FreeAndNil(FBilinearGatherCL);
-  if Assigned(FBicubicGatherCL)  then FreeAndNil(FBicubicGatherCL);
-  if Assigned(FCornerBuf) then FreeAndNil(FCornerBuf);
-  if Assigned(FWeightBuf) then FreeAndNil(FWeightBuf);
-  if Assigned(FDstFlat)   then FreeAndNil(FDstFlat);
-  {$ENDIF}
-  inherited Destroy();
-end;
-
 procedure TNNetResize2D.Backpropagate();
 var
-  OutX, OutY, D, InX, InY, AC, Mode, ox, oy, r, cc: integer;
-  OutXM1, OutYM1, MapBase: integer;
-  ix0, ix1, iy0, iy1: integer;
-  ix: array[0..3] of integer;
-  iyc: array[0..3] of integer;
-  wx: array[0..3] of TNeuralFloat;
-  wy: array[0..3] of TNeuralFloat;
-  wx0, wx1, wy0, wy1: TNeuralFloat;
-  GradPtr: TNeuralFloatArrPtr;
+  D, ox, oy, iy0, MaxOutXPos, MaxOutYPos: integer;
   PrevError: TNNetVolume;
   StartTime: double;
 begin
@@ -56373,79 +56062,24 @@ begin
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
   PrevError := FPrevLayer.OutputError;
-  OutX := FOutput.SizeX; OutY := FOutput.SizeY; D := FOutput.Depth;
-  InX := FPrevLayer.Output.SizeX; InY := FPrevLayer.Output.SizeY;
-  Mode := FStruct[2]; AC := FStruct[3];
-  OutYM1 := OutY - 1;
-  OutXM1 := OutX - 1;
-  if Mode = 0 then
-  begin
-    // Transpose of nearest: accumulate the whole error column into the picked src.
-    EnsureNearestSizeMap(FXMap, OutX, InX);
-    for oy := 0 to OutYM1 do
+  EnsureAxisMaps(FPrevLayer.Output);
+  case FStruct[2] of
+    0:
     begin
-      iy0 := ResizeNearestIdx(oy, OutY, InY);
-      for ox := 0 to OutXM1 do
+      // Transpose of nearest: accumulate the whole error column into the picked src.
+      D := FOutput.Depth;
+      MaxOutXPos := FOutput.SizeX - 1;
+      MaxOutYPos := FOutput.SizeY - 1;
+      for oy := 0 to MaxOutYPos do
       begin
-        ix0 := FXMap.Idx[ox];
-        TNNetVolume.MulAdd(PrevError.GetRawPtr(ix0, iy0),
-          FOutputError.GetRawPtr(ox, oy), 1.0, D);
+        iy0 := FYMap.Idx[oy];
+        for ox := 0 to MaxOutXPos do
+          TNNetVolume.MulAdd(PrevError.GetRawPtr(FXMap.Idx[ox], iy0),
+            FOutputError.GetRawPtr(ox, oy), 1.0, D);
       end;
     end;
-  end
-  else if Mode = 2 then
-  begin
-    // Transpose of the 4x4 bicubic gather: scatter grad into all 16 source taps.
-    EnsureBicubicSizeMap(FXMap, OutX, InX, AC);
-    for oy := 0 to OutYM1 do
-    begin
-      BicubicResizeMap(oy, OutY, InY, AC, iyc[0], iyc[1], iyc[2], iyc[3],
-        wy[0], wy[1], wy[2], wy[3]);
-      for ox := 0 to OutXM1 do
-      begin
-        // The X geometry is invariant across rows, so it comes from the cached
-        // per-shape map.
-        MapBase := ox * 4;
-        ix[0] := FXMap.Idx[MapBase];
-        ix[1] := FXMap.Idx[MapBase + 1];
-        ix[2] := FXMap.Idx[MapBase + 2];
-        ix[3] := FXMap.Idx[MapBase + 3];
-        wx[0] := FXMap.W[MapBase];
-        wx[1] := FXMap.W[MapBase + 1];
-        wx[2] := FXMap.W[MapBase + 2];
-        wx[3] := FXMap.W[MapBase + 3];
-        GradPtr := FOutputError.GetRawPtr(ox, oy);
-        for r := 0 to 3 do
-          for cc := 0 to 3 do
-            TNNetVolume.MulAdd(PrevError.GetRawPtr(ix[cc], iyc[r]),
-              GradPtr, wy[r] * wx[cc], D);
-      end;
-    end;
-  end
-  else
-  begin
-    // Transpose of the 4-corner bilinear blend.
-    EnsureBilinearSizeMap(FXMap, OutX, InX, AC);
-    for oy := 0 to OutYM1 do
-    begin
-      BilinearResizeMap(oy, OutY, InY, AC, iy0, iy1, wy1);
-      wy0 := 1 - wy1;
-      for ox := 0 to OutXM1 do
-      begin
-        // The X geometry is invariant across rows, so it comes from the cached
-        // per-shape map.
-        MapBase := ox * 2;
-        ix0 := FXMap.Idx[MapBase];
-        ix1 := FXMap.Idx[MapBase + 1];
-        wx0 := FXMap.W[MapBase];
-        wx1 := FXMap.W[MapBase + 1];
-        GradPtr := FOutputError.GetRawPtr(ox, oy);
-        TNNetVolume.MulAdd(PrevError.GetRawPtr(ix0, iy0), GradPtr, wy0 * wx0, D);
-        TNNetVolume.MulAdd(PrevError.GetRawPtr(ix1, iy0), GradPtr, wy0 * wx1, D);
-        TNNetVolume.MulAdd(PrevError.GetRawPtr(ix0, iy1), GradPtr, wy1 * wx0, D);
-        TNNetVolume.MulAdd(PrevError.GetRawPtr(ix1, iy1), GradPtr, wy1 * wx1, D);
-      end;
-    end;
+    2: BicubicBackward(PrevError);
+    else BilinearBackward(PrevError);
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
