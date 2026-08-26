@@ -813,22 +813,37 @@ var
   I, CCI, CCPrev: integer;
   Tmp: cardinal;
 begin
+  // CCPrev carries the combining class of Buf[I - 1] across iterations (-1 =
+  // not known yet), so a run of combining marks costs one table lookup per
+  // element instead of two: stepping forward makes the current element the
+  // previous one, and the swap at I = 1 puts the element whose class CCPrev
+  // already holds into slot 1. Only the backtrack step exposes a fresh
+  // neighbour, so only it has to re-look-up.
   I := 1;
+  CCPrev := -1;
   while I < Len do
   begin
     CCI := NFCCombiningClass(Buf[I]);
     if CCI <> 0 then
     begin
-      CCPrev := NFCCombiningClass(Buf[I - 1]);
+      if CCPrev < 0 then CCPrev := NFCCombiningClass(Buf[I - 1]);
       if (CCPrev <> 0) and (CCPrev > CCI) then
       begin
         Tmp := Buf[I];
         Buf[I] := Buf[I - 1];
         Buf[I - 1] := Tmp;
-        if I > 1 then begin Dec(I); continue; end;
+        if I > 1 then
+        begin
+          Dec(I);
+          CCPrev := -1;
+          continue;
+        end;
+        Inc(I);
+        continue;
       end;
     end;
     Inc(I);
+    CCPrev := CCI;
   end;
 end;
 
@@ -845,17 +860,20 @@ var
   Len, Position, CP, OutLen: integer;
   StarterPos: integer;
   StarterCC, CC, Composite: integer;
-  I, LenM1, OutPos, FragLen: integer;
-  Frag: string;
+  I, LenM1, OutPos, Total, Factor: integer;
+  PBuf: PAnsiChar;
 begin
   if S = '' then Exit('');
-  // Worst-case compatibility expansion is bounded but larger than canonical
-  // (some compat decompositions emit up to ~18 codepoints); 18x the input
-  // codepoint count is a safe over-allocation for both modes.
-  SetLength(Buf, Length(S) * 18 + 8);
+  // Per-codepoint worst-case expansion of the tables in neuralnfctables.inc:
+  // 4 for a full canonical (NFD) decomposition, 18 for the longest
+  // compatibility (NFKD) one. Length(S) counts bytes, so it already bounds the
+  // codepoint count from above.
+  if Compat then Factor := 18 else Factor := 4;
+  Total := Length(S);
+  SetLength(Buf, Total * Factor + 8);
   Len := 0;
   Position := 1;
-  while Position <= Length(S) do
+  while Position <= Total do
   begin
     CP := integer(NextCodePoint(S, Position));
     NFCDecomposeRec(cardinal(CP), Buf, Len, Compat);
@@ -903,23 +921,16 @@ begin
     Len := OutLen;
   end;
 
-  // #18: build the UTF-8 result via a preallocated buffer + write cursor
-  // instead of repeated string concatenation (which reallocs O(Len^2)).
-  // Each codepoint encodes to at most 4 UTF-8 bytes.
+  // #18/#23: build the UTF-8 result by encoding straight into a preallocated
+  // buffer through a carried 0-based cursor -- no per-codepoint string
+  // fragment, no repeated concatenation. Each codepoint takes at most 4 bytes.
   SetLength(Result, Len * 4);
-  OutPos := 1;
+  PBuf := PAnsiChar(Result);
+  OutPos := 0;
   LenM1 := Len - 1;
   for I := 0 to LenM1 do
-  begin
-    Frag := CodePointToUTF8(Buf[I]);
-    FragLen := Length(Frag);
-    if FragLen > 0 then
-    begin
-      Move(Frag[1], Result[OutPos], FragLen);
-      Inc(OutPos, FragLen);
-    end;
-  end;
-  SetLength(Result, OutPos - 1);
+    HFWriteCodePointUTF8(PBuf, OutPos, Buf[I]);
+  SetLength(Result, OutPos);
 end;
 
 { ---------------------------------------------------------------- }
@@ -1159,25 +1170,26 @@ var
   end;
 
 var
-  OutPos, ByteCnt, EncLen: integer;
-  Encoded: string;
+  OutPos: integer;
+  PBuf: PAnsiChar;
 
-  // Writes into the preallocated Result buffer. Plain Result := Result + c
-  // is QUADRATIC in this unit: {$CODEPAGE UTF8} (via neuralnetwork.inc)
-  // defeats FPC's in-place append optimization, so every concat copies the
-  // whole accumulated string -- a 466 KB BERT tokenizer.json then takes
-  // minutes instead of milliseconds. Escapes never grow the text (6 or 12
-  // escape bytes become at most 4 UTF-8 bytes), so Length(S) is a safe
-  // upper bound for the output size.
+  // Writes into the preallocated Result buffer through the 0-based cursor
+  // OutPos. Plain Result := Result + c is QUADRATIC in this unit:
+  // {$CODEPAGE UTF8} (via neuralnetwork.inc) defeats FPC's in-place append
+  // optimization, so every concat copies the whole accumulated string -- a
+  // 466 KB BERT tokenizer.json then takes minutes instead of milliseconds.
+  // Escapes never grow the text (6 or 12 escape bytes become at most 4 UTF-8
+  // bytes), so Length(S) is a safe upper bound for the output size.
   procedure AppendChar(C: char); inline;
   begin
+    PBuf[OutPos] := C;
     Inc(OutPos);
-    Result[OutPos] := C;
   end;
 
 begin
   Total := Length(S);
   SetLength(Result, Total);
+  PBuf := PAnsiChar(Result);
   OutPos := 0;
   Position := 1;
   while Position <= Total do
@@ -1195,9 +1207,8 @@ begin
           CP := $10000 + ((CP - $D800) shl 10) + (LowCP - $DC00);
           Inc(Position, 6);
         end;
-        Encoded := CodePointToUTF8(CP);
-        EncLen := Length(Encoded);
-        for ByteCnt := 1 to EncLen do AppendChar(Encoded[ByteCnt]);
+        // Encodes straight into the buffer: no intermediate string fragment.
+        HFWriteCodePointUTF8(PBuf, OutPos, CP);
       end
       else
       begin // any other escape: copy verbatim, never reinterpret char 2
@@ -1519,18 +1530,28 @@ end;
 
 function TNeuralHFTokenizer.FixJSONKey(const Key: string): string;
 var
-  Position: integer;
+  Position, Total, OutPos: integer;
   CP: cardinal;
+  PBuf: PAnsiChar;
 begin
   if not FKeysMangled then Exit(Key);
-  Result := '';
+  // #23: every unshielded codepoint is <= 255, so it consumes 1 or 2 input
+  // bytes and emits exactly 1 -- Length(Key) is an upper bound for the output.
+  // Preallocating and carrying a cursor avoids the quadratic Result + Chr(CP)
+  // concatenation over a ~150k-entry vocab.
+  Total := Length(Key);
+  SetLength(Result, Total);
+  PBuf := PAnsiChar(Result);
+  OutPos := 0;
   Position := 1;
-  while Position <= Length(Key) do
+  while Position <= Total do
   begin
     CP := NextCodePoint(Key, Position);
     if CP > 255 then Exit(Key); // not the latin-1 pattern: keep verbatim
-    Result := Result + Chr(CP);
+    PBuf[OutPos] := Chr(CP);
+    Inc(OutPos);
   end;
+  SetLength(Result, OutPos);
 end;
 
 // Ends a bulk fill of one of the sorted lookup lists (FVocab / FMerges).
@@ -1603,6 +1624,10 @@ end;
 
 // Indexes the finished merge table for pair lookup. Runs once per load, from
 // the first MergeRank call; every FMerges fill site invalidates it.
+//
+// FMergeEntry[].Key points INTO the FMerges strings rather than copying them,
+// so the index is valid only while FMerges is left unmodified -- any add,
+// delete, sort or edit must clear FMergeHashBuilt so this rebuilds.
 procedure TNeuralHFTokenizer.BuildMergeHash();
 var
   Cnt, MergesCnt, MergesCntM1, Cap, Slot: integer;
