@@ -104021,11 +104021,12 @@ end;
 procedure TNNetConvolution.ComputeRange(StartRange, FinRange: integer);
 var
   FirstElem, LastElem, Cnt: integer;
-  Pos, PosX, PosY, LocalSize, NeuronIdx, MaxNeurons: integer;
-  LocalNeuron: TNNetNeuron;
+  Pos, LocalSize, NeuronIdx, MaxNeurons: integer;
   PtrA: TNeuralFloatArrPtr;
   ConvResult: TNeuralFloatPtr;
   NumPositions, SliceFirst, SliceLast, NumPositionsM1, base: integer;
+  InPos, OutPos, InPosStep, OutPosStep: integer;
+  LocalWeights: TNNetVolume;
 begin
   if ChunkOverNeurons() then
   begin
@@ -104054,20 +104055,28 @@ begin
       // Low-memory: the concatenated cache was released, so read per-neuron
       // weights directly (the neuron-sliced twin of ComputeLowMemoryCPU).
       LocalSize := FFeatureSizeX * FFeatureSizeY * FInputCopy.Depth;
+      // #12: FInputPrepared and FOutputRaw are both (FOutputSizeX, FOutputSizeY,
+      // depth) row-major with depth innermost, so position Pos = PosY*SizeX+PosX
+      // sits at flat offset Pos*Depth. Carry the two offsets by their constant
+      // per-position step instead of a mod/div plus a GetRawPtr multiply.
+      InPosStep  := FInputPrepared.Depth;
+      OutPosStep := FOutputRaw.Depth;
+      InPos  := 0;
+      OutPos := 0;
       for Pos := 0 to NumPositionsM1 do
       begin
-        PosX := Pos mod FOutputSizeX;
-        PosY := Pos div FOutputSizeX;
-        PtrA       := FInputPrepared.GetRawPtr(PosX, PosY);
-        ConvResult := FOutputRaw.GetRawPtr(PosX, PosY);
+        PtrA       := FInputPrepared.GetRawPtr(InPos);
+        ConvResult := FOutputRaw.GetRawPtr(OutPos);
         Inc(ConvResult, StartRange);
         for NeuronIdx := StartRange to FinRange do
         begin
-          LocalNeuron := FArrNeurons[NeuronIdx];
-          ConvResult^ := LocalNeuron.Weights.DotProduct(
-            PtrA, LocalNeuron.Weights.DataPtr, LocalSize);
+          LocalWeights := FArrNeurons[NeuronIdx].Weights;
+          ConvResult^ := LocalWeights.DotProduct(
+            PtrA, LocalWeights.DataPtr, LocalSize);
           Inc(ConvResult);
         end;
+        Inc(InPos, InPosStep);
+        Inc(OutPos, OutPosStep);
       end;
     end
     else
@@ -104125,19 +104134,26 @@ begin
     // below. Coded by Claude (AI).
     LocalSize  := FFeatureSizeX * FFeatureSizeY * FInputCopy.Depth;
     MaxNeurons := FNeurons.Count - 1;
+    // #12: same depth-innermost layout as FirstElem above assumes, so position
+    // Pos sits at flat offset Pos*Depth in both volumes - seed at StartRange and
+    // carry the constant per-position step, no mod/div and no GetRawPtr multiply.
+    InPosStep  := FInputPrepared.Depth;
+    OutPosStep := FOutputRaw.Depth;
+    InPos  := StartRange * InPosStep;
+    OutPos := StartRange * OutPosStep;
     for Pos := StartRange to FinRange do
     begin
-      PosX := Pos mod FOutputSizeX;
-      PosY := Pos div FOutputSizeX;
-      PtrA       := FInputPrepared.GetRawPtr(PosX, PosY);
-      ConvResult := FOutputRaw.GetRawPtr(PosX, PosY);
+      PtrA       := FInputPrepared.GetRawPtr(InPos);
+      ConvResult := FOutputRaw.GetRawPtr(OutPos);
       for NeuronIdx := 0 to MaxNeurons do
       begin
-        LocalNeuron := FArrNeurons[NeuronIdx];
-        ConvResult^ := LocalNeuron.Weights.DotProduct(
-          PtrA, LocalNeuron.Weights.DataPtr, LocalSize);
+        LocalWeights := FArrNeurons[NeuronIdx].Weights;
+        ConvResult^ := LocalWeights.DotProduct(
+          PtrA, LocalWeights.DataPtr, LocalSize);
         Inc(ConvResult);
       end;
+      Inc(InPos, InPosStep);
+      Inc(OutPos, OutPosStep);
     end;
   end
   else if ShouldUseInterleavedDotProduct then
@@ -104368,6 +104384,7 @@ var
   yCount, FeatSizeYMax: integer;
   InputX: integer;
   RowSize: integer;
+  SrcRowStride, SrcPos, DstPos: integer;
   {$IFDEF AVXANY}
   SourceRawPos, DestRawPos: pointer;
   {$ENDIF}
@@ -104387,24 +104404,34 @@ begin
 
     FInputPrepared.ReSize(FOutput.SizeX, FOutput.SizeY, FInputCopy.Depth * FFeatureSizeX * FFeatureSizeY);
 
+    // #12: across yCount both ends advance by a constant step - the source by
+    // one FInputCopy row, the destination by DepthFSize (an output position's
+    // FFeatureSizeY feature rows are one contiguous run). Seed both per (x,y)
+    // and carry them instead of re-deriving each offset.
+    SrcRowStride := FInputCopy.GetRawPos(0, 1);
+
     for OutputCntX := 0 to MaxX do
     begin
       InputX := OutputCntX * FStride;
       for OutputCntY := 0 to MaxY do
       begin
+        SrcPos := FInputCopy.GetRawPos(InputX, OutputCntY * FStride);
+        DstPos := FInputPrepared.GetRawPos(OutputCntX, OutputCntY);
         for yCount := 0 to FeatSizeYMax do
         begin
           {$IFDEF AVXANY}
-          SourceRawPos := FInputCopy.GetRawPtr(InputX, OutputCntY*FStride + yCount );
-          DestRawPos := FInputPrepared.GetRawPtr(OutputCntX, OutputCntY, DepthFSize * yCount);
+          SourceRawPos := FInputCopy.GetRawPtr(SrcPos);
+          DestRawPos := FInputPrepared.GetRawPtr(DstPos);
           asm_dword_copy;
           {$ELSE}
           Move(
-            FInputCopy.FData[FInputCopy.GetRawPos(InputX, OutputCntY*FStride + yCount )],
-            FInputPrepared.FData[FInputPrepared.GetRawPos(OutputCntX, OutputCntY, DepthFSize * yCount)],
+            FInputCopy.FData[SrcPos],
+            FInputPrepared.FData[DstPos],
             SizeOfDepthFSize
           );
           {$ENDIF}
+          Inc(SrcPos, SrcRowStride);
+          Inc(DstPos, DepthFSize);
         end;
       end;
     end;
@@ -104523,7 +104550,8 @@ var
   g: array[0..2, 0..2] of TNeuralFloat; // raw 3x3 kernel for one (o,c)
   Gg: array[0..3, 0..2] of TNeuralFloat; // G * g  (4x3)
   U: array[0..3, 0..3] of TNeuralFloat;  // G g G^T (4x4)
-  i, j, p: integer;
+  i, j: integer;
+  wDepth, wRowStride, wRowPos, wPos, pPos: integer;
 begin
   NeuronCnt := FNeurons.Count;
   if NeuronCnt = 0 then Exit;
@@ -104536,13 +104564,25 @@ begin
 
   for OutChannel := 0 to NeuronMax do
   begin
-    Weights := FNeurons[OutChannel].Weights; // (3,3,InDepth)
+    Weights := FArrNeurons[OutChannel].Weights; // (3,3,InDepth), #10
+    // #12: in the weight volume one kernel column step is Depth elements and one
+    // kernel row step is SizeX*Depth, so the 3x3 gather is two carried offsets.
+    wDepth := Weights.Depth;
+    wRowStride := Weights.GetRawPos(0, 1);
     for InChannel := 0 to InDepthM1 do
     begin
       // Gather the 3x3 kernel for this (output,input) channel pair.
+      wRowPos := Weights.GetRawPos(0, 0, InChannel); // (x=0, y=0) of this channel
       for i := 0 to 2 do
+      begin
+        wPos := wRowPos;
         for j := 0 to 2 do
-          g[i][j] := Weights.Get(j, i, InChannel); // Get(x,y,d): x=col j, y=row i
+        begin
+          g[i][j] := Weights.FData[wPos]; // x=col j, y=row i
+          Inc(wPos, wDepth);
+        end;
+        Inc(wRowPos, wRowStride);
+      end;
 
       // Gg = G * g, with G rows: [1,0,0],[.5,.5,.5],[.5,-.5,.5],[0,0,1]
       for j := 0 to 2 do
@@ -104560,12 +104600,13 @@ begin
         U[i][2] := 0.5 * (Gg[i][0] - Gg[i][1] + Gg[i][2]);
         U[i][3] := Gg[i][2];
       end;
-      // Scatter into the depth-contiguous pack: p = i*4 + j.
+      // Scatter into the depth-contiguous pack: p = i*4 + j, p-stride = InDepth.
+      pPos := FWinogradKernels.GetRawPos(0, OutChannel, InChannel);
       for i := 0 to 3 do
         for j := 0 to 3 do
         begin
-          p := i * 4 + j;
-          FWinogradKernels[p, OutChannel, InChannel] := U[i][j];
+          FWinogradKernels.FData[pPos] := U[i][j];
+          Inc(pPos, InDepth);
         end;
     end;
   end;
@@ -104749,12 +104790,15 @@ begin
         begin
           outY := baseY + i;
           if outY >= FOutputSizeY then Continue;
+          // #11/#12: the row base is invariant across j and one output column
+          // step is NeuronCnt elements (depth innermost). Advance it
+          // unconditionally so the edge-drop test cannot desynchronise it.
+          outBase := FOutputRaw.GetRawPos(baseX, outY) + o;
           for j := 0 to 1 do
           begin
             outX := baseX + j;
-            if outX >= FOutputSizeX then Continue;
-            outBase := FOutputRaw.GetRawPos(outX, outY);
-            FOutputRaw.FData[outBase + o] := Y[i][j];
+            if outX < FOutputSizeX then FOutputRaw.FData[outBase] := Y[i][j];
+            Inc(outBase, NeuronCnt);
           end;
         end;
       end;
@@ -104834,6 +104878,9 @@ var
   i, j: integer;
   outX, outY: integer;
   pSliceFloats: integer;
+  inSizeX, inSizeY, rowBase, rowStride, wBase, outBase, pos: integer;
+  vGatherPos, vDstPos, mSrcPos, mDstPos, tileStrideV, tileStrideM: integer;
+  kPtr: TNeuralFloatArrPtr;
 begin
   // Resident kernel pack: rebuild/transpose only when invalidated.
   if (not FWinogradKernelsTValid) then BuildWinogradKernelsT();
@@ -104842,6 +104889,9 @@ begin
   NeuronCnt := FNeurons.Count;
   NeuronMax := NeuronCnt - 1;
   MaxC := InDepth - 1;
+  inSizeX := FInputCopy.SizeX;
+  inSizeY := FInputCopy.SizeY;
+  rowStride := inSizeX * InDepth;   // #5: Y-axis stride, invariant for the pass
 
   TilesX := (FOutputSizeX + 1) shr 1;
   TilesY := (FOutputSizeY + 1) shr 1;
@@ -104870,17 +104920,28 @@ begin
       tile := ty * TilesX + tx;
       for c := 0 to MaxC do
       begin
+        // Rule #11/#12 (as in ComputeWinogradCPU): carry the row base across sy
+        // by the Y-axis stride and +InDepth across sx, and hoist the input size
+        // property getters out of the innermost loop.
+        rowBase := FInputCopy.GetRawPos(baseX, baseY, c);
         for sy := 0 to 3 do
         begin
           iy := baseY + sy;
-          for sx := 0 to 3 do
+          if (iy >= 0) and (iy < inSizeY) then
           begin
-            ix := baseX + sx;
-            if (ix >= 0) and (ix < FInputCopy.SizeX) and
-               (iy >= 0) and (iy < FInputCopy.SizeY)
-              then d[sy][sx] := FInputCopy.Get(ix, iy, c)
-              else d[sy][sx] := 0;
-          end;
+            pos := rowBase;
+            for sx := 0 to 3 do
+            begin
+              ix := baseX + sx;
+              if (ix >= 0) and (ix < inSizeX)
+                then d[sy][sx] := FInputCopy.FData[pos]
+                else d[sy][sx] := 0;
+              Inc(pos, InDepth);
+            end;
+          end
+          else
+            for sx := 0 to 3 do d[sy][sx] := 0;
+          Inc(rowBase, rowStride);
         end;
         for j := 0 to 3 do
         begin
@@ -104896,11 +104957,14 @@ begin
           V[i][2] := -Bd[i][1] + Bd[i][2];
           V[i][3] := Bd[i][1] - Bd[i][3];
         end;
+        // Scatter into the depth-contiguous pack: p = i*4+j, p-stride = InDepth.
+        wBase := FWinogradInput.GetRawPos(0, tile, c);
+        pos := wBase;
         for i := 0 to 3 do
           for j := 0 to 3 do
           begin
-            p := i * 4 + j;
-            FWinogradInput[p, tile, c] := V[i][j];
+            FWinogradInput.FData[pos] := V[i][j];
+            Inc(pos, InDepth);
           end;
       end;
     end;
@@ -104913,30 +104977,49 @@ begin
   FWgVp.ReSize(NumTiles * InDepth, 1, 1);
   FWgMp.ReSize(NumTiles * NeuronCnt, 1, 1);
   pSliceFloats := NeuronCnt * InDepth;
+  // #5/#8: the two pack base pointers and the operand shapes do not change with
+  // p - the buffers were sized above and Compute re-uploads both operands every
+  // dispatch, so one buffer check covers all 16. #12: over tile the gather and
+  // scatter ends advance by constant strides (the p axis is the fast X axis, so
+  // one tile step is 16 depth slots in the packed volumes).
+  kPtr := FWinogradKernelsT.GetRawPtr(0, 0);
+  tileStrideV := FWinogradInput.GetRawPos(0, 1);
+  tileStrideM := FWinogradM.GetRawPos(0, 1);
+  FDotCL.ReallocateBuffersIfRequired(FWgUp, FWgVp, InDepth);
   for p := 0 to 15 do
   begin
     // Copy the contiguous p block of the resident transposed kernel pack ([c*N+o]).
-    srcPtr := FWinogradKernelsT.GetRawPtr(0, 0);
-    Move(srcPtr^[p * pSliceFloats], FWgUp.FData[0],
+    Move(kPtr^[p * pSliceFloats], FWgUp.FData[0],
       pSliceFloats * csNeuralFloatSize);   // #13: contiguous copy
     // Gather the p slice of the transformed input into row-major [tile*InDepth+c].
     // FWinogradInput stores p on the fast X axis, so the tile slices are strided,
     // but each tile's depth run is contiguous - one Move per tile (#13).
+    vGatherPos := FWinogradInput.GetRawPos(p, 0);
+    vDstPos := 0;
     for tile := 0 to NumTilesM1 do
-      Move(FWinogradInput.FData[FWinogradInput.GetRawPos(p, tile)],
-        FWgVp.FData[tile * InDepth], InDepth * csNeuralFloatSize);
+    begin
+      Move(FWinogradInput.FData[vGatherPos], FWgVp.FData[vDstPos],
+        InDepth * csNeuralFloatSize);
+      Inc(vGatherPos, tileStrideV);
+      Inc(vDstPos, InDepth);
+    end;
 
-    FDotCL.ReallocateBuffersIfRequired(FWgUp, FWgVp, InDepth);
     FDotCL.Compute(FWgUp, FWgVp, {ActFN}0, {NewVAs}true, {NewVBs}true);
     FDotCL.FinishAndLoadResult(FWgMp, 0);
 
     // Scatter Res[tile*NeuronCnt + o] into FWinogradM[p, tile, o]. Each tile's
-    // neuron run is contiguous on both sides - one Move per tile (#13).
+    // neuron run is contiguous on both sides - one Move per tile (#13). The
+    // result pointer is re-read here: FinishAndLoadResult may resize FWgMp.
     srcPtr := FWgMp.GetRawPtr(0, 0);
+    mSrcPos := 0;
+    mDstPos := FWinogradM.GetRawPos(p, 0);
     for tile := 0 to NumTilesM1 do
-      Move(srcPtr^[tile * NeuronCnt],
-        FWinogradM.FData[FWinogradM.GetRawPos(p, tile)],
+    begin
+      Move(srcPtr^[mSrcPos], FWinogradM.FData[mDstPos],
         NeuronCnt * csNeuralFloatSize);
+      Inc(mSrcPos, NeuronCnt);
+      Inc(mDstPos, tileStrideM);
+    end;
   end;
 
   // --- Output transform Y = A^T M A and scatter into FOutputRaw (CPU). ---
@@ -104950,9 +105033,15 @@ begin
       for o := 0 to NeuronMax do
       begin
         mPtr := FWinogradM.GetRawPtr(0, tile, o);
+        // Read M[i][j] = mPtr[(i*4+j)*NeuronCnt]  (depth axis = neuron).
+        // Rule #12: carry the p-strided offset instead of re-multiplying.
+        pos := 0;
         for i := 0 to 3 do
           for j := 0 to 3 do
-            M[i][j] := mPtr^[(i * 4 + j) * NeuronCnt];
+          begin
+            M[i][j] := mPtr^[pos];
+            Inc(pos, NeuronCnt);
+          end;
         for j := 0 to 3 do
         begin
           AM[0][j] := M[0][j] + M[1][j] + M[2][j];
@@ -104967,11 +105056,15 @@ begin
         begin
           outY := baseY + i;
           if outY >= FOutputSizeY then Continue;
+          // #11/#12: the row base is invariant across j and one output column
+          // step is NeuronCnt elements (depth innermost). Advance it
+          // unconditionally so the edge-drop test cannot desynchronise it.
+          outBase := FOutputRaw.GetRawPos(baseX, outY) + o;
           for j := 0 to 1 do
           begin
             outX := baseX + j;
-            if outX >= FOutputSizeX then Continue;
-            FOutputRaw[outX, outY, o] := Y[i][j];
+            if outX < FOutputSizeX then FOutputRaw.FData[outBase] := Y[i][j];
+            Inc(outBase, NeuronCnt);
           end;
         end;
       end;
