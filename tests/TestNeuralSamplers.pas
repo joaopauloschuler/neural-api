@@ -85,6 +85,11 @@ type
     // silently takes the plain full-sort branch and proves nothing).
     procedure TestTopPLargeVocabNucleusIsCorrect;
     procedure TestTopPLargeVocabFlatDistributionRetries;
+
+    // Nucleus closure and the weighted draw inside it.
+    procedure TestTopPFullMassIsNotGreedy;
+    procedure TestTopPNucleusIncludesCrossingToken;
+    procedure TestTopPDrawIsMassWeighted;
     procedure TestWeightedTopKLargeVocabNeverDrawsOutsideTopK;
     procedure TestMinPLargeVocabRespectsThreshold;
     procedure TestMinPCompactionKeptSetMatchesReference;
@@ -1483,9 +1488,9 @@ begin
     for I := 0 to V_SIZE - 1 do
     begin
       Cum := Cum + V.Raw[I];
-      if Cum > 0.80 then
+      if Cum >= 0.80 then
       begin
-        NucleusSize := I;
+        NucleusSize := I + 1; // the crossing token belongs to the nucleus
         Break;
       end;
     end;
@@ -2012,6 +2017,118 @@ begin
   finally
     Sampler.Free;
     V.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestTopPFullMassIsNotGreedy;
+const
+  V_SIZE = 32;
+var
+  Sampler: TNNetSamplerTopP;
+  V: TNNetVolume;
+  I, Token, Distinct, TailHits: integer;
+  Seen: array[0..V_SIZE - 1] of boolean;
+begin
+  // TopP = 1.0 asks for the whole distribution: the nucleus never "closes"
+  // early, and the sampler must fall through to full ancestral sampling
+  // instead of returning the argmax every time.
+  Sampler := TNNetSamplerTopP.Create(1.0);
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  try
+    V.Fill(0.02);
+    V.Raw[0] := 0.02 + (1.0 - V_SIZE * 0.02); // a modest peak, mass sums to 1
+    for I := 0 to V_SIZE - 1 do Seen[I] := false;
+    RandSeed := 20260826;
+    Distinct := 0;
+    TailHits := 0;
+    for I := 0 to 999 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('TopP=1 draw must be a valid token, got ' + IntToStr(Token),
+        (Token >= 0) and (Token < V_SIZE));
+      if not Seen[Token] then
+      begin
+        Seen[Token] := true;
+        Inc(Distinct);
+      end;
+      if Token > 0 then Inc(TailHits);
+    end;
+    AssertTrue('TopP=1 must not degenerate to greedy, distinct=' +
+      IntToStr(Distinct), Distinct > 10);
+    // The tail carries ~62% of the mass here, so it must dominate the draws.
+    AssertTrue('TopP=1 must sample the low-probability tail, hits=' +
+      IntToStr(TailHits), TailHits > 400);
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestTopPNucleusIncludesCrossingToken;
+var
+  Sampler: TNNetSamplerTopP;
+  V: TNNetVolume;
+  I, Token, Hits0, Hits1: integer;
+begin
+  // Masses 0.5 / 0.3 / 0.2: the smallest prefix reaching 0.75 is {0, 1}, so
+  // the token that CROSSES the threshold (index 1) is inside the nucleus and
+  // index 2 is outside it.
+  Sampler := TNNetSamplerTopP.Create(0.75);
+  V := TNNetVolume.Create(3, 1, 1);
+  try
+    V.Raw[0] := 0.5;
+    V.Raw[1] := 0.3;
+    V.Raw[2] := 0.2;
+    RandSeed := 4242;
+    Hits0 := 0;
+    Hits1 := 0;
+    for I := 0 to 999 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('token 2 is outside the 0.75 nucleus', Token <> 2);
+      if Token = 0 then Inc(Hits0);
+      if Token = 1 then Inc(Hits1);
+    end;
+    AssertEquals('every draw must land in the nucleus', 1000, Hits0 + Hits1);
+    AssertTrue('the crossing token must be reachable, hits=' + IntToStr(Hits1),
+      Hits1 > 100);
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestTopPDrawIsMassWeighted;
+const
+  DRAWS = 4000;
+var
+  Sampler: TNNetSamplerTopP;
+  V: TNNetVolume;
+  I, Token, Hits0: integer;
+  Share: TNeuralFloat;
+begin
+  // Nucleus {0, 1} with masses 0.6 / 0.3 renormalizes to 2/3 and 1/3. A
+  // uniform draw over the two members would give 0.5 instead.
+  Sampler := TNNetSamplerTopP.Create(0.85);
+  V := TNNetVolume.Create(8, 1, 1);
+  try
+    V.Fill(0.0166666667);
+    V.Raw[0] := 0.6;
+    V.Raw[1] := 0.3;
+    RandSeed := 987654;
+    Hits0 := 0;
+    for I := 0 to DRAWS - 1 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('draw must stay inside the nucleus', Token < 2);
+      if Token = 0 then Inc(Hits0);
+    end;
+    Share := Hits0 / DRAWS;
+    AssertTrue('the top token must take ~2/3 of the draws, not 1/2, got ' +
+      FloatToStr(Share), (Share > 0.63) and (Share < 0.70));
+  finally
+    V.Free;
+    Sampler.Free;
   end;
 end;
 

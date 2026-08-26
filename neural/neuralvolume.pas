@@ -1077,6 +1077,11 @@ type
   end;
 
   { TNNetSamplerTopP }
+  // Nucleus (top-p) sampling. Operates on PROBABILITIES (a post-softmax
+  // volume): keeps the SMALLEST descending prefix whose cumulative mass
+  // reaches TopP - the crossing token included - renormalizes the kept mass
+  // and draws PROPORTIONALLY to it. TopP >= 1 keeps the whole row, i.e. full
+  // ancestral sampling; TopP <= 0 keeps the argmax alone (greedy).
   TNNetSamplerTopP = class (TNNetSamplerBase)
     protected
       FTopP: TNeuralFloat;
@@ -5480,9 +5485,9 @@ const
   // is not, the retry below pays one full sort and is still correct.
   csTopPAdaptiveK = 256;
 var
-  CumulativeSum: TNeuralFloat;
-  I, Threshold, Hi: Integer;
-  Found, Truncated: boolean;
+  KeptSum, Roll, Cumulative: TNeuralFloat;
+  I, KeptCount, KeptCountM1, Hi: Integer;
+  Truncated: boolean;
 begin
   if FCount = 0 then
   begin
@@ -5495,33 +5500,46 @@ begin
   Truncated := FCount > csTopPAdaptiveMin;
   if Truncated then SelectTopCandidates(csTopPAdaptiveK)
   else SortTokenArray();
+  // Smallest prefix whose cumulative mass REACHES FTopP. The token that
+  // crosses the threshold is part of the nucleus, so it is counted before the
+  // test. When the window runs out without reaching FTopP (FTopP >= 1, or a
+  // row that does not sum to one) the nucleus is the whole window, i.e. full
+  // ancestral sampling - not a silent collapse to the argmax.
   repeat
-    CumulativeSum := 0;
-    Threshold := 0;
-    Found := false;
+    KeptCount := 0;
+    KeptSum := 0;
     Hi := FCount - 1;
     for I := 0 to Hi do
     begin
-      CumulativeSum := CumulativeSum + FTokenArr[I].Score;
-      if CumulativeSum > FTopP then
-      begin
-        Threshold := I;
-        Found := true;
-        Break;
-      end;
+      Inc(KeptCount);
+      KeptSum := KeptSum + FTokenArr[I].Score;
+      if KeptSum >= FTopP then Break;
     end;
-    if Found or (not Truncated) then Break;
+    if (KeptSum >= FTopP) or (not Truncated) then Break;
     // The prefix did not hold FTopP of the mass: re-arm the full row (the
     // partition only permuted it) and redo the scan exactly once.
     RestoreFullWindowSorted();
     Truncated := false;
   until false;
-
-  // Randomly select one of the top tokens within the threshold.
-  if Threshold > 0 then
-    Result := FTokenArr[Random(Threshold)].Token
-  else
-    Result := FTokenArr[0].Token; // Fallback in case P is too low.
+  if KeptSum <= 0 then
+  begin
+    Result := FTokenArr[0].Token; // fallback: degenerate distribution
+    exit;
+  end;
+  // Weighted draw proportional to the renormalized kept mass.
+  Roll := Random * KeptSum;
+  Cumulative := 0;
+  KeptCountM1 := KeptCount - 1;
+  Result := FTokenArr[KeptCountM1].Token; // numeric-safety fallback
+  for I := 0 to KeptCountM1 do
+  begin
+    Cumulative := Cumulative + FTokenArr[I].Score;
+    if Roll < Cumulative then
+    begin
+      Result := FTokenArr[I].Token;
+      exit;
+    end;
+  end;
 end;
 
 function TNNetSamplerTopP.GetToken(Origin: TNNetVolume): integer;
