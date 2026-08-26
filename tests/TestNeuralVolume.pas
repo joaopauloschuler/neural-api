@@ -28,6 +28,7 @@ type
     procedure TestVolumeAddScalarParity;
     procedure TestVolumeSumSqrCenteredParity;
     procedure TestVolumeReluGateMaskParity;
+    procedure TestVolumeReluGradParity;
     procedure TestVolumeLeakyReluParity;
     procedure TestVolumeReluLParity;
     procedure TestVolumeMaxPosParity;
@@ -573,6 +574,72 @@ begin
   TNNetVolume.ReluGateMask(TNeuralFloatArrPtr(@Src[0]),
     TNeuralFloatArrPtr(@Src[0]), 0);
   AssertEquals('empty run', 5.0, Src[0], 0.0);
+end;
+
+procedure TTestNeuralVolume.TestVolumeReluGradParity;
+// ReluGrad is AVXReluGrad on an AVX2/64-bit build and a scalar loop everywhere
+// else. It is a pure select with no arithmetic, so both paths must agree
+// BIT-exactly -- including at the boundary, where the contract is > 0 (so both
+// +0.0 and -0.0 gate SHUT, unlike ReluGateMask's >= 0) and NaN gates shut. The
+// sizes separate the three parts of the vectorized routine - the 32-element
+// unrolled body, the 8-element remainder loop and the scalar tail.
+const
+  Sizes: array[0..15] of integer =
+    (1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 39, 40, 47, 64, 128, 1000);
+var
+  Raw, Err, Dst, Ref: array of TNeuralFloat;
+  SI, K, N: integer;
+begin
+  RandSeed := 314159;
+  for SI := 0 to High(Sizes) do
+  begin
+    N := Sizes[SI];
+    SetLength(Raw, N);
+    SetLength(Err, N);
+    SetLength(Dst, N + 1);   // one guard slot past the run
+    SetLength(Ref, N);
+    for K := 0 to N - 1 do
+    begin
+      case K mod 7 of
+        0: Raw[K] := 0.0;
+        1: Raw[K] := -0.0;
+        2: Raw[K] := -1e-30;
+        3: Raw[K] := 1e-30;
+      else
+        Raw[K] := (Random - 0.5) * 8;
+      end;
+      Err[K] := (Random - 0.5) * 20;
+      Dst[K] := 12345;
+      if Raw[K] > 0 then Ref[K] := Err[K] else Ref[K] := 0;
+    end;
+    Dst[N] := 12345;
+    TNNetVolume.ReluGrad(TNeuralFloatArrPtr(@Dst[0]),
+      TNeuralFloatArrPtr(@Err[0]), TNeuralFloatArrPtr(@Raw[0]), N);
+    for K := 0 to N - 1 do
+      AssertEquals('ReluGrad[' + IntToStr(K) + '] (N=' + IntToStr(N) + ')',
+        Ref[K], Dst[K], 0.0);
+    AssertEquals('ReluGrad wrote past N=' + IntToStr(N), 12345.0, Dst[N], 0.0);
+  end;
+  // In-place (dst = err) must produce the same gated errors.
+  N := 40;
+  SetLength(Raw, N);
+  SetLength(Err, N);
+  SetLength(Ref, N);
+  for K := 0 to N - 1 do
+  begin
+    Raw[K] := (Random - 0.5) * 8;
+    Err[K] := (Random - 0.5) * 20;
+    if Raw[K] > 0 then Ref[K] := Err[K] else Ref[K] := 0;
+  end;
+  TNNetVolume.ReluGrad(TNeuralFloatArrPtr(@Err[0]),
+    TNeuralFloatArrPtr(@Err[0]), TNeuralFloatArrPtr(@Raw[0]), N);
+  for K := 0 to N - 1 do
+    AssertEquals('ReluGrad in-place[' + IntToStr(K) + ']', Ref[K], Err[K], 0.0);
+  // A zero-length run must leave the buffer untouched.
+  Err[0] := 5.0;
+  TNNetVolume.ReluGrad(TNeuralFloatArrPtr(@Err[0]),
+    TNeuralFloatArrPtr(@Err[0]), TNeuralFloatArrPtr(@Raw[0]), 0);
+  AssertEquals('empty run', 5.0, Err[0], 0.0);
 end;
 
 procedure TTestNeuralVolume.TestVolumeLeakyReluParity;

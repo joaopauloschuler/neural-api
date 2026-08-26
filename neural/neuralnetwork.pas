@@ -115115,6 +115115,60 @@ begin
   end;
 end;
 
+// Hoare-partition quickselect: permutes A[0..Count-1] so that A[K] holds the
+// K-th smallest value and everything below index K is <= it. Average O(Count)
+// against a full sort's O(Count log Count) — and against the O(Count^2)
+// insertion sort this replaced, on buffers that reach one activation per unit
+// of a whole feature map. The median-of-three pivot keeps an already-sorted or
+// all-equal input (a saturated or collapsed layer) off the quadratic path.
+// Same shape as PartialSelectTokenArray in neuralvolume.pas, ascending and on
+// plain Singles. Coded by Claude (AI).
+procedure SelectNthSmallestSingle(var A: TNeuralFloatDynArr;
+  Count, K: integer);
+var
+  Lo, Hi, I, J, Mid: integer;
+  Pivot, T: TNeuralFloat;
+begin
+  if (K < 0) or (K >= Count) then exit;
+  Lo := 0;
+  Hi := Count - 1;
+  while Lo < Hi do
+  begin
+    // Median of A[Lo], A[Mid], A[Hi] as the pivot value.
+    Mid := (Lo + Hi) shr 1;
+    if A[Mid] < A[Lo] then
+    begin
+      T := A[Mid]; A[Mid] := A[Lo]; A[Lo] := T;
+    end;
+    if A[Hi] < A[Lo] then
+    begin
+      T := A[Hi]; A[Hi] := A[Lo]; A[Lo] := T;
+    end;
+    if A[Mid] > A[Hi] then
+    begin
+      T := A[Mid]; A[Mid] := A[Hi]; A[Hi] := T;
+    end;
+    Pivot := A[Mid];
+    I := Lo;
+    J := Hi;
+    repeat
+      while A[I] < Pivot do Inc(I);
+      while A[J] > Pivot do Dec(J);
+      if I <= J then
+      begin
+        T := A[I]; A[I] := A[J]; A[J] := T;
+        Inc(I);
+        Dec(J);
+      end;
+    until I > J;
+    // Descend into the side that still contains rank K; when K falls inside
+    // the equal-to-pivot gap the split is already exact.
+    if K <= J then Hi := J
+    else if K >= I then Lo := I
+    else Break;
+  end;
+end;
+
 class function TNNet.ActivationStatsReport(
   NN: TNNet;
   Samples: TNNetVolumeList;
@@ -115148,9 +115202,12 @@ var
   HistBins: array of int64;
   MaxHistBin: int64;
   // |median| approximation from the last probe sample.
-  LastVals: array of TNeuralFloat;
-  Tmp: TNeuralFloat;
-  J: integer;
+  LastVals: TNeuralFloatDynArr;
+  MedIdx: integer;
+  LeftMax: TNeuralFloat;
+  OutVol: TNNetVolume;
+  IsLastSample: boolean;
+  V2, V3: TNeuralFloat;
   // Network-level std histogram.
   StdBins: array of integer;
   MinStd, MaxStd, StdRange: TNeuralFloat;
@@ -115216,12 +115273,16 @@ begin
       SetLength(LastVals, Units);
 
       MaxSamplePos := Samples.Count - 1;
+      // Compute() refills this volume in place, so the reference stays valid
+      // for the whole sweep.
+      OutVol := Layer.Output;
       for SampleIdx := 0 to MaxSamplePos do
       begin
         NN.Compute(Samples[SampleIdx]);
+        IsLastSample := SampleIdx = MaxSamplePos;
         for UnitIdx := 0 to UnitsM1 do
         begin
-          V := Layer.Output.Raw[UnitIdx];
+          V := OutVol.FData[UnitIdx];
           AbsV := Abs(V);
           if N = 0 then
           begin
@@ -115233,10 +115294,14 @@ begin
             if V < MinV then MinV := V;
             if V > MaxV then MaxV := V;
           end;
+          V2 := V * V;
+          V3 := V2 * V;
           SumV := SumV + V;
-          SumSq := SumSq + V * V;
-          SumCube := SumCube + V * V * V;
-          SumQuad := SumQuad + V * V * V * V;
+          SumSq := SumSq + V2;
+          SumCube := SumCube + V3;
+          // V3 * V, not V2 * V2: same association as the original
+          // V*V*V*V, so the accumulated sum stays bit-identical.
+          SumQuad := SumQuad + V3 * V;
           if AbsV > MaxAbsV then MaxAbsV := AbsV;
           if V < 0 then Inc(NegCount);
           if AbsV < cNearZero then Inc(NearZeroCount);
@@ -115245,7 +115310,7 @@ begin
           Inc(N);
           // Keep only the last sample's values for the |median| estimate so
           // memory stays bounded (no full-batch activation storage).
-          if SampleIdx = Samples.Count - 1 then
+          if IsLastSample then
             LastVals[UnitIdx] := V;
         end;
       end;
@@ -115277,24 +115342,24 @@ begin
         Kurt := 0;
       end;
 
-      // |median| from the last probe sample: simple insertion sort of the
-      // bounded Units-sized buffer (deterministic, memory-bounded).
-      for UnitIdx := 1 to UnitsM1 do
-      begin
-        Tmp := LastVals[UnitIdx];
-        J := UnitIdx - 1;
-        while (J >= 0) and (LastVals[J] > Tmp) do
-        begin
-          LastVals[J + 1] := LastVals[J];
-          Dec(J);
-        end;
-        LastVals[J + 1] := Tmp;
-      end;
-      if Units mod 2 = 1 then
-        MedAbs := Abs(LastVals[Units div 2])
+      // |median| from the last probe sample. Only one rank is needed, so this
+      // quickselects it instead of sorting the whole Units-sized buffer; the
+      // histogram below only counts values into bins, so the partial ordering
+      // quickselect leaves behind is all this buffer ever has to carry.
+      MedIdx := Units div 2;
+      SelectNthSmallestSingle(LastVals, Units, MedIdx);
+      if Units and 1 = 1 then
+        MedAbs := Abs(LastVals[MedIdx])
       else
-        MedAbs := Abs(0.5 *
-          (LastVals[Units div 2 - 1] + LastVals[Units div 2]));
+      begin
+        // Even Units averages ranks MedIdx-1 and MedIdx. Quickselect placed
+        // rank MedIdx and left everything below it <= that value, so the
+        // largest of the lower part is rank MedIdx-1.
+        LeftMax := LastVals[0];
+        for UnitIdx := 1 to MedIdx - 1 do
+          if LastVals[UnitIdx] > LeftMax then LeftMax := LastVals[UnitIdx];
+        MedAbs := Abs(0.5 * (LeftMax + LastVals[MedIdx]));
+      end;
 
       SatLowFrac := SatLowCount / N;
       SatHighFrac := SatHighCount / N;
@@ -115816,6 +115881,7 @@ const
   cAlphaHi      = 4.0;      // alpha > cAlphaHi..cUnderTrained: drifting random
   cUnderTrained = 6.0;      // alpha > this: under-trained / still random-like
   cBadKS        = 0.20;     // KS distance above this: poor power-law fit
+  cInvLn10: Double = 0.43429448190325176; // 1/ln(10), for log10 from ln
 type
   TDoubleArray = array of Double;
   TDoubleMatrix = array of TDoubleArray;
@@ -115851,11 +115917,17 @@ var
   // hoisted scratch (mode objfpc has no inline var declarations)
   SumW, SumSqW, Key: Double;
   GRow: TDoubleArray;
+  WiPtr: PSingle;
   WVol, WVolJ: TNNetVolume;
   WiVal: TNeuralFloat;
   Cnt, FirstPos, NPos, CutHi, Cut, NTail: integer;
   BestKS, BestAlpha, BestLMin, LMin, SumLn, AFit, DKS, Emp, FitV: Double;
   HaveLg: boolean;
+  // ln(Eig[i]) and its suffix sums, built once per layer: the tail fit sweeps
+  // every cut over the same eigenvalues, and the log10 histogram walks them
+  // twice more.
+  LnEig, SufLn: TDoubleArray;
+  LnCut, NegExp: Double;
 
   // In-place symmetric cyclic Jacobi eigensolver. A is (Dim x Dim) symmetric;
   // on return A's diagonal holds the eigenvalues (off-diagonals driven to ~0).
@@ -116077,11 +116149,13 @@ begin
         for I := 0 to DimM1 do
         begin
           WVol := Layer.Neurons[I].Weights;
+          WiPtr := PSingle(WVol.GetRawPtr());
+          GRow := Gram[I];
           for J := I to DimM1 do
           begin
             WVolJ := Layer.Neurons[J].Weights;
-            Gram[I][J] := DotProductSSD(
-              PSingle(WVol.GetRawPtr()), PSingle(WVolJ.GetRawPtr()), FanIn);
+            GRow[J] := DotProductSSD(
+              WiPtr, PSingle(WVolJ.GetRawPtr()), FanIn);
           end;
         end;
       end;
@@ -116152,6 +116226,21 @@ begin
       // eigenvalue a pure-random Gaussian Gram of matching std would produce.
       MPEdge := Sqr(1.0 + Sqrt(FanIn / FanOut)) * Std * Std * FanOut;
 
+      // One log per eigenvalue for the whole layer. Both consumers below guard
+      // on Eig[I] > 1e-20 before reading LnEig (the tail fit implicitly: its
+      // cut is checked > 1e-20 and the spectrum is ascending), so the zero
+      // filled in for a vanishing eigenvalue is never read. SufLn[I] is the
+      // sum of LnEig over the tail I..Dim-1, which turns each cut's Hill sum
+      // into a subtraction instead of a fresh pass of logs.
+      SetLength(LnEig, Dim);
+      SetLength(SufLn, Dim + 1);
+      SufLn[Dim] := 0;
+      for I := DimM1 downto 0 do
+      begin
+        if Eig[I] > 1e-20 then LnEig[I] := pcr_logf(Eig[I]) else LnEig[I] := 0;
+        SufLn[I] := SufLn[I + 1] + LnEig[I];
+      end;
+
       // --- Power-law tail fit (Clauset/Hill MLE swept over lambda_min). ---
       // For each candidate cut lambda_min = Eig[c] (c from largest downward,
       // keeping >= cMinTailPts tail points), the Hill MLE is
@@ -116180,17 +116269,20 @@ begin
           LMin := Eig[Cut];
           if LMin <= 1e-20 then Continue;
           NTail := Dim - Cut; // tail = Eig[Cut..Dim-1]
-          SumLn := 0;
-          for I := Cut to DimM1 do
-            SumLn := SumLn + pcr_logf(Eig[I] / LMin);
+          LnCut := LnEig[Cut];
+          // sum ln(Eig[I]/LMin) over the tail, from the precomputed suffix sum
+          SumLn := SufLn[Cut] - NTail * LnCut;
           if SumLn <= 1e-12 then Continue;
           AFit := 1.0 + NTail / SumLn;
-          // KS distance: empirical tail CDF vs fitted power-law CDF.
+          // KS distance: empirical tail CDF vs fitted power-law CDF. The
+          // (Eig[I]/LMin)^(1-alpha) power is exp((1-alpha)*(ln x - ln LMin)),
+          // so the logs already in hand replace a pow per tail point.
+          NegExp := 1.0 - AFit;
           DKS := 0;
           for I := Cut to DimM1 do
           begin
             Emp := (I - Cut + 1) / NTail; // 1/n .. 1
-            FitV := 1.0 - pcr_powf(Eig[I] / LMin, 1.0 - AFit);
+            FitV := 1.0 - NeuralExp(NegExp * (LnEig[I] - LnCut));
             if Abs(Emp - FitV) > DKS then DKS := Abs(Emp - FitV);
           end;
           if DKS < BestKS then
@@ -116247,7 +116339,8 @@ begin
       for I := 0 to DimM1 do
         if Eig[I] > 1e-20 then
         begin
-          Lg := pcr_log10f(Eig[I]);
+          // log10(x) = ln(x)/ln(10); LnEig was built above.
+          Lg := LnEig[I] * cInvLn10;
           if not HaveLg then
           begin
             MinL := Lg; MaxL := Lg; HaveLg := True;
@@ -116266,7 +116359,7 @@ begin
           for I := 0 to DimM1 do
             if Eig[I] > 1e-20 then
             begin
-              Lg := pcr_log10f(Eig[I]);
+              Lg := LnEig[I] * cInvLn10;
               if LRange > 1e-30 then
                 K := Trunc(((Lg - MinL) / LRange) * cBins)
               else
@@ -132317,17 +132410,11 @@ procedure TNNetLayer.ComputeErrorDeriv();
   end;
   // ReLU derivative is 1 above zero and 0 below, so the generic
   // err * f'(raw) reduces to a copy-or-zero: no indirect call, no multiply.
+  // TNNetVolume.ReluGrad is that masked select as one vectorized pass.
   procedure ReluComputeErrorDeriv();
-  var
-    MaxOutput, OutputCnt: integer;
   begin
-    MaxOutput := OutputError.Size - 1;
-    for OutputCnt := 0 to MaxOutput do
-    begin
-      if FOutputRaw.FData[OutputCnt] > 0
-        then OutputErrorDeriv.FData[OutputCnt] := OutputError.FData[OutputCnt]
-        else OutputErrorDeriv.FData[OutputCnt] := 0;
-    end;
+    TNNetVolume.ReluGrad(FOutputErrorDeriv.DataPtr, FOutputError.DataPtr,
+      FOutputRaw.DataPtr, FOutputError.Size);
   end;
 begin
   {$IFDEF FPC}

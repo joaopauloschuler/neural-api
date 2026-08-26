@@ -679,6 +679,13 @@ type
       // other build runs the equivalent scalar loop. Bit-identical either way,
       // the >= 0 boundary included. Buffers may alias (dst = src).
       class procedure ReluGateMask(pDst, pSrc: TNeuralFloatArrPtr; N: integer); static;
+      // ReluGrad writes the ReLU backward masked select
+      // dst[0..N-1] := err[i] where raw[i] > 0 and 0 elsewhere, the whole
+      // err * f'(raw) product for a ReLU layer. AVX2/64-bit builds run
+      // AVXReluGrad; every other build runs the equivalent scalar loop.
+      // Bit-identical either way, the > 0 boundary included (both signed zeros
+      // gate to 0). Buffers may alias (dst = err).
+      class procedure ReluGrad(pDst, pErr, pRaw: TNeuralFloatArrPtr; N: integer); static;
       // LeakyRelu writes dst[0..N-1] := src[i] when src[i] >= 0 and
       // Slope*src[i] otherwise - the activation every HiFi-GAN / vocoder
       // resblock applies over its whole channel x timestep signal.
@@ -2749,6 +2756,92 @@ begin
   NumElementsM1 := NumElements - 1;
   for i := localNumElements to NumElementsM1 do
     PtrDst^[i] := NeuralSingleToBFloat16(PtrSrc^[i]);
+end;
+
+// dst[i] := err[i] where raw[i] > 0, else 0.0 -- the ReLU backward masked
+// select. The GT_OQ predicate (14) is false for NaN and false for both signed
+// zeros, exactly as the scalar `raw > 0` test is, and the vandps against the
+// error vector reproduces every error bit pattern (a NaN error included) where
+// the mask is all-ones and a clean +0.0 where it is not. So this is
+// bit-identical to the scalar loop, boundary included. Nothing but a zero
+// register is needed, so the kernel references no constant at all and stays
+// position independent.
+//
+// The loop shape is DotProductsTiled's: an unrolled body doing 32 elements per
+// iteration through four independent register chains, then an 8-at-a-time loop
+// for the 8..31 remainder, then the Pascal tail for the last 1..7.
+// Coded by Claude (AI).
+procedure AVXReluGrad(PtrDst, PtrErr, PtrRaw: TNeuralFloatArrPtr;
+  NumElements: integer);
+var
+  localNumElements, i, NumElementsM1: integer;
+begin
+  localNumElements := NumElements and (not 7);
+  if localNumElements > 0 then
+  begin
+  asm
+  mov rax, PtrRaw
+  mov r8, PtrErr
+  mov rdx, PtrDst
+  mov ecx, localNumElements
+  vxorps    ymm3, ymm3, ymm3
+
+  push rcx
+  shr ecx, 5                       // large iterations = elements / 32
+  jz @SkipLargeGradLoop
+@LargeGradLoop:
+  vmovups   ymm0, [rax]            // 4 x 8 raw values, four independent chains
+  vmovups   ymm1, [rax+32]
+  vmovups   ymm4, [rax+64]
+  vmovups   ymm5, [rax+96]
+
+  vcmpps    ymm0, ymm0, ymm3, 14   // GT_OQ: false for NaN and for both zeros
+  vcmpps    ymm1, ymm1, ymm3, 14
+  vcmpps    ymm4, ymm4, ymm3, 14
+  vcmpps    ymm5, ymm5, ymm3, 14
+
+  vandps    ymm0, ymm0, [r8]       // keep err where raw > 0, else +0.0
+  vandps    ymm1, ymm1, [r8+32]
+  vandps    ymm4, ymm4, [r8+64]
+  vandps    ymm5, ymm5, [r8+96]
+
+  vmovups   [rdx], ymm0
+  vmovups   [rdx+32], ymm1
+  vmovups   [rdx+64], ymm4
+  vmovups   [rdx+96], ymm5
+
+  add rax, 128
+  add r8, 128
+  add rdx, 128
+  dec ecx
+  jnz @LargeGradLoop
+
+@SkipLargeGradLoop:
+  pop rcx
+  and ecx, $0000001F
+  jz @EndGrad
+  shr ecx, 3                       // small iterations = (elements mod 32) / 8
+@SmallGradLoop:
+  vmovups   ymm0, [rax]
+  vcmpps    ymm0, ymm0, ymm3, 14
+  vandps    ymm0, ymm0, [r8]
+  vmovups   [rdx], ymm0
+  add rax, 32
+  add r8, 32
+  add rdx, 32
+  dec ecx
+  jnz @SmallGradLoop
+
+@EndGrad:
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'R8', 'ymm0', 'ymm1', 'ymm3', 'ymm4', 'ymm5'
+  ];
+  end;
+  NumElementsM1 := NumElements - 1;
+  for i := localNumElements to NumElementsM1 do
+    if PtrRaw^[i] > 0 then PtrDst^[i] := PtrErr^[i] else PtrDst^[i] := 0;
 end;
 
 // dst[i] := 1.0 when src[i] >= 0, else 0.0 -- the ReLU derivative gate mask.
@@ -11160,6 +11253,32 @@ begin
   {$ELSE}
   for I := 0 to N - 1 do
     if pSrc^[I] >= 0 then pDst^[I] := 1 else pDst^[I] := 0;
+  {$ENDIF}
+end;
+
+class procedure TNNetVolume.ReluGrad(pDst, pErr, pRaw: TNeuralFloatArrPtr;
+  N: integer);
+{$IFNDEF AVX2}
+var
+  I: integer;
+{$ELSE}
+{$IFNDEF AVX64}
+var
+  I: integer;
+{$ENDIF}
+{$ENDIF}
+begin
+  if N <= 0 then exit;
+  {$IFDEF AVX2}
+  {$IFDEF AVX64}
+  AVXReluGrad(pDst, pErr, pRaw, N);
+  {$ELSE}
+  for I := 0 to N - 1 do
+    if pRaw^[I] > 0 then pDst^[I] := pErr^[I] else pDst^[I] := 0;
+  {$ENDIF}
+  {$ELSE}
+  for I := 0 to N - 1 do
+    if pRaw^[I] > 0 then pDst^[I] := pErr^[I] else pDst^[I] := 0;
   {$ENDIF}
 end;
 
