@@ -59,6 +59,19 @@ type
     // LoadWavResampledToVolume on an 8 kHz WAV returns a 16 kHz volume of the
     // right length, round-tripped through a temp WAV on disk.
     procedure TestLoadWavResampledRoundTrip;
+    // ComputeWhisperLogMel skips frames that lie entirely in the zero tail
+    // WITHOUT scanning them: the skip must fire for exactly those frames and
+    // not one frame earlier, so rows that still overlap the waveform must not
+    // collapse to the mel floor.
+    procedure TestWhisperLogMelZeroTailSkip;
+    // A silent waveform produces one uniform log-mel value everywhere.
+    procedure TestWhisperLogMelSilence;
+    // ComputeMusicgenMelodyChroma emits a one-hot row per frame and a steady
+    // pure tone picks the same chroma in every interior frame.
+    procedure TestMelodyChromaOneHotPureTone;
+    // BuildChromaFilterBank rows are the column-L2-normalized Gaussians rolled
+    // by 3*(NumChroma div 12): assert the roll and the (weighted) column norms.
+    procedure TestChromaFilterBankRollAndNorm;
   end;
 
 implementation
@@ -712,6 +725,206 @@ begin
   finally
     Src.Free;
     Loaded.Free;
+  end;
+end;
+
+procedure TTestNeuralAudio.TestWhisperLogMelZeroTailSkip;
+const
+  cFrames = 50;                       // 8000 samples of 30 s-style context
+  cMels = 20;
+  cSigLen = 1600;                     // waveform occupies [0, 1600)
+var
+  Samples, Mel: TNNetVolume;
+  i, f, m: integer;
+  MinVal, V, RowMax: double;
+begin
+  Samples := TNNetVolume.Create(cSigLen, 1, 1);
+  Mel := TNNetVolume.Create(1, 1, 1);
+  try
+    for i := 0 to cSigLen - 1 do
+      Samples.FData[i] := 0.5 * Sin(2.0 * Pi * 440.0 * i / 16000.0);
+    ComputeWhisperLogMel(Samples, Mel, cMels, cFrames);
+    AssertEquals('log-mel frame count', cFrames, Mel.SizeX);
+    AssertEquals('log-mel bin count', cMels, Mel.Depth);
+    MinVal := Mel.FData[0];
+    for i := 0 to Mel.Size - 1 do
+      if Mel.FData[i] < MinVal then MinVal := Mel.FData[i];
+    // FrameStart = f*160 - 200, so frames from f = 12 on start at or after
+    // sample 1600 and are entirely inside the zero tail: floor rows.
+    for f := 12 to cFrames - 1 do
+      for m := 0 to cMels - 1 do
+        AssertEquals('zero-tail row ' + IntToStr(f) + ' is the mel floor',
+          MinVal, Mel[f, 0, m], 1e-6);
+    // Frame 11 starts at 1560 and still catches 40 signal samples; every frame
+    // up to it overlaps the waveform and must NOT have been skipped.
+    for f := 0 to 11 do
+    begin
+      RowMax := -1e30;
+      for m := 0 to cMels - 1 do
+      begin
+        V := Mel[f, 0, m];
+        if V > RowMax then RowMax := V;
+      end;
+      AssertTrue('signal-overlapping row ' + IntToStr(f) +
+        ' was not skipped as all-zero', RowMax > MinVal + 1e-4);
+    end;
+  finally
+    Samples.Free;
+    Mel.Free;
+  end;
+end;
+
+procedure TTestNeuralAudio.TestWhisperLogMelSilence;
+const
+  cFrames = 8;
+  cMels = 12;
+var
+  Samples, Mel: TNNetVolume;
+  i: integer;
+begin
+  Samples := TNNetVolume.Create(400, 1, 1);
+  Mel := TNNetVolume.Create(1, 1, 1);
+  try
+    Samples.Fill(0.0);
+    ComputeWhisperLogMel(Samples, Mel, cMels, cFrames);
+    // Everything is the mel floor, so the max-8 clamp makes the whole matrix
+    // one value: (log10(1e-10) + 4) / 4.
+    for i := 0 to Mel.Size - 1 do
+      AssertEquals('silence log-mel cell ' + IntToStr(i),
+        (-10.0 + 4.0) * 0.25, Mel.FData[i], 1e-9);
+  finally
+    Samples.Free;
+    Mel.Free;
+  end;
+end;
+
+// Independent reference for the chroma filter bank's HF freq_bins: slot b >= 1
+// is NumChroma * log2(sr*b/NFFT / (440/16)).
+function ChromaFreqBin(SampleRate, NFFT, NumChroma, b: integer): double;
+begin
+  Result := NumChroma * Ln((SampleRate * (b / NFFT)) / (440.0 / 16.0)) / Ln(2.0);
+end;
+
+procedure TTestNeuralAudio.TestChromaFilterBankRollAndNorm;
+const
+  cSr = 32000;
+  cNFFT = 1024;
+  cNumChroma = 12;
+  cRollBy = 3;                        // 3 * (NumChroma div 12)
+var
+  Filt: TNNetVolume;
+  NumKept, b, c, ArgMax, Expected: integer;
+  FB, Frac, Nearest, ColNorm, W, Tmp, V, MaxVal: double;
+begin
+  NumKept := cNFFT div 2 + 1;
+  Filt := TNNetVolume.Create;
+  try
+    BuildChromaFilterBank(Filt, cSr, cNFFT, cNumChroma);
+    AssertEquals('bank rows', cNumChroma, Filt.SizeX);
+    AssertEquals('bank kept bins', NumKept, Filt.Depth);
+    for b := 1 to NumKept - 1 do
+    begin
+      FB := ChromaFreqBin(cSr, cNFFT, cNumChroma, b);
+      // Columns are L2-normalized to 1 and then scaled by the Gaussian
+      // frequency weighting, so the column norm IS that weight. The roll is a
+      // row permutation and leaves the norm untouched.
+      Tmp := (FB / cNumChroma - 5.0) / 2.0;
+      W := Exp(-0.5 * Tmp * Tmp);
+      ColNorm := 0.0;
+      MaxVal := -1e30;
+      ArgMax := 0;
+      for c := 0 to cNumChroma - 1 do
+      begin
+        V := Filt[c, 0, b];
+        ColNorm := ColNorm + V * V;
+        if V > MaxVal then
+        begin
+          MaxVal := V;
+          ArgMax := c;
+        end;
+      end;
+      AssertEquals('column ' + IntToStr(b) + ' norm is the freq weighting',
+        W, Sqrt(ColNorm), 1e-6);
+      // Row c peaks where the wrapped distance to freq_bins is zero, i.e. at
+      // chroma (round(freq_bin) - RollBy) mod NumChroma after the roll. Only
+      // assert it where the bin is unambiguously near one semitone.
+      Nearest := Round(FB);
+      Frac := Abs(FB - Nearest);
+      if Frac < 0.2 then
+      begin
+        Expected := (Round(Nearest) - cRollBy) mod cNumChroma;
+        while Expected < 0 do Inc(Expected, cNumChroma);
+        AssertEquals('column ' + IntToStr(b) + ' peaks at the rolled chroma',
+          Expected, ArgMax);
+      end;
+    end;
+  finally
+    Filt.Free;
+  end;
+end;
+
+procedure TTestNeuralAudio.TestMelodyChromaOneHotPureTone;
+const
+  cSr = 32000;
+  cNFFT = 1024;
+  cHop = 256;
+  cNumChroma = 12;
+  cToneBin = 14;                      // 437.5 Hz: exactly on an FFT bin
+var
+  Samples, Chroma, Filt: TNNetVolume;
+  N, i, f, c, NumOnes, Hot, Expected: integer;
+  V, MaxVal, Freq: double;
+begin
+  N := 16 * cHop;
+  Samples := TNNetVolume.Create(N, 1, 1);
+  Chroma := TNNetVolume.Create(1, 1, 1);
+  Filt := TNNetVolume.Create;
+  try
+    Freq := cSr * (cToneBin / cNFFT);
+    for i := 0 to N - 1 do
+      Samples.FData[i] := Sin(2.0 * Pi * Freq * i / cSr);
+    ComputeMusicgenMelodyChroma(Samples, Chroma, cSr, cNFFT, cHop, cNumChroma);
+    AssertEquals('chroma frame count', 1 + N div cHop, Chroma.SizeX);
+    AssertEquals('chroma depth', cNumChroma, Chroma.Depth);
+    // The dominant chroma of a pure tone is the bank's own argmax at that bin.
+    BuildChromaFilterBank(Filt, cSr, cNFFT, cNumChroma);
+    MaxVal := -1e30;
+    Expected := 0;
+    for c := 0 to cNumChroma - 1 do
+    begin
+      V := Filt[c, 0, cToneBin];
+      if V > MaxVal then
+      begin
+        MaxVal := V;
+        Expected := c;
+      end;
+    end;
+    for f := 0 to Chroma.SizeX - 1 do
+    begin
+      NumOnes := 0;
+      Hot := -1;
+      for c := 0 to cNumChroma - 1 do
+      begin
+        V := Chroma[f, 0, c];
+        if V <> 0.0 then
+        begin
+          Inc(NumOnes);
+          Hot := c;
+          AssertEquals('chroma frame ' + IntToStr(f) + ' one-hot value',
+            1.0, V, 1e-9);
+        end;
+      end;
+      AssertEquals('chroma frame ' + IntToStr(f) + ' has exactly one hot bin',
+        1, NumOnes);
+      // Frames 2..(NumFrames-3) are fully inside the tone (no reflect pad).
+      if (f >= 2) and (f <= Chroma.SizeX - 3) then
+        AssertEquals('interior chroma frame ' + IntToStr(f) + ' picks the tone',
+          Expected, Hot);
+    end;
+  finally
+    Samples.Free;
+    Chroma.Free;
+    Filt.Free;
   end;
 end;
 
