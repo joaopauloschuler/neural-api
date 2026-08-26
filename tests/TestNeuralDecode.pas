@@ -276,6 +276,7 @@ type
     procedure TestJSONStateMachineNumbers;
     procedure TestJSONStateMachineTopLevelCompletionAllowsOnlyWS;
     procedure TestJSONStateMachineBalancedStackClosing;
+    procedure TestCharLevelConstraintsRejectSubwordVocab;
     procedure TestJSONConstraintValidatesMultiCharTokens;
     procedure TestJSONConstraintMaskMatchesUnguardedReference;
     procedure TestJSONStateMachineFuzzRandomWalksStayValid;
@@ -6655,6 +6656,57 @@ end;
 // Token-level constraint over MULTI-CHARACTER (BPE-style) tokens: a token is
 // allowed exactly when ALL its characters are legal continuations, validated
 // transitively through a cloned automaton; EOS (< 2) only at completion.
+// The char-level constructors map token id to Chr(id), so a vocabulary wider
+// than the byte alphabet would alias ids 256+ onto bytes. That must be
+// rejected with EArgumentException; the full 256-id byte vocabulary still
+// builds and decides tokens by their character.
+procedure TTestNeuralDecode.TestCharLevelConstraintsRejectSubwordVocab;
+const
+  ArithGrammar =
+    'root ::= term (("+"|"-") term)*'#10 +
+    'term ::= num'#10 +
+    'num ::= [0-9]+';
+var
+  J: TNNetJSONConstraint;
+  G: TNNetGrammarConstraint;
+  Raised: boolean;
+begin
+  Raised := false;
+  try
+    J := TNNetJSONConstraint.CreateCharLevel(300);
+    J.Free;
+  except
+    on EArgumentException do Raised := true;
+  end;
+  AssertTrue('JSON char-level rejects a 300-id vocabulary', Raised);
+  Raised := false;
+  try
+    G := TNNetGrammarConstraint.CreateCharLevel(ArithGrammar, 300);
+    G.Free;
+  except
+    on EArgumentException do Raised := true;
+  end;
+  AssertTrue('grammar char-level rejects a 300-id vocabulary', Raised);
+  // The full byte alphabet is still legal.
+  J := TNNetJSONConstraint.CreateCharLevel(256);
+  try
+    J.Reset([]);
+    AssertTrue('{ opens a value', J.TokenAllowed(Ord('{')));
+    AssertTrue('} does not open a value', not J.TokenAllowed(Ord('}')));
+  finally
+    J.Free;
+  end;
+  G := TNNetGrammarConstraint.CreateCharLevel(ArithGrammar, 256);
+  try
+    G.Reset([]);
+    AssertTrue('a digit starts the expression', G.TokenAllowed(Ord('7')));
+    AssertTrue('a plus does not start the expression',
+      not G.TokenAllowed(Ord('+')));
+  finally
+    G.Free;
+  end;
+end;
+
 procedure TTestNeuralDecode.TestJSONConstraintValidatesMultiCharTokens;
 var
   Dict: TStringListInt;

@@ -483,7 +483,8 @@ type
   // word-level dicts whose detokenizer inserts separators would be validated
   // without the separators. Create(Dict) snapshots Dict.DeTokenize(id) for
   // every id; CreateCharLevel(VocabSize) is the char-level model convention
-  // (token id = character code, ids < 2 special).
+  // (token id = character code, ids < 2 special) and therefore accepts at most
+  // 256 ids.
   // Coded by Claude (AI).
   TNNetJSONConstraint = class(TNNetTokenConstraint)
     private
@@ -711,7 +712,8 @@ type
   // grammar is in a complete (accepting) state; empty-string tokens are never
   // allowed. Create(GBNFText, Dict) snapshots Dict.DeTokenize(id) per id;
   // CreateCharLevel(GBNFText, VocabSize) is the char-level convention (token id
-  // = character code, ids < 2 special). Owns its TNNetGrammar.
+  // = character code, ids < 2 special) and therefore accepts at most 256 ids.
+  // Owns its TNNetGrammar.
   // Coded by Claude (AI).
   TNNetGrammarConstraint = class(TNNetTokenConstraint)
     private
@@ -3357,10 +3359,21 @@ begin
 end;
 
 constructor TNNetJSONConstraint.CreateCharLevel(VocabSize: integer);
+const
+  csMaxCharLevelVocab = 256; // Chr() alphabet: a token id is one byte
 var
   I, Hi: integer;
 begin
   inherited Create();
+  // The char-level convention maps token id to Chr(id), so the vocabulary
+  // cannot be wider than the byte alphabet - a subword vocabulary would alias
+  // ids 256..VocabSize-1 onto bytes instead of failing.
+  if VocabSize > csMaxCharLevelVocab then
+    raise EArgumentException.Create(
+      'TNNetJSONConstraint.CreateCharLevel: the char-level convention (token ' +
+      'id = character code) requires a vocabulary of at most ' +
+      IntToStr(csMaxCharLevelVocab) + ' ids; use Create(Dict) for a subword ' +
+      'vocabulary.');
   FMachine := TNNetJSONStateMachine.Create();
   FProbe := TNNetJSONStateMachine.Create();
   FFirstOKVersion := -1; // no table yet; machine versions start above zero
@@ -4299,10 +4312,21 @@ end;
 
 constructor TNNetGrammarConstraint.CreateCharLevel(const GBNFText: string;
   VocabSize: integer);
+const
+  csMaxCharLevelVocab = 256; // Chr() alphabet: a token id is one byte
 var
   I, Hi: integer;
 begin
   inherited Create();
+  // The char-level convention maps token id to Chr(id), so the vocabulary
+  // cannot be wider than the byte alphabet - a subword vocabulary would alias
+  // ids 256..VocabSize-1 onto bytes instead of failing.
+  if VocabSize > csMaxCharLevelVocab then
+    raise EArgumentException.Create(
+      'TNNetGrammarConstraint.CreateCharLevel: the char-level convention ' +
+      '(token id = character code) requires a vocabulary of at most ' +
+      IntToStr(csMaxCharLevelVocab) + ' ids; use Create(GBNFText, Dict) for a ' +
+      'subword vocabulary.');
   FGrammar := TNNetGrammar.Create(GBNFText);
   FMachine := TNNetGrammarMachine.Create(FGrammar);
   FProbe := TNNetGrammarMachine.Create(FGrammar);
