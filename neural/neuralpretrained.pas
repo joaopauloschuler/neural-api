@@ -10060,6 +10060,11 @@ type
   end;
 
 function ReadSDUNetConfigFromJSONFile(const FileName: string): TSDUNetConfig;
+// Same parser fed from a JSON string. SourceName only names the source in error
+// messages, so a caller holding a patched config in memory (ControlNet) can
+// reuse this reader without round-tripping through a file.
+function ReadSDUNetConfigFromJSONText(const JsonSource,
+  SourceName: string): TSDUNetConfig;
 
 function SDUNetConfigToString(const Config: TSDUNetConfig): string;
 
@@ -66945,6 +66950,21 @@ const
 function ReadSDUNetConfigFromJSONFile(const FileName: string): TSDUNetConfig;
 var
   JsonText: TStringList;
+begin
+  if not FileExists(FileName) then
+    ImportError('SD UNet import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  try
+    JsonText.LoadFromFile(FileName);
+    Result := ReadSDUNetConfigFromJSONText(JsonText.Text, FileName);
+  finally
+    JsonText.Free;
+  end;
+end;
+
+function ReadSDUNetConfigFromJSONText(const JsonSource,
+  SourceName: string): TSDUNetConfig;
+var
   Root: TJSONData;
   Obj: TJSONObject;
   ArrData: TJSONData;
@@ -66952,21 +66972,17 @@ var
   ClassName, s: string;
   i, AttnHeadDim, SampleSize, LpMax: integer;
 begin
-  if not FileExists(FileName) then
-    ImportError('SD UNet import: config file not found: ' + FileName);
-  JsonText := TStringList.Create;
   Root := nil;
   try
-    JsonText.LoadFromFile(FileName);
     try
-      Root := GetJSON(JsonText.Text);
+      Root := GetJSON(JsonSource);
     except
       on E: Exception do
-        ImportError('SD UNet import: config "' + FileName +
+        ImportError('SD UNet import: config "' + SourceName +
           '" is not valid JSON (' + E.Message + ').');
     end;
     if not (Root is TJSONObject) then
-      ImportError('SD UNet import: config "' + FileName +
+      ImportError('SD UNet import: config "' + SourceName +
         '" is not a JSON object.');
     Obj := TJSONObject(Root);
     ClassName := Obj.Get('_class_name', Obj.Get('model_type',
@@ -67166,7 +67182,6 @@ begin
         '" unsupported (only "text_time" / absent).');
   finally
     Root.Free;
-    JsonText.Free;
   end;
 end;
 
@@ -68180,16 +68195,12 @@ var
   Arr: TJSONArray;
   ClassName, MirrorJson, s: string;
   i, NumStride2, Factor, BaseDownTaps: integer;
-  PatchedFile: TStringList;
-  TmpPath: string;
   ArrCountM1, BaseNumBlockOutM1: integer;
 begin
   if not FileExists(FileName) then
     ImportError('ControlNet import: config file not found: ' + FileName);
   JsonText := TStringList.Create;
   Root := nil;
-  PatchedFile := nil;
-  TmpPath := '';
   try
     JsonText.LoadFromFile(FileName);
     try
@@ -68234,12 +68245,7 @@ begin
     Obj.Add('_class_name', 'UNet2DConditionModel');
     // out_channels is irrelevant for ControlNet (no conv_out) but the SD reader
     // defaults it; leave as-is.
-    TmpPath := GetTempDir(False) + 'cai_controlnet_cfg_' +
-      IntToStr(Random(1000000)) + '.json';
-    PatchedFile := TStringList.Create;
-    PatchedFile.Text := Obj.AsJSON;
-    PatchedFile.SaveToFile(TmpPath);
-    Result.Base := ReadSDUNetConfigFromJSONFile(TmpPath);
+    Result.Base := ReadSDUNetConfigFromJSONText(Obj.AsJSON, FileName);
 
     // ---- ControlNet-specific fields ----
     Result.CondChannels := Obj.Get('conditioning_channels', 3);
@@ -68285,8 +68291,6 @@ begin
   finally
     Root.Free;
     JsonText.Free;
-    if PatchedFile <> nil then PatchedFile.Free;
-    if (TmpPath <> '') and FileExists(TmpPath) then DeleteFile(TmpPath);
   end;
 end;
 
