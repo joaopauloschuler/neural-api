@@ -116266,7 +116266,7 @@ var
   Gram: TDoubleMatrix;         // smaller of (N x N) or (D x D)
   Eig: TDoubleArray;
   GramDim, EffDim: integer;
-  EigSum, EigSqSum, PCA_ID, PR: Double;
+  EigSum, EigSqSum, PCA_ID, PR, TraceSum: Double;
   TwoNN_ID, MaxBar, Compress, Gap: Double;
   R1, R2, Dist, DiffV, MuI: Double;
   Mu: TDoubleArray;            // per-sample r2/r1 ratios (>1)
@@ -116592,6 +116592,12 @@ begin
         end;
       end;
 
+      // trace BEFORE the decomposition; it is the full spectrum scale the
+      // PSD-noise threshold below is measured against (Jacobi returns the
+      // eigenvalues in no particular order, so a running sum is not a scale).
+      TraceSum := 0;
+      for I := 0 to GramDimM1 do TraceSum := TraceSum + Gram[I][I];
+
       JacobiEigenvalues(Gram, GramDim, Eig);
 
       // PSD: clamp tiny-negative numerical noise; participation ratio.
@@ -116601,7 +116607,7 @@ begin
       begin
         if Eig[I] < 0 then
         begin
-          if Eig[I] < -1e-6 * (Abs(EigSum) + 1.0) then
+          if Eig[I] < -1e-6 * (Abs(TraceSum) + 1.0) then
             Flags.Add(Format(
               '  Layer %3d %s: negative PCA eigenvalue %.6g (PSD violation).',
               [LayerIdx, ShapeStr, Eig[I]]));
