@@ -339,6 +339,11 @@ type
     procedure TestResize2DBicubicInputGradientCheck;
     procedure TestResize2DSerializationRoundTrip;
     procedure TestDeconvolutionOpenCLParity;
+    // A conv that first runs the fused-activation device forward (output left
+    // in OpenCL memory) and is then switched to the Winograd path, which writes
+    // FOutput on the host: the Winograd pass must publish host residency, or a
+    // later reader downloads the previous forward's device buffer over it.
+    procedure TestConvWinogradAfterOpenCLResidencyParity;
     // OpenCL forward offload parity (vs CPU) for the depthwise convolutions.
     procedure TestDepthwiseConvOpenCLParity;
     procedure TestDepthwiseConv1DOpenCLParity;
@@ -66293,6 +66298,91 @@ begin
   finally
     OutCPU.Free;
     Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// A conv layer switching from the fused-activation device forward to the
+// Winograd forward mid-session. The fused device pass leaves the output in
+// OpenCL memory; the Winograd pass runs only its M-stage on the device and
+// writes FOutput on the host, so it must publish host residency. When it does
+// not, ForceOutputOnRAM sees a stale "on device" flag and downloads the
+// PREVIOUS forward's device buffer over the fresh result - which is why the two
+// forwards below use different inputs. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestConvWinogradAfterOpenCLResidencyParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  InputA, InputB, OutCPU: TNNetVolume;
+  Conv: TNNetConvolutionReLU;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, InSize: integer;
+  Diff, MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  InputA := TNNetVolume.Create(8, 8, 4);
+  InputB := TNNetVolume.Create(8, 8, 4);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 4, 1));
+    // 6 neurons, 3x3, pad 1, stride 1: the exact shape Winograd F(2x2,3x3) takes.
+    Conv := TNNetConvolutionReLU.Create(6, 3, 1, 1);
+    NN.AddLayer(Conv);
+    // A pointwise consumer: this is the layer that binds the conv's device
+    // buffer when the conv still claims device residency.
+    NN.AddLayer(TNNetPointwiseConvLinear.Create(3));
+    // Inference-only: the device bias+ReLU fusion (the branch that leaves the
+    // output on the device) is offered to non-trainable layers only. Keep the
+    // full weight caches - low-memory mode would rule Winograd out.
+    NN.SetTrainable(False, False);
+    InSize := InputA.Size;
+    for i := 0 to InSize - 1 do
+    begin
+      InputA.Raw[i] := 0.05 * i - 0.3;
+      InputB.Raw[i] := 0.3 - 0.04 * i;
+    end;
+
+    // CPU reference for the SECOND input, on the direct path.
+    NN.Compute(InputB);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      // Fused bias+ReLU on the device: the conv result stays in OpenCL memory.
+      NN.Compute(InputA);
+      // Same layer, Winograd from here on: a host-written output.
+      Conv.EnableWinograd(true);
+      NN.Compute(InputB);
+      NN.GetLastLayer.ForceOutputOnRAM();
+      MaxDiff := 0;
+      AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    AssertTrue('Winograd forward after a fused device forward: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free;
+    InputB.Free;
+    InputA.Free;
     NN.Free;
   end;
 end;

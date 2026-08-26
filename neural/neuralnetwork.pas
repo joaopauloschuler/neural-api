@@ -105084,6 +105084,14 @@ begin
 
   if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
   ApplyActivationFunctionToOutput();
+  // Only the M-stage ran on the device: the output transform, the bias-add and
+  // the activation above all wrote FOutput on the host, so this pass publishes
+  // host residency - a device copy of it does not exist. Without this a stale
+  // FOutputOnOpenCL left by an earlier fused-activation device forward (the
+  // layer can switch paths when Winograd, int8 or low-memory mode is toggled)
+  // would make a consumer bind an outdated device buffer.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
 end;
 {$ENDIF}
 
