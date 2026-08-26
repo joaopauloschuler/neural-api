@@ -116232,6 +116232,10 @@ begin
 
       // Marchenko-Pastur bulk edge (1 + sqrt(in/out))^2 * sigma^2, the largest
       // eigenvalue a pure-random Gaussian Gram of matching std would produce.
+      // The expression equals (sqrt(in) + sqrt(out))^2 * sigma^2, so it is
+      // symmetric in fan-in/fan-out and needs no orientation switch to match
+      // the Gram matrix built above: W^T W and W W^T share the same nonzero
+      // spectrum, hence the same bulk edge.
       MPEdge := Sqr(1.0 + Sqrt(FanIn / FanOut)) * Std * Std * FanOut;
 
       // One log per eigenvalue for the whole layer. Both consumers below guard
