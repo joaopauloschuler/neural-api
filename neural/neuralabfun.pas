@@ -709,7 +709,9 @@ end;
 
 function TRunOperation.Make2D(X,Y: integer): integer;
 begin
-  Result := X + Y * FCS.ImageSizeY;
+  // Row-major: X is the contiguous axis, so a step in Y skips one full row of
+  // ImageSizeX elements.
+  Result := X + Y * FCS.ImageSizeX;
 end;
 
 function TRunOperation.CreateFeatureCenter(): integer;
@@ -1074,9 +1076,9 @@ begin
   Result := 0;
   TopX := FCS.ImageSizeX - FCS.FeatureSize - 1;
   TopY := FCS.ImageSizeY - FCS.FeatureSize - 1;
-  // Make2D(X,Y) = X + Y*ImageSizeY. Y is the inner loop, so Pos advances by
-  // ImageSizeY each Y (#6 strength reduction); seed at Y = FeatureSize.
-  RowStep := FCS.ImageSizeY;
+  // Make2D(X,Y) = X + Y*ImageSizeX. Y is the inner loop, so Pos advances by
+  // ImageSizeX each Y (#6 strength reduction); seed at Y = FeatureSize.
+  RowStep := FCS.ImageSizeX;
   ColSeed := FCS.FeatureSize * RowStep;
   for X := FCS.FeatureSize to TopX do
   begin

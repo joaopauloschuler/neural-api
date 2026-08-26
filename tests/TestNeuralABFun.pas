@@ -38,6 +38,8 @@ type
     procedure TestSaturatingAndShiftOps;
     // Division and modulo by zero leave the next state at its initial value.
     procedure TestDivModByZeroIsInert;
+    // The bidimensional position of (X,Y) strides by the image width.
+    procedure TestMake2DStridesByImageWidth;
   end;
 
 implementation
@@ -118,6 +120,37 @@ begin
   // CurrentStates[20] = 235; 245 div 235 = 1, 245 mod 235 = 10.
   AssertEquals('div', 1, NextStateOf(csDiv, 10, 20, 0));
   AssertEquals('mod', 10, NextStateOf(csMod, 10, 20, 0));
+end;
+
+procedure TTestNeuralABFun.TestMake2DStridesByImageWidth;
+var
+  Engine: TRunOperation;
+  Settings: TCreateOperationSettings;
+  Actions, CurrentStates, NextStates: array of byte;
+  X, Y: integer;
+begin
+  Settings := csCreateOpImageProcessing;
+  Settings.ImageSizeX := 8;
+  Settings.ImageSizeY := 4;
+  SetLength(Actions, Settings.ImageSizeX * Settings.ImageSizeY);
+  SetLength(CurrentStates, Settings.ImageSizeX * Settings.ImageSizeY);
+  SetLength(NextStates, Settings.ImageSizeX * Settings.ImageSizeY);
+  Engine.Load(Settings, Actions, CurrentStates, NextStates);
+
+  // A step along X is one element; a step along Y is one full row of 8.
+  AssertEquals('origin', 0, Engine.Make2D(0, 0));
+  AssertEquals('x step', 3, Engine.Make2D(3, 0));
+  AssertEquals('y step', 8, Engine.Make2D(0, 1));
+  AssertEquals('x and y', 19, Engine.Make2D(3, 2));
+  // Every pixel of the non-square image must map to a distinct position inside
+  // the array; the last one is exactly the last element.
+  AssertEquals('last pixel',
+    Settings.ImageSizeX * Settings.ImageSizeY - 1,
+    Engine.Make2D(Settings.ImageSizeX - 1, Settings.ImageSizeY - 1));
+  for Y := 0 to Settings.ImageSizeY - 1 do
+    for X := 0 to Settings.ImageSizeX - 1 do
+      AssertEquals('pixel '+IntToStr(X)+','+IntToStr(Y),
+        Y * Settings.ImageSizeX + X, Engine.Make2D(X, Y));
 end;
 
 initialization
