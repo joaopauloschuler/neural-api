@@ -54745,12 +54745,10 @@ procedure TNNetUpsample.ComputePreviousLayerError();
 var
   CntX, CntY, OutD: integer;
   MaxX, MaxY, MaxD: integer;
-  StartTime: double;
   PrevBase, Out00, Out10, Out01, Out11: integer;
   OutDepthStride, OutRowStride: integer;
   PrevError: TNNetVolume;
 begin
-  StartTime := Now();
   PrevError := FPrevLayer.OutputError;
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
@@ -54776,7 +54774,6 @@ begin
         Inc(PrevBase, 4);
       end;
     end;
-  FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
 { TNNetPixelShuffle }
