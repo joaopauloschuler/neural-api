@@ -1115,7 +1115,10 @@ begin
       sqrtAbT := FSqrtAlphaBar[Tt];
       // Step-invariant reciprocals/deltas hoisted out of the element loops (#5).
       invSqrtAbT := 1.0 / sqrtAbT;
-      invSigma := 1.0 / sigma;
+      // sigma_t is 0 wherever ab_t reaches 1 (Beta1 = 0, or a cosine schedule
+      // whose first beta clips to 0). There is no drift at a clean sample, so
+      // the reciprocal collapses to 0 instead of overflowing.
+      if sigma > 0 then invSigma := 1.0 / sigma else invSigma := 0;
       dSig := sigmaNext - sigma;
       // First denoiser eval at (x_t, t) -> x0.
       Denoise(X, Pred, Tt);
@@ -1130,9 +1133,11 @@ begin
       Ye.Copy(Y);
       Ye.Mul(1.0 + kEuler);
       Ye.MulAdd(-kEuler, X0);
-      if TtPrev = 0 then
+      if (TtPrev = 0) or (sigmaNext <= 0) then
       begin
-        // Final step: sqrt(ab_prev) = 1, y_e is already the clean image.
+        // Final step: sqrt(ab_prev) = 1, y_e is already the clean image. A
+        // sigma_{t-1} of 0 at TtPrev > 0 means ab_prev = 1 as well, so the same
+        // holds there; k-diffusion likewise skips the corrector at sigma 0.
         X.Copy(Ye);
       end
       else

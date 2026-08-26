@@ -64,6 +64,7 @@ type
     procedure TestDPMSolverVsOracle;
     procedure TestUniPCVsOracle;
     procedure TestHeunVsOracle;
+    procedure TestHeunZeroSigmaRunsFinite;
     procedure TestMinSNRWeight;
     procedure TestDDPMRunsNoNaN;
     procedure TestEulerAncestralZeroEtaMatchesDDIM;
@@ -452,6 +453,29 @@ begin
       AssertEquals('heun vs oracle @ ' + IntToStr(i),
         cOracleHeun[i], X.FData[i], 1e-4);
     end;
+  finally
+    Sched.Free; X.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestHeunZeroSigmaRunsFinite;
+var
+  Sched: TNNetDiffusionScheduler;
+  X: TNNetVolume;
+  i: integer;
+begin
+  // Beta1 = 0 makes alpha_bar_1 exactly 1, so SigmaOf(1) = 0. With uniform
+  // spacing and NumSteps = T the Heun driver visits Tt = 1 (sigma = 0) and
+  // Tt = 2 -> TtPrev = 1 (sigma_next = 0). Both reciprocals must stay finite.
+  Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, 0.0, cBetaT);
+  X := TNNetVolume.Create(cN, 1, 1);
+  try
+    AssertEquals('sigma at Tt=1 is 0', 0.0, Sched.SigmaAt[1], 0.0);
+    for i := 0 to cN - 1 do X.FData[i] := (i - cN / 2) * 0.3;
+    Sched.Sample(X, @ToyModel, cT, smHeun, 0.0, tsUniform);
+    for i := 0 to cN - 1 do
+      AssertFalse('heun zero-sigma finite @ ' + IntToStr(i),
+        IsNan(X.FData[i]) or IsInfinite(X.FData[i]));
   finally
     Sched.Free; X.Free;
   end;
