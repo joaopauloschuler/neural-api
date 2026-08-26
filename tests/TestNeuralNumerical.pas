@@ -996,6 +996,7 @@ type
     procedure TestImplicitLongConvInputGradientCheck;
     procedure TestImplicitLongConvWeightGradientCheck;
     procedure TestImplicitLongConvCausality;
+    procedure TestImplicitLongConvComputeParity;
     procedure TestImplicitLongConvSerializationRoundTrip;
     procedure TestSpatialGatingUnitInputGradientCheck;
     procedure TestSpatialGatingUnitWeightGradientCheck;
@@ -45422,6 +45423,95 @@ begin
     NN.Free;
     Input.Free;
     baseOut.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestImplicitLongConvComputeParity;
+var
+  NN: TNNet;
+  Input, Impulse, RefOut: TNNetVolume;
+  LConv: TNNetImplicitLongConv;
+  Filter: TNNetVolume;
+  maxErr, sum: TNeuralFloat;
+  i, t, p, c, SeqLen, Depth: integer;
+
+  // The layer is linear in its input, so a unit impulse at t=0 reads the whole
+  // implicit filter h[p,c] straight out of the output.
+  procedure ReadFilter();
+  var
+    k: integer;
+  begin
+    Impulse.Fill(0);
+    for k := 0 to Depth - 1 do Impulse[0, 0, k] := 1;
+    NN.Compute(Impulse);
+    Filter.Copy(NN.GetLastLayer.Output);
+  end;
+
+begin
+  SeqLen := 7;
+  Depth := 5; // not a multiple of 4: exercises the MulAdd remainder path
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  Impulse := TNNetVolume.Create(SeqLen, 1, Depth);
+  RefOut := TNNetVolume.Create(SeqLen, 1, Depth);
+  Filter := TNNetVolume.Create(SeqLen, 1, Depth);
+  maxErr := 0;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    LConv := TNNetImplicitLongConv.Create(4);
+    NN.AddLayer(LConv);
+    // Push W2 / logDecay off the near-no-op default so the filter is rich.
+    for i := 0 to LConv.Neurons[2].Weights.Size - 1 do
+      LConv.Neurons[2].Weights.Raw[i] :=
+        LConv.Neurons[2].Weights.Raw[i] + Sin(i * 1.1 + 0.3) * 0.7;
+    for i := 0 to LConv.Neurons[4].Weights.Size - 1 do
+      LConv.Neurons[4].Weights.Raw[i] := 0.3 + i * 0.1;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.7) * 1.3 - 0.4;
+
+    ReadFilter();
+    NN.Compute(Input);
+    // Straightforward causal reference: y[t,c] = sum_{p<=t} h[p,c]*x[t-p,c].
+    for t := 0 to SeqLen - 1 do
+      for c := 0 to Depth - 1 do
+      begin
+        sum := 0;
+        for p := 0 to t do
+          sum := sum + Filter[p, 0, c] * Input[t - p, 0, c];
+        RefOut[t, 0, c] := sum;
+      end;
+    for i := 0 to RefOut.Size - 1 do
+      if Abs(RefOut.Raw[i] - NN.GetLastLayer.Output.Raw[i]) > maxErr then
+        maxErr := Abs(RefOut.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+    AssertTrue('ImplicitLongConv compute parity (err=' + FloatToStr(maxErr) + ')',
+      maxErr < 1e-4);
+
+    // A direct weight edit (no AfterWeightUpdate) must invalidate the cached
+    // filter: re-read it and check the conv still matches.
+    for i := 0 to LConv.Neurons[0].Weights.Size - 1 do
+      LConv.Neurons[0].Weights.Raw[i] :=
+        LConv.Neurons[0].Weights.Raw[i] + 0.5;
+    ReadFilter();
+    NN.Compute(Input);
+    maxErr := 0;
+    for t := 0 to SeqLen - 1 do
+      for c := 0 to Depth - 1 do
+      begin
+        sum := 0;
+        for p := 0 to t do
+          sum := sum + Filter[p, 0, c] * Input[t - p, 0, c];
+        if Abs(sum - NN.GetLastLayer.Output[t, 0, c]) > maxErr then
+          maxErr := Abs(sum - NN.GetLastLayer.Output[t, 0, c]);
+      end;
+    AssertTrue('ImplicitLongConv filter cache staleness (err=' +
+      FloatToStr(maxErr) + ')', maxErr < 1e-4);
+    WriteLn('ImplicitLongConv compute parity max abs error: ', maxErr:0:8);
+  finally
+    NN.Free;
+    Input.Free;
+    Impulse.Free;
+    RefOut.Free;
+    Filter.Free;
   end;
 end;
 

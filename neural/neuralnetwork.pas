@@ -11803,7 +11803,13 @@ type
       // heap allocations on a training step (rule #17), and an inference-only
       // net never touches them.
       FGdH, FGdBase, FGdAct, FGdPre: TNNetVolume;
+      // Snapshot of the five weight tensors behind the cached FFilter, plus the
+      // SeqLen it was built for: the filter is a pure function of both.
+      FFiltSrc: array[0..4] of TNNetVolume;
+      FFiltSeqLen: integer;
+      FFiltValid: boolean;
       procedure BuildPhi();
+      function FilterIsStale(): boolean;
       procedure BuildFilter();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
@@ -73697,6 +73703,8 @@ end;
 
 { TNNetImplicitLongConv }
 constructor TNNetImplicitLongConv.Create(pHidden: integer = 4);
+var
+  ii: integer;
 begin
   inherited Create();
   FHidden := Max(pHidden, 1);
@@ -73715,6 +73723,9 @@ begin
   FGdBase := TNNetVolume.Create();
   FGdAct := TNNetVolume.Create();
   FGdPre := TNNetVolume.Create();
+  for ii := 0 to 4 do FFiltSrc[ii] := TNNetVolume.Create();
+  FFiltSeqLen := -1;
+  FFiltValid := false;
   // The implicit MLP needs five learnable tensors with DIFFERENT shapes, so we
   // size each neuron individually in SetPrevLayer (Depth/SeqLen are not known
   // yet here). AddMissingNeurons gives us the five neuron slots.
@@ -73722,7 +73733,10 @@ begin
 end;
 
 destructor TNNetImplicitLongConv.Destroy();
+var
+  ii: integer;
 begin
+  for ii := 0 to 4 do FFiltSrc[ii].Free;
   FGdPre.Free;
   FGdAct.Free;
   FGdBase.Free;
@@ -73792,9 +73806,33 @@ begin
   FDecayV.ReSize(FSeqLen, 1, Depth);
   FFilter.ReSize(FSeqLen, 1, Depth);
   FSpLog.ReSize(1, 1, Depth);
+  FFiltValid := false;
   BuildPhi();
   InitDefault();
   AfterWeightUpdate();
+end;
+
+function TNNetImplicitLongConv.FilterIsStale(): boolean;
+var
+  ii: integer;
+begin
+  // Compares the cached weight snapshot against the live tensors: O(Depth*H),
+  // a factor SeqLen cheaper than the rebuild it guards.
+  Result := (not FFiltValid) or (FFiltSeqLen <> FSeqLen);
+  if not Result then
+    for ii := 0 to 4 do
+      if (FFiltSrc[ii].Size <> FNeurons[ii].FWeights.Size) or
+         (FFiltSrc[ii].SumDiff(FNeurons[ii].FWeights) <> 0) then
+      begin
+        Result := true;
+        break;
+      end;
+  if Result then
+  begin
+    for ii := 0 to 4 do FFiltSrc[ii].Copy(FNeurons[ii].FWeights);
+    FFiltSeqLen := FSeqLen;
+    FFiltValid := true;
+  end;
 end;
 
 procedure TNNetImplicitLongConv.BuildFilter();
@@ -73806,7 +73844,9 @@ var
   pBase: integer;
 begin
   // Generate the full-length implicit filter h[p,c] = base[p,c]*decay[p,c] and
-  // cache every intermediate (pre, act, base, decay) for the backward pass.
+  // cache every intermediate (pre, act, base, decay) for the backward pass. The
+  // filter depends on the weights alone, so an unchanged snapshot skips it all.
+  if not FilterIsStale() then exit;
   W1 := FNeurons[0].FWeights;
   B1 := FNeurons[1].FWeights;
   W2 := FNeurons[2].FWeights;
@@ -73842,8 +73882,8 @@ begin
     begin
       s := B1.FData[j] + TNNetVolume.DotProduct(
         @W1.FData[j * FNumFeat], @FPhi.FData[pFeatBase], FNumFeat);
-      FPre[p, 0, j] := s;
-      FAct[p, 0, j] := pcr_tanhf(s);
+      FPre.FData[pHidBase + j] := s;
+      FAct.FData[pHidBase + j] := pcr_tanhf(s);
     end;
     // Output: base = W2*act + b2; decay = exp(-softplus(logDecay)*p_norm).
     // W2[c,0,j]=W2.FData[c*FHidden+j]; FAct row p is contiguous -> DotProduct.
@@ -73862,35 +73902,33 @@ procedure TNNetImplicitLongConv.Compute();
 var
   StartTime: double;
   Prev: TNNetVolume;
-  Depth, t, p, c, posF, posX, idx: integer;
-  DepthM1, FSeqLenM1: integer;
-  sum: TNeuralFloat;
+  Depth, t, p, posF, posX, tBase: integer;
+  FSeqLenM1: integer;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   Prev := FPrevLayer.FOutput;
   Depth := FOutput.Depth;
-  DepthM1 := Depth - 1;
   FSeqLenM1 := FSeqLen - 1;
   BuildFilter();
-  // Causal depthwise long conv: y[t,c] = sum_{p=0..t} h[p,c]*x[t-p,c].
-  // FFilter[p,0,c]=FData[p*Depth+c] (+Depth per p); Prev[t-p,0,c]=FData[(t-p)*
-  // Depth+c] (-Depth per p): carry both flat offsets (#12), no accessor mul.
-  for c := 0 to DepthM1 do
-    for t := 0 to FSeqLenM1 do
+  // Causal depthwise long conv: y[t,c] = sum_{p=0..t} h[p,c]*x[t-p,c]. Depth is
+  // the contiguous axis, so every p adds one whole row - accumulate the output
+  // row with the 3-pointer MulAdd instead of walking Depth-strided (#13).
+  FOutput.Fill(0);
+  tBase := 0;
+  for t := 0 to FSeqLenM1 do
+  begin
+    posF := 0;
+    posX := tBase;
+    for p := 0 to t do
     begin
-      sum := 0;
-      posF := c;
-      idx := t * Depth + c;
-      posX := idx;
-      for p := 0 to t do
-      begin
-        sum := sum + FFilter.FData[posF] * Prev.FData[posX];
-        Inc(posF, Depth);
-        Dec(posX, Depth);
-      end;
-      FOutput.FData[idx] := sum;
+      TNNetVolume.MulAdd(@FOutput.FData[tBase], @FFilter.FData[posF],
+        @Prev.FData[posX], Depth);
+      Inc(posF, Depth);
+      Dec(posX, Depth);
     end;
+    Inc(tBase, Depth);
+  end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -73900,9 +73938,11 @@ var
   N0, N1, N2, N3, N4: TNNetNeuron;
   W2, WLog: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
-  Depth, t, p, c, j, f, s, posH, posX, posF, idx: integer;
+  Depth, t, p, c, j, f, posH, posP, posX, posF, idx: integer;
   DepthM1, FSeqLenM1, FHiddenM1, FNumFeatM1: integer;
-  gy, gh, gbase, gdec, gpre, pn, dsp_dlog, gAccum, invLen, w2cj: TNeuralFloat;
+  tBase, pBase, pHidBase, MaxActPos: integer;
+  N2D: TNNetVolume;
+  gh, gbase, gdec, gpre, decv, act, dsp_dlog, gAccum, invLen, negLR: TNeuralFloat;
   hasInputGrad: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -73939,91 +73979,114 @@ begin
     FGdH.Fill(0); FGdBase.Fill(0); FGdAct.Fill(0); FGdPre.Fill(0);
     // dL/dh[p,c] = sum_{t>=p} gy[t,c]*x[t-p,c]
     // dL/dx[s,c] = sum_{p=0..SeqLen-1-s} gy[s+p,c]*h[p,c]   (s = t-p)
+    // Depth is contiguous: with t outer both accumulations are whole-row
+    // 3-pointer MulAdds over gy row t, x row t-p and h row p (#13).
     invLen := 0;
     if FSeqLen > 1 then invLen := 1 / (FSeqLen - 1);
-    for c := 0 to DepthM1 do
-      for t := 0 to FSeqLenM1 do
+    tBase := 0;
+    for t := 0 to FSeqLenM1 do
+    begin
+      posF := 0;
+      posX := tBase;
+      for p := 0 to t do
       begin
-        idx := t * Depth + c;
-        gy := FOutputError.FData[idx];
-        if gy = 0 then continue;
-        // FGdH[p,0,c] +Depth per p; Prev/PrevErr[t-p,0,c] share one offset,
-        // -Depth per p; FFilter[p,0,c] +Depth per p. Carry the offsets (#12).
-        posH := c;
-        posX := idx;
-        posF := c;
-        for p := 0 to t do
-        begin
-          FGdH.FData[posH] := FGdH.FData[posH] + gy * Prev.FData[posX];
-          if hasInputGrad then
-            PrevErr.FData[posX] := PrevErr.FData[posX] + gy * FFilter.FData[posF];
-          Inc(posH, Depth);
-          Dec(posX, Depth);
-          Inc(posF, Depth);
-        end;
+        TNNetVolume.MulAdd(@FGdH.FData[posF], @FOutputError.FData[tBase],
+          @Prev.FData[posX], Depth);
+        if hasInputGrad then
+          TNNetVolume.MulAdd(@PrevErr.FData[posX], @FOutputError.FData[tBase],
+            @FFilter.FData[posF], Depth);
+        Inc(posF, Depth);
+        Dec(posX, Depth);
       end;
+      Inc(tBase, Depth);
+    end;
 
     // h = base.*decay -> dL/dbase = dL/dh.*decay ; dL/ddecay = dL/dh.*base.
     // logDecay grad: decay = exp(-sp*pn), sp = softplus(logDecay),
     //   d decay/d logDecay = decay*(-pn)*sigmoid(logDecay).
+    // dL/db2[c] += sum_p dL/dbase[p,c] (summed in the producing pass, #4) and
+    // the p-invariant -invLen*sigmoid(logDecay) factored out of the gAccum sum.
+    negLR := -FLearningRate;
     for c := 0 to DepthM1 do
     begin
       dsp_dlog := Sigmoid(WLog.FData[c]);
       gAccum := 0;
+      gbase := 0;
+      posH := c;
       for p := 0 to FSeqLenM1 do
       begin
-        pn := p * invLen;
-        gh := FGdH[p, 0, c];
-        FGdBase[p, 0, c] := gh * FDecayV[p, 0, c];
-        gdec := gh * FBaseV[p, 0, c];
-        gAccum := gAccum + gdec * FDecayV[p, 0, c] * (-pn) * dsp_dlog;
+        gh := FGdH.FData[posH];
+        decv := FDecayV.FData[posH];
+        gdec := gh * decv;
+        FGdBase.FData[posH] := gdec;
+        gbase := gbase + gdec;
+        gAccum := gAccum + gdec * FBaseV.FData[posH] * p;
+        Inc(posH, Depth);
       end;
-      // dL/db2[c] += sum_p dL/dbase[p,c] ; dL/dlogDecay[c] += gAccum.
-      gbase := 0;
-      for p := 0 to FSeqLenM1 do
-        gbase := gbase + FGdBase[p, 0, c];
-      N3.FDelta.FData[c] := N3.FDelta.FData[c] + (-FLearningRate) * gbase;
-      N4.FDelta.FData[c] := N4.FDelta.FData[c] + (-FLearningRate) * gAccum;
+      N3.FDelta.FData[c] := N3.FDelta.FData[c] + negLR * gbase;
+      N4.FDelta.FData[c] := N4.FDelta.FData[c] +
+        (FLearningRate * invLen * dsp_dlog) * gAccum;
     end;
 
     // base = W2*act + b2:
     //   dL/dW2[c,j] += sum_p dL/dbase[p,c]*act[p,j]
     //   dL/dact[p,j] = sum_c dL/dbase[p,c]*W2[c,j]
-    for c := 0 to DepthM1 do
-      for j := 0 to FHiddenM1 do
-      begin
-        gAccum := 0;
-        w2cj := W2[c, 0, j]; // invariant across p (#8)
-        for p := 0 to FSeqLenM1 do
-        begin
-          gbase := FGdBase[p, 0, c];
-          gAccum := gAccum + gbase * FAct[p, 0, j];
-          FGdAct[p, 0, j] := FGdAct[p, 0, j] + gbase * w2cj;
-        end;
-        N2.FDelta[c, 0, j] := N2.FDelta[c, 0, j] + (-FLearningRate) * gAccum;
-      end;
-
-    // act = tanh(pre) -> dL/dpre = dL/dact*(1-act^2).
+    // W2, N2.FDelta, FAct and FGdAct are all contiguous along j, so with p
+    // outer both accumulations become scalar-times-row MulAdds (#13).
+    N2D := N2.FDelta;
+    pBase := 0;
+    pHidBase := 0;
     for p := 0 to FSeqLenM1 do
-      for j := 0 to FHiddenM1 do
-        FGdPre[p, 0, j] := FGdAct[p, 0, j] *
-          (1 - FAct[p, 0, j] * FAct[p, 0, j]);
+    begin
+      for c := 0 to DepthM1 do
+      begin
+        gbase := FGdBase.FData[pBase + c];
+        posH := c * FHidden;
+        TNNetVolume.MulAdd(@FGdAct.FData[pHidBase], @W2.FData[posH],
+          gbase, FHidden);
+        TNNetVolume.MulAdd(@N2D.FData[posH], @FAct.FData[pHidBase],
+          negLR * gbase, FHidden);
+      end;
+      Inc(pBase, Depth);
+      Inc(pHidBase, FHidden);
+    end;
+
+    // act = tanh(pre) -> dL/dpre = dL/dact*(1-act^2). Same shape: flat walk.
+    MaxActPos := FSeqLen * FHidden - 1;
+    for idx := 0 to MaxActPos do
+    begin
+      act := FAct.FData[idx];
+      FGdPre.FData[idx] := FGdAct.FData[idx] * (1 - act * act);
+    end;
 
     // pre = W1*phi + b1:
     //   dL/dW1[j,f] += sum_p dL/dpre[p,j]*phi[p,f]
     //   dL/db1[j]   += sum_p dL/dpre[p,j]
     for j := 0 to FHiddenM1 do
     begin
+      // FGdPre[p,0,j] +FHidden per p, FPhi[p,0,f] +FNumFeat per p: carry the
+      // flat offsets instead of the strided accessors (#12).
       gpre := 0;
+      posH := j;
       for p := 0 to FSeqLenM1 do
-        gpre := gpre + FGdPre[p, 0, j];
-      N1.FDelta.FData[j] := N1.FDelta.FData[j] + (-FLearningRate) * gpre;
+      begin
+        gpre := gpre + FGdPre.FData[posH];
+        Inc(posH, FHidden);
+      end;
+      N1.FDelta.FData[j] := N1.FDelta.FData[j] + negLR * gpre;
       for f := 0 to FNumFeatM1 do
       begin
         gAccum := 0;
+        posH := j;
+        posP := f;
         for p := 0 to FSeqLenM1 do
-          gAccum := gAccum + FGdPre[p, 0, j] * FPhi[p, 0, f];
-        N0.FDelta[j, 0, f] := N0.FDelta[j, 0, f] + (-FLearningRate) * gAccum;
+        begin
+          gAccum := gAccum + FGdPre.FData[posH] * FPhi.FData[posP];
+          Inc(posH, FHidden);
+          Inc(posP, FNumFeat);
+        end;
+        N0.FDelta.FData[j * FNumFeat + f] :=
+          N0.FDelta.FData[j * FNumFeat + f] + negLR * gAccum;
       end;
     end;
   end;
