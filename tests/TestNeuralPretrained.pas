@@ -517,6 +517,11 @@ type
     // of the melody decoder (chroma+text conditioning PREPENDED to the causal
     // self-attention sequence) matches the HF logits < 1e-4.
     procedure TestMusicGenMelodyParity;
+    // Degenerate hidden_size: the half-split sinusoidal table steps by
+    // log(10000)/(hidden_size/2 - 1), so hidden_size=2 would divide by zero.
+    // Asserts the MusicGen/Parler/Melody importers reject it with a clear
+    // EPretrainedImportError instead.
+    procedure TestMusicGenTinyHiddenRejected;
     procedure TestBlip2QFormerConfigFromJSONFile;
     procedure TestBlip2QFormerParity;
     procedure TestBlip2FullBridgeParity;
@@ -18690,6 +18695,72 @@ begin
     RowLogits.Free;
     RefRoot.Free;
     RefJson.Free;
+  end;
+end;
+
+// hidden_size=2 leaves a single channel per half, so the sinusoidal table's
+// log(10000)/(hidden_size/2 - 1) step would divide by zero. All three
+// MusicGen-family importers must reject it before building anything.
+procedure TTestNeuralPretrained.TestMusicGenTinyHiddenRejected;
+var
+  Config: TMusicGenConfig;
+  MelodyConfig: TMusicGenMelodyConfig;
+  ParlerConfig: TParlerConfig;
+  Reader: TNNetSafeTensorsReader;
+  Msg: string;
+begin
+  Config := ReadMusicGenConfigFromJSONFile(
+    FixturePath('tiny_musicgen_config.json'));
+  Config.Hidden := 2;
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_musicgen.safetensors'));
+  try
+    Msg := '';
+    try
+      BuildMusicGenFromSafeTensorsEx(Reader, Config, 2, 2).Free;
+    except
+      on E: Exception do Msg := E.Message;
+    end;
+    AssertTrue('MusicGen hidden_size=2 must be rejected, got "' + Msg + '"',
+      Pos('hidden_size', Msg) > 0);
+  finally
+    Reader.Free;
+  end;
+
+  ParlerConfig := ReadParlerConfigFromJSONFile(
+    FixturePath('tiny_parler_config.json'));
+  ParlerConfig.Hidden := 2;
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_parler.safetensors'));
+  try
+    Msg := '';
+    try
+      BuildParlerTTSFromSafeTensorsEx(Reader, ParlerConfig, 2, 1, 1).Free;
+    except
+      on E: Exception do Msg := E.Message;
+    end;
+    AssertTrue('Parler-TTS hidden_size=2 must be rejected, got "' + Msg + '"',
+      Pos('hidden_size', Msg) > 0);
+  finally
+    Reader.Free;
+  end;
+
+  MelodyConfig := ReadMusicGenMelodyConfigFromJSONFile(
+    FixturePath('tiny_musicgen_melody_config.json'));
+  MelodyConfig.Hidden := 2;
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_musicgen_melody.safetensors'));
+  try
+    Msg := '';
+    try
+      BuildMusicGenMelodyFromSafeTensorsEx(Reader, MelodyConfig, 2, 2).Free;
+    except
+      on E: Exception do Msg := E.Message;
+    end;
+    AssertTrue('MusicGen Melody hidden_size=2 must be rejected, got "' +
+      Msg + '"', Pos('hidden_size', Msg) > 0);
+  finally
+    Reader.Free;
   end;
 end;
 

@@ -33586,6 +33586,11 @@ begin
     ImportError('MusicGen import: DecSeqLen must not exceed ' +
       'max_position_embeddings = ' +
       IntToStr(Config.MaxPositionEmbeddings) + '.');
+  // The half-split sinusoidal table steps by log(10000)/(hidden_size/2 - 1),
+  // so hidden_size must be even and leave at least 2 channels per half.
+  if Odd(Config.Hidden) or (Config.Hidden < 4) then
+    ImportError('MusicGen import: hidden_size must be EVEN and >= 4 (the ' +
+      'half-split sinusoidal table), got ' + IntToStr(Config.Hidden) + '.');
 
   Model := TMusicGenModel.Create(Config, EncSeqLen, DecSeqLen);
   Consumed := TStringList.Create;
@@ -34286,6 +34291,11 @@ begin
     ImportError('Parler-TTS import: PromptLen + CodecLen = ' +
       IntToStr(DecSeqLen) + ' must not exceed max_position_embeddings = ' +
       IntToStr(Config.MaxPositionEmbeddings) + '.');
+  // The half-split sinusoidal table steps by log(10000)/(hidden_size/2 - 1),
+  // so hidden_size must be even and leave at least 2 channels per half.
+  if Odd(Config.Hidden) or (Config.Hidden < 4) then
+    ImportError('Parler-TTS import: hidden_size must be EVEN and >= 4 (the ' +
+      'half-split sinusoidal table), got ' + IntToStr(Config.Hidden) + '.');
 
   Model := TParlerTTSModel.Create(Config, EncSeqLen, PromptLen, CodecLen);
   ShimCfg := ParlerToMusicGenConfig(Config);
@@ -34870,6 +34880,11 @@ begin
     ImportError('MusicGen Melody: chroma_length + EncSeqLen + DecSeqLen = ' +
       IntToStr(FullSeqLen) + ' exceeds max_position_embeddings = ' +
       IntToStr(Config.MaxPositionEmbeddings) + '.');
+  // The half-split sinusoidal table steps by log(10000)/(hidden_size/2 - 1),
+  // so hidden_size must be even and leave at least 2 channels per half.
+  if Odd(Config.Hidden) or (Config.Hidden < 4) then
+    ImportError('MusicGen Melody: hidden_size must be EVEN and >= 4 (the ' +
+      'half-split sinusoidal table), got ' + IntToStr(Config.Hidden) + '.');
 
   Model := TMusicGenMelodyModel.Create(Config, EncSeqLen, DecSeqLen);
   Dec := nil;
