@@ -763,10 +763,10 @@ var
   begin
     if (LocalNonZeroPrevStatesCount > 0) then
     begin
-      if LocalNonZeroPrevStatesCount > csMaxTests then
+      if LocalNonZeroPrevStatesCount > FCS.MaxTests then
         MJ := FCS.MaxTests
       else
-        MJ := LocalNonZeroPrevStatesCount+1;
+        MJ := LocalNonZeroPrevStatesCount;
       for J := 1 to MJ do
       begin
         ElementPosition := LocalNonZeroPrevStates[random(LocalNonZeroPrevStatesCount)];

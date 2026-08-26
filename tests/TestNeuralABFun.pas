@@ -48,6 +48,9 @@ type
     // Equal-test creation stops at the configured MaxTests, not at the
     // csMaxTests ceiling.
     procedure TestEqualTestsRespectMaxTests;
+    // The non-zero equal-test variant obeys the same two caps: the configured
+    // MaxTests and the number of non-zero states.
+    procedure TestNonZeroEqualTestsRespectMaxTests;
   end;
 
 implementation
@@ -288,6 +291,49 @@ begin
   Creator.Create(True, True, Errors);
   AssertEquals('equal tests capped at the state count', Length(Actions),
     Creator.GetCount());
+end;
+
+procedure TTestNeuralABFun.TestNonZeroEqualTestsRespectMaxTests;
+var
+  Creator: TCreateValidOperations;
+  Settings: TCreateOperationSettings;
+  Actions, CurrentStates, NextStates, Errors: array of byte;
+  I: integer;
+begin
+  // FullEqual off (and not bidimensional) selects the non-zero variant, which
+  // draws only from the non-zero positions. Every action here is non-zero and
+  // equal to the value at the position it is read from, so each drawn test
+  // holds and is included: the operation count is the loop bound itself.
+  Settings := csCreateOpSimplest;
+  Settings.AddBinaryTest := False;
+  Settings.AddTrueTest := False;
+  Settings.MaxTests := 5;
+  SetLength(Actions, 20);
+  SetLength(CurrentStates, 20);
+  SetLength(NextStates, 20);
+  SetLength(Errors, 20);
+  for I := 0 to 19 do
+  begin
+    Actions[I] := I + 1;
+    CurrentStates[I] := I + 1;
+    NextStates[I] := 0;
+    Errors[I] := 0;
+  end;
+
+  Creator.Load(Settings, Actions, CurrentStates, NextStates);
+  Creator.LoadCreationData(0);
+  Creator.Create(True, False, Errors);
+  AssertEquals('non-zero equal tests capped at MaxTests',
+    integer(Settings.MaxTests), Creator.GetCount());
+
+  // With more tests allowed than there are non-zero states, the non-zero count
+  // is the cap.
+  Settings.MaxTests := csMaxTests;
+  Creator.Load(Settings, Actions, CurrentStates, NextStates);
+  Creator.LoadCreationData(0);
+  Creator.Create(True, False, Errors);
+  AssertEquals('non-zero equal tests capped at the non-zero state count',
+    Length(Actions), Creator.GetCount());
 end;
 
 initialization
