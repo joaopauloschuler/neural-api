@@ -16671,7 +16671,10 @@ begin
             // k_norm(k_proj) then partial apply_rotary_pos_emb), so the
             // whole head is sliced FIRST, normed, and the rotary /
             // pass-through slices are cut RELATIVE to the normed head.
-            if Config.QKNorm then
+            // Skipped when Plan.TiledQKNorm normed the whole K projection
+            // above: KSource is already normed, so the plain chBase-relative
+            // slices below are correct (and KNorms is 1-long there).
+            if Config.QKNorm and (not Plan.TiledQKNorm) then
             begin
               KSlice := NN.AddLayerAfter(
                 TNNetSplitChannels.Create(SliceChannels), KSource);
@@ -16745,8 +16748,9 @@ begin
           if (RotaryDims < HeadDim) and (not Plan.HoistRoPE) then
           begin
             // Partial rotary on the Q head - same wiring as the K path
-            // (including the Qwen3.5 full-head q_norm BEFORE the split).
-            if Config.QKNorm then
+            // (including the Qwen3.5 full-head q_norm BEFORE the split, and
+            // its Plan.TiledQKNorm skip).
+            if Config.QKNorm and (not Plan.TiledQKNorm) then
             begin
               QSlice := NN.AddLayerAfter(
                 TNNetSplitChannels.Create(SliceChannels), QSource);
