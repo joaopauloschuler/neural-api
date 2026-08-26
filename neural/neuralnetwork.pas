@@ -72944,7 +72944,7 @@ var
   GyPtr, XtPtr, PrevErrPtr: TNeuralFloatArrPtr;
   WdRow, WBRow, WCRow: TNeuralFloatArrPtr;
   GradWdRow, GradWBRow, GradWCRow: TNeuralFloatArrPtr;
-  gy, ght, ad, sp, bt, ct, ht, htm1, xt, ea: TNeuralFloat;
+  gy, ght, ad, sp, bt, ct, ht, htm1, xt, ea, hae: TNeuralFloat;
   gbbar, gdelta, gb, gc, gpre, gxd: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -73012,11 +73012,11 @@ begin
       // delta path: from a_t and from bbar_t.
       //   da_t/ddelta = -exp(A_raw)*a_t ; dh_t/da_t = h_{t-1}.
       //   dbbar/ddelta = b_t.
-      gdelta := ght * (htm1 * (-ea * ad)) + gbbar * bt;
-      // A_raw: da/dA_raw = -delta*exp(A_raw)*a_t = ddelta-coef * ...
-      //   da/dA_raw = a_t * (-delta_t*exp(A_raw)).
-      FGradA.FData[d] := FGradA.FData[d] +
-        ght * htm1 * (ad * (-sp * ea));
+      // hae = gh*h_{t-1}*a_t*exp(A_raw) is shared by the delta and A_raw paths.
+      hae := ght * htm1 * ad * ea;
+      gdelta := gbbar * bt - hae;
+      // A_raw: da/dA_raw = a_t * (-delta_t*exp(A_raw)).
+      FGradA.FData[d] := FGradA.FData[d] - sp * hae;
       // softplus'(pre) = sigmoid(pre) = a path? pre = log(exp(delta)-1)... but we
       // have delta directly: d(delta)/d(pre) = sigmoid(pre) = 1 - exp(-delta).
       gpre := gdelta * (1 - NeuralExp(-sp));
@@ -73083,6 +73083,7 @@ var
   hasInputGrad: boolean;
   GyPtr, XtPtr, PrevErrPtr, WdRow, GradWdRow: TNeuralFloatArrPtr;
   gy, ght, ad, sp, ht, htm1, xd, ea, gdelta, gpre, gxd: TNeuralFloat;
+  bt, hae, ghbt, spxd, gxv: TNeuralFloat;
 begin
   StartTime := Now();
   Nd := FNeurons[0]; NB := FNeurons[1]; NC := FNeurons[2];
@@ -73126,7 +73127,8 @@ begin
       hbasePrev := hbase - DepthNS;       // #5: previous-timestep state base
       ebase := d * NS;
       gdelta := 0;
-      gxd := gy * Ee.FData[d];          // direct feedthrough e[d]*x_t[d]
+      gxv := 0;                         // sum_s gh*b_t[s]; scaled by delta below
+      spxd := sp * xd;                  // invariant across the state loop
       FGradE.FData[d] := FGradE.FData[d] + gy * xd;
       for s := 0 to NSM1 do
       begin
@@ -73136,23 +73138,28 @@ begin
           then htm1 := FState.FData[hbasePrev + s]
           else htm1 := 0;
         ea := FExpA.FData[ebase + s];
+        bt := FBt.FData[tb + s];
         // gh_t[d,s]: accumulated from t+1 plus the direct y-path c_t[s]*gy.
         ght := FGh.FData[ebase + s] + FCt.FData[tb + s] * gy;
+        ghbt := ght * bt;
+        // hae = gh*h_{t-1}*a*exp(A_raw) is shared by the delta and A_raw paths.
+        hae := ght * htm1 * ad * ea;
         // dL/dc_t[s] += gy*h_t[d,s] (summed over channels d).
         FGcT.FData[s] := FGcT.FData[s] + gy * ht;
         // dL/db_t[s] += gh*delta*x_d (summed over channels d).
-        FGbT.FData[s] := FGbT.FData[s] + ght * sp * xd;
+        FGbT.FData[s] := FGbT.FData[s] + ght * spxd;
         // delta path: through a (da/ddelta = -ea*a, scaled by h_{t-1}) and
         // through the input term (d(delta*b*x)/ddelta = b*x).
-        gdelta := gdelta + ght * (htm1 * (-ea * ad) + FBt.FData[tb + s] * xd);
+        gdelta := gdelta + ghbt * xd - hae;
         // A_raw[d,s]: da/dA_raw = a*(-delta*ea).
-        FGradA.FData[ebase + s] := FGradA.FData[ebase + s] +
-          ght * htm1 * (ad * (-sp * ea));
+        FGradA.FData[ebase + s] := FGradA.FData[ebase + s] - sp * hae;
         // x_t[d] direct path through delta*b_t[s]*x_t[d].
-        gxd := gxd + ght * sp * FBt.FData[tb + s];
+        gxv := gxv + ghbt;
         // Propagate to t-1: gh_{t-1}[d,s] = a_t[d,s]*gh_t[d,s].
         FGh.FData[ebase + s] := ad * ght;
       end;
+      // direct feedthrough e[d]*x_t[d] plus the delta*b*x input path.
+      gxd := gy * Ee.FData[d] + sp * gxv;
       // softplus'(pre) = sigmoid(pre) = 1 - exp(-delta).
       gpre := gdelta * (1 - NeuralExp(-sp));
       FGradBd.FData[d] := FGradBd.FData[d] + gpre;
@@ -73524,7 +73531,7 @@ var
   GyPtr, XtPtr, PrevErrPtr: TNeuralFloatArrPtr;
   rstd, gy, z, dotzg, gz, gate, sig, silu, dsilu, gdth, ght, gAlog: TNeuralFloat;
   dth, ah, ar, xv, htm1, gy_y, gpre, gxv, yval: TNeuralFloat;
-  kZ, arah, ghtdth, gyz: TNeuralFloat;
+  kZ, arah, gyz, bv, dtxv, ghhtm1, gxvAcc, gdthB: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -73617,7 +73624,7 @@ begin
       ar := FArBuf[h];   // A = -exp(A_log)
       arah := ar * ah;   // invariant across the c/s loops below
       hP := h * P;
-      gdth := 0;
+      gdthB := 0;
       gAlog := 0;
       for c := 0 to PM1 do
       begin
@@ -73629,39 +73636,46 @@ begin
         gy_y := FY.FData[tDInner + xbase];   // dL/dy_c (set above)
         // D skip: y_c += D[h]*x_c.
         FGradD.FData[h] := FGradD.FData[h] + gy_y * xv;
-        gxv := gy_y * Dd.FData[h];
+        dtxv := dth * xv;      // invariant across the state loop
+        gxvAcc := 0;           // sum_s gh*B[s]; scaled by dt after the loop
         for s := 0 to NM1 do
         begin
           if t > 0
             then htm1 := FState.FData[hbasePrev + s]
             else htm1 := 0;
+          bv := XtPtr^[bBase + s];
           // gh_t[c,s] = gh-from-(t+1) (in FGh) + direct y-path C*gy_y.
           ght := FGh.FData[ebase + s] + XtPtr^[cBase + s] * gy_y;
+          ghhtm1 := ght * htm1;   // one product, two uses
           // dL/dC[g,s] += gy_y * h_t[c,s]  -> input-grad on C channel.
           if hasInputGrad then
             PrevErrPtr^[cBase + s] := PrevErrPtr^[cBase + s] +
               gy_y * FState.FData[hbase + s];
           // h_t = a*h_{t-1} + dt*B*x ; a = exp(dt*ar).
-          // dt path: dh/ddt = ar*a*h_{t-1} + B*x.
-          gdth := gdth + ght * (arah * htm1 +
-            XtPtr^[bBase + s] * xv);
+          // dt path: dh/ddt = ar*a*h_{t-1} + B*x. The ar*a factor is invariant
+          // per head, so its half of the sum rides along in gAlog.
+          gdthB := gdthB + ght * (bv * xv);
           // A_log path: da/dA_log = a*dt*ar (ar=-exp(A_log)); dh/da = h_{t-1}.
-          gAlog := gAlog + ght * htm1;
-          ghtdth := ght * dth;   // one product, two uses
+          gAlog := gAlog + ghhtm1;
           // B path (input grad): dh/dB = dt*x.
           if hasInputGrad then
             PrevErrPtr^[bBase + s] := PrevErrPtr^[bBase + s] +
-              ghtdth * xv;
+              ght * dtxv;
           // x path through dt*B*x.
-          gxv := gxv + ghtdth * XtPtr^[bBase + s];
+          gxvAcc := gxvAcc + ght * bv;
           // Propagate to t-1: gh_{t-1}[c,s] = a*gh_t[c,s].
           FGh.FData[ebase + s] := ah * ght;
         end;
         if hasInputGrad then
+        begin
+          gxv := gy_y * Dd.FData[h] + dth * gxvAcc;
           PrevErrPtr^[xbase] := PrevErrPtr^[xbase] + gxv;
+        end;
       end;
       // dL/dA_log via the per-head accumulated gAlog (= sum ght*h_{t-1}).
       FGradA.FData[h] := FGradA.FData[h] + gAlog * (ah * dth * ar);
+      // dt path: the ar*a*h_{t-1} half reuses gAlog; the B*x half is gdthB.
+      gdth := arah * gAlog + gdthB;
       // dt backward: dt = softplus(dt_in + dt_bias); dsoftplus = 1 - exp(-dt).
       gpre := gdth * (1 - NeuralExp(-dth));
       FGradDtB.FData[h] := FGradDtB.FData[h] + gpre;     // dL/d dt_bias
@@ -74390,8 +74404,9 @@ begin
       for d := 0 to DepthM1 do
       begin
         xv := Prev.FData[basePrev0 + d];
+        // Horner form: one multiply fewer per element than a*x*x + b*x + c.
         FOutput.FData[baseOut0 + d] :=
-          Wa.FData[d] * xv * xv + Wb.FData[d] * xv + Wc.FData[d];
+          (Wa.FData[d] * xv + Wb.FData[d]) * xv + Wc.FData[d];
       end;
     end;
   FForwardTime := FForwardTime + (Now() - StartTime);
@@ -74996,13 +75011,17 @@ var
   OutputMaxX, OutputMaxY, MaxD: integer;
   InX, InY, InXMax, InYMax: integer;
   CntInputPX, CntInputPY: integer;
-  OutputRawPos: integer;
+  OutputRawPos, IdxRawPos: integer;
+  OutputRawPtr, InputRawPtr: TNeuralFloatArrPtr;
   CurrValue: TNeuralFloat;
   LocalPoolSizeM1, InputSizeXM1, InputSizeYM1: integer;
+  LocalNeedsArgMin: boolean;
 begin
   OutputMaxX := Output.SizeX - 1;
   OutputMaxY := Output.SizeY - 1;
   MaxD := Output.Depth - 1;
+  // #20: one test per forward instead of a branch inside the depth loop.
+  LocalNeedsArgMin := FIsTrainable;
   LocalPoolSizeM1 := FPoolSize - 1;
   InputSizeXM1 := FInputCopy.SizeX - 1;
   InputSizeYM1 := FInputCopy.SizeY - 1;
@@ -75016,25 +75035,46 @@ begin
       InX := CntOutputX * FStride;
       InXMax := Min(InX + LocalPoolSizeM1, InputSizeXM1);
       OutputRawPos := Output.GetRawPos(CntOutputX, CntOutputY);
-      for CntD := 0 to MaxD do
+      OutputRawPtr := FOutput.GetRawPtr(CntOutputX, CntOutputY);
+      // Mirrors TNNetMaxPool.ComputeWithStride: each window cell is one
+      // depth-contiguous strip, so the reduction walks the depth axis with
+      // pointers instead of re-indexing FInputCopy per element. Window cells
+      // keep the PX-then-PY visiting order, so the strict-'<' first-winner
+      // tie-break (and hence FMaxPosX/FMaxPosY) is unchanged. The argmin
+      // bookkeeping is skipped when only the backward pass would read it.
+      for CntInputPX := InX to InXMax do
       begin
-        for CntInputPX := InX to InXMax do
+        for CntInputPY := InY to InYMax do
         begin
-          for CntInputPY := InY to InYMax do
+          InputRawPtr := FInputCopy.GetRawPtr(CntInputPX, CntInputPY);
+          if LocalNeedsArgMin then
           begin
-            CurrValue := FInputCopy[CntInputPX, CntInputPY, CntD];
-            if CurrValue < FOutput.FData[OutputRawPos] then
+            IdxRawPos := OutputRawPos;
+            for CntD := 0 to MaxD do
             begin
-              FOutput.FData[OutputRawPos] := CurrValue;
-              FMaxPosX[OutputRawPos] := CntInputPX;
-              FMaxPosY[OutputRawPos] := CntInputPY;
+              CurrValue := InputRawPtr^[CntD];
+              if CurrValue < OutputRawPtr^[CntD] then
+              begin
+                OutputRawPtr^[CntD] := CurrValue;
+                FMaxPosX[IdxRawPos] := CntInputPX;
+                FMaxPosY[IdxRawPos] := CntInputPY;
+              end;
+              Inc(IdxRawPos);
+            end;
+          end
+          else
+          begin
+            for CntD := 0 to MaxD do
+            begin
+              CurrValue := InputRawPtr^[CntD];
+              if CurrValue < OutputRawPtr^[CntD]
+                then OutputRawPtr^[CntD] := CurrValue;
             end;
           end;
         end;
-        Inc(OutputRawPos);
       end;
     end;
-  end; // of for CntD
+  end;
 end;
 
 procedure TNNetMinPool.Compute();

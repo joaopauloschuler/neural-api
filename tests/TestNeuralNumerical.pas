@@ -41,6 +41,7 @@ type
     procedure TestGridAvgPoolPaddedForward;
     procedure TestGridAvgPoolPaddedGradientCheck;
     procedure TestMinPoolWithNegatives;
+    procedure TestMinPoolStridedForwardReference;
     procedure TestPoolingWithOddDimensions;
     procedure TestMinChannelGradientCheck;
     procedure TestMaxChannelGradientCheck;
@@ -2166,6 +2167,67 @@ begin
       NN.GetLastLayer.Output[1, 1, 1], 0.0001);
   finally
     NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Reference check for the strided/padded min-pool path (TNNetMinPool.
+// ComputeWithStride). Pass 1 documents the zero padding taking part in the
+// minimum; pass 2 covers the argmin-free branch of a non-trainable layer.
+procedure TTestNeuralNumerical.TestMinPoolStridedForwardReference;
+var
+  NN: TNNet;
+  Input, Padded, PoolOut: TNNetVolume;
+  Pass, x_, y_, d_, px, py: integer;
+  InX, InY, InXMax, InYMax, Padding: integer;
+  Trainable: boolean;
+  Expected, CurrValue: TNeuralFloat;
+begin
+  Input := TNNetVolume.Create(5, 5, 2);
+  Padded := TNNetVolume.Create(1, 1, 1);
+  try
+    for x_ := 0 to 4 do
+      for y_ := 0 to 4 do
+        for d_ := 0 to 1 do
+          Input[x_, y_, d_] := ((x_ * 7 + y_ * 3 + d_ * 11) mod 13) - 6 + 0.25 * x_;
+    for Pass := 0 to 2 do
+    begin
+      if Pass = 1 then Padding := 1 else Padding := 0;
+      Trainable := Pass < 2;
+      NN := TNNet.Create();
+      try
+        NN.AddLayer(TNNetInput.Create(5, 5, 2));
+        NN.AddLayer(TNNetMinPool.Create(3, 2, Padding).SetTrainable(Trainable));
+        NN.Compute(Input);
+        PoolOut := NN.GetLastLayer.Output;
+        if Padding > 0
+          then Padded.CopyPadding(Input, Padding)
+          else Padded.Copy(Input);
+        for y_ := 0 to PoolOut.SizeY - 1 do
+          for x_ := 0 to PoolOut.SizeX - 1 do
+            for d_ := 0 to PoolOut.Depth - 1 do
+            begin
+              InX := x_ * 2;
+              InY := y_ * 2;
+              InXMax := Min(InX + 2, Padded.SizeX - 1);
+              InYMax := Min(InY + 2, Padded.SizeY - 1);
+              Expected := 1000000;
+              for px := InX to InXMax do
+                for py := InY to InYMax do
+                begin
+                  CurrValue := Padded[px, py, d_];
+                  if CurrValue < Expected then Expected := CurrValue;
+                end;
+              AssertEquals('MinPool pass ' + IntToStr(Pass) + ' at (' +
+                IntToStr(x_) + ',' + IntToStr(y_) + ',' + IntToStr(d_) + ')',
+                Expected, PoolOut[x_, y_, d_], 0.0001);
+            end;
+      finally
+        NN.Free;
+      end;
+    end;
+  finally
+    Padded.Free;
     Input.Free;
   end;
 end;
