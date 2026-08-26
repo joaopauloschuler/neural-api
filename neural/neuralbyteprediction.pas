@@ -588,7 +588,7 @@ var
   T: longint;
 begin
   T := WrongNeuronPredictionCnt + CorrectNeuronPredictionCnt;
-  GetD := (CorrectNeuronPredictionCnt / (T + 2));
+  GetD := ((CorrectNeuronPredictionCnt + 1) / (T + 2));
 end;
 
 function TNeuronGroupBase.ToString: string;
