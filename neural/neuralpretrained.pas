@@ -31921,6 +31921,13 @@ var
   begin
     if not Reader.HasTensor(TName) then
       ImportError('Florence-2 import: missing tensor "' + TName + '".');
+    if (Reader.DimCount(TName) <> 2) or
+       (Reader.DimSize(TName, 0) <>
+          BC.MaxPositionEmbeddings + BartPositionOffset) or
+       (Reader.DimSize(TName, 1) <> BC.DModel) then
+      ImportError('Florence-2 import: "' + TName + '" must have shape [' +
+        IntToStr(BC.MaxPositionEmbeddings + BartPositionOffset) + ', ' +
+        IntToStr(BC.DModel) + '], got ' + Reader.ShapeAsString(TName));
     Reader.LoadTensorFlat(TName, Tmp);
     // Source rows BartPositionOffset..BartPositionOffset+SeqLen-1 and the
     // destination table rows are both contiguous, so the whole window is a

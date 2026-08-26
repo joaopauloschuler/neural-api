@@ -584,6 +584,7 @@ type
     procedure TestTrOCRParity;
     procedure TestFlorence2LocationTokens;
     procedure TestFlorence2Parity;
+    procedure TestFlorence2PositionTableShape;
     procedure TestInceptionV3ConfigFromJSONFile;
     procedure TestInceptionV3ImageClassificationParity;
     procedure TestInceptionV3FullParity;
@@ -23060,6 +23061,42 @@ begin
     EncoderNet.Free;
     DecoderNet.Free;
   end;
+end;
+
+// A learned position table smaller than max_position_embeddings + 2 must be
+// rejected: the loader copies the whole SeqLen window in one Move, so a short
+// checkpoint table would be read past its end.
+procedure TTestNeuralPretrained.TestFlorence2PositionTableShape;
+var
+  EncoderNet, DecoderNet: TNNet;
+  Projector: TFlorence2Projector;
+  Config: TFlorence2Config;
+  Rejected: boolean;
+begin
+  Config := ReadFlorence2ConfigFromJSONFile(
+    FixturePath('tiny_florence2_config.json'));
+  // The fixture table has max_position_embeddings + 2 = 42 rows; claiming a
+  // longer context makes the requested window overrun it.
+  Config.Bart.MaxPositionEmbeddings := 128;
+  Rejected := false;
+  EncoderNet := nil;
+  DecoderNet := nil;
+  FillChar(Projector, SizeOf(Projector), 0);
+  try
+    try
+      BuildFlorence2FromSafeTensorsWithConfig(
+        FixturePath('tiny_florence2.safetensors'), Config,
+        EncoderNet, DecoderNet, Projector, {EncSeqLen=}100, {DecSeqLen=}100,
+        {pTrainable=}false);
+    except
+      on E: EPretrainedImportError do Rejected := true;
+    end;
+  finally
+    FreeFlorence2Projector(Projector);
+    EncoderNet.Free;
+    DecoderNet.Free;
+  end;
+  AssertTrue('short embed_positions table rejected', Rejected);
 end;
 
 // Verifies ReadOwlViTConfigFromJSONFile on the committed OWL-ViT pico config
