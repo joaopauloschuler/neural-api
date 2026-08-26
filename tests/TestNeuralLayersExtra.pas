@@ -22,6 +22,9 @@ type
     // DeLocalConnect tests
     procedure TestDeLocalConnectForward;
     procedure TestDeLocalConnectReLUForward;
+
+    // LocalProduct tests
+    procedure TestLocalProductBackwardWindow;
     
     // DeMaxPool (Upsampling) tests
     procedure TestDeMaxPoolForward;
@@ -807,6 +810,73 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+// TNNetLocalProduct multiplies the whole FeatureSizeX x FeatureSizeY x InputDepth
+// window into every output cell, so its (deliberately smoothed, unit-derivative)
+// backward must spread the output error over that same window: the full X extent
+// and every input channel, and nothing outside it.
+procedure TTestNeuralLayersExtra.TestLocalProductBackwardWindow;
+var
+  NN: TNNet;
+  Input, Target, DesiredErr: TNNetVolume;
+  ProdLayer, InLayer: TNNetLayer;
+  CntX, CntY, CntD: integer;
+  Share, InSum: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 2);
+  Target := TNNetVolume.Create(2, 2, 1);
+  DesiredErr := TNNetVolume.Create(2, 2, 1);
+  try
+    InLayer := NN.AddLayer(TNNetInput.Create(3, 3, 2));
+    ProdLayer := NN.AddLayer(TNNetLocalProduct.Create(1, 2, 0, 1, 0));
+
+    Input.Fill(1.0);
+    NN.Compute(Input);
+
+    AssertEquals('LocalProduct output SizeX', 2, ProdLayer.Output.SizeX);
+    AssertEquals('LocalProduct output SizeY', 2, ProdLayer.Output.SizeY);
+    AssertEquals('LocalProduct output Depth', 1, ProdLayer.Output.Depth);
+
+    // Inputs never backprop, so their error buffer is size 1 by default. Give
+    // it a full-size buffer so the layer actually scatters into it.
+    InLayer.OutputError.ReSize(InLayer.Output);
+
+    // Seed an error in the (0,0) output cell only: its window is the whole
+    // 2 x 2 x 2 block anchored at the input origin.
+    DesiredErr.Fill(0);
+    DesiredErr[0, 0, 0] := 8.0;
+    Target.Copy(ProdLayer.Output);
+    Target.Sub(DesiredErr); // Target = Output - DesiredErr => error = DesiredErr
+    NN.Backpropagate(Target);
+
+    // Total error is preserved: 8.0 spread over the 8 window cells.
+    InSum := InLayer.OutputError.GetSum();
+    AssertEquals('LocalProduct backward preserves total error', 8.0, InSum, 0.0001);
+
+    Share := 8.0 / 8;
+    for CntX := 0 to 1 do
+      for CntY := 0 to 1 do
+        for CntD := 0 to 1 do
+          AssertEquals('LocalProduct window share at ' + IntToStr(CntX) + ',' +
+            IntToStr(CntY) + ',' + IntToStr(CntD),
+            Share, InLayer.OutputError[CntX, CntY, CntD], 0.0001);
+
+    // Everything outside the window stays untouched.
+    for CntX := 0 to 2 do
+      for CntY := 0 to 2 do
+        if (CntX = 2) or (CntY = 2) then
+          for CntD := 0 to 1 do
+            AssertEquals('LocalProduct outside window at ' + IntToStr(CntX) + ',' +
+              IntToStr(CntY) + ',' + IntToStr(CntD),
+              0.0, InLayer.OutputError[CntX, CntY, CntD], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+    DesiredErr.Free;
   end;
 end;
 

@@ -54448,8 +54448,8 @@ end;
 procedure TNNetLocalProduct.BackpropagateAtOutputPos(OutputX, OutputY,
   OutputD: integer);
 var
-  CntX, CntY: integer;
-  MaxX, MaxY: integer;
+  CntRowPos, CntY: integer;
+  MaxRowPos, MaxY: integer;
   LocalOutputError: TNeuralFloat;
   LocalPrevError: TNNetVolume;
   OutputIdx: integer;
@@ -54461,9 +54461,11 @@ begin
 
   if (LocalOutputError <> 0) and (FOutput.FData[OutputIdx] > 0) then
   begin
-    MaxY := FFeatureSizeY - 1;
-    MaxX := FFeatureSizeX - 1;
     LocalPrevError := FPrevLayer.OutputError;
+    MaxY := FFeatureSizeY - 1;
+    // One row of the feature window spans FeatureSizeX positions times every
+    // input channel, and those cells are contiguous in the raw data.
+    MaxRowPos := FFeatureSizeX * LocalPrevError.Depth - 1;
 
     FSmoothErrorPropagation := true;
 
@@ -54479,12 +54481,12 @@ begin
     begin
       for CntY := 0 to MaxY do
       begin
-        // (X, Y) are invariant across the CntX loop (CntX is the depth slot),
-        // so hoist the depth-0 base and add CntX inside.
+        // The row start is invariant across the inner loop, so hoist it and
+        // walk the contiguous run of window cells from there.
         DestBase := LocalPrevError.GetRawPos( (OutputX-FPadding)*FStride, (OutputY-FPadding)*FStride + CntY, 0);
-        for CntX := 0 to MaxX do
+        for CntRowPos := 0 to MaxRowPos do
         begin
-          DestPos := DestBase + CntX;
+          DestPos := DestBase + CntRowPos;
           LocalPrevError.FData[DestPos] := LocalPrevError.FData[DestPos] + Delta;
         end;
       end;
@@ -54497,7 +54499,11 @@ var
   WindowVolume: integer;
 begin
   inherited SetPrevLayer(pPrevLayer);
-  WindowVolume := FFeatureSizeX * FFeatureSizeY * FOutput.Depth;
+  // Destination cells per output cell (the whole feature window, all input
+  // channels) times the output depth, since every output channel repeats the
+  // same product and therefore contributes the same share.
+  WindowVolume := FFeatureSizeX * FFeatureSizeY * pPrevLayer.Output.Depth *
+    FOutput.Depth;
   if WindowVolume > 0
     then FInvWindowVolume := 1 / WindowVolume
     else FInvWindowVolume := 0;
