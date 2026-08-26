@@ -69019,12 +69019,20 @@ begin
   begin
     if (Net.Layers[LayerIdx] is TNNetAvgPool) and (LayerIdx > 0) then
     begin
-      // the layer feeding this pool is the previous block's feature.
+      // the layer feeding this pool is the previous block's feature. FeatLayers
+      // holds Config.NumChannels slots, so a net with more stages than the
+      // Config describes has to be rejected before the write, not after it.
+      if Found >= Config.NumChannels then
+        ImportError('T2IAdapterFeatures: located more than ' +
+          IntToStr(Config.NumChannels) + ' feature layers.');
       FeatLayers[Found] := Net.Layers[LayerIdx - 1];
       Inc(Found);
     end;
   end;
   // the last block's feature is the final layer of the net.
+  if Found >= Config.NumChannels then
+    ImportError('T2IAdapterFeatures: located more than ' +
+      IntToStr(Config.NumChannels) + ' feature layers.');
   FeatLayers[Found] := Net.Layers[Net.CountLayers() - 1];
   Inc(Found);
   if Found <> Config.NumChannels then

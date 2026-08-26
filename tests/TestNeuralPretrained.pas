@@ -627,6 +627,7 @@ type
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
     procedure TestT2IAdapterParity;
+    procedure TestT2IAdapterFeatureCountMismatch;
     procedure TestIPAdapterConfigFromJSONFile;
     procedure TestIPAdapterParity;
     procedure TestVaeRoundTrip;
@@ -25976,6 +25977,57 @@ begin
     Cond.Free;
     RefJson.Free;
     if RefRoot <> nil then RefRoot.Free;
+  end;
+end;
+
+// T2IAdapterFeatures collects one feature layer per Config stage into an array
+// sized by Config.NumChannels. A Config that describes fewer stages than the net
+// actually has (a hand-made config, or a config read from a different adapter)
+// must be reported, not written past the end of that array.
+procedure TTestNeuralPretrained.TestT2IAdapterFeatureCountMismatch;
+var
+  NN: TNNet;
+  Config: TT2IAdapterConfig;
+  Cond: TNNetVolume;
+  Features: array of TNNetVolume;
+  fi: integer;
+  Rejected: boolean;
+  Msg: string;
+begin
+  RandSeed := 424242;
+  NN := BuildT2IAdapterFromSafeTensors(
+    FixturePath('tiny_t2i_adapter.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_t2i_adapter_config.json'));
+  Cond := TNNetVolume.Create;
+  Rejected := false;
+  Msg := '';
+  // one stage fewer than the fixture net has.
+  SetLength(Features, Config.NumChannels - 1);
+  for fi := 0 to Config.NumChannels - 2 do
+    Features[fi] := TNNetVolume.Create;
+  try
+    AssertTrue('fixture has more than one stage', Config.NumChannels > 1);
+    Cond.ReSize(Config.CondGrid, Config.CondGrid, Config.CondChannels);
+    Cond.Fill(0);
+    Config.NumChannels := Config.NumChannels - 1;
+    try
+      T2IAdapterFeatures(NN, Config, Cond, Features);
+    except
+      on E: EPretrainedImportError do
+      begin
+        Rejected := true;
+        Msg := E.Message;
+      end;
+    end;
+    AssertTrue('a stage-count mismatch must be reported', Rejected);
+    // the "more than" wording is the guard that runs BEFORE the array write; the
+    // trailing total-count check would report an overrun that already happened.
+    AssertTrue('the extra stage must be caught before the array write (' +
+      Msg + ')', Pos('more than', Msg) > 0);
+  finally
+    for fi := 0 to Length(Features) - 1 do Features[fi].Free;
+    NN.Free;
+    Cond.Free;
   end;
 end;
 
