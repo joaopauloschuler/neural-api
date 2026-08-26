@@ -6901,18 +6901,20 @@ end;
 function MatchStopStringSuffix(const Text: string;
   const StopStrings: array of string): integer;
 var
-  S, L: integer;
+  S, L, TextLen: integer;
   StopStringsHi: integer;
 begin
   Result := 0;
+  TextLen := Length(Text); // #5: invariant across the probes
+  if TextLen = 0 then exit; // no suffix can match
   StopStringsHi := High(StopStrings);
   for S := 0 to StopStringsHi do
   begin
     L := Length(StopStrings[S]);
     // #13/App C: exact single-byte suffix compare via CompareMem - no Copy
-    // heap-string alloc per probe (guarded by L >= 1 and L <= Length(Text)).
-    if (L > Result) and (L >= 1) and (L <= Length(Text)) and
-      CompareMem(@Text[Length(Text) - L + 1], @StopStrings[S][1], L) then
+    // heap-string alloc per probe (guarded by L >= 1 and L <= TextLen).
+    if (L > Result) and (L >= 1) and (L <= TextLen) and
+      CompareMem(@Text[TextLen - L + 1], @StopStrings[S][1], L) then
       Result := L;
   end;
 end;
@@ -7153,13 +7155,15 @@ function DecodeContrastiveSearch(NN: TNNet; const Prompt: string;
 var
   InputVolume, OutputVolume: TNNetVolume;
   HiddenLayer: TNNetLayer;
-  Probs: array of TNeuralFloat;
+  PRaw: TNeuralFloatArrPtr;        // the step's raw next-token row
+  CandP: array of TNeuralFloat;    // normalised probability of each candidate
   Cand: array of integer;          // current top-k candidate token ids
   Past: array of TNNetVolume;      // hidden states of already-processed tokens
   CandHidden: TNNetVolume;         // snapshot of a candidate's hidden state
-  VocabSize, Step, I, J, NumCand, Best, StopLen, PastLen: integer;
+  VocabSize, Step, I, J, NumCand, Best, BestCand, StopLen, PastLen: integer;
   VocabSizeM1, NumCandM1, PastLenM1: integer;
   Total, InvTotal, MaxSim, Sim, ScoreV, BestScore, BestP, PJ: TNeuralFloat;
+  WeakestP: TNeuralFloat;
   Context, CandStr: string;
   TmpI: integer;
 begin
@@ -7168,9 +7172,9 @@ begin
   HiddenLayer := ContrastiveHiddenLayer(NN);
   VocabSize := OutputVolume.Size;
   VocabSizeM1 := VocabSize - 1;
-  SetLength(Probs, VocabSize);
   if TopK < 1 then TopK := 1;
   if TopK > VocabSize then TopK := VocabSize;
+  SetLength(CandP, TopK);
   Result.Text := '';
   Result.SumLogProb := 0;
   Result.Finished := False;
@@ -7185,27 +7189,29 @@ begin
   try
     for Step := 1 to MaxLen do
     begin
-      // Forward the current context: probabilities for the next token AND the
-      // context's own last hidden state (seeds the past set on the first step).
+      // The one committed forward of the step: its output row is the next-token
+      // distribution AND its hidden state is the last context token's, which is
+      // exactly what the past-context set needs. On step 1 the context is the
+      // bare prompt, so the prompt's hidden state seeds the set.
       InputVolume.OneHotEncodingReversed(Context);
       NN.Compute(InputVolume, OutputVolume);
-      Total := OutputVolume.GetSum();
-      if Total <= 0 then Total := 1.0;
-      // #5/#13: /Total is one shared positive constant -> bulk scale-copy.
-      InvTotal := 1.0 / Total;
-      Move(OutputVolume.FData[0], Probs[0], VocabSize * csNeuralFloatSize);
-      TNNetVolume.Mul(TNeuralFloatArrPtr(@Probs[0]), InvTotal, VocabSize);
-      // On the first step record the prompt's hidden state as the only past
-      // context (so step 1 already has something to penalise against).
-      if PastLen = 0 then
+      if PenaltyAlpha > 0 then
       begin
         // #17: amortized doubling - Past is addressed by PastLen (never Length),
         // and the cleanup frees [0..PastLen-1], so over-allocated slots are safe.
         if PastLen >= Length(Past) then SetLength(Past, (PastLen + 1) * 2);
-        Past[0] := TNNetVolume.Create();
-        Past[0].Copy(HiddenLayer.Output);
-        PastLen := 1;
+        Past[PastLen] := TNNetVolume.Create();
+        Past[PastLen].Copy(HiddenLayer.Output);
+        Inc(PastLen);
       end;
+      Total := OutputVolume.GetSum();
+      if Total <= 0 then Total := 1.0;
+      // #14: /Total is one shared POSITIVE constant, so the raw row ranks the
+      // tokens exactly as the normalised row does. Select on the raw row and
+      // normalise only the TopK survivors, instead of materialising a
+      // vocab-sized probability copy per token.
+      InvTotal := 1.0 / Total;
+      PRaw := OutputVolume.DataPtr;
       // Top-k candidates by probability (partial selection sort; k is tiny).
       // Cand is pre-sized to VocabSize once (see above); NumCand bounds the
       // meaningful prefix, no per-step realloc.
@@ -7221,34 +7227,43 @@ begin
       for I := 1 to NumCandM1 do
       begin
         TmpI := Cand[I];
-        BestP := Probs[TmpI];
+        BestP := PRaw^[TmpI];
         J := I - 1;
-        while (J >= 0) and (Probs[Cand[J]] < BestP) do
+        while (J >= 0) and (PRaw^[Cand[J]] < BestP) do
         begin
           Cand[J + 1] := Cand[J];
           Dec(J);
         end;
         Cand[J + 1] := TmpI;
       end;
+      // #4/#11: the weakest kept probability is a two-level dependent load that
+      // only the insertion branch can change - keep it in a local and refresh
+      // it there, instead of re-reading it for every vocabulary token.
+      WeakestP := PRaw^[Cand[NumCandM1]];
       for I := NumCand to VocabSizeM1 do
       begin
-        PJ := Probs[I];
-        if PJ > Probs[Cand[NumCandM1]] then
+        PJ := PRaw^[I];
+        if PJ > WeakestP then
         begin
           J := NumCandM1 - 1;
-          while (J >= 0) and (Probs[Cand[J]] < PJ) do
+          while (J >= 0) and (PRaw^[Cand[J]] < PJ) do
           begin
             Cand[J + 1] := Cand[J];
             Dec(J);
           end;
           Cand[J + 1] := I;
+          WeakestP := PRaw^[Cand[NumCandM1]];
         end;
       end;
+      // Normalise the survivors now: the per-candidate forwards below overwrite
+      // OutputVolume, so the raw row is gone by the time the scores are formed.
+      for I := 0 to NumCandM1 do CandP[I] := PRaw^[Cand[I]] * InvTotal;
       // Re-rank candidates by the contrastive objective. PenaltyAlpha=0 keeps
       // (1-alpha)*p(v) only, so the highest-probability candidate (Cand[0])
       // wins by construction -> exactly greedy argmax over the top-k (= plain
       // greedy argmax, since the global argmax is always in the top-k set).
       Best := Cand[0];
+      BestCand := 0;
       BestScore := -1e30;
       for I := 0 to NumCandM1 do
       begin
@@ -7269,31 +7284,25 @@ begin
             if Sim > MaxSim then MaxSim := Sim;
           end;
         end;
-        ScoreV := (1 - PenaltyAlpha) * Probs[Cand[I]] - PenaltyAlpha * MaxSim;
+        ScoreV := (1 - PenaltyAlpha) * CandP[I] - PenaltyAlpha * MaxSim;
         if ScoreV > BestScore then
         begin
           BestScore := ScoreV;
           Best := Cand[I];
+          BestCand := I;
         end;
       end;
-      Result.SumLogProb := Result.SumLogProb + SafeLogProb(Probs[Best]);
+      Result.SumLogProb := Result.SumLogProb + SafeLogProb(CandP[BestCand]);
       if Best = csDecodeEOSToken then
       begin
         Result.Finished := True;
         Break;
       end;
-      // Commit: append the token, and add ITS hidden state to the past set so
-      // future candidates are penalised against it too. Recompute the chosen
-      // continuation's hidden state (cheap, k is small; avoids stashing all k).
+      // Commit: append the token. The chosen continuation's hidden state is
+      // harvested by the next step's own forward over this very context, so no
+      // commit forward is needed here.
       Result.Text := Result.Text + Chr(Best);
       Context := Context + Chr(Best);
-      InputVolume.OneHotEncodingReversed(Context);
-      NN.Compute(InputVolume, OutputVolume);
-      // #17: amortized doubling (see the seeding note above).
-      if PastLen >= Length(Past) then SetLength(Past, (PastLen + 1) * 2);
-      Past[PastLen] := TNNetVolume.Create();
-      Past[PastLen].Copy(HiddenLayer.Output);
-      Inc(PastLen);
       // Stop strings: terminate and trim, exactly like DecodeGreedy.
       if Length(StopStrings) > 0 then
       begin
@@ -7323,13 +7332,15 @@ function DecodeContrastiveSearchStreamed(Session: TNNetStreamingDecoder;
   const StopSequences: TNNetTokenSequences): integer;
 var
   InV, Row: TNNetVolume;
-  Probs: array of TNeuralFloat;
+  PRaw: TNeuralFloatArrPtr;
+  CandP: array of TNeuralFloat;
   Cand: array of integer;
   Past: array of TNNetVolume;
   CandHidden: TNNetVolume;
   VocabSize, Pos, CapLen, I, J, NumCand, Best, PastLen, StopLen: integer;
   VocabSizeM1, NumCandM1, PastLenM1, PromptLenM2: integer;
   Total, InvTotal, MaxSim, Sim, ScoreV, BestScore, BestP, PJ: TNeuralFloat;
+  WeakestP: TNeuralFloat;
   TmpI: integer;
 begin
   if Session.Net.GetFirstLayer().Output.SizeX <> 1 then
@@ -7343,9 +7354,9 @@ begin
   Row := Session.Output();
   VocabSize := Row.Size;
   VocabSizeM1 := VocabSize - 1;
-  SetLength(Probs, VocabSize);
   if TopK < 1 then TopK := 1;
   if TopK > VocabSize then TopK := VocabSize;
+  SetLength(CandP, TopK);
   CapLen := Min(PromptLen + MaxNewTokens, MaxTotalLen);
   if Length(Tokens) < CapLen then SetLength(Tokens, CapLen);
   InV := TNNetVolume.Create(Session.Net.GetFirstLayer().Output);
@@ -7395,10 +7406,12 @@ begin
       Row := Session.Output();
       Total := Row.GetSum();
       if Total <= 0 then Total := 1.0;
-      // #5/#13: /Total is one shared positive constant -> bulk scale-copy.
+      // #14: /Total is one shared POSITIVE constant, so the raw row ranks the
+      // tokens exactly as the normalised row does. Select on the raw row and
+      // normalise only the TopK survivors, instead of materialising a
+      // vocab-sized probability copy per token.
       InvTotal := 1.0 / Total;
-      Move(Row.FData[0], Probs[0], VocabSize * csNeuralFloatSize);
-      TNNetVolume.Mul(TNeuralFloatArrPtr(@Probs[0]), InvTotal, VocabSize);
+      PRaw := Row.DataPtr;
       // Top-k candidates by probability (partial selection sort; k is tiny).
       // Cand pre-sized to VocabSize once; NumCand bounds the meaningful prefix.
       NumCand := TopK;
@@ -7413,29 +7426,37 @@ begin
       for I := 1 to NumCandM1 do
       begin
         TmpI := Cand[I];
-        BestP := Probs[TmpI];
+        BestP := PRaw^[TmpI];
         J := I - 1;
-        while (J >= 0) and (Probs[Cand[J]] < BestP) do
+        while (J >= 0) and (PRaw^[Cand[J]] < BestP) do
         begin
           Cand[J + 1] := Cand[J];
           Dec(J);
         end;
         Cand[J + 1] := TmpI;
       end;
+      // #4/#11: the weakest kept probability is a two-level dependent load that
+      // only the insertion branch can change - keep it in a local and refresh
+      // it there, instead of re-reading it for every vocabulary token.
+      WeakestP := PRaw^[Cand[NumCandM1]];
       for I := NumCand to VocabSizeM1 do
       begin
-        PJ := Probs[I];
-        if PJ > Probs[Cand[NumCandM1]] then
+        PJ := PRaw^[I];
+        if PJ > WeakestP then
         begin
           J := NumCandM1 - 1;
-          while (J >= 0) and (Probs[Cand[J]] < PJ) do
+          while (J >= 0) and (PRaw^[Cand[J]] < PJ) do
           begin
             Cand[J + 1] := Cand[J];
             Dec(J);
           end;
           Cand[J + 1] := I;
+          WeakestP := PRaw^[Cand[NumCandM1]];
         end;
       end;
+      // Normalise the survivors now: the per-candidate StepForward calls below
+      // overwrite the session output row.
+      for I := 0 to NumCandM1 do CandP[I] := PRaw^[Cand[I]] * InvTotal;
       // Re-rank by the contrastive objective. PenaltyAlpha=0 keeps
       // (1-alpha)*p(v) only, so Cand[0] (the global argmax) wins by
       // construction -> bit-for-bit the streamed greedy argmax.
@@ -7462,7 +7483,7 @@ begin
             if Sim > MaxSim then MaxSim := Sim;
           end;
         end;
-        ScoreV := (1 - PenaltyAlpha) * Probs[Cand[I]] - PenaltyAlpha * MaxSim;
+        ScoreV := (1 - PenaltyAlpha) * CandP[I] - PenaltyAlpha * MaxSim;
         if ScoreV > BestScore then
         begin
           BestScore := ScoreV;
@@ -7723,13 +7744,12 @@ var
   CandSnap, LensOut: TNNetVolume;
   // Final distribution, the candidate lens row being scored, and the winning
   // candidate's row kept from the scoring pass.
-  PFinal, PLens, PBestLens: array of TNeuralFloat;
+  PFinal, PLens, PBestLens, SwapLens: array of TNeuralFloat;
   Cands: TNeuralIntegerArray;
   VocabSize, Step, I, C, L, HeadIdx, HeadInIdx, LastLayer: integer;
   NumCand, Best, StopLen, VocabSizeM1, NumCandM1: integer;
   Total, MaxFinal, Threshold, JS, BestJS, Pf, Pl, Pm, ScoreV, BestScore: TNeuralFloat;
-  InvTotal, BestVal: TNeuralFloat;
-  VocabRowBytes: integer;
+  InvTotal, InvPm: TNeuralFloat;
   Context: string;
   HaveContrast: boolean;
 const
@@ -7743,7 +7763,6 @@ begin
   SetLength(PFinal, VocabSize);
   SetLength(PLens, VocabSize);
   SetLength(PBestLens, VocabSize);
-  VocabRowBytes := VocabSize * csNeuralFloatSize;
   LastLayer := NN.GetLastLayerIdx();
   HeadIdx := ResolveHeadStartIdx(NN, HeadStartIdx);
   HeadInIdx := HeadIdx - 1;
@@ -7768,25 +7787,21 @@ begin
       Total := OutputVolume.GetSum();
       if Total <= 0 then Total := 1.0;
       InvTotal := 1.0 / Total; // #5: invariant across the vocab loop (cf. 6826/6858)
-      MaxFinal := 0;
-      for I := 0 to VocabSizeM1 do
-      begin
-        Pf := OutputVolume.Raw[I] * InvTotal;
-        if Pf < 0 then Pf := 0;
-        PFinal[I] := Pf;
-        if Pf > MaxFinal then MaxFinal := Pf;
-      end;
+      // #13/#18: InvTotal is positive, so clamping before the scale is the same
+      // as clamping after it - the whole per-element loop is a Relu copy plus a
+      // uniform scale, and MaxPos then returns the maximum AND its first index
+      // in one vectorized pass (ties to the lower index, as the scalar loop).
+      TNNetVolume.Relu(TNeuralFloatArrPtr(@PFinal[0]), OutputVolume.DataPtr,
+        VocabSize);
+      TNNetVolume.Mul(TNeuralFloatArrPtr(@PFinal[0]), InvTotal, VocabSize);
+      MaxFinal := TNNetVolume.MaxPos(TNeuralFloatArrPtr(@PFinal[0]), VocabSize,
+        Best);
 
       if not HaveContrast then
-      begin
         // Greedy argmax over p_final == DecodeGreedy's step (the raw softmax row
-        // is monotone in p_final, so this is bit-identical).
-        // #18: one vectorized MaxPos pass; ties go to the lower index, exactly
-        // as the scalar > loop did.
-        BestVal := TNNetVolume.MaxPos(TNeuralFloatArrPtr(@PFinal[0]),
-          VocabSize, Best);
-        Result.SumLogProb := Result.SumLogProb + SafeLogProb(BestVal);
-      end
+        // is monotone in p_final, so this is bit-identical); Best and MaxFinal
+        // are already the argmax pair from the pass above.
+        Result.SumLogProb := Result.SumLogProb + SafeLogProb(MaxFinal)
       else
       begin
         // (2)+(3) Pick the premature layer with MAX Jensen-Shannon divergence
@@ -7810,23 +7825,28 @@ begin
           Total := LensOut.GetSum();
           if Total <= 0 then Total := 1.0;
           InvTotal := 1.0 / Total;
+          // The lens row is materialised in full, because the winning
+          // candidate's row is the one the contrast step below consumes.
+          // #13/#18: same clamp/scale identity as p_final above.
+          TNNetVolume.Relu(TNeuralFloatArrPtr(@PLens[0]), LensOut.DataPtr,
+            VocabSize);
+          TNNetVolume.Mul(TNeuralFloatArrPtr(@PLens[0]), InvTotal, VocabSize);
           // JS(p_final || p_lens) = 0.5 KL(p||m) + 0.5 KL(q||m), m = 0.5(p+q).
-          // #4/#5: single fused vocab loop - Pm lives in a local; only Pl is
-          // materialised, because the winning candidate's Pl row is the one
-          // the contrast step below consumes.
+          // #4/#5: Pm lives in a local, and #21: both logs divide by that same
+          // Pm, so one reciprocal replaces the two divides - JS only ranks
+          // candidate layers, so no gradient check watches this arithmetic.
           JS := 0;
           for I := 0 to VocabSizeM1 do
           begin
-            Pl := LensOut.Raw[I] * InvTotal;
-            if Pl < 0 then Pl := 0;
-            PLens[I] := Pl;
-            Pm := 0.5 * (PFinal[I] + Pl);
+            Pl := PLens[I];
+            Pf := PFinal[I];
+            Pm := 0.5 * (Pf + Pl);
             if Pm < cEps then Continue;
+            InvPm := 1.0 / Pm;
             // Rule #16: JS only ranks candidate layers (if JS > BestJS), so the
             // fast Cephes logf is safe here; 2*Vocab*NumCand RTL Ln removed/token.
-            Pf := PFinal[I];
-            if Pf >= cEps then JS := JS + 0.5 * Pf * pcr_logf(Pf / Pm);
-            if Pl >= cEps then JS := JS + 0.5 * Pl * pcr_logf(Pl / Pm);
+            if Pf >= cEps then JS := JS + 0.5 * Pf * pcr_logf(Pf * InvPm);
+            if Pl >= cEps then JS := JS + 0.5 * Pl * pcr_logf(Pl * InvPm);
           end;
           // #27: the winner's distribution is already in hand, so keep it here
           // instead of re-splicing and re-running the head sub-stack for it
@@ -7836,10 +7856,16 @@ begin
           // BestJS's -1.0 seed, so the first candidate's row is kept even when
           // no candidate ever clears that seed.
           if (C = 0) or (JS > BestJS) then
-            Move(PLens[0], PBestLens[0], VocabRowBytes);
+          begin
+            // Keeping the row is a buffer swap, not a vocab-sized copy: the
+            // buffer handed back becomes the next candidate's scratch and is
+            // fully rewritten by its bulk fill above.
+            SwapLens := PLens;
+            PLens := PBestLens;
+            PBestLens := SwapLens;
+          end;
           if JS > BestJS then BestJS := JS;
         end;
-        Move(PBestLens[0], PLens[0], VocabRowBytes);
         // (4) Adaptive plausibility constraint: keep only tokens at/above
         //     Alpha * max(p_final); argmax the contrast score over that set.
         Threshold := Alpha * MaxFinal;
@@ -7850,8 +7876,8 @@ begin
           begin
             // #14: argmax of ln(pf')-ln(pl') == argmax of pf'/pl' (ln strictly monotone);
             // same 1e-30 clamps as SafeLogProb, so ranking is order-identical.
-            Pf := PFinal[I]; if Pf < 1e-30 then Pf := 1e-30;
-            Pl := PLens[I];  if Pl < 1e-30 then Pl := 1e-30;
+            Pf := PFinal[I];    if Pf < 1e-30 then Pf := 1e-30;
+            Pl := PBestLens[I]; if Pl < 1e-30 then Pl := 1e-30;
             ScoreV := Pf / Pl;
             if (Best < 0) or (ScoreV > BestScore) then
             begin

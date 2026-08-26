@@ -151,6 +151,7 @@ type
     procedure TestConstrainedBeamPhraseCharOutsideVocab;
     // Contrastive search (penalty_alpha) decoding.
     procedure TestContrastiveAlphaZeroMatchesGreedy;
+    procedure TestContrastiveSingleCandidateMatchesGreedy;
     procedure TestContrastiveAlphaChangesSelection;
     // Token-level / KV-cache contrastive search (TNNetStreamingDecoder).
     procedure TestContrastiveStreamedAlphaZeroMatchesStreamedGreedy;
@@ -982,6 +983,37 @@ begin
     AssertEquals('alpha=0 contrastive text == greedy text', G.Text, C.Text);
     AssertEquals('alpha=0 contrastive finished == greedy',
       Ord(G.Finished), Ord(C.Finished));
+    // The per-step probability the score accumulates is the normalised row
+    // entry of the chosen token, exactly as greedy's is.
+    AssertEquals('alpha=0 contrastive sumlogprob == greedy',
+      G.SumLogProb, C.SumLogProb, 0.0);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestContrastiveSingleCandidateMatchesGreedy;
+var
+  NN: TNNet;
+  G, C: TNNetDecodeResult;
+  NoStops: array of string;
+begin
+  // TopK=1 leaves exactly one candidate per step, so the degeneration penalty
+  // cannot re-order anything and the emitted token is the greedy argmax at
+  // every step - whatever the past-context set holds. This pins the commit
+  // bookkeeping of the decode loop (context append plus the past-state append
+  // that the next step's own forward produces) independently of the re-rank.
+  RandSeed := 424242;
+  SetLength(NoStops, 0);
+  NN := BuildTinyNet(4, 8);
+  try
+    G := DecodeGreedy(NN, 'ab', 8);
+    C := DecodeContrastiveSearch(NN, 'ab', 8, 1, 1.0, NoStops);
+    AssertEquals('topk=1 contrastive text == greedy text', G.Text, C.Text);
+    AssertEquals('topk=1 contrastive finished == greedy',
+      Ord(G.Finished), Ord(C.Finished));
+    AssertEquals('topk=1 contrastive sumlogprob == greedy',
+      G.SumLogProb, C.SumLogProb, 0.0);
   finally
     NN.Free;
   end;
