@@ -11647,7 +11647,9 @@ begin
   GroupSize := FDepth div Groups;
   MaxGroup := Groups - 1;
   Self.Fill(0);
-  if MaxToken <= SizeX then
+  // The write loop indexes X with CntToken up to MaxToken, so the last valid
+  // token count is SizeX.
+  if MaxToken < SizeX then
   begin
     for CntToken := 0 to MaxToken do
     begin

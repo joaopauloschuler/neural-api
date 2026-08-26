@@ -57,6 +57,7 @@ type
     procedure TestVolumeOneHotEncodingOnPixel;
     procedure TestVolumeOneHotEncoding;
     procedure TestVolumeOneHotEncodingReversedString;
+    procedure TestVolumeGroupedOneHotEncoding;
     procedure TestVolumePositionalEncoding;
     procedure TestVolumeColorConversions;
     procedure TestVolumeLabRoundTrip;
@@ -2026,6 +2027,41 @@ begin
     // Other positions should be 0
     AssertEquals('V[0,0,0] should be 0.0', 0.0, V[0, 0, 0], 0.0001);
     AssertEquals('V[1,0,0] should be 0.0', 0.0, V[1, 0, 0], 0.0001);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeGroupedOneHotEncoding;
+var
+  V: TNNetVolume;
+  Tokens: array[0..2] of integer;
+  TooManyTokens: array[0..3] of integer;
+begin
+  // 3 positions, depth 8 split into 2 groups of 4: group 0 holds Token mod 4
+  // and group 1 (offset 4) holds Token div 4.
+  V := TNNetVolume.Create(3, 1, 8);
+  try
+    Tokens[0] := 1;
+    Tokens[1] := 5;
+    Tokens[2] := 8;
+    V.GroupedOneHotEncoding(Tokens, 2);
+    AssertEquals('token 1 low group', 1.0, V[0, 0, 1], 0.0001);
+    AssertEquals('token 1 high group', 1.0, V[0, 0, 4], 0.0001);
+    AssertEquals('token 5 low group', 1.0, V[1, 0, 1], 0.0001);
+    AssertEquals('token 5 high group', 1.0, V[1, 0, 5], 0.0001);
+    AssertEquals('token 8 low group', 1.0, V[2, 0, 0], 0.0001);
+    AssertEquals('token 8 high group', 1.0, V[2, 0, 6], 0.0001);
+    AssertEquals('two bits per position', 6.0, V.GetSum(), 0.0001);
+
+    // One token more than SizeX must be rejected instead of writing a depth row
+    // past the end of the volume.
+    TooManyTokens[0] := 1;
+    TooManyTokens[1] := 2;
+    TooManyTokens[2] := 3;
+    TooManyTokens[3] := 4;
+    V.GroupedOneHotEncoding(TooManyTokens, 2);
+    AssertEquals('oversized token list encodes nothing', 0.0, V.GetSum(), 0.0001);
   finally
     V.Free;
   end;
