@@ -87,6 +87,8 @@ type
     procedure TestTopPLargeVocabFlatDistributionRetries;
     procedure TestWeightedTopKLargeVocabNeverDrawsOutsideTopK;
     procedure TestMinPLargeVocabRespectsThreshold;
+    procedure TestMinPCompactionKeptSetMatchesReference;
+    procedure TestMinPAllNegativeScoresReturnsArgMax;
 
     // Adaptive typical-sampling path and the merged log pass.
     procedure TestTypicalArgMinMatchesTwoLogReference;
@@ -1615,6 +1617,88 @@ begin
       AssertTrue('Large-vocab min-p drew below the threshold: token ' +
         IntToStr(Token), V.Raw[Token] >= Threshold);
     end;
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestMinPCompactionKeptSetMatchesReference;
+const
+  V_SIZE = 64;
+var
+  Sampler: TNNetSamplerMinP;
+  V: TNNetVolume;
+  I, Token, Survivors: integer;
+  MaxP, Threshold: TNeuralFloat;
+  Expected, Seen: array[0..V_SIZE - 1] of boolean;
+begin
+  // The swap compaction must select EXACTLY the tokens passing
+  // p >= MinP * max(p), the same set the old quickselect produced. The
+  // survivors are scattered across the row (not a prefix), so a compaction
+  // that lost or reordered an entry would show up as a missing or an
+  // out-of-set draw.
+  RandSeed := 20260826;
+  Sampler := TNNetSamplerMinP.Create(0.25);
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  try
+    // Small background mass everywhere, with six scattered peaks.
+    for I := 0 to V_SIZE - 1 do V.Raw[I] := 0.001 + 0.0001 * I;
+    V.Raw[3]  := 0.40;
+    V.Raw[17] := 0.30;
+    V.Raw[18] := 0.11;  // just above 0.25 * 0.40 = 0.10
+    V.Raw[40] := 0.10;  // exactly at the cut - kept (>=)
+    V.Raw[41] := 0.09;  // just below the cut - rejected
+    V.Raw[63] := 0.20;
+
+    MaxP := V.Raw[0];
+    for I := 1 to V_SIZE - 1 do
+      if V.Raw[I] > MaxP then MaxP := V.Raw[I];
+    Threshold := 0.25 * MaxP;
+    Survivors := 0;
+    for I := 0 to V_SIZE - 1 do
+    begin
+      Expected[I] := V.Raw[I] >= Threshold;
+      Seen[I] := false;
+      if Expected[I] then Inc(Survivors);
+    end;
+    AssertEquals('reference survivor count', 5, Survivors);
+
+    for I := 1 to 2000 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('min-p drew a token outside the reference kept set: ' +
+        IntToStr(Token), Expected[Token]);
+      Seen[Token] := true;
+    end;
+    for I := 0 to V_SIZE - 1 do
+      if Expected[I] then
+        AssertTrue('kept token never drawn: ' + IntToStr(I), Seen[I]);
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestMinPAllNegativeScoresReturnsArgMax;
+const
+  V_SIZE = 32;
+var
+  Sampler: TNNetSamplerMinP;
+  V: TNNetVolume;
+  I: integer;
+begin
+  // With every score negative, MinP * max is ABOVE max, so no token clears the
+  // cut. The fallback must keep the argmax alone.
+  RandSeed := 20260826;
+  Sampler := TNNetSamplerMinP.Create(0.5);
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  try
+    for I := 0 to V_SIZE - 1 do V.Raw[I] := -10.0 - I;
+    V.Raw[21] := -1.0; // the argmax, still negative
+    for I := 1 to 50 do
+      AssertEquals('all-negative min-p must return the argmax',
+        21, Sampler.GetToken(V));
   finally
     V.Free;
     Sampler.Free;

@@ -1662,10 +1662,10 @@ type
     over Count boxes. Boxes are passed as four parallel flat arrays in corner
     (x1,y1,x2,y2) format; Scores[i] is box i's confidence; Classes[i] is its
     integer class id. The routine does NOT mutate any input array. It returns
-    the kept box indices, ORDERED by descending score (ties keep the original
-    relative order, because the internal sort is a stable selection sort over
-    the index permutation). A box j is suppressed by an earlier (higher-score)
-    kept box i ONLY when Classes[j] = Classes[i] AND IoU(i,j) > IoUThreshold
+    the kept box indices, ORDERED by descending score (equal scores end up in
+    an unspecified relative order - the internal index sort is a quicksort).
+    A box j is suppressed by an earlier (higher-score) kept box i ONLY when
+    Classes[j] = Classes[i] AND IoU(i,j) > IoUThreshold
     (strictly greater, matching the YOLO post-process). Pass a class array of
     all-equal ids for class-agnostic NMS. }
   function NeuralGreedyNMS(
@@ -4580,6 +4580,35 @@ begin
     Result := 0;
 end;
 
+// In-place quicksort of the index array Order so that Scores[Order[0..]] ends
+// up DESCENDING. Sorts the caller's existing buffers by reference and recurses
+// on the CPU stack only, so it adds no heap allocation (rule #17). Ties end up
+// in an unspecified relative order.
+procedure QuickSortOrderByScoreDesc(var Order: array of integer;
+  const Scores: array of TNeuralFloat; iLo, iHi: Integer);
+var
+  Lo, Hi, T: Integer;
+  Mid: TNeuralFloat;
+begin
+  Lo := iLo;
+  Hi := iHi;
+  Mid := Scores[Order[(Lo + Hi) shr 1]];
+  repeat
+    while Scores[Order[Lo]] > Mid do Inc(Lo);
+    while Scores[Order[Hi]] < Mid do Dec(Hi);
+    if Lo <= Hi then
+    begin
+      T := Order[Lo];
+      Order[Lo] := Order[Hi];
+      Order[Hi] := T;
+      Inc(Lo);
+      Dec(Hi);
+    end;
+  until Lo > Hi;
+  if Hi > iLo then QuickSortOrderByScoreDesc(Order, Scores, iLo, Hi);
+  if Lo < iHi then QuickSortOrderByScoreDesc(Order, Scores, Lo, iHi);
+end;
+
 function NeuralGreedyNMS(
   const BX1, BY1, BX2, BY2, Scores: array of TNeuralFloat;
   const Classes: array of integer; Count: integer;
@@ -4587,26 +4616,19 @@ function NeuralGreedyNMS(
 var
   Order: TNeuralIntegerArray;
   Keep: array of boolean;
-  i, jj, oi, oj, tmp, HiCand, KeptCnt: integer;
+  i, jj, oi, oj, HiCand, KeptCnt: integer;
   jjStart: integer;
   IoU: TNeuralFloat;
-  best: TNeuralFloat;
 begin
   SetLength(Result, 0);
   if Count <= 0 then Exit;
   HiCand := Count - 1;
-  // Index permutation sorted by descending score (stable selection sort over
-  // the indices - candidate counts in detection are small).
+  // Index permutation sorted by descending score. The greedy pass below needs
+  // the full order, so this is a sort rather than a partial selection - but
+  // O(N log N), since a dense detection head emits thousands of candidates.
   SetLength(Order, Count);
   for i := 0 to HiCand do Order[i] := i;
-  for i := 0 to HiCand do
-  begin
-    jjStart := i + 1;
-    best := Scores[Order[i]]; // #4: pivot keyed value, refreshed on swap
-    for jj := jjStart to HiCand do
-      if Scores[Order[jj]] > best then
-      begin tmp := Order[i]; Order[i] := Order[jj]; Order[jj] := tmp; best := Scores[Order[i]]; end;
-  end;
+  if HiCand > 0 then QuickSortOrderByScoreDesc(Order, Scores, 0, HiCand);
   // Greedy NMS over the sorted order: a later box is suppressed only by an
   // earlier (higher-score) kept box of the SAME class with IoU > threshold.
   SetLength(Keep, Count);
@@ -4718,10 +4740,10 @@ end;
 
 procedure MixVolumes(Output, A, B: TNNetVolume; Lambda: TNeuralFloat);
 begin
-  // Output := Lambda*A + (1-Lambda)*B, reusing AVX-backed volume ops.
+  // Output := Lambda*A + (1-Lambda)*B in two passes: Copy sizes Output and
+  // loads A, then MulMulAdd fuses the scale of A with the scaled add of B.
   Output.Copy(A);
-  Output.Mul(Lambda);
-  Output.MulAdd(1.0 - Lambda, B);
+  Output.MulMulAdd(Lambda, 1.0 - Lambda, B);
 end;
 
 function CreateMixedVolumePairList(Original: TNNetVolumePairList;
@@ -4804,8 +4826,8 @@ var
   Cnt, CntM1, I, J, Tmp, Partner: integer;
   Perm: array of integer;
   Lambda, LambdaAdj: TNeuralFloat;
-  X0, Y0, BoxW, BoxH, X, Y, D, W, H, DepthMax, XMax, YMax: integer;
-  PastePos: integer;
+  X0, Y0, BoxW, BoxH, Y, W, H, YMax: integer;
+  PastePos, RowBytes: integer;
   CutA, MixedB: TNNetVolume;
   SrcA, SrcB: TNNetVolume;
   PartnerPair: TNNetVolumePair;
@@ -4846,16 +4868,17 @@ begin
     // fall back to lambda=1 (no paste) so mismatched shapes are still safe.
     if (SrcB.SizeX = W) and (SrcB.SizeY = H) and (SrcB.Depth = SrcA.Depth) then
     begin
-      DepthMax := SrcA.Depth - 1;
-      XMax := X0 + BoxW - 1;
       YMax := Y0 + BoxH - 1;
-      for X := X0 to XMax do
+      // One box row is contiguous: GetRawPos(X,Y,0) = ((SizeX*Y)+X)*Depth, so
+      // X0..X0+BoxW-1 at a fixed Y spans BoxW*Depth consecutive floats. CutA (a
+      // copy of SrcA) and SrcB share XY/depth geometry here, so a single base
+      // indexes both FData arrays.
+      RowBytes := BoxW * SrcA.Depth * csNeuralFloatSize;
+      if RowBytes > 0 then
         for Y := Y0 to YMax do
         begin
-          // CutA (a copy of SrcA) and SrcB share XY/depth geometry here, so a
-          // single base indexes both FData arrays.
-          PastePos := CutA.GetRawPos(X, Y);
-          Move(SrcB.FData[PastePos], CutA.FData[PastePos], (DepthMax + 1) * csNeuralFloatSize);
+          PastePos := CutA.GetRawPos(X0, Y);
+          Move(SrcB.FData[PastePos], CutA.FData[PastePos], RowBytes);
         end;
       // True pasted-area fraction after clamping.
       LambdaAdj := 1.0 - (BoxW * BoxH) / (W * H);
@@ -5170,7 +5193,7 @@ var
   exp2x: TNeuralFloat;
 begin
   x := NeuronForceRange(x, 10);
-  exp2x := exp(-2 * x);
+  exp2x := NeuralExp(-2 * x);
   Result := (1 - exp2x) / (1 + exp2x);
 end;
 
@@ -5477,24 +5500,54 @@ end;
 
 procedure TNNetSamplerMinP.TruncateToMinP();
 var
-  I, Hi, KeepCount: integer;
+  I, MaxTokenPos, ArgMax, KeepCount: integer;
   MaxScore, Threshold: TNeuralFloat;
+  Swap: TNNetToken;
 begin
   if FCount = 0 then exit;
-  // The p >= MinP * max(p) cut does not need a sorted row to be COUNTED, so
-  // find the max and the survivor count in two linear passes and select
-  // exactly that many. Avoids sorting the whole vocabulary for a kept set
-  // that is normally a handful of tokens.
-  Hi := FCount - 1;
+  // The p >= MinP * max(p) cut is a threshold filter, not a rank query: every
+  // survivor is strictly above every reject, so gathering the survivors to the
+  // front IS the selection. Pass 1 finds the max (and its slot); pass 2 swaps
+  // each survivor into place. The swap compaction is a permutation of the row,
+  // exactly like the quickselect it replaces, so the discarded tail stays
+  // intact for RestoreFullWindowSorted. Only the small kept window is sorted.
+  MaxTokenPos := FCount - 1;
   MaxScore := FTokenArr[0].Score;
-  for I := 1 to Hi do
-    if FTokenArr[I].Score > MaxScore then MaxScore := FTokenArr[I].Score;
+  ArgMax := 0;
+  for I := 1 to MaxTokenPos do
+    if FTokenArr[I].Score > MaxScore then
+    begin
+      MaxScore := FTokenArr[I].Score;
+      ArgMax := I;
+    end;
   Threshold := FMinP * MaxScore;
   KeepCount := 0;
-  for I := 0 to Hi do
-    if FTokenArr[I].Score >= Threshold then Inc(KeepCount);
-  if KeepCount < 1 then KeepCount := 1;
-  SelectTopCandidates(KeepCount);
+  for I := 0 to MaxTokenPos do
+    if FTokenArr[I].Score >= Threshold then
+    begin
+      if I <> KeepCount then
+      begin
+        Swap := FTokenArr[KeepCount];
+        FTokenArr[KeepCount] := FTokenArr[I];
+        FTokenArr[I] := Swap;
+      end;
+      Inc(KeepCount);
+    end;
+  if KeepCount < 1 then
+  begin
+    // All scores negative: nothing clears MinP*max. Keep the argmax alone.
+    if ArgMax <> 0 then
+    begin
+      Swap := FTokenArr[0];
+      FTokenArr[0] := FTokenArr[ArgMax];
+      FTokenArr[ArgMax] := Swap;
+    end;
+    KeepCount := 1;
+  end;
+  FCount := KeepCount;
+  // A row that was already sorted keeps its order (survivors are its prefix,
+  // so every swap above was a self-swap), so leave FSorted alone.
+  SortTokenArray();
 end;
 
 function TNNetSamplerMinP.GetToken(Origin: TNNetVolume): integer;
