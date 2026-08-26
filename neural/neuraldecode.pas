@@ -8083,6 +8083,7 @@ function PromptLookupDraft(const Context: string;
 var
   CtxLen, P, FollowLen, PStart: integer;
   Suffix: string;
+  FirstChar: char;
 begin
   Result := '';
   CtxLen := Length(Context);
@@ -8093,10 +8094,13 @@ begin
   // recent earlier occurrence has the largest P with P+MatchLen-1 < CtxLen, i.e.
   // P <= CtxLen - MatchLen, EXCLUDING P = CtxLen - MatchLen + 1 (the suffix).
   PStart := CtxLen - MatchLen;
+  FirstChar := Suffix[1];
   for P := PStart downto 1 do
     // #23/App C: exact single-byte compare via CompareMem - no Copy
-    // heap-string allocation per probed start position.
-    if CompareMem(@Context[P], @Suffix[1], MatchLen) then
+    // heap-string allocation per probed start position, and the first-char
+    // test rejects nearly every start position before the call.
+    if (Context[P] = FirstChar) and
+       CompareMem(@Context[P], @Suffix[1], MatchLen) then
     begin
       FollowLen := CtxLen - (P + MatchLen) + 1; // chars available after match
       if FollowLen > NumDraft then FollowLen := NumDraft;
@@ -8240,7 +8244,7 @@ procedure SelectTopBeamCandidates(var Cand: TBeamCandidateArray;
   Count, KeepCount: integer);
 var
   I, J, MaxKeepIdx, MaxCandIdx: integer;
-  IncomingScore: TNeuralFloat;
+  IncomingScore, WeakestScore: TNeuralFloat;
   Tmp: TBeamCandidate;
 begin
   if KeepCount > Count then KeepCount := Count;
@@ -8263,10 +8267,13 @@ begin
   // One pass over the rest: a record enters the prefix only when it beats the
   // weakest kept score, and that weakest record is evicted into the slot the
   // incoming record just left (the tail order is unspecified either way).
+  // #5: the weakest kept score only changes when the prefix does, so hold it
+  // in a register instead of re-reading the record for every pool entry.
+  WeakestScore := Cand[MaxKeepIdx].Score;
   for I := KeepCount to MaxCandIdx do
   begin
     IncomingScore := Cand[I].Score;
-    if IncomingScore > Cand[MaxKeepIdx].Score then
+    if IncomingScore > WeakestScore then
     begin
       Tmp := Cand[I];
       Cand[I] := Cand[MaxKeepIdx];
@@ -8277,6 +8284,7 @@ begin
         Dec(J);
       end;
       Cand[J + 1] := Tmp;
+      WeakestScore := Cand[MaxKeepIdx].Score;
     end;
   end;
 end;
@@ -8487,7 +8495,7 @@ function DecodeBeamSearchCachedAll(Session: TNNetStreamingDecoder;
 var
   InV, Row: TNNetVolume;
   LogProbs: array of TNeuralFloat;
-  VocabSize, PromptLen, Step, I, T, B, Pos, LenB, CandCount: integer;
+  VocabSize, PromptLen, Step, I, J, T, B, Pos, LenB, CandCount: integer;
   VocabSizeM1, LiveHi, FinishedHi, FinSurvivorsHi, PromptLenM2: integer;
   KeepCount, MaxKeepIdx, ParentIdx: integer;
   Live: TCachedBeamArray;      // still-growing beams (each owns a Snap)
@@ -8671,9 +8679,21 @@ begin
         NewLive[I].LastToken := Cand[I].LastToken;
         // The child's input sits one position after its parent's last token.
         NewLive[I].LastPos := Live[ParentIdx].LastPos + 1;
-        Session.RestoreSnapshot(BaseAfter[ParentIdx]);
-        NewLive[I].Snap := Session.Snapshot();
+        NewLive[I].Snap := nil;
       end;
+      // #5: siblings share one base cache, so restore each DISTINCT parent once
+      // and take a fresh independent clone (Snapshot is a pure read of the
+      // restored state) for every survivor of it; slot order is untouched, so
+      // the beams are element-for-element what a per-survivor restore gave.
+      for I := 0 to MaxKeepIdx do
+        if NewLive[I].Snap = nil then
+        begin
+          ParentIdx := Cand[I].ParentIdx;
+          Session.RestoreSnapshot(BaseAfter[ParentIdx]);
+          for J := I to MaxKeepIdx do
+            if Cand[J].ParentIdx = ParentIdx then
+              NewLive[J].Snap := Session.Snapshot();
+        end;
       FreeLiveSnaps;   // release the parents' caches
       FreeBaseAfter;   // release the per-parent base caches
       Live := NewLive;
@@ -9041,15 +9061,18 @@ type
 // Phrase[1..p-1] is a suffix of ParentText - p = Length(Phrase) being the
 // "phrase completes on this char" case. That turns a per-candidate rescan of a
 // growing text into one per-parent table build plus a lookup per candidate.
+// AllPresent reports the same verdict as AllForcedPhrasesPresent(ParentText),
+// which this pass already decides per phrase.
 function BuildChildProgress(const ParentText: string;
   const ForceTokens: array of string;
-  out ChildProg: TByteProgressTable): integer;
+  out ChildProg: TByteProgressTable; out AllPresent: boolean): integer;
 var
   K, P, C, PhraseLen, ParentLen, ForceTokensHi: integer;
   Phrase: string;
   PhraseVal: TByteProgressTable;
 begin
   Result := 0;
+  AllPresent := True;
   FillChar(ChildProg[0], csByteAlphabetSize * csIntegerSize, 0);
   ParentLen := Length(ParentText);
   ForceTokensHi := High(ForceTokens);
@@ -9063,6 +9086,7 @@ begin
       Inc(Result, PhraseLen);
       Continue;
     end;
+    AllPresent := False;
     FillChar(PhraseVal[0], csByteAlphabetSize * csIntegerSize, 0);
     // Ascending p, so a longer admissible prefix overwrites a shorter one and
     // each byte ends up holding the maximum - the same value the downto scan
@@ -9099,6 +9123,7 @@ var
   ChildProg: TByteProgressTable;
   InvDenFin, InvDenExt, NewSumLP: TNeuralFloat;
   BSumLP: TNeuralFloat;
+  BeamAllPresent: boolean;
   BText: string;
 begin
   if BeamWidth < 1 then BeamWidth := 1;
@@ -9171,7 +9196,8 @@ begin
         // whole forced-phrase progress table is a per-beam invariant. Build it
         // once and read each candidate's progress out of it, instead of
         // rescanning each candidate's text at prune time.
-        BaseProg := BuildChildProgress(BText, ForceTokens, ChildProg);
+        BaseProg := BuildChildProgress(BText, ForceTokens, ChildProg,
+          BeamAllPresent);
         for I := 1 to NeededLen do
         begin
           T := Ord(Needed[I]);
@@ -9191,8 +9217,7 @@ begin
           begin
             // EOS only allowed once ALL phrases are present; otherwise the
             // hypothesis must keep generating to satisfy the constraint.
-            if not AllForcedPhrasesPresent(BText, ForceTokens) then
-              Continue;
+            if not BeamAllPresent then Continue;
             FinB.SumLogProb := NewSumLP;
             FinB.Text := BText;
             FinB.Finished := True;

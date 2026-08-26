@@ -138,6 +138,7 @@ type
     // KV-cache (cache-forking) beam search must be bit-identical to the
     // re-encoding DecodeBeamSearchAll, full ranked beam, best-first.
     procedure TestBeamSearchCachedMatchesReEncodeBigram;
+    procedure TestBeamSearchCachedSiblingsShareParentCache;
     procedure TestBeamSearchCachedMatchesReEncodeCausalReference;
     procedure TestBeamSearchCachedRejectsWideSession;
     // Diverse beam search (Hamming-diversity groups).
@@ -8551,6 +8552,46 @@ begin
         RefAll[I].Text, CacAll[I].Text);
       AssertEquals('alpha=0.7 score rank ' + IntToStr(I),
         RefAll[I].Score, CacAll[I].Score, 0.0);
+    end;
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestBeamSearchCachedSiblingsShareParentCache;
+const
+  Vocab = 8;
+  ContextLen = 16;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  RefAll, CacAll: TNNetDecodeResultArray;
+  Prompt: string;
+  I: integer;
+begin
+  // Survivors that share a parent restore that parent's base cache ONCE and
+  // clone it per child. A long run with a beam narrower than the vocabulary
+  // makes every step mix siblings with children of other parents, so the whole
+  // ranked pool must still match the re-encoding reference exactly.
+  Prompt := Chr(2) + Chr(4) + Chr(6);
+  BuildBigramBeamPair(Full, Twin, Vocab, ContextLen);
+  Session := nil;
+  try
+    Session := TNNetStreamingDecoder.Create(Twin, ContextLen);
+    RefAll := DecodeBeamSearchAll(Full, Prompt, 9, 3, 0.0);
+    CacAll := DecodeBeamSearchCachedAll(Session, Prompt, 9, 3, 0.0);
+    AssertEquals('same beam count', Length(RefAll), Length(CacAll));
+    for I := 0 to High(RefAll) do
+    begin
+      AssertEquals('text rank ' + IntToStr(I), RefAll[I].Text, CacAll[I].Text);
+      AssertEquals('sumlogprob rank ' + IntToStr(I),
+        RefAll[I].SumLogProb, CacAll[I].SumLogProb, 0.0);
+      AssertEquals('score rank ' + IntToStr(I),
+        RefAll[I].Score, CacAll[I].Score, 0.0);
+      AssertTrue('finished flag rank ' + IntToStr(I),
+        RefAll[I].Finished = CacAll[I].Finished);
     end;
   finally
     Session.Free;
