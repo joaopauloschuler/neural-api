@@ -6494,6 +6494,9 @@ type
     // 0..2*att_span-1, so Compute is a flat lookup.
     FC2P: array of integer;
     FP2C: array of integer;
+    // Q^c_i . K^r_pos for every K^r row, rebuilt once per query row: the (i,j)
+    // pair loop only ever sees 2*FAttSpan distinct rows.
+    FC2PDot: array of TNeuralFloat;
     FSeqLen: integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     {$IFDEF OpenCL}
@@ -6561,6 +6564,11 @@ type
     // per input width in SetPrevLayer: FPosIdx[i*SeqLen+j] =
     // clamp(j - i, -L, R) + L, already in [0, L+R].
     FPosIdx: array of integer;
+    // Q[i].P[pos] for every table row, rebuilt once per query row: the (i,j)
+    // pair loop only ever sees FNumPos distinct rows, so a wide band re-dots
+    // the same rows many times over.
+    FC2PDot: array of TNeuralFloat;
+    FNumPos: integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     {$IFDEF OpenCL}
     // CORRECT device offload: the content-to-content (Q.K^T) score matmul and
@@ -42755,16 +42763,26 @@ begin
         qnPtr := FQNorm.GetRawPtr(i, 0);   // i-only, hoisted (#11)
         gQnPtr := FgQn.GetRawPtr(i, 0);      // i-only, hoisted (#11)
         posN := 0;                             // j=0 offset (#12); FKNorm/gKn shape
+        // score[i,j] = scale * cos[i,j], cos[i,j] = qn[i].kn[j], so
+        // d(loss)/d(scale) += dScore[j] * cos[i,j] -- needed only when the
+        // scale is learnable, so the pair loop is unswitched on it (#20).
+        if LearnScale then
         for j := 0 to SeqLenM1 do
         begin
-          // score[i,j] = scale * cos[i,j], cos[i,j] = qn[i].kn[j].
-          // d(loss)/d(scale) += dScore[j] * cos[i,j] (accumulated over i,j).
-          // Only needed when the scale is learnable (see LearnScale above).
-          if LearnScale then
+          knPtr := FKNorm.GetRawPtr(posN);          // #4: shared by 3 uses
+          Cos := TNNetVolume.DotProduct(qnPtr, knPtr, FDk);
+          GradScale := GradScale + FdScoreBuf[j] * Cos;
+          dS := FdScoreBuf[j] * LiveScale;
+          if dS <> 0 then
           begin
-            Cos := TNNetVolume.DotProduct(qnPtr, FKNorm.GetRawPtr(posN), FDk);
-            GradScale := GradScale + FdScoreBuf[j] * Cos;
+            TNNetVolume.MulAdd(gQnPtr, knPtr, dS, FDk);
+            TNNetVolume.MulAdd(FgKn.GetRawPtr(posN), qnPtr, dS, FDk);
           end;
+          Inc(posN, NormStride);
+        end
+        else
+        for j := 0 to SeqLenM1 do
+        begin
           dS := FdScoreBuf[j] * LiveScale;
           if dS <> 0 then
           begin
@@ -43146,7 +43164,7 @@ var
   StartTime: double;
   SeqLen, i, j, n: integer;
   SeqLenM1, NumBucketsM1: integer;
-  RowStride, posV, posK, AttnRow: integer;
+  RowStride, posV, posK, AttnRow, BucketBase, bIdx: integer;
   dOutPtr, qPtr, dQPtr: pointer;
   Prev, PrevErr: TNNetVolume;
   SumDAttnAttn, A, dS: TNeuralFloat;
@@ -43199,12 +43217,13 @@ begin
     dQPtr := nil;
     if hasInputGrad then dQPtr := PrevErr.GetRawPtr(i, 0);
     posK := FDk;                                    // j=0 offset (#12)
+    BucketBase := SeqLenM1 - i;                     // #11: j-invariant
     for j := 0 to SeqLenM1 do
     begin
       // ---- Bias-table gradient: the bias enters the score additively, so
       // dL/db[bucket(j-i)] is the exact scatter-add of dScore[j]. ----
-      FgBiasBuf[FBucketOfs[j - i + SeqLen - 1]] :=
-        FgBiasBuf[FBucketOfs[j - i + SeqLen - 1]] + FdScoreBuf[j];
+      bIdx := FBucketOfs[BucketBase + j];
+      FgBiasBuf[bIdx] := FgBiasBuf[bIdx] + FdScoreBuf[j];
       // ---- Gradients w.r.t Q[i] and K[j] (identical to the parent) ----
       dS := FdScoreBuf[j] * FInvSqrtDk;
       if (dS <> 0) and hasInputGrad then
@@ -43322,6 +43341,7 @@ begin
   // variant can diverge them.
   SetLength(FC2P, FSeqLen * FSeqLen);
   SetLength(FP2C, FSeqLen * FSeqLen);
+  SetLength(FC2PDot, twoSpan);
   SeqLM1 := FSeqLen - 1;
   for i := 0 to SeqLM1 do
   begin
@@ -43363,12 +43383,13 @@ var
   pos, AttnRow, idxBase: integer;
   StartTime: double;
   SeqLen, i, j, d: integer;
-  SeqLenM1, DkM1: integer;
+  SeqLenM1, DkM1, TwoSpan, cp, ScoredKeys: integer;
   RowStride, TwoFDk, posKey, posV, RowBytes: integer;
   Score, MaxScore, SumExp, c2c, c2p, p2c, A: TNeuralFloat;
   Prev: TNNetVolume;
   OutPtr, Krow, Qrow, QueryPtr, kPtr, AttnRowPtr: TNeuralFloatArrPtr;
   PosK, PosQ: TNNetVolume;
+  UseC2PDot: boolean;
 begin
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   {$IFDEF OpenCL}
@@ -43389,6 +43410,7 @@ begin
   RowStride := Prev.GetRawPos(1, 0);
   PosK := FNeurons[0].FWeights; // K^r table, row a at GetRawPtr(a, 0)
   PosQ := FNeurons[1].FWeights; // Q^r table
+  TwoSpan := 2 * FAttSpan;
   for i := 0 to SeqLenM1 do
   begin
     AttnRow := FAttn.GetRawPos(0, i);
@@ -43397,6 +43419,14 @@ begin
     QueryPtr := Prev.GetRawPtr(i, 0);
     posKey := FDk;                        // j=0 K offset (#12)
     MaxScore := -1e30;
+    // More scored keys than table rows means the same Q^c_i . K^r row is
+    // re-dotted: build the whole c2p column once and gather it instead.
+    if FCausal then ScoredKeys := i + 1 else ScoredKeys := SeqLen;
+    UseC2PDot := TwoSpan < ScoredKeys;
+    if UseC2PDot then
+      for cp := 0 to TwoSpan - 1 do
+        FC2PDot[cp] := TNNetVolume.DotProduct(QueryPtr,
+          PosK.GetRawPtr(cp, 0), FDk);
     for j := 0 to SeqLenM1 do
     begin
       pos := AttnRow + j;
@@ -43409,8 +43439,12 @@ begin
         // Content-to-content: Q^c_i . K^c_j (depth contiguous AVX dot).
         c2c := TNNetVolume.DotProduct(QueryPtr, kPtr, FDk);
         // Content-to-position: Q^c_i . K^r_{c2p_pos(i,j)}.
-        Krow := PosK.GetRawPtr(FC2P[idxBase + j], 0);
-        c2p := TNNetVolume.DotProduct(QueryPtr, Krow, FDk);
+        if UseC2PDot then c2p := FC2PDot[FC2P[idxBase + j]]
+        else
+        begin
+          Krow := PosK.GetRawPtr(FC2P[idxBase + j], 0);
+          c2p := TNNetVolume.DotProduct(QueryPtr, Krow, FDk);
+        end;
         // Position-to-content: K^c_j . Q^r_{p2c_pos(i,j)}.
         Qrow := PosQ.GetRawPtr(FP2C[idxBase + j], 0);
         p2c := TNNetVolume.DotProduct(kPtr, Qrow, FDk);
@@ -43477,13 +43511,14 @@ var
   pos, AttnRow, idxBase: integer;
   StartTime: double;
   SeqLen, i, j, d: integer;
-  SeqLenM1, DkM1: integer;
+  SeqLenM1, DkM1, TwoSpan, cp, ScoredKeys: integer;
   RowStride, posKey: integer;
   Score, MaxScore, SumExp, c2p, p2c: TNeuralFloat;
   Prev: TNNetVolume;
   QBase, KBase, VBase, iDk, posPack: integer;
   Krow, Qrow, QueryPtr, AttnRowPtr: TNeuralFloatArrPtr;
   PosK, PosQ: TNNetVolume;
+  UseC2PDot: boolean;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   StartTime := Now();
@@ -43494,6 +43529,7 @@ begin
   RowStride := Prev.GetRawPos(1, 0);
   PosK := FNeurons[0].FWeights; // K^r table
   PosQ := FNeurons[1].FWeights; // Q^r table
+  TwoSpan := 2 * FAttSpan;
 
   // 1) Unpack depth-packed Q|K|V into the kernel operand layouts.
   FQRowBuf.ReSize(SeqLen * FDk, 1, 1);
@@ -43532,6 +43568,14 @@ begin
     QueryPtr := Prev.GetRawPtr(i, 0);
     posKey := FDk;                        // j=0 K offset (#12)
     MaxScore := -1e30;
+    // More scored keys than table rows means the same Q^c_i . K^r row is
+    // re-dotted: build the whole c2p column once and gather it instead.
+    if FCausal then ScoredKeys := i + 1 else ScoredKeys := SeqLen;
+    UseC2PDot := TwoSpan < ScoredKeys;
+    if UseC2PDot then
+      for cp := 0 to TwoSpan - 1 do
+        FC2PDot[cp] := TNNetVolume.DotProduct(QueryPtr,
+          PosK.GetRawPtr(cp, 0), FDk);
     for j := 0 to SeqLenM1 do
     begin
       pos := AttnRow + j;
@@ -43540,8 +43584,12 @@ begin
       else
       begin
         // c2p = Q^c_i . K^r_{c2p_pos(i,j)};  p2c = K^c_j . Q^r_{p2c_pos(i,j)}.
-        Krow := PosK.GetRawPtr(FC2P[idxBase + j], 0);
-        c2p := TNNetVolume.DotProduct(QueryPtr, Krow, FDk);
+        if UseC2PDot then c2p := FC2PDot[FC2P[idxBase + j]]
+        else
+        begin
+          Krow := PosK.GetRawPtr(FC2P[idxBase + j], 0);
+          c2p := TNNetVolume.DotProduct(QueryPtr, Krow, FDk);
+        end;
         Qrow := PosQ.GetRawPtr(FP2C[idxBase + j], 0);
         p2c := TNNetVolume.DotProduct(Prev.GetRawPtr(posKey), Qrow, FDk);
         Score := (FAttn.FData[pos] + c2p + p2c) * FInvSqrtScaled;
@@ -43707,6 +43755,8 @@ begin
   // round-trips it through the base per-neuron save/load and steps it with the
   // optimizer.
   NumPos := FLeftMax + FRightMax + 1;
+  FNumPos := NumPos;
+  SetLength(FC2PDot, NumPos);
   if FNeurons.Count < 1 then AddMissingNeurons(1 - FNeurons.Count);
   SetNumWeightsForAllNeurons(NumPos, 1, FDk);
   AfterWeightUpdate();
@@ -43784,6 +43834,25 @@ begin
     MaskBand(i, SeqLenM1, jLo, jHi);
     posK := FDk + jLo * RowStride;        // j=jLo K offset (#12)
     MaxScore := -1e30;
+    BandLen := jHi - jLo + 1;
+    // A band wider than the table re-dots the same rows: cache Q[i].P[pos]
+    // once per row and gather it (#20 unswitch on the cheaper variant).
+    if FNumPos < BandLen then
+    begin
+      for pos := 0 to FNumPos - 1 do
+        FC2PDot[pos] := TNNetVolume.DotProduct(QueryPtr,
+          PosT.GetRawPtr(pos, 0), FDk);
+      for j := jLo to jHi do
+      begin
+        c2c := TNNetVolume.DotProduct(
+          QueryPtr, Prev.GetRawPtr(posK), FDk);
+        Score := (c2c + FC2PDot[FPosIdx[idxBase + j]]) * FInvSqrtDk;
+        FAttn.FData[AttnRow + j] := Score;
+        if Score > MaxScore then MaxScore := Score;
+        Inc(posK, RowStride);
+      end;
+    end
+    else
     for j := jLo to jHi do
     begin
       // Content-to-content: Q[i].K[j] (depth-contiguous AVX dot).
@@ -43810,7 +43879,6 @@ begin
     begin
       // The band is contiguous, so the shift, the exp and the normalizer are
       // one fused vectorized pass (#19).
-      BandLen := jHi - jLo + 1;
       AttnRowPtr := FAttn.GetRawPtr(AttnRow + jLo);
       SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
         BandLen);
@@ -43845,8 +43913,8 @@ end;
 // in between, then the shared 1/sqrt(d_k) scale + mask + softmax. The position
 // term is a GATHERED dot product (the table row depends on (i,j)), so it cannot
 // fold into a single dense GEMM and stays on the CPU. The mask is the same
-// causal/sliding-window test as the CPU body (ScoreIsMasked with no segment
-// source). Coded by Claude (AI).
+// single attendable band as the CPU body (MaskBand: no segment source here).
+// Coded by Claude (AI).
 procedure TNNetConformerRelPosAttention.ComputeOpenCL();
 const
   cMaskFloor = -1e8;
@@ -43854,11 +43922,11 @@ var
   pos, AttnRow, idxBase: integer;
   StartTime: double;
   SeqLen, i, j, d: integer;
-  SeqLenM1, DkM1: integer;
+  SeqLenM1, DkM1, jLo, jHi, BandLen: integer;
   Score, MaxScore, SumExp, c2p: TNeuralFloat;
   Prev: TNNetVolume;
   QBase, KBase, VBase, iDk, posPack: integer;
-  Prow, AttnRowPtr: TNeuralFloatArrPtr;
+  Prow, AttnRowPtr, QueryPtr: TNeuralFloatArrPtr;
   PosT: TNNetVolume;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -43902,35 +43970,41 @@ begin
   begin
     AttnRow := FAttn.GetRawPos(0, i);
     idxBase := i * SeqLen;
+    // Query row pointer is fixed for this i - invariant across the key loop (#11).
+    QueryPtr := Prev.GetRawPtr(i, 0);
+    // Same single attendable band as the CPU forward: bias only the band and
+    // write the exact zeros the softmax produces outside it.
+    MaskBand(i, SeqLenM1, jLo, jHi);
     MaxScore := -1e30;
-    for j := 0 to SeqLenM1 do
+    for j := jLo to jHi do
     begin
       pos := AttnRow + j;
-      if ScoreIsMasked(i, j, false, nil, 0) then
-        Score := -1e9
-      else
-      begin
-        Prow := PosT.GetRawPtr(FPosIdx[idxBase + j], 0);
-        c2p := TNNetVolume.DotProduct(Prev.GetRawPtr(i, 0), Prow, FDk);
-        Score := (FAttn.FData[pos] + c2p) * FInvSqrtDk;
-      end;
+      Prow := PosT.GetRawPtr(FPosIdx[idxBase + j], 0);
+      c2p := TNNetVolume.DotProduct(QueryPtr, Prow, FDk);
+      Score := (FAttn.FData[pos] + c2p) * FInvSqrtDk;
       FAttn.FData[pos] := Score;
       if Score > MaxScore then MaxScore := Score;
     end;
+    if jLo > 0 then
+      FillChar(FAttn.FData[AttnRow], jLo * csNeuralFloatSize, 0);
+    if jHi < SeqLenM1 then
+      FillChar(FAttn.FData[AttnRow + jHi + 1],
+        (SeqLenM1 - jHi) * csNeuralFloatSize, 0);
     if MaxScore <= cMaskFloor then
     begin
       FillDWord(FAttn.FData[AttnRow], SeqLen, 0);       // #13: contiguous zero
     end
     else
     begin
-      // The score row is contiguous, so the shift, the exp and the normalizer
-      // are one fused vectorized pass (#19), and the scale is the same single
+      // The band is contiguous, so the shift, the exp and the normalizer are
+      // one fused vectorized pass (#19), and the scale is the same single
       // reciprocal-multiply the CPU forward of this layer already uses.
-      AttnRowPtr := FAttn.GetRawPtr(AttnRow);
+      BandLen := jHi - jLo + 1;
+      AttnRowPtr := FAttn.GetRawPtr(AttnRow + jLo);
       SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
-        SeqLen);
+        BandLen);
       if SumExp > 0 then
-        TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
+        TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, BandLen);
     end;
   end;
 
@@ -44820,7 +44894,7 @@ var
   FWindowSizeM1, FHeadsM1, nWyM1, nWxM1, gyM1, gxM1, winTokM1: integer;
   dBase, tokBase: integer;
   QkvW, QkvB, ProjW, ProjB, RelP: TNNetVolume;
-  Score, MaxScore, SumExp, acc, biasH, InvSumExp: TNeuralFloat;
+  Score, MaxScore, SumExp, acc, biasH: TNeuralFloat;
   QPtr, KPtr, OutP, ctxPtr: TNeuralFloatArrPtr;
   inRange: boolean;
 begin
@@ -44960,24 +45034,20 @@ begin
           Inc(posK, FChannels);
          end;
         end;
-        SumExp := 0;
-        for j := 0 to winTokM1 do
-        begin
-          Score := NeuralExp(FAttn.FData[j] - MaxScore);
-          FAttn.FData[j] := Score;
-          SumExp := SumExp + Score;
-        end;
+        // #18: one fused exp-shift-and-sum pass over the window scores.
+        SumExp := TNNetVolume.ExpShiftSum(@FAttn.FData[0], @FAttn.FData[0],
+          MaxScore, winTok);
         OutP := @FCtx.FData[qBase];
         FillDWord(OutP^, FHeadDim, 0);
         posV := hOfs;
-        InvSumExp := 1 / SumExp;                    // #5
         for j := 0 to winTokM1 do
         begin
-          Score := FAttn.FData[j] * InvSumExp;
           KPtr := @FV.FData[posV];
-          TNNetVolume.MulAdd(OutP, KPtr, Score, FHeadDim);
+          TNNetVolume.MulAdd(OutP, KPtr, FAttn.FData[j], FHeadDim);
           Inc(posV, FChannels);
         end;
+        // #5: scale the head vector once instead of every attention weight.
+        TNNetVolume.Mul(OutP, 1 / SumExp, FHeadDim);
        end;
     end;
     // Output projection per token, scatter back to grid (skip padded tokens).

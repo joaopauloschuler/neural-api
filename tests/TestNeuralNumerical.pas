@@ -1279,6 +1279,8 @@ type
     procedure TestConformerRelPosAttentionGradientCheck;
     procedure TestConformerRelPosAttentionSerializationRoundTrip;
     procedure TestConformerRelPosAttentionMaskBandEquivalence;
+    procedure TestConformerRelPosAttentionC2PCacheParity;
+    procedure TestDisentangledAttentionC2PCacheGradientCheck;
     procedure TestALiBiSlopeMatchesReference;
     procedure TestALiBiAttentionGradientCheck;
     procedure TestALiBiAttentionZeroSlopeMatchesSDPA;
@@ -24003,6 +24005,181 @@ begin
     NN.Free;
     if Assigned(NN2) then NN2.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestConformerRelPosAttentionC2PCacheParity;
+// A band wider than the distance table makes Compute cache Q[i].P[pos] per
+// query row and gather it. Check that cached forward against a direct
+// reference: NumPos = 3 (LMax = RMax = 1) with SeqLen = 8 takes the cached
+// branch, NumPos = 17 (LMax = RMax = 8) takes the direct one, and both must
+// match the same reference math.
+var
+  Dk, SeqLen: integer;
+  Ref: TNNetVolume;
+
+  // Reference: score(i,j) = (Q_i.K_j + Q_i.P[clamp(j-i,-L,R)+L]) / sqrt(Dk),
+  // softmax over the full row (bidirectional, no window), out_i = sum_j A_ij V_j.
+  procedure ComputeReference(Attn: TNNetConformerRelPosAttention;
+    Inp: TNNetVolume; LMax, RMax: integer);
+  var
+    i, j, d, dist: integer;
+    Score, MaxScore, SumExp: TNeuralFloat;
+    Row: array of TNeuralFloat;
+    PosT: TNNetVolume;
+  begin
+    PosT := Attn.Neurons[0].Weights;
+    SetLength(Row, SeqLen);
+    for i := 0 to SeqLen - 1 do
+    begin
+      MaxScore := -1e30;
+      for j := 0 to SeqLen - 1 do
+      begin
+        Score := 0;
+        for d := 0 to Dk - 1 do
+          Score := Score + Inp[i, 0, d] * Inp[j, 0, Dk + d];
+        dist := j - i;
+        if dist < -LMax then dist := -LMax;
+        if dist > RMax then dist := RMax;
+        for d := 0 to Dk - 1 do
+          Score := Score + Inp[i, 0, d] * PosT[dist + LMax, 0, d];
+        Score := Score / Sqrt(Dk);
+        Row[j] := Score;
+        if Score > MaxScore then MaxScore := Score;
+      end;
+      SumExp := 0;
+      for j := 0 to SeqLen - 1 do
+      begin
+        Row[j] := Exp(Row[j] - MaxScore);
+        SumExp := SumExp + Row[j];
+      end;
+      for d := 0 to Dk - 1 do
+      begin
+        Score := 0;
+        for j := 0 to SeqLen - 1 do
+          Score := Score + Row[j] * Inp[j, 0, 2 * Dk + d];
+        Ref[i, 0, d] := Score / SumExp;
+      end;
+    end;
+  end;
+
+  procedure CheckSpan(LMax, RMax: integer; const Tag: string);
+  var
+    NN: TNNet;
+    Attn: TNNetConformerRelPosAttention;
+    Inp: TNNetVolume;
+    Got: TNNetVolume;
+    i, d, w_: integer;
+  begin
+    NN := TNNet.Create();
+    Inp := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+    try
+      NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+      Attn := TNNetConformerRelPosAttention.Create(Dk, {Causal=}false,
+        LMax, RMax);
+      NN.AddLayer(Attn);
+      for w_ := 0 to Attn.Neurons[0].Weights.Size - 1 do
+        Attn.Neurons[0].Weights.Raw[w_] := Sin((w_ + 1) * 0.37) * 0.5;
+      Attn.FlushWeightCache;
+      for w_ := 0 to Inp.Size - 1 do
+        Inp.Raw[w_] := Sin(w_ * 0.41) * 0.8 - 0.2;
+      NN.Compute(Inp);
+      ComputeReference(Attn, Inp, LMax, RMax);
+      Got := NN.GetLastLayer().Output;
+      for i := 0 to SeqLen - 1 do
+        for d := 0 to Dk - 1 do
+          AssertEquals(Tag + ' out[' + IntToStr(i) + ',' + IntToStr(d) + ']',
+            Ref[i, 0, d], Got[i, 0, d], 1e-4);
+    finally
+      Inp.Free;
+      NN.Free;
+    end;
+  end;
+
+begin
+  Dk := 4;
+  SeqLen := 8;
+  Ref := TNNetVolume.Create(SeqLen, 1, Dk);
+  try
+    CheckSpan(1, 1, 'conformer c2p cached');
+    CheckSpan(8, 8, 'conformer c2p direct');
+  finally
+    Ref.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestDisentangledAttentionC2PCacheGradientCheck;
+// att_span 2 with SeqLen 8 scores more keys than the K^r table has rows, so
+// Compute caches Q^c_i.K^r per query row and gathers it. The backward pass
+// still re-dots K^r directly, so a central-difference input-gradient check on
+// this config is an oracle for the cached forward.
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  Attn: TNNetDisentangledAttention;
+  SeqLen, Dk, Span, i, w: integer;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+
+  function ComputeLoss: TNeuralFloat;
+  var idx: integer; diff: TNeuralFloat;
+  begin
+    NN.Compute(Input);
+    Result := 0;
+    for idx := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[idx] - Desired.Raw[idx];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  SeqLen := 8;
+  Dk := 4;
+  Span := 2;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 3 * Dk);
+  Desired := TNNetVolume.Create(SeqLen, 1, Dk);
+  epsilon := 0.001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, 3 * Dk, 1));
+    Attn := TNNetDisentangledAttention.Create(Dk, {causal=}false,
+      Span, {pos_buckets=}4, {max_rel=}6);
+    NN.AddLayer(Attn);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+    for w := 0 to Attn.Neurons[0].Weights.Size - 1 do
+    begin
+      Attn.Neurons[0].Weights.Raw[w] := Sin((w + 1) * 0.53) * 0.6;
+      Attn.Neurons[1].Weights.Raw[w] := Cos((w + 1) * 0.47) * 0.6;
+    end;
+    Attn.FlushWeightCache;
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.8 - 0.2;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.27) * 0.5;
+    for i := 0 to Input.Size - 1 do
+    begin
+      Input.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss;
+      Input.Raw[i] := Input.Raw[i] - 2 * epsilon;
+      lossMinus := ComputeLoss;
+      Input.Raw[i] := Input.Raw[i] + epsilon;
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('Disentangled cached-c2p input gradient at ' + IntToStr(i) +
+        ' num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad),
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    Desired.Free;
   end;
 end;
 
