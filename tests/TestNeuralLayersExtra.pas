@@ -132,6 +132,8 @@ type
     procedure TestFeatureSeparabilityReportSmoke;
     procedure TestNeuralCollapseReportSmoke;
     procedure TestRepresentationSimilarityReportSmoke;
+    procedure TestWeightHistogramReportNumbers;
+    procedure TestActivationReportsRepeatStable;
     procedure TestEnableInputGradient;
     procedure TestAdversarialRobustnessReportSmoke;
     procedure TestGradientConflictReportSmoke;
@@ -4877,6 +4879,124 @@ begin
     Probes.Free;
     NN.Free;
     NN2.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestWeightHistogramReportNumbers;
+var
+  NN: TNNet;
+  Report: string;
+begin
+  Report := TNNet.WeightHistogramReport(nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.InitWeights();
+    // Hand-set weights so every printed statistic has a closed form:
+    // min=-1, max=1, mean=0.0625, ||W||2=sqrt(2.375), 3 near-zero of 8.
+    NN.Layers[1].Neurons[0].Weights.Raw[0] := -1.0;
+    NN.Layers[1].Neurons[0].Weights.Raw[1] := 0.0;
+    NN.Layers[1].Neurons[0].Weights.Raw[2] := 0.5;
+    NN.Layers[1].Neurons[0].Weights.Raw[3] := 1.0;
+    NN.Layers[1].Neurons[1].Weights.Raw[0] := 0.25;
+    NN.Layers[1].Neurons[1].Weights.Raw[1] := -0.25;
+    NN.Layers[1].Neurons[1].Weights.Raw[2] := 0.0;
+    NN.Layers[1].Neurons[1].Weights.Raw[3] := 1e-7;
+
+    Report := TNNet.WeightHistogramReport(NN, 4);
+    AssertTrue('weight count reported', Pos('Weights=8', Report) > 0);
+    AssertTrue('stats line exact',
+      Pos(Format('  min=%.4f  max=%.4f  mean=%.4f  std=%.4f  ||W||2=%.4f  ' +
+        '||W||inf=%.4f', [-1.0, 1.0, 0.0625, 0.5413, 1.5411, 1.0]),
+        Report) > 0);
+    AssertTrue('near-zero count exact',
+      Pos(Format('  near-zero (|w|<%g): %d (%.2f%%)', [1e-6, 3, 37.5]),
+        Report) > 0);
+    // Bins over [-1, 1]: counts 1, 1, 4, 2; the tallest bin fills the bar.
+    AssertTrue('first bin bar exact',
+      Pos(Format('  [%8.3f, %8.3f) | %s',
+        [-1.0, -0.5, StringOfChar('#', 10)]), Report) > 0);
+    AssertTrue('modal bin bar exact',
+      Pos(Format('  [%8.3f, %8.3f) | %s',
+        [0.0, 0.5, StringOfChar('#', 40)]), Report) > 0);
+    AssertTrue('last bin closes the interval',
+      Pos(Format('  [%8.3f, %8.3f] | %s',
+        [0.5, 1.0, StringOfChar('#', 20)]), Report) > 0);
+    AssertTrue('total line exact',
+      Pos('Network total trainable weights: 8 across 1 layer(s).',
+        Report) > 0);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestActivationReportsRepeatStable;
+var
+  NN: TNNet;
+  Probes: TNNetVolumeList;
+  Samples: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  I, J, C: integer;
+  First, Second: string;
+begin
+  RandSeed := 20250826;
+  NN := TNNet.Create();
+  Probes := TNNetVolumeList.Create(True);
+  Samples := TNNetVolumePairList.Create(True);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(6));
+    NN.AddLayer(TNNetFullConnectReLU.Create(6));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.01, 0.9);
+    NN.InitWeights();
+    for I := 0 to 17 do
+    begin
+      C := I mod 3;
+      X := TNNetVolume.Create(4, 1, 1);
+      for J := 0 to 3 do X.Raw[J] := (Random - 0.5) * 2.0 + C;
+      Probes.Add(X);
+      X := TNNetVolume.Create(4, 1, 1);
+      for J := 0 to 3 do X.Raw[J] := (Random - 0.5) * 2.0 + C;
+      Y := TNNetVolume.Create(3, 1, 1);
+      Y.Fill(0); Y.Raw[C] := 1.0;
+      Samples.Add(TNNetVolumePair.Create(X, Y));
+    end;
+
+    // These four reports snapshot activations and (TunedLens) transiently
+    // overwrite the head input. Repeating a call must return the identical
+    // text: any leaked live-net state would show up as a different report.
+    First := TNNet.TunedLensReport(NN, Probes, -1, 60, 0.005);
+    Second := TNNet.TunedLensReport(NN, Probes, -1, 60, 0.005);
+    AssertEquals('TunedLensReport repeats identically', First, Second);
+
+    First := TNNet.FeatureSeparabilityReport(NN, Samples, 3);
+    Second := TNNet.FeatureSeparabilityReport(NN, Samples, 3);
+    AssertEquals('FeatureSeparabilityReport repeats identically',
+      First, Second);
+
+    First := TNNet.NeuralCollapseReport(NN, Samples, 3);
+    Second := TNNet.NeuralCollapseReport(NN, Samples, 3);
+    AssertEquals('NeuralCollapseReport repeats identically', First, Second);
+
+    First := TNNet.RepresentationSimilarityReport(NN, Probes);
+    Second := TNNet.RepresentationSimilarityReport(NN, Probes);
+    AssertEquals('RepresentationSimilarityReport repeats identically',
+      First, Second);
+
+    // A projected (capped MaxFeatDim) run must also be repeatable.
+    First := TNNet.FeatureSeparabilityReport(NN, Samples, 3, 1.0, 0.05, 3);
+    Second := TNNet.FeatureSeparabilityReport(NN, Samples, 3, 1.0, 0.05, 3);
+    AssertEquals('projected FeatureSeparabilityReport repeats identically',
+      First, Second);
+  finally
+    Samples.Free;
+    Probes.Free;
+    NN.Free;
   end;
 end;
 

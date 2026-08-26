@@ -112890,7 +112890,11 @@ var
   TunedKL, TunedEnt, TunedAgree: TFloatArray;
   TunedKLPre: TFloatArray;              // KL with the UNTRAINED (identity) translator
   MaxDp: TFloatArray;                   // max |p_tuned - p_logit| at the head input
-  CandSnap, TargetVol, LogitProb: TNNetVolume;
+  // Per sample: the current layer's activation and, at the head input, the raw
+  // logit-lens distribution; both reused by every pass over the probe batch.
+  ActCache: TNNetVolumeList;
+  RawLogitProb: array of TFloatArray;
+  TargetVol, LogitProb: TNNetVolume;
   Lens: TNNet;                          // private mini-net: Input->Translator->headClones
   Translator: TNNetLayer;
   StructStr, OneStruct: string;
@@ -112902,7 +112906,7 @@ var
 begin
   Result := '';
   Lines := TStringList.Create();
-  CandSnap := nil; TargetVol := nil; LogitProb := nil; Lens := nil;
+  ActCache := nil; TargetVol := nil; LogitProb := nil; Lens := nil;
   try
     if NN = nil then
     begin
@@ -112983,8 +112987,13 @@ begin
 
     SetLength(FinalProb, NumSamples);
     SetLength(FinalArgmax, NumSamples);
-    CandSnap := TNNetVolume.Create();
-    TargetVol := TNNetVolume.Create();
+    ActCache := TNNetVolumeList.Create(True);
+    for SampleIdx := 0 to NumSamplesM1 do
+      ActCache.Add(TNNetVolume.Create(HeadInSize, 1, 1));
+    SetLength(RawLogitProb, NumSamples);
+    for SampleIdx := 0 to NumSamplesM1 do
+      SetLength(RawLogitProb[SampleIdx], NumClasses);
+    TargetVol := TNNetVolume.Create(NumClasses, 1, 1);
     LogitProb := TNNetVolume.Create(NumClasses, 1, 1);
 
     // --- (1) final forward pass per sample: record p_final and argmax. ---
@@ -113050,14 +113059,45 @@ begin
       Lens.ClearInertia();
       Lens.ClearDeltas();
 
-      // --- pre-fit pass (identity translator): KL must tie the raw logit lens.
+      // --- raw logit-lens columns (the model's own head on the raw activation,
+      //     NO translator) - same idiom as LogitLensReport, for the side-by-side.
+      //     This is the ONLY pass that runs the net: it caches each sample's
+      //     activation (and, at the head input, its raw logit distribution) for
+      //     the pre-fit, fitting and post-fit passes below.
       for SampleIdx := 0 to NumSamplesM1 do
       begin
         InVol := pInput[SampleIdx];
         if InVol = nil then Continue;
         NN.Compute(InVol);
-        CandSnap.Copy(NN.Layers[L].Output);
-        Lens.Compute(CandSnap);
+        ActCache[SampleIdx].Copy(NN.Layers[L].Output);
+        NN.Layers[HeadInIdx].Output.CopyNoChecks(ActCache[SampleIdx]);
+        for C := HeadIdx to LastLayer do NN.Layers[C].Compute();
+        EntVal := 0; KLval := 0;
+        for C := 0 to NumClassesM1 do
+        begin
+          Pl := NN.GetLastLayer().Output.FData[C];
+          if Pl < 0 then Pl := 0;
+          LogitProb.FData[C] := Pl;
+          RawLogitProb[SampleIdx][C] := NN.GetLastLayer().Output.FData[C];
+          if Pl < cEps then Pl := cEps;
+          EntVal := EntVal - LogitProb.FData[C] * pcr_logf(Pl);
+          Pf := FinalProb[SampleIdx][C];
+          if Pf < cEps then Pf := cEps;
+          KLval := KLval + LogitProb.FData[C] * pcr_logf(Pl / Pf);
+        end;
+        if KLval < 0 then KLval := 0;
+        LogitEnt[L] := LogitEnt[L] + EntVal;
+        LogitKL[L] := LogitKL[L] + KLval;
+      end;
+      LogitEnt[L] := LogitEnt[L] / NumSamples;
+      LogitKL[L] := LogitKL[L] / NumSamples;
+
+      // --- pre-fit pass (identity translator): KL must tie the raw logit lens.
+      for SampleIdx := 0 to NumSamplesM1 do
+      begin
+        InVol := pInput[SampleIdx];
+        if InVol = nil then Continue;
+        Lens.Compute(ActCache[SampleIdx]);
         KLval := 0;
         for C := 0 to NumClassesM1 do
         begin
@@ -113073,35 +113113,6 @@ begin
       end;
       TunedKLPre[L] := TunedKLPre[L] / NumSamples;
 
-      // --- raw logit-lens columns (the model's own head on the raw activation,
-      //     NO translator) - same idiom as LogitLensReport, for the side-by-side.
-      for SampleIdx := 0 to NumSamplesM1 do
-      begin
-        InVol := pInput[SampleIdx];
-        if InVol = nil then Continue;
-        NN.Compute(InVol);
-        CandSnap.Copy(NN.Layers[L].Output);
-        NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
-        for C := HeadIdx to LastLayer do NN.Layers[C].Compute();
-        EntVal := 0; KLval := 0;
-        for C := 0 to NumClassesM1 do
-        begin
-          Pl := NN.GetLastLayer().Output.FData[C];
-          if Pl < 0 then Pl := 0;
-          LogitProb.FData[C] := Pl;
-          if Pl < cEps then Pl := cEps;
-          EntVal := EntVal - LogitProb.FData[C] * pcr_logf(Pl);
-          Pf := FinalProb[SampleIdx][C];
-          if Pf < cEps then Pf := cEps;
-          KLval := KLval + LogitProb.FData[C] * pcr_logf(Pl / Pf);
-        end;
-        if KLval < 0 then KLval := 0;
-        LogitEnt[L] := LogitEnt[L] + EntVal;
-        LogitKL[L] := LogitKL[L] + KLval;
-      end;
-      LogitEnt[L] := LogitEnt[L] / NumSamples;
-      LogitKL[L] := LogitKL[L] / NumSamples;
-
       // --- fit the translator: minimise KL(p_final || p_tuned). With a softmax
       //     head, backpropagating p_final as the soft target IS that gradient. A
       //     single online sweep per iteration over the probe batch. The head
@@ -113111,11 +113122,8 @@ begin
         SampleIdx := It mod NumSamples;
         InVol := pInput[SampleIdx];
         if InVol = nil then Continue;
-        NN.Compute(InVol);
-        CandSnap.Copy(NN.Layers[L].Output);
-        TargetVol.ReSize(NumClasses, 1, 1);
         for C := 0 to NumClassesM1 do TargetVol.FData[C] := FinalProb[SampleIdx][C];
-        Lens.Compute(CandSnap);
+        Lens.Compute(ActCache[SampleIdx]);
         // Online step: TNNetFullConnect.Backpropagate applies the weight update
         // inline (non-batch mode), exactly like the Fit/TrainOnce loop. The head
         // clones have LearningRate 0, so only the translator is stepped.
@@ -113128,9 +113136,7 @@ begin
       begin
         InVol := pInput[SampleIdx];
         if InVol = nil then Continue;
-        NN.Compute(InVol);
-        CandSnap.Copy(NN.Layers[L].Output);
-        Lens.Compute(CandSnap);
+        Lens.Compute(ActCache[SampleIdx]);
         EntVal := 0; KLval := 0;
         for C := 0 to NumClassesM1 do
         begin
@@ -113151,21 +113157,12 @@ begin
         // For the head-input layer (no real translation needed) track the max
         // |p_tuned - p_logit| to assert tuned == logit == final there.
         if L = HeadInIdx then
-        begin
-          // recompute raw logit (head on raw activation) for this sample
-          NN.Compute(InVol);
-          CandSnap.Copy(NN.Layers[L].Output);
-          NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
-          for C := HeadIdx to LastLayer do NN.Layers[C].Compute();
           for C := 0 to NumClassesM1 do
           begin
-            // Lens is a separate net; its Output persists through the NN
-            // recompute above, so this compares tuned vs raw-logit at the head.
             Pl := Abs(Lens.GetLastLayer().Output.FData[C] -
-                      NN.GetLastLayer().Output.FData[C]);
+                      RawLogitProb[SampleIdx][C]);
             if Pl > MaxDp[L] then MaxDp[L] := Pl;
           end;
-        end;
         Inc(TunedCnt);
       end;
       if TunedCnt = 0 then TunedCnt := 1;
@@ -113310,7 +113307,7 @@ begin
        (pInput[0] <> nil) and (NN.CountLayers() >= 2) then
       NN.Compute(pInput[0]);
     if Lens <> nil then Lens.Free;
-    if CandSnap <> nil then CandSnap.Free;
+    if ActCache <> nil then ActCache.Free;
     if TargetVol <> nil then TargetVol.Free;
     if LogitProb <> nil then LogitProb.Free;
     Lines.Free;
@@ -113352,12 +113349,12 @@ var
   Labels: array of integer;
   ClassCount: array of integer;
   UsedClasses: integer;
-  FeatRow: TDoubleArray;
   // per-probe layer scatter results
   TrSw, TrSb, TrTotal, FisherR, Silh, OffDiagCos, OffDiagTarget: array of TNeuralFloat;
   IdResidual: array of TNeuralFloat;
   // scratch for one layer
-  Feats: TDoubleMatrix;        // N x D activation rows
+  Feats: TDoubleMatrix;        // N x D activation rows for one probe
+  AllFeats: array of TDoubleMatrix;  // [probe][sample] activation rows
   ClassMean: TDoubleMatrix;    // NumClasses x D
   GlobalMean: TDoubleArray;    // D
   ClassMeanNorm: TDoubleArray; // NumClasses
@@ -113372,9 +113369,10 @@ var
   LogR, MinLogR, MaxLogR, SpanR: TNeuralFloat;
   NumClassesM1, NM1, LastLayerIdx, MaxFeatDimM1, NumProbedM1, DM1: integer;
 
-  // Fill FeatRow (length D) from a probed layer Output, applying the random
-  // projection when this layer was capped.
-  procedure ReadFeatures(const Pr: TLayerProbe; OutVol: TNNetVolume);
+  // Fill Dest (length Pr.FeatDim) from a probed layer Output, applying the
+  // random projection when this layer was capped.
+  procedure ReadFeatures(const Pr: TLayerProbe; OutVol: TNNetVolume;
+    var Dest: TDoubleArray);
   var
     K: integer;
     FeatDimMax: integer;
@@ -113383,12 +113381,12 @@ var
     if Pr.Projected then
     begin
       for K := 0 to FeatDimMax do
-        FeatRow[K] := Pr.ProjSign[K] * OutVol.FData[Pr.ProjSrc[K]];
+        Dest[K] := Pr.ProjSign[K] * OutVol.FData[Pr.ProjSrc[K]];
     end
     else
     begin
       for K := 0 to FeatDimMax do
-        FeatRow[K] := OutVol.FData[K];
+        Dest[K] := OutVol.FData[K];
     end;
   end;
 
@@ -113507,30 +113505,29 @@ begin
     SetLength(IdResidual, NumProbed);
     HaveCosMat := false;
 
-    // --- Per probed layer: one forward pass over the batch, scatter decomp. ---
+    // --- One forward per sample fills every probe's N x D snapshot. ---
+    SetLength(AllFeats, NumProbed);
+    for ProbeIdx := 0 to NumProbedM1 do SetLength(AllFeats[ProbeIdx], N);
+    for SampleIdx := 0 to NM1 do
+    begin
+      if Labels[SampleIdx] < 0 then Continue;
+      Pair := Samples[SampleIdx];
+      NN.Compute(Pair.I);
+      for ProbeIdx := 0 to NumProbedM1 do
+      begin
+        SetLength(AllFeats[ProbeIdx][SampleIdx], Probes[ProbeIdx].FeatDim);
+        ReadFeatures(Probes[ProbeIdx],
+          NN.Layers[Probes[ProbeIdx].LayerIdx].Output,
+          AllFeats[ProbeIdx][SampleIdx]);
+      end;
+    end;
+
+    // --- Per probed layer: scatter decomposition over the snapshot. ---
     for ProbeIdx := 0 to NumProbedM1 do
     begin
-      LayerIdx := Probes[ProbeIdx].LayerIdx;
-      Layer := NN.Layers[LayerIdx];
       D := Probes[ProbeIdx].FeatDim;
       DM1 := D - 1;
-      SetLength(FeatRow, D);
-
-      // snapshot the N x D activation matrix (one Compute per sample)
-      SetLength(Feats, N);
-      for SampleIdx := 0 to NM1 do
-      begin
-        if Labels[SampleIdx] < 0 then
-        begin
-          Feats[SampleIdx] := nil;
-          Continue;
-        end;
-        Pair := Samples[SampleIdx];
-        NN.Compute(Pair.I);
-        ReadFeatures(Probes[ProbeIdx], Layer.Output);
-        SetLength(Feats[SampleIdx], D);
-        for F := 0 to DM1 do Feats[SampleIdx][F] := FeatRow[F];
-      end;
+      Feats := AllFeats[ProbeIdx];
 
       // per-class mean + global mean
       SetLength(ClassMean, NumClasses);
@@ -113676,7 +113673,7 @@ begin
       for I := 0 to NumClassesM1 do
       begin
         if ClassCount[I] = 0 then Continue;
-        for J := 0 to NumClassesM1 do
+        for J := I to NumClassesM1 do
         begin
           if ClassCount[J] = 0 then Continue;
           if (ClassMeanNorm[I] > 1e-30) and (ClassMeanNorm[J] > 1e-30) then
@@ -113689,11 +113686,17 @@ begin
           else
             CosV := 0;
           CosMat[I][J] := CosV;
-          if I <> J then
-          begin
-            DotV := DotV + CosV;
-            Inc(OtherCls);
-          end;
+          CosMat[J][I] := CosV;
+        end;
+      end;
+      for I := 0 to NumClassesM1 do
+      begin
+        if ClassCount[I] = 0 then Continue;
+        for J := 0 to NumClassesM1 do
+        begin
+          if (ClassCount[J] = 0) or (I = J) then Continue;
+          DotV := DotV + CosMat[I][J];
+          Inc(OtherCls);
         end;
       end;
       if OtherCls > 0 then
@@ -114089,10 +114092,11 @@ begin
       for J := 0 to NumClassesM1 do CosMat[I][J] := 0;
     end;
     DotV := 0; OtherCls := 0; NC2DevMean := 0; NC2DevMax := 0;
+    // The cosine matrix is symmetric: compute the upper triangle and mirror it.
     for I := 0 to NumClassesM1 do
     begin
       if ClassCount[I] = 0 then Continue;
-      for J := 0 to NumClassesM1 do
+      for J := I to NumClassesM1 do
       begin
         if ClassCount[J] = 0 then Continue;
         if (CenNorm[I] > 1e-30) and (CenNorm[J] > 1e-30) then
@@ -114104,14 +114108,21 @@ begin
         else
           CosV := 0;
         CosMat[I][J] := CosV;
-        if I <> J then
-        begin
-          DotV := DotV + CosV;
-          AbsDev := Abs(CosV - ETFTarget);
-          NC2DevMean := NC2DevMean + AbsDev;
-          if AbsDev > NC2DevMax then NC2DevMax := AbsDev;
-          Inc(OtherCls);
-        end;
+        CosMat[J][I] := CosV;
+      end;
+    end;
+    for I := 0 to NumClassesM1 do
+    begin
+      if ClassCount[I] = 0 then Continue;
+      for J := 0 to NumClassesM1 do
+      begin
+        if (ClassCount[J] = 0) or (I = J) then Continue;
+        CosV := CosMat[I][J];
+        DotV := DotV + CosV;
+        AbsDev := Abs(CosV - ETFTarget);
+        NC2DevMean := NC2DevMean + AbsDev;
+        if AbsDev > NC2DevMax then NC2DevMax := AbsDev;
+        Inc(OtherCls);
       end;
     end;
     if OtherCls > 0 then
@@ -114262,27 +114273,28 @@ type
   end;
 var
   Lines: TStringList;
-  N, UsedSamples, I, J, A, B, L, GlyphIdx, BlockStart, NearDup: integer;
+  N, UsedSamples, I, J, A, L, GlyphIdx, BlockStart, NearDup: integer;
   CrossMode: boolean;
   GramsA, GramsB: array of TLayerGram;
   CountA, CountB: integer;
   CKA: TFloatMatrix;        // CountA x CountB
-  Dot, RowAcc, Adj, AdjMin, BestPair: TNeuralFloat;
+  Dot, Adj, AdjMin, BestPair: TNeuralFloat;
   AdjMinIdx, BestI, BestJ: integer;
   Line, Glyph: string;
   InBlock: boolean;
   NM1, CountAM1, CountAM2, CountBM1, IP1: integer;
 
   // Build the list of double-centered Gram matrices for one net over the
-  // probe batch (one Compute per probe per probeable layer). N is the probe
-  // count used. Returns the count of probeable layers catalogued.
+  // probe batch (one Compute per probe, feeding every probeable layer). N is
+  // the probe count used. Returns the count of probeable layers catalogued.
   function BuildGrams(ANet: TNNet; var Grams: array of TLayerGram): integer;
   var
-    LayerIdx, Si, Sj, Fi, Cnt: integer;
+    LayerIdx, Si, Sj, Fi, Cnt, GramIdx: integer;
     Layer: TNNetLayer;
     FlatSz: integer;
-    LastLayerIdxA, NM1, FlatSzM1: integer;
-    // per-layer activation snapshot: N rows x FeatDim cols
+    LastLayerIdxA, NM1, FlatSzM1, MaxGramPos: integer;
+    // per probeable layer, the N rows x FeatDim activation snapshot
+    ActsPerLayer: array of TFloatMatrix;
     Acts: TFloatMatrix;
     ColMean: array of TNeuralFloat;
     RowMean: array of TNeuralFloat;
@@ -114291,23 +114303,40 @@ var
     Cnt := 0;
     NM1 := N - 1;
     LastLayerIdxA := ANet.GetLastLayerIdx();
+    // --- catalogue the probeable layers (non-empty and within MaxFeatDim).
     for LayerIdx := 0 to LastLayerIdxA do
     begin
       Layer := ANet.Layers[LayerIdx];
       FlatSz := Layer.Output.Size;
       if FlatSz = 0 then Continue;
       if FlatSz > MaxFeatDim then Continue;
-      FlatSzM1 := FlatSz - 1;
+      Grams[Cnt].LayerIdx := LayerIdx;
+      Grams[Cnt].FeatDim := FlatSz;
+      Grams[Cnt].Name := Layer.ClassName;
+      Inc(Cnt);
+    end;
+    MaxGramPos := Cnt - 1;
 
-      // --- snapshot the N x FlatSz activation matrix (one forward per probe).
-      SetLength(Acts, N);
-      for Si := 0 to NM1 do
+    // --- snapshot every catalogued layer from ONE forward pass per probe.
+    SetLength(ActsPerLayer, Cnt);
+    for GramIdx := 0 to MaxGramPos do SetLength(ActsPerLayer[GramIdx], N);
+    for Si := 0 to NM1 do
+    begin
+      ANet.Compute(Probes[Si]);
+      for GramIdx := 0 to MaxGramPos do
       begin
-        ANet.Compute(Probes[Si]);
-        SetLength(Acts[Si], FlatSz);
-        for Fi := 0 to FlatSzM1 do
-          Acts[Si][Fi] := Layer.Output.Raw[Fi];
+        FlatSz := Grams[GramIdx].FeatDim;
+        SetLength(ActsPerLayer[GramIdx][Si], FlatSz);
+        Move(ANet.Layers[Grams[GramIdx].LayerIdx].Output.FData[0],
+          ActsPerLayer[GramIdx][Si][0], FlatSz * SizeOf(TNeuralFloat));
       end;
+    end;
+
+    for GramIdx := 0 to MaxGramPos do
+    begin
+      FlatSz := Grams[GramIdx].FeatDim;
+      FlatSzM1 := FlatSz - 1;
+      Acts := ActsPerLayer[GramIdx];
 
       // --- column-center the features (subtract per-feature mean across rows).
       SetLength(ColMean, FlatSz);
@@ -114323,18 +114352,14 @@ var
       // --- linear Gram K = X X^T (N x N). Column-centering X makes K already
       //     equal to the double-centered Gram, so CKA is feature-mean
       //     invariant and the self-CKA diagonal is exactly 1.0.
-      Grams[Cnt].LayerIdx := LayerIdx;
-      Grams[Cnt].FeatDim := FlatSz;
-      Grams[Cnt].Name := Layer.ClassName;
-      SetLength(Grams[Cnt].K, N);
-      for Si := 0 to NM1 do SetLength(Grams[Cnt].K[Si], N);
+      SetLength(Grams[GramIdx].K, N);
+      for Si := 0 to NM1 do SetLength(Grams[GramIdx].K[Si], N);
       for Si := 0 to NM1 do
         for Sj := Si to NM1 do
         begin
-          V := 0;
-          for Fi := 0 to FlatSzM1 do V := V + Acts[Si][Fi] * Acts[Sj][Fi];
-          Grams[Cnt].K[Si][Sj] := V;
-          Grams[Cnt].K[Sj][Si] := V;
+          V := TNNetVolume.DotProduct(@Acts[Si][0], @Acts[Sj][0], FlatSz);
+          Grams[GramIdx].K[Si][Sj] := V;
+          Grams[GramIdx].K[Sj][Si] := V;
         end;
 
       // --- numerically defensive double-center of the Gram itself (H K H);
@@ -114345,24 +114370,23 @@ var
       for Si := 0 to NM1 do
       begin
         RowMean[Si] := 0;
-        for Sj := 0 to NM1 do RowMean[Si] := RowMean[Si] + Grams[Cnt].K[Si][Sj];
+        for Sj := 0 to NM1 do
+          RowMean[Si] := RowMean[Si] + Grams[GramIdx].K[Si][Sj];
         GrandMean := GrandMean + RowMean[Si];
         RowMean[Si] := RowMean[Si] / N;
       end;
       GrandMean := GrandMean / (TNeuralFloat(N) * N);
       for Si := 0 to NM1 do
         for Sj := 0 to NM1 do
-          Grams[Cnt].K[Si][Sj] :=
-            Grams[Cnt].K[Si][Sj] - RowMean[Si] - RowMean[Sj] + GrandMean;
+          Grams[GramIdx].K[Si][Sj] :=
+            Grams[GramIdx].K[Si][Sj] - RowMean[Si] - RowMean[Sj] + GrandMean;
 
       // --- Frobenius norm of the centered Gram.
       Frob := 0;
       for Si := 0 to NM1 do
-        for Sj := 0 to NM1 do
-          Frob := Frob + Grams[Cnt].K[Si][Sj] * Grams[Cnt].K[Si][Sj];
-      Grams[Cnt].FrobNorm := Sqrt(Frob);
-
-      Inc(Cnt);
+        Frob := Frob + TNNetVolume.DotProduct(
+          @Grams[GramIdx].K[Si][0], @Grams[GramIdx].K[Si][0], N);
+      Grams[GramIdx].FrobNorm := Sqrt(Frob);
     end;
     Result := Cnt;
   end;
@@ -114427,12 +114451,8 @@ begin
         Dot := 0;
         // <K_i, K_j>_F = sum over all (a,b) of K_i[a][b] * K_j[a][b]
         for A := 0 to NM1 do
-        begin
-          RowAcc := 0;
-          for B := 0 to NM1 do
-            RowAcc := RowAcc + GramsA[I].K[A][B] * GramsB[J].K[A][B];
-          Dot := Dot + RowAcc;
-        end;
+          Dot := Dot + TNNetVolume.DotProduct(
+            @GramsA[I].K[A][0], @GramsB[J].K[A][0], N);
         if (GramsA[I].FrobNorm > 1e-20) and (GramsB[J].FrobNorm > 1e-20) then
           CKA[I][J] := Dot / (GramsA[I].FrobNorm * GramsB[J].FrobNorm)
         else
@@ -114654,7 +114674,7 @@ var
   W, AbsW, MinW, MaxW, MaxAbs, Sum, SumSq, Mean, Std, L2, Linf: TNeuralFloat;
   WCount, NearZero, TrainableLayers, TotalWeights, BarLen, MaxBin: integer;
   BinCounts: array of integer;
-  Span, BinLo, BinHi: TNeuralFloat;
+  Span, BinScale, BinWidth, BinLo, BinHi: TNeuralFloat;
   ShapeStr, Bar: string;
   LastLayerIdx, BinsM1: integer;
 begin
@@ -114698,19 +114718,17 @@ begin
       begin
         Neuron := Layer.Neurons[NeuronIdx];
         MaxStatsWeightPos := Neuron.Weights.Size - 1;
+        if MaxStatsWeightPos < 0 then Continue;
+        if WCount = 0 then
+        begin
+          MinW := Neuron.Weights.FData[0];
+          MaxW := MinW;
+        end;
         for K := 0 to MaxStatsWeightPos do
         begin
           W := Neuron.Weights.FData[K];
-          if WCount = 0 then
-          begin
-            MinW := W;
-            MaxW := W;
-          end
-          else
-          begin
-            if W < MinW then MinW := W;
-            if W > MaxW then MaxW := W;
-          end;
+          if W < MinW then MinW := W
+          else if W > MaxW then MaxW := W;
           Sum := Sum + W;
           SumSq := SumSq + W * W;
           AbsW := Abs(W);
@@ -114731,6 +114749,8 @@ begin
       MaxAbs := Linf;
       if MaxAbs <= 0 then MaxAbs := cZeroEps;
       Span := 2.0 * MaxAbs;
+      BinWidth := Span / Bins;
+      BinScale := Bins / Span;
 
       // Second pass: bin counts over [-MaxAbs, +MaxAbs].
       SetLength(BinCounts, Bins);
@@ -114743,7 +114763,7 @@ begin
         for K := 0 to MaxBinWeightPos do
         begin
           W := Neuron.Weights.FData[K];
-          BinIdx := Trunc(((W + MaxAbs) / Span) * Bins);
+          BinIdx := Trunc((W + MaxAbs) * BinScale);
           if BinIdx < 0 then BinIdx := 0;
           if BinIdx >= Bins then BinIdx := Bins - 1;
           Inc(BinCounts[BinIdx]);
@@ -114765,8 +114785,8 @@ begin
         [cZeroEps, NearZero, (NearZero / WCount) * 100.0]));
       for BinIdx := 0 to BinsM1 do
       begin
-        BinLo := -MaxAbs + BinIdx * (Span / Bins);
-        BinHi := -MaxAbs + (BinIdx + 1) * (Span / Bins);
+        BinLo := -MaxAbs + BinIdx * BinWidth;
+        BinHi := -MaxAbs + (BinIdx + 1) * BinWidth;
         if MaxBin > 0 then
           BarLen := Round((BinCounts[BinIdx] / MaxBin) * cMaxBarWidth)
         else
