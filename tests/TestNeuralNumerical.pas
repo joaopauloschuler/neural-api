@@ -50843,6 +50843,10 @@ begin
     Input.Raw[2] := -0.3;  // raw evidence class 2
 
     NN.Compute(Input);
+    // The loss the head reports must be the very function the gradient below is
+    // numerically checked against: a term missing from either side shows here.
+    AssertEquals('EvidentialClassification reported loss',
+      EdlLoss(Input), EC.EvidentialLoss(Yt), 1e-4);
     // Framework seeds FOutputError := output - target; the head recovers the
     // one-hot label from the alpha channels. Target = one-hot label.
     Target.Raw[0] := Yt[0]; Target.Raw[1] := Yt[1]; Target.Raw[2] := Yt[2];

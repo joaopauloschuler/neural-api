@@ -30165,7 +30165,7 @@ procedure TNNetArcFace.Backpropagate();
 var
   StartTime: double;
   Margin, Scale, CosM, SinM, InvXNorm: TNeuralFloat;
-  XNorm, WNorm, Dot, CosT, MaxLogit, SumExp, ProbY: TNeuralFloat;
+  XNorm, WNorm, Dot, CosT, MaxLogit, SumExp: TNeuralFloat;
   SinTheta, CosMargined, DMarginDCos, AK, GK, InvW: TNeuralFloat;
   c1, c2, c2Sum, d1, d2: TNeuralFloat;
   K, KM1, D, LabelIdx, ClassC, X, Y, MaxX, MaxY, Kk, baseOut0, baseErr0: integer;
@@ -30250,12 +30250,8 @@ begin
       SumExp := TNNetVolume.ExpShiftSum(Addr(FProbArrBuf[0]),
         Addr(FProbArrBuf[0]), MaxLogit, K);
       if SumExp < 1e-30 then SumExp := 1e-30;
-      ProbY := 0;
       for Kk := 0 to KM1 do
-      begin
         FProbArrBuf[Kk] := FProbArrBuf[Kk] / SumExp;
-        if Kk = ClassC then ProbY := FProbArrBuf[Kk];
-      end;
 
       // Accumulate feature gradient dL/dx and weight gradients.
       FillChar(FGradXBuf[0], D * csNeuralFloatSize, 0); // #13
@@ -31052,7 +31048,7 @@ function TNNetEvidentialClassification.EvidentialLoss(
   Y: integer = 0): TNeuralFloat;
 var
   Kc, KcM1, c: integer;
-  Al, Sstr, Pk, Yk, Lam, Err, Kl, AlTil, StilDe, SumAlTilM1: TNeuralFloat;
+  Al, Sstr, Pk, Yk, Lam, Err, Kl, AlTil, StilDe: TNeuralFloat;
 begin
   Kc := FStruct[0];
   KcM1 := Kc - 1;
@@ -31072,13 +31068,10 @@ begin
   end;
   // KL[ Dir(alphaTilde) || Dir(1) ], alphaTilde_k = y_k + (1-y_k)*alpha_k.
   StilDe := 0;
-  SumAlTilM1 := 0;
   for c := 0 to KcM1 do
   begin
     if c > High(yTarget) then Yk := 0 else Yk := yTarget[c];
-    AlTil := Yk + (1 - Yk) * FOutput[X, Y, c];
-    StilDe := StilDe + AlTil;
-    SumAlTilM1 := SumAlTilM1 + (AlTil - 1);
+    StilDe := StilDe + Yk + (1 - Yk) * FOutput[X, Y, c];
   end;
   Kl := LnGammaF(StilDe) - LnGammaF(Kc);
   for c := 0 to KcM1 do
