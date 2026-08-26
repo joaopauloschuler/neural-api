@@ -1125,6 +1125,7 @@ var
   StatePosition1, StatePosition2: integer;
   CurrentBaseValue: integer;
   MaxAct, MaxCur: integer;
+  OperandArrayLen: integer;
 begin
   // NextState is a var output read below (and returned as the result for test
   // opcodes); csNop, csDiv/csMod by zero and the invalid-opcode branch never
@@ -1146,12 +1147,26 @@ begin
   else
     StatePosition2 := Oper.Op2;
 
-  if (not (OpCode in ImediatSet) and ((StatePosition1 >= NumberOfActions) or
-    (StatePosition1 < 0))) or ((StatePosition2 >= NumberOfActions) or
-    (StatePosition2 < 0)) then
+  // Operand positions index Actions when RunOnAction is set and CurrentStates
+  // otherwise, so they must be bounded against the array they will be read
+  // from; the two arrays have independent lengths. Only binary opcodes read an
+  // operand: the operand-free ones (csNop, csTrue, csSet, csInc, csDec, csInj,
+  // csNot) work off Op1 as an immediate or off the base state, so their unused
+  // positions must not reject the operation. csEqual takes Op1 as an immediate
+  // and only reads operand 2.
+  if Oper.RunOnAction
+    then OperandArrayLen := NumberOfActions
+    else OperandArrayLen := NumberOfCurrentStates;
+
+  if OpCode in BinaryOperationSet then
   begin
-    OperateAndTestOperation := 0;
-    exit;
+    if (not (OpCode in ImediatSet) and ((StatePosition1 >= OperandArrayLen) or
+      (StatePosition1 < 0))) or ((StatePosition2 >= OperandArrayLen) or
+      (StatePosition2 < 0)) then
+    begin
+      OperateAndTestOperation := 0;
+      exit;
+    end;
   end;
 
   // Upper index bounds bound once (#4); reused by the EnsureRange clamps below.

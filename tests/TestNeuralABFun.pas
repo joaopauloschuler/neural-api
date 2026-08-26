@@ -40,6 +40,11 @@ type
     procedure TestDivModByZeroIsInert;
     // The bidimensional position of (X,Y) strides by the image width.
     procedure TestMake2DStridesByImageWidth;
+    // Operand positions are bounded against the array they are read from:
+    // Actions when RunOnAction is set, CurrentStates otherwise.
+    procedure TestOperandsBoundedByTheirOwnArray;
+    // The operand-free opcodes run even when there is no action at all.
+    procedure TestOperandFreeOpsWithoutActions;
   end;
 
 implementation
@@ -151,6 +156,94 @@ begin
     for X := 0 to Settings.ImageSizeX - 1 do
       AssertEquals('pixel '+IntToStr(X)+','+IntToStr(Y),
         Y * Settings.ImageSizeX + X, Engine.Make2D(X, Y));
+end;
+
+procedure TTestNeuralABFun.TestOperandsBoundedByTheirOwnArray;
+var
+  Engine: TRunOperation;
+  Actions, CurrentStates, NextStates: array of byte;
+  Oper: TOperation;
+  NextState: byte;
+  I: integer;
+begin
+  // Deliberately mismatched lengths: 4 actions against 16 current states.
+  SetLength(Actions, 4);
+  SetLength(CurrentStates, 16);
+  SetLength(NextStates, 16);
+  for I := 0 to 3 do Actions[I] := I + 1;
+  for I := 0 to 15 do
+  begin
+    CurrentStates[I] := I + 100;
+    NextStates[I] := 0;
+  end;
+  Engine.Load(csCreateOpDefault, Actions, CurrentStates, NextStates);
+
+  // RunOnAction is false, so the operands index CurrentStates: 10 and 12 are
+  // valid there even though both are past the end of the action array.
+  Oper := CreateOperation(csAdd, 10, 12, False, False, False);
+  NextState := 0;
+  Engine.OperateAndTestOperation(Oper, 0, NextState);
+  AssertEquals('state operands past the action count', (110 + 112) and 255,
+    NextState);
+
+  // The same positions read as actions are out of range and must be rejected.
+  Oper := CreateOperation(csAdd, 10, 12, False, False, True);
+  NextState := 0;
+  AssertEquals('action operands past the action count', 0,
+    Engine.OperateAndTestOperation(Oper, 0, NextState));
+  AssertEquals('rejected operation produces no state', 0, NextState);
+
+  // Actions[1] + Actions[2] = 2 + 3, to show the action path still works.
+  Oper := CreateOperation(csAdd, 1, 2, False, False, True);
+  NextState := 0;
+  Engine.OperateAndTestOperation(Oper, 0, NextState);
+  AssertEquals('action operands in range', 5, NextState);
+end;
+
+procedure TTestNeuralABFun.TestOperandFreeOpsWithoutActions;
+var
+  Engine: TRunOperation;
+  Actions, CurrentStates, NextStates: array of byte;
+  Oper: TOperation;
+  NextState: byte;
+  I: integer;
+begin
+  SetLength(Actions, 0);
+  SetLength(CurrentStates, 4);
+  SetLength(NextStates, 4);
+  for I := 0 to 3 do
+  begin
+    CurrentStates[I] := 10 * I;
+    NextStates[I] := 0;
+  end;
+  Engine.Load(csCreateOpDefault, Actions, CurrentStates, NextStates);
+
+  // None of these read an operand, so an empty action array cannot block them.
+  Oper := CreateOperation(csInc, 0, 0, False, False, False);
+  NextState := 0;
+  Engine.OperateAndTestOperation(Oper, 1, NextState);
+  AssertEquals('inc without actions', 11, NextState);
+
+  Oper := CreateOperation(csNot, 0, 0, False, False, False);
+  NextState := 0;
+  Engine.OperateAndTestOperation(Oper, 1, NextState);
+  AssertEquals('not without actions', 245, NextState);
+
+  Oper := CreateOperation(csInj, 0, 0, False, False, False);
+  NextState := 0;
+  Engine.OperateAndTestOperation(Oper, 2, NextState);
+  AssertEquals('inj without actions', 20, NextState);
+
+  Oper := CreateOperation(csSet, 42, 0, False, False, False);
+  NextState := 0;
+  Engine.OperateAndTestOperation(Oper, 0, NextState);
+  AssertEquals('set without actions', 42, NextState);
+
+  // csTrue is a test opcode, so it returns its own next state.
+  Oper := CreateOperation(csTrue, 0, 0, False, False, False);
+  NextState := 0;
+  AssertEquals('true without actions', 1,
+    Engine.OperateAndTestOperation(Oper, 0, NextState));
 end;
 
 initialization
