@@ -42375,22 +42375,27 @@ begin
       InRow := InSig[i];
       // Left reflect pad: mirror around index 0 WITHOUT repeating sample 0
       // (PyTorch 'reflect': padded[PadLeft-1-j] = x[1+j]).
-      for t := 0 to PadLeftM1 do
-      begin
-        RefIdx := PadLeft - t; // distance from the first real sample
-        if RefIdx >= InLen then RefIdx := InLen - 1;
-        PadRow[t] := InRow[RefIdx];
-      end;
-      // #13: the middle section is a contiguous copy of the whole channel row.
+      // A zero-length stage output has no sample to mirror, so it keeps the
+      // zeros SetLength wrote; without the guard both reflect indices would
+      // read before the start of the row.
       if InLen > 0 then
-        Move(InRow[0], PadRow[PadLeft], InLen * csNeuralFloatSize);
-      // Right reflect pad around the last index.
-      RightBase := PadLeft + InLen;               // #5: invariant across t
-      for t := 0 to PadRightM1 do
       begin
-        RefIdx := InLen - 2 - t;
-        if RefIdx < 0 then RefIdx := 0;
-        PadRow[RightBase + t] := InRow[RefIdx];
+        for t := 0 to PadLeftM1 do
+        begin
+          RefIdx := PadLeft - t; // distance from the first real sample
+          if RefIdx >= InLen then RefIdx := InLen - 1;
+          PadRow[t] := InRow[RefIdx];
+        end;
+        // #13: the middle section is a contiguous copy of the whole channel row.
+        Move(InRow[0], PadRow[PadLeft], InLen * csNeuralFloatSize);
+        // Right reflect pad around the last index.
+        RightBase := PadLeft + InLen;             // #5: invariant across t
+        for t := 0 to PadRightM1 do
+        begin
+          RefIdx := InLen - 2 - t;
+          if RefIdx < 0 then RefIdx := 0;
+          PadRow[RightBase + t] := InRow[RefIdx];
+        end;
       end;
     end;
     OutLen := (Length(Padded[0]) - EffK) div Stride + 1;

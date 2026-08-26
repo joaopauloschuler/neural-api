@@ -402,6 +402,9 @@ type
     // ships) instead of the new .parametrizations.weight.original0/1; pins the
     // importer's legacy-naming branch (same w = g*v/||v||, identical oracle).
     procedure TestEnCodecLegacyWeightNormParity;
+    // Degenerate input: an EMPTY waveform must encode to zero frames instead of
+    // reading past the start of the (empty) channel row while reflect-padding.
+    procedure TestEnCodecEmptyWaveform;
     // OpenCL parity: decodes the same EnCodec fixture with the channel-major
     // conv1d/ConvTranspose1d OpenCL offload ARMED, and asserts the waveform
     // matches the CPU (AVX/scalar DotProduct) decode within 1e-4. SKIPs cleanly
@@ -16326,6 +16329,34 @@ end;
 procedure TTestNeuralPretrained.TestEnCodecLegacyWeightNormParity;
 begin
   CheckEnCodecParity('tiny_encodec_legacynorm'); // legacy weight_g/weight_v
+end;
+
+procedure TTestNeuralPretrained.TestEnCodecEmptyWaveform;
+var
+  Model: TEnCodecModel;
+  Config: TEnCodecConfig;
+  Wave: TNeuralFloatDynArr;
+  Codes: array of TNeuralIntegerArray;
+  Frames, q: integer;
+begin
+  Model := nil;
+  try
+    Model := BuildEnCodecFromSafeTensors(
+      FixturePath('tiny_encodec.safetensors'), Config,
+      FixturePath('tiny_encodec_config.json'));
+    AssertTrue('codec built', Model <> nil);
+    SetLength(Wave, 0);
+    // The encoder stages reflect-pad every channel row; an empty row has no
+    // sample to mirror, so the stage must yield an empty row rather than read
+    // before its first element.
+    Model.EncodeAudioToCodes(Wave, Codes, Frames);
+    AssertEquals('empty waveform encodes to zero frames', 0, Frames);
+    AssertEquals('RVQ stages still reported', Model.NumCodebooks, Length(Codes));
+    for q := 0 to Length(Codes) - 1 do
+      AssertEquals('empty code row', 0, Length(Codes[q]));
+  finally
+    Model.Free;
+  end;
 end;
 
 procedure TTestNeuralPretrained.TestEnCodecOpenCLConvParity;
