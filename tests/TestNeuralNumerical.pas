@@ -1253,6 +1253,7 @@ type
     procedure TestForgetGateBiasReferenceCheck;
     procedure TestForgetGateBiasInputGradientCheck;
     procedure TestForgetGateBiasWeightGradientCheck;
+    procedure TestForgetGateBiasInputGradientUsesForwardWeights;
     procedure TestForgetGateBiasSerializationRoundTrip;
     procedure TestForgettingAttentionShape;
     procedure TestForgettingAttentionInputGradientCheck;
@@ -14136,6 +14137,61 @@ begin
     WriteLn('  ForgetGateBias weight gradient max-abs-error: ', maxErr:0:8);
   finally
     NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestForgetGateBiasInputGradientUsesForwardWeights;
+// dx_t = dlogit_t * w must be built from the weights the forward pass used.
+// Two nets with identical weights and a nonzero learning rate: one batches the
+// update (so no update happens during Backpropagate), one steps immediately.
+// The input gradient they hand to the previous layer must match.
+var
+  NNBatch, NNStep: TNNet;
+  Input, Desired: TNNetVolume;
+  SeqLen, Feat, i, ii, jj: integer;
+  maxDiff: TNeuralFloat;
+begin
+  RandSeed := 424242;
+  SeqLen := 4; Feat := 3;
+  NNBatch := TNNet.Create();
+  NNStep := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Feat);
+  Desired := TNNetVolume.Create(SeqLen, SeqLen, 1);
+  try
+    NNBatch.AddLayer(TNNetInput.Create(SeqLen, 1, Feat, 1));
+    NNBatch.AddLayer(TNNetForgetGateBias.Create());
+    NNStep.LoadFromString(NNBatch.SaveToString());
+    // A large learning rate makes a post-update weight read impossible to miss.
+    NNBatch.SetLearningRate(10.0, 0.0);
+    NNStep.SetLearningRate(10.0, 0.0);
+    NNBatch.SetBatchUpdate(true);
+    NNStep.SetBatchUpdate(false);
+
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.6) * 0.7 + 0.1;
+    NNBatch.Compute(Input);
+    for ii := 0 to SeqLen - 1 do
+    begin
+      for jj := 0 to ii do
+        Desired[jj, ii, 0] := 0.1 * Sin(ii * 0.5 - jj * 0.7);
+      for jj := ii + 1 to SeqLen - 1 do
+        Desired[jj, ii, 0] := NNBatch.GetLastLayer.Output[jj, ii, 0];
+    end;
+
+    NNBatch.Compute(Input);
+    NNBatch.Layers[0].OutputError.Fill(0);
+    NNBatch.Backpropagate(Desired);
+    NNStep.Compute(Input);
+    NNStep.Layers[0].OutputError.Fill(0);
+    NNStep.Backpropagate(Desired);
+
+    maxDiff := 0;
+    for i := 0 to Input.Size - 1 do
+      maxDiff := Max(maxDiff, Abs(NNBatch.Layers[0].OutputError.Raw[i] -
+        NNStep.Layers[0].OutputError.Raw[i]));
+    AssertTrue('ForgetGateBias input gradient is update-order independent ' +
+      '(maxDiff=' + FloatToStr(maxDiff) + ')', maxDiff < 1e-6);
+  finally
+    NNBatch.Free; NNStep.Free; Input.Free; Desired.Free;
   end;
 end;
 

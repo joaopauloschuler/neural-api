@@ -34897,13 +34897,9 @@ begin
       dLogitAcc := dLogitAcc + dLogit;
     end;
     Neuron0.FBiasDelta := Neuron0.FBiasDelta + NegLearningRate * dLogitAcc;
-    if (not FBatchUpdate) then
-    begin
-      Neuron0.UpdateWeights(FInertia);
-      AfterWeightUpdate();
-    end;
   end;
-  // ---- gradient w.r.t the input x_t: dx_t += dlogit * w. ----
+  // ---- gradient w.r.t the input x_t: dx_t += dlogit * w. Reads w, so it must
+  //      run on the FORWARD-PASS weights, before any non-batched update. ----
   if (FPrevLayer.Output.Size > 0) and
      (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) and
      (FNeurons.Count > 0) then
@@ -34918,6 +34914,11 @@ begin
         TNNetVolume.MulAdd(PrevErr.GetRawPtr(t, 0),
           WeightsPtr, dLogit, FFeatures);
     end;
+  end;
+  if (FNeurons.Count > 0) and (not FBatchUpdate) then
+  begin
+    FNeurons[0].UpdateWeights(FInertia);
+    AfterWeightUpdate();
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
