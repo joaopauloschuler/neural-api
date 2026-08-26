@@ -66,6 +66,7 @@ type
     procedure TestVolumeCopyResizingMatchesReference;
     procedure TestVolumeCopyCropping;
     procedure TestVolumeShift;
+    procedure TestVolumeSumToPos;
     procedure TestVolumeRawPosAndPtr;
     procedure TestVolumeDepthOperations;
     // AssertFinite tests
@@ -2314,6 +2315,39 @@ begin
   finally
     Original.Free;
     Cropped.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeSumToPos;
+var
+  Source, Prefix: TNNetVolume;
+begin
+  Source := TNNetVolume.Create(5, 1, 1);
+  Prefix := TNNetVolume.Create(1, 1, 1);
+  try
+    Source.Raw[0] := 1.0;
+    Source.Raw[1] := 2.0;
+    Source.Raw[2] := -3.0;
+    Source.Raw[3] := 4.0;
+    Source.Raw[4] := 0.5;
+
+    Prefix.SumToPos(Source);
+
+    AssertEquals('Prefix takes the source shape', Source.Size, Prefix.Size);
+    AssertEquals('Position 0 repeats the first element', 1.0, Prefix.Raw[0], 0.0001);
+    AssertEquals('Position 1', 3.0, Prefix.Raw[1], 0.0001);
+    AssertEquals('Position 2', 0.0, Prefix.Raw[2], 0.0001);
+    AssertEquals('Position 3', 4.0, Prefix.Raw[3], 0.0001);
+    AssertEquals('Last position sums everything', 4.5, Prefix.Raw[4], 0.0001);
+
+    // In place over itself must give the same prefix sums.
+    Source.SumToPos(Source);
+    AssertEquals('In place position 0', 1.0, Source.Raw[0], 0.0001);
+    AssertEquals('In place position 2', 0.0, Source.Raw[2], 0.0001);
+    AssertEquals('In place last position', 4.5, Source.Raw[4], 0.0001);
+  finally
+    Prefix.Free;
+    Source.Free;
   end;
 end;
 

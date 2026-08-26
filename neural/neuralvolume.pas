@@ -9832,6 +9832,8 @@ begin
   end;
 end;
 
+// Stores at each position the sum of all Original elements up to and
+// including that position (inclusive prefix sum). Self may be Original.
 procedure TVolume.SumToPos(Original: TVolume);
 var
   I: integer;
@@ -9842,11 +9844,8 @@ begin
   begin
     vHigh := High(Original.FData);
     FData[0] := Original.FData[0];
-    if vHigh > 0 then
-    begin
-      for I := 1 to vHigh do
-        FData[I] := Original.FData[I] + Original.FData[I-1];
-    end;
+    for I := 1 to vHigh do
+      FData[I] := FData[I-1] + Original.FData[I];
   end;
 end;
 
