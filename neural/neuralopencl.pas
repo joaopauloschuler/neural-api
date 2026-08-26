@@ -80,6 +80,9 @@ type
     FDevices: TDevices;
     FCurrentPlatform: cl_platform_id;
     FCurrentDevice: cl_device_id;
+    // Cached CL_DEVICE_MAX_COMPUTE_UNITS of FCurrentDevice, 0 while not
+    // yet queried. The int8 launch sizer asks for it per GEMM per token.
+    FMaxComputeUnits: integer;
     FOpenCLProgramSource: TStringList;
 
     FContext: cl_context;        // OpenCL compute context
@@ -143,7 +146,8 @@ type
 
     function CreateKernel(kernelname: string): cl_kernel;
     // CL_DEVICE_MAX_COMPUTE_UNITS of the current device, 1 when the query
-    // fails. Sizes launches that must fill the device to run at speed.
+    // fails. Cached after the first call. Sizes launches that must fill the
+    // device to run at speed.
     function DeviceMaxComputeUnits(): integer;
     function RunKernel(pkernel:cl_kernel; ThreadCount: integer): integer;
     function RunKernel2D(pkernel:cl_kernel; d1size, d2size: csize_t): integer; overload;
@@ -336,6 +340,16 @@ type
       FSplitKFP16Kernel: cl_kernel;
       FSplitKReduceFP16Kernel: cl_kernel;
       FCastFP16Kernel: cl_kernel;
+      /// Last (shape, buffer, kernel) tuple bound into the split-K entry points
+      /// by BindSplitKInvariantArgs. The split-K handles are per-instance, so
+      /// eleven of the sixteen arguments survive from launch to launch and are
+      /// re-set only when one of these changes. FSplitKArgsBound is cleared
+      /// whenever a buffer this tuple names is released. Coded by Claude (AI).
+      FSplitKArgsBound: boolean;
+      FBoundSplitKKernel, FBoundSplitKReduceKernel: cl_kernel;
+      FBoundSplits, FBoundNumAs, FBoundNumBs, FBoundSize: longint;
+      FBoundPartialBuffer, FBoundCodesBuffer: cl_mem;
+      FBoundResultBuffer, FBoundScalesBuffer: cl_mem;
 
       /// How many slabs to cut the reduction axis into for the current shape:
       /// 1 means the launch already fills the device, so ComputeInt8 keeps the
@@ -345,6 +359,11 @@ type
       /// pSplits. False when the device rejected either kernel, which sends
       /// ComputeInt8 back to the single-pass path. Coded by Claude (AI).
       function PrepareSplitK(pSplits: integer): boolean;
+      /// Sets the split-K arguments that do not change between launches of the
+      /// same shape, skipping the eleven clSetKernelArg calls when the cached
+      /// tuple still matches. Coded by Claude (AI).
+      function BindSplitKInvariantArgs(pKernel, pReduceKernel: cl_kernel;
+        pSplits: longint): integer;
       /// Narrows ElementCount floats of pSrcFP32 into FInputBufferBsFP16 with
       /// cai_f32_to_half, on the shared in-order queue. Coded by Claude (AI).
       function CastBOperandToFP16(pSrcFP32: cl_mem; ElementCount: longint): integer;
@@ -609,6 +628,7 @@ begin
   FCapCodes := 0;
   FCapScales := 0;
   FInt8Ready := false;
+  FSplitKArgsBound := false;
 end;
 
 // Grow-only buffer management for the per-forward attention/gram callers. Unlike
@@ -776,7 +796,9 @@ var
   UseBias: longint;
   NeededBias: csize_t;
   BufferBs: cl_mem;
+  K: cl_kernel;
 begin
+  K := Kernel();
   FActFun := pActFN;
   if pExternalVBs <> nil then BufferBs := pExternalVBs else BufferBs := FInputBufferBs;
 
@@ -784,28 +806,28 @@ begin
   begin
     if (VBs.Size = FSize * FNumBs) then
     begin
-      err := clSetKernelArg(Kernel, 0, csLongintSize, @FThreadCount);
+      err := clSetKernelArg(K, 0, csLongintSize, @FThreadCount);
       if (err <> CL_SUCCESS) then ErrorProc('0 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 1, csLongintSize, @FNumAs);
+      err := err or clSetKernelArg(K, 1, csLongintSize, @FNumAs);
       if (err <> CL_SUCCESS) then ErrorProc('1 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 2, csLongintSize, @FNumBs);
+      err := err or clSetKernelArg(K, 2, csLongintSize, @FNumBs);
       if (err <> CL_SUCCESS) then ErrorProc('2 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 3, csLongintSize, @FSize);
+      err := err or clSetKernelArg(K, 3, csLongintSize, @FSize);
       if (err <> CL_SUCCESS) then ErrorProc('3 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 4, csLongintSize, @FActFun);
+      err := err or clSetKernelArg(K, 4, csLongintSize, @FActFun);
       if (err <> CL_SUCCESS) then ErrorProc('4 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 5, csCLMemSize,  @FInputBufferAs);
+      err := err or clSetKernelArg(K, 5, csCLMemSize,  @FInputBufferAs);
       if (err <> CL_SUCCESS) then ErrorProc('5 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 6, csCLMemSize,  @BufferBs);
+      err := err or clSetKernelArg(K, 6, csCLMemSize,  @BufferBs);
       if (err <> CL_SUCCESS) then ErrorProc('6 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 7, csCLMemSize,  @FResultBuffer);
+      err := err or clSetKernelArg(K, 7, csCLMemSize,  @FResultBuffer);
       if (err <> CL_SUCCESS) then ErrorProc('7 Error: Failed to set kernel arguments:' + IntToStr(err));
 
       // Fused bias (arg 8 UseBias, arg 9 FBiasBuffer). Both args MUST be set every
@@ -830,10 +852,10 @@ begin
       else
         UseBias := 0;
 
-      err := err or clSetKernelArg(Kernel, 8, csLongintSize, @UseBias);
+      err := err or clSetKernelArg(K, 8, csLongintSize, @UseBias);
       if (err <> CL_SUCCESS) then ErrorProc('8 Error: Failed to set kernel arguments:' + IntToStr(err));
 
-      err := err or clSetKernelArg(Kernel, 9, csCLMemSize, @FBiasBuffer);
+      err := err or clSetKernelArg(K, 9, csCLMemSize, @FBiasBuffer);
       if (err <> CL_SUCCESS) then ErrorProc('9 Error: Failed to set kernel arguments:' + IntToStr(err));
 
       if (FHostInput) then
@@ -1100,6 +1122,46 @@ begin
   err := err or CastBOperandToFP16(FInputBufferBs, VBs.Size);
 end;
 
+function TDotProductSharedKernel.BindSplitKInvariantArgs(pKernel,
+  pReduceKernel: cl_kernel; pSplits: longint): integer;
+begin
+  Result := CL_SUCCESS;
+  if FSplitKArgsBound and (pKernel = FBoundSplitKKernel) and
+    (pReduceKernel = FBoundSplitKReduceKernel) and (pSplits = FBoundSplits) and
+    (FNumAs = FBoundNumAs) and (FNumBs = FBoundNumBs) and (FSize = FBoundSize) and
+    (FPartialBuffer = FBoundPartialBuffer) and (FCodesBuffer = FBoundCodesBuffer) and
+    (FResultBuffer = FBoundResultBuffer) and (FScalesBuffer = FBoundScalesBuffer)
+  then exit;
+
+  FSplitKArgsBound := false;
+  Result := clSetKernelArg(pKernel, 0, csLongintSize, @FNumAs);
+  Result := Result or clSetKernelArg(pKernel, 1, csLongintSize, @FNumBs);
+  Result := Result or clSetKernelArg(pKernel, 2, csLongintSize, @FSize);
+  Result := Result or clSetKernelArg(pKernel, 3, csLongintSize, @pSplits);
+  Result := Result or clSetKernelArg(pKernel, 4, csCLMemSize, @FCodesBuffer);
+  Result := Result or clSetKernelArg(pKernel, 6, csCLMemSize, @FPartialBuffer);
+
+  Result := Result or clSetKernelArg(pReduceKernel, 0, csLongintSize, @FNumAs);
+  Result := Result or clSetKernelArg(pReduceKernel, 1, csLongintSize, @FNumBs);
+  Result := Result or clSetKernelArg(pReduceKernel, 2, csLongintSize, @pSplits);
+  Result := Result or clSetKernelArg(pReduceKernel, 4, csCLMemSize, @FPartialBuffer);
+  Result := Result or clSetKernelArg(pReduceKernel, 5, csCLMemSize, @FResultBuffer);
+  Result := Result or clSetKernelArg(pReduceKernel, 8, csCLMemSize, @FScalesBuffer);
+  if Result <> CL_SUCCESS then exit;
+
+  FBoundSplitKKernel := pKernel;
+  FBoundSplitKReduceKernel := pReduceKernel;
+  FBoundSplits := pSplits;
+  FBoundNumAs := FNumAs;
+  FBoundNumBs := FNumBs;
+  FBoundSize := FSize;
+  FBoundPartialBuffer := FPartialBuffer;
+  FBoundCodesBuffer := FCodesBuffer;
+  FBoundResultBuffer := FResultBuffer;
+  FBoundScalesBuffer := FScalesBuffer;
+  FSplitKArgsBound := true;
+end;
+
 procedure TDotProductSharedKernel.ComputeInt8(VBs: TNNetVolume;
   pActFN: longint; NewVBs: boolean = true; VBias: TNNetVolume = nil;
   NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
@@ -1155,26 +1217,16 @@ begin
     // Pass 1: raw slab sums. Pass 2: reduce, scale, bias, activation. Both on
     // the same in-order queue, so pass 2 is ordered after pass 1 with no wait.
     if FFP16Activations then K := FSplitKFP16Kernel else K := FSplitKKernel;
-    err := err or clSetKernelArg(K, 0, csLongintSize, @FNumAs);
-    err := err or clSetKernelArg(K, 1, csLongintSize, @FNumBs);
-    err := err or clSetKernelArg(K, 2, csLongintSize, @FSize);
-    err := err or clSetKernelArg(K, 3, csLongintSize, @Splits);
-    err := err or clSetKernelArg(K, 4, csCLMemSize, @FCodesBuffer);
-    err := err or clSetKernelArg(K, 5, csCLMemSize, @BufferBs);
-    err := err or clSetKernelArg(K, 6, csCLMemSize, @FPartialBuffer);
-
     if FFP16Activations
       then KReduce := FSplitKReduceFP16Kernel
       else KReduce := FSplitKReduceKernel;
-    err := err or clSetKernelArg(KReduce, 0, csLongintSize, @FNumAs);
-    err := err or clSetKernelArg(KReduce, 1, csLongintSize, @FNumBs);
-    err := err or clSetKernelArg(KReduce, 2, csLongintSize, @Splits);
+    // Shape, codes, scales, partial and result stay bound across launches of
+    // the same shape; only the four arguments below change per call.
+    err := err or BindSplitKInvariantArgs(K, KReduce, Splits);
+    err := err or clSetKernelArg(K, 5, csCLMemSize, @BufferBs);
     err := err or clSetKernelArg(KReduce, 3, csLongintSize, @FActFun);
-    err := err or clSetKernelArg(KReduce, 4, csCLMemSize, @FPartialBuffer);
-    err := err or clSetKernelArg(KReduce, 5, csCLMemSize, @FResultBuffer);
     err := err or clSetKernelArg(KReduce, 6, csLongintSize, @UseBias);
     err := err or clSetKernelArg(KReduce, 7, csCLMemSize, @FBiasBuffer);
-    err := err or clSetKernelArg(KReduce, 8, csCLMemSize, @FScalesBuffer);
 
     if err = CL_SUCCESS then
     begin
@@ -1955,6 +2007,7 @@ end;
 procedure TEasyOpenCL.SetCurrentDevice(pDeviceId: cl_device_id);
 begin
   FCurrentDevice := pDeviceId;
+  FMaxComputeUnits := 0;
 end;
 
 procedure TEasyOpenCL.CompileProgramFromFile(filename: string);
@@ -2155,6 +2208,8 @@ var
   Units: cl_uint;
   BytesWritten: csize_t;
 begin
+  Result := FMaxComputeUnits;
+  if Result > 0 then exit;
   Result := 1;
   if FCurrentDevice = nil then exit;
   Units := 0;
@@ -2163,6 +2218,7 @@ begin
   begin
     if Units > 0 then Result := Units;
   end;
+  FMaxComputeUnits := Result;
 end;
 
 function TEasyOpenCL.RunKernel(pkernel: cl_kernel; ThreadCount: integer): integer;
