@@ -11120,7 +11120,7 @@ type
     FEncoder: TNNet;        // image -> (LatentGrid,LatentGrid,VqEmbedDim) latent
     FDecoder: TNNet;        // (LatentGrid,LatentGrid,VqEmbedDim) latent -> RGB
     FCodebook: TNNetVolume; // [NumVqEmbeddings][VqEmbedDim] (row-major in Depth)
-    FCodebookNormSqr: TNeuralFloatDynArr; // #14: per-entry ||e||^2, built once
+    FCodebookNormSqr: TNeuralFloatDynArr; // #14: per-entry 0.5||e||^2, built once
     FConfig: TVqModelConfig;
   public
     constructor Create(AEncoder, ADecoder: TNNet; ACodebook: TNNetVolume;
@@ -14782,13 +14782,19 @@ end;
 // streaming and direct-to-int8 paths below intact. The last dimension must
 // still equal InDim, which rejects a TRANSPOSED slab ([E, InDim, OutRows],
 // the Llama-4 layout) whose destination neurons are columns, not rows.
+// pDeferFlush skips the trailing FlushWeightCache, whose concat/interleave
+// rebuild copies the WHOLE layer's weights. When several calls fill disjoint
+// neuron ranges of the SAME layer (the fused gate_up halves, the Qwen3.5
+// per-head q_proj slices), only the last one has to rebuild the cache: the
+// caller passes true on the earlier calls and flushes the layer once after
+// the group.
 procedure LoadLlamaLinearWeights(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName: string; InDim, OutDim: integer;
   NeuronBase: integer = 0; ExpectedNeurons: integer = -1;
   RotaryHeadDim: integer = 0; const BiasName: string = '';
   Scale: TNeuralFloat = 1.0; RotaryDims: integer = 0;
   SrcRowBase: integer = 0; SrcRows: integer = 0;
-  pFlatSlabRows: boolean = false);
+  pFlatSlabRows: boolean = false; pDeferFlush: boolean = false);
 var
   W, B, WV: TNNetVolume;
   j, TargetIdx, HalfDim, SrcRow, Base, Row: integer;
@@ -15000,7 +15006,7 @@ begin
     B.Free;
     W.Free;
   end;
-  Layer.FlushWeightCache();
+  if not pDeferFlush then Layer.FlushWeightCache();
 end;
 
 // Loads a bias-free nn.Linear [OutDim, InDim] matrix straight onto a pointwise
@@ -17035,7 +17041,8 @@ begin
                 {NeuronBase=}d * HeadDim, {ExpectedNeurons=}2 * QWidth,
                 {RotaryHeadDim=}RotaryHeadDimArg, {BiasName=}'',
                 {Scale=}QProjScale, {RotaryDims=}RotaryDims,
-                {SrcRowBase=}d * 2 * HeadDim, {SrcRows=}2 * QWidth);
+                {SrcRowBase=}d * 2 * HeadDim, {SrcRows=}2 * QWidth,
+                {pFlatSlabRows=}false, {pDeferFlush=}true);
               LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
                 TensorNameStr, Config.HiddenSize, HeadDim,
                 {NeuronBase=}QWidth + d * HeadDim,
@@ -17043,8 +17050,12 @@ begin
                 {RotaryHeadDim=}0, {BiasName=}'', {Scale=}1.0,
                 {RotaryDims=}0,
                 {SrcRowBase=}d * 2 * HeadDim + HeadDim,
-                {SrcRows=}2 * QWidth);
+                {SrcRows=}2 * QWidth,
+                {pFlatSlabRows=}false, {pDeferFlush=}true);
             end;
+            // Every head slice deferred its cache rebuild: one rebuild here
+            // instead of 2*NumHeads full-layer concat/interleave passes.
+            Blocks[BlockCnt].QProj.FlushWeightCache();
             MarkConsumed(TensorNameStr);
           end
           else
@@ -17415,7 +17426,7 @@ begin
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp, FusedName,
             Config.HiddenSize, i,
             0, 2 * i, 0, '', 1.0, 0,
-            i, 2 * i);
+            i, 2 * i, {pFlatSlabRows=}false, {pDeferFlush=}true);
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp, FusedName,
             Config.HiddenSize, i,
             i, 2 * i,
@@ -17427,7 +17438,8 @@ begin
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
             TensorNameStr + 'up_proj.weight',
             Config.HiddenSize, i,
-            0, 2 * i);
+            0, 2 * i, 0, '', 1.0, 0, 0, 0,
+            {pFlatSlabRows=}false, {pDeferFlush=}true);
           MarkConsumed(TensorNameStr + 'up_proj.weight');
           LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].GateUp,
             TensorNameStr + 'gate_proj.weight',
@@ -23024,11 +23036,12 @@ var
   SliceChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
   HeadDim, QWidth, KVWidth, i, j, d: integer;
-  BlockMax, KVHeadMax, HeadMax, HeadDimM1, VocabM1, HiddenM1: integer;
+  BlockMax, KVHeadMax, HeadMax, HeadDimM1, VocabM1: integer;
   LayerIsLocal: boolean;
   LayerWindow: integer;
   Tmp, WVTied: TNNetVolume;
-  TiedBase: integer;
+  TiedBase, HiddenBytes: integer;
+  NeuronTied: TNNetNeuron;
   BlockPrefix, AttnPrefix, LMHeadName, TensorNameStr: string;
   Consumed: TStringList;
 
@@ -23248,19 +23261,30 @@ begin
         begin
           EnsureWritableImportWeights(LMHead);
           VocabM1 := Config.VocabSize - 1;
-          HiddenM1 := Config.HiddenSize - 1;
+          HiddenBytes := Config.HiddenSize * csNeuralFloatSize;
           TiedBase := 0;
-          for j := 0 to VocabM1 do
-          begin
-            WVTied := LMHead.FArrNeurons[j].Weights;
-            Move(Tmp.FData[TiedBase], WVTied.FData[0],
-              Config.HiddenSize * csNeuralFloatSize);
-            if Config.LogitScale <> 1.0 then
+          // #20: the scale fold is invariant over the vocab, so the test is
+          // unswitched into two branch-free row loops.
+          if Config.LogitScale <> 1.0 then
+            for j := 0 to VocabM1 do
+            begin
+              NeuronTied := LMHead.FArrNeurons[j];
+              WVTied := NeuronTied.Weights;
+              Move(Tmp.FData[TiedBase], WVTied.FData[0], HiddenBytes);
               TNNetVolume.Mul(WVTied.GetRawPtr(0), Config.LogitScale,
                 Config.HiddenSize);
-            LMHead.FArrNeurons[j].BiasWeight := 0;
-            Inc(TiedBase, Config.HiddenSize);
-          end;
+              NeuronTied.BiasWeight := 0;
+              Inc(TiedBase, Config.HiddenSize);
+            end
+          else
+            for j := 0 to VocabM1 do
+            begin
+              NeuronTied := LMHead.FArrNeurons[j];
+              Move(Tmp.FData[TiedBase], NeuronTied.Weights.FData[0],
+                HiddenBytes);
+              NeuronTied.BiasWeight := 0;
+              Inc(TiedBase, Config.HiddenSize);
+            end;
           LMHead.FlushWeightCache();
           if Reader.HasTensor(LMHeadName) then MarkConsumed(LMHeadName);
         end
@@ -23505,8 +23529,9 @@ procedure LoadPhiPartialRotaryLinearWeights(Reader: TNNetSafeTensorsReader;
   Hidden, HeadDim, RotaryDims: integer);
 var
   W, B, WV: TNNetVolume;
-  r, HeadIdx, RowInHead, RotHalf, TargetRow, TargetIdx, srcBase: integer;
-  HiddenM1: integer;
+  r, HeadBase, RowInHead, RotHalf, TargetRow, TargetIdx, srcBase: integer;
+  HiddenM1, RowBytes: integer;
+  Neuron: TNNetNeuron;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -23534,11 +23559,14 @@ begin
     Reader.LoadTensorFlat(WName, W);
     Reader.LoadTensorFlat(BName, B);
     HiddenM1 := Hidden - 1;
+    RowBytes := Hidden * csNeuralFloatSize;
     srcBase := 0;
+    // The head index and the row within the head advance by 1 with r, so both
+    // are carried instead of re-derived with a div and a mod per row (#6).
+    HeadBase := 0;      // HeadIdx * HeadDim
+    RowInHead := 0;
     for r := 0 to HiddenM1 do
     begin
-      HeadIdx := r div HeadDim;
-      RowInHead := r mod HeadDim;
       // rotate_half -> interleaved permutation, RESTRICTED to the first
       // RotaryDims rows of the head (the partial-rotary slice).
       TargetRow := RowInHead;
@@ -23549,16 +23577,22 @@ begin
         else
           TargetRow := 2 * (RowInHead - RotHalf) + 1;
       end;
-      TargetIdx := HeadIdx * HeadDim + TargetRow;
-      if Layer.FArrNeurons[TargetIdx].Weights.Size <> Hidden then
+      TargetIdx := HeadBase + TargetRow;
+      Neuron := Layer.FArrNeurons[TargetIdx];
+      WV := Neuron.Weights;
+      if WV.Size <> Hidden then
         ImportError('Phi import: internal error - neuron ' +
           IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
-          IntToStr(Layer.FArrNeurons[TargetIdx].Weights.Size) +
-          ' weights, expected ' + IntToStr(Hidden) + '.');
-      WV := Layer.FArrNeurons[TargetIdx].Weights;
-      Move(W.FData[srcBase], WV.FData[0], Hidden * csNeuralFloatSize);
-      Layer.FArrNeurons[TargetIdx].BiasWeight := B.FData[r];
+          IntToStr(WV.Size) + ' weights, expected ' + IntToStr(Hidden) + '.');
+      Move(W.FData[srcBase], WV.FData[0], RowBytes);
+      Neuron.BiasWeight := B.FData[r];
       Inc(srcBase, Hidden);
+      Inc(RowInHead);
+      if RowInHead = HeadDim then
+      begin
+        RowInHead := 0;
+        Inc(HeadBase, HeadDim);
+      end;
     end;
   finally
     B.Free;
@@ -38387,8 +38421,9 @@ var
   CrossLeaves: array of TNNetCrossAttention;
   LeafCnt, LayerCnt, HeadCnt, EncFrames, AvgN: integer;
   i, h, GlobalIdx, LayersMax, HeadsHi, TextLenM1: integer;
-  rBase, lBase: integer;
+  rBase, lBase, RowBytes: integer;
   Leaf: TNNetCrossAttention;
+  RowPtr: TNeuralFloatArrPtr;
   RowMax, SumExp: TNeuralFloat;
   FiltRow, FiltSrc, FiltWin: array of TNeuralFloat;
 begin
@@ -38460,13 +38495,14 @@ begin
     SetLength(FiltRow, EncFrames);
     SetLength(FiltSrc, EncFrames);
     SetLength(FiltWin, EncFrames);
+    RowBytes := EncFrames * csNeuralFloatSize;
     rBase := 0;   // #12: carry the row base (step EncFrames, Depth=1)
     for i := 0 to TextLenM1 do
     begin
-      Move(Result.FData[rBase], FiltSrc[0], EncFrames * csNeuralFloatSize);
+      Move(Result.FData[rBase], FiltSrc[0], RowBytes);
       WhisperMedianFilterRow(FiltRow, FiltSrc, FiltWin, EncFrames,
         MedianKernel);
-      Move(FiltRow[0], Result.FData[rBase], EncFrames * csNeuralFloatSize);
+      Move(FiltRow[0], Result.FData[rBase], RowBytes);
       Inc(rBase, EncFrames);
     end;
   end;
@@ -38478,11 +38514,11 @@ begin
   begin
     // #18/#19: the row is EncFrames contiguous floats (Depth=1), so the max, the
     // exp and the accumulate are all vectorized passes.
-    RowMax := TNNetVolume.MaxValue(Result.GetRawPtr(rBase), EncFrames);
-    SumExp := TNNetVolume.ExpShiftSum(Result.GetRawPtr(rBase),
-      Result.GetRawPtr(rBase), RowMax, EncFrames);
+    RowPtr := Result.GetRawPtr(rBase);
+    RowMax := TNNetVolume.MaxValue(RowPtr, EncFrames);
+    SumExp := TNNetVolume.ExpShiftSum(RowPtr, RowPtr, RowMax, EncFrames);
     if SumExp > 0 then
-      TNNetVolume.Mul(Result.GetRawPtr(rBase), 1.0 / SumExp, EncFrames);
+      TNNetVolume.Mul(RowPtr, 1.0 / SumExp, EncFrames);
     Inc(rBase, EncFrames);
   end;
 end;
@@ -38578,7 +38614,7 @@ var
   Score: TNNetVolume;
   PathTok, PathFrame: array of integer;
   PathLen, NText, t, k, WordCnt: integer;
-  ScoreXMax, NTextM1, PathLenM1, dstBase, srcBase: integer;
+  NTextM1, PathLenM1: integer;
   TokStartFrame, TokEndFrame: array of integer;
   TokAttnSum: array of TNeuralFloat;  // path-attention sum per token
   TokAttnCnt: array of integer;       // path steps per token
@@ -38622,15 +38658,11 @@ begin
     // Slice out the text-token rows into a compact (NText x EncFrames) map.
     if TextStart > 0 then
     begin
-      // Re-pack rows [TextStart..] to the top.
-      ScoreXMax := Score.SizeX - 1;
-      for t := 0 to NTextM1 do
-      begin
-        dstBase := Score.GetRawPos(0, t);
-        srcBase := Score.GetRawPos(0, t + TextStart);
-        Move(Score.FData[srcBase], Score.FData[dstBase],
-          (ScoreXMax + 1) * csNeuralFloatSize);
-      end;
+      // Re-pack rows [TextStart..] to the top. Depth=1, so the NText source
+      // rows are one contiguous run and land on one contiguous destination
+      // run: a single Move (memmove semantics cover the forward overlap).
+      Move(Score.FData[Score.GetRawPos(0, TextStart)], Score.FData[0],
+        NText * Score.SizeX * csNeuralFloatSize);
     end;
     // DTW on just the text rows.
     SetLength(PathTok, NText + Score.SizeX);
@@ -38989,9 +39021,10 @@ procedure LoadWav2Vec2PosConv(Reader: TNNetSafeTensorsReader;
   HiddenSize, Groups, Kernel: integer; Consumed: TStringList);
 var
   G, V, B, WV: TNNetVolume;
-  InPerGroup, o, ic, kk, oc, SrcIdx, SrcBase, DstBase, TapRowsM1: integer;
-  InPerGroupM1, KernelM1, HiddenSizeM1: integer;
-  Norm, Acc, GTap: TNeuralFloat;
+  InPerGroup, o, ic, kk, SrcIdx, SrcBase, DstBase, TapElemsM1: integer;
+  InPerGroupM1, KernelM1, HiddenSizeM1, InGroupKernel: integer;
+  Norm, GTap: TNeuralFloat;
+  Neuron: TNNetNeuron;
   TapScale: array of TNeuralFloat;
 begin
   InPerGroup := HiddenSize div Groups;
@@ -39035,27 +39068,34 @@ begin
     // Only the Kernel norms are materialized; g[k]*v/norm is then applied
     // straight into the neurons, so no [Out, In/groups, Kernel] effective
     // weight buffer is built and re-gathered at the same indices.
+    // The squares accumulate in ONE contiguous sweep of v into a Kernel-sized
+    // accumulator (TapScale doubles as it) rather than Kernel strided passes
+    // over the whole tensor - each tap still sums its own elements in the same
+    // increasing order, so the norms are unchanged.
     SetLength(TapScale, Kernel);
-    TapRowsM1 := HiddenSize * InPerGroup - 1;
+    for kk := 0 to KernelM1 do TapScale[kk] := 0;
+    TapElemsM1 := HiddenSize * InPerGroup * Kernel - 1;
+    kk := 0;
+    for SrcIdx := 0 to TapElemsM1 do
+    begin
+      TapScale[kk] := TapScale[kk] + Sqr(V.FData[SrcIdx]);
+      Inc(kk);
+      if kk = Kernel then kk := 0;
+    end;
     for kk := 0 to KernelM1 do
     begin
-      Acc := 0;
-      SrcIdx := kk;
-      for oc := 0 to TapRowsM1 do
-      begin
-        Acc := Acc + Sqr(V.FData[SrcIdx]);
-        Inc(SrcIdx, Kernel);
-      end;
-      Norm := Sqrt(Acc);
+      Norm := Sqrt(TapScale[kk]);
       if Norm = 0 then Norm := 1;
       // #21: fold g[k]/norm[k] into one per-tap scale so the neuron loop
       // multiplies instead of dividing by a value invariant over (o, ic).
       TapScale[kk] := G.FData[kk] / Norm;
     end;
+    InGroupKernel := InPerGroup * Kernel;
+    SrcBase := 0;
     for o := 0 to HiddenSizeM1 do
     begin
-      WV := Layer.FArrNeurons[o].Weights;
-      SrcBase := o * InPerGroup * Kernel;
+      Neuron := Layer.FArrNeurons[o];
+      WV := Neuron.Weights;
       DstBase := 0;
       for kk := 0 to KernelM1 do
       begin
@@ -39068,7 +39108,8 @@ begin
         end;
         Inc(DstBase, InPerGroup);
       end;
-      Layer.FArrNeurons[o].BiasWeight := B.FData[o];
+      Neuron.BiasWeight := B.FData[o];
+      Inc(SrcBase, InGroupKernel);
     end;
   finally
     B.Free; V.Free; G.Free;
@@ -60470,8 +60511,7 @@ procedure RunMaskRCNN(NN: TNNet; const Config: TMaskRCNNConfig;
   const LevelFeats: array of TNNetVolume; const Box: array of TNeuralFloat;
   ClsLogits, BboxDeltas, MaskLogits: TNNetVolume);
 var
-  lv, LayersCntM1, NumLevelsM1: integer;
-  Inputs: array of TNNetVolume;
+  lv, LayersCntM1, NumClasses4: integer;
   L, ClsL, BboxL, MaskL: TNNetLayer;
 begin
   if Length(LevelFeats) <> Config.NumLevels then
@@ -60479,37 +60519,34 @@ begin
       ' level feature maps, got ' + IntToStr(Length(LevelFeats)) + '.');
   if Length(Box) <> 4 then
     ImportError('RunMaskRCNN: Box must be (x1,y1,x2,y2).');
-  // Rewrite the proposal box on every RoIAlign layer (box + mask heads).
-  LayersCntM1 := NN.Layers.Count - 1;
-  for lv := 0 to LayersCntM1 do
-    if NN.Layers[lv] is TNNetRoIAlign then
-      TNNetRoIAlign(NN.Layers[lv]).SetBox(Box[0], Box[1], Box[2], Box[3]);
-  // The level inputs are layers 0..NumLevels-1 (config order). The multi-input
-  // TNNet.Compute copies inputs 1..N then forwards from input[0].
-  SetLength(Inputs, Config.NumLevels);
-  NumLevelsM1 := Config.NumLevels - 1;
-  for lv := 0 to NumLevelsM1 do
-    Inputs[lv] := LevelFeats[lv];
-  NN.Compute(Inputs);
-
-  // Locate the head outputs by class + shape (no per-layer name API):
+  // One pass rewrites the proposal box on every RoIAlign layer (box + mask
+  // heads) AND locates the head outputs by class + shape (no per-layer name
+  // API):
   //   cls_score / bbox_pred = TNNetFullConnectLinear with Size num_classes /
   //   num_classes*4; mask_logits = the LAST TNNetConvolutionLinear whose Depth
   //   = num_classes (the 1x1 logits conv, after the 28x28 deconv).
+  // The heads are structural, so locating them before Compute is equivalent -
+  // only their Output is read afterwards.
   ClsL := nil; BboxL := nil; MaskL := nil;
+  NumClasses4 := Config.NumClasses * 4;
   LayersCntM1 := NN.Layers.Count - 1;
   for lv := 0 to LayersCntM1 do
   begin
     L := NN.Layers[lv];
-    if (L is TNNetFullConnectLinear) and not (L is TNNetFullConnectReLU) then
+    if L is TNNetRoIAlign then
+      TNNetRoIAlign(L).SetBox(Box[0], Box[1], Box[2], Box[3])
+    else if (L is TNNetFullConnectLinear) and not (L is TNNetFullConnectReLU) then
     begin
       if L.Output.Size = Config.NumClasses then ClsL := L
-      else if L.Output.Size = Config.NumClasses * 4 then BboxL := L;
+      else if L.Output.Size = NumClasses4 then BboxL := L;
     end
     else if (L.ClassType = TNNetConvolutionLinear) and
             (L.Output.Depth = Config.NumClasses) and (L.Output.SizeX > 1) then
       MaskL := L;
   end;
+  // The level inputs are layers 0..NumLevels-1 (config order). The multi-input
+  // TNNet.Compute copies inputs 1..N then forwards from input[0].
+  NN.Compute(LevelFeats);
 
   if ClsLogits <> nil then
   begin
@@ -60704,7 +60741,7 @@ end;
 procedure LoadConvNeXtDepthwise(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BName: string; Ch, K: integer);
 var
-  W, B, WVol: TNNetVolume;
+  W, WVol: TNNetVolume;
   c, ky, kx, srcIdx, dstIdx: integer;
   ChM1, KM1: integer;
 begin
@@ -60727,14 +60764,17 @@ begin
     ImportError('ConvNeXt import: internal error - depthwise "' + WName +
       '" neuron has ' + IntToStr(Layer.FArrNeurons[0].Weights.Size) +
       ' weights, expected ' + IntToStr(K * K * Ch) + '.');
+  // The per-channel bias is consumed by the caller's TNNetChannelBias
+  // (LoadConvNeXtChannelVector, which repeats both checks); here only its
+  // presence and length are validated, so the tensor is never decoded twice.
+  if not Reader.HasTensor(BName) then
+    ImportError('ConvNeXt import: missing tensor "' + BName + '".');
+  if Reader.ElementCount(BName) <> Ch then
+    ImportError('ConvNeXt import: depthwise "' + BName + '" must have ' +
+      IntToStr(Ch) + ' elements.');
   W := TNNetVolume.Create;
-  B := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(WName, W);
-    Reader.LoadTensorFlat(BName, B);
-    if B.Size <> Ch then
-      ImportError('ConvNeXt import: depthwise "' + BName + '" must have ' +
-        IntToStr(Ch) + ' elements.');
     ChM1 := Ch - 1;
     KM1 := K - 1;
     WVol := Layer.FArrNeurons[0].Weights;
@@ -60760,7 +60800,7 @@ begin
     Layer.FArrNeurons[0].BiasWeight := 0;
     Layer.FlushWeightCache();
   finally
-    W.Free; B.Free;
+    W.Free;
   end;
 end;
 
@@ -66356,35 +66396,19 @@ end;
 // STABLE DIFFUSION VAE DECODER IMPORT (diffusers AutoencoderKL, decoder only)
 // ===========================================================================
 
-function ReadVaeDecoderConfigFromJSONFile(
+// Parses an ALREADY-loaded diffusers AutoencoderKL config object; FileName only
+// names the file in the error messages. Split out so the encoder reader, which
+// needs three extra fields of the same file, shares one read + one GetJSON with
+// the decoder reader instead of parsing the config twice.
+function ParseVaeDecoderConfigObject(Obj: TJSONObject;
   const FileName: string): TVaeDecoderConfig;
 var
   LpMax: integer;
-  JsonText: TStringList;
-  Root: TJSONData;
-  Obj: TJSONObject;
   ArrData: TJSONData;
   Arr: TJSONArray;
   ClassName: string;
   i, SampleSize: integer;
 begin
-  if not FileExists(FileName) then
-    ImportError('VAE import: config file not found: ' + FileName);
-  JsonText := TStringList.Create;
-  Root := nil;
-  try
-    JsonText.LoadFromFile(FileName);
-    try
-      Root := GetJSON(JsonText.Text);
-    except
-      on E: Exception do
-        ImportError('VAE import: config "' + FileName +
-          '" is not valid JSON (' + E.Message + ').');
-    end;
-    if not (Root is TJSONObject) then
-      ImportError('VAE import: config "' + FileName +
-        '" is not a JSON object.');
-    Obj := TJSONObject(Root);
     // diffusers configs carry "_class_name"; accept that or "model_type".
     ClassName := Obj.Get('_class_name', Obj.Get('model_type', 'AutoencoderKL'));
     if (ClassName <> 'AutoencoderKL') and (ClassName <> 'AutoencoderKLTemporalDecoder')
@@ -66431,6 +66455,32 @@ begin
     if Result.LatentGrid < 1 then
       ImportError('VAE import: resolved latent grid is ' +
         IntToStr(Result.LatentGrid) + ' (must be >= 1).');
+end;
+
+// Reads the config file, then hands the parsed object to the shared parser.
+function ReadVaeDecoderConfigFromJSONFile(
+  const FileName: string): TVaeDecoderConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+begin
+  if not FileExists(FileName) then
+    ImportError('VAE import: config file not found: ' + FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('VAE import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('VAE import: config "' + FileName +
+        '" is not a JSON object.');
+    Result := ParseVaeDecoderConfigObject(TJSONObject(Root), FileName);
   finally
     Root.Free;
     JsonText.Free;
@@ -68779,9 +68829,9 @@ end;
 procedure LoadT2IAdapterConvIn(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
   const WName, BName: string; OutCh, CondCh, R, K: integer);
 var
-  W, B: TNNetVolume;
-  InCh, o, c, ky, kx, ic, dy, dx, torchOc, caiC: integer;
-  OutChM1, CondChM1, RM1, KM1: integer;
+  W, B, WVol: TNNetVolume;
+  InCh, o, kk, ic, dy, dx, srcIdx, dstIdx, SrcOBase: integer;
+  OutChM1, CondChM1, RM1, KSqrM1, KSqr, InChKSqr: integer;
 begin
   InCh := CondCh * R * R;
   EnsureWritableImportWeights(Layer);
@@ -68808,29 +68858,37 @@ begin
     OutChM1 := OutCh - 1;
     CondChM1 := CondCh - 1;
     RM1 := R - 1;
-    KM1 := K - 1;
+    KSqr := K * K;
+    KSqrM1 := KSqr - 1;
+    InChKSqr := InCh * KSqr;
+    SrcOBase := 0;                 // #6: o * InCh * K * K, carried
     for o := 0 to OutChM1 do
     begin
+      WVol := Layer.FArrNeurons[o].Weights;
       // Walk CAI input channels caiC = (dx*R + dy)*CondCh + ic and copy from the
-      // torch column torchOc = ic*R*R + dy*R + dx for each kernel position.
+      // torch column torchOc = ic*R*R + dy*R + dx. Torch stores one column's
+      // K*K taps contiguously and CAI strides them by InCh, so both sides are
+      // carried offsets over a single flattened kernel loop (#12).
       for ic := 0 to CondChM1 do
         for dx := 0 to RM1 do
           for dy := 0 to RM1 do
           begin
-            caiC := (dx * R + dy) * CondCh + ic;
-            torchOc := (ic * R + dy) * R + dx;
-            for ky := 0 to KM1 do
-              for kx := 0 to KM1 do
-                Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + caiC] :=
-                  W.FData[((o * InCh + torchOc) * K + ky) * K + kx];
+            dstIdx := (dx * R + dy) * CondCh + ic;
+            srcIdx := SrcOBase + ((ic * R + dy) * R + dx) * KSqr;
+            for kk := 0 to KSqrM1 do
+            begin
+              WVol.FData[dstIdx] := W.FData[srcIdx];
+              Inc(dstIdx, InCh);
+              Inc(srcIdx);
+            end;
           end;
       Layer.FArrNeurons[o].BiasWeight := B.FData[o];
+      Inc(SrcOBase, InChKSqr);
     end;
     Layer.FlushWeightCache();
   finally
     W.Free; B.Free;
   end;
-  c := 0; if c <> 0 then ; // silence unused
 end;
 
 // Adds one adapter ResnetBlock (block1 3x3 pad1 -> ReLU -> block2 1x1 -> +x) and
@@ -69303,15 +69361,27 @@ var
   Obj: TJSONObject;
   ImgSize: integer;
 begin
-  // The shared reader already resolves LatentGrid and validates the config;
-  // re-read in_channels (decoder reader stored out_channels=3).
-  Result := ReadVaeDecoderConfigFromJSONFile(FileName);
+  // ONE read + ONE parse: the shared parser resolves LatentGrid and validates
+  // the config, then the three encoder-only fields are taken from the SAME
+  // object (in_channels; the decoder parse stored out_channels=3).
+  if not FileExists(FileName) then
+    ImportError('VAE import: config file not found: ' + FileName);
   JsonText := TStringList.Create;
   Root := nil;
   try
     JsonText.LoadFromFile(FileName);
-    Root := GetJSON(JsonText.Text);
+    try
+      Root := GetJSON(JsonText.Text);
+    except
+      on E: Exception do
+        ImportError('VAE import: config "' + FileName +
+          '" is not valid JSON (' + E.Message + ').');
+    end;
+    if not (Root is TJSONObject) then
+      ImportError('VAE import: config "' + FileName +
+        '" is not a JSON object.');
     Obj := TJSONObject(Root);
+    Result := ParseVaeDecoderConfigObject(Obj, FileName);
     Result.OutChannels := Obj.Get('in_channels', 3); // RGB input channels
     // If the config pins the image grid directly, recompute LatentGrid from it.
     ImgSize := Obj.Get('image_size', 0);
@@ -69844,9 +69914,11 @@ begin
   FDecoder := ADecoder;
   FCodebook := ACodebook;
   FConfig := AConfig;
-  // #14: precompute each codebook entry's squared norm once at build time, so
-  // the per-position nearest-neighbour search becomes ||e||^2 - 2 z.e (one AVX
-  // DotProduct) instead of a full subtract-square nest.
+  // #14: precompute each codebook entry's HALVED squared norm once at build
+  // time, so the per-position nearest-neighbour search becomes
+  // 0.5||e||^2 - z.e (one AVX DotProduct) instead of a full subtract-square
+  // nest - and the per-entry 2* of the -2 z.e form is folded in here.
+  // Halving is an exact power-of-two scale, so the argmin is unchanged.
   EDim := FConfig.VqEmbedDim;
   if (EDim > 0) and (FCodebook <> nil) then
   begin
@@ -69855,7 +69927,7 @@ begin
     EBase := 0;
     for k := 0 to NE - 1 do
     begin
-      FCodebookNormSqr[k] := TNNetVolume.DotProduct(
+      FCodebookNormSqr[k] := 0.5 * TNNetVolume.DotProduct(
         @FCodebook.FData[EBase], @FCodebook.FData[EBase], EDim);
       Inc(EBase, EDim);
     end;
@@ -69880,8 +69952,10 @@ var
   Score, BestScore, dot: TNeuralFloat;
   ZBase, EBase, NumEmbM1: integer;
 begin
-  // argmin_k ||z - e_k||^2 = argmin_k (||e_k||^2 - 2 z.e_k); ||z||^2 is a shared
-  // constant, dropped. The inner nest is one AVX DotProduct (#14/#18).
+  // argmin_k ||z - e_k||^2 = argmin_k (0.5||e_k||^2 - z.e_k); ||z||^2 is a
+  // shared constant, dropped, and the whole expression is halved so NormSqr
+  // (built pre-halved) absorbs the -2 factor. The inner nest is one AVX
+  // DotProduct (#14/#18).
   ZBase := Pos * EDim;
   Best := 0;
   BestScore := 1e30;
@@ -69891,7 +69965,7 @@ begin
   begin
     dot := TNNetVolume.DotProduct(
       @Latent.FData[ZBase], @Codebook.FData[EBase], EDim);
-    Score := NormSqr[k] - 2.0 * dot;
+    Score := NormSqr[k] - dot;
     if Score < BestScore then
     begin
       BestScore := Score;
@@ -71912,7 +71986,7 @@ var
   DecInputs: array of TNNetVolume;
   Cond: TNNetVolume;
   NumTaps, i, EotPos, ChanCnt, OutSize, NumTapsM1, ProjectionDimM1: integer;
-  TextOut: TNNetVolume;
+  TextOut, DecOut: TNNetVolume;
 begin
   NumTaps := Length(Config.ExtractLayers);
   NumTapsM1 := NumTaps - 1;
@@ -71937,9 +72011,13 @@ begin
   DecInputs[NumTaps] := Cond;
   try
     DecoderNet.Compute(DecInputs);
-    OutSize := DecoderNet.GetLastLayer().Output.SizeX;
+    DecOut := DecoderNet.GetLastLayer().Output;
+    OutSize := DecOut.SizeX;
+    // The ReSize pins the (OutSize, OutSize, 1) map shape: Copy only reshapes
+    // when the element COUNT differs, so a same-size caller volume of another
+    // shape would otherwise survive unreshaped.
     Logits.ReSize(OutSize, OutSize, 1);
-    Logits.Copy(DecoderNet.GetLastLayer().Output);
+    Logits.Copy(DecOut);
   finally
     Cond.Free;
   end;
