@@ -15185,9 +15185,10 @@ procedure LoadLlamaHeadRMSNormWeights(Reader: TNNetSafeTensorsReader;
   HeadDim: integer; GainOffset: TNeuralFloat = 0;
   Scale: TNeuralFloat = 1.0; RotaryDims: integer = 0);
 var
-  Tmp, WV: TNNetVolume;
+  Tmp, WV, WV0: TNNetVolume;
   HeadCnt, j, TargetIdx, HalfDim: integer;
   NormLayersMax, HeadDimM1, NormLayersLow: integer;
+  HalfDimM1, RotaryDimsM1, RowBytes: integer;
 begin
   if not Reader.HasTensor(WName) then
     ImportError('Llama import: missing tensor "' + WName + '".');
@@ -15202,20 +15203,35 @@ begin
     Reader.LoadTensorFlat(WName, Tmp);
     NormLayersMax := High(NormLayers);
     HeadDimM1 := HeadDim - 1;
+    HalfDimM1 := HalfDim - 1;
+    RotaryDimsM1 := RotaryDims - 1;
     NormLayersLow := Low(NormLayers);
-    for HeadCnt := NormLayersLow to NormLayersMax do
+    if NormLayersMax < NormLayersLow then Exit;
+    // The permuted, scaled gain row depends only on j, so it is identical for
+    // every head: build it once in the first head, then copy the finished row.
+    // The three j ranges are the three permutation branches, each with its own
+    // carried destination index, so no per-channel test survives.
+    WV0 := NormLayers[NormLayersLow].FArrNeurons[0].Weights;
+    TargetIdx := 0;                          // rotate_half low half -> even slots
+    for j := 0 to HalfDimM1 do
+    begin
+      WV0.FData[TargetIdx] := Scale * (GainOffset + Tmp.FData[j]); // gain
+      Inc(TargetIdx, 2);
+    end;
+    TargetIdx := 1;                          // rotate_half high half -> odd slots
+    for j := HalfDim to RotaryDimsM1 do
+    begin
+      WV0.FData[TargetIdx] := Scale * (GainOffset + Tmp.FData[j]);
+      Inc(TargetIdx, 2);
+    end;
+    for j := RotaryDims to HeadDimM1 do      // partial-rotary pass-through tail
+      WV0.FData[j] := Scale * (GainOffset + Tmp.FData[j]);
+    NormLayers[NormLayersLow].FlushWeightCache();
+    RowBytes := HeadDim * csNeuralFloatSize;
+    for HeadCnt := NormLayersLow + 1 to NormLayersMax do
     begin
       WV := NormLayers[HeadCnt].FArrNeurons[0].Weights;
-      for j := 0 to HeadDimM1 do
-      begin
-        if j >= RotaryDims then
-          TargetIdx := j // partial-rotary pass-through tail: no permutation
-        else if j < HalfDim then
-          TargetIdx := 2 * j
-        else
-          TargetIdx := 2 * (j - HalfDim) + 1;
-        WV.FData[TargetIdx] := Scale * (GainOffset + Tmp.FData[j]); // gain
-      end;
+      Move(WV0.FData[0], WV.FData[0], RowBytes);
       NormLayers[HeadCnt].FlushWeightCache();
     end;
   finally
@@ -15235,8 +15251,8 @@ procedure LoadLlamaFullWidthQKNormWeights(Reader: TNNetSafeTensorsReader;
   GainOffset: TNeuralFloat = 0);
 var
   Tmp, WV: TNNetVolume;
-  HeadCnt, j, TargetIdx, HalfDim, hBase: integer;
-  NumHeadsM1, HeadDimM1: integer;
+  HeadCnt, j, HalfDim, hBase: integer;
+  NumHeadsM1, HeadDimM1, HalfDimM1, DstIdx, SrcIdx: integer;
 begin
   if not Reader.HasTensor(WName) then
     ImportError('Llama import: missing tensor "' + WName + '".');
@@ -15250,18 +15266,30 @@ begin
     Reader.LoadTensorFlat(WName, Tmp);
     NumHeadsM1 := (Width div HeadDim) - 1;
     HeadDimM1 := HeadDim - 1;
+    HalfDimM1 := HalfDim - 1;
     WV := NormLayer.FArrNeurons[0].Weights;
+    hBase := 0;
     for HeadCnt := 0 to NumHeadsM1 do
     begin
-      hBase := HeadCnt * HeadDim;
-      for j := 0 to HeadDimM1 do
+      // The two rotate_half halves are contiguous source runs landing on the
+      // even and the odd destination slots of the head, so both indexes are
+      // carried and the per-channel test disappears.
+      DstIdx := hBase;                       // low half -> hBase + 2*j
+      SrcIdx := hBase;
+      for j := 0 to HalfDimM1 do
       begin
-        if j < HalfDim then
-          TargetIdx := 2 * j
-        else
-          TargetIdx := 2 * (j - HalfDim) + 1;
-        WV.FData[hBase + TargetIdx] := GainOffset + Tmp.FData[hBase + j]; // gain
+        WV.FData[DstIdx] := GainOffset + Tmp.FData[SrcIdx]; // gain
+        Inc(DstIdx, 2);
+        Inc(SrcIdx);
       end;
+      DstIdx := hBase + 1;                   // high half -> hBase + 2*(j-HalfDim)+1
+      for j := HalfDim to HeadDimM1 do
+      begin
+        WV.FData[DstIdx] := GainOffset + Tmp.FData[SrcIdx];
+        Inc(DstIdx, 2);
+        Inc(SrcIdx);
+      end;
+      Inc(hBase, HeadDim);
     end;
     NormLayer.FlushWeightCache();
   finally
@@ -16660,7 +16688,6 @@ begin
             end
             else
             begin
-              chBase := KVHeadCnt * HeadDim;
               for d := 0 to RotaryDimsM1 do
                 RotChannels[d] := chBase + d;
               for d := 0 to HeadDimMRotaryM1 do
@@ -16736,7 +16763,6 @@ begin
             end
             else
             begin
-              chBase := HeadCnt * HeadDim;
               for d := 0 to RotaryDimsM1 do
                 RotChannels[d] := chBase + d;
               for d := 0 to HeadDimMRotaryM1 do
@@ -18476,7 +18502,7 @@ var
   Linears, Norms: array of TNNetLayer;
   Embed: TNNetLayer;
   Lay: TNNetLayer;
-  i, i0, HS, dstOfs: integer;
+  i, i0, HS, dstOfs, LinCnt, NormCnt: integer;
   V, WV: TNNetVolume;
   BlockPrefix: string;
 
@@ -18583,9 +18609,13 @@ begin
   //      block (2) then the final norm. Per-head slices are TNNetSplitChannels
   //      so they do not pollute either list. ----
   Embed := nil;
-  SetLength(Linears, 0);
-  SetLength(Norms, 0);
   LpMax := Net.Layers.Count - 1;
+  // Every collected layer comes from Net.Layers, so the layer count bounds
+  // both lists: size once here and truncate to the real counts afterwards.
+  SetLength(Linears, LpMax + 1);
+  SetLength(Norms, LpMax + 1);
+  LinCnt := 0;
+  NormCnt := 0;
   for i := 0 to LpMax do
   begin
     Lay := Net.Layers[i];
@@ -18598,15 +18628,17 @@ begin
     end
     else if Lay is TNNetPointwiseConvLinear then
     begin
-      SetLength(Linears, Length(Linears) + 1);
-      Linears[High(Linears)] := Lay;
+      Linears[LinCnt] := Lay;
+      Inc(LinCnt);
     end
     else if Lay is TNNetTokenRMSNorm then
     begin
-      SetLength(Norms, Length(Norms) + 1);
-      Norms[High(Norms)] := Lay;
+      Norms[NormCnt] := Lay;
+      Inc(NormCnt);
     end;
   end;
+  SetLength(Linears, LinCnt);
+  SetLength(Norms, NormCnt);
   if Embed = nil then
     ImportError('TNNet GGUF export: no TNNetEmbedding layer found - not a ' +
       'Llama TNNet stack?');
@@ -18844,7 +18876,7 @@ end;
 function BuildQwen3MemTensorReader(Net: TNNet;
   const Config: TLlamaConfig): TNNetMemTensorReader;
 var
-  LpMax, NormsHigh: integer;
+  LpMax, NormsHigh, LinCnt, NormCnt: integer;
   Reader: TNNetMemTensorReader;
   HeadDim, QWidth, KVWidth, HalfDim, IntSize, hBase: integer;
   b, j, h, k, i, i0, HS, dstOfs: integer;
@@ -18987,9 +19019,13 @@ begin
   //      norms are the interleaved block + per-head set above. Per-head q/k
   //      slices are TNNetSplitChannels so only the genuine norms land here. ----
   Embed := nil;
-  SetLength(Linears, 0);
-  SetLength(Norms, 0);
   LpMax := Net.Layers.Count - 1;
+  // Bounded by the layer count (see the Llama exporter): size once, truncate
+  // to the real counts after the walk.
+  SetLength(Linears, LpMax + 1);
+  SetLength(Norms, LpMax + 1);
+  LinCnt := 0;
+  NormCnt := 0;
   for i := 0 to LpMax do
   begin
     Lay := Net.Layers[i];
@@ -19001,15 +19037,17 @@ begin
     end
     else if Lay is TNNetPointwiseConvLinear then
     begin
-      SetLength(Linears, Length(Linears) + 1);
-      Linears[High(Linears)] := Lay;
+      Linears[LinCnt] := Lay;
+      Inc(LinCnt);
     end
     else if Lay is TNNetTokenRMSNorm then
     begin
-      SetLength(Norms, Length(Norms) + 1);
-      Norms[High(Norms)] := Lay;
+      Norms[NormCnt] := Lay;
+      Inc(NormCnt);
     end;
   end;
+  SetLength(Linears, LinCnt);
+  SetLength(Norms, NormCnt);
   if Embed = nil then
     ImportError('TNNet Qwen3 export: no TNNetEmbedding layer found - not a ' +
       'Qwen3 TNNet stack?');
@@ -19257,10 +19295,11 @@ var
   Writer: TNNetSafeTensorsWriter;
   Embeds, LayerNorms, PwConvs: array of TNNetLayer;
   WordEmb, TypeEmb, PosEmb, EmbLN: TNNetLayer;
+  Lay: TNNetLayer;
   V: TNNetVolume;
   i, BlockCnt, PwBase, NumPw, ExpectPw, ExpectLN, ExpectEmb: integer;
   d, IntSize, UsablePositions: integer;
-  LayerCntM1, BlockMax: integer;
+  LayerCntM1, BlockMax, EmbCnt, LNCnt, PwCnt: integer;
   BlockPrefix, QName, KName, VName, AttnDenseName, AttnLNName: string;
   InterName, OutDenseName, OutLNName: string;
 
@@ -19311,35 +19350,44 @@ begin
   // then AttnLN/OutLN per block. PointwiseConvLinear: QKV,AttnDense,Inter,
   // OutDense per block, then the optional pooler.dense (the SDPA per-head
   // attention adds SplitChannels, not PointwiseConvLinear).
-  SetLength(Embeds, 0);
-  SetLength(LayerNorms, 0);
-  SetLength(PwConvs, 0);
   PosEmb := nil;
   LayerCntM1 := Net.CountLayers - 1;
+  // All three lists are filled from Net.Layers, so the layer count bounds each
+  // one: size once here and truncate to the real counts after the walk.
+  SetLength(Embeds, LayerCntM1 + 1);
+  SetLength(LayerNorms, LayerCntM1 + 1);
+  SetLength(PwConvs, LayerCntM1 + 1);
+  EmbCnt := 0;
+  LNCnt := 0;
+  PwCnt := 0;
   for i := 0 to LayerCntM1 do
   begin
-    if Net.Layers[i] is TNNetLearnedPositionalEmbedding then
+    Lay := Net.Layers[i];
+    if Lay is TNNetLearnedPositionalEmbedding then
     begin
       if PosEmb <> nil then
         ImportError('BERT export: more than one positional-embedding layer.');
-      PosEmb := Net.Layers[i];
+      PosEmb := Lay;
     end
-    else if Net.Layers[i] is TNNetEmbedding then
+    else if Lay is TNNetEmbedding then
     begin
-      SetLength(Embeds, Length(Embeds) + 1);
-      Embeds[High(Embeds)] := Net.Layers[i];
+      Embeds[EmbCnt] := Lay;
+      Inc(EmbCnt);
     end
-    else if Net.Layers[i] is TNNetTokenLayerNorm then
+    else if Lay is TNNetTokenLayerNorm then
     begin
-      SetLength(LayerNorms, Length(LayerNorms) + 1);
-      LayerNorms[High(LayerNorms)] := Net.Layers[i];
+      LayerNorms[LNCnt] := Lay;
+      Inc(LNCnt);
     end
-    else if Net.Layers[i] is TNNetPointwiseConvLinear then
+    else if Lay is TNNetPointwiseConvLinear then
     begin
-      SetLength(PwConvs, Length(PwConvs) + 1);
-      PwConvs[High(PwConvs)] := Net.Layers[i];
+      PwConvs[PwCnt] := Lay;
+      Inc(PwCnt);
     end;
   end;
+  SetLength(Embeds, EmbCnt);
+  SetLength(LayerNorms, LNCnt);
+  SetLength(PwConvs, PwCnt);
   if PosEmb = nil then
     ImportError('BERT export: no TNNetLearnedPositionalEmbedding layer - ' +
       'not a BuildBertFromSafeTensors encoder?');
@@ -72094,6 +72142,7 @@ procedure LoadStyleGAN2Linear(Reader: TNNetSafeTensorsReader;
 var
   W, B: TNNetVolume;
   j, OutDimM1, SrcBase, RowBytes: integer;
+  HasBias: boolean;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -72112,7 +72161,8 @@ begin
   B := TNNetVolume.Create;
   try
     Reader.LoadTensorFlat(WName, W);
-    if BName <> '' then
+    HasBias := BName <> '';
+    if HasBias then
     begin
       if not Reader.HasTensor(BName) then
         ImportError('StyleGAN2 import: missing bias tensor "' + BName + '".');
@@ -72129,7 +72179,7 @@ begin
       // #13: neuron j's weights are HF row j verbatim - one contiguous copy.
       Move(W.FData[SrcBase], Layer.FArrNeurons[j].Weights.FData[0], RowBytes);
       Inc(SrcBase, InDim);
-      if BName <> '' then Layer.FArrNeurons[j].BiasWeight := B.FData[j]
+      if HasBias then Layer.FArrNeurons[j].BiasWeight := B.FData[j]
       else Layer.FArrNeurons[j].BiasWeight := 0;
     end;
     Layer.FlushWeightCache();
@@ -72146,6 +72196,8 @@ procedure LoadStyleGAN2ModConv(Reader: TNNetSafeTensorsReader;
 var
   W, B: TNNetVolume;
   o, c, ky, kx, OutChM1, InChM1, KM1: integer;
+  DstW, BiasW: TNNetVolume;
+  KSq, InChKSq, oBase, kyBase, DstBase, SrcIdx: integer;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -72169,13 +72221,35 @@ begin
     OutChM1 := OutCh - 1;
     InChM1 := InCh - 1;
     KM1 := K - 1;
+    KSq := K * K;
+    InChKSq := InCh * KSq;
+    // [out,in,K,K] -> per-neuron [K,K,in]: the destination base advances by
+    // InCh per (ky,kx) slot and the source by K*K per input channel, so the
+    // whole 4-deep index arithmetic reduces to carried adds.
+    oBase := 0;                             // o * InCh * K * K
     for o := 0 to OutChM1 do
+    begin
+      DstW := Layer.FArrNeurons[o].Weights;
+      DstBase := 0;                         // (ky * K + kx) * InCh
+      kyBase := 0;                          // ky * K
       for ky := 0 to KM1 do
+      begin
         for kx := 0 to KM1 do
+        begin
+          SrcIdx := oBase + kyBase + kx;
           for c := 0 to InChM1 do
-            Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
-              W.FData[((o * InCh + c) * K + ky) * K + kx];
-    Layer.FArrNeurons[OutCh].Weights.Fill(0);
+          begin
+            DstW.FData[DstBase + c] := W.FData[SrcIdx];
+            Inc(SrcIdx, KSq);
+          end;
+          Inc(DstBase, InCh);
+        end;
+        Inc(kyBase, K);
+      end;
+      Inc(oBase, InChKSq);
+    end;
+    BiasW := Layer.FArrNeurons[OutCh].Weights;
+    BiasW.Fill(0);
     if BName <> '' then
     begin
       if not Reader.HasTensor(BName) then
@@ -72184,7 +72258,7 @@ begin
       if B.Size <> OutCh then
         ImportError('StyleGAN2 import: bias "' + BName + '" must have ' +
           IntToStr(OutCh) + ' elements, got ' + IntToStr(B.Size) + '.');
-      for o := 0 to OutChM1 do Layer.FArrNeurons[OutCh].Weights.FData[o] := B.FData[o];
+      Move(B.FData[0], BiasW.FData[0], OutCh * csNeuralFloatSize);
     end;
     Layer.FlushWeightCache();
   finally
@@ -72211,7 +72285,8 @@ var
   ConstW, NoiseW: TNNetVolume;
   b, c, l, nConv, size, ch, lat, gridSize, noiseIdx: integer;
   MappingLayersM1, NumBlocksM1, chM1, gridSizeM1, nConvM1, SizeSqM1: integer;
-  ConvsBM1: integer;
+  ConvsBM1, SizeSq, DstIdx, SrcIdx: integer;
+  TgtVol: TNNetVolume;
   pfx: string;
 
   function AddConvPass(const Prefix: string): TConvRefs;
@@ -72308,15 +72383,27 @@ begin
       ImportError('StyleGAN2 import: "const" size mismatch.');
     gridSize := Config.StartSize * Config.StartSize;
     gridSizeM1 := gridSize - 1;
+    // CHW -> HWC: one contiguous source run per channel, landing on a
+    // destination stepped by ch.
+    TgtVol := ConstInput.Output;
+    SrcIdx := 0;                             // c * gridSize
     for c := 0 to chM1 do
+    begin
+      DstIdx := c;
       for l := 0 to gridSizeM1 do
-        ConstInput.Output.FData[l * ch + c] := ConstW.FData[c * gridSize + l];
+      begin
+        TgtVol.FData[DstIdx] := ConstW.FData[SrcIdx + l];
+        Inc(DstIdx, ch);
+      end;
+      Inc(SrcIdx, gridSize);
+    end;
 
     noiseIdx := 0;
     for b := 0 to NumBlocksM1 do
     begin
       size := Config.StartSize shl b;
-      SizeSqM1 := size * size - 1;
+      SizeSq := size * size;
+      SizeSqM1 := SizeSq - 1;
       ConvsBM1 := Length(Convs[b]) - 1;
       for c := 0 to ConvsBM1 do
       begin
@@ -72338,10 +72425,19 @@ begin
         Reader.LoadTensorFlat(pfx + 'noise', NoiseW);
         if NoiseW.Size <> ch * size * size then
           ImportError('StyleGAN2 import: "' + pfx + 'noise" size mismatch.');
+        // CHW -> HWC, same carried-index shape as the learned constant above.
+        TgtVol := Convs[b][c].Noise.Output;
+        SrcIdx := 0;                         // l * SizeSq
         for l := 0 to chM1 do
+        begin
+          DstIdx := l;
           for noiseIdx := 0 to SizeSqM1 do
-            Convs[b][c].Noise.Output.FData[noiseIdx * ch + l] :=
-              NoiseW.FData[l * size * size + noiseIdx];
+          begin
+            TgtVol.FData[DstIdx] := NoiseW.FData[SrcIdx + noiseIdx];
+            Inc(DstIdx, ch);
+          end;
+          Inc(SrcIdx, SizeSq);
+        end;
       end;
       pfx := 'block.' + IntToStr(b) + '.torgb.';
       LoadStyleGAN2Linear(Reader, ToRGBAffine[b], pfx + 'affine.weight',
@@ -72478,8 +72574,6 @@ procedure LoadDINOv2LayerScale(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const TName: string; Hidden: integer);
 var
   Tmp: TNNetVolume;
-  i: integer;
-  HiM1: integer;
 begin
   if not Reader.HasTensor(TName) then
     ImportError('DINOv2 import: missing tensor "' + TName + '".');
@@ -72493,9 +72587,10 @@ begin
       ImportError('DINOv2 import: internal error - LayerScale layer has ' +
         IntToStr(Layer.FArrNeurons[0].Weights.Size) + ' weights, expected ' +
         IntToStr(Hidden) + '.');
-    HiM1 := Hidden - 1;
-    for i := 0 to HiM1 do
-      Layer.FArrNeurons[0].Weights.FData[i] := Tmp.FData[i];
+    // The gain is the tensor verbatim and the size was just checked, so this
+    // is one contiguous copy.
+    Move(Tmp.FData[0], Layer.FArrNeurons[0].Weights.FData[0],
+      Hidden * csNeuralFloatSize);
     Layer.FlushWeightCache();
   finally
     Tmp.Free;
