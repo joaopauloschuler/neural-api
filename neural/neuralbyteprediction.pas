@@ -529,7 +529,7 @@ end;
 
 function TClassifier.PredictClass(PActions: array of byte): byte;
 var
-  I: word;
+  I: longint;
   ABF: TRunOperation;
   Probability, Best: single;
   NextState: byte;
@@ -1303,7 +1303,7 @@ procedure TStatePredictionClass.Prediction(
   var pVictoryIndex: array of longint  { index of victorious neuron });
 
 var
-  I, J, MaxIndex: word;
+  I, J, MaxIndex: longint;
   ABF: TRunOperation;
   Probability, TotalCount, relP: single;
   NextState: byte;
@@ -1378,7 +1378,7 @@ procedure TStatePredictionClass.PredictionProbability(
   {output}var pRelationProbability: array of single; {probabilidades}
   var pVictoryIndex: array of longint  { posicao do vitorioso});
 var
-  I: word;
+  I: longint;
   ABF: TRunOperation;
   Probability, TotalCount: single;
   NextState: byte;
