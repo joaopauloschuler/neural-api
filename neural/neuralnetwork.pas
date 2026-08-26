@@ -51714,6 +51714,12 @@ begin
     // Depth roll: output[d] = prev[(d - Shift) wrapped]. The rotated column is
     // two contiguous runs, so the per-element double-mod becomes two Moves.
     Sh := ((Shift mod Depth) + Depth) mod Depth;
+    if Sh = 0 then
+      // Plain copy. Besides being the cheapest form, it keeps the two-run code
+      // below from addressing FData[SrcBase + Depth], one past the last cell.
+      Move(FPrevLayer.FOutput.FData[0], FOutput.FData[0],
+        FOutput.Size * csNeuralFloatSize)
+    else
     for CntY := 0 to MaxY do
       for CntX := 0 to MaxX do
       begin
@@ -51757,6 +51763,11 @@ begin
           Sh := ((Shift mod SizeX) + SizeX) mod SizeX;
           RowLen := SizeX * Depth;
           HeadLen := Sh * Depth;
+          if Sh = 0 then
+            // Straight accumulation. It is the cheapest form and it avoids
+            // addressing one past the row end in the wrapped run below.
+            FPrevLayer.FOutputError.Add(FOutputError)
+          else
           for CntY := 0 to MaxY do
           begin
             PrevBase := CntY * RowLen;
@@ -51775,15 +51786,27 @@ begin
           RowLen := SizeX * Depth;
           HeadLen := Sh * RowLen;
           VolLen := SizeY * RowLen;
-          TNNetVolume.Add(FPrevLayer.FOutputError.GetRawPtr(0),
-            FOutputError.GetRawPtr(HeadLen), VolLen - HeadLen);
-          TNNetVolume.Add(FPrevLayer.FOutputError.GetRawPtr(VolLen - HeadLen),
-            FOutputError.GetRawPtr(0), HeadLen);
+          if Sh = 0 then
+            // Straight accumulation, which also avoids forming the one-past-the
+            // -end address FOutputError[VolLen] in the wrapped run below.
+            FPrevLayer.FOutputError.Add(FOutputError)
+          else
+          begin
+            TNNetVolume.Add(FPrevLayer.FOutputError.GetRawPtr(0),
+              FOutputError.GetRawPtr(HeadLen), VolLen - HeadLen);
+            TNNetVolume.Add(FPrevLayer.FOutputError.GetRawPtr(VolLen - HeadLen),
+              FOutputError.GetRawPtr(0), HeadLen);
+          end;
         end;
     else
       // Depth roll (inverse): prevErr[d] += err[(d + Shift) wrapped]; the
       // wrapped read is two contiguous runs, so accumulate with two Adds.
       Sh := ((Shift mod Depth) + Depth) mod Depth;
+      if Sh = 0 then
+        // Straight accumulation, which also avoids addressing the cell one past
+        // the end of each column in the wrapped run below.
+        FPrevLayer.FOutputError.Add(FOutputError)
+      else
       for CntY := 0 to MaxY do
         for CntX := 0 to MaxX do
         begin

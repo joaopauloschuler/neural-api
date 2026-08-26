@@ -1492,6 +1492,8 @@ type
     procedure TestRollGradientCheck;
     procedure TestRollGradientCheckAxisX;
     procedure TestRollGradientCheckAxisY;
+    procedure TestRollZeroShiftIsIdentity;
+    procedure TestRollZeroShiftGradientCheck;
     procedure TestRollInvolution;
     procedure TestRollSerializationRoundTrip;
     procedure TestRollAxisSerializationRoundTrip;
@@ -26415,6 +26417,54 @@ begin
   // precision central differences on this shape sit just above 0.01.
   LayerInputGradientCheck(Self, TNNetRoll.Create(1, 1),
     'RollAxisY', 3, 4, 2, 0.05);
+end;
+
+procedure TTestNeuralNumerical.TestRollZeroShiftIsIdentity;
+const
+  // Public axis codes 0 = X, 1 = Y, 2 = Depth on a 3 x 2 x 4 volume, each with
+  // shift zero and with plus/minus one full turn of the axis.
+  Axes: array[0..8] of integer = (0, 0, 0, 1, 1, 1, 2, 2, 2);
+  Shifts: array[0..8] of integer = (0, 3, -3, 0, 2, -2, 0, 4, -4);
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Cfg, i: integer;
+begin
+  // A roll whose normalised shift is zero must reproduce the input exactly. It
+  // is also the case where the two-run rotation would address one cell past the
+  // end of the axis, so this pins the plain-copy shortcut on every axis.
+  for Cfg := 0 to 8 do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(3, 2, 4);
+    try
+      NN.AddLayer(TNNetInput.Create(3, 2, 4, 1));
+      NN.AddLayer(TNNetRoll.Create(Shifts[Cfg], Axes[Cfg]));
+      RandSeed := 424242;
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := Random() * 2 - 1;
+      NN.Compute(Input);
+      for i := 0 to Input.Size - 1 do
+        AssertEquals('Roll zero shift axis ' + IntToStr(Axes[Cfg]) +
+          ' shift ' + IntToStr(Shifts[Cfg]) + ' index ' + IntToStr(i),
+          Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN.Free;
+      Input.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestRollZeroShiftGradientCheck;
+begin
+  // Backward pass of the zero-shift roll on each axis: the inverse roll is the
+  // identity, and no wrapped run may reach past the end of the axis.
+  LayerInputGradientCheck(Self, TNNetRoll.Create(0, 0),
+    'RollZeroAxisX', 4, 3, 2, 0.05);
+  LayerInputGradientCheck(Self, TNNetRoll.Create(0, 1),
+    'RollZeroAxisY', 3, 4, 2, 0.05);
+  LayerInputGradientCheck(Self, TNNetRoll.Create(0, 2),
+    'RollZeroAxisDepth', 2, 2, 5, 0.05);
 end;
 
 procedure TTestNeuralNumerical.TestRollAxisSerializationRoundTrip;
