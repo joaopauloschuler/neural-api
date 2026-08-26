@@ -51,6 +51,9 @@ type
     // The non-zero equal-test variant obeys the same two caps: the configured
     // MaxTests and the number of non-zero states.
     procedure TestNonZeroEqualTestsRespectMaxTests;
+    // The bidimensional scan reports a match at position 0 as a match; that
+    // window is reachable whenever FeatureSize is 0.
+    procedure TestConvolutedMatchAtOrigin;
   end;
 
 implementation
@@ -334,6 +337,55 @@ begin
   Creator.Create(True, False, Errors);
   AssertEquals('non-zero equal tests capped at the non-zero state count',
     Length(Actions), Creator.GetCount());
+end;
+
+procedure TTestNeuralABFun.TestConvolutedMatchAtOrigin;
+var
+  Engine: TRunOperation;
+  Settings: TCreateOperationSettings;
+  Actions, CurrentStates, NextStates: array of byte;
+  Tests: TTestsClass;
+  I: integer;
+begin
+  // A 4x4 image with a feature size of 0: the scanned windows are every
+  // position from 0 to 15, the first of them being the origin.
+  Settings := csCreateOpImageProcessing;
+  Settings.FeatureSize := 0;
+  Settings.ImageSizeX := 4;
+  Settings.ImageSizeY := 4;
+  SetLength(Actions, 16);
+  SetLength(CurrentStates, 16);
+  SetLength(NextStates, 16);
+  for I := 0 to 15 do
+  begin
+    Actions[I] := 0;
+    CurrentStates[I] := 0;
+    NextStates[I] := 0;
+  end;
+
+  // One test comparing the immediate 7 against the state at the window base;
+  // only the state holding 7 makes it fire.
+  Tests.N := 0;
+  Tests.TestThreshold := 1;
+  Tests.TestBasePosition := 0;
+  Tests.AddTest(CreateOperation(csEqual, 7, 0, False, True, False));
+
+  // No state carries 7 yet, so no window matches.
+  Engine.Load(Settings, Actions, CurrentStates, NextStates);
+  AssertEquals('no window matches', 0, Engine.TestTests(Tests));
+
+  // A match away from the origin is reported and locates its window.
+  CurrentStates[6] := 7;
+  Engine.Load(Settings, Actions, CurrentStates, NextStates);
+  AssertTrue('match at position 6', Engine.TestTests(Tests) > 0);
+  AssertEquals('position 6 window', 6, Tests.TestBasePosition);
+
+  // A match at the origin must read as a match too, not as a no-match.
+  CurrentStates[6] := 0;
+  CurrentStates[0] := 7;
+  Engine.Load(Settings, Actions, CurrentStates, NextStates);
+  AssertTrue('match at position 0', Engine.TestTests(Tests) > 0);
+  AssertEquals('origin window', 0, Tests.TestBasePosition);
 end;
 
 initialization

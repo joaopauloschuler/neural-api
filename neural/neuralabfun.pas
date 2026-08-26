@@ -1072,8 +1072,16 @@ var
   X,Y: integer;
   TopX, TopY: integer;
   Pos, RowStep, ColSeed: integer;
+  Found: boolean;
 begin
+  // Callers read the result as "the tests fired" (>0), so this returns the
+  // matching test count of the winning window, exactly like the non
+  // bidimensional LocalTestTests. The matching position is reported through
+  // Tests.TestBasePosition: returning it here instead would make a legitimate
+  // match at position 0 (reachable whenever FeatureSize is 0) read as a
+  // no-match.
   Result := 0;
+  Found := False;
   TopX := FCS.ImageSizeX - FCS.FeatureSize - 1;
   TopY := FCS.ImageSizeY - FCS.FeatureSize - 1;
   // Make2D(X,Y) = X + Y*ImageSizeX. Y is the inner loop, so Pos advances by
@@ -1086,14 +1094,15 @@ begin
     for Y := FCS.FeatureSize to TopY do
     begin
       Tests.TestBasePosition := Pos;
-      if (Self.LocalTestTests(Tests)>0) then
+      Result := Self.LocalTestTests(Tests);
+      if (Result>0) then
       begin
-        Result := Pos;
+        Found := True;
         Break;
       end;
       Inc(Pos, RowStep);              // next Y: Make2D(X, Y+1)
     end;
-    if (Result>0) then Break;
+    if Found then Break;
   end;
 end;
 
