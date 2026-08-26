@@ -119828,6 +119828,21 @@ begin
         Perm[HCount][bestI] := bestJ;
       end;
 
+      // The greedy loop stops early when every remaining A-unit has no best
+      // B-unit (a whole score row of NaN, e.g. non-finite weights with the FPU
+      // exceptions masked). Perm must still be a genuine permutation — both the
+      // neuron reorder and the next layer's column compensation index by it — so
+      // pair the leftovers in ascending index order.
+      J := 0;
+      for I := 0 to WidthM1 do
+        if Perm[HCount][I] < 0 then
+        begin
+          while (J <= WidthM1) and UsedB[J] do Inc(J);
+          if J > WidthM1 then Break;
+          Perm[HCount][I] := J;
+          UsedB[J] := true;
+        end;
+
       // Churn = fraction of positions whose B-unit changed.
       mJ := 0;
       for I := 0 to WidthM1 do

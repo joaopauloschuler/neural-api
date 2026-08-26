@@ -137,6 +137,7 @@ type
     procedure TestEffectiveReceptiveFieldReportSmoke;
     procedure TestModeConnectivityReportSmoke;
     procedure TestPermutationAlignReportSmoke;
+    procedure TestPermutationAlignDegenerateScoreRow;
     procedure TestIntrinsicDimensionReportSmoke;
     procedure TestNeuralTangentKernelReportSmoke;
     procedure TestActivationPatchingReportSmoke;
@@ -6101,6 +6102,76 @@ begin
     NN.Free;
     NNB.Free;
     NNC.Free;
+    RandSeed := SavedSeed;
+  end;
+end;
+
+// A non-finite weight makes one A-unit's whole similarity row NaN, so that unit
+// never wins a greedy pick and the alignment loop ends with positions still
+// unassigned. The permutation must still be complete: the neuron reorder indexes
+// the saved weight rows by it, so a leftover -1 reads out of bounds.
+procedure TTestNeuralLayersExtra.TestPermutationAlignDegenerateScoreRow;
+var
+  NN, NNB: TNNet;
+  Samples: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  SnapB, Report: string;
+  I: integer;
+  SavedSeed: longword;
+  OldMask: TFPUExceptionMask;
+begin
+  SavedSeed := RandSeed;
+  // A NaN weight traps on the probe forward pass with the default mask, so the
+  // degenerate score row is only reachable with the FP exceptions masked off.
+  OldMask := GetExceptionMask();
+  SetExceptionMask(OldMask + [exInvalidOp, exOverflow, exZeroDivide,
+    exDenormalized, exUnderflow, exPrecision]);
+  NN := TNNet.Create();
+  NNB := TNNet.Create();
+  Samples := TNNetVolumePairList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    RandSeed := 4242;
+    NN.InitWeights();
+
+    NNB.AddLayer(TNNetInput.Create(2, 1, 1));
+    NNB.AddLayer(TNNetFullConnectReLU.Create(8));
+    NNB.AddLayer(TNNetFullConnectReLU.Create(8));
+    NNB.AddLayer(TNNetFullConnectLinear.Create(3));
+    RandSeed := 7;
+    NNB.InitWeights();
+
+    for I := 1 to 6 do
+    begin
+      X := TNNetVolume.Create(2, 1, 1);
+      Y := TNNetVolume.Create(3, 1, 1);
+      X.FData[0] := I * 0.1;
+      X.FData[1] := -I * 0.2;
+      Y.Fill(0);
+      Y.FData[I mod 3] := 1.0;
+      Samples.Add(TNNetVolumePair.Create(X, Y));
+    end;
+    SnapB := NNB.SaveDataToString();
+
+    // Poison ONE endpoint-A hidden unit: its whole score row becomes NaN.
+    NN.Layers[1].Neurons[0].Weights.FData[0] := NaN;
+
+    Report := TNNet.PermutationAlignReport(NN, SnapB, Samples, 0, 4);
+    AssertTrue('degenerate score row still reports',
+      Pos('PermutationAlignReport (Git', Report) > 0);
+    AssertTrue('degenerate churn line present', Pos('churn = ', Report) > 0);
+    // The completed permutation must keep B's function intact.
+    AssertTrue('degenerate case keeps permutation invariance',
+      Pos('Check 1 permutation invariance: PASS', Report) > 0);
+    AssertEquals('B snapshot untouched', SnapB, NNB.SaveDataToString());
+  finally
+    Samples.Free;
+    NN.Free;
+    NNB.Free;
+    SetExceptionMask(OldMask);
     RandSeed := SavedSeed;
   end;
 end;
