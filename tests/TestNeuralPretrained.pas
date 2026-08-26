@@ -210,6 +210,7 @@ type
     procedure TestRopeScalingWiredIntoLlamaBuilder;
     procedure TestLlamaImporterFailsOnMissingTensor;
     procedure TestLlamaLogitParity;
+    procedure TestNoPELayerWithPartialRotaryCarriesNoRoPE;
     procedure TestGGUFReaderMetadataAndTensors;
     procedure TestGGUFTensorDecodeParity;
     procedure TestGGUFKQuantDecodeParity;
@@ -5760,6 +5761,48 @@ begin
     Output.Free;
     Input.Free;
     RefJson.Free;
+    NN.Free;
+  end;
+end;
+
+// A NoPE layer (Config.NoRopeLayers) must carry NO positional encoding at
+// ANY rotary width. No checkpoint combines a NoPE layer with partial rotary
+// today, so the tiny Llama config is parsed by the real loader and handed
+// both flags: neither changes a tensor shape, so the fixture weights load
+// unchanged. Plan.HoistRoPE is false on the NoPE layer, and with the fused
+// path off that drops it into the per-head fallback - the path that must NOT
+// cut a rotary slice there.
+procedure TTestNeuralPretrained.TestNoPELayerWithPartialRotaryCarriesNoRoPE;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+  LayerCnt, RoPECnt, i: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildLlamaFromSafeTensorsEx(FixturePath('tiny_llama.safetensors'),
+    Config, {SeqLen=}0, {pTrainable=}false,
+    FixturePath('tiny_llama_config.json'));
+  NN.Free;
+  // head_dim 4 -> rotary_dim 2, and layer 1 is NoPE.
+  Config.PartialRotaryFactor := 0.5;
+  SetLength(Config.NoRopeLayers, Config.NumLayers);
+  for i := 0 to Config.NumLayers - 1 do
+    Config.NoRopeLayers[i] := i = 0;
+  NeuralAllowFusedAttention := false;
+  NN := nil;
+  try
+    NN := BuildLlamaFromSafeTensorsWithConfig(
+      FixturePath('tiny_llama.safetensors'), Config, {SeqLen=}0,
+      {pTrainable=}false);
+    RoPECnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+      if NN.Layers[LayerCnt] is TNNetRotaryEmbedding then Inc(RoPECnt);
+    // Layer 0 hoists its partial rotary into ONE head-tiled layer per q/k
+    // projection; layer 1 rotates nothing.
+    AssertEquals('rotary layers (hoisted q/k of the RoPE layer only)',
+      2, RoPECnt);
+  finally
+    NeuralAllowFusedAttention := true;
     NN.Free;
   end;
 end;

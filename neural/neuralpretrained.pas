@@ -16661,7 +16661,12 @@ begin
           // PARTIAL rotation over the whole projection, this head is done - the
           // plain slice below is correct and cutting a rotary slice here would
           // rotate it twice.
-          if (RotaryDims < HeadDim) and (not Plan.HoistRoPE) then
+          // LayerUseRoPE: a NoPE layer carries no rotation at any rotary width,
+          // so it takes the plain path - whose whole-head slice is the exact
+          // layout the [rotary|pass-through] concat would produce unrotated,
+          // and which is the only path wiring the NoPE-only extras below.
+          if (RotaryDims < HeadDim) and LayerUseRoPE and
+             (not Plan.HoistRoPE) then
           begin
             // PARTIAL rotary (Phi-3, Config.PartialRotaryFactor < 1):
             // RoPE on the first RotaryDims channels of the head only -
@@ -16747,9 +16752,10 @@ begin
           chBase := HeadCnt * HeadDim;
           for d := 0 to HeadDimM1 do
             SliceChannels[d] := chBase + d;
-          // Skipped when the tiled rotary already rotated the whole projection
-          // (see the K path).
-          if (RotaryDims < HeadDim) and (not Plan.HoistRoPE) then
+          // Skipped when the tiled rotary already rotated the whole projection,
+          // and on a NoPE layer (see the K path).
+          if (RotaryDims < HeadDim) and LayerUseRoPE and
+             (not Plan.HoistRoPE) then
           begin
             // Partial rotary on the Q head - same wiring as the K path
             // (including the Qwen3.5 full-head q_norm BEFORE the split, and
