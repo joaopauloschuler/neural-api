@@ -33,6 +33,10 @@ type
     procedure TestGetFIsPlainFrequency;
     // The "> 0.8" confidence gate turns at the count the estimator implies.
     procedure TestConfidenceGateThreshold;
+    // AddState returns the index it wrote and keeps the state usable.
+    procedure TestClassifierAddStateReturnsIndex;
+    // Past the NumStates capacity AddState refuses instead of writing past the end.
+    procedure TestClassifierAddStateBeyondCapacity;
   end;
 
 implementation
@@ -86,6 +90,44 @@ begin
   // The fourth one gives 5/6 and turns the gate on.
   SetCounts(4, 0);
   AssertTrue('4 flawless hits pass the 0.8 gate', FGroup.GetD() > 0.8);
+end;
+
+procedure TTestNeuralBytePrediction.TestClassifierAddStateReturnsIndex;
+var
+  Classifier: TClassifier;
+  State: array[0..3] of byte;
+  PredictedClass: byte;
+begin
+  State[0] := 1; State[1] := 0; State[2] := 1; State[3] := 0;
+
+  Classifier.Init({pZerosIncluded=}False, {operationLayerSize=}8,
+    {pNumberOfSearches=}4);
+  Classifier.AddClassifier({NumClasses=}3, {NumStates=}2);
+
+  AssertEquals('First AddState index', 0, Classifier.AddState(1, State));
+  AssertEquals('Second AddState index', 1, Classifier.AddState(2, State));
+
+  // The stored state has to be usable: the neuron builder draws its tests from
+  // the loaded action array of state 0.
+  Classifier.CreateRandomNeuronGroup({neuronpos=}0, {pClass=}2);
+  PredictedClass := Classifier.PredictClass(State);
+  AssertTrue('Predicted class is within NumClasses', PredictedClass < 3);
+end;
+
+procedure TTestNeuralBytePrediction.TestClassifierAddStateBeyondCapacity;
+var
+  Classifier: TClassifier;
+  State: array[0..1] of byte;
+begin
+  State[0] := 1; State[1] := 1;
+
+  Classifier.Init({pZerosIncluded=}False, {operationLayerSize=}8,
+    {pNumberOfSearches=}4);
+  Classifier.AddClassifier({NumClasses=}2, {NumStates=}1);
+
+  AssertEquals('Only slot', 0, Classifier.AddState(0, State));
+  AssertEquals('One past the capacity', -1, Classifier.AddState(1, State));
+  AssertEquals('Still refused afterwards', -1, Classifier.AddState(1, State));
 end;
 
 initialization

@@ -289,6 +289,8 @@ type
     FPossibleStates: array of single;
   public
     procedure AddClassifier(NumClasses, NumStates: integer);
+    // Stores one labeled training state and returns its index, or -1 when the
+    // NumStates capacity given to AddClassifier is already full.
     function AddState(pLabel: integer; pState: array of byte): integer;
     function EvolveNeuronGroup(var NG: TNeuronGroup): integer;
     function EvolveNeuronGroupAtPos(neuronpos: integer): integer;
@@ -378,10 +380,21 @@ function TClassifier.AddState(pLabel: integer; pState: array of byte): integer;
 var
   CurrentState, NextState: array[0..0] of byte;
 begin
+  // The state array is sized once by AddClassifier and never grows: the neuron
+  // groups sample it by index, so a reallocation would move states under them.
+  // Report a full classifier with -1 instead of writing past the end.
+  if (FNextFreePos < 0) or (FNextFreePos >= Length(FStates)) then
+  begin
+    Result := -1;
+    exit;
+  end;
+
   CurrentState[0] := 0;
   NextState[0] := pLabel;
+  FStates[FNextFreePos].FLabel := byte(pLabel);
   FStates[FNextFreePos].FTester.Load(FCS, pState, CurrentState, NextState);
 
+  Result := FNextFreePos;
   Inc(FNextFreePos);
 end;
 
