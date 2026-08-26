@@ -9524,7 +9524,7 @@ var
   OrigPosX, OrigPosY: integer;
   MoveSizeBytes: integer;
   RawPostDest, RawPosSource: integer;
-  DestRowStride, SrcRowStride, SrcColBase: integer;
+  SrcRowStride, SrcRowBase: integer;
 begin
   if (NewSizeX=Original.SizeX) and (NewSizeY=Original.SizeY) then
   begin
@@ -9543,20 +9543,21 @@ begin
     OrigMaxX := Original.SizeX - 1;
     OrigMaxY := Original.SizeY - 1;
     MoveSizeBytes := Depth * SizeOf(T);
-    DestRowStride := FSizeX * FDepth;                  // #12: per-CntY dest step
     SrcRowStride := Original.FSizeX * Original.FDepth;  // #5: invariant per call
 
-    for CntX := 0 to MaxX do
+    // Destination rows are walked in storage order, so the per-pixel Move
+    // writes advance contiguously and the reads stay inside one source row.
+    for CntY := 0 to MaxY do
     begin
-      OrigPosX := Min(OrigMaxX, Round(CntX * InvRatioX));
-      SrcColBase := OrigPosX * Original.FDepth; // #11: invariant across CntY
-      RawPostDest := GetRawPos(CntX, 0);        // #12: carried across CntY
-      for CntY := 0 to MaxY do
+      OrigPosY := Min(OrigMaxY, Round(CntY * InvRatioY));
+      SrcRowBase := SrcRowStride * OrigPosY; // #11: invariant across CntX
+      RawPostDest := GetRawPos(0, CntY);     // #12: carried across CntX
+      for CntX := 0 to MaxX do
       begin
-        OrigPosY := Min(OrigMaxY, Round(CntY * InvRatioY));
-        RawPosSource := SrcRowStride * OrigPosY + SrcColBase;
+        OrigPosX := Min(OrigMaxX, Round(CntX * InvRatioX));
+        RawPosSource := SrcRowBase + OrigPosX * Original.FDepth;
         Move(Original.FData[RawPosSource], FData[RawPostDest], MoveSizeBytes);
-        Inc(RawPostDest, DestRowStride);
+        Inc(RawPostDest, FDepth);
       end;
     end;
   end;
@@ -10672,7 +10673,8 @@ end;
 procedure TVolume.PointwiseSoftMax(NoForward: boolean = false);
 var
   StartPointPos: integer;
-  MaxX, MaxY, MaxD, FDepthM1, MaxDP1: integer;
+  MaxX, MaxY, MaxD, FDepthM1: integer;
+  SpanLen, TailLen: integer;
   CountX, CountY: integer;
   SpanMax: TNeuralFloat;
   TotalSum: TNeuralFloat;
@@ -10692,26 +10694,49 @@ begin
     // single fused pass, then normalize. Subtracting the span max leaves every
     // element at <= 0, which is why no clamp is needed - the exp of anything
     // far below -88 is a hard zero on both the AVX and the scalar path.
+    // NoForward is fixed for the whole call, so the nest is unswitched on it
+    // (#20): the ordinary path below is three straight kernel calls over a span
+    // length that never changes.
     colBase := 0; // #12: carried GetRawPos(CountX, 0)
-    for CountX := 0 to MaxX do
+    if NoForward then
     begin
-      if NoForward then MaxD := Min(FDepthM1, CountX);
-      StartPointPos := colBase;
-      for CountY := 0 to MaxY do
+      for CountX := 0 to MaxX do
       begin
-        if NoForward and (MaxD < FDepthM1) then
+        MaxD := Min(FDepthM1, CountX);
+        SpanLen := MaxD + 1;
+        TailLen := FDepth - SpanLen; // slots above the causal span, zeroed
+        StartPointPos := colBase;
+        for CountY := 0 to MaxY do
         begin
-          MaxDP1 := MaxD + 1;
-          FillChar(FData[StartPointPos + MaxDP1], (FDepthM1 - MaxDP1 + 1) * csNeuralFloatSize, 0);
+          if TailLen > 0 then
+            FillChar(FData[StartPointPos + SpanLen], TailLen * csNeuralFloatSize, 0);
+          SpanMax := TNNetVolume.MaxValue(Addr(FData[StartPointPos]), SpanLen);
+          TotalSum := TNNetVolume.ExpShiftSum(Addr(FData[StartPointPos]),
+            Addr(FData[StartPointPos]), SpanMax, SpanLen);
+          if TotalSum > 0 then
+            TNNetVolume.Mul(Addr(FData[StartPointPos]), 1.0 / TotalSum, SpanLen);
+          Inc(StartPointPos, RowStride);
         end;
-        SpanMax := TNNetVolume.MaxValue(Addr(FData[StartPointPos]), MaxD + 1);
-        TotalSum := TNNetVolume.ExpShiftSum(Addr(FData[StartPointPos]),
-          Addr(FData[StartPointPos]), SpanMax, MaxD + 1);
-        if TotalSum > 0 then
-          TNNetVolume.Mul(Addr(FData[StartPointPos]), 1.0 / TotalSum, MaxD + 1);
-        Inc(StartPointPos, RowStride);
+        Inc(colBase, FDepth);
       end;
-      Inc(colBase, FDepth);
+    end
+    else
+    begin
+      SpanLen := FDepth;
+      for CountX := 0 to MaxX do
+      begin
+        StartPointPos := colBase;
+        for CountY := 0 to MaxY do
+        begin
+          SpanMax := TNNetVolume.MaxValue(Addr(FData[StartPointPos]), SpanLen);
+          TotalSum := TNNetVolume.ExpShiftSum(Addr(FData[StartPointPos]),
+            Addr(FData[StartPointPos]), SpanMax, SpanLen);
+          if TotalSum > 0 then
+            TNNetVolume.Mul(Addr(FData[StartPointPos]), 1.0 / TotalSum, SpanLen);
+          Inc(StartPointPos, RowStride);
+        end;
+        Inc(colBase, FDepth);
+      end;
     end;
   end;
 end;
@@ -11512,7 +11537,7 @@ begin
       for GroupCnt := 0 to MaxGroup do
       begin
         TokenDiv := Token div GroupSize;
-        TokenMod := Token mod GroupSize;
+        TokenMod := Token - TokenDiv * GroupSize; // = Token mod GroupSize
         TokenPos := groupBase + TokenMod;
         if TokenPos < FDepth then
         begin
@@ -11554,10 +11579,9 @@ begin
   MaxGroupSize := GroupSize - 1;
   // Calculate maximum group index
   MaxGroup := Groups - 1;
-  // Initialize the tokens array with zeros
+  // SetLength zeroes a freshly nil'd out parameter, and every slot is assigned
+  // below anyway, so no separate zero-fill pass is needed.
   SetLength(aTokens, FSizeX);
-  for CntToken := 0 to MaxToken do
-    aTokens[CntToken] := 0;
   // Iterate through the volume data to reconstruct tokens
   for CntToken := 0 to MaxToken do
   begin
@@ -11769,12 +11793,11 @@ end;
 procedure TVolume.PositionalEncoding(n: integer; PositionOffset: integer);
 var
   Position: Integer;
-  divTerm: Double;
+  divTerm, InvDiv: TNeuralFloat;
   MaxX, MaxY, MaxDepth: integer;
   CntX, CntY, CntDepth: integer;
   EmbeddingSize: integer;
   RawPos, RowStride, colPos: integer;
-  IsEvenDepth: boolean;
 begin
   EmbeddingSize := FDepth;
   MaxX := FSizeX - 1;
@@ -11784,21 +11807,41 @@ begin
   for CntDepth := 0 to MaxDepth do
   begin
     divTerm := pcr_powf(n, (CntDepth and (not 1)) / EmbeddingSize); // 2*(CntDepth div 2), CntDepth>=0
-    IsEvenDepth := ((CntDepth and 1) = 0);
+    // Whether the plane is a sine or a cosine is fixed by CntDepth, so the
+    // CntX/CntY nest is written out once per branch instead of testing per
+    // element (#20). The table is a fixed sinusoid, so the divide by divTerm
+    // becomes one reciprocal and a multiply (#21).
+    InvDiv := 1 / divTerm;
     colPos := CntDepth; // #12: carried GetRawPos(CntX, 0, CntDepth)
-    for CntX := 0 to MaxX do
+    if (CntDepth and 1) = 0 then
     begin
-      RawPos := colPos;
-      Position := CntX + PositionOffset; // #6: Position at CntY=0, carried across CntY
-      for CntY := 0 to MaxY do
+      for CntX := 0 to MaxX do
       begin
-        if IsEvenDepth
-          then FData[RawPos] := pcr_sinf(Position / divTerm)
-          else FData[RawPos] := pcr_cosf(Position / divTerm);
-        Inc(RawPos, RowStride);
-        Inc(Position, FSizeX); // #6: next CntY position
+        RawPos := colPos;
+        Position := CntX + PositionOffset; // #6: Position at CntY=0, carried across CntY
+        for CntY := 0 to MaxY do
+        begin
+          FData[RawPos] := pcr_sinf(Position * InvDiv);
+          Inc(RawPos, RowStride);
+          Inc(Position, FSizeX); // #6: next CntY position
+        end;
+        Inc(colPos, FDepth);
       end;
-      Inc(colPos, FDepth);
+    end
+    else
+    begin
+      for CntX := 0 to MaxX do
+      begin
+        RawPos := colPos;
+        Position := CntX + PositionOffset; // #6: Position at CntY=0, carried across CntY
+        for CntY := 0 to MaxY do
+        begin
+          FData[RawPos] := pcr_cosf(Position * InvDiv);
+          Inc(RawPos, RowStride);
+          Inc(Position, FSizeX); // #6: next CntY position
+        end;
+        Inc(colPos, FDepth);
+      end;
     end;
   end;
 end;
@@ -12022,7 +12065,7 @@ begin
       base := colBase;
       for J := 0 to MaxY do
       begin
-        aux := (FData[base] + FData[base+1] + FData[base+2]) / 3;
+        aux := (FData[base] + FData[base+1] + FData[base+2]) * (1.0/3.0);
         FData[base] := aux;
         FData[base+1] := aux;
         FData[base+2] := aux;
@@ -12056,7 +12099,7 @@ begin
       for J := 0 to MaxY do
       begin
         FData[selfPos] :=
-          (Rgb.FData[rgbBase] + Rgb.FData[rgbBase+1] + Rgb.FData[rgbBase+2]) / 3;
+          (Rgb.FData[rgbBase] + Rgb.FData[rgbBase+1] + Rgb.FData[rgbBase+2]) * (1.0/3.0);
         Inc(rgbBase, rgbRowStride);
         Inc(selfPos, selfRowStride);
       end;
@@ -12373,7 +12416,9 @@ var
   MinIX, MaxIX, MinIY, MaxIY: integer;
   CountX, CountY: integer;
   iBase: integer;
-  RowStrideSq, SqDepth: integer;
+  RowStrideSq, SqDepth, RowStride: integer;
+  ColMaxIX, ColMinIX, RowMaxIY, RowMinIY: integer;
+  SelfPtr: pointer;
   HasLeft, HasTop: boolean;
 begin
   ReSize(Original);
@@ -12413,30 +12458,39 @@ begin
 
   // Self is filled with 1, so each box sum accumulates on top of it. Self and
   // SqrElements share Original's shape, so one base indexes both.
+  RowStride := FSizeX * FDepth; // #12: per-CountY step in Self
   for CountX := 0 to MaxX do
   begin
     MinIX := Max(CountX + iFrom,0);
     MaxIX := Min(CountX + iTo, MaxX);
     HasLeft := MinIX > 0;
+    // #11: the window's column offsets are the same for every CountY, so a
+    // corner index is one row offset plus one of these.
+    ColMaxIX := MaxIX * SqDepth;
+    ColMinIX := (MinIX - 1) * SqDepth;
+    iBase := GetRawPos(CountX, 0); // #12: carried across CountY
     for CountY := 0 to MaxY do
     begin
       MinIY := Max(CountY + iFrom,0);
       MaxIY := Min(CountY + iTo, MaxY);
       HasTop := MinIY > 0;
-      iBase := GetRawPos(CountX, CountY);
-      TNNetVolume.Add(GetRawPtr(iBase),
-        SqrElements.GetRawPtr(SqrElements.GetRawPos(MaxIX, MaxIY)), FDepth);
+      SelfPtr := GetRawPtr(iBase); // #4: one destination pointer, four corners
+      RowMaxIY := MaxIY * RowStrideSq;
+      TNNetVolume.Add(SelfPtr,
+        SqrElements.GetRawPtr(RowMaxIY + ColMaxIX), FDepth);
       if HasLeft then
-        TNNetVolume.MulAdd(GetRawPtr(iBase),
-          SqrElements.GetRawPtr(SqrElements.GetRawPos(MinIX - 1, MaxIY)), -1, FDepth);
+        TNNetVolume.MulAdd(SelfPtr,
+          SqrElements.GetRawPtr(RowMaxIY + ColMinIX), -1, FDepth);
       if HasTop then
       begin
-        TNNetVolume.MulAdd(GetRawPtr(iBase),
-          SqrElements.GetRawPtr(SqrElements.GetRawPos(MaxIX, MinIY - 1)), -1, FDepth);
+        RowMinIY := (MinIY - 1) * RowStrideSq;
+        TNNetVolume.MulAdd(SelfPtr,
+          SqrElements.GetRawPtr(RowMinIY + ColMaxIX), -1, FDepth);
         if HasLeft then
-          TNNetVolume.Add(GetRawPtr(iBase),
-            SqrElements.GetRawPtr(SqrElements.GetRawPos(MinIX - 1, MinIY - 1)), FDepth);
+          TNNetVolume.Add(SelfPtr,
+            SqrElements.GetRawPtr(RowMinIY + ColMinIX), FDepth);
       end;
+      Inc(iBase, RowStride);
     end;
   end;
 
@@ -12451,13 +12505,13 @@ end;
 procedure TNNetVolume.CalculateLocalResponseFromDepth(Original, SqrElements: TNNetVolume;
   pSize: integer; alpha, beta: TNeuralFloat);
 var
-  iFrom, iTo: integer;
+  iTo: integer;
   MaxX, MaxY, MaxD: integer;
-  MinID, MaxID: integer;
   CountX, CountY, CountD: integer;
   sqrPos: integer;
-  iBase: integer;
-  WindowSum: TNeuralFloat;
+  iBase, RowStride: integer;
+  LoEnd, MidStart, MidEnd, HiStart: integer;
+  ColTotal: TNeuralFloat;
 begin
   ReSize(Original);
   SqrElements.ReSize(Original); // no-op once the shape settles (rule #17)
@@ -12467,17 +12521,28 @@ begin
   MaxD := FDepth - 1;
 
   iTo := pSize shr 1;
-  iFrom := -iTo;
   SqrElements.Copy(Original);
   SqrElements.Mul(SqrElements);
   SqrElements.Mul(alpha/pSize);
 
+  RowStride := FSizeX * FDepth; // #12: per-CountY step
+  // The window clamps only near the two ends of the column, so the depth axis
+  // splits into three ranges whose bodies need no test at all (#20): a head
+  // where the window starts at depth 0, a middle where neither end clamps, and
+  // a tail where the window stops at MaxD. Empty ranges collapse on their own
+  // when the window is wider than the depth.
+  LoEnd := Min(iTo, MaxD);
+  MidStart := LoEnd + 1;
+  MidEnd := MaxD - iTo;
+  HiStart := Max(MidStart, MidEnd + 1);
+
+  if MaxD >= 0 then
   for CountX := 0 to MaxX do
   begin
+    // Self and SqrElements are both shaped like Original, so one base indexes both.
+    iBase := GetRawPos(CountX, 0); // #12: carried across CountY
     for CountY := 0 to MaxY do
     begin
-      // Self and SqrElements are both shaped like Original, so one base indexes both.
-      iBase := GetRawPos(CountX, CountY);
       // Inclusive prefix along the depth axis of this (X, Y) column, in place.
       for CountD := 1 to MaxD do
       begin
@@ -12485,16 +12550,17 @@ begin
         SqrElements.FData[sqrPos] :=
           SqrElements.FData[sqrPos] + SqrElements.FData[sqrPos - 1];
       end;
-      for CountD := 0 to MaxD do
-      begin
-        MinID := CountD + iFrom;
-        MaxID := Min(CountD + iTo, MaxD);
-        WindowSum := SqrElements.FData[iBase + MaxID];
-        // MinID <= 0 means the window starts at depth 0: nothing to subtract.
-        if MinID > 0 then
-          WindowSum := WindowSum - SqrElements.FData[iBase + MinID - 1];
-        FData[iBase + CountD] := 1 + WindowSum;
-      end;
+      ColTotal := SqrElements.FData[iBase + MaxD]; // #5: the tail's upper corner
+      for CountD := 0 to LoEnd do
+        FData[iBase + CountD] :=
+          1 + SqrElements.FData[iBase + Min(CountD + iTo, MaxD)];
+      for CountD := MidStart to MidEnd do
+        FData[iBase + CountD] := 1 + (SqrElements.FData[iBase + CountD + iTo] -
+          SqrElements.FData[iBase + CountD - iTo - 1]);
+      for CountD := HiStart to MaxD do
+        FData[iBase + CountD] := 1 + (ColTotal -
+          SqrElements.FData[iBase + CountD - iTo - 1]);
+      Inc(iBase, RowStride);
     end;
   end;
 

@@ -61,6 +61,7 @@ type
     procedure TestVolumeLabRoundTrip;
     procedure TestVolumeGaussianNoise;
     procedure TestVolumeCopyResizing;
+    procedure TestVolumeCopyResizingMatchesReference;
     procedure TestVolumeCopyCropping;
     procedure TestVolumeShift;
     procedure TestVolumeRawPosAndPtr;
@@ -2141,6 +2142,55 @@ begin
   end;
 end;
 
+// CopyResizing is a nearest-neighbour gather; the destination is walked in
+// storage order, which must not change which source pixel each output takes.
+procedure TTestNeuralVolume.TestVolumeCopyResizingMatchesReference;
+var
+  Original, Resized: TNNetVolume;
+  RatioX, RatioY, InvRatioX, InvRatioY: TNeuralFloat;
+  I, CntX, CntY, CntD, OrigPosX, OrigPosY: integer;
+  NewSizeX, NewSizeY, Cnt: integer;
+begin
+  Original := TNNetVolume.Create(7, 5, 3);
+  Resized := TNNetVolume.Create(1, 1, 1);
+  try
+    RandSeed := 987;
+    for I := 0 to Original.Size - 1 do
+      Original.FData[I] := (Random - 0.5) * 10;
+    for Cnt := 0 to 3 do
+    begin
+      case Cnt of
+        0: begin NewSizeX := 13; NewSizeY := 11; end;  // upscale
+        1: begin NewSizeX := 3;  NewSizeY := 2;  end;  // downscale
+        2: begin NewSizeX := 13; NewSizeY := 2;  end;  // mixed
+        else begin NewSizeX := 1; NewSizeY := 1; end;  // degenerate
+      end;
+      Resized.CopyResizing(Original, NewSizeX, NewSizeY);
+      AssertEquals('SizeX', NewSizeX, Resized.SizeX);
+      AssertEquals('SizeY', NewSizeY, Resized.SizeY);
+      AssertEquals('Depth', Original.Depth, Resized.Depth);
+      RatioX := NewSizeX / Original.SizeX;
+      RatioY := NewSizeY / Original.SizeY;
+      InvRatioX := 1 / RatioX;
+      InvRatioY := 1 / RatioY;
+      for CntX := 0 to NewSizeX - 1 do
+      begin
+        OrigPosX := Min(Original.SizeX - 1, Round(CntX * InvRatioX));
+        for CntY := 0 to NewSizeY - 1 do
+        begin
+          OrigPosY := Min(Original.SizeY - 1, Round(CntY * InvRatioY));
+          for CntD := 0 to Original.Depth - 1 do
+            AssertEquals('Resized element',
+              Original[OrigPosX, OrigPosY, CntD], Resized[CntX, CntY, CntD], 0);
+        end;
+      end;
+    end;
+  finally
+    Original.Free;
+    Resized.Free;
+  end;
+end;
+
 procedure TTestNeuralVolume.TestVolumeCopyCropping;
 var
   Original, Cropped: TNNetVolume;
@@ -3934,7 +3984,9 @@ begin
     RandSeed := 4321;
     for I := 0 to Original.Size - 1 do
       Original.FData[I] := (Random - 0.5) * 20;
-    for pSize := 1 to 5 do
+    // pSize runs past twice the depth so the window-clamp ranges the
+    // implementation splits the depth axis into are each driven empty in turn.
+    for pSize := 1 to 21 do
     begin
       ReferenceLocalResponseDepth(Want, Original, pSize, 0.001 / 9.0, 0.75);
       Got.CalculateLocalResponseFromDepth(Original, Scratch, pSize, 0.001 / 9.0, 0.75);
