@@ -1730,6 +1730,9 @@ type
     procedure TestFakeQuantizeForwardDequantQuant;
     procedure TestFakeQuantizeSTEGradientCheck;
     procedure TestFakeQuantizeObserverAndRoundTrip;
+    // Byte-processing skip connection on an input depth that is not a multiple
+    // of 8 (added at the END to avoid disturbing the shared-RNG ordering).
+    procedure TestByteProcessingSkipUnalignedDepth;
   end;
 
 implementation
@@ -77457,6 +77460,80 @@ begin
     finally
       NN2.Free;
     end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestByteProcessingSkipUnalignedDepth;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, D, i: integer;
+  Residual: TNeuralFloat;
+
+  // The engine emits one bit per channel, decoded to 0 or +0.5 when the skip
+  // connection is on, so output minus input must land on one of those two
+  // values for every channel the input actually has.
+  function IsBitValue(V: TNeuralFloat): boolean;
+  begin
+    Result := (Abs(V) < 1e-5) or (Abs(V - 0.5) < 1e-5);
+  end;
+
+begin
+  // Depth 12 is not a multiple of 8, so the layers pad their output up to whole
+  // bytes (16 channels). The skip connection must still add input channel D to
+  // output channel D of the SAME position and leave the padding channels alone;
+  // a whole-volume add would misalign the columns and read past the input.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 12);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 12));
+    NN.AddLayer(TNNetByteProcessing.Create(0, 8, 40, 1));
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 1.0 + i * 3.0;
+    NN.Compute(Input);
+    AssertEquals('ByteProcessing padded output size', 16,
+      NN.GetLastLayer.Output.Size);
+    for i := 0 to 11 do
+      AssertTrue('ByteProcessing skip residual at ' + IntToStr(i) + ' = ' +
+        FloatToStr(NN.GetLastLayer.Output.Raw[i] - Input.Raw[i]),
+        IsBitValue(NN.GetLastLayer.Output.Raw[i] - Input.Raw[i]));
+    for i := 12 to 15 do
+      AssertTrue('ByteProcessing padding channel ' + IntToStr(i) + ' = ' +
+        FloatToStr(NN.GetLastLayer.Output.Raw[i]),
+        IsBitValue(NN.GetLastLayer.Output.Raw[i]));
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(2, 2, 12);
+  try
+    NN.AddLayer(TNNetInput.Create(2, 2, 12));
+    NN.AddLayer(TNNetPointwiseByteProcessing.Create(0, 8, 40, 1));
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := 1.0 + i * 3.0;
+    NN.Compute(Input);
+    AssertEquals('PointwiseByteProcessing padded output depth', 16,
+      NN.GetLastLayer.Output.Depth);
+    for X := 0 to 1 do
+      for Y := 0 to 1 do
+      begin
+        for D := 0 to 11 do
+        begin
+          Residual := NN.GetLastLayer.Output[X, Y, D] - Input[X, Y, D];
+          AssertTrue('PointwiseByteProcessing skip residual at (' +
+            IntToStr(X) + ',' + IntToStr(Y) + ',' + IntToStr(D) + ') = ' +
+            FloatToStr(Residual), IsBitValue(Residual));
+        end;
+        for D := 12 to 15 do
+          AssertTrue('PointwiseByteProcessing padding channel at (' +
+            IntToStr(X) + ',' + IntToStr(Y) + ',' + IntToStr(D) + ') = ' +
+            FloatToStr(NN.GetLastLayer.Output[X, Y, D]),
+            IsBitValue(NN.GetLastLayer.Output[X, Y, D]));
+      end;
   finally
     NN.Free;
     Input.Free;

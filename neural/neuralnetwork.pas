@@ -53206,7 +53206,11 @@ begin
   if FAddSkipConnection then
   begin
     FOutput.CopyAsBits(FByteOutput, 0, +0.5);
-    FOutput.Add(FPrevLayer.Output);
+    // The output is padded up to whole bytes, so it can be longer than the
+    // input: add only the elements the input actually has (bit J maps to input
+    // position J; the padding tail keeps the engine's bit alone).
+    TNNetVolume.Add(FOutput.GetRawPtr(0), FPrevLayer.FOutput.GetRawPtr(0),
+      FPrevLayer.FOutput.Size);
   end
   else FOutput.CopyAsBits(FByteOutput, -0.5, +0.5);
 end;
@@ -53382,12 +53386,16 @@ begin
       FPosOutput.CopyAsBits(FByteOutput, MinValue, +0.5);
       Move(FPosOutput.FData[0], FOutput.FData[OutBase],
         (OutDepthM1 + 1) * csNeuralFloatSize);
+      if FAddSkipConnection then
+      begin
+        // Per position: output channel D maps to input channel D. The output
+        // depth is rounded up to whole bytes, so a whole-volume Add would
+        // misalign the columns (and overrun the input) whenever the input depth
+        // is not a multiple of 8; the padding channels take no residual.
+        TNNetVolume.Add(FOutput.GetRawPtr(OutBase),
+          FPrevLayer.FOutput.GetRawPtr(PrevOutBase), FInDepth);
+      end;
     end;
-
-  if FAddSkipConnection then
-  begin
-    FOutput.Add(FPrevLayer.Output);
-  end;
 
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
