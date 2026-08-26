@@ -741,7 +741,7 @@ var
   var
     ElementPosition, J, MJ: integer;
   begin
-    if LocalNumberOfPreviousStates > csMaxTests then
+    if LocalNumberOfPreviousStates > FCS.MaxTests then
       MJ := FCS.MaxTests
     else
       MJ := LocalNumberOfPreviousStates;

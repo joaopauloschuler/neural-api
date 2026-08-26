@@ -45,6 +45,9 @@ type
     procedure TestOperandsBoundedByTheirOwnArray;
     // The operand-free opcodes run even when there is no action at all.
     procedure TestOperandFreeOpsWithoutActions;
+    // Equal-test creation stops at the configured MaxTests, not at the
+    // csMaxTests ceiling.
+    procedure TestEqualTestsRespectMaxTests;
   end;
 
 implementation
@@ -244,6 +247,47 @@ begin
   NextState := 0;
   AssertEquals('true without actions', 1,
     Engine.OperateAndTestOperation(Oper, 0, NextState));
+end;
+
+procedure TTestNeuralABFun.TestEqualTestsRespectMaxTests;
+var
+  Creator: TCreateValidOperations;
+  Settings: TCreateOperationSettings;
+  Actions, CurrentStates, NextStates, Errors: array of byte;
+  I: integer;
+begin
+  // Only equal tests, read from the action array: every equal test compares a
+  // value against the position it was read from, so it always holds and is
+  // always included. The operation count is therefore the loop bound itself.
+  Settings := csCreateOpSimplest;
+  Settings.AddBinaryTest := False;
+  Settings.AddTrueTest := False;
+  Settings.MaxTests := 5;
+  SetLength(Actions, 20);
+  SetLength(CurrentStates, 20);
+  SetLength(NextStates, 20);
+  SetLength(Errors, 20);
+  for I := 0 to 19 do
+  begin
+    Actions[I] := I + 1;
+    CurrentStates[I] := I + 1;
+    NextStates[I] := 0;
+    Errors[I] := 0;
+  end;
+
+  Creator.Load(Settings, Actions, CurrentStates, NextStates);
+  Creator.LoadCreationData(0);
+  Creator.Create(True, True, Errors);
+  AssertEquals('equal tests capped at MaxTests', integer(Settings.MaxTests),
+    Creator.GetCount());
+
+  // With more tests allowed than there are states, the state count is the cap.
+  Settings.MaxTests := csMaxTests;
+  Creator.Load(Settings, Actions, CurrentStates, NextStates);
+  Creator.LoadCreationData(0);
+  Creator.Create(True, True, Errors);
+  AssertEquals('equal tests capped at the state count', Length(Actions),
+    Creator.GetCount());
 end;
 
 initialization
