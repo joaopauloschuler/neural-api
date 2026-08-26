@@ -2327,10 +2327,13 @@ type
   // Output depth = input depth / 2. The layer emits the reparameterized
   // sample
   //   z = mu + sigma * eps,   sigma = exp(0.5 * log_var),   eps ~ N(0,1).
-  // eps is drawn ONCE per forward pass, FROZEN into FEps, and REUSED in the
-  // matching backward pass (exactly the fixed-noise pattern of
-  // TNNetGumbelSoftmax / TNNetDropout: stochastic forward, deterministic
-  // gradient that reuses the stored draw). Sampling is ON by default
+  // eps is drawn ONCE per forward pass and the backward Jacobian it produces,
+  // 0.5 * sigma * eps, is FROZEN into FDzDLogVar and REUSED in the matching
+  // backward pass (exactly the fixed-noise pattern of TNNetGumbelSoftmax /
+  // TNNetDropout: stochastic forward, deterministic gradient that reuses the
+  // stored draw). Freezing the whole product rather than eps alone keeps the
+  // exponential on the forward pass only and turns both backward halves into
+  // contiguous bulk passes. Sampling is ON by default
   // (Enabled = true) since a VAE samples during both training and Compute;
   // EnableDropouts does NOT toggle this layer. Set Enabled := false manually
   // for deterministic mean-only inference: the layer emits z = mu (eps forced
@@ -2354,7 +2357,9 @@ type
   TNNetGaussianReparameterize = class(TNNetLayer)
   protected
     FEnabled: boolean;
-    FEps: TNNetVolume; // frozen N(0,1) draw, sampled in Compute, reused in Backpropagate
+    // Frozen dz/dlog_var = 0.5*sigma*eps, built in Compute from that pass's
+    // N(0,1) draw and consumed as-is by Backpropagate.
+    FDzDLogVar: TNNetVolume;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
   public
     constructor Create(); override;
@@ -2364,7 +2369,8 @@ type
     // Sampling toggle. true (default) = stochastic z = mu + sigma*eps;
     // false = deterministic mean-only inference z = mu.
     property Enabled: boolean read FEnabled write FEnabled;
-    property Eps: TNNetVolume read FEps;
+    // The frozen backward Jacobian 0.5*sigma*eps of the last forward pass.
+    property DzDLogVar: TNNetVolume read FDzDLogVar;
   end;
 
   /// Standard-normal-prior KL divergence loss head for a continuous-latent VAE.
@@ -26286,33 +26292,60 @@ begin
           end;
           TNNetVolume.Sigmoid(sigPtr, sigPtr, HalfDepth);
           gateIdx := basePrev0;
-        end;
-        for D := 0 to MaxD do
+          // #20: HasScratch is fixed for the whole call, so the accumulate loop
+          // is split rather than re-tested per element -- the scratch variant
+          // then carries no exponential at all.
+          for D := 0 to MaxD do
+          begin
+            upIdx   := gateIdx + 1;
+            gateRaw := FPrevLayer.FOutput.FData[gateIdx];
+            upRaw   := FPrevLayer.FOutput.FData[upIdx];
+            gate := gateRaw;
+            up   := upRaw;
+            if gate > limit then gate := limit;
+            if up >  limit then up :=  limit;
+            if up < -limit then up := -limit;
+            sigmoidVal := sigPtr^[D];
+            glu := gate * sigmoidVal;
+            // d glu / d gate = sigmoid + gate*alpha*sigmoid*(1-sigmoid).
+            gluDeriv := sigmoidVal +
+              gate * alpha * sigmoidVal * (1 - sigmoidVal);
+            err := FOutputError.FData[baseErr0 + D];
+            // out = (up+1)*glu. Clamp regions have zero local derivative.
+            if (gateRaw <= limit) then
+              FPrevLayer.FOutputError.FData[gateIdx] :=
+                FPrevLayer.FOutputError.FData[gateIdx] + err * (up + 1) * gluDeriv;
+            if (upRaw >= -limit) and (upRaw <= limit) then
+              FPrevLayer.FOutputError.FData[upIdx] :=
+                FPrevLayer.FOutputError.FData[upIdx] + err * glu;
+            Inc(gateIdx, 2);
+          end;
+        end
+        else
         begin
-          upIdx   := gateIdx + 1;
-          gateRaw := FPrevLayer.FOutput.FData[gateIdx];
-          upRaw   := FPrevLayer.FOutput.FData[upIdx];
-          gate := gateRaw;
-          up   := upRaw;
-          if gate > limit then gate := limit;
-          if up >  limit then up :=  limit;
-          if up < -limit then up := -limit;
-          if HasScratch
-            then sigmoidVal := sigPtr^[D]
-            else sigmoidVal := 1 / (1 + NeuralExp(-alpha * gate));
-          glu := gate * sigmoidVal;
-          // d glu / d gate = sigmoid + gate*alpha*sigmoid*(1-sigmoid).
-          gluDeriv := sigmoidVal +
-            gate * alpha * sigmoidVal * (1 - sigmoidVal);
-          err := FOutputError.FData[baseErr0 + D];
-          // out = (up+1)*glu. Clamp regions have zero local derivative.
-          if (gateRaw <= limit) then
-            FPrevLayer.FOutputError.FData[gateIdx] :=
-              FPrevLayer.FOutputError.FData[gateIdx] + err * (up + 1) * gluDeriv;
-          if (upRaw >= -limit) and (upRaw <= limit) then
-            FPrevLayer.FOutputError.FData[upIdx] :=
-              FPrevLayer.FOutputError.FData[upIdx] + err * glu;
-          Inc(gateIdx, 2);
+          for D := 0 to MaxD do
+          begin
+            upIdx   := gateIdx + 1;
+            gateRaw := FPrevLayer.FOutput.FData[gateIdx];
+            upRaw   := FPrevLayer.FOutput.FData[upIdx];
+            gate := gateRaw;
+            up   := upRaw;
+            if gate > limit then gate := limit;
+            if up >  limit then up :=  limit;
+            if up < -limit then up := -limit;
+            sigmoidVal := 1 / (1 + NeuralExp(-alpha * gate));
+            glu := gate * sigmoidVal;
+            gluDeriv := sigmoidVal +
+              gate * alpha * sigmoidVal * (1 - sigmoidVal);
+            err := FOutputError.FData[baseErr0 + D];
+            if (gateRaw <= limit) then
+              FPrevLayer.FOutputError.FData[gateIdx] :=
+                FPrevLayer.FOutputError.FData[gateIdx] + err * (up + 1) * gluDeriv;
+            if (upRaw >= -limit) and (upRaw <= limit) then
+              FPrevLayer.FOutputError.FData[upIdx] :=
+                FPrevLayer.FOutputError.FData[upIdx] + err * glu;
+            Inc(gateIdx, 2);
+          end;
         end;
       end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -26420,6 +26453,11 @@ begin
           bPtr := FPrevLayer.FOutput.GetRawPtr(basePrev0 + HalfDepth);
           sigPtr := FOutputErrorDeriv.GetRawPtr(baseErr0);
           TNNetVolume.Sigmoid(sigPtr, bPtr, HalfDepth);
+          // dy/da = sigmoid(b), so the A half is a contiguous multiply-
+          // accumulate over the whole row (rule #13). The B half keeps its
+          // per-element `a` factor and stays scalar below.
+          TNNetVolume.MulAdd(FPrevLayer.FOutputError.GetRawPtr(basePrev0),
+            FOutputError.GetRawPtr(baseErr0), sigPtr, HalfDepth);
           for D := 0 to MaxD do
           begin
             basePrev := basePrev0 + D;
@@ -26429,8 +26467,6 @@ begin
             // sigmoid'(b) = sigmoid * (1 - sigmoid)
             sigmoidDeriv := sigmoidVal * (1 - sigmoidVal);
             err := FOutputError.FData[baseErr0 + D];
-            FPrevLayer.FOutputError.FData[basePrev] :=
-              FPrevLayer.FOutputError.FData[basePrev] + err * sigmoidVal;
             FPrevLayer.FOutputError.FData[basePrevH] :=
               FPrevLayer.FOutputError.FData[basePrevH] + err * a * sigmoidDeriv;
           end;
@@ -26594,7 +26630,7 @@ end;
 constructor TNNetGaussianReparameterize.Create();
 begin
   inherited Create();
-  FEps := TNNetVolume.Create();
+  FDzDLogVar := TNNetVolume.Create();
   // Sampling is ON by default (a VAE samples during both training and normal
   // Compute). EnableDropouts does NOT touch this layer; set Enabled := false
   // manually for deterministic mean-only inference (z = mu).
@@ -26603,7 +26639,7 @@ end;
 
 destructor TNNetGaussianReparameterize.Destroy();
 begin
-  FEps.Free;
+  FDzDLogVar.Free;
   inherited Destroy();
 end;
 
@@ -26618,8 +26654,8 @@ begin
   FOutput.ReSize(pPrevLayer.FOutput.SizeX, pPrevLayer.FOutput.SizeY,
     pPrevLayer.FOutput.Depth div 2);
   SetOutputErrorSize(FOutput);
-  // Frozen-noise buffer mirrors the output shape (one eps per latent unit).
-  FEps.ReSize(FOutput);
+  // Frozen-noise buffer mirrors the output shape (one draw per latent unit).
+  FDzDLogVar.ReSize(FOutput);
 end;
 
 procedure TNNetGaussianReparameterize.Compute();
@@ -26627,7 +26663,7 @@ var
   StartTime: double;
   MaxX, MaxY, MaxD: integer;
   X, Y, D, HalfDepth, basePrev0, baseOut0, idxPrev, idxOut: integer;
-  mu, logVar, sigma, e: TNeuralFloat;
+  mu, logVar, sigma, e, sigmaEps: TNeuralFloat;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -26639,7 +26675,7 @@ begin
     for X := 0 to MaxX do
     begin
       basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
-      // FEps mirrors FOutput's shape (#13 equal-dims => one base indexes both).
+      // FDzDLogVar mirrors FOutput's shape (#13 equal-dims => one base indexes both).
       baseOut0  := FOutput.GetRawPos(X, Y);
       // #5: FEnabled is invariant for the whole call -- hoist above the D loop.
       if FEnabled then
@@ -26650,19 +26686,23 @@ begin
           idxOut  := baseOut0 + D;            // #4: form once, index both volumes
           mu     := FPrevLayer.FOutput.FData[idxPrev];
           logVar := FPrevLayer.FOutput.FData[idxPrev + HalfDepth];
-          // Draw eps ~ N(0,1) and FREEZE it for the matching backward pass,
-          // exactly like TNNetGumbelSoftmax freezes its Gumbel draw.
-          e := FEps.RandomGaussianValue();
+          // Draw eps ~ N(0,1) and FREEZE the backward Jacobian it implies,
+          // dz/dlog_var = 0.5*sigma*eps, exactly like TNNetGumbelSoftmax
+          // freezes its Gumbel draw. The output reuses the same sigma*eps
+          // product, so the exponential is paid once per element per pass.
+          e := FDzDLogVar.RandomGaussianValue();
           sigma := NeuralExp(0.5 * logVar);
-          FEps.FData[idxOut] := e;
-          FOutput.FData[idxOut] := mu + sigma * e;
+          sigmaEps := sigma * e;
+          FDzDLogVar.FData[idxOut] := 0.5 * sigmaEps;
+          FOutput.FData[idxOut] := mu + sigmaEps;
         end;
       end
       else
       begin
-        // #13: deterministic inference -- eps = 0 and output = the contiguous
-        // mu half of the previous layer's output.
-        FillChar(FEps.FData[baseOut0], HalfDepth * csNeuralFloatSize, 0);
+        // #13: deterministic inference -- z = mu carries no log_var dependency,
+        // so dz/dlog_var is zero and the output is the contiguous mu half of
+        // the previous layer's output.
+        FillChar(FDzDLogVar.FData[baseOut0], HalfDepth * csNeuralFloatSize, 0);
         Move(FPrevLayer.FOutput.FData[basePrev0], FOutput.FData[baseOut0],
           HalfDepth * csNeuralFloatSize);
       end;
@@ -26673,9 +26713,8 @@ end;
 procedure TNNetGaussianReparameterize.Backpropagate();
 var
   StartTime: double;
-  MaxX, MaxY, MaxD: integer;
-  X, Y, D, HalfDepth, basePrev0, baseErr0, idxHi, idxLo: integer;
-  logVar, sigma, e, g: TNeuralFloat;
+  MaxX, MaxY: integer;
+  X, Y, HalfDepth, basePrev0, baseErr0: integer;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -26687,30 +26726,24 @@ begin
     HalfDepth := FOutput.Depth;
     MaxX := FOutput.SizeX - 1;
     MaxY := FOutput.SizeY - 1;
-    MaxD := HalfDepth - 1;
     for Y := 0 to MaxY do
       for X := 0 to MaxX do
       begin
         basePrev0 := FPrevLayer.FOutput.GetRawPos(X, Y);
-        // FOutputError and FEps share FOutput's shape (#13 equal-dims => one base).
+        // FOutputError and FDzDLogVar share FOutput's shape (#13 equal-dims =>
+        // one base indexes both).
         baseErr0  := FOutputError.GetRawPos(X, Y);
         // dz/dmu = 1 : the mu half is a pure contiguous accumulate (rule #13)
         TNNetVolume.Add(
           FPrevLayer.FOutputError.GetRawPtr(basePrev0),
           FOutputError.GetRawPtr(baseErr0), HalfDepth);
-        // dlogvar half stays scalar (per-element sigma=NeuralExp, e)
-        for D := 0 to MaxD do
-        begin
-          idxHi := basePrev0 + D + HalfDepth; // #4: formed once per iteration
-          idxLo := baseErr0 + D; // #4: FOutputError/FEps share output shape
-          g := FOutputError.FData[idxLo];
-          logVar := FPrevLayer.FOutput.FData[idxHi];
-          sigma := NeuralExp(0.5 * logVar);
-          e := FEps.FData[idxLo]; // reuse the FROZEN forward draw
-          // dz/dlog_var = 0.5 * sigma * eps
-          FPrevLayer.FOutputError.FData[idxHi] :=
-            FPrevLayer.FOutputError.FData[idxHi] + g * 0.5 * sigma * e;
-        end;
+        // dz/dlog_var was frozen by Compute, so the log_var half is a
+        // contiguous multiply-accumulate too (rule #13) -- no exponential and
+        // no log_var reload here.
+        TNNetVolume.MulAdd(
+          FPrevLayer.FOutputError.GetRawPtr(basePrev0 + HalfDepth),
+          FOutputError.GetRawPtr(baseErr0),
+          FDzDLogVar.GetRawPtr(baseErr0), HalfDepth);
       end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;

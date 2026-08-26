@@ -1450,6 +1450,8 @@ type
     procedure TestGumbelSoftmaxHardForwardIsOneHot;
     procedure TestGumbelSoftmaxGradientCheck;
     procedure TestGaussianReparameterizeGradientCheck;
+    procedure TestGaussianReparameterizeWideGradientCheck;
+    procedure TestGaussianReparameterizeDisabledGradient;
     procedure TestVAEKLDivergenceGradientCheck;
     procedure TestGumbelSoftmaxSerializationRoundTrip;
     procedure TestGumbelSoftmaxSetTemperature;
@@ -27698,6 +27700,130 @@ begin
     NN.Free;
     Input.Free;
     InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGaussianReparameterizeWideGradientCheck;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  epsilon, lossPlus, lossMinus, numericalGrad, analyticalGrad: TNeuralFloat;
+  i: integer;
+
+  function ComputeLoss(AInput: TNNetVolume): TNeuralFloat;
+  var
+    k: integer;
+    diff: TNeuralFloat;
+  begin
+    RandSeed := 987654;
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  // Wide companion to TestGaussianReparameterizeGradientCheck: input depth 26 =
+  // 13 latents, so both backward halves run a full vector block AND a
+  // remainder, unlike the 2-latent case which is remainder-only. Same
+  // fixed-noise discipline: RandSeed is reset before every forward so the
+  // frozen 0.5*sigma*eps the backward reuses matches the sampled forward.
+  RandSeed := 987654;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 26);
+  InputPlus := TNNetVolume.Create(1, 1, 26);
+  epsilon := 1e-3;
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 26, 1));
+    NN.AddLayer(TNNetGaussianReparameterize.Create());
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.41) * 0.5 + 0.15; // keep log_var modest
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.07 * (i + 1);
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      RandSeed := 987654;
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('GaussianReparameterize wide gradient check at ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) +
+        ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 1e-2);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestGaussianReparameterizeDisabledGradient;
+var
+  NN: TNNet;
+  Layer: TNNetGaussianReparameterize;
+  Input, Desired: TNNetVolume;
+  i, HalfD: integer;
+begin
+  // Mean-only inference (Enabled = false): z = mu exactly, so the mu half must
+  // receive the incoming gradient unchanged and the log_var half must receive
+  // nothing at all. This pins the deterministic branch, whose frozen
+  // dz/dlog_var row is zero-filled rather than sampled.
+  HalfD := 13;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(1, 1, 2 * HalfD);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 2 * HalfD, 1));
+    Layer := TNNetGaussianReparameterize(
+      NN.AddLayer(TNNetGaussianReparameterize.Create()));
+    Layer.Enabled := false;
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    Desired := TNNetVolume.Create();
+    Desired.ReSize(NN.GetLastLayer.Output);
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.33) * 0.5;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := 0.05 * (i + 1);
+
+    NN.Compute(Input);
+    for i := 0 to HalfD - 1 do
+      AssertEquals('Disabled reparameterize emits mu at ' + IntToStr(i),
+        Input.Raw[i], NN.GetLastLayer.Output.Raw[i], 0.0000001);
+
+    NN.Layers[0].OutputError.Fill(0);
+    NN.Backpropagate(Desired);
+    for i := 0 to HalfD - 1 do
+    begin
+      AssertEquals('Disabled reparameterize dL/dmu at ' + IntToStr(i),
+        Layer.OutputError.Raw[i], NN.Layers[0].OutputError.Raw[i], 0.0000001);
+      AssertEquals('Disabled reparameterize dL/dlog_var at ' + IntToStr(i),
+        0.0, NN.Layers[0].OutputError.Raw[i + HalfD], 0.0000001);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
     Desired.Free;
   end;
 end;
