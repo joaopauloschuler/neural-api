@@ -631,6 +631,7 @@ type
     procedure TestT2IAdapterShortConvInBias;
     procedure TestIPAdapterConfigFromJSONFile;
     procedure TestIPAdapterParity;
+    procedure TestIPAdapterTorchBin;
     procedure TestVaeRoundTrip;
     procedure TestVqModelEncodeParity;
     procedure TestVqModelDecodeParity;
@@ -25752,6 +25753,86 @@ begin
     Output.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// IP-Adapter import from the torch-pickle checkpoint. The real
+// ip-adapter_sd15.bin groups its tensors in nested sub-dicts ('image_proj',
+// 'ip_adapter') instead of the flat dotted names of the safetensors export;
+// tests/fixtures/tiny_ip_adapter.bin is the same pico checkpoint saved that
+// way. The reader must rejoin the levels with a dot, so the .bin-built net has
+// to reproduce the safetensors-built net exactly on the same inputs.
+procedure TTestNeuralPretrained.TestIPAdapterTorchBin;
+var
+  Reader: TNNetSafeTensorsReader;
+  NNBin, NNSafe: TNNet;
+  Config, BinConfig: TIPAdapterConfig;
+  Hidden, Text, ImageEmbed, OutBin, OutSafe: TNNetVolume;
+  SCnt, DCnt: integer;
+  MaxDiff, Diff: double;
+begin
+  RandSeed := 424242;
+  Reader := CreatePretrainedTensorReader(FixturePath('tiny_ip_adapter.bin'));
+  try
+    AssertTrue('image_proj.proj.weight flattened',
+      Reader.HasTensor('image_proj.proj.weight'));
+    AssertTrue('ip_adapter.1.to_k_ip.weight flattened',
+      Reader.HasTensor('ip_adapter.1.to_k_ip.weight'));
+    AssertTrue('unet.attn2.to_q.weight flattened',
+      Reader.HasTensor('unet.attn2.to_q.weight'));
+    AssertEquals('image_proj.proj.weight rows', 24,
+      Reader.DimSize('image_proj.proj.weight', 0));
+    AssertEquals('image_proj.proj.weight cols', 10,
+      Reader.DimSize('image_proj.proj.weight', 1));
+  finally
+    Reader.Free;
+  end;
+
+  NNBin := nil;
+  NNSafe := nil;
+  Hidden := TNNetVolume.Create;
+  Text := TNNetVolume.Create;
+  ImageEmbed := TNNetVolume.Create;
+  OutBin := TNNetVolume.Create;
+  OutSafe := TNNetVolume.Create;
+  try
+    NNSafe := BuildIPAdapterFromSafeTensors(
+      FixturePath('tiny_ip_adapter.safetensors'), Config,
+      {pTrainable=}true, FixturePath('tiny_ip_adapter_config.json'));
+    NNBin := BuildIPAdapterFromSafeTensors(
+      FixturePath('tiny_ip_adapter.bin'), BinConfig,
+      {pTrainable=}true, FixturePath('tiny_ip_adapter_config.json'));
+    AssertEquals('same layer count', NNSafe.CountLayers(), NNBin.CountLayers());
+
+    Hidden.ReSize(Config.HiddenTokens, 1, Config.Channels);
+    for SCnt := 0 to Hidden.Size - 1 do
+      Hidden.FData[SCnt] := ((SCnt * 7) mod 11 - 5) / 8;
+    Text.ReSize(Config.TextSeqLen, 1, Config.CrossAttentionDim);
+    for SCnt := 0 to Text.Size - 1 do
+      Text.FData[SCnt] := ((SCnt * 5) mod 13 - 6) / 16;
+    ImageEmbed.ReSize(Config.ClipEmbeddingsDim, 1, 1);
+    for SCnt := 0 to ImageEmbed.Size - 1 do
+      ImageEmbed.FData[SCnt] := ((SCnt * 3) mod 7 - 3) / 4;
+
+    IPAdapterCrossAttention(NNSafe, Config, Hidden, Text, ImageEmbed, OutSafe);
+    IPAdapterCrossAttention(NNBin, BinConfig, Hidden, Text, ImageEmbed, OutBin);
+    AssertEquals('same output size', OutSafe.Size, OutBin.Size);
+    MaxDiff := 0;
+    for DCnt := 0 to OutSafe.Size - 1 do
+    begin
+      Diff := Abs(OutSafe.FData[DCnt] - OutBin.FData[DCnt]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('torch .bin vs safetensors: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be 0', MaxDiff = 0);
+  finally
+    OutSafe.Free;
+    OutBin.Free;
+    ImageEmbed.Free;
+    Text.Free;
+    Hidden.Free;
+    NNBin.Free;
+    NNSafe.Free;
   end;
 end;
 

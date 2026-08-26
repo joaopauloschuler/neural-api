@@ -10379,6 +10379,10 @@ function IPAdapterConfigToString(const Config: TIPAdapterConfig): string;
 function BuildIPAdapter(Reader: TNNetSafeTensorsReader;
   const Config: TIPAdapterConfig; pTrainable: boolean = true): TNNet;
 
+// FileName is any format CreatePretrainedTensorReader dispatches on
+// (.safetensors or the canonical ip-adapter_sd15.bin torch pickle, whose
+// nested 'image_proj'/'ip_adapter' sub-dicts the torch reader flattens into
+// the same dotted names the safetensors export uses).
 function BuildIPAdapterFromSafeTensorsEx(const FileName: string;
   const Config: TIPAdapterConfig; pTrainable: boolean = true): TNNet;
 
@@ -69348,7 +69352,7 @@ function BuildIPAdapterFromSafeTensorsEx(const FileName: string;
 var
   Reader: TNNetSafeTensorsReader;
 begin
-  Reader := TNNetSafeTensorsReader.Create(FileName);
+  Reader := CreatePretrainedTensorReader(FileName);
   try
     Result := BuildIPAdapter(Reader, Config, pTrainable);
   finally
