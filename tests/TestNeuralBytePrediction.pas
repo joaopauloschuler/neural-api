@@ -37,6 +37,9 @@ type
     procedure TestClassifierAddStateReturnsIndex;
     // Past the NumStates capacity AddState refuses instead of writing past the end.
     procedure TestClassifierAddStateBeyondCapacity;
+    // EvolveNeuronGroupAtPos stops at the first improving mutation and reports
+    // how many attempts that took, or -1 when the budget of 10 ran out.
+    procedure TestClassifierEvolveReturnsAttemptCount;
   end;
 
 implementation
@@ -128,6 +131,48 @@ begin
   AssertEquals('Only slot', 0, Classifier.AddState(0, State));
   AssertEquals('One past the capacity', -1, Classifier.AddState(1, State));
   AssertEquals('Still refused afterwards', -1, Classifier.AddState(1, State));
+end;
+
+procedure TTestNeuralBytePrediction.TestClassifierEvolveReturnsAttemptCount;
+var
+  Classifier: TClassifier;
+  State: array[0..3] of byte;
+  StateCount, Attempts, ImprovedCnt: integer;
+  OldSeed: longint;
+begin
+  OldSeed := RandSeed;
+  RandSeed := 20260826;
+  try
+    Classifier.Init({pZerosIncluded=}False, {operationLayerSize=}8,
+      {pNumberOfSearches=}4);
+    Classifier.AddClassifier({NumClasses=}2, {NumStates=}16);
+
+    // The label is a copy of the first action, so a single binary test on it is
+    // enough for a mutation to find a real improvement.
+    for StateCount := 0 to 15 do
+    begin
+      State[0] := StateCount and 1;
+      State[1] := (StateCount shr 1) and 1;
+      State[2] := (StateCount shr 2) and 1;
+      State[3] := (StateCount shr 3) and 1;
+      Classifier.AddState(State[0], State);
+    end;
+
+    ImprovedCnt := 0;
+    for StateCount := 0 to 19 do
+    begin
+      Classifier.CreateRandomNeuronGroup({neuronpos=}0, {pClass=}1);
+      Attempts := Classifier.EvolveNeuronGroupAtPos(0);
+      AssertTrue('Evolve result is -1 or an attempt number in 1..10',
+        (Attempts = -1) or ((Attempts >= 1) and (Attempts <= 10)));
+      if Attempts > 0 then Inc(ImprovedCnt);
+    end;
+
+    // With a learnable label the search has to succeed at least once.
+    AssertTrue('At least one evolution improved the group', ImprovedCnt > 0);
+  finally
+    RandSeed := OldSeed;
+  end;
 end;
 
 initialization

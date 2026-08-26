@@ -416,12 +416,14 @@ begin
 
     if (NewScore > BaseScore) and (Mutaded.CorrectNeuronPredictionCnt > FCS.MinSampleForPrediction) then
     begin
+      // First-improvement hill climbing: the first mutation that beats the
+      // current score is accepted and the search stops. Result carries the
+      // number of attempts it took, or -1 when the budget ran out unimproved.
       NG := Mutaded;
       Result := MutationCount;
       //WriteLn(' Better: ', Mutaded.CorrectNeuronPredictionCnt,'x',
         //NewScore:6:4, ' Exit@: ', MutationCount);
-      BaseScore := NewScore;
-      if (MutationCount>0) then exit;
+      exit;
     end;
   end;
   //WriteLn(' Not Found!!!');
