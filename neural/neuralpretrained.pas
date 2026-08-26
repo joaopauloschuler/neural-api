@@ -69254,97 +69254,107 @@ begin
   HeadDimM1 := HeadDim - 1;
   AttnPrefix := 'unet.attn2.';
   NN := TNNet.Create;
-  SetLength(TxtHeads, Heads);
-  SetLength(ImgHeads, Heads);
-  SetLength(QChannels, HeadDim);
+  try
+    SetLength(TxtHeads, Heads);
+    SetLength(ImgHeads, Heads);
+    SetLength(QChannels, HeadDim);
 
-  // input0 = UNet hidden state (Q source); input1 = text states; input2 = the
-  // pooled CLIP image embedding (single token).
-  // input0 (TNNetInput #0) = UNet hidden state tokens (SizeX=HiddenTokens,1,d);
-  // #1 = text-state tokens; #2 = the pooled CLIP image embedding (single
-  // token). Built in that order so the Nth-input accessors resolve positionally
-  // (mirrors the SD UNet / ControlNet input convention). Inputs are already in
-  // (SeqLen,1,Depth) token shape -- no reshape needed for the attention path.
-  HiddenIn := NN.AddLayer(TNNetInput.Create(Config.HiddenTokens, 1, d));
-  TextIn := NN.AddLayer(TNNetInput.Create(Config.TextSeqLen, 1, Cross));
-  ImgEmbIn := NN.AddLayer(TNNetInput.Create(Config.ClipEmbeddingsDim, 1, 1));
+    // input0 = UNet hidden state (Q source); input1 = text states; input2 = the
+    // pooled CLIP image embedding (single token).
+    // input0 (TNNetInput #0) = UNet hidden state tokens (SizeX=HiddenTokens,1,d);
+    // #1 = text-state tokens; #2 = the pooled CLIP image embedding (single
+    // token). Built in that order so the Nth-input accessors resolve positionally
+    // (mirrors the SD UNet / ControlNet input convention). Inputs are already in
+    // (SeqLen,1,Depth) token shape -- no reshape needed for the attention path.
+    HiddenIn := NN.AddLayer(TNNetInput.Create(Config.HiddenTokens, 1, d));
+    TextIn := NN.AddLayer(TNNetInput.Create(Config.TextSeqLen, 1, Cross));
+    ImgEmbIn := NN.AddLayer(TNNetInput.Create(Config.ClipEmbeddingsDim, 1, 1));
 
-  // ---- image_proj (diffusers ImageProjModel): Linear (clip -> N*cross, WITH
-  //      bias) -> reshape to N tokens of dim cross -> LayerNorm. ----
-  ImgProj := NN.AddLayerAfter(
-    TNNetFullConnectLinear.Create(Config.NumImageTokens * Cross).
-      SetTrainable(pTrainable), ImgEmbIn);
-  NN.AddLayer(TNNetReshape.Create(Config.NumImageTokens, 1, Cross));
-  ImgTokens := NN.AddLayer(
-    TNNetTokenLayerNorm.Create().SetTrainable(pTrainable));
+    // ---- image_proj (diffusers ImageProjModel): Linear (clip -> N*cross, WITH
+    //      bias) -> reshape to N tokens of dim cross -> LayerNorm. ----
+    ImgProj := NN.AddLayerAfter(
+      TNNetFullConnectLinear.Create(Config.NumImageTokens * Cross).
+        SetTrainable(pTrainable), ImgEmbIn);
+    NN.AddLayer(TNNetReshape.Create(Config.NumImageTokens, 1, Cross));
+    ImgTokens := NN.AddLayer(
+      TNNetTokenLayerNorm.Create().SetTrainable(pTrainable));
 
-  // ---- decoupled cross-attention (the SAME multi-head construction the SD
-  //      UNet cross-attn uses, with the EXTRA image K/V tapped in). ----
-  QProj := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(d, {SuppressBias=}1).SetTrainable(pTrainable),
-    HiddenIn);
-  KTxt := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(d, {SuppressBias=}1).SetTrainable(pTrainable),
-    TextIn);
-  VTxt := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(d, {SuppressBias=}1).SetTrainable(pTrainable),
-    TextIn);
-  KImg := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(d, {SuppressBias=}1).SetTrainable(pTrainable),
-    ImgTokens);
-  VImg := NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(d, {SuppressBias=}1).SetTrainable(pTrainable),
-    ImgTokens);
-  for hh := 0 to HeadsM1 do
-  begin
-    for dd := 0 to HeadDimM1 do QChannels[dd] := hh * HeadDim + dd;
-    QSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), QProj);
-    KTxtSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), KTxt);
-    VTxtSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), VTxt);
-    KImgSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), KImg);
-    VImgSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), VImg);
-    KVTxtPack := NN.AddLayer(TNNetDeepConcat.Create([KTxtSlice, VTxtSlice]));
-    TxtHeads[hh] := NN.AddLayerAfter(
-      TNNetCrossAttention.Create(HeadDim, {CausalMask=}false, KVTxtPack), QSlice);
-    KVImgPack := NN.AddLayer(TNNetDeepConcat.Create([KImgSlice, VImgSlice]));
-    ImgHeads[hh] := NN.AddLayerAfter(
-      TNNetCrossAttention.Create(HeadDim, {CausalMask=}false, KVImgPack), QSlice);
+    // ---- decoupled cross-attention (the SAME multi-head construction the SD
+    //      UNet cross-attn uses, with the EXTRA image K/V tapped in). ----
+    QProj := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(d, {SuppressBias=}1).SetTrainable(pTrainable),
+      HiddenIn);
+    KTxt := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(d, {SuppressBias=}1).SetTrainable(pTrainable),
+      TextIn);
+    VTxt := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(d, {SuppressBias=}1).SetTrainable(pTrainable),
+      TextIn);
+    KImg := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(d, {SuppressBias=}1).SetTrainable(pTrainable),
+      ImgTokens);
+    VImg := NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(d, {SuppressBias=}1).SetTrainable(pTrainable),
+      ImgTokens);
+    for hh := 0 to HeadsM1 do
+    begin
+      for dd := 0 to HeadDimM1 do QChannels[dd] := hh * HeadDim + dd;
+      QSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), QProj);
+      KTxtSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), KTxt);
+      VTxtSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), VTxt);
+      KImgSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), KImg);
+      VImgSlice := NN.AddLayerAfter(TNNetSplitChannels.Create(QChannels), VImg);
+      KVTxtPack := NN.AddLayer(TNNetDeepConcat.Create([KTxtSlice, VTxtSlice]));
+      TxtHeads[hh] := NN.AddLayerAfter(
+        TNNetCrossAttention.Create(HeadDim, {CausalMask=}false, KVTxtPack), QSlice);
+      KVImgPack := NN.AddLayer(TNNetDeepConcat.Create([KImgSlice, VImgSlice]));
+      ImgHeads[hh] := NN.AddLayerAfter(
+        TNNetCrossAttention.Create(HeadDim, {CausalMask=}false, KVImgPack), QSlice);
+    end;
+    TxtHead := NN.AddLayer(TNNetDeepConcat.Create(TxtHeads));
+    ImgHead := NN.AddLayer(TNNetDeepConcat.Create(ImgHeads));
+    // image stream scaled by the fixed conditioning_scale, then summed with text.
+    ScaledImg := NN.AddLayerAfter(
+      TNNetMulByConstant.Create(Config.ConditioningScale), ImgHead);
+    Combined := NN.AddLayer(TNNetSum.Create([TxtHead, ScaledImg]));
+    // shared to_out.0 (biased) over the combined per-head output.
+    NN.AddLayerAfter(
+      TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), Combined);
+
+    // The wiring layers (inputs, slices, concats, attention, sum) carry no
+    // per-layer SetTrainable, so an inference net frees their training volumes
+    // here.
+    if not pTrainable then NN.SetTrainable();
+
+    // ---- weight loading ----
+    // image_proj.proj: Linear (clip -> N*cross) WITH bias.
+    LoadLlamaLinearWeights(Reader, ImgProj, 'image_proj.proj.weight',
+      Config.ClipEmbeddingsDim, Config.NumImageTokens * Cross, 0, -1, 0,
+      'image_proj.proj.bias');
+    LoadLayerNormWeights(Reader, ImgTokens,
+      'image_proj.norm.weight', 'image_proj.norm.bias', Cross);
+    // base UNet attn2 (shared Q + text K/V + out), all bias-free except to_out.0.
+    LoadLlamaLinearWeights(Reader, QProj, AttnPrefix + 'to_q.weight', d, d, 0, -1, 0, '');
+    LoadLlamaLinearWeights(Reader, KTxt, AttnPrefix + 'to_k.weight', Cross, d, 0, -1, 0, '');
+    LoadLlamaLinearWeights(Reader, VTxt, AttnPrefix + 'to_v.weight', Cross, d, 0, -1, 0, '');
+    LoadLlamaLinearWeights(Reader, NN.GetLastLayer(),
+      AttnPrefix + 'to_out.0.weight', d, d, 0, -1, 0, AttnPrefix + 'to_out.0.bias');
+    // ip_adapter extra K/V (bias-free).
+    LoadLlamaLinearWeights(Reader, KImg,
+      'ip_adapter.' + IntToStr(Config.AttnIndex) + '.to_k_ip.weight',
+      Cross, d, 0, -1, 0, '');
+    LoadLlamaLinearWeights(Reader, VImg,
+      'ip_adapter.' + IntToStr(Config.AttnIndex) + '.to_v_ip.weight',
+      Cross, d, 0, -1, 0, '');
+
+    SetLength(TxtHeads, 0);
+    SetLength(ImgHeads, 0);
+    SetLength(QChannels, 0);
+    Result := NN;
+  except
+    NN.Free;
+    raise;
   end;
-  TxtHead := NN.AddLayer(TNNetDeepConcat.Create(TxtHeads));
-  ImgHead := NN.AddLayer(TNNetDeepConcat.Create(ImgHeads));
-  // image stream scaled by the fixed conditioning_scale, then summed with text.
-  ScaledImg := NN.AddLayerAfter(
-    TNNetMulByConstant.Create(Config.ConditioningScale), ImgHead);
-  Combined := NN.AddLayer(TNNetSum.Create([TxtHead, ScaledImg]));
-  // shared to_out.0 (biased) over the combined per-head output.
-  NN.AddLayerAfter(
-    TNNetPointwiseConvLinear.Create(d).SetTrainable(pTrainable), Combined);
-
-  // ---- weight loading ----
-  // image_proj.proj: Linear (clip -> N*cross) WITH bias.
-  LoadLlamaLinearWeights(Reader, ImgProj, 'image_proj.proj.weight',
-    Config.ClipEmbeddingsDim, Config.NumImageTokens * Cross, 0, -1, 0,
-    'image_proj.proj.bias');
-  LoadLayerNormWeights(Reader, ImgTokens,
-    'image_proj.norm.weight', 'image_proj.norm.bias', Cross);
-  // base UNet attn2 (shared Q + text K/V + out), all bias-free except to_out.0.
-  LoadLlamaLinearWeights(Reader, QProj, AttnPrefix + 'to_q.weight', d, d, 0, -1, 0, '');
-  LoadLlamaLinearWeights(Reader, KTxt, AttnPrefix + 'to_k.weight', Cross, d, 0, -1, 0, '');
-  LoadLlamaLinearWeights(Reader, VTxt, AttnPrefix + 'to_v.weight', Cross, d, 0, -1, 0, '');
-  LoadLlamaLinearWeights(Reader, NN.GetLastLayer(),
-    AttnPrefix + 'to_out.0.weight', d, d, 0, -1, 0, AttnPrefix + 'to_out.0.bias');
-  // ip_adapter extra K/V (bias-free).
-  LoadLlamaLinearWeights(Reader, KImg,
-    'ip_adapter.' + IntToStr(Config.AttnIndex) + '.to_k_ip.weight',
-    Cross, d, 0, -1, 0, '');
-  LoadLlamaLinearWeights(Reader, VImg,
-    'ip_adapter.' + IntToStr(Config.AttnIndex) + '.to_v_ip.weight',
-    Cross, d, 0, -1, 0, '');
-
-  SetLength(TxtHeads, 0);
-  SetLength(ImgHeads, 0);
-  SetLength(QChannels, 0);
-  Result := NN;
 end;
 
 function BuildIPAdapterFromSafeTensorsEx(const FileName: string;

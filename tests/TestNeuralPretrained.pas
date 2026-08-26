@@ -632,6 +632,7 @@ type
     procedure TestIPAdapterConfigFromJSONFile;
     procedure TestIPAdapterParity;
     procedure TestIPAdapterTorchBin;
+    procedure TestIPAdapterInferenceNet;
     procedure TestVaeRoundTrip;
     procedure TestVqModelEncodeParity;
     procedure TestVqModelDecodeParity;
@@ -25833,6 +25834,82 @@ begin
     Hidden.Free;
     NNBin.Free;
     NNSafe.Free;
+  end;
+end;
+
+// pTrainable=false must reach the WHOLE net, not just the weighted layers: the
+// IP-Adapter wiring (inputs, channel slices, concats, cross-attention, sum)
+// carries no per-layer SetTrainable, so only the net-level flip frees its
+// training volumes. Inference output must stay identical to the trainable net.
+procedure TTestNeuralPretrained.TestIPAdapterInferenceNet;
+var
+  NNTrain, NNInfer: TNNet;
+  TrainConfig, InferConfig: TIPAdapterConfig;
+  Hidden, Text, ImageEmbed, OutTrain, OutInfer: TNNetVolume;
+  SCnt, DCnt, TrainErrLayers, InferErrLayers, MaxLayerIdx: integer;
+  MaxDiff, Diff: double;
+begin
+  RandSeed := 424242;
+  NNTrain := nil;
+  NNInfer := nil;
+  Hidden := TNNetVolume.Create;
+  Text := TNNetVolume.Create;
+  ImageEmbed := TNNetVolume.Create;
+  OutTrain := TNNetVolume.Create;
+  OutInfer := TNNetVolume.Create;
+  try
+    NNTrain := BuildIPAdapterFromSafeTensors(
+      FixturePath('tiny_ip_adapter.safetensors'), TrainConfig,
+      {pTrainable=}true, FixturePath('tiny_ip_adapter_config.json'));
+    NNInfer := BuildIPAdapterFromSafeTensors(
+      FixturePath('tiny_ip_adapter.safetensors'), InferConfig,
+      {pTrainable=}false, FixturePath('tiny_ip_adapter_config.json'));
+    AssertEquals('same layer count', NNTrain.CountLayers(), NNInfer.CountLayers());
+    AssertTrue('trainable net flag', NNTrain.IsTrainable);
+    AssertTrue('inference net flag', not NNInfer.IsTrainable);
+
+    TrainErrLayers := 0;
+    InferErrLayers := 0;
+    MaxLayerIdx := NNTrain.CountLayers() - 1;
+    for SCnt := 0 to MaxLayerIdx do
+    begin
+      if NNTrain.Layers[SCnt].OutputError.Size > 1 then Inc(TrainErrLayers);
+      if NNInfer.Layers[SCnt].OutputError.Size > 1 then Inc(InferErrLayers);
+    end;
+    AssertTrue('trainable net keeps error volumes', TrainErrLayers > 0);
+    AssertEquals('inference net frees all error volumes', 0, InferErrLayers);
+
+    Hidden.ReSize(TrainConfig.HiddenTokens, 1, TrainConfig.Channels);
+    for SCnt := 0 to Hidden.Size - 1 do
+      Hidden.FData[SCnt] := ((SCnt * 7) mod 11 - 5) / 8;
+    Text.ReSize(TrainConfig.TextSeqLen, 1, TrainConfig.CrossAttentionDim);
+    for SCnt := 0 to Text.Size - 1 do
+      Text.FData[SCnt] := ((SCnt * 5) mod 13 - 6) / 16;
+    ImageEmbed.ReSize(TrainConfig.ClipEmbeddingsDim, 1, 1);
+    for SCnt := 0 to ImageEmbed.Size - 1 do
+      ImageEmbed.FData[SCnt] := ((SCnt * 3) mod 7 - 3) / 4;
+
+    IPAdapterCrossAttention(NNTrain, TrainConfig, Hidden, Text, ImageEmbed,
+      OutTrain);
+    IPAdapterCrossAttention(NNInfer, InferConfig, Hidden, Text, ImageEmbed,
+      OutInfer);
+    AssertEquals('same output size', OutTrain.Size, OutInfer.Size);
+    MaxDiff := 0;
+    for DCnt := 0 to OutTrain.Size - 1 do
+    begin
+      Diff := Abs(OutTrain.FData[DCnt] - OutInfer.FData[DCnt]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('inference vs trainable: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be 0', MaxDiff = 0);
+  finally
+    OutInfer.Free;
+    OutTrain.Free;
+    ImageEmbed.Free;
+    Text.Free;
+    Hidden.Free;
+    NNInfer.Free;
+    NNTrain.Free;
   end;
 end;
 
