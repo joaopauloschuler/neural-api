@@ -68906,6 +68906,10 @@ begin
     Reader.LoadTensorFlat(WName, W);
     if not Reader.HasTensor(BName) then
       ImportError('T2I-Adapter import: missing bias "' + BName + '".');
+    if (Reader.DimCount(BName) <> 1) or
+       (Reader.DimSize(BName, 0) <> OutCh) then
+      ImportError('T2I-Adapter import: "' + BName + '" must have shape [' +
+        IntToStr(OutCh) + '], got ' + Reader.ShapeAsString(BName));
     Reader.LoadTensorFlat(BName, B);
     OutChM1 := OutCh - 1;
     CondChM1 := CondCh - 1;

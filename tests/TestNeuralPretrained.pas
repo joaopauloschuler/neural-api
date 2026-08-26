@@ -628,6 +628,7 @@ type
     procedure TestControlNetCombinedParity;
     procedure TestT2IAdapterParity;
     procedure TestT2IAdapterFeatureCountMismatch;
+    procedure TestT2IAdapterShortConvInBias;
     procedure TestIPAdapterConfigFromJSONFile;
     procedure TestIPAdapterParity;
     procedure TestVaeRoundTrip;
@@ -26028,6 +26029,81 @@ begin
     for fi := 0 to Length(Features) - 1 do Features[fi].Free;
     NN.Free;
     Cond.Free;
+  end;
+end;
+
+// The adapter conv_in reads one bias element per output channel, so a
+// conv_in.bias shorter than the weight's output dimension must be reported
+// instead of read past the end of the decoded tensor. Rebuilds the pico
+// fixture with that one tensor one element short.
+procedure TTestNeuralPretrained.TestT2IAdapterShortConvInBias;
+const
+  csBiasName = 'adapter.conv_in.bias';
+var
+  Reader: TNNetSafeTensorsReader;
+  Writer: TNNetSafeTensorsWriter;
+  V: TNNetVolume;
+  Path, TName: string;
+  Dims: array of Int64;
+  Info: TSafeTensorInfo;
+  t, d, TensorCntM1, DimCntM1: integer;
+  NN: TNNet;
+  Config: TT2IAdapterConfig;
+  Rejected: boolean;
+  Msg: string;
+begin
+  RandSeed := 424242;
+  Path := GetTempDir(false) + 'cai_t2i_short_bias.safetensors';
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_t2i_adapter.safetensors'));
+  Writer := TNNetSafeTensorsWriter.Create(Path);
+  V := TNNetVolume.Create;
+  try
+    AssertTrue('fixture has the conv_in bias', Reader.HasTensor(csBiasName));
+    TensorCntM1 := Reader.Count - 1;
+    for t := 0 to TensorCntM1 do
+    begin
+      TName := Reader.TensorName(t);
+      Info := Reader.GetInfo(TName);
+      DimCntM1 := Length(Info.Shape) - 1;
+      SetLength(Dims, DimCntM1 + 1);
+      for d := 0 to DimCntM1 do Dims[d] := Info.Shape[d];
+      Reader.LoadTensorFlat(TName, V);
+      if TName = csBiasName then
+      begin
+        AssertTrue('the bias is a vector of more than one element',
+          (DimCntM1 = 0) and (Dims[0] > 1));
+        Dims[0] := Dims[0] - 1;
+        V.ReSize(V.Size - 1, 1, 1);
+      end;
+      Writer.AddTensorFlat(TName, Dims, V);
+    end;
+    Writer.SaveToFile();
+  finally
+    V.Free;
+    Writer.Free;
+    Reader.Free;
+  end;
+  NN := nil;
+  Rejected := false;
+  Msg := '';
+  try
+    try
+      NN := BuildT2IAdapterFromSafeTensors(Path, Config,
+        {pTrainable=}true, FixturePath('tiny_t2i_adapter_config.json'));
+    except
+      on E: EPretrainedImportError do
+      begin
+        Rejected := true;
+        Msg := E.Message;
+      end;
+    end;
+    AssertTrue('a short conv_in bias must be reported', Rejected);
+    AssertTrue('the message must name the bias tensor (' + Msg + ')',
+      Pos(csBiasName, Msg) > 0);
+  finally
+    NN.Free;
+    DeleteFile(Path);
   end;
 end;
 
