@@ -327,8 +327,8 @@ unit neuralpretrained;
 // linears (mlp.dense_h_to_4h / dense_4h_to_h) are plain nn.Linear
 // [out, in] WITH biases. Attention is standard scaled (1/sqrt(head_dim)).
 // hidden_act is "gelu" = the EXACT erf form in every Pythia config -
-// composed from existing layers exactly like the BERT path (gelu_new /
-// gelu_pytorch_tanh configs get the single TNNetGELU instead).
+// a single TNNetGELUErf (gelu_new / gelu_pytorch_tanh configs get the
+// tanh TNNetGELU instead).
 // Embeddings are UNTIED by default (embed_in / embed_out are separate
 // tensors; tie_word_embeddings=false in every Pythia config); a tied
 // config copies embed_in like the GPT-2 path. final_layer_norm caps the
@@ -20749,7 +20749,6 @@ var
   EmbeddingLayer, FinalLN, LMHead: TNNetLayer;
   BranchInput, AttnOut, MlpOut, QKVLayer: TNNetLayer;
   RotSlice, PassSlice, QHead, KHead, VHead, HeadPack: TNNetLayer;
-  GELUSource, PhiBranch: TNNetLayer;
   QSource, KSource, VSource: TNNetLayer;
   HeadOutputs: array of TNNetLayer;
   RotChannels, PassChannels, VChannels, SlabChannels: array of integer;
@@ -20767,23 +20766,16 @@ var
     Consumed.Add(TName);
   end;
 
-  // x*Phi(x), the exact erf GELU, composed from existing layers exactly
-  // like the BERT path (see the BERT IMPORT section of the unit header).
+  // x*Phi(x): the single TNNetGELUErf computes the exact erf form in one
+  // layer (and carries a cai_activation opcode, so its output stays on the
+  // device), where the composed [scale -> erf -> +1 -> *0.5 -> concat ->
+  // ReGLU] chain costs six layers, a double-width concat and a download.
   procedure AddExactOrTanhGELU;
   begin
     if Config.HiddenActTanh then
       NN.AddLayer( TNNetGELU.Create() ) // tanh approximation
     else
-    begin
-      GELUSource := NN.GetLastLayer();
-      NN.AddLayerAfter(
-        TNNetMulByConstant.Create(0.7071067811865476), GELUSource);
-      NN.AddLayer( TNNetErf.Create() );
-      NN.AddLayer( TNNetAddConstant.Create(1.0) );
-      PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
-      NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, GELUSource]) );
-      NN.AddLayer( TNNetReGLU.Create() );
-    end;
+      NN.AddLayer( TNNetGELUErf.Create() ); // exact erf form
   end;
 
 begin
@@ -22610,7 +22602,6 @@ var
   EmbeddingLayer, FinalLN, LMHead: TNNetLayer;
   BranchInput, SharedLN, AttnOut, MlpOut: TNNetLayer;
   QHead, KHead: TNNetLayer;
-  GELUSource, PhiBranch: TNNetLayer;
   BlockCnt, SeqLen, HeadDim, RotaryTileDims, i, d: integer;
   BlockMax: integer;
   Tmp: TNNetVolume;
@@ -22622,24 +22613,17 @@ var
     Consumed.Add(TName);
   end;
 
-  // x*Phi(x), the exact erf GELU, composed from existing layers exactly
-  // like the BERT path (see the BERT IMPORT section of the unit header).
+  // x*Phi(x): the single TNNetGELUErf computes the exact erf form in one
+  // layer (and carries a cai_activation opcode, so its output stays on the
+  // device), where the composed [scale -> erf -> +1 -> *0.5 -> concat ->
+  // ReGLU] chain costs six layers, a double-width concat and a download.
   // GPT-J configs use gelu_new (the tanh TNNetGELU) in practice.
   procedure AddExactOrTanhGELU;
   begin
     if Config.HiddenActTanh then
       NN.AddLayer( TNNetGELU.Create() ) // tanh approximation
     else
-    begin
-      GELUSource := NN.GetLastLayer();
-      NN.AddLayerAfter(
-        TNNetMulByConstant.Create(0.7071067811865476), GELUSource);
-      NN.AddLayer( TNNetErf.Create() );
-      NN.AddLayer( TNNetAddConstant.Create(1.0) );
-      PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
-      NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, GELUSource]) );
-      NN.AddLayer( TNNetReGLU.Create() );
-    end;
+      NN.AddLayer( TNNetGELUErf.Create() ); // exact erf form
   end;
 
 begin
@@ -23764,7 +23748,6 @@ var
   EmbeddingLayer, FinalLN, LMHead: TNNetLayer;
   BranchInput, SharedLN, AttnOut, MlpOut: TNNetLayer;
   RotSlice, PassSlice, QHead, KHead, VHead, HeadPack: TNNetLayer;
-  GELUSource, PhiBranch: TNNetLayer;
   HeadOutputs: array of TNNetLayer;
   RotChannels, PassChannels, VChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, HeadDim, RotaryDims, i, d: integer;
@@ -23779,24 +23762,17 @@ var
     Consumed.Add(TName);
   end;
 
-  // x*Phi(x), the exact erf GELU, composed from existing layers exactly
-  // like the BERT path (see the BERT IMPORT section of the unit header).
+  // x*Phi(x): the single TNNetGELUErf computes the exact erf form in one
+  // layer (and carries a cai_activation opcode, so its output stays on the
+  // device), where the composed [scale -> erf -> +1 -> *0.5 -> concat ->
+  // ReGLU] chain costs six layers, a double-width concat and a download.
   // Phi configs use gelu_new (the tanh TNNetGELU) in practice.
   procedure AddExactOrTanhGELU;
   begin
     if Config.HiddenActTanh then
       NN.AddLayer( TNNetGELU.Create() ) // tanh approximation
     else
-    begin
-      GELUSource := NN.GetLastLayer();
-      NN.AddLayerAfter(
-        TNNetMulByConstant.Create(0.7071067811865476), GELUSource);
-      NN.AddLayer( TNNetErf.Create() );
-      NN.AddLayer( TNNetAddConstant.Create(1.0) );
-      PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
-      NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, GELUSource]) );
-      NN.AddLayer( TNNetReGLU.Create() );
-    end;
+      NN.AddLayer( TNNetGELUErf.Create() ); // exact erf form
   end;
 
 begin
@@ -54155,20 +54131,12 @@ var
     Consumed.Add(TName);
   end;
 
-  // x*Phi(x), the exact erf GELU (Falcon's activation is "gelu" = exact),
-  // composed from existing layers exactly like the GPT-NeoX/BERT path.
+  // x*Phi(x): Falcon's activation is "gelu" = the exact erf form, which the
+  // single TNNetGELUErf computes in one layer and, through its
+  // cai_activation opcode, on the device.
   procedure AddExactGELU;
-  var
-    GELUSource, PhiBranch: TNNetLayer;
   begin
-    GELUSource := NN.GetLastLayer();
-    NN.AddLayerAfter(
-      TNNetMulByConstant.Create(0.7071067811865476), GELUSource);
-    NN.AddLayer( TNNetErf.Create() );
-    NN.AddLayer( TNNetAddConstant.Create(1.0) );
-    PhiBranch := NN.AddLayer( TNNetMulByConstant.Create(0.5) );
-    NN.AddLayer( TNNetDeepConcat.Create([PhiBranch, GELUSource]) );
-    NN.AddLayer( TNNetReGLU.Create() );
+    NN.AddLayer( TNNetGELUErf.Create() );
   end;
 
 begin
