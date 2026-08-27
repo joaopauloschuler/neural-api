@@ -1746,6 +1746,12 @@ function BuildGptOssFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
+// Reads one gpt-oss expert weight slab (dense tensor or MXFP4 "_blocks" /
+// "_scales" pair) into Dest as a flat [E, In, Out] array.
+procedure LoadGptOssExpertSlab(Reader: TNNetSafeTensorsReader;
+  const BaseName: string; NumExperts, InDim, OutDim: integer;
+  Dest: TNNetVolume);
+
 type
   TGPTNeoConfig = record
     HiddenSize: integer;       // d_model (hidden_size)
@@ -28578,13 +28584,19 @@ end;
 // (transformers _convert_moe_packed_tensors ends with .transpose(1,2)).
 procedure LoadGptOssExpertSlab(Reader: TNNetSafeTensorsReader;
   const BaseName: string; NumExperts, InDim, OutDim: integer; Dest: TNNetVolume);
+const
+  // One tile is TileRows x TileCols floats of the transposed block; both fit
+  // together in L2 for every gpt-oss expert width.
+  cSlabTileRows = 16;
+  cSlabTileCols = 64;
 var
   Blocks, Scales: TBytes;
-  Deq: array of single;
-  e, ii, oo, NumBlocks: integer;
+  RowTile: array of single;
+  e, ii, NumBlocks: integer;
   BlocksName, ScalesName: string;
-  NumExpertsM1, OutDimM1, InDimM1: integer;
-  srcIdx, dstIdx, InTimesOut: integer;
+  NumExpertsM1, InTimesOut, BlocksPerRow: integer;
+  TileRows, RowsInTileM1, FirstRow, FirstCol, LastCol, RowInTile: integer;
+  ExpertBase, SrcBlock, DstBase: integer;
 begin
   if Reader.HasTensor(BaseName) then
   begin
@@ -28619,30 +28631,41 @@ begin
     ImportError('gpt-oss import: MXFP4 "' + ScalesName + '" has ' +
       IntToStr(Length(Scales)) + ' bytes, expected ' +
       IntToStr(NumBlocks) + '.');
-  SetLength(Deq, NumExperts * OutDim * InDim);
-  DequantizeMXFP4(@Blocks[0], @Scales[0], NumBlocks, @Deq[0]);
-  // Deq is [E, Out, In] (row-major). Transpose the last two axes into Dest's
-  // [E, In, Out] layout.
+  // The source is [E, Out, In]: one tile of TileRows consecutive Out rows is
+  // dequantized at a time and transposed into Dest's [E, In, Out] layout, so
+  // no full-size FP32 intermediate is ever held.
   Dest.ReSize(NumExperts * InDim * OutDim, 1, 1);
-  NumExpertsM1 := NumExperts - 1;
-  OutDimM1 := OutDim - 1;
-  InDimM1 := InDim - 1;
+  BlocksPerRow := InDim div MXFP4_BLOCK_ELEMS;
+  TileRows := Min(cSlabTileRows, OutDim);
+  SetLength(RowTile, TileRows * InDim);
   InTimesOut := InDim * OutDim;
-  // Source index runs fully sequentially across the whole nest (#6); the dest
-  // index is a per-(e,oo) base advanced by OutDim each ii (#11/#4).
-  srcIdx := 0;
+  NumExpertsM1 := NumExperts - 1;
   for e := 0 to NumExpertsM1 do
-    for oo := 0 to OutDimM1 do
+  begin
+    ExpertBase := e * InTimesOut;
+    FirstRow := 0;
+    while FirstRow < OutDim do
     begin
-      dstIdx := e * InTimesOut + oo;
-      for ii := 0 to InDimM1 do
+      RowsInTileM1 := Min(TileRows, OutDim - FirstRow) - 1;
+      SrcBlock := (e * OutDim + FirstRow) * BlocksPerRow;
+      DequantizeMXFP4(@Blocks[SrcBlock * MXFP4_BLOCK_BYTES], @Scales[SrcBlock],
+        (RowsInTileM1 + 1) * BlocksPerRow, @RowTile[0]);
+      FirstCol := 0;
+      while FirstCol < InDim do
       begin
-        Dest.FData[dstIdx] := Deq[srcIdx];
-        Inc(srcIdx);
-        Inc(dstIdx, OutDim);
+        LastCol := Min(FirstCol + cSlabTileCols, InDim) - 1;
+        for ii := FirstCol to LastCol do
+        begin
+          DstBase := ExpertBase + ii * OutDim + FirstRow;
+          for RowInTile := 0 to RowsInTileM1 do
+            Dest.FData[DstBase + RowInTile] := RowTile[RowInTile * InDim + ii];
+        end;
+        Inc(FirstCol, cSlabTileCols);
       end;
+      Inc(FirstRow, TileRows);
     end;
-  SetLength(Deq, 0);
+  end;
+  SetLength(RowTile, 0);
 end;
 
 // Builds and loads one gpt-oss MoE FFN branch from MoESource. Router (bias) ->
@@ -28960,20 +28983,19 @@ var
   FS: TFormatSettings;
   LineNo, EmbDim, VocabRows, TokenIdx, DimCnt, RowCnt: integer;
   MatchedCnt, HeaderCount, HeaderDim: integer;
-  MeanVal: TNeuralFloat;
   FileOpen: boolean;
 
   // Returns the next whitespace-separated field of Line starting at P
   // (1-based); '' once the line is exhausted. Spaces and tabs separate.
   function NextField(var P: integer): string;
+  var
+    StartPos, MaxLinePos: integer;
   begin
-    while (P <= Length(Line)) and (Line[P] in [' ', #9]) do Inc(P);
-    Result := '';
-    while (P <= Length(Line)) and not (Line[P] in [' ', #9]) do
-    begin
-      Result := Result + Line[P];
-      Inc(P);
-    end;
+    MaxLinePos := Length(Line);
+    while (P <= MaxLinePos) and (Line[P] in [' ', #9]) do Inc(P);
+    StartPos := P;
+    while (P <= MaxLinePos) and not (Line[P] in [' ', #9]) do Inc(P);
+    Result := Copy(Line, StartPos, P - StartPos);
   end;
 
   // Parses the D vector floats following the word at position P and, when
@@ -28990,14 +29012,10 @@ var
         ImportError('Embedding import: line ' + IntToStr(LineNo) + ' of ' +
           FileName + ' has fewer than ' + IntToStr(EmbDim) +
           ' vector values (word "' + WordStr + '").');
-      try
-        Row[DimCnt] := StrToFloat(Field, FS);
-      except
-        on E: Exception do
-          ImportError('Embedding import: line ' + IntToStr(LineNo) + ' of ' +
-            FileName + ': "' + Field + '" is not a number (word "' + WordStr +
-            '").');
-      end;
+      if not TryStrToFloat(Field, Row[DimCnt], FS) then
+        ImportError('Embedding import: line ' + IntToStr(LineNo) + ' of ' +
+          FileName + ': "' + Field + '" is not a number (word "' + WordStr +
+          '").');
     end;
     if NextField(P) <> '' then
       ImportError('Embedding import: line ' + IntToStr(LineNo) + ' of ' +
@@ -29088,17 +29106,19 @@ begin
     // one match, the mean vector is a better prior than the random init.
     if (MatchedCnt > 0) and (MatchedCnt < VocabRows) then
     begin
+      // Row holds the mean vector: accumulate the matched rows into it, then
+      // broadcast it over the unmatched ones (Row is free after parsing).
+      for DimCnt := 0 to EmbDimM1B do Row[DimCnt] := 0;
+      for RowCnt := 0 to VocabRowsM1 do
+        if Matched[RowCnt] then
+          TNNetVolume.Add(TNeuralFloatArrPtr(@Row[0]),
+            Weights.GetRawPtr(RowCnt * EmbDim), EmbDim);
       for DimCnt := 0 to EmbDimM1B do
-      begin
-        MeanVal := 0;
-        for RowCnt := 0 to VocabRowsM1 do
-          if Matched[RowCnt] then
-            MeanVal := MeanVal + Weights.FData[RowCnt * EmbDim + DimCnt];
-        MeanVal := MeanVal / MatchedCnt;
-        for RowCnt := 0 to VocabRowsM1 do
-          if not Matched[RowCnt] then
-            Weights.FData[RowCnt * EmbDim + DimCnt] := MeanVal;
-      end;
+        Row[DimCnt] := Row[DimCnt] / MatchedCnt;
+      for RowCnt := 0 to VocabRowsM1 do
+        if not Matched[RowCnt] then
+          Move(Row[0], Weights.FData[RowCnt * EmbDim],
+            EmbDim * csNeuralFloatSize);
     end;
     Embedding.FlushWeightCache();
     if FreezeEmbedding then Embedding.LearningRate := 0;
@@ -29630,13 +29650,12 @@ begin
           EnsureWritableImportWeights(LMHead);
           VocabSizeM1 := Config.VocabSize - 1;
           DModelM1 := Config.DModel - 1;
+          Tmp.Mul(TieScale); // one pass over the table instead of per row
           for j := 0 to VocabSizeM1 do
           begin
             Move(Tmp.FData[j * Config.DModel],
               LMHead.FArrNeurons[j].Weights.FData[0],
               Config.DModel * csNeuralFloatSize);
-            TNNetVolume.Mul(LMHead.FArrNeurons[j].Weights.GetRawPtr(0),
-              TieScale, Config.DModel);
             LMHead.FArrNeurons[j].BiasWeight := 0;
           end;
           LMHead.FlushWeightCache();

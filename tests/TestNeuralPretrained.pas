@@ -258,6 +258,7 @@ type
     procedure TestQwen35MoeLogitParity;
     procedure TestGptOssLogitParity;
     procedure TestGptOssMXFP4LogitParity;
+    procedure TestGptOssExpertSlabTranspose;
     procedure TestGemmaLogitParity;
     procedure TestGemma2LogitParity;
     procedure TestGemma3LogitParity;
@@ -9211,6 +9212,62 @@ begin
       Config.VocabSize);
   finally
     NN.Free;
+  end;
+end;
+
+// Exercises LoadGptOssExpertSlab's MXFP4 tile transpose on shapes the pico
+// fixture never reaches: an OutDim that is not a whole number of row tiles and
+// an InDim wider than one column tile. The reference is the whole slab
+// dequantized in one call plus a naive [E,Out,In] -> [E,In,Out] transpose.
+procedure TTestNeuralPretrained.TestGptOssExpertSlabTranspose;
+const
+  cExperts = 3;
+  cInDim = 96;   // 3 MXFP4 blocks per row, 2 column tiles
+  cOutDim = 19;  // one full 16-row tile plus a 3-row remainder
+var
+  Reader: TNNetSafeTensorsReader;
+  Dest: TNNetVolume;
+  Blocks, Scales, Payload: array of byte;
+  Deq: array of single;
+  NumBlocks, ByteCnt, i, e, ii, oo, MismatchCnt: integer;
+  TempName, Header: string;
+begin
+  RandSeed := 20260826;
+  NumBlocks := cExperts * cOutDim * (cInDim div MXFP4_BLOCK_ELEMS);
+  ByteCnt := NumBlocks * MXFP4_BLOCK_BYTES;
+  SetLength(Blocks, ByteCnt);
+  SetLength(Scales, NumBlocks);
+  for i := 0 to ByteCnt - 1 do Blocks[i] := Random(256);
+  // Scale bytes stay away from 0xFF, which dequantizes to NaN.
+  for i := 0 to NumBlocks - 1 do Scales[i] := 120 + Random(8);
+  SetLength(Payload, ByteCnt + NumBlocks);
+  Move(Blocks[0], Payload[0], ByteCnt);
+  Move(Scales[0], Payload[ByteCnt], NumBlocks);
+  Header := '{"w_blocks":{"dtype":"U8","shape":[3,19,3,16],"data_offsets":[0,' +
+    IntToStr(ByteCnt) + ']},"w_scales":{"dtype":"U8","shape":[3,19,3],' +
+    '"data_offsets":[' + IntToStr(ByteCnt) + ',' +
+    IntToStr(ByteCnt + NumBlocks) + ']}}';
+  TempName := WriteTempSafeTensors(Header, Payload);
+  Dest := TNNetVolume.Create;
+  Reader := TNNetSafeTensorsReader.Create(TempName);
+  try
+    LoadGptOssExpertSlab(Reader, 'w', cExperts, cInDim, cOutDim, Dest);
+    AssertEquals('slab element count', cExperts * cInDim * cOutDim, Dest.Size);
+    SetLength(Deq, cExperts * cOutDim * cInDim);
+    DequantizeMXFP4(@Blocks[0], @Scales[0], NumBlocks, @Deq[0]);
+    MismatchCnt := 0;
+    for e := 0 to cExperts - 1 do
+      for oo := 0 to cOutDim - 1 do
+        for ii := 0 to cInDim - 1 do
+          if Dest.FData[e * cInDim * cOutDim + ii * cOutDim + oo] <>
+             Deq[(e * cOutDim + oo) * cInDim + ii] then Inc(MismatchCnt);
+    AssertEquals('transposed elements differing from the reference', 0,
+      MismatchCnt);
+  finally
+    Reader.Free;
+    Dest.Free;
+    SetLength(Deq, 0);
+    DeleteFile(TempName);
   end;
 end;
 
