@@ -8923,9 +8923,15 @@ function BuildMaskRCNNFromSafeTensors(const FileName: string;
 //   ClsLogits   (num_classes, 1, 1) class logits,
 //   BboxDeltas  (num_classes*4, 1, 1) box-regression deltas,
 //   MaskLogits  (Wm, Hm, num_classes) per-class mask logits (CAI depth-major).
+// pFeatsUnchanged is the multi-proposal opt-in: it asserts LevelFeats holds the
+// SAME maps as the immediately preceding call on this net, so the FPN backbone
+// (everything up to the first RoIAlign, the only Box consumer) still holds its
+// result and the forward pass restarts at the RoIAlign instead of the input.
+// Pass it only for the 2nd and later boxes of one image.
 procedure RunMaskRCNN(NN: TNNet; const Config: TMaskRCNNConfig;
   const LevelFeats: array of TNNetVolume; const Box: array of TNeuralFloat;
-  ClsLogits, BboxDeltas, MaskLogits: TNNetVolume);
+  ClsLogits, BboxDeltas, MaskLogits: TNNetVolume;
+  pFeatsUnchanged: boolean = false);
 
 // ---------------------------------------------------------------------------
 // CONVNEXT v1 / v2 IMPORT (HF "convnext" / "convnextv2",
@@ -58884,8 +58890,9 @@ begin
         if Tmp.Size <> d then
           ImportError('SigLIP import: "' + Prefix + 'head.probe" must have ' +
             IntToStr(d) + ' elements, got ' + IntToStr(Tmp.Size) + '.');
-        for ci := 0 to dM1 do
-          Probe.FArrNeurons[0].Weights.FData[ci] := Tmp.FData[ci];
+        // Both sides are d contiguous floats (App. C, #13).
+        Move(Tmp.FData[0], Probe.FArrNeurons[0].Weights.FData[0],
+          d * csNeuralFloatSize);
         Probe.FlushWeightCache();
       finally
         Tmp.Free;
@@ -59188,10 +59195,14 @@ begin
   LoadLayerNormWeights(Reader, Block.LN1,
     BlockPrefix + 'layernorm_before.weight',
     BlockPrefix + 'layernorm_before.bias', d);
+  // Q/K/V fill disjoint neuron ranges of the SAME fused QKV layer, so only the
+  // V call has to rebuild the concat cache (pDeferFlush on Q and K).
   LoadLlamaLinearWeights(Reader, Block.QKV,
-    QName + '.weight', d, d, 0, 3 * d, 0, QName + '.bias');
+    QName + '.weight', d, d, 0, 3 * d, 0, QName + '.bias',
+    1.0, 0, 0, 0, false, true);
   LoadLlamaLinearWeights(Reader, Block.QKV,
-    KName + '.weight', d, d, d, 3 * d, 0, KName + '.bias');
+    KName + '.weight', d, d, d, 3 * d, 0, KName + '.bias',
+    1.0, 0, 0, 0, false, true);
   LoadLlamaLinearWeights(Reader, Block.QKV,
     VName + '.weight', d, d, 2 * d, 3 * d, 0, VName + '.bias');
   LoadLlamaLinearWeights(Reader, Block.AttnDense,
@@ -60046,6 +60057,7 @@ var
   Wd, W1, Gd, Bd, Md, Vd, G1, B1, M1, V1, Gi, Bi, Mi, Vi, WVol: TNNetVolume;
   o, c, ky, kx, kBase, srcIdx, CentreBase, OutChM1, InChM1: integer;
   Sd, Sh, Den, S1, H1, Si, Hi: TNeuralFloat;
+  DenseWName, OneWName: string;
 
   procedure NeedBN(const P: string; Ga, Be, Me, Va: TNNetVolume);
   begin
@@ -60063,6 +60075,8 @@ var
 
 begin
   EnsureWritableImportWeights(Layer);
+  DenseWName := Prefix + '.rbr_dense.conv.weight';
+  OneWName := Prefix + '.rbr_1x1.conv.weight';
   if Layer.Neurons.Count <> OutCh then
     ImportError('RepVGG import: internal error - block "' + Prefix +
       '" target has ' + IntToStr(Layer.Neurons.Count) + ' neurons, expected ' +
@@ -60072,17 +60086,17 @@ begin
       '" target neuron has ' + IntToStr(Layer.FArrNeurons[0].Weights.Size) +
       ' weights, expected ' + IntToStr(3 * 3 * InCh) + '.');
   // dense 3x3 conv must exist with shape [OutCh, InCh, 3, 3].
-  if not Reader.HasTensor(Prefix + '.rbr_dense.conv.weight') then
+  if not Reader.HasTensor(DenseWName) then
     ImportError('RepVGG import: missing tensor "' + Prefix +
       '.rbr_dense.conv.weight".');
-  if (Reader.DimCount(Prefix + '.rbr_dense.conv.weight') <> 4) or
-     (Reader.DimSize(Prefix + '.rbr_dense.conv.weight', 0) <> OutCh) or
-     (Reader.DimSize(Prefix + '.rbr_dense.conv.weight', 1) <> InCh) or
-     (Reader.DimSize(Prefix + '.rbr_dense.conv.weight', 2) <> 3) or
-     (Reader.DimSize(Prefix + '.rbr_dense.conv.weight', 3) <> 3) then
+  if (Reader.DimCount(DenseWName) <> 4) or
+     (Reader.DimSize(DenseWName, 0) <> OutCh) or
+     (Reader.DimSize(DenseWName, 1) <> InCh) or
+     (Reader.DimSize(DenseWName, 2) <> 3) or
+     (Reader.DimSize(DenseWName, 3) <> 3) then
     ImportError('RepVGG import: "' + Prefix + '.rbr_dense.conv.weight" must ' +
       'have shape [' + IntToStr(OutCh) + ', ' + IntToStr(InCh) + ', 3, 3], got ' +
-      Reader.ShapeAsString(Prefix + '.rbr_dense.conv.weight'));
+      Reader.ShapeAsString(DenseWName));
   Wd := TNNetVolume.Create; W1 := TNNetVolume.Create;
   Gd := TNNetVolume.Create; Bd := TNNetVolume.Create;
   Md := TNNetVolume.Create; Vd := TNNetVolume.Create;
@@ -60091,22 +60105,22 @@ begin
   Gi := TNNetVolume.Create; Bi := TNNetVolume.Create;
   Mi := TNNetVolume.Create; Vi := TNNetVolume.Create;
   try
-    Reader.LoadTensorFlat(Prefix + '.rbr_dense.conv.weight', Wd);
+    Reader.LoadTensorFlat(DenseWName, Wd);
     NeedBN(Prefix + '.rbr_dense.bn', Gd, Bd, Md, Vd);
     if Has1x1 then
     begin
-      if not Reader.HasTensor(Prefix + '.rbr_1x1.conv.weight') then
+      if not Reader.HasTensor(OneWName) then
         ImportError('RepVGG import: missing tensor "' + Prefix +
           '.rbr_1x1.conv.weight".');
-      if (Reader.DimCount(Prefix + '.rbr_1x1.conv.weight') <> 4) or
-         (Reader.DimSize(Prefix + '.rbr_1x1.conv.weight', 0) <> OutCh) or
-         (Reader.DimSize(Prefix + '.rbr_1x1.conv.weight', 1) <> InCh) or
-         (Reader.DimSize(Prefix + '.rbr_1x1.conv.weight', 2) <> 1) or
-         (Reader.DimSize(Prefix + '.rbr_1x1.conv.weight', 3) <> 1) then
+      if (Reader.DimCount(OneWName) <> 4) or
+         (Reader.DimSize(OneWName, 0) <> OutCh) or
+         (Reader.DimSize(OneWName, 1) <> InCh) or
+         (Reader.DimSize(OneWName, 2) <> 1) or
+         (Reader.DimSize(OneWName, 3) <> 1) then
         ImportError('RepVGG import: "' + Prefix + '.rbr_1x1.conv.weight" must ' +
           'have shape [' + IntToStr(OutCh) + ', ' + IntToStr(InCh) +
-          ', 1, 1], got ' + Reader.ShapeAsString(Prefix + '.rbr_1x1.conv.weight'));
-      Reader.LoadTensorFlat(Prefix + '.rbr_1x1.conv.weight', W1);
+          ', 1, 1], got ' + Reader.ShapeAsString(OneWName));
+      Reader.LoadTensorFlat(OneWName, W1);
       NeedBN(Prefix + '.rbr_1x1.bn', G1, B1, M1, V1);
     end;
     if HasIdentity then
@@ -60779,9 +60793,10 @@ end;
 
 procedure RunMaskRCNN(NN: TNNet; const Config: TMaskRCNNConfig;
   const LevelFeats: array of TNNetVolume; const Box: array of TNeuralFloat;
-  ClsLogits, BboxDeltas, MaskLogits: TNNetVolume);
+  ClsLogits, BboxDeltas, MaskLogits: TNNetVolume;
+  pFeatsUnchanged: boolean = false);
 var
-  lv, LayersCntM1, NumClasses4: integer;
+  lv, LayersCntM1, NumClasses4, FirstRoIAlignIdx: integer;
   L, ClsL, BboxL, MaskL: TNNetLayer;
 begin
   if Length(LevelFeats) <> Config.NumLevels then
@@ -60798,13 +60813,17 @@ begin
   // The heads are structural, so locating them before Compute is equivalent -
   // only their Output is read afterwards.
   ClsL := nil; BboxL := nil; MaskL := nil;
+  FirstRoIAlignIdx := -1;
   NumClasses4 := Config.NumClasses * 4;
   LayersCntM1 := NN.Layers.Count - 1;
   for lv := 0 to LayersCntM1 do
   begin
     L := NN.Layers[lv];
     if L is TNNetRoIAlign then
-      TNNetRoIAlign(L).SetBox(Box[0], Box[1], Box[2], Box[3])
+    begin
+      if FirstRoIAlignIdx < 0 then FirstRoIAlignIdx := lv;
+      TNNetRoIAlign(L).SetBox(Box[0], Box[1], Box[2], Box[3]);
+    end
     else if (L is TNNetFullConnectLinear) and not (L is TNNetFullConnectReLU) then
     begin
       if L.Output.Size = Config.NumClasses then ClsL := L
@@ -60816,7 +60835,18 @@ begin
   end;
   // The level inputs are layers 0..NumLevels-1 (config order). The multi-input
   // TNNet.Compute copies inputs 1..N then forwards from input[0].
-  NN.Compute(LevelFeats);
+  // With pFeatsUnchanged the backbone output still stands, so the pass restarts
+  // at the first RoIAlign: AddLayerAfter always appends, so the layer list is
+  // topological and every Box consumer sits at or after that index (it also
+  // skips the FPN levels below the chosen one, which feed nothing).
+  if pFeatsUnchanged and (FirstRoIAlignIdx > 0) then
+  begin
+    NN.ComputeSerial(FirstRoIAlignIdx);
+    {$IFDEF OpenCL}
+    NN.GetLastLayer().ForceOutputOnRAM();
+    {$ENDIF}
+  end
+  else NN.Compute(LevelFeats);
 
   if ClsLogits <> nil then
   begin
@@ -65156,7 +65186,7 @@ procedure MaxViTBuildHeadBias(BiasTable: TNNetVolume;
   const RelPosIndex: TNeuralIntegerArray; HeadIdx, NumHeads, P: integer;
   Mat: TNNetVolume);
 var
-  p2, p2M1, i, j, idx: integer;
+  p2, p2M1, i, j, k, idx: integer;
 begin
   p2 := P * P;
   p2M1 := p2 - 1;
@@ -65168,11 +65198,14 @@ begin
       IntToStr(Sqr(2 * P - 1) * NumHeads) + ' for window/grid size ' +
       IntToStr(P) + ' x ' + IntToStr(NumHeads) + ' heads.');
   Mat.ReSize(p2 * p2, 1, 1);
+  // #6: (i * p2 + j) walks the flat range 0..p2*p2-1 in order, so carry it.
+  k := 0;
   for i := 0 to p2M1 do
     for j := 0 to p2M1 do
     begin
-      idx := RelPosIndex[i * p2 + j];
-      Mat.FData[i * p2 + j] := BiasTable.FData[idx * NumHeads + HeadIdx];
+      idx := RelPosIndex[k];
+      Mat.FData[k] := BiasTable.FData[idx * NumHeads + HeadIdx];
+      Inc(k);
     end;
 end;
 
@@ -65198,7 +65231,7 @@ var
     QSlice, KSlice, VSlice, QKV, HeadAttn: TNNetLayer;
     WindowOuts, HeadOuts: array of TNNetLayer;
     WinAttnLayers: array of TNNetLayer;
-    BiasTable, HeadBias: TNNetVolume;
+    BiasTable, HeadBias, QkvSlab: TNNetVolume;
   begin
     MaxViTBuildPartition(AH, P, IsGrid, Perm, InvPerm, NW);
     MaxViTBuildRelPosIndex(P, RelPosIndex);
@@ -65216,43 +65249,62 @@ var
     Reordered := NN.AddLayer( TNNetGatherTokens.Create(Perm) );
 
     SetLength(WindowOuts, NW);
-    for wIdx := 0 to NWM1 do
-    begin
-      WinSlice := NN.AddLayerAfter(
-        TNNetCrop.Create(wIdx * ws2, 0, ws2, 1), Reordered);
-      QProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(ADim).SetTrainable(pTrainable) );
-      KProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(ADim).SetTrainable(pTrainable), WinSlice);
-      VProj := NN.AddLayerAfter(
-        TNNetPointwiseConvLinear.Create(ADim).SetTrainable(pTrainable), WinSlice);
-      SetLength(HeadOuts, Config.NumHeads);
-      for h := 0 to NumHeadsM1 do
+    // Every window slices the SAME [3*ADim, ADim] qkv slab. Readers with no row
+    // view (packed NF4, quantized GGUF, the synthetic views) decode the whole
+    // slab per slice, i.e. 3*NW full decodes per block; stage it once for those
+    // and slice it from RAM. Row-streamable readers keep the streaming path and
+    // never pay the slab-sized transient.
+    QkvSlab := nil;
+    try
+      if not Reader.CanStreamTensorRows(Prefix + '.attn.qkv.weight') then
       begin
-        SetLength(Channels, AHeadDim);
-        for ci := 0 to AHeadDimM1 do Channels[ci] := h * AHeadDim + ci;
-        QSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), QProj);
-        KSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), KProj);
-        VSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), VProj);
-        QKV := NN.AddLayer( TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
-        HeadAttn := NN.AddLayer( TNNetWindowAttention.Create(AHeadDim, ws2) );
-        SetLength(WinAttnLayers, Length(WinAttnLayers) + 1);
-        WinAttnLayers[High(WinAttnLayers)] := HeadAttn;
-        HeadOuts[h] := HeadAttn;
+        QkvSlab := TNNetVolume.Create;
+        StageTensorSlabFlat(Reader, Prefix + '.attn.qkv.weight',
+          3 * ADim, ADim, QkvSlab);
       end;
-      AttnConcat := NN.AddLayer( TNNetDeepConcat.Create(HeadOuts) );
-      OProj := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(ADim).SetTrainable(pTrainable) );
-      WindowOuts[wIdx] := OProj;
-      // q/k/v sliced out of the packed [3*Dim, Dim] qkv slab; o_proj plain.
-      LoadLlamaLinearWeights(Reader, QProj, Prefix + '.attn.qkv.weight',
-        ADim, ADim, 0, -1, 0, Prefix + '.attn.qkv.bias', 1.0, 0, 0, 3 * ADim);
-      LoadLlamaLinearWeights(Reader, KProj, Prefix + '.attn.qkv.weight',
-        ADim, ADim, 0, -1, 0, Prefix + '.attn.qkv.bias', 1.0, 0, ADim, 3 * ADim);
-      LoadLlamaLinearWeights(Reader, VProj, Prefix + '.attn.qkv.weight',
-        ADim, ADim, 0, -1, 0, Prefix + '.attn.qkv.bias', 1.0, 0, 2 * ADim, 3 * ADim);
-      LoadLlamaLinearWeights(Reader, OProj, Prefix + '.attn.proj.weight',
-        ADim, ADim, 0, -1, 0, Prefix + '.attn.proj.bias');
+      for wIdx := 0 to NWM1 do
+      begin
+        WinSlice := NN.AddLayerAfter(
+          TNNetCrop.Create(wIdx * ws2, 0, ws2, 1), Reordered);
+        QProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(ADim).SetTrainable(pTrainable) );
+        KProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(ADim).SetTrainable(pTrainable), WinSlice);
+        VProj := NN.AddLayerAfter(
+          TNNetPointwiseConvLinear.Create(ADim).SetTrainable(pTrainable), WinSlice);
+        SetLength(HeadOuts, Config.NumHeads);
+        for h := 0 to NumHeadsM1 do
+        begin
+          SetLength(Channels, AHeadDim);
+          for ci := 0 to AHeadDimM1 do Channels[ci] := h * AHeadDim + ci;
+          QSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), QProj);
+          KSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), KProj);
+          VSlice := NN.AddLayerAfter( TNNetSplitChannels.Create(Channels), VProj);
+          QKV := NN.AddLayer( TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+          HeadAttn := NN.AddLayer( TNNetWindowAttention.Create(AHeadDim, ws2) );
+          SetLength(WinAttnLayers, Length(WinAttnLayers) + 1);
+          WinAttnLayers[High(WinAttnLayers)] := HeadAttn;
+          HeadOuts[h] := HeadAttn;
+        end;
+        AttnConcat := NN.AddLayer( TNNetDeepConcat.Create(HeadOuts) );
+        OProj := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(ADim).SetTrainable(pTrainable) );
+        WindowOuts[wIdx] := OProj;
+        // q/k/v sliced out of the packed [3*Dim, Dim] qkv slab; o_proj plain.
+        LoadLlamaLinearWeights(Reader, QProj, Prefix + '.attn.qkv.weight',
+          ADim, ADim, 0, -1, 0, Prefix + '.attn.qkv.bias', 1.0, 0, 0, 3 * ADim,
+          false, false, QkvSlab);
+        LoadLlamaLinearWeights(Reader, KProj, Prefix + '.attn.qkv.weight',
+          ADim, ADim, 0, -1, 0, Prefix + '.attn.qkv.bias', 1.0, 0, ADim, 3 * ADim,
+          false, false, QkvSlab);
+        LoadLlamaLinearWeights(Reader, VProj, Prefix + '.attn.qkv.weight',
+          ADim, ADim, 0, -1, 0, Prefix + '.attn.qkv.bias', 1.0, 0, 2 * ADim,
+          3 * ADim, false, false, QkvSlab);
+        LoadLlamaLinearWeights(Reader, OProj, Prefix + '.attn.proj.weight',
+          ADim, ADim, 0, -1, 0, Prefix + '.attn.proj.bias');
+      end;
+    finally
+      QkvSlab.Free;
     end;
     AttnConcat := NN.AddLayer(
       TNNetConcat.Create(NW * ws2, 1, ADim, WindowOuts) );
@@ -66784,7 +66836,9 @@ procedure LoadVaeConv(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName, BName: string; OutCh, InCh, K: integer);
 var
   W, B: TNNetVolume;
-  o, c, ky, kx, OutChM1, InChM1, KM1: integer;
+  o, c, ky, kx, OutChM1, InChM1, KM1, kBase, srcIdx, KK: integer;
+  Neuron: TNNetNeuron;
+  WVol: TNNetVolume;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -66822,15 +66876,30 @@ begin
     OutChM1 := OutCh - 1;
     InChM1 := InCh - 1;
     KM1 := K - 1;
+    KK := K * K;
     for o := 0 to OutChM1 do
     begin
-      for ky := 0 to KM1 do
-        for kx := 0 to KM1 do
-          for c := 0 to InChM1 do
-            Layer.FArrNeurons[o].Weights.FData[(ky * K + kx) * InCh + c] :=
-              W.FData[((o * InCh + c) * K + ky) * K + kx];
-      if BName <> '' then Layer.FArrNeurons[o].BiasWeight := B.FData[o]
-      else Layer.FArrNeurons[o].BiasWeight := 0;
+      Neuron := Layer.FArrNeurons[o];
+      WVol := Neuron.Weights;
+      if K = 1 then
+        // 1x1: the InCh weights of a filter are contiguous in both tensors,
+        // so the transpose degenerates to a copy (App. C, #13).
+        Move(W.FData[o * InCh], WVol.FData[0], InCh * csNeuralFloatSize)
+      else
+        for ky := 0 to KM1 do
+          for kx := 0 to KM1 do
+          begin
+            kBase := (ky * K + kx) * InCh;
+            // #12: the source walks c with a fixed K*K stride.
+            srcIdx := (o * InCh * K + ky) * K + kx;
+            for c := 0 to InChM1 do
+            begin
+              WVol.FData[kBase + c] := W.FData[srcIdx];
+              Inc(srcIdx, KK);
+            end;
+          end;
+      if BName <> '' then Neuron.BiasWeight := B.FData[o]
+      else Neuron.BiasWeight := 0;
     end;
     Layer.FlushWeightCache();
   finally
