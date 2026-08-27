@@ -15897,15 +15897,18 @@ begin
         {ExpectedNeurons=}SlabInRows, {RotaryHeadDim=}0, {BiasName=}'',
         {Scale=}1.0, {RotaryDims=}0,
         {SrcRowBase=}e * TwoI + ExpertWidth, {SrcRows=}SlabInRows,
-        {pFlatSlabRows=}true);
+        {pFlatSlabRows=}true, {pDeferFlush=}true);
       LoadLlamaLinearWeights(Reader, EG, InName,
         {InDim=}HiddenSize, {OutDim=}ExpertWidth,
         {NeuronBase=}e * TwoI + ExpertWidth,
         {ExpectedNeurons=}SlabInRows, {RotaryHeadDim=}0, {BiasName=}'',
         {Scale=}1.0, {RotaryDims=}0,
         {SrcRowBase=}e * TwoI, {SrcRows=}SlabInRows,
-        {pFlatSlabRows=}true);
+        {pFlatSlabRows=}true, {pDeferFlush=}true);
     end;
+    // Every expert half filled a disjoint neuron range of the same bank, so
+    // one cache rebuild covers them all (the staged path below does the same).
+    EG.FlushWeightCache();
   end
   else
   begin
@@ -16148,14 +16151,20 @@ begin
   LoadLlamaLinearWeights(Reader, Block.LinQKV,
     LinPrefix + 'in_proj_qkv.weight', Config.HiddenSize, ConvDim);
   Consumed.Add(LinPrefix + 'in_proj_qkv.weight');
+  // z, b and a fill DISJOINT neuron ranges of the SAME LinZBA layer, so only
+  // the last one has to rebuild the layer's concat/bias cache.
   LoadLlamaLinearWeights(Reader, Block.LinZBA,
     LinPrefix + 'in_proj_z.weight', Config.HiddenSize, ValueDim,
-    {NeuronBase=}0, {ExpectedNeurons=}ZBADim);
+    {NeuronBase=}0, {ExpectedNeurons=}ZBADim,
+    {RotaryHeadDim=}0, {BiasName=}'', {Scale=}1.0, {RotaryDims=}0,
+    {SrcRowBase=}0, {SrcRows=}0, {pFlatSlabRows=}false, {pDeferFlush=}true);
   Consumed.Add(LinPrefix + 'in_proj_z.weight');
   LoadLlamaLinearWeights(Reader, Block.LinZBA,
     LinPrefix + 'in_proj_b.weight', Config.HiddenSize,
     Config.LinearNumVHeads,
-    {NeuronBase=}ValueDim, {ExpectedNeurons=}ZBADim);
+    {NeuronBase=}ValueDim, {ExpectedNeurons=}ZBADim,
+    {RotaryHeadDim=}0, {BiasName=}'', {Scale=}1.0, {RotaryDims=}0,
+    {SrcRowBase=}0, {SrcRows=}0, {pFlatSlabRows=}false, {pDeferFlush=}true);
   Consumed.Add(LinPrefix + 'in_proj_b.weight');
   LoadLlamaLinearWeights(Reader, Block.LinZBA,
     LinPrefix + 'in_proj_a.weight', Config.HiddenSize,
@@ -17315,11 +17324,16 @@ begin
             // Always-on shared expert: SEPARATE 2-D SwiGLU projections
             // (shared_expert.gate/up/down_proj) + the [1, hidden] sigmoid
             // gate shared_expert_gate (see BuildMixtralMoEBranch).
+            // The up and gate halves fill disjoint neuron ranges of the same
+            // layer: only the gate half rebuilds the weight cache.
             TensorNameStr := BlockPrefix + 'mlp.shared_expert.';
             LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedGateUp,
               TensorNameStr + 'up_proj.weight',
               Config.HiddenSize, Config.SharedIntermediateSize,
-              0, 2 * Config.SharedIntermediateSize);
+              0, 2 * Config.SharedIntermediateSize,
+              {RotaryHeadDim=}0, {BiasName=}'', {Scale=}1.0, {RotaryDims=}0,
+              {SrcRowBase=}0, {SrcRows=}0,
+              {pFlatSlabRows=}false, {pDeferFlush=}true);
             MarkConsumed(TensorNameStr + 'up_proj.weight');
             LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedGateUp,
               TensorNameStr + 'gate_proj.weight',
@@ -17349,11 +17363,15 @@ begin
               Config.NumLocalExperts, Config.HiddenSize, i, Consumed);
             if Config.SharedIntermediateSize > 0 then
             begin
+              // Disjoint halves of one layer: the gate half flushes for both.
               TensorNameStr := BlockPrefix + 'feed_forward.shared_expert.';
               LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedGateUp,
                 TensorNameStr + 'up_proj.weight',
                 Config.HiddenSize, Config.SharedIntermediateSize,
-                0, 2 * Config.SharedIntermediateSize);
+                0, 2 * Config.SharedIntermediateSize,
+                {RotaryHeadDim=}0, {BiasName=}'', {Scale=}1.0, {RotaryDims=}0,
+                {SrcRowBase=}0, {SrcRows=}0,
+                {pFlatSlabRows=}false, {pDeferFlush=}true);
               MarkConsumed(TensorNameStr + 'up_proj.weight');
               LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedGateUp,
                 TensorNameStr + 'gate_proj.weight',
@@ -17394,7 +17412,9 @@ begin
                 {NeuronBase=}0, {ExpectedNeurons=}2 * Config.SharedIntermediateSize,
                 {RotaryHeadDim=}0, {BiasName=}'', {Scale=}1.0, {RotaryDims=}0,
                 {SrcRowBase=}Config.SharedIntermediateSize,
-                {SrcRows=}2 * Config.SharedIntermediateSize); // UP rows
+                {SrcRows=}2 * Config.SharedIntermediateSize, // UP rows
+                // Disjoint halves of one layer: the GATE half flushes for both.
+                {pFlatSlabRows=}false, {pDeferFlush=}true);
               LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].SharedGateUp,
                 TensorNameStr + 'input_linear.weight',
                 Config.HiddenSize, Config.SharedIntermediateSize,
