@@ -70223,10 +70223,10 @@ var
   StartTime: double;
   Wout: TNNetVolume;
   SeqLen, t, d, n, baseT, baseDN, baseW, prevBase, DepthOrder: integer;
-  SeqLenM1, DepthM1, OrderM1: integer;
-  acc, u: TNeuralFloat;
+  SeqLenM1, DepthM1, OrderM1, abarOfs, OrderBytes: integer;
+  HasPrev: boolean;
+  u: TNeuralFloat;
   XtPtr, OutPtr: TNeuralFloatArrPtr;
-  AbarR: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -70236,26 +70236,37 @@ begin
   DepthM1 := FDepth - 1;
   OrderM1 := FOrder - 1;
   DepthOrder := FDepth * FOrder;
+  OrderBytes := FOrder * csNeuralFloatSize;
   for t := 0 to SeqLenM1 do
   begin
     XtPtr := FPrevLayer.FOutput.GetRawPtr(t, 0);
     OutPtr := FOutput.GetRawPtr(t, 0);
     baseT := t * DepthOrder;
+    HasPrev := t > 0;
     for d := 0 to DepthM1 do
     begin
       u := XtPtr^[d];
       baseW := d * FOrder;
       baseDN := baseT + baseW;
       prevBase := baseDN - DepthOrder;
-      // m_t[d] = Abar * m_{t-1}[d] + Bbar * u
-      for n := 0 to OrderM1 do
+      // m_t[d] = Abar * m_{t-1}[d] + Bbar * u. The t = 0 step has no carry, so
+      // it is a plain scaled copy of Bbar; unswitching also lets the Abar row
+      // pointer advance by a constant FOrder instead of a per-row multiply.
+      if HasPrev then
       begin
-        AbarR := FAbar.GetRawPtr(n, 0);
-        acc := FBbar.FData[n] * u;
-        if t > 0 then
-          acc := acc +
-            TNNetVolume.DotProduct(AbarR, @FM.FData[prevBase], FOrder);
-        FM.FData[baseDN + n] := acc;
+        abarOfs := 0;
+        for n := 0 to OrderM1 do
+        begin
+          FM.FData[baseDN + n] := FBbar.FData[n] * u +
+            TNNetVolume.DotProduct(@FAbar.FData[abarOfs],
+              @FM.FData[prevBase], FOrder);
+          Inc(abarOfs, FOrder);
+        end;
+      end
+      else
+      begin
+        Move(FBbar.FData[0], FM.FData[baseDN], OrderBytes);
+        TNNetVolume.Mul(@FM.FData[baseDN], u, FOrder);
       end;
       // read-out y_t[d] = sum_n Wout[d,n]*m_t[d,n]
       OutPtr^[d] :=
@@ -70526,8 +70537,8 @@ var
   StartTime: double;
   Wq, Wk, Wv, Wa, Ba: TNNetVolume;
   SeqLen, Depth, t, d, e, j, baseT, baseS, SeqLenM1: integer;
-  DepthM1, idx, dD, rowOfs, baseSPrev, DepthSq: integer;
-  hasInputGrad: boolean;
+  DepthM1, idx, dD, rowOfs, baseSPrev, DepthSq, DepthBytes: integer;
+  hasInputGrad, HasPrev: boolean;
   GyPtr, XtPtr, PrevErrPtr: TNeuralFloatArrPtr;
   WqR, WkR, WvR, WaR, GWqR, GWkR, GWvR, GWaR: TNeuralFloatArrPtr;
   knrm, kdotgkn, alphad, ga_pre, sPrev: TNeuralFloat;
@@ -70555,6 +70566,7 @@ begin
   // plus the carry from step t+1's gated use of S_t as S_{t-1}.
   SeqLenM1 := SeqLen - 1;
   DepthSq := Depth * Depth;   // #5
+  DepthBytes := Depth * csNeuralFloatSize;
   for t := SeqLenM1 downto 0 do
   begin
     GyPtr := FOutputError.GetRawPtr(t, 0);
@@ -70564,38 +70576,33 @@ begin
     knrm := FKnorm.FData[t];
     if hasInputGrad then PrevErrPtr := PrevErr.GetRawPtr(t, 0)
     else PrevErrPtr := nil;
-    for d := 0 to DepthM1 do
-    begin
-      FgqBuf[d] := 0; FgvBuf[d] := 0; FgknBuf[d] := 0; FgkrawBuf[d] := 0; FgaBuf[d] := 0;
-    end;
-    // Read-out y_t[e] = sum_d q_t[d]*S_t[d,e]: scatter into dL/dS_t (+carry) and
-    // dL/dq, vectorized per row d (FGS row + FS row contiguous over e).
-    dD := 0;
-    for d := 0 to DepthM1 do
-    begin
-      TNNetVolume.MulAdd(@FGS.FData[dD], @GyPtr^[0], FQ.FData[baseT + d], Depth);
-      FgqBuf[d] := FgqBuf[d] +
-        TNNetVolume.DotProduct(@GyPtr^[0], @FS.FData[baseS + dD], Depth);
-      Inc(dD, Depth);
-    end;
-    // Now FGS = dL/dS_t (full). Write: S_t[d,e] = alpha[d]*S_{t-1}[d,e] + k[d]*v[e].
-    // dL/dk, dL/dv (via the outer product), dL/dalpha and the carry dL/dS_{t-1}
-    // (= alpha[d]*FGS[d,e], a per-row scaling by the gate). Per row d (contig over e).
+    FillChar(FgqBuf[0], DepthBytes, 0); FillChar(FgvBuf[0], DepthBytes, 0);
+    FillChar(FgknBuf[0], DepthBytes, 0); FillChar(FgkrawBuf[0], DepthBytes, 0);
+    FillChar(FgaBuf[0], DepthBytes, 0);
+    // Read-out y_t[e] = sum_d q_t[d]*S_t[d,e] scattered into dL/dS_t (+carry)
+    // and dL/dq, fused with the write term S_t[d,e] = alpha[d]*S_{t-1}[d,e] +
+    // k[d]*v[e] (dL/dk, dL/dv, dL/dalpha and the alpha[d]-scaled carry
+    // dL/dS_{t-1}). FGS row d is complete after this iteration's first MulAdd,
+    // so the write term consumes the row while it is still hot instead of in a
+    // second sweep. Per row d, contiguous over e.
+    HasPrev := t > 0;
     baseSPrev := baseS - DepthSq;
     dD := 0;
     for d := 0 to DepthM1 do
     begin
       idx := baseT + d;
-      alphad := FAlpha.FData[idx];
+      TNNetVolume.MulAdd(@FGS.FData[dD], @GyPtr^[0], FQ.FData[idx], Depth);
+      FgqBuf[d] := FgqBuf[d] +
+        TNNetVolume.DotProduct(@GyPtr^[0], @FS.FData[baseS + dD], Depth);
       FgknBuf[d] := FgknBuf[d] +
         TNNetVolume.DotProduct(@FGS.FData[dD], @FV.FData[baseT], Depth);
       TNNetVolume.MulAdd(@FgvBuf[0], @FGS.FData[dD], FKey.FData[idx], Depth);
-      if t > 0 then
+      if HasPrev then
       begin
         FgaBuf[d] := FgaBuf[d] + TNNetVolume.DotProduct(@FGS.FData[dD],
           @FS.FData[baseSPrev + dD], Depth);
         // Carry dL/dS_{t-1}[d,e] = alpha[d] * dL/dS_t[d,e] (row-scaled by the gate).
-        TNNetVolume.Mul(@FGS.FData[dD], alphad, Depth);
+        TNNetVolume.Mul(@FGS.FData[dD], FAlpha.FData[idx], Depth);
       end;
       Inc(dD, Depth);
     end;
