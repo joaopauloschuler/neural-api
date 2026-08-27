@@ -24421,14 +24421,16 @@ begin
   end
   else
   begin
-    // can't calculate error on input layers.
+    // Forward-only: nothing on this path is gradient-checked, so the sigmoid
+    // rides the vectorized TNNetVolume.Sigmoid instead of the RTL double Exp.
+    // FOutput := beta*x, sigmoid(beta*x) in place, then a scalar finish that
+    // folds the beta*x factor back in (no transcendental left in the loop).
+    FOutput.Copy(LocalPrevOutput, SizeM1 + 1);
+    TNNetVolume.Mul(FOutput.DataPtr, Beta, SizeM1 + 1);
+    TNNetVolume.Sigmoid(FOutput.DataPtr, FOutput.DataPtr, SizeM1 + 1);
     for OutputCnt := 0 to SizeM1 do
-    begin
-      PrevValue := LocalPrevOutput.FData[OutputCnt];
-      BetaX := Beta * PrevValue;
-      // Kept on RTL Exp for parity with the deriv branch above (see note).
-      FOutput.FData[OutputCnt] := Beta * PrevValue / ( 1 + Exp(-BetaX) );
-    end;
+      FOutput.FData[OutputCnt] := Beta * LocalPrevOutput.FData[OutputCnt] *
+        FOutput.FData[OutputCnt];
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -24624,7 +24626,7 @@ end;
 procedure TNNetMishLearnable.Compute();
 var
   StartTime: double;
-  alpha, x, ax, sp, expVal, onePlusExp, t, sig: TNeuralFloat;
+  alpha, x, ax, expVal, t, sig: TNeuralFloat;
   i, SizeM1: integer;
   LocalPrevOutput: TNNetVolume;
   HasDeriv: boolean;
@@ -24643,32 +24645,44 @@ begin
   SizeM1 := LocalPrevOutput.Size - 1;
   HasDeriv := (FOutput.Size = FOutputError.Size) and
               (FOutputErrorDeriv.Size = FOutput.Size);
+  // Two-pass, mirroring TNNetMish.Compute: fill FOutput with the numerically
+  // stable softplus(alpha*x), take one vectorized TNNetVolume.Tanh ride over the
+  // whole volume, then finish elementwise. Under HasDeriv the exp(alpha*x) that
+  // pass 1 already computed is parked in the FOutputErrorDeriv scratch and read
+  // back by pass 2 before that slot is overwritten with the derivative.
   if HasDeriv then
   begin
     for i := 0 to SizeM1 do
     begin
-      x := LocalPrevOutput.FData[i];
-      ax := alpha * x;
-      // Numerically stable softplus(ax) and sigmoid(ax).
+      ax := alpha * LocalPrevOutput.FData[i];
       if ax > 30 then
-      begin
-        sp := ax;
-        sig := 1.0;
-      end
-      else if ax < -30 then
-      begin
-        expVal := NeuralExp(ax);
-        sp := expVal;
-        sig := expVal;
-      end
+        FOutput.FData[i] := ax
       else
       begin
         expVal := NeuralExp(ax);
-        onePlusExp := 1 + expVal;
-        sp := pcr_logf(onePlusExp);
-        sig := expVal / onePlusExp;
+        FOutputErrorDeriv.FData[i] := expVal;
+        if ax < -30 then
+          FOutput.FData[i] := expVal
+        else
+          FOutput.FData[i] := pcr_logf(1 + expVal);
       end;
-      t := pcr_tanhf(sp);
+    end;
+    TNNetVolume.Tanh(FOutput.DataPtr, FOutput.DataPtr, SizeM1 + 1);
+    for i := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[i];
+      t := FOutput.FData[i];   // tanh(softplus(alpha*x)) from the vectorized pass
+      ax := alpha * x;
+      if ax > 30 then
+        sig := 1.0
+      else
+      begin
+        expVal := FOutputErrorDeriv.FData[i];   // exp(alpha*x) parked by pass 1
+        if ax < -30 then
+          sig := expVal
+        else
+          sig := expVal / (1 + expVal);
+      end;
       FOutput.FData[i] := x * t;
       // dy/dx = t + x*(1 - t^2)*(alpha*sig).
       FOutputErrorDeriv.FData[i] := t + x * (1 - t * t) * (alpha * sig);
@@ -24678,16 +24692,16 @@ begin
   begin
     for i := 0 to SizeM1 do
     begin
-      x := LocalPrevOutput.FData[i];
-      ax := alpha * x;
+      ax := alpha * LocalPrevOutput.FData[i];
       if ax > 30 then
-        sp := ax
+        FOutput.FData[i] := ax
       else if ax < -30 then
-        sp := NeuralExp(ax)
+        FOutput.FData[i] := NeuralExp(ax)
       else
-        sp := pcr_logf(1 + NeuralExp(ax));
-      FOutput.FData[i] := x * pcr_tanhf(sp);
+        FOutput.FData[i] := pcr_logf(1 + NeuralExp(ax));
     end;
+    TNNetVolume.Tanh(FOutput.DataPtr, FOutput.DataPtr, SizeM1 + 1);
+    TNNetVolume.Mul(FOutput.DataPtr, LocalPrevOutput.DataPtr, SizeM1 + 1);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
