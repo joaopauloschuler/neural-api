@@ -58083,7 +58083,7 @@ var
   localNeuron: TNNetNeuron;
   W: TNNetVolume;
   Prev, PrevErr: TNNetVolume;
-  SizeX, SizeY, Depth, x, y, d: integer;
+  SizeX, SizeY, Depth, x, y: integer;
   SizeXM1, SizeYM1, DepthM1: integer;
   hasInputGrad: boolean;
 begin
@@ -58106,13 +58106,16 @@ begin
   // Gradient w.r.t. each per-channel alpha:
   // gradAlpha[d] = sum over x,y of OutputError[x,y,d] * Input[x,y,d].
   FillDWord(FgradAlphaBuf[0], DepthM1 + 1, 0);   // #13
-  for x := 0 to SizeXM1 do
-    for y := 0 to SizeYM1 do
+  // Y outer / X inner (App. E): consecutive x are adjacent Depth-wide slots in
+  // both volumes, so the sweep walks memory forward instead of striding planes.
+  for y := 0 to SizeYM1 do
+    for x := 0 to SizeXM1 do
       TNNetVolume.MulAdd(@FgradAlphaBuf[0], FOutputError.GetRawPtr(x, y),
         Prev.GetRawPtr(x, y), Depth);
-  for d := 0 to DepthM1 do
-    localNeuron.FDelta.Raw[d] := localNeuron.FDelta.Raw[d] +
-      (-FLearningRate) * FgradAlphaBuf[d];
+  // FDelta is (1,1,Depth), so the whole per-channel update is one scaled
+  // accumulate (#13).
+  TNNetVolume.MulAdd(localNeuron.FDelta.DataPtr, @FgradAlphaBuf[0],
+    -FLearningRate, Depth);
 
   if (not FBatchUpdate) then
   begin
@@ -58126,8 +58129,8 @@ begin
     PrevErr := FPrevLayer.FOutputError;
     // Gradient w.r.t. the input:
     // dInput[x,y,d] = OutputError[x,y,d] * alpha[d].
-    for x := 0 to SizeXM1 do
-      for y := 0 to SizeYM1 do
+    for y := 0 to SizeYM1 do
+      for x := 0 to SizeXM1 do
         TNNetVolume.MulAdd(PrevErr.GetRawPtr(x, y),
           FOutputError.GetRawPtr(x, y), W.DataPtr, Depth);
     FPrevLayer.Backpropagate();
@@ -58185,10 +58188,12 @@ procedure TNNetSquash.Compute();
 var
   MaxOutputX: integer;
   MaxOutputY: integer;
-  NumCapsM1, DimM1: integer;
+  NumCapsM1: integer;
   StartTime: double;
-  Dim, NumCaps, x, y, c, i, baseD, baseIn, baseCap: integer;
+  Dim, NumCaps, x, y, c, baseD, baseIn, baseCap: integer;
+  basePrev0, baseCap0: integer;
   Prev: TNNetVolume;
+  PrevPtr: TNeuralFloatArrPtr;
   SumSq, n, fOverN, Eps: TNeuralFloat;
 begin
   StartTime := Now();
@@ -58198,27 +58203,35 @@ begin
   NumCaps := FOutput.Depth div Dim;
   Eps := 1e-12;
   NumCapsM1 := NumCaps - 1;
-  DimM1 := Dim - 1;
   MaxOutputX := FOutput.SizeX - 1;
   MaxOutputY := FOutput.SizeY - 1;
-  for x := 0 to MaxOutputX do
-    for y := 0 to MaxOutputY do
+  // Y outer / X inner (App. E), and the two row bases are hoisted to the (x,y)
+  // level: the capsule loop then only carries baseD by Dim and baseCap by 1
+  // (#6/#11). FOutput shares Prev's shape, so one base indexes both.
+  for y := 0 to MaxOutputY do
+    for x := 0 to MaxOutputX do
+    begin
+      basePrev0 := Prev.GetRawPos(x, y);
+      baseCap0 := FNorm2.GetRawPos(x, y);
+      baseD := 0;
       for c := 0 to NumCapsM1 do
       begin
-        baseD := c * Dim;
-        baseIn := Prev.GetRawPos(x, y, baseD);
-        baseCap := FNorm2.GetRawPos(x, y, c);
-        SumSq := TNNetVolume.DotProduct(Prev.GetRawPtr(baseIn),
-          Prev.GetRawPtr(baseIn), Dim);
+        baseIn := basePrev0 + baseD;
+        baseCap := baseCap0 + c;
+        PrevPtr := Prev.GetRawPtr(baseIn);
+        SumSq := TNNetVolume.DotProduct(PrevPtr, PrevPtr, Dim);
         n := Sqrt(SumSq + Eps);
-        // f = ||s||^2 / (1 + ||s||^2); v = (f/n) * s
-        fOverN := (SumSq / (1 + SumSq)) / n;
+        // f = ||s||^2 / (1 + ||s||^2); v = (f/n) * s. One divide by the
+        // product instead of two chained divides (#21).
+        fOverN := SumSq / ((1 + SumSq) * n);
         FNorm2.FData[baseCap] := SumSq;
         FScale.FData[baseCap] := fOverN;
         // #13: scale-copy v = (f/n)*s (Move then in-place scalar Mul).
         Move(Prev.FData[baseIn], FOutput.FData[baseIn], Dim * csNeuralFloatSize);
         TNNetVolume.Mul(FOutput.GetRawPtr(baseIn), fOverN, Dim);
+        Inc(baseD, Dim);
       end;
+    end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -58226,11 +58239,13 @@ procedure TNNetSquash.Backpropagate();
 var
   MaxOutputX: integer;
   MaxOutputY: integer;
-  NumCapsM1, DimM1: integer;
+  NumCapsM1: integer;
   StartTime: double;
-  Dim, NumCaps, x, y, c, i, baseD, baseIn, baseCap: integer;
+  Dim, NumCaps, x, y, c, baseD, baseIn, baseCap: integer;
+  basePrev0, baseCap0: integer;
   Prev, PrevErr: TNNetVolume;
-  SumSq, n, fOverN, dFON, sDotG, gi, si, k2, Eps: TNeuralFloat;
+  PrevPtr, ErrPtr, PrevErrPtr: TNeuralFloatArrPtr;
+  SumSq, n, fOverN, dFON, sDotG, k2, Eps: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -58252,28 +58267,36 @@ begin
     MaxOutputX := FOutput.SizeX - 1;
     MaxOutputY := FOutput.SizeY - 1;
     NumCapsM1 := NumCaps - 1;
-    DimM1 := Dim - 1;
-    for x := 0 to MaxOutputX do
-      for y := 0 to MaxOutputY do
+    // Same traversal as Compute: Y outer / X inner with the row bases hoisted
+    // to the (x,y) level (App. E, #6/#11). Prev, PrevErr and FOutputError all
+    // share one shape, so one base addresses all three.
+    for y := 0 to MaxOutputY do
+      for x := 0 to MaxOutputX do
+      begin
+        basePrev0 := Prev.GetRawPos(x, y);
+        baseCap0 := FNorm2.GetRawPos(x, y);
+        baseD := 0;
         for c := 0 to NumCapsM1 do
         begin
-          baseD := c * Dim;
-          baseIn := Prev.GetRawPos(x, y, baseD);
-          baseCap := FNorm2.GetRawPos(x, y, c);
+          baseIn := basePrev0 + baseD;
+          baseCap := baseCap0 + c;
           SumSq := FNorm2.FData[baseCap];
           fOverN := FScale.FData[baseCap];
           n := Sqrt(SumSq + Eps);
-          // scalar coefficient of s_j in d(f/n)/ds_j
-          dFON := ( 2 / Sqr(1 + SumSq) ) / n - fOverN / (SumSq + Eps);
-          sDotG := TNNetVolume.DotProduct(Prev.GetRawPtr(baseIn),
-            FOutputError.GetRawPtr(baseIn), Dim);
+          // Scalar coefficient of s_j in d(f/n)/ds_j; the first term divides
+          // once by the product instead of twice in sequence (#21).
+          dFON := 2 / (Sqr(1 + SumSq) * n) - fOverN / (SumSq + Eps);
+          PrevPtr := Prev.GetRawPtr(baseIn);
+          ErrPtr := FOutputError.GetRawPtr(baseIn);
+          PrevErrPtr := PrevErr.GetRawPtr(baseIn);
+          sDotG := TNNetVolume.DotProduct(PrevPtr, ErrPtr, Dim);
           // #13: dL/ds = fOverN*g + (sDotG*dFON)*s, two scaled accumulates.
           k2 := sDotG * dFON;
-          TNNetVolume.MulAdd(PrevErr.GetRawPtr(baseIn),
-            FOutputError.GetRawPtr(baseIn), fOverN, Dim);
-          TNNetVolume.MulAdd(PrevErr.GetRawPtr(baseIn),
-            Prev.GetRawPtr(baseIn), k2, Dim);
+          TNNetVolume.MulAdd(PrevErrPtr, ErrPtr, fOverN, Dim);
+          TNNetVolume.MulAdd(PrevErrPtr, PrevPtr, k2, Dim);
+          Inc(baseD, Dim);
         end;
+      end;
     FPrevLayer.Backpropagate();
   end;
   FBackwardTime := FBackwardTime + (Now() - StartTime);
