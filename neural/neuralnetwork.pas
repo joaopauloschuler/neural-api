@@ -117332,7 +117332,7 @@ var
   MaxBin, BarLen, HaveLg: integer;
   Bar, RowStr: string;
   Glyph: char;
-  CellVal: Double;
+  CellVal, SymDev: Double;
   // --- NTK drift (optional SnapshotB) scratch ---
   NetB: TNNet;
   StructStr, DiffStr: string;
@@ -117641,11 +117641,10 @@ begin
             Neuron := Layer.Neurons[NeuronIdx];
             DeltaCount := Neuron.Delta.Size;
             if DeltaCount > 0 then
-            begin
-              Move(Neuron.Delta.FData[0], GRow[P],
-                DeltaCount * csNeuralFloatSize);
-              TNNetVolume.Mul(TNeuralFloatArrPtr(@GRow[P]), InvLr, DeltaCount);
-            end;
+              // GRow is a freshly allocated (zeroed) row, so the scaled copy is
+              // one fused pass instead of a Move followed by a Mul.
+              TNNetVolume.MulAdd(TNeuralFloatArrPtr(@GRow[P]),
+                TNeuralFloatArrPtr(@Neuron.Delta.FData[0]), InvLr, DeltaCount);
             Inc(P, DeltaCount);
             // bias parameter
             GRow[P] := Neuron.FBiasDelta * InvLr;
@@ -117704,9 +117703,14 @@ begin
     for I := 0 to Nm1 do
     begin
       if Gram[I][I] < DiagMin then DiagMin := Gram[I][I];
-      for J := 0 to Nm1 do
-        if Abs(Gram[I][J] - Gram[J][I]) > SymOK then
-          SymOK := Abs(Gram[I][J] - Gram[J][I]);
+      // |K_ij - K_ji| is symmetric in (i,j), so the strict upper triangle
+      // already carries the maximum.
+      JStart := I + 1;
+      for J := JStart to Nm1 do
+      begin
+        SymDev := Abs(Gram[I][J] - Gram[J][I]);
+        if SymDev > SymOK then SymOK := SymDev;
+      end;
     end;
 
     // Snapshot the self Gram before the in-place Jacobi pass destroys it. The
@@ -117738,7 +117742,10 @@ begin
     MaxAbs := 0;
     for I := 0 to Nm1 do
       for J := 0 to Nm1 do
-        if Abs(Gram[I][J]) > MaxAbs then MaxAbs := Abs(Gram[I][J]);
+      begin
+        CellVal := Abs(Gram[I][J]);
+        if CellVal > MaxAbs then MaxAbs := CellVal;
+      end;
     Lines.Add('Kernel heatmap (rows/cols = probe index, ramp ''' + cGlyphs +
       ''' from 0 to |K|max):');
     Bar := '      ';
@@ -117750,6 +117757,8 @@ begin
       RowStr := Format('  [%2d] ', [I]);
       for J := 0 to Nm1 do
       begin
+        // Exact divide: the reciprocal form loses the exact 1.0 at |K|max and
+        // shifts that cell into the neighbouring glyph band.
         if MaxAbs > 0 then
           CellVal := Abs(Gram[I][J]) / MaxAbs
         else
@@ -118111,11 +118120,10 @@ var
   // per-trainable-layer flat-index bookkeeping over the whole net
   LayerHasParams: array of boolean;
   LayerInScope: array of boolean;   // included in the stats (LayerIdx filter)
-  FlatBase: array of integer;       // flat offset of each layer's params
   LayerParamCnt: array of integer;
-  NetParamCnt, TrainableLayers, ScopeParamCnt: integer;
+  TrainableLayers, ScopeParamCnt: integer;
   RestrictName: string;
-  ScopeMap: array of integer;       // net-flat param -> scope-flat slot (-1)
+  ScopeBase: array of integer;      // scope-flat base of each in-scope layer
   ScopeFlat: integer;
   // per-sample flattened gradient vectors (only over in-scope params)
   Grads: array of TFloatArray;      // [usable sample] -> scope-flat gradient
@@ -118125,13 +118133,14 @@ var
   DeltaCount: integer;
   InvLr: TNeuralFloat;
   UsableCount: integer;
+  InvUsable, InvUsableM1: TNeuralFloat;
   // accumulated batch statistics over the scope-flat parameter axis
   GBar: TFloatArray;                // mean gradient g_bar_k
   GStd: TFloatArray;                // per-param std across samples
   GSnr: TFloatArray;                // |g_bar_k| / (std_k + eps)
   Mean, Var_, Sd: TNeuralFloat;
-  // scope-flat -> owning trainable-layer index (for the per-layer means)
-  ParamLayer: array of integer;
+  SnrSum, TrSigmaSum, GBarSqSum: TNeuralFloat;
+  MaxScopeParamPos: integer;
   LayerSnrSum: array of TNeuralFloat;
   LayerTrSigma: array of TNeuralFloat;  // tr(Sigma) restricted to the layer
   LayerGBarSq: array of TNeuralFloat;   // ||g_bar||^2 restricted to the layer
@@ -118151,7 +118160,7 @@ var
   FlagStr: string;
   BTab: array[0..6] of integer;
   LastLayerIdx, LayerCntM1, ScopeParamCntM1, UsableCountM1: integer;
-  cBinsM1, BTabHigh, LayerParamCntM1: integer;
+  cBinsM1, BTabHigh: integer;
 begin
   Result := '';
   Lines := TStringList.Create();
@@ -118182,10 +118191,8 @@ begin
     // --- Catalogue trainable layers and lay out a flat parameter index. ---
     SetLength(LayerHasParams, NN.CountLayers());
     SetLength(LayerInScope, NN.CountLayers());
-    SetLength(FlatBase, NN.CountLayers());
     SetLength(LayerParamCnt, NN.CountLayers());
 
-    NetParamCnt := 0;
     TrainableLayers := 0;
     for LIdx := 0 to LastLayerIdx do
     begin
@@ -118193,7 +118200,6 @@ begin
       LayerHasParams[LIdx] := false;
       LayerInScope[LIdx] := false;
       LayerParamCnt[LIdx] := 0;
-      FlatBase[LIdx] := NetParamCnt;
       if Layer.Neurons.Count = 0 then Continue;
       K := 0;
       MaxParamCountNeuronPos := Layer.Neurons.Count - 1;
@@ -118203,8 +118209,6 @@ begin
       if K = 0 then Continue;
       LayerHasParams[LIdx] := true;
       LayerParamCnt[LIdx] := K;
-      FlatBase[LIdx] := NetParamCnt;
-      NetParamCnt := NetParamCnt + K;
       Inc(TrainableLayers);
     end;
 
@@ -118234,28 +118238,15 @@ begin
         RestrictName := 'all trainable layers';
     end;
 
-    // Map each net-flat parameter to a scope-flat slot (-1 if out of scope) and
-    // remember which trainable layer each in-scope slot belongs to.
-    SetLength(ScopeMap, NetParamCnt);
-    SetLength(ParamLayer, NetParamCnt);
+    // An in-scope layer owns one contiguous scope-flat slab, so the layout is
+    // one base per layer rather than a net-flat slot table.
+    SetLength(ScopeBase, NN.CountLayers());
     ScopeFlat := 0;
     for LIdx := 0 to LastLayerIdx do
     begin
-      if not LayerHasParams[LIdx] then Continue;
-      P := FlatBase[LIdx];
-      LayerParamCntM1 := LayerParamCnt[LIdx] - 1;
-      for K := 0 to LayerParamCntM1 do
-      begin
-        if LayerInScope[LIdx] then
-        begin
-          ScopeMap[P] := ScopeFlat;
-          ParamLayer[ScopeFlat] := LIdx;
-          Inc(ScopeFlat);
-        end
-        else
-          ScopeMap[P] := -1;
-        Inc(P);
-      end;
+      ScopeBase[LIdx] := ScopeFlat;
+      if not LayerInScope[LIdx] then Continue;
+      ScopeFlat := ScopeFlat + LayerParamCnt[LIdx];
     end;
     ScopeParamCnt := ScopeFlat;
     ScopeParamCntM1 := ScopeParamCnt - 1;
@@ -118300,9 +118291,7 @@ begin
         Target.Raw[LabelClass] := 1.0;
         NN.Backpropagate(Target);
 
-        // Flatten this sample's in-scope per-parameter gradient vector. An
-        // in-scope layer owns one contiguous scope-flat slab, so only its base
-        // needs the ScopeMap lookup.
+        // Flatten this sample's in-scope per-parameter gradient vector.
         SetLength(Grads[UsableCount], ScopeParamCnt);
         GRow := Grads[UsableCount];
         for LIdx := 0 to LastLayerIdx do
@@ -118312,18 +118301,17 @@ begin
           LR := Layer.LearningRate;
           if LR <= 0 then LR := 1.0;
           InvLr := 1.0 / LR;
-          P := ScopeMap[FlatBase[LIdx]];
+          P := ScopeBase[LIdx];
           MaxGradNeuronPos := Layer.Neurons.Count - 1;
           for NeuronIdx := 0 to MaxGradNeuronPos do
           begin
             Neuron := Layer.Neurons[NeuronIdx];
             DeltaCount := Neuron.Delta.Size;
             if DeltaCount > 0 then
-            begin
-              Move(Neuron.Delta.FData[0], GRow[P],
-                DeltaCount * csNeuralFloatSize);
-              TNNetVolume.Mul(TNeuralFloatArrPtr(@GRow[P]), InvLr, DeltaCount);
-            end;
+              // GRow is a freshly allocated (zeroed) row, so the scaled copy is
+              // one fused pass instead of a Move followed by a Mul.
+              TNNetVolume.MulAdd(TNeuralFloatArrPtr(@GRow[P]),
+                TNeuralFloatArrPtr(@Neuron.Delta.FData[0]), InvLr, DeltaCount);
             Inc(P, DeltaCount);
             // bias parameter
             GRow[P] := Neuron.FBiasDelta * InvLr;
@@ -118345,6 +118333,8 @@ begin
       Exit;
     end;
     UsableCountM1 := UsableCount - 1;
+    InvUsable := 1.0 / UsableCount;
+    InvUsableM1 := 1.0 / UsableCountM1;
 
     // --- Per-parameter mean, variance and SNR over the batch. ---
     // Sample-major: every pass walks one gradient row contiguously, where the
@@ -118363,7 +118353,7 @@ begin
     for I := 0 to UsableCountM1 do
       TNNetVolume.Add(GBarPtr, TNeuralFloatArrPtr(@Grads[I][0]),
         ScopeParamCnt);
-    for K := 0 to ScopeParamCntM1 do GBar[K] := GBar[K] / UsableCount;
+    TNNetVolume.Mul(GBarPtr, InvUsable, ScopeParamCnt);
 
     MeanGiSq := 0;
     for I := 0 to UsableCountM1 do
@@ -118378,7 +118368,7 @@ begin
       MeanGiSq := MeanGiSq +
         TNNetVolume.DotProduct(GRowPtr, GRowPtr, ScopeParamCnt);
     end;
-    MeanGiSq := MeanGiSq / UsableCount;
+    MeanGiSq := MeanGiSq * InvUsable;
 
     TrSigma := 0;
     GBarSq := 0;
@@ -118386,7 +118376,7 @@ begin
     begin
       Mean := GBar[K];
       // unbiased per-parameter variance across samples
-      Var_ := SumSqDev[K] / (UsableCount - 1);
+      Var_ := SumSqDev[K] * InvUsableM1;
       if Var_ < 0 then Var_ := 0;
       Sd := Sqrt(Var_);
       GStd[K] := Sd;
@@ -118415,14 +118405,26 @@ begin
       LayerScopeCnt[LIdx] := 0;
       LayerName[LIdx] := '';
     end;
-    for K := 0 to ScopeParamCntM1 do
+    for LIdx := 0 to LastLayerIdx do
     begin
-      LIdx := ParamLayer[K];
-      LayerSnrSum[LIdx] := LayerSnrSum[LIdx] + GSnr[K];
-      LayerTrSigma[LIdx] := LayerTrSigma[LIdx] + GStd[K] * GStd[K];
-      LayerGBarSq[LIdx] := LayerGBarSq[LIdx] + GBar[K] * GBar[K];
-      Inc(LayerScopeCnt[LIdx]);
+      if not LayerInScope[LIdx] then Continue;
       LayerName[LIdx] := NN.Layers[LIdx].ClassName;
+      LayerScopeCnt[LIdx] := LayerParamCnt[LIdx];
+      SnrSum := 0;
+      TrSigmaSum := 0;
+      GBarSqSum := 0;
+      MaxScopeParamPos := ScopeBase[LIdx] + LayerParamCnt[LIdx] - 1;
+      for K := ScopeBase[LIdx] to MaxScopeParamPos do
+      begin
+        Sd := GStd[K];
+        Mean := GBar[K];
+        SnrSum := SnrSum + GSnr[K];
+        TrSigmaSum := TrSigmaSum + Sd * Sd;
+        GBarSqSum := GBarSqSum + Mean * Mean;
+      end;
+      LayerSnrSum[LIdx] := SnrSum;
+      LayerTrSigma[LIdx] := TrSigmaSum;
+      LayerGBarSq[LIdx] := GBarSqSum;
     end;
 
     // --- SNR histogram bin edges (over the actual SNR range). ---

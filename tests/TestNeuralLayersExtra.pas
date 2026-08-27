@@ -5578,11 +5578,25 @@ begin
     AssertTrue('noisy batch has larger noise scale than clean',
       NoisyB > CleanB);
 
+    // --- Per-layer table rows name the owning layer of each scope slab. ---
+    AssertTrue('full scope counts every trainable param',
+      Pos('75 param(s) in scope', CleanReport) > 0);
+    AssertTrue('hidden layer row names its class',
+      Pos('     1   TNNetFullConnectReLU', CleanReport) > 0);
+    AssertTrue('output layer row names its class',
+      Pos('     2   TNNetFullConnectLinear', CleanReport) > 0);
+
     // --- LayerIdx scope filter runs and is labelled. ---
     HeadReport := TNNet.GradientNoiseScaleReport(NN, Noisy, True, 2);
     AssertTrue('layer-restricted report non-empty', Length(HeadReport) > 0);
     AssertTrue('layer-restricted scope labelled',
       Pos('layer 2', HeadReport) > 0);
+    AssertTrue('layer-restricted scope counts that layer only',
+      Pos('39 param(s) in scope', HeadReport) > 0);
+    AssertTrue('layer-restricted table row names the restricted layer',
+      Pos('     2   TNNetFullConnectLinear', HeadReport) > 0);
+    AssertTrue('out-of-scope layer absent from the restricted report',
+      Pos('TNNetFullConnectReLU', HeadReport) = 0);
 
     // predicted-label mode also produces a well-formed report.
     CleanReport := TNNet.GradientNoiseScaleReport(NN, Clean, False);
