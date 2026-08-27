@@ -491,6 +491,11 @@ type
     // them together. Coded by Claude (AI).
     procedure TestOpenCLDisableEnableCycle;
     procedure TestOpenCLDisableEnableCycleTraining;
+    // The same disable/re-enable cycle WITHOUT ForceOpenCL, so the per-layer
+    // size verdict is what has to survive the teardown: it is frozen at
+    // SetPrevLayer and never recomputed, so a DisableOpenCL that clears it
+    // pins the layer to the CPU for the rest of its life. Coded by Claude (AI).
+    procedure TestOpenCLReEnableSizeVerdict;
     // OpenCL split-K int8 parity: a long reduction axis with few output
     // neurons is the decode GEMV shape that makes TDotProductSharedKernel
     // .Int8SplitCount cut the axis into slabs, so this covers the two-pass
@@ -67378,6 +67383,90 @@ begin
     NNRef.Free;
     NN.Free;
   end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Disable/re-enable with NO ForceOpenCL. Every other cycle test forces the
+// device path, which hides the per-layer size verdict: FShouldOpenCL is decided
+// once at SetPrevLayer, so anything that clears it without recomputing it leaves
+// the layer on the CPU forever. 2048x512 is above TNNetFullConnect's verdict
+// (>=512 neurons, >=128 inputs), run both int8-quantized and FP32 because the
+// verdict is shared by the two forwards. ForwardGPUCnt is the assertion that
+// matters - a silent CPU fallback matches the CPU reference exactly.
+// Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestOpenCLReEnableSizeVerdict;
+{$IFDEF OpenCL}
+  procedure RunFC(const aName: string; pQuantize: boolean);
+  var
+    NN: TNNet;
+    Input, Ref: TNNetVolume;
+    FC: TNNetFullConnect;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i, GPUCntBefore: integer;
+    Diff, MaxDiff: TNeuralFloat;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    RandSeed := 20260826;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(1, 1, 2048);
+    Ref := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(1, 1, 2048, 1));
+      FC := TNNetFullConnect.Create(512, 0);
+      NN.AddLayer(FC);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.7 * Sin(i * 0.013) - 0.2;
+      for i := 0 to FC.Neurons.Count - 1 do
+        FC.Neurons[i].BiasWeight := 0.25 * Cos(i * 0.11);
+      NN.UpdateWeights();
+      FC.SetTrainable(False, False);
+      if pQuantize then NN.QuantizeWeightsInt8();
+
+      NN.Compute(Input);
+      Ref.Copy(NN.GetLastLayer.Output);
+
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      AssertTrue('ReEnableVerdict ' + aName + ' first arming ran on the device',
+        FC.ForwardGPUCnt > 0);
+      NN.DisableOpenCL();
+      NN.Compute(Input);
+
+      GPUCntBefore := FC.ForwardGPUCnt;
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      NN.GetLastLayer.ForceOutputOnRAM();
+      MaxDiff := 0;
+      for i := 0 to Ref.Size - 1 do
+      begin
+        Diff := Abs(Ref.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      WriteLn('  ReEnableVerdict ', aName, ': max|diff|=', MaxDiff:0:9,
+        ' gpu forwards=', FC.ForwardGPUCnt);
+      AssertTrue('ReEnableVerdict ' + aName + ' re-armed on the device: ' +
+        'ForwardGPUCnt = ' + IntToStr(FC.ForwardGPUCnt) + ' must exceed ' +
+        IntToStr(GPUCntBefore), FC.ForwardGPUCnt > GPUCntBefore);
+      AssertTrue('ReEnableVerdict ' + aName + ' device vs CPU parity: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    finally
+      Ref.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+begin
+  RunFC('fp32 2048x512', False);
+  RunFC('int8 2048x512', True);
 end;
 {$ELSE}
 begin

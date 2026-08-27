@@ -132506,11 +132506,14 @@ begin
     FNN.FreeKernelIfNotShared('cai_dot_product', F32Kernel);
 end;
 
+// FShouldOpenCL is deliberately left alone: it is the per-layer SIZE verdict,
+// frozen at SetPrevLayer and never recomputed, so clearing it here would pin the
+// layer to the CPU for good after a re-arming. Every reader pairs it with
+// FHasOpenCL (or an allocated helper), which this call does clear.
 procedure TNNetLayer.DisableOpenCL();
 begin
   ReleaseDotProductCL();
   FHasOpenCL := false;
-  FShouldOpenCL := false;
 end;
 
 procedure TNNetLayer.EnableOpenCL(DotProductKernel: TNeuralKernel);
