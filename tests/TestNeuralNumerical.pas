@@ -1003,6 +1003,7 @@ type
     procedure TestProductKeyMemoryInputGradientCheck;
     procedure TestProductKeyMemoryWeightGradientCheck;
     procedure TestProductKeyMemoryTopK1GradientCheck;
+    procedure TestProductKeyMemoryTopKSelectionTies;
     procedure TestProductKeyMemorySerializationRoundTrip;
     procedure TestAddProductKeyMemoryBuilder;
     procedure TestProductKeyMemoryMultiHeadInputGradientCheck;
@@ -43192,6 +43193,163 @@ begin
     WriteLn('ProductKeyMemory weight gradient max abs error: ', maxErr:0:8);
   finally
     NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+// The product-key top-K selection breaks exact score ties by preferring the
+// lower key index (half lists) and the lower flat candidate index a*TopK+b
+// (combination list). Integer-valued keys and inputs make ties the common case,
+// so this oracle - a literal transcription of the original partial-selection-
+// sort selection - pins the tie policy that the heap-based selection replaced.
+procedure TTestNeuralNumerical.TestProductKeyMemoryTopKSelectionTies;
+const
+  cHalfKeys = 6;                 // NumKeys = 36
+  cTopK = 3;
+  cValueDim = 3;
+  cQueryDim = 4;                 // HalfQ = 2
+  cHalfQ = cQueryDim div 2;
+  cSeqLen = 5;
+  cNumCand = cTopK * cTopK;
+var
+  NN: TNNet;
+  Input, Ref: TNNetVolume;
+  PKM: TNNetProductKeyMemory;
+  K1, K2, V: TNNetVolume;
+  S1, S2: array[0..cHalfKeys - 1] of TNeuralFloat;
+  Used: array[0..cHalfKeys - 1] of boolean;
+  SelA, SelB: array[0..cTopK - 1] of integer;
+  CandScore: array[0..cNumCand - 1] of TNeuralFloat;
+  CandA, CandB: array[0..cNumCand - 1] of integer;
+  Wgt: array[0..cTopK - 1] of TNeuralFloat;
+  KeyIdx: array[0..cTopK - 1] of integer;
+  t, a, b, d, i, j, kk, gi, gbest, best, tmp, nCand: integer;
+  bestVal, acc, MaxScore, SumExp: TNeuralFloat;
+
+  // The pre-heap PKMTopKIndices: Want full scans with "already taken" marks,
+  // strict > so an exact tie keeps the lower index, then the (dead) re-sort.
+  procedure OldTopK(const Scores: array of TNeuralFloat;
+    var SelIdx: array of integer);
+  var
+    i, j, best, tmp: integer;
+    bestVal: TNeuralFloat;
+  begin
+    for j := 0 to cHalfKeys - 1 do Used[j] := False;
+    bestVal := 0;
+    for i := 0 to cTopK - 1 do
+    begin
+      best := -1;
+      for j := 0 to cHalfKeys - 1 do
+        if not Used[j] then
+          if (best = -1) or (Scores[j] > bestVal) then
+          begin
+            best := j;
+            bestVal := Scores[j];
+          end;
+      Used[best] := True;
+      SelIdx[i] := best;
+    end;
+    for i := 0 to cTopK - 2 do
+      for j := i + 1 to cTopK - 1 do
+        if Scores[SelIdx[j]] > Scores[SelIdx[i]] then
+        begin
+          tmp := SelIdx[i]; SelIdx[i] := SelIdx[j]; SelIdx[j] := tmp;
+        end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(cSeqLen, 1, cQueryDim);
+  Ref := TNNetVolume.Create(cSeqLen, 1, cValueDim);
+  try
+    NN.AddLayer(TNNetInput.Create(cSeqLen, 1, cQueryDim, 1));
+    PKM := TNNetProductKeyMemory.Create(cHalfKeys * cHalfKeys, cValueDim,
+      cTopK, 1, cQueryDim);
+    NN.AddLayer(PKM);
+    AssertEquals('HalfKeys', cHalfKeys, PKM.HalfKeys);
+    AssertEquals('TopK', cTopK, PKM.TopK);
+    K1 := PKM.Neurons[0].Weights;
+    K2 := PKM.Neurons[1].Weights;
+    V := PKM.Neurons[2].Weights;
+    // Small integer keys/inputs => exactly-equal half scores and exactly-equal
+    // candidate sums, which is what the tie policy has to resolve.
+    for t := 0 to cSeqLen - 1 do
+      for d := 0 to cQueryDim - 1 do
+        Input[t, 0, d] := ((t + d) mod 3) - 1;
+    for a := 0 to cHalfKeys - 1 do
+      for d := 0 to cHalfQ - 1 do
+      begin
+        K1[a, 0, d] := ((a + 2 * d) mod 3) - 1;
+        K2[a, 0, d] := ((2 * a + d) mod 3) - 1;
+      end;
+    for i := 0 to cHalfKeys * cHalfKeys - 1 do
+      for d := 0 to cValueDim - 1 do
+        V[i, 0, d] := Sin(i * 0.37 + d * 0.83) * 0.6 + 0.05 * d;
+
+    NN.Compute(Input);
+
+    for t := 0 to cSeqLen - 1 do
+    begin
+      for a := 0 to cHalfKeys - 1 do
+      begin
+        acc := 0;
+        for d := 0 to cHalfQ - 1 do acc := acc + Input[t, 0, d] * K1[a, 0, d];
+        S1[a] := acc;
+        acc := 0;
+        for d := 0 to cHalfQ - 1 do
+          acc := acc + Input[t, 0, cHalfQ + d] * K2[a, 0, d];
+        S2[a] := acc;
+      end;
+      OldTopK(S1, SelA);
+      OldTopK(S2, SelB);
+      nCand := 0;
+      for a := 0 to cTopK - 1 do
+        for b := 0 to cTopK - 1 do
+        begin
+          CandScore[nCand] := S1[SelA[a]] + S2[SelB[b]];
+          CandA[nCand] := SelA[a];
+          CandB[nCand] := SelB[b];
+          Inc(nCand);
+        end;
+      // Original candidate selection: max scan with strict >, so an exact tie
+      // keeps the lowest flat candidate index; consumed entries are marked -1.
+      for kk := 0 to cTopK - 1 do
+      begin
+        gbest := -1;
+        for gi := 0 to cNumCand - 1 do
+          if (CandA[gi] >= 0) and
+             ((gbest = -1) or (CandScore[gi] > CandScore[gbest])) then
+            gbest := gi;
+        KeyIdx[kk] := CandA[gbest] * cHalfKeys + CandB[gbest];
+        Wgt[kk] := CandScore[gbest];
+        CandA[gbest] := -1;
+      end;
+      MaxScore := -1e30;
+      for kk := 0 to cTopK - 1 do
+        if Wgt[kk] > MaxScore then MaxScore := Wgt[kk];
+      SumExp := 0;
+      for kk := 0 to cTopK - 1 do
+      begin
+        Wgt[kk] := Exp(Wgt[kk] - MaxScore);
+        SumExp := SumExp + Wgt[kk];
+      end;
+      for d := 0 to cValueDim - 1 do
+      begin
+        acc := 0;
+        for kk := 0 to cTopK - 1 do
+          acc := acc + (Wgt[kk] / SumExp) * V[KeyIdx[kk], 0, d];
+        Ref[t, 0, d] := acc;
+      end;
+    end;
+
+    for t := 0 to cSeqLen - 1 do
+      for d := 0 to cValueDim - 1 do
+        AssertTrue('ProductKeyMemory top-K selection at t=' + IntToStr(t) +
+          ' d=' + IntToStr(d) + ' (got=' +
+          FloatToStr(PKM.Output[t, 0, d]) + ' expected=' +
+          FloatToStr(Ref[t, 0, d]) + ')',
+          Abs(PKM.Output[t, 0, d] - Ref[t, 0, d]) < 1e-5);
+  finally
+    NN.Free; Input.Free; Ref.Free;
   end;
 end;
 

@@ -6242,11 +6242,10 @@ type
       FGradK1: TNNetVolume;      // (HalfKeys,1,HalfQ) K1-gradient accumulator (reused per head)
       FGradK2: TNNetVolume;      // (HalfKeys,1,HalfQ) K2-gradient accumulator (reused per head)
       FGradV: TNNetVolume;       // (NumKeys,1,ValueDim) V-gradient accumulator (reused per head)
-      // Compute scratch: per-half top-K indices (TopK) + candidate buffers (TopK*TopK).
+      // Compute scratch: per-half top-K indices (TopK) + the candidate merge
+      // heap (TopK entries: one (A slot, B slot) frontier pair per A slot).
       FSelABuf, FSelBBuf, FCandABuf, FCandBBuf: array of integer;
       FCandScoreBuf: array of TNeuralFloat;
-      // Top-K selection "already taken" marks (HalfKeys), reused per call.
-      FTopKUsed: array of boolean;
       // Backpropagate scratch (TopK): g_k and softmax-Jacobian score gradient.
       FGBuf, FdScoreBuf: array of TNeuralFloat;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -35683,7 +35682,6 @@ begin
   SetLength(FSelABuf, 0); SetLength(FSelBBuf, 0);
   SetLength(FCandABuf, 0); SetLength(FCandBBuf, 0);
   SetLength(FCandScoreBuf, 0);
-  SetLength(FTopKUsed, 0);
   FreeBackpropScratch();
   inherited Destroy();
 end;
@@ -35747,9 +35745,8 @@ begin
   SetLength(FIdxB, FHeads * SeqLen * FTopK);
   SetLength(FIdxKey, FHeads * SeqLen * FTopK);
   SetLength(FSelABuf, FTopK); SetLength(FSelBBuf, FTopK);
-  SetLength(FCandScoreBuf, FTopK * FTopK);
-  SetLength(FCandABuf, FTopK * FTopK); SetLength(FCandBBuf, FTopK * FTopK);
-  SetLength(FTopKUsed, FHalfKeys);
+  SetLength(FCandScoreBuf, FTopK);
+  SetLength(FCandABuf, FTopK); SetLength(FCandBBuf, FTopK);
   // Backprop-only scratch: skip on inference-only layers.
   if FIsTrainable then
   begin
@@ -35758,46 +35755,99 @@ begin
   InitDefault();
 end;
 
-// Fills SelIdx[0..Want-1] with the indices of the Want largest entries of
-// Scores[0..Count-1] (descending). Simple partial selection sort -- Want is
-// TopK (tiny) and Count is HalfKeys (sqrt of memory), so this is cheap.
-// Used[0..Count-1] is caller-owned scratch (a persistent layer field, sized at
-// SetPrevLayer): the routine runs per (head, token), so it must never allocate.
-procedure PKMTopKIndices(Scores: TNeuralFloatArrPtr; Count, Want: integer;
-  var SelIdx: array of integer; var Used: array of boolean);
+// Selection order over candidate indices: the higher score wins, an exact tie
+// goes to the lower index. A total order, so "the Want best in descending
+// order" is unambiguous.
+function PKMScoreBeats(Scores: TNeuralFloatArrPtr; x, y: integer): boolean;
+  {$IFDEF Release} inline; {$ENDIF}
+begin
+  Result := (Scores^[x] > Scores^[y]) or
+    ((Scores^[x] = Scores^[y]) and (x < y));
+end;
+
+// Sifts SelIdx[Start] down the min-heap held in SelIdx[0..HeapLen-1]: the WORST
+// entry under PKMScoreBeats sits at the root, so it is the one a new candidate
+// has to beat.
+procedure PKMSiftDown(Scores: TNeuralFloatArrPtr; var SelIdx: array of integer;
+  Start, HeapLen: integer);
 var
-  i, j, best, tmp, CountM1, WantM1, WantM2: integer;
-  JStart: integer;
-  bestVal: TNeuralFloat;
+  p, c, c2, tmp: integer;
+begin
+  p := Start;
+  while True do
+  begin
+    c := 2 * p + 1;
+    if c >= HeapLen then break;
+    c2 := c + 1;
+    // Descend towards the worse child.
+    if (c2 < HeapLen) and PKMScoreBeats(Scores, SelIdx[c], SelIdx[c2]) then
+      c := c2;
+    if not PKMScoreBeats(Scores, SelIdx[p], SelIdx[c]) then break;
+    tmp := SelIdx[p]; SelIdx[p] := SelIdx[c]; SelIdx[c] := tmp;
+    p := c;
+  end;
+end;
+
+// Fills SelIdx[0..Want-1] with the indices of the Want largest entries of
+// Scores[0..Count-1], descending (rule #22: select, don't sort). One pass over
+// the Count scores against a size-Want heap, then an in-place heap sort of the
+// survivors: O(Count*log Want) instead of the Want full scans a partial
+// selection sort needs. Runs per (head, token), so it never allocates.
+// Requires Want >= 1 and Want <= Count (the constructor clamps TopK to
+// HalfKeys).
+procedure PKMTopKIndices(Scores: TNeuralFloatArrPtr; Count, Want: integer;
+  var SelIdx: array of integer);
+var
+  i, j, tmp, CountM1, WantM1, MaxHeapParent: integer;
 begin
   CountM1 := Count - 1;
   WantM1 := Want - 1;
-  WantM2 := Want - 2;
-  FillChar(Used[0], Count, 0);
-  bestVal := 0;
-  for i := 0 to WantM1 do
+  // Seed with the first Want indices and heapify them.
+  for i := 0 to WantM1 do SelIdx[i] := i;
+  MaxHeapParent := (Want div 2) - 1;
+  for i := MaxHeapParent downto 0 do PKMSiftDown(Scores, SelIdx, i, Want);
+  // Every later candidate that beats the current worst replaces it.
+  for j := Want to CountM1 do
+    if PKMScoreBeats(Scores, j, SelIdx[0]) then
+    begin
+      SelIdx[0] := j;
+      PKMSiftDown(Scores, SelIdx, 0, Want);
+    end;
+  // Heap sort: moving the worst survivor to the end of the shrinking heap
+  // leaves SelIdx in descending selection order.
+  for i := WantM1 downto 1 do
   begin
-    best := -1;
-    for j := 0 to CountM1 do
-      if not Used[j] then
-        if (best = -1) or (Scores^[j] > bestVal) then
-        begin
-          best := j;
-          bestVal := Scores^[j];
-        end;
-    Used[best] := True;
-    SelIdx[i] := best;
+    tmp := SelIdx[0]; SelIdx[0] := SelIdx[i]; SelIdx[i] := tmp;
+    PKMSiftDown(Scores, SelIdx, 0, i);
   end;
-  // Ensure strictly descending order (selection already yields it, but keep
-  // deterministic on exact ties by stable index break-down).
-  for i := 0 to WantM2 do
+end;
+
+// Sifts the root of the candidate merge heap down over entries
+// [0..HeapLen-1]. The BEST entry (highest score; lowest A slot on an exact
+// tie, which is the lowest flat candidate index a*TopK+b) sits at the root.
+procedure PKMCandSiftDown(var Score: array of TNeuralFloat;
+  var PosA, PosB: array of integer; HeapLen: integer);
+var
+  p, c, c2, ti: integer;
+  ts: TNeuralFloat;
+begin
+  p := 0;
+  while True do
   begin
-    JStart := i + 1;
-    for j := JStart to WantM1 do
-      if Scores^[SelIdx[j]] > Scores^[SelIdx[i]] then
-      begin
-        tmp := SelIdx[i]; SelIdx[i] := SelIdx[j]; SelIdx[j] := tmp;
-      end;
+    c := 2 * p + 1;
+    if c >= HeapLen then break;
+    c2 := c + 1;
+    // Descend towards the better child.
+    if (c2 < HeapLen) and
+       ((Score[c2] > Score[c]) or
+        ((Score[c2] = Score[c]) and (PosA[c2] < PosA[c]))) then
+      c := c2;
+    if not ((Score[c] > Score[p]) or
+            ((Score[c] = Score[p]) and (PosA[c] < PosA[p]))) then break;
+    ts := Score[p]; Score[p] := Score[c]; Score[c] := ts;
+    ti := PosA[p]; PosA[p] := PosA[c]; PosA[c] := ti;
+    ti := PosB[p]; PosB[p] := PosB[c]; PosB[c] := ti;
+    p := c;
   end;
 end;
 
@@ -35808,9 +35858,10 @@ var
   SeqLen, t, a, b, kk, jj, base, keyIdx, h, qOff, wOff, outOff, i0: integer;
   baseS1, baseS2, baseW, posK1, posK2: integer;
   q1, q2, OutPtr, Vptr: TNeuralFloatArrPtr;
-  nCand, gi, gbest: integer;
-  SeqLenM1, HeadsM1, HalfKeysM1, TopKM1, ValueDimM1, nCandM1: integer;
-  MaxScore, SumExp, sc, w: TNeuralFloat;
+  HeapLen, posA, posB, keyA, keyB: integer;
+  SeqLenM1, HeadsM1, HalfKeysM1, TopKM1, ValueDimM1: integer;
+  WPtr: TNeuralFloatArrPtr;
+  MaxScore, SumExp, sB0, w: TNeuralFloat;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -35852,47 +35903,63 @@ begin
         Inc(posK2, FHalfQ);
       end;
       // Top-TopK per half.
-      PKMTopKIndices(FS1.GetRawPtr(t, 0), FHalfKeys, FTopK, FSelABuf, FTopKUsed);
-      PKMTopKIndices(FS2.GetRawPtr(t, 0), FHalfKeys, FTopK, FSelBBuf, FTopKUsed);
-      // TopK x TopK candidate combinations, scored s1[a] + s2[b].
-      nCand := 0;
+      PKMTopKIndices(FS1.GetRawPtr(t, 0), FHalfKeys, FTopK, FSelABuf);
+      PKMTopKIndices(FS2.GetRawPtr(t, 0), FHalfKeys, FTopK, FSelBBuf);
+      // Global top-TopK of the TopK x TopK combinations scored s1[a] + s2[b].
+      // Both half lists are descending, so that score is non-increasing in a
+      // and in b: the winners come out of a max-heap carrying ONE frontier
+      // entry (a, its next unconsumed b) per A slot, never materializing the
+      // TopK^2 candidates (rules #22/#14). Seeded at b=0 the entries are
+      // already ordered by score, which IS a valid heap - no heapify needed.
+      sB0 := FS2.FData[baseS2 + FSelBBuf[0]];
       for a := 0 to TopKM1 do
-        for b := 0 to TopKM1 do
-        begin
-          FCandScoreBuf[nCand] := FS1.FData[baseS1 + FSelABuf[a]] + FS2.FData[baseS2 + FSelBBuf[b]];
-          FCandABuf[nCand] := FSelABuf[a];
-          FCandBBuf[nCand] := FSelBBuf[b];
-          Inc(nCand);
-        end;
-      // Pick the global top-TopK of the candidates (partial selection sort).
-      nCandM1 := nCand - 1;
+      begin
+        FCandScoreBuf[a] := FS1.FData[baseS1 + FSelABuf[a]] + sB0;
+        FCandABuf[a] := a;
+        FCandBBuf[a] := 0;
+      end;
+      HeapLen := FTopK;
       for kk := 0 to TopKM1 do
       begin
-        gbest := -1;
-        for gi := 0 to nCandM1 do
-          if (FCandABuf[gi] >= 0) and
-             ((gbest = -1) or (FCandScoreBuf[gi] > FCandScoreBuf[gbest])) then
-            gbest := gi;
-        FIdxA[base + kk] := FCandABuf[gbest];
-        FIdxB[base + kk] := FCandBBuf[gbest];
-        FIdxKey[base + kk] := FCandABuf[gbest] * FHalfKeys + FCandBBuf[gbest];
-        FW.FData[baseW + kk] := FCandScoreBuf[gbest]; // store raw score; softmax below
-        FCandABuf[gbest] := -1;                      // mark consumed
+        posA := FCandABuf[0];
+        posB := FCandBBuf[0];
+        keyA := FSelABuf[posA];
+        keyB := FSelBBuf[posB];
+        FIdxA[base + kk] := keyA;
+        FIdxB[base + kk] := keyB;
+        FIdxKey[base + kk] := keyA * FHalfKeys + keyB;
+        FW.FData[baseW + kk] := FCandScoreBuf[0]; // store raw score; softmax below
+        // Advance this A slot to its next B; an A slot out of B entries leaves
+        // the heap (the last entry takes its place).
+        Inc(posB);
+        if posB <= TopKM1 then
+        begin
+          FCandBBuf[0] := posB;
+          FCandScoreBuf[0] := FS1.FData[baseS1 + keyA] +
+            FS2.FData[baseS2 + FSelBBuf[posB]];
+        end
+        else
+        begin
+          Dec(HeapLen);
+          FCandScoreBuf[0] := FCandScoreBuf[HeapLen];
+          FCandABuf[0] := FCandABuf[HeapLen];
+          FCandBBuf[0] := FCandBBuf[HeapLen];
+        end;
+        if HeapLen > 1 then
+          PKMCandSiftDown(FCandScoreBuf, FCandABuf, FCandBBuf, HeapLen);
       end;
-      // Softmax over the TopK selected combination scores (this head).
+      // Softmax over the TopK selected combination scores (this head). The
+      // slots are contiguous, so the shift, the exp and the normalizer are one
+      // vectorized pass (#19); the normalization stays an exact divide because
+      // this layer is gradient-checked (#21).
+      WPtr := FW.GetRawPtr(baseW);
       MaxScore := -1e30;
       for kk := 0 to TopKM1 do
-        if FW.FData[baseW + kk] > MaxScore then MaxScore := FW.FData[baseW + kk];
-      SumExp := 0;
-      for kk := 0 to TopKM1 do
-      begin
-        sc := NeuralExp(FW.FData[baseW + kk] - MaxScore);
-        FW.FData[baseW + kk] := sc;
-        SumExp := SumExp + sc;
-      end;
+        if WPtr^[kk] > MaxScore then MaxScore := WPtr^[kk];
+      SumExp := TNNetVolume.ExpShiftSum(WPtr, WPtr, MaxScore, FTopK);
       if SumExp > 0 then
         for kk := 0 to TopKM1 do
-          FW.FData[baseW + kk] := FW.FData[baseW + kk] / SumExp;
+          WPtr^[kk] := WPtr^[kk] / SumExp;
       // Weighted sum over the selected value rows -> this head's output slice.
       OutPtr := FOutput.GetRawPtr(t, 0, outOff);
       FillChar(OutPtr^[0], FValueDim * csNeuralFloatSize, 0);  // #13
