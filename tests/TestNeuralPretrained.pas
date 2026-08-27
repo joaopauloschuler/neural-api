@@ -191,6 +191,7 @@ type
     procedure TestInt8QuantizedPhiLogitDrift;
     procedure TestInt8QuantizedBertHiddenDrift;
     procedure TestInt8QuantizedBloomLogitDrift;
+    procedure TestInt8QuantizedFalconLogitDrift;
     procedure TestInt8QuantizedRWKVLogitDrift;
     procedure TestInt8QuantizedMambaLogitDrift;
     procedure TestInt8QuantizedModernBertHiddenDrift;
@@ -4834,6 +4835,34 @@ begin
     // 2 blocks x (qkv + dense + h_to_4h + 4h_to_h) + tied LM head.
     // Measured 2026-06 on tiny_bloom: 2.7e-3 relative; gated at 5e-2.
     AssertInt8DriftPair('BLOOM', NNFP32, NNQ, 8, Config.VocabSize,
+      {MinQuantLayers=}9, {MaxRelDrift=}5e-2, {TwoChannelInput=}false);
+  finally
+    NNQ.Free;
+    NNFP32.Free;
+  end;
+end;
+
+// Falcon arms construction-time int8 (TNNet.BuildQuantInt8 plus the
+// int8-armed TNNetEmbedding constructor), so the quantized build never
+// materializes the FP32 vocab table and the tied LM head is filled straight
+// into the codes by LoadEmbeddingAndLMHead. This gates that armed route
+// against the FP32 build it must approximate.
+procedure TTestNeuralPretrained.TestInt8QuantizedFalconLogitDrift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TFalconConfig;
+begin
+  RandSeed := 424242;
+  NNFP32 := BuildFalconFromSafeTensorsEx(
+    FixturePath('tiny_falcon_mq.safetensors'), Config, {SeqLen=}8,
+    {pTrainable=}true, FixturePath('tiny_falcon_mq_config.json'));
+  NNQ := BuildFalconFromSafeTensorsEx(
+    FixturePath('tiny_falcon_mq.safetensors'), Config, {SeqLen=}8,
+    {pTrainable=}false, FixturePath('tiny_falcon_mq_config.json'),
+    {pQuantizeInt8=}true);
+  try
+    // 2 blocks x (qkv + dense + h_to_4h + 4h_to_h) + the tied LM head.
+    AssertInt8DriftPair('Falcon', NNFP32, NNQ, 8, Config.VocabSize,
       {MinQuantLayers=}9, {MaxRelDrift=}5e-2, {TwoChannelInput=}false);
   finally
     NNQ.Free;

@@ -52340,14 +52340,14 @@ var
   QSlice, KSlice, VSlice, HeadPack, ExpertOut, GateTopK, GateE, GateEB: TNNetLayer;
   KSlices, VSlices: array of TNNetLayer;
   HeadOutputs, MoEBranches: array of TNNetLayer;
-  BlockCnt, SeqLen, i, j, HeadDim, QWidth, KVWidth, GroupSize: integer;
+  BlockCnt, SeqLen, i, HeadDim, QWidth, KVWidth, GroupSize: integer;
   HeadCnt, KVHeadCnt, KVGroup, d, e: integer;
   Tmp, XW, DtW: TNNetVolume;
   MixP, FfP, AttP, LayerP, TensorNameStr: string;
   Consumed: TStringList;
   ConvBiasSuppress, NS, DI, RK: integer;
   NumLayersM1, NumKVHeadsM1, HeadDimM1, NumHeadsM1: integer;
-  NumExpertsM1, VocabSizeM1, HiddenSizeM1: integer;
+  NumExpertsM1: integer;
   SliceChannels: array of integer;
 
   procedure MarkConsumed(const TName: string);
@@ -52485,8 +52485,6 @@ begin
       HeadDimM1 := HeadDim - 1;
       NumHeadsM1 := Config.NumHeads - 1;
       NumExpertsM1 := Config.NumExperts - 1;
-      VocabSizeM1 := Config.VocabSize - 1;
-      HiddenSizeM1 := Config.HiddenSize - 1;
 
       // ---------------- Architecture (NO positional encoding) ----------
       NN := TNNet.Create();
@@ -52617,32 +52615,12 @@ begin
       if not pTrainable then NN.SetTrainable();
 
       // ---------------- Weights ----------------
-      Reader.LoadTensorFlat(Config.Prefix + 'embed_tokens.weight', Tmp);
-      EnsureWritableImportWeights(EmbeddingLayer);
-      if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
-        ImportError('Jamba import: embed_tokens.weight size mismatch.');
-      EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
-      EmbeddingLayer.FlushWeightCache();
-      MarkConsumed(Config.Prefix + 'embed_tokens.weight');
-      if Config.TieWordEmbeddings then
-      begin
-        EnsureWritableImportWeights(LMHead);
-        for j := 0 to VocabSizeM1 do
-        begin
-          Move(Tmp.FData[j * Config.HiddenSize],
-            LMHead.FArrNeurons[j].Weights.FData[0],
-            Config.HiddenSize * csNeuralFloatSize);
-          LMHead.FArrNeurons[j].BiasWeight := 0;
-        end;
-        LMHead.FlushWeightCache();
-        if Reader.HasTensor('lm_head.weight') then MarkConsumed('lm_head.weight');
-      end
-      else
-      begin
-        LoadLlamaLinearWeights(Reader, LMHead, 'lm_head.weight',
-          Config.HiddenSize, Config.VocabSize);
-        MarkConsumed('lm_head.weight');
-      end;
+      // Jamba folds no scale anywhere, so all three fold factors are 1.
+      LoadEmbeddingAndLMHead(Reader, EmbeddingLayer, LMHead,
+        Config.Prefix + 'embed_tokens.weight', 'lm_head.weight',
+        Config.VocabSize, Config.HiddenSize, Config.TieWordEmbeddings,
+        {EmbedScale=}1.0, {EmbeddingMultiplier=}1.0, {LogitScaleFold=}1.0,
+        pQuantizeInt8, Tmp, Consumed, 'Jamba import: ');
       for BlockCnt := 0 to NumLayersM1 do
       begin
         LayerP := Config.Prefix + 'layers.' + IntToStr(BlockCnt) + '.';
@@ -53042,10 +53020,10 @@ var
   BranchInput, NormedSrc, XBCConv, DtSplit, GateSplit: TNNetLayer;
   GateScaled, SharedOut, ExpertOut, GateE, GateEB: TNNetLayer;
   MoEBranches: array of TNNetLayer;
-  BlockCnt, SeqLen, i, j, ConvDim, ProjSize, ConvBiasSuppress: integer;
+  BlockCnt, SeqLen, i, ConvDim, ProjSize, ConvBiasSuppress: integer;
   QWidth, KVWidth, e: integer;
   NumLayersM1: integer;
-  NumRoutedExpertsM1, VocabSizeM1, HiddenSizeM1: integer;
+  NumRoutedExpertsM1: integer;
   Tmp, BiasVec: TNNetVolume;
   MixPrefix, LayerP, AttP, TensorNameStr, InBias, OutBias, MoeP: string;
   Consumed: TStringList;
@@ -53151,8 +53129,6 @@ begin
       KVWidth := Config.NumKVHeads * Config.HeadDim;
       NumLayersM1 := Config.NumLayers - 1;
       NumRoutedExpertsM1 := Config.NumRoutedExperts - 1;
-      VocabSizeM1 := Config.VocabSize - 1;
-      HiddenSizeM1 := Config.HiddenSize - 1;
 
       // ---------------- Architecture (single pre-norm residual / block) ----
       NN := TNNet.Create();
@@ -53653,8 +53629,8 @@ var
   BranchInput, AttnOut, QKVLayer, HeadPack: TNNetLayer;
   HeadOutputs: array of TNNetLayer;
   Channels: array of integer;
-  BlockCnt, SeqLen, HeadCnt, HeadDim, i, j, d: integer;
-  NumLayersM1, NumHeadsM1, HeadDimM1, VocabSizeM1, HiddenSizeM1: integer;
+  BlockCnt, SeqLen, HeadCnt, HeadDim, i, d: integer;
+  NumLayersM1, NumHeadsM1, HeadDimM1: integer;
   Tmp: TNNetVolume;
   BlockPrefix, AttnPrefix, TensorNameStr: string;
   Consumed: TStringList;
@@ -53706,15 +53682,22 @@ begin
       NumLayersM1 := Config.NumLayers - 1;
       NumHeadsM1 := Config.NumHeads - 1;
       HeadDimM1 := HeadDim - 1;
-      VocabSizeM1 := Config.VocabSize - 1;
-      HiddenSizeM1 := Config.HiddenSize - 1;
 
       // ---------------- Architecture ----------------
       NN := TNNet.Create();
+      // Armed BEFORE the first AddLayer so every eligible layer allocates the
+      // int8 container directly instead of an FP32 slab the per-block sweeps
+      // below would only shrink again.
+      NN.BuildQuantInt8 := pQuantizeInt8;
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real BPE token (<unk>), not padding.
+      // pTrainable/pQuantizeInt8 go to the constructor: the net flag does not
+      // reach the embedding container, and BLOOM's 250880-row vocab table is
+      // the single largest FP32 transient of the import.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1,
+        {ScaleEmbedding=}0.02, pTrainable, pQuantizeInt8
+        ).SetTrainable(pTrainable) );
       // word_embeddings_layernorm: BLOOM normalises the embedding output
       // BEFORE the first block (no positional embedding is added - ALiBi
       // is the only position signal, inside the attention scores).
@@ -53789,30 +53772,18 @@ begin
       try
         // word_embeddings -> embedding table AND the ALWAYS-tied LM head
         // (BloomForCausalLM ships no separate lm_head tensor; logits =
-        // h . word_embeddings^T, bias-free).
-        Reader.LoadTensorFlat(Config.Prefix + 'word_embeddings.weight', Tmp);
-        EnsureWritableImportWeights(EmbeddingLayer);
-        if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
-          ImportError('BLOOM import: word_embeddings.weight element count ' +
-            IntToStr(Tmp.Size) + ' does not match the embedding table ' +
-            'size ' + IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
-        EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
-        EmbeddingLayer.FlushWeightCache();
-        MarkConsumed(Config.Prefix + 'word_embeddings.weight');
-        EnsureWritableImportWeights(LMHead);
-        for j := 0 to VocabSizeM1 do
-        begin
-          Move(Tmp.FData[j * Config.HiddenSize],
-            LMHead.FArrNeurons[j].Weights.FData[0],
-            Config.HiddenSize * csNeuralFloatSize);
-          LMHead.FArrNeurons[j].BiasWeight := 0;
-        end;
-        LMHead.FlushWeightCache();
-        if Reader.HasTensor('lm_head.weight') then
-          MarkConsumed('lm_head.weight'); // redundant tied copy, if present
+        // h . word_embeddings^T, bias-free). BLOOM folds no scale anywhere,
+        // so all three fold factors are 1.
+        LoadEmbeddingAndLMHead(Reader, EmbeddingLayer, LMHead,
+          Config.Prefix + 'word_embeddings.weight', 'lm_head.weight',
+          Config.VocabSize, Config.HiddenSize, {TieWordEmbeddings=}true,
+          {EmbedScale=}1.0, {EmbeddingMultiplier=}1.0, {LogitScaleFold=}1.0,
+          pQuantizeInt8, Tmp, Consumed, 'BLOOM import: ');
       finally
         Tmp.Free;
       end;
+      // Re-quantize the refilled head/embedding before streaming the blocks.
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       LoadLayerNormWeights(Reader, EmbeddingLN,
         Config.Prefix + 'word_embeddings_layernorm.weight',
         Config.Prefix + 'word_embeddings_layernorm.bias', Config.HiddenSize);
@@ -54110,9 +54081,8 @@ var
   KRotated, VSlices, HeadOutputs: array of TNNetLayer;
   SliceChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
-  HeadDim, QWidth, KVWidth, i, j, d: integer;
+  HeadDim, QWidth, KVWidth, i, d: integer;
   NumLayersM1, NumKVHeadsM1, HeadDimM1, NumHeadsM1: integer;
-  VocabSizeM1, HiddenSizeM1: integer;
   PerHeadThirds, HoistRoPE: boolean;
   Tmp: TNNetVolume;
   BlockPrefix, AttnPrefix, TensorNameStr: string;
@@ -54163,8 +54133,6 @@ begin
       NumKVHeadsM1 := Config.NumKVHeads - 1;
       HeadDimM1 := HeadDim - 1;
       NumHeadsM1 := Config.NumHeads - 1;
-      VocabSizeM1 := Config.VocabSize - 1;
-      HiddenSizeM1 := Config.HiddenSize - 1;
       // The plain-MHA QKV layout (per-head [q|k|v] thirds) is used ONLY when
       // neither the new arch nor multi_query applies: that is exactly when
       // the effective num_kv_heads equals num_heads AND the new arch is off.
@@ -54209,9 +54177,18 @@ begin
 
       // ---------------- Architecture ----------------
       NN := TNNet.Create();
+      // Armed BEFORE the first AddLayer so every eligible layer allocates the
+      // int8 container directly instead of an FP32 slab the per-block sweeps
+      // below would only shrink again.
+      NN.BuildQuantInt8 := pQuantizeInt8;
       NN.AddLayer( TNNetInput.Create(SeqLen) );
+      // pTrainable/pQuantizeInt8 go to the constructor: the net flag does not
+      // reach the embedding container, and the vocab table is the single
+      // largest FP32 transient of the import.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1,
+        {ScaleEmbedding=}0.02, pTrainable, pQuantizeInt8
+        ).SetTrainable(pTrainable) );
       if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
@@ -54354,38 +54331,17 @@ begin
       // ---------------- Weights ----------------
       Tmp := TNNetVolume.Create;
       try
-        Reader.LoadTensorFlat(Config.Prefix + 'word_embeddings.weight', Tmp);
-        EnsureWritableImportWeights(EmbeddingLayer);
-        if EmbeddingLayer.FArrNeurons[0].Weights.Size <> Tmp.Size then
-          ImportError('Falcon import: word_embeddings.weight element count ' +
-            IntToStr(Tmp.Size) + ' does not match the embedding table size ' +
-            IntToStr(EmbeddingLayer.FArrNeurons[0].Weights.Size) + '.');
-        EmbeddingLayer.FArrNeurons[0].Weights.Copy(Tmp);
-        EmbeddingLayer.FlushWeightCache();
-        MarkConsumed(Config.Prefix + 'word_embeddings.weight');
-        if Config.TieWordEmbeddings then
-        begin
-          EnsureWritableImportWeights(LMHead);
-          for j := 0 to VocabSizeM1 do
-          begin
-            Move(Tmp.FData[j * Config.HiddenSize],
-              LMHead.FArrNeurons[j].Weights.FData[0],
-              Config.HiddenSize * csNeuralFloatSize);
-            LMHead.FArrNeurons[j].BiasWeight := 0;
-          end;
-          LMHead.FlushWeightCache();
-          if Reader.HasTensor('lm_head.weight') then
-            MarkConsumed('lm_head.weight');
-        end
-        else
-        begin
-          LoadLlamaLinearWeights(Reader, LMHead, 'lm_head.weight',
-            Config.HiddenSize, Config.VocabSize);
-          MarkConsumed('lm_head.weight');
-        end;
+        // Falcon folds no scale anywhere, so all three fold factors are 1.
+        LoadEmbeddingAndLMHead(Reader, EmbeddingLayer, LMHead,
+          Config.Prefix + 'word_embeddings.weight', 'lm_head.weight',
+          Config.VocabSize, Config.HiddenSize, Config.TieWordEmbeddings,
+          {EmbedScale=}1.0, {EmbeddingMultiplier=}1.0, {LogitScaleFold=}1.0,
+          pQuantizeInt8, Tmp, Consumed, 'Falcon import: ');
       finally
         Tmp.Free;
       end;
+      // Re-quantize the refilled head/embedding before streaming the blocks.
+      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       for BlockCnt := 0 to NumLayersM1 do
       begin
         BlockPrefix := Config.Prefix + 'h.' + IntToStr(BlockCnt) + '.';
@@ -54921,11 +54877,19 @@ begin
 
       // ---------------- Architecture ----------------
       NN := TNNet.Create();
+      // Armed BEFORE the first AddLayer so every eligible layer allocates the
+      // int8 container directly instead of an FP32 slab the per-block sweeps
+      // below would only shrink again.
+      NN.BuildQuantInt8 := pQuantizeInt8;
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real BPE token, not padding (the
-      // ModernBERT [PAD] sits at id 50283).
+      // ModernBERT [PAD] sits at id 50283). pTrainable/pQuantizeInt8 go to the
+      // constructor: the net flag does not reach the embedding container, and
+      // the vocab table is the single largest FP32 transient of the import.
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
-        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1).SetTrainable(pTrainable) );
+        Config.VocabSize, Config.HiddenSize, {EncodeZero=}1,
+        {ScaleEmbedding=}0.02, pTrainable, pQuantizeInt8
+        ).SetTrainable(pTrainable) );
       // embeddings.norm right after the table - ModernBERT has NO position
       // embeddings at all (RoPE inside attention is the only position
       // signal).
