@@ -52344,6 +52344,7 @@ var
   HeadCnt, KVHeadCnt, KVGroup, d, e: integer;
   Tmp, XW, DtW: TNNetVolume;
   MixP, FfP, AttP, LayerP, TensorNameStr: string;
+  ExpP, UpName, GateName, DownName: string;
   Consumed: TStringList;
   ConvBiasSuppress, NS, DI, RK: integer;
   NumLayersM1, NumKVHeadsM1, HeadDimM1, NumHeadsM1: integer;
@@ -52667,21 +52668,24 @@ begin
           MarkConsumed(FfP + 'router.weight');
           for e := 0 to NumExpertsM1 do
           begin
+            // Each expert prefix and tensor name is built ONCE and reused by
+            // both the load and its MarkConsumed.
+            ExpP := FfP + 'experts.' + IntToStr(e) + '.';
+            UpName := ExpP + 'up_proj.weight';
+            GateName := ExpP + 'gate_proj.weight';
+            DownName := ExpP + 'down_proj.weight';
             // SwiGLU fused: up_proj (w3) in 0..I-1, gate_proj (w1) in I..2I-1.
             LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertGateUp[e],
-              FfP + 'experts.' + IntToStr(e) + '.up_proj.weight',
-              Config.HiddenSize, Config.IntermediateSize, 0,
+              UpName, Config.HiddenSize, Config.IntermediateSize, 0,
               2 * Config.IntermediateSize);
             LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertGateUp[e],
-              FfP + 'experts.' + IntToStr(e) + '.gate_proj.weight',
-              Config.HiddenSize, Config.IntermediateSize,
+              GateName, Config.HiddenSize, Config.IntermediateSize,
               Config.IntermediateSize, 2 * Config.IntermediateSize);
             LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].ExpertDown[e],
-              FfP + 'experts.' + IntToStr(e) + '.down_proj.weight',
-              Config.IntermediateSize, Config.HiddenSize);
-            MarkConsumed(FfP + 'experts.' + IntToStr(e) + '.up_proj.weight');
-            MarkConsumed(FfP + 'experts.' + IntToStr(e) + '.gate_proj.weight');
-            MarkConsumed(FfP + 'experts.' + IntToStr(e) + '.down_proj.weight');
+              DownName, Config.IntermediateSize, Config.HiddenSize);
+            MarkConsumed(UpName);
+            MarkConsumed(GateName);
+            MarkConsumed(DownName);
           end;
         end
         else
@@ -53035,7 +53039,7 @@ var
 
   procedure LoadChannelVector(Layer: TNNetLayer; NeuronIdx: integer;
     const TName: string; Channels: integer);
-  var dd, ChannelsM1: integer;
+  var WV: TNNetVolume;
   begin
     if not Reader.HasTensor(TName) then
       ImportError('Nemotron-H import: missing tensor "' + TName + '".');
@@ -53044,15 +53048,18 @@ var
       ImportError('Nemotron-H import: "' + TName + '" must carry ' +
         IntToStr(Channels) + ' elements, got ' + Reader.ShapeAsString(TName));
     EnsureWritableImportWeights(Layer);
-    ChannelsM1 := Channels - 1;
-    for dd := 0 to ChannelsM1 do
-      Layer.FArrNeurons[NeuronIdx].Weights.FData[dd] := Tmp.FData[dd];
+    WV := Layer.FArrNeurons[NeuronIdx].Weights;
+    if WV.Size < Channels then
+      ImportError('Nemotron-H import: internal error - the neuron for "' +
+        TName + '" holds ' + IntToStr(WV.Size) + ' weights, expected at ' +
+        'least ' + IntToStr(Channels) + '.');
+    Move(Tmp.FData[0], WV.FData[0], Channels * csNeuralFloatSize);
     Layer.FlushWeightCache();
     MarkConsumed(TName);
   end;
 
   procedure LoadDepthwiseConv(Layer: TNNetLayer; const WName, BName: string);
-  var dd, kk, ConvDimM1, ConvKernelM1: integer;
+  var dd, ConvDimM1, SrcBase, RowBytes: integer;
   begin
     if not Reader.HasTensor(WName) then
       ImportError('Nemotron-H import: missing tensor "' + WName + '".');
@@ -53066,11 +53073,16 @@ var
     Reader.LoadTensorFlat(WName, Tmp);
     EnsureWritableImportWeights(Layer);
     ConvDimM1 := ConvDim - 1;
-    ConvKernelM1 := Config.ConvKernel - 1;
+    // One contiguous kernel row per channel: a bulk Move instead of a scalar
+    // inner loop, with the source offset carried by addition.
+    RowBytes := Config.ConvKernel * csNeuralFloatSize;
+    SrcBase := 0;
     for dd := 0 to ConvDimM1 do
-      for kk := 0 to ConvKernelM1 do
-        Layer.FArrNeurons[dd].Weights.FData[kk] :=
-          Tmp.FData[dd * Config.ConvKernel + kk];
+    begin
+      Move(Tmp.FData[SrcBase], Layer.FArrNeurons[dd].Weights.FData[0],
+        RowBytes);
+      Inc(SrcBase, Config.ConvKernel);
+    end;
     MarkConsumed(WName);
     if Config.UseConvBias then
     begin
@@ -54599,8 +54611,10 @@ procedure LoadModernBertQKVWeights(Reader: TNNetSafeTensorsReader;
 var
   W, B: TNNetVolume;
   r, Third, RowInThird, HeadIdx, RowInHead, HalfDim, TargetIdx: integer;
-  ThreeHiddenM1: integer;
+  ThreeHiddenM1, SrcBase, RowBytes: integer;
   WV: TNNetVolume;
+  N: TNNetNeuron;
+  HasBias: boolean;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -54635,6 +54649,9 @@ begin
       B := TNNetVolume.Create;
       Reader.LoadTensorFlat(BName, B);
     end;
+    RowBytes := Hidden * csNeuralFloatSize;
+    HasBias := B <> nil;
+    SrcBase := 0;
     for r := 0 to ThreeHiddenM1 do
     begin
       Third := r div Hidden; // 0=q, 1=k, 2=v (whole thirds)
@@ -54652,18 +54669,18 @@ begin
       end
       else
         TargetIdx := r; // v: straight
-      WV := Layer.FArrNeurons[TargetIdx].Weights;   // #9: bind chain once
+      N := Layer.FArrNeurons[TargetIdx];   // #7: one mirror index per row
+      WV := N.Weights;
       if WV.Size <> Hidden then
         ImportError('ModernBERT import: internal error - neuron ' +
           IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
           IntToStr(WV.Size) +
           ' weights, expected ' + IntToStr(Hidden) + '.');
       // contiguous source row -> contiguous neuron weights (#13)
-      Move(W.FData[r * Hidden], WV.FData[0], Hidden * csNeuralFloatSize);
-      if B <> nil then
-        Layer.FArrNeurons[TargetIdx].BiasWeight := B.FData[r]
-      else
-        Layer.FArrNeurons[TargetIdx].BiasWeight := 0;
+      Move(W.FData[SrcBase], WV.FData[0], RowBytes);
+      if HasBias then N.BiasWeight := B.FData[r]
+      else N.BiasWeight := 0;
+      Inc(SrcBase, Hidden);   // #6: r * Hidden, carried
     end;
   finally
     B.Free;
@@ -54684,8 +54701,10 @@ procedure LoadModernBertWiWeights(Reader: TNNetSafeTensorsReader;
   Hidden, Intermediate: integer);
 var
   W, B: TNNetVolume;
-  r, TargetIdx, TwoIntermediateM1: integer;
+  r, TargetIdx, TwoIntermediateM1, SrcBase, RowBytes: integer;
   WV: TNNetVolume;
+  N: TNNetNeuron;
+  HasBias: boolean;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -54720,6 +54739,9 @@ begin
       Reader.LoadTensorFlat(BName, B);
     end;
     TwoIntermediateM1 := 2 * Intermediate - 1;
+    RowBytes := Hidden * csNeuralFloatSize;
+    HasBias := B <> nil;
+    SrcBase := 0;
     for r := 0 to TwoIntermediateM1 do
     begin
       // Swap the halves: HF input rows (r < I) -> neurons I + r (the
@@ -54728,18 +54750,18 @@ begin
         TargetIdx := Intermediate + r
       else
         TargetIdx := r - Intermediate;
-      WV := Layer.FArrNeurons[TargetIdx].Weights;   // #9: bind chain once
+      N := Layer.FArrNeurons[TargetIdx];   // #7: one mirror index per row
+      WV := N.Weights;
       if WV.Size <> Hidden then
         ImportError('ModernBERT import: internal error - neuron ' +
           IntToStr(TargetIdx) + ' for "' + WName + '" has ' +
           IntToStr(WV.Size) +
           ' weights, expected ' + IntToStr(Hidden) + '.');
       // contiguous source row -> contiguous neuron weights (#13)
-      Move(W.FData[r * Hidden], WV.FData[0], Hidden * csNeuralFloatSize);
-      if B <> nil then
-        Layer.FArrNeurons[TargetIdx].BiasWeight := B.FData[r]
-      else
-        Layer.FArrNeurons[TargetIdx].BiasWeight := 0;
+      Move(W.FData[SrcBase], WV.FData[0], RowBytes);
+      if HasBias then N.BiasWeight := B.FData[r]
+      else N.BiasWeight := 0;
+      Inc(SrcBase, Hidden);   // #6: r * Hidden, carried
     end;
   finally
     B.Free;
