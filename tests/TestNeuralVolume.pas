@@ -54,6 +54,8 @@ type
     procedure TestVolumeTranspose;
     // Additional volume tests
     procedure TestVolumeNormalization;
+    procedure TestVolumePointwiseNormAndMul;
+    procedure TestVolumePointwiseMulWithoutNorms;
     procedure TestVolumeMagnitude;
     procedure TestVolumeEntropy;
     procedure TestVolumeCrossEntropy;
@@ -4264,6 +4266,55 @@ begin
     Want.Free;
     Got.Free;
     Original.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumePointwiseNormAndMul;
+var
+  Normalized, Scaled, Norms: TNNetVolume;
+  CountX, CountY: integer;
+begin
+  Normalized := TNNetVolume.Create(2, 3, 2);
+  Scaled := TNNetVolume.Create(2, 3, 2);
+  Norms := TNNetVolume.Create(1, 1, 1);
+  try
+    for CountX := 0 to Normalized.Size - 1 do Normalized.FData[CountX] := CountX + 1;
+    Scaled.Copy(Normalized);
+    Normalized.PointwiseNorm(Norms);
+    AssertEquals('Norms size X', 2, Norms.SizeX);
+    AssertEquals('Norms size Y', 3, Norms.SizeY);
+    for CountY := 0 to 2 do
+      for CountX := 0 to 1 do
+        AssertEquals('Unit modulus at ' + IntToStr(CountX) + ',' + IntToStr(CountY),
+          1.0,
+          Sqrt(Sqr(Normalized[CountX, CountY, 0]) + Sqr(Normalized[CountX, CountY, 1])),
+          0.0001);
+    // PointwiseMul reapplies the recorded multipliers, so it reproduces PointwiseNorm.
+    Scaled.PointwiseMul(Norms);
+    for CountX := 0 to Normalized.Size - 1 do
+      AssertEquals('Element ' + IntToStr(CountX),
+        Normalized.FData[CountX], Scaled.FData[CountX], 0.0001);
+  finally
+    Norms.Free;
+    Scaled.Free;
+    Normalized.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumePointwiseMulWithoutNorms;
+var
+  Scaled: TNNetVolume;
+  CountElement: integer;
+begin
+  Scaled := TNNetVolume.Create(2, 3, 2);
+  try
+    for CountElement := 0 to Scaled.Size - 1 do Scaled.FData[CountElement] := CountElement + 1;
+    Scaled.PointwiseMul(nil);
+    for CountElement := 0 to Scaled.Size - 1 do
+      AssertEquals('Element ' + IntToStr(CountElement),
+        CountElement + 1, Scaled.FData[CountElement], 0.0001);
+  finally
+    Scaled.Free;
   end;
 end;
 

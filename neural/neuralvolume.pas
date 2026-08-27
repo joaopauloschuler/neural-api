@@ -571,7 +571,7 @@ type
       procedure DotProductsTiledInt8(NumAs, BStart, BFinish, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
       procedure DotProductsTiledInt8(NumAs, BStart, BFinish, VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
       procedure PointwiseNorm(pNorms: TNNetVolume = nil);
-      procedure PointwiseMul(pNorms: TNNetVolume);
+      procedure PointwiseMul(pNorms: TNNetVolume = nil);
       // Exp writes dst[0..N-1] := exp(src[0..N-1]). On an AVX2 build it
       // uses an 8-wide polynomial approximation (AVXExp) with a scalar NeuralExp
       // remainder; on a non-AVX build it is a plain NeuralExp loop. Buffers may
@@ -10866,6 +10866,7 @@ begin
   end;
   MaxX := FSizeX - 1;
   MaxY := FSizeY - 1;
+  RowStride := FSizeX * FDepth;
   // Y outer, X inner visits the depth spans back to back in storage order.
   rowBase := 0; // #12: carried GetRawPos(0, CountY)
   for CountY := 0 to MaxY do
@@ -10887,7 +10888,7 @@ begin
   end;
 end;
 
-procedure TNNetVolume.PointwiseMul(pNorms: TNNetVolume);
+procedure TNNetVolume.PointwiseMul(pNorms: TNNetVolume = nil);
 var
   StartPointPtr: pointer;
   MaxX, MaxY: integer;
@@ -10895,9 +10896,12 @@ var
   Modulus: TNeuralFloat;
   RowStride, rowBase, pos: integer;
 begin
-  if Assigned(pNorms) then pNorms.ReSize(SizeX, SizeY, 1);
+  // No norms recorded means no scaling to reapply, as in PointwiseNorm(nil).
+  if not Assigned(pNorms) then exit;
+  pNorms.ReSize(SizeX, SizeY, 1);
   MaxX := FSizeX - 1;
   MaxY := FSizeY - 1;
+  RowStride := FSizeX * FDepth;
   // Y outer, X inner visits the depth spans back to back in storage order.
   rowBase := 0; // #12: carried GetRawPos(0, CountY)
   for CountY := 0 to MaxY do
