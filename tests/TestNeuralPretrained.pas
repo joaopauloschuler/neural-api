@@ -10138,7 +10138,8 @@ procedure TTestNeuralPretrained.TestModernBertHiddenStateParity;
 var
   NN: TNNet;
   Config: TModernBertConfig;
-  LayerCnt, RopeCnt, SDPACnt, WindowedCnt, GegluErfCnt, LNCnt: integer;
+  LayerCnt, RopeCnt, SDPACnt, FusedCnt, WindowedCnt, GegluErfCnt,
+  LNCnt: integer;
   SDPA: TNNetScaledDotProductAttention;
 begin
   RandSeed := 424242;
@@ -10146,6 +10147,11 @@ begin
     FixturePath('tiny_modernbert.safetensors'), Config, {SeqLen=}0,
     {pTrainable=}true, FixturePath('tiny_modernbert_config.json'));
   try
+    // Ground truth first: the structural assertions below must never shadow
+    // the HF oracle. The fixture stores last_hidden_state under the "logits"
+    // key, so the logit helper compares all SeqLen x hidden values.
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_modernbert_logits.json'), 16, Config.HiddenSize);
     AssertEquals('model_type', 'modernbert', Config.ModelType);
     AssertEquals('layers', 4, Config.NumLayers);
     AssertEquals('heads', 2, Config.NumHeads);
@@ -10161,16 +10167,19 @@ begin
     AssertFalse('mlp_bias', Config.MlpBias);
     AssertFalse('norm_bias', Config.NormBias);
     AssertEquals('prefix (plain ModernBertModel export)', '', Config.Prefix);
-    // Structure: 2 RoPE layers (q and k) per head per block = 16; one
-    // SDPA per head per block = 8, NON-causal everywhere, with the
-    // BIDIRECTIONAL window W = 4 div 2 + 1 = 3 on the LOCAL layers only
-    // (layers 1 and 2 -> 2 layers x 2 heads = 4 windowed heads); one
+    // Structure: 2 head-tiled RoPE layers (one per q/k BAND) per block = 8.
+    // Attention is NON-causal everywhere. The GLOBAL layers (0 and 3, since
+    // global_attn_every_n_layers=3) mask nothing, so their heads fuse into
+    // ONE TNNetFusedSDPA each = 2. The LOCAL layers (1 and 2) carry the
+    // BIDIRECTIONAL window W = 4 div 2 + 1 = 3, which the fused layer cannot
+    // express, so they keep one SDPA per head = 4 windowed heads. One
     // TNNetGEGLUErf per block (exact erf gelu - NOT the tanh TNNetGEGLU);
     // LayerNorms = embedding norm + 3 attn_norms (layer 0 SKIPS its
     // attn_norm: HF nn.Identity) + 4 mlp_norms + final_norm = 9; and NO
     // learned position table anywhere (RoPE only).
     RopeCnt := 0;
     SDPACnt := 0;
+    FusedCnt := 0;
     WindowedCnt := 0;
     GegluErfCnt := 0;
     LNCnt := 0;
@@ -10192,7 +10201,8 @@ begin
         else
           AssertFalse('full-attention head carries no window flag',
             SDPA.BidirectionalWindow);
-        Inc(SDPACnt);
+        if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then Inc(FusedCnt)
+        else Inc(SDPACnt);
       end;
       if NN.Layers[LayerCnt] is TNNetGEGLUErf then Inc(GegluErfCnt);
       AssertFalse('no tanh GEGLU with hidden_activation=gelu',
@@ -10202,18 +10212,14 @@ begin
       AssertFalse('no learned position table in a ModernBERT net',
         NN.Layers[LayerCnt] is TNNetLearnedPositionalEmbedding);
     end;
-    AssertEquals('RoPE count (q+k per head per block)', 16, RopeCnt);
-    AssertEquals('SDPA count (heads per block)', 8, SDPACnt);
+    AssertEquals('RoPE count (head-tiled q+k band per block)', 8, RopeCnt);
+    AssertEquals('fused attention (2 global layers)', 2, FusedCnt);
+    AssertEquals('per-head SDPA (2 local layers x 2 heads)', 4, SDPACnt);
     AssertEquals('windowed heads (2 local layers x 2 heads)', 4,
       WindowedCnt);
     AssertEquals('TNNetGEGLUErf per block', 4, GegluErfCnt);
     AssertEquals('LayerNorm count (emb + 3 attn + 4 mlp + final)', 9,
       LNCnt);
-    // Hidden-state parity: the fixture stores last_hidden_state under the
-    // "logits" key, so the logit helper compares all SeqLen x hidden
-    // values.
-    AssertLogitParityWithFixture(NN,
-      FixturePath('tiny_modernbert_logits.json'), 16, Config.HiddenSize);
   finally
     NN.Free;
   end;

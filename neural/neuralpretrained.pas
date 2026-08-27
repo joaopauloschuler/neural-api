@@ -54806,6 +54806,7 @@ var
   Blocks: array of TModernBertBlockLayers;
   EmbeddingLayer, EmbeddingNorm, FinalNorm: TNNetLayer;
   BranchInput, NormedSource, QSlice, KSlice, VSlice, HeadPack: TNNetLayer;
+  QBand, KBand, VBand: TNNetLayer;
   HeadOutputs: array of TNNetLayer;
   Channels: array of integer;
   BlockCnt, SeqLen, HeadCnt, HeadDim, LayerWindow, i, d: integer;
@@ -54941,37 +54942,59 @@ begin
         Blocks[BlockCnt].QKV := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable),
           NormedSource);
-        for HeadCnt := 0 to NumHeadsM1 do
+        // The slab holds WHOLE thirds, so each band is ONE contiguous split
+        // and every head sits at HeadCnt*HeadDim inside it. The layer's RoPE
+        // therefore sits AHEAD of the head split: one head-tiled
+        // TNNetRotaryEmbedding (pRotaryHeadDim = HeadDim) repeats the per-head
+        // frequency schedule across the whole band, bit-identical to one
+        // rotary per head. V is never rotated.
+        QBand := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(0, Config.HiddenSize),
+          Blocks[BlockCnt].QKV);
+        KBand := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(Config.HiddenSize, Config.HiddenSize),
+          Blocks[BlockCnt].QKV);
+        VBand := NN.AddLayerAfter(
+          TNNetSplitChannels.Create(2 * Config.HiddenSize, Config.HiddenSize),
+          Blocks[BlockCnt].QKV);
+        QBand := NN.AddLayerAfter( TNNetRotaryEmbedding.Create(LayerTheta,
+          rsmNone, 1.0, 0, 1.0, 32.0, 0.0, true, {pRotaryHeadDim=}HeadDim),
+          QBand);
+        KBand := NN.AddLayerAfter( TNNetRotaryEmbedding.Create(LayerTheta,
+          rsmNone, 1.0, 0, 1.0, 32.0, 0.0, true, {pRotaryHeadDim=}HeadDim),
+          KBand);
+        // BIDIRECTIONAL attention (CausalMask=false - this is an encoder).
+        // A GLOBAL layer masks nothing, so nothing per-head is left between
+        // the projection and the attention math and the shared builder packs
+        // every head into ONE layer. A LOCAL layer carries the symmetric
+        // sliding window, which the fused builder cannot express (it has no
+        // bidirectional-window argument), so those keep per-head SDPA.
+        if LayerWindow = 0 then
+          NN.AddGQAAttentionFromSources(QBand, KBand, VBand,
+            Config.NumHeads, Config.NumHeads, HeadDim, {CausalMask=}false)
+        else
         begin
-          // q and k slices rotate with the layer's RoPE theta; v never.
-          for d := 0 to HeadDimM1 do
-            Channels[d] := HeadCnt * HeadDim + d;
-          QSlice := NN.AddLayerAfter(
-            TNNetSplitChannels.Create(Channels), Blocks[BlockCnt].QKV);
-          QSlice := NN.AddLayerAfter(
-            TNNetRotaryEmbedding.Create(LayerTheta), QSlice);
-          for d := 0 to HeadDimM1 do
-            Channels[d] := Config.HiddenSize + HeadCnt * HeadDim + d;
-          KSlice := NN.AddLayerAfter(
-            TNNetSplitChannels.Create(Channels), Blocks[BlockCnt].QKV);
-          KSlice := NN.AddLayerAfter(
-            TNNetRotaryEmbedding.Create(LayerTheta), KSlice);
-          for d := 0 to HeadDimM1 do
-            Channels[d] := 2 * Config.HiddenSize + HeadCnt * HeadDim + d;
-          VSlice := NN.AddLayerAfter(
-            TNNetSplitChannels.Create(Channels), Blocks[BlockCnt].QKV);
-          HeadPack := NN.AddLayer(
-            TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
-          // BIDIRECTIONAL attention (CausalMask=false - this is an
-          // encoder); local layers add the symmetric sliding window.
-          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
-            TNNetScaledDotProductAttention.Create(HeadDim,
-              {CausalMask=}false, {pWindow=}LayerWindow,
-              {pScoreSoftCap=}0,
-              {pBidirectionalWindow=}LayerWindow > 0),
-            HeadPack);
+          for HeadCnt := 0 to NumHeadsM1 do
+          begin
+            for d := 0 to HeadDimM1 do
+              Channels[d] := HeadCnt * HeadDim + d;
+            QSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(Channels), QBand);
+            KSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(Channels), KBand);
+            VSlice := NN.AddLayerAfter(
+              TNNetSplitChannels.Create(Channels), VBand);
+            HeadPack := NN.AddLayer(
+              TNNetDeepConcat.Create([QSlice, KSlice, VSlice]) );
+            HeadOutputs[HeadCnt] := NN.AddLayerAfter(
+              TNNetScaledDotProductAttention.Create(HeadDim,
+                {CausalMask=}false, {pWindow=}LayerWindow,
+                {pScoreSoftCap=}0,
+                {pBidirectionalWindow=}true),
+              HeadPack);
+          end;
+          NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         end;
-        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
         Blocks[BlockCnt].AttnWo := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
