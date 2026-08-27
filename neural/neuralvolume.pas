@@ -9020,7 +9020,6 @@ begin
   begin
     VFix := Value/VMaxAbs;
     Self.Mul( VFix );
-    WriteLn(VMaxAbs:6:2);
   end;
 end;
 

@@ -38,6 +38,7 @@ type
     procedure TestVolumeAdafactorDeltaParity;
     procedure TestVolumeClampAbsParity;
     procedure TestVolumeForceMaxRangeParity;
+    procedure TestVolumeForceMaxAbs;
     procedure TestVolumeHasNonFiniteBitTest;
     procedure TestVolumeLionDeltaParity;
     procedure TestVolumeFlip;
@@ -1326,6 +1327,41 @@ begin
     Vol.ForceMaxRange(0);
     AssertEquals('zero bound clamps up', 0.0, Vol.Raw[0], 0.0);
     AssertEquals('zero bound clamps down', 0.0, Vol.Raw[1], 0.0);
+  finally
+    Vol.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeForceMaxAbs;
+// ForceMaxAbs rescales the whole volume so that the largest magnitude lands on
+// the bound, keeping every ratio between cells; a volume already inside the
+// bound is left byte for byte as it was.
+var
+  Vol: TNNetVolume;
+begin
+  Vol := TNNetVolume.Create(4, 1, 1);
+  try
+    Vol.Raw[0] := 2.0;
+    Vol.Raw[1] := -8.0;
+    Vol.Raw[2] := 0.0;
+    Vol.Raw[3] := 4.0;
+    Vol.ForceMaxAbs(2.0);
+    AssertEquals('scaled max abs', 2.0, Vol.GetMaxAbs(), 0.0001);
+    AssertEquals('scaled cell 0', 0.5, Vol.Raw[0], 0.0001);
+    AssertEquals('scaled cell 1', -2.0, Vol.Raw[1], 0.0001);
+    AssertEquals('scaled cell 2', 0.0, Vol.Raw[2], 0.0);
+    AssertEquals('scaled cell 3', 1.0, Vol.Raw[3], 0.0001);
+
+    // Already within the bound: no scaling at all.
+    Vol.Raw[0] := 0.25;
+    Vol.Raw[1] := -1.5;
+    Vol.Raw[2] := 0.0;
+    Vol.Raw[3] := 1.0;
+    Vol.ForceMaxAbs(2.0);
+    AssertEquals('in range cell 0', 0.25, Vol.Raw[0], 0.0);
+    AssertEquals('in range cell 1', -1.5, Vol.Raw[1], 0.0);
+    AssertEquals('in range cell 2', 0.0, Vol.Raw[2], 0.0);
+    AssertEquals('in range cell 3', 1.0, Vol.Raw[3], 0.0);
   finally
     Vol.Free;
   end;
