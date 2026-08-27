@@ -85475,11 +85475,14 @@ begin
   OutDepthM1 := FOutDepth - 1;
   SeqLenM1 := FSeqLen - 1;
   ModesM1 := FModes - 1;
-  // Refresh the contiguous weight mirror so a directly hand-edited weight (a
-  // finite-difference perturbation, a freshly LoadFromString'd net, etc.) is
-  // honoured even without an intervening AfterWeightUpdate. Cost is a single
-  // weight-sized copy -- cheap next to the FFTs and the vectorized contraction.
-  RebuildWeightPlanes();
+  // Every sanctioned weight writer (SetPrevLayer, UpdateWeights, CopyWeights,
+  // LoadDataFromString, the Init*/normalize helpers) goes through
+  // AfterWeightUpdate, which rebuilds the mirror, so an inference-only layer's
+  // planes are always current and the rebuild is pure waste there -- it copies
+  // as many elements as the contraction below multiplies. A TRAINABLE layer is
+  // additionally hand-edited (a finite-difference perturbation writes
+  // Weights.FData straight), so it keeps refreshing per forward.
+  if FIsTrainable then RebuildWeightPlanes();
   // 1. Real FFT of every input channel along SeqLen.
   for ci := 0 to InDepthM1 do
   begin
@@ -86549,11 +86552,14 @@ begin
   SizeYM1 := FSizeY - 1;
   ModesXM1 := FModesX - 1;
   ModesYM1 := FModesY - 1;
-  // Refresh the contiguous weight mirror so a directly hand-edited weight (a
-  // finite-difference perturbation, a freshly LoadFromString'd net, etc.) is
-  // honoured even without an intervening AfterWeightUpdate. Cost is a single
-  // weight-sized copy -- cheap next to the FFTs and the vectorized contraction.
-  RebuildWeightPlanes();
+  // Every sanctioned weight writer (SetPrevLayer, UpdateWeights, CopyWeights,
+  // LoadDataFromString, the Init*/normalize helpers) goes through
+  // AfterWeightUpdate, which rebuilds the mirror, so an inference-only layer's
+  // planes are always current and the rebuild is pure waste there -- it copies
+  // as many elements as the contraction below multiplies. A TRAINABLE layer is
+  // additionally hand-edited (a finite-difference perturbation writes
+  // Weights.FData straight), so it keeps refreshing per forward.
+  if FIsTrainable then RebuildWeightPlanes();
   // 1. 2-D FFT of every input channel.
   InRowStride := FSizeX * FInDepth;       // #5: one grid row of the input
   for ci := 0 to InDepthM1 do

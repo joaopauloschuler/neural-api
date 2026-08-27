@@ -259,6 +259,7 @@ type
     procedure TestSpectralConv2DGradientCheck;
     procedure TestSpectralConv2DShapeAndTruncation;
     procedure TestSpectralConv2DSerializationRoundTrip;
+    procedure TestSpectralConvInferenceOnlyWeightPlanes;
     // AddFourierNeuralOperator1D/2D block builders (spectral + pointwise residual)
     procedure TestFourierNeuralOperator1DShape;
     procedure TestFourierNeuralOperator2DShape;
@@ -62845,6 +62846,120 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestSpectralConvInferenceOnlyWeightPlanes;
+var
+  NN, NNRef: TNNet;
+  SC1, SCRef1: TNNetSpectralConv1D;
+  SC2, SCRef2: TNNetSpectralConv2D;
+  Input1, Input2: TNNetVolume;
+  i: integer;
+
+  // Overwrites the spectral weight neuron with a deterministic pattern.
+  procedure SetSpectralWeights(ALayer: TNNetLayer; ASeed: TNeuralFloat);
+  var
+    k: integer;
+  begin
+    for k := 0 to ALayer.Neurons[0].Weights.Size - 1 do
+      ALayer.Neurons[0].Weights.Raw[k] := ASeed * (k + 1) - 0.31;
+  end;
+
+begin
+  // Both spectral convolutions read their weights through a contiguous Re/Im
+  // plane mirror that an INFERENCE-ONLY layer refreshes only in
+  // AfterWeightUpdate. This pins the two external routes that must still be
+  // honoured after SetTrainable(False): LoadDataFromString and a direct weight
+  // mutation followed by FlushWeightCache. A stale mirror shows up as an output
+  // that still reflects the pre-change weights.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  NNRef := TNNet.Create();
+  Input1 := TNNetVolume.Create(8, 1, 2);
+  Input2 := TNNetVolume.Create(4, 4, 2);
+  try
+    NN.AddLayer(TNNetInput.Create(8, 1, 2));
+    SC1 := TNNetSpectralConv1D.Create(3, 4);
+    NN.AddLayer(SC1);
+    NNRef.AddLayer(TNNetInput.Create(8, 1, 2));
+    SCRef1 := TNNetSpectralConv1D.Create(3, 4);
+    NNRef.AddLayer(SCRef1);
+
+    for i := 0 to Input1.Size - 1 do
+      Input1.Raw[i] := Sin(i * 0.7) * 1.1 - 0.3;
+
+    // The reference net stays trainable and carries the FINAL weights.
+    SetSpectralWeights(SCRef1, 0.05);
+    NNRef.Compute(Input1);
+
+    // The layer under test goes inference-only holding DIFFERENT weights, then
+    // receives the final ones through LoadDataFromString.
+    SetSpectralWeights(SC1, -0.11);
+    NN.SetTrainable(False, False);
+    NN.Compute(Input1);
+    NN.LoadDataFromString(NNRef.SaveDataToString());
+    NN.Compute(Input1);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('SpectralConv1D inference-only LoadDataFromString pos ' +
+        IntToStr(i), NNRef.GetLastLayer.Output.Raw[i],
+        NN.GetLastLayer.Output.Raw[i], 1e-5);
+
+    // Same layer, the direct-mutation route.
+    SetSpectralWeights(SCRef1, 0.023);
+    NNRef.Compute(Input1);
+    SetSpectralWeights(SC1, 0.023);
+    SC1.FlushWeightCache();
+    NN.Compute(Input1);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('SpectralConv1D inference-only FlushWeightCache pos ' +
+        IntToStr(i), NNRef.GetLastLayer.Output.Raw[i],
+        NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    NNRef.Free;
+    Input1.Free;
+  end;
+
+  NN := TNNet.Create();
+  NNRef := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 2));
+    SC2 := TNNetSpectralConv2D.Create(3, 2, 2);
+    NN.AddLayer(SC2);
+    NNRef.AddLayer(TNNetInput.Create(4, 4, 2));
+    SCRef2 := TNNetSpectralConv2D.Create(3, 2, 2);
+    NNRef.AddLayer(SCRef2);
+
+    for i := 0 to Input2.Size - 1 do
+      Input2.Raw[i] := Cos(i * 0.53) * 0.9 + 0.2;
+
+    SetSpectralWeights(SCRef2, 0.037);
+    NNRef.Compute(Input2);
+
+    SetSpectralWeights(SC2, -0.19);
+    NN.SetTrainable(False, False);
+    NN.Compute(Input2);
+    NN.LoadDataFromString(NNRef.SaveDataToString());
+    NN.Compute(Input2);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('SpectralConv2D inference-only LoadDataFromString pos ' +
+        IntToStr(i), NNRef.GetLastLayer.Output.Raw[i],
+        NN.GetLastLayer.Output.Raw[i], 1e-5);
+
+    SetSpectralWeights(SCRef2, 0.011);
+    NNRef.Compute(Input2);
+    SetSpectralWeights(SC2, 0.011);
+    SC2.FlushWeightCache();
+    NN.Compute(Input2);
+    for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+      AssertEquals('SpectralConv2D inference-only FlushWeightCache pos ' +
+        IntToStr(i), NNRef.GetLastLayer.Output.Raw[i],
+        NN.GetLastLayer.Output.Raw[i], 1e-5);
+  finally
+    NN.Free;
+    NNRef.Free;
+    Input2.Free;
   end;
 end;
 
