@@ -53040,17 +53040,15 @@ var
   Blocks: array of TNemotronHBlockLayers;
   EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
   BranchInput, NormedSrc, XBCConv, DtSplit, GateSplit: TNNetLayer;
-  QSlice, HeadPack: TNNetLayer;
   GateScaled, SharedOut, ExpertOut, GateE, GateEB: TNNetLayer;
-  KSlices, VSlices, HeadOutputs, MoEBranches: array of TNNetLayer;
-  BlockCnt, SeqLen, i, j, d, ConvDim, ProjSize, ConvBiasSuppress: integer;
-  QWidth, KVWidth, GroupSize, HeadCnt, KVHeadCnt, KVGroup, e: integer;
-  NumLayersM1, NumKVHeadsM1, HeadDimM1, NumHeadsM1: integer;
+  MoEBranches: array of TNNetLayer;
+  BlockCnt, SeqLen, i, j, ConvDim, ProjSize, ConvBiasSuppress: integer;
+  QWidth, KVWidth, e: integer;
+  NumLayersM1: integer;
   NumRoutedExpertsM1, VocabSizeM1, HiddenSizeM1: integer;
   Tmp, BiasVec: TNNetVolume;
   MixPrefix, LayerP, AttP, TensorNameStr, InBias, OutBias, MoeP: string;
   Consumed: TStringList;
-  SliceChannels: array of integer;
 
   procedure MarkConsumed(const TName: string);
   begin
@@ -53151,11 +53149,7 @@ begin
       ProjSize := Config.DInner + ConvDim + Config.MambaNumHeads;
       QWidth := Config.NumHeads * Config.HeadDim;
       KVWidth := Config.NumKVHeads * Config.HeadDim;
-      GroupSize := Config.NumHeads div Config.NumKVHeads;
       NumLayersM1 := Config.NumLayers - 1;
-      NumKVHeadsM1 := Config.NumKVHeads - 1;
-      HeadDimM1 := Config.HeadDim - 1;
-      NumHeadsM1 := Config.NumHeads - 1;
       NumRoutedExpertsM1 := Config.NumRoutedExperts - 1;
       VocabSizeM1 := Config.VocabSize - 1;
       HiddenSizeM1 := Config.HiddenSize - 1;
@@ -53182,10 +53176,6 @@ begin
       if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
-      SetLength(KSlices, Config.NumKVHeads);
-      SetLength(VSlices, Config.NumKVHeads);
-      SetLength(HeadOutputs, Config.NumHeads);
-      SetLength(SliceChannels, Config.HeadDim);
       for BlockCnt := 0 to NumLayersM1 do
       begin
         // x := x + mixer(norm(x)).
@@ -53228,32 +53218,14 @@ begin
               TNNetPointwiseConvLinear.Create(KVWidth, 1).SetTrainable(pTrainable), NormedSrc);
             Blocks[BlockCnt].VProj := NN.AddLayerAfter(
               TNNetPointwiseConvLinear.Create(KVWidth, 1).SetTrainable(pTrainable), NormedSrc);
-            for KVHeadCnt := 0 to NumKVHeadsM1 do
-            begin
-              for d := 0 to HeadDimM1 do
-                SliceChannels[d] := KVHeadCnt * Config.HeadDim + d;
-              KSlices[KVHeadCnt] := NN.AddLayerAfter(
-                TNNetSplitChannels.Create(SliceChannels),
-                Blocks[BlockCnt].KProj);
-              VSlices[KVHeadCnt] := NN.AddLayerAfter(
-                TNNetSplitChannels.Create(SliceChannels),
-                Blocks[BlockCnt].VProj);
-            end;
-            for HeadCnt := 0 to NumHeadsM1 do
-            begin
-              KVGroup := HeadCnt div GroupSize;
-              for d := 0 to HeadDimM1 do
-                SliceChannels[d] := HeadCnt * Config.HeadDim + d;
-              QSlice := NN.AddLayerAfter(
-                TNNetSplitChannels.Create(SliceChannels),
-                Blocks[BlockCnt].QProj);
-              HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
-                [QSlice, KSlices[KVGroup], VSlices[KVGroup]]) );
-              HeadOutputs[HeadCnt] := NN.AddLayerAfter(
-                TNNetScaledDotProductAttention.Create(
-                  Config.HeadDim, {CausalMask=}true), HeadPack);
-            end;
-            NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+            // NoPE: nothing per-head sits between the three projections and
+            // the attention math (no rotary, no QK-norm, no bias), so the
+            // shared builder packs every head into ONE attention layer
+            // instead of a 3*NumKVHeads + 3*NumHeads layer forest.
+            NN.AddGQAAttentionFromSources(Blocks[BlockCnt].QProj,
+              Blocks[BlockCnt].KProj, Blocks[BlockCnt].VProj,
+              Config.NumHeads, Config.NumKVHeads, Config.HeadDim,
+              {CausalMask=}true);
             Blocks[BlockCnt].OProj := NN.AddLayer(
               TNNetPointwiseConvLinear.Create(Config.HiddenSize, 1).SetTrainable(pTrainable) );
           end;

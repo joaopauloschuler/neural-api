@@ -9781,13 +9781,17 @@ procedure TTestNeuralPretrained.TestNemotronHLogitParity;
 var
   NN: TNNet;
   Config: TNemotronHConfig;
-  LayerCnt, Mamba2Cnt, AttnCnt, SquareCnt, SwiGLUCnt: integer;
+  LayerCnt, Mamba2Cnt, AttnCnt, FusedCnt, SquareCnt, SwiGLUCnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildNemotronHFromSafeTensorsEx(
     FixturePath('tiny_nemotronh.safetensors'), Config, {SeqLen=}7,
     {pTrainable=}true, FixturePath('tiny_nemotronh_config.json'));
   try
+    // Ground truth first: a structural assertion below must never shadow the
+    // HF oracle.
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_nemotronh_logits.json'), 7, Config.VocabSize);
     AssertEquals('model_type', 'nemotron_h', Config.ModelType);
     AssertEquals('pattern', 'M*-M', Config.Pattern);
     AssertEquals('layers', 4, Config.NumLayers);
@@ -9808,23 +9812,23 @@ begin
     AssertFalse('untied head', Config.TieWordEmbeddings);
     AssertEquals('prefix', 'model.', Config.Prefix);
     // Schedule M*-M: 2 Mamba-2 mixers (-> 2 TNNetMamba2), 1 attention block
-    // (-> NumHeads=4 SDPA heads), 1 relu2 MLP (-> 1 TNNetSquare). No SwiGLU
-    // anywhere (the MLP is NON-gated).
-    Mamba2Cnt := 0; AttnCnt := 0; SquareCnt := 0; SwiGLUCnt := 0;
+    // (NoPE, so all 4 heads fuse into ONE TNNetFusedSDPA), 1 relu2 MLP (-> 1
+    // TNNetSquare). No SwiGLU anywhere (the MLP is NON-gated).
+    Mamba2Cnt := 0; AttnCnt := 0; FusedCnt := 0; SquareCnt := 0; SwiGLUCnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
       if NN.Layers[LayerCnt] is TNNetMamba2 then Inc(Mamba2Cnt);
-      if NN.Layers[LayerCnt] is TNNetScaledDotProductAttention then
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
         Inc(AttnCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then Inc(FusedCnt);
       if NN.Layers[LayerCnt] is TNNetSquare then Inc(SquareCnt);
       if NN.Layers[LayerCnt] is TNNetSwiGLU then Inc(SwiGLUCnt);
     end;
     AssertEquals('TNNetMamba2 count (2 M blocks)', 2, Mamba2Cnt);
-    AssertEquals('SDPA head count (4 heads x 1 attn block)', 4, AttnCnt);
+    AssertEquals('one fused attention per attn block', 1, FusedCnt);
+    AssertEquals('no per-head SDPA survives the fusion', 0, AttnCnt);
     AssertEquals('TNNetSquare count (1 relu2 MLP block)', 1, SquareCnt);
     AssertEquals('SwiGLU count (non-gated relu2 MLP => 0)', 0, SwiGLUCnt);
-    AssertLogitParityWithFixture(NN,
-      FixturePath('tiny_nemotronh_logits.json'), 7, Config.VocabSize);
   finally
     NN.Free;
   end;
@@ -9869,7 +9873,8 @@ procedure TTestNeuralPretrained.TestNemotronHMoELogitParity;
 var
   NN: TNNet;
   Config: TNemotronHConfig;
-  LayerCnt, Mamba2Cnt, AttnCnt, SquareCnt, GateCnt, SwiGLUCnt: integer;
+  LayerCnt, Mamba2Cnt, AttnCnt, FusedCnt, SquareCnt, GateCnt,
+  SwiGLUCnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildNemotronHFromSafeTensorsEx(
@@ -9895,21 +9900,26 @@ begin
     // comparison - the only assertion here that checks the MODEL.
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_nemotronh_moe_logits.json'), 7, Config.VocabSize);
-    // Schedule M*E-: 1 Mamba-2, 1 attention (4 SDPA heads), 1 MoE block
-    // (-> 4 routed + 1 shared relu2 expert => 5 TNNetSquare), 1 dense relu2
-    // MLP (-> 1 more TNNetSquare) = 6 TNNetSquare. One TNNetBiasBalancedTopKGate
-    // (the sigmoid router with norm_topk_prob). No SwiGLU (non-gated experts).
-    Mamba2Cnt := 0; AttnCnt := 0; SquareCnt := 0; GateCnt := 0; SwiGLUCnt := 0;
+    // Schedule M*E-: 1 Mamba-2, 1 attention (NoPE, so all 4 heads fuse into
+    // ONE TNNetFusedSDPA), 1 MoE block (-> 4 routed + 1 shared relu2 expert
+    // => 5 TNNetSquare), 1 dense relu2 MLP (-> 1 more TNNetSquare) = 6
+    // TNNetSquare. One TNNetBiasBalancedTopKGate (the sigmoid router with
+    // norm_topk_prob). No SwiGLU (non-gated experts).
+    Mamba2Cnt := 0; AttnCnt := 0; FusedCnt := 0; SquareCnt := 0; GateCnt := 0;
+    SwiGLUCnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
       if NN.Layers[LayerCnt] is TNNetMamba2 then Inc(Mamba2Cnt);
-      if NN.Layers[LayerCnt] is TNNetScaledDotProductAttention then Inc(AttnCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+        Inc(AttnCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then Inc(FusedCnt);
       if NN.Layers[LayerCnt] is TNNetSquare then Inc(SquareCnt);
       if NN.Layers[LayerCnt] is TNNetBiasBalancedTopKGate then Inc(GateCnt);
       if NN.Layers[LayerCnt] is TNNetSwiGLU then Inc(SwiGLUCnt);
     end;
     AssertEquals('TNNetMamba2 count (1 M block)', 1, Mamba2Cnt);
-    AssertEquals('SDPA head count (4 heads x 1 attn block)', 4, AttnCnt);
+    AssertEquals('one fused attention per attn block', 1, FusedCnt);
+    AssertEquals('no per-head SDPA survives the fusion', 0, AttnCnt);
     AssertEquals('TNNetSquare count (4 routed + 1 shared + 1 dense MLP)', 6,
       SquareCnt);
     AssertEquals('TNNetBiasBalancedTopKGate count (1 MoE router)', 1, GateCnt);
