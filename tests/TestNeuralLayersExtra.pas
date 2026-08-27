@@ -134,6 +134,7 @@ type
     procedure TestRepresentationSimilarityReportSmoke;
     procedure TestWeightHistogramReportNumbers;
     procedure TestActivationReportsRepeatStable;
+    procedure TestLensReportsIgnoreNilProbes;
     procedure TestEnableInputGradient;
     procedure TestAdversarialRobustnessReportSmoke;
     procedure TestGradientConflictReportSmoke;
@@ -4996,6 +4997,65 @@ begin
   finally
     Samples.Free;
     Probes.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestLensReportsIgnoreNilProbes;
+var
+  NN: TNNet;
+  Owner, Dense, WithNil: TNNetVolumeList;
+  X: TNNetVolume;
+  I, J, C: integer;
+  WithoutNilReport, WithNilReport: string;
+begin
+  RandSeed := 20250827;
+  NN := TNNet.Create();
+  Owner := TNNetVolumeList.Create(True);
+  Dense := TNNetVolumeList.Create(False);
+  WithNil := TNNetVolumeList.Create(False);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(6));
+    NN.AddLayer(TNNetFullConnectReLU.Create(6));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.01, 0.9);
+    NN.InitWeights();
+    for I := 0 to 11 do
+    begin
+      C := I mod 3;
+      X := TNNetVolume.Create(4, 1, 1);
+      for J := 0 to 3 do X.Raw[J] := (Random - 0.5) * 2.0 + C;
+      Owner.Add(X);
+      Dense.Add(X);
+      WithNil.Add(X);
+      if I = 5 then WithNil.Add(nil);
+    end;
+
+    // A nil probe entry is skipped, so it must not dilute any average: the
+    // report over the padded list has to match the report over the dense one.
+    WithoutNilReport := TNNet.LogitLensReport(NN, Dense);
+    WithNilReport := TNNet.LogitLensReport(NN, WithNil);
+    AssertEquals('LogitLensReport ignores a nil probe entry',
+      WithoutNilReport, WithNilReport);
+
+    WithoutNilReport := TNNet.TunedLensReport(NN, Dense, -1, 60, 0.005);
+    WithNilReport := TNNet.TunedLensReport(NN, WithNil, -1, 60, 0.005);
+    AssertEquals('TunedLensReport ignores a nil probe entry',
+      WithoutNilReport, WithNilReport);
+
+    // An all-nil batch is reported, not divided by zero.
+    WithNil.Clear();
+    WithNil.Add(nil);
+    AssertTrue('LogitLensReport reports an all-nil batch',
+      Pos('no usable', TNNet.LogitLensReport(NN, WithNil)) > 0);
+    AssertTrue('TunedLensReport reports an all-nil batch',
+      Pos('no usable', TNNet.TunedLensReport(NN, WithNil)) > 0);
+  finally
+    WithNil.Free;
+    Dense.Free;
+    Owner.Free;
     NN.Free;
   end;
 end;

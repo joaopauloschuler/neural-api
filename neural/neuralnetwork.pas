@@ -112489,6 +112489,7 @@ var
   CrystBins: array of integer;
   MaxBin, BarLen: integer;
   NumLayersM1, NumCompatM1, NumSamplesM1, NumClassesM1, cBinsM1: integer;
+  ValidCnt: integer;                  // probe entries that are not nil
   Prob: TFloatArray;                  // scratch p_L for one sample
   KLval, EntVal, Conf, Pf, Pl, Acc, BarVal, MaxKL: TNeuralFloat;
   Bar, SkipList: string;
@@ -112552,6 +112553,17 @@ begin
 
     NumSamples := pInput.Count;
     NumSamplesM1 := NumSamples - 1;
+    // nil probe entries are skipped everywhere, so every average is taken over
+    // the usable entries only.
+    ValidCnt := 0;
+    for SampleIdx := 0 to NumSamplesM1 do
+      if pInput[SampleIdx] <> nil then Inc(ValidCnt);
+    if ValidCnt = 0 then
+    begin
+      Result := 'LogitLensReport: pInput has no usable (non-nil) sample.' +
+        sLineBreak;
+      Exit;
+    end;
 
     // --- Catalogue which earlier layers (0..HeadInIdx) are lens-compatible. ---
     SetLength(Compatible, NumLayers);
@@ -112666,10 +112678,10 @@ begin
         EntSum[L] := EntSum[L] + EntVal;
         KLsum[L] := KLsum[L] + KLval;
       end;
-      Agree[L] := Agree[L] / NumSamples;
-      ConfSum[L] := ConfSum[L] / NumSamples;
-      EntSum[L] := EntSum[L] / NumSamples;
-      KLsum[L] := KLsum[L] / NumSamples;
+      Agree[L] := Agree[L] / ValidCnt;
+      ConfSum[L] := ConfSum[L] / ValidCnt;
+      EntSum[L] := EntSum[L] / ValidCnt;
+      KLsum[L] := KLsum[L] / ValidCnt;
     end;
 
     // --- (3) per-sample crystallization depth (in compatible-layer order). ---
@@ -112680,6 +112692,7 @@ begin
     for SampleIdx := 0 to NumSamplesM1 do
     begin
       CrystComp[SampleIdx] := -1;
+      if pInput[SampleIdx] = nil then Continue;
       for I := NumCompatM1 downto 0 do
       begin
         if PerSampleCorrect[I][SampleIdx] then
@@ -112700,7 +112713,7 @@ begin
     Lines.Add(Format('Layers=%d, classes=%d, probe sample(s)=%d. ' +
       'HeadStartIdx=%d (%s), head-input layer=%d (%s, size=%d). ' +
       '%d of %d sub-head layer(s) lens-compatible.',
-      [NumLayers, NumClasses, NumSamples, HeadIdx,
+      [NumLayers, NumClasses, ValidCnt, HeadIdx,
        NN.Layers[HeadIdx].ClassName, HeadInIdx,
        NN.Layers[HeadInIdx].ClassName, HeadInSize, NumCompat, HeadInIdx + 1]));
     if HeadStartIdx < 0 then
@@ -112772,7 +112785,7 @@ begin
       Lines.Add(Format('Crystallization depth (shallowest layer after which ' +
         'the lens argmax matches final and never flips): mean = %.2f over ' +
         '%.0f / %d sample(s).',
-        [CrystSum / CrystCnt, CrystCnt, NumSamples]))
+        [CrystSum / CrystCnt, CrystCnt, ValidCnt]))
     else
       Lines.Add('Crystallization depth: no sample crystallizes before the ' +
         'head (lens never stabilises to the final argmax).');
@@ -112898,7 +112911,8 @@ var
   Pl, Pf, KLval, EntVal, MeanLogitKL, MeanTunedKLPre, MeanTunedKL: TNeuralFloat;
   BarLen: integer;
   Bar, SkipList: string;
-  TunedCnt: integer;
+  ValidCnt: integer;                    // probe entries that are not nil
+  ValidIdx: array of integer;           // their indexes, in order
   NumLayersM1, NumSamplesM1, NumClassesM1, NumCompatM1: integer;
 begin
   Result := '';
@@ -112950,6 +112964,21 @@ begin
     HeadInSize := NN.Layers[HeadInIdx].Output.Size;
     NumSamples := pInput.Count;
     NumSamplesM1 := NumSamples - 1;
+    // nil probe entries are skipped everywhere, so every average is taken over
+    // the usable entries only and fitting sweeps just those.
+    SetLength(ValidIdx, NumSamples);
+    ValidCnt := 0;
+    for SampleIdx := 0 to NumSamplesM1 do
+      if pInput[SampleIdx] <> nil then
+      begin
+        ValidIdx[ValidCnt] := SampleIdx; Inc(ValidCnt);
+      end;
+    if ValidCnt = 0 then
+    begin
+      Result := 'TunedLensReport: pInput has no usable (non-nil) sample.' +
+        sLineBreak;
+      Exit;
+    end;
 
     // --- Catalogue lens-compatible layers (flat size == head input size). ---
     SetLength(Compatible, NumLayers);
@@ -113086,8 +113115,8 @@ begin
         LogitEnt[L] := LogitEnt[L] + EntVal;
         LogitKL[L] := LogitKL[L] + KLval;
       end;
-      LogitEnt[L] := LogitEnt[L] / NumSamples;
-      LogitKL[L] := LogitKL[L] / NumSamples;
+      LogitEnt[L] := LogitEnt[L] / ValidCnt;
+      LogitKL[L] := LogitKL[L] / ValidCnt;
 
       // --- pre-fit pass (identity translator): KL must tie the raw logit lens.
       for SampleIdx := 0 to NumSamplesM1 do
@@ -113108,7 +113137,7 @@ begin
         if KLval < 0 then KLval := 0;
         TunedKLPre[L] := TunedKLPre[L] + KLval;
       end;
-      TunedKLPre[L] := TunedKLPre[L] / NumSamples;
+      TunedKLPre[L] := TunedKLPre[L] / ValidCnt;
 
       // --- fit the translator: minimise KL(p_final || p_tuned). With a softmax
       //     head, backpropagating p_final as the soft target IS that gradient. A
@@ -113116,9 +113145,7 @@ begin
       //     clones have LearningRate 0, so only the translator is stepped.
       for It := 1 to TrainIters do
       begin
-        SampleIdx := It mod NumSamples;
-        InVol := pInput[SampleIdx];
-        if InVol = nil then Continue;
+        SampleIdx := ValidIdx[It mod ValidCnt];
         for C := 0 to NumClassesM1 do TargetVol.FData[C] := FinalProb[SampleIdx][C];
         Lens.Compute(ActCache[SampleIdx]);
         // Online step: TNNetFullConnect.Backpropagate applies the weight update
@@ -113128,7 +113155,6 @@ begin
       end;
 
       // --- post-fit tuned-lens columns + correctness signals. ---
-      TunedCnt := 0;
       for SampleIdx := 0 to NumSamplesM1 do
       begin
         InVol := pInput[SampleIdx];
@@ -113160,12 +113186,10 @@ begin
                       RawLogitProb[SampleIdx][C]);
             if Pl > MaxDp[L] then MaxDp[L] := Pl;
           end;
-        Inc(TunedCnt);
       end;
-      if TunedCnt = 0 then TunedCnt := 1;
-      TunedEnt[L] := TunedEnt[L] / TunedCnt;
-      TunedKL[L] := TunedKL[L] / TunedCnt;
-      TunedAgree[L] := TunedAgree[L] / TunedCnt;
+      TunedEnt[L] := TunedEnt[L] / ValidCnt;
+      TunedKL[L] := TunedKL[L] / ValidCnt;
+      TunedAgree[L] := TunedAgree[L] / ValidCnt;
     end;
 
     // --- (4) report header + side-by-side table. ---
@@ -113176,7 +113200,7 @@ begin
     Lines.Add(Format('Layers=%d, classes=%d, probe sample(s)=%d. ' +
       'HeadStartIdx=%d (%s), head-input layer=%d (%s, size=%d). ' +
       '%d lens-compatible layer(s). TrainIters=%d, lr=%.4g.',
-      [NumLayers, NumClasses, NumSamples, HeadIdx,
+      [NumLayers, NumClasses, ValidCnt, HeadIdx,
        NN.Layers[HeadIdx].ClassName, HeadInIdx,
        NN.Layers[HeadInIdx].ClassName, HeadInSize, NumCompat,
        TrainIters, LearningRate]));
