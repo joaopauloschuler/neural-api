@@ -37,6 +37,8 @@ type
     procedure TestVolumeAdamDeltaParity;
     procedure TestVolumeAdafactorDeltaParity;
     procedure TestVolumeClampAbsParity;
+    procedure TestVolumeForceMaxRangeParity;
+    procedure TestVolumeHasNonFiniteBitTest;
     procedure TestVolumeLionDeltaParity;
     procedure TestVolumeFlip;
     procedure TestVolumeClassification;
@@ -1273,6 +1275,94 @@ begin
     AssertEquals('zero bound is a no-op' + Tag, 9.0, Buf[0], 0.0);
     TNNetVolume.ClampAbs(TNeuralFloatArrPtr(@Buf[0]), cBound, 0);
     AssertEquals('empty run' + Tag, 9.0, Buf[0], 0.0);
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeForceMaxRangeParity;
+// ForceMaxRange now hands a positive bound to the ClampAbs kernel. The
+// reference is NeuronForceRange's own two-branch chain, so the assertion is
+// bit-identity: values inside the bound, exactly on it, and beyond it on both
+// signs, plus the infinities. NaN is deliberately absent: the debug build traps
+// invalid FP compares, so NaN handling is asserted where it can be observed
+// without one - see TestVolumeHasNonFiniteBitTest. A non-positive bound is
+// outside the kernel's contract and
+// still takes the scalar path, which zeroes the whole volume.
+var
+  Vol: TNNetVolume;
+  K, N: integer;
+  Ref: array of TNeuralFloat;
+  v: TNeuralFloat;
+begin
+  N := 37;
+  Vol := TNNetVolume.Create(N, 1, 1);
+  SetLength(Ref, N);
+  try
+    for K := 0 to N - 1 do
+    begin
+      case K mod 7 of
+        0: v := 0.25;
+        1: v := -0.25;
+        2: v := 9.0;
+        3: v := -9.0;
+        4: v := 2.0;          // exactly the bound
+        5: v := -2.0;
+        else v := 0.0;
+      end;
+      Vol.Raw[K] := v;
+      Ref[K] := NeuronForceRange(v, 2.0);
+    end;
+    Vol.Raw[10] := Infinity;   Ref[10] := NeuronForceRange(Infinity, 2.0);
+    Vol.Raw[11] := -Infinity;  Ref[11] := NeuronForceRange(-Infinity, 2.0);
+
+    Vol.ForceMaxRange(2.0);
+    for K := 0 to N - 1 do
+    begin
+      AssertEquals('ForceMaxRange[' + IntToStr(K) + ']', Ref[K], Vol.Raw[K], 0.0);
+    end;
+
+    // A zero bound keeps the historical scalar behaviour: everything collapses.
+    Vol.Raw[0] := 5;
+    Vol.Raw[1] := -5;
+    Vol.ForceMaxRange(0);
+    AssertEquals('zero bound clamps up', 0.0, Vol.Raw[0], 0.0);
+    AssertEquals('zero bound clamps down', 0.0, Vol.Raw[1], 0.0);
+  finally
+    Vol.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeHasNonFiniteBitTest;
+// HasNonFinite classifies binary32 by masking the exponent field instead of
+// calling IsNan/IsInfinite per element. The two must agree on every class the
+// scan can meet: normals, zeros, denormals (finite - the exponent field is 0),
+// the largest finite value, both infinities and a NaN.
+const
+  cProbes: array[0..8] of TNeuralFloat =
+    (0.0, -0.0, 1.0, -1.0, 3.4e38, 1.0e-40, -1.0e-40, 1.17549435e-38, 123456.75);
+var
+  Vol: TNNetVolume;
+  K: integer;
+begin
+  Vol := TNNetVolume.Create(Length(cProbes), 1, 1);
+  try
+    for K := 0 to High(cProbes) do Vol.Raw[K] := cProbes[K];
+    AssertFalse('finite probes (denormals included) are finite', Vol.HasNonFinite());
+
+    for K := 0 to High(cProbes) do
+    begin
+      // One slot at a time goes non-finite, so the scan has to find it wherever
+      // it sits rather than only at the head of the buffer.
+      Vol.Raw[K] := NaN;
+      AssertTrue('NaN at ' + IntToStr(K), Vol.HasNonFinite());
+      Vol.Raw[K] := Infinity;
+      AssertTrue('+Inf at ' + IntToStr(K), Vol.HasNonFinite());
+      Vol.Raw[K] := -Infinity;
+      AssertTrue('-Inf at ' + IntToStr(K), Vol.HasNonFinite());
+      Vol.Raw[K] := cProbes[K];
+      AssertFalse('restored at ' + IntToStr(K), Vol.HasNonFinite());
+    end;
+  finally
+    Vol.Free;
   end;
 end;
 

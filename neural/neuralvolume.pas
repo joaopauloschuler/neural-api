@@ -8989,6 +8989,15 @@ var
   I: integer;
   vHigh: integer;
 begin
+  if (FSize > 0) and (Value > 0) then
+  begin
+    // For a positive bound this is exactly the ClampAbs kernel, NaN included:
+    // NaN satisfies neither comparison and is left alone by both.
+    TNNetVolume.ClampAbs(Addr(FData[0]), Value, FSize);
+    exit;
+  end;
+  // A non-positive bound sits outside the kernel's contract - it early-exits
+  // there - so the scalar clamp keeps handling it.
   vHigh := High(FData);
   for I := 0 to vHigh do
     FData[I] := NeuronForceRange(FData[I], Value);
@@ -9023,7 +9032,9 @@ begin
   MaxIdx := FSize - 1;
   for I := 0 to MaxIdx do
   begin
-    if IsNan(FData[I]) or IsInfinite(FData[I]) then
+    // An all-ones binary32 exponent is precisely the NaN/Inf encoding, so one
+    // mask-and-compare replaces the pair of RTL classification calls.
+    if (PLongWord(Addr(FData[I]))^ and $7F800000) = $7F800000 then
     begin
       Result := true;
       Exit;
@@ -10134,24 +10145,12 @@ var
   I: integer;
   vHigh: integer;
 begin
-  if Length(FData) > 0 then
-  begin
-    if FData[0] >0 then Result := FData[0] else Result := -FData[0];
-    vHigh := High(FData);
-    if vHigh > 0 then
-    begin
-      for I := 1 to vHigh do
-      begin
-        if FData[I] > 0
-          then Result := Result + FData[I]
-          else Result := Result - FData[I];
-      end;
-    end;
-  end
-  else
-  begin
-    Result := 0;
-  end;
+  // Abs clears the sign bit; the sign test it replaces was a data-dependent
+  // branch taken once per element.
+  Result := 0;
+  vHigh := High(FData);
+  for I := 0 to vHigh do
+    Result := Result + Abs(FData[I]);
 end;
 
 function TVolume.GetSumSqr(): T;
@@ -10203,24 +10202,14 @@ end;
 function TVolume.GetVariance(): T;
 var
   Avg: T;
-  I: integer;
-  vHigh: integer;
-  AuxDif: Single;
   floatSize: Single;
 begin
   Result := 0;
   if (FSize > 1) then
   begin
     Avg := GetAvg();
-    vHigh := High(FData);
-
-    for I := 0 to vHigh do
-    begin
-      AuxDif := FData[I] - Avg;
-      Result := Result + Sqr(AuxDif);
-    end;
     floatSize := FSize;
-    Result := Result / floatSize;
+    Result := TNNetVolume.SumSqrCentered(Addr(FData[0]), Avg, FSize) / floatSize;
   end
 end;
 
