@@ -85059,10 +85059,11 @@ end;
 //   y[i] = sum_j OCT_SGN[i][j] * W[OCT_SRC[i][j]] * x[j].
 procedure TNNetOctonionLinear.ComputeCPU();
 var
-  oo, io, oBase, base, i, j: integer;
+  oo, io, oBase, base: integer;
   OutOM1, InOM1: integer;
-  acc: array[0..7] of TNeuralFloat;
-  xj: TNeuralFloat;
+  y0, y1, y2, y3, y4, y5, y6, y7: TNeuralFloat;
+  x0, x1, x2, x3, x4, x5, x6, x7: TNeuralFloat;
+  w0, w1, w2, w3, w4, w5, w6, w7: TNeuralFloat;
   W, PrevOut, Bias: TNNetVolume;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -85077,25 +85078,52 @@ begin
     // The eight output components share the same weight row, so the BLOCK loop
     // is outermost and the components accumulate in registers -- one traversal
     // of the InOctonions*8 row instead of eight, like TNNetQuaternionLinear and
-    // the *Conv siblings. For a fixed component the additions still run in
-    // (io, j) order, so the sums are unchanged.
-    for i := 0 to 7 do acc[i] := 0;
+    // the *Conv siblings. The 8x8 (i,j) nest over OCT_SGN/OCT_SRC touches only
+    // eight distinct weights and eight distinct inputs per block, so it is
+    // written out: the tables are folded into the +/- signs and the operand
+    // indices, leaving 64 fused multiply-adds on registers with no table reads.
+    // Each accumulator still adds its terms in ascending j, so the sums keep
+    // their original order.
+    y0 := 0; y1 := 0; y2 := 0; y3 := 0; y4 := 0; y5 := 0; y6 := 0; y7 := 0;
     for io := 0 to InOM1 do
     begin
       base := io * 8;                            // #9: one base for W and input
-      for j := 0 to 7 do
-      begin
-        xj := PrevOut.FData[base + j];
-        for i := 0 to 7 do
-          acc[i] := acc[i] + OCT_SGN[i, j] * W.FData[base + OCT_SRC[i, j]] * xj;
-      end;
+      w0 := W.FData[base    ]; x0 := PrevOut.FData[base    ];
+      w1 := W.FData[base + 1]; x1 := PrevOut.FData[base + 1];
+      w2 := W.FData[base + 2]; x2 := PrevOut.FData[base + 2];
+      w3 := W.FData[base + 3]; x3 := PrevOut.FData[base + 3];
+      w4 := W.FData[base + 4]; x4 := PrevOut.FData[base + 4];
+      w5 := W.FData[base + 5]; x5 := PrevOut.FData[base + 5];
+      w6 := W.FData[base + 6]; x6 := PrevOut.FData[base + 6];
+      w7 := W.FData[base + 7]; x7 := PrevOut.FData[base + 7];
+      y0 := y0 + w0*x0 - w1*x1 - w2*x2 - w3*x3 - w4*x4 - w5*x5 - w6*x6 - w7*x7;
+      y1 := y1 + w1*x0 + w0*x1 - w3*x2 + w2*x3 - w5*x4 + w4*x5 + w7*x6 - w6*x7;
+      y2 := y2 + w2*x0 + w3*x1 + w0*x2 - w1*x3 - w6*x4 - w7*x5 + w4*x6 + w5*x7;
+      y3 := y3 + w3*x0 - w2*x1 + w1*x2 + w0*x3 - w7*x4 + w6*x5 - w5*x6 + w4*x7;
+      y4 := y4 + w4*x0 + w5*x1 + w6*x2 + w7*x3 + w0*x4 - w1*x5 - w2*x6 - w3*x7;
+      y5 := y5 + w5*x0 - w4*x1 + w7*x2 - w6*x3 + w1*x4 + w0*x5 + w3*x6 - w2*x7;
+      y6 := y6 + w6*x0 - w7*x1 - w4*x2 + w5*x3 + w2*x4 - w3*x5 + w0*x6 + w1*x7;
+      y7 := y7 + w7*x0 + w6*x1 - w5*x2 - w4*x3 + w3*x4 + w2*x5 - w1*x6 + w0*x7;
     end;
     if FSuppressBias = 0 then
-      for i := 0 to 7 do
-        FOutput.FData[oBase + i] := acc[i] + Bias.FData[oBase + i]
-    else
-      for i := 0 to 7 do
-        FOutput.FData[oBase + i] := acc[i];
+    begin
+      y0 := y0 + Bias.FData[oBase    ];
+      y1 := y1 + Bias.FData[oBase + 1];
+      y2 := y2 + Bias.FData[oBase + 2];
+      y3 := y3 + Bias.FData[oBase + 3];
+      y4 := y4 + Bias.FData[oBase + 4];
+      y5 := y5 + Bias.FData[oBase + 5];
+      y6 := y6 + Bias.FData[oBase + 6];
+      y7 := y7 + Bias.FData[oBase + 7];
+    end;
+    FOutput.FData[oBase    ] := y0;
+    FOutput.FData[oBase + 1] := y1;
+    FOutput.FData[oBase + 2] := y2;
+    FOutput.FData[oBase + 3] := y3;
+    FOutput.FData[oBase + 4] := y4;
+    FOutput.FData[oBase + 5] := y5;
+    FOutput.FData[oBase + 6] := y6;
+    FOutput.FData[oBase + 7] := y7;
   end;
 end;
 
@@ -85120,11 +85148,12 @@ end;
 //   dL/dx[j] += sum_i OCT_SGN[i][j] * W[OCT_SRC[i][j]] * e[i].
 procedure TNNetOctonionLinear.ComputePreviousLayerErrorCPU();
 var
-  oo, io, oBase, base, pj, i, j: integer;
+  oo, io, oBase, base, i: integer;
   OutOM1, InOM1: integer;
   e: array[0..7] of TNeuralFloat;
   allZero: boolean;
-  contrib: TNeuralFloat;
+  e0, e1, e2, e3, e4, e5, e6, e7: TNeuralFloat;
+  w0, w1, w2, w3, w4, w5, w6, w7: TNeuralFloat;
   W, LocalPrevError: TNNetVolume;
 begin
   LocalPrevError := FPrevLayer.OutputError;
@@ -85141,17 +85170,38 @@ begin
       if e[i] <> 0 then allZero := False;
     end;
     if allZero then continue;
+    e0 := e[0]; e1 := e[1]; e2 := e[2]; e3 := e[3];
+    e4 := e[4]; e5 := e[5]; e6 := e[6]; e7 := e[7];
     for io := 0 to InOM1 do
     begin
       base := io * 8;                            // #9: one base
-      for j := 0 to 7 do
-      begin
-        contrib := 0;
-        for i := 0 to 7 do
-          contrib := contrib + OCT_SGN[i, j] * W.FData[base + OCT_SRC[i, j]] * e[i];
-        pj := base + j;                          // #10: (base + j) once
-        LocalPrevError.FData[pj] := LocalPrevError.FData[pj] + contrib;
-      end;
+      // M(W)^T contracted against the block error, written out: the eight
+      // weights are read once per block and OCT_SGN/OCT_SRC are folded into the
+      // signs and operand indices. Each component still sums over ascending i.
+      w0 := W.FData[base    ];
+      w1 := W.FData[base + 1];
+      w2 := W.FData[base + 2];
+      w3 := W.FData[base + 3];
+      w4 := W.FData[base + 4];
+      w5 := W.FData[base + 5];
+      w6 := W.FData[base + 6];
+      w7 := W.FData[base + 7];
+      LocalPrevError.FData[base    ] := LocalPrevError.FData[base    ]
+        + (  w0*e0 + w1*e1 + w2*e2 + w3*e3 + w4*e4 + w5*e5 + w6*e6 + w7*e7);
+      LocalPrevError.FData[base + 1] := LocalPrevError.FData[base + 1]
+        + (- w1*e0 + w0*e1 + w3*e2 - w2*e3 + w5*e4 - w4*e5 - w7*e6 + w6*e7);
+      LocalPrevError.FData[base + 2] := LocalPrevError.FData[base + 2]
+        + (- w2*e0 - w3*e1 + w0*e2 + w1*e3 + w6*e4 + w7*e5 - w4*e6 - w5*e7);
+      LocalPrevError.FData[base + 3] := LocalPrevError.FData[base + 3]
+        + (- w3*e0 + w2*e1 - w1*e2 + w0*e3 + w7*e4 - w6*e5 + w5*e6 - w4*e7);
+      LocalPrevError.FData[base + 4] := LocalPrevError.FData[base + 4]
+        + (- w4*e0 - w5*e1 - w6*e2 - w7*e3 + w0*e4 + w1*e5 + w2*e6 + w3*e7);
+      LocalPrevError.FData[base + 5] := LocalPrevError.FData[base + 5]
+        + (- w5*e0 + w4*e1 - w7*e2 + w6*e3 - w1*e4 + w0*e5 - w3*e6 + w2*e7);
+      LocalPrevError.FData[base + 6] := LocalPrevError.FData[base + 6]
+        + (- w6*e0 + w7*e1 + w4*e2 - w5*e3 - w2*e4 + w3*e5 + w0*e6 - w1*e7);
+      LocalPrevError.FData[base + 7] := LocalPrevError.FData[base + 7]
+        + (- w7*e0 - w6*e1 + w5*e2 + w4*e3 - w3*e4 - w2*e5 + w1*e6 + w0*e7);
     end;
   end;
 end;
@@ -85161,10 +85211,12 @@ end;
 //   dL/dW[OCT_SRC[i][j]] += OCT_SGN[i][j] * x[j] * e[i].
 procedure TNNetOctonionLinear.BackpropagateCPU();
 var
-  oo, io, oBase, base, p, i, j: integer;
+  oo, io, oBase, base, i: integer;
   OutOM1, InOM1: integer;
   e: array[0..7] of TNeuralFloat;
   allZero: boolean;
+  e0, e1, e2, e3, e4, e5, e6, e7: TNeuralFloat;
+  x0, x1, x2, x3, x4, x5, x6, x7: TNeuralFloat;
   WDelta, BiasDelta, PrevOut: TNNetVolume;
 begin
   PrevOut := FPrevLayer.FOutput;
@@ -85185,17 +85237,38 @@ begin
       for i := 0 to 7 do
         BiasDelta.FData[oBase + i] := BiasDelta.FData[oBase + i] + e[i];
     if allZero then continue;
+    e0 := e[0]; e1 := e[1]; e2 := e[2]; e3 := e[3];
+    e4 := e[4]; e5 := e[5]; e6 := e[6]; e7 := e[7];
     for io := 0 to InOM1 do
     begin
       base := io * 8;                            // #9: one base
-      for i := 0 to 7 do
-        for j := 0 to 7 do
-        begin
-          p := base + OCT_SRC[i, j];             // #10: weight index once
-          WDelta.FData[p] :=
-            WDelta.FData[p]
-            + OCT_SGN[i, j] * PrevOut.FData[base + j] * e[i];
-        end;
+      // The 8x8 scatter writes only eight distinct weight slots, so each slot
+      // is read once, accumulated in registers over ascending i (its original
+      // order) and stored once -- 56 read-modify-writes removed per block.
+      x0 := PrevOut.FData[base    ];
+      x1 := PrevOut.FData[base + 1];
+      x2 := PrevOut.FData[base + 2];
+      x3 := PrevOut.FData[base + 3];
+      x4 := PrevOut.FData[base + 4];
+      x5 := PrevOut.FData[base + 5];
+      x6 := PrevOut.FData[base + 6];
+      x7 := PrevOut.FData[base + 7];
+      WDelta.FData[base    ] := WDelta.FData[base    ]
+        + (  x0*e0 + x1*e1 + x2*e2 + x3*e3 + x4*e4 + x5*e5 + x6*e6 + x7*e7);
+      WDelta.FData[base + 1] := WDelta.FData[base + 1]
+        + (- x1*e0 + x0*e1 - x3*e2 + x2*e3 - x5*e4 + x4*e5 + x7*e6 - x6*e7);
+      WDelta.FData[base + 2] := WDelta.FData[base + 2]
+        + (- x2*e0 + x3*e1 + x0*e2 - x1*e3 - x6*e4 - x7*e5 + x4*e6 + x5*e7);
+      WDelta.FData[base + 3] := WDelta.FData[base + 3]
+        + (- x3*e0 - x2*e1 + x1*e2 + x0*e3 - x7*e4 + x6*e5 - x5*e6 + x4*e7);
+      WDelta.FData[base + 4] := WDelta.FData[base + 4]
+        + (- x4*e0 + x5*e1 + x6*e2 + x7*e3 + x0*e4 - x1*e5 - x2*e6 - x3*e7);
+      WDelta.FData[base + 5] := WDelta.FData[base + 5]
+        + (- x5*e0 - x4*e1 + x7*e2 - x6*e3 + x1*e4 + x0*e5 + x3*e6 - x2*e7);
+      WDelta.FData[base + 6] := WDelta.FData[base + 6]
+        + (- x6*e0 - x7*e1 - x4*e2 + x5*e3 + x2*e4 - x3*e5 + x0*e6 + x1*e7);
+      WDelta.FData[base + 7] := WDelta.FData[base + 7]
+        + (- x7*e0 + x6*e1 - x5*e2 - x4*e3 + x3*e4 + x2*e5 - x1*e6 + x0*e7);
     end;
   end;
   if not FBatchUpdate then
