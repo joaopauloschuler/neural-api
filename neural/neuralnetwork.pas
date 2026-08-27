@@ -17209,6 +17209,11 @@ type
       FRowOffBuf, FOutIdxBuf, FEntWeightBuf, FBackErrFlat, FBackOutFlat: TNNetVolume;
       // Persistent, lazily-sized per-source-pixel CSR count/cursor scratch (rule #17).
       FCountsBuf, FCursorBuf: array of integer;
+      // Shape the CSR scatter table in FRowOffBuf/FOutIdxBuf/FEntWeightBuf was
+      // built for. The table is a pure function of the source/output grid (the
+      // factor maps themselves are), so it is rebuilt only when that changes
+      // (#27). -1 marks "never built".
+      FScatterSrcW, FScatterSrcH, FScatterOutX, FScatterOutY: integer;
       procedure BackpropagateOpenCL();
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -55819,6 +55824,9 @@ begin
   if pFactor < 1 then pFactor := 1;
   FStruct[0] := pFactor;
   if pAlignCorners <> 0 then FStruct[1] := 1 else FStruct[1] := 0;
+  {$IFDEF OpenCL}
+  FScatterSrcW := -1;
+  {$ENDIF}
 end;
 
 {$IFDEF OpenCL}
@@ -55897,6 +55905,7 @@ begin
   if not Assigned(FEntWeightBuf) then FEntWeightBuf := TNNetVolume.Create();
   if not Assigned(FBackErrFlat)  then FBackErrFlat  := TNNetVolume.Create();
   if not Assigned(FBackOutFlat)  then FBackOutFlat  := TNNetVolume.Create();
+  FScatterSrcW := -1; // freshly created buffers hold no scatter table
 end;
 {$ENDIF}
 
@@ -55943,73 +55952,98 @@ var
   OutX, D, ox, oy, r, cc: integer;
   SrcW, SrcH, NumSrc, NumOut, NumEnt, srcpix, e: integer;
   XBase, YBase, MaxOutXPos, MaxOutYPos, MaxSrcPos: integer;
-  iy: array[0..3] of integer;
-  wy: array[0..3] of TNeuralFloat;
+  iyRow, xi: array[0..3] of integer;
+  wy, wx: array[0..3] of TNeuralFloat;
+  OutY, OutRowBase, OutPix, cur: integer;
   PrevOutput: TNNetVolume;
 begin
   PrevOutput := FPrevLayer.Output;
   OutX := FOutput.SizeX; D := FOutput.Depth;
+  OutY := FOutput.SizeY;
   SrcW := PrevOutput.SizeX; SrcH := PrevOutput.SizeY;
   NumSrc := SrcW * SrcH;
-  NumOut := OutX * FOutput.SizeY;
+  NumOut := OutX * OutY;
   NumEnt := NumOut * 16; // every output pixel emits exactly 16 corner taps.
-  MaxOutYPos := FOutput.SizeY - 1;
+  MaxOutYPos := OutY - 1;
   MaxOutXPos := OutX - 1;
   MaxSrcPos := NumSrc - 1;
-  FRowOffBuf.ReSize(NumSrc + 1, 1, 1);
-  FOutIdxBuf.ReSize(NumEnt, 1, 1);
-  FEntWeightBuf.ReSize(NumEnt, 1, 1);
   FBackErrFlat.ReSize(NumOut * D, 1, 1);
   FBackOutFlat.ReSize(NumSrc * D, 1, 1);
   // Output error flattened to the [outpix*D + d] raw order the device indexes.
   Move(FOutputError.FData[0], FBackErrFlat.FData[0],
     NumOut * D * csNeuralFloatSize);
-  // Pass 1: count entries per source pixel (the cached maps hold the same
-  // clamped indices the scalar backward scatters into).
-  if Length(FCountsBuf) <> NumSrc then SetLength(FCountsBuf, NumSrc);
-  FillDWord(FCountsBuf[0], NumSrc, 0);   // #13 (integer counts)
-  for oy := 0 to MaxOutYPos do
+  // The CSR table is a pure function of the two grids: EnsureBicubicFactorMap
+  // rebuilds FXMap/FYMap only when they change, and the factor/align-corners
+  // settings are fixed per layer. So build it once per shape, not per backward
+  // pass (#27) - it costs two sweeps of NumOut*16 entries.
+  if (FScatterSrcW <> SrcW) or (FScatterSrcH <> SrcH) or
+     (FScatterOutX <> OutX) or (FScatterOutY <> OutY) then
   begin
-    YBase := oy * 4;
-    for ox := 0 to MaxOutXPos do
+    FRowOffBuf.ReSize(NumSrc + 1, 1, 1);
+    FOutIdxBuf.ReSize(NumEnt, 1, 1);
+    FEntWeightBuf.ReSize(NumEnt, 1, 1);
+    // Pass 1: count entries per source pixel (the cached maps hold the same
+    // clamped indices the scalar backward scatters into).
+    if Length(FCountsBuf) <> NumSrc then SetLength(FCountsBuf, NumSrc);
+    FillDWord(FCountsBuf[0], NumSrc, 0);   // #13 (integer counts)
+    for oy := 0 to MaxOutYPos do
     begin
-      XBase := ox * 4;
-      for r := 0 to 3 do
-        for cc := 0 to 3 do
-          Inc(FCountsBuf[FYMap.Idx[YBase + r] * SrcW + FXMap.Idx[XBase + cc]]);
+      YBase := oy * 4;
+      // Row-scaled source rows are invariant across the whole ox/cc sweep (#11).
+      for r := 0 to 3 do iyRow[r] := FYMap.Idx[YBase + r] * SrcW;
+      for ox := 0 to MaxOutXPos do
+      begin
+        XBase := ox * 4;
+        for cc := 0 to 3 do xi[cc] := FXMap.Idx[XBase + cc];
+        for r := 0 to 3 do
+        begin
+          srcpix := iyRow[r];
+          for cc := 0 to 3 do Inc(FCountsBuf[srcpix + xi[cc]]);
+        end;
+      end;
     end;
-  end;
-  // Prefix sum -> CSR row offsets; seed per-row write cursors.
-  if Length(FCursorBuf) <> NumSrc then SetLength(FCursorBuf, NumSrc);
-  e := 0;
-  for srcpix := 0 to MaxSrcPos do
-  begin
-    FRowOffBuf.FData[srcpix] := e;
-    FCursorBuf[srcpix] := e;
-    e := e + FCountsBuf[srcpix];
-  end;
-  FRowOffBuf.FData[NumSrc] := e;
-  // Pass 2: scatter (outpix, weight) entries into their source-pixel rows.
-  for oy := 0 to MaxOutYPos do
-  begin
-    YBase := oy * 4;
-    for r := 0 to 3 do
+    // Prefix sum -> CSR row offsets; seed per-row write cursors.
+    if Length(FCursorBuf) <> NumSrc then SetLength(FCursorBuf, NumSrc);
+    e := 0;
+    for srcpix := 0 to MaxSrcPos do
     begin
-      iy[r] := FYMap.Idx[YBase + r];
-      wy[r] := FYMap.W[YBase + r];
+      FRowOffBuf.FData[srcpix] := e;
+      FCursorBuf[srcpix] := e;
+      e := e + FCountsBuf[srcpix];
     end;
-    for ox := 0 to MaxOutXPos do
+    FRowOffBuf.FData[NumSrc] := e;
+    // Pass 2: scatter (outpix, weight) entries into their source-pixel rows.
+    for oy := 0 to MaxOutYPos do
     begin
-      XBase := ox * 4;
+      YBase := oy * 4;
+      OutRowBase := oy * OutX;
       for r := 0 to 3 do
+      begin
+        iyRow[r] := FYMap.Idx[YBase + r] * SrcW;
+        wy[r] := FYMap.W[YBase + r];
+      end;
+      for ox := 0 to MaxOutXPos do
+      begin
+        XBase := ox * 4;
+        OutPix := OutRowBase + ox;
         for cc := 0 to 3 do
         begin
-          srcpix := iy[r] * SrcW + FXMap.Idx[XBase + cc];
-          FOutIdxBuf.FData[FCursorBuf[srcpix]] := oy * OutX + ox;
-          FEntWeightBuf.FData[FCursorBuf[srcpix]] := wy[r] * FXMap.W[XBase + cc];
-          Inc(FCursorBuf[srcpix]);
+          xi[cc] := FXMap.Idx[XBase + cc];
+          wx[cc] := FXMap.W[XBase + cc];
         end;
+        for r := 0 to 3 do
+          for cc := 0 to 3 do
+          begin
+            srcpix := iyRow[r] + xi[cc];
+            cur := FCursorBuf[srcpix];
+            FOutIdxBuf.FData[cur] := OutPix;
+            FEntWeightBuf.FData[cur] := wy[r] * wx[cc];
+            FCursorBuf[srcpix] := cur + 1;
+          end;
+      end;
     end;
+    FScatterSrcW := SrcW; FScatterSrcH := SrcH;
+    FScatterOutX := OutX; FScatterOutY := OutY;
   end;
   FScatterCL.Scatter(FBackErrFlat, FRowOffBuf, FOutIdxBuf, FEntWeightBuf,
     FBackOutFlat, NumSrc, D);
