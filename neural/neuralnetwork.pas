@@ -99311,12 +99311,15 @@ begin
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
 
-  for CntX := 0 to MaxX do
+  // App. E: the depth axis is contiguous and consecutive X share a row, so the
+  // X loop is innermost -- an X step walks Depth floats forward while a Y step
+  // jumps a whole SizeX*Depth row. Measured ~1.6-2.5x over the X-outer form.
+  for CntY := 0 to MaxY do
   begin
-    OutX := CntX div FPoolSize;
-    for CntY := 0 to MaxY do
+    OutY := CntY div FPoolSize;
+    for CntX := 0 to MaxX do
     begin
-      OutY := CntY div FPoolSize;
+      OutX := CntX div FPoolSize;
       FOutput.Add
       (
         FOutput.GetRawPtr(OutX, OutY),
@@ -99399,13 +99402,14 @@ begin
     exit;
   end;
 
-  // General (overlapping / padded) scalar fallback.
-  for CntX := 0 to MaxX do
+  // General (overlapping / padded) scalar fallback. App. E: X innermost so the
+  // input-error walk is row-contiguous.
+  for CntY := 0 to MaxY do
   begin
-    OutX := CntX div FPoolSize;
-    for CntY := 0 to MaxY do
+    OutY := CntY div FPoolSize;
+    for CntX := 0 to MaxX do
     begin
-      OutY := CntY div FPoolSize;
+      OutX := CntX div FPoolSize;
       FOutput.Add
       (
         FPrevLayer.OutputError.GetRawPtr(CntX, CntY),
@@ -99458,12 +99462,14 @@ begin
   // row rather than calling pcr_powf per element.
   IsP2 := FP = 2.0;
 
-  for CntX := 0 to MaxX do
+  // App. E: X innermost -- consecutive X are one contiguous row, consecutive Y
+  // jump a whole SizeX*Depth row.
+  for CntY := 0 to MaxY do
   begin
-    OutX := CntX div FPoolSize;
-    for CntY := 0 to MaxY do
+    OutY := CntY div FPoolSize;
+    for CntX := 0 to MaxX do
     begin
-      OutY := CntY div FPoolSize;
+      OutX := CntX div FPoolSize;
       OutputRawPos := FOutput.GetRawPos(OutX, OutY);
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
       if IsP2 then
@@ -99532,12 +99538,13 @@ begin
   MaxD := FPrevLayer.Output.Depth - 1;
 
   // dy/dx_i = (y^(1-p) / N) * |x_i|^(p-1) * sign(x_i)
-  for CntX := 0 to MaxX do
+  // App. E: X innermost so every volume is walked along its contiguous row.
+  for CntY := 0 to MaxY do
   begin
-    OutX := CntX div FPoolSize;
-    for CntY := 0 to MaxY do
+    OutY := CntY div FPoolSize;
+    for CntX := 0 to MaxX do
     begin
-      OutY := CntY div FPoolSize;
+      OutX := CntX div FPoolSize;
       OutputRawPos := FOutput.GetRawPos(OutX, OutY);
       PrevRawPos := FPrevLayer.OutputError.GetRawPos(CntX, CntY);
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
@@ -99623,12 +99630,13 @@ begin
   // Pass 1: window maximum of beta*x per output cell+channel (stability).
   FWinMax.ReSize(FOutput);
   FWinMax.Fill(-3.402823e38);
-  for CntX := 0 to MaxX do
+  // App. E: X innermost -- consecutive X share a contiguous row in every volume.
+  for CntY := 0 to MaxY do
   begin
-    OutX := CntX div FPoolSize;
-    for CntY := 0 to MaxY do
+    OutY := CntY div FPoolSize;
+    for CntX := 0 to MaxX do
     begin
-      OutY := CntY div FPoolSize;
+      OutX := CntX div FPoolSize;
       OutputRawPos := FWinMax.GetRawPos(OutX, OutY);
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
       for CntD := 0 to MaxD do
@@ -99657,12 +99665,12 @@ begin
   // already bounds it above by 0, this guards the low tail against
   // denormal/garbage exp on extreme inputs.
   Depth := MaxD + 1;
-  for CntX := 0 to MaxX do
+  for CntY := 0 to MaxY do
   begin
-    OutX := CntX div FPoolSize;
-    for CntY := 0 to MaxY do
+    OutY := CntY div FPoolSize;
+    for CntX := 0 to MaxX do
     begin
-      OutY := CntY div FPoolSize;
+      OutX := CntX div FPoolSize;
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
       WinMaxPtr := FWinMax.GetRawPtr(OutX, OutY);
       ExpSumPtr := FExpSum.GetRawPtr(OutX, OutY);
@@ -99686,12 +99694,12 @@ begin
     end;
   end;
   {$ELSE}
-  for CntX := 0 to MaxX do
+  for CntY := 0 to MaxY do
   begin
-    OutX := CntX div FPoolSize;
-    for CntY := 0 to MaxY do
+    OutY := CntY div FPoolSize;
+    for CntX := 0 to MaxX do
     begin
-      OutY := CntY div FPoolSize;
+      OutX := CntX div FPoolSize;
       OutputRawPos := FExpSum.GetRawPos(OutX, OutY);
       ExpValBase := FExpVal.GetRawPos(CntX, CntY);
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
@@ -99744,12 +99752,13 @@ begin
   // and accumulates.
   Output.Fill(0);
   {$IFDEF AVXANY}
-  for CntX := 0 to MaxX do
+  // App. E: X innermost -- consecutive X share a contiguous row in every volume.
+  for CntY := 0 to MaxY do
   begin
-    OutX := CntX div FPoolSize;
-    for CntY := 0 to MaxY do
+    OutY := CntY div FPoolSize;
+    for CntX := 0 to MaxX do
     begin
-      OutY := CntY div FPoolSize;
+      OutX := CntX div FPoolSize;
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
       ExpSumPtr := FExpSum.GetRawPtr(OutX, OutY);
       OutPtr := FOutput.GetRawPtr(OutX, OutY);
@@ -99768,12 +99777,12 @@ begin
     end;
   end;
   {$ELSE}
-  for CntX := 0 to MaxX do
+  for CntY := 0 to MaxY do
   begin
-    OutX := CntX div FPoolSize;
-    for CntY := 0 to MaxY do
+    OutY := CntY div FPoolSize;
+    for CntX := 0 to MaxX do
     begin
-      OutY := CntY div FPoolSize;
+      OutX := CntX div FPoolSize;
       OutputRawPos := FOutput.GetRawPos(OutX, OutY);
       ExpValBase := FExpVal.GetRawPos(CntX, CntY);
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
@@ -99831,12 +99840,13 @@ begin
   // dy/dx_i = w_i * (1 + beta*(x_i - y)), so
   // d(loss)/dx_i = OutputError * w_i * (1 + beta*(x_i - y)).
   {$IFDEF AVXANY}
-  for CntX := 0 to MaxX do
+  // App. E: X innermost -- consecutive X share a contiguous row in every volume.
+  for CntY := 0 to MaxY do
   begin
-    OutX := CntX div FPoolSize;
-    for CntY := 0 to MaxY do
+    OutY := CntY div FPoolSize;
+    for CntX := 0 to MaxX do
     begin
-      OutY := CntY div FPoolSize;
+      OutX := CntX div FPoolSize;
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
       ExpSumPtr := FExpSum.GetRawPtr(OutX, OutY);
       OutPtr := FOutput.GetRawPtr(OutX, OutY);
@@ -99865,12 +99875,12 @@ begin
     end;
   end;
   {$ELSE}
-  for CntX := 0 to MaxX do
+  for CntY := 0 to MaxY do
   begin
-    OutX := CntX div FPoolSize;
-    for CntY := 0 to MaxY do
+    OutY := CntY div FPoolSize;
+    for CntX := 0 to MaxX do
     begin
-      OutY := CntY div FPoolSize;
+      OutX := CntX div FPoolSize;
       OutputRawPos := FOutput.GetRawPos(OutX, OutY);
       PrevRawPos := FPrevLayer.OutputError.GetRawPos(CntX, CntY);
       ExpValBase := FExpVal.GetRawPos(CntX, CntY);
@@ -100100,9 +100110,11 @@ begin
   // pass (#13) so the running maximum lives in the map itself. Tap order
   // (dx outer, dy inner) and the strict '>' are preserved, so the recorded
   // argmax is unchanged.
+  // App. E: the (CntX,CntY) cells are independent, so X is the inner axis --
+  // consecutive X are one contiguous row in both the map and the input.
   FMaxMap.Fill(-3.402823e38);
-  for CntX := 0 to MaxX do
-    for CntY := 0 to MaxY do
+  for CntY := 0 to MaxY do
+    for CntX := 0 to MaxX do
     begin
       baseMap := FMaxMap.GetRawPos(CntX, CntY);
       for dx := 0 to PoolSizeMax do
