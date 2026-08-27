@@ -80314,8 +80314,8 @@ end;
 procedure TNNet.MergeLoRA(BaseLayer, ADown, BUp: TNNetLayer;
   Alpha: TNeuralFloat);
 var
-  Rank, d_in, d_out, i, j, k: integer;
-  RankM1, d_inM1, d_outM1: integer;
+  Rank, d_in, d_out, j, k: integer;
+  RankM1, d_outM1: integer;
   Scale, Acc: TNeuralFloat;
   BUpNj, BaseNj: TNNetNeuron;
   BUpWj, BaseWj: TNNetVolume;
@@ -80345,7 +80345,6 @@ begin
       ') must equal Rank (' + IntToStr(Rank) + ').');
   Scale := Alpha / Rank;
   RankM1 := Rank - 1;
-  d_inM1 := d_in - 1;
   d_outM1 := d_out - 1;
   // The bypass output is bypass[j] = Scale*( sum_k B[j][k]*(A[k].x + biasA[k])
   // + biasB[j] ). The x-dependent part folds into the base WEIGHTS and the
@@ -80372,13 +80371,11 @@ begin
     BUpWj  := BUpNj.Weights;
     BaseNj := BaseLayer.Neurons[j];
     BaseWj := BaseNj.Weights;
-    for i := 0 to d_inM1 do
-    begin
-      Acc := 0;
-      for k := 0 to RankM1 do
-        Acc := Acc + BUpWj.FData[k] * ADownW[k].FData[i];
-      BaseWj.FData[i] := BaseWj.FData[i] + Scale * Acc;
-    end;
+    // Rank-one update per k over the whole d_in row: the k loop is the outer
+    // one so the i axis stays contiguous for the vectorized MulAdd.
+    for k := 0 to RankM1 do
+      TNNetVolume.MulAdd(BaseWj.DataPtr, ADownW[k].DataPtr,
+        Scale * BUpWj.FData[k], d_in);
     Acc := BUpNj.BiasWeight;
     for k := 0 to RankM1 do
       Acc := Acc + BUpWj.FData[k] * ADownBias[k];
@@ -132846,8 +132843,14 @@ function TNNetLayer.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNe
 var
   MaxLayer: integer;
   Cnt: integer;
+  AlreadyFreed: boolean;
 begin
   Result := Self;
+  MaxLayer := FNeurons.Count - 1;
+  // A repeated inference-only call finds every neuron already freed. Neurons are
+  // only appended to (or popped from) the end, so the last one decides for all.
+  AlreadyFreed := (not pTrainable) and (not FIsTrainable) and
+    ( (MaxLayer < 0) or (FNeurons[MaxLayer].FDelta = nil) );
   FIsTrainable := pTrainable;
   // Low-memory mode drops the backprop-side weight caches, so it only makes
   // sense for an inference-only layer. Coercing here makes the contradictory
@@ -132865,7 +132868,7 @@ begin
     FOutputError.ReSize(1, 1, 1);
     FOutputErrorDeriv.ReSize(1, 1, 1);
   end;
-  MaxLayer := FNeurons.Count - 1;
+  if AlreadyFreed then exit;
   for Cnt := 0 to MaxLayer do
   begin
     FNeurons[Cnt].SetTrainable(pTrainable, pLowMemory);

@@ -63,6 +63,7 @@ type
     // Additional activation function tests
     procedure TestReLU6Activation;
     procedure TestReLULClampsAtInference;
+    procedure TestSetTrainablePerBlockEqualsWholeNet;
     procedure TestLeakyReLUActivation;
     procedure TestSwishActivation;
     procedure TestHyperbolicTangent;
@@ -2306,6 +2307,90 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+// Importers flip the whole net inference-only once per built block, so the
+// repeated calls must land in the same state as one call after the last block.
+procedure TTestNeuralLayers.TestSetTrainablePerBlockEqualsWholeNet;
+var
+  PerBlockNN, WholeNN: TNNet;
+  BlockCnt: integer;
+
+  procedure AddBlock(pNN: TNNet);
+  begin
+    pNN.AddLayer( TNNetFullConnectReLU.Create(6) );
+    pNN.AddLayer( TNNetPointwiseConvLinear.Create(4) );
+  end;
+
+  procedure AssertSameState(const pWhen: string);
+  var
+    LayerCnt, NeuronCnt, MaxLayerPos, MaxNeuronPos: integer;
+    LayerA, LayerB: TNNetLayer;
+    Prefix: string;
+  begin
+    AssertEquals(pWhen + ': layer count', WholeNN.CountLayers(),
+      PerBlockNN.CountLayers());
+    MaxLayerPos := WholeNN.GetLastLayerIdx();
+    for LayerCnt := 0 to MaxLayerPos do
+    begin
+      LayerA := PerBlockNN.Layers[LayerCnt];
+      LayerB := WholeNN.Layers[LayerCnt];
+      Prefix := pWhen + ': layer ' + IntToStr(LayerCnt);
+      AssertEquals(Prefix + ' IsTrainable', LayerB.IsTrainable, LayerA.IsTrainable);
+      AssertEquals(Prefix + ' ActiveLowMemory', LayerB.ActiveLowMemory(),
+        LayerA.ActiveLowMemory());
+      AssertEquals(Prefix + ' neuron count', LayerB.Neurons.Count,
+        LayerA.Neurons.Count);
+      MaxNeuronPos := LayerB.Neurons.Count - 1;
+      for NeuronCnt := 0 to MaxNeuronPos do
+      begin
+        AssertEquals(Prefix + ' neuron ' + IntToStr(NeuronCnt) + ' Delta assigned',
+          Assigned(LayerB.Neurons[NeuronCnt].Delta),
+          Assigned(LayerA.Neurons[NeuronCnt].Delta));
+        AssertEquals(Prefix + ' neuron ' + IntToStr(NeuronCnt) + ' BackInertia assigned',
+          Assigned(LayerB.Neurons[NeuronCnt].BackInertia),
+          Assigned(LayerA.Neurons[NeuronCnt].BackInertia));
+        if Assigned(LayerB.Neurons[NeuronCnt].Delta) then
+          AssertEquals(Prefix + ' neuron ' + IntToStr(NeuronCnt) + ' Delta size',
+            LayerB.Neurons[NeuronCnt].Delta.Size,
+            LayerA.Neurons[NeuronCnt].Delta.Size);
+      end;
+    end;
+  end;
+
+begin
+  PerBlockNN := TNNet.Create();
+  WholeNN := TNNet.Create();
+  try
+    PerBlockNN.AddLayer( TNNetInput.Create(4, 1, 4) );
+    WholeNN.AddLayer( TNNetInput.Create(4, 1, 4) );
+    for BlockCnt := 1 to 3 do
+    begin
+      AddBlock(PerBlockNN);
+      // The per-block net pays the flip after every block, exactly as the
+      // pretrained importers do to cap peak RSS.
+      PerBlockNN.SetTrainable(False);
+      AddBlock(WholeNN);
+    end;
+    WholeNN.SetTrainable(False);
+    AssertSameState('after per-block flips');
+
+    // Re-arming must still rebuild every training buffer, including on the
+    // layers whose repeated inference-only flip was skipped.
+    PerBlockNN.SetTrainable(True, False);
+    WholeNN.SetTrainable(True, False);
+    AssertSameState('after re-arming');
+    AssertTrue('re-armed Delta is weight sized',
+      PerBlockNN.Layers[1].Neurons[0].Delta.Size =
+      PerBlockNN.Layers[1].Neurons[0].Weights.Size);
+
+    PerBlockNN.SetTrainable(False);
+    WholeNN.SetTrainable(False);
+    AssertSameState('after re-freezing');
+  finally
+    PerBlockNN.Free;
+    WholeNN.Free;
   end;
 end;
 
