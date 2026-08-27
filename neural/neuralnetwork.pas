@@ -68796,7 +68796,9 @@ var
   Prev: TNNetVolume;
   t, y, x, oc, ky, kx, sy, sx, tap, oy, ZCnt: integer;
   TimeStepsM1, HM1, WM1, HiddenCM1, FeatureM1: integer;
-  zBase, InCBytes, HiddenCBytes: integer;
+  zBase, InCBytes, HiddenCBytes, FrameBytes: integer;
+  base, prevBase, idx, PrevFrameOfs: integer;
+  HasPrev: boolean;
   accI, accF, accO, accG, fv, iv, ov, gv, cv, hp, tc: TNeuralFloat;
   WiR, WfR, WoR, WgR, ZPtr: TNeuralFloatArrPtr;
 begin
@@ -68814,6 +68816,8 @@ begin
   FeatureM1 := FFeature - 1;
   InCBytes := FInC * csNeuralFloatSize;
   HiddenCBytes := FHiddenC * csNeuralFloatSize;
+  FrameBytes := FH * HiddenCBytes;
+  PrevFrameOfs := FH * FHiddenC;   // one frame back along the packed X axis
   FHprev.Fill(0);
   for t := 0 to TimeStepsM1 do
   begin
@@ -68829,11 +68833,18 @@ begin
           HiddenCBytes);
       end;
     // Convolve each gate over z_t (SAME padding), then update c_t and h_t.
+    HasPrev := t > 0;
     for y := 0 to HM1 do
       for x := 0 to WM1 do
       begin
+        // FI/FFg/FO/FG/FC/FTanhC are all ReSized to FOutput, so one base
+        // addresses every gate volume at this pixel; the previous frame's c
+        // sits exactly one frame (FH rows) earlier in the same volume.
+        base := FOutput.GetRawPos(oy + y, x);
+        prevBase := base - PrevFrameOfs;
         for oc := 0 to HiddenCM1 do
         begin
+          idx := base + oc;
           WiR := Wi.GetRawPtr(oc, 0); WfR := Wf.GetRawPtr(oc, 0);
           WoR := Wo.GetRawPtr(oc, 0); WgR := Wg.GetRawPtr(oc, 0);
           accI := Bi.FData[oc]; accF := Bf.FData[oc];
@@ -68857,20 +68868,21 @@ begin
           end;
           iv := Sigmoid(accI); fv := Sigmoid(accF);
           ov := Sigmoid(accO); gv := pcr_tanhf(accG);
-          if t > 0 then hp := FC.Data[(t - 1) * FH + y, x, oc] else hp := 0;
+          if HasPrev then hp := FC.FData[prevBase + oc] else hp := 0;
           cv := fv * hp + iv * gv;
           tc := pcr_tanhf(cv);
-          FI.Data[oy + y, x, oc] := iv;  FFg.Data[oy + y, x, oc] := fv;
-          FO.Data[oy + y, x, oc] := ov;  FG.Data[oy + y, x, oc] := gv;
-          FC.Data[oy + y, x, oc] := cv;  FTanhC.Data[oy + y, x, oc] := tc;
-          FOutput.Data[oy + y, x, oc] := ov * tc;
+          FI.FData[idx] := iv;  FFg.FData[idx] := fv;
+          FO.FData[idx] := ov;  FG.FData[idx] := gv;
+          FC.FData[idx] := cv;  FTanhC.FData[idx] := tc;
+          FOutput.FData[idx] := ov * tc;
         end;
       end;
-    // Carry h_t forward as h_{t-1} for the next step (contiguous row copies).
-    for y := 0 to HM1 do
-      for x := 0 to WM1 do
-        Move(FOutput.FData[FOutput.GetRawPos(oy + y, x)],
-          FHprev.FData[FHprev.GetRawPos(y, x)], HiddenCBytes);
+    // Carry h_t forward as h_{t-1} for the next step. Frame t occupies FH
+    // consecutive X slots in FOutput and the whole of FHprev at this Y, so the
+    // whole column is one Move (App. C).
+    for x := 0 to WM1 do
+      Move(FOutput.FData[FOutput.GetRawPos(oy, x)],
+        FHprev.FData[FHprev.GetRawPos(0, x)], FrameBytes);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -68882,7 +68894,8 @@ var
   t, y, x, oc, ky, kx, sy, sx, tap, oy, j, ZCnt: integer;
   HM1, WM1, HiddenCM1, FeatureM1, FTimeStepsM1: integer;
   zBase, InCBytes, HiddenCBytes: integer;
-  hasInputGrad: boolean;
+  base, prevBase, gbase, idx, gidx, PrevFrameOfs: integer;
+  hasInputGrad, HasPrev: boolean;
   iv, fv, ov, gv, tc, hp, gh, gc, gtc: TNeuralFloat;
   gpreI, gpreF, gpreO, gpreG: TNeuralFloat;
   WiR, WfR, WoR, WgR, ZPtr, GzPtr: TNeuralFloatArrPtr;
@@ -68901,6 +68914,7 @@ begin
   FeatureM1 := FFeature - 1;
   InCBytes := FInC * csNeuralFloatSize;
   HiddenCBytes := FHiddenC * csNeuralFloatSize;
+  PrevFrameOfs := FH * FHiddenC;   // one frame back along the packed X axis
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size);
   PrevErr := nil;
@@ -68914,6 +68928,7 @@ begin
   for t := FTimeStepsM1 downto 0 do
   begin
     oy := t * FH;
+    HasPrev := t > 0;
     // Rebuild z_t = [x_t ; h_{t-1}] (same construction as forward).
     for y := 0 to HM1 do
       for x := 0 to WM1 do
@@ -68931,25 +68946,33 @@ begin
     for y := 0 to HM1 do
       for x := 0 to WM1 do
       begin
+        // FI/FFg/FO/FG/FTanhC/FC/FOutputError all share FOutput's shape, and
+        // FGh/FGc/FGcNext all share FHprev's, so two bases index everything;
+        // the previous frame's c sits one frame (FH rows) earlier in FC.
+        base := FOutput.GetRawPos(oy + y, x);
+        prevBase := base - PrevFrameOfs;
+        gbase := FGh.GetRawPos(y, x);
         for oc := 0 to HiddenCM1 do
         begin
-          iv := FI.Data[oy + y, x, oc]; fv := FFg.Data[oy + y, x, oc];
-          ov := FO.Data[oy + y, x, oc]; gv := FG.Data[oy + y, x, oc];
-          tc := FTanhC.Data[oy + y, x, oc];
-          if t > 0 then hp := FC.Data[(t - 1) * FH + y, x, oc] else hp := 0;
+          idx := base + oc;
+          gidx := gbase + oc;
+          iv := FI.FData[idx]; fv := FFg.FData[idx];
+          ov := FO.FData[idx]; gv := FG.FData[idx];
+          tc := FTanhC.FData[idx];
+          if HasPrev then hp := FC.FData[prevBase + oc] else hp := 0;
           // dL/dh_t = upstream + carry from step t+1's gate convs.
-          gh := FOutputError.Data[oy + y, x, oc] + FGh.Data[y, x, oc];
+          gh := FOutputError.FData[idx] + FGh.FData[gidx];
           // h_t = o_t * tanh(c_t).
           gtc := gh * ov;                         // dL/d tanh(c_t)
           gpreO := gh * tc * ov * (1 - ov);       // dL/d preO (sigmoid)
           // dL/dc_t = this-step path + carry from step t+1 (f_{t+1} memory path).
-          gc := gtc * (1 - tc * tc) + FGcNext.Data[y, x, oc];
+          gc := gtc * (1 - tc * tc) + FGcNext.FData[gidx];
           // c_t = f_t*hp + i_t*g_t.
           gpreF := gc * hp * fv * (1 - fv);        // dL/d preF
           gpreI := gc * gv * iv * (1 - iv);        // dL/d preI
           gpreG := gc * iv * (1 - gv * gv);        // dL/d preG (tanh)
           // Carry dL/dc_{t-1} = f_t * dL/dc_t into the next (earlier) step.
-          FGc.Data[y, x, oc] := gc * fv;
+          FGc.FData[gidx] := gc * fv;
           FGradB[0].FData[oc] := FGradB[0].FData[oc] + gpreI;
           FGradB[1].FData[oc] := FGradB[1].FData[oc] + gpreF;
           FGradB[2].FData[oc] := FGradB[2].FData[oc] + gpreO;
