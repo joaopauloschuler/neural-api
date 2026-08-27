@@ -26471,7 +26471,15 @@ end;
 // pTrainable=false must reach the WHOLE net, not just the weighted layers: the
 // IP-Adapter wiring (inputs, channel slices, concats, cross-attention, sum)
 // carries no per-layer SetTrainable, so only the net-level flip frees its
-// training volumes. Inference output must stay identical to the trainable net.
+// training volumes. Inference output must match the trainable net to within a
+// rounding tolerance: SetTrainable(False) also arms low-memory mode, so the
+// pointwise convolutions reduce through ComputeLowMemoryCPU (per-neuron dot
+// products) while the trainable net reduces through DotProductsTiled over the
+// concatenated weight cache. The two accumulation orders agree bit-for-bit in a
+// scalar build but differ by about one float32 ulp under AVX. The mode cannot be
+// pinned away here: with low memory armed the concatenated cache is never built,
+// so clearing the flag after the weights are loaded would leave DotProductsTiled
+// reading an empty buffer.
 procedure TTestNeuralPretrained.TestIPAdapterInferenceNet;
 var
   NNTrain, NNInfer: TNNet;
@@ -26532,7 +26540,7 @@ begin
       if Diff > MaxDiff then MaxDiff := Diff;
     end;
     AssertTrue('inference vs trainable: max |diff| = ' + FloatToStr(MaxDiff) +
-      ' must be 0', MaxDiff = 0);
+      ' must be below 1e-5', MaxDiff < 1e-5);
   finally
     OutInfer.Free;
     OutTrain.Free;
