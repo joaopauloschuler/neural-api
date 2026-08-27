@@ -1750,6 +1750,10 @@ function BuildGptOssFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pTrainable: boolean = true;
   pQuantizeInt8: boolean = false): TNNet;
 
+// Flat element count of a gpt-oss expert slab, computed in Int64 so callers
+// can reject a slab before the 32-bit index arithmetic downstream wraps.
+function GptOssSlabElementCount(NumExperts, InDim, OutDim: integer): Int64;
+
 // Reads one gpt-oss expert weight slab (dense tensor or MXFP4 "_blocks" /
 // "_scales" pair) into Dest as a flat [E, In, Out] array.
 procedure LoadGptOssExpertSlab(Reader: TNNetSafeTensorsReader;
@@ -28609,6 +28613,11 @@ end;
 // uint8) dequantized via DequantizeMXFP4. The MXFP4 packed layout is
 // [E, Out, In/32, 16] -> dequant to [E, Out, In] -> transpose to [E, In, Out]
 // (transformers _convert_moe_packed_tensors ends with .transpose(1,2)).
+function GptOssSlabElementCount(NumExperts, InDim, OutDim: integer): Int64;
+begin
+  Result := Int64(NumExperts) * InDim * OutDim;
+end;
+
 procedure LoadGptOssExpertSlab(Reader: TNNetSafeTensorsReader;
   const BaseName: string; NumExperts, InDim, OutDim: integer; Dest: TNNetVolume);
 const
@@ -28624,7 +28633,17 @@ var
   NumExpertsM1, InTimesOut, BlocksPerRow: integer;
   TileRows, RowsInTileM1, FirstRow, FirstCol, LastCol, RowInTile: integer;
   ExpertBase, SrcBlock, DstBase: integer;
+  SlabElems: Int64;
 begin
+  // Every index below is 32-bit; gpt-oss-120b gate_up already sits at 98.9% of
+  // that range, so an even wider slab must fail here instead of wrapping.
+  SlabElems := GptOssSlabElementCount(NumExperts, InDim, OutDim);
+  if (SlabElems <= 0) or (SlabElems > High(integer)) then
+    ImportError('gpt-oss import: expert slab "' + BaseName + '" [' +
+      IntToStr(NumExperts) + ', ' + IntToStr(InDim) + ', ' +
+      IntToStr(OutDim) + '] has ' + IntToStr(SlabElems) +
+      ' elements, over the ' + IntToStr(High(integer)) +
+      ' a single weight volume can index.');
   if Reader.HasTensor(BaseName) then
   begin
     if (Reader.DimCount(BaseName) <> 3) or

@@ -259,6 +259,7 @@ type
     procedure TestGptOssLogitParity;
     procedure TestGptOssMXFP4LogitParity;
     procedure TestGptOssExpertSlabTranspose;
+    procedure TestGptOssSlabElementCountGuard;
     procedure TestGemmaLogitParity;
     procedure TestGemma2LogitParity;
     procedure TestGemma3LogitParity;
@@ -9271,6 +9272,35 @@ begin
     SetLength(Deq, 0);
     DeleteFile(TempName);
   end;
+end;
+
+// The slab loader indexes with 32-bit ints and gpt-oss-120b's gate_up slab
+// (128 x 2880 x 5760) already sits at 98.9% of that range, so the count is
+// computed in Int64 and anything wider is rejected before any allocation.
+procedure TTestNeuralPretrained.TestGptOssSlabElementCountGuard;
+var
+  Rejected: boolean;
+begin
+  AssertEquals('gpt-oss-120b gate_up slab elements', '2123366400',
+    IntToStr(GptOssSlabElementCount(128, 2880, 5760)));
+  AssertEquals('gpt-oss-120b down slab elements', '1061683200',
+    IntToStr(GptOssSlabElementCount(128, 2880, 2880)));
+  AssertEquals('gpt-oss-20b gate_up slab elements', '530841600',
+    IntToStr(GptOssSlabElementCount(32, 2880, 5760)));
+  AssertTrue('gpt-oss-120b gate_up must stay importable',
+    GptOssSlabElementCount(128, 2880, 5760) <= High(integer));
+  // 32-bit arithmetic would wrap this to a negative element count.
+  AssertEquals('oversized slab elements', '4246732800',
+    IntToStr(GptOssSlabElementCount(256, 2880, 5760)));
+  Rejected := false;
+  try
+    // Rejected before the reader or the destination volume is touched.
+    LoadGptOssExpertSlab(nil, 'w', 256, 2880, 5760, nil);
+  except
+    on E: EPretrainedImportError do Rejected := true;
+  end;
+  AssertTrue('an over-2^31 expert slab must raise EPretrainedImportError',
+    Rejected);
 end;
 
 // Verifies the RWKV-4 import target - the suite's FIRST NON-TRANSFORMER
