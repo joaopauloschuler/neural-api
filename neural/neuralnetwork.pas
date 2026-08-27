@@ -99447,7 +99447,7 @@ var
   StartTime: double;
   OutputRawPos: integer;
   InputRawPtr: TNeuralFloatPtr;
-  N, InvP, XVal: TNeuralFloat;
+  N, InvN, InvP: TNeuralFloat;
   IsP2: boolean;
 begin
   StartTime := Now();
@@ -99473,14 +99473,11 @@ begin
       OutputRawPos := FOutput.GetRawPos(OutX, OutY);
       InputRawPtr := FPrevLayer.Output.GetRawPtr(CntX, CntY);
       if IsP2 then
-        for CntD := 0 to MaxD do
-        begin
-          XVal := InputRawPtr^;
-          FOutput.FData[OutputRawPos] :=
-            FOutput.FData[OutputRawPos] + XVal * XVal;
-          Inc(OutputRawPos);
-          Inc(InputRawPtr);
-        end
+        // #13: out += x*x over the contiguous depth run is the three-pointer
+        // elementwise FMA with the input column as both factors.
+        TNNetVolume.MulAdd(FOutput.GetRawPtr(OutX, OutY),
+          TNeuralFloatArrPtr(InputRawPtr), TNeuralFloatArrPtr(InputRawPtr),
+          MaxD + 1)
       else
         for CntD := 0 to MaxD do
         begin
@@ -99493,16 +99490,18 @@ begin
   end;
 
   // y = ( (1/N) * sum |x_i|^p )^(1/p)
+  // #21: N is fixed for the whole pass, so divide once and scale.
   N := FPoolSize * FPoolSize;
+  InvN := 1.0 / N;
   InvP := 1.0 / FP;
   MaxOutputPos := FOutput.Size - 1;
   if IsP2 then
     for OutputRawPos := 0 to MaxOutputPos do
-      FOutput.FData[OutputRawPos] := Sqrt(FOutput.FData[OutputRawPos] / N)
+      FOutput.FData[OutputRawPos] := Sqrt(FOutput.FData[OutputRawPos] * InvN)
   else
     for OutputRawPos := 0 to MaxOutputPos do
       FOutput.FData[OutputRawPos] :=
-        pcr_powf(FOutput.FData[OutputRawPos] / N, InvP);
+        pcr_powf(FOutput.FData[OutputRawPos] * InvN, InvP);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -100154,8 +100153,9 @@ var
   StartTime: double;
   CntOutX, CntOutY, CntD: integer;
   OutMaxX, OutMaxY, MaxD, InMaxX, InMaxY: integer;
-  i, j, SrcX, SrcY, OutBase, MapBase: integer;
+  i, j, SrcX, SrcY, OutBase, Depth: integer;
   WSum, Wij: TNeuralFloat;
+  OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -100169,14 +100169,18 @@ begin
   //   * maxmap[ox*Stride + i - 1, oy*Stride + j - 1], clamping the blur source
   // coordinates to the valid range and renormalising by the used-weight sum.
   // The tap validity and weights are invariant across the depth axis, so the
-  // tap loop is hoisted above CntD: each valid tap adds Wij*maxmap over the
-  // contiguous depth run (same per-element add order as the scalar form), then
-  // the run is divided once by the used-weight sum.
-  for CntOutX := 0 to OutMaxX do
-    for CntOutY := 0 to OutMaxY do
+  // tap loop sits above the depth run: each depth run is a uniform elementwise
+  // op with a loop-invariant scalar -- a zero-fill, one scaled accumulate per
+  // valid tap and one final scale (#13/#21; the per-element tap order is
+  // unchanged). App. E: the output X axis is the inner one so the cells are
+  // visited along their contiguous row.
+  Depth := MaxD + 1;
+  for CntOutY := 0 to OutMaxY do
+    for CntOutX := 0 to OutMaxX do
     begin
       OutBase := FOutput.GetRawPos(CntOutX, CntOutY);
-      for CntD := 0 to MaxD do FOutput.FData[OutBase + CntD] := 0;
+      OutPtr := FOutput.GetRawPtr(CntOutX, CntOutY);
+      FillChar(FOutput.FData[OutBase], Depth * csNeuralFloatSize, 0);
       WSum := 0;
       for i := 0 to 2 do
       begin
@@ -100188,15 +100192,10 @@ begin
           if (SrcY < 0) or (SrcY > InMaxY) then Continue;
           Wij := cW[i] * cW[j];
           WSum := WSum + Wij;
-          MapBase := FMaxMap.GetRawPos(SrcX, SrcY);
-          for CntD := 0 to MaxD do
-            FOutput.FData[OutBase + CntD] :=
-              FOutput.FData[OutBase + CntD] + Wij * FMaxMap.FData[MapBase + CntD];
+          TNNetVolume.MulAdd(OutPtr, FMaxMap.GetRawPtr(SrcX, SrcY), Wij, Depth);
         end;
       end;
-      if WSum > 0 then
-        for CntD := 0 to MaxD do
-          FOutput.FData[OutBase + CntD] := FOutput.FData[OutBase + CntD] / WSum;
+      if WSum > 0 then TNNetVolume.Mul(OutPtr, 1.0 / WSum, Depth);
     end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -100208,8 +100207,9 @@ var
   StartTime: double;
   CntOutX, CntOutY, CntD: integer;
   OutMaxX, OutMaxY, MaxD, InMaxX, InMaxY: integer;
-  i, j, SrcX, SrcY, MapRawPos, PrevRawPos: integer;
-  WSum, Wij, OutErr, Contrib, ErrOverW: TNeuralFloat;
+  i, j, SrcX, SrcY, MapRawPos, PrevRawPos, ErrBase: integer;
+  WSum, Wij, OutErr, InvWSum: TNeuralFloat;
+  PrevErr: TNNetVolume;
 begin
   Inc(FBackPropCallCurrentCnt);
   if
@@ -100217,6 +100217,7 @@ begin
     (FPrevLayer.FOutput.Size <> FPrevLayer.FOutputError.Size) then exit;
   TestBackPropCallCurrCnt();
   StartTime := Now();
+  PrevErr := FPrevLayer.OutputError;
   OutMaxX := FOutput.SizeX - 1;
   OutMaxY := FOutput.SizeY - 1;
   MaxD := FOutput.Depth - 1;
@@ -100226,10 +100227,13 @@ begin
   // cell it read from (the fixed blur is a transposed conv), then route that
   // contribution to the argmax input cell of that maxmap cell (the max).
   // WSum (the used-weight normaliser) and the tap validity are invariant across
-  // the depth axis, so the first pass is computed once per (CntOutX,CntOutY),
-  // and OutErr/WSum is hoisted to a single reciprocal-multiply per (cell,depth).
-  for CntOutX := 0 to OutMaxX do
-    for CntOutY := 0 to OutMaxY do
+  // the depth axis, so the first pass is computed once per (CntOutX,CntOutY)
+  // and the tap loop sits above the depth run. The scatter itself stays scalar:
+  // the destination is the recorded argmax of each maxmap cell, so the write
+  // index is data-dependent and not a contiguous run. Every destination element
+  // still receives its taps in the same (i,j) order.
+  for CntOutY := 0 to OutMaxY do
+    for CntOutX := 0 to OutMaxX do
     begin
       // First pass: the used-weight normaliser for this output cell.
       WSum := 0;
@@ -100245,27 +100249,31 @@ begin
         end;
       end;
       if WSum <= 0 then Continue;
-      for CntD := 0 to MaxD do
+      InvWSum := 1.0 / WSum;
+      ErrBase := FOutputError.GetRawPos(CntOutX, CntOutY);
+      // Second pass: scatter to the input via the recorded argmax.
+      for i := 0 to 2 do
       begin
-        OutErr := FOutputError[CntOutX, CntOutY, CntD];
-        if OutErr = 0 then Continue;
-        ErrOverW := OutErr / WSum;
-        // Second pass: scatter to the input via the recorded argmax.
-        for i := 0 to 2 do
+        SrcX := CntOutX * FStride + i - 1;
+        if (SrcX < 0) or (SrcX > InMaxX) then Continue;
+        for j := 0 to 2 do
         begin
-          SrcX := CntOutX * FStride + i - 1;
-          if (SrcX < 0) or (SrcX > InMaxX) then Continue;
-          for j := 0 to 2 do
+          SrcY := CntOutY * FStride + j - 1;
+          if (SrcY < 0) or (SrcY > InMaxY) then Continue;
+          Wij := cW[i] * cW[j] * InvWSum;
+          // #12: the maxmap offset advances by one element per depth step.
+          MapRawPos := FMaxMap.GetRawPos(SrcX, SrcY);
+          for CntD := 0 to MaxD do
           begin
-            SrcY := CntOutY * FStride + j - 1;
-            if (SrcY < 0) or (SrcY > InMaxY) then Continue;
-            Wij := cW[i] * cW[j];
-            Contrib := Wij * ErrOverW;
-            MapRawPos := FMaxMap.GetRawPos(SrcX, SrcY, CntD);
-            PrevRawPos := FPrevLayer.OutputError.GetRawPos(
-              FMaxMapPosX[MapRawPos], FMaxMapPosY[MapRawPos], CntD);
-            FPrevLayer.OutputError.FData[PrevRawPos] :=
-              FPrevLayer.OutputError.FData[PrevRawPos] + Contrib;
+            OutErr := FOutputError.FData[ErrBase + CntD];
+            if OutErr <> 0 then
+            begin
+              PrevRawPos := PrevErr.GetRawPos(
+                FMaxMapPosX[MapRawPos], FMaxMapPosY[MapRawPos], CntD);
+              PrevErr.FData[PrevRawPos] := PrevErr.FData[PrevRawPos] +
+                Wij * OutErr;
+            end;
+            Inc(MapRawPos);
           end;
         end;
       end;
@@ -100298,8 +100306,9 @@ var
   StartTime: double;
   CntOutX, CntOutY, CntD: integer;
   OutMaxX, OutMaxY, MaxD, InMaxX, InMaxY: integer;
-  i, j, SrcX, SrcY, OutBase, InBase: integer;
+  i, j, SrcX, SrcY, OutBase, Depth: integer;
   WSum, Wij: TNeuralFloat;
+  OutPtr: TNeuralFloatArrPtr;
   Input: TNNetVolume;
 begin
   StartTime := Now();
@@ -100314,14 +100323,18 @@ begin
   //   * input[ox*Stride + i - 1, oy*Stride + j - 1], clamping the blur source
   // coordinates to the valid range and renormalising by the used-weight sum.
   // Tap validity and weights are invariant across the depth axis, so the tap
-  // loop is hoisted above CntD: each valid tap adds Wij*input over the
-  // contiguous depth run (same per-element add order as the scalar form), then
-  // the run is divided once by the used-weight sum.
-  for CntOutX := 0 to OutMaxX do
-    for CntOutY := 0 to OutMaxY do
+  // loop sits above the depth run: each depth run is then a uniform elementwise
+  // op with a loop-invariant scalar, i.e. a zero-fill, one scaled accumulate per
+  // valid tap and one final scale (#13/#21; the per-element tap order is
+  // unchanged). App. E: the output X axis is the inner one so the cells are
+  // visited along their contiguous row.
+  Depth := MaxD + 1;
+  for CntOutY := 0 to OutMaxY do
+    for CntOutX := 0 to OutMaxX do
     begin
       OutBase := FOutput.GetRawPos(CntOutX, CntOutY);
-      for CntD := 0 to MaxD do FOutput.FData[OutBase + CntD] := 0;
+      OutPtr := FOutput.GetRawPtr(CntOutX, CntOutY);
+      FillChar(FOutput.FData[OutBase], Depth * csNeuralFloatSize, 0);
       WSum := 0;
       for i := 0 to 2 do
       begin
@@ -100333,15 +100346,10 @@ begin
           if (SrcY < 0) or (SrcY > InMaxY) then Continue;
           Wij := cW[i] * cW[j];
           WSum := WSum + Wij;
-          InBase := Input.GetRawPos(SrcX, SrcY);
-          for CntD := 0 to MaxD do
-            FOutput.FData[OutBase + CntD] :=
-              FOutput.FData[OutBase + CntD] + Wij * Input.FData[InBase + CntD];
+          TNNetVolume.MulAdd(OutPtr, Input.GetRawPtr(SrcX, SrcY), Wij, Depth);
         end;
       end;
-      if WSum > 0 then
-        for CntD := 0 to MaxD do
-          FOutput.FData[OutBase + CntD] := FOutput.FData[OutBase + CntD] / WSum;
+      if WSum > 0 then TNNetVolume.Mul(OutPtr, 1.0 / WSum, Depth);
     end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -100351,11 +100359,12 @@ const
   cW: array[0..2] of TNeuralFloat = (1.0, 2.0, 1.0);
 var
   StartTime: double;
-  CntOutX, CntOutY, CntD: integer;
+  CntOutX, CntOutY: integer;
   OutMaxX, OutMaxY, MaxD, InMaxX, InMaxY: integer;
-  i, j, SrcX, SrcY, PrevRawPos: integer;
-  WSum, Wij, OutErr, Contrib, ErrOverW: TNeuralFloat;
-  Input: TNNetVolume;
+  i, j, SrcX, SrcY, Depth: integer;
+  WSum, InvWSum: TNeuralFloat;
+  ErrPtr: TNeuralFloatArrPtr;
+  PrevErr, Input: TNNetVolume;
 begin
   Inc(FBackPropCallCurrentCnt);
   if
@@ -100372,10 +100381,14 @@ begin
   // For each output cell error, scatter w[i]*w[j]/WSum * OutErr to the input
   // cell it read from (the fixed blur is a transposed conv). WSum and tap
   // validity are invariant across the depth axis, so the normaliser pass runs
-  // once per (CntOutX,CntOutY) and OutErr/WSum is hoisted to one reciprocal-
-  // multiply per (cell,depth).
-  for CntOutX := 0 to OutMaxX do
-    for CntOutY := 0 to OutMaxY do
+  // once per (CntOutX,CntOutY) and the tap loop sits above the depth run: each
+  // tap is then one scaled accumulate of the whole error row into the source
+  // cell (#13/#21). Every destination element still receives its taps in the
+  // same (i,j) order.
+  PrevErr := FPrevLayer.OutputError;
+  Depth := MaxD + 1;
+  for CntOutY := 0 to OutMaxY do
+    for CntOutX := 0 to OutMaxX do
     begin
       // First pass: the used-weight normaliser for this output cell.
       WSum := 0;
@@ -100391,26 +100404,19 @@ begin
         end;
       end;
       if WSum <= 0 then Continue;
-      for CntD := 0 to MaxD do
+      InvWSum := 1.0 / WSum;
+      ErrPtr := FOutputError.GetRawPtr(CntOutX, CntOutY);
+      // Second pass: scatter to the input cells.
+      for i := 0 to 2 do
       begin
-        OutErr := FOutputError[CntOutX, CntOutY, CntD];
-        if OutErr = 0 then Continue;
-        ErrOverW := OutErr / WSum;
-        // Second pass: scatter to the input cells.
-        for i := 0 to 2 do
+        SrcX := CntOutX * FStride + i - 1;
+        if (SrcX < 0) or (SrcX > InMaxX) then Continue;
+        for j := 0 to 2 do
         begin
-          SrcX := CntOutX * FStride + i - 1;
-          if (SrcX < 0) or (SrcX > InMaxX) then Continue;
-          for j := 0 to 2 do
-          begin
-            SrcY := CntOutY * FStride + j - 1;
-            if (SrcY < 0) or (SrcY > InMaxY) then Continue;
-            Wij := cW[i] * cW[j];
-            Contrib := Wij * ErrOverW;
-            PrevRawPos := FPrevLayer.OutputError.GetRawPos(SrcX, SrcY, CntD);
-            FPrevLayer.OutputError.FData[PrevRawPos] :=
-              FPrevLayer.OutputError.FData[PrevRawPos] + Contrib;
-          end;
+          SrcY := CntOutY * FStride + j - 1;
+          if (SrcY < 0) or (SrcY > InMaxY) then Continue;
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(SrcX, SrcY), ErrPtr,
+            cW[i] * cW[j] * InvWSum, Depth);
         end;
       end;
     end;
