@@ -304,11 +304,14 @@ unit neuralpretrained;
 //
 // 2. PARTIAL ROTARY: only the FIRST rotary_ndims = int(rotary_pct*head_dim)
 //    channels of each Q/K head get RoPE (rotary_pct = 0.25 for Pythia); the
-//    remaining channels pass through unrotated. Wired per head as a channel
-//    split: SplitChannels(first d_rot) -> TNNetRotaryEmbedding(theta) and
-//    SplitChannels(rest), re-concatenated before the SDPA. The RoPE
-//    frequency schedule matches HF (theta_k = base^(-2k/d_rot): the layer
-//    derives the schedule from its input depth, which IS d_rot here).
+//    remaining channels pass through unrotated. Wired as ONE head-tiled
+//    TNNetRotaryEmbedding over the whole Q (and K) block of the slab
+//    (pRotaryHeadDim = head_dim, pRotaryTileDims = d_rot): the tile's
+//    trailing pairs get theta 0, an exact identity, so the single layer is
+//    equivalent to one per-head [SplitChannels(first d_rot) -> RoPE |
+//    SplitChannels(rest)] pair. The RoPE frequency schedule matches HF
+//    (theta_k = base^(-2k/d_rot)). The scaling modes a tiled layer cannot
+//    carry (LongRoPE, YaRN with an output mscale) keep the per-head forest.
 //    GPT-NeoX applies rotate_half WITHIN the rotary slice (the same
 //    first-half/second-half layout as Llama), so the loader permutes the
 //    first d_rot rows of every head exactly like the Llama importer does
@@ -20747,10 +20750,13 @@ var
   BranchInput, AttnOut, MlpOut, QKVLayer: TNNetLayer;
   RotSlice, PassSlice, QHead, KHead, VHead, HeadPack: TNNetLayer;
   GELUSource, PhiBranch: TNNetLayer;
+  QSource, KSource, VSource: TNNetLayer;
   HeadOutputs: array of TNNetLayer;
-  RotChannels, PassChannels, VChannels: array of integer;
+  RotChannels, PassChannels, VChannels, SlabChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, HeadDim, RotaryDims, i, j, d: integer;
   BlockMax, HeadMax, RotMax, PassMax, HeadDimM1, VocabM1, HiddenM1, hBase: integer;
+  MaxHiddenChannel, RotaryTileDims: integer;
+  HoistRoPE: boolean;
   Tmp, WVTied: TNNetVolume;
   TiedBase: integer;
   BlockPrefix, AttnPrefix, TensorNameStr: string;
@@ -20849,11 +20855,26 @@ begin
       SetLength(RotChannels, RotaryDims);
       SetLength(PassChannels, HeadDim - RotaryDims);
       SetLength(VChannels, HeadDim);
+      SetLength(SlabChannels, Config.HiddenSize);
       BlockMax := Config.NumLayers - 1;
       HeadMax := Config.NumHeads - 1;
       RotMax := RotaryDims - 1;
       PassMax := HeadDim - RotaryDims - 1;
       HeadDimM1 := HeadDim - 1;
+      MaxHiddenChannel := Config.HiddenSize - 1;
+      // LongRoPE can NEVER be hoisted: CreateRoPEFromScaling routes it to
+      // CreateLongRoPE, whose signature carries no head dim, so a hoisted
+      // layer would run its frequency schedule over the WHOLE projection
+      // width and silently fall back to an all-ones long_factor table.
+      // A YaRN mscale is rejected for the same reason the partial-rotary
+      // constructor rejects it: it would scale the pass-through channels.
+      HoistRoPE := (Config.RopeScaling.Mode <> rsmLongRoPE) and
+        (not ((Config.RopeScaling.Mode = rsmYaRN) and
+          ((Config.RopeScaling.YarnAttnFactor > 0) or
+           (Config.RopeScaling.Factor > 1))));
+      // 0 = rotate the whole head (rotary_pct = 1).
+      if RotaryDims < HeadDim then RotaryTileDims := RotaryDims
+      else RotaryTileDims := 0;
       for BlockCnt := 0 to BlockMax do
       begin
         // Attention branch: dense(MHA-with-partial-RoPE(LN_1(x))).
@@ -20863,6 +20884,45 @@ begin
         QKVLayer := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(3 * Config.HiddenSize).SetTrainable(pTrainable) );
         Blocks[BlockCnt].QKV := QKVLayer;
+        if HoistRoPE then
+        begin
+          // HOISTED PARTIAL ROTARY: LoadGPTNeoXQKVWeights lays the fused
+          // projection out as three contiguous [Q | K | V] blocks, each a run
+          // of NumHeads head_dim-wide tiles whose FIRST RotaryDims channels
+          // rotate - exactly the layout one head-tiled TNNetRotaryEmbedding
+          // consumes. So ONE rotary per projection replaces the per-head
+          // [rotary slice -> RoPE | pass-through slice] forest: the tile dims
+          // zero the pass-through pairs' theta (an exact identity) and the
+          // frequency schedule denominator stays RotaryDims, matching HF's
+          // inv_freq over rotary_ndims. Coded by Claude (AI).
+          for d := 0 to MaxHiddenChannel do
+            SlabChannels[d] := d;
+          QSource := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SlabChannels), QKVLayer);
+          QSource := NN.AddLayerAfter(
+            CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling,
+              {pRotaryHeadDim=}HeadDim, {pRotaryTileDims=}RotaryTileDims),
+            QSource);
+          for d := 0 to MaxHiddenChannel do
+            SlabChannels[d] := Config.HiddenSize + d;
+          KSource := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SlabChannels), QKVLayer);
+          KSource := NN.AddLayerAfter(
+            CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling,
+              {pRotaryHeadDim=}HeadDim, {pRotaryTileDims=}RotaryTileDims),
+            KSource);
+          // V is never rotated.
+          for d := 0 to MaxHiddenChannel do
+            SlabChannels[d] := 2 * Config.HiddenSize + d;
+          VSource := NN.AddLayerAfter(
+            TNNetSplitChannels.Create(SlabChannels), QKVLayer);
+          // GPT-NeoX is plain MHA (one KV head per query head) with the
+          // standard 1/sqrt(head_dim) scaling.
+          NN.AddGQAAttentionFromSources(QSource, KSource, VSource,
+            Config.NumHeads, Config.NumHeads, HeadDim, {CausalMask=}true);
+        end
+        else
+        begin
         for HeadCnt := 0 to HeadMax do
         begin
           // PARTIAL ROTARY per head: RoPE on the first RotaryDims channels
@@ -20923,6 +20983,7 @@ begin
               {CausalMask=}true), HeadPack);
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        end;
         Blocks[BlockCnt].AttnDense := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         AttnOut := NN.GetLastLayer();

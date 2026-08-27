@@ -287,6 +287,7 @@ type
     procedure TestGPTNeoXConfigFromJSONFile;
     procedure TestGPTNeoXLogitParity;
     procedure TestGPTNeoXSequentialLogitParity;
+    procedure TestGPTNeoXHoistedRoPEMatchesPerHead;
     procedure TestOPTConfigFromJSONFile;
     procedure TestOPTNextTokenLogitsParity;
     procedure TestOPT350ProjPostLNLogitParity;
@@ -10678,6 +10679,84 @@ begin
       Config.VocabSize);
   finally
     NN.Free;
+  end;
+end;
+
+// The GPT-NeoX importer wires attention two ways: ONE head-tiled
+// TNNetRotaryEmbedding per projection feeding the shared fused-attention
+// builder (the default), and the per-head
+// [rotary slice -> RoPE | pass-through slice] forest kept for the scaling
+// modes a tiled layer cannot carry. Both must produce the same logits.
+// rsmLongRoPE selects the per-head branch; an all-ones long_factor table with
+// long_mscale 1 makes its frequency schedule identical to the plain RoPE the
+// hoisted branch builds, so the two nets are directly comparable.
+procedure TTestNeuralPretrained.TestGPTNeoXHoistedRoPEMatchesPerHead;
+var
+  NNHoisted, NNPerHead: TNNet;
+  HoistedConfig, PerHeadConfig: TGPTNeoXConfig;
+  Input, OutH, OutP: TNNetVolume;
+  i, s, RotPairs, SeqLen, SeqLenM1, OutMax: integer;
+  MaxDiff, MaxAbsOut: double;
+begin
+  RandSeed := 424242;
+  HoistedConfig := ReadGPTNeoXConfigFromJSONFile(
+    FixturePath('tiny_gptneox_config.json'));
+  PerHeadConfig := HoistedConfig;
+  PerHeadConfig.RopeScaling.Mode := rsmLongRoPE;
+  RotPairs := Trunc((HoistedConfig.HiddenSize div HoistedConfig.NumHeads) *
+    HoistedConfig.RotaryPct) shr 1;
+  SetLength(PerHeadConfig.RopeScaling.LongFactors, RotPairs);
+  for i := 0 to RotPairs - 1 do
+    PerHeadConfig.RopeScaling.LongFactors[i] := 1.0;
+  PerHeadConfig.RopeScaling.LongAttnFactor := 1.0;
+  NNHoisted := BuildGPTNeoXFromSafeTensorsWithConfig(
+    FixturePath('tiny_gptneox.safetensors'), HoistedConfig);
+  NNPerHead := nil;
+  Input := TNNetVolume.Create;
+  OutH := TNNetVolume.Create;
+  OutP := TNNetVolume.Create;
+  try
+    NNPerHead := BuildGPTNeoXFromSafeTensorsWithConfig(
+      FixturePath('tiny_gptneox.safetensors'), PerHeadConfig);
+    // Structural: the hoist collapses the per-head forest into a handful of
+    // layers per block, so it must be the far shorter net.
+    AssertTrue('hoisted net layer count ' +
+      IntToStr(NNHoisted.CountLayers) + ' must be below the per-head ' +
+      IntToStr(NNPerHead.CountLayers),
+      NNHoisted.CountLayers < NNPerHead.CountLayers);
+    SeqLen := 8;
+    SeqLenM1 := SeqLen - 1;
+    Input.ReSize(HoistedConfig.MaxPositions, 1, 1);
+    MaxDiff := 0;
+    MaxAbsOut := 0;
+    for s := 0 to 2 do
+    begin
+      Input.Fill(0);
+      for i := 0 to SeqLenM1 do
+        Input.FData[i] := (s * 7 + i * 3 + 1) mod HoistedConfig.VocabSize;
+      NNHoisted.Compute(Input);
+      NNHoisted.GetOutput(OutH);
+      NNPerHead.Compute(Input);
+      NNPerHead.GetOutput(OutP);
+      AssertEquals('output size', OutH.Size, OutP.Size);
+      OutMax := OutH.Size - 1;
+      for i := 0 to OutMax do
+      begin
+        if Abs(OutH.FData[i]) > MaxAbsOut then MaxAbsOut := Abs(OutH.FData[i]);
+        if Abs(OutH.FData[i] - OutP.FData[i]) > MaxDiff then
+          MaxDiff := Abs(OutH.FData[i] - OutP.FData[i]);
+      end;
+    end;
+    AssertTrue('logits non-degenerate', MaxAbsOut > 1e-3);
+    AssertTrue('hoisted vs per-head max |diff| = ' + FloatToStr(MaxDiff) +
+      ' relative to max |out| = ' + FloatToStr(MaxAbsOut),
+      MaxDiff < 1e-4 * MaxAbsOut);
+  finally
+    OutP.Free;
+    OutH.Free;
+    Input.Free;
+    NNPerHead.Free;
+    NNHoisted.Free;
   end;
 end;
 
