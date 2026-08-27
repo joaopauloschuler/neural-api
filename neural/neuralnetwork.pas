@@ -99025,9 +99025,9 @@ var
   P, Gamma: TNeuralFloat;
   SizeX, SizeY, BS: integer;
   FeatArea, ValidArea, MaxSeedX, MaxSeedY: integer;
-  SeedXMax, SeedYMax, SizeXMax, SizeYMax: integer;
+  SeedXMax, SeedYMax: integer;
   x, y, bx, by, ex, ey: integer;
-  CntKept, CntAll: integer;
+  CntKept, CntAll, RowBase, AreaMax: integer;
   Rescale: TNeuralFloat;
 begin
   SizeX := FOutput.SizeX;
@@ -99050,8 +99050,6 @@ begin
   Gamma := P * FeatArea / (BS * BS * ValidArea);
   SeedYMax := MaxSeedY - 1;
   SeedXMax := MaxSeedX - 1;
-  SizeYMax := SizeY - 1;
-  SizeXMax := SizeX - 1;
 
   // Sample Bernoulli seeds only where a full block fits, then dilate each
   // seed into a BSxBS block of zeros (square max-pool-style dilation).
@@ -99063,20 +99061,27 @@ begin
       begin
         ex := x + BS - 1;
         ey := y + BS - 1;
+        // #3: FKeepMask has Depth = 1, so [bx,by,0] collapses to the flat index
+        // by*SizeX + bx, and one block row is a contiguous run.
+        RowBase := y * SizeX;
         for by := y to ey do
-          for bx := x to ex do
-            FKeepMask.Data[bx, by, 0] := 0;
+        begin
+          for bx := x to ex do FKeepMask.FData[RowBase + bx] := 0;
+          Inc(RowBase, SizeX);
+        end;
       end;
     end;
   end;
 
   // Rescale surviving activations by count_all / count_kept so the expected
   // activation is preserved. Guard against an all-zero mask (passthrough).
+  // Depth = 1 makes the whole mask one flat run, so both sweeps are single
+  // loops over FData (#3).
   CntAll := FeatArea;
   CntKept := 0;
-  for y := 0 to SizeYMax do
-    for x := 0 to SizeXMax do
-      if FKeepMask.Data[x, y, 0] <> 0 then Inc(CntKept);
+  AreaMax := FeatArea - 1;
+  for x := 0 to AreaMax do
+    if FKeepMask.FData[x] <> 0 then Inc(CntKept);
   if CntKept = 0 then
   begin
     // Everything dropped: fall back to identity to avoid div-by-zero.
@@ -99084,10 +99089,8 @@ begin
     exit;
   end;
   Rescale := CntAll / CntKept;
-  for y := 0 to SizeYMax do
-    for x := 0 to SizeXMax do
-      if FKeepMask.Data[x, y, 0] <> 0 then
-        FKeepMask.Data[x, y, 0] := Rescale;
+  for x := 0 to AreaMax do
+    if FKeepMask.FData[x] <> 0 then FKeepMask.FData[x] := Rescale;
 end;
 
 procedure TNNetDropBlock.Compute();
@@ -99875,8 +99878,8 @@ var
   CntInputPX, CntInputPY: integer;
   OutputRawPos: integer;
   StartTime: double;
-  Sum, Acc, R, Threshold, CurrValue, Y, BestDiff, Diff, Mean, Cnt: TNeuralFloat;
-  BestX, BestY, Picked: integer;
+  Sum, SumSq, Acc, R, Threshold, CurrValue, Y, BestDiff, Diff, Mean: TNeuralFloat;
+  BestX, BestY, Picked, Cnt: integer;
   Prev: TNNetVolume;
 begin
   StartTime := Now();
@@ -99907,17 +99910,32 @@ begin
       InXMax := Min(InX + FPoolSize - 1, Prev.SizeX - 1);
       if InX < 0 then InX := 0;
       OutputRawPos := Output.GetRawPos(CntX, CntY);
+      // Rule #5: the clipped window area does not depend on the channel, so it
+      // is counted once here instead of being float-incremented per element.
+      Cnt := (InXMax - InX + 1) * (InYMax - InY + 1);
       for CntD := 0 to MaxD do
       begin
-        // Pass 1: window sum and cell count.
+        // Pass 1: window sum, and -- for inference -- the sum of squares that
+        // the expectation needs, folded in so the window is traversed once
+        // (#5/#14). Training does not use it, so FEnabled unswitches the pass.
         Sum := 0;
-        Cnt := 0;
-        for CntInputPX := InX to InXMax do
-          for CntInputPY := InY to InYMax do
-          begin
-            Sum := Sum + Prev[CntInputPX, CntInputPY, CntD];
-            Cnt := Cnt + 1;
-          end;
+        if FEnabled then
+        begin
+          for CntInputPX := InX to InXMax do
+            for CntInputPY := InY to InYMax do
+              Sum := Sum + Prev[CntInputPX, CntInputPY, CntD];
+        end
+        else
+        begin
+          SumSq := 0;
+          for CntInputPX := InX to InXMax do
+            for CntInputPY := InY to InYMax do
+            begin
+              CurrValue := Prev[CntInputPX, CntInputPY, CntD];
+              Sum := Sum + CurrValue;
+              SumSq := SumSq + CurrValue * CurrValue;
+            end;
+        end;
 
         if Sum > 0 then
         begin
@@ -99952,15 +99970,9 @@ begin
           end
           else
           begin
-            // INFERENCE: expectation y = sum_i p_i*a_i = sum_i a_i^2 / Sum.
-            Y := 0;
-            for CntInputPX := InX to InXMax do
-              for CntInputPY := InY to InYMax do
-              begin
-                CurrValue := Prev[CntInputPX, CntInputPY, CntD];
-                Y := Y + CurrValue * CurrValue;
-              end;
-            Y := Y / Sum;
+            // INFERENCE: expectation y = sum_i p_i*a_i = sum_i a_i^2 / Sum,
+            // whose numerator pass 1 already accumulated.
+            Y := SumSq / Sum;
             FOutput.FData[OutputRawPos] := Y;
             // Cache the cell whose activation is closest to y for backward.
             BestX := InX;
@@ -100390,14 +100402,13 @@ end;
 
 procedure TNNetDeMaxPool.Compute();
 var
-  CntX, CntY, CntD: integer;
+  CntX, CntY: integer;
   MaxX, MaxY, MaxD: integer;
   OutX, OutY: integer;
   OutXStart, OutXEnd, OutYStart, OutYEnd: integer;
-  CurrValue: TNeuralFloat;
   StartTime: double;
   PrevLayerRawPos, OutputRawPos: integer;
-  Pos, RowStride: integer;
+  Pos, DepthBytes, OutDepth: integer;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -100424,30 +100435,30 @@ begin
   end
   else
   begin
-    RowStride := Output.SizeX * Output.Depth;
-    // #11/#12: depth innermost so the prev-layer read is a carried offset, and
-    // the pooling-block bounds are hoisted per (CntX,CntY).
-    for CntX := 0 to MaxX do
+    DepthBytes := (MaxD + 1) * csNeuralFloatSize;
+    OutDepth := Output.Depth;
+    // Each input cell is replicated verbatim into every cell of its
+    // PoolSize x PoolSize output block, so the depth run is a contiguous copy
+    // (#13/App. C) rather than a depth-outer scatter that strode a whole output
+    // row per write. Within one block row the destination advances by exactly
+    // one cell, so the offset is carried (#12).
+    for CntY := 0 to MaxY do
     begin
-      OutXStart := CntX*FPoolSize;
-      OutXEnd := OutXStart + FPoolSize - 1;
-      for CntY := 0 to MaxY do
+      OutYStart := CntY*FPoolSize;
+      OutYEnd := OutYStart + FPoolSize - 1;
+      for CntX := 0 to MaxX do
       begin
-        OutYStart := CntY*FPoolSize;
-        OutYEnd := OutYStart + FPoolSize - 1;
+        OutXStart := CntX*FPoolSize;
+        OutXEnd := OutXStart + FPoolSize - 1;
         PrevLayerRawPos := FPrevLayer.FOutput.GetRawPos(CntX, CntY);
-        for CntD := 0 to MaxD do
+        for OutY := OutYStart to OutYEnd do
         begin
-          CurrValue := FPrevLayer.FOutput.FData[PrevLayerRawPos];
-          Inc(PrevLayerRawPos);
+          Pos := Output.GetRawPos(OutXStart, OutY);
           for OutX := OutXStart to OutXEnd do
           begin
-            Pos := Output.GetRawPos(OutX, OutYStart, CntD);
-            for OutY := OutYStart to OutYEnd do
-            begin
-              Output.FData[Pos] := CurrValue;
-              Inc(Pos, RowStride);
-            end;
+            Move(FPrevLayer.FOutput.FData[PrevLayerRawPos],
+                 Output.FData[Pos], DepthBytes);
+            Inc(Pos, OutDepth);
           end;
         end;
       end;
@@ -100648,7 +100659,7 @@ var
   MaxInX, MaxInY, MaxInD, MaxN: integer;
   FeatYMax, FeatXMax, OutHMax, OutWMax: integer;
   StrideX, Pad, outBase, pos: integer;
-  acc, raw, b: TNeuralFloat;
+  acc, raw: TNeuralFloat;
   W: TNNetVolume;
   prevPtr: TNeuralFloatArrPtr;
 begin
@@ -100692,17 +100703,37 @@ begin
 
   // Add bias INTO the raw output (so the activation derivative used in
   // Backpropagate sees the true pre-activation), then apply the activation.
-  for oc := 0 to MaxN do
+  // App. E: the out-channel is the DEPTH axis here, so an oc-outer nest made
+  // one strided pass over the whole output per channel; with oc innermost the
+  // pair of volumes is streamed once, and the offset is a hoisted row base plus
+  // oc (#11). The bias is unswitched out of the body (#20).
+  if FSuppressBias = 0 then
   begin
-    if FSuppressBias = 0 then b := FArrNeurons[oc].FBiasWeight else b := 0;
     for oy := 0 to OutHMax do
      for ox := 0 to OutWMax do
      begin
        // Rule #4: one offset serves both same-shaped volumes.
-       pos := FOutputRaw.GetRawPos(ox, oy, oc);
-       raw := FOutputRaw.FData[pos] + b;
-       FOutputRaw.FData[pos] := raw;
-       FOutput.FData[pos] := FActivationFn(raw);
+       outBase := FOutputRaw.GetRawPos(ox, oy);
+       for oc := 0 to MaxN do
+       begin
+         pos := outBase + oc;
+         raw := FOutputRaw.FData[pos] + FArrNeurons[oc].FBiasWeight;
+         FOutputRaw.FData[pos] := raw;
+         FOutput.FData[pos] := FActivationFn(raw);
+       end;
+     end;
+  end
+  else
+  begin
+    for oy := 0 to OutHMax do
+     for ox := 0 to OutWMax do
+     begin
+       outBase := FOutputRaw.GetRawPos(ox, oy);
+       for oc := 0 to MaxN do
+       begin
+         pos := outBase + oc;
+         FOutput.FData[pos] := FActivationFn(FOutputRaw.FData[pos]);
+       end;
      end;
   end;
 end;
@@ -100761,8 +100792,8 @@ var
   ix, iy, id, kx, ky, oc, ox, oy, t, a, pos: integer;
   MaxInX, MaxInY, MaxN: integer;
   FeatYMax, FeatXMax, InDMax, OutHMax, OutWMax: integer;
-  StrideX, Pad, N, NumAs, NumBs: integer;
-  raw, b: TNeuralFloat;
+  StrideX, Pad, N, NumAs, NumBs, aBase, wBase, outBase: integer;
+  raw: TNeuralFloat;
   W: TNNetVolume;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -100788,14 +100819,24 @@ begin
     FGemmWInter.ReSize(NumAs * InD, 1, 1);
     for ky := 0 to FeatYMax do
      for kx := 0 to FeatXMax do
+     begin
+      // #10/#11: the tap's row block is invariant across oc, and the array
+      // mirror skips the neuron list getter.
+      aBase := (ky * FFeatureSizeX + kx) * N;
       for oc := 0 to MaxN do
       begin
-        W := FNeurons[oc].FWeights;
-        a := (ky * FFeatureSizeX + kx) * N + oc;
+        W := FArrNeurons[oc].FWeights;
+        a := aBase + oc;
         // INTERLEAVED A layout the kernel reads: A[id*NumAs + a].
+        wBase := W.GetRawPos(kx, ky);
+        pos := a;
         for id := 0 to InDMax do
-          FGemmWInter.FData[id * NumAs + a] := W[kx, ky, id];
+        begin
+          FGemmWInter.FData[pos] := W.FData[wBase + id];
+          Inc(pos, NumAs);
+        end;
       end;
+     end;
   end;
 
   // 2. B operand: one row per input cell, its InD contiguous depth column.
@@ -100831,25 +100872,43 @@ begin
         ox := ix * StrideX - Pad + kx;
         if (ox < 0) or (ox >= OutW) then continue;
         t := iy * InW + ix;
-        a := (ky * FFeatureSizeX + kx) * N;
+        aBase := (ky * FFeatureSizeX + kx) * N;
         // #13: the oc-run is a contiguous accumulate (FOutputRaw depth = N).
         TNNetVolume.Add(FOutputRaw.GetRawPtr(ox, oy),
-          @FGemmRes.FData[t * NumAs + a], N);
+          @FGemmRes.FData[t * NumAs + aBase], N);
       end;
    end;
 
-  // 5. Bias + activation, identical to ComputeCPU.
-  for oc := 0 to MaxN do
+  // 5. Bias + activation, identical to ComputeCPU: oc innermost so the output
+  //    pair is streamed once instead of once per channel (App. E), with the
+  //    bias unswitched out of the body (#20).
+  if FSuppressBias = 0 then
   begin
-    if FSuppressBias = 0 then b := FNeurons[oc].FBiasWeight else b := 0;
     for oy := 0 to OutHMax do
      for ox := 0 to OutWMax do
      begin
        // #3: one flat offset addresses both same-shaped output volumes.
-       pos := FOutputRaw.GetRawPos(ox, oy, oc);
-       raw := FOutputRaw.FData[pos] + b;
-       FOutputRaw.FData[pos] := raw;
-       FOutput.FData[pos] := FActivationFn(raw);
+       outBase := FOutputRaw.GetRawPos(ox, oy);
+       for oc := 0 to MaxN do
+       begin
+         pos := outBase + oc;
+         raw := FOutputRaw.FData[pos] + FArrNeurons[oc].FBiasWeight;
+         FOutputRaw.FData[pos] := raw;
+         FOutput.FData[pos] := FActivationFn(raw);
+       end;
+     end;
+  end
+  else
+  begin
+    for oy := 0 to OutHMax do
+     for ox := 0 to OutWMax do
+     begin
+       outBase := FOutputRaw.GetRawPos(ox, oy);
+       for oc := 0 to MaxN do
+       begin
+         pos := outBase + oc;
+         FOutput.FData[pos] := FActivationFn(FOutputRaw.FData[pos]);
+       end;
      end;
   end;
 end;
@@ -100863,11 +100922,11 @@ var
   ix, iy, id, kx, ky, oc, ox, oy: integer;
   MaxInX, MaxInY, MaxInD, MaxN: integer;
   FeatYMax, FeatXMax, OutHMax, OutWMax: integer;
-  StrideX, Pad, actKind, pos: integer;
+  StrideX, Pad, actKind, pos, outBase, derivBase: integer;
   lr, d, deriv, xval: TNeuralFloat;
   W, GW: TNNetVolume;
   localNeuron: TNNetNeuron;
-  hasInputGrad: boolean;
+  hasInputGrad, hasBias: boolean;
   prevPtr, prevErrPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -100895,14 +100954,19 @@ begin
   if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @Identity then actKind := 0
   else if {$IFNDEF FPC}@{$ENDIF}FActivationFn = @RectifiedLinearUnit then actKind := 1
   else actKind := 2;
-  for oc := 0 to MaxN do
-  begin
-    localNeuron := FArrNeurons[oc];
-    for oy := 0 to OutHMax do
-     for ox := 0 to OutWMax do
+  // App. E: oc is the DEPTH axis, so an oc-outer nest made one strided pass over
+  // the output volumes per channel; with oc innermost they are streamed once and
+  // the offset is a hoisted row base plus oc (#11). The bias-delta sums pick up
+  // their terms in a different order, which the no-bit-parity policy allows.
+  hasBias := FSuppressBias = 0;
+  for oy := 0 to OutHMax do
+   for ox := 0 to OutWMax do
+   begin
+     // #3/#12: one flat offset addresses all four same-shaped output volumes.
+     outBase := FOutputError.GetRawPos(ox, oy);
+     for oc := 0 to MaxN do
      begin
-       // #3/#12: one flat offset addresses all four same-shaped output volumes.
-       pos := FOutputError.GetRawPos(ox, oy, oc);
+       pos := outBase + oc;
        case actKind of
          0: deriv := FOutputError.FData[pos];
          1: if FOutput.FData[pos] > 0
@@ -100913,10 +100977,13 @@ begin
            FActivationFnDerivative(FOutputRaw.FData[pos]);
        end;
        FOutputErrorDeriv.FData[pos] := deriv;
-       if (FSuppressBias = 0) and (deriv <> 0) then
+       if hasBias and (deriv <> 0) then
+       begin
+         localNeuron := FArrNeurons[oc];
          localNeuron.FBiasDelta := localNeuron.FBiasDelta + lr * deriv;
+       end;
      end;
-  end;
+   end;
 
   // Scatter (dual of the forward overlap-add):
   //   dL/dW[oc][k] += deriv[o] * in[i]      (o = i*stride - pad + k)
@@ -100931,12 +100998,14 @@ begin
       begin
         ox := ix * StrideX - Pad + kx;
         if (ox < 0) or (ox >= OutW) then continue;
-        // Rule #11: Prev / PrevErr depth-column ptrs are invariant across oc.
+        // Rule #11: Prev / PrevErr depth-column ptrs and the derivative row base
+        // are invariant across oc.
         prevPtr := Prev.GetRawPtr(ix, iy);
         if hasInputGrad then prevErrPtr := PrevErr.GetRawPtr(ix, iy);
+        derivBase := FOutputErrorDeriv.GetRawPos(ox, oy);
         for oc := 0 to MaxN do
         begin
-          d := FOutputErrorDeriv.Get(ox, oy, oc);
+          d := FOutputErrorDeriv.FData[derivBase + oc];
           if d = 0 then continue;
           GW := FArrNeurons[oc].FDelta;
           W := FArrNeurons[oc].FWeights;

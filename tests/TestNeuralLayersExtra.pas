@@ -29,6 +29,7 @@ type
     // DeMaxPool (Upsampling) tests
     procedure TestDeMaxPoolForward;
     procedure TestDeMaxPoolOutputSize;
+    procedure TestDeMaxPoolBlockReplication;
 
     // MaxPoolWithPosition tests
     procedure TestMaxPoolWithPositionNonTrainable;
@@ -998,6 +999,47 @@ begin
     // DeMaxPool with scale 3 should triple the dimensions
     AssertEquals('Output SizeX should be 9', 9, NN.GetLastLayer.Output.SizeX);
     AssertEquals('Output SizeY should be 9', 9, NN.GetLastLayer.Output.SizeY);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// The default (FSpacing = 0) TNNetDeMaxPool forward replicates each input cell
+// verbatim into its whole PoolSize x PoolSize output block, on every channel.
+// The existing DeMaxPool tests only check the output geometry, so this one
+// pins the value placement itself: every output cell must equal the input cell
+// it upsampled from.
+procedure TTestNeuralLayersExtra.TestDeMaxPoolBlockReplication;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, D: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 3, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 3, 5));
+    NN.AddLayer(TNNetDeMaxPool.Create(3));
+
+    for Y := 0 to 2 do
+      for X := 0 to 3 do
+        for D := 0 to 4 do
+          Input[X, Y, D] := X * 100 + Y * 10 + D + 1;
+
+    NN.Compute(Input);
+
+    AssertEquals('Output SizeX', 12, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Output SizeY', 9, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('Output Depth', 5, NN.GetLastLayer.Output.Depth);
+
+    for Y := 0 to 8 do
+      for X := 0 to 11 do
+        for D := 0 to 4 do
+          AssertEquals('Replicated cell (' + IntToStr(X) + ',' + IntToStr(Y) +
+            ',' + IntToStr(D) + ')',
+            Input[X div 3, Y div 3, D],
+            NN.GetLastLayer.Output[X, Y, D], 0);
   finally
     NN.Free;
     Input.Free;
