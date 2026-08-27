@@ -69144,8 +69144,12 @@ begin
       Inc(rowOff, Dv);
     end;
   end;
-  // Decayed carry + rank-1 corrective write, vectorized per output row d
-  // (contiguous over e). PrevS may alias CurS (in-place decode carry).
+  // Decayed carry + rank-1 corrective write, fused with the read-out
+  // o[e] = sum_d S_t[d,e] q[d]: row d is written once (by this iteration) and
+  // read once (right after), so the state row is consumed while still hot and
+  // the second sweep over S disappears. PrevS may alias CurS (in-place decode
+  // carry); both rows are contiguous over e.
+  FillChar(OutPtr^[0], Dv * csNeuralFloatSize, 0);
   rowOff := 0;
   for d := 0 to DkM1 do
   begin
@@ -69153,13 +69157,6 @@ begin
     else PrevRow := nil;
     TNNetVolume.RankOneUpdateRow(@CurS^[rowOff], PrevRow,
       @ErrPtr^[0], Decay, Beta * KPtr^[d], Dv);
-    Inc(rowOff, Dv);
-  end;
-  // Read-out o[e] = sum_d S_t[d,e] q[d]. Accumulate per row d via MulAdd.
-  FillChar(OutPtr^[0], Dv * csNeuralFloatSize, 0);
-  rowOff := 0;
-  for d := 0 to DkM1 do
-  begin
     TNNetVolume.MulAdd(@OutPtr^[0], @CurS^[rowOff], QPtr^[d], Dv);
     Inc(rowOff, Dv);
   end;
@@ -69172,28 +69169,25 @@ class procedure TNNetDeltaNet.DeltaRuleStepBackward(PrevS, CurS, KPtr, QPtr,
   ErrPtr, GyPtr, GS, GK, GQ, GV: TNeuralFloatArrPtr; Beta, Decay: TNeuralFloat;
   out GBeta, GDecay: TNeuralFloat; Dk, Dv: integer);
 var
-  d, i: integer;
-  DkM1, DkDvM1, rowOff: integer;
+  d: integer;
+  DkM1, rowOff: integer;
+  ScaleGS: boolean;
   dotGSerr, gbetav, gdec: TNeuralFloat;
 begin
   DkM1 := Dk - 1;
-  // Read-out o[e] = sum_d S_t[d,e] q[d]: scatter into dL/dS_t (+carry) and
-  // dL/dq, vectorized per row d (GS row + CurS row contiguous over e).
+  // Read-out o[e] = sum_d S_t[d,e] q[d] scattered into dL/dS_t (+carry) and
+  // dL/dq, fused with the write term S_t[d,e] = Sd[d,e] + Beta*k[d]*err[e]
+  // (dL/dBeta, dL/dk, dL/derr into GV; d err/d v = +1). GS row d is completed
+  // by this iteration's first MulAdd, so the write term can consume it right
+  // away instead of in a second sweep. The pass-through carry dL/dSd = GS is
+  // mutated further below.
+  gbetav := 0;
   rowOff := 0;
   for d := 0 to DkM1 do
   begin
     TNNetVolume.MulAdd(@GS^[rowOff], @GyPtr^[0], QPtr^[d], Dv);
     GQ^[d] := GQ^[d] +
       TNNetVolume.DotProduct(@GyPtr^[0], @CurS^[rowOff], Dv);
-    Inc(rowOff, Dv);
-  end;
-  // Now GS = dL/dS_t (full). Write: S_t[d,e] = Sd[d,e] + Beta*k[d]*err[e].
-  // dL/dBeta, dL/dk (via write), dL/derr (into GV; d err/d v = +1), and the
-  // pass-through carry dL/dSd = GS (mutated below after using it).
-  gbetav := 0;
-  rowOff := 0;
-  for d := 0 to DkM1 do
-  begin
     dotGSerr := TNNetVolume.DotProduct(@GS^[rowOff], @ErrPtr^[0], Dv);
     GK^[d] := GK^[d] + Beta * dotGSerr;
     gbetav := gbetav + KPtr^[d] * dotGSerr;
@@ -69206,26 +69200,22 @@ begin
   // dL/dSd; then dL/dS_{t-1} = Decay * dL/dSd and dL/dDecay = <dL/dSd, S_{t-1}>.
   if PrevS <> nil then
   begin
+    ScaleGS := Decay <> 1.0;
+    gdec := 0;
     rowOff := 0;
     for d := 0 to DkM1 do
     begin
       GK^[d] := GK^[d] - Decay * TNNetVolume.DotProduct(@GV^[0],
         @PrevS^[rowOff], Dv);
       TNNetVolume.MulAdd(@GS^[rowOff], @GV^[0], -KPtr^[d], Dv);
-      Inc(rowOff, Dv);
-    end;
-    // (GS now holds dL/dSd: the +Sd write term contributes identity, the -pred
-    //  term contributed the -gerr*k correction just applied.)
-    gdec := 0;
-    rowOff := 0;
-    for d := 0 to DkM1 do
-    begin
+      // GS row d now holds dL/dSd (the +Sd write term contributes identity, the
+      // -pred term contributed the -gerr*k correction just applied), so both
+      // dL/dDecay and the dL/dS_{t-1} row scaling read it while it is still hot.
       gdec := gdec + TNNetVolume.DotProduct(@GS^[rowOff], @PrevS^[rowOff], Dv);
+      if ScaleGS then TNNetVolume.Mul(@GS^[rowOff], Decay, Dv);
       Inc(rowOff, Dv);
     end;
     GDecay := gdec;
-    if Decay <> 1.0 then
-      TNNetVolume.Mul(GS, Decay, Dk * Dv);
   end;
 end;
 
@@ -69294,7 +69284,7 @@ var
   StartTime: double;
   Wq, Wk, Wv, Wb: TNNetVolume;
   SeqLen, Depth, t, d, j, baseT, baseS, rowOfs, DepthSq: integer;
-  DepthM1, SeqLenM1: integer;
+  DepthM1, SeqLenM1, DepthBytes: integer;
   hasInputGrad: boolean;
   GyPtr, XtPtr, PrevErrPtr, PrevSPtr: TNeuralFloatArrPtr;
   WqR, WkR, WvR, GWqR, GWkR, GWvR: TNeuralFloatArrPtr;
@@ -69312,6 +69302,7 @@ begin
   DepthM1 := Depth - 1;
   SeqLenM1 := SeqLen - 1;
   DepthSq := Depth * Depth;   // #5
+  DepthBytes := Depth * csNeuralFloatSize;
   hasInputGrad := Assigned(FPrevLayer) and
     (FPrevLayer.FOutputError.Size = FPrevLayer.FOutput.Size) and
     (FPrevLayer.FOutput.Size > 0);
@@ -69331,10 +69322,8 @@ begin
     knrm := FKnorm.FData[t];
     if hasInputGrad then PrevErrPtr := PrevErr.GetRawPtr(t, 0)
     else PrevErrPtr := nil;
-    for d := 0 to DepthM1 do
-    begin
-      FgqBuf[d] := 0; FgvBuf[d] := 0; FgknBuf[d] := 0; FgkrawBuf[d] := 0;
-    end;
+    FillChar(FgqBuf[0], DepthBytes, 0); FillChar(FgvBuf[0], DepthBytes, 0);
+    FillChar(FgknBuf[0], DepthBytes, 0); FillChar(FgkrawBuf[0], DepthBytes, 0);
     // Delta-rule adjoint (read-out scatter, write terms, read-back correction
     // and the dL/dS_{t-1} carry) via the shared kernel (Decay=1; the returned
     // dL/dDecay is unused - there is no decay gate in the classic layer).
