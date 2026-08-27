@@ -15211,12 +15211,6 @@ type
     FxrPlane, FximPlane: array of TNeuralFloat;
     // BackpropagateCPU contiguous input-spectrum gradient, FxrPlane's layout.
     FdXrePlane, FdXimPlane: array of TNeuralFloat;
-    // BackpropagateCPU weight-gradient row scratch, one InDepth-long run reused
-    // per (co,mx,my). Each spectral weight is written by exactly one mode triple,
-    // so no full-size gradient plane (nor its zero/scatter passes) is needed: the
-    // row is accumulated with contiguous MulAdds over FxrPlane/FximPlane and then
-    // scattered straight into the strided interleaved WDelta.
-    FdWrRow, FdWiRow: array of TNeuralFloat;
     // Persistent FFT2D X-axis scratch (length FSizeX). The Y axis needs none:
     // the [x][y] layout makes Re[ix] the contiguous Y row, so FourierMixFFT
     // runs in place on it.
@@ -85566,8 +85560,9 @@ var
   ci, co, m, n, b: integer;
   WDelta, LocalPrevError: TNNetVolume;
   invL, gyr, gyi, contrib, lrGyr, lrGyi: Double;
+  xr, xi, wr, wi: TNeuralFloat;
   InDepthM1, OutDepthM1, SeqLenM1, ModesM1: integer;
-  wBaseIdx, xBaseIdx, planeSize, wPlaneSize, pos, OutStride, TailLen: integer;
+  wBaseIdx, xBaseIdx, wPos, xPos, planeSize, wPlaneSize, pos, OutStride, TailLen: integer;
 begin
   WDelta := FArrNeurons[0].FDelta;
   invL := 1.0 / FSeqLen;
@@ -85603,26 +85598,31 @@ begin
       gyi := invL * FGimBuf[m];
       wBaseIdx := (co * FModes + m) * FInDepth;
       xBaseIdx := m * FInDepth;
-      // Weight gradient: contiguous AVX MulAdd accumulation into the Re/Im
-      // weight-gradient planes over the ci axis (input spectra FxrPlane/FximPlane
-      // are already (m,ci)-contiguous Single mirrors, as the forward path uses).
-      // Math is the transpose of the forward complex GEMM, identical to the old
-      // strided-scalar loop with -FLearningRate folded into the scalar factors:
-      //   dWr[ci] += -LR*gyr * xr[ci] + -LR*gyi * xi[ci]
-      //   dWi[ci] += -LR*gyi * xr[ci] +  LR*gyr * xi[ci]
+      // Transpose of the forward complex GEMM, with -FLearningRate folded into
+      // the weight-gradient scalars. All four accumulators run over the same
+      // contiguous ci axis off the same two source pairs, so the eight AXPY
+      // passes collapse into one fused traversal (each operand read once):
+      //   dWr[ci]  += -LR*gyr * xr[ci] + -LR*gyi * xi[ci]
+      //   dWi[ci]  += -LR*gyi * xr[ci] +  LR*gyr * xi[ci]
+      //   dXre[ci] +=  gyr * Wr[ci] + gyi * Wi[ci]
+      //   dXim[ci] += -gyr * Wi[ci] + gyi * Wr[ci]
       lrGyr := -FLearningRate * gyr;
       lrGyi := -FLearningRate * gyi;
-      TNNetVolume.MulAdd(@FdWrPlane[wBaseIdx], @FxrPlane[xBaseIdx], lrGyr, FInDepth);
-      TNNetVolume.MulAdd(@FdWrPlane[wBaseIdx], @FximPlane[xBaseIdx], lrGyi, FInDepth);
-      TNNetVolume.MulAdd(@FdWiPlane[wBaseIdx], @FxrPlane[xBaseIdx], lrGyi, FInDepth);
-      TNNetVolume.MulAdd(@FdWiPlane[wBaseIdx], @FximPlane[xBaseIdx], -lrGyr, FInDepth);
-      // Input-spectrum gradient (sum over co): contiguous AXPY over the ci axis.
-      //   dXre[ci] += gyr*Wr[ci] + gyi*Wi[ci]
-      //   dXim[ci] += -gyr*Wi[ci] + gyi*Wr[ci]
-      TNNetVolume.MulAdd(@FdXrePlane[xBaseIdx], @FWrPlane[wBaseIdx], gyr, FInDepth);
-      TNNetVolume.MulAdd(@FdXrePlane[xBaseIdx], @FWiPlane[wBaseIdx], gyi, FInDepth);
-      TNNetVolume.MulAdd(@FdXimPlane[xBaseIdx], @FWiPlane[wBaseIdx], -gyr, FInDepth);
-      TNNetVolume.MulAdd(@FdXimPlane[xBaseIdx], @FWrPlane[wBaseIdx], gyi, FInDepth);
+      wPos := wBaseIdx;
+      xPos := xBaseIdx;
+      for ci := 0 to InDepthM1 do
+      begin
+        xr := FxrPlane[xPos];
+        xi := FximPlane[xPos];
+        wr := FWrPlane[wPos];
+        wi := FWiPlane[wPos];
+        FdWrPlane[wPos]  := FdWrPlane[wPos]  + lrGyr * xr + lrGyi * xi;
+        FdWiPlane[wPos]  := FdWiPlane[wPos]  + lrGyi * xr - lrGyr * xi;
+        FdXrePlane[xPos] := FdXrePlane[xPos] + gyr * wr + gyi * wi;
+        FdXimPlane[xPos] := FdXimPlane[xPos] - gyr * wi + gyi * wr;
+        Inc(wPos);
+        Inc(xPos);
+      end;
     end;
   end;
 
@@ -86346,8 +86346,6 @@ begin
   SetLength(FdXimBuf, 0);
   SetLength(FdXrePlane, 0);
   SetLength(FdXimPlane, 0);
-  SetLength(FdWrRow, 0);
-  SetLength(FdWiRow, 0);
 end;
 
 function TNNetSpectralConv2D.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
@@ -86462,8 +86460,6 @@ begin
     SetLength(FdXimBuf, FInDepth, FModesX, FModesY);
     SetLength(FdXrePlane, FModesX * FModesY * FInDepth);
     SetLength(FdXimPlane, FModesX * FModesY * FInDepth);
-    SetLength(FdWrRow, FInDepth);
-    SetLength(FdWiRow, FInDepth);
   end;
 
   InitDefault();
@@ -86597,8 +86593,8 @@ begin
   begin
     // Only the truncated part of the spectrum stays zero: the kept mode block
     // [0..ModesX-1][0..ModesY-1] is overwritten below (#13: FillChar per row).
-    for ix := 0 to ModesXM1 do
-      if TailBytes > 0 then
+    if TailBytes > 0 then                 // #20: loop-invariant, tested once
+      for ix := 0 to ModesXM1 do
       begin
         FillChar(FSreBuf[ix][FModesY], TailBytes, 0);
         FillChar(FSimBuf[ix][FModesY], TailBytes, 0);
@@ -86656,7 +86652,8 @@ var
   InDepthM1, OutDepthM1, SizeXM1, SizeYM1, ModesXM1, ModesYM1: integer;
   WDelta, LocalPrevError: TNNetVolume;
   invL, gyr, gyi, contrib, lrGyr, lrGyi: Double;
-  b, L, wBaseIdx, xBaseIdx, planeSize, OutStride, pos: integer;
+  xr, xi, wr, wi: TNeuralFloat;
+  b, L, wBaseIdx, xBaseIdx, wPos, xPos, planeSize, OutStride, pos: integer;
   InRowStride, OutRowStride, RowBytes, TailBytes: integer;
 begin
   WDelta := FArrNeurons[0].FDelta;
@@ -86701,33 +86698,35 @@ begin
         wBaseIdx := ((co * FModesX + mx) * FModesY + my) * FInDepth;
         xBaseIdx := (mx * FModesY + my) * FInDepth;
         // Transpose of the forward complex GEMM, with -FLearningRate folded into
-        // the scalar factors. Every reduction is contiguous over the ci axis:
-        //   dWr[ci] += -LR*gyr * xr[ci] + -LR*gyi * xi[ci]
-        //   dWi[ci] += -LR*gyi * xr[ci] +  LR*gyr * xi[ci]
+        // the weight-gradient scalars:
+        //   dWr[ci]  += -LR*gyr * xr[ci] + -LR*gyi * xi[ci]
+        //   dWi[ci]  += -LR*gyi * xr[ci] +  LR*gyr * xi[ci]
+        //   dXre[ci] +=  gyr * Wr[ci] + gyi * Wi[ci]
+        //   dXim[ci] += -gyr * Wi[ci] + gyi * Wr[ci]
+        // This mode triple owns its WDelta slots outright ((mx,my,ci,co) is a
+        // unique address), so the weight gradient lands straight in the strided
+        // interleaved WDelta with no row scratch. All four accumulators walk the
+        // same ci axis off the same operands, so one fused traversal replaces two
+        // FillChars, eight AXPY passes and a separate scatter loop.
         lrGyr := -FLearningRate * gyr;
         lrGyi := -FLearningRate * gyi;
-        FillChar(FdWrRow[0], FInDepth * csNeuralFloatSize, 0);   // #13
-        FillChar(FdWiRow[0], FInDepth * csNeuralFloatSize, 0);
-        TNNetVolume.MulAdd(@FdWrRow[0], @FxrPlane[xBaseIdx], lrGyr, FInDepth);
-        TNNetVolume.MulAdd(@FdWrRow[0], @FximPlane[xBaseIdx], lrGyi, FInDepth);
-        TNNetVolume.MulAdd(@FdWiRow[0], @FxrPlane[xBaseIdx], lrGyi, FInDepth);
-        TNNetVolume.MulAdd(@FdWiRow[0], @FximPlane[xBaseIdx], -lrGyr, FInDepth);
-        // This mode triple owns these weights outright, so scatter the row into
-        // the strided interleaved WDelta right here.
         b := (((mx * FModesY + my) * FInDepth) * FOutDepth + co) * 2;
+        wPos := wBaseIdx;
+        xPos := xBaseIdx;
         for ci := 0 to InDepthM1 do
         begin
-          WDelta.FData[b]     := WDelta.FData[b]     + FdWrRow[ci];
-          WDelta.FData[b + 1] := WDelta.FData[b + 1] + FdWiRow[ci];
+          xr := FxrPlane[xPos];
+          xi := FximPlane[xPos];
+          wr := FWrPlane[wPos];
+          wi := FWiPlane[wPos];
+          WDelta.FData[b]     := WDelta.FData[b]     + lrGyr * xr + lrGyi * xi;
+          WDelta.FData[b + 1] := WDelta.FData[b + 1] + lrGyi * xr - lrGyr * xi;
+          FdXrePlane[xPos] := FdXrePlane[xPos] + gyr * wr + gyi * wi;
+          FdXimPlane[xPos] := FdXimPlane[xPos] - gyr * wi + gyi * wr;
           Inc(b, OutStride);
+          Inc(wPos);
+          Inc(xPos);
         end;
-        // Input-spectrum gradient (sum over co):
-        //   dXre[ci] +=  gyr*Wr[ci] + gyi*Wi[ci]
-        //   dXim[ci] += -gyr*Wi[ci] + gyi*Wr[ci]
-        TNNetVolume.MulAdd(@FdXrePlane[xBaseIdx], @FWrPlane[wBaseIdx], gyr, FInDepth);
-        TNNetVolume.MulAdd(@FdXrePlane[xBaseIdx], @FWiPlane[wBaseIdx], gyi, FInDepth);
-        TNNetVolume.MulAdd(@FdXimPlane[xBaseIdx], @FWiPlane[wBaseIdx], -gyr, FInDepth);
-        TNNetVolume.MulAdd(@FdXimPlane[xBaseIdx], @FWrPlane[wBaseIdx], gyi, FInDepth);
       end;
   end;
 
@@ -86754,8 +86753,8 @@ begin
     begin
       // Only the truncated part stays zero: the kept mode block is overwritten
       // right below (#13: FillChar per row).
-      for ix := 0 to ModesXM1 do
-        if TailBytes > 0 then
+      if TailBytes > 0 then               // #20: loop-invariant, tested once
+        for ix := 0 to ModesXM1 do
         begin
           FillChar(FGreBuf[ix][FModesY], TailBytes, 0);
           FillChar(FGimBuf[ix][FModesY], TailBytes, 0);
