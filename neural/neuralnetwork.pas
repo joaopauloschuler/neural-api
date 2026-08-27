@@ -85716,6 +85716,20 @@ begin
   Result := j;
 end;
 
+// Splits the sample range [0, nM1] for one neighbour offset. Only the |off|
+// samples at each edge can leave the band, so [MidLoPos, MidMaxPos] is the
+// interior where the reflection is provably the identity and the index is a
+// plain i + off. The clamps keep the three ranges a partition of [0, nM1] for
+// any offset, including one wider than the band.
+procedure DWT1DSplitRange(off, nM1: integer;
+  out MidLoPos, MidMaxPos: integer); {$IFDEF Release} inline; {$ENDIF}
+begin
+  if off < 0 then MidLoPos := -off else MidLoPos := 0;
+  if MidLoPos > nM1 + 1 then MidLoPos := nM1 + 1;
+  if off > 0 then MidMaxPos := nM1 - off else MidMaxPos := nM1;
+  if MidMaxPos < MidLoPos - 1 then MidMaxPos := MidLoPos - 1;
+end;
+
 constructor TNNetDWT1D.Create(pFilter: integer; pLearnable: boolean = false);
 begin
   inherited Create();
@@ -85869,8 +85883,9 @@ end;
 // each length FHalf. Walks the step list in order.
 procedure TNNetDWT1D.ForwardLift(var s, d: array of Double);
 var
-  st, t, i, jj, off: integer;
+  st, t, i, off: integer;
   StepKindMax, HalfM1, TapMaxSt, tapBase: integer;
+  MidLoPos, MidMaxPos, HeadMaxPos, TailLoPos: integer;
   tap: Double;
   offRow: {$IFDEF FPC}array of integer{$ELSE} TNeuralIntegerArray {$ENDIF};
 begin
@@ -85886,20 +85901,23 @@ begin
     // App. E: a predict step reads only s and writes only d (an update step, the
     // other way round), so the tap loop moves outside the sample loop. The tap
     // value and its offset are then fetched once per tap instead of once per
-    // (tap, sample), and the reflection collapses to a range test that fails
-    // only at the two edges.
+    // (tap, sample), and the sample loop splits on the offset (#20) so the
+    // interior runs contiguously with no reflection test at all.
     if FStepKind[st] = 0 then
       // predict: d[i] -= sum_t tap[t] * s[i + off[t]]
       for t := 0 to TapMaxSt do
       begin
         tap := GetTap(tapBase + t);
         off := offRow[t];
-        for i := 0 to HalfM1 do
-        begin
-          jj := i + off;
-          if (jj < 0) or (jj > HalfM1) then jj := DWT1DReflect(jj, FHalf);
-          d[i] := d[i] - tap * s[jj];
-        end;
+        DWT1DSplitRange(off, HalfM1, MidLoPos, MidMaxPos);
+        HeadMaxPos := MidLoPos - 1;
+        TailLoPos := MidMaxPos + 1;
+        for i := 0 to HeadMaxPos do
+          d[i] := d[i] - tap * s[DWT1DReflect(i + off, FHalf)];
+        for i := MidLoPos to MidMaxPos do
+          d[i] := d[i] - tap * s[i + off];
+        for i := TailLoPos to HalfM1 do
+          d[i] := d[i] - tap * s[DWT1DReflect(i + off, FHalf)];
       end
     else
       // update: s[i] += sum_t tap[t] * d[i + off[t]]
@@ -85907,12 +85925,15 @@ begin
       begin
         tap := GetTap(tapBase + t);
         off := offRow[t];
-        for i := 0 to HalfM1 do
-        begin
-          jj := i + off;
-          if (jj < 0) or (jj > HalfM1) then jj := DWT1DReflect(jj, FHalf);
-          s[i] := s[i] + tap * d[jj];
-        end;
+        DWT1DSplitRange(off, HalfM1, MidLoPos, MidMaxPos);
+        HeadMaxPos := MidLoPos - 1;
+        TailLoPos := MidMaxPos + 1;
+        for i := 0 to HeadMaxPos do
+          s[i] := s[i] + tap * d[DWT1DReflect(i + off, FHalf)];
+        for i := MidLoPos to MidMaxPos do
+          s[i] := s[i] + tap * d[i + off];
+        for i := TailLoPos to HalfM1 do
+          s[i] := s[i] + tap * d[DWT1DReflect(i + off, FHalf)];
       end;
   end;
   // final band scaling
@@ -85928,8 +85949,9 @@ end;
 // predict/update sign flipped. Invertibility holds for ANY tap values.
 procedure TNNetDWT1D.InverseChannel(const s, d: array of Double; var x: array of Double);
 var
-  st, t, i, jj, off, pos: integer;
+  st, t, i, off, pos: integer;
   HalfM1, TapMaxSt, StepKindM1, tapBase: integer;
+  MidLoPos, MidMaxPos, HeadMaxPos, TailLoPos: integer;
   tap: Double;
   offRow: {$IFDEF FPC}array of integer{$ELSE} TNeuralIntegerArray {$ENDIF};
 begin
@@ -85953,20 +85975,23 @@ begin
     tapBase := FStepTapOfs[st];
     offRow := FStepOffs[st];
     // App. E, as in ForwardLift: each step reads one band and writes the other,
-    // so the tap loop moves outside and the tap/offset lookups leave the sample
-    // loop.
+    // so the tap loop moves outside, the tap/offset lookups leave the sample
+    // loop, and the sample loop splits on the offset (#20).
     if FStepKind[st] = 0 then
       // inverse of predict: d[i] += sum_t tap[t] * s[i + off[t]]
       for t := 0 to TapMaxSt do
       begin
         tap := GetTap(tapBase + t);
         off := offRow[t];
-        for i := 0 to HalfM1 do
-        begin
-          jj := i + off;
-          if (jj < 0) or (jj > HalfM1) then jj := DWT1DReflect(jj, FHalf);
-          FIldBuf[i] := FIldBuf[i] + tap * FIlsBuf[jj];
-        end;
+        DWT1DSplitRange(off, HalfM1, MidLoPos, MidMaxPos);
+        HeadMaxPos := MidLoPos - 1;
+        TailLoPos := MidMaxPos + 1;
+        for i := 0 to HeadMaxPos do
+          FIldBuf[i] := FIldBuf[i] + tap * FIlsBuf[DWT1DReflect(i + off, FHalf)];
+        for i := MidLoPos to MidMaxPos do
+          FIldBuf[i] := FIldBuf[i] + tap * FIlsBuf[i + off];
+        for i := TailLoPos to HalfM1 do
+          FIldBuf[i] := FIldBuf[i] + tap * FIlsBuf[DWT1DReflect(i + off, FHalf)];
       end
     else
       // inverse of update: s[i] -= sum_t tap[t] * d[i + off[t]]
@@ -85974,12 +85999,15 @@ begin
       begin
         tap := GetTap(tapBase + t);
         off := offRow[t];
-        for i := 0 to HalfM1 do
-        begin
-          jj := i + off;
-          if (jj < 0) or (jj > HalfM1) then jj := DWT1DReflect(jj, FHalf);
-          FIlsBuf[i] := FIlsBuf[i] - tap * FIldBuf[jj];
-        end;
+        DWT1DSplitRange(off, HalfM1, MidLoPos, MidMaxPos);
+        HeadMaxPos := MidLoPos - 1;
+        TailLoPos := MidMaxPos + 1;
+        for i := 0 to HeadMaxPos do
+          FIlsBuf[i] := FIlsBuf[i] - tap * FIldBuf[DWT1DReflect(i + off, FHalf)];
+        for i := MidLoPos to MidMaxPos do
+          FIlsBuf[i] := FIlsBuf[i] - tap * FIldBuf[i + off];
+        for i := TailLoPos to HalfM1 do
+          FIlsBuf[i] := FIlsBuf[i] - tap * FIldBuf[DWT1DReflect(i + off, FHalf)];
       end;
   end;
   // merge even/odd back into x (length FExtLen)
@@ -86149,6 +86177,7 @@ procedure TNNetDWT1D.BackpropagateCPU();
 var
   c, i, st, t, jj, off, pos: integer;
   DepthM1, HalfM1, StepKindMax, TapMaxSt, tapBase: integer;
+  MidLoPos, MidMaxPos, HeadMaxPos, TailLoPos: integer;
   TwoDepth, PadIdx, HalfBytes: integer;
   PrevOut, LocalPrevError, W, WDelta: TNNetVolume;
   tap, g, dsum: Double;
@@ -86197,24 +86226,30 @@ begin
         begin
           tap := GetTap(tapBase + t);
           off := offRow[t];
-          for i := 0 to HalfM1 do
-          begin
-            jj := i + off;
-            if (jj < 0) or (jj > HalfM1) then jj := DWT1DReflect(jj, FHalf);
-            FdFBuf[i] := FdFBuf[i] - tap * FsFBuf[jj];
-          end;
+          DWT1DSplitRange(off, HalfM1, MidLoPos, MidMaxPos);
+          HeadMaxPos := MidLoPos - 1;
+          TailLoPos := MidMaxPos + 1;
+          for i := 0 to HeadMaxPos do
+            FdFBuf[i] := FdFBuf[i] - tap * FsFBuf[DWT1DReflect(i + off, FHalf)];
+          for i := MidLoPos to MidMaxPos do
+            FdFBuf[i] := FdFBuf[i] - tap * FsFBuf[i + off];
+          for i := TailLoPos to HalfM1 do
+            FdFBuf[i] := FdFBuf[i] - tap * FsFBuf[DWT1DReflect(i + off, FHalf)];
         end
       else
         for t := 0 to TapMaxSt do
         begin
           tap := GetTap(tapBase + t);
           off := offRow[t];
-          for i := 0 to HalfM1 do
-          begin
-            jj := i + off;
-            if (jj < 0) or (jj > HalfM1) then jj := DWT1DReflect(jj, FHalf);
-            FsFBuf[i] := FsFBuf[i] + tap * FdFBuf[jj];
-          end;
+          DWT1DSplitRange(off, HalfM1, MidLoPos, MidMaxPos);
+          HeadMaxPos := MidLoPos - 1;
+          TailLoPos := MidMaxPos + 1;
+          for i := 0 to HeadMaxPos do
+            FsFBuf[i] := FsFBuf[i] + tap * FdFBuf[DWT1DReflect(i + off, FHalf)];
+          for i := MidLoPos to MidMaxPos do
+            FsFBuf[i] := FsFBuf[i] + tap * FdFBuf[i + off];
+          for i := TailLoPos to HalfM1 do
+            FsFBuf[i] := FsFBuf[i] + tap * FdFBuf[DWT1DReflect(i + off, FHalf)];
         end;
     end;
 
@@ -86245,11 +86280,29 @@ begin
         begin
           tap := GetTap(tapBase + t);
           off := offRow[t];
+          // #20: the three ranges are walked in ascending i, so both the gs
+          // scatter and the dsum accumulation keep their original order.
+          DWT1DSplitRange(off, HalfM1, MidLoPos, MidMaxPos);
+          HeadMaxPos := MidLoPos - 1;
+          TailLoPos := MidMaxPos + 1;
           dsum := 0;
-          for i := 0 to HalfM1 do
+          for i := 0 to HeadMaxPos do
+          begin
+            jj := DWT1DReflect(i + off, FHalf);
+            g := FgdBuf[i];
+            FgsBuf[jj] := FgsBuf[jj] - g * tap;
+            dsum := dsum + g * histRow[jj];
+          end;
+          for i := MidLoPos to MidMaxPos do
           begin
             jj := i + off;
-            if (jj < 0) or (jj > HalfM1) then jj := DWT1DReflect(jj, FHalf);
+            g := FgdBuf[i];
+            FgsBuf[jj] := FgsBuf[jj] - g * tap;
+            dsum := dsum + g * histRow[jj];
+          end;
+          for i := TailLoPos to HalfM1 do
+          begin
+            jj := DWT1DReflect(i + off, FHalf);
             g := FgdBuf[i];
             FgsBuf[jj] := FgsBuf[jj] - g * tap;
             dsum := dsum + g * histRow[jj];
@@ -86267,11 +86320,27 @@ begin
         begin
           tap := GetTap(tapBase + t);
           off := offRow[t];
+          DWT1DSplitRange(off, HalfM1, MidLoPos, MidMaxPos);
+          HeadMaxPos := MidLoPos - 1;
+          TailLoPos := MidMaxPos + 1;
           dsum := 0;
-          for i := 0 to HalfM1 do
+          for i := 0 to HeadMaxPos do
+          begin
+            jj := DWT1DReflect(i + off, FHalf);
+            g := FgsBuf[i];
+            FgdBuf[jj] := FgdBuf[jj] + g * tap;
+            dsum := dsum + g * histRow[jj];
+          end;
+          for i := MidLoPos to MidMaxPos do
           begin
             jj := i + off;
-            if (jj < 0) or (jj > HalfM1) then jj := DWT1DReflect(jj, FHalf);
+            g := FgsBuf[i];
+            FgdBuf[jj] := FgdBuf[jj] + g * tap;
+            dsum := dsum + g * histRow[jj];
+          end;
+          for i := TailLoPos to HalfM1 do
+          begin
+            jj := DWT1DReflect(i + off, FHalf);
             g := FgsBuf[i];
             FgdBuf[jj] := FgdBuf[jj] + g * tap;
             dsum := dsum + g * histRow[jj];
