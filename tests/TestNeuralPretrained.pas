@@ -302,6 +302,7 @@ type
     procedure TestCohere2LogitParity;
     procedure TestPhiConfigFromJSONFile;
     procedure TestPhiLogitParity;
+    procedure TestHoistedRoPEUnfusedLogitParity;
     procedure TestPhi3LogitParity;
     procedure TestPhi3LongRoPELogitParity;
     procedure TestPhi3LongRoPEFullRotaryLogitParity;
@@ -10917,6 +10918,7 @@ procedure TTestNeuralPretrained.TestGPTJLogitParity;
 var
   NN: TNNet;
   Config: TGPTJConfig;
+  LayerCnt, SDPACnt, FusedCnt, RoPECnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildGPTJFromSafeTensorsEx(
@@ -10930,6 +10932,24 @@ begin
     AssertEquals('rotary_dim', 4, Config.RotaryDim);
     AssertFalse('untied', Config.TieWordEmbeddings);
     AssertEquals('prefix', 'transformer.', Config.Prefix);
+    // The partial rotary is hoisted into ONE head-tiled layer per q/k
+    // projection, so nothing per-head survives and every block collapses to
+    // a single fused attention layer.
+    SDPACnt := 0;
+    FusedCnt := 0;
+    RoPECnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+        Inc(SDPACnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then Inc(FusedCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetRotaryEmbedding then
+        Inc(RoPECnt);
+    end;
+    AssertEquals('one fused attention per block', Config.NumLayers, FusedCnt);
+    AssertEquals('no per-head SDPA survives the fusion', 0, SDPACnt);
+    AssertEquals('hoisted RoPE (q/k per block)', 2 * Config.NumLayers,
+      RoPECnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_gptj_logits.json'), Config.MaxPositions,
       Config.VocabSize);
@@ -11213,7 +11233,7 @@ procedure TTestNeuralPretrained.TestCohere2LogitParity;
 var
   NN: TNNet;
   Config: TCohereConfig;
-  LayerCnt, SDPACnt, RoPECnt: integer;
+  LayerCnt, SDPACnt, FusedCnt, RoPECnt: integer;
   SDPA: TNNetScaledDotProductAttention;
 begin
   RandSeed := 424242;
@@ -11230,29 +11250,34 @@ begin
     AssertEquals('sliding_window_pattern', 4, Config.SlidingWindowPattern);
     AssertEquals('logit_scale', 0.0625, Config.LogitScale, 1e-9);
     // layers 0,1,2 local (Window=4) + RoPE; layer 3 global (Window=0) NoPE.
-    // RoPE layers: q+k per local layer = (2 q + 1 kv) per layer x 3 local
-    // layers = 9 TNNetRotaryEmbedding; the global layer has NONE.
+    // With no qk_norm nothing per-head survives the projection, so RoPE is
+    // hoisted (ONE head-tiled layer per q/k projection: 2 x 3 local layers =
+    // 6, the global layer none) and every block collapses to ONE fused
+    // attention layer carrying its own window.
     SDPACnt := 0;
+    FusedCnt := 0;
     RoPECnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
       if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+        Inc(SDPACnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then
       begin
         SDPA := TNNetScaledDotProductAttention(NN.Layers[LayerCnt]);
-        if SDPACnt < 3 * Config.NumHeads then
-          AssertEquals('local SDPA head ' + IntToStr(SDPACnt) +
+        if FusedCnt < 3 then
+          AssertEquals('local block ' + IntToStr(FusedCnt) +
             ' window', 4, SDPA.Window)
         else
-          AssertEquals('global SDPA head ' + IntToStr(SDPACnt) +
+          AssertEquals('global block ' + IntToStr(FusedCnt) +
             ' window (full)', 0, SDPA.Window);
-        Inc(SDPACnt);
+        Inc(FusedCnt);
       end;
       if NN.Layers[LayerCnt].ClassType = TNNetRotaryEmbedding then
         Inc(RoPECnt);
     end;
-    AssertEquals('SDPA heads (4 layers x 2 q heads)', 8, SDPACnt);
-    AssertEquals('RoPE layers (3 local x (2 q + 1 kv); global NoPE)', 9,
-      RoPECnt);
+    AssertEquals('one fused attention per block', 4, FusedCnt);
+    AssertEquals('no per-head SDPA survives the fusion', 0, SDPACnt);
+    AssertEquals('hoisted RoPE (3 local x q/k; global NoPE)', 6, RoPECnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_cohere2_logits.json'), Config.MaxPositions,
       Config.VocabSize);
@@ -11300,6 +11325,7 @@ procedure TTestNeuralPretrained.TestPhiLogitParity;
 var
   NN: TNNet;
   Config: TPhiConfig;
+  LayerCnt, SDPACnt, FusedCnt, RoPECnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildPhiFromSafeTensorsEx(
@@ -11314,10 +11340,107 @@ begin
       Config.PartialRotaryFactor, 1e-9);
     AssertFalse('untied', Config.TieWordEmbeddings);
     AssertEquals('prefix', 'model.', Config.Prefix);
+    // No rope_scaling: the partial rotary hoists into ONE head-tiled layer
+    // per q/k projection and every block collapses to one fused attention.
+    SDPACnt := 0;
+    FusedCnt := 0;
+    RoPECnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+        Inc(SDPACnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then Inc(FusedCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetRotaryEmbedding then
+        Inc(RoPECnt);
+    end;
+    AssertEquals('one fused attention per block', Config.NumLayers, FusedCnt);
+    AssertEquals('no per-head SDPA survives the fusion', 0, SDPACnt);
+    AssertEquals('hoisted RoPE (q/k per block)', 2 * Config.NumLayers,
+      RoPECnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_phi_logits.json'), Config.MaxPositions,
       Config.VocabSize);
   finally
+    NN.Free;
+  end;
+end;
+
+// The three families whose RoPE is now hoisted ahead of the head split
+// (cohere2, GPT-J, Phi) must reproduce the same float64 HF logits with the
+// fused attention layer switched OFF - the per-head forest then reads the
+// ALREADY-rotated projections, so it must cut plain head slices and rotate
+// nothing a second time. Counting the rotary layers pins that: a per-head
+// re-rotation would multiply them by the head count.
+procedure TTestNeuralPretrained.TestHoistedRoPEUnfusedLogitParity;
+var
+  NN: TNNet;
+  CohereConfig: TCohereConfig;
+  GPTJConfig: TGPTJConfig;
+  PhiConfig: TPhiConfig;
+  SDPACnt, FusedCnt, RoPECnt: integer;
+
+  procedure CountAttentionLayers();
+  var
+    i: integer;
+  begin
+    SDPACnt := 0;
+    FusedCnt := 0;
+    RoPECnt := 0;
+    for i := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[i].ClassType = TNNetScaledDotProductAttention then
+        Inc(SDPACnt);
+      if NN.Layers[i].ClassType = TNNetFusedSDPA then Inc(FusedCnt);
+      if NN.Layers[i].ClassType = TNNetRotaryEmbedding then Inc(RoPECnt);
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NeuralAllowFusedAttention := false;
+  NN := nil;
+  try
+    NN := BuildCohereFromSafeTensorsEx(
+      FixturePath('tiny_cohere2.safetensors'),
+      CohereConfig, {SeqLen=}0, {pTrainable=}true,
+      FixturePath('tiny_cohere2_config.json'));
+    CountAttentionLayers();
+    AssertEquals('cohere2 unfused per-head SDPA', 8, SDPACnt);
+    AssertEquals('cohere2 no fused layer', 0, FusedCnt);
+    AssertEquals('cohere2 hoisted RoPE (3 local x q/k)', 6, RoPECnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_cohere2_logits.json'), CohereConfig.MaxPositions,
+      CohereConfig.VocabSize);
+    FreeAndNil(NN);
+    NN := BuildGPTJFromSafeTensorsEx(
+      FixturePath('tiny_gptj.safetensors'),
+      GPTJConfig, {SeqLen=}0, {pTrainable=}true,
+      FixturePath('tiny_gptj_config.json'));
+    CountAttentionLayers();
+    AssertEquals('gptj unfused per-head SDPA',
+      GPTJConfig.NumLayers * GPTJConfig.NumHeads, SDPACnt);
+    AssertEquals('gptj no fused layer', 0, FusedCnt);
+    AssertEquals('gptj hoisted RoPE (q/k per block)',
+      2 * GPTJConfig.NumLayers, RoPECnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gptj_logits.json'), GPTJConfig.MaxPositions,
+      GPTJConfig.VocabSize);
+    FreeAndNil(NN);
+    NN := BuildPhiFromSafeTensorsEx(
+      FixturePath('tiny_phi.safetensors'),
+      PhiConfig, {SeqLen=}0, {pTrainable=}true,
+      FixturePath('tiny_phi_config.json'));
+    CountAttentionLayers();
+    AssertEquals('phi unfused per-head SDPA',
+      PhiConfig.NumLayers * PhiConfig.NumHeads, SDPACnt);
+    AssertEquals('phi no fused layer', 0, FusedCnt);
+    AssertEquals('phi hoisted RoPE (q/k per block)',
+      2 * PhiConfig.NumLayers, RoPECnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_phi_logits.json'), PhiConfig.MaxPositions,
+      PhiConfig.VocabSize);
+  finally
+    NeuralAllowFusedAttention := true;
     NN.Free;
   end;
 end;

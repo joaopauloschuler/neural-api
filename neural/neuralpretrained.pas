@@ -344,8 +344,10 @@ unit neuralpretrained;
 //
 // 2. PARTIAL rotary with the INTERLEAVED (GPT-J) pair layout: only the
 //    FIRST rotary_dim channels of each Q/K head get RoPE (64 of head_dim
-//    256 for GPT-J-6B), wired per head as the same SplitChannels ->
-//    TNNetRotaryEmbedding -> re-concat split the GPT-NeoX path uses. But
+//    256 for GPT-J-6B), wired as ONE head-tiled TNNetRotaryEmbedding over
+//    the whole q/k projection (pRotaryHeadDim/pRotaryTileDims: the
+//    pass-through pairs carry a zero angle, an exact identity), so the head
+//    split happens once, inside the attention layer. But
 //    GPT-J pairs channels (0,1),(2,3),... - rotate_every_two, exactly
 //    TNNetRotaryEmbedding's native even/odd layout - so unlike
 //    gpt_neox/llama there is NO rotate_half row permutation at weight-load
@@ -382,9 +384,11 @@ unit neuralpretrained;
 //   TNNetRotaryEmbedding's interleaved even/odd layout - the same
 //   permutation the gpt_neox path composes into its fused slab, here
 //   applied to the separate q_proj/k_proj matrices (and their biases) by
-//   LoadPhiPartialRotaryLinearWeights. The rotary slice feeds a
-//   depth-rotary_ndims TNNetRotaryEmbedding, so the frequency schedule
-//   theta^(-2k/rotary_ndims) matches HF's inv_freq exactly.
+//   LoadPhiPartialRotaryLinearWeights. ONE head-tiled TNNetRotaryEmbedding
+//   covers the whole q/k projection (pRotaryHeadDim/pRotaryTileDims), so the
+//   frequency schedule theta^(-2k/rotary_ndims) matches HF's inv_freq
+//   exactly. A LongRoPE rope_scaling keeps the per-head split/concat wiring
+//   (CreateLongRoPE carries no head dim).
 //
 // Attention is standard scaled (1/sqrt(head_dim)). hidden_act is
 // "gelu_new" (the tanh TNNetGELU) in every released Phi config; the exact
@@ -22534,18 +22538,16 @@ function BuildGPTJFromSafeTensorsWithConfig(const FileName: string;
   var Config: TGPTJConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
 var
-  ReaderMax, chBase: integer;
+  ReaderMax: integer;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Blocks: array of TGPTJBlockLayers;
   EmbeddingLayer, FinalLN, LMHead: TNNetLayer;
   BranchInput, SharedLN, AttnOut, MlpOut: TNNetLayer;
-  RotSlice, PassSlice, QHead, KHead, VHead, HeadPack: TNNetLayer;
+  QHead, KHead: TNNetLayer;
   GELUSource, PhiBranch: TNNetLayer;
-  HeadOutputs: array of TNNetLayer;
-  RotChannels, PassChannels, VChannels: array of integer;
-  BlockCnt, SeqLen, HeadCnt, HeadDim, i, d: integer;
-  BlockMax, HeadMax, RotMax, PassMax, HeadDimM1: integer;
+  BlockCnt, SeqLen, HeadDim, RotaryTileDims, i, d: integer;
+  BlockMax: integer;
   Tmp: TNNetVolume;
   BlockPrefix, AttnPrefix, TensorNameStr: string;
   Consumed: TStringList;
@@ -22639,15 +22641,11 @@ begin
       if not pTrainable then NN.SetTrainable();
       if pQuantizeInt8 then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
-      SetLength(HeadOutputs, Config.NumHeads);
-      SetLength(RotChannels, Config.RotaryDim);
-      SetLength(PassChannels, HeadDim - Config.RotaryDim);
-      SetLength(VChannels, HeadDim);
       BlockMax := Config.NumLayers - 1;
-      HeadMax := Config.NumHeads - 1;
-      RotMax := Config.RotaryDim - 1;
-      PassMax := HeadDim - Config.RotaryDim - 1;
-      HeadDimM1 := HeadDim - 1;
+      // 0 = rotate the whole head (rotary_dim = head_dim carries no
+      // pass-through tail).
+      if Config.RotaryDim < HeadDim then RotaryTileDims := Config.RotaryDim
+      else RotaryTileDims := 0;
       for BlockCnt := 0 to BlockMax do
       begin
         // SHARED-LN PARALLEL residual: ONE LayerNorm (ln_1) feeds BOTH the
@@ -22665,65 +22663,28 @@ begin
           TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), SharedLN);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), SharedLN);
-        for HeadCnt := 0 to HeadMax do
-        begin
-          // PARTIAL ROTARY per head: RoPE on the first rotary_dim channels
-          // of the Q and K head, pass-through on the rest. GPT-J pairs the
-          // rotary channels INTERLEAVED - (0,1),(2,3),... - which is
-          // TNNetRotaryEmbedding's native layout, so the projection rows
-          // were loaded STRAIGHT (no rotate_half permutation; see the
-          // unit header). The rotary slice feeds a depth-rotary_dim
-          // TNNetRotaryEmbedding, so the layer's frequency schedule
-          // theta^(-2k/rotary_dim) matches HF's inv_freq exactly.
-          chBase := HeadCnt * HeadDim;
-          for d := 0 to RotMax do
-            RotChannels[d] := chBase + d;
-          for d := 0 to PassMax do
-            PassChannels[d] := chBase + Config.RotaryDim + d;
-          RotSlice := NN.AddLayerAfter(
-            TNNetSplitChannels.Create(RotChannels),
-            Blocks[BlockCnt].QProj);
-          RotSlice := NN.AddLayerAfter(
-            TNNetRotaryEmbedding.Create(Config.RopeTheta), RotSlice);
-          if HeadDim > Config.RotaryDim then
-          begin
-            PassSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(PassChannels),
-              Blocks[BlockCnt].QProj);
-            QHead := NN.AddLayer(
-              TNNetDeepConcat.Create([RotSlice, PassSlice]) );
-          end
-          else
-            QHead := RotSlice;
-          RotSlice := NN.AddLayerAfter(
-            TNNetSplitChannels.Create(RotChannels),
-            Blocks[BlockCnt].KProj);
-          RotSlice := NN.AddLayerAfter(
-            TNNetRotaryEmbedding.Create(Config.RopeTheta), RotSlice);
-          if HeadDim > Config.RotaryDim then
-          begin
-            PassSlice := NN.AddLayerAfter(
-              TNNetSplitChannels.Create(PassChannels),
-              Blocks[BlockCnt].KProj);
-            KHead := NN.AddLayer(
-              TNNetDeepConcat.Create([RotSlice, PassSlice]) );
-          end
-          else
-            KHead := RotSlice;
-          // V head (one contiguous head_dim-wide slice; never rotated).
-          for d := 0 to HeadDimM1 do
-            VChannels[d] := chBase + d;
-          VHead := NN.AddLayerAfter(
-            TNNetSplitChannels.Create(VChannels), Blocks[BlockCnt].VProj);
-          // Pack [Q_h | K_h | V_h] (width 3*head_dim) for the scaled SDPA
-          // (GPT-J uses the standard 1/sqrt(head_dim) scaling).
-          HeadPack := NN.AddLayer(
-            TNNetDeepConcat.Create([QHead, KHead, VHead]) );
-          HeadOutputs[HeadCnt] := NN.AddLayerAfter(
-            TNNetScaledDotProductAttention.Create(HeadDim,
-              {CausalMask=}true), HeadPack);
-        end;
-        NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        // HOISTED PARTIAL ROTARY: nothing per-head sits between the q/k
+        // projection and the attention math, so ONE head-tiled
+        // TNNetRotaryEmbedding per projection replaces the per-head
+        // [rotary slice -> RoPE | pass-through slice] forest. RotaryTileDims
+        // zeroes the pass-through pairs' theta (a zero angle is an exact
+        // identity), and the frequency schedule denominator stays rotary_dim,
+        // so it matches HF's inv_freq exactly. GPT-J pairs the rotary channels
+        // INTERLEAVED - (0,1),(2,3),... - TNNetRotaryEmbedding's native
+        // layout, so the projection rows were loaded STRAIGHT (no rotate_half
+        // permutation; see the unit header).
+        QHead := NN.AddLayerAfter( TNNetRotaryEmbedding.Create(
+          Config.RopeTheta, rsmNone, 1.0, 0, 1.0, 32.0, 0.0, true,
+          {pRotaryHeadDim=}HeadDim, {pRotaryTileDims=}RotaryTileDims),
+          Blocks[BlockCnt].QProj);
+        KHead := NN.AddLayerAfter( TNNetRotaryEmbedding.Create(
+          Config.RopeTheta, rsmNone, 1.0, 0, 1.0, 32.0, 0.0, true,
+          {pRotaryHeadDim=}HeadDim, {pRotaryTileDims=}RotaryTileDims),
+          Blocks[BlockCnt].KProj);
+        // GPT-J is plain MHA (one KV head per query head) with the standard
+        // 1/sqrt(head_dim) scaling; V is never rotated.
+        NN.AddGQAAttentionFromSources(QHead, KHead, Blocks[BlockCnt].VProj,
+          Config.NumHeads, Config.NumHeads, HeadDim, {CausalMask=}true);
         Blocks[BlockCnt].OutProj := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         AttnOut := NN.GetLastLayer();
@@ -23124,14 +23085,14 @@ var
   Blocks: array of TCohereBlockLayers;
   EmbeddingLayer, FinalLN, LMHead: TNNetLayer;
   BranchInput, SharedLN, AttnOut, MlpOut: TNNetLayer;
-  QSlice, KSlice, VSlice, HeadPack: TNNetLayer;
+  QSlice, KSlice, VSlice, HeadPack, QSource, KSource: TNNetLayer;
   KRotated, VSlices: array of TNNetLayer;
   HeadOutputs: array of TNNetLayer;
   SliceChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, KVHeadCnt, KVGroup, GroupSize: integer;
   HeadDim, QWidth, KVWidth, i, j, d: integer;
   BlockMax, KVHeadMax, HeadMax, HeadDimM1, VocabM1: integer;
-  LayerIsLocal: boolean;
+  LayerIsLocal, LayerApplyRoPE, HoistRoPE: boolean;
   LayerWindow: integer;
   Tmp, WVTied: TNNetVolume;
   TiedBase, HiddenBytes: integer;
@@ -23286,12 +23247,39 @@ begin
         end;
         // RoPE iff this layer is rotary: cohere = always, cohere2 = only
         // the sliding layers (global layers are NoPE).
+        LayerApplyRoPE := (Config.SlidingWindowPattern = 0) or LayerIsLocal;
+        // cohere2 (use_qk_norm=false) has NOTHING per-head between the q/k
+        // projection and the attention math, so RoPE hoists to ONE head-tiled
+        // layer per projection (same schedule tiled across the width, so
+        // bit-identical) and the head forest collapses into the fused path.
+        // cohere's PER-HEAD q_norm/k_norm precedes RoPE and has no tiled
+        // LayerNorm kernel, so that variant keeps the per-head wiring.
+        HoistRoPE := not Config.UseQKNorm;
+        if HoistRoPE then
+        begin
+          QSource := Blocks[BlockCnt].QProj;
+          KSource := Blocks[BlockCnt].KProj;
+          if LayerApplyRoPE then
+          begin
+            QSource := NN.AddLayerAfter( TNNetRotaryEmbedding.Create(
+              Config.RopeTheta, rsmNone, 1.0, 0, 1.0, 32.0, 0.0, true,
+              {pRotaryHeadDim=}HeadDim), QSource);
+            KSource := NN.AddLayerAfter( TNNetRotaryEmbedding.Create(
+              Config.RopeTheta, rsmNone, 1.0, 0, 1.0, 32.0, 0.0, true,
+              {pRotaryHeadDim=}HeadDim), KSource);
+          end;
+          // Standard 1/sqrt(head_dim) scaling; LayerWindow>0 bands the mask.
+          NN.AddGQAAttentionFromSources(QSource, KSource,
+            Blocks[BlockCnt].VProj, Config.NumHeads, Config.NumKVHeads,
+            HeadDim, {CausalMask=}true, {Window=}LayerWindow);
+        end
+        else
+        begin
         // Build each KV head once (rotated/normed), shared across its group.
         for KVHeadCnt := 0 to KVHeadMax do
         begin
           KRotated[KVHeadCnt] := BuildQKHead(Blocks[BlockCnt].KProj,
-            KVHeadCnt, {IsQuery=}false,
-            {ApplyRoPE=}(Config.SlidingWindowPattern = 0) or LayerIsLocal);
+            KVHeadCnt, {IsQuery=}false, {ApplyRoPE=}LayerApplyRoPE);
           chBase := KVHeadCnt * HeadDim;
           for d := 0 to HeadDimM1 do
             SliceChannels[d] := chBase + d;
@@ -23302,8 +23290,7 @@ begin
         begin
           KVGroup := HeadCnt div GroupSize;
           QSlice := BuildQKHead(Blocks[BlockCnt].QProj, HeadCnt,
-            {IsQuery=}true,
-            {ApplyRoPE=}(Config.SlidingWindowPattern = 0) or LayerIsLocal);
+            {IsQuery=}true, {ApplyRoPE=}LayerApplyRoPE);
           // Pack [Q_h | K_group | V_group] for SDPA (standard
           // 1/sqrt(head_dim) scaling). LayerWindow>0 bands the causal mask.
           HeadPack := NN.AddLayer( TNNetDeepConcat.Create(
@@ -23313,6 +23300,7 @@ begin
               {pWindow=}LayerWindow), HeadPack);
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        end;
         Blocks[BlockCnt].OProj := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         AttnOut := NN.GetLastLayer();
@@ -23715,7 +23703,8 @@ var
   HeadOutputs: array of TNNetLayer;
   RotChannels, PassChannels, VChannels: array of integer;
   BlockCnt, SeqLen, HeadCnt, HeadDim, RotaryDims, i, d: integer;
-  BlockMax, HeadMax, RotMax, PassMax, HeadDimM1: integer;
+  BlockMax, HeadMax, RotMax, PassMax, HeadDimM1, RotaryTileDims: integer;
+  HoistRoPE: boolean;
   Tmp: TNNetVolume;
   BlockPrefix, AttnPrefix, TensorNameStr: string;
   Consumed: TStringList;
@@ -23822,6 +23811,19 @@ begin
       RotMax := RotaryDims - 1;
       PassMax := HeadDim - RotaryDims - 1;
       HeadDimM1 := HeadDim - 1;
+      // LongRoPE can NEVER be hoisted: CreateRoPEFromScaling routes it to
+      // CreateLongRoPE, whose signature carries no head dim, so a hoisted
+      // layer would run its frequency schedule over the WHOLE projection
+      // width and silently fall back to an all-ones long_factor table.
+      // A YaRN mscale is rejected for the same reason the partial-rotary
+      // constructor rejects it: it would scale the pass-through channels.
+      HoistRoPE := (Config.RopeScaling.Mode <> rsmLongRoPE) and
+        (not ((Config.RopeScaling.Mode = rsmYaRN) and
+          ((Config.RopeScaling.YarnAttnFactor > 0) or
+           (Config.RopeScaling.Factor > 1))));
+      // 0 = rotate the whole head (partial_rotary_factor = 1).
+      if RotaryDims < HeadDim then RotaryTileDims := RotaryDims
+      else RotaryTileDims := 0;
       for BlockCnt := 0 to BlockMax do
       begin
         // SHARED-LN PARALLEL residual: ONE LayerNorm (input_layernorm)
@@ -23839,6 +23841,30 @@ begin
           TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), SharedLN);
         Blocks[BlockCnt].VProj := NN.AddLayerAfter(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable), SharedLN);
+        if HoistRoPE then
+        begin
+          // HOISTED PARTIAL ROTARY: nothing per-head sits between the q/k
+          // projection and the attention math, so ONE head-tiled
+          // TNNetRotaryEmbedding per projection replaces the per-head
+          // [rotary slice -> RoPE | pass-through slice] forest. The tile
+          // dims zero the pass-through pairs' theta (an exact identity) and
+          // the frequency schedule denominator stays RotaryDims, matching
+          // HF's inv_freq over rotary_ndims.
+          QHead := NN.AddLayerAfter(
+            CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling,
+              {pRotaryHeadDim=}HeadDim, {pRotaryTileDims=}RotaryTileDims),
+            Blocks[BlockCnt].QProj);
+          KHead := NN.AddLayerAfter(
+            CreateRoPEFromScaling(Config.RopeTheta, Config.RopeScaling,
+              {pRotaryHeadDim=}HeadDim, {pRotaryTileDims=}RotaryTileDims),
+            Blocks[BlockCnt].KProj);
+          // Phi is plain MHA (one KV head per query head) with the standard
+          // 1/sqrt(head_dim) scaling; V is never rotated.
+          NN.AddGQAAttentionFromSources(QHead, KHead, Blocks[BlockCnt].VProj,
+            Config.NumHeads, Config.NumHeads, HeadDim, {CausalMask=}true);
+        end
+        else
+        begin
         for HeadCnt := 0 to HeadMax do
         begin
           // PARTIAL ROTARY per head: RoPE on the first RotaryDims channels
@@ -23899,6 +23925,7 @@ begin
               {CausalMask=}true), HeadPack);
         end;
         NN.AddLayer( TNNetDeepConcat.Create(HeadOutputs) );
+        end;
         Blocks[BlockCnt].AttnDense := NN.AddLayer(
           TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
         AttnOut := NN.GetLastLayer();
