@@ -569,6 +569,20 @@ function IsNF4QuantizedTensor(Reader: TNNetSafeTensorsReader;
 procedure LoadNF4QuantizedTensorFlat(Reader: TNNetSafeTensorsReader;
   const WName: string; NumRows, InDim: integer; Dest: TNNetVolume);
 
+// HF nn.Linear [out, in] -> pointwise-linear neuron loader, and the staged
+// whole-slab helper feeding its pSrcSlab (see the implementation comments).
+// Exposed for the staged-vs-streamed slice parity test.
+procedure StageTensorSlabFlat(Reader: TNNetSafeTensorsReader;
+  const WName: string; SrcRows, InDim: integer; Dest: TNNetVolume);
+procedure LoadLlamaLinearWeights(Reader: TNNetSafeTensorsReader;
+  Layer: TNNetLayer; const WName: string; InDim, OutDim: integer;
+  NeuronBase: integer = 0; ExpectedNeurons: integer = -1;
+  RotaryHeadDim: integer = 0; const BiasName: string = '';
+  Scale: TNeuralFloat = 1.0; RotaryDims: integer = 0;
+  SrcRowBase: integer = 0; SrcRows: integer = 0;
+  pFlatSlabRows: boolean = false; pDeferFlush: boolean = false;
+  pSrcSlab: TNNetVolume = nil);
+
 // Opens the checkpoint at FileName with the reader matching its format:
 // a ".bin" extension - or a ".bin.index.json" sharded-checkpoint index
 // (pytorch_model.bin.index.json) - gets the restricted torch.save reader
@@ -14795,6 +14809,20 @@ begin
     EmbeddingJob(0, 1);
 end;
 
+// Materializes the WHOLE [SrcRows, InDim] tensor as one flat FP32 buffer,
+// expanding a packed bitsandbytes NF4 tensor on the way - the same buffer
+// LoadLlamaLinearWeights builds internally when it cannot stream rows. A
+// caller that slices one slab many times stages it once with this and passes
+// it back through that routine's pSrcSlab.
+procedure StageTensorSlabFlat(Reader: TNNetSafeTensorsReader;
+  const WName: string; SrcRows, InDim: integer; Dest: TNNetVolume);
+begin
+  if IsNF4QuantizedTensor(Reader, WName) then
+    LoadNF4QuantizedTensorFlat(Reader, WName, SrcRows, InDim, Dest)
+  else
+    Reader.LoadTensorFlat(WName, Dest);
+end;
+
 // Loads a HF nn.Linear weight [out, in] (bias-free, the Llama convention)
 // into a TNNetPointwiseConvLinear: HF computes y = x . W^T, so output
 // channel j IS row j: Neuron[NeuronBase + j].Weights[i] = W[j*in + i].
@@ -14835,15 +14863,23 @@ end;
 // per-head q_proj slices), only the last one has to rebuild the cache: the
 // caller passes true on the earlier calls and flushes the layer once after
 // the group.
+// pSrcSlab supplies the WHOLE [SrcRows, InDim] tensor already materialized as
+// flat FP32 (StageTensorSlabFlat), so this call slices it from RAM instead of
+// touching the reader. It exists for readers that cannot serve row ranges
+// (packed NF4, the quantized-GGUF and synthetic view readers): those fall back
+// to decoding the entire slab PER SLICE, so a caller taking many slices out of
+// one slab stages it once and hands it here. The rows loaded are byte-identical
+// to the reader path - it is the same buffer that path would have built.
 procedure LoadLlamaLinearWeights(Reader: TNNetSafeTensorsReader;
   Layer: TNNetLayer; const WName: string; InDim, OutDim: integer;
   NeuronBase: integer = 0; ExpectedNeurons: integer = -1;
   RotaryHeadDim: integer = 0; const BiasName: string = '';
   Scale: TNeuralFloat = 1.0; RotaryDims: integer = 0;
   SrcRowBase: integer = 0; SrcRows: integer = 0;
-  pFlatSlabRows: boolean = false; pDeferFlush: boolean = false);
+  pFlatSlabRows: boolean = false; pDeferFlush: boolean = false;
+  pSrcSlab: TNNetVolume = nil);
 var
-  W, B, WV: TNNetVolume;
+  W, B, WV, WSrc: TNNetVolume;
   j, TargetIdx, HalfDim, SrcRow, Base, Row: integer;
   OutDimM1: integer;
   QLayer: TNNetLayerConcatedWeights;
@@ -14950,7 +14986,14 @@ begin
   // rows instead of ~2x the tensor's FP32 bytes. The codes are the ones
   // the FP32 round-trip would produce (a uniform Scale cancels out of the
   // per-row quantization), see TNNetLayerConcatedWeights.ImportInt8QuantRow.
-  DirectInt8 := (QLayer <> nil) and QLayer.WeightsQuantizedInt8 and
+  // A staged slab is only ever supplied for a reader that cannot stream rows,
+  // which is exactly what direct-to-int8 requires - so the two never combine.
+  if (pSrcSlab <> nil) and (pSrcSlab.Size <> SrcRows * InDim) then
+    ImportError('Llama import: internal error - staged slab for "' + WName +
+      '" holds ' + IntToStr(pSrcSlab.Size) + ' elements, expected ' +
+      IntToStr(SrcRows) + ' x ' + IntToStr(InDim) + '.');
+  DirectInt8 := (pSrcSlab = nil) and
+    (QLayer <> nil) and QLayer.WeightsQuantizedInt8 and
     (QLayer.QuantInt8VectorSize = InDim) and
     (not IsNF4QuantizedTensor(Reader, WName)) and
     Reader.CanStreamTensorRows(WName);
@@ -15011,10 +15054,16 @@ begin
       // re-decodes the whole thing. The packed NF4 form has no row view and
       // the synthetic-view readers answer CanStreamTensorRows false, so both
       // fall back to the full load.
-      RowStream := (SrcRows > OutDim) and
+      RowStream := (pSrcSlab = nil) and (SrcRows > OutDim) and
         (not IsNF4QuantizedTensor(Reader, WName)) and
         Reader.CanStreamTensorRows(WName);
-      if RowStream then
+      WSrc := W;
+      if pSrcSlab <> nil then
+      begin
+        WSrc := pSrcSlab;          // the caller staged the whole slab
+        WRowBase := SrcRowBase;
+      end
+      else if RowStream then
       begin
         Reader.LoadTensorRowsFlat(WName, SrcRowBase, OutDim, InDim, W);
         WRowBase := 0;             // W holds the slice, so row j is row j
@@ -15040,7 +15089,7 @@ begin
             ' weights, expected ' + IntToStr(InDim) + '.');
         Base := (WRowBase + j) * InDim;
         WV := Layer.FArrNeurons[TargetIdx].Weights;
-        Move(W.FData[Base], WV.FData[0], InDim * csNeuralFloatSize);
+        Move(WSrc.FData[Base], WV.FData[0], InDim * csNeuralFloatSize);
         if Scale <> 1.0 then TNNetVolume.Mul(WV.GetRawPtr(0), Scale, InDim);
         if B <> nil then
           Layer.FArrNeurons[TargetIdx].BiasWeight := Scale * B.FData[SrcRow]
@@ -16335,6 +16384,7 @@ var
   QHeadCW: TNNetLayerConcatedWeights;
   EmbChunkRows, EmbRowsInChunk: integer;
   EmbFan: TInt8RowChunkFan;
+  QSlab: TNNetVolume;
   Consumed: TStringList;
 
   procedure MarkConsumed(const TName: string);
@@ -17126,24 +17176,41 @@ begin
             //     STRAIGHT (no rotary permutation - the gate multiplies the
             //     attention output, which lives in HF channel order).
             TensorNameStr := BlockPrefix + 'self_attn.q_proj.weight';
-            for d := 0 to NumHeadsM1 do
-            begin
-              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
-                TensorNameStr, Config.HiddenSize, HeadDim,
-                {NeuronBase=}d * HeadDim, {ExpectedNeurons=}2 * QWidth,
-                {RotaryHeadDim=}RotaryHeadDimArg, {BiasName=}'',
-                {Scale=}QProjScale, {RotaryDims=}RotaryDims,
-                {SrcRowBase=}d * 2 * HeadDim, {SrcRows=}2 * QWidth,
-                {pFlatSlabRows=}false, {pDeferFlush=}true);
-              LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
-                TensorNameStr, Config.HiddenSize, HeadDim,
-                {NeuronBase=}QWidth + d * HeadDim,
-                {ExpectedNeurons=}2 * QWidth,
-                {RotaryHeadDim=}0, {BiasName=}'', {Scale=}1.0,
-                {RotaryDims=}0,
-                {SrcRowBase=}d * 2 * HeadDim + HeadDim,
-                {SrcRows=}2 * QWidth,
-                {pFlatSlabRows=}false, {pDeferFlush=}true);
+            // Readers with no row view (packed NF4, quantized GGUF and the
+            // synthetic views) decode the WHOLE slab per slice, which the
+            // 2*NumHeads slices below would turn into 2*NumHeads full decodes
+            // per block. Stage the slab once for those and slice it from RAM;
+            // row-streamable readers keep the per-slice streaming path and
+            // never pay the slab-sized transient.
+            QSlab := nil;
+            try
+              if not Reader.CanStreamTensorRows(TensorNameStr) then
+              begin
+                QSlab := TNNetVolume.Create;
+                StageTensorSlabFlat(Reader, TensorNameStr, 2 * QWidth,
+                  Config.HiddenSize, QSlab);
+              end;
+              for d := 0 to NumHeadsM1 do
+              begin
+                LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+                  TensorNameStr, Config.HiddenSize, HeadDim,
+                  {NeuronBase=}d * HeadDim, {ExpectedNeurons=}2 * QWidth,
+                  {RotaryHeadDim=}RotaryHeadDimArg, {BiasName=}'',
+                  {Scale=}QProjScale, {RotaryDims=}RotaryDims,
+                  {SrcRowBase=}d * 2 * HeadDim, {SrcRows=}2 * QWidth,
+                  {pFlatSlabRows=}false, {pDeferFlush=}true, {pSrcSlab=}QSlab);
+                LoadLlamaLinearWeights(Reader, Blocks[BlockCnt].QProj,
+                  TensorNameStr, Config.HiddenSize, HeadDim,
+                  {NeuronBase=}QWidth + d * HeadDim,
+                  {ExpectedNeurons=}2 * QWidth,
+                  {RotaryHeadDim=}0, {BiasName=}'', {Scale=}1.0,
+                  {RotaryDims=}0,
+                  {SrcRowBase=}d * 2 * HeadDim + HeadDim,
+                  {SrcRows=}2 * QWidth,
+                  {pFlatSlabRows=}false, {pDeferFlush=}true, {pSrcSlab=}QSlab);
+              end;
+            finally
+              QSlab.Free;
             end;
             // Every head slice deferred its cache rebuild: one rebuild here
             // instead of 2*NumHeads full-layer concat/interleave passes.

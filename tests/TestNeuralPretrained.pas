@@ -252,6 +252,7 @@ type
     procedure TestLlama4MoeLogitParity;
     procedure TestQwen3MoeWindowLogitParity;
     procedure TestQwen35LogitParity;
+    procedure TestQwen35QProjStagedSlabSliceParity;
     procedure TestQwen35StreamedDecodeParity;
     procedure TestQwen35StreamedDecodeOpenCLParity;
     procedure TestQwen2StreamedDecodeOpenCLParity;
@@ -8776,6 +8777,102 @@ begin
       FixturePath('tiny_qwen3_5_logits.json'), 16, 13);
   finally
     NN.Free;
+  end;
+end;
+
+// Qwen3.5's double-width q_proj is loaded as 2*NumHeads slices of one slab.
+// Readers with no row view decode the whole slab per slice, so the importer
+// stages it once and slices it from RAM (LoadLlamaLinearWeights' pSrcSlab).
+// That staged slice must produce EXACTLY the weights the row-streamed slice
+// produces - including the per-head rotate_half permutation of the query half
+// and the straight gate half. Both halves of every head are loaded twice here,
+// once each way, into two identical layers and compared bit for bit.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35QProjStagedSlabSliceParity;
+const
+  WName = 'model.language_model.layers.3.self_attn.q_proj.weight';
+  HeadDim = 8;
+  NumHeads = 2;
+  RotaryDims = 2;                    // partial_rotary_factor 0.25 * head_dim
+  QProjScale = 0.75;                 // a non-unit Scale exercises that fold too
+var
+  Reader: TNNetSafeTensorsReader;
+  NNStream, NNStaged: TNNet;
+  LStream, LStaged: TNNetLayer;
+  Slab: TNNetVolume;
+  Hidden, QWidth, SlabRows, d, n, w: integer;
+  MaxNeuronPos, MaxWeightPos: integer;
+
+  // The two calls the importer makes per head: the query half (rotate_half
+  // permuted inside the rotary slice) then the gate half (straight).
+  procedure LoadHeads(Layer: TNNetLayer; Staged: TNNetVolume);
+  var
+    h: integer;
+  begin
+    for h := 0 to NumHeads - 1 do
+    begin
+      LoadLlamaLinearWeights(Reader, Layer, WName, Hidden, HeadDim,
+        {NeuronBase=}h * HeadDim, {ExpectedNeurons=}2 * QWidth,
+        {RotaryHeadDim=}HeadDim, {BiasName=}'',
+        {Scale=}QProjScale, {RotaryDims=}RotaryDims,
+        {SrcRowBase=}h * 2 * HeadDim, {SrcRows=}SlabRows,
+        {pFlatSlabRows=}false, {pDeferFlush=}true, {pSrcSlab=}Staged);
+      LoadLlamaLinearWeights(Reader, Layer, WName, Hidden, HeadDim,
+        {NeuronBase=}QWidth + h * HeadDim, {ExpectedNeurons=}2 * QWidth,
+        {RotaryHeadDim=}0, {BiasName=}'', {Scale=}1.0, {RotaryDims=}0,
+        {SrcRowBase=}h * 2 * HeadDim + HeadDim, {SrcRows=}SlabRows,
+        {pFlatSlabRows=}false, {pDeferFlush=}true, {pSrcSlab=}Staged);
+    end;
+    Layer.FlushWeightCache();
+  end;
+
+begin
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_qwen3_5.safetensors'));
+  NNStream := nil;
+  NNStaged := nil;
+  Slab := nil;
+  try
+    AssertTrue('q_proj present', Reader.HasTensor(WName));
+    // The row-streamed path is the reference, so it must really be available.
+    AssertTrue('fixture rows are streamable', Reader.CanStreamTensorRows(WName));
+    SlabRows := Reader.DimSize(WName, 0);
+    Hidden := Reader.DimSize(WName, 1);
+    AssertEquals('slab rows', 2 * NumHeads * HeadDim, SlabRows);
+    QWidth := NumHeads * HeadDim;
+    NNStream := TNNet.Create;
+    NNStream.AddLayer(TNNetInput.Create(1, 1, Hidden));
+    LStream := NNStream.AddLayer(TNNetPointwiseConvLinear.Create(2 * QWidth));
+    NNStaged := TNNet.Create;
+    NNStaged.AddLayer(TNNetInput.Create(1, 1, Hidden));
+    LStaged := NNStaged.AddLayer(TNNetPointwiseConvLinear.Create(2 * QWidth));
+    LoadHeads(LStream, nil);
+    Slab := TNNetVolume.Create;
+    StageTensorSlabFlat(Reader, WName, SlabRows, Hidden, Slab);
+    AssertEquals('staged slab size', SlabRows * Hidden, Slab.Size);
+    LoadHeads(LStaged, Slab);
+    MaxNeuronPos := LStream.Neurons.Count - 1;
+    MaxWeightPos := Hidden - 1;
+    for n := 0 to MaxNeuronPos do
+    begin
+      AssertEquals('bias of neuron ' + IntToStr(n),
+        LStream.Neurons[n].BiasWeight, LStaged.Neurons[n].BiasWeight);
+      for w := 0 to MaxWeightPos do
+        AssertEquals('neuron ' + IntToStr(n) + ' weight ' + IntToStr(w),
+          LStream.Neurons[n].Weights.FData[w],
+          LStaged.Neurons[n].Weights.FData[w]);
+    end;
+    // Not a self-comparison of two zero layers: the loaded rows carry data.
+    d := 0;
+    for n := 0 to MaxNeuronPos do
+      for w := 0 to MaxWeightPos do
+        if LStaged.Neurons[n].Weights.FData[w] <> 0 then Inc(d);
+    AssertTrue('staged layer holds non-zero weights', d > 0);
+  finally
+    Slab.Free;
+    NNStaged.Free;
+    NNStream.Free;
+    Reader.Free;
   end;
 end;
 
