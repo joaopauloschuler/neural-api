@@ -9082,22 +9082,25 @@ procedure TVolume.FillAtDepth(pDepth: integer; Value: T);
 var
   CntX, CntY: integer;
   MaxX, MaxY: integer;
-  RawPos, RowStride, colPos: integer;
+  RawPos, RowStride, rowPos: integer;
 begin
   MaxX := SizeX - 1;
   MaxY := SizeY - 1;
   RowStride := FSizeX * FDepth; // per-CntY step
 
-  colPos := pDepth; // #12: carried GetRawPos(CntX, 0, pDepth)
-  for CntX := 0 to MaxX do
+  // Y outer, X inner follows storage order: consecutive CntX slots of one
+  // channel are FDepth elements apart, where consecutive CntY slots are a whole
+  // row apart.
+  rowPos := pDepth; // #12: carried GetRawPos(0, CntY, pDepth)
+  for CntY := 0 to MaxY do
   begin
-    RawPos := colPos;
-    for CntY := 0 to MaxY do
+    RawPos := rowPos;
+    for CntX := 0 to MaxX do
     begin
       FData[RawPos] := Value;
-      Inc(RawPos, RowStride);
+      Inc(RawPos, FDepth);
     end;
-    Inc(colPos, FDepth);
+    Inc(rowPos, RowStride);
   end;
 end;
 
@@ -9908,22 +9911,24 @@ function TVolume.SumAtDepth(pDepth: integer): T;
 var
   CntX, CntY: integer;
   MaxX, MaxY: integer;
-  RawPos, RowStride, colPos: integer;
+  RawPos, RowStride, rowPos: integer;
 begin
   MaxX := SizeX - 1;
   MaxY := SizeY - 1;
   RowStride := FSizeX * FDepth; // per-CntY step
   Result := 0;
-  colPos := pDepth; // #12: carried GetRawPos(CntX, 0, pDepth)
-  for CntX := 0 to MaxX do
+  // Y outer, X inner walks the channel in storage order; the sum reassociates,
+  // which this codebase does not require to be bit-identical.
+  rowPos := pDepth; // #12: carried GetRawPos(0, CntY, pDepth)
+  for CntY := 0 to MaxY do
   begin
-    RawPos := colPos;
-    for CntY := 0 to MaxY do
+    RawPos := rowPos;
+    for CntX := 0 to MaxX do
     begin
       Result := Result + FData[RawPos];
-      Inc(RawPos, RowStride);
+      Inc(RawPos, FDepth);
     end;
-    Inc(colPos, FDepth);
+    Inc(rowPos, RowStride);
   end;
 end;
 
@@ -10082,7 +10087,7 @@ var
   CntX, CntY: integer;
   MaxX, MaxY: integer;
   Aux: T;
-  RawPos, RowStride, colPos: integer;
+  RawPos, RowStride, rowPos: integer;
 begin
   MaxX := SizeX - 1;
   MaxY := SizeY - 1;
@@ -10091,20 +10096,21 @@ begin
   pMin := Self.Data[0, 0, pDepth];
   pMax := Self.Data[0, 0, pDepth];
 
-  colPos := pDepth; // #12: carried GetRawPos(CntX, 0, pDepth)
-  for CntX := 0 to MaxX do
+  // Y outer, X inner walks the channel in storage order.
+  rowPos := pDepth; // #12: carried GetRawPos(0, CntY, pDepth)
+  for CntY := 0 to MaxY do
   begin
-    RawPos := colPos;
-    for CntY := 0 to MaxY do
+    RawPos := rowPos;
+    for CntX := 0 to MaxX do
     begin
       Aux := FData[RawPos];
 
       if Aux < pMin
       then pMin := Aux
       else if Aux > pMax then pMax := Aux;
-      Inc(RawPos, RowStride);
+      Inc(RawPos, FDepth);
     end;
-    Inc(colPos, FDepth);
+    Inc(rowPos, RowStride);
   end;
 end;
 
@@ -10852,7 +10858,7 @@ var
   MaxX, MaxY: integer;
   CountX, CountY: integer;
   Modulus, Multiplier: TNeuralFloat;
-  RowStride, colBase, pos: integer;
+  RowStride, rowBase, pos: integer;
 begin
   if Assigned(pNorms) then
   begin
@@ -10861,12 +10867,12 @@ begin
   end;
   MaxX := FSizeX - 1;
   MaxY := FSizeY - 1;
-  RowStride := FSizeX * FDepth; // #12: per-CountY GetRawPos step (carried below)
-  colBase := 0;
-  for CountX := 0 to MaxX do
+  // Y outer, X inner visits the depth spans back to back in storage order.
+  rowBase := 0; // #12: carried GetRawPos(0, CountY)
+  for CountY := 0 to MaxY do
   begin
-    pos := colBase;
-    for CountY := 0 to MaxY do
+    pos := rowBase;
+    for CountX := 0 to MaxX do
     begin
       StartPointPtr := GetRawPtr(pos);
       Modulus := Sqrt(DotProduct(StartPointPtr, StartPointPtr, FDepth));
@@ -10876,9 +10882,9 @@ begin
         if Assigned(pNorms) then pNorms[CountX, CountY, 0] := Multiplier;
         Mul(StartPointPtr, Multiplier, FDepth);
       end;
-      Inc(pos, RowStride);
+      Inc(pos, FDepth);
     end;
-    Inc(colBase, FDepth);
+    Inc(rowBase, RowStride);
   end;
 end;
 
@@ -10888,17 +10894,17 @@ var
   MaxX, MaxY: integer;
   CountX, CountY: integer;
   Modulus: TNeuralFloat;
-  RowStride, colBase, pos: integer;
+  RowStride, rowBase, pos: integer;
 begin
   if Assigned(pNorms) then pNorms.ReSize(SizeX, SizeY, 1);
   MaxX := FSizeX - 1;
   MaxY := FSizeY - 1;
-  RowStride := FSizeX * FDepth; // #12: per-CountY GetRawPos step (carried below)
-  colBase := 0;
-  for CountX := 0 to MaxX do
+  // Y outer, X inner visits the depth spans back to back in storage order.
+  rowBase := 0; // #12: carried GetRawPos(0, CountY)
+  for CountY := 0 to MaxY do
   begin
-    pos := colBase;
-    for CountY := 0 to MaxY do
+    pos := rowBase;
+    for CountX := 0 to MaxX do
     begin
       StartPointPtr := GetRawPtr(pos);
       Modulus := pNorms[CountX, CountY, 0];
@@ -10906,9 +10912,9 @@ begin
       begin
         Mul(StartPointPtr, Modulus, FDepth);
       end;
-      Inc(pos, RowStride);
+      Inc(pos, FDepth);
     end;
-    Inc(colBase, FDepth);
+    Inc(rowBase, RowStride);
   end;
 end;
 
