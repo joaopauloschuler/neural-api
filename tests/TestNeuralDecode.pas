@@ -150,6 +150,7 @@ type
     procedure TestConstrainedBeamForcesPhrasePresence;
     procedure TestConstrainedBeamForcesMultiplePhrases;
     procedure TestConstrainedBeamPhraseCharOutsideVocab;
+    procedure TestConstrainedBeamKeepsTokenAboveByteAlphabet;
     // Contrastive search (penalty_alpha) decoding.
     procedure TestContrastiveAlphaZeroMatchesGreedy;
     procedure TestContrastiveSingleCandidateMatchesGreedy;
@@ -961,6 +962,35 @@ begin
         ' is inside the vocabulary', Ord(Con.Text[I]) < cVocab);
     AssertEquals('an unsatisfiable phrase is never completed',
       0, Pos('xyz', Con.Text));
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestConstrainedBeamKeepsTokenAboveByteAlphabet;
+const
+  cVocab = 300;
+  cPeakTok = 296;   // Chr(296) wraps onto Chr(40), the forced phrase char.
+var
+  NN: TNNet;
+  Uncon, Con: TNNetDecodeResult;
+  Force: array of string;
+begin
+  // Vocabulary wider than the byte alphabet: the duplicate-with-injection check
+  // must not fold token 296 onto the needed char 40. The peak token satisfies
+  // the phrase on its own, so the constrained best beam must score exactly like
+  // the unconstrained one instead of falling back to a low-probability token.
+  RandSeed := 424242;
+  SetLength(Force, 1);
+  Force[0] := Chr(40);
+  NN := BuildPeakedLogitNet(8, cVocab, cPeakTok);
+  try
+    Uncon := DecodeBeamSearch(NN, 'ab', 6, 4, 0.0);
+    Con := DecodeConstrainedBeamSearch(NN, 'ab', 6, 4, Force, 0.0);
+    AssertTrue('constrained beam emits the forced char',
+      Pos(Force[0], Con.Text) > 0);
+    AssertEquals('the above-byte peak token stays a candidate',
+      Uncon.Score, Con.Score, 1e-6);
   finally
     NN.Free;
   end;

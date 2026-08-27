@@ -9228,8 +9228,9 @@ begin
           else
           begin
             // Skip a token already added through the force-injection pass above
-            // (it is a needed next-char) to avoid a duplicate candidate.
-            if Chr(T) in NeededSet then Continue;
+            // (it is a needed next-char) to avoid a duplicate candidate. Only a
+            // byte-range token can be one: Chr wraps above the byte alphabet.
+            if (T <= MaxByteTok) and (Chr(T) in NeededSet) then Continue;
             // #17: no per-candidate string - the text is built for survivors
             // only, below.
             PCand^.SumLogProb := NewSumLP;
