@@ -1873,8 +1873,7 @@ __kernel void cai_mrope
 //       low-end rescaling.
 //   1 = TNNetSoftMax (TVolume.SoftMax, GroupLen = FOutput.Size): mirrors the
 //       scalar path which, after the max-subtract, multiplies the whole group by
-//       (-1000 / minValue) when minValue < -1000 (and leaves the group UNCHANGED
-//       -- TotalSum := 0 -- in the degenerate minValue == 0 all-equal case).
+//       (-1000 / minValue) when minValue < -1000.
 // The per-group reduction stays inside one work-item to match the scalar
 // accumulation order (parity < 1e-4). Forward-only; training stays on the CPU.
 __kernel void cai_softmax
@@ -1902,18 +1901,12 @@ __kernel void cai_softmax
   const float shift = (maxv != 0.0f) ? maxv : 0.0f;
   // Whole-volume variant: after the shift, minValue := min - shift. When that
   // shifted minimum is < -1000 the scalar path rescales the whole group by
-  // (-1000 / shiftedMin); when it is exactly 0 (all elements equal) the scalar
-  // path returns without normalizing.
+  // (-1000 / shiftedMin). An all-equal group needs no special case: it shifts
+  // to all zeros and normalizes to the uniform 1/FGroupLen, as on the CPU.
   float scale = 1.0f;
   if (FApplyMinScale != 0)
   {
     const float shiftedMin = minv - shift;
-    if (shiftedMin == 0.0f)
-    {
-      // Degenerate all-equal group: scalar SoftMax leaves data unchanged.
-      for (int c = 0; c < FGroupLen; c++) FY[base + c] = FX[base + c];
-      return;
-    }
     if (shiftedMin < -1000.0f) scale = -1000.0f / shiftedMin;
   }
   float total = 0.0f;

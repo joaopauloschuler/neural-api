@@ -5263,7 +5263,7 @@ type
     // X is the activation volume; Y receives the softmaxed result (may alias X).
     // The volume is tiled into NumGroups contiguous groups of GroupLen elements
     // (NumGroups * GroupLen = X.Size). ApplyMinScale = true reproduces the
-    // whole-volume TVolume.SoftMax low-end (-1000/min) rescale + all-equal no-op.
+    // whole-volume TVolume.SoftMax low-end (-1000/min) rescale.
     // pExternalSrc BORROWS an already-resident input in place of uploading X,
     // which is then read for its size only; the borrowed buffer is never
     // released here. pKeepResultOnOpenCL leaves the result in ResultBuffer for

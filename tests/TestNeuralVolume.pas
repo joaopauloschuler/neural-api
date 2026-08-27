@@ -45,6 +45,7 @@ type
     procedure TestVolumeClassification;
     procedure TestVolumeSoftMax;
     procedure TestVolumeSoftMaxParity;
+    procedure TestVolumeSoftMaxConstantInput;
     procedure TestVolumePointwiseSoftMaxParity;
     procedure TestVolumeGroupedPointwiseSoftMaxParity;
     procedure TestGroupedDotProductsTiledRebuildsOnNewSource;
@@ -1649,6 +1650,36 @@ begin
     AssertTrue('V[3] should be greater than V[0]', V.Raw[3] > V.Raw[0]);
     AssertTrue('V[3] should be greater than V[1]', V.Raw[3] > V.Raw[1]);
     AssertTrue('V[3] should be greater than V[2]', V.Raw[3] > V.Raw[2]);
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeSoftMaxConstantInput;
+// A constant vector has no preferred element, so softmax must return the
+// uniform distribution 1/N and a total sum of N (N * exp(0)).
+var
+  V: TNNetVolume;
+  N, I: integer;
+  TotalSum: TNeuralFloat;
+begin
+  N := 5;
+  V := TNNetVolume.Create(N, 1, 1);
+  try
+    V.Fill(3.5);
+    TotalSum := V.SoftMax();
+    AssertEquals('Constant vector SoftMax total sum', N * 1.0, TotalSum, 1e-6);
+    for I := 0 to N - 1 do
+      AssertEquals('Constant vector SoftMax at ' + IntToStr(I),
+        1.0 / N, V.Raw[I], 1e-6);
+    AssertEquals('Constant vector SoftMax sums to 1', 1.0, V.GetSum(), 1e-6);
+
+    // An all-zero vector is the same degenerate case and must not stay at zero.
+    V.Fill(0);
+    V.SoftMax();
+    for I := 0 to N - 1 do
+      AssertEquals('Zero vector SoftMax at ' + IntToStr(I),
+        1.0 / N, V.Raw[I], 1e-6);
   finally
     V.Free;
   end;

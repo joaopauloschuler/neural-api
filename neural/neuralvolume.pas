@@ -10738,25 +10738,29 @@ var
   TotalSum: TNeuralFloat;
   MinValue, MaxValue, ShiftedMin: T;
 begin
-  MaxValue := GetMax();
-  MinValue := GetMin();
-  // Value the smallest element takes once the max is subtracted off. Reading it
-  // before the shift rather than after lets the shift itself be folded into the
-  // exponentiation below.
-  ShiftedMin := MinValue - MaxValue;
-
   TotalSum := 0;
+  vHigh := High(FData);
 
-  // forces range [-1000,0]
-  if ShiftedMin <> 0 then
+  if vHigh >= 0 then
   begin
-    vHigh := High(FData);
+    MaxValue := GetMax();
+    MinValue := GetMin();
+    // Value the smallest element takes once the max is subtracted off. Reading
+    // it before the shift rather than after lets the shift itself be folded
+    // into the exponentiation below.
+    ShiftedMin := MinValue - MaxValue;
+
+    // Only the rescale below divides by ShiftedMin, and it runs solely when
+    // ShiftedMin < -1000, so the shift/exp/normalize path is unconditional: an
+    // all-equal volume must still come out as the uniform distribution 1/N with
+    // TotalSum = N, the same answer PointwiseSoftMax gives a constant span.
     if ShiftedMin < -1000 then
     begin
-      // The rescale has to see the shifted values, so here the subtraction is a
-      // pass of its own and the fused kernel exponentiates with a zero shift.
-      // Sub and Mul are the non-virtual TVolume scalar loops from inside this
-      // body, so both passes name the TNNetVolume kernels explicitly.
+      // Forces range [-1000,0]. The rescale has to see the shifted values, so
+      // here the subtraction is a pass of its own and the fused kernel
+      // exponentiates with a zero shift. Sub and Mul are the non-virtual
+      // TVolume scalar loops from inside this body, so both passes name the
+      // TNNetVolume kernels explicitly.
       TNNetVolume.AddScalar(Addr(FData[0]), -MaxValue, vHigh + 1);
       TNNetVolume.Mul(Addr(FData[0]), -1000/ShiftedMin, vHigh + 1);
       TotalSum := TNNetVolume.ExpShiftSum(Addr(FData[0]), Addr(FData[0]), 0, vHigh + 1);
