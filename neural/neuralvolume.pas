@@ -10750,8 +10750,10 @@ begin
     begin
       // The rescale has to see the shifted values, so here the subtraction is a
       // pass of its own and the fused kernel exponentiates with a zero shift.
-      Sub(MaxValue);
-      Mul( -1000/ShiftedMin );
+      // Sub and Mul are the non-virtual TVolume scalar loops from inside this
+      // body, so both passes name the TNNetVolume kernels explicitly.
+      TNNetVolume.AddScalar(Addr(FData[0]), -MaxValue, vHigh + 1);
+      TNNetVolume.Mul(Addr(FData[0]), -1000/ShiftedMin, vHigh + 1);
       TotalSum := TNNetVolume.ExpShiftSum(Addr(FData[0]), Addr(FData[0]), 0, vHigh + 1);
     end
     else
@@ -10762,7 +10764,11 @@ begin
 
     if TotalSum > 0 then
     begin
-      Divi(TotalSum);
+      // The largest element exponentiates to exactly 1, so TotalSum >= 1 and
+      // its reciprocal can neither overflow nor land in the denormals - one
+      // reciprocal and a vector multiply replace the scalar per-element divide
+      // (the same normalization PointwiseSoftMax already runs).
+      TNNetVolume.Mul(Addr(FData[0]), 1.0 / TotalSum, vHigh + 1);
     end;
   end;
 
