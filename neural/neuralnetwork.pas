@@ -25035,15 +25035,18 @@ begin
   {$IFDEF AVXANY}
   // The input is a single depth-contiguous elementwise segment, so exp(x) is
   // batched 8-wide via AVXExp (the same vector exp PointwiseSoftMax uses) into a
-  // scratch buffer; the outer tanh(exp(x)) stays a scalar pcr_tanhf in the
-  // finishing pass (its argument exp(x) is data-dependent so it cannot reuse the
-  // batch). The |x|>20 saturation lanes are handled exactly as the scalar path.
+  // scratch buffer, and the outer tanh(exp(x)) then rides TNNetVolume.Tanh into
+  // FOutput. AVXExp clamps its argument to +/-88.4, so the scratch holds finite
+  // values and the |x|>20 lanes simply saturate to 1 before being overwritten
+  // with the exact saturation values below, exactly as the scalar path does.
   Size := LocalPrevOutput.Size;
   if Size > 0 then
   begin
     if Length(FExpBuf) <> Size then SetLength(FExpBuf, Size); // rule #17: lazy amortized resize
     TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpBuf[0]),
       TNeuralFloatArrPtr(@LocalPrevOutput.FData[0]), Size);
+    TNNetVolume.Tanh(TNeuralFloatArrPtr(@FOutput.FData[0]),
+      TNeuralFloatArrPtr(@FExpBuf[0]), Size);
     if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
     begin
       for OutputCnt := 0 to SizeM1 do
@@ -25061,11 +25064,10 @@ begin
         end
         else
         begin
-          // expX = exp(x) comes vectorized from the AVXExp batch; the outer
-          // tanh(expX) stays scalar (its argument exp(x) is data-dependent, not
-          // a fixed multiple of x, so it cannot reuse the same exp batch).
+          // Both transcendentals are vectorized now: expX from the AVXExp batch,
+          // tanh(expX) already in FOutput, read back before it is overwritten.
           expX := FExpBuf[OutputCnt];
-          tanhExpX := pcr_tanhf(expX);
+          tanhExpX := FOutput.FData[OutputCnt];
           FOutput.FData[OutputCnt] := x * tanhExpX;
           FOutputErrorDeriv.FData[OutputCnt] :=
             tanhExpX + x * (1 - tanhExpX * tanhExpX) * expX;
@@ -25082,7 +25084,7 @@ begin
         else if x < -20 then
           FOutput.FData[OutputCnt] := 0
         else
-          FOutput.FData[OutputCnt] := x * pcr_tanhf(FExpBuf[OutputCnt]);
+          FOutput.FData[OutputCnt] := x * FOutput.FData[OutputCnt];
       end;
     end;
   end;
@@ -25433,13 +25435,22 @@ begin
   TNNetVolume.Erf(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
   if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
   begin
+    // The Gaussian pdf's exp(-x^2/2) rides TNNetVolume.Exp in the
+    // FOutputErrorDeriv scratch instead of a scalar NeuralExp per element; the
+    // finish loop reads each slot back before overwriting it with the
+    // derivative, so no extra buffer is needed.
+    Move(LocalPrevOutput.FData[0], FOutputErrorDeriv.FData[0],
+      (SizeM1 + 1) * csNeuralFloatSize);
+    TNNetVolume.Mul(FOutputErrorDeriv.DataPtr, FOutputErrorDeriv.DataPtr, SizeM1 + 1);
+    TNNetVolume.Mul(FOutputErrorDeriv.DataPtr, -0.5, SizeM1 + 1);
+    TNNetVolume.Exp(FOutputErrorDeriv.DataPtr, FOutputErrorDeriv.DataPtr, SizeM1 + 1);
     for OutputCnt := 0 to SizeM1 do
     begin
       x := LocalPrevOutput.FData[OutputCnt];
       cdf := 0.5 * (1 + FOutput.FData[OutputCnt]);   // FOutput = erf(x/sqrt(2))
-      FOutput.FData[OutputCnt] := x * cdf;
       // GELU_erf'(x) = Phi(x) + x * phi(x)
-      pdf := INV_SQRT_2PI * NeuralExp(-0.5 * x * x);
+      pdf := INV_SQRT_2PI * FOutputErrorDeriv.FData[OutputCnt];
+      FOutput.FData[OutputCnt] := x * cdf;
       FOutputErrorDeriv.FData[OutputCnt] := cdf + x * pdf;
     end;
   end
@@ -25849,11 +25860,11 @@ begin
     MaxY := FOutput.SizeY - 1;
     MaxD := HalfDepth - 1;
     // FOutputErrorDeriv is sized alongside FOutputError by SetOutputErrorSize and
-    // is never otherwise used by this layer, so it serves as the per-row erf
-    // scratch without any allocation. It collapses to (1,1,1) on a
-    // non-trainable layer, hence the guard and the scalar fallback below.
-    // Only the erf is promoted: the pdf's exp(-b^2/2) would need a second row
-    // buffer, so it stays scalar.
+    // is never otherwise used by this layer, so it serves as the per-row
+    // transcendental scratch without any allocation. It collapses to (1,1,1) on a
+    // non-trainable layer, hence the guard and the scalar fallback below. The one
+    // row is reused sequentially: erf(B/sqrt(2)) first, then exp(-B^2/2), so both
+    // transcendentals are vectorized off a single buffer.
     HasScratch := (FOutputErrorDeriv.Size = FOutput.Size);
     if HasScratch then
     begin
@@ -25869,6 +25880,8 @@ begin
           Move(bPtr^[0], erfPtr^[0], HalfDepth * csNeuralFloatSize);
           TNNetVolume.Mul(erfPtr, INV_SQRT_2, HalfDepth);
           TNNetVolume.Erf(erfPtr, erfPtr, HalfDepth);
+          // Pass 1 spends the erf on the Phi(b) share of both halves and reseeds
+          // the same row with -b^2/2 for the pdf's exp.
           for D := 0 to MaxD do
           begin
             basePrev := basePrev0 + D;
@@ -25876,16 +25889,26 @@ begin
             a := FPrevLayer.FOutput.FData[basePrev];
             b := FPrevLayer.FOutput.FData[basePrevH];
             cdf := 0.5 * (1 + erfPtr^[D]);
-            // Gaussian PDF: phi(b) = exp(-b^2/2)/sqrt(2*pi);
-            // d/db GELU_erf(b) = Phi(b) + b*phi(b).
-            pdf := INV_SQRT_2PI * NeuralExp(-0.5 * b * b);
-            geluVal := b * cdf;
-            geluDeriv := cdf + b * pdf;
             err := FOutputError.FData[baseErr0 + D];
             FPrevLayer.FOutputError.FData[basePrev] :=
-              FPrevLayer.FOutputError.FData[basePrev] + err * geluVal;
+              FPrevLayer.FOutputError.FData[basePrev] + err * b * cdf;
             FPrevLayer.FOutputError.FData[basePrevH] :=
-              FPrevLayer.FOutputError.FData[basePrevH] + err * a * geluDeriv;
+              FPrevLayer.FOutputError.FData[basePrevH] + err * a * cdf;
+            erfPtr^[D] := -0.5 * b * b;
+          end;
+          TNNetVolume.Exp(erfPtr, erfPtr, HalfDepth);
+          // Pass 2 adds the remaining b*phi(b) share of d/db GELU_erf(b), with
+          // phi(b) = exp(-b^2/2)/sqrt(2*pi).
+          for D := 0 to MaxD do
+          begin
+            basePrev := basePrev0 + D;
+            basePrevH := basePrev + HalfDepth;
+            a := FPrevLayer.FOutput.FData[basePrev];
+            b := FPrevLayer.FOutput.FData[basePrevH];
+            err := FOutputError.FData[baseErr0 + D];
+            FPrevLayer.FOutputError.FData[basePrevH] :=
+              FPrevLayer.FOutputError.FData[basePrevH] +
+              err * a * b * (INV_SQRT_2PI * erfPtr^[D]);
           end;
         end;
     end

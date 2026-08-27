@@ -1171,6 +1171,8 @@ type
     procedure TestDepthToSpaceGradientCheck;
     procedure TestGEGLUForward;
     procedure TestGEGLUGradientCheck;
+    procedure TestGEGLUErfGradientCheck;
+    procedure TestGELUErfGradientCheck;
     procedure TestSwiGLUForward;
     procedure TestSwiGLUGradientCheck;
     procedure TestGptOssGatedSwiGLUForward;
@@ -10766,6 +10768,21 @@ procedure TTestNeuralNumerical.TestGEGLUGradientCheck;
 begin
   // Depth 4 -> output depth 2; gradient flows to both input halves.
   LayerInputGradientCheck(Self, TNNetGEGLU.Create(), 'GEGLU', 2, 2, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestGEGLUErfGradientCheck;
+begin
+  // Exact-erf gate. Its backward pass rides one scratch row twice - erf first,
+  // then exp(-b^2/2) for the Gaussian pdf - so both halves of
+  // d/db GELU_erf(b) = Phi(b) + b*phi(b) are pinned here.
+  LayerInputGradientCheck(Self, TNNetGEGLUErf.Create(), 'GEGLUErf', 2, 2, 4, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestGELUErfGradientCheck;
+begin
+  // Exact-erf GELU: the pdf's exp(-x^2/2) is vectorized into the derivative
+  // scratch by Compute, so the cached derivative is what this checks.
+  LayerInputGradientCheck(Self, TNNetGELUErf.Create(), 'GELUErf', 2, 2, 3, 0.01);
 end;
 
 procedure TTestNeuralNumerical.TestSwiGLUForward;
