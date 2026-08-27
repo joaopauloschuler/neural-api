@@ -56222,8 +56222,10 @@ begin
       begin
         iy0 := FYMap.Idx[oy];
         for ox := 0 to MaxOutXPos do
-          TNNetVolume.MulAdd(PrevError.GetRawPtr(FXMap.Idx[ox], iy0),
-            FOutputError.GetRawPtr(ox, oy), 1.0, D);
+          // Weight is exactly 1 for nearest, so this is a plain accumulate:
+          // Add skips MulAdd's per-vector broadcast multiply (#13/#18).
+          TNNetVolume.Add(PrevError.GetRawPtr(FXMap.Idx[ox], iy0),
+            FOutputError.GetRawPtr(ox, oy), D);
       end;
     end;
     2: BicubicBackward(PrevError);
@@ -56282,7 +56284,9 @@ begin
     if Count > 1 then
     begin
       CountM1 := Count - 1;
-      for Cnt := 0 to CountM1 do
+      // Neuron 0 already seeded Result; rescanning its whole weights volume
+      // would repeat a full sweep for nothing.
+      for Cnt := 1 to CountM1 do
       begin
         MaxValue := Self[Cnt].Weights.GetMax();
         if MaxValue > Result then Result := MaxValue;
@@ -56307,7 +56311,8 @@ begin
     if Count > 1 then
     begin
       CountM1 := Count - 1;
-      for Cnt := 0 to CountM1 do
+      // Neuron 0 already seeded Result (see GetMaxWeight).
+      for Cnt := 1 to CountM1 do
       begin
         MaxValue := Self[Cnt].Weights.GetMaxAbs();
         if MaxValue > Result then Result := MaxValue;
@@ -56332,7 +56337,8 @@ begin
     if Count > 1 then
     begin
       CountM1 := Count - 1;
-      for Cnt := 0 to CountM1 do
+      // Neuron 0 already seeded Result (see GetMaxWeight).
+      for Cnt := 1 to CountM1 do
       begin
         MinValue := Self[Cnt].Weights.GetMin();
         if MinValue < Result then Result := MinValue;
@@ -56947,19 +56953,29 @@ begin
 end;
 
 procedure TNNetChannelRandomMulAdd.Compute();
+const
+  cInvRandomScale: double = 1/100000;
 var
   StartTime: double;
   MaxDepth, DepthCount: integer;
+  MulRange, BiasRange: integer;
+  MulBase, BiasBase: double;
 begin
   StartTime := Now();
   inherited Compute;
   if FEnabled then
   begin
     MaxDepth := FOutput.Depth - 1;
+    // #5/#21: the Random() range and the centring offset depend only on
+    // FStruct, and the /100000 scaling is one reciprocal for every channel.
+    MulRange := 200 * FStruct[1] + 1;
+    BiasRange := 200 * FStruct[0] + 1;
+    MulBase := 1 - (0.001 * FStruct[1]);
+    BiasBase := -(0.001 * FStruct[0]);
     for DepthCount := 0 to MaxDepth do
     begin
-      FRandomMul.FData[DepthCount] := 1 + (Random(200 * FStruct[1] + 1)/100000) - (0.001 * FStruct[1]);
-      FRandomBias.FData[DepthCount] := (Random(200 * FStruct[0] + 1)/100000) - (0.001 * FStruct[0]);
+      FRandomMul.FData[DepthCount] := MulBase + Random(MulRange) * cInvRandomScale;
+      FRandomBias.FData[DepthCount] := BiasBase + Random(BiasRange) * cInvRandomScale;
     end;
     FOutput.MulChannels(FRandomMul);
     FOutput.AddToChannels(FRandomBias);
@@ -57133,7 +57149,7 @@ var
   bCanBackPropagate: boolean;
   LocalPrevError, LocalDelta, LocalWeight: TNNetVolume;
   OutputErrorDerivLearningPtr, OutputErrorDerivPtr: pointer;
-  LocalDepth, LocalWeightDepth: integer;
+  LocalDepth, LocalWeightDepth, LocalDeltaDepth: integer;
   FeatureCntX, FeatureCntY: integer;
   MaxFeatureX, MaxFeatureY, MaxFeatureYInRange: integer;
   LocalPrevSizeX, LocalPrevSizeY: integer;
@@ -57264,7 +57280,10 @@ begin
         begin
           LocalDelta := FArrNeurons[NeuronIdx].Delta;
           LocalWeight := FArrNeurons[NeuronIdx].Weights;
-          LocalDepth := LocalWeight.Depth * NeuronIdx;
+          // #11: both depths are invariant across the feature-tap nest below.
+          LocalWeightDepth := LocalWeight.Depth;
+          LocalDeltaDepth := LocalDelta.Depth;
+          LocalDepth := LocalWeightDepth * NeuronIdx;
           OutputErrorDerivLearningPtr := FOutputError.GetRawPtr(OutputX, OutputY, LocalDepth);
           OutputErrorDerivPtr := FOutputErrorDeriv.GetRawPtr(OutputX, OutputY, LocalDepth);
           {$IFDEF Debug}
@@ -57288,7 +57307,7 @@ begin
                 LocalDelta.GetRawPtr(dPos),
                 OutputErrorDerivLearningPtr,
                 FInputCopy.GetRawPtr(inPos),
-                LocalDelta.Depth
+                LocalDeltaDepth
               );
               if XInRange and (FeatureCntY <= MaxFeatureYInRange) then
               begin
@@ -57297,7 +57316,7 @@ begin
                   LocalPrevError.GetRawPtr(pePos),
                   LocalWeight.GetRawPtr(wPos),
                   OutputErrorDerivPtr,
-                  LocalWeight.Depth
+                  LocalWeightDepth
                 );
               end;
               Inc(dPos, dStride);
@@ -57483,12 +57502,14 @@ begin
   if MaxNeurons = 0 then
   begin
     LocalW := FArrNeurons[0].Weights;
-    for OutputX := 0 to MaxX do
+    // Y outer / X inner (App. E): consecutive OutputX share an input row and
+    // advance the output pointer by one slot, instead of jumping a whole plane.
+    for OutputY := 0 to MaxY do
     begin
-      InputX := OutputX * FStride;
-      for OutputY := 0 to MaxY do
+      InputY := OutputY * FStride;
+      for OutputX := 0 to MaxX do
       begin
-        InputY := OutputY * FStride;
+        InputX := OutputX * FStride;
         OutputPtr := FOutputRaw.GetRawPtr(OutputX, OutputY);
         {$IFDEF AVX64}
         PtrA := OutputPtr;
@@ -57521,12 +57542,13 @@ begin
   end
   else
   begin
-    for OutputX := 0 to MaxX do
+    // Y outer / X inner (App. E): see the single-neuron branch above.
+    for OutputY := 0 to MaxY do
     begin
-      InputX := OutputX * FStride;
-      for OutputY := 0 to MaxY do
+      InputY := OutputY * FStride;
+      for OutputX := 0 to MaxX do
       begin
-        InputY := OutputY * FStride;
+        InputX := OutputX * FStride;
         for NeuronIdx := 0 to MaxNeurons do
         begin
           LocalW := FArrNeurons[NeuronIdx].Weights;
@@ -57589,12 +57611,14 @@ begin
   InRowStride := FInputCopy.GetRawPos(0, 1);
   CodesPtr := FQuantTable.DataPtr;   // #13: table bases hoisted out of the nest
   ScalePtr := FQuantTable.ScalePtr;
-  for OutputX := 0 to MaxX do
+  // Y outer / X inner (App. E): consecutive OutputX share an input row and
+  // advance the output pointer by one slot, instead of jumping a whole plane.
+  for OutputY := 0 to MaxY do
   begin
-    InputX := OutputX * FStride;
-    for OutputY := 0 to MaxY do
+    InputY := OutputY * FStride;
+    for OutputX := 0 to MaxX do
     begin
-      InputY := OutputY * FStride;
+      InputX := OutputX * FStride;
       for NeuronIdx := 0 to MaxNeurons do
       begin
         // Neuron row base as a pointer (#11): the tap loops then add only

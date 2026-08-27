@@ -202,7 +202,13 @@ type
     // The point of the bank: the routed path's LAYER COUNT and ACTIVATION
     // FOOTPRINT are independent of the expert count.
     procedure TestMoEExpertBankScalesWithTopKNotExperts;
+    // Depthwise 2-D convolution forward: the CPU nests are interchanged
+    // (Y outer / X inner), so a non-square input catches any axis mix-up.
+    procedure TestDepthwiseConvForwardMatchesReference;
+    procedure TestDepthwiseConvInt8ForwardMatchesFP32;
   private
+    // Naive per-tap depthwise reference used by the two tests above.
+    procedure AssertDepthwiseConvMatchesReference(Multiplier, Stride: integer);
     // Builds ONE net holding both the per-expert reference graph and the fused
     // bank behind the SAME router, then asserts the two outputs agree.
     // QuantizeBanks quantizes ONLY the two bank layers, leaving the reference
@@ -8760,6 +8766,116 @@ begin
     finally
       NN.Free;
     end;
+  end;
+end;
+
+// Builds Input(7,5,3) -> DepthwiseConvLinear(Multiplier, 3x3, no padding,
+// Stride) on random weights and random input, then recomputes every output
+// element with a naive tap loop. The input is deliberately NON-SQUARE so a
+// swapped X/Y axis shows up as a shape error or a wrong value rather than
+// cancelling out.
+procedure TTestNeuralLayersExtra.AssertDepthwiseConvMatchesReference(
+  Multiplier, Stride: integer);
+const
+  InX = 7; InY = 5; InD = 3; FeatureSize = 3;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Layer: TNNetLayer;
+  W, Output: TNNetVolume;
+  NeuronCnt, ox, oy, d, fx, fy: integer;
+  MaxOutXPos, MaxOutYPos, Expected: integer;
+  Sum: TNeuralFloat;
+  Tag: string;
+begin
+  Tag := 'mult=' + IntToStr(Multiplier) + ' stride=' + IntToStr(Stride);
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(InX, InY, InD);
+  try
+    NN.AddLayer(TNNetInput.Create(InX, InY, InD));
+    Layer := NN.AddLayer(
+      TNNetDepthwiseConvLinear.Create(Multiplier, FeatureSize, 0, Stride));
+    for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+      Layer.Neurons[NeuronCnt].Weights.RandomizeGaussian(1);
+    Input.Randomize();
+    NN.Compute(Input);
+    Output := Layer.Output;
+
+    Expected := (InX - FeatureSize) div Stride + 1;
+    AssertEquals('output SizeX (' + Tag + ')', Expected, Output.SizeX);
+    Expected := (InY - FeatureSize) div Stride + 1;
+    AssertEquals('output SizeY (' + Tag + ')', Expected, Output.SizeY);
+    AssertEquals('output depth (' + Tag + ')', Multiplier * InD, Output.Depth);
+
+    MaxOutXPos := Output.SizeX - 1;
+    MaxOutYPos := Output.SizeY - 1;
+    for NeuronCnt := 0 to Multiplier - 1 do
+    begin
+      W := Layer.Neurons[NeuronCnt].Weights;
+      for oy := 0 to MaxOutYPos do
+        for ox := 0 to MaxOutXPos do
+          for d := 0 to InD - 1 do
+          begin
+            Sum := 0;
+            for fx := 0 to FeatureSize - 1 do
+              for fy := 0 to FeatureSize - 1 do
+                Sum := Sum +
+                  Input[ox * Stride + fx, oy * Stride + fy, d] * W[fx, fy, d];
+            AssertEquals('depthwise out[' + IntToStr(ox) + ',' + IntToStr(oy) +
+              ',' + IntToStr(NeuronCnt) + ':' + IntToStr(d) + '] (' + Tag + ')',
+              Sum, Output[ox, oy, NeuronCnt * InD + d], 1e-4);
+          end;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestDepthwiseConvForwardMatchesReference;
+begin
+  // Single-neuron and multi-neuron branches, unit and strided.
+  AssertDepthwiseConvMatchesReference(1, 1);
+  AssertDepthwiseConvMatchesReference(1, 2);
+  AssertDepthwiseConvMatchesReference(3, 1);
+  AssertDepthwiseConvMatchesReference(3, 2);
+end;
+
+// The int8 forward walks its own nest over the same taps; it must land within
+// quantization drift of the FP32 forward it replaces.
+procedure TTestNeuralLayersExtra.TestDepthwiseConvInt8ForwardMatchesFP32;
+const
+  InX = 7; InY = 5; InD = 3; FeatureSize = 3; Multiplier = 2;
+var
+  NN: TNNet;
+  Input, Reference: TNNetVolume;
+  Layer: TNNetLayer;
+  NeuronCnt, i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(InX, InY, InD);
+  Reference := TNNetVolume.Create(1, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(InX, InY, InD));
+    Layer := NN.AddLayer(
+      TNNetDepthwiseConvLinear.Create(Multiplier, FeatureSize, 0, 1));
+    for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+      Layer.Neurons[NeuronCnt].Weights.RandomizeGaussian(1);
+    Input.Randomize();
+    NN.Compute(Input);
+    Reference.Copy(Layer.Output);
+
+    TNNetDepthwiseConv(Layer).QuantizeWeightsInt8();
+    NN.Compute(Input);
+
+    AssertEquals('int8 output size', Reference.Size, Layer.Output.Size);
+    for i := 0 to Reference.Size - 1 do
+      AssertEquals('int8 depthwise element ' + IntToStr(i),
+        Reference.FData[i], Layer.Output.FData[i], 0.05);
+  finally
+    NN.Free;
+    Input.Free;
+    Reference.Free;
   end;
 end;
 
