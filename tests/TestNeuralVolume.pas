@@ -73,6 +73,7 @@ type
     procedure TestVolumeCopyCropping;
     procedure TestVolumeShift;
     procedure TestVolumeSumToPos;
+    procedure TestVolumeSmallestIdxInRange;
     procedure TestVolumeRawPosAndPtr;
     procedure TestVolumeDepthOperations;
     // AssertFinite tests
@@ -2506,6 +2507,38 @@ begin
     AssertEquals('In place last position', 4.5, Source.Raw[4], 0.0001);
   finally
     Prefix.Free;
+    Source.Free;
+  end;
+end;
+
+procedure TTestNeuralVolume.TestVolumeSmallestIdxInRange;
+var
+  Source: TNNetVolume;
+begin
+  Source := TNNetVolume.Create(6, 1, 1);
+  try
+    Source.Raw[0] := 5.0;
+    Source.Raw[1] := 2.0;
+    Source.Raw[2] := 9.0;
+    Source.Raw[3] := 2.0;
+    Source.Raw[4] := 7.0;
+    Source.Raw[5] := 1.0;
+
+    AssertEquals('Single element range returns its own position',
+      2, Source.GetSmallestIdxInRange(2, 1));
+    AssertEquals('Normal range finds the minimum',
+      1, Source.GetSmallestIdxInRange(0, 4));
+    AssertEquals('A tie keeps the first position',
+      1, Source.GetSmallestIdxInRange(1, 3));
+    AssertEquals('The minimum at the start position survives the scan',
+      1, Source.GetSmallestIdxInRange(1, 4));
+    AssertEquals('The range is clipped to the volume size',
+      5, Source.GetSmallestIdxInRange(4, 100));
+    AssertEquals('A start position beyond the volume returns zero',
+      0, Source.GetSmallestIdxInRange(6, 3));
+    AssertEquals('An empty range returns zero',
+      0, Source.GetSmallestIdxInRange(2, 0));
+  finally
     Source.Free;
   end;
 end;

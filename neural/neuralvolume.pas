@@ -10247,15 +10247,12 @@ begin
     begin
       SmallestValue := FData[StartPos];
       Result := StartPos;
-      if FinishPos > StartPos then
+      for PosCnt := StartPos + 1 to FinishPos do
       begin
-        for PosCnt := StartPos to FinishPos do
+        if FData[PosCnt] < SmallestValue then
         begin
-          if FData[PosCnt] < SmallestValue then
-          begin
-            SmallestValue := FData[PosCnt];
-            Result := PosCnt;
-          end;
+          SmallestValue := FData[PosCnt];
+          Result := PosCnt;
         end;
       end;
     end;
