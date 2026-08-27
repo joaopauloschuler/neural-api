@@ -34993,8 +34993,9 @@ end;
 procedure TNNetForgetGateBias.Backpropagate();
 var
   StartTime: double;
-  SeqLen, t, i, j, s, SeqLenM1: integer;
+  SeqLen, t, i, s, SeqLenM1: integer;
   Row, pos, SXStride: integer;
+  hasInputGrad: boolean;
   dLogit, FVal, RunSum, dLogitAcc, NegLearningRate, Acc: TNeuralFloat;
   Prev, PrevErr: TNNetVolume;
   Neuron0: TNNetNeuron;
@@ -35014,10 +35015,10 @@ begin
   SXStride := FOutputError.SizeX;   // D[X=j,Y=i]: one s-step advances offset by SizeX (#12)
   for i := 0 to SeqLenM1 do
   begin
-    Acc := 0;
     Row := FOutputError.GetRawPos(0, i);
-    for j := 0 to i do
-      Acc := Acc + FOutputError.FData[Row + j];   // +F_i in D[i, j<=i]
+    // +F_i in D[i, j<=i]: a contiguous i+1 element run, so one AVX reduction
+    // (#13/#18).
+    Acc := TNNetVolume.Sum(FOutputError.GetRawPtr(Row), i + 1);
     // -F_i in D[k>=i, i]: FOutputError[i, s, 0] offset = SizeX*s + i, carried by +SizeX.
     pos := FOutputError.GetRawPos(i, i);
     for s := i to SeqLenM1 do
@@ -35038,11 +35039,23 @@ begin
   // ---- df_t = dL/d(ln f_t) / f_t; logit = w.x_t + b with f=sigmoid(logit),
   //      so dL/dlogit = df_t * f_t*(1-f_t) = dLogf[t]*(1-f_t). Then
   //      dw += dlogit * x_t, db += dlogit, dx_t += dlogit * w. ----
+  //      The input gradient shares dlogit, so it rides along in the SAME pass;
+  //      it reads w, which is still the forward-pass weights because the
+  //      non-batched update below has not run yet.
   if FNeurons.Count > 0 then
   begin
     Neuron0 := FNeurons[0];
     DeltaPtr := Neuron0.FDelta.GetRawPtr(0, 0);
     NegLearningRate := -FLearningRate;
+    hasInputGrad := (FPrevLayer.Output.Size > 0) and
+      (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size);
+    PrevErr := nil;
+    WeightsPtr := nil;
+    if hasInputGrad then
+    begin
+      PrevErr := FPrevLayer.FOutputError;
+      WeightsPtr := Neuron0.FWeights.GetRawPtr(0, 0);
+    end;
     // dlogit accumulates raw and takes the -lr factor once (#5).
     dLogitAcc := 0;
     for t := 0 to SeqLenM1 do
@@ -35052,26 +35065,14 @@ begin
       // weight grad: delta += -lr * dlogit * x_t (AVX MulAdd over FFeatures).
       TNNetVolume.MulAdd(DeltaPtr,
         Prev.GetRawPtr(t, 0), NegLearningRate * dLogit, FFeatures);
+      // input grad: dx_t += dlogit * w.
+      if hasInputGrad then
+        if dLogit <> 0 then
+          TNNetVolume.MulAdd(PrevErr.GetRawPtr(t, 0),
+            WeightsPtr, dLogit, FFeatures);
       dLogitAcc := dLogitAcc + dLogit;
     end;
     Neuron0.FBiasDelta := Neuron0.FBiasDelta + NegLearningRate * dLogitAcc;
-  end;
-  // ---- gradient w.r.t the input x_t: dx_t += dlogit * w. Reads w, so it must
-  //      run on the FORWARD-PASS weights, before any non-batched update. ----
-  if (FPrevLayer.Output.Size > 0) and
-     (FPrevLayer.Output.Size = FPrevLayer.OutputError.Size) and
-     (FNeurons.Count > 0) then
-  begin
-    PrevErr := FPrevLayer.FOutputError;
-    WeightsPtr := FNeurons[0].FWeights.GetRawPtr(0, 0);
-    for t := 0 to SeqLenM1 do
-    begin
-      FVal := FF.FData[t];
-      dLogit := FdLogfBuf[t] * (1.0 - FVal);
-      if dLogit <> 0 then
-        TNNetVolume.MulAdd(PrevErr.GetRawPtr(t, 0),
-          WeightsPtr, dLogit, FFeatures);
-    end;
   end;
   if (FNeurons.Count > 0) and (not FBatchUpdate) then
   begin
@@ -35520,7 +35521,7 @@ procedure TNNetInducedSetAttention.Backpropagate();
 var
   StartTime: double;
   X, I, Xerr: TNNetVolume;
-  SeqLen, m, ni, k: integer;
+  SeqLen, m, ni: integer;
   SeqLenM1, MM1, baseA, posM, posNi, RowStride: integer;
   hasInputGrad: boolean;
   SumDAA, A, dS: TNeuralFloat;
@@ -35561,8 +35562,10 @@ begin
       FdABuf[m] := TNNetVolume.DotProduct(dOutNiPtr, FH.GetRawPtr(posM), FDim);
       Inc(posM, RowStride);
     end;
-    SumDAA := 0;
-    for k := 0 to MM1 do SumDAA := SumDAA + FdABuf[k] * FA2.FData[baseA + k];
+    // dA . a2 over this query's FM attention weights: both operands are
+    // contiguous, so it is one AVX dot product (#13/#18).
+    SumDAA := TNNetVolume.DotProduct(TNeuralFloatArrPtr(@FdABuf[0]),
+      FA2.GetRawPtr(baseA), FM);
     for m := 0 to MM1 do
       FdScoreBuf[m] := FA2.FData[baseA + m] * (FdABuf[m] - SumDAA);
     // score2[ni,m] = invSqrtDim * (X[ni] . H[m]):
@@ -35601,8 +35604,10 @@ begin
       FdABuf[ni] := TNNetVolume.DotProduct(dHm, X.GetRawPtr(posNi), FDim);
       Inc(posNi, RowStride);
     end;
-    SumDAA := 0;
-    for k := 0 to SeqLenM1 do SumDAA := SumDAA + FdABuf[k] * FA1.FData[baseA + k];
+    // dA . a1 over this inducing point's SeqLen attention weights: one AVX dot
+    // product (#13/#18).
+    SumDAA := TNNetVolume.DotProduct(TNeuralFloatArrPtr(@FdABuf[0]),
+      FA1.GetRawPtr(baseA), SeqLen);
     for ni := 0 to SeqLenM1 do
       FdScoreBuf[ni] := FA1.FData[baseA + ni] * (FdABuf[ni] - SumDAA);
     // score1[m,ni] = invSqrtDim * (I[m] . X[ni]):
