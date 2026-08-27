@@ -577,6 +577,7 @@ type
     procedure TestDetrConfigFromJSONFile;
     procedure TestDetrObjectDetectionParity;
     procedure TestDetrDetectionDecode;
+    procedure TestDetrQueryPosSurvivesTokenCountCollision;
     procedure TestMask2FormerParity;
     procedure TestMask2FormerMaskEinsumOrderParity;
     procedure TestMask2FormerSemanticDecodeReference;
@@ -22845,6 +22846,105 @@ begin
     Img.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// The DETR spatial pos tables are per-layer copies of one 2-D sine constant,
+// while the query-pos tables are learned. Rebuilds the pico fixture with
+// num_queries = the 4x4 feature grid's token count (16) and a MARKED query
+// table, then asserts the marked table survives in both query-pos layers (a
+// size-based identification would have overwritten them with the sine table).
+procedure TTestNeuralPretrained.TestDetrQueryPosSurvivesTokenCountCollision;
+const
+  cQueries = 16;
+  cDModel = 16;
+var
+  Reader: TNNetSafeTensorsReader;
+  Writer: TNNetSafeTensorsWriter;
+  Vol: TNNetVolume;
+  Shape: array of Int64;
+  StPath, CfgPath, Name: string;
+  Cfg: TStringList;
+  Config: TDetrConfig;
+  NN: TNNet;
+  Layer: TNNetLayer;
+  t, d, q, c, PosLayers, QueryTables, SpatialTables: integer;
+  Marked: boolean;
+begin
+  RandSeed := 424242;
+  StPath := GetTempDir(false) + 'cai_detr_qcollide_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  Vol := TNNetVolume.Create;
+  Reader := TNNetSafeTensorsReader.Create(FixturePath('tiny_detr.safetensors'));
+  Writer := TNNetSafeTensorsWriter.Create(StPath);
+  try
+    for t := 0 to Reader.Count - 1 do
+    begin
+      Name := Reader.TensorName(t);
+      if Name = 'model.query_position_embeddings.weight' then
+      begin
+        // marked table: row q, channel c = 100 + q + c/100, far outside the
+        // spatial sine constant's [-1, 1].
+        Vol.ReSize(cQueries * cDModel, 1, 1);
+        for q := 0 to cQueries - 1 do
+          for c := 0 to cDModel - 1 do
+            Vol.FData[q * cDModel + c] := 100 + q + c * 0.01;
+        SetLength(Shape, 2);
+        Shape[0] := cQueries; Shape[1] := cDModel;
+      end
+      else
+      begin
+        Reader.LoadTensorFlat(Name, Vol);
+        SetLength(Shape, Reader.DimCount(Name));
+        for d := 0 to Reader.DimCount(Name) - 1 do
+          Shape[d] := Reader.DimSize(Name, d);
+      end;
+      Writer.AddTensorFlat(Name, Shape, Vol);
+    end;
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+    Reader.Free;
+    Vol.Free;
+  end;
+  Cfg := TStringList.Create;
+  try
+    Cfg.LoadFromFile(FixturePath('tiny_detr_config.json'));
+    CfgPath := WriteTempJSON(StringReplace(Cfg.Text, '"num_queries": 5',
+      '"num_queries": ' + IntToStr(cQueries), []));
+  finally
+    Cfg.Free;
+  end;
+  NN := BuildDetrFromSafeTensors(StPath, Config, {pTrainable=}true, CfgPath);
+  try
+    AssertEquals('num_queries = feature-grid token count', cQueries,
+      Config.NumQueries);
+    PosLayers := 0; QueryTables := 0; SpatialTables := 0;
+    for t := 0 to NN.Layers.Count - 1 do
+    begin
+      Layer := NN.Layers[t];
+      if not (Layer is TNNetLearnedPositionalEmbedding) then continue;
+      Inc(PosLayers);
+      Marked := true;
+      for q := 0 to cQueries - 1 do
+        for c := 0 to cDModel - 1 do
+          if Abs(Layer.FArrNeurons[0].Weights.FData[q * cDModel + c] -
+                 (100 + q + c * 0.01)) > 1e-4 then Marked := false;
+      if Marked then Inc(QueryTables)
+      else
+      begin
+        Inc(SpatialTables);
+        AssertTrue('spatial table holds the sine constant',
+          Abs(Layer.FArrNeurons[0].Weights.FData[0]) <= 1.0);
+      end;
+    end;
+    AssertEquals('pos-embed layers', 4, PosLayers);
+    AssertEquals('query-pos tables kept', 2, QueryTables);
+    AssertEquals('spatial-pos tables filled', 2, SpatialTables);
+  finally
+    NN.Free;
+    DeleteFile(StPath);
+    DeleteFile(CfgPath);
   end;
 end;
 

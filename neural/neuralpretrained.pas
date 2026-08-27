@@ -76494,7 +76494,6 @@ end;
 function BuildDetr(Reader: TNNetSafeTensorsReader;
   const Config: TDetrConfig; pTrainable: boolean): TNNet;
 var
-  LpMax: integer;
   NN: TNNet;
   StemConv, InputProj, EncStates, QueryInput: TNNetLayer;
   SpatialPos, BranchIn, Normed, Plain, AttnOut, QPos: TNNetLayer;
@@ -76503,18 +76502,17 @@ var
   DecSelfNorm, DecCrossNorm, DecFFNNorm, DecFC1, DecFC2: array of TNNetLayer;
   DecSelf, DecCross: array of TDetrAttnRefs;
   EncSelf: array of TDetrAttnRefs;
-  DecSpatialPos: array of TNNetLayer;
+  EncSpatialPos, DecSpatialPos: array of TNNetLayer;
   DecQueryPosSelf, DecQueryPosCross: array of TNNetLayer;
   ClassHead, BBox0, BBox1, BBox2, DecFinalNorm: TNNetLayer;
   FirstSpatialPos: TNNetLayer;
   NumStages, Stage, BlockIdx, Stride, InWidth, BaseWidth, OutWidth: integer;
   NumStagesM1, EncLayersM1, DecLayersM1: integer;
   BackboneDepthsM1: integer;
-  GridDim, NumTokens, L, Mid: integer;
-  StagePrefix, BP, LP, ShortcutKey: string;
+  GridDim, NumTokens, L: integer;
+  StagePrefix, BP, LP: string;
   BlockRefs: array of TResNetBlockLayers;
   RefCount: integer;
-  ConfigRN: TResNetConfig;
 
   // Builds one HF ResNet bottleneck block (layer.0=1x1, layer.1=3x3 stride,
   // layer.2=1x1; optional shortcut 1x1). Mirrors AddResNetBlock but the HF
@@ -76544,6 +76542,22 @@ var
     else
       NN.AddLayer( TNNetSum.Create([Branch, Inp]) );
     NN.AddLayer( TNNetReLU.Create() );
+  end;
+
+  // Fills one spatial pos table. Every DETR spatial table holds the same 2-D
+  // sine constant, so it is computed once and copied into the rest.
+  procedure FillSpatialPosTable(Layer: TNNetLayer);
+  begin
+    if FirstSpatialPos = nil then
+    begin
+      FillDetrSpatialPosEmbed(Layer, GridDim, GridDim, Config.DModel);
+      FirstSpatialPos := Layer;
+    end
+    else
+    begin
+      Layer.FArrNeurons[0].Weights.Copy(FirstSpatialPos.FArrNeurons[0].Weights);
+      Layer.FlushWeightCache();
+    end;
   end;
 
 begin
@@ -76582,6 +76596,7 @@ begin
   SetLength(DecFFNNorm, Config.DecoderLayers);
   SetLength(DecFC1, Config.DecoderLayers);
   SetLength(DecFC2, Config.DecoderLayers);
+  SetLength(EncSpatialPos, Config.EncoderLayers);
   SetLength(DecSpatialPos, Config.DecoderLayers);
   SetLength(DecQueryPosSelf, Config.DecoderLayers);
   SetLength(DecQueryPosCross, Config.DecoderLayers);
@@ -76635,6 +76650,7 @@ begin
       // filled with the same 2-D sine constant below).
       SpatialPos := NN.AddLayerAfter(
         TNNetLearnedPositionalEmbedding.Create(NumTokens).SetTrainable(pTrainable), Plain);
+      EncSpatialPos[L] := SpatialPos;
       AttnOut := AddDetrAttention(NN, Config, {QSource=}SpatialPos,
         {KSource=}SpatialPos, {VSource=}Plain, Config.EncoderHeads,
         Config.DModel, Refs);
@@ -76650,8 +76666,6 @@ begin
       EncFC2[L] := NN.AddLayer( TNNetPointwiseConvLinear.Create(Config.DModel, 0).SetTrainable(pTrainable) );
       NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchIn]) );
       EncFFNNorm[L] := NN.AddLayer( TNNetTokenLayerNorm.Create().SetTrainable(pTrainable) );
-      // The spatial pos table is per-layer; remember the LAST one is the
-      // encoder memory's pos (reused by the decoder cross-attn keys).
     end;
     EncStates := NN.GetLastLayer();  // encoder memory (NumTokens,1,d_model)
 
@@ -76818,36 +76832,13 @@ begin
       Config.DModel);
 
     // spatial pos tables (encoder layers + decoder cross-attn): the SAME 2-D
-    // sine constant, computed in Pascal.
-    for L := 0 to EncLayersM1 do
-    begin
-      // each encoder layer's spatial-pos layer is the one feeding its q/k.
-      // We stored EncSelf refs only; re-derive the pos layer via its q_proj's
-      // previous layer is fragile, so fill them by walking the net below.
-    end;
-    // Fill every TNNetLearnedPositionalEmbedding that holds the SPATIAL table
-    // (those sized NumTokens). The query-pos layers (sized NumQueries) were
-    // already loaded above; do not overwrite them.
-    // Every spatial table holds the same constant, so it is computed once and
-    // copied into the remaining layers (#5 across calls).
-    LpMax := NN.Layers.Count - 1;
+    // sine constant. The layers are taken by reference - a size test would also
+    // match the query-pos tables whenever num_queries = NumTokens.
     FirstSpatialPos := nil;
-    for L := 0 to LpMax do
-      if (NN.Layers[L] is TNNetLearnedPositionalEmbedding) and
-         (NN.Layers[L].Output.SizeX = NumTokens) then
-      begin
-        if FirstSpatialPos = nil then
-        begin
-          FillDetrSpatialPosEmbed(NN.Layers[L], GridDim, GridDim, Config.DModel);
-          FirstSpatialPos := NN.Layers[L];
-        end
-        else
-        begin
-          NN.Layers[L].FArrNeurons[0].Weights.Copy(
-            FirstSpatialPos.FArrNeurons[0].Weights);
-          NN.Layers[L].FlushWeightCache();
-        end;
-      end;
+    for L := 0 to EncLayersM1 do
+      FillSpatialPosTable(EncSpatialPos[L]);
+    for L := 0 to DecLayersM1 do
+      FillSpatialPosTable(DecSpatialPos[L]);
 
     // class head + box MLP
     LoadLlamaLinearWeights(Reader, ClassHead,
@@ -76864,8 +76855,6 @@ begin
     // first Compute starts the queries at zero.
     QueryInput.Output.Fill(0);
     Result := NN;
-    // silence unused locals
-    if (Mid = 0) and (ShortcutKey = '') and (ConfigRN.Depth = 0) then ;
   except
     NN.Free;
     raise;
