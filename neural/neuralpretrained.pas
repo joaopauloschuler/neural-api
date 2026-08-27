@@ -12133,6 +12133,12 @@ procedure RunMask2FormerSemantic(NN: TNNet;
   const LevelSources, LevelKeyPos: array of TNNetVolume;
   ClassLogits, MaskLogits: TNNetVolume);
 
+// Computes the per-query mask logits from a mask embedding (Q,1,Hidden) and the
+// per-pixel mask_features (MaskW,MaskH,Hidden): mask[q,p] = sum_c embed[q,c] *
+// feat[p,c]. Dest is resized to (Q, 1, MaskW*MaskH).
+procedure Mask2FormerMaskEinsum(MaskEmbed, MaskFeatures, Dest: TNNetVolume;
+  NumQueries, Hidden, MaskW, MaskH: integer);
+
 // Folds the final-layer per-query ClassLogits (NumQueries,1,NumLabels+1) and
 // MaskLogits (NumQueries,1,MaskW*MaskH) into a per-pixel semantic label map.
 // Mirrors HF post_process_semantic_segmentation: softmax each query's class
@@ -12654,6 +12660,26 @@ begin
   else if (Layer is TNNetEmbedding) and
      TNNetEmbedding(Layer).WeightsQuantizedInt8 then
     TNNetEmbedding(Layer).DequantizeWeightsInt8();
+end;
+
+// Replicates already-imported weights onto a second layer built from the same
+// shape (checkpoints that feed one tensor set into several layers).
+procedure CopyImportedLayerWeights(Dest, Src: TNNetLayer);
+var
+  n, MaxNeuronPos: integer;
+begin
+  EnsureWritableImportWeights(Dest);
+  if Dest.Neurons.Count <> Src.Neurons.Count then
+    ImportError('Import: shared-weight copy between layers of ' +
+      IntToStr(Dest.Neurons.Count) + ' and ' + IntToStr(Src.Neurons.Count) +
+      ' neurons.');
+  MaxNeuronPos := Dest.Neurons.Count - 1;
+  for n := 0 to MaxNeuronPos do
+  begin
+    Dest.Neurons[n].Weights.CopyNoChecks(Src.Neurons[n].Weights);
+    Dest.Neurons[n].BiasWeight := Src.Neurons[n].BiasWeight;
+  end;
+  Dest.FlushWeightCache();
 end;
 
 // Transposes ColCount COLUMNS of a row-major [Rows, Stride] slab (starting
@@ -76380,7 +76406,7 @@ procedure LoadDetr1x1Conv(Reader: TNNetSafeTensorsReader; Layer: TNNetLayer;
   const WName, BName: string; OutCh, InCh: integer);
 var
   W, B: TNNetVolume;
-  o, c, OutChM1, InChM1: integer;
+  o, OutChM1, SrcBase: integer;
 begin
   EnsureWritableImportWeights(Layer);
   if not Reader.HasTensor(WName) then
@@ -76398,12 +76424,13 @@ begin
     Reader.LoadTensorFlat(WName, W);
     Reader.LoadTensorFlat(BName, B);
     OutChM1 := OutCh - 1;
-    InChM1 := InCh - 1;
+    SrcBase := 0;
     for o := 0 to OutChM1 do
     begin
-      for c := 0 to InChM1 do
-        Layer.FArrNeurons[o].Weights.FData[c] := W.FData[o * InCh + c];
+      Move(W.FData[SrcBase], Layer.FArrNeurons[o].Weights.FData[0],
+        InCh * csNeuralFloatSize);
       Layer.FArrNeurons[o].BiasWeight := B.FData[o];
+      Inc(SrcBase, InCh);
     end;
     Layer.FlushWeightCache();
   finally
@@ -76711,15 +76738,16 @@ begin
         LP + 'final_layer_norm', Config.DModel);
     end;
 
-    // object-query position table (loaded into every decoder pos layer).
+    // object-query position table (the same table in every decoder pos layer,
+    // so it is decoded once and copied).
+    LoadDetrLearnedPosEmbed(Reader, DecQueryPosSelf[0],
+      'model.query_position_embeddings.weight', Config.NumQueries,
+      Config.DModel);
     for L := 0 to DecLayersM1 do
     begin
-      LoadDetrLearnedPosEmbed(Reader, DecQueryPosSelf[L],
-        'model.query_position_embeddings.weight', Config.NumQueries,
-        Config.DModel);
-      LoadDetrLearnedPosEmbed(Reader, DecQueryPosCross[L],
-        'model.query_position_embeddings.weight', Config.NumQueries,
-        Config.DModel);
+      if L > 0 then
+        CopyImportedLayerWeights(DecQueryPosSelf[L], DecQueryPosSelf[0]);
+      CopyImportedLayerWeights(DecQueryPosCross[L], DecQueryPosSelf[0]);
     end;
 
     // decoder layers
@@ -77437,9 +77465,13 @@ begin
       LoadLayerNormWeights(Reader, M2F.Layers[L].FfnNorm,
         LP + 'final_layer_norm.weight', LP + 'final_layer_norm.bias',
         Config.Hidden);
-      // shared predictor (same weights into every layer's copy).
-      LoadM2FPredictor(Reader, M2F.Layers[L].PredNorm, M2F.Layers[L].Cls,
-        M2F.Layers[L].ME0, M2F.Layers[L].ME1, M2F.Layers[L].ME2, Config);
+      // shared predictor: the init net already imported these tensors, so every
+      // layer's copy is filled from it instead of re-decoding the checkpoint.
+      CopyImportedLayerWeights(M2F.Layers[L].PredNorm, M2F.InitNet.PredNorm);
+      CopyImportedLayerWeights(M2F.Layers[L].Cls, M2F.InitNet.Cls);
+      CopyImportedLayerWeights(M2F.Layers[L].ME0, M2F.InitNet.ME0);
+      CopyImportedLayerWeights(M2F.Layers[L].ME1, M2F.InitNet.ME1);
+      CopyImportedLayerWeights(M2F.Layers[L].ME2, M2F.InitNet.ME2);
     end;
 
     // The container returned to the caller is the init net's TNNet (the caller
@@ -77486,34 +77518,34 @@ begin
   Result := BuildMask2FormerFromSafeTensorsEx(FileName, Config, pTrainable);
 end;
 
-// Computes the per-query mask logits from a mask embedding (Q,1,H) and the
-// per-pixel mask_features (W,H,Hidden): mask[q, p] = sum_c embed[q,c] *
-// feat[p, c]. Dest is (Q, 1, W*H).
 procedure Mask2FormerMaskEinsum(MaskEmbed, MaskFeatures, Dest: TNNetVolume;
   NumQueries, Hidden, MaskW, MaskH: integer);
 var
   q, p, NumPix, pH: integer;
   NumQueriesM1, NumPixM1: integer;
-  meBase, destBase: integer;
-  mePtr: TNeuralFloatArrPtr;
+  meBase, destPos: integer;
+  mfPtr: TNeuralFloatArrPtr;
 begin
   NumPix := MaskW * MaskH;
   Dest.ReSize(NumQueries, 1, NumPix);
   NumQueriesM1 := NumQueries - 1;
   NumPixM1 := NumPix - 1;
-  for q := 0 to NumQueriesM1 do
+  // Pixel-outer so the big mask_features volume is streamed once and the small
+  // query embedding stays cached; both dot-product runs stay contiguous (#13).
+  pH := 0;
+  for p := 0 to NumPixM1 do
   begin
-    meBase := MaskEmbed.GetRawPos(q, 0, 0);
-    destBase := Dest.GetRawPos(q, 0, 0);
-    mePtr := MaskEmbed.GetRawPtr(meBase);   // fixed for the whole p loop (#8)
-    pH := 0;
-    for p := 0 to NumPixM1 do
+    mfPtr := MaskFeatures.GetRawPtr(pH);
+    meBase := MaskEmbed.GetRawPos(0, 0, 0);
+    destPos := Dest.GetRawPos(0, 0, 0) + p;
+    for q := 0 to NumQueriesM1 do
     begin
-      // Both runs are contiguous over Hidden (rule #13/#12).
-      Dest.FData[destBase + p] := TNNetVolume.DotProduct(
-        mePtr, MaskFeatures.GetRawPtr(pH), Hidden);
-      Inc(pH, Hidden);
+      Dest.FData[destPos] := TNNetVolume.DotProduct(
+        MaskEmbed.GetRawPtr(meBase), mfPtr, Hidden);
+      Inc(meBase, Hidden);
+      Inc(destPos, NumPix);
     end;
+    Inc(pH, Hidden);
   end;
 end;
 

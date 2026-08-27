@@ -576,6 +576,7 @@ type
     procedure TestDetrObjectDetectionParity;
     procedure TestDetrDetectionDecode;
     procedure TestMask2FormerParity;
+    procedure TestMask2FormerMaskEinsumOrderParity;
     procedure TestMask2FormerSemanticDecodeReference;
     procedure TestYoloConfigFromJSONFile;
     procedure TestYoloObjectDetectionParity;
@@ -22448,6 +22449,62 @@ begin
     MaskLogits.Free;
     for i := 0 to Length(SrcArr) - 1 do begin SrcArr[i].Free; PosArr[i].Free; end;
     FreeMask2Former(NN);
+  end;
+end;
+
+// The mask einsum is pixel-outer for cache reasons; this pins it bit-identical
+// to the query-outer order (same DotProduct calls, same operand runs) on a few
+// shapes, including non-square and degenerate ones.
+procedure TTestNeuralPretrained.TestMask2FormerMaskEinsumOrderParity;
+var
+  ShapeIdx, NQ, HD, MW, MH, NumPix, q, p, i: integer;
+  meBase, refBase, pH: integer;
+  MaskEmbed, MaskFeatures, Got, Ref: TNNetVolume;
+const
+  csNQ: array[0..3] of integer = (7, 1, 4, 3);
+  csHD: array[0..3] of integer = (16, 5, 33, 1);
+  csMW: array[0..3] of integer = (5, 3, 2, 6);
+  csMH: array[0..3] of integer = (3, 6, 2, 1);
+begin
+  for ShapeIdx := 0 to 3 do
+  begin
+    NQ := csNQ[ShapeIdx];
+    HD := csHD[ShapeIdx];
+    MW := csMW[ShapeIdx];
+    MH := csMH[ShapeIdx];
+    NumPix := MW * MH;
+    MaskEmbed := TNNetVolume.Create(NQ, 1, HD);
+    MaskFeatures := TNNetVolume.Create(MW, MH, HD);
+    Got := TNNetVolume.Create(1, 1, 1);
+    Ref := TNNetVolume.Create(NQ, 1, NumPix);
+    try
+      RandSeed := 1234 + ShapeIdx;
+      for i := 0 to MaskEmbed.Size - 1 do MaskEmbed.FData[i] := Random - 0.5;
+      for i := 0 to MaskFeatures.Size - 1 do MaskFeatures.FData[i] := Random - 0.5;
+      // query-outer reference.
+      for q := 0 to NQ - 1 do
+      begin
+        meBase := MaskEmbed.GetRawPos(q, 0, 0);
+        refBase := Ref.GetRawPos(q, 0, 0);
+        pH := 0;
+        for p := 0 to NumPix - 1 do
+        begin
+          Ref.FData[refBase + p] := TNNetVolume.DotProduct(
+            MaskEmbed.GetRawPtr(meBase), MaskFeatures.GetRawPtr(pH), HD);
+          Inc(pH, HD);
+        end;
+      end;
+      Mask2FormerMaskEinsum(MaskEmbed, MaskFeatures, Got, NQ, HD, MW, MH);
+      AssertEquals('mask einsum size', Ref.Size, Got.Size);
+      for i := 0 to Ref.Size - 1 do
+        AssertTrue('mask einsum bit parity at ' + IntToStr(i),
+          Got.FData[i] = Ref.FData[i]);
+    finally
+      MaskEmbed.Free;
+      MaskFeatures.Free;
+      Got.Free;
+      Ref.Free;
+    end;
   end;
 end;
 
