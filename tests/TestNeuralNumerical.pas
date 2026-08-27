@@ -15,6 +15,9 @@ uses
 type
   TTestNeuralNumerical = class(TTestCase)
   private
+    // Last message handed to TEasyOpenCL.ErrorProc by a deliberate bad build.
+    FLastCompileError: string;
+    procedure CaptureCompileError(const AMessage: string);
     // Shared input+weight finite-difference check for an asymmetric kernel.
     procedure RectangularConvGradientCheckXY(pFeatureSizeX, pFeatureSizeY: integer; const ALabel: string);
     // Shared CPU-vs-device forward comparison for the fused MoE expert banks.
@@ -597,6 +600,11 @@ type
     // source in OpenCL memory can put it there - and the projection follows
     // only when the normalized tokens stayed.
     procedure TokenRMSNormResidentChainUnforcedOpenCLParity;
+    // TEasyOpenCL.CompileProgram owns the PChar copy of its program source
+    // (TStrings.GetText StrNew's it), so repeated compiles must not grow the
+    // FPC heap; the failing-build path must also survive its build-log read.
+    procedure CompileProgramSourceIsNotLeaked;
+    procedure CompileProgramBuildFailureLogIsSafe;
     // OpenCL gated FFN forward offload parity (vs CPU) for the GLU-family
     // activations TNNetGLU / TNNetSwiGLU / TNNetGEGLU / TNNetGEGLUErf.
     procedure GLUFamilyOpenCLParity;
@@ -78088,6 +78096,141 @@ begin
     Input.Free;
   end;
 end;
+
+procedure TTestNeuralNumerical.CaptureCompileError(const AMessage: string);
+begin
+  FLastCompileError := AMessage;
+end;
+
+// Data-segment size of this process in KB, or -1 where /proc is unavailable.
+// The suite links cmem, so GetFPCHeapStatus is blind and a leak is only
+// visible as growth of the process image.
+function ReadVmDataKB(): int64;
+var
+  Lines: TStringList;
+  i, SpacePos: integer;
+  Line: string;
+begin
+  Result := -1;
+  if not FileExists('/proc/self/status') then Exit;
+  Lines := TStringList.Create();
+  try
+    Lines.LoadFromFile('/proc/self/status');
+    for i := 0 to Lines.Count - 1 do
+    begin
+      Line := Trim(Lines[i]);
+      if Copy(Line, 1, 7) = 'VmData:' then
+      begin
+        Line := Trim(Copy(Line, 8, Length(Line)));
+        SpacePos := Pos(' ', Line);
+        if SpacePos > 0 then Line := Copy(Line, 1, SpacePos - 1);
+        Result := StrToInt64Def(Line, -1);
+        Exit;
+      end;
+    end;
+  finally
+    Lines.Free;
+  end;
+end;
+
+// TEasyOpenCL.CompileProgram takes a caller-owned PChar copy of the program
+// source. Compiling a deliberately large source repeatedly must leave the
+// process image flat: a missing StrDispose loses one source length per call.
+procedure TTestNeuralNumerical.CompileProgramSourceIsNotLeaked;
+{$IFDEF OpenCL}
+const
+  csRepeats = 8;
+var
+  EasyCL: TEasyOpenCL;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Padding, KernelSrc: string;
+  i, SrcLen: integer;
+  MemBefore, MemAfter, LeakKB: int64;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  if ReadVmDataKB() < 0 then
+  begin
+    AssertTrue('no /proc/self/status: SKIP', true);
+    Exit;
+  end;
+  // A big comment block makes each leaked copy an mmap of its own, well clear
+  // of driver-side noise, while staying trivial for the device compiler.
+  Padding := StringOfChar('x', 1000000);
+  KernelSrc := '/* ' + Padding + ' */' + LineEnding +
+    '__kernel void cai_leak_probe(__global float* v)' + LineEnding +
+    '{ v[get_global_id(0)] = 1.0f; }' + LineEnding;
+  SrcLen := Length(KernelSrc);
+  EasyCL := TEasyOpenCL.Create();
+  try
+    EasyCL.HideMessages();
+    EasyCL.SetCurrentPlatform(PlatformId);
+    EasyCL.SetCurrentDevice(DeviceId);
+    // Warm up: the first compile settles the driver-side and RTL allocations.
+    EasyCL.CompileProgram(KernelSrc);
+    MemBefore := ReadVmDataKB();
+    for i := 1 to csRepeats do EasyCL.CompileProgram(KernelSrc);
+    MemAfter := ReadVmDataKB();
+    LeakKB := (Int64(csRepeats) * SrcLen) div 1024;
+    AssertTrue('CompileProgram data-segment growth over ' + IntToStr(csRepeats) +
+      ' compiles = ' + IntToStr(MemAfter - MemBefore) + ' KB; one leaked source ' +
+      'per compile would be ' + IntToStr(LeakKB) + ' KB',
+      MemAfter - MemBefore < LeakKB div 2);
+  finally
+    EasyCL.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// A failing build reads the device build log into a fixed stack buffer. The
+// whole buffer must be offered to the driver from its first byte, and the
+// reported message must be a readable, terminated log.
+procedure TTestNeuralNumerical.CompileProgramBuildFailureLogIsSafe;
+{$IFDEF OpenCL}
+var
+  EasyCL: TEasyOpenCL;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Guard: array[0..63] of byte;
+  i: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  FillChar(Guard, SizeOf(Guard), $5A);
+  FLastCompileError := '';
+  EasyCL := TEasyOpenCL.Create();
+  try
+    EasyCL.HideMessages();
+    EasyCL.ErrorProc := @Self.CaptureCompileError;
+    EasyCL.SetCurrentPlatform(PlatformId);
+    EasyCL.SetCurrentDevice(DeviceId);
+    EasyCL.CompileProgram('__kernel void broken(__global float* v) { this is not C; }');
+    AssertTrue('build failure must be reported: ' + FLastCompileError,
+      Pos('Failed to build program executable', FLastCompileError) > 0);
+    AssertTrue('build log must be shorter than the 1000 byte buffer',
+      Length(FLastCompileError) < 1000 + 60);
+  finally
+    EasyCL.Free;
+  end;
+  for i := 0 to High(Guard) do
+    AssertEquals('stack guard byte ' + IntToStr(i), $5A, Guard[i]);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 initialization
   RegisterTest(TTestNeuralNumerical);

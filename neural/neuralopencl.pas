@@ -1843,52 +1843,61 @@ begin
   err := 0;
   FreeContext();
 
+  // GetText/StrNew return a caller-owned copy of the source: the try/finally
+  // below disposes it on every exit path, early error returns included.
   {$IFDEF FPC}
   localKernelSource := FOpenCLProgramSource.GetText();
   {$ELSE}
   localKernelSource := AnsiStrings.StrNew(PAnsiChar(AnsiString(FOpenCLProgramSource.Text)));
   {$ENDIF}
+  try
+    // Create a compute context
+    FContext := CreateContext();
+    if FContext = nil then exit;
 
-  // Create a compute context
-  FContext := CreateContext();
-  if FContext = nil then exit;
+    // Create a command queue
+    FCommands := CreateCommandQueue();
 
-  // Create a command queue
-  FCommands := CreateCommandQueue();
+    // Create the compute program from the source buffer
+    {$IFDEF FPC}
+    FProg := clCreateProgramWithSource(context, 1, PPChar(@localKernelSource), nil,  err);
+    {$ELSE}
+    FProg := clCreateProgramWithSource(context, 1, PPAnsiChar(@localKernelSource), nil,  @err);
+    {$ENDIF}
+    if FProg = nil then
+    begin
+      FMessageProc(localKernelSource);
+      FErrorProc('Error: Failed to create compute program:' + IntToStr(err));
+      exit;
+    end
+    else
+      FMessageProc('clCreateProgramWithSource OK!');
 
-  // Create the compute program from the source buffer
-  {$IFDEF FPC}
-  FProg := clCreateProgramWithSource(context, 1, PPChar(@localKernelSource), nil,  err);
-  {$ELSE}
-  FProg := clCreateProgramWithSource(context, 1, PPAnsiChar(@localKernelSource), nil,  @err);
-  {$ENDIF}
-  if FProg = nil then
-  begin
-    FMessageProc(localKernelSource);
-    FErrorProc('Error: Failed to create compute program:' + IntToStr(err));
-    exit;
-  end
-  else
-    FMessageProc('clCreateProgramWithSource OK!');
+    localCompilerOptions := {$IFDEF FPC}StrAlloc{$ELSE}AnsiStrAlloc{$ENDIF}(length(FCompilerOptions)+1);
+    {$IFDEF FPC}StrPCopy{$ELSE}AnsiStrings.StrPCopy{$ENDIF}(localCompilerOptions,FCompilerOptions);
 
-  localCompilerOptions := {$IFDEF FPC}StrAlloc{$ELSE}AnsiStrAlloc{$ENDIF}(length(FCompilerOptions)+1);
-  {$IFDEF FPC}StrPCopy{$ELSE}AnsiStrings.StrPCopy{$ENDIF}(localCompilerOptions,FCompilerOptions);
+    // Build the program executable
+    err := clBuildProgram(FProg, 0, nil, localCompilerOptions, nil, nil);
 
-  // Build the program executable
-  err := clBuildProgram(FProg, 0, nil, localCompilerOptions, nil, nil);
+    {$IFDEF FPC}StrDispose{$ELSE}AnsiStrings.StrDispose{$ENDIF}(localCompilerOptions);
 
-  {$IFDEF FPC}StrDispose{$ELSE}AnsiStrings.StrDispose{$ENDIF}(localCompilerOptions);
-
-  if (err <> CL_SUCCESS) then
-  begin
-    errorlog := @errorlogstr[1];
-    loglen := SizeOf(errorlogstr);
-    clGetProgramBuildInfo(FProg, FCurrentDevice, CL_PROGRAM_BUILD_LOG, SizeOf(errorlogstr), errorlog, {$IFDEF FPC}loglen{$ELSE}@loglen{$ENDIF});
-    FErrorProc('Error: Failed to build program executable:' + IntToStr(err) + ' ' + errorlog);
-    exit;
-  end
-  else
-    FMessageProc('clBuildProgram OK!');
+    if (err <> CL_SUCCESS) then
+    begin
+      // The log goes into the whole buffer from index 0; the last byte is
+      // forced to #0 so the PChar terminates even on a driver that fills it.
+      errorlogstr[0] := #0;
+      errorlog := @errorlogstr[0];
+      loglen := SizeOf(errorlogstr);
+      clGetProgramBuildInfo(FProg, FCurrentDevice, CL_PROGRAM_BUILD_LOG, SizeOf(errorlogstr), errorlog, {$IFDEF FPC}loglen{$ELSE}@loglen{$ENDIF});
+      errorlogstr[High(errorlogstr)] := #0;
+      FErrorProc('Error: Failed to build program executable:' + IntToStr(err) + ' ' + errorlog);
+      exit;
+    end
+    else
+      FMessageProc('clBuildProgram OK!');
+  finally
+    {$IFDEF FPC}StrDispose{$ELSE}AnsiStrings.StrDispose{$ENDIF}(localKernelSource);
+  end;
 end;
 
 procedure TEasyOpenCL.printDevicesInfo();
