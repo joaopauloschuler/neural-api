@@ -33472,11 +33472,12 @@ var
   StartTime: double;
   SeqLen, i, j, d: integer;
   SeqLenM1, DkM1: integer;
+  jLo, jHi, BandLen: integer;
   Score, MaxScore, SumExp: TNeuralFloat;
   Prev, Seg: TNNetVolume;
   AttnRowPtr: TNeuralFloatArrPtr;
   SegI, QBase, KBase, VBase, iDk, posPack: integer;
-  HasSeg: boolean;
+  HasSeg, HasSoftCap: boolean;
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   StartTime := Now();
@@ -33485,6 +33486,7 @@ begin
   SeqLenM1 := SeqLen - 1;
   DkM1 := FDk - 1;
   HasSeg := Assigned(FSegLayer);
+  HasSoftCap := FScoreSoftCap > 0;   // layer state, invariant per key (#20)
   Seg := nil;
   SegI := 0;
   if HasSeg then Seg := FSegLayer.FOutput;
@@ -33529,19 +33531,49 @@ begin
     if HasSeg then SegI := Round(Seg[i, 0, 0]);
     AttnRow := FAttn.GetRawPos(0, i);
     MaxScore := -1e30;
-    for j := 0 to SeqLenM1 do
+    // Same split as the CPU Compute(): a segment source makes the mask
+    // data-dependent, so that path keeps the per-(i, j) predicate over the
+    // whole row. Without one every mask term is a half-line in j and the
+    // attendable keys form ONE contiguous band (see MaskBand), so the band is
+    // transformed with no per-key test and the zeros the softmax would have
+    // produced outside it are written directly.
+    if HasSeg then
     begin
-      pos := AttnRow + j;
-      if ScoreIsMasked(i, j, HasSeg, Seg, SegI) then
-        FAttn.FData[pos] := -1e9
-      else
+      jLo := 0;
+      jHi := SeqLenM1;
+      for j := 0 to SeqLenM1 do
       begin
+        pos := AttnRow + j;
+        if ScoreIsMasked(i, j, HasSeg, Seg, SegI) then
+          FAttn.FData[pos] := -1e9
+        else
+        begin
+          Score := FAttn.FData[pos] * FInvSqrtDk;
+          if HasSoftCap then
+            Score := FScoreSoftCap * pcr_tanhf(Score * FInvScoreSoftCap);
+          FAttn.FData[pos] := Score;
+        end;
+        if FAttn.FData[pos] > MaxScore then MaxScore := FAttn.FData[pos];
+      end;
+    end
+    else
+    begin
+      MaskBand(i, SeqLenM1, jLo, jHi);
+      for j := jLo to jHi do
+      begin
+        pos := AttnRow + j;
         Score := FAttn.FData[pos] * FInvSqrtDk;
-        if FScoreSoftCap > 0 then
+        if HasSoftCap then
           Score := FScoreSoftCap * pcr_tanhf(Score * FInvScoreSoftCap);
         FAttn.FData[pos] := Score;
+        if Score > MaxScore then MaxScore := Score;
       end;
-      if FAttn.FData[pos] > MaxScore then MaxScore := FAttn.FData[pos];
+      // exp(-1e9 - max) underflows to EXACTLY 0, which is what the masked
+      // slots carried before, and the P.V matmul below already relies on it.
+      if jLo > 0 then
+        FillDWord(FAttn.FData[AttnRow], jLo, 0);
+      if jHi < SeqLenM1 then
+        FillDWord(FAttn.FData[AttnRow + jHi + 1], SeqLenM1 - jHi, 0);
     end;
     if MaxScore <= cMaskFloor then
     begin
@@ -33551,13 +33583,14 @@ begin
     end
     else
     begin
-      // The score row is contiguous, so the shift, the exp and the normalizer
-      // are one fused vectorized pass (#19).
-      AttnRowPtr := FAttn.GetRawPtr(AttnRow);
+      // The band is contiguous, so the shift, the exp and the normalizer are
+      // one fused vectorized pass (#19).
+      BandLen := jHi - jLo + 1;
+      AttnRowPtr := FAttn.GetRawPtr(AttnRow + jLo);
       SumExp := TNNetVolume.ExpShiftSum(AttnRowPtr, AttnRowPtr, MaxScore,
-        SeqLen);
+        BandLen);
       if SumExp > 0 then
-        TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, SeqLen);
+        TNNetVolume.Mul(AttnRowPtr, 1 / SumExp, BandLen);
     end;
   end;
 
