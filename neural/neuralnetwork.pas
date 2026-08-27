@@ -24516,7 +24516,7 @@ var
   gradBeta, beta, x, betaX, sig, err: TNeuralFloat;
   i: integer;
   LocalPrevOutput, PrevErr: TNNetVolume;
-  ScalarPrevErr: boolean;
+  ScalarPrevErr, HasDeriv: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -24538,24 +24538,44 @@ begin
   // FOutputErrorDeriv whenever it took its scratch path, so the whole input
   // gradient is one vectorized MulAdd. The elementwise form below stays for the
   // forward-only path, where that cache holds nothing.
+  HasDeriv := (FOutput.Size = FOutputError.Size) and
+              (FOutputErrorDeriv.Size = FOutput.Size);
   ScalarPrevErr := PropagatesErr;
-  if PropagatesErr and (FOutput.Size = FOutputError.Size) and
-     (FOutputErrorDeriv.Size = FOutput.Size) then
+  if PropagatesErr and HasDeriv then
   begin
     TNNetVolume.MulAdd(PrevErr.DataPtr, FOutputError.DataPtr,
       FOutputErrorDeriv.DataPtr, MaxOutputErrorPos + 1);
     ScalarPrevErr := False;
   end;
-  for i := 0 to MaxOutputErrorPos do
+  if HasDeriv and (beta <> 0) then
   begin
-    x := LocalPrevOutput.FData[i];
-    betaX := beta * x;
-    sig := 1 / (1 + NeuralExp(-betaX));
-    err := FOutputError.FData[i];
-    gradBeta := gradBeta + err * x * x * sig * (1 - sig);
-    if ScalarPrevErr then
-      PrevErr.FData[i] := PrevErr.FData[i] +
-        err * (sig + x * beta * sig * (1 - sig));
+    // x*(dy/dx) - y = x*(sig + x*beta*sig*(1-sig)) - x*sig
+    //              = beta * x^2 * sig * (1 - sig),
+    // so the per-element beta gradient term err*x^2*sig*(1-sig) equals
+    // err*(x*deriv - y)/beta. Compute() cached dy/dx in FOutputErrorDeriv and y
+    // in FOutput on this same path, so no sigmoid is recomputed here. The single
+    // divide stays outside the loop and exact (#21's gradient-check exception).
+    for i := 0 to MaxOutputErrorPos do
+      gradBeta := gradBeta + FOutputError.FData[i] *
+        (LocalPrevOutput.FData[i] * FOutputErrorDeriv.FData[i] -
+         FOutput.FData[i]);
+    gradBeta := gradBeta / beta;
+  end
+  else
+  begin
+    // No cached forward pair (or a zero beta the identity cannot divide by):
+    // rebuild the sigmoid elementwise.
+    for i := 0 to MaxOutputErrorPos do
+    begin
+      x := LocalPrevOutput.FData[i];
+      betaX := beta * x;
+      sig := 1 / (1 + NeuralExp(-betaX));
+      err := FOutputError.FData[i];
+      gradBeta := gradBeta + err * x * x * sig * (1 - sig);
+      if ScalarPrevErr then
+        PrevErr.FData[i] := PrevErr.FData[i] +
+          err * (sig + x * beta * sig * (1 - sig));
+    end;
   end;
   localNeuron.FDelta.Raw[0] := localNeuron.FDelta.Raw[0] +
     (-FLearningRate) * gradBeta;
@@ -24681,7 +24701,7 @@ var
   gradAlpha, alpha, x, ax, sp, expVal, onePlusExp, t, sig, err: TNeuralFloat;
   i: integer;
   LocalPrevOutput, PrevErr: TNNetVolume;
-  ScalarPrevErr: boolean;
+  ScalarPrevErr, HasDeriv: boolean;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -24703,42 +24723,62 @@ begin
   // FOutputErrorDeriv whenever it took its scratch path, so the whole input
   // gradient is one vectorized MulAdd. The elementwise form below stays for the
   // forward-only path, where that cache holds nothing.
+  HasDeriv := (FOutput.Size = FOutputError.Size) and
+              (FOutputErrorDeriv.Size = FOutput.Size);
   ScalarPrevErr := PropagatesErr;
-  if PropagatesErr and (FOutput.Size = FOutputError.Size) and
-     (FOutputErrorDeriv.Size = FOutput.Size) then
+  if PropagatesErr and HasDeriv then
   begin
     TNNetVolume.MulAdd(PrevErr.DataPtr, FOutputError.DataPtr,
       FOutputErrorDeriv.DataPtr, MaxOutputErrorPos + 1);
     ScalarPrevErr := False;
   end;
-  for i := 0 to MaxOutputErrorPos do
+  if HasDeriv and (alpha <> 0) then
   begin
-    x := LocalPrevOutput.FData[i];
-    ax := alpha * x;
-    if ax > 30 then
+    // x*(dy/dx) - y = x*(t + x*(1 - t^2)*alpha*sig) - x*t
+    //              = alpha * x^2 * (1 - t^2) * sig,
+    // so the per-element alpha gradient term err*x^2*(1 - t^2)*sig equals
+    // err*(x*deriv - y)/alpha. Compute() cached dy/dx in FOutputErrorDeriv and y
+    // in FOutput on this same path, so no exp/log/tanh is recomputed here. The
+    // single divide stays outside the loop and exact (#21's exception).
+    for i := 0 to MaxOutputErrorPos do
+      gradAlpha := gradAlpha + FOutputError.FData[i] *
+        (LocalPrevOutput.FData[i] * FOutputErrorDeriv.FData[i] -
+         FOutput.FData[i]);
+    gradAlpha := gradAlpha / alpha;
+  end
+  else
+  begin
+    // No cached forward pair (or a zero alpha the identity cannot divide by):
+    // rebuild softplus/sigmoid/tanh elementwise.
+    for i := 0 to MaxOutputErrorPos do
     begin
-      sp := ax;
-      sig := 1.0;
-    end
-    else if ax < -30 then
-    begin
-      expVal := NeuralExp(ax);
-      sp := expVal;
-      sig := expVal;
-    end
-    else
-    begin
-      expVal := NeuralExp(ax);
-      onePlusExp := 1 + expVal;
-      sp := pcr_logf(onePlusExp);
-      sig := expVal / onePlusExp;
+      x := LocalPrevOutput.FData[i];
+      ax := alpha * x;
+      if ax > 30 then
+      begin
+        sp := ax;
+        sig := 1.0;
+      end
+      else if ax < -30 then
+      begin
+        expVal := NeuralExp(ax);
+        sp := expVal;
+        sig := expVal;
+      end
+      else
+      begin
+        expVal := NeuralExp(ax);
+        onePlusExp := 1 + expVal;
+        sp := pcr_logf(onePlusExp);
+        sig := expVal / onePlusExp;
+      end;
+      t := pcr_tanhf(sp);
+      err := FOutputError.FData[i];
+      gradAlpha := gradAlpha + err * x * x * (1 - t * t) * sig;
+      if ScalarPrevErr then
+        PrevErr.FData[i] := PrevErr.FData[i] +
+          err * (t + x * (1 - t * t) * (alpha * sig));
     end;
-    t := pcr_tanhf(sp);
-    err := FOutputError.FData[i];
-    gradAlpha := gradAlpha + err * x * x * (1 - t * t) * sig;
-    if ScalarPrevErr then
-      PrevErr.FData[i] := PrevErr.FData[i] +
-        err * (t + x * (1 - t * t) * (alpha * sig));
   end;
   localNeuron.FDelta.Raw[0] := localNeuron.FDelta.Raw[0] +
     (-FLearningRate) * gradAlpha;
