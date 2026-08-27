@@ -130,7 +130,7 @@ draws uniformly. `--greedy` hard-overrides everything.
 | `--cpu` | force CPU even when built with `-dOpenCL` | — |
 | `--gpu-platform N` | OpenCL platform index | 0 |
 | `--gpu-device N` | OpenCL device index within the platform | 0 |
-| `--gpu-fp16` | **experimental and under construction.** Half-precision activations in the int8 OpenCL matmuls (`cai_dot_product_int8_h` and its split-K twin): the weights stay int8 and the layer still hands the CPU a `Single`, only the column matrix inside OpenCL memory narrows. Logits are not bit-exact. Needs `--gpu` and int8 weights — `--cpu` or `--fp32` ignores it, and a device that rejects the half kernel keeps the FP32 activations | off |
+| `--experimental-fp16` | **experimental and under construction.** Half-precision activations in the int8 OpenCL matmuls (`cai_dot_product_int8_h` and its split-K twin): the weights stay int8 and the layer still hands the CPU a `Single`, only the column matrix inside OpenCL memory narrows. Logits are not bit-exact. Needs `--gpu` and int8 weights — `--cpu` or `--fp32` ignores it, and a device that rejects the half kernel keeps the FP32 activations | off |
 | `--no-gpu-shared-kernel` | give every layer its own OpenCL kernel handles and command queue instead of the net-wide shared ones (see below) | shared on |
 | `--stats` | per-turn timing to **stderr**: TTFT (prefill + first token), steady-state decode tok/s, and `prompt N (reused K)` from the KV-cache reuse | off |
 | `--profile` | per-layer-class forward timing to **stderr** after each turn (decode steps only — prefill is excluded), plus a `[sched]` line with the layer-graph scheduler stats (graph width, parallel vs serial passes, peak in-flight) | off |
