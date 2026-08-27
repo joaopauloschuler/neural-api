@@ -19603,9 +19603,10 @@ var
   Writer: TNNetSafeTensorsWriter;
   Embeds, LayerNorms, PwConvs: array of TNNetLayer;
   EmbIn, FinalLN, LMHead: TNNetLayer;
+  Lay: TNNetLayer;
   i, BlockCnt, PwBase, ExpectPw, ExpectLN: integer;
   d, IntSize, HeadDim, RotaryDims: integer;
-  LayerCntM1, BlockMax: integer;
+  LayerCntM1, BlockMax, EmbCnt, LNCnt, PwCnt: integer;
   BlockPrefix, AttnPrefix: string;
 
   // Straight HF nn.Linear [OutDim, InDim] (+optional bias [OutDim]) from
@@ -19711,28 +19712,37 @@ begin
   HeadDim := d div Config.NumHeads;
   RotaryDims := Trunc(HeadDim * Config.RotaryPct);
   // ---- collect load-bearing layers in net (= importer build) order ----
-  SetLength(Embeds, 0);
-  SetLength(LayerNorms, 0);
-  SetLength(PwConvs, 0);
+  // All three lists are filled from Net.Layers, so the layer count bounds each
+  // one: size once here and truncate to the real counts after the walk.
   LayerCntM1 := Net.CountLayers - 1;
+  SetLength(Embeds, LayerCntM1 + 1);
+  SetLength(LayerNorms, LayerCntM1 + 1);
+  SetLength(PwConvs, LayerCntM1 + 1);
+  EmbCnt := 0;
+  LNCnt := 0;
+  PwCnt := 0;
   for i := 0 to LayerCntM1 do
   begin
-    if Net.Layers[i] is TNNetEmbedding then
+    Lay := Net.Layers[i];
+    if Lay is TNNetEmbedding then
     begin
-      SetLength(Embeds, Length(Embeds) + 1);
-      Embeds[High(Embeds)] := Net.Layers[i];
+      Embeds[EmbCnt] := Lay;
+      Inc(EmbCnt);
     end
-    else if Net.Layers[i] is TNNetTokenLayerNorm then
+    else if Lay is TNNetTokenLayerNorm then
     begin
-      SetLength(LayerNorms, Length(LayerNorms) + 1);
-      LayerNorms[High(LayerNorms)] := Net.Layers[i];
+      LayerNorms[LNCnt] := Lay;
+      Inc(LNCnt);
     end
-    else if Net.Layers[i] is TNNetPointwiseConvLinear then
+    else if Lay is TNNetPointwiseConvLinear then
     begin
-      SetLength(PwConvs, Length(PwConvs) + 1);
-      PwConvs[High(PwConvs)] := Net.Layers[i];
+      PwConvs[PwCnt] := Lay;
+      Inc(PwCnt);
     end;
   end;
+  SetLength(Embeds, EmbCnt);
+  SetLength(LayerNorms, LNCnt);
+  SetLength(PwConvs, PwCnt);
   if Length(Embeds) <> 1 then
     ImportError('GPT-NeoX export: found ' + IntToStr(Length(Embeds)) +
       ' TNNetEmbedding layers, expected 1 - not a ' +
@@ -19803,9 +19813,10 @@ var
   Writer: TNNetSafeTensorsWriter;
   Embeds, LayerNorms, PwConvs: array of TNNetLayer;
   EmbIn, EmbLN, FinalLN: TNNetLayer;
+  Lay: TNNetLayer;
   i, BlockCnt, PwBase, ExpectPw, ExpectLN: integer;
   d, IntSize, HeadDim: integer;
-  LayerCntM1, BlockMax: integer;
+  LayerCntM1, BlockMax, EmbCnt, LNCnt, PwCnt: integer;
   BlockPrefix, AttnPrefix: string;
 
   // Straight HF nn.Linear [OutDim, InDim] (+bias [OutDim]) from OutDim
@@ -19899,28 +19910,37 @@ begin
     ImportError('BLOOM export: hidden_size not divisible by n_head.');
   HeadDim := d div Config.NumHeads;
   // ---- collect load-bearing layers in net (= importer build) order ----
-  SetLength(Embeds, 0);
-  SetLength(LayerNorms, 0);
-  SetLength(PwConvs, 0);
+  // All three lists are filled from Net.Layers, so the layer count bounds each
+  // one: size once here and truncate to the real counts after the walk.
   LayerCntM1 := Net.CountLayers - 1;
+  SetLength(Embeds, LayerCntM1 + 1);
+  SetLength(LayerNorms, LayerCntM1 + 1);
+  SetLength(PwConvs, LayerCntM1 + 1);
+  EmbCnt := 0;
+  LNCnt := 0;
+  PwCnt := 0;
   for i := 0 to LayerCntM1 do
   begin
-    if Net.Layers[i] is TNNetEmbedding then
+    Lay := Net.Layers[i];
+    if Lay is TNNetEmbedding then
     begin
-      SetLength(Embeds, Length(Embeds) + 1);
-      Embeds[High(Embeds)] := Net.Layers[i];
+      Embeds[EmbCnt] := Lay;
+      Inc(EmbCnt);
     end
-    else if Net.Layers[i] is TNNetTokenLayerNorm then
+    else if Lay is TNNetTokenLayerNorm then
     begin
-      SetLength(LayerNorms, Length(LayerNorms) + 1);
-      LayerNorms[High(LayerNorms)] := Net.Layers[i];
+      LayerNorms[LNCnt] := Lay;
+      Inc(LNCnt);
     end
-    else if Net.Layers[i] is TNNetPointwiseConvLinear then
+    else if Lay is TNNetPointwiseConvLinear then
     begin
-      SetLength(PwConvs, Length(PwConvs) + 1);
-      PwConvs[High(PwConvs)] := Net.Layers[i];
+      PwConvs[PwCnt] := Lay;
+      Inc(PwCnt);
     end;
   end;
+  SetLength(Embeds, EmbCnt);
+  SetLength(LayerNorms, LNCnt);
+  SetLength(PwConvs, PwCnt);
   if Length(Embeds) <> 1 then
     ImportError('BLOOM export: found ' + IntToStr(Length(Embeds)) +
       ' TNNetEmbedding layers, expected 1 - not a ' +
