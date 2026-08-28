@@ -16576,6 +16576,9 @@ type
       pOutputPadding: integer = 0; pSuppressBias: integer = 0); reintroduce; overload;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     procedure Compute(); override;
+    // Never chunks: the inherited ComputeRange is the forward convolution, not
+    // the transposed scatter this layer's Compute runs. Coded by Claude (AI).
+    function ChunkEligible(): boolean; override;
     procedure Backpropagate(); override;
     {$IFDEF OpenCL}
     destructor Destroy(); override;
@@ -101092,6 +101095,11 @@ begin
     (Int64(FNeurons.Count) * (FPrevLayer.FOutput.SizeX * FPrevLayer.FOutput.SizeY)
      * (FFeatureSizeX * FFeatureSizeY) * FPrevLayer.FOutput.Depth >= cNeuralOpenCLMinWork);
   {$ENDIF}
+end;
+
+function TNNetDeconvolution.ChunkEligible(): boolean;
+begin
+  Result := false;
 end;
 
 procedure TNNetDeconvolution.Compute();

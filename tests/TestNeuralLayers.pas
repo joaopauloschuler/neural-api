@@ -122,6 +122,7 @@ type
     procedure TestConvolutionInt8Int8NotEnabled;
     procedure TestConvolutionInt8Int8ChunkedMatchesSerial;
     procedure TestConvolutionInt8Int8ChunkEligible;
+    procedure TestDeconvolutionNeverChunkEligible;
     // Int8 input arming at net level and on TNNetFullConnect
     procedure TestNetEnableInt8InputCountsQuantizedLayers;
     procedure TestDequantizeWeightsInt8DropsInt8Input;
@@ -4209,6 +4210,28 @@ begin
     NN.DisableInt8Input();
     AssertTrue('A conv without an int8 input stays chunk-eligible',
       Conv.ChunkEligible());
+  finally
+    NN.Free;
+  end;
+end;
+
+// A chunked TNNetDeconvolution would run the inherited forward-convolution
+// ComputeRange instead of its transposed scatter. Coded by Claude (AI).
+procedure TTestNeuralLayers.TestDeconvolutionNeverChunkEligible;
+var
+  NN: TNNet;
+  Deconv: TNNetDeconvolution;
+  Conv: TNNetConvolution;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 16));
+    Conv := TNNetConvolution(NN.AddLayer(TNNetConvolution.Create(16, 3, 1, 1)));
+    Deconv := TNNetDeconvolution(NN.AddLayer(TNNetDeconvolution.Create(16, 3, 2, 1)));
+    NN.EnableIntraLayerThreading(true);
+    NN.SchedulerMinGain := 0;
+    AssertTrue('the plain convolution is chunk-eligible', Conv.ChunkEligible());
+    AssertFalse('the deconvolution must never chunk', Deconv.ChunkEligible());
   finally
     NN.Free;
   end;
