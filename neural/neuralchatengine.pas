@@ -170,6 +170,11 @@ type
                                  // bit-exact. Needs OpenCL AND int8 weights:
                                  // TNNetConvolutionBase.ShouldOpenCLFP16 tests
                                  // FQuantInt8, so --fp32 ignores it
+    ExperimentalInt8Input: boolean; // --experimental-int8-input: TNNet.EnableInt8Input
+                                 // after the weights are int8. Today only a
+                                 // TNNetConvolution has an int8 x int8 kernel;
+                                 // the LLM blocks arm an input copy nothing
+                                 // reads yet. Needs int8 weights
     Host: string;                // ChatServer only: HTTP listen address
     Port: integer;               // ChatServer only: HTTP listen port
     ErrorMsg: string;
@@ -352,6 +357,11 @@ begin
   WriteLn('                        the int8 OpenCL matmuls (weights stay int8; logits');
   WriteLn('                        not bit-exact). Needs --gpu and int8 weights;');
   WriteLn('                        ignored otherwise');
+  WriteLn('  --experimental-int8-input  under construction: int8-quantized activations');
+  WriteLn('                        (one scale per tensor) feeding the int8 weights on the');
+  WriteLn('                        CPU convolution path; other layers arm the copy but');
+  WriteLn('                        still run int8 x FP32. Needs int8 weights; ignored');
+  WriteLn('                        with --fp32');
   WriteLn('  --no-gpu-shared-kernel  give each layer private OpenCL kernels and command');
   WriteLn('                        queue instead of the net-wide shared ones (default:');
   WriteLn('                        shared, which is faster). Each layer then waits for');
@@ -421,6 +431,7 @@ begin
   Result.GpuDevice := 0;
   Result.GpuSharedKernel := true; // shared kernels/queue (--no-gpu-shared-kernel)
   Result.ExperimentalFP16 := false; // FP32 activations; --experimental-fp16 opts into the halves
+  Result.ExperimentalInt8Input := false; // FP32 activations; --experimental-int8-input opts into int8
   Result.Host := '127.0.0.1'; // loopback-only by default: a local inference
   Result.Port := 8080;        // server, not an internet-facing one
   Result.ErrorMsg := '';
@@ -528,6 +539,7 @@ begin
     end
     else if Arg = '--no-gpu-shared-kernel' then Opt.GpuSharedKernel := false
     else if Arg = '--experimental-fp16' then Opt.ExperimentalFP16 := true
+    else if Arg = '--experimental-int8-input' then Opt.ExperimentalInt8Input := true
     else if Arg = '--selftest' then Opt.SelfTest := true
     else if (Arg = '--help') or (Arg = '-h') then Opt.ShowHelp := true
     else if Arg = '--greedy' then Opt.Greedy := true
@@ -1097,6 +1109,12 @@ begin
       ' weights only, and --fp32 was requested]');
     Opt.ExperimentalFP16 := false;
   end;
+  if Opt.ExperimentalInt8Input and (not Opt.Int8) then
+  begin
+    Notice('[--experimental-int8-input ignored: the int8 input feeds int8' +
+      ' weights only, and --fp32 was requested]');
+    Opt.ExperimentalInt8Input := false;
+  end;
 
   // Model: generic architecture dispatch, inference-only, int8 by default.
   // Weight precision. Int8 is the default (less RAM and faster on CPU and
@@ -1196,6 +1214,15 @@ begin
     end;
   end;
   {$ENDIF}
+
+  // After BuildQuantInt8/QuantizeWeightsInt8 (an FP32 layer is skipped) and
+  // after EnableOpenCL (the CPU verdict is what routes to the int8 x int8
+  // kernel). The armed count is the user's confirmation that ordering held.
+  if Opt.ExperimentalInt8Input then
+    Notice('[--experimental-int8-input: under construction - int8 input copy' +
+      ' armed on ' + IntToStr(NN.EnableInt8Input()) + ' layers; only' +
+      ' TNNetConvolution runs int8 x int8 today, the others still run' +
+      ' int8 x FP32]');
 
   SeqLen := Opt.CtxLen;
   VocabSize := NN.GetLastLayer().Output.Depth;
