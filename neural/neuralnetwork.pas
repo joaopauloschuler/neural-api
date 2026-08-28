@@ -105140,7 +105140,7 @@ var
 begin
   if not Assigned(FPrevLayer) then
   begin
-    FErrorProc('TNNetConvolutionBase.EnableInt8Input requires SetPrevLayer.');
+    FErrorProc(ClassName + '.EnableInt8Input requires SetPrevLayer.');
     exit;
   end;
   if Assigned(FInputCopyInt8) then exit;
@@ -105173,14 +105173,14 @@ var
 begin
   if not Assigned(FInputCopyInt8) then
   begin
-    FErrorProc('TNNetConvolutionBase.QuantizeInputInt8 requires EnableInt8Input.');
+    FErrorProc(ClassName + '.QuantizeInputInt8 requires EnableInt8Input.');
     exit;
   end;
   // With no padding FInputCopy is only bound to the previous layer's output by
   // Compute, so an unrun layer has none.
   if (not Assigned(FInputCopy)) or (FInputCopy.Size <> FInputCopyInt8.Size) then
   begin
-    FErrorProc('TNNetConvolutionBase.QuantizeInputInt8: no input, or an input ' +
+    FErrorProc(ClassName + '.QuantizeInputInt8: no input, or an input ' +
       'size differing from the enabled int8 size ' +
       IntToStr(FInputCopyInt8.Size) + '.');
     exit;
@@ -105215,7 +105215,7 @@ var
 begin
   if not Assigned(FInputPreparedInt8) then
   begin
-    FErrorProc('TNNetConvolutionBase.PrepareInputForConvolutionInt8 requires ' +
+    FErrorProc(ClassName + '.PrepareInputForConvolutionInt8 requires ' +
       'EnableInt8Input.');
     exit;
   end;
