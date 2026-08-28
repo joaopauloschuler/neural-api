@@ -120,6 +120,10 @@ type
     procedure TestConvolutionInt8Int8Strided;
     procedure TestConvolutionInt8Int8Pointwise;
     procedure TestConvolutionInt8Int8NotEnabled;
+    // Int8 input arming at net level and on TNNetFullConnect
+    procedure TestNetEnableInt8InputCountsQuantizedLayers;
+    procedure TestDequantizeWeightsInt8DropsInt8Input;
+    procedure TestFullConnectQuantizeInputInt8;
   end;
 
 implementation
@@ -4095,6 +4099,172 @@ begin
     NN.Free;
     Input.Free;
     BeforeOutput.Free;
+  end;
+end;
+
+// TNNet.EnableInt8Input arms the int8 input copy on int8-quantized weight
+// layers only, and TNNet.DisableInt8Input returns every layer to FP32 input.
+procedure TTestNeuralLayers.TestNetEnableInt8InputCountsQuantizedLayers;
+var
+  NN: TNNet;
+  Input, BeforeOutput: TNNetVolume;
+  ConvFP32, ConvQuant: TNNetConvolutionReLU;
+  FullConnect: TNNetFullConnectLinear;
+  Bounds: TNeuralFloatDynArr;
+  NeuronCnt, MaxNeuronPos: integer;
+  RawPos, MaxRawPos: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 3);
+  BeforeOutput := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 3));
+    ConvFP32 := TNNetConvolutionReLU.Create(4, 3, 1, 1);
+    NN.AddLayer(ConvFP32);
+    NN.AddLayer(TNNetReLU.Create());
+    ConvQuant := TNNetConvolutionReLU.Create(5, 3, 1, 1);
+    NN.AddLayer(ConvQuant);
+    FullConnect := TNNetFullConnectLinear.Create(6);
+    NN.AddLayer(FullConnect);
+    FillInt8ConvInput(Input);
+    FillInt8ConvWeights(ConvFP32);
+    FillInt8ConvWeights(ConvQuant);
+
+    // Read the FP32 weight magnitudes before the codes replace them.
+    MaxNeuronPos := ConvQuant.Neurons.Count - 1;
+    SetLength(Bounds, ConvQuant.Neurons.Count);
+    for NeuronCnt := 0 to MaxNeuronPos do
+      Bounds[NeuronCnt] := Int8ConvWeightMagnitude(ConvQuant, NeuronCnt);
+
+    TNNetLayerConcatedWeights(ConvQuant).QuantizeWeightsInt8();
+    TNNetLayerConcatedWeights(FullConnect).QuantizeWeightsInt8();
+    AssertTrue('The FP32 convolution stays FP32', not ConvFP32.WeightsQuantizedInt8);
+    NN.Compute(Input);
+    BeforeOutput.Copy(ConvQuant.Output);
+
+    AssertEquals('Enabled int8-input layer count', 2, NN.EnableInt8Input());
+    AssertTrue('The FP32 convolution has no int8 input copy',
+      ConvFP32.InputCopyInt8 = nil);
+    AssertEquals('Quantized conv int8 input SizeX', 10, ConvQuant.InputCopyInt8.SizeX);
+    AssertEquals('Quantized conv int8 input SizeY', 10, ConvQuant.InputCopyInt8.SizeY);
+    AssertEquals('Quantized conv int8 input Depth', 4, ConvQuant.InputCopyInt8.Depth);
+    AssertEquals('FullConnect int8 input SizeX', 8, FullConnect.InputCopyInt8.SizeX);
+    AssertEquals('FullConnect int8 input SizeY', 8, FullConnect.InputCopyInt8.SizeY);
+    AssertEquals('FullConnect int8 input Depth', 5, FullConnect.InputCopyInt8.Depth);
+
+    NN.Compute(Input);
+    for NeuronCnt := 0 to MaxNeuronPos do
+      Bounds[NeuronCnt] := 0.5 * ConvQuant.InputScaleInt8 * Bounds[NeuronCnt] + 1e-5;
+    MaxRawPos := ConvQuant.Output.Size - 1;
+    for RawPos := 0 to MaxRawPos do
+    begin
+      NeuronCnt := RawPos mod ConvQuant.Output.Depth;
+      AssertTrue('Quantized conv output ' + IntToStr(RawPos) + ' int8 x int8 ' +
+        FloatToStr(ConvQuant.Output.FData[RawPos]) + ' vs int8 weights ' +
+        FloatToStr(BeforeOutput.FData[RawPos]) + ' exceeds bound ' +
+        FloatToStr(Bounds[NeuronCnt]),
+        Abs(ConvQuant.Output.FData[RawPos] - BeforeOutput.FData[RawPos]) <=
+          Bounds[NeuronCnt]);
+    end;
+
+    NN.DisableInt8Input();
+    AssertTrue('Quantized conv int8 input is dropped', ConvQuant.InputCopyInt8 = nil);
+    AssertTrue('Quantized conv int8 im2col is dropped', ConvQuant.InputPreparedInt8 = nil);
+    AssertTrue('FullConnect int8 input is dropped', FullConnect.InputCopyInt8 = nil);
+    NN.Compute(Input);
+    for RawPos := 0 to MaxRawPos do
+      AssertTrue('Int8-weight output ' + IntToStr(RawPos) + ' is restored',
+        BeforeOutput.FData[RawPos] = ConvQuant.Output.FData[RawPos]);
+  finally
+    NN.Free;
+    Input.Free;
+    BeforeOutput.Free;
+  end;
+end;
+
+// DequantizeWeightsInt8 puts the layer back on the FP32 weight path, so it
+// must drop the int8 input copy that only the int8 kernels read.
+procedure TTestNeuralLayers.TestDequantizeWeightsInt8DropsInt8Input;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Conv: TNNetConvolutionReLU;
+  RawPos, MaxRawPos: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 3));
+    Conv := TNNetConvolutionReLU.Create(5, 3, 1, 1);
+    NN.AddLayer(Conv);
+    FillInt8ConvInput(Input);
+    FillInt8ConvWeights(Conv);
+
+    TNNetLayerConcatedWeights(Conv).QuantizeWeightsInt8();
+    NN.Compute(Input);
+    Conv.EnableInt8Input();
+    AssertTrue('Int8 input copy is sized', Conv.InputCopyInt8.Size > 0);
+    NN.Compute(Input);
+
+    TNNetLayerConcatedWeights(Conv).DequantizeWeightsInt8();
+    AssertTrue('Weights are FP32 again', not Conv.WeightsQuantizedInt8);
+    AssertTrue('Int8 input copy is dropped', Conv.InputCopyInt8 = nil);
+    AssertTrue('Int8 im2col is dropped', Conv.InputPreparedInt8 = nil);
+    AssertEquals('Int8 input scale is reset', 1, Conv.InputScaleInt8, 0);
+
+    NN.Compute(Input);
+    MaxRawPos := Conv.Output.Size - 1;
+    for RawPos := 0 to MaxRawPos do
+      AssertTrue('FP32 output ' + IntToStr(RawPos) + ' is finite',
+        Abs(Conv.Output.FData[RawPos]) < 1e6);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// TNNetFullConnect inherits the int8 input copy: it quantizes the previous
+// layer's output, since a fully connected layer has no padded input copy.
+procedure TTestNeuralLayers.TestFullConnectQuantizeInputInt8;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  FullConnect: TNNetFullConnectLinear;
+  PrevOutput: TNNetVolume;
+  Scale, Tolerance, Dequantized: TNeuralFloat;
+  RawPos, MaxRawPos: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 4, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 4, 3));
+    FullConnect := TNNetFullConnectLinear.Create(5);
+    NN.AddLayer(FullConnect);
+    FillInt8ConvInput(Input);
+
+    TNNetLayerConcatedWeights(FullConnect).QuantizeWeightsInt8();
+    NN.Compute(Input);
+    FullConnect.EnableInt8Input();
+    AssertEquals('FullConnect int8 input Size', 4 * 4 * 3,
+      FullConnect.InputCopyInt8.Size);
+    NN.Compute(Input);
+
+    FullConnect.QuantizeInputInt8();
+    PrevOutput := NN.Layers[0].Output;
+    Scale := FullConnect.InputScaleInt8;
+    AssertTrue('The int8 input scale must be positive', Scale > 0);
+    Tolerance := Scale / 2 + 1e-6;
+    MaxRawPos := PrevOutput.Size - 1;
+    for RawPos := 0 to MaxRawPos do
+    begin
+      Dequantized := Scale * FullConnect.InputCopyInt8.FData[RawPos];
+      AssertTrue('Int8 input element ' + IntToStr(RawPos) + ' expected ' +
+        FloatToStr(PrevOutput.FData[RawPos]) + ' got ' + FloatToStr(Dequantized),
+        Abs(Dequantized - PrevOutput.FData[RawPos]) <= Tolerance);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 

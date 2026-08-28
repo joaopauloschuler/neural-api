@@ -610,6 +610,13 @@ type
       procedure ForceOpenCL(pForce: boolean); virtual;
       {$ENDIF}
 
+      // Arms the int8 quantized copy of this layer's forward input. Does
+      // nothing here: only weight-carrying layers own one. Coded by Claude (AI).
+      procedure EnableInt8Input(); virtual;
+      // Frees the int8 input copy, returning the layer to the FP32 input path.
+      // Coded by Claude (AI).
+      procedure DisableInt8Input(); virtual;
+
       // Computes the forward pass of this layer.
       procedure Compute(); virtual; abstract;
       // Computes the backward pass.
@@ -912,6 +919,15 @@ type
       FQuantTable: TNNetVolumeQuant8;
       FQuantVectorSize: integer;
       FQuantWSizeX, FQuantWSizeY, FQuantWSizeD: integer;
+      // Int8 copy of the forward input (Int8InputSource), nil until
+      // EnableInt8Input sizes it: most layers never run an int8 input.
+      FInputCopyInt8: TNNetVolumeQuant8;
+      // The one scale shared by every element of FInputCopyInt8: a dot product
+      // carries one scale per operand, not one per element.
+      FInputScaleInt8: TNeuralFloat;
+      // Creates FInputCopyInt8 sized as the previous layer's output grown by
+      // pPadding on each side. Keeps an existing one. Coded by Claude (AI).
+      procedure AllocInputCopyInt8(pPadding: integer);
       // Construction-time int8 arming (see TNNet.BuildQuantInt8): puts the
       // layer directly into the quantized state (dims recorded, zeroed
       // codes, unit scales) instead of sizing FP32 rows. Returns False when
@@ -935,6 +951,17 @@ type
       // safetensors importers to refill a quantized layer with checkpoint
       // weights) and leaves the layer un-quantized. // Coded by Claude (AI).
       procedure DequantizeWeightsInt8();
+      // The FP32 volume QuantizeInputInt8 reads. The previous layer's output
+      // here; a convolution reads its padded input copy. Coded by Claude (AI).
+      function Int8InputSource(): TNNetVolume; virtual;
+      // Sizes FInputCopyInt8 once so the per-forward int8 routines never
+      // allocate. Call AFTER SetPrevLayer. Coded by Claude (AI).
+      procedure EnableInt8Input(); override;
+      procedure DisableInt8Input(); override;
+      // Quantizes the whole Int8InputSource into FInputCopyInt8 with ONE
+      // per-tensor scale kept in FInputScaleInt8. Needs EnableInt8Input.
+      // Coded by Claude (AI).
+      procedure QuantizeInputInt8();
       // Quantizes ONE weight row straight into the armed int8 container:
       // row NeuronIdx receives codes Round(v*127/max|row|) over the
       // QuantInt8VectorSize elements of Src starting at SrcOffset, and
@@ -974,6 +1001,8 @@ type
       procedure SetNumWeightsForAllNeurons(NumWeights: integer); overload; override;
       procedure SetNumWeightsForAllNeurons(x, y, d: integer); overload; override;
       property WeightsQuantizedInt8: boolean read FQuantInt8;
+      property InputCopyInt8: TNNetVolumeQuant8 read FInputCopyInt8;
+      property InputScaleInt8: TNeuralFloat read FInputScaleInt8;
       // Weight-row element count of the int8 container (0 when unarmed);
       // importers gate their direct row-streaming path on this matching
       // the checkpoint row width. Coded by Claude (AI).
@@ -14442,6 +14471,12 @@ type
       property FeatureSizeY: integer read FFeatureSizeY;
       destructor Destroy(); override;
       procedure InitDefault(); override;
+      // The padded input copy Compute builds, not the previous layer's output.
+      // Coded by Claude (AI).
+      function Int8InputSource(): TNNetVolume; override;
+      // Sizes FInputCopyInt8 like FInputCopy: the previous layer's output
+      // grown by FPadding on each side. Coded by Claude (AI).
+      procedure EnableInt8Input(); override;
   end;
 
   /// This class does a depthwise convolution.
@@ -14498,13 +14533,9 @@ type
   TNNetConvolutionBase = class(TNNetConvolutionAbstract)
     private
       FInputPrepared: TNNetVolume;
-      // Int8 twins of FInputCopy and FInputPrepared: nil until EnableInt8Input
-      // sizes them, since most convolutions never run an int8 input.
-      FInputCopyInt8: TNNetVolumeQuant8;
+      // Int8 twin of FInputPrepared: nil until EnableInt8Input sizes it,
+      // since most convolutions never run an int8 input.
       FInputPreparedInt8: TNNetVolumeQuant8;
-      // The one scale shared by every element of FInputCopyInt8: a dot product
-      // carries one scale per operand, not one per element.
-      FInputScaleInt8: TNeuralFloat;
       //FDotProductResult: TNNetVolume;
       FPointwise: boolean;
       FLearnSmoothener: TNeuralFloat;
@@ -14549,12 +14580,10 @@ type
       // Coded by Claude (AI).
       function ShouldOpenCLFP16(): boolean; override;
       {$ENDIF}
-      // Sizes FInputCopyInt8/FInputPreparedInt8 once so the per-forward int8
-      // routines never allocate. Call AFTER SetPrevLayer. Coded by Claude (AI).
-      procedure EnableInt8Input();
-      // Quantizes the whole FInputCopy into FInputCopyInt8 with ONE per-tensor
-      // scale kept in FInputScaleInt8. Needs EnableInt8Input. Coded by Claude (AI).
-      procedure QuantizeInputInt8();
+      // Adds FInputPreparedInt8 to the inherited input copy, so the
+      // per-forward int8 routines never allocate. Coded by Claude (AI).
+      procedure EnableInt8Input(); override;
+      procedure DisableInt8Input(); override;
       // Byte im2col: FInputCopyInt8 -> FInputPreparedInt8 in exactly the layout
       // of PrepareInputForConvolutionFast. Needs EnableInt8Input. Coded by Claude (AI).
       procedure PrepareInputForConvolutionInt8();
@@ -14563,11 +14592,9 @@ type
       // The FP32 im2col the int8 buffers mirror. On a pointwise convolution it
       // is the previous layer's output.
       property InputPrepared: TNNetVolume read FInputPrepared;
-      property InputCopyInt8: TNNetVolumeQuant8 read FInputCopyInt8;
       // On a pointwise convolution this IS InputCopyInt8, mirroring the FP32
       // path where FInputPrepared is the previous layer's output.
       property InputPreparedInt8: TNNetVolumeQuant8 read FInputPreparedInt8;
-      property InputScaleInt8: TNeuralFloat read FInputScaleInt8;
   end;
 
   TNNetConvolutionClass = class of TNNetConvolutionBase;
@@ -19464,6 +19491,12 @@ type
       // QuantizeWeightsInt8 sweep sets it automatically otherwise.
       property BuildQuantInt8: boolean
         read FBuildQuantInt8 write FBuildQuantInt8; // Coded by Claude (AI).
+      // Arms the int8 input copy on every int8-quantized weight layer, returning
+      // how many. Run it after the net is built and after QuantizeWeightsInt8 -
+      // a layer still holding FP32 weights is skipped. Coded by Claude (AI).
+      function EnableInt8Input(): integer;
+      // Returns every layer to the FP32 input path. Coded by Claude (AI).
+      procedure DisableInt8Input();
       {$IFDEF OpenCL}
       // FP16 activation mode for int8 convolutions (see FOpenCLFP16). Set it
       // BEFORE EnableOpenCL; afterwards it has no effect.
@@ -78098,7 +78131,85 @@ begin
   end;
   FQuantTable.ReSize(0, 0, 0);
   FQuantInt8 := false;
+  // The int8 input copy only feeds the int8 weight kernels, so it is dead
+  // weight on a layer that just went back to FP32.
+  DisableInt8Input();
   AfterWeightUpdate(); // rebuild the concatenated cache / bias output
+end;
+
+procedure TNNetLayerConcatedWeights.AllocInputCopyInt8(pPadding: integer);
+var
+  PrevOutput: TNNetVolume;
+begin
+  if not Assigned(FPrevLayer) then
+  begin
+    FErrorProc(ClassName + '.EnableInt8Input requires SetPrevLayer.');
+    exit;
+  end;
+  if Assigned(FInputCopyInt8) then exit;
+  PrevOutput := FPrevLayer.Output;
+  FInputCopyInt8 := TNNetVolumeQuant8.Create(PrevOutput.SizeX + pPadding * 2,
+    PrevOutput.SizeY + pPadding * 2, PrevOutput.Depth);
+  FInputCopyInt8.Fill(0);
+  FInputCopyInt8.ScaleData.Fill(1);
+  FInputScaleInt8 := 1;
+end;
+
+function TNNetLayerConcatedWeights.Int8InputSource(): TNNetVolume;
+begin
+  if Assigned(FPrevLayer)
+    then Result := FPrevLayer.Output
+    else Result := nil;
+end;
+
+procedure TNNetLayerConcatedWeights.EnableInt8Input();
+begin
+  AllocInputCopyInt8({pPadding}0);
+end;
+
+procedure TNNetLayerConcatedWeights.DisableInt8Input();
+begin
+  FreeAndNil(FInputCopyInt8);
+  FInputScaleInt8 := 1;
+end;
+
+procedure TNNetLayerConcatedWeights.QuantizeInputInt8();
+var
+  Source: TNNetVolume;
+  MaxAbs: TNeuralFloat;
+begin
+  if not Assigned(FInputCopyInt8) then
+  begin
+    FErrorProc(ClassName + '.QuantizeInputInt8 requires EnableInt8Input.');
+    exit;
+  end;
+  // On a convolution the source is bound to the previous layer's output by
+  // Compute when there is no padding, so an unrun layer has none.
+  Source := Int8InputSource();
+  if (not Assigned(Source)) or (Source.Size <> FInputCopyInt8.Size) then
+  begin
+    FErrorProc(ClassName + '.QuantizeInputInt8: no input, or an input ' +
+      'size differing from the enabled int8 size ' +
+      IntToStr(FInputCopyInt8.Size) + '.');
+    exit;
+  end;
+  MaxAbs := TNNetVolume.MaxAbsFinite(Source.DataPtr, Source.Size);
+  // The QuantizeInt8 scale, unchanged: codes are Round(v * 127/MaxAbs), so a
+  // code dequantizes as code * MaxAbs/127.
+  FInputScaleInt8 := MaxAbs / 127;
+  if FInputScaleInt8 > 0 then
+  begin
+    TNNetVolume.QuantizeInt8(FInputCopyInt8.DataPtr, Source.DataPtr,
+      Source.Size, MaxAbs);
+  end
+  else
+  begin
+    // Zero (or nothing finite) input: zero codes with unit scale, the
+    // QuantizeWeightsInt8 zero-row convention.
+    FInputCopyInt8.Fill(0);
+    FInputScaleInt8 := 1;
+  end;
+  FInputCopyInt8.ScaleData.Fill(FInputScaleInt8);
 end;
 
 procedure TNNetLayerConcatedWeights.ImportInt8QuantRow(NeuronIdx: integer;
@@ -78226,6 +78337,8 @@ end;
 
 destructor TNNetLayerConcatedWeights.Destroy();
 begin
+  // Virtual: a convolution frees its int8 im2col buffer here too.
+  DisableInt8Input();
   FBiasOutput.Free;
   FQuantTable.Free;
   FConcatedWeights.Free;
@@ -105135,24 +105248,9 @@ begin
 end;
 
 procedure TNNetConvolutionBase.EnableInt8Input();
-var
-  InputSizeX, InputSizeY, InputDepth: integer;
 begin
-  if not Assigned(FPrevLayer) then
-  begin
-    FErrorProc(ClassName + '.EnableInt8Input requires SetPrevLayer.');
-    exit;
-  end;
-  if Assigned(FInputCopyInt8) then exit;
-  InputDepth := FPrevLayer.Output.Depth;
-  // Same geometry CopyPadding gives FInputCopy; with no padding FInputCopy is
-  // the previous layer's output itself.
-  InputSizeX := FPrevLayer.Output.SizeX + FPadding * 2;
-  InputSizeY := FPrevLayer.Output.SizeY + FPadding * 2;
-  FInputCopyInt8 := TNNetVolumeQuant8.Create(InputSizeX, InputSizeY, InputDepth);
-  FInputCopyInt8.Fill(0);
-  FInputCopyInt8.ScaleData.Fill(1);
-  FInputScaleInt8 := 1;
+  inherited EnableInt8Input();
+  if Assigned(FInputPreparedInt8) or (not Assigned(FInputCopyInt8)) then exit;
   if FPointwise then
   begin
     FInputPreparedInt8 := FInputCopyInt8;
@@ -105161,47 +105259,19 @@ begin
   begin
     // The size PrepareInputForConvolutionFast re-states on every forward.
     FInputPreparedInt8 := TNNetVolumeQuant8.Create(FOutputSizeX, FOutputSizeY,
-      InputDepth * FFeatureSizeX * FFeatureSizeY);
+      FInputCopyInt8.Depth * FFeatureSizeX * FFeatureSizeY);
     FInputPreparedInt8.Fill(0);
     FInputPreparedInt8.ScaleData.Fill(1);
   end;
 end;
 
-procedure TNNetConvolutionBase.QuantizeInputInt8();
-var
-  MaxAbs: TNeuralFloat;
+procedure TNNetConvolutionBase.DisableInt8Input();
 begin
-  if not Assigned(FInputCopyInt8) then
-  begin
-    FErrorProc(ClassName + '.QuantizeInputInt8 requires EnableInt8Input.');
-    exit;
-  end;
-  // With no padding FInputCopy is only bound to the previous layer's output by
-  // Compute, so an unrun layer has none.
-  if (not Assigned(FInputCopy)) or (FInputCopy.Size <> FInputCopyInt8.Size) then
-  begin
-    FErrorProc(ClassName + '.QuantizeInputInt8: no input, or an input ' +
-      'size differing from the enabled int8 size ' +
-      IntToStr(FInputCopyInt8.Size) + '.');
-    exit;
-  end;
-  MaxAbs := TNNetVolume.MaxAbsFinite(FInputCopy.DataPtr, FInputCopy.Size);
-  // The QuantizeInt8 scale, unchanged: codes are Round(v * 127/MaxAbs), so a
-  // code dequantizes as code * MaxAbs/127.
-  FInputScaleInt8 := MaxAbs / 127;
-  if FInputScaleInt8 > 0 then
-  begin
-    TNNetVolume.QuantizeInt8(FInputCopyInt8.DataPtr, FInputCopy.DataPtr,
-      FInputCopy.Size, MaxAbs);
-  end
-  else
-  begin
-    // Zero (or nothing finite) input: zero codes with unit scale, the
-    // QuantizeWeightsInt8 zero-row convention.
-    FInputCopyInt8.Fill(0);
-    FInputScaleInt8 := 1;
-  end;
-  FInputCopyInt8.ScaleData.Fill(FInputScaleInt8);
+  // On a pointwise convolution FInputPreparedInt8 aliases FInputCopyInt8.
+  if not FPointwise
+    then FInputPreparedInt8.Free;
+  FInputPreparedInt8 := nil;
+  inherited DisableInt8Input();
 end;
 
 procedure TNNetConvolutionBase.PrepareInputForConvolutionInt8();
@@ -105277,11 +105347,6 @@ destructor TNNetConvolutionBase.Destroy();
 begin
   if not FPointwise
     then FInputPrepared.Free;
-
-  // On a pointwise convolution FInputPreparedInt8 aliases FInputCopyInt8.
-  if not FPointwise
-    then FInputPreparedInt8.Free;
-  FInputCopyInt8.Free;
 
   //FDotProductResult.Free;
   {$IFDEF OpenCL}
@@ -107208,6 +107273,17 @@ begin
   // InitGlorotBengioUniform(1);
   // But CAI works better with He:
   InitHeUniform(1);
+end;
+
+function TNNetConvolutionAbstract.Int8InputSource(): TNNetVolume;
+begin
+  Result := FInputCopy;
+end;
+
+procedure TNNetConvolutionAbstract.EnableInt8Input();
+begin
+  // FPadding gives FInputCopyInt8 the geometry CopyPadding gives FInputCopy.
+  AllocInputCopyInt8(FPadding);
 end;
 
 { TNNetFullConnect }
@@ -131530,6 +131606,40 @@ begin
   end;
 end;
 
+function TNNet.EnableInt8Input(): integer;
+var
+  LayerCnt: integer;
+  CurrentLayer: TNNetLayer;
+  LastLayerIdx: integer;
+begin
+  Result := 0;
+  LastLayerIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+  begin
+    CurrentLayer := FLayers[LayerCnt];
+    if (CurrentLayer is TNNetLayerConcatedWeights) and
+      TNNetLayerConcatedWeights(CurrentLayer).WeightsQuantizedInt8 then
+    begin
+      CurrentLayer.EnableInt8Input();
+      // Count what the layer actually armed: it refuses without a prev layer.
+      if Assigned(TNNetLayerConcatedWeights(CurrentLayer).InputCopyInt8)
+        then Inc(Result);
+    end;
+  end;
+end;
+
+procedure TNNet.DisableInt8Input();
+var
+  LayerCnt: integer;
+  LastLayerIdx: integer;
+begin
+  LastLayerIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+  begin
+    FLayers[LayerCnt].DisableInt8Input();
+  end;
+end;
+
 function TNNet.ResizeTokenEmbeddings(NewVocabSize: integer): TNNetEmbedding;
 var
   EmbLayer: TNNetEmbedding;
@@ -133164,6 +133274,16 @@ begin
   FHasOpenCL := true;
 end;
 {$ENDIF}
+
+// TNNet.EnableInt8Input calls this on layers that own no weights too, so a
+// layer with no int8 input copy simply has nothing to do here.
+procedure TNNetLayer.EnableInt8Input();
+begin
+end;
+
+procedure TNNetLayer.DisableInt8Input();
+begin
+end;
 
 function TNNetLayer.ForceOutputOnRAM(): boolean;
 begin
