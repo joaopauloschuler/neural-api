@@ -110,6 +110,11 @@ type
     procedure TestMaxChannelSquareRegression;
     procedure TestFlipXPaddedConvBackprop;
     procedure TestFlipYPaddedConvBackprop;
+    // Int8 convolution input (quantized FInputCopy + byte im2col)
+    procedure TestConvolutionInt8InputPadded;
+    procedure TestConvolutionInt8InputStrided;
+    procedure TestConvolutionInt8InputPointwise;
+    procedure TestConvolutionInt8InputNotEnabled;
   end;
 
 implementation
@@ -3683,6 +3688,184 @@ begin
     NN.Free;
     Input.Free;
     Expected.Free;
+  end;
+end;
+
+// Runs the int8 input path on Conv after a forward and checks the byte im2col
+// against the FP32 one it mirrors: same geometry, and every code dequantizes
+// to within half a quantization step of the FP32 element.
+procedure AssertInt8Im2ColMatchesFP32(Conv: TNNetConvolutionBase;
+  const TestName: string);
+var
+  Prepared: TNNetVolume;
+  PreparedInt8: TNNetVolumeQuant8;
+  Scale, Tolerance, Dequantized: TNeuralFloat;
+  MaxRawPos, RawPos: integer;
+begin
+  Conv.QuantizeInputInt8();
+  Conv.PrepareInputForConvolutionInt8();
+  Prepared := Conv.InputPrepared;
+  PreparedInt8 := Conv.InputPreparedInt8;
+  TAssert.AssertEquals(TestName + ': int8 im2col SizeX', Prepared.SizeX, PreparedInt8.SizeX);
+  TAssert.AssertEquals(TestName + ': int8 im2col SizeY', Prepared.SizeY, PreparedInt8.SizeY);
+  TAssert.AssertEquals(TestName + ': int8 im2col Depth', Prepared.Depth, PreparedInt8.Depth);
+  TAssert.AssertEquals(TestName + ': int8 im2col Size', Prepared.Size, PreparedInt8.Size);
+  Scale := Conv.InputScaleInt8;
+  TAssert.AssertTrue(TestName + ': scale must be positive', Scale > 0);
+  Tolerance := Scale / 2 + 1e-6;
+  MaxRawPos := Prepared.Size - 1;
+  for RawPos := 0 to MaxRawPos do
+  begin
+    Dequantized := Scale * PreparedInt8.FData[RawPos];
+    TAssert.AssertTrue(TestName + ': im2col element ' + IntToStr(RawPos) + ' expected ' +
+      FloatToStr(Prepared.FData[RawPos]) + ' got ' + FloatToStr(Dequantized),
+      Abs(Dequantized - Prepared.FData[RawPos]) <= Tolerance);
+  end;
+end;
+
+// Fills a volume with a deterministic non-symmetric pattern: distinct values
+// per element, both signs, and nothing landing on a quantization boundary.
+procedure FillInt8ConvInput(Input: TNNetVolume);
+var
+  MaxRawPos, RawPos: integer;
+begin
+  MaxRawPos := Input.Size - 1;
+  for RawPos := 0 to MaxRawPos do
+    Input.FData[RawPos] := Sin(0.37 * RawPos + 0.11) * (1 + 0.013 * RawPos);
+end;
+
+procedure TTestNeuralLayers.TestConvolutionInt8InputPadded;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Conv: TNNetConvolutionLinear;
+  MaxBorderXPos, MaxBorderYPos: integer;
+  CntX, CntY, CntD: integer;
+  MaxDepthPos, MaxTapPos, TapPos: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(7, 7, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(7, 7, 3));
+    Conv := TNNetConvolutionLinear.Create(4, 3, 1, 1);
+    NN.AddLayer(Conv);
+    FillInt8ConvInput(Input);
+    NN.Compute(Input);
+
+    Conv.EnableInt8Input();
+    AssertEquals('Padded int8 input SizeX', 9, Conv.InputCopyInt8.SizeX);
+    AssertEquals('Padded int8 input SizeY', 9, Conv.InputCopyInt8.SizeY);
+    AssertEquals('Padded int8 input Depth', 3, Conv.InputCopyInt8.Depth);
+    AssertInt8Im2ColMatchesFP32(Conv, 'Padded conv');
+
+    // The padded border quantizes from exact FP32 zeros, so it must be code 0.
+    MaxBorderXPos := Conv.InputCopyInt8.SizeX - 1;
+    MaxBorderYPos := Conv.InputCopyInt8.SizeY - 1;
+    MaxDepthPos := Conv.InputCopyInt8.Depth - 1;
+    for CntY := 0 to MaxBorderYPos do
+      for CntX := 0 to MaxBorderXPos do
+        if (CntX = 0) or (CntY = 0) or (CntX = MaxBorderXPos) or
+           (CntY = MaxBorderYPos) then
+          for CntD := 0 to MaxDepthPos do
+            AssertEquals('Padded border code at ' + IntToStr(CntX) + ',' +
+              IntToStr(CntY) + ',' + IntToStr(CntD), 0,
+              integer(Conv.InputCopyInt8.Get(CntX, CntY, CntD)));
+
+    // Output (0,0) gathers the padded top feature row first: FeatureSizeX*Depth
+    // leading codes are zero.
+    MaxTapPos := 3 * 3 - 1;
+    for TapPos := 0 to MaxTapPos do
+      AssertEquals('Padded im2col tap ' + IntToStr(TapPos), 0,
+        integer(Conv.InputPreparedInt8.Get(0, 0, TapPos)));
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestConvolutionInt8InputStrided;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Conv: TNNetConvolutionLinear;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(7, 7, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(7, 7, 3));
+    Conv := TNNetConvolutionLinear.Create(4, 3, 0, 2);
+    NN.AddLayer(Conv);
+    FillInt8ConvInput(Input);
+    NN.Compute(Input);
+
+    Conv.EnableInt8Input();
+    AssertEquals('Strided int8 input SizeX', 7, Conv.InputCopyInt8.SizeX);
+    AssertEquals('Strided output SizeX', 3, Conv.Output.SizeX);
+    AssertInt8Im2ColMatchesFP32(Conv, 'Strided conv');
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestConvolutionInt8InputPointwise;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Conv: TNNetConvolutionLinear;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(7, 7, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(7, 7, 3));
+    Conv := TNNetConvolutionLinear.Create(4, 1, 0, 1);
+    NN.AddLayer(Conv);
+    FillInt8ConvInput(Input);
+    NN.Compute(Input);
+
+    AssertTrue('1x1 conv must be pointwise', Conv.Pointwise);
+    Conv.EnableInt8Input();
+    // Nothing to gather: the int8 im2col IS the quantized input copy.
+    AssertTrue('Pointwise int8 im2col aliases the int8 input copy',
+      Conv.InputPreparedInt8 = Conv.InputCopyInt8);
+    AssertInt8Im2ColMatchesFP32(Conv, 'Pointwise conv');
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestConvolutionInt8InputNotEnabled;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Conv: TNNetConvolutionLinear;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(7, 7, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(7, 7, 3));
+    Conv := TNNetConvolutionLinear.Create(4, 3, 1, 1);
+    NN.AddLayer(Conv);
+    FillInt8ConvInput(Input);
+    NN.Compute(Input);
+
+    // Without EnableInt8Input both buffers stay nil and both methods no-op.
+    AssertTrue('Int8 input copy starts nil', Conv.InputCopyInt8 = nil);
+    AssertTrue('Int8 im2col starts nil', Conv.InputPreparedInt8 = nil);
+    Conv.QuantizeInputInt8();
+    Conv.PrepareInputForConvolutionInt8();
+    AssertTrue('Int8 input copy stays nil', Conv.InputCopyInt8 = nil);
+
+    // Enabling twice keeps the same buffers.
+    Conv.EnableInt8Input();
+    AssertTrue('Int8 input copy is sized', Conv.InputCopyInt8.Size > 0);
+    Conv.EnableInt8Input();
+    AssertEquals('Second enable keeps the size', 9 * 9 * 3,
+      Conv.InputCopyInt8.Size);
+  finally
+    NN.Free;
+    Input.Free;
   end;
 end;
 

@@ -14498,6 +14498,13 @@ type
   TNNetConvolutionBase = class(TNNetConvolutionAbstract)
     private
       FInputPrepared: TNNetVolume;
+      // Int8 twins of FInputCopy and FInputPrepared: nil until EnableInt8Input
+      // sizes them, since most convolutions never run an int8 input.
+      FInputCopyInt8: TNNetVolumeQuant8;
+      FInputPreparedInt8: TNNetVolumeQuant8;
+      // The one scale shared by every element of FInputCopyInt8: a dot product
+      // carries one scale per operand, not one per element.
+      FInputScaleInt8: TNeuralFloat;
       //FDotProductResult: TNNetVolume;
       FPointwise: boolean;
       FLearnSmoothener: TNeuralFloat;
@@ -14542,8 +14549,25 @@ type
       // Coded by Claude (AI).
       function ShouldOpenCLFP16(): boolean; override;
       {$ENDIF}
+      // Sizes FInputCopyInt8/FInputPreparedInt8 once so the per-forward int8
+      // routines never allocate. Call AFTER SetPrevLayer. Coded by Claude (AI).
+      procedure EnableInt8Input();
+      // Quantizes the whole FInputCopy into FInputCopyInt8 with ONE per-tensor
+      // scale kept in FInputScaleInt8. Needs EnableInt8Input. Coded by Claude (AI).
+      procedure QuantizeInputInt8();
+      // Byte im2col: FInputCopyInt8 -> FInputPreparedInt8 in exactly the layout
+      // of PrepareInputForConvolutionFast. Needs EnableInt8Input. Coded by Claude (AI).
+      procedure PrepareInputForConvolutionInt8();
 
       property Pointwise: boolean read FPointwise;
+      // The FP32 im2col the int8 buffers mirror. On a pointwise convolution it
+      // is the previous layer's output.
+      property InputPrepared: TNNetVolume read FInputPrepared;
+      property InputCopyInt8: TNNetVolumeQuant8 read FInputCopyInt8;
+      // On a pointwise convolution this IS InputCopyInt8, mirroring the FP32
+      // path where FInputPrepared is the previous layer's output.
+      property InputPreparedInt8: TNNetVolumeQuant8 read FInputPreparedInt8;
+      property InputScaleInt8: TNeuralFloat read FInputScaleInt8;
   end;
 
   TNNetConvolutionClass = class of TNNetConvolutionBase;
@@ -105079,6 +105103,122 @@ begin
   end;
 end;
 
+procedure TNNetConvolutionBase.EnableInt8Input();
+var
+  InputSizeX, InputSizeY, InputDepth: integer;
+begin
+  if not Assigned(FPrevLayer) then
+  begin
+    FErrorProc('TNNetConvolutionBase.EnableInt8Input requires SetPrevLayer.');
+    exit;
+  end;
+  if Assigned(FInputCopyInt8) then exit;
+  InputDepth := FPrevLayer.Output.Depth;
+  // Same geometry CopyPadding gives FInputCopy; with no padding FInputCopy is
+  // the previous layer's output itself.
+  InputSizeX := FPrevLayer.Output.SizeX + FPadding * 2;
+  InputSizeY := FPrevLayer.Output.SizeY + FPadding * 2;
+  FInputCopyInt8 := TNNetVolumeQuant8.Create(InputSizeX, InputSizeY, InputDepth);
+  FInputCopyInt8.Fill(0);
+  FInputCopyInt8.ScaleData.Fill(1);
+  FInputScaleInt8 := 1;
+  if FPointwise then
+  begin
+    FInputPreparedInt8 := FInputCopyInt8;
+  end
+  else
+  begin
+    // The size PrepareInputForConvolutionFast re-states on every forward.
+    FInputPreparedInt8 := TNNetVolumeQuant8.Create(FOutputSizeX, FOutputSizeY,
+      InputDepth * FFeatureSizeX * FFeatureSizeY);
+    FInputPreparedInt8.Fill(0);
+    FInputPreparedInt8.ScaleData.Fill(1);
+  end;
+end;
+
+procedure TNNetConvolutionBase.QuantizeInputInt8();
+var
+  MaxAbs: TNeuralFloat;
+begin
+  if not Assigned(FInputCopyInt8) then
+  begin
+    FErrorProc('TNNetConvolutionBase.QuantizeInputInt8 requires EnableInt8Input.');
+    exit;
+  end;
+  // With no padding FInputCopy is only bound to the previous layer's output by
+  // Compute, so an unrun layer has none.
+  if (not Assigned(FInputCopy)) or (FInputCopy.Size <> FInputCopyInt8.Size) then
+  begin
+    FErrorProc('TNNetConvolutionBase.QuantizeInputInt8: no input, or an input ' +
+      'size differing from the enabled int8 size ' +
+      IntToStr(FInputCopyInt8.Size) + '.');
+    exit;
+  end;
+  MaxAbs := TNNetVolume.MaxAbsFinite(FInputCopy.DataPtr, FInputCopy.Size);
+  // The QuantizeInt8 scale, unchanged: codes are Round(v * 127/MaxAbs), so a
+  // code dequantizes as code * MaxAbs/127.
+  FInputScaleInt8 := MaxAbs / 127;
+  if FInputScaleInt8 > 0 then
+  begin
+    TNNetVolume.QuantizeInt8(FInputCopyInt8.DataPtr, FInputCopy.DataPtr,
+      FInputCopy.Size, MaxAbs);
+  end
+  else
+  begin
+    // Zero (or nothing finite) input: zero codes with unit scale, the
+    // QuantizeWeightsInt8 zero-row convention.
+    FInputCopyInt8.Fill(0);
+    FInputScaleInt8 := 1;
+  end;
+  FInputCopyInt8.ScaleData.Fill(FInputScaleInt8);
+end;
+
+procedure TNNetConvolutionBase.PrepareInputForConvolutionInt8();
+var
+  OutputCntX, OutputCntY: integer;
+  MaxOutputXPos, MaxOutputYPos: integer;
+  DepthFSize, DepthFSizeBytes: integer;
+  yCount, MaxFeatureYPos: integer;
+  InputX: integer;
+  SrcRowStride, SrcPos, DstPos: integer;
+begin
+  if not Assigned(FInputPreparedInt8) then
+  begin
+    FErrorProc('TNNetConvolutionBase.PrepareInputForConvolutionInt8 requires ' +
+      'EnableInt8Input.');
+    exit;
+  end;
+  // Pointwise: FInputPreparedInt8 IS FInputCopyInt8, so there is nothing to
+  // gather, exactly as in the FP32 path.
+  if FPointwise then exit;
+  DepthFSize := FInputCopyInt8.Depth * FFeatureSizeX;
+  DepthFSizeBytes := DepthFSize * csShortIntSize;
+  MaxOutputXPos := FOutput.SizeX - 1;
+  MaxOutputYPos := FOutput.SizeY - 1;
+  MaxFeatureYPos := FFeatureSizeY - 1;
+  SrcRowStride := FInputCopyInt8.GetRawPos(0, 1);
+  for OutputCntX := 0 to MaxOutputXPos do
+  begin
+    InputX := OutputCntX * FStride;
+    for OutputCntY := 0 to MaxOutputYPos do
+    begin
+      SrcPos := FInputCopyInt8.GetRawPos(InputX, OutputCntY * FStride);
+      DstPos := FInputPreparedInt8.GetRawPos(OutputCntX, OutputCntY);
+      for yCount := 0 to MaxFeatureYPos do
+      begin
+        Move(
+          FInputCopyInt8.FData[SrcPos],
+          FInputPreparedInt8.FData[DstPos],
+          DepthFSizeBytes
+        );
+        Inc(SrcPos, SrcRowStride);
+        Inc(DstPos, DepthFSize);
+      end;
+    end;
+  end;
+  FInputPreparedInt8.ScaleData.Fill(FInputScaleInt8);
+end;
+
 constructor TNNetConvolutionBase.Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0);
 begin
   inherited Create(pFeatureSize, pInputPadding, pStride, pSuppressBias);
@@ -105106,6 +105246,11 @@ destructor TNNetConvolutionBase.Destroy();
 begin
   if not FPointwise
     then FInputPrepared.Free;
+
+  // On a pointwise convolution FInputPreparedInt8 aliases FInputCopyInt8.
+  if not FPointwise
+    then FInputPreparedInt8.Free;
+  FInputCopyInt8.Free;
 
   //FDotProductResult.Free;
   {$IFDEF OpenCL}
