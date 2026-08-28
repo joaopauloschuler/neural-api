@@ -115,6 +115,11 @@ type
     procedure TestConvolutionInt8InputStrided;
     procedure TestConvolutionInt8InputPointwise;
     procedure TestConvolutionInt8InputNotEnabled;
+    // Int8 x int8 convolution forward (int8 weights AND int8 input)
+    procedure TestConvolutionInt8Int8Padded;
+    procedure TestConvolutionInt8Int8Strided;
+    procedure TestConvolutionInt8Int8Pointwise;
+    procedure TestConvolutionInt8Int8NotEnabled;
   end;
 
 implementation
@@ -3866,6 +3871,230 @@ begin
   finally
     NN.Free;
     Input.Free;
+  end;
+end;
+
+// Deterministic non-trivial weights and bias, then the caches the forward
+// reads (FConcatedWeights, FBiasOutput) are rebuilt from them.
+procedure FillInt8ConvWeights(Conv: TNNetConvolution);
+var
+  NeuronCnt, MaxNeuronPos, WeightCnt, MaxWeightPos: integer;
+  W: TNNetVolume;
+begin
+  MaxNeuronPos := Conv.Neurons.Count - 1;
+  for NeuronCnt := 0 to MaxNeuronPos do
+  begin
+    W := Conv.Neurons[NeuronCnt].Weights;
+    MaxWeightPos := W.Size - 1;
+    for WeightCnt := 0 to MaxWeightPos do
+      W.FData[WeightCnt] := Sin(0.21 * (WeightCnt + 7 * NeuronCnt) + 0.3) * 0.5;
+    Conv.Neurons[NeuronCnt].BiasWeight := 0.05 * NeuronCnt - 0.1;
+  end;
+  Conv.FlushWeightCache();
+end;
+
+// Sum of the absolute DEQUANTIZED weights of one neuron, bounded by the FP32
+// magnitudes plus their own half-step quantization error. Read it before
+// QuantizeWeightsInt8, which releases the FP32 weights.
+function Int8ConvWeightMagnitude(Conv: TNNetConvolution;
+  NeuronIdx: integer): TNeuralFloat;
+var
+  W: TNNetVolume;
+  WeightCnt, MaxWeightPos: integer;
+  SumAbsW, MaxAbsW: TNeuralFloat;
+begin
+  W := Conv.Neurons[NeuronIdx].Weights;
+  MaxWeightPos := W.Size - 1;
+  SumAbsW := 0;
+  MaxAbsW := 0;
+  for WeightCnt := 0 to MaxWeightPos do
+  begin
+    SumAbsW := SumAbsW + Abs(W.FData[WeightCnt]);
+    if Abs(W.FData[WeightCnt]) > MaxAbsW then MaxAbsW := Abs(W.FData[WeightCnt]);
+  end;
+  Result := SumAbsW + W.Size * MaxAbsW / 254;
+end;
+
+// Runs the three convolution forwards - FP32, int8 weights, int8 x int8 - on
+// one net and checks the int8 x int8 output against both.
+procedure AssertInt8Int8ConvMatches(NN: TNNet; Conv: TNNetConvolution;
+  Input: TNNetVolume; const TestName: string);
+var
+  FP32Output, Int8WeightOutput: TNNetVolume;
+  Bounds: TNeuralFloatDynArr;
+  NeuronCnt, MaxNeuronPos: integer;
+  RawPos, MaxRawPos: integer;
+  MaxAbsFP32, MaxAbsDiff, NonZeroCodes: TNeuralFloat;
+  CodeCnt, MaxCodePos: integer;
+begin
+  FP32Output := TNNetVolume.Create();
+  Int8WeightOutput := TNNetVolume.Create();
+  try
+    FillInt8ConvWeights(Conv);
+    NN.Compute(Input);
+    FP32Output.Copy(Conv.Output);
+
+    MaxNeuronPos := Conv.Neurons.Count - 1;
+    SetLength(Bounds, Conv.Neurons.Count);
+    for NeuronCnt := 0 to MaxNeuronPos do
+      Bounds[NeuronCnt] := Int8ConvWeightMagnitude(Conv, NeuronCnt);
+
+    TNNetLayerConcatedWeights(Conv).QuantizeWeightsInt8();
+    TAssert.AssertTrue(TestName + ': weights are int8', Conv.WeightsQuantizedInt8);
+    NN.Compute(Input);
+    Int8WeightOutput.Copy(Conv.Output);
+
+    Conv.EnableInt8Input();
+    // The int8 x int8 forward must not read the FP32 im2col at all. On a
+    // pointwise convolution FInputPrepared IS the previous layer's output, so
+    // clearing it there would clear the input itself.
+    if not Conv.Pointwise then Conv.InputPrepared.Fill(0);
+    NN.Compute(Input);
+
+    // Every tap rounded by half an input step is the exact worst case.
+    for NeuronCnt := 0 to MaxNeuronPos do
+      Bounds[NeuronCnt] := 0.5 * Conv.InputScaleInt8 * Bounds[NeuronCnt] + 1e-5;
+
+    NonZeroCodes := 0;
+    MaxCodePos := Conv.InputPreparedInt8.Size - 1;
+    for CodeCnt := 0 to MaxCodePos do
+      if Conv.InputPreparedInt8.FData[CodeCnt] <> 0 then NonZeroCodes := NonZeroCodes + 1;
+    TAssert.AssertTrue(TestName + ': the int8 im2col carries codes', NonZeroCodes > 0);
+    if not Conv.Pointwise then
+    begin
+      MaxCodePos := Conv.InputPrepared.Size - 1;
+      for CodeCnt := 0 to MaxCodePos do
+        TAssert.AssertTrue(TestName + ': the FP32 im2col stays unbuilt at ' +
+          IntToStr(CodeCnt), Conv.InputPrepared.FData[CodeCnt] = 0);
+    end;
+
+    MaxRawPos := Conv.Output.Size - 1;
+    MaxAbsFP32 := 0;
+    MaxAbsDiff := 0;
+    for RawPos := 0 to MaxRawPos do
+    begin
+      NeuronCnt := RawPos mod Conv.Output.Depth;
+      TAssert.AssertTrue(TestName + ': output ' + IntToStr(RawPos) + ' int8 x int8 ' +
+        FloatToStr(Conv.Output.FData[RawPos]) + ' vs int8 weights ' +
+        FloatToStr(Int8WeightOutput.FData[RawPos]) + ' exceeds bound ' +
+        FloatToStr(Bounds[NeuronCnt]),
+        Abs(Conv.Output.FData[RawPos] - Int8WeightOutput.FData[RawPos]) <=
+          Bounds[NeuronCnt]);
+      if Abs(FP32Output.FData[RawPos]) > MaxAbsFP32
+        then MaxAbsFP32 := Abs(FP32Output.FData[RawPos]);
+      if Abs(Conv.Output.FData[RawPos] - FP32Output.FData[RawPos]) > MaxAbsDiff
+        then MaxAbsDiff := Abs(Conv.Output.FData[RawPos] - FP32Output.FData[RawPos]);
+    end;
+    TAssert.AssertTrue(TestName + ': FP32 reference must be non-trivial', MaxAbsFP32 > 0.1);
+    TAssert.AssertTrue(TestName + ': max abs error ' + FloatToStr(MaxAbsDiff) +
+      ' over max abs output ' + FloatToStr(MaxAbsFP32) + ' exceeds 5%',
+      MaxAbsDiff <= 0.05 * MaxAbsFP32);
+  finally
+    FP32Output.Free;
+    Int8WeightOutput.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestConvolutionInt8Int8Padded;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Conv: TNNetConvolutionReLU;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 3));
+    Conv := TNNetConvolutionReLU.Create(5, 3, 1, 1);
+    NN.AddLayer(Conv);
+    FillInt8ConvInput(Input);
+    AssertInt8Int8ConvMatches(NN, Conv, Input, 'Padded int8 x int8 conv');
+    AssertEquals('Padded int8 x int8 output SizeX', 8, Conv.Output.SizeX);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestConvolutionInt8Int8Strided;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Conv: TNNetConvolutionLinear;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 3));
+    Conv := TNNetConvolutionLinear.Create(5, 3, 0, 2);
+    NN.AddLayer(Conv);
+    FillInt8ConvInput(Input);
+    AssertInt8Int8ConvMatches(NN, Conv, Input, 'Strided int8 x int8 conv');
+    AssertEquals('Strided int8 x int8 output SizeX', 3, Conv.Output.SizeX);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestConvolutionInt8Int8Pointwise;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Conv: TNNetConvolutionLinear;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 6);
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 6));
+    Conv := TNNetConvolutionLinear.Create(5, 1, 0, 1);
+    NN.AddLayer(Conv);
+    FillInt8ConvInput(Input);
+    AssertTrue('1x1 conv must be pointwise', Conv.Pointwise);
+    AssertInt8Int8ConvMatches(NN, Conv, Input, 'Pointwise int8 x int8 conv');
+    AssertTrue('Pointwise int8 im2col aliases the int8 input copy',
+      Conv.InputPreparedInt8 = Conv.InputCopyInt8);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// Without EnableInt8Input a quantized convolution keeps the int8-weight x FP32
+// forward, bit for bit.
+procedure TTestNeuralLayers.TestConvolutionInt8Int8NotEnabled;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Conv: TNNetConvolutionReLU;
+  BeforeOutput: TNNetVolume;
+  RawPos, MaxRawPos: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 3);
+  BeforeOutput := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 3));
+    Conv := TNNetConvolutionReLU.Create(5, 3, 1, 1);
+    NN.AddLayer(Conv);
+    FillInt8ConvInput(Input);
+    FillInt8ConvWeights(Conv);
+
+    TNNetLayerConcatedWeights(Conv).QuantizeWeightsInt8();
+    NN.Compute(Input);
+    BeforeOutput.Copy(Conv.Output);
+    NN.Compute(Input);
+
+    AssertTrue('Int8 input copy stays nil', Conv.InputCopyInt8 = nil);
+    AssertTrue('Int8 im2col stays nil', Conv.InputPreparedInt8 = nil);
+    MaxRawPos := Conv.Output.Size - 1;
+    for RawPos := 0 to MaxRawPos do
+      AssertTrue('Int8-weight output ' + IntToStr(RawPos) + ' is unchanged',
+        BeforeOutput.FData[RawPos] = Conv.Output.FData[RawPos]);
+  finally
+    NN.Free;
+    Input.Free;
+    BeforeOutput.Free;
   end;
 end;
 

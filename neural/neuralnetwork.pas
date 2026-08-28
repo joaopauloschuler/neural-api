@@ -14702,6 +14702,12 @@ type
     protected
       procedure ComputeCPU();
       procedure ComputeTiledCPU();
+      // True when the CPU forward runs int8 codes on BOTH operands: int8
+      // weights, an EnableInt8Input copy, shapes agreeing. Coded by Claude (AI).
+      function ShouldComputeInt8Int8CPU(): boolean;
+      // Int8 x int8 forward: quantize the input, byte im2col, then one tiled
+      // int32 reduction per output. Needs EnableInt8Input. Coded by Claude (AI).
+      procedure ComputeInt8Int8CPU();
       procedure ComputeInterleaved();
       // Threaded slice: one contiguous block of output positions, computed
       // with the ranged kernels (absolute row positions, so disjoint ranges
@@ -104653,7 +104659,10 @@ begin
   // only the immutable FQuantTable. Coded by Claude (AI).
   Result := (FNN <> nil) and FNN.FIntraLayerThreading and
     (not WillOpenCL()) and
-    (not WinogradEligible())
+    (not WinogradEligible()) and
+    // An int8-input layer is serial: ComputeRange still runs the int8 x FP32
+    // kernel and Compute() no longer builds the FP32 im2col it reads.
+    (not Assigned(FInputCopyInt8))
     // any size is elegible
     //and (int64(FPrevLayer.FOutput.Size) * FOutput.Size >= 128*1024)
     ;
@@ -105037,6 +105046,28 @@ end;
 procedure TNNetConvolution.ComputeTiledCPU();
 begin
   FOutputRaw.DotProductsTiled(FNeurons.Count, FOutputSizeX * FOutputSizeY, FVectorSize, FConcatedWeights, FInputPrepared, FTileSizeD, FTileSizeX);
+  if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
+  ApplyActivationFunctionToOutput();
+end;
+
+function TNNetConvolution.ShouldComputeInt8Int8CPU(): boolean;
+begin
+  // The OpenCL forward has its own int8 kernel and reads the FP32
+  // FInputPrepared, so it never routes here. The two shape tests are
+  // pass-stable, which is what lets Compute() skip the FP32 im2col.
+  Result := FQuantInt8 and Assigned(FInputPreparedInt8) and
+    (not WillOpenCL()) and
+    (FInputPreparedInt8.Depth = FVectorSize) and
+    (FQuantTable.Depth = FVectorSize);
+end;
+
+procedure TNNetConvolution.ComputeInt8Int8CPU();
+begin
+  QuantizeInputInt8();
+  PrepareInputForConvolutionInt8();
+  FOutputRaw.DotProductsTiledInt8Int8(FNeurons.Count,
+    FOutputSizeX * FOutputSizeY, FVectorSize, FQuantTable,
+    FInputPreparedInt8, FInputScaleInt8, FTileSizeD, FTileSizeX);
   if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
   ApplyActivationFunctionToOutput();
 end;
@@ -105920,6 +105951,10 @@ procedure TNNetConvolution.Compute();
     begin
       ComputeWinogradCPU();
     end
+    else if ShouldComputeInt8Int8CPU() then
+    begin
+      ComputeInt8Int8CPU();
+    end
     else if FQuantInt8 then
     begin
       // int8-quantized inference: fused tiled forward. The int8 codes are
@@ -105973,7 +106008,10 @@ begin
     // FDotCL was prepared with, so its device buffer stays correctly sized. The
     // gather reads FInputCopy (built above), so padding still happens on host.
     {$IFDEF OpenCL}
-    if not ShouldOpenCLIm2Col() then PrepareInputForConvolutionFast();
+    // The int8 x int8 CPU forward reads FInputPreparedInt8 only, and its
+    // backward pass is refused (FQuantInt8), so the FP32 im2col is dead work.
+    if not (ShouldOpenCLIm2Col() or ShouldComputeInt8Int8CPU())
+      then PrepareInputForConvolutionFast();
     if WillOpenCL() then
     begin
       Inc(FForwardGPUCnt);
@@ -105987,7 +106025,7 @@ begin
       ComputeOnCPU;
     end;
     {$ELSE}
-    PrepareInputForConvolutionFast();
+    if not ShouldComputeInt8Int8CPU() then PrepareInputForConvolutionFast();
     Inc(FForwardCPUCnt);
     ComputeOnCPU;
     {$ENDIF}

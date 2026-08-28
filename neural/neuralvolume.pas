@@ -575,6 +575,12 @@ type
       // chunks range A). AFinish < 0 means all rows. Coded by Claude (AI).
       procedure DotProductsTiledInt8(NumAs, BStart, BFinish, VectorSize: integer; const Codes: array of ShortInt; const Scales: array of TNeuralFloat; VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
       procedure DotProductsTiledInt8(NumAs, BStart, BFinish, VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolume; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
+      // Int8 x int8 twin of DotProductsTiledInt8: each output is an exact int32
+      // sum scaled once by Codes.Scale[row] * BScale. Coded by Claude (AI).
+      procedure DotProductsTiledInt8Int8(NumAs, NumBs, VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolumeQuant8; BScale: TNeuralFloat; TileSizeA, TileSizeB: integer); overload;
+      // Ranged twin, same contract as the ranged DotProductsTiledInt8: B columns
+      // [BStart..BFinish], A rows [AStart..AFinish] (AFinish < 0 = all rows).
+      procedure DotProductsTiledInt8Int8(NumAs, BStart, BFinish, VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolumeQuant8; BScale: TNeuralFloat; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
       procedure PointwiseNorm(pNorms: TNNetVolume = nil);
       procedure PointwiseMul(pNorms: TNNetVolume = nil);
       // Exp writes dst[0..N-1] := exp(src[0..N-1]). On an AVX2 build it
@@ -13983,6 +13989,73 @@ begin
     end; // A Tiling.
   end; // B Tiling.
 end;
+
+procedure TNNetVolume.DotProductsTiledInt8Int8(NumAs, NumBs, VectorSize: integer;
+  Codes: TNNetVolumeQuant8; VBs: TNNetVolumeQuant8; BScale: TNeuralFloat;
+  TileSizeA, TileSizeB: integer);
+begin
+  DotProductsTiledInt8Int8(NumAs, 0, NumBs - 1, VectorSize, Codes, VBs, BScale,
+    TileSizeA, TileSizeB);
+end;
+
+procedure TNNetVolume.DotProductsTiledInt8Int8(NumAs, BStart, BFinish,
+  VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolumeQuant8;
+  BScale: TNeuralFloat; TileSizeA, TileSizeB: integer;
+  AStart: integer = 0; AFinish: integer = -1);
+var
+  CntA, CntB: integer;
+  RowBase, AOfs, BPos: integer;
+  PtrA, PtrB: TNeuralInt8ArrPtr;
+  CodeData, BData: TNeuralInt8ArrPtr;
+  ScaleData: TNeuralFloatArrPtr;
+  // Tiling
+  TileACnt, TileBCnt: integer;
+  StartTileA, EndTileA, StartTileB, EndTileB: integer;
+  MaxTileA, MaxTileB: integer;
+  TileAOfs0: integer;
+begin
+  // Ceil-division tiling anchored at the range start with a clamped trailing
+  // PARTIAL tile, the same contract as the ranged DotProductsTiledInt8. NumAs
+  // stays the output row stride, so a sliced call writes exactly its own
+  // output elements.
+  if AFinish < 0 then AFinish := NumAs - 1;
+  CodeData := Codes.DataPtr;
+  BData := VBs.DataPtr;
+  ScaleData := Codes.ScalePtr;
+  MaxTileA := ((AFinish - AStart + 1) + TileSizeA - 1) div TileSizeA - 1;
+  MaxTileB := ((BFinish - BStart + 1) + TileSizeB - 1) div TileSizeB - 1;
+  for TileBCnt := 0 to MaxTileB do
+  begin
+    StartTileB := BStart + TileBCnt * TileSizeB;
+    EndTileB := Min(StartTileB + TileSizeB - 1, BFinish);
+    for TileACnt := 0 to MaxTileA do
+    begin
+      StartTileA := AStart + TileACnt * TileSizeA;
+      EndTileA := Min(StartTileA + TileSizeA - 1, AFinish);
+      TileAOfs0 := StartTileA * VectorSize; // #5: hoisted, invariant across CntB
+      BPos := StartTileB * VectorSize;   // #12: carried CntB*VectorSize
+      RowBase := StartTileB * NumAs;     // #12: carried CntB*NumAs
+      for CntB := StartTileB to EndTileB do
+      begin
+        PtrB := TNeuralInt8ArrPtr(@BData^[BPos]);
+        AOfs := TileAOfs0;
+        for CntA := StartTileA to EndTileA do
+        begin
+          PtrA := TNeuralInt8ArrPtr(@CodeData^[AOfs]);
+          // Deferred scales: the inner kernel is a pure int32 code reduction
+          // and the operand scales meet it once, at the store.
+          FData[RowBase + CntA] :=
+            DotProductInt8Int8(PtrA, PtrB, VectorSize) *
+            (ScaleData^[CntA] * BScale);
+          Inc(AOfs, VectorSize);
+        end;
+        Inc(BPos, VectorSize); // #12: next CntB*VectorSize
+        Inc(RowBase, NumAs);   // #12: next CntB*NumAs
+      end;
+    end; // A Tiling.
+  end; // B Tiling.
+end;
+
 
 procedure TNNetGroupedVolume.GroupedDotProductsTiledInt8(Groups, NumAs, NumBs,
   VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolume;
