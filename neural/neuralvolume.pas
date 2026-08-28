@@ -536,6 +536,11 @@ type
       // registers); every other build runs the pure Pascal loop.
       // Coded by Claude (AI).
       class function DotProductInt8(PtrA: TNeuralInt8ArrPtr; PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
+      // Int8 x int8 dot product: returns the exact int32 sum of code_a[i] *
+      // code_b[i]; the caller applies scale_a * scale_b once. Codes must be in
+      // [-127, 127] (the QuantizeInt8 range): -128 x -128 would overflow the
+      // AVX2 kernel's signed-magnitude pair sum. Coded by Claude (AI).
+      class function DotProductInt8Int8(PtrA, PtrB: TNeuralInt8ArrPtr; NumElements: integer): integer;
       // Fused int8-weight x float32-input elementwise multiply-accumulate:
       // PtrA[i] += PtrCodes[i] * PtrB[i], with NO scale applied - the caller
       // multiplies the accumulated result by the per-row quantization scale
@@ -1995,6 +2000,66 @@ begin
            PtrA^[localNumElements] * PtrB^[localNumElements] +
            PtrA^[localNumElements+1] * PtrB^[localNumElements+1] +
            PtrA^[localNumElements+2] * PtrB^[localNumElements+2];
+  end;
+end;
+
+// Int8 x int8 dot product, 32 elements per iteration: a*b = |a| * (sign(a)*b)
+// makes one operand unsigned for vpmaddubsw (byte pairs -> int16), vpmaddwd
+// against in-register int16 ones widens to int32, vpaddd accumulates. The pair
+// sum never saturates while codes stay in [-127, 127]. Coded by Claude (AI).
+function AVXDotProductInt8Int8(PtrA, PtrB: TNeuralInt8ArrPtr;
+  NumElements: integer): integer;
+var
+  vRes: integer;
+  localNumElements, MissedElements, I, MaxTailPos: integer;
+begin
+  MissedElements := NumElements and 31;
+  localNumElements := NumElements xor MissedElements;
+  Result := 0;
+  if localNumElements > 0 then
+  begin
+  asm
+  mov ecx, localNumElements
+  shr ecx, 5
+  mov rax, PtrA
+  mov rdx, PtrB
+  vpxor ymm0, ymm0, ymm0
+  vpcmpeqw ymm7, ymm7, ymm7
+  vpsrlw ymm7, ymm7, 15
+
+@Loop:
+  vmovdqu ymm2, [rax]
+  vmovdqu ymm3, [rdx]
+  vpsignb ymm3, ymm3, ymm2
+  vpabsb ymm2, ymm2
+  vpmaddubsw ymm2, ymm2, ymm3
+  vpmaddwd ymm2, ymm2, ymm7
+  vpaddd ymm0, ymm0, ymm2
+
+  add rax, 32
+  add rdx, 32
+  dec ecx
+  jnz @Loop
+
+  vextracti128 xmm2, ymm0, 1
+  vpaddd xmm0, xmm0, xmm2
+  vphaddd xmm0, xmm0, xmm0
+  vphaddd xmm0, xmm0, xmm0
+  vmovd vRes, xmm0
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX',
+    'ymm0', 'ymm2', 'ymm3', 'ymm7'
+  ];
+    Result := vRes;
+  end;
+
+  if MissedElements > 0 then
+  begin
+    MaxTailPos := NumElements - 1;
+    for I := localNumElements to MaxTailPos do
+      Result := Result + PtrA^[I] * PtrB^[I];
   end;
 end;
 
@@ -13526,6 +13591,27 @@ begin
   if NumElements >= csMinAvxSize then
   begin
     Result := AVXDotProductInt8(PtrA, PtrB, NumElements);
+    exit;
+  end;
+  {$ENDIF}
+  {$ENDIF}
+  Result := 0;
+  vHigh := NumElements - 1;
+  for I := 0 to vHigh do
+    Result := Result + PtrA^[I] * PtrB^[I];
+end;
+
+class function TNNetVolume.DotProductInt8Int8(PtrA, PtrB: TNeuralInt8ArrPtr;
+  NumElements: integer): integer;
+var
+  I: integer;
+  vHigh: integer;
+begin
+  {$IFDEF AVX64}
+  {$IFDEF AVX2}
+  if NumElements >= csMinAvxSize then
+  begin
+    Result := AVXDotProductInt8Int8(PtrA, PtrB, NumElements);
     exit;
   end;
   {$ENDIF}

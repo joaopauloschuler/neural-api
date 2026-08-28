@@ -118,6 +118,8 @@ type
     procedure TestQuantizeInt8MatchesScalarReference;
     procedure TestDequantizeInt8;
     procedure TestDequantizeInt8RoundTrip;
+    procedure TestDotProductInt8Int8LengthSweep;
+    procedure TestDotProductInt8Int8MatchesFloatPath;
     procedure TestDecodeBF16;
     procedure TestDecodeBF16LengthSweep;
     procedure TestDecodeF16;
@@ -3702,6 +3704,73 @@ begin
     end;
     AssertEquals('wrote past N=' + IntToStr(Len), 12345.0, Dst[Len], 0);
   end;
+end;
+
+// Exact int32 oracle over lengths around the AVX2 32-element block and its
+// tail, with the extreme codes +-127 placed so consecutive pairs hit the
+// vpmaddubsw worst case (2 * 127 * 127). Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestDotProductInt8Int8LengthSweep;
+const
+  cLengths: array[0..15] of integer =
+    (0, 1, 3, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65, 100, 1000, 1024);
+  N = 1024;
+var
+  A, B: TInt8DynArr;
+  Expected, Got: integer;
+  i, L, Len: integer;
+begin
+  SetLength(A, N);
+  SetLength(B, N);
+  for i := 0 to N - 1 do
+  begin
+    A[i] := ShortInt(((i * 37) mod 255) - 127);
+    B[i] := ShortInt(((i * 91 + 5) mod 255) - 127);
+  end;
+  // first 8 elements: all four sign combinations of the +-127 extremes
+  A[0] := 127;  B[0] := 127;  A[1] := 127;  B[1] := 127;
+  A[2] := -127; B[2] := -127; A[3] := -127; B[3] := -127;
+  A[4] := 127;  B[4] := -127; A[5] := 127;  B[5] := -127;
+  A[6] := -127; B[6] := 127;  A[7] := -127; B[7] := 127;
+  for L := 0 to High(cLengths) do
+  begin
+    Len := cLengths[L];
+    Expected := 0;
+    for i := 0 to Len - 1 do Expected := Expected + A[i] * B[i];
+    Got := TNNetVolume.DotProductInt8Int8(TNeuralInt8ArrPtr(@A[0]),
+      TNeuralInt8ArrPtr(@B[0]), Len);
+    AssertEquals('N=' + IntToStr(Len), Expected, Got);
+  end;
+end;
+
+// The int8 x int8 sum times both scales must agree with the existing
+// int8-weight x FP32-input path fed the dequantized B. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestDotProductInt8Int8MatchesFloatPath;
+const
+  N = 333;
+  ScaleA: TNeuralFloat = 0.02;
+  ScaleB: TNeuralFloat = 0.5;
+var
+  A, B: TInt8DynArr;
+  BFloat: array of TNeuralFloat;
+  ViaFloat, ViaInt: TNeuralFloat;
+  i: integer;
+begin
+  SetLength(A, N);
+  SetLength(B, N);
+  SetLength(BFloat, N);
+  for i := 0 to N - 1 do
+  begin
+    A[i] := ShortInt(((i * 53) mod 255) - 127);
+    B[i] := ShortInt(((i * 17 + 9) mod 255) - 127);
+  end;
+  TNNetVolume.DequantizeInt8(TNeuralFloatArrPtr(@BFloat[0]),
+    TNeuralInt8ArrPtr(@B[0]), N, ScaleB);
+  ViaFloat := ScaleA * TNNetVolume.DotProductInt8(TNeuralInt8ArrPtr(@A[0]),
+    TNeuralFloatArrPtr(@BFloat[0]), N);
+  ViaInt := ScaleA * ScaleB * TNNetVolume.DotProductInt8Int8(
+    TNeuralInt8ArrPtr(@A[0]), TNeuralInt8ArrPtr(@B[0]), N);
+  AssertEquals('int8 x int8 vs int8 x float', ViaFloat, ViaInt,
+    Abs(ViaFloat) * 1e-5);
 end;
 
 // QuantizeInt8 then DequantizeInt8 must land within half a code of the input,
