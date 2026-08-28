@@ -14746,9 +14746,9 @@ type
       // padded FInputCopy, size the im2col strides) used by both Compute() and
       // PrepareChunkedForward() so the two never drift. Coded by Claude (AI).
       procedure PrepareForwardPrologue();
-      // Builds FInputCopy + FInputPrepared (im2col) before this layer's chunks
-      // run - the input prep Compute() would otherwise do, which the parallel
-      // chunk path skips. Coded by Claude (AI).
+      // Builds FInputCopy + the im2col (FInputPreparedInt8 when the forward runs
+      // int8 x int8) before this layer's chunks run - the input prep Compute()
+      // would otherwise do, which the chunk path skips. Coded by Claude (AI).
       procedure PrepareChunkedForward(); override;
       procedure BackpropagateCPU();
       procedure BackpropagateFastCPU();
@@ -14773,9 +14773,10 @@ type
       procedure Compute(); override;
       // Frozen chunk-eligibility (see TNNetLayerThreading.ChunkEligible): CPU
       // forward only (not WillOpenCL), and the positions*neurons*vector MAC work
-      // is at or above the net's min-work threshold. Winograd and int8 keep
-      // their serial paths; low-memory DOES chunk (ComputeRange has a per-neuron
-      // ranged branch). Pure function of pass-stable state. Coded by Claude (AI).
+      // is at or above the net's min-work threshold. Winograd keeps its serial
+      // path; int8, int8 x int8 and low-memory DO chunk (ComputeRange has a
+      // ranged branch each). Pure function of pass-stable state.
+      // Coded by Claude (AI).
       function ChunkEligible(): boolean; override;
       // ComputeRange's index space: output NEURONS when ChunkOverNeurons (below),
       // else output positions (X*Y). Coded by Claude (AI).
@@ -104769,13 +104770,11 @@ begin
   // it (the concatenated-weight caches it would otherwise need are released in
   // low-memory mode). Int8-quantized is NOT excluded either: ComputeRange
   // routes to the ranged fused int8 kernel on both chunk axes, which reads
-  // only the immutable FQuantTable. Coded by Claude (AI).
+  // only the immutable FQuantTable and the input PrepareChunkedForward built.
+  // Coded by Claude (AI).
   Result := (FNN <> nil) and FNN.FIntraLayerThreading and
     (not WillOpenCL()) and
-    (not WinogradEligible()) and
-    // An int8-input layer is serial: ComputeRange still runs the int8 x FP32
-    // kernel and Compute() no longer builds the FP32 im2col it reads.
-    (not Assigned(FInputCopyInt8))
+    (not WinogradEligible())
     // any size is elegible
     //and (int64(FPrevLayer.FOutput.Size) * FOutput.Size >= 128*1024)
     ;
@@ -104824,7 +104823,18 @@ begin
     // race-free. Coded by Claude (AI).
     NumPositions := FOutputSizeX * FOutputSizeY;
     NumPositionsM1 := NumPositions - 1;
-    if FQuantInt8 then
+    if ShouldComputeInt8Int8CPU() then
+    begin
+      // Int8 x int8: both operands are codes. FInputPreparedInt8 was built once
+      // by PrepareChunkedForward, before any chunk was published, so this slice
+      // only reads it. Bias + activation run in the shared tail below.
+      // Coded by Claude (AI).
+      FOutputRaw.DotProductsTiledInt8Int8(FNeurons.Count, {BStart}0,
+        {BFinish}NumPositionsM1, FVectorSize, FQuantTable,
+        FInputPreparedInt8, FInputScaleInt8, FTileSizeD, FTileSizeX,
+        {AStart}StartRange, {AFinish}FinRange);
+    end
+    else if FQuantInt8 then
     begin
       // Int8-quantized: the FP32 weight storage was released at quantization
       // time, so the branches below would read freed memory. The fused int8
@@ -104897,7 +104907,17 @@ begin
   // element range below (FNeurons.Count = output channels/depth).
   FirstElem := StartRange * FNeurons.Count;
   LastElem  := (FinRange + 1) * FNeurons.Count - 1;
-  if FQuantInt8 then
+  if ShouldComputeInt8Int8CPU() then
+  begin
+    // Int8 x int8: position-sliced twin of ComputeInt8Int8CPU (B range = this
+    // chunk's output positions). FInputPreparedInt8 was built once by
+    // PrepareChunkedForward, before any chunk was published. Bias + activation
+    // run in the shared tail below. Coded by Claude (AI).
+    FOutputRaw.DotProductsTiledInt8Int8(FNeurons.Count, StartRange, FinRange,
+      FVectorSize, FQuantTable, FInputPreparedInt8, FInputScaleInt8,
+      FTileSizeD, FTileSizeX);
+  end
+  else if FQuantInt8 then
   begin
     // Int8-quantized: position-sliced twin of the serial fused int8 forward
     // (same kernel, B range = this chunk's output positions). Reads only the
@@ -106005,7 +106025,14 @@ begin
   // Pointwise convs: PrepareInputForConvolutionFast is a no-op (FInputPrepared
   // already aliases FPrevLayer.Output), so this just refreshes FInputCopy sizes.
   PrepareForwardPrologue();
-  PrepareInputForConvolutionFast();
+  // Int8 x int8: the chunks read FInputPreparedInt8 only, so the FP32 im2col is
+  // dead work here for the same reason it is in Compute(). Coded by Claude (AI).
+  if ShouldComputeInt8Int8CPU() then
+  begin
+    QuantizeInputInt8();
+    PrepareInputForConvolutionInt8();
+  end
+  else PrepareInputForConvolutionFast();
   Inc(FForwardCPUCnt);
 end;
 

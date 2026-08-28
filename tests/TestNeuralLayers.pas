@@ -120,6 +120,8 @@ type
     procedure TestConvolutionInt8Int8Strided;
     procedure TestConvolutionInt8Int8Pointwise;
     procedure TestConvolutionInt8Int8NotEnabled;
+    procedure TestConvolutionInt8Int8ChunkedMatchesSerial;
+    procedure TestConvolutionInt8Int8ChunkEligible;
     // Int8 input arming at net level and on TNNetFullConnect
     procedure TestNetEnableInt8InputCountsQuantizedLayers;
     procedure TestDequantizeWeightsInt8DropsInt8Input;
@@ -3999,6 +4001,82 @@ begin
   end;
 end;
 
+// One int8-quantized convolution with an int8 input, built the same way twice
+// so a chunked forward can be compared against the serial one.
+function BuildInt8Int8ConvNet(pInputX, pInputY, pDepth, pNeurons,
+  pFeatureSize, pPadding, pStride: integer;
+  out Conv: TNNetConvolutionLinear): TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(pInputX, pInputY, pDepth));
+  Conv := TNNetConvolutionLinear.Create(pNeurons, pFeatureSize, pPadding, pStride);
+  Result.AddLayer(Conv);
+  FillInt8ConvWeights(Conv);
+  TNNetLayerConcatedWeights(Conv).QuantizeWeightsInt8();
+  Conv.EnableInt8Input();
+  Result.SetTrainable(False);
+end;
+
+// The chunked int8 x int8 forward against the serial one on an identical net.
+// Same kernel and same per-output reduction order, so parity is BIT-exact.
+procedure AssertInt8Int8ChunkParity(pInputX, pInputY, pDepth, pNeurons,
+  pFeatureSize, pPadding, pStride: integer; const TestName: string);
+var
+  SerialNN, ChunkNN: TNNet;
+  Input, SerialOutput: TNNetVolume;
+  SerialConv, ChunkConv: TNNetConvolutionLinear;
+  RawPos, MaxRawPos: integer;
+begin
+  Input := TNNetVolume.Create(pInputX, pInputY, pDepth);
+  SerialOutput := TNNetVolume.Create();
+  SerialNN := nil;
+  ChunkNN := nil;
+  try
+    FillInt8ConvInput(Input);
+    SerialNN := BuildInt8Int8ConvNet(pInputX, pInputY, pDepth, pNeurons,
+      pFeatureSize, pPadding, pStride, SerialConv);
+    SerialNN.Compute(Input);
+    SerialOutput.Copy(SerialConv.Output);
+    TAssert.AssertTrue(TestName + ': serial reference is non-trivial',
+      SerialOutput.GetMaxAbs() > 1e-3);
+
+    ChunkNN := BuildInt8Int8ConvNet(pInputX, pInputY, pDepth, pNeurons,
+      pFeatureSize, pPadding, pStride, ChunkConv);
+    // The chunk verdict belongs BEFORE the pass: a single-core box would turn
+    // intra-layer threading back off and the parity check would prove nothing.
+    ChunkNN.EnableIntraLayerThreading(true);
+    TAssert.AssertTrue(TestName + ': conv is chunk-eligible',
+      ChunkConv.ChunkEligible());
+    // The chunk path must not build the FP32 im2col either (on a pointwise conv
+    // FInputPrepared IS the previous layer's output, so it cannot be cleared).
+    if not ChunkConv.Pointwise then ChunkConv.InputPrepared.Fill(0);
+    ChunkNN.SchedulerMinGain := 0;
+    ChunkNN.Compute(Input, 0, {Parallel=}True);
+
+    if not ChunkConv.Pointwise then
+    begin
+      MaxRawPos := ChunkConv.InputPrepared.Size - 1;
+      for RawPos := 0 to MaxRawPos do
+        TAssert.AssertTrue(TestName + ': the FP32 im2col stays unbuilt at ' +
+          IntToStr(RawPos), ChunkConv.InputPrepared.FData[RawPos] = 0);
+    end;
+    TAssert.AssertEquals(TestName + ': output size', SerialOutput.Size,
+      ChunkConv.Output.Size);
+    MaxRawPos := SerialOutput.Size - 1;
+    for RawPos := 0 to MaxRawPos do
+      TAssert.AssertTrue(TestName + ': chunked output ' + IntToStr(RawPos) +
+        ' ' + FloatToStr(ChunkConv.Output.FData[RawPos]) +
+        ' must be bit-identical to serial ' +
+        FloatToStr(SerialOutput.FData[RawPos]),
+        ChunkConv.Output.FData[RawPos] = SerialOutput.FData[RawPos]);
+  finally
+    SerialNN.Free;
+    ChunkNN.Free;
+    Input.Free;
+    SerialOutput.Free;
+  end;
+end;
+
 procedure TTestNeuralLayers.TestConvolutionInt8Int8Padded;
 var
   NN: TNNet;
@@ -4099,6 +4177,40 @@ begin
     NN.Free;
     Input.Free;
     BeforeOutput.Free;
+  end;
+end;
+
+// Both chunk axes of the int8 x int8 forward: spatial positions (a padded 3x3
+// and a pointwise conv over an 8x8 grid) and output neurons (a single-position
+// pointwise conv, the transformer decode shape).
+procedure TTestNeuralLayers.TestConvolutionInt8Int8ChunkedMatchesSerial;
+begin
+  AssertInt8Int8ChunkParity(8, 8, 3, 5, 3, 1, 1, 'Padded int8 x int8 chunk');
+  AssertInt8Int8ChunkParity(8, 8, 6, 5, 1, 0, 1, 'Pointwise int8 x int8 chunk');
+  AssertInt8Int8ChunkParity(1, 1, 64, 32, 1, 0, 1,
+    'Single-position int8 x int8 chunk');
+end;
+
+// An int8-input layer is chunk-eligible: ComputeRange runs the ranged int8 x
+// int8 kernel on both chunk axes.
+procedure TTestNeuralLayers.TestConvolutionInt8Int8ChunkEligible;
+var
+  NN: TNNet;
+  Conv: TNNetConvolutionLinear;
+begin
+  NN := BuildInt8Int8ConvNet(1, 1, 64, 32, 1, 0, 1, Conv);
+  try
+    NN.EnableIntraLayerThreading(true);
+    AssertTrue('An int8-input conv keeps its int8 input copy',
+      Conv.InputCopyInt8 <> nil);
+    AssertTrue('An int8-input conv is chunk-eligible', Conv.ChunkEligible());
+    AssertTrue('A single-position conv chunks over neurons',
+      Conv.ChunkOverNeurons() = (NeuralDefaultThreadCount() > 1));
+    NN.DisableInt8Input();
+    AssertTrue('A conv without an int8 input stays chunk-eligible',
+      Conv.ChunkEligible());
+  finally
+    NN.Free;
   end;
 end;
 
