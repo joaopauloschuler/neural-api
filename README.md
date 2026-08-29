@@ -25,12 +25,6 @@ This project is [Lazarus](https://www.lazarus-ide.org/) / [Free Pascal](https://
 
 ## Installation
 Clone this project, add the [**neural**](https://github.com/joaopauloschuler/neural-api/tree/master/neural) folder to your [Lazarus](https://www.lazarus-ide.org/) unit search path and you'll be ready to go!
-
-## A.I. Powered Support
-You can get A.I. powered help from these tools:
-* [CAI Neural API support at Poe (free)](https://poe.com/CAI-NEURAL-API-FREE)
-* [CAI Neural API support at Poe](https://poe.com/CAI-NEURAL-API)
-* [CAI Neural API support at ChatGPT4](https://chatgpt.com/g/g-6BrAwhTQ9-free-pascal-developer-neural-api)
  
 ## Documentation
 The documentation covers: 
