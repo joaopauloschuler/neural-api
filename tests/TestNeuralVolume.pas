@@ -3879,17 +3879,23 @@ const
 var
   W: TNNetVolume;
   Q: TNNetVolumeQuant4;
-  B: TInt8DynArr;
-  Expected, Got, AbsSum: TNeuralFloat;
+  B: TNNetVolumeQuant8;
+  Expected, Got, AbsSum, BlockSum: TNeuralFloat;
   i, L, Len: integer;
 begin
   RandSeed := 9753;
   W := TNNetVolume.Create(1, 1, MaxN);
   Q := TNNetVolumeQuant4.Create();
-  SetLength(B, MaxN);
+  B := TNNetVolumeQuant8.Create(1, 1, MaxN);
   try
     W.RandomizeGaussian(0.05);
-    for i := 0 to MaxN - 1 do B[i] := ShortInt(((i * 91 + 5) mod 255) - 127);
+    for i := 0 to MaxN - 1 do B.FData[i] := ShortInt(((i * 91 + 5) mod 255) - 127);
+    B.EnableBlockSums();
+    B.ComputeBlockSums();
+    BlockSum := 0;
+    for i := 32 to 63 do BlockSum := BlockSum + B.FData[i];
+    AssertEquals('block sum 1 is 8 x the code sum', 8 * BlockSum,
+      B.BlockSum8RowPtr(0, 0)^[1], 0);
     Q.QuantizeFrom(W);
     for L := 0 to High(cBlocks) do
     begin
@@ -3898,21 +3904,21 @@ begin
       AbsSum := 0;
       for i := 0 to Len - 1 do
       begin
-        Expected := Expected + Q.Dequantize(0, 0, i) * B[i];
-        AbsSum := AbsSum + Abs(Q.Dequantize(0, 0, i) * B[i]);
+        Expected := Expected + Q.Dequantize(0, 0, i) * B.FData[i];
+        AbsSum := AbsSum + Abs(Q.Dequantize(0, 0, i) * B.FData[i]);
       end;
       Got := TNNetVolume.DotProductInt4Int8(Q.DataPtr, Q.ScalePtr,
-        TNeuralInt8ArrPtr(@B[0]), Len);
+        B.DataPtr, B.BlockSum8Ptr, Len);
       AssertEquals('N=' + IntToStr(Len), Expected, Got, AbsSum * 1e-5 + 1e-6);
     end;
     // Extra elements past the last full block are ignored.
     Got := TNNetVolume.DotProductInt4Int8(Q.DataPtr, Q.ScalePtr,
-      TNeuralInt8ArrPtr(@B[0]), 32 + 31);
+      B.DataPtr, B.BlockSum8Ptr, 32 + 31);
     Expected := TNNetVolume.DotProductInt4Int8(Q.DataPtr, Q.ScalePtr,
-      TNeuralInt8ArrPtr(@B[0]), 32);
+      B.DataPtr, B.BlockSum8Ptr, 32);
     AssertEquals('partial block ignored', Expected, Got, 0);
   finally
-    Q.Free; W.Free;
+    B.Free; Q.Free; W.Free;
   end;
 end;
 
@@ -3945,6 +3951,8 @@ begin
     Q.QuantizeFrom(W);
     Q.DequantizeTo(WFloat);
     for i := 0 to B.Size - 1 do B.FData[i] := ShortInt(((i * 53 + 3) mod 255) - 127);
+    B.EnableBlockSums();
+    B.ComputeBlockSums();
     for i := 0 to B.Size - 1 do BFloat.FData[i] := B.FData[i] * BScale;
     OutRef.DotProductsTiled(NumAs, NumBs, VectorSize, WFloat, BFloat, 4, 2);
     OutQ.Fill(-1);

@@ -14760,6 +14760,11 @@ type
       // Quantized weights x int8 input forward: quantize the input, byte
       // im2col, one tiled reduction per output. Needs EnableInt8Input. Coded by Claude (AI).
       procedure ComputeQuantInt8InputCPU();
+      // Quantizes the input, builds the byte im2col and, for int4 weights, the
+      // block sums the kernel's zero-point correction reads. Coded by Claude (AI).
+      procedure PrepareQuantInt8Input();
+      // Also enables the block sums on FInputPreparedInt8 (see PrepareQuantInt8Input).
+      procedure QuantizeWeightsInt4(); override;
       // Int4 weights with no int8 input path left the FP32 weights released,
       // so the other forwards would read shrunk storage. Coded by Claude (AI).
       procedure RaiseWhenInt4WithoutInt8Input();
@@ -105351,6 +105356,7 @@ begin
   // Same pass-stable shape tests as the int8 x int8 verdict, against the Q4_0
   // container. An int4 layer never reaches the device (EnableOpenCL refuses).
   Result := FQuantInt4 and Assigned(FInputPreparedInt8) and
+    FInputPreparedInt8.HasBlockSums and
     (not WillOpenCL()) and
     (FInputPreparedInt8.Depth = FVectorSize) and
     (FQuantTableInt4.Depth = FVectorSize);
@@ -105373,10 +105379,24 @@ begin
     FTileSizeD, FTileSizeX, AStart, AFinish);
 end;
 
-procedure TNNetConvolution.ComputeQuantInt8InputCPU();
+procedure TNNetConvolution.PrepareQuantInt8Input();
 begin
   QuantizeInputInt8();
   PrepareInputForConvolutionInt8();
+  if FQuantInt4 then FInputPreparedInt8.ComputeBlockSums();
+end;
+
+procedure TNNetConvolution.QuantizeWeightsInt4();
+begin
+  inherited QuantizeWeightsInt4();
+  if FQuantInt4 and Assigned(FInputPreparedInt8) and
+    (not FInputPreparedInt8.HasBlockSums) then
+    FInputPreparedInt8.EnableBlockSums();
+end;
+
+procedure TNNetConvolution.ComputeQuantInt8InputCPU();
+begin
+  PrepareQuantInt8Input();
   DotProductsQuantInt8Input({BStart}0,
     {BFinish}FOutputSizeX * FOutputSizeY - 1, {AStart}0,
     {AFinish}FNeurons.Count - 1);
@@ -106219,8 +106239,7 @@ begin
   // Coded by Claude (AI).
   if ShouldComputeQuantInt8InputCPU() then
   begin
-    QuantizeInputInt8();
-    PrepareInputForConvolutionInt8();
+    PrepareQuantInt8Input();
   end
   else
   begin
