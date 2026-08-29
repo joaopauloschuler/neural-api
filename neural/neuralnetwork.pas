@@ -131882,11 +131882,12 @@ begin
   for LayerCnt := 0 to LastLayerIdx do
   begin
     CurrentLayer := FLayers[LayerCnt];
-    if (CurrentLayer is TNNetLayerConcatedWeights) and
-      TNNetLayerConcatedWeights(CurrentLayer).WeightsQuantizedInt8 then
+    if CurrentLayer is TNNetLayerConcatedWeights then
     begin
-      CurrentLayer.EnableInt8Input();
-      // Count what the layer actually armed: it refuses without a prev layer.
+      if TNNetLayerConcatedWeights(CurrentLayer).WeightsQuantizedInt8 then
+        CurrentLayer.EnableInt8Input();
+      // Count every layer holding the copy: what this call armed (it refuses
+      // without a prev layer) plus the int4 layers, which arm it themselves.
       if Assigned(TNNetLayerConcatedWeights(CurrentLayer).InputCopyInt8)
         then Inc(Result);
     end;

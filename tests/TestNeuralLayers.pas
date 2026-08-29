@@ -4628,6 +4628,9 @@ begin
       not FullConnect.WeightsQuantizedInt4);
     AssertEquals('Re-running the sweep counts the same layers', 2,
       NN.QuantizeWeightsInt4());
+    // No int8 layer to arm, yet the two int4 layers already hold the copy.
+    AssertEquals('EnableInt8Input counts the int4 layers too', 2,
+      NN.EnableInt8Input());
   finally
     NN.Free;
   end;
