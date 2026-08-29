@@ -1457,6 +1457,19 @@ var
   TStart, TFirst, TEnd: QWord;
   Produced: integer;
   DecodeSecs: double;
+  // --stats per-phase split of one decode step, accumulated over the loop in
+  // ms: the net forward, the logits row copy + softmax, the processor chain
+  // (repetition penalty), the sampler, the detokenize + emit, and the rest.
+  PhaseMark, StepMark: TDateTime;
+  ForwardMs, SoftMaxMs, ChainMs, SamplerMs, EmitMs, StepMs: double;
+  function PhaseElapsedMs(): double;
+  var
+    NowMark: TDateTime;
+  begin
+    NowMark := Now();
+    Result := (NowMark - PhaseMark) * MSecsPerDay;
+    PhaseMark := NowMark;
+  end;
 begin
   Result := '';
   if not Loaded then
@@ -1598,25 +1611,37 @@ begin
     // argmax(logits); softmax and its full-vocab Move are order-preserving, so
     // argmax(softmax(L)) = argmax(L). Skip both on this hot per-token path.
     GreedyFast := (Sampler = nil) and (Chain.Count = 0);
+    ForwardMs := 0; SoftMaxMs := 0; ChainMs := 0; SamplerMs := 0;
+    EmitMs := 0; StepMs := 0;
     for StepCnt := 1 to GenOpt.MaxNewTokens do
     begin
       if Len >= SeqLen then break;
+      StepMark := Now();
+      PhaseMark := StepMark;
       // One width-1 forward of the last committed token over the cached past.
       LastPos := Len - 1;
       InV.FData[0] := Tokens[LastPos];
       Session.StepForward(InV, LastPos);
+      ForwardMs := ForwardMs + PhaseElapsedMs();
       Output := Session.Output(); // (1,1,vocab) -- the single logits row
       if GreedyFast then
-        NewToken := ArgMaxRow(Output)   // #14: argmax(softmax)=argmax(logits)
+      begin
+        NewToken := ArgMaxRow(Output);  // #14: argmax(softmax)=argmax(logits)
+        SamplerMs := SamplerMs + PhaseElapsedMs();
+      end
       else
       begin
         Move(Output.FData[0], Row.FData[0], RowBytes);
         RowSoftMax(Row);
+        SoftMaxMs := SoftMaxMs + PhaseElapsedMs();
         Chain.ProcessRow(Row);
+        ChainMs := ChainMs + PhaseElapsedMs();
         if Assigned(Sampler) then NewToken := Sampler.GetToken(Row)
         else NewToken := ArgMaxRow(Row);
+        SamplerMs := SamplerMs + PhaseElapsedMs();
       end;
       Chain.Commit(NewToken);
+      ChainMs := ChainMs + PhaseElapsedMs();
       Tokens[Len] := NewToken;
       Inc(Len);
       Inc(Produced);
@@ -1674,6 +1699,8 @@ begin
           EmLen := DecLen;
         end;
       end;
+      EmitMs := EmitMs + PhaseElapsedMs();
+      StepMs := StepMs + (Now() - StepMark) * MSecsPerDay;
     end;
     LastCompletionTokens := Produced;
     Result := Tokenizer.DecodeCount(Generated, GenCount,
@@ -1720,6 +1747,16 @@ begin
             [(Produced - 1) / DecodeSecs]));
       end;
       WriteLn(StdErr);
+      // The same decode steps split by phase, so the host work outside the
+      // net forward is visible next to it. A step that broke on EOS before
+      // its emit phase counts in "other".
+      WriteLn(StdErr, Format('[stats] per decode step (ms): forward %.2f,' +
+        ' softmax %.2f, processors %.2f, sampler %.2f, emit %.2f, other %.2f,' +
+        ' step %.2f',
+        [ForwardMs / Produced, SoftMaxMs / Produced, ChainMs / Produced,
+         SamplerMs / Produced, EmitMs / Produced,
+         (StepMs - ForwardMs - SoftMaxMs - ChainMs - SamplerMs - EmitMs) / Produced,
+         StepMs / Produced]));
       Flush(StdErr);
     end;
     // --profile: per-layer-class forward timing accumulated over this call's
