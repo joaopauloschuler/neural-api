@@ -548,9 +548,9 @@ type
       class function DotProductInt8Int8(PtrA, PtrB: TNeuralInt8ArrPtr; NumElements: integer): integer;
       // Int4-weight x int8-input dot product over NumElements div 32 blocks:
       // sum over blocks of BlockScale * sum(code_w * code_b), TNNetVolumeQuant4
-      // row layout, with PtrBlockSum8 = TNNetVolumeQuant8.BlockSum8RowPtr of B
-      // (the multiply reads the biased nibble, the sums undo the bias). Caller
-      // applies the input scale. Not bit-exact vs Pascal. Coded by Claude (AI).
+      // row layout; PtrB / PtrBlockSum8 are TNNetVolumeQuant8.PairedCodesRowPtr /
+      // BlockSum8RowPtr of the input row. Caller applies the input scale. Not
+      // bit-exact vs Pascal. Coded by Claude (AI).
       class function DotProductInt4Int8(PtrPacked: TNeuralByteArrPtr; PtrBlockScales: TNeuralFloatArrPtr; PtrB: TNeuralInt8ArrPtr; PtrBlockSum8: TNeuralFloatArrPtr; NumElements: integer): TNeuralFloat;
       // Fused int8-weight x float32-input elementwise multiply-accumulate:
       // PtrA[i] += PtrCodes[i] * PtrB[i], with NO scale applied - the caller
@@ -593,7 +593,7 @@ type
       // [BStart..BFinish], A rows [AStart..AFinish] (AFinish < 0 = all rows).
       procedure DotProductsTiledInt8Int8(NumAs, BStart, BFinish, VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolumeQuant8; BScale: TNeuralFloat; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
       // Int4-weight x int8-input twin of DotProductsTiledInt8Int8: the block
-      // scales live in Weights, BScale is the input scale; VBs needs block sums.
+      // scales live in Weights, BScale is the input scale; VBs needs its int4 input planes.
       procedure DotProductsTiledInt4Int8(NumAs, NumBs, VectorSize: integer; Weights: TNNetVolumeQuant4; VBs: TNNetVolumeQuant8; BScale: TNeuralFloat; TileSizeA, TileSizeB: integer); overload;
       // Ranged form, same tiling and output layout as the ranged DotProductsTiledInt8Int8.
       procedure DotProductsTiledInt4Int8(NumAs, BStart, BFinish, VectorSize: integer; Weights: TNNetVolumeQuant4; VBs: TNNetVolumeQuant8; BScale: TNeuralFloat; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
@@ -981,10 +981,12 @@ type
     private
       FScaleData: TNNetVolume;
       FBlockSum8: TNNetVolume;
+      FPairedCodes: TInt8DynArr;
+      FPairedCodesPtr: TNeuralInt8ArrPtr;
       FDataPtr: TNeuralInt8ArrPtr;
       FSizeX, FSizeY, FDepth, FSize: integer;
       function GetBlockSum8Ptr(): TNeuralFloatArrPtr; {$IFDEF Release} inline; {$ENDIF}
-      function GetHasBlockSums(): boolean; {$IFDEF Release} inline; {$ENDIF}
+      function GetHasInt4InputPlanes(): boolean; {$IFDEF Release} inline; {$ENDIF}
       function GetScale(x, y: integer): TNeuralFloat; {$IFDEF Release} inline; {$ENDIF}
       procedure SetScale(x, y: integer; Value: TNeuralFloat); {$IFDEF Release} inline; {$ENDIF}
       function GetScalePtr(): TNeuralFloatArrPtr; {$IFDEF Release} inline; {$ENDIF}
@@ -1021,13 +1023,16 @@ type
       procedure DequantizeTo(Dest: TNNetVolume);
 
       procedure Fill(c: ShortInt = 0);
-      // Allocates the per-block plane (SizeX, SizeY, Depth div 32) that
-      // ComputeBlockSums fills; needs Depth a multiple of 32. Kept by ReSize.
-      procedure EnableBlockSums();
-      // Fills BlockSum8: 8 * (sum of the 32 codes) per block of every row, the
-      // int4 kernel's zero-point correction. Needs EnableBlockSums.
-      procedure ComputeBlockSums();
+      // Allocates the two planes DotProductInt4Int8 reads from this volume
+      // (see ComputeInt4InputPlanes); needs Depth a multiple of 32. Kept by ReSize.
+      procedure EnableInt4InputPlanes();
+      // Fills BlockSum8 (8 * sum of each block's 32 codes, the zero-point
+      // correction) and PairedCodes (per pair of blocks k,k+1 the 64 codes
+      // reordered [k 0..15][k+1 0..15][k 16..31][k+1 16..31]; an odd last block
+      // stays in order). Needs EnableInt4InputPlanes.
+      procedure ComputeInt4InputPlanes();
       function BlockSum8RowPtr(x, y: integer): TNeuralFloatArrPtr; {$IFDEF Release} inline; {$ENDIF}
+      function PairedCodesRowPtr(x, y: integer): TNeuralInt8ArrPtr; {$IFDEF Release} inline; {$ENDIF}
       procedure CopyFrom(Original: TNNetVolumeQuant8);
       // Drops Count rows from row StartY on and shifts the rows above them
       // down, leaving the last Count rows stale. Capacity is untouched: this
@@ -1048,8 +1053,10 @@ type
       // keeps it in step with FData.
       property ScaleData: TNNetVolume read FScaleData;
       property Scale[x, y: integer]: TNeuralFloat read GetScale write SetScale;
-      property HasBlockSums: boolean read GetHasBlockSums;
+      property HasInt4InputPlanes: boolean read GetHasInt4InputPlanes;
       property BlockSum8Ptr: TNeuralFloatArrPtr read GetBlockSum8Ptr;
+      // Same row geometry as DataPtr, codes in the paired-block order.
+      property PairedCodesPtr: TNeuralInt8ArrPtr read FPairedCodesPtr;
   end;
 
   { TNNetVolumeQuant4 }
@@ -2166,11 +2173,12 @@ end;
 
 // Int4 x int8 block dot product. Two blocks per iteration: one 32-byte load
 // unpacks (mask only) into [lo nibbles of both blocks | hi nibbles of both
-// blocks], two vperm2i128 arrange the inputs the same way, the biased nibble
-// is vpmaddubsw's u8 operand, and the pair sums are FMA'd with the block
-// scales. The bias is undone afterwards by one short float dot of the block
-// scales against PtrBlockSum8 (8 * sum of the block's codes). Every constant
-// is built in registers (PIC-safe). Requires NumBlocks >= 1. Coded by Claude (AI).
+// blocks], the input row already sits in that paired order
+// (TNNetVolumeQuant8.PairedCodes), the biased nibble is vpmaddubsw's u8
+// operand, and the pair sums are FMA'd with the two block scales expanded by
+// one vpermps. The bias is undone afterwards by one short float dot of the
+// block scales against PtrBlockSum8. Constants are built in registers
+// (PIC-safe). Requires NumBlocks >= 1. Coded by Claude (AI).
 function AVXDotProductInt4Int8(PtrPacked: TNeuralByteArrPtr;
   PtrBlockScales: TNeuralFloatArrPtr; PtrB: TNeuralInt8ArrPtr;
   PtrBlockSum8: TNeuralFloatArrPtr; NumBlocks: integer): Single;
@@ -2193,6 +2201,9 @@ begin
   vpcmpeqw ymm5, ymm5, ymm5
   vpsrlw ymm5, ymm5, 12
   vpackuswb ymm5, ymm5, ymm5     // bytes 0x0F: the nibble mask
+  vpcmpeqd ymm6, ymm6, ymm6
+  vpsrld ymm6, ymm6, 31          // dwords 1
+  vperm2i128 ymm6, ymm1, ymm6, $20  // [0 0 0 0 | 1 1 1 1]: the scale-pair index
   test ecx, ecx
   jz @PairsDone
 
@@ -2201,18 +2212,13 @@ begin
   vpsrlw ymm3, ymm2, 4
   vpand ymm2, ymm2, ymm5         // [k elems 0..15 | k+1 elems 0..15]
   vpand ymm3, ymm3, ymm5         // [k elems 16..31 | k+1 elems 16..31]
-  vmovdqu ymm8, [rdx]            // input block k
-  vmovdqu ymm9, [rdx+32]         // input block k+1
-  vperm2i128 ymm10, ymm8, ymm9, $20  // [k in 0..15 | k+1 in 0..15]
-  vperm2i128 ymm11, ymm8, ymm9, $31  // [k in 16..31 | k+1 in 16..31]
-  vpmaddubsw ymm2, ymm2, ymm10   // u8 nibble x s8 input, exact
-  vpmaddubsw ymm3, ymm3, ymm11
+  vpmaddubsw ymm2, ymm2, [rdx]   // u8 nibble x s8 input, exact
+  vpmaddubsw ymm3, ymm3, [rdx+32]
   vpaddw ymm2, ymm2, ymm3        // |sum| <= 4 * 15 * 127, no saturation
   vpmaddwd ymm2, ymm2, ymm7      // lanes 0..3 block k, 4..7 block k+1
   vcvtdq2ps ymm2, ymm2
-  vbroadcastss ymm4, [r8]
-  vbroadcastss ymm3, [r8+4]
-  vblendps ymm4, ymm4, ymm3, $F0
+  vmovsd xmm4, [r8]
+  vpermps ymm4, ymm6, ymm4
   vfmadd231ps ymm0, ymm2, ymm4
 
   add rax, 32
@@ -2229,8 +2235,7 @@ begin
   vpsrlw xmm3, xmm2, 4
   vinserti128 ymm2, ymm2, xmm3, 1
   vpand ymm2, ymm2, ymm5
-  vmovdqu ymm3, [rdx]
-  vpmaddubsw ymm2, ymm2, ymm3
+  vpmaddubsw ymm2, ymm2, [rdx]
   vpmaddwd ymm2, ymm2, ymm7
   vcvtdq2ps ymm2, ymm2
   vbroadcastss ymm4, [r8]
@@ -2263,8 +2268,7 @@ begin
   end
   [
     'RAX', 'RCX', 'RDX', 'R8',
-    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm7',
-    'ymm8', 'ymm9', 'ymm10', 'ymm11'
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm6', 'ymm7'
   ];
   Result := vRes;
   for BlockIdx := NumOctets * 8 to NumBlocks - 1 do
@@ -13834,8 +13838,8 @@ class function TNNetVolume.DotProductInt4Int8(PtrPacked: TNeuralByteArrPtr;
   PtrBlockScales: TNeuralFloatArrPtr; PtrB: TNeuralInt8ArrPtr;
   PtrBlockSum8: TNeuralFloatArrPtr; NumElements: integer): TNeuralFloat;
 var
-  NumBlocks, BlockIdx, ByteIdx, MaxBlockIdx: integer;
-  PackedByte, BlockSum, PackedOfs, BOfs: integer;
+  NumBlocks, NumPairs, PairIdx, MaxPairIdx, ByteIdx: integer;
+  PackedByte, PackedByteNext, SumK, SumKNext, PackedOfs, BOfs: integer;
 begin
   NumBlocks := NumElements div TNNetVolumeQuant4.BlockSize;
   Result := 0;
@@ -13847,23 +13851,44 @@ begin
   exit;
   {$ENDIF}
   {$ENDIF}
-  MaxBlockIdx := NumBlocks - 1;
+  // Biased nibble times code, the bias undone by the precomputed 8 * sum; the
+  // input row is in the paired order (see TNNetVolumeQuant8.ComputeInt4InputPlanes).
+  NumPairs := NumBlocks shr 1;
+  MaxPairIdx := NumPairs - 1;
   PackedOfs := 0;
   BOfs := 0;
-  for BlockIdx := 0 to MaxBlockIdx do
+  for PairIdx := 0 to MaxPairIdx do
   begin
-    // Biased nibble times code, the bias undone by the precomputed 8 * sum.
-    BlockSum := 0;
+    SumK := 0;
+    SumKNext := 0;
     for ByteIdx := 0 to TNNetVolumeQuant4.PackedBlockBytes - 1 do
     begin
       PackedByte := PtrPacked^[PackedOfs + ByteIdx];
-      BlockSum := BlockSum +
+      PackedByteNext := PtrPacked^[PackedOfs + ByteIdx + TNNetVolumeQuant4.PackedBlockBytes];
+      SumK := SumK +
+        (PackedByte and 15) * PtrB^[BOfs + ByteIdx] +
+        (PackedByte shr 4) * PtrB^[BOfs + ByteIdx + 32];
+      SumKNext := SumKNext +
+        (PackedByteNext and 15) * PtrB^[BOfs + ByteIdx + 16] +
+        (PackedByteNext shr 4) * PtrB^[BOfs + ByteIdx + 48];
+    end;
+    Result := Result +
+      (SumK - PtrBlockSum8^[2 * PairIdx]) * PtrBlockScales^[2 * PairIdx] +
+      (SumKNext - PtrBlockSum8^[2 * PairIdx + 1]) * PtrBlockScales^[2 * PairIdx + 1];
+    Inc(PackedOfs, 2 * TNNetVolumeQuant4.PackedBlockBytes);
+    Inc(BOfs, 2 * TNNetVolumeQuant4.BlockSize);
+  end;
+  if (NumBlocks and 1) = 1 then
+  begin
+    SumK := 0;
+    for ByteIdx := 0 to TNNetVolumeQuant4.PackedBlockBytes - 1 do
+    begin
+      PackedByte := PtrPacked^[PackedOfs + ByteIdx];
+      SumK := SumK +
         (PackedByte and 15) * PtrB^[BOfs + ByteIdx] +
         (PackedByte shr 4) * PtrB^[BOfs + ByteIdx + TNNetVolumeQuant4.PackedBlockBytes];
     end;
-    Result := Result + (BlockSum - PtrBlockSum8^[BlockIdx]) * PtrBlockScales^[BlockIdx];
-    Inc(PackedOfs, TNNetVolumeQuant4.PackedBlockBytes);
-    Inc(BOfs, TNNetVolumeQuant4.BlockSize);
+    Result := Result + (SumK - PtrBlockSum8^[NumBlocks - 1]) * PtrBlockScales^[NumBlocks - 1];
   end;
 end;
 
@@ -14328,14 +14353,14 @@ begin
   // Same ceil-division tiling and output layout as DotProductsTiledInt8Int8;
   // the A rows are addressed by packed bytes and by block scales.
   if AFinish < 0 then AFinish := NumAs - 1;
-  if not VBs.HasBlockSums then
-    raise Exception.Create('DotProductsTiledInt4Int8: VBs has no block sums' +
-      ' (call EnableBlockSums + ComputeBlockSums).');
+  if not VBs.HasInt4InputPlanes then
+    raise Exception.Create('DotProductsTiledInt4Int8: VBs has no int4 input' +
+      ' planes (call EnableInt4InputPlanes + ComputeInt4InputPlanes).');
   PackedData := Weights.DataPtr;
   ScaleData := Weights.ScalePtr;
   PackedRowBytes := Weights.PackedRowBytes;
   BlocksPerRow := Weights.BlocksPerRow;
-  BData := VBs.DataPtr;
+  BData := VBs.PairedCodesPtr;
   BSum8Data := VBs.BlockSum8Ptr;
   MaxTileA := ((AFinish - AStart + 1) + TileSizeA - 1) div TileSizeA - 1;
   MaxTileB := ((BFinish - BStart + 1) + TileSizeB - 1) div TileSizeB - 1;
@@ -19777,6 +19802,7 @@ begin
   inherited Create();
   FScaleData := TNNetVolume.Create(1, 1, 1);
   FBlockSum8 := nil;
+  FPairedCodesPtr := nil;
   FSizeX := 0;
   FSizeY := 0;
   FDepth := 0;
@@ -19791,6 +19817,7 @@ begin
   FDataPtr := nil;
   FScaleData.Free;
   FBlockSum8.Free;
+  SetLength(FPairedCodes, 0);
   inherited Destroy();
 end;
 
@@ -19818,15 +19845,15 @@ begin
   if FSize > 0
   then FDataPtr := addr(FData[0])
   else FDataPtr := nil;
-  if Assigned(FBlockSum8) then EnableBlockSums();
+  if Assigned(FBlockSum8) then EnableInt4InputPlanes();
 end;
 
-procedure TNNetVolumeQuant8.EnableBlockSums();
+procedure TNNetVolumeQuant8.EnableInt4InputPlanes();
 var
   BlocksPerRow: integer;
 begin
   if (FDepth mod TNNetVolumeQuant4.BlockSize) <> 0 then
-    raise Exception.Create('TNNetVolumeQuant8.EnableBlockSums: depth ' +
+    raise Exception.Create('TNNetVolumeQuant8.EnableInt4InputPlanes: depth ' +
       IntToStr(FDepth) + ' is not a multiple of ' +
       IntToStr(TNNetVolumeQuant4.BlockSize) + '.');
   BlocksPerRow := FDepth div TNNetVolumeQuant4.BlockSize;
@@ -19835,11 +19862,16 @@ begin
   then FBlockSum8.ReSize(FSizeX, FSizeY, BlocksPerRow)
   else FBlockSum8.ReSize(1, 1, 1);
   FBlockSum8.Fill(0);
+  if Length(FPairedCodes) <> FSize then SetLength(FPairedCodes, FSize);
+  if FSize > 0
+  then FPairedCodesPtr := addr(FPairedCodes[0])
+  else FPairedCodesPtr := nil;
 end;
 
-procedure TNNetVolumeQuant8.ComputeBlockSums();
+procedure TNNetVolumeQuant8.ComputeInt4InputPlanes();
 var
   BlockIdx, MaxBlockIdx, CodeIdx, CodeOfs, BlockSum: integer;
+  RowIdx, MaxRowIdx, PairIdx, MaxPairIdx, RowOfs, PairOfs: integer;
   SumData: TNeuralFloatArrPtr;
 begin
   if (FSize = 0) or (not Assigned(FBlockSum8)) then exit;
@@ -19855,6 +19887,31 @@ begin
     SumData^[BlockIdx] := 8 * BlockSum;
     Inc(CodeOfs, TNNetVolumeQuant4.BlockSize);
   end;
+  // Paired order per row: [k 0..15][k+1 0..15][k 16..31][k+1 16..31]; an odd
+  // last block is copied in its natural order.
+  MaxRowIdx := FSizeX * FSizeY - 1;
+  MaxPairIdx := (FDepth div TNNetVolumeQuant4.BlockSize) div 2 - 1;
+  RowOfs := 0;
+  for RowIdx := 0 to MaxRowIdx do
+  begin
+    PairOfs := RowOfs;
+    for PairIdx := 0 to MaxPairIdx do
+    begin
+      Move(FDataPtr^[PairOfs], FPairedCodesPtr^[PairOfs], 16);
+      Move(FDataPtr^[PairOfs + 32], FPairedCodesPtr^[PairOfs + 16], 16);
+      Move(FDataPtr^[PairOfs + 16], FPairedCodesPtr^[PairOfs + 32], 16);
+      Move(FDataPtr^[PairOfs + 48], FPairedCodesPtr^[PairOfs + 48], 16);
+      Inc(PairOfs, 64);
+    end;
+    if ((FDepth div TNNetVolumeQuant4.BlockSize) and 1) = 1 then
+      Move(FDataPtr^[PairOfs], FPairedCodesPtr^[PairOfs], 32);
+    Inc(RowOfs, FDepth);
+  end;
+end;
+
+function TNNetVolumeQuant8.PairedCodesRowPtr(x, y: integer): TNeuralInt8ArrPtr;
+begin
+  Result := TNeuralInt8ArrPtr(@FPairedCodesPtr^[((FSizeX * y) + x) * FDepth]);
 end;
 
 function TNNetVolumeQuant8.BlockSum8RowPtr(x, y: integer): TNeuralFloatArrPtr;
@@ -19870,7 +19927,7 @@ begin
   else Result := nil;
 end;
 
-function TNNetVolumeQuant8.GetHasBlockSums(): boolean;
+function TNNetVolumeQuant8.GetHasInt4InputPlanes(): boolean;
 begin
   Result := Assigned(FBlockSum8);
 end;

@@ -3871,7 +3871,8 @@ end;
 
 // DotProductInt4Int8 must agree with the dequantized FP32 dot product over
 // every block count, including the AVX2 kernel's float accumulation order.
-// Coded by Claude (AI).
+// NumElements must be the input row's depth (the paired order is a property
+// of the whole row), or a prefix holding whole block pairs. Coded by Claude (AI).
 procedure TTestNeuralVolumeQuant8.TestDotProductInt4Int8MatchesReference;
 const
   cBlocks: array[0..6] of integer = (0, 1, 2, 3, 7, 8, 33);
@@ -3886,20 +3887,17 @@ begin
   RandSeed := 9753;
   W := TNNetVolume.Create(1, 1, MaxN);
   Q := TNNetVolumeQuant4.Create();
-  B := TNNetVolumeQuant8.Create(1, 1, MaxN);
+  B := TNNetVolumeQuant8.Create();
   try
     W.RandomizeGaussian(0.05);
-    for i := 0 to MaxN - 1 do B.FData[i] := ShortInt(((i * 91 + 5) mod 255) - 127);
-    B.EnableBlockSums();
-    B.ComputeBlockSums();
-    BlockSum := 0;
-    for i := 32 to 63 do BlockSum := BlockSum + B.FData[i];
-    AssertEquals('block sum 1 is 8 x the code sum', 8 * BlockSum,
-      B.BlockSum8RowPtr(0, 0)^[1], 0);
     Q.QuantizeFrom(W);
     for L := 0 to High(cBlocks) do
     begin
       Len := cBlocks[L] * 32;
+      B.ReSize(1, 1, Max(Len, 32));
+      for i := 0 to B.Size - 1 do B.FData[i] := ShortInt(((i * 91 + 5) mod 255) - 127);
+      B.EnableInt4InputPlanes();
+      B.ComputeInt4InputPlanes();
       Expected := 0;
       AbsSum := 0;
       for i := 0 to Len - 1 do
@@ -3908,14 +3906,28 @@ begin
         AbsSum := AbsSum + Abs(Q.Dequantize(0, 0, i) * B.FData[i]);
       end;
       Got := TNNetVolume.DotProductInt4Int8(Q.DataPtr, Q.ScalePtr,
-        B.DataPtr, B.BlockSum8Ptr, Len);
+        B.PairedCodesPtr, B.BlockSum8Ptr, Len);
       AssertEquals('N=' + IntToStr(Len), Expected, Got, AbsSum * 1e-5 + 1e-6);
     end;
-    // Extra elements past the last full block are ignored.
+    // The planes of a 96-deep row: sums and the paired order of blocks 0,1
+    // and the odd block 2 in its natural order.
+    B.ReSize(1, 1, 96);
+    for i := 0 to 95 do B.FData[i] := ShortInt(((i * 91 + 5) mod 255) - 127);
+    B.EnableInt4InputPlanes();
+    B.ComputeInt4InputPlanes();
+    BlockSum := 0;
+    for i := 32 to 63 do BlockSum := BlockSum + B.FData[i];
+    AssertEquals('block sum 1 is 8 x the code sum', 8 * BlockSum,
+      B.BlockSum8RowPtr(0, 0)^[1], 0);
+    AssertEquals('paired: block 1 elem 0 sits at 16', B.FData[32], B.PairedCodesPtr^[16]);
+    AssertEquals('paired: block 0 elem 16 sits at 32', B.FData[16], B.PairedCodesPtr^[32]);
+    AssertEquals('paired: block 1 elem 16 sits at 48', B.FData[48], B.PairedCodesPtr^[48]);
+    AssertEquals('paired: odd last block stays', B.FData[64 + 5], B.PairedCodesPtr^[64 + 5]);
+    // Extra elements past the last full block are ignored (64 + 31 = 2 blocks).
     Got := TNNetVolume.DotProductInt4Int8(Q.DataPtr, Q.ScalePtr,
-      B.DataPtr, B.BlockSum8Ptr, 32 + 31);
+      B.PairedCodesPtr, B.BlockSum8Ptr, 64 + 31);
     Expected := TNNetVolume.DotProductInt4Int8(Q.DataPtr, Q.ScalePtr,
-      B.DataPtr, B.BlockSum8Ptr, 32);
+      B.PairedCodesPtr, B.BlockSum8Ptr, 64);
     AssertEquals('partial block ignored', Expected, Got, 0);
   finally
     B.Free; Q.Free; W.Free;
@@ -3951,8 +3963,8 @@ begin
     Q.QuantizeFrom(W);
     Q.DequantizeTo(WFloat);
     for i := 0 to B.Size - 1 do B.FData[i] := ShortInt(((i * 53 + 3) mod 255) - 127);
-    B.EnableBlockSums();
-    B.ComputeBlockSums();
+    B.EnableInt4InputPlanes();
+    B.ComputeInt4InputPlanes();
     for i := 0 to B.Size - 1 do BFloat.FData[i] := B.FData[i] * BScale;
     OutRef.DotProductsTiled(NumAs, NumBs, VectorSize, WFloat, BFloat, 4, 2);
     OutQ.Fill(-1);

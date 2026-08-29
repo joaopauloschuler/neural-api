@@ -14778,7 +14778,7 @@ type
       // Quantizes the input, builds the byte im2col and, for int4 weights, the
       // block sums the kernel's zero-point correction reads. Coded by Claude (AI).
       procedure PrepareQuantInt8Input();
-      // Also enables the block sums on FInputPreparedInt8 (see PrepareQuantInt8Input).
+      // Also enables the int4 input planes on FInputPreparedInt8 (see PrepareQuantInt8Input).
       procedure FinishInt4WeightConversion(); override;
       // Int4 weights with no int8 input path left the FP32 weights released,
       // so the other forwards would read shrunk storage. Coded by Claude (AI).
@@ -105454,7 +105454,7 @@ begin
   // Same pass-stable shape tests as the int8 x int8 verdict, against the Q4_0
   // container. An int4 layer never reaches the device (EnableOpenCL refuses).
   Result := FQuantInt4 and Assigned(FInputPreparedInt8) and
-    FInputPreparedInt8.HasBlockSums and
+    FInputPreparedInt8.HasInt4InputPlanes and
     (not WillOpenCL()) and
     (FInputPreparedInt8.Depth = FVectorSize) and
     (FQuantTableInt4.Depth = FVectorSize);
@@ -105481,15 +105481,15 @@ procedure TNNetConvolution.PrepareQuantInt8Input();
 begin
   QuantizeInputInt8();
   PrepareInputForConvolutionInt8();
-  if FQuantInt4 then FInputPreparedInt8.ComputeBlockSums();
+  if FQuantInt4 then FInputPreparedInt8.ComputeInt4InputPlanes();
 end;
 
 procedure TNNetConvolution.FinishInt4WeightConversion();
 begin
   inherited FinishInt4WeightConversion();
   if FQuantInt4 and Assigned(FInputPreparedInt8) and
-    (not FInputPreparedInt8.HasBlockSums) then
-    FInputPreparedInt8.EnableBlockSums();
+    (not FInputPreparedInt8.HasInt4InputPlanes) then
+    FInputPreparedInt8.EnableInt4InputPlanes();
 end;
 
 procedure TNNetConvolution.ComputeQuantInt8InputCPU();
