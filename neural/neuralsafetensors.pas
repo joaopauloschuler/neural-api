@@ -174,6 +174,15 @@ type
     // CanStreamTensorRows returns true. Coded by Claude (AI).
     procedure LoadTensorRowsFlat(const pName: string;
       FirstRow, RowCount, RowSize: integer; Dest: TNNetVolume); virtual;
+    // TRUE when LoadTensorPackedRowsQ4_0 can hand over the named tensor's raw
+    // Q4_0 blocks. False here: only TNNetGGUFReader has Q4_0 tensors.
+    function CanStreamTensorPackedQ4_0(const pName: string): boolean; virtual;
+    // Serves rows FirstRow..FirstRow+RowCount-1 (RowSize codes each) of a Q4_0
+    // tensor into Dest, resized to (RowCount, 1, RowSize), as packed nibbles
+    // plus the f16 block scales widened exactly as the dequantizer widens them.
+    procedure LoadTensorPackedRowsQ4_0(const pName: string;
+      FirstRow, RowCount, RowSize: integer;
+      Dest: TNNetVolumeQuant4); virtual;
     // Loads the named tensor's RAW on-disk bytes verbatim into Dest (no dtype
     // decoding). Used by the MXFP4 dequant-at-load path (gpt-oss), whose
     // packed-nibble "*_blocks" and E8M0 "*_scales" tensors ship as U8 and must
@@ -1124,6 +1133,21 @@ begin
   ReadElementsInto(Info.Shard,
     FDataStarts[Info.Shard] + Info.DataBegin, Info.DType,
     integer(NumElements), Dest);
+end;
+
+function TNNetSafeTensorsReader.CanStreamTensorPackedQ4_0(
+  const pName: string): boolean;
+begin
+  Result := false;
+end;
+
+procedure TNNetSafeTensorsReader.LoadTensorPackedRowsQ4_0(
+  const pName: string; FirstRow, RowCount, RowSize: integer;
+  Dest: TNNetVolumeQuant4);
+begin
+  raise ESafeTensorsError.CreateFmt(
+    'safetensors: "%s" holds no Q4_0 blocks to serve packed: %s',
+    [pName, FFileName]);
 end;
 
 function TNNetSafeTensorsReader.CanStreamTensorRows(

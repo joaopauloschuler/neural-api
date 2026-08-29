@@ -1159,7 +1159,7 @@ function BuildFromGGUF(const FileName: string;
 // into the interleaved-rotary layout llama.cpp expects (the inverse of the
 // reader's de-interleave), so a write -> BuildLlamaFromGGUF round-trip
 // reproduces logits. pDType selects the matrix encoding (gwF32 lossless,
-// gwF16, gwQ8_0); 1-D norm gains always stay F32.
+// gwF16, gwQ8_0, gwQ4_0); 1-D norm gains always stay F32.
 //
 // SCOPE: the Llama BACKBONE plus its qwen2 and gemma2 siblings - the three
 // families BuildFromGGUF can read back. The architecture is selected from the
@@ -12518,6 +12518,14 @@ function BuildGRUFromSafeTensors(const FileName, Prefix: string;
 // neuralnetwork, next to TNNet.AddGQAAttentionFromSources which reads it, and
 // reaches this unit through the uses clause above.
 
+var
+  // Direct Q4_0 -> int4 route (--int4): LoadLlamaLinearWeights copies an
+  // eligible Q4_0 tensor into the layer's int4 rows; others keep the FP32/int8 route.
+  NeuralImportInt4FromQ4_0: boolean = false;
+  // Layers LoadLlamaLinearWeights direct-loaded that way. It only grows, so a
+  // caller zeroes it before the build and reads it after. Coded by Claude (AI).
+  NeuralImportInt4LayerCount: integer = 0;
+
 implementation
 
 procedure ImportError(const Msg: string);
@@ -14889,11 +14897,12 @@ var
   j, TargetIdx, HalfDim, SrcRow, Base, Row: integer;
   OutDimM1: integer;
   QLayer: TNNetLayerConcatedWeights;
-  DirectInt8, RowStream: boolean;
+  DirectInt8, DirectInt4, RowStream: boolean;
   WRowBase: integer;
   ChunkRows, RowsInChunk, RowCnt, RowsInChunkM1: integer;
   ChunkTargets: TNeuralIntegerArray;
   Fan: TInt8RowChunkFan;
+  PackedChunk: TNNetVolumeQuant4;
 
   // Maps checkpoint row pRow (0-based within this OutDim slice) to its
   // neuron index: the rotate_half -> interleaved rotary reorder (restricted
@@ -15003,11 +15012,28 @@ begin
     (QLayer.QuantInt8VectorSize = InDim) and
     (not IsNF4QuantizedTensor(Reader, WName)) and
     Reader.CanStreamTensorRows(WName);
-  if not DirectInt8 then
+  // Direct Q4_0 -> int4: the checkpoint tensor already holds the exact block
+  // layout TNNetVolumeQuant4 stores, so its rows are copied in verbatim and
+  // no FP32 or int8 row is ever built. It needs THIS call to fill the WHOLE
+  // layer (NeuronBase 0, OutDim = every neuron): a layer filled by several
+  // calls - the fused SwiGLU gate/up halves, the Qwen3.5 per-head q_proj
+  // slices - would end up half int4 and half int8, so it keeps the old route
+  // and TNNet.QuantizeWeightsInt4 requantizes it after the load.
+  DirectInt4 := NeuralImportInt4FromQ4_0 and (pSrcSlab = nil) and
+    (QLayer <> nil) and (not QLayer.WeightsQuantizedInt4) and
+    QLayer.SupportsInt4Weights() and
+    (NeuronBase = 0) and (OutDim = ExpectedNeurons) and
+    ((InDim mod TNNetVolumeQuant4.BlockSize) = 0) and
+    (not IsNF4QuantizedTensor(Reader, WName)) and
+    Reader.CanStreamTensorPackedQ4_0(WName);
+  if DirectInt4 then DirectInt4 := QLayer.BeginInt4QuantImport(InDim);
+  if DirectInt4 then DirectInt8 := false;
+  if not (DirectInt8 or DirectInt4) then
     EnsureWritableImportWeights(Layer);
   W := TNNetVolume.Create;
   B := nil;
   Fan := nil;
+  PackedChunk := nil;
   try
     if BiasName <> '' then
     begin
@@ -15015,13 +15041,50 @@ begin
       Reader.LoadTensorFlat(BiasName, B);
     end;
     OutDimM1 := OutDim - 1;
-    if DirectInt8 then
+    if DirectInt8 or DirectInt4 then
     begin
       // ~4 MB of FP32 rows per read keeps the syscall count low while
       // bounding the scratch far below the full [SrcRows, InDim] tensor.
       ChunkRows := (4 * 1024 * 1024) div (InDim * 4);
       if ChunkRows < 1 then ChunkRows := 1;
       if ChunkRows > OutDim then ChunkRows := OutDim;
+    end;
+    if DirectInt4 then
+    begin
+      PackedChunk := TNNetVolumeQuant4.Create(ChunkRows, 1, InDim);
+      j := 0;
+      while j < OutDim do
+      begin
+        RowsInChunk := ChunkRows;
+        if j + RowsInChunk > OutDim then RowsInChunk := OutDim - j;
+        Reader.LoadTensorPackedRowsQ4_0(WName, SrcRowBase + j, RowsInChunk,
+          InDim, PackedChunk);
+        RowsInChunkM1 := RowsInChunk - 1;
+        for RowCnt := 0 to RowsInChunkM1 do
+        begin
+          Row := j + RowCnt;
+          TargetIdx := MapTargetNeuron(Row);
+          if B <> nil then
+            Layer.FArrNeurons[TargetIdx].BiasWeight :=
+              Scale * B.FData[SrcRowBase + Row]
+          else
+            Layer.FArrNeurons[TargetIdx].BiasWeight := 0; // bias-free Linear
+          // A Q4_0 weight is code * BlockScale, so folding Scale into the
+          // block scales is exact and leaves the codes untouched.
+          if Scale <> 1.0 then
+            TNNetVolume.Mul(PackedChunk.GetScaleRowPtr(RowCnt, 0), Scale,
+              PackedChunk.BlocksPerRow);
+          QLayer.ImportInt4QuantRow(TargetIdx,
+            PackedChunk.GetRawPtr(RowCnt, 0),
+            PackedChunk.GetScaleRowPtr(RowCnt, 0));
+        end;
+        Inc(j, RowsInChunk);
+      end;
+      QLayer.EndInt4QuantImport();
+      Inc(NeuralImportInt4LayerCount);
+    end
+    else if DirectInt8 then
+    begin
       SetLength(ChunkTargets, ChunkRows);
       Fan := TInt8RowChunkFan.Create; // freed by the outer finally
       j := 0;
@@ -15104,6 +15167,7 @@ begin
       end;
     end;
   finally
+    PackedChunk.Free;
     Fan.Free;
     B.Free;
     W.Free;

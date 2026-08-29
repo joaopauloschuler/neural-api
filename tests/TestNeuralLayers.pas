@@ -130,6 +130,8 @@ type
     procedure TestConvolutionInt4RefusesUnblockedVectorSize;
     procedure TestConvolutionInt4Int8ChunkedMatchesSerial;
     procedure TestNetQuantizeWeightsInt4CountsConvertedLayers;
+    procedure TestConvImportInt4QuantRowMatchesQuantizeRow;
+    procedure TestBeginInt4QuantImportRefusesIneligibleLayers;
     procedure TestDeconvolutionNeverChunkEligible;
     // Int8 input arming at net level and on TNNetFullConnect
     procedure TestNetEnableInt8InputCountsQuantizedLayers;
@@ -4631,6 +4633,124 @@ begin
     // No int8 layer to arm, yet the two int4 layers already hold the copy.
     AssertEquals('EnableInt8Input counts the int4 layers too', 2,
       NN.EnableInt8Input());
+  finally
+    NN.Free;
+  end;
+end;
+
+// TNNetVolumeQuant4.QuantizeRow is idempotent under its own rule: the value
+// the largest-magnitude code (-8) dequantizes to reproduces the same block
+// scale, so requantizing a dequantized Q4_0 row returns the SAME codes. The
+// importer relies on it - a checkpoint Q4_0 row copied in verbatim IS the row
+// the quantizing route would have produced. Coded by Claude (AI).
+procedure TTestNeuralLayers.TestConvImportInt4QuantRowMatchesQuantizeRow;
+var
+  NN: TNNet;
+  Conv: TNNetPointwiseConvLinear;
+  Checkpoint, RoundTrip: TNNetVolumeQuant4;
+  DequantizedRow: TNNetVolume;
+  W: TNNetVolume;
+  NeuronCnt, MaxNeuronPos, WeightCnt, MaxWeightPos, BytePos, MaxBytePos: integer;
+  ScalePos, MaxScalePos: integer;
+const
+  VectorSize = 64;
+  NeuronCount = 5;
+begin
+  NN := TNNet.Create();
+  Checkpoint := TNNetVolumeQuant4.Create(NeuronCount, 1, VectorSize);
+  RoundTrip := TNNetVolumeQuant4.Create(NeuronCount, 1, VectorSize);
+  DequantizedRow := TNNetVolume.Create(1, 1, VectorSize);
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, VectorSize));
+    Conv := TNNetPointwiseConvLinear.Create(NeuronCount);
+    NN.AddLayer(Conv);
+    NN.SetTrainable(False);
+    MaxNeuronPos := NeuronCount - 1;
+    MaxWeightPos := VectorSize - 1;
+    // The "checkpoint": Q4_0 rows quantized from varied FP32 weights.
+    for NeuronCnt := 0 to MaxNeuronPos do
+    begin
+      W := Conv.Neurons[NeuronCnt].Weights;
+      for WeightCnt := 0 to MaxWeightPos do
+        W.FData[WeightCnt] :=
+          Sin(0.37 * WeightCnt + 1.9 * NeuronCnt) * (0.5 + 0.25 * NeuronCnt);
+      Checkpoint.QuantizeRow(NeuronCnt, 0, TNeuralFloatArrPtr(@W.FData[0]));
+    end;
+
+    // Requantizing the dequantized row returns the same codes and scales.
+    for NeuronCnt := 0 to MaxNeuronPos do
+    begin
+      Checkpoint.DequantizeRowTo(NeuronCnt, 0,
+        TNeuralFloatArrPtr(@DequantizedRow.FData[0]));
+      RoundTrip.QuantizeRow(NeuronCnt, 0,
+        TNeuralFloatArrPtr(@DequantizedRow.FData[0]));
+    end;
+    MaxBytePos := Checkpoint.PackedSize - 1;
+    for BytePos := 0 to MaxBytePos do
+      AssertEquals('Q4_0 requantize keeps packed byte ' + IntToStr(BytePos),
+        Checkpoint.FData[BytePos], RoundTrip.FData[BytePos]);
+    MaxScalePos := Checkpoint.ScaleData.Size - 1;
+    for ScalePos := 0 to MaxScalePos do
+      AssertTrue('Q4_0 requantize keeps block scale ' + IntToStr(ScalePos),
+        Checkpoint.ScaleData.FData[ScalePos] =
+        RoundTrip.ScaleData.FData[ScalePos]);
+
+    // The import route lands exactly those rows in the layer.
+    AssertTrue('BeginInt4QuantImport accepts a 64-weight pointwise layer',
+      Conv.BeginInt4QuantImport(VectorSize));
+    for NeuronCnt := 0 to MaxNeuronPos do
+      Conv.ImportInt4QuantRow(NeuronCnt,
+        Checkpoint.GetRawPtr(NeuronCnt, 0),
+        Checkpoint.GetScaleRowPtr(NeuronCnt, 0));
+    Conv.EndInt4QuantImport();
+    AssertTrue('The imported layer holds int4 weights',
+      Conv.WeightsQuantizedInt4);
+    AssertTrue('The imported layer holds no int8 weights',
+      not Conv.WeightsQuantizedInt8);
+    AssertTrue('EndInt4QuantImport arms the int8 input',
+      Conv.InputCopyInt8 <> nil);
+    AssertEquals('Imported int4 row count', NeuronCount,
+      Conv.QuantTableInt4.SizeX);
+    AssertEquals('Imported int4 row size', VectorSize,
+      Conv.QuantTableInt4.Depth);
+    for BytePos := 0 to MaxBytePos do
+      AssertEquals('Imported packed byte ' + IntToStr(BytePos),
+        Checkpoint.FData[BytePos], Conv.QuantTableInt4.FData[BytePos]);
+    for ScalePos := 0 to MaxScalePos do
+      AssertTrue('Imported block scale ' + IntToStr(ScalePos),
+        Checkpoint.ScaleData.FData[ScalePos] =
+        Conv.QuantTableInt4.ScaleData.FData[ScalePos]);
+  finally
+    DequantizedRow.Free;
+    RoundTrip.Free;
+    Checkpoint.Free;
+    NN.Free;
+  end;
+end;
+
+// BeginInt4QuantImport is the loader's eligibility test: it refuses a row size
+// that is not a multiple of 32 and a layer class with no int4 forward, so the
+// caller keeps its FP32/int8 route. Coded by Claude (AI).
+procedure TTestNeuralLayers.TestBeginInt4QuantImportRefusesIneligibleLayers;
+var
+  NN: TNNet;
+  Conv: TNNetPointwiseConvLinear;
+  FullConnect: TNNetFullConnectLinear;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(1, 1, 48));
+    Conv := TNNetPointwiseConvLinear.Create(4);
+    NN.AddLayer(Conv);
+    FullConnect := TNNetFullConnectLinear.Create(4);
+    NN.AddLayer(FullConnect);
+    NN.SetTrainable(False);
+    AssertTrue('A 48-weight row is not a multiple of the Q4_0 block size',
+      not Conv.BeginInt4QuantImport(48));
+    AssertTrue('A refused import leaves the layer FP32',
+      not Conv.WeightsQuantizedInt4);
+    AssertTrue('A fully connected layer has no int4 forward',
+      not TNNetLayerConcatedWeights(FullConnect).BeginInt4QuantImport(32));
   finally
     NN.Free;
   end;

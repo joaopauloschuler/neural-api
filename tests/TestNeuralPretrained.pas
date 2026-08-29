@@ -219,6 +219,8 @@ type
     procedure TestGGUFLlamaLogitParity;
     procedure TestGGUFLlamaQ8AndF16ImportDrift;
     procedure TestGGUFWriterRoundTrip;
+    procedure TestGGUFQ4_0PackedRowStreaming;
+    procedure TestLlamaGGUFQ4_0DirectInt4Load;
     procedure TestBuildFromGGUFQwen2RoundTrip;
     procedure TestBuildFromGGUFGemma2RoundTrip;
     procedure TestGGUFGemma2Q8AndF16ImportDrift;
@@ -6544,6 +6546,216 @@ begin
   finally
     NNG.Free;
     NNRef.Free;
+  end;
+end;
+
+// TNNetGGUFReader.LoadTensorPackedRowsQ4_0 hands over the checkpoint Q4_0
+// blocks untouched: dequantizing what it serves through
+// TNNetVolumeQuant4.DequantizeRowTo must reproduce, BIT FOR BIT, what
+// DequantizeQ4_0 produces on the same file through LoadTensorFlat.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestGGUFQ4_0PackedRowStreaming;
+var
+  Writer: TNNetGGUFWriter;
+  Reader: TNNetGGUFReader;
+  Src, Dequantized, RowDequantized: TNNetVolume;
+  Packed4: TNNetVolumeQuant4;
+  GGUFPath: string;
+  RowCnt, WeightCnt, Base: integer;
+const
+  Rows = 6;
+  Cols = 96;
+begin
+  GGUFPath := GetTempDir(false) + 'cai_q4_0_rows_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Src := TNNetVolume.Create(Rows * Cols, 1, 1);
+  Dequantized := TNNetVolume.Create;
+  RowDequantized := TNNetVolume.Create(Cols, 1, 1);
+  Packed4 := TNNetVolumeQuant4.Create;
+  try
+    for RowCnt := 0 to Rows - 1 do
+      for WeightCnt := 0 to Cols - 1 do
+        Src.FData[RowCnt * Cols + WeightCnt] :=
+          Sin(0.21 * WeightCnt + 1.3 * RowCnt) * (0.3 + 0.4 * RowCnt);
+    Writer := TNNetGGUFWriter.Create(GGUFPath);
+    try
+      Writer.AddMetaString('general.architecture', 'llama');
+      Writer.AddTensorFlat('q4.weight', [Rows, Cols], Src, gwQ4_0);
+      Writer.SaveToFile;
+    finally
+      Writer.Free;
+    end;
+
+    Reader := TNNetGGUFReader.Create(GGUFPath);
+    try
+      AssertTrue('the writer emitted a Q4_0 tensor',
+        Reader.TensorGGMLType('q4.weight') = GGML_TYPE_Q4_0);
+      AssertTrue('a Q4_0 tensor streams packed',
+        Reader.CanStreamTensorPackedQ4_0('q4.weight'));
+      // The dequantize-at-load reference.
+      Reader.LoadTensorFlat('q4.weight', Dequantized);
+      AssertEquals('dequantized element count', Rows * Cols,
+        Dequantized.Size);
+      // The whole tensor, then a row range: both must dequantize identically.
+      Reader.LoadTensorPackedRowsQ4_0('q4.weight', 0, Rows, Cols, Packed4);
+      AssertEquals('packed row count', Rows, Packed4.SizeX);
+      AssertEquals('packed row size', Cols, Packed4.Depth);
+      for RowCnt := 0 to Rows - 1 do
+      begin
+        Packed4.DequantizeRowTo(RowCnt, 0,
+          TNeuralFloatArrPtr(@RowDequantized.FData[0]));
+        Base := RowCnt * Cols;
+        for WeightCnt := 0 to Cols - 1 do
+          AssertTrue('packed row ' + IntToStr(RowCnt) + ' element ' +
+            IntToStr(WeightCnt) + ' must equal the dequantized load',
+            RowDequantized.FData[WeightCnt] = Dequantized.FData[Base + WeightCnt]);
+      end;
+      Reader.LoadTensorPackedRowsQ4_0('q4.weight', 2, 3, Cols, Packed4);
+      AssertEquals('ranged packed row count', 3, Packed4.SizeX);
+      for RowCnt := 0 to 2 do
+      begin
+        Packed4.DequantizeRowTo(RowCnt, 0,
+          TNeuralFloatArrPtr(@RowDequantized.FData[0]));
+        Base := (2 + RowCnt) * Cols;
+        for WeightCnt := 0 to Cols - 1 do
+          AssertTrue('ranged packed row ' + IntToStr(RowCnt) + ' element ' +
+            IntToStr(WeightCnt) + ' must equal the dequantized load',
+            RowDequantized.FData[WeightCnt] = Dequantized.FData[Base + WeightCnt]);
+      end;
+    finally
+      Reader.Free;
+    end;
+  finally
+    Packed4.Free;
+    RowDequantized.Free;
+    Dequantized.Free;
+    Src.Free;
+    DeleteFile(GGUFPath);
+  end;
+end;
+
+// End to end: a Q4_0 .gguf loaded with NeuralImportInt4FromQ4_0 set puts the
+// checkpoint blocks straight into the int4 weight rows. Compared against the
+// SAME file loaded the old way (dequantize -> int8 -> requantize to int4),
+// the direct route must be at least as close to the exact dequantized-FP32
+// forward, because it quantizes the weights once instead of twice. A Q8_0
+// copy of the same model direct-loads nothing and still ends up int4.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLlamaGGUFQ4_0DirectInt4Load;
+var
+  NNFP32, NNDirect, NNRequant: TNNet;
+  Config, ConfigG: TLlamaConfig;
+  Reader: TNNetSafeTensorsReader;
+  Tokens: array of string;
+  Q4Path, Q8Path: string;
+  Input, OutFP32, OutDirect, OutRequant: TNNetVolume;
+  i, s2, SeqLen, Vocab: integer;
+  DirectCount, DirectInt4Layers, RequantInt4Layers, Q8DirectCount: integer;
+  DirectDiff, RequantDiff: double;
+
+  // Sum of |A - B| over the whole logit block.
+  function AbsDiffSum(A, B: TNNetVolume): double;
+  var
+    k: integer;
+  begin
+    Result := 0;
+    for k := 0 to A.Size - 1 do Result := Result + Abs(A.FData[k] - B.FData[k]);
+  end;
+
+begin
+  Q4Path := GetTempDir(false) + 'cai_llama_q4_0_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Q8Path := GetTempDir(false) + 'cai_llama_q4_0_ctl_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Config := ReadLlamaConfigFromJSONFile(
+    FixturePath('tiny_llama_q8_config.json'));
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_llama_q8.safetensors'));
+  try
+    SetLength(Tokens, 0);
+    SaveLlamaToGGUFEx(Reader, Config, Tokens, Q4Path, gwQ4_0);
+    SaveLlamaToGGUFEx(Reader, Config, Tokens, Q8Path, gwQ8_0);
+  finally
+    Reader.Free;
+  end;
+
+  NNFP32 := nil; NNDirect := nil; NNRequant := nil;
+  Input := TNNetVolume.Create;
+  OutFP32 := TNNetVolume.Create;
+  OutDirect := TNNetVolume.Create;
+  OutRequant := TNNetVolume.Create;
+  try
+    // (a) the exact dequantized Q4_0 weights, in FP32.
+    NNFP32 := BuildLlamaFromGGUFEx(Q4Path, ConfigG, {pSeqLen=}0,
+      {pTrainable=}false, {pQuantizeInt8=}false);
+    // (b) the direct route.
+    NeuralImportInt4FromQ4_0 := true;
+    NeuralImportInt4LayerCount := 0;
+    try
+      NNDirect := BuildLlamaFromGGUFEx(Q4Path, ConfigG, {pSeqLen=}0,
+        {pTrainable=}false, {pQuantizeInt8=}true);
+    finally
+      NeuralImportInt4FromQ4_0 := false;
+    end;
+    DirectCount := NeuralImportInt4LayerCount;
+    DirectInt4Layers := NNDirect.QuantizeWeightsInt4();
+    // 2 blocks x { q, k, v, o, down } load whole-layer and go direct. The
+    // fused SwiGLU gate/up layer is filled by two calls, and the tied LM head
+    // loads through LoadEmbeddingAndLMHead, so those 3 are requantized.
+    AssertEquals('direct-loaded int4 layers', 10, DirectCount);
+    AssertEquals('int4 layers after the sweep', 13, DirectInt4Layers);
+
+    // (c) the old route on the same file.
+    NNRequant := BuildLlamaFromGGUFEx(Q4Path, ConfigG, {pSeqLen=}0,
+      {pTrainable=}false, {pQuantizeInt8=}true);
+    RequantInt4Layers := NNRequant.QuantizeWeightsInt4();
+    AssertEquals('the old route converts the same layers', DirectInt4Layers,
+      RequantInt4Layers);
+
+    SeqLen := ConfigG.MaxPositions;
+    Vocab := ConfigG.VocabSize;
+    Input.ReSize(SeqLen, 1, 1);
+    DirectDiff := 0;
+    RequantDiff := 0;
+    for s2 := 0 to 2 do
+    begin
+      for i := 0 to SeqLen - 1 do
+        Input.FData[i] := (s2 * 5 + i * 3 + 1) mod Vocab;
+      NNFP32.Compute(Input);   NNFP32.GetOutput(OutFP32);
+      NNDirect.Compute(Input); NNDirect.GetOutput(OutDirect);
+      NNRequant.Compute(Input); NNRequant.GetOutput(OutRequant);
+      DirectDiff := DirectDiff + AbsDiffSum(OutDirect, OutFP32);
+      RequantDiff := RequantDiff + AbsDiffSum(OutRequant, OutFP32);
+    end;
+    // The direct route carries the checkpoint codes; the old route
+    // re-quantizes them through int8, so it can only be further away.
+    AssertTrue('direct sum |diff| ' + FloatToStr(DirectDiff) +
+      ' must not exceed the requantized sum |diff| ' + FloatToStr(RequantDiff),
+      DirectDiff <= RequantDiff);
+    AssertTrue('the int4 forward must still track the FP32 forward: ' +
+      FloatToStr(DirectDiff), DirectDiff < 0.5 * OutFP32.Size * 3);
+
+    // (d) a Q8_0 file of the same model: nothing loads directly, and
+    // TNNet.QuantizeWeightsInt4 still converts every eligible layer.
+    FreeAndNil(NNDirect);
+    NeuralImportInt4FromQ4_0 := true;
+    NeuralImportInt4LayerCount := 0;
+    try
+      NNDirect := BuildLlamaFromGGUFEx(Q8Path, ConfigG, {pSeqLen=}0,
+        {pTrainable=}false, {pQuantizeInt8=}true);
+    finally
+      NeuralImportInt4FromQ4_0 := false;
+    end;
+    Q8DirectCount := NeuralImportInt4LayerCount;
+    AssertEquals('a Q8_0 checkpoint direct-loads no int4 layer', 0,
+      Q8DirectCount);
+    AssertEquals('a Q8_0 checkpoint still requantizes to int4',
+      DirectInt4Layers, NNDirect.QuantizeWeightsInt4());
+  finally
+    OutRequant.Free; OutDirect.Free; OutFP32.Free; Input.Free;
+    NNRequant.Free; NNDirect.Free; NNFP32.Free;
+    DeleteFile(Q8Path);
+    DeleteFile(Q4Path);
   end;
 end;
 

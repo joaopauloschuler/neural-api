@@ -923,6 +923,9 @@ type
       // per neuron; FP32 rows shrunk, FQuantInt8 false, int8 input enabled.
       FQuantInt4: boolean;
       FQuantTableInt4: TNNetVolumeQuant4;
+      // Rows written since BeginInt4QuantImport; EndInt4QuantImport checks it
+      // against FNeurons.Count before it commits the conversion.
+      FQuantInt4ImportedRows: integer;
       // Int8 copy of the forward input (Int8InputSource), nil until
       // EnableInt8Input sizes it: most layers never run an int8 input.
       FInputCopyInt8: TNNetVolumeQuant8;
@@ -938,6 +941,9 @@ type
       // arming does not apply and the caller must run the FP32 path.
       // Coded by Claude (AI).
       function ArmBuildQuantInt8Storage(x, y, d: integer): boolean;
+      // Commits the int4 weight state once FQuantTableInt4 holds every row:
+      // int8 table and FP32 rows dropped, caches shrunk, int8 input armed.
+      procedure FinishInt4WeightConversion(); virtual;
       procedure AfterWeightUpdate(); override;
       procedure BuildBiasOutput(); {$IFDEF Release} inline; {$ENDIF}
     public
@@ -961,6 +967,15 @@ type
       // Q4_0-quantizes the weights (from FP32, or from the int8 table by
       // requantizing) and enables the int8 input; needs SetPrevLayer. Coded by Claude (AI).
       procedure QuantizeWeightsInt4(); virtual;
+      // Opens a Q4_0 row import: sizes FQuantTableInt4 for FNeurons.Count rows
+      // of RowSize; False when this layer or RowSize cannot hold int4 weights.
+      function BeginInt4QuantImport(RowSize: integer): boolean;
+      // Copies one checkpoint Q4_0 row (BlocksPerRow packed blocks of 16 bytes
+      // plus their block scales) into neuron NeuronIdx of the open import.
+      procedure ImportInt4QuantRow(NeuronIdx: integer;
+        PackedSrc: TNeuralByteArrPtr; BlockScales: TNeuralFloatArrPtr);
+      // Commits the import; refuses unless every neuron received a row.
+      procedure EndInt4QuantImport();
       // The FP32 volume QuantizeInputInt8 reads. The previous layer's output
       // here; a convolution reads its padded input copy. Coded by Claude (AI).
       function Int8InputSource(): TNNetVolume; virtual;
@@ -14764,7 +14779,7 @@ type
       // block sums the kernel's zero-point correction reads. Coded by Claude (AI).
       procedure PrepareQuantInt8Input();
       // Also enables the block sums on FInputPreparedInt8 (see PrepareQuantInt8Input).
-      procedure QuantizeWeightsInt4(); override;
+      procedure FinishInt4WeightConversion(); override;
       // Int4 weights with no int8 input path left the FP32 weights released,
       // so the other forwards would read shrunk storage. Coded by Claude (AI).
       procedure RaiseWhenInt4WithoutInt8Input();
@@ -78240,8 +78255,6 @@ begin
         TNeuralFloatArrPtr(@DequantizedRow.FData[0]));
     end;
     DequantizedRow.Free;
-    FQuantTable.ReSize(0, 0, 0);
-    FQuantInt8 := false;
   end
   else
   begin
@@ -78264,20 +78277,104 @@ begin
       FQuantTableInt4.QuantizeRow(NeuronCnt, 0,
         TNeuralFloatArrPtr(@W.FData[0]));
     end;
-    // Free the FP32 storage only after every row quantized, as
-    // QuantizeWeightsInt8 does: (1,1,1) genuinely shrinks the heap.
-    for NeuronCnt := 0 to MaxQuantNeuronPos do
-    begin
-      FNeurons[NeuronCnt].Weights.ReSize(1, 1, 1);
-      FNeurons[NeuronCnt].Weights.Fill(0);
-    end;
-    FConcatedWeights.ReSize(1, 1, 1);
-    FConcatedWInter.ReSize(1, 1, 1);
   end;
+  FinishInt4WeightConversion();
+end;
+
+procedure TNNetLayerConcatedWeights.FinishInt4WeightConversion();
+var
+  MaxShrinkNeuronPos, NeuronCnt: integer;
+begin
+  if FQuantInt8 then
+  begin
+    FQuantTable.ReSize(0, 0, 0);
+    FQuantInt8 := false;
+  end;
+  // Free the FP32 storage only after every row is in the int4 table, as
+  // QuantizeWeightsInt8 does: (1,1,1) genuinely shrinks the heap.
+  MaxShrinkNeuronPos := FNeurons.Count - 1;
+  for NeuronCnt := 0 to MaxShrinkNeuronPos do
+  begin
+    FNeurons[NeuronCnt].Weights.ReSize(1, 1, 1);
+    FNeurons[NeuronCnt].Weights.Fill(0);
+  end;
+  FConcatedWeights.ReSize(1, 1, 1);
+  FConcatedWInter.ReSize(1, 1, 1);
   FQuantInt4 := true;
   // The int4 weights have no FP32-input kernel, so the int8 input copy is part
   // of the conversion, not an option.
   EnableInt8Input();
+end;
+
+function TNNetLayerConcatedWeights.BeginInt4QuantImport(
+  RowSize: integer): boolean;
+begin
+  Result := false;
+  FQuantInt4ImportedRows := 0;
+  if FQuantInt4 then exit;          // already int4: nothing to import into
+  if FLinkedNeurons then exit;      // shared neurons: owner layer decides
+  if FNeurons.Count = 0 then exit;
+  if not SupportsInt4Weights() then exit;
+  if RowSize <= 1 then exit;
+  if (RowSize mod TNNetVolumeQuant4.BlockSize) <> 0 then exit;
+  {$IFDEF OpenCL}
+  // Same refusal as QuantizeWeightsInt4: there is no int4 OpenCL kernel.
+  if FHasOpenCL then exit;
+  {$ENDIF}
+  // The armed int8 container already recorded the weight geometry; otherwise
+  // the still-FP32 neuron rows carry it.
+  if not (FQuantInt8 and (FQuantVectorSize = RowSize)) then
+  begin
+    if FNeurons[0].Weights.Size <> RowSize then exit;
+    FQuantWSizeX := FNeurons[0].Weights.SizeX;
+    FQuantWSizeY := FNeurons[0].Weights.SizeY;
+    FQuantWSizeD := FNeurons[0].Weights.Depth;
+  end;
+  FQuantVectorSize := RowSize;
+  FQuantTableInt4.ReSize(FNeurons.Count, 1, RowSize);
+  // A row the caller never imports then dequantizes to zero instead of to
+  // whatever the previous allocation held.
+  FQuantTableInt4.Fill();
+  Result := true;
+end;
+
+procedure TNNetLayerConcatedWeights.ImportInt4QuantRow(NeuronIdx: integer;
+  PackedSrc: TNeuralByteArrPtr; BlockScales: TNeuralFloatArrPtr);
+begin
+  if FQuantInt4 or (FQuantTableInt4.Size = 0) then
+  begin
+    FErrorProc(ClassName + '.ImportInt4QuantRow: no open int4 import - call ' +
+      'BeginInt4QuantImport first.');
+    exit;
+  end;
+  if (NeuronIdx < 0) or (NeuronIdx >= FNeurons.Count) then
+  begin
+    FErrorProc(ClassName + '.ImportInt4QuantRow: neuron index ' +
+      IntToStr(NeuronIdx) + ' is outside 0..' +
+      IntToStr(FNeurons.Count - 1) + '.');
+    exit;
+  end;
+  FQuantTableInt4.ImportPackedRow(NeuronIdx, 0, PackedSrc, BlockScales);
+  Inc(FQuantInt4ImportedRows);
+end;
+
+procedure TNNetLayerConcatedWeights.EndInt4QuantImport();
+begin
+  if FQuantInt4 or (FQuantTableInt4.Size = 0) then
+  begin
+    FErrorProc(ClassName + '.EndInt4QuantImport: there is no open int4 ' +
+      'import.');
+    exit;
+  end;
+  if FQuantInt4ImportedRows <> FNeurons.Count then
+  begin
+    FErrorProc(ClassName + '.EndInt4QuantImport: ' +
+      IntToStr(FQuantInt4ImportedRows) + ' of ' +
+      IntToStr(FNeurons.Count) + ' neuron rows were imported.');
+    FQuantTableInt4.ReSize(0, 0, 0);
+    exit;
+  end;
+  FinishInt4WeightConversion();
 end;
 
 procedure TNNetLayerConcatedWeights.AllocInputCopyInt8(pPadding: integer);
@@ -78478,6 +78575,7 @@ begin
   FAfterWeightUpdateHasBeenCalled := false;
   FQuantInt8 := false;
   FQuantInt4 := false;
+  FQuantInt4ImportedRows := 0;
   FQuantVectorSize := 0;
 end;
 
@@ -105386,9 +105484,9 @@ begin
   if FQuantInt4 then FInputPreparedInt8.ComputeBlockSums();
 end;
 
-procedure TNNetConvolution.QuantizeWeightsInt4();
+procedure TNNetConvolution.FinishInt4WeightConversion();
 begin
-  inherited QuantizeWeightsInt4();
+  inherited FinishInt4WeightConversion();
   if FQuantInt4 and Assigned(FInputPreparedInt8) and
     (not FInputPreparedInt8.HasBlockSums) then
     FInputPreparedInt8.EnableBlockSums();

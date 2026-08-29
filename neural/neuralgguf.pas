@@ -179,6 +179,11 @@ type
     procedure ReadMetaValue(Stream: TFileStream; var Meta: TGGUFMetaValue);
     function FindMeta(const pKey: string): integer;
     function DeinterleaveHeadDimFor(const pName: string): integer;
+    // Resolves and range-checks a row request shared by the row-streaming
+    // loaders, and returns the stored bytes per row. Coded by Claude (AI).
+    function ValidateRowStreamRange(const pName: string;
+      FirstRow, RowCount, RowSize: integer;
+      out Idx, GGMLType, HeadDim: integer): Int64;
     // Reads ElemCount elements of ggml dtype GGMLType, starting at absolute
     // byte position FilePos, into Dest.FData[DestOfs ...]. F32 lands
     // straight in the destination; every other dtype decodes through a
@@ -237,6 +242,13 @@ type
     function CanStreamTensorRows(const pName: string): boolean; override;
     procedure LoadTensorRowsFlat(const pName: string;
       FirstRow, RowCount, RowSize: integer; Dest: TNNetVolume); override;
+    // Q4_0 tensors, served as raw blocks. The de-interleave permutation of a
+    // registered 2-D q/k projection moves whole ROWS, which leaves every
+    // 32-code block intact, so those stream packed too. Coded by Claude (AI).
+    function CanStreamTensorPackedQ4_0(const pName: string): boolean; override;
+    procedure LoadTensorPackedRowsQ4_0(const pName: string;
+      FirstRow, RowCount, RowSize: integer;
+      Dest: TNNetVolumeQuant4); override;
 
     property Version: integer read FVersion;
     property Alignment: integer read FAlignment;
@@ -246,9 +258,11 @@ type
   // The ggml dtype a writer encodes a 2-D matrix tensor as. F32 is the
   // lossless default; F16 halves the file (round-to-nearest-even via
   // EncodeF16); Q8_0 quantizes 32-element blocks to an f16 scale + 32 int8
-  // (~4x smaller, the dominant weight-only quant). 1-D norm gains always
-  // stay F32 (the llama.cpp convention), whatever the matrix dtype.
-  TGGUFWriteDType = (gwF32, gwF16, gwQ8_0);
+  // (~4x smaller, the dominant weight-only quant); Q4_0 quantizes the same
+  // 32-element blocks to an f16 scale + 32 nibbles (~8x smaller). 1-D norm
+  // gains always stay F32 (the llama.cpp convention), whatever the matrix
+  // dtype.
+  TGGUFWriteDType = (gwF32, gwF16, gwQ8_0, gwQ4_0);
 
   // One tensor queued in a TNNetGGUFWriter: its ggml name, the row-major
   // shape (the writer reverses it to the ggml contiguous-first order on
@@ -309,7 +323,8 @@ type
     // flat row-major order (prod(pShape) must equal Src.Size). pDType picks
     // the ggml encoding: gwF32/gwF16/gwQ8_0. Q8_0 requires the contiguous
     // (last) dimension to be a multiple of 32. Data is copied, so Src may be
-    // freed/reused immediately.
+    // freed/reused immediately. gwQ4_0, like gwQ8_0, needs the contiguous
+    // dimension to be a multiple of 32.
     procedure AddTensorFlat(const pName: string; const pShape: array of Int64;
       Src: TNNetVolume; pDType: TGGUFWriteDType = gwF32);
     // Queues a Q8_0 tensor built DIRECTLY from int8 weight-only storage
@@ -1713,14 +1728,11 @@ begin
     Result := Length(FTensors[Idx].Shape) = 2;
 end;
 
-procedure TNNetGGUFReader.LoadTensorRowsFlat(const pName: string;
-  FirstRow, RowCount, RowSize: integer; Dest: TNNetVolume);
+function TNNetGGUFReader.ValidateRowStreamRange(const pName: string;
+  FirstRow, RowCount, RowSize: integer;
+  out Idx, GGMLType, HeadDim: integer): Int64;
 var
-  Idx, GGMLType, HeadDim: integer;
-  NumElements, ElemCount, InnerDim, RowBytes: Int64;
-  dr, r, SrcRow, RowCountM1, TensorBase, DstOfs: Int64;
-  TotalRows, HeadIdx, LoadedHead, HeadFirstRow, RowsInHead: Int64;
-  RawBytes: TBytes;
+  NumElements, InnerDim: Int64;
 begin
   Idx := FindTensor(pName);
   if Idx < 0 then
@@ -1739,11 +1751,6 @@ begin
       'gguf: rows %d..%d of RowSize=%d exceed the %d elements of "%s": %s',
       [FirstRow, FirstRow + RowCount - 1, RowSize, NumElements, pName,
        FFileName]);
-  ElemCount := Int64(RowCount) * RowSize;
-  if ElemCount > High(integer) then
-    raise EGGUFError.CreateFmt(
-      'gguf: row range of "%s" is too large (%d elements): %s',
-      [pName, ElemCount, FFileName]);
   InnerDim := FTensors[Idx].Shape[High(FTensors[Idx].Shape)]; // ggml ne[0]
   HeadDim := DeinterleaveHeadDimFor(pName);
   // Quantized rows are only block-aligned at TRUE ne[0] boundaries, and
@@ -1755,19 +1762,126 @@ begin
      (((GGMLType <> GGML_TYPE_F32) and (GGMLType <> GGML_TYPE_F16)) or
       (HeadDim > 0)) then
     raise EGGUFError.CreateFmt(
-      'gguf: LoadTensorRowsFlat on "%s" (%s%s) needs RowSize = the ' +
+      'gguf: row streaming on "%s" (%s%s) needs RowSize = the ' +
       'contiguous dimension %d, got %d: %s',
       [pName, GGMLTypeName(GGMLType), BoolToStr(HeadDim > 0,
        ', de-interleaved', ''), InnerDim, RowSize, FFileName]);
   if (HeadDim > 0) and (Length(FTensors[Idx].Shape) <> 2) then
     raise EGGUFError.CreateFmt(
-      'gguf: LoadTensorRowsFlat cannot serve the de-interleaved 1-D ' +
+      'gguf: row streaming cannot serve the de-interleaved 1-D ' +
       'tensor "%s" (%s) - use LoadTensorFlat: %s',
       [pName, ShapeAsString(pName), FFileName]);
   // With RowSize a whole number of blocks (= ne[0] for quantized dtypes;
-  // any RowSize for the scalar F32/F16), row r spans exactly RowBytes
-  // starting at DataBegin + r*RowBytes.
-  RowBytes := GGMLByteSize(GGMLType, RowSize);
+  // any RowSize for the scalar F32/F16), row r spans exactly this many bytes
+  // starting at DataBegin + r*Result.
+  Result := GGMLByteSize(GGMLType, RowSize);
+end;
+
+function TNNetGGUFReader.CanStreamTensorPackedQ4_0(
+  const pName: string): boolean;
+var
+  Idx: integer;
+begin
+  Idx := FindTensor(pName);
+  if Idx < 0 then
+    raise EGGUFError.CreateFmt(
+      'gguf: tensor "%s" not found in %s', [pName, FFileName]);
+  Result := FGGMLTypes[Idx] = GGML_TYPE_Q4_0;
+  // Same restriction as CanStreamTensorRows: the 1-D bias form permutes
+  // single elements along ne[0], which is not a row view.
+  if Result and (DeinterleaveHeadDimFor(pName) > 0) then
+    Result := Length(FTensors[Idx].Shape) = 2;
+end;
+
+procedure TNNetGGUFReader.LoadTensorPackedRowsQ4_0(const pName: string;
+  FirstRow, RowCount, RowSize: integer; Dest: TNNetVolumeQuant4);
+var
+  Idx, GGMLType, HeadDim, BlockIdx, MaxBlockPos, RowCountM1: integer;
+  RowBytes, TensorBase, TotalRows: Int64;
+  dr, r, SrcRow, HeadIdx, LoadedHead, BufFirstRow, RowsInHead: Int64;
+  RawBytes: TBytes;
+  SrcBlock: PByte;
+  DestPacked: TNeuralByteArrPtr;
+  DestScales: TNeuralFloatArrPtr;
+begin
+  RowBytes := ValidateRowStreamRange(pName, FirstRow, RowCount, RowSize,
+    Idx, GGMLType, HeadDim);
+  if GGMLType <> GGML_TYPE_Q4_0 then
+    raise EGGUFError.CreateFmt(
+      'gguf: LoadTensorPackedRowsQ4_0 on "%s" needs a Q4_0 tensor, got %s: %s',
+      [pName, GGMLTypeName(GGMLType), FFileName]);
+  Dest.ReSize(RowCount, 1, RowSize);
+  MaxBlockPos := Dest.BlocksPerRow - 1;
+  TensorBase := FDataStarts[0] + FTensors[Idx].DataBegin;
+  TotalRows := ElementCount(pName) div RowSize;
+  RowCountM1 := RowCount - 1;
+  BufFirstRow := FirstRow;
+  if HeadDim = 0 then
+  begin
+    // Contiguous stored rows: one sequential ranged read of the whole
+    // request (the caller chunks it).
+    SetLength(RawBytes, Int64(RowCount) * RowBytes);
+    FStreams[0].Position := TensorBase + Int64(FirstRow) * RowBytes;
+    FStreams[0].ReadBuffer(RawBytes[0], Int64(RowCount) * RowBytes);
+  end
+  else
+    // De-interleaved q/k projection: the permutation never leaves the
+    // HeadDim-row head, so one read per head serves every row inside it.
+    SetLength(RawBytes, Int64(HeadDim) * RowBytes);
+  LoadedHead := -1;
+  for dr := 0 to RowCountM1 do
+  begin
+    r := Int64(FirstRow) + dr;
+    SrcRow := r;
+    if HeadDim > 0 then
+    begin
+      HeadIdx := r div HeadDim;
+      if HeadIdx <> LoadedHead then
+      begin
+        BufFirstRow := HeadIdx * HeadDim;
+        RowsInHead := HeadDim;
+        if BufFirstRow + RowsInHead > TotalRows then
+          RowsInHead := TotalRows - BufFirstRow;
+        FStreams[0].Position := TensorBase + BufFirstRow * RowBytes;
+        FStreams[0].ReadBuffer(RawBytes[0], RowsInHead * RowBytes);
+        LoadedHead := HeadIdx;
+      end;
+      SrcRow := GGUFDeinterleavedSrcRow(r, HeadDim);
+    end;
+    SrcBlock := PByte(@RawBytes[(SrcRow - BufFirstRow) * RowBytes]);
+    DestPacked := Dest.GetRawPtr(integer(dr), 0);
+    DestScales := Dest.GetScaleRowPtr(integer(dr), 0);
+    // Block layout (18 bytes): f16 d, then the 16 packed bytes the int4
+    // container stores verbatim. DecodeF16 is the widening DequantizeQ4_0
+    // applies, so the scales are bit-identical to a dequantized load.
+    for BlockIdx := 0 to MaxBlockPos do
+    begin
+      DestScales^[BlockIdx] := DecodeF16(PWord(SrcBlock)^);
+      Move((SrcBlock + 2)^,
+        DestPacked^[BlockIdx * TNNetVolumeQuant4.PackedBlockBytes],
+        TNNetVolumeQuant4.PackedBlockBytes);
+      Inc(SrcBlock, GGUF_Q4_0_BLOCK_BYTES);
+    end;
+  end;
+end;
+
+procedure TNNetGGUFReader.LoadTensorRowsFlat(const pName: string;
+  FirstRow, RowCount, RowSize: integer; Dest: TNNetVolume);
+var
+  Idx, GGMLType, HeadDim: integer;
+  NumElements, ElemCount, RowBytes: Int64;
+  dr, r, SrcRow, RowCountM1, TensorBase, DstOfs: Int64;
+  TotalRows, HeadIdx, LoadedHead, HeadFirstRow, RowsInHead: Int64;
+  RawBytes: TBytes;
+begin
+  RowBytes := ValidateRowStreamRange(pName, FirstRow, RowCount, RowSize,
+    Idx, GGMLType, HeadDim);
+  NumElements := ElementCount(pName);
+  ElemCount := Int64(RowCount) * RowSize;
+  if ElemCount > High(integer) then
+    raise EGGUFError.CreateFmt(
+      'gguf: row range of "%s" is too large (%d elements): %s',
+      [pName, ElemCount, FFileName]);
   Dest.ReSize(integer(ElemCount), 1, 1);
   RowCountM1 := RowCount - 1;
   if HeadDim = 0 then
@@ -2038,8 +2152,9 @@ var
   ScalePtr: PWord;
   AbsMax, V, Scale, InvScale, Q: single;
   Pending: TGGUFPendingTensor;
-  pShapeHi: integer;
-  NumBlocksM1, Q8ElemsM1: Int64;
+  pShapeHi, Q4RowBlocksM1: integer;
+  NumBlocksM1, Q8ElemsM1, NumRows, NumRowsM1: Int64;
+  Q4Row: TNNetVolumeQuant4;
 begin
   if FSaved then
     raise EGGUFError.Create('gguf writer: AddTensorFlat after SaveToFile.');
@@ -2132,6 +2247,46 @@ begin
         end;
         Inc(ElemBase, GGUF_Q8_0_BLOCK_ELEMS);
         Inc(ByteBase, GGUF_Q8_0_BLOCK_BYTES);
+      end;
+    end;
+    gwQ4_0:
+    begin
+      ContigDim := integer(pShape[High(pShape)]);
+      if (ContigDim mod GGUF_QK_LEGACY) <> 0 then
+        raise EGGUFError.CreateFmt(
+          'gguf writer: tensor "%s" is Q4_0 but its contiguous dimension ' +
+          '%d is not a multiple of the block size %d.',
+          [pName, ContigDim, GGUF_QK_LEGACY]);
+      Pending.GGMLType := GGML_TYPE_Q4_0;
+      NumBlocks := NumElements div GGUF_QK_LEGACY;
+      NumBlocksM1 := NumBlocks - 1;
+      SetLength(Pending.Data, NumBlocks * GGUF_Q4_0_BLOCK_BYTES);
+      // The Q4_0 rule and the packed nibble order live in
+      // TNNetVolumeQuant4.QuantizeRow (scale = max/-8, low nibbles hold
+      // elements 0..15), which is the layout ggml stores after the f16 d.
+      Q4Row := TNNetVolumeQuant4.Create(1, 1, ContigDim);
+      try
+        ElemBase := 0;
+        ByteBase := 0;
+        Q4RowBlocksM1 := Q4Row.BlocksPerRow - 1;
+        NumRows := NumElements div ContigDim;
+        NumRowsM1 := NumRows - 1;
+        for b := 0 to NumRowsM1 do
+        begin
+          Q4Row.QuantizeRow(0, 0, TNeuralFloatArrPtr(@Src.FData[ElemBase]));
+          for i := 0 to Q4RowBlocksM1 do
+          begin
+            ScalePtr := PWord(@Pending.Data[ByteBase]);
+            ScalePtr^ := EncodeF16(Q4Row.ScaleData.FData[i]);
+            Move(Q4Row.FData[i * TNNetVolumeQuant4.PackedBlockBytes],
+              Pending.Data[ByteBase + 2],
+              TNNetVolumeQuant4.PackedBlockBytes);
+            Inc(ByteBase, GGUF_Q4_0_BLOCK_BYTES);
+          end;
+          Inc(ElemBase, ContigDim);
+        end;
+      finally
+        Q4Row.Free;
       end;
     end;
   end;

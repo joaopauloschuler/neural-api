@@ -1026,6 +1026,7 @@ var
                                 // checkpoint + caches, GPU weight upload)
   Cnt, LastIdx: integer;
   Int4LayerCount: integer;      // layers holding int4 weights after --int4
+  Int4DirectLayerCount: integer; // of those, loaded straight from Q4_0 blocks
 begin
   Result := false;
   ErrorMsg := '';
@@ -1145,9 +1146,10 @@ begin
     cwmInt8: Notice('[int8 weights (default) - less RAM, faster on CPU and GPU;' +
       ' on --gpu the codes stay resident on the device; --fp32 opts out]');
     cwmFP32: Notice('[--fp32: full-precision weights - more RAM, slower than int8]');
-    cwmInt4: Notice('[--int4: the checkpoint streams into int8 rows, then' +
-      ' TNNet.QuantizeWeightsInt4 requantizes the convolution/projection layers' +
-      ' to Q4_0 int4; CPU path, output quality below int8]');
+    cwmInt4: Notice('[--int4: Q4_0 tensors of a .gguf checkpoint load' +
+      ' straight into int4 weight rows; every other tensor streams into int8' +
+      ' rows and TNNet.QuantizeWeightsInt4 requantizes it to Q4_0 int4 after' +
+      ' the load; CPU path, output quality below int8]');
   end;
   if Opt.LowMemory then
     Notice('[low-memory forward (default) - concatenated weight cache dropped,' +
@@ -1161,6 +1163,11 @@ begin
   // The global gates the importer's per-block fused-vs-per-head decision, so
   // it must be set BEFORE BuildFromPretrained. Restored after the build so a
   // second load in the same process is unaffected.
+  // The direct Q4_0 -> int4 weight route reads a global too, for the same
+  // reason: it must reach LoadLlamaLinearWeights without touching the
+  // signature of every importer between here and it. Restored after the build.
+  NeuralImportInt4FromQ4_0 := Opt.WeightMode = cwmInt4;
+  NeuralImportInt4LayerCount := 0;
   NeuralAllowFusedAttention := not Opt.NoFusedAttn;
   if Opt.NoFusedAttn then
     Notice('[--no-fused-attn: per-head attention wiring (SplitChannels/SDPA/' +
@@ -1174,6 +1181,8 @@ begin
   NN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}1,
     {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32);
   NeuralAllowFusedAttention := true; // restore the global default post-build
+  NeuralImportInt4FromQ4_0 := false;
+  Int4DirectLayerCount := NeuralImportInt4LayerCount;
   // Low-memory forward path, set independently of trainability. The importer
   // built inference-only with low memory ON (SetTrainable's pLowMemory default);
   // honor --max-fast-memory by re-sweeping the layers, then flush each weight
@@ -1189,9 +1198,14 @@ begin
   // refuses a layer that already has OpenCL enabled.
   if Opt.WeightMode = cwmInt4 then
   begin
+    // Counts the layers the loader already direct-loaded too: they exit
+    // QuantizeWeightsInt4 immediately and it counts them as int4.
     Int4LayerCount := NN.QuantizeWeightsInt4();
     Notice('[--int4: Q4_0 int4 weights on ' + IntToStr(Int4LayerCount) +
-      ' layers (int8 -> int4 requantized at load); the other weight layers' +
+      ' layers (' + IntToStr(Int4DirectLayerCount) +
+      ' loaded directly from the checkpoint Q4_0 blocks, ' +
+      IntToStr(Int4LayerCount - Int4DirectLayerCount) +
+      ' requantized from int8); the other weight layers' +
       ' stay int8; int8 input copy enabled on the int4 layers]');
   end;
 
