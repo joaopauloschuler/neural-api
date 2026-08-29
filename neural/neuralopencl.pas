@@ -315,6 +315,16 @@ type
       FSplitKReduceKernel: cl_kernel;
       FPartialBuffer: cl_mem;
       FCapPartial: csize_t;
+      /// Q4_0 WEIGHT MODE (cai_dot_product_int4_splitk). FCodesBuffer holds the
+      /// interleaved packed nibbles (half the int8 bytes), FBlockScalesBuffer
+      /// one float per (row, block of 32), and FScalesBuffer a row of 1.0 so
+      /// the int8 reduce pass needs no twin. Armed by PrepareForComputeInt4,
+      /// which is mutually exclusive with PrepareForComputeInt8; the two-pass
+      /// path is the only int4 path, so KSplits may be 1. Coded by Claude (AI).
+      FInt4Ready: boolean;
+      FBlockScalesBuffer: cl_mem;
+      FCapBlockScales: csize_t;
+      FSplitKInt4Kernel: cl_kernel;
       /// FP16 ACTIVATION MODE (cai_dot_product_int8_h and its split-K twin).
       /// The A operand is unchanged - int8 codes and FP32 scales; only B, the
       /// column matrix every one of the FNumAs output rows re-reads, narrows to
@@ -349,7 +359,7 @@ type
       FBoundSplitKKernel, FBoundSplitKReduceKernel: cl_kernel;
       FBoundSplits, FBoundNumAs, FBoundNumBs, FBoundSize: longint;
       FBoundPartialBuffer, FBoundCodesBuffer: cl_mem;
-      FBoundResultBuffer, FBoundScalesBuffer: cl_mem;
+      FBoundResultBuffer, FBoundScalesBuffer, FBoundBlockScalesBuffer: cl_mem;
 
       /// How many slabs to cut the reduction axis into for the current shape:
       /// 1 means the launch already fills the device, so ComputeInt8 keeps the
@@ -373,6 +383,15 @@ type
       /// Coded by Claude (AI).
       function PrepareInt8BOperand(VBs: TNNetVolume; NewVBs: boolean;
         pExternalVBs: cl_mem; var err: integer): cl_mem;
+      /// Uploads VBias into the resident grow-only bias buffer when needed and
+      /// returns the UseBias kernel argument (0 for a nil VBias). Coded by Claude (AI).
+      function PrepareBiasOperand(VBias: TNNetVolume; NewVBias: boolean;
+        var err: integer): longint;
+      /// The shared body of ComputeInt8 and ComputeInt4: B operand, bias,
+      /// split-K or single-pass launch against the resident codes. Coded by Claude (AI).
+      procedure ComputeResidentCodes(VBs: TNNetVolume; pActFN: longint;
+        NewVBs: boolean; VBias: TNNetVolume; NewVBias: boolean;
+        pExternalVBs: cl_mem);
 
 
       function Kernel(): cl_kernel; {$IFDEF Release} inline; {$ENDIF}
@@ -426,6 +445,18 @@ type
       procedure ComputeInt8(VBs: TNNetVolume; pActFN: longint;
         NewVBs: boolean = true; VBias: TNNetVolume = nil;
         NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
+      /// Arms the Q4_0 weight mode: pPacked is NumAs*pSize/2 bytes in the
+      /// layout packed[a + p*NumAs] (p = k/2, low nibble = code k, high = code
+      /// k+1, biased +8); pBlockScales is NumAs*pSize/32 floats in the layout
+      /// scale[a + blk*NumAs]. pSize must be a multiple of 32. Blocking
+      /// uploads, as PrepareForComputeInt8. Coded by Claude (AI).
+      function PrepareForComputeInt4(pPacked, pBlockScales: Pointer;
+        NumAs, pSize: longint; VBs: TNNetVolume): integer;
+      /// Int4 twin of ComputeInt8: same B operand, bias, activation and result
+      /// contract, against the codes PrepareForComputeInt4 armed. Coded by Claude (AI).
+      procedure ComputeInt4(VBs: TNNetVolume; pActFN: longint;
+        NewVBs: boolean = true; VBias: TNNetVolume = nil;
+        NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
 
       /// The underlying device kernel shared by this instance. Exposed so a layer
@@ -436,6 +467,9 @@ type
       /// UnprepareForCompute). Layers gate their int8 device route on this,
       /// falling back to the fused CPU path when unarmed.
       property Int8Ready: boolean read FInt8Ready;
+      /// True after a successful PrepareForComputeInt4 (cleared by
+      /// UnprepareForCompute); the int4 layers gate their device route on it.
+      property Int4Ready: boolean read FInt4Ready;
       /// The buffer Compute/ComputeInt8 leave their result in and
       /// FinishAndLoadResult reads back from. Exposed so a layer can bind it
       /// (device residency) instead of downloading. Still owned here: released
@@ -593,6 +627,7 @@ begin
   if Assigned(FScalesBuffer)  then clReleaseMemObject(FScalesBuffer);
   if Assigned(FPartialBuffer) then clReleaseMemObject(FPartialBuffer);
   if Assigned(FInputBufferBsFP16) then clReleaseMemObject(FInputBufferBsFP16);
+  if Assigned(FBlockScalesBuffer) then clReleaseMemObject(FBlockScalesBuffer);
   // Owned here, unlike FInt8Kernel and FFP16Kernel: these came from CreateKernel
   // against the net's program, so this instance releases them.
   if Assigned(FSplitKKernel)       then clReleaseKernel(FSplitKKernel);
@@ -601,6 +636,11 @@ begin
   if Assigned(FSplitKReduceFP16Kernel) then
     clReleaseKernel(FSplitKReduceFP16Kernel);
   if Assigned(FCastFP16Kernel)     then clReleaseKernel(FCastFP16Kernel);
+  if Assigned(FSplitKInt4Kernel)   then clReleaseKernel(FSplitKInt4Kernel);
+  FSplitKInt4Kernel := nil;
+  FBlockScalesBuffer := nil;
+  FCapBlockScales := 0;
+  FInt4Ready := false;
   FPartialBuffer := nil;
   FInputBufferBsFP16 := nil;
   FSplitKKernel := nil;
@@ -988,6 +1028,71 @@ begin
   PrepareForComputeInt8 := err;
 end;
 
+function TDotProductSharedKernel.PrepareForComputeInt4(pPacked,
+  pBlockScales: Pointer; NumAs, pSize: longint; VBs: TNNetVolume): integer;
+var
+  NeededPacked, NeededBlockScales, NeededScales, NeededResult: csize_t;
+  UnitScales: TNNetVolume;
+  err: integer;
+begin
+  UnprepareForCompute();
+  if not Assigned(FInt8Kernel) then
+  begin
+    ErrorProc('Error: PrepareForComputeInt4 - this TDotProductSharedKernel was ' +
+      'built without a cai_dot_product_int8 handle.');
+    PrepareForComputeInt4 := CL_INVALID_KERNEL;
+    exit;
+  end;
+  if (pSize mod 32) <> 0 then
+  begin
+    ErrorProc('Error: PrepareForComputeInt4 - row size ' + IntToStr(pSize) +
+      ' is not a multiple of the Q4_0 block size 32.');
+    PrepareForComputeInt4 := CL_INVALID_VALUE;
+    exit;
+  end;
+  FNumAs := NumAs;
+  FNumBs := VBs.Size div pSize;
+  FThreadCount := FNumAs * FNumBs;
+  FSize := pSize;
+  FGroupSizeA := 0;
+  FGroupSizeB := 0;
+  // cai_dot_product_int4_splitk reads FP32 activations only.
+  FFP16Activations := false;
+
+  NeededPacked := csize_t(FNumAs) * (FSize div 2);
+  NeededBlockScales := csize_t(FNumAs) * (FSize div 32) * csNeuralFloatSize;
+  NeededScales := FNumAs * csNeuralFloatSize;
+  NeededResult := FNumAs * FNumBs * csNeuralFloatSize;
+
+  FCodesBuffer := FDotProductKernel.CreateInputBuffer(NeededPacked);
+  FBlockScalesBuffer := FDotProductKernel.CreateInputBuffer(NeededBlockScales);
+  FScalesBuffer := FDotProductKernel.CreateInputBuffer(NeededScales);
+  FResultBuffer := FDotProductKernel.CreateOutputBuffer(NeededResult);
+  FInputBufferBs := FDotProductKernel.CreateInputBuffer(VBs);
+  FCapCodes := NeededPacked;
+  FCapBlockScales := NeededBlockScales;
+  FCapScales := NeededScales;
+  FCapResult := NeededResult;
+  FCapBs := VBs.GetMemSize();
+
+  // The block scales are folded into the partials by pass 1, so the per-row
+  // scale the shared reduce pass applies is 1.
+  UnitScales := TNNetVolume.Create(FNumAs, 1, 1, 1);
+  err := FDotProductKernel.WriteBuffer(FCodesBuffer, NeededPacked, pPacked, CL_TRUE);
+  err := err or FDotProductKernel.WriteBuffer(FBlockScalesBuffer,
+    NeededBlockScales, pBlockScales, CL_TRUE);
+  err := err or FDotProductKernel.WriteBuffer(FScalesBuffer, NeededScales,
+    UnitScales.DataPtr, CL_TRUE);
+  UnitScales.Free;
+  if (err <> CL_SUCCESS) then
+    ErrorProc('Error: PrepareForComputeInt4 - failed uploading codes/scales: '
+      + IntToStr(err));
+
+  FPreviousComputeTime := 0;
+  FInt4Ready := (err = CL_SUCCESS);
+  PrepareForComputeInt4 := err;
+end;
+
 const
   /// Work-items per compute unit the int8 launch aims for before it stops
   /// splitting. Enough to cover memory latency without cutting rows so thin
@@ -1025,7 +1130,19 @@ begin
   if not Assigned(FInt8Kernel) then exit;
   // Both passes have an FP16 twin: pass 1 stores its raw slab sums as half, so
   // pass 2 must read them as half and FPartialBuffer is sized in half bytes.
-  if FFP16Activations then
+  if FInt4Ready then
+  begin
+    // Pass 1 reads the packed nibbles; pass 2 is the shared FP32 reduce.
+    if not Assigned(FSplitKInt4Kernel) then
+      FSplitKInt4Kernel := FInt8Kernel.CreateKernel('cai_dot_product_int4_splitk');
+    if not Assigned(FSplitKInt4Kernel) then exit;
+    if not Assigned(FSplitKReduceKernel) then
+      FSplitKReduceKernel :=
+        FInt8Kernel.CreateKernel('cai_dot_product_int8_splitk_reduce');
+    if not Assigned(FSplitKReduceKernel) then exit;
+    PartialElementSize := SizeOf(TNeuralFloat);
+  end
+  else if FFP16Activations then
   begin
     if not Assigned(FSplitKFP16Kernel) then
       FSplitKFP16Kernel :=
@@ -1131,6 +1248,7 @@ begin
     (FNumAs = FBoundNumAs) and (FNumBs = FBoundNumBs) and (FSize = FBoundSize) and
     (FPartialBuffer = FBoundPartialBuffer) and (FCodesBuffer = FBoundCodesBuffer) and
     (FResultBuffer = FBoundResultBuffer) and (FScalesBuffer = FBoundScalesBuffer)
+    and (FBlockScalesBuffer = FBoundBlockScalesBuffer)
   then exit;
 
   FSplitKArgsBound := false;
@@ -1140,6 +1258,8 @@ begin
   Result := Result or clSetKernelArg(pKernel, 3, csLongintSize, @pSplits);
   Result := Result or clSetKernelArg(pKernel, 4, csCLMemSize, @FCodesBuffer);
   Result := Result or clSetKernelArg(pKernel, 6, csCLMemSize, @FPartialBuffer);
+  if pKernel = FSplitKInt4Kernel then
+    Result := Result or clSetKernelArg(pKernel, 7, csCLMemSize, @FBlockScalesBuffer);
 
   Result := Result or clSetKernelArg(pReduceKernel, 0, csLongintSize, @FNumAs);
   Result := Result or clSetKernelArg(pReduceKernel, 1, csLongintSize, @FNumBs);
@@ -1159,19 +1279,13 @@ begin
   FBoundCodesBuffer := FCodesBuffer;
   FBoundResultBuffer := FResultBuffer;
   FBoundScalesBuffer := FScalesBuffer;
+  FBoundBlockScalesBuffer := FBlockScalesBuffer;
   FSplitKArgsBound := true;
 end;
 
 procedure TDotProductSharedKernel.ComputeInt8(VBs: TNNetVolume;
   pActFN: longint; NewVBs: boolean = true; VBias: TNNetVolume = nil;
   NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
-var
-  err: integer;
-  UseBias: longint;
-  NeededBias: csize_t;
-  K, KReduce: cl_kernel;
-  BufferBs: cl_mem;
-  Splits: longint;
 begin
   if not FInt8Ready then
   begin
@@ -1179,44 +1293,83 @@ begin
       'PrepareForComputeInt8.');
     exit;
   end;
+  ComputeResidentCodes(VBs, pActFN, NewVBs, VBias, NewVBias, pExternalVBs);
+end;
+
+procedure TDotProductSharedKernel.ComputeInt4(VBs: TNNetVolume;
+  pActFN: longint; NewVBs: boolean = true; VBias: TNNetVolume = nil;
+  NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
+begin
+  if not FInt4Ready then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeInt4 without ' +
+      'PrepareForComputeInt4.');
+    exit;
+  end;
+  ComputeResidentCodes(VBs, pActFN, NewVBs, VBias, NewVBias, pExternalVBs);
+end;
+
+function TDotProductSharedKernel.PrepareBiasOperand(VBias: TNNetVolume;
+  NewVBias: boolean; var err: integer): longint;
+var
+  NeededBias: csize_t;
+begin
+  // Fused bias: same contract as Compute (a bias-less caller passes UseBias=0
+  // and a NULL buffer the kernel never reads). Resident grow-only buffer,
+  // re-uploaded only when NewVBias or just (re)allocated.
+  Result := 0;
+  if VBias = nil then exit;
+  NeededBias := VBias.GetMemSize();
+  if (FBiasBuffer = nil) or (NeededBias > FCapBias) then
+  begin
+    if Assigned(FBiasBuffer) then clReleaseMemObject(FBiasBuffer);
+    FBiasBuffer := FDotProductKernel.CreateInputBuffer(NeededBias);
+    FCapBias := NeededBias;
+    NewVBias := true; // fresh/grown buffer: force upload regardless of caller
+  end;
+  if NewVBias then err := err or FDotProductKernel.WriteBuffer(FBiasBuffer, VBias);
+  Result := 1;
+end;
+
+procedure TDotProductSharedKernel.ComputeResidentCodes(VBs: TNNetVolume;
+  pActFN: longint; NewVBs: boolean; VBias: TNNetVolume; NewVBias: boolean;
+  pExternalVBs: cl_mem);
+var
+  err: integer;
+  UseBias: longint;
+  K, KReduce: cl_kernel;
+  BufferBs: cl_mem;
+  Splits: longint;
+begin
   if (VBs.Size <> FSize * FNumBs) then
   begin
-    ErrorProc('Error: TDotProductSharedKernel.ComputeInt8 - VB size: ' +
+    ErrorProc('Error: TDotProductSharedKernel.ComputeResidentCodes - VB size: ' +
       IntToStr(VBs.Size) + ' FSize: ' + IntToStr(FSize) +
       ' NumBs:' + IntToStr(FNumBs));
     exit;
   end;
   FActFun := pActFN;
-
-  // Fused bias: same contract as Compute (a bias-less caller passes UseBias=0
-  // and a NULL buffer the kernel never reads). Resident grow-only buffer,
-  // re-uploaded only when NewVBias or just (re)allocated.
   err := CL_SUCCESS;
-  if VBias <> nil then
-  begin
-    NeededBias := VBias.GetMemSize();
-    if (FBiasBuffer = nil) or (NeededBias > FCapBias) then
-    begin
-      if Assigned(FBiasBuffer) then clReleaseMemObject(FBiasBuffer);
-      FBiasBuffer := FDotProductKernel.CreateInputBuffer(NeededBias);
-      FCapBias := NeededBias;
-      NewVBias := true; // fresh/grown buffer: force upload regardless of caller
-    end;
-    if NewVBias then err := err or FDotProductKernel.WriteBuffer(FBiasBuffer, VBias);
-    UseBias := 1;
-  end
-  else
-    UseBias := 0;
+  UseBias := PrepareBiasOperand(VBias, NewVBias, err);
 
   // Binds (FP32) or narrows into (FP16) the B operand the GEMM below reads.
   BufferBs := PrepareInt8BOperand(VBs, NewVBs, pExternalVBs, err);
 
   Splits := Int8SplitCount();
-  if (Splits > 1) and PrepareSplitK(Splits) then
+  // Int4 has no single-pass kernel: its pass 1 runs with KSplits = 1 instead.
+  if FInt4Ready and (not PrepareSplitK(Splits)) then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.ComputeResidentCodes - ' +
+      'the device rejected cai_dot_product_int4_splitk.');
+    exit;
+  end;
+  if FInt4Ready or ((Splits > 1) and PrepareSplitK(Splits)) then
   begin
     // Pass 1: raw slab sums. Pass 2: reduce, scale, bias, activation. Both on
     // the same in-order queue, so pass 2 is ordered after pass 1 with no wait.
-    if FFP16Activations then K := FSplitKFP16Kernel else K := FSplitKKernel;
+    if FInt4Ready then K := FSplitKInt4Kernel
+    else if FFP16Activations then K := FSplitKFP16Kernel
+    else K := FSplitKKernel;
     if FFP16Activations
       then KReduce := FSplitKReduceFP16Kernel
       else KReduce := FSplitKReduceKernel;
@@ -1235,7 +1388,7 @@ begin
     end
     else
     begin
-      ErrorProc('Error: TDotProductSharedKernel.ComputeInt8 - ' +
+      ErrorProc('Error: TDotProductSharedKernel.ComputeResidentCodes - ' +
         'failed setting split-K parameters: ' + IntToStr(err));
     end;
     exit;
@@ -1260,7 +1413,7 @@ begin
   end
   else
   begin
-    ErrorProc('Error: TDotProductSharedKernel.ComputeInt8 - ' +
+    ErrorProc('Error: TDotProductSharedKernel.ComputeResidentCodes - ' +
       'failed setting parameters: ' + IntToStr(err));
   end;
 end;

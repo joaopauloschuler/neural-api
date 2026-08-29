@@ -1149,7 +1149,8 @@ begin
     cwmInt4: Notice('[--int4: Q4_0 tensors of a .gguf checkpoint load' +
       ' straight into int4 weight rows; every other tensor streams into int8' +
       ' rows and TNNet.QuantizeWeightsInt4 requantizes it to Q4_0 int4 after' +
-      ' the load; CPU path, output quality below int8]');
+      ' the load; on --gpu the packed codes stay resident on the device;' +
+      ' output quality below int8]');
   end;
   if Opt.LowMemory then
     Notice('[low-memory forward (default) - concatenated weight cache dropped,' +
@@ -1246,8 +1247,8 @@ begin
             'each layer waits for its sources, so --profile charges GPU time to ' +
             'layers instead of the queue drain; slower than shared]');
         if Opt.WeightMode = cwmInt4 then
-          Notice('[--int4 with --gpu: the int4 layers run on the CPU (there is' +
-            ' no int4 OpenCL kernel); the remaining layers still use OpenCL]');
+          Notice('[--int4 with --gpu: cai_dot_product_int4_splitk reads the' +
+            ' packed codes at half the int8 traffic; activations stay FP32]');
         if Opt.ExperimentalFP16 then
           Notice('[--experimental-fp16: under construction -' +
             ' half-precision activations in the int8 matmuls; weights stay' +

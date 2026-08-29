@@ -578,6 +578,78 @@ __kernel void cai_dot_product_int8_splitk_h
   }
 } // end of kernel
 
+// SPLIT-K PASS 1, Q4_0 WEIGHT twin. Same grid, same slab-major
+// FPartialBuffer and the same reduce (cai_dot_product_int8_splitk_reduce) as
+// cai_dot_product_int8_splitk, but the A operand is Q4_0: two 4-bit codes per
+// byte in the interleaved layout FPackedAs[a + p*FNumAs] (p = k/2, low nibble
+// = code k, high nibble = code k+1, both biased by +8), and one float scale
+// per block of 32 codes, FBlockScales[a + blk*FNumAs]. Adjacent work-items
+// still read adjacent bytes, at half the int8 traffic. The block scale is
+// applied HERE, per block, so the partial is already dequantized and the
+// reduce's per-row FScales must be 1. A slab is a whole number of blocks
+// (FSize is a multiple of 32 - the TNNetVolumeQuant4 invariant), and a slab
+// past the last block writes 0. Coded by Claude (AI).
+__kernel void cai_dot_product_int4_splitk
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int KSplits,
+  __global const uchar* FPackedAs,
+  __global const float* FInputBufferBs,
+  __global float* FPartialBuffer,
+  __global const float* FBlockScales
+)
+{
+  const int a_id = get_global_id(0);
+  const int b_id = get_global_id(1);
+  const int s    = get_global_id(2);
+
+  if ( (a_id < FNumAs) && (b_id < FNumBs) && (s < KSplits) )
+  {
+    const int BlockCount = FSize >> 5;
+    const int BlocksPerSlab = (BlockCount + KSplits - 1) / KSplits;
+    const int blkStart = s * BlocksPerSlab;
+    int blkEnd = blkStart + BlocksPerSlab;
+    if (blkEnd > BlockCount) blkEnd = BlockCount;
+
+    float PartialResult = 0;
+    // Pair index p = k/2 = 16*blk, so the packed position of a block's first
+    // byte is a_id + 16*blk*FNumAs; the 16 bytes of a block are FNumAs apart.
+    int PackedPos = a_id + (blkStart << 4) * FNumAs;
+    __global const float* B = FInputBufferBs + b_id * FSize + (blkStart << 5);
+
+    for (int blk = blkStart; blk < blkEnd; blk++)
+    {
+      float BlockSum = 0;
+      for (int pair = 0; pair < 16; pair += 4)
+      {
+        const int Packed0 = FPackedAs[PackedPos];
+        const int Packed1 = FPackedAs[PackedPos + FNumAs];
+        const int Packed2 = FPackedAs[PackedPos + 2 * FNumAs];
+        const int Packed3 = FPackedAs[PackedPos + 3 * FNumAs];
+        const float8 Bv = vload8(0, B);
+        BlockSum =
+          mad(convert_float((Packed0 & 15) - 8), Bv.s0,
+          mad(convert_float((Packed0 >> 4) - 8), Bv.s1,
+          mad(convert_float((Packed1 & 15) - 8), Bv.s2,
+          mad(convert_float((Packed1 >> 4) - 8), Bv.s3,
+          mad(convert_float((Packed2 & 15) - 8), Bv.s4,
+          mad(convert_float((Packed2 >> 4) - 8), Bv.s5,
+          mad(convert_float((Packed3 & 15) - 8), Bv.s6,
+          mad(convert_float((Packed3 >> 4) - 8), Bv.s7,
+          BlockSum))))))));
+        PackedPos += 4 * FNumAs;
+        B += 8;
+      }
+      PartialResult = mad(BlockSum, FBlockScales[a_id + blk * FNumAs],
+        PartialResult);
+    }
+
+    FPartialBuffer[s * FNumAs * FNumBs + b_id * FNumAs + a_id] = PartialResult;
+  }
+} // end of kernel
+
 // SPLIT-K PASS 2. Sums the KSplits raw partials of one (a_id, b_id), then
 // applies the deferred per-row scale, the fused bias and the fused activation
 // in cai_dot_product_int8's order, and writes the final result. One work-item

@@ -1049,6 +1049,9 @@ type
       // FDotCL's resident int8 mode (cai_dot_product_int8) against VBs.
       // Coded by Claude (AI).
       procedure PrepareInt8DotCL(VBs: TNNetVolume);
+      // Repacks FQuantTableInt4 into the device layout and arms FDotCL's
+      // resident int4 mode (cai_dot_product_int4_splitk) against VBs.
+      procedure PrepareInt4DotCL(VBs: TNNetVolume);
       // True when this layer runs its int8 forward with the FP16 B operand.
       property FP16Active: boolean read FFP16Active;
       {$ENDIF}
@@ -14742,7 +14745,7 @@ type
       // cai_dot_product_int8 (armed in EnableOpenCL); shares the fused
       // bias/activation verdict and the device-im2col path with
       // ComputeOpenCL. Coded by Claude (AI).
-      procedure ComputeOpenCLInt8(pPrevOutputBuffer: cl_mem = nil;
+      procedure ComputeOpenCLQuantized(pPrevOutputBuffer: cl_mem = nil;
         pIm2ColSrcBuffer: cl_mem = nil);
     public
       procedure DisableOpenCL(); override;
@@ -78229,8 +78232,8 @@ begin
   {$IFDEF OpenCL}
   if FHasOpenCL then
   begin
-    FErrorProc(ClassName + '.QuantizeWeightsInt4: there is no int4 OpenCL ' +
-      'kernel; quantize before TNNet.EnableOpenCL.');
+    FErrorProc(ClassName + '.QuantizeWeightsInt4: EnableOpenCL armed the ' +
+      'device against the int8 table; quantize before TNNet.EnableOpenCL.');
     exit;
   end;
   {$ENDIF}
@@ -78318,7 +78321,7 @@ begin
   if RowSize <= 1 then exit;
   if (RowSize mod TNNetVolumeQuant4.BlockSize) <> 0 then exit;
   {$IFDEF OpenCL}
-  // Same refusal as QuantizeWeightsInt4: there is no int4 OpenCL kernel.
+  // Same refusal as QuantizeWeightsInt4: the device is armed at EnableOpenCL.
   if FHasOpenCL then exit;
   {$ENDIF}
   // The armed int8 container already recorded the weight geometry; otherwise
@@ -78646,6 +78649,8 @@ begin
   if not Assigned(FDotCL) then exit;
   if FQuantInt8 then
     PrepareInt8DotCL(FInputPrepared)
+  else if FQuantInt4 then
+    PrepareInt4DotCL(FInputPrepared)
   else
     FDotCL.PrepareForCompute(FConcatedWInter, FInputPrepared, FVectorSize);
   // Borrow the cai_im2col handle so ComputeOpenCL can build the column matrix
@@ -78687,10 +78692,6 @@ end;
 procedure TNNetLayerConcatedWeights.EnableOpenCL(
   DotProductKernel: TNeuralKernel);
 begin
-  // No int4 OpenCL kernel exists and the device int8 kernel reads FQuantTable,
-  // which QuantizeWeightsInt4 released. Leaving FHasOpenCL false keeps every
-  // WillOpenCL() reader (and this layer's FDotCL) on the CPU path.
-  if FQuantInt4 then exit;
   inherited EnableOpenCL(DotProductKernel);
   (*
   // good for debugging
@@ -78723,10 +78724,11 @@ begin
         FFP16Kernel);
       FDotCL.HideMessages();
     end;
-    if FQuantInt8 then
+    if FQuantInt8 or FQuantInt4 then
     begin
-      // int8-quantized: there are no FP32 weights to concat/interleave - the
-      // descendant arms the resident device codes/scales via PrepareInt8DotCL.
+      // Quantized: there are no FP32 weights to concat/interleave - the
+      // descendant arms the resident device codes/scales via PrepareInt8DotCL
+      // or PrepareInt4DotCL.
       // FShouldConcatWeights is still set because it gates BuildBiasOutput
       // (the fused device bias-add reads FBiasOutput); the concat itself
       // stays skipped by AfterWeightUpdate's FQuantInt8 guard. The weight
@@ -78785,6 +78787,60 @@ begin
   end;
   FDotCL.PrepareForComputeInt8(@Inter[0], FQuantTable.ScalePtr, NumAs,
     FQuantVectorSize, VBs, FFP16Active);
+end;
+
+// Device layout: packed[a + p*NumAs] holds codes k=2p (low nibble) and k+1
+// (high nibble) of row a, scales[a + blk*NumAs] the row's block scale; the
+// Q4_0 row keeps element j and j+16 of a block in one byte, so the pairs are
+// rebuilt here. One-time: the table is immutable after quantization.
+// Coded by Claude (AI).
+procedure TNNetLayerConcatedWeights.PrepareInt4DotCL(VBs: TNNetVolume);
+var
+  PackedCodes: TNeuralByteDynArr;
+  BlockScales: TNeuralFloatDynArr;
+  RowPtr: TNeuralByteArrPtr;
+  ScaleRowPtr: TNeuralFloatArrPtr;
+  NumAs, NumAsM1, ACnt, BlockCnt, MaxBlockPos, ByteCnt: integer;
+  PairPos, ScalePos, RowOfs, LowCode, HighCode: integer;
+  // Biased code of block element Elem (0..31) at RowPtr^[RowOfs..RowOfs+15].
+  function NibbleOfBlock(Elem: integer): integer;
+  begin
+    if Elem < TNNetVolumeQuant4.PackedBlockBytes
+      then Result := RowPtr^[RowOfs + Elem] and 15
+      else Result := RowPtr^[RowOfs + Elem - TNNetVolumeQuant4.PackedBlockBytes] shr 4;
+  end;
+begin
+  NumAs := FNeurons.Count;
+  if (not Assigned(FDotCL)) or (NumAs = 0) or (FQuantVectorSize = 0) or
+    (VBs.Size = 0) or (FQuantTableInt4.Depth <> FQuantVectorSize) then exit;
+  MaxBlockPos := FQuantTableInt4.BlocksPerRow - 1;
+  SetLength(PackedCodes, NumAs * FQuantTableInt4.PackedRowBytes);
+  SetLength(BlockScales, NumAs * FQuantTableInt4.BlocksPerRow);
+  NumAsM1 := NumAs - 1;
+  for ACnt := 0 to NumAsM1 do
+  begin
+    RowPtr := FQuantTableInt4.GetRawPtr(ACnt, 0);
+    ScaleRowPtr := FQuantTableInt4.GetScaleRowPtr(ACnt, 0);
+    PairPos := ACnt;                     // ACnt + p*NumAs carried by +NumAs
+    ScalePos := ACnt;
+    RowOfs := 0;
+    for BlockCnt := 0 to MaxBlockPos do
+    begin
+      BlockScales[ScalePos] := ScaleRowPtr^[BlockCnt];
+      Inc(ScalePos, NumAs);
+      // Device pair ByteCnt covers block elements 2*ByteCnt and 2*ByteCnt+1.
+      for ByteCnt := 0 to TNNetVolumeQuant4.PackedBlockBytes - 1 do
+      begin
+        LowCode := NibbleOfBlock(2 * ByteCnt);
+        HighCode := NibbleOfBlock(2 * ByteCnt + 1);
+        PackedCodes[PairPos] := LowCode or (HighCode shl 4);
+        Inc(PairPos, NumAs);
+      end;
+      Inc(RowOfs, TNNetVolumeQuant4.PackedBlockBytes);
+    end;
+  end;
+  FDotCL.PrepareForComputeInt4(@PackedCodes[0], @BlockScales[0], NumAs,
+    FQuantVectorSize, VBs);
 end;
 {$ENDIF}
 
@@ -105262,7 +105318,8 @@ begin
   // asks this routine in turn, and the size verdict is what a resident source
   // is allowed to override.
   Result := Assigned(FDotCL) and FHasOpenCL
-    and ((not FQuantInt8) or FDotCL.Int8Ready);
+    and ((not FQuantInt8) or FDotCL.Int8Ready)
+    and ((not FQuantInt4) or FDotCL.Int4Ready);
 end;
 
 // The spatial twin. Here the B operand is the column matrix, which cai_im2col
@@ -105290,12 +105347,12 @@ begin
     Im2ColSrcBuffer := FPrevLayer.OpenCLOutputBuffer()
   else
     FPrevLayer.ForceOutputOnRAM();
-  // Int8-quantized: the FP32 concatenated weights this body uploads do not
-  // exist; the resident-code twin does the whole forward. WillOpenCL only
-  // routes here when the int8 buffers are armed (FDotCL.Int8Ready).
-  if FQuantInt8 then
+  // Quantized: the FP32 concatenated weights this body uploads do not exist;
+  // the resident-code twin does the whole forward. WillOpenCL only routes
+  // here when the code buffers are armed (FDotCL.Int8Ready / Int4Ready).
+  if FQuantInt8 or FQuantInt4 then
   begin
-    ComputeOpenCLInt8(PrevOutputBuffer, Im2ColSrcBuffer);
+    ComputeOpenCLQuantized(PrevOutputBuffer, Im2ColSrcBuffer);
     Exit;
   end;
   // Winograd F(2x2,3x3) device forward: when the layer is Winograd-eligible the
@@ -105367,8 +105424,8 @@ begin
   end;
 end;
 
-// Int8-quantized device forward. The A operand is the RESIDENT interleaved
-// code buffer + per-row scales armed by EnableOpenCL (via PrepareInt8DotCL);
+// Quantized device forward. The A operand is the RESIDENT interleaved code
+// buffer + scales armed by EnableOpenCL (PrepareInt8DotCL or PrepareInt4DotCL);
 // weights never re-upload (quantized layers are inference-only). Everything
 // else mirrors ComputeOpenCL: same fused bias/activation verdict, same
 // device-im2col option (the B side is unchanged - cai_im2col gathers into the
@@ -105377,7 +105434,7 @@ end;
 // The two buffers are the caller's binding verdicts: a resident source to use
 // as the B operand (pointwise) or as the cai_im2col gather source (spatial).
 // Both nil means ComputeOpenCL already moved the previous output to RAM.
-procedure TNNetConvolution.ComputeOpenCLInt8(pPrevOutputBuffer: cl_mem;
+procedure TNNetConvolution.ComputeOpenCLQuantized(pPrevOutputBuffer: cl_mem;
   pIm2ColSrcBuffer: cl_mem);
 var
   ActOpcode: integer;
@@ -105397,8 +105454,12 @@ begin
       {RowSpan}FInputCopy.Depth * FFeatureSizeX, {InSizeX}FInputCopy.SizeX,
       {InDepth}FInputCopy.Depth, {Stride}FStride, {NewSrc}true, pIm2ColSrcBuffer);
 
-  FDotCL.ComputeInt8(FInputPrepared, ActOpcode, {NewVBs}(not OpenCLIm2Col),
-    BiasVol, {NewVBias}false, pPrevOutputBuffer);
+  if FQuantInt4 then
+    FDotCL.ComputeInt4(FInputPrepared, ActOpcode, {NewVBs}(not OpenCLIm2Col),
+      BiasVol, {NewVBias}false, pPrevOutputBuffer)
+  else
+    FDotCL.ComputeInt8(FInputPrepared, ActOpcode, {NewVBs}(not OpenCLIm2Col),
+      BiasVol, {NewVBias}false, pPrevOutputBuffer);
 
   if ActivationFunctionInOpenCL then
   begin
@@ -105452,7 +105513,7 @@ end;
 function TNNetConvolution.ShouldComputeInt4Int8CPU(): boolean;
 begin
   // Same pass-stable shape tests as the int8 x int8 verdict, against the Q4_0
-  // container. An int4 layer never reaches the device (EnableOpenCL refuses).
+  // container. The device forward has its own int4 kernel and never routes here.
   Result := FQuantInt4 and Assigned(FInputPreparedInt8) and
     FInputPreparedInt8.HasInt4InputPlanes and
     (not WillOpenCL()) and
@@ -136540,10 +136601,11 @@ function TNNetConvolution.WillOpenCL(): boolean;
 begin
   Result := Assigned(FDotCL) and FHasOpenCL
     and (FShouldOpenCL or FForceOpenCL or ShouldBindPrevOutputOnOpenCL())
-    // int8-quantized: the device route needs the resident code/scale buffers,
+    // quantized: the device route needs the resident code/scale buffers,
     // armed only when EnableOpenCL ran AFTER quantization. Unarmed quantized
-    // layers stay on the fused int8 CPU path.
-    and ((not FQuantInt8) or FDotCL.Int8Ready);
+    // layers stay on the fused CPU path.
+    and ((not FQuantInt8) or FDotCL.Int8Ready)
+    and ((not FQuantInt4) or FDotCL.Int4Ready);
 end;
 {$ENDIF}
 

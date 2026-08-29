@@ -503,6 +503,10 @@ type
     // cai_dot_product_int8_splitk path the sweep above never reaches.
     // Coded by Claude (AI).
     procedure TestInt8SplitKOpenCLParity;
+    // Q4_0 int4 weights on the device (cai_dot_product_int4_splitk + the shared
+    // reduce) vs an FP32 forward over the same dequantized weights, on the
+    // pointwise, spatial (device im2col) and one-slab shapes. Coded by Claude (AI).
+    procedure TestInt4OpenCLParity;
     // OpenCL single-launch fused-mixture forward parity (vs the fused CPU
     // forward) for TNNetMoEExpertBankDown: the whole gate-weighted expert
     // mixture of one MoE block in one kernel, reading the gate|up bank's slot
@@ -68065,6 +68069,135 @@ begin
   RunFC('1500x512 swish bias', 1500, 512, @Swish, @SwishDerivative, 0);
   RunFC('1500x512 hardswish bias', 1500, 512, @HardSwish,
     @HardSwishDerivative, 0);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// --- Q4_0 int4 weights on the device ----------------------------------------
+//
+// The device int4 forward reads FP32 activations against the Q4_0 codes, so its
+// oracle is an FP32 forward over the SAME dequantized weights (built from a
+// twin net with the same seed, each row passed through TNNetVolumeQuant4): the
+// two differ only in float accumulation order. The CPU int4 forward quantizes
+// its input to int8 as well, so it is held to a looser bound.
+
+procedure TTestNeuralNumerical.TestInt4OpenCLParity;
+{$IFDEF OpenCL}
+  procedure RunConv(const aName: string; pInputSize, pInputDepth, pNeurons,
+    pFeatureSize, pPadding: integer; UseReLU: boolean);
+  var
+    NN, NNRef: TNNet;
+    Input, OutRef, OutCPU: TNNetVolume;
+    Conv, ConvRef: TNNetConvolutionBase;
+    Quant4: TNNetVolumeQuant4;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i: integer;
+    Diff, MaxDiffGPU, MaxDiffCPU, MaxAbs, Tol: TNeuralFloat;
+    procedure BuildNet(var pNN: TNNet; var pConv: TNNetConvolutionBase);
+    var
+      NeuronCnt: integer;
+    begin
+      RandSeed := 20260829;
+      pNN := TNNet.Create();
+      pNN.AddLayer(TNNetInput.Create(pInputSize, pInputSize, pInputDepth, 1));
+      if UseReLU
+        then pConv := TNNetConvolutionReLU.Create(pNeurons, pFeatureSize, pPadding, 1)
+        else pConv := TNNetConvolutionLinear.Create(pNeurons, pFeatureSize, pPadding, 1);
+      pNN.AddLayer(pConv);
+      for NeuronCnt := 0 to pConv.Neurons.Count - 1 do
+        pConv.Neurons[NeuronCnt].BiasWeight := 0.25 * Sin(NeuronCnt * 0.3);
+      pNN.UpdateWeights();
+    end;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    BuildNet(NN, Conv);
+    BuildNet(NNRef, ConvRef);
+    Input := TNNetVolume.Create(pInputSize, pInputSize, pInputDepth);
+    OutRef := TNNetVolume.Create();
+    OutCPU := TNNetVolume.Create();
+    Quant4 := TNNetVolumeQuant4.Create(1, 1, ConvRef.Neurons[0].Weights.Size);
+    try
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.7 * Sin(i * 0.013) - 0.2;
+      // The reference keeps FP32 weights that went through the same Q4_0
+      // quantizer QuantizeWeightsInt4 applies to the twin.
+      for i := 0 to ConvRef.Neurons.Count - 1 do
+      begin
+        Quant4.QuantizeRow(0, 0, ConvRef.Neurons[i].Weights.DataPtr);
+        Quant4.DequantizeRowTo(0, 0, ConvRef.Neurons[i].Weights.DataPtr);
+      end;
+      NNRef.UpdateWeights();
+      ConvRef.SetTrainable(False, False);
+      NNRef.Compute(Input);
+      OutRef.Copy(NNRef.GetLastLayer.Output);
+
+      Conv.SetTrainable(False, False);
+      NN.QuantizeWeightsInt4();
+      AssertTrue('Int4OpenCL ' + aName + ' twin is int4', Conv.WeightsQuantizedInt4);
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        NN.Compute(Input); // resident codes/scales/bias + partial buffer reuse
+        AssertEquals('Int4OpenCL ' + aName + ' output size match', OutRef.Size,
+          NN.GetLastLayer.Output.Size);
+        MaxDiffGPU := 0;
+        MaxDiffCPU := 0;
+        MaxAbs := 0;
+        for i := 0 to OutRef.Size - 1 do
+        begin
+          Diff := Abs(OutRef.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+          if Diff > MaxDiffGPU then MaxDiffGPU := Diff;
+          Diff := Abs(OutRef.Raw[i] - OutCPU.Raw[i]);
+          if Diff > MaxDiffCPU then MaxDiffCPU := Diff;
+          if Abs(OutRef.Raw[i]) > MaxAbs then MaxAbs := Abs(OutRef.Raw[i]);
+        end;
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  Int4OpenCL ', aName, ' parity: gpu max|diff|=', MaxDiffGPU:0:9,
+        ' cpu-int8-input max|diff|=', MaxDiffCPU:0:6, ' max|ref|=', MaxAbs:0:6,
+        ' gpu forwards=', Conv.ForwardGPUCnt);
+      AssertTrue('Int4OpenCL ' + aName + ' ran on the device: ForwardGPUCnt = ' +
+        IntToStr(Conv.ForwardGPUCnt) + ' must be 2', Conv.ForwardGPUCnt = 2);
+      if MaxAbs < 1 then Tol := 1e-4 else Tol := 1e-4 * MaxAbs;
+      AssertTrue('Int4OpenCL ' + aName + ' device vs dequantized FP32: max |diff| = ' +
+        FloatToStr(MaxDiffGPU) + ' must be < ' + FloatToStr(Tol), MaxDiffGPU < Tol);
+      // The CPU int4 route also quantizes the input (int8, one scale per tensor).
+      if MaxAbs < 1 then Tol := 2e-2 else Tol := 2e-2 * MaxAbs;
+      AssertTrue('Int4OpenCL ' + aName + ' CPU int4 x int8 vs dequantized FP32: ' +
+        'max |diff| = ' + FloatToStr(MaxDiffCPU) + ' must be < ' + FloatToStr(Tol),
+        MaxDiffCPU < Tol);
+    finally
+      Quant4.Free;
+      OutCPU.Free;
+      OutRef.Free;
+      Input.Free;
+      NNRef.Free;
+      NN.Free;
+    end;
+  end;
+begin
+  // Decode GEMV shape: 2048 inputs = 64 blocks, 16 slabs of 4 blocks, one B.
+  RunConv('1x1 d2048 n512 linear', 1, 2048, 512, 1, 0, false);
+  RunConv('1x1 d2048 n512 relu', 1, 2048, 512, 1, 0, true);
+  // 96 inputs = 3 blocks, below the 128-wide slab minimum: KSplits = 1.
+  RunConv('1x1 d96 n64 relu', 1, 96, 64, 1, 0, true);
+  // Spatial: device im2col builds the B operand, 16 columns (FNumBs = 16),
+  // FSize 576 = 18 blocks over 4 slabs - a slab count that does not divide.
+  RunConv('3x3 pad1 d64 n16 relu', 4, 64, 16, 3, 1, true);
+  RunConv('3x3 pad0 d32 n16 linear', 6, 32, 16, 3, 0, false);
 end;
 {$ELSE}
 begin

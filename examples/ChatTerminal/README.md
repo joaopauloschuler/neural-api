@@ -122,7 +122,7 @@ draws uniformly. `--greedy` hard-overrides everything.
 | `-p "prompt"` | one-shot: answer this single prompt, print the reply and exit without opening the REPL (see below) | interactive REPL |
 | `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — less RAM **and** faster than fp32 on both CPU (fused AVX2 int8 kernels) and GPU: the quantized codes stay resident on the device (see below) | **on** |
 | `--fp32` | full-precision fp32 weights — more RAM, slower. Also switches the KV-cache default to fp32 | off |
-| `--int4` | int4 (Q4_0, blocks of 32) weights on the convolution/projection layers, int8 elsewhere — half the weight RAM of `--int8`. A Q4_0 tensor of a `.gguf` checkpoint loads straight into the int4 rows (same codes, same block scales, no FP32 and no int8 row in between) whenever one call fills the whole layer; every other tensor streams into int8 rows and `TNNet.QuantizeWeightsInt4` requantizes it after the load. CPU path (there is no int4 OpenCL kernel), output quality below `--int8` | off |
+| `--int4` | int4 (Q4_0, blocks of 32) weights on the convolution/projection layers, int8 elsewhere — half the weight RAM of `--int8`. A Q4_0 tensor of a `.gguf` checkpoint loads straight into the int4 rows (same codes, same block scales, no FP32 and no int8 row in between) whenever one call fills the whole layer; every other tensor streams into int8 rows and `TNNet.QuantizeWeightsInt4` requantizes it after the load. On `--gpu` the packed codes stay resident on the device (`cai_dot_product_int4_splitk`, FP32 activations). Output quality below `--int8` | off |
 | `--kv-int8` | int8-quantized KV cache (per-row scale = max\|row\|/127): ~1/4 the KV RAM at long context, identical on CPU and GPU. Slightly lossy logits (drift on the order of e-2, greedy argmax stable); the FP32 K/V buffers are never allocated | **on** whenever the weights are int8 |
 | `--kv-fp32` | keep the bit-exact FP32 KV cache while the weights stay int8 | off |
 | `--low-memory` | drop each conv/linear layer's concatenated weight cache (`FConcatedWeights`) and compute per-neuron straight from the weights — less RAM, somewhat slower forward (`pLowMemory`). **Overridden by `--gpu`** (see below) | **on** |
@@ -158,7 +158,7 @@ into the int8 codes, so loading never spikes to the FP32 size) and run
 through fused int8 kernels that are both smaller *and* faster than fp32 on
 CPU and GPU; `--fp32` opts back into full-precision storage, and `--int4`
 quantizes the convolution/projection layers one step further (Q4_0 blocks of
-32, half the weight RAM of int8, CPU only, lower output quality).
+32, half the weight RAM of int8 on CPU and GPU, lower output quality).
 
 The decode-time KV cache follows the weight mode: with int8 weights (the
 default) each attention layer's K/V rows are quantized to int8 with a
