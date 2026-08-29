@@ -90,9 +90,13 @@ const
   csFallbackRepetitionPenalty = 1.05;
 
 type
+  // Weight storage the chat engine loads the checkpoint into.
+  // cwmInt4 is int4 on the convolution/projection layers, int8 elsewhere.
+  TChatWeightMode = (cwmFP32, cwmInt8, cwmInt4);
+
   TChatOptions = record
     ModelDir: string;
-    Int8: boolean;
+    WeightMode: TChatWeightMode; // --fp32 / --int8 (default) / --int4
     LowMemory: boolean;          // true (default) = low-memory forward path
                                  // (drops the concatenated weight cache);
                                  // independent of trainability
@@ -169,12 +173,12 @@ type
                                  // Weights stay int8 and the logits are not
                                  // bit-exact. Needs OpenCL AND int8 weights:
                                  // TNNetConvolutionBase.ShouldOpenCLFP16 tests
-                                 // FQuantInt8, so --fp32 ignores it
+                                 // FQuantInt8, so --fp32 and --int4 ignore it
     ExperimentalInt8Input: boolean; // --experimental-int8-input: TNNet.EnableInt8Input
                                  // after the weights are int8. Today only a
                                  // TNNetConvolution has an int8 x int8 kernel;
                                  // the LLM blocks arm an input copy nothing
-                                 // reads yet. Needs int8 weights
+                                 // reads yet. Needs int8 or int4 weights
     Host: string;                // ChatServer only: HTTP listen address
     Port: integer;               // ChatServer only: HTTP listen port
     ErrorMsg: string;
@@ -341,6 +345,10 @@ begin
   WriteLn('  --int8                int8 weight-only quantized inference (DEFAULT; less');
   WriteLn('                        RAM and faster on CPU and GPU: resident int8 codes)');
   WriteLn('  --fp32                full-precision weights (more RAM, slower)');
+  WriteLn('  --int4                int4 (Q4_0, blocks of 32) weights on the');
+  WriteLn('                        convolution/projection layers, int8 elsewhere;');
+  WriteLn('                        half the weight RAM of --int8; CPU path;');
+  WriteLn('                        output quality below --int8');
   WriteLn('  --low-memory          drop conv/linear weight cache; per-neuron forward (DEFAULT)');
   WriteLn('  --max-fast-memory     keep the concatenated weight cache (faster forward, more RAM)');
   WriteLn('  --kv-int8             int8-quantized KV cache: ~1/4 the KV RAM at long context');
@@ -356,12 +364,12 @@ begin
   WriteLn('  --experimental-fp16   under construction: half-precision activations for');
   WriteLn('                        the int8 OpenCL matmuls (weights stay int8; logits');
   WriteLn('                        not bit-exact). Needs --gpu and int8 weights;');
-  WriteLn('                        ignored otherwise');
+  WriteLn('                        ignored otherwise (--fp32, --int4)');
   WriteLn('  --experimental-int8-input  under construction: int8-quantized activations');
   WriteLn('                        (one scale per tensor) feeding the int8 weights on the');
   WriteLn('                        CPU convolution path; other layers arm the copy but');
-  WriteLn('                        still run int8 x FP32. Needs int8 weights; ignored');
-  WriteLn('                        with --fp32');
+  WriteLn('                        still run int8 x FP32. Needs int8 or int4');
+  WriteLn('                        weights; ignored with --fp32');
   WriteLn('  --no-gpu-shared-kernel  give each layer private OpenCL kernels and command');
   WriteLn('                        queue instead of the net-wide shared ones (default:');
   WriteLn('                        shared, which is faster). Each layer then waits for');
@@ -388,10 +396,20 @@ begin
   WriteLn('  --help                this text');
 end;
 
+// 'fp32' | 'int8' | 'int4', the name of the flag that selects the mode.
+function ChatWeightModeName(WeightMode: TChatWeightMode): string;
+begin
+  case WeightMode of
+    cwmFP32: Result := 'fp32';
+    cwmInt4: Result := 'int4';
+    else Result := 'int8';
+  end;
+end;
+
 function DefaultChatOptions(): TChatOptions;
 begin
   Result.ModelDir := '';
-  Result.Int8 := true; // int8 weights by default: less RAM, faster (--fp32 opts out)
+  Result.WeightMode := cwmInt8; // less RAM, faster; --fp32 and --int4 opt out
   Result.LowMemory := true; // low-memory forward path by default (drops weight cache)
   Result.CtxLen := 0;
   Result.MaxNewTokens := 8192;
@@ -496,8 +514,9 @@ begin
   while ArgPos < Args.Count do
   begin
     Arg := Args[ArgPos];
-    if Arg = '--int8' then Opt.Int8 := true
-    else if Arg = '--fp32' then Opt.Int8 := false
+    if Arg = '--int8' then Opt.WeightMode := cwmInt8
+    else if Arg = '--fp32' then Opt.WeightMode := cwmFP32
+    else if Arg = '--int4' then Opt.WeightMode := cwmInt4
     else if Arg = '--low-memory' then Opt.LowMemory := true
     else if Arg = '--max-fast-memory' then Opt.LowMemory := false
     else if Arg = '--stats' then Opt.Stats := true
@@ -657,11 +676,11 @@ begin
     end;
     Inc(ArgPos);
   end;
-  // The KV cache follows the weight mode unless picked explicitly: int8
-  // weights get the int8 KV cache (same accuracy philosophy, ~1/4 the KV
+  // The KV cache follows the weight mode unless picked explicitly: int8 and
+  // int4 weights get the int8 KV cache (same accuracy philosophy, ~1/4 the KV
   // RAM), --fp32 weights keep the bit-exact FP32 cache. Identical on CPU
   // and GPU (the cached decode path is the same code).
-  if not Opt.KVInt8Set then Opt.KVInt8 := Opt.Int8;
+  if not Opt.KVInt8Set then Opt.KVInt8 := Opt.WeightMode <> cwmFP32;
   Result := true;
 end;
 
@@ -1006,6 +1025,7 @@ var
   LoadStart: QWord;             // per-phase load wall clock (tokenizer,
                                 // checkpoint + caches, GPU weight upload)
   Cnt, LastIdx: integer;
+  Int4LayerCount: integer;      // layers holding int4 weights after --int4
 begin
   Result := false;
   ErrorMsg := '';
@@ -1103,13 +1123,14 @@ begin
     Notice('[--experimental-fp16 ignored: OpenCL offload is off]');
     Opt.ExperimentalFP16 := false;
   end;
-  if Opt.ExperimentalFP16 and (not Opt.Int8) then
+  if Opt.ExperimentalFP16 and (Opt.WeightMode <> cwmInt8) then
   begin
     Notice('[--experimental-fp16 ignored: the half activations are wired for int8' +
-      ' weights only, and --fp32 was requested]');
+      ' weights only, and --' + ChatWeightModeName(Opt.WeightMode) +
+      ' was requested]');
     Opt.ExperimentalFP16 := false;
   end;
-  if Opt.ExperimentalInt8Input and (not Opt.Int8) then
+  if Opt.ExperimentalInt8Input and (Opt.WeightMode = cwmFP32) then
   begin
     Notice('[--experimental-int8-input ignored: the int8 input feeds int8' +
       ' weights only, and --fp32 was requested]');
@@ -1118,12 +1139,16 @@ begin
 
   // Model: generic architecture dispatch, inference-only, int8 by default.
   // Weight precision. Int8 is the default (less RAM and faster on CPU and
-  // GPU); --fp32 opts into full-precision weights (more RAM, slower).
-  if Opt.Int8 then
-    Notice('[int8 weights (default) - less RAM, faster on CPU and GPU;' +
-      ' on --gpu the codes stay resident on the device; --fp32 opts out]')
-  else
-    Notice('[--fp32: full-precision weights - more RAM, slower than int8]');
+  // GPU); --fp32 opts into full-precision weights (more RAM, slower);
+  // --int4 quantizes the convolution/projection layers further, on the CPU.
+  case Opt.WeightMode of
+    cwmInt8: Notice('[int8 weights (default) - less RAM, faster on CPU and GPU;' +
+      ' on --gpu the codes stay resident on the device; --fp32 opts out]');
+    cwmFP32: Notice('[--fp32: full-precision weights - more RAM, slower than int8]');
+    cwmInt4: Notice('[--int4: the checkpoint streams into int8 rows, then' +
+      ' TNNet.QuantizeWeightsInt4 requantizes the convolution/projection layers' +
+      ' to Q4_0 int4; CPU path, output quality below int8]');
+  end;
   if Opt.LowMemory then
     Notice('[low-memory forward (default) - concatenated weight cache dropped,' +
       ' per-neuron compute, not compatible with GPU,' +
@@ -1147,7 +1172,7 @@ begin
   // forward and the KV cache (budget = CtxLen, set on the session below) holds
   // the context. SeqLen is the cache budget, NOT the built input width.
   NN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}1,
-    {pTrainable=}false, '', {pQuantizeInt8=}Opt.Int8);
+    {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32);
   NeuralAllowFusedAttention := true; // restore the global default post-build
   // Low-memory forward path, set independently of trainability. The importer
   // built inference-only with low memory ON (SetTrainable's pLowMemory default);
@@ -1159,6 +1184,16 @@ begin
     NN.Layers[Cnt].FlushWeightCache();
   Notice(Format('Model loaded in %.1fs.',
     [(GetTickCount64() - LoadStart) / 1000]));
+
+  // --int4 runs BEFORE EnableOpenCL: TNNetLayerConcatedWeights.QuantizeWeightsInt4
+  // refuses a layer that already has OpenCL enabled.
+  if Opt.WeightMode = cwmInt4 then
+  begin
+    Int4LayerCount := NN.QuantizeWeightsInt4();
+    Notice('[--int4: Q4_0 int4 weights on ' + IntToStr(Int4LayerCount) +
+      ' layers (int8 -> int4 requantized at load); the other weight layers' +
+      ' stay int8; int8 input copy enabled on the int4 layers]');
+  end;
 
   {$IFDEF OpenCL}
   // OpenCL offload of the conv/linear matmuls. Enabling it rebuilds each
@@ -1196,6 +1231,9 @@ begin
           Notice('[--no-gpu-shared-kernel: per-layer kernels and command queues - ' +
             'each layer waits for its sources, so --profile charges GPU time to ' +
             'layers instead of the queue drain; slower than shared]');
+        if Opt.WeightMode = cwmInt4 then
+          Notice('[--int4 with --gpu: the int4 layers run on the CPU (there is' +
+            ' no int4 OpenCL kernel); the remaining layers still use OpenCL]');
         if Opt.ExperimentalFP16 then
           Notice('[--experimental-fp16: under construction -' +
             ' half-precision activations in the int8 matmuls; weights stay' +
@@ -1220,9 +1258,10 @@ begin
   // kernel). The armed count is the user's confirmation that ordering held.
   if Opt.ExperimentalInt8Input then
     Notice('[--experimental-int8-input: under construction - int8 input copy' +
-      ' armed on ' + IntToStr(NN.EnableInt8Input()) + ' layers; only' +
-      ' TNNetConvolution runs int8 x int8 today, the others still run' +
-      ' int8 x FP32]');
+      ' armed on ' + IntToStr(NN.EnableInt8Input()) + ' layers (the count is' +
+      ' every layer holding the copy, so with --int4 it includes the int4' +
+      ' layers, which arm it themselves); only TNNetConvolution runs' +
+      ' int8 x int8 today, the others still run int8 x FP32]');
 
   SeqLen := Opt.CtxLen;
   VocabSize := NN.GetLastLayer().Output.Depth;
@@ -1271,7 +1310,7 @@ begin
     [ModelType, NN.CountWeights(), VocabSize, SeqLen]);
   if RawMode then Line := Line + 'raw (completion)'
   else Line := Line + ChatFormatName(ChatFormat);
-  Notice(Line + ', ' + BoolToStr(Opt.Int8, 'int8', 'fp32') + ' weights.');
+  Notice(Line + ', ' + ChatWeightModeName(Opt.WeightMode) + ' weights.');
   // The reasoning effort is a no-op on a template without a reasoning
   // control, so say which of the two happened rather than dropping it
   // silently.

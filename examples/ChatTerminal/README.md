@@ -122,6 +122,7 @@ draws uniformly. `--greedy` hard-overrides everything.
 | `-p "prompt"` | one-shot: answer this single prompt, print the reply and exit without opening the REPL (see below) | interactive REPL |
 | `--int8` | int8 weight-only quantized inference (`pQuantizeInt8`) — less RAM **and** faster than fp32 on both CPU (fused AVX2 int8 kernels) and GPU: the quantized codes stay resident on the device (see below) | **on** |
 | `--fp32` | full-precision fp32 weights — more RAM, slower. Also switches the KV-cache default to fp32 | off |
+| `--int4` | int4 (Q4_0, blocks of 32) weights on the convolution/projection layers, int8 elsewhere — half the weight RAM of `--int8`. The checkpoint streams into int8 rows, then `TNNet.QuantizeWeightsInt4` requantizes the eligible layers; CPU path (there is no int4 OpenCL kernel), output quality below `--int8` | off |
 | `--kv-int8` | int8-quantized KV cache (per-row scale = max\|row\|/127): ~1/4 the KV RAM at long context, identical on CPU and GPU. Slightly lossy logits (drift on the order of e-2, greedy argmax stable); the FP32 K/V buffers are never allocated | **on** whenever the weights are int8 |
 | `--kv-fp32` | keep the bit-exact FP32 KV cache while the weights stay int8 | off |
 | `--low-memory` | drop each conv/linear layer's concatenated weight cache (`FConcatedWeights`) and compute per-neuron straight from the weights — less RAM, somewhat slower forward (`pLowMemory`). **Overridden by `--gpu`** (see below) | **on** |
@@ -130,8 +131,8 @@ draws uniformly. `--greedy` hard-overrides everything.
 | `--cpu` | force CPU even when built with `-dOpenCL` | — |
 | `--gpu-platform N` | OpenCL platform index | 0 |
 | `--gpu-device N` | OpenCL device index within the platform | 0 |
-| `--experimental-fp16` | **experimental and under construction.** Half-precision activations in the int8 OpenCL matmuls (`cai_dot_product_int8_h` and its split-K twin): the weights stay int8 and the layer still hands the CPU a `Single`, only the column matrix inside OpenCL memory narrows. Logits are not bit-exact. Needs `--gpu` and int8 weights — `--cpu` or `--fp32` ignores it, and a device that rejects the half kernel keeps the FP32 activations | off |
-| `--experimental-int8-input` | **experimental and under construction.** `TNNet.EnableInt8Input` after the weights are quantized: every int8-weight layer keeps an int8 copy of its input with one scale per tensor. Today only `TNNetConvolution` has an int8 x int8 CPU kernel (`ComputeInt8Int8CPU`); the fully connected blocks of an LLM arm the copy but still run int8 x FP32, so on ChatTerminal's models this changes nothing yet. Needs int8 weights — `--fp32` ignores it | off |
+| `--experimental-fp16` | **experimental and under construction.** Half-precision activations in the int8 OpenCL matmuls (`cai_dot_product_int8_h` and its split-K twin): the weights stay int8 and the layer still hands the CPU a `Single`, only the column matrix inside OpenCL memory narrows. Logits are not bit-exact. Needs `--gpu` and int8 weights — `--cpu`, `--fp32` or `--int4` ignores it, and a device that rejects the half kernel keeps the FP32 activations | off |
+| `--experimental-int8-input` | **experimental and under construction.** `TNNet.EnableInt8Input` after the weights are quantized: every int8-weight layer keeps an int8 copy of its input with one scale per tensor. Today only `TNNetConvolution` has an int8 x int8 CPU kernel (`ComputeInt8Int8CPU`); the fully connected blocks of an LLM arm the copy but still run int8 x FP32, so on ChatTerminal's models this changes nothing yet. Needs int8 or int4 weights — `--fp32` ignores it. With `--int4` the printed count includes the int4 layers, which arm the copy themselves | off |
 | `--no-gpu-shared-kernel` | give every layer its own OpenCL kernel handles and command queue instead of the net-wide shared ones (see below) | shared on |
 | `--stats` | per-turn timing to **stderr**: TTFT (prefill + first token), steady-state decode tok/s, and `prompt N (reused K)` from the KV-cache reuse | off |
 | `--profile` | per-layer-class forward timing to **stderr** after each turn (decode steps only — prefill is excluded), plus a `[sched]` line with the layer-graph scheduler stats (graph width, parallel vs serial passes, peak in-flight) | off |
@@ -155,7 +156,9 @@ weight storage is int8 by default — quantized at construction time (no FP32
 weight copy is ever allocated; large checkpoints stream row-by-row straight
 into the int8 codes, so loading never spikes to the FP32 size) and run
 through fused int8 kernels that are both smaller *and* faster than fp32 on
-CPU and GPU; `--fp32` opts back into full-precision storage.
+CPU and GPU; `--fp32` opts back into full-precision storage, and `--int4`
+quantizes the convolution/projection layers one step further (Q4_0 blocks of
+32, half the weight RAM of int8, CPU only, lower output quality).
 
 The decode-time KV cache follows the weight mode: with int8 weights (the
 default) each attention layer's K/V rows are quantized to int8 with a
