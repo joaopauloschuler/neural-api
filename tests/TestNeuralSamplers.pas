@@ -85,6 +85,11 @@ type
     // silently takes the plain full-sort branch and proves nothing).
     procedure TestTopPLargeVocabNucleusIsCorrect;
     procedure TestTopPLargeVocabFlatDistributionRetries;
+    // The gathered-nucleus fast path (LoadNucleusCandidates) must draw the
+    // very token the full-window path draws for the same RNG state, and must
+    // decline a flat row so the full path answers. Coded by Claude (AI).
+    procedure TestTopPLargeVocabGatherMatchesFullPath;
+    procedure TestGetTokenArrayAboveGathersAndSums;
 
     // Nucleus closure and the weighted draw inside it.
     procedure TestTopPFullMassIsNotGreedy;
@@ -107,6 +112,24 @@ type
   end;
 
 implementation
+
+type
+  // Exposes the two top-p routes of TNNetSamplerTopP to the tests.
+  TTopPRoutes = class(TNNetSamplerTopP)
+    function GatherApplies(V: TNNetVolume): boolean;
+    function GetTokenFullPath(V: TNNetVolume): integer;
+  end;
+
+function TTopPRoutes.GatherApplies(V: TNNetVolume): boolean;
+begin
+  Result := LoadNucleusCandidates(V);
+end;
+
+function TTopPRoutes.GetTokenFullPath(V: TNNetVolume): integer;
+begin
+  LoadCandidates(V);
+  Result := SampleFromNucleus();
+end;
 
 procedure TTestNeuralSamplers.TestGreedySamplerCreation;
 var
@@ -1546,6 +1569,85 @@ begin
     SetLength(Seen, 0);
     V.Free;
     Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestTopPLargeVocabGatherMatchesFullPath;
+const
+  V_SIZE = 250000; // a real LLM vocabulary
+var
+  Sampler: TTopPRoutes;
+  V: TNNetVolume;
+  I, TokenFast, TokenFull: integer;
+begin
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  try
+    // Peak at 0: strictly descending scores, so no tie can be ordered
+    // differently by the two routes.
+    BuildLargePeakedRow(V, V_SIZE, 0);
+    Sampler := TTopPRoutes.Create(0.80);
+    try
+      AssertTrue('Peaked row: the gather must hold the 0.80 nucleus',
+        Sampler.GatherApplies(V));
+      for I := 0 to 199 do
+      begin
+        RandSeed := 1000 + I;
+        TokenFast := Sampler.GetToken(V);
+        RandSeed := 1000 + I;
+        TokenFull := Sampler.GetTokenFullPath(V);
+        AssertEquals('Draw ' + IntToStr(I) + ': gathered and full routes',
+          TokenFull, TokenFast);
+      end;
+    finally
+      Sampler.Free;
+    end;
+    // A uniform row keeps every token above max/1024, and the gather's mass
+    // is checked against TopP >= 1, so it must decline and leave the full
+    // path (ancestral sampling over the whole row) in charge.
+    V.Fill(1.0 / V_SIZE);
+    Sampler := TTopPRoutes.Create(1.0);
+    try
+      AssertFalse('Flat row with TopP 1.0: the gather must decline',
+        Sampler.GatherApplies(V));
+      TokenFast := Sampler.GetToken(V);
+      AssertTrue('Flat row draw in range', (TokenFast >= 0) and (TokenFast < V_SIZE));
+    finally
+      Sampler.Free;
+    end;
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestGetTokenArrayAboveGathersAndSums;
+var
+  V: TNNetVolume;
+  Arr: TNNetTokenArray;
+  Count: integer;
+  Mass: TNeuralFloat;
+begin
+  V := TNNetVolume.Create(2, 1, 4);
+  try
+    // Pixel 0: 0.5, 0.01, 0.3, 0.19; pixel 1: 0.05, 0.9, 0.02, 0.03.
+    V.Raw[0] := 0.5; V.Raw[1] := 0.01; V.Raw[2] := 0.3; V.Raw[3] := 0.19;
+    V.Raw[4] := 0.05; V.Raw[5] := 0.9; V.Raw[6] := 0.02; V.Raw[7] := 0.03;
+    // The whole-volume gather spans both pixels.
+    Mass := V.GetTokenArrayAbove(Arr, 0.1, Count);
+    AssertEquals('whole volume: four tokens reach 0.1', 4, Count);
+    AssertEquals('whole volume: gathered in index order', 0, Arr[0].Token);
+    AssertEquals('whole volume: second is index 2', 2, Arr[1].Token);
+    AssertEquals('whole volume: third is index 3', 3, Arr[2].Token);
+    AssertEquals('whole volume: fourth is index 5', 5, Arr[3].Token);
+    AssertTrue('whole volume: mass 1.89', Abs(Mass - 1.89) < 1e-6);
+    AssertEquals('array keeps the full length', 8, Length(Arr));
+    Mass := V.GetTokenArrayAboveOnPixel(Arr, 0.04, 1, 0, Count);
+    AssertEquals('pixel 1: two tokens reach 0.04', 2, Count);
+    AssertEquals('pixel 1: depth index 0', 0, Arr[0].Token);
+    AssertEquals('pixel 1: depth index 1', 1, Arr[1].Token);
+    AssertTrue('pixel 1: mass 0.95', Abs(Mass - 0.95) < 1e-6);
+  finally
+    SetLength(Arr, 0);
+    V.Free;
   end;
 end;
 

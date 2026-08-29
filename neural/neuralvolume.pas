@@ -462,6 +462,10 @@ type
       procedure CalculateLocalResponseFromDepth(Original, SqrElements: TNNetVolume; pSize:integer; alpha, beta: TNeuralFloat );
       procedure GetTokenArray(var TokenArray: TNNetTokenArray);
       procedure GetTokenArrayOnPixel(var TokenArray: TNNetTokenArray; X,Y: integer);
+      // Gathers into TokenArray[0..Count-1], in index order, the tokens scoring
+      // at least Threshold and returns their summed score; the array keeps its full length.
+      function GetTokenArrayAbove(var TokenArray: TNNetTokenArray; Threshold: TNeuralFloat; out Count: integer): TNeuralFloat;
+      function GetTokenArrayAboveOnPixel(var TokenArray: TNNetTokenArray; Threshold: TNeuralFloat; X, Y: integer; out Count: integer): TNeuralFloat;
       (*
       Assume that "As" and "Bs" contain lists of vectors "A" and "B".
       "NumAs and NumBs" are the number of elements in the
@@ -1202,6 +1206,17 @@ type
       // top-k pre-truncation so the whole vocabulary is not sorted to find
       // a nucleus that is typically a few dozen tokens wide.
       function SampleFromNucleus(): integer;
+      // Loads only the tokens scoring at least MaxScore/1024 and returns true
+      // when their mass reaches FTopP - the proof that the nucleus is inside.
+      function LoadNucleusCandidates(Origin: TNNetVolume): boolean;
+      function LoadNucleusCandidatesOnPixel(Origin: TNNetVolume; PixelX, PixelY: integer): boolean;
+      // The window is the gathered set (a few dozen tokens): sort it whole.
+      function SampleFromGatheredNucleus(): integer;
+      // Width of the smallest descending prefix of the window that reaches
+      // FTopP (the crossing token included), or the whole window.
+      function NucleusWidth(out KeptSum: TNeuralFloat): integer;
+      // Weighted draw over the first KeptCount window entries.
+      function DrawFromNucleus(KeptCount: integer; KeptSum: TNeuralFloat): integer;
     public
       constructor Create(TopP: TNeuralFloat);
       function GetToken(Origin: TNNetVolume): integer; override;
@@ -5762,8 +5777,8 @@ const
   // is not, the retry below pays one full sort and is still correct.
   csTopPAdaptiveK = 256;
 var
-  KeptSum, Roll, Cumulative: TNeuralFloat;
-  I, KeptCount, KeptCountM1, Hi: Integer;
+  KeptSum: TNeuralFloat;
+  KeptCount: Integer;
   Truncated: boolean;
 begin
   if FCount = 0 then
@@ -5777,27 +5792,43 @@ begin
   Truncated := FCount > csTopPAdaptiveMin;
   if Truncated then SelectTopCandidates(csTopPAdaptiveK)
   else SortTokenArray();
-  // Smallest prefix whose cumulative mass REACHES FTopP. The token that
-  // crosses the threshold is part of the nucleus, so it is counted before the
-  // test. When the window runs out without reaching FTopP (FTopP >= 1, or a
-  // row that does not sum to one) the nucleus is the whole window, i.e. full
-  // ancestral sampling - not a silent collapse to the argmax.
   repeat
-    KeptCount := 0;
-    KeptSum := 0;
-    Hi := FCount - 1;
-    for I := 0 to Hi do
-    begin
-      Inc(KeptCount);
-      KeptSum := KeptSum + FTokenArr[I].Score;
-      if KeptSum >= FTopP then Break;
-    end;
+    KeptCount := NucleusWidth(KeptSum);
     if (KeptSum >= FTopP) or (not Truncated) then Break;
     // The prefix did not hold FTopP of the mass: re-arm the full row (the
     // partition only permuted it) and redo the scan exactly once.
     RestoreFullWindowSorted();
     Truncated := false;
   until false;
+  Result := DrawFromNucleus(KeptCount, KeptSum);
+end;
+
+function TNNetSamplerTopP.NucleusWidth(out KeptSum: TNeuralFloat): integer;
+var
+  I, Hi: integer;
+begin
+  // Smallest prefix whose cumulative mass REACHES FTopP. The token that
+  // crosses the threshold is part of the nucleus, so it is counted before the
+  // test. When the window runs out without reaching FTopP (FTopP >= 1, or a
+  // row that does not sum to one) the nucleus is the whole window, i.e. full
+  // ancestral sampling - not a silent collapse to the argmax.
+  Result := 0;
+  KeptSum := 0;
+  Hi := FCount - 1;
+  for I := 0 to Hi do
+  begin
+    Inc(Result);
+    KeptSum := KeptSum + FTokenArr[I].Score;
+    if KeptSum >= FTopP then Break;
+  end;
+end;
+
+function TNNetSamplerTopP.DrawFromNucleus(KeptCount: integer;
+  KeptSum: TNeuralFloat): integer;
+var
+  Roll, Cumulative: TNeuralFloat;
+  I, KeptCountM1: integer;
+begin
   if KeptSum <= 0 then
   begin
     Result := FTokenArr[0].Token; // fallback: degenerate distribution
@@ -5819,17 +5850,68 @@ begin
   end;
 end;
 
+const
+  // Gather threshold as a fraction of the row maximum. Tokens below it are
+  // left out of the window; the gathered mass is checked against FTopP, so a
+  // fraction that proves too coarse costs a fallback, never a wrong nucleus.
+  csNucleusGatherFraction = 1 / 1024;
+
+function TNNetSamplerTopP.LoadNucleusCandidates(Origin: TNNetVolume): boolean;
+var
+  GatheredMass: TNeuralFloat;
+begin
+  GatheredMass := Origin.GetTokenArrayAbove(FTokenArr,
+    Origin.GetMax() * csNucleusGatherFraction, FCount);
+  FSorted := false;
+  Result := (FCount > 0) and (GatheredMass >= FTopP);
+end;
+
+function TNNetSamplerTopP.LoadNucleusCandidatesOnPixel(Origin: TNNetVolume;
+  PixelX, PixelY: integer): boolean;
+var
+  GatheredMass, MaxScore: TNeuralFloat;
+begin
+  MaxScore := Origin.FData[Origin.GetRawPos(PixelX, PixelY,
+    Origin.GetClassOnPixel(PixelX, PixelY))];
+  GatheredMass := Origin.GetTokenArrayAboveOnPixel(FTokenArr,
+    MaxScore * csNucleusGatherFraction, PixelX, PixelY, FCount);
+  FSorted := false;
+  Result := (FCount > 0) and (GatheredMass >= FTopP);
+end;
+
+function TNNetSamplerTopP.SampleFromGatheredNucleus(): integer;
+var
+  KeptSum: TNeuralFloat;
+  KeptCount: integer;
+begin
+  SortTokenArray();
+  KeptCount := NucleusWidth(KeptSum);
+  Result := DrawFromNucleus(KeptCount, KeptSum);
+end;
+
 function TNNetSamplerTopP.GetToken(Origin: TNNetVolume): integer;
 begin
-  LoadCandidates(Origin);
-  Result := SampleFromNucleus();
+  // The gather proves the nucleus lies inside its few dozen tokens, which
+  // skips building and partitioning the full-vocabulary window.
+  if LoadNucleusCandidates(Origin) then
+    Result := SampleFromGatheredNucleus()
+  else
+  begin
+    LoadCandidates(Origin);
+    Result := SampleFromNucleus();
+  end;
 end;
 
 function TNNetSamplerTopP.GetTokenOnPixel(Origin: TNNetVolume; PixelX,
   PixelY: integer): integer;
 begin
-  LoadCandidatesOnPixel(Origin, PixelX, PixelY);
-  Result := SampleFromNucleus();
+  if LoadNucleusCandidatesOnPixel(Origin, PixelX, PixelY) then
+    Result := SampleFromGatheredNucleus()
+  else
+  begin
+    LoadCandidatesOnPixel(Origin, PixelX, PixelY);
+    Result := SampleFromNucleus();
+  end;
 end;
 
 { TNNetSamplerMinP }
@@ -13017,6 +13099,53 @@ begin
     begin
       TokenArray[I].Token := I;
       TokenArray[I].Score := FData[Base + I];
+    end;
+  end;
+end;
+
+function TNNetVolume.GetTokenArrayAbove(var TokenArray: TNNetTokenArray;
+  Threshold: TNeuralFloat; out Count: integer): TNeuralFloat;
+var
+  I, vHigh: integer;
+  Score: TNeuralFloat;
+begin
+  if (Length(TokenArray) < FSize) then SetLength(TokenArray, FSize);
+  Result := 0;
+  Count := 0;
+  vHigh := FSize - 1;
+  for I := 0 to vHigh do
+  begin
+    Score := FData[I];
+    if Score >= Threshold then
+    begin
+      TokenArray[Count].Token := I;
+      TokenArray[Count].Score := Score;
+      Inc(Count);
+      Result := Result + Score;
+    end;
+  end;
+end;
+
+function TNNetVolume.GetTokenArrayAboveOnPixel(var TokenArray: TNNetTokenArray;
+  Threshold: TNeuralFloat; X, Y: integer; out Count: integer): TNeuralFloat;
+var
+  I, vHigh, Base: integer;
+  Score: TNeuralFloat;
+begin
+  if (Length(TokenArray) < FDepth) then SetLength(TokenArray, FDepth);
+  Result := 0;
+  Count := 0;
+  vHigh := FDepth - 1;
+  Base := GetRawPos(X, Y);
+  for I := 0 to vHigh do
+  begin
+    Score := FData[Base + I];
+    if Score >= Threshold then
+    begin
+      TokenArray[Count].Token := I;
+      TokenArray[Count].Score := Score;
+      Inc(Count);
+      Result := Result + Score;
     end;
   end;
 end;
