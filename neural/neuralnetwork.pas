@@ -919,6 +919,10 @@ type
       FQuantTable: TNNetVolumeQuant8;
       FQuantVectorSize: integer;
       FQuantWSizeX, FQuantWSizeY, FQuantWSizeD: integer;
+      // Int4 twin of FQuantTable (inference-only, CPU only): Q4_0 rows, one
+      // per neuron; FP32 rows shrunk, FQuantInt8 false, int8 input enabled.
+      FQuantInt4: boolean;
+      FQuantTableInt4: TNNetVolumeQuant4;
       // Int8 copy of the forward input (Int8InputSource), nil until
       // EnableInt8Input sizes it: most layers never run an int8 input.
       FInputCopyInt8: TNNetVolumeQuant8;
@@ -951,6 +955,12 @@ type
       // safetensors importers to refill a quantized layer with checkpoint
       // weights) and leaves the layer un-quantized. // Coded by Claude (AI).
       procedure DequantizeWeightsInt8();
+      // Whether this layer's forward has an int4 weight x int8 input kernel.
+      // False here: only TNNetConvolution carries one. Coded by Claude (AI).
+      function SupportsInt4Weights(): boolean; virtual;
+      // Q4_0-quantizes the weights (from FP32, or from the int8 table by
+      // requantizing) and enables the int8 input; needs SetPrevLayer. Coded by Claude (AI).
+      procedure QuantizeWeightsInt4(); virtual;
       // The FP32 volume QuantizeInputInt8 reads. The previous layer's output
       // here; a convolution reads its padded input copy. Coded by Claude (AI).
       function Int8InputSource(): TNNetVolume; virtual;
@@ -1001,6 +1011,8 @@ type
       procedure SetNumWeightsForAllNeurons(NumWeights: integer); overload; override;
       procedure SetNumWeightsForAllNeurons(x, y, d: integer); overload; override;
       property WeightsQuantizedInt8: boolean read FQuantInt8;
+      property WeightsQuantizedInt4: boolean read FQuantInt4;
+      property QuantTableInt4: TNNetVolumeQuant4 read FQuantTableInt4;
       property InputCopyInt8: TNNetVolumeQuant8 read FInputCopyInt8;
       property InputScaleInt8: TNeuralFloat read FInputScaleInt8;
       // Weight-row element count of the int8 container (0 when unarmed);
@@ -14729,12 +14741,28 @@ type
     protected
       procedure ComputeCPU();
       procedure ComputeTiledCPU();
+      // TNNetConvolution owns the int4 weight x int8 input forward
+      // (ComputeQuantInt8InputCPU). Coded by Claude (AI).
+      function SupportsInt4Weights(): boolean; override;
       // True when the CPU forward runs int8 codes on BOTH operands: int8
       // weights, an EnableInt8Input copy, shapes agreeing. Coded by Claude (AI).
       function ShouldComputeInt8Int8CPU(): boolean;
-      // Int8 x int8 forward: quantize the input, byte im2col, then one tiled
-      // int32 reduction per output. Needs EnableInt8Input. Coded by Claude (AI).
-      procedure ComputeInt8Int8CPU();
+      // The int4 twin: Q4_0 weight blocks against the same int8 input copy.
+      // Coded by Claude (AI).
+      function ShouldComputeInt4Int8CPU(): boolean;
+      // True when either quantized-weight kernel can run against the int8
+      // input copy - the one check the forward dispatch asks. Coded by Claude (AI).
+      function ShouldComputeQuantInt8InputCPU(): boolean;
+      // Quantized weights x int8 input over the given position and neuron
+      // ranges; FQuantInt4 picks the tiled kernel. Coded by Claude (AI).
+      procedure DotProductsQuantInt8Input(BStart, BFinish, AStart,
+        AFinish: integer);
+      // Quantized weights x int8 input forward: quantize the input, byte
+      // im2col, one tiled reduction per output. Needs EnableInt8Input. Coded by Claude (AI).
+      procedure ComputeQuantInt8InputCPU();
+      // Int4 weights with no int8 input path left the FP32 weights released,
+      // so the other forwards would read shrunk storage. Coded by Claude (AI).
+      procedure RaiseWhenInt4WithoutInt8Input();
       procedure ComputeInterleaved();
       // Threaded slice: one contiguous block of output positions, computed
       // with the ranged kernels (absolute row positions, so disjoint ranges
@@ -19495,6 +19523,9 @@ type
       // QuantizeWeightsInt8 sweep sets it automatically otherwise.
       property BuildQuantInt8: boolean
         read FBuildQuantInt8 write FBuildQuantInt8; // Coded by Claude (AI).
+      // Q4_0-quantizes every layer that SupportsInt4Weights and returns how
+      // many hold int4 weights afterwards. Coded by Claude (AI).
+      function QuantizeWeightsInt4(): integer;
       // Arms the int8 input copy on every int8-quantized weight layer, returning
       // how many. Run it after the net is built and after QuantizeWeightsInt8 -
       // a layer still holding FP32 weights is skipped. Coded by Claude (AI).
@@ -77960,7 +77991,9 @@ begin
       //    kernels consume FQuantTable directly).
       //  - low-memory: ComputeLowMemoryCPU reads per-neuron weights directly,
       //    so the persistent cache is pure overhead.
-      if not FQuantInt8 and not ActiveLowMemory() then
+      //  - int4: same as int8 - the FP32 rows are gone, the kernels read
+      //    FQuantTableInt4.
+      if not FQuantInt8 and not FQuantInt4 and not ActiveLowMemory() then
       begin
         FNeuronWeightList.ConcatInto(FConcatedWeights);
         if FShouldInterleaveWeights then
@@ -78141,6 +78174,107 @@ begin
   AfterWeightUpdate(); // rebuild the concatenated cache / bias output
 end;
 
+function TNNetLayerConcatedWeights.SupportsInt4Weights(): boolean;
+begin
+  Result := false;
+end;
+
+procedure TNNetLayerConcatedWeights.QuantizeWeightsInt4();
+var
+  MaxQuantNeuronPos, NeuronCnt: integer;
+  RowSize: integer;
+  DequantizedRow: TNNetVolume;
+  W: TNNetVolume;
+begin
+  if FQuantInt4 then exit;          // idempotent
+  if FLinkedNeurons then exit;      // shared neurons: owner layer decides
+  if FNeurons.Count = 0 then exit;
+  if not SupportsInt4Weights() then
+  begin
+    FErrorProc(ClassName + '.QuantizeWeightsInt4: this layer class has no ' +
+      'int4 weight x int8 input forward.');
+    exit;
+  end;
+  if FQuantInt8
+    then RowSize := FQuantVectorSize
+    else RowSize := FNeurons[0].Weights.Size;
+  if RowSize <= 1 then exit;        // nothing to quantize
+  if (RowSize mod TNNetVolumeQuant4.BlockSize) <> 0 then
+  begin
+    FErrorProc(ClassName + '.QuantizeWeightsInt4: weight row size ' +
+      IntToStr(RowSize) + ' is not a multiple of the Q4_0 block size ' +
+      IntToStr(TNNetVolumeQuant4.BlockSize) + '.');
+    exit;
+  end;
+  {$IFDEF OpenCL}
+  if FHasOpenCL then
+  begin
+    FErrorProc(ClassName + '.QuantizeWeightsInt4: there is no int4 OpenCL ' +
+      'kernel; quantize before TNNet.EnableOpenCL.');
+    exit;
+  end;
+  {$ENDIF}
+  FQuantVectorSize := RowSize;
+  if not FQuantInt8 then
+  begin
+    FQuantWSizeX := FNeurons[0].Weights.SizeX;
+    FQuantWSizeY := FNeurons[0].Weights.SizeY;
+    FQuantWSizeD := FNeurons[0].Weights.Depth;
+  end;
+  MaxQuantNeuronPos := FNeurons.Count - 1;
+  if FQuantInt8 then
+  begin
+    // One row at a time: this is a load-time conversion, not a forward pass.
+    DequantizedRow := TNNetVolume.Create(1, 1, RowSize);
+    FQuantTableInt4.ReSize(FNeurons.Count, 1, RowSize);
+    for NeuronCnt := 0 to MaxQuantNeuronPos do
+    begin
+      FQuantTable.DequantizeRowTo(NeuronCnt, 0,
+        TNeuralFloatArrPtr(@DequantizedRow.FData[0]));
+      FQuantTableInt4.QuantizeRow(NeuronCnt, 0,
+        TNeuralFloatArrPtr(@DequantizedRow.FData[0]));
+    end;
+    DequantizedRow.Free;
+    FQuantTable.ReSize(0, 0, 0);
+    FQuantInt8 := false;
+  end
+  else
+  begin
+    for NeuronCnt := 0 to MaxQuantNeuronPos do
+    begin
+      if FNeurons[NeuronCnt].Weights.Size <> RowSize then
+      begin
+        FErrorProc(ClassName + '.QuantizeWeightsInt4: neuron ' +
+          IntToStr(NeuronCnt) + ' weight size ' +
+          IntToStr(FNeurons[NeuronCnt].Weights.Size) + ' differs from ' +
+          IntToStr(RowSize) + '.');
+        FQuantTableInt4.ReSize(0, 0, 0);
+        exit;
+      end;
+    end;
+    FQuantTableInt4.ReSize(FNeurons.Count, 1, RowSize);
+    for NeuronCnt := 0 to MaxQuantNeuronPos do
+    begin
+      W := FNeurons[NeuronCnt].Weights;
+      FQuantTableInt4.QuantizeRow(NeuronCnt, 0,
+        TNeuralFloatArrPtr(@W.FData[0]));
+    end;
+    // Free the FP32 storage only after every row quantized, as
+    // QuantizeWeightsInt8 does: (1,1,1) genuinely shrinks the heap.
+    for NeuronCnt := 0 to MaxQuantNeuronPos do
+    begin
+      FNeurons[NeuronCnt].Weights.ReSize(1, 1, 1);
+      FNeurons[NeuronCnt].Weights.Fill(0);
+    end;
+    FConcatedWeights.ReSize(1, 1, 1);
+    FConcatedWInter.ReSize(1, 1, 1);
+  end;
+  FQuantInt4 := true;
+  // The int4 weights have no FP32-input kernel, so the int8 input copy is part
+  // of the conversion, not an option.
+  EnableInt8Input();
+end;
+
 procedure TNNetLayerConcatedWeights.AllocInputCopyInt8(pPadding: integer);
 var
   PrevOutput: TNNetVolume;
@@ -78253,13 +78387,14 @@ end;
 
 function TNNetLayerConcatedWeights.Int8QuantizedSizeBytes(): int64;
 begin
-  Result := FQuantTable.GetMemSize();
+  // Both containers: the empty one reports 0, and a layer holds at most one.
+  Result := FQuantTable.GetMemSize() + FQuantTableInt4.GetMemSize();
 end;
 
 function TNNetLayerConcatedWeights.CountWeights(): int64;
 begin
-  if FQuantInt8 and (not FLinkedNeurons)
-  then Result := FQuantTable.Size
+  if FQuantInt8 and (not FLinkedNeurons) then Result := FQuantTable.Size
+  else if FQuantInt4 and (not FLinkedNeurons) then Result := FQuantTableInt4.Size
   else Result := inherited CountWeights();
 end;
 
@@ -78331,11 +78466,13 @@ begin
   FConcatedWeights := TNNetVolume.Create();
   FConcatedWInter := TNNetVolume.Create();
   FQuantTable := TNNetVolumeQuant8.Create();
+  FQuantTableInt4 := TNNetVolumeQuant4.Create();
   FBiasOutput := TNNetVolume.Create();
   FShouldConcatWeights := false;
   FShouldInterleaveWeights := false;
   FAfterWeightUpdateHasBeenCalled := false;
   FQuantInt8 := false;
+  FQuantInt4 := false;
   FQuantVectorSize := 0;
 end;
 
@@ -78345,6 +78482,7 @@ begin
   DisableInt8Input();
   FBiasOutput.Free;
   FQuantTable.Free;
+  FQuantTableInt4.Free;
   FConcatedWeights.Free;
   FNeuronWeightList.Free;
   FConcatedWInter.Free;
@@ -78446,6 +78584,10 @@ end;
 procedure TNNetLayerConcatedWeights.EnableOpenCL(
   DotProductKernel: TNeuralKernel);
 begin
+  // No int4 OpenCL kernel exists and the device int8 kernel reads FQuantTable,
+  // which QuantizeWeightsInt4 released. Leaving FHasOpenCL false keeps every
+  // WillOpenCL() reader (and this layer's FDotCL) on the CPU path.
+  if FQuantInt4 then exit;
   inherited EnableOpenCL(DotProductKernel);
   (*
   // good for debugging
@@ -104831,15 +104973,13 @@ begin
     // race-free. Coded by Claude (AI).
     NumPositions := FOutputSizeX * FOutputSizeY;
     NumPositionsM1 := NumPositions - 1;
-    if ShouldComputeInt8Int8CPU() then
+    if ShouldComputeQuantInt8InputCPU() then
     begin
-      // Int8 x int8: both operands are codes. FInputPreparedInt8 was built once
-      // by PrepareChunkedForward, before any chunk was published, so this slice
-      // only reads it. Bias + activation run in the shared tail below.
-      // Coded by Claude (AI).
-      FOutputRaw.DotProductsTiledInt8Int8(FNeurons.Count, {BStart}0,
-        {BFinish}NumPositionsM1, FVectorSize, FQuantTable,
-        FInputPreparedInt8, FInputScaleInt8, FTileSizeD, FTileSizeX,
+      // Quantized weights x int8 input: both operands are codes.
+      // FInputPreparedInt8 was built once by PrepareChunkedForward, before any
+      // chunk was published, so this slice only reads it. Bias + activation run
+      // in the shared tail below. Coded by Claude (AI).
+      DotProductsQuantInt8Input({BStart}0, {BFinish}NumPositionsM1,
         {AStart}StartRange, {AFinish}FinRange);
     end
     else if FQuantInt8 then
@@ -104915,15 +105055,14 @@ begin
   // element range below (FNeurons.Count = output channels/depth).
   FirstElem := StartRange * FNeurons.Count;
   LastElem  := (FinRange + 1) * FNeurons.Count - 1;
-  if ShouldComputeInt8Int8CPU() then
+  if ShouldComputeQuantInt8InputCPU() then
   begin
-    // Int8 x int8: position-sliced twin of ComputeInt8Int8CPU (B range = this
-    // chunk's output positions). FInputPreparedInt8 was built once by
+    // Position-sliced twin of ComputeQuantInt8InputCPU (B range = this chunk's
+    // output positions). FInputPreparedInt8 was built once by
     // PrepareChunkedForward, before any chunk was published. Bias + activation
     // run in the shared tail below. Coded by Claude (AI).
-    FOutputRaw.DotProductsTiledInt8Int8(FNeurons.Count, StartRange, FinRange,
-      FVectorSize, FQuantTable, FInputPreparedInt8, FInputScaleInt8,
-      FTileSizeD, FTileSizeX);
+    DotProductsQuantInt8Input(StartRange, FinRange, {AStart}0,
+      {AFinish}FNeurons.Count - 1);
   end
   else if FQuantInt8 then
   begin
@@ -105191,6 +105330,11 @@ begin
   ApplyActivationFunctionToOutput();
 end;
 
+function TNNetConvolution.SupportsInt4Weights(): boolean;
+begin
+  Result := true;
+end;
+
 function TNNetConvolution.ShouldComputeInt8Int8CPU(): boolean;
 begin
   // The OpenCL forward has its own int8 kernel and reads the FP32
@@ -105202,15 +105346,51 @@ begin
     (FQuantTable.Depth = FVectorSize);
 end;
 
-procedure TNNetConvolution.ComputeInt8Int8CPU();
+function TNNetConvolution.ShouldComputeInt4Int8CPU(): boolean;
+begin
+  // Same pass-stable shape tests as the int8 x int8 verdict, against the Q4_0
+  // container. An int4 layer never reaches the device (EnableOpenCL refuses).
+  Result := FQuantInt4 and Assigned(FInputPreparedInt8) and
+    (not WillOpenCL()) and
+    (FInputPreparedInt8.Depth = FVectorSize) and
+    (FQuantTableInt4.Depth = FVectorSize);
+end;
+
+function TNNetConvolution.ShouldComputeQuantInt8InputCPU(): boolean;
+begin
+  Result := ShouldComputeInt8Int8CPU() or ShouldComputeInt4Int8CPU();
+end;
+
+procedure TNNetConvolution.DotProductsQuantInt8Input(BStart, BFinish, AStart,
+  AFinish: integer);
+begin
+  if FQuantInt4
+  then FOutputRaw.DotProductsTiledInt4Int8(FNeurons.Count, BStart, BFinish,
+    FVectorSize, FQuantTableInt4, FInputPreparedInt8, FInputScaleInt8,
+    FTileSizeD, FTileSizeX, AStart, AFinish)
+  else FOutputRaw.DotProductsTiledInt8Int8(FNeurons.Count, BStart, BFinish,
+    FVectorSize, FQuantTable, FInputPreparedInt8, FInputScaleInt8,
+    FTileSizeD, FTileSizeX, AStart, AFinish);
+end;
+
+procedure TNNetConvolution.ComputeQuantInt8InputCPU();
 begin
   QuantizeInputInt8();
   PrepareInputForConvolutionInt8();
-  FOutputRaw.DotProductsTiledInt8Int8(FNeurons.Count,
-    FOutputSizeX * FOutputSizeY, FVectorSize, FQuantTable,
-    FInputPreparedInt8, FInputScaleInt8, FTileSizeD, FTileSizeX);
+  DotProductsQuantInt8Input({BStart}0,
+    {BFinish}FOutputSizeX * FOutputSizeY - 1, {AStart}0,
+    {AFinish}FNeurons.Count - 1);
   if FSuppressBias = 0 then FOutputRaw.Add(FBiasOutput);
   ApplyActivationFunctionToOutput();
+end;
+
+procedure TNNetConvolution.RaiseWhenInt4WithoutInt8Input();
+begin
+  if FQuantInt4 and (not ShouldComputeInt4Int8CPU()) then
+    raise Exception.Create(ClassName + '.RaiseWhenInt4WithoutInt8Input: layer ' +
+      IntToStr(FLayerIdx) + ' has int4 weights but no usable int8 input ' +
+      'path (call EnableInt8Input; vector size ' + IntToStr(FVectorSize) +
+      '). The FP32 weights were released at quantization time.');
 end;
 
 procedure TNNetConvolutionBase.PrepareInputForConvolutionFast();
@@ -105444,6 +105624,7 @@ begin
     (FFeatureSizeX = 3) and (FFeatureSizeY = 3) and
     (FStride = 1) and
     (not FQuantInt8) and
+    (not FQuantInt4) and
     (not ActiveLowMemory());
 end;
 
@@ -106033,27 +106214,33 @@ begin
   // Pointwise convs: PrepareInputForConvolutionFast is a no-op (FInputPrepared
   // already aliases FPrevLayer.Output), so this just refreshes FInputCopy sizes.
   PrepareForwardPrologue();
-  // Int8 x int8: the chunks read FInputPreparedInt8 only, so the FP32 im2col is
-  // dead work here for the same reason it is in Compute(). Coded by Claude (AI).
-  if ShouldComputeInt8Int8CPU() then
+  // Quantized weights x int8 input: the chunks read FInputPreparedInt8 only, so
+  // the FP32 im2col is dead work here for the same reason it is in Compute().
+  // Coded by Claude (AI).
+  if ShouldComputeQuantInt8InputCPU() then
   begin
     QuantizeInputInt8();
     PrepareInputForConvolutionInt8();
   end
-  else PrepareInputForConvolutionFast();
+  else
+  begin
+    RaiseWhenInt4WithoutInt8Input();
+    PrepareInputForConvolutionFast();
+  end;
   Inc(FForwardCPUCnt);
 end;
 
 procedure TNNetConvolution.Compute();
   procedure ComputeOnCPU;
   begin
+    RaiseWhenInt4WithoutInt8Input();
     if WinogradEligible() then
     begin
       ComputeWinogradCPU();
     end
-    else if ShouldComputeInt8Int8CPU() then
+    else if ShouldComputeQuantInt8InputCPU() then
     begin
-      ComputeInt8Int8CPU();
+      ComputeQuantInt8InputCPU();
     end
     else if FQuantInt8 then
     begin
@@ -106110,7 +106297,7 @@ begin
     {$IFDEF OpenCL}
     // The int8 x int8 CPU forward reads FInputPreparedInt8 only, and its
     // backward pass is refused (FQuantInt8), so the FP32 im2col is dead work.
-    if not (ShouldOpenCLIm2Col() or ShouldComputeInt8Int8CPU())
+    if not (ShouldOpenCLIm2Col() or ShouldComputeQuantInt8InputCPU())
       then PrepareInputForConvolutionFast();
     if WillOpenCL() then
     begin
@@ -106125,7 +106312,7 @@ begin
       ComputeOnCPU;
     end;
     {$ELSE}
-    if not ShouldComputeInt8Int8CPU() then PrepareInputForConvolutionFast();
+    if not ShouldComputeQuantInt8InputCPU() then PrepareInputForConvolutionFast();
     Inc(FForwardCPUCnt);
     ComputeOnCPU;
     {$ENDIF}
@@ -106142,9 +106329,9 @@ var
   StartTime, LocalNow: double;
   MaxError: TNeuralFloat;
 begin
-  if FQuantInt8 then
+  if FQuantInt8 or FQuantInt4 then
     raise Exception.Create('TNNetConvolution.Backpropagate: layer ' +
-      IntToStr(FLayerIdx) + ' has int8-quantized weights (inference-only). ' +
+      IntToStr(FLayerIdx) + ' has quantized weights (inference-only). ' +
       'Rebuild/reload without quantization to train.');
   if ActiveLowMemory() then
     raise Exception.Create('TNNetConvolution.Backpropagate: layer ' +
@@ -131637,6 +131824,30 @@ begin
        (CurrentLayer.ClassType = TNNetTokenAndPositionalEmbedding) then
     begin
       TNNetEmbedding(CurrentLayer).QuantizeWeightsInt8();
+    end;
+  end;
+end;
+
+function TNNet.QuantizeWeightsInt4(): integer;
+var
+  LayerCnt: integer;
+  CurrentLayer: TNNetLayer;
+  LastLayerIdx: integer;
+begin
+  Result := 0;
+  LastLayerIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+  begin
+    CurrentLayer := FLayers[LayerCnt];
+    // Same eligibility predicate as the int8 sweep, so the two cannot drift.
+    // The embedding is skipped: its int4 forward would be a gather, not a dot.
+    if NeuralInt8QuantizableClass(CurrentLayer) and
+      TNNetLayerConcatedWeights(CurrentLayer).SupportsInt4Weights() then
+    begin
+      TNNetLayerConcatedWeights(CurrentLayer).QuantizeWeightsInt4();
+      // Count outcomes, not attempts: a refused layer stays FP32.
+      if TNNetLayerConcatedWeights(CurrentLayer).WeightsQuantizedInt4
+        then Inc(Result);
     end;
   end;
 end;

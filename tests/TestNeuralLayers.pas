@@ -122,6 +122,14 @@ type
     procedure TestConvolutionInt8Int8NotEnabled;
     procedure TestConvolutionInt8Int8ChunkedMatchesSerial;
     procedure TestConvolutionInt8Int8ChunkEligible;
+    // Int4 x int8 convolution forward (Q4_0 weights AND int8 input)
+    procedure TestConvolutionInt4Int8Padded;
+    procedure TestConvolutionInt4Int8Strided;
+    procedure TestConvolutionInt4Int8Pointwise;
+    procedure TestConvolutionInt4Int8FromInt8;
+    procedure TestConvolutionInt4RefusesUnblockedVectorSize;
+    procedure TestConvolutionInt4Int8ChunkedMatchesSerial;
+    procedure TestNetQuantizeWeightsInt4CountsConvertedLayers;
     procedure TestDeconvolutionNeverChunkEligible;
     // Int8 input arming at net level and on TNNetFullConnect
     procedure TestNetEnableInt8InputCountsQuantizedLayers;
@@ -4210,6 +4218,416 @@ begin
     NN.DisableInt8Input();
     AssertTrue('A conv without an int8 input stays chunk-eligible',
       Conv.ChunkEligible());
+  finally
+    NN.Free;
+  end;
+end;
+
+// Rounds every neuron's weights onto the Q4_0 grid in place, so a plain FP32
+// forward reproduces exactly the weights the int4 kernel reads.
+procedure RoundConvWeightsToInt4(Conv: TNNetConvolution);
+var
+  RoundTrip: TNNetVolumeQuant4;
+  NeuronCnt, MaxNeuronPos: integer;
+  W: TNNetVolume;
+begin
+  RoundTrip := TNNetVolumeQuant4.Create(1, 1, Conv.Neurons[0].Weights.Size);
+  try
+    MaxNeuronPos := Conv.Neurons.Count - 1;
+    for NeuronCnt := 0 to MaxNeuronPos do
+    begin
+      W := Conv.Neurons[NeuronCnt].Weights;
+      RoundTrip.QuantizeRow(0, 0, TNeuralFloatArrPtr(@W.FData[0]));
+      RoundTrip.DequantizeRowTo(0, 0, TNeuralFloatArrPtr(@W.FData[0]));
+    end;
+  finally
+    RoundTrip.Free;
+  end;
+  Conv.FlushWeightCache();
+end;
+
+// Sum of the absolute weights of one neuron. Read it while the FP32 rows still
+// exist - QuantizeWeightsInt4 releases them.
+function ConvWeightAbsSum(Conv: TNNetConvolution;
+  NeuronIdx: integer): TNeuralFloat;
+var
+  W: TNNetVolume;
+  WeightCnt, MaxWeightPos: integer;
+begin
+  W := Conv.Neurons[NeuronIdx].Weights;
+  MaxWeightPos := W.Size - 1;
+  Result := 0;
+  for WeightCnt := 0 to MaxWeightPos do
+    Result := Result + Abs(W.FData[WeightCnt]);
+end;
+
+// Runs three convolution forwards on one net - FP32, FP32 with the weights
+// rounded onto the Q4_0 grid, and int4 x int8 - and checks the int4 x int8
+// output against both. pFromInt8 takes the layer through the int8 container
+// first (the direct-load route: int8 codes dequantized and requantized).
+procedure AssertInt4Int8ConvMatches(NN: TNNet; Conv: TNNetConvolution;
+  Input: TNNetVolume; const TestName: string; pFromInt8: boolean);
+var
+  FP32Output, Int4WeightOutput: TNNetVolume;
+  Bounds: TNeuralFloatDynArr;
+  NeuronCnt, MaxNeuronPos: integer;
+  RawPos, MaxRawPos: integer;
+  MaxAbsFP32, MaxAbsDiff, SumSqDiff, SumSqFP32: TNeuralFloat;
+begin
+  FP32Output := TNNetVolume.Create();
+  Int4WeightOutput := TNNetVolume.Create();
+  try
+    FillInt8ConvWeights(Conv);
+    NN.Compute(Input);
+    FP32Output.Copy(Conv.Output);
+
+    // Reference with the exact weights the int4 kernel will read.
+    RoundConvWeightsToInt4(Conv);
+    NN.Compute(Input);
+    Int4WeightOutput.Copy(Conv.Output);
+
+    MaxNeuronPos := Conv.Neurons.Count - 1;
+    SetLength(Bounds, Conv.Neurons.Count);
+    for NeuronCnt := 0 to MaxNeuronPos do
+      Bounds[NeuronCnt] := ConvWeightAbsSum(Conv, NeuronCnt);
+
+    if pFromInt8 then
+    begin
+      TNNetLayerConcatedWeights(Conv).QuantizeWeightsInt8();
+      TAssert.AssertTrue(TestName + ': weights are int8 first',
+        Conv.WeightsQuantizedInt8);
+    end;
+    TNNetLayerConcatedWeights(Conv).QuantizeWeightsInt4();
+    TAssert.AssertTrue(TestName + ': weights are int4',
+      Conv.WeightsQuantizedInt4);
+    TAssert.AssertTrue(TestName + ': the int8 container is released',
+      not Conv.WeightsQuantizedInt8);
+    TAssert.AssertTrue(TestName + ': QuantizeWeightsInt4 arms the int8 input',
+      Conv.InputCopyInt8 <> nil);
+
+    // The int4 x int8 forward must not read the FP32 im2col at all. On a
+    // pointwise convolution FInputPrepared IS the previous layer's output, so
+    // clearing it there would clear the input itself.
+    if not Conv.Pointwise then Conv.InputPrepared.Fill(0);
+    NN.Compute(Input);
+    if not Conv.Pointwise then
+    begin
+      MaxRawPos := Conv.InputPrepared.Size - 1;
+      for RawPos := 0 to MaxRawPos do
+        TAssert.AssertTrue(TestName + ': the FP32 im2col stays unbuilt at ' +
+          IntToStr(RawPos), Conv.InputPrepared.FData[RawPos] = 0);
+    end;
+
+    // Against the Q4_0-rounded FP32 reference only the INPUT was quantized, so
+    // every tap is off by at most half an input step: the exact worst case is
+    // 0.5*InputScale*sum|w| (plus float-accumulation slack). A double
+    // quantization (int8 then int4) moves the weights themselves, so its
+    // reference is the FP32 output and the relative check below.
+    if not pFromInt8 then
+    begin
+      for NeuronCnt := 0 to MaxNeuronPos do
+        Bounds[NeuronCnt] := 0.5 * Conv.InputScaleInt8 * Bounds[NeuronCnt] + 1e-4;
+      MaxRawPos := Conv.Output.Size - 1;
+      for RawPos := 0 to MaxRawPos do
+      begin
+        NeuronCnt := RawPos mod Conv.Output.Depth;
+        TAssert.AssertTrue(TestName + ': output ' + IntToStr(RawPos) +
+          ' int4 x int8 ' + FloatToStr(Conv.Output.FData[RawPos]) +
+          ' vs int4 weights ' + FloatToStr(Int4WeightOutput.FData[RawPos]) +
+          ' exceeds bound ' + FloatToStr(Bounds[NeuronCnt]),
+          Abs(Conv.Output.FData[RawPos] - Int4WeightOutput.FData[RawPos]) <=
+            Bounds[NeuronCnt]);
+      end;
+    end;
+
+    MaxRawPos := Conv.Output.Size - 1;
+    MaxAbsFP32 := 0;
+    MaxAbsDiff := 0;
+    SumSqDiff := 0;
+    SumSqFP32 := 0;
+    for RawPos := 0 to MaxRawPos do
+    begin
+      if Abs(FP32Output.FData[RawPos]) > MaxAbsFP32
+        then MaxAbsFP32 := Abs(FP32Output.FData[RawPos]);
+      if Abs(Conv.Output.FData[RawPos] - FP32Output.FData[RawPos]) > MaxAbsDiff
+        then MaxAbsDiff := Abs(Conv.Output.FData[RawPos] - FP32Output.FData[RawPos]);
+      SumSqDiff := SumSqDiff +
+        Sqr(Conv.Output.FData[RawPos] - FP32Output.FData[RawPos]);
+      SumSqFP32 := SumSqFP32 + Sqr(FP32Output.FData[RawPos]);
+    end;
+    TAssert.AssertTrue(TestName + ': FP32 reference must be non-trivial',
+      MaxAbsFP32 > 0.1);
+    // Q4_0 spreads 16 codes over a block whose largest magnitude maps to -8, so
+    // the step is blockmax/8 and a uniform rounding error has standard deviation
+    // blockmax/(8*sqrt(12)) ~ 0.036*blockmax per weight - a relative L2 output
+    // error of 8% here (0.075..0.095 measured over these four shapes).
+    TAssert.AssertTrue(TestName + ': relative L2 error ' +
+      FloatToStr(Sqrt(SumSqDiff / SumSqFP32)) + ' (max abs diff ' +
+      FloatToStr(MaxAbsDiff) + ' over max abs output ' +
+      FloatToStr(MaxAbsFP32) + ') exceeds 12%',
+      Sqrt(SumSqDiff / SumSqFP32) <= 0.12);
+  finally
+    FP32Output.Free;
+    Int4WeightOutput.Free;
+  end;
+end;
+
+// One int4-quantized convolution with an int8 input, built the same way twice
+// so a chunked forward can be compared against the serial one.
+function BuildInt4Int8ConvNet(pInputX, pInputY, pDepth, pNeurons,
+  pFeatureSize, pPadding, pStride: integer;
+  out Conv: TNNetConvolutionLinear): TNNet;
+begin
+  Result := TNNet.Create();
+  Result.AddLayer(TNNetInput.Create(pInputX, pInputY, pDepth));
+  Conv := TNNetConvolutionLinear.Create(pNeurons, pFeatureSize, pPadding, pStride);
+  Result.AddLayer(Conv);
+  FillInt8ConvWeights(Conv);
+  TNNetLayerConcatedWeights(Conv).QuantizeWeightsInt4();
+  Result.SetTrainable(False);
+end;
+
+// The chunked int4 x int8 forward against the serial one on an identical net.
+// Same kernel and same per-output reduction order, so parity is BIT-exact.
+procedure AssertInt4Int8ChunkParity(pInputX, pInputY, pDepth, pNeurons,
+  pFeatureSize, pPadding, pStride: integer; const TestName: string);
+var
+  SerialNN, ChunkNN: TNNet;
+  Input, SerialOutput: TNNetVolume;
+  SerialConv, ChunkConv: TNNetConvolutionLinear;
+  RawPos, MaxRawPos: integer;
+begin
+  Input := TNNetVolume.Create(pInputX, pInputY, pDepth);
+  SerialOutput := TNNetVolume.Create();
+  SerialNN := nil;
+  ChunkNN := nil;
+  try
+    FillInt8ConvInput(Input);
+    SerialNN := BuildInt4Int8ConvNet(pInputX, pInputY, pDepth, pNeurons,
+      pFeatureSize, pPadding, pStride, SerialConv);
+    SerialNN.Compute(Input);
+    SerialOutput.Copy(SerialConv.Output);
+    TAssert.AssertTrue(TestName + ': serial reference is non-trivial',
+      SerialOutput.GetMaxAbs() > 1e-3);
+
+    ChunkNN := BuildInt4Int8ConvNet(pInputX, pInputY, pDepth, pNeurons,
+      pFeatureSize, pPadding, pStride, ChunkConv);
+    // The chunk verdict belongs BEFORE the pass: a single-core box would turn
+    // intra-layer threading back off and the parity check would prove nothing.
+    ChunkNN.EnableIntraLayerThreading(true);
+    TAssert.AssertTrue(TestName + ': conv is chunk-eligible',
+      ChunkConv.ChunkEligible());
+    if not ChunkConv.Pointwise then ChunkConv.InputPrepared.Fill(0);
+    ChunkNN.SchedulerMinGain := 0;
+    ChunkNN.Compute(Input, 0, {Parallel=}True);
+
+    if not ChunkConv.Pointwise then
+    begin
+      MaxRawPos := ChunkConv.InputPrepared.Size - 1;
+      for RawPos := 0 to MaxRawPos do
+        TAssert.AssertTrue(TestName + ': the FP32 im2col stays unbuilt at ' +
+          IntToStr(RawPos), ChunkConv.InputPrepared.FData[RawPos] = 0);
+    end;
+    TAssert.AssertEquals(TestName + ': output size', SerialOutput.Size,
+      ChunkConv.Output.Size);
+    MaxRawPos := SerialOutput.Size - 1;
+    for RawPos := 0 to MaxRawPos do
+      TAssert.AssertTrue(TestName + ': chunked output ' + IntToStr(RawPos) +
+        ' ' + FloatToStr(ChunkConv.Output.FData[RawPos]) +
+        ' must be bit-identical to serial ' +
+        FloatToStr(SerialOutput.FData[RawPos]),
+        ChunkConv.Output.FData[RawPos] = SerialOutput.FData[RawPos]);
+  finally
+    SerialNN.Free;
+    ChunkNN.Free;
+    Input.Free;
+    SerialOutput.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestConvolutionInt4Int8Padded;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Conv: TNNetConvolutionReLU;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 32);
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 32));
+    // 3*3*32 = 288 weights per neuron: 9 Q4_0 blocks.
+    Conv := TNNetConvolutionReLU.Create(5, 3, 1, 1);
+    NN.AddLayer(Conv);
+    FillInt8ConvInput(Input);
+    AssertInt4Int8ConvMatches(NN, Conv, Input, 'Padded int4 x int8 conv',
+      {pFromInt8=}False);
+    AssertEquals('Padded int4 x int8 output SizeX', 8, Conv.Output.SizeX);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestConvolutionInt4Int8Strided;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Conv: TNNetConvolutionLinear;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 32);
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 32));
+    Conv := TNNetConvolutionLinear.Create(5, 3, 0, 2);
+    NN.AddLayer(Conv);
+    FillInt8ConvInput(Input);
+    AssertInt4Int8ConvMatches(NN, Conv, Input, 'Strided int4 x int8 conv',
+      {pFromInt8=}False);
+    AssertEquals('Strided int4 x int8 output SizeX', 3, Conv.Output.SizeX);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayers.TestConvolutionInt4Int8Pointwise;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Conv: TNNetConvolutionLinear;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 64);
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 64));
+    Conv := TNNetConvolutionLinear.Create(5, 1, 0, 1);
+    NN.AddLayer(Conv);
+    FillInt8ConvInput(Input);
+    AssertTrue('1x1 conv must be pointwise', Conv.Pointwise);
+    AssertInt4Int8ConvMatches(NN, Conv, Input, 'Pointwise int4 x int8 conv',
+      {pFromInt8=}False);
+    AssertTrue('Pointwise int8 im2col aliases the int8 input copy',
+      Conv.InputPreparedInt8 = Conv.InputCopyInt8);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// The direct-load route: an already int8-quantized layer converted to int4
+// through a per-row dequantize/requantize.
+procedure TTestNeuralLayers.TestConvolutionInt4Int8FromInt8;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Conv: TNNetConvolutionReLU;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 32);
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 32));
+    Conv := TNNetConvolutionReLU.Create(5, 3, 1, 1);
+    NN.AddLayer(Conv);
+    FillInt8ConvInput(Input);
+    AssertInt4Int8ConvMatches(NN, Conv, Input, 'Int8-then-int4 conv',
+      {pFromInt8=}True);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// A weight row that is not a multiple of 32 has no Q4_0 layout: the layer must
+// stay FP32 and keep computing exactly as before.
+procedure TTestNeuralLayers.TestConvolutionInt4RefusesUnblockedVectorSize;
+var
+  NN: TNNet;
+  Input, BeforeOutput: TNNetVolume;
+  Conv: TNNetConvolutionReLU;
+  RawPos, MaxRawPos: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(8, 8, 3);
+  BeforeOutput := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 3));
+    // 3*3*3 = 27 weights per neuron.
+    Conv := TNNetConvolutionReLU.Create(5, 3, 1, 1);
+    NN.AddLayer(Conv);
+    FillInt8ConvInput(Input);
+    FillInt8ConvWeights(Conv);
+    NN.Compute(Input);
+    BeforeOutput.Copy(Conv.Output);
+
+    AssertEquals('Refused vector size', 27, Conv.Neurons[0].Weights.Size);
+    TNNetLayerConcatedWeights(Conv).QuantizeWeightsInt4();
+    AssertTrue('A 27-element row is not int4 quantizable',
+      not Conv.WeightsQuantizedInt4);
+    AssertTrue('The refused layer keeps its FP32 weights',
+      Conv.Neurons[0].Weights.Size = 27);
+    AssertTrue('The refused layer has no int8 input copy',
+      Conv.InputCopyInt8 = nil);
+
+    NN.Compute(Input);
+    MaxRawPos := Conv.Output.Size - 1;
+    for RawPos := 0 to MaxRawPos do
+      AssertTrue('Refused-layer output ' + IntToStr(RawPos) + ' is unchanged',
+        BeforeOutput.FData[RawPos] = Conv.Output.FData[RawPos]);
+  finally
+    NN.Free;
+    Input.Free;
+    BeforeOutput.Free;
+  end;
+end;
+
+// Both chunk axes of the int4 x int8 forward: spatial positions (a padded 3x3
+// and a pointwise conv over an 8x8 grid) and output neurons (a single-position
+// pointwise conv, the transformer decode shape).
+procedure TTestNeuralLayers.TestConvolutionInt4Int8ChunkedMatchesSerial;
+begin
+  AssertInt4Int8ChunkParity(8, 8, 32, 5, 3, 1, 1, 'Padded int4 x int8 chunk');
+  AssertInt4Int8ChunkParity(8, 8, 64, 5, 1, 0, 1, 'Pointwise int4 x int8 chunk');
+  AssertInt4Int8ChunkParity(1, 1, 64, 32, 1, 0, 1,
+    'Single-position int4 x int8 chunk');
+end;
+
+// TNNet.QuantizeWeightsInt4 counts the layers it converted, not the ones it
+// tried: a row size that is not a multiple of 32 and a layer class without an
+// int4 forward are both refused.
+procedure TTestNeuralLayers.TestNetQuantizeWeightsInt4CountsConvertedLayers;
+var
+  NN: TNNet;
+  ConvUnblocked, ConvBlocked: TNNetConvolutionReLU;
+  Pointwise: TNNetPointwiseConvLinear;
+  FullConnect: TNNetFullConnectLinear;
+begin
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(8, 8, 3));
+    // 3*3*3 = 27: refused. Its 32 outputs then give the next conv 3*3*32 = 288.
+    ConvUnblocked := TNNetConvolutionReLU.Create(32, 3, 1, 1);
+    NN.AddLayer(ConvUnblocked);
+    ConvBlocked := TNNetConvolutionReLU.Create(64, 3, 1, 1);
+    NN.AddLayer(ConvBlocked);
+    // 64 weights per neuron.
+    Pointwise := TNNetPointwiseConvLinear.Create(6);
+    NN.AddLayer(Pointwise);
+    // 8*8*6 = 384, a multiple of 32, but TNNetFullConnect has no int4 forward.
+    FullConnect := TNNetFullConnectLinear.Create(6);
+    NN.AddLayer(FullConnect);
+    NN.SetTrainable(False);
+
+    AssertEquals('Converted int4 layer count', 2, NN.QuantizeWeightsInt4());
+    AssertTrue('The 27-element convolution stays FP32',
+      not ConvUnblocked.WeightsQuantizedInt4);
+    AssertTrue('The 288-element convolution is int4',
+      ConvBlocked.WeightsQuantizedInt4);
+    AssertTrue('The pointwise convolution is int4',
+      Pointwise.WeightsQuantizedInt4);
+    AssertTrue('A fully connected layer has no int4 forward',
+      not FullConnect.WeightsQuantizedInt4);
+    AssertEquals('Re-running the sweep counts the same layers', 2,
+      NN.QuantizeWeightsInt4());
   finally
     NN.Free;
   end;
