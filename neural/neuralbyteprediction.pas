@@ -244,9 +244,11 @@ type
       searchedNeuronsCnt: longint): extended;
 
     // Returns the neuron group score. Better neurons survive.
-    function GetNeuronGroupScore(neuronPos: longint): extended;
+    function GetNeuronGroupScore(neuronPos: longint): longint;
 
-    function EvalNeuronGroup(NG: TNeuronGroup; var ABF: TRunOperation): byte;
+    // NG is passed by reference: TNeuronGroup embeds a csMaxTests-wide operation
+    // array, so a by-value copy would be ~500 bytes per call on a search loop.
+    function EvalNeuronGroup(var NG: TNeuronGroup; var ABF: TRunOperation): byte;
 
     function GetBestNeuronIndex
       (var posBest: longint; Num: longint;
@@ -282,13 +284,19 @@ type
     FNextFreePos: integer;
     FNumClasses: integer;
     FRandomProbability: single;
+    // Per-class score accumulator, sized once in AddClassifier and only
+    // re-zeroed by PredictClass.
+    FPossibleStates: array of single;
   public
     procedure AddClassifier(NumClasses, NumStates: integer);
+    // Stores one labeled training state and returns its index, or -1 when the
+    // NumStates capacity given to AddClassifier is already full.
     function AddState(pLabel: integer; pState: array of byte): integer;
     function EvolveNeuronGroup(var NG: TNeuronGroup): integer;
     function EvolveNeuronGroupAtPos(neuronpos: integer): integer;
     function NeuronGroupFitness(var NG: TNeuronGroup): single;
-    function MutateNeuronGroup(NG: TNeuronGroup): TNeuronGroup;
+    // Mutates NG in place; the record is too large to copy in and out.
+    procedure MutateNeuronGroup(var NG: TNeuronGroup);
     procedure CreateRandomNeuronGroup(neuronpos, pClass: integer);
     function PredictClass(PActions: array of byte): byte;
   end;
@@ -365,16 +373,28 @@ begin
   FNumClasses := NumClasses;
   FRandomProbability := 1/FNumClasses;
   SetLength(FStates, NumStates);
+  SetLength(FPossibleStates, FNumClasses);
 end;
 
 function TClassifier.AddState(pLabel: integer; pState: array of byte): integer;
 var
   CurrentState, NextState: array[0..0] of byte;
 begin
+  // The state array is sized once by AddClassifier and never grows: the neuron
+  // groups sample it by index, so a reallocation would move states under them.
+  // Report a full classifier with -1 instead of writing past the end.
+  if (FNextFreePos < 0) or (FNextFreePos >= Length(FStates)) then
+  begin
+    Result := -1;
+    exit;
+  end;
+
   CurrentState[0] := 0;
   NextState[0] := pLabel;
+  FStates[FNextFreePos].FLabel := byte(pLabel);
   FStates[FNextFreePos].FTester.Load(FCS, pState, CurrentState, NextState);
 
+  Result := FNextFreePos;
   Inc(FNextFreePos);
 end;
 
@@ -390,17 +410,20 @@ begin
   //Write(' Start:', NG.CorrectNeuronPredictionCnt,'x',BaseScore:6:4, ' Size:', NG.TestNeuronLayer.N);
   for MutationCount := 1 to 10 do
   begin
-    Mutaded := Self.MutateNeuronGroup(NG);
+    Mutaded := NG;
+    Self.MutateNeuronGroup(Mutaded);
     NewScore := Self.NeuronGroupFitness(Mutaded);
 
     if (NewScore > BaseScore) and (Mutaded.CorrectNeuronPredictionCnt > FCS.MinSampleForPrediction) then
     begin
+      // First-improvement hill climbing: the first mutation that beats the
+      // current score is accepted and the search stops. Result carries the
+      // number of attempts it took, or -1 when the budget ran out unimproved.
       NG := Mutaded;
       Result := MutationCount;
       //WriteLn(' Better: ', Mutaded.CorrectNeuronPredictionCnt,'x',
         //NewScore:6:4, ' Exit@: ', MutationCount);
-      BaseScore := NewScore;
-      if (MutationCount>0) then exit;
+      exit;
     end;
   end;
   //WriteLn(' Not Found!!!');
@@ -448,7 +471,7 @@ begin
   end;
 end;
 
-function TClassifier.MutateNeuronGroup(NG: TNeuronGroup): TNeuronGroup;
+procedure TClassifier.MutateNeuronGroup(var NG: TNeuronGroup);
 var
   MutationType: byte;
 begin
@@ -494,8 +517,6 @@ begin
   begin
     NG.TestNeuronLayer.TestThreshold := NG.TestNeuronLayer.N;
   end;
-
-  Result := NG;
 end;
 
 procedure TClassifier.CreateRandomNeuronGroup(neuronpos, pClass: integer
@@ -510,28 +531,24 @@ end;
 
 function TClassifier.PredictClass(PActions: array of byte): byte;
 var
-  I: word;
+  I: longint;
   ABF: TRunOperation;
   Probability, Best: single;
   NextState: byte;
   PredictionPosition: integer;
   PCurrentStates, PNextStates: array[0..0] of byte;
-  PossibleStates: array of single;
   Hi: longint;
   MaxIdx: longint;
   NGP: ^TNeuronGroup;   // bind FNN[I] once per iteration (rule #4)
 begin
   PCurrentStates[0] := 0;
   PNextStates[0] := 0;
-  SetLength(PossibleStates, FNumClasses);
 
   ABF.Load(FCS, PActions, PCurrentStates, PNextStates);
 
-  Hi := High(PossibleStates);
-  for i := Low(PossibleStates) to Hi do
-  begin
-    PossibleStates[I] := 0;
-  end;
+  Hi := FNumClasses - 1;
+  // A single 0 fill: 0.0 as single is an all-zero bit pattern.
+  if FNumClasses > 0 then FillDWord(FPossibleStates[0], FNumClasses, 0);
 
   MaxIdx := FMaxOperationNeuronCount - 1;
   for I := 0 to MaxIdx do
@@ -549,7 +566,7 @@ begin
       begin
         ABF.OperateAndTestOperation(
           NGP^.OperationNeuronLayer, PredictionPosition, NextState);
-        PossibleStates[NextState] := (Probability - FRandomProbability) + PossibleStates[NextState];
+        FPossibleStates[NextState] := (Probability - FRandomProbability) + FPossibleStates[NextState];
       end;// of if
     end;
   end;// of for
@@ -558,14 +575,13 @@ begin
   Result := 0;
   for i := 0 to Hi do
   begin
-    //Write(' ',PossibleStates[I]:6:4 );
-    if ( PossibleStates[I] > Best ) then
+    //Write(' ',FPossibleStates[I]:6:4 );
+    if ( FPossibleStates[I] > Best ) then
     begin
-      Best := PossibleStates[I];
+      Best := FPossibleStates[I];
       Result := I;
     end;
   end;
-  SetLength(PossibleStates,0);
   //WriteLn(' Best:', Result);
 end;// of procedure PredProb
 
@@ -587,7 +603,7 @@ var
   T: longint;
 begin
   T := WrongNeuronPredictionCnt + CorrectNeuronPredictionCnt;
-  GetD := (CorrectNeuronPredictionCnt / (T + 2));
+  GetD := ((CorrectNeuronPredictionCnt + 1) / (T + 2));
 end;
 
 function TNeuronGroupBase.ToString: string;
@@ -993,7 +1009,7 @@ begin
   end;
 end;
 
-function TStatePredictionClass.EvalNeuronGroup(NG: TNeuronGroup;
+function TStatePredictionClass.EvalNeuronGroup(var NG: TNeuronGroup;
   var ABF: TRunOperation): byte;
 var
   Effect: byte;
@@ -1003,9 +1019,11 @@ begin
     NG.PredictionPos, Effect);
 end;
 
-function TStatePredictionClass.GetNeuronGroupScore(neuronPos: longint): extended;
+// The score is a victory count (or the -100 empty-group sentinel), so it is
+// exact in longint; no need to widen to extended just to compare.
+function TStatePredictionClass.GetNeuronGroupScore(neuronPos: longint): longint;
 var
-  R: extended;
+  R: longint;
 begin
   if (FNN[neuronPos].TestNeuronLayer.N = 0) then
     R := -100
@@ -1021,7 +1039,7 @@ function TStatePredictionClass.GetWorstNeuronIndex(var posWorst: longint;
   searchedNeuronsCnt: longint): extended;
 var
   I, neuronPos: longint;
-  Actual, worst: extended;
+  Actual, worst: longint;
 begin
   posWorst := random(FMaxOperationNeuronCount);
   worst := GetNeuronGroupScore(posWorst);
@@ -1287,7 +1305,7 @@ procedure TStatePredictionClass.Prediction(
   var pVictoryIndex: array of longint  { index of victorious neuron });
 
 var
-  I, J, MaxIndex: word;
+  I, J, MaxIndex: longint;
   ABF: TRunOperation;
   Probability, TotalCount, relP: single;
   NextState: byte;
@@ -1348,12 +1366,9 @@ begin
       begin
         ABF.OperateAndTestOperation(NGP^.OperationNeuronLayer,
           PredictionPos, NextState);
-        if (Probability > relP) then
-        begin
-          PNextStates[PredictionPos] := NextState;
-          pRelationProbability[PredictionPos] := Probability;
-          pVictoryIndex[PredictionPos] := I;
-        end;
+        PNextStates[PredictionPos] := NextState;
+        pRelationProbability[PredictionPos] := Probability;
+        pVictoryIndex[PredictionPos] := I;
       end;// of if
     end; // of probability if
   end;// of for
@@ -1365,7 +1380,7 @@ procedure TStatePredictionClass.PredictionProbability(
   {output}var pRelationProbability: array of single; {probabilidades}
   var pVictoryIndex: array of longint  { posicao do vitorioso});
 var
-  I: word;
+  I: longint;
   ABF: TRunOperation;
   Probability, TotalCount: single;
   NextState: byte;

@@ -38,6 +38,22 @@ type
     procedure TestSaturatingAndShiftOps;
     // Division and modulo by zero leave the next state at its initial value.
     procedure TestDivModByZeroIsInert;
+    // The bidimensional position of (X,Y) strides by the image width.
+    procedure TestMake2DStridesByImageWidth;
+    // Operand positions are bounded against the array they are read from:
+    // Actions when RunOnAction is set, CurrentStates otherwise.
+    procedure TestOperandsBoundedByTheirOwnArray;
+    // The operand-free opcodes run even when there is no action at all.
+    procedure TestOperandFreeOpsWithoutActions;
+    // Equal-test creation stops at the configured MaxTests, not at the
+    // csMaxTests ceiling.
+    procedure TestEqualTestsRespectMaxTests;
+    // The non-zero equal-test variant obeys the same two caps: the configured
+    // MaxTests and the number of non-zero states.
+    procedure TestNonZeroEqualTestsRespectMaxTests;
+    // The bidimensional scan reports a match at position 0 as a match; that
+    // window is reachable whenever FeatureSize is 0.
+    procedure TestConvolutedMatchAtOrigin;
   end;
 
 implementation
@@ -118,6 +134,258 @@ begin
   // CurrentStates[20] = 235; 245 div 235 = 1, 245 mod 235 = 10.
   AssertEquals('div', 1, NextStateOf(csDiv, 10, 20, 0));
   AssertEquals('mod', 10, NextStateOf(csMod, 10, 20, 0));
+end;
+
+procedure TTestNeuralABFun.TestMake2DStridesByImageWidth;
+var
+  Engine: TRunOperation;
+  Settings: TCreateOperationSettings;
+  Actions, CurrentStates, NextStates: array of byte;
+  X, Y: integer;
+begin
+  Settings := csCreateOpImageProcessing;
+  Settings.ImageSizeX := 8;
+  Settings.ImageSizeY := 4;
+  SetLength(Actions, Settings.ImageSizeX * Settings.ImageSizeY);
+  SetLength(CurrentStates, Settings.ImageSizeX * Settings.ImageSizeY);
+  SetLength(NextStates, Settings.ImageSizeX * Settings.ImageSizeY);
+  Engine.Load(Settings, Actions, CurrentStates, NextStates);
+
+  // A step along X is one element; a step along Y is one full row of 8.
+  AssertEquals('origin', 0, Engine.Make2D(0, 0));
+  AssertEquals('x step', 3, Engine.Make2D(3, 0));
+  AssertEquals('y step', 8, Engine.Make2D(0, 1));
+  AssertEquals('x and y', 19, Engine.Make2D(3, 2));
+  // Every pixel of the non-square image must map to a distinct position inside
+  // the array; the last one is exactly the last element.
+  AssertEquals('last pixel',
+    Settings.ImageSizeX * Settings.ImageSizeY - 1,
+    Engine.Make2D(Settings.ImageSizeX - 1, Settings.ImageSizeY - 1));
+  for Y := 0 to Settings.ImageSizeY - 1 do
+    for X := 0 to Settings.ImageSizeX - 1 do
+      AssertEquals('pixel '+IntToStr(X)+','+IntToStr(Y),
+        Y * Settings.ImageSizeX + X, Engine.Make2D(X, Y));
+end;
+
+procedure TTestNeuralABFun.TestOperandsBoundedByTheirOwnArray;
+var
+  Engine: TRunOperation;
+  Actions, CurrentStates, NextStates: array of byte;
+  Oper: TOperation;
+  NextState: byte;
+  I: integer;
+begin
+  // Deliberately mismatched lengths: 4 actions against 16 current states.
+  SetLength(Actions, 4);
+  SetLength(CurrentStates, 16);
+  SetLength(NextStates, 16);
+  for I := 0 to 3 do Actions[I] := I + 1;
+  for I := 0 to 15 do
+  begin
+    CurrentStates[I] := I + 100;
+    NextStates[I] := 0;
+  end;
+  Engine.Load(csCreateOpDefault, Actions, CurrentStates, NextStates);
+
+  // RunOnAction is false, so the operands index CurrentStates: 10 and 12 are
+  // valid there even though both are past the end of the action array.
+  Oper := CreateOperation(csAdd, 10, 12, False, False, False);
+  NextState := 0;
+  Engine.OperateAndTestOperation(Oper, 0, NextState);
+  AssertEquals('state operands past the action count', (110 + 112) and 255,
+    NextState);
+
+  // The same positions read as actions are out of range and must be rejected.
+  Oper := CreateOperation(csAdd, 10, 12, False, False, True);
+  NextState := 0;
+  AssertEquals('action operands past the action count', 0,
+    Engine.OperateAndTestOperation(Oper, 0, NextState));
+  AssertEquals('rejected operation produces no state', 0, NextState);
+
+  // Actions[1] + Actions[2] = 2 + 3, to show the action path still works.
+  Oper := CreateOperation(csAdd, 1, 2, False, False, True);
+  NextState := 0;
+  Engine.OperateAndTestOperation(Oper, 0, NextState);
+  AssertEquals('action operands in range', 5, NextState);
+end;
+
+procedure TTestNeuralABFun.TestOperandFreeOpsWithoutActions;
+var
+  Engine: TRunOperation;
+  Actions, CurrentStates, NextStates: array of byte;
+  Oper: TOperation;
+  NextState: byte;
+  I: integer;
+begin
+  SetLength(Actions, 0);
+  SetLength(CurrentStates, 4);
+  SetLength(NextStates, 4);
+  for I := 0 to 3 do
+  begin
+    CurrentStates[I] := 10 * I;
+    NextStates[I] := 0;
+  end;
+  Engine.Load(csCreateOpDefault, Actions, CurrentStates, NextStates);
+
+  // None of these read an operand, so an empty action array cannot block them.
+  Oper := CreateOperation(csInc, 0, 0, False, False, False);
+  NextState := 0;
+  Engine.OperateAndTestOperation(Oper, 1, NextState);
+  AssertEquals('inc without actions', 11, NextState);
+
+  Oper := CreateOperation(csNot, 0, 0, False, False, False);
+  NextState := 0;
+  Engine.OperateAndTestOperation(Oper, 1, NextState);
+  AssertEquals('not without actions', 245, NextState);
+
+  Oper := CreateOperation(csInj, 0, 0, False, False, False);
+  NextState := 0;
+  Engine.OperateAndTestOperation(Oper, 2, NextState);
+  AssertEquals('inj without actions', 20, NextState);
+
+  Oper := CreateOperation(csSet, 42, 0, False, False, False);
+  NextState := 0;
+  Engine.OperateAndTestOperation(Oper, 0, NextState);
+  AssertEquals('set without actions', 42, NextState);
+
+  // csTrue is a test opcode, so it returns its own next state.
+  Oper := CreateOperation(csTrue, 0, 0, False, False, False);
+  NextState := 0;
+  AssertEquals('true without actions', 1,
+    Engine.OperateAndTestOperation(Oper, 0, NextState));
+end;
+
+procedure TTestNeuralABFun.TestEqualTestsRespectMaxTests;
+var
+  Creator: TCreateValidOperations;
+  Settings: TCreateOperationSettings;
+  Actions, CurrentStates, NextStates, Errors: array of byte;
+  I: integer;
+begin
+  // Only equal tests, read from the action array: every equal test compares a
+  // value against the position it was read from, so it always holds and is
+  // always included. The operation count is therefore the loop bound itself.
+  Settings := csCreateOpSimplest;
+  Settings.AddBinaryTest := False;
+  Settings.AddTrueTest := False;
+  Settings.MaxTests := 5;
+  SetLength(Actions, 20);
+  SetLength(CurrentStates, 20);
+  SetLength(NextStates, 20);
+  SetLength(Errors, 20);
+  for I := 0 to 19 do
+  begin
+    Actions[I] := I + 1;
+    CurrentStates[I] := I + 1;
+    NextStates[I] := 0;
+    Errors[I] := 0;
+  end;
+
+  Creator.Load(Settings, Actions, CurrentStates, NextStates);
+  Creator.LoadCreationData(0);
+  Creator.Create(True, True, Errors);
+  AssertEquals('equal tests capped at MaxTests', integer(Settings.MaxTests),
+    Creator.GetCount());
+
+  // With more tests allowed than there are states, the state count is the cap.
+  Settings.MaxTests := csMaxTests;
+  Creator.Load(Settings, Actions, CurrentStates, NextStates);
+  Creator.LoadCreationData(0);
+  Creator.Create(True, True, Errors);
+  AssertEquals('equal tests capped at the state count', Length(Actions),
+    Creator.GetCount());
+end;
+
+procedure TTestNeuralABFun.TestNonZeroEqualTestsRespectMaxTests;
+var
+  Creator: TCreateValidOperations;
+  Settings: TCreateOperationSettings;
+  Actions, CurrentStates, NextStates, Errors: array of byte;
+  I: integer;
+begin
+  // FullEqual off (and not bidimensional) selects the non-zero variant, which
+  // draws only from the non-zero positions. Every action here is non-zero and
+  // equal to the value at the position it is read from, so each drawn test
+  // holds and is included: the operation count is the loop bound itself.
+  Settings := csCreateOpSimplest;
+  Settings.AddBinaryTest := False;
+  Settings.AddTrueTest := False;
+  Settings.MaxTests := 5;
+  SetLength(Actions, 20);
+  SetLength(CurrentStates, 20);
+  SetLength(NextStates, 20);
+  SetLength(Errors, 20);
+  for I := 0 to 19 do
+  begin
+    Actions[I] := I + 1;
+    CurrentStates[I] := I + 1;
+    NextStates[I] := 0;
+    Errors[I] := 0;
+  end;
+
+  Creator.Load(Settings, Actions, CurrentStates, NextStates);
+  Creator.LoadCreationData(0);
+  Creator.Create(True, False, Errors);
+  AssertEquals('non-zero equal tests capped at MaxTests',
+    integer(Settings.MaxTests), Creator.GetCount());
+
+  // With more tests allowed than there are non-zero states, the non-zero count
+  // is the cap.
+  Settings.MaxTests := csMaxTests;
+  Creator.Load(Settings, Actions, CurrentStates, NextStates);
+  Creator.LoadCreationData(0);
+  Creator.Create(True, False, Errors);
+  AssertEquals('non-zero equal tests capped at the non-zero state count',
+    Length(Actions), Creator.GetCount());
+end;
+
+procedure TTestNeuralABFun.TestConvolutedMatchAtOrigin;
+var
+  Engine: TRunOperation;
+  Settings: TCreateOperationSettings;
+  Actions, CurrentStates, NextStates: array of byte;
+  Tests: TTestsClass;
+  I: integer;
+begin
+  // A 4x4 image with a feature size of 0: the scanned windows are every
+  // position from 0 to 15, the first of them being the origin.
+  Settings := csCreateOpImageProcessing;
+  Settings.FeatureSize := 0;
+  Settings.ImageSizeX := 4;
+  Settings.ImageSizeY := 4;
+  SetLength(Actions, 16);
+  SetLength(CurrentStates, 16);
+  SetLength(NextStates, 16);
+  for I := 0 to 15 do
+  begin
+    Actions[I] := 0;
+    CurrentStates[I] := 0;
+    NextStates[I] := 0;
+  end;
+
+  // One test comparing the immediate 7 against the state at the window base;
+  // only the state holding 7 makes it fire.
+  Tests.N := 0;
+  Tests.TestThreshold := 1;
+  Tests.TestBasePosition := 0;
+  Tests.AddTest(CreateOperation(csEqual, 7, 0, False, True, False));
+
+  // No state carries 7 yet, so no window matches.
+  Engine.Load(Settings, Actions, CurrentStates, NextStates);
+  AssertEquals('no window matches', 0, Engine.TestTests(Tests));
+
+  // A match away from the origin is reported and locates its window.
+  CurrentStates[6] := 7;
+  Engine.Load(Settings, Actions, CurrentStates, NextStates);
+  AssertTrue('match at position 6', Engine.TestTests(Tests) > 0);
+  AssertEquals('position 6 window', 6, Tests.TestBasePosition);
+
+  // A match at the origin must read as a match too, not as a no-match.
+  CurrentStates[6] := 0;
+  CurrentStates[0] := 7;
+  Engine.Load(Settings, Actions, CurrentStates, NextStates);
+  AssertTrue('match at position 0', Engine.TestTests(Tests) > 0);
+  AssertEquals('origin window', 0, Tests.TestBasePosition);
 end;
 
 initialization

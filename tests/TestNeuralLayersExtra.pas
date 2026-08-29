@@ -22,10 +22,14 @@ type
     // DeLocalConnect tests
     procedure TestDeLocalConnectForward;
     procedure TestDeLocalConnectReLUForward;
+
+    // LocalProduct tests
+    procedure TestLocalProductBackwardWindow;
     
     // DeMaxPool (Upsampling) tests
     procedure TestDeMaxPoolForward;
     procedure TestDeMaxPoolOutputSize;
+    procedure TestDeMaxPoolBlockReplication;
 
     // MaxPoolWithPosition tests
     procedure TestMaxPoolWithPositionNonTrainable;
@@ -129,6 +133,9 @@ type
     procedure TestFeatureSeparabilityReportSmoke;
     procedure TestNeuralCollapseReportSmoke;
     procedure TestRepresentationSimilarityReportSmoke;
+    procedure TestWeightHistogramReportNumbers;
+    procedure TestActivationReportsRepeatStable;
+    procedure TestLensReportsIgnoreNilProbes;
     procedure TestEnableInputGradient;
     procedure TestAdversarialRobustnessReportSmoke;
     procedure TestGradientConflictReportSmoke;
@@ -137,6 +144,7 @@ type
     procedure TestEffectiveReceptiveFieldReportSmoke;
     procedure TestModeConnectivityReportSmoke;
     procedure TestPermutationAlignReportSmoke;
+    procedure TestPermutationAlignDegenerateScoreRow;
     procedure TestIntrinsicDimensionReportSmoke;
     procedure TestNeuralTangentKernelReportSmoke;
     procedure TestActivationPatchingReportSmoke;
@@ -195,7 +203,13 @@ type
     // The point of the bank: the routed path's LAYER COUNT and ACTIVATION
     // FOOTPRINT are independent of the expert count.
     procedure TestMoEExpertBankScalesWithTopKNotExperts;
+    // Depthwise 2-D convolution forward: the CPU nests are interchanged
+    // (Y outer / X inner), so a non-square input catches any axis mix-up.
+    procedure TestDepthwiseConvForwardMatchesReference;
+    procedure TestDepthwiseConvInt8ForwardMatchesFP32;
   private
+    // Naive per-tap depthwise reference used by the two tests above.
+    procedure AssertDepthwiseConvMatchesReference(Multiplier, Stride: integer);
     // Builds ONE net holding both the per-expert reference graph and the fused
     // bank behind the SAME router, then asserts the two outputs agree.
     // QuantizeBanks quantizes ONLY the two bank layers, leaving the reference
@@ -809,6 +823,73 @@ begin
   end;
 end;
 
+// TNNetLocalProduct multiplies the whole FeatureSizeX x FeatureSizeY x InputDepth
+// window into every output cell, so its (deliberately smoothed, unit-derivative)
+// backward must spread the output error over that same window: the full X extent
+// and every input channel, and nothing outside it.
+procedure TTestNeuralLayersExtra.TestLocalProductBackwardWindow;
+var
+  NN: TNNet;
+  Input, Target, DesiredErr: TNNetVolume;
+  ProdLayer, InLayer: TNNetLayer;
+  CntX, CntY, CntD: integer;
+  Share, InSum: TNeuralFloat;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(3, 3, 2);
+  Target := TNNetVolume.Create(2, 2, 1);
+  DesiredErr := TNNetVolume.Create(2, 2, 1);
+  try
+    InLayer := NN.AddLayer(TNNetInput.Create(3, 3, 2));
+    ProdLayer := NN.AddLayer(TNNetLocalProduct.Create(1, 2, 0, 1, 0));
+
+    Input.Fill(1.0);
+    NN.Compute(Input);
+
+    AssertEquals('LocalProduct output SizeX', 2, ProdLayer.Output.SizeX);
+    AssertEquals('LocalProduct output SizeY', 2, ProdLayer.Output.SizeY);
+    AssertEquals('LocalProduct output Depth', 1, ProdLayer.Output.Depth);
+
+    // Inputs never backprop, so their error buffer is size 1 by default. Give
+    // it a full-size buffer so the layer actually scatters into it.
+    InLayer.OutputError.ReSize(InLayer.Output);
+
+    // Seed an error in the (0,0) output cell only: its window is the whole
+    // 2 x 2 x 2 block anchored at the input origin.
+    DesiredErr.Fill(0);
+    DesiredErr[0, 0, 0] := 8.0;
+    Target.Copy(ProdLayer.Output);
+    Target.Sub(DesiredErr); // Target = Output - DesiredErr => error = DesiredErr
+    NN.Backpropagate(Target);
+
+    // Total error is preserved: 8.0 spread over the 8 window cells.
+    InSum := InLayer.OutputError.GetSum();
+    AssertEquals('LocalProduct backward preserves total error', 8.0, InSum, 0.0001);
+
+    Share := 8.0 / 8;
+    for CntX := 0 to 1 do
+      for CntY := 0 to 1 do
+        for CntD := 0 to 1 do
+          AssertEquals('LocalProduct window share at ' + IntToStr(CntX) + ',' +
+            IntToStr(CntY) + ',' + IntToStr(CntD),
+            Share, InLayer.OutputError[CntX, CntY, CntD], 0.0001);
+
+    // Everything outside the window stays untouched.
+    for CntX := 0 to 2 do
+      for CntY := 0 to 2 do
+        if (CntX = 2) or (CntY = 2) then
+          for CntD := 0 to 1 do
+            AssertEquals('LocalProduct outside window at ' + IntToStr(CntX) + ',' +
+              IntToStr(CntY) + ',' + IntToStr(CntD),
+              0.0, InLayer.OutputError[CntX, CntY, CntD], 0.0001);
+  finally
+    NN.Free;
+    Input.Free;
+    Target.Free;
+    DesiredErr.Free;
+  end;
+end;
+
 procedure TTestNeuralLayersExtra.TestDeMaxPoolForward;
 var
   NN: TNNet;
@@ -918,6 +999,47 @@ begin
     // DeMaxPool with scale 3 should triple the dimensions
     AssertEquals('Output SizeX should be 9', 9, NN.GetLastLayer.Output.SizeX);
     AssertEquals('Output SizeY should be 9', 9, NN.GetLastLayer.Output.SizeY);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+// The default (FSpacing = 0) TNNetDeMaxPool forward replicates each input cell
+// verbatim into its whole PoolSize x PoolSize output block, on every channel.
+// The existing DeMaxPool tests only check the output geometry, so this one
+// pins the value placement itself: every output cell must equal the input cell
+// it upsampled from.
+procedure TTestNeuralLayersExtra.TestDeMaxPoolBlockReplication;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  X, Y, D: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 3, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 3, 5));
+    NN.AddLayer(TNNetDeMaxPool.Create(3));
+
+    for Y := 0 to 2 do
+      for X := 0 to 3 do
+        for D := 0 to 4 do
+          Input[X, Y, D] := X * 100 + Y * 10 + D + 1;
+
+    NN.Compute(Input);
+
+    AssertEquals('Output SizeX', 12, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('Output SizeY', 9, NN.GetLastLayer.Output.SizeY);
+    AssertEquals('Output Depth', 5, NN.GetLastLayer.Output.Depth);
+
+    for Y := 0 to 8 do
+      for X := 0 to 11 do
+        for D := 0 to 4 do
+          AssertEquals('Replicated cell (' + IntToStr(X) + ',' + IntToStr(Y) +
+            ',' + IntToStr(D) + ')',
+            Input[X div 3, Y div 3, D],
+            NN.GetLastLayer.Output[X, Y, D], 0);
   finally
     NN.Free;
     Input.Free;
@@ -4809,6 +4931,183 @@ begin
   end;
 end;
 
+procedure TTestNeuralLayersExtra.TestWeightHistogramReportNumbers;
+var
+  NN: TNNet;
+  Report: string;
+begin
+  Report := TNNet.WeightHistogramReport(nil);
+  AssertTrue('nil NN reported gracefully', Pos('NN is nil', Report) > 0);
+
+  NN := TNNet.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectLinear.Create(2));
+    NN.InitWeights();
+    // Hand-set weights so every printed statistic has a closed form:
+    // min=-1, max=1, mean=0.0625, ||W||2=sqrt(2.375), 3 near-zero of 8.
+    NN.Layers[1].Neurons[0].Weights.Raw[0] := -1.0;
+    NN.Layers[1].Neurons[0].Weights.Raw[1] := 0.0;
+    NN.Layers[1].Neurons[0].Weights.Raw[2] := 0.5;
+    NN.Layers[1].Neurons[0].Weights.Raw[3] := 1.0;
+    NN.Layers[1].Neurons[1].Weights.Raw[0] := 0.25;
+    NN.Layers[1].Neurons[1].Weights.Raw[1] := -0.25;
+    NN.Layers[1].Neurons[1].Weights.Raw[2] := 0.0;
+    NN.Layers[1].Neurons[1].Weights.Raw[3] := 1e-7;
+
+    Report := TNNet.WeightHistogramReport(NN, 4);
+    AssertTrue('weight count reported', Pos('Weights=8', Report) > 0);
+    AssertTrue('stats line exact',
+      Pos(Format('  min=%.4f  max=%.4f  mean=%.4f  std=%.4f  ||W||2=%.4f  ' +
+        '||W||inf=%.4f', [-1.0, 1.0, 0.0625, 0.5413, 1.5411, 1.0]),
+        Report) > 0);
+    AssertTrue('near-zero count exact',
+      Pos(Format('  near-zero (|w|<%g): %d (%.2f%%)', [1e-6, 3, 37.5]),
+        Report) > 0);
+    // Bins over [-1, 1]: counts 1, 1, 4, 2; the tallest bin fills the bar.
+    AssertTrue('first bin bar exact',
+      Pos(Format('  [%8.3f, %8.3f) | %s',
+        [-1.0, -0.5, StringOfChar('#', 10)]), Report) > 0);
+    AssertTrue('modal bin bar exact',
+      Pos(Format('  [%8.3f, %8.3f) | %s',
+        [0.0, 0.5, StringOfChar('#', 40)]), Report) > 0);
+    AssertTrue('last bin closes the interval',
+      Pos(Format('  [%8.3f, %8.3f] | %s',
+        [0.5, 1.0, StringOfChar('#', 20)]), Report) > 0);
+    AssertTrue('total line exact',
+      Pos('Network total trainable weights: 8 across 1 layer(s).',
+        Report) > 0);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestActivationReportsRepeatStable;
+var
+  NN: TNNet;
+  Probes: TNNetVolumeList;
+  Samples: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  I, J, C: integer;
+  First, Second: string;
+begin
+  RandSeed := 20250826;
+  NN := TNNet.Create();
+  Probes := TNNetVolumeList.Create(True);
+  Samples := TNNetVolumePairList.Create(True);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(6));
+    NN.AddLayer(TNNetFullConnectReLU.Create(6));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.01, 0.9);
+    NN.InitWeights();
+    for I := 0 to 17 do
+    begin
+      C := I mod 3;
+      X := TNNetVolume.Create(4, 1, 1);
+      for J := 0 to 3 do X.Raw[J] := (Random - 0.5) * 2.0 + C;
+      Probes.Add(X);
+      X := TNNetVolume.Create(4, 1, 1);
+      for J := 0 to 3 do X.Raw[J] := (Random - 0.5) * 2.0 + C;
+      Y := TNNetVolume.Create(3, 1, 1);
+      Y.Fill(0); Y.Raw[C] := 1.0;
+      Samples.Add(TNNetVolumePair.Create(X, Y));
+    end;
+
+    // These four reports snapshot activations and (TunedLens) transiently
+    // overwrite the head input. Repeating a call must return the identical
+    // text: any leaked live-net state would show up as a different report.
+    First := TNNet.TunedLensReport(NN, Probes, -1, 60, 0.005);
+    Second := TNNet.TunedLensReport(NN, Probes, -1, 60, 0.005);
+    AssertEquals('TunedLensReport repeats identically', First, Second);
+
+    First := TNNet.FeatureSeparabilityReport(NN, Samples, 3);
+    Second := TNNet.FeatureSeparabilityReport(NN, Samples, 3);
+    AssertEquals('FeatureSeparabilityReport repeats identically',
+      First, Second);
+
+    First := TNNet.NeuralCollapseReport(NN, Samples, 3);
+    Second := TNNet.NeuralCollapseReport(NN, Samples, 3);
+    AssertEquals('NeuralCollapseReport repeats identically', First, Second);
+
+    First := TNNet.RepresentationSimilarityReport(NN, Probes);
+    Second := TNNet.RepresentationSimilarityReport(NN, Probes);
+    AssertEquals('RepresentationSimilarityReport repeats identically',
+      First, Second);
+
+    // A projected (capped MaxFeatDim) run must also be repeatable.
+    First := TNNet.FeatureSeparabilityReport(NN, Samples, 3, 1.0, 0.05, 3);
+    Second := TNNet.FeatureSeparabilityReport(NN, Samples, 3, 1.0, 0.05, 3);
+    AssertEquals('projected FeatureSeparabilityReport repeats identically',
+      First, Second);
+  finally
+    Samples.Free;
+    Probes.Free;
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestLensReportsIgnoreNilProbes;
+var
+  NN: TNNet;
+  Owner, Dense, WithNil: TNNetVolumeList;
+  X: TNNetVolume;
+  I, J, C: integer;
+  WithoutNilReport, WithNilReport: string;
+begin
+  RandSeed := 20250827;
+  NN := TNNet.Create();
+  Owner := TNNetVolumeList.Create(True);
+  Dense := TNNetVolumeList.Create(False);
+  WithNil := TNNetVolumeList.Create(False);
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(6));
+    NN.AddLayer(TNNetFullConnectReLU.Create(6));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    NN.AddLayer(TNNetSoftMax.Create());
+    NN.SetLearningRate(0.01, 0.9);
+    NN.InitWeights();
+    for I := 0 to 11 do
+    begin
+      C := I mod 3;
+      X := TNNetVolume.Create(4, 1, 1);
+      for J := 0 to 3 do X.Raw[J] := (Random - 0.5) * 2.0 + C;
+      Owner.Add(X);
+      Dense.Add(X);
+      WithNil.Add(X);
+      if I = 5 then WithNil.Add(nil);
+    end;
+
+    // A nil probe entry is skipped, so it must not dilute any average: the
+    // report over the padded list has to match the report over the dense one.
+    WithoutNilReport := TNNet.LogitLensReport(NN, Dense);
+    WithNilReport := TNNet.LogitLensReport(NN, WithNil);
+    AssertEquals('LogitLensReport ignores a nil probe entry',
+      WithoutNilReport, WithNilReport);
+
+    WithoutNilReport := TNNet.TunedLensReport(NN, Dense, -1, 60, 0.005);
+    WithNilReport := TNNet.TunedLensReport(NN, WithNil, -1, 60, 0.005);
+    AssertEquals('TunedLensReport ignores a nil probe entry',
+      WithoutNilReport, WithNilReport);
+
+    // An all-nil batch is reported, not divided by zero.
+    WithNil.Clear();
+    WithNil.Add(nil);
+    AssertTrue('LogitLensReport reports an all-nil batch',
+      Pos('no usable', TNNet.LogitLensReport(NN, WithNil)) > 0);
+    AssertTrue('TunedLensReport reports an all-nil batch',
+      Pos('no usable', TNNet.TunedLensReport(NN, WithNil)) > 0);
+  finally
+    WithNil.Free;
+    Dense.Free;
+    Owner.Free;
+    NN.Free;
+  end;
+end;
+
 // Runs one forward + one backward on NN with a one-hot target on class c
 // (using the public TNNet.Backpropagate, which sets the last-layer output
 // error = Output - target and runs the backward chain; ClearDeltas keeps the
@@ -5387,11 +5686,25 @@ begin
     AssertTrue('noisy batch has larger noise scale than clean',
       NoisyB > CleanB);
 
+    // --- Per-layer table rows name the owning layer of each scope slab. ---
+    AssertTrue('full scope counts every trainable param',
+      Pos('75 param(s) in scope', CleanReport) > 0);
+    AssertTrue('hidden layer row names its class',
+      Pos('     1   TNNetFullConnectReLU', CleanReport) > 0);
+    AssertTrue('output layer row names its class',
+      Pos('     2   TNNetFullConnectLinear', CleanReport) > 0);
+
     // --- LayerIdx scope filter runs and is labelled. ---
     HeadReport := TNNet.GradientNoiseScaleReport(NN, Noisy, True, 2);
     AssertTrue('layer-restricted report non-empty', Length(HeadReport) > 0);
     AssertTrue('layer-restricted scope labelled',
       Pos('layer 2', HeadReport) > 0);
+    AssertTrue('layer-restricted scope counts that layer only',
+      Pos('39 param(s) in scope', HeadReport) > 0);
+    AssertTrue('layer-restricted table row names the restricted layer',
+      Pos('     2   TNNetFullConnectLinear', HeadReport) > 0);
+    AssertTrue('out-of-scope layer absent from the restricted report',
+      Pos('TNNetFullConnectReLU', HeadReport) = 0);
 
     // predicted-label mode also produces a well-formed report.
     CleanReport := TNNet.GradientNoiseScaleReport(NN, Clean, False);
@@ -6101,6 +6414,76 @@ begin
     NN.Free;
     NNB.Free;
     NNC.Free;
+    RandSeed := SavedSeed;
+  end;
+end;
+
+// A non-finite weight makes one A-unit's whole similarity row NaN, so that unit
+// never wins a greedy pick and the alignment loop ends with positions still
+// unassigned. The permutation must still be complete: the neuron reorder indexes
+// the saved weight rows by it, so a leftover -1 reads out of bounds.
+procedure TTestNeuralLayersExtra.TestPermutationAlignDegenerateScoreRow;
+var
+  NN, NNB: TNNet;
+  Samples: TNNetVolumePairList;
+  X, Y: TNNetVolume;
+  SnapB, Report: string;
+  I: integer;
+  SavedSeed: longword;
+  OldMask: TFPUExceptionMask;
+begin
+  SavedSeed := RandSeed;
+  // A NaN weight traps on the probe forward pass with the default mask, so the
+  // degenerate score row is only reachable with the FP exceptions masked off.
+  OldMask := GetExceptionMask();
+  SetExceptionMask(OldMask + [exInvalidOp, exOverflow, exZeroDivide,
+    exDenormalized, exUnderflow, exPrecision]);
+  NN := TNNet.Create();
+  NNB := TNNet.Create();
+  Samples := TNNetVolumePairList.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(2, 1, 1));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectReLU.Create(8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    RandSeed := 4242;
+    NN.InitWeights();
+
+    NNB.AddLayer(TNNetInput.Create(2, 1, 1));
+    NNB.AddLayer(TNNetFullConnectReLU.Create(8));
+    NNB.AddLayer(TNNetFullConnectReLU.Create(8));
+    NNB.AddLayer(TNNetFullConnectLinear.Create(3));
+    RandSeed := 7;
+    NNB.InitWeights();
+
+    for I := 1 to 6 do
+    begin
+      X := TNNetVolume.Create(2, 1, 1);
+      Y := TNNetVolume.Create(3, 1, 1);
+      X.FData[0] := I * 0.1;
+      X.FData[1] := -I * 0.2;
+      Y.Fill(0);
+      Y.FData[I mod 3] := 1.0;
+      Samples.Add(TNNetVolumePair.Create(X, Y));
+    end;
+    SnapB := NNB.SaveDataToString();
+
+    // Poison ONE endpoint-A hidden unit: its whole score row becomes NaN.
+    NN.Layers[1].Neurons[0].Weights.FData[0] := NaN;
+
+    Report := TNNet.PermutationAlignReport(NN, SnapB, Samples, 0, 4);
+    AssertTrue('degenerate score row still reports',
+      Pos('PermutationAlignReport (Git', Report) > 0);
+    AssertTrue('degenerate churn line present', Pos('churn = ', Report) > 0);
+    // The completed permutation must keep B's function intact.
+    AssertTrue('degenerate case keeps permutation invariance',
+      Pos('Check 1 permutation invariance: PASS', Report) > 0);
+    AssertEquals('B snapshot untouched', SnapB, NNB.SaveDataToString());
+  finally
+    Samples.Free;
+    NN.Free;
+    NNB.Free;
+    SetExceptionMask(OldMask);
     RandSeed := SavedSeed;
   end;
 end;
@@ -8425,6 +8808,116 @@ begin
     finally
       NN.Free;
     end;
+  end;
+end;
+
+// Builds Input(7,5,3) -> DepthwiseConvLinear(Multiplier, 3x3, no padding,
+// Stride) on random weights and random input, then recomputes every output
+// element with a naive tap loop. The input is deliberately NON-SQUARE so a
+// swapped X/Y axis shows up as a shape error or a wrong value rather than
+// cancelling out.
+procedure TTestNeuralLayersExtra.AssertDepthwiseConvMatchesReference(
+  Multiplier, Stride: integer);
+const
+  InX = 7; InY = 5; InD = 3; FeatureSize = 3;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Layer: TNNetLayer;
+  W, Output: TNNetVolume;
+  NeuronCnt, ox, oy, d, fx, fy: integer;
+  MaxOutXPos, MaxOutYPos, Expected: integer;
+  Sum: TNeuralFloat;
+  Tag: string;
+begin
+  Tag := 'mult=' + IntToStr(Multiplier) + ' stride=' + IntToStr(Stride);
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(InX, InY, InD);
+  try
+    NN.AddLayer(TNNetInput.Create(InX, InY, InD));
+    Layer := NN.AddLayer(
+      TNNetDepthwiseConvLinear.Create(Multiplier, FeatureSize, 0, Stride));
+    for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+      Layer.Neurons[NeuronCnt].Weights.RandomizeGaussian(1);
+    Input.Randomize();
+    NN.Compute(Input);
+    Output := Layer.Output;
+
+    Expected := (InX - FeatureSize) div Stride + 1;
+    AssertEquals('output SizeX (' + Tag + ')', Expected, Output.SizeX);
+    Expected := (InY - FeatureSize) div Stride + 1;
+    AssertEquals('output SizeY (' + Tag + ')', Expected, Output.SizeY);
+    AssertEquals('output depth (' + Tag + ')', Multiplier * InD, Output.Depth);
+
+    MaxOutXPos := Output.SizeX - 1;
+    MaxOutYPos := Output.SizeY - 1;
+    for NeuronCnt := 0 to Multiplier - 1 do
+    begin
+      W := Layer.Neurons[NeuronCnt].Weights;
+      for oy := 0 to MaxOutYPos do
+        for ox := 0 to MaxOutXPos do
+          for d := 0 to InD - 1 do
+          begin
+            Sum := 0;
+            for fx := 0 to FeatureSize - 1 do
+              for fy := 0 to FeatureSize - 1 do
+                Sum := Sum +
+                  Input[ox * Stride + fx, oy * Stride + fy, d] * W[fx, fy, d];
+            AssertEquals('depthwise out[' + IntToStr(ox) + ',' + IntToStr(oy) +
+              ',' + IntToStr(NeuronCnt) + ':' + IntToStr(d) + '] (' + Tag + ')',
+              Sum, Output[ox, oy, NeuronCnt * InD + d], 1e-4);
+          end;
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralLayersExtra.TestDepthwiseConvForwardMatchesReference;
+begin
+  // Single-neuron and multi-neuron branches, unit and strided.
+  AssertDepthwiseConvMatchesReference(1, 1);
+  AssertDepthwiseConvMatchesReference(1, 2);
+  AssertDepthwiseConvMatchesReference(3, 1);
+  AssertDepthwiseConvMatchesReference(3, 2);
+end;
+
+// The int8 forward walks its own nest over the same taps; it must land within
+// quantization drift of the FP32 forward it replaces.
+procedure TTestNeuralLayersExtra.TestDepthwiseConvInt8ForwardMatchesFP32;
+const
+  InX = 7; InY = 5; InD = 3; FeatureSize = 3; Multiplier = 2;
+var
+  NN: TNNet;
+  Input, Reference: TNNetVolume;
+  Layer: TNNetLayer;
+  NeuronCnt, i: integer;
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(InX, InY, InD);
+  Reference := TNNetVolume.Create(1, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(InX, InY, InD));
+    Layer := NN.AddLayer(
+      TNNetDepthwiseConvLinear.Create(Multiplier, FeatureSize, 0, 1));
+    for NeuronCnt := 0 to Layer.Neurons.Count - 1 do
+      Layer.Neurons[NeuronCnt].Weights.RandomizeGaussian(1);
+    Input.Randomize();
+    NN.Compute(Input);
+    Reference.Copy(Layer.Output);
+
+    TNNetDepthwiseConv(Layer).QuantizeWeightsInt8();
+    NN.Compute(Input);
+
+    AssertEquals('int8 output size', Reference.Size, Layer.Output.Size);
+    for i := 0 to Reference.Size - 1 do
+      AssertEquals('int8 depthwise element ' + IntToStr(i),
+        Reference.FData[i], Layer.Output.FData[i], 0.05);
+  finally
+    NN.Free;
+    Input.Free;
+    Reference.Free;
   end;
 end;
 

@@ -85,8 +85,20 @@ type
     // silently takes the plain full-sort branch and proves nothing).
     procedure TestTopPLargeVocabNucleusIsCorrect;
     procedure TestTopPLargeVocabFlatDistributionRetries;
+    // The gathered-nucleus fast path (LoadNucleusCandidates) must draw the
+    // very token the full-window path draws for the same RNG state, and must
+    // decline a flat row so the full path answers. Coded by Claude (AI).
+    procedure TestTopPLargeVocabGatherMatchesFullPath;
+    procedure TestGetTokenArrayAboveGathersAndSums;
+
+    // Nucleus closure and the weighted draw inside it.
+    procedure TestTopPFullMassIsNotGreedy;
+    procedure TestTopPNucleusIncludesCrossingToken;
+    procedure TestTopPDrawIsMassWeighted;
     procedure TestWeightedTopKLargeVocabNeverDrawsOutsideTopK;
     procedure TestMinPLargeVocabRespectsThreshold;
+    procedure TestMinPCompactionKeptSetMatchesReference;
+    procedure TestMinPAllNegativeScoresReturnsArgMax;
 
     // Adaptive typical-sampling path and the merged log pass.
     procedure TestTypicalArgMinMatchesTwoLogReference;
@@ -100,6 +112,24 @@ type
   end;
 
 implementation
+
+type
+  // Exposes the two top-p routes of TNNetSamplerTopP to the tests.
+  TTopPRoutes = class(TNNetSamplerTopP)
+    function GatherApplies(V: TNNetVolume): boolean;
+    function GetTokenFullPath(V: TNNetVolume): integer;
+  end;
+
+function TTopPRoutes.GatherApplies(V: TNNetVolume): boolean;
+begin
+  Result := LoadNucleusCandidates(V);
+end;
+
+function TTopPRoutes.GetTokenFullPath(V: TNNetVolume): integer;
+begin
+  LoadCandidates(V);
+  Result := SampleFromNucleus();
+end;
 
 procedure TTestNeuralSamplers.TestGreedySamplerCreation;
 var
@@ -1481,9 +1511,9 @@ begin
     for I := 0 to V_SIZE - 1 do
     begin
       Cum := Cum + V.Raw[I];
-      if Cum > 0.80 then
+      if Cum >= 0.80 then
       begin
-        NucleusSize := I;
+        NucleusSize := I + 1; // the crossing token belongs to the nucleus
         Break;
       end;
     end;
@@ -1539,6 +1569,85 @@ begin
     SetLength(Seen, 0);
     V.Free;
     Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestTopPLargeVocabGatherMatchesFullPath;
+const
+  V_SIZE = 250000; // a real LLM vocabulary
+var
+  Sampler: TTopPRoutes;
+  V: TNNetVolume;
+  I, TokenFast, TokenFull: integer;
+begin
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  try
+    // Peak at 0: strictly descending scores, so no tie can be ordered
+    // differently by the two routes.
+    BuildLargePeakedRow(V, V_SIZE, 0);
+    Sampler := TTopPRoutes.Create(0.80);
+    try
+      AssertTrue('Peaked row: the gather must hold the 0.80 nucleus',
+        Sampler.GatherApplies(V));
+      for I := 0 to 199 do
+      begin
+        RandSeed := 1000 + I;
+        TokenFast := Sampler.GetToken(V);
+        RandSeed := 1000 + I;
+        TokenFull := Sampler.GetTokenFullPath(V);
+        AssertEquals('Draw ' + IntToStr(I) + ': gathered and full routes',
+          TokenFull, TokenFast);
+      end;
+    finally
+      Sampler.Free;
+    end;
+    // A uniform row keeps every token above max/1024, and the gather's mass
+    // is checked against TopP >= 1, so it must decline and leave the full
+    // path (ancestral sampling over the whole row) in charge.
+    V.Fill(1.0 / V_SIZE);
+    Sampler := TTopPRoutes.Create(1.0);
+    try
+      AssertFalse('Flat row with TopP 1.0: the gather must decline',
+        Sampler.GatherApplies(V));
+      TokenFast := Sampler.GetToken(V);
+      AssertTrue('Flat row draw in range', (TokenFast >= 0) and (TokenFast < V_SIZE));
+    finally
+      Sampler.Free;
+    end;
+  finally
+    V.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestGetTokenArrayAboveGathersAndSums;
+var
+  V: TNNetVolume;
+  Arr: TNNetTokenArray;
+  Count: integer;
+  Mass: TNeuralFloat;
+begin
+  V := TNNetVolume.Create(2, 1, 4);
+  try
+    // Pixel 0: 0.5, 0.01, 0.3, 0.19; pixel 1: 0.05, 0.9, 0.02, 0.03.
+    V.Raw[0] := 0.5; V.Raw[1] := 0.01; V.Raw[2] := 0.3; V.Raw[3] := 0.19;
+    V.Raw[4] := 0.05; V.Raw[5] := 0.9; V.Raw[6] := 0.02; V.Raw[7] := 0.03;
+    // The whole-volume gather spans both pixels.
+    Mass := V.GetTokenArrayAbove(Arr, 0.1, Count);
+    AssertEquals('whole volume: four tokens reach 0.1', 4, Count);
+    AssertEquals('whole volume: gathered in index order', 0, Arr[0].Token);
+    AssertEquals('whole volume: second is index 2', 2, Arr[1].Token);
+    AssertEquals('whole volume: third is index 3', 3, Arr[2].Token);
+    AssertEquals('whole volume: fourth is index 5', 5, Arr[3].Token);
+    AssertTrue('whole volume: mass 1.89', Abs(Mass - 1.89) < 1e-6);
+    AssertEquals('array keeps the full length', 8, Length(Arr));
+    Mass := V.GetTokenArrayAboveOnPixel(Arr, 0.04, 1, 0, Count);
+    AssertEquals('pixel 1: two tokens reach 0.04', 2, Count);
+    AssertEquals('pixel 1: depth index 0', 0, Arr[0].Token);
+    AssertEquals('pixel 1: depth index 1', 1, Arr[1].Token);
+    AssertTrue('pixel 1: mass 0.95', Abs(Mass - 0.95) < 1e-6);
+  finally
+    SetLength(Arr, 0);
+    V.Free;
   end;
 end;
 
@@ -1615,6 +1724,88 @@ begin
       AssertTrue('Large-vocab min-p drew below the threshold: token ' +
         IntToStr(Token), V.Raw[Token] >= Threshold);
     end;
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestMinPCompactionKeptSetMatchesReference;
+const
+  V_SIZE = 64;
+var
+  Sampler: TNNetSamplerMinP;
+  V: TNNetVolume;
+  I, Token, Survivors: integer;
+  MaxP, Threshold: TNeuralFloat;
+  Expected, Seen: array[0..V_SIZE - 1] of boolean;
+begin
+  // The swap compaction must select EXACTLY the tokens passing
+  // p >= MinP * max(p), the same set the old quickselect produced. The
+  // survivors are scattered across the row (not a prefix), so a compaction
+  // that lost or reordered an entry would show up as a missing or an
+  // out-of-set draw.
+  RandSeed := 20260826;
+  Sampler := TNNetSamplerMinP.Create(0.25);
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  try
+    // Small background mass everywhere, with six scattered peaks.
+    for I := 0 to V_SIZE - 1 do V.Raw[I] := 0.001 + 0.0001 * I;
+    V.Raw[3]  := 0.40;
+    V.Raw[17] := 0.30;
+    V.Raw[18] := 0.11;  // just above 0.25 * 0.40 = 0.10
+    V.Raw[40] := 0.10;  // exactly at the cut - kept (>=)
+    V.Raw[41] := 0.09;  // just below the cut - rejected
+    V.Raw[63] := 0.20;
+
+    MaxP := V.Raw[0];
+    for I := 1 to V_SIZE - 1 do
+      if V.Raw[I] > MaxP then MaxP := V.Raw[I];
+    Threshold := 0.25 * MaxP;
+    Survivors := 0;
+    for I := 0 to V_SIZE - 1 do
+    begin
+      Expected[I] := V.Raw[I] >= Threshold;
+      Seen[I] := false;
+      if Expected[I] then Inc(Survivors);
+    end;
+    AssertEquals('reference survivor count', 5, Survivors);
+
+    for I := 1 to 2000 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('min-p drew a token outside the reference kept set: ' +
+        IntToStr(Token), Expected[Token]);
+      Seen[Token] := true;
+    end;
+    for I := 0 to V_SIZE - 1 do
+      if Expected[I] then
+        AssertTrue('kept token never drawn: ' + IntToStr(I), Seen[I]);
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestMinPAllNegativeScoresReturnsArgMax;
+const
+  V_SIZE = 32;
+var
+  Sampler: TNNetSamplerMinP;
+  V: TNNetVolume;
+  I: integer;
+begin
+  // With every score negative, MinP * max is ABOVE max, so no token clears the
+  // cut. The fallback must keep the argmax alone.
+  RandSeed := 20260826;
+  Sampler := TNNetSamplerMinP.Create(0.5);
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  try
+    for I := 0 to V_SIZE - 1 do V.Raw[I] := -10.0 - I;
+    V.Raw[21] := -1.0; // the argmax, still negative
+    for I := 1 to 50 do
+      AssertEquals('all-negative min-p must return the argmax',
+        21, Sampler.GetToken(V));
   finally
     V.Free;
     Sampler.Free;
@@ -1928,6 +2119,118 @@ begin
   finally
     Sampler.Free;
     V.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestTopPFullMassIsNotGreedy;
+const
+  V_SIZE = 32;
+var
+  Sampler: TNNetSamplerTopP;
+  V: TNNetVolume;
+  I, Token, Distinct, TailHits: integer;
+  Seen: array[0..V_SIZE - 1] of boolean;
+begin
+  // TopP = 1.0 asks for the whole distribution: the nucleus never "closes"
+  // early, and the sampler must fall through to full ancestral sampling
+  // instead of returning the argmax every time.
+  Sampler := TNNetSamplerTopP.Create(1.0);
+  V := TNNetVolume.Create(V_SIZE, 1, 1);
+  try
+    V.Fill(0.02);
+    V.Raw[0] := 0.02 + (1.0 - V_SIZE * 0.02); // a modest peak, mass sums to 1
+    for I := 0 to V_SIZE - 1 do Seen[I] := false;
+    RandSeed := 20260826;
+    Distinct := 0;
+    TailHits := 0;
+    for I := 0 to 999 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('TopP=1 draw must be a valid token, got ' + IntToStr(Token),
+        (Token >= 0) and (Token < V_SIZE));
+      if not Seen[Token] then
+      begin
+        Seen[Token] := true;
+        Inc(Distinct);
+      end;
+      if Token > 0 then Inc(TailHits);
+    end;
+    AssertTrue('TopP=1 must not degenerate to greedy, distinct=' +
+      IntToStr(Distinct), Distinct > 10);
+    // The tail carries ~62% of the mass here, so it must dominate the draws.
+    AssertTrue('TopP=1 must sample the low-probability tail, hits=' +
+      IntToStr(TailHits), TailHits > 400);
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestTopPNucleusIncludesCrossingToken;
+var
+  Sampler: TNNetSamplerTopP;
+  V: TNNetVolume;
+  I, Token, Hits0, Hits1: integer;
+begin
+  // Masses 0.5 / 0.3 / 0.2: the smallest prefix reaching 0.75 is {0, 1}, so
+  // the token that CROSSES the threshold (index 1) is inside the nucleus and
+  // index 2 is outside it.
+  Sampler := TNNetSamplerTopP.Create(0.75);
+  V := TNNetVolume.Create(3, 1, 1);
+  try
+    V.Raw[0] := 0.5;
+    V.Raw[1] := 0.3;
+    V.Raw[2] := 0.2;
+    RandSeed := 4242;
+    Hits0 := 0;
+    Hits1 := 0;
+    for I := 0 to 999 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('token 2 is outside the 0.75 nucleus', Token <> 2);
+      if Token = 0 then Inc(Hits0);
+      if Token = 1 then Inc(Hits1);
+    end;
+    AssertEquals('every draw must land in the nucleus', 1000, Hits0 + Hits1);
+    AssertTrue('the crossing token must be reachable, hits=' + IntToStr(Hits1),
+      Hits1 > 100);
+  finally
+    V.Free;
+    Sampler.Free;
+  end;
+end;
+
+procedure TTestNeuralSamplers.TestTopPDrawIsMassWeighted;
+const
+  DRAWS = 4000;
+var
+  Sampler: TNNetSamplerTopP;
+  V: TNNetVolume;
+  I, Token, Hits0: integer;
+  Share: TNeuralFloat;
+begin
+  // Nucleus {0, 1} with masses 0.6 / 0.3 renormalizes to 2/3 and 1/3. A
+  // uniform draw over the two members would give 0.5 instead.
+  Sampler := TNNetSamplerTopP.Create(0.85);
+  V := TNNetVolume.Create(8, 1, 1);
+  try
+    V.Fill(0.0166666667);
+    V.Raw[0] := 0.6;
+    V.Raw[1] := 0.3;
+    RandSeed := 987654;
+    Hits0 := 0;
+    for I := 0 to DRAWS - 1 do
+    begin
+      Token := Sampler.GetToken(V);
+      AssertTrue('draw must stay inside the nucleus', Token < 2);
+      if Token = 0 then Inc(Hits0);
+    end;
+    Share := Hits0 / DRAWS;
+    AssertTrue('the top token must take ~2/3 of the draws, not 1/2, got ' +
+      FloatToStr(Share), (Share > 0.63) and (Share < 0.70));
+  finally
+    V.Free;
+    Sampler.Free;
   end;
 end;
 

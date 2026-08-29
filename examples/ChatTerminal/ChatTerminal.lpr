@@ -270,22 +270,40 @@ begin
     Check(Opt.CtxLen = 128, '--ctx');
     Check(Opt.FormatName = 'chatml', '--format');
     Check(Opt.SystemPrompt = 'Be brief.', '--system');
-    Check(Opt.Int8, '--int8');
+    Check(Opt.WeightMode = cwmInt8, '--int8');
     Check(Opt.Stats, '--stats');
     Check(Opt.Profile, '--profile');
 
-    // int8 is the default; --fp32 opts into full-precision weights.
+    // int8 is the default; --fp32 and --int4 opt out. The last flag wins.
     Args.Clear;
     Args.Add('/tmp/model');
-    Check(ParseArgs(Args, Opt) and Opt.Int8, 'int8 is the default weight mode');
+    Check(ParseArgs(Args, Opt) and (Opt.WeightMode = cwmInt8),
+      'int8 is the default weight mode');
     Args.Clear;
     Args.Add('/tmp/model');
     Args.Add('--fp32');
-    Check(ParseArgs(Args, Opt) and not Opt.Int8, '--fp32 disables int8');
+    Check(ParseArgs(Args, Opt) and (Opt.WeightMode = cwmFP32),
+      '--fp32 selects fp32 weights');
     Args.Clear;
     Args.Add('/tmp/model');
     Args.Add('--fp32'); Args.Add('--int8');
-    Check(ParseArgs(Args, Opt) and Opt.Int8, '--int8 re-enables it');
+    Check(ParseArgs(Args, Opt) and (Opt.WeightMode = cwmInt8),
+      '--int8 re-selects int8');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--int4');
+    Check(ParseArgs(Args, Opt) and (Opt.WeightMode = cwmInt4),
+      '--int4 selects int4 weights');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--int4'); Args.Add('--fp32');
+    Check(ParseArgs(Args, Opt) and (Opt.WeightMode = cwmFP32),
+      '--int4 --fp32 ends fp32');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--fp32'); Args.Add('--int4');
+    Check(ParseArgs(Args, Opt) and (Opt.WeightMode = cwmInt4),
+      '--fp32 --int4 ends int4');
 
     // --stats is off by default.
     Args.Clear;
@@ -323,6 +341,11 @@ begin
     Args.Add('--fp32');
     Check(ParseArgs(Args, Opt) and not Opt.KVInt8,
       '--fp32 weights default to the FP32 KV cache');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--int4');
+    Check(ParseArgs(Args, Opt) and Opt.KVInt8,
+      '--int4 weights default to the int8 KV cache');
     Args.Clear;
     Args.Add('/tmp/model');
     Args.Add('--kv-fp32');
@@ -368,15 +391,15 @@ begin
     Check(ParseArgs(Args, Opt) and not Opt.GpuSharedKernel,
       '--no-gpu-shared-kernel parses');
 
-    // FP32 activations in the int8 matmuls unless --gpu-fp16 asks for halves.
+    // FP32 activations in the int8 matmuls unless --experimental-fp16 asks for halves.
     Args.Clear;
     Args.Add('/tmp/model');
-    Check(ParseArgs(Args, Opt) and not Opt.GpuFP16,
+    Check(ParseArgs(Args, Opt) and not Opt.ExperimentalFP16,
       'FP32 activations by default');
     Args.Clear;
     Args.Add('/tmp/model');
-    Args.Add('--gpu-fp16');
-    Check(ParseArgs(Args, Opt) and Opt.GpuFP16, '--gpu-fp16 parses');
+    Args.Add('--experimental-fp16');
+    Check(ParseArgs(Args, Opt) and Opt.ExperimentalFP16, '--experimental-fp16 parses');
 
     // -p: empty (interactive REPL) by default, holds the one-shot prompt when
     // given, and needs a value.

@@ -187,6 +187,12 @@ rather than acted on.
       and the two previously-OOMing shapes (KAN 81 GB, DepthwiseConv1D 2 GB) now
       run. `OpenCLForwardBenchmark` re-includes `TNNetKANConv`.
 
+## Hardware Support
+  - [ ] CUDA/HIP Support
+    - [ ] Software Spec 
+  - [ ] ARM SIMD: NEON → SVE → SME kernels behind the TNNetVolume dispatch (requires ARM processor) 
+    - [ ] Software Spec
+
 ## Infrastructure / dev experience
 
 - [ ] Gradient checkpointing for training deeper nets in less memory

@@ -52,8 +52,10 @@ Coded by Claude (AI).
 
 Usage (from the repo root):
   /home/bpsa/x/bin/python tools/ip_adapter_tiny_fixture.py
-writes tests/fixtures/tiny_ip_adapter{.safetensors,_config.json,_io.json}.
-Needs numpy + safetensors + scipy(erf, optional) only.
+writes tests/fixtures/tiny_ip_adapter{.safetensors,.bin,_config.json,_io.json}.
+The .bin twin carries the SAME tensors in the checkpoint's nested sub-dict
+layout, for the torch-pickle import path.
+Needs numpy + safetensors + torch (for the .bin twin).
 """
 import json
 import math
@@ -164,6 +166,25 @@ def build_state_dict():
     return sd, ap
 
 
+def write_torch_bin(sd_f32, path):
+    """torch.save the SAME tensors in the checkpoint's NESTED layout.
+
+    ip-adapter_sd15.bin groups its tensors in sub-dicts keyed by module
+    ('image_proj', 'ip_adapter') instead of the flat dotted names the
+    safetensors export uses; the Pascal reader rejoins the levels with a dot.
+    The base UNet attn2 projections (which really live in the SD checkpoint)
+    are nested the same way so one file feeds the whole importer.
+    """
+    import torch
+
+    nested = {}
+    for name, arr in sd_f32.items():
+        head, _, rest = name.partition('.')
+        nested.setdefault(head, {})[rest] = torch.from_numpy(arr.copy())
+    torch.save(nested, path, _use_new_zipfile_serialization=True)
+    print(f'wrote {path} (nested keys: {sorted(nested)})')
+
+
 def main():
     sd, ap = build_state_dict()
     sd_f32 = {k: v.astype(np.float32) for k, v in sd.items()}
@@ -189,6 +210,7 @@ def main():
     print(f'image tokens {img_tokens.shape} cross-attn out {out.shape}')
 
     save_file(sd_f32, 'tests/fixtures/tiny_ip_adapter.safetensors')
+    write_torch_bin(sd_f32, 'tests/fixtures/tiny_ip_adapter.bin')
     config = {
         '_class_name': 'IPAdapterModel',
         'clip_embeddings_dim': CLIP_DIM,

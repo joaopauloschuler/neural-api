@@ -298,6 +298,12 @@ type
       // vocab-size membership buffer, grown only when a larger row is seen,
       // never re-allocated per token.
       FAllowedBuf: array of boolean;
+    protected
+      // Applies the membership a MaskAllowed implementation recorded in
+      // FAllowedBuf[0..Probs.Size-1], including both fallbacks above: nothing
+      // blocked or zero allowed mass leave the row untouched.
+      procedure ApplyAllowedMask(Probs: TNNetVolume; AnyBlocked: boolean;
+        AllowedMass: TNeuralFloat);
     public
       // Called once at the start of generation with the prompt token ids so
       // stateful constraints can start a fresh sequence. Default: no-op.
@@ -368,12 +374,21 @@ type
       FCandidates: TNNetTokenSequences;
       FActive: array of boolean;
       FDepth: integer;
+      // The allowed ids of one step and their probabilities: at most one per
+      // candidate plus the two special ids, sized once in Create (rule #17).
+      FStepIds: TNeuralIntegerArray;
+      FStepProbs: array of TNeuralFloat;
+      // Collects this step's distinct allowed ids into FStepIds/FStepProbs and
+      // returns how many; marks them in FAllowedBuf and clears the marks again.
+      function CollectAllowedIds(Probs: TNNetVolume;
+        out AllowedMass: TNeuralFloat): integer;
     public
       constructor Create(const Candidates: TNNetTokenSequences); overload;
       constructor Create(Dict: TStringListInt;
         const Candidates: array of string); overload;
       procedure Reset(const PromptTokens: array of integer); override;
       function TokenAllowed(TokenId: integer): boolean; override;
+      procedure MaskAllowed(Probs: TNNetVolume); override;
       procedure Commit(TokenId: integer); override;
       // True when some still-active candidate has been emitted in full.
       function Completed(): boolean;
@@ -468,7 +483,8 @@ type
   // word-level dicts whose detokenizer inserts separators would be validated
   // without the separators. Create(Dict) snapshots Dict.DeTokenize(id) for
   // every id; CreateCharLevel(VocabSize) is the char-level model convention
-  // (token id = character code, ids < 2 special).
+  // (token id = character code, ids < 2 special) and therefore accepts at most
+  // 256 ids.
   // Coded by Claude (AI).
   TNNetJSONConstraint = class(TNNetTokenConstraint)
     private
@@ -481,13 +497,25 @@ type
       // TokenAllowed after the state moves, keyed on the machine's version.
       FFirstOK: array[0..255] of boolean;
       FFirstOKVersion: int64;
+      // Rule #27: the same reasoning one field up, for the token text itself.
+      // A vocabulary-sized array of strings is a pointer chase per id, while
+      // the gates only ever ask for the first byte and whether the text is
+      // empty, one character, or longer - so both answers are precomputed into
+      // flat byte tables. FTokTextKind is 0, 1 or 2 for those three cases.
+      FTokFirstByte: array of byte;
+      FTokTextKind: array of byte;
       procedure BuildFirstOK();
+      procedure BuildTokenTables();
+      // Decides a token that carries text (2 <= TokenId <= High(FTokenStr));
+      // the caller must have refreshed FFirstOK for the machine's version.
+      function TextTokenAllowed(TokenId: integer): boolean;
     public
       constructor Create(Dict: TStringListInt); overload;
       constructor CreateCharLevel(VocabSize: integer);
       destructor Destroy(); override;
       procedure Reset(const PromptTokens: array of integer); override;
       function TokenAllowed(TokenId: integer): boolean; override;
+      procedure MaskAllowed(Probs: TNNetVolume); override;
       procedure Commit(TokenId: integer); override;
       // The live automaton (after the committed tokens) for inspection.
       property Machine: TNNetJSONStateMachine read FMachine;
@@ -518,6 +546,10 @@ type
     Lo, Hi: char;
   end;
 
+  // Membership of one compiled character class, one entry per byte value: the
+  // run-time answer to "is C in this class?" without walking the ranges.
+  TNNetGrammarCharSetTable = array[0..255] of boolean;
+
   { TNNetGrammar }
   // A GBNF-subset grammar COMPILED to a flat pushdown representation. Supported
   // subset (llama.cpp-style, v1):
@@ -541,6 +573,12 @@ type
       FRules: array of TNNetGrammarElemArray; // index -> compiled body
       FRanges: array of TNNetGrammarRange;    // pooled char-class ranges
       FCharSets: array of record First, Count: integer; end; // run in FRanges
+      // Rule #27: per-class membership and per-rule alternate positions, both
+      // fixed once the grammar is compiled. They answer at run time what
+      // ElemMatches and PushRuleAlternates used to rescan the ranges and the
+      // rule body for, on every candidate character of every decode step.
+      FSetTable: array of TNNetGrammarCharSetTable;
+      FRuleAlts: array of TNeuralIntegerArray;
       FRootRule: integer;
       // --- parser state (over FSource) ---
       FPos: integer;
@@ -570,6 +608,9 @@ type
         var Elems: TNNetGrammarElemArray);
       procedure BuildPlusRule(AtomRule: integer;
         var Elems: TNNetGrammarElemArray);
+      // Records the start element index of every top-level alternate of every
+      // rule; run once the last rule body (helper rules included) is in place.
+      procedure BuildRuleAlternates();
       procedure Compile();
     public
       // Builds and compiles the grammar from GBNF text. Raises EAssertionFailed
@@ -601,15 +642,11 @@ type
       FScratch: array of array of integer;
       FScratchLen: array of integer;
       FScratchCount: integer;
-      // Persistent per-char advance buffer (rule #17): FeedChar is not
-      // re-entrant, so one lazily-sized buffer serves every matched stack
-      // instead of a fresh SetLength per (stack, char, probed token).
-      FAdvBuf: array of integer;
       // Persistent per-recursion-depth work buffers (rule #17). Every entry
       // into AddStackExpanded / PushRuleAlternates takes FWorkPool[FWorkDepth]
       // and increments the depth, so a recursive expansion reuses buffers
-      // instead of SetLength-ing a fresh dynamic array per frame. Like FScratch
-      // and FAdvBuf, this makes the expansion non-reentrant per machine
+      // instead of SetLength-ing a fresh dynamic array per frame. Like
+      // FScratch, this makes the expansion non-reentrant per machine
       // instance - FMachine and FProbe are separate objects, so a probed token
       // never shares these with the live automaton.
       FWorkPool: array of array of integer;
@@ -619,12 +656,23 @@ type
       // observable active set, so callers can cache per-state work and rebuild
       // it exactly when the version moves.
       FVersion: int64;
-      function PackPos(Rule, Idx: integer): integer;
-      procedure UnpackPos(Pos: integer; out Rule, Idx: integer);
+      function PackPos(Rule, Idx: integer): integer; {$IFDEF Release} inline; {$ENDIF}
+      procedure UnpackPos(Pos: integer; out Rule, Idx: integer); {$IFDEF Release} inline; {$ENDIF}
+      // Copies Src[0..Len-1] into a fresh pooled work frame holding room for
+      // Capacity entries; returns the frame depth the caller restores after use.
+      function BeginWorkFrame(const Src: array of integer;
+        Len, Capacity: integer): integer;
+      // Walks the pooled frame's top down to a resting state: getEnd/getAlt pop
+      // in place, a rule ref forks into its alternates, a terminal comes to rest.
+      procedure ExpandWorkFrame(D, Len: integer);
       // Pushes a stack (copy of Src[0..Len-1] then descends rule refs so the
       // new top is a terminal or the stack is empty) into the scratch set,
       // expanding alternates. Dedups against what's already in scratch.
       procedure AddStackExpanded(const Src: array of integer; Len: integer);
+      // AddStackExpanded with the copied stack's top element replaced by NewTop,
+      // which is the advance FeedChar needs without a second buffer and copy.
+      procedure AddStackAdvanced(const Src: array of integer;
+        Len, NewTop: integer);
       // Forks Base into every alternate of RuleIdx (used by Reset and ruleref
       // expansion).
       procedure PushRuleAlternates(const Base: array of integer;
@@ -664,7 +712,8 @@ type
   // grammar is in a complete (accepting) state; empty-string tokens are never
   // allowed. Create(GBNFText, Dict) snapshots Dict.DeTokenize(id) per id;
   // CreateCharLevel(GBNFText, VocabSize) is the char-level convention (token id
-  // = character code, ids < 2 special). Owns its TNNetGrammar.
+  // = character code, ids < 2 special) and therefore accepts at most 256 ids.
+  // Owns its TNNetGrammar.
   // Coded by Claude (AI).
   TNNetGrammarConstraint = class(TNNetTokenConstraint)
     private
@@ -676,13 +725,22 @@ type
       // has 256 possible answers per decode step, not one per vocabulary id.
       FFirstOK: array[0..255] of boolean;
       FFirstOKVersion: int64;
+      // Rule #27: see TNNetJSONConstraint.FTokFirstByte - the per-id gates read
+      // these flat tables instead of chasing the string table's pointers.
+      FTokFirstByte: array of byte;
+      FTokTextKind: array of byte;
       procedure BuildFirstOK();
+      procedure BuildTokenTables();
+      // Decides a token that carries text (2 <= TokenId <= High(FTokenStr));
+      // the caller must have refreshed FFirstOK for the machine's version.
+      function TextTokenAllowed(TokenId: integer): boolean;
     public
       constructor Create(const GBNFText: string; Dict: TStringListInt); overload;
       constructor CreateCharLevel(const GBNFText: string; VocabSize: integer);
       destructor Destroy(); override;
       procedure Reset(const PromptTokens: array of integer); override;
       function TokenAllowed(TokenId: integer): boolean; override;
+      procedure MaskAllowed(Probs: TNNetVolume); override;
       procedure Commit(TokenId: integer); override;
       // The live machine (after the committed tokens) for inspection.
       property Machine: TNNetGrammarMachine read FMachine;
@@ -2314,46 +2372,32 @@ function ContrastiveCosine(A, B: TNNetVolume): TNeuralFloat; forward;
 
 function DecodeCTCGreedy(Scores: TNNetVolume; Blank: integer): TNeuralIntegerArray;
 var
-  NumT, Vocab, ti, k, ArgMax, Prev, Count: integer;
-  NumTM1, VocabM1, base: integer;
-  Best, V: TNeuralFloat;
-  Path: TNeuralIntegerArray;
+  NumT, Vocab, ti, ArgMax, Prev, Count, FrameBase: integer;
+  NumTM1: integer;
 begin
   NumT := Scores.SizeX;
   Vocab := Scores.Depth;
   NumTM1 := NumT - 1;
-  VocabM1 := Vocab - 1;
   if Blank < 0 then Blank := Vocab - 1;
-  SetLength(Path, NumT);
-  // Argmax per frame.
-  for ti := 0 to NumTM1 do
-  begin
-    ArgMax := 0;
-    base := Scores.GetRawPos(ti, 0, 0);
-    Best := Scores.FData[base];
-    for k := 1 to VocabM1 do
-    begin
-      V := Scores.FData[base + k];
-      if V > Best then
-      begin
-        Best := V;
-        ArgMax := k;
-      end;
-    end;
-    Path[ti] := ArgMax;
-  end;
-  // Collapse adjacent repeats, then drop blanks.
   SetLength(Result, NumT);
   Count := 0;
   Prev := -1;
+  // Rule #13/#18: the per-frame argmax is TNNetVolume.MaxPos, whose scalar
+  // fallback is this scan element for element (strict >, so the first maximum
+  // wins on both paths) and whose AVX2 path reduces the frame in vector steps.
+  // The collapse-and-drop-blanks pass folds into the same loop, so no path
+  // array is materialised.
+  FrameBase := 0;   // #12: GetRawPos(ti, 0, 0) = ti * Vocab, carried by addition
   for ti := 0 to NumTM1 do
   begin
-    if (Path[ti] <> Prev) and (Path[ti] <> Blank) then
+    TNNetVolume.MaxPos(Scores.GetRawPtr(FrameBase), Vocab, ArgMax);
+    if (ArgMax <> Prev) and (ArgMax <> Blank) then
     begin
-      Result[Count] := Path[ti];
+      Result[Count] := ArgMax;
       Inc(Count);
     end;
-    Prev := Path[ti];
+    Prev := ArgMax;
+    Inc(FrameBase, Vocab);
   end;
   SetLength(Result, Count);
 end;
@@ -2429,8 +2473,13 @@ var
   // stay double: those accumulate products of probabilities across frames and
   // need the range.
   Prob: array of TNeuralFloat;
+  // Each candidate's total probability, alongside Cand and kept in step with it
+  // through the selection swaps: the pruning pass compares it O(NCand *
+  // BeamWidth) times, so it is materialised once per frame instead of being
+  // re-added out of the 24-byte records on every comparison.
+  CandTot: array of double;
   BestIdx: integer;
-  BestScore, Total, Sum, AddV: double;
+  BestScore, TmpTot, Sum, AddV: double;
   BeamPBv, BeamPNBv, SumPBNB: double;
   PHashJ: QWord;
 begin
@@ -2446,6 +2495,7 @@ begin
   SlotCap := BeamWidth * (Vocab + 1);
   SetLength(Prob, Vocab);
   SetLength(Cand, SlotCap);
+  SetLength(CandTot, SlotCap);
   SetLength(SlotCand, SlotCap);
   SetLength(ExtAlias, SlotCap);
   SetLength(CurPref, BeamWidth * Stride);
@@ -2488,8 +2538,14 @@ begin
 
     BeamsHi := BeamCount - 1;
     LiveSlots := BeamCount * (Vocab + 1);
-    FillDWord(SlotCand[0], LiveSlots, DWord(-1));
-    FillDWord(ExtAlias[0], LiveSlots, DWord(-1));
+    // Only the unchanged slots of SlotCand are ever read: an extension slot is
+    // consulted through ExtAlias, which redirects it to an unchanged slot, and
+    // an unaliased extension slot is always a fresh candidate. Conversely
+    // ExtAlias is only read at extension slots, which start at BeamCount. So
+    // each array is cleared over the range it is read from, not over all
+    // BeamCount * (Vocab + 1) slots.
+    FillDWord(SlotCand[0], BeamCount, DWord(-1));
+    FillDWord(ExtAlias[BeamCount], LiveSlots - BeamCount, DWord(-1));
 
     // Alias pass, O(BeamCount^2): a beam bj whose prefix is beam bi's prefix
     // plus one symbol makes extension slot (bi, lastsym) an alias of unchanged
@@ -2567,8 +2623,8 @@ begin
         if CSlot < 0 then
         begin
           // No alias: this extension slot is its own canonical slot, and no
-          // other (bi, k) pair addresses it, so it is always new.
-          SlotCand[ExtSlot] := NCand;
+          // other (bi, k) pair addresses it, so it is always new - and nothing
+          // reads SlotCand there, which is why it is not recorded.
           c := NCand;
           Inc(NCand);
           Cand[c].Parent := bi;
@@ -2606,25 +2662,26 @@ begin
     SortLimit := NCandHi - 1;
     if (NCand > BeamWidth) and (BeamWidth - 1 < SortLimit) then
       SortLimit := BeamWidth - 1;
+    for i := 0 to NCandHi do CandTot[i] := Cand[i].PB + Cand[i].PNB;
     for i := 0 to SortLimit do
     begin
       BestIdx := i;
-      BestScore := Cand[i].PB + Cand[i].PNB;
+      BestScore := CandTot[i];
       IP1 := i + 1;
       for j := IP1 to NCandHi do
-      begin
-        Total := Cand[j].PB + Cand[j].PNB;
-        if Total > BestScore then
+        if CandTot[j] > BestScore then
         begin
-          BestScore := Total;
+          BestScore := CandTot[j];
           BestIdx := j;
         end;
-      end;
       if BestIdx <> i then
       begin
         TmpCand := Cand[i];
         Cand[i] := Cand[BestIdx];
         Cand[BestIdx] := TmpCand;
+        TmpTot := CandTot[i];
+        CandTot[i] := CandTot[BestIdx];
+        CandTot[BestIdx] := TmpTot;
       end;
     end;
 
@@ -2739,7 +2796,7 @@ end;
 procedure TNNetTokenConstraint.MaskAllowed(Probs: TNNetVolume);
 var
   I, SizeM1: integer;
-  AllowedMass, InvMass: TNeuralFloat;
+  AllowedMass: TNeuralFloat;
   AnyBlocked, A: boolean;
 begin
   // Rule #17: lazily grow the persistent membership buffer, never per call.
@@ -2755,6 +2812,15 @@ begin
     then AllowedMass := AllowedMass + Probs.Raw[I]
     else AnyBlocked := true;
   end;
+  ApplyAllowedMask(Probs, AnyBlocked, AllowedMass);
+end;
+
+procedure TNNetTokenConstraint.ApplyAllowedMask(Probs: TNNetVolume;
+  AnyBlocked: boolean; AllowedMass: TNeuralFloat);
+var
+  I, SizeM1: integer;
+  InvMass: TNeuralFloat;
+begin
   // Nothing to mask: every token is allowed.
   if not AnyBlocked then exit;
   // FALLBACK (documented in the class header): zero allowed mass - leave the
@@ -2766,6 +2832,7 @@ begin
   // entries. Bit-identical: allowed entries get the same single multiply;
   // disallowed are scaled-then-zeroed = 0.
   Probs.Mul(InvMass);
+  SizeM1 := Probs.Size - 1;
   for I := 0 to SizeM1 do
     if not FAllowedBuf[I] then Probs.Raw[I] := 0;
 end;
@@ -2856,6 +2923,9 @@ begin
       Copy(Candidates[I], 0, Length(Candidates[I]));
   end;
   SetLength(FActive, Length(FCandidates));
+  // One allowed id per candidate at most, plus the two special ids.
+  SetLength(FStepIds, Length(FCandidates) + 2);
+  SetLength(FStepProbs, Length(FCandidates) + 2);
   Reset([]);
 end;
 
@@ -2902,6 +2972,70 @@ begin
   for I := 0 to Hi do
     if FActive[I] and (FDepth < Length(FCandidates[I])) and
       (FCandidates[I][FDepth] = TokenId) then exit(true);
+end;
+
+function TNNetForcedSequenceConstraint.CollectAllowedIds(Probs: TNNetVolume;
+  out AllowedMass: TNeuralFloat): integer;
+var
+  I, T, MaxCandPos, SizeM1: integer;
+
+  procedure TakeId(Id: integer);
+  begin
+    if FAllowedBuf[Id] then exit;   // the same id may head several candidates
+    FAllowedBuf[Id] := true;
+    FStepIds[Result] := Id;
+    FStepProbs[Result] := Probs.Raw[Id];
+    AllowedMass := AllowedMass + Probs.Raw[Id];
+    Inc(Result);
+  end;
+
+begin
+  Result := 0;
+  AllowedMass := 0;
+  SizeM1 := Probs.Size - 1;
+  // Special/EOS ids follow the Completed() rule exactly as TokenAllowed does -
+  // which is also why a candidate token below 2 is not taken by the trie branch
+  // below: TokenAllowed answers those from Completed(), never from the trie.
+  if Completed() then
+  begin
+    if SizeM1 >= 0 then TakeId(0);
+    if SizeM1 >= 1 then TakeId(1);
+  end;
+  MaxCandPos := High(FCandidates);
+  for I := 0 to MaxCandPos do
+    if FActive[I] and (FDepth < Length(FCandidates[I])) then
+    begin
+      T := FCandidates[I][FDepth];
+      if (T >= 2) and (T <= SizeM1) then TakeId(T);
+    end;
+  // Leave the shared membership buffer clear for the next call.
+  for I := 0 to Result - 1 do FAllowedBuf[FStepIds[I]] := false;
+end;
+
+procedure TNNetForcedSequenceConstraint.MaskAllowed(Probs: TNNetVolume);
+var
+  I, AllowedCount, MaxAllowedPos: integer;
+  AllowedMass, InvMass: TNeuralFloat;
+begin
+  // The trie allows at most one token per candidate, so the row is masked from
+  // that handful of ids instead of running TokenAllowed - itself a scan over the
+  // candidates - once per vocabulary id.
+  if Length(FAllowedBuf) < Probs.Size then SetLength(FAllowedBuf, Probs.Size);
+  AllowedCount := CollectAllowedIds(Probs, AllowedMass);
+  // The collected ids are distinct and all inside the row, so a count short of
+  // the row size is exactly "some token is disallowed". Both fallbacks of the
+  // base class hold: nothing blocked, and zero allowed mass, leave the row
+  // untouched.
+  if AllowedCount >= Probs.Size then exit;
+  if AllowedMass <= 0 then exit;
+  InvMass := 1.0 / AllowedMass;
+  // Same arithmetic as the base class - one multiply per allowed entry, zero
+  // everywhere else - written sparsely, so the disallowed entries are cleared in
+  // one bulk fill rather than tested one by one.
+  Probs.Fill(0);
+  MaxAllowedPos := AllowedCount - 1;
+  for I := 0 to MaxAllowedPos do
+    Probs.Raw[FStepIds[I]] := FStepProbs[I] * InvMass;
 end;
 
 procedure TNNetForcedSequenceConstraint.Commit(TokenId: integer);
@@ -3221,13 +3355,25 @@ begin
     if I < 2
     then FTokenStr[I] := '' // special ids carry no text
     else FTokenStr[I] := Dict.DeTokenize(I);
+  BuildTokenTables();
 end;
 
 constructor TNNetJSONConstraint.CreateCharLevel(VocabSize: integer);
+const
+  csMaxCharLevelVocab = 256; // Chr() alphabet: a token id is one byte
 var
   I, Hi: integer;
 begin
   inherited Create();
+  // The char-level convention maps token id to Chr(id), so the vocabulary
+  // cannot be wider than the byte alphabet - a subword vocabulary would alias
+  // ids 256..VocabSize-1 onto bytes instead of failing.
+  if VocabSize > csMaxCharLevelVocab then
+    raise EArgumentException.Create(
+      'TNNetJSONConstraint.CreateCharLevel: the char-level convention (token ' +
+      'id = character code) requires a vocabulary of at most ' +
+      IntToStr(csMaxCharLevelVocab) + ' ids; use Create(Dict) for a subword ' +
+      'vocabulary.');
   FMachine := TNNetJSONStateMachine.Create();
   FProbe := TNNetJSONStateMachine.Create();
   FFirstOKVersion := -1; // no table yet; machine versions start above zero
@@ -3237,6 +3383,7 @@ begin
     if I < 2
     then FTokenStr[I] := ''
     else FTokenStr[I] := Chr(I);
+  BuildTokenTables();
 end;
 
 destructor TNNetJSONConstraint.Destroy();
@@ -3263,37 +3410,97 @@ begin
   FFirstOKVersion := FMachine.Version;
 end;
 
-function TNNetJSONConstraint.TokenAllowed(TokenId: integer): boolean;
+procedure TNNetJSONConstraint.BuildTokenTables();
+var
+  I, Hi: integer;
+begin
+  Hi := High(FTokenStr);
+  SetLength(FTokFirstByte, Hi + 1);
+  SetLength(FTokTextKind, Hi + 1);
+  for I := 0 to Hi do
+    if FTokenStr[I] = '' then
+    begin
+      FTokFirstByte[I] := 0;
+      FTokTextKind[I] := 0;
+    end
+    else
+    begin
+      FTokFirstByte[I] := Ord(FTokenStr[I][1]);
+      if Length(FTokenStr[I]) = 1
+      then FTokTextKind[I] := 1
+      else FTokTextKind[I] := 2;
+    end;
+end;
+
+function TNNetJSONConstraint.TextTokenAllowed(TokenId: integer): boolean;
 var
   S: string;
-  I, LenS: integer;
+  I, LenS, Kind: integer;
 begin
-  if (TokenId < 0) or (TokenId > High(FTokenStr)) then exit(false);
-  // Special/EOS ids: legal exactly when a complete top-level value stands.
-  if TokenId < 2 then exit(FMachine.IsComplete());
-  S := FTokenStr[TokenId];
-  if S = '' then exit(false); // would not advance generation
+  Kind := FTokTextKind[TokenId];
+  if Kind = 0 then exit(false); // empty token: would not advance generation
   // First-character gate: the probe's first FeedChar starts from exactly the
   // state FFirstOK was built from, so a token whose first byte the machine
   // rejects can never be fed - and this skips the CopyFrom deep copy plus the
-  // per-character feed for the vast majority of the vocabulary. The table is
-  // per state, hence rebuilt exactly when the machine's version moves.
-  if FFirstOKVersion <> FMachine.Version then BuildFirstOK();
-  if not FFirstOK[Ord(S[1])] then exit(false);
+  // per-character feed for the vast majority of the vocabulary.
+  if not FFirstOK[FTokFirstByte[TokenId]] then exit(false);
   // A one-character token is fully decided by that prefilter. FFirstOK[c] is
   // FMachine.CharAllowed(c), CharAllowed is save-state / FeedChar / restore, so
   // its boolean IS FeedChar's; and FProbe is an exact clone of FMachine, so
   // FProbe.FeedChar(S[1]) would return that same boolean. Char-level
   // constraints (CreateCharLevel) make this 100% of the vocabulary, and it
   // skips the CopyFrom state clone plus the feed entirely.
-  LenS := Length(S);
-  if LenS = 1 then exit(true);
+  if Kind = 1 then exit(true);
   // Transitive multi-character validation: clone the live state and feed the
   // token's characters one by one; ALL must be legal continuations.
+  S := FTokenStr[TokenId];
+  LenS := Length(S);
   FProbe.CopyFrom(FMachine);
   for I := 1 to LenS do
     if not FProbe.FeedChar(S[I]) then exit(false);
   Result := true;
+end;
+
+function TNNetJSONConstraint.TokenAllowed(TokenId: integer): boolean;
+begin
+  if (TokenId < 0) or (TokenId > High(FTokenStr)) then exit(false);
+  // Special/EOS ids: legal exactly when a complete top-level value stands.
+  if TokenId < 2 then exit(FMachine.IsComplete());
+  // The first-character table is per state, hence rebuilt exactly when the
+  // machine's version moves.
+  if FFirstOKVersion <> FMachine.Version then BuildFirstOK();
+  Result := TextTokenAllowed(TokenId);
+end;
+
+procedure TNNetJSONConstraint.MaskAllowed(Probs: TNNetVolume);
+var
+  I, SizeM1, MaxTokenPos: integer;
+  AllowedMass: TNeuralFloat;
+  AnyBlocked, A, SpecialOK: boolean;
+begin
+  // Rule #5: nothing in the row scan feeds FMachine, so TokenAllowed's two
+  // per-call machine queries - the first-character table's version check and
+  // the special-id completion verdict - are invariant across the whole row and
+  // are taken once here instead of once per vocabulary id, along with the
+  // virtual dispatch itself.
+  if Length(FAllowedBuf) < Probs.Size then SetLength(FAllowedBuf, Probs.Size);
+  if FFirstOKVersion <> FMachine.Version then BuildFirstOK();
+  SpecialOK := FMachine.IsComplete();
+  MaxTokenPos := High(FTokenStr);
+  SizeM1 := Probs.Size - 1;
+  AllowedMass := 0;
+  AnyBlocked := false;
+  for I := 0 to SizeM1 do
+  begin
+    if I > MaxTokenPos then A := false
+    else if I < 2 then A := SpecialOK
+    else A := TextTokenAllowed(I);
+    FAllowedBuf[I] := A;
+    if A
+    then AllowedMass := AllowedMass + Probs.Raw[I]
+    else AnyBlocked := true;
+  end;
+  ApplyAllowedMask(Probs, AnyBlocked, AllowedMass);
 end;
 
 procedure TNNetJSONConstraint.Commit(TokenId: integer);
@@ -3308,9 +3515,13 @@ end;
 { TNNetGrammar }
 
 const
-  // Packed position = Rule * KGrammarStride + ElementIndex. A rule body of more
-  // than KGrammarStride elements would collide; far beyond any practical GBNF.
-  KGrammarStride = 1000000;
+  // Packed position = (Rule shl KGrammarStrideBits) + ElementIndex. A rule body
+  // of more than KGrammarStride elements would collide; far beyond any
+  // practical GBNF. The stride is a power of two so pack/unpack are shifts and
+  // a mask rather than a multiply and two divides (#15).
+  KGrammarStrideBits = 20;
+  KGrammarStride = 1 shl KGrammarStrideBits;
+  KGrammarIdxMask = KGrammarStride - 1;
 
 constructor TNNetGrammar.Create(const GBNFText: string);
 begin
@@ -3384,7 +3595,7 @@ end;
 function TNNetGrammar.AddCharSet(
   const ARanges: array of TNNetGrammarRange): integer;
 var
-  I, Base, ARangesHi: integer;
+  I, C, Base, ARangesHi: integer;
 begin
   Base := Length(FRanges);
   SetLength(FRanges, Base + Length(ARanges));
@@ -3394,6 +3605,13 @@ begin
   SetLength(FCharSets, Result + 1);
   FCharSets[Result].First := Base;
   FCharSets[Result].Count := Length(ARanges);
+  // Rule #27: expand the ranges into a byte-indexed membership table here, once
+  // per class, instead of walking them per candidate character at run time.
+  SetLength(FSetTable, Result + 1);
+  for C := 0 to 255 do FSetTable[Result][C] := false;
+  for I := 0 to ARangesHi do
+    for C := Ord(ARanges[I].Lo) to Ord(ARanges[I].Hi) do
+      FSetTable[Result][C] := true;
 end;
 
 // Appends one element to a growing element array.
@@ -3631,6 +3849,40 @@ begin
   end;
 end;
 
+procedure TNNetGrammar.BuildRuleAlternates();
+var
+  R, K, AltIdx, AltCount, MaxRulePos, MaxElemPos: integer;
+begin
+  MaxRulePos := Length(FRules) - 1;
+  SetLength(FRuleAlts, MaxRulePos + 1);
+  for R := 0 to MaxRulePos do
+  begin
+    MaxElemPos := Length(FRules[R]) - 1;
+    if MaxElemPos < 0 then
+    begin
+      // A rule that is referenced but never defined has an empty body. Its
+      // single out-of-range alternate keeps the run-time behaviour of the body
+      // scan this table replaces.
+      SetLength(FRuleAlts[R], 1);
+      FRuleAlts[R][0] := 0;
+      continue;
+    end;
+    AltCount := 0;
+    AltIdx := 0;
+    while true do
+    begin
+      SetLength(FRuleAlts[R], AltCount + 1);
+      FRuleAlts[R][AltCount] := AltIdx;
+      Inc(AltCount);
+      K := AltIdx;
+      while (FRules[R][K].ElemType <> getAlt) and
+            (FRules[R][K].ElemType <> getEnd) do Inc(K);
+      if FRules[R][K].ElemType = getEnd then break;
+      AltIdx := K + 1;
+    end;
+  end;
+end;
+
 procedure TNNetGrammar.Compile();
 // Splits the source into 'name ::= body' definitions (continuation lines fold
 // into the previous def), pre-registers names so forward refs resolve, parses
@@ -3711,6 +3963,9 @@ begin
     Defs.Free;
   end;
 
+  // Every rule body, helper rules included, is in place by now.
+  BuildRuleAlternates();
+
   FRootRule := FRuleNames.IndexOf('root');
   if FRootRule < 0 then
     raise EAssertionFailed.Create('TNNetGrammar: no ''root'' rule defined');
@@ -3727,13 +3982,13 @@ end;
 
 function TNNetGrammarMachine.PackPos(Rule, Idx: integer): integer;
 begin
-  Result := Rule * KGrammarStride + Idx;
+  Result := (Rule shl KGrammarStrideBits) + Idx;
 end;
 
 procedure TNNetGrammarMachine.UnpackPos(Pos: integer; out Rule, Idx: integer);
 begin
-  Rule := Pos div KGrammarStride;
-  Idx := Pos mod KGrammarStride;
+  Rule := Pos shr KGrammarStrideBits;
+  Idx := Pos and KGrammarIdxMask;
 end;
 
 function TNNetGrammarMachine.ScratchHas(const Src: array of integer;
@@ -3770,59 +4025,89 @@ begin
   Inc(FScratchCount);
 end;
 
-procedure TNNetGrammarMachine.AddStackExpanded(const Src: array of integer;
-  Len: integer);
-// Descends the stack top: rule-refs are expanded (forking on each alternate),
-// getEnd/getAlt pop, terminals (or empty stacks) come to rest in the scratch
-// set. Recursion depth is bounded by the grammar nesting + recursion depth of
-// the partial parse.
-var
-  D, WLen: integer;
-  TopPos, Rule, Idx, RefRule, ContPos: integer;
-  Elem: TNNetGrammarElem;
+function TNNetGrammarMachine.BeginWorkFrame(const Src: array of integer;
+  Len, Capacity: integer): integer;
 begin
   // Rule #17: this frame's work buffer comes from the persistent pool. Src is
-  // always a shallower slot or an external buffer, never FWorkPool[D] itself.
-  D := FWorkDepth;
-  if D >= Length(FWorkPool) then SetLength(FWorkPool, D + 8);
-  if Length(FWorkPool[D]) < Len then SetLength(FWorkPool[D], Len + 8);
+  // always a shallower slot or an external buffer, never FWorkPool[Result].
+  Result := FWorkDepth;
+  if Result >= Length(FWorkPool) then SetLength(FWorkPool, Result + 8);
+  if Length(FWorkPool[Result]) < Capacity then
+    SetLength(FWorkPool[Result], Capacity + 8);
   // Contiguous integer copy -> Move (rule #13 / App. C).
-  if Len > 0 then Move(Src[0], FWorkPool[D][0], Len * csIntegerSize);
-  WLen := Len;
+  if Len > 0 then Move(Src[0], FWorkPool[Result][0], Len * csIntegerSize);
   Inc(FWorkDepth);
+end;
 
-  if WLen = 0 then AddStackRaw(FWorkPool[D], 0)
-  else
+procedure TNNetGrammarMachine.ExpandWorkFrame(D, Len: integer);
+// Descends the stack top: rule-refs are expanded (forking on each alternate),
+// getEnd/getAlt pop, terminals (or empty stacks) come to rest in the scratch
+// set. A pop only shortens the same frame, so it iterates here instead of
+// recursing; recursion is left to the rule-ref fork, whose depth is bounded by
+// the grammar nesting + recursion depth of the partial parse.
+var
+  WLen, TopPos, Rule, Idx: integer;
+  Elem: TNNetGrammarElem;
+begin
+  WLen := Len;
+  while true do
   begin
+    if WLen = 0 then
+    begin
+      AddStackRaw(FWorkPool[D], 0);
+      exit;
+    end;
     TopPos := FWorkPool[D][WLen - 1];
     UnpackPos(TopPos, Rule, Idx);
     // Rule #4/#7: bind the ELEMENT record, not the rule body. A
     // TNNetGrammarElemArray local is managed, so it would cost an
     // fpc_dynarray_assign plus the implicit try/finally frame FPC wraps around
-    // the whole (recursive) routine; the record copy is two words.
+    // the whole routine; the record copy is two words.
     Elem := FGrammar.FRules[Rule][Idx];
 
     case Elem.ElemType of
       getEnd, getAlt:
-        begin
-          // End of an alternate/rule: pop and continue with the parent.
-          Dec(WLen);
-          AddStackExpanded(FWorkPool[D], WLen);
-        end;
+        // End of an alternate/rule: pop and continue with the parent.
+        Dec(WLen);
       getRuleRef:
         begin
-          RefRule := Elem.Value;
-          ContPos := PackPos(Rule, Idx + 1);
-          // Continuation replaces the ref on top.
-          FWorkPool[D][WLen - 1] := ContPos;
+          // The continuation replaces the ref on top. PackPos(Rule, Idx + 1) is
+          // TopPos + 1: the element index is the low field of the packed
+          // position and cannot carry into the rule field for any rule body
+          // shorter than KGrammarStride.
+          FWorkPool[D][WLen - 1] := TopPos + 1;
           // Fork into each alternate of the referenced rule.
-          PushRuleAlternates(FWorkPool[D], WLen, RefRule);
+          PushRuleAlternates(FWorkPool[D], WLen, Elem.Value);
+          exit;
         end;
       else
-        // Terminal top: a valid resting state.
-        AddStackRaw(FWorkPool[D], WLen);
+        begin
+          // Terminal top: a valid resting state.
+          AddStackRaw(FWorkPool[D], WLen);
+          exit;
+        end;
     end;
   end;
+end;
+
+procedure TNNetGrammarMachine.AddStackExpanded(const Src: array of integer;
+  Len: integer);
+var
+  D: integer;
+begin
+  D := BeginWorkFrame(Src, Len, Len);
+  ExpandWorkFrame(D, Len);
+  FWorkDepth := D;
+end;
+
+procedure TNNetGrammarMachine.AddStackAdvanced(const Src: array of integer;
+  Len, NewTop: integer);
+var
+  D: integer;
+begin
+  D := BeginWorkFrame(Src, Len, Len);
+  FWorkPool[D][Len - 1] := NewTop;
+  ExpandWorkFrame(D, Len);
   FWorkDepth := D;
 end;
 
@@ -3832,54 +4117,45 @@ procedure TNNetGrammarMachine.PushRuleAlternates(const Base: array of integer;
 // Base[0..BaseLen-1] and expand. An empty alternate's first position is its
 // getEnd, which AddStackExpanded pops to continue with Base.
 var
-  D, AltIdx, K, BaseLenP1: integer;
-  RefBody: TNNetGrammarElemArray;
+  D, A, MaxAltPos, BaseLenP1: integer;
 begin
-  RefBody := FGrammar.FRules[RuleIdx];
-  // Rule #17: this frame's work buffer comes from the persistent pool (see
-  // AddStackExpanded). The base bytes never change across alternates, so they
-  // are copied once; only the top slot is rewritten per alternate.
-  D := FWorkDepth;
+  // The base entries never change across alternates, so they are copied once
+  // into this frame's pooled buffer; only the top slot is rewritten per
+  // alternate.
   BaseLenP1 := BaseLen + 1;
-  if D >= Length(FWorkPool) then SetLength(FWorkPool, D + 8);
-  if Length(FWorkPool[D]) < BaseLenP1 then
-    SetLength(FWorkPool[D], BaseLenP1 + 8);
-  // Contiguous integer copy -> Move (rule #13 / App. C).
-  if BaseLen > 0 then Move(Base[0], FWorkPool[D][0], BaseLen * csIntegerSize);
-  Inc(FWorkDepth);
-  AltIdx := 0;
-  while true do
+  D := BeginWorkFrame(Base, BaseLen, BaseLenP1);
+  // Rule #27: the alternates' start indices come from the table the grammar
+  // built at compile time, so the body is not rescanned for its separators on
+  // every fork. Indexed in place: binding the row to a managed local would cost
+  // an fpc_dynarray_assign plus a try/finally frame per call.
+  MaxAltPos := Length(FGrammar.FRuleAlts[RuleIdx]) - 1;
+  for A := 0 to MaxAltPos do
   begin
-    FWorkPool[D][BaseLen] := PackPos(RuleIdx, AltIdx);
+    FWorkPool[D][BaseLen] := PackPos(RuleIdx, FGrammar.FRuleAlts[RuleIdx][A]);
+    // Expansion pops and rewrites its frame's entries, so it must run on its
+    // own copy - this frame still has to serve the remaining alternates.
     AddStackExpanded(FWorkPool[D], BaseLenP1);
-    K := AltIdx;
-    while (RefBody[K].ElemType <> getAlt) and
-          (RefBody[K].ElemType <> getEnd) do Inc(K);
-    if RefBody[K].ElemType = getEnd then break;
-    AltIdx := K + 1;
   end;
   FWorkDepth := D;
 end;
 
 procedure TNNetGrammarMachine.CommitScratchToActive();
 var
-  I, FScratchCountM1: integer;
+  TmpStacks: array of array of integer;
+  TmpLen: array of integer;
 begin
-  if Length(FStacks) < FScratchCount then
-  begin
-    SetLength(FStacks, FScratchCount);
-    SetLength(FStackLen, FScratchCount);
-  end;
-  FScratchCountM1 := FScratchCount - 1;
-  for I := 0 to FScratchCountM1 do
-  begin
-    if Length(FStacks[I]) < FScratchLen[I] then
-      SetLength(FStacks[I], FScratchLen[I] + 8);
-    // Contiguous integer copy -> Move (rule #13 / App. C).
-    if FScratchLen[I] > 0 then
-      Move(FScratch[I][0], FStacks[I][0], FScratchLen[I] * csIntegerSize);
-    FStackLen[I] := FScratchLen[I];
-  end;
+  // Swap the buffer references instead of copying every stack: the retired
+  // active buffers become the next call's scratch. Safe because the builder
+  // only ever READS the active set (FeedChar walks FStacks while AddStackRaw
+  // fills FScratch) and resets FScratchCount to 0 before reusing it, so no live
+  // stack is ever aliased. This is the ping-pong DecodeCTCBeamSearch uses for
+  // its prefix buffers.
+  TmpStacks := FStacks;
+  FStacks := FScratch;
+  FScratch := TmpStacks;
+  TmpLen := FStackLen;
+  FStackLen := FScratchLen;
+  FScratchLen := TmpLen;
   FStackCount := FScratchCount;
 end;
 
@@ -3923,7 +4199,7 @@ end;
 
 function TNNetGrammarMachine.ElemMatches(Pos: integer; C: char): boolean;
 var
-  Rule, Idx, SetIdx, R, RMax, SetFirst: integer;
+  Rule, Idx: integer;
   Elem: TNNetGrammarElem;
   InSet: boolean;
 begin
@@ -3940,15 +4216,8 @@ begin
     getCharAny: Result := C <> #0;
     getCharSet, getCharSetNot:
       begin
-        SetIdx := Elem.Value;
-        InSet := false;
-        // FGrammar.FCharSets[SetIdx] resolved once for both First and Count.
-        SetFirst := FGrammar.FCharSets[SetIdx].First;
-        RMax := SetFirst + FGrammar.FCharSets[SetIdx].Count - 1;
-        for R := SetFirst to RMax do
-          if (C >= FGrammar.FRanges[R].Lo) and
-             (C <= FGrammar.FRanges[R].Hi) then
-          begin InSet := true; break; end;
+        // Rule #27: one table read instead of a walk over the class's ranges.
+        InSet := FGrammar.FSetTable[Elem.Value][Ord(C)];
         if Elem.ElemType = getCharSet
         then Result := InSet
         else Result := (not InSet) and (C <> #0);
@@ -3959,7 +4228,7 @@ end;
 
 function TNNetGrammarMachine.FeedChar(C: char): boolean;
 var
-  I, TopPos, Rule, Idx, FStackCountM1, StkLen: integer;
+  I, TopPos, FStackCountM1, StkLen: integer;
 begin
   Inc(FVersion);
   FScratchCount := 0;
@@ -3970,15 +4239,12 @@ begin
     if StkLen = 0 then continue; // a completed stack accepts nothing
     TopPos := FStacks[I][StkLen - 1];
     if ElemMatches(TopPos, C) then
-    begin
-      UnpackPos(TopPos, Rule, Idx);
-      // Rule #17: reuse the persistent advance buffer (FeedChar is not
-      // re-entrant) instead of a fresh SetLength per matched stack.
-      if Length(FAdvBuf) < StkLen then SetLength(FAdvBuf, StkLen + 8);
-      Move(FStacks[I][0], FAdvBuf[0], StkLen * csIntegerSize);
-      FAdvBuf[StkLen - 1] := PackPos(Rule, Idx + 1);
-      AddStackExpanded(FAdvBuf, StkLen);
-    end;
+      // The matched element is consumed, so the stack advances to the next
+      // element of the same rule - the packed position plus one (the element
+      // index is the low field and cannot carry into the rule field). The
+      // advance lands directly in the expansion's own work frame, so no
+      // intermediate buffer and no second copy.
+      AddStackAdvanced(FStacks[I], StkLen, TopPos + 1);
   end;
   Result := FScratchCount > 0;
   CommitScratchToActive();
@@ -4041,14 +4307,26 @@ begin
     if I < 2
     then FTokenStr[I] := ''
     else FTokenStr[I] := Dict.DeTokenize(I);
+  BuildTokenTables();
 end;
 
 constructor TNNetGrammarConstraint.CreateCharLevel(const GBNFText: string;
   VocabSize: integer);
+const
+  csMaxCharLevelVocab = 256; // Chr() alphabet: a token id is one byte
 var
   I, Hi: integer;
 begin
   inherited Create();
+  // The char-level convention maps token id to Chr(id), so the vocabulary
+  // cannot be wider than the byte alphabet - a subword vocabulary would alias
+  // ids 256..VocabSize-1 onto bytes instead of failing.
+  if VocabSize > csMaxCharLevelVocab then
+    raise EArgumentException.Create(
+      'TNNetGrammarConstraint.CreateCharLevel: the char-level convention ' +
+      '(token id = character code) requires a vocabulary of at most ' +
+      IntToStr(csMaxCharLevelVocab) + ' ids; use Create(GBNFText, Dict) for a ' +
+      'subword vocabulary.');
   FGrammar := TNNetGrammar.Create(GBNFText);
   FMachine := TNNetGrammarMachine.Create(FGrammar);
   FProbe := TNNetGrammarMachine.Create(FGrammar);
@@ -4059,6 +4337,7 @@ begin
     if I < 2
     then FTokenStr[I] := ''
     else FTokenStr[I] := Chr(I);
+  BuildTokenTables();
 end;
 
 destructor TNNetGrammarConstraint.Destroy();
@@ -4086,40 +4365,99 @@ begin
   FFirstOKVersion := FMachine.Version;
 end;
 
-function TNNetGrammarConstraint.TokenAllowed(TokenId: integer): boolean;
+procedure TNNetGrammarConstraint.BuildTokenTables();
+var
+  I, Hi: integer;
+begin
+  Hi := High(FTokenStr);
+  SetLength(FTokFirstByte, Hi + 1);
+  SetLength(FTokTextKind, Hi + 1);
+  for I := 0 to Hi do
+    if FTokenStr[I] = '' then
+    begin
+      FTokFirstByte[I] := 0;
+      FTokTextKind[I] := 0;
+    end
+    else
+    begin
+      FTokFirstByte[I] := Ord(FTokenStr[I][1]);
+      if Length(FTokenStr[I]) = 1
+      then FTokTextKind[I] := 1
+      else FTokTextKind[I] := 2;
+    end;
+end;
+
+function TNNetGrammarConstraint.TextTokenAllowed(TokenId: integer): boolean;
 var
   S: string;
-  I, LenS: integer;
+  I, LenS, Kind: integer;
 begin
-  if (TokenId < 0) or (TokenId > High(FTokenStr)) then exit(false);
-  // Special/EOS ids: legal exactly when the grammar is in a complete state.
-  if TokenId < 2 then exit(FMachine.IsComplete());
-  S := FTokenStr[TokenId];
-  if S = '' then exit(false);
+  Kind := FTokTextKind[TokenId];
+  if Kind = 0 then exit(false);
   // Rule #14/#17: FeedChar returns FScratchCount > 0, and the scratch is only
   // ever written inside its "if ElemMatches(TopPos, C)" branch - so a char no
   // active stack top matches can NEVER be fed. CharAllowed decides exactly that,
   // read-only and allocation-free, on FMachine (FProbe would be its clone). The
   // vast majority of the vocabulary dies on its first character, so this guard
-  // skips the CopyFrom deep copy and the FeedChar advance-buffer work entirely.
-  // Rule #27: that verdict depends only on the machine state, so it is answered
-  // from a 256-entry table rebuilt exactly when the machine's version moves -
-  // once per decode step instead of once per vocabulary id.
-  if FFirstOKVersion <> FMachine.Version then BuildFirstOK();
-  if not FFirstOK[Ord(S[1])] then exit(false);
+  // skips the CopyFrom deep copy and the FeedChar expansion work entirely.
+  if not FFirstOK[FTokFirstByte[TokenId]] then exit(false);
   // A one-character token is fully decided by that gate: FeedChar reaches
-  // AddStackExpanded exactly on the stacks whose top ElemMatches, and that call
+  // AddStackAdvanced exactly on the stacks whose top ElemMatches, and that call
   // always lands at least one entry in an empty scratch set (AddStackRaw's
   // dedupe cannot reject the first one), so FScratchCount > 0 <=> some top
   // matched <=> CharAllowed. Char-level constraints make this 100% of the
   // vocabulary, and it skips the CopyFrom deep copy plus the feed entirely.
-  LenS := Length(S);
-  if LenS = 1 then exit(true);
+  if Kind = 1 then exit(true);
   // Transitive multi-character validation on a forked machine.
+  S := FTokenStr[TokenId];
+  LenS := Length(S);
   FProbe.CopyFrom(FMachine);
   for I := 1 to LenS do
     if not FProbe.FeedChar(S[I]) then exit(false);
   Result := true;
+end;
+
+function TNNetGrammarConstraint.TokenAllowed(TokenId: integer): boolean;
+begin
+  if (TokenId < 0) or (TokenId > High(FTokenStr)) then exit(false);
+  // Special/EOS ids: legal exactly when the grammar is in a complete state.
+  if TokenId < 2 then exit(FMachine.IsComplete());
+  // Rule #27: the first-character verdict depends only on the machine state, so
+  // it is answered from a 256-entry table rebuilt exactly when the machine's
+  // version moves - once per decode step instead of once per vocabulary id.
+  if FFirstOKVersion <> FMachine.Version then BuildFirstOK();
+  Result := TextTokenAllowed(TokenId);
+end;
+
+procedure TNNetGrammarConstraint.MaskAllowed(Probs: TNNetVolume);
+var
+  I, SizeM1, MaxTokenPos: integer;
+  AllowedMass: TNeuralFloat;
+  AnyBlocked, A, SpecialOK: boolean;
+begin
+  // Rule #5: nothing in the row scan feeds FMachine, so TokenAllowed's two
+  // per-call machine queries - the first-character table's version check and
+  // the special-id completion verdict - are invariant across the whole row and
+  // are taken once here instead of once per vocabulary id, along with the
+  // virtual dispatch itself.
+  if Length(FAllowedBuf) < Probs.Size then SetLength(FAllowedBuf, Probs.Size);
+  if FFirstOKVersion <> FMachine.Version then BuildFirstOK();
+  SpecialOK := FMachine.IsComplete();
+  MaxTokenPos := High(FTokenStr);
+  SizeM1 := Probs.Size - 1;
+  AllowedMass := 0;
+  AnyBlocked := false;
+  for I := 0 to SizeM1 do
+  begin
+    if I > MaxTokenPos then A := false
+    else if I < 2 then A := SpecialOK
+    else A := TextTokenAllowed(I);
+    FAllowedBuf[I] := A;
+    if A
+    then AllowedMass := AllowedMass + Probs.Raw[I]
+    else AnyBlocked := true;
+  end;
+  ApplyAllowedMask(Probs, AnyBlocked, AllowedMass);
 end;
 
 procedure TNNetGrammarConstraint.Commit(TokenId: integer);
@@ -5491,15 +5829,14 @@ begin
   end;
   TNNetVolume.Ln(RowPtr, RowPtr, Size);   // Row   := ln(cond)
   TNNetVolume.Ln(UncPtr, UncPtr, Size);   // Uncond := ln(uncond)
-  Row.Sub(UncondRow);                           // cond - uncond
-  Row.Mul(FGuidanceScale);                       // scale*(cond - uncond)
-  Row.Add(UncondRow);                            // + uncond = Combined
+  // #13/App D: scale*cond + (1-scale)*uncond is the same combination in two
+  // passes (a scale then a fused multiply-add) instead of sub/scale/add.
+  Row.Mul(FGuidanceScale);                       // scale*cond
+  Row.MulAdd(1.0 - FGuidanceScale, UncondRow);   // + (1-scale)*uncond
   // Softmax the combined logits back into a probability row (the chain's
-  // documented domain).
+  // documented domain). #13/#19: one fused exp-and-sum pass over the row.
   MaxL := Row.GetMax();
-  Row.Add(-MaxL);
-  TNNetVolume.Exp(RowPtr, RowPtr, Size);
-  Sum := Row.GetSum();
+  Sum := TNNetVolume.ExpShiftSum(RowPtr, RowPtr, MaxL, Size);
   if Sum > 0 then
     Row.Mul(1.0 / Sum);
 end;
@@ -6147,7 +6484,7 @@ var
   LastText, CandText: string;
   Allowed: TNeuralIntegerArray;
   TokenCnt, AllowedCount, VocabCount, LastLen, Roll, RollIdx, Tok: integer;
-  PromptLenM1, VocabCountM1, RollStart: integer;
+  PromptLenM1, VocabCountM1, RollStart, CandLen: integer;
   HasStrictExtension: boolean;
 begin
   Result := nil;
@@ -6177,12 +6514,15 @@ begin
   for TokenCnt := 0 to VocabCountM1 do
   begin
     CandText := Dict.DeTokenize(TokenCnt);
-    if (Length(CandText) >= LastLen) and
-       (Copy(CandText, 1, LastLen) = LastText) then
+    CandLen := Length(CandText);
+    // #23/App C: exact prefix compare via CompareMem - no Copy heap-string
+    // allocation per vocabulary id (guarded by CandLen >= LastLen >= 1).
+    if (CandLen >= LastLen) and
+       CompareMem(@CandText[1], @LastText[1], LastLen) then
     begin
       Allowed[AllowedCount] := TokenCnt;
       Inc(AllowedCount);
-      if Length(CandText) > LastLen then HasStrictExtension := true;
+      if CandLen > LastLen then HasStrictExtension := true;
     end;
   end;
   // Without a strict extension the only allowed continuation re-emits the
@@ -6561,18 +6901,20 @@ end;
 function MatchStopStringSuffix(const Text: string;
   const StopStrings: array of string): integer;
 var
-  S, L: integer;
+  S, L, TextLen: integer;
   StopStringsHi: integer;
 begin
   Result := 0;
+  TextLen := Length(Text); // #5: invariant across the probes
+  if TextLen = 0 then exit; // no suffix can match
   StopStringsHi := High(StopStrings);
   for S := 0 to StopStringsHi do
   begin
     L := Length(StopStrings[S]);
     // #13/App C: exact single-byte suffix compare via CompareMem - no Copy
-    // heap-string alloc per probe (guarded by L >= 1 and L <= Length(Text)).
-    if (L > Result) and (L >= 1) and (L <= Length(Text)) and
-      CompareMem(@Text[Length(Text) - L + 1], @StopStrings[S][1], L) then
+    // heap-string alloc per probe (guarded by L >= 1 and L <= TextLen).
+    if (L > Result) and (L >= 1) and (L <= TextLen) and
+      CompareMem(@Text[TextLen - L + 1], @StopStrings[S][1], L) then
       Result := L;
   end;
 end;
@@ -6625,28 +6967,23 @@ begin
       // is allowed fall back to the plain argmax (same policy as
       // TNNetTokenConstraint.MaskAllowed). Original > tie-break preserved.
       // #4: carry the running best value in a local instead of reloading
-      // Raw[Best] every iteration.
+      // Raw[Best] every iteration. #20: the cheap score test runs first, so
+      // the TokenAllowed call is paid only by a token that beats the running
+      // max - the conjunction picks the same tokens either way.
       Best := -1;
       BestVal := 0;
       if Assigned(Constraint) then
         for I := 0 to VocabSizeM1 do
-          if Constraint.TokenAllowed(I) and
-            ((Best < 0) or (OutputVolume.Raw[I] > BestVal)) then
+          if ((Best < 0) or (OutputVolume.Raw[I] > BestVal)) and
+            Constraint.TokenAllowed(I) then
           begin
             Best := I;
             BestVal := OutputVolume.Raw[I];
           end;
+      // #18: the unconstrained argmax is one vectorized MaxPos pass (ties go to
+      // the lower index, exactly as the scalar > loop did).
       if Best < 0 then
-      begin
-        Best := 0;
-        BestVal := OutputVolume.Raw[0];
-        for I := 1 to VocabSizeM1 do
-          if OutputVolume.Raw[I] > BestVal then
-          begin
-            Best := I;
-            BestVal := OutputVolume.Raw[I];
-          end;
-      end;
+        BestVal := TNNetVolume.MaxPos(OutputVolume.DataPtr, VocabSize, Best);
       Result.SumLogProb := Result.SumLogProb + SafeLogProb(OutputVolume.Raw[Best] / Total);
       if Assigned(Constraint) then Constraint.Commit(Best);
       if Best = csDecodeEOSToken then
@@ -6696,8 +7033,8 @@ function DecodeBatchGreedy(NN: TNNet; const Prompts: array of string;
   MaxLen: integer;
   const StopStrings: array of string): TNNetDecodeResultArray;
 var
-  N, R, Step, VocabSize, Best, I, StopLen: integer;
-  NM1, VocabSizeM1: integer;
+  N, R, Step, VocabSize, Best, StopLen: integer;
+  NM1: integer;
   InVols, OutVols: array of TNNetVolume;
   Contexts: array of string;
   Done: array of boolean;
@@ -6710,7 +7047,6 @@ begin
   if N = 0 then Exit;
   NM1 := N - 1;
   VocabSize := NN.GetLastLayer().Output.Size;
-  VocabSizeM1 := VocabSize - 1;
   SetLength(InVols, N);
   SetLength(OutVols, N);
   SetLength(Contexts, N);
@@ -6739,18 +7075,11 @@ begin
         // Rule #14: rank on the raw distribution (SafeLogProb is monotonic,
         // /Total a shared positive constant), one SafeLogProb for the winner.
         Total := NextTokenForward(NN, Contexts[R], InVols[R], OutVols[R]);
-        // #4/#7: bind the row volume once; carry the running best value; also
-        // avoids the OutVols[R] accessor re-indexing Raw[Best] each iteration.
+        // #7/#18: bind the row volume once, then one vectorized MaxPos pass
+        // (ties go to the lower index, exactly as the scalar > loop did).
         RowV := OutVols[R];
-        Best := 0;
-        BestVal := RowV.Raw[0];
-        for I := 1 to VocabSizeM1 do
-          if RowV.Raw[I] > BestVal then
-          begin
-            Best := I;
-            BestVal := RowV.Raw[I];
-          end;
-        Result[R].SumLogProb := Result[R].SumLogProb + SafeLogProb(RowV.Raw[Best] / Total);
+        BestVal := TNNetVolume.MaxPos(RowV.DataPtr, VocabSize, Best);
+        Result[R].SumLogProb := Result[R].SumLogProb + SafeLogProb(BestVal / Total);
         if Best = csDecodeEOSToken then
         begin
           Result[R].Finished := True;
@@ -6826,13 +7155,15 @@ function DecodeContrastiveSearch(NN: TNNet; const Prompt: string;
 var
   InputVolume, OutputVolume: TNNetVolume;
   HiddenLayer: TNNetLayer;
-  Probs: array of TNeuralFloat;
+  PRaw: TNeuralFloatArrPtr;        // the step's raw next-token row
+  CandP: array of TNeuralFloat;    // normalised probability of each candidate
   Cand: array of integer;          // current top-k candidate token ids
   Past: array of TNNetVolume;      // hidden states of already-processed tokens
   CandHidden: TNNetVolume;         // snapshot of a candidate's hidden state
-  VocabSize, Step, I, J, NumCand, Best, StopLen, PastLen: integer;
-  VocabSizeM1, NumCandM1, PastLenM1, IP1: integer;
+  VocabSize, Step, I, J, NumCand, Best, BestCand, StopLen, PastLen: integer;
+  VocabSizeM1, NumCandM1, PastLenM1: integer;
   Total, InvTotal, MaxSim, Sim, ScoreV, BestScore, BestP, PJ: TNeuralFloat;
+  WeakestP: TNeuralFloat;
   Context, CandStr: string;
   TmpI: integer;
 begin
@@ -6841,9 +7172,9 @@ begin
   HiddenLayer := ContrastiveHiddenLayer(NN);
   VocabSize := OutputVolume.Size;
   VocabSizeM1 := VocabSize - 1;
-  SetLength(Probs, VocabSize);
   if TopK < 1 then TopK := 1;
   if TopK > VocabSize then TopK := VocabSize;
+  SetLength(CandP, TopK);
   Result.Text := '';
   Result.SumLogProb := 0;
   Result.Finished := False;
@@ -6858,54 +7189,81 @@ begin
   try
     for Step := 1 to MaxLen do
     begin
-      // Forward the current context: probabilities for the next token AND the
-      // context's own last hidden state (seeds the past set on the first step).
+      // The one committed forward of the step: its output row is the next-token
+      // distribution AND its hidden state is the last context token's, which is
+      // exactly what the past-context set needs. On step 1 the context is the
+      // bare prompt, so the prompt's hidden state seeds the set.
       InputVolume.OneHotEncodingReversed(Context);
       NN.Compute(InputVolume, OutputVolume);
-      Total := OutputVolume.GetSum();
-      if Total <= 0 then Total := 1.0;
-      // #5/#13: /Total is one shared positive constant -> bulk scale-copy.
-      InvTotal := 1.0 / Total;
-      Move(OutputVolume.FData[0], Probs[0], VocabSize * csNeuralFloatSize);
-      TNNetVolume.Mul(TNeuralFloatArrPtr(@Probs[0]), InvTotal, VocabSize);
-      // On the first step record the prompt's hidden state as the only past
-      // context (so step 1 already has something to penalise against).
-      if PastLen = 0 then
+      if PenaltyAlpha > 0 then
       begin
         // #17: amortized doubling - Past is addressed by PastLen (never Length),
         // and the cleanup frees [0..PastLen-1], so over-allocated slots are safe.
         if PastLen >= Length(Past) then SetLength(Past, (PastLen + 1) * 2);
-        Past[0] := TNNetVolume.Create();
-        Past[0].Copy(HiddenLayer.Output);
-        PastLen := 1;
+        Past[PastLen] := TNNetVolume.Create();
+        Past[PastLen].Copy(HiddenLayer.Output);
+        Inc(PastLen);
       end;
+      Total := OutputVolume.GetSum();
+      if Total <= 0 then Total := 1.0;
+      // #14: /Total is one shared POSITIVE constant, so the raw row ranks the
+      // tokens exactly as the normalised row does. Select on the raw row and
+      // normalise only the TopK survivors, instead of materialising a
+      // vocab-sized probability copy per token.
+      InvTotal := 1.0 / Total;
+      PRaw := OutputVolume.DataPtr;
       // Top-k candidates by probability (partial selection sort; k is tiny).
       // Cand is pre-sized to VocabSize once (see above); NumCand bounds the
       // meaningful prefix, no per-step realloc.
-      for I := 0 to VocabSizeM1 do Cand[I] := I;
       NumCand := TopK;
       NumCandM1 := NumCand - 1;
-      for I := 0 to NumCandM1 do
+      // Rule #22: a bounded insertion keeps the top-TopK ids ordered in one
+      // pass over the vocabulary, so only the ids that beat the weakest kept
+      // probability are ever moved - no full index array to seed and no
+      // TopK sweeps over the whole row. Every shift stops at the first
+      // probability that is not strictly smaller, so ties keep the lower id
+      // and Cand[0] is the FIRST global argmax, as the selection sort gave.
+      for I := 0 to NumCandM1 do Cand[I] := I;
+      for I := 1 to NumCandM1 do
       begin
-        Best := I;
-        BestP := Probs[Cand[Best]];   // #4: hoist the running best, drop reload
-        IP1 := I + 1;
-        for J := IP1 to VocabSizeM1 do
+        TmpI := Cand[I];
+        BestP := PRaw^[TmpI];
+        J := I - 1;
+        while (J >= 0) and (PRaw^[Cand[J]] < BestP) do
         begin
-          PJ := Probs[Cand[J]];   // #4: bind once, drop the second index+reload
-          if PJ > BestP then
-          begin
-            Best := J;
-            BestP := PJ;
-          end;
+          Cand[J + 1] := Cand[J];
+          Dec(J);
         end;
-        TmpI := Cand[I]; Cand[I] := Cand[Best]; Cand[Best] := TmpI;
+        Cand[J + 1] := TmpI;
       end;
+      // #4/#11: the weakest kept probability is a two-level dependent load that
+      // only the insertion branch can change - keep it in a local and refresh
+      // it there, instead of re-reading it for every vocabulary token.
+      WeakestP := PRaw^[Cand[NumCandM1]];
+      for I := NumCand to VocabSizeM1 do
+      begin
+        PJ := PRaw^[I];
+        if PJ > WeakestP then
+        begin
+          J := NumCandM1 - 1;
+          while (J >= 0) and (PRaw^[Cand[J]] < PJ) do
+          begin
+            Cand[J + 1] := Cand[J];
+            Dec(J);
+          end;
+          Cand[J + 1] := I;
+          WeakestP := PRaw^[Cand[NumCandM1]];
+        end;
+      end;
+      // Normalise the survivors now: the per-candidate forwards below overwrite
+      // OutputVolume, so the raw row is gone by the time the scores are formed.
+      for I := 0 to NumCandM1 do CandP[I] := PRaw^[Cand[I]] * InvTotal;
       // Re-rank candidates by the contrastive objective. PenaltyAlpha=0 keeps
       // (1-alpha)*p(v) only, so the highest-probability candidate (Cand[0])
       // wins by construction -> exactly greedy argmax over the top-k (= plain
       // greedy argmax, since the global argmax is always in the top-k set).
       Best := Cand[0];
+      BestCand := 0;
       BestScore := -1e30;
       for I := 0 to NumCandM1 do
       begin
@@ -6926,31 +7284,25 @@ begin
             if Sim > MaxSim then MaxSim := Sim;
           end;
         end;
-        ScoreV := (1 - PenaltyAlpha) * Probs[Cand[I]] - PenaltyAlpha * MaxSim;
+        ScoreV := (1 - PenaltyAlpha) * CandP[I] - PenaltyAlpha * MaxSim;
         if ScoreV > BestScore then
         begin
           BestScore := ScoreV;
           Best := Cand[I];
+          BestCand := I;
         end;
       end;
-      Result.SumLogProb := Result.SumLogProb + SafeLogProb(Probs[Best]);
+      Result.SumLogProb := Result.SumLogProb + SafeLogProb(CandP[BestCand]);
       if Best = csDecodeEOSToken then
       begin
         Result.Finished := True;
         Break;
       end;
-      // Commit: append the token, and add ITS hidden state to the past set so
-      // future candidates are penalised against it too. Recompute the chosen
-      // continuation's hidden state (cheap, k is small; avoids stashing all k).
+      // Commit: append the token. The chosen continuation's hidden state is
+      // harvested by the next step's own forward over this very context, so no
+      // commit forward is needed here.
       Result.Text := Result.Text + Chr(Best);
       Context := Context + Chr(Best);
-      InputVolume.OneHotEncodingReversed(Context);
-      NN.Compute(InputVolume, OutputVolume);
-      // #17: amortized doubling (see the seeding note above).
-      if PastLen >= Length(Past) then SetLength(Past, (PastLen + 1) * 2);
-      Past[PastLen] := TNNetVolume.Create();
-      Past[PastLen].Copy(HiddenLayer.Output);
-      Inc(PastLen);
       // Stop strings: terminate and trim, exactly like DecodeGreedy.
       if Length(StopStrings) > 0 then
       begin
@@ -6980,13 +7332,15 @@ function DecodeContrastiveSearchStreamed(Session: TNNetStreamingDecoder;
   const StopSequences: TNNetTokenSequences): integer;
 var
   InV, Row: TNNetVolume;
-  Probs: array of TNeuralFloat;
+  PRaw: TNeuralFloatArrPtr;
+  CandP: array of TNeuralFloat;
   Cand: array of integer;
   Past: array of TNNetVolume;
   CandHidden: TNNetVolume;
   VocabSize, Pos, CapLen, I, J, NumCand, Best, PastLen, StopLen: integer;
-  VocabSizeM1, NumCandM1, PastLenM1, PromptLenM2, IP1: integer;
+  VocabSizeM1, NumCandM1, PastLenM1, PromptLenM2: integer;
   Total, InvTotal, MaxSim, Sim, ScoreV, BestScore, BestP, PJ: TNeuralFloat;
+  WeakestP: TNeuralFloat;
   TmpI: integer;
 begin
   if Session.Net.GetFirstLayer().Output.SizeX <> 1 then
@@ -7000,9 +7354,9 @@ begin
   Row := Session.Output();
   VocabSize := Row.Size;
   VocabSizeM1 := VocabSize - 1;
-  SetLength(Probs, VocabSize);
   if TopK < 1 then TopK := 1;
   if TopK > VocabSize then TopK := VocabSize;
+  SetLength(CandP, TopK);
   CapLen := Min(PromptLen + MaxNewTokens, MaxTotalLen);
   if Length(Tokens) < CapLen then SetLength(Tokens, CapLen);
   InV := TNNetVolume.Create(Session.Net.GetFirstLayer().Output);
@@ -7052,31 +7406,57 @@ begin
       Row := Session.Output();
       Total := Row.GetSum();
       if Total <= 0 then Total := 1.0;
-      // #5/#13: /Total is one shared positive constant -> bulk scale-copy.
+      // #14: /Total is one shared POSITIVE constant, so the raw row ranks the
+      // tokens exactly as the normalised row does. Select on the raw row and
+      // normalise only the TopK survivors, instead of materialising a
+      // vocab-sized probability copy per token.
       InvTotal := 1.0 / Total;
-      Move(Row.FData[0], Probs[0], VocabSize * csNeuralFloatSize);
-      TNNetVolume.Mul(TNeuralFloatArrPtr(@Probs[0]), InvTotal, VocabSize);
+      PRaw := Row.DataPtr;
       // Top-k candidates by probability (partial selection sort; k is tiny).
       // Cand pre-sized to VocabSize once; NumCand bounds the meaningful prefix.
-      for I := 0 to VocabSizeM1 do Cand[I] := I;
       NumCand := TopK;
       NumCandM1 := NumCand - 1;
-      for I := 0 to NumCandM1 do
+      // Rule #22: a bounded insertion keeps the top-TopK ids ordered in one
+      // pass over the vocabulary, so only the ids that beat the weakest kept
+      // probability are ever moved - no full index array to seed and no
+      // TopK sweeps over the whole row. Every shift stops at the first
+      // probability that is not strictly smaller, so ties keep the lower id
+      // and Cand[0] is the FIRST global argmax, as the selection sort gave.
+      for I := 0 to NumCandM1 do Cand[I] := I;
+      for I := 1 to NumCandM1 do
       begin
-        Best := I;
-        BestP := Probs[Cand[Best]];   // #4: hoist the running best, drop reload
-        IP1 := I + 1;
-        for J := IP1 to VocabSizeM1 do
+        TmpI := Cand[I];
+        BestP := PRaw^[TmpI];
+        J := I - 1;
+        while (J >= 0) and (PRaw^[Cand[J]] < BestP) do
         begin
-          PJ := Probs[Cand[J]];   // #4: bind once, drop the second index+reload
-          if PJ > BestP then
-          begin
-            Best := J;
-            BestP := PJ;
-          end;
+          Cand[J + 1] := Cand[J];
+          Dec(J);
         end;
-        TmpI := Cand[I]; Cand[I] := Cand[Best]; Cand[Best] := TmpI;
+        Cand[J + 1] := TmpI;
       end;
+      // #4/#11: the weakest kept probability is a two-level dependent load that
+      // only the insertion branch can change - keep it in a local and refresh
+      // it there, instead of re-reading it for every vocabulary token.
+      WeakestP := PRaw^[Cand[NumCandM1]];
+      for I := NumCand to VocabSizeM1 do
+      begin
+        PJ := PRaw^[I];
+        if PJ > WeakestP then
+        begin
+          J := NumCandM1 - 1;
+          while (J >= 0) and (PRaw^[Cand[J]] < PJ) do
+          begin
+            Cand[J + 1] := Cand[J];
+            Dec(J);
+          end;
+          Cand[J + 1] := I;
+          WeakestP := PRaw^[Cand[NumCandM1]];
+        end;
+      end;
+      // Normalise the survivors now: the per-candidate StepForward calls below
+      // overwrite the session output row.
+      for I := 0 to NumCandM1 do CandP[I] := PRaw^[Cand[I]] * InvTotal;
       // Re-rank by the contrastive objective. PenaltyAlpha=0 keeps
       // (1-alpha)*p(v) only, so Cand[0] (the global argmax) wins by
       // construction -> bit-for-bit the streamed greedy argmax.
@@ -7103,7 +7483,7 @@ begin
             if Sim > MaxSim then MaxSim := Sim;
           end;
         end;
-        ScoreV := (1 - PenaltyAlpha) * Probs[Cand[I]] - PenaltyAlpha * MaxSim;
+        ScoreV := (1 - PenaltyAlpha) * CandP[I] - PenaltyAlpha * MaxSim;
         if ScoreV > BestScore then
         begin
           BestScore := ScoreV;
@@ -7168,8 +7548,8 @@ function DecodeEarlyExitSelfSpeculative(NN: TNNet; const Prompt: string;
 var
   InputVolume, OutputVolume, ExitSnap, ExitOut: TNNetVolume;
   VocabSize, Step, I, HeadIdx, HeadInIdx, LastLayer, ResolvedExit: integer;
-  FullBest, ExitBest, StopLen, VocabSizeM1: integer;
-  Total, MaxFinal, MaxExit, Pf, V: TNeuralFloat;
+  FullBest, ExitBest, StopLen: integer;
+  Total, MaxFinal, MaxExit, Pf: TNeuralFloat;
   Context: string;
   Confident: boolean;
 begin
@@ -7177,7 +7557,6 @@ begin
   OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
   ExitSnap := TNNetVolume.Create();
   VocabSize := OutputVolume.Size;
-  VocabSizeM1 := VocabSize - 1;
   LastLayer := NN.GetLastLayerIdx();
   HeadIdx := ResolveHeadStartIdx(NN, HeadStartIdx);
   HeadInIdx := HeadIdx - 1;
@@ -7212,14 +7591,9 @@ begin
       NN.Compute(InputVolume, OutputVolume);
       Total := OutputVolume.GetSum();
       if Total <= 0 then Total := 1.0;
-      FullBest := 0;
-      MaxFinal := OutputVolume.Raw[0];
-      for I := 1 to VocabSizeM1 do
-        if OutputVolume.Raw[I] > MaxFinal then
-        begin
-          MaxFinal := OutputVolume.Raw[I];
-          FullBest := I;
-        end;
+      // #18: one vectorized MaxPos pass; ties go to the lower index, exactly as
+      // the scalar > loop did.
+      MaxFinal := TNNetVolume.MaxPos(OutputVolume.DataPtr, VocabSize, FullBest);
       MaxFinal := MaxFinal / Total;
       if MaxFinal < 0 then MaxFinal := 0;
 
@@ -7243,17 +7617,7 @@ begin
         ExitOut := NN.GetLastLayer().Output;  // invariant across the scan (#8)
         Total := ExitOut.GetSum();
         if Total <= 0 then Total := 1.0;
-        ExitBest := 0;
-        MaxExit := ExitOut.Raw[0];
-        for I := 1 to VocabSizeM1 do
-        begin
-          V := ExitOut.Raw[I];
-          if V > MaxExit then
-          begin
-            MaxExit := V;
-            ExitBest := I;
-          end;
-        end;
+        MaxExit := TNNetVolume.MaxPos(ExitOut.DataPtr, VocabSize, ExitBest);
         MaxExit := MaxExit / Total;
         if MaxExit < 0 then MaxExit := 0;
 
@@ -7378,12 +7742,14 @@ function DecodeDoLa(NN: TNNet; const Prompt: string;
 var
   InputVolume, OutputVolume: TNNetVolume;
   CandSnap, LensOut: TNNetVolume;
-  PFinal, PLens: array of TNeuralFloat;  // final + chosen-lens distributions
+  // Final distribution, the candidate lens row being scored, and the winning
+  // candidate's row kept from the scoring pass.
+  PFinal, PLens, PBestLens, SwapLens: array of TNeuralFloat;
   Cands: TNeuralIntegerArray;
   VocabSize, Step, I, C, L, HeadIdx, HeadInIdx, LastLayer: integer;
-  NumCand, BestLayer, Best, StopLen, VocabSizeM1, NumCandM1: integer;
+  NumCand, Best, StopLen, VocabSizeM1, NumCandM1: integer;
   Total, MaxFinal, Threshold, JS, BestJS, Pf, Pl, Pm, ScoreV, BestScore: TNeuralFloat;
-  InvTotal, BestVal: TNeuralFloat;
+  InvTotal, InvPm: TNeuralFloat;
   Context: string;
   HaveContrast: boolean;
 const
@@ -7396,6 +7762,7 @@ begin
   VocabSizeM1 := VocabSize - 1;
   SetLength(PFinal, VocabSize);
   SetLength(PLens, VocabSize);
+  SetLength(PBestLens, VocabSize);
   LastLayer := NN.GetLastLayerIdx();
   HeadIdx := ResolveHeadStartIdx(NN, HeadStartIdx);
   HeadInIdx := HeadIdx - 1;
@@ -7420,29 +7787,21 @@ begin
       Total := OutputVolume.GetSum();
       if Total <= 0 then Total := 1.0;
       InvTotal := 1.0 / Total; // #5: invariant across the vocab loop (cf. 6826/6858)
-      MaxFinal := 0;
-      for I := 0 to VocabSizeM1 do
-      begin
-        Pf := OutputVolume.Raw[I] * InvTotal;
-        if Pf < 0 then Pf := 0;
-        PFinal[I] := Pf;
-        if Pf > MaxFinal then MaxFinal := Pf;
-      end;
+      // #13/#18: InvTotal is positive, so clamping before the scale is the same
+      // as clamping after it - the whole per-element loop is a Relu copy plus a
+      // uniform scale, and MaxPos then returns the maximum AND its first index
+      // in one vectorized pass (ties to the lower index, as the scalar loop).
+      TNNetVolume.Relu(TNeuralFloatArrPtr(@PFinal[0]), OutputVolume.DataPtr,
+        VocabSize);
+      TNNetVolume.Mul(TNeuralFloatArrPtr(@PFinal[0]), InvTotal, VocabSize);
+      MaxFinal := TNNetVolume.MaxPos(TNeuralFloatArrPtr(@PFinal[0]), VocabSize,
+        Best);
 
       if not HaveContrast then
-      begin
         // Greedy argmax over p_final == DecodeGreedy's step (the raw softmax row
-        // is monotone in p_final, so this is bit-identical).
-        Best := 0;
-        BestVal := PFinal[0];
-        for I := 1 to VocabSizeM1 do
-          if PFinal[I] > BestVal then
-          begin
-            Best := I;
-            BestVal := PFinal[I];
-          end;
-        Result.SumLogProb := Result.SumLogProb + SafeLogProb(PFinal[Best]);
-      end
+        // is monotone in p_final, so this is bit-identical); Best and MaxFinal
+        // are already the argmax pair from the pass above.
+        Result.SumLogProb := Result.SumLogProb + SafeLogProb(MaxFinal)
       else
       begin
         // (2)+(3) Pick the premature layer with MAX Jensen-Shannon divergence
@@ -7450,7 +7809,6 @@ begin
         //         net after the full forward above (no extra forward needed);
         //         snapshot it, splice into the head-input slot, recompute the
         //         head sub-stack, read p_premature.
-        BestLayer := Cands[0];
         BestJS := -1.0;
         for C := 0 to NumCandM1 do
         begin
@@ -7467,47 +7825,46 @@ begin
           Total := LensOut.GetSum();
           if Total <= 0 then Total := 1.0;
           InvTotal := 1.0 / Total;
+          // The lens row is materialised in full, because the winning
+          // candidate's row is the one the contrast step below consumes.
+          // #13/#18: same clamp/scale identity as p_final above.
+          TNNetVolume.Relu(TNeuralFloatArrPtr(@PLens[0]), LensOut.DataPtr,
+            VocabSize);
+          TNNetVolume.Mul(TNeuralFloatArrPtr(@PLens[0]), InvTotal, VocabSize);
           // JS(p_final || p_lens) = 0.5 KL(p||m) + 0.5 KL(q||m), m = 0.5(p+q).
-          // #4/#5: single fused vocab loop - Pl and Pm live in locals; the
-          // PLens/MFinalLens arrays are not needed for JS (PLens is recomputed
-          // for the chosen layer below). Bit-identical.
+          // #4/#5: Pm lives in a local, and #21: both logs divide by that same
+          // Pm, so one reciprocal replaces the two divides - JS only ranks
+          // candidate layers, so no gradient check watches this arithmetic.
           JS := 0;
           for I := 0 to VocabSizeM1 do
           begin
-            Pl := LensOut.Raw[I] * InvTotal;
-            if Pl < 0 then Pl := 0;
-            Pm := 0.5 * (PFinal[I] + Pl);
+            Pl := PLens[I];
+            Pf := PFinal[I];
+            Pm := 0.5 * (Pf + Pl);
             if Pm < cEps then Continue;
+            InvPm := 1.0 / Pm;
             // Rule #16: JS only ranks candidate layers (if JS > BestJS), so the
             // fast Cephes logf is safe here; 2*Vocab*NumCand RTL Ln removed/token.
-            Pf := PFinal[I];
-            if Pf >= cEps then JS := JS + 0.5 * Pf * pcr_logf(Pf / Pm);
-            if Pl >= cEps then JS := JS + 0.5 * Pl * pcr_logf(Pl / Pm);
+            if Pf >= cEps then JS := JS + 0.5 * Pf * pcr_logf(Pf * InvPm);
+            if Pl >= cEps then JS := JS + 0.5 * Pl * pcr_logf(Pl * InvPm);
           end;
-          if JS > BestJS then
+          // #27: the winner's distribution is already in hand, so keep it here
+          // instead of re-splicing and re-running the head sub-stack for it
+          // below. The head recompute cannot touch a candidate layer's own
+          // output (candidates all sit below HeadInIdx), so the kept row is
+          // exactly what that recompute would have produced. C = 0 pairs with
+          // BestJS's -1.0 seed, so the first candidate's row is kept even when
+          // no candidate ever clears that seed.
+          if (C = 0) or (JS > BestJS) then
           begin
-            BestJS := JS;
-            BestLayer := L;
+            // Keeping the row is a buffer swap, not a vocab-sized copy: the
+            // buffer handed back becomes the next candidate's scratch and is
+            // fully rewritten by its bulk fill above.
+            SwapLens := PLens;
+            PLens := PBestLens;
+            PBestLens := SwapLens;
           end;
-        end;
-        // Recompute the chosen premature layer's distribution into PLens.
-        {$IFDEF OpenCL}
-        NN.Layers[BestLayer].ForceOutputOnRAM();
-        NN.Layers[HeadInIdx].ForceOutputOnRAM();
-        {$ENDIF}
-        CandSnap.Copy(NN.Layers[BestLayer].Output);
-        NN.Layers[HeadInIdx].Output.CopyNoChecks(CandSnap);
-        for I := HeadIdx to LastLayer do NN.Layers[I].Compute();
-        {$IFDEF OpenCL} NN.GetLastLayer().ForceOutputOnRAM(); {$ENDIF}
-        LensOut := NN.GetLastLayer().Output;  // invariant across the loop (#8)
-        Total := LensOut.GetSum();
-        if Total <= 0 then Total := 1.0;
-        InvTotal := 1.0 / Total;
-        for I := 0 to VocabSizeM1 do
-        begin
-          Pl := LensOut.Raw[I] * InvTotal;
-          if Pl < 0 then Pl := 0;
-          PLens[I] := Pl;
+          if JS > BestJS then BestJS := JS;
         end;
         // (4) Adaptive plausibility constraint: keep only tokens at/above
         //     Alpha * max(p_final); argmax the contrast score over that set.
@@ -7519,8 +7876,8 @@ begin
           begin
             // #14: argmax of ln(pf')-ln(pl') == argmax of pf'/pl' (ln strictly monotone);
             // same 1e-30 clamps as SafeLogProb, so ranking is order-identical.
-            Pf := PFinal[I]; if Pf < 1e-30 then Pf := 1e-30;
-            Pl := PLens[I];  if Pl < 1e-30 then Pl := 1e-30;
+            Pf := PFinal[I];    if Pf < 1e-30 then Pf := 1e-30;
+            Pl := PBestLens[I]; if Pl < 1e-30 then Pl := 1e-30;
             ScoreV := Pf / Pl;
             if (Best < 0) or (ScoreV > BestScore) then
             begin
@@ -7529,16 +7886,7 @@ begin
             end;
           end;
         if Best < 0 then  // degenerate empty head set: fall back to final argmax
-        begin
-          Best := 0;
-          BestVal := PFinal[0];
-          for I := 1 to VocabSizeM1 do
-            if PFinal[I] > BestVal then
-            begin
-              Best := I;
-              BestVal := PFinal[I];
-            end;
-        end;
+          TNNetVolume.MaxPos(TNeuralFloatArrPtr(@PFinal[0]), VocabSize, Best);
         Result.SumLogProb := Result.SumLogProb + SafeLogProb(PFinal[Best]);
       end;
 
@@ -7574,15 +7922,13 @@ function DecodeSampled(NN: TNNet; const Prompt: string; MaxLen: integer;
   const StopStrings: array of string): TNNetDecodeResult;
 var
   InputVolume, OutputVolume: TNNetVolume;
-  VocabSize, Step, I, Best, StopLen: integer;
-  VocabSizeM1: integer;
+  VocabSize, Step, Best, StopLen: integer;
   Total, Pf, BestVal: TNeuralFloat;
   Context: string;
 begin
   InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
   OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
   VocabSize := OutputVolume.Size;
-  VocabSizeM1 := VocabSize - 1;
   Result.Text := '';
   Result.SumLogProb := 0;
   Result.Finished := False;
@@ -7596,15 +7942,9 @@ begin
         Best := Sampler.GetToken(OutputVolume)
       else
       begin
-        // #4: carry the running best value instead of reloading Raw[Best].
-        Best := 0;
-        BestVal := OutputVolume.Raw[0];
-        for I := 1 to VocabSizeM1 do
-          if OutputVolume.Raw[I] > BestVal then
-          begin
-            Best := I;
-            BestVal := OutputVolume.Raw[I];
-          end;
+        // #18: one vectorized MaxPos pass; ties go to the lower index, exactly
+        // as the scalar > loop did.
+        BestVal := TNNetVolume.MaxPos(OutputVolume.DataPtr, VocabSize, Best);
       end;
       if (Best < 0) or (Best >= VocabSize) then Best := 0;
       // Log-prob of the chosen token (re-normalised row, same convention as
@@ -7743,6 +8083,7 @@ function PromptLookupDraft(const Context: string;
 var
   CtxLen, P, FollowLen, PStart: integer;
   Suffix: string;
+  FirstChar: char;
 begin
   Result := '';
   CtxLen := Length(Context);
@@ -7753,8 +8094,13 @@ begin
   // recent earlier occurrence has the largest P with P+MatchLen-1 < CtxLen, i.e.
   // P <= CtxLen - MatchLen, EXCLUDING P = CtxLen - MatchLen + 1 (the suffix).
   PStart := CtxLen - MatchLen;
+  FirstChar := Suffix[1];
   for P := PStart downto 1 do
-    if Copy(Context, P, MatchLen) = Suffix then
+    // #23/App C: exact single-byte compare via CompareMem - no Copy
+    // heap-string allocation per probed start position, and the first-char
+    // test rejects nearly every start position before the call.
+    if (Context[P] = FirstChar) and
+       CompareMem(@Context[P], @Suffix[1], MatchLen) then
     begin
       FollowLen := CtxLen - (P + MatchLen) + 1; // chars available after match
       if FollowLen > NumDraft then FollowLen := NumDraft;
@@ -7769,15 +8115,13 @@ function DecodePromptLookup(NN: TNNet; const Prompt: string;
   const StopStrings: array of string): TNNetDecodeResult;
 var
   InputVolume, OutputVolume: TNNetVolume;
-  VocabSize, Step, I, Best, StopLen, D: integer;
-  VocabSizeM1: integer;
+  VocabSize, Step, Best, StopLen, D: integer;
   Total, BestVal: TNeuralFloat;
   Context, Draft: string;
 begin
   InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
   OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
   VocabSize := OutputVolume.Size;
-  VocabSizeM1 := VocabSize - 1;
   Result.Text := '';
   Result.SumLogProb := 0;
   Result.Finished := False;
@@ -7792,16 +8136,10 @@ begin
       // Rule #14: rank on the raw distribution (SafeLogProb monotonic, /Total a
       // shared positive constant); one SafeLogProb for the winner.
       Total := NextTokenForward(NN, Context, InputVolume, OutputVolume);
-      // #4: carry the running best value instead of reloading Raw[Best].
-      Best := 0;
-      BestVal := OutputVolume.Raw[0];
-      for I := 1 to VocabSizeM1 do
-        if OutputVolume.Raw[I] > BestVal then
-        begin
-          Best := I;
-          BestVal := OutputVolume.Raw[I];
-        end;
-      Result.SumLogProb := Result.SumLogProb + SafeLogProb(OutputVolume.Raw[Best] / Total);
+      // #18: one vectorized MaxPos pass; ties go to the lower index, exactly
+      // as the scalar > loop did.
+      BestVal := TNNetVolume.MaxPos(OutputVolume.DataPtr, VocabSize, Best);
+      Result.SumLogProb := Result.SumLogProb + SafeLogProb(BestVal / Total);
       Inc(Step);
       if Best = csDecodeEOSToken then
       begin
@@ -7833,15 +8171,9 @@ begin
         (not Result.Finished) do
       begin
         Total := NextTokenForward(NN, Context, InputVolume, OutputVolume);
-        // #4: carry the running best value instead of reloading Raw[Best].
-        Best := 0;
-        BestVal := OutputVolume.Raw[0];
-        for I := 1 to VocabSizeM1 do
-          if OutputVolume.Raw[I] > BestVal then
-          begin
-            Best := I;
-            BestVal := OutputVolume.Raw[I];
-          end;
+        // #18: one vectorized MaxPos pass; ties go to the lower index, exactly
+        // as the scalar > loop did.
+        BestVal := TNNetVolume.MaxPos(OutputVolume.DataPtr, VocabSize, Best);
         // Reject as soon as the model disagrees with the draft (or EOS).
         if (Best = csDecodeEOSToken) or (Best <> Ord(Draft[D])) then
         begin
@@ -7851,7 +8183,7 @@ begin
           Break;
         end;
         // Accept: identical to the greedy argmax, so emit it.
-        Result.SumLogProb := Result.SumLogProb + SafeLogProb(OutputVolume.Raw[Best] / Total);
+        Result.SumLogProb := Result.SumLogProb + SafeLogProb(BestVal / Total);
         Inc(Step);
         Result.Text := Result.Text + Chr(Best);
         Context := Context + Chr(Best);
@@ -7902,36 +8234,57 @@ type
   TBeamCandidateArray = array of TBeamCandidate;
 
 // Rule #22: only the top KeepCount candidates survive a prune, so order just
-// those and leave the rest of Cand[0..Count-1] unordered - O(Count*KeepCount)
-// instead of the O(Count^2) full sort. Selecting by ROTATION rather than by
-// swap keeps equal-scoring records in fill order, so the kept prefix is
-// element-for-element what a stable descending sort would have produced.
+// those and leave the rest of Cand[0..Count-1] unordered. A bounded insertion
+// keeps the ordered prefix while ONE pass runs over the pool, so the cost is
+// O(Count) compares plus the rare insertion shift, not O(Count*KeepCount).
+// Both the seed sort and the insertion shift stop at the first score that is
+// not strictly smaller, so equal-scoring records keep fill order and the kept
+// prefix is element-for-element what a stable descending sort would produce.
 procedure SelectTopBeamCandidates(var Cand: TBeamCandidateArray;
   Count, KeepCount: integer);
 var
-  I, J, BestIdx, IP1, MaxKeepIdx, MaxCandIdx: integer;
-  BestScore: TNeuralFloat;
+  I, J, MaxKeepIdx, MaxCandIdx: integer;
+  IncomingScore, WeakestScore: TNeuralFloat;
   Tmp: TBeamCandidate;
 begin
   if KeepCount > Count then KeepCount := Count;
+  if KeepCount < 1 then exit;
   MaxKeepIdx := KeepCount - 1;
   MaxCandIdx := Count - 1;
-  for I := 0 to MaxKeepIdx do
+  // Seed: order the first KeepCount records descending by score.
+  for I := 1 to MaxKeepIdx do
   begin
-    BestIdx := I;
-    BestScore := Cand[I].Score;
-    IP1 := I + 1;
-    for J := IP1 to MaxCandIdx do
-      if Cand[J].Score > BestScore then
-      begin
-        BestScore := Cand[J].Score;
-        BestIdx := J;
-      end;
-    if BestIdx <> I then
+    Tmp := Cand[I];
+    IncomingScore := Tmp.Score;
+    J := I - 1;
+    while (J >= 0) and (Cand[J].Score < IncomingScore) do
     begin
-      Tmp := Cand[BestIdx];
-      for J := BestIdx downto IP1 do Cand[J] := Cand[J - 1];
-      Cand[I] := Tmp;
+      Cand[J + 1] := Cand[J];
+      Dec(J);
+    end;
+    Cand[J + 1] := Tmp;
+  end;
+  // One pass over the rest: a record enters the prefix only when it beats the
+  // weakest kept score, and that weakest record is evicted into the slot the
+  // incoming record just left (the tail order is unspecified either way).
+  // #5: the weakest kept score only changes when the prefix does, so hold it
+  // in a register instead of re-reading the record for every pool entry.
+  WeakestScore := Cand[MaxKeepIdx].Score;
+  for I := KeepCount to MaxCandIdx do
+  begin
+    IncomingScore := Cand[I].Score;
+    if IncomingScore > WeakestScore then
+    begin
+      Tmp := Cand[I];
+      Cand[I] := Cand[MaxKeepIdx];
+      J := MaxKeepIdx - 1;
+      while (J >= 0) and (Cand[J].Score < IncomingScore) do
+      begin
+        Cand[J + 1] := Cand[J];
+        Dec(J);
+      end;
+      Cand[J + 1] := Tmp;
+      WeakestScore := Cand[MaxKeepIdx].Score;
     end;
   end;
 end;
@@ -8142,7 +8495,7 @@ function DecodeBeamSearchCachedAll(Session: TNNetStreamingDecoder;
 var
   InV, Row: TNNetVolume;
   LogProbs: array of TNeuralFloat;
-  VocabSize, PromptLen, Step, I, T, B, Pos, LenB, CandCount: integer;
+  VocabSize, PromptLen, Step, I, J, T, B, Pos, LenB, CandCount: integer;
   VocabSizeM1, LiveHi, FinishedHi, FinSurvivorsHi, PromptLenM2: integer;
   KeepCount, MaxKeepIdx, ParentIdx: integer;
   Live: TCachedBeamArray;      // still-growing beams (each owns a Snap)
@@ -8326,9 +8679,21 @@ begin
         NewLive[I].LastToken := Cand[I].LastToken;
         // The child's input sits one position after its parent's last token.
         NewLive[I].LastPos := Live[ParentIdx].LastPos + 1;
-        Session.RestoreSnapshot(BaseAfter[ParentIdx]);
-        NewLive[I].Snap := Session.Snapshot();
+        NewLive[I].Snap := nil;
       end;
+      // #5: siblings share one base cache, so restore each DISTINCT parent once
+      // and take a fresh independent clone (Snapshot is a pure read of the
+      // restored state) for every survivor of it; slot order is untouched, so
+      // the beams are element-for-element what a per-survivor restore gave.
+      for I := 0 to MaxKeepIdx do
+        if NewLive[I].Snap = nil then
+        begin
+          ParentIdx := Cand[I].ParentIdx;
+          Session.RestoreSnapshot(BaseAfter[ParentIdx]);
+          for J := I to MaxKeepIdx do
+            if Cand[J].ParentIdx = ParentIdx then
+              NewLive[J].Snap := Session.Snapshot();
+        end;
       FreeLiveSnaps;   // release the parents' caches
       FreeBaseAfter;   // release the per-parent base caches
       Live := NewLive;
@@ -8607,13 +8972,14 @@ end;
 function NeededNextChars(const Text: string;
   const ForceTokens: array of string; VocabSize: integer): string;
 var
-  K, P, MatchLen, PhraseLenM1: integer;
+  K, P, MatchLen, PhraseLenM1, TextLen: integer;
   ForceTokensHi: integer;
-  Phrase, Tail: string;
+  Phrase: string;
   C: char;
 begin
   Result := '';
   ForceTokensHi := High(ForceTokens);
+  TextLen := Length(Text);  // #5: invariant across both loops
   for K := 0 to ForceTokensHi do
   begin
     Phrase := ForceTokens[K];
@@ -8624,9 +8990,9 @@ begin
     PhraseLenM1 := Length(Phrase) - 1;
     for P := PhraseLenM1 downto 1 do
       // #13/App C: exact single-byte suffix compare via CompareMem - no Copy
-      // heap-string allocations per probe (guarded by Length(Text) >= P, P >= 1).
-      if (Length(Text) >= P) and
-         CompareMem(@Text[Length(Text) - P + 1], @Phrase[1], P) then
+      // heap-string allocations per probe (guarded by TextLen >= P, P >= 1).
+      if (TextLen >= P) and
+         CompareMem(@Text[TextLen - P + 1], @Phrase[1], P) then
       begin
         MatchLen := P;
         Break;
@@ -8638,8 +9004,7 @@ begin
     // blocks EOS forever for this phrase and the caller gets the best-effort
     // frontier from the unsatisfied-constraint fallback.
     if Ord(C) >= VocabSize then Continue;
-    Tail := Result;
-    if Pos(C, Tail) = 0 then Result := Result + C;
+    if Pos(C, Result) = 0 then Result := Result + C;
   end;
 end;
 
@@ -8651,12 +9016,13 @@ end;
 function ForcedProgress(const Text: string;
   const ForceTokens: array of string): integer;
 var
-  K, P, PhraseLenM1: integer;
+  K, P, PhraseLenM1, TextLen: integer;
   ForceTokensHi: integer;
   Phrase: string;
 begin
   Result := 0;
   ForceTokensHi := High(ForceTokens);
+  TextLen := Length(Text);  // #5: invariant across both loops
   for K := 0 to ForceTokensHi do
   begin
     Phrase := ForceTokens[K];
@@ -8668,9 +9034,9 @@ begin
       PhraseLenM1 := Length(Phrase) - 1;
       for P := PhraseLenM1 downto 1 do
         // #13/App C: exact single-byte suffix compare via CompareMem - no Copy
-        // heap-string allocations per probe (guarded by Length(Text) >= P).
-        if (Length(Text) >= P) and
-           CompareMem(@Text[Length(Text) - P + 1], @Phrase[1], P) then
+        // heap-string allocations per probe (guarded by TextLen >= P).
+        if (TextLen >= P) and
+           CompareMem(@Text[TextLen - P + 1], @Phrase[1], P) then
         begin
           Inc(Result, P);
           Break;
@@ -8695,15 +9061,18 @@ type
 // Phrase[1..p-1] is a suffix of ParentText - p = Length(Phrase) being the
 // "phrase completes on this char" case. That turns a per-candidate rescan of a
 // growing text into one per-parent table build plus a lookup per candidate.
+// AllPresent reports the same verdict as AllForcedPhrasesPresent(ParentText),
+// which this pass already decides per phrase.
 function BuildChildProgress(const ParentText: string;
   const ForceTokens: array of string;
-  out ChildProg: TByteProgressTable): integer;
+  out ChildProg: TByteProgressTable; out AllPresent: boolean): integer;
 var
   K, P, C, PhraseLen, ParentLen, ForceTokensHi: integer;
   Phrase: string;
   PhraseVal: TByteProgressTable;
 begin
   Result := 0;
+  AllPresent := True;
   FillChar(ChildProg[0], csByteAlphabetSize * csIntegerSize, 0);
   ParentLen := Length(ParentText);
   ForceTokensHi := High(ForceTokens);
@@ -8717,6 +9086,7 @@ begin
       Inc(Result, PhraseLen);
       Continue;
     end;
+    AllPresent := False;
     FillChar(PhraseVal[0], csByteAlphabetSize * csIntegerSize, 0);
     // Ascending p, so a longer admissible prefix overwrites a shorter one and
     // each byte ends up holding the maximum - the same value the downto scan
@@ -8753,6 +9123,7 @@ var
   ChildProg: TByteProgressTable;
   InvDenFin, InvDenExt, NewSumLP: TNeuralFloat;
   BSumLP: TNeuralFloat;
+  BeamAllPresent: boolean;
   BText: string;
 begin
   if BeamWidth < 1 then BeamWidth := 1;
@@ -8825,7 +9196,8 @@ begin
         // whole forced-phrase progress table is a per-beam invariant. Build it
         // once and read each candidate's progress out of it, instead of
         // rescanning each candidate's text at prune time.
-        BaseProg := BuildChildProgress(BText, ForceTokens, ChildProg);
+        BaseProg := BuildChildProgress(BText, ForceTokens, ChildProg,
+          BeamAllPresent);
         for I := 1 to NeededLen do
         begin
           T := Ord(Needed[I]);
@@ -8845,8 +9217,7 @@ begin
           begin
             // EOS only allowed once ALL phrases are present; otherwise the
             // hypothesis must keep generating to satisfy the constraint.
-            if not AllForcedPhrasesPresent(BText, ForceTokens) then
-              Continue;
+            if not BeamAllPresent then Continue;
             FinB.SumLogProb := NewSumLP;
             FinB.Text := BText;
             FinB.Finished := True;
@@ -8857,8 +9228,9 @@ begin
           else
           begin
             // Skip a token already added through the force-injection pass above
-            // (it is a needed next-char) to avoid a duplicate candidate.
-            if Chr(T) in NeededSet then Continue;
+            // (it is a needed next-char) to avoid a duplicate candidate. Only a
+            // byte-range token can be one: Chr wraps above the byte alphabet.
+            if (T <= MaxByteTok) and (Chr(T) in NeededSet) then Continue;
             // #17: no per-candidate string - the text is built for survivors
             // only, below.
             PCand^.SumLogProb := NewSumLP;
@@ -9255,11 +9627,12 @@ begin
         Move(Logits.FData[Base], Probs.FData[0], VocabSize * csNeuralFloatSize);
         MaxLogit := Probs.GetMax();
         InvT := 1.0 / Temperature;
-        Probs.Add(-MaxLogit);
         Probs.Mul(InvT);
         ProbsPtr := TNeuralFloatArrPtr(Probs.GetRawPtr(0));
-        TNNetVolume.Exp(ProbsPtr, ProbsPtr, VocabSize);
-        SumExp := Probs.GetSum();
+        // (x - Max)/T = x/T - Max/T, so the shift rides along with the fused
+        // exp-and-sum pass instead of costing its own Add and GetSum sweeps.
+        SumExp := TNNetVolume.ExpShiftSum(ProbsPtr, ProbsPtr,
+          MaxLogit * InvT, VocabSize);
         if SumExp <= 0 then SumExp := 1.0;
         Probs.Mul(1.0 / SumExp);
         Next := Sampler.GetToken(Probs);
@@ -9324,10 +9697,11 @@ var
   NewBeam: TNNetTokenDecodeResult;
   EncSeqLen, DecSeqLen, VocabSize, EffMaxNew: integer;
   EncSeqLenM1, DecSeqLenM1, VocabSizeM1, LiveHi: integer;
-  Step, B, I, T, Pos, PrevLen, Base, CandCount: integer;
+  Step, B, I, T, Pos, PrevLen, CandCount: integer;
   KeepCount, MaxKeepIdx, ParentIdx, ParentLen: integer;
   ParentToks: TNeuralIntegerArray;
-  MaxLogit, SumExp, CutScore, V, InvDenExt, NewSumLP: TNeuralFloat;
+  LogitsRowPtr, LogProbsPtr: TNeuralFloatArrPtr;
+  MaxLogit, SumExp, CutScore, InvDenExt, NewSumLP: TNeuralFloat;
   LnSumExp, LnTiny, LP: TNeuralFloat;
   AllDominated: boolean;
   BSumLP: TNeuralFloat;
@@ -9428,16 +9802,14 @@ begin
         DecoderNet.Compute(DecToks);
         // Stable softmax of the logits row at the last prefix position,
         // then SafeLogProb - the log image of the greedy/sampled row.
-        Base := PrevLen * VocabSize;
-        MaxLogit := Logits.FData[Base];
-        for T := 1 to VocabSizeM1 do
-        begin
-          V := Logits.FData[Base + T];
-          if V > MaxLogit then MaxLogit := V;
-        end;
-        SumExp := 0;
-        for T := 0 to VocabSizeM1 do
-          SumExp := SumExp + NeuralExp(Logits.FData[Base + T] - MaxLogit);
+        // #12/#18: bind the row base once, then take the row max and the
+        // exp-sum with the vectorized primitives. The exp values land in
+        // LogProbs, which the log-space rewrite below overwrites in place.
+        LogitsRowPtr := TNeuralFloatArrPtr(@Logits.FData[PrevLen * VocabSize]);
+        LogProbsPtr := TNeuralFloatArrPtr(@LogProbs[0]);
+        MaxLogit := TNNetVolume.MaxValue(LogitsRowPtr, VocabSize);
+        SumExp := TNNetVolume.ExpShiftSum(LogProbsPtr, LogitsRowPtr, MaxLogit,
+          VocabSize);
         if SumExp <= 0 then SumExp := 1.0;
         // Rule #14: log(exp(x)/SumExp) = x - Ln(SumExp), so collapse the per-vocab
         // NeuralExp + divide + Ln (SafeLogProb) to a single subtraction. Ln(SumExp)
@@ -9446,7 +9818,7 @@ begin
         LnSumExp := Ln(SumExp);
         for T := 0 to VocabSizeM1 do
         begin
-          LP := Logits.FData[Base + T] - MaxLogit - LnSumExp;
+          LP := LogitsRowPtr^[T] - MaxLogit - LnSumExp;
           if LP < LnTiny then LP := LnTiny;
           LogProbs[T] := LP;
         end;
@@ -9546,20 +9918,43 @@ end;
 function NeedleSpliceAt(const Filler, NeedleFact: string;
   DepthFraction: TNeuralFloat): string;
 var
-  Len, Pos: integer;
+  Len, SplicePos, PadLen, FactLen, TailLen, OutPos: integer;
 begin
   Len := Length(Filler);
   if DepthFraction < 0 then DepthFraction := 0;
   if DepthFraction > 1 then DepthFraction := 1;
-  Pos := Round(DepthFraction * Len);
-  if Pos < 0 then Pos := 0;
-  if Pos > Len then Pos := Len;
+  SplicePos := Round(DepthFraction * Len);
+  if SplicePos < 0 then SplicePos := 0;
+  if SplicePos > Len then SplicePos := Len;
   // Snap forward to the next space so we splice on a word boundary.
-  while (Pos > 0) and (Pos < Len) and (Filler[Pos] <> ' ') do Inc(Pos);
-  Result := Copy(Filler, 1, Pos);
-  if (Result <> '') and (Result[Length(Result)] <> ' ') then Result := Result + ' ';
-  Result := Result + NeedleFact + ' ';
-  Result := Result + Copy(Filler, Pos + 1, Len - Pos);
+  while (SplicePos > 0) and (SplicePos < Len) and
+    (Filler[SplicePos] <> ' ') do Inc(SplicePos);
+  // #23: size the result once and fill it with Moves. The head keeps a
+  // separating space only when it does not already end in one.
+  PadLen := 0;
+  if (SplicePos > 0) and (Filler[SplicePos] <> ' ') then PadLen := 1;
+  FactLen := Length(NeedleFact);
+  TailLen := Len - SplicePos;
+  SetLength(Result, SplicePos + PadLen + FactLen + 1 + TailLen);
+  OutPos := 0;
+  if SplicePos > 0 then
+  begin
+    Move(Filler[1], Result[1], SplicePos);
+    OutPos := SplicePos;
+  end;
+  if PadLen = 1 then
+  begin
+    Result[OutPos + 1] := ' ';
+    Inc(OutPos);
+  end;
+  if FactLen > 0 then
+  begin
+    Move(NeedleFact[1], Result[OutPos + 1], FactLen);
+    Inc(OutPos, FactLen);
+  end;
+  Result[OutPos + 1] := ' ';
+  Inc(OutPos);
+  if TailLen > 0 then Move(Filler[SplicePos + 1], Result[OutPos + 1], TailLen);
 end;
 
 function NeedleInHaystackReport(
@@ -9649,10 +10044,23 @@ function NeedleLoremFiller(CharCount: integer; Data: Pointer): string;
 const
   cLorem = 'the quick brown fox jumps over the lazy dog while a calm river ' +
            'flows past green hills and a small village sleeps under stars ';
+var
+  LoremLen, ChunkLen, OutPos: integer;
 begin
   Result := '';
-  while Length(Result) < CharCount do Result := Result + cLorem;
-  Result := Copy(Result, 1, CharCount);
+  if CharCount < 1 then exit;
+  // #23: one allocation and repeated Moves instead of a quadratic append
+  // chain that is then truncated.
+  LoremLen := Length(cLorem);
+  SetLength(Result, CharCount);
+  OutPos := 0;
+  while OutPos < CharCount do
+  begin
+    ChunkLen := LoremLen;
+    if OutPos + ChunkLen > CharCount then ChunkLen := CharCount - OutPos;
+    Move(cLorem[1], Result[OutPos + 1], ChunkLen);
+    Inc(OutPos, ChunkLen);
+  end;
 end;
 
 function NeedleGreedyGenerate(const Prompt: string; Data: Pointer): string;

@@ -359,13 +359,23 @@ begin
         // Invariant per-frame base (#11) and the two constant divides folded
         // into one reciprocal multiply (#5).
         InvScale := 1.0 / (NumChannels * 32768.0);
-        for FrameCnt := 0 to NumFramesM1 do
+        // Mono is the common case: unswitch it so the frame loop is a plain
+        // scale instead of a one-trip channel-average nest (#3).
+        if NumChannels = 1 then
         begin
-          fBase := FrameCnt * NumChannels;
-          Acc := 0;
-          for ChCnt := 0 to NumChannelsM1 do
-            Acc := Acc + Raw[fBase + ChCnt];
-          Samples.FData[FrameCnt] := Acc * InvScale;
+          for FrameCnt := 0 to NumFramesM1 do
+            Samples.FData[FrameCnt] := Raw[FrameCnt] * InvScale;
+        end
+        else
+        begin
+          for FrameCnt := 0 to NumFramesM1 do
+          begin
+            fBase := FrameCnt * NumChannels;
+            Acc := 0;
+            for ChCnt := 0 to NumChannelsM1 do
+              Acc := Acc + Raw[fBase + ChCnt];
+            Samples.FData[FrameCnt] := Acc * InvScale;
+          end;
         end;
         Result := SampleRate;
         exit;
@@ -400,7 +410,7 @@ var
   NumPhases, PhaseStepInt, PhaseStepFrac, Num, IntBase: integer;
   MaxTaps, TapCnt, TapCntM1, RelLo, WBase, T, TLo, THi, J0, G, A, B: integer;
   Frac: double;
-  PhaseW, PhaseWSum: array of double;
+  PhaseW, PhaseWSumInv: array of double;
   PhaseLo, PhaseCnt: array of integer;
 
   // Lanczos-windowed sinc at offset T (in input-sample units), low-passed at
@@ -493,7 +503,7 @@ begin
     // path, so the allocation is legal) and the inner loop becomes a table read
     // plus a multiply-accumulate instead of two Sin calls and two divides.
     SetLength(PhaseW, NumPhases * MaxTaps);
-    SetLength(PhaseWSum, NumPhases);
+    SetLength(PhaseWSumInv, NumPhases);
     SetLength(PhaseLo, NumPhases);
     SetLength(PhaseCnt, NumPhases);
     for Num := 0 to NumPhases - 1 do
@@ -520,7 +530,13 @@ begin
         PhaseW[WBase + T] := W;
         WSum := WSum + W;
       end;
-      PhaseWSum[Num] := WSum;
+      // Store the reciprocal: the interior branch below normalizes by a
+      // multiply. A zero total keeps the old behaviour (an all-zero kernel row
+      // wrote an exact 0.0, never a division result).
+      if WSum <> 0.0 then
+        PhaseWSumInv[Num] := 1.0 / WSum
+      else
+        PhaseWSumInv[Num] := 0.0;
     end;
 
     Num := 0;
@@ -536,17 +552,17 @@ begin
       if J0 < 0 then TLo := -J0;
       THi := TapCntM1;
       if J0 + THi > NInM1 then THi := NInM1 - J0;
-      Acc := 0.0;
       if (TLo = 0) and (THi = TapCntM1) then
       begin
-        // Interior sample: every tap is in range, so the normalizer is the
-        // phase's precomputed total.
-        WSum := PhaseWSum[Num];
-        for T := 0 to TapCntM1 do
-          Acc := Acc + PhaseW[WBase + T] * Wave.FData[J0 + T];
+        // Interior sample: every tap is in range, so the whole tap loop is the
+        // Single wave against the Double kernel row - exactly DotProductSD, and
+        // the normalizer is the phase's precomputed reciprocal (#13/#21).
+        Result.FData[OutCnt] := DotProductSD(@Wave.FData[J0], @PhaseW[WBase],
+          TapCntM1 + 1) * PhaseWSumInv[Num];
       end
       else
       begin
+        Acc := 0.0;
         WSum := 0.0;
         for T := TLo to THi do
         begin
@@ -554,11 +570,11 @@ begin
           Acc := Acc + W * Wave.FData[J0 + T];
           WSum := WSum + W;
         end;
+        if WSum <> 0.0 then
+          Result.FData[OutCnt] := Acc / WSum
+        else
+          Result.FData[OutCnt] := 0.0;
       end;
-      if WSum <> 0.0 then
-        Result.FData[OutCnt] := Acc / WSum
-      else
-        Result.FData[OutCnt] := 0.0;
       // Exact rational advance of the input position: no accumulated rounding.
       Inc(IntBase, PhaseStepInt);
       Inc(Num, PhaseStepFrac);
@@ -790,14 +806,21 @@ begin
   // immediately multiplied by the stage twiddle W^(n2*k1). W^j is read off the
   // fundamental table at j mod N, so no second table is needed. The result is
   // stored k1-major so stage 2 walks it contiguously.
+  //
+  // Both twiddle indices are already reduced, so no `mod N` is needed here: the
+  // guard above establishes N1*N2 = N, and K1 <= N1-1, N2Cnt <= N2-1, hence
+  // N2*K1 <= N - N2 < N and N2Cnt*K1 <= (N1-1)*(N2-1) = N - N1 - N2 + 1 < N.
+  // Both also advance by a constant per K1 step (N2 and N2Cnt respectively), so
+  // they are carried by addition instead of recomputed (#6).
   for N2Cnt := 0 to N2M1 do
   begin
+    TwStep := 0;
+    TwFix := 0;
     for K1 := 0 to N1M1 do
     begin
       Re := 0.0;
       Im := 0.0;
       Tw := 0;
-      TwStep := (N2 * K1) mod N;
       SrcIdx := N2Cnt;
       for N1Cnt := 0 to N1M1 do
       begin
@@ -808,12 +831,13 @@ begin
         if Tw >= N then Dec(Tw, N);
         Inc(SrcIdx, N2);
       end;
-      TwFix := (N2Cnt * K1) mod N;
       C := CosTab[TwFix];
       S := SinTab[TwFix];
       DstBase := K1 * N2 + N2Cnt;
       ScrRe[DstBase] := Re * C - Im * S;
       ScrIm[DstBase] := Re * S + Im * C;
+      Inc(TwStep, N2);
+      Inc(TwFix, N2Cnt);
     end;
   end;
 
@@ -824,12 +848,14 @@ begin
     DstBase := K1 * N2;
     K := K1;
     K2 := 0;
+    // Same reduction argument as stage 1: K2 <= N2-1 so N1*K2 <= N - N1 < N,
+    // and the index advances by N1 per K2 step (#6).
+    TwStep := 0;
     while (K <= NumBinsM1) and (K2 <= N2M1) do
     begin
       Re := 0.0;
       Im := 0.0;
       Tw := 0;
-      TwStep := (N1 * K2) mod N;
       for N2Cnt := 0 to N2M1 do
       begin
         Br := ScrRe[DstBase + N2Cnt];
@@ -843,6 +869,7 @@ begin
       end;
       PowerOut[K] := Re * Re + Im * Im;
       Inc(K2);
+      Inc(TwStep, N1);
       K := K1 + N1 * K2;
     end;
   end;
@@ -859,6 +886,7 @@ var
   CosTab, SinTab: array of double; // (NumBins x NFFT) DFT twiddles
   FilterBank: array of double;    // (NumBins x NumMelBins) triangular bank
   FilterFreqs: array of double;   // NumMelBins + 2 triangle corner freqs
+  MelBinLo, MelBinHi: array of integer; // per-mel nonzero bin span
   Power: array of double;         // one frame's power spectrum
   LogMel: array of double;        // (NumFrames x NumMelBins)
   FrameBuf: array of double;      // one windowed frame (built once per frame)
@@ -868,7 +896,8 @@ var
   MelMin, MelMax, FFTFreq, DownSlope, UpSlope, Tri: double;
   ReAcc, ImAcc, Acc, MaxLog, V, MaxLogM8: double;
   logFloor, invLn10, angStep, ang: double;
-  twBase, rowBase, twIdx, idx, nCopy, nCopyM1: integer;
+  twBase, rowBase, twIdx, idx, nCopy, nCopyM1, BinHi: integer;
+  LastNZ: integer;                // conservative last index Wave may be nonzero at
   AllZero: boolean;
 
   // np.pad reflect indexing for the center pad (mirror WITHOUT the edge
@@ -908,6 +937,7 @@ begin
     Wave[SampleCnt] := Samples.FData[SampleCnt];
   for SampleCnt := nCopy to NumSamplesM1 do
     Wave[SampleCnt] := 0.0;
+  LastNZ := nCopyM1;   // everything from nCopy on was just zeroed
 
   // ---- periodic hann window (transformers window_function default) ----
   SetLength(Window, csWhisperNFFT);
@@ -936,6 +966,16 @@ begin
     FilterFreqs[MelCnt] := MelToHertzSlaney(
       MelMin + (MelMax - MelMin) * MelCnt / (NumMelBins + 1));
   SetLength(FilterBank, NumBins * NumMelBins);
+  // Each slaney triangle covers a short contiguous run of the 201 rfft
+  // bins, so the projection only has to touch [MelBinLo, MelBinHi]; the
+  // skipped taps are exact zeros, leaving the result bit-identical.
+  SetLength(MelBinLo, NumMelBins);
+  SetLength(MelBinHi, NumMelBins);
+  for MelCnt := 0 to NumMelBinsM1 do
+  begin
+    MelBinLo[MelCnt] := NumBins;
+    MelBinHi[MelCnt] := -1;
+  end;
   for BinCnt := 0 to NumBinsM1 do
   begin
     FFTFreq := (csWhisperSampleRate div 2) * BinCnt / (NumBins - 1);
@@ -952,6 +992,11 @@ begin
       // projection's inner (BinCnt) loop is contiguous (App E / rule #6).
       FilterBank[MelCnt * NumBins + BinCnt] := Tri *
         (2.0 / (FilterFreqs[MelCnt + 2] - FilterFreqs[MelCnt]));
+      if Tri > 0.0 then
+      begin
+        if BinCnt < MelBinLo[MelCnt] then MelBinLo[MelCnt] := BinCnt;
+        MelBinHi[MelCnt] := BinCnt;
+      end;
     end;
   end;
 
@@ -985,15 +1030,24 @@ begin
     FrameStart := FrameCnt * csWhisperHop - (csWhisperNFFT div 2);
     // The 30 s zero-padding tail produces all-zero frames whose mel rows
     // are exactly log10(mel_floor) - skip their O(bins*taps) DFT.
-    AllZero := true;
-    for TapCnt := 0 to NFFTM1 do
+    //
+    // Wave is zero from nCopy on by construction, so a frame starting at or
+    // after nCopy is all-zero without reading a single tap: its in-range taps
+    // sit in the zero tail, and the only frame indices that can run past the
+    // end reflect to >= NumSamples-41, which is itself past nCopy (FrameStart
+    // <= NumSamples-360 bounds nCopy there). Frames with a negative start
+    // reflect into the head of the waveform, so those still need the scan.
+    if FrameStart >= 0 then
+      AllZero := FrameStart > LastNZ
+    else
     begin
-      SrcIdx := FrameStart + TapCnt;
-      if (SrcIdx >= 0) and (SrcIdx < NumSamples) then
-      begin
-        if Wave[SrcIdx] <> 0.0 then begin AllZero := false; break; end;
-      end
-      else if WaveAt(SrcIdx) <> 0.0 then begin AllZero := false; break; end;
+      AllZero := true;
+      for TapCnt := 0 to NFFTM1 do
+        if WaveAt(FrameStart + TapCnt) <> 0.0 then
+        begin
+          AllZero := false;
+          break;
+        end;
     end;
     if AllZero then
     begin
@@ -1003,16 +1057,30 @@ begin
     else
     begin
       // Build the windowed frame ONCE; every bin reuses it (rule #5/#11 -
-      // ~200x fewer WaveAt calls than windowing inside the bin loop).
-      for TapCnt := 0 to NFFTM1 do
-        FrameBuf[TapCnt] := WaveAt(FrameStart + TapCnt) * Window[TapCnt];
+      // ~200x fewer WaveAt calls than windowing inside the bin loop). Whether
+      // the frame needs reflection is fixed for the whole tap loop, so the test
+      // is unswitched out of it (#20): an interior frame indexes Wave through a
+      // carried offset with no call and no bounds test (#12).
+      if (FrameStart >= 0) and (FrameStart + NFFTM1 <= NumSamplesM1) then
+      begin
+        SrcIdx := FrameStart;
+        for TapCnt := 0 to NFFTM1 do
+        begin
+          FrameBuf[TapCnt] := Wave[SrcIdx] * Window[TapCnt];
+          Inc(SrcIdx);
+        end;
+      end
+      else
+        for TapCnt := 0 to NFFTM1 do
+          FrameBuf[TapCnt] := WaveAt(FrameStart + TapCnt) * Window[TapCnt];
       RealFramePowerSpectrum(FrameBuf, csWhisperNFFT, NumBins, DftN1, DftN2,
         CosTab, SinTab, DftScrRe, DftScrIm, Power);
       for MelCnt := 0 to NumMelBinsM1 do
       begin
         Acc := 0.0;
         twBase := MelCnt * NumBins;         // mel-major filter bank row base
-        for BinCnt := 0 to NumBinsM1 do
+        BinHi := MelBinHi[MelCnt];
+        for BinCnt := MelBinLo[MelCnt] to BinHi do
           Acc := Acc + FilterBank[twBase + BinCnt] * Power[BinCnt];
         if Acc < csWhisperMelFloor then Acc := csWhisperMelFloor;
         LogMel[rowBase + MelCnt] := Ln(Acc) * invLn10;
@@ -1076,8 +1144,7 @@ var
   BinsWidth: array of double;    // NFFT
   Raw: array of double;          // (NumChroma x NFFT) before normalization
   ColNorm, Diff, Val, W, Tmp: double;
-  Rolled: array of double;       // (NumChroma x NumKept) after roll + slice
-  RollBy: integer;
+  RollBy, idx, SrcBase, DstBase: integer;
 begin
   // chroma_filter_bank(tuning=0, power=2, weighting=(5,2), start_at_c=True),
   // transformers.audio_utils. The filter bank has one column per FREQ BIN of
@@ -1137,12 +1204,24 @@ begin
   for b := 0 to NumBinsM1 do
   begin
     ColNorm := 0.0;
+    idx := b;
     for c := 0 to NumChromaM1 do
-      ColNorm := ColNorm + Raw[c * NumBins + b] * Raw[c * NumBins + b];
+    begin
+      Val := Raw[idx];             // read once, squared (#4)
+      ColNorm := ColNorm + Val * Val;
+      Inc(idx, NumBins);           // c * NumBins + b, carried (#6)
+    end;
     ColNorm := Sqrt(ColNorm);
     if ColNorm > 0.0 then
+    begin
+      Tmp := 1.0 / ColNorm;        // one divide, NumChroma multiplies (#21)
+      idx := b;
       for c := 0 to NumChromaM1 do
-        Raw[c * NumBins + b] := Raw[c * NumBins + b] / ColNorm;
+      begin
+        Raw[idx] := Raw[idx] * Tmp;
+        Inc(idx, NumBins);
+      end;
+    end;
   end;
 
   // Gaussian frequency weighting: *= exp(-0.5*((freq_bins/NumChroma - 5)/2)^2)
@@ -1158,16 +1237,83 @@ begin
 
   // start_at_c_chroma: roll rows by -3*(NumChroma div 12) along the chroma axis
   RollBy := 3 * (NumChroma div 12);   // shift UP by RollBy (np.roll(-RollBy))
-  SetLength(Rolled, NumChroma * NumKept);
-  for c := 0 to NumChromaM1 do
-    for b := 0 to NumKeptM1 do
-      Rolled[c * NumKept + b] :=
-        Raw[(((c + RollBy) mod NumChroma)) * NumBins + b];
-
   Filt.ReSize(NumChroma, 1, NumKept);
+  // The roll is a pure row permutation and the slice a prefix, so the rolled
+  // rows go straight into Filt - no intermediate copy of the whole bank.
   for c := 0 to NumChromaM1 do
+  begin
+    SrcBase := ((c + RollBy) mod NumChroma) * NumBins;   // per-row, hoisted (#11)
+    DstBase := c * NumKept;
     for b := 0 to NumKeptM1 do
-      Filt.FData[c * NumKept + b] := Rolled[c * NumKept + b];
+      Filt.FData[DstBase + b] := Raw[SrcBase + b];
+  end;
+end;
+
+// In-place radix-2 FFT (forward: X[k] = sum x[n] exp(-2*pi*i*k*n/N)). N must
+// be a power of two; Re/Im must both hold at least N entries. Shared by the
+// melody chroma front-end and the power-of-two inverse STFT path.
+//
+// CosTab/SinTab are the caller's fundamental twiddle table, CosTab[j] =
+// cos(2*pi*j/N) and SinTab[j] = sin(2*pi*j/N); at least N div 2 entries are
+// read. A stage of length lenF needs exp(-2*pi*i*k2/lenF) for k2 < lenF div 2,
+// which is entry k2*(N div lenF) < N div 2 of that same table. Reading the
+// twiddle instead of advancing it by complex multiplication removes the
+// loop-carried dependency the recurrence imposes on the butterfly loop, and
+// drops the drift the recurrence accumulates across a long stage.
+procedure FFTRadix2InPlace(var Re, Im: array of double; N: integer;
+  const CosTab, SinTab: array of double);
+var
+  i2, j2, lenF, halfF, k2, a2, b2: integer;
+  MaxTapPos, halfFM1, twIdx, twStep: integer;
+  wRe, wIm, tmpF: double;
+  uRe, uIm, vRe, vIm: double;
+begin
+  MaxTapPos := N - 1;
+  j2 := 0;
+  for i2 := 1 to MaxTapPos do
+  begin
+    k2 := N shr 1;
+    while (j2 and k2) <> 0 do
+    begin
+      j2 := j2 and (not k2);
+      k2 := k2 shr 1;
+    end;
+    j2 := j2 or k2;
+    if i2 < j2 then
+    begin
+      tmpF := Re[i2]; Re[i2] := Re[j2]; Re[j2] := tmpF;
+      tmpF := Im[i2]; Im[i2] := Im[j2]; Im[j2] := tmpF;
+    end;
+  end;
+  lenF := 2;
+  while lenF <= N do
+  begin
+    halfF := lenF shr 1;
+    halfFM1 := halfF - 1;
+    twStep := N div lenF;
+    i2 := 0;
+    while i2 < N do
+    begin
+      twIdx := 0;
+      for k2 := 0 to halfFM1 do
+      begin
+        a2 := i2 + k2;
+        b2 := a2 + halfF;
+        // w = exp(-2*pi*i*k2/lenF) = CosTab[twIdx] - i*SinTab[twIdx].
+        wRe := CosTab[twIdx];
+        wIm := SinTab[twIdx];
+        uRe := Re[a2]; uIm := Im[a2];
+        tmpF := Re[b2];
+        vRe := tmpF * wRe + Im[b2] * wIm;
+        vIm := Im[b2] * wRe - tmpF * wIm;
+        Re[a2] := uRe + vRe; Im[a2] := uIm + vIm;
+        Re[b2] := uRe - vRe; Im[b2] := uIm - vIm;
+        Inc(twIdx, twStep);
+      end;
+      i2 := i2 + lenF;
+    end;
+    lenF := lenF shl 1;
+  end;
 end;
 
 procedure ComputeMusicgenMelodyChroma(Samples: TNNetVolume; Chroma: TNNetVolume;
@@ -1180,11 +1326,12 @@ var
   WinNorm: double;                // sqrt(sum(window^2))
   Filt: TNNetVolume;
   Re, Im: array of double;        // FFT scratch (NFFT)
+  FftCos, FftSin: array of double; // radix-2 twiddles, cos/sin(2*pi*j/NFFT)
   Power: array of double;         // one frame's power spectrum (NumBins)
   RawChroma: array of double;     // (NumFrames x NumChroma)
   FrameStart, FrameCnt, TapCnt, BinCnt, ChCnt, SrcIdx, ArgMax: integer;
-  rowBase, fBase: integer;
-  Acc, MaxVal, V, WinNormInv: double;
+  rowBase, fBase, HalfNFFT, HalfNFFTM1: integer;
+  Acc, MaxVal, V, WinNormInv, angStep, ang: double;
 
   // reflect pad indexing (np pad mode 'reflect' = torch center pad): mirror
   // WITHOUT repeating the edge sample. Single bounce suffices (PadLeft < len).
@@ -1195,62 +1342,6 @@ var
     if Idx < 0 then Idx := 0;
     if Idx >= NumSamplesIn then Idx := NumSamplesIn - 1;
     Result := Samples.FData[Idx];
-  end;
-
-  // In-place radix-2 FFT (forward: X[k] = sum x[n] exp(-2*pi*i*k*n/N)). NFFT
-  // is a power of two for the melody front-end (16384).
-  procedure FFTRadix2;
-  var
-    i2, j2, lenF, halfF, k2, a2, b2: integer;
-    halfFM1: integer;
-    ang, wRe, wIm, wpRe, wpIm, tmpF: double;
-    uRe, uIm, vRe, vIm: double;
-  begin
-    j2 := 0;
-    for i2 := 1 to NFFTM1 do
-    begin
-      k2 := NFFT shr 1;
-      while (j2 and k2) <> 0 do
-      begin
-        j2 := j2 and (not k2);
-        k2 := k2 shr 1;
-      end;
-      j2 := j2 or k2;
-      if i2 < j2 then
-      begin
-        tmpF := Re[i2]; Re[i2] := Re[j2]; Re[j2] := tmpF;
-        tmpF := Im[i2]; Im[i2] := Im[j2]; Im[j2] := tmpF;
-      end;
-    end;
-    lenF := 2;
-    while lenF <= NFFT do
-    begin
-      halfF := lenF shr 1;
-      halfFM1 := halfF - 1;
-      ang := -2.0 * Pi / lenF;
-      wpRe := Cos(ang);
-      wpIm := Sin(ang);
-      i2 := 0;
-      while i2 < NFFT do
-      begin
-        wRe := 1.0; wIm := 0.0;
-        for k2 := 0 to halfFM1 do
-        begin
-          a2 := i2 + k2;
-          b2 := a2 + halfF;
-          uRe := Re[a2]; uIm := Im[a2];
-          vRe := Re[b2] * wRe - Im[b2] * wIm;
-          vIm := Re[b2] * wIm + Im[b2] * wRe;
-          Re[a2] := uRe + vRe; Im[a2] := uIm + vIm;
-          Re[b2] := uRe - vRe; Im[b2] := uIm - vIm;
-          tmpF := wRe * wpRe - wIm * wpIm;
-          wIm := wRe * wpIm + wIm * wpRe;
-          wRe := tmpF;
-        end;
-        i2 := i2 + lenF;
-      end;
-      lenF := lenF shl 1;
-    end;
   end;
 
 begin
@@ -1294,6 +1385,19 @@ begin
   SetLength(Im, NFFT);
   SetLength(Power, NumBins);
   SetLength(RawChroma, NumFrames * NumChroma);
+  // Radix-2 twiddle table, built once for the whole call (preprocessing, not a
+  // Compute path): the FFT reads entries 0..NFFT div 2 - 1 of it.
+  HalfNFFT := NFFT shr 1;
+  HalfNFFTM1 := HalfNFFT - 1;
+  SetLength(FftCos, HalfNFFT);
+  SetLength(FftSin, HalfNFFT);
+  angStep := 2.0 * Pi / NFFT;
+  for TapCnt := 0 to HalfNFFTM1 do
+  begin
+    ang := angStep * TapCnt;
+    FftCos[TapCnt] := Cos(ang);
+    FftSin[TapCnt] := Sin(ang);
+  end;
   try
     BuildChromaFilterBank(Filt, SampleRate, NFFT, NumChroma);
 
@@ -1303,17 +1407,25 @@ begin
       // FrameCnt*Hop - PadLeft in the ORIGINAL signal.
       FrameStart := FrameCnt * Hop - PadLeft;
       rowBase := FrameCnt * NumChroma;      // RawChroma row base (rule #4)
-      for TapCnt := 0 to NFFTM1 do
+      // The imaginary part is a constant zero fill: IEEE +0.0 is all-zero bits,
+      // so one FillChar replaces NFFT stores interleaved with the tap work.
+      FillChar(Im[0], NFFT * csDoubleSize, 0);
+      // Whether this frame needs reflection is fixed for the whole tap loop, so
+      // the test is unswitched out of it (#20); the interior case then walks
+      // Samples through a carried offset (#12).
+      if (FrameStart >= 0) and (FrameStart + NFFTM1 <= NumSamplesM1) then
       begin
-        SrcIdx := FrameStart + TapCnt;
-        if (SrcIdx >= 0) and (SrcIdx <= NumSamplesM1) then
-          V := Samples.FData[SrcIdx]
-        else
-          V := WaveAt(SrcIdx);
-        Re[TapCnt] := V * Window[TapCnt];
-        Im[TapCnt] := 0.0;
-      end;
-      FFTRadix2;
+        SrcIdx := FrameStart;
+        for TapCnt := 0 to NFFTM1 do
+        begin
+          Re[TapCnt] := Samples.FData[SrcIdx] * Window[TapCnt];
+          Inc(SrcIdx);
+        end;
+      end
+      else
+        for TapCnt := 0 to NFFTM1 do
+          Re[TapCnt] := WaveAt(FrameStart + TapCnt) * Window[TapCnt];
+      FFTRadix2InPlace(Re, Im, NFFT, FftCos, FftSin);
       // one-sided power spectrum, normalized by the window L2 energy
       for BinCnt := 0 to NumBinsM1 do
       begin
@@ -1333,15 +1445,14 @@ begin
         // Single filter row against the Double power spectrum: the staged
         // mixed-precision dot avoids the cvtss2sd false dependency chain.
         Acc := DotProductSD(@Filt.FData[fBase], @Power[0], NumBins);
-        RawChroma[rowBase + ChCnt] := Acc;
         if Acc > MaxVal then
         begin
           MaxVal := Acc;
           ArgMax := ChCnt;
         end;
       end;
-      for ChCnt := 0 to NumChromaM1 do
-        RawChroma[rowBase + ChCnt] := 0.0;
+      // Only the argmax cell is ever non-zero and SetLength zero-fills the
+      // whole array, so the row needs exactly one store.
       RawChroma[rowBase + ArgMax] := 1.0;
     end;
 
@@ -1356,6 +1467,7 @@ begin
     Filt.Free;
     SetLength(Re, 0); SetLength(Im, 0); SetLength(Power, 0);
     SetLength(RawChroma, 0); SetLength(Window, 0);
+    SetLength(FftCos, 0); SetLength(FftSin, 0);
   end;
 end;
 
@@ -1377,6 +1489,9 @@ var
   Acc0, Acc1, Acc2, Acc3, SelfConj, Sample, WinTap: double;
   ReVal0, ReVal1, ReVal2, ReVal3: double;
   ImVal0, ImVal1, ImVal2, ImVal3: double;
+  FftRe, FftIm: array of double;  // full-spectrum radix-2 scratch (pow2 NFFT)
+  IsPow2: boolean;                // NFFT is a power of two -> radix-2 path
+  MirrorCnt, MirrorSrc: integer;
 const
   csEnvEps = 1e-12;               // divide-by-zero guard for the COLA envelope
 begin
@@ -1433,6 +1548,18 @@ begin
   TopIsHalf := (NFFT and 1) = 0;
   NumBins4 := NumBins and (not 3);
 
+  // For a power-of-two NFFT the whole per-frame O(NFFT*NumBins) inverse DFT
+  // collapses to one O(NFFT*log2 NFFT) radix-2 pass. The one-sided spectrum is
+  // mirrored back to full length with the conjugate the storage convention
+  // implies (stored Im = +sum x*sin, so x[t] = Re(FFT(Y))/NFFT for
+  // Y[k] = Re[k] + i*Im[k], Y[NFFT-k] = Re[k] - i*Im[k]).
+  IsPow2 := (NFFT and NFFTM1) = 0;
+  if IsPow2 then
+  begin
+    SetLength(FftRe, NFFT);
+    SetLength(FftIm, NFFT);
+  end;
+
   OutLen := NFFT + (NumFrames - 1) * HopLength;
   OutLenM1 := OutLen - 1;
   NumFramesM1 := NumFrames - 1;
@@ -1448,6 +1575,32 @@ begin
   begin
     FrameStart := FrameCnt * HopLength;
     frameBase := FrameCnt * NumBins;      // Re/Im row base (invariant over nest)
+    if IsPow2 then
+    begin
+      for BinCnt := 0 to NumBinsM1 do
+      begin
+        FftRe[BinCnt] := Re.FData[frameBase + BinCnt];
+        FftIm[BinCnt] := Im.FData[frameBase + BinCnt];
+      end;
+      MirrorSrc := NumBinsM1 - 1;
+      for MirrorCnt := NumBins to NFFTM1 do
+      begin
+        FftRe[MirrorCnt] := Re.FData[frameBase + MirrorSrc];
+        FftIm[MirrorCnt] := -Im.FData[frameBase + MirrorSrc];
+        Dec(MirrorSrc);
+      end;
+      // The fundamental table built above is exactly the twiddle table the
+      // radix-2 stages index (CosTab[j] = cos(2*pi*j/NFFT)); no second table.
+      FFTRadix2InPlace(FftRe, FftIm, NFFT, CosTab, SinTab);
+      for TapCnt := 0 to NFFTM1 do
+      begin
+        Sample := FftRe[TapCnt] * invNFFT;
+        OutIdx := FrameStart + TapCnt;
+        AccSig[OutIdx] := AccSig[OutIdx] + Sample * Window[TapCnt];
+        AccEnv[OutIdx] := AccEnv[OutIdx] + Win2[TapCnt];
+      end;
+      continue;
+    end;
     for TapCnt := 0 to NFFTM1 do
     begin
       // inverse real DFT of this frame at sample TapCnt.

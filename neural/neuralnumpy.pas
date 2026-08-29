@@ -104,6 +104,8 @@ type
     FSize: array of QWord;
     FLocalOfs: array of QWord;
     procedure ParseZipDirectory;
+    // Absolute file offset of the entry's payload (past its local header).
+    function EntryDataOffset(Index: integer): Int64;
     function EntryRawBytes(Index: integer): TBytes;
   public
     constructor Create(const pFileName: string);
@@ -149,6 +151,9 @@ function EncodeF16(Value: Single): Word;
 // Builds a complete .npy blob (header + raw data) in memory.
 function BuildNpyBlob(Src: TNNetVolume; const pShape: array of Int64;
   const pDType: string): TBytes;
+// CRC-32 (the ZIP/PNG polynomial, $EDB88320 reflected) of a byte buffer, as
+// written into the .npz local and central-directory headers.
+function Crc32Of(const B: TBytes): Cardinal;
 
 implementation
 
@@ -351,7 +356,6 @@ var
   i: Int64;
   pf8: PDouble;
   pu16: PWord;
-  pi1: PShortInt;
   pu1: PByte;
   pi2: PSmallInt;
   pi4: PLongInt;
@@ -384,8 +388,10 @@ begin
   end
   else if DType = 'i1' then
   begin
-    pi1 := PShortInt(@Raw[0]);
-    for i := 0 to NumElementsM1 do begin Dst[i] := pi1^; Inc(pi1); end;
+    // Rule #18, like the 'f2' arm above: a scale of 1.0 makes DequantizeInt8 a
+    // plain int8 -> Single widening (an exact multiply), vectorized on AVX2.
+    TNNetVolume.DequantizeInt8(TNeuralFloatArrPtr(Dst),
+      TNeuralInt8ArrPtr(@Raw[0]), integer(NumElements), 1.0);
   end
   else if (DType = 'u1') or (DType = 'b1') then
   begin
@@ -445,7 +451,6 @@ var
   Major, Minor: byte;
   HeaderLen: Cardinal;
   Lo16: Word;
-  HeaderBytes: TBytes;
   Header: string;
   Descr: string;
   FortranOrder: boolean;
@@ -454,7 +459,7 @@ var
   i: integer;
   ElemSize: integer;
   Raw: TBytes;
-  HeaderLenM1, ShapeHi: integer;
+  ShapeHi: integer;
   ElemsPerChunk, Done, ThisElems, ChunkBytes: Int64;
 begin
   if Stream.Read(Magic, 6) <> 6 then
@@ -480,14 +485,12 @@ begin
       raise ENumpyError.Create('numpy: truncated header length');
     HeaderLen := LEtoN(HeaderLen);
   end;
-  SetLength(HeaderBytes, HeaderLen);
-  if HeaderLen > 0 then
-    if Stream.Read(HeaderBytes[0], HeaderLen) <> integer(HeaderLen) then
-      raise ENumpyError.Create('numpy: truncated header dict');
+  // The header dict is ASCII, so it is read straight into the string instead
+  // of through a byte buffer and a per-character Chr loop.
   SetLength(Header, HeaderLen);
-  HeaderLenM1 := integer(HeaderLen) - 1;
-  for i := 0 to HeaderLenM1 do
-    Header[i + 1] := Chr(HeaderBytes[i]);
+  if HeaderLen > 0 then
+    if Stream.Read(Header[1], HeaderLen) <> integer(HeaderLen) then
+      raise ENumpyError.Create('numpy: truncated header dict');
 
   ParseHeaderDict(Header, Descr, FortranOrder, Shape);
   OutDType := NormalizeDescr(Descr);
@@ -594,68 +597,6 @@ begin
     raise ENumpyError.CreateFmt('numpy: cannot write dtype "%s"', [DType]);
 end;
 
-procedure AppendElement(var Buf: TBytes; var Pos: integer;
-  Tag: integer; Value: Single);
-var
-  u: Cardinal;
-  d: Double;
-  pd: PCardinal;
-  w: Word;
-  i64: Int64;
-begin
-  case Tag of
-  0: // f4
-  begin
-    u := PCardinal(@Value)^;
-    Buf[Pos] := u and $FF; Buf[Pos+1] := (u shr 8) and $FF;
-    Buf[Pos+2] := (u shr 16) and $FF; Buf[Pos+3] := (u shr 24) and $FF;
-    Inc(Pos, 4);
-  end;
-  1: // f8
-  begin
-    d := Value;
-    pd := PCardinal(@d);
-    Buf[Pos] := pd^ and $FF; Buf[Pos+1] := (pd^ shr 8) and $FF;
-    Buf[Pos+2] := (pd^ shr 16) and $FF; Buf[Pos+3] := (pd^ shr 24) and $FF;
-    Inc(pd);
-    Buf[Pos+4] := pd^ and $FF; Buf[Pos+5] := (pd^ shr 8) and $FF;
-    Buf[Pos+6] := (pd^ shr 16) and $FF; Buf[Pos+7] := (pd^ shr 24) and $FF;
-    Inc(Pos, 8);
-  end;
-  2: // f2
-  begin
-    w := EncodeF16(Value);
-    Buf[Pos] := w and $FF; Buf[Pos+1] := (w shr 8) and $FF;
-    Inc(Pos, 2);
-  end;
-  3: // i1/u1
-  begin
-    Buf[Pos] := Round(Value) and $FF; Inc(Pos);
-  end;
-  4: // i2/u2
-  begin
-    i64 := Round(Value);
-    Buf[Pos] := i64 and $FF; Buf[Pos+1] := (i64 shr 8) and $FF; Inc(Pos, 2);
-  end;
-  5: // i4/u4
-  begin
-    i64 := Round(Value);
-    Buf[Pos] := i64 and $FF; Buf[Pos+1] := (i64 shr 8) and $FF;
-    Buf[Pos+2] := (i64 shr 16) and $FF; Buf[Pos+3] := (i64 shr 24) and $FF;
-    Inc(Pos, 4);
-  end;
-  6: // i8/u8
-  begin
-    i64 := Round(Value);
-    Buf[Pos]   := i64 and $FF;        Buf[Pos+1] := (i64 shr 8) and $FF;
-    Buf[Pos+2] := (i64 shr 16) and $FF; Buf[Pos+3] := (i64 shr 24) and $FF;
-    Buf[Pos+4] := (i64 shr 32) and $FF; Buf[Pos+5] := (i64 shr 40) and $FF;
-    Buf[Pos+6] := (i64 shr 48) and $FF; Buf[Pos+7] := (i64 shr 56) and $FF;
-    Inc(Pos, 8);
-  end;
-  end;
-end;
-
 function BuildNpyBlob(Src: TNNetVolume; const pShape: array of Int64;
   const pDType: string): TBytes;
 var
@@ -666,8 +607,13 @@ var
   HeaderLen, TotalHeader, PadTo: integer;
   PreambleLen: integer;
   DataPos: integer;
-  pShapeHi, ShapeHi, HeaderTextLen, Tag: integer;
+  pShapeHi, ShapeHi, HeaderTextLen: integer;
   NumElementsM1: Int64;
+  pf8: PDouble;
+  pu1: PByte;
+  pu2: PWord;
+  pu4: PCardinal;
+  pi8: PInt64;
 begin
   // normalize dtype (lower, strip byte-order if caller passed one)
   DType := LowerCase(pDType);
@@ -710,43 +656,71 @@ begin
   HeaderLen := ((PreambleLen + TotalHeader + PadTo - 1) div PadTo) * PadTo
     - PreambleLen;
   // pad HeaderText with spaces up to HeaderLen-1, then newline
-  while Length(HeaderText) < HeaderLen - 1 do HeaderText := HeaderText + ' ';
+  // One padded append instead of a reallocating concatenation per space (#23).
+  if Length(HeaderText) < HeaderLen - 1 then
+    HeaderText := HeaderText +
+      StringOfChar(' ', HeaderLen - 1 - Length(HeaderText));
   HeaderText := HeaderText + #10;
   if Length(HeaderText) <> HeaderLen then
     HeaderLen := Length(HeaderText); // safety (should match)
 
   SetLength(Result, PreambleLen + HeaderLen + NumElements * ElemSize);
-  for i := 0 to 5 do Result[i] := NPY_MAGIC[i];
+  Move(NPY_MAGIC[0], Result[0], 6);
   Result[6] := 1; // major
   Result[7] := 0; // minor
   Result[8] := HeaderLen and $FF;
   Result[9] := (HeaderLen shr 8) and $FF;
   HeaderTextLen := Length(HeaderText);
-  for i := 1 to HeaderTextLen do
-    Result[PreambleLen + i - 1] := Ord(HeaderText[i]);
+  if HeaderTextLen > 0 then
+    Move(HeaderText[1], Result[PreambleLen], HeaderTextLen);
 
   DataPos := PreambleLen + HeaderLen;
+  if NumElements = 0 then Exit;
   // f4 (the common/default case) is a byte-identical contiguous copy on a LE
-  // host, and f2 is one vectorized narrow into the same LE byte order, so both
-  // skip AppendElement's per-element walk. Other dtypes keep the per-element
-  // encode (genuine format conversion).
-  if DType = 'f4' then
-  begin
-    if NumElements > 0 then
-      Move(Src.FData[0], Result[DataPos], NumElements * csNeuralFloatSize);
-  end
-  else if DType = 'f2' then
-  begin
-    if NumElements > 0 then
-      TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@Result[DataPos]),
-        TNeuralFloatArrPtr(@Src.FData[0]), integer(NumElements));
-  end
-  else
-  begin
-    NumElementsM1 := NumElements - 1;
-    Tag := DTypeTag(DType);   // resolve dtype dispatch once, not per element (#5)
-    for i := 0 to NumElementsM1 do
-      AppendElement(Result, DataPos, Tag, Src.FData[i]);
+  // host, and f2 is one vectorized narrow into the same LE byte order. The
+  // remaining dtypes are a genuine conversion, but the dtype is invariant
+  // across the elements, so the dispatch is unswitched out of the loop (#20)
+  // and each arm stores whole elements through a typed pointer instead of
+  // splitting them into bytes by hand (LE host, as the reader's decode
+  // already assumes). Truncation to the low bytes is what the byte-splitting
+  // did, and is what a narrower typed store does.
+  NumElementsM1 := NumElements - 1;
+  case DTypeTag(DType) of
+  0: // f4
+    Move(Src.FData[0], Result[DataPos], NumElements * csNeuralFloatSize);
+  2: // f2
+    TNNetVolume.EncodeF16(TNeuralHalfArrPtr(@Result[DataPos]),
+      TNeuralFloatArrPtr(@Src.FData[0]), integer(NumElements));
+  1: // f8
+    begin
+      pf8 := PDouble(@Result[DataPos]);
+      for i := 0 to NumElementsM1 do
+      begin pf8^ := Src.FData[i]; Inc(pf8); end;
+    end;
+  3: // i1/u1
+    begin
+      pu1 := PByte(@Result[DataPos]);
+      for i := 0 to NumElementsM1 do
+      begin pu1^ := Byte(Round(Src.FData[i])); Inc(pu1); end;
+    end;
+  4: // i2/u2
+    begin
+      pu2 := PWord(@Result[DataPos]);
+      for i := 0 to NumElementsM1 do
+      begin pu2^ := Word(Round(Src.FData[i])); Inc(pu2); end;
+    end;
+  5: // i4/u4
+    begin
+      pu4 := PCardinal(@Result[DataPos]);
+      for i := 0 to NumElementsM1 do
+      begin pu4^ := Cardinal(Round(Src.FData[i])); Inc(pu4); end;
+    end;
+  6: // i8/u8
+    begin
+      pi8 := PInt64(@Result[DataPos]);
+      for i := 0 to NumElementsM1 do
+      begin pi8^ := Round(Src.FData[i]); Inc(pi8); end;
+    end;
   end;
 end;
 
@@ -769,7 +743,9 @@ end;
 // ZIP CRC-32 (for the writer's central directory)
 // ---------------------------------------------------------------------------
 var
-  CrcTable: array[0..255] of Cardinal;
+  // Slice-by-4 tables: CrcTable[0] is the classic byte table, CrcTable[k] is it
+  // advanced by k further zero bytes, which is what lets one step consume four.
+  CrcTable: array[0..3, 0..255] of Cardinal;
   CrcReady: boolean = false;
 
 procedure InitCrcTable;
@@ -781,19 +757,44 @@ begin
     for j := 0 to 7 do
       if (c and 1) <> 0 then c := $EDB88320 xor (c shr 1)
       else c := c shr 1;
-    CrcTable[i] := c;
+    CrcTable[0][i] := c;
+  end;
+  for i := 0 to 255 do
+  begin
+    c := CrcTable[0][i];
+    for j := 1 to 3 do
+    begin
+      c := CrcTable[0][c and $FF] xor (c shr 8);
+      CrcTable[j][i] := c;
+    end;
   end;
   CrcReady := true;
 end;
 
 function Crc32Of(const B: TBytes): Cardinal;
-var i: integer; c: Cardinal; BHi: integer;
+var
+  i, BLen, QuadEnd: integer;
+  c: Cardinal;
 begin
   if not CrcReady then InitCrcTable;
   c := $FFFFFFFF;
-  BHi := High(B);
-  for i := 0 to BHi do
-    c := CrcTable[(c xor B[i]) and $FF] xor (c shr 8);
+  BLen := Length(B);
+  // Four bytes per step over the bulk, then the 0-3 byte tail. LE host: the
+  // four bytes are read as one Cardinal in the order the byte loop would.
+  QuadEnd := BLen - 4;
+  i := 0;
+  while i <= QuadEnd do
+  begin
+    c := c xor PCardinal(@B[i])^;
+    c := CrcTable[3][c and $FF] xor CrcTable[2][(c shr 8) and $FF] xor
+         CrcTable[1][(c shr 16) and $FF] xor CrcTable[0][c shr 24];
+    Inc(i, 4);
+  end;
+  while i < BLen do
+  begin
+    c := CrcTable[0][(c xor B[i]) and $FF] xor (c shr 8);
+    Inc(i);
+  end;
   Result := c xor $FFFFFFFF;
 end;
 
@@ -843,7 +844,6 @@ var
   CompSize, USize, LocalOfs: Cardinal;
   EntryName: string;
   i: integer;
-  NameLenM1: integer;
 begin
   if FStream.Size < 22 then
     raise ENumpyError.Create('numpy: .npz too small to be a ZIP');
@@ -891,9 +891,7 @@ begin
     CommentLen := ReadWordAt(CdBytes, Pos + 32);
     LocalOfs := ReadDWordAt(CdBytes, Pos + 42);
     SetLength(EntryName, NameLen);
-    NameLenM1 := NameLen - 1;
-    for i := 0 to NameLenM1 do
-      EntryName[i + 1] := Chr(CdBytes[Pos + 46 + i]);
+    if NameLen > 0 then Move(CdBytes[Pos + 46], EntryName[1], NameLen);
     // strip trailing ".npy" to form the dict key
     if (Length(EntryName) > 4) and
        (LowerCase(Copy(EntryName, Length(EntryName) - 3, 4)) = '.npy') then
@@ -914,10 +912,23 @@ begin
   SetLength(FLocalOfs, EntryCnt);
 end;
 
-function TNNetNpzReader.EntryRawBytes(Index: integer): TBytes;
+function TNNetNpzReader.EntryDataOffset(Index: integer): Int64;
 var
   LocalHdr: array[0..29] of byte;
   NameLen, ExtraLen: integer;
+begin
+  FStream.Position := FLocalOfs[Index];
+  FStream.ReadBuffer(LocalHdr, 30);
+  if (LocalHdr[0] or (LocalHdr[1] shl 8) or (LocalHdr[2] shl 16) or
+      (LocalHdr[3] shl 24)) <> $04034B50 then
+    raise ENumpyError.Create('numpy: bad local-header signature in .npz');
+  NameLen := LocalHdr[26] or (LocalHdr[27] shl 8);
+  ExtraLen := LocalHdr[28] or (LocalHdr[29] shl 8);
+  Result := Int64(FLocalOfs[Index]) + 30 + NameLen + ExtraLen;
+end;
+
+function TNNetNpzReader.EntryRawBytes(Index: integer): TBytes;
+var
   DataOfs: Int64;
   Comp: TBytes;
   {$IFDEF FPC}
@@ -927,14 +938,7 @@ var
   ChunkBuf: array[0..65535] of byte;
   {$ENDIF}
 begin
-  FStream.Position := FLocalOfs[Index];
-  FStream.ReadBuffer(LocalHdr, 30);
-  if (LocalHdr[0] or (LocalHdr[1] shl 8) or (LocalHdr[2] shl 16) or
-      (LocalHdr[3] shl 24)) <> $04034B50 then
-    raise ENumpyError.Create('numpy: bad local-header signature in .npz');
-  NameLen := LocalHdr[26] or (LocalHdr[27] shl 8);
-  ExtraLen := LocalHdr[28] or (LocalHdr[29] shl 8);
-  DataOfs := FLocalOfs[Index] + 30 + NameLen + ExtraLen;
+  DataOfs := EntryDataOffset(Index);
   SetLength(Comp, FCompSize[Index]);
   FStream.Position := DataOfs;
   if FCompSize[Index] > 0 then FStream.ReadBuffer(Comp[0], FCompSize[Index]);
@@ -1011,10 +1015,24 @@ var
   Raw: TBytes;
   MemStream: TMemoryStream;
   DType: string;
+  DataOfs: Int64;
 begin
   Idx := IndexOfKey(pKey);
   if Idx < 0 then
     raise ENumpyError.CreateFmt('numpy: key "%s" not in %s', [pKey, FFileName]);
+  if FMethod[Idx] = 0 then
+  begin
+    // STORED: the entry payload IS the .npy blob, so decode it straight out of
+    // the archive. LoadNpyFromStream stages through a fixed chunk, so neither
+    // the raw entry nor a memory-stream copy of the whole tensor is needed.
+    DataOfs := EntryDataOffset(Idx);
+    FStream.Position := DataOfs;
+    LoadNpyFromStream(FStream, Dest, Result, DType);
+    if FStream.Position > DataOfs + Int64(FCompSize[Idx]) then
+      raise ENumpyError.CreateFmt('numpy: entry "%s" is truncated in %s',
+        [pKey, FFileName]);
+    Exit;
+  end;
   Raw := EntryRawBytes(Idx);
   MemStream := TMemoryStream.Create;
   try
@@ -1072,7 +1090,7 @@ procedure TNNetNpzWriter.Save;
 var
   Stream: TFileStream;
   i, n: integer;
-  nM1, EntryNameLenM1: integer;
+  nM1, EntryNameLen: integer;
   EntryName: string;
   NameBytes: TBytes;
   Crc, CompSize: Cardinal;
@@ -1106,10 +1124,9 @@ begin
     begin
       LocalOfs[i] := Stream.Position;
       EntryName := FKeys[i] + '.npy';
-      SetLength(NameBytes, Length(EntryName));
-      EntryNameLenM1 := Length(EntryName) - 1;
-      for P := 0 to EntryNameLenM1 do
-        NameBytes[P] := Ord(EntryName[P + 1]);
+      EntryNameLen := Length(EntryName);
+      SetLength(NameBytes, EntryNameLen);
+      if EntryNameLen > 0 then Move(EntryName[1], NameBytes[0], EntryNameLen);
       Crc := Crc32Of(FBlobs[i]);   // computed once here, reused in central dir
       Crcs[i] := Crc;
       CompSize := Length(FBlobs[i]);
@@ -1136,10 +1153,9 @@ begin
     for i := 0 to nM1 do
     begin
       EntryName := FKeys[i] + '.npy';
-      SetLength(NameBytes, Length(EntryName));
-      EntryNameLenM1 := Length(EntryName) - 1;
-      for P := 0 to EntryNameLenM1 do
-        NameBytes[P] := Ord(EntryName[P + 1]);
+      EntryNameLen := Length(EntryName);
+      SetLength(NameBytes, EntryNameLen);
+      if EntryNameLen > 0 then Move(EntryName[1], NameBytes[0], EntryNameLen);
       Crc := Crcs[i];              // reuse first-loop CRC (no second byte pass)
       CompSize := Length(FBlobs[i]);
       SetLength(Hdr, 46);

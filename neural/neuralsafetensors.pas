@@ -76,6 +76,33 @@ type
     FParDecodeDst: PSingle;
     FParDecodeCount: integer;
     FParDecodeBF16: boolean;
+    // Name -> FTensors index, open addressing with linear probing:
+    // FNameSlots[Slot] holds a tensor index, csTensorSlotEmpty or
+    // csTensorSlotDeleted. FIndexedSlots counts the non-empty slots (live
+    // plus deleted) and keeps the load factor below one half, so a probe
+    // always meets an empty slot. Without it FindTensor is a linear scan and
+    // a load costs one scan per metadata query per tensor.
+    FNameSlots: array of integer;
+    FNameSlotMask: integer;
+    FIndexedSlots: integer;
+    FNameIndexValid: boolean;
+    // Clears the name index and sizes it for pTensorCount names.
+    procedure ResetTensorIndex(pTensorCount: integer);
+    // Doubles the slot table and reinserts the live names, dropping deleted
+    // slots.
+    procedure GrowTensorIndex;
+    // Rebuilds the name index from FTensors. Entries with an empty name are
+    // skipped - a header parser oversizes FTensors before filling it.
+    procedure RebuildTensorIndex;
+    // Marks the name index stale so the next FindTensor rebuilds it. Call it
+    // after any change to FTensors this class did not make itself.
+    procedure InvalidateTensorIndex;
+    // Records FTensors[Idx].Name -> Idx, so a header parser can index its
+    // entries as it fills them. The caller must know the name is new. It is a
+    // no-op while the index is stale, since FindTensor rebuilds it in full.
+    procedure AddTensorToIndex(Idx: integer);
+    // Drops pName from the name index (the FTensors entry is untouched).
+    procedure RemoveTensorFromIndex(const pName: string);
     function FindTensor(const pName: string): integer;
     // Allocates WITHOUT parsing anything - the subclass constructor fills
     // the fields itself (Create(pFileName) would parse as safetensors).
@@ -147,6 +174,15 @@ type
     // CanStreamTensorRows returns true. Coded by Claude (AI).
     procedure LoadTensorRowsFlat(const pName: string;
       FirstRow, RowCount, RowSize: integer; Dest: TNNetVolume); virtual;
+    // TRUE when LoadTensorPackedRowsQ4_0 can hand over the named tensor's raw
+    // Q4_0 blocks. False here: only TNNetGGUFReader has Q4_0 tensors.
+    function CanStreamTensorPackedQ4_0(const pName: string): boolean; virtual;
+    // Serves rows FirstRow..FirstRow+RowCount-1 (RowSize codes each) of a Q4_0
+    // tensor into Dest, resized to (RowCount, 1, RowSize), as packed nibbles
+    // plus the f16 block scales widened exactly as the dequantizer widens them.
+    procedure LoadTensorPackedRowsQ4_0(const pName: string;
+      FirstRow, RowCount, RowSize: integer;
+      Dest: TNNetVolumeQuant4); virtual;
     // Loads the named tensor's RAW on-disk bytes verbatim into Dest (no dtype
     // decoding). Used by the MXFP4 dequant-at-load path (gpt-oss), whose
     // packed-nibble "*_blocks" and E8M0 "*_scales" tensors ship as U8 and must
@@ -290,6 +326,29 @@ var
   NeuralLoaderStageBytes: integer = 8 * 1024 * 1024;
 
 implementation
+
+const
+  // TNNetSafeTensorsReader name-index slot states and the smallest slot table.
+  csTensorSlotEmpty = -1;
+  csTensorSlotDeleted = -2;
+  csMinTensorSlots = 64;
+
+// FNV-1a over the name bytes. The multiply wraps by design, so overflow
+// checking is off for it.
+{$PUSH}{$Q-}{$R-}
+function SafeTensorNameHash(const pName: string): cardinal;
+var
+  i, NameLen: integer;
+begin
+  Result := 2166136261;
+  NameLen := Length(pName);
+  for i := 1 to NameLen do
+  begin
+    Result := Result xor cardinal(Ord(pName[i]));
+    Result := Result * 16777619;
+  end;
+end;
+{$POP}
 
 function DecodeF16(Bits: Word): Single;
 var
@@ -582,10 +641,10 @@ var
   Root: TJSONData;
   Obj, TensorObj: TJSONObject;
   ShapeArr, OffsArr: TJSONArray;
-  i, j, TensorCnt, ObjCount, ShapeCount, ObjMax, ShapeMax: integer;
+  i, j, TensorCnt, ObjCount, ShapeCount, ObjMax, ShapeMax, DupIdx: integer;
   ExpectedBytes, NumElements: Int64;
   ByteSize: integer;
-  ShardName: string;
+  ShardName, EntryName: string;
 begin
   ShardName := FShardNames[ShardIdx];
   try
@@ -609,29 +668,32 @@ begin
     ObjMax := ObjCount - 1;
     for i := 0 to ObjMax do
     begin
-      if Obj.Names[i] = '__metadata__' then continue;
+      EntryName := Obj.Names[i];
+      if EntryName = '__metadata__' then continue;
       if not (Obj.Items[i] is TJSONObject) then
         raise ESafeTensorsError.CreateFmt(
           'safetensors: entry "%s" is not an object: %s',
-          [Obj.Names[i], ShardName]);
+          [EntryName, ShardName]);
       TensorObj := TJSONObject(Obj.Items[i]);
-      if FindTensor(Obj.Names[i]) >= 0 then
+      DupIdx := FindTensor(EntryName);
+      if DupIdx >= 0 then
         raise ESafeTensorsError.CreateFmt(
           'safetensors: tensor "%s" in shard "%s" duplicates a tensor from ' +
-          'shard "%s".', [Obj.Names[i], ShardName,
-           FShardNames[FTensors[FindTensor(Obj.Names[i])].Shard]]);
-      FTensors[TensorCnt].Name := Obj.Names[i];
+          'shard "%s".', [EntryName, ShardName,
+           FShardNames[FTensors[DupIdx].Shard]]);
+      FTensors[TensorCnt].Name := EntryName;
+      AddTensorToIndex(TensorCnt);
       FTensors[TensorCnt].Shard := ShardIdx;
       if TensorObj.IndexOfName('dtype') < 0 then
         raise ESafeTensorsError.CreateFmt(
           'safetensors: tensor "%s" has no dtype: %s',
-          [Obj.Names[i], ShardName]);
+          [EntryName, ShardName]);
       FTensors[TensorCnt].DType := TensorObj.Get('dtype', '');
       if (TensorObj.IndexOfName('shape') < 0) or
          not (TensorObj.Find('shape') is TJSONArray) then
         raise ESafeTensorsError.CreateFmt(
           'safetensors: tensor "%s" has no shape array: %s',
-          [Obj.Names[i], ShardName]);
+          [EntryName, ShardName]);
       ShapeArr := TJSONArray(TensorObj.Find('shape'));
       ShapeCount := ShapeArr.Count;
       SetLength(FTensors[TensorCnt].Shape, ShapeCount);
@@ -643,19 +705,19 @@ begin
         if FTensors[TensorCnt].Shape[j] < 0 then
           raise ESafeTensorsError.CreateFmt(
             'safetensors: tensor "%s" has a negative dimension: %s',
-            [Obj.Names[i], ShardName]);
+            [EntryName, ShardName]);
         NumElements := NumElements * FTensors[TensorCnt].Shape[j];
       end;
       if (TensorObj.IndexOfName('data_offsets') < 0) or
          not (TensorObj.Find('data_offsets') is TJSONArray) then
         raise ESafeTensorsError.CreateFmt(
           'safetensors: tensor "%s" has no data_offsets array: %s',
-          [Obj.Names[i], ShardName]);
+          [EntryName, ShardName]);
       OffsArr := TJSONArray(TensorObj.Find('data_offsets'));
       if OffsArr.Count <> 2 then
         raise ESafeTensorsError.CreateFmt(
           'safetensors: tensor "%s" data_offsets must have 2 entries: %s',
-          [Obj.Names[i], ShardName]);
+          [EntryName, ShardName]);
       FTensors[TensorCnt].DataBegin := OffsArr.Items[0].AsInt64;
       FTensors[TensorCnt].DataEnd := OffsArr.Items[1].AsInt64;
       if (FTensors[TensorCnt].DataBegin < 0) or
@@ -664,7 +726,7 @@ begin
         raise ESafeTensorsError.CreateFmt(
           'safetensors: tensor "%s" data_offsets [%d, %d) fall outside the ' +
           'data section (size %d): %s',
-          [Obj.Names[i], FTensors[TensorCnt].DataBegin,
+          [EntryName, FTensors[TensorCnt].DataBegin,
            FTensors[TensorCnt].DataEnd, FDataSizes[ShardIdx], ShardName]);
       ByteSize := DTypeByteSize(FTensors[TensorCnt].DType);
       if ByteSize > 0 then
@@ -675,7 +737,7 @@ begin
           raise ESafeTensorsError.CreateFmt(
             'safetensors: tensor "%s" (%s, %d elements) expects %d bytes ' +
             'but data_offsets span %d bytes: %s',
-            [Obj.Names[i], FTensors[TensorCnt].DType, NumElements,
+            [EntryName, FTensors[TensorCnt].DType, NumElements,
              ExpectedBytes,
              FTensors[TensorCnt].DataEnd - FTensors[TensorCnt].DataBegin,
              ShardName]);
@@ -688,14 +750,104 @@ begin
   end;
 end;
 
+procedure TNNetSafeTensorsReader.ResetTensorIndex(pTensorCount: integer);
+var
+  Capacity, WantedCapacity: integer;
+begin
+  WantedCapacity := pTensorCount * 2;
+  Capacity := csMinTensorSlots;
+  while Capacity < WantedCapacity do Capacity := Capacity * 2;
+  SetLength(FNameSlots, 0);          // drop the old contents, do not copy them
+  SetLength(FNameSlots, Capacity);
+  FillDWord(FNameSlots[0], Capacity, DWord(csTensorSlotEmpty));
+  FNameSlotMask := Capacity - 1;
+  FIndexedSlots := 0;
+  FNameIndexValid := True;
+end;
+
+procedure TNNetSafeTensorsReader.GrowTensorIndex;
+var
+  OldSlots: array of integer;
+  i, OldSlotsHi, Idx, Slot, NewCapacity: integer;
+begin
+  OldSlots := Copy(FNameSlots, 0, Length(FNameSlots));
+  NewCapacity := (FNameSlotMask + 1) * 2;
+  SetLength(FNameSlots, 0);
+  SetLength(FNameSlots, NewCapacity);
+  FillDWord(FNameSlots[0], NewCapacity, DWord(csTensorSlotEmpty));
+  FNameSlotMask := NewCapacity - 1;
+  FIndexedSlots := 0;
+  OldSlotsHi := High(OldSlots);
+  for i := 0 to OldSlotsHi do
+  begin
+    Idx := OldSlots[i];
+    if Idx < 0 then continue;
+    Slot := integer(SafeTensorNameHash(FTensors[Idx].Name)) and FNameSlotMask;
+    while FNameSlots[Slot] >= 0 do Slot := (Slot + 1) and FNameSlotMask;
+    FNameSlots[Slot] := Idx;
+    Inc(FIndexedSlots);
+  end;
+end;
+
+procedure TNNetSafeTensorsReader.RebuildTensorIndex;
+var
+  i, TensorsHi: integer;
+begin
+  ResetTensorIndex(Length(FTensors));
+  TensorsHi := High(FTensors);
+  for i := 0 to TensorsHi do
+    if FTensors[i].Name <> '' then AddTensorToIndex(i);
+end;
+
+procedure TNNetSafeTensorsReader.InvalidateTensorIndex;
+begin
+  FNameIndexValid := False;
+end;
+
+procedure TNNetSafeTensorsReader.AddTensorToIndex(Idx: integer);
+var
+  Slot: integer;
+begin
+  // A stale index is rebuilt wholesale by the next FindTensor, so filling it
+  // here would only build a table that is thrown away.
+  if not FNameIndexValid then exit;
+  if (FIndexedSlots + 1) * 2 > FNameSlotMask + 1 then GrowTensorIndex;
+  Slot := integer(SafeTensorNameHash(FTensors[Idx].Name)) and FNameSlotMask;
+  while FNameSlots[Slot] >= 0 do Slot := (Slot + 1) and FNameSlotMask;
+  if FNameSlots[Slot] = csTensorSlotEmpty then Inc(FIndexedSlots);
+  FNameSlots[Slot] := Idx;
+end;
+
+procedure TNNetSafeTensorsReader.RemoveTensorFromIndex(const pName: string);
+var
+  Slot, Idx: integer;
+begin
+  if not FNameIndexValid then exit;
+  Slot := integer(SafeTensorNameHash(pName)) and FNameSlotMask;
+  repeat
+    Idx := FNameSlots[Slot];
+    if Idx = csTensorSlotEmpty then exit;
+    if (Idx >= 0) and (FTensors[Idx].Name = pName) then
+    begin
+      FNameSlots[Slot] := csTensorSlotDeleted;
+      exit;
+    end;
+    Slot := (Slot + 1) and FNameSlotMask;
+  until False;
+end;
+
 function TNNetSafeTensorsReader.FindTensor(const pName: string): integer;
 var
-  i, Hi: integer;
+  Slot, Idx: integer;
 begin
-  Hi := High(FTensors);
-  for i := 0 to Hi do
-    if FTensors[i].Name = pName then exit(i);
-  Result := -1;
+  if not FNameIndexValid then RebuildTensorIndex;
+  Slot := integer(SafeTensorNameHash(pName)) and FNameSlotMask;
+  repeat
+    Idx := FNameSlots[Slot];
+    if Idx = csTensorSlotEmpty then exit(-1);
+    if (Idx >= 0) and (FTensors[Idx].Name = pName) then exit(Idx);
+    Slot := (Slot + 1) and FNameSlotMask;
+  until False;
 end;
 
 function TNNetSafeTensorsReader.Count: integer;
@@ -716,7 +868,9 @@ begin
     raise ESafeTensorsError.CreateFmt(
       'safetensors RenameTensor: target name "%s" already exists: %s',
       [pNewName, FFileName]);
+  RemoveTensorFromIndex(pOldName);
   FTensors[Idx].Name := pNewName;
+  AddTensorToIndex(Idx);
 end;
 
 function TNNetSafeTensorsReader.RenameTensorPrefix(
@@ -735,6 +889,7 @@ begin
         Copy(FTensors[i].Name, OldLen + 1, MaxInt);
       Inc(Result);
     end;
+  if Result > 0 then InvalidateTensorIndex;
 end;
 
 function TNNetSafeTensorsReader.RemoveTensorsWithPrefix(
@@ -758,6 +913,7 @@ begin
     Inc(WriteIdx);
   end;
   SetLength(FTensors, WriteIdx);
+  if Result > 0 then InvalidateTensorIndex;
 end;
 
 function TNNetSafeTensorsReader.ShardCount: integer;
@@ -977,6 +1133,21 @@ begin
   ReadElementsInto(Info.Shard,
     FDataStarts[Info.Shard] + Info.DataBegin, Info.DType,
     integer(NumElements), Dest);
+end;
+
+function TNNetSafeTensorsReader.CanStreamTensorPackedQ4_0(
+  const pName: string): boolean;
+begin
+  Result := false;
+end;
+
+procedure TNNetSafeTensorsReader.LoadTensorPackedRowsQ4_0(
+  const pName: string; FirstRow, RowCount, RowSize: integer;
+  Dest: TNNetVolumeQuant4);
+begin
+  raise ESafeTensorsError.CreateFmt(
+    'safetensors: "%s" holds no Q4_0 blocks to serve packed: %s',
+    [pName, FFileName]);
 end;
 
 function TNNetSafeTensorsReader.CanStreamTensorRows(

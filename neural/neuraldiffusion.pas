@@ -120,6 +120,10 @@ type
     // Tables indexed 0..T. Index 0 is the clean-image anchor.
     FBeta, FAlpha, FAlphaBar: array of TNeuralFloat;
     FSqrtAlphaBar, FSqrtOneMinusAlphaBar: array of TNeuralFloat;
+    // Half-log-SNR lambda_t and Karras sigma_t. Both are pure functions of
+    // FAlphaBar, so they are tabulated once in BuildTables instead of paying an
+    // Ln pair / a Sqrt per sampling step (rule #27).
+    FLambda, FSigma: array of TNeuralFloat;
     // DPM-Solver++ multistep state (previous step's converted x0 prediction).
     FHasPrev: boolean;
     FPrevX0: TNNetVolume;
@@ -301,6 +305,8 @@ begin
   SetLength(FAlphaBar, FT + 1);
   SetLength(FSqrtAlphaBar, FT + 1);
   SetLength(FSqrtOneMinusAlphaBar, FT + 1);
+  SetLength(FLambda, FT + 1);
+  SetLength(FSigma, FT + 1);
   BuildTables(Beta1, BetaT, CosineS);
   FPrevX0 := nil;
   FUniPrevSample := nil;
@@ -391,6 +397,30 @@ begin
         end;
       end;
   end;
+  // Derived per-timestep tables: lambda_t = 0.5*(ln ab - ln(1-ab)) and
+  // sigma_t = sqrt((1-ab)/ab). Both are read once per sampling step (sigma also
+  // FT times per Karras snap), so the transcendentals are paid here instead.
+  // Entries where the closed form is not finite are left at the limit value
+  // (sigma) or unused (lambda: SigmaOf/Lambda keep the direct form there).
+  for i := 0 to FT do
+  begin
+    abCur := FAlphaBar[i];
+    if abCur >= 1.0 then
+    begin
+      FSigma[i] := 0;          // clean anchor
+      FLambda[i] := 0;         // unused: Lambda() falls back to the direct form
+    end
+    else if abCur <= 0.0 then
+    begin
+      FSigma[i] := MaxSingle;  // keeps the table monotone for the sigma search
+      FLambda[i] := 0;         // unused, as above
+    end
+    else
+    begin
+      FSigma[i] := Sqrt((1.0 - abCur) / abCur);
+      FLambda[i] := 0.5 * (Ln(abCur) - Ln(1.0 - abCur));
+    end;
+  end;
 end;
 
 function TNNetDiffusionScheduler.GetBeta(Tt: integer): TNeuralFloat;
@@ -406,26 +436,31 @@ function TNNetDiffusionScheduler.Lambda(Tt: integer): TNeuralFloat;
 var ab: double;
 begin
   ab := FAlphaBar[Tt];
-  // lambda = log( sqrt(ab) / sqrt(1-ab) ) = 0.5*(log ab - log(1-ab)).
-  Result := 0.5 * (Ln(ab) - Ln(1.0 - ab));
+  // lambda = log( sqrt(ab) / sqrt(1-ab) ) = 0.5*(log ab - log(1-ab)), tabulated
+  // in BuildTables wherever it is finite (0 < ab < 1).
+  if (ab > 0.0) and (ab < 1.0) then Result := FLambda[Tt]
+  else Result := 0.5 * (Ln(ab) - Ln(1.0 - ab));
 end;
 
 function TNNetDiffusionScheduler.SigmaOf(Tt: integer): TNeuralFloat;
 var ab: double;
 begin
-  // sigma_t = sqrt((1-ab_t)/ab_t). At Tt=0 (clean anchor) this is 0.
+  // sigma_t = sqrt((1-ab_t)/ab_t), tabulated in BuildTables. At Tt=0 (clean
+  // anchor) this is 0.
   ab := FAlphaBar[Tt];
-  if ab >= 1.0 then Result := 0
+  if ab > 0.0 then Result := FSigma[Tt]
   else Result := Sqrt((1.0 - ab) / ab);
 end;
 
 function TNNetDiffusionScheduler.SNRWeight(Tt: integer;
   Gamma: TNeuralFloat): TNeuralFloat;
 var
-  snr, clamped: double;
+  ab, snr, clamped: double;
 begin
-  // SNR(t) = exp(2*Lambda(t)) (Lambda is the half-log-SNR the DPM-Solver uses).
-  snr := Exp(2.0 * Lambda(Tt));
+  // SNR(t) = exp(2*Lambda(t)) = ab_t/(1-ab_t) (Lambda is the half-log-SNR the
+  // DPM-Solver uses); the closed form skips the log/exp round trip.
+  ab := FAlphaBar[Tt];
+  snr := ab / (1.0 - ab);
   // min(SNR, Gamma); Gamma = +Inf leaves the clamp inactive (clamped = snr).
   if snr < Gamma then clamped := snr else clamped := Gamma;
   case FPrediction of
@@ -440,17 +475,22 @@ end;
 
 function TNNetDiffusionScheduler.SigmaToTimestep(TargetSigma: TNeuralFloat): integer;
 var
-  t, best: integer;
-  d, bestD: double;
+  lo, hi, mid, best: integer;
 begin
-  // The schedule's Sigma() is monotone increasing in Tt, so the nearest match
-  // is well defined. Linear scan keeps this dependency-free and exact.
-  best := 1; bestD := Abs(SigmaOf(1) - TargetSigma);
-  for t := 2 to FT do
+  // The schedule's sigma is monotone increasing in Tt, so a binary search for
+  // the first table entry >= TargetSigma plus one neighbour comparison finds the
+  // nearest match exactly, in O(log T) instead of a full scan.
+  lo := 1; hi := FT;
+  while lo < hi do
   begin
-    d := Abs(SigmaOf(t) - TargetSigma);
-    if d < bestD then begin bestD := d; best := t; end;
+    mid := (lo + hi) shr 1;
+    if FSigma[mid] < TargetSigma then lo := mid + 1 else hi := mid;
   end;
+  best := lo;
+  // On a tie the lower timestep wins, as an ascending scan would pick it.
+  if (lo > 1) and (Abs(FSigma[lo - 1] - TargetSigma) <=
+                   Abs(FSigma[lo] - TargetSigma)) then best := lo - 1;
+  while (best > 1) and (FSigma[best - 1] = FSigma[best]) do Dec(best);
   Result := best;
 end;
 
@@ -458,7 +498,7 @@ function TNNetDiffusionScheduler.BuildTimestepSchedule(NumSteps: integer;
   Spacing: TNNetTimestepSpacing): TNeuralIntegerArray;
 var
   k, Tt: integer;
-  NumStepsM1: integer;
+  NumStepsM1, FTM1: integer;
   sigMin, sigMax, invRho, frac, targetSigma: double;
   pMax, pMin: double;
 const
@@ -479,26 +519,34 @@ begin
         invRho := 1.0 / cRho;
         pMax := Power(sigMax, invRho);   // #5: invariant across the k loop
         pMin := Power(sigMin, invRho);
-        for k := 0 to NumStepsM1 do
-        begin
-          if NumSteps = 1 then frac := 0.0
-          else frac := k / (NumSteps - 1);
-          // k=0 -> sigma_max (most noise, highest Tt); k=n-1 -> sigma_min.
-          targetSigma := Power(pMax + frac * (pMin - pMax), cRho);
-          Tt := SigmaToTimestep(targetSigma);
-          // Index 0 of Result is the FIRST (highest-noise) step.
-          Result[k] := Tt;
-        end;
+        // A single step sits at sigma_max; the general case interpolates
+        // (rule #20: the NumSteps test is loop-invariant).
+        if NumSteps = 1 then Result[0] := SigmaToTimestep(Power(pMax, cRho))
+        else
+          for k := 0 to NumStepsM1 do
+          begin
+            frac := k / NumStepsM1;
+            // k=0 -> sigma_max (most noise, highest Tt); k=n-1 -> sigma_min.
+            targetSigma := Power(pMax + frac * (pMin - pMax), cRho);
+            Tt := SigmaToTimestep(targetSigma);
+            // Index 0 of Result is the FIRST (highest-noise) step.
+            Result[k] := Tt;
+          end;
         Result[NumSteps] := 0; // clean-image anchor.
       end;
     else // tsUniform
       begin
-        for k := 0 to NumStepsM1 do
+        // Descending: Result[0] is the highest timestep. The NumSteps test and
+        // the FT-1 span are loop-invariant (rules #20/#5).
+        if NumSteps = 1 then Result[0] := FT
+        else
         begin
-          // Descending: Result[0] is the highest timestep.
-          if NumSteps = 1 then Tt := FT
-          else Tt := 1 + Round((NumSteps - 1 - k) * (FT - 1) / (NumSteps - 1));
-          Result[k] := Tt;
+          FTM1 := FT - 1;
+          for k := 0 to NumStepsM1 do
+          begin
+            Tt := 1 + Round((NumStepsM1 - k) * FTM1 / NumStepsM1);
+            Result[k] := Tt;
+          end;
         end;
         Result[NumSteps] := 0;
       end;
@@ -556,34 +604,50 @@ begin
   sab := FSqrtAlphaBar[Tt];
   somab := FSqrtOneMinusAlphaBar[Tt];
   X0SizeM1 := X0.Size - 1;
-  // Hoist the per-element Assigned() tests (rule #5 / no-nil-tests-in-hot-loops).
+  // Hoist the per-element Assigned() tests (rule #5 / no-nil-tests-in-hot-loops)
+  // and unswitch the loop on them (rule #20).
   hasPre := Assigned(PreSampledNoise);
   hasNoiseOut := Assigned(NoiseOut);
-  for i := 0 to X0SizeM1 do
+  if hasPre then
   begin
-    if hasPre then eps := PreSampledNoise.FData[i]
-    else eps := RandG(0, 1);
-    if hasNoiseOut then NoiseOut.FData[i] := eps;
-    Xt.FData[i] := sab * X0.FData[i] + somab * eps;
-  end;
+    // Supplied noise: the whole update is a uniform affine map (rule #13).
+    if hasNoiseOut then NoiseOut.Copy(PreSampledNoise);
+    if Xt = PreSampledNoise then
+    begin
+      // Xt IS the noise: scale it in place before folding X0 in.
+      Xt.Mul(somab);
+      Xt.MulAdd(sab, X0);
+    end
+    else
+    begin
+      Xt.Copy(X0);
+      Xt.Mul(sab);
+      Xt.MulAdd(somab, PreSampledNoise);
+    end;
+  end
+  else if hasNoiseOut then
+    for i := 0 to X0SizeM1 do
+    begin
+      eps := RandG(0, 1);
+      NoiseOut.FData[i] := eps;
+      Xt.FData[i] := sab * X0.FData[i] + somab * eps;
+    end
+  else
+    for i := 0 to X0SizeM1 do
+      // Fresh noise, nothing to report: one transcendental per element.
+      Xt.FData[i] := sab * X0.FData[i] + somab * RandG(0, 1);
 end;
 
 class procedure TNNetDiffusionScheduler.ApplyCFG(EpsCond, EpsUncond,
   Dst: TNNetVolume; W: TNeuralFloat);
-var i, DstSizeM1: integer;
-  eu: TNeuralFloat;
 begin
   // Dst := (1-W)*EpsUncond + W*EpsCond (rule #13). The copy-first bulk form is
-  // safe when Dst aliases EpsUncond, but WRONG when Dst aliases EpsCond (Copy
-  // would clobber EpsCond before it is read); fall back to the scalar loop then.
+  // WRONG when Dst aliases EpsCond (Copy would clobber EpsCond before it is
+  // read), so scale EpsCond in place instead and fold EpsUncond in afterwards.
   if Dst = EpsCond then
   begin
-    DstSizeM1 := Dst.Size - 1;
-    for i := 0 to DstSizeM1 do
-    begin
-      eu := EpsUncond.FData[i];   // #4: read once
-      Dst.FData[i] := eu + W * (EpsCond.FData[i] - eu);
-    end;
+    Dst.Mul(W);
+    Dst.MulAdd(1.0 - W, EpsUncond);
   end
   else
   begin
@@ -1051,7 +1115,10 @@ begin
       sqrtAbT := FSqrtAlphaBar[Tt];
       // Step-invariant reciprocals/deltas hoisted out of the element loops (#5).
       invSqrtAbT := 1.0 / sqrtAbT;
-      invSigma := 1.0 / sigma;
+      // sigma_t is 0 wherever ab_t reaches 1 (Beta1 = 0, or a cosine schedule
+      // whose first beta clips to 0). There is no drift at a clean sample, so
+      // the reciprocal collapses to 0 instead of overflowing.
+      if sigma > 0 then invSigma := 1.0 / sigma else invSigma := 0;
       dSig := sigmaNext - sigma;
       // First denoiser eval at (x_t, t) -> x0.
       Denoise(X, Pred, Tt);
@@ -1066,9 +1133,11 @@ begin
       Ye.Copy(Y);
       Ye.Mul(1.0 + kEuler);
       Ye.MulAdd(-kEuler, X0);
-      if TtPrev = 0 then
+      if (TtPrev = 0) or (sigmaNext <= 0) then
       begin
-        // Final step: sqrt(ab_prev) = 1, y_e is already the clean image.
+        // Final step: sqrt(ab_prev) = 1, y_e is already the clean image. A
+        // sigma_{t-1} of 0 at TtPrev > 0 means ab_prev = 1 as well, so the same
+        // holds there; k-diffusion likewise skips the corrector at sigma 0.
         X.Copy(Ye);
       end
       else

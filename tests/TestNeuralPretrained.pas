@@ -191,6 +191,7 @@ type
     procedure TestInt8QuantizedPhiLogitDrift;
     procedure TestInt8QuantizedBertHiddenDrift;
     procedure TestInt8QuantizedBloomLogitDrift;
+    procedure TestInt8QuantizedFalconLogitDrift;
     procedure TestInt8QuantizedRWKVLogitDrift;
     procedure TestInt8QuantizedMambaLogitDrift;
     procedure TestInt8QuantizedModernBertHiddenDrift;
@@ -210,6 +211,7 @@ type
     procedure TestRopeScalingWiredIntoLlamaBuilder;
     procedure TestLlamaImporterFailsOnMissingTensor;
     procedure TestLlamaLogitParity;
+    procedure TestNoPELayerWithPartialRotaryCarriesNoRoPE;
     procedure TestGGUFReaderMetadataAndTensors;
     procedure TestGGUFTensorDecodeParity;
     procedure TestGGUFKQuantDecodeParity;
@@ -217,10 +219,13 @@ type
     procedure TestGGUFLlamaLogitParity;
     procedure TestGGUFLlamaQ8AndF16ImportDrift;
     procedure TestGGUFWriterRoundTrip;
+    procedure TestGGUFQ4_0PackedRowStreaming;
+    procedure TestLlamaGGUFQ4_0DirectInt4Load;
     procedure TestBuildFromGGUFQwen2RoundTrip;
     procedure TestBuildFromGGUFGemma2RoundTrip;
     procedure TestGGUFGemma2Q8AndF16ImportDrift;
     procedure TestBuildFromGGUFRejectsUnknownArch;
+    procedure TestGGUFMetaArrayStaging;
     procedure TestGGUFWriterGpt2TokenizerRoundTrip;
     procedure TestTNNetGGUFWriterRoundTrip;
     procedure TestGGUFWriterQ8FromInt8;
@@ -249,6 +254,7 @@ type
     procedure TestLlama4MoeLogitParity;
     procedure TestQwen3MoeWindowLogitParity;
     procedure TestQwen35LogitParity;
+    procedure TestQwen35QProjStagedSlabSliceParity;
     procedure TestQwen35StreamedDecodeParity;
     procedure TestQwen35StreamedDecodeOpenCLParity;
     procedure TestQwen2StreamedDecodeOpenCLParity;
@@ -256,6 +262,8 @@ type
     procedure TestQwen35MoeLogitParity;
     procedure TestGptOssLogitParity;
     procedure TestGptOssMXFP4LogitParity;
+    procedure TestGptOssExpertSlabTranspose;
+    procedure TestGptOssSlabElementCountGuard;
     procedure TestGemmaLogitParity;
     procedure TestGemma2LogitParity;
     procedure TestGemma3LogitParity;
@@ -283,6 +291,7 @@ type
     procedure TestGPTNeoXConfigFromJSONFile;
     procedure TestGPTNeoXLogitParity;
     procedure TestGPTNeoXSequentialLogitParity;
+    procedure TestGPTNeoXHoistedRoPEMatchesPerHead;
     procedure TestOPTConfigFromJSONFile;
     procedure TestOPTNextTokenLogitsParity;
     procedure TestOPT350ProjPostLNLogitParity;
@@ -299,6 +308,7 @@ type
     procedure TestCohere2LogitParity;
     procedure TestPhiConfigFromJSONFile;
     procedure TestPhiLogitParity;
+    procedure TestHoistedRoPEUnfusedLogitParity;
     procedure TestPhi3LogitParity;
     procedure TestPhi3LongRoPELogitParity;
     procedure TestPhi3LongRoPEFullRotaryLogitParity;
@@ -401,6 +411,9 @@ type
     // ships) instead of the new .parametrizations.weight.original0/1; pins the
     // importer's legacy-naming branch (same w = g*v/||v||, identical oracle).
     procedure TestEnCodecLegacyWeightNormParity;
+    // Degenerate input: an EMPTY waveform must encode to zero frames instead of
+    // reading past the start of the (empty) channel row while reflect-padding.
+    procedure TestEnCodecEmptyWaveform;
     // OpenCL parity: decodes the same EnCodec fixture with the channel-major
     // conv1d/ConvTranspose1d OpenCL offload ARMED, and asserts the waveform
     // matches the CPU (AVX/scalar DotProduct) decode within 1e-4. SKIPs cleanly
@@ -513,6 +526,11 @@ type
     // of the melody decoder (chroma+text conditioning PREPENDED to the causal
     // self-attention sequence) matches the HF logits < 1e-4.
     procedure TestMusicGenMelodyParity;
+    // Degenerate hidden_size: the half-split sinusoidal table steps by
+    // log(10000)/(hidden_size/2 - 1), so hidden_size=2 would divide by zero.
+    // Asserts the MusicGen/Parler/Melody importers reject it with a clear
+    // EPretrainedImportError instead.
+    procedure TestMusicGenTinyHiddenRejected;
     procedure TestBlip2QFormerConfigFromJSONFile;
     procedure TestBlip2QFormerParity;
     procedure TestBlip2FullBridgeParity;
@@ -565,7 +583,9 @@ type
     procedure TestDetrConfigFromJSONFile;
     procedure TestDetrObjectDetectionParity;
     procedure TestDetrDetectionDecode;
+    procedure TestDetrQueryPosSurvivesTokenCountCollision;
     procedure TestMask2FormerParity;
+    procedure TestMask2FormerMaskEinsumOrderParity;
     procedure TestMask2FormerSemanticDecodeReference;
     procedure TestYoloConfigFromJSONFile;
     procedure TestYoloObjectDetectionParity;
@@ -580,6 +600,7 @@ type
     procedure TestTrOCRParity;
     procedure TestFlorence2LocationTokens;
     procedure TestFlorence2Parity;
+    procedure TestFlorence2PositionTableShape;
     procedure TestInceptionV3ConfigFromJSONFile;
     procedure TestInceptionV3ImageClassificationParity;
     procedure TestInceptionV3FullParity;
@@ -617,8 +638,12 @@ type
     procedure TestControlNetParity;
     procedure TestControlNetCombinedParity;
     procedure TestT2IAdapterParity;
+    procedure TestT2IAdapterFeatureCountMismatch;
+    procedure TestT2IAdapterShortConvInBias;
     procedure TestIPAdapterConfigFromJSONFile;
     procedure TestIPAdapterParity;
+    procedure TestIPAdapterTorchBin;
+    procedure TestIPAdapterInferenceNet;
     procedure TestVaeRoundTrip;
     procedure TestVqModelEncodeParity;
     procedure TestVqModelDecodeParity;
@@ -4820,6 +4845,34 @@ begin
   end;
 end;
 
+// Falcon arms construction-time int8 (TNNet.BuildQuantInt8 plus the
+// int8-armed TNNetEmbedding constructor), so the quantized build never
+// materializes the FP32 vocab table and the tied LM head is filled straight
+// into the codes by LoadEmbeddingAndLMHead. This gates that armed route
+// against the FP32 build it must approximate.
+procedure TTestNeuralPretrained.TestInt8QuantizedFalconLogitDrift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TFalconConfig;
+begin
+  RandSeed := 424242;
+  NNFP32 := BuildFalconFromSafeTensorsEx(
+    FixturePath('tiny_falcon_mq.safetensors'), Config, {SeqLen=}8,
+    {pTrainable=}true, FixturePath('tiny_falcon_mq_config.json'));
+  NNQ := BuildFalconFromSafeTensorsEx(
+    FixturePath('tiny_falcon_mq.safetensors'), Config, {SeqLen=}8,
+    {pTrainable=}false, FixturePath('tiny_falcon_mq_config.json'),
+    {pQuantizeInt8=}true);
+  try
+    // 2 blocks x (qkv + dense + h_to_4h + 4h_to_h) + the tied LM head.
+    AssertInt8DriftPair('Falcon', NNFP32, NNQ, 8, Config.VocabSize,
+      {MinQuantLayers=}9, {MaxRelDrift=}5e-2, {TwoChannelInput=}false);
+  finally
+    NNQ.Free;
+    NNFP32.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestInt8QuantizedRWKVLogitDrift;
 var
   NNFP32, NNQ: TNNet;
@@ -5750,6 +5803,48 @@ begin
   end;
 end;
 
+// A NoPE layer (Config.NoRopeLayers) must carry NO positional encoding at
+// ANY rotary width. No checkpoint combines a NoPE layer with partial rotary
+// today, so the tiny Llama config is parsed by the real loader and handed
+// both flags: neither changes a tensor shape, so the fixture weights load
+// unchanged. Plan.HoistRoPE is false on the NoPE layer, and with the fused
+// path off that drops it into the per-head fallback - the path that must NOT
+// cut a rotary slice there.
+procedure TTestNeuralPretrained.TestNoPELayerWithPartialRotaryCarriesNoRoPE;
+var
+  NN: TNNet;
+  Config: TLlamaConfig;
+  LayerCnt, RoPECnt, i: integer;
+begin
+  RandSeed := 424242;
+  NN := BuildLlamaFromSafeTensorsEx(FixturePath('tiny_llama.safetensors'),
+    Config, {SeqLen=}0, {pTrainable=}false,
+    FixturePath('tiny_llama_config.json'));
+  NN.Free;
+  // head_dim 4 -> rotary_dim 2, and layer 1 is NoPE.
+  Config.PartialRotaryFactor := 0.5;
+  SetLength(Config.NoRopeLayers, Config.NumLayers);
+  for i := 0 to Config.NumLayers - 1 do
+    Config.NoRopeLayers[i] := i = 0;
+  NeuralAllowFusedAttention := false;
+  NN := nil;
+  try
+    NN := BuildLlamaFromSafeTensorsWithConfig(
+      FixturePath('tiny_llama.safetensors'), Config, {SeqLen=}0,
+      {pTrainable=}false);
+    RoPECnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+      if NN.Layers[LayerCnt] is TNNetRotaryEmbedding then Inc(RoPECnt);
+    // Layer 0 hoists its partial rotary into ONE head-tiled layer per q/k
+    // projection; layer 1 rotates nothing.
+    AssertEquals('rotary layers (hoisted q/k of the RoPE layer only)',
+      2, RoPECnt);
+  finally
+    NeuralAllowFusedAttention := true;
+    NN.Free;
+  end;
+end;
+
 // GGUF reader smoke test on tests/fixtures/tiny_llama_f32.gguf (the
 // tiny_llama checkpoint converted by tools/make_pico_gguf_fixture.py with
 // the llama.cpp tensor naming and q/k permute): header fields, typed
@@ -5828,8 +5923,9 @@ procedure TTestNeuralPretrained.TestGGUFTensorDecodeParity;
 var
   GGUF: TNNetGGUFReader;
   ST: TNNetSafeTensorsReader;
-  VG, VS: TNNetVolume;
+  VG, VS, VSlice: TNNetVolume;
   MaxDiff: double;
+  k: integer;
 
   function MaxAbsDiff(const GGUFName, STName: string): double;
   var
@@ -5867,6 +5963,22 @@ begin
       AssertTrue('q_proj de-interleaved rows exact',
         MaxAbsDiff('blk.0.attn_q.weight',
           'model.layers.0.self_attn.q_proj.weight') = 0);
+      // A row SLICE of the same tensor must serve the same de-interleaved
+      // rows. Rows 1..6 of the 8-row (2-head, HeadDim 4) matrix start and
+      // end mid-head, so the reader cannot lean on head-aligned requests.
+      // VG still holds the whole de-interleaved tensor from the assert
+      // above.
+      VSlice := TNNetVolume.Create;
+      try
+        GGUF.LoadTensorRowsFlat('blk.0.attn_q.weight', {FirstRow=}1,
+          {RowCount=}6, {RowSize=}8, VSlice);
+        AssertEquals('q_proj slice size', 48, VSlice.Size);
+        for k := 0 to 47 do
+          AssertEquals('q_proj de-interleaved slice element ' + IntToStr(k),
+            VG.FData[8 + k], VSlice.FData[k], 0);
+      finally
+        VSlice.Free;
+      end;
     finally
       GGUF.Free;
     end;
@@ -6437,6 +6549,216 @@ begin
   end;
 end;
 
+// TNNetGGUFReader.LoadTensorPackedRowsQ4_0 hands over the checkpoint Q4_0
+// blocks untouched: dequantizing what it serves through
+// TNNetVolumeQuant4.DequantizeRowTo must reproduce, BIT FOR BIT, what
+// DequantizeQ4_0 produces on the same file through LoadTensorFlat.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestGGUFQ4_0PackedRowStreaming;
+var
+  Writer: TNNetGGUFWriter;
+  Reader: TNNetGGUFReader;
+  Src, Dequantized, RowDequantized: TNNetVolume;
+  Packed4: TNNetVolumeQuant4;
+  GGUFPath: string;
+  RowCnt, WeightCnt, Base: integer;
+const
+  Rows = 6;
+  Cols = 96;
+begin
+  GGUFPath := GetTempDir(false) + 'cai_q4_0_rows_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Src := TNNetVolume.Create(Rows * Cols, 1, 1);
+  Dequantized := TNNetVolume.Create;
+  RowDequantized := TNNetVolume.Create(Cols, 1, 1);
+  Packed4 := TNNetVolumeQuant4.Create;
+  try
+    for RowCnt := 0 to Rows - 1 do
+      for WeightCnt := 0 to Cols - 1 do
+        Src.FData[RowCnt * Cols + WeightCnt] :=
+          Sin(0.21 * WeightCnt + 1.3 * RowCnt) * (0.3 + 0.4 * RowCnt);
+    Writer := TNNetGGUFWriter.Create(GGUFPath);
+    try
+      Writer.AddMetaString('general.architecture', 'llama');
+      Writer.AddTensorFlat('q4.weight', [Rows, Cols], Src, gwQ4_0);
+      Writer.SaveToFile;
+    finally
+      Writer.Free;
+    end;
+
+    Reader := TNNetGGUFReader.Create(GGUFPath);
+    try
+      AssertTrue('the writer emitted a Q4_0 tensor',
+        Reader.TensorGGMLType('q4.weight') = GGML_TYPE_Q4_0);
+      AssertTrue('a Q4_0 tensor streams packed',
+        Reader.CanStreamTensorPackedQ4_0('q4.weight'));
+      // The dequantize-at-load reference.
+      Reader.LoadTensorFlat('q4.weight', Dequantized);
+      AssertEquals('dequantized element count', Rows * Cols,
+        Dequantized.Size);
+      // The whole tensor, then a row range: both must dequantize identically.
+      Reader.LoadTensorPackedRowsQ4_0('q4.weight', 0, Rows, Cols, Packed4);
+      AssertEquals('packed row count', Rows, Packed4.SizeX);
+      AssertEquals('packed row size', Cols, Packed4.Depth);
+      for RowCnt := 0 to Rows - 1 do
+      begin
+        Packed4.DequantizeRowTo(RowCnt, 0,
+          TNeuralFloatArrPtr(@RowDequantized.FData[0]));
+        Base := RowCnt * Cols;
+        for WeightCnt := 0 to Cols - 1 do
+          AssertTrue('packed row ' + IntToStr(RowCnt) + ' element ' +
+            IntToStr(WeightCnt) + ' must equal the dequantized load',
+            RowDequantized.FData[WeightCnt] = Dequantized.FData[Base + WeightCnt]);
+      end;
+      Reader.LoadTensorPackedRowsQ4_0('q4.weight', 2, 3, Cols, Packed4);
+      AssertEquals('ranged packed row count', 3, Packed4.SizeX);
+      for RowCnt := 0 to 2 do
+      begin
+        Packed4.DequantizeRowTo(RowCnt, 0,
+          TNeuralFloatArrPtr(@RowDequantized.FData[0]));
+        Base := (2 + RowCnt) * Cols;
+        for WeightCnt := 0 to Cols - 1 do
+          AssertTrue('ranged packed row ' + IntToStr(RowCnt) + ' element ' +
+            IntToStr(WeightCnt) + ' must equal the dequantized load',
+            RowDequantized.FData[WeightCnt] = Dequantized.FData[Base + WeightCnt]);
+      end;
+    finally
+      Reader.Free;
+    end;
+  finally
+    Packed4.Free;
+    RowDequantized.Free;
+    Dequantized.Free;
+    Src.Free;
+    DeleteFile(GGUFPath);
+  end;
+end;
+
+// End to end: a Q4_0 .gguf loaded with NeuralImportInt4FromQ4_0 set puts the
+// checkpoint blocks straight into the int4 weight rows. Compared against the
+// SAME file loaded the old way (dequantize -> int8 -> requantize to int4),
+// the direct route must be at least as close to the exact dequantized-FP32
+// forward, because it quantizes the weights once instead of twice. A Q8_0
+// copy of the same model direct-loads nothing and still ends up int4.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLlamaGGUFQ4_0DirectInt4Load;
+var
+  NNFP32, NNDirect, NNRequant: TNNet;
+  Config, ConfigG: TLlamaConfig;
+  Reader: TNNetSafeTensorsReader;
+  Tokens: array of string;
+  Q4Path, Q8Path: string;
+  Input, OutFP32, OutDirect, OutRequant: TNNetVolume;
+  i, s2, SeqLen, Vocab: integer;
+  DirectCount, DirectInt4Layers, RequantInt4Layers, Q8DirectCount: integer;
+  DirectDiff, RequantDiff: double;
+
+  // Sum of |A - B| over the whole logit block.
+  function AbsDiffSum(A, B: TNNetVolume): double;
+  var
+    k: integer;
+  begin
+    Result := 0;
+    for k := 0 to A.Size - 1 do Result := Result + Abs(A.FData[k] - B.FData[k]);
+  end;
+
+begin
+  Q4Path := GetTempDir(false) + 'cai_llama_q4_0_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Q8Path := GetTempDir(false) + 'cai_llama_q4_0_ctl_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Config := ReadLlamaConfigFromJSONFile(
+    FixturePath('tiny_llama_q8_config.json'));
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_llama_q8.safetensors'));
+  try
+    SetLength(Tokens, 0);
+    SaveLlamaToGGUFEx(Reader, Config, Tokens, Q4Path, gwQ4_0);
+    SaveLlamaToGGUFEx(Reader, Config, Tokens, Q8Path, gwQ8_0);
+  finally
+    Reader.Free;
+  end;
+
+  NNFP32 := nil; NNDirect := nil; NNRequant := nil;
+  Input := TNNetVolume.Create;
+  OutFP32 := TNNetVolume.Create;
+  OutDirect := TNNetVolume.Create;
+  OutRequant := TNNetVolume.Create;
+  try
+    // (a) the exact dequantized Q4_0 weights, in FP32.
+    NNFP32 := BuildLlamaFromGGUFEx(Q4Path, ConfigG, {pSeqLen=}0,
+      {pTrainable=}false, {pQuantizeInt8=}false);
+    // (b) the direct route.
+    NeuralImportInt4FromQ4_0 := true;
+    NeuralImportInt4LayerCount := 0;
+    try
+      NNDirect := BuildLlamaFromGGUFEx(Q4Path, ConfigG, {pSeqLen=}0,
+        {pTrainable=}false, {pQuantizeInt8=}true);
+    finally
+      NeuralImportInt4FromQ4_0 := false;
+    end;
+    DirectCount := NeuralImportInt4LayerCount;
+    DirectInt4Layers := NNDirect.QuantizeWeightsInt4();
+    // 2 blocks x { q, k, v, o, down } load whole-layer and go direct. The
+    // fused SwiGLU gate/up layer is filled by two calls, and the tied LM head
+    // loads through LoadEmbeddingAndLMHead, so those 3 are requantized.
+    AssertEquals('direct-loaded int4 layers', 10, DirectCount);
+    AssertEquals('int4 layers after the sweep', 13, DirectInt4Layers);
+
+    // (c) the old route on the same file.
+    NNRequant := BuildLlamaFromGGUFEx(Q4Path, ConfigG, {pSeqLen=}0,
+      {pTrainable=}false, {pQuantizeInt8=}true);
+    RequantInt4Layers := NNRequant.QuantizeWeightsInt4();
+    AssertEquals('the old route converts the same layers', DirectInt4Layers,
+      RequantInt4Layers);
+
+    SeqLen := ConfigG.MaxPositions;
+    Vocab := ConfigG.VocabSize;
+    Input.ReSize(SeqLen, 1, 1);
+    DirectDiff := 0;
+    RequantDiff := 0;
+    for s2 := 0 to 2 do
+    begin
+      for i := 0 to SeqLen - 1 do
+        Input.FData[i] := (s2 * 5 + i * 3 + 1) mod Vocab;
+      NNFP32.Compute(Input);   NNFP32.GetOutput(OutFP32);
+      NNDirect.Compute(Input); NNDirect.GetOutput(OutDirect);
+      NNRequant.Compute(Input); NNRequant.GetOutput(OutRequant);
+      DirectDiff := DirectDiff + AbsDiffSum(OutDirect, OutFP32);
+      RequantDiff := RequantDiff + AbsDiffSum(OutRequant, OutFP32);
+    end;
+    // The direct route carries the checkpoint codes; the old route
+    // re-quantizes them through int8, so it can only be further away.
+    AssertTrue('direct sum |diff| ' + FloatToStr(DirectDiff) +
+      ' must not exceed the requantized sum |diff| ' + FloatToStr(RequantDiff),
+      DirectDiff <= RequantDiff);
+    AssertTrue('the int4 forward must still track the FP32 forward: ' +
+      FloatToStr(DirectDiff), DirectDiff < 0.5 * OutFP32.Size * 3);
+
+    // (d) a Q8_0 file of the same model: nothing loads directly, and
+    // TNNet.QuantizeWeightsInt4 still converts every eligible layer.
+    FreeAndNil(NNDirect);
+    NeuralImportInt4FromQ4_0 := true;
+    NeuralImportInt4LayerCount := 0;
+    try
+      NNDirect := BuildLlamaFromGGUFEx(Q8Path, ConfigG, {pSeqLen=}0,
+        {pTrainable=}false, {pQuantizeInt8=}true);
+    finally
+      NeuralImportInt4FromQ4_0 := false;
+    end;
+    Q8DirectCount := NeuralImportInt4LayerCount;
+    AssertEquals('a Q8_0 checkpoint direct-loads no int4 layer', 0,
+      Q8DirectCount);
+    AssertEquals('a Q8_0 checkpoint still requantizes to int4',
+      DirectInt4Layers, NNDirect.QuantizeWeightsInt4());
+  finally
+    OutRequant.Free; OutDirect.Free; OutFP32.Free; Input.Free;
+    NNRequant.Free; NNDirect.Free; NNFP32.Free;
+    DeleteFile(Q8Path);
+    DeleteFile(Q4Path);
+  end;
+end;
+
 // GGUF WRITER round-trip: import the tiny_llama checkpoint from
 // safetensors, SaveLlamaToGGUFEx it back out, then re-import the emitted
 // .gguf via BuildLlamaFromGGUF and assert the two nets produce IDENTICAL
@@ -6915,6 +7237,95 @@ begin
   // soft-capping does not amplify it. Gated < 3e-3 like the Llama F16 arm.
   AssertTrue('F16 gemma2 GGUF logit drift = ' + FloatToStr(Drift) +
     ' must be < 3e-3 relative', Drift < 3e-3);
+end;
+
+// The metadata ARRAY reader pulls the header through a staging block
+// (NeuralGGUFMetaStageBytes) instead of one stream read per element. Every
+// element must arrive identical whatever the staging size is, including
+// sizes small enough that a single string straddles a refill and that the
+// block holds less than one numeric element. The fixture carries all three
+// array kinds the writer emits (strings of mixed length, f32, i32), plus a
+// scalar key AFTER the arrays so the restored stream position is pinned.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestGGUFMetaArrayStaging;
+const
+  cCount = 40;
+  cStages: array[0..4] of integer = (7, 16, 64, 4096, 64 * 1024);
+var
+  Reader: TNNetGGUFReader;
+  Writer: TNNetGGUFWriter;
+  GGUFPath: string;
+  Tokens: array of string;
+  Scores: array of single;
+  Types: array of Int64;
+  Dummy: TNNetVolume;
+  SavedStage, StageCnt, i: integer;
+begin
+  SetLength(Tokens, cCount);
+  SetLength(Scores, cCount);
+  SetLength(Types, cCount);
+  for i := 0 to cCount - 1 do
+  begin
+    // Lengths sweep 1..40 bytes so refills land inside a string body and
+    // inside the 8-byte length prefix.
+    Tokens[i] := StringOfChar(Chr(Ord('a') + (i mod 26)), i + 1);
+    Scores[i] := -0.5 * i;
+    Types[i] := i - 7;
+  end;
+  GGUFPath := GetTempDir(false) + 'cai_gguf_meta_stage_' +
+    IntToStr(Random(1000000)) + '.gguf';
+  Writer := TNNetGGUFWriter.Create(GGUFPath);
+  Dummy := TNNetVolume.Create(4, 1, 1);
+  try
+    Writer.AddMetaString('general.architecture', 'llama');
+    Writer.AddMetaStringArray('tokenizer.ggml.tokens', Tokens);
+    Writer.AddMetaFloat32Array('tokenizer.ggml.scores', Scores);
+    Writer.AddMetaInt32Array('tokenizer.ggml.token_type', Types);
+    // Read after the arrays: a staged reader that leaves the stream at the
+    // wrong offset corrupts this key (or the tensor table below).
+    Writer.AddMetaUInt32('llama.block_count', 123);
+    Writer.AddTensorFlat('token_embd.weight', [2, 2], Dummy, gwF32);
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+    Dummy.Free;
+  end;
+  SavedStage := NeuralGGUFMetaStageBytes;
+  try
+    for StageCnt := Low(cStages) to High(cStages) do
+    begin
+      NeuralGGUFMetaStageBytes := cStages[StageCnt];
+      Reader := TNNetGGUFReader.Create(GGUFPath);
+      try
+        AssertEquals('token count at stage ' + IntToStr(cStages[StageCnt]),
+          cCount, integer(Reader.GetMetaArrayCount('tokenizer.ggml.tokens')));
+        for i := 0 to cCount - 1 do
+        begin
+          AssertEquals('token ' + IntToStr(i) + ' at stage ' +
+            IntToStr(cStages[StageCnt]), Tokens[i],
+            Reader.GetMetaArrayString('tokenizer.ggml.tokens', i));
+          AssertEquals('score ' + IntToStr(i) + ' at stage ' +
+            IntToStr(cStages[StageCnt]), Scores[i],
+            Reader.GetMetaArrayNumber('tokenizer.ggml.scores', i), 0);
+          AssertEquals('token type ' + IntToStr(i) + ' at stage ' +
+            IntToStr(cStages[StageCnt]), Types[i],
+            integer(Round(
+              Reader.GetMetaArrayNumber('tokenizer.ggml.token_type', i))));
+        end;
+        AssertEquals('key after the arrays at stage ' +
+          IntToStr(cStages[StageCnt]), 123,
+          integer(Reader.GetMetaInt('llama.block_count', -1)));
+        AssertEquals('tensor table after the arrays at stage ' +
+          IntToStr(cStages[StageCnt]), 4,
+          integer(Reader.ElementCount('token_embd.weight')));
+      finally
+        Reader.Free;
+      end;
+    end;
+  finally
+    NeuralGGUFMetaStageBytes := SavedStage;
+  end;
+  DeleteFile(GGUFPath);
 end;
 
 // BuildFromGGUF must reject an unsupported architecture with a clear error
@@ -8581,6 +8992,102 @@ begin
   end;
 end;
 
+// Qwen3.5's double-width q_proj is loaded as 2*NumHeads slices of one slab.
+// Readers with no row view decode the whole slab per slice, so the importer
+// stages it once and slices it from RAM (LoadLlamaLinearWeights' pSrcSlab).
+// That staged slice must produce EXACTLY the weights the row-streamed slice
+// produces - including the per-head rotate_half permutation of the query half
+// and the straight gate half. Both halves of every head are loaded twice here,
+// once each way, into two identical layers and compared bit for bit.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35QProjStagedSlabSliceParity;
+const
+  WName = 'model.language_model.layers.3.self_attn.q_proj.weight';
+  HeadDim = 8;
+  NumHeads = 2;
+  RotaryDims = 2;                    // partial_rotary_factor 0.25 * head_dim
+  QProjScale = 0.75;                 // a non-unit Scale exercises that fold too
+var
+  Reader: TNNetSafeTensorsReader;
+  NNStream, NNStaged: TNNet;
+  LStream, LStaged: TNNetLayer;
+  Slab: TNNetVolume;
+  Hidden, QWidth, SlabRows, d, n, w: integer;
+  MaxNeuronPos, MaxWeightPos: integer;
+
+  // The two calls the importer makes per head: the query half (rotate_half
+  // permuted inside the rotary slice) then the gate half (straight).
+  procedure LoadHeads(Layer: TNNetLayer; Staged: TNNetVolume);
+  var
+    h: integer;
+  begin
+    for h := 0 to NumHeads - 1 do
+    begin
+      LoadLlamaLinearWeights(Reader, Layer, WName, Hidden, HeadDim,
+        {NeuronBase=}h * HeadDim, {ExpectedNeurons=}2 * QWidth,
+        {RotaryHeadDim=}HeadDim, {BiasName=}'',
+        {Scale=}QProjScale, {RotaryDims=}RotaryDims,
+        {SrcRowBase=}h * 2 * HeadDim, {SrcRows=}SlabRows,
+        {pFlatSlabRows=}false, {pDeferFlush=}true, {pSrcSlab=}Staged);
+      LoadLlamaLinearWeights(Reader, Layer, WName, Hidden, HeadDim,
+        {NeuronBase=}QWidth + h * HeadDim, {ExpectedNeurons=}2 * QWidth,
+        {RotaryHeadDim=}0, {BiasName=}'', {Scale=}1.0, {RotaryDims=}0,
+        {SrcRowBase=}h * 2 * HeadDim + HeadDim, {SrcRows=}SlabRows,
+        {pFlatSlabRows=}false, {pDeferFlush=}true, {pSrcSlab=}Staged);
+    end;
+    Layer.FlushWeightCache();
+  end;
+
+begin
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_qwen3_5.safetensors'));
+  NNStream := nil;
+  NNStaged := nil;
+  Slab := nil;
+  try
+    AssertTrue('q_proj present', Reader.HasTensor(WName));
+    // The row-streamed path is the reference, so it must really be available.
+    AssertTrue('fixture rows are streamable', Reader.CanStreamTensorRows(WName));
+    SlabRows := Reader.DimSize(WName, 0);
+    Hidden := Reader.DimSize(WName, 1);
+    AssertEquals('slab rows', 2 * NumHeads * HeadDim, SlabRows);
+    QWidth := NumHeads * HeadDim;
+    NNStream := TNNet.Create;
+    NNStream.AddLayer(TNNetInput.Create(1, 1, Hidden));
+    LStream := NNStream.AddLayer(TNNetPointwiseConvLinear.Create(2 * QWidth));
+    NNStaged := TNNet.Create;
+    NNStaged.AddLayer(TNNetInput.Create(1, 1, Hidden));
+    LStaged := NNStaged.AddLayer(TNNetPointwiseConvLinear.Create(2 * QWidth));
+    LoadHeads(LStream, nil);
+    Slab := TNNetVolume.Create;
+    StageTensorSlabFlat(Reader, WName, SlabRows, Hidden, Slab);
+    AssertEquals('staged slab size', SlabRows * Hidden, Slab.Size);
+    LoadHeads(LStaged, Slab);
+    MaxNeuronPos := LStream.Neurons.Count - 1;
+    MaxWeightPos := Hidden - 1;
+    for n := 0 to MaxNeuronPos do
+    begin
+      AssertEquals('bias of neuron ' + IntToStr(n),
+        LStream.Neurons[n].BiasWeight, LStaged.Neurons[n].BiasWeight);
+      for w := 0 to MaxWeightPos do
+        AssertEquals('neuron ' + IntToStr(n) + ' weight ' + IntToStr(w),
+          LStream.Neurons[n].Weights.FData[w],
+          LStaged.Neurons[n].Weights.FData[w]);
+    end;
+    // Not a self-comparison of two zero layers: the loaded rows carry data.
+    d := 0;
+    for n := 0 to MaxNeuronPos do
+      for w := 0 to MaxWeightPos do
+        if LStaged.Neurons[n].Weights.FData[w] <> 0 then Inc(d);
+    AssertTrue('staged layer holds non-zero weights', d > 0);
+  finally
+    Slab.Free;
+    NNStaged.Free;
+    NNStream.Free;
+    Reader.Free;
+  end;
+end;
+
 // Incremental-decode parity through the FULL Qwen3.5 hybrid stack: the same
 // fixture net built at SeqLen=1 and driven token-by-token through
 // TNNetStreamingDecoder (KV-cached SDPA + conv-state TNNetDepthwiseConv1D +
@@ -9048,6 +9555,91 @@ begin
   finally
     NN.Free;
   end;
+end;
+
+// Exercises LoadGptOssExpertSlab's MXFP4 tile transpose on shapes the pico
+// fixture never reaches: an OutDim that is not a whole number of row tiles and
+// an InDim wider than one column tile. The reference is the whole slab
+// dequantized in one call plus a naive [E,Out,In] -> [E,In,Out] transpose.
+procedure TTestNeuralPretrained.TestGptOssExpertSlabTranspose;
+const
+  cExperts = 3;
+  cInDim = 96;   // 3 MXFP4 blocks per row, 2 column tiles
+  cOutDim = 19;  // one full 16-row tile plus a 3-row remainder
+var
+  Reader: TNNetSafeTensorsReader;
+  Dest: TNNetVolume;
+  Blocks, Scales, Payload: array of byte;
+  Deq: array of single;
+  NumBlocks, ByteCnt, i, e, ii, oo, MismatchCnt: integer;
+  TempName, Header: string;
+begin
+  RandSeed := 20260826;
+  NumBlocks := cExperts * cOutDim * (cInDim div MXFP4_BLOCK_ELEMS);
+  ByteCnt := NumBlocks * MXFP4_BLOCK_BYTES;
+  SetLength(Blocks, ByteCnt);
+  SetLength(Scales, NumBlocks);
+  for i := 0 to ByteCnt - 1 do Blocks[i] := Random(256);
+  // Scale bytes stay away from 0xFF, which dequantizes to NaN.
+  for i := 0 to NumBlocks - 1 do Scales[i] := 120 + Random(8);
+  SetLength(Payload, ByteCnt + NumBlocks);
+  Move(Blocks[0], Payload[0], ByteCnt);
+  Move(Scales[0], Payload[ByteCnt], NumBlocks);
+  Header := '{"w_blocks":{"dtype":"U8","shape":[3,19,3,16],"data_offsets":[0,' +
+    IntToStr(ByteCnt) + ']},"w_scales":{"dtype":"U8","shape":[3,19,3],' +
+    '"data_offsets":[' + IntToStr(ByteCnt) + ',' +
+    IntToStr(ByteCnt + NumBlocks) + ']}}';
+  TempName := WriteTempSafeTensors(Header, Payload);
+  Dest := TNNetVolume.Create;
+  Reader := TNNetSafeTensorsReader.Create(TempName);
+  try
+    LoadGptOssExpertSlab(Reader, 'w', cExperts, cInDim, cOutDim, Dest);
+    AssertEquals('slab element count', cExperts * cInDim * cOutDim, Dest.Size);
+    SetLength(Deq, cExperts * cOutDim * cInDim);
+    DequantizeMXFP4(@Blocks[0], @Scales[0], NumBlocks, @Deq[0]);
+    MismatchCnt := 0;
+    for e := 0 to cExperts - 1 do
+      for oo := 0 to cOutDim - 1 do
+        for ii := 0 to cInDim - 1 do
+          if Dest.FData[e * cInDim * cOutDim + ii * cOutDim + oo] <>
+             Deq[(e * cOutDim + oo) * cInDim + ii] then Inc(MismatchCnt);
+    AssertEquals('transposed elements differing from the reference', 0,
+      MismatchCnt);
+  finally
+    Reader.Free;
+    Dest.Free;
+    SetLength(Deq, 0);
+    DeleteFile(TempName);
+  end;
+end;
+
+// The slab loader indexes with 32-bit ints and gpt-oss-120b's gate_up slab
+// (128 x 2880 x 5760) already sits at 98.9% of that range, so the count is
+// computed in Int64 and anything wider is rejected before any allocation.
+procedure TTestNeuralPretrained.TestGptOssSlabElementCountGuard;
+var
+  Rejected: boolean;
+begin
+  AssertEquals('gpt-oss-120b gate_up slab elements', '2123366400',
+    IntToStr(GptOssSlabElementCount(128, 2880, 5760)));
+  AssertEquals('gpt-oss-120b down slab elements', '1061683200',
+    IntToStr(GptOssSlabElementCount(128, 2880, 2880)));
+  AssertEquals('gpt-oss-20b gate_up slab elements', '530841600',
+    IntToStr(GptOssSlabElementCount(32, 2880, 5760)));
+  AssertTrue('gpt-oss-120b gate_up must stay importable',
+    GptOssSlabElementCount(128, 2880, 5760) <= High(integer));
+  // 32-bit arithmetic would wrap this to a negative element count.
+  AssertEquals('oversized slab elements', '4246732800',
+    IntToStr(GptOssSlabElementCount(256, 2880, 5760)));
+  Rejected := false;
+  try
+    // Rejected before the reader or the destination volume is touched.
+    LoadGptOssExpertSlab(nil, 'w', 256, 2880, 5760, nil);
+  except
+    on E: EPretrainedImportError do Rejected := true;
+  end;
+  AssertTrue('an over-2^31 expert slab must raise EPretrainedImportError',
+    Rejected);
 end;
 
 // Verifies the RWKV-4 import target - the suite's FIRST NON-TRANSFORMER
@@ -9527,13 +10119,17 @@ procedure TTestNeuralPretrained.TestNemotronHLogitParity;
 var
   NN: TNNet;
   Config: TNemotronHConfig;
-  LayerCnt, Mamba2Cnt, AttnCnt, SquareCnt, SwiGLUCnt: integer;
+  LayerCnt, Mamba2Cnt, AttnCnt, FusedCnt, SquareCnt, SwiGLUCnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildNemotronHFromSafeTensorsEx(
     FixturePath('tiny_nemotronh.safetensors'), Config, {SeqLen=}7,
     {pTrainable=}true, FixturePath('tiny_nemotronh_config.json'));
   try
+    // Ground truth first: a structural assertion below must never shadow the
+    // HF oracle.
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_nemotronh_logits.json'), 7, Config.VocabSize);
     AssertEquals('model_type', 'nemotron_h', Config.ModelType);
     AssertEquals('pattern', 'M*-M', Config.Pattern);
     AssertEquals('layers', 4, Config.NumLayers);
@@ -9554,23 +10150,23 @@ begin
     AssertFalse('untied head', Config.TieWordEmbeddings);
     AssertEquals('prefix', 'model.', Config.Prefix);
     // Schedule M*-M: 2 Mamba-2 mixers (-> 2 TNNetMamba2), 1 attention block
-    // (-> NumHeads=4 SDPA heads), 1 relu2 MLP (-> 1 TNNetSquare). No SwiGLU
-    // anywhere (the MLP is NON-gated).
-    Mamba2Cnt := 0; AttnCnt := 0; SquareCnt := 0; SwiGLUCnt := 0;
+    // (NoPE, so all 4 heads fuse into ONE TNNetFusedSDPA), 1 relu2 MLP (-> 1
+    // TNNetSquare). No SwiGLU anywhere (the MLP is NON-gated).
+    Mamba2Cnt := 0; AttnCnt := 0; FusedCnt := 0; SquareCnt := 0; SwiGLUCnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
       if NN.Layers[LayerCnt] is TNNetMamba2 then Inc(Mamba2Cnt);
-      if NN.Layers[LayerCnt] is TNNetScaledDotProductAttention then
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
         Inc(AttnCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then Inc(FusedCnt);
       if NN.Layers[LayerCnt] is TNNetSquare then Inc(SquareCnt);
       if NN.Layers[LayerCnt] is TNNetSwiGLU then Inc(SwiGLUCnt);
     end;
     AssertEquals('TNNetMamba2 count (2 M blocks)', 2, Mamba2Cnt);
-    AssertEquals('SDPA head count (4 heads x 1 attn block)', 4, AttnCnt);
+    AssertEquals('one fused attention per attn block', 1, FusedCnt);
+    AssertEquals('no per-head SDPA survives the fusion', 0, AttnCnt);
     AssertEquals('TNNetSquare count (1 relu2 MLP block)', 1, SquareCnt);
     AssertEquals('SwiGLU count (non-gated relu2 MLP => 0)', 0, SwiGLUCnt);
-    AssertLogitParityWithFixture(NN,
-      FixturePath('tiny_nemotronh_logits.json'), 7, Config.VocabSize);
   finally
     NN.Free;
   end;
@@ -9615,7 +10211,8 @@ procedure TTestNeuralPretrained.TestNemotronHMoELogitParity;
 var
   NN: TNNet;
   Config: TNemotronHConfig;
-  LayerCnt, Mamba2Cnt, AttnCnt, SquareCnt, GateCnt, SwiGLUCnt: integer;
+  LayerCnt, Mamba2Cnt, AttnCnt, FusedCnt, SquareCnt, GateCnt,
+  SwiGLUCnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildNemotronHFromSafeTensorsEx(
@@ -9641,21 +10238,26 @@ begin
     // comparison - the only assertion here that checks the MODEL.
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_nemotronh_moe_logits.json'), 7, Config.VocabSize);
-    // Schedule M*E-: 1 Mamba-2, 1 attention (4 SDPA heads), 1 MoE block
-    // (-> 4 routed + 1 shared relu2 expert => 5 TNNetSquare), 1 dense relu2
-    // MLP (-> 1 more TNNetSquare) = 6 TNNetSquare. One TNNetBiasBalancedTopKGate
-    // (the sigmoid router with norm_topk_prob). No SwiGLU (non-gated experts).
-    Mamba2Cnt := 0; AttnCnt := 0; SquareCnt := 0; GateCnt := 0; SwiGLUCnt := 0;
+    // Schedule M*E-: 1 Mamba-2, 1 attention (NoPE, so all 4 heads fuse into
+    // ONE TNNetFusedSDPA), 1 MoE block (-> 4 routed + 1 shared relu2 expert
+    // => 5 TNNetSquare), 1 dense relu2 MLP (-> 1 more TNNetSquare) = 6
+    // TNNetSquare. One TNNetBiasBalancedTopKGate (the sigmoid router with
+    // norm_topk_prob). No SwiGLU (non-gated experts).
+    Mamba2Cnt := 0; AttnCnt := 0; FusedCnt := 0; SquareCnt := 0; GateCnt := 0;
+    SwiGLUCnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
       if NN.Layers[LayerCnt] is TNNetMamba2 then Inc(Mamba2Cnt);
-      if NN.Layers[LayerCnt] is TNNetScaledDotProductAttention then Inc(AttnCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+        Inc(AttnCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then Inc(FusedCnt);
       if NN.Layers[LayerCnt] is TNNetSquare then Inc(SquareCnt);
       if NN.Layers[LayerCnt] is TNNetBiasBalancedTopKGate then Inc(GateCnt);
       if NN.Layers[LayerCnt] is TNNetSwiGLU then Inc(SwiGLUCnt);
     end;
     AssertEquals('TNNetMamba2 count (1 M block)', 1, Mamba2Cnt);
-    AssertEquals('SDPA head count (4 heads x 1 attn block)', 4, AttnCnt);
+    AssertEquals('one fused attention per attn block', 1, FusedCnt);
+    AssertEquals('no per-head SDPA survives the fusion', 0, AttnCnt);
     AssertEquals('TNNetSquare count (4 routed + 1 shared + 1 dense MLP)', 6,
       SquareCnt);
     AssertEquals('TNNetBiasBalancedTopKGate count (1 MoE router)', 1, GateCnt);
@@ -9845,7 +10447,8 @@ procedure TTestNeuralPretrained.TestModernBertHiddenStateParity;
 var
   NN: TNNet;
   Config: TModernBertConfig;
-  LayerCnt, RopeCnt, SDPACnt, WindowedCnt, GegluErfCnt, LNCnt: integer;
+  LayerCnt, RopeCnt, SDPACnt, FusedCnt, WindowedCnt, GegluErfCnt,
+  LNCnt: integer;
   SDPA: TNNetScaledDotProductAttention;
 begin
   RandSeed := 424242;
@@ -9853,6 +10456,11 @@ begin
     FixturePath('tiny_modernbert.safetensors'), Config, {SeqLen=}0,
     {pTrainable=}true, FixturePath('tiny_modernbert_config.json'));
   try
+    // Ground truth first: the structural assertions below must never shadow
+    // the HF oracle. The fixture stores last_hidden_state under the "logits"
+    // key, so the logit helper compares all SeqLen x hidden values.
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_modernbert_logits.json'), 16, Config.HiddenSize);
     AssertEquals('model_type', 'modernbert', Config.ModelType);
     AssertEquals('layers', 4, Config.NumLayers);
     AssertEquals('heads', 2, Config.NumHeads);
@@ -9868,16 +10476,19 @@ begin
     AssertFalse('mlp_bias', Config.MlpBias);
     AssertFalse('norm_bias', Config.NormBias);
     AssertEquals('prefix (plain ModernBertModel export)', '', Config.Prefix);
-    // Structure: 2 RoPE layers (q and k) per head per block = 16; one
-    // SDPA per head per block = 8, NON-causal everywhere, with the
-    // BIDIRECTIONAL window W = 4 div 2 + 1 = 3 on the LOCAL layers only
-    // (layers 1 and 2 -> 2 layers x 2 heads = 4 windowed heads); one
+    // Structure: 2 head-tiled RoPE layers (one per q/k BAND) per block = 8.
+    // Attention is NON-causal everywhere. The GLOBAL layers (0 and 3, since
+    // global_attn_every_n_layers=3) mask nothing, so their heads fuse into
+    // ONE TNNetFusedSDPA each = 2. The LOCAL layers (1 and 2) carry the
+    // BIDIRECTIONAL window W = 4 div 2 + 1 = 3, which the fused layer cannot
+    // express, so they keep one SDPA per head = 4 windowed heads. One
     // TNNetGEGLUErf per block (exact erf gelu - NOT the tanh TNNetGEGLU);
     // LayerNorms = embedding norm + 3 attn_norms (layer 0 SKIPS its
     // attn_norm: HF nn.Identity) + 4 mlp_norms + final_norm = 9; and NO
     // learned position table anywhere (RoPE only).
     RopeCnt := 0;
     SDPACnt := 0;
+    FusedCnt := 0;
     WindowedCnt := 0;
     GegluErfCnt := 0;
     LNCnt := 0;
@@ -9899,7 +10510,8 @@ begin
         else
           AssertFalse('full-attention head carries no window flag',
             SDPA.BidirectionalWindow);
-        Inc(SDPACnt);
+        if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then Inc(FusedCnt)
+        else Inc(SDPACnt);
       end;
       if NN.Layers[LayerCnt] is TNNetGEGLUErf then Inc(GegluErfCnt);
       AssertFalse('no tanh GEGLU with hidden_activation=gelu',
@@ -9909,18 +10521,14 @@ begin
       AssertFalse('no learned position table in a ModernBERT net',
         NN.Layers[LayerCnt] is TNNetLearnedPositionalEmbedding);
     end;
-    AssertEquals('RoPE count (q+k per head per block)', 16, RopeCnt);
-    AssertEquals('SDPA count (heads per block)', 8, SDPACnt);
+    AssertEquals('RoPE count (head-tiled q+k band per block)', 8, RopeCnt);
+    AssertEquals('fused attention (2 global layers)', 2, FusedCnt);
+    AssertEquals('per-head SDPA (2 local layers x 2 heads)', 4, SDPACnt);
     AssertEquals('windowed heads (2 local layers x 2 heads)', 4,
       WindowedCnt);
     AssertEquals('TNNetGEGLUErf per block', 4, GegluErfCnt);
     AssertEquals('LayerNorm count (emb + 3 attn + 4 mlp + final)', 9,
       LNCnt);
-    // Hidden-state parity: the fixture stores last_hidden_state under the
-    // "logits" key, so the logit helper compares all SeqLen x hidden
-    // values.
-    AssertLogitParityWithFixture(NN,
-      FixturePath('tiny_modernbert_logits.json'), 16, Config.HiddenSize);
   finally
     NN.Free;
   end;
@@ -10428,6 +11036,84 @@ begin
   end;
 end;
 
+// The GPT-NeoX importer wires attention two ways: ONE head-tiled
+// TNNetRotaryEmbedding per projection feeding the shared fused-attention
+// builder (the default), and the per-head
+// [rotary slice -> RoPE | pass-through slice] forest kept for the scaling
+// modes a tiled layer cannot carry. Both must produce the same logits.
+// rsmLongRoPE selects the per-head branch; an all-ones long_factor table with
+// long_mscale 1 makes its frequency schedule identical to the plain RoPE the
+// hoisted branch builds, so the two nets are directly comparable.
+procedure TTestNeuralPretrained.TestGPTNeoXHoistedRoPEMatchesPerHead;
+var
+  NNHoisted, NNPerHead: TNNet;
+  HoistedConfig, PerHeadConfig: TGPTNeoXConfig;
+  Input, OutH, OutP: TNNetVolume;
+  i, s, RotPairs, SeqLen, SeqLenM1, OutMax: integer;
+  MaxDiff, MaxAbsOut: double;
+begin
+  RandSeed := 424242;
+  HoistedConfig := ReadGPTNeoXConfigFromJSONFile(
+    FixturePath('tiny_gptneox_config.json'));
+  PerHeadConfig := HoistedConfig;
+  PerHeadConfig.RopeScaling.Mode := rsmLongRoPE;
+  RotPairs := Trunc((HoistedConfig.HiddenSize div HoistedConfig.NumHeads) *
+    HoistedConfig.RotaryPct) shr 1;
+  SetLength(PerHeadConfig.RopeScaling.LongFactors, RotPairs);
+  for i := 0 to RotPairs - 1 do
+    PerHeadConfig.RopeScaling.LongFactors[i] := 1.0;
+  PerHeadConfig.RopeScaling.LongAttnFactor := 1.0;
+  NNHoisted := BuildGPTNeoXFromSafeTensorsWithConfig(
+    FixturePath('tiny_gptneox.safetensors'), HoistedConfig);
+  NNPerHead := nil;
+  Input := TNNetVolume.Create;
+  OutH := TNNetVolume.Create;
+  OutP := TNNetVolume.Create;
+  try
+    NNPerHead := BuildGPTNeoXFromSafeTensorsWithConfig(
+      FixturePath('tiny_gptneox.safetensors'), PerHeadConfig);
+    // Structural: the hoist collapses the per-head forest into a handful of
+    // layers per block, so it must be the far shorter net.
+    AssertTrue('hoisted net layer count ' +
+      IntToStr(NNHoisted.CountLayers) + ' must be below the per-head ' +
+      IntToStr(NNPerHead.CountLayers),
+      NNHoisted.CountLayers < NNPerHead.CountLayers);
+    SeqLen := 8;
+    SeqLenM1 := SeqLen - 1;
+    Input.ReSize(HoistedConfig.MaxPositions, 1, 1);
+    MaxDiff := 0;
+    MaxAbsOut := 0;
+    for s := 0 to 2 do
+    begin
+      Input.Fill(0);
+      for i := 0 to SeqLenM1 do
+        Input.FData[i] := (s * 7 + i * 3 + 1) mod HoistedConfig.VocabSize;
+      NNHoisted.Compute(Input);
+      NNHoisted.GetOutput(OutH);
+      NNPerHead.Compute(Input);
+      NNPerHead.GetOutput(OutP);
+      AssertEquals('output size', OutH.Size, OutP.Size);
+      OutMax := OutH.Size - 1;
+      for i := 0 to OutMax do
+      begin
+        if Abs(OutH.FData[i]) > MaxAbsOut then MaxAbsOut := Abs(OutH.FData[i]);
+        if Abs(OutH.FData[i] - OutP.FData[i]) > MaxDiff then
+          MaxDiff := Abs(OutH.FData[i] - OutP.FData[i]);
+      end;
+    end;
+    AssertTrue('logits non-degenerate', MaxAbsOut > 1e-3);
+    AssertTrue('hoisted vs per-head max |diff| = ' + FloatToStr(MaxDiff) +
+      ' relative to max |out| = ' + FloatToStr(MaxAbsOut),
+      MaxDiff < 1e-4 * MaxAbsOut);
+  finally
+    OutP.Free;
+    OutH.Free;
+    Input.Free;
+    NNPerHead.Free;
+    NNHoisted.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestOPTConfigFromJSONFile;
 var
   Config: TOPTConfig;
@@ -10696,6 +11382,7 @@ procedure TTestNeuralPretrained.TestGPTJLogitParity;
 var
   NN: TNNet;
   Config: TGPTJConfig;
+  LayerCnt, SDPACnt, FusedCnt, RoPECnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildGPTJFromSafeTensorsEx(
@@ -10709,6 +11396,24 @@ begin
     AssertEquals('rotary_dim', 4, Config.RotaryDim);
     AssertFalse('untied', Config.TieWordEmbeddings);
     AssertEquals('prefix', 'transformer.', Config.Prefix);
+    // The partial rotary is hoisted into ONE head-tiled layer per q/k
+    // projection, so nothing per-head survives and every block collapses to
+    // a single fused attention layer.
+    SDPACnt := 0;
+    FusedCnt := 0;
+    RoPECnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+        Inc(SDPACnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then Inc(FusedCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetRotaryEmbedding then
+        Inc(RoPECnt);
+    end;
+    AssertEquals('one fused attention per block', Config.NumLayers, FusedCnt);
+    AssertEquals('no per-head SDPA survives the fusion', 0, SDPACnt);
+    AssertEquals('hoisted RoPE (q/k per block)', 2 * Config.NumLayers,
+      RoPECnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_gptj_logits.json'), Config.MaxPositions,
       Config.VocabSize);
@@ -10992,7 +11697,7 @@ procedure TTestNeuralPretrained.TestCohere2LogitParity;
 var
   NN: TNNet;
   Config: TCohereConfig;
-  LayerCnt, SDPACnt, RoPECnt: integer;
+  LayerCnt, SDPACnt, FusedCnt, RoPECnt: integer;
   SDPA: TNNetScaledDotProductAttention;
 begin
   RandSeed := 424242;
@@ -11009,29 +11714,34 @@ begin
     AssertEquals('sliding_window_pattern', 4, Config.SlidingWindowPattern);
     AssertEquals('logit_scale', 0.0625, Config.LogitScale, 1e-9);
     // layers 0,1,2 local (Window=4) + RoPE; layer 3 global (Window=0) NoPE.
-    // RoPE layers: q+k per local layer = (2 q + 1 kv) per layer x 3 local
-    // layers = 9 TNNetRotaryEmbedding; the global layer has NONE.
+    // With no qk_norm nothing per-head survives the projection, so RoPE is
+    // hoisted (ONE head-tiled layer per q/k projection: 2 x 3 local layers =
+    // 6, the global layer none) and every block collapses to ONE fused
+    // attention layer carrying its own window.
     SDPACnt := 0;
+    FusedCnt := 0;
     RoPECnt := 0;
     for LayerCnt := 0 to NN.Layers.Count - 1 do
     begin
       if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+        Inc(SDPACnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then
       begin
         SDPA := TNNetScaledDotProductAttention(NN.Layers[LayerCnt]);
-        if SDPACnt < 3 * Config.NumHeads then
-          AssertEquals('local SDPA head ' + IntToStr(SDPACnt) +
+        if FusedCnt < 3 then
+          AssertEquals('local block ' + IntToStr(FusedCnt) +
             ' window', 4, SDPA.Window)
         else
-          AssertEquals('global SDPA head ' + IntToStr(SDPACnt) +
+          AssertEquals('global block ' + IntToStr(FusedCnt) +
             ' window (full)', 0, SDPA.Window);
-        Inc(SDPACnt);
+        Inc(FusedCnt);
       end;
       if NN.Layers[LayerCnt].ClassType = TNNetRotaryEmbedding then
         Inc(RoPECnt);
     end;
-    AssertEquals('SDPA heads (4 layers x 2 q heads)', 8, SDPACnt);
-    AssertEquals('RoPE layers (3 local x (2 q + 1 kv); global NoPE)', 9,
-      RoPECnt);
+    AssertEquals('one fused attention per block', 4, FusedCnt);
+    AssertEquals('no per-head SDPA survives the fusion', 0, SDPACnt);
+    AssertEquals('hoisted RoPE (3 local x q/k; global NoPE)', 6, RoPECnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_cohere2_logits.json'), Config.MaxPositions,
       Config.VocabSize);
@@ -11079,6 +11789,7 @@ procedure TTestNeuralPretrained.TestPhiLogitParity;
 var
   NN: TNNet;
   Config: TPhiConfig;
+  LayerCnt, SDPACnt, FusedCnt, RoPECnt: integer;
 begin
   RandSeed := 424242;
   NN := BuildPhiFromSafeTensorsEx(
@@ -11093,10 +11804,107 @@ begin
       Config.PartialRotaryFactor, 1e-9);
     AssertFalse('untied', Config.TieWordEmbeddings);
     AssertEquals('prefix', 'model.', Config.Prefix);
+    // No rope_scaling: the partial rotary hoists into ONE head-tiled layer
+    // per q/k projection and every block collapses to one fused attention.
+    SDPACnt := 0;
+    FusedCnt := 0;
+    RoPECnt := 0;
+    for LayerCnt := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[LayerCnt].ClassType = TNNetScaledDotProductAttention then
+        Inc(SDPACnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetFusedSDPA then Inc(FusedCnt);
+      if NN.Layers[LayerCnt].ClassType = TNNetRotaryEmbedding then
+        Inc(RoPECnt);
+    end;
+    AssertEquals('one fused attention per block', Config.NumLayers, FusedCnt);
+    AssertEquals('no per-head SDPA survives the fusion', 0, SDPACnt);
+    AssertEquals('hoisted RoPE (q/k per block)', 2 * Config.NumLayers,
+      RoPECnt);
     AssertLogitParityWithFixture(NN,
       FixturePath('tiny_phi_logits.json'), Config.MaxPositions,
       Config.VocabSize);
   finally
+    NN.Free;
+  end;
+end;
+
+// The three families whose RoPE is now hoisted ahead of the head split
+// (cohere2, GPT-J, Phi) must reproduce the same float64 HF logits with the
+// fused attention layer switched OFF - the per-head forest then reads the
+// ALREADY-rotated projections, so it must cut plain head slices and rotate
+// nothing a second time. Counting the rotary layers pins that: a per-head
+// re-rotation would multiply them by the head count.
+procedure TTestNeuralPretrained.TestHoistedRoPEUnfusedLogitParity;
+var
+  NN: TNNet;
+  CohereConfig: TCohereConfig;
+  GPTJConfig: TGPTJConfig;
+  PhiConfig: TPhiConfig;
+  SDPACnt, FusedCnt, RoPECnt: integer;
+
+  procedure CountAttentionLayers();
+  var
+    i: integer;
+  begin
+    SDPACnt := 0;
+    FusedCnt := 0;
+    RoPECnt := 0;
+    for i := 0 to NN.Layers.Count - 1 do
+    begin
+      if NN.Layers[i].ClassType = TNNetScaledDotProductAttention then
+        Inc(SDPACnt);
+      if NN.Layers[i].ClassType = TNNetFusedSDPA then Inc(FusedCnt);
+      if NN.Layers[i].ClassType = TNNetRotaryEmbedding then Inc(RoPECnt);
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NeuralAllowFusedAttention := false;
+  NN := nil;
+  try
+    NN := BuildCohereFromSafeTensorsEx(
+      FixturePath('tiny_cohere2.safetensors'),
+      CohereConfig, {SeqLen=}0, {pTrainable=}true,
+      FixturePath('tiny_cohere2_config.json'));
+    CountAttentionLayers();
+    AssertEquals('cohere2 unfused per-head SDPA', 8, SDPACnt);
+    AssertEquals('cohere2 no fused layer', 0, FusedCnt);
+    AssertEquals('cohere2 hoisted RoPE (3 local x q/k)', 6, RoPECnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_cohere2_logits.json'), CohereConfig.MaxPositions,
+      CohereConfig.VocabSize);
+    FreeAndNil(NN);
+    NN := BuildGPTJFromSafeTensorsEx(
+      FixturePath('tiny_gptj.safetensors'),
+      GPTJConfig, {SeqLen=}0, {pTrainable=}true,
+      FixturePath('tiny_gptj_config.json'));
+    CountAttentionLayers();
+    AssertEquals('gptj unfused per-head SDPA',
+      GPTJConfig.NumLayers * GPTJConfig.NumHeads, SDPACnt);
+    AssertEquals('gptj no fused layer', 0, FusedCnt);
+    AssertEquals('gptj hoisted RoPE (q/k per block)',
+      2 * GPTJConfig.NumLayers, RoPECnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_gptj_logits.json'), GPTJConfig.MaxPositions,
+      GPTJConfig.VocabSize);
+    FreeAndNil(NN);
+    NN := BuildPhiFromSafeTensorsEx(
+      FixturePath('tiny_phi.safetensors'),
+      PhiConfig, {SeqLen=}0, {pTrainable=}true,
+      FixturePath('tiny_phi_config.json'));
+    CountAttentionLayers();
+    AssertEquals('phi unfused per-head SDPA',
+      PhiConfig.NumLayers * PhiConfig.NumHeads, SDPACnt);
+    AssertEquals('phi no fused layer', 0, FusedCnt);
+    AssertEquals('phi hoisted RoPE (q/k per block)',
+      2 * PhiConfig.NumLayers, RoPECnt);
+    AssertLogitParityWithFixture(NN,
+      FixturePath('tiny_phi_logits.json'), PhiConfig.MaxPositions,
+      PhiConfig.VocabSize);
+  finally
+    NeuralAllowFusedAttention := true;
     NN.Free;
   end;
 end;
@@ -16221,6 +17029,34 @@ begin
   CheckEnCodecParity('tiny_encodec_legacynorm'); // legacy weight_g/weight_v
 end;
 
+procedure TTestNeuralPretrained.TestEnCodecEmptyWaveform;
+var
+  Model: TEnCodecModel;
+  Config: TEnCodecConfig;
+  Wave: TNeuralFloatDynArr;
+  Codes: array of TNeuralIntegerArray;
+  Frames, q: integer;
+begin
+  Model := nil;
+  try
+    Model := BuildEnCodecFromSafeTensors(
+      FixturePath('tiny_encodec.safetensors'), Config,
+      FixturePath('tiny_encodec_config.json'));
+    AssertTrue('codec built', Model <> nil);
+    SetLength(Wave, 0);
+    // The encoder stages reflect-pad every channel row; an empty row has no
+    // sample to mirror, so the stage must yield an empty row rather than read
+    // before its first element.
+    Model.EncodeAudioToCodes(Wave, Codes, Frames);
+    AssertEquals('empty waveform encodes to zero frames', 0, Frames);
+    AssertEquals('RVQ stages still reported', Model.NumCodebooks, Length(Codes));
+    for q := 0 to Length(Codes) - 1 do
+      AssertEquals('empty code row', 0, Length(Codes[q]));
+  finally
+    Model.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestEnCodecOpenCLConvParity;
 {$IFDEF OpenCL}
 var
@@ -18385,7 +19221,8 @@ var
   RefObj: TJSONObject;
   WaveFreqs, WaveAmps, EncStatesArr, RowArr, CondArr, CodesArr, LogitsArr,
     KArr, TArr, ChromaArr: TJSONArray;
-  Samples, Chroma, EncStates, ChromaCond, Prefix, Logits: TNNetVolume;
+  Samples, Chroma, EncStates, ChromaCond, Prefix, Logits,
+    RowLogits: TNNetVolume;
   Codes: TNNetIntArr2D;
   EncSeq, DecSeq, K, Vocab, TextD, NumChroma, ChromaLen, NSamp, SR: integer;
   NumFrames, t, k_i, v, i, c, expArg, gotArg: integer;
@@ -18402,6 +19239,7 @@ begin
   ChromaCond := TNNetVolume.Create;
   Prefix := TNNetVolume.Create;
   Logits := TNNetVolume.Create;
+  RowLogits := TNNetVolume.Create;
   try
     RefJson.LoadFromFile(FixturePath('tiny_musicgen_melody_ref.json'));
     RefRoot := GetJSON(RefJson.Text);
@@ -18522,6 +19360,22 @@ begin
     end;
     AssertTrue('MusicGen Melody decoder logit parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    // ---- (3) the single-row twin returns the same row as the block read ----
+    MaxDiff := 0;
+    for t := 0 to DecSeq - 1 do
+    begin
+      Model.ComputeLogitsAtRow(Codes, Prefix, t, RowLogits);
+      AssertEquals('row logits depth = K*vocab', K * Vocab, RowLogits.Depth);
+      AssertEquals('row logits length = 1', 1, RowLogits.SizeX);
+      for i := 0 to K * Vocab - 1 do
+      begin
+        Diff := Abs(RowLogits.FData[i] - Logits.FData[t * (K * Vocab) + i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+    end;
+    AssertTrue('MusicGen Melody ComputeLogitsAtRow matches ComputeLogits: ' +
+      'max |diff| = ' + FloatToStr(MaxDiff), MaxDiff = 0);
   finally
     Model.Free;
     Samples.Free;
@@ -18530,8 +19384,75 @@ begin
     ChromaCond.Free;
     Prefix.Free;
     Logits.Free;
+    RowLogits.Free;
     RefRoot.Free;
     RefJson.Free;
+  end;
+end;
+
+// hidden_size=2 leaves a single channel per half, so the sinusoidal table's
+// log(10000)/(hidden_size/2 - 1) step would divide by zero. All three
+// MusicGen-family importers must reject it before building anything.
+procedure TTestNeuralPretrained.TestMusicGenTinyHiddenRejected;
+var
+  Config: TMusicGenConfig;
+  MelodyConfig: TMusicGenMelodyConfig;
+  ParlerConfig: TParlerConfig;
+  Reader: TNNetSafeTensorsReader;
+  Msg: string;
+begin
+  Config := ReadMusicGenConfigFromJSONFile(
+    FixturePath('tiny_musicgen_config.json'));
+  Config.Hidden := 2;
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_musicgen.safetensors'));
+  try
+    Msg := '';
+    try
+      BuildMusicGenFromSafeTensorsEx(Reader, Config, 2, 2).Free;
+    except
+      on E: Exception do Msg := E.Message;
+    end;
+    AssertTrue('MusicGen hidden_size=2 must be rejected, got "' + Msg + '"',
+      Pos('hidden_size', Msg) > 0);
+  finally
+    Reader.Free;
+  end;
+
+  ParlerConfig := ReadParlerConfigFromJSONFile(
+    FixturePath('tiny_parler_config.json'));
+  ParlerConfig.Hidden := 2;
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_parler.safetensors'));
+  try
+    Msg := '';
+    try
+      BuildParlerTTSFromSafeTensorsEx(Reader, ParlerConfig, 2, 1, 1).Free;
+    except
+      on E: Exception do Msg := E.Message;
+    end;
+    AssertTrue('Parler-TTS hidden_size=2 must be rejected, got "' + Msg + '"',
+      Pos('hidden_size', Msg) > 0);
+  finally
+    Reader.Free;
+  end;
+
+  MelodyConfig := ReadMusicGenMelodyConfigFromJSONFile(
+    FixturePath('tiny_musicgen_melody_config.json'));
+  MelodyConfig.Hidden := 2;
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_musicgen_melody.safetensors'));
+  try
+    Msg := '';
+    try
+      BuildMusicGenMelodyFromSafeTensorsEx(Reader, MelodyConfig, 2, 2).Free;
+    except
+      on E: Exception do Msg := E.Message;
+    end;
+    AssertTrue('MusicGen Melody hidden_size=2 must be rejected, got "' +
+      Msg + '"', Pos('hidden_size', Msg) > 0);
+  finally
+    Reader.Free;
   end;
 end;
 
@@ -22175,6 +23096,62 @@ begin
   end;
 end;
 
+// The mask einsum is pixel-outer for cache reasons; this pins it bit-identical
+// to the query-outer order (same DotProduct calls, same operand runs) on a few
+// shapes, including non-square and degenerate ones.
+procedure TTestNeuralPretrained.TestMask2FormerMaskEinsumOrderParity;
+var
+  ShapeIdx, NQ, HD, MW, MH, NumPix, q, p, i: integer;
+  meBase, refBase, pH: integer;
+  MaskEmbed, MaskFeatures, Got, Ref: TNNetVolume;
+const
+  csNQ: array[0..3] of integer = (7, 1, 4, 3);
+  csHD: array[0..3] of integer = (16, 5, 33, 1);
+  csMW: array[0..3] of integer = (5, 3, 2, 6);
+  csMH: array[0..3] of integer = (3, 6, 2, 1);
+begin
+  for ShapeIdx := 0 to 3 do
+  begin
+    NQ := csNQ[ShapeIdx];
+    HD := csHD[ShapeIdx];
+    MW := csMW[ShapeIdx];
+    MH := csMH[ShapeIdx];
+    NumPix := MW * MH;
+    MaskEmbed := TNNetVolume.Create(NQ, 1, HD);
+    MaskFeatures := TNNetVolume.Create(MW, MH, HD);
+    Got := TNNetVolume.Create(1, 1, 1);
+    Ref := TNNetVolume.Create(NQ, 1, NumPix);
+    try
+      RandSeed := 1234 + ShapeIdx;
+      for i := 0 to MaskEmbed.Size - 1 do MaskEmbed.FData[i] := Random - 0.5;
+      for i := 0 to MaskFeatures.Size - 1 do MaskFeatures.FData[i] := Random - 0.5;
+      // query-outer reference.
+      for q := 0 to NQ - 1 do
+      begin
+        meBase := MaskEmbed.GetRawPos(q, 0, 0);
+        refBase := Ref.GetRawPos(q, 0, 0);
+        pH := 0;
+        for p := 0 to NumPix - 1 do
+        begin
+          Ref.FData[refBase + p] := TNNetVolume.DotProduct(
+            MaskEmbed.GetRawPtr(meBase), MaskFeatures.GetRawPtr(pH), HD);
+          Inc(pH, HD);
+        end;
+      end;
+      Mask2FormerMaskEinsum(MaskEmbed, MaskFeatures, Got, NQ, HD, MW, MH);
+      AssertEquals('mask einsum size', Ref.Size, Got.Size);
+      for i := 0 to Ref.Size - 1 do
+        AssertTrue('mask einsum bit parity at ' + IntToStr(i),
+          Got.FData[i] = Ref.FData[i]);
+    finally
+      MaskEmbed.Free;
+      MaskFeatures.Free;
+      Got.Free;
+      Ref.Free;
+    end;
+  end;
+end;
+
 // DecodeMask2FormerSemantic index/argmax check: the shipped decoder is compared
 // against a straightforward per-pixel reference (the plain nested formulation of
 // argmax_c sum_q softmax(cls)[q,c] * sigmoid(mask[q,p])) on small synthetic
@@ -22332,6 +23309,105 @@ begin
     Img.Free;
     RefJson.Free;
     NN.Free;
+  end;
+end;
+
+// The DETR spatial pos tables are per-layer copies of one 2-D sine constant,
+// while the query-pos tables are learned. Rebuilds the pico fixture with
+// num_queries = the 4x4 feature grid's token count (16) and a MARKED query
+// table, then asserts the marked table survives in both query-pos layers (a
+// size-based identification would have overwritten them with the sine table).
+procedure TTestNeuralPretrained.TestDetrQueryPosSurvivesTokenCountCollision;
+const
+  cQueries = 16;
+  cDModel = 16;
+var
+  Reader: TNNetSafeTensorsReader;
+  Writer: TNNetSafeTensorsWriter;
+  Vol: TNNetVolume;
+  Shape: array of Int64;
+  StPath, CfgPath, Name: string;
+  Cfg: TStringList;
+  Config: TDetrConfig;
+  NN: TNNet;
+  Layer: TNNetLayer;
+  t, d, q, c, PosLayers, QueryTables, SpatialTables: integer;
+  Marked: boolean;
+begin
+  RandSeed := 424242;
+  StPath := GetTempDir(false) + 'cai_detr_qcollide_' +
+    IntToStr(Random(1000000)) + '.safetensors';
+  Vol := TNNetVolume.Create;
+  Reader := TNNetSafeTensorsReader.Create(FixturePath('tiny_detr.safetensors'));
+  Writer := TNNetSafeTensorsWriter.Create(StPath);
+  try
+    for t := 0 to Reader.Count - 1 do
+    begin
+      Name := Reader.TensorName(t);
+      if Name = 'model.query_position_embeddings.weight' then
+      begin
+        // marked table: row q, channel c = 100 + q + c/100, far outside the
+        // spatial sine constant's [-1, 1].
+        Vol.ReSize(cQueries * cDModel, 1, 1);
+        for q := 0 to cQueries - 1 do
+          for c := 0 to cDModel - 1 do
+            Vol.FData[q * cDModel + c] := 100 + q + c * 0.01;
+        SetLength(Shape, 2);
+        Shape[0] := cQueries; Shape[1] := cDModel;
+      end
+      else
+      begin
+        Reader.LoadTensorFlat(Name, Vol);
+        SetLength(Shape, Reader.DimCount(Name));
+        for d := 0 to Reader.DimCount(Name) - 1 do
+          Shape[d] := Reader.DimSize(Name, d);
+      end;
+      Writer.AddTensorFlat(Name, Shape, Vol);
+    end;
+    Writer.SaveToFile;
+  finally
+    Writer.Free;
+    Reader.Free;
+    Vol.Free;
+  end;
+  Cfg := TStringList.Create;
+  try
+    Cfg.LoadFromFile(FixturePath('tiny_detr_config.json'));
+    CfgPath := WriteTempJSON(StringReplace(Cfg.Text, '"num_queries": 5',
+      '"num_queries": ' + IntToStr(cQueries), []));
+  finally
+    Cfg.Free;
+  end;
+  NN := BuildDetrFromSafeTensors(StPath, Config, {pTrainable=}true, CfgPath);
+  try
+    AssertEquals('num_queries = feature-grid token count', cQueries,
+      Config.NumQueries);
+    PosLayers := 0; QueryTables := 0; SpatialTables := 0;
+    for t := 0 to NN.Layers.Count - 1 do
+    begin
+      Layer := NN.Layers[t];
+      if not (Layer is TNNetLearnedPositionalEmbedding) then continue;
+      Inc(PosLayers);
+      Marked := true;
+      for q := 0 to cQueries - 1 do
+        for c := 0 to cDModel - 1 do
+          if Abs(Layer.FArrNeurons[0].Weights.FData[q * cDModel + c] -
+                 (100 + q + c * 0.01)) > 1e-4 then Marked := false;
+      if Marked then Inc(QueryTables)
+      else
+      begin
+        Inc(SpatialTables);
+        AssertTrue('spatial table holds the sine constant',
+          Abs(Layer.FArrNeurons[0].Weights.FData[0]) <= 1.0);
+      end;
+    end;
+    AssertEquals('pos-embed layers', 4, PosLayers);
+    AssertEquals('query-pos tables kept', 2, QueryTables);
+    AssertEquals('spatial-pos tables filled', 2, SpatialTables);
+  finally
+    NN.Free;
+    DeleteFile(StPath);
+    DeleteFile(CfgPath);
   end;
 end;
 
@@ -22903,6 +23979,42 @@ begin
     EncoderNet.Free;
     DecoderNet.Free;
   end;
+end;
+
+// A learned position table smaller than max_position_embeddings + 2 must be
+// rejected: the loader copies the whole SeqLen window in one Move, so a short
+// checkpoint table would be read past its end.
+procedure TTestNeuralPretrained.TestFlorence2PositionTableShape;
+var
+  EncoderNet, DecoderNet: TNNet;
+  Projector: TFlorence2Projector;
+  Config: TFlorence2Config;
+  Rejected: boolean;
+begin
+  Config := ReadFlorence2ConfigFromJSONFile(
+    FixturePath('tiny_florence2_config.json'));
+  // The fixture table has max_position_embeddings + 2 = 42 rows; claiming a
+  // longer context makes the requested window overrun it.
+  Config.Bart.MaxPositionEmbeddings := 128;
+  Rejected := false;
+  EncoderNet := nil;
+  DecoderNet := nil;
+  FillChar(Projector, SizeOf(Projector), 0);
+  try
+    try
+      BuildFlorence2FromSafeTensorsWithConfig(
+        FixturePath('tiny_florence2.safetensors'), Config,
+        EncoderNet, DecoderNet, Projector, {EncSeqLen=}100, {DecSeqLen=}100,
+        {pTrainable=}false);
+    except
+      on E: EPretrainedImportError do Rejected := true;
+    end;
+  finally
+    FreeFlorence2Projector(Projector);
+    EncoderNet.Free;
+    DecoderNet.Free;
+  end;
+  AssertTrue('short embed_positions table rejected', Rejected);
 end;
 
 // Verifies ReadOwlViTConfigFromJSONFile on the committed OWL-ViT pico config
@@ -25488,6 +26600,170 @@ begin
   end;
 end;
 
+// IP-Adapter import from the torch-pickle checkpoint. The real
+// ip-adapter_sd15.bin groups its tensors in nested sub-dicts ('image_proj',
+// 'ip_adapter') instead of the flat dotted names of the safetensors export;
+// tests/fixtures/tiny_ip_adapter.bin is the same pico checkpoint saved that
+// way. The reader must rejoin the levels with a dot, so the .bin-built net has
+// to reproduce the safetensors-built net exactly on the same inputs.
+procedure TTestNeuralPretrained.TestIPAdapterTorchBin;
+var
+  Reader: TNNetSafeTensorsReader;
+  NNBin, NNSafe: TNNet;
+  Config, BinConfig: TIPAdapterConfig;
+  Hidden, Text, ImageEmbed, OutBin, OutSafe: TNNetVolume;
+  SCnt, DCnt: integer;
+  MaxDiff, Diff: double;
+begin
+  RandSeed := 424242;
+  Reader := CreatePretrainedTensorReader(FixturePath('tiny_ip_adapter.bin'));
+  try
+    AssertTrue('image_proj.proj.weight flattened',
+      Reader.HasTensor('image_proj.proj.weight'));
+    AssertTrue('ip_adapter.1.to_k_ip.weight flattened',
+      Reader.HasTensor('ip_adapter.1.to_k_ip.weight'));
+    AssertTrue('unet.attn2.to_q.weight flattened',
+      Reader.HasTensor('unet.attn2.to_q.weight'));
+    AssertEquals('image_proj.proj.weight rows', 24,
+      Reader.DimSize('image_proj.proj.weight', 0));
+    AssertEquals('image_proj.proj.weight cols', 10,
+      Reader.DimSize('image_proj.proj.weight', 1));
+  finally
+    Reader.Free;
+  end;
+
+  NNBin := nil;
+  NNSafe := nil;
+  Hidden := TNNetVolume.Create;
+  Text := TNNetVolume.Create;
+  ImageEmbed := TNNetVolume.Create;
+  OutBin := TNNetVolume.Create;
+  OutSafe := TNNetVolume.Create;
+  try
+    NNSafe := BuildIPAdapterFromSafeTensors(
+      FixturePath('tiny_ip_adapter.safetensors'), Config,
+      {pTrainable=}true, FixturePath('tiny_ip_adapter_config.json'));
+    NNBin := BuildIPAdapterFromSafeTensors(
+      FixturePath('tiny_ip_adapter.bin'), BinConfig,
+      {pTrainable=}true, FixturePath('tiny_ip_adapter_config.json'));
+    AssertEquals('same layer count', NNSafe.CountLayers(), NNBin.CountLayers());
+
+    Hidden.ReSize(Config.HiddenTokens, 1, Config.Channels);
+    for SCnt := 0 to Hidden.Size - 1 do
+      Hidden.FData[SCnt] := ((SCnt * 7) mod 11 - 5) / 8;
+    Text.ReSize(Config.TextSeqLen, 1, Config.CrossAttentionDim);
+    for SCnt := 0 to Text.Size - 1 do
+      Text.FData[SCnt] := ((SCnt * 5) mod 13 - 6) / 16;
+    ImageEmbed.ReSize(Config.ClipEmbeddingsDim, 1, 1);
+    for SCnt := 0 to ImageEmbed.Size - 1 do
+      ImageEmbed.FData[SCnt] := ((SCnt * 3) mod 7 - 3) / 4;
+
+    IPAdapterCrossAttention(NNSafe, Config, Hidden, Text, ImageEmbed, OutSafe);
+    IPAdapterCrossAttention(NNBin, BinConfig, Hidden, Text, ImageEmbed, OutBin);
+    AssertEquals('same output size', OutSafe.Size, OutBin.Size);
+    MaxDiff := 0;
+    for DCnt := 0 to OutSafe.Size - 1 do
+    begin
+      Diff := Abs(OutSafe.FData[DCnt] - OutBin.FData[DCnt]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('torch .bin vs safetensors: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be 0', MaxDiff = 0);
+  finally
+    OutSafe.Free;
+    OutBin.Free;
+    ImageEmbed.Free;
+    Text.Free;
+    Hidden.Free;
+    NNBin.Free;
+    NNSafe.Free;
+  end;
+end;
+
+// pTrainable=false must reach the WHOLE net, not just the weighted layers: the
+// IP-Adapter wiring (inputs, channel slices, concats, cross-attention, sum)
+// carries no per-layer SetTrainable, so only the net-level flip frees its
+// training volumes. Inference output must match the trainable net to within a
+// rounding tolerance: SetTrainable(False) also arms low-memory mode, so the
+// pointwise convolutions reduce through ComputeLowMemoryCPU (per-neuron dot
+// products) while the trainable net reduces through DotProductsTiled over the
+// concatenated weight cache. The two accumulation orders agree bit-for-bit in a
+// scalar build but differ by about one float32 ulp under AVX. The mode cannot be
+// pinned away here: with low memory armed the concatenated cache is never built,
+// so clearing the flag after the weights are loaded would leave DotProductsTiled
+// reading an empty buffer.
+procedure TTestNeuralPretrained.TestIPAdapterInferenceNet;
+var
+  NNTrain, NNInfer: TNNet;
+  TrainConfig, InferConfig: TIPAdapterConfig;
+  Hidden, Text, ImageEmbed, OutTrain, OutInfer: TNNetVolume;
+  SCnt, DCnt, TrainErrLayers, InferErrLayers, MaxLayerIdx: integer;
+  MaxDiff, Diff: double;
+begin
+  RandSeed := 424242;
+  NNTrain := nil;
+  NNInfer := nil;
+  Hidden := TNNetVolume.Create;
+  Text := TNNetVolume.Create;
+  ImageEmbed := TNNetVolume.Create;
+  OutTrain := TNNetVolume.Create;
+  OutInfer := TNNetVolume.Create;
+  try
+    NNTrain := BuildIPAdapterFromSafeTensors(
+      FixturePath('tiny_ip_adapter.safetensors'), TrainConfig,
+      {pTrainable=}true, FixturePath('tiny_ip_adapter_config.json'));
+    NNInfer := BuildIPAdapterFromSafeTensors(
+      FixturePath('tiny_ip_adapter.safetensors'), InferConfig,
+      {pTrainable=}false, FixturePath('tiny_ip_adapter_config.json'));
+    AssertEquals('same layer count', NNTrain.CountLayers(), NNInfer.CountLayers());
+    AssertTrue('trainable net flag', NNTrain.IsTrainable);
+    AssertTrue('inference net flag', not NNInfer.IsTrainable);
+
+    TrainErrLayers := 0;
+    InferErrLayers := 0;
+    MaxLayerIdx := NNTrain.CountLayers() - 1;
+    for SCnt := 0 to MaxLayerIdx do
+    begin
+      if NNTrain.Layers[SCnt].OutputError.Size > 1 then Inc(TrainErrLayers);
+      if NNInfer.Layers[SCnt].OutputError.Size > 1 then Inc(InferErrLayers);
+    end;
+    AssertTrue('trainable net keeps error volumes', TrainErrLayers > 0);
+    AssertEquals('inference net frees all error volumes', 0, InferErrLayers);
+
+    Hidden.ReSize(TrainConfig.HiddenTokens, 1, TrainConfig.Channels);
+    for SCnt := 0 to Hidden.Size - 1 do
+      Hidden.FData[SCnt] := ((SCnt * 7) mod 11 - 5) / 8;
+    Text.ReSize(TrainConfig.TextSeqLen, 1, TrainConfig.CrossAttentionDim);
+    for SCnt := 0 to Text.Size - 1 do
+      Text.FData[SCnt] := ((SCnt * 5) mod 13 - 6) / 16;
+    ImageEmbed.ReSize(TrainConfig.ClipEmbeddingsDim, 1, 1);
+    for SCnt := 0 to ImageEmbed.Size - 1 do
+      ImageEmbed.FData[SCnt] := ((SCnt * 3) mod 7 - 3) / 4;
+
+    IPAdapterCrossAttention(NNTrain, TrainConfig, Hidden, Text, ImageEmbed,
+      OutTrain);
+    IPAdapterCrossAttention(NNInfer, InferConfig, Hidden, Text, ImageEmbed,
+      OutInfer);
+    AssertEquals('same output size', OutTrain.Size, OutInfer.Size);
+    MaxDiff := 0;
+    for DCnt := 0 to OutTrain.Size - 1 do
+    begin
+      Diff := Abs(OutTrain.FData[DCnt] - OutInfer.FData[DCnt]);
+      if Diff > MaxDiff then MaxDiff := Diff;
+    end;
+    AssertTrue('inference vs trainable: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be below 1e-5', MaxDiff < 1e-5);
+  finally
+    OutInfer.Free;
+    OutTrain.Free;
+    ImageEmbed.Free;
+    Text.Free;
+    Hidden.Free;
+    NNInfer.Free;
+    NNTrain.Free;
+  end;
+end;
+
 // End-to-end base-UNet-plus-ControlNet single denoise step. Builds a CONTROL-
 // ENABLED SD UNet (BuildSDUNet pWithControl=true) from the tiny_sd_unet fixture
 // and a ControlNet from the tiny_controlnet fixture (config-compatible: shared
@@ -25711,6 +26987,132 @@ begin
     Cond.Free;
     RefJson.Free;
     if RefRoot <> nil then RefRoot.Free;
+  end;
+end;
+
+// T2IAdapterFeatures collects one feature layer per Config stage into an array
+// sized by Config.NumChannels. A Config that describes fewer stages than the net
+// actually has (a hand-made config, or a config read from a different adapter)
+// must be reported, not written past the end of that array.
+procedure TTestNeuralPretrained.TestT2IAdapterFeatureCountMismatch;
+var
+  NN: TNNet;
+  Config: TT2IAdapterConfig;
+  Cond: TNNetVolume;
+  Features: array of TNNetVolume;
+  fi: integer;
+  Rejected: boolean;
+  Msg: string;
+begin
+  RandSeed := 424242;
+  NN := BuildT2IAdapterFromSafeTensors(
+    FixturePath('tiny_t2i_adapter.safetensors'), Config,
+    {pTrainable=}true, FixturePath('tiny_t2i_adapter_config.json'));
+  Cond := TNNetVolume.Create;
+  Rejected := false;
+  Msg := '';
+  // one stage fewer than the fixture net has.
+  SetLength(Features, Config.NumChannels - 1);
+  for fi := 0 to Config.NumChannels - 2 do
+    Features[fi] := TNNetVolume.Create;
+  try
+    AssertTrue('fixture has more than one stage', Config.NumChannels > 1);
+    Cond.ReSize(Config.CondGrid, Config.CondGrid, Config.CondChannels);
+    Cond.Fill(0);
+    Config.NumChannels := Config.NumChannels - 1;
+    try
+      T2IAdapterFeatures(NN, Config, Cond, Features);
+    except
+      on E: EPretrainedImportError do
+      begin
+        Rejected := true;
+        Msg := E.Message;
+      end;
+    end;
+    AssertTrue('a stage-count mismatch must be reported', Rejected);
+    // the "more than" wording is the guard that runs BEFORE the array write; the
+    // trailing total-count check would report an overrun that already happened.
+    AssertTrue('the extra stage must be caught before the array write (' +
+      Msg + ')', Pos('more than', Msg) > 0);
+  finally
+    for fi := 0 to Length(Features) - 1 do Features[fi].Free;
+    NN.Free;
+    Cond.Free;
+  end;
+end;
+
+// The adapter conv_in reads one bias element per output channel, so a
+// conv_in.bias shorter than the weight's output dimension must be reported
+// instead of read past the end of the decoded tensor. Rebuilds the pico
+// fixture with that one tensor one element short.
+procedure TTestNeuralPretrained.TestT2IAdapterShortConvInBias;
+const
+  csBiasName = 'adapter.conv_in.bias';
+var
+  Reader: TNNetSafeTensorsReader;
+  Writer: TNNetSafeTensorsWriter;
+  V: TNNetVolume;
+  Path, TName: string;
+  Dims: array of Int64;
+  Info: TSafeTensorInfo;
+  t, d, TensorCntM1, DimCntM1: integer;
+  NN: TNNet;
+  Config: TT2IAdapterConfig;
+  Rejected: boolean;
+  Msg: string;
+begin
+  RandSeed := 424242;
+  Path := GetTempDir(false) + 'cai_t2i_short_bias.safetensors';
+  Reader := TNNetSafeTensorsReader.Create(
+    FixturePath('tiny_t2i_adapter.safetensors'));
+  Writer := TNNetSafeTensorsWriter.Create(Path);
+  V := TNNetVolume.Create;
+  try
+    AssertTrue('fixture has the conv_in bias', Reader.HasTensor(csBiasName));
+    TensorCntM1 := Reader.Count - 1;
+    for t := 0 to TensorCntM1 do
+    begin
+      TName := Reader.TensorName(t);
+      Info := Reader.GetInfo(TName);
+      DimCntM1 := Length(Info.Shape) - 1;
+      SetLength(Dims, DimCntM1 + 1);
+      for d := 0 to DimCntM1 do Dims[d] := Info.Shape[d];
+      Reader.LoadTensorFlat(TName, V);
+      if TName = csBiasName then
+      begin
+        AssertTrue('the bias is a vector of more than one element',
+          (DimCntM1 = 0) and (Dims[0] > 1));
+        Dims[0] := Dims[0] - 1;
+        V.ReSize(V.Size - 1, 1, 1);
+      end;
+      Writer.AddTensorFlat(TName, Dims, V);
+    end;
+    Writer.SaveToFile();
+  finally
+    V.Free;
+    Writer.Free;
+    Reader.Free;
+  end;
+  NN := nil;
+  Rejected := false;
+  Msg := '';
+  try
+    try
+      NN := BuildT2IAdapterFromSafeTensors(Path, Config,
+        {pTrainable=}true, FixturePath('tiny_t2i_adapter_config.json'));
+    except
+      on E: EPretrainedImportError do
+      begin
+        Rejected := true;
+        Msg := E.Message;
+      end;
+    end;
+    AssertTrue('a short conv_in bias must be reported', Rejected);
+    AssertTrue('the message must name the bias tensor (' + Msg + ')',
+      Pos(csBiasName, Msg) > 0);
+  finally
+    NN.Free;
+    DeleteFile(Path);
   end;
 end;
 

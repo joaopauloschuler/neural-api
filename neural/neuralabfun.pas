@@ -306,7 +306,7 @@ type
     // creates a random binary test from action array
     function CreateActionRandomBinaryTest(): TOperation;
 
-    function OperateAndTestOperation(Oper: TOperation; BasePosition: integer;
+    function OperateAndTestOperation(const Oper: TOperation; BasePosition: integer;
       var NextState: byte): byte;
     function TestTests(var Tests: TTestsClass): integer;
   end;
@@ -709,7 +709,9 @@ end;
 
 function TRunOperation.Make2D(X,Y: integer): integer;
 begin
-  Result := X + Y * FCS.ImageSizeY;
+  // Row-major: X is the contiguous axis, so a step in Y skips one full row of
+  // ImageSizeX elements.
+  Result := X + Y * FCS.ImageSizeX;
 end;
 
 function TRunOperation.CreateFeatureCenter(): integer;
@@ -729,8 +731,8 @@ end;
 procedure TCreateValidOperations.Create(Tests, FullEqual: boolean;
   var ERRORS: array of byte);
 var
-  LocalNonZeroPrevStates, NonZeroErrors: TPositionArray;
-  LocalNonZeroPrevStatesCount, NonZeroErrorsCount: integer;
+  LocalNonZeroPrevStates: TPositionArray;
+  LocalNonZeroPrevStatesCount: integer;
   LocalNumberOfPreviousStates: integer;
   LocalPreviousStates: array of byte;
   OnAction: boolean;
@@ -739,7 +741,7 @@ var
   var
     ElementPosition, J, MJ: integer;
   begin
-    if LocalNumberOfPreviousStates > csMaxTests then
+    if LocalNumberOfPreviousStates > FCS.MaxTests then
       MJ := FCS.MaxTests
     else
       MJ := LocalNumberOfPreviousStates;
@@ -761,10 +763,10 @@ var
   begin
     if (LocalNonZeroPrevStatesCount > 0) then
     begin
-      if LocalNonZeroPrevStatesCount > csMaxTests then
+      if LocalNonZeroPrevStatesCount > FCS.MaxTests then
         MJ := FCS.MaxTests
       else
-        MJ := LocalNonZeroPrevStatesCount+1;
+        MJ := LocalNonZeroPrevStatesCount;
       for J := 1 to MJ do
       begin
         ElementPosition := LocalNonZeroPrevStates[random(LocalNonZeroPrevStatesCount)];
@@ -895,13 +897,9 @@ var
 
 
 var
-  NumberOfErrors: integer;
   RunOnActionFlag: integer;
 begin
   Clear;
-  SetLength(NonZeroErrors,Self.NumberOfCurrentStates);
-  NumberOfErrors := NumberOfNextStates;
-  NonZeroErrorsCount := getNonZeroElementsPos(NumberOfErrors, ERRORS, NonZeroErrors);
 
   if not(FCS.TestOnStates) then RunOnActionFlag := 1
   else if not(FCS.TestOnActions) then RunOnActionFlag := 0
@@ -912,9 +910,9 @@ begin
   begin
     // using LocalPreviousStates
     LocalNumberOfPreviousStates := NumberOfActions;
-    SetLength(LocalPreviousStates, NumberOfActions);
     SetLength(LocalNonZeroPrevStates, NumberOfActions);
-    ABCopy(LocalPreviousStates, Actions);
+    // Read-only alias (a dynamic-array reference), not a copy of the bytes.
+    LocalPreviousStates := Actions;
     LocalNonZeroPrevStatesCount := getNonZeroElementsPos(LocalNumberOfPreviousStates, LocalPreviousStates,
       LocalNonZeroPrevStates);
     OnAction := True;
@@ -926,8 +924,7 @@ begin
     LocalNonZeroPrevStatesCount := getNonZeroElementsPos(NumberOfCurrentStates, CurrentStates, LocalNonZeroPrevStates);
     OnAction := False;
     LocalNumberOfPreviousStates := NumberOfCurrentStates;
-    SetLength(LocalPreviousStates, NumberOfCurrentStates);
-    ABCopy(LocalPreviousStates, CurrentStates);
+    LocalPreviousStates := CurrentStates;
   end;
 
   FBasePosition := FPredictedBytePos;
@@ -967,7 +964,6 @@ begin
   end;
 
   SetLength(LocalNonZeroPrevStates, 0);
-  SetLength(NonZeroErrors, 0);
   SetLength(LocalPreviousStates, 0);
 
 end;
@@ -1047,8 +1043,8 @@ var
   efeito: byte;
   PermissibleErrors: ShortInt;
   N, BasePos: integer;   // #8: Tests is a var param; its fields would reload each
-                         // iteration. OperateAndTestOperation takes Oper/Base by
-                         // value and never mutates Tests, so both are invariant.
+                         // iteration. OperateAndTestOperation takes Oper as const
+                         // and never mutates Tests, so both are invariant.
 begin
   // Initialised so the Tests.N = 0 case below does not read it uninitialised.
   PermissibleErrors := 0;
@@ -1076,13 +1072,21 @@ var
   X,Y: integer;
   TopX, TopY: integer;
   Pos, RowStep, ColSeed: integer;
+  Found: boolean;
 begin
+  // Callers read the result as "the tests fired" (>0), so this returns the
+  // matching test count of the winning window, exactly like the non
+  // bidimensional LocalTestTests. The matching position is reported through
+  // Tests.TestBasePosition: returning it here instead would make a legitimate
+  // match at position 0 (reachable whenever FeatureSize is 0) read as a
+  // no-match.
   Result := 0;
+  Found := False;
   TopX := FCS.ImageSizeX - FCS.FeatureSize - 1;
   TopY := FCS.ImageSizeY - FCS.FeatureSize - 1;
-  // Make2D(X,Y) = X + Y*ImageSizeY. Y is the inner loop, so Pos advances by
-  // ImageSizeY each Y (#6 strength reduction); seed at Y = FeatureSize.
-  RowStep := FCS.ImageSizeY;
+  // Make2D(X,Y) = X + Y*ImageSizeX. Y is the inner loop, so Pos advances by
+  // ImageSizeX each Y (#6 strength reduction); seed at Y = FeatureSize.
+  RowStep := FCS.ImageSizeX;
   ColSeed := FCS.FeatureSize * RowStep;
   for X := FCS.FeatureSize to TopX do
   begin
@@ -1090,14 +1094,15 @@ begin
     for Y := FCS.FeatureSize to TopY do
     begin
       Tests.TestBasePosition := Pos;
-      if (Self.LocalTestTests(Tests)>0) then
+      Result := Self.LocalTestTests(Tests);
+      if (Result>0) then
       begin
-        Result := Pos;
+        Found := True;
         Break;
       end;
       Inc(Pos, RowStep);              // next Y: Make2D(X, Y+1)
     end;
-    if (Result>0) then Break;
+    if Found then Break;
   end;
 end;
 
@@ -1119,7 +1124,7 @@ begin
 end;
 
 function TRunOperation.OperateAndTestOperation(
-  {input} Oper: TOperation; BasePosition: integer;
+  {input} const Oper: TOperation; BasePosition: integer;
   {output}var NextState: byte): byte;
 var
   RelativeOperandPosition1,         //Operand position is relative
@@ -1129,6 +1134,7 @@ var
   StatePosition1, StatePosition2: integer;
   CurrentBaseValue: integer;
   MaxAct, MaxCur: integer;
+  OperandArrayLen: integer;
 begin
   // NextState is a var output read below (and returned as the result for test
   // opcodes); csNop, csDiv/csMod by zero and the invalid-opcode branch never
@@ -1150,12 +1156,26 @@ begin
   else
     StatePosition2 := Oper.Op2;
 
-  if (not (OpCode in ImediatSet) and ((StatePosition1 >= NumberOfActions) or
-    (StatePosition1 < 0))) or ((StatePosition2 >= NumberOfActions) or
-    (StatePosition2 < 0)) then
+  // Operand positions index Actions when RunOnAction is set and CurrentStates
+  // otherwise, so they must be bounded against the array they will be read
+  // from; the two arrays have independent lengths. Only binary opcodes read an
+  // operand: the operand-free ones (csNop, csTrue, csSet, csInc, csDec, csInj,
+  // csNot) work off Op1 as an immediate or off the base state, so their unused
+  // positions must not reject the operation. csEqual takes Op1 as an immediate
+  // and only reads operand 2.
+  if Oper.RunOnAction
+    then OperandArrayLen := NumberOfActions
+    else OperandArrayLen := NumberOfCurrentStates;
+
+  if OpCode in BinaryOperationSet then
   begin
-    OperateAndTestOperation := 0;
-    exit;
+    if (not (OpCode in ImediatSet) and ((StatePosition1 >= OperandArrayLen) or
+      (StatePosition1 < 0))) or ((StatePosition2 >= OperandArrayLen) or
+      (StatePosition2 < 0)) then
+    begin
+      OperateAndTestOperation := 0;
+      exit;
+    end;
   end;
 
   // Upper index bounds bound once (#4); reused by the EnsureRange clamps below.

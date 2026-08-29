@@ -398,12 +398,12 @@ type
   end;
 
 // MMLU answer-letter scoring harness. For every question the four answer-letter
-// tokens (LetterTokens[0..3], typically the ids of " A".." D") are each scored
-// as a single-token completion of PromptTokens via ScoreCompletion; the highest
-// log-probability letter is the prediction. NumSubjects sizes the per-subject
-// table (questions with SubjectIndex outside 0..NumSubjects-1 are skipped).
-// LastWindow forwards to ScoreCompletion (over-context prompts score over the
-// trailing window instead of raising). Reports per-subject accuracy plus the
+// tokens (LetterTokens[0..3], typically the ids of " A".." D") are scored as
+// single-token completions of PromptTokens by ONE forward of the prompt; the
+// highest log-probability letter is the prediction. NumSubjects sizes the
+// per-subject table (questions with SubjectIndex outside 0..NumSubjects-1 are
+// skipped). LastWindow scores over-context prompts over the trailing window
+// instead of raising. Reports per-subject accuracy plus the
 // macro (mean-over-subjects) and micro (pooled) averages.
 function EvaluateMMLU(NN: TNNet;
   const Questions: array of TNNetMMLUQuestion;
@@ -662,16 +662,17 @@ procedure ScorePerPositionWindow(NN: TNNet; InV: TNNetVolume; Last: TNNetLayer;
   VocabSize: integer; ExcludeSpecial: boolean; var SumNLL: TNeuralFloat;
   var Stats: TNNetPerplexityStats);
 var
-  Pos, D, Tgt, VocabSizeM1, RowBase: integer;
+  Pos, Tgt, RowBase: integer;
   RowSum, Prob: TNeuralFloat;
   LO: TNNetVolume;
 begin
-  InV.Fill(0);
-  if InDepth = 1
-  then InV.CopyNoChecksIntArr(WindowToks)   // token ids -> embedding
-  else InV.OneHotEncoding(WindowToks);       // one-hot, left-aligned
+  if InDepth = 1 then
+  begin
+    InV.Fill(0);
+    InV.CopyNoChecksIntArr(WindowToks);      // token ids -> embedding
+  end
+  else InV.OneHotEncoding(WindowToks);       // one-hot, left-aligned (self-fills)
   NN.Compute(InV);
-  VocabSizeM1 := VocabSize - 1;
   LO := Last.Output;
   for Pos := FirstTgt to LastTgt do
   begin
@@ -684,9 +685,7 @@ begin
     // Output row Pos-1 predicts token Pos. Defensive re-normalisation keeps
     // the math honest even for near-softmax heads.
     RowBase := LO.GetRawPos(Pos - 1, 0);
-    RowSum := 0;
-    for D := 0 to VocabSizeM1 do
-      RowSum := RowSum + LO.FData[RowBase + D];
+    RowSum := TNNetVolume.Sum(TNeuralFloatArrPtr(@LO.FData[RowBase]), VocabSize);
     if RowSum <= 0 then RowSum := 1.0;
     Prob := LO.FData[RowBase + Tgt] / RowSum;
     SumNLL := SumNLL - SafeLogProb(Prob);
@@ -840,7 +839,7 @@ var
   ContextLen, InDepth, VocabSize: integer;
   PerPosition: boolean;
   LineIdx, StreamLen, WinStart, WinLen, FirstTgt, LastTgt: integer;
-  CorpusCount, CorpusCountM1: integer;
+  CorpusCount, CorpusCountM1, StreamCap, TokCount: integer;
   PrevEndAbs: integer; // last ABSOLUTE stream position already scored
   SumNLL: TNeuralFloat;
 begin
@@ -863,16 +862,27 @@ begin
   // Concatenate the whole corpus into one token stream (the HF recipe scores
   // the corpus as a single sequence, not per line).
   StreamLen := 0;
+  StreamCap := 0;
   CorpusCount := Corpus.Count;
   CorpusCountM1 := CorpusCount - 1;
   for LineIdx := 0 to CorpusCountM1 do
   begin
     Dict.Tokenize(Corpus[LineIdx], Toks);
-    if Length(Toks) = 0 then continue;
-    SetLength(Stream, StreamLen + Length(Toks));
-    Move(Toks[0], Stream[StreamLen], Length(Toks) * csIntegerSize);
-    StreamLen := StreamLen + Length(Toks);
+    TokCount := Length(Toks);
+    if TokCount = 0 then continue;
+    if StreamLen + TokCount > StreamCap then
+    begin
+      // Geometric growth: a corpus of L lines otherwise reallocates and copies
+      // the whole stream once per line (#23).
+      StreamCap := StreamCap * 2;
+      if StreamCap < StreamLen + TokCount then
+        StreamCap := StreamLen + TokCount;
+      SetLength(Stream, StreamCap);
+    end;
+    Move(Toks[0], Stream[StreamLen], TokCount * csIntegerSize);
+    StreamLen := StreamLen + TokCount;
   end;
+  SetLength(Stream, StreamLen);
   if StreamLen < 2 then Exit;
   SumNLL := 0;
   // PrevEndAbs tracks the last stream position already scored. The first
@@ -915,27 +925,32 @@ end;
 // Token-level logprob scoring + multiple-choice harness
 // ---------------------------------------------------------------------------
 
-// Internal worker behind ScoreSequence / ScoreCompletionsBatch. Fills Result
-// for scored positions in [max(1,FirstScored) .. High(Tokens)] and leaves all
-// earlier entries at 0. FirstScored lets the shared-prefix batch path skip the
-// (unused) context positions for single next-token heads, scoring ONLY the
+// Internal worker behind ScoreSequence / ScoreCompletionsBatch / LAMBADA. Fills
+// Result for scored positions in [max(1,FirstScored) .. High(Tokens)] and leaves
+// all earlier entries at 0. FirstScored lets the shared-prefix batch path skip
+// the (unused) context positions for single next-token heads, scoring ONLY the
 // completion tokens while producing identical per-token log-probs. LastWindow
 // switches over-context sequences from raising to trailing-window scoring.
-function ScoreSequenceFrom(NN: TNNet;
+// WantArgmax additionally fills Preds[Pos] with the model's argmax next token at
+// every scored position, read off the SAME forward as the log-probability (-1
+// where nothing was scored), so a greedy harness needs no second forward.
+function ScoreSequenceArgmaxFrom(NN: TNNet;
   const Tokens: TNeuralIntegerArray; FirstScored: integer;
-  LastWindow: boolean): TNeuralFloatDynArr;
+  LastWindow, WantArgmax: boolean;
+  var Preds: TNeuralIntegerArray): TNeuralFloatDynArr;
 var
   InV: TNNetVolume;
   Last: TNNetLayer;
   Prefix: TNeuralIntegerArray;
   ContextLen, InDepth, VocabSize: integer;
-  PerPosition, Overflows: boolean;
-  SampleLen, Pos, D, Tgt, FirstPos, WinStart, WinLen, Row: integer;
-  SampleLenM1, VocabSizeM1, RowBase: integer;
+  PerPosition, Overflows, TgtInVocab: boolean;
+  SampleLen, Pos, Tgt, FirstPos, WinStart, WinLen, Row, Best: integer;
+  SampleLenM1, RowBase: integer;
   RowSum, Prob: TNeuralFloat;
   LO: TNNetVolume;
 begin
   SetLength(Result, 0);
+  SetLength(Preds, 0);
   if NN = nil then Exit;
   if NN.CountLayers() < 2 then Exit;
   SampleLen := Length(Tokens);
@@ -960,10 +975,15 @@ begin
     raise EArgumentException.CreateFmt(
       'ScoreSequence: sequence length %d exceeds the model context window %d',
       [SampleLen, ContextLen]);
+  // Result was released above, so SetLength allocates it fresh and FPC zeroes
+  // the new elements: unscored positions are already 0.
   SetLength(Result, SampleLen);
   SampleLenM1 := SampleLen - 1;
-  VocabSizeM1 := VocabSize - 1;
-  for Pos := 0 to SampleLenM1 do Result[Pos] := 0;
+  if WantArgmax then
+  begin
+    SetLength(Preds, SampleLen);
+    for Pos := 0 to SampleLenM1 do Preds[Pos] := -1;
+  end;
   if SampleLen < 2 then Exit;
   FirstPos := FirstScored;
   if FirstPos < 1 then FirstPos := 1;
@@ -972,26 +992,32 @@ begin
     if PerPosition and (not Overflows) then
     begin
       // ONE teacher-forced forward scores every position at once.
-      InV.Fill(0);
-      if InDepth = 1
-      then InV.CopyNoChecksIntArr(Tokens)       // token ids -> embedding
-      else InV.OneHotEncoding(Tokens);          // one-hot, left-aligned
+      if InDepth = 1 then
+      begin
+        InV.Fill(0);
+        InV.CopyNoChecksIntArr(Tokens);         // token ids -> embedding
+      end
+      else InV.OneHotEncoding(Tokens);          // one-hot, left-aligned (self-fills)
       NN.Compute(InV);
       LO := Last.Output;
       for Pos := FirstPos to SampleLenM1 do
       begin
         Tgt := Tokens[Pos];
+        // Output row Pos-1 predicts token Pos (the causal shift). Defensive
+        // re-normalisation, exactly like Perplexity.
+        RowBase := LO.GetRawPos(Pos - 1, 0);
+        if WantArgmax then
+        begin
+          TNNetVolume.MaxPos(TNeuralFloatArrPtr(@LO.FData[RowBase]),
+            VocabSize, Best);
+          Preds[Pos] := Best;
+        end;
         if (Tgt < 0) or (Tgt >= VocabSize) then
         begin
           Result[Pos] := SafeLogProb(0); // out-of-vocab: clamped, not skipped
           continue;
         end;
-        // Output row Pos-1 predicts token Pos (the causal shift). Defensive
-        // re-normalisation, exactly like Perplexity.
-        RowBase := LO.GetRawPos(Pos - 1, 0);
-        RowSum := 0;
-        for D := 0 to VocabSizeM1 do
-          RowSum := RowSum + LO.FData[RowBase + D];
+        RowSum := TNNetVolume.Sum(TNeuralFloatArrPtr(@LO.FData[RowBase]), VocabSize);
         if RowSum <= 0 then RowSum := 1.0;
         Prob := LO.FData[RowBase + Tgt] / RowSum;
         Result[Pos] := SafeLogProb(Prob);
@@ -1004,7 +1030,8 @@ begin
       for Pos := FirstPos to SampleLenM1 do
       begin
         Tgt := Tokens[Pos];
-        if (Tgt < 0) or (Tgt >= VocabSize) then
+        TgtInVocab := (Tgt >= 0) and (Tgt < VocabSize);
+        if not (TgtInVocab or WantArgmax) then
         begin
           Result[Pos] := SafeLogProb(0);
           continue;
@@ -1013,17 +1040,28 @@ begin
         if WinStart < 0 then WinStart := 0;
         WinLen := Pos - WinStart + 1;           // tokens [WinStart..Pos]
         Prefix := Copy(Tokens, WinStart, WinLen);
-        InV.Fill(0);
-        if InDepth = 1
-        then InV.CopyNoChecksIntArr(Prefix)
+        if InDepth = 1 then
+        begin
+          InV.Fill(0);
+          InV.CopyNoChecksIntArr(Prefix);
+        end
         else InV.OneHotEncoding(Prefix);
         NN.Compute(InV);
         LO := Last.Output;
         Row := WinLen - 2;                       // row predicting the last token
         RowBase := LO.GetRawPos(Row, 0);
-        RowSum := 0;
-        for D := 0 to VocabSizeM1 do
-          RowSum := RowSum + LO.FData[RowBase + D];
+        if WantArgmax then
+        begin
+          TNNetVolume.MaxPos(TNeuralFloatArrPtr(@LO.FData[RowBase]),
+            VocabSize, Best);
+          Preds[Pos] := Best;
+        end;
+        if not TgtInVocab then
+        begin
+          Result[Pos] := SafeLogProb(0);
+          continue;
+        end;
+        RowSum := TNNetVolume.Sum(TNeuralFloatArrPtr(@LO.FData[RowBase]), VocabSize);
         if RowSum <= 0 then RowSum := 1.0;
         Prob := LO.FData[RowBase + Tgt] / RowSum;
         Result[Pos] := SafeLogProb(Prob);
@@ -1036,7 +1074,8 @@ begin
       for Pos := FirstPos to SampleLenM1 do
       begin
         Tgt := Tokens[Pos];
-        if (Tgt < 0) or (Tgt >= VocabSize) then
+        TgtInVocab := (Tgt >= 0) and (Tgt < VocabSize);
+        if not (TgtInVocab or WantArgmax) then
         begin
           Result[Pos] := SafeLogProb(0);
           continue;
@@ -1052,9 +1091,20 @@ begin
         end
         else InV.OneHotEncodingReversed(Prefix);
         NN.Compute(InV);
-        RowSum := Last.Output.GetSum();
+        LO := Last.Output;
+        if WantArgmax then
+        begin
+          TNNetVolume.MaxPos(TNeuralFloatArrPtr(@LO.FData[0]), VocabSize, Best);
+          Preds[Pos] := Best;
+        end;
+        if not TgtInVocab then
+        begin
+          Result[Pos] := SafeLogProb(0);
+          continue;
+        end;
+        RowSum := LO.GetSum();
         if RowSum <= 0 then RowSum := 1.0;
-        Prob := Last.Output.FData[Tgt] / RowSum;
+        Prob := LO.FData[Tgt] / RowSum;
         Result[Pos] := SafeLogProb(Prob);
       end;
     end;
@@ -1062,6 +1112,16 @@ begin
     InV.Free;
   end;
   SetLength(Prefix, 0);
+end;
+
+function ScoreSequenceFrom(NN: TNNet;
+  const Tokens: TNeuralIntegerArray; FirstScored: integer;
+  LastWindow: boolean): TNeuralFloatDynArr;
+var
+  Preds: TNeuralIntegerArray;
+begin
+  Result := ScoreSequenceArgmaxFrom(NN, Tokens, FirstScored, LastWindow,
+    false, Preds);
 end;
 
 function ScoreSequence(NN: TNNet;
@@ -1081,7 +1141,7 @@ function ScoreCompletionCore(NN: TNNet;
 var
   Full: TNeuralIntegerArray;
   LogProbs: TNeuralFloatDynArr;
-  CtxLen, CompLen, I, CtxLenM1, CompLenM1, FullLastIdx: integer;
+  CtxLen, CompLen, I, FullLastIdx: integer;
 begin
   Result.SumLogProb := 0;
   Result.MeanLogProb := 0;
@@ -1094,10 +1154,8 @@ begin
       'completion token is scored from the last context position)');
   if CompLen = 0 then Exit;
   SetLength(Full, CtxLen + CompLen);
-  CtxLenM1 := CtxLen - 1;
-  CompLenM1 := CompLen - 1;
-  for I := 0 to CtxLenM1 do Full[I] := ContextTokens[I];
-  for I := 0 to CompLenM1 do Full[CtxLen + I] := CompletionTokens[I];
+  Move(ContextTokens[0], Full[0], CtxLen * csIntegerSize);
+  Move(CompletionTokens[0], Full[CtxLen], CompLen * csIntegerSize);
   // Only the completion positions (CtxLen ..) are summed below, so scoring can
   // start there - the shared context forwards are skipped for single-head nets.
   LogProbs := ScoreSequenceFrom(NN, Full, CtxLen, LastWindow);
@@ -1190,6 +1248,113 @@ end;
 // MMLU few-shot accuracy harness
 // ---------------------------------------------------------------------------
 
+// Log-probability of each single-token candidate at the position that follows
+// ContextTokens, from ONE forward. Branch selection, windowing and the
+// re-normalised SafeLogProb math mirror ScoreSequenceFrom for a sequence of
+// length Length(ContextTokens)+1 scored at its last position.
+function ScoreSingleTokenCandidates(NN: TNNet;
+  const ContextTokens: TNeuralIntegerArray;
+  const CandidateTokens: array of integer;
+  LastWindow: boolean): TNeuralFloatDynArr;
+var
+  InV: TNNetVolume;
+  Last, FirstLayer: TNNetLayer;
+  Prefix: TNeuralIntegerArray;
+  ContextLen, InDepth, VocabSize, CtxLen, SampleLen: integer;
+  Cand, CandHi, Tgt, WinStart, WinLen, Row, RowBase: integer;
+  PerPosition, Overflows: boolean;
+  RowSum: TNeuralFloat;
+  LO: TNNetVolume;
+begin
+  CandHi := High(CandidateTokens);
+  SetLength(Result, CandHi + 1);
+  for Cand := 0 to CandHi do Result[Cand] := 0;
+  if NN = nil then Exit;
+  if NN.CountLayers() < 2 then Exit;
+  if CandHi < 0 then Exit;
+  CtxLen := Length(ContextTokens);
+  if CtxLen < 1 then
+    raise EArgumentException.Create(
+      'ScoreSingleTokenCandidates: ContextTokens must be non-empty (the ' +
+      'candidate token is scored from the last context position)');
+  SampleLen := CtxLen + 1;                  // context + the candidate token
+  FirstLayer := NN.GetFirstLayer();
+  ContextLen := FirstLayer.Output.SizeX;
+  InDepth := FirstLayer.Output.Depth;
+  Last := NN.GetLastLayer();
+  // Same head-shape auto-detection as ScoreSequenceFrom (see unit header).
+  PerPosition := (ContextLen > 1) and (Last.Output.SizeX = ContextLen) and
+    (Last.Output.Depth >= 2);
+  if PerPosition
+  then VocabSize := Last.Output.Depth
+  else VocabSize := Last.Output.Size;
+  if VocabSize < 2 then Exit;
+  Overflows := (PerPosition and (SampleLen > ContextLen)) or
+               ((not PerPosition) and (SampleLen - 1 > ContextLen));
+  if Overflows and (not LastWindow) then
+    raise EArgumentException.CreateFmt(
+      'ScoreSequence: sequence length %d exceeds the model context window %d',
+      [SampleLen, ContextLen]);
+  InV := TNNetVolume.Create(FirstLayer.Output);
+  try
+    if PerPosition then
+    begin
+      // The window holds context tokens only; the row predicting the candidate
+      // position is its last row. A causal head makes that row independent of
+      // the candidate token itself, which is what lets every candidate share
+      // this one forward (the same causal shift the whole unit scores by).
+      WinStart := 0;
+      if Overflows then
+      begin
+        WinStart := CtxLen - ContextLen + 1;
+        if WinStart < 0 then WinStart := 0;
+      end;
+      WinLen := CtxLen - WinStart;
+      Prefix := Copy(ContextTokens, WinStart, WinLen);
+      if InDepth = 1 then
+      begin
+        InV.Fill(0);
+        InV.CopyNoChecksIntArr(Prefix);
+      end
+      else InV.OneHotEncoding(Prefix);
+      NN.Compute(InV);
+      LO := Last.Output;
+      Row := WinLen - 1;
+      RowBase := LO.GetRawPos(Row, 0);
+      RowSum := TNNetVolume.Sum(TNeuralFloatArrPtr(@LO.FData[RowBase]), VocabSize);
+    end
+    else
+    begin
+      // Single next-token head: the reversed right-aligned prefix is the
+      // context alone, so every candidate reads the same output row exactly.
+      WinStart := 0;
+      if LastWindow and (CtxLen > ContextLen) then WinStart := CtxLen - ContextLen;
+      Prefix := Copy(ContextTokens, WinStart, CtxLen - WinStart);
+      if InDepth = 1 then
+      begin
+        InV.Fill(0);
+        InV.CopyReversedNoChecksIntArr(Prefix);
+      end
+      else InV.OneHotEncodingReversed(Prefix);
+      NN.Compute(InV);
+      LO := Last.Output;
+      RowBase := 0;
+      RowSum := LO.GetSum();
+    end;
+    if RowSum <= 0 then RowSum := 1.0;
+    for Cand := 0 to CandHi do
+    begin
+      Tgt := CandidateTokens[Cand];
+      if (Tgt < 0) or (Tgt >= VocabSize)
+      then Result[Cand] := SafeLogProb(0)   // out-of-vocab: clamped, not skipped
+      else Result[Cand] := SafeLogProb(LO.FData[RowBase + Tgt] / RowSum);
+    end;
+  finally
+    InV.Free;
+  end;
+  SetLength(Prefix, 0);
+end;
+
 function EvaluateMMLU(NN: TNNet;
   const Questions: array of TNNetMMLUQuestion;
   const LetterTokens: array of integer;
@@ -1198,8 +1363,7 @@ function EvaluateMMLU(NN: TNNet;
 var
   QIdx, L, NumLetters, Best, Subj, NonEmpty: integer;
   NumSubjectsM1, QuestionsHi, NumLettersM1: integer;
-  Letter: TNeuralIntegerArray;
-  Score: TNNetCompletionScore;
+  LetterLogProbs: TNeuralFloatDynArr;
   BestLP, MacroSum: TNeuralFloat;
 begin
   Result.MacroAccuracy := 0;
@@ -1220,7 +1384,6 @@ begin
   NumLetters := Length(LetterTokens);
   if NumLetters = 0 then Exit;
   NumLettersM1 := NumLetters - 1;
-  SetLength(Letter, 1); // each candidate is the SINGLE answer-letter token
 
   QuestionsHi := High(Questions);
   for QIdx := 0 to QuestionsHi do
@@ -1228,21 +1391,19 @@ begin
     Subj := Questions[QIdx].SubjectIndex;
     if (Subj < 0) or (Subj >= NumSubjects) then continue;
     if Length(Questions[QIdx].PromptTokens) = 0 then continue;
-    // Score every answer-letter token as a single-token completion; the
-    // highest single-token log-prob letter is the prediction (first-max).
+    // All answer letters are single-token completions of the SAME prompt, so
+    // one forward scores them all; the highest log-prob letter is the
+    // prediction (first-max).
+    LetterLogProbs := ScoreSingleTokenCandidates(NN,
+      Questions[QIdx].PromptTokens, LetterTokens, LastWindow);
     Best := 0;
-    BestLP := 0;
-    for L := 0 to NumLettersM1 do
-    begin
-      Letter[0] := LetterTokens[L];
-      Score := ScoreCompletionCore(NN, Questions[QIdx].PromptTokens,
-        Letter, LastWindow);
-      if (L = 0) or (Score.SumLogProb > BestLP) then
+    BestLP := LetterLogProbs[0];
+    for L := 1 to NumLettersM1 do
+      if LetterLogProbs[L] > BestLP then
       begin
-        BestLP := Score.SumLogProb;
+        BestLP := LetterLogProbs[L];
         Best := L;
       end;
-    end;
     Inc(Result.ItemCount);
     Inc(Result.PerSubject[Subj].Total);
     if Best = Questions[QIdx].GoldLetter then
@@ -1356,114 +1517,13 @@ end;
 // LAMBADA last-word accuracy
 // ---------------------------------------------------------------------------
 
-// Internal: model's argmax next-token prediction for position Pos of Tokens
-// (conditioned on Tokens[0..Pos-1]). Mirrors the forward in ScoreSequenceFrom
-// EXACTLY - including the reversed-prefix encoding for single next-token heads -
-// so the greedy LAMBADA prediction matches the scorer's conditioning. Returns
-// -1 on a degenerate model / out-of-range Pos.
-function PredictArgmaxAt(NN: TNNet;
-  const Tokens: TNeuralIntegerArray; Pos: integer;
-  LastWindow: boolean): integer;
-var
-  InV: TNNetVolume;
-  Last: TNNetLayer;
-  Prefix: TNeuralIntegerArray;
-  ContextLen, InDepth, VocabSize, WinStart, WinLen, Row, D, Best: integer;
-  VocabSizeM1, RowBase: integer;
-  PerPosition, Overflows: boolean;
-  BestVal, V: TNeuralFloat;
-  LO: TNNetVolume;
-begin
-  Result := -1;
-  if NN = nil then Exit;
-  if NN.CountLayers() < 2 then Exit;
-  if (Pos < 1) or (Pos > High(Tokens)) then Exit;
-  ContextLen := NN.GetFirstLayer().Output.SizeX;
-  InDepth := NN.GetFirstLayer().Output.Depth;
-  Last := NN.GetLastLayer();
-  PerPosition := (ContextLen > 1) and (Last.Output.SizeX = ContextLen) and
-    (Last.Output.Depth >= 2);
-  if PerPosition
-  then VocabSize := Last.Output.Depth
-  else VocabSize := Last.Output.Size;
-  if VocabSize < 2 then Exit;
-  VocabSizeM1 := VocabSize - 1;
-  InV := TNNetVolume.Create(NN.GetFirstLayer().Output);
-  try
-    if PerPosition then
-    begin
-      // Window of context tokens [WinStart..Pos-1]; the row predicting Pos is
-      // the last row of that window (length-1). Over-context: trailing window.
-      WinStart := 0;
-      if Pos > ContextLen then
-      begin
-        if not LastWindow then
-          raise EArgumentException.CreateFmt(
-            'EvaluateLAMBADA: position %d exceeds the model context window %d',
-            [Pos, ContextLen]);
-        WinStart := Pos - ContextLen;
-      end;
-      WinLen := Pos - WinStart;                 // tokens [WinStart..Pos-1]
-      Prefix := Copy(Tokens, WinStart, WinLen);
-      InV.Fill(0);
-      if InDepth = 1
-      then InV.CopyNoChecksIntArr(Prefix)
-      else InV.OneHotEncoding(Prefix);
-      NN.Compute(InV);
-      Row := WinLen - 1;                         // row predicting token at Pos
-      LO := Last.Output;
-      RowBase := LO.GetRawPos(Row, 0);
-      Best := 0;
-      BestVal := LO.FData[RowBase];
-      for D := 1 to VocabSizeM1 do
-      begin
-        V := LO.FData[RowBase + D];
-        if V > BestVal then begin BestVal := V; Best := D; end;
-      end;
-      Result := Best;
-    end
-    else
-    begin
-      // Single next-token head: reversed right-aligned prefix [WinStart..Pos-1].
-      WinStart := 0;
-      if Pos > ContextLen then
-      begin
-        if not LastWindow then
-          raise EArgumentException.CreateFmt(
-            'EvaluateLAMBADA: position %d exceeds the model context window %d',
-            [Pos, ContextLen]);
-        WinStart := Pos - ContextLen;
-      end;
-      Prefix := Copy(Tokens, WinStart, Pos - WinStart);
-      if InDepth = 1 then
-      begin
-        InV.Fill(0);
-        InV.CopyReversedNoChecksIntArr(Prefix);
-      end
-      else InV.OneHotEncodingReversed(Prefix);
-      NN.Compute(InV);
-      Best := 0;
-      BestVal := Last.Output.FData[0];
-      for D := 1 to VocabSizeM1 do
-      begin
-        V := Last.Output.FData[D];
-        if V > BestVal then begin BestVal := V; Best := D; end;
-      end;
-      Result := Best;
-    end;
-  finally
-    InV.Free;
-  end;
-  SetLength(Prefix, 0);
-end;
-
 function EvaluateLAMBADA(NN: TNNet;
   const Examples: array of TNNetLambadaExample;
   LastWindow: boolean): TNNetLambadaStats;
 var
-  ExIdx, CtxLen, WordLen, I, Pos, Pred: integer;
-  ExamplesHi, CtxLenM1, WordLenM1, FullLastIdx: integer;
-  Full: TNeuralIntegerArray;
+  ExIdx, CtxLen, WordLen, I, FullLen: integer;
+  ExamplesHi, FullLastIdx: integer;
+  Full, Preds: TNeuralIntegerArray;
   LogProbs: TNeuralFloatDynArr;
   AllCorrect: boolean;
   SumNLL: TNeuralFloat;
@@ -1482,30 +1542,28 @@ begin
     CtxLen := Length(Examples[ExIdx].ContextTokens);
     WordLen := Length(Examples[ExIdx].FinalWordTokens);
     if (CtxLen < 1) or (WordLen < 1) then continue;
-    CtxLenM1 := CtxLen - 1;
-    WordLenM1 := WordLen - 1;
+    FullLen := CtxLen + WordLen;
     // Build the full passage (context + gold final word). Greedy prediction is
     // teacher-forced on the gold tokens: position CtxLen+i predicts the i-th
     // final-word token from Full[0..CtxLen+i-1].
-    SetLength(Full, CtxLen + WordLen);
-    for I := 0 to CtxLenM1 do Full[I] := Examples[ExIdx].ContextTokens[I];
-    for I := 0 to WordLenM1 do
-      Full[CtxLen + I] := Examples[ExIdx].FinalWordTokens[I];
-    AllCorrect := true;
-    for I := 0 to WordLenM1 do
-    begin
-      Pos := CtxLen + I;
-      Pred := PredictArgmaxAt(NN, Full, Pos, LastWindow);
-      if Pred <> Full[Pos] then
-      begin
-        AllCorrect := false;
-        break; // word is already wrong; remaining argmaxes don't matter
-      end;
-    end;
-    // Teacher-forced final-word NLL for the co-reported perplexity.
-    LogProbs := ScoreSequenceFrom(NN, Full, CtxLen, LastWindow);
-    FullLastIdx := CtxLen + WordLen - 1;
-    if Length(LogProbs) = CtxLen + WordLen then
+    SetLength(Full, FullLen);
+    Move(Examples[ExIdx].ContextTokens[0], Full[0], CtxLen * csIntegerSize);
+    Move(Examples[ExIdx].FinalWordTokens[0], Full[CtxLen],
+      WordLen * csIntegerSize);
+    // ONE scoring pass yields both the greedy argmax and the teacher-forced NLL
+    // of every final-word position - they read the same forward's output rows.
+    LogProbs := ScoreSequenceArgmaxFrom(NN, Full, CtxLen, LastWindow, true,
+      Preds);
+    FullLastIdx := FullLen - 1;
+    AllCorrect := Length(Preds) = FullLen;   // degenerate model: never correct
+    if AllCorrect then
+      for I := CtxLen to FullLastIdx do
+        if Preds[I] <> Full[I] then
+        begin
+          AllCorrect := false;
+          break; // word is already wrong; remaining argmaxes don't matter
+        end;
+    if Length(LogProbs) = FullLen then
       for I := CtxLen to FullLastIdx do
       begin
         SumNLL := SumNLL - LogProbs[I];
@@ -1550,20 +1608,43 @@ end;
 // Builds a sorted "ngram-key -> count" map for all N-grams of Tokens. Keys
 // are the ids joined with commas; counts live in Objects[] as PtrInt.
 function CountNGrams(const Tokens: TNeuralIntegerArray; N: integer): TStringList;
+const
+  cMaxIntChars = 11; // '-2147483648'
 var
-  Start, Idx, KeyPos, LastStart, NM1: integer;
-  Key: string;
+  Start, Idx, KeyPos, LastStart, NM1, PieceLen: integer;
+  Key, KeyBuf, Piece: string;
 begin
   Result := TStringList.Create();
   Result.Sorted := true;
   Result.CaseSensitive := true;
   LastStart := Length(Tokens) - N;
   NM1 := N - 1;
+  SetLength(KeyBuf, N * (cMaxIntChars + 1));
   for Start := 0 to LastStart do
   begin
-    Key := IntToStr(Tokens[Start]);
-    for Idx := 1 to NM1 do
-      Key := Key + ',' + IntToStr(Tokens[Start + Idx]);
+    if NM1 = 0 then Key := IntToStr(Tokens[Start])
+    else
+    begin
+      // Join the ids through one reused buffer and a write index (#23): each
+      // id is at most 11 characters plus its separator, so KeyBuf is sized
+      // once for the whole order and the key costs a single allocation
+      // instead of one per id.
+      KeyPos := 0;
+      for Idx := 0 to NM1 do
+      begin
+        if Idx > 0 then
+        begin
+          Inc(KeyPos);
+          KeyBuf[KeyPos] := ',';
+        end;
+        Piece := IntToStr(Tokens[Start + Idx]);
+        PieceLen := Length(Piece);
+        Move(Piece[1], KeyBuf[KeyPos + 1], PieceLen);
+        Inc(KeyPos, PieceLen);
+      end;
+      SetLength(Key, KeyPos);
+      Move(KeyBuf[1], Key[1], KeyPos);
+    end;
     if Result.Find(Key, KeyPos)
     then Result.Objects[KeyPos] := TObject(PtrInt(Result.Objects[KeyPos]) + 1)
     else Result.AddObject(Key, TObject(PtrInt(1)));
@@ -1591,27 +1672,35 @@ end;
 procedure TokenizeWithVocab(const Text: string; Vocab: TStringList;
   var Ids: TNeuralIntegerArray);
 var
-  CharIdx, WordPos, IdCount, TextLen: integer;
+  CharIdx, WordPos, IdCount, TextLen, WordStart: integer;
   CurWord: string;
-  procedure PushWord();
+  // Emits Text[WordStart..CharIdx-1] as one id. The word is cut out with a
+  // single Copy at the boundary instead of being grown one character at a
+  // time (#23), and Ids is presized to the most words the text can hold
+  // (alternating word/separator) and truncated once at the end.
+  procedure PushWord(EndIdx: integer);
   begin
-    if CurWord = '' then Exit;
+    if EndIdx < WordStart then Exit;
+    CurWord := Copy(Text, WordStart, EndIdx - WordStart + 1);
     if not Vocab.Find(CurWord, WordPos) then
       // New word: its id is the number of distinct words seen so far.
       WordPos := Vocab.AddObject(CurWord, TObject(PtrInt(Vocab.Count)));
-    IdCount := Length(Ids);
-    SetLength(Ids, IdCount + 1);
     Ids[IdCount] := PtrInt(Vocab.Objects[WordPos]);
-    CurWord := '';
+    Inc(IdCount);
   end;
 begin
-  SetLength(Ids, 0);
-  CurWord := '';
   TextLen := Length(Text);
+  SetLength(Ids, TextLen div 2 + 1);
+  IdCount := 0;
+  WordStart := 1;
   for CharIdx := 1 to TextLen do
-    if Text[CharIdx] <= ' ' then PushWord()
-    else CurWord := CurWord + Text[CharIdx];
-  PushWord();
+    if Text[CharIdx] <= ' ' then
+    begin
+      PushWord(CharIdx - 1);
+      WordStart := CharIdx + 1;
+    end;
+  PushWord(TextLen);
+  SetLength(Ids, IdCount);
 end;
 
 // ---------------------------------------------------------------------------
@@ -1922,13 +2011,22 @@ var
 
   // Strip whitespace (sacrebleu default) or keep it, per IncludeWhitespace.
   function Prep(const Src: string): string;
-  var I, SrcLen: integer;
+  var I, SrcLen, OutPos: integer;
   begin
     if IncludeWhitespace then Exit(Src);
-    Result := '';
     SrcLen := Length(Src);
+    // Presize to the whole source (nothing is ever added), write through an
+    // index and truncate once, instead of reallocating per kept character
+    // (#23).
+    SetLength(Result, SrcLen);
+    OutPos := 0;
     for I := 1 to SrcLen do
-      if Src[I] > ' ' then Result := Result + Src[I];
+      if Src[I] > ' ' then
+      begin
+        Inc(OutPos);
+        Result[OutPos] := Src[I];
+      end;
+    SetLength(Result, OutPos);
   end;
 
 begin
@@ -2079,37 +2177,101 @@ begin
   Result := RepetitionRate(Text, 1);
 end;
 
+// BLEU of ONE candidate/reference pair from the per-order clipped overlaps
+// (Matches[Order], slot 0 unused) of maps built beforehand. Clipping,
+// smoothing, the excluded-order rule and the brevity penalty are the
+// single-pair case of CorpusBLEU evaluated in the same order on the same
+// integers, so the result is bit-identical to it.
+function PairBLEUFromMatches(const Matches: TNeuralIntegerArray;
+  CandLen, RefLen, MaxN: integer; Smooth: boolean): TNeuralFloat;
+var
+  Order, UsedOrders: integer;
+  Totals: int64;
+  Precision, SumLogP, BrevityPenalty: TNeuralFloat;
+begin
+  Result := 0;
+  if (CandLen = 0) or (MaxN < 1) then Exit;
+  SumLogP := 0;
+  UsedOrders := 0;
+  for Order := 1 to MaxN do
+  begin
+    // A candidate shorter than the order contributes no n-grams at all, so the
+    // order is not measurable and is excluded from the geometric mean.
+    if CandLen < Order then continue;
+    Totals := CandLen - Order + 1;
+    if Smooth and (Order >= 2) then
+      // Lin & Och (2004) smoothing-1: add-1 to numerator and denominator
+      // for every order above unigrams.
+      Precision := (Matches[Order] + 1) / (Totals + 1)
+    else
+      Precision := Matches[Order] / Totals;
+    if Precision <= 0 then Exit; // unsmoothed zero precision -> BLEU = 0
+    SumLogP := SumLogP + Ln(Precision);
+    Inc(UsedOrders);
+  end;
+  if UsedOrders = 0 then Exit;
+  if CandLen >= RefLen
+  then BrevityPenalty := 1.0
+  else BrevityPenalty := Exp(1.0 - RefLen / CandLen);
+  Result := BrevityPenalty * Exp(SumLogP / UsedOrders);
+end;
+
 function SelfBLEU(const Generations: array of TNeuralIntegerArray;
   MaxN: integer = 4; Smooth: boolean = true): TNeuralFloat;
 var
-  I, J, NumOthers, GenerationsHi: integer;
-  PerCand, OtherBleu: TNeuralFloat;
-  Cand, Ref: array of TNeuralIntegerArray;
+  I, J, NumOthers, GenerationsHi, GenerationsHiM1, Order, GenCount: integer;
+  // Counts[Gen][Order] and the length of each generation. Every generation is
+  // both a candidate and a reference of every other one, so its n-gram maps
+  // are built ONCE here instead of once per ordered pair (#28): G*MaxN builds
+  // instead of 2*G*(G-1)*MaxN.
+  Counts: array of array of TStringList;
+  Lens, Matches: TNeuralIntegerArray;
+  PerCand: TNeuralFloatDynArr;
 begin
   Result := 0;
-  if Length(Generations) < 2 then Exit; // need at least one "other" reference
-  SetLength(Cand, 1);
-  SetLength(Ref, 1);
-  GenerationsHi := High(Generations);
-  for I := 0 to GenerationsHi do
-  begin
-    // Mean single-reference BLEU of generation I against every OTHER one
-    // (v1: CorpusBLEU is single-reference, so average instead of multi-ref
-    // clipping - documented in the unit header).
-    PerCand := 0;
-    NumOthers := 0;
-    Cand[0] := Generations[I];
-    for J := 0 to GenerationsHi do
+  GenCount := Length(Generations);
+  if GenCount < 2 then Exit; // need at least one "other" reference
+  if MaxN < 1 then Exit;
+  GenerationsHi := GenCount - 1;
+  GenerationsHiM1 := GenerationsHi - 1;
+  SetLength(Counts, GenCount, MaxN + 1);
+  SetLength(Lens, GenCount);
+  SetLength(Matches, MaxN + 1);
+  SetLength(PerCand, GenCount);
+  try
+    for I := 0 to GenerationsHi do
     begin
-      if J = I then continue;
-      Ref[0] := Generations[J];
-      OtherBleu := CorpusBLEU(Cand, Ref, MaxN, Smooth);
-      PerCand := PerCand + OtherBleu;
-      Inc(NumOthers);
+      Lens[I] := Length(Generations[I]);
+      PerCand[I] := 0;
+      for Order := 1 to MaxN do
+        Counts[I][Order] := CountNGrams(Generations[I], Order);
     end;
-    if NumOthers > 0 then Result := Result + PerCand / NumOthers;
+    // Mean single-reference BLEU of each generation against every OTHER one
+    // (v1: CorpusBLEU is single-reference, so average instead of multi-ref
+    // clipping - documented in the unit header). ClippedOverlap sums
+    // min(candidate count, reference count) over the shared n-gram types, so
+    // it is symmetric: one pass per UNORDERED pair feeds both directions,
+    // halving the n-gram matching. Each PerCand[I] still accumulates its
+    // others in increasing index order, as the ordered-pair loop did.
+    for I := 0 to GenerationsHiM1 do
+      for J := I + 1 to GenerationsHi do
+      begin
+        for Order := 1 to MaxN do
+          Matches[Order] := ClippedOverlap(Counts[I][Order], Counts[J][Order]);
+        PerCand[I] := PerCand[I] +
+          PairBLEUFromMatches(Matches, Lens[I], Lens[J], MaxN, Smooth);
+        PerCand[J] := PerCand[J] +
+          PairBLEUFromMatches(Matches, Lens[J], Lens[I], MaxN, Smooth);
+      end;
+    NumOthers := GenCount - 1;
+    for I := 0 to GenerationsHi do
+      Result := Result + PerCand[I] / NumOthers;
+  finally
+    for I := 0 to GenerationsHi do
+      for Order := 1 to MaxN do
+        Counts[I][Order].Free;
   end;
-  Result := Result / Length(Generations);
+  Result := Result / GenCount;
 end;
 
 function SelfBLEU(const Generations: array of string;
@@ -2169,7 +2331,8 @@ var
   begin
     if OpenStart >= 0 then
     begin
-      SetLength(Result, Count + 1);
+      // Presized to one span per tag in the caller and truncated once, so a
+      // fully entity-tagged sequence never reallocates per span (#23).
       Result[Count].EntityType := OpenType;
       Result[Count].TokenStart := OpenStart;
       Result[Count].TokenEnd := EndIdx;
@@ -2180,11 +2343,11 @@ var
   end;
 
 begin
-  SetLength(Result, 0);
   Count := 0;
   OpenStart := -1;
   OpenType := '';
   TagsHi := High(Tags);
+  SetLength(Result, Length(Tags));
   for I := 0 to TagsHi do
   begin
     SplitTag(Tags[I], Prefix, EntType);
@@ -2210,7 +2373,8 @@ begin
     else // 'O' or unknown -> outside
       CloseOpen(I - 1);
   end;
-  CloseOpen(High(Tags));
+  CloseOpen(TagsHi);
+  SetLength(Result, Count);
 end;
 
 function SpanInArray(const Span: TNNetEntitySpan;
@@ -2315,6 +2479,7 @@ function TopKIndices(const Logits: TNeuralFloatDynArr; TopK: integer): TNeuralIn
 var
   Order: TNeuralIntegerArray;
   I, J, Tmp, N, NM1, TopKM1: integer;
+  BestVal: TNeuralFloat;
 begin
   N := Length(Logits);
   SetLength(Order, N);
@@ -2329,11 +2494,17 @@ begin
   // loop by TopK-1 (partial sort, O(N*TopK) instead of O(N^2)). Bit-exact -
   // the discarded tail Order[TopK..NM1] is never read.
   for I := 0 to TopKM1 do
+  begin
+    // The running maximum is carried in a local, so the common (no-swap)
+    // iteration costs one indirect load instead of two (#5).
+    BestVal := Logits[Order[I]];
     for J := I + 1 to NM1 do
-      if Logits[Order[J]] > Logits[Order[I]] then
+      if Logits[Order[J]] > BestVal then
       begin
         Tmp := Order[I]; Order[I] := Order[J]; Order[J] := Tmp;
+        BestVal := Logits[Order[I]];
       end;
+  end;
   SetLength(Result, TopK);
   for I := 0 to TopKM1 do Result[I] := Order[I];
 end;
@@ -2347,6 +2518,7 @@ var
   StartIdxHi, EndIdxHi, CountM1, TmpM1: integer;
   Cand: TNNetQASpanArray;
   TmpSpan: TNNetQASpan;
+  BestScore: TNeuralFloat;
 begin
   SetLength(Result, 0);
   if Length(StartLogits) <> Length(EndLogits) then
@@ -2383,11 +2555,15 @@ begin
   TmpM1 := Tmp - 1;
   CountM1 := Count - 1;
   for A := 0 to TmpM1 do
+  begin
+    BestScore := Cand[A].Score;
     for B := A + 1 to CountM1 do
-      if Cand[B].Score > Cand[A].Score then
+      if Cand[B].Score > BestScore then
       begin
         TmpSpan := Cand[A]; Cand[A] := Cand[B]; Cand[B] := TmpSpan;
+        BestScore := Cand[A].Score;
       end;
+  end;
 
   SetLength(Result, Tmp);
   for A := 0 to TmpM1 do Result[A] := Cand[A];

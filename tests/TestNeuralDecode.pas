@@ -138,6 +138,7 @@ type
     // KV-cache (cache-forking) beam search must be bit-identical to the
     // re-encoding DecodeBeamSearchAll, full ranked beam, best-first.
     procedure TestBeamSearchCachedMatchesReEncodeBigram;
+    procedure TestBeamSearchCachedSiblingsShareParentCache;
     procedure TestBeamSearchCachedMatchesReEncodeCausalReference;
     procedure TestBeamSearchCachedRejectsWideSession;
     // Diverse beam search (Hamming-diversity groups).
@@ -149,8 +150,10 @@ type
     procedure TestConstrainedBeamForcesPhrasePresence;
     procedure TestConstrainedBeamForcesMultiplePhrases;
     procedure TestConstrainedBeamPhraseCharOutsideVocab;
+    procedure TestConstrainedBeamKeepsTokenAboveByteAlphabet;
     // Contrastive search (penalty_alpha) decoding.
     procedure TestContrastiveAlphaZeroMatchesGreedy;
+    procedure TestContrastiveSingleCandidateMatchesGreedy;
     procedure TestContrastiveAlphaChangesSelection;
     // Token-level / KV-cache contrastive search (TNNetStreamingDecoder).
     procedure TestContrastiveStreamedAlphaZeroMatchesStreamedGreedy;
@@ -265,6 +268,7 @@ type
     procedure TestGenerateTokensStreamedNilConstraintMatchesPlain;
     procedure TestGenerateTokensStreamedWhitelistOnlyEmitsAllowed;
     procedure TestForcedSequenceConstraintFollowsCandidate;
+    procedure TestForcedSequenceMaskMatchesUnguardedReference;
     // Token healing (guidance-style BPE boundary repair).
     procedure TestPrepareTokenHealingBuildsPrefixSetAndTrims;
     procedure TestTokenHealingChangesFirstTokenVsUnhealed;
@@ -275,6 +279,7 @@ type
     procedure TestJSONStateMachineNumbers;
     procedure TestJSONStateMachineTopLevelCompletionAllowsOnlyWS;
     procedure TestJSONStateMachineBalancedStackClosing;
+    procedure TestCharLevelConstraintsRejectSubwordVocab;
     procedure TestJSONConstraintValidatesMultiCharTokens;
     procedure TestJSONConstraintMaskMatchesUnguardedReference;
     procedure TestJSONStateMachineFuzzRandomWalksStayValid;
@@ -962,6 +967,35 @@ begin
   end;
 end;
 
+procedure TTestNeuralDecode.TestConstrainedBeamKeepsTokenAboveByteAlphabet;
+const
+  cVocab = 300;
+  cPeakTok = 296;   // Chr(296) wraps onto Chr(40), the forced phrase char.
+var
+  NN: TNNet;
+  Uncon, Con: TNNetDecodeResult;
+  Force: array of string;
+begin
+  // Vocabulary wider than the byte alphabet: the duplicate-with-injection check
+  // must not fold token 296 onto the needed char 40. The peak token satisfies
+  // the phrase on its own, so the constrained best beam must score exactly like
+  // the unconstrained one instead of falling back to a low-probability token.
+  RandSeed := 424242;
+  SetLength(Force, 1);
+  Force[0] := Chr(40);
+  NN := BuildPeakedLogitNet(8, cVocab, cPeakTok);
+  try
+    Uncon := DecodeBeamSearch(NN, 'ab', 6, 4, 0.0);
+    Con := DecodeConstrainedBeamSearch(NN, 'ab', 6, 4, Force, 0.0);
+    AssertTrue('constrained beam emits the forced char',
+      Pos(Force[0], Con.Text) > 0);
+    AssertEquals('the above-byte peak token stays a candidate',
+      Uncon.Score, Con.Score, 1e-6);
+  finally
+    NN.Free;
+  end;
+end;
+
 procedure TTestNeuralDecode.TestContrastiveAlphaZeroMatchesGreedy;
 var
   NN: TNNet;
@@ -980,6 +1014,37 @@ begin
     AssertEquals('alpha=0 contrastive text == greedy text', G.Text, C.Text);
     AssertEquals('alpha=0 contrastive finished == greedy',
       Ord(G.Finished), Ord(C.Finished));
+    // The per-step probability the score accumulates is the normalised row
+    // entry of the chosen token, exactly as greedy's is.
+    AssertEquals('alpha=0 contrastive sumlogprob == greedy',
+      G.SumLogProb, C.SumLogProb, 0.0);
+  finally
+    NN.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestContrastiveSingleCandidateMatchesGreedy;
+var
+  NN: TNNet;
+  G, C: TNNetDecodeResult;
+  NoStops: array of string;
+begin
+  // TopK=1 leaves exactly one candidate per step, so the degeneration penalty
+  // cannot re-order anything and the emitted token is the greedy argmax at
+  // every step - whatever the past-context set holds. This pins the commit
+  // bookkeeping of the decode loop (context append plus the past-state append
+  // that the next step's own forward produces) independently of the re-rank.
+  RandSeed := 424242;
+  SetLength(NoStops, 0);
+  NN := BuildTinyNet(4, 8);
+  try
+    G := DecodeGreedy(NN, 'ab', 8);
+    C := DecodeContrastiveSearch(NN, 'ab', 8, 1, 1.0, NoStops);
+    AssertEquals('topk=1 contrastive text == greedy text', G.Text, C.Text);
+    AssertEquals('topk=1 contrastive finished == greedy',
+      Ord(G.Finished), Ord(C.Finished));
+    AssertEquals('topk=1 contrastive sumlogprob == greedy',
+      G.SumLogProb, C.SumLogProb, 0.0);
   finally
     NN.Free;
   end;
@@ -6182,6 +6247,108 @@ begin
   end;
 end;
 
+// TNNetForcedSequenceConstraint.MaskAllowed masks from the trie's handful of
+// allowed ids instead of asking TokenAllowed per vocabulary id. It must agree
+// element for element with the base-class algorithm (mask by TokenAllowed, then
+// renormalize the survivors) at every trie depth, including the two untouched-
+// row fallbacks: nothing blocked, and zero allowed mass.
+procedure TTestNeuralDecode.TestForcedSequenceMaskMatchesUnguardedReference;
+const
+  cVocab = 8;
+var
+  Seqs: TNNetTokenSequences;
+  C: TNNetForcedSequenceConstraint;
+  V, Ref: TNNetVolume;
+  I, Step: integer;
+
+  // The base TNNetTokenConstraint.MaskAllowed, spelled out over Ref.
+  procedure ReferenceMask();
+  var
+    J: integer;
+    Mass, InvMass: TNeuralFloat;
+    AnyBlocked: boolean;
+  begin
+    Mass := 0;
+    AnyBlocked := false;
+    for J := 0 to cVocab - 1 do
+      if C.TokenAllowed(J)
+      then Mass := Mass + Ref.Raw[J]
+      else AnyBlocked := true;
+    if (not AnyBlocked) or (Mass <= 0) then exit;
+    InvMass := 1.0 / Mass;
+    for J := 0 to cVocab - 1 do
+      if C.TokenAllowed(J)
+      then Ref.Raw[J] := Ref.Raw[J] * InvMass
+      else Ref.Raw[J] := 0;
+  end;
+
+begin
+  // Two candidates share a head (id 3), so the mask's dedup path runs; the
+  // third starts elsewhere.
+  SetLength(Seqs, 3);
+  SetLength(Seqs[0], 2); Seqs[0][0] := 3; Seqs[0][1] := 4;
+  SetLength(Seqs[1], 2); Seqs[1][0] := 3; Seqs[1][1] := 5;
+  SetLength(Seqs[2], 1); Seqs[2][0] := 7;
+  V := TNNetVolume.Create(cVocab, 1, 1);
+  Ref := TNNetVolume.Create(cVocab, 1, 1);
+  C := TNNetForcedSequenceConstraint.Create(Seqs);
+  try
+    for Step := 0 to 2 do
+    begin
+      for I := 0 to cVocab - 1 do
+      begin
+        V.Raw[I] := 0.05 * (I + 1);
+        Ref.Raw[I] := 0.05 * (I + 1);
+      end;
+      ReferenceMask();
+      C.MaskAllowed(V);
+      for I := 0 to cVocab - 1 do
+        AssertEquals('depth ' + IntToStr(Step) + ' element ' + IntToStr(I),
+          Ref.Raw[I], V.Raw[I], 1e-6);
+      // Guard against a vacuous comparison: at the trie root only ids 3 and 7
+      // survive, with mass 0.2 + 0.4.
+      if Step = 0 then
+      begin
+        AssertEquals('root masks a non-candidate id', 0.0, V.Raw[5], 1e-9);
+        AssertEquals('root renormalizes id 3', 0.2 / 0.6, V.Raw[3], 1e-6);
+      end;
+      C.Commit(3 + Step * 1); // walks 3 -> 4 (a live candidate), then off-trie
+    end;
+
+    // Zero allowed mass: rewind, then give every trie-allowed id probability 0.
+    C.Reset([]);
+    for I := 0 to cVocab - 1 do V.Raw[I] := 0.25;
+    V.Raw[3] := 0;
+    V.Raw[7] := 0;
+    C.MaskAllowed(V);
+    AssertEquals('zero-mass fallback leaves an allowed id', 0.0, V.Raw[3], 1e-9);
+    AssertEquals('zero-mass fallback leaves a blocked id', 0.25, V.Raw[5], 1e-6);
+  finally
+    C.Free;
+    Ref.Free;
+    V.Free;
+  end;
+
+  // Nothing blocked: a two-element row whose only ids are the specials, with a
+  // candidate fully emitted so both are allowed. The row must be untouched.
+  SetLength(Seqs, 1);
+  SetLength(Seqs[0], 1); Seqs[0][0] := 5;
+  V := TNNetVolume.Create(2, 1, 1);
+  C := TNNetForcedSequenceConstraint.Create(Seqs);
+  try
+    C.Commit(5);
+    AssertTrue('candidate completed', C.Completed());
+    V.Raw[0] := 0.3;
+    V.Raw[1] := 0.2;
+    C.MaskAllowed(V);
+    AssertEquals('nothing blocked leaves element 0', 0.3, V.Raw[0], 1e-6);
+    AssertEquals('nothing blocked leaves element 1', 0.2, V.Raw[1], 1e-6);
+  finally
+    C.Free;
+    V.Free;
+  end;
+end;
+
 // PrepareTokenHealing without a model: on a vocabulary holding 'egg',
 // 'egging' and 'eggs', a prompt ending in 'egg' must yield a one-shot
 // constraint allowing EXACTLY the egg-prefixed tokens, decrement PromptLen
@@ -6552,6 +6719,57 @@ end;
 // Token-level constraint over MULTI-CHARACTER (BPE-style) tokens: a token is
 // allowed exactly when ALL its characters are legal continuations, validated
 // transitively through a cloned automaton; EOS (< 2) only at completion.
+// The char-level constructors map token id to Chr(id), so a vocabulary wider
+// than the byte alphabet would alias ids 256+ onto bytes. That must be
+// rejected with EArgumentException; the full 256-id byte vocabulary still
+// builds and decides tokens by their character.
+procedure TTestNeuralDecode.TestCharLevelConstraintsRejectSubwordVocab;
+const
+  ArithGrammar =
+    'root ::= term (("+"|"-") term)*'#10 +
+    'term ::= num'#10 +
+    'num ::= [0-9]+';
+var
+  J: TNNetJSONConstraint;
+  G: TNNetGrammarConstraint;
+  Raised: boolean;
+begin
+  Raised := false;
+  try
+    J := TNNetJSONConstraint.CreateCharLevel(300);
+    J.Free;
+  except
+    on EArgumentException do Raised := true;
+  end;
+  AssertTrue('JSON char-level rejects a 300-id vocabulary', Raised);
+  Raised := false;
+  try
+    G := TNNetGrammarConstraint.CreateCharLevel(ArithGrammar, 300);
+    G.Free;
+  except
+    on EArgumentException do Raised := true;
+  end;
+  AssertTrue('grammar char-level rejects a 300-id vocabulary', Raised);
+  // The full byte alphabet is still legal.
+  J := TNNetJSONConstraint.CreateCharLevel(256);
+  try
+    J.Reset([]);
+    AssertTrue('{ opens a value', J.TokenAllowed(Ord('{')));
+    AssertTrue('} does not open a value', not J.TokenAllowed(Ord('}')));
+  finally
+    J.Free;
+  end;
+  G := TNNetGrammarConstraint.CreateCharLevel(ArithGrammar, 256);
+  try
+    G.Reset([]);
+    AssertTrue('a digit starts the expression', G.TokenAllowed(Ord('7')));
+    AssertTrue('a plus does not start the expression',
+      not G.TokenAllowed(Ord('+')));
+  finally
+    G.Free;
+  end;
+end;
+
 procedure TTestNeuralDecode.TestJSONConstraintValidatesMultiCharTokens;
 var
   Dict: TStringListInt;
@@ -8364,6 +8582,46 @@ begin
         RefAll[I].Text, CacAll[I].Text);
       AssertEquals('alpha=0.7 score rank ' + IntToStr(I),
         RefAll[I].Score, CacAll[I].Score, 0.0);
+    end;
+  finally
+    Session.Free;
+    Twin.Free;
+    Full.Free;
+  end;
+end;
+
+procedure TTestNeuralDecode.TestBeamSearchCachedSiblingsShareParentCache;
+const
+  Vocab = 8;
+  ContextLen = 16;
+var
+  Full, Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  RefAll, CacAll: TNNetDecodeResultArray;
+  Prompt: string;
+  I: integer;
+begin
+  // Survivors that share a parent restore that parent's base cache ONCE and
+  // clone it per child. A long run with a beam narrower than the vocabulary
+  // makes every step mix siblings with children of other parents, so the whole
+  // ranked pool must still match the re-encoding reference exactly.
+  Prompt := Chr(2) + Chr(4) + Chr(6);
+  BuildBigramBeamPair(Full, Twin, Vocab, ContextLen);
+  Session := nil;
+  try
+    Session := TNNetStreamingDecoder.Create(Twin, ContextLen);
+    RefAll := DecodeBeamSearchAll(Full, Prompt, 9, 3, 0.0);
+    CacAll := DecodeBeamSearchCachedAll(Session, Prompt, 9, 3, 0.0);
+    AssertEquals('same beam count', Length(RefAll), Length(CacAll));
+    for I := 0 to High(RefAll) do
+    begin
+      AssertEquals('text rank ' + IntToStr(I), RefAll[I].Text, CacAll[I].Text);
+      AssertEquals('sumlogprob rank ' + IntToStr(I),
+        RefAll[I].SumLogProb, CacAll[I].SumLogProb, 0.0);
+      AssertEquals('score rank ' + IntToStr(I),
+        RefAll[I].Score, CacAll[I].Score, 0.0);
+      AssertTrue('finished flag rank ' + IntToStr(I),
+        RefAll[I].Finished = CacAll[I].Finished);
     end;
   finally
     Session.Free;
