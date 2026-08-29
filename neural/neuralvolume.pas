@@ -58,6 +58,8 @@ type
   TNeuralFloat = Single;
   TNeuralFloatDynArr = array of TNeuralFloat;
   TInt8DynArr = array of ShortInt;
+  // PackedRow 4-bit codes, two per byte (TNNetVolumeQuant4 storage).
+  TNeuralByteDynArr = array of Byte;
   TNeuralFloatPtr = ^TNeuralFloat;
 
   {$IFNDEF FPC}
@@ -91,6 +93,8 @@ type
   // TNeuralFloatArrPtr views float buffers). Coded by Claude (AI).
   TNeuralInt8Arr = array[0..Maxint div 2] of ShortInt;
   TNeuralInt8ArrPtr = ^TNeuralInt8Arr;
+  TNeuralByteArr = array[0..Maxint div 2] of Byte;
+  TNeuralByteArrPtr = ^TNeuralByteArr;
   // Unbounded-view type over 16-bit half / bfloat16 source data (never
   // allocated as such - the checkpoint readers aim it at their staging
   // buffers, mirroring how TNeuralInt8ArrPtr views int8 codes).
@@ -438,6 +442,7 @@ type
   // Forward: the int8 tiled kernels below take a TNNetVolumeQuant8 table
   // (declared after TNNetVolume, since it owns one as its scale plane).
   TNNetVolumeQuant8 = class;
+  TNNetVolumeQuant4 = class;
 
   { TNNetVolume }
   {$IFDEF FPC}
@@ -541,6 +546,12 @@ type
       // [-127, 127] (the QuantizeInt8 range): -128 x -128 would overflow the
       // AVX2 kernel's signed-magnitude pair sum. Coded by Claude (AI).
       class function DotProductInt8Int8(PtrA, PtrB: TNeuralInt8ArrPtr; NumElements: integer): integer;
+      // Int4-weight x int8-input dot product over NumElements div 32 blocks:
+      // sum over blocks of BlockScale * sum(code_w[i] * code_b[i]), the
+      // TNNetVolumeQuant4 row layout (16 packed bytes + one scale per block).
+      // The caller applies the input scale once. AVX2 accumulates in float per
+      // lane, so it is NOT bit-exact against the Pascal loop. Coded by Claude (AI).
+      class function DotProductInt4Int8(PtrPacked: TNeuralByteArrPtr; PtrBlockScales: TNeuralFloatArrPtr; PtrB: TNeuralInt8ArrPtr; NumElements: integer): TNeuralFloat;
       // Fused int8-weight x float32-input elementwise multiply-accumulate:
       // PtrA[i] += PtrCodes[i] * PtrB[i], with NO scale applied - the caller
       // multiplies the accumulated result by the per-row quantization scale
@@ -581,6 +592,11 @@ type
       // Ranged twin, same contract as the ranged DotProductsTiledInt8: B columns
       // [BStart..BFinish], A rows [AStart..AFinish] (AFinish < 0 = all rows).
       procedure DotProductsTiledInt8Int8(NumAs, BStart, BFinish, VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolumeQuant8; BScale: TNeuralFloat; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
+      // Int4-weight x int8-input twin of DotProductsTiledInt8Int8: the block
+      // scales live in Weights, BScale is the one per-tensor input scale.
+      procedure DotProductsTiledInt4Int8(NumAs, NumBs, VectorSize: integer; Weights: TNNetVolumeQuant4; VBs: TNNetVolumeQuant8; BScale: TNeuralFloat; TileSizeA, TileSizeB: integer); overload;
+      // Ranged form, same tiling and output layout as the ranged DotProductsTiledInt8Int8.
+      procedure DotProductsTiledInt4Int8(NumAs, BStart, BFinish, VectorSize: integer; Weights: TNNetVolumeQuant4; VBs: TNNetVolumeQuant8; BScale: TNeuralFloat; TileSizeA, TileSizeB: integer; AStart: integer = 0; AFinish: integer = -1); overload;
       procedure PointwiseNorm(pNorms: TNNetVolume = nil);
       procedure PointwiseMul(pNorms: TNNetVolume = nil);
       // Exp writes dst[0..N-1] := exp(src[0..N-1]). On an AVX2 build it
@@ -1022,6 +1038,73 @@ type
       // keeps it in step with FData.
       property ScaleData: TNNetVolume read FScaleData;
       property Scale[x, y: integer]: TNeuralFloat read GetScale write SetScale;
+  end;
+
+  { TNNetVolumeQuant4 }
+  // Int4 block-quantized codes under the TNNetVolume geometry: one row per
+  // (x,y), Depth codes per row in blocks of 32 (BlockSize), each block 16
+  // packed bytes (low nibbles = elements 0..15, high nibbles = 16..31, code
+  // biased by 8) plus one scale. This is the GGUF Q4_0 layout, so a Q4_0 row
+  // can be copied in as it is. Depth must be a multiple of 32; ReSize refuses
+  // any other depth. The empty state is Size = 0 and a nil DataPtr.
+  // Coded by Claude (AI).
+  TNNetVolumeQuant4 = class(TObject)
+    private
+      FScaleData: TNNetVolume;
+      FDataPtr: TNeuralByteArrPtr;
+      FSizeX, FSizeY, FDepth, FSize: integer;
+      FBlocksPerRow, FPackedRowBytes, FPackedSize: integer;
+      function GetScalePtr(): TNeuralFloatArrPtr; {$IFDEF Release} inline; {$ENDIF}
+    public
+      const BlockSize = 32;
+      const PackedBlockBytes = 16;
+    public
+      // PackedRow nibbles, PackedRowBytes per row. Never SetLength it - call ReSize.
+      FData: TNeuralByteDynArr;
+
+      constructor Create(); {$IFNDEF FPC} overload; {$ENDIF}
+      constructor Create(pSizeX, pSizeY, pDepth: integer); {$IFNDEF FPC} overload; {$ENDIF}
+      destructor Destroy(); override;
+
+      // pDepth must be a multiple of BlockSize; otherwise raises.
+      procedure ReSize(pSizeX, pSizeY, pDepth: integer);
+
+      function GetRawPos(x, y: integer): integer; {$IFDEF Release} inline; {$ENDIF}
+      // Base of the (x,y) row's packed bytes / block scales.
+      function GetRawPtr(x, y: integer): TNeuralByteArrPtr; {$IFDEF Release} inline; {$ENDIF}
+      function GetScaleRowPtr(x, y: integer): TNeuralFloatArrPtr; {$IFDEF Release} inline; {$ENDIF}
+      function GetCode(x, y, d: integer): integer; {$IFDEF Release} inline; {$ENDIF}
+      function Dequantize(x, y, d: integer): TNeuralFloat;
+
+      // Quantizes Depth floats at Src into row (x,y) with the Q4_0 rule per
+      // block: scale = max/-8 (max = the largest-magnitude value), codes in [0,15].
+      procedure QuantizeRow(x, y: integer; Src: TNeuralFloatArrPtr);
+      // Quantizes every row of Source (same SizeX, SizeY, Depth) into this volume.
+      procedure QuantizeFrom(Source: TNNetVolume);
+      // Copies one Q4_0 row (BlocksPerRow x 16 packed bytes) and its block
+      // scales from the caller's buffers; the loader's direct path.
+      procedure ImportPackedRow(x, y: integer; PackedSrc: TNeuralByteArrPtr; Scales: TNeuralFloatArrPtr);
+      procedure DequantizeRowTo(x, y: integer; Dest: TNeuralFloatArrPtr);
+      // Expands every row into Dest, resized to (SizeX, SizeY, Depth). Leaves
+      // Dest untouched when this volume is empty.
+      procedure DequantizeTo(Dest: TNNetVolume);
+
+      // Every code to zero (nibble 8) and every block scale to 0.
+      procedure Fill();
+      procedure CopyFrom(Original: TNNetVolumeQuant4);
+      function GetMemSize(): int64;
+
+      property SizeX: integer read FSizeX;
+      property SizeY: integer read FSizeY;
+      property Depth: integer read FDepth;
+      property Size: integer read FSize;
+      property BlocksPerRow: integer read FBlocksPerRow;
+      property PackedRowBytes: integer read FPackedRowBytes;
+      property PackedSize: integer read FPackedSize;
+      property DataPtr: TNeuralByteArrPtr read FDataPtr;
+      property ScalePtr: TNeuralFloatArrPtr read GetScalePtr;
+      // (SizeX, SizeY, BlocksPerRow): one scale per block. Never ReSize it.
+      property ScaleData: TNNetVolume read FScaleData;
   end;
 
   { TNNetSamplerBase }
@@ -2067,6 +2150,105 @@ begin
     for I := localNumElements to MaxTailPos do
       Result := Result + PtrA^[I] * PtrB^[I];
   end;
+end;
+
+// Int4 x int8 block dot product. Two blocks per iteration: one 32-byte load
+// unpacks (mask, subtract 8) into [lo nibbles of both blocks | hi nibbles of
+// both blocks], two vperm2i128 arrange the inputs the same way, and the pair
+// sums go through AVXDotProductInt8Int8's sign-magnitude vpmaddubsw into two
+// float accumulators, each FMA'd with its block scale. An odd last block runs
+// the single-block loop. Every constant is built in registers (PIC-safe).
+// Requires NumBlocks >= 1. Coded by Claude (AI).
+function AVXDotProductInt4Int8(PtrPacked: TNeuralByteArrPtr;
+  PtrBlockScales: TNeuralFloatArrPtr; PtrB: TNeuralInt8ArrPtr;
+  NumBlocks: integer): Single;
+var
+  vRes: Single;
+  NumPairs, OddBlock: integer;
+begin
+  NumPairs := NumBlocks shr 1;
+  OddBlock := NumBlocks and 1;
+  asm
+  mov ecx, NumPairs
+  mov rax, PtrPacked
+  mov rdx, PtrB
+  mov r8, PtrBlockScales
+  vxorps ymm0, ymm0, ymm0
+  vxorps ymm1, ymm1, ymm1
+  vpcmpeqw ymm7, ymm7, ymm7
+  vpsrlw ymm7, ymm7, 15          // words 0x0001: the vpmaddwd ones
+  vpsllw ymm6, ymm7, 3
+  vpackuswb ymm6, ymm6, ymm6     // bytes 0x08: the nibble zero point
+  vpcmpeqw ymm5, ymm5, ymm5
+  vpsrlw ymm5, ymm5, 12
+  vpackuswb ymm5, ymm5, ymm5     // bytes 0x0F: the nibble mask
+  test ecx, ecx
+  jz @PairsDone
+
+@PairLoop:
+  vmovdqu ymm2, [rax]            // [block k packed | block k+1 packed]
+  vpsrlw ymm3, ymm2, 4
+  vpand ymm2, ymm2, ymm5         // [k elems 0..15 | k+1 elems 0..15]
+  vpand ymm3, ymm3, ymm5         // [k elems 16..31 | k+1 elems 16..31]
+  vpsubb ymm2, ymm2, ymm6
+  vpsubb ymm3, ymm3, ymm6
+  vmovdqu ymm8, [rdx]            // input block k
+  vmovdqu ymm9, [rdx+32]         // input block k+1
+  vperm2i128 ymm10, ymm8, ymm9, $20  // [k in 0..15 | k+1 in 0..15]
+  vperm2i128 ymm11, ymm8, ymm9, $31  // [k in 16..31 | k+1 in 16..31]
+  vpsignb ymm10, ymm10, ymm2
+  vpabsb ymm2, ymm2
+  vpmaddubsw ymm2, ymm2, ymm10
+  vpsignb ymm11, ymm11, ymm3
+  vpabsb ymm3, ymm3
+  vpmaddubsw ymm3, ymm3, ymm11
+  vpaddw ymm2, ymm2, ymm3        // |sum| <= 4 * 8 * 127, no saturation
+  vpmaddwd ymm2, ymm2, ymm7      // lanes 0..3 block k, 4..7 block k+1
+  vcvtdq2ps ymm2, ymm2
+  vbroadcastss ymm4, [r8]
+  vbroadcastss ymm3, [r8+4]
+  vblendps ymm4, ymm4, ymm3, $F0
+  vfmadd231ps ymm0, ymm2, ymm4
+
+  add rax, 32
+  add rdx, 64
+  add r8, 8
+  dec ecx
+  jnz @PairLoop
+
+@PairsDone:
+  mov ecx, OddBlock
+  test ecx, ecx
+  jz @Reduce
+  vmovdqu xmm2, [rax]
+  vpsrlw xmm3, xmm2, 4
+  vinserti128 ymm2, ymm2, xmm3, 1
+  vpand ymm2, ymm2, ymm5
+  vpsubb ymm2, ymm2, ymm6
+  vmovdqu ymm3, [rdx]
+  vpsignb ymm3, ymm3, ymm2
+  vpabsb ymm2, ymm2
+  vpmaddubsw ymm2, ymm2, ymm3
+  vpmaddwd ymm2, ymm2, ymm7
+  vcvtdq2ps ymm2, ymm2
+  vbroadcastss ymm4, [r8]
+  vfmadd231ps ymm1, ymm2, ymm4
+
+@Reduce:
+  vaddps ymm0, ymm0, ymm1
+  vextractf128 xmm2, ymm0, 1
+  vaddps xmm0, xmm0, xmm2
+  vhaddps xmm0, xmm0, xmm0
+  vhaddps xmm0, xmm0, xmm0
+  vmovss vRes, xmm0
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX', 'R8',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm6', 'ymm7',
+    'ymm8', 'ymm9', 'ymm10', 'ymm11'
+  ];
+  Result := vRes;
 end;
 
 // Fused int8 axpy PtrA[i] += W * PtrCodes[i]: AVXDotProductInt8's byte->float
@@ -13628,6 +13810,41 @@ begin
     Result := Result + PtrA^[I] * PtrB^[I];
 end;
 
+class function TNNetVolume.DotProductInt4Int8(PtrPacked: TNeuralByteArrPtr;
+  PtrBlockScales: TNeuralFloatArrPtr; PtrB: TNeuralInt8ArrPtr;
+  NumElements: integer): TNeuralFloat;
+var
+  NumBlocks, BlockIdx, ByteIdx, MaxBlockIdx: integer;
+  PackedByte, BlockSum, PackedOfs, BOfs: integer;
+begin
+  NumBlocks := NumElements div TNNetVolumeQuant4.BlockSize;
+  Result := 0;
+  if NumBlocks <= 0 then exit;
+  {$IFDEF AVX64}
+  {$IFDEF AVX2}
+  Result := AVXDotProductInt4Int8(PtrPacked, PtrBlockScales, PtrB, NumBlocks);
+  exit;
+  {$ENDIF}
+  {$ENDIF}
+  MaxBlockIdx := NumBlocks - 1;
+  PackedOfs := 0;
+  BOfs := 0;
+  for BlockIdx := 0 to MaxBlockIdx do
+  begin
+    BlockSum := 0;
+    for ByteIdx := 0 to TNNetVolumeQuant4.PackedBlockBytes - 1 do
+    begin
+      PackedByte := PtrPacked^[PackedOfs + ByteIdx];
+      BlockSum := BlockSum +
+        ((PackedByte and 15) - 8) * PtrB^[BOfs + ByteIdx] +
+        ((PackedByte shr 4) - 8) * PtrB^[BOfs + ByteIdx + TNNetVolumeQuant4.PackedBlockBytes];
+    end;
+    Result := Result + BlockSum * PtrBlockScales^[BlockIdx];
+    Inc(PackedOfs, TNNetVolumeQuant4.PackedBlockBytes);
+    Inc(BOfs, TNNetVolumeQuant4.BlockSize);
+  end;
+end;
+
 class function TNNetVolume.SumSqrCentered(pSrc: TNeuralFloatArrPtr;
   Mean: TNeuralFloat; N: integer): TNeuralFloat;
 var
@@ -14056,6 +14273,75 @@ begin
   end; // B Tiling.
 end;
 
+
+procedure TNNetVolume.DotProductsTiledInt4Int8(NumAs, NumBs, VectorSize: integer;
+  Weights: TNNetVolumeQuant4; VBs: TNNetVolumeQuant8; BScale: TNeuralFloat;
+  TileSizeA, TileSizeB: integer);
+begin
+  DotProductsTiledInt4Int8(NumAs, 0, NumBs - 1, VectorSize, Weights, VBs,
+    BScale, TileSizeA, TileSizeB);
+end;
+
+procedure TNNetVolume.DotProductsTiledInt4Int8(NumAs, BStart, BFinish,
+  VectorSize: integer; Weights: TNNetVolumeQuant4; VBs: TNNetVolumeQuant8;
+  BScale: TNeuralFloat; TileSizeA, TileSizeB: integer;
+  AStart: integer = 0; AFinish: integer = -1);
+var
+  CntA, CntB: integer;
+  RowBase, PackedOfs, ScaleOfs, BPos: integer;
+  PackedRowBytes, BlocksPerRow: integer;
+  PtrB: TNeuralInt8ArrPtr;
+  PackedData: TNeuralByteArrPtr;
+  BData: TNeuralInt8ArrPtr;
+  ScaleData: TNeuralFloatArrPtr;
+  // Tiling
+  TileACnt, TileBCnt: integer;
+  StartTileA, EndTileA, StartTileB, EndTileB: integer;
+  MaxTileA, MaxTileB: integer;
+  TilePackedOfs0, TileScaleOfs0: integer;
+begin
+  // Same ceil-division tiling and output layout as DotProductsTiledInt8Int8;
+  // the A rows are addressed by packed bytes and by block scales.
+  if AFinish < 0 then AFinish := NumAs - 1;
+  PackedData := Weights.DataPtr;
+  ScaleData := Weights.ScalePtr;
+  PackedRowBytes := Weights.PackedRowBytes;
+  BlocksPerRow := Weights.BlocksPerRow;
+  BData := VBs.DataPtr;
+  MaxTileA := ((AFinish - AStart + 1) + TileSizeA - 1) div TileSizeA - 1;
+  MaxTileB := ((BFinish - BStart + 1) + TileSizeB - 1) div TileSizeB - 1;
+  for TileBCnt := 0 to MaxTileB do
+  begin
+    StartTileB := BStart + TileBCnt * TileSizeB;
+    EndTileB := Min(StartTileB + TileSizeB - 1, BFinish);
+    for TileACnt := 0 to MaxTileA do
+    begin
+      StartTileA := AStart + TileACnt * TileSizeA;
+      EndTileA := Min(StartTileA + TileSizeA - 1, AFinish);
+      TilePackedOfs0 := StartTileA * PackedRowBytes;
+      TileScaleOfs0 := StartTileA * BlocksPerRow;
+      BPos := StartTileB * VectorSize;
+      RowBase := StartTileB * NumAs;
+      for CntB := StartTileB to EndTileB do
+      begin
+        PtrB := TNeuralInt8ArrPtr(@BData^[BPos]);
+        PackedOfs := TilePackedOfs0;
+        ScaleOfs := TileScaleOfs0;
+        for CntA := StartTileA to EndTileA do
+        begin
+          FData[RowBase + CntA] :=
+            DotProductInt4Int8(TNeuralByteArrPtr(@PackedData^[PackedOfs]),
+              TNeuralFloatArrPtr(@ScaleData^[ScaleOfs]), PtrB, VectorSize) *
+            BScale;
+          Inc(PackedOfs, PackedRowBytes);
+          Inc(ScaleOfs, BlocksPerRow);
+        end;
+        Inc(BPos, VectorSize);
+        Inc(RowBase, NumAs);
+      end;
+    end; // A Tiling.
+  end; // B Tiling.
+end;
 
 procedure TNNetGroupedVolume.GroupedDotProductsTiledInt8(Groups, NumAs, NumBs,
   VectorSize: integer; Codes: TNNetVolumeQuant8; VBs: TNNetVolume;
@@ -19651,6 +19937,235 @@ function TNNetVolumeQuant8.GetMemSize(): int64;
 begin
   Result := int64(FSize) * csShortIntSize +
     int64(FSizeX) * int64(FSizeY) * csNeuralFloatSize;
+end;
+
+{ TNNetVolumeQuant4 }
+
+constructor TNNetVolumeQuant4.Create();
+begin
+  Create(0, 0, 0);
+end;
+
+constructor TNNetVolumeQuant4.Create(pSizeX, pSizeY, pDepth: integer);
+begin
+  inherited Create();
+  FScaleData := TNNetVolume.Create(1, 1, 1);
+  FSizeX := 0;
+  FSizeY := 0;
+  FDepth := 0;
+  FSize := 0;
+  FBlocksPerRow := 0;
+  FPackedRowBytes := 0;
+  FPackedSize := 0;
+  FDataPtr := nil;
+  ReSize(pSizeX, pSizeY, pDepth);
+end;
+
+destructor TNNetVolumeQuant4.Destroy();
+begin
+  SetLength(FData, 0);
+  FDataPtr := nil;
+  FScaleData.Free;
+  inherited Destroy();
+end;
+
+procedure TNNetVolumeQuant4.ReSize(pSizeX, pSizeY, pDepth: integer);
+var
+  NewPackedSize: integer;
+begin
+  if (pDepth mod BlockSize) <> 0 then
+    raise Exception.Create('TNNetVolumeQuant4.ReSize: depth ' +
+      IntToStr(pDepth) + ' is not a multiple of ' + IntToStr(BlockSize) + '.');
+  FSizeX := pSizeX;
+  FSizeY := pSizeY;
+  FDepth := pDepth;
+  FSize := pSizeX * pSizeY * pDepth;
+  FBlocksPerRow := pDepth div BlockSize;
+  FPackedRowBytes := FBlocksPerRow * PackedBlockBytes;
+  NewPackedSize := pSizeX * pSizeY * FPackedRowBytes;
+  if NewPackedSize <> FPackedSize then
+  begin
+    FPackedSize := NewPackedSize;
+    SetLength(FData, FPackedSize);
+  end;
+  // One scale per block; the plane parks at (1,1,1) when empty, as in
+  // TNNetVolumeQuant8.ReSize.
+  if FSize > 0
+  then FScaleData.ReSize(pSizeX, pSizeY, FBlocksPerRow)
+  else FScaleData.ReSize(1, 1, 1);
+  if FPackedSize > 0
+  then FDataPtr := addr(FData[0])
+  else FDataPtr := nil;
+end;
+
+function TNNetVolumeQuant4.GetScalePtr(): TNeuralFloatArrPtr;
+begin
+  Result := FScaleData.DataPtr;
+end;
+
+function TNNetVolumeQuant4.GetRawPos(x, y: integer): integer;
+begin
+  Result := ((FSizeX * y) + x) * FPackedRowBytes;
+end;
+
+function TNNetVolumeQuant4.GetRawPtr(x, y: integer): TNeuralByteArrPtr;
+begin
+  Result := TNeuralByteArrPtr(@FDataPtr^[((FSizeX * y) + x) * FPackedRowBytes]);
+end;
+
+function TNNetVolumeQuant4.GetScaleRowPtr(x, y: integer): TNeuralFloatArrPtr;
+begin
+  Result := TNeuralFloatArrPtr(@FScaleData.FDataPtr^[((FSizeX * y) + x) * FBlocksPerRow]);
+end;
+
+function TNNetVolumeQuant4.GetCode(x, y, d: integer): integer;
+var
+  BlockIdx, InBlock, PackedByte: integer;
+begin
+  BlockIdx := d div BlockSize;
+  InBlock := d mod BlockSize;
+  PackedByte := FData[GetRawPos(x, y) + BlockIdx * PackedBlockBytes +
+    (InBlock mod PackedBlockBytes)];
+  if InBlock < PackedBlockBytes
+  then Result := (PackedByte and 15) - 8
+  else Result := (PackedByte shr 4) - 8;
+end;
+
+function TNNetVolumeQuant4.Dequantize(x, y, d: integer): TNeuralFloat;
+begin
+  Result := GetCode(x, y, d) *
+    FScaleData.FData[((FSizeX * y) + x) * FBlocksPerRow + d div BlockSize];
+end;
+
+procedure TNNetVolumeQuant4.QuantizeRow(x, y: integer; Src: TNeuralFloatArrPtr);
+var
+  PackedRow: TNeuralByteArrPtr;
+  Scales: TNeuralFloatArrPtr;
+  BlockIdx, MaxBlockIdx, ByteIdx, SrcOfs, PackedOfs: integer;
+  Value, MaxAbs, MaxSigned, InvScale: TNeuralFloat;
+  LowCode, HighCode: integer;
+begin
+  PackedRow := GetRawPtr(x, y);
+  Scales := GetScaleRowPtr(x, y);
+  MaxBlockIdx := FBlocksPerRow - 1;
+  SrcOfs := 0;
+  PackedOfs := 0;
+  for BlockIdx := 0 to MaxBlockIdx do
+  begin
+    // Q4_0: the largest-magnitude value maps to code -8 exactly, so the scale
+    // carries its sign. Non-finite values are skipped and quantize to 0.
+    MaxAbs := 0;
+    MaxSigned := 0;
+    for ByteIdx := 0 to BlockSize - 1 do
+    begin
+      Value := Src^[SrcOfs + ByteIdx];
+      if IsNan(Value) or IsInfinite(Value) then continue;
+      if Abs(Value) > MaxAbs then
+      begin
+        MaxAbs := Abs(Value);
+        MaxSigned := Value;
+      end;
+    end;
+    Scales^[BlockIdx] := MaxSigned / (-8);
+    if MaxSigned <> 0
+    then InvScale := -8 / MaxSigned
+    else InvScale := 0;
+    for ByteIdx := 0 to PackedBlockBytes - 1 do
+    begin
+      Value := Src^[SrcOfs + ByteIdx];
+      if IsNan(Value) or IsInfinite(Value) then Value := 0;
+      LowCode := Min(15, Trunc(Value * InvScale + 8.5));
+      Value := Src^[SrcOfs + ByteIdx + PackedBlockBytes];
+      if IsNan(Value) or IsInfinite(Value) then Value := 0;
+      HighCode := Min(15, Trunc(Value * InvScale + 8.5));
+      PackedRow^[PackedOfs + ByteIdx] := Byte(LowCode or (HighCode shl 4));
+    end;
+    Inc(SrcOfs, BlockSize);
+    Inc(PackedOfs, PackedBlockBytes);
+  end;
+end;
+
+procedure TNNetVolumeQuant4.QuantizeFrom(Source: TNNetVolume);
+var
+  RowIdx, MaxRowIdx, SrcOfs: integer;
+begin
+  ReSize(Source.SizeX, Source.SizeY, Source.Depth);
+  MaxRowIdx := FSizeX * FSizeY - 1;
+  SrcOfs := 0;
+  for RowIdx := 0 to MaxRowIdx do
+  begin
+    QuantizeRow(RowIdx mod FSizeX, RowIdx div FSizeX,
+      TNeuralFloatArrPtr(@Source.FDataPtr^[SrcOfs]));
+    Inc(SrcOfs, FDepth);
+  end;
+end;
+
+procedure TNNetVolumeQuant4.ImportPackedRow(x, y: integer;
+  PackedSrc: TNeuralByteArrPtr; Scales: TNeuralFloatArrPtr);
+begin
+  Move(PackedSrc^[0], GetRawPtr(x, y)^[0], FPackedRowBytes);
+  Move(Scales^[0], GetScaleRowPtr(x, y)^[0], FBlocksPerRow * csNeuralFloatSize);
+end;
+
+procedure TNNetVolumeQuant4.DequantizeRowTo(x, y: integer; Dest: TNeuralFloatArrPtr);
+var
+  PackedRow: TNeuralByteArrPtr;
+  Scales: TNeuralFloatArrPtr;
+  BlockIdx, MaxBlockIdx, ByteIdx, DestOfs, PackedOfs, PackedByte: integer;
+  Scale: TNeuralFloat;
+begin
+  PackedRow := GetRawPtr(x, y);
+  Scales := GetScaleRowPtr(x, y);
+  MaxBlockIdx := FBlocksPerRow - 1;
+  DestOfs := 0;
+  PackedOfs := 0;
+  for BlockIdx := 0 to MaxBlockIdx do
+  begin
+    Scale := Scales^[BlockIdx];
+    for ByteIdx := 0 to PackedBlockBytes - 1 do
+    begin
+      PackedByte := PackedRow^[PackedOfs + ByteIdx];
+      Dest^[DestOfs + ByteIdx] := ((PackedByte and 15) - 8) * Scale;
+      Dest^[DestOfs + ByteIdx + PackedBlockBytes] := ((PackedByte shr 4) - 8) * Scale;
+    end;
+    Inc(DestOfs, BlockSize);
+    Inc(PackedOfs, PackedBlockBytes);
+  end;
+end;
+
+procedure TNNetVolumeQuant4.DequantizeTo(Dest: TNNetVolume);
+var
+  RowIdx, MaxRowIdx, DestOfs: integer;
+begin
+  if FSize = 0 then exit;
+  Dest.ReSize(FSizeX, FSizeY, FDepth);
+  MaxRowIdx := FSizeX * FSizeY - 1;
+  DestOfs := 0;
+  for RowIdx := 0 to MaxRowIdx do
+  begin
+    DequantizeRowTo(RowIdx mod FSizeX, RowIdx div FSizeX,
+      TNeuralFloatArrPtr(@Dest.FDataPtr^[DestOfs]));
+    Inc(DestOfs, FDepth);
+  end;
+end;
+
+procedure TNNetVolumeQuant4.Fill();
+begin
+  if FPackedSize > 0 then FillChar(FData[0], FPackedSize, $88);
+  if FSize > 0 then FScaleData.Fill(0);
+end;
+
+procedure TNNetVolumeQuant4.CopyFrom(Original: TNNetVolumeQuant4);
+begin
+  ReSize(Original.SizeX, Original.SizeY, Original.Depth);
+  if FPackedSize > 0 then Move(Original.FData[0], FData[0], FPackedSize);
+  FScaleData.Copy(Original.ScaleData);
+end;
+
+function TNNetVolumeQuant4.GetMemSize(): int64;
+begin
+  Result := int64(FPackedSize) +
+    int64(FSizeX) * int64(FSizeY) * int64(FBlocksPerRow) * csNeuralFloatSize;
 end;
 
 { TNNetGroupedVolume }

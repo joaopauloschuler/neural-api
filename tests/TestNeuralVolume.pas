@@ -120,6 +120,10 @@ type
     procedure TestDequantizeInt8RoundTrip;
     procedure TestDotProductInt8Int8LengthSweep;
     procedure TestDotProductInt8Int8MatchesFloatPath;
+    procedure TestQuant4GeometryAndLayout;
+    procedure TestQuant4QuantizeRoundTrip;
+    procedure TestDotProductInt4Int8MatchesReference;
+    procedure TestQuant4TiledDotProductMatchesDequantized;
     procedure TestDecodeBF16;
     procedure TestDecodeBF16LengthSweep;
     procedure TestDecodeF16;
@@ -3771,6 +3775,206 @@ begin
     TNeuralInt8ArrPtr(@A[0]), TNeuralInt8ArrPtr(@B[0]), N);
   AssertEquals('int8 x int8 vs int8 x float', ViaFloat, ViaInt,
     Abs(ViaFloat) * 1e-5);
+end;
+
+// The packed layout is the GGUF Q4_0 row: per block of 32, byte j holds code
+// j in the low nibble and code j+16 in the high nibble, both biased by 8, and
+// the largest-magnitude value of the block quantizes to code -8 exactly.
+// Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestQuant4GeometryAndLayout;
+var
+  Q: TNNetVolumeQuant4;
+  Src: array[0..63] of TNeuralFloat;
+  i: integer;
+  Raised: boolean;
+begin
+  Q := TNNetVolumeQuant4.Create(2, 3, 64);
+  try
+    AssertEquals('size', 2 * 3 * 64, Q.Size);
+    AssertEquals('blocks per row', 2, Q.BlocksPerRow);
+    AssertEquals('packed row bytes', 32, Q.PackedRowBytes);
+    AssertEquals('packed size', 6 * 32, Q.PackedSize);
+    AssertEquals('scale count', 6 * 2, Q.ScaleData.Size);
+    AssertEquals('mem size', 6 * 32 + 12 * 4, Q.GetMemSize());
+    // Block 0: element 5 is the (negative) extreme; block 1: element 40 is
+    // the positive extreme, so its scale is negative and it still codes -8.
+    for i := 0 to 63 do Src[i] := 0;
+    Src[5] := -4.0; Src[21] := 2.0; Src[0] := 0.5;
+    Src[40] := 8.0; Src[56] := -8.0 * 0.25;
+    Q.QuantizeRow(1, 2, TNeuralFloatArrPtr(@Src[0]));
+    AssertEquals('block 0 scale', 0.5, Q.GetScaleRowPtr(1, 2)^[0], 1e-7);
+    AssertEquals('block 1 scale', -1.0, Q.GetScaleRowPtr(1, 2)^[1], 1e-7);
+    AssertEquals('code of the extreme', -8, Q.GetCode(1, 2, 5));
+    AssertEquals('code 21 (high nibble of byte 5)', 4, Q.GetCode(1, 2, 21));
+    AssertEquals('byte 5 packs (5, 21)', (0) or ((4 + 8) shl 4), Q.GetRawPtr(1, 2)^[5]);
+    AssertEquals('code 0', 1, Q.GetCode(1, 2, 0));
+    AssertEquals('zero codes as 8', 8, Q.GetRawPtr(1, 2)^[1] and 15);
+    AssertEquals('positive extreme codes -8', -8, Q.GetCode(1, 2, 40));
+    AssertEquals('positive extreme dequantizes', 8.0, Q.Dequantize(1, 2, 40), 1e-7);
+    AssertEquals('block 1 negative value', 2, Q.GetCode(1, 2, 56));
+    AssertEquals('untouched row stays', 0, Q.GetRawPtr(0, 0)^[0]);
+    Q.Fill();
+    AssertEquals('Fill nibbles', $88, Q.GetRawPtr(1, 2)^[5]);
+    AssertEquals('Fill scale', 0.0, Q.GetScaleRowPtr(1, 2)^[1], 0);
+    Raised := false;
+    try
+      Q.ReSize(1, 1, 48);
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('depth 48 refused', Raised);
+    Q.ReSize(0, 0, 0);
+    AssertEquals('empty size', 0, Q.Size);
+    AssertTrue('empty DataPtr', Q.DataPtr = nil);
+  finally
+    Q.Free;
+  end;
+end;
+
+// QuantizeFrom then DequantizeTo must land within one block scale of the
+// input: half a code in general, a full code on the side opposite the block's
+// extreme, where Q4_0 saturates at code 7 (the extreme takes -8). CopyFrom
+// must carry both planes. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestQuant4QuantizeRoundTrip;
+const
+  Depth = 96;
+var
+  V, Back: TNNetVolume;
+  Q, Q2: TNNetVolumeQuant4;
+  x, y, d, RowIdx: integer;
+  Tol: TNeuralFloat;
+begin
+  RandSeed := 1357;
+  V := TNNetVolume.Create(3, 2, Depth);
+  Back := TNNetVolume.Create(1, 1, 1);
+  Q := TNNetVolumeQuant4.Create();
+  Q2 := TNNetVolumeQuant4.Create();
+  try
+    V.RandomizeGaussian(1.0);
+    Q.QuantizeFrom(V);
+    Q2.CopyFrom(Q);
+    Q2.DequantizeTo(Back);
+    AssertEquals('shape', V.Size, Back.Size);
+    for y := 0 to 1 do
+      for x := 0 to 2 do
+        for d := 0 to Depth - 1 do
+        begin
+          RowIdx := y * 3 + x;
+          Tol := Abs(Q.GetScaleRowPtr(x, y)^[d div 32]) + 1e-6;
+          AssertEquals('row ' + IntToStr(RowIdx) + ' d ' + IntToStr(d),
+            V.FData[RowIdx * Depth + d], Back.FData[RowIdx * Depth + d], Tol);
+        end;
+  finally
+    Q2.Free; Q.Free; Back.Free; V.Free;
+  end;
+end;
+
+// DotProductInt4Int8 must agree with the dequantized FP32 dot product over
+// every block count, including the AVX2 kernel's float accumulation order.
+// Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestDotProductInt4Int8MatchesReference;
+const
+  cBlocks: array[0..6] of integer = (0, 1, 2, 3, 7, 8, 33);
+  MaxN = 33 * 32;
+var
+  W: TNNetVolume;
+  Q: TNNetVolumeQuant4;
+  B: TInt8DynArr;
+  Expected, Got, AbsSum: TNeuralFloat;
+  i, L, Len: integer;
+begin
+  RandSeed := 9753;
+  W := TNNetVolume.Create(1, 1, MaxN);
+  Q := TNNetVolumeQuant4.Create();
+  SetLength(B, MaxN);
+  try
+    W.RandomizeGaussian(0.05);
+    for i := 0 to MaxN - 1 do B[i] := ShortInt(((i * 91 + 5) mod 255) - 127);
+    Q.QuantizeFrom(W);
+    for L := 0 to High(cBlocks) do
+    begin
+      Len := cBlocks[L] * 32;
+      Expected := 0;
+      AbsSum := 0;
+      for i := 0 to Len - 1 do
+      begin
+        Expected := Expected + Q.Dequantize(0, 0, i) * B[i];
+        AbsSum := AbsSum + Abs(Q.Dequantize(0, 0, i) * B[i]);
+      end;
+      Got := TNNetVolume.DotProductInt4Int8(Q.DataPtr, Q.ScalePtr,
+        TNeuralInt8ArrPtr(@B[0]), Len);
+      AssertEquals('N=' + IntToStr(Len), Expected, Got, AbsSum * 1e-5 + 1e-6);
+    end;
+    // Extra elements past the last full block are ignored.
+    Got := TNNetVolume.DotProductInt4Int8(Q.DataPtr, Q.ScalePtr,
+      TNeuralInt8ArrPtr(@B[0]), 32 + 31);
+    Expected := TNNetVolume.DotProductInt4Int8(Q.DataPtr, Q.ScalePtr,
+      TNeuralInt8ArrPtr(@B[0]), 32);
+    AssertEquals('partial block ignored', Expected, Got, 0);
+  finally
+    Q.Free; W.Free;
+  end;
+end;
+
+// The int4 x int8 tiled matmul (full and ranged) must agree with
+// DotProductsTiled fed the dequantized weights and the dequantized input,
+// on a shape whose tiles end partial. Coded by Claude (AI).
+procedure TTestNeuralVolumeQuant8.TestQuant4TiledDotProductMatchesDequantized;
+const
+  NumAs = 7;
+  NumBs = 5;
+  VectorSize = 160;
+  BScale: TNeuralFloat = 0.03;
+var
+  W, WFloat, BFloat, OutRef, OutQ: TNNetVolume;
+  Q: TNNetVolumeQuant4;
+  B: TNNetVolumeQuant8;
+  i, CntA, CntB: integer;
+  Tol: TNeuralFloat;
+begin
+  RandSeed := 2468;
+  W := TNNetVolume.Create(NumAs, 1, VectorSize);
+  WFloat := TNNetVolume.Create(1, 1, 1);
+  BFloat := TNNetVolume.Create(NumBs, 1, VectorSize);
+  OutRef := TNNetVolume.Create(NumAs, NumBs, 1);
+  OutQ := TNNetVolume.Create(NumAs, NumBs, 1);
+  Q := TNNetVolumeQuant4.Create();
+  B := TNNetVolumeQuant8.Create(NumBs, 1, VectorSize);
+  try
+    W.RandomizeGaussian(0.1);
+    Q.QuantizeFrom(W);
+    Q.DequantizeTo(WFloat);
+    for i := 0 to B.Size - 1 do B.FData[i] := ShortInt(((i * 53 + 3) mod 255) - 127);
+    for i := 0 to B.Size - 1 do BFloat.FData[i] := B.FData[i] * BScale;
+    OutRef.DotProductsTiled(NumAs, NumBs, VectorSize, WFloat, BFloat, 4, 2);
+    OutQ.Fill(-1);
+    OutQ.DotProductsTiledInt4Int8(NumAs, NumBs, VectorSize, Q, B, BScale, 4, 2);
+    for CntB := 0 to NumBs - 1 do
+      for CntA := 0 to NumAs - 1 do
+      begin
+        Tol := Abs(OutRef.FData[CntB * NumAs + CntA]) * 1e-4 + 1e-4;
+        AssertEquals('full a=' + IntToStr(CntA) + ' b=' + IntToStr(CntB),
+          OutRef.FData[CntB * NumAs + CntA], OutQ.FData[CntB * NumAs + CntA], Tol);
+      end;
+    // Ranged: rows 2..4 of B and A 3..6 only; everything else stays -1.
+    OutQ.Fill(-1);
+    OutQ.DotProductsTiledInt4Int8(NumAs, 2, 4, VectorSize, Q, B, BScale, 4, 2, 3, 6);
+    for CntB := 0 to NumBs - 1 do
+      for CntA := 0 to NumAs - 1 do
+      begin
+        if (CntB >= 2) and (CntB <= 4) and (CntA >= 3) then
+        begin
+          Tol := Abs(OutRef.FData[CntB * NumAs + CntA]) * 1e-4 + 1e-4;
+          AssertEquals('ranged a=' + IntToStr(CntA) + ' b=' + IntToStr(CntB),
+            OutRef.FData[CntB * NumAs + CntA], OutQ.FData[CntB * NumAs + CntA], Tol);
+        end
+        else
+          AssertEquals('untouched a=' + IntToStr(CntA) + ' b=' + IntToStr(CntB),
+            -1.0, OutQ.FData[CntB * NumAs + CntA], 0);
+      end;
+  finally
+    B.Free; Q.Free; OutQ.Free; OutRef.Free; BFloat.Free; WFloat.Free; W.Free;
+  end;
 end;
 
 // QuantizeInt8 then DequantizeInt8 must land within half a code of the input,
