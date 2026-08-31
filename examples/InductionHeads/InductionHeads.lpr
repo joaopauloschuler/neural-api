@@ -189,13 +189,16 @@ end;
 procedure Train(NN: TNNet);
 var
   Epoch, b: integer;
-  InputV, TargetV: TNNetVolume;
+  InputV, TargetV, LastOut: TNNetVolume;
   S: TSeq;
   SumCE: TNeuralFloat;
   StartTime, Elapsed: double;
 begin
   InputV  := TNNetVolume.Create(cSeqLen, 1, 1);
   TargetV := TNNetVolume.Create(cSeqLen, 1, cVocab);
+  // The last layer's Output object is stable across Compute calls: resolve
+  // the GetLastLayer.Output chain once instead of once per sample.
+  LastOut := NN.GetLastLayer.Output;
   try
     StartTime := Now();
     for Epoch := 1 to cEpochs do
@@ -206,7 +209,7 @@ begin
         MakeSeq(S);
         FillPair(S, InputV, TargetV);
         NN.Compute(InputV);
-        SumCE := SumCE + NN.GetLastLayer.Output.MeanCrossEntropy(TargetV);
+        SumCE := SumCE + LastOut.MeanCrossEntropy(TargetV);
         NN.Backpropagate(TargetV);   // per-sample SGD update (auto)
       end;
       if (Epoch = 1) or (Epoch mod 30 = 0) or (Epoch = cEpochs) then
@@ -231,13 +234,15 @@ const
   cProbes = 400;
 var
   k, t, Pred: integer;
-  InputV, TargetV: TNNetVolume;
+  InputV, TargetV, LastOut: TNNetVolume;
   S: TSeq;
   C1, C2, N1, N2: integer;
   SumCE1, SumCE2: TNeuralFloat;
 begin
   InputV  := TNNetVolume.Create(cSeqLen, 1, 1);
   TargetV := TNNetVolume.Create(cSeqLen, 1, cVocab);
+  // Stable Output object: resolve GetLastLayer.Output once, not per position.
+  LastOut := NN.GetLastLayer.Output;
   C1 := 0; C2 := 0; N1 := 0; N2 := 0; SumCE1 := 0; SumCE2 := 0;
   try
     for k := 1 to cProbes do
@@ -247,20 +252,20 @@ begin
       NN.Compute(InputV);
       for t := 0 to cSeqLen - 2 do
       begin
-        Pred := NN.GetLastLayer.Output.GetClassOnPixel(t, 0);
+        Pred := LastOut.GetClassOnPixel(t, 0);
         if t < cPrefix - 1 then
         begin
           // First half: predicting still-unseen prefix tokens (chance only).
           if Pred = S[t + 1] then Inc(C1);
           Inc(N1);
-          SumCE1 := SumCE1 + NN.GetLastLayer.Output.CrossEntropyOnPixel(TargetV, t, 0);
+          SumCE1 := SumCE1 + LastOut.CrossEntropyOnPixel(TargetV, t, 0);
         end
         else
         begin
           // Second half (and the boundary): induction can recover S[t+1].
           if Pred = S[t + 1] then Inc(C2);
           Inc(N2);
-          SumCE2 := SumCE2 + NN.GetLastLayer.Output.CrossEntropyOnPixel(TargetV, t, 0);
+          SumCE2 := SumCE2 + LastOut.CrossEntropyOnPixel(TargetV, t, 0);
         end;
       end;
     end;
@@ -402,11 +407,12 @@ procedure PrevTokenScore(NN: TNNet;
 const
   cProbes = 200;
 var
-  k, i, j, ArgK: integer;
+  k, i, j, ArgK, RowBase: integer;
   InputV, TargetV: TNNetVolume;
   Attn: TNNetVolume;
   S: TSeq;
   SumPrev, SumUniform, SumPrevShare, Best, PastMass: TNeuralFloat;
+  PrevV, v: TNeuralFloat;
   Rows, ArgHits: integer;
 begin
   InputV  := TNNetVolume.Create(cSeqLen, 1, 1);
@@ -421,17 +427,22 @@ begin
       Attn := TNNetScaledDotProductAttention(NN.Layers[gAttn1Idx]).AttentionWeights;
       for i := 1 to cPrefix - 1 do
       begin
-        SumPrev := SumPrev + Attn[i - 1, i, 0];
+        // Attn is (SeqLen, SeqLen, 1): one row base serves every key j of
+        // query i, and the (i-1, i) cell is read once instead of three times.
+        RowBase := Attn.GetRawPos(0, i);
+        PrevV := Attn.FData[RowBase + i - 1];
+        SumPrev := SumPrev + PrevV;
         SumUniform := SumUniform + 1.0 / (i + 1); // uniform over causal keys 0..i
         // Strictly-earlier mass (keys 0..i-1, self i excluded) + argmax over it.
         PastMass := 0; ArgK := 0; Best := -1;
         for j := 0 to i - 1 do
         begin
-          PastMass := PastMass + Attn[j, i, 0];
-          if Attn[j, i, 0] > Best then begin Best := Attn[j, i, 0]; ArgK := j; end;
+          v := Attn.FData[RowBase + j];
+          PastMass := PastMass + v;
+          if v > Best then begin Best := v; ArgK := j; end;
         end;
         if PastMass > 1e-9 then
-          SumPrevShare := SumPrevShare + Attn[i - 1, i, 0] / PastMass;
+          SumPrevShare := SumPrevShare + PrevV / PastMass;
         if ArgK = i - 1 then Inc(ArgHits);
         Inc(Rows);
       end;

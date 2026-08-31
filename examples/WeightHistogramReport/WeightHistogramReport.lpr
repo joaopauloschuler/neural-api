@@ -79,9 +79,8 @@ const
 
   function MaxAbsWeight(NN: TNNet): TNeuralFloat;
   var
-    L, N, K: integer;
+    L, N, MaxNeuron: integer;
     Layer: TNNetLayer;
-    Neuron: TNNetNeuron;
     V: TNeuralFloat;
   begin
     Result := 0;
@@ -89,14 +88,12 @@ const
     begin
       Layer := NN.Layers[L];
       if Layer.Neurons.Count = 0 then Continue;
-      for N := 0 to Layer.Neurons.Count - 1 do
+      MaxNeuron := Layer.Neurons.Count - 1;
+      for N := 0 to MaxNeuron do
       begin
-        Neuron := Layer.Neurons[N];
-        for K := 0 to Neuron.Weights.Size - 1 do
-        begin
-          V := Abs(Neuron.Weights.FData[K]);
-          if V > Result then Result := V;
-        end;
+        // SIMD bulk max-abs over the whole weight volume.
+        V := Layer.Neurons[N].Weights.GetMaxAbs();
+        if V > Result then Result := V;
       end;
     end;
   end;

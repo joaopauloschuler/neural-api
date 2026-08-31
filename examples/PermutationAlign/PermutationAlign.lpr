@@ -66,16 +66,22 @@ const
     NN.SetLearningRate(cLearningRate, 0.9);
   end;
 
-  // Deterministic sample for class C (so two nets can be fed the SAME data,
-  // differing only in init / batch order).
-  procedure MakeSample(C: integer; out X, Y: TNNetVolume);
+  // Fills an existing pair with a deterministic sample for class C (so two
+  // nets can be fed the SAME data, differing only in init / batch order).
+  procedure FillSample(C: integer; X, Y: TNNetVolume);
   begin
-    X := TNNetVolume.Create(2, 1, 1);
-    Y := TNNetVolume.Create(cClasses, 1, 1);
     X.FData[0] := Centers[C][0] + (Random - 0.5) * 0.6;
     X.FData[1] := Centers[C][1] + (Random - 0.5) * 0.6;
     Y.Fill(0);
     Y.FData[C] := 1.0;
+  end;
+
+  // Allocating variant for callers that keep the pair (ownership transfer).
+  procedure MakeSample(C: integer; out X, Y: TNNetVolume);
+  begin
+    X := TNNetVolume.Create(2, 1, 1);
+    Y := TNNetVolume.Create(cClasses, 1, 1);
+    FillSample(C, X, Y);
   end;
 
   procedure TrainNet(NN: TNNet);
@@ -83,19 +89,23 @@ const
     Epoch, I, C: integer;
     X, Y: TNNetVolume;
   begin
-    for Epoch := 1 to cEpochs do
-      for I := 1 to cTrainPerCls do
-        for C := 0 to cClasses - 1 do
-        begin
-          MakeSample(C, X, Y);
-          try
+    // One pair for the whole run, refilled in place: no per-sample heap
+    // allocation inside the training loop.
+    X := TNNetVolume.Create(2, 1, 1);
+    Y := TNNetVolume.Create(cClasses, 1, 1);
+    try
+      for Epoch := 1 to cEpochs do
+        for I := 1 to cTrainPerCls do
+          for C := 0 to cClasses - 1 do
+          begin
+            FillSample(C, X, Y);
             NN.Compute(X);
             NN.Backpropagate(Y);
-          finally
-            X.Free;
-            Y.Free;
           end;
-        end;
+    finally
+      X.Free;
+      Y.Free;
+    end;
   end;
 
   procedure BuildProbes(out Probes: TNNetVolumePairList);
