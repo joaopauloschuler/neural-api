@@ -1102,24 +1102,68 @@ const
   /// setup outweighs the reduction work.
   csInt8SplitKMinSlab = 128;
   csInt8SplitKMaxSplits = 64;
+  /// Int4 pass 1 moves half the bytes per multiply-accumulate of the int8
+  /// pass, so its split sizing may want more work-items in flight.
+  csInt4SplitKThreadsPerUnit = 1024;
+  csInt4SplitKMinSlab = 128;
+  csInt4SplitKMaxSplits = 64;
+
+var
+  vInt4SplitKOverridesLoaded: boolean = false;
+  vInt4SplitKThreadsPerUnit: integer = csInt4SplitKThreadsPerUnit;
+  vInt4SplitKMinSlab: integer = csInt4SplitKMinSlab;
+  vInt4SplitKMaxSplits: integer = csInt4SplitKMaxSplits;
+
+// Reads the NEURAL_INT4_SPLITK_THREADS / _MINSLAB / _MAXSPLITS environment
+// overrides once, so a split-sizing sweep needs no rebuild per point.
+procedure LoadInt4SplitKOverrides();
+  procedure ReadOverride(const pName: string; var pValue: integer);
+  var
+    EnvValue: string;
+    Parsed: integer;
+  begin
+    EnvValue := GetEnvironmentVariable(pName);
+    if (EnvValue <> '') and TryStrToInt(EnvValue, Parsed) and (Parsed > 0) then
+      pValue := Parsed;
+  end;
+begin
+  if vInt4SplitKOverridesLoaded then exit;
+  vInt4SplitKOverridesLoaded := true;
+  ReadOverride('NEURAL_INT4_SPLITK_THREADS', vInt4SplitKThreadsPerUnit);
+  ReadOverride('NEURAL_INT4_SPLITK_MINSLAB', vInt4SplitKMinSlab);
+  ReadOverride('NEURAL_INT4_SPLITK_MAXSPLITS', vInt4SplitKMaxSplits);
+end;
 
 function TDotProductSharedKernel.Int8SplitCount(): integer;
 var
   Rows, TargetThreads, MaxSplitsBySize: integer;
+  ThreadsPerUnit, MinSlab, MaxSplits: integer;
 begin
   Result := 1;
   Rows := FNumAs * FNumBs;
   if (Rows < 1) or (FSize < 1) then exit;
-  TargetThreads := FDotProductKernel.DeviceMaxComputeUnits() *
-    csInt8SplitKThreadsPerUnit;
+  if FInt4Ready then
+  begin
+    LoadInt4SplitKOverrides();
+    ThreadsPerUnit := vInt4SplitKThreadsPerUnit;
+    MinSlab := vInt4SplitKMinSlab;
+    MaxSplits := vInt4SplitKMaxSplits;
+  end
+  else
+  begin
+    ThreadsPerUnit := csInt8SplitKThreadsPerUnit;
+    MinSlab := csInt8SplitKMinSlab;
+    MaxSplits := csInt8SplitKMaxSplits;
+  end;
+  TargetThreads := FDotProductKernel.DeviceMaxComputeUnits() * ThreadsPerUnit;
   // Already fills the device (prefill, or a vocab-sized head): one pass wins,
   // because splitting would only add a partial buffer and a second launch.
   if Rows >= TargetThreads then exit;
-  MaxSplitsBySize := FSize div csInt8SplitKMinSlab;
+  MaxSplitsBySize := FSize div MinSlab;
   if MaxSplitsBySize < 2 then exit;
   Result := (TargetThreads + Rows - 1) div Rows;
   if Result > MaxSplitsBySize then Result := MaxSplitsBySize;
-  if Result > csInt8SplitKMaxSplits then Result := csInt8SplitKMaxSplits;
+  if Result > MaxSplits then Result := MaxSplits;
 end;
 
 function TDotProductSharedKernel.PrepareSplitK(pSplits: integer): boolean;
