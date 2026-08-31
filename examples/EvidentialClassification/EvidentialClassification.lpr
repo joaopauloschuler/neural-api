@@ -65,7 +65,7 @@ Coded by Claude (AI).
 
 uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes, SysUtils, Math,
-  neuralnetwork, neuralvolume;
+  neuralnetwork, neuralvolume, pascoremath32;
 
 const
   HIDDEN   = 32;        // trunk hidden width
@@ -95,14 +95,14 @@ end;
 // Draw one training sample from blob c (Box-Muller Gaussian noise).
 procedure SampleBlob(c: integer; out px, py: TNeuralFloat);
 var
-  u1, u2, g1, g2: TNeuralFloat;
+  u1, u2, r, sinv, cosv: TNeuralFloat;
 begin
   u1 := Random; if u1 < 1e-7 then u1 := 1e-7;
   u2 := Random;
-  g1 := Sqrt(-2 * Ln(u1)) * Cos(2 * Pi * u2);
-  g2 := Sqrt(-2 * Ln(u1)) * Sin(2 * Pi * u2);
-  px := CentreX(c) + SPREAD * g1;
-  py := CentreY(c) + SPREAD * g2;
+  r := Sqrt(-2 * Ln(u1));
+  pcr_sincosf(2 * Pi * u2, sinv, cosv);
+  px := CentreX(c) + SPREAD * (r * cosv);
+  py := CentreY(c) + SPREAD * (r * sinv);
 end;
 
 // --------------------------------------------------------------------------
