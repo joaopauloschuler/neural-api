@@ -34950,7 +34950,6 @@ begin
           Inc(posV, RowStride);
         end;
         // Softmax Jacobian.
-        SumDAttnAttn := 0;
         SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[AttnRow], SeqLen);
         for j := 0 to SeqLenM1 do
           FdScoreBuf[j] := FAttn.FData[AttnRow + j] *
@@ -37203,7 +37202,6 @@ begin
         Inc(posV, RowStride);
       end;
       // ---- Softmax Jacobian: dScore[j] = Attn[j]*(dAttn[j] - sum_k dAttn[k]*Attn[k]) ----
-      SumDAttnAttn := 0;
       SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[AttnRow], KVLen);
       for j := 0 to KVLenM1 do
         FdScoreBuf[j] := FAttn.FData[AttnRow + j] * (FdAttnBuf[j] - SumDAttnAttn);
@@ -43060,7 +43058,6 @@ begin
           Inc(posV, RowStride);
         end;
         // ---- Softmax Jacobian: dScore[j] = Attn[j]*(dAttn[j] - sum_k dAttn[k]*Attn[k]) ----
-        SumDAttnAttn := 0;
         SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[AttnRow], SeqLen);
         for j := 0 to SeqLenM1 do
           FdScoreBuf[j] := FAttn.FData[AttnRow + j] * (FdAttnBuf[j] - SumDAttnAttn);
@@ -43517,7 +43514,6 @@ begin
       Inc(posV, RowStride);
     end;
     // ---- Softmax Jacobian ----
-    SumDAttnAttn := 0;
     SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[AttnRow], SeqLen);
     for j := 0 to SeqLenM1 do
       FdScoreBuf[j] := FAttn.FData[AttnRow + j] * (FdAttnBuf[j] - SumDAttnAttn);
@@ -43982,7 +43978,6 @@ begin
       Inc(posV, RowStride);
     end;
     // ---- softmax Jacobian -> dScore ----
-    SumDAttnAttn := 0;
     SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[AttnRow], SeqLen);
     for j := 0 to SeqLenM1 do
       FdScoreBuf[j] := FAttn.FData[AttnRow + j] * (FdAttnBuf[j] - SumDAttnAttn);
@@ -44374,7 +44369,6 @@ begin
       Inc(posV, RowStride);
     end;
     // ---- softmax Jacobian -> dScore ----
-    SumDAttnAttn := 0;
     SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[AttnRow], SeqLen);
     for j := 0 to SeqLenM1 do
       FdScoreBuf[j] := FAttn.FData[AttnRow + j] * (FdAttnBuf[j] - SumDAttnAttn);
@@ -45657,7 +45651,6 @@ begin
       end;
       // ---- Softmax Jacobian over the augmented row ----
       // dScore[m] = w[m] * (dAttn[m] - sum_k dAttn[k]*w[k])
-      SumDAttnAttn := 0;
       SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FSinkAttn.FData[Row], AugLen);
       for j := 0 to AugLenM1 do
         FdScoreBuf[j] := FSinkAttn.FData[Row + j] * (FdAttnBuf[j] - SumDAttnAttn);
@@ -46417,7 +46410,7 @@ var
   RowStride, posE, posF, attnBase, posR, baseE, baseF: integer;
   dOutPtr, qPtr, dQPtr, dKpPtr, dVpPtr: pointer;
   Prev, PrevErr, E, F, dE, dF: TNNetVolume;
-  posdE, posdF: integer;
+  posdE: integer;
   SumDAttnAttn, A, dS, Coef, NegLr: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -46460,7 +46453,6 @@ begin
           Inc(posR, FDk);
         end;
         // Softmax Jacobian: dScore[r] = Attn[r]*(dAttn[r] - sum_k dAttn[k]*Attn[k]).
-        SumDAttnAttn := 0;
         SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[attnBase], FProjDim);
         for r := 0 to ProjDimM1 do
           FdScoreBuf[r] := FAttn.FData[attnBase + r] * (FdAttnBuf[r] - SumDAttnAttn);
@@ -46498,23 +46490,25 @@ begin
         baseF := F.GetRawPos(0, r);              // #11: F row base (depth 1)
         posE := FDk;                             // s=0 K-region offset (#12)
         posF := 2 * FDk;                         // s=0 V-region offset (#12)
+        // dE/dF share shape (SeqLen, ProjDim, 1), so one carried offset (#12)
+        // indexes both; depth 1 makes the per-s step 1.
+        posdE := dE.GetRawPos(0, r);
         for s := 0 to SeqLenM1 do
         begin
-          // #3 RMW: compute each delta's flat offset once, reuse for read+write.
-          posdE := dE.GetRawPos(s, r);
+          // #3 RMW: one flat offset per delta pair, reused for read+write.
           dE.FData[posdE] := dE.FData[posdE] + NegLr * TNNetVolume.DotProduct(
             dKpPtr, Prev.GetRawPtr(posE), FDk);
           Coef := E.FData[baseE + s];
           if Coef <> 0 then
             TNNetVolume.MulAdd(PrevErr.GetRawPtr(posE), dKpPtr, Coef, FDk);
-          posdF := dF.GetRawPos(s, r);
-          dF.FData[posdF] := dF.FData[posdF] + NegLr * TNNetVolume.DotProduct(
+          dF.FData[posdE] := dF.FData[posdE] + NegLr * TNNetVolume.DotProduct(
             dVpPtr, Prev.GetRawPtr(posF), FDk);
           Coef := F.FData[baseF + s];
           if Coef <> 0 then
             TNNetVolume.MulAdd(PrevErr.GetRawPtr(posF), dVpPtr, Coef, FDk);
           Inc(posE, RowStride);
           Inc(posF, RowStride);
+          Inc(posdE);
         end;
       end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -47583,6 +47577,7 @@ var
   SeqLen, Depth, HalfD, NumPrefix: integer;
   SeqLenM1, HalfDM1, DepthM1: integer;
   pos, n, c, base: integer;
+  idxCS, idx, idxHi, idxOut: integer;
   basePrev0, baseOut0: integer;
   cs, sn, x0, x1: TNeuralFloat;
   Prev: TNNetVolume;
@@ -47614,12 +47609,16 @@ begin
       // rotate_half pairing: channel c (c<HalfD) with c+HalfD.
       for c := 0 to HalfDM1 do
       begin
-        cs := FCos[base + c];
-        sn := FSin[base + c];
-        x0 := Prev.FData[basePrev0 + c];
-        x1 := Prev.FData[basePrev0 + c + HalfD];
-        FOutput.FData[baseOut0 + c]         := cs * x0 - sn * x1;
-        FOutput.FData[baseOut0 + c + HalfD] := cs * x1 + sn * x0;
+        idxCS := base + c;           // #4: shared by the cos and sin reads
+        cs := FCos[idxCS];
+        sn := FSin[idxCS];
+        idx := basePrev0 + c;        // #4: base+c formed once per volume
+        idxHi := idx + HalfD;
+        x0 := Prev.FData[idx];
+        x1 := Prev.FData[idxHi];
+        idxOut := baseOut0 + c;
+        FOutput.FData[idxOut]         := cs * x0 - sn * x1;
+        FOutput.FData[idxOut + HalfD] := cs * x1 + sn * x0;
       end;
     end;
   end;
@@ -47632,6 +47631,7 @@ var
   SeqLen, Depth, HalfD, NumPrefix: integer;
   SeqLenM1, HalfDM1, DepthM1: integer;
   pos, n, c, base: integer;
+  idxCS, idxG, idx, idxHi: integer;
   basePrevErr0, baseOutErr0: integer;
   cs, sn, gy0, gy1: TNeuralFloat;
   PrevErr: TNNetVolume;
@@ -47669,14 +47669,17 @@ begin
         // Transpose of the forward rotation.
         for c := 0 to HalfDM1 do
         begin
-          cs := FCos[base + c];
-          sn := FSin[base + c];
-          gy0 := FOutputError.FData[baseOutErr0 + c];
-          gy1 := FOutputError.FData[baseOutErr0 + c + HalfD];
-          PrevErr.FData[basePrevErr0 + c] :=
-            PrevErr.FData[basePrevErr0 + c] + (cs * gy0 + sn * gy1);
-          PrevErr.FData[basePrevErr0 + c + HalfD] :=
-            PrevErr.FData[basePrevErr0 + c + HalfD] + (cs * gy1 - sn * gy0);
+          idxCS := base + c;             // #4: shared by the cos and sin reads
+          cs := FCos[idxCS];
+          sn := FSin[idxCS];
+          idxG := baseOutErr0 + c;
+          gy0 := FOutputError.FData[idxG];
+          gy1 := FOutputError.FData[idxG + HalfD];
+          // #3 RMW: each accumulate's flat offset computed once, not twice.
+          idx := basePrevErr0 + c;
+          idxHi := idx + HalfD;
+          PrevErr.FData[idx]   := PrevErr.FData[idx]   + (cs * gy0 + sn * gy1);
+          PrevErr.FData[idxHi] := PrevErr.FData[idxHi] + (cs * gy1 - sn * gy0);
         end;
       end;
     end;
@@ -47710,10 +47713,64 @@ begin
   HasDeriv := (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size);
   // Two-pass: fill FOutput with softplus(x), vectorize tanh in place
   // (Tanh), then a scalar finishing pass reads tanh(softplus(x)) back.
-  // When the derivative pass will run, the exp(x) the first pass already
-  // computed is parked in FOutputErrorDeriv (sized to match FOutput exactly
-  // under HasDeriv) so the second pass reads it back instead of recomputing it;
-  // each slot is read before it is overwritten with the final derivative.
+  // When the derivative pass will run, exp(x) is parked in FOutputErrorDeriv
+  // (sized to match FOutput exactly under HasDeriv) so the second pass reads
+  // it back instead of recomputing it; each slot is read before it is
+  // overwritten with the final derivative.
+  {$IFDEF AVXANY}
+  // exp(x) is batched 8-wide via the elementwise Exp kernel (#19). The exp
+  // argument is clamped into [-88, 88] so the AVXExp scalar tail (plain
+  // pcr_expf, no internal clamp) never overflows on extreme inputs; the
+  // saturated x > 20 branch below ignores the clamped exp entirely, and below
+  // -88 the exp underflows to a negligible denormal either way.
+  if HasDeriv then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 88 then x := 88 else if x < -88 then x := -88;
+      FOutputErrorDeriv.FData[OutputCnt] := x;
+    end;
+    TNNetVolume.Exp(@FOutputErrorDeriv.FData[0], @FOutputErrorDeriv.FData[0],
+      LocalPrevOutput.Size);
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      // Numerically-stable softplus; tanh saturates correctly at both extremes.
+      if x > 20 then
+        FOutput.FData[OutputCnt] := x
+      else
+      begin
+        expVal := FOutputErrorDeriv.FData[OutputCnt];
+        if x < -20 then
+          FOutput.FData[OutputCnt] := expVal
+        else
+          FOutput.FData[OutputCnt] := pcr_log1pf(expVal);
+      end;
+    end;
+  end
+  else
+  begin
+    // No park buffer here: FOutput itself hosts exp(x), and the finishing pass
+    // reads each slot before overwriting it with softplus(x).
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 88 then x := 88 else if x < -88 then x := -88;
+      FOutput.FData[OutputCnt] := x;
+    end;
+    TNNetVolume.Exp(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 20 then
+        FOutput.FData[OutputCnt] := x
+      else if x >= -20 then
+        FOutput.FData[OutputCnt] := pcr_log1pf(FOutput.FData[OutputCnt]);
+      // x < -20: FOutput already holds exp(x), the softplus limit.
+    end;
+  end;
+  {$ELSE}
   if HasDeriv then
   begin
     for OutputCnt := 0 to SizeM1 do
@@ -47746,6 +47803,7 @@ begin
         FOutput.FData[OutputCnt] := pcr_log1pf(NeuralExp(x));
     end;
   end;
+  {$ENDIF}
   TNNetVolume.Tanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
   if HasDeriv then
   begin
@@ -47921,6 +47979,49 @@ begin
   // exactly under HasDeriv) as well; the second pass reads each slot back
   // before overwriting it with the final derivative, halving the mid-band
   // transcendental count.
+  {$IFDEF AVXANY}
+  // exp(x) is batched 8-wide via the elementwise Exp kernel (#19), hosted in
+  // FOutput until softplus overwrites it. The exp argument is clamped into
+  // [-88, 88] so the AVXExp scalar tail (plain pcr_expf, no internal clamp)
+  // never overflows on extreme inputs; the saturated x > 30 branch below
+  // ignores the clamped exp entirely, and below -88 the exp underflows to a
+  // negligible denormal either way.
+  for OutputCnt := 0 to SizeM1 do
+  begin
+    x := LocalPrevOutput.FData[OutputCnt];
+    if x > 88 then x := 88 else if x < -88 then x := -88;
+    FOutput.FData[OutputCnt] := x;
+  end;
+  TNNetVolume.Exp(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+  if HasDeriv then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 30 then
+        FOutput.FData[OutputCnt] := x
+      else if x >= -30 then
+      begin
+        sp := pcr_log1pf(FOutput.FData[OutputCnt]);
+        FOutputErrorDeriv.FData[OutputCnt] := sp;
+        FOutput.FData[OutputCnt] := sp;
+      end;
+      // x < -30: FOutput already holds exp(x), the softplus limit.
+    end;
+  end
+  else
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 30 then
+        FOutput.FData[OutputCnt] := x
+      else if x >= -30 then
+        FOutput.FData[OutputCnt] := pcr_log1pf(FOutput.FData[OutputCnt]);
+      // x < -30: FOutput already holds exp(x), the softplus limit.
+    end;
+  end;
+  {$ELSE}
   if HasDeriv then
   begin
     for OutputCnt := 0 to SizeM1 do
@@ -47951,6 +48052,7 @@ begin
         FOutput.FData[OutputCnt] := pcr_log1pf(NeuralExp(x));
     end;
   end;
+  {$ENDIF}
   TNNetVolume.Erf(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
   if HasDeriv then
   begin
@@ -48247,16 +48349,23 @@ begin
   // The input is a single depth-contiguous elementwise segment. exp(beta*x) -- the
   // transcendental shared by the output ln(1+exp) and the sigmoid derivative -- is
   // batched 8-wide via AVXExp (the vector exp PointwiseSoftMax uses) into a scratch
-  // buffer; ExpBuf holds exp(beta*x) clamped into AVXExp's safe [exp(Lo),exp(Hi)]
-  // range, never overflowing. The exact scalar BetaX>30 / BetaX<-30 thresholds are
-  // reapplied in the scalar finishing pass so saturation matches the scalar path:
-  // for those clamped lanes the precomputed exp is ignored entirely.
+  // buffer. The exact scalar BetaX>30 / BetaX<-30 thresholds are reapplied in the
+  // scalar finishing pass so saturation matches the scalar path: for those clamped
+  // lanes the precomputed exp is ignored entirely.
   Size := LocalPrevOutput.Size;
   if Size > 0 then
   begin
     if Length(FBetaXBuf) <> Size then SetLength(FBetaXBuf, Size); // rule #17: lazy amortized resize
-    Move(LocalPrevOutput.FData[0], FBetaXBuf[0], Size * csNeuralFloatSize);
-    TNNetVolume.Mul(@FBetaXBuf[0], Beta, Size);
+    // One fused scalar pass builds beta*x, clamped into [-88, 88] so the AVXExp
+    // scalar tail (plain pcr_expf, no internal clamp) never overflows on extreme
+    // inputs. The finishing pass reads FBetaXBuf only for the +/-30 saturation
+    // comparisons, which the clamp preserves.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      BetaX := Beta * LocalPrevOutput.FData[OutputCnt];
+      if BetaX > 88 then BetaX := 88 else if BetaX < -88 then BetaX := -88;
+      FBetaXBuf[OutputCnt] := BetaX;
+    end;
     if Length(FExpBuf) <> Size then SetLength(FExpBuf, Size); // rule #17: lazy amortized resize
     TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FBetaXBuf[0]), Size);
     if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
@@ -48445,7 +48554,7 @@ var
   MaxPrevOutputErrorPos: integer;
   StartTime: double;
   localNeuron: TNNetNeuron;
-  gradBeta, beta, invBeta, x, betaX, sig, y: TNeuralFloat;
+  gradBeta, beta, invBeta, x, betaX, sig, y, expBetaX: TNeuralFloat;
   i: integer;
   LocalPrevOutput: TNNetVolume;
   HasDeriv: boolean;
@@ -48494,13 +48603,17 @@ begin
       end
       else if betaX < -30 then
       begin
-        sig := NeuralExp(betaX);
-        y := invBeta * pcr_logf(1 + NeuralExp(betaX));
+        // One exp serves both: sigmoid(z) -> e^z here (#4).
+        expBetaX := NeuralExp(betaX);
+        sig := expBetaX;
+        y := invBeta * pcr_logf(1 + expBetaX);
       end
       else
       begin
-        sig := 1 / (1 + NeuralExp(-betaX));
-        y := invBeta * pcr_logf(1 + NeuralExp(betaX));
+        // One exp serves both, as Compute does: 1/(1+e^-z) = e^z/(1+e^z).
+        expBetaX := NeuralExp(betaX);
+        sig := expBetaX / (1 + expBetaX);
+        y := invBeta * pcr_logf(1 + expBetaX);
       end;
       gradBeta := gradBeta + FOutputError.Raw[i] * invBeta * (x * sig - y);
     end;
@@ -48587,11 +48700,9 @@ begin
   begin
     if Alpha = 0 then
     begin
-      for OutputCnt := 0 to SizeM1 do
-      begin
-        FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt];
-        FOutputErrorDeriv.FData[OutputCnt] := 1.0;
-      end;
+      // Identity: bulk copy + fill (#13) instead of a scalar per-element loop.
+      FOutput.Copy(LocalPrevOutput);
+      FOutputErrorDeriv.Fill(1.0);
     end
     else if Alpha < 0 then
     begin
@@ -132075,7 +132186,7 @@ var
   OldW, OldHeadW: TNNetVolume;
   MeanRow: array of TNeuralFloat;
   OldBias: array of TNeuralFloat;
-  MeanBias: TNeuralFloat;
+  MeanBias, InvVocab: TNeuralFloat;
   HeadVecSize: integer;
   LastLayerIdx: integer;
   EmbSizeM1, OldVocabM1, CopyRowsM1, NewVocabSizeM1, HeadVecSizeM1: integer;
@@ -132136,15 +132247,15 @@ begin
     // Mean of the existing rows (HF convention for new token rows).
     SetLength(MeanRow, EmbSize);
     for ColCnt := 0 to EmbSizeM1 do MeanRow[ColCnt] := 0;
+    InvVocab := 1 / OldVocab;
     for RowCnt := 0 to OldVocabM1 do
     begin
       rowBase := RowCnt * EmbSize;
-      for ColCnt := 0 to EmbSizeM1 do
-        MeanRow[ColCnt] := MeanRow[ColCnt] +
-          OldW.FData[rowBase + ColCnt];
+      // Bulk row accumulate (#13), matching the LM-head twin below.
+      TNNetVolume.Add(@MeanRow[0], @OldW.FData[rowBase], EmbSize);
     end;
-    for ColCnt := 0 to EmbSizeM1 do
-      MeanRow[ColCnt] := MeanRow[ColCnt] / OldVocab;
+    // #21 reciprocal-multiply; cold path, no gradient check watches it.
+    TNNetVolume.Mul(@MeanRow[0], InvVocab, EmbSize);
     EmbLayer.SetNumWeightsForAllNeurons(NewVocabSize, 1, EmbSize);
     CopyRows := Min(OldVocab, NewVocabSize);
     CopyRowsM1 := CopyRows - 1;
@@ -132192,9 +132303,10 @@ begin
         OldBias[RowCnt] := Head.Neurons[RowCnt].BiasWeight;
         MeanBias := MeanBias + Head.Neurons[RowCnt].BiasWeight;
       end;
-      for ColCnt := 0 to HeadVecSizeM1 do
-        MeanRow[ColCnt] := MeanRow[ColCnt] / OldVocab;
-      MeanBias := MeanBias / OldVocab;
+      // #21 reciprocal-multiply; cold path, no gradient check watches it.
+      InvVocab := 1 / OldVocab;
+      TNNetVolume.Mul(@MeanRow[0], InvVocab, HeadVecSize);
+      MeanBias := MeanBias * InvVocab;
       // Adjust the neuron count, then rebuild the layer geometry through
       // SetPrevLayer: output volumes, vector sizes, concatenated-weight
       // caches and tiling all derive from FNeurons.Count there. It re-inits
@@ -133480,6 +133592,18 @@ begin
       else
         FOutput.FData[OutputCnt] := x*(x + 3)*cInv6;
     end;
+  end
+  else
+  if FActivationFn = @Swish then
+  begin
+    // Swish(x) = x * sigmoid(x). Batched sigmoid into the output slice, then an
+    // in-place multiply by the raw input (both kernels fall back to scalar
+    // loops on non-AVX builds). Replaces a per-element indirect call plus a
+    // scalar exponential; parity with the scalar Swish() is within ~1e-6.
+    TNNetVolume.Sigmoid(@FOutput.FData[pFirst], @FOutputRaw.FData[pFirst],
+      pLast - pFirst + 1);
+    TNNetVolume.Mul(@FOutput.FData[pFirst], @FOutputRaw.FData[pFirst],
+      pLast - pFirst + 1);
   end
   else
   begin

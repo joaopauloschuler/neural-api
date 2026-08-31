@@ -1684,6 +1684,7 @@ type
     procedure TestLogCoshActivationGradientCheck;
     procedure TestLogCoshActivationStability;
     procedure TestSerfGradientCheck;
+    procedure TestVisionRoPE2DForwardAndGradientCheck;
     procedure TestBentIdentityForward;
     procedure TestBentIdentityGradientCheck;
     procedure TestBentIdentitySerializationRoundTrip;
@@ -2965,6 +2966,9 @@ procedure TTestNeuralNumerical.TestSoftExponentialGradientCheck;
 begin
   // alpha > 0 branch: derivative = exp(alpha*x), smooth everywhere.
   ActivationGradientCheck(Self, TNNetSoftExponential.Create(0.5), 'SoftExponentialPos',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+  // alpha = 0 branch: identity forward with derivative 1 everywhere.
+  ActivationGradientCheck(Self, TNNetSoftExponential.Create(0.0), 'SoftExponentialZero',
     [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
   // alpha < 0 branch: keep inputs inside the log domain x < 1/alpha - alpha.
   // For alpha = -0.3 that bound is ~ -3.03, so bounded inputs are safe.
@@ -30860,6 +30864,100 @@ begin
   // Serf is smooth everywhere; sample a moderate range around the bend.
   ActivationGradientCheck(Self, TNNetSerf.Create(), 'Serf',
     [0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 0.0], 0.01);
+end;
+
+// 2x2 patch grid + 1 prefix token, head_dim 8. Checks: prefix tokens pass
+// through untouched, each rotated pair preserves its norm (the rotation is
+// orthogonal), and the input gradient matches a finite-difference probe.
+procedure TTestNeuralNumerical.TestVisionRoPE2DForwardAndGradientCheck;
+const
+  SeqLen = 5;   // 1 prefix + 2x2 patches
+  Depth = 8;
+  HalfD = Depth div 2;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  // Double keeps the finite-difference subtraction meaningful: the loss sums
+  // 40 O(1) terms, so a Single accumulator's rounding is ~1% of the probe.
+  epsilon, lossPlus, lossMinus, numericalGrad: Double;
+  analyticalGrad: TNeuralFloat;
+  inNorm, outNorm: TNeuralFloat;
+  i, pos, c: integer;
+  Rope: TNNetVisionRoPE2D;
+  OutV: TNNetVolume;
+
+  function ComputeLoss(AInput: TNNetVolume): Double;
+  var
+    k: integer;
+    diff: Double;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, Depth);
+  Desired := TNNetVolume.Create(SeqLen, 1, Depth);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    Rope := TNNetVisionRoPE2D.Create(2, 2, 1, 100.0);
+    NN.AddLayer(Rope);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.61) * 1.3 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.37);
+
+    NN.Compute(Input);
+    OutV := NN.GetLastLayer.Output;
+    // Prefix token (pos 0) is passed through unrotated.
+    for c := 0 to Depth - 1 do
+      AssertEquals('VisionRoPE2D prefix channel ' + IntToStr(c),
+        Input[0, 0, c], OutV[0, 0, c], 1e-6);
+    // Each patch token's rotated pair (c, c+HalfD) preserves its norm.
+    for pos := 1 to SeqLen - 1 do
+      for c := 0 to HalfD - 1 do
+      begin
+        inNorm := Sqr(Input[pos, 0, c]) + Sqr(Input[pos, 0, c + HalfD]);
+        outNorm := Sqr(OutV[pos, 0, c]) + Sqr(OutV[pos, 0, c + HalfD]);
+        AssertEquals('VisionRoPE2D pair norm at pos ' + IntToStr(pos) +
+          ' c ' + IntToStr(c), inNorm, outNorm, 1e-4);
+      end;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('VisionRoPE2D input gradient at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestBentIdentityForward;
