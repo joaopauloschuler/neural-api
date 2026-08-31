@@ -122757,18 +122757,9 @@ var
   MaxCountNeuronPos: integer;
   MaxCollectNeuronPos: integer;
   MaxCollectWeightPos: integer;
-  MaxLayerCountNeuronPos: integer;
-  MaxLayerCollectNeuronPos: integer;
-  MaxLayerCollectWeightPos: integer;
   MaxPruneNeuronPos: integer;
   MaxPruneWeightPos: integer;
   MaxLossOutputPos: integer;
-  MaxKneeCollectNeuronPos: integer;
-  MaxKneeCollectWeightPos: integer;
-  MaxKneeCountNeuronPos: integer;
-  MaxKneeLayerCollectNeuronPos: integer;
-  MaxKneeLayerCollectWeightPos: integer;
-  MaxKneeScanNeuronPos: integer;
   MaxKneeScanWeightPos: integer;
   Lines: TStringList;
   Levels: array of TNeuralFloat;
@@ -122777,6 +122768,13 @@ var
   LevelRealised: array of TNeuralFloat;
   TrLayerIdx: array of integer;
   AllAbs: array of TNeuralFloat;
+  // Invariant |w| pool: weights are restored exactly from Snapshot after each
+  // level, so the pooled magnitudes are collected once and copied into the
+  // AllAbs/LayerAbs scratch per level (SelectKthSmallest permutes the scratch).
+  AllAbsMaster: array of TNeuralFloat;
+  LayerWeightCount: array of integer;  // weights per trainable layer
+  LayerOffset: array of integer;       // slice start of each layer in the pool
+  MaxLayerWeightCount: integer;
   KneePrunedFrac: array of TNeuralFloat;
   KneeWeights: array of integer;
   KneeZeroed: array of integer;
@@ -122787,7 +122785,9 @@ var
   MPLastLayerIdx, MPUsedSamplesM1, MPNumLevelsM1, MPTrainM1, MPBaselineHigh: integer;
   Layer: TNNetLayer;
   Neuron: TNNetNeuron;
-  W, AbsW, Threshold, S, AccLoss, AccAcc, SampleLoss, Tgt, Diff: TNeuralFloat;
+  LblVol: TNNetVolume;
+  CommonSize: integer;
+  AbsW, Threshold, S, AccLoss, AccAcc, SampleLoss, Diff: TNeuralFloat;
   BaseLoss, BaseAcc, BarVal, MaxBarVal, RealisedFrac: TNeuralFloat;
   HasLabels, RestoreNeeded: boolean;
   Output: TNNetVolume;
@@ -122824,6 +122824,7 @@ begin
 
     // ---- collect trainable layers (Neurons with a non-empty weight tensor). --
     SetLength(TrLayerIdx, 0);
+    SetLength(LayerWeightCount, 0);
     TotalWeights := 0;
     MPLastLayerIdx := NN.GetLastLayerIdx();
     for LayerIdx := 0 to MPLastLayerIdx do
@@ -122833,10 +122834,14 @@ begin
       if Layer.Neurons[0].Weights = nil then Continue;
       if Layer.Neurons[0].Weights.Size = 0 then Continue;
       SetLength(TrLayerIdx, Length(TrLayerIdx) + 1);
+      SetLength(LayerWeightCount, Length(LayerWeightCount) + 1);
       TrLayerIdx[High(TrLayerIdx)] := LayerIdx;
       MaxCountNeuronPos := Layer.Neurons.Count - 1;
+      PerLayerCount := 0;
       for NeuronIdx := 0 to MaxCountNeuronPos do
-        TotalWeights := TotalWeights + Layer.Neurons[NeuronIdx].Weights.Size;
+        PerLayerCount := PerLayerCount + Layer.Neurons[NeuronIdx].Weights.Size;
+      LayerWeightCount[High(LayerWeightCount)] := PerLayerCount;
+      TotalWeights := TotalWeights + PerLayerCount;
     end;
     TrainableLayers := Length(TrLayerIdx);
 
@@ -122899,6 +122904,33 @@ begin
     SetLength(KneeZeroed, TrainableLayers);
     SetLength(AllAbs, TotalWeights);
 
+    // ---- collect the |w| pool ONCE (layer slices in TrLayerIdx order). ----
+    // The per-level threshold scans work on scratch copies of this pool: one
+    // Move per level replaces re-walking every neuron's weight list.
+    SetLength(AllAbsMaster, TotalWeights);
+    SetLength(LayerOffset, TrainableLayers);
+    MaxLayerWeightCount := 0;
+    K := 0;
+    for I := 0 to MPTrainM1 do
+    begin
+      LayerOffset[I] := K;
+      if LayerWeightCount[I] > MaxLayerWeightCount then
+        MaxLayerWeightCount := LayerWeightCount[I];
+      Layer := NN.Layers[TrLayerIdx[I]];
+      MaxCollectNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxCollectNeuronPos do
+      begin
+        Neuron := Layer.Neurons[NeuronIdx];
+        MaxCollectWeightPos := Neuron.Weights.Size - 1;
+        for LayerIdx := 0 to MaxCollectWeightPos do
+        begin
+          AllAbsMaster[K] := Abs(Neuron.Weights.FData[LayerIdx]);
+          Inc(K);
+        end;
+      end;
+    end;
+    if PerLayer then SetLength(LayerAbs, MaxLayerWeightCount);
+
     for LvIdx := 0 to MPNumLevelsM1 do
     begin
       S := Levels[LvIdx] / 100.0;
@@ -122907,23 +122939,9 @@ begin
       // ---- compute & apply threshold(s), zeroing |w| <= threshold in place. --
       if not PerLayer then
       begin
-        // GLOBAL: pool all |w|, sort, cut at s-percentile.
-        K := 0;
-        for I := 0 to MPTrainM1 do
-        begin
-          Layer := NN.Layers[TrLayerIdx[I]];
-          MaxCollectNeuronPos := Layer.Neurons.Count - 1;
-          for NeuronIdx := 0 to MaxCollectNeuronPos do
-          begin
-            Neuron := Layer.Neurons[NeuronIdx];
-            MaxCollectWeightPos := Neuron.Weights.Size - 1;
-            for LayerIdx := 0 to MaxCollectWeightPos do
-            begin
-              AllAbs[K] := Abs(Neuron.Weights.FData[LayerIdx]);
-              Inc(K);
-            end;
-          end;
-        end;
+        // GLOBAL: refresh the scratch from the invariant pool, cut at the
+        // s-percentile.
+        Move(AllAbsMaster[0], AllAbs[0], TotalWeights * csNeuralFloatSize);
         CutIdx := Trunc(S * TotalWeights);
         if CutIdx < 0 then CutIdx := 0;
         if CutIdx > TotalWeights then CutIdx := TotalWeights;
@@ -122940,29 +122958,16 @@ begin
       for I := 0 to MPTrainM1 do
       begin
         Layer := NN.Layers[TrLayerIdx[I]];
-        KneeWeights[I] := 0;
+        KneeWeights[I] := LayerWeightCount[I];
         KneeZeroed[I] := 0;
-        MaxLayerCountNeuronPos := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to MaxLayerCountNeuronPos do
-          KneeWeights[I] := KneeWeights[I] + Layer.Neurons[NeuronIdx].Weights.Size;
 
         if PerLayer then
         begin
-          // PER-LAYER: sort this layer's |w|, cut at s-percentile.
-          PerLayerCount := KneeWeights[I];
-          SetLength(LayerAbs, PerLayerCount);
-          K := 0;
-          MaxLayerCollectNeuronPos := Layer.Neurons.Count - 1;
-          for NeuronIdx := 0 to MaxLayerCollectNeuronPos do
-          begin
-            Neuron := Layer.Neurons[NeuronIdx];
-            MaxLayerCollectWeightPos := Neuron.Weights.Size - 1;
-            for LayerIdx := 0 to MaxLayerCollectWeightPos do
-            begin
-              LayerAbs[K] := Abs(Neuron.Weights.FData[LayerIdx]);
-              Inc(K);
-            end;
-          end;
+          // PER-LAYER: refresh this layer's slice of the invariant pool,
+          // cut at the s-percentile.
+          PerLayerCount := LayerWeightCount[I];
+          Move(AllAbsMaster[LayerOffset[I]], LayerAbs[0],
+            PerLayerCount * csNeuralFloatSize);
           PerLayerCut := Trunc(S * PerLayerCount);
           if PerLayerCut <= 0 then Threshold := -1
           else if PerLayerCut >= PerLayerCount then
@@ -122972,19 +122977,23 @@ begin
             PerLayerCut - 1);
         end;
 
-        MaxPruneNeuronPos := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to MaxPruneNeuronPos do
+        // Threshold < 0 means "zero nothing": skip the whole scan.
+        if Threshold >= 0 then
         begin
-          Neuron := Layer.Neurons[NeuronIdx];
-          MaxPruneWeightPos := Neuron.Weights.Size - 1;
-          for LayerIdx := 0 to MaxPruneWeightPos do
+          MaxPruneNeuronPos := Layer.Neurons.Count - 1;
+          for NeuronIdx := 0 to MaxPruneNeuronPos do
           begin
-            AbsW := Abs(Neuron.Weights.FData[LayerIdx]);
-            if (Threshold >= 0) and (AbsW <= Threshold) then
+            Neuron := Layer.Neurons[NeuronIdx];
+            MaxPruneWeightPos := Neuron.Weights.Size - 1;
+            for LayerIdx := 0 to MaxPruneWeightPos do
             begin
-              Neuron.Weights.FData[LayerIdx] := 0;
-              Inc(KneeZeroed[I]);
-              Inc(ZeroedTotal);
+              AbsW := Abs(Neuron.Weights.FData[LayerIdx]);
+              if AbsW <= Threshold then
+              begin
+                Neuron.Weights.FData[LayerIdx] := 0;
+                Inc(KneeZeroed[I]);
+                Inc(ZeroedTotal);
+              end;
             end;
           end;
         end;
@@ -123004,27 +123013,38 @@ begin
       begin
         NN.Compute(Samples[SampleIdx]);
         Output := NN.GetLastLayer.Output;
-        SampleLoss := 0;
-        MaxLossOutputPos := Output.Size - 1;
-        for I := 0 to MaxLossOutputPos do
+        if HasLabels then
         begin
-          if HasLabels then
+          LblVol := Labels[SampleIdx];
+          SampleLoss := 0;
+          // Head: elementwise MSE over the overlapping prefix. Tail (label
+          // shorter than the output): the target is 0, so the remainder is a
+          // vectorized sum of squares.
+          CommonSize := Output.Size;
+          if LblVol.Size < CommonSize then CommonSize := LblVol.Size;
+          MaxLossOutputPos := CommonSize - 1;
+          for I := 0 to MaxLossOutputPos do
           begin
-            if I < Labels[SampleIdx].Size then Tgt := Labels[SampleIdx].Raw[I]
-            else Tgt := 0;
-          end
-          else
-            Tgt := Baseline[SampleIdx].Raw[I];
-          Diff := Output.Raw[I] - Tgt;
-          SampleLoss := SampleLoss + Diff * Diff;
-        end;
+            Diff := Output.Raw[I] - LblVol.Raw[I];
+            SampleLoss := SampleLoss + Diff * Diff;
+          end;
+          if CommonSize < Output.Size then
+            SampleLoss := SampleLoss + TNNetVolume.DotProduct(
+              TNeuralFloatArrPtr(@Output.FData[CommonSize]),
+              TNeuralFloatArrPtr(@Output.FData[CommonSize]),
+              Output.Size - CommonSize);
+        end
+        else
+          // Baseline outputs were copied from this same net, so the sizes
+          // match by construction.
+          SampleLoss := Output.GetDistanceSqr(Baseline[SampleIdx]);
         if Output.Size > 0 then SampleLoss := SampleLoss / Output.Size;
         AccLoss := AccLoss + SampleLoss;
 
         if HasLabels then
         begin
           PredClass := Output.GetClass();
-          TrueClass := Labels[SampleIdx].GetClass();
+          TrueClass := LblVol.GetClass();
           if PredClass = TrueClass then AccAcc := AccAcc + 1.0;
         end;
       end;
@@ -123113,29 +123133,10 @@ begin
     // ---- (c) per-layer pruned fraction AT THE KNEE. ----
     // Re-apply the knee threshold once to read per-layer pruned counts.
     S := KneeSparsity / 100.0;
-    for I := 0 to MPTrainM1 do
-    begin
-      KneeZeroed[I] := 0;
-      KneeWeights[I] := 0;
-    end;
     if not PerLayer then
     begin
-      K := 0;
-      for I := 0 to MPTrainM1 do
-      begin
-        Layer := NN.Layers[TrLayerIdx[I]];
-        MaxKneeCollectNeuronPos := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to MaxKneeCollectNeuronPos do
-        begin
-          Neuron := Layer.Neurons[NeuronIdx];
-          MaxKneeCollectWeightPos := Neuron.Weights.Size - 1;
-          for LayerIdx := 0 to MaxKneeCollectWeightPos do
-          begin
-            AllAbs[K] := Abs(Neuron.Weights.FData[LayerIdx]);
-            Inc(K);
-          end;
-        end;
-      end;
+      // The weights are restored, so the invariant pool is still exact.
+      Move(AllAbsMaster[0], AllAbs[0], TotalWeights * csNeuralFloatSize);
       CutIdx := Trunc(S * TotalWeights);
       if CutIdx <= 0 then Threshold := -1
       else if CutIdx >= TotalWeights then
@@ -123144,26 +123145,11 @@ begin
     end;
     for I := 0 to MPTrainM1 do
     begin
-      Layer := NN.Layers[TrLayerIdx[I]];
       if PerLayer then
       begin
-        PerLayerCount := 0;
-        MaxKneeCountNeuronPos := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to MaxKneeCountNeuronPos do
-          PerLayerCount := PerLayerCount + Layer.Neurons[NeuronIdx].Weights.Size;
-        SetLength(LayerAbs, PerLayerCount);
-        K := 0;
-        MaxKneeLayerCollectNeuronPos := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to MaxKneeLayerCollectNeuronPos do
-        begin
-          Neuron := Layer.Neurons[NeuronIdx];
-          MaxKneeLayerCollectWeightPos := Neuron.Weights.Size - 1;
-          for LayerIdx := 0 to MaxKneeLayerCollectWeightPos do
-          begin
-            LayerAbs[K] := Abs(Neuron.Weights.FData[LayerIdx]);
-            Inc(K);
-          end;
-        end;
+        PerLayerCount := LayerWeightCount[I];
+        Move(AllAbsMaster[LayerOffset[I]], LayerAbs[0],
+          PerLayerCount * csNeuralFloatSize);
         PerLayerCut := Trunc(S * PerLayerCount);
         if PerLayerCut <= 0 then Threshold := -1
         else if PerLayerCut >= PerLayerCount then
@@ -123172,17 +123158,15 @@ begin
         else Threshold := SelectKthSmallest(LayerAbs, PerLayerCount,
           PerLayerCut - 1);
       end;
-      MaxKneeScanNeuronPos := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to MaxKneeScanNeuronPos do
+      // Count against this layer's slice of the pool: the weights are
+      // restored, so the pool holds exactly the layer's |w| values.
+      KneeWeights[I] := LayerWeightCount[I];
+      KneeZeroed[I] := 0;
+      if Threshold >= 0 then
       begin
-        Neuron := Layer.Neurons[NeuronIdx];
-        MaxKneeScanWeightPos := Neuron.Weights.Size - 1;
-        for LayerIdx := 0 to MaxKneeScanWeightPos do
-        begin
-          Inc(KneeWeights[I]);
-          AbsW := Abs(Neuron.Weights.FData[LayerIdx]);
-          if (Threshold >= 0) and (AbsW <= Threshold) then Inc(KneeZeroed[I]);
-        end;
+        MaxKneeScanWeightPos := LayerOffset[I] + LayerWeightCount[I] - 1;
+        for K := LayerOffset[I] to MaxKneeScanWeightPos do
+          if AllAbsMaster[K] <= Threshold then Inc(KneeZeroed[I]);
       end;
       if KneeWeights[I] > 0 then
         KneePrunedFrac[I] := KneeZeroed[I] / KneeWeights[I]
@@ -123298,6 +123282,8 @@ var
   MeanConf: array of TNeuralFloat;
   PredClass: array of integer;
   MaxLogit, SumExp, Z, PEnt, EEnt, ExpEntAcc, TopMean, TopM2, Delta2: TNeuralFloat;
+  InvTemp, InvSum: TNeuralFloat;
+  ProbPtr: TNeuralFloatArrPtr;
   ModalArg, Flips, BestArg, BestCount: integer;
   ArgCount: array of integer;
   // histogram of BALD
@@ -123405,6 +123391,8 @@ begin
     NN.EnableDropouts(True);
 
     SetLength(Prob, NumClasses);
+    ProbPtr := TNeuralFloatArrPtr(@Prob[0]);
+    InvTemp := 1.0 / Temperature;
     SetLength(MeanProb, NumClasses);
     SetLength(PassArgmax, NumPasses);
     SetLength(TopProbHist, NumPasses);
@@ -123441,61 +123429,56 @@ begin
         begin
           // Output is already a probability vector p. Temperature scaling on
           // a probability is p^(1/T) renormalised (== softmax(logit/T) up to
-          // an additive constant); T=1 is the identity.
+          // an additive constant); T=1 is the identity, so the transcendental
+          // pair is skipped entirely in that common case.
           SumExp := 0;
-          for ClassIdx := 0 to MCNumClassesM1 do
+          if Temperature = 1.0 then
           begin
-            Z := Output.Raw[ClassIdx];
-            if Z < cEps then Z := cEps;
-            if Temperature <> 1.0 then Z := NeuralExp(pcr_logf(Z) / Temperature);
-            Prob[ClassIdx] := Z;
-            SumExp := SumExp + Z;
-          end;
-          if SumExp <= 0 then SumExp := cEps;
-          for ClassIdx := 0 to MCNumClassesM1 do
-            Prob[ClassIdx] := Prob[ClassIdx] / SumExp;
-        end
-        else if IsLogHead then
-        begin
-          // Output is log p. Recover p via exp, then temperature-renormalise
-          // as in the prob-head case (log p / T -> exp -> renormalise).
-          SumExp := 0;
-          MaxLogit := Output.Raw[0] / Temperature;
-          for ClassIdx := 1 to MCNumClassesM1 do
+            for ClassIdx := 0 to MCNumClassesM1 do
+            begin
+              Z := Output.Raw[ClassIdx];
+              if Z < cEps then Z := cEps;
+              Prob[ClassIdx] := Z;
+              SumExp := SumExp + Z;
+            end;
+          end
+          else
           begin
-            Z := Output.Raw[ClassIdx] / Temperature;
-            if Z > MaxLogit then MaxLogit := Z;
+            for ClassIdx := 0 to MCNumClassesM1 do
+            begin
+              Z := Output.Raw[ClassIdx];
+              if Z < cEps then Z := cEps;
+              Z := NeuralExp(pcr_logf(Z) * InvTemp);
+              Prob[ClassIdx] := Z;
+              SumExp := SumExp + Z;
+            end;
           end;
-          for ClassIdx := 0 to MCNumClassesM1 do
-          begin
-            Z := NeuralExp((Output.Raw[ClassIdx] / Temperature) - MaxLogit);
-            Prob[ClassIdx] := Z;
-            SumExp := SumExp + Z;
-          end;
-          if SumExp <= 0 then SumExp := cEps;
-          for ClassIdx := 0 to MCNumClassesM1 do
-            Prob[ClassIdx] := Prob[ClassIdx] / SumExp;
         end
         else
         begin
-          // Raw logits: numerically-stable softmax(z / Temperature).
-          MaxLogit := Output.Raw[0] / Temperature;
-          for ClassIdx := 1 to MCNumClassesM1 do
+          // Log-softmax head (Output = log p) and raw logits share the same
+          // math: numerically-stable softmax(Output / Temperature). At T=1
+          // both passes run vectorized straight off the output volume; T<>1
+          // pre-scales once into Prob so no element is divided twice.
+          if Temperature = 1.0 then
           begin
-            Z := Output.Raw[ClassIdx] / Temperature;
-            if Z > MaxLogit then MaxLogit := Z;
-          end;
-          SumExp := 0;
-          for ClassIdx := 0 to MCNumClassesM1 do
+            MaxLogit := TNNetVolume.MaxValue(Output.DataPtr, NumClasses);
+            SumExp := TNNetVolume.ExpShiftSum(ProbPtr, Output.DataPtr,
+              MaxLogit, NumClasses);
+          end
+          else
           begin
-            Z := NeuralExp((Output.Raw[ClassIdx] / Temperature) - MaxLogit);
-            Prob[ClassIdx] := Z;
-            SumExp := SumExp + Z;
+            for ClassIdx := 0 to MCNumClassesM1 do
+              Prob[ClassIdx] := Output.Raw[ClassIdx] * InvTemp;
+            MaxLogit := TNNetVolume.MaxValue(ProbPtr, NumClasses);
+            SumExp := TNNetVolume.ExpShiftSum(ProbPtr, ProbPtr,
+              MaxLogit, NumClasses);
           end;
-          if SumExp <= 0 then SumExp := cEps;
-          for ClassIdx := 0 to MCNumClassesM1 do
-            Prob[ClassIdx] := Prob[ClassIdx] / SumExp;
         end;
+        if SumExp <= 0 then SumExp := cEps;
+        InvSum := 1.0 / SumExp;
+        for ClassIdx := 0 to MCNumClassesM1 do
+          Prob[ClassIdx] := Prob[ClassIdx] * InvSum;
 
         // per-pass entropy H[p_t] (aleatoric contribution).
         PEnt := 0;
@@ -123742,7 +123725,6 @@ const
   cTransformCount = 4;
 var
   MaxCheckSamplePos: integer;
-  MaxCheckOutputPos: integer;
   TransformM1, EqCBinsM1, CountedM1: integer;
   Lines: TStringList;
   TName: array[0 .. cTransformCount - 1] of string;
@@ -123750,9 +123732,9 @@ var
   TIdx, SampleIdx, I, BinIdx, UsedSamples: integer;
   ShapeX, ShapeY, ShapeD: integer;
   IsImage: boolean;
-  Base, Trans: TNNetVolume;
+  Base, Trans, OutVol: TNNetVolume;
   BaseClass: integer;
-  BaseNorm, Diff, SumSq, DeltaL2, RelErr: TNeuralFloat;
+  BaseNorm, SumSq, DeltaL2, RelErr: TNeuralFloat;
   Counted, AgreeCount, SkippedZero: integer;
   AccErr, MaxErr, MeanErr, AgreeRate: TNeuralFloat;
   // per-sample relative errors for this transform (for the histogram)
@@ -123831,9 +123813,11 @@ begin
       ['Transform', 'InvarErr', 'Top1-Agree', 'Skipped', 'Verdict']));
     Lines.Add(StringOfChar('-', 92));
 
+    // Sized once to the acceptance cap; only the first Counted entries are
+    // read, so no per-sample regrow and no truncation are needed.
+    SetLength(PerSampleErr, Samples.Count);
     for TIdx := 0 to TransformM1 do
     begin
-      SetLength(PerSampleErr, 0);
       AccErr := 0;
       MaxErr := 0;
       Counted := 0;
@@ -123853,25 +123837,20 @@ begin
         TNet[TIdx].Compute(Samples[SampleIdx]);
         Trans := TNet[TIdx].GetLastLayer.Output;
         NN.Compute(Trans);
-        // NN.GetLastLayer.Output now holds f(T(x)).
+        OutVol := NN.GetLastLayer.Output; // f(T(x))
 
         Inc(UsedSamples);
 
         // top-1 agreement.
-        if NN.GetLastLayer.Output.GetClass() = BaseClass then Inc(AgreeCount);
+        if OutVol.GetClass() = BaseClass then Inc(AgreeCount);
 
-        // relative L2 invariance error.
+        // relative L2 invariance error, as two vectorized reductions.
         SumSq := 0;
         BaseNorm := 0;
-        if NN.GetLastLayer.Output.Size = Base.Size then
+        if OutVol.Size = Base.Size then
         begin
-          MaxCheckOutputPos := Base.Size - 1;
-          for I := 0 to MaxCheckOutputPos do
-          begin
-            Diff := NN.GetLastLayer.Output.Raw[I] - Base.Raw[I];
-            SumSq := SumSq + Diff * Diff;
-            BaseNorm := BaseNorm + Base.Raw[I] * Base.Raw[I];
-          end;
+          SumSq := OutVol.GetDistanceSqr(Base);
+          BaseNorm := Base.GetSumSqr();
         end;
         DeltaL2 := Sqrt(SumSq);
         BaseNorm := Sqrt(BaseNorm);
@@ -123884,7 +123863,6 @@ begin
         AccErr := AccErr + RelErr;
         if RelErr > MaxErr then MaxErr := RelErr;
         Inc(Counted);
-        SetLength(PerSampleErr, Counted);
         PerSampleErr[Counted - 1] := RelErr;
       end;
 
@@ -124257,7 +124235,6 @@ class function TNNet.AdversarialRobustnessReport(
 ): string;
 var
   MaxGradPos: integer;
-  MaxAdvPos: integer;
   NM1, NEpsM1, NClassesM1, EpsListM1, EpsLenM1: integer;
   Lines: TStringList;
   N, NClasses, OutSize, NEps, MedianIdx: integer;
@@ -124270,9 +124247,9 @@ var
   Acc: array of TNeuralFloat;
   // per-class accuracy at median eps
   ClassTotal, ClassCorrect: array of integer;
-  Grad, Adv: TNNetVolume;
+  Grad, Adv, Target, SampleVol: TNNetVolume;
   HaveZero: boolean;
-  Tmp: TNeuralFloat;
+  Tmp, EpsE: TNeuralFloat;
   PredCls: integer;
   AccClean, AccMedian, Drop: TNeuralFloat;
   Verdict: string;
@@ -124298,38 +124275,31 @@ var
   // into GradOut (assumed already sized to X).
   procedure InputLossGrad(X: TNNetVolume; TrueClass: integer; GradOut: TNNetVolume);
   var
-    Gi, GradOutM1: integer;
-    Target: TNNetVolume;
     InLayer: TNNetLayer;
+    ValidClass: boolean;
   begin
     NN.ClearDeltas();
     NN.Compute(X);
-    Target := TNNetVolume.Create(NN.GetLastLayer.Output.Size, 1, 1);
-    try
-      Target.Fill(0);
-      if (TrueClass >= 0) and (TrueClass < Target.Size) then
-        Target.Raw[TrueClass] := 1.0;
-      // TNNet.Backpropagate sets last-layer error = Output - Target (the
-      // cross-entropy gradient) and runs the backward chain.
-      NN.Backpropagate(Target);
-    finally
-      Target.Free;
-    end;
-    GradOut.Fill(0);
+    // Target is the caller-owned all-zero scratch: raise the one-hot bit,
+    // backpropagate, then lower it so the scratch stays all-zero.
+    ValidClass := (TrueClass >= 0) and (TrueClass < Target.Size);
+    if ValidClass then Target.Raw[TrueClass] := 1.0;
+    // TNNet.Backpropagate sets last-layer error = Output - Target (the
+    // cross-entropy gradient) and runs the backward chain.
+    NN.Backpropagate(Target);
+    if ValidClass then Target.Raw[TrueClass] := 0;
     InLayer := NN.Layers[0];
     if (InLayer.OutputError <> nil) and
        (InLayer.OutputError.Size = GradOut.Size) then
-    begin
-      GradOutM1 := GradOut.Size - 1;
-      for Gi := 0 to GradOutM1 do
-        GradOut.Raw[Gi] := InLayer.OutputError.Raw[Gi];
-    end;
+      GradOut.Copy(InLayer.OutputError)
+    else
+      GradOut.Fill(0);
   end;
 
 begin
   Result := '';
   Lines := TStringList.Create();
-  Grad := nil; Adv := nil;
+  Grad := nil; Adv := nil; Target := nil;
   try
     if NN = nil then
     begin
@@ -124420,28 +124390,36 @@ begin
 
     Grad := TNNetVolume.Create(Samples[0]);
     Adv := TNNetVolume.Create(Samples[0]);
+    // One-hot scratch for InputLossGrad, created once for the whole report;
+    // the callee raises and lowers a single element per call.
+    Target := TNNetVolume.Create(OutSize, 1, 1);
+    Target.Fill(0);
 
     for I := 0 to NM1 do
     begin
+      SampleVol := Samples[I];
       // Clean forward: record argmax and max-softmax confidence.
-      NN.Compute(Samples[I]);
+      NN.Compute(SampleVol);
       CleanArgmax[I] := NN.GetLastLayer.Output.GetClass();
       CleanConf[I] := NN.GetLastLayer.Output.GetMax();
       CritEps[I] := -1;  // assume survives until proven otherwise
 
       // Input loss gradient (one backward pass), then its sign.
-      Grad.ReSize(Samples[I]);
-      Adv.ReSize(Samples[I]);
-      InputLossGrad(Samples[I], Labels[I], Grad);
+      Grad.ReSize(SampleVol);
+      Adv.ReSize(SampleVol);
+      InputLossGrad(SampleVol, Labels[I], Grad);
       MaxGradPos := Grad.Size - 1;
       for J := 0 to MaxGradPos do Grad.Raw[J] := SignF(Grad.Raw[J]);
 
       for E := 0 to NEpsM1 do
       begin
         // x_adv = x + eps * sign(grad); eps=0 reproduces the clean input.
-        MaxAdvPos := Adv.Size - 1;
-        for J := 0 to MaxAdvPos do
-          Adv.Raw[J] := Samples[I].Raw[J] + Eps[E] * Grad.Raw[J];
+        // Bulk copy + vectorized MulAdd beat the fused scalar loop here: the
+        // scalar form pays three property accessors per element, the two
+        // bulk passes run at memcpy/SIMD speed.
+        EpsE := Eps[E];
+        Adv.Copy(SampleVol);
+        TNNetVolume.MulAdd(Adv.DataPtr, Grad.DataPtr, EpsE, Adv.Size);
         NN.Compute(Adv);
         PredCls := NN.GetLastLayer.Output.GetClass();
         if PredCls = Labels[I] then Inc(CorrectAtEps[E]);
@@ -124604,6 +124582,7 @@ begin
   finally
     if Grad <> nil then Grad.Free;
     if Adv <> nil then Adv.Free;
+    if Target <> nil then Target.Free;
     Lines.Free;
   end;
 end;
