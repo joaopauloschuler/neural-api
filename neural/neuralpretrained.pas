@@ -44344,7 +44344,7 @@ var
   BqA, BkA, BvA, BoA: array of TNeuralFloat;
   // #9: per-layer LayerNorm / LayerScale chain binds (invariant across t1/dd).
   LnG, LnB, LnPG, LnPB, ASc, MSc: TNeuralFloatDynArr;
-  HnRow, Mlp1Row, VRow, XRow: array of double;
+  HnRow, Mlp1Row, VRow, XRow, SigRow: array of double;
   QRow, KRow, AttnRow: array of double;
   QPtr: PDouble;
   HasBq, HasBk, HasBv, HasBo: boolean;
@@ -44384,7 +44384,8 @@ begin
   for t1 := 0 to TM1 do
   begin
     SetLength(X[t1], D);
-    for dd := 0 to DM1 do X[t1][dd] := Sig[dd][t1];
+    XRow := X[t1];                     // #9: bind the invariant row once per t1
+    for dd := 0 to DM1 do XRow[dd] := Sig[dd][t1];
   end;
   // Precompute inv_freq for RoPE (head_dim).
   SetLength(invfreq, half);
@@ -44402,8 +44403,10 @@ begin
     for dd := 0 to halfM1 do
     begin
       ang := t1 * invfreq[dd];           // #4: shared angle for Cos and Sin
-      qr := Cos(ang);
-      kr := Sin(ang);
+      // #16: one SinCos per angle - on x86_64 it is a single x87 fsincos,
+      // whose results match the fsin/fcos the separate calls compile to
+      // (same hardware argument reduction), so parity is preserved.
+      SinCos(ang, kr, qr);               // kr = Sin, qr = Cos
       CosTab[tBase + dd] := qr;
       CosTab[tBase + dd + half] := qr;
       SinTab[tBase + dd] := kr;
@@ -44620,7 +44623,10 @@ begin
   end;
   // write back channel-major.
   for dd := 0 to DM1 do
-    for t1 := 0 to TM1 do Sig[dd][t1] := X[t1][dd];
+  begin
+    SigRow := Sig[dd];                 // #9: bind the invariant row once per dd
+    for t1 := 0 to TM1 do SigRow[t1] := X[t1][dd];
+  end;
 end;
 
 // One conv encoder/decoder stage (eskConv / eskELU / eskResnet) using the
@@ -45736,18 +45742,29 @@ end;
 
 procedure TNNetDAC.Encode(const Waveform: array of TNeuralFloat;
   out Codes: TNNetIntArr2D; out FrameCount: integer);
+const
+  // See TNNetMimi.Encode: frames are independent (the residual recursion is
+  // within a frame, across q), so blocking the frame axis reads each in_proj
+  // row, normalized codebook row and out_proj row once per block instead of
+  // once per frame. The residual is Double, so the block working set is
+  // csDacRvqFrameBlock * HiddenDim * 8 bytes (8 * 1024 * 8 = 64 KB).
+  csDacRvqFrameBlock = 8;
 var
   Sig, Tmp: TMimiDblArr2D;
   i, t, b, NumStages, ru, q, NQ, Cd, HiddenDim: integer;
-  Frames, FramesM1, Stride, Pad, Km: integer;
-  Residual, NormP: TMimiDblArr;
-  cbk, best: integer;
-  dot, BestSim: double;
+  Frames, FramesM1, Stride, Pad: integer;
+  cbk: integer;
+  dot: double;
   CBN: TMimiDblArr;             // reference bind of FCodebookNorms[q]
   WIn, BIn, WOut, BOut, CBData: TNeuralFloatDynArr; // #9 per-q field binds
   CbSize, d, CdM1: integer;
   wBase, cbBase, bestBase, oBase: integer;
   WaveLenM1, NumStagesM1, EncResHigh, NQM1, CbSizeM1, HiddenDimM1: integer;
+  t0, tt, BCountM1, rBase, npBase: integer;
+  RBuf: TMimiDblArr;             // csDacRvqFrameBlock residuals, frame-major
+  NPBuf: TMimiDblArr;            // projected latents, frame-major [b*Cd + d]
+  BestSim: TMimiDblArr;          // per blocked frame
+  BestIdx: TNeuralIntegerArray;  // per blocked frame
 begin
   // input -> [1][T]
   SetLength(Sig, 1);
@@ -45787,11 +45804,26 @@ begin
   SetLength(Codes, NQ);
   for q := 0 to NQM1 do SetLength(Codes[q], Frames);
 
-  SetLength(Residual, HiddenDim);
-  SetLength(NormP, Cd);
-  for t := 0 to FramesM1 do
+  SetLength(RBuf, csDacRvqFrameBlock * HiddenDim);
+  SetLength(NPBuf, csDacRvqFrameBlock * Cd);
+  SetLength(BestSim, csDacRvqFrameBlock);
+  SetLength(BestIdx, csDacRvqFrameBlock);
+  // Frame-blocked RVQ (see TNNetMimi.Encode): each in_proj / codebook /
+  // out_proj row is read once per block of frames instead of once per frame.
+  // Every dot keeps its operands and element order and every argmax sees the
+  // same candidate sequence, so the codes are bit-identical.
+  t0 := 0;
+  while t0 <= FramesM1 do
   begin
-    for i := 0 to HiddenDimM1 do Residual[i] := Sig[i][t];
+    BCountM1 := csDacRvqFrameBlock - 1;
+    if t0 + BCountM1 > FramesM1 then BCountM1 := FramesM1 - t0;
+    rBase := 0;
+    for b := 0 to BCountM1 do
+    begin
+      tt := t0 + b;
+      for i := 0 to HiddenDimM1 do RBuf[rBase + i] := Sig[i][tt];
+      Inc(rBase, HiddenDim);
+    end;
     for q := 0 to NQM1 do
     begin
       // #9: bind the per-q record field chains once (array-of-record deref +
@@ -45799,16 +45831,19 @@ begin
       WIn := FInProj[q].W;   BIn := FInProj[q].B;
       WOut := FOutProj[q].W; BOut := FOutProj[q].B;
       CBData := FCodebooks[q].Data;
-      // in_proj: 1x1 conv hidden->codebook_dim. Residual is one frame; do the
-      // matmul (out[o] = bias + sum_i W[o,i]*residual[i]).
-      Km := FInProj[q].Kernel; // = 1
-      if Km = 0 then Km := 1;
+      // in_proj: 1x1 conv hidden->codebook_dim, weight-row outer so each
+      // Single row streams once per block against every blocked residual.
       wBase := 0; // d * HiddenDim
       for d := 0 to CdM1 do
       begin
-        // Single weight row against the Double residual: the staged
-        // mixed-precision dot avoids the cvtss2sd false dependency chain.
-        NormP[d] := BIn[d] + DotProductSD(@WIn[wBase], @Residual[0], HiddenDim);
+        rBase := 0; npBase := d;
+        for b := 0 to BCountM1 do
+        begin
+          // Single weight row against the Double residual: the staged
+          // mixed-precision dot avoids the cvtss2sd false dependency chain.
+          NPBuf[npBase] := BIn[d] + DotProductSD(@WIn[wBase], @RBuf[rBase], HiddenDim);
+          Inc(rBase, HiddenDim); Inc(npBase, Cd);
+        end;
         Inc(wBase, HiddenDim);
       end;
       // argmax cosine against the pre-normalized codebook. #14: the projected
@@ -45819,34 +45854,49 @@ begin
       // drops a sum of squares, a Sqrt and Cd divides per (frame, quantizer).
       CbSize := FCodebooks[q].Rows;
       CbSizeM1 := CbSize - 1;
-      best := 0; BestSim := -1e30;
       CBN := FCodebookNorms[q];
+      for b := 0 to BCountM1 do
+      begin
+        BestSim[b] := -1e30; BestIdx[b] := 0;
+      end;
       cbBase := 0; // cbk * Cd
       for cbk := 0 to CbSizeM1 do
       begin
-        dot := MimiDotProductD(@NormP[0], @CBN[cbBase], Cd);
-        if dot > BestSim then begin BestSim := dot; best := cbk; end;
+        npBase := 0;
+        for b := 0 to BCountM1 do
+        begin
+          dot := MimiDotProductD(@NPBuf[npBase], @CBN[cbBase], Cd);
+          if dot > BestSim[b] then begin BestSim[b] := dot; BestIdx[b] := cbk; end;
+          Inc(npBase, Cd);
+        end;
         Inc(cbBase, Cd);
       end;
-      Codes[q][t] := best;
-      // out_proj(raw codebook row) -> hidden, subtract from residual.
+      for b := 0 to BCountM1 do Codes[q][t0 + b] := BestIdx[b];
+      // out_proj(raw codebook row) -> hidden, subtract from residual;
+      // weight-row outer so each WOut row streams once per block.
       // W and codebook data are both Single but the accumulator is Double for
-      // the <1e-4 codec parity tolerance. Cd is 8, and the i-loop already supplies
-      // the instruction-level parallelism a staged mixed-precision dot would
-      // add - measured 2.97 cycles/element as written against 2.40 staged, not
-      // enough to justify reassociating a sum the parity tolerance pins.
-      // Offset bases hoisted.
-      bestBase := best * Cd; // invariant across the whole i-loop
+      // the <1e-4 codec parity tolerance. Cd is 8, and the d-loop already
+      // supplies the instruction-level parallelism a staged mixed-precision dot
+      // would add - measured 2.97 cycles/element as written against 2.40
+      // staged, not enough to justify reassociating a sum the parity tolerance
+      // pins. Offset bases hoisted.
       oBase := 0;            // i * Cd
       for i := 0 to HiddenDimM1 do
       begin
-        dot := BOut[i];
-        for d := 0 to CdM1 do
-          dot := dot + WOut[oBase + d] * CBData[bestBase + d];
-        Residual[i] := Residual[i] - dot;
+        rBase := i;          // b*HiddenDim + i, carried
+        for b := 0 to BCountM1 do
+        begin
+          bestBase := BestIdx[b] * Cd;
+          dot := BOut[i];
+          for d := 0 to CdM1 do
+            dot := dot + WOut[oBase + d] * CBData[bestBase + d];
+          RBuf[rBase] := RBuf[rBase] - dot;
+          Inc(rBase, HiddenDim);
+        end;
         Inc(oBase, Cd);
       end;
     end;
+    Inc(t0, csDacRvqFrameBlock);
   end;
 end;
 
@@ -45856,10 +45906,12 @@ var
   Sig, Tmp: TMimiDblArr2D;
   i, t, b, NumStages, ru, q, NQ, Cd, HiddenDim, Frames, code, d: integer;
   Stride, Pad, FramesM1, NUse, OutLen, CdM1: integer;
-  codeBase, oBase: integer;
+  codeBase, oBase, tBase: integer;
   dot: double;
   HiddenDimM1, NUseM1, NumStagesM1, DecResHigh, OutLenM1: integer;
   WOut, BOut, CBData: TNeuralFloatDynArr;  // #9: q-invariant out_proj / codebook
+  Acc: TMimiDblArr;    // frame-major [t*HiddenDim + i] RVQ accumulator
+  SigRow: TMimiDblArr;
 begin
   NQ := Length(FCodebooks);
   if (UseCodebooks > 0) and (UseCodebooks < NQ) then NUse := UseCodebooks
@@ -45873,16 +45925,19 @@ begin
   FramesM1 := Frames - 1;
 
   // from_codes: quantized = sum_q out_proj(codebook[codes[q]]).
-  SetLength(Sig, HiddenDim);
-  for i := 0 to HiddenDimM1 do
-  begin
-    SetLength(Sig[i], Frames);
-    FillChar(Sig[i][0], Frames * csDoubleSize, 0);
-  end;
+  // Accumulate FRAME-major (see TNNetMimi.Decode): the channel-major form
+  // scattered each per-(q,t) out_proj column across HiddenDim SEPARATE dynamic
+  // arrays, touching one element (and one cache line) in each and resolving
+  // Sig[i] twice per element. Acc[t*HiddenDim + i] is one contiguous run per
+  // frame; the additions keep their order and operands, so the samples are
+  // bit-identical. Transposed to channel-major once at the end, not NUse times.
+  SetLength(Acc, Frames * HiddenDim);
+  if Frames > 0 then FillChar(Acc[0], Frames * HiddenDim * csDoubleSize, 0);
   for q := 0 to NUseM1 do
   begin
     WOut := FOutProj[q].W; BOut := FOutProj[q].B;  // #9: bind invariant chains
     CBData := FCodebooks[q].Data;                  //     (all q-only, not t/i/d)
+    tBase := 0;              // #6: t*HiddenDim carried
     for t := 0 to FramesM1 do
     begin
       code := Codes[q][t];
@@ -45893,9 +45948,25 @@ begin
         dot := BOut[i];
         for d := 0 to CdM1 do
           dot := dot + WOut[oBase + d] * CBData[codeBase + d];
-        Sig[i][t] := Sig[i][t] + dot;
+        Acc[tBase + i] := Acc[tBase + i] + dot;
         Inc(oBase, Cd);
       end;
+      Inc(tBase, HiddenDim);
+    end;
+  end;
+  // App.E/#9: channel-outer transpose - each channel row is sized and bound
+  // once and written contiguously; the frame-major source advances by the
+  // carried HiddenDim stride (#6).
+  SetLength(Sig, HiddenDim);
+  for i := 0 to HiddenDimM1 do
+  begin
+    SetLength(Sig[i], Frames);
+    SigRow := Sig[i];
+    tBase := i;                      // t*HiddenDim + i, carried
+    for t := 0 to FramesM1 do
+    begin
+      SigRow[t] := Acc[tBase];
+      Inc(tBase, HiddenDim);
     end;
   end;
 
@@ -67243,7 +67314,8 @@ var
   tx, ty, d: integer;
   gx, gy, gxBase, gyBase: integer;  // global image coords
   wx, wy, w, oneMinusW: TNeuralFloat;  // feather weights
-  invOv: Double;                       // 1/(ImgOverlap+1), call-invariant (#5)
+  invOv: TNeuralFloat;                 // 1/(ImgOverlap+1), call-invariant (#5);
+                                       // Single: feeds Single blend weights (#25)
   StartsYHi, StartsXHi, TileLatentMinSizeM1, LatentDepthM1: integer;
   ImgTileWM1, OutChannelsM1: integer;
   ltBase, latBase, resBase, doBase: integer;
@@ -67354,18 +67426,13 @@ begin
         begin
           wx := (tx + 1) * invOv;
           w := wx * wy;
-          // w is d-invariant: full overwrite (w=1) is a Move; the feather edge
-          // is scale-in-place + scaled accumulate.
-          if w = 1.0 then
-            Move(DecOut.FData[doBase], Result.FData[resBase],
-              OutChannels * csNeuralFloatSize)
-          else
-          begin
-            oneMinusW := 1.0 - w;
-            TNNetVolume.Mul(Result.GetRawPtr(resBase), oneMinusW, OutChannels);
-            TNNetVolume.MulAdd(Result.GetRawPtr(resBase),
-              DecOut.GetRawPtr(doBase), w, OutChannels);
-          end;
+          oneMinusW := 1.0 - w;
+          // Fused scalar blend: the run is only OutChannels (=3) elements, so
+          // per-pixel bulk kernel calls cost more in dispatch than the 3 muls
+          // and 3 FMAs they replace.
+          for d := 0 to OutChannelsM1 do
+            Result.FData[resBase + d] :=
+              oneMinusW * Result.FData[resBase + d] + w * DecOut.FData[doBase + d];
           Inc(resBase, OutChannels);
           Inc(doBase, OutChannels);
         end;
