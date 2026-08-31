@@ -715,6 +715,9 @@ type
     procedure TestNormLayersInferenceOnlyForwardParity;
     procedure TestRMSNormGatedGradientCheck;
     procedure TestRMSNormGatedSerializationRoundTrip;
+    // TNNetLlama4AttnTemperature: per-position log1p(floor(pos/floor_scale))
+    // step-function scaling, with positions crossing floor-value boundaries.
+    procedure TestLlama4AttnTemperatureFloorBoundary;
     // Residual builder helpers (AddPreNormResidual / AddRMSNormResidual / AddPostNormResidual / AddGatedResidual)
     procedure TestPreNormResidualGradientCheck;
     procedure TestRMSNormResidualGradientCheck;
@@ -27171,6 +27174,47 @@ begin
   // non-trivial.
   NormSerializationRoundTripWithPerturbedWeights(Self,
     TNNetRMSNormGated.Create(), 'RMSNormGated', 3, 2, 4, 1e-5);
+end;
+
+procedure TTestNeuralNumerical.TestLlama4AttnTemperatureFloorBoundary;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  pos, d, SeqLen, Depth: integer;
+  Expected, Scale: TNeuralFloat;
+begin
+  // FloorScale = 2 makes the floor value step every 2 positions, so the
+  // 6-position sequence crosses several run boundaries: position 0 has floor
+  // value 0 (scale exactly 1), 1..2 floor 1, 3..4 floor 2, 5 floor 3.
+  SeqLen := 6;
+  Depth := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    NN.AddLayer(TNNetLlama4AttnTemperature.Create(2.0, 0.5));
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        Input[pos, 0, d] := 1 + pos * 0.25 + d * 0.125;
+    NN.Compute(Input);
+    for pos := 0 to SeqLen - 1 do
+    begin
+      Scale := Ln(1 + Floor((pos + 1) / 2.0)) * 0.5 + 1;
+      for d := 0 to Depth - 1 do
+      begin
+        Expected := Input[pos, 0, d] * Scale;
+        AssertEquals('Llama4AttnTemperature pos ' + IntToStr(pos) +
+          ' depth ' + IntToStr(d), Expected,
+          NN.GetLastLayer.Output[pos, 0, d], 2e-4);
+      end;
+    end;
+    // The floor-0 run multiplies by exactly 1: the output must be bit-equal.
+    AssertEquals('Llama4AttnTemperature floor-0 position is exact',
+      Input[0, 0, 0], NN.GetLastLayer.Output[0, 0, 0], 0.0);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestSwitchableNormSerializationRoundTrip;
