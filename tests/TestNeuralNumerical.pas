@@ -68911,6 +68911,11 @@ begin
     // Device forward (both GEMMs offloaded; base class arms FShouldOpenCL).
     NN.EnableOpenCL(PlatformId, DeviceId);
     NN.Compute(Input);
+    // Second device forward: the score GEMM's shape returns AFTER the value
+    // GEMM bound different arguments on the same FDotCL, so this pins the
+    // cached-argument rebind across launches (a stale-args bug would surface
+    // here, not on the first forward).
+    NN.Compute(Input);
 
     AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
     MaxDiff := 0;

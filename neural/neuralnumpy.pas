@@ -1013,7 +1013,7 @@ function TNNetNpzReader.LoadVolume(const pKey: string;
 var
   Idx: integer;
   Raw: TBytes;
-  MemStream: TMemoryStream;
+  MemStream: TBytesStream;
   DType: string;
   DataOfs: Int64;
 begin
@@ -1034,10 +1034,10 @@ begin
     Exit;
   end;
   Raw := EntryRawBytes(Idx);
-  MemStream := TMemoryStream.Create;
+  // TBytesStream adopts the decompressed array by reference (FPC dynarrays are
+  // refcounted), so the .npy blob is decoded in place with no second copy.
+  MemStream := TBytesStream.Create(Raw);
   try
-    if Length(Raw) > 0 then MemStream.WriteBuffer(Raw[0], Length(Raw));
-    MemStream.Position := 0;
     LoadNpyFromStream(MemStream, Dest, Result, DType);
   finally
     MemStream.Free;

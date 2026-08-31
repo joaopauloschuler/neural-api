@@ -360,6 +360,33 @@ type
       FBoundSplits, FBoundNumAs, FBoundNumBs, FBoundSize: longint;
       FBoundPartialBuffer, FBoundCodesBuffer: cl_mem;
       FBoundResultBuffer, FBoundScalesBuffer, FBoundBlockScalesBuffer: cl_mem;
+      /// Private clones of the single-launch entry points, created lazily on
+      /// first use (the split-K recipe). The injected FDotProductKernel /
+      /// FInt8Kernel / FFP16Kernel handles are net-wide in the default
+      /// shared-kernel mode, so their cl_kernel argument state is rewritten by
+      /// every other layer between this instance's launches - argument caching
+      /// is only sound on a handle this instance owns. Launches still ride
+      /// FDotProductKernel's in-order queue. Coded by Claude (AI).
+      FMainKernel: cl_kernel;
+      FSinglePassKernel: cl_kernel;
+      /// Last tuple bound into FMainKernel by Compute: shape (args 0-3), the A
+      /// operand (5), the result (7) and the bias pair (8/9) survive from
+      /// launch to launch; only the activation (4) and the B operand (6) are
+      /// set per call. Cleared with the handle by UnprepareForCompute; a buffer
+      /// swapped by ReallocateBuffersIfRequired or a bias (re)allocation misses
+      /// the value compare and rebinds. Coded by Claude (AI).
+      FMainArgsBound: boolean;
+      FBoundMainThreadCount, FBoundMainNumAs, FBoundMainNumBs: longint;
+      FBoundMainSize, FBoundMainUseBias: longint;
+      FBoundMainAsBuffer, FBoundMainResultBuffer, FBoundMainBiasBuffer: cl_mem;
+      /// Single-pass twin for ComputeResidentCodes: shape (args 0-3), codes
+      /// (5), result (7) and scales (10) are fixed after
+      /// PrepareForComputeInt8/Int4 (both start from UnprepareForCompute, which
+      /// clears this); the activation (4), B operand (6) and bias pair (8/9)
+      /// are set per call. Coded by Claude (AI).
+      FSinglePassArgsBound: boolean;
+      FBoundSPThreadCount, FBoundSPNumAs, FBoundSPNumBs, FBoundSPSize: longint;
+      FBoundSPCodesBuffer, FBoundSPResultBuffer, FBoundSPScalesBuffer: cl_mem;
 
       /// How many slabs to cut the reduction axis into for the current shape:
       /// 1 means the launch already fills the device, so ComputeInt8 keeps the
@@ -374,6 +401,13 @@ type
       /// tuple still matches. Coded by Claude (AI).
       function BindSplitKInvariantArgs(pKernel, pReduceKernel: cl_kernel;
         pSplits: longint): integer;
+      /// Sets the FMainKernel arguments that survive between launches,
+      /// skipping the eight clSetKernelArg calls when the cached tuple still
+      /// matches. Coded by Claude (AI).
+      function BindMainInvariantArgs(pUseBias: longint): integer;
+      /// Single-pass sibling for FSinglePassKernel (args 0-3, 5, 7, 10).
+      /// Coded by Claude (AI).
+      function BindSinglePassInvariantArgs(): integer;
       /// Narrows ElementCount floats of pSrcFP32 into FInputBufferBsFP16 with
       /// cai_f32_to_half, on the shared in-order queue. Coded by Claude (AI).
       function CastBOperandToFP16(pSrcFP32: cl_mem; ElementCount: longint): integer;
@@ -393,8 +427,6 @@ type
         NewVBs: boolean; VBias: TNNetVolume; NewVBias: boolean;
         pExternalVBs: cl_mem);
 
-
-      function Kernel(): cl_kernel; {$IFDEF Release} inline; {$ENDIF}
     public
       constructor Create(DotProductKernel: TNeuralKernel;
         pInt8Kernel: TNeuralKernel = nil; pFP16Kernel: TNeuralKernel = nil);
@@ -594,11 +626,6 @@ begin
   inherited Destroy();
 end;
 
-function TDotProductSharedKernel.Kernel(): cl_kernel;
-begin
-  Kernel := FDotProductKernel.Kernel;
-end;
-
 constructor TDotProductSharedKernel.Create(DotProductKernel: TNeuralKernel;
   pInt8Kernel: TNeuralKernel = nil; pFP16Kernel: TNeuralKernel = nil);
 begin
@@ -637,6 +664,12 @@ begin
     clReleaseKernel(FSplitKReduceFP16Kernel);
   if Assigned(FCastFP16Kernel)     then clReleaseKernel(FCastFP16Kernel);
   if Assigned(FSplitKInt4Kernel)   then clReleaseKernel(FSplitKInt4Kernel);
+  if Assigned(FMainKernel)         then clReleaseKernel(FMainKernel);
+  if Assigned(FSinglePassKernel)   then clReleaseKernel(FSinglePassKernel);
+  FMainKernel := nil;
+  FSinglePassKernel := nil;
+  FMainArgsBound := false;
+  FSinglePassArgsBound := false;
   FSplitKInt4Kernel := nil;
   FBlockScalesBuffer := nil;
   FCapBlockScales := 0;
@@ -834,11 +867,9 @@ procedure TDotProductSharedKernel.Compute
 var
   err: integer;
   UseBias: longint;
-  NeededBias: csize_t;
   BufferBs: cl_mem;
   K: cl_kernel;
 begin
-  K := Kernel();
   FActFun := pActFN;
   if pExternalVBs <> nil then BufferBs := pExternalVBs else BufferBs := FInputBufferBs;
 
@@ -846,71 +877,26 @@ begin
   begin
     if (VBs.Size = FSize * FNumBs) then
     begin
-      err := clSetKernelArg(K, 0, csLongintSize, @FThreadCount);
-      if (err <> CL_SUCCESS) then ErrorProc('0 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      err := err or clSetKernelArg(K, 1, csLongintSize, @FNumAs);
-      if (err <> CL_SUCCESS) then ErrorProc('1 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      err := err or clSetKernelArg(K, 2, csLongintSize, @FNumBs);
-      if (err <> CL_SUCCESS) then ErrorProc('2 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      err := err or clSetKernelArg(K, 3, csLongintSize, @FSize);
-      if (err <> CL_SUCCESS) then ErrorProc('3 Error: Failed to set kernel arguments:' + IntToStr(err));
-
+      // Argument caching needs an entry point no other instance rebinds:
+      // FDotProductKernel is the net-wide shared cai_dot_product handle in the
+      // default shared-kernel mode, so this instance clones a handle of its
+      // own (the split-K recipe) and launches it on the same in-order queue.
+      if not Assigned(FMainKernel) then
+        FMainKernel := FDotProductKernel.CreateKernel('cai_dot_product');
+      K := FMainKernel;
+      err := CL_SUCCESS;
+      UseBias := PrepareBiasOperand(VBias, NewVBias, err);
+      // Shape, A operand, result and bias stay bound across launches; only
+      // the two arguments below change per call.
+      err := err or BindMainInvariantArgs(UseBias);
       err := err or clSetKernelArg(K, 4, csLongintSize, @FActFun);
-      if (err <> CL_SUCCESS) then ErrorProc('4 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      err := err or clSetKernelArg(K, 5, csCLMemSize,  @FInputBufferAs);
-      if (err <> CL_SUCCESS) then ErrorProc('5 Error: Failed to set kernel arguments:' + IntToStr(err));
-
       err := err or clSetKernelArg(K, 6, csCLMemSize,  @BufferBs);
-      if (err <> CL_SUCCESS) then ErrorProc('6 Error: Failed to set kernel arguments:' + IntToStr(err));
+      if (err <> CL_SUCCESS) then
+        ErrorProc('Error: TDotProductSharedKernel.Compute - failed setting ' +
+          'kernel arguments: ' + IntToStr(err));
 
-      err := err or clSetKernelArg(K, 7, csCLMemSize,  @FResultBuffer);
-      if (err <> CL_SUCCESS) then ErrorProc('7 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      // Fused bias (arg 8 UseBias, arg 9 FBiasBuffer). Both args MUST be set every
-      // call: cai_dot_product now has 10 args and the enqueue rejects any unset
-      // one. A bias-less caller (VBias=nil) passes UseBias=0 and a NULL buffer
-      // (legal - the kernel never reads it). With a bias volume, keep it resident
-      // grow-only and re-upload only when NewVBias or the buffer was just
-      // (re)allocated. Coded by Claude (AI).
-      if VBias <> nil then
-      begin
-        NeededBias := VBias.GetMemSize();
-        if (FBiasBuffer = nil) or (NeededBias > FCapBias) then
-        begin
-          if Assigned(FBiasBuffer) then clReleaseMemObject(FBiasBuffer);
-          FBiasBuffer := FDotProductKernel.CreateInputBuffer(NeededBias);
-          FCapBias := NeededBias;
-          NewVBias := true; // fresh/grown buffer: force upload regardless of caller
-        end;
-        if NewVBias then err := err or FDotProductKernel.WriteBuffer(FBiasBuffer, VBias);
-        UseBias := 1;
-      end
-      else
-        UseBias := 0;
-
-      err := err or clSetKernelArg(K, 8, csLongintSize, @UseBias);
-      if (err <> CL_SUCCESS) then ErrorProc('8 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      err := err or clSetKernelArg(K, 9, csCLMemSize, @FBiasBuffer);
-      if (err <> CL_SUCCESS) then ErrorProc('9 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      if (FHostInput) then
-      begin
-        //TODO: Fix this refresh.
-        //if NewVAs then err := err or FDotProductKernel.RefreshHostInputBufferCache(FInputBufferAs, VAs.GetMemSize());
-        //if NewVBs then err := err or FDotProductKernel.RefreshHostInputBufferCache(FInputBufferBs, VBs.GetMemSize())
-        if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
-        if NewVBs and (pExternalVBs = nil) then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
-      end
-      else
-      begin
-        if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
-        if NewVBs and (pExternalVBs = nil) then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
-      end;
+      if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+      if NewVBs and (pExternalVBs = nil) then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
 
       if (err <> CL_SUCCESS) then ErrorProc('Failed at WriteBuffer(input):' + IntToStr(err));
 
@@ -919,11 +905,11 @@ begin
 
         if (FGroupSizeA > 0) and (FGroupSizeB > 0)  then
         begin
-          FDotProductKernel.RunKernel2D(Kernel, FNumAs, FNumBs, FGroupSizeA, FGroupSizeB);
+          FDotProductKernel.RunKernel2D(K, FNumAs, FNumBs, FGroupSizeA, FGroupSizeB);
         end
         else
         begin
-          FDotProductKernel.RunKernel2D(Kernel, FNumAs, FNumBs);
+          FDotProductKernel.RunKernel2D(K, FNumAs, FNumBs);
         end;
 
       end
@@ -1327,6 +1313,74 @@ begin
   FSplitKArgsBound := true;
 end;
 
+function TDotProductSharedKernel.BindMainInvariantArgs(pUseBias: longint): integer;
+var
+  K: cl_kernel;
+begin
+  Result := CL_SUCCESS;
+  if FMainArgsBound and (FThreadCount = FBoundMainThreadCount) and
+    (FNumAs = FBoundMainNumAs) and (FNumBs = FBoundMainNumBs) and
+    (FSize = FBoundMainSize) and (FInputBufferAs = FBoundMainAsBuffer) and
+    (FResultBuffer = FBoundMainResultBuffer) and
+    (pUseBias = FBoundMainUseBias) and (FBiasBuffer = FBoundMainBiasBuffer)
+  then exit;
+
+  FMainArgsBound := false;
+  K := FMainKernel;
+  Result := clSetKernelArg(K, 0, csLongintSize, @FThreadCount);
+  Result := Result or clSetKernelArg(K, 1, csLongintSize, @FNumAs);
+  Result := Result or clSetKernelArg(K, 2, csLongintSize, @FNumBs);
+  Result := Result or clSetKernelArg(K, 3, csLongintSize, @FSize);
+  Result := Result or clSetKernelArg(K, 5, csCLMemSize, @FInputBufferAs);
+  Result := Result or clSetKernelArg(K, 7, csCLMemSize, @FResultBuffer);
+  Result := Result or clSetKernelArg(K, 8, csLongintSize, @pUseBias);
+  Result := Result or clSetKernelArg(K, 9, csCLMemSize, @FBiasBuffer);
+  if Result <> CL_SUCCESS then exit;
+
+  FBoundMainThreadCount := FThreadCount;
+  FBoundMainNumAs := FNumAs;
+  FBoundMainNumBs := FNumBs;
+  FBoundMainSize := FSize;
+  FBoundMainAsBuffer := FInputBufferAs;
+  FBoundMainResultBuffer := FResultBuffer;
+  FBoundMainUseBias := pUseBias;
+  FBoundMainBiasBuffer := FBiasBuffer;
+  FMainArgsBound := true;
+end;
+
+function TDotProductSharedKernel.BindSinglePassInvariantArgs(): integer;
+var
+  K: cl_kernel;
+begin
+  Result := CL_SUCCESS;
+  if FSinglePassArgsBound and (FThreadCount = FBoundSPThreadCount) and
+    (FNumAs = FBoundSPNumAs) and (FNumBs = FBoundSPNumBs) and
+    (FSize = FBoundSPSize) and (FCodesBuffer = FBoundSPCodesBuffer) and
+    (FResultBuffer = FBoundSPResultBuffer) and
+    (FScalesBuffer = FBoundSPScalesBuffer)
+  then exit;
+
+  FSinglePassArgsBound := false;
+  K := FSinglePassKernel;
+  Result := clSetKernelArg(K, 0, csLongintSize, @FThreadCount);
+  Result := Result or clSetKernelArg(K, 1, csLongintSize, @FNumAs);
+  Result := Result or clSetKernelArg(K, 2, csLongintSize, @FNumBs);
+  Result := Result or clSetKernelArg(K, 3, csLongintSize, @FSize);
+  Result := Result or clSetKernelArg(K, 5, csCLMemSize, @FCodesBuffer);
+  Result := Result or clSetKernelArg(K, 7, csCLMemSize, @FResultBuffer);
+  Result := Result or clSetKernelArg(K, 10, csCLMemSize, @FScalesBuffer);
+  if Result <> CL_SUCCESS then exit;
+
+  FBoundSPThreadCount := FThreadCount;
+  FBoundSPNumAs := FNumAs;
+  FBoundSPNumBs := FNumBs;
+  FBoundSPSize := FSize;
+  FBoundSPCodesBuffer := FCodesBuffer;
+  FBoundSPResultBuffer := FResultBuffer;
+  FBoundSPScalesBuffer := FScalesBuffer;
+  FSinglePassArgsBound := true;
+end;
+
 procedure TDotProductSharedKernel.ComputeInt8(VBs: TNNetVolume;
   pActFN: longint; NewVBs: boolean = true; VBias: TNNetVolume = nil;
   NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
@@ -1438,18 +1492,25 @@ begin
     exit;
   end;
 
-  if FFP16Activations then K := FFP16Kernel.Kernel else K := FInt8Kernel.Kernel;
-  err := err or clSetKernelArg(K, 0, csLongintSize, @FThreadCount);
-  err := err or clSetKernelArg(K, 1, csLongintSize, @FNumAs);
-  err := err or clSetKernelArg(K, 2, csLongintSize, @FNumBs);
-  err := err or clSetKernelArg(K, 3, csLongintSize, @FSize);
+  // Same ownership rule as the split-K handles: the injected FInt8Kernel /
+  // FFP16Kernel handles are net-wide in the default shared-kernel mode, so
+  // argument caching is only sound on a private clone. A quant-mode flip
+  // re-runs PrepareForComputeInt8/Int4, whose UnprepareForCompute releases
+  // this clone, so FFP16Activations cannot go stale in it.
+  if not Assigned(FSinglePassKernel) then
+  begin
+    if FFP16Activations
+      then FSinglePassKernel := FFP16Kernel.CreateKernel('cai_dot_product_int8_h')
+      else FSinglePassKernel := FInt8Kernel.CreateKernel('cai_dot_product_int8');
+  end;
+  K := FSinglePassKernel;
+  // Shape, codes, result and scales stay bound across launches; only the four
+  // arguments below change per call.
+  err := err or BindSinglePassInvariantArgs();
   err := err or clSetKernelArg(K, 4, csLongintSize, @FActFun);
-  err := err or clSetKernelArg(K, 5, csCLMemSize, @FCodesBuffer);
   err := err or clSetKernelArg(K, 6, csCLMemSize, @BufferBs);
-  err := err or clSetKernelArg(K, 7, csCLMemSize, @FResultBuffer);
   err := err or clSetKernelArg(K, 8, csLongintSize, @UseBias);
   err := err or clSetKernelArg(K, 9, csCLMemSize, @FBiasBuffer);
-  err := err or clSetKernelArg(K, 10, csCLMemSize, @FScalesBuffer);
 
   if err = CL_SUCCESS then
   begin
