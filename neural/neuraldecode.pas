@@ -2368,7 +2368,6 @@ uses
 
 // Forward declarations for helpers used before their definition.
 function ContrastiveHiddenLayer(NN: TNNet): TNNetLayer; forward;
-function ContrastiveCosine(A, B: TNNetVolume): TNeuralFloat; forward;
 
 function DecodeCTCGreedy(Scores: TNNetVolume; Blank: integer): TNeuralIntegerArray;
 var
@@ -5829,10 +5828,12 @@ begin
   end;
   TNNetVolume.Ln(RowPtr, RowPtr, Size);   // Row   := ln(cond)
   TNNetVolume.Ln(UncPtr, UncPtr, Size);   // Uncond := ln(uncond)
-  // #13/App D: scale*cond + (1-scale)*uncond is the same combination in two
-  // passes (a scale then a fused multiply-add) instead of sub/scale/add.
-  Row.Mul(FGuidanceScale);                       // scale*cond
-  Row.MulAdd(1.0 - FGuidanceScale, UncondRow);   // + (1-scale)*uncond
+  // #13/App D: scale*cond + (1-scale)*uncond in ONE fused pass (two vmulps +
+  // one vaddps). These are pre-softmax log-space logits with no parity
+  // contract at scale<>1 (the scale=1 early exit above carries the only
+  // bit-for-bit guarantee), and scale=0 stays exact: 0*cond + 1*uncond has no
+  // rounding, so the uncond-only invariant is preserved.
+  Row.MulMulAdd(FGuidanceScale, 1.0 - FGuidanceScale, UncondRow);
   // Softmax the combined logits back into a probability row (the chain's
   // documented domain). #13/#19: one fused exp-and-sum pass over the row.
   MaxL := Row.GetMax();
@@ -7135,20 +7136,6 @@ begin
     Result := Head;
 end;
 
-// Cosine similarity of two equal-length flat vectors (the per-token hidden
-// states). Zero magnitude on either side yields 0 (no penalty), keeping the
-// score finite for a dead representation.
-function ContrastiveCosine(A, B: TNNetVolume): TNeuralFloat;
-var
-  Denom: TNeuralFloat;
-begin
-  Denom := A.GetMagnitude() * B.GetMagnitude();
-  if Denom <= 0 then
-    Result := 0
-  else
-    Result := A.DotProduct(B) / Denom;
-end;
-
 function DecodeContrastiveSearch(NN: TNNet; const Prompt: string;
   MaxLen: integer; TopK: integer; PenaltyAlpha: TNeuralFloat;
   const StopStrings: array of string): TNNetDecodeResult;
@@ -7159,11 +7146,12 @@ var
   CandP: array of TNeuralFloat;    // normalised probability of each candidate
   Cand: array of integer;          // current top-k candidate token ids
   Past: array of TNNetVolume;      // hidden states of already-processed tokens
+  PastMag: array of TNeuralFloat;  // their magnitudes, cached at capture
   CandHidden: TNNetVolume;         // snapshot of a candidate's hidden state
   VocabSize, Step, I, J, NumCand, Best, BestCand, StopLen, PastLen: integer;
   VocabSizeM1, NumCandM1, PastLenM1: integer;
   Total, InvTotal, MaxSim, Sim, ScoreV, BestScore, BestP, PJ: TNeuralFloat;
-  WeakestP: TNeuralFloat;
+  WeakestP, CandMag, Denom: TNeuralFloat;
   Context, CandStr: string;
   TmpI: integer;
 begin
@@ -7180,6 +7168,7 @@ begin
   Result.Finished := False;
   Context := Prompt;
   Past := nil;
+  PastMag := nil;
   PastLen := 0;
   CandHidden := nil;
   // Rule #17: the top-k candidate index scratch is vocab-sized every step; size
@@ -7200,8 +7189,13 @@ begin
         // #17: amortized doubling - Past is addressed by PastLen (never Length),
         // and the cleanup frees [0..PastLen-1], so over-allocated slots are safe.
         if PastLen >= Length(Past) then SetLength(Past, (PastLen + 1) * 2);
+        if PastLen >= Length(PastMag) then
+          SetLength(PastMag, (PastLen + 1) * 2);
         Past[PastLen] := TNNetVolume.Create();
         Past[PastLen].Copy(HiddenLayer.Output);
+        // #5/#27: past states are immutable once captured, so the magnitude is
+        // computed here ONCE instead of once per candidate in the scan below.
+        PastMag[PastLen] := Past[PastLen].GetMagnitude();
         Inc(PastLen);
       end;
       Total := OutputVolume.GetSum();
@@ -7276,11 +7270,20 @@ begin
           NN.Compute(InputVolume, OutputVolume);
           if CandHidden = nil then CandHidden := TNNetVolume.Create();
           CandHidden.Copy(HiddenLayer.Output);
+          // #5: the candidate's magnitude is invariant across the past loop;
+          // past magnitudes were cached at capture, so each pair costs one
+          // DotProduct. Zero magnitude on either side yields Sim = 0 (no
+          // penalty), keeping the score finite for a dead representation.
+          CandMag := CandHidden.GetMagnitude();
           MaxSim := -1e30;
           PastLenM1 := PastLen - 1;
           for J := 0 to PastLenM1 do
           begin
-            Sim := ContrastiveCosine(CandHidden, Past[J]);
+            Denom := CandMag * PastMag[J];
+            if Denom <= 0 then
+              Sim := 0
+            else
+              Sim := CandHidden.DotProduct(Past[J]) / Denom;
             if Sim > MaxSim then MaxSim := Sim;
           end;
         end;
@@ -7336,11 +7339,12 @@ var
   CandP: array of TNeuralFloat;
   Cand: array of integer;
   Past: array of TNNetVolume;
+  PastMag: array of TNeuralFloat;  // magnitudes, cached at capture
   CandHidden: TNNetVolume;
   VocabSize, Pos, CapLen, I, J, NumCand, Best, PastLen, StopLen: integer;
   VocabSizeM1, NumCandM1, PastLenM1, PromptLenM2: integer;
   Total, InvTotal, MaxSim, Sim, ScoreV, BestScore, BestP, PJ: TNeuralFloat;
-  WeakestP: TNeuralFloat;
+  WeakestP, CandMag, Denom: TNeuralFloat;
   TmpI: integer;
 begin
   if Session.Net.GetFirstLayer().Output.SizeX <> 1 then
@@ -7361,6 +7365,7 @@ begin
   if Length(Tokens) < CapLen then SetLength(Tokens, CapLen);
   InV := TNNetVolume.Create(Session.Net.GetFirstLayer().Output);
   Past := nil;
+  PastMag := nil;
   PastLen := 0;
   CandHidden := nil;
   // Rule #17: size the top-k candidate scratch ONCE (function scope); carry
@@ -7383,8 +7388,13 @@ begin
         // #17: amortized doubling - Past is addressed by PastLen (never Length),
         // and cleanup frees [0..PastLen-1], so over-allocated slots are safe.
         if PastLen >= Length(Past) then SetLength(Past, (PastLen + 1) * 2);
+        if PastLen >= Length(PastMag) then
+          SetLength(PastMag, (PastLen + 1) * 2);
         Past[PastLen] := TNNetVolume.Create();
         Past[PastLen].Copy(Session.HiddenState());
+        // #5/#27: past states are immutable once captured - magnitude cached
+        // ONCE here instead of once per candidate in the scan below.
+        PastMag[PastLen] := Past[PastLen].GetMagnitude();
         Inc(PastLen);
       end;
     end;
@@ -7399,8 +7409,11 @@ begin
       begin
         // #17: amortized doubling (see the prefill note above).
         if PastLen >= Length(Past) then SetLength(Past, (PastLen + 1) * 2);
+        if PastLen >= Length(PastMag) then
+          SetLength(PastMag, (PastLen + 1) * 2);
         Past[PastLen] := TNNetVolume.Create();
         Past[PastLen].Copy(Session.HiddenState());
+        PastMag[PastLen] := Past[PastLen].GetMagnitude();
         Inc(PastLen);
       end;
       Row := Session.Output();
@@ -7475,11 +7488,19 @@ begin
           if CandHidden = nil then CandHidden := TNNetVolume.Create();
           CandHidden.Copy(Session.HiddenState());
           Session.TruncateTo(Pos);
+          // #5: candidate magnitude invariant across the past loop; past
+          // magnitudes cached at capture, so each pair costs one DotProduct.
+          // Zero magnitude on either side yields Sim = 0 (no penalty).
+          CandMag := CandHidden.GetMagnitude();
           MaxSim := -1e30;
           PastLenM1 := PastLen - 1;
           for J := 0 to PastLenM1 do
           begin
-            Sim := ContrastiveCosine(CandHidden, Past[J]);
+            Denom := CandMag * PastMag[J];
+            if Denom <= 0 then
+              Sim := 0
+            else
+              Sim := CandHidden.DotProduct(Past[J]) / Denom;
             if Sim > MaxSim then MaxSim := Sim;
           end;
         end;
@@ -7745,15 +7766,21 @@ var
   // Final distribution, the candidate lens row being scored, and the winning
   // candidate's row kept from the scoring pass.
   PFinal, PLens, PBestLens, SwapLens: array of TNeuralFloat;
+  // Scratch rows for the bulk JS evaluation: the mixture m = 0.5(Pf+Pl) (ln'd
+  // in place) and a clamped-log row (lnPf per step, then lnPl per candidate).
+  MRow, LnRow: array of TNeuralFloat;
   Cands: TNeuralIntegerArray;
   VocabSize, Step, I, C, L, HeadIdx, HeadInIdx, LastLayer: integer;
   NumCand, Best, StopLen, VocabSizeM1, NumCandM1: integer;
-  Total, MaxFinal, Threshold, JS, BestJS, Pf, Pl, Pm, ScoreV, BestScore: TNeuralFloat;
-  InvTotal, InvPm: TNeuralFloat;
+  Total, MaxFinal, Threshold, JS, BestJS, Pf, Pl, ScoreV, BestScore: TNeuralFloat;
+  InvTotal, DotPfLnPf: TNeuralFloat;
   Context: string;
   HaveContrast: boolean;
 const
   cEps = 1e-12;
+  // ReluL high limit for the floor clamp: far above any probability, so only
+  // the cEps floor ever fires.
+  cLnHi = 1e30;
 begin
   InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
   OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
@@ -7763,6 +7790,8 @@ begin
   SetLength(PFinal, VocabSize);
   SetLength(PLens, VocabSize);
   SetLength(PBestLens, VocabSize);
+  SetLength(MRow, VocabSize);
+  SetLength(LnRow, VocabSize);
   LastLayer := NN.GetLastLayerIdx();
   HeadIdx := ResolveHeadStartIdx(NN, HeadStartIdx);
   HeadInIdx := HeadIdx - 1;
@@ -7809,7 +7838,24 @@ begin
         //         net after the full forward above (no extra forward needed);
         //         snapshot it, splice into the head-input slot, recompute the
         //         head sub-stack, read p_premature.
+        // JS(p||q) = 0.5 KL(p||m) + 0.5 KL(q||m), m = 0.5(p+q), expanded to
+        // dot products so the logs run through the 8-wide Ln kernel instead of
+        // 2 scalar pcr_logf per vocab element (#13/#19):
+        //   JS = 0.5*[dot(Pf,lnPf) - dot(Pf,lnM) + dot(Pl,lnPl) - dot(Pl,lnM)]
+        // dot(Pf,lnPf) is invariant across the candidate loop (#5): once here.
+        // Each Ln INPUT is floor-clamped to cEps first (ReluL with Slope=0 is
+        // exactly that clamp); the dot-product WEIGHTS stay unclamped, so a
+        // zero probability contributes exactly 0*ln(cEps) = 0 and only terms
+        // with a sub-cEps nonzero probability are perturbed (the scalar form
+        // skipped those via its cEps guards). JS only RANKS candidate layers,
+        // so an O(cEps*|ln cEps|) ranking-only perturbation is safe.
         BestJS := -1.0;
+        TNNetVolume.ReluL(TNeuralFloatArrPtr(@LnRow[0]),
+          TNeuralFloatArrPtr(@PFinal[0]), cEps, cLnHi, 0, VocabSize);
+        TNNetVolume.Ln(TNeuralFloatArrPtr(@LnRow[0]),
+          TNeuralFloatArrPtr(@LnRow[0]), VocabSize);
+        DotPfLnPf := TNNetVolume.DotProduct(TNeuralFloatArrPtr(@PFinal[0]),
+          TNeuralFloatArrPtr(@LnRow[0]), VocabSize);
         for C := 0 to NumCandM1 do
         begin
           L := Cands[C];
@@ -7831,23 +7877,26 @@ begin
           TNNetVolume.Relu(TNeuralFloatArrPtr(@PLens[0]), LensOut.DataPtr,
             VocabSize);
           TNNetVolume.Mul(TNeuralFloatArrPtr(@PLens[0]), InvTotal, VocabSize);
-          // JS(p_final || p_lens) = 0.5 KL(p||m) + 0.5 KL(q||m), m = 0.5(p+q).
-          // #4/#5: Pm lives in a local, and #21: both logs divide by that same
-          // Pm, so one reciprocal replaces the two divides - JS only ranks
-          // candidate layers, so no gradient check watches this arithmetic.
-          JS := 0;
-          for I := 0 to VocabSizeM1 do
-          begin
-            Pl := PLens[I];
-            Pf := PFinal[I];
-            Pm := 0.5 * (Pf + Pl);
-            if Pm < cEps then Continue;
-            InvPm := 1.0 / Pm;
-            // Rule #16: JS only ranks candidate layers (if JS > BestJS), so the
-            // fast Cephes logf is safe here; 2*Vocab*NumCand RTL Ln removed/token.
-            if Pf >= cEps then JS := JS + 0.5 * Pf * pcr_logf(Pf * InvPm);
-            if Pl >= cEps then JS := JS + 0.5 * Pl * pcr_logf(Pl * InvPm);
-          end;
+          // m = 0.5*Pf + 0.5*Pl into the scratch row, then two bulk Ln passes
+          // and three DotProducts form the JS terms (see the expansion above).
+          Move(PLens[0], MRow[0], VocabSize * csNeuralFloatSize);
+          TNNetVolume.MulMulAdd(TNeuralFloatArrPtr(@MRow[0]),
+            TNeuralFloatArrPtr(@PFinal[0]), 0.5, 0.5, VocabSize);
+          TNNetVolume.ReluL(TNeuralFloatArrPtr(@MRow[0]),
+            TNeuralFloatArrPtr(@MRow[0]), cEps, cLnHi, 0, VocabSize);
+          TNNetVolume.Ln(TNeuralFloatArrPtr(@MRow[0]),
+            TNeuralFloatArrPtr(@MRow[0]), VocabSize);
+          TNNetVolume.ReluL(TNeuralFloatArrPtr(@LnRow[0]),
+            TNeuralFloatArrPtr(@PLens[0]), cEps, cLnHi, 0, VocabSize);
+          TNNetVolume.Ln(TNeuralFloatArrPtr(@LnRow[0]),
+            TNeuralFloatArrPtr(@LnRow[0]), VocabSize);
+          JS := 0.5 * (DotPfLnPf
+            - TNNetVolume.DotProduct(TNeuralFloatArrPtr(@PFinal[0]),
+                TNeuralFloatArrPtr(@MRow[0]), VocabSize)
+            + TNNetVolume.DotProduct(TNeuralFloatArrPtr(@PLens[0]),
+                TNeuralFloatArrPtr(@LnRow[0]), VocabSize)
+            - TNNetVolume.DotProduct(TNeuralFloatArrPtr(@PLens[0]),
+                TNeuralFloatArrPtr(@MRow[0]), VocabSize));
           // #27: the winner's distribution is already in hand, so keep it here
           // instead of re-splicing and re-running the head sub-stack for it
           // below. The head recompute cannot touch a candidate layer's own
