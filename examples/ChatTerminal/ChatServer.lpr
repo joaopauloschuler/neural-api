@@ -140,16 +140,87 @@ end;
 // Request parsing (pure: JSON in, records out - exercised by --selftest).
 // ---------------------------------------------------------------------------
 
+// Flattens a message "content" node to text. Accepts the legacy string form
+// and the OpenAI content-parts array ([{"type":"text","text":...}, ...]) that
+// current SDKs (openai-python, smolagents/bpsa, LangChain) send by default;
+// the text parts are joined with newlines. Non-text parts (image_url, ...)
+// are rejected: this server is text-only. False + ErrMsg on any other shape.
+function ContentNodeToText(ContentNode: TJSONData; MsgIdx: integer;
+  out Text: string; out ErrMsg: string): boolean;
+var
+  Parts: TJSONArray;
+  Part: TJSONObject;
+  TypeNode, TextNode: TJSONData;
+  Cnt: integer;
+begin
+  Result := false;
+  Text := '';
+  ErrMsg := '';
+  if not Assigned(ContentNode) then
+  begin
+    ErrMsg := Format('messages[%d].content is missing', [MsgIdx]);
+    exit;
+  end;
+  if ContentNode.JSONType = jtString then
+  begin
+    Text := ContentNode.AsString;
+    Result := true;
+    exit;
+  end;
+  if ContentNode.JSONType <> jtArray then
+  begin
+    ErrMsg := Format('messages[%d].content must be a string or an array of ' +
+      '{"type":"text","text":...} parts', [MsgIdx]);
+    exit;
+  end;
+  Parts := TJSONArray(ContentNode);
+  for Cnt := 0 to Parts.Count - 1 do
+  begin
+    if Parts.Items[Cnt].JSONType <> jtObject then
+    begin
+      ErrMsg := Format('messages[%d].content[%d] is not an object',
+        [MsgIdx, Cnt]);
+      exit;
+    end;
+    Part := TJSONObject(Parts.Items[Cnt]);
+    TypeNode := Part.Find('type');
+    if not (Assigned(TypeNode) and (TypeNode.JSONType = jtString)) then
+    begin
+      ErrMsg := Format('messages[%d].content[%d].type must be a string',
+        [MsgIdx, Cnt]);
+      exit;
+    end;
+    if TypeNode.AsString <> 'text' then
+    begin
+      ErrMsg := Format('messages[%d].content[%d].type "%s" is not supported ' +
+        '(text-only server)', [MsgIdx, Cnt, TypeNode.AsString]);
+      exit;
+    end;
+    TextNode := Part.Find('text');
+    if not (Assigned(TextNode) and (TextNode.JSONType = jtString)) then
+    begin
+      ErrMsg := Format('messages[%d].content[%d].text must be a string',
+        [MsgIdx, Cnt]);
+      exit;
+    end;
+    if Cnt > 0 then Text := Text + LineEnding;
+    Text := Text + TextNode.AsString;
+  end;
+  Result := true;
+end;
+
 // Reads the "messages" array of a chat completions request into TChatMessages.
-// False + ErrMsg when the field is missing/malformed (role and content must
-// both be strings; content may be empty, role may not).
+// False + ErrMsg when the field is missing/malformed (role must be a
+// non-empty string; content is a string or a text content-parts array, see
+// ContentNodeToText, and may be empty).
 function ParseRequestMessages(Req: TJSONObject; out Msgs: TChatMessages;
   out ErrMsg: string): boolean;
 var
   Node: TJSONData;
   Arr: TJSONArray;
   Item: TJSONObject;
-  RoleNode, ContentNode: TJSONData;
+  RoleNode: TJSONData;
+  Content: string;
   Cnt: integer;
 begin
   Result := false;
@@ -177,19 +248,15 @@ begin
     end;
     Item := TJSONObject(Arr.Items[Cnt]);
     RoleNode := Item.Find('role');
-    ContentNode := Item.Find('content');
     if not (Assigned(RoleNode) and (RoleNode.JSONType = jtString) and
       (RoleNode.AsString <> '')) then
     begin
       ErrMsg := Format('messages[%d].role must be a non-empty string', [Cnt]);
       exit;
     end;
-    if not (Assigned(ContentNode) and (ContentNode.JSONType = jtString)) then
-    begin
-      ErrMsg := Format('messages[%d].content must be a string', [Cnt]);
+    if not ContentNodeToText(Item.Find('content'), Cnt, Content, ErrMsg) then
       exit;
-    end;
-    Msgs[Cnt] := ChatMessage(RoleNode.AsString, ContentNode.AsString);
+    Msgs[Cnt] := ChatMessage(RoleNode.AsString, Content);
   end;
   Result := true;
 end;
@@ -1076,6 +1143,57 @@ begin
     Check(ParseRequestMessages(Req, Msgs, ErrMsg) and (Length(Msgs) = 2) and
       (Msgs[0].Role = 'system') and (Msgs[1].Content = 'b'),
       'multi-message array parses in order');
+  finally
+    Req.Free;
+  end;
+
+  // OpenAI content-parts arrays (what openai-python / smolagents send).
+  Req := ParseObj('{"messages":[{"role":"user","content":' +
+    '[{"type":"text","text":"Hi!"}]}]}');
+  try
+    Check(ParseRequestMessages(Req, Msgs, ErrMsg) and (Length(Msgs) = 1) and
+      (Msgs[0].Content = 'Hi!'),
+      'single text content part flattens to its text');
+  finally
+    Req.Free;
+  end;
+  Req := ParseObj('{"messages":[{"role":"user","content":' +
+    '[{"type":"text","text":"a"},{"type":"text","text":"b"}]}]}');
+  try
+    Check(ParseRequestMessages(Req, Msgs, ErrMsg) and (Length(Msgs) = 1) and
+      (Msgs[0].Content = 'a' + LineEnding + 'b'),
+      'multiple text parts join with newlines');
+  finally
+    Req.Free;
+  end;
+  Req := ParseObj('{"messages":[{"role":"user","content":[]}]}');
+  try
+    Check(ParseRequestMessages(Req, Msgs, ErrMsg) and (Length(Msgs) = 1) and
+      (Msgs[0].Content = ''),
+      'empty content-parts array is empty text');
+  finally
+    Req.Free;
+  end;
+  Req := ParseObj('{"messages":[{"role":"user","content":' +
+    '[{"type":"image_url","image_url":{"url":"x"}}]}]}');
+  try
+    Check(not ParseRequestMessages(Req, Msgs, ErrMsg) and
+      (Pos('image_url', ErrMsg) > 0),
+      'non-text content part rejected');
+  finally
+    Req.Free;
+  end;
+  Req := ParseObj('{"messages":[{"role":"user","content":[{"type":"text"}]}]}');
+  try
+    Check(not ParseRequestMessages(Req, Msgs, ErrMsg),
+      'text part without text rejected');
+  finally
+    Req.Free;
+  end;
+  Req := ParseObj('{"messages":[{"role":"user","content":42}]}');
+  try
+    Check(not ParseRequestMessages(Req, Msgs, ErrMsg),
+      'numeric content rejected');
   finally
     Req.Free;
   end;

@@ -342,7 +342,12 @@ data: [DONE]
 
 Endpoints: `POST /v1/chat/completions` (messages rendered through the
 model's chat template), `POST /v1/completions` (plain completion, no
-template - the `--format raw` path), `GET /v1/models`. With
+template - the `--format raw` path), `GET /v1/models`. A message
+`content` is either a string or the OpenAI content-parts array
+(`[{"type":"text","text":"..."}, ...]`) that current SDKs such as
+openai-python and smolagents send by default; text parts are joined
+with newlines and any non-text part (`image_url`, ...) is a 400, since
+the server is text-only. With
 `"stream": true` both POST endpoints stream the reply as OpenAI-style
 Server-Sent Events - one `data:` chunk per decoded token, a
 `finish_reason` chunk, then `data: [DONE]`.
@@ -367,7 +372,7 @@ parameter-overlay checks.
 
 ## Testing
 
-`--selftest` runs 93 offline checks (argument parsing, prompt assembly
+`--selftest` runs 39 offline checks (argument parsing, prompt assembly
 against the byte-exact ChatML render, end-of-turn markers, REPL command
 parsing, the KV-cache-reuse prefix diff) without needing any model files. For an end-to-end plumbing check,
 any directory with a pico-sized random checkpoint plus a tokenizer works —
