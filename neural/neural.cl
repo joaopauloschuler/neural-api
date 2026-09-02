@@ -733,6 +733,319 @@ __kernel void cai_dot_product_int8_splitk_reduce_h
   }
 } // end of kernel
 
+// TILED GEMM for a window of columns. cai_dot_product_int8 and the split-K
+// pair give one work-item per (row, column) and every work-item streams its
+// whole weight row, so a K-column prefill moves each weight byte through L2
+// K times. Here one work-group of CAI_TILED_LANES lanes owns a tile of
+// CAI_TILED_LANES*CAI_TILED_ROWS_PER_LANE rows x CAI_TILED_COLS columns: the
+// B tile (CAI_TILED_COLS columns x CAI_TILED_KSTEP reduction elements) is
+// staged in __local once per K-step and every lane reads each weight code of
+// its rows ONCE, multiplying it into CAI_TILED_COLS accumulators, so a weight
+// byte crosses the memory system once per column tile instead of once per
+// column. Codes keep the codes[a + i*FNumAs] layout (a lane's second row is
+// CAI_TILED_LANES rows up, so both per-k loads of a work-group hit
+// CAI_TILED_LANES consecutive bytes) and the result keeps [b*FNumAs + a].
+//
+// Tile constants (mirrored by csTiledGemm* in neuralopencl.pas; the host
+// derives the launch geometry from them, so both copies must agree):
+// - CAI_TILED_LANES 64: two warps/one wavefront of coalesced 64-byte code
+//   reads; small enough that a 2560-row projection at a 64-column window
+//   still yields 80 work-groups, large enough that the tile stage is 8
+//   coalesced loads per lane.
+// - CAI_TILED_ROWS_PER_LANE 2 and CAI_TILED_COLS 16: 32 accumulators per
+//   lane. Each staged B element serves 2 multiply-adds and each weight
+//   byte 16, so a lane issues 1 global byte load per 32 mads and 1 local
+//   float4 broadcast per 8 mads. Doubling either doubles the register
+//   file per lane and halves the grid, which starves the device at the
+//   4B-class shapes.
+// - CAI_TILED_KSTEP 32 = one Q4_0 block, so the int4 twin loads one block
+//   scale per row per step; the tile is 2 KB of __local.
+//
+// Ragged edges: a lane whose row index passes FNumAs-1 reads row FNumAs-1
+// instead (a valid address) and skips its store; columns past FNumBs and
+// reduction elements past FSize are staged as 0 and never stored; the code
+// loop stops at FSize, never reading past the codes buffer. The tail applies
+// the per-row scale, the fused bias and the fused activation in
+// cai_dot_product_int8's order. Coded by Claude (AI).
+#define CAI_TILED_LANES 64
+#define CAI_TILED_ROWS_PER_LANE 2
+#define CAI_TILED_COLS 16
+#define CAI_TILED_KSTEP 32
+#define CAI_TILED_B_ELEMS (CAI_TILED_COLS * CAI_TILED_KSTEP)
+
+// Stages B[b0..b0+CAI_TILED_COLS) x [k0..k0+CAI_TILED_KSTEP) into Bs, column
+// major (Bs[b*CAI_TILED_KSTEP + k]), zero past FNumBs and FSize. Coalesced
+// over k. The caller owns the barriers.
+static inline void cai_tiled_stage_b(const int FNumBs, const int FSize,
+  const int b0, const int k0, __global const float* B, __local float* Bs,
+  const int lid)
+{
+  for (int idx = lid; idx < CAI_TILED_B_ELEMS; idx += CAI_TILED_LANES)
+  {
+    const int b = idx / CAI_TILED_KSTEP;
+    const int k = idx - b * CAI_TILED_KSTEP;
+    const int gb = b0 + b;
+    const int gk = k0 + k;
+    Bs[idx] = ((gb < FNumBs) && (gk < FSize)) ? B[gb * FSize + gk] : 0.0f;
+  }
+}
+
+// Half-storage twin of cai_tiled_stage_b (the FP16-activation B operand).
+static inline void cai_tiled_stage_b_h(const int FNumBs, const int FSize,
+  const int b0, const int k0, __global const half* B, __local float* Bs,
+  const int lid)
+{
+  for (int idx = lid; idx < CAI_TILED_B_ELEMS; idx += CAI_TILED_LANES)
+  {
+    const int b = idx / CAI_TILED_KSTEP;
+    const int k = idx - b * CAI_TILED_KSTEP;
+    const int gb = b0 + b;
+    const int gk = k0 + k;
+    Bs[idx] = ((gb < FNumBs) && (gk < FSize))
+      ? vload_half(gb * FSize + gk, B) : 0.0f;
+  }
+}
+
+// Four consecutive reduction elements (w0..w3 = k..k+3) of one row against
+// the staged tile, into the row's CAI_TILED_COLS accumulators. Every lane of
+// the work-group reads the same tile address, so the float4 load is a
+// broadcast.
+static inline void cai_tiled_mad4(float* acc, __local const float* Bs,
+  const float w0, const float w1, const float w2, const float w3, const int k)
+{
+  #pragma unroll
+  for (int b = 0; b < CAI_TILED_COLS; b++)
+  {
+    const float4 bv = vload4(0, Bs + b * CAI_TILED_KSTEP + k);
+    acc[b] = mad(w3, bv.s3, mad(w2, bv.s2, mad(w1, bv.s1,
+      mad(w0, bv.s0, acc[b]))));
+  }
+}
+
+// Per-row scale, fused bias, fused activation and store of one row's
+// CAI_TILED_COLS results; a row past FNumAs-1 or a column past FNumBs-1 is
+// skipped.
+static inline void cai_tiled_store_row(const int FNumAs, const int FNumBs,
+  const int ActFN, const int UseBias, __global float* R,
+  __global const float* Bias, __global const float* Scales,
+  const int row, const int b0, const float* acc)
+{
+  if (row >= FNumAs) return;
+  const float RowScale = Scales[row];
+  #pragma unroll
+  for (int b = 0; b < CAI_TILED_COLS; b++)
+  {
+    const int gb = b0 + b;
+    if (gb < FNumBs)
+    {
+      const int pos = gb * FNumAs + row;
+      float v = acc[b] * RowScale;
+      if (UseBias != 0) v += Bias[pos];
+      R[pos] = cai_fused_act(v, ActFN);
+    }
+  }
+}
+
+// Int8 tiled body, shared by the FP32 and the half B operand entry points:
+// exactly one of Bf/Bh is read, chosen by the compile-time constant BIsHalf
+// at each call site. Coded by Claude (AI).
+static inline void cai_dot_product_int8_tiled_body(const int FNumAs,
+  const int FNumBs, const int FSize, const int ActFN,
+  __global const char* FInputBufferAs, __global const float* Bf,
+  __global const half* Bh, const int BIsHalf, __global float* FResultBuffer,
+  const int UseBias, __global const float* FBiasOutput,
+  __global const float* FScales, __local float* Bs)
+{
+  const int lid = get_local_id(0);
+  const int a0 = get_group_id(0) * (CAI_TILED_LANES * CAI_TILED_ROWS_PER_LANE);
+  const int b0 = get_group_id(1) * CAI_TILED_COLS;
+  const int MaxRow = FNumAs - 1;
+  const int row0 = min(a0 + lid, MaxRow);
+  const int row1 = min(a0 + lid + CAI_TILED_LANES, MaxRow);
+
+  float acc0[CAI_TILED_COLS];
+  float acc1[CAI_TILED_COLS];
+  #pragma unroll
+  for (int b = 0; b < CAI_TILED_COLS; b++) { acc0[b] = 0.0f; acc1[b] = 0.0f; }
+
+  const int RowStep4 = 4 * FNumAs;
+  for (int k0 = 0; k0 < FSize; k0 += CAI_TILED_KSTEP)
+  {
+    // The previous step's reads must finish before the tile is overwritten.
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (BIsHalf) cai_tiled_stage_b_h(FNumBs, FSize, b0, k0, Bh, Bs, lid);
+    else         cai_tiled_stage_b(FNumBs, FSize, b0, k0, Bf, Bs, lid);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int kEnd = min(CAI_TILED_KSTEP, FSize - k0);
+    __global const char* A0 = FInputBufferAs + row0 + k0 * FNumAs;
+    __global const char* A1 = FInputBufferAs + row1 + k0 * FNumAs;
+    int k = 0;
+    for (; k + 3 < kEnd; k += 4)
+    {
+      const float w00 = convert_float(A0[0]);
+      const float w01 = convert_float(A0[FNumAs]);
+      const float w02 = convert_float(A0[2 * FNumAs]);
+      const float w03 = convert_float(A0[3 * FNumAs]);
+      const float w10 = convert_float(A1[0]);
+      const float w11 = convert_float(A1[FNumAs]);
+      const float w12 = convert_float(A1[2 * FNumAs]);
+      const float w13 = convert_float(A1[3 * FNumAs]);
+      A0 += RowStep4;
+      A1 += RowStep4;
+      cai_tiled_mad4(acc0, Bs, w00, w01, w02, w03, k);
+      cai_tiled_mad4(acc1, Bs, w10, w11, w12, w13, k);
+    }
+    // Ragged FSize: the last step's remainder (fewer than 4 elements).
+    for (; k < kEnd; k++)
+    {
+      const float w0 = convert_float(A0[0]);
+      const float w1 = convert_float(A1[0]);
+      A0 += FNumAs;
+      A1 += FNumAs;
+      #pragma unroll
+      for (int b = 0; b < CAI_TILED_COLS; b++)
+      {
+        const float bv = Bs[b * CAI_TILED_KSTEP + k];
+        acc0[b] = mad(w0, bv, acc0[b]);
+        acc1[b] = mad(w1, bv, acc1[b]);
+      }
+    }
+  }
+
+  cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
+    FBiasOutput, FScales, a0 + lid, b0, acc0);
+  cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
+    FBiasOutput, FScales, a0 + lid + CAI_TILED_LANES, b0, acc1);
+}
+
+// Tiled twin of cai_dot_product_int8 for FNumBs >= CAI_TILED_COLS. Launch:
+// global (ceil(FNumAs / (CAI_TILED_LANES*CAI_TILED_ROWS_PER_LANE)) *
+// CAI_TILED_LANES, ceil(FNumBs / CAI_TILED_COLS)), local (CAI_TILED_LANES, 1).
+// Same operands, scale order and fused tail as cai_dot_product_int8; the
+// result differs from it only by float summation order. Coded by Claude (AI).
+__kernel void cai_dot_product_int8_tiled
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int ActFN,
+  __global const char* FInputBufferAs,
+  __global const float* FInputBufferBs,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FBiasOutput,
+  __global const float* FScales
+)
+{
+  __local float Bs[CAI_TILED_B_ELEMS];
+  cai_dot_product_int8_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
+    FInputBufferBs, 0, 0, FResultBuffer, UseBias, FBiasOutput, FScales, Bs);
+}
+
+// HALF-ACTIVATION twin of cai_dot_product_int8_tiled: B is read through
+// vload_half while it is staged, everything after the stage is the same
+// float code. Same accuracy note as cai_dot_product_int8_h. Coded by Claude (AI).
+__kernel void cai_dot_product_int8_tiled_h
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int ActFN,
+  __global const char* FInputBufferAs,
+  __global const half* FInputBufferBs,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FBiasOutput,
+  __global const float* FScales
+)
+{
+  __local float Bs[CAI_TILED_B_ELEMS];
+  cai_dot_product_int8_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
+    0, FInputBufferBs, 1, FResultBuffer, UseBias, FBiasOutput, FScales, Bs);
+}
+
+// Q4_0 WEIGHT twin of cai_dot_product_int8_tiled: same tile, same launch
+// geometry, same fused tail (FScales is the row of 1.0 PrepareForComputeInt4
+// uploads). The A operand is the interleaved packed layout of
+// cai_dot_product_int4_splitk (FPackedAs[a + p*FNumAs], p = k/2, low nibble
+// = code k, high = code k+1, +8 biased; FBlockScales[a + blk*FNumAs]). A
+// K-step is one block, so each lane loads one block scale per row per step
+// and applies it to the code before the multiply-add: the dequantized weight
+// (code - 8) * scale, which is what the FP32 oracle multiplies, rather than
+// the block-sum-then-scale of pass 1 - a difference of float rounding order
+// only. FSize is a multiple of 32 (the PrepareForComputeInt4 invariant), so
+// no step is ragged along k. Coded by Claude (AI).
+__kernel void cai_dot_product_int4_tiled
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int ActFN,
+  __global const uchar* FPackedAs,
+  __global const float* FInputBufferBs,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FBiasOutput,
+  __global const float* FScales,
+  __global const float* FBlockScales
+)
+{
+  __local float Bs[CAI_TILED_B_ELEMS];
+  const int lid = get_local_id(0);
+  const int a0 = get_group_id(0) * (CAI_TILED_LANES * CAI_TILED_ROWS_PER_LANE);
+  const int b0 = get_group_id(1) * CAI_TILED_COLS;
+  const int MaxRow = FNumAs - 1;
+  const int row0 = min(a0 + lid, MaxRow);
+  const int row1 = min(a0 + lid + CAI_TILED_LANES, MaxRow);
+
+  float acc0[CAI_TILED_COLS];
+  float acc1[CAI_TILED_COLS];
+  #pragma unroll
+  for (int b = 0; b < CAI_TILED_COLS; b++) { acc0[b] = 0.0f; acc1[b] = 0.0f; }
+
+  const int PairStep2 = 2 * FNumAs;
+  int blk = 0;
+  for (int k0 = 0; k0 < FSize; k0 += CAI_TILED_KSTEP, blk++)
+  {
+    barrier(CLK_LOCAL_MEM_FENCE);
+    cai_tiled_stage_b(FNumBs, FSize, b0, k0, FInputBufferBs, Bs, lid);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const float s0 = FBlockScales[row0 + blk * FNumAs];
+    const float s1 = FBlockScales[row1 + blk * FNumAs];
+    // Pair p = k/2 = 16*blk is the block's first packed byte; the block's 16
+    // bytes of one row are FNumAs apart.
+    __global const uchar* P0 = FPackedAs + row0 + (blk << 4) * FNumAs;
+    __global const uchar* P1 = FPackedAs + row1 + (blk << 4) * FNumAs;
+    #pragma unroll
+    for (int k = 0; k < CAI_TILED_KSTEP; k += 4)
+    {
+      const int p00 = P0[0];
+      const int p01 = P0[FNumAs];
+      const int p10 = P1[0];
+      const int p11 = P1[FNumAs];
+      P0 += PairStep2;
+      P1 += PairStep2;
+      const float w00 = convert_float((p00 & 15) - 8) * s0;
+      const float w01 = convert_float((p00 >> 4) - 8) * s0;
+      const float w02 = convert_float((p01 & 15) - 8) * s0;
+      const float w03 = convert_float((p01 >> 4) - 8) * s0;
+      const float w10 = convert_float((p10 & 15) - 8) * s1;
+      const float w11 = convert_float((p10 >> 4) - 8) * s1;
+      const float w12 = convert_float((p11 & 15) - 8) * s1;
+      const float w13 = convert_float((p11 >> 4) - 8) * s1;
+      cai_tiled_mad4(acc0, Bs, w00, w01, w02, w03, k);
+      cai_tiled_mad4(acc1, Bs, w10, w11, w12, w13, k);
+    }
+  }
+
+  cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
+    FBiasOutput, FScales, a0 + lid, b0, acc0);
+  cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
+    FBiasOutput, FScales, a0 + lid + CAI_TILED_LANES, b0, acc1);
+} // end of kernel
+
 __kernel void cai_dot_product2
 (
   const int FThreadCount,

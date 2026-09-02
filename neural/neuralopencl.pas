@@ -64,6 +64,18 @@ const
   /// Bytes per OpenCL half. There is no Pascal type for it: the FP16 B
   /// operand is only ever written and read by device kernels.
   csHalfSize = 2;
+  /// Tile geometry of cai_dot_product_int8_tiled / _tiled_h / _int4_tiled
+  /// (the CAI_TILED_* defines in neural.cl; the launch geometry derives from
+  /// them, so the two copies must agree): lanes per work-group, rows per
+  /// lane and columns per tile.
+  csTiledGemmLanes = 64;
+  csTiledGemmRowsPerLane = 2;
+  csTiledGemmCols = 16;
+  /// Columns (FNumBs) from which ComputeResidentCodes takes the tiled GEMM:
+  /// one full column tile. Below it the tile would multiply zero-padded
+  /// columns, while the existing kernels re-read each weight row only a
+  /// handful of times.
+  csTiledGemmMinColumns = csTiledGemmCols;
 
 type
   TPlatformNames = array of string;
@@ -83,6 +95,9 @@ type
     // Cached CL_DEVICE_MAX_COMPUTE_UNITS of FCurrentDevice, 0 while not
     // yet queried. The int8 launch sizer asks for it per GEMM per token.
     FMaxComputeUnits: integer;
+    // Cached CL_DEVICE_MAX_WORK_GROUP_SIZE of FCurrentDevice, 0 while not
+    // yet queried.
+    FMaxWorkGroupSize: integer;
     FOpenCLProgramSource: TStringList;
 
     FContext: cl_context;        // OpenCL compute context
@@ -149,6 +164,12 @@ type
     // fails. Cached after the first call. Sizes launches that must fill the
     // device to run at speed.
     function DeviceMaxComputeUnits(): integer;
+    // CL_DEVICE_MAX_WORK_GROUP_SIZE of the current device, 1 when the query
+    // fails. Cached after the first call.
+    function DeviceMaxWorkGroupSize(): integer;
+    // CL_KERNEL_WORK_GROUP_SIZE of pKernel on the current device (register
+    // use can cap it below the device limit), 0 when the query fails.
+    function KernelMaxWorkGroupSize(pKernel: cl_kernel): integer;
     function RunKernel(pkernel:cl_kernel; ThreadCount: integer): integer;
     function RunKernel2D(pkernel:cl_kernel; d1size, d2size: csize_t): integer; overload;
     function RunKernel2D(pkernel:cl_kernel; d1size, d2size, d1groupsize, d2groupsize: csize_t): integer; overload;
@@ -387,6 +408,19 @@ type
       FSinglePassArgsBound: boolean;
       FBoundSPThreadCount, FBoundSPNumAs, FBoundSPNumBs, FBoundSPSize: longint;
       FBoundSPCodesBuffer, FBoundSPResultBuffer, FBoundSPScalesBuffer: cl_mem;
+      /// TILED GEMM (cai_dot_product_int8_tiled / _tiled_h / _int4_tiled) for
+      /// a window of FNumBs >= TiledGemmMinColumns columns: one work-group per
+      /// tile of rows x columns reads each weight code once per column tile.
+      /// The handle is owned here and bound lazily by PrepareTiled, which also
+      /// sets the arguments that never change while it lives: shape, codes,
+      /// result and scales are fixed from PrepareForComputeInt8/Int4 to
+      /// UnprepareForCompute, which releases the handle. FTiledRejected
+      /// remembers a device that refused the kernel or its work-group size, so
+      /// the fallback is decided once. FTiledLaunchCount is the test hook that
+      /// proves the tiled path ran. Coded by Claude (AI).
+      FTiledKernel: cl_kernel;
+      FTiledRejected: boolean;
+      FTiledLaunchCount: integer;
 
       /// How many slabs to cut the reduction axis into for the current shape:
       /// 1 means the launch already fills the device, so ComputeInt8 keeps the
@@ -421,8 +455,14 @@ type
       /// returns the UseBias kernel argument (0 for a nil VBias). Coded by Claude (AI).
       function PrepareBiasOperand(VBias: TNNetVolume; NewVBias: boolean;
         var err: integer): longint;
+      /// True when the current shape and device take the tiled GEMM: at least
+      /// TiledGemmMinColumns columns and a work-group of csTiledGemmLanes fits.
+      function ShouldUseTiledGemm(): boolean;
+      /// Binds the tiled entry point for the armed weight mode and its fixed
+      /// arguments. False when the device rejected it (existing path runs).
+      function PrepareTiled(): boolean;
       /// The shared body of ComputeInt8 and ComputeInt4: B operand, bias,
-      /// split-K or single-pass launch against the resident codes. Coded by Claude (AI).
+      /// tiled, split-K or single-pass launch against the resident codes. Coded by Claude (AI).
       procedure ComputeResidentCodes(VBs: TNNetVolume; pActFN: longint;
         NewVBs: boolean; VBias: TNNetVolume; NewVBias: boolean;
         pExternalVBs: cl_mem);
@@ -502,6 +542,9 @@ type
       /// True after a successful PrepareForComputeInt4 (cleared by
       /// UnprepareForCompute); the int4 layers gate their device route on it.
       property Int4Ready: boolean read FInt4Ready;
+      /// Launches of the tiled GEMM over this instance's lifetime; a test
+      /// asserts it moved to prove the tiled path ran.
+      property TiledGemmLaunchCount: integer read FTiledLaunchCount;
       /// The buffer Compute/ComputeInt8 leave their result in and
       /// FinishAndLoadResult reads back from. Exposed so a layer can bind it
       /// (device residency) instead of downloading. Still owned here: released
@@ -542,6 +585,12 @@ type
       procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint);
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
   end;
+
+/// Columns (FNumBs) from which ComputeResidentCodes takes the tiled GEMM; 0
+/// turns it off. csTiledGemmMinColumns unless NEURAL_TILED_GEMM_MINCOLS is set
+/// (read once, at first use) or SetTiledGemmMinColumns was called.
+function TiledGemmMinColumns(): integer;
+procedure SetTiledGemmMinColumns(pValue: integer);
 
 implementation
 uses math;
@@ -666,8 +715,11 @@ begin
   if Assigned(FSplitKInt4Kernel)   then clReleaseKernel(FSplitKInt4Kernel);
   if Assigned(FMainKernel)         then clReleaseKernel(FMainKernel);
   if Assigned(FSinglePassKernel)   then clReleaseKernel(FSinglePassKernel);
+  if Assigned(FTiledKernel)        then clReleaseKernel(FTiledKernel);
   FMainKernel := nil;
   FSinglePassKernel := nil;
+  FTiledKernel := nil;
+  FTiledRejected := false;
   FMainArgsBound := false;
   FSinglePassArgsBound := false;
   FSplitKInt4Kernel := nil;
@@ -1120,6 +1172,81 @@ begin
   ReadOverride('NEURAL_INT4_SPLITK_MAXSPLITS', vInt4SplitKMaxSplits);
 end;
 
+var
+  vTiledGemmMinColumnsLoaded: boolean = false;
+  vTiledGemmMinColumns: integer = csTiledGemmMinColumns;
+
+function TiledGemmMinColumns(): integer;
+var
+  EnvValue: string;
+  Parsed: integer;
+begin
+  if not vTiledGemmMinColumnsLoaded then
+  begin
+    vTiledGemmMinColumnsLoaded := true;
+    EnvValue := GetEnvironmentVariable('NEURAL_TILED_GEMM_MINCOLS');
+    if (EnvValue <> '') and TryStrToInt(EnvValue, Parsed) and (Parsed >= 0) then
+      vTiledGemmMinColumns := Parsed;
+  end;
+  Result := vTiledGemmMinColumns;
+end;
+
+procedure SetTiledGemmMinColumns(pValue: integer);
+begin
+  vTiledGemmMinColumnsLoaded := true;
+  vTiledGemmMinColumns := pValue;
+end;
+
+function TDotProductSharedKernel.ShouldUseTiledGemm(): boolean;
+var
+  MinColumns: integer;
+begin
+  MinColumns := TiledGemmMinColumns();
+  Result := (MinColumns > 0) and (FNumBs >= MinColumns) and (FSize > 0) and
+    (FDotProductKernel.DeviceMaxWorkGroupSize() >= csTiledGemmLanes);
+end;
+
+function TDotProductSharedKernel.PrepareTiled(): boolean;
+var
+  err: integer;
+begin
+  Result := Assigned(FTiledKernel);
+  if Result or FTiledRejected then exit;
+  FTiledRejected := true;
+  if FInt4Ready then
+    FTiledKernel := FInt8Kernel.CreateKernel('cai_dot_product_int4_tiled')
+  else if FFP16Activations then
+    FTiledKernel := FFP16Kernel.CreateKernel('cai_dot_product_int8_tiled_h')
+  else
+    FTiledKernel := FInt8Kernel.CreateKernel('cai_dot_product_int8_tiled');
+  if not Assigned(FTiledKernel) then exit;
+  // Register use can cap the kernel below the device's work-group limit.
+  if FDotProductKernel.KernelMaxWorkGroupSize(FTiledKernel) < csTiledGemmLanes then
+  begin
+    clReleaseKernel(FTiledKernel);
+    FTiledKernel := nil;
+    exit;
+  end;
+  err := clSetKernelArg(FTiledKernel, 0, csLongintSize, @FNumAs);
+  err := err or clSetKernelArg(FTiledKernel, 1, csLongintSize, @FNumBs);
+  err := err or clSetKernelArg(FTiledKernel, 2, csLongintSize, @FSize);
+  err := err or clSetKernelArg(FTiledKernel, 4, csCLMemSize, @FCodesBuffer);
+  err := err or clSetKernelArg(FTiledKernel, 6, csCLMemSize, @FResultBuffer);
+  err := err or clSetKernelArg(FTiledKernel, 9, csCLMemSize, @FScalesBuffer);
+  if FInt4Ready then
+    err := err or clSetKernelArg(FTiledKernel, 10, csCLMemSize, @FBlockScalesBuffer);
+  if err <> CL_SUCCESS then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.PrepareTiled - failed setting ' +
+      'the fixed tiled GEMM arguments: ' + IntToStr(err));
+    clReleaseKernel(FTiledKernel);
+    FTiledKernel := nil;
+    exit;
+  end;
+  FTiledRejected := false;
+  Result := true;
+end;
+
 function TDotProductSharedKernel.Int8SplitCount(): integer;
 var
   Rows, TargetThreads, MaxSplitsBySize: integer;
@@ -1437,7 +1564,7 @@ var
   UseBias: longint;
   K, KReduce: cl_kernel;
   BufferBs: cl_mem;
-  Splits: longint;
+  Splits, RowTiles, ColTiles: longint;
 begin
   if (VBs.Size <> FSize * FNumBs) then
   begin
@@ -1452,6 +1579,33 @@ begin
 
   // Binds (FP32) or narrows into (FP16) the B operand the GEMM below reads.
   BufferBs := PrepareInt8BOperand(VBs, NewVBs, pExternalVBs, err);
+
+  // A window of columns: one work-group per (row tile, column tile), each
+  // weight code read once per column tile. Only the four arguments below
+  // change per call; the FNumBs = 1 decode paths further down are untouched.
+  if ShouldUseTiledGemm() and PrepareTiled() then
+  begin
+    K := FTiledKernel;
+    err := err or clSetKernelArg(K, 3, csLongintSize, @FActFun);
+    err := err or clSetKernelArg(K, 5, csCLMemSize, @BufferBs);
+    err := err or clSetKernelArg(K, 7, csLongintSize, @UseBias);
+    err := err or clSetKernelArg(K, 8, csCLMemSize, @FBiasBuffer);
+    if err = CL_SUCCESS then
+    begin
+      RowTiles := (FNumAs + csTiledGemmLanes * csTiledGemmRowsPerLane - 1)
+        div (csTiledGemmLanes * csTiledGemmRowsPerLane);
+      ColTiles := (FNumBs + csTiledGemmCols - 1) div csTiledGemmCols;
+      FDotProductKernel.RunKernel2D(K, RowTiles * csTiledGemmLanes, ColTiles,
+        csTiledGemmLanes, 1);
+      Inc(FTiledLaunchCount);
+    end
+    else
+    begin
+      ErrorProc('Error: TDotProductSharedKernel.ComputeResidentCodes - ' +
+        'failed setting tiled GEMM parameters: ' + IntToStr(err));
+    end;
+    exit;
+  end;
 
   Splits := Int8SplitCount();
   // Int4 has no single-pass kernel: its pass 1 runs with KSplits = 1 instead.
@@ -2275,6 +2429,7 @@ procedure TEasyOpenCL.SetCurrentDevice(pDeviceId: cl_device_id);
 begin
   FCurrentDevice := pDeviceId;
   FMaxComputeUnits := 0;
+  FMaxWorkGroupSize := 0;
 end;
 
 procedure TEasyOpenCL.CompileProgramFromFile(filename: string);
@@ -2486,6 +2641,37 @@ begin
     if Units > 0 then Result := Units;
   end;
   FMaxComputeUnits := Result;
+end;
+
+function TEasyOpenCL.DeviceMaxWorkGroupSize(): integer;
+var
+  GroupSize: csize_t;
+  BytesWritten: csize_t;
+begin
+  Result := FMaxWorkGroupSize;
+  if Result > 0 then exit;
+  Result := 1;
+  if FCurrentDevice = nil then exit;
+  GroupSize := 0;
+  if clGetDeviceInfo(FCurrentDevice, CL_DEVICE_MAX_WORK_GROUP_SIZE,
+    SizeOf(GroupSize), @GroupSize, {$IFDEF FPC}BytesWritten{$ELSE}@BytesWritten{$ENDIF}) = CL_SUCCESS then
+  begin
+    if GroupSize > 0 then Result := GroupSize;
+  end;
+  FMaxWorkGroupSize := Result;
+end;
+
+function TEasyOpenCL.KernelMaxWorkGroupSize(pKernel: cl_kernel): integer;
+var
+  GroupSize: csize_t;
+  BytesWritten: csize_t;
+begin
+  Result := 0;
+  if (FCurrentDevice = nil) or (pKernel = nil) then exit;
+  GroupSize := 0;
+  if clGetKernelWorkGroupInfo(pKernel, FCurrentDevice, CL_KERNEL_WORK_GROUP_SIZE,
+    SizeOf(GroupSize), @GroupSize, @BytesWritten) = CL_SUCCESS then
+    Result := GroupSize;
 end;
 
 function TEasyOpenCL.RunKernel(pkernel: cl_kernel; ThreadCount: integer): integer;

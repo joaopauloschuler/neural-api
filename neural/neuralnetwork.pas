@@ -604,6 +604,9 @@ type
       // True when the previous layer left its finished output in device memory
       // and exposes both handles, so this layer may bind it. Coded by Claude (AI).
       function PrevOutputOnOpenCL(): boolean;
+      // Tiled-GEMM launches of this layer's FDotCL so far (0 without one): the
+      // test hook proving a window forward took the tiled int8/int4 kernel.
+      function OpenCLTiledGemmLaunchCount(): integer;
       // Force (pForce=True) or release (False) the OpenCL path on this layer,
       // bypassing the per-layer size verdict in WillOpenCL. Used by the GPU
       // parity tests to exercise the device path on tiny tensors. Coded by Claude (AI).
@@ -133827,6 +133830,11 @@ end;
 function TNNetLayer.PrevOutputOnOpenCL(): boolean;
 begin
   Result := Assigned(FPrevLayer) and FPrevLayer.OutputBindableOnOpenCL();
+end;
+
+function TNNetLayer.OpenCLTiledGemmLaunchCount(): integer;
+begin
+  if Assigned(FDotCL) then Result := FDotCL.TiledGemmLaunchCount else Result := 0;
 end;
 
 function TNNetLayer.GetDotCLWaitBeta(): TNeuralFloat;
