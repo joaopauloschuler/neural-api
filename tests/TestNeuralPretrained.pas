@@ -28,6 +28,16 @@ type
   TTestNeuralPretrained = class(TTestCase)
   private
     function FixturePath(const FileName: string): string;
+    // The tiny_qwen3_5 hybrid fixture as an inference net whose input width
+    // (the streamed window) is pSeqLen tokens.
+    function BuildQwen35FixtureTwin(pSeqLen: integer): TNNet;
+    // Largest |A[i] - B[i]| over two volumes of the same size.
+    function MaxAbsVolumeDiff(A, B: TNNetVolume): double;
+    // Windows of StepTokens through WindowSession over the first
+    // PrefillTokenCount tokens, snapshot handoff, then width-1 for the rest.
+    procedure RunWindowedPrefillStream(WindowSession,
+      TailSession: TNNetStreamingDecoder; const Tokens: array of integer;
+      StepTokens, PrefillTokenCount: integer; Logits: TNNetVolume);
     {$IFDEF OpenCL}
     // First OpenCL platform/device on the box; false when there is none, which
     // every caller reports as a SKIP.
@@ -256,6 +266,10 @@ type
     procedure TestQwen35LogitParity;
     procedure TestQwen35QProjStagedSlabSliceParity;
     procedure TestQwen35StreamedDecodeParity;
+    procedure TestQwen35WindowedPrefillParity;
+    procedure TestQwen35WindowCausality;
+    procedure TestQwen35WindowAtNonZeroPosition;
+    procedure TestQwen35WindowedPrefillSnapshotHandoff;
     procedure TestQwen35StreamedDecodeOpenCLParity;
     procedure TestQwen2StreamedDecodeOpenCLParity;
     procedure TestQwen35TurnBoundaryResumeParity;
@@ -9146,6 +9160,398 @@ begin
     Session.Free;
     Twin.Free;
     Full.Free;
+  end;
+end;
+
+function TTestNeuralPretrained.BuildQwen35FixtureTwin(pSeqLen: integer): TNNet;
+var
+  Config: TLlamaConfig;
+begin
+  Result := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5.safetensors'), Config, pSeqLen,
+    {pTrainable=}false, FixturePath('tiny_qwen3_5_config.json'));
+end;
+
+function TTestNeuralPretrained.MaxAbsVolumeDiff(A, B: TNNetVolume): double;
+var
+  Pos, MaxPos: integer;
+  Diff: double;
+begin
+  AssertEquals('compared volumes have the same size', A.Size, B.Size);
+  Result := 0;
+  MaxPos := A.Size - 1;
+  for Pos := 0 to MaxPos do
+  begin
+    Diff := Abs(A.FData[Pos] - B.FData[Pos]);
+    if Diff > Result then Result := Diff;
+  end;
+end;
+
+// The production prefill shape: the first PrefillTokenCount tokens go through
+// WindowSession in whole windows of StepTokens (never padded), the state
+// crosses to TailSession through Snapshot/RestoreSnapshot, and every
+// remaining token (the prefill tail and the decoded continuation) is stepped
+// one at a time on TailSession. Logits receives one row per token so runs of
+// any window width compare row by row. TNNet.Compute only prints on a width
+// mismatch, so both input widths are asserted before anything is fed.
+// Passing the same session twice is the plain width-1 reference stream.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunWindowedPrefillStream(WindowSession,
+  TailSession: TNNetStreamingDecoder; const Tokens: array of integer;
+  StepTokens, PrefillTokenCount: integer; Logits: TNNetVolume);
+var
+  WindowIn, TailIn, StepOut: TNNetVolume;
+  Snap: TNNetDecoderSessionSnapshot;
+  Pos, Row, Vocab, TokenCount, WindowCount, WindowPos: integer;
+  MaxRowPos, MaxWindowPos: integer;
+begin
+  TokenCount := Length(Tokens);
+  Vocab := TailSession.Output().Depth;
+  AssertEquals('window net input width', StepTokens,
+    WindowSession.Net.GetFirstLayer().Output.SizeX);
+  AssertEquals('tail net input width', 1,
+    TailSession.Net.GetFirstLayer().Output.SizeX);
+  AssertTrue('prefill fits the token list', PrefillTokenCount <= TokenCount);
+  Logits.ReSize(TokenCount, 1, Vocab);
+  Logits.Fill(0);
+  WindowIn := TNNetVolume.Create(StepTokens, 1, 1);
+  TailIn := TNNetVolume.Create(1, 1, 1);
+  try
+    WindowSession.Reset();
+    TailSession.Reset();
+    WindowCount := PrefillTokenCount div StepTokens;
+    MaxWindowPos := WindowCount - 1;
+    MaxRowPos := StepTokens - 1;
+    Pos := 0;
+    for WindowPos := 0 to MaxWindowPos do
+    begin
+      for Row := 0 to MaxRowPos do WindowIn.FData[Row] := Tokens[Pos + Row];
+      WindowSession.StepForward(WindowIn, Pos);
+      StepOut := WindowSession.Output();
+      AssertEquals('window logits hold one row per token at ' + IntToStr(Pos),
+        StepTokens * Vocab, StepOut.Size);
+      Move(StepOut.FData[0], Logits.FData[Pos * Vocab],
+        StepTokens * Vocab * SizeOf(TNeuralFloat));
+      Inc(Pos, StepTokens);
+    end;
+    if (WindowSession <> TailSession) and (Pos > 0) then
+    begin
+      Snap := WindowSession.Snapshot();
+      try
+        TailSession.RestoreSnapshot(Snap);
+      finally
+        Snap.Free;
+      end;
+    end;
+    while Pos < TokenCount do
+    begin
+      TailIn.FData[0] := Tokens[Pos];
+      TailSession.StepForward(TailIn, Pos);
+      StepOut := TailSession.Output();
+      AssertEquals('width-1 logits hold one row at ' + IntToStr(Pos),
+        Vocab, StepOut.Size);
+      Move(StepOut.FData[0], Logits.FData[Pos * Vocab],
+        Vocab * SizeOf(TNeuralFloat));
+      Inc(Pos);
+    end;
+  finally
+    TailIn.Free;
+    WindowIn.Free;
+  end;
+end;
+
+// Batched-prefill parity through the whole Qwen3.5 hybrid stack (DeltaNet
+// recurrence + conv state + KV-cached fused SDPA + RoPE offsets): the full
+// 16-token forward, the width-1 stream, 4-token windows (they divide the
+// prompt) and 6-token windows (two windows, then a 4-token tail stepped at
+// width 1 after the snapshot handoff) must all agree within 2e-4.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35WindowedPrefillParity;
+const
+  SeqLen = 16;
+var
+  Full, Twin1, Twin4, Twin6: TNNet;
+  Config: TLlamaConfig;
+  Session1, Session4, Session6: TNNetStreamingDecoder;
+  FullIn, FullOut, Logits1, Logits4, Logits6: TNNetVolume;
+  Toks: array[0..SeqLen - 1] of integer;
+  T, Vocab: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  Full := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5.safetensors'), Config, {SeqLen=}0,
+    {pTrainable=}false, FixturePath('tiny_qwen3_5_config.json'));
+  Twin1 := nil; Twin4 := nil; Twin6 := nil;
+  Session1 := nil; Session4 := nil; Session6 := nil;
+  FullIn := TNNetVolume.Create(SeqLen, 1, 1);
+  FullOut := TNNetVolume.Create();
+  Logits1 := TNNetVolume.Create();
+  Logits4 := TNNetVolume.Create();
+  Logits6 := TNNetVolume.Create();
+  try
+    Vocab := Config.VocabSize;
+    for T := 0 to SeqLen - 1 do
+    begin
+      Toks[T] := (5 * T + 2) mod Vocab;
+      FullIn.FData[T] := Toks[T];
+    end;
+    Full.Compute(FullIn);
+    Full.GetOutput(FullOut);
+    AssertEquals('full forward logits', SeqLen * Vocab, FullOut.Size);
+    Twin1 := BuildQwen35FixtureTwin(1);
+    Twin4 := BuildQwen35FixtureTwin(4);
+    Twin6 := BuildQwen35FixtureTwin(6);
+    Session1 := TNNetStreamingDecoder.Create(Twin1, SeqLen);
+    Session4 := TNNetStreamingDecoder.Create(Twin4, SeqLen);
+    Session6 := TNNetStreamingDecoder.Create(Twin6, SeqLen);
+    AssertTrue('recurrent-state layers collected', Session4.SSMCount > 0);
+    AssertTrue('attention layers collected', Session4.SDPACount > 0);
+    RunWindowedPrefillStream(Session1, Session1, Toks, 1, SeqLen, Logits1);
+    RunWindowedPrefillStream(Session4, Session1, Toks, 4, SeqLen, Logits4);
+    RunWindowedPrefillStream(Session6, Session1, Toks, 6, SeqLen, Logits6);
+    MaxDiff := MaxAbsVolumeDiff(FullOut, Logits1);
+    AssertTrue('width-1 stream vs full forward: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 2e-4', MaxDiff < 2e-4);
+    MaxDiff := MaxAbsVolumeDiff(FullOut, Logits4);
+    AssertTrue('4-token windows vs full forward: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 2e-4', MaxDiff < 2e-4);
+    MaxDiff := MaxAbsVolumeDiff(FullOut, Logits6);
+    AssertTrue('6-token windows + width-1 tail vs full forward: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 2e-4', MaxDiff < 2e-4);
+    MaxDiff := MaxAbsVolumeDiff(Logits1, Logits4);
+    AssertTrue('4-token windows vs width-1 stream: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 2e-4', MaxDiff < 2e-4);
+  finally
+    Logits6.Free;
+    Logits4.Free;
+    Logits1.Free;
+    FullOut.Free;
+    FullIn.Free;
+    Session6.Free;
+    Session4.Free;
+    Session1.Free;
+    Twin6.Free;
+    Twin4.Free;
+    Twin1.Free;
+    Full.Free;
+  end;
+end;
+
+// Intra-window causality at tolerance 0: two 4-token windows that differ
+// only in row 1 give bit-identical row-0 logits (row 1 must move, so the
+// changed token is known to have reached the net). Checked for a window at
+// position 0 and for a window that follows an earlier window, where the
+// attention scores run against a non-empty cache. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35WindowCausality;
+const
+  WindowLen = 4;
+  Toks: array[0..7] of integer = (7, 3, 10, 1, 8, 5, 2, 9);
+var
+  Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  WindowIn, RowA, RowB, RowA1, RowB1: TNNetVolume;
+  Vocab: integer;
+
+  procedure RunWindowAt(FirstWindowPos, ChangedRow1Token: integer;
+    Row0, Row1: TNNetVolume);
+  var
+    Row: integer;
+  begin
+    Session.Reset();
+    if FirstWindowPos > 0 then
+    begin
+      for Row := 0 to WindowLen - 1 do WindowIn.FData[Row] := Toks[Row];
+      Session.StepForward(WindowIn, 0);
+    end;
+    for Row := 0 to WindowLen - 1 do
+      WindowIn.FData[Row] := Toks[FirstWindowPos + Row];
+    if ChangedRow1Token >= 0 then WindowIn.FData[1] := ChangedRow1Token;
+    Session.StepForward(WindowIn, FirstWindowPos);
+    AssertEquals('window logits hold one row per token',
+      WindowLen * Vocab, Session.Output().Size);
+    Row0.ReSize(1, 1, Vocab);
+    Row1.ReSize(1, 1, Vocab);
+    Move(Session.Output().FData[0], Row0.FData[0], Vocab * SizeOf(TNeuralFloat));
+    Move(Session.Output().FData[Vocab], Row1.FData[0],
+      Vocab * SizeOf(TNeuralFloat));
+  end;
+
+  procedure CheckCausalityAt(FirstWindowPos: integer);
+  var
+    ChangedToken: integer;
+  begin
+    ChangedToken := (Toks[FirstWindowPos + 1] + 1) mod Vocab;
+    RunWindowAt(FirstWindowPos, -1, RowA, RowA1);
+    RunWindowAt(FirstWindowPos, ChangedToken, RowB, RowB1);
+    AssertEquals('row 0 ignores row 1 (window at ' +
+      IntToStr(FirstWindowPos) + ')', 0.0, MaxAbsVolumeDiff(RowA, RowB), 0.0);
+    AssertTrue('row 1 sees its own token (window at ' +
+      IntToStr(FirstWindowPos) + ')', MaxAbsVolumeDiff(RowA1, RowB1) > 0);
+  end;
+
+begin
+  RandSeed := 424242;
+  Twin := BuildQwen35FixtureTwin(WindowLen);
+  Session := nil;
+  WindowIn := TNNetVolume.Create(WindowLen, 1, 1);
+  RowA := TNNetVolume.Create();
+  RowB := TNNetVolume.Create();
+  RowA1 := TNNetVolume.Create();
+  RowB1 := TNNetVolume.Create();
+  try
+    Session := TNNetStreamingDecoder.Create(Twin, 2 * WindowLen);
+    Vocab := Session.Output().Depth;
+    AssertEquals('window net input width', WindowLen,
+      Twin.GetFirstLayer().Output.SizeX);
+    CheckCausalityAt(0);
+    CheckCausalityAt(WindowLen);
+  finally
+    RowB1.Free;
+    RowA1.Free;
+    RowB.Free;
+    RowA.Free;
+    WindowIn.Free;
+    Session.Free;
+    Twin.Free;
+  end;
+end;
+
+// A window whose first token sits at a NON-ZERO absolute position: the
+// width-1 session streams the first 8 tokens, its snapshot is restored into
+// the 4-token window net, and the two windows at positions 8 and 12 must
+// match the width-1 stream. RoPE is relative, so a window rotated from
+// position 0 instead of 8 is invisible to a full-vs-windowed comparison that
+// starts at 0; this comparison against cached keys at their true positions
+// catches it. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35WindowAtNonZeroPosition;
+const
+  SeqLen = 16;
+  PrefixLen = 8;
+  WindowLen = 4;
+var
+  Twin1, Twin4: TNNet;
+  Session1, Session4: TNNetStreamingDecoder;
+  Snap: TNNetDecoderSessionSnapshot;
+  Logits1, StepIn, WindowIn, WindowLogits: TNNetVolume;
+  Toks: array[0..SeqLen - 1] of integer;
+  T, Row, Vocab, WindowStart: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  Twin1 := BuildQwen35FixtureTwin(1);
+  Twin4 := nil;
+  Session1 := nil; Session4 := nil; Snap := nil;
+  Logits1 := TNNetVolume.Create();
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  WindowIn := TNNetVolume.Create(WindowLen, 1, 1);
+  WindowLogits := TNNetVolume.Create();
+  try
+    Twin4 := BuildQwen35FixtureTwin(WindowLen);
+    Session1 := TNNetStreamingDecoder.Create(Twin1, SeqLen);
+    Session4 := TNNetStreamingDecoder.Create(Twin4, SeqLen);
+    Vocab := Session1.Output().Depth;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    RunWindowedPrefillStream(Session1, Session1, Toks, 1, SeqLen, Logits1);
+    AssertEquals('window net input width', WindowLen,
+      Twin4.GetFirstLayer().Output.SizeX);
+    // The width-1 prefix again, stopped where the windows take over.
+    Session1.Reset();
+    StepIn.ReSize(1, 1, 1);
+    for T := 0 to PrefixLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      Session1.StepForward(StepIn, T);
+    end;
+    Snap := Session1.Snapshot();
+    Session4.Reset();
+    Session4.RestoreSnapshot(Snap);
+    WindowLogits.ReSize(WindowLen, 1, Vocab);
+    WindowStart := PrefixLen;
+    while WindowStart < SeqLen do
+    begin
+      for Row := 0 to WindowLen - 1 do
+        WindowIn.FData[Row] := Toks[WindowStart + Row];
+      Session4.StepForward(WindowIn, WindowStart);
+      AssertEquals('window logits hold one row per token',
+        WindowLen * Vocab, Session4.Output().Size);
+      WindowLogits.Copy(Session4.Output());
+      MaxDiff := 0;
+      for Row := 0 to WindowLen * Vocab - 1 do
+        MaxDiff := Max(MaxDiff, Abs(WindowLogits.FData[Row] -
+          Logits1.FData[WindowStart * Vocab + Row]));
+      AssertTrue('window at position ' + IntToStr(WindowStart) +
+        ' vs width-1 stream: max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 2e-4', MaxDiff < 2e-4);
+      Inc(WindowStart, WindowLen);
+    end;
+  finally
+    Snap.Free;
+    WindowLogits.Free;
+    WindowIn.Free;
+    StepIn.Free;
+    Logits1.Free;
+    Session4.Free;
+    Session1.Free;
+    Twin4.Free;
+    Twin1.Free;
+  end;
+end;
+
+// Snapshot handoff at tolerance 0: an 8-token prompt prefilled as two
+// 4-token windows on the window net, snapshot, restored into the width-1 net
+// and continued for 8 more tokens must reproduce the all-width-1 stream
+// bit for bit, with the FP32 KV cache and with the int8 KV cache.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35WindowedPrefillSnapshotHandoff;
+const
+  SeqLen = 16;
+  PromptLen = 8;
+  WindowLen = 4;
+var
+  Twin1, Twin4: TNNet;
+  Toks: array[0..SeqLen - 1] of integer;
+  T, Vocab: integer;
+
+  procedure CheckHandoff(Int8KV: boolean);
+  var
+    Session1, Session4: TNNetStreamingDecoder;
+    LogitsRef, LogitsHandoff: TNNetVolume;
+    Mode: string;
+  begin
+    Mode := BoolToStr(Int8KV, 'int8 KV', 'FP32 KV');
+    Session1 := TNNetStreamingDecoder.Create(Twin1, SeqLen, Int8KV);
+    Session4 := nil;
+    LogitsRef := TNNetVolume.Create();
+    LogitsHandoff := TNNetVolume.Create();
+    try
+      Session4 := TNNetStreamingDecoder.Create(Twin4, SeqLen, Int8KV);
+      RunWindowedPrefillStream(Session1, Session1, Toks, 1, SeqLen, LogitsRef);
+      RunWindowedPrefillStream(Session4, Session1, Toks, WindowLen, PromptLen,
+        LogitsHandoff);
+      AssertEquals('windowed prefill + handoff vs all-width-1 (' + Mode + ')',
+        0.0, MaxAbsVolumeDiff(LogitsRef, LogitsHandoff), 0.0);
+    finally
+      LogitsHandoff.Free;
+      LogitsRef.Free;
+      Session4.Free;
+      Session1.Free;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  Twin1 := BuildQwen35FixtureTwin(1);
+  Twin4 := nil;
+  try
+    Twin4 := BuildQwen35FixtureTwin(WindowLen);
+    Vocab := Twin1.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    CheckHandoff(false);
+    CheckHandoff(true);
+  finally
+    Twin4.Free;
+    Twin1.Free;
   end;
 end;
 
