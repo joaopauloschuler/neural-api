@@ -17604,8 +17604,10 @@ type
       destructor Destroy(); override;
       // The classic serial layer loop (layers computed in index order) -
       // ComputeParallel's fallback. Virtual abstract: implemented by
-      // TNNet, where the training semantics live. Coded by Claude (AI).
-      procedure ComputeSerial(FromLayerIdx: integer = 0); virtual; abstract;
+      // TNNet, where the training semantics live. EndLayerIdx (inclusive)
+      // stops the pass early; -1 = the last layer. Coded by Claude (AI).
+      procedure ComputeSerial(FromLayerIdx: integer = 0;
+        EndLayerIdx: integer = -1); virtual; abstract;
       function CountLayers(): integer;
       function GetLastLayerIdx(): integer; {$IFDEF Release} inline; {$ENDIF}
       // Resets every layer's inference-scheduler state (FComputeState) to
@@ -17623,8 +17625,11 @@ type
       // straight-line nets, single-core hosts, FDetectAnomaly (worker
       // exceptions would not carry the anomaly report) and OpenCL-enabled
       // nets (a single device command queue serializes anyway).
+      // EndLayerIdx (inclusive) stops the pass early: layers past it are
+      // neither scheduled nor waited on; -1 = the last layer.
       // Coded by Claude (AI).
-      procedure ComputeParallel(FromLayerIdx: integer = 0);
+      procedure ComputeParallel(FromLayerIdx: integer = 0;
+        EndLayerIdx: integer = -1);
       // One-line diagnostic of how parallel the inference scheduler actually
       // ran since the last ResetSchedulerStats:
       //   width W       - static max independent layers the topology allows
@@ -19481,14 +19486,18 @@ type
       // at FromLayerIdx.
       // Dispatches to ComputeSerial when Parallel is false (default), or to
       // ComputeParallel (layer-graph parallel scheduler) when Parallel
-      // is true. Coded by Claude (AI).
-      procedure Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0; Parallel: boolean = false); overload;
+      // is true. EndLayerIdx (inclusive) stops the forward early (-1 = the
+      // last layer): layers past it do not run and their Output is stale;
+      // under OpenCL nothing is downloaded, the queue is only drained.
+      // Coded by Claude (AI).
+      procedure Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0; Parallel: boolean = false; EndLayerIdx: integer = -1); overload;
       // The classic serial layer loop (layers computed in index order).
       // Always used while FIsTrainable is True - backpropagation requires
       // the strict ordering - and as ComputeParallel's fallback
       // (declared virtual abstract in TNNetExecutionPlanner).
       // Coded by Claude (AI).
-      procedure ComputeSerial(FromLayerIdx: integer = 0); override;
+      procedure ComputeSerial(FromLayerIdx: integer = 0;
+        EndLayerIdx: integer = -1); override;
       // Computes the forward pass with pInput.
       procedure Compute(pInput: array of TNNetVolume; Parallel: boolean = false); overload;
       // Computes the forward pass with pInput.
@@ -130200,7 +130209,7 @@ begin
   end;
 end;
 
-procedure TNNet.Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0; Parallel: boolean = false);
+procedure TNNet.Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0; Parallel: boolean = false; EndLayerIdx: integer = -1);
 var
   StartTime: double;
   {$IFDEF OpenCL}
@@ -130213,15 +130222,29 @@ begin
     if FLayers[FromLayerIdx].FOutput.Size = pInput.Size then
     begin
       FLayers[FromLayerIdx].FOutput.CopyNoChecks(pInput);
+      if (EndLayerIdx < 0) or (EndLayerIdx > GetLastLayerIdx())
+        then EndLayerIdx := GetLastLayerIdx();
+      if EndLayerIdx < FromLayerIdx then
+      begin
+        FErrorProc('Compute - EndLayerIdx ' + IntToStr(EndLayerIdx) +
+          ' is before FromLayerIdx ' + IntToStr(FromLayerIdx) + '.');
+        exit;
+      end;
       // Trainable nets need the strict serial layer order (backpropagation
       // pairs with it); inference-only nets (SetTrainable(False)) may run
       // independent layers in parallel. Coded by Claude (AI).
       if Parallel
-        then ComputeParallel(FromLayerIdx)
-        else ComputeSerial(FromLayerIdx);
+        then ComputeParallel(FromLayerIdx, EndLayerIdx)
+        else ComputeSerial(FromLayerIdx, EndLayerIdx);
       {$IFDEF OpenCL}
       StartOpenCLQueueTime := Now();
-      GetLastLayer().ForceOutputOnRAM();
+      // A full forward settles the logits on the host. A forward cut short
+      // has no host reader, so it only drains the queue: the upload of the
+      // next input must not overtake a non-blocking write still reading the
+      // host buffers of this pass.
+      if EndLayerIdx = GetLastLayerIdx()
+        then GetLastLayer().ForceOutputOnRAM()
+        else if Assigned(FDotProductKernel) then FDotProductKernel.Finish();
       FNNetForwardTimeQueueOpenCL := FNNetForwardTimeQueueOpenCL + (Now() - StartOpenCLQueueTime);
       {$ENDIF}
     end else
@@ -130240,12 +130263,14 @@ begin
   FNNetForwardTime := FNNetForwardTime + (Now() - StartTime);
 end;
 
-procedure TNNet.ComputeSerial(FromLayerIdx: integer = 0);
+procedure TNNet.ComputeSerial(FromLayerIdx: integer = 0;
+  EndLayerIdx: integer = -1);
 var
   LayerCnt: integer;
   LastLayer: integer;
 begin
   LastLayer := GetLastLayerIdx();
+  if (EndLayerIdx >= 0) and (EndLayerIdx < LastLayer) then LastLayer := EndLayerIdx;
   // Serial forward is fully single-threaded: the compute path picks the
   // threading mode so callers only choose serial vs parallel (no separate
   // intra-layer knob). ComputeParallel does the inverse (enables it).
@@ -130561,10 +130586,14 @@ begin
   // dependent's unmet-dependency counter and enqueue those that hit zero.
   // This replaces the old full-range re-sweep (O(L^2) per pass) with
   // O(L + edges) total queue traffic.
+  // A dependent past FSchedLast is outside this pass (Compute with an end
+  // layer): its in-degree was never seeded, so it is neither counted nor
+  // enqueued.
   DependentsHigh := High(FSchedDependents[pLayerIdx]);
   for DepCnt := 0 to DependentsHigh do
   begin
     DependentIdx := FSchedDependents[pLayerIdx][DepCnt];
+    if DependentIdx > FSchedLast then continue;
     if NeuralAtomicDecrement(FSchedInDeg[DependentIdx]) = 0
       then SchedEnqueueReady(DependentIdx);
   end;
@@ -130706,7 +130735,8 @@ begin
   end;
 end;
 
-procedure TNNetExecutionPlanner.ComputeParallel(FromLayerIdx: integer = 0);
+procedure TNNetExecutionPlanner.ComputeParallel(FromLayerIdx: integer = 0;
+  EndLayerIdx: integer = -1);
 var
   LayerCnt, DepCnt: integer;
   LastLayer: integer;
@@ -130716,6 +130746,7 @@ var
   FromLayerIdxM1: integer;
 begin
   LastLayer := GetLastLayerIdx();
+  if (EndLayerIdx >= 0) and (EndLayerIdx < LastLayer) then LastLayer := EndLayerIdx;
   // Parallel forward also drives intra-layer threading (big WillThread layers
   // split across the pool); the compute path picks the threading mode so
   // callers only choose serial vs parallel. ComputeSerial does the inverse.
@@ -130738,7 +130769,7 @@ begin
   then
   begin
     Inc(FSchedSerialPassCnt);
-    ComputeSerial(FromLayerIdx); // the classic serial layer loop
+    ComputeSerial(FromLayerIdx, LastLayer); // the classic serial layer loop
     exit;
   end;
   Inc(FSchedParallelPassCnt);
@@ -130758,7 +130789,7 @@ begin
     FLayers[LayerCnt].FComputeState := 2;
   end;
   FSchedFrom := FromLayerIdx;
-  FSchedLast := LastLayer;
+  FSchedLast := LastLayer; // the pass ends here: RunEpilogue wakes no layer past it
   FSchedRemaining := LastLayer - FromLayerIdx + 1;
   FSchedFailed := 0;
   FSchedErrorMsg := '';

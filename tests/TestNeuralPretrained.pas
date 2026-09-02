@@ -36,9 +36,14 @@ type
     function MaxAbsVolumeDiff(A, B: TNNetVolume): double;
     // Windows of StepTokens through WindowSession over the first
     // PrefillTokenCount tokens, snapshot handoff, then width-1 for the rest.
+    // The first HiddenOnlyTokenCount tokens step with StepForwardToHidden
+    // (their Logits rows stay zero).
     procedure RunWindowedPrefillStream(WindowSession,
       TailSession: TNNetStreamingDecoder; const Tokens: array of integer;
-      StepTokens, PrefillTokenCount: integer; Logits: TNNetVolume);
+      StepTokens, PrefillTokenCount: integer; Logits: TNNetVolume;
+      HiddenOnlyTokenCount: integer = 0);
+    // Largest |A[i] - B[i]| over the rows FromRow.. of two (T,1,V) volumes.
+    function MaxAbsRowDiffFrom(A, B: TNNetVolume; FromRow: integer): double;
     // A temp HF-style directory (model.safetensors, config.json,
     // tokenizer.json) of the tiny_qwen3_5 fixture for TChatEngine.LoadModel.
     function MakeQwen35ChatModelDir(): string;
@@ -283,6 +288,7 @@ type
     procedure TestQwen35WindowCausality;
     procedure TestQwen35WindowAtNonZeroPosition;
     procedure TestQwen35WindowedPrefillSnapshotHandoff;
+    procedure TestQwen35WindowedPrefillToHiddenParity;
     procedure TestQwen35WindowedPrefillOpenCLParity;
     procedure TestQwen35WindowedPrefillOpenCLInt8KVParity;
     procedure TestQwen35StreamedDecodeOpenCLParity;
@@ -9213,15 +9219,33 @@ end;
 // any window width compare row by row. TNNet.Compute only prints on a width
 // mismatch, so both input widths are asserted before anything is fed.
 // Passing the same session twice is the plain width-1 reference stream.
-// Coded by Claude (AI).
+// HiddenOnlyTokenCount > 0 is the production prefill: those leading tokens
+// (every whole window, then the width-1 tail up to that count) step with
+// StepForwardToHidden, so the LM head of either net must not run - its
+// host Output keeps a sentinel until the first full step. Coded by Claude (AI).
 procedure TTestNeuralPretrained.RunWindowedPrefillStream(WindowSession,
   TailSession: TNNetStreamingDecoder; const Tokens: array of integer;
-  StepTokens, PrefillTokenCount: integer; Logits: TNNetVolume);
+  StepTokens, PrefillTokenCount: integer; Logits: TNNetVolume;
+  HiddenOnlyTokenCount: integer = 0);
+const
+  Sentinel = -12345.0;
 var
   WindowIn, TailIn, StepOut: TNNetVolume;
   Snap: TNNetDecoderSessionSnapshot;
   Pos, Row, Vocab, TokenCount, WindowCount, WindowPos: integer;
   MaxRowPos, MaxWindowPos: integer;
+
+  procedure AssertHeadUntouched(Net: TNNet; const What: string);
+  var
+    Head: TNNetVolume;
+  begin
+    Head := Net.GetLastLayer().Output;
+    AssertEquals(What + ': the LM head ran during a hidden-only step (first)',
+      Sentinel, Head.FData[0], 0.0);
+    AssertEquals(What + ': the LM head ran during a hidden-only step (last)',
+      Sentinel, Head.FData[Head.Size - 1], 0.0);
+  end;
+
 begin
   TokenCount := Length(Tokens);
   Vocab := TailSession.Output().Depth;
@@ -9230,6 +9254,9 @@ begin
   AssertEquals('tail net input width', 1,
     TailSession.Net.GetFirstLayer().Output.SizeX);
   AssertTrue('prefill fits the token list', PrefillTokenCount <= TokenCount);
+  AssertTrue('the hidden-only tokens cover every whole window',
+    (HiddenOnlyTokenCount = 0) or
+    (HiddenOnlyTokenCount >= (PrefillTokenCount div StepTokens) * StepTokens));
   Logits.ReSize(TokenCount, 1, Vocab);
   Logits.Fill(0);
   WindowIn := TNNetVolume.Create(StepTokens, 1, 1);
@@ -9237,6 +9264,11 @@ begin
   try
     WindowSession.Reset();
     TailSession.Reset();
+    if HiddenOnlyTokenCount > 0 then
+    begin
+      WindowSession.Net.GetLastLayer().Output.Fill(Sentinel);
+      TailSession.Net.GetLastLayer().Output.Fill(Sentinel);
+    end;
     WindowCount := PrefillTokenCount div StepTokens;
     MaxWindowPos := WindowCount - 1;
     MaxRowPos := StepTokens - 1;
@@ -9244,12 +9276,20 @@ begin
     for WindowPos := 0 to MaxWindowPos do
     begin
       for Row := 0 to MaxRowPos do WindowIn.FData[Row] := Tokens[Pos + Row];
-      WindowSession.StepForward(WindowIn, Pos);
-      StepOut := WindowSession.Output();
-      AssertEquals('window logits hold one row per token at ' + IntToStr(Pos),
-        StepTokens * Vocab, StepOut.Size);
-      Move(StepOut.FData[0], Logits.FData[Pos * Vocab],
-        StepTokens * Vocab * SizeOf(TNeuralFloat));
+      if Pos < HiddenOnlyTokenCount then
+      begin
+        WindowSession.StepForwardToHidden(WindowIn, Pos);
+        AssertHeadUntouched(WindowSession.Net, 'window at ' + IntToStr(Pos));
+      end
+      else
+      begin
+        WindowSession.StepForward(WindowIn, Pos);
+        StepOut := WindowSession.Output();
+        AssertEquals('window logits hold one row per token at ' + IntToStr(Pos),
+          StepTokens * Vocab, StepOut.Size);
+        Move(StepOut.FData[0], Logits.FData[Pos * Vocab],
+          StepTokens * Vocab * SizeOf(TNeuralFloat));
+      end;
       Inc(Pos, StepTokens);
     end;
     if (WindowSession <> TailSession) and (Pos > 0) then
@@ -9264,17 +9304,42 @@ begin
     while Pos < TokenCount do
     begin
       TailIn.FData[0] := Tokens[Pos];
-      TailSession.StepForward(TailIn, Pos);
-      StepOut := TailSession.Output();
-      AssertEquals('width-1 logits hold one row at ' + IntToStr(Pos),
-        Vocab, StepOut.Size);
-      Move(StepOut.FData[0], Logits.FData[Pos * Vocab],
-        Vocab * SizeOf(TNeuralFloat));
+      if Pos < HiddenOnlyTokenCount then
+      begin
+        TailSession.StepForwardToHidden(TailIn, Pos);
+        AssertHeadUntouched(TailSession.Net, 'width-1 at ' + IntToStr(Pos));
+      end
+      else
+      begin
+        TailSession.StepForward(TailIn, Pos);
+        StepOut := TailSession.Output();
+        AssertEquals('width-1 logits hold one row at ' + IntToStr(Pos),
+          Vocab, StepOut.Size);
+        Move(StepOut.FData[0], Logits.FData[Pos * Vocab],
+          Vocab * SizeOf(TNeuralFloat));
+      end;
       Inc(Pos);
     end;
   finally
     TailIn.Free;
     WindowIn.Free;
+  end;
+end;
+
+function TTestNeuralPretrained.MaxAbsRowDiffFrom(A, B: TNNetVolume;
+  FromRow: integer): double;
+var
+  Pos, MaxPos: integer;
+  Diff: double;
+begin
+  Result := 0;
+  AssertEquals('row-diff volumes share a size', A.Size, B.Size);
+  AssertEquals('row-diff volumes share a depth', A.Depth, B.Depth);
+  MaxPos := A.Size - 1;
+  for Pos := FromRow * A.Depth to MaxPos do
+  begin
+    Diff := Abs(A.FData[Pos] - B.FData[Pos]);
+    if Diff > Result then Result := Diff;
   end;
 end;
 
@@ -9573,6 +9638,82 @@ begin
   end;
 end;
 
+// The production prefill shape with the LM head skipped: the first PromptLen
+// tokens step with StepForwardToHidden (whole windows on the width-4 twin,
+// the snapshot handoff, then the width-1 tail), every later token is a full
+// step. The rows after the prefill must be bit-identical to the all-width-1
+// full-step reference, with the FP32 and the int8 KV cache, on the serial
+// loop and on the layer-graph scheduler: no state lives past the LM-head
+// input. The width-1-only variant (no twin) covers today's default path.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35WindowedPrefillToHiddenParity;
+const
+  SeqLen = 16;
+  PromptLen = 10;
+  WindowLen = 4;
+var
+  Twin1, Twin4: TNNet;
+  Toks: array[0..SeqLen - 1] of integer;
+  T, Vocab: integer;
+
+  procedure CheckPrefill(Int8KV, Parallel: boolean);
+  var
+    Session1, Session4: TNNetStreamingDecoder;
+    LogitsRef, LogitsHidden: TNNetVolume;
+    Mode: string;
+  begin
+    Mode := BoolToStr(Int8KV, 'int8 KV', 'FP32 KV') +
+      BoolToStr(Parallel, ', parallel', ', serial');
+    Session1 := TNNetStreamingDecoder.Create(Twin1, SeqLen, Int8KV);
+    Session4 := nil;
+    LogitsRef := TNNetVolume.Create();
+    LogitsHidden := TNNetVolume.Create();
+    try
+      Session4 := TNNetStreamingDecoder.Create(Twin4, SeqLen, Int8KV);
+      Session1.Parallel := Parallel;
+      Session4.Parallel := Parallel;
+      AssertTrue('the LM head is the only layer past the hidden slot',
+        Twin1.GetLastLayerIdx() = Session1.HiddenLayer().LayerIdx + 1);
+      AssertTrue('the hidden slot is the final norm',
+        Session1.HiddenLayer() is TNNetTokenRMSNorm);
+      RunWindowedPrefillStream(Session1, Session1, Toks, 1, SeqLen, LogitsRef);
+      RunWindowedPrefillStream(Session4, Session1, Toks, WindowLen, PromptLen,
+        LogitsHidden, PromptLen);
+      AssertEquals('windows + width-1 tail to the hidden slot, then full' +
+        ' steps (' + Mode + ')', 0.0,
+        MaxAbsRowDiffFrom(LogitsRef, LogitsHidden, PromptLen), 0.0);
+      AssertEquals('the hidden-only rows hold no logits (' + Mode + ')', 0.0,
+        LogitsHidden.FData[(PromptLen - 1) * Vocab], 0.0);
+      RunWindowedPrefillStream(Session1, Session1, Toks, 1, PromptLen,
+        LogitsHidden, PromptLen);
+      AssertEquals('width-1 prefill to the hidden slot, then full steps (' +
+        Mode + ')', 0.0,
+        MaxAbsRowDiffFrom(LogitsRef, LogitsHidden, PromptLen), 0.0);
+    finally
+      LogitsHidden.Free;
+      LogitsRef.Free;
+      Session4.Free;
+      Session1.Free;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  Twin1 := BuildQwen35FixtureTwin(1);
+  Twin4 := nil;
+  try
+    Twin4 := BuildQwen35FixtureTwin(WindowLen);
+    Vocab := Twin1.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    CheckPrefill({Int8KV=}false, {Parallel=}false);
+    CheckPrefill({Int8KV=}true, {Parallel=}false);
+    CheckPrefill({Int8KV=}false, {Parallel=}true);
+  finally
+    Twin4.Free;
+    Twin1.Free;
+  end;
+end;
+
 // The device path of the batched prefill, FP32 KV cache.
 procedure TTestNeuralPretrained.TestQwen35WindowedPrefillOpenCLParity;
 begin
@@ -9637,14 +9778,14 @@ const
 var
   TwinCPU1, TwinCPUW, TwinCL1, TwinCLW: TNNet;
   SessionCPU1, SessionCPUW, SessionCL1, SessionCLW: TNNetStreamingDecoder;
-  LogitsCPU1, LogitsCPUW, LogitsCL, RowZero, Win: TNNetVolume;
+  LogitsCPU1, LogitsCPUW, LogitsCL, LogitsCLHidden, RowZero, Win: TNNetVolume;
   Toks: array[0..SeqLen - 1] of integer;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
   T, Vocab, MaxRowPos: integer;
   Mode, WideConfigPath: string;
   WideConfig: TStringList;
-  DiffHost, DiffWidth1: double;
+  DiffHost, DiffWidth1, DiffHidden: double;
 
   function BuildWideTwin(pSeqLen: integer): TNNet;
   var
@@ -9728,6 +9869,7 @@ begin
   LogitsCPU1 := TNNetVolume.Create();
   LogitsCPUW := TNNetVolume.Create();
   LogitsCL := TNNetVolume.Create();
+  LogitsCLHidden := TNNetVolume.Create();
   RowZero := TNNetVolume.Create();
   Win := TNNetVolume.Create(WindowLen, 1, 1);
   try
@@ -9752,6 +9894,12 @@ begin
       PromptLen, LogitsCL);
     DiffHost := MaxAbsVolumeDiff(LogitsCPUW, LogitsCL);
     DiffWidth1 := MaxAbsVolumeDiff(LogitsCPU1, LogitsCL);
+    // The production prefill: every prompt token stops at the LM-head input
+    // (both twins skip their LM head), then the full decode steps must still
+    // match the host and the fused attention must still be on the device.
+    RunWindowedPrefillStream(SessionCLW, SessionCL1, Toks, WindowLen,
+      PromptLen, LogitsCLHidden, PromptLen);
+    DiffHidden := MaxAbsRowDiffFrom(LogitsCPU1, LogitsCLHidden, PromptLen);
 
     AssertAllOnDevice(TwinCLW, TNNetFusedSDPA, Mode + ' window twin');
     AssertAllOnDevice(TwinCLW, TNNetCellMulByCell, Mode + ' window twin');
@@ -9761,12 +9909,16 @@ begin
       FloatToStr(DiffHost) + ' must be < 1e-3', DiffHost < 1e-3);
     AssertTrue(Mode + ' windowed device vs width-1 host: max |diff| = ' +
       FloatToStr(DiffWidth1) + ' must be < 1e-3', DiffWidth1 < 1e-3);
+    AssertTrue(Mode + ' prefill to the hidden slot on the device, decode vs' +
+      ' width-1 host: max |diff| = ' + FloatToStr(DiffHidden) +
+      ' must be < 1e-3', DiffHidden < 1e-3);
 
     CheckRowZeroCausality(0);
     CheckRowZeroCausality(WindowLen);
   finally
     Win.Free;
     RowZero.Free;
+    LogitsCLHidden.Free;
     LogitsCL.Free;
     LogitsCPUW.Free;
     LogitsCPU1.Free;

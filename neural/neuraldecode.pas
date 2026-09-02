@@ -1277,6 +1277,8 @@ type
     FRopes: array of TNNetRotaryEmbedding;
     FLearnedPos: array of TNNetLearnedPositionalEmbedding; // GPT-2-style wpe
     FHiddenLayer: TNNetLayer;        // lazily resolved last-hidden-state layer
+    // Writes AbsPos to every rope / learned-position layer before a forward.
+    procedure SetWindowPosition(AbsPos: integer);
     function GetSDPACount(): integer;
     function GetSSMCount(): integer;
     function GetRopeCount(): integer;
@@ -1308,6 +1310,12 @@ type
     // layer's PositionOffset before pNet.Compute (see the exactness contract
     // above).
     procedure StepForward(InV: TNNetVolume; AbsPos: integer);
+    // StepForward that stops at the LM-head input layer (the one HiddenState
+    // reads): no logits, Output() is stale. For prefill steps nobody reads.
+    procedure StepForwardToHidden(InV: TNNetVolume; AbsPos: integer);
+    // The LM-head input layer (ContrastiveHiddenLayer), resolved once: the
+    // layer HiddenState reads and StepForwardToHidden stops at.
+    function HiddenLayer(): TNNetLayer;
     // Speculative-decode rollback: TruncateCache(CommittedLen) on every
     // attention layer, discarding the K/V of rejected/pad tokens. No-op when
     // the net has no attention layers.
@@ -6031,7 +6039,7 @@ begin
   for i := 0 to HiSSM do StateReset(FSSMs[i]);
 end;
 
-procedure TNNetStreamingDecoder.StepForward(InV: TNNetVolume; AbsPos: integer);
+procedure TNNetStreamingDecoder.SetWindowPosition(AbsPos: integer);
 var
   i, HiRope, HiLearned: integer;
 begin
@@ -6046,7 +6054,22 @@ begin
   // step at absolute position p reads wpe[p] (and a width-K verify window
   // reads wpe[p..p+K-1]).
   for i := 0 to HiLearned do FLearnedPos[i].PositionOffset := AbsPos;
+end;
+
+procedure TNNetStreamingDecoder.StepForward(InV: TNNetVolume; AbsPos: integer);
+begin
+  SetWindowPosition(AbsPos);
   FNet.Compute(InV, {FromLayerIdx=}0, FParallel);
+end;
+
+procedure TNNetStreamingDecoder.StepForwardToHidden(InV: TNNetVolume;
+  AbsPos: integer);
+begin
+  SetWindowPosition(AbsPos);
+  // Every stateful layer (KV cache, recurrent state, conv history) sits
+  // before the LM-head input, so the skipped layers hold no state.
+  FNet.Compute(InV, {FromLayerIdx=}0, FParallel,
+    {EndLayerIdx=}HiddenLayer().LayerIdx);
 end;
 
 procedure TNNetStreamingDecoder.TruncateTo(CommittedLen: integer);
@@ -6185,13 +6208,17 @@ begin
   Result := FNet.GetLastLayer().Output;
 end;
 
+function TNNetStreamingDecoder.HiddenLayer(): TNNetLayer;
+begin
+  // The same heuristic as the cache-less path (ContrastiveHiddenLayer).
+  if FHiddenLayer = nil then FHiddenLayer := ContrastiveHiddenLayer(FNet);
+  Result := FHiddenLayer;
+end;
+
 function TNNetStreamingDecoder.HiddenState(): TNNetVolume;
 begin
-  // Resolve the LM-head input layer once (same heuristic as the cache-less
-  // path) and return its output - the hidden state of the token in the window
-  // just stepped.
-  if FHiddenLayer = nil then FHiddenLayer := ContrastiveHiddenLayer(FNet);
-  Result := FHiddenLayer.Output;
+  // The hidden state of the token in the window just stepped.
+  Result := HiddenLayer().Output;
 end;
 
 function TNNetStreamingDecoder.GetSDPACount(): integer;

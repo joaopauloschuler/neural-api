@@ -1676,7 +1676,9 @@ begin
     // Len-1. Tokens Reused..LenM2 are fed: whole windows of WindowLen
     // through WindowSession first (never padded), then the tail one token
     // at a time through Session. The reused state goes straight into
-    // whichever session steps first.
+    // whichever session steps first. No prefill logits are read, so every
+    // prefill forward stops at the LM-head input (StepForwardToHidden):
+    // the vocab projection runs only in the decode steps.
     if CacheReuse then
     begin
       Reused := CommonPrefixLen(CachedTokens, PromptIds);
@@ -1732,7 +1734,7 @@ begin
         if Cnt + WindowLen > SeqLen then break;
         for WindowRow := 0 to MaxRowPos do
           WindowIn.FData[WindowRow] := Tokens[Cnt + WindowRow];
-        WindowSession.StepForward(WindowIn, Cnt);
+        WindowSession.StepForwardToHidden(WindowIn, Cnt);
         Inc(Cnt, WindowLen);
         Inc(LastPrefillWindows);
       end;
@@ -1741,7 +1743,7 @@ begin
     while Cnt <= LenM2 do
     begin
       InV.FData[0] := Tokens[Cnt];
-      Session.StepForward(InV, Cnt);
+      Session.StepForwardToHidden(InV, Cnt);
       Inc(Cnt);
     end;
     // --profile: discard the one-shot prefill timings (and scheduler stats)
