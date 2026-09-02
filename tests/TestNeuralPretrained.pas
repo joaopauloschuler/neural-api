@@ -54,6 +54,11 @@ type
     // CPU-vs-OpenCL streamed decode: two inference twins of the same
     // checkpoint at SeqLen=1, one armed for OpenCL, stepped side by side.
     procedure RunStreamedDecodeOpenCLParity(const Stem: string);
+    // Every layer of AClass in Net ran at least one forward on the device.
+    procedure AssertAllOnDevice(Net: TNNet; AClass: TClass;
+      const What: string);
+    // Windowed prefill on OpenCL twins against the host, FP32 or int8 KV.
+    procedure RunWindowedPrefillOpenCLParity(Int8KV: boolean);
     {$ENDIF}
     procedure RunConvNeXtParity(const Base: string);
     procedure RunResNetParity(const Base: string);
@@ -278,11 +283,14 @@ type
     procedure TestQwen35WindowCausality;
     procedure TestQwen35WindowAtNonZeroPosition;
     procedure TestQwen35WindowedPrefillSnapshotHandoff;
+    procedure TestQwen35WindowedPrefillOpenCLParity;
+    procedure TestQwen35WindowedPrefillOpenCLInt8KVParity;
     procedure TestQwen35StreamedDecodeOpenCLParity;
     procedure TestQwen2StreamedDecodeOpenCLParity;
     procedure TestQwen35TurnBoundaryResumeParity;
     procedure TestQwen35ChatPrefillWindowParity;
     procedure TestQwen35ChatPrefillWindowInt8KVParity;
+    procedure TestQwen35ChatPrefillWindowOpenCLParity;
     procedure TestQwen35MoeLogitParity;
     procedure TestGptOssLogitParity;
     procedure TestGptOssMXFP4LogitParity;
@@ -9565,7 +9573,215 @@ begin
   end;
 end;
 
+// The device path of the batched prefill, FP32 KV cache.
+procedure TTestNeuralPretrained.TestQwen35WindowedPrefillOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  RunWindowedPrefillOpenCLParity({Int8KV=}false);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+// The same with the int8 KV cache, the ChatTerminal default under int8 and
+// int4 weights: cai_sdpa_append_kv_int8 quantizes every window row.
+procedure TTestNeuralPretrained.TestQwen35WindowedPrefillOpenCLInt8KVParity;
+begin
+  {$IFDEF OpenCL}
+  RunWindowedPrefillOpenCLParity({Int8KV=}true);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
 {$IFDEF OpenCL}
+procedure TTestNeuralPretrained.AssertAllOnDevice(Net: TNNet; AClass: TClass;
+  const What: string);
+var
+  LayerPos, MaxLayerPos, Total, OnDevice: integer;
+begin
+  Total := 0;
+  OnDevice := 0;
+  MaxLayerPos := Net.CountLayers() - 1;
+  for LayerPos := 0 to MaxLayerPos do
+    if Net.Layers[LayerPos].ClassType = AClass then
+    begin
+      Inc(Total);
+      if Net.Layers[LayerPos].ForwardGPUCnt > 0 then Inc(OnDevice);
+    end;
+  AssertTrue(What + ' has ' + AClass.ClassName + ' layers', Total > 0);
+  AssertEquals(What + ': ' + AClass.ClassName + ' layers that reached the device',
+    Total, OnDevice);
+end;
+
+// The batched prefill on the device: a 46-token prompt as two 20-row windows
+// on an OpenCL twin plus a 6-token tail, the snapshot handed to an OpenCL
+// width-1 twin, then 6 more tokens one at a time. 20 rows exceed the 16-row
+// score band, so cai_sdpa_decode walks two rows per band on the first four
+// band rows, and 20 does not divide 46, so the tail path runs. The fixture
+// config says max_position_embeddings 16, which the importer only uses to
+// bound the input width (default RoPE has no table), so the twins are built
+// from a temporary copy that says 64. The device run
+// must match the host's width-1 stream and the host's identical windowed run
+// within 1e-3, and every TNNetFusedSDPA and TNNetCellMulByCell of both OpenCL
+// twins must have run on the device - without that an unarmed path compares
+// the host with itself. The last block reads the intra-window causal bound
+// straight off the device: two windows that differ only in row 1 give
+// bit-identical row-0 logits, at position 0 and after a previous window.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunWindowedPrefillOpenCLParity(Int8KV: boolean);
+const
+  SeqLen = 52;
+  PromptLen = 46;
+  WindowLen = 20;
+var
+  TwinCPU1, TwinCPUW, TwinCL1, TwinCLW: TNNet;
+  SessionCPU1, SessionCPUW, SessionCL1, SessionCLW: TNNetStreamingDecoder;
+  LogitsCPU1, LogitsCPUW, LogitsCL, RowZero, Win: TNNetVolume;
+  Toks: array[0..SeqLen - 1] of integer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, Vocab, MaxRowPos: integer;
+  Mode, WideConfigPath: string;
+  WideConfig: TStringList;
+  DiffHost, DiffWidth1: double;
+
+  function BuildWideTwin(pSeqLen: integer): TNNet;
+  var
+    Config: TLlamaConfig;
+  begin
+    Result := BuildQwen35FromSafeTensorsEx(
+      FixturePath('tiny_qwen3_5.safetensors'), Config, pSeqLen,
+      {pTrainable=}false, WideConfigPath);
+  end;
+
+  // Feeds the window starting at FirstPos on the OpenCL twin (after the window
+  // at 0 when FirstPos > 0), once as is and once with row 1 changed; row 0's
+  // logits must not move and row 1's must.
+  procedure CheckRowZeroCausality(FirstPos: integer);
+  var
+    Row, OtherTok: integer;
+    RowOneDiff: double;
+  begin
+    OtherTok := (Toks[FirstPos + 1] + 7) mod Vocab;
+    AssertTrue('the second window token really changes',
+      OtherTok <> Toks[FirstPos + 1]);
+    SessionCLW.Reset();
+    if FirstPos > 0 then
+    begin
+      for Row := 0 to MaxRowPos do Win.FData[Row] := Toks[Row];
+      SessionCLW.StepForward(Win, 0);
+    end;
+    for Row := 0 to MaxRowPos do Win.FData[Row] := Toks[FirstPos + Row];
+    SessionCLW.StepForward(Win, FirstPos);
+    RowZero.Copy(SessionCLW.Output());
+    SessionCLW.Reset();
+    if FirstPos > 0 then
+    begin
+      for Row := 0 to MaxRowPos do Win.FData[Row] := Toks[Row];
+      SessionCLW.StepForward(Win, 0);
+    end;
+    for Row := 0 to MaxRowPos do Win.FData[Row] := Toks[FirstPos + Row];
+    Win.FData[1] := OtherTok;
+    SessionCLW.StepForward(Win, FirstPos);
+    // Same kernels in the same order for row 0's work-groups, so any
+    // difference is row 1 leaking backwards - exact, not a tolerance.
+    for Row := 0 to Vocab - 1 do
+      AssertEquals(Mode + ' at ' + IntToStr(FirstPos) + ': row 0 logit ' +
+        IntToStr(Row) + ' must not depend on the row 1 token',
+        RowZero.FData[Row], SessionCLW.Output().FData[Row], 0.0);
+    RowOneDiff := 0;
+    for Row := 0 to Vocab - 1 do
+      RowOneDiff := Max(RowOneDiff, Abs(RowZero.FData[Vocab + Row] -
+        SessionCLW.Output().FData[Vocab + Row]));
+    AssertTrue(Mode + ' at ' + IntToStr(FirstPos) +
+      ': row 1 logits move with the row 1 token', RowOneDiff > 0);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  AssertTrue('the window is wider than the score band',
+    WindowLen > csFusedSDPABandRows);
+  AssertTrue('the window does not divide the prompt',
+    PromptLen mod WindowLen <> 0);
+  Mode := BoolToStr(Int8KV, 'int8 KV', 'FP32 KV');
+  RandSeed := 424242;
+  WideConfigPath := IncludeTrailingPathDelimiter(GetTempDir(false)) +
+    'cai_qwen35_wide_' + IntToStr(Random(1000000)) + '_config.json';
+  WideConfig := TStringList.Create();
+  try
+    WideConfig.LoadFromFile(FixturePath('tiny_qwen3_5_config.json'));
+    WideConfig.Text := StringReplace(WideConfig.Text,
+      '"max_position_embeddings": 16', '"max_position_embeddings": 64', []);
+    AssertTrue('the wide config carries the larger context',
+      Pos('"max_position_embeddings": 64', WideConfig.Text) > 0);
+    WideConfig.SaveToFile(WideConfigPath);
+  finally
+    WideConfig.Free;
+  end;
+  TwinCPU1 := nil; TwinCPUW := nil; TwinCL1 := nil; TwinCLW := nil;
+  SessionCPU1 := nil; SessionCPUW := nil; SessionCL1 := nil; SessionCLW := nil;
+  LogitsCPU1 := TNNetVolume.Create();
+  LogitsCPUW := TNNetVolume.Create();
+  LogitsCL := TNNetVolume.Create();
+  RowZero := TNNetVolume.Create();
+  Win := TNNetVolume.Create(WindowLen, 1, 1);
+  try
+    TwinCPU1 := BuildWideTwin(1);
+    TwinCPUW := BuildWideTwin(WindowLen);
+    TwinCL1 := BuildWideTwin(1);
+    TwinCLW := BuildWideTwin(WindowLen);
+    TwinCL1.EnableOpenCL(PlatformId, DeviceId);
+    TwinCLW.EnableOpenCL(PlatformId, DeviceId);
+    Vocab := TwinCPU1.GetLastLayer().Output.Depth;
+    MaxRowPos := WindowLen - 1;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    SessionCPU1 := TNNetStreamingDecoder.Create(TwinCPU1, SeqLen, Int8KV);
+    SessionCPUW := TNNetStreamingDecoder.Create(TwinCPUW, SeqLen, Int8KV);
+    SessionCL1 := TNNetStreamingDecoder.Create(TwinCL1, SeqLen, Int8KV);
+    SessionCLW := TNNetStreamingDecoder.Create(TwinCLW, SeqLen, Int8KV);
+    RunWindowedPrefillStream(SessionCPU1, SessionCPU1, Toks, 1, SeqLen,
+      LogitsCPU1);
+    RunWindowedPrefillStream(SessionCPUW, SessionCPU1, Toks, WindowLen,
+      PromptLen, LogitsCPUW);
+    RunWindowedPrefillStream(SessionCLW, SessionCL1, Toks, WindowLen,
+      PromptLen, LogitsCL);
+    DiffHost := MaxAbsVolumeDiff(LogitsCPUW, LogitsCL);
+    DiffWidth1 := MaxAbsVolumeDiff(LogitsCPU1, LogitsCL);
+
+    AssertAllOnDevice(TwinCLW, TNNetFusedSDPA, Mode + ' window twin');
+    AssertAllOnDevice(TwinCLW, TNNetCellMulByCell, Mode + ' window twin');
+    AssertAllOnDevice(TwinCL1, TNNetFusedSDPA, Mode + ' width-1 twin');
+    AssertAllOnDevice(TwinCL1, TNNetCellMulByCell, Mode + ' width-1 twin');
+    AssertTrue(Mode + ' windowed device vs windowed host: max |diff| = ' +
+      FloatToStr(DiffHost) + ' must be < 1e-3', DiffHost < 1e-3);
+    AssertTrue(Mode + ' windowed device vs width-1 host: max |diff| = ' +
+      FloatToStr(DiffWidth1) + ' must be < 1e-3', DiffWidth1 < 1e-3);
+
+    CheckRowZeroCausality(0);
+    CheckRowZeroCausality(WindowLen);
+  finally
+    Win.Free;
+    RowZero.Free;
+    LogitsCL.Free;
+    LogitsCPUW.Free;
+    LogitsCPU1.Free;
+    SessionCLW.Free;
+    SessionCL1.Free;
+    SessionCPUW.Free;
+    SessionCPU1.Free;
+    TwinCLW.Free;
+    TwinCL1.Free;
+    TwinCPUW.Free;
+    TwinCPU1.Free;
+    DeleteFile(WideConfigPath);
+  end;
+end;
+
 function TTestNeuralPretrained.AcquireFirstOpenCLDevice(
   out APlatform: cl_platform_id; out ADevice: cl_device_id): boolean;
 var
@@ -9874,6 +10090,16 @@ var
         AssertEquals('turn 2 windows (window ' + IntToStr(WindowLen) + ')',
           FedCount div WindowLen, Engine.LastPrefillWindows);
       AssertTrue('turn 2 produced tokens', Turns[1].Completion > 0);
+      {$IFDEF OpenCL}
+      // Under --gpu the fused attention of both nets must have stayed on the
+      // device; otherwise the run compares the host path with itself.
+      if Opt.Gpu then
+      begin
+        AssertAllOnDevice(Engine.NN, TNNetFusedSDPA, 'width-1 net');
+        if Assigned(Engine.WindowNN) then
+          AssertAllOnDevice(Engine.WindowNN, TNNetFusedSDPA, 'window net');
+      end;
+      {$ENDIF}
     finally
       Args.Free;
       Engine.Free;
@@ -9940,6 +10166,19 @@ begin
   // int8 KV cache on the serial forward: the window session's int8 codes
   // cross to the width-1 session verbatim.
   RunQwen35ChatPrefillWindowParity(['--kv-int8', '--serial']);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatPrefillWindowOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  // ParseArgs takes the last of --cpu/--gpu, so --gpu here overrides the
+  // harness's --cpu: both nets are armed for OpenCL, the KV cache is int8
+  // (the ChatTerminal default under int8 and int4 weights) and the forward is
+  // serial. The harness asserts every TNNetFusedSDPA reached the device.
+  RunQwen35ChatPrefillWindowParity(['--kv-int8', '--serial', '--gpu']);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
 end;
 
 // Verifies the Qwen3.5/3.6-MoE hybrid import (HF model_type "qwen3_5_moe",

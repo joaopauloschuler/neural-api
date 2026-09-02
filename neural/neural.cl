@@ -2644,40 +2644,48 @@ __kernel void cai_gated_delta_net
 }
 
 // KV-CACHE APPEND FOR THE FUSED MULTI-HEAD ATTENTION DECODE (TNNetFusedSDPA).
-// Writes the current token's K and V rows, one per KV head, into cache slot
-// FCacheSlot. ONE WORK-GROUP PER KV HEAD; the lanes split the head dimension.
+// Writes the step's K and V rows - FTokenCnt token rows, one row per KV head
+// each - into the cache slots FCacheSlot .. FCacheSlot+FTokenCnt-1. ONE
+// WORK-GROUP PER (KV HEAD, TOKEN ROW): dimension 1 of the launch carries
+// g*FTokenCnt + t, so the work-groups of one KV head are adjacent and write
+// one cache plane; the lanes split the head dimension.
 //
 // The cache is HEAD-MAJOR: head g's rows are the contiguous block starting at
 // g*FCacheMax*FDk, so slot (g*FCacheMax + position) addresses one row and the
 // decode kernel below reads each head's key stream contiguously. This is the
 // layout TNNetFusedSDPA.AppendRow already writes on the host side.
 //
-// The token row is [ Q (FQW) | K (FKW) | V (FKW) ], so head g's key slice
-// starts at FQW + g*FDk and its value slice at FQW + FKW + g*FDk.
+// Token row t starts at t*FXStride in FX and is [ Q (FQW) | K (FKW) | V (FKW) ],
+// so head g's key slice starts at t*FXStride + FQW + g*FDk and its value slice
+// FKW further on.
 // This kernel and cai_sdpa_decode share one command queue and are enqueued in
-// that order, so the in-order queue is what makes the appended row visible -
+// that order, so the in-order queue is what makes the appended rows visible -
 // there is no cross-work-group synchronization and none is needed.
 // Coded by Claude (AI).
 __kernel void cai_sdpa_append_kv
 (
   const int FKVHeads,
+  const int FTokenCnt,
   const int FDk,
   const int FCacheMax,
   const int FCacheSlot,
   const int FQW,
   const int FKW,
+  const int FXStride,
   __global const float* FX,
   __global float* FKCache,
   __global float* FVCache
 )
 {
-  const int g = get_group_id(1);
+  const int gid = get_group_id(1);
   const int lid = get_local_id(0);
   const int lsize = get_local_size(0);
+  const int g = gid / FTokenCnt;
+  const int t = gid - g * FTokenCnt;
   if (g >= FKVHeads) return;
-  const int dst = (g * FCacheMax + FCacheSlot) * FDk;
-  const int kSrc = FQW + g * FDk;
-  const int vSrc = FQW + FKW + g * FDk;
+  const int dst = (g * FCacheMax + FCacheSlot + t) * FDk;
+  const int kSrc = t * FXStride + FQW + g * FDk;
+  const int vSrc = kSrc + FKW;
   for (int d = lid; d < FDk; d += lsize)
   {
     FKCache[dst + d] = FX[kSrc + d];
@@ -2685,39 +2693,55 @@ __kernel void cai_sdpa_append_kv
   }
 }
 
-// CACHED-DECODE SCALED DOT-PRODUCT ATTENTION (TNNetFusedSDPA), one token over
-// the resident KV cache. ONE WORK-GROUP PER QUERY HEAD: the head's score band
-// is private to its work-group, so every synchronization this kernel needs is
-// an intra-work-group barrier and no cross-work-group ordering is ever
-// required. Launch 2-D with global (LocalSize, FQHeads) and local (LocalSize,
-// 1); LocalSize must be a power of two (the tree reductions halve it).
-// FScratch is LocalSize + FDk floats of __local memory.
+// CACHED-DECODE SCALED DOT-PRODUCT ATTENTION (TNNetFusedSDPA) over the
+// resident KV cache, for the FTokenCnt token rows cai_sdpa_append_kv just
+// wrote at slots FCacheSlot .. FCacheSlot+FTokenCnt-1. ONE WORK-GROUP PER
+// (QUERY HEAD, BAND ROW): dimension 1 of the launch carries h*FBandRows + r,
+// and work-group (h, r) scores window rows t = r, r+FBandRows, r+2*FBandRows,
+// ... < FTokenCnt one after another over its own private score band. Every
+// synchronization this kernel needs is therefore an intra-work-group barrier
+// and no cross-work-group ordering is ever required. Launch 2-D with global
+// (LocalSize, FQHeads*FBandRows) and local (LocalSize, 1); LocalSize must be
+// a power of two (the tree reductions halve it). FScratch is LocalSize + FDk
+// floats of __local memory.
+//
+// INTRA-STEP CAUSAL MASK. Every row of the step is in the cache before this
+// runs, so token row t must stop at its OWN slot: it attends
+// [jStart .. FCacheSlot+t] and never sees the rows the later window rows
+// appended. LiveLen = FCacheSlot + t + 1 is that bound, and it is what makes a
+// width-K window agree with K single-token steps.
 //
 // Query head h reads KV head h/FGroupSize (grouped-query attention) and runs
-// three phases over the live cache [jStart..FCacheLen-1]:
+// three phases over the live cache [jStart..LiveLen-1]:
 //   1. lanes split the key axis: score j = dot(q, K[j]) * FInvSqrtDk, the
 //      Gemma-2 soft-cap when FScoreSoftCap > 0, then a tree max;
 //   2. the same partition exponentiates in place and tree-sums the normalizer;
 //   3. lanes split the head dimension: out[d] = sum_j P[j] * V[j][d], each lane
 //      accumulating over the whole key range and dividing once at the end.
-// The score band lives in global memory (FScores, FQHeads*FCacheMax floats)
-// rather than __local because a long context does not fit in a work-group's
-// local memory; it is written and read only by the one work-group that owns
-// it, so the barrier between phases 2 and 3 carries a global memory fence.
+// The score band lives in global memory (FScores, FQHeads*FBandRows*FCacheMax
+// floats) rather than __local because a long context does not fit in a
+// work-group's local memory; band (h, r) is written and read only by the one
+// work-group that owns it, so the barrier between phases 2 and 3 carries a
+// global memory fence, and the barrier that closes a row keeps the next row's
+// scores from landing before this row's value sum has read them. FBandRows
+// bounds the band, so a K-row window costs FBandRows rows of band, not K.
 //
-// FWindow > 0 is the sliding-window mask: jStart = FCacheLen - FWindow. The
-// causal mask needs no code at all - the cache holds only committed tokens, so
-// every live row is attendable. Forward-only, and the caller restricts it to a
-// single-token step: prefill, eviction, segment masking and the int8 cache all
-// stay on the host path. Coded by Claude (AI).
+// FWindow > 0 is the sliding-window mask, applied per token row: jStart =
+// LiveLen - FWindow. Forward-only, and the caller restricts the step to
+// committed tokens that fit the cache: eviction, segment masking, prefix-LM
+// and the bidirectional window stay on the host path. Coded by Claude (AI).
 __kernel void cai_sdpa_decode
 (
   const int FQHeads,
+  const int FTokenCnt,
+  const int FBandRows,
   const int FGroupSize,
   const int FDk,
   const int FCacheMax,
-  const int FCacheLen,
+  const int FCacheSlot,
   const int FWindow,
+  const int FXStride,
+  const int FYStride,
   const float FInvSqrtDk,
   const float FScoreSoftCap,
   const float FInvScoreSoftCap,
@@ -2729,27 +2753,34 @@ __kernel void cai_sdpa_decode
   __local float* FScratch
 )
 {
-  const int h = get_group_id(1);
+  const int gid = get_group_id(1);
   const int lid = get_local_id(0);
   const int lsize = get_local_size(0);
-  int s, d, j;
+  int s, d, j, t;
+  const int h = gid / FBandRows;
+  const int r = gid - h * FBandRows;
   if (h >= FQHeads) return;
 
   __local float* qloc = FScratch + lsize;
 
   const int g = h / FGroupSize;
-  const int qBase = h * FDk;
   const int plane = g * FCacheMax * FDk;
-  const int scoreBase = h * FCacheMax;
-  const int jStart = ((FWindow > 0) && (FCacheLen > FWindow))
-                     ? (FCacheLen - FWindow) : 0;
+  const int scoreBase = gid * FCacheMax;
+
+  for (t = r; t < FTokenCnt; t += FBandRows)
+  {
+  const int qBase = t * FXStride + h * FDk;
+  const int yBase = t * FYStride + h * FDk;
+  const int LiveLen = FCacheSlot + t + 1;
+  const int jStart = ((FWindow > 0) && (LiveLen > FWindow))
+                     ? (LiveLen - FWindow) : 0;
 
   for (d = lid; d < FDk; d += lsize) qloc[d] = FX[qBase + d];
   barrier(CLK_LOCAL_MEM_FENCE);
 
   // ---- phase 1: scores over the live cache, then the row max ----
   float m = -1e30f;
-  for (j = jStart + lid; j < FCacheLen; j += lsize)
+  for (j = jStart + lid; j < LiveLen; j += lsize)
   {
     __global const float* krow = FKCache + plane + j * FDk;
     float acc = 0.0f;
@@ -2773,7 +2804,7 @@ __kernel void cai_sdpa_decode
   // ---- phase 2: shifted exp in place (same lane owns the same j), then the
   // normalizer ----
   float partial = 0.0f;
-  for (j = jStart + lid; j < FCacheLen; j += lsize)
+  for (j = jStart + lid; j < LiveLen; j += lsize)
   {
     const float e = exp(FScores[scoreBase + j] - MaxScore);
     FScores[scoreBase + j] = e;
@@ -2799,18 +2830,24 @@ __kernel void cai_sdpa_decode
   for (d = lid; d < FDk; d += lsize)
   {
     float acc = 0.0f;
-    for (j = jStart; j < FCacheLen; j++)
+    for (j = jStart; j < LiveLen; j++)
       acc = mad(FScores[scoreBase + j], FVCache[plane + j * FDk + d], acc);
-    FY[qBase + d] = acc * InvSumExp;
+    FY[yBase + d] = acc * InvSumExp;
+  }
+  // The next row overwrites qloc and this band: its writes wait for every
+  // lane's value sum, and the score band is global memory.
+  barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
   }
 }
 
-// INT8 KV-CACHE APPEND (TNNetFusedSDPA, int8 cache). Quantizes the token's K
-// and V slices into the resident int8 cache at slot FCacheSlot, one work-group
-// per KV head, lanes splitting FDk. The format is the host's, unchanged: one
-// symmetric FP32 scale per row, scale = maxabs/127, codes in [-127,127], laid
-// out exactly as TNNetScaledDotProductAttention.QuantizeCacheRow writes them,
-// so the cache stays byte-comparable with FKCacheQ/FVCacheQ.
+// INT8 KV-CACHE APPEND (TNNetFusedSDPA, int8 cache). Quantizes the step's K
+// and V slices into the resident int8 cache at slots FCacheSlot ..
+// FCacheSlot+FTokenCnt-1, one work-group per (KV head, token row) exactly as
+// cai_sdpa_append_kv above, lanes splitting FDk. The format is the host's,
+// unchanged: one symmetric FP32 scale per row, scale = maxabs/127, codes in
+// [-127,127], laid out exactly as
+// TNNetScaledDotProductAttention.QuantizeCacheRow writes them, so the cache
+// stays byte-comparable with FKCacheQ/FVCacheQ.
 //
 // Three deliberate choices:
 //   - rint, not round: OpenCL's round is half-away-from-zero while FPC's Round
@@ -2826,11 +2863,13 @@ __kernel void cai_sdpa_decode
 __kernel void cai_sdpa_append_kv_int8
 (
   const int FKVHeads,
+  const int FTokenCnt,
   const int FDk,
   const int FCacheMax,
   const int FCacheSlot,
   const int FQW,
   const int FKW,
+  const int FXStride,
   __global const float* FX,
   __global char* FKCodes,
   __global float* FKScales,
@@ -2839,17 +2878,20 @@ __kernel void cai_sdpa_append_kv_int8
   __local float* FScratch
 )
 {
-  const int g = get_group_id(1);
+  const int gid = get_group_id(1);
   const int lid = get_local_id(0);
   const int lsize = get_local_size(0);
   int s, d, part;
+  const int g = gid / FTokenCnt;
+  const int t = gid - g * FTokenCnt;
   if (g >= FKVHeads) return;
-  const int slot = g * FCacheMax + FCacheSlot;
+  const int slot = g * FCacheMax + FCacheSlot + t;
   const int dst = slot * FDk;
+  const int kBase = t * FXStride + FQW + g * FDk;
 
   for (part = 0; part < 2; part++)
   {
-    const int base = (part == 0) ? (FQW + g * FDk) : (FQW + FKW + g * FDk);
+    const int base = (part == 0) ? kBase : (kBase + FKW);
     __global char* codes = (part == 0) ? FKCodes : FVCodes;
     __global float* scales = (part == 0) ? FKScales : FVScales;
 
@@ -2888,7 +2930,9 @@ __kernel void cai_sdpa_append_kv_int8
 
 // CACHED-DECODE SCALED DOT-PRODUCT ATTENTION OVER AN INT8 KV CACHE
 // (TNNetFusedSDPA). Phase for phase the same kernel as cai_sdpa_decode above -
-// one work-group per query head, the score band in global memory, a
+// one work-group per (query head, band row) walking its rows in turn, the
+// same LiveLen = FCacheSlot+t+1 intra-step causal bound, the score band in
+// global memory, a
 // CLK_GLOBAL_MEM_FENCE barrier between phases 2 and 3 - and only the loads
 // differ: the codes stream straight into the accumulator and the row scale is
 // folded in as one scalar OUTSIDE the element loop, so the cache is never
@@ -2900,11 +2944,15 @@ __kernel void cai_sdpa_append_kv_int8
 __kernel void cai_sdpa_decode_int8
 (
   const int FQHeads,
+  const int FTokenCnt,
+  const int FBandRows,
   const int FGroupSize,
   const int FDk,
   const int FCacheMax,
-  const int FCacheLen,
+  const int FCacheSlot,
   const int FWindow,
+  const int FXStride,
+  const int FYStride,
   const float FInvSqrtDk,
   const float FScoreSoftCap,
   const float FInvScoreSoftCap,
@@ -2918,28 +2966,35 @@ __kernel void cai_sdpa_decode_int8
   __local float* FScratch
 )
 {
-  const int h = get_group_id(1);
+  const int gid = get_group_id(1);
   const int lid = get_local_id(0);
   const int lsize = get_local_size(0);
-  int s, d, j;
+  int s, d, j, t;
+  const int h = gid / FBandRows;
+  const int r = gid - h * FBandRows;
   if (h >= FQHeads) return;
 
   __local float* qloc = FScratch + lsize;
 
   const int g = h / FGroupSize;
-  const int qBase = h * FDk;
   const int scalePlane = g * FCacheMax;
   const int plane = scalePlane * FDk;
-  const int scoreBase = h * FCacheMax;
-  const int jStart = ((FWindow > 0) && (FCacheLen > FWindow))
-                     ? (FCacheLen - FWindow) : 0;
+  const int scoreBase = gid * FCacheMax;
+
+  for (t = r; t < FTokenCnt; t += FBandRows)
+  {
+  const int qBase = t * FXStride + h * FDk;
+  const int yBase = t * FYStride + h * FDk;
+  const int LiveLen = FCacheSlot + t + 1;
+  const int jStart = ((FWindow > 0) && (LiveLen > FWindow))
+                     ? (LiveLen - FWindow) : 0;
 
   for (d = lid; d < FDk; d += lsize) qloc[d] = FX[qBase + d];
   barrier(CLK_LOCAL_MEM_FENCE);
 
   // ---- phase 1: scores over the live cache, then the row max ----
   float m = -1e30f;
-  for (j = jStart + lid; j < FCacheLen; j += lsize)
+  for (j = jStart + lid; j < LiveLen; j += lsize)
   {
     __global const char* krow = FKCodes + plane + j * FDk;
     float acc = 0.0f;
@@ -2963,7 +3018,7 @@ __kernel void cai_sdpa_decode_int8
   // ---- phase 2: shifted exp in place (same lane owns the same j), then the
   // normalizer ----
   float partial = 0.0f;
-  for (j = jStart + lid; j < FCacheLen; j += lsize)
+  for (j = jStart + lid; j < LiveLen; j += lsize)
   {
     const float e = exp(FScores[scoreBase + j] - MaxScore);
     FScores[scoreBase + j] = e;
@@ -2986,10 +3041,12 @@ __kernel void cai_sdpa_decode_int8
   for (d = lid; d < FDk; d += lsize)
   {
     float acc = 0.0f;
-    for (j = jStart; j < FCacheLen; j++)
+    for (j = jStart; j < LiveLen; j++)
       acc = mad(FScores[scoreBase + j] * FVScales[scalePlane + j],
                 (float)FVCodes[plane + j * FDk + d], acc);
-    FY[qBase + d] = acc * InvSumExp;
+    FY[yBase + d] = acc * InvSumExp;
+  }
+  barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
   }
 }
 
