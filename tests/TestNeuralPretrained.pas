@@ -22,6 +22,7 @@ uses
   Classes, SysUtils, Math, fpcunit, testregistry, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralmxfp4, neuralnf4, neuralpretrained, neuralhftokenizer, neuralaudio,
+  neuralchatengine,
   neuraldecode, neuraldiffusion;
 
 type
@@ -38,6 +39,13 @@ type
     procedure RunWindowedPrefillStream(WindowSession,
       TailSession: TNNetStreamingDecoder; const Tokens: array of integer;
       StepTokens, PrefillTokenCount: integer; Logits: TNNetVolume);
+    // A temp HF-style directory (model.safetensors, config.json,
+    // tokenizer.json) of the tiny_qwen3_5 fixture for TChatEngine.LoadModel.
+    function MakeQwen35ChatModelDir(): string;
+    procedure RemoveQwen35ChatModelDir(const Dir: string);
+    // Two greedy chat turns per --prefill-window value in {0, 4, 6}; every
+    // value must produce the same tokens as the token-by-token prefill.
+    procedure RunQwen35ChatPrefillWindowParity(const ExtraArgs: array of string);
     {$IFDEF OpenCL}
     // First OpenCL platform/device on the box; false when there is none, which
     // every caller reports as a SKIP.
@@ -273,6 +281,8 @@ type
     procedure TestQwen35StreamedDecodeOpenCLParity;
     procedure TestQwen2StreamedDecodeOpenCLParity;
     procedure TestQwen35TurnBoundaryResumeParity;
+    procedure TestQwen35ChatPrefillWindowParity;
+    procedure TestQwen35ChatPrefillWindowInt8KVParity;
     procedure TestQwen35MoeLogitParity;
     procedure TestGptOssLogitParity;
     procedure TestGptOssMXFP4LogitParity;
@@ -9752,6 +9762,184 @@ begin
     StepIn.Free;
     Twin.Free;
   end;
+end;
+
+function TTestNeuralPretrained.MakeQwen35ChatModelDir(): string;
+begin
+  Result := IncludeTrailingPathDelimiter(GetTempDir(false)) +
+    'cai_chat_qwen35_' + IntToStr(Random(1000000)) + DirectorySeparator;
+  ForceDirectories(Result);
+  CopyFileTo(FixturePath('tiny_qwen3_5.safetensors'),
+    Result + 'model.safetensors');
+  CopyFileTo(FixturePath('tiny_qwen3_5_config.json'), Result + 'config.json');
+  CopyFileTo(FixturePath('tiny_bpe_split_qwen35_tokenizer.json'),
+    Result + 'tokenizer.json');
+end;
+
+procedure TTestNeuralPretrained.RemoveQwen35ChatModelDir(const Dir: string);
+begin
+  DeleteFile(Dir + 'model.safetensors');
+  DeleteFile(Dir + 'config.json');
+  DeleteFile(Dir + 'tokenizer.json');
+  RemoveDir(Dir);
+end;
+
+// Engine-level parity of --prefill-window on the tiny_qwen3_5 hybrid: the
+// same two greedy turns with windows of 0 (token by token), 4 (turn 1: one
+// window + a 2-token tail; turn 2: one window + a 1-token tail) and 6
+// (turn 1: exactly one window, no tail; turn 2: no whole window, all width
+// 1) must produce identical replies and identical cached token sequences.
+// Turn 2 extends turn 1, so the turn-boundary snapshot is resumed - into
+// the window session when a window runs first. Prompt ids are fed directly (the fixture vocab is 13
+// ids, the tokenizer only decodes). The window counts are asserted so the
+// test cannot pass by never using the twin. Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunQwen35ChatPrefillWindowParity(
+  const ExtraArgs: array of string);
+const
+  Ctx = 16;
+  Turn1Len = 7;
+  Turn2Extra = 6;
+  MaxNew = 2;
+  Vocab = 13;
+  WindowChoices: array[0..2] of integer = (0, 4, 6);
+type
+  TTurnRecord = record
+    Reply: string;
+    Completion: integer;
+    Cached: TNeuralIntegerArray;
+  end;
+var
+  Dir, ErrorMsg: string;
+  Reference: array[0..1] of TTurnRecord;
+  Current: array[0..1] of TTurnRecord;
+  Choice, T: integer;
+
+  procedure RunEngine(WindowLen: integer; var Turns: array of TTurnRecord);
+  var
+    Engine: TChatEngine;
+    Opt: TChatOptions;
+    Args: TStringList;
+    Prompt: TNeuralIntegerArray;
+    Pos, FedCount, Extra: integer;
+    ParsedOK, LoadedOK: boolean;
+  begin
+    Engine := TChatEngine.Create();
+    Args := TStringList.Create();
+    try
+      Args.Add(Dir);
+      Args.Add('--greedy');
+      Args.Add('--fp32');
+      Args.Add('--cpu');
+      Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
+      Args.Add('--max-new-tokens'); Args.Add(IntToStr(MaxNew));
+      Args.Add('--prefill-window'); Args.Add(IntToStr(WindowLen));
+      for Extra := 0 to High(ExtraArgs) do Args.Add(ExtraArgs[Extra]);
+      ParsedOK := ParseArgs(Args, Opt);
+      AssertTrue('chat options parse: ' + Opt.ErrorMsg, ParsedOK);
+      AssertEquals('--prefill-window parsed', WindowLen, Opt.PrefillWindow);
+      LoadedOK := Engine.LoadModel(Opt, ErrorMsg);
+      AssertTrue('LoadModel: ' + ErrorMsg, LoadedOK);
+      AssertEquals('twin present exactly when a window is requested',
+        WindowLen > 0, Assigned(Engine.WindowNN));
+      if WindowLen > 0 then
+        AssertEquals('twin input width', WindowLen,
+          Engine.WindowNN.GetFirstLayer().Output.SizeX);
+      AssertEquals('width-1 net input width', 1,
+        Engine.NN.GetFirstLayer().Output.SizeX);
+      // Turn 1: Turn1Len prompt ids; Turn1Len-1 of them are prefilled.
+      SetLength(Prompt, Turn1Len);
+      for Pos := 0 to Turn1Len - 1 do Prompt[Pos] := (5 * Pos + 2) mod Vocab;
+      Turns[0].Reply := Engine.GenerateFromIds(Prompt, Engine.Opt);
+      Turns[0].Completion := Engine.LastCompletionTokens;
+      Turns[0].Cached := Copy(Engine.CachedTokens);
+      FedCount := Turn1Len - 1;
+      if WindowLen > 0 then
+        AssertEquals('turn 1 windows (window ' + IntToStr(WindowLen) + ')',
+          FedCount div WindowLen, Engine.LastPrefillWindows)
+      else AssertEquals('no windows without the twin', 0,
+        Engine.LastPrefillWindows);
+      AssertTrue('turn 1 produced tokens', Turns[0].Completion > 0);
+      // Turn 2 extends the cached sequence by Turn2Extra ids, so the turn
+      // boundary snapshot resumes and only the new ids are prefilled.
+      SetLength(Prompt, Length(Turns[0].Cached) + Turn2Extra);
+      for Pos := 0 to High(Turns[0].Cached) do Prompt[Pos] := Turns[0].Cached[Pos];
+      for Pos := 0 to Turn2Extra - 1 do
+        Prompt[Length(Turns[0].Cached) + Pos] := (7 * Pos + 3) mod Vocab;
+      AssertTrue('turn 2 prompt fits the context', Length(Prompt) < Ctx);
+      Turns[1].Reply := Engine.GenerateFromIds(Prompt, Engine.Opt);
+      Turns[1].Completion := Engine.LastCompletionTokens;
+      Turns[1].Cached := Copy(Engine.CachedTokens);
+      FedCount := Turn2Extra - 1;
+      if WindowLen > 0 then
+        AssertEquals('turn 2 windows (window ' + IntToStr(WindowLen) + ')',
+          FedCount div WindowLen, Engine.LastPrefillWindows);
+      AssertTrue('turn 2 produced tokens', Turns[1].Completion > 0);
+    finally
+      Args.Free;
+      Engine.Free;
+    end;
+  end;
+
+  procedure AssertSameTurn(const Expected, Actual: TTurnRecord;
+    const What: string);
+  var
+    Pos: integer;
+  begin
+    AssertEquals(What + ': reply text', Expected.Reply, Actual.Reply);
+    AssertEquals(What + ': completion tokens', Expected.Completion,
+      Actual.Completion);
+    AssertEquals(What + ': cached token count', Length(Expected.Cached),
+      Length(Actual.Cached));
+    for Pos := 0 to High(Expected.Cached) do
+      AssertEquals(What + ': cached token ' + IntToStr(Pos),
+        Expected.Cached[Pos], Actual.Cached[Pos]);
+  end;
+
+begin
+  RandSeed := 424242;
+  Dir := MakeQwen35ChatModelDir();
+  try
+    RunEngine(WindowChoices[0], Reference);
+    AssertTrue('the reference decoded past the prompt',
+      Length(Reference[1].Cached) >= Turn1Len + Turn2Extra);
+    for Choice := 1 to High(WindowChoices) do
+    begin
+      RunEngine(WindowChoices[Choice], Current);
+      for T := 0 to 1 do
+        AssertSameTurn(Reference[T], Current[T], 'window ' +
+          IntToStr(WindowChoices[Choice]) + ' turn ' + IntToStr(T + 1));
+    end;
+  finally
+    RemoveQwen35ChatModelDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatPrefillWindowParity;
+var
+  Args: TStringList;
+  Opt: TChatOptions;
+begin
+  // The parser rejects a one-token window (it would be today's path twice).
+  Args := TStringList.Create();
+  try
+    Args.Add('/tmp/model'); Args.Add('--prefill-window'); Args.Add('1');
+    AssertFalse('--prefill-window 1 is rejected', ParseArgs(Args, Opt));
+    Args.Clear;
+    Args.Add('/tmp/model'); Args.Add('--prefill-window'); Args.Add('64');
+    AssertTrue('--prefill-window 64 parses', ParseArgs(Args, Opt));
+    AssertEquals('--prefill-window value', 64, Opt.PrefillWindow);
+  finally
+    Args.Free;
+  end;
+  // FP32 KV cache on the default (layer-graph parallel) forward.
+  RunQwen35ChatPrefillWindowParity(['--kv-fp32']);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatPrefillWindowInt8KVParity;
+begin
+  // int8 KV cache on the serial forward: the window session's int8 codes
+  // cross to the width-1 session verbatim.
+  RunQwen35ChatPrefillWindowParity(['--kv-int8', '--serial']);
 end;
 
 // Verifies the Qwen3.5/3.6-MoE hybrid import (HF model_type "qwen3_5_moe",

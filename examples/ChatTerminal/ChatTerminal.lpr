@@ -93,9 +93,10 @@ the chat template rejects the turn (e.g. --system on a format without a
 system role).
 
 --stats prints per-turn timing to stderr (kept off stdout so piped model
-output stays clean): time-to-first-token (prefill + the first decode step)
-and the steady-state decode rate in tok/s (measured over the tokens after
-the first, so prefill is excluded).
+output stays clean): time-to-first-token (prefill + the first decode step),
+the prefill rate in tok/s (prefilled tokens over TTFT minus one mean decode
+step; omitted when nothing was prefilled) and the steady-state decode rate
+in tok/s (measured over the tokens after the first, so prefill is excluded).
 
 --selftest runs the argument-parsing / prompt-assembly / REPL-command unit
 checks (no model needed) and exits.

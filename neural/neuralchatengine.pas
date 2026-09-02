@@ -179,6 +179,11 @@ type
                                  // TNNetConvolution has an int8 x int8 kernel;
                                  // the LLM blocks arm an input copy nothing
                                  // reads yet. Needs int8 or int4 weights
+    PrefillWindow: integer;      // --prefill-window N: prefill the prompt N
+                                 // tokens per forward on a width-N twin of
+                                 // the net (a second copy of the weights in
+                                 // RAM and on the device, checkpoint loaded
+                                 // twice); 0 = one token per forward
     Host: string;                // ChatServer only: HTTP listen address
     Port: integer;               // ChatServer only: HTTP listen port
     ErrorMsg: string;
@@ -212,6 +217,14 @@ type
     Opt: TChatOptions;
     NN: TNNet;
     Session: TNNetStreamingDecoder;
+    // --prefill-window N: a width-N twin of NN with its own session. Whole
+    // windows of the prompt go through WindowSession; SwitchTo carries the
+    // state to Session before the width-1 tail and the decode loop. Both
+    // nil when the option is 0. WindowIn is the (N,1,1) window of token ids.
+    WindowNN: TNNet;
+    WindowSession: TNNetStreamingDecoder;
+    WindowIn: TNNetVolume;
+    ActiveSession: TNNetStreamingDecoder; // the session holding the live state
     Tokenizer: TNeuralHFTokenizer;
     ChatFormat: TNeuralChatFormat;
     RawMode: boolean;            // FormatName 'raw': no chat template at all
@@ -256,6 +269,8 @@ type
     LastPromptTokens: integer;
     LastCompletionTokens: integer;
     LastFinishReason: string;
+    LastPrefillWindows: integer; // whole windows the last call fed through
+                                 // WindowSession (0 without --prefill-window)
     Loaded: boolean;
     {$IFDEF OpenCL}
     GpuCL: TEasyOpenCL;          // platform/device handle for OpenCL offload
@@ -288,6 +303,9 @@ type
   private
     procedure Notice(const S: string);
     procedure EmitToken(const S: string);
+    // Moves the live state from ActiveSession into Target (snapshot, restore)
+    // and makes Target the active session. No-op when Target is active.
+    procedure SwitchTo(Target: TNNetStreamingDecoder);
   end;
 
 function DefaultChatOptions(): TChatOptions;
@@ -375,13 +393,20 @@ begin
   WriteLn('                        shared, which is faster). Each layer then waits for');
   WriteLn('                        its sources, so --profile charges GPU time per layer');
   WriteLn('                        instead of the queue drain: a profiling mode.');
-  WriteLn('  --stats               per-turn timing to stderr (TTFT, decode tok/s)');
+  WriteLn('  --stats               per-turn timing to stderr (TTFT, prefill tok/s,');
+  WriteLn('                        decode tok/s)');
   WriteLn('  --profile             per-layer-class forward timing to stderr after each');
   WriteLn('                        turn (decode steps only); ranks classes to optimize.');
   WriteLn('                        Also prints [sched]: layer-graph parallelism (graph');
   WriteLn('                        width, parallel vs serial passes, peak in-flight)');
   WriteLn('  --no-cache-reuse      re-prefill the whole prompt each turn (default:');
   WriteLn('                        reuse the shared KV-cache prefix from last turn)');
+  WriteLn('  --prefill-window N    prefill the prompt N tokens per forward on a second,');
+  WriteLn('                        width-N copy of the net (default 0 = one token per');
+  WriteLn('                        forward). Keeps a second copy of the weights in RAM');
+  WriteLn('                        and on the device and loads the checkpoint twice.');
+  WriteLn('                        The prompt tail that does not fill a window is fed');
+  WriteLn('                        one token at a time; nothing is padded');
   WriteLn('  --serial              serial layer loop (default: layer-graph parallel');
   WriteLn('                        forward across independent layers; the parallel');
   WriteLn('                        path also threads large conv/linear layers');
@@ -437,6 +462,7 @@ begin
   Result.Stats := false;
   Result.Profile := false;
   Result.NoCacheReuse := false;
+  Result.PrefillWindow := 0; // one token per prefill forward (--prefill-window N)
   Result.KVInt8 := false;    // resolved after parsing: follows the weight mode
   Result.KVInt8Set := false; // unless --kv-int8/--kv-fp32 picked explicitly
   Result.Serial := false; // parallel layer-graph forward by default (--serial)
@@ -522,6 +548,16 @@ begin
     else if Arg = '--stats' then Opt.Stats := true
     else if Arg = '--profile' then Opt.Profile := true
     else if Arg = '--no-cache-reuse' then Opt.NoCacheReuse := true
+    else if Arg = '--prefill-window' then
+    begin
+      if not NextInt(Arg, IVal) then exit(false);
+      if (IVal < 0) or (IVal = 1) then
+      begin
+        Opt.ErrorMsg := '--prefill-window: must be 0 (off) or at least 2';
+        exit(false);
+      end;
+      Opt.PrefillWindow := IVal;
+    end
     else if Arg = '--kv-int8' then
     begin
       Opt.KVInt8 := true;
@@ -970,6 +1006,10 @@ begin
   Opt := DefaultChatOptions();
   NN := nil;
   Session := nil;
+  WindowNN := nil;
+  WindowSession := nil;
+  WindowIn := nil;
+  ActiveSession := nil;
   Tokenizer := nil;
   ChatFormat := cfUnknown;
   RawMode := false;
@@ -986,6 +1026,7 @@ begin
   LastPromptTokens := 0;
   LastCompletionTokens := 0;
   LastFinishReason := '';
+  LastPrefillWindows := 0;
   Loaded := false;
   {$IFDEF OpenCL}
   GpuCL := nil;
@@ -1000,8 +1041,11 @@ begin
   FreeAndNil(TurnSnap); // owned deep copy of the session state; free it first
   FreeAndNil(Session); // before NN.Free: Destroy ends incremental decode on
                        // NN's layers
+  FreeAndNil(WindowSession);
   FreeAndNil(Tokenizer);
   FreeAndNil(NN);
+  FreeAndNil(WindowNN);
+  FreeAndNil(WindowIn);
   {$IFDEF OpenCL}
   FreeAndNil(GpuCL); // after NN.Free; nil when GPU was off or fell back to CPU
   {$ENDIF}
@@ -1016,6 +1060,23 @@ end;
 procedure TChatEngine.EmitToken(const S: string);
 begin
   if Assigned(OnToken) then OnToken(S);
+end;
+
+procedure TChatEngine.SwitchTo(Target: TNNetStreamingDecoder);
+var
+  Snap: TNNetDecoderSessionSnapshot;
+begin
+  if Target = ActiveSession then exit;
+  // Snapshot() always creates its copy (there is no fill-in-place variant),
+  // so a switch costs one deep copy of the KV cache, the same as the
+  // turn-boundary capture.
+  Snap := ActiveSession.Snapshot();
+  try
+    Target.RestoreSnapshot(Snap);
+  finally
+    Snap.Free;
+  end;
+  ActiveSession := Target;
 end;
 
 function TChatEngine.LoadModel(const AOpt: TChatOptions;
@@ -1108,6 +1169,15 @@ begin
       [Opt.CtxLen]));
   end;
 
+  // A window must leave room in the cache for at least one more token: the
+  // prompt is at most CtxLen-1 tokens and the last one is never prefilled.
+  if Opt.PrefillWindow >= Opt.CtxLen then
+  begin
+    Notice(Format('[--prefill-window %d ignored: not below the context of' +
+      ' %d tokens]', [Opt.PrefillWindow, Opt.CtxLen]));
+    Opt.PrefillWindow := 0;
+  end;
+
   {$IFDEF OpenCL}
   GpuCL := nil;
   if Opt.Gpu and Opt.LowMemory then
@@ -1181,9 +1251,19 @@ begin
   // the context. SeqLen is the cache budget, NOT the built input width.
   NN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}1,
     {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32);
+  Int4DirectLayerCount := NeuralImportInt4LayerCount;
+  // --prefill-window: the width-N twin. No importer route builds a net
+  // without reading its weights, so the twin costs a second checkpoint read
+  // and a second copy of the weights; every step NN takes below, the twin
+  // takes too.
+  if Opt.PrefillWindow > 0 then
+  begin
+    NeuralImportInt4LayerCount := 0;
+    WindowNN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}Opt.PrefillWindow,
+      {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32);
+  end;
   NeuralAllowFusedAttention := true; // restore the global default post-build
   NeuralImportInt4FromQ4_0 := false;
-  Int4DirectLayerCount := NeuralImportInt4LayerCount;
   // Low-memory forward path, set independently of trainability. The importer
   // built inference-only with low memory ON (SetTrainable's pLowMemory default);
   // honor --max-fast-memory by re-sweeping the layers, then flush each weight
@@ -1192,6 +1272,13 @@ begin
   LastIdx := NN.GetLastLayerIdx();
   for Cnt := 0 to LastIdx do
     NN.Layers[Cnt].FlushWeightCache();
+  if Assigned(WindowNN) then
+  begin
+    WindowNN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
+    LastIdx := WindowNN.GetLastLayerIdx();
+    for Cnt := 0 to LastIdx do
+      WindowNN.Layers[Cnt].FlushWeightCache();
+  end;
   Notice(Format('Model loaded in %.1fs.',
     [(GetTickCount64() - LoadStart) / 1000]));
 
@@ -1202,6 +1289,7 @@ begin
     // Counts the layers the loader already direct-loaded too: they exit
     // QuantizeWeightsInt4 immediately and it counts them as int4.
     Int4LayerCount := NN.QuantizeWeightsInt4();
+    if Assigned(WindowNN) then WindowNN.QuantizeWeightsInt4();
     Notice('[--int4: Q4_0 int4 weights on ' + IntToStr(Int4LayerCount) +
       ' layers (' + IntToStr(Int4DirectLayerCount) +
       ' loaded directly from the checkpoint Q4_0 blocks, ' +
@@ -1261,6 +1349,12 @@ begin
         NN.OpenCLFP16 := Opt.ExperimentalFP16;
         NN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
           GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
+        if Assigned(WindowNN) then
+        begin
+          WindowNN.OpenCLFP16 := Opt.ExperimentalFP16;
+          WindowNN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
+            GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
+        end;
         Notice(Format('GPU weights uploaded in %.1fs.',
           [(GetTickCount64() - LoadStart) / 1000]));
       end;
@@ -1272,11 +1366,14 @@ begin
   // after EnableOpenCL (the CPU verdict is what routes to the int8 x int8
   // kernel). The armed count is the user's confirmation that ordering held.
   if Opt.ExperimentalInt8Input then
+  begin
     Notice('[--experimental-int8-input: under construction - int8 input copy' +
       ' armed on ' + IntToStr(NN.EnableInt8Input()) + ' layers (the count is' +
       ' every layer holding the copy, so with --int4 it includes the int4' +
       ' layers, which arm it themselves); only TNNetConvolution runs' +
       ' int8 x int8 today, the others still run int8 x FP32]');
+    if Assigned(WindowNN) then WindowNN.EnableInt8Input();
+  end;
 
   SeqLen := Opt.CtxLen;
   VocabSize := NN.GetLastLayer().Output.Depth;
@@ -1285,6 +1382,17 @@ begin
   // keep the pages). Reset and cache-reuse truncation keep the int8 mode
   // (they only rewind the cache length).
   Session := TNNetStreamingDecoder.Create(NN, SeqLen, Opt.KVInt8);
+  ActiveSession := Session;
+  if Assigned(WindowNN) then
+  begin
+    WindowSession := TNNetStreamingDecoder.Create(WindowNN, SeqLen, Opt.KVInt8);
+    WindowIn := TNNetVolume.Create(Opt.PrefillWindow, 1, 1);
+    Notice(Format('[--prefill-window %d: the prompt is prefilled %d tokens per' +
+      ' forward on a second, width-%d copy of the net (weights held twice in' +
+      ' RAM and on the device; checkpoint loaded twice); the tail that does' +
+      ' not fill a window goes one token at a time]',
+      [Opt.PrefillWindow, Opt.PrefillWindow, Opt.PrefillWindow]));
+  end;
   if Opt.KVInt8 then
     Notice('[int8 KV cache (default with int8 weights) - ~1/4 the KV RAM, ' +
       'logits not bit-exact; --kv-fp32 opts out]');
@@ -1295,14 +1403,18 @@ begin
   // conv/linear layers above the MinWork threshold split across the pool via
   // worker 0), ComputeSerial runs fully single-threaded. No separate flag.
   Session.Parallel := not Opt.Serial;
+  if Assigned(WindowSession) then WindowSession.Parallel := Session.Parallel;
   // --max-threads: cap the scheduler pool (and with it the per-layer chunk
   // count). Set BEFORE StartThreadWorkers so the pool is created at the capped
   // size instead of being built wide and resized on the next pass.
   if Opt.MaxThreads > 0 then NN.MaxThreadNum := Opt.MaxThreads;
+  if Assigned(WindowNN) and (Opt.MaxThreads > 0) then
+    WindowNN.MaxThreadNum := Opt.MaxThreads;
   // Keep the scheduler's worker pool alive and HOT between decode steps (default
   // policy: ~50% of the pool hot, worker 0 always) so each token's parallel
   // forward reaches the workers without re-warming the pool every step.
   if Session.Parallel then NN.StartThreadWorkers();
+  if Assigned(WindowNN) and Session.Parallel then WindowNN.StartThreadWorkers();
   // KV-cache reuse across turns needs position-truncatable attention K/V and no
   // recurrent (SSM) state to rewind. Pure-attention nets qualify; NoCacheReuse
   // forces the full re-prefill at the call site.
@@ -1448,6 +1560,8 @@ var
   InV, Output, Row: TNNetVolume;
   Len, StepCnt, Cnt, NewToken: integer;
   Reused, PromptLen: integer;  // KV-cache reuse bookkeeping (and --stats)
+  WindowLen, WindowCount, WindowPos, WindowRow, MaxRowPos: integer; // --prefill-window
+  PrefillMs, MeanStepMs: double; // --stats prefill rate
   LenM2, MarkerLen, EmLen, DecLen: integer;
   LastPos, RowBytes: integer;
   Decoded, Emitted, Piece: string;
@@ -1478,6 +1592,7 @@ begin
   LastPromptTokens := Length(PromptIds);
   LastCompletionTokens := 0;
   LastFinishReason := 'length';
+  LastPrefillWindows := 0;
   Len := Length(PromptIds);
   // An empty prompt has no last token to feed as the first decode step's
   // input (a BOS-less tokenizer encodes '' to zero ids): decoding cannot
@@ -1554,17 +1669,18 @@ begin
   try
   try
     Chain.Reset(PromptIds);
-    // Prefill the prompt token-at-a-time, reusing the KV-cache prefix shared
-    // with the last call when possible. Reused = length of the cached prefix
-    // that still matches this prompt; TruncateTo drops the divergent tail
-    // (Reused=0 is a full reset). The LAST prompt token is fed as the first
-    // decode step's input, so the cache must not already hold it - cap reuse
-    // at Len-1.
+    // Prefill the prompt, reusing the KV-cache prefix shared with the last
+    // call when possible. Reused = length of the cached prefix that still
+    // matches this prompt. The LAST prompt token is fed as the first decode
+    // step's input, so the cache must not already hold it - cap reuse at
+    // Len-1. Tokens Reused..LenM2 are fed: whole windows of WindowLen
+    // through WindowSession first (never padded), then the tail one token
+    // at a time through Session. The reused state goes straight into
+    // whichever session steps first.
     if CacheReuse then
     begin
       Reused := CommonPrefixLen(CachedTokens, PromptIds);
       if Reused > Len - 1 then Reused := Len - 1;
-      Session.TruncateTo(Reused);
     end
     else if StateReuse then
     begin
@@ -1574,28 +1690,59 @@ begin
       // sequence that produced it - i.e. the cached prefix still matches at
       // least that far. Anything shorter or divergent (/reset, edited
       // history, a different conversation on a shared engine) falls through
-      // to the full reset below.
+      // to the full reset.
       Reused := CommonPrefixLen(CachedTokens, PromptIds);
       if (Reused >= TurnSnapPos) and (TurnSnapPos <= Len - 1) then
-      begin
-        Reused := TurnSnapPos;
-        Session.RestoreSnapshot(TurnSnap);
-      end
-      else
-      begin
-        Reused := 0;
-        Session.Reset();
-      end;
+        Reused := TurnSnapPos
+      else Reused := 0;
     end
-    else
+    else Reused := 0;
+    WindowCount := 0;
+    WindowLen := 0;
+    if Assigned(WindowSession) then
     begin
-      Reused := 0;
-      Session.Reset(); // SSM state cannot be position-truncated; full reset
+      WindowLen := WindowIn.SizeX;
+      WindowCount := (LenM2 + 1 - Reused) div WindowLen;
     end;
-    for Cnt := Reused to LenM2 do
+    if WindowCount > 0 then ActiveSession := WindowSession
+    else ActiveSession := Session;
+    if Reused = 0 then ActiveSession.Reset() // SSM state cannot be truncated
+    else if CacheReuse then
+    begin
+      // The prefix lives in Session's cache: truncate there, then carry it.
+      Session.TruncateTo(Reused);
+      ActiveSession := Session;
+      if WindowCount > 0 then SwitchTo(WindowSession);
+    end
+    else ActiveSession.RestoreSnapshot(TurnSnap);
+    Cnt := Reused;
+    if WindowCount > 0 then
+    begin
+      {$IFDEF Debug}
+      Assert(WindowIn.SizeX = WindowNN.GetFirstLayer().Output.SizeX,
+        'TChatEngine: window volume width differs from the twin input width');
+      {$ENDIF}
+      MaxRowPos := WindowLen - 1;
+      // A window that would overflow the cache is never fed: the fused
+      // attention layer only prints on overflow and then scores past its
+      // buffers. Cnt + WindowLen <= LenM2 + 1 < SeqLen holds for every whole
+      // window, so the check is insurance.
+      for WindowPos := 0 to WindowCount - 1 do
+      begin
+        if Cnt + WindowLen > SeqLen then break;
+        for WindowRow := 0 to MaxRowPos do
+          WindowIn.FData[WindowRow] := Tokens[Cnt + WindowRow];
+        WindowSession.StepForward(WindowIn, Cnt);
+        Inc(Cnt, WindowLen);
+        Inc(LastPrefillWindows);
+      end;
+      SwitchTo(Session);
+    end;
+    while Cnt <= LenM2 do
     begin
       InV.FData[0] := Tokens[Cnt];
       Session.StepForward(InV, Cnt);
+      Inc(Cnt);
     end;
     // --profile: discard the one-shot prefill timings (and scheduler stats)
     // so the per-layer-class report below reflects only the repeated
@@ -1739,6 +1886,14 @@ begin
       TEnd := GetTickCount64();
       Write(StdErr, Format('[stats] %d tokens, TTFT %d ms, prompt %d (reused %d)',
         [Produced, TFirst - TStart, PromptLen, Reused]));
+      // Prefill rate: the prefilled tokens over TTFT minus one mean decode
+      // step (TTFT includes the first step). Omitted when nothing was
+      // prefilled or the timer resolution leaves no positive prefill time.
+      MeanStepMs := StepMs / Produced;
+      PrefillMs := (TFirst - TStart) - MeanStepMs;
+      if (PromptLen - 1 - Reused > 0) and (PrefillMs > 0) then
+        Write(StdErr, Format(', prefill %.1f tok/s',
+          [(PromptLen - 1 - Reused) * 1000.0 / PrefillMs]));
       if Produced > 1 then
       begin
         DecodeSecs := (TEnd - TFirst) / 1000.0;
@@ -1785,6 +1940,8 @@ begin
     FreeAndNil(TurnSnap); // captured at a boundary this session is no longer at
     TurnSnapPos := 0;
     Session.Reset();
+    if Assigned(WindowSession) then WindowSession.Reset();
+    ActiveSession := Session;
     raise;
   end;
 end;
