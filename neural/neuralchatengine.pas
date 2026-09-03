@@ -146,6 +146,9 @@ type
                                  // each turn, prefill and decode reported apart;
                                  // for picking the next layer class to optimize
     NoCacheReuse: boolean;       // force full re-prefill every turn (A/B + debug)
+    NoPromptSnapshot: boolean;   // --no-prompt-snapshot: a hybrid keeps only the
+                                 // end-of-reply snapshot (saves one KV copy of
+                                 // host RAM; a re-rendered reply re-prefills)
     KVInt8: boolean;             // int8-quantized KV cache (~1/4 the KV RAM at
                                  // long context; logits not bit-exact). Follows
                                  // the weight mode (on with int8 weights, off
@@ -281,6 +284,18 @@ type
     StateReuseOK: boolean;       // snapshot resume sound for this architecture?
     TurnSnap: TNNetDecoderSessionSnapshot;  // owned; nil when none is held
     TurnSnapPos: integer;        // tokens fed into the session at capture
+    // Second snapshot of the same route, captured at the END OF THE PROMPT
+    // (after the prefill, before the first decode step), so a prompt that
+    // repeats the previous prompt but not the reply the engine produced (a
+    // client that re-renders the assistant turn through its chat template,
+    // an agent appending a tool observation) still resumes at the prompt end
+    // instead of a full re-prefill. TurnSnap is deeper and wins when the
+    // prompt echoes the reply verbatim. Same cost as TurnSnap: one more copy
+    // of the KV cache at full context plus the recurrent state, held for the
+    // life of the engine; --no-prompt-snapshot drops it. PromptSnapPos is
+    // the number of tokens fed when it was captured (the prompt length - 1).
+    PromptSnap: TNNetDecoderSessionSnapshot; // owned; nil when none is held
+    PromptSnapPos: integer;
     SeqLen, VocabSize: integer;
     MarkerIds: TNeuralIntegerArray;   // end-of-turn stop sequence (token ids)
     CachedTokens: TNeuralIntegerArray; // token ids resident in the KV cache
@@ -294,6 +309,10 @@ type
     LastPromptTokens: integer;
     LastCompletionTokens: integer;
     LastFinishReason: string;
+    LastReusedTokens: integer;   // prompt tokens the last call resumed from
+                                 // the cache or a snapshot (the (reused K)
+                                 // of --stats)
+    LastPrefillTokens: integer;  // prompt tokens the last call fed
     LastPrefillWindows: integer; // whole windows the last call fed through
                                  // WindowSession (0 without --prefill-window)
     LastPrefillTailWindows: integer; // whole windows the last call fed
@@ -440,6 +459,10 @@ begin
   WriteLn('                        width, parallel vs serial passes, peak in-flight)');
   WriteLn('  --no-cache-reuse      re-prefill the whole prompt each turn (default:');
   WriteLn('                        reuse the shared KV-cache prefix from last turn)');
+  WriteLn('  --no-prompt-snapshot  hybrid/recurrent nets: keep only the end-of-reply');
+  WriteLn('                        snapshot (default: also one at the end of the');
+  WriteLn('                        prompt, so a client that re-renders the reply');
+  WriteLn('                        still resumes; costs one more copy of the KV cache)');
   WriteLn('  --prefill-window N    prefill the prompt N tokens per forward on a width-N');
   WriteLn('                        twin of the net (default 0 = one token per forward;');
   WriteLn('                        N is 0 or at least 2 and below the context, else');
@@ -515,6 +538,7 @@ begin
   Result.Stats := false;
   Result.Profile := false;
   Result.NoCacheReuse := false;
+  Result.NoPromptSnapshot := false;
   Result.PrefillWindow := 0; // one token per prefill forward (--prefill-window N)
   Result.PrefillTailWindow := 0; // auto (--prefill-tail-window T)
   Result.KVInt8 := false;    // resolved after parsing: follows the weight mode
@@ -602,6 +626,7 @@ begin
     else if Arg = '--stats' then Opt.Stats := true
     else if Arg = '--profile' then Opt.Profile := true
     else if Arg = '--no-cache-reuse' then Opt.NoCacheReuse := true
+    else if Arg = '--no-prompt-snapshot' then Opt.NoPromptSnapshot := true
     else if Arg = '--prefill-window' then
     begin
       if not NextInt(Arg, IVal) then exit(false);
@@ -1087,6 +1112,8 @@ begin
   StateReuseOK := false;
   TurnSnap := nil;
   TurnSnapPos := 0;
+  PromptSnap := nil;
+  PromptSnapPos := 0;
   SeqLen := 0;
   VocabSize := 0;
   SetLength(MarkerIds, 0);
@@ -1096,6 +1123,8 @@ begin
   LastPromptTokens := 0;
   LastCompletionTokens := 0;
   LastFinishReason := '';
+  LastReusedTokens := 0;
+  LastPrefillTokens := 0;
   LastPrefillWindows := 0;
   LastPrefillTailWindows := 0;
   TotalInputTokens := 0;
@@ -1114,7 +1143,8 @@ end;
 
 destructor TChatEngine.Destroy();
 begin
-  FreeAndNil(TurnSnap); // owned deep copy of the session state; free it first
+  FreeAndNil(TurnSnap); // owned deep copies of the session state; free first
+  FreeAndNil(PromptSnap);
   FreeAndNil(Session); // before NN.Free: Destroy ends incremental decode on
                        // NN's layers
   FreeAndNil(WindowSession);
@@ -1628,6 +1658,8 @@ begin
   StateReuseOK := Session.SSMCount > 0;
   FreeAndNil(TurnSnap);
   TurnSnapPos := 0;
+  FreeAndNil(PromptSnap);
+  PromptSnapPos := 0;
   SetLength(CachedTokens, 0);
   Line := Format('Model: %s, %d params, vocab %d, context %d, chat format ',
     [ModelType, NN.CountWeights(), VocabSize, SeqLen]);
@@ -1649,8 +1681,17 @@ begin
   else if ReuseOK then
     Notice('[KV-cache reuse ON - only the new prompt tail is prefilled each turn]')
   else if StateReuseOK then
-    Notice('[turn-boundary state reuse ON (recurrent/SSM state resumed from a' +
-      ' snapshot) - only the new prompt tail is prefilled each turn]')
+  begin
+    if Opt.NoPromptSnapshot then
+      Notice('[turn-boundary state reuse ON (recurrent/SSM state resumed from' +
+        ' the end-of-reply snapshot; --no-prompt-snapshot) - only the new' +
+        ' prompt tail is prefilled each turn]')
+    else
+      Notice('[turn-boundary state reuse ON (recurrent/SSM state resumed from' +
+        ' the end-of-reply snapshot, or from the end-of-prompt snapshot when' +
+        ' the reply was re-rendered) - only the new prompt tail is prefilled' +
+        ' each turn]');
+  end
   else
     Notice('[cache reuse N/A for this architecture - full re-prefill each turn]');
   if Opt.Serial then
@@ -1736,8 +1777,9 @@ end;
 //     history to truncate, so instead resume the WHOLE session from the
 //     snapshot captured at the end of the previous turn - exact by the
 //     TNNetDecoderSessionSnapshot contract - and prefill only the tokens
-//     added since. Requires this prompt to extend the snapshot's sequence;
-//     a divergent prompt falls back to a full reset.
+//     added since. Two snapshots are held, TurnSnap (end of the reply) and
+//     PromptSnap (end of the prompt); the deepest one this prompt extends is
+//     resumed, a prompt extending neither falls back to a full reset.
 // NoCacheReuse disables both: full reset, whole prompt re-prefilled.
 function TChatEngine.GenerateFromIds(const PromptIds: TNeuralIntegerArray;
   const GenOpt: TChatOptions): string;
@@ -1747,6 +1789,7 @@ var
   Sampler: TNNetSamplerBase;
   CacheReuse: boolean;
   StateReuse: boolean;
+  ResumeSnap: TNNetDecoderSessionSnapshot; // the snapshot this call resumes
   GreedyFast: boolean;
   Tokens: TNeuralIntegerArray;
   Generated: TNeuralIntegerArray;
@@ -1821,6 +1864,8 @@ begin
   LastPromptTokens := Length(PromptIds);
   LastCompletionTokens := 0;
   LastFinishReason := 'length';
+  LastReusedTokens := 0;
+  LastPrefillTokens := 0;
   LastPrefillWindows := 0;
   LastPrefillTailWindows := 0;
   Len := Length(PromptIds);
@@ -1844,7 +1889,8 @@ begin
   // The snapshot route needs a snapshot in hand; --no-cache-reuse disables
   // both routes.
   StateReuse := StateReuseOK and not GenOpt.NoCacheReuse and
-    Assigned(TurnSnap);
+    (Assigned(TurnSnap) or Assigned(PromptSnap));
+  ResumeSnap := nil;
   // Distribution pipeline (TGenerationConfig order: penalty -> temperature
   // -> sampler).
   Chain := TNNetLogitsProcessorChain.Create();
@@ -1937,20 +1983,35 @@ begin
     end
     else if StateReuse then
     begin
-      // Turn-boundary resume. The snapshot is only usable WHOLE (recurrent
-      // state has no per-position history to roll back), so it resumes at
-      // exactly TurnSnapPos and only if this prompt extends the token
-      // sequence that produced it - i.e. the cached prefix still matches at
-      // least that far. Anything shorter or divergent (/reset, edited
-      // history, a different conversation on a shared engine) falls through
-      // to the full reset.
+      // Snapshot resume. A snapshot is only usable WHOLE (recurrent state has
+      // no per-position history to roll back), so it resumes at exactly its
+      // position and only if this prompt extends the token sequence that
+      // produced it - i.e. the cached prefix still matches at least that
+      // far. The deepest usable one wins: TurnSnap (prompt + reply) when the
+      // client echoed the reply verbatim, else PromptSnap (the previous
+      // prompt only) when the reply came back re-rendered. A prompt shorter
+      // or divergent inside the previous prompt (/reset, edited history, a
+      // different conversation on a shared engine) falls through to the full
+      // reset.
       Reused := CommonPrefixLen(CachedTokens, PromptIds);
-      if (Reused >= TurnSnapPos) and (TurnSnapPos <= Len - 1) then
-        Reused := TurnSnapPos
+      if Assigned(TurnSnap) and (TurnSnapPos > 0) and
+        (Reused >= TurnSnapPos) and (TurnSnapPos <= Len - 1) then
+      begin
+        ResumeSnap := TurnSnap;
+        Reused := TurnSnapPos;
+      end
+      else if Assigned(PromptSnap) and (PromptSnapPos > 0) and
+        (Reused >= PromptSnapPos) and (PromptSnapPos <= Len - 1) then
+      begin
+        ResumeSnap := PromptSnap;
+        Reused := PromptSnapPos;
+      end
       else Reused := 0;
     end
     else Reused := 0;
     PrefillTokens := LenM2 + 1 - Reused;
+    LastReusedTokens := Reused;
+    LastPrefillTokens := PrefillTokens;
     WindowCount := 0;
     WindowLen := 0;
     TailCount := 0;
@@ -1977,7 +2038,7 @@ begin
       ActiveSession := Session;
       SwitchTo(FirstSession);
     end
-    else ActiveSession.RestoreSnapshot(TurnSnap);
+    else ActiveSession.RestoreSnapshot(ResumeSnap);
     Cnt := Reused;
     if WindowCount > 0 then
       FeedWindows(WindowSession, WindowIn, WindowCount, LastPrefillWindows);
@@ -1997,6 +2058,20 @@ begin
       Inc(Cnt);
     end;
     TPrefillEnd := GetTickCount64();
+    // End-of-prompt capture for the next call's resume: Session now holds
+    // exactly PromptIds[0..Len-2], a prefix of what CachedTokens will list
+    // after the decode loop, so the prefix test above stays truthful for
+    // it. Taken here rather than before SwitchTo so a run with single steps
+    // pays one copy, not two; with none the state SwitchTo restored is
+    // still in host RAM and the capture is a host copy. The time counts
+    // toward TTFT (--stats prefill excludes it).
+    if StateReuseOK and not GenOpt.NoCacheReuse and
+      not GenOpt.NoPromptSnapshot then
+    begin
+      if PromptSnap = nil then PromptSnap := TNNetDecoderSessionSnapshot.Create();
+      Session.SnapshotInto(PromptSnap); // reuses last call's volumes
+      PromptSnapPos := Len - 1;
+    end;
     SingleSteps := PrefillTokens - LastPrefillWindows * WindowLen -
       LastPrefillTailWindows * TailLen;
     // --profile: the prefill's own layer-class report, one table per net
@@ -2246,8 +2321,10 @@ begin
   end;
   except
     SetLength(CachedTokens, 0);
-    FreeAndNil(TurnSnap); // captured at a boundary this session is no longer at
-    TurnSnapPos := 0;
+    FreeAndNil(TurnSnap); // captured at boundaries the sequence CachedTokens
+    TurnSnapPos := 0;     // no longer vouches for
+    FreeAndNil(PromptSnap);
+    PromptSnapPos := 0;
     Session.Reset();
     if Assigned(WindowSession) then WindowSession.Reset();
     if Assigned(TailSession) then TailSession.Reset();

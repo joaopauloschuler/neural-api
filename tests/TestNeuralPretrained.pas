@@ -70,6 +70,10 @@ type
     // Two greedy chat turns with --prefill-window 6 --prefill-tail-window 2
     // against the token-by-token prefill; per-stage window counts asserted.
     procedure RunQwen35ChatPrefillLadderParity(const ExtraArgs: array of string);
+    // Turn 1 prompt P, then a second prompt that re-renders the reply (P+X),
+    // echoes it (P+R+Y) or diverges inside P, each against a fresh engine.
+    procedure RunQwen35ChatPromptSnapshotResume(const ExtraArgs: array of string;
+      Ladder: boolean; Turn1Len: integer; PromptSnapshot: boolean);
     // Reply, completion count and cached ids equal.
     procedure AssertSameChatTurn(const Expected, Actual: TChatTurnRecord;
       const What: string);
@@ -343,6 +347,10 @@ type
     procedure TestQwen35ChatPrefillLadderParity;
     procedure TestQwen35ChatPrefillLadderInt8KVParity;
     procedure TestQwen35ChatPrefillLadderOpenCLParity;
+    procedure TestQwen35ChatPromptSnapshotResume;
+    procedure TestQwen35ChatPromptSnapshotLadder;
+    procedure TestQwen35ChatPromptSnapshotInt8KV;
+    procedure TestQwen35ChatPromptSnapshotOpenCL;
     procedure TestQwen35ChatPrefillTailWindowErrors;
     procedure TestQwen35BorrowedTwinBuild;
     procedure TestQwen35BorrowedTwinInferenceMemory;
@@ -10879,6 +10887,253 @@ begin
   finally
     RemoveChatModelDir(Dir);
   end;
+end;
+
+// Engine-level parity of the end-of-prompt snapshot on the tiny_qwen3_5
+// hybrid. Turn 1 feeds prompt P (Turn1Len ids) and produces reply R. The
+// second prompt then takes one of three shapes, each answered by the warm
+// engine and by a fresh engine that sees only that prompt; both must produce
+// the same reply and cached ids (tolerance 0, the snapshot contract):
+//   re-rendered: P + X with X[0] <> R[0] - PromptSnap resumes at |P|-1 and
+//     |X| tokens are prefilled (P's last id, fed as turn 1's first decode
+//     input, is not in the snapshot); with --no-prompt-snapshot nothing
+//     resumes;
+//   echo: P + R + Y - TurnSnap is deeper and wins, reused = |P + R| - 1;
+//   divergent: P changed inside, then X - full reset, reused 0.
+// With the ladder (--prefill-window 6 --prefill-tail-window 2) Turn1Len 7, 9
+// and 10 put the end of P in the window, tail and width-1 session. Prompt
+// ids are fed directly (the fixture vocab is 13 ids). Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunQwen35ChatPromptSnapshotResume(
+  const ExtraArgs: array of string; Ladder: boolean; Turn1Len: integer;
+  PromptSnapshot: boolean);
+const
+  Ctx = 40;
+  MaxNew = 3;
+  Vocab = 13;
+  WindowLen = 6;
+  TailLen = 2;
+  ExtraLen = 5;
+type
+  TSecondPrompt = (spReRendered, spEcho, spDivergent);
+const
+  CaseName: array[TSecondPrompt] of string = ('re-rendered', 'echo',
+    'divergent');
+var
+  Dir, Tag: string;
+
+  function NewEngine(): TChatEngine;
+  var
+    Opt: TChatOptions;
+    Args: TStringList;
+    ErrorMsg: string;
+    Extra: integer;
+    ParsedOK, LoadedOK: boolean;
+  begin
+    Result := TChatEngine.Create();
+    Args := TStringList.Create();
+    try
+      Args.Add(Dir);
+      Args.Add('--greedy');
+      Args.Add('--fp32');
+      Args.Add('--cpu');
+      Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
+      Args.Add('--max-new-tokens'); Args.Add(IntToStr(MaxNew));
+      if Ladder then
+      begin
+        Args.Add('--prefill-window'); Args.Add(IntToStr(WindowLen));
+        Args.Add('--prefill-tail-window'); Args.Add(IntToStr(TailLen));
+      end;
+      if not PromptSnapshot then Args.Add('--no-prompt-snapshot');
+      for Extra := 0 to High(ExtraArgs) do Args.Add(ExtraArgs[Extra]);
+      ParsedOK := ParseArgs(Args, Opt);
+      AssertTrue(Tag + 'chat options parse: ' + Opt.ErrorMsg, ParsedOK);
+      AssertEquals(Tag + '--no-prompt-snapshot parsed', not PromptSnapshot,
+        Opt.NoPromptSnapshot);
+      LoadedOK := Result.LoadModel(Opt, ErrorMsg);
+      AssertTrue(Tag + 'LoadModel: ' + ErrorMsg, LoadedOK);
+      AssertTrue(Tag + 'the fixture is a hybrid (snapshot route)',
+        Result.StateReuseOK);
+      AssertEquals(Tag + 'twins present exactly with the ladder', Ladder,
+        Assigned(Result.WindowNN) and Assigned(Result.TailNN));
+    finally
+      Args.Free;
+    end;
+  end;
+
+  procedure RunTurn(Engine: TChatEngine; const Prompt: TNeuralIntegerArray;
+    var Turn: TChatTurnRecord);
+  begin
+    AssertTrue(Tag + 'prompt fits the context', Length(Prompt) < Ctx);
+    Turn.Reply := Engine.GenerateFromIds(Prompt, Engine.Opt);
+    Turn.Completion := Engine.LastCompletionTokens;
+    Turn.Cached := Copy(Engine.CachedTokens);
+    AssertTrue(Tag + 'the width-1 session holds the state after a turn',
+      Engine.ActiveSession = Engine.Session);
+  end;
+
+  procedure AssertOnDevice(Engine: TChatEngine; const What: string);
+  begin
+    {$IFDEF OpenCL}
+    // Under --gpu the fused attention of every net must have stayed on the
+    // device; otherwise the run compares the host path with itself.
+    if Engine.Opt.Gpu then
+    begin
+      AssertAllOnDevice(Engine.NN, TNNetFusedSDPA, What + ' width-1 net');
+      if Ladder then
+      begin
+        AssertAllOnDevice(Engine.WindowNN, TNNetFusedSDPA, What + ' window net');
+        AssertAllOnDevice(Engine.TailNN, TNNetFusedSDPA, What + ' tail net');
+      end;
+    end;
+    {$ENDIF}
+  end;
+
+  procedure CheckCase(Kind: TSecondPrompt);
+  var
+    Warm, Fresh: TChatEngine;
+    Prompt1, Prompt2: TNeuralIntegerArray;
+    Turn1, Warm2, Fresh2: TChatTurnRecord;
+    Pos, FedCount, ExpectedReused: integer;
+  begin
+    Tag := CaseName[Kind] + ' (turn 1 of ' + IntToStr(Turn1Len) + '): ';
+    Warm := NewEngine();
+    Fresh := NewEngine();
+    try
+      SetLength(Prompt1, Turn1Len);
+      for Pos := 0 to Turn1Len - 1 do Prompt1[Pos] := (5 * Pos + 2) mod Vocab;
+      RunTurn(Warm, Prompt1, Turn1);
+      // Two reply tokens at least, so the cached sequence runs past P and a
+      // re-rendered X can differ from R at its first id.
+      AssertTrue(Tag + 'turn 1 produced at least two tokens',
+        Turn1.Completion >= 2);
+      FedCount := Turn1Len - 1;
+      AssertEquals(Tag + 'turn 1 reused nothing', 0, Warm.LastReusedTokens);
+      AssertEquals(Tag + 'turn 1 prefill count', FedCount,
+        Warm.LastPrefillTokens);
+      if Ladder then
+      begin
+        AssertEquals(Tag + 'turn 1 windows of 6', FedCount div WindowLen,
+          Warm.LastPrefillWindows);
+        AssertEquals(Tag + 'turn 1 tail windows of 2',
+          (FedCount mod WindowLen) div TailLen, Warm.LastPrefillTailWindows);
+      end;
+      AssertEquals(Tag + 'prompt snapshot held', PromptSnapshot,
+        Assigned(Warm.PromptSnap));
+      if PromptSnapshot then
+        AssertEquals(Tag + 'prompt snapshot position', FedCount,
+          Warm.PromptSnapPos);
+      AssertTrue(Tag + 'turn snapshot held', Assigned(Warm.TurnSnap));
+      AssertEquals(Tag + 'turn snapshot position', Length(Turn1.Cached),
+        Warm.TurnSnapPos);
+      AssertTrue(Tag + 'the cached sequence starts with P',
+        CommonPrefixLen(Turn1.Cached, Prompt1) = Turn1Len);
+      case Kind of
+        spReRendered:
+        begin
+          SetLength(Prompt2, Turn1Len + ExtraLen);
+          Move(Prompt1[0], Prompt2[0], Turn1Len * csIntegerSize);
+          for Pos := 0 to ExtraLen - 1 do
+            Prompt2[Turn1Len + Pos] := (7 * Pos + 3) mod Vocab;
+          Prompt2[Turn1Len] := (Turn1.Cached[Turn1Len] + 1) mod Vocab;
+          if PromptSnapshot then ExpectedReused := FedCount
+          else ExpectedReused := 0;
+        end;
+        spEcho:
+        begin
+          SetLength(Prompt2, Length(Turn1.Cached) + ExtraLen);
+          Move(Turn1.Cached[0], Prompt2[0], Length(Turn1.Cached) * csIntegerSize);
+          for Pos := 0 to ExtraLen - 1 do
+            Prompt2[Length(Turn1.Cached) + Pos] := (7 * Pos + 3) mod Vocab;
+          ExpectedReused := Length(Turn1.Cached);
+        end;
+        else
+        begin
+          SetLength(Prompt2, Turn1Len + ExtraLen);
+          Move(Prompt1[0], Prompt2[0], Turn1Len * csIntegerSize);
+          Prompt2[Turn1Len div 2] := (Prompt1[Turn1Len div 2] + 1) mod Vocab;
+          for Pos := 0 to ExtraLen - 1 do
+            Prompt2[Turn1Len + Pos] := (7 * Pos + 3) mod Vocab;
+          ExpectedReused := 0;
+        end;
+      end;
+      RunTurn(Warm, Prompt2, Warm2);
+      AssertEquals(Tag + 'turn 2 reused', ExpectedReused,
+        Warm.LastReusedTokens);
+      AssertEquals(Tag + 'turn 2 prefill count',
+        Length(Prompt2) - 1 - ExpectedReused, Warm.LastPrefillTokens);
+      AssertTrue(Tag + 'turn 2 produced tokens', Warm2.Completion > 0);
+      RunTurn(Fresh, Prompt2, Fresh2);
+      AssertEquals(Tag + 'the fresh engine reused nothing', 0,
+        Fresh.LastReusedTokens);
+      AssertSameChatTurn(Fresh2, Warm2, Tag + 'turn 2 vs fresh engine');
+      AssertOnDevice(Warm, Tag + 'warm');
+      AssertOnDevice(Fresh, Tag + 'fresh');
+    finally
+      Fresh.Free;
+      Warm.Free;
+    end;
+  end;
+
+var
+  Kind: TSecondPrompt;
+begin
+  RandSeed := 454545;
+  Dir := MakeQwen35ChatModelDir();
+  try
+    for Kind := Low(TSecondPrompt) to High(TSecondPrompt) do CheckCase(Kind);
+  finally
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatPromptSnapshotResume;
+var
+  Args: TStringList;
+  Opt: TChatOptions;
+begin
+  Args := TStringList.Create();
+  try
+    Args.Add('/tmp/model'); Args.Add('--no-prompt-snapshot');
+    AssertTrue('--no-prompt-snapshot parses', ParseArgs(Args, Opt));
+    AssertTrue('--no-prompt-snapshot value', Opt.NoPromptSnapshot);
+    AssertFalse('the prompt snapshot is on by default',
+      DefaultChatOptions().NoPromptSnapshot);
+  finally
+    Args.Free;
+  end;
+  // Token-by-token prefill, FP32 KV, the default parallel forward; then the
+  // opt-out, where a re-rendered reply falls back to the full reset.
+  RunQwen35ChatPromptSnapshotResume(['--kv-fp32'], false, 10, true);
+  RunQwen35ChatPromptSnapshotResume(['--kv-fp32'], false, 10, false);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatPromptSnapshotLadder;
+begin
+  // The end of P inside the width-6 window session (6 fed), the tail
+  // session (6 + 2) and the width-1 session (6 + 2 + 1).
+  RunQwen35ChatPromptSnapshotResume(['--kv-fp32'], true, 7, true);
+  RunQwen35ChatPromptSnapshotResume(['--kv-fp32'], true, 9, true);
+  RunQwen35ChatPromptSnapshotResume(['--kv-fp32'], true, 10, true);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatPromptSnapshotInt8KV;
+begin
+  // int8 KV cache: the snapshot carries the code/scale planes verbatim.
+  RunQwen35ChatPromptSnapshotResume(['--kv-int8', '--serial'], true, 9, true);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatPromptSnapshotOpenCL;
+begin
+  {$IFDEF OpenCL}
+  // The production path on a GPU, with and without the ladder; the harness
+  // asserts every TNNetFusedSDPA of every net reached the device.
+  RunQwen35ChatPromptSnapshotResume(['--int8', '--kv-int8', '--serial',
+    '--gpu'], true, 10, true);
+  RunQwen35ChatPromptSnapshotResume(['--int8', '--kv-int8', '--serial',
+    '--gpu'], false, 10, true);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
 end;
 
 procedure TTestNeuralPretrained.TestQwen35ChatPrefillLadderParity;

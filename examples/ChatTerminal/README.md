@@ -137,6 +137,7 @@ draws uniformly. `--greedy` hard-overrides everything.
 | `--stats` | per-turn timing to **stderr**. `input:` prompt tokens, `(reused K)` from the KV-cache reuse, TTFT (prefill + first token) and `prefill X tok/s`; `output:` reply tokens, their time from the end of prefill, and the steady-state decode tok/s; a per-decode-step phase split; and `total input` / `total output` lines accumulated for as long as the process runs (`cached` = prompt tokens the reuse skipped) | off |
 | `--profile` | per-layer-class forward timing to **stderr** after each turn, one `[profile] prefill:` report (one table per net that ran: the windows on the `--prefill-window` twin, the windows on the tail twin, the single steps on the main net, each under a header line with its window count) and one for the decode steps, each followed by a `[sched]` line with the layer-graph scheduler stats (graph width, parallel vs serial passes, peak in-flight) | off |
 | `--no-cache-reuse` | re-prefill the whole prompt every turn instead of reusing the shared KV-cache prefix (A/B + debugging) | reuse on |
+| `--no-prompt-snapshot` | hybrid/recurrent nets only: keep just the end-of-reply snapshot, not the end-of-prompt one (see *turn-boundary state reuse* below). Saves one copy of the KV cache in host RAM; a client that re-renders the reply then re-prefills the whole conversation | both snapshots |
 | `--prefill-window N` | prefill the prompt N tokens per forward on a width-N twin of the net (`TChatEngine.WindowNN`); the state crosses to the width-1 net with a session snapshot before the tail and the decode loop. The tail that does not fill a window is fed one token at a time — nothing is padded. The twin borrows the loaded net's weights (`BuildFromPretrained` with `pWeightOwner`: the int8/int4 tables in RAM and the resident codes on the device are shared, the checkpoint is read once, and the twin allocates no weight storage — it costs its activations). Model families outside the Llama builder (`PretrainedModelTypeCanBorrowWeights`: llama, mistral, qwen*, gemma*, phi3, olmo*, mixtral, glm4, granite*, minicpm, bitnet) fall back to a full second build — checkpoint read twice, weights held twice — and the startup notice says so. N must be 0 or at least 2, and below the context length (`--ctx`), otherwise the program stops with an error before loading | 0 (one token per forward) |
 | `--prefill-tail-window T` | width of a second, width-T twin (`TChatEngine.TailNN`) that feeds what the width-N windows leave over T tokens per forward, so at most T-1 tokens go one at a time: the prompt runs down a ladder of widths N, then T, then 1. On a 7880-token prompt with N=256 the 199-token leftover cost 199 single steps, about a fifth of the time-to-first-token; with T=16 it costs 12 tail windows and 7 single steps. The tail twin borrows the weights like the width-N twin (it costs its activations) and is not built on the full-second-build fallback. T must be below N and needs `--prefill-window` (otherwise the program stops with an error before loading); 0 picks 16 when that is below N, else a notice and no tail twin; 1 builds none | 0 (auto) |
 | `--serial` | classic in-order serial layer loop, fully single-threaded, instead of the layer-graph parallel forward that also threads large conv/linear layers internally (see below) | parallel on |
@@ -261,10 +262,34 @@ stays roughly flat instead of growing with the transcript. This is correct
 regardless of tokenizer round-tripping (the diff always finds the true
 shared prefix; `/system` and `/reset` simply diverge earlier and re-prefill
 more), and it works the same with the int8 KV cache (truncation only
-rewinds the cache length). It applies to pure-attention models only: a recurrent (SSM/Mamba/RWKV)
-state cannot be truncated by position, so those fall back to a full
-re-prefill each turn. `--no-cache-reuse` forces the full re-prefill (use
-`--stats` to compare: watch `prompt N (reused K)` and TTFT).
+rewinds the cache length). Truncation applies to pure-attention models
+only: a recurrent (SSM/Mamba/RWKV) state cannot be truncated by position.
+
+**Turn-boundary state reuse (hybrid/recurrent models).** For a net with
+recurrent layers (`qwen3_5`, mamba, ...) `TChatEngine` instead resumes the
+whole session state from a snapshot (`TNNetStreamingDecoder.SnapshotInto` /
+`RestoreSnapshot`: every attention layer's KV cache plus every recurrent
+state, bit-identical to a fresh prefill). It holds two snapshots per engine
+and resumes the deepest one the new prompt extends:
+
+- the **end-of-reply snapshot** (`TurnSnap`), taken after the decode loop
+  over prompt + reply — a chat client that sends the reply back verbatim
+  prefills only the new user turn;
+- the **end-of-prompt snapshot** (`PromptSnap`), taken after the prefill
+  and before the first decode step — a client that re-renders the assistant
+  turn through its chat template, or an agent that appends a tool
+  observation, no longer matches the generated ids, so the reply snapshot is
+  unusable; this one still resumes at the end of the previous prompt and
+  only the re-rendered reply plus the new turn is prefilled.
+
+A prompt that diverges inside the previous prompt (`/reset`, an edited
+history) resets and re-prefills everything. Each snapshot costs one copy of
+the KV cache at full context (int8 KV: about a quarter of the FP32 figure)
+plus the small recurrent state; `--no-prompt-snapshot` drops the second one.
+Under `--gpu` the end-of-prompt capture downloads the live cache rows from the
+device and the first decode step uploads them again; that time counts toward
+TTFT. `--no-cache-reuse` turns both routes off (use `--stats` to compare:
+watch `prompt N (reused K)` and TTFT).
 
 **`-p "prompt"` — one-shot mode.** With `-p` the program answers that single
 prompt and exits instead of opening the REPL: stdin is never read, so it
