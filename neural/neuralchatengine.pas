@@ -441,7 +441,9 @@ begin
   WriteLn('  --no-cache-reuse      re-prefill the whole prompt each turn (default:');
   WriteLn('                        reuse the shared KV-cache prefix from last turn)');
   WriteLn('  --prefill-window N    prefill the prompt N tokens per forward on a width-N');
-  WriteLn('                        twin of the net (default 0 = one token per forward).');
+  WriteLn('                        twin of the net (default 0 = one token per forward;');
+  WriteLn('                        N is 0 or at least 2 and below the context, else');
+  WriteLn('                        the program stops with an error before loading).');
   WriteLn('                        The twin shares the loaded weights (in RAM and on');
   WriteLn('                        the device) and the checkpoint is read once: it');
   WriteLn('                        costs its activations only. Model families outside');
@@ -455,7 +457,8 @@ begin
   WriteLn('                        most T-1 tokens go one at a time (default 0 = auto,');
   WriteLn('                        ' + IntToStr(csDefaultPrefillTailWindow) +
     ' when that is below N; 1 = no tail twin). T must be');
-  WriteLn('                        below N. Shares the weights like the width-N twin;');
+  WriteLn('                        below N and needs --prefill-window, else the program');
+  WriteLn('                        stops with an error. Shares the weights like the width-N twin;');
   WriteLn('                        not built on the full-second-build fallback');
   WriteLn('  --serial              serial layer loop (default: layer-graph parallel');
   WriteLn('                        forward across independent layers; the parallel');
@@ -1243,18 +1246,26 @@ begin
 
   // A window must leave room in the cache for at least one more token: the
   // prompt is at most CtxLen-1 tokens and the last one is never prefilled.
+  // A value the user typed that cannot be honoured is an error, not a
+  // notice: a silently ignored window costs a full model load to discover.
   if Opt.PrefillWindow >= Opt.CtxLen then
   begin
-    Notice(Format('[--prefill-window %d ignored: not below the context of' +
-      ' %d tokens]', [Opt.PrefillWindow, Opt.CtxLen]));
-    Opt.PrefillWindow := 0;
+    ErrorMsg := Format('--prefill-window %d: must be below the context of' +
+      ' %d tokens (raise it with --ctx N, or pick a smaller window)',
+      [Opt.PrefillWindow, Opt.CtxLen]);
+    FreeAndNil(Tokenizer);
+    exit;
   end;
   // The tail twin's width: below the window, or there is none (1).
   if Opt.PrefillWindow = 0 then
   begin
     if Opt.PrefillTailWindow > 1 then
-      Notice(Format('[--prefill-tail-window %d ignored: needs' +
-        ' --prefill-window]', [Opt.PrefillTailWindow]));
+    begin
+      ErrorMsg := Format('--prefill-tail-window %d: needs --prefill-window N' +
+        ' with N above it', [Opt.PrefillTailWindow]);
+      FreeAndNil(Tokenizer);
+      exit;
+    end;
     Opt.PrefillTailWindow := 1;
   end
   else if Opt.PrefillTailWindow = 0 then
@@ -1271,9 +1282,11 @@ begin
   end
   else if Opt.PrefillTailWindow >= Opt.PrefillWindow then
   begin
-    Notice(Format('[--prefill-tail-window %d ignored: not below' +
-      ' --prefill-window %d]', [Opt.PrefillTailWindow, Opt.PrefillWindow]));
-    Opt.PrefillTailWindow := 1;
+    ErrorMsg := Format('--prefill-tail-window %d: must be below' +
+      ' --prefill-window %d (1 builds no tail twin)',
+      [Opt.PrefillTailWindow, Opt.PrefillWindow]);
+    FreeAndNil(Tokenizer);
+    exit;
   end;
 
   {$IFDEF OpenCL}

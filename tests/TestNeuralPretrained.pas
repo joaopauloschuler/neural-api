@@ -343,7 +343,7 @@ type
     procedure TestQwen35ChatPrefillLadderParity;
     procedure TestQwen35ChatPrefillLadderInt8KVParity;
     procedure TestQwen35ChatPrefillLadderOpenCLParity;
-    procedure TestQwen35ChatPrefillTailWindowNotices;
+    procedure TestQwen35ChatPrefillTailWindowErrors;
     procedure TestQwen35BorrowedTwinBuild;
     procedure TestQwen35BorrowedTwinInferenceMemory;
     procedure TestLlamaBorrowedTwinInt4Parity;
@@ -10927,7 +10927,7 @@ end;
 // notice (no tail twin, LastPrefillTailWindows stays 0), the default 16 is
 // not below a window of 4 so auto builds none and says so, and T without
 // --prefill-window is ignored with a notice. Coded by Claude (AI).
-procedure TTestNeuralPretrained.TestQwen35ChatPrefillTailWindowNotices;
+procedure TTestNeuralPretrained.TestQwen35ChatPrefillTailWindowErrors;
 const
   Ctx = 16;
   PromptLen = 7;
@@ -10937,12 +10937,16 @@ var
   Prompt: TNeuralIntegerArray;
   TokenPos: integer;
 
-  function RunEngine(const WindowArgs: array of string): TChatEngine;
+  // Parses and loads with the given window flags. ExpectError = '' means the
+  // load must succeed; otherwise the load must fail and the message must
+  // contain ExpectError (the engine is still returned, unloaded).
+  function RunEngine(const WindowArgs: array of string;
+    const ExpectError: string = ''): TChatEngine;
   var
     Args: TStringList;
     Opt: TChatOptions;
     ArgPos: integer;
-    ParsedOK: boolean;
+    ParsedOK, LoadedOK: boolean;
   begin
     Result := TChatEngine.Create();
     Args := TStringList.Create();
@@ -10957,8 +10961,19 @@ var
       AssertTrue('chat options parse: ' + Opt.ErrorMsg, ParsedOK);
       FNotices := '';
       Result.OnNotice := @CaptureNotice;
-      AssertTrue('LoadModel: ' + ErrorMsg, Result.LoadModel(Opt, ErrorMsg));
-      Result.GenerateFromIds(Prompt, Result.Opt);
+      ErrorMsg := '';
+      LoadedOK := Result.LoadModel(Opt, ErrorMsg);
+      if ExpectError = '' then
+      begin
+        AssertTrue('LoadModel: ' + ErrorMsg, LoadedOK);
+        Result.GenerateFromIds(Prompt, Result.Opt);
+      end
+      else
+      begin
+        AssertFalse('LoadModel must refuse: ' + ExpectError, LoadedOK);
+        AssertTrue('error names the cause (' + ErrorMsg + ')',
+          Pos(ExpectError, ErrorMsg) > 0);
+      end;
     finally
       Args.Free;
     end;
@@ -10973,19 +10988,18 @@ begin
   for TokenPos := 0 to PromptLen - 1 do
     Prompt[TokenPos] := (5 * TokenPos + 2) mod Vocab;
   try
-    Engine := RunEngine(['--prefill-window', '4', '--prefill-tail-window', '4']);
-    try
-      AssertTrue('T = N is ignored with a notice',
-        Pos('[--prefill-tail-window 4 ignored: not below --prefill-window 4]',
-          FNotices) > 0);
-      AssertTrue('no tail twin', Engine.TailNN = nil);
-      AssertTrue('no tail session', Engine.TailSession = nil);
-      AssertEquals('resolved to no tail twin', 1, Engine.Opt.PrefillTailWindow);
-      AssertEquals('the width-4 twin still ran', 1, Engine.LastPrefillWindows);
-      AssertEquals('no tail windows', 0, Engine.LastPrefillTailWindows);
-    finally
-      Engine.Free;
-    end;
+    // A user-given value that cannot be honoured stops the load.
+    Engine := RunEngine(['--prefill-window', '4', '--prefill-tail-window', '4'],
+      '--prefill-tail-window 4: must be below --prefill-window 4');
+    Engine.Free;
+    Engine := RunEngine(['--prefill-tail-window', '2'],
+      '--prefill-tail-window 2: needs --prefill-window');
+    Engine.Free;
+    Engine := RunEngine(['--prefill-window', IntToStr(Ctx)],
+      Format('--prefill-window %d: must be below the context of %d',
+        [Ctx, Ctx]));
+    Engine.Free;
+    // A width the engine derived on its own is a notice, not an error.
     Engine := RunEngine(['--prefill-window', '4']);
     try
       AssertTrue('auto below a window of 4 builds no tail twin',
@@ -10993,16 +11007,16 @@ begin
       AssertTrue('no tail twin (auto)', Engine.TailNN = nil);
       AssertEquals('resolved to no tail twin (auto)', 1,
         Engine.Opt.PrefillTailWindow);
+      AssertEquals('the width-4 twin still ran', 1, Engine.LastPrefillWindows);
+      AssertEquals('no tail windows', 0, Engine.LastPrefillTailWindows);
     finally
       Engine.Free;
     end;
-    Engine := RunEngine(['--prefill-tail-window', '2']);
+    // 1 is the explicit "no tail twin" and is always accepted.
+    Engine := RunEngine(['--prefill-window', '4', '--prefill-tail-window', '1']);
     try
-      AssertTrue('T without a window is ignored with a notice',
-        Pos('[--prefill-tail-window 2 ignored: needs --prefill-window]',
-          FNotices) > 0);
-      AssertTrue('no twin', Engine.WindowNN = nil);
-      AssertTrue('no tail twin (no window)', Engine.TailNN = nil);
+      AssertTrue('no tail twin (explicit 1)', Engine.TailNN = nil);
+      AssertEquals('the width-4 twin ran', 1, Engine.LastPrefillWindows);
     finally
       Engine.Free;
     end;
@@ -11099,7 +11113,12 @@ var
       Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
       Args.Add('--max-new-tokens'); Args.Add('2');
       Args.Add('--prefill-window'); Args.Add(IntToStr(WindowLen));
-      Args.Add('--prefill-tail-window'); Args.Add('2');
+      // A tail width without a window is a load error, so only the windowed
+      // run asks for one.
+      if WindowLen > 0 then
+      begin
+        Args.Add('--prefill-tail-window'); Args.Add('2');
+      end;
       AssertTrue('chat options parse', ParseArgs(Args, Opt));
       FNotices := '';
       Result.OnNotice := @CaptureNotice;
