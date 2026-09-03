@@ -453,6 +453,13 @@ type
       FDepartingBranchesCnt: integer;
       FBackPropCallCurrentCnt: integer;
       FLinkedNeurons: boolean;
+      // Weight borrowing (LinkWeightsFrom): a borrower reads FWeightOwner's
+      // neurons (and, per class, its quantized tables and resident device
+      // codes) at its own input width, in any net. The owner lists its
+      // borrowers (nil until one links) and detaches them when it is freed,
+      // so either side may be destroyed first. Coded by Claude (AI).
+      FWeightOwner: TNNetLayer;
+      FWeightBorrowers: TList;
       FCanNormalizeDelta: boolean;
       FCanSetNumWeightsForAllNeurons: boolean;
       // When False, SetNumWeightsForAllNeurons skips allocating the per-neuron
@@ -558,6 +565,18 @@ type
       // no-op: layers whose ComputeRange reads FPrevLayer.Output directly
       // (FullConnect) need nothing. Coded by Claude (AI).
       procedure PrepareChunkedForward(); virtual;
+      // The neuron-list half of LinkWeightsFrom: frees this layer's neurons,
+      // points FNeurons at Owner's, registers the link. False (nothing
+      // changed) when Owner is not a same-class, same-count, unlinked layer.
+      function LinkNeuronsFrom(Owner: TNNetLayer): boolean;
+      // Called by the owner as it is destroyed: replaces every borrowed
+      // reference with empty storage this layer owns. The layer must not
+      // compute afterwards. Descendants that alias more than the neuron list
+      // extend it. Coded by Claude (AI).
+      procedure DetachFromWeightOwner(); virtual;
+      // Detaches every borrower of this layer (idempotent); descendants call
+      // it BEFORE freeing anything a borrower aliases.
+      procedure UnlinkWeightBorrowers();
     public
       // Fast (array) mirror of the FNeurons list: same TNNetNeuron references,
       // indexed directly without the TNNetNeuronList method/bounds overhead.
@@ -835,6 +854,13 @@ type
       // overrides" implementation block for auditability. Coded by Claude (AI).
       procedure AppendInputLayers(pList: TList); virtual;
 
+      // Computes with Owner's weights (neurons, and per class its quantized
+      // tables and resident device codes) at this layer's own input width, in
+      // any net; inference-only afterwards. Order: Owner's weight state final,
+      // this layer attached (SetPrevLayer), OpenCL enabled AFTER the link
+      // (EnableOpenCLInContextOf). False when Owner is unsuitable. Coded by Claude (AI).
+      function LinkWeightsFrom(Owner: TNNetLayer): boolean; virtual;
+
       // Low-memory inference predicates (Coded by Claude (AI)):
       // SupportsLowMemory is True only for layer classes that implement a
       // per-neuron CPU forward path (default False = safe). WillOpenCL
@@ -872,6 +898,9 @@ type
       property ForwardGPUCnt: integer read FForwardGPUCnt write FForwardGPUCnt;
       property ForwardCPUCnt: integer read FForwardCPUCnt write FForwardCPUCnt;
       property LinkedNeurons: boolean read FLinkedNeurons;
+      // The layer whose weights this one borrows (nil: none, or the owner is
+      // already gone).
+      property WeightOwner: TNNetLayer read FWeightOwner;
       {$IFDEF OpenCL}
       property HasOpenCL: boolean read FHasOpenCL;
       property ShouldOpenCL:boolean read FShouldOpenCL;
@@ -929,6 +958,9 @@ type
       // Rows written since BeginInt4QuantImport; EndInt4QuantImport checks it
       // against FNeurons.Count before it commits the conversion.
       FQuantInt4ImportedRows: integer;
+      // True while FQuantTable and FQuantTableInt4 are FWeightOwner's objects
+      // (LinkWeightsFrom): never freed, requantized or uploaded here.
+      FLinkedWeightTables: boolean;
       // Int8 copy of the forward input (Int8InputSource), nil until
       // EnableInt8Input sizes it: most layers never run an int8 input.
       FInputCopyInt8: TNNetVolumeQuant8;
@@ -947,12 +979,26 @@ type
       // Commits the int4 weight state once FQuantTableInt4 holds every row:
       // int8 table and FP32 rows dropped, caches shrunk, int8 input armed.
       procedure FinishInt4WeightConversion(); virtual;
+      // Arms the int4 planes of the int8 input copy after the layer went int4
+      // (own conversion or link); only the convolution has such planes.
+      procedure ArmInt4InputPlanes(); virtual;
+      procedure DetachFromWeightOwner(); override;
+      {$IFDEF OpenCL}
+      // Arms FDotCL from the owner's resident codes (retained, not copied);
+      // False when the owner is unarmed or in another context.
+      function BorrowOwnerOpenCLCodes(VBs: TNNetVolume): boolean;
+      {$ENDIF}
       procedure AfterWeightUpdate(); override;
       procedure BuildBiasOutput(); {$IFDEF Release} inline; {$ENDIF}
     public
       constructor Create(); override;
       destructor Destroy(); override;
       procedure RefreshNeuronWeightList();
+      // Neurons plus, when Owner is int8/int4, its tables by reference (this
+      // layer's own rows and tables are freed); a later EnableOpenCL then
+      // retains Owner's resident codes. Needs SetPrevLayer and an owner row
+      // width equal to this layer's FVectorSize. Coded by Claude (AI).
+      function LinkWeightsFrom(Owner: TNNetLayer): boolean; override;
       // Converts the FP32 weights to per-output-channel symmetric int8
       // (scale = max|row|/127, round-to-nearest) and frees the FP32 weight
       // storage. INFERENCE-ONLY afterwards: Backpropagate raises. No-op on
@@ -1057,6 +1103,10 @@ type
       procedure PrepareInt4DotCL(VBs: TNNetVolume);
       // True when this layer runs its int8 forward with the FP16 B operand.
       property FP16Active: boolean read FFP16Active;
+      // Test hooks: the resident weight codes FDotCL holds (nil when unarmed)
+      // and whether they are a retained reference to the owner's buffer.
+      function OpenCLCodesBuffer(): cl_mem;
+      function OpenCLCodesBorrowed(): boolean;
       {$ENDIF}
   end;
 
@@ -5302,9 +5352,19 @@ type
     procedure Gather(W: TNNetVolume; QuantTable: TNNetVolumeQuant8;
       const TokenRows: array of integer; Y: TNNetVolume;
       NumTokens, EmbeddingSize, VocabSize: integer);
+    // Uploads the table now when it is not resident yet (Gather does it
+    // lazily), so a borrower can retain it before its first forward.
+    procedure EnsureTableResident(W: TNNetVolume; QuantTable: TNNetVolumeQuant8;
+      VocabSize, EmbeddingSize: integer);
+    // Retains Owner's resident table (same entry point, same context) in place
+    // of uploading one; False when it cannot. Owner's blocking upload is
+    // complete before this returns, whatever queue Gather rides.
+    function BorrowTableFrom(Owner: TNNetEmbeddingCL): boolean;
     // Which entry point this helper bound: the owning layer rebuilds it when its
     // own quantization state no longer matches.
     property Int8: boolean read FInt8;
+    // The resident vocab table (nil until uploaded or borrowed): test hook.
+    property TableBuffer: cl_mem read FBufW;
     // FBufY and the queue that owns its contents - what a layer running Gather
     // answers OpenCLOutputBuffer/OpenCLOutputKernel with.
     function OutputBuffer(): cl_mem;
@@ -7908,16 +7968,35 @@ type
     // table's memory AND per-token bandwidth to ~1/4. Backpropagate raises.
     FQuantInt8: boolean;
     FQuantTable: TNNetVolumeQuant8;
+    // True while FQuantTable is FWeightOwner's object (LinkWeightsFrom).
+    FLinkedQuantTable: boolean;
     {$IFDEF OpenCL}
     FTokenRows: array of integer;
     FEmbeddingCL: TNNetEmbeddingCL;
     procedure ComputeOpenCL();
     // Creates FEmbeddingCL, or rebuilds it when a quantize/dequantize flip left
     // it bound to the wrong neural.cl entry point. No-op without FHasOpenCL.
+    // A borrower then retains its owner's resident table.
     procedure ArmEmbeddingCL();
+    // Points FEmbeddingCL at the owner's resident table; the owner uploads it
+    // now if it has not yet. No-op unless linked and both are OpenCL-armed.
+    procedure BorrowOwnerOpenCLTable();
     {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+  protected
+    procedure DetachFromWeightOwner(); override;
   public
+    // Neurons plus, when Owner is int8, its vocab table by reference; the
+    // gather then reads the owner's codes, and a later EnableOpenCL retains
+    // the owner's resident table. Coded by Claude (AI).
+    function LinkWeightsFrom(Owner: TNNetLayer): boolean; override;
+    {$IFDEF OpenCL}
+    // Uploads the vocab table now (the device gather otherwise does it lazily
+    // on the first forward); no-op unless OpenCL-armed.
+    procedure EnsureOpenCLTableResident();
+    // Test hook: the resident vocab table (nil until uploaded or borrowed).
+    function OpenCLTableBuffer(): cl_mem;
+    {$ENDIF}
     // pTrainable=false skips the training-only Delta/BackInertia volumes
     // (2x the vocab table) that the default-trainable sizing allocates in
     // the constructor - a later SetTrainable(true) restores them (see
@@ -14629,6 +14708,7 @@ type
       // per-forward int8 routines never allocate. Coded by Claude (AI).
       procedure EnableInt8Input(); override;
       procedure DisableInt8Input(); override;
+      procedure ArmInt4InputPlanes(); override;
       // Byte im2col: FInputCopyInt8 -> FInputPreparedInt8 in exactly the layout
       // of PrepareInputForConvolutionFast. Needs EnableInt8Input. Coded by Claude (AI).
       procedure PrepareInputForConvolutionInt8();
@@ -14871,7 +14951,6 @@ type
       FLinkedLayer: TNNetConvolution;
     public
       constructor Create(LinkedLayer: TNNetLayer); overload; virtual;
-      destructor Destroy; override;
       // Shared-weight convolutions depend on FConcatedWeights (snapshotted or
       // rebuilt per forward), so they cannot drop it for low-memory mode.
       function SupportsLowMemory(): boolean; override;
@@ -17750,6 +17829,11 @@ type
       // Coded by Claude (AI).
       FOpenCLFP16: boolean;
       FDotProductKernel: TNeuralKernel;
+      // Retained references to the context and program FDotProductKernel
+      // borrows under EnableOpenCLInContextOf; nil when this net compiled its
+      // own. Released after FDotProductKernel goes.
+      FBorrowedOpenCLContext: cl_context;
+      FBorrowedOpenCLProgram: cl_program;
       // Net-wide cache of borrowed-program helper kernels, one TNeuralKernel per
       // distinct neural.cl entry point (cai_token_norm, cai_group_norm, ...),
       // SHARED by every layer of that type instead of one handle per layer
@@ -19577,6 +19661,10 @@ type
       // how many. Run it after the net is built and after QuantizeWeightsInt8 -
       // a layer still holding FP32 weights is skipped. Coded by Claude (AI).
       function EnableInt8Input(): integer;
+      // Links every weight-bearing layer to the same-index layer of Owner
+      // (TNNetLayer.LinkWeightsFrom; same architecture at another input width).
+      // Owner's weight state final, before EnableOpenCL; returns the count. Coded by Claude (AI).
+      function LinkWeightsFrom(Owner: TNNet): integer;
       // Returns every layer to the FP32 input path. Coded by Claude (AI).
       procedure DisableInt8Input();
       {$IFDEF OpenCL}
@@ -19694,6 +19782,14 @@ type
       {$IFDEF OpenCL}
       procedure DisableOpenCL();
       procedure EnableOpenCL(platform_id: cl_platform_id; device_id: cl_device_id; pHasSharedKernel:boolean = true);
+      // EnableOpenCL inside Owner's armed context/program (own command queue),
+      // so layers linked to Owner's retain its resident weights instead of
+      // uploading a copy. Owner first; either net may be freed first. Coded by Claude (AI).
+      procedure EnableOpenCLInContextOf(Owner: TNNet;
+        pHasSharedKernel: boolean = true);
+      // Drops the retained context/program of EnableOpenCLInContextOf (no-op
+      // otherwise); DisableOpenCL and Destroy call it after the root kernel.
+      procedure ReleaseBorrowedOpenCLContext();
       // Returns the one net-wide helper kernel bound to the given neural.cl entry
       // point, building it lazily against FDotProductKernel's already-compiled
       // program on first request and caching it. Layers' *CL helpers borrow this
@@ -38942,14 +39038,7 @@ begin
   // The weight table is constant across forwards (until a weight update fires
   // InvalidateWeightCache), so upload it once and keep it resident. Only the
   // tiny per-token row list and the output volume move each call.
-  if not FWeightCached then
-  begin
-    if FInt8
-      then UploadInt8Table(FBufW, FCapW, FBufScales, FCapScales,
-             QuantTable.DataPtr, QuantTable.ScalePtr, VocabSize, EmbeddingSize)
-      else FKernel.EnsureWriteBuffer(FBufW, FCapW, W, {DoWrite}true);
-    FWeightCached := true;
-  end;
+  EnsureTableResident(W, QuantTable, VocabSize, EmbeddingSize);
   // Upload the host-resolved per-token source rows; allocate the device result.
   // (bufRows is a raw byte buffer from a host int array, not a volume; use the
   // byte-size EnsureBuffer overload then write it explicitly.)
@@ -38969,6 +39058,44 @@ begin
   // a consumer orders itself with OpenCLWaitOutputIfAnotherQueue. Buffers are
   // persistent (FBuf*), reused next forward - not released here.
   FKernel.RunKernel(k, NumTokens * EmbeddingSize);
+end;
+
+procedure TNNetEmbeddingCL.EnsureTableResident(W: TNNetVolume;
+  QuantTable: TNNetVolumeQuant8; VocabSize, EmbeddingSize: integer);
+begin
+  if FWeightCached then exit;
+  if FInt8
+    then UploadInt8Table(FBufW, FCapW, FBufScales, FCapScales,
+           QuantTable.DataPtr, QuantTable.ScalePtr, VocabSize, EmbeddingSize)
+    else FKernel.EnsureWriteBuffer(FBufW, FCapW, W, {DoWrite}true);
+  FWeightCached := true;
+end;
+
+// After a borrow, an InvalidateWeightCache on this helper makes the next
+// Gather rewrite the shared buffer with the same table (both layers read one
+// host table), which is harmless; the layer re-borrows after its weight hook
+// so that path is not normally taken. Coded by Claude (AI).
+function TNNetEmbeddingCL.BorrowTableFrom(Owner: TNNetEmbeddingCL): boolean;
+begin
+  Result := false;
+  if (not Assigned(Owner)) or (Owner = Self) then exit;
+  if (Owner.FInt8 <> FInt8) or (not Owner.FWeightCached) then exit;
+  if Owner.FKernel.Context <> FKernel.Context then exit;
+  if Assigned(FBufW) then clReleaseMemObject(FBufW);
+  if Assigned(FBufScales) then clReleaseMemObject(FBufScales);
+  FBufScales := nil;
+  FCapScales := 0;
+  clRetainMemObject(Owner.FBufW);
+  FBufW := Owner.FBufW;
+  FCapW := Owner.FCapW;
+  if Assigned(Owner.FBufScales) then
+  begin
+    clRetainMemObject(Owner.FBufScales);
+    FBufScales := Owner.FBufScales;
+    FCapScales := Owner.FCapScales;
+  end;
+  FWeightCached := true;
+  Result := true;
 end;
 
 function TNNetEmbeddingCL.OutputBuffer(): cl_mem;
@@ -54424,13 +54551,6 @@ begin
   FNeurons := LinkedLayer.FNeurons;
   FLinkedNeurons := true;
   FCanNormalizeDelta := false;
-end;
-
-destructor TNNetConvolutionSharedWeights.Destroy;
-begin
-  // recreate a new neural list to allow the destroy to work.
-  FNeurons := TNNetNeuronList.Create();
-  inherited Destroy;
 end;
 
 function TNNetConvolutionSharedWeights.SupportsLowMemory(): boolean;
@@ -78689,7 +78809,94 @@ end;
 function TNNetLayerConcatedWeights.Int8QuantizedSizeBytes(): int64;
 begin
   // Both containers: the empty one reports 0, and a layer holds at most one.
+  // Borrowed tables are the owner's bytes.
+  if FLinkedWeightTables then exit(0);
   Result := FQuantTable.GetMemSize() + FQuantTableInt4.GetMemSize();
+end;
+
+function TNNetLayerConcatedWeights.LinkWeightsFrom(Owner: TNNetLayer): boolean;
+var
+  OwnerCW: TNNetLayerConcatedWeights;
+  OwnerQuantized: boolean;
+begin
+  Result := false;
+  if (not Assigned(Owner)) or (Owner.ClassType <> Self.ClassType) then
+  begin
+    FErrorProc(ClassName + '.LinkWeightsFrom: owner must be a layer of the ' +
+      'same class.');
+    exit;
+  end;
+  OwnerCW := TNNetLayerConcatedWeights(Owner);
+  OwnerQuantized := OwnerCW.FQuantInt8 or OwnerCW.FQuantInt4;
+  if OwnerQuantized and (OwnerCW.FQuantVectorSize <> FVectorSize) then
+  begin
+    FErrorProc(ClassName + '.LinkWeightsFrom: owner rows have ' +
+      IntToStr(OwnerCW.FQuantVectorSize) + ' weights, this layer expects ' +
+      IntToStr(FVectorSize) + ' (call SetPrevLayer first).');
+    exit;
+  end;
+  if (FQuantInt8 or FQuantInt4) and (not OwnerQuantized) then
+  begin
+    FErrorProc(ClassName + '.LinkWeightsFrom: this layer is quantized but ' +
+      'the owner holds FP32 rows.');
+    exit;
+  end;
+  {$IFDEF OpenCL}
+  if FHasOpenCL then
+  begin
+    FErrorProc(ClassName + '.LinkWeightsFrom: link before EnableOpenCL - the ' +
+      'device already holds this layer''s own weights.');
+    exit;
+  end;
+  {$ENDIF}
+  // An own int4 state left an int8 input copy behind that an int8 owner does
+  // not use; it comes back below when the owner is int4.
+  if OwnerCW.FQuantInt8 and FQuantInt4 then DisableInt8Input();
+  if not LinkNeuronsFrom(Owner) then exit;
+  // The weight list pointed at the rows LinkNeuronsFrom just freed.
+  RefreshNeuronWeightList();
+  if OwnerQuantized then
+  begin
+    FQuantTable.Free;
+    FQuantTableInt4.Free;
+    FQuantTable := OwnerCW.FQuantTable;
+    FQuantTableInt4 := OwnerCW.FQuantTableInt4;
+    FLinkedWeightTables := true;
+    FQuantInt8 := OwnerCW.FQuantInt8;
+    FQuantInt4 := OwnerCW.FQuantInt4;
+    FQuantVectorSize := OwnerCW.FQuantVectorSize;
+    FQuantWSizeX := OwnerCW.FQuantWSizeX;
+    FQuantWSizeY := OwnerCW.FQuantWSizeY;
+    FQuantWSizeD := OwnerCW.FQuantWSizeD;
+    FConcatedWeights.ReSize(1, 1, 1);
+    FConcatedWInter.ReSize(1, 1, 1);
+    if FQuantInt4 then
+    begin
+      EnableInt8Input();
+      ArmInt4InputPlanes();
+    end;
+  end;
+  // FP32 owner: this layer keeps its own concatenated caches, rebuilt from
+  // the shared rows here (only the rows themselves are shared).
+  AfterWeightUpdate();
+  Result := true;
+end;
+
+procedure TNNetLayerConcatedWeights.ArmInt4InputPlanes();
+begin
+end;
+
+procedure TNNetLayerConcatedWeights.DetachFromWeightOwner();
+begin
+  if not Assigned(FWeightOwner) then exit;
+  inherited DetachFromWeightOwner();
+  if FLinkedWeightTables then
+  begin
+    FQuantTable := TNNetVolumeQuant8.Create();
+    FQuantTableInt4 := TNNetVolumeQuant4.Create();
+    FLinkedWeightTables := false;
+  end;
+  RefreshNeuronWeightList();
 end;
 
 function TNNetLayerConcatedWeights.CountWeights(): int64;
@@ -78780,11 +78987,16 @@ end;
 
 destructor TNNetLayerConcatedWeights.Destroy();
 begin
+  // Borrowers alias the tables freed below, so they are detached first.
+  UnlinkWeightBorrowers();
   // Virtual: a convolution frees its int8 im2col buffer here too.
   DisableInt8Input();
   FBiasOutput.Free;
-  FQuantTable.Free;
-  FQuantTableInt4.Free;
+  if not FLinkedWeightTables then
+  begin
+    FQuantTable.Free;
+    FQuantTableInt4.Free;
+  end;
   FConcatedWeights.Free;
   FNeuronWeightList.Free;
   FConcatedWInter.Free;
@@ -78967,6 +79179,7 @@ begin
   NumAs := FNeurons.Count;
   if (not Assigned(FDotCL)) or (NumAs = 0) or (FQuantVectorSize = 0) or
     (VBs.Size = 0) then exit;
+  if BorrowOwnerOpenCLCodes(VBs) then exit;
   CodesPtr := FQuantTable.DataPtr;   // #13: one base pointer for the transpose
   SetLength(Inter, NumAs * FQuantVectorSize);
   VSizeM1 := FQuantVectorSize - 1;
@@ -79009,6 +79222,7 @@ begin
   NumAs := FNeurons.Count;
   if (not Assigned(FDotCL)) or (NumAs = 0) or (FQuantVectorSize = 0) or
     (VBs.Size = 0) or (FQuantTableInt4.Depth <> FQuantVectorSize) then exit;
+  if BorrowOwnerOpenCLCodes(VBs) then exit;
   MaxBlockPos := FQuantTableInt4.BlocksPerRow - 1;
   SetLength(PackedCodes, NumAs * FQuantTableInt4.PackedRowBytes);
   SetLength(BlockScales, NumAs * FQuantTableInt4.BlocksPerRow);
@@ -79037,6 +79251,37 @@ begin
   end;
   FDotCL.PrepareForComputeInt4(@PackedCodes[0], @BlockScales[0], NumAs,
     FQuantVectorSize, VBs);
+end;
+
+// A borrower that cannot borrow (owner not OpenCL-armed yet, or armed in
+// another context - EnableOpenCLInContextOf is the route that shares one)
+// reports it and uploads its own copy: correct, but the duplication the link
+// exists to remove. Coded by Claude (AI).
+function TNNetLayerConcatedWeights.BorrowOwnerOpenCLCodes(
+  VBs: TNNetVolume): boolean;
+var
+  OwnerCW: TNNetLayerConcatedWeights;
+begin
+  Result := false;
+  if not (FLinkedWeightTables and Assigned(FWeightOwner)) then exit;
+  OwnerCW := TNNetLayerConcatedWeights(FWeightOwner);
+  if Assigned(OwnerCW.FDotCL) then
+    Result := FDotCL.PrepareForComputeBorrowingCodes(OwnerCW.FDotCL, VBs,
+      FFP16Active);
+  if not Result then
+    FErrorProc(ClassName + '.PrepareInt8DotCL: layer ' + IntToStr(FLayerIdx) +
+      ' could not borrow its owner''s resident codes (owner not armed, or ' +
+      'another OpenCL context) - uploading a second copy.');
+end;
+
+function TNNetLayerConcatedWeights.OpenCLCodesBuffer(): cl_mem;
+begin
+  if Assigned(FDotCL) then Result := FDotCL.CodesBuffer else Result := nil;
+end;
+
+function TNNetLayerConcatedWeights.OpenCLCodesBorrowed(): boolean;
+begin
+  Result := Assigned(FDotCL) and FDotCL.CodesBorrowed;
 end;
 {$ENDIF}
 
@@ -105753,7 +105998,12 @@ end;
 procedure TNNetConvolution.FinishInt4WeightConversion();
 begin
   inherited FinishInt4WeightConversion();
-  if FQuantInt4 and Assigned(FInputPreparedInt8) and
+  if FQuantInt4 then ArmInt4InputPlanes();
+end;
+
+procedure TNNetConvolutionBase.ArmInt4InputPlanes();
+begin
+  if Assigned(FInputPreparedInt8) and
     (not FInputPreparedInt8.HasInt4InputPlanes) then
     FInputPreparedInt8.EnableInt4InputPlanes();
 end;
@@ -108797,7 +109047,9 @@ end;
 
 destructor TNNetEmbedding.Destroy;
 begin
-  FQuantTable.Free;
+  // Borrowers alias the table freed below, so they are detached first.
+  UnlinkWeightBorrowers();
+  if not FLinkedQuantTable then FQuantTable.Free;
   SetLength(FInputTokens, 0);
   {$IFDEF OpenCL}
   SetLength(FTokenRows, 0);
@@ -108833,6 +109085,35 @@ begin
   end;
   if not Assigned(FEmbeddingCL) then
     FEmbeddingCL := TNNetEmbeddingCL.Create(FNN, FQuantInt8);
+  BorrowOwnerOpenCLTable();
+end;
+
+procedure TNNetEmbedding.BorrowOwnerOpenCLTable();
+var
+  OwnerEmbedding: TNNetEmbedding;
+begin
+  if (not Assigned(FWeightOwner)) or (not Assigned(FEmbeddingCL)) then exit;
+  OwnerEmbedding := TNNetEmbedding(FWeightOwner);
+  if not Assigned(OwnerEmbedding.FEmbeddingCL) then exit;
+  OwnerEmbedding.EnsureOpenCLTableResident();
+  if not FEmbeddingCL.BorrowTableFrom(OwnerEmbedding.FEmbeddingCL) then
+    FErrorProc('TNNetEmbedding.BorrowOwnerOpenCLTable: layer ' +
+      IntToStr(FLayerIdx) + ' could not borrow its owner''s resident vocab ' +
+      'table (another OpenCL context, or a quantization mismatch) - ' +
+      'uploading a second copy.');
+end;
+
+procedure TNNetEmbedding.EnsureOpenCLTableResident();
+begin
+  if not Assigned(FEmbeddingCL) then exit;
+  FEmbeddingCL.EnsureTableResident(FNeurons[0].Weights, FQuantTable,
+    FVocabSize, FEmbeddingSize);
+end;
+
+function TNNetEmbedding.OpenCLTableBuffer(): cl_mem;
+begin
+  if Assigned(FEmbeddingCL) then Result := FEmbeddingCL.TableBuffer
+  else Result := nil;
 end;
 
 // Three routes in, and two blocks. FShouldOpenCL is pinned False here (the
@@ -108874,6 +109155,8 @@ begin
   // they change which entry point the gather needs.
   ArmEmbeddingCL();
   if Assigned(FEmbeddingCL) then FEmbeddingCL.InvalidateWeightCache();
+  // A borrower's table is the owner's buffer: re-borrow rather than re-upload.
+  BorrowOwnerOpenCLTable();
 end;
 
 // Device token-gather forward faithful to the scalar Compute() below. The
@@ -109022,7 +109305,66 @@ end;
 
 function TNNetEmbedding.Int8QuantizedSizeBytes(): int64;
 begin
+  // A borrowed table is the owner's bytes.
+  if FLinkedQuantTable then exit(0);
   Result := FQuantTable.GetMemSize();
+end;
+
+function TNNetEmbedding.LinkWeightsFrom(Owner: TNNetLayer): boolean;
+var
+  OwnerEmbedding: TNNetEmbedding;
+begin
+  Result := false;
+  if (not Assigned(Owner)) or (Owner.ClassType <> Self.ClassType) then
+  begin
+    FErrorProc('TNNetEmbedding.LinkWeightsFrom: owner must be a layer of the ' +
+      'same class.');
+    exit;
+  end;
+  OwnerEmbedding := TNNetEmbedding(Owner);
+  if (OwnerEmbedding.FVocabSize <> FVocabSize) or
+    (OwnerEmbedding.FEmbeddingSize <> FEmbeddingSize) then
+  begin
+    FErrorProc('TNNetEmbedding.LinkWeightsFrom: owner table is ' +
+      IntToStr(OwnerEmbedding.FVocabSize) + 'x' +
+      IntToStr(OwnerEmbedding.FEmbeddingSize) + ', this layer''s is ' +
+      IntToStr(FVocabSize) + 'x' + IntToStr(FEmbeddingSize) + '.');
+    exit;
+  end;
+  {$IFDEF OpenCL}
+  if FHasOpenCL then
+  begin
+    FErrorProc('TNNetEmbedding.LinkWeightsFrom: link before EnableOpenCL.');
+    exit;
+  end;
+  {$ENDIF}
+  if not LinkNeuronsFrom(Owner) then exit;
+  if OwnerEmbedding.FQuantInt8 then
+  begin
+    FQuantTable.Free;
+    FQuantTable := OwnerEmbedding.FQuantTable;
+    FLinkedQuantTable := true;
+    FQuantInt8 := true;
+  end
+  else if FQuantInt8 then
+  begin
+    // FP32 owner rows replace this layer's own int8 table.
+    FQuantTable.ReSize(0, 0, 0);
+    FQuantInt8 := false;
+  end;
+  AfterWeightUpdate();
+  Result := true;
+end;
+
+procedure TNNetEmbedding.DetachFromWeightOwner();
+begin
+  if not Assigned(FWeightOwner) then exit;
+  inherited DetachFromWeightOwner();
+  if FLinkedQuantTable then
+  begin
+    FQuantTable := TNNetVolumeQuant8.Create();
+    FLinkedQuantTable := false;
+  end;
 end;
 
 function TNNetEmbedding.CountWeights(): int64;
@@ -109664,6 +110006,7 @@ begin
     FSharedKernels.Free;
   end;
   if FDotProductKernel <> nil then FDotProductKernel.Free;
+  ReleaseBorrowedOpenCLContext();
   // The list tracks helper objects it does not own; FLayers freed them above.
   if Assigned(FOpenCLOwned) then FOpenCLOwned.Free;
   {$ENDIF}
@@ -131805,6 +132148,50 @@ begin
     FreeAndNil(FSharedKernels);
   end;
   if Assigned(FDotProductKernel) then FreeAndNil(FDotProductKernel);
+  ReleaseBorrowedOpenCLContext();
+end;
+
+procedure TNNet.ReleaseBorrowedOpenCLContext();
+begin
+  if Assigned(FBorrowedOpenCLProgram) then clReleaseProgram(FBorrowedOpenCLProgram);
+  if Assigned(FBorrowedOpenCLContext) then clReleaseContext(FBorrowedOpenCLContext);
+  FBorrowedOpenCLProgram := nil;
+  FBorrowedOpenCLContext := nil;
+end;
+
+procedure TNNet.EnableOpenCLInContextOf(Owner: TNNet;
+  pHasSharedKernel: boolean = true);
+var
+  LayerCnt: integer;
+  LastLayerIdx: integer;
+begin
+  if (not Assigned(Owner)) or (Owner = Self) or
+    (not Assigned(Owner.FDotProductKernel)) or
+    (not Assigned(Owner.FDotProductKernel.Context)) or
+    (not Assigned(Owner.FDotProductKernel.Prog)) then
+  begin
+    FErrorProc('EnableOpenCLInContextOf: the owner net is not OpenCL-armed - ' +
+      'call its EnableOpenCL first.');
+    exit;
+  end;
+  if Assigned(FDotProductKernel) then DisableOpenCL();
+  FHasSharedKernel := pHasSharedKernel;
+  // Own command queue (pSharedQueue false): the two nets enqueue independently.
+  // Ordering against the owner's weight uploads needs nothing more, because
+  // every resident weight a borrower retains was written with a blocking
+  // upload before the borrow. The explicit retains keep the context and
+  // program alive when the owner net is disabled or freed first.
+  FDotProductKernel := TNeuralKernel.CreateFromProgram(Owner.FDotProductKernel,
+    'cai_dot_product', {pHideMessages=}true, {pSharedQueue=}false);
+  clRetainContext(Owner.FDotProductKernel.Context);
+  clRetainProgram(Owner.FDotProductKernel.Prog);
+  FBorrowedOpenCLContext := Owner.FDotProductKernel.Context;
+  FBorrowedOpenCLProgram := Owner.FDotProductKernel.Prog;
+  LastLayerIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+  begin
+    FLayers[LayerCnt].EnableOpenCL(FDotProductKernel);
+  end;
 end;
 
 procedure TNNet.EnableOpenCL(platform_id: cl_platform_id;
@@ -132233,6 +132620,32 @@ begin
       if TNNetLayerConcatedWeights(CurrentLayer).WeightsQuantizedInt4
         then Inc(Result);
     end;
+  end;
+end;
+
+function TNNet.LinkWeightsFrom(Owner: TNNet): integer;
+var
+  LayerCnt: integer;
+  OwnerLayer: TNNetLayer;
+  LastLayerIdx: integer;
+begin
+  Result := 0;
+  if (not Assigned(Owner)) or (Owner = Self) then exit;
+  if Owner.CountLayers() <> CountLayers() then
+  begin
+    FErrorProc('TNNet.LinkWeightsFrom: the owner has ' +
+      IntToStr(Owner.CountLayers()) + ' layers, this net ' +
+      IntToStr(CountLayers()) + '.');
+    exit;
+  end;
+  LastLayerIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+  begin
+    OwnerLayer := Owner.FLayers[LayerCnt];
+    // Weightless layers, and owner layers that only link another layer's
+    // neurons themselves, have nothing to lend.
+    if OwnerLayer.CountWeights() = 0 then continue;
+    if FLayers[LayerCnt].LinkWeightsFrom(OwnerLayer) then Inc(Result);
   end;
 end;
 
@@ -133724,6 +134137,72 @@ begin
   end;
 end;
 
+function TNNetLayer.LinkNeuronsFrom(Owner: TNNetLayer): boolean;
+begin
+  Result := false;
+  if (not Assigned(Owner)) or (Owner = Self) then exit;
+  if Owner.ClassType <> Self.ClassType then
+  begin
+    FErrorProc(ClassName + '.LinkWeightsFrom: owner is a ' + Owner.ClassName +
+      ', not the same class.');
+    exit;
+  end;
+  if FLinkedNeurons or Owner.FLinkedNeurons then
+  begin
+    FErrorProc(ClassName + '.LinkWeightsFrom: layer ' + IntToStr(FLayerIdx) +
+      ' or its owner already links another layer''s neurons.');
+    exit;
+  end;
+  if Owner.FNeurons.Count <> FNeurons.Count then
+  begin
+    FErrorProc(ClassName + '.LinkWeightsFrom: owner has ' +
+      IntToStr(Owner.FNeurons.Count) + ' neurons, this layer ' +
+      IntToStr(FNeurons.Count) + '.');
+    exit;
+  end;
+  FNeurons.Free;
+  FNeurons := Owner.FNeurons;
+  FLinkedNeurons := true;
+  FCanNormalizeDelta := false;
+  // Borrowed weights are read-only here: the owner trains (or, quantized,
+  // nobody does).
+  FIsTrainable := false;
+  FWeightOwner := Owner;
+  if not Assigned(Owner.FWeightBorrowers) then
+    Owner.FWeightBorrowers := TList.Create();
+  Owner.FWeightBorrowers.Add(Self);
+  BuildArrNeurons();
+  Result := true;
+end;
+
+function TNNetLayer.LinkWeightsFrom(Owner: TNNetLayer): boolean;
+begin
+  Result := LinkNeuronsFrom(Owner);
+  // Derived per-layer caches (tap tables, exp(A_log), ...) are rebuilt from
+  // the shared neurons by the same hook a weight load fires.
+  if Result then AfterWeightUpdate();
+end;
+
+procedure TNNetLayer.DetachFromWeightOwner();
+begin
+  if not Assigned(FWeightOwner) then exit;
+  FWeightOwner := nil;
+  FNeurons := TNNetNeuronList.Create();
+  FLinkedNeurons := false;
+  SetLength(FArrNeurons, 0);
+end;
+
+procedure TNNetLayer.UnlinkWeightBorrowers();
+var
+  BorrowerPos, MaxBorrowerPos: integer;
+begin
+  if not Assigned(FWeightBorrowers) then exit;
+  MaxBorrowerPos := FWeightBorrowers.Count - 1;
+  for BorrowerPos := 0 to MaxBorrowerPos do
+    TNNetLayer(FWeightBorrowers[BorrowerPos]).DetachFromWeightOwner();
+  FreeAndNil(FWeightBorrowers);
+end;
+
 { TNNetLayer }
 constructor TNNetLayer.Create();
 begin
@@ -133770,11 +134249,15 @@ begin
   {$IFDEF OpenCL}
   ReleaseDotProductCL();
   {$ENDIF}
+  UnlinkWeightBorrowers();
+  if Assigned(FWeightOwner) then FWeightOwner.FWeightBorrowers.Remove(Self);
   FOutputError.Free;
   FOutputErrorDeriv.Free;
   FOutputRaw.Free;
   FOutput.Free;
-  FNeurons.Free;
+  // A linked neuron list belongs to its owner (TNNetConvolutionSharedWeights
+  // or a LinkWeightsFrom owner).
+  if not FLinkedNeurons then FNeurons.Free;
   if Assigned(FPruneMask) then FPruneMask.Free;
   // Muon scratch (only allocated on layers that ran the matrix Muon path).
   if Assigned(FMuonMmat) then

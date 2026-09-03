@@ -64,7 +64,18 @@ type
       const What: string);
     // Windowed prefill on OpenCL twins against the host, FP32 or int8 KV.
     procedure RunWindowedPrefillOpenCLParity(Int8KV: boolean);
+    // Every layer of Linked that borrows weights holds the same resident
+    // device codes / vocab table handle as its owner; returns how many.
+    function AssertDeviceWeightsBorrowed(Linked: TNNet;
+      const What: string): integer;
     {$ENDIF}
+    // Every weight-bearing layer of Linked borrows from Owner, and Linked
+    // reports no weights and no quantized bytes of its own; returns how many
+    // layers borrow.
+    function AssertWeightsLinked(Linked, Owner: TNNet;
+      const What: string): integer;
+    // The tiny_llama_q8 fixture as an int4 inference net of input width pSeqLen.
+    function BuildLlamaInt4FixtureTwin(pSeqLen: integer): TNNet;
     procedure RunConvNeXtParity(const Base: string);
     procedure RunResNetParity(const Base: string);
     procedure RunRegNetParity(const Base: string);
@@ -291,6 +302,10 @@ type
     procedure TestQwen35WindowedPrefillToHiddenParity;
     procedure TestQwen35WindowedPrefillOpenCLParity;
     procedure TestQwen35WindowedPrefillOpenCLInt8KVParity;
+    procedure TestQwen35LinkedWeightsInt8Parity;
+    procedure TestLlamaLinkedWeightsInt4Parity;
+    procedure TestQwen35LinkedWeightsOpenCLParity;
+    procedure TestLlamaLinkedWeightsInt4OpenCLParity;
     procedure TestQwen35StreamedDecodeOpenCLParity;
     procedure TestQwen2StreamedDecodeOpenCLParity;
     procedure TestQwen35TurnBoundaryResumeParity;
@@ -9734,6 +9749,346 @@ begin
   AssertTrue('OpenCL not compiled in: SKIP', true);
   {$ENDIF}
 end;
+
+function TTestNeuralPretrained.AssertWeightsLinked(Linked, Owner: TNNet;
+  const What: string): integer;
+var
+  LayerPos, MaxLayerPos: integer;
+  OwnerLayer, LinkedLayer: TNNetLayer;
+  LinkedBytes: int64;
+begin
+  Result := 0;
+  LinkedBytes := 0;
+  AssertEquals(What + ': layer counts', Owner.CountLayers(),
+    Linked.CountLayers());
+  MaxLayerPos := Owner.CountLayers() - 1;
+  for LayerPos := 0 to MaxLayerPos do
+  begin
+    OwnerLayer := Owner.Layers[LayerPos];
+    LinkedLayer := Linked.Layers[LayerPos];
+    if OwnerLayer.CountWeights() > 0 then
+    begin
+      AssertTrue(What + ': layer ' + IntToStr(LayerPos) + ' (' +
+        OwnerLayer.ClassName + ') borrows', LinkedLayer.WeightOwner = OwnerLayer);
+      AssertTrue(What + ': layer ' + IntToStr(LayerPos) +
+        ' links the neurons', LinkedLayer.LinkedNeurons);
+      Inc(Result);
+    end;
+    AssertEquals(What + ': layer ' + IntToStr(LayerPos) + ' (' +
+      LinkedLayer.ClassName + ') reports no weights of its own', 0,
+      LinkedLayer.CountWeights());
+    if LinkedLayer is TNNetLayerConcatedWeights then
+      LinkedBytes := LinkedBytes +
+        TNNetLayerConcatedWeights(LinkedLayer).Int8QuantizedSizeBytes()
+    else if LinkedLayer is TNNetEmbedding then
+      LinkedBytes := LinkedBytes +
+        TNNetEmbedding(LinkedLayer).Int8QuantizedSizeBytes();
+  end;
+  AssertEquals(What + ': quantized bytes held by the linked net', 0,
+    LinkedBytes);
+  AssertTrue(What + ': some layer borrows', Result > 0);
+end;
+
+function TTestNeuralPretrained.BuildLlamaInt4FixtureTwin(
+  pSeqLen: integer): TNNet;
+var
+  Config: TLlamaConfig;
+begin
+  Result := BuildLlamaFromSafeTensorsEx(
+    FixturePath('tiny_llama_q8.safetensors'), Config, pSeqLen,
+    {pTrainable=}false, FixturePath('tiny_llama_q8_config.json'),
+    {pQuantizeInt8=}true);
+  AssertTrue('int4 layers in the tiny llama twin',
+    Result.QuantizeWeightsInt4() > 0);
+end;
+
+// A width-6 twin computing with the width-1 net's int8 tables (Phase 5 of
+// docs/BATCHED-PREFILL-DESIGN.md): the same windows through a twin that
+// quantized its own copy must give bit-identical logits, while the linked
+// twin owns no weight bytes. The owner is freed last here. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35LinkedWeightsInt8Parity;
+const
+  SeqLen = 16;
+  WindowLen = 6;
+var
+  Owner, Reference, Linked: TNNet;
+  SessionOwner, SessionReference, SessionLinked: TNNetStreamingDecoder;
+  LogitsReference, LogitsLinked: TNNetVolume;
+  Toks: array[0..SeqLen - 1] of integer;
+  T, Vocab, LinkedCount: integer;
+  ReferenceBytes: int64;
+begin
+  Owner := BuildQwen35FixtureTwin(1);
+  Reference := nil; Linked := nil;
+  SessionOwner := nil; SessionReference := nil; SessionLinked := nil;
+  LogitsReference := TNNetVolume.Create();
+  LogitsLinked := TNNetVolume.Create();
+  try
+    Owner.QuantizeWeightsInt8();
+    Reference := BuildQwen35FixtureTwin(WindowLen);
+    Reference.QuantizeWeightsInt8();
+    // Built with FP32 rows on purpose: the link must free them.
+    Linked := BuildQwen35FixtureTwin(WindowLen);
+    LinkedCount := Linked.LinkWeightsFrom(Owner);
+    AssertEquals('layers linked', AssertWeightsLinked(Linked, Owner, 'int8'),
+      LinkedCount);
+    ReferenceBytes := 0;
+    for T := 0 to Reference.CountLayers() - 1 do
+      if Reference.Layers[T] is TNNetLayerConcatedWeights then
+        ReferenceBytes := ReferenceBytes +
+          TNNetLayerConcatedWeights(Reference.Layers[T]).Int8QuantizedSizeBytes();
+    AssertTrue('the unlinked twin really holds int8 bytes', ReferenceBytes > 0);
+    Vocab := Owner.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    SessionOwner := TNNetStreamingDecoder.Create(Owner, SeqLen);
+    SessionReference := TNNetStreamingDecoder.Create(Reference, SeqLen);
+    SessionLinked := TNNetStreamingDecoder.Create(Linked, SeqLen);
+    RunWindowedPrefillStream(SessionReference, SessionOwner, Toks, WindowLen,
+      SeqLen, LogitsReference);
+    RunWindowedPrefillStream(SessionLinked, SessionOwner, Toks, WindowLen,
+      SeqLen, LogitsLinked);
+    AssertEquals('linked twin vs its own-copy twin: bit-identical logits',
+      0.0, MaxAbsVolumeDiff(LogitsReference, LogitsLinked), 0.0);
+  finally
+    LogitsLinked.Free;
+    LogitsReference.Free;
+    SessionLinked.Free;
+    SessionReference.Free;
+    SessionOwner.Free;
+    Linked.Free;
+    Reference.Free;
+    Owner.Free;
+  end;
+end;
+
+// Int4 tables borrowed across widths on the tiny llama (its rows are a
+// multiple of the Q4_0 block): a width-4 full forward on the linked twin
+// equals the twin that requantized its own copy, bit for bit. The owner is
+// freed FIRST here: the linked layers detach and are then freed without it.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLlamaLinkedWeightsInt4Parity;
+const
+  SeqLen = 4;
+var
+  Owner, Reference, Linked: TNNet;
+  Input, OutReference, OutLinked: TNNetVolume;
+  T, Vocab, LayerPos, Int4Linked: integer;
+begin
+  Owner := BuildLlamaInt4FixtureTwin(1);
+  Reference := nil; Linked := nil;
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutReference := TNNetVolume.Create();
+  OutLinked := TNNetVolume.Create();
+  try
+    Reference := BuildLlamaInt4FixtureTwin(SeqLen);
+    // Built int8-armed, as the importers build a quantized net, then linked
+    // to the int4 owner: the link switches it to int4 and arms its int8 input.
+    Linked := BuildLlamaInt4FixtureTwin(SeqLen);
+    AssertTrue('layers linked', Linked.LinkWeightsFrom(Owner) > 0);
+    AssertWeightsLinked(Linked, Owner, 'int4');
+    Int4Linked := 0;
+    for LayerPos := 0 to Linked.CountLayers() - 1 do
+      if (Linked.Layers[LayerPos] is TNNetLayerConcatedWeights) and
+        TNNetLayerConcatedWeights(Linked.Layers[LayerPos]).WeightsQuantizedInt4
+        then Inc(Int4Linked);
+    AssertTrue('int4 layers on the linked twin', Int4Linked > 0);
+    Vocab := Owner.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Input.FData[T] := (3 * T + 1) mod Vocab;
+    Reference.Compute(Input);
+    Reference.GetOutput(OutReference);
+    Linked.Compute(Input);
+    Linked.GetOutput(OutLinked);
+    AssertTrue('logits produced', OutReference.Size = SeqLen * Vocab);
+    AssertEquals('linked int4 twin vs its own-copy twin: bit-identical',
+      0.0, MaxAbsVolumeDiff(OutReference, OutLinked), 0.0);
+    FreeAndNil(Owner);
+    for LayerPos := 0 to Linked.CountLayers() - 1 do
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' detached from the freed ' +
+        'owner', Linked.Layers[LayerPos].WeightOwner = nil);
+  finally
+    OutLinked.Free;
+    OutReference.Free;
+    Input.Free;
+    Linked.Free;
+    Reference.Free;
+    Owner.Free;
+  end;
+end;
+
+{$IFDEF OpenCL}
+function TTestNeuralPretrained.AssertDeviceWeightsBorrowed(Linked: TNNet;
+  const What: string): integer;
+var
+  LayerPos, MaxLayerPos: integer;
+  LinkedLayer, OwnerLayer: TNNetLayer;
+begin
+  Result := 0;
+  MaxLayerPos := Linked.CountLayers() - 1;
+  for LayerPos := 0 to MaxLayerPos do
+  begin
+    LinkedLayer := Linked.Layers[LayerPos];
+    OwnerLayer := LinkedLayer.WeightOwner;
+    if not Assigned(OwnerLayer) then continue;
+    if LinkedLayer is TNNetLayerConcatedWeights then
+    begin
+      if TNNetLayerConcatedWeights(OwnerLayer).OpenCLCodesBuffer() = nil then
+        continue;
+      AssertTrue(What + ': layer ' + IntToStr(LayerPos) + ' (' +
+        LinkedLayer.ClassName + ') borrows its device codes',
+        TNNetLayerConcatedWeights(LinkedLayer).OpenCLCodesBorrowed());
+      AssertTrue(What + ': layer ' + IntToStr(LayerPos) +
+        ' holds the owner''s codes handle',
+        TNNetLayerConcatedWeights(LinkedLayer).OpenCLCodesBuffer() =
+        TNNetLayerConcatedWeights(OwnerLayer).OpenCLCodesBuffer());
+      Inc(Result);
+    end
+    else if LinkedLayer is TNNetEmbedding then
+    begin
+      AssertTrue(What + ': the owner embedding table is resident',
+        TNNetEmbedding(OwnerLayer).OpenCLTableBuffer() <> nil);
+      AssertTrue(What + ': layer ' + IntToStr(LayerPos) +
+        ' holds the owner''s vocab table handle',
+        TNNetEmbedding(LinkedLayer).OpenCLTableBuffer() =
+        TNNetEmbedding(OwnerLayer).OpenCLTableBuffer());
+      Inc(Result);
+    end;
+  end;
+  AssertTrue(What + ': some layer borrows device weights', Result > 0);
+end;
+{$ENDIF}
+
+// The device half of the weight link: a width-4 OpenCL twin enabled inside
+// the owner's context (EnableOpenCLInContextOf) retains the owner's resident
+// int8 codes and vocab table - one handle, no second upload - and its
+// windowed prefill equals a twin that uploaded its own copy, bit for bit.
+// The owner net is freed first. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35LinkedWeightsOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 16;
+  WindowLen = 4;
+  PromptLen = 12;
+var
+  Owner, Reference, Linked: TNNet;
+  SessionOwner, SessionReference, SessionLinked: TNNetStreamingDecoder;
+  LogitsReference, LogitsLinked: TNNetVolume;
+  Toks: array[0..SeqLen - 1] of integer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, Vocab: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Owner := BuildQwen35FixtureTwin(1);
+  Reference := nil; Linked := nil;
+  SessionOwner := nil; SessionReference := nil; SessionLinked := nil;
+  LogitsReference := TNNetVolume.Create();
+  LogitsLinked := TNNetVolume.Create();
+  try
+    Owner.QuantizeWeightsInt8();
+    Reference := BuildQwen35FixtureTwin(WindowLen);
+    Reference.QuantizeWeightsInt8();
+    Linked := BuildQwen35FixtureTwin(WindowLen);
+    AssertTrue('layers linked', Linked.LinkWeightsFrom(Owner) > 0);
+    Owner.EnableOpenCL(PlatformId, DeviceId);
+    Reference.EnableOpenCL(PlatformId, DeviceId);
+    Linked.EnableOpenCLInContextOf(Owner);
+    AssertWeightsLinked(Linked, Owner, 'int8 device');
+    AssertDeviceWeightsBorrowed(Linked, 'int8 device');
+    Vocab := Owner.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    SessionOwner := TNNetStreamingDecoder.Create(Owner, SeqLen);
+    SessionReference := TNNetStreamingDecoder.Create(Reference, SeqLen);
+    SessionLinked := TNNetStreamingDecoder.Create(Linked, SeqLen);
+    RunWindowedPrefillStream(SessionReference, SessionOwner, Toks, WindowLen,
+      PromptLen, LogitsReference);
+    RunWindowedPrefillStream(SessionLinked, SessionOwner, Toks, WindowLen,
+      PromptLen, LogitsLinked);
+    AssertAllOnDevice(Linked, TNNetPointwiseConvLinear, 'linked twin');
+    AssertAllOnDevice(Linked, TNNetEmbedding, 'linked twin');
+    AssertEquals('linked device twin vs its own-copy device twin: ' +
+      'bit-identical logits', 0.0,
+      MaxAbsVolumeDiff(LogitsReference, LogitsLinked), 0.0);
+    FreeAndNil(SessionOwner);
+    FreeAndNil(Owner);
+  finally
+    LogitsLinked.Free;
+    LogitsReference.Free;
+    SessionLinked.Free;
+    SessionReference.Free;
+    SessionOwner.Free;
+    Linked.Free;
+    Reference.Free;
+    Owner.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Int4 device codes borrowed across widths: the width-4 linked twin, enabled
+// in the owner's context, shares the owner's packed-nibble and block-scale
+// buffers and matches its own-copy twin bit for bit. The linked net is freed
+// first here. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLlamaLinkedWeightsInt4OpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 4;
+var
+  Owner, Reference, Linked: TNNet;
+  Input, OutReference, OutLinked: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, Vocab: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Owner := BuildLlamaInt4FixtureTwin(1);
+  Reference := nil; Linked := nil;
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutReference := TNNetVolume.Create();
+  OutLinked := TNNetVolume.Create();
+  try
+    Reference := BuildLlamaInt4FixtureTwin(SeqLen);
+    Linked := BuildLlamaInt4FixtureTwin(SeqLen);
+    AssertTrue('layers linked', Linked.LinkWeightsFrom(Owner) > 0);
+    Owner.EnableOpenCL(PlatformId, DeviceId);
+    Reference.EnableOpenCL(PlatformId, DeviceId);
+    Linked.EnableOpenCLInContextOf(Owner);
+    AssertWeightsLinked(Linked, Owner, 'int4 device');
+    AssertDeviceWeightsBorrowed(Linked, 'int4 device');
+    Vocab := Owner.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Input.FData[T] := (3 * T + 1) mod Vocab;
+    Reference.Compute(Input);
+    Reference.GetOutput(OutReference);
+    Linked.Compute(Input);
+    Linked.GetOutput(OutLinked);
+    AssertAllOnDevice(Linked, TNNetPointwiseConvLinear, 'linked int4 twin');
+    AssertEquals('linked int4 device twin vs its own-copy device twin: ' +
+      'bit-identical', 0.0, MaxAbsVolumeDiff(OutReference, OutLinked), 0.0);
+    FreeAndNil(Linked);
+  finally
+    OutLinked.Free;
+    OutReference.Free;
+    Input.Free;
+    Linked.Free;
+    Reference.Free;
+    Owner.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 {$IFDEF OpenCL}
 procedure TTestNeuralPretrained.AssertAllOnDevice(Net: TNNet; AClass: TClass;

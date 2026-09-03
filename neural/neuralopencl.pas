@@ -421,6 +421,11 @@ type
       FTiledKernel: cl_kernel;
       FTiledRejected: boolean;
       FTiledLaunchCount: integer;
+      /// True while FCodesBuffer / FScalesBuffer / FBlockScalesBuffer are
+      /// retained references to another instance's resident weights
+      /// (PrepareForComputeBorrowingCodes); the release in UnprepareForCompute
+      /// is the same clReleaseMemObject either way. Coded by Claude (AI).
+      FCodesBorrowed: boolean;
 
       /// How many slabs to cut the reduction axis into for the current shape:
       /// 1 means the launch already fills the device, so ComputeInt8 keeps the
@@ -524,6 +529,12 @@ type
       /// uploads, as PrepareForComputeInt8. Coded by Claude (AI).
       function PrepareForComputeInt4(pPacked, pBlockScales: Pointer;
         NumAs, pSize: longint; VBs: TNNetVolume): integer;
+      /// Arms Owner's weight mode (int8 or int4) by retaining its resident
+      /// code/scale buffers - no second upload - and allocating only this
+      /// instance's B/result buffers for VBs (any column count). Owner must be
+      /// armed in this instance's context; False leaves this one unarmed. Coded by Claude (AI).
+      function PrepareForComputeBorrowingCodes(Owner: TDotProductSharedKernel;
+        VBs: TNNetVolume; pFP16: boolean = false): boolean;
       /// Int4 twin of ComputeInt8: same B operand, bias, activation and result
       /// contract, against the codes PrepareForComputeInt4 armed. Coded by Claude (AI).
       procedure ComputeInt4(VBs: TNNetVolume; pActFN: longint;
@@ -542,6 +553,11 @@ type
       /// True after a successful PrepareForComputeInt4 (cleared by
       /// UnprepareForCompute); the int4 layers gate their device route on it.
       property Int4Ready: boolean read FInt4Ready;
+      /// The resident weight codes (nil when unarmed) and whether they are a
+      /// retained reference to another instance's buffer: the test hooks that
+      /// prove a borrower created no second copy.
+      property CodesBuffer: cl_mem read FCodesBuffer;
+      property CodesBorrowed: boolean read FCodesBorrowed;
       /// Launches of the tiled GEMM over this instance's lifetime; a test
       /// asserts it moved to prove the tiled path ran.
       property TiledGemmLaunchCount: integer read FTiledLaunchCount;
@@ -726,6 +742,7 @@ begin
   FBlockScalesBuffer := nil;
   FCapBlockScales := 0;
   FInt4Ready := false;
+  FCodesBorrowed := false;
   FPartialBuffer := nil;
   FInputBufferBsFP16 := nil;
   FSplitKKernel := nil;
@@ -1129,6 +1146,69 @@ begin
   FPreviousComputeTime := 0;
   FInt4Ready := (err = CL_SUCCESS);
   PrepareForComputeInt4 := err;
+end;
+
+// Owner's PrepareForComputeInt8/Int4 uploaded its codes with blocking writes,
+// so they are complete before this instance's first launch even when the two
+// ride different command queues. OpenCL refcounts the shared buffers: either
+// instance may be unprepared or freed first. Coded by Claude (AI).
+function TDotProductSharedKernel.PrepareForComputeBorrowingCodes(
+  Owner: TDotProductSharedKernel; VBs: TNNetVolume;
+  pFP16: boolean = false): boolean;
+var
+  NeededResult: csize_t;
+begin
+  Result := false;
+  UnprepareForCompute();
+  if (not Assigned(Owner)) or (Owner = Self) then exit;
+  if not (Owner.FInt8Ready or Owner.FInt4Ready) then exit;
+  if not Assigned(FInt8Kernel) then exit;
+  if Owner.FDotProductKernel.Context <> FDotProductKernel.Context then exit;
+  if (Owner.FSize <= 0) or (VBs.Size = 0) or
+    ((VBs.Size mod Owner.FSize) <> 0) then exit;
+  FNumAs := Owner.FNumAs;
+  FSize := Owner.FSize;
+  FNumBs := VBs.Size div FSize;
+  FThreadCount := FNumAs * FNumBs;
+  FGroupSizeA := 0;
+  FGroupSizeB := 0;
+  // The int4 kernels read FP32 activations only, as PrepareForComputeInt4.
+  FFP16Activations := Owner.FInt8Ready and pFP16 and Assigned(FFP16Kernel) and
+    Assigned(FFP16Kernel.Kernel);
+
+  clRetainMemObject(Owner.FCodesBuffer);
+  FCodesBuffer := Owner.FCodesBuffer;
+  FCapCodes := Owner.FCapCodes;
+  clRetainMemObject(Owner.FScalesBuffer);
+  FScalesBuffer := Owner.FScalesBuffer;
+  FCapScales := Owner.FCapScales;
+  if Assigned(Owner.FBlockScalesBuffer) then
+  begin
+    clRetainMemObject(Owner.FBlockScalesBuffer);
+    FBlockScalesBuffer := Owner.FBlockScalesBuffer;
+    FCapBlockScales := Owner.FCapBlockScales;
+  end;
+  FCodesBorrowed := true;
+
+  NeededResult := FNumAs * FNumBs * csNeuralFloatSize;
+  FResultBuffer := FDotProductKernel.CreateOutputBuffer(NeededResult);
+  FCapResult := NeededResult;
+  if FFP16Activations then
+  begin
+    FCapBsFP16 := csize_t(FNumBs) * FSize * csHalfSize;
+    FInputBufferBsFP16 := FDotProductKernel.CreateBuffer(FCapBsFP16);
+    FInputBufferBs := nil;
+    FCapBs := 0;
+  end
+  else
+  begin
+    FInputBufferBs := FDotProductKernel.CreateInputBuffer(VBs);
+    FCapBs := VBs.GetMemSize();
+  end;
+  FPreviousComputeTime := 0;
+  FInt8Ready := Owner.FInt8Ready;
+  FInt4Ready := Owner.FInt4Ready;
+  Result := true;
 end;
 
 const
