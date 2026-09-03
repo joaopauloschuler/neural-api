@@ -16238,18 +16238,24 @@ begin
   Block.LinQKV := NN.AddLayerAfter(
     TNNetPointwiseConvLinear.Create(ConvDim).SetTrainable(pTrainable),
     Source);
+  // Every layer takes pTrainable BEFORE AddLayer sizes it: SetPrevLayer
+  // allocates the error buffers and (TNNetGatedDeltaNet) the per-step BPTT
+  // caches only for a trainable layer, and an inference net must never pay
+  // for them, not even until the block-level SetTrainable shrinks them.
   Block.LinConv := NN.AddLayer( TNNetDepthwiseConv1D.Create(
-    Config.LinearConvKernel, {pCausal=}true, {pSuppressBias=}1) );
-  ConvAct := NN.AddLayer( TNNetSiLU.Create() );
+    Config.LinearConvKernel, {pCausal=}true, {pSuppressBias=}1
+    ).SetTrainable(pTrainable) );
+  ConvAct := NN.AddLayer( TNNetSiLU.Create().SetTrainable(pTrainable) );
   Block.LinZBA := NN.AddLayerAfter(
     TNNetPointwiseConvLinear.Create(
       ValueDim + 2 * Config.LinearNumVHeads).SetTrainable(pTrainable),
     Source);
-  NN.AddLayer( TNNetDeepConcat.Create([ConvAct, Block.LinZBA]) );
+  NN.AddLayer( TNNetDeepConcat.Create([ConvAct, Block.LinZBA]
+    ).SetTrainable(pTrainable) );
   Block.LinDelta := NN.AddLayer( TNNetGatedDeltaNet.Create(
     Config.LinearNumKHeads, Config.LinearNumVHeads,
     Config.LinearKeyHeadDim, Config.LinearValueHeadDim,
-    Config.RmsNormEps) );
+    Config.RmsNormEps).SetTrainable(pTrainable) );
   Block.LinOut := NN.AddLayer(
     TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
 end;

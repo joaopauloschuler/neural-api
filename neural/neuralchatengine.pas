@@ -1159,6 +1159,7 @@ var
   Cnt, LastIdx: integer;
   Int4LayerCount: integer;      // layers holding int4 weights after --int4
   Int4DirectLayerCount: integer; // of those, loaded straight from Q4_0 blocks
+  TwinBytes: int64;             // the prefill twins' NonWeightBytes
 begin
   Result := false;
   ErrorMsg := '';
@@ -1564,6 +1565,15 @@ begin
         ' per forward on the width-%d twin; the tail that does not fill a' +
         ' window goes one token at a time]',
         [Opt.PrefillWindow, Opt.PrefillWindow, Opt.PrefillWindow]));
+    // The twins' whole host footprint besides the borrowed weights: layer
+    // outputs, the convolution kernels' raw outputs and bias rows, the KV
+    // caches their sessions just sized; inference-only layers keep no
+    // per-step backward caches.
+    TwinBytes := WindowNN.NonWeightBytes();
+    if Assigned(TailNN) then TwinBytes := TwinBytes + TailNN.NonWeightBytes();
+    Notice(Format('[--prefill-window %d: the twins hold %.1f MB of' +
+      ' activations and caches in host memory besides the borrowed weights]',
+      [Opt.PrefillWindow, TwinBytes / (1024 * 1024)]));
   end;
   if Opt.KVInt8 then
     Notice('[int8 KV cache (default with int8 weights) - ~1/4 the KV RAM, ' +

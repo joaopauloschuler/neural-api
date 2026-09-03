@@ -345,6 +345,7 @@ type
     procedure TestQwen35ChatPrefillLadderOpenCLParity;
     procedure TestQwen35ChatPrefillTailWindowNotices;
     procedure TestQwen35BorrowedTwinBuild;
+    procedure TestQwen35BorrowedTwinInferenceMemory;
     procedure TestLlamaBorrowedTwinInt4Parity;
     procedure TestLlamaBorrowedTwinInt4OpenCLParity;
     procedure TestQwen35MoeLogitParity;
@@ -11229,6 +11230,155 @@ begin
     Twin.Free; // the engine order: the borrower before its owner
     Reference.Free;
     Owner.Free;
+  end;
+end;
+
+// An inference-only twin costs its activations only. Inside the decode
+// session production wraps it in, the width-256 borrowing twin's
+// NonWeightBytes stay within 2x its layer outputs (the convolution kernels'
+// FOutputRaw and bias rows are the rest); every TNNetGatedDeltaNet keeps one
+// scratch row and two matrix-state rows instead of 256 BPTT rows; the same
+// graph built trainable costs more than twice as much; SetTrainable(true)
+// after the build brings the BPTT caches back; and the inference forward
+// (two alternating state rows) equals the trainable forward bit for bit.
+// The fixture config caps the context at 16, so a copy with a 4096 cap is
+// written to a temp file. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35BorrowedTwinInferenceMemory;
+const
+  WindowLen = 256;
+  ParitySeqLen = 16;
+var
+  Owner, Twin, Trained, Inference16, Trained16, Solo: TNNet;
+  Session: TNNetStreamingDecoder;
+  Config: TLlamaConfig;
+  Cfg: TStringList;
+  CfgPath: string;
+  LayerCnt, LastLayerIdx, DeltaCnt, T: integer;
+  ActivationBytes, TwinBytes, TrainedBytes, SoloInferenceBytes: int64;
+  TwinLayer, TrainedLayer, FirstTrainedDelta: TNNetLayer;
+  In16, OutInference, OutTrained: TNNetVolume;
+begin
+  Cfg := TStringList.Create();
+  CfgPath := IncludeTrailingPathDelimiter(GetTempDir(false)) +
+    'cai_qwen35_ctx4096_' + IntToStr(Random(1000000)) + '.json';
+  Owner := nil; Twin := nil; Trained := nil; Session := nil;
+  Inference16 := nil; Trained16 := nil; Solo := nil;
+  In16 := TNNetVolume.Create(ParitySeqLen, 1, 1);
+  OutInference := TNNetVolume.Create();
+  OutTrained := TNNetVolume.Create();
+  try
+    Cfg.LoadFromFile(FixturePath('tiny_qwen3_5_config.json'));
+    Cfg.Text := StringReplace(Cfg.Text, '"max_position_embeddings": 16',
+      '"max_position_embeddings": 4096', []);
+    AssertTrue('context cap rewritten', Pos('4096', Cfg.Text) > 0);
+    Cfg.SaveToFile(CfgPath);
+    Owner := BuildQwen35FromSafeTensorsEx(
+      FixturePath('tiny_qwen3_5.safetensors'), Config, 1,
+      {pTrainable=}false, CfgPath);
+    // A borrowing build never opens the checkpoint (BuildQwen35FixtureTwin).
+    Twin := BuildQwen35FromSafeTensorsEx(
+      ExtractFilePath(FixturePath('tiny_qwen3_5_config.json')) +
+      'does_not_exist_tiny_qwen3_5.safetensors', Config,
+      WindowLen, {pTrainable=}false, CfgPath, {pQuantizeInt8=}false, Owner);
+    Trained := BuildQwen35FromSafeTensorsEx(
+      FixturePath('tiny_qwen3_5.safetensors'), Config, WindowLen,
+      {pTrainable=}true, CfgPath);
+    AssertEquals('the twin sized no weight storage', 0,
+      Twin.WeightElementsSized());
+    AssertEquals('same graph', Trained.CountLayers(), Twin.CountLayers());
+    Session := TNNetStreamingDecoder.Create(Twin, 2 * WindowLen);
+    ActivationBytes := 0;
+    LastLayerIdx := Twin.GetLastLayerIdx();
+    for LayerCnt := 0 to LastLayerIdx do
+      ActivationBytes := ActivationBytes +
+        int64(Twin.Layers[LayerCnt].Output.Size) * csNeuralFloatSize;
+    TwinBytes := Twin.NonWeightBytes();
+    TrainedBytes := Trained.NonWeightBytes();
+    AssertTrue(Format('twin non-weight bytes %d within 2x its activations %d',
+      [TwinBytes, ActivationBytes]), TwinBytes <= 2 * ActivationBytes);
+    AssertTrue(Format('trainable net %d bytes costs more than twice the twin %d',
+      [TrainedBytes, TwinBytes]), TrainedBytes > 2 * TwinBytes);
+    DeltaCnt := 0;
+    FirstTrainedDelta := nil;
+    for LayerCnt := 0 to LastLayerIdx do
+    begin
+      TwinLayer := Twin.Layers[LayerCnt];
+      TrainedLayer := Trained.Layers[LayerCnt];
+      AssertEquals('layer class at ' + IntToStr(LayerCnt),
+        TrainedLayer.ClassName, TwinLayer.ClassName);
+      if TwinLayer is TNNetGatedDeltaNet then
+      begin
+        Inc(DeltaCnt);
+        if FirstTrainedDelta = nil then FirstTrainedDelta := TrainedLayer;
+        // One scratch row, two state rows and FDecS against 256 BPTT rows.
+        AssertTrue(Format('DeltaNet at %d: twin %d bytes vs trainable %d',
+          [LayerCnt, TwinLayer.NonWeightBytes(), TrainedLayer.NonWeightBytes()]),
+          8 * TwinLayer.NonWeightBytes() < TrainedLayer.NonWeightBytes());
+      end;
+      if TwinLayer is TNNetFusedSDPA then
+        // No SeqLen x SeqLen x heads score map inside a decode session: the
+        // layer holds its output and the KV cache of 2*WindowLen rows.
+        AssertTrue(Format('attention at %d: twin %d bytes, output %d',
+          [LayerCnt, TwinLayer.NonWeightBytes(), TwinLayer.Output.Size *
+           csNeuralFloatSize]),
+          TwinLayer.NonWeightBytes() <=
+          int64(TwinLayer.Output.Size) * csNeuralFloatSize +
+          int64(2 * WindowLen) * TwinLayer.Output.Depth * 4 * csNeuralFloatSize);
+    end;
+    AssertEquals('DeltaNet layers compared', 6, DeltaCnt);
+    // SetTrainable(true) after the build: the standalone layer, built
+    // inference-only at the same shapes, grows to the trainable layer's bytes.
+    Solo := TNNet.Create();
+    Solo.AddLayer(TNNetInput.Create(WindowLen, 1,
+      FirstTrainedDelta.PrevLayer.Output.Depth));
+    Solo.AddLayer(TNNetGatedDeltaNet.Create(Config.LinearNumKHeads,
+      Config.LinearNumVHeads, Config.LinearKeyHeadDim,
+      Config.LinearValueHeadDim, Config.RmsNormEps).SetTrainable(false));
+    SoloInferenceBytes := Solo.GetLastLayer().NonWeightBytes();
+    AssertTrue('inference-only DeltaNet below the trainable one',
+      8 * SoloInferenceBytes < FirstTrainedDelta.NonWeightBytes());
+    // TNNetLayer.SetTrainable(true) leaves the two error buffers to
+    // SetPrevLayer, so the flipped layer is short of exactly those (they hold
+    // one element each until then); the BPTT caches themselves come back.
+    Solo.SetTrainable({pTrainable=}true, {pLowMemory=}false);
+    AssertEquals('SetTrainable(true) restores the BPTT caches',
+      FirstTrainedDelta.NonWeightBytes() -
+      2 * (int64(FirstTrainedDelta.Output.Size) - 1) * csNeuralFloatSize,
+      Solo.GetLastLayer().NonWeightBytes());
+    Solo.SetTrainable({pTrainable=}false);
+    AssertEquals('SetTrainable(false) releases them again',
+      SoloInferenceBytes, Solo.GetLastLayer().NonWeightBytes());
+    // Bit-exact forward: the inference net's two alternating state rows
+    // against the trainable net's per-step cache, full width, no session.
+    Inference16 := BuildQwen35FromSafeTensorsEx(
+      FixturePath('tiny_qwen3_5.safetensors'), Config, ParitySeqLen,
+      {pTrainable=}false, CfgPath);
+    Trained16 := BuildQwen35FromSafeTensorsEx(
+      FixturePath('tiny_qwen3_5.safetensors'), Config, ParitySeqLen,
+      {pTrainable=}true, CfgPath);
+    for T := 0 to ParitySeqLen - 1 do
+      In16.FData[T] := (5 * T + 2) mod Config.VocabSize;
+    Inference16.Compute(In16);
+    Inference16.GetOutput(OutInference);
+    Trained16.Compute(In16);
+    Trained16.GetOutput(OutTrained);
+    AssertEquals('logits rows', ParitySeqLen * Config.VocabSize,
+      OutInference.Size);
+    AssertEquals('inference forward vs trainable forward: bit-identical',
+      0.0, MaxAbsVolumeDiff(OutTrained, OutInference), 0.0);
+  finally
+    OutTrained.Free;
+    OutInference.Free;
+    In16.Free;
+    Trained16.Free;
+    Inference16.Free;
+    Solo.Free;
+    Session.Free;
+    Twin.Free; // the borrower before its owner
+    Trained.Free;
+    Owner.Free;
+    DeleteFile(CfgPath);
+    Cfg.Free;
   end;
 end;
 

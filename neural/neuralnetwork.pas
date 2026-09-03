@@ -706,6 +706,9 @@ type
       // quantized layers (whose FP32 volumes are shrunk to one element)
       // can report their real parameter count.
       function CountWeights(): int64; virtual;
+      // Bytes of every TNNetVolume this layer owns apart from its neurons'
+      // weight rows and quantized tables: activations, error buffers, caches.
+      function NonWeightBytes(): int64; virtual;
       // Returns the number of neurons in the layer.
       function CountNeurons(): integer; {$IFDEF Release} inline; {$ENDIF}
       // Multiplies all weights in the layer by value V.
@@ -1073,6 +1076,7 @@ type
       // Bytes held by the int8 container (codes + scales).
       // Coded by Claude (AI).
       function Int8QuantizedSizeBytes(): int64;
+      function NonWeightBytes(): int64; override;
       // Copies the int8 weight-only storage out for direct re-export (e.g.
       // the GGUF writer's Q8_0-from-int8 path) without dequantizing: pCodes
       // receives NumRows*VS row-major symmetric codes, pScales the NumRows
@@ -4297,6 +4301,7 @@ type
     function ComputeTiled(): boolean;
     procedure SetBlockCausalSeg(pValue: boolean);
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    function NonWeightBytes(): int64; override;
   protected
     // Shape contract, overridable by the fused multi-head subclass
     // (TNNetFusedSDPA): expected packed input depth, output depth, and the
@@ -8001,6 +8006,7 @@ type
     procedure BorrowOwnerOpenCLTable();
     {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    function NonWeightBytes(): int64; override;
   protected
     procedure DetachFromWeightOwner(); override;
   public
@@ -8426,6 +8432,7 @@ type
       destructor Destroy(); override;
       function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      function NonWeightBytes(): int64; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -8467,6 +8474,7 @@ type
       function ShouldBindPrevOutputOnOpenCL(): boolean;
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      function NonWeightBytes(): int64; override;
       // Releases FNormalized / FInvRMS / FGainGradScratch: they are read only
       // by Backpropagate, so an inference-only layer neither fills nor needs
       // them. ComputeRange keys the x_hat snapshot on FNormalized's size.
@@ -9645,6 +9653,7 @@ type
       // table dirty for anything that does go through the weight-update path.
       procedure PrepareTapTables();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      function NonWeightBytes(): int64; override;
       procedure ComputeCPU(); {$IFDEF Release} inline; {$ENDIF}
       procedure ComputeDecodeCPU();
       // Ranged kernels shared by the serial forwards (full-width call) and the
@@ -10780,6 +10789,10 @@ type
       FDecSOnOpenCL: boolean;
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      function NonWeightBytes(): int64; override;
+      // Sizes the per-timestep caches for the current input width and
+      // trainability (SetPrevLayer and SetTrainable both call it).
+      procedure SizeSequenceCaches();
       procedure FreeBackpropScratch();
       // Ranged forward kernel shared by the serial Compute() (full-width call)
       // and the threaded chunk path: K-HEADS [FirstKh..LastKh] only, i.e.
@@ -14715,6 +14728,7 @@ type
       {$ENDIF}
       procedure PrepareInputForConvolutionFast();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      function NonWeightBytes(): int64; override;
       function ShouldUseInterleavedDotProduct:boolean; {$IFDEF Release} inline; {$ENDIF}
     public
       constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload; virtual;
@@ -19855,6 +19869,8 @@ type
       function CountNeurons(): integer;
       // Int64: billion-parameter checkpoints overflow a 32-bit total.
       function CountWeights(): int64;
+      // Sum of every layer's NonWeightBytes.
+      function NonWeightBytes(): int64;
       function SummaryString(): string;
       procedure PrintSummary();
       // Unified-diff-style architecture comparison.
@@ -22540,6 +22556,20 @@ var
   {$ENDIF}
 
 implementation
+
+// nil-tolerant byte counts for NonWeightBytes.
+function VolumeBytes(V: TNNetVolume): int64;
+begin
+  if Assigned(V) then Result := int64(V.Size) * csNeuralFloatSize
+  else Result := 0;
+end;
+
+function Quant8Bytes(Q: TNNetVolumeQuant8): int64;
+begin
+  if Assigned(Q) then
+    Result := int64(Q.Size) * csShortIntSize + VolumeBytes(Q.ScaleData)
+  else Result := 0;
+end;
 
 // Quickselect order statistic, defined further below beside the pruning paths
 // that were its first callers; declared here so LayerSensitivityReport can use
@@ -33104,6 +33134,7 @@ begin
     FVCacheQ.ReSize(0, 0, 0);
   end;
   SetLength(FCacheScores, MaxContext);
+  FAttn.ReSize(1, 1, 1); // the cached path scores into FCacheScores
   FCacheMax := MaxContext;
   FCacheLen := 0;
   FCacheEnabled := true;
@@ -33120,6 +33151,10 @@ procedure TNNetScaledDotProductAttention.EndIncrementalDecode();
 begin
   ForceCacheOnRAM();
   FCacheEnabled := false;
+  // The full-sequence forward and Backpropagate read FAttn again.
+  if Assigned(FPrevLayer) then
+    FAttn.ReSize(FPrevLayer.FOutput.SizeX,
+      FPrevLayer.FOutput.SizeX * AttnHeadCount(), 1);
   FCacheLen := 0;
   FEvictSinks := 0;
   FEvictWindow := 0;
@@ -33629,8 +33664,11 @@ begin
   SetOutputErrorSize(FOutput);
   // Attention weights: rows = queries (i), cols = keys (j). Use X=key, Y=query;
   // with H > 1 attention maps (fused subclass), head h's map occupies the
-  // Y-row band [h*SeqLen .. (h+1)*SeqLen-1].
-  FAttn.ReSize(pPrevLayer.FOutput.SizeX,
+  // Y-row band [h*SeqLen .. (h+1)*SeqLen-1]. The KV-cached decode scores into
+  // FCacheScores instead, so a layer inside a decode session keeps FAttn
+  // collapsed (BeginIncrementalDecode) until EndIncrementalDecode.
+  if FCacheEnabled then FAttn.ReSize(1, 1, 1)
+  else FAttn.ReSize(pPrevLayer.FOutput.SizeX,
     pPrevLayer.FOutput.SizeX * AttnHeadCount(), 1);
   if Assigned(FSegLayer) then
   begin
@@ -33648,6 +33686,18 @@ begin
       FErrorProc('TNNetScaledDotProductAttention: segment masking is not ' +
         'supported on the KV-cache incremental-decode path.');
   end;
+end;
+
+function TNNetScaledDotProductAttention.NonWeightBytes(): int64;
+begin
+  Result := inherited NonWeightBytes() + VolumeBytes(FAttn) +
+    VolumeBytes(FKCache) + VolumeBytes(FVCache) +
+    Quant8Bytes(FKCacheQ) + Quant8Bytes(FVCacheQ) +
+    int64(Length(FCacheScores)) * csNeuralFloatSize;
+  {$IFDEF OpenCL}
+  Result := Result + VolumeBytes(FQRowBuf) + VolumeBytes(FKInterBuf) +
+    VolumeBytes(FVRowBuf);
+  {$ENDIF}
 end;
 
 function TNNetScaledDotProductAttention.InputDepthRequired(): integer;
@@ -34996,6 +35046,7 @@ begin
     FVCacheQ.ReSize(0, 0, 0);
   end;
   SetLength(FCacheScores, pMaxContext * FQHeads);
+  FAttn.ReSize(1, 1, 1); // the cached path scores into FCacheScores
   FCacheMax := pMaxContext;
   FCacheLen := 0;
   FCacheEnabled := true;
@@ -61792,6 +61843,12 @@ begin
   {$ENDIF}
 end;
 
+function TNNetDepthwiseConv1D.NonWeightBytes(): int64;
+begin
+  Result := inherited NonWeightBytes() + VolumeBytes(FDecHist) +
+    VolumeBytes(FTapW) + VolumeBytes(FTapBias);
+end;
+
 procedure TNNetDepthwiseConv1D.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
   SeqLen, Channels: integer;
@@ -70191,7 +70248,60 @@ end;
 function TNNetGatedDeltaNet.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if Assigned(FPrevLayer) then SizeSequenceCaches()
+  else if not pTrainable then FreeBackpropScratch();
+end;
+
+function TNNetGatedDeltaNet.NonWeightBytes(): int64;
+begin
+  Result := inherited NonWeightBytes() +
+    VolumeBytes(FQn) + VolumeBytes(FKn) + VolumeBytes(FQInv) + VolumeBytes(FKInv) +
+    VolumeBytes(FBeta) + VolumeBytes(FDecay) + VolumeBytes(FSp) +
+    VolumeBytes(FErr) + VolumeBytes(FO) + VolumeBytes(FRInv) + VolumeBytes(FS) +
+    VolumeBytes(FGS) + VolumeBytes(FGradA) + VolumeBytes(FGradDtB) +
+    VolumeBytes(FGradW) + VolumeBytes(FDecS);
+end;
+
+// Training keeps every step's q/k norms, gates, read-out and matrix state for
+// the right-to-left BPTT. An inference-only layer reads each of them within
+// the step that wrote it, so it keeps one row of per-token scratch and two
+// matrix-state rows that alternate (the incremental decode aliases FDecS and
+// touches none of them); the backward accumulators collapse with them.
+procedure TNNetGatedDeltaNet.SizeSequenceCaches();
+var
+  CacheRows, StateRows, Hk, Hv, Dk, Dv: integer;
+begin
+  Hk := FNumKHeads; Hv := FNumVHeads; Dk := FHeadDimK; Dv := FHeadDimV;
+  if FIsTrainable then
+  begin
+    CacheRows := FOutput.SizeX;
+    StateRows := FOutput.SizeX;
+  end
+  else
+  begin
+    CacheRows := 1;
+    StateRows := Min(FOutput.SizeX, 2);
+  end;
+  FQn.ReSize(CacheRows, 1, Hk * Dk);  FKn.ReSize(CacheRows, 1, Hk * Dk);
+  FQInv.ReSize(CacheRows, 1, Hk);     FKInv.ReSize(CacheRows, 1, Hk);
+  FBeta.ReSize(CacheRows, 1, Hv);     FDecay.ReSize(CacheRows, 1, Hv);
+  FSp.ReSize(CacheRows, 1, Hv);
+  FErr.ReSize(CacheRows, 1, Hv * Dv); FO.ReSize(CacheRows, 1, Hv * Dv);
+  FRInv.ReSize(CacheRows, 1, Hv);
+  FS.ReSize(StateRows, Hv * Dk, Dv);
+  if FIsTrainable then
+  begin
+    FGS.ReSize(Hv * Dk, 1, Dv);
+    FGradA.ReSize(1, 1, Hv); FGradDtB.ReSize(1, 1, Hv); FGradW.ReSize(1, 1, Dv);
+    SetLength(FgoBuf, Dv); SetLength(FgrBuf, Dv); SetLength(FgvBuf, Dv);
+    SetLength(FgqBuf, Hk * Dk); SetLength(FgkBuf, Hk * Dk);
+  end
+  else
+  begin
+    FGS.ReSize(1, 1, 1);
+    FGradA.ReSize(1, 1, 1); FGradDtB.ReSize(1, 1, 1); FGradW.ReSize(1, 1, 1);
+    FreeBackpropScratch();
+  end;
 end;
 
 destructor TNNetGatedDeltaNet.Destroy();
@@ -70261,26 +70371,12 @@ begin
         FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
       end;
   end;
-  FQn.ReSize(SeqLen, 1, Hk * Dk);  FKn.ReSize(SeqLen, 1, Hk * Dk);
-  FQInv.ReSize(SeqLen, 1, Hk);     FKInv.ReSize(SeqLen, 1, Hk);
-  FBeta.ReSize(SeqLen, 1, Hv);     FDecay.ReSize(SeqLen, 1, Hv);
-  FSp.ReSize(SeqLen, 1, Hv);
-  FErr.ReSize(SeqLen, 1, Hv * Dv); FO.ReSize(SeqLen, 1, Hv * Dv);
-  FRInv.ReSize(SeqLen, 1, Hv);
-  FS.ReSize(SeqLen, Hv * Dk, Dv);
+  SizeSequenceCaches();
   // Persistent per-head ea buffer (forward + backward), sized once at setup so
   // the threaded ComputeCPURange never resizes on the hot path (rule #17); the
   // disjoint k-head ranges write/read disjoint [FirstH..LastH] slots.
   SetLength(FEaBuf, Hv);
-  FGS.ReSize(Hv * Dk, 1, Dv);
-  FGradA.ReSize(1, 1, Hv); FGradDtB.ReSize(1, 1, Hv); FGradW.ReSize(1, 1, Dv);
   FDecS.ReSize(1, 1, Hv * Dk * Dv);
-  // Backprop-only scratch: skip on inference-only layers.
-  if FIsTrainable then
-  begin
-    SetLength(FgoBuf, Dv); SetLength(FgrBuf, Dv); SetLength(FgvBuf, Dv);
-    SetLength(FgqBuf, Hk * Dk); SetLength(FgkBuf, Hk * Dk);
-  end;
   InitDefault();
 end;
 
@@ -70327,11 +70423,12 @@ var
   SeqLenM1, DkM1, DvM1: integer;
   Hk, Hv, Dk, Dv, DkDv, HkDk, HvDv: integer;
   FirstH, LastH: integer;
-  qb, kb, cb, ob, sBase, thv, knBase, hDv, zOff: integer;
+  qb, kb, cb, ob, thv, knBase, hDv, hDkDv, zOff: integer;
   tHkDk, tHk, khDk, idxK, tHvB, tHvDv: integer;
+  CacheRow, StateBase, PrevStateBase, HvDkDv: integer;
   sumq, qinv, kinv, betav, pre, sp, ea, gval, decv: TNeuralFloat;
   msq, rinv, zv, sig, eps, scale: TNeuralFloat;
-  decode: boolean;
+  decode, KeepSteps: boolean;
   XtPtr, OutPtr, PrevSPtr, CurSPtr: TNeuralFloatArrPtr;
 begin
   Prev := FPrevLayer.FOutput;
@@ -70340,7 +70437,7 @@ begin
   NormW := FNeurons[2].FWeights;
   SeqLen := FOutput.SizeX;
   Hk := FNumKHeads; Hv := FNumVHeads; Dk := FHeadDimK; Dv := FHeadDimV;
-  HkDk := Hk * Dk; HvDv := Hv * Dv; DkDv := Dk * Dv;
+  HkDk := Hk * Dk; HvDv := Hv * Dv; DkDv := Dk * Dv; HvDkDv := Hv * DkDv;
   SeqLenM1 := SeqLen - 1;
   DkM1 := Dk - 1; DvM1 := Dv - 1;
   FirstH := FirstKh * FRep;
@@ -70348,6 +70445,10 @@ begin
   eps := FEps;
   scale := FScale;
   decode := FDecodeEnabled;
+  // Training keeps every step's caches for BPTT; inference reuses row 0 of
+  // the per-token caches and alternates between the two matrix-state rows
+  // (SizeSequenceCaches).
+  KeepSteps := FIsTrainable;
   // Rule #5/#8: ea_h = exp(min(A_log_h, 30)) invariant across t; precompute once
   // for this range's value heads into the persistent buffer (rule #17). Disjoint
   // k-head ranges touch disjoint [FirstH..LastH] slots, so this is race-free.
@@ -70357,12 +70458,24 @@ begin
   begin
     XtPtr := Prev.GetRawPtr(t, 0);
     OutPtr := FOutput.GetRawPtr(t, 0);
+    if KeepSteps then
+    begin
+      CacheRow := t;
+      StateBase := t * HvDkDv;
+      PrevStateBase := StateBase - HvDkDv;
+    end
+    else
+    begin
+      CacheRow := 0;
+      StateBase := (t and 1) * HvDkDv;
+      PrevStateBase := HvDkDv - StateBase;
+    end;
     // --- q/k per-head L2 norm (eps INSIDE the squared sum, HF-exact); q also
     // picks up the 1/sqrt(Dk) scale so the kernel consumes it as-is.
-    tHkDk := t * HkDk;                    // #11: invariant across the kh loop
-    tHk := t * Hk;
-    tHvB := t * Hv;                        // #11: invariant across the h loop
-    tHvDv := t * HvDv;
+    tHkDk := CacheRow * HkDk;              // #11: invariant across the kh loop
+    tHk := CacheRow * Hk;
+    tHvB := CacheRow * Hv;                 // #11: invariant across the h loop
+    tHvDv := CacheRow * HvDv;
     for kh := FirstKh to LastKh do
     begin
       khDk := kh * Dk;                    // #4: kh*Dk formed once (qb, cb, kb)
@@ -70410,9 +70523,9 @@ begin
       end
       else
       begin
-        sBase := thv * DkDv;
-        CurSPtr := @FS.FData[sBase];
-        if t > 0 then PrevSPtr := @FS.FData[sBase - Hv * DkDv]
+        hDkDv := h * DkDv;
+        CurSPtr := @FS.FData[StateBase + hDkDv];
+        if t > 0 then PrevSPtr := @FS.FData[PrevStateBase + hDkDv]
         else PrevSPtr := nil;
       end;
       knBase := tHkDk + kh * Dk;
@@ -70488,6 +70601,8 @@ begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
+  // An inference-only layer holds no per-step caches to walk (SizeSequenceCaches).
+  if not FIsTrainable then exit;
   StartTime := Now();
   NA := FNeurons[0]; NDtB := FNeurons[1]; NNorm := FNeurons[2];
   ALog := NA.FWeights; DtB := NDtB.FWeights; NormW := NNorm.FWeights;
@@ -76618,6 +76733,11 @@ begin
   else FreeBackpropScratch();
 end;
 
+function TNNetRMSNorm.NonWeightBytes(): int64;
+begin
+  Result := inherited NonWeightBytes() + VolumeBytes(FNormalized);
+end;
+
 procedure TNNetRMSNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -76875,6 +76995,12 @@ begin
     end;
   end
   else FreeBackpropScratch();
+end;
+
+function TNNetTokenRMSNorm.NonWeightBytes(): int64;
+begin
+  Result := inherited NonWeightBytes() + VolumeBytes(FNormalized) +
+    VolumeBytes(FInvRMS) + VolumeBytes(FGainGradScratch);
 end;
 
 procedure TNNetTokenRMSNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -78856,6 +78982,13 @@ begin
     // zero-row convention (pExtraScale is irrelevant - dequant is 0 either
     // way - and scale 1 keeps requantize-after-dequantize exact).
     FQuantTable.Scale[NeuronIdx, 0] := 1;
+end;
+
+function TNNetLayerConcatedWeights.NonWeightBytes(): int64;
+begin
+  Result := inherited NonWeightBytes() + VolumeBytes(FConcatedWeights) +
+    VolumeBytes(FConcatedWInter) + VolumeBytes(FBiasOutput) +
+    Quant8Bytes(FInputCopyInt8);
 end;
 
 function TNNetLayerConcatedWeights.Int8QuantizedSizeBytes(): int64;
@@ -105357,6 +105490,15 @@ begin
 end;
 
 { TNNetConvolution }
+// A pointwise convolution reads the previous output as its im2col, so
+// FInputPrepared is only owned (and counted) by the spatial case.
+function TNNetConvolutionBase.NonWeightBytes(): int64;
+begin
+  Result := inherited NonWeightBytes() + Quant8Bytes(FInputPreparedInt8) +
+    VolumeBytes(FPrevLayerErrorPadded);
+  if not FPointwise then Result := Result + VolumeBytes(FInputPrepared);
+end;
+
 procedure TNNetConvolutionBase.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -109366,6 +109508,12 @@ begin
     FQuantTable.Scale[RowIdx, 0] := 1;
 end;
 
+function TNNetEmbedding.NonWeightBytes(): int64;
+begin
+  Result := inherited NonWeightBytes() +
+    int64(Length(FInputTokens)) * csIntegerSize;
+end;
+
 function TNNetEmbedding.Int8QuantizedSizeBytes(): int64;
 begin
   // A borrowed table is the owner's bytes.
@@ -110095,6 +110243,16 @@ begin
       Result := Result + FLayers[LayerCnt].CountNeurons();
     end;
   end;
+end;
+
+function TNNet.NonWeightBytes(): int64;
+var
+  LayerCnt, LastLayerIdx: integer;
+begin
+  Result := 0;
+  LastLayerIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+    Result := Result + FLayers[LayerCnt].NonWeightBytes();
 end;
 
 function TNNet.CountWeights(): int64;
@@ -134888,6 +135046,12 @@ begin
     end;
   end;
   Result := Self;
+end;
+
+function TNNetLayer.NonWeightBytes(): int64;
+begin
+  Result := VolumeBytes(FOutput) + VolumeBytes(FOutputRaw) +
+    VolumeBytes(FOutputError) + VolumeBytes(FOutputErrorDeriv);
 end;
 
 function TNNetLayer.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
