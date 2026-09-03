@@ -154,6 +154,7 @@ Coded by Claude (AI).
 interface
 
 uses
+  {$IFDEF OpenCL} cl, {$ENDIF}
   Classes, SysUtils, neuralvolume, neuralnetwork, neuralhftokenizer;
 
 type
@@ -1199,6 +1200,51 @@ type
     property SSMCount: integer read GetSSMCount;
   end;
 
+  // TNNetDecoderStateCheckpoint: the recurrent half of a TNNetStreamingDecoder's
+  // state - one copy of the decode state and step count of every recurrent
+  // layer, and NO attention K/V. Attention K/V is position-indexed, so
+  // TNNetStreamingDecoder.TruncateTo rewinds it in place; the recurrent state
+  // is a fixed-size summary with no per-position history, so resuming from a
+  // position needs a copy taken there. TruncateTo(Pos) + RestoreStateFrom
+  // therefore resumes a hybrid (Qwen3.5 GatedDeltaNet + conv + attention,
+  // Mamba) from any checkpointed position without copying the K/V cache.
+  //
+  // STORAGE. TNNetStreamingDecoder.SizeStateCheckpoint allocates once: per
+  // recurrent layer, a buffer in OpenCL memory when the layer keeps its decode
+  // state there (a TNNetRecurrentDecodeBase descendant with an OpenCL path),
+  // else a host TNNetVolume. CaptureStateInto and RestoreStateFrom allocate
+  // nothing, and for an OpenCL slot they are device-to-device copies that
+  // leave the layer's state resident. The buffers belong to the checkpoint,
+  // not to a net, so a checkpoint captured on one session restores into
+  // another session wrapping the same layer roster in the same OpenCL context
+  // (the width-N prefill twin and the width-1 session). Coded by Claude (AI).
+  TNNetDecoderStateCheckpoint = class(TObject)
+  private
+    FLayerClasses: array of TClass;  // per recurrent layer, checked on capture/restore
+    FH: array of TNNetVolume;        // per-layer host state (nil on the OpenCL route)
+    FSteps: array of integer;        // per-layer step count
+    FSlotBytes: array of int64;      // per-layer bytes of the OpenCL slot (0 = host route)
+    {$IFDEF OpenCL}
+    FSlots: array of cl_mem;         // per-layer state in OpenCL memory (nil = host route)
+    {$ENDIF}
+    FPosition: integer;
+    FSized: boolean;
+    function GetLayerCount(): integer;
+    function GetOpenCLSlotCount(): integer;
+  public
+    destructor Destroy(); override;
+    // Releases every buffer; the checkpoint can be sized again afterwards.
+    procedure Clear();
+    // Bytes held: OpenCL slots plus host volumes plus the step counts.
+    function Bytes(): int64;
+    function OpenCLBytes(): int64;
+    // Tokens fed when the checkpoint was captured (caller-owned bookkeeping).
+    property Position: integer read FPosition write FPosition;
+    property LayerCount: integer read GetLayerCount;
+    property OpenCLSlotCount: integer read GetOpenCLSlotCount;
+    property Sized: boolean read FSized;
+  end;
+
   // TNNetStreamingDecoder: a reusable incremental-decode "streaming session"
   // over a causal next-token net, replacing the hand-rolled step-net plumbing
   // every streaming example repeats (build a short-width twin, CopyWeights,
@@ -1292,6 +1338,9 @@ type
       out Steps: integer);
     class procedure StateRestore(L: TNNetLayer; Src: TNNetVolume;
       Steps: integer);
+    // Raises unless Chk was sized for this session's recurrent layer roster.
+    procedure CheckStateCheckpointFits(Chk: TNNetDecoderStateCheckpoint;
+      const Caller: string);
   public
     // pInt8KV = true arms the int8-quantized KV cache at construction: the
     // attention layers allocate the int8 code/scale storage directly and the
@@ -1377,6 +1426,19 @@ type
     // when the shapes match, so a repeated capture allocates nothing.
     procedure SnapshotInto(Snap: TNNetDecoderSessionSnapshot);
     procedure RestoreSnapshot(Snap: TNNetDecoderSessionSnapshot);
+    // CACHE CHECKPOINTS (the recurrent half only; see
+    // TNNetDecoderStateCheckpoint). SizeStateCheckpoint allocates Chk's
+    // per-layer storage for this session - call it once, outside any decode
+    // step; NewStateCheckpoint creates and sizes one. CaptureStateInto copies
+    // every recurrent layer's live state and step count into Chk;
+    // RestoreStateFrom copies them back. Neither allocates, and both raise on
+    // a checkpoint sized for another layer roster. The caller pairs
+    // RestoreStateFrom with TruncateTo(Pos), which rewinds the attention K/V
+    // caches in place (a cache resident in OpenCL memory stays resident).
+    procedure SizeStateCheckpoint(Chk: TNNetDecoderStateCheckpoint);
+    function NewStateCheckpoint(): TNNetDecoderStateCheckpoint;
+    procedure CaptureStateInto(Chk: TNNetDecoderStateCheckpoint);
+    procedure RestoreStateFrom(Chk: TNNetDecoderStateCheckpoint);
     // Convenience: the net's last layer output (e.g. the softmax row(s) of
     // the window just computed).
     function Output(): TNNetVolume;
@@ -5898,6 +5960,71 @@ begin
   Result := Length(FH);
 end;
 
+{ TNNetDecoderStateCheckpoint }
+
+destructor TNNetDecoderStateCheckpoint.Destroy();
+begin
+  Clear();
+  inherited Destroy();
+end;
+
+procedure TNNetDecoderStateCheckpoint.Clear();
+var
+  i, MaxLayerPos: integer;
+begin
+  MaxLayerPos := High(FH);
+  for i := 0 to MaxLayerPos do FH[i].Free;
+  {$IFDEF OpenCL}
+  MaxLayerPos := High(FSlots);
+  for i := 0 to MaxLayerPos do
+    if Assigned(FSlots[i]) then clReleaseMemObject(FSlots[i]);
+  SetLength(FSlots, 0);
+  {$ENDIF}
+  SetLength(FH, 0);
+  SetLength(FSteps, 0);
+  SetLength(FSlotBytes, 0);
+  SetLength(FLayerClasses, 0);
+  FPosition := 0;
+  FSized := false;
+end;
+
+function TNNetDecoderStateCheckpoint.Bytes(): int64;
+var
+  i, MaxLayerPos: integer;
+begin
+  Result := 0;
+  MaxLayerPos := High(FSteps);
+  for i := 0 to MaxLayerPos do
+  begin
+    Result := Result + FSlotBytes[i] + SizeOf(integer);
+    if Assigned(FH[i]) then Result := Result + FH[i].GetMemSize();
+  end;
+end;
+
+function TNNetDecoderStateCheckpoint.OpenCLBytes(): int64;
+var
+  i, MaxLayerPos: integer;
+begin
+  Result := 0;
+  MaxLayerPos := High(FSlotBytes);
+  for i := 0 to MaxLayerPos do Result := Result + FSlotBytes[i];
+end;
+
+function TNNetDecoderStateCheckpoint.GetLayerCount(): integer;
+begin
+  Result := Length(FSteps);
+end;
+
+function TNNetDecoderStateCheckpoint.GetOpenCLSlotCount(): integer;
+var
+  i, MaxLayerPos: integer;
+begin
+  Result := 0;
+  MaxLayerPos := High(FSlotBytes);
+  for i := 0 to MaxLayerPos do
+    if FSlotBytes[i] > 0 then Inc(Result);
+end;
+
 { TNNetStreamingDecoder }
 
 // The three recurrent-state class families share the incremental-decode
@@ -6228,6 +6355,128 @@ begin
         Snap.FLen[i], Snap.FSinks[i], Snap.FWindow[i]);
   for i := 0 to HiSSM do
     StateRestore(FSSMs[i], Snap.FH[i], Snap.FSteps[i]);
+end;
+
+procedure TNNetStreamingDecoder.SizeStateCheckpoint(
+  Chk: TNNetDecoderStateCheckpoint);
+var
+  i, MaxLayerPos, StepsAtSizing: integer;
+  Layer: TNNetLayer;
+begin
+  Chk.Clear();
+  SetLength(Chk.FLayerClasses, Length(FSSMs));
+  SetLength(Chk.FH, Length(FSSMs));
+  SetLength(Chk.FSteps, Length(FSSMs));
+  SetLength(Chk.FSlotBytes, Length(FSSMs));
+  {$IFDEF OpenCL} SetLength(Chk.FSlots, Length(FSSMs)); {$ENDIF}
+  MaxLayerPos := High(FSSMs);
+  for i := 0 to MaxLayerPos do
+  begin
+    Layer := FSSMs[i];
+    Chk.FLayerClasses[i] := Layer.ClassType;
+    Chk.FH[i] := nil;
+    Chk.FSteps[i] := 0;
+    Chk.FSlotBytes[i] := 0;
+    {$IFDEF OpenCL}
+    Chk.FSlots[i] := nil;
+    if Layer is TNNetRecurrentDecodeBase then
+    begin
+      Chk.FSlots[i] := TNNetRecurrentDecodeBase(Layer).NewStateSlotOnOpenCL();
+      if Assigned(Chk.FSlots[i]) then
+      begin
+        Chk.FSlotBytes[i] := TNNetRecurrentDecodeBase(Layer).StateBytes();
+        continue;
+      end;
+    end;
+    {$ENDIF}
+    // Host route: the volume takes the state's shape now, so no later capture
+    // resizes it (the contents are replaced by the first capture).
+    Chk.FH[i] := TNNetVolume.Create();
+    StateCapture(Layer, Chk.FH[i], StepsAtSizing);
+  end;
+  Chk.FSized := true;
+end;
+
+function TNNetStreamingDecoder.NewStateCheckpoint(): TNNetDecoderStateCheckpoint;
+begin
+  Result := TNNetDecoderStateCheckpoint.Create();
+  SizeStateCheckpoint(Result);
+end;
+
+procedure TNNetStreamingDecoder.CheckStateCheckpointFits(
+  Chk: TNNetDecoderStateCheckpoint; const Caller: string);
+var
+  i, MaxLayerPos: integer;
+  Layer: TNNetLayer;
+  LayerBytes, HeldBytes: int64;
+begin
+  if (not Chk.FSized) or (Length(Chk.FSteps) <> Length(FSSMs)) then
+    raise Exception.Create('TNNetStreamingDecoder.' + Caller +
+      ': the checkpoint holds ' + IntToStr(Length(Chk.FSteps)) +
+      ' recurrent layers but this session has ' + IntToStr(Length(FSSMs)) +
+      ' (size it with SizeStateCheckpoint for this session).');
+  MaxLayerPos := High(FSSMs);
+  for i := 0 to MaxLayerPos do
+  begin
+    Layer := FSSMs[i];
+    if Chk.FLayerClasses[i] <> Layer.ClassType then
+      raise Exception.Create('TNNetStreamingDecoder.' + Caller +
+        ': recurrent layer ' + IntToStr(i) + ' is a ' + Layer.ClassName +
+        ' but the checkpoint was sized for a ' +
+        Chk.FLayerClasses[i].ClassName + ' (mismatched architecture).');
+    if not (Layer is TNNetRecurrentDecodeBase) then continue;
+    LayerBytes := TNNetRecurrentDecodeBase(Layer).StateBytes();
+    if Chk.FSlotBytes[i] > 0
+      then HeldBytes := Chk.FSlotBytes[i]
+      else HeldBytes := Chk.FH[i].GetMemSize();
+    if HeldBytes <> LayerBytes then
+      raise Exception.Create('TNNetStreamingDecoder.' + Caller +
+        ': recurrent layer ' + IntToStr(i) + ' holds ' +
+        IntToStr(LayerBytes) + ' state bytes but the checkpoint holds ' +
+        IntToStr(HeldBytes) + ' (mismatched architecture).');
+  end;
+end;
+
+procedure TNNetStreamingDecoder.CaptureStateInto(
+  Chk: TNNetDecoderStateCheckpoint);
+var
+  i, MaxLayerPos: integer;
+begin
+  CheckStateCheckpointFits(Chk, 'CaptureStateInto');
+  MaxLayerPos := High(FSSMs);
+  for i := 0 to MaxLayerPos do
+  begin
+    {$IFDEF OpenCL}
+    if Assigned(Chk.FSlots[i]) then
+    begin
+      TNNetRecurrentDecodeBase(FSSMs[i]).CaptureStateToOpenCL(Chk.FSlots[i],
+        Chk.FSteps[i]);
+      continue;
+    end;
+    {$ENDIF}
+    StateCapture(FSSMs[i], Chk.FH[i], Chk.FSteps[i]);
+  end;
+end;
+
+procedure TNNetStreamingDecoder.RestoreStateFrom(
+  Chk: TNNetDecoderStateCheckpoint);
+var
+  i, MaxLayerPos: integer;
+begin
+  CheckStateCheckpointFits(Chk, 'RestoreStateFrom');
+  MaxLayerPos := High(FSSMs);
+  for i := 0 to MaxLayerPos do
+  begin
+    {$IFDEF OpenCL}
+    if Assigned(Chk.FSlots[i]) then
+    begin
+      TNNetRecurrentDecodeBase(FSSMs[i]).RestoreStateFromOpenCL(Chk.FSlots[i],
+        Chk.FSteps[i]);
+      continue;
+    end;
+    {$ENDIF}
+    StateRestore(FSSMs[i], Chk.FH[i], Chk.FSteps[i]);
+  end;
 end;
 
 function TNNetStreamingDecoder.Output(): TNNetVolume;

@@ -55,6 +55,14 @@ type
       HiddenOnlyTokenCount: integer = 0);
     // Largest |A[i] - B[i]| over the rows FromRow.. of two (T,1,V) volumes.
     function MaxAbsRowDiffFrom(A, B: TNNetVolume; FromRow: integer): double;
+    // Cache-checkpoint resume on one tiny_qwen3_5 width-1 session: run to p,
+    // capture, run on, TruncateTo(p) + RestoreStateFrom, same tail bit for bit.
+    procedure RunQwen35StateCheckpointResume(Int8KV, UseOpenCL: boolean);
+    // The same across the twins: captured on the width-4 twin, restored into
+    // the width-1 session after the snapshot handoff.
+    procedure RunQwen35StateCheckpointTwinHandoff(Int8KV, UseOpenCL: boolean);
+    // Bytes the checkpoint formula must report for Net's recurrent layers.
+    function ExpectedStateCheckpointBytes(Net: TNNet): int64;
     // A temp HF-style directory (model.safetensors, config.json,
     // tokenizer.json) of the tiny_<Stem> fixture for TChatEngine.LoadModel;
     // the tokenizer is the qwen35 one for every stem (the engine tests feed
@@ -90,6 +98,10 @@ type
       const What: string);
     // Windowed prefill on OpenCL twins against the host, FP32 or int8 KV.
     procedure RunWindowedPrefillOpenCLParity(Int8KV: boolean);
+    // Every recurrent layer of Net keeps its decode state in OpenCL memory,
+    // and every TNNetFusedSDPA its KV cache.
+    procedure AssertRecurrentStateOnOpenCL(Net: TNNet; const What: string);
+    procedure AssertKVCacheOnOpenCL(Net: TNNet; const What: string);
     // Every layer of Linked that borrows weights holds the same resident
     // device codes / vocab table handle as its owner; returns how many.
     function AssertDeviceWeightsBorrowed(Linked: TNNet;
@@ -338,6 +350,13 @@ type
     procedure TestQwen35StreamedDecodeOpenCLParity;
     procedure TestQwen2StreamedDecodeOpenCLParity;
     procedure TestQwen35TurnBoundaryResumeParity;
+    procedure TestQwen35StateCheckpointResumeParity;
+    procedure TestQwen35StateCheckpointResumeInt8KVParity;
+    procedure TestQwen35StateCheckpointTwinHandoffParity;
+    procedure TestQwen35StateCheckpointOpenCLParity;
+    procedure TestQwen35StateCheckpointOpenCLInt8KVParity;
+    procedure TestQwen35StateCheckpointOpenCLTwinHandoffParity;
+    procedure TestMambaStateCheckpointResumeParity;
     procedure TestQwen35ChatPrefillWindowParity;
     procedure TestQwen35ChatPrefillWindowInt8KVParity;
     procedure TestQwen35ChatPrefillWindowOpenCLParity;
@@ -10543,6 +10562,510 @@ begin
     RefSession.Free;
     StepIn.Free;
     Twin.Free;
+  end;
+end;
+
+function TTestNeuralPretrained.ExpectedStateCheckpointBytes(Net: TNNet): int64;
+var
+  LayerPos, MaxLayerPos: integer;
+  Layer: TNNetLayer;
+begin
+  Result := 0;
+  MaxLayerPos := Net.CountLayers() - 1;
+  for LayerPos := 0 to MaxLayerPos do
+  begin
+    Layer := Net.Layers[LayerPos];
+    if Layer is TNNetRecurrentDecodeBase then
+      Result := Result + TNNetRecurrentDecodeBase(Layer).StateBytes() +
+        SizeOf(integer);
+  end;
+end;
+
+{$IFDEF OpenCL}
+procedure TTestNeuralPretrained.AssertRecurrentStateOnOpenCL(Net: TNNet;
+  const What: string);
+var
+  LayerPos, MaxLayerPos, Total: integer;
+  Layer: TNNetLayer;
+begin
+  Total := 0;
+  MaxLayerPos := Net.CountLayers() - 1;
+  for LayerPos := 0 to MaxLayerPos do
+  begin
+    Layer := Net.Layers[LayerPos];
+    if Layer is TNNetRecurrentDecodeBase then
+    begin
+      Inc(Total);
+      AssertTrue(What + ': ' + Layer.ClassName + ' at ' + IntToStr(LayerPos) +
+        ' keeps its decode state in OpenCL memory',
+        TNNetRecurrentDecodeBase(Layer).StateOnOpenCL());
+    end;
+  end;
+  AssertTrue(What + ' has recurrent layers', Total > 0);
+end;
+
+procedure TTestNeuralPretrained.AssertKVCacheOnOpenCL(Net: TNNet;
+  const What: string);
+var
+  LayerPos, MaxLayerPos, Total: integer;
+  Layer: TNNetLayer;
+begin
+  Total := 0;
+  MaxLayerPos := Net.CountLayers() - 1;
+  for LayerPos := 0 to MaxLayerPos do
+  begin
+    Layer := Net.Layers[LayerPos];
+    if Layer is TNNetFusedSDPA then
+    begin
+      Inc(Total);
+      AssertTrue(What + ': TNNetFusedSDPA at ' + IntToStr(LayerPos) +
+        ' keeps its KV cache in OpenCL memory',
+        TNNetFusedSDPA(Layer).CacheOnOpenCL);
+    end;
+  end;
+  AssertTrue(What + ' has fused attention layers', Total > 0);
+end;
+{$ENDIF}
+
+// One width-1 session: an uninterrupted run is the reference; the checkpoint
+// run feeds to CheckPos, captures, feeds on to RunOnTo, rewinds the K/V
+// caches with TruncateTo(CheckPos), restores the recurrent half and feeds the
+// tail again - bit for bit the reference, twice from the same checkpoint. On
+// OpenCL the recurrent state and the KV cache must stay resident across the
+// capture, the truncate and the restore (F16, F17). Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunQwen35StateCheckpointResume(Int8KV,
+  UseOpenCL: boolean);
+const
+  SeqLen   = 12;
+  CheckPos = 5;
+  RunOnTo  = 9;
+var
+  Twin: TNNet;
+  Config: TLlamaConfig;
+  Session: TNNetStreamingDecoder;
+  Chk: TNNetDecoderStateCheckpoint;
+  StepIn: TNNetVolume;
+  RefOut: array[0..SeqLen - 1] of array of TNeuralFloat;
+  Toks: array[0..SeqLen - 1] of integer;
+  {$IFDEF OpenCL}
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  {$ENDIF}
+  T, V, Vocab: integer;
+  Mode: string;
+  Raised: boolean;
+
+  procedure FeedRecording(FromPos, ToPos: integer);
+  var
+    P, Dim: integer;
+  begin
+    for P := FromPos to ToPos - 1 do
+    begin
+      StepIn.FData[0] := Toks[P];
+      Session.StepForward(StepIn, P);
+      SetLength(RefOut[P], Vocab);
+      for Dim := 0 to Vocab - 1 do RefOut[P][Dim] := Session.Output().FData[Dim];
+    end;
+  end;
+
+  procedure FeedAndCheck(FromPos, ToPos: integer; const What: string);
+  var
+    P, Dim: integer;
+  begin
+    for P := FromPos to ToPos - 1 do
+    begin
+      StepIn.FData[0] := Toks[P];
+      Session.StepForward(StepIn, P);
+      for Dim := 0 to Vocab - 1 do
+        AssertEquals(Mode + ' ' + What + ': logit pos ' + IntToStr(P) +
+          ' tok ' + IntToStr(Dim), RefOut[P][Dim],
+          Session.Output().FData[Dim], 0.0);
+    end;
+  end;
+
+begin
+  Mode := BoolToStr(Int8KV, 'int8 KV', 'FP32 KV');
+  if UseOpenCL then
+  begin
+    {$IFDEF OpenCL}
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    Mode := Mode + ' OpenCL';
+    {$ELSE}
+    AssertTrue('OpenCL not compiled in: SKIP', true);
+    Exit;
+    {$ENDIF}
+  end;
+  RandSeed := 424242;
+  Twin := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5.safetensors'),
+    Config, {SeqLen=}1, {pTrainable=}false,
+    FixturePath('tiny_qwen3_5_config.json'));
+  Session := nil; Chk := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    {$IFDEF OpenCL}
+    if UseOpenCL then Twin.EnableOpenCL(PlatformId, DeviceId);
+    {$ENDIF}
+    Vocab := Config.VocabSize;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen, Int8KV);
+    AssertTrue('recurrent layers present', Session.SSMCount > 0);
+    AssertTrue('attention layers present', Session.SDPACount > 0);
+    Session.Reset();
+    FeedRecording(0, SeqLen);
+
+    Chk := Session.NewStateCheckpoint();
+    AssertTrue(Mode + ': the checkpoint is sized', Chk.Sized);
+    AssertEquals(Mode + ': one checkpoint entry per recurrent layer',
+      Session.SSMCount, Chk.LayerCount);
+    AssertEquals(Mode + ': checkpoint bytes follow the StateBytes formula',
+      ExpectedStateCheckpointBytes(Twin), Chk.Bytes());
+    if UseOpenCL
+      then AssertEquals(Mode + ': every recurrent layer holds an OpenCL slot',
+        Session.SSMCount, Chk.OpenCLSlotCount)
+      else AssertEquals(Mode + ': no OpenCL slots on the host',
+        0, Chk.OpenCLSlotCount);
+    AssertEquals(Mode + ': OpenCL bytes', Chk.OpenCLBytes() > 0, UseOpenCL);
+
+    Session.Reset();
+    FeedAndCheck(0, CheckPos, 'before the checkpoint');
+    {$IFDEF OpenCL}
+    if UseOpenCL then
+    begin
+      AssertAllOnDevice(Twin, TNNetGatedDeltaNet, Mode);
+      AssertAllOnDevice(Twin, TNNetDepthwiseConv1D, Mode);
+      AssertAllOnDevice(Twin, TNNetFusedSDPA, Mode);
+      AssertRecurrentStateOnOpenCL(Twin, Mode + ' before the capture');
+    end;
+    {$ENDIF}
+    Session.CaptureStateInto(Chk);
+    Chk.Position := CheckPos;
+    {$IFDEF OpenCL}
+    if UseOpenCL then
+      AssertRecurrentStateOnOpenCL(Twin, Mode + ' after the capture (F16)');
+    {$ENDIF}
+    FeedAndCheck(CheckPos, RunOnTo, 'after the checkpoint');
+    AssertEquals(Mode + ': cache length before the rewind', RunOnTo,
+      Session.SDPACacheLength(0));
+
+    Session.TruncateTo(CheckPos);
+    AssertEquals(Mode + ': cache length after the rewind', CheckPos,
+      Session.SDPACacheLength(0));
+    {$IFDEF OpenCL}
+    if UseOpenCL then
+      AssertKVCacheOnOpenCL(Twin, Mode + ' after TruncateTo (F17)');
+    {$ENDIF}
+    Session.RestoreStateFrom(Chk);
+    {$IFDEF OpenCL}
+    if UseOpenCL then
+      AssertRecurrentStateOnOpenCL(Twin, Mode + ' after the restore');
+    {$ENDIF}
+    FeedAndCheck(CheckPos, SeqLen, 'first resume');
+
+    // The checkpoint is a copy: a second resume from it reads the same state.
+    Session.TruncateTo(CheckPos);
+    Session.RestoreStateFrom(Chk);
+    FeedAndCheck(CheckPos, SeqLen, 'second resume');
+
+    Raised := false;
+    try
+      Session.TruncateTo(SeqLen + 1);
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue(Mode + ': TruncateTo past the cache length raises', Raised);
+  finally
+    Chk.Free;
+    Session.Free;
+    StepIn.Free;
+    Twin.Free;
+  end;
+end;
+
+// The engine's resume path across the twins: the width-4 twin prefills two
+// windows, the checkpoint is captured on ITS layers at 8, the twin feeds one
+// more window, the whole state is handed to the width-1 session by snapshot
+// (as SwitchTo does), the session rewinds to 8 with TruncateTo and restores
+// the twin's checkpoint. The tail must match, bit for bit, the tail after a
+// snapshot handoff taken at 8. Under OpenCL the twin shares the session's
+// context (EnableOpenCLInContextOf), so the slots are reachable from both.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunQwen35StateCheckpointTwinHandoff(Int8KV,
+  UseOpenCL: boolean);
+const
+  SeqLen    = 12;
+  WindowLen = 4;
+  CheckPos  = 8;
+var
+  Twin1, TwinW: TNNet;
+  Config: TLlamaConfig;
+  Session1, SessionW: TNNetStreamingDecoder;
+  Chk: TNNetDecoderStateCheckpoint;
+  Snap: TNNetDecoderSessionSnapshot;
+  StepIn, WindowIn: TNNetVolume;
+  RefOut: array[0..SeqLen - 1] of array of TNeuralFloat;
+  Toks: array[0..SeqLen - 1] of integer;
+  {$IFDEF OpenCL}
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  {$ENDIF}
+  T, P, Dim, Vocab: integer;
+  Mode: string;
+
+  procedure FeedWindows(FromPos, ToPos: integer);
+  var
+    Pos, Row: integer;
+  begin
+    Pos := FromPos;
+    while Pos < ToPos do
+    begin
+      for Row := 0 to WindowLen - 1 do WindowIn.FData[Row] := Toks[Pos + Row];
+      SessionW.StepForward(WindowIn, Pos);
+      Inc(Pos, WindowLen);
+    end;
+  end;
+
+  procedure HandOff();
+  begin
+    Snap := SessionW.Snapshot();
+    try
+      Session1.RestoreSnapshot(Snap);
+    finally
+      Snap.Free;
+    end;
+  end;
+
+begin
+  Mode := BoolToStr(Int8KV, 'int8 KV', 'FP32 KV');
+  if UseOpenCL then
+  begin
+    {$IFDEF OpenCL}
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    Mode := Mode + ' OpenCL';
+    {$ELSE}
+    AssertTrue('OpenCL not compiled in: SKIP', true);
+    Exit;
+    {$ENDIF}
+  end;
+  AssertTrue('the checkpoint sits on a window boundary',
+    CheckPos mod WindowLen = 0);
+  RandSeed := 424242;
+  Twin1 := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5.safetensors'),
+    Config, {SeqLen=}1, {pTrainable=}false,
+    FixturePath('tiny_qwen3_5_config.json'));
+  TwinW := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5.safetensors'),
+    Config, WindowLen, {pTrainable=}false,
+    FixturePath('tiny_qwen3_5_config.json'));
+  Session1 := nil; SessionW := nil; Chk := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  WindowIn := TNNetVolume.Create(WindowLen, 1, 1);
+  try
+    {$IFDEF OpenCL}
+    if UseOpenCL then
+    begin
+      Twin1.EnableOpenCL(PlatformId, DeviceId);
+      TwinW.EnableOpenCLInContextOf(Twin1);
+    end;
+    {$ENDIF}
+    Vocab := Config.VocabSize;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    Session1 := TNNetStreamingDecoder.Create(Twin1, SeqLen, Int8KV);
+    SessionW := TNNetStreamingDecoder.Create(TwinW, SeqLen, Int8KV);
+
+    // Reference: handoff at CheckPos, then the width-1 tail.
+    SessionW.Reset();
+    Session1.Reset();
+    FeedWindows(0, CheckPos);
+    HandOff();
+    for P := CheckPos to SeqLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[P];
+      Session1.StepForward(StepIn, P);
+      SetLength(RefOut[P], Vocab);
+      for Dim := 0 to Vocab - 1 do RefOut[P][Dim] := Session1.Output().FData[Dim];
+    end;
+
+    // Checkpoint run: capture on the twin at CheckPos, run the twin on to the
+    // end, hand everything off, rewind the session and restore the twin's
+    // checkpoint into it.
+    Chk := SessionW.NewStateCheckpoint();
+    AssertEquals(Mode + ': one entry per recurrent layer of the twin',
+      SessionW.SSMCount, Chk.LayerCount);
+    if UseOpenCL then
+      AssertEquals(Mode + ': every recurrent layer of the twin holds an OpenCL slot',
+        SessionW.SSMCount, Chk.OpenCLSlotCount);
+    SessionW.Reset();
+    Session1.Reset();
+    FeedWindows(0, CheckPos);
+    SessionW.CaptureStateInto(Chk);
+    Chk.Position := CheckPos;
+    {$IFDEF OpenCL}
+    if UseOpenCL then
+      AssertRecurrentStateOnOpenCL(TwinW, Mode + ' twin after the capture');
+    {$ENDIF}
+    FeedWindows(CheckPos, SeqLen);
+    HandOff();
+    AssertEquals(Mode + ': the session holds the whole prompt', SeqLen,
+      Session1.SDPACacheLength(0));
+    Session1.TruncateTo(CheckPos);
+    Session1.RestoreStateFrom(Chk);
+    {$IFDEF OpenCL}
+    if UseOpenCL then
+      AssertRecurrentStateOnOpenCL(Twin1, Mode + ' session after the restore');
+    {$ENDIF}
+    for P := CheckPos to SeqLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[P];
+      Session1.StepForward(StepIn, P);
+      for Dim := 0 to Vocab - 1 do
+        AssertEquals(Mode + ' twin checkpoint resume: logit pos ' +
+          IntToStr(P) + ' tok ' + IntToStr(Dim), RefOut[P][Dim],
+          Session1.Output().FData[Dim], 0.0);
+    end;
+  finally
+    Chk.Free;
+    SessionW.Free;
+    Session1.Free;
+    WindowIn.Free;
+    StepIn.Free;
+    TwinW.Free;
+    Twin1.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestQwen35StateCheckpointResumeParity;
+begin
+  RunQwen35StateCheckpointResume({Int8KV=}false, {UseOpenCL=}false);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35StateCheckpointResumeInt8KVParity;
+begin
+  RunQwen35StateCheckpointResume({Int8KV=}true, {UseOpenCL=}false);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35StateCheckpointTwinHandoffParity;
+begin
+  RunQwen35StateCheckpointTwinHandoff({Int8KV=}false, {UseOpenCL=}false);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35StateCheckpointOpenCLParity;
+begin
+  RunQwen35StateCheckpointResume({Int8KV=}false, {UseOpenCL=}true);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35StateCheckpointOpenCLInt8KVParity;
+begin
+  RunQwen35StateCheckpointResume({Int8KV=}true, {UseOpenCL=}true);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35StateCheckpointOpenCLTwinHandoffParity;
+begin
+  RunQwen35StateCheckpointTwinHandoff({Int8KV=}true, {UseOpenCL=}true);
+end;
+
+// The host route on a pure recurrent net (tiny_mamba: TNNetSelectiveSSM plus
+// the conv state, no attention): the checkpoint holds every recurrent layer in
+// host volumes, TruncateTo has nothing to rewind, and the resumed tail matches
+// the uninterrupted run bit for bit. A checkpoint sized for this roster must
+// be refused by a session of another architecture. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestMambaStateCheckpointResumeParity;
+const
+  SeqLen   = 10;
+  CheckPos = 4;
+  RunOnTo  = 7;
+var
+  NN, Qwen: TNNet;
+  Config: TMambaConfig;
+  QwenConfig: TLlamaConfig;
+  Session, QwenSession: TNNetStreamingDecoder;
+  Chk: TNNetDecoderStateCheckpoint;
+  StepIn: TNNetVolume;
+  RefOut: array[0..SeqLen - 1] of array of TNeuralFloat;
+  Toks: array[0..SeqLen - 1] of integer;
+  T, Vocab: integer;
+  Raised: boolean;
+
+  procedure Feed(FromPos, ToPos: integer; Recording: boolean; const What: string);
+  var
+    P, Dim: integer;
+  begin
+    for P := FromPos to ToPos - 1 do
+    begin
+      StepIn.FData[0] := Toks[P];
+      Session.StepForward(StepIn, P);
+      if Recording then
+      begin
+        SetLength(RefOut[P], Vocab);
+        for Dim := 0 to Vocab - 1 do RefOut[P][Dim] := Session.Output().FData[Dim];
+      end
+      else
+        for Dim := 0 to Vocab - 1 do
+          AssertEquals('mamba ' + What + ': logit pos ' + IntToStr(P) +
+            ' tok ' + IntToStr(Dim), RefOut[P][Dim],
+            Session.Output().FData[Dim], 0.0);
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := BuildMambaFromSafeTensorsEx(FixturePath('tiny_mamba.safetensors'),
+    Config, {SeqLen=}1, {pTrainable=}false,
+    FixturePath('tiny_mamba_config.json'));
+  Qwen := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5.safetensors'),
+    QwenConfig, {SeqLen=}1, {pTrainable=}false,
+    FixturePath('tiny_qwen3_5_config.json'));
+  Session := nil; QwenSession := nil; Chk := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    Vocab := Config.VocabSize;
+    for T := 0 to SeqLen - 1 do Toks[T] := (3 * T + 1) mod Vocab;
+    Session := TNNetStreamingDecoder.Create(NN, SeqLen);
+    AssertTrue('mamba recurrent layers present', Session.SSMCount > 0);
+    AssertEquals('mamba has no attention cache', 0, Session.SDPACount);
+    Session.Reset();
+    Feed(0, SeqLen, true, '');
+
+    Chk := Session.NewStateCheckpoint();
+    AssertEquals('mamba: one entry per recurrent layer', Session.SSMCount,
+      Chk.LayerCount);
+    AssertEquals('mamba: host route only', 0, Chk.OpenCLSlotCount);
+    AssertEquals('mamba: checkpoint bytes follow the StateBytes formula',
+      ExpectedStateCheckpointBytes(NN), Chk.Bytes());
+    Session.Reset();
+    Feed(0, CheckPos, false, 'before the checkpoint');
+    Session.CaptureStateInto(Chk);
+    Feed(CheckPos, RunOnTo, false, 'after the checkpoint');
+    Session.TruncateTo(CheckPos);
+    Session.RestoreStateFrom(Chk);
+    Feed(CheckPos, SeqLen, false, 'resume');
+
+    QwenSession := TNNetStreamingDecoder.Create(Qwen, SeqLen);
+    QwenSession.Reset();
+    Raised := false;
+    try
+      QwenSession.RestoreStateFrom(Chk);
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('a checkpoint of another architecture is refused', Raised);
+  finally
+    Chk.Free;
+    QwenSession.Free;
+    Session.Free;
+    StepIn.Free;
+    Qwen.Free;
+    NN.Free;
   end;
 end;
 

@@ -2234,6 +2234,10 @@ type
   public
     constructor Create(NN: TNNet; const pKernelName: string);
     destructor Destroy(); override;
+    // A fresh READ_WRITE buffer of Bytes in this helper's context, owned by the
+    // caller; and a blocking upload of V into an existing buffer.
+    function NewOpenCLBuffer(Bytes: csize_t): cl_mem;
+    procedure UploadToOpenCLBuffer(Buf: cl_mem; V: TNNetVolume);
   end;
 
   // OpenCL device forward for the GLU-family gated feed-forward activations
@@ -4747,6 +4751,8 @@ type
     function WillOpenCL(): boolean; override;
     function OpenCLOutputBuffer(): cl_mem; override;
     function OpenCLOutputKernel(): TNeuralKernel; override;
+    // True while the live KV cache sits in FFusedSDPACL's buffers.
+    property CacheOnOpenCL: boolean read FCacheOnOpenCL;
     {$ENDIF}
     property QHeads: integer read FQHeads;
     property KVHeads: integer read FKVHeads;
@@ -5209,6 +5215,10 @@ type
     // Reads the live history buffer back into Hist (blocking). Nothing to read
     // before the first UploadHistory, which the caller tracks.
     procedure DownloadHistory(Hist: TNNetVolume);
+    // Copies between the live history buffer and Slot, both in OpenCL memory,
+    // on the decode queue. CopyHistoryFrom sizes the two buffers for Hist.
+    procedure CopyHistoryTo(Slot: cl_mem; Bytes: csize_t);
+    procedure CopyHistoryFrom(Slot: cl_mem; Hist: TNNetVolume);
     // Incremental-decode forward: same arguments as Compute (Off is always
     // K-1, the causal offset), plus the resident history the launch reads and
     // advances. UploadHistory must have run for this session.
@@ -5252,6 +5262,10 @@ type
     // Reads the state bank back into S (blocking). Nothing to read before the
     // first UploadState, which the caller tracks.
     procedure DownloadState(S: TNNetVolume);
+    // Copies between the state bank and Slot, both in OpenCL memory, on this
+    // helper's queue. CopyStateFrom sizes the bank for S.
+    procedure CopyStateTo(Slot: cl_mem; Bytes: csize_t);
+    procedure CopyStateFrom(Slot: cl_mem; S: TNNetVolume);
     // ALog / DtBias / NormW are Neurons[0..2]'s weights; X is the packed
     // [q|k|v|z|b|a] input and Y receives the gated read-out. S sizes the
     // resident state bank. The six channel offsets come from the layer so the
@@ -9553,6 +9567,21 @@ type
       // Snapshot / fork: copy the persisted state and step count out / back.
       procedure CaptureState(Dst: TNNetVolume; out Steps: integer); virtual; abstract;
       procedure RestoreState(Src: TNNetVolume; Steps: integer); virtual; abstract;
+      // Bytes of the persisted decode state, so a checkpoint store can size one
+      // slot per layer before any decode step runs. Valid after Begin.
+      function StateBytes(): int64; virtual; abstract;
+      // True while the live decode state sits in OpenCL memory rather than in
+      // the layer's RAM volume (false for a layer without an OpenCL path).
+      function StateOnOpenCL(): boolean; virtual;
+      {$IFDEF OpenCL}
+      // A fresh StateBytes-sized buffer in this layer's OpenCL context, owned
+      // by the caller (clReleaseMemObject); nil when the layer has no OpenCL path.
+      function NewStateSlotOnOpenCL(): cl_mem; virtual;
+      // Copy the live state into / out of Slot without leaving OpenCL memory
+      // (a RAM-resident state is uploaded, never downloaded); Steps travel too.
+      procedure CaptureStateToOpenCL(Slot: cl_mem; out Steps: integer); virtual;
+      procedure RestoreStateFromOpenCL(Slot: cl_mem; Steps: integer); virtual;
+      {$ENDIF}
       property DecodeEnabled: boolean read FDecodeEnabled;
       property DecodeSteps: integer read FDecodeSteps;
   end;
@@ -9701,6 +9730,13 @@ type
       procedure ResetState(); override;
       procedure CaptureState(Dst: TNNetVolume; out Steps: integer); override;
       procedure RestoreState(Src: TNNetVolume; Steps: integer); override;
+      function StateBytes(): int64; override;
+      function StateOnOpenCL(): boolean; override;
+      {$IFDEF OpenCL}
+      function NewStateSlotOnOpenCL(): cl_mem; override;
+      procedure CaptureStateToOpenCL(Slot: cl_mem; out Steps: integer); override;
+      procedure RestoreStateFromOpenCL(Slot: cl_mem; Steps: integer); override;
+      {$ENDIF}
       // Frozen chunk-eligibility (see TNNetLayerThreading.ChunkEligible): CPU
       // forward only (not WillOpenCL - matching TNNetConvolution's conservative
       // rule, even though decode steps never dispatch to the device). The
@@ -10842,6 +10878,13 @@ type
       procedure ResetState(); override;
       procedure CaptureState(Dst: TNNetVolume; out Steps: integer); override;
       procedure RestoreState(Src: TNNetVolume; Steps: integer); override;
+      function StateBytes(): int64; override;
+      function StateOnOpenCL(): boolean; override;
+      {$IFDEF OpenCL}
+      function NewStateSlotOnOpenCL(): cl_mem; override;
+      procedure CaptureStateToOpenCL(Slot: cl_mem; out Steps: integer); override;
+      procedure RestoreStateFromOpenCL(Slot: cl_mem; Steps: integer); override;
+      {$ENDIF}
       // Frozen chunk-eligibility (see TNNetLayerThreading.ChunkEligible): the
       // k-head axis has independent work in BOTH modes (the per-head t-scan is
       // the sequential part; heads never interact), and this layer has no
@@ -11009,6 +11052,7 @@ type
       procedure ResetState(); override;
       procedure CaptureState(Dst: TNNetVolume; out Steps: integer); override;
       procedure RestoreState(Src: TNNetVolume; Steps: integer); override;
+      function StateBytes(): int64; override;
   end;
 
   /// TNNetCrossWKV: a TWO-SOURCE key/value variant of the RWKV-4 WKV
@@ -11852,6 +11896,7 @@ type
       procedure ResetState(); override;
       procedure CaptureState(Dst: TNNetVolume; out Steps: integer); override;
       procedure RestoreState(Src: TNNetVolume; Steps: integer); override;
+      function StateBytes(): int64; override;
   end;
 
   /// TNNetMamba2: the Mamba-2 / State-Space Duality (SSD) sequence mixer
@@ -33171,22 +33216,16 @@ end;
 
 procedure TNNetScaledDotProductAttention.TruncateCache(NewLength: integer);
 begin
-  ForceCacheOnRAM();
   if not FCacheEnabled then
-  begin
-    FErrorProc('TNNetScaledDotProductAttention.TruncateCache requires the ' +
-      'cached path. Call BeginIncrementalDecode first.');
-    exit;
-  end;
+    raise Exception.Create('TNNetScaledDotProductAttention.TruncateCache' +
+      ' requires the cached path. Call BeginIncrementalDecode first.');
   if (NewLength < 0) or (NewLength > FCacheLen) then
-  begin
-    FErrorProc('TNNetScaledDotProductAttention.TruncateCache requires ' +
-      '0 <= NewLength <= CacheLength. Got NewLength=' + IntToStr(NewLength) +
-      ', CacheLength=' + IntToStr(FCacheLen));
-    exit;
-  end;
-  // One-field rewind: the preallocated K/V buffers keep their storage and the
-  // truncated slots are overwritten by the next append.
+    raise Exception.Create('TNNetScaledDotProductAttention.TruncateCache' +
+      ' requires 0 <= NewLength <= CacheLength. Got NewLength=' +
+      IntToStr(NewLength) + ', CacheLength=' + IntToStr(FCacheLen));
+  // One-field rewind: the preallocated K/V buffers keep their storage, the
+  // truncated slots are overwritten by the next append, and a cache resident
+  // in OpenCL memory stays there (the kernels take the slot per launch).
   FCacheLen := NewLength;
 end;
 
@@ -37658,6 +37697,16 @@ begin
   inherited Destroy();
 end;
 
+function TNNetKernelCL.NewOpenCLBuffer(Bytes: csize_t): cl_mem;
+begin
+  Result := FKernel.CreateBuffer(CL_MEM_READ_WRITE, Bytes);
+end;
+
+procedure TNNetKernelCL.UploadToOpenCLBuffer(Buf: cl_mem; V: TNNetVolume);
+begin
+  FKernel.WriteBuffer(Buf, V, CL_TRUE);
+end;
+
 procedure TNNetKernelCL.UploadInt8Table(var pCodeBuf: cl_mem;
   var pCodeCap: csize_t; var pScaleBuf: cl_mem; var pScaleCap: csize_t;
   pCodes: TNeuralInt8ArrPtr; pScales: TNeuralFloatArrPtr;
@@ -38284,6 +38333,20 @@ begin
   FDecodeKernel.ReadBuffer(HistBuffer, Hist, CL_TRUE);
 end;
 
+procedure TNNetDepthwiseConv1DCL.CopyHistoryTo(Slot: cl_mem; Bytes: csize_t);
+begin
+  FDecodeKernel.CopyBuffer(LiveHistoryBuffer(), Slot, Bytes);
+  // The slot may be read next by another net's queue, so the copy completes here.
+  FDecodeKernel.Finish();
+end;
+
+procedure TNNetDepthwiseConv1DCL.CopyHistoryFrom(Slot: cl_mem; Hist: TNNetVolume);
+begin
+  FDecodeKernel.EnsureOutputBuffer(FBufHistA, FCapHistA, Hist);
+  FDecodeKernel.EnsureOutputBuffer(FBufHistB, FCapHistB, Hist);
+  FDecodeKernel.CopyBuffer(Slot, LiveHistoryBuffer(), Hist.GetMemSize());
+end;
+
 procedure TNNetDepthwiseConv1DCL.ComputeDecode(PackedW, Bias, X, Y: TNNetVolume;
   SeqLen, Channels, Ksize, SuppressBias: integer; NewW: boolean = true;
   pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
@@ -38410,6 +38473,19 @@ begin
   if not Assigned(FBufS) then exit;
   FKernel.Finish();
   FKernel.ReadBuffer(FBufS, S, CL_TRUE);
+end;
+
+procedure TNNetGatedDeltaNetCL.CopyStateTo(Slot: cl_mem; Bytes: csize_t);
+begin
+  FKernel.CopyBuffer(FBufS, Slot, Bytes);
+  // The slot may be read next by another net's queue, so the copy completes here.
+  FKernel.Finish();
+end;
+
+procedure TNNetGatedDeltaNetCL.CopyStateFrom(Slot: cl_mem; S: TNNetVolume);
+begin
+  FKernel.EnsureOutputBuffer(FBufS, FCapS, S);
+  FKernel.CopyBuffer(Slot, FBufS, S.GetMemSize());
 end;
 
 procedure TNNetGatedDeltaNetCL.Compute(ALog, DtBias, NormW, X, Y, S: TNNetVolume;
@@ -61815,6 +61891,33 @@ begin
   ResetState();
 end;
 
+function TNNetRecurrentDecodeBase.StateOnOpenCL(): boolean;
+begin
+  Result := false;
+end;
+
+{$IFDEF OpenCL}
+function TNNetRecurrentDecodeBase.NewStateSlotOnOpenCL(): cl_mem;
+begin
+  Result := nil;
+end;
+
+procedure TNNetRecurrentDecodeBase.CaptureStateToOpenCL(Slot: cl_mem;
+  out Steps: integer);
+begin
+  Steps := FDecodeSteps;
+  raise Exception.Create(ClassName + '.CaptureStateToOpenCL: this layer keeps' +
+    ' its decode state in RAM; use CaptureState.');
+end;
+
+procedure TNNetRecurrentDecodeBase.RestoreStateFromOpenCL(Slot: cl_mem;
+  Steps: integer);
+begin
+  raise Exception.Create(ClassName + '.RestoreStateFromOpenCL: this layer keeps' +
+    ' its decode state in RAM; use RestoreState.');
+end;
+{$ENDIF}
+
 constructor TNNetDepthwiseConv1D.Create(pKernelSize: integer; pCausal: boolean = true; pSuppressBias: integer = 0);
 begin
   inherited Create();
@@ -62210,6 +62313,50 @@ begin
   FDecodeSteps := Steps;
   {$IFDEF OpenCL} FDecHistOnOpenCL := false; {$ENDIF}
 end;
+
+function TNNetDepthwiseConv1D.StateBytes(): int64;
+begin
+  Result := FDecHist.GetMemSize();
+end;
+
+function TNNetDepthwiseConv1D.StateOnOpenCL(): boolean;
+begin
+  {$IFDEF OpenCL} Result := FDecHistOnOpenCL; {$ELSE} Result := false; {$ENDIF}
+end;
+
+{$IFDEF OpenCL}
+function TNNetDepthwiseConv1D.NewStateSlotOnOpenCL(): cl_mem;
+begin
+  if Assigned(FDepthwise1DCL)
+    then Result := FDepthwise1DCL.NewOpenCLBuffer(FDecHist.GetMemSize())
+    else Result := nil;
+end;
+
+procedure TNNetDepthwiseConv1D.CaptureStateToOpenCL(Slot: cl_mem;
+  out Steps: integer);
+begin
+  if not Assigned(FDepthwise1DCL) then
+    raise Exception.Create('TNNetDepthwiseConv1D.CaptureStateToOpenCL: the' +
+      ' layer has no OpenCL path.');
+  // The live history is wherever the flag says; a RAM-resident one is uploaded
+  // straight into the slot so the layer's own buffers are never touched.
+  if FDecHistOnOpenCL
+    then FDepthwise1DCL.CopyHistoryTo(Slot, FDecHist.GetMemSize())
+    else FDepthwise1DCL.UploadToOpenCLBuffer(Slot, FDecHist);
+  Steps := FDecodeSteps;
+end;
+
+procedure TNNetDepthwiseConv1D.RestoreStateFromOpenCL(Slot: cl_mem;
+  Steps: integer);
+begin
+  if not Assigned(FDepthwise1DCL) then
+    raise Exception.Create('TNNetDepthwiseConv1D.RestoreStateFromOpenCL: the' +
+      ' layer has no OpenCL path.');
+  FDepthwise1DCL.CopyHistoryFrom(Slot, FDecHist);
+  FDecHistOnOpenCL := true;
+  FDecodeSteps := Steps;
+end;
+{$ENDIF}
 
 {$IFDEF OpenCL}
 procedure TNNetDepthwiseConv1D.DisableOpenCL();
@@ -63679,6 +63826,11 @@ begin
   Move(Src.FData[FChannels],     FDecBB.FData[0], RowBytes);
   Move(Src.FData[2 * FChannels], FDecPP.FData[0], RowBytes);
   FDecodeSteps := Steps;
+end;
+
+function TNNetWKV.StateBytes(): int64;
+begin
+  Result := 3 * FChannels * csNeuralFloatSize;
 end;
 
 procedure TNNetWKV.Backpropagate();
@@ -70799,6 +70951,50 @@ begin
   {$IFDEF OpenCL} FDecSOnOpenCL := false; {$ENDIF}
 end;
 
+function TNNetGatedDeltaNet.StateBytes(): int64;
+begin
+  Result := FDecS.GetMemSize();
+end;
+
+function TNNetGatedDeltaNet.StateOnOpenCL(): boolean;
+begin
+  {$IFDEF OpenCL} Result := FDecSOnOpenCL; {$ELSE} Result := false; {$ENDIF}
+end;
+
+{$IFDEF OpenCL}
+function TNNetGatedDeltaNet.NewStateSlotOnOpenCL(): cl_mem;
+begin
+  if Assigned(FGatedDeltaNetCL)
+    then Result := FGatedDeltaNetCL.NewOpenCLBuffer(FDecS.GetMemSize())
+    else Result := nil;
+end;
+
+procedure TNNetGatedDeltaNet.CaptureStateToOpenCL(Slot: cl_mem;
+  out Steps: integer);
+begin
+  if not Assigned(FGatedDeltaNetCL) then
+    raise Exception.Create('TNNetGatedDeltaNet.CaptureStateToOpenCL: the' +
+      ' layer has no OpenCL path.');
+  // The live state is wherever the flag says; a RAM-resident one is uploaded
+  // straight into the slot so the layer's own bank is never touched.
+  if FDecSOnOpenCL
+    then FGatedDeltaNetCL.CopyStateTo(Slot, FDecS.GetMemSize())
+    else FGatedDeltaNetCL.UploadToOpenCLBuffer(Slot, FDecS);
+  Steps := FDecodeSteps;
+end;
+
+procedure TNNetGatedDeltaNet.RestoreStateFromOpenCL(Slot: cl_mem;
+  Steps: integer);
+begin
+  if not Assigned(FGatedDeltaNetCL) then
+    raise Exception.Create('TNNetGatedDeltaNet.RestoreStateFromOpenCL: the' +
+      ' layer has no OpenCL path.');
+  FGatedDeltaNetCL.CopyStateFrom(Slot, FDecS);
+  FDecSOnOpenCL := true;
+  FDecodeSteps := Steps;
+end;
+{$ENDIF}
+
 procedure TNNetGatedDeltaNet.AfterWeightUpdate();
 begin
   inherited AfterWeightUpdate();
@@ -73783,6 +73979,11 @@ procedure TNNetSelectiveSSM.RestoreState(Src: TNNetVolume; Steps: integer);
 begin
   FDecH.Copy(Src);
   FDecodeSteps := Steps;
+end;
+
+function TNNetSelectiveSSM.StateBytes(): int64;
+begin
+  Result := FDecH.GetMemSize();
 end;
 
 procedure TNNetSelectiveSSM.Backpropagate();

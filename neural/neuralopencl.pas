@@ -153,6 +153,9 @@ type
     // persistent buffer without moving the whole allocation.
     function WriteBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_FALSE): integer;
     function ReadBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_TRUE): integer;
+    // Enqueues a cb-byte copy from src to dst on this queue, both in OpenCL
+    // memory; ordered after earlier work on the queue and returns at once.
+    function CopyBuffer(src, dst: cl_mem; cb: csize_t): integer;
 
     function CreateInputBuffer(size: csize_t): cl_mem; overload; {$IFDEF Release} inline; {$ENDIF}
     function CreateHostInputBuffer(size: csize_t; ptr: Pointer): cl_mem; overload; {$IFDEF Release} inline; {$ENDIF}
@@ -2660,6 +2663,16 @@ begin
   begin
     FErrorProc('ERROR: Failed to read buffer slice: ' + IntToStr(Result) +
       ' Offset:' + IntToStr(offsetBytes) + ' Size:' + IntToStr(cb) + ' bytes.');
+  end;
+end;
+
+function TEasyOpenCL.CopyBuffer(src, dst: cl_mem; cb: csize_t): integer;
+begin
+  Result := clEnqueueCopyBuffer(FCommands, src, dst, 0, 0, cb, 0, nil, nil);
+  if (Result <> CL_SUCCESS) then
+  begin
+    FErrorProc('ERROR: Failed to copy buffer: ' + IntToStr(Result) +
+      ' Size:' + IntToStr(cb) + ' bytes.');
   end;
 end;
 
