@@ -78,10 +78,11 @@ type
     // Two greedy chat turns with --prefill-window 6 --prefill-tail-window 2
     // against the token-by-token prefill; per-stage window counts asserted.
     procedure RunQwen35ChatPrefillLadderParity(const ExtraArgs: array of string);
-    // Turn 1 prompt P, then a second prompt that re-renders the reply (P+X),
-    // echoes it (P+R+Y) or diverges inside P, each against a fresh engine.
-    procedure RunQwen35ChatPromptSnapshotResume(const ExtraArgs: array of string;
-      Ladder: boolean; Turn1Len: integer; PromptSnapshot: boolean);
+    // Turn 1 prompt P, then a second prompt that diverges at P's start,
+    // inside P, re-renders the reply (P+X) or echoes it (P+R+Y), each
+    // against a fresh engine.
+    procedure RunQwen35ChatCheckpointResume(const ExtraArgs: array of string;
+      Ladder: boolean; Turn1Len: integer);
     // Reply, completion count and cached ids equal.
     procedure AssertSameChatTurn(const Expected, Actual: TChatTurnRecord;
       const What: string);
@@ -366,10 +367,12 @@ type
     procedure TestQwen35ChatPrefillLadderParity;
     procedure TestQwen35ChatPrefillLadderInt8KVParity;
     procedure TestQwen35ChatPrefillLadderOpenCLParity;
-    procedure TestQwen35ChatPromptSnapshotResume;
-    procedure TestQwen35ChatPromptSnapshotLadder;
-    procedure TestQwen35ChatPromptSnapshotInt8KV;
-    procedure TestQwen35ChatPromptSnapshotOpenCL;
+    procedure TestQwen35ChatCheckpointResume;
+    procedure TestQwen35ChatCheckpointLadder;
+    procedure TestQwen35ChatCheckpointInt8KV;
+    procedure TestQwen35ChatCheckpointOpenCL;
+    procedure TestQwen35ChatCheckpointRetention;
+    procedure TestQwen35ChatCheckpointFlagErrors;
     procedure TestQwen35ChatPrefillTailWindowErrors;
     procedure TestQwen35BorrowedTwinBuild;
     procedure TestQwen35BorrowedTwinInferenceMemory;
@@ -11412,23 +11415,25 @@ begin
   end;
 end;
 
-// Engine-level parity of the end-of-prompt snapshot on the tiny_qwen3_5
-// hybrid. Turn 1 feeds prompt P (Turn1Len ids) and produces reply R. The
-// second prompt then takes one of three shapes, each answered by the warm
-// engine and by a fresh engine that sees only that prompt; both must produce
-// the same reply and cached ids (tolerance 0, the snapshot contract):
-//   re-rendered: P + X with X[0] <> R[0] - PromptSnap resumes at |P|-1 and
-//     |X| tokens are prefilled (P's last id, fed as turn 1's first decode
-//     input, is not in the snapshot); with --no-prompt-snapshot nothing
-//     resumes;
-//   echo: P + R + Y - TurnSnap is deeper and wins, reused = |P + R| - 1;
-//   divergent: P changed inside, then X - full reset, reused 0.
+// Engine-level parity of the cache checkpoints on the tiny_qwen3_5 hybrid.
+// Turn 1 feeds prompt P (Turn1Len ids) and produces reply R. The second
+// prompt then takes one of four shapes, each answered by the warm engine and
+// by a fresh engine that sees only that prompt; both must produce the same
+// reply and cached ids (tolerance 0):
+//   start: P changed at id 0, then X - nothing to resume from, reused 0;
+//   inside: P changed at id |P| div 2, then X - the deepest checkpoint at or
+//     below the divergence is resumed (a window checkpoint with the ladder,
+//     within one window of the divergence; none without it);
+//   re-rendered: P + X with X[0] <> R[0] - the end-of-prompt checkpoint
+//     resumes at |P|-1 (P's last id, fed as turn 1's first decode input, is
+//     not in the cache) and |X| tokens are prefilled;
+//   echo: P + R + Y - the end-of-reply checkpoint is deeper and wins.
 // With the ladder (--prefill-window 6 --prefill-tail-window 2) Turn1Len 7, 9
-// and 10 put the end of P in the window, tail and width-1 session. Prompt
-// ids are fed directly (the fixture vocab is 13 ids). Coded by Claude (AI).
-procedure TTestNeuralPretrained.RunQwen35ChatPromptSnapshotResume(
-  const ExtraArgs: array of string; Ladder: boolean; Turn1Len: integer;
-  PromptSnapshot: boolean);
+// and 10 put the end of P in the window, tail and width-1 session, and 17
+// puts a window checkpoint below the inside divergence. Prompt ids are fed
+// directly (the fixture vocab is 13 ids). Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunQwen35ChatCheckpointResume(
+  const ExtraArgs: array of string; Ladder: boolean; Turn1Len: integer);
 const
   Ctx = 40;
   MaxNew = 3;
@@ -11437,10 +11442,10 @@ const
   TailLen = 2;
   ExtraLen = 5;
 type
-  TSecondPrompt = (spReRendered, spEcho, spDivergent);
+  TSecondPrompt = (spStart, spInside, spReRendered, spEcho);
 const
-  CaseName: array[TSecondPrompt] of string = ('re-rendered', 'echo',
-    'divergent');
+  CaseName: array[TSecondPrompt] of string = ('start', 'inside',
+    're-rendered', 'echo');
 var
   Dir, Tag: string;
 
@@ -11466,21 +11471,46 @@ var
         Args.Add('--prefill-window'); Args.Add(IntToStr(WindowLen));
         Args.Add('--prefill-tail-window'); Args.Add(IntToStr(TailLen));
       end;
-      if not PromptSnapshot then Args.Add('--no-prompt-snapshot');
       for Extra := 0 to High(ExtraArgs) do Args.Add(ExtraArgs[Extra]);
       ParsedOK := ParseArgs(Args, Opt);
       AssertTrue(Tag + 'chat options parse: ' + Opt.ErrorMsg, ParsedOK);
-      AssertEquals(Tag + '--no-prompt-snapshot parsed', not PromptSnapshot,
-        Opt.NoPromptSnapshot);
       LoadedOK := Result.LoadModel(Opt, ErrorMsg);
       AssertTrue(Tag + 'LoadModel: ' + ErrorMsg, LoadedOK);
-      AssertTrue(Tag + 'the fixture is a hybrid (snapshot route)',
+      AssertTrue(Tag + 'the fixture is a hybrid (checkpoint route)',
         Result.StateReuseOK);
+      AssertEquals(Tag + 'the store is sized at load',
+        Result.Opt.CacheCheckpoints, Length(Result.Checkpoints));
+      AssertTrue(Tag + 'the default store holds at least two checkpoints',
+        Length(Result.Checkpoints) >= 2);
       AssertEquals(Tag + 'twins present exactly with the ladder', Ladder,
         Assigned(Result.WindowNN) and Assigned(Result.TailNN));
+      // Under --gpu the slots live in OpenCL memory (a capture is a copy
+      // between resident buffers); on the CPU they are host volumes.
+      AssertEquals(Tag + 'checkpoint slots in OpenCL memory exactly under --gpu',
+        Result.Opt.Gpu, Result.Checkpoints[0].OpenCLSlotCount > 0);
     finally
       Args.Free;
     end;
+  end;
+
+  function HoldsPosition(Engine: TChatEngine; Position: integer): boolean;
+  var
+    SlotPos: integer;
+  begin
+    Result := false;
+    for SlotPos := 0 to High(Engine.Checkpoints) do
+      if Engine.Checkpoints[SlotPos].Position = Position then exit(true);
+  end;
+
+  function DeepestHeldAtOrBelow(Engine: TChatEngine; Limit: integer): integer;
+  var
+    SlotPos: integer;
+  begin
+    Result := 0;
+    for SlotPos := 0 to High(Engine.Checkpoints) do
+      if (Engine.Checkpoints[SlotPos].Position <= Limit) and
+        (Engine.Checkpoints[SlotPos].Position > Result) then
+        Result := Engine.Checkpoints[SlotPos].Position;
   end;
 
   procedure RunTurn(Engine: TChatEngine; const Prompt: TNeuralIntegerArray;
@@ -11492,6 +11522,14 @@ var
     Turn.Cached := Copy(Engine.CachedTokens);
     AssertTrue(Tag + 'the width-1 session holds the state after a turn',
       Engine.ActiveSession = Engine.Session);
+    // The store never claims a position past the cached sequence, and the
+    // two turn-boundary checkpoints are always held.
+    AssertEquals(Tag + 'no checkpoint past the cached sequence',
+      Length(Turn.Cached), DeepestHeldAtOrBelow(Engine, Ctx));
+    AssertTrue(Tag + 'end-of-prompt checkpoint held',
+      HoldsPosition(Engine, Length(Prompt) - 1));
+    AssertTrue(Tag + 'end-of-reply checkpoint held',
+      HoldsPosition(Engine, Length(Turn.Cached)));
   end;
 
   procedure AssertOnDevice(Engine: TChatEngine; const What: string);
@@ -11516,7 +11554,7 @@ var
     Warm, Fresh: TChatEngine;
     Prompt1, Prompt2: TNeuralIntegerArray;
     Turn1, Warm2, Fresh2: TChatTurnRecord;
-    Pos, FedCount, ExpectedReused: integer;
+    Pos, FedCount, DivPos, ExpectedReused, ExpectedPrefix: integer;
   begin
     Tag := CaseName[Kind] + ' (turn 1 of ' + IntToStr(Turn1Len) + '): ';
     Warm := NewEngine();
@@ -11531,6 +11569,8 @@ var
         Turn1.Completion >= 2);
       FedCount := Turn1Len - 1;
       AssertEquals(Tag + 'turn 1 reused nothing', 0, Warm.LastReusedTokens);
+      AssertEquals(Tag + 'turn 1 shared no prefix', 0, Warm.LastPrefixTokens);
+      AssertEquals(Tag + 'turn 1 saw an empty cache', 0, Warm.LastCachedTokens);
       AssertEquals(Tag + 'turn 1 prefill count', FedCount,
         Warm.LastPrefillTokens);
       if Ladder then
@@ -11539,49 +11579,61 @@ var
           Warm.LastPrefillWindows);
         AssertEquals(Tag + 'turn 1 tail windows of 2',
           (FedCount mod WindowLen) div TailLen, Warm.LastPrefillTailWindows);
+        // Every window the width-6 twin fed left a checkpoint at its end.
+        for Pos := 1 to FedCount div WindowLen do
+          AssertTrue(Tag + 'window checkpoint at ' + IntToStr(Pos * WindowLen),
+            HoldsPosition(Warm, Pos * WindowLen));
       end;
-      AssertEquals(Tag + 'prompt snapshot held', PromptSnapshot,
-        Assigned(Warm.PromptSnap));
-      if PromptSnapshot then
-        AssertEquals(Tag + 'prompt snapshot position', FedCount,
-          Warm.PromptSnapPos);
-      AssertTrue(Tag + 'turn snapshot held', Assigned(Warm.TurnSnap));
-      AssertEquals(Tag + 'turn snapshot position', Length(Turn1.Cached),
-        Warm.TurnSnapPos);
       AssertTrue(Tag + 'the cached sequence starts with P',
         CommonPrefixLen(Turn1.Cached, Prompt1) = Turn1Len);
+      SetLength(Prompt2, Turn1Len + ExtraLen);
+      Move(Prompt1[0], Prompt2[0], Turn1Len * csIntegerSize);
+      for Pos := 0 to ExtraLen - 1 do
+        Prompt2[Turn1Len + Pos] := (7 * Pos + 3) mod Vocab;
       case Kind of
+        spStart:
+        begin
+          Prompt2[0] := (Prompt1[0] + 1) mod Vocab;
+          ExpectedPrefix := 0;
+          ExpectedReused := 0;
+        end;
+        spInside:
+        begin
+          DivPos := Turn1Len div 2;
+          Prompt2[DivPos] := (Prompt1[DivPos] + 1) mod Vocab;
+          ExpectedPrefix := DivPos;
+          ExpectedReused := DeepestHeldAtOrBelow(Warm, DivPos);
+          if Ladder and (DivPos >= WindowLen) then
+            AssertTrue(Tag + 'a window checkpoint within one window below' +
+              ' the divergence', (ExpectedReused > 0) and
+              (DivPos - ExpectedReused < WindowLen))
+          else
+            AssertEquals(Tag + 'no checkpoint below the divergence', 0,
+              ExpectedReused);
+        end;
         spReRendered:
         begin
-          SetLength(Prompt2, Turn1Len + ExtraLen);
-          Move(Prompt1[0], Prompt2[0], Turn1Len * csIntegerSize);
-          for Pos := 0 to ExtraLen - 1 do
-            Prompt2[Turn1Len + Pos] := (7 * Pos + 3) mod Vocab;
           Prompt2[Turn1Len] := (Turn1.Cached[Turn1Len] + 1) mod Vocab;
-          if PromptSnapshot then ExpectedReused := FedCount
-          else ExpectedReused := 0;
+          ExpectedPrefix := Turn1Len;
+          ExpectedReused := FedCount;
         end;
-        spEcho:
+        else
         begin
           SetLength(Prompt2, Length(Turn1.Cached) + ExtraLen);
           Move(Turn1.Cached[0], Prompt2[0], Length(Turn1.Cached) * csIntegerSize);
           for Pos := 0 to ExtraLen - 1 do
             Prompt2[Length(Turn1.Cached) + Pos] := (7 * Pos + 3) mod Vocab;
+          ExpectedPrefix := Length(Turn1.Cached);
           ExpectedReused := Length(Turn1.Cached);
-        end;
-        else
-        begin
-          SetLength(Prompt2, Turn1Len + ExtraLen);
-          Move(Prompt1[0], Prompt2[0], Turn1Len * csIntegerSize);
-          Prompt2[Turn1Len div 2] := (Prompt1[Turn1Len div 2] + 1) mod Vocab;
-          for Pos := 0 to ExtraLen - 1 do
-            Prompt2[Turn1Len + Pos] := (7 * Pos + 3) mod Vocab;
-          ExpectedReused := 0;
         end;
       end;
       RunTurn(Warm, Prompt2, Warm2);
       AssertEquals(Tag + 'turn 2 reused', ExpectedReused,
         Warm.LastReusedTokens);
+      AssertEquals(Tag + 'turn 2 prefix', ExpectedPrefix,
+        Warm.LastPrefixTokens);
+      AssertEquals(Tag + 'turn 2 cached count', Length(Turn1.Cached),
+        Warm.LastCachedTokens);
       AssertEquals(Tag + 'turn 2 prefill count',
         Length(Prompt2) - 1 - ExpectedReused, Warm.LastPrefillTokens);
       AssertTrue(Tag + 'turn 2 produced tokens', Warm2.Completion > 0);
@@ -11609,54 +11661,416 @@ begin
   end;
 end;
 
-procedure TTestNeuralPretrained.TestQwen35ChatPromptSnapshotResume;
+procedure TTestNeuralPretrained.TestQwen35ChatCheckpointResume;
 var
   Args: TStringList;
   Opt: TChatOptions;
 begin
   Args := TStringList.Create();
   try
-    Args.Add('/tmp/model'); Args.Add('--no-prompt-snapshot');
-    AssertTrue('--no-prompt-snapshot parses', ParseArgs(Args, Opt));
-    AssertTrue('--no-prompt-snapshot value', Opt.NoPromptSnapshot);
-    AssertFalse('the prompt snapshot is on by default',
-      DefaultChatOptions().NoPromptSnapshot);
+    AssertEquals('not given until LoadModel resolves it', -1,
+      DefaultChatOptions().CacheCheckpoints);
+    Args.Add('/tmp/model'); Args.Add('--cache-checkpoints'); Args.Add('4');
+    AssertTrue('--cache-checkpoints 4 parses', ParseArgs(Args, Opt));
+    AssertEquals('--cache-checkpoints value', 4, Opt.CacheCheckpoints);
+    Args.Clear();
+    Args.Add('/tmp/model'); Args.Add('--cache-checkpoints'); Args.Add('-3');
+    AssertFalse('a negative count is refused', ParseArgs(Args, Opt));
+    AssertTrue('the refusal names the flag: ' + Opt.ErrorMsg,
+      Pos('--cache-checkpoints', Opt.ErrorMsg) > 0);
   finally
     Args.Free;
   end;
-  // Token-by-token prefill, FP32 KV, the default parallel forward; then the
-  // opt-out, where a re-rendered reply falls back to the full reset.
-  RunQwen35ChatPromptSnapshotResume(['--kv-fp32'], false, 10, true);
-  RunQwen35ChatPromptSnapshotResume(['--kv-fp32'], false, 10, false);
+  // Token-by-token prefill, FP32 KV, the default parallel forward (the two
+  // turn-boundary checkpoints only); then the ladder with a window
+  // checkpoint below the inside divergence.
+  RunQwen35ChatCheckpointResume(['--kv-fp32'], false, 10);
+  RunQwen35ChatCheckpointResume(['--kv-fp32'], true, 17);
 end;
 
-procedure TTestNeuralPretrained.TestQwen35ChatPromptSnapshotLadder;
+procedure TTestNeuralPretrained.TestQwen35ChatCheckpointLadder;
 begin
   // The end of P inside the width-6 window session (6 fed), the tail
   // session (6 + 2) and the width-1 session (6 + 2 + 1).
-  RunQwen35ChatPromptSnapshotResume(['--kv-fp32'], true, 7, true);
-  RunQwen35ChatPromptSnapshotResume(['--kv-fp32'], true, 9, true);
-  RunQwen35ChatPromptSnapshotResume(['--kv-fp32'], true, 10, true);
+  RunQwen35ChatCheckpointResume(['--kv-fp32'], true, 7);
+  RunQwen35ChatCheckpointResume(['--kv-fp32'], true, 9);
+  RunQwen35ChatCheckpointResume(['--kv-fp32'], true, 10);
 end;
 
-procedure TTestNeuralPretrained.TestQwen35ChatPromptSnapshotInt8KV;
+procedure TTestNeuralPretrained.TestQwen35ChatCheckpointInt8KV;
 begin
-  // int8 KV cache: the snapshot carries the code/scale planes verbatim.
-  RunQwen35ChatPromptSnapshotResume(['--kv-int8', '--serial'], true, 9, true);
+  // int8 KV cache: TruncateTo rewinds the code/scale planes in place.
+  RunQwen35ChatCheckpointResume(['--kv-int8', '--serial'], true, 17);
 end;
 
-procedure TTestNeuralPretrained.TestQwen35ChatPromptSnapshotOpenCL;
+procedure TTestNeuralPretrained.TestQwen35ChatCheckpointOpenCL;
 begin
   {$IFDEF OpenCL}
   // The production path on a GPU, with and without the ladder; the harness
-  // asserts every TNNetFusedSDPA of every net reached the device.
-  RunQwen35ChatPromptSnapshotResume(['--int8', '--kv-int8', '--serial',
-    '--gpu'], true, 10, true);
-  RunQwen35ChatPromptSnapshotResume(['--int8', '--kv-int8', '--serial',
-    '--gpu'], false, 10, true);
+  // asserts every TNNetFusedSDPA of every net reached the device, and the
+  // store's slots live in OpenCL memory.
+  RunQwen35ChatCheckpointResume(['--int8', '--kv-int8', '--serial',
+    '--gpu'], true, 17);
+  RunQwen35ChatCheckpointResume(['--int8', '--kv-int8', '--serial',
+    '--gpu'], false, 10);
   {$ELSE}
   AssertTrue('OpenCL not compiled in: SKIP', true);
   {$ENDIF}
+end;
+
+// The retention rule on a store of 3 slots with the 6/2 ladder (band width
+// 2, the finest capture spacing): after each turn the engine's held
+// positions must equal those of a simulation of the band rule over the same
+// capture sequence (every window end, the tail window ends, the end of the
+// prompt, the end of the reply), the two turn-boundary checkpoints are
+// always held, and the second turn, which resumes inside the first prompt,
+// reuses the slots: same slot count, same bytes. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35ChatCheckpointRetention;
+const
+  Ctx = 40;
+  StoreSize = 3;
+  WindowLen = 6;
+  TailLen = 2;
+  Vocab = 13;
+  Prompt1Len = 30;
+  DivPos = 28;    // turn 2 changes this id of prompt 1
+  ExtraLen = 5;
+  MaxNew = 3;
+var
+  Dir: string;
+  Engine: TChatEngine;
+  Prompt: TNeuralIntegerArray;
+  Turn: TChatTurnRecord;
+  Sim: array[0..StoreSize - 1] of integer; // the simulation's positions
+  BytesBefore: int64;
+  Pos: integer;
+
+  function StoreBytes(): int64;
+  var
+    SlotPos: integer;
+  begin
+    Result := 0;
+    for SlotPos := 0 to High(Engine.Checkpoints) do
+      Result := Result + Engine.Checkpoints[SlotPos].Bytes();
+  end;
+
+  // The band rule as section 7.3 states it: drop what the sequence no longer
+  // vouches for, keep the deepest held checkpoint per band of distance from
+  // the capture about to land, evict the farthest one when every slot is
+  // taken, then insert.
+  procedure SimCapture(Position: integer);
+  var
+    SlotPos, OtherPos, Live, Farthest, Distance: integer;
+    Dropped: boolean;
+  begin
+    for SlotPos := 0 to StoreSize - 1 do
+      if Sim[SlotPos] = Position then exit;
+    for SlotPos := 0 to StoreSize - 1 do
+      if Sim[SlotPos] > Position then Sim[SlotPos] := 0;
+    for SlotPos := 0 to StoreSize - 1 do
+    begin
+      if Sim[SlotPos] <= 0 then continue;
+      Distance := Position - Sim[SlotPos];
+      Dropped := false;
+      for OtherPos := 0 to StoreSize - 1 do
+        if (OtherPos <> SlotPos) and (Sim[OtherPos] > Sim[SlotPos]) and
+          (Engine.CheckpointBand(Position - Sim[OtherPos]) =
+           Engine.CheckpointBand(Distance)) then Dropped := true;
+      if Dropped then Sim[SlotPos] := 0;
+    end;
+    Live := 0;
+    for SlotPos := 0 to StoreSize - 1 do
+      if Sim[SlotPos] > 0 then Inc(Live);
+    if Live >= StoreSize then
+    begin
+      Farthest := -1;
+      for SlotPos := 0 to StoreSize - 1 do
+        if (Sim[SlotPos] > 0) and
+          ((Farthest < 0) or (Sim[SlotPos] < Sim[Farthest])) then
+          Farthest := SlotPos;
+      Sim[Farthest] := 0;
+    end;
+    for SlotPos := 0 to StoreSize - 1 do
+      if Sim[SlotPos] <= 0 then
+      begin
+        Sim[SlotPos] := Position;
+        exit;
+      end;
+    Fail('simulation: no free slot');
+  end;
+
+  // Replays the ladder's capture sequence for a prefill from Reused to the
+  // end of a Len-id prompt, then the reply end.
+  procedure SimTurn(Reused, Len, ReplyEnd: integer);
+  var
+    Fed, Windows, Tails, WindowPos: integer;
+  begin
+    for WindowPos := 0 to StoreSize - 1 do
+      if Sim[WindowPos] > Reused then Sim[WindowPos] := 0;
+    Fed := Reused;
+    Windows := (Len - 1 - Reused) div WindowLen;
+    for WindowPos := 1 to Windows do
+    begin
+      Inc(Fed, WindowLen);
+      SimCapture(Fed);
+    end;
+    Tails := (Len - 1 - Fed) div TailLen;
+    for WindowPos := 1 to Tails do
+    begin
+      Inc(Fed, TailLen);
+      SimCapture(Fed);
+    end;
+    SimCapture(Len - 1);
+    SimCapture(ReplyEnd);
+  end;
+
+  procedure AssertStoreMatchesSimulation(const What: string);
+  var
+    SlotPos, OtherPos, Found: integer;
+  begin
+    AssertEquals(What + ': slot count', StoreSize, Length(Engine.Checkpoints));
+    for SlotPos := 0 to StoreSize - 1 do
+    begin
+      if Sim[SlotPos] <= 0 then continue;
+      Found := 0;
+      for OtherPos := 0 to StoreSize - 1 do
+        if Engine.Checkpoints[OtherPos].Position = Sim[SlotPos] then Inc(Found);
+      AssertEquals(What + ': simulated position ' + IntToStr(Sim[SlotPos]) +
+        ' held once', 1, Found);
+    end;
+    for SlotPos := 0 to StoreSize - 1 do
+    begin
+      if Engine.Checkpoints[SlotPos].Position <= 0 then continue;
+      Found := 0;
+      for OtherPos := 0 to StoreSize - 1 do
+        if Sim[OtherPos] = Engine.Checkpoints[SlotPos].Position then Inc(Found);
+      AssertEquals(What + ': held position ' +
+        IntToStr(Engine.Checkpoints[SlotPos].Position) + ' simulated', 1,
+        Found);
+    end;
+  end;
+
+  procedure RunTurn();
+  begin
+    Turn.Reply := Engine.GenerateFromIds(Prompt, Engine.Opt);
+    Turn.Completion := Engine.LastCompletionTokens;
+    Turn.Cached := Copy(Engine.CachedTokens);
+  end;
+
+var
+  Args: TStringList;
+  Opt: TChatOptions;
+  ErrorMsg: string;
+  ParsedOK, LoadedOK: boolean;
+begin
+  RandSeed := 464646;
+  Dir := MakeQwen35ChatModelDir();
+  Engine := TChatEngine.Create();
+  Args := TStringList.Create();
+  try
+    Args.Add(Dir);
+    Args.Add('--greedy'); Args.Add('--fp32'); Args.Add('--cpu');
+    Args.Add('--kv-fp32'); Args.Add('--serial');
+    Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
+    Args.Add('--max-new-tokens'); Args.Add(IntToStr(MaxNew));
+    Args.Add('--prefill-window'); Args.Add(IntToStr(WindowLen));
+    Args.Add('--prefill-tail-window'); Args.Add(IntToStr(TailLen));
+    Args.Add('--cache-checkpoints'); Args.Add(IntToStr(StoreSize));
+    ParsedOK := ParseArgs(Args, Opt);
+    AssertTrue('chat options parse: ' + Opt.ErrorMsg, ParsedOK);
+    LoadedOK := Engine.LoadModel(Opt, ErrorMsg);
+    AssertTrue('LoadModel: ' + ErrorMsg, LoadedOK);
+    AssertEquals('store of 3', StoreSize, Length(Engine.Checkpoints));
+    AssertEquals('band width is the tail window', TailLen,
+      Engine.CheckpointBandWidth);
+    AssertEquals('band ratio (Ctx / W)^(1 / N)',
+      Power(Ctx / TailLen, 1 / StoreSize), Engine.CheckpointBandRatio, 1e-9);
+    // The bands as the rule states them, at this ratio (about 2.71):
+    // [2, 5.4), [5.4, 14.7), [14.7, 40).
+    AssertEquals('below W is band 0', 0, Engine.CheckpointBand(1));
+    AssertEquals('W is band 0', 0, Engine.CheckpointBand(2));
+    AssertEquals('5 is band 0', 0, Engine.CheckpointBand(5));
+    AssertEquals('6 is band 1', 1, Engine.CheckpointBand(6));
+    AssertEquals('14 is band 1', 1, Engine.CheckpointBand(14));
+    AssertEquals('15 is band 2', 2, Engine.CheckpointBand(15));
+    AssertEquals('past the context is the last band', StoreSize - 1,
+      Engine.CheckpointBand(Ctx * 2));
+    for Pos := 0 to StoreSize - 1 do
+    begin
+      Sim[Pos] := 0;
+      AssertEquals('slot ' + IntToStr(Pos) + ' starts free', 0,
+        Engine.Checkpoints[Pos].Position);
+    end;
+    BytesBefore := StoreBytes();
+    AssertTrue('the slots hold state bytes at load', BytesBefore > 0);
+
+    SetLength(Prompt, Prompt1Len);
+    for Pos := 0 to Prompt1Len - 1 do Prompt[Pos] := (5 * Pos + 2) mod Vocab;
+    RunTurn();
+    AssertTrue('turn 1 produced tokens', Turn.Completion > 0);
+    AssertEquals('turn 1 windows', (Prompt1Len - 1) div WindowLen,
+      Engine.LastPrefillWindows);
+    SimTurn(0, Prompt1Len, Length(Turn.Cached));
+    AssertStoreMatchesSimulation('after turn 1');
+    AssertEquals('turn 1 kept the slot bytes', BytesBefore, StoreBytes());
+
+    // Turn 2 diverges at DivPos: the deepest checkpoint at or below it is
+    // resumed and the ones past it are dropped before the new captures.
+    SetLength(Prompt, Prompt1Len + ExtraLen);
+    for Pos := 0 to Prompt1Len - 1 do Prompt[Pos] := (5 * Pos + 2) mod Vocab;
+    Prompt[DivPos] := (Prompt[DivPos] + 1) mod Vocab;
+    for Pos := 0 to ExtraLen - 1 do
+      Prompt[Prompt1Len + Pos] := (7 * Pos + 3) mod Vocab;
+    RunTurn();
+    AssertEquals('turn 2 prefix', DivPos, Engine.LastPrefixTokens);
+    AssertTrue('turn 2 resumed a checkpoint', Engine.LastReusedTokens > 0);
+    AssertTrue('turn 2 resumed at or below the divergence',
+      Engine.LastReusedTokens <= DivPos);
+    SimTurn(Engine.LastReusedTokens, Length(Prompt), Length(Turn.Cached));
+    AssertStoreMatchesSimulation('after turn 2');
+    AssertEquals('turn 2 kept the slot bytes', BytesBefore, StoreBytes());
+  finally
+    Args.Free;
+    Engine.Free;
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+// --cache-checkpoints validation in LoadModel: 1 and 2049 stop the load, 0
+// loads with no store (a re-sent prompt re-prefills), the default on the CPU
+// is 8 slots, and a pure-attention net says the flag is inert and keeps the
+// KV-cache truncation route. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35ChatCheckpointFlagErrors;
+const
+  Ctx = 16;
+  PromptLen = 7;
+  Vocab = 13;
+var
+  Dir, ErrorMsg: string;
+  Prompt: TNeuralIntegerArray;
+  TokenPos: integer;
+
+  // Parses and loads Dir with the given flags. ExpectError = '' means the
+  // load must succeed; otherwise it must fail and the message must contain
+  // ExpectError (the engine is still returned, unloaded).
+  function RunEngine(const ModelDir: string; const Flags: array of string;
+    const ExpectError: string = ''): TChatEngine;
+  var
+    Args: TStringList;
+    Opt: TChatOptions;
+    ArgPos: integer;
+    ParsedOK, LoadedOK: boolean;
+  begin
+    Result := TChatEngine.Create();
+    Args := TStringList.Create();
+    try
+      Args.Add(ModelDir);
+      Args.Add('--greedy'); Args.Add('--fp32'); Args.Add('--cpu');
+      Args.Add('--serial');
+      Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
+      Args.Add('--max-new-tokens'); Args.Add('2');
+      for ArgPos := 0 to High(Flags) do Args.Add(Flags[ArgPos]);
+      ParsedOK := ParseArgs(Args, Opt);
+      AssertTrue('chat options parse: ' + Opt.ErrorMsg, ParsedOK);
+      FNotices := '';
+      Result.OnNotice := @CaptureNotice;
+      ErrorMsg := '';
+      LoadedOK := Result.LoadModel(Opt, ErrorMsg);
+      if ExpectError = '' then
+        AssertTrue('LoadModel: ' + ErrorMsg, LoadedOK)
+      else
+      begin
+        AssertFalse('LoadModel must refuse: ' + ExpectError, LoadedOK);
+        AssertTrue('error names the cause (' + ErrorMsg + ')',
+          Pos(ExpectError, ErrorMsg) > 0);
+      end;
+    finally
+      Args.Free;
+    end;
+  end;
+
+var
+  Engine: TChatEngine;
+begin
+  RandSeed := 474747;
+  Dir := MakeQwen35ChatModelDir();
+  SetLength(Prompt, PromptLen);
+  for TokenPos := 0 to PromptLen - 1 do
+    Prompt[TokenPos] := (5 * TokenPos + 2) mod Vocab;
+  try
+    Engine := RunEngine(Dir, ['--cache-checkpoints', '1'],
+      '--cache-checkpoints 1: must be 0 (off) or 2 to 2048');
+    Engine.Free;
+    Engine := RunEngine(Dir, ['--cache-checkpoints', '2049'],
+      '--cache-checkpoints 2049: must be 0 (off) or 2 to 2048');
+    Engine.Free;
+    // 0: the route is off, a re-sent prompt re-prefills everything.
+    Engine := RunEngine(Dir, ['--cache-checkpoints', '0']);
+    try
+      AssertTrue('the OFF notice', Pos('cache checkpoints OFF', FNotices) > 0);
+      AssertEquals('no store at 0', 0, Length(Engine.Checkpoints));
+      Engine.GenerateFromIds(Prompt, Engine.Opt);
+      Engine.GenerateFromIds(Prompt, Engine.Opt);
+      AssertEquals('re-sent prompt reused nothing at 0', 0,
+        Engine.LastReusedTokens);
+      // The cache holds the whole prompt (its last id was the first decode
+      // input), so the shared prefix is the prompt itself.
+      AssertEquals('the prefix diagnostic still reports the shared ids',
+        PromptLen, Engine.LastPrefixTokens);
+      AssertEquals('re-sent prompt prefilled everything', PromptLen - 1,
+        Engine.LastPrefillTokens);
+    finally
+      Engine.Free;
+    end;
+    // Not given: 8 slots on the CPU, and the ON notice names the store.
+    Engine := RunEngine(Dir, []);
+    try
+      AssertEquals('CPU default', 8, Engine.Opt.CacheCheckpoints);
+      AssertEquals('8 slots', 8, Length(Engine.Checkpoints));
+      AssertTrue('the ON notice', Pos('cache checkpoints ON', FNotices) > 0);
+      AssertTrue('the ON notice says where the store lives',
+        Pos('in host RAM', FNotices) > 0);
+      AssertEquals('band width without a twin: half the context', Ctx div 2,
+        Engine.CheckpointBandWidth);
+      Engine.GenerateFromIds(Prompt, Engine.Opt);
+      Engine.GenerateFromIds(Prompt, Engine.Opt);
+      AssertEquals('re-sent prompt resumed at its end', PromptLen - 1,
+        Engine.LastReusedTokens);
+      AssertEquals('re-sent prompt prefilled nothing', 0,
+        Engine.LastPrefillTokens);
+    finally
+      Engine.Free;
+    end;
+    // --no-cache-reuse sizes no store either.
+    Engine := RunEngine(Dir, ['--no-cache-reuse']);
+    try
+      AssertEquals('no store under --no-cache-reuse', 0,
+        Length(Engine.Checkpoints));
+    finally
+      Engine.Free;
+    end;
+  finally
+    RemoveChatModelDir(Dir);
+  end;
+  // A pure-attention net: the flag is inert with a notice, the KV-cache
+  // truncation route stays.
+  Dir := MakeChatModelDir('qwen2');
+  try
+    Engine := RunEngine(Dir, ['--cache-checkpoints', '4']);
+    try
+      AssertTrue('pure attention: KV-cache reuse route', Engine.ReuseOK);
+      AssertFalse('pure attention: no checkpoint route', Engine.StateReuseOK);
+      AssertEquals('pure attention: no store', 0, Length(Engine.Checkpoints));
+      AssertTrue('pure attention: the inert notice',
+        Pos('--cache-checkpoints 4 ignored', FNotices) > 0);
+      AssertTrue('pure attention: the KV-cache reuse notice',
+        Pos('KV-cache reuse ON', FNotices) > 0);
+    finally
+      Engine.Free;
+    end;
+  finally
+    RemoveChatModelDir(Dir);
+  end;
 end;
 
 procedure TTestNeuralPretrained.TestQwen35ChatPrefillLadderParity;
