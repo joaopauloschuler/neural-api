@@ -89,6 +89,12 @@ const
   csFallbackTopP = 0.2;
   csFallbackRepetitionPenalty = 1.05;
 
+  // Default width of the --prefill-window tail twin (--prefill-tail-window 0).
+  // After the width-N windows at most T-1 tokens are left for the width-1
+  // single steps, the twin costs its activations only, and a 16-wide window
+  // is still a full launch of every kernel on the device.
+  csDefaultPrefillTailWindow = 16;
+
 type
   // Weight storage the chat engine loads the checkpoint into.
   // cwmInt4 is int4 on the convolution/projection layers, int8 elsewhere.
@@ -185,6 +191,12 @@ type
                                  // twin costs its activations; a non-Llama
                                  // family falls back to a full second
                                  // build); 0 = one token per forward
+    PrefillTailWindow: integer;  // --prefill-tail-window T: a second, width-T
+                                 // twin feeds the leftover of the width-N
+                                 // windows T tokens per forward. 0 = auto
+                                 // (csDefaultPrefillTailWindow), 1 = none;
+                                 // LoadModel resolves it (1 when no tail
+                                 // twin was built)
     Host: string;                // ChatServer only: HTTP listen address
     Port: integer;               // ChatServer only: HTTP listen port
     ErrorMsg: string;
@@ -219,12 +231,20 @@ type
     NN: TNNet;
     Session: TNNetStreamingDecoder;
     // --prefill-window N: a width-N twin of NN with its own session. Whole
-    // windows of the prompt go through WindowSession; SwitchTo carries the
-    // state to Session before the width-1 tail and the decode loop. Both
-    // nil when the option is 0. WindowIn is the (N,1,1) window of token ids.
+    // windows of the prompt go through WindowSession, what they leave over
+    // goes through the width-T tail twin (TailSession), and SwitchTo carries
+    // the state to Session before the single steps and the decode loop. All
+    // nil when the option is 0 (the tail trio also when no tail twin was
+    // built). WindowIn / TailIn are the (N,1,1) / (T,1,1) windows of ids.
     WindowNN: TNNet;
     WindowSession: TNNetStreamingDecoder;
     WindowIn: TNNetVolume;
+    TailNN: TNNet;
+    TailSession: TNNetStreamingDecoder;
+    TailIn: TNNetVolume;
+    // The one snapshot SwitchTo captures into (SnapshotInto reuses its
+    // volumes), allocated with the twins; nil without them.
+    TransferSnap: TNNetDecoderSessionSnapshot;
     // True when WindowNN borrows NN's weights (BuildFromPretrained with
     // pWeightOwner: the checkpoint is read once and the twin holds no weight
     // storage); false on the non-Llama fallback, a full second build.
@@ -276,6 +296,8 @@ type
     LastFinishReason: string;
     LastPrefillWindows: integer; // whole windows the last call fed through
                                  // WindowSession (0 without --prefill-window)
+    LastPrefillTailWindows: integer; // whole windows the last call fed
+                                 // through TailSession (0 without a tail twin)
     // Lifetime totals over every GenerateFromIds call of this engine, for a
     // host that reports usage for as long as it runs (the [stats] totals
     // lines). Input = prompt tokens and the prefill time; cached = the part
@@ -425,9 +447,16 @@ begin
   WriteLn('                        costs its activations only. Model families outside');
   WriteLn('                        the Llama builder (llama, mistral, qwen*, gemma*,');
   WriteLn('                        phi3, ...) fall back to a full second build, which');
-  WriteLn('                        the startup notice says. The prompt tail that does');
-  WriteLn('                        not fill a window is fed one token at a time;');
-  WriteLn('                        nothing is padded');
+  WriteLn('                        the startup notice says. What the windows leave');
+  WriteLn('                        over goes through the tail twin (below), then one');
+  WriteLn('                        token at a time; nothing is padded');
+  WriteLn('  --prefill-tail-window T  width of a second twin that feeds the leftover');
+  WriteLn('                        of the width-N windows T tokens per forward, so at');
+  WriteLn('                        most T-1 tokens go one at a time (default 0 = auto,');
+  WriteLn('                        ' + IntToStr(csDefaultPrefillTailWindow) +
+    ' when that is below N; 1 = no tail twin). T must be');
+  WriteLn('                        below N. Shares the weights like the width-N twin;');
+  WriteLn('                        not built on the full-second-build fallback');
   WriteLn('  --serial              serial layer loop (default: layer-graph parallel');
   WriteLn('                        forward across independent layers; the parallel');
   WriteLn('                        path also threads large conv/linear layers');
@@ -484,6 +513,7 @@ begin
   Result.Profile := false;
   Result.NoCacheReuse := false;
   Result.PrefillWindow := 0; // one token per prefill forward (--prefill-window N)
+  Result.PrefillTailWindow := 0; // auto (--prefill-tail-window T)
   Result.KVInt8 := false;    // resolved after parsing: follows the weight mode
   Result.KVInt8Set := false; // unless --kv-int8/--kv-fp32 picked explicitly
   Result.Serial := false; // parallel layer-graph forward by default (--serial)
@@ -578,6 +608,17 @@ begin
         exit(false);
       end;
       Opt.PrefillWindow := IVal;
+    end
+    else if Arg = '--prefill-tail-window' then
+    begin
+      if not NextInt(Arg, IVal) then exit(false);
+      if IVal < 0 then
+      begin
+        Opt.ErrorMsg := '--prefill-tail-window: must be 0 (auto), 1 (none)' +
+          ' or a width below --prefill-window';
+        exit(false);
+      end;
+      Opt.PrefillTailWindow := IVal;
     end
     else if Arg = '--kv-int8' then
     begin
@@ -1030,6 +1071,10 @@ begin
   WindowNN := nil;
   WindowSession := nil;
   WindowIn := nil;
+  TailNN := nil;
+  TailSession := nil;
+  TailIn := nil;
+  TransferSnap := nil;
   WindowBorrowsWeights := false;
   ActiveSession := nil;
   Tokenizer := nil;
@@ -1049,6 +1094,7 @@ begin
   LastCompletionTokens := 0;
   LastFinishReason := '';
   LastPrefillWindows := 0;
+  LastPrefillTailWindows := 0;
   TotalInputTokens := 0;
   TotalCachedInputTokens := 0;
   TotalInputMs := 0;
@@ -1069,11 +1115,14 @@ begin
   FreeAndNil(Session); // before NN.Free: Destroy ends incremental decode on
                        // NN's layers
   FreeAndNil(WindowSession);
-  FreeAndNil(WindowNN); // before NN: the twin borrows NN's weights and
-                        // resident device codes
+  FreeAndNil(TailSession);
+  FreeAndNil(WindowNN); // before NN: the twins borrow NN's weights and
+  FreeAndNil(TailNN);   // resident device codes
   FreeAndNil(Tokenizer);
   FreeAndNil(NN);
   FreeAndNil(WindowIn);
+  FreeAndNil(TailIn);
+  FreeAndNil(TransferSnap);
   {$IFDEF OpenCL}
   FreeAndNil(GpuCL); // after NN.Free; nil when GPU was off or fell back to CPU
   {$ENDIF}
@@ -1091,19 +1140,13 @@ begin
 end;
 
 procedure TChatEngine.SwitchTo(Target: TNNetStreamingDecoder);
-var
-  Snap: TNNetDecoderSessionSnapshot;
 begin
   if Target = ActiveSession then exit;
-  // Snapshot() always creates its copy (there is no fill-in-place variant),
-  // so a switch costs one deep copy of the KV cache, the same as the
-  // turn-boundary capture.
-  Snap := ActiveSession.Snapshot();
-  try
-    Target.RestoreSnapshot(Snap);
-  finally
-    Snap.Free;
-  end;
+  // One deep copy of the live state each way, into the snapshot LoadModel
+  // allocated once (the same cost as the turn-boundary capture); nothing is
+  // allocated per switch.
+  ActiveSession.SnapshotInto(TransferSnap);
+  Target.RestoreSnapshot(TransferSnap);
   ActiveSession := Target;
 end;
 
@@ -1205,6 +1248,32 @@ begin
       ' %d tokens]', [Opt.PrefillWindow, Opt.CtxLen]));
     Opt.PrefillWindow := 0;
   end;
+  // The tail twin's width: below the window, or there is none (1).
+  if Opt.PrefillWindow = 0 then
+  begin
+    if Opt.PrefillTailWindow > 1 then
+      Notice(Format('[--prefill-tail-window %d ignored: needs' +
+        ' --prefill-window]', [Opt.PrefillTailWindow]));
+    Opt.PrefillTailWindow := 1;
+  end
+  else if Opt.PrefillTailWindow = 0 then
+  begin
+    if csDefaultPrefillTailWindow < Opt.PrefillWindow then
+      Opt.PrefillTailWindow := csDefaultPrefillTailWindow
+    else
+    begin
+      Notice(Format('[--prefill-window %d: no tail twin, the default tail' +
+        ' width %d is not below it (--prefill-tail-window T picks one)]',
+        [Opt.PrefillWindow, csDefaultPrefillTailWindow]));
+      Opt.PrefillTailWindow := 1;
+    end;
+  end
+  else if Opt.PrefillTailWindow >= Opt.PrefillWindow then
+  begin
+    Notice(Format('[--prefill-tail-window %d ignored: not below' +
+      ' --prefill-window %d]', [Opt.PrefillTailWindow, Opt.PrefillWindow]));
+    Opt.PrefillTailWindow := 1;
+  end;
 
   {$IFDEF OpenCL}
   GpuCL := nil;
@@ -1296,6 +1365,11 @@ begin
       ' Llama builder, so the width-%d twin is a full second build:' +
       ' checkpoint read twice, weights held twice in RAM and on the device]',
       [Opt.PrefillWindow, ModelType, Opt.PrefillWindow]));
+    if Opt.PrefillTailWindow > 1 then
+      Notice(Format('[--prefill-tail-window %d: no tail twin on the full' +
+        ' second build, a third copy of the weights is not worth the' +
+        ' leftover single steps]', [Opt.PrefillTailWindow]));
+    Opt.PrefillTailWindow := 1;
     NeuralImportInt4LayerCount := 0;
     WindowNN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}Opt.PrefillWindow,
       {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32);
@@ -1352,10 +1426,23 @@ begin
     LastIdx := WindowNN.GetLastLayerIdx();
     for Cnt := 0 to LastIdx do
       WindowNN.Layers[Cnt].FlushWeightCache();
-    Notice(Format('[--prefill-window %d: width-%d twin built in %.1fs' +
-      ' sharing the loaded weights (checkpoint read once; the twin holds' +
-      ' %d weights of its own and costs its activations only)]',
-      [Opt.PrefillWindow, Opt.PrefillWindow,
+    if Opt.PrefillTailWindow > 1 then
+    begin
+      TailNN := BuildFromPretrained(Opt.ModelDir,
+        {pSeqLen=}Opt.PrefillTailWindow, {pTrainable=}false, '',
+        {pQuantizeInt8=}Opt.WeightMode <> cwmFP32, {pWeightOwner=}NN);
+      TailNN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
+      LastIdx := TailNN.GetLastLayerIdx();
+      for Cnt := 0 to LastIdx do
+        TailNN.Layers[Cnt].FlushWeightCache();
+    end;
+    Line := '';
+    if Assigned(TailNN) then
+      Line := Format(' and the width-%d tail twin', [Opt.PrefillTailWindow]);
+    Notice(Format('[--prefill-window %d: width-%d twin%s built in %.1fs' +
+      ' sharing the loaded weights (checkpoint read once; the twins hold' +
+      ' %d weights of their own and cost their activations only)]',
+      [Opt.PrefillWindow, Opt.PrefillWindow, Line,
        (GetTickCount64() - LoadStart) / 1000, WindowNN.CountWeights()]));
   end;
   NeuralAllowFusedAttention := true; // restore the global default post-build
@@ -1422,6 +1509,11 @@ begin
             WindowNN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
               GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
         end;
+        if Assigned(TailNN) then // only built when it borrows
+        begin
+          TailNN.OpenCLFP16 := Opt.ExperimentalFP16;
+          TailNN.EnableOpenCLInContextOf(NN, Opt.GpuSharedKernel);
+        end;
         Notice(Format('GPU weights uploaded in %.1fs.',
           [(GetTickCount64() - LoadStart) / 1000]));
       end;
@@ -1440,6 +1532,7 @@ begin
       ' layers, which arm it themselves); only TNNetConvolution runs' +
       ' int8 x int8 today, the others still run int8 x FP32]');
     if Assigned(WindowNN) then WindowNN.EnableInt8Input();
+    if Assigned(TailNN) then TailNN.EnableInt8Input();
   end;
 
   SeqLen := Opt.CtxLen;
@@ -1454,10 +1547,23 @@ begin
   begin
     WindowSession := TNNetStreamingDecoder.Create(WindowNN, SeqLen, Opt.KVInt8);
     WindowIn := TNNetVolume.Create(Opt.PrefillWindow, 1, 1);
-    Notice(Format('[--prefill-window %d: the prompt is prefilled %d tokens per' +
-      ' forward on the width-%d twin; the tail that does not fill a window' +
-      ' goes one token at a time]',
-      [Opt.PrefillWindow, Opt.PrefillWindow, Opt.PrefillWindow]));
+    TransferSnap := TNNetDecoderSessionSnapshot.Create();
+    if Assigned(TailNN) then
+    begin
+      TailSession := TNNetStreamingDecoder.Create(TailNN, SeqLen, Opt.KVInt8);
+      TailIn := TNNetVolume.Create(Opt.PrefillTailWindow, 1, 1);
+      Notice(Format('[--prefill-window %d: the prompt is prefilled %d tokens' +
+        ' per forward on the width-%d twin, what those windows leave over %d' +
+        ' tokens per forward on the tail twin, and the fewer than %d tokens' +
+        ' left go one token at a time]',
+        [Opt.PrefillWindow, Opt.PrefillWindow, Opt.PrefillWindow,
+         Opt.PrefillTailWindow, Opt.PrefillTailWindow]));
+    end
+    else
+      Notice(Format('[--prefill-window %d: the prompt is prefilled %d tokens' +
+        ' per forward on the width-%d twin; the tail that does not fill a' +
+        ' window goes one token at a time]',
+        [Opt.PrefillWindow, Opt.PrefillWindow, Opt.PrefillWindow]));
   end;
   if Opt.KVInt8 then
     Notice('[int8 KV cache (default with int8 weights) - ~1/4 the KV RAM, ' +
@@ -1470,17 +1576,21 @@ begin
   // worker 0), ComputeSerial runs fully single-threaded. No separate flag.
   Session.Parallel := not Opt.Serial;
   if Assigned(WindowSession) then WindowSession.Parallel := Session.Parallel;
+  if Assigned(TailSession) then TailSession.Parallel := Session.Parallel;
   // --max-threads: cap the scheduler pool (and with it the per-layer chunk
   // count). Set BEFORE StartThreadWorkers so the pool is created at the capped
   // size instead of being built wide and resized on the next pass.
   if Opt.MaxThreads > 0 then NN.MaxThreadNum := Opt.MaxThreads;
   if Assigned(WindowNN) and (Opt.MaxThreads > 0) then
     WindowNN.MaxThreadNum := Opt.MaxThreads;
+  if Assigned(TailNN) and (Opt.MaxThreads > 0) then
+    TailNN.MaxThreadNum := Opt.MaxThreads;
   // Keep the scheduler's worker pool alive and HOT between decode steps (default
   // policy: ~50% of the pool hot, worker 0 always) so each token's parallel
   // forward reaches the workers without re-warming the pool every step.
   if Session.Parallel then NN.StartThreadWorkers();
   if Assigned(WindowNN) and Session.Parallel then WindowNN.StartThreadWorkers();
+  if Assigned(TailNN) and Session.Parallel then TailNN.StartThreadWorkers();
   // KV-cache reuse across turns needs position-truncatable attention K/V and no
   // recurrent (SSM) state to rewind. Pure-attention nets qualify; NoCacheReuse
   // forces the full re-prefill at the call site.
@@ -1623,7 +1733,10 @@ var
   InV, Output, Row: TNNetVolume;
   Len, StepCnt, Cnt, NewToken: integer;
   Reused, PromptLen: integer;  // KV-cache reuse bookkeeping (and --stats)
-  WindowLen, WindowCount, WindowPos, WindowRow, MaxRowPos: integer; // --prefill-window
+  WindowLen, WindowCount: integer; // --prefill-window: the width-N twin
+  TailLen, TailCount: integer;     // and its width-T tail twin
+  SingleSteps: integer;            // prefill tokens fed one at a time
+  FirstSession: TNNetStreamingDecoder; // the session the prefill steps first
   PrefillMs: double;           // --stats: TStart..TPrefillEnd
   PrefillTokens: integer;      // tokens fed by this call's prefill
   LenM2, MarkerLen, EmLen, DecLen: integer;
@@ -1649,6 +1762,34 @@ var
     Result := (NowMark - PhaseMark) * MSecsPerDay;
     PhaseMark := NowMark;
   end;
+  // Up to WindowCount whole windows of Tokens from Cnt on through WSession
+  // (the active one), never padded. A window that would overflow the cache is
+  // never fed: the fused attention layer only prints on overflow and then
+  // scores past its buffers; the caller then feeds what is left in smaller
+  // windows or single steps. Fed counts the windows this call fed.
+  procedure FeedWindows(WSession: TNNetStreamingDecoder; WIn: TNNetVolume;
+    WindowCount: integer; var Fed: integer);
+  var
+    WLen, WindowPos, WindowRow, MaxRowPos: integer;
+  begin
+    WLen := WIn.SizeX;
+    {$IFDEF Debug}
+    Assert(WSession = ActiveSession,
+      'TChatEngine: windows fed to a session that does not hold the state');
+    Assert(WLen = WSession.Net.GetFirstLayer().Output.SizeX,
+      'TChatEngine: window volume width differs from the twin input width');
+    {$ENDIF}
+    MaxRowPos := WLen - 1;
+    for WindowPos := 0 to WindowCount - 1 do
+    begin
+      if Cnt + WLen > SeqLen then break;
+      for WindowRow := 0 to MaxRowPos do
+        WIn.FData[WindowRow] := Tokens[Cnt + WindowRow];
+      WSession.StepForwardToHidden(WIn, Cnt);
+      Inc(Cnt, WLen);
+      Inc(Fed);
+    end;
+  end;
 begin
   Result := '';
   if not Loaded then
@@ -1658,6 +1799,7 @@ begin
   LastCompletionTokens := 0;
   LastFinishReason := 'length';
   LastPrefillWindows := 0;
+  LastPrefillTailWindows := 0;
   Len := Length(PromptIds);
   // An empty prompt has no last token to feed as the first decode step's
   // input (a BOS-less tokenizer encodes '' to zero ids): decoding cannot
@@ -1737,6 +1879,11 @@ begin
       WindowNN.ClearTime();
       WindowNN.ResetSchedulerStats();
     end;
+    if Assigned(TailNN) then
+    begin
+      TailNN.ClearTime();
+      TailNN.ResetSchedulerStats();
+    end;
   end;
   Produced := 0;
   PromptLen := Len;
@@ -1752,12 +1899,14 @@ begin
     // call when possible. Reused = length of the cached prefix that still
     // matches this prompt. The LAST prompt token is fed as the first decode
     // step's input, so the cache must not already hold it - cap reuse at
-    // Len-1. Tokens Reused..LenM2 are fed: whole windows of WindowLen
-    // through WindowSession first (never padded), then the tail one token
-    // at a time through Session. The reused state goes straight into
-    // whichever session steps first. No prefill logits are read, so every
-    // prefill forward stops at the LM-head input (StepForwardToHidden):
-    // the vocab projection runs only in the decode steps.
+    // Len-1. Tokens Reused..LenM2 are fed down a ladder of widths: whole
+    // windows of WindowLen through WindowSession, whole windows of TailLen
+    // of what is left through TailSession, then the fewer than TailLen
+    // tokens left one at a time through Session (never padded). The reused
+    // state goes straight into whichever session steps first. No prefill
+    // logits are read, so every prefill forward stops at the LM-head input
+    // (StepForwardToHidden): the vocab projection runs only in the decode
+    // steps.
     if CacheReuse then
     begin
       Reused := CommonPrefixLen(CachedTokens, PromptIds);
@@ -1778,47 +1927,46 @@ begin
       else Reused := 0;
     end
     else Reused := 0;
+    PrefillTokens := LenM2 + 1 - Reused;
     WindowCount := 0;
     WindowLen := 0;
+    TailCount := 0;
+    TailLen := 0;
     if Assigned(WindowSession) then
     begin
       WindowLen := WindowIn.SizeX;
-      WindowCount := (LenM2 + 1 - Reused) div WindowLen;
+      WindowCount := PrefillTokens div WindowLen;
+      if Assigned(TailSession) then
+      begin
+        TailLen := TailIn.SizeX;
+        TailCount := (PrefillTokens - WindowCount * WindowLen) div TailLen;
+      end;
     end;
-    if WindowCount > 0 then ActiveSession := WindowSession
-    else ActiveSession := Session;
+    if WindowCount > 0 then FirstSession := WindowSession
+    else if TailCount > 0 then FirstSession := TailSession
+    else FirstSession := Session;
+    ActiveSession := FirstSession;
     if Reused = 0 then ActiveSession.Reset() // SSM state cannot be truncated
     else if CacheReuse then
     begin
       // The prefix lives in Session's cache: truncate there, then carry it.
       Session.TruncateTo(Reused);
       ActiveSession := Session;
-      if WindowCount > 0 then SwitchTo(WindowSession);
+      SwitchTo(FirstSession);
     end
     else ActiveSession.RestoreSnapshot(TurnSnap);
     Cnt := Reused;
     if WindowCount > 0 then
+      FeedWindows(WindowSession, WindowIn, WindowCount, LastPrefillWindows);
+    // Whole windows of TailLen over what is left, so a window the width-N
+    // twin did not feed (the cache-room check) also falls to the tail twin.
+    if TailLen > 0 then TailCount := (LenM2 + 1 - Cnt) div TailLen;
+    if TailCount > 0 then
     begin
-      {$IFDEF Debug}
-      Assert(WindowIn.SizeX = WindowNN.GetFirstLayer().Output.SizeX,
-        'TChatEngine: window volume width differs from the twin input width');
-      {$ENDIF}
-      MaxRowPos := WindowLen - 1;
-      // A window that would overflow the cache is never fed: the fused
-      // attention layer only prints on overflow and then scores past its
-      // buffers. Cnt + WindowLen <= LenM2 + 1 < SeqLen holds for every whole
-      // window, so the check is insurance.
-      for WindowPos := 0 to WindowCount - 1 do
-      begin
-        if Cnt + WindowLen > SeqLen then break;
-        for WindowRow := 0 to MaxRowPos do
-          WindowIn.FData[WindowRow] := Tokens[Cnt + WindowRow];
-        WindowSession.StepForwardToHidden(WindowIn, Cnt);
-        Inc(Cnt, WindowLen);
-        Inc(LastPrefillWindows);
-      end;
-      SwitchTo(Session);
+      SwitchTo(TailSession);
+      FeedWindows(TailSession, TailIn, TailCount, LastPrefillTailWindows);
     end;
+    SwitchTo(Session);
     while Cnt <= LenM2 do
     begin
       InV.FData[0] := Tokens[Cnt];
@@ -1826,10 +1974,12 @@ begin
       Inc(Cnt);
     end;
     TPrefillEnd := GetTickCount64();
-    PrefillTokens := LenM2 + 1 - Reused;
-    // --profile: the prefill's own layer-class report (windows on the twin,
-    // the tail on NN), then clean timers so the report after the decode
-    // loop covers only the repeated single-token decode steps.
+    SingleSteps := PrefillTokens - LastPrefillWindows * WindowLen -
+      LastPrefillTailWindows * TailLen;
+    // --profile: the prefill's own layer-class report, one table per net
+    // that ran (the width-N twin, the tail twin, NN for the single steps),
+    // then clean timers so the report after the decode loop covers only the
+    // repeated single-token decode steps.
     if GenOpt.Profile then
     begin
       if PrefillTokens > 0 then
@@ -1838,17 +1988,34 @@ begin
         Write(StdErr, Format('[profile] prefill: %d tokens in %d ms',
           [PrefillTokens, TPrefillEnd - TStart]));
         if WindowLen > 0 then
-          Write(StdErr, Format(' (%d windows of %d on the twin, %d single steps)',
-            [LastPrefillWindows, WindowLen,
-             PrefillTokens - LastPrefillWindows * WindowLen]));
+        begin
+          Write(StdErr, Format(' (%d windows of %d', [LastPrefillWindows,
+            WindowLen]));
+          if TailLen > 0 then
+            Write(StdErr, Format(', %d tail windows of %d',
+              [LastPrefillTailWindows, TailLen]));
+          Write(StdErr, Format(', %d single steps)', [SingleSteps]));
+        end;
         WriteLn(StdErr);
         if LastPrefillWindows > 0 then
         begin
+          WriteLn(StdErr, Format('[profile] width-%d twin: %d windows',
+            [WindowLen, LastPrefillWindows]));
           Write(StdErr, TNNet.LayerClassTimingReport(WindowNN));
           WriteLn(StdErr, '[sched] ', WindowNN.SchedulerStatsReport());
         end;
-        if PrefillTokens - LastPrefillWindows * WindowLen > 0 then
+        if LastPrefillTailWindows > 0 then
         begin
+          WriteLn(StdErr, Format('[profile] width-%d tail twin: %d windows',
+            [TailLen, LastPrefillTailWindows]));
+          Write(StdErr, TNNet.LayerClassTimingReport(TailNN));
+          WriteLn(StdErr, '[sched] ', TailNN.SchedulerStatsReport());
+        end;
+        if SingleSteps > 0 then
+        begin
+          if WindowLen > 0 then
+            WriteLn(StdErr, Format('[profile] width-1 net: %d single steps',
+              [SingleSteps]));
           Write(StdErr, TNNet.LayerClassTimingReport(NN));
           WriteLn(StdErr, '[sched] ', NN.SchedulerStatsReport());
         end;
@@ -1977,8 +2144,8 @@ begin
     // previous snapshot (one is held at a time, not a per-turn history).
     if StateReuseOK and not GenOpt.NoCacheReuse then
     begin
-      FreeAndNil(TurnSnap);
-      TurnSnap := Session.Snapshot();
+      if TurnSnap = nil then TurnSnap := TNNetDecoderSessionSnapshot.Create();
+      Session.SnapshotInto(TurnSnap); // reuses last turn's volumes
       TurnSnapPos := Len - 1;
     end;
     // Lifetime usage totals, kept whether or not --stats prints them.
@@ -2060,6 +2227,7 @@ begin
     TurnSnapPos := 0;
     Session.Reset();
     if Assigned(WindowSession) then WindowSession.Reset();
+    if Assigned(TailSession) then TailSession.Reset();
     ActiveSession := Session;
     raise;
   end;

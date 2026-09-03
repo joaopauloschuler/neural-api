@@ -1373,6 +1373,9 @@ type
     // snapshot must come from a session wrapping the SAME architecture at the
     // SAME MaxCacheLen (e.g. the same twin, or twins CopyWeights'd from one net).
     function Snapshot(): TNNetDecoderSessionSnapshot;
+    // Same capture into a snapshot the caller owns: its volumes are reused
+    // when the shapes match, so a repeated capture allocates nothing.
+    procedure SnapshotInto(Snap: TNNetDecoderSessionSnapshot);
     procedure RestoreSnapshot(Snap: TNNetDecoderSessionSnapshot);
     // Convenience: the net's last layer output (e.g. the softmax row(s) of
     // the window just computed).
@@ -6118,47 +6121,71 @@ begin
 end;
 
 function TNNetStreamingDecoder.Snapshot(): TNNetDecoderSessionSnapshot;
+begin
+  Result := TNNetDecoderSessionSnapshot.Create();
+  SnapshotInto(Result);
+end;
+
+procedure TNNetStreamingDecoder.SnapshotInto(Snap: TNNetDecoderSessionSnapshot);
 var
   i, HiSDPA, HiSSM: integer;
 begin
-  Result := TNNetDecoderSessionSnapshot.Create();
-  SetLength(Result.FK, Length(FSDPAs));
-  SetLength(Result.FV, Length(FSDPAs));
-  SetLength(Result.FKQ, Length(FSDPAs));
-  SetLength(Result.FVQ, Length(FSDPAs));
-  SetLength(Result.FInt8, Length(FSDPAs));
-  SetLength(Result.FLen, Length(FSDPAs));
-  SetLength(Result.FSinks, Length(FSDPAs));
-  SetLength(Result.FWindow, Length(FSDPAs));
+  // The per-layer arrays and their volumes stay in place across captures: a
+  // shorter array is grown (new entries nil), an entry is created on first
+  // use only, and Copy/CopyFrom below reallocate only when a shape changed.
+  if Length(Snap.FK) <> Length(FSDPAs) then
+  begin
+    for i := 0 to High(Snap.FK) do FreeAndNil(Snap.FK[i]);
+    for i := 0 to High(Snap.FV) do FreeAndNil(Snap.FV[i]);
+    for i := 0 to High(Snap.FKQ) do FreeAndNil(Snap.FKQ[i]);
+    for i := 0 to High(Snap.FVQ) do FreeAndNil(Snap.FVQ[i]);
+    SetLength(Snap.FK, 0);
+    SetLength(Snap.FV, 0);
+    SetLength(Snap.FKQ, 0);
+    SetLength(Snap.FVQ, 0);
+    SetLength(Snap.FK, Length(FSDPAs));
+    SetLength(Snap.FV, Length(FSDPAs));
+    SetLength(Snap.FKQ, Length(FSDPAs));
+    SetLength(Snap.FVQ, Length(FSDPAs));
+    SetLength(Snap.FInt8, Length(FSDPAs));
+    SetLength(Snap.FLen, Length(FSDPAs));
+    SetLength(Snap.FSinks, Length(FSDPAs));
+    SetLength(Snap.FWindow, Length(FSDPAs));
+  end;
   HiSDPA := High(FSDPAs);
   for i := 0 to HiSDPA do
   begin
     // Capture whichever storage is live: the int8 cache keeps its codes and
-    // per-row scales, the FP32 cache its volumes. Only one pair is allocated
-    // per layer.
-    Result.FInt8[i] := FSDPAs[i].Int8KVCache;
-    if Result.FInt8[i] then
+    // per-row scales, the FP32 cache its volumes. Only the live pair is
+    // allocated on first use; the other stays nil.
+    Snap.FInt8[i] := FSDPAs[i].Int8KVCache;
+    if Snap.FInt8[i] then
     begin
-      Result.FKQ[i] := TNNetVolumeQuant8.Create();
-      Result.FVQ[i] := TNNetVolumeQuant8.Create();
-      FSDPAs[i].CaptureCacheStateInt8(Result.FKQ[i], Result.FVQ[i],
-        Result.FLen[i], Result.FSinks[i], Result.FWindow[i]);
+      if Snap.FKQ[i] = nil then Snap.FKQ[i] := TNNetVolumeQuant8.Create();
+      if Snap.FVQ[i] = nil then Snap.FVQ[i] := TNNetVolumeQuant8.Create();
+      FSDPAs[i].CaptureCacheStateInt8(Snap.FKQ[i], Snap.FVQ[i],
+        Snap.FLen[i], Snap.FSinks[i], Snap.FWindow[i]);
     end
     else
     begin
-      Result.FK[i] := TNNetVolume.Create();
-      Result.FV[i] := TNNetVolume.Create();
-      FSDPAs[i].CaptureCacheState(Result.FK[i], Result.FV[i],
-        Result.FLen[i], Result.FSinks[i], Result.FWindow[i]);
+      if Snap.FK[i] = nil then Snap.FK[i] := TNNetVolume.Create();
+      if Snap.FV[i] = nil then Snap.FV[i] := TNNetVolume.Create();
+      FSDPAs[i].CaptureCacheState(Snap.FK[i], Snap.FV[i],
+        Snap.FLen[i], Snap.FSinks[i], Snap.FWindow[i]);
     end;
   end;
-  SetLength(Result.FH, Length(FSSMs));
-  SetLength(Result.FSteps, Length(FSSMs));
+  if Length(Snap.FH) <> Length(FSSMs) then
+  begin
+    for i := 0 to High(Snap.FH) do FreeAndNil(Snap.FH[i]);
+    SetLength(Snap.FH, 0);
+    SetLength(Snap.FH, Length(FSSMs));
+    SetLength(Snap.FSteps, Length(FSSMs));
+  end;
   HiSSM := High(FSSMs);
   for i := 0 to HiSSM do
   begin
-    Result.FH[i] := TNNetVolume.Create();
-    StateCapture(FSSMs[i], Result.FH[i], Result.FSteps[i]);
+    if Snap.FH[i] = nil then Snap.FH[i] := TNNetVolume.Create();
+    StateCapture(FSSMs[i], Snap.FH[i], Snap.FSteps[i]);
   end;
 end;
 
