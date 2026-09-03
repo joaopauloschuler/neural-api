@@ -251,3 +251,199 @@ activation memory (K x every layer output).
    and uses it if one exists.
 3. Validation runs on the 4B model first, then the 27B once Phase 5 has
    removed the duplication.
+
+## 7. Cache checkpoints: `--cache-checkpoints N` (design, 2026-09-03)
+
+### 7.1 The problem
+
+A hybrid (Qwen3.5/3.8, Mamba) resumes a prompt only from a whole-state
+snapshot, and the engine holds two: the end of the previous reply and the
+end of the previous prompt (`neuralchatengine.pas:1997-2008`). Any prompt
+that diverges before those two positions pays the full prefill. Measured on
+the 27B (bpsa step 2, 8151 tokens, 53 s): `reused 0`, because bpsa appends a
+suffix to the LAST user message on every request, so the previous task
+message re-renders without it and the token ids diverge inside the previous
+prompt. Every agent framework moves something near the end of the prompt;
+the engine must reuse everything before the divergence, not nothing.
+
+Reuse works on token ids, not characters. `CommonPrefixLen`
+(`neuralchatengine.pas:887`) already yields the last shared token; BPE may
+re-split the token just before the differing character, which costs at most
+one or two tokens.
+
+### 7.2 Facts (verified at 6fbfd037, the a18 tip on 2026-09-03)
+
+F13. **Pure-attention nets already reuse up to the divergence.** The
+     `CacheReuse` route computes the common prefix, calls
+     `Session.TruncateTo(Reused)` (`neuralchatengine.pas:2037`) and prefills
+     the tail. Nothing to add for Llama/Qwen2.5.
+
+F14. **The hybrid's state splits into a truncatable half and a
+     non-truncatable half.** Attention K/V is position-indexed:
+     `TNNetScaledDotProductAttention.TruncateCache`
+     (`neuralnetwork.pas:33172`) rewinds `FCacheLen` and the next append
+     overwrites. The recurrent state (`TNNetGatedDeltaNet.FDecS`,
+     `TNNetDepthwiseConv1D.FDecHist`, every `TNNetRecurrentDecodeBase`
+     descendant, `neuralnetwork.pas:9532`) is one fixed-size volume with no
+     per-position history. Only that half needs a checkpoint.
+
+F15. **The recurrent half is small; the K/V half is the snapshot's bulk.**
+     GDN state is `FNumVHeads * FHeadDimK * FHeadDimV` floats
+     (`neuralnetwork.pas:70776`); conv history is `(KernelSize-1) * Depth`.
+     On the 27B (48 GDN layers, 64 value heads of 128 x 128 by the published
+     config, NOT verified against the user's `config.json`): about 4 MB per
+     GDN layer, ~192 MB per checkpoint. The int8 K/V of 16 attention layers
+     at 32k context is ~1.1 GB, which is what each of today's two snapshots
+     copies (`TNNetStreamingDecoder.SnapshotInto`, `neuraldecode.pas:6129`).
+
+F16. **Today's capture and restore cross the bus.**
+     `TNNetGatedDeltaNet.CaptureState` (`:70787`) calls
+     `ForceDecodeStateOnRAM` (a queue drain plus a blocking read) and
+     `RestoreState` (`:70795`) copies on the host and clears `FDecSOnOpenCL`,
+     so the next forward re-uploads. `TNNetDepthwiseConv1D` (`:62199`,
+     `:62207`) does the same with `FDecHist`. A checkpoint taken after every
+     prefill window through these routes would repeat the cost that made
+     the MTP verify window slow. The device-side copy that fixed it there
+     (commit `eca33396`, `MarkStateCheckpointOnOpenCL`) exists ONLY on branch
+     `a11`, which never worked well and is not merged: read it for the shape
+     of a `clEnqueueCopyBuffer` between two resident buffers, trust nothing
+     from it, write and test fresh.
+
+F17. **`TruncateCache` downloads the resident cache first.** Its first line
+     is `ForceCacheOnRAM()`, which `TNNetFusedSDPA` overrides
+     (`neuralnetwork.pas:34958`) with a blocking `DownloadCache[Int8]` that
+     also clears `FCacheOnOpenCL`, so the next forward re-uploads the whole
+     cache. The rewind itself is one host field; the kernels take
+     `FCacheSlot` per launch and own no length. The download is therefore
+     unnecessary for the rewind and must not be paid on the resume path.
+
+F18. **State lives in whichever twin is active.** The width-N twin, the
+     tail twin and the width-1 session are three nets with their own layers;
+     `SwitchTo` (`neuralchatengine.pas:1175`) moves state between them by a
+     full snapshot copy. A checkpoint captured on the twin's layers during a
+     window prefill must be restorable into the width-1 session's layers, so
+     it cannot live inside one layer's OpenCL helper. The three nets share one
+     OpenCL context (`EnableOpenCLInContextOf`, Phase 5a), so a `cl_mem`
+     owned by an object outside the nets is reachable from all three.
+
+F19. **The resume already runs on the width-1 session.** The `CacheReuse`
+     route truncates `Session`, sets it active and calls
+     `SwitchTo(FirstSession)` (`neuralchatengine.pas:2035-2040`). The
+     checkpoint route slots into the same place: truncate `Session`, restore
+     the recurrent half into `Session`, then `SwitchTo`.
+
+### 7.3 Design
+
+A **cache checkpoint** is: a position (tokens fed), plus one copy of the
+recurrent state and step count of every `TNNetRecurrentDecodeBase` layer of
+the session. It holds NO attention K/V. The engine keeps up to N of them in
+a **checkpoint store** allocated once at `LoadModel` (rule 17), N given by
+`--cache-checkpoints N`.
+
+**Capture points.** After every window the width-N twin feeds, after every
+tail-twin window, at the end of the prompt (where `PromptSnap` is taken
+today, `:2068`) and at the end of the reply (where `TurnSnap` is taken,
+`:2243`). Under `--gpu` a capture is one `clEnqueueCopyBuffer` per layer from
+the layer's resident state buffer into the store's slot buffer, on the
+layer's own queue; on CPU it is `CaptureState` into the slot's host volume.
+Nothing is allocated per capture.
+
+**Resume.** `Reused := CommonPrefixLen(CachedTokens, PromptIds)`, capped at
+`Len - 1` as today. Pick the checkpoint with the largest position `<=
+Reused`. If none, full reset. Else `Session.TruncateTo(Pos)`, restore the
+recurrent half into `Session` from the slot (device-to-device under `--gpu`),
+`Reused := Pos`, and continue down the existing ladder. The two whole-state
+snapshots (`TurnSnap`, `PromptSnap`, `TransferSnap` stays) and the 2 x 1.1 GB
+they hold go away; the end-of-reply and end-of-prompt captures are ordinary
+checkpoints at N >= 2.
+
+**Retention (which N to keep).** Let `E` be the current fed position and
+`d = E - Pos` a checkpoint's distance from it. Divergence is far more likely
+near the end of a prompt than near its start, so slots are spent
+geometrically: with window `W` and context `C`, band `k` covers distances
+`[W * r^k, W * r^(k+1))` for `k = 0 .. N-1`, with `r = (C / W)^(1 / N)`. The
+store keeps the deepest checkpoint (largest `Pos`) in each band; on every
+capture and at the end of every request it recomputes the bands against the
+new `E` and drops the rest. The end-of-reply and end-of-prompt checkpoints
+are always kept (they are the two innermost). Bound: a divergence at
+distance `d` resumes from the nearest kept checkpoint beyond it, so the
+extra prefill is at most `(r - 1) * d` on top of the unavoidable `d`. At the
+defaults (`W = 256`, `C = 32768`):
+
+| N | r | extra prefill, worst case | memory at 27B |
+| --- | --- | --- | --- |
+| 8 (CPU default) | 2.00 | 1.0 x d | 1.5 GB host |
+| 16 (`--gpu` default) | 1.38 | 0.38 x d | 3.0 GB OpenCL memory |
+
+`--cache-checkpoints 0` turns the checkpoint route off (a hybrid then
+re-prefills every turn, as `--no-cache-reuse` does). Values 1 and above
+2048 are rejected at `LoadModel` with an error and a hard stop, like the
+window flags. `--no-prompt-snapshot` is removed: its job (skip the
+end-of-prompt capture) has no meaning once that capture is one cheap slot.
+
+**Diagnostic.** The `[stats] input:` line becomes
+`prompt %d tokens (reused %d, prefix %d of %d cached)`, so a `reused 0` in a
+server log states where the ids diverged without a client-side dump.
+
+### 7.4 Agents, serial, each ending green with a commit
+
+**Agent 1 - session layer** (`neuraldecode.pas`, `neuralnetwork.pas`,
+`neuralopencl.pas` if a helper needs a buffer accessor). Deliverables:
+
+1. `TNNetRecurrentDecodeBase`: `CaptureStateToOpenCL(Slot: cl_mem)` and
+   `RestoreStateFromOpenCL(Slot: cl_mem)` (device-to-device copies on the
+   layer's queue, leaving residency flags TRUE), plus `StateBytes()` so a
+   store can size its slots. Descendants without a resident state fall back
+   to `CaptureState` / `RestoreState`.
+2. `TNNetFusedSDPA.TruncateCache` override (or a base change) that rewinds
+   `FCacheLen` WITHOUT `ForceCacheOnRAM` (F17), with the same range checks.
+3. `TNNetDecoderStateCheckpoint` (per-layer host volumes + step counts, or
+   per-layer `cl_mem` slots when the session runs OpenCL) and on
+   `TNNetStreamingDecoder`: `CaptureStateInto(Chk)`, `RestoreStateFrom(Chk)`,
+   both usable across the twin sessions (F18).
+4. Tests (`tests/TestNeuralPretrained.pas`, the tiny Qwen3.5 fixture): run to
+   position p, checkpoint, run on to q, `TruncateTo(p)` + restore, run the
+   same tail again, compare hidden states bit for bit with an uninterrupted
+   run. CPU, OpenCL, FP32 KV, int8 KV, and capture on the width-N twin with
+   restore into the width-1 session. A test that asserts the resident cache
+   stayed resident across `TruncateTo` (F17), and one that asserts the
+   recurrent state stayed resident across a capture (F16).
+
+**Agent 2 - engine and programs** (`neuralchatengine.pas`, `ChatTerminal.lpr`,
+`ChatServer.lpr`, `examples/ChatTerminal/README.md`). Deliverables:
+
+1. `--cache-checkpoints N` with the validation, defaults and notices above;
+   `--no-prompt-snapshot` removed everywhere it is mentioned.
+2. The checkpoint store with the retention rule, the capture points, and the
+   resume path in `GenerateFromIds`; `TurnSnap` / `PromptSnap` deleted.
+3. The `prefix %d of %d cached` stats diagnostic; `LastReusedTokens` keeps
+   its meaning (tokens actually resumed from).
+4. Tests: extend the `TestQwen35ChatPromptSnapshot*` family
+   (`tests/TestNeuralPretrained.pas:350-353`) into `TestQwen35ChatCheckpoint*`
+   with divergence at the start, inside the previous prompt, at the
+   prompt/reply boundary and inside the reply; each compares the reply and
+   the reused count with a fresh engine; ladder, int8 KV and OpenCL variants;
+   a retention test that feeds a long prompt and checks the kept positions
+   against the band rule; a flag-validation test.
+
+**The user measures after Agent 2** with the bpsa run of 2026-09-03. Success:
+request 3 reports `reused` within one window of the divergence (about 7600
+or above), and the process holds about 2.2 GB less host RAM.
+
+### 7.5 Traps for both agents
+
+- Rule 17: slots are allocated at `LoadModel` / session build. A capture or
+  restore allocates nothing. `SnapshotInto` shows the reuse pattern.
+- A capture must copy the RESIDENT buffer. Copying the host mirror of a
+  layer whose flag says the state is in OpenCL memory saves stale data, and
+  the suite cannot see it unless a test asserts residency (the sentinel
+  trap in the residency notes).
+- `FErrorProc` prints and returns. Range errors in `TruncateCache` and the
+  checkpoint store raise in Debug.
+- `LoadModel` validates the flag and fails hard; a silently ignored value
+  cost a 27B load once already.
+- Distrust the summary and this section alike: verify every cited line
+  before building on it. Both suites, `lazbuild -B`, one OpenCL process at a
+  time, `ulimit -v 3145728`. Nothing OpenCL is timed on this box.
+- Comments state the current rationale; the two-snapshot history belongs in
+  the commit message.
