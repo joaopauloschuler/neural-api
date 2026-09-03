@@ -28,10 +28,13 @@ uses
 type
   TTestNeuralPretrained = class(TTestCase)
   private
+    FNotices: string; // CaptureNotice accumulator
     function FixturePath(const FileName: string): string;
     // The tiny_qwen3_5 hybrid fixture as an inference net whose input width
-    // (the streamed window) is pSeqLen tokens.
-    function BuildQwen35FixtureTwin(pSeqLen: integer): TNNet;
+    // (the streamed window) is pSeqLen tokens; pWeightOwner builds it
+    // borrowing that net's weights from a checkpoint path that does not exist.
+    function BuildQwen35FixtureTwin(pSeqLen: integer;
+      pQuantizeInt8: boolean = false; pWeightOwner: TNNet = nil): TNNet;
     // Largest |A[i] - B[i]| over two volumes of the same size.
     function MaxAbsVolumeDiff(A, B: TNNetVolume): double;
     // Windows of StepTokens through WindowSession over the first
@@ -45,9 +48,14 @@ type
     // Largest |A[i] - B[i]| over the rows FromRow.. of two (T,1,V) volumes.
     function MaxAbsRowDiffFrom(A, B: TNNetVolume; FromRow: integer): double;
     // A temp HF-style directory (model.safetensors, config.json,
-    // tokenizer.json) of the tiny_qwen3_5 fixture for TChatEngine.LoadModel.
+    // tokenizer.json) of the tiny_<Stem> fixture for TChatEngine.LoadModel;
+    // the tokenizer is the qwen35 one for every stem (the engine tests feed
+    // ids directly).
+    function MakeChatModelDir(const Stem: string): string;
     function MakeQwen35ChatModelDir(): string;
-    procedure RemoveQwen35ChatModelDir(const Dir: string);
+    procedure RemoveChatModelDir(const Dir: string);
+    // TChatEngine.OnNotice sink: every notice line appended to FNotices.
+    procedure CaptureNotice(const S: string);
     // Two greedy chat turns per --prefill-window value in {0, 4, 6}; every
     // value must produce the same tokens as the token-by-token prefill.
     procedure RunQwen35ChatPrefillWindowParity(const ExtraArgs: array of string);
@@ -74,8 +82,11 @@ type
     // layers borrow.
     function AssertWeightsLinked(Linked, Owner: TNNet;
       const What: string): integer;
-    // The tiny_llama_q8 fixture as an int4 inference net of input width pSeqLen.
-    function BuildLlamaInt4FixtureTwin(pSeqLen: integer): TNNet;
+    // The tiny_llama_q8 fixture as an int4 inference net of input width
+    // pSeqLen; pWeightOwner builds it borrowing that net's (int4) weights
+    // from a checkpoint path that does not exist.
+    function BuildLlamaInt4FixtureTwin(pSeqLen: integer;
+      pWeightOwner: TNNet = nil): TNNet;
     procedure RunConvNeXtParity(const Base: string);
     procedure RunResNetParity(const Base: string);
     procedure RunRegNetParity(const Base: string);
@@ -312,6 +323,12 @@ type
     procedure TestQwen35ChatPrefillWindowParity;
     procedure TestQwen35ChatPrefillWindowInt8KVParity;
     procedure TestQwen35ChatPrefillWindowOpenCLParity;
+    procedure TestQwen35ChatPrefillWindowInt8WeightsParity;
+    procedure TestQwen35ChatPrefillWindowInt8WeightsOpenCLParity;
+    procedure TestMambaChatPrefillWindowFallback;
+    procedure TestQwen35BorrowedTwinBuild;
+    procedure TestLlamaBorrowedTwinInt4Parity;
+    procedure TestLlamaBorrowedTwinInt4OpenCLParity;
     procedure TestQwen35MoeLogitParity;
     procedure TestGptOssLogitParity;
     procedure TestGptOssMXFP4LogitParity;
@@ -9202,13 +9219,21 @@ begin
   end;
 end;
 
-function TTestNeuralPretrained.BuildQwen35FixtureTwin(pSeqLen: integer): TNNet;
+function TTestNeuralPretrained.BuildQwen35FixtureTwin(pSeqLen: integer;
+  pQuantizeInt8: boolean = false; pWeightOwner: TNNet = nil): TNNet;
 var
   Config: TLlamaConfig;
+  WeightsFile: string;
 begin
-  Result := BuildQwen35FromSafeTensorsEx(
-    FixturePath('tiny_qwen3_5.safetensors'), Config, pSeqLen,
-    {pTrainable=}false, FixturePath('tiny_qwen3_5_config.json'));
+  // A borrowing build never opens the checkpoint, so a path that does not
+  // exist proves it.
+  if Assigned(pWeightOwner)
+    then WeightsFile := ExtractFilePath(FixturePath('tiny_qwen3_5_config.json')) +
+      'does_not_exist_tiny_qwen3_5.safetensors'
+    else WeightsFile := FixturePath('tiny_qwen3_5.safetensors');
+  Result := BuildQwen35FromSafeTensorsEx(WeightsFile, Config, pSeqLen,
+    {pTrainable=}false, FixturePath('tiny_qwen3_5_config.json'),
+    pQuantizeInt8, pWeightOwner);
 end;
 
 function TTestNeuralPretrained.MaxAbsVolumeDiff(A, B: TNNetVolume): double;
@@ -9790,16 +9815,23 @@ begin
 end;
 
 function TTestNeuralPretrained.BuildLlamaInt4FixtureTwin(
-  pSeqLen: integer): TNNet;
+  pSeqLen: integer; pWeightOwner: TNNet = nil): TNNet;
 var
   Config: TLlamaConfig;
+  WeightsFile: string;
 begin
-  Result := BuildLlamaFromSafeTensorsEx(
-    FixturePath('tiny_llama_q8.safetensors'), Config, pSeqLen,
+  if Assigned(pWeightOwner)
+    then WeightsFile := ExtractFilePath(FixturePath('tiny_llama_q8_config.json')) +
+      'does_not_exist_tiny_llama_q8.safetensors'
+    else WeightsFile := FixturePath('tiny_llama_q8.safetensors');
+  Result := BuildLlamaFromSafeTensorsEx(WeightsFile, Config, pSeqLen,
     {pTrainable=}false, FixturePath('tiny_llama_q8_config.json'),
-    {pQuantizeInt8=}true);
-  AssertTrue('int4 layers in the tiny llama twin',
-    Result.QuantizeWeightsInt4() > 0);
+    {pQuantizeInt8=}true, pWeightOwner);
+  // A borrowing twin holds the owner's int4 tables already; its own
+  // QuantizeWeightsInt4 would have nothing to convert.
+  if not Assigned(pWeightOwner) then
+    AssertTrue('int4 layers in the tiny llama twin',
+      Result.QuantizeWeightsInt4() > 0);
 end;
 
 // A width-6 twin computing with the width-1 net's int8 tables (Phase 5 of
@@ -10487,19 +10519,30 @@ begin
   end;
 end;
 
-function TTestNeuralPretrained.MakeQwen35ChatModelDir(): string;
+function TTestNeuralPretrained.MakeChatModelDir(const Stem: string): string;
 begin
   Result := IncludeTrailingPathDelimiter(GetTempDir(false)) +
-    'cai_chat_qwen35_' + IntToStr(Random(1000000)) + DirectorySeparator;
+    'cai_chat_' + Stem + '_' + IntToStr(Random(1000000)) + DirectorySeparator;
   ForceDirectories(Result);
-  CopyFileTo(FixturePath('tiny_qwen3_5.safetensors'),
+  CopyFileTo(FixturePath('tiny_' + Stem + '.safetensors'),
     Result + 'model.safetensors');
-  CopyFileTo(FixturePath('tiny_qwen3_5_config.json'), Result + 'config.json');
+  CopyFileTo(FixturePath('tiny_' + Stem + '_config.json'),
+    Result + 'config.json');
   CopyFileTo(FixturePath('tiny_bpe_split_qwen35_tokenizer.json'),
     Result + 'tokenizer.json');
 end;
 
-procedure TTestNeuralPretrained.RemoveQwen35ChatModelDir(const Dir: string);
+function TTestNeuralPretrained.MakeQwen35ChatModelDir(): string;
+begin
+  Result := MakeChatModelDir('qwen3_5');
+end;
+
+procedure TTestNeuralPretrained.CaptureNotice(const S: string);
+begin
+  FNotices := FNotices + S + LineEnding;
+end;
+
+procedure TTestNeuralPretrained.RemoveChatModelDir(const Dir: string);
 begin
   DeleteFile(Dir + 'model.safetensors');
   DeleteFile(Dir + 'config.json');
@@ -10565,8 +10608,21 @@ var
       AssertEquals('twin present exactly when a window is requested',
         WindowLen > 0, Assigned(Engine.WindowNN));
       if WindowLen > 0 then
+      begin
         AssertEquals('twin input width', WindowLen,
           Engine.WindowNN.GetFirstLayer().Output.SizeX);
+        // The twin borrows every weight of the width-1 net: same layer count
+        // and class per index, WeightOwner set on every weight-bearing
+        // layer, no weights or quantized bytes of its own, and not one FP32
+        // row or int8 code sized while it was built.
+        AssertTrue('the qwen3_5 twin borrows', Engine.WindowBorrowsWeights);
+        AssertWeightsLinked(Engine.WindowNN, Engine.NN, 'engine twin');
+        AssertEquals('twin CountWeights', 0, Engine.WindowNN.CountWeights());
+        AssertEquals('twin sized no weight storage of its own', 0,
+          Engine.WindowNN.WeightElementsSized());
+        AssertTrue('the width-1 net sized its own rows',
+          Engine.NN.WeightElementsSized() > 0);
+      end;
       AssertEquals('width-1 net input width', 1,
         Engine.NN.GetFirstLayer().Output.SizeX);
       // Turn 1: Turn1Len prompt ids; Turn1Len-1 of them are prefilled.
@@ -10604,7 +10660,13 @@ var
       begin
         AssertAllOnDevice(Engine.NN, TNNetFusedSDPA, 'width-1 net');
         if Assigned(Engine.WindowNN) then
+        begin
           AssertAllOnDevice(Engine.WindowNN, TNNetFusedSDPA, 'window net');
+          // Quantized weights: the twin holds the width-1 net's resident
+          // codes and vocab table, one handle each, no second upload.
+          if Opt.WeightMode <> cwmFP32 then
+            AssertDeviceWeightsBorrowed(Engine.WindowNN, 'window net');
+        end;
       end;
       {$ENDIF}
     finally
@@ -10643,7 +10705,7 @@ begin
           IntToStr(WindowChoices[Choice]) + ' turn ' + IntToStr(T + 1));
     end;
   finally
-    RemoveQwen35ChatModelDir(Dir);
+    RemoveChatModelDir(Dir);
   end;
 end;
 
@@ -10687,6 +10749,294 @@ begin
   AssertTrue('OpenCL not compiled in: SKIP', true);
   {$ENDIF}
 end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatPrefillWindowInt8WeightsParity;
+begin
+  // int8 weights (the ChatTerminal default): the twin borrows the width-1
+  // net's int8 tables; --int8 after the harness's --fp32 wins.
+  RunQwen35ChatPrefillWindowParity(['--int8', '--kv-int8', '--serial']);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatPrefillWindowInt8WeightsOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  // The production path on a GPU: int8 codes resident once, retained by the
+  // twin through EnableOpenCLInContextOf.
+  RunQwen35ChatPrefillWindowParity(['--int8', '--kv-int8', '--serial',
+    '--gpu']);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+// A model_type outside the Llama builder (tiny_mamba) keeps the full second
+// build: LoadModel says so, the twin holds its own weights and borrows none,
+// and both prefill widths still produce the same greedy reply. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestMambaChatPrefillWindowFallback;
+const
+  Ctx = 16;
+  PromptLen = 7;
+  Vocab = 13;
+var
+  Dir, ErrorMsg: string;
+  Prompt: TNeuralIntegerArray;
+  TokenPos: integer;
+  ReplyNoWindow, ReplyWindow: string;
+
+  function RunEngine(WindowLen: integer; out Reply: string): TChatEngine;
+  var
+    Args: TStringList;
+    Opt: TChatOptions;
+  begin
+    Result := TChatEngine.Create();
+    Args := TStringList.Create();
+    try
+      Args.Add(Dir);
+      Args.Add('--greedy'); Args.Add('--fp32'); Args.Add('--cpu');
+      Args.Add('--serial');
+      Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
+      Args.Add('--max-new-tokens'); Args.Add('2');
+      Args.Add('--prefill-window'); Args.Add(IntToStr(WindowLen));
+      AssertTrue('chat options parse', ParseArgs(Args, Opt));
+      FNotices := '';
+      Result.OnNotice := @CaptureNotice;
+      AssertTrue('LoadModel: ' + ErrorMsg, Result.LoadModel(Opt, ErrorMsg));
+      Reply := Result.GenerateFromIds(Prompt, Result.Opt);
+    finally
+      Args.Free;
+    end;
+  end;
+
+var
+  Engine: TChatEngine;
+  LayerPos: integer;
+begin
+  RandSeed := 515151;
+  AssertFalse('mamba is outside the Llama builder',
+    PretrainedModelTypeCanBorrowWeights('mamba'));
+  AssertTrue('qwen3_5 is inside it',
+    PretrainedModelTypeCanBorrowWeights('qwen3_5'));
+  Dir := MakeChatModelDir('mamba');
+  SetLength(Prompt, PromptLen);
+  for TokenPos := 0 to PromptLen - 1 do
+    Prompt[TokenPos] := (5 * TokenPos + 2) mod Vocab;
+  try
+    Engine := RunEngine(0, ReplyNoWindow);
+    try
+      AssertTrue('no twin without a window', Engine.WindowNN = nil);
+    finally
+      Engine.Free;
+    end;
+    Engine := RunEngine(4, ReplyWindow);
+    try
+      AssertTrue('the fallback notice names the full second build',
+        Pos('full second build', FNotices) > 0);
+      AssertTrue('twin present', Assigned(Engine.WindowNN));
+      AssertFalse('the mamba twin does not borrow', Engine.WindowBorrowsWeights);
+      AssertEquals('the twin holds a full copy of the weights',
+        Engine.NN.CountWeights(), Engine.WindowNN.CountWeights());
+      AssertTrue('the twin sized its own rows',
+        Engine.WindowNN.WeightElementsSized() > 0);
+      for LayerPos := 0 to Engine.WindowNN.CountLayers() - 1 do
+        AssertTrue('layer ' + IntToStr(LayerPos) + ' owns its weights',
+          Engine.WindowNN.Layers[LayerPos].WeightOwner = nil);
+      AssertEquals('one window fed', 1, Engine.LastPrefillWindows);
+    finally
+      Engine.Free;
+    end;
+    AssertEquals('windowed and token-by-token replies agree',
+      ReplyNoWindow, ReplyWindow);
+  finally
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+// The builder route of the borrowing twin (Phase 5 step B): built from a
+// checkpoint path that does not exist, so no reader is opened; every
+// weight-bearing layer links the owner's layer at the same index, not one
+// FP32 row or int8 code is sized, and its windowed prefill equals a twin
+// that quantized its own copy, bit for bit. A twin built with the other
+// fused-attention setting has another graph and is refused. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35BorrowedTwinBuild;
+const
+  SeqLen = 16;
+  WindowLen = 6;
+var
+  Owner, Reference, Twin, Mismatched: TNNet;
+  SessionOwner, SessionReference, SessionTwin: TNNetStreamingDecoder;
+  LogitsReference, LogitsTwin: TNNetVolume;
+  Toks: array[0..SeqLen - 1] of integer;
+  T, Vocab: integer;
+  Refused: boolean;
+begin
+  Owner := BuildQwen35FixtureTwin(1, {pQuantizeInt8=}true);
+  Reference := nil; Twin := nil; Mismatched := nil;
+  SessionOwner := nil; SessionReference := nil; SessionTwin := nil;
+  LogitsReference := TNNetVolume.Create();
+  LogitsTwin := TNNetVolume.Create();
+  try
+    AssertTrue('the owner sized its own storage',
+      Owner.WeightElementsSized() > 0);
+    Reference := BuildQwen35FixtureTwin(WindowLen, {pQuantizeInt8=}true);
+    Twin := BuildQwen35FixtureTwin(WindowLen, {pQuantizeInt8=}true, Owner);
+    AssertWeightsLinked(Twin, Owner, 'borrowed build');
+    AssertEquals('the twin sized no weight storage', 0,
+      Twin.WeightElementsSized());
+    AssertEquals('twin input width', WindowLen,
+      Twin.GetFirstLayer().Output.SizeX);
+    Vocab := Owner.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    SessionOwner := TNNetStreamingDecoder.Create(Owner, SeqLen);
+    SessionReference := TNNetStreamingDecoder.Create(Reference, SeqLen);
+    SessionTwin := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    RunWindowedPrefillStream(SessionReference, SessionOwner, Toks, WindowLen,
+      SeqLen, LogitsReference);
+    RunWindowedPrefillStream(SessionTwin, SessionOwner, Toks, WindowLen,
+      SeqLen, LogitsTwin);
+    AssertEquals('borrowed twin vs its own-copy twin: bit-identical logits',
+      0.0, MaxAbsVolumeDiff(LogitsReference, LogitsTwin), 0.0);
+    // Graph mismatch: per-head attention wiring instead of the fused layer.
+    Refused := false;
+    NeuralAllowFusedAttention := false;
+    try
+      try
+        Mismatched := BuildQwen35FixtureTwin(WindowLen, {pQuantizeInt8=}true,
+          Owner);
+      except
+        on E: Exception do Refused := true;
+      end;
+    finally
+      NeuralAllowFusedAttention := true;
+    end;
+    AssertTrue('a twin with another graph is refused', Refused);
+    AssertTrue('nothing built on refusal', Mismatched = nil);
+  finally
+    LogitsTwin.Free;
+    LogitsReference.Free;
+    SessionTwin.Free;
+    SessionReference.Free;
+    SessionOwner.Free;
+    Mismatched.Free;
+    Twin.Free; // the engine order: the borrower before its owner
+    Reference.Free;
+    Owner.Free;
+  end;
+end;
+
+// The borrowing build under an int4 owner (tiny_llama_q8, Q4_0-sized rows):
+// the twin links the int4 tables, arms its own int8 input copy, sizes no
+// storage, and its width-4 forward equals a twin that requantized its own
+// copy, bit for bit. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLlamaBorrowedTwinInt4Parity;
+const
+  SeqLen = 4;
+var
+  Owner, Reference, Twin: TNNet;
+  Input, OutReference, OutTwin: TNNetVolume;
+  T, Vocab, LayerPos, Int4Linked: integer;
+  TwinLayer: TNNetLayerConcatedWeights;
+begin
+  Owner := BuildLlamaInt4FixtureTwin(1);
+  Reference := nil; Twin := nil;
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutReference := TNNetVolume.Create();
+  OutTwin := TNNetVolume.Create();
+  try
+    Reference := BuildLlamaInt4FixtureTwin(SeqLen);
+    Twin := BuildLlamaInt4FixtureTwin(SeqLen, Owner);
+    AssertWeightsLinked(Twin, Owner, 'borrowed int4');
+    AssertEquals('the twin sized no weight storage', 0,
+      Twin.WeightElementsSized());
+    Int4Linked := 0;
+    for LayerPos := 0 to Twin.CountLayers() - 1 do
+      if Twin.Layers[LayerPos] is TNNetLayerConcatedWeights then
+      begin
+        TwinLayer := TNNetLayerConcatedWeights(Twin.Layers[LayerPos]);
+        if TwinLayer.WeightsQuantizedInt4 then
+        begin
+          Inc(Int4Linked);
+          AssertTrue('int4 layer ' + IntToStr(LayerPos) +
+            ' armed its int8 input copy', Assigned(TwinLayer.InputCopyInt8));
+        end;
+      end;
+    AssertTrue('int4 layers on the borrowed twin', Int4Linked > 0);
+    Vocab := Owner.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Input.FData[T] := (3 * T + 1) mod Vocab;
+    Reference.Compute(Input);
+    Reference.GetOutput(OutReference);
+    Twin.Compute(Input);
+    Twin.GetOutput(OutTwin);
+    AssertTrue('logits produced', OutReference.Size = SeqLen * Vocab);
+    AssertEquals('borrowed int4 twin vs its own-copy twin: bit-identical',
+      0.0, MaxAbsVolumeDiff(OutReference, OutTwin), 0.0);
+  finally
+    OutTwin.Free;
+    OutReference.Free;
+    Input.Free;
+    Twin.Free;
+    Reference.Free;
+    Owner.Free;
+  end;
+end;
+
+// Same under OpenCL (PoCL here): the borrowed twin armed in the owner's
+// context holds the owner's resident int4 codes, runs its projections on the
+// device and matches a twin that uploaded its own copy. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLlamaBorrowedTwinInt4OpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 4;
+var
+  Owner, Reference, Twin: TNNet;
+  Input, OutReference, OutTwin: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, Vocab: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Owner := BuildLlamaInt4FixtureTwin(1);
+  Reference := nil; Twin := nil;
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutReference := TNNetVolume.Create();
+  OutTwin := TNNetVolume.Create();
+  try
+    Reference := BuildLlamaInt4FixtureTwin(SeqLen);
+    Twin := BuildLlamaInt4FixtureTwin(SeqLen, Owner);
+    Owner.EnableOpenCL(PlatformId, DeviceId);
+    Reference.EnableOpenCL(PlatformId, DeviceId);
+    Twin.EnableOpenCLInContextOf(Owner);
+    AssertWeightsLinked(Twin, Owner, 'borrowed int4 device');
+    AssertDeviceWeightsBorrowed(Twin, 'borrowed int4 device');
+    AssertEquals('the twin sized no weight storage', 0,
+      Twin.WeightElementsSized());
+    Vocab := Owner.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Input.FData[T] := (3 * T + 1) mod Vocab;
+    Reference.Compute(Input);
+    Reference.GetOutput(OutReference);
+    Twin.Compute(Input);
+    Twin.GetOutput(OutTwin);
+    AssertAllOnDevice(Twin, TNNetPointwiseConvLinear, 'borrowed int4 twin');
+    AssertEquals('borrowed int4 device twin vs its own-copy device twin: ' +
+      'bit-identical', 0.0, MaxAbsVolumeDiff(OutReference, OutTwin), 0.0);
+    FreeAndNil(Twin);
+  finally
+    OutTwin.Free;
+    OutReference.Free;
+    Input.Free;
+    Twin.Free;
+    Reference.Free;
+    Owner.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 // Verifies the Qwen3.5/3.6-MoE hybrid import (HF model_type "qwen3_5_moe",
 // architectures ["Qwen3_5MoeForConditionalGeneration"], e.g.

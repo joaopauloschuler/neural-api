@@ -181,9 +181,10 @@ type
                                  // reads yet. Needs int8 or int4 weights
     PrefillWindow: integer;      // --prefill-window N: prefill the prompt N
                                  // tokens per forward on a width-N twin of
-                                 // the net (a second copy of the weights in
-                                 // RAM and on the device, checkpoint loaded
-                                 // twice); 0 = one token per forward
+                                 // the net that borrows its weights (the
+                                 // twin costs its activations; a non-Llama
+                                 // family falls back to a full second
+                                 // build); 0 = one token per forward
     Host: string;                // ChatServer only: HTTP listen address
     Port: integer;               // ChatServer only: HTTP listen port
     ErrorMsg: string;
@@ -224,6 +225,10 @@ type
     WindowNN: TNNet;
     WindowSession: TNNetStreamingDecoder;
     WindowIn: TNNetVolume;
+    // True when WindowNN borrows NN's weights (BuildFromPretrained with
+    // pWeightOwner: the checkpoint is read once and the twin holds no weight
+    // storage); false on the non-Llama fallback, a full second build.
+    WindowBorrowsWeights: boolean;
     ActiveSession: TNNetStreamingDecoder; // the session holding the live state
     Tokenizer: TNeuralHFTokenizer;
     ChatFormat: TNeuralChatFormat;
@@ -413,12 +418,16 @@ begin
   WriteLn('                        width, parallel vs serial passes, peak in-flight)');
   WriteLn('  --no-cache-reuse      re-prefill the whole prompt each turn (default:');
   WriteLn('                        reuse the shared KV-cache prefix from last turn)');
-  WriteLn('  --prefill-window N    prefill the prompt N tokens per forward on a second,');
-  WriteLn('                        width-N copy of the net (default 0 = one token per');
-  WriteLn('                        forward). Keeps a second copy of the weights in RAM');
-  WriteLn('                        and on the device and loads the checkpoint twice.');
-  WriteLn('                        The prompt tail that does not fill a window is fed');
-  WriteLn('                        one token at a time; nothing is padded');
+  WriteLn('  --prefill-window N    prefill the prompt N tokens per forward on a width-N');
+  WriteLn('                        twin of the net (default 0 = one token per forward).');
+  WriteLn('                        The twin shares the loaded weights (in RAM and on');
+  WriteLn('                        the device) and the checkpoint is read once: it');
+  WriteLn('                        costs its activations only. Model families outside');
+  WriteLn('                        the Llama builder (llama, mistral, qwen*, gemma*,');
+  WriteLn('                        phi3, ...) fall back to a full second build, which');
+  WriteLn('                        the startup notice says. The prompt tail that does');
+  WriteLn('                        not fill a window is fed one token at a time;');
+  WriteLn('                        nothing is padded');
   WriteLn('  --serial              serial layer loop (default: layer-graph parallel');
   WriteLn('                        forward across independent layers; the parallel');
   WriteLn('                        path also threads large conv/linear layers');
@@ -1021,6 +1030,7 @@ begin
   WindowNN := nil;
   WindowSession := nil;
   WindowIn := nil;
+  WindowBorrowsWeights := false;
   ActiveSession := nil;
   Tokenizer := nil;
   ChatFormat := cfUnknown;
@@ -1059,9 +1069,10 @@ begin
   FreeAndNil(Session); // before NN.Free: Destroy ends incremental decode on
                        // NN's layers
   FreeAndNil(WindowSession);
+  FreeAndNil(WindowNN); // before NN: the twin borrows NN's weights and
+                        // resident device codes
   FreeAndNil(Tokenizer);
   FreeAndNil(NN);
-  FreeAndNil(WindowNN);
   FreeAndNil(WindowIn);
   {$IFDEF OpenCL}
   FreeAndNil(GpuCL); // after NN.Free; nil when GPU was off or fell back to CPU
@@ -1263,23 +1274,32 @@ begin
 
   Notice('Loading ' + Opt.ModelDir + ' ...');
   LoadStart := GetTickCount64();
+  ModelType := ReadModelType(IncludeTrailingPathDelimiter(Opt.ModelDir) +
+    'config.json');
+  if ModelType = '' then ModelType := 'unknown';
   // Built at INPUT WIDTH 1 (pSeqLen=1): streamed decode feeds one token per
   // forward and the KV cache (budget = CtxLen, set on the session below) holds
   // the context. SeqLen is the cache budget, NOT the built input width.
   NN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}1,
     {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32);
   Int4DirectLayerCount := NeuralImportInt4LayerCount;
-  // --prefill-window: the width-N twin. No importer route builds a net
-  // without reading its weights, so the twin costs a second checkpoint read
-  // and a second copy of the weights; every step NN takes below, the twin
-  // takes too.
-  if Opt.PrefillWindow > 0 then
+  // --prefill-window: the width-N twin borrows NN's weights
+  // (BuildFromPretrained with pWeightOwner: one checkpoint read, no weight
+  // storage of its own) once NN's weight state is final, below. Families the
+  // Llama builder does not cover take the full second build here instead;
+  // that twin then follows every step NN takes.
+  WindowBorrowsWeights := (Opt.PrefillWindow > 0) and
+    PretrainedModelTypeCanBorrowWeights(ModelType);
+  if (Opt.PrefillWindow > 0) and (not WindowBorrowsWeights) then
   begin
+    Notice(Format('[--prefill-window %d: model_type "%s" is outside the' +
+      ' Llama builder, so the width-%d twin is a full second build:' +
+      ' checkpoint read twice, weights held twice in RAM and on the device]',
+      [Opt.PrefillWindow, ModelType, Opt.PrefillWindow]));
     NeuralImportInt4LayerCount := 0;
     WindowNN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}Opt.PrefillWindow,
       {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32);
   end;
-  NeuralAllowFusedAttention := true; // restore the global default post-build
   NeuralImportInt4FromQ4_0 := false;
   // Low-memory forward path, set independently of trainability. The importer
   // built inference-only with low memory ON (SetTrainable's pLowMemory default);
@@ -1306,6 +1326,8 @@ begin
     // Counts the layers the loader already direct-loaded too: they exit
     // QuantizeWeightsInt4 immediately and it counts them as int4.
     Int4LayerCount := NN.QuantizeWeightsInt4();
+    // The fallback twin quantizes its own copy; a borrowing twin does not
+    // exist yet and will link NN's int4 tables as it is built.
     if Assigned(WindowNN) then WindowNN.QuantizeWeightsInt4();
     Notice('[--int4: Q4_0 int4 weights on ' + IntToStr(Int4LayerCount) +
       ' layers (' + IntToStr(Int4DirectLayerCount) +
@@ -1314,6 +1336,29 @@ begin
       ' requantized from int8); the other weight layers' +
       ' stay int8; int8 input copy enabled on the int4 layers]');
   end;
+
+  // The borrowing twin: NN's weight state is final (int8, or int4 above) and
+  // OpenCL is not enabled yet, the order TNNetLayer.LinkWeightsFrom needs.
+  // NeuralAllowFusedAttention is still the build-time value, so the twin
+  // gets the same graph. It takes no quantize step of its own (its layers
+  // borrow), only the low-memory sweep that decides its own caches.
+  if WindowBorrowsWeights then
+  begin
+    LoadStart := GetTickCount64();
+    WindowNN := BuildFromPretrained(Opt.ModelDir, {pSeqLen=}Opt.PrefillWindow,
+      {pTrainable=}false, '', {pQuantizeInt8=}Opt.WeightMode <> cwmFP32,
+      {pWeightOwner=}NN);
+    WindowNN.SetTrainable({pTrainable=}false, {pLowMemory=}Opt.LowMemory);
+    LastIdx := WindowNN.GetLastLayerIdx();
+    for Cnt := 0 to LastIdx do
+      WindowNN.Layers[Cnt].FlushWeightCache();
+    Notice(Format('[--prefill-window %d: width-%d twin built in %.1fs' +
+      ' sharing the loaded weights (checkpoint read once; the twin holds' +
+      ' %d weights of its own and costs its activations only)]',
+      [Opt.PrefillWindow, Opt.PrefillWindow,
+       (GetTickCount64() - LoadStart) / 1000, WindowNN.CountWeights()]));
+  end;
+  NeuralAllowFusedAttention := true; // restore the global default post-build
 
   {$IFDEF OpenCL}
   // OpenCL offload of the conv/linear matmuls. Enabling it rebuilds each
@@ -1369,8 +1414,13 @@ begin
         if Assigned(WindowNN) then
         begin
           WindowNN.OpenCLFP16 := Opt.ExperimentalFP16;
-          WindowNN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
-            GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
+          // A borrowing twin must live in NN's OpenCL context to retain
+          // NN's resident codes (a context of its own cannot share cl_mem).
+          if WindowBorrowsWeights then
+            WindowNN.EnableOpenCLInContextOf(NN, Opt.GpuSharedKernel)
+          else
+            WindowNN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
+              GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
         end;
         Notice(Format('GPU weights uploaded in %.1fs.',
           [(GetTickCount64() - LoadStart) / 1000]));
@@ -1405,9 +1455,8 @@ begin
     WindowSession := TNNetStreamingDecoder.Create(WindowNN, SeqLen, Opt.KVInt8);
     WindowIn := TNNetVolume.Create(Opt.PrefillWindow, 1, 1);
     Notice(Format('[--prefill-window %d: the prompt is prefilled %d tokens per' +
-      ' forward on a second, width-%d copy of the net (weights held twice in' +
-      ' RAM and on the device; checkpoint loaded twice); the tail that does' +
-      ' not fill a window goes one token at a time]',
+      ' forward on the width-%d twin; the tail that does not fill a window' +
+      ' goes one token at a time]',
       [Opt.PrefillWindow, Opt.PrefillWindow, Opt.PrefillWindow]));
   end;
   if Opt.KVInt8 then
@@ -1447,9 +1496,6 @@ begin
   FreeAndNil(TurnSnap);
   TurnSnapPos := 0;
   SetLength(CachedTokens, 0);
-  ModelType := ReadModelType(IncludeTrailingPathDelimiter(Opt.ModelDir) +
-    'config.json');
-  if ModelType = '' then ModelType := 'unknown';
   Line := Format('Model: %s, %d params, vocab %d, context %d, chat format ',
     [ModelType, NN.CountWeights(), VocabSize, SeqLen]);
   if RawMode then Line := Line + 'raw (completion)'

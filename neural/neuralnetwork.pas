@@ -460,6 +460,14 @@ type
       // so either side may be destroyed first. Coded by Claude (AI).
       FWeightOwner: TNNetLayer;
       FWeightBorrowers: TList;
+      // Build-time borrowing (TNNet.BuildWeightOwner): True from the moment
+      // this layer skipped sizing its weight rows until LinkBuildWeightOwner
+      // links it; a layer left pending is a graph mismatch.
+      FBuildLinkPending: boolean;
+      // FP32 weight elements (or int8 codes) this layer allocated for its own
+      // rows through SetNumWeightsForAllNeurons, ArmBuildQuantInt8Storage or
+      // its constructor; a layer built borrowing reports 0. Coded by Claude (AI).
+      FWeightElementsSized: int64;
       FCanNormalizeDelta: boolean;
       FCanSetNumWeightsForAllNeurons: boolean;
       // When False, SetNumWeightsForAllNeurons skips allocating the per-neuron
@@ -577,6 +585,13 @@ type
       // Detaches every borrower of this layer (idempotent); descendants call
       // it BEFORE freeing anything a borrower aliases.
       procedure UnlinkWeightBorrowers();
+      // True, and the link marked pending, when the owning net builds
+      // borrowing (TNNet.BuildWeightOwner): the caller sizes no weight rows.
+      function DeferWeightSizingToBuildLink(): boolean;
+      // TNNet calls it once the layer index is final: links this layer to the
+      // owner net's layer at the same index (same class), raising on a graph
+      // mismatch or a refused link. Coded by Claude (AI).
+      procedure LinkBuildWeightOwner();
     public
       // Fast (array) mirror of the FNeurons list: same TNNetNeuron references,
       // indexed directly without the TNNetNeuronList method/bounds overhead.
@@ -901,6 +916,9 @@ type
       // The layer whose weights this one borrows (nil: none, or the owner is
       // already gone).
       property WeightOwner: TNNetLayer read FWeightOwner;
+      // Weight elements this layer allocated for rows of its own (test hook
+      // for the borrowing build: 0 on every linked layer).
+      property WeightElementsSized: int64 read FWeightElementsSized;
       {$IFDEF OpenCL}
       property HasOpenCL: boolean read FHasOpenCL;
       property ShouldOpenCL:boolean read FShouldOpenCL;
@@ -8007,10 +8025,14 @@ type
     // vocab table (VocabSize x EmbeddingSize floats, the single largest
     // tensor of an LLM checkpoint) is never allocated at all; the importer
     // then fills the codes via ImportInt8QuantRow or the
-    // EnsureWritableImportWeights round-trip. Coded by Claude (AI).
+    // EnsureWritableImportWeights round-trip. pWeightOwner (a same-shape
+    // TNNetEmbedding of an already-loaded net) allocates no table at all:
+    // the layer links to it here (LinkWeightsFrom) - the table is sized in
+    // this constructor, before any net can see the layer. Coded by Claude (AI).
     constructor Create(pVocabSize, pEmbeddingSize: integer;
       EncodeZero: integer = 0; ScaleEmbedding: TNeuralFloat = 0.02;
-      pTrainable: boolean = true; pQuantizeInt8: boolean = false); reintroduce;
+      pTrainable: boolean = true; pQuantizeInt8: boolean = false;
+      pWeightOwner: TNNetLayer = nil); reintroduce;
     destructor Destroy; override;
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
@@ -17817,6 +17839,13 @@ type
       // existing per-block sweeps flip every LATER layer onto the quantized
       // construction path with no importer changes. Coded by Claude (AI).
       FBuildQuantInt8: boolean;
+      // BORROWING BUILD. While set, every layer attached to this net sizes no
+      // weight rows (TNNetLayer.DeferWeightSizingToBuildLink) and, once its
+      // index is final, links to FBuildWeightOwner's layer at the same index
+      // (TNNetLayer.LinkBuildWeightOwner, which raises on a graph mismatch).
+      // The builder sets it before the first AddLayer and clears it after the
+      // graph; the owner's weight state must be final. Coded by Claude (AI).
+      FBuildWeightOwner: TNNet;
       {$IFDEF OpenCL}
       // FP16 ACTIVATION MODE. When true, an int8 convolution runs its device
       // forward with the half B operand (cai_dot_product_int8_h and friends)
@@ -19654,6 +19683,12 @@ type
       // QuantizeWeightsInt8 sweep sets it automatically otherwise.
       property BuildQuantInt8: boolean
         read FBuildQuantInt8 write FBuildQuantInt8; // Coded by Claude (AI).
+      // The net whose weights every layer attached from now on borrows (see
+      // FBuildWeightOwner); nil = the layers size their own rows.
+      property BuildWeightOwner: TNNet
+        read FBuildWeightOwner write FBuildWeightOwner;
+      // Sum of every layer's WeightElementsSized: 0 for a net built borrowing.
+      function WeightElementsSized(): int64;
       // Q4_0-quantizes every layer that SupportsInt4Weights and returns how
       // many hold int4 weights afterwards. Coded by Claude (AI).
       function QuantizeWeightsInt4(): integer;
@@ -21870,6 +21905,10 @@ type
 
       // custom layers support
       function ShouldIncDepartingBranchesCnt(pLayer: TNNetLayer):boolean; virtual;
+      // Adds pLayer to FLayers, assigns its index and, under a borrowing
+      // build (FBuildWeightOwner), links it to the owner's layer at that
+      // index. Every AddLayer route ends here. Coded by Claude (AI).
+      procedure RegisterLayer(pLayer: TNNetLayer);
 
       // Anomaly detection (port of torch.autograd.set_detect_anomaly).
       // When DetectAnomaly is True, Compute scans every layer's Output for
@@ -70206,16 +70245,22 @@ begin
   FOutput.ReSize(SeqLen, 1, Hv * Dv);
   SetOutputErrorSize(FOutput);
   if FNeurons.Count < 3 then AddMissingNeurons(3);
-  FNeurons[0].FWeights.ReSize(Hv, 1, 1);  // A_log
-  FNeurons[1].FWeights.ReSize(Hv, 1, 1);  // dt_bias
-  FNeurons[2].FWeights.ReSize(Dv, 1, 1);  // norm gain w (shared across heads)
-  // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
-  if FIsTrainable then
-    for ii := 0 to 2 do
-    begin
-      FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
-      FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
-    end;
+  // The rows are sized here, not through SetNumWeightsForAllNeurons (they
+  // differ per neuron), so the borrowing build is honoured here too.
+  if not DeferWeightSizingToBuildLink() then
+  begin
+    Inc(FWeightElementsSized, 2 * Hv + Dv);
+    FNeurons[0].FWeights.ReSize(Hv, 1, 1);  // A_log
+    FNeurons[1].FWeights.ReSize(Hv, 1, 1);  // dt_bias
+    FNeurons[2].FWeights.ReSize(Dv, 1, 1);  // norm gain w (shared across heads)
+    // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
+    if FIsTrainable then
+      for ii := 0 to 2 do
+      begin
+        FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
+        FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
+      end;
+  end;
   FQn.ReSize(SeqLen, 1, Hk * Dk);  FKn.ReSize(SeqLen, 1, Hk * Dk);
   FQInv.ReSize(SeqLen, 1, Hk);     FKInv.ReSize(SeqLen, 1, Hk);
   FBeta.ReSize(SeqLen, 1, Hv);     FDecay.ReSize(SeqLen, 1, Hv);
@@ -78332,7 +78377,10 @@ begin
       //    so the persistent cache is pure overhead.
       //  - int4: same as int8 - the FP32 rows are gone, the kernels read
       //    FQuantTableInt4.
-      if not FQuantInt8 and not FQuantInt4 and not ActiveLowMemory() then
+      //  - a pending build link: the rows are one-element placeholders until
+      //    LinkBuildWeightOwner points them at the owner's.
+      if not FQuantInt8 and not FQuantInt4 and not ActiveLowMemory() and
+        not FBuildLinkPending then
       begin
         FNeuronWeightList.ConcatInto(FConcatedWeights);
         if FShouldInterleaveWeights then
@@ -78384,6 +78432,7 @@ begin
   FQuantWSizeD := d;
   // ReSize does no zero fill, so the arming state is written explicitly:
   // zero codes = zero weights, unit scales.
+  Inc(FWeightElementsSized, int64(FNeurons.Count) * V);
   FQuantTable.ReSize(FNeurons.Count, 1, V);
   FQuantTable.Fill(0);
   FQuantTable.ScaleData.Fill(1);
@@ -78399,6 +78448,8 @@ end;
 procedure TNNetLayerConcatedWeights.SetNumWeightsForAllNeurons(
   NumWeights: integer);
 begin
+  // A borrowing build sizes nothing, not even the int8 container.
+  if DeferWeightSizingToBuildLink() then exit;
   if ArmBuildQuantInt8Storage(NumWeights, 1, 1) then exit;
   inherited SetNumWeightsForAllNeurons(NumWeights);
 end;
@@ -78406,6 +78457,7 @@ end;
 procedure TNNetLayerConcatedWeights.SetNumWeightsForAllNeurons(
   x, y, d: integer);
 begin
+  if DeferWeightSizingToBuildLink() then exit;
   if ArmBuildQuantInt8Storage(x, y, d) then exit;
   inherited SetNumWeightsForAllNeurons(x, y, d);
 end;
@@ -109002,7 +109054,8 @@ end;
 
 constructor TNNetEmbedding.Create(pVocabSize, pEmbeddingSize: integer;
   EncodeZero: integer = 0; ScaleEmbedding: TNeuralFloat = 0.02;
-  pTrainable: boolean = true; pQuantizeInt8: boolean = false);
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNetLayer = nil);
 begin
   inherited Create();
   FQuantTable := TNNetVolumeQuant8.Create();
@@ -109020,14 +109073,24 @@ begin
   // SetNumWeightsForAllNeurons then skips the Delta/BackInertia volumes
   // whose transient allocation would otherwise drive the process to a
   // 3x-vocab-table FP32 high-water mark the allocator never returns.
-  FIsTrainable := pTrainable and (not pQuantizeInt8);
-  if pQuantizeInt8 then
+  FIsTrainable := pTrainable and (not pQuantizeInt8) and
+    (not Assigned(pWeightOwner));
+  if Assigned(pWeightOwner) then
+  begin
+    // No table of any kind: the owner's rows or int8 table are read by
+    // reference. A refused link (shape or class mismatch) is a build error.
+    if not LinkWeightsFrom(pWeightOwner) then
+      raise Exception.Create('TNNetEmbedding.Create: could not borrow the ' +
+        'table of the given owner layer (see the message above).');
+  end
+  else if pQuantizeInt8 then
   begin
     // Arm the int8 container directly: zero codes (dequantized weight 0 -
     // a valid forward), unit scales (the zero-row convention). ReSize does
     // not fill, so the scales are set explicitly. The FP32 table is never
     // allocated; DequantizeWeightsInt8 can still restore writable rows for
     // the FP32 import path.
+    Inc(FWeightElementsSized, int64(pVocabSize) * pEmbeddingSize);
     FQuantTable.ReSize(pVocabSize, 1, pEmbeddingSize);
     FQuantTable.Fill(0);
     FQuantTable.ScaleData.Fill(1);
@@ -109979,6 +110042,7 @@ begin
   inherited Create();
   ClearTime();
   FIsTrainable := true;
+  FBuildWeightOwner := nil;
   {$IFDEF OpenCL}
   FDotProductKernel := nil;
   FSharedKernels := nil;
@@ -129010,9 +129074,25 @@ begin
     if ShouldIncDepartingBranchesCnt(pLayer)
       then AfterLayer.IncDepartingBranchesCnt();
   end;
+  RegisterLayer(pLayer);
+  Result := pLayer;
+end;
+
+procedure TNNet.RegisterLayer(pLayer: TNNetLayer);
+begin
   FLayers.Add(pLayer);
   pLayer.FLayerIdx := GetLastLayerIdx();
-  Result := pLayer;
+  if Assigned(FBuildWeightOwner) then pLayer.LinkBuildWeightOwner();
+end;
+
+function TNNet.WeightElementsSized(): int64;
+var
+  LayerCnt, LastLayerIdx: integer;
+begin
+  Result := 0;
+  LastLayerIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+    Result := Result + FLayers[LayerCnt].FWeightElementsSized;
 end;
 
 function TNNet.AddLayer(strData: string):TNNetLayer;
@@ -130390,8 +130470,7 @@ begin
   begin
     pLayer.NN := Self;
     pLayer.SetPrevLayer(pAfterLayer);
-    FLayers.Add(pLayer);
-    pLayer.FLayerIdx := GetLastLayerIdx();
+    RegisterLayer(pLayer);
     if (ShouldIncDepartingBranchesCnt(pLayer)) then pAfterLayer.IncDepartingBranchesCnt();
     Result := pLayer;
   end
@@ -130410,8 +130489,7 @@ begin
     pLayer.SetPrevLayer(FLayers[pAfterLayerIdx]);
     if (ShouldIncDepartingBranchesCnt(pLayer)) then FLayers[pAfterLayerIdx].IncDepartingBranchesCnt();
   end;
-  FLayers.Add(pLayer);
-  pLayer.FLayerIdx := GetLastLayerIdx();
+  RegisterLayer(pLayer);
   Result := pLayer;
 end;
 
@@ -132645,7 +132723,9 @@ begin
     // Weightless layers, and owner layers that only link another layer's
     // neurons themselves, have nothing to lend.
     if OwnerLayer.CountWeights() = 0 then continue;
-    if FLayers[LayerCnt].LinkWeightsFrom(OwnerLayer) then Inc(Result);
+    // A borrowing build linked the layer as it was attached.
+    if FLayers[LayerCnt].FWeightOwner = OwnerLayer then Inc(Result)
+    else if FLayers[LayerCnt].LinkWeightsFrom(OwnerLayer) then Inc(Result);
   end;
 end;
 
@@ -134192,6 +134272,55 @@ begin
   SetLength(FArrNeurons, 0);
 end;
 
+function TNNetLayer.DeferWeightSizingToBuildLink(): boolean;
+begin
+  Result := Assigned(FNN) and Assigned(FNN.FBuildWeightOwner) and
+    (FNeurons.Count > 0) and FCanSetNumWeightsForAllNeurons and
+    (not FLinkedNeurons);
+  if Result then FBuildLinkPending := true;
+end;
+
+// Raises instead of reporting through FErrorProc: a twin whose graph differs
+// from its owner's would compute garbage silently, and the build is the one
+// place where the mismatch is cheap to stop. Coded by Claude (AI).
+procedure TNNetLayer.LinkBuildWeightOwner();
+var
+  OwnerNet: TNNet;
+  OwnerLayer: TNNetLayer;
+begin
+  OwnerNet := FNN.FBuildWeightOwner;
+  if FLayerIdx >= OwnerNet.CountLayers() then
+    raise Exception.Create(ClassName + '.LinkBuildWeightOwner: layer ' +
+      IntToStr(FLayerIdx) + ' has no counterpart - the owner net has only ' +
+      IntToStr(OwnerNet.CountLayers()) + ' layers (graph mismatch).');
+  OwnerLayer := OwnerNet.FLayers[FLayerIdx];
+  if OwnerLayer.ClassType <> Self.ClassType then
+    raise Exception.Create(ClassName + '.LinkBuildWeightOwner: layer ' +
+      IntToStr(FLayerIdx) + ' is a ' + ClassName + ' but the owner''s is a ' +
+      OwnerLayer.ClassName + ' (graph mismatch).');
+  if FWeightOwner = OwnerLayer then
+  begin
+    // Linked already (a TNNetEmbedding links in its constructor).
+    FBuildLinkPending := false;
+    exit;
+  end;
+  if OwnerLayer.CountWeights() = 0 then
+  begin
+    if FBuildLinkPending then
+      raise Exception.Create(ClassName + '.LinkBuildWeightOwner: layer ' +
+        IntToStr(FLayerIdx) + ' skipped sizing its rows but the owner''s ' +
+        'layer has no weights to lend.');
+    exit;
+  end;
+  // Cleared before the link: LinkWeightsFrom rebuilds the derived caches
+  // through AfterWeightUpdate, which a pending link keeps empty.
+  FBuildLinkPending := false;
+  if not LinkWeightsFrom(OwnerLayer) then
+    raise Exception.Create(ClassName + '.LinkBuildWeightOwner: layer ' +
+      IntToStr(FLayerIdx) + ' could not borrow the owner''s weights (see ' +
+      'the message above).');
+end;
+
 procedure TNNetLayer.UnlinkWeightBorrowers();
 var
   BorrowerPos, MaxBorrowerPos: integer;
@@ -135063,8 +135192,10 @@ var
   MaxNeuronPos: integer;
   Cnt: integer;
 begin
+  if DeferWeightSizingToBuildLink() then exit;
   if (FNeurons.Count > 0) and (FCanSetNumWeightsForAllNeurons) then
   begin
+    Inc(FWeightElementsSized, int64(FNeurons.Count) * NumWeights);
     MaxNeuronPos := FNeurons.Count-1;
     for Cnt := 0 to MaxNeuronPos do
     begin
@@ -135087,8 +135218,10 @@ var
   Cnt: integer;
   N: TNNetNeuron;
 begin
+  if DeferWeightSizingToBuildLink() then exit;
   if (FNeurons.Count > 0) and (FCanSetNumWeightsForAllNeurons) then
   begin
+    Inc(FWeightElementsSized, int64(FNeurons.Count) * x * y * d);
     MaxNeuronPos := FNeurons.Count-1;
     for Cnt := 0 to MaxNeuronPos do
     begin
