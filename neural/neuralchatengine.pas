@@ -137,8 +137,8 @@ type
     ShowHelp: boolean;
     Stats: boolean;              // per-turn timing to stderr (TTFT, tok/s)
     Profile: boolean;            // per-layer-class forward timing to stderr after
-                                 // each turn (decode steps only); for picking the
-                                 // next layer class to optimize (e.g. OpenCL)
+                                 // each turn, prefill and decode reported apart;
+                                 // for picking the next layer class to optimize
     NoCacheReuse: boolean;       // force full re-prefill every turn (A/B + debug)
     KVInt8: boolean;             // int8-quantized KV cache (~1/4 the KV RAM at
                                  // long context; logits not bit-exact). Follows
@@ -271,6 +271,16 @@ type
     LastFinishReason: string;
     LastPrefillWindows: integer; // whole windows the last call fed through
                                  // WindowSession (0 without --prefill-window)
+    // Lifetime totals over every GenerateFromIds call of this engine, for a
+    // host that reports usage for as long as it runs (the [stats] totals
+    // lines). Input = prompt tokens and the prefill time; cached = the part
+    // of the prompt the KV-cache/turn-snapshot reuse skipped; output = reply
+    // tokens and the time from the end of prefill to the end of decode.
+    TotalInputTokens: Int64;
+    TotalCachedInputTokens: Int64;
+    TotalInputMs: double;
+    TotalOutputTokens: Int64;
+    TotalOutputMs: double;
     Loaded: boolean;
     {$IFDEF OpenCL}
     GpuCL: TEasyOpenCL;          // platform/device handle for OpenCL offload
@@ -393,10 +403,12 @@ begin
   WriteLn('                        shared, which is faster). Each layer then waits for');
   WriteLn('                        its sources, so --profile charges GPU time per layer');
   WriteLn('                        instead of the queue drain: a profiling mode.');
-  WriteLn('  --stats               per-turn timing to stderr (TTFT, prefill tok/s,');
-  WriteLn('                        decode tok/s)');
+  WriteLn('  --stats               per-turn timing to stderr: input (prompt, TTFT,');
+  WriteLn('                        prefill tok/s), output (tokens, time, decode tok/s),');
+  WriteLn('                        per-step split, and lifetime input/output totals');
   WriteLn('  --profile             per-layer-class forward timing to stderr after each');
-  WriteLn('                        turn (decode steps only); ranks classes to optimize.');
+  WriteLn('                        turn, one report for the prefill and one for the');
+  WriteLn('                        decode steps; ranks classes to optimize.');
   WriteLn('                        Also prints [sched]: layer-graph parallelism (graph');
   WriteLn('                        width, parallel vs serial passes, peak in-flight)');
   WriteLn('  --no-cache-reuse      re-prefill the whole prompt each turn (default:');
@@ -1027,6 +1039,11 @@ begin
   LastCompletionTokens := 0;
   LastFinishReason := '';
   LastPrefillWindows := 0;
+  TotalInputTokens := 0;
+  TotalCachedInputTokens := 0;
+  TotalInputMs := 0;
+  TotalOutputTokens := 0;
+  TotalOutputMs := 0;
   Loaded := false;
   {$IFDEF OpenCL}
   GpuCL := nil;
@@ -1561,14 +1578,16 @@ var
   Len, StepCnt, Cnt, NewToken: integer;
   Reused, PromptLen: integer;  // KV-cache reuse bookkeeping (and --stats)
   WindowLen, WindowCount, WindowPos, WindowRow, MaxRowPos: integer; // --prefill-window
-  PrefillMs, MeanStepMs: double; // --stats prefill rate
+  PrefillMs: double;           // --stats: TStart..TPrefillEnd
+  PrefillTokens: integer;      // tokens fed by this call's prefill
   LenM2, MarkerLen, EmLen, DecLen: integer;
   LastPos, RowBytes: integer;
   Decoded, Emitted, Piece: string;
-  // --stats timing (monotonic ms). TStart: before prefill; TFirst: when the
-  // first reply token is produced (so TTFT covers prefill + first step);
-  // TEnd: after the decode loop. Produced counts emitted tokens.
-  TStart, TFirst, TEnd: QWord;
+  // --stats timing (monotonic ms). TStart: before prefill; TPrefillEnd:
+  // after the last prefill step; TFirst: when the first reply token is
+  // produced (so TTFT covers prefill + first step); TEnd: after the decode
+  // loop. Produced counts emitted tokens.
+  TStart, TPrefillEnd, TFirst, TEnd: QWord;
   Produced: integer;
   DecodeSecs: double;
   // --stats per-phase split of one decode step, accumulated over the loop in
@@ -1657,8 +1676,22 @@ begin
   Output := nil; // a reference into the net, returned by Session.Output()
   Row := TNNetVolume.Create(VocabSize, 1, 1);
   TStart := GetTickCount64();
+  TPrefillEnd := TStart;
   TFirst := 0;
   TEnd := 0;
+  // --profile: the prefill gets its own layer-class report, so both nets
+  // start this call with clean timers (the twin runs the windows, NN the
+  // tail).
+  if GenOpt.Profile then
+  begin
+    NN.ClearTime();
+    NN.ResetSchedulerStats();
+    if Assigned(WindowNN) then
+    begin
+      WindowNN.ClearTime();
+      WindowNN.ResetSchedulerStats();
+    end;
+  end;
   Produced := 0;
   PromptLen := Len;
   // Outer except: past this point the session's KV cache is mutated
@@ -1746,12 +1779,35 @@ begin
       Session.StepForwardToHidden(InV, Cnt);
       Inc(Cnt);
     end;
-    // --profile: discard the one-shot prefill timings (and scheduler stats)
-    // so the per-layer-class report below reflects only the repeated
-    // single-token decode steps - the steady-state workload whose layer costs
-    // we want to rank for optimization.
+    TPrefillEnd := GetTickCount64();
+    PrefillTokens := LenM2 + 1 - Reused;
+    // --profile: the prefill's own layer-class report (windows on the twin,
+    // the tail on NN), then clean timers so the report after the decode
+    // loop covers only the repeated single-token decode steps.
     if GenOpt.Profile then
     begin
+      if PrefillTokens > 0 then
+      begin
+        WriteLn(StdErr);
+        Write(StdErr, Format('[profile] prefill: %d tokens in %d ms',
+          [PrefillTokens, TPrefillEnd - TStart]));
+        if WindowLen > 0 then
+          Write(StdErr, Format(' (%d windows of %d on the twin, %d single steps)',
+            [LastPrefillWindows, WindowLen,
+             PrefillTokens - LastPrefillWindows * WindowLen]));
+        WriteLn(StdErr);
+        if LastPrefillWindows > 0 then
+        begin
+          Write(StdErr, TNNet.LayerClassTimingReport(WindowNN));
+          WriteLn(StdErr, '[sched] ', WindowNN.SchedulerStatsReport());
+        end;
+        if PrefillTokens - LastPrefillWindows * WindowLen > 0 then
+        begin
+          Write(StdErr, TNNet.LayerClassTimingReport(NN));
+          WriteLn(StdErr, '[sched] ', NN.SchedulerStatsReport());
+        end;
+        Flush(StdErr);
+      end;
       NN.ClearTime();
       NN.ResetSchedulerStats();
     end;
@@ -1879,23 +1935,34 @@ begin
       TurnSnap := Session.Snapshot();
       TurnSnapPos := Len - 1;
     end;
+    // Lifetime usage totals, kept whether or not --stats prints them.
+    // Input time is the prefill; output time runs from the end of prefill
+    // to the end of decode (it includes the first decode step).
+    TEnd := GetTickCount64();
+    PrefillMs := TPrefillEnd - TStart;
+    if Produced > 0 then
+    begin
+      Inc(TotalInputTokens, PromptLen);
+      Inc(TotalCachedInputTokens, Reused);
+      TotalInputMs := TotalInputMs + PrefillMs;
+      Inc(TotalOutputTokens, Produced);
+      TotalOutputMs := TotalOutputMs + (TEnd - TPrefillEnd);
+    end;
     // Per-turn timing to stderr (keeps stdout = pure model output). TTFT =
-    // prefill + first decode step; tok/s measures the steady-state decode of
-    // the tokens AFTER the first, so prefill cost is excluded. prompt N (reused
-    // K) shows how much of the prompt the KV-cache reuse skipped re-prefilling.
+    // prefill + first decode step; decode tok/s measures the steady-state
+    // decode of the tokens AFTER the first, so prefill cost is excluded.
+    // prompt N (reused K) shows how much of the prompt the KV-cache reuse
+    // skipped re-prefilling.
     if GenOpt.Stats and (Produced > 0) then
     begin
-      TEnd := GetTickCount64();
-      Write(StdErr, Format('[stats] %d tokens, TTFT %d ms, prompt %d (reused %d)',
-        [Produced, TFirst - TStart, PromptLen, Reused]));
-      // Prefill rate: the prefilled tokens over TTFT minus one mean decode
-      // step (TTFT includes the first step). Omitted when nothing was
-      // prefilled or the timer resolution leaves no positive prefill time.
-      MeanStepMs := StepMs / Produced;
-      PrefillMs := (TFirst - TStart) - MeanStepMs;
-      if (PromptLen - 1 - Reused > 0) and (PrefillMs > 0) then
+      Write(StdErr, Format('[stats] input: prompt %d tokens (reused %d),' +
+        ' TTFT %d ms', [PromptLen, Reused, TFirst - TStart]));
+      if (PrefillTokens > 0) and (PrefillMs > 0) then
         Write(StdErr, Format(', prefill %.1f tok/s',
-          [(PromptLen - 1 - Reused) * 1000.0 / PrefillMs]));
+          [PrefillTokens * 1000.0 / PrefillMs]));
+      WriteLn(StdErr);
+      Write(StdErr, Format('[stats] output: %d tokens in %.1f s',
+        [Produced, (TEnd - TPrefillEnd) / 1000.0]));
       if Produced > 1 then
       begin
         DecodeSecs := (TEnd - TFirst) / 1000.0;
@@ -1914,6 +1981,10 @@ begin
          SamplerMs / Produced, EmitMs / Produced,
          (StepMs - ForwardMs - SoftMaxMs - ChainMs - SamplerMs - EmitMs) / Produced,
          StepMs / Produced]));
+      WriteLn(StdErr, Format('[stats] total input: %d tokens (cached %d), %.1f s',
+        [TotalInputTokens, TotalCachedInputTokens, TotalInputMs / 1000.0]));
+      WriteLn(StdErr, Format('[stats] total output: %d tokens, %.1f s',
+        [TotalOutputTokens, TotalOutputMs / 1000.0]));
       Flush(StdErr);
     end;
     // --profile: per-layer-class forward timing accumulated over this call's
