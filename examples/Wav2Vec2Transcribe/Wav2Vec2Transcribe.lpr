@@ -139,18 +139,18 @@ end;
 // feature extractor's do_normalize).
 procedure NormalizeSamples(V: TNNetVolume);
 var
-  k: integer;
   Mean, Variance, Std: TNeuralFloat;
 begin
   if V.Size < 1 then exit;
-  Mean := 0;
-  for k := 0 to V.Size - 1 do Mean := Mean + V.FData[k];
-  Mean := Mean / V.Size;
-  Variance := 0;
-  for k := 0 to V.Size - 1 do Variance := Variance + Sqr(V.FData[k] - Mean);
-  Variance := Variance / V.Size;
+  // SIMD bulk methods replace the three scalar passes: E[x^2] - E[x]^2 gives
+  // the variance (clamped at 0 against rounding; the +1e-7 epsilon absorbs
+  // the borderline cases), and the normalize is a bulk add + scale.
+  Mean := V.GetSum() / V.Size;
+  Variance := V.GetSumSqr() / V.Size - Mean * Mean;
+  if Variance < 0 then Variance := 0;
   Std := Sqrt(Variance + 1e-7);
-  for k := 0 to V.Size - 1 do V.FData[k] := (V.FData[k] - Mean) / Std;
+  V.Add(-Mean);
+  V.Mul(1 / Std);
 end;
 
 begin

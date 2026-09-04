@@ -69,8 +69,9 @@ procedure WriteColorPPM(Img: TNNetVolume; const FileName: string);
 var
   F: TextFile;
   Bin: TFileStream;
-  X, Y, W, H: integer;
+  X, Y, W, H, RowOff: integer;
   R, G, B: byte;
+  Row: array of byte;
 begin
   W := Img.SizeX; H := Img.SizeY;
   AssignFile(F, FileName); Rewrite(F);
@@ -79,14 +80,22 @@ begin
   Bin := TFileStream.Create(FileName, fmOpenReadWrite);
   try
     Bin.Seek(0, soEnd);
+    // One buffered WriteBuffer per scanline instead of 3 WriteByte calls per
+    // pixel.
+    SetLength(Row, W * 3);
     for Y := 0 to H - 1 do
+    begin
+      RowOff := 0;
       for X := 0 to W - 1 do
       begin
         R := ToByte(Img[X, Y, 0]);
         if Img.Depth > 1 then G := ToByte(Img[X, Y, 1]) else G := R;
         if Img.Depth > 2 then B := ToByte(Img[X, Y, 2]) else B := R;
-        Bin.WriteByte(R); Bin.WriteByte(G); Bin.WriteByte(B);
+        Row[RowOff] := R; Row[RowOff + 1] := G; Row[RowOff + 2] := B;
+        Inc(RowOff, 3);
       end;
+      Bin.WriteBuffer(Row[0], W * 3);
+    end;
   finally
     Bin.Free;
   end;
@@ -138,15 +147,9 @@ begin
 end;
 
 function RMSE(A, B: TNNetVolume): TNeuralFloat;
-var i: integer; s, d: TNeuralFloat;
 begin
-  s := 0;
-  for i := 0 to A.Size - 1 do
-  begin
-    d := A.FData[i] - B.FData[i];
-    s := s + d * d;
-  end;
-  Result := Sqrt(s / A.Size);
+  // SIMD bulk sum of squared differences.
+  Result := Sqrt(A.GetDistanceSqr(B) / A.Size);
 end;
 
 var

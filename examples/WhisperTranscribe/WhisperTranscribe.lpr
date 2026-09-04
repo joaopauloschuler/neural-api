@@ -86,7 +86,8 @@ var
   Generated: array of integer;
   MaxNewTokens, DecSeqLen: integer;
   StepCnt, PosCnt, TokCnt, BestId, CurLen: integer;
-  BestLogit: TNeuralFloat;
+  RowBase, VocabM1: integer;
+  BestLogit, CurLogit: TNeuralFloat;
   StartTicks: QWord;
   WantWordTimestamps: boolean;
   AlignTokens: array of integer;
@@ -202,33 +203,38 @@ begin
     SetLength(Generated, 0);
     CurLen := Length(Prologue);
     DecToks.ReSize(DecSeqLen, 1, 1);
+    // Pack the prologue + start-id padding ONCE; each decode step then only
+    // writes its newly accepted token (nothing else mutates DecToks between
+    // steps).
+    for PosCnt := 0 to DecSeqLen - 1 do
+      if PosCnt < CurLen then
+        DecToks.FData[PosCnt] := Prologue[PosCnt]
+      else
+        DecToks.FData[PosCnt] := Config.DecoderStartTokenId;
     Write('Tokens:');
+    VocabM1 := Config.VocabSize - 1;
     while CurLen < DecSeqLen do
     begin
-      for PosCnt := 0 to DecSeqLen - 1 do
-        if PosCnt < Length(Prologue) then
-          DecToks.FData[PosCnt] := Prologue[PosCnt]
-        else if PosCnt - Length(Prologue) <= High(Generated) then
-          DecToks.FData[PosCnt] := Generated[PosCnt - Length(Prologue)]
-        else
-          DecToks.FData[PosCnt] := Config.DecoderStartTokenId;
       Dec.Compute(DecToks);
       Dec.GetOutput(Logits);
       // argmax over the logits row at the last prefix position
+      RowBase := (CurLen - 1) * Config.VocabSize;
       BestId := 0;
-      BestLogit := Logits.FData[(CurLen - 1) * Config.VocabSize];
-      for TokCnt := 1 to Config.VocabSize - 1 do
-        if Logits.FData[(CurLen - 1) * Config.VocabSize + TokCnt] >
-           BestLogit then
+      BestLogit := Logits.FData[RowBase];
+      for TokCnt := 1 to VocabM1 do
+      begin
+        CurLogit := Logits.FData[RowBase + TokCnt];
+        if CurLogit > BestLogit then
         begin
-          BestLogit := Logits.FData[(CurLen - 1) * Config.VocabSize +
-            TokCnt];
+          BestLogit := CurLogit;
           BestId := TokCnt;
         end;
+      end;
       Write(' ', BestId);
       if BestId = Config.EosTokenId then break;
       SetLength(Generated, Length(Generated) + 1);
       Generated[High(Generated)] := BestId;
+      DecToks.FData[CurLen] := BestId;
       Inc(CurLen);
     end;
     WriteLn;

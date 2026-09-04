@@ -733,6 +733,319 @@ __kernel void cai_dot_product_int8_splitk_reduce_h
   }
 } // end of kernel
 
+// TILED GEMM for a window of columns. cai_dot_product_int8 and the split-K
+// pair give one work-item per (row, column) and every work-item streams its
+// whole weight row, so a K-column prefill moves each weight byte through L2
+// K times. Here one work-group of CAI_TILED_LANES lanes owns a tile of
+// CAI_TILED_LANES*CAI_TILED_ROWS_PER_LANE rows x CAI_TILED_COLS columns: the
+// B tile (CAI_TILED_COLS columns x CAI_TILED_KSTEP reduction elements) is
+// staged in __local once per K-step and every lane reads each weight code of
+// its rows ONCE, multiplying it into CAI_TILED_COLS accumulators, so a weight
+// byte crosses the memory system once per column tile instead of once per
+// column. Codes keep the codes[a + i*FNumAs] layout (a lane's second row is
+// CAI_TILED_LANES rows up, so both per-k loads of a work-group hit
+// CAI_TILED_LANES consecutive bytes) and the result keeps [b*FNumAs + a].
+//
+// Tile constants (mirrored by csTiledGemm* in neuralopencl.pas; the host
+// derives the launch geometry from them, so both copies must agree):
+// - CAI_TILED_LANES 64: two warps/one wavefront of coalesced 64-byte code
+//   reads; small enough that a 2560-row projection at a 64-column window
+//   still yields 80 work-groups, large enough that the tile stage is 8
+//   coalesced loads per lane.
+// - CAI_TILED_ROWS_PER_LANE 2 and CAI_TILED_COLS 16: 32 accumulators per
+//   lane. Each staged B element serves 2 multiply-adds and each weight
+//   byte 16, so a lane issues 1 global byte load per 32 mads and 1 local
+//   float4 broadcast per 8 mads. Doubling either doubles the register
+//   file per lane and halves the grid, which starves the device at the
+//   4B-class shapes.
+// - CAI_TILED_KSTEP 32 = one Q4_0 block, so the int4 twin loads one block
+//   scale per row per step; the tile is 2 KB of __local.
+//
+// Ragged edges: a lane whose row index passes FNumAs-1 reads row FNumAs-1
+// instead (a valid address) and skips its store; columns past FNumBs and
+// reduction elements past FSize are staged as 0 and never stored; the code
+// loop stops at FSize, never reading past the codes buffer. The tail applies
+// the per-row scale, the fused bias and the fused activation in
+// cai_dot_product_int8's order. Coded by Claude (AI).
+#define CAI_TILED_LANES 64
+#define CAI_TILED_ROWS_PER_LANE 2
+#define CAI_TILED_COLS 16
+#define CAI_TILED_KSTEP 32
+#define CAI_TILED_B_ELEMS (CAI_TILED_COLS * CAI_TILED_KSTEP)
+
+// Stages B[b0..b0+CAI_TILED_COLS) x [k0..k0+CAI_TILED_KSTEP) into Bs, column
+// major (Bs[b*CAI_TILED_KSTEP + k]), zero past FNumBs and FSize. Coalesced
+// over k. The caller owns the barriers.
+static inline void cai_tiled_stage_b(const int FNumBs, const int FSize,
+  const int b0, const int k0, __global const float* B, __local float* Bs,
+  const int lid)
+{
+  for (int idx = lid; idx < CAI_TILED_B_ELEMS; idx += CAI_TILED_LANES)
+  {
+    const int b = idx / CAI_TILED_KSTEP;
+    const int k = idx - b * CAI_TILED_KSTEP;
+    const int gb = b0 + b;
+    const int gk = k0 + k;
+    Bs[idx] = ((gb < FNumBs) && (gk < FSize)) ? B[gb * FSize + gk] : 0.0f;
+  }
+}
+
+// Half-storage twin of cai_tiled_stage_b (the FP16-activation B operand).
+static inline void cai_tiled_stage_b_h(const int FNumBs, const int FSize,
+  const int b0, const int k0, __global const half* B, __local float* Bs,
+  const int lid)
+{
+  for (int idx = lid; idx < CAI_TILED_B_ELEMS; idx += CAI_TILED_LANES)
+  {
+    const int b = idx / CAI_TILED_KSTEP;
+    const int k = idx - b * CAI_TILED_KSTEP;
+    const int gb = b0 + b;
+    const int gk = k0 + k;
+    Bs[idx] = ((gb < FNumBs) && (gk < FSize))
+      ? vload_half(gb * FSize + gk, B) : 0.0f;
+  }
+}
+
+// Four consecutive reduction elements (w0..w3 = k..k+3) of one row against
+// the staged tile, into the row's CAI_TILED_COLS accumulators. Every lane of
+// the work-group reads the same tile address, so the float4 load is a
+// broadcast.
+static inline void cai_tiled_mad4(float* acc, __local const float* Bs,
+  const float w0, const float w1, const float w2, const float w3, const int k)
+{
+  #pragma unroll
+  for (int b = 0; b < CAI_TILED_COLS; b++)
+  {
+    const float4 bv = vload4(0, Bs + b * CAI_TILED_KSTEP + k);
+    acc[b] = mad(w3, bv.s3, mad(w2, bv.s2, mad(w1, bv.s1,
+      mad(w0, bv.s0, acc[b]))));
+  }
+}
+
+// Per-row scale, fused bias, fused activation and store of one row's
+// CAI_TILED_COLS results; a row past FNumAs-1 or a column past FNumBs-1 is
+// skipped.
+static inline void cai_tiled_store_row(const int FNumAs, const int FNumBs,
+  const int ActFN, const int UseBias, __global float* R,
+  __global const float* Bias, __global const float* Scales,
+  const int row, const int b0, const float* acc)
+{
+  if (row >= FNumAs) return;
+  const float RowScale = Scales[row];
+  #pragma unroll
+  for (int b = 0; b < CAI_TILED_COLS; b++)
+  {
+    const int gb = b0 + b;
+    if (gb < FNumBs)
+    {
+      const int pos = gb * FNumAs + row;
+      float v = acc[b] * RowScale;
+      if (UseBias != 0) v += Bias[pos];
+      R[pos] = cai_fused_act(v, ActFN);
+    }
+  }
+}
+
+// Int8 tiled body, shared by the FP32 and the half B operand entry points:
+// exactly one of Bf/Bh is read, chosen by the compile-time constant BIsHalf
+// at each call site. Coded by Claude (AI).
+static inline void cai_dot_product_int8_tiled_body(const int FNumAs,
+  const int FNumBs, const int FSize, const int ActFN,
+  __global const char* FInputBufferAs, __global const float* Bf,
+  __global const half* Bh, const int BIsHalf, __global float* FResultBuffer,
+  const int UseBias, __global const float* FBiasOutput,
+  __global const float* FScales, __local float* Bs)
+{
+  const int lid = get_local_id(0);
+  const int a0 = get_group_id(0) * (CAI_TILED_LANES * CAI_TILED_ROWS_PER_LANE);
+  const int b0 = get_group_id(1) * CAI_TILED_COLS;
+  const int MaxRow = FNumAs - 1;
+  const int row0 = min(a0 + lid, MaxRow);
+  const int row1 = min(a0 + lid + CAI_TILED_LANES, MaxRow);
+
+  float acc0[CAI_TILED_COLS];
+  float acc1[CAI_TILED_COLS];
+  #pragma unroll
+  for (int b = 0; b < CAI_TILED_COLS; b++) { acc0[b] = 0.0f; acc1[b] = 0.0f; }
+
+  const int RowStep4 = 4 * FNumAs;
+  for (int k0 = 0; k0 < FSize; k0 += CAI_TILED_KSTEP)
+  {
+    // The previous step's reads must finish before the tile is overwritten.
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (BIsHalf) cai_tiled_stage_b_h(FNumBs, FSize, b0, k0, Bh, Bs, lid);
+    else         cai_tiled_stage_b(FNumBs, FSize, b0, k0, Bf, Bs, lid);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int kEnd = min(CAI_TILED_KSTEP, FSize - k0);
+    __global const char* A0 = FInputBufferAs + row0 + k0 * FNumAs;
+    __global const char* A1 = FInputBufferAs + row1 + k0 * FNumAs;
+    int k = 0;
+    for (; k + 3 < kEnd; k += 4)
+    {
+      const float w00 = convert_float(A0[0]);
+      const float w01 = convert_float(A0[FNumAs]);
+      const float w02 = convert_float(A0[2 * FNumAs]);
+      const float w03 = convert_float(A0[3 * FNumAs]);
+      const float w10 = convert_float(A1[0]);
+      const float w11 = convert_float(A1[FNumAs]);
+      const float w12 = convert_float(A1[2 * FNumAs]);
+      const float w13 = convert_float(A1[3 * FNumAs]);
+      A0 += RowStep4;
+      A1 += RowStep4;
+      cai_tiled_mad4(acc0, Bs, w00, w01, w02, w03, k);
+      cai_tiled_mad4(acc1, Bs, w10, w11, w12, w13, k);
+    }
+    // Ragged FSize: the last step's remainder (fewer than 4 elements).
+    for (; k < kEnd; k++)
+    {
+      const float w0 = convert_float(A0[0]);
+      const float w1 = convert_float(A1[0]);
+      A0 += FNumAs;
+      A1 += FNumAs;
+      #pragma unroll
+      for (int b = 0; b < CAI_TILED_COLS; b++)
+      {
+        const float bv = Bs[b * CAI_TILED_KSTEP + k];
+        acc0[b] = mad(w0, bv, acc0[b]);
+        acc1[b] = mad(w1, bv, acc1[b]);
+      }
+    }
+  }
+
+  cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
+    FBiasOutput, FScales, a0 + lid, b0, acc0);
+  cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
+    FBiasOutput, FScales, a0 + lid + CAI_TILED_LANES, b0, acc1);
+}
+
+// Tiled twin of cai_dot_product_int8 for FNumBs >= CAI_TILED_COLS. Launch:
+// global (ceil(FNumAs / (CAI_TILED_LANES*CAI_TILED_ROWS_PER_LANE)) *
+// CAI_TILED_LANES, ceil(FNumBs / CAI_TILED_COLS)), local (CAI_TILED_LANES, 1).
+// Same operands, scale order and fused tail as cai_dot_product_int8; the
+// result differs from it only by float summation order. Coded by Claude (AI).
+__kernel void cai_dot_product_int8_tiled
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int ActFN,
+  __global const char* FInputBufferAs,
+  __global const float* FInputBufferBs,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FBiasOutput,
+  __global const float* FScales
+)
+{
+  __local float Bs[CAI_TILED_B_ELEMS];
+  cai_dot_product_int8_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
+    FInputBufferBs, 0, 0, FResultBuffer, UseBias, FBiasOutput, FScales, Bs);
+}
+
+// HALF-ACTIVATION twin of cai_dot_product_int8_tiled: B is read through
+// vload_half while it is staged, everything after the stage is the same
+// float code. Same accuracy note as cai_dot_product_int8_h. Coded by Claude (AI).
+__kernel void cai_dot_product_int8_tiled_h
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int ActFN,
+  __global const char* FInputBufferAs,
+  __global const half* FInputBufferBs,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FBiasOutput,
+  __global const float* FScales
+)
+{
+  __local float Bs[CAI_TILED_B_ELEMS];
+  cai_dot_product_int8_tiled_body(FNumAs, FNumBs, FSize, ActFN, FInputBufferAs,
+    0, FInputBufferBs, 1, FResultBuffer, UseBias, FBiasOutput, FScales, Bs);
+}
+
+// Q4_0 WEIGHT twin of cai_dot_product_int8_tiled: same tile, same launch
+// geometry, same fused tail (FScales is the row of 1.0 PrepareForComputeInt4
+// uploads). The A operand is the interleaved packed layout of
+// cai_dot_product_int4_splitk (FPackedAs[a + p*FNumAs], p = k/2, low nibble
+// = code k, high = code k+1, +8 biased; FBlockScales[a + blk*FNumAs]). A
+// K-step is one block, so each lane loads one block scale per row per step
+// and applies it to the code before the multiply-add: the dequantized weight
+// (code - 8) * scale, which is what the FP32 oracle multiplies, rather than
+// the block-sum-then-scale of pass 1 - a difference of float rounding order
+// only. FSize is a multiple of 32 (the PrepareForComputeInt4 invariant), so
+// no step is ragged along k. Coded by Claude (AI).
+__kernel void cai_dot_product_int4_tiled
+(
+  const int FNumAs,
+  const int FNumBs,
+  const int FSize,
+  const int ActFN,
+  __global const uchar* FPackedAs,
+  __global const float* FInputBufferBs,
+  __global float* FResultBuffer,
+  const int UseBias,
+  __global const float* FBiasOutput,
+  __global const float* FScales,
+  __global const float* FBlockScales
+)
+{
+  __local float Bs[CAI_TILED_B_ELEMS];
+  const int lid = get_local_id(0);
+  const int a0 = get_group_id(0) * (CAI_TILED_LANES * CAI_TILED_ROWS_PER_LANE);
+  const int b0 = get_group_id(1) * CAI_TILED_COLS;
+  const int MaxRow = FNumAs - 1;
+  const int row0 = min(a0 + lid, MaxRow);
+  const int row1 = min(a0 + lid + CAI_TILED_LANES, MaxRow);
+
+  float acc0[CAI_TILED_COLS];
+  float acc1[CAI_TILED_COLS];
+  #pragma unroll
+  for (int b = 0; b < CAI_TILED_COLS; b++) { acc0[b] = 0.0f; acc1[b] = 0.0f; }
+
+  const int PairStep2 = 2 * FNumAs;
+  int blk = 0;
+  for (int k0 = 0; k0 < FSize; k0 += CAI_TILED_KSTEP, blk++)
+  {
+    barrier(CLK_LOCAL_MEM_FENCE);
+    cai_tiled_stage_b(FNumBs, FSize, b0, k0, FInputBufferBs, Bs, lid);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const float s0 = FBlockScales[row0 + blk * FNumAs];
+    const float s1 = FBlockScales[row1 + blk * FNumAs];
+    // Pair p = k/2 = 16*blk is the block's first packed byte; the block's 16
+    // bytes of one row are FNumAs apart.
+    __global const uchar* P0 = FPackedAs + row0 + (blk << 4) * FNumAs;
+    __global const uchar* P1 = FPackedAs + row1 + (blk << 4) * FNumAs;
+    #pragma unroll
+    for (int k = 0; k < CAI_TILED_KSTEP; k += 4)
+    {
+      const int p00 = P0[0];
+      const int p01 = P0[FNumAs];
+      const int p10 = P1[0];
+      const int p11 = P1[FNumAs];
+      P0 += PairStep2;
+      P1 += PairStep2;
+      const float w00 = convert_float((p00 & 15) - 8) * s0;
+      const float w01 = convert_float((p00 >> 4) - 8) * s0;
+      const float w02 = convert_float((p01 & 15) - 8) * s0;
+      const float w03 = convert_float((p01 >> 4) - 8) * s0;
+      const float w10 = convert_float((p10 & 15) - 8) * s1;
+      const float w11 = convert_float((p10 >> 4) - 8) * s1;
+      const float w12 = convert_float((p11 & 15) - 8) * s1;
+      const float w13 = convert_float((p11 >> 4) - 8) * s1;
+      cai_tiled_mad4(acc0, Bs, w00, w01, w02, w03, k);
+      cai_tiled_mad4(acc1, Bs, w10, w11, w12, w13, k);
+    }
+  }
+
+  cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
+    FBiasOutput, FScales, a0 + lid, b0, acc0);
+  cai_tiled_store_row(FNumAs, FNumBs, ActFN, UseBias, FResultBuffer,
+    FBiasOutput, FScales, a0 + lid + CAI_TILED_LANES, b0, acc1);
+} // end of kernel
+
 __kernel void cai_dot_product2
 (
   const int FThreadCount,
@@ -2644,40 +2957,48 @@ __kernel void cai_gated_delta_net
 }
 
 // KV-CACHE APPEND FOR THE FUSED MULTI-HEAD ATTENTION DECODE (TNNetFusedSDPA).
-// Writes the current token's K and V rows, one per KV head, into cache slot
-// FCacheSlot. ONE WORK-GROUP PER KV HEAD; the lanes split the head dimension.
+// Writes the step's K and V rows - FTokenCnt token rows, one row per KV head
+// each - into the cache slots FCacheSlot .. FCacheSlot+FTokenCnt-1. ONE
+// WORK-GROUP PER (KV HEAD, TOKEN ROW): dimension 1 of the launch carries
+// g*FTokenCnt + t, so the work-groups of one KV head are adjacent and write
+// one cache plane; the lanes split the head dimension.
 //
 // The cache is HEAD-MAJOR: head g's rows are the contiguous block starting at
 // g*FCacheMax*FDk, so slot (g*FCacheMax + position) addresses one row and the
 // decode kernel below reads each head's key stream contiguously. This is the
 // layout TNNetFusedSDPA.AppendRow already writes on the host side.
 //
-// The token row is [ Q (FQW) | K (FKW) | V (FKW) ], so head g's key slice
-// starts at FQW + g*FDk and its value slice at FQW + FKW + g*FDk.
-// This kernel and cai_sdpa_decode share one command queue and are enqueued in
-// that order, so the in-order queue is what makes the appended row visible -
+// Token row t starts at t*FXStride in FX and is [ Q (FQW) | K (FKW) | V (FKW) ],
+// so head g's key slice starts at t*FXStride + FQW + g*FDk and its value slice
+// FKW further on.
+// This kernel and cai_sdpa_decode_split share one command queue and are
+// enqueued in that order, so the in-order queue makes the appended rows visible -
 // there is no cross-work-group synchronization and none is needed.
 // Coded by Claude (AI).
 __kernel void cai_sdpa_append_kv
 (
   const int FKVHeads,
+  const int FTokenCnt,
   const int FDk,
   const int FCacheMax,
   const int FCacheSlot,
   const int FQW,
   const int FKW,
+  const int FXStride,
   __global const float* FX,
   __global float* FKCache,
   __global float* FVCache
 )
 {
-  const int g = get_group_id(1);
+  const int gid = get_group_id(1);
   const int lid = get_local_id(0);
   const int lsize = get_local_size(0);
+  const int g = gid / FTokenCnt;
+  const int t = gid - g * FTokenCnt;
   if (g >= FKVHeads) return;
-  const int dst = (g * FCacheMax + FCacheSlot) * FDk;
-  const int kSrc = FQW + g * FDk;
-  const int vSrc = FQW + FKW + g * FDk;
+  const int dst = (g * FCacheMax + FCacheSlot + t) * FDk;
+  const int kSrc = t * FXStride + FQW + g * FDk;
+  const int vSrc = kSrc + FKW;
   for (int d = lid; d < FDk; d += lsize)
   {
     FKCache[dst + d] = FX[kSrc + d];
@@ -2685,81 +3006,277 @@ __kernel void cai_sdpa_append_kv
   }
 }
 
-// CACHED-DECODE SCALED DOT-PRODUCT ATTENTION (TNNetFusedSDPA), one token over
-// the resident KV cache. ONE WORK-GROUP PER QUERY HEAD: the head's score band
-// is private to its work-group, so every synchronization this kernel needs is
-// an intra-work-group barrier and no cross-work-group ordering is ever
-// required. Launch 2-D with global (LocalSize, FQHeads) and local (LocalSize,
-// 1); LocalSize must be a power of two (the tree reductions halve it).
-// FScratch is LocalSize + FDk floats of __local memory.
+// Query heads a lane scores against one K row at a time in the split-row
+// decode kernels: a fixed slab so the accumulators stay in registers. A head
+// group wider than this re-reads the K row once per slab. The slab loops clamp
+// the head index of every load, so an if-converted lane past the slab's last
+// head reads a real row (and discards it) instead of computing on garbage.
+#define CAI_SDPA_QSLAB 16
+
+// Per-head reduction over the live rows of the split-row score tile (one row
+// of FChunkRows floats per query head, ChunkLive live): SegCount heads per
+// pass, one segment of SegLanes lanes (a power of two) per head, a tree inside
+// the segment. IsSum selects the sum over the max; Out receives one value per
+// head. A macro rather than a function so the barriers sit in the kernel body.
+#define CAI_SDPA_HEAD_REDUCE(IsSum, Out) \
+  for (qBase = 0; qBase < FGroupSize; qBase += SegCount) \
+  { \
+    q = qBase + seg; \
+    float v = (IsSum) ? 0.0f : -1e30f; \
+    if (q < FGroupSize) \
+    { \
+      __local const float* row = tile + q * FChunkRows; \
+      if (IsSum) { for (r = sl; r < ChunkLive; r += SegLanes) v += row[r]; } \
+      else       { for (r = sl; r < ChunkLive; r += SegLanes) v = fmax(v, row[r]); } \
+    } \
+    FScratch[lid] = v; \
+    barrier(CLK_LOCAL_MEM_FENCE); \
+    for (s = SegLanes >> 1; s > 0; s >>= 1) \
+    { \
+      if (sl < s) \
+        FScratch[lid] = (IsSum) ? (FScratch[lid] + FScratch[lid + s]) \
+                                : fmax(FScratch[lid], FScratch[lid + s]); \
+      barrier(CLK_LOCAL_MEM_FENCE); \
+    } \
+    if ((sl == 0) && (q < FGroupSize)) Out[q] = FScratch[lid]; \
+    barrier(CLK_LOCAL_MEM_FENCE); \
+  }
+
+// SPLIT-ROW CACHED-DECODE ATTENTION, PASS 1, FP32 KV CACHE (TNNetFusedSDPA).
+// ONE WORK-GROUP PER (KV HEAD g, TOKEN ROW t, CHUNK c): dimension 1 of the
+// launch carries (g*FTokenCnt + t)*FSplits + c. The group holds the
+// FGroupSize query rows of head group g in local memory and attends the
+// cache rows [ChunkStart, ChunkStart + ChunkLive) of chunk c, where
+// ChunkStart = FChunkBase + c*FChunkRows clipped below by the sliding-window
+// start jStart = LiveLen - FWindow (FWindow > 0) and ChunkLive is clipped
+// above by the causal bound LiveLen = FCacheSlot + t + 1: token row t attends
+// up to its OWN slot, so a width-K window agrees with K single-token steps.
 //
-// Query head h reads KV head h/FGroupSize (grouped-query attention) and runs
-// three phases over the live cache [jStart..FCacheLen-1]:
-//   1. lanes split the key axis: score j = dot(q, K[j]) * FInvSqrtDk, the
-//      Gemma-2 soft-cap when FScoreSoftCap > 0, then a tree max;
-//   2. the same partition exponentiates in place and tree-sums the normalizer;
-//   3. lanes split the head dimension: out[d] = sum_j P[j] * V[j][d], each lane
-//      accumulating over the whole key range and dividing once at the end.
-// The score band lives in global memory (FScores, FQHeads*FCacheMax floats)
-// rather than __local because a long context does not fit in a work-group's
-// local memory; it is written and read only by the one work-group that owns
-// it, so the barrier between phases 2 and 3 carries a global memory fence.
+// PARTIAL STATE. Per query head h = g*FGroupSize + q the group writes, at
+// FPartials + ((h*FTokenCnt + t)*FSplits + c)*(FDk + 2):
+//   [0] m = the chunk's max score, [1] l = sum over the chunk of exp(s - m),
+//   [2 .. FDk+1] acc[d] = sum over the chunk of exp(s - m) * V[j][d].
+// A chunk with no live row writes m = -1e30, l = 0 and acc = 0, which
+// cai_sdpa_decode_merge weights to zero; chunk 0 of every token row has a
+// live row unless the window empties it too.
 //
-// FWindow > 0 is the sliding-window mask: jStart = FCacheLen - FWindow. The
-// causal mask needs no code at all - the cache holds only committed tokens, so
-// every live row is attendable. Forward-only, and the caller restricts it to a
-// single-token step: prefill, eviction, segment masking and the int8 cache all
-// stay on the host path. Coded by Claude (AI).
-__kernel void cai_sdpa_decode
+// Launch 2-D with global (LocalSize, FKVHeads*FTokenCnt*FSplits) and local
+// (LocalSize, 1); LocalSize must be a power of two. FScratch is
+// LocalSize + FGroupSize*FDk + FChunkRows*FGroupSize + 2*FGroupSize floats of
+// __local memory: the reduction scratch, the query tile, the score tile
+// (head-major, FChunkRows floats per head) and the per-head max and sum.
+//
+// Phases: (1) lanes split the chunk's rows; a lane reads its K row once, as
+// float4 loads, and scores it against every query row of the group, scale and
+// the Gemma-2 soft-cap applied, then one segmented tree max per head;
+// (2) exp in place on the tile and one segmented tree sum per head; (3) lanes
+// split the head dimension, so consecutive lanes read consecutive V elements,
+// and accumulate the chunk's rows for every head of the group.
+// Coded by Claude (AI).
+__kernel void cai_sdpa_decode_split
 (
-  const int FQHeads,
+  const int FKVHeads,
+  const int FTokenCnt,
+  const int FSplits,
+  const int FChunkRows,
+  const int FChunkBase,
   const int FGroupSize,
   const int FDk,
   const int FCacheMax,
-  const int FCacheLen,
+  const int FCacheSlot,
   const int FWindow,
+  const int FXStride,
   const float FInvSqrtDk,
   const float FScoreSoftCap,
   const float FInvScoreSoftCap,
   __global const float* FX,
   __global const float* FKCache,
   __global const float* FVCache,
-  __global float* FScores,
+  __global float* FPartials,
+  __local float* FScratch
+)
+{
+  const int gid = get_group_id(1);
+  const int lid = get_local_id(0);
+  const int lsize = get_local_size(0);
+  int i, d, d4, r, q, qBase, s;
+  const int c = gid % FSplits;
+  const int rowPair = gid / FSplits;
+  const int t = rowPair % FTokenCnt;
+  const int g = rowPair / FTokenCnt;
+  if (g >= FKVHeads) return;
+
+  __local float* qloc = FScratch + lsize;
+  __local float* tile = qloc + FGroupSize * FDk;
+  __local float* headMax = tile + FChunkRows * FGroupSize;
+  __local float* headSum = headMax + FGroupSize;
+
+  const int PartialStride = FDk + 2;
+  const int PartialRow0 =
+    (((g * FGroupSize) * FTokenCnt + t) * FSplits + c) * PartialStride;
+  const int PartialHeadStride = FTokenCnt * FSplits * PartialStride;
+
+  const int LiveLen = FCacheSlot + t + 1;
+  const int jStart = ((FWindow > 0) && (LiveLen > FWindow))
+                     ? (LiveLen - FWindow) : 0;
+  int ChunkStart = FChunkBase + c * FChunkRows;
+  int ChunkEnd = ChunkStart + FChunkRows;
+  if (ChunkStart < jStart) ChunkStart = jStart;
+  if (ChunkEnd > LiveLen) ChunkEnd = LiveLen;
+  const int ChunkLive = ChunkEnd - ChunkStart;
+
+  if (ChunkLive <= 0)
+  {
+    for (q = 0; q < FGroupSize; q++)
+    {
+      __global float* part = FPartials + PartialRow0 + q * PartialHeadStride;
+      for (d = lid; d < FDk; d += lsize) part[2 + d] = 0.0f;
+      if (lid == 0) { part[0] = -1e30f; part[1] = 0.0f; }
+    }
+    return;
+  }
+
+  const int plane = g * FCacheMax * FDk;
+  const int QTileLen = FGroupSize * FDk;
+  __global const float* qsrc = FX + t * FXStride + g * QTileLen;
+  for (i = lid; i < QTileLen; i += lsize) qloc[i] = qsrc[i];
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  // ---- phase 1: every query row of the group against this lane's K rows ----
+  const int Dk4 = FDk >> 2;
+  const int DkVecEnd = Dk4 << 2;
+  for (r = lid; r < ChunkLive; r += lsize)
+  {
+    __global const float* krow = FKCache + plane + (ChunkStart + r) * FDk;
+    for (qBase = 0; qBase < FGroupSize; qBase += CAI_SDPA_QSLAB)
+    {
+      const int SlabHeads = min(CAI_SDPA_QSLAB, FGroupSize - qBase);
+      const int SlabHeadsM1 = SlabHeads - 1;
+      __local const float* qslab = qloc + qBase * FDk;
+      float acc[CAI_SDPA_QSLAB];
+      #pragma unroll
+      for (i = 0; i < CAI_SDPA_QSLAB; i++) acc[i] = 0.0f;
+      for (d4 = 0; d4 < Dk4; d4++)
+      {
+        const float4 k4 = vload4(d4, krow);
+        #pragma unroll
+        for (i = 0; i < CAI_SDPA_QSLAB; i++)
+          if (i < SlabHeads)
+            acc[i] += dot(k4, vload4(d4, qslab + min(i, SlabHeadsM1) * FDk));
+      }
+      for (d = DkVecEnd; d < FDk; d++)
+      {
+        const float kd = krow[d];
+        #pragma unroll
+        for (i = 0; i < CAI_SDPA_QSLAB; i++)
+          if (i < SlabHeads)
+            acc[i] = mad(kd, qslab[min(i, SlabHeadsM1) * FDk + d], acc[i]);
+      }
+      #pragma unroll
+      for (i = 0; i < CAI_SDPA_QSLAB; i++)
+        if (i < SlabHeads)
+        {
+          float sc = acc[i] * FInvSqrtDk;
+          if (FScoreSoftCap > 0.0f)
+            sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
+          tile[(qBase + i) * FChunkRows + r] = sc;
+        }
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  // Segment geometry through shifts and masks only: PoCL miscompiles a
+  // division of the local id by a run-time value (the work-group then runs
+  // as if it had one lane), so no lane index is ever divided here.
+  int SegShift = 0;
+  while (((2 << SegShift) <= FGroupSize) && ((2 << SegShift) <= lsize)) SegShift++;
+  const int SegCount = 1 << SegShift;
+  const int SegLanes = lsize >> SegShift;
+  const int seg = lid >> ((31 - clz(lsize)) - SegShift);
+  const int sl = lid & (SegLanes - 1);
+  CAI_SDPA_HEAD_REDUCE(0, headMax)
+
+  // ---- phase 2: shifted exp in place, then the per-head normalizer ----
+  for (q = 0; q < FGroupSize; q++)
+  {
+    __local float* row = tile + q * FChunkRows;
+    const float RowMax = headMax[q];
+    for (r = lid; r < ChunkLive; r += lsize) row[r] = exp(row[r] - RowMax);
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  CAI_SDPA_HEAD_REDUCE(1, headSum)
+
+  // ---- phase 3: the unnormalized value sum, one output dimension per lane ----
+  for (d = lid; d < FDk; d += lsize)
+  {
+    __global const float* vcol = FVCache + plane + ChunkStart * FDk + d;
+    for (qBase = 0; qBase < FGroupSize; qBase += CAI_SDPA_QSLAB)
+    {
+      const int SlabHeads = min(CAI_SDPA_QSLAB, FGroupSize - qBase);
+      const int SlabHeadsM1 = SlabHeads - 1;
+      __local const float* pslab = tile + qBase * FChunkRows;
+      float acc[CAI_SDPA_QSLAB];
+      #pragma unroll
+      for (i = 0; i < CAI_SDPA_QSLAB; i++) acc[i] = 0.0f;
+      for (r = 0; r < ChunkLive; r++)
+      {
+        const float v = vcol[r * FDk];
+        #pragma unroll
+        for (i = 0; i < CAI_SDPA_QSLAB; i++)
+          if (i < SlabHeads)
+            acc[i] = mad(pslab[min(i, SlabHeadsM1) * FChunkRows + r], v, acc[i]);
+      }
+      #pragma unroll
+      for (i = 0; i < CAI_SDPA_QSLAB; i++)
+        if (i < SlabHeads)
+          FPartials[PartialRow0 + (qBase + i) * PartialHeadStride + 2 + d] = acc[i];
+    }
+  }
+  for (q = lid; q < FGroupSize; q += lsize)
+  {
+    __global float* part = FPartials + PartialRow0 + q * PartialHeadStride;
+    part[0] = headMax[q];
+    part[1] = headSum[q];
+  }
+}
+
+// SPLIT-ROW CACHED-DECODE ATTENTION, PASS 2, BOTH CACHE FORMATS
+// (TNNetFusedSDPA). ONE WORK-GROUP PER (QUERY HEAD h, TOKEN ROW t): dimension
+// 1 of the launch carries h*FTokenCnt + t. Merges the FSplits partial states
+// pass 1 wrote for (h, t) - layout as cai_sdpa_decode_split states - by
+// log-sum-exp: M = max of the chunk maxima, w_c = exp(m_c - M) or 0 for a
+// chunk with l_c = 0, L = sum of l_c*w_c, and Y[t][h*FDk + d] =
+// sum of w_c*acc_c[d] / L, zero when L = 0 as the host path does.
+// Launch 2-D with global (LocalSize, FQHeads*FTokenCnt) and local
+// (LocalSize, 1); LocalSize a power of two. FScratch is LocalSize + FSplits
+// floats of __local memory: the reduction scratch, then the chunk weights.
+// Coded by Claude (AI).
+__kernel void cai_sdpa_decode_merge
+(
+  const int FQHeads,
+  const int FTokenCnt,
+  const int FSplits,
+  const int FDk,
+  const int FYStride,
+  __global const float* FPartials,
   __global float* FY,
   __local float* FScratch
 )
 {
-  const int h = get_group_id(1);
+  const int gid = get_group_id(1);
   const int lid = get_local_id(0);
   const int lsize = get_local_size(0);
-  int s, d, j;
+  int s, c, d;
+  const int h = gid / FTokenCnt;
+  const int t = gid - h * FTokenCnt;
   if (h >= FQHeads) return;
 
-  __local float* qloc = FScratch + lsize;
+  __local float* weight = FScratch + lsize;
+  const int PartialStride = FDk + 2;
+  __global const float* part = FPartials + gid * FSplits * PartialStride;
 
-  const int g = h / FGroupSize;
-  const int qBase = h * FDk;
-  const int plane = g * FCacheMax * FDk;
-  const int scoreBase = h * FCacheMax;
-  const int jStart = ((FWindow > 0) && (FCacheLen > FWindow))
-                     ? (FCacheLen - FWindow) : 0;
-
-  for (d = lid; d < FDk; d += lsize) qloc[d] = FX[qBase + d];
-  barrier(CLK_LOCAL_MEM_FENCE);
-
-  // ---- phase 1: scores over the live cache, then the row max ----
   float m = -1e30f;
-  for (j = jStart + lid; j < FCacheLen; j += lsize)
-  {
-    __global const float* krow = FKCache + plane + j * FDk;
-    float acc = 0.0f;
-    for (d = 0; d < FDk; d++) acc = mad(qloc[d], krow[d], acc);
-    float sc = acc * FInvSqrtDk;
-    if (FScoreSoftCap > 0.0f)
-      sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
-    FScores[scoreBase + j] = sc;
-    m = fmax(m, sc);
-  }
+  for (c = lid; c < FSplits; c += lsize) m = fmax(m, part[c * PartialStride]);
   FScratch[lid] = m;
   barrier(CLK_LOCAL_MEM_FENCE);
   for (s = lsize >> 1; s > 0; s >>= 1)
@@ -2770,14 +3287,16 @@ __kernel void cai_sdpa_decode
   const float MaxScore = FScratch[0];
   barrier(CLK_LOCAL_MEM_FENCE);
 
-  // ---- phase 2: shifted exp in place (same lane owns the same j), then the
-  // normalizer ----
   float partial = 0.0f;
-  for (j = jStart + lid; j < FCacheLen; j += lsize)
+  for (c = lid; c < FSplits; c += lsize)
   {
-    const float e = exp(FScores[scoreBase + j] - MaxScore);
-    FScores[scoreBase + j] = e;
-    partial += e;
+    const float ChunkSum = part[c * PartialStride + 1];
+    // The exponent is clamped so an empty chunk's m = -1e30 never reaches exp:
+    // its weight is forced to zero below whatever exp would have returned.
+    const float w = (ChunkSum > 0.0f)
+      ? exp(fmax(part[c * PartialStride] - MaxScore, -80.0f)) : 0.0f;
+    weight[c] = w;
+    partial += ChunkSum * w;
   }
   FScratch[lid] = partial;
   barrier(CLK_LOCAL_MEM_FENCE);
@@ -2787,30 +3306,26 @@ __kernel void cai_sdpa_decode
     barrier(CLK_LOCAL_MEM_FENCE);
   }
   const float SumExp = FScratch[0];
-  // Phase 3 reads score entries written by OTHER lanes, so the fence spans
-  // global memory too.
-  barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
-
-  // ---- phase 3: the value sum, one output dimension per lane ----
-  // SumExp = 0 cannot arise here (the live range is never empty and exp of the
-  // shifted max is 1), but the host path zeroes the row in that case and this
-  // matches it.
   const float InvSumExp = (SumExp > 0.0f) ? (1.0f / SumExp) : 0.0f;
+
+  const int yBase = t * FYStride + h * FDk;
   for (d = lid; d < FDk; d += lsize)
   {
     float acc = 0.0f;
-    for (j = jStart; j < FCacheLen; j++)
-      acc = mad(FScores[scoreBase + j], FVCache[plane + j * FDk + d], acc);
-    FY[qBase + d] = acc * InvSumExp;
+    for (c = 0; c < FSplits; c++)
+      acc = mad(weight[c], part[c * PartialStride + 2 + d], acc);
+    FY[yBase + d] = acc * InvSumExp;
   }
 }
 
-// INT8 KV-CACHE APPEND (TNNetFusedSDPA, int8 cache). Quantizes the token's K
-// and V slices into the resident int8 cache at slot FCacheSlot, one work-group
-// per KV head, lanes splitting FDk. The format is the host's, unchanged: one
-// symmetric FP32 scale per row, scale = maxabs/127, codes in [-127,127], laid
-// out exactly as TNNetScaledDotProductAttention.QuantizeCacheRow writes them,
-// so the cache stays byte-comparable with FKCacheQ/FVCacheQ.
+// INT8 KV-CACHE APPEND (TNNetFusedSDPA, int8 cache). Quantizes the step's K
+// and V slices into the resident int8 cache at slots FCacheSlot ..
+// FCacheSlot+FTokenCnt-1, one work-group per (KV head, token row) exactly as
+// cai_sdpa_append_kv above, lanes splitting FDk. The format is the host's,
+// unchanged: one symmetric FP32 scale per row, scale = maxabs/127, codes in
+// [-127,127], laid out exactly as
+// TNNetScaledDotProductAttention.QuantizeCacheRow writes them, so the cache
+// stays byte-comparable with FKCacheQ/FVCacheQ.
 //
 // Three deliberate choices:
 //   - rint, not round: OpenCL's round is half-away-from-zero while FPC's Round
@@ -2826,11 +3341,13 @@ __kernel void cai_sdpa_decode
 __kernel void cai_sdpa_append_kv_int8
 (
   const int FKVHeads,
+  const int FTokenCnt,
   const int FDk,
   const int FCacheMax,
   const int FCacheSlot,
   const int FQW,
   const int FKW,
+  const int FXStride,
   __global const float* FX,
   __global char* FKCodes,
   __global float* FKScales,
@@ -2839,17 +3356,20 @@ __kernel void cai_sdpa_append_kv_int8
   __local float* FScratch
 )
 {
-  const int g = get_group_id(1);
+  const int gid = get_group_id(1);
   const int lid = get_local_id(0);
   const int lsize = get_local_size(0);
   int s, d, part;
+  const int g = gid / FTokenCnt;
+  const int t = gid - g * FTokenCnt;
   if (g >= FKVHeads) return;
-  const int slot = g * FCacheMax + FCacheSlot;
+  const int slot = g * FCacheMax + FCacheSlot + t;
   const int dst = slot * FDk;
+  const int kBase = t * FXStride + FQW + g * FDk;
 
   for (part = 0; part < 2; part++)
   {
-    const int base = (part == 0) ? (FQW + g * FDk) : (FQW + FKW + g * FDk);
+    const int base = (part == 0) ? kBase : (kBase + FKW);
     __global char* codes = (part == 0) ? FKCodes : FVCodes;
     __global float* scales = (part == 0) ? FKScales : FVScales;
 
@@ -2886,25 +3406,29 @@ __kernel void cai_sdpa_append_kv_int8
   }
 }
 
-// CACHED-DECODE SCALED DOT-PRODUCT ATTENTION OVER AN INT8 KV CACHE
-// (TNNetFusedSDPA). Phase for phase the same kernel as cai_sdpa_decode above -
-// one work-group per query head, the score band in global memory, a
-// CLK_GLOBAL_MEM_FENCE barrier between phases 2 and 3 - and only the loads
-// differ: the codes stream straight into the accumulator and the row scale is
-// folded in as one scalar OUTSIDE the element loop, so the cache is never
-// dequantized into memory. That is what makes an int8 cache a bandwidth saving
-// rather than a bandwidth cost, and it mirrors what
-// TNNetFusedSDPA.ComputeCachedToken already does on the host.
-// char is signed in OpenCL C, so (float)code sign-extends with no mask.
-// FScratch is LocalSize + FDk floats. Coded by Claude (AI).
-__kernel void cai_sdpa_decode_int8
+// SPLIT-ROW CACHED-DECODE ATTENTION, PASS 1, INT8 KV CACHE (TNNetFusedSDPA).
+// The same work-group geometry, chunk bounds, partial layout and empty-chunk
+// rule as cai_sdpa_decode_split above, and the same merge; only the loads
+// differ. A lane reads its K row as 16-byte loads, the codes go straight into
+// the accumulators, and the row scale is folded in once per row OUTSIDE the
+// element loop, so the cache is never dequantized into memory - which is what
+// makes an int8 cache a bandwidth saving. Phase 3 folds the V row scale into
+// the value the lane multiplies, once per row per lane. char is signed in
+// OpenCL C, so the conversion sign-extends with no mask. FScratch is sized as
+// for cai_sdpa_decode_split. Coded by Claude (AI).
+__kernel void cai_sdpa_decode_split_int8
 (
-  const int FQHeads,
+  const int FKVHeads,
+  const int FTokenCnt,
+  const int FSplits,
+  const int FChunkRows,
+  const int FChunkBase,
   const int FGroupSize,
   const int FDk,
   const int FCacheMax,
-  const int FCacheLen,
+  const int FCacheSlot,
   const int FWindow,
+  const int FXStride,
   const float FInvSqrtDk,
   const float FScoreSoftCap,
   const float FInvScoreSoftCap,
@@ -2913,83 +3437,159 @@ __kernel void cai_sdpa_decode_int8
   __global const float* FKScales,
   __global const char* FVCodes,
   __global const float* FVScales,
-  __global float* FScores,
-  __global float* FY,
+  __global float* FPartials,
   __local float* FScratch
 )
 {
-  const int h = get_group_id(1);
+  const int gid = get_group_id(1);
   const int lid = get_local_id(0);
   const int lsize = get_local_size(0);
-  int s, d, j;
-  if (h >= FQHeads) return;
+  int i, d, d16, r, q, qBase, s;
+  const int c = gid % FSplits;
+  const int rowPair = gid / FSplits;
+  const int t = rowPair % FTokenCnt;
+  const int g = rowPair / FTokenCnt;
+  if (g >= FKVHeads) return;
 
   __local float* qloc = FScratch + lsize;
+  __local float* tile = qloc + FGroupSize * FDk;
+  __local float* headMax = tile + FChunkRows * FGroupSize;
+  __local float* headSum = headMax + FGroupSize;
 
-  const int g = h / FGroupSize;
-  const int qBase = h * FDk;
+  const int PartialStride = FDk + 2;
+  const int PartialRow0 =
+    (((g * FGroupSize) * FTokenCnt + t) * FSplits + c) * PartialStride;
+  const int PartialHeadStride = FTokenCnt * FSplits * PartialStride;
+
+  const int LiveLen = FCacheSlot + t + 1;
+  const int jStart = ((FWindow > 0) && (LiveLen > FWindow))
+                     ? (LiveLen - FWindow) : 0;
+  int ChunkStart = FChunkBase + c * FChunkRows;
+  int ChunkEnd = ChunkStart + FChunkRows;
+  if (ChunkStart < jStart) ChunkStart = jStart;
+  if (ChunkEnd > LiveLen) ChunkEnd = LiveLen;
+  const int ChunkLive = ChunkEnd - ChunkStart;
+
+  if (ChunkLive <= 0)
+  {
+    for (q = 0; q < FGroupSize; q++)
+    {
+      __global float* part = FPartials + PartialRow0 + q * PartialHeadStride;
+      for (d = lid; d < FDk; d += lsize) part[2 + d] = 0.0f;
+      if (lid == 0) { part[0] = -1e30f; part[1] = 0.0f; }
+    }
+    return;
+  }
+
   const int scalePlane = g * FCacheMax;
   const int plane = scalePlane * FDk;
-  const int scoreBase = h * FCacheMax;
-  const int jStart = ((FWindow > 0) && (FCacheLen > FWindow))
-                     ? (FCacheLen - FWindow) : 0;
-
-  for (d = lid; d < FDk; d += lsize) qloc[d] = FX[qBase + d];
+  const int QTileLen = FGroupSize * FDk;
+  __global const float* qsrc = FX + t * FXStride + g * QTileLen;
+  for (i = lid; i < QTileLen; i += lsize) qloc[i] = qsrc[i];
   barrier(CLK_LOCAL_MEM_FENCE);
 
-  // ---- phase 1: scores over the live cache, then the row max ----
-  float m = -1e30f;
-  for (j = jStart + lid; j < FCacheLen; j += lsize)
+  // ---- phase 1: every query row of the group against this lane's K rows ----
+  const int Dk16 = FDk >> 4;
+  const int DkVecEnd = Dk16 << 4;
+  for (r = lid; r < ChunkLive; r += lsize)
   {
+    const int j = ChunkStart + r;
     __global const char* krow = FKCodes + plane + j * FDk;
-    float acc = 0.0f;
-    for (d = 0; d < FDk; d++) acc = mad(qloc[d], (float)krow[d], acc);
-    float sc = acc * (FKScales[scalePlane + j] * FInvSqrtDk);
-    if (FScoreSoftCap > 0.0f)
-      sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
-    FScores[scoreBase + j] = sc;
-    m = fmax(m, sc);
+    const float RowScale = FKScales[scalePlane + j] * FInvSqrtDk;
+    for (qBase = 0; qBase < FGroupSize; qBase += CAI_SDPA_QSLAB)
+    {
+      const int SlabHeads = min(CAI_SDPA_QSLAB, FGroupSize - qBase);
+      const int SlabHeadsM1 = SlabHeads - 1;
+      __local const float* qslab = qloc + qBase * FDk;
+      float acc[CAI_SDPA_QSLAB];
+      #pragma unroll
+      for (i = 0; i < CAI_SDPA_QSLAB; i++) acc[i] = 0.0f;
+      for (d16 = 0; d16 < Dk16; d16++)
+      {
+        const float16 k16 = convert_float16(vload16(d16, krow));
+        #pragma unroll
+        for (i = 0; i < CAI_SDPA_QSLAB; i++)
+          if (i < SlabHeads)
+          {
+            const float16 q16 = vload16(d16, qslab + min(i, SlabHeadsM1) * FDk);
+            acc[i] += dot(k16.s0123, q16.s0123) + dot(k16.s4567, q16.s4567)
+                    + dot(k16.s89ab, q16.s89ab) + dot(k16.scdef, q16.scdef);
+          }
+      }
+      for (d = DkVecEnd; d < FDk; d++)
+      {
+        const float kd = (float)krow[d];
+        #pragma unroll
+        for (i = 0; i < CAI_SDPA_QSLAB; i++)
+          if (i < SlabHeads)
+            acc[i] = mad(kd, qslab[min(i, SlabHeadsM1) * FDk + d], acc[i]);
+      }
+      #pragma unroll
+      for (i = 0; i < CAI_SDPA_QSLAB; i++)
+        if (i < SlabHeads)
+        {
+          float sc = acc[i] * RowScale;
+          if (FScoreSoftCap > 0.0f)
+            sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
+          tile[(qBase + i) * FChunkRows + r] = sc;
+        }
+    }
   }
-  FScratch[lid] = m;
-  barrier(CLK_LOCAL_MEM_FENCE);
-  for (s = lsize >> 1; s > 0; s >>= 1)
-  {
-    if (lid < s) FScratch[lid] = fmax(FScratch[lid], FScratch[lid + s]);
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-  const float MaxScore = FScratch[0];
   barrier(CLK_LOCAL_MEM_FENCE);
 
-  // ---- phase 2: shifted exp in place (same lane owns the same j), then the
-  // normalizer ----
-  float partial = 0.0f;
-  for (j = jStart + lid; j < FCacheLen; j += lsize)
-  {
-    const float e = exp(FScores[scoreBase + j] - MaxScore);
-    FScores[scoreBase + j] = e;
-    partial += e;
-  }
-  FScratch[lid] = partial;
-  barrier(CLK_LOCAL_MEM_FENCE);
-  for (s = lsize >> 1; s > 0; s >>= 1)
-  {
-    if (lid < s) FScratch[lid] += FScratch[lid + s];
-    barrier(CLK_LOCAL_MEM_FENCE);
-  }
-  const float SumExp = FScratch[0];
-  // Phase 3 reads score entries written by OTHER lanes, so the fence spans
-  // global memory too.
-  barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+  // Segment geometry through shifts and masks only: PoCL miscompiles a
+  // division of the local id by a run-time value (the work-group then runs
+  // as if it had one lane), so no lane index is ever divided here.
+  int SegShift = 0;
+  while (((2 << SegShift) <= FGroupSize) && ((2 << SegShift) <= lsize)) SegShift++;
+  const int SegCount = 1 << SegShift;
+  const int SegLanes = lsize >> SegShift;
+  const int seg = lid >> ((31 - clz(lsize)) - SegShift);
+  const int sl = lid & (SegLanes - 1);
+  CAI_SDPA_HEAD_REDUCE(0, headMax)
 
-  // ---- phase 3: the value sum, one output dimension per lane ----
-  const float InvSumExp = (SumExp > 0.0f) ? (1.0f / SumExp) : 0.0f;
+  // ---- phase 2: shifted exp in place, then the per-head normalizer ----
+  for (q = 0; q < FGroupSize; q++)
+  {
+    __local float* row = tile + q * FChunkRows;
+    const float RowMax = headMax[q];
+    for (r = lid; r < ChunkLive; r += lsize) row[r] = exp(row[r] - RowMax);
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+  CAI_SDPA_HEAD_REDUCE(1, headSum)
+
+  // ---- phase 3: the unnormalized value sum, one output dimension per lane ----
   for (d = lid; d < FDk; d += lsize)
   {
-    float acc = 0.0f;
-    for (j = jStart; j < FCacheLen; j++)
-      acc = mad(FScores[scoreBase + j] * FVScales[scalePlane + j],
-                (float)FVCodes[plane + j * FDk + d], acc);
-    FY[qBase + d] = acc * InvSumExp;
+    __global const char* vcol = FVCodes + plane + ChunkStart * FDk + d;
+    __global const float* vscale = FVScales + scalePlane + ChunkStart;
+    for (qBase = 0; qBase < FGroupSize; qBase += CAI_SDPA_QSLAB)
+    {
+      const int SlabHeads = min(CAI_SDPA_QSLAB, FGroupSize - qBase);
+      const int SlabHeadsM1 = SlabHeads - 1;
+      __local const float* pslab = tile + qBase * FChunkRows;
+      float acc[CAI_SDPA_QSLAB];
+      #pragma unroll
+      for (i = 0; i < CAI_SDPA_QSLAB; i++) acc[i] = 0.0f;
+      for (r = 0; r < ChunkLive; r++)
+      {
+        const float v = vscale[r] * (float)vcol[r * FDk];
+        #pragma unroll
+        for (i = 0; i < CAI_SDPA_QSLAB; i++)
+          if (i < SlabHeads)
+            acc[i] = mad(pslab[min(i, SlabHeadsM1) * FChunkRows + r], v, acc[i]);
+      }
+      #pragma unroll
+      for (i = 0; i < CAI_SDPA_QSLAB; i++)
+        if (i < SlabHeads)
+          FPartials[PartialRow0 + (qBase + i) * PartialHeadStride + 2 + d] = acc[i];
+    }
+  }
+  for (q = lid; q < FGroupSize; q += lsize)
+  {
+    __global float* part = FPartials + PartialRow0 + q * PartialHeadStride;
+    part[0] = headMax[q];
+    part[1] = headSum[q];
   }
 }
 

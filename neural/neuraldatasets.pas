@@ -852,6 +852,9 @@ type
       FRngState: cardinal;
       FOrder: TNeuralIntegerArray;   // sample indices in emission order
       FBatchCount: integer;
+      // Per-batch pad length (max member length), filled by BuildBatches so
+      // BatchSeqLen is an array read instead of a rescan of the batch.
+      FBatchSeqLens: TNeuralIntegerArray;
       FIsBuilt: boolean;
       function NextRandom(): TNeuralFloat;
       function NextRandomInt(N: integer): integer;
@@ -2136,6 +2139,7 @@ procedure TNNetLengthGroupedBatcher.Clear();
 begin
   SetLength(FSamples, 0);
   SetLength(FOrder, 0);
+  SetLength(FBatchSeqLens, 0);
   FSampleCount := 0;
   FBatchCount := 0;
   FIsBuilt := false;
@@ -2237,6 +2241,7 @@ procedure TNNetLengthGroupedBatcher.BuildBatches();
 var
   Mega, Lo, Hi, I, LongestPos, Tmp: integer;
   SampleM1: integer;
+  Flat, L, MaxLen, BatchM1: integer;
 begin
   if FSampleCount < 1 then
     raise Exception.Create(
@@ -2271,6 +2276,25 @@ begin
   end;
   // 5. partition into BatchSize chunks.
   FBatchCount := (FSampleCount + FBatchSize - 1) div FBatchSize;
+  // Cache each batch's pad length (its max member length) so per-sample
+  // BatchSeqLen callers read one array element instead of rescanning the batch.
+  SetLength(FBatchSeqLens, FBatchCount);
+  Flat := 0;
+  BatchM1 := FBatchCount - 1;
+  SampleM1 := FSampleCount - 1;
+  for I := 0 to BatchM1 do
+  begin
+    MaxLen := 0;
+    Hi := Flat + FBatchSize - 1;
+    if Hi > SampleM1 then Hi := SampleM1;
+    while Flat <= Hi do
+    begin
+      L := Length(FSamples[FOrder[Flat]]);
+      if L > MaxLen then MaxLen := L;
+      Inc(Flat);
+    end;
+    FBatchSeqLens[I] := MaxLen;
+  end;
   FIsBuilt := true;
 end;
 
@@ -2308,18 +2332,12 @@ begin
 end;
 
 function TNNetLengthGroupedBatcher.BatchSeqLen(BatchIdx: integer): integer;
-var
-  W, L: integer;
-  MaxW: integer;
 begin
   RequireBuilt();
-  Result := 0;
-  MaxW := BatchSize(BatchIdx) - 1;
-  for W := 0 to MaxW do
-  begin
-    L := SampleLenOf(BatchIdx, W);
-    if L > Result then Result := L;
-  end;
+  if (BatchIdx < 0) or (BatchIdx >= FBatchCount) then
+    raise Exception.Create(
+      'TNNetLengthGroupedBatcher.BatchSeqLen: bad batch index.');
+  Result := FBatchSeqLens[BatchIdx];
 end;
 
 procedure TNNetLengthGroupedBatcher.GetTrainingPair(BatchIdx, WithinIdx: integer;
@@ -2327,7 +2345,8 @@ procedure TNNetLengthGroupedBatcher.GetTrainingPair(BatchIdx, WithinIdx: integer
 var
   Sample: TNeuralIntegerArray;
   SeqLen, Len, Pos, Token: integer;
-  SeqM1, LenM2: integer;
+  SeqM1, LenM1, LenM2: integer;
+  InputDepth, TargetDepth: integer;
   IsIdInput: boolean;
 begin
   RequireBuilt();
@@ -2343,67 +2362,106 @@ begin
   Sample := FSamples[SampleIndexOf(BatchIdx, WithinIdx)];
   Len := Length(Sample);
   // Input: real tokens then right-padding to the batch's seq len.
-  pInput.Fill(0);
   SeqM1 := SeqLen - 1;
+  LenM1 := Len - 1;
   LenM2 := Len - 2;
-  IsIdInput := (pInput.Depth = 1);
-  for Pos := 0 to SeqM1 do
+  InputDepth := pInput.Depth;   // #5/#8: invariant property getter
+  IsIdInput := (InputDepth = 1);
+  // The token-id branch writes every slot up to SeqM1 (pad tail included), so
+  // pre-zeroing is only needed when the volume has slots the loops below do
+  // not reach or when the one-hot branch leaves non-selected depths untouched.
+  if not (IsIdInput and (pInput.Size = SeqLen)) then pInput.Fill(0);
+  // #20: real tokens (Len <= SeqLen by BatchSeqLen's definition), then the
+  // pad tail with its position-invariant token test hoisted.
+  for Pos := 0 to LenM1 do
   begin
-    if Pos < Len then Token := Sample[Pos] else Token := FPadToken;
+    Token := Sample[Pos];
     if IsIdInput
     then pInput.FData[Pos] := Token
-    else if (Token >= 0) and (Token < pInput.Depth)
+    else if (Token >= 0) and (Token < InputDepth)
     then pInput[Pos, 0, Token] := 1;
+  end;
+  if IsIdInput then
+  begin
+    for Pos := Len to SeqM1 do pInput.FData[Pos] := FPadToken;
+  end
+  else if (FPadToken >= 0) and (FPadToken < InputDepth) then
+  begin
+    for Pos := Len to SeqM1 do pInput[Pos, 0, FPadToken] := 1;
   end;
   // Target: per-position one-hot of the NEXT real token (positions 0..Len-2);
   // every padded position and the sample's last real token carry no target.
   pTarget.Fill(0);
+  TargetDepth := pTarget.Depth;   // #5/#8: invariant property getter
   for Pos := 0 to LenM2 do
   begin
     Token := Sample[Pos + 1];
-    if (Token >= 0) and (Token < pTarget.Depth) then pTarget[Pos, 0, Token] := 1;
+    if (Token >= 0) and (Token < TargetDepth) then pTarget[Pos, 0, Token] := 1;
   end;
 end;
 
 procedure TNNetLengthGroupedBatcher.ApplyLossMask(BatchIdx, WithinIdx: integer;
   Desired, Actual: TNNetVolume);
 var
-  SeqLen, Len, Pos: integer;
-  SeqM1, DepthM1, DesBase, ActBase, CopyBytes: integer;
+  SeqLen, Len, Pos, StartPos: integer;
+  SeqM1, Depth, DesBase, ActBase, CopyBytes: integer;
+  DesStride, ActStride: integer;
 begin
   RequireBuilt();
   SeqLen := BatchSeqLen(BatchIdx);
   Len := SampleLenOf(BatchIdx, WithinIdx);
+  // Predictable iff a next real token exists (Pos in 0..Len-2), so the masked
+  // positions form one contiguous tail: Len-1..SeqLen-1.
+  StartPos := Len - 1;
+  if StartPos < 0 then StartPos := 0;
   SeqM1 := SeqLen - 1;
-  DepthM1 := Desired.Depth - 1;
-  CopyBytes := (DepthM1 + 1) * csNeuralFloatSize;
-  for Pos := 0 to SeqM1 do
+  if StartPos > SeqM1 then exit;
+  Depth := Desired.Depth;
+  if Depth = Actual.Depth then
   begin
-    // Predictable iff a next real token exists: Pos in 0..Len-2.
-    if Pos > Len - 2 then
+    // Both pairs use GetTrainingPair's layout (positions on X, targets on
+    // depth, row y = 0), where consecutive positions are Depth floats apart:
+    // the whole tail is one contiguous block per volume.
+    Move(Actual.FData[Actual.GetRawPos(StartPos, 0, 0)],
+      Desired.FData[Desired.GetRawPos(StartPos, 0, 0)],
+      (SeqLen - StartPos) * Depth * csNeuralFloatSize);
+  end
+  else
+  begin
+    // Depth mismatch: per-position copy with carried offsets (#12).
+    CopyBytes := Depth * csNeuralFloatSize;
+    DesBase := Desired.GetRawPos(StartPos, 0, 0);
+    ActBase := Actual.GetRawPos(StartPos, 0, 0);
+    DesStride := Desired.GetRawPos(1, 0);
+    ActStride := Actual.GetRawPos(1, 0);
+    for Pos := StartPos to SeqM1 do
     begin
-      DesBase := Desired.GetRawPos(Pos, 0, 0);
-      ActBase := Actual.GetRawPos(Pos, 0, 0);
       Move(Actual.FData[ActBase], Desired.FData[DesBase], CopyBytes);
+      Inc(DesBase, DesStride);
+      Inc(ActBase, ActStride);
     end;
   end;
 end;
 
 function TNNetLengthGroupedBatcher.TotalPadTokens(): int64;
 var
-  B, W, SeqLen: integer;
+  B, W, SeqLen, Flat: integer;
   BatchM1: integer;
   BatchSizeM1: integer;
 begin
   RequireBuilt();
   Result := 0;
   BatchM1 := FBatchCount - 1;
+  Flat := 0;
   for B := 0 to BatchM1 do
   begin
-    SeqLen := BatchSeqLen(B);
+    SeqLen := FBatchSeqLens[B];
     BatchSizeM1 := BatchSize(B) - 1;
     for W := 0 to BatchSizeM1 do
-      Result := Result + (SeqLen - SampleLenOf(B, W));
+    begin
+      Result := Result + (SeqLen - Length(FSamples[FOrder[Flat]]));
+      Inc(Flat);
+    end;
   end;
 end;
 

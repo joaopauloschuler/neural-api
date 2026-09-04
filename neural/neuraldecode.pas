@@ -154,6 +154,7 @@ Coded by Claude (AI).
 interface
 
 uses
+  {$IFDEF OpenCL} cl, {$ENDIF}
   Classes, SysUtils, neuralvolume, neuralnetwork, neuralhftokenizer;
 
 type
@@ -1199,6 +1200,51 @@ type
     property SSMCount: integer read GetSSMCount;
   end;
 
+  // TNNetDecoderStateCheckpoint: the recurrent half of a TNNetStreamingDecoder's
+  // state - one copy of the decode state and step count of every recurrent
+  // layer, and NO attention K/V. Attention K/V is position-indexed, so
+  // TNNetStreamingDecoder.TruncateTo rewinds it in place; the recurrent state
+  // is a fixed-size summary with no per-position history, so resuming from a
+  // position needs a copy taken there. TruncateTo(Pos) + RestoreStateFrom
+  // therefore resumes a hybrid (Qwen3.5 GatedDeltaNet + conv + attention,
+  // Mamba) from any checkpointed position without copying the K/V cache.
+  //
+  // STORAGE. TNNetStreamingDecoder.SizeStateCheckpoint allocates once: per
+  // recurrent layer, a buffer in OpenCL memory when the layer keeps its decode
+  // state there (a TNNetRecurrentDecodeBase descendant with an OpenCL path),
+  // else a host TNNetVolume. CaptureStateInto and RestoreStateFrom allocate
+  // nothing, and for an OpenCL slot they are device-to-device copies that
+  // leave the layer's state resident. The buffers belong to the checkpoint,
+  // not to a net, so a checkpoint captured on one session restores into
+  // another session wrapping the same layer roster in the same OpenCL context
+  // (the width-N prefill twin and the width-1 session). Coded by Claude (AI).
+  TNNetDecoderStateCheckpoint = class(TObject)
+  private
+    FLayerClasses: array of TClass;  // per recurrent layer, checked on capture/restore
+    FH: array of TNNetVolume;        // per-layer host state (nil on the OpenCL route)
+    FSteps: array of integer;        // per-layer step count
+    FSlotBytes: array of int64;      // per-layer bytes of the OpenCL slot (0 = host route)
+    {$IFDEF OpenCL}
+    FSlots: array of cl_mem;         // per-layer state in OpenCL memory (nil = host route)
+    {$ENDIF}
+    FPosition: integer;
+    FSized: boolean;
+    function GetLayerCount(): integer;
+    function GetOpenCLSlotCount(): integer;
+  public
+    destructor Destroy(); override;
+    // Releases every buffer; the checkpoint can be sized again afterwards.
+    procedure Clear();
+    // Bytes held: OpenCL slots plus host volumes plus the step counts.
+    function Bytes(): int64;
+    function OpenCLBytes(): int64;
+    // Tokens fed when the checkpoint was captured (caller-owned bookkeeping).
+    property Position: integer read FPosition write FPosition;
+    property LayerCount: integer read GetLayerCount;
+    property OpenCLSlotCount: integer read GetOpenCLSlotCount;
+    property Sized: boolean read FSized;
+  end;
+
   // TNNetStreamingDecoder: a reusable incremental-decode "streaming session"
   // over a causal next-token net, replacing the hand-rolled step-net plumbing
   // every streaming example repeats (build a short-width twin, CopyWeights,
@@ -1277,6 +1323,8 @@ type
     FRopes: array of TNNetRotaryEmbedding;
     FLearnedPos: array of TNNetLearnedPositionalEmbedding; // GPT-2-style wpe
     FHiddenLayer: TNNetLayer;        // lazily resolved last-hidden-state layer
+    // Writes AbsPos to every rope / learned-position layer before a forward.
+    procedure SetWindowPosition(AbsPos: integer);
     function GetSDPACount(): integer;
     function GetSSMCount(): integer;
     function GetRopeCount(): integer;
@@ -1290,6 +1338,9 @@ type
       out Steps: integer);
     class procedure StateRestore(L: TNNetLayer; Src: TNNetVolume;
       Steps: integer);
+    // Raises unless Chk was sized for this session's recurrent layer roster.
+    procedure CheckStateCheckpointFits(Chk: TNNetDecoderStateCheckpoint;
+      const Caller: string);
   public
     // pInt8KV = true arms the int8-quantized KV cache at construction: the
     // attention layers allocate the int8 code/scale storage directly and the
@@ -1308,6 +1359,12 @@ type
     // layer's PositionOffset before pNet.Compute (see the exactness contract
     // above).
     procedure StepForward(InV: TNNetVolume; AbsPos: integer);
+    // StepForward that stops at the LM-head input layer (the one HiddenState
+    // reads): no logits, Output() is stale. For prefill steps nobody reads.
+    procedure StepForwardToHidden(InV: TNNetVolume; AbsPos: integer);
+    // The LM-head input layer (ContrastiveHiddenLayer), resolved once: the
+    // layer HiddenState reads and StepForwardToHidden stops at.
+    function HiddenLayer(): TNNetLayer;
     // Speculative-decode rollback: TruncateCache(CommittedLen) on every
     // attention layer, discarding the K/V of rejected/pad tokens. No-op when
     // the net has no attention layers.
@@ -1365,7 +1422,23 @@ type
     // snapshot must come from a session wrapping the SAME architecture at the
     // SAME MaxCacheLen (e.g. the same twin, or twins CopyWeights'd from one net).
     function Snapshot(): TNNetDecoderSessionSnapshot;
+    // Same capture into a snapshot the caller owns: its volumes are reused
+    // when the shapes match, so a repeated capture allocates nothing.
+    procedure SnapshotInto(Snap: TNNetDecoderSessionSnapshot);
     procedure RestoreSnapshot(Snap: TNNetDecoderSessionSnapshot);
+    // CACHE CHECKPOINTS (the recurrent half only; see
+    // TNNetDecoderStateCheckpoint). SizeStateCheckpoint allocates Chk's
+    // per-layer storage for this session - call it once, outside any decode
+    // step; NewStateCheckpoint creates and sizes one. CaptureStateInto copies
+    // every recurrent layer's live state and step count into Chk;
+    // RestoreStateFrom copies them back. Neither allocates, and both raise on
+    // a checkpoint sized for another layer roster. The caller pairs
+    // RestoreStateFrom with TruncateTo(Pos), which rewinds the attention K/V
+    // caches in place (a cache resident in OpenCL memory stays resident).
+    procedure SizeStateCheckpoint(Chk: TNNetDecoderStateCheckpoint);
+    function NewStateCheckpoint(): TNNetDecoderStateCheckpoint;
+    procedure CaptureStateInto(Chk: TNNetDecoderStateCheckpoint);
+    procedure RestoreStateFrom(Chk: TNNetDecoderStateCheckpoint);
     // Convenience: the net's last layer output (e.g. the softmax row(s) of
     // the window just computed).
     function Output(): TNNetVolume;
@@ -2368,7 +2441,6 @@ uses
 
 // Forward declarations for helpers used before their definition.
 function ContrastiveHiddenLayer(NN: TNNet): TNNetLayer; forward;
-function ContrastiveCosine(A, B: TNNetVolume): TNeuralFloat; forward;
 
 function DecodeCTCGreedy(Scores: TNNetVolume; Blank: integer): TNeuralIntegerArray;
 var
@@ -5829,10 +5901,12 @@ begin
   end;
   TNNetVolume.Ln(RowPtr, RowPtr, Size);   // Row   := ln(cond)
   TNNetVolume.Ln(UncPtr, UncPtr, Size);   // Uncond := ln(uncond)
-  // #13/App D: scale*cond + (1-scale)*uncond is the same combination in two
-  // passes (a scale then a fused multiply-add) instead of sub/scale/add.
-  Row.Mul(FGuidanceScale);                       // scale*cond
-  Row.MulAdd(1.0 - FGuidanceScale, UncondRow);   // + (1-scale)*uncond
+  // #13/App D: scale*cond + (1-scale)*uncond in ONE fused pass (two vmulps +
+  // one vaddps). These are pre-softmax log-space logits with no parity
+  // contract at scale<>1 (the scale=1 early exit above carries the only
+  // bit-for-bit guarantee), and scale=0 stays exact: 0*cond + 1*uncond has no
+  // rounding, so the uncond-only invariant is preserved.
+  Row.MulMulAdd(FGuidanceScale, 1.0 - FGuidanceScale, UncondRow);
   // Softmax the combined logits back into a probability row (the chain's
   // documented domain). #13/#19: one fused exp-and-sum pass over the row.
   MaxL := Row.GetMax();
@@ -5884,6 +5958,71 @@ end;
 function TNNetDecoderSessionSnapshot.GetSSMCount(): integer;
 begin
   Result := Length(FH);
+end;
+
+{ TNNetDecoderStateCheckpoint }
+
+destructor TNNetDecoderStateCheckpoint.Destroy();
+begin
+  Clear();
+  inherited Destroy();
+end;
+
+procedure TNNetDecoderStateCheckpoint.Clear();
+var
+  i, MaxLayerPos: integer;
+begin
+  MaxLayerPos := High(FH);
+  for i := 0 to MaxLayerPos do FH[i].Free;
+  {$IFDEF OpenCL}
+  MaxLayerPos := High(FSlots);
+  for i := 0 to MaxLayerPos do
+    if Assigned(FSlots[i]) then clReleaseMemObject(FSlots[i]);
+  SetLength(FSlots, 0);
+  {$ENDIF}
+  SetLength(FH, 0);
+  SetLength(FSteps, 0);
+  SetLength(FSlotBytes, 0);
+  SetLength(FLayerClasses, 0);
+  FPosition := 0;
+  FSized := false;
+end;
+
+function TNNetDecoderStateCheckpoint.Bytes(): int64;
+var
+  i, MaxLayerPos: integer;
+begin
+  Result := 0;
+  MaxLayerPos := High(FSteps);
+  for i := 0 to MaxLayerPos do
+  begin
+    Result := Result + FSlotBytes[i] + SizeOf(integer);
+    if Assigned(FH[i]) then Result := Result + FH[i].GetMemSize();
+  end;
+end;
+
+function TNNetDecoderStateCheckpoint.OpenCLBytes(): int64;
+var
+  i, MaxLayerPos: integer;
+begin
+  Result := 0;
+  MaxLayerPos := High(FSlotBytes);
+  for i := 0 to MaxLayerPos do Result := Result + FSlotBytes[i];
+end;
+
+function TNNetDecoderStateCheckpoint.GetLayerCount(): integer;
+begin
+  Result := Length(FSteps);
+end;
+
+function TNNetDecoderStateCheckpoint.GetOpenCLSlotCount(): integer;
+var
+  i, MaxLayerPos: integer;
+begin
+  Result := 0;
+  MaxLayerPos := High(FSlotBytes);
+  for i := 0 to MaxLayerPos do
+    if FSlotBytes[i] > 0 then Inc(Result);
 end;
 
 { TNNetStreamingDecoder }
@@ -6030,7 +6169,7 @@ begin
   for i := 0 to HiSSM do StateReset(FSSMs[i]);
 end;
 
-procedure TNNetStreamingDecoder.StepForward(InV: TNNetVolume; AbsPos: integer);
+procedure TNNetStreamingDecoder.SetWindowPosition(AbsPos: integer);
 var
   i, HiRope, HiLearned: integer;
 begin
@@ -6045,7 +6184,22 @@ begin
   // step at absolute position p reads wpe[p] (and a width-K verify window
   // reads wpe[p..p+K-1]).
   for i := 0 to HiLearned do FLearnedPos[i].PositionOffset := AbsPos;
+end;
+
+procedure TNNetStreamingDecoder.StepForward(InV: TNNetVolume; AbsPos: integer);
+begin
+  SetWindowPosition(AbsPos);
   FNet.Compute(InV, {FromLayerIdx=}0, FParallel);
+end;
+
+procedure TNNetStreamingDecoder.StepForwardToHidden(InV: TNNetVolume;
+  AbsPos: integer);
+begin
+  SetWindowPosition(AbsPos);
+  // Every stateful layer (KV cache, recurrent state, conv history) sits
+  // before the LM-head input, so the skipped layers hold no state.
+  FNet.Compute(InV, {FromLayerIdx=}0, FParallel,
+    {EndLayerIdx=}HiddenLayer().LayerIdx);
 end;
 
 procedure TNNetStreamingDecoder.TruncateTo(CommittedLen: integer);
@@ -6094,47 +6248,71 @@ begin
 end;
 
 function TNNetStreamingDecoder.Snapshot(): TNNetDecoderSessionSnapshot;
+begin
+  Result := TNNetDecoderSessionSnapshot.Create();
+  SnapshotInto(Result);
+end;
+
+procedure TNNetStreamingDecoder.SnapshotInto(Snap: TNNetDecoderSessionSnapshot);
 var
   i, HiSDPA, HiSSM: integer;
 begin
-  Result := TNNetDecoderSessionSnapshot.Create();
-  SetLength(Result.FK, Length(FSDPAs));
-  SetLength(Result.FV, Length(FSDPAs));
-  SetLength(Result.FKQ, Length(FSDPAs));
-  SetLength(Result.FVQ, Length(FSDPAs));
-  SetLength(Result.FInt8, Length(FSDPAs));
-  SetLength(Result.FLen, Length(FSDPAs));
-  SetLength(Result.FSinks, Length(FSDPAs));
-  SetLength(Result.FWindow, Length(FSDPAs));
+  // The per-layer arrays and their volumes stay in place across captures: a
+  // shorter array is grown (new entries nil), an entry is created on first
+  // use only, and Copy/CopyFrom below reallocate only when a shape changed.
+  if Length(Snap.FK) <> Length(FSDPAs) then
+  begin
+    for i := 0 to High(Snap.FK) do FreeAndNil(Snap.FK[i]);
+    for i := 0 to High(Snap.FV) do FreeAndNil(Snap.FV[i]);
+    for i := 0 to High(Snap.FKQ) do FreeAndNil(Snap.FKQ[i]);
+    for i := 0 to High(Snap.FVQ) do FreeAndNil(Snap.FVQ[i]);
+    SetLength(Snap.FK, 0);
+    SetLength(Snap.FV, 0);
+    SetLength(Snap.FKQ, 0);
+    SetLength(Snap.FVQ, 0);
+    SetLength(Snap.FK, Length(FSDPAs));
+    SetLength(Snap.FV, Length(FSDPAs));
+    SetLength(Snap.FKQ, Length(FSDPAs));
+    SetLength(Snap.FVQ, Length(FSDPAs));
+    SetLength(Snap.FInt8, Length(FSDPAs));
+    SetLength(Snap.FLen, Length(FSDPAs));
+    SetLength(Snap.FSinks, Length(FSDPAs));
+    SetLength(Snap.FWindow, Length(FSDPAs));
+  end;
   HiSDPA := High(FSDPAs);
   for i := 0 to HiSDPA do
   begin
     // Capture whichever storage is live: the int8 cache keeps its codes and
-    // per-row scales, the FP32 cache its volumes. Only one pair is allocated
-    // per layer.
-    Result.FInt8[i] := FSDPAs[i].Int8KVCache;
-    if Result.FInt8[i] then
+    // per-row scales, the FP32 cache its volumes. Only the live pair is
+    // allocated on first use; the other stays nil.
+    Snap.FInt8[i] := FSDPAs[i].Int8KVCache;
+    if Snap.FInt8[i] then
     begin
-      Result.FKQ[i] := TNNetVolumeQuant8.Create();
-      Result.FVQ[i] := TNNetVolumeQuant8.Create();
-      FSDPAs[i].CaptureCacheStateInt8(Result.FKQ[i], Result.FVQ[i],
-        Result.FLen[i], Result.FSinks[i], Result.FWindow[i]);
+      if Snap.FKQ[i] = nil then Snap.FKQ[i] := TNNetVolumeQuant8.Create();
+      if Snap.FVQ[i] = nil then Snap.FVQ[i] := TNNetVolumeQuant8.Create();
+      FSDPAs[i].CaptureCacheStateInt8(Snap.FKQ[i], Snap.FVQ[i],
+        Snap.FLen[i], Snap.FSinks[i], Snap.FWindow[i]);
     end
     else
     begin
-      Result.FK[i] := TNNetVolume.Create();
-      Result.FV[i] := TNNetVolume.Create();
-      FSDPAs[i].CaptureCacheState(Result.FK[i], Result.FV[i],
-        Result.FLen[i], Result.FSinks[i], Result.FWindow[i]);
+      if Snap.FK[i] = nil then Snap.FK[i] := TNNetVolume.Create();
+      if Snap.FV[i] = nil then Snap.FV[i] := TNNetVolume.Create();
+      FSDPAs[i].CaptureCacheState(Snap.FK[i], Snap.FV[i],
+        Snap.FLen[i], Snap.FSinks[i], Snap.FWindow[i]);
     end;
   end;
-  SetLength(Result.FH, Length(FSSMs));
-  SetLength(Result.FSteps, Length(FSSMs));
+  if Length(Snap.FH) <> Length(FSSMs) then
+  begin
+    for i := 0 to High(Snap.FH) do FreeAndNil(Snap.FH[i]);
+    SetLength(Snap.FH, 0);
+    SetLength(Snap.FH, Length(FSSMs));
+    SetLength(Snap.FSteps, Length(FSSMs));
+  end;
   HiSSM := High(FSSMs);
   for i := 0 to HiSSM do
   begin
-    Result.FH[i] := TNNetVolume.Create();
-    StateCapture(FSSMs[i], Result.FH[i], Result.FSteps[i]);
+    if Snap.FH[i] = nil then Snap.FH[i] := TNNetVolume.Create();
+    StateCapture(FSSMs[i], Snap.FH[i], Snap.FSteps[i]);
   end;
 end;
 
@@ -6179,18 +6357,144 @@ begin
     StateRestore(FSSMs[i], Snap.FH[i], Snap.FSteps[i]);
 end;
 
+procedure TNNetStreamingDecoder.SizeStateCheckpoint(
+  Chk: TNNetDecoderStateCheckpoint);
+var
+  i, MaxLayerPos, StepsAtSizing: integer;
+  Layer: TNNetLayer;
+begin
+  Chk.Clear();
+  SetLength(Chk.FLayerClasses, Length(FSSMs));
+  SetLength(Chk.FH, Length(FSSMs));
+  SetLength(Chk.FSteps, Length(FSSMs));
+  SetLength(Chk.FSlotBytes, Length(FSSMs));
+  {$IFDEF OpenCL} SetLength(Chk.FSlots, Length(FSSMs)); {$ENDIF}
+  MaxLayerPos := High(FSSMs);
+  for i := 0 to MaxLayerPos do
+  begin
+    Layer := FSSMs[i];
+    Chk.FLayerClasses[i] := Layer.ClassType;
+    Chk.FH[i] := nil;
+    Chk.FSteps[i] := 0;
+    Chk.FSlotBytes[i] := 0;
+    {$IFDEF OpenCL}
+    Chk.FSlots[i] := nil;
+    if Layer is TNNetRecurrentDecodeBase then
+    begin
+      Chk.FSlots[i] := TNNetRecurrentDecodeBase(Layer).NewStateSlotOnOpenCL();
+      if Assigned(Chk.FSlots[i]) then
+      begin
+        Chk.FSlotBytes[i] := TNNetRecurrentDecodeBase(Layer).StateBytes();
+        continue;
+      end;
+    end;
+    {$ENDIF}
+    // Host route: the volume takes the state's shape now, so no later capture
+    // resizes it (the contents are replaced by the first capture).
+    Chk.FH[i] := TNNetVolume.Create();
+    StateCapture(Layer, Chk.FH[i], StepsAtSizing);
+  end;
+  Chk.FSized := true;
+end;
+
+function TNNetStreamingDecoder.NewStateCheckpoint(): TNNetDecoderStateCheckpoint;
+begin
+  Result := TNNetDecoderStateCheckpoint.Create();
+  SizeStateCheckpoint(Result);
+end;
+
+procedure TNNetStreamingDecoder.CheckStateCheckpointFits(
+  Chk: TNNetDecoderStateCheckpoint; const Caller: string);
+var
+  i, MaxLayerPos: integer;
+  Layer: TNNetLayer;
+  LayerBytes, HeldBytes: int64;
+begin
+  if (not Chk.FSized) or (Length(Chk.FSteps) <> Length(FSSMs)) then
+    raise Exception.Create('TNNetStreamingDecoder.' + Caller +
+      ': the checkpoint holds ' + IntToStr(Length(Chk.FSteps)) +
+      ' recurrent layers but this session has ' + IntToStr(Length(FSSMs)) +
+      ' (size it with SizeStateCheckpoint for this session).');
+  MaxLayerPos := High(FSSMs);
+  for i := 0 to MaxLayerPos do
+  begin
+    Layer := FSSMs[i];
+    if Chk.FLayerClasses[i] <> Layer.ClassType then
+      raise Exception.Create('TNNetStreamingDecoder.' + Caller +
+        ': recurrent layer ' + IntToStr(i) + ' is a ' + Layer.ClassName +
+        ' but the checkpoint was sized for a ' +
+        Chk.FLayerClasses[i].ClassName + ' (mismatched architecture).');
+    if not (Layer is TNNetRecurrentDecodeBase) then continue;
+    LayerBytes := TNNetRecurrentDecodeBase(Layer).StateBytes();
+    if Chk.FSlotBytes[i] > 0
+      then HeldBytes := Chk.FSlotBytes[i]
+      else HeldBytes := Chk.FH[i].GetMemSize();
+    if HeldBytes <> LayerBytes then
+      raise Exception.Create('TNNetStreamingDecoder.' + Caller +
+        ': recurrent layer ' + IntToStr(i) + ' holds ' +
+        IntToStr(LayerBytes) + ' state bytes but the checkpoint holds ' +
+        IntToStr(HeldBytes) + ' (mismatched architecture).');
+  end;
+end;
+
+procedure TNNetStreamingDecoder.CaptureStateInto(
+  Chk: TNNetDecoderStateCheckpoint);
+var
+  i, MaxLayerPos: integer;
+begin
+  CheckStateCheckpointFits(Chk, 'CaptureStateInto');
+  MaxLayerPos := High(FSSMs);
+  for i := 0 to MaxLayerPos do
+  begin
+    {$IFDEF OpenCL}
+    if Assigned(Chk.FSlots[i]) then
+    begin
+      TNNetRecurrentDecodeBase(FSSMs[i]).CaptureStateToOpenCL(Chk.FSlots[i],
+        Chk.FSteps[i]);
+      continue;
+    end;
+    {$ENDIF}
+    StateCapture(FSSMs[i], Chk.FH[i], Chk.FSteps[i]);
+  end;
+end;
+
+procedure TNNetStreamingDecoder.RestoreStateFrom(
+  Chk: TNNetDecoderStateCheckpoint);
+var
+  i, MaxLayerPos: integer;
+begin
+  CheckStateCheckpointFits(Chk, 'RestoreStateFrom');
+  MaxLayerPos := High(FSSMs);
+  for i := 0 to MaxLayerPos do
+  begin
+    {$IFDEF OpenCL}
+    if Assigned(Chk.FSlots[i]) then
+    begin
+      TNNetRecurrentDecodeBase(FSSMs[i]).RestoreStateFromOpenCL(Chk.FSlots[i],
+        Chk.FSteps[i]);
+      continue;
+    end;
+    {$ENDIF}
+    StateRestore(FSSMs[i], Chk.FH[i], Chk.FSteps[i]);
+  end;
+end;
+
 function TNNetStreamingDecoder.Output(): TNNetVolume;
 begin
   Result := FNet.GetLastLayer().Output;
 end;
 
+function TNNetStreamingDecoder.HiddenLayer(): TNNetLayer;
+begin
+  // The same heuristic as the cache-less path (ContrastiveHiddenLayer).
+  if FHiddenLayer = nil then FHiddenLayer := ContrastiveHiddenLayer(FNet);
+  Result := FHiddenLayer;
+end;
+
 function TNNetStreamingDecoder.HiddenState(): TNNetVolume;
 begin
-  // Resolve the LM-head input layer once (same heuristic as the cache-less
-  // path) and return its output - the hidden state of the token in the window
-  // just stepped.
-  if FHiddenLayer = nil then FHiddenLayer := ContrastiveHiddenLayer(FNet);
-  Result := FHiddenLayer.Output;
+  // The hidden state of the token in the window just stepped.
+  Result := HiddenLayer().Output;
 end;
 
 function TNNetStreamingDecoder.GetSDPACount(): integer;
@@ -7135,20 +7439,6 @@ begin
     Result := Head;
 end;
 
-// Cosine similarity of two equal-length flat vectors (the per-token hidden
-// states). Zero magnitude on either side yields 0 (no penalty), keeping the
-// score finite for a dead representation.
-function ContrastiveCosine(A, B: TNNetVolume): TNeuralFloat;
-var
-  Denom: TNeuralFloat;
-begin
-  Denom := A.GetMagnitude() * B.GetMagnitude();
-  if Denom <= 0 then
-    Result := 0
-  else
-    Result := A.DotProduct(B) / Denom;
-end;
-
 function DecodeContrastiveSearch(NN: TNNet; const Prompt: string;
   MaxLen: integer; TopK: integer; PenaltyAlpha: TNeuralFloat;
   const StopStrings: array of string): TNNetDecodeResult;
@@ -7159,11 +7449,12 @@ var
   CandP: array of TNeuralFloat;    // normalised probability of each candidate
   Cand: array of integer;          // current top-k candidate token ids
   Past: array of TNNetVolume;      // hidden states of already-processed tokens
+  PastMag: array of TNeuralFloat;  // their magnitudes, cached at capture
   CandHidden: TNNetVolume;         // snapshot of a candidate's hidden state
   VocabSize, Step, I, J, NumCand, Best, BestCand, StopLen, PastLen: integer;
   VocabSizeM1, NumCandM1, PastLenM1: integer;
   Total, InvTotal, MaxSim, Sim, ScoreV, BestScore, BestP, PJ: TNeuralFloat;
-  WeakestP: TNeuralFloat;
+  WeakestP, CandMag, Denom: TNeuralFloat;
   Context, CandStr: string;
   TmpI: integer;
 begin
@@ -7180,6 +7471,7 @@ begin
   Result.Finished := False;
   Context := Prompt;
   Past := nil;
+  PastMag := nil;
   PastLen := 0;
   CandHidden := nil;
   // Rule #17: the top-k candidate index scratch is vocab-sized every step; size
@@ -7200,8 +7492,13 @@ begin
         // #17: amortized doubling - Past is addressed by PastLen (never Length),
         // and the cleanup frees [0..PastLen-1], so over-allocated slots are safe.
         if PastLen >= Length(Past) then SetLength(Past, (PastLen + 1) * 2);
+        if PastLen >= Length(PastMag) then
+          SetLength(PastMag, (PastLen + 1) * 2);
         Past[PastLen] := TNNetVolume.Create();
         Past[PastLen].Copy(HiddenLayer.Output);
+        // #5/#27: past states are immutable once captured, so the magnitude is
+        // computed here ONCE instead of once per candidate in the scan below.
+        PastMag[PastLen] := Past[PastLen].GetMagnitude();
         Inc(PastLen);
       end;
       Total := OutputVolume.GetSum();
@@ -7276,11 +7573,20 @@ begin
           NN.Compute(InputVolume, OutputVolume);
           if CandHidden = nil then CandHidden := TNNetVolume.Create();
           CandHidden.Copy(HiddenLayer.Output);
+          // #5: the candidate's magnitude is invariant across the past loop;
+          // past magnitudes were cached at capture, so each pair costs one
+          // DotProduct. Zero magnitude on either side yields Sim = 0 (no
+          // penalty), keeping the score finite for a dead representation.
+          CandMag := CandHidden.GetMagnitude();
           MaxSim := -1e30;
           PastLenM1 := PastLen - 1;
           for J := 0 to PastLenM1 do
           begin
-            Sim := ContrastiveCosine(CandHidden, Past[J]);
+            Denom := CandMag * PastMag[J];
+            if Denom <= 0 then
+              Sim := 0
+            else
+              Sim := CandHidden.DotProduct(Past[J]) / Denom;
             if Sim > MaxSim then MaxSim := Sim;
           end;
         end;
@@ -7336,11 +7642,12 @@ var
   CandP: array of TNeuralFloat;
   Cand: array of integer;
   Past: array of TNNetVolume;
+  PastMag: array of TNeuralFloat;  // magnitudes, cached at capture
   CandHidden: TNNetVolume;
   VocabSize, Pos, CapLen, I, J, NumCand, Best, PastLen, StopLen: integer;
   VocabSizeM1, NumCandM1, PastLenM1, PromptLenM2: integer;
   Total, InvTotal, MaxSim, Sim, ScoreV, BestScore, BestP, PJ: TNeuralFloat;
-  WeakestP: TNeuralFloat;
+  WeakestP, CandMag, Denom: TNeuralFloat;
   TmpI: integer;
 begin
   if Session.Net.GetFirstLayer().Output.SizeX <> 1 then
@@ -7361,6 +7668,7 @@ begin
   if Length(Tokens) < CapLen then SetLength(Tokens, CapLen);
   InV := TNNetVolume.Create(Session.Net.GetFirstLayer().Output);
   Past := nil;
+  PastMag := nil;
   PastLen := 0;
   CandHidden := nil;
   // Rule #17: size the top-k candidate scratch ONCE (function scope); carry
@@ -7383,8 +7691,13 @@ begin
         // #17: amortized doubling - Past is addressed by PastLen (never Length),
         // and cleanup frees [0..PastLen-1], so over-allocated slots are safe.
         if PastLen >= Length(Past) then SetLength(Past, (PastLen + 1) * 2);
+        if PastLen >= Length(PastMag) then
+          SetLength(PastMag, (PastLen + 1) * 2);
         Past[PastLen] := TNNetVolume.Create();
         Past[PastLen].Copy(Session.HiddenState());
+        // #5/#27: past states are immutable once captured - magnitude cached
+        // ONCE here instead of once per candidate in the scan below.
+        PastMag[PastLen] := Past[PastLen].GetMagnitude();
         Inc(PastLen);
       end;
     end;
@@ -7399,8 +7712,11 @@ begin
       begin
         // #17: amortized doubling (see the prefill note above).
         if PastLen >= Length(Past) then SetLength(Past, (PastLen + 1) * 2);
+        if PastLen >= Length(PastMag) then
+          SetLength(PastMag, (PastLen + 1) * 2);
         Past[PastLen] := TNNetVolume.Create();
         Past[PastLen].Copy(Session.HiddenState());
+        PastMag[PastLen] := Past[PastLen].GetMagnitude();
         Inc(PastLen);
       end;
       Row := Session.Output();
@@ -7475,11 +7791,19 @@ begin
           if CandHidden = nil then CandHidden := TNNetVolume.Create();
           CandHidden.Copy(Session.HiddenState());
           Session.TruncateTo(Pos);
+          // #5: candidate magnitude invariant across the past loop; past
+          // magnitudes cached at capture, so each pair costs one DotProduct.
+          // Zero magnitude on either side yields Sim = 0 (no penalty).
+          CandMag := CandHidden.GetMagnitude();
           MaxSim := -1e30;
           PastLenM1 := PastLen - 1;
           for J := 0 to PastLenM1 do
           begin
-            Sim := ContrastiveCosine(CandHidden, Past[J]);
+            Denom := CandMag * PastMag[J];
+            if Denom <= 0 then
+              Sim := 0
+            else
+              Sim := CandHidden.DotProduct(Past[J]) / Denom;
             if Sim > MaxSim then MaxSim := Sim;
           end;
         end;
@@ -7745,15 +8069,21 @@ var
   // Final distribution, the candidate lens row being scored, and the winning
   // candidate's row kept from the scoring pass.
   PFinal, PLens, PBestLens, SwapLens: array of TNeuralFloat;
+  // Scratch rows for the bulk JS evaluation: the mixture m = 0.5(Pf+Pl) (ln'd
+  // in place) and a clamped-log row (lnPf per step, then lnPl per candidate).
+  MRow, LnRow: array of TNeuralFloat;
   Cands: TNeuralIntegerArray;
   VocabSize, Step, I, C, L, HeadIdx, HeadInIdx, LastLayer: integer;
   NumCand, Best, StopLen, VocabSizeM1, NumCandM1: integer;
-  Total, MaxFinal, Threshold, JS, BestJS, Pf, Pl, Pm, ScoreV, BestScore: TNeuralFloat;
-  InvTotal, InvPm: TNeuralFloat;
+  Total, MaxFinal, Threshold, JS, BestJS, Pf, Pl, ScoreV, BestScore: TNeuralFloat;
+  InvTotal, DotPfLnPf: TNeuralFloat;
   Context: string;
   HaveContrast: boolean;
 const
   cEps = 1e-12;
+  // ReluL high limit for the floor clamp: far above any probability, so only
+  // the cEps floor ever fires.
+  cLnHi = 1e30;
 begin
   InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
   OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
@@ -7763,6 +8093,8 @@ begin
   SetLength(PFinal, VocabSize);
   SetLength(PLens, VocabSize);
   SetLength(PBestLens, VocabSize);
+  SetLength(MRow, VocabSize);
+  SetLength(LnRow, VocabSize);
   LastLayer := NN.GetLastLayerIdx();
   HeadIdx := ResolveHeadStartIdx(NN, HeadStartIdx);
   HeadInIdx := HeadIdx - 1;
@@ -7809,7 +8141,24 @@ begin
         //         net after the full forward above (no extra forward needed);
         //         snapshot it, splice into the head-input slot, recompute the
         //         head sub-stack, read p_premature.
+        // JS(p||q) = 0.5 KL(p||m) + 0.5 KL(q||m), m = 0.5(p+q), expanded to
+        // dot products so the logs run through the 8-wide Ln kernel instead of
+        // 2 scalar pcr_logf per vocab element (#13/#19):
+        //   JS = 0.5*[dot(Pf,lnPf) - dot(Pf,lnM) + dot(Pl,lnPl) - dot(Pl,lnM)]
+        // dot(Pf,lnPf) is invariant across the candidate loop (#5): once here.
+        // Each Ln INPUT is floor-clamped to cEps first (ReluL with Slope=0 is
+        // exactly that clamp); the dot-product WEIGHTS stay unclamped, so a
+        // zero probability contributes exactly 0*ln(cEps) = 0 and only terms
+        // with a sub-cEps nonzero probability are perturbed (the scalar form
+        // skipped those via its cEps guards). JS only RANKS candidate layers,
+        // so an O(cEps*|ln cEps|) ranking-only perturbation is safe.
         BestJS := -1.0;
+        TNNetVolume.ReluL(TNeuralFloatArrPtr(@LnRow[0]),
+          TNeuralFloatArrPtr(@PFinal[0]), cEps, cLnHi, 0, VocabSize);
+        TNNetVolume.Ln(TNeuralFloatArrPtr(@LnRow[0]),
+          TNeuralFloatArrPtr(@LnRow[0]), VocabSize);
+        DotPfLnPf := TNNetVolume.DotProduct(TNeuralFloatArrPtr(@PFinal[0]),
+          TNeuralFloatArrPtr(@LnRow[0]), VocabSize);
         for C := 0 to NumCandM1 do
         begin
           L := Cands[C];
@@ -7831,23 +8180,26 @@ begin
           TNNetVolume.Relu(TNeuralFloatArrPtr(@PLens[0]), LensOut.DataPtr,
             VocabSize);
           TNNetVolume.Mul(TNeuralFloatArrPtr(@PLens[0]), InvTotal, VocabSize);
-          // JS(p_final || p_lens) = 0.5 KL(p||m) + 0.5 KL(q||m), m = 0.5(p+q).
-          // #4/#5: Pm lives in a local, and #21: both logs divide by that same
-          // Pm, so one reciprocal replaces the two divides - JS only ranks
-          // candidate layers, so no gradient check watches this arithmetic.
-          JS := 0;
-          for I := 0 to VocabSizeM1 do
-          begin
-            Pl := PLens[I];
-            Pf := PFinal[I];
-            Pm := 0.5 * (Pf + Pl);
-            if Pm < cEps then Continue;
-            InvPm := 1.0 / Pm;
-            // Rule #16: JS only ranks candidate layers (if JS > BestJS), so the
-            // fast Cephes logf is safe here; 2*Vocab*NumCand RTL Ln removed/token.
-            if Pf >= cEps then JS := JS + 0.5 * Pf * pcr_logf(Pf * InvPm);
-            if Pl >= cEps then JS := JS + 0.5 * Pl * pcr_logf(Pl * InvPm);
-          end;
+          // m = 0.5*Pf + 0.5*Pl into the scratch row, then two bulk Ln passes
+          // and three DotProducts form the JS terms (see the expansion above).
+          Move(PLens[0], MRow[0], VocabSize * csNeuralFloatSize);
+          TNNetVolume.MulMulAdd(TNeuralFloatArrPtr(@MRow[0]),
+            TNeuralFloatArrPtr(@PFinal[0]), 0.5, 0.5, VocabSize);
+          TNNetVolume.ReluL(TNeuralFloatArrPtr(@MRow[0]),
+            TNeuralFloatArrPtr(@MRow[0]), cEps, cLnHi, 0, VocabSize);
+          TNNetVolume.Ln(TNeuralFloatArrPtr(@MRow[0]),
+            TNeuralFloatArrPtr(@MRow[0]), VocabSize);
+          TNNetVolume.ReluL(TNeuralFloatArrPtr(@LnRow[0]),
+            TNeuralFloatArrPtr(@PLens[0]), cEps, cLnHi, 0, VocabSize);
+          TNNetVolume.Ln(TNeuralFloatArrPtr(@LnRow[0]),
+            TNeuralFloatArrPtr(@LnRow[0]), VocabSize);
+          JS := 0.5 * (DotPfLnPf
+            - TNNetVolume.DotProduct(TNeuralFloatArrPtr(@PFinal[0]),
+                TNeuralFloatArrPtr(@MRow[0]), VocabSize)
+            + TNNetVolume.DotProduct(TNeuralFloatArrPtr(@PLens[0]),
+                TNeuralFloatArrPtr(@LnRow[0]), VocabSize)
+            - TNNetVolume.DotProduct(TNeuralFloatArrPtr(@PLens[0]),
+                TNeuralFloatArrPtr(@MRow[0]), VocabSize));
           // #27: the winner's distribution is already in hand, so keep it here
           // instead of re-splicing and re-running the head sub-stack for it
           // below. The head recompute cannot touch a candidate layer's own

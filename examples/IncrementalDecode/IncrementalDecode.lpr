@@ -99,6 +99,7 @@ var
   Session: TNNetStreamingDecoder;
   FullIn, StepIn, FullOut, StepOut: TNNetVolume;
   T, D: integer;
+  RowBytes: integer;
   Diff, MaxDiff: TNeuralFloat;
 begin
   NNFull := TNNet.Create();
@@ -114,9 +115,10 @@ begin
   FullOut := TNNetVolume.Create();
   StepOut := TNNetVolume.Create();
   try
-    for T := 0 to cCheckLen - 1 do
-      for D := 0 to 3 * cDk - 1 do
-        FullIn[T, 0, D] := MasterSeq[T, 0, D];
+    // Both volumes store contiguous (T,0,D) depth runs from row 0: one Move
+    // replaces the per-element accessor round-trips.
+    RowBytes := 3 * cDk * csNeuralFloatSize;
+    Move(MasterSeq.FData[0], FullIn.FData[0], cCheckLen * RowBytes);
     NNFull.Compute(FullIn);
     NNFull.GetOutput(FullOut);
 
@@ -124,8 +126,7 @@ begin
     MaxDiff := 0;
     for T := 0 to cCheckLen - 1 do
     begin
-      for D := 0 to 3 * cDk - 1 do
-        StepIn[0, 0, D] := FullIn[T, 0, D];
+      Move(FullIn.FData[FullIn.GetRawPos(T, 0)], StepIn.FData[0], RowBytes);
       Session.StepForward(StepIn, T);
       NNStep.GetOutput(StepOut);
       for D := 0 to cDk - 1 do
@@ -163,7 +164,7 @@ function TimeFullForwardPerStep(Len: integer): double;
 var
   NN: TNNet;
   InV: TNNetVolume;
-  T, D, Rep, Reps: integer;
+  Rep, Reps: integer;
   T0: double;
 begin
   // Each full forward is large; a handful of reps is plenty for stable ms
@@ -174,9 +175,8 @@ begin
   NN.AddLayer(TNNetScaledDotProductAttention.Create(cDk, true));
   InV := TNNetVolume.Create(Len, 1, 3 * cDk);
   try
-    for T := 0 to Len - 1 do
-      for D := 0 to 3 * cDk - 1 do
-        InV[T, 0, D] := MasterSeq[T, 0, D];
+    // Contiguous prefix rows shared with MasterSeq: one Move seeds them all.
+    Move(MasterSeq.FData[0], InV.FData[0], Len * 3 * cDk * csNeuralFloatSize);
     NN.Compute(InV); // warm-up
     T0 := NowMs();
     for Rep := 1 to Reps do
@@ -196,7 +196,8 @@ var
   NN: TNNet;
   Session: TNNetStreamingDecoder;
   StepIn: TNNetVolume;
-  T, D, C: integer;
+  T, C: integer;
+  RowBytes: integer;
   T0: double;
   WindowStart: array[0..High(cCheckpoints)] of integer;
 begin
@@ -210,10 +211,12 @@ begin
   try
     Session.Reset();
     T0 := 0;
+    // One contiguous Move per token: the fill sits inside the timed window,
+    // so per-element accessor copies would skew the cached-step numbers.
+    RowBytes := 3 * cDk * csNeuralFloatSize;
     for T := 0 to cMaxLen - 1 do
     begin
-      for D := 0 to 3 * cDk - 1 do
-        StepIn[0, 0, D] := MasterSeq[T, 0, D];
+      Move(MasterSeq.FData[MasterSeq.GetRawPos(T, 0)], StepIn.FData[0], RowBytes);
       for C := 0 to High(cCheckpoints) do
         if T = WindowStart[C] then T0 := NowMs();
       Session.StepForward(StepIn, T);
@@ -244,6 +247,7 @@ var
   Session: TNNetStreamingDecoder;
   FullIn, StepIn, FullOut, StepOut: TNNetVolume;
   T, D: integer;
+  RowBytes: integer;
   Diff, MaxDiff: TNeuralFloat;
 begin
   NNFull := TNNet.Create();
@@ -271,9 +275,10 @@ begin
       SSMFull.Neurons[3].Weights.FData[D] := (Random(2000) - 1000) / 1000;
     end;
     SSMStep.CopyWeights(SSMFull);
-    for T := 0 to cCheckLen - 1 do
-      for D := 0 to cSSMDepth - 1 do
-        FullIn[T, 0, D] := MasterSeq[T, 0, D];
+    // Contiguous (T,0,D) depth runs from row 0: bulk Move instead of the
+    // per-element accessor round-trips.
+    RowBytes := cSSMDepth * csNeuralFloatSize;
+    Move(MasterSeq.FData[0], FullIn.FData[0], cCheckLen * RowBytes);
     NNFull.Compute(FullIn);
     NNFull.GetOutput(FullOut);
 
@@ -281,8 +286,7 @@ begin
     MaxDiff := 0;
     for T := 0 to cCheckLen - 1 do
     begin
-      for D := 0 to cSSMDepth - 1 do
-        StepIn[0, 0, D] := FullIn[T, 0, D];
+      Move(FullIn.FData[FullIn.GetRawPos(T, 0)], StepIn.FData[0], RowBytes);
       Session.StepForward(StepIn, T);
       NNStep.GetOutput(StepOut);
       for D := 0 to cSSMDepth - 1 do
@@ -317,7 +321,7 @@ function TimeSSMFullForwardPerStep(Len: integer): double;
 var
   NN: TNNet;
   InV: TNNetVolume;
-  T, D, Rep, Reps: integer;
+  Rep, Reps: integer;
   T0: double;
 begin
   Reps := Max(8, 4096 div Len);
@@ -326,9 +330,8 @@ begin
   NN.AddLayer(TNNetDiagonalSSM.Create());
   InV := TNNetVolume.Create(Len, 1, cSSMDepth);
   try
-    for T := 0 to Len - 1 do
-      for D := 0 to cSSMDepth - 1 do
-        InV[T, 0, D] := MasterSeq[T, 0, D];
+    // Contiguous prefix rows shared with MasterSeq: one Move seeds them all.
+    Move(MasterSeq.FData[0], InV.FData[0], Len * cSSMDepth * csNeuralFloatSize);
     NN.Compute(InV); // warm-up
     T0 := NowMs();
     for Rep := 1 to Reps do
@@ -349,7 +352,8 @@ var
   NN: TNNet;
   Session: TNNetStreamingDecoder;
   StepIn: TNNetVolume;
-  T, D, C: integer;
+  T, C: integer;
+  RowBytes: integer;
   T0: double;
   WindowStart: array[0..High(cCheckpoints)] of integer;
 begin
@@ -363,10 +367,12 @@ begin
   try
     Session.Reset();
     T0 := 0;
+    // One contiguous Move per token: the fill sits inside the timed window,
+    // so per-element accessor copies would skew the incremental numbers.
+    RowBytes := cSSMDepth * csNeuralFloatSize;
     for T := 0 to cMaxLen - 1 do
     begin
-      for D := 0 to cSSMDepth - 1 do
-        StepIn[0, 0, D] := MasterSeq[T, 0, D];
+      Move(MasterSeq.FData[MasterSeq.GetRawPos(T, 0)], StepIn.FData[0], RowBytes);
       for C := 0 to High(cCheckpoints) do
         if T = WindowStart[C] then T0 := NowMs();
       Session.StepForward(StepIn, T);

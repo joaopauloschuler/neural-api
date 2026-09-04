@@ -251,18 +251,21 @@ end;
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Packs [gray | RGB] into a 4-channel discriminator input volume.
+// Packs [gray | RGB] into a 4-channel discriminator input volume. All three
+// volumes are walked in layout order, so three running offsets (depth 4 / 1 /
+// 3 per pixel) replace eight accessor offset computations per pixel.
 procedure PackPair(Dst, Gray, Rgb: TNNetVolume);
-var X, Y: integer;
+var Pixel, dOff, gOff, rOff: integer;
 begin
-  for Y := 0 to cGrid - 1 do
-    for X := 0 to cGrid - 1 do
-    begin
-      Dst[X, Y, 0] := Gray[X, Y, 0];
-      Dst[X, Y, 1] := Rgb[X, Y, 0];
-      Dst[X, Y, 2] := Rgb[X, Y, 1];
-      Dst[X, Y, 3] := Rgb[X, Y, 2];
-    end;
+  dOff := 0; gOff := 0; rOff := 0;
+  for Pixel := 1 to cGrid * cGrid do
+  begin
+    Dst.FData[dOff]     := Gray.FData[gOff];
+    Dst.FData[dOff + 1] := Rgb.FData[rOff];
+    Dst.FData[dOff + 2] := Rgb.FData[rOff + 1];
+    Dst.FData[dOff + 3] := Rgb.FData[rOff + 2];
+    Inc(dOff, 4); Inc(gOff); Inc(rOff, 3);
+  end;
 end;
 
 // ---------------------------------------------------------------------------
@@ -284,29 +287,36 @@ end;
 procedure Evaluate(G: TNNet; const Grays, Colors: TVolArray; const Cls: TLabelArray;
   out MeanL1, ColorAcc: TNeuralFloat);
 var
-  I, X, Y, N, Correct, Total: integer;
-  Out_: TNNetVolume;
-  SumL1: TNeuralFloat;
+  I, X, Y, N, Correct, Total, Off: integer;
+  Out_, Cv: TNNetVolume;
+  SumL1, R, Gc, B: TNeuralFloat;
 begin
   N := Length(Grays);
   SumL1 := 0; Correct := 0; Total := 0;
+  // The last layer's Output object is stable across Compute calls.
+  Out_ := G.GetLastLayer().Output;
   for I := 0 to N - 1 do
   begin
     G.Compute(Grays[I]);
-    Out_ := G.GetLastLayer().Output;
+    Cv := Colors[I];
+    // Out_ and Cv share the (cGrid, cGrid, 3) layout: one running offset
+    // serves both; raw Abs sums accumulate and the /3 happens once at the end.
+    Off := 0;
     for Y := 0 to cGrid - 1 do
       for X := 0 to cGrid - 1 do
       begin
-        SumL1 := SumL1 +
-          (Abs(Out_[X, Y, 0] - Colors[I][X, Y, 0]) +
-           Abs(Out_[X, Y, 1] - Colors[I][X, Y, 1]) +
-           Abs(Out_[X, Y, 2] - Colors[I][X, Y, 2])) / 3;
-        if ColorClass(Out_[X, Y, 0], Out_[X, Y, 1], Out_[X, Y, 2]) = Round(Cls[I][X, Y, 0]) then
+        R  := Out_.FData[Off];
+        Gc := Out_.FData[Off + 1];
+        B  := Out_.FData[Off + 2];
+        SumL1 := SumL1 + Abs(R - Cv.FData[Off]) + Abs(Gc - Cv.FData[Off + 1]) +
+          Abs(B - Cv.FData[Off + 2]);
+        if ColorClass(R, Gc, B) = Round(Cls[I][X, Y, 0]) then
           Inc(Correct);
         Inc(Total);
+        Inc(Off, 3);
       end;
   end;
-  MeanL1 := SumL1 / Total;
+  MeanL1 := SumL1 / 3 / Total;
   ColorAcc := Correct / Total;
 end;
 
@@ -415,10 +425,11 @@ var
   G, D: TNNet;
   Grays, Colors, TGrays, TColors: TVolArray;
   Cls, TCls: TLabelArray;
-  Epoch, Step, Idx, X, Y: integer;
+  Epoch, Step, Idx, Pixel, POff, DOff: integer;
   FakePair, RealPair, Ones, Zeros: TNNetVolume;
-  GOut, GErr, DInGrad: TNNetVolume;
-  L1, Acc: TNeuralFloat;
+  GOut, GErrV, DInGrad, Cv: TNNetVolume;
+  GLast: TNNetLayer;
+  L1, Acc, kL1: TNeuralFloat;
   T0: TDateTime;
   PatchW, PatchH: integer;
 begin
@@ -452,9 +463,16 @@ begin
   // Scratch volumes.
   FakePair := TNNetVolume.Create(cGrid, cGrid, 4);
   RealPair := TNNetVolume.Create(cGrid, cGrid, 4);
-  GErr     := TNNetVolume.Create(cGrid, cGrid, 3);
   Ones  := TNNetVolume.Create(PatchW, PatchH, 1); Ones.Fill(1);
   Zeros := TNNetVolume.Create(PatchW, PatchH, 1); Zeros.Fill(0);
+
+  // Step-invariant bindings: the layer objects and their Output/OutputError
+  // volumes are stable across Compute calls, and the L1 scale is constant.
+  GLast   := G.GetLastLayer();
+  GOut    := GLast.Output;
+  GErrV   := GLast.OutputError;          // (cGrid, cGrid, 3), fully overwritten per step
+  DInGrad := D.Layers[0].OutputError;    // 4-ch grad w.r.t. [gray|R|G|B]
+  kL1     := cLambdaL1 / (cGrid * cGrid);
 
   try
     WriteLn('Training...');
@@ -470,7 +488,6 @@ begin
 
         // ---- 1) Generator forward -------------------------------------
         G.Compute(Grays[Idx]);
-        GOut := G.GetLastLayer().Output;
 
         // ---- 2) Train discriminator -----------------------------------
         PackPair(RealPair, Grays[Idx], Colors[Idx]);
@@ -486,25 +503,31 @@ begin
         D.SetLearningRate(0, 0.5);
         D.Compute(FakePair);
         D.Backpropagate(Ones);                 // want D to call fake "real"
-        DInGrad := D.Layers[0].OutputError;    // 4-ch grad w.r.t. [gray|R|G|B]
         D.SetLearningRate(gDLearnRate, 0.5);
 
-        for Y := 0 to cGrid - 1 do
-          for X := 0 to cGrid - 1 do
-          begin
-            // adversarial gradient on the RGB channels (1..3 of D input)
-            // + L1 reconstruction gradient lambda * sign(fake - target).
-            GErr[X, Y, 0] := DInGrad[X, Y, 1] +
-              cLambdaL1 * Sign(GOut[X, Y, 0] - Colors[Idx][X, Y, 0]) / (cGrid * cGrid);
-            GErr[X, Y, 1] := DInGrad[X, Y, 2] +
-              cLambdaL1 * Sign(GOut[X, Y, 1] - Colors[Idx][X, Y, 1]) / (cGrid * cGrid);
-            GErr[X, Y, 2] := DInGrad[X, Y, 3] +
-              cLambdaL1 * Sign(GOut[X, Y, 2] - Colors[Idx][X, Y, 2]) / (cGrid * cGrid);
-          end;
+        // Adversarial gradient on the RGB channels (1..3 of D input) + L1
+        // reconstruction gradient lambda * sign(fake - target), written
+        // straight into G's last-layer OutputError (every element is set, so
+        // no scratch copy is needed). GOut/GErrV/Cv share the depth-3 layout
+        // (one running offset), DInGrad is depth-4 (its own offset). Sign()
+        // keeps the body scalar.
+        Cv := Colors[Idx];
+        POff := 0;
+        DOff := 0;
+        for Pixel := 1 to cGrid * cGrid do
+        begin
+          GErrV.FData[POff] := DInGrad.FData[DOff + 1] +
+            kL1 * Sign(GOut.FData[POff] - Cv.FData[POff]);
+          GErrV.FData[POff + 1] := DInGrad.FData[DOff + 2] +
+            kL1 * Sign(GOut.FData[POff + 1] - Cv.FData[POff + 1]);
+          GErrV.FData[POff + 2] := DInGrad.FData[DOff + 3] +
+            kL1 * Sign(GOut.FData[POff + 2] - Cv.FData[POff + 2]);
+          Inc(POff, 3);
+          Inc(DOff, 4);
+        end;
 
         G.ResetBackpropCallCurrCnt();
-        G.GetLastLayer().OutputError.Copy(GErr);
-        G.GetLastLayer().Backpropagate();
+        GLast.Backpropagate();
       end;
 
       if (Epoch = 1) or (Epoch mod 5 = 0) or (Epoch = gEpochs) then
@@ -523,7 +546,7 @@ begin
     WritePPM(G, TGrays, TColors, 0, 'pix2pix_sample.ppm');
 
   finally
-    FakePair.Free; RealPair.Free; GErr.Free; Ones.Free; Zeros.Free;
+    FakePair.Free; RealPair.Free; Ones.Free; Zeros.Free;
     G.Free; D.Free;
     FreeDataset(Grays, Colors, Cls);
     FreeDataset(TGrays, TColors, TCls);

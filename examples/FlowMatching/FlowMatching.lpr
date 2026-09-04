@@ -208,18 +208,18 @@ var
   // byte/127.5 - 1 (identical convention to the DDPM example).
   procedure LoadCleanDigit(Src: TNNetVolume);
   var
-    x, y: integer;
-    v, b: TNeuralFloat;
+    i, MaxPos: integer;
+    b: TNeuralFloat;
   begin
-    for y := 0 to cImgSize - 1 do
-      for x := 0 to cImgSize - 1 do
-      begin
-        v := Src[x, y, 0];
-        b := (v + 2.0) * 64.0;        // approx original 0..255 byte
-        if b < 0 then b := 0;
-        if b > 255 then b := 255;
-        X1[x, y, 0] := b / 127.5 - 1.0;
-      end;
+    // Elementwise map over the whole (28,28,1) image: one flat pass over FData.
+    MaxPos := X1.Size - 1;
+    for i := 0 to MaxPos do
+    begin
+      b := (Src.FData[i] + 2.0) * 64.0;   // approx original 0..255 byte
+      if b < 0 then b := 0;
+      if b > 255 then b := 255;
+      X1.FData[i] := b / 127.5 - 1.0;
+    end;
   end;
 
   // Build the flow-matching training pair for a continuous time t in [0,1]:
@@ -227,15 +227,18 @@ var
   //   Xt = (1-t)*X0 + t*X1,  VTrue = X1 - X0  (the constant velocity target).
   procedure MakeInterpolant(t: TNeuralFloat);
   var
-    i: integer;
-    x0v: TNeuralFloat;
+    i, MaxPos: integer;
+    x0v, x1v, omt: TNeuralFloat;
   begin
-    for i := 0 to X1.Size - 1 do
+    omt := 1.0 - t;
+    MaxPos := X1.Size - 1;
+    for i := 0 to MaxPos do
     begin
       x0v := RandG(0, 1);
+      x1v := X1.FData[i];
       X0.FData[i] := x0v;
-      Xt.FData[i] := (1.0 - t) * x0v + t * X1.FData[i];
-      VTrue.FData[i] := X1.FData[i] - x0v;
+      Xt.FData[i] := omt * x0v + t * x1v;
+      VTrue.FData[i] := x1v - x0v;
     end;
   end;
 
@@ -249,19 +252,9 @@ var
 
   // Mean-squared error between the network's v_hat and the true velocity.
   function VelMSE: TNeuralFloat;
-  var
-    i: integer;
-    d, s: TNeuralFloat;
-    Pred: TNNetVolume;
   begin
-    Pred := NN.GetLastLayer.Output;
-    s := 0;
-    for i := 0 to VTrue.Size - 1 do
-    begin
-      d := Pred.FData[i] - VTrue.FData[i];
-      s := s + d * d;
-    end;
-    Result := s / VTrue.Size;
+    // SIMD sum of squared differences over the whole velocity map.
+    Result := NN.GetLastLayer.Output.GetDistanceSqr(VTrue) / VTrue.Size;
   end;
 
   procedure TrainLoop;
@@ -307,7 +300,6 @@ var
   var
     k, i: integer;
     t, dt: TNeuralFloat;
-    V: TNNetVolume;
   begin
     dt := 1.0 / NumSteps;
     for i := 0 to Dst.Size - 1 do
@@ -317,9 +309,7 @@ var
       t := k * dt;                       // current time along the path
       SetTimeInput(t);
       NN.Compute([Dst, TimeVol]);
-      V := NN.GetLastLayer.Output;
-      for i := 0 to Dst.Size - 1 do
-        Dst.FData[i] := Dst.FData[i] + dt * V.FData[i];
+      Dst.MulAdd(dt, NN.GetLastLayer.Output);   // x += dt * v_theta (SIMD)
     end;
   end;
 

@@ -19,6 +19,7 @@ type
     procedure TestFullyConnectedForward;
     procedure TestFullConnectThreadingParity;
     procedure TestWillThreadParallelPassParity;
+    procedure TestComputeEndLayerIdx;
     procedure TestConvolutionWillThreadParity;
     procedure TestConvolutionColdParallelParity;
     procedure TestConvolutionLowMemoryChunkParity;
@@ -373,6 +374,89 @@ begin
   finally
     Input.Free;
     SerialOut.Free;
+    NN.Free;
+  end;
+end;
+
+// TNNet.Compute with an end layer index: a two-branch net (Input -> two
+// FullConnect branches -> DeepConcat -> two more FullConnects) is cut at the
+// DeepConcat on the serial loop and on the layer-graph scheduler. The layers
+// up to the cut must equal the full forward bit for bit, the layers past it
+// must not run (their outputs keep a sentinel), and a full forward after the
+// cut must still reproduce the reference. Coded by Claude (AI).
+procedure TTestNeuralLayers.TestComputeEndLayerIdx;
+const
+  Sentinel = -12345.0;
+var
+  NN: TNNet;
+  Input, FullConcat, FullOut: TNNetVolume;
+  InputLayer, Branch1, Branch2, Concat: TNNetLayer;
+  Layer: TNNetLayer;
+  i, LayerCnt, neuron, w, EndIdx, MaxLayerPos: integer;
+  FC: TNNetFullConnect;
+
+  procedure CheckCut(Parallel: boolean; const Mode: string);
+  var
+    Pos, Idx: integer;
+  begin
+    for Idx := EndIdx + 1 to MaxLayerPos do NN.Layers[Idx].Output.Fill(Sentinel);
+    Concat.Output.Fill(0);
+    NN.Compute(Input, 0, Parallel, EndIdx);
+    for Pos := 0 to FullConcat.Size - 1 do
+      AssertTrue(Mode + ': the end layer matches the full forward at ' +
+        IntToStr(Pos), FullConcat.Raw[Pos] = Concat.Output.Raw[Pos]);
+    for Idx := EndIdx + 1 to MaxLayerPos do
+      for Pos := 0 to NN.Layers[Idx].Output.Size - 1 do
+        AssertTrue(Mode + ': layer ' + IntToStr(Idx) + ' past the end ran',
+          NN.Layers[Idx].Output.Raw[Pos] = Sentinel);
+    NN.Compute(Input, 0, Parallel);
+    for Pos := 0 to FullOut.Size - 1 do
+      AssertTrue(Mode + ': the full forward after the cut matches at ' +
+        IntToStr(Pos), FullOut.Raw[Pos] = NN.GetLastLayer().Output.Raw[Pos]);
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(64, 1, 1);
+  FullConcat := TNNetVolume.Create();
+  FullOut := TNNetVolume.Create();
+  try
+    InputLayer := NN.AddLayer(TNNetInput.Create(64));
+    Branch1 := NN.AddLayerAfter(TNNetFullConnectLinear.Create(1, 1, 32), InputLayer);
+    Branch2 := NN.AddLayerAfter(TNNetFullConnectReLU.Create(1, 1, 16), InputLayer);
+    Concat := NN.AddLayer(TNNetDeepConcat.Create([Branch1, Branch2]));
+    NN.AddLayer(TNNetFullConnectReLU.Create(1, 1, 8));
+    NN.AddLayer(TNNetFullConnectLinear.Create(1, 1, 4));
+    MaxLayerPos := NN.CountLayers() - 1;
+    EndIdx := Concat.LayerIdx;
+    AssertTrue('two layers sit past the cut', MaxLayerPos = EndIdx + 2);
+    for LayerCnt := 0 to MaxLayerPos do
+    begin
+      Layer := NN.Layers[LayerCnt];
+      if Layer is TNNetFullConnect then
+      begin
+        FC := TNNetFullConnect(Layer);
+        for neuron := 0 to FC.Neurons.Count - 1 do
+        begin
+          for w := 0 to FC.Neurons[neuron].Weights.Size - 1 do
+            FC.Neurons[neuron].Weights.Raw[w] :=
+              Sin(LayerCnt * 1.7 + neuron * 0.013 + w * 0.0007) * 0.1;
+          FC.Neurons[neuron].BiasWeight := Cos(neuron * 0.021) * 0.05;
+        end;
+      end;
+    end;
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.05) - 0.3;
+    NN.SetTrainable(False);
+    NN.Compute(Input);
+    FullConcat.Copy(Concat.Output);
+    FullOut.Copy(NN.GetLastLayer().Output);
+    AssertTrue('the reference output is non-trivial', FullOut.GetSumAbs() > 0.0);
+    CheckCut(False, 'serial');
+    CheckCut(True, 'parallel');
+  finally
+    FullOut.Free;
+    FullConcat.Free;
+    Input.Free;
     NN.Free;
   end;
 end;

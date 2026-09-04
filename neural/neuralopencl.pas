@@ -64,6 +64,18 @@ const
   /// Bytes per OpenCL half. There is no Pascal type for it: the FP16 B
   /// operand is only ever written and read by device kernels.
   csHalfSize = 2;
+  /// Tile geometry of cai_dot_product_int8_tiled / _tiled_h / _int4_tiled
+  /// (the CAI_TILED_* defines in neural.cl; the launch geometry derives from
+  /// them, so the two copies must agree): lanes per work-group, rows per
+  /// lane and columns per tile.
+  csTiledGemmLanes = 64;
+  csTiledGemmRowsPerLane = 2;
+  csTiledGemmCols = 16;
+  /// Columns (FNumBs) from which ComputeResidentCodes takes the tiled GEMM:
+  /// one full column tile. Below it the tile would multiply zero-padded
+  /// columns, while the existing kernels re-read each weight row only a
+  /// handful of times.
+  csTiledGemmMinColumns = csTiledGemmCols;
 
 type
   TPlatformNames = array of string;
@@ -83,6 +95,12 @@ type
     // Cached CL_DEVICE_MAX_COMPUTE_UNITS of FCurrentDevice, 0 while not
     // yet queried. The int8 launch sizer asks for it per GEMM per token.
     FMaxComputeUnits: integer;
+    // Cached CL_DEVICE_MAX_WORK_GROUP_SIZE of FCurrentDevice, 0 while not
+    // yet queried.
+    FMaxWorkGroupSize: integer;
+    // Cached CL_DEVICE_LOCAL_MEM_SIZE of FCurrentDevice in bytes, 0 while not
+    // yet queried.
+    FLocalMemSize: integer;
     FOpenCLProgramSource: TStringList;
 
     FContext: cl_context;        // OpenCL compute context
@@ -138,6 +156,9 @@ type
     // persistent buffer without moving the whole allocation.
     function WriteBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_FALSE): integer;
     function ReadBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool = CL_TRUE): integer;
+    // Enqueues a cb-byte copy from src to dst on this queue, both in OpenCL
+    // memory; ordered after earlier work on the queue and returns at once.
+    function CopyBuffer(src, dst: cl_mem; cb: csize_t): integer;
 
     function CreateInputBuffer(size: csize_t): cl_mem; overload; {$IFDEF Release} inline; {$ENDIF}
     function CreateHostInputBuffer(size: csize_t; ptr: Pointer): cl_mem; overload; {$IFDEF Release} inline; {$ENDIF}
@@ -149,6 +170,18 @@ type
     // fails. Cached after the first call. Sizes launches that must fill the
     // device to run at speed.
     function DeviceMaxComputeUnits(): integer;
+    // CL_DEVICE_MAX_WORK_GROUP_SIZE of the current device, 1 when the query
+    // fails. Cached after the first call.
+    function DeviceMaxWorkGroupSize(): integer;
+    // CL_DEVICE_LOCAL_MEM_SIZE of the current device in bytes, capped at
+    // MaxInt; 16 KB when the query fails. Cached after the first call.
+    function DeviceLocalMemSize(): integer;
+    // CL_KERNEL_WORK_GROUP_SIZE of pKernel on the current device (register
+    // use can cap it below the device limit), 0 when the query fails.
+    function KernelMaxWorkGroupSize(pKernel: cl_kernel): integer;
+    // CL_KERNEL_LOCAL_MEM_SIZE of pKernel on the current device: the local
+    // memory the kernel declares itself, in bytes; 0 when the query fails.
+    function KernelLocalMemSize(pKernel: cl_kernel): integer;
     function RunKernel(pkernel:cl_kernel; ThreadCount: integer): integer;
     function RunKernel2D(pkernel:cl_kernel; d1size, d2size: csize_t): integer; overload;
     function RunKernel2D(pkernel:cl_kernel; d1size, d2size, d1groupsize, d2groupsize: csize_t): integer; overload;
@@ -360,6 +393,51 @@ type
       FBoundSplits, FBoundNumAs, FBoundNumBs, FBoundSize: longint;
       FBoundPartialBuffer, FBoundCodesBuffer: cl_mem;
       FBoundResultBuffer, FBoundScalesBuffer, FBoundBlockScalesBuffer: cl_mem;
+      /// Private clones of the single-launch entry points, created lazily on
+      /// first use (the split-K recipe). The injected FDotProductKernel /
+      /// FInt8Kernel / FFP16Kernel handles are net-wide in the default
+      /// shared-kernel mode, so their cl_kernel argument state is rewritten by
+      /// every other layer between this instance's launches - argument caching
+      /// is only sound on a handle this instance owns. Launches still ride
+      /// FDotProductKernel's in-order queue. Coded by Claude (AI).
+      FMainKernel: cl_kernel;
+      FSinglePassKernel: cl_kernel;
+      /// Last tuple bound into FMainKernel by Compute: shape (args 0-3), the A
+      /// operand (5), the result (7) and the bias pair (8/9) survive from
+      /// launch to launch; only the activation (4) and the B operand (6) are
+      /// set per call. Cleared with the handle by UnprepareForCompute; a buffer
+      /// swapped by ReallocateBuffersIfRequired or a bias (re)allocation misses
+      /// the value compare and rebinds. Coded by Claude (AI).
+      FMainArgsBound: boolean;
+      FBoundMainThreadCount, FBoundMainNumAs, FBoundMainNumBs: longint;
+      FBoundMainSize, FBoundMainUseBias: longint;
+      FBoundMainAsBuffer, FBoundMainResultBuffer, FBoundMainBiasBuffer: cl_mem;
+      /// Single-pass twin for ComputeResidentCodes: shape (args 0-3), codes
+      /// (5), result (7) and scales (10) are fixed after
+      /// PrepareForComputeInt8/Int4 (both start from UnprepareForCompute, which
+      /// clears this); the activation (4), B operand (6) and bias pair (8/9)
+      /// are set per call. Coded by Claude (AI).
+      FSinglePassArgsBound: boolean;
+      FBoundSPThreadCount, FBoundSPNumAs, FBoundSPNumBs, FBoundSPSize: longint;
+      FBoundSPCodesBuffer, FBoundSPResultBuffer, FBoundSPScalesBuffer: cl_mem;
+      /// TILED GEMM (cai_dot_product_int8_tiled / _tiled_h / _int4_tiled) for
+      /// a window of FNumBs >= TiledGemmMinColumns columns: one work-group per
+      /// tile of rows x columns reads each weight code once per column tile.
+      /// The handle is owned here and bound lazily by PrepareTiled, which also
+      /// sets the arguments that never change while it lives: shape, codes,
+      /// result and scales are fixed from PrepareForComputeInt8/Int4 to
+      /// UnprepareForCompute, which releases the handle. FTiledRejected
+      /// remembers a device that refused the kernel or its work-group size, so
+      /// the fallback is decided once. FTiledLaunchCount is the test hook that
+      /// proves the tiled path ran. Coded by Claude (AI).
+      FTiledKernel: cl_kernel;
+      FTiledRejected: boolean;
+      FTiledLaunchCount: integer;
+      /// True while FCodesBuffer / FScalesBuffer / FBlockScalesBuffer are
+      /// retained references to another instance's resident weights
+      /// (PrepareForComputeBorrowingCodes); the release in UnprepareForCompute
+      /// is the same clReleaseMemObject either way. Coded by Claude (AI).
+      FCodesBorrowed: boolean;
 
       /// How many slabs to cut the reduction axis into for the current shape:
       /// 1 means the launch already fills the device, so ComputeInt8 keeps the
@@ -374,6 +452,13 @@ type
       /// tuple still matches. Coded by Claude (AI).
       function BindSplitKInvariantArgs(pKernel, pReduceKernel: cl_kernel;
         pSplits: longint): integer;
+      /// Sets the FMainKernel arguments that survive between launches,
+      /// skipping the eight clSetKernelArg calls when the cached tuple still
+      /// matches. Coded by Claude (AI).
+      function BindMainInvariantArgs(pUseBias: longint): integer;
+      /// Single-pass sibling for FSinglePassKernel (args 0-3, 5, 7, 10).
+      /// Coded by Claude (AI).
+      function BindSinglePassInvariantArgs(): integer;
       /// Narrows ElementCount floats of pSrcFP32 into FInputBufferBsFP16 with
       /// cai_f32_to_half, on the shared in-order queue. Coded by Claude (AI).
       function CastBOperandToFP16(pSrcFP32: cl_mem; ElementCount: longint): integer;
@@ -387,14 +472,18 @@ type
       /// returns the UseBias kernel argument (0 for a nil VBias). Coded by Claude (AI).
       function PrepareBiasOperand(VBias: TNNetVolume; NewVBias: boolean;
         var err: integer): longint;
+      /// True when the current shape and device take the tiled GEMM: at least
+      /// TiledGemmMinColumns columns and a work-group of csTiledGemmLanes fits.
+      function ShouldUseTiledGemm(): boolean;
+      /// Binds the tiled entry point for the armed weight mode and its fixed
+      /// arguments. False when the device rejected it (existing path runs).
+      function PrepareTiled(): boolean;
       /// The shared body of ComputeInt8 and ComputeInt4: B operand, bias,
-      /// split-K or single-pass launch against the resident codes. Coded by Claude (AI).
+      /// tiled, split-K or single-pass launch against the resident codes. Coded by Claude (AI).
       procedure ComputeResidentCodes(VBs: TNNetVolume; pActFN: longint;
         NewVBs: boolean; VBias: TNNetVolume; NewVBias: boolean;
         pExternalVBs: cl_mem);
 
-
-      function Kernel(): cl_kernel; {$IFDEF Release} inline; {$ENDIF}
     public
       constructor Create(DotProductKernel: TNeuralKernel;
         pInt8Kernel: TNeuralKernel = nil; pFP16Kernel: TNeuralKernel = nil);
@@ -452,6 +541,12 @@ type
       /// uploads, as PrepareForComputeInt8. Coded by Claude (AI).
       function PrepareForComputeInt4(pPacked, pBlockScales: Pointer;
         NumAs, pSize: longint; VBs: TNNetVolume): integer;
+      /// Arms Owner's weight mode (int8 or int4) by retaining its resident
+      /// code/scale buffers - no second upload - and allocating only this
+      /// instance's B/result buffers for VBs (any column count). Owner must be
+      /// armed in this instance's context; False leaves this one unarmed. Coded by Claude (AI).
+      function PrepareForComputeBorrowingCodes(Owner: TDotProductSharedKernel;
+        VBs: TNNetVolume; pFP16: boolean = false): boolean;
       /// Int4 twin of ComputeInt8: same B operand, bias, activation and result
       /// contract, against the codes PrepareForComputeInt4 armed. Coded by Claude (AI).
       procedure ComputeInt4(VBs: TNNetVolume; pActFN: longint;
@@ -470,6 +565,14 @@ type
       /// True after a successful PrepareForComputeInt4 (cleared by
       /// UnprepareForCompute); the int4 layers gate their device route on it.
       property Int4Ready: boolean read FInt4Ready;
+      /// The resident weight codes (nil when unarmed) and whether they are a
+      /// retained reference to another instance's buffer: the test hooks that
+      /// prove a borrower created no second copy.
+      property CodesBuffer: cl_mem read FCodesBuffer;
+      property CodesBorrowed: boolean read FCodesBorrowed;
+      /// Launches of the tiled GEMM over this instance's lifetime; a test
+      /// asserts it moved to prove the tiled path ran.
+      property TiledGemmLaunchCount: integer read FTiledLaunchCount;
       /// The buffer Compute/ComputeInt8 leave their result in and
       /// FinishAndLoadResult reads back from. Exposed so a layer can bind it
       /// (device residency) instead of downloading. Still owned here: released
@@ -510,6 +613,18 @@ type
       procedure Compute(VAs, VBs: TNNetVolume; pActFN: longint);
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
   end;
+
+/// Columns (FNumBs) from which ComputeResidentCodes takes the tiled GEMM; 0
+/// turns it off. csTiledGemmMinColumns unless NEURAL_TILED_GEMM_MINCOLS is set
+/// (read once, at first use) or SetTiledGemmMinColumns was called.
+function TiledGemmMinColumns(): integer;
+procedure SetTiledGemmMinColumns(pValue: integer);
+
+/// Split-row SDPA decode sizing (TNNetFusedSDPACL): csFusedSDPA* defaults
+/// unless NEURAL_SDPA_GROUPS_PER_UNIT / _MIN_CHUNK_ROWS / _MAX_SPLITS /
+/// _MAX_CHUNK_ROWS are set.
+procedure FusedSDPASplitSizing(out GroupsPerUnit, MinChunkRows, MaxSplits,
+  MaxChunkRows: integer);
 
 implementation
 uses math;
@@ -594,11 +709,6 @@ begin
   inherited Destroy();
 end;
 
-function TDotProductSharedKernel.Kernel(): cl_kernel;
-begin
-  Kernel := FDotProductKernel.Kernel;
-end;
-
 constructor TDotProductSharedKernel.Create(DotProductKernel: TNeuralKernel;
   pInt8Kernel: TNeuralKernel = nil; pFP16Kernel: TNeuralKernel = nil);
 begin
@@ -637,10 +747,20 @@ begin
     clReleaseKernel(FSplitKReduceFP16Kernel);
   if Assigned(FCastFP16Kernel)     then clReleaseKernel(FCastFP16Kernel);
   if Assigned(FSplitKInt4Kernel)   then clReleaseKernel(FSplitKInt4Kernel);
+  if Assigned(FMainKernel)         then clReleaseKernel(FMainKernel);
+  if Assigned(FSinglePassKernel)   then clReleaseKernel(FSinglePassKernel);
+  if Assigned(FTiledKernel)        then clReleaseKernel(FTiledKernel);
+  FMainKernel := nil;
+  FSinglePassKernel := nil;
+  FTiledKernel := nil;
+  FTiledRejected := false;
+  FMainArgsBound := false;
+  FSinglePassArgsBound := false;
   FSplitKInt4Kernel := nil;
   FBlockScalesBuffer := nil;
   FCapBlockScales := 0;
   FInt4Ready := false;
+  FCodesBorrowed := false;
   FPartialBuffer := nil;
   FInputBufferBsFP16 := nil;
   FSplitKKernel := nil;
@@ -834,11 +954,9 @@ procedure TDotProductSharedKernel.Compute
 var
   err: integer;
   UseBias: longint;
-  NeededBias: csize_t;
   BufferBs: cl_mem;
   K: cl_kernel;
 begin
-  K := Kernel();
   FActFun := pActFN;
   if pExternalVBs <> nil then BufferBs := pExternalVBs else BufferBs := FInputBufferBs;
 
@@ -846,71 +964,26 @@ begin
   begin
     if (VBs.Size = FSize * FNumBs) then
     begin
-      err := clSetKernelArg(K, 0, csLongintSize, @FThreadCount);
-      if (err <> CL_SUCCESS) then ErrorProc('0 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      err := err or clSetKernelArg(K, 1, csLongintSize, @FNumAs);
-      if (err <> CL_SUCCESS) then ErrorProc('1 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      err := err or clSetKernelArg(K, 2, csLongintSize, @FNumBs);
-      if (err <> CL_SUCCESS) then ErrorProc('2 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      err := err or clSetKernelArg(K, 3, csLongintSize, @FSize);
-      if (err <> CL_SUCCESS) then ErrorProc('3 Error: Failed to set kernel arguments:' + IntToStr(err));
-
+      // Argument caching needs an entry point no other instance rebinds:
+      // FDotProductKernel is the net-wide shared cai_dot_product handle in the
+      // default shared-kernel mode, so this instance clones a handle of its
+      // own (the split-K recipe) and launches it on the same in-order queue.
+      if not Assigned(FMainKernel) then
+        FMainKernel := FDotProductKernel.CreateKernel('cai_dot_product');
+      K := FMainKernel;
+      err := CL_SUCCESS;
+      UseBias := PrepareBiasOperand(VBias, NewVBias, err);
+      // Shape, A operand, result and bias stay bound across launches; only
+      // the two arguments below change per call.
+      err := err or BindMainInvariantArgs(UseBias);
       err := err or clSetKernelArg(K, 4, csLongintSize, @FActFun);
-      if (err <> CL_SUCCESS) then ErrorProc('4 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      err := err or clSetKernelArg(K, 5, csCLMemSize,  @FInputBufferAs);
-      if (err <> CL_SUCCESS) then ErrorProc('5 Error: Failed to set kernel arguments:' + IntToStr(err));
-
       err := err or clSetKernelArg(K, 6, csCLMemSize,  @BufferBs);
-      if (err <> CL_SUCCESS) then ErrorProc('6 Error: Failed to set kernel arguments:' + IntToStr(err));
+      if (err <> CL_SUCCESS) then
+        ErrorProc('Error: TDotProductSharedKernel.Compute - failed setting ' +
+          'kernel arguments: ' + IntToStr(err));
 
-      err := err or clSetKernelArg(K, 7, csCLMemSize,  @FResultBuffer);
-      if (err <> CL_SUCCESS) then ErrorProc('7 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      // Fused bias (arg 8 UseBias, arg 9 FBiasBuffer). Both args MUST be set every
-      // call: cai_dot_product now has 10 args and the enqueue rejects any unset
-      // one. A bias-less caller (VBias=nil) passes UseBias=0 and a NULL buffer
-      // (legal - the kernel never reads it). With a bias volume, keep it resident
-      // grow-only and re-upload only when NewVBias or the buffer was just
-      // (re)allocated. Coded by Claude (AI).
-      if VBias <> nil then
-      begin
-        NeededBias := VBias.GetMemSize();
-        if (FBiasBuffer = nil) or (NeededBias > FCapBias) then
-        begin
-          if Assigned(FBiasBuffer) then clReleaseMemObject(FBiasBuffer);
-          FBiasBuffer := FDotProductKernel.CreateInputBuffer(NeededBias);
-          FCapBias := NeededBias;
-          NewVBias := true; // fresh/grown buffer: force upload regardless of caller
-        end;
-        if NewVBias then err := err or FDotProductKernel.WriteBuffer(FBiasBuffer, VBias);
-        UseBias := 1;
-      end
-      else
-        UseBias := 0;
-
-      err := err or clSetKernelArg(K, 8, csLongintSize, @UseBias);
-      if (err <> CL_SUCCESS) then ErrorProc('8 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      err := err or clSetKernelArg(K, 9, csCLMemSize, @FBiasBuffer);
-      if (err <> CL_SUCCESS) then ErrorProc('9 Error: Failed to set kernel arguments:' + IntToStr(err));
-
-      if (FHostInput) then
-      begin
-        //TODO: Fix this refresh.
-        //if NewVAs then err := err or FDotProductKernel.RefreshHostInputBufferCache(FInputBufferAs, VAs.GetMemSize());
-        //if NewVBs then err := err or FDotProductKernel.RefreshHostInputBufferCache(FInputBufferBs, VBs.GetMemSize())
-        if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
-        if NewVBs and (pExternalVBs = nil) then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
-      end
-      else
-      begin
-        if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
-        if NewVBs and (pExternalVBs = nil) then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
-      end;
+      if NewVAs then err := err or FDotProductKernel.WriteBuffer(FInputBufferAs, VAs);
+      if NewVBs and (pExternalVBs = nil) then err := err or FDotProductKernel.WriteBuffer(FInputBufferBs, VBs);
 
       if (err <> CL_SUCCESS) then ErrorProc('Failed at WriteBuffer(input):' + IntToStr(err));
 
@@ -919,11 +992,11 @@ begin
 
         if (FGroupSizeA > 0) and (FGroupSizeB > 0)  then
         begin
-          FDotProductKernel.RunKernel2D(Kernel, FNumAs, FNumBs, FGroupSizeA, FGroupSizeB);
+          FDotProductKernel.RunKernel2D(K, FNumAs, FNumBs, FGroupSizeA, FGroupSizeB);
         end
         else
         begin
-          FDotProductKernel.RunKernel2D(Kernel, FNumAs, FNumBs);
+          FDotProductKernel.RunKernel2D(K, FNumAs, FNumBs);
         end;
 
       end
@@ -1093,6 +1166,69 @@ begin
   PrepareForComputeInt4 := err;
 end;
 
+// Owner's PrepareForComputeInt8/Int4 uploaded its codes with blocking writes,
+// so they are complete before this instance's first launch even when the two
+// ride different command queues. OpenCL refcounts the shared buffers: either
+// instance may be unprepared or freed first. Coded by Claude (AI).
+function TDotProductSharedKernel.PrepareForComputeBorrowingCodes(
+  Owner: TDotProductSharedKernel; VBs: TNNetVolume;
+  pFP16: boolean = false): boolean;
+var
+  NeededResult: csize_t;
+begin
+  Result := false;
+  UnprepareForCompute();
+  if (not Assigned(Owner)) or (Owner = Self) then exit;
+  if not (Owner.FInt8Ready or Owner.FInt4Ready) then exit;
+  if not Assigned(FInt8Kernel) then exit;
+  if Owner.FDotProductKernel.Context <> FDotProductKernel.Context then exit;
+  if (Owner.FSize <= 0) or (VBs.Size = 0) or
+    ((VBs.Size mod Owner.FSize) <> 0) then exit;
+  FNumAs := Owner.FNumAs;
+  FSize := Owner.FSize;
+  FNumBs := VBs.Size div FSize;
+  FThreadCount := FNumAs * FNumBs;
+  FGroupSizeA := 0;
+  FGroupSizeB := 0;
+  // The int4 kernels read FP32 activations only, as PrepareForComputeInt4.
+  FFP16Activations := Owner.FInt8Ready and pFP16 and Assigned(FFP16Kernel) and
+    Assigned(FFP16Kernel.Kernel);
+
+  clRetainMemObject(Owner.FCodesBuffer);
+  FCodesBuffer := Owner.FCodesBuffer;
+  FCapCodes := Owner.FCapCodes;
+  clRetainMemObject(Owner.FScalesBuffer);
+  FScalesBuffer := Owner.FScalesBuffer;
+  FCapScales := Owner.FCapScales;
+  if Assigned(Owner.FBlockScalesBuffer) then
+  begin
+    clRetainMemObject(Owner.FBlockScalesBuffer);
+    FBlockScalesBuffer := Owner.FBlockScalesBuffer;
+    FCapBlockScales := Owner.FCapBlockScales;
+  end;
+  FCodesBorrowed := true;
+
+  NeededResult := FNumAs * FNumBs * csNeuralFloatSize;
+  FResultBuffer := FDotProductKernel.CreateOutputBuffer(NeededResult);
+  FCapResult := NeededResult;
+  if FFP16Activations then
+  begin
+    FCapBsFP16 := csize_t(FNumBs) * FSize * csHalfSize;
+    FInputBufferBsFP16 := FDotProductKernel.CreateBuffer(FCapBsFP16);
+    FInputBufferBs := nil;
+    FCapBs := 0;
+  end
+  else
+  begin
+    FInputBufferBs := FDotProductKernel.CreateInputBuffer(VBs);
+    FCapBs := VBs.GetMemSize();
+  end;
+  FPreviousComputeTime := 0;
+  FInt8Ready := Owner.FInt8Ready;
+  FInt4Ready := Owner.FInt4Ready;
+  Result := true;
+end;
+
 const
   /// Work-items per compute unit the int8 launch aims for before it stops
   /// splitting. Enough to cover memory latency without cutting rows so thin
@@ -1102,24 +1238,178 @@ const
   /// setup outweighs the reduction work.
   csInt8SplitKMinSlab = 128;
   csInt8SplitKMaxSplits = 64;
+  /// Int4 pass 1 moves half the bytes per multiply-accumulate of the int8
+  /// pass, so its split sizing may want more work-items in flight.
+  csInt4SplitKThreadsPerUnit = 1024;
+  csInt4SplitKMinSlab = 128;
+  csInt4SplitKMaxSplits = 64;
+  /// Split-row SDPA decode: pass 1 aims for this many work-groups per compute
+  /// unit, never cuts a chunk below MinChunkRows cache rows, and never splits
+  /// a (KV head, token row) into more than MaxSplits chunks, because each
+  /// chunk costs a partial state the merge pass has to read.
+  csFusedSDPAGroupsPerUnit = 4;
+  csFusedSDPAMinChunkRows = 64;
+  csFusedSDPAMaxSplits = 64;
+  /// Pass 3 walks a chunk's rows serially per lane, so this bounds that chain
+  /// when a wide prefill window would otherwise get a few very long chunks.
+  csFusedSDPAMaxChunkRows = 512;
+
+var
+  vInt4SplitKOverridesLoaded: boolean = false;
+  vInt4SplitKThreadsPerUnit: integer = csInt4SplitKThreadsPerUnit;
+  vInt4SplitKMinSlab: integer = csInt4SplitKMinSlab;
+  vInt4SplitKMaxSplits: integer = csInt4SplitKMaxSplits;
+  vFusedSDPASplitOverridesLoaded: boolean = false;
+  vFusedSDPAGroupsPerUnit: integer = csFusedSDPAGroupsPerUnit;
+  vFusedSDPAMinChunkRows: integer = csFusedSDPAMinChunkRows;
+  vFusedSDPAMaxSplits: integer = csFusedSDPAMaxSplits;
+  vFusedSDPAMaxChunkRows: integer = csFusedSDPAMaxChunkRows;
+
+// Replaces pValue with the environment variable pName when it holds a
+// positive integer; otherwise leaves it alone.
+procedure ReadPositiveIntOverride(const pName: string; var pValue: integer);
+var
+  EnvValue: string;
+  Parsed: integer;
+begin
+  EnvValue := GetEnvironmentVariable(pName);
+  if (EnvValue <> '') and TryStrToInt(EnvValue, Parsed) and (Parsed > 0) then
+    pValue := Parsed;
+end;
+
+// Reads the NEURAL_INT4_SPLITK_THREADS / _MINSLAB / _MAXSPLITS environment
+// overrides once, so a split-sizing sweep needs no rebuild per point.
+procedure LoadInt4SplitKOverrides();
+begin
+  if vInt4SplitKOverridesLoaded then exit;
+  vInt4SplitKOverridesLoaded := true;
+  ReadPositiveIntOverride('NEURAL_INT4_SPLITK_THREADS', vInt4SplitKThreadsPerUnit);
+  ReadPositiveIntOverride('NEURAL_INT4_SPLITK_MINSLAB', vInt4SplitKMinSlab);
+  ReadPositiveIntOverride('NEURAL_INT4_SPLITK_MAXSPLITS', vInt4SplitKMaxSplits);
+end;
+
+procedure FusedSDPASplitSizing(out GroupsPerUnit, MinChunkRows, MaxSplits,
+  MaxChunkRows: integer);
+begin
+  if not vFusedSDPASplitOverridesLoaded then
+  begin
+    vFusedSDPASplitOverridesLoaded := true;
+    ReadPositiveIntOverride('NEURAL_SDPA_GROUPS_PER_UNIT', vFusedSDPAGroupsPerUnit);
+    ReadPositiveIntOverride('NEURAL_SDPA_MIN_CHUNK_ROWS', vFusedSDPAMinChunkRows);
+    ReadPositiveIntOverride('NEURAL_SDPA_MAX_SPLITS', vFusedSDPAMaxSplits);
+    ReadPositiveIntOverride('NEURAL_SDPA_MAX_CHUNK_ROWS', vFusedSDPAMaxChunkRows);
+  end;
+  GroupsPerUnit := vFusedSDPAGroupsPerUnit;
+  MinChunkRows := vFusedSDPAMinChunkRows;
+  MaxSplits := vFusedSDPAMaxSplits;
+  MaxChunkRows := vFusedSDPAMaxChunkRows;
+end;
+
+var
+  vTiledGemmMinColumnsLoaded: boolean = false;
+  vTiledGemmMinColumns: integer = csTiledGemmMinColumns;
+
+function TiledGemmMinColumns(): integer;
+var
+  EnvValue: string;
+  Parsed: integer;
+begin
+  if not vTiledGemmMinColumnsLoaded then
+  begin
+    vTiledGemmMinColumnsLoaded := true;
+    EnvValue := GetEnvironmentVariable('NEURAL_TILED_GEMM_MINCOLS');
+    if (EnvValue <> '') and TryStrToInt(EnvValue, Parsed) and (Parsed >= 0) then
+      vTiledGemmMinColumns := Parsed;
+  end;
+  Result := vTiledGemmMinColumns;
+end;
+
+procedure SetTiledGemmMinColumns(pValue: integer);
+begin
+  vTiledGemmMinColumnsLoaded := true;
+  vTiledGemmMinColumns := pValue;
+end;
+
+function TDotProductSharedKernel.ShouldUseTiledGemm(): boolean;
+var
+  MinColumns: integer;
+begin
+  MinColumns := TiledGemmMinColumns();
+  Result := (MinColumns > 0) and (FNumBs >= MinColumns) and (FSize > 0) and
+    (FDotProductKernel.DeviceMaxWorkGroupSize() >= csTiledGemmLanes);
+end;
+
+function TDotProductSharedKernel.PrepareTiled(): boolean;
+var
+  err: integer;
+begin
+  Result := Assigned(FTiledKernel);
+  if Result or FTiledRejected then exit;
+  FTiledRejected := true;
+  if FInt4Ready then
+    FTiledKernel := FInt8Kernel.CreateKernel('cai_dot_product_int4_tiled')
+  else if FFP16Activations then
+    FTiledKernel := FFP16Kernel.CreateKernel('cai_dot_product_int8_tiled_h')
+  else
+    FTiledKernel := FInt8Kernel.CreateKernel('cai_dot_product_int8_tiled');
+  if not Assigned(FTiledKernel) then exit;
+  // Register use can cap the kernel below the device's work-group limit.
+  if FDotProductKernel.KernelMaxWorkGroupSize(FTiledKernel) < csTiledGemmLanes then
+  begin
+    clReleaseKernel(FTiledKernel);
+    FTiledKernel := nil;
+    exit;
+  end;
+  err := clSetKernelArg(FTiledKernel, 0, csLongintSize, @FNumAs);
+  err := err or clSetKernelArg(FTiledKernel, 1, csLongintSize, @FNumBs);
+  err := err or clSetKernelArg(FTiledKernel, 2, csLongintSize, @FSize);
+  err := err or clSetKernelArg(FTiledKernel, 4, csCLMemSize, @FCodesBuffer);
+  err := err or clSetKernelArg(FTiledKernel, 6, csCLMemSize, @FResultBuffer);
+  err := err or clSetKernelArg(FTiledKernel, 9, csCLMemSize, @FScalesBuffer);
+  if FInt4Ready then
+    err := err or clSetKernelArg(FTiledKernel, 10, csCLMemSize, @FBlockScalesBuffer);
+  if err <> CL_SUCCESS then
+  begin
+    ErrorProc('Error: TDotProductSharedKernel.PrepareTiled - failed setting ' +
+      'the fixed tiled GEMM arguments: ' + IntToStr(err));
+    clReleaseKernel(FTiledKernel);
+    FTiledKernel := nil;
+    exit;
+  end;
+  FTiledRejected := false;
+  Result := true;
+end;
 
 function TDotProductSharedKernel.Int8SplitCount(): integer;
 var
   Rows, TargetThreads, MaxSplitsBySize: integer;
+  ThreadsPerUnit, MinSlab, MaxSplits: integer;
 begin
   Result := 1;
   Rows := FNumAs * FNumBs;
   if (Rows < 1) or (FSize < 1) then exit;
-  TargetThreads := FDotProductKernel.DeviceMaxComputeUnits() *
-    csInt8SplitKThreadsPerUnit;
+  if FInt4Ready then
+  begin
+    LoadInt4SplitKOverrides();
+    ThreadsPerUnit := vInt4SplitKThreadsPerUnit;
+    MinSlab := vInt4SplitKMinSlab;
+    MaxSplits := vInt4SplitKMaxSplits;
+  end
+  else
+  begin
+    ThreadsPerUnit := csInt8SplitKThreadsPerUnit;
+    MinSlab := csInt8SplitKMinSlab;
+    MaxSplits := csInt8SplitKMaxSplits;
+  end;
+  TargetThreads := FDotProductKernel.DeviceMaxComputeUnits() * ThreadsPerUnit;
   // Already fills the device (prefill, or a vocab-sized head): one pass wins,
   // because splitting would only add a partial buffer and a second launch.
   if Rows >= TargetThreads then exit;
-  MaxSplitsBySize := FSize div csInt8SplitKMinSlab;
+  MaxSplitsBySize := FSize div MinSlab;
   if MaxSplitsBySize < 2 then exit;
   Result := (TargetThreads + Rows - 1) div Rows;
   if Result > MaxSplitsBySize then Result := MaxSplitsBySize;
-  if Result > csInt8SplitKMaxSplits then Result := csInt8SplitKMaxSplits;
+  if Result > MaxSplits then Result := MaxSplits;
 end;
 
 function TDotProductSharedKernel.PrepareSplitK(pSplits: integer): boolean;
@@ -1283,6 +1573,74 @@ begin
   FSplitKArgsBound := true;
 end;
 
+function TDotProductSharedKernel.BindMainInvariantArgs(pUseBias: longint): integer;
+var
+  K: cl_kernel;
+begin
+  Result := CL_SUCCESS;
+  if FMainArgsBound and (FThreadCount = FBoundMainThreadCount) and
+    (FNumAs = FBoundMainNumAs) and (FNumBs = FBoundMainNumBs) and
+    (FSize = FBoundMainSize) and (FInputBufferAs = FBoundMainAsBuffer) and
+    (FResultBuffer = FBoundMainResultBuffer) and
+    (pUseBias = FBoundMainUseBias) and (FBiasBuffer = FBoundMainBiasBuffer)
+  then exit;
+
+  FMainArgsBound := false;
+  K := FMainKernel;
+  Result := clSetKernelArg(K, 0, csLongintSize, @FThreadCount);
+  Result := Result or clSetKernelArg(K, 1, csLongintSize, @FNumAs);
+  Result := Result or clSetKernelArg(K, 2, csLongintSize, @FNumBs);
+  Result := Result or clSetKernelArg(K, 3, csLongintSize, @FSize);
+  Result := Result or clSetKernelArg(K, 5, csCLMemSize, @FInputBufferAs);
+  Result := Result or clSetKernelArg(K, 7, csCLMemSize, @FResultBuffer);
+  Result := Result or clSetKernelArg(K, 8, csLongintSize, @pUseBias);
+  Result := Result or clSetKernelArg(K, 9, csCLMemSize, @FBiasBuffer);
+  if Result <> CL_SUCCESS then exit;
+
+  FBoundMainThreadCount := FThreadCount;
+  FBoundMainNumAs := FNumAs;
+  FBoundMainNumBs := FNumBs;
+  FBoundMainSize := FSize;
+  FBoundMainAsBuffer := FInputBufferAs;
+  FBoundMainResultBuffer := FResultBuffer;
+  FBoundMainUseBias := pUseBias;
+  FBoundMainBiasBuffer := FBiasBuffer;
+  FMainArgsBound := true;
+end;
+
+function TDotProductSharedKernel.BindSinglePassInvariantArgs(): integer;
+var
+  K: cl_kernel;
+begin
+  Result := CL_SUCCESS;
+  if FSinglePassArgsBound and (FThreadCount = FBoundSPThreadCount) and
+    (FNumAs = FBoundSPNumAs) and (FNumBs = FBoundSPNumBs) and
+    (FSize = FBoundSPSize) and (FCodesBuffer = FBoundSPCodesBuffer) and
+    (FResultBuffer = FBoundSPResultBuffer) and
+    (FScalesBuffer = FBoundSPScalesBuffer)
+  then exit;
+
+  FSinglePassArgsBound := false;
+  K := FSinglePassKernel;
+  Result := clSetKernelArg(K, 0, csLongintSize, @FThreadCount);
+  Result := Result or clSetKernelArg(K, 1, csLongintSize, @FNumAs);
+  Result := Result or clSetKernelArg(K, 2, csLongintSize, @FNumBs);
+  Result := Result or clSetKernelArg(K, 3, csLongintSize, @FSize);
+  Result := Result or clSetKernelArg(K, 5, csCLMemSize, @FCodesBuffer);
+  Result := Result or clSetKernelArg(K, 7, csCLMemSize, @FResultBuffer);
+  Result := Result or clSetKernelArg(K, 10, csCLMemSize, @FScalesBuffer);
+  if Result <> CL_SUCCESS then exit;
+
+  FBoundSPThreadCount := FThreadCount;
+  FBoundSPNumAs := FNumAs;
+  FBoundSPNumBs := FNumBs;
+  FBoundSPSize := FSize;
+  FBoundSPCodesBuffer := FCodesBuffer;
+  FBoundSPResultBuffer := FResultBuffer;
+  FBoundSPScalesBuffer := FScalesBuffer;
+  FSinglePassArgsBound := true;
+end;
+
 procedure TDotProductSharedKernel.ComputeInt8(VBs: TNNetVolume;
   pActFN: longint; NewVBs: boolean = true; VBias: TNNetVolume = nil;
   NewVBias: boolean = true; pExternalVBs: cl_mem = nil);
@@ -1339,7 +1697,7 @@ var
   UseBias: longint;
   K, KReduce: cl_kernel;
   BufferBs: cl_mem;
-  Splits: longint;
+  Splits, RowTiles, ColTiles: longint;
 begin
   if (VBs.Size <> FSize * FNumBs) then
   begin
@@ -1354,6 +1712,33 @@ begin
 
   // Binds (FP32) or narrows into (FP16) the B operand the GEMM below reads.
   BufferBs := PrepareInt8BOperand(VBs, NewVBs, pExternalVBs, err);
+
+  // A window of columns: one work-group per (row tile, column tile), each
+  // weight code read once per column tile. Only the four arguments below
+  // change per call; the FNumBs = 1 decode paths further down are untouched.
+  if ShouldUseTiledGemm() and PrepareTiled() then
+  begin
+    K := FTiledKernel;
+    err := err or clSetKernelArg(K, 3, csLongintSize, @FActFun);
+    err := err or clSetKernelArg(K, 5, csCLMemSize, @BufferBs);
+    err := err or clSetKernelArg(K, 7, csLongintSize, @UseBias);
+    err := err or clSetKernelArg(K, 8, csCLMemSize, @FBiasBuffer);
+    if err = CL_SUCCESS then
+    begin
+      RowTiles := (FNumAs + csTiledGemmLanes * csTiledGemmRowsPerLane - 1)
+        div (csTiledGemmLanes * csTiledGemmRowsPerLane);
+      ColTiles := (FNumBs + csTiledGemmCols - 1) div csTiledGemmCols;
+      FDotProductKernel.RunKernel2D(K, RowTiles * csTiledGemmLanes, ColTiles,
+        csTiledGemmLanes, 1);
+      Inc(FTiledLaunchCount);
+    end
+    else
+    begin
+      ErrorProc('Error: TDotProductSharedKernel.ComputeResidentCodes - ' +
+        'failed setting tiled GEMM parameters: ' + IntToStr(err));
+    end;
+    exit;
+  end;
 
   Splits := Int8SplitCount();
   // Int4 has no single-pass kernel: its pass 1 runs with KSplits = 1 instead.
@@ -1394,18 +1779,25 @@ begin
     exit;
   end;
 
-  if FFP16Activations then K := FFP16Kernel.Kernel else K := FInt8Kernel.Kernel;
-  err := err or clSetKernelArg(K, 0, csLongintSize, @FThreadCount);
-  err := err or clSetKernelArg(K, 1, csLongintSize, @FNumAs);
-  err := err or clSetKernelArg(K, 2, csLongintSize, @FNumBs);
-  err := err or clSetKernelArg(K, 3, csLongintSize, @FSize);
+  // Same ownership rule as the split-K handles: the injected FInt8Kernel /
+  // FFP16Kernel handles are net-wide in the default shared-kernel mode, so
+  // argument caching is only sound on a private clone. A quant-mode flip
+  // re-runs PrepareForComputeInt8/Int4, whose UnprepareForCompute releases
+  // this clone, so FFP16Activations cannot go stale in it.
+  if not Assigned(FSinglePassKernel) then
+  begin
+    if FFP16Activations
+      then FSinglePassKernel := FFP16Kernel.CreateKernel('cai_dot_product_int8_h')
+      else FSinglePassKernel := FInt8Kernel.CreateKernel('cai_dot_product_int8');
+  end;
+  K := FSinglePassKernel;
+  // Shape, codes, result and scales stay bound across launches; only the four
+  // arguments below change per call.
+  err := err or BindSinglePassInvariantArgs();
   err := err or clSetKernelArg(K, 4, csLongintSize, @FActFun);
-  err := err or clSetKernelArg(K, 5, csCLMemSize, @FCodesBuffer);
   err := err or clSetKernelArg(K, 6, csCLMemSize, @BufferBs);
-  err := err or clSetKernelArg(K, 7, csCLMemSize, @FResultBuffer);
   err := err or clSetKernelArg(K, 8, csLongintSize, @UseBias);
   err := err or clSetKernelArg(K, 9, csCLMemSize, @FBiasBuffer);
-  err := err or clSetKernelArg(K, 10, csCLMemSize, @FScalesBuffer);
 
   if err = CL_SUCCESS then
   begin
@@ -2170,6 +2562,8 @@ procedure TEasyOpenCL.SetCurrentDevice(pDeviceId: cl_device_id);
 begin
   FCurrentDevice := pDeviceId;
   FMaxComputeUnits := 0;
+  FMaxWorkGroupSize := 0;
+  FLocalMemSize := 0;
 end;
 
 procedure TEasyOpenCL.CompileProgramFromFile(filename: string);
@@ -2323,6 +2717,16 @@ begin
   end;
 end;
 
+function TEasyOpenCL.CopyBuffer(src, dst: cl_mem; cb: csize_t): integer;
+begin
+  Result := clEnqueueCopyBuffer(FCommands, src, dst, 0, 0, cb, 0, nil, nil);
+  if (Result <> CL_SUCCESS) then
+  begin
+    FErrorProc('ERROR: Failed to copy buffer: ' + IntToStr(Result) +
+      ' Size:' + IntToStr(cb) + ' bytes.');
+  end;
+end;
+
 function TEasyOpenCL.CreateInputBuffer(size: csize_t): cl_mem;
 begin
   Result := CreateBuffer(CL_MEM_READ_ONLY,size);
@@ -2381,6 +2785,75 @@ begin
     if Units > 0 then Result := Units;
   end;
   FMaxComputeUnits := Result;
+end;
+
+function TEasyOpenCL.DeviceMaxWorkGroupSize(): integer;
+var
+  GroupSize: csize_t;
+  BytesWritten: csize_t;
+begin
+  Result := FMaxWorkGroupSize;
+  if Result > 0 then exit;
+  Result := 1;
+  if FCurrentDevice = nil then exit;
+  GroupSize := 0;
+  if clGetDeviceInfo(FCurrentDevice, CL_DEVICE_MAX_WORK_GROUP_SIZE,
+    SizeOf(GroupSize), @GroupSize, {$IFDEF FPC}BytesWritten{$ELSE}@BytesWritten{$ENDIF}) = CL_SUCCESS then
+  begin
+    if GroupSize > 0 then Result := GroupSize;
+  end;
+  FMaxWorkGroupSize := Result;
+end;
+
+function TEasyOpenCL.DeviceLocalMemSize(): integer;
+const
+  csLocalMemFallbackBytes = 16384;
+var
+  LocalBytes: cl_ulong;
+  BytesWritten: csize_t;
+begin
+  Result := FLocalMemSize;
+  if Result > 0 then exit;
+  Result := csLocalMemFallbackBytes;
+  if FCurrentDevice = nil then exit;
+  LocalBytes := 0;
+  if clGetDeviceInfo(FCurrentDevice, CL_DEVICE_LOCAL_MEM_SIZE,
+    SizeOf(LocalBytes), @LocalBytes, {$IFDEF FPC}BytesWritten{$ELSE}@BytesWritten{$ENDIF}) = CL_SUCCESS then
+  begin
+    if LocalBytes > 0 then
+    begin
+      if LocalBytes > MaxInt then Result := MaxInt else Result := LocalBytes;
+    end;
+  end;
+  FLocalMemSize := Result;
+end;
+
+function TEasyOpenCL.KernelMaxWorkGroupSize(pKernel: cl_kernel): integer;
+var
+  GroupSize: csize_t;
+  BytesWritten: csize_t;
+begin
+  Result := 0;
+  if (FCurrentDevice = nil) or (pKernel = nil) then exit;
+  GroupSize := 0;
+  if clGetKernelWorkGroupInfo(pKernel, FCurrentDevice, CL_KERNEL_WORK_GROUP_SIZE,
+    SizeOf(GroupSize), @GroupSize, @BytesWritten) = CL_SUCCESS then
+    Result := GroupSize;
+end;
+
+function TEasyOpenCL.KernelLocalMemSize(pKernel: cl_kernel): integer;
+var
+  LocalBytes: cl_ulong;
+  BytesWritten: csize_t;
+begin
+  Result := 0;
+  if (FCurrentDevice = nil) or (pKernel = nil) then exit;
+  LocalBytes := 0;
+  if clGetKernelWorkGroupInfo(pKernel, FCurrentDevice, CL_KERNEL_LOCAL_MEM_SIZE,
+    SizeOf(LocalBytes), @LocalBytes, @BytesWritten) = CL_SUCCESS then
+  begin
+    if LocalBytes > MaxInt then Result := MaxInt else Result := LocalBytes;
+  end;
 end;
 
 function TEasyOpenCL.RunKernel(pkernel: cl_kernel; ThreadCount: integer): integer;

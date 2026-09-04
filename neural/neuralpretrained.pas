@@ -1049,9 +1049,19 @@ function LlamaConfigToString(const Config: TLlamaConfig): string;
 // at real checkpoint widths) - see TestInt8QuantizedLlamaLogitDrift.
 // Every importer that rides this path (Mistral/Qwen/Gemma/...) inherits
 // the behaviour by passing pQuantizeInt8 through.
+// pWeightOwner: a net this same builder produced from the same config,
+// weight state final (quantized) and OpenCL not yet enabled. The result is
+// the same graph at pSeqLen whose every weight-bearing layer borrows the
+// owner's layer at the same index (TNNetLayer.LinkWeightsFrom): the
+// checkpoint is not opened, no tensor is loaded and no weight storage - FP32
+// rows or int8/int4 tables - is allocated; the twin costs its activations.
+// A layer count or class mismatch raises. Arm it afterwards with
+// TNNet.EnableOpenCLInContextOf(owner), after the owner's EnableOpenCL, and
+// free it before the owner. Coded by Claude (AI).
 function BuildLlamaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
-  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
@@ -1059,7 +1069,7 @@ function BuildLlamaFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true;
   const ConfigFileName: string = '';
-  pQuantizeInt8: boolean = false): TNNet;
+  pQuantizeInt8: boolean = false; pWeightOwner: TNNet = nil): TNNet;
 
 function BuildLlamaFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pTrainable: boolean = true;
@@ -1237,7 +1247,8 @@ procedure SaveLlamaToSafeTensors(Net: TNNet; const Config: TLlamaConfig;
 function BuildMistralFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true;
-  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 
 function BuildMistralFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pTrainable: boolean = true;
@@ -1249,7 +1260,8 @@ function BuildMistralFromSafeTensors(const FileName: string;
 function BuildQwen2FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true;
-  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 
 function BuildQwen2FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pTrainable: boolean = true;
@@ -1263,7 +1275,8 @@ function BuildQwen2FromSafeTensors(const FileName: string;
 function BuildQwen3FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true;
-  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 
 function BuildQwen3FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pTrainable: boolean = true;
@@ -1298,7 +1311,8 @@ procedure SaveQwen3ToSafeTensors(Net: TNNet; const Config: TLlamaConfig;
 function BuildQwen3MoeFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true;
-  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 
 function BuildQwen3MoeFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pTrainable: boolean = true;
@@ -1334,7 +1348,8 @@ function BuildQwen3MoeFromSafeTensors(const FileName: string;
 function BuildQwen35FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true;
-  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 
 function BuildQwen35FromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pTrainable: boolean = true;
@@ -1343,7 +1358,8 @@ function BuildQwen35FromSafeTensors(const FileName: string;
 function BuildQwen35MoeFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true;
-  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 
 function BuildQwen35MoeFromSafeTensors(const FileName: string;
   pSeqLen: integer = 0; pTrainable: boolean = true;
@@ -12304,9 +12320,22 @@ function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
 // (SeqLen,1,num_labels) class logits (row 0 / last non-pad row, see the
 // SEQUENCE CLASSIFICATION IMPORT section); the LM/encoder stays the
 // default for every other architectures value.
+// pWeightOwner: a net BuildFromPretrained produced from the same Path, its
+// weight state final; the result borrows its weights instead of reading the
+// checkpoint again (see BuildLlamaFromSafeTensorsWithConfig). Only the
+// model types PretrainedModelTypeCanBorrowWeights accepts take it; every
+// other family raises EPretrainedImportError.
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pTrainable: boolean = true;
-  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
+
+// True for the config.json model_type values BuildFromPretrained routes
+// through the Llama builder (llama, mistral, qwen2, qwen3, qwen3_moe,
+// qwen3_5, qwen3_5_moe, gemma, gemma2, gemma3_text, phi3, olmo2, olmoe,
+// mixtral, glm4, granite, granitemoe, minicpm, bitnet) - the families whose
+// twin can borrow an already-loaded net's weights (pWeightOwner).
+function PretrainedModelTypeCanBorrowWeights(const ModelType: string): boolean;
 
 // ---------------------------------------------------------------------------
 // CLASSICAL PRETRAINED WORD EMBEDDINGS (GloVe / word2vec / fastText text
@@ -16209,18 +16238,24 @@ begin
   Block.LinQKV := NN.AddLayerAfter(
     TNNetPointwiseConvLinear.Create(ConvDim).SetTrainable(pTrainable),
     Source);
+  // Every layer takes pTrainable BEFORE AddLayer sizes it: SetPrevLayer
+  // allocates the error buffers and (TNNetGatedDeltaNet) the per-step BPTT
+  // caches only for a trainable layer, and an inference net must never pay
+  // for them, not even until the block-level SetTrainable shrinks them.
   Block.LinConv := NN.AddLayer( TNNetDepthwiseConv1D.Create(
-    Config.LinearConvKernel, {pCausal=}true, {pSuppressBias=}1) );
-  ConvAct := NN.AddLayer( TNNetSiLU.Create() );
+    Config.LinearConvKernel, {pCausal=}true, {pSuppressBias=}1
+    ).SetTrainable(pTrainable) );
+  ConvAct := NN.AddLayer( TNNetSiLU.Create().SetTrainable(pTrainable) );
   Block.LinZBA := NN.AddLayerAfter(
     TNNetPointwiseConvLinear.Create(
       ValueDim + 2 * Config.LinearNumVHeads).SetTrainable(pTrainable),
     Source);
-  NN.AddLayer( TNNetDeepConcat.Create([ConvAct, Block.LinZBA]) );
+  NN.AddLayer( TNNetDeepConcat.Create([ConvAct, Block.LinZBA]
+    ).SetTrainable(pTrainable) );
   Block.LinDelta := NN.AddLayer( TNNetGatedDeltaNet.Create(
     Config.LinearNumKHeads, Config.LinearNumVHeads,
     Config.LinearKeyHeadDim, Config.LinearValueHeadDim,
-    Config.RmsNormEps) );
+    Config.RmsNormEps).SetTrainable(pTrainable) );
   Block.LinOut := NN.AddLayer(
     TNNetPointwiseConvLinear.Create(Config.HiddenSize).SetTrainable(pTrainable) );
 end;
@@ -16417,13 +16452,24 @@ end;
 // error messages only. BuildLlamaFromSafeTensorsWithConfig wraps this with
 // CreatePretrainedTensorReader; BuildLlamaFromGGUFEx wraps it with a
 // TNNetGGUFReader whose tensors were renamed to the HF names.
+// pWeightOwner (a net this builder produced from the same config, its weight
+// state final - quantized - and OpenCL not yet enabled): the graph is built
+// at pSeqLen with every weight-bearing layer linked to the owner's layer at
+// the same index (TNNet.BuildWeightOwner); nothing is read from pReader
+// (nil is accepted), no tensor is loaded, no FP32 or int8 weight storage is
+// allocated, and no quantize sweep runs. A layer count or class mismatch
+// raises. Coded by Claude (AI).
 function BuildLlamaFromTensorReaderWithConfig(
   pReader: TNNetSafeTensorsReader; const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
-  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
+  BorrowWeights: boolean;   // pWeightOwner given: graph only, no loads
+  QuantizeSweeps: boolean;  // per-block QuantizeWeightsInt8 sweeps run
+  OwnerWeightLayers: integer;
   Blocks: array of TLlamaBlockLayers;
   EmbeddingLayer, FinalNorm, LMHead: TNNetLayer;
   BranchInput, NormedSource: TNNetLayer;
@@ -16462,9 +16508,25 @@ var
     Consumed.Add(TName);
   end;
 
+  // The owner's layer at the index the next AddLayer will take; nil when
+  // the build does not borrow. A TNNetEmbedding sizes its table in its
+  // constructor, before any net sees it, so it takes the owner layer there.
+  function OwnerLayerForNextIndex(): TNNetLayer;
+  begin
+    if not BorrowWeights then exit(nil);
+    if NN.CountLayers() >= pWeightOwner.CountLayers() then
+      raise EPretrainedImportError.Create('Llama import: the borrowing ' +
+        'twin needs a layer at index ' + IntToStr(NN.CountLayers()) +
+        ' but the owner net has only ' + IntToStr(pWeightOwner.CountLayers()) +
+        ' layers (graph mismatch).');
+    Result := pWeightOwner.Layers[NN.CountLayers()];
+  end;
+
 begin
   Reader := pReader; // ownership taken: freed in the finally below
   NN := nil;
+  BorrowWeights := Assigned(pWeightOwner);
+  QuantizeSweeps := pQuantizeInt8 and (not BorrowWeights);
   Consumed := TStringList.Create;
   Consumed.Sorted := True;
   Consumed.Duplicates := dupIgnore;
@@ -16574,30 +16636,39 @@ begin
       // under "model.language_model." (Qwen3_5ForConditionalGeneration;
       // lm_head.weight stays top-level); text-only exports use the plain
       // "model." prefix like every other family.
-      if Reader.HasTensor('model.language_model.embed_tokens.weight') then
-        Config.Prefix := 'model.language_model.'
-      else if Reader.HasTensor('model.embed_tokens.weight') then
-        Config.Prefix := 'model.'
-      else if Reader.HasTensor('embed_tokens.weight') then
-        Config.Prefix := ''
-      else
-        ImportError('Llama import: neither "model.embed_tokens.weight" nor ' +
-          '"embed_tokens.weight" found in ' + Reader.FileName +
-          ' - not a Llama checkpoint?');
-      if (Reader.DimCount(Config.Prefix + 'embed_tokens.weight') <> 2) or
-         (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 0) <>
-          Config.VocabSize) or
-         (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 1) <>
-          Config.HiddenSize) then
-        ImportError('Llama import: embed_tokens.weight must have shape [' +
-          IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
-          '], got ' +
-          Reader.ShapeAsString(Config.Prefix + 'embed_tokens.weight'));
       LMHeadName := 'lm_head.weight';
-      if (not Config.TieWordEmbeddings) and
-         (not Reader.HasTensor(LMHeadName)) then
-        ImportError('Llama import: config says tie_word_embeddings=false ' +
-          'but "' + LMHeadName + '" is missing from ' + Reader.FileName + '.');
+      if BorrowWeights then
+      begin
+        // Tensor names are never resolved: the owner net holds the weights.
+        if not Assigned(pWeightOwner.GetFirstLayer()) then
+          ImportError('Llama import: the weight owner net is empty.');
+      end
+      else
+      begin
+        if Reader.HasTensor('model.language_model.embed_tokens.weight') then
+          Config.Prefix := 'model.language_model.'
+        else if Reader.HasTensor('model.embed_tokens.weight') then
+          Config.Prefix := 'model.'
+        else if Reader.HasTensor('embed_tokens.weight') then
+          Config.Prefix := ''
+        else
+          ImportError('Llama import: neither "model.embed_tokens.weight" nor ' +
+            '"embed_tokens.weight" found in ' + Reader.FileName +
+            ' - not a Llama checkpoint?');
+        if (Reader.DimCount(Config.Prefix + 'embed_tokens.weight') <> 2) or
+           (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 0) <>
+            Config.VocabSize) or
+           (Reader.DimSize(Config.Prefix + 'embed_tokens.weight', 1) <>
+            Config.HiddenSize) then
+          ImportError('Llama import: embed_tokens.weight must have shape [' +
+            IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
+            '], got ' +
+            Reader.ShapeAsString(Config.Prefix + 'embed_tokens.weight'));
+        if (not Config.TieWordEmbeddings) and
+           (not Reader.HasTensor(LMHeadName)) then
+          ImportError('Llama import: config says tie_word_embeddings=false ' +
+            'but "' + LMHeadName + '" is missing from ' + Reader.FileName + '.');
+      end;
       if pSeqLen <= 0 then SeqLen := Config.MaxPositions
       else SeqLen := pSeqLen;
       if SeqLen > Config.MaxPositions then
@@ -16613,7 +16684,10 @@ begin
       // after block 0 was built FP32). With the flag armed, attaching a
       // projection/MLP/LM-head layer allocates the int8 container
       // directly - the process never touches the FP32 weight footprint.
-      NN.BuildQuantInt8 := pQuantizeInt8;
+      // A borrowing build arms neither: its layers size nothing and link to
+      // the owner's as they are attached (TNNet.BuildWeightOwner).
+      NN.BuildQuantInt8 := QuantizeSweeps;
+      NN.BuildWeightOwner := pWeightOwner;
       NN.AddLayer( TNNetInput.Create(SeqLen) );
       // EncodeZero=1: token id 0 is a real token (<unk> in the Llama vocab),
       // not padding.
@@ -16624,14 +16698,15 @@ begin
       // sequence set a process-lifetime allocator high-water mark).
       EmbeddingLayer := NN.AddLayer( TNNetEmbedding.Create(
         Config.VocabSize, Config.HiddenSize, {EncodeZero=}1,
-        {ScaleEmbedding=}0.02, pTrainable, pQuantizeInt8
+        {ScaleEmbedding=}0.02, pTrainable, QuantizeSweeps,
+        OwnerLayerForNextIndex()
         ).SetTrainable(pTrainable) );
       // pQuantizeInt8: idempotent block-by-block sweeps (same pattern as
       // SetTrainable) keep peak RAM at quantized-net + one FP32 block
       // during BOTH construction and the weight-load phase below (the
       // loaders call DequantizeWeightsInt8 before refilling a layer).
       if not pTrainable then NN.SetTrainable();
-      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      if QuantizeSweeps then NN.QuantizeWeightsInt8();
       SetLength(Blocks, Config.NumLayers);
       SetLength(KRotated, Config.NumKVHeads);
       SetLength(VSlices, Config.NumKVHeads);
@@ -17100,7 +17175,7 @@ begin
             NN.AddLayer( TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
         NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), BranchInput]) );
         if not pTrainable then NN.SetTrainable();
-        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+        if QuantizeSweeps then NN.QuantizeWeightsInt8();
       end;
       FinalNorm := NN.AddLayer(
         TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
@@ -17112,7 +17187,31 @@ begin
       if Config.FinalLogitSoftCap > 0 then
         NN.AddLayer( TNNetSoftCapping.Create(Config.FinalLogitSoftCap) );
       if not pTrainable then NN.SetTrainable();
-      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      if QuantizeSweeps then NN.QuantizeWeightsInt8();
+
+      if BorrowWeights then
+      begin
+        // ---------------- Borrowed weights ----------------
+        // Every layer linked as it was attached; what remains is the graph
+        // check the per-layer link cannot make (a shorter twin) and the
+        // count of owner layers with weights against the links made.
+        NN.BuildWeightOwner := nil;
+        if NN.CountLayers() <> pWeightOwner.CountLayers() then
+          ImportError('Llama import: the borrowing twin has ' +
+            IntToStr(NN.CountLayers()) + ' layers, the owner net ' +
+            IntToStr(pWeightOwner.CountLayers()) + ' (graph mismatch).');
+        OwnerWeightLayers := 0;
+        for i := 0 to pWeightOwner.CountLayers() - 1 do
+          if pWeightOwner.Layers[i].CountWeights() > 0 then
+            Inc(OwnerWeightLayers);
+        if NN.LinkWeightsFrom(pWeightOwner) <> OwnerWeightLayers then
+          ImportError('Llama import: not every weight layer of the owner ' +
+            'net is borrowed by the twin (graph mismatch).');
+        Result := NN;
+        NN := nil; // ownership transferred to the caller
+        // The finally below still runs: nothing was read, so nothing to close.
+        exit;
+      end;
 
       // ---------------- Weights ----------------
       // Config.RMSNormAddOne (Gemma): every RMSNorm gain is stored as 1 + w
@@ -17164,7 +17263,7 @@ begin
         Tmp.Free;
       end;
       // Re-quantize the refilled LM head before streaming the blocks.
-      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      if QuantizeSweeps then NN.QuantizeWeightsInt8();
       NumLayersM1 := Config.NumLayers - 1;
       for BlockCnt := 0 to NumLayersM1 do
       begin
@@ -17486,7 +17585,7 @@ begin
               BlockPrefix + 'mlp.shared_expert_gate.weight',
               Config.HiddenSize, 1);
             MarkConsumed(BlockPrefix + 'mlp.shared_expert_gate.weight');
-            if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+            if QuantizeSweeps then NN.QuantizeWeightsInt8();
             continue;
           end;
           if Config.MoEGateUpTransposed then
@@ -17520,7 +17619,7 @@ begin
                 Config.SharedIntermediateSize, Config.HiddenSize);
               MarkConsumed(TensorNameStr + 'down_proj.weight');
             end;
-            if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+            if QuantizeSweeps then NN.QuantizeWeightsInt8();
             continue;
           end;
           if Config.MoEGraniteNaming then
@@ -17569,7 +17668,7 @@ begin
                 {Scale=}Config.ResidualMultiplier);
               MarkConsumed(TensorNameStr + 'output_linear.weight');
             end;
-            if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+            if QuantizeSweeps then NN.QuantizeWeightsInt8();
             continue;
           end;
           if Config.MoEQwen3Naming then
@@ -17640,7 +17739,7 @@ begin
               MarkConsumed(TensorNameStr + 'w2.weight');
             end;
           end;
-          if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+          if QuantizeSweeps then NN.QuantizeWeightsInt8();
           continue;
         end;
         // Dense FFN width: Llama-4 dense layers carry intermediate_size_mlp
@@ -17693,14 +17792,14 @@ begin
           Config.ResidualMultiplier);
         MarkConsumed(TensorNameStr + 'down_proj.weight');
         // Re-quantize the block just refilled with checkpoint weights.
-        if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+        if QuantizeSweeps then NN.QuantizeWeightsInt8();
       end;
       LoadLlamaRMSNormWeights(Reader, FinalNorm,
         Config.Prefix + 'norm.weight', Config.HiddenSize, NormGainOffset);
       MarkConsumed(Config.Prefix + 'norm.weight');
 
       // Final sweep: everything refilled above ends int8-quantized.
-      if pQuantizeInt8 then NN.QuantizeWeightsInt8();
+      if QuantizeSweeps then NN.QuantizeWeightsInt8();
       // ---------------- Unexpected-tensor check ----------------
       // Every tensor must be consumed or be a known ignorable buffer:
       // older HF exports serialize the per-layer "rotary_emb.inv_freq"
@@ -17741,11 +17840,17 @@ end;
 
 function BuildLlamaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
-  pTrainable: boolean = true; pQuantizeInt8: boolean = false): TNNet;
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
+var
+  Reader: TNNetSafeTensorsReader;
 begin
-  Result := BuildLlamaFromTensorReaderWithConfig(
-    CreatePretrainedTensorReader(FileName), FileName, Config, pSeqLen,
-    pTrainable, pQuantizeInt8);
+  // A borrowing build never opens the checkpoint: the owner net holds the
+  // weights, so FileName need not even exist.
+  if Assigned(pWeightOwner) then Reader := nil
+  else Reader := CreatePretrainedTensorReader(FileName);
+  Result := BuildLlamaFromTensorReaderWithConfig(Reader, FileName, Config,
+    pSeqLen, pTrainable, pQuantizeInt8, pWeightOwner);
 end;
 
 function BuildLlamaFromGGUFEx(const FileName: string;
@@ -20169,7 +20274,7 @@ function BuildLlamaFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true;
   const ConfigFileName: string = '';
-  pQuantizeInt8: boolean = false): TNNet;
+  pQuantizeInt8: boolean = false; pWeightOwner: TNNet = nil): TNNet;
 var
   ConfigPath: string;
 begin
@@ -20178,7 +20283,7 @@ begin
   Config := ReadLlamaConfigFromJSONFile(ConfigPath);
   // The builder detects Config.Prefix from the checkpoint (var parameter).
   Result := BuildLlamaFromSafeTensorsWithConfig(FileName, Config, pSeqLen,
-    pTrainable, pQuantizeInt8);
+    pTrainable, pQuantizeInt8, pWeightOwner);
 end;
 
 function BuildLlamaFromSafeTensors(const FileName: string;
@@ -27823,10 +27928,11 @@ end;
 function BuildLlamaFamilyFromSafeTensors(const FileName: string;
   const ExpectedModelType: string; out Config: TLlamaConfig;
   pSeqLen: integer; pTrainable: boolean;
-  const ConfigFileName: string; pQuantizeInt8: boolean = false): TNNet;
+  const ConfigFileName: string; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 begin
   Result := BuildLlamaFromSafeTensorsEx(FileName, Config, pSeqLen,
-    pTrainable, ConfigFileName, pQuantizeInt8);
+    pTrainable, ConfigFileName, pQuantizeInt8, pWeightOwner);
   if Config.ModelType <> ExpectedModelType then
   begin
     Result.Free;
@@ -27840,10 +27946,11 @@ end;
 function BuildMistralFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true;
-  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'mistral', Config,
-    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8, pWeightOwner);
 end;
 
 function BuildMistralFromSafeTensors(const FileName: string;
@@ -27859,10 +27966,11 @@ end;
 function BuildQwen2FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true;
-  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'qwen2', Config,
-    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8, pWeightOwner);
 end;
 
 function BuildQwen2FromSafeTensors(const FileName: string;
@@ -27878,10 +27986,11 @@ end;
 function BuildQwen3FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true;
-  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'qwen3', Config,
-    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8, pWeightOwner);
 end;
 
 function BuildQwen3FromSafeTensors(const FileName: string;
@@ -27897,10 +28006,11 @@ end;
 function BuildQwen3MoeFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true;
-  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'qwen3_moe', Config,
-    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8, pWeightOwner);
 end;
 
 function BuildQwen3MoeFromSafeTensors(const FileName: string;
@@ -27916,10 +28026,11 @@ end;
 function BuildQwen35FromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true;
-  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'qwen3_5', Config,
-    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8, pWeightOwner);
 end;
 
 function BuildQwen35FromSafeTensors(const FileName: string;
@@ -27935,10 +28046,11 @@ end;
 function BuildQwen35MoeFromSafeTensorsEx(const FileName: string;
   out Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true;
-  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 begin
   Result := BuildLlamaFamilyFromSafeTensors(FileName, 'qwen3_5_moe', Config,
-    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8);
+    pSeqLen, pTrainable, ConfigFileName, pQuantizeInt8, pWeightOwner);
 end;
 
 function BuildQwen35MoeFromSafeTensors(const FileName: string;
@@ -44344,7 +44456,7 @@ var
   BqA, BkA, BvA, BoA: array of TNeuralFloat;
   // #9: per-layer LayerNorm / LayerScale chain binds (invariant across t1/dd).
   LnG, LnB, LnPG, LnPB, ASc, MSc: TNeuralFloatDynArr;
-  HnRow, Mlp1Row, VRow, XRow: array of double;
+  HnRow, Mlp1Row, VRow, XRow, SigRow: array of double;
   QRow, KRow, AttnRow: array of double;
   QPtr: PDouble;
   HasBq, HasBk, HasBv, HasBo: boolean;
@@ -44384,7 +44496,8 @@ begin
   for t1 := 0 to TM1 do
   begin
     SetLength(X[t1], D);
-    for dd := 0 to DM1 do X[t1][dd] := Sig[dd][t1];
+    XRow := X[t1];                     // #9: bind the invariant row once per t1
+    for dd := 0 to DM1 do XRow[dd] := Sig[dd][t1];
   end;
   // Precompute inv_freq for RoPE (head_dim).
   SetLength(invfreq, half);
@@ -44402,8 +44515,10 @@ begin
     for dd := 0 to halfM1 do
     begin
       ang := t1 * invfreq[dd];           // #4: shared angle for Cos and Sin
-      qr := Cos(ang);
-      kr := Sin(ang);
+      // #16: one SinCos per angle - on x86_64 it is a single x87 fsincos,
+      // whose results match the fsin/fcos the separate calls compile to
+      // (same hardware argument reduction), so parity is preserved.
+      SinCos(ang, kr, qr);               // kr = Sin, qr = Cos
       CosTab[tBase + dd] := qr;
       CosTab[tBase + dd + half] := qr;
       SinTab[tBase + dd] := kr;
@@ -44620,7 +44735,10 @@ begin
   end;
   // write back channel-major.
   for dd := 0 to DM1 do
-    for t1 := 0 to TM1 do Sig[dd][t1] := X[t1][dd];
+  begin
+    SigRow := Sig[dd];                 // #9: bind the invariant row once per dd
+    for t1 := 0 to TM1 do SigRow[t1] := X[t1][dd];
+  end;
 end;
 
 // One conv encoder/decoder stage (eskConv / eskELU / eskResnet) using the
@@ -45736,18 +45854,29 @@ end;
 
 procedure TNNetDAC.Encode(const Waveform: array of TNeuralFloat;
   out Codes: TNNetIntArr2D; out FrameCount: integer);
+const
+  // See TNNetMimi.Encode: frames are independent (the residual recursion is
+  // within a frame, across q), so blocking the frame axis reads each in_proj
+  // row, normalized codebook row and out_proj row once per block instead of
+  // once per frame. The residual is Double, so the block working set is
+  // csDacRvqFrameBlock * HiddenDim * 8 bytes (8 * 1024 * 8 = 64 KB).
+  csDacRvqFrameBlock = 8;
 var
   Sig, Tmp: TMimiDblArr2D;
   i, t, b, NumStages, ru, q, NQ, Cd, HiddenDim: integer;
-  Frames, FramesM1, Stride, Pad, Km: integer;
-  Residual, NormP: TMimiDblArr;
-  cbk, best: integer;
-  dot, BestSim: double;
+  Frames, FramesM1, Stride, Pad: integer;
+  cbk: integer;
+  dot: double;
   CBN: TMimiDblArr;             // reference bind of FCodebookNorms[q]
   WIn, BIn, WOut, BOut, CBData: TNeuralFloatDynArr; // #9 per-q field binds
   CbSize, d, CdM1: integer;
   wBase, cbBase, bestBase, oBase: integer;
   WaveLenM1, NumStagesM1, EncResHigh, NQM1, CbSizeM1, HiddenDimM1: integer;
+  t0, tt, BCountM1, rBase, npBase: integer;
+  RBuf: TMimiDblArr;             // csDacRvqFrameBlock residuals, frame-major
+  NPBuf: TMimiDblArr;            // projected latents, frame-major [b*Cd + d]
+  BestSim: TMimiDblArr;          // per blocked frame
+  BestIdx: TNeuralIntegerArray;  // per blocked frame
 begin
   // input -> [1][T]
   SetLength(Sig, 1);
@@ -45787,11 +45916,26 @@ begin
   SetLength(Codes, NQ);
   for q := 0 to NQM1 do SetLength(Codes[q], Frames);
 
-  SetLength(Residual, HiddenDim);
-  SetLength(NormP, Cd);
-  for t := 0 to FramesM1 do
+  SetLength(RBuf, csDacRvqFrameBlock * HiddenDim);
+  SetLength(NPBuf, csDacRvqFrameBlock * Cd);
+  SetLength(BestSim, csDacRvqFrameBlock);
+  SetLength(BestIdx, csDacRvqFrameBlock);
+  // Frame-blocked RVQ (see TNNetMimi.Encode): each in_proj / codebook /
+  // out_proj row is read once per block of frames instead of once per frame.
+  // Every dot keeps its operands and element order and every argmax sees the
+  // same candidate sequence, so the codes are bit-identical.
+  t0 := 0;
+  while t0 <= FramesM1 do
   begin
-    for i := 0 to HiddenDimM1 do Residual[i] := Sig[i][t];
+    BCountM1 := csDacRvqFrameBlock - 1;
+    if t0 + BCountM1 > FramesM1 then BCountM1 := FramesM1 - t0;
+    rBase := 0;
+    for b := 0 to BCountM1 do
+    begin
+      tt := t0 + b;
+      for i := 0 to HiddenDimM1 do RBuf[rBase + i] := Sig[i][tt];
+      Inc(rBase, HiddenDim);
+    end;
     for q := 0 to NQM1 do
     begin
       // #9: bind the per-q record field chains once (array-of-record deref +
@@ -45799,16 +45943,19 @@ begin
       WIn := FInProj[q].W;   BIn := FInProj[q].B;
       WOut := FOutProj[q].W; BOut := FOutProj[q].B;
       CBData := FCodebooks[q].Data;
-      // in_proj: 1x1 conv hidden->codebook_dim. Residual is one frame; do the
-      // matmul (out[o] = bias + sum_i W[o,i]*residual[i]).
-      Km := FInProj[q].Kernel; // = 1
-      if Km = 0 then Km := 1;
+      // in_proj: 1x1 conv hidden->codebook_dim, weight-row outer so each
+      // Single row streams once per block against every blocked residual.
       wBase := 0; // d * HiddenDim
       for d := 0 to CdM1 do
       begin
-        // Single weight row against the Double residual: the staged
-        // mixed-precision dot avoids the cvtss2sd false dependency chain.
-        NormP[d] := BIn[d] + DotProductSD(@WIn[wBase], @Residual[0], HiddenDim);
+        rBase := 0; npBase := d;
+        for b := 0 to BCountM1 do
+        begin
+          // Single weight row against the Double residual: the staged
+          // mixed-precision dot avoids the cvtss2sd false dependency chain.
+          NPBuf[npBase] := BIn[d] + DotProductSD(@WIn[wBase], @RBuf[rBase], HiddenDim);
+          Inc(rBase, HiddenDim); Inc(npBase, Cd);
+        end;
         Inc(wBase, HiddenDim);
       end;
       // argmax cosine against the pre-normalized codebook. #14: the projected
@@ -45819,34 +45966,49 @@ begin
       // drops a sum of squares, a Sqrt and Cd divides per (frame, quantizer).
       CbSize := FCodebooks[q].Rows;
       CbSizeM1 := CbSize - 1;
-      best := 0; BestSim := -1e30;
       CBN := FCodebookNorms[q];
+      for b := 0 to BCountM1 do
+      begin
+        BestSim[b] := -1e30; BestIdx[b] := 0;
+      end;
       cbBase := 0; // cbk * Cd
       for cbk := 0 to CbSizeM1 do
       begin
-        dot := MimiDotProductD(@NormP[0], @CBN[cbBase], Cd);
-        if dot > BestSim then begin BestSim := dot; best := cbk; end;
+        npBase := 0;
+        for b := 0 to BCountM1 do
+        begin
+          dot := MimiDotProductD(@NPBuf[npBase], @CBN[cbBase], Cd);
+          if dot > BestSim[b] then begin BestSim[b] := dot; BestIdx[b] := cbk; end;
+          Inc(npBase, Cd);
+        end;
         Inc(cbBase, Cd);
       end;
-      Codes[q][t] := best;
-      // out_proj(raw codebook row) -> hidden, subtract from residual.
+      for b := 0 to BCountM1 do Codes[q][t0 + b] := BestIdx[b];
+      // out_proj(raw codebook row) -> hidden, subtract from residual;
+      // weight-row outer so each WOut row streams once per block.
       // W and codebook data are both Single but the accumulator is Double for
-      // the <1e-4 codec parity tolerance. Cd is 8, and the i-loop already supplies
-      // the instruction-level parallelism a staged mixed-precision dot would
-      // add - measured 2.97 cycles/element as written against 2.40 staged, not
-      // enough to justify reassociating a sum the parity tolerance pins.
-      // Offset bases hoisted.
-      bestBase := best * Cd; // invariant across the whole i-loop
+      // the <1e-4 codec parity tolerance. Cd is 8, and the d-loop already
+      // supplies the instruction-level parallelism a staged mixed-precision dot
+      // would add - measured 2.97 cycles/element as written against 2.40
+      // staged, not enough to justify reassociating a sum the parity tolerance
+      // pins. Offset bases hoisted.
       oBase := 0;            // i * Cd
       for i := 0 to HiddenDimM1 do
       begin
-        dot := BOut[i];
-        for d := 0 to CdM1 do
-          dot := dot + WOut[oBase + d] * CBData[bestBase + d];
-        Residual[i] := Residual[i] - dot;
+        rBase := i;          // b*HiddenDim + i, carried
+        for b := 0 to BCountM1 do
+        begin
+          bestBase := BestIdx[b] * Cd;
+          dot := BOut[i];
+          for d := 0 to CdM1 do
+            dot := dot + WOut[oBase + d] * CBData[bestBase + d];
+          RBuf[rBase] := RBuf[rBase] - dot;
+          Inc(rBase, HiddenDim);
+        end;
         Inc(oBase, Cd);
       end;
     end;
+    Inc(t0, csDacRvqFrameBlock);
   end;
 end;
 
@@ -45856,10 +46018,12 @@ var
   Sig, Tmp: TMimiDblArr2D;
   i, t, b, NumStages, ru, q, NQ, Cd, HiddenDim, Frames, code, d: integer;
   Stride, Pad, FramesM1, NUse, OutLen, CdM1: integer;
-  codeBase, oBase: integer;
+  codeBase, oBase, tBase: integer;
   dot: double;
   HiddenDimM1, NUseM1, NumStagesM1, DecResHigh, OutLenM1: integer;
   WOut, BOut, CBData: TNeuralFloatDynArr;  // #9: q-invariant out_proj / codebook
+  Acc: TMimiDblArr;    // frame-major [t*HiddenDim + i] RVQ accumulator
+  SigRow: TMimiDblArr;
 begin
   NQ := Length(FCodebooks);
   if (UseCodebooks > 0) and (UseCodebooks < NQ) then NUse := UseCodebooks
@@ -45873,16 +46037,19 @@ begin
   FramesM1 := Frames - 1;
 
   // from_codes: quantized = sum_q out_proj(codebook[codes[q]]).
-  SetLength(Sig, HiddenDim);
-  for i := 0 to HiddenDimM1 do
-  begin
-    SetLength(Sig[i], Frames);
-    FillChar(Sig[i][0], Frames * csDoubleSize, 0);
-  end;
+  // Accumulate FRAME-major (see TNNetMimi.Decode): the channel-major form
+  // scattered each per-(q,t) out_proj column across HiddenDim SEPARATE dynamic
+  // arrays, touching one element (and one cache line) in each and resolving
+  // Sig[i] twice per element. Acc[t*HiddenDim + i] is one contiguous run per
+  // frame; the additions keep their order and operands, so the samples are
+  // bit-identical. Transposed to channel-major once at the end, not NUse times.
+  SetLength(Acc, Frames * HiddenDim);
+  if Frames > 0 then FillChar(Acc[0], Frames * HiddenDim * csDoubleSize, 0);
   for q := 0 to NUseM1 do
   begin
     WOut := FOutProj[q].W; BOut := FOutProj[q].B;  // #9: bind invariant chains
     CBData := FCodebooks[q].Data;                  //     (all q-only, not t/i/d)
+    tBase := 0;              // #6: t*HiddenDim carried
     for t := 0 to FramesM1 do
     begin
       code := Codes[q][t];
@@ -45893,9 +46060,25 @@ begin
         dot := BOut[i];
         for d := 0 to CdM1 do
           dot := dot + WOut[oBase + d] * CBData[codeBase + d];
-        Sig[i][t] := Sig[i][t] + dot;
+        Acc[tBase + i] := Acc[tBase + i] + dot;
         Inc(oBase, Cd);
       end;
+      Inc(tBase, HiddenDim);
+    end;
+  end;
+  // App.E/#9: channel-outer transpose - each channel row is sized and bound
+  // once and written contiguously; the frame-major source advances by the
+  // carried HiddenDim stride (#6).
+  SetLength(Sig, HiddenDim);
+  for i := 0 to HiddenDimM1 do
+  begin
+    SetLength(Sig[i], Frames);
+    SigRow := Sig[i];
+    tBase := i;                      // t*HiddenDim + i, carried
+    for t := 0 to FramesM1 do
+    begin
+      SigRow[t] := Acc[tBase];
+      Inc(tBase, HiddenDim);
     end;
   end;
 
@@ -67243,7 +67426,8 @@ var
   tx, ty, d: integer;
   gx, gy, gxBase, gyBase: integer;  // global image coords
   wx, wy, w, oneMinusW: TNeuralFloat;  // feather weights
-  invOv: Double;                       // 1/(ImgOverlap+1), call-invariant (#5)
+  invOv: TNeuralFloat;                 // 1/(ImgOverlap+1), call-invariant (#5);
+                                       // Single: feeds Single blend weights (#25)
   StartsYHi, StartsXHi, TileLatentMinSizeM1, LatentDepthM1: integer;
   ImgTileWM1, OutChannelsM1: integer;
   ltBase, latBase, resBase, doBase: integer;
@@ -67354,18 +67538,13 @@ begin
         begin
           wx := (tx + 1) * invOv;
           w := wx * wy;
-          // w is d-invariant: full overwrite (w=1) is a Move; the feather edge
-          // is scale-in-place + scaled accumulate.
-          if w = 1.0 then
-            Move(DecOut.FData[doBase], Result.FData[resBase],
-              OutChannels * csNeuralFloatSize)
-          else
-          begin
-            oneMinusW := 1.0 - w;
-            TNNetVolume.Mul(Result.GetRawPtr(resBase), oneMinusW, OutChannels);
-            TNNetVolume.MulAdd(Result.GetRawPtr(resBase),
-              DecOut.GetRawPtr(doBase), w, OutChannels);
-          end;
+          oneMinusW := 1.0 - w;
+          // Fused scalar blend: the run is only OutChannels (=3) elements, so
+          // per-pixel bulk kernel calls cost more in dispatch than the 3 muls
+          // and 3 FMAs they replace.
+          for d := 0 to OutChannelsM1 do
+            Result.FData[resBase + d] :=
+              oneMinusW * Result.FData[resBase + d] + w * DecOut.FData[doBase + d];
           Inc(resBase, OutChannels);
           Inc(doBase, OutChannels);
         end;
@@ -80730,9 +80909,26 @@ begin
   end;
 end;
 
+function PretrainedModelTypeCanBorrowWeights(const ModelType: string): boolean;
+begin
+  Result := (ModelType = 'llama') or (ModelType = 'mistral') or
+    (ModelType = 'qwen2') or (ModelType = 'qwen3') or
+    (ModelType = 'qwen3_moe') or
+    (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_moe') or
+    (ModelType = 'gemma') or (ModelType = 'gemma2') or
+    (ModelType = 'gemma3_text') or (ModelType = 'phi3') or
+    (ModelType = 'olmo2') or (ModelType = 'olmoe') or
+    (ModelType = 'mixtral') or
+    (ModelType = 'glm4') or
+    (ModelType = 'granite') or (ModelType = 'granitemoe') or
+    (ModelType = 'minicpm') or
+    (ModelType = 'bitnet');
+end;
+
 function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
   pTrainable: boolean = true;
-  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false): TNNet;
+  const ConfigFileName: string = ''; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNet = nil): TNNet;
 var
   ConfigPath, WeightsPath, ModelType, ArchName: string;
   JsonText: TStringList;
@@ -80843,6 +81039,15 @@ begin
     JsonText.Free;
   end;
 
+  // A borrowing twin exists for the Llama builder only: every other family
+  // is refused here with the reason, before any builder runs.
+  if Assigned(pWeightOwner) and
+    (not PretrainedModelTypeCanBorrowWeights(ModelType)) then
+    ImportError('BuildFromPretrained: model_type "' + ModelType +
+      '" cannot borrow the weights of an already-loaded net - only the ' +
+      'Llama-family builders can (PretrainedModelTypeCanBorrowWeights); ' +
+      'build the second net without pWeightOwner.');
+
   // ---- dispatch ----
   if (ModelType = 'gpt2') and GPT2SeqCls then
   begin
@@ -80939,18 +81144,11 @@ begin
     // BuildLlama4FromSafeTensors.
     Result := BuildLlama4FromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
-  else if (ModelType = 'llama') or (ModelType = 'mistral') or
-          (ModelType = 'qwen2') or (ModelType = 'qwen3') or
-          (ModelType = 'qwen3_moe') or
-          (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_moe') or
-          (ModelType = 'gemma') or (ModelType = 'gemma2') or
-          (ModelType = 'gemma3_text') or (ModelType = 'phi3') or
-          (ModelType = 'olmo2') or (ModelType = 'olmoe') or
-          (ModelType = 'mixtral') or
-          (ModelType = 'glm4') or
-          (ModelType = 'granite') or (ModelType = 'granitemoe') or
-          (ModelType = 'minicpm') or
-          (ModelType = 'bitnet') then
+  else if PretrainedModelTypeCanBorrowWeights(ModelType) then
+    // llama, mistral, qwen2, qwen3, qwen3_moe, qwen3_5, qwen3_5_moe, gemma,
+    // gemma2, gemma3_text, phi3, olmo2, olmoe, mixtral, glm4, granite,
+    // granitemoe, minicpm, bitnet - the one Llama builder, so these are also
+    // the families whose twin can borrow a loaded net's weights.
     // 'glm4' (architectures ["Glm4ForCausalLM"], THUDM/GLM-4-9B-0414 etc.)
     // raises the four-norm sandwich (post_self_attn_layernorm /
     // post_mlp_layernorm INSIDE the residual branches), partial+interleaved
@@ -80984,7 +81182,7 @@ begin
     // gated-shared-expert sparse FFN; the vision tower and MTP head are
     // skipped (TEXT decoder only). See BuildQwen35FromSafeTensorsEx.
     Result := BuildLlamaFromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
-      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
+      pSeqLen, pTrainable, ConfigPath, pQuantizeInt8, pWeightOwner)
   else if (ModelType = 'bert') or (ModelType = 'distilbert') or
           (ModelType = 'roberta') or (ModelType = 'xlm-roberta') then
     // ENCODER route: input (SeqLen,1,2) token|token-type ids (channel 1

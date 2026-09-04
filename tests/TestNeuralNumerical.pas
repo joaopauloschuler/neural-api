@@ -13,6 +13,20 @@ uses
   ;
 
 type
+  // Test-only split-sizing overrides handed to TNNetFusedSDPACL (0 = automatic).
+  // UsableLocalMemBytes is the scratch budget the score tile is sized against;
+  // the helper adds the kernel's own local memory and the reserve back on top
+  // to make the forced device figure.
+  TFusedSDPASplitOverride = record
+    Splits, ChunkRows, UsableLocalMemBytes: integer;
+  end;
+  // The pass-1 geometry of the last decode step, read back for the assertions:
+  // the chunking, the scratch it asked for, the kernel's own local memory and
+  // the local-memory figure (forced or device) it was sized against.
+  TFusedSDPASplitLaunch = record
+    Splits, ChunkRows, StaticLocalBytes, LocalMemBytes, ScratchBytes: integer;
+  end;
+
   TTestNeuralNumerical = class(TTestCase)
   private
     // Last message handed to TEasyOpenCL.ErrorProc by a deliberate bad build.
@@ -26,6 +40,12 @@ type
     procedure RunMoEBankDownOpenCLParity(TokenCnt, HiddenSize, ExpertCnt,
       ExpertWidth, TopCnt: integer; Quantize, ScaleInputByGate, WithBias,
       SparseRouter: boolean; const Msg: string; Tolerance: TNeuralFloat);
+    // Runs one split-row decode parity case, prints its max|diff| and launch
+    // geometry, and checks the OpenCL forward count and the tolerance.
+    function CheckFusedSDPASplitCase(const What: string; QHeads, KVHeads, Dk,
+      StepCnt, StepTokens, Window: integer; Int8KV: boolean;
+      SoftCap, Tolerance: TNeuralFloat; const Override: TFusedSDPASplitOverride;
+      ExpectedGpuForwards: integer): TFusedSDPASplitLaunch;
   published
     // Convolution numerical tests with known weights
     procedure TestConvolutionNumericalValues;
@@ -392,6 +412,43 @@ type
     procedure FusedSDPAInt8DecodeResidentOpenCLParity;
     procedure FusedSDPAInt8WindowedDecodeOpenCLParity;
     procedure FusedSDPAInt8HandoffDecodeOpenCLParity;
+    // A decode step that carries a WINDOW of token rows, so one launch holds
+    // many (KV head, token row) pairs. Every row is appended before the
+    // attention runs, so row t must still stop at its own cache slot; the
+    // sliding window and the soft cap ride along on the int8 twin.
+    procedure FusedSDPAMultiTokenStepOpenCLParity;
+    procedure FusedSDPAInt8MultiTokenStepOpenCLParity;
+    // The split-row decode with a chunk boundary inside the live range and a
+    // partially filled last chunk: ChunkRows forced to 12, so 40 single-token
+    // steps end at Splits = 4 whatever the device's compute-unit count. Dk is
+    // off the vector width (float4 / 16 codes), so the remainder loops run.
+    procedure FusedSDPASplitLongContextOpenCLParity;
+    procedure FusedSDPAInt8SplitLongContextOpenCLParity;
+    // A 20-row step over 8-row chunks: rows t < 8 leave chunks 1 and 2 with
+    // no live row, so the empty-chunk state must merge to zero weight.
+    procedure FusedSDPASplitEmptyChunksOpenCLParity;
+    procedure FusedSDPAInt8SplitEmptyChunksOpenCLParity;
+    // A 5-row sliding window over 4-row chunks with the soft-cap on: jStart
+    // lands inside a chunk and past whole chunks, and the chunk base follows
+    // row 0's window start.
+    procedure FusedSDPASplitWindowOpenCLParity;
+    procedure FusedSDPAInt8SplitWindowOpenCLParity;
+    // GroupSize 1 (one query head per KV head), and MQA with 18 query heads on
+    // one KV head - wider than the kernel's 16-head register slab.
+    procedure FusedSDPASplitGroupSizeOneOpenCLParity;
+    procedure FusedSDPASplitMQAOpenCLParity;
+    // A forced 1120-byte local-memory budget: ChunkRows shrinks to 2 and 140
+    // steps push Splits past the configured maximum, still matching the CPU.
+    procedure FusedSDPASplitLocalMemShrinkOpenCLParity;
+    // A budget too small for the query tile keeps the layer on the host path.
+    procedure FusedSDPASplitQueryTileFallbackOpenCLParity;
+    // A forced local-memory figure on the int8 kernel: the scratch of every
+    // launch stays within the figure less the kernel's own local memory and
+    // csFusedSDPALocalMemReserveBytes, so the device keeps its headroom.
+    procedure FusedSDPAInt8SplitLocalMemHeadroomOpenCLParity;
+    // A 600-row span with one forced chunk: csFusedSDPAMaxChunkRows caps the
+    // chunk and the chunk count grows to cover the span.
+    procedure FusedSDPASplitChunkRowsCapOpenCLParity;
     // The int8 append kernel against QuantizeCacheRow: row scales within one
     // ulp, codes within one step, and codes exactly equal on rows built to
     // stress the quantizer - all zeros, one outlier, flat, exact midpoints.
@@ -507,6 +564,13 @@ type
     // reduce) vs an FP32 forward over the same dequantized weights, on the
     // pointwise, spatial (device im2col) and one-slab shapes. Coded by Claude (AI).
     procedure TestInt4OpenCLParity;
+    // Tiled int8 / int4 GEMM for a window of columns (cai_dot_product_int8_tiled,
+    // _tiled_h, _int4_tiled) vs the existing kernels over the same resident
+    // codes and vs the CPU / dequantized-FP32 reference, on shapes on both
+    // sides of the column threshold with ragged rows, columns and reduction
+    // axis; the launch counter proves the tiled path ran. Coded by Claude (AI).
+    procedure TestTiledGemmInt8OpenCLParity;
+    procedure TestTiledGemmInt4OpenCLParity;
     // OpenCL single-launch fused-mixture forward parity (vs the fused CPU
     // forward) for TNNetMoEExpertBankDown: the whole gate-weighted expert
     // mixture of one MoE block in one kernel, reading the gate|up bank's slot
@@ -715,6 +779,9 @@ type
     procedure TestNormLayersInferenceOnlyForwardParity;
     procedure TestRMSNormGatedGradientCheck;
     procedure TestRMSNormGatedSerializationRoundTrip;
+    // TNNetLlama4AttnTemperature: per-position log1p(floor(pos/floor_scale))
+    // step-function scaling, with positions crossing floor-value boundaries.
+    procedure TestLlama4AttnTemperatureFloorBoundary;
     // Residual builder helpers (AddPreNormResidual / AddRMSNormResidual / AddPostNormResidual / AddGatedResidual)
     procedure TestPreNormResidualGradientCheck;
     procedure TestRMSNormResidualGradientCheck;
@@ -1684,6 +1751,7 @@ type
     procedure TestLogCoshActivationGradientCheck;
     procedure TestLogCoshActivationStability;
     procedure TestSerfGradientCheck;
+    procedure TestVisionRoPE2DForwardAndGradientCheck;
     procedure TestBentIdentityForward;
     procedure TestBentIdentityGradientCheck;
     procedure TestBentIdentitySerializationRoundTrip;
@@ -2965,6 +3033,9 @@ procedure TTestNeuralNumerical.TestSoftExponentialGradientCheck;
 begin
   // alpha > 0 branch: derivative = exp(alpha*x), smooth everywhere.
   ActivationGradientCheck(Self, TNNetSoftExponential.Create(0.5), 'SoftExponentialPos',
+    [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
+  // alpha = 0 branch: identity forward with derivative 1 everywhere.
+  ActivationGradientCheck(Self, TNNetSoftExponential.Create(0.0), 'SoftExponentialZero',
     [0.5, -0.5, 1.0, -2.0, 2.5], 0.01);
   // alpha < 0 branch: keep inputs inside the log domain x < 1/alpha - alpha.
   // For alpha = -0.3 that bound is ~ -3.03, so bounded inputs are safe.
@@ -27169,6 +27240,47 @@ begin
     TNNetRMSNormGated.Create(), 'RMSNormGated', 3, 2, 4, 1e-5);
 end;
 
+procedure TTestNeuralNumerical.TestLlama4AttnTemperatureFloorBoundary;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  pos, d, SeqLen, Depth: integer;
+  Expected, Scale: TNeuralFloat;
+begin
+  // FloorScale = 2 makes the floor value step every 2 positions, so the
+  // 6-position sequence crosses several run boundaries: position 0 has floor
+  // value 0 (scale exactly 1), 1..2 floor 1, 3..4 floor 2, 5 floor 3.
+  SeqLen := 6;
+  Depth := 3;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth));
+    NN.AddLayer(TNNetLlama4AttnTemperature.Create(2.0, 0.5));
+    for pos := 0 to SeqLen - 1 do
+      for d := 0 to Depth - 1 do
+        Input[pos, 0, d] := 1 + pos * 0.25 + d * 0.125;
+    NN.Compute(Input);
+    for pos := 0 to SeqLen - 1 do
+    begin
+      Scale := Ln(1 + Floor((pos + 1) / 2.0)) * 0.5 + 1;
+      for d := 0 to Depth - 1 do
+      begin
+        Expected := Input[pos, 0, d] * Scale;
+        AssertEquals('Llama4AttnTemperature pos ' + IntToStr(pos) +
+          ' depth ' + IntToStr(d), Expected,
+          NN.GetLastLayer.Output[pos, 0, d], 2e-4);
+      end;
+    end;
+    // The floor-0 run multiplies by exactly 1: the output must be bit-equal.
+    AssertEquals('Llama4AttnTemperature floor-0 position is exact',
+      Input[0, 0, 0], NN.GetLastLayer.Output[0, 0, 0], 0.0);
+  finally
+    NN.Free;
+    Input.Free;
+  end;
+end;
+
 procedure TTestNeuralNumerical.TestSwitchableNormSerializationRoundTrip;
 begin
   // The two mixing logits (FNeurons[0], exactly 2 weights) survive
@@ -30860,6 +30972,100 @@ begin
   // Serf is smooth everywhere; sample a moderate range around the bend.
   ActivationGradientCheck(Self, TNNetSerf.Create(), 'Serf',
     [0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 0.0], 0.01);
+end;
+
+// 2x2 patch grid + 1 prefix token, head_dim 8. Checks: prefix tokens pass
+// through untouched, each rotated pair preserves its norm (the rotation is
+// orthogonal), and the input gradient matches a finite-difference probe.
+procedure TTestNeuralNumerical.TestVisionRoPE2DForwardAndGradientCheck;
+const
+  SeqLen = 5;   // 1 prefix + 2x2 patches
+  Depth = 8;
+  HalfD = Depth div 2;
+var
+  NN: TNNet;
+  Input, InputPlus, Desired: TNNetVolume;
+  // Double keeps the finite-difference subtraction meaningful: the loss sums
+  // 40 O(1) terms, so a Single accumulator's rounding is ~1% of the probe.
+  epsilon, lossPlus, lossMinus, numericalGrad: Double;
+  analyticalGrad: TNeuralFloat;
+  inNorm, outNorm: TNeuralFloat;
+  i, pos, c: integer;
+  Rope: TNNetVisionRoPE2D;
+  OutV: TNNetVolume;
+
+  function ComputeLoss(AInput: TNNetVolume): Double;
+  var
+    k: integer;
+    diff: Double;
+  begin
+    NN.Compute(AInput);
+    Result := 0;
+    for k := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      diff := NN.GetLastLayer.Output.Raw[k] - Desired.Raw[k];
+      Result := Result + 0.5 * diff * diff;
+    end;
+  end;
+
+begin
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Depth);
+  InputPlus := TNNetVolume.Create(SeqLen, 1, Depth);
+  Desired := TNNetVolume.Create(SeqLen, 1, Depth);
+  epsilon := 0.0001;
+  try
+    NN.AddLayer(TNNetInput.Create(SeqLen, 1, Depth, 1));
+    Rope := TNNetVisionRoPE2D.Create(2, 2, 1, 100.0);
+    NN.AddLayer(Rope);
+    NN.SetLearningRate(1.0, 0.0);
+    NN.SetBatchUpdate(true);
+
+    for i := 0 to Input.Size - 1 do
+      Input.Raw[i] := Sin(i * 0.61) * 1.3 + 0.1;
+    for i := 0 to Desired.Size - 1 do
+      Desired.Raw[i] := Cos(i * 0.37);
+
+    NN.Compute(Input);
+    OutV := NN.GetLastLayer.Output;
+    // Prefix token (pos 0) is passed through unrotated.
+    for c := 0 to Depth - 1 do
+      AssertEquals('VisionRoPE2D prefix channel ' + IntToStr(c),
+        Input[0, 0, c], OutV[0, 0, c], 1e-6);
+    // Each patch token's rotated pair (c, c+HalfD) preserves its norm.
+    for pos := 1 to SeqLen - 1 do
+      for c := 0 to HalfD - 1 do
+      begin
+        inNorm := Sqr(Input[pos, 0, c]) + Sqr(Input[pos, 0, c + HalfD]);
+        outNorm := Sqr(OutV[pos, 0, c]) + Sqr(OutV[pos, 0, c + HalfD]);
+        AssertEquals('VisionRoPE2D pair norm at pos ' + IntToStr(pos) +
+          ' c ' + IntToStr(c), inNorm, outNorm, 1e-4);
+      end;
+
+    for i := 0 to Input.Size - 1 do
+    begin
+      InputPlus.Copy(Input);
+      InputPlus.Raw[i] := Input.Raw[i] + epsilon;
+      lossPlus := ComputeLoss(InputPlus);
+      InputPlus.Raw[i] := Input.Raw[i] - epsilon;
+      lossMinus := ComputeLoss(InputPlus);
+      numericalGrad := (lossPlus - lossMinus) / (2 * epsilon);
+
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      analyticalGrad := NN.Layers[0].OutputError.Raw[i];
+
+      AssertTrue('VisionRoPE2D input gradient at position ' + IntToStr(i) +
+        ' (num=' + FloatToStr(numericalGrad) + ' ana=' + FloatToStr(analyticalGrad) + ')',
+        Abs(numericalGrad - analyticalGrad) < 0.01);
+    end;
+  finally
+    NN.Free;
+    Input.Free;
+    InputPlus.Free;
+    Desired.Free;
+  end;
 end;
 
 procedure TTestNeuralNumerical.TestBentIdentityForward;
@@ -68205,6 +68411,303 @@ begin
 end;
 {$ENDIF}
 
+// --- Tiled GEMM for a window of columns ---------------------------------------
+//
+// cai_dot_product_int8_tiled / _tiled_h / _int4_tiled take over from the
+// single-pass and split-K kernels when FNumBs >= csTiledGemmMinColumns. A
+// pointwise convolution over a (pColumns x 1 x pInputs) input gives exactly
+// FNumBs = pColumns, FNumAs = pNeurons, FSize = pInputs, so the shapes below
+// pick FNumBs on both sides of the threshold and ragged FNumAs / FSize (not
+// multiples of the 128-row tile, the 16-column tile, the 32-wide K-step or its
+// 4-wide inner unroll). Each shape runs three device forwards: two tiled (the
+// launch counter must read 2, or 0 below the threshold), then one with the
+// tiled path switched off (SetTiledGemmMinColumns(0)) so the SAME resident
+// codes go through the existing kernels. The tiled result is held against the
+// existing kernels' result and against the reference at the FP32 tolerance;
+// they differ only in float summation order.
+
+procedure TTestNeuralNumerical.TestTiledGemmInt8OpenCLParity;
+{$IFDEF OpenCL}
+  procedure RunPointwise(const aName: string; pColumns, pInputs, pNeurons: integer;
+    ActFn: TNeuralActivationFunction; ActDeriv: TNeuralActivationFunction;
+    pSuppressBias: integer; pFP16, ExpectTiled: boolean);
+  var
+    NN: TNNet;
+    Input, OutCPU, OutTiled, OutUntiled: TNNetVolume;
+    Conv: TNNetConvolution;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i, TiledLaunches, ExpectedLaunches: integer;
+    Diff, MaxDiffCPU, MaxDiffKernels, MaxAbs, Tol, TolCPU: TNeuralFloat;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    RandSeed := 20260902;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(pColumns, 1, pInputs);
+    OutCPU := TNNetVolume.Create();
+    OutTiled := TNNetVolume.Create();
+    OutUntiled := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(pColumns, 1, pInputs, 1));
+      Conv := TNNetConvolution.Create(pNeurons, 1, 0, 1, pSuppressBias);
+      Conv.ActivationFn := ActFn;
+      Conv.ActivationFnDerivative := ActDeriv;
+      NN.AddLayer(Conv);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.7 * Sin(i * 0.013) - 0.2;
+      for i := 0 to Conv.Neurons.Count - 1 do
+        Conv.Neurons[i].BiasWeight := 0.25 * Cos(i * 0.11);
+      NN.UpdateWeights();
+      Conv.SetTrainable(False, False);
+
+      NN.QuantizeWeightsInt8();
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.ForceOpenCL(True);
+      if pFP16 then NN.OpenCLFP16 := True; // before EnableOpenCL: it sizes the half B buffer
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        if pFP16 then
+          AssertTrue('TiledGemmInt8 ' + aName + ' took the FP16 route', Conv.FP16Active);
+        SetTiledGemmMinColumns(csTiledGemmMinColumns);
+        NN.Compute(Input);
+        NN.Compute(Input); // resident codes/scales/bias + bound tiled arguments reuse
+        OutTiled.Copy(NN.GetLastLayer.Output);
+        TiledLaunches := Conv.OpenCLTiledGemmLaunchCount();
+        // The existing kernels over the same resident codes and B operand.
+        SetTiledGemmMinColumns(0);
+        NN.Compute(Input);
+        OutUntiled.Copy(NN.GetLastLayer.Output);
+        AssertEquals('TiledGemmInt8 ' + aName + ' switched-off path launched no tile',
+          TiledLaunches, Conv.OpenCLTiledGemmLaunchCount());
+      finally
+        SetTiledGemmMinColumns(csTiledGemmMinColumns);
+        NN.ForceOpenCL(False);
+      end;
+      AssertEquals('TiledGemmInt8 ' + aName + ' output size match', OutCPU.Size,
+        OutTiled.Size);
+      MaxDiffCPU := 0;
+      MaxDiffKernels := 0;
+      MaxAbs := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - OutTiled.Raw[i]);
+        if Diff > MaxDiffCPU then MaxDiffCPU := Diff;
+        Diff := Abs(OutUntiled.Raw[i] - OutTiled.Raw[i]);
+        if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
+        if Abs(OutCPU.Raw[i]) > MaxAbs then MaxAbs := Abs(OutCPU.Raw[i]);
+      end;
+      WriteLn('  TiledGemmInt8 ', aName, ': tiled vs cpu max|diff|=', MaxDiffCPU:0:9,
+        ' tiled vs existing kernels max|diff|=', MaxDiffKernels:0:9,
+        ' max|ref|=', MaxAbs:0:6, ' tiled launches=', TiledLaunches,
+        ' gpu forwards=', Conv.ForwardGPUCnt);
+      // Without these the device path could be unarmed, or the tiled kernel
+      // never taken, and parity would prove nothing.
+      AssertTrue('TiledGemmInt8 ' + aName + ' ran on the device: ForwardGPUCnt = ' +
+        IntToStr(Conv.ForwardGPUCnt) + ' must be 3', Conv.ForwardGPUCnt = 3);
+      if ExpectTiled then ExpectedLaunches := 2 else ExpectedLaunches := 0;
+      AssertEquals('TiledGemmInt8 ' + aName + ' tiled launches', ExpectedLaunches,
+        TiledLaunches);
+      if MaxAbs < 1 then Tol := 1e-4 else Tol := 1e-4 * MaxAbs;
+      AssertTrue('TiledGemmInt8 ' + aName + ' tiled vs existing kernels: max |diff| = ' +
+        FloatToStr(MaxDiffKernels) + ' must be < ' + FloatToStr(Tol), MaxDiffKernels < Tol);
+      // The half B operand carries ~5e-4 relative error against the FP32 CPU
+      // reference; both device kernels read the same half values.
+      if pFP16 then TolCPU := 1e-2 else TolCPU := Tol;
+      AssertTrue('TiledGemmInt8 ' + aName + ' tiled vs CPU: max |diff| = ' +
+        FloatToStr(MaxDiffCPU) + ' must be < ' + FloatToStr(TolCPU), MaxDiffCPU < TolCPU);
+    finally
+      OutUntiled.Free;
+      OutTiled.Free;
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+begin
+  // Below the threshold: the existing single-pass / split-K kernels, no tile.
+  RunPointwise('1 col 1003x96 relu bias', 1, 1003, 96,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, false);
+  RunPointwise('7 col 1003x96 identity nobias', 7, 1003, 96,
+    @Identity, @IdentityDerivative, 1, false, false);
+  // Exactly one column tile; 200 rows = one full row tile + 72; 1003 = 31
+  // K-steps + a 11-wide remainder whose last 3 elements take the scalar loop.
+  RunPointwise('16 col 1003x200 relu bias', 16, 1003, 200,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true);
+  // Four column tiles, 130 rows (a lane's second row past FNumAs), no bias.
+  RunPointwise('64 col 1003x130 identity nobias', 64, 1003, 130,
+    @Identity, @IdentityDerivative, 1, false, true);
+  // 130 columns = 8 tiles + a 2-column tile; 257 rows = 2 tiles + 1 row;
+  // 96 = 3 K-steps exactly; a transcendental activation.
+  RunPointwise('130 col 96x257 swish bias', 130, 96, 257,
+    @Swish, @SwishDerivative, 0, false, true);
+  RunPointwise('130 col 96x257 tanh bias', 130, 96, 257,
+    @HiperbolicTangent, @HiperbolicTangentDerivative, 0, false, true);
+  // Long reduction axis, the decode-projection shape at a 64-token window.
+  RunPointwise('64 col 2048x320 relu bias', 64, 2048, 320,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false, true);
+  // FP16 B operand: cai_dot_product_int8_tiled_h stages through vload_half.
+  RunPointwise('fp16 64 col 1003x130 relu bias', 64, 1003, 130,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, true);
+  RunPointwise('fp16 7 col 1003x96 relu bias', 7, 1003, 96,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true, false);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Int4 twin of TestTiledGemmInt8OpenCLParity. The oracle is the one
+// TestInt4OpenCLParity uses: an FP32 forward over the same Q4_0-dequantized
+// rows. cai_dot_product_int4_tiled multiplies (code - 8) * scale, exactly the
+// dequantized weight the oracle holds, so it is checked against that oracle
+// and against the split-K pair (block-sum-then-scale) at the FP32 tolerance.
+procedure TTestNeuralNumerical.TestTiledGemmInt4OpenCLParity;
+{$IFDEF OpenCL}
+  procedure RunPointwise(const aName: string; pColumns, pInputs, pNeurons: integer;
+    ActFn: TNeuralActivationFunction; ActDeriv: TNeuralActivationFunction;
+    pSuppressBias: integer; ExpectTiled: boolean);
+  var
+    NN, NNRef: TNNet;
+    Input, OutRef, OutTiled, OutUntiled: TNNetVolume;
+    Conv, ConvRef: TNNetConvolution;
+    Quant4: TNNetVolumeQuant4;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i, TiledLaunches, ExpectedLaunches: integer;
+    Diff, MaxDiffRef, MaxDiffKernels, MaxAbs, Tol: TNeuralFloat;
+    procedure BuildNet(var pNN: TNNet; var pConv: TNNetConvolution);
+    var
+      NeuronCnt: integer;
+    begin
+      RandSeed := 20260902;
+      pNN := TNNet.Create();
+      pNN.AddLayer(TNNetInput.Create(pColumns, 1, pInputs, 1));
+      pConv := TNNetConvolution.Create(pNeurons, 1, 0, 1, pSuppressBias);
+      pConv.ActivationFn := ActFn;
+      pConv.ActivationFnDerivative := ActDeriv;
+      pNN.AddLayer(pConv);
+      for NeuronCnt := 0 to pConv.Neurons.Count - 1 do
+        pConv.Neurons[NeuronCnt].BiasWeight := 0.25 * Sin(NeuronCnt * 0.3);
+      pNN.UpdateWeights();
+    end;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    BuildNet(NN, Conv);
+    BuildNet(NNRef, ConvRef);
+    Input := TNNetVolume.Create(pColumns, 1, pInputs);
+    OutRef := TNNetVolume.Create();
+    OutTiled := TNNetVolume.Create();
+    OutUntiled := TNNetVolume.Create();
+    Quant4 := TNNetVolumeQuant4.Create(1, 1, ConvRef.Neurons[0].Weights.Size);
+    try
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.7 * Sin(i * 0.013) - 0.2;
+      // The reference keeps FP32 weights that went through the same Q4_0
+      // quantizer QuantizeWeightsInt4 applies to the twin.
+      for i := 0 to ConvRef.Neurons.Count - 1 do
+      begin
+        Quant4.QuantizeRow(0, 0, ConvRef.Neurons[i].Weights.DataPtr);
+        Quant4.DequantizeRowTo(0, 0, ConvRef.Neurons[i].Weights.DataPtr);
+      end;
+      NNRef.UpdateWeights();
+      ConvRef.SetTrainable(False, False);
+      NNRef.Compute(Input);
+      OutRef.Copy(NNRef.GetLastLayer.Output);
+
+      Conv.SetTrainable(False, False);
+      NN.QuantizeWeightsInt4();
+      AssertTrue('TiledGemmInt4 ' + aName + ' twin is int4', Conv.WeightsQuantizedInt4);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        SetTiledGemmMinColumns(csTiledGemmMinColumns);
+        NN.Compute(Input);
+        NN.Compute(Input); // resident codes/scales/bias + bound tiled arguments reuse
+        OutTiled.Copy(NN.GetLastLayer.Output);
+        TiledLaunches := Conv.OpenCLTiledGemmLaunchCount();
+        // The split-K pair over the same resident packed codes and B operand.
+        SetTiledGemmMinColumns(0);
+        NN.Compute(Input);
+        OutUntiled.Copy(NN.GetLastLayer.Output);
+        AssertEquals('TiledGemmInt4 ' + aName + ' switched-off path launched no tile',
+          TiledLaunches, Conv.OpenCLTiledGemmLaunchCount());
+      finally
+        SetTiledGemmMinColumns(csTiledGemmMinColumns);
+        NN.ForceOpenCL(False);
+      end;
+      AssertEquals('TiledGemmInt4 ' + aName + ' output size match', OutRef.Size,
+        OutTiled.Size);
+      MaxDiffRef := 0;
+      MaxDiffKernels := 0;
+      MaxAbs := 0;
+      for i := 0 to OutRef.Size - 1 do
+      begin
+        Diff := Abs(OutRef.Raw[i] - OutTiled.Raw[i]);
+        if Diff > MaxDiffRef then MaxDiffRef := Diff;
+        Diff := Abs(OutUntiled.Raw[i] - OutTiled.Raw[i]);
+        if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
+        if Abs(OutRef.Raw[i]) > MaxAbs then MaxAbs := Abs(OutRef.Raw[i]);
+      end;
+      WriteLn('  TiledGemmInt4 ', aName, ': tiled vs dequantized FP32 max|diff|=',
+        MaxDiffRef:0:9, ' tiled vs split-K max|diff|=', MaxDiffKernels:0:9,
+        ' max|ref|=', MaxAbs:0:6, ' tiled launches=', TiledLaunches,
+        ' gpu forwards=', Conv.ForwardGPUCnt);
+      AssertTrue('TiledGemmInt4 ' + aName + ' ran on the device: ForwardGPUCnt = ' +
+        IntToStr(Conv.ForwardGPUCnt) + ' must be 3', Conv.ForwardGPUCnt = 3);
+      if ExpectTiled then ExpectedLaunches := 2 else ExpectedLaunches := 0;
+      AssertEquals('TiledGemmInt4 ' + aName + ' tiled launches', ExpectedLaunches,
+        TiledLaunches);
+      if MaxAbs < 1 then Tol := 1e-4 else Tol := 1e-4 * MaxAbs;
+      AssertTrue('TiledGemmInt4 ' + aName + ' tiled vs split-K: max |diff| = ' +
+        FloatToStr(MaxDiffKernels) + ' must be < ' + FloatToStr(Tol), MaxDiffKernels < Tol);
+      AssertTrue('TiledGemmInt4 ' + aName + ' tiled vs dequantized FP32: max |diff| = ' +
+        FloatToStr(MaxDiffRef) + ' must be < ' + FloatToStr(Tol), MaxDiffRef < Tol);
+    finally
+      Quant4.Free;
+      OutUntiled.Free;
+      OutTiled.Free;
+      OutRef.Free;
+      Input.Free;
+      NNRef.Free;
+      NN.Free;
+    end;
+  end;
+begin
+  // Below the threshold: the split-K pair, no tile. 2048 = 64 blocks.
+  RunPointwise('1 col 2048x96 relu bias', 1, 2048, 96,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false);
+  RunPointwise('7 col 96x64 identity nobias', 7, 96, 64,
+    @Identity, @IdentityDerivative, 1, false);
+  // One column tile, 200 rows (one row tile + 72), 3 blocks.
+  RunPointwise('16 col 96x200 relu bias', 16, 96, 200,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true);
+  // Four column tiles, 130 rows, 65 blocks (an odd count), no bias.
+  RunPointwise('64 col 2080x130 identity nobias', 64, 2080, 130,
+    @Identity, @IdentityDerivative, 1, true);
+  // 130 columns = 8 tiles + a 2-column tile; 257 rows = 2 tiles + 1 row.
+  RunPointwise('130 col 160x257 swish bias', 130, 160, 257,
+    @Swish, @SwishDerivative, 0, true);
+  RunPointwise('130 col 160x257 tanh bias', 130, 160, 257,
+    @HiperbolicTangent, @HiperbolicTangentDerivative, 0, true);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
 // --- pHasSharedKernel = FALSE (private per-layer kernel handles) -------------
 //
 // EnableOpenCL's third argument selects between one net-wide handle per kernel
@@ -68768,6 +69271,11 @@ begin
 
     // Device forward (both GEMMs offloaded; base class arms FShouldOpenCL).
     NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    // Second device forward: the score GEMM's shape returns AFTER the value
+    // GEMM bound different arguments on the same FDotCL, so this pins the
+    // cached-argument rebind across launches (a stale-args bug would surface
+    // here, not on the first forward).
     NN.Compute(Input);
 
     AssertEquals('output size match', OutCPU.Size, NN.GetLastLayer.Output.Size);
@@ -71083,14 +71591,26 @@ begin
 end;
 {$ENDIF}
 
-// Shared body of the cached-decode parity tests: runs StepCnt single token
-// steps through a CPU network and an OpenCL network built the same way and
-// returns the largest output difference. CaptureAt >= 0 takes a cache snapshot
-// after that step on the OpenCL side and restores it before the next.
-// Int8KV picks the int8 KV cache, and with it the int8 snapshot API.
-function RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, Window,
-  CpuWarmupSteps, CaptureAt: integer; Int8KV: boolean; SoftCap: TNeuralFloat;
-  out GpuForwards: integer): TNeuralFloat;
+function FusedSDPASplitOverride(Splits, ChunkRows,
+  UsableLocalMemBytes: integer): TFusedSDPASplitOverride;
+begin
+  Result.Splits := Splits;
+  Result.ChunkRows := ChunkRows;
+  Result.UsableLocalMemBytes := UsableLocalMemBytes;
+end;
+
+// Shared body of the cached-decode parity tests: runs StepCnt decode steps of
+// StepTokens token rows each through a CPU network and an OpenCL network built
+// the same way and returns the largest output difference. StepTokens > 1 is a
+// prefill window, where every row of the step is appended before the attention
+// runs and row t may attend only up to its own slot. CaptureAt >= 0 takes a
+// cache snapshot after that step on the OpenCL side and restores it before the
+// next. Int8KV picks the int8 KV cache, and with it the int8 snapshot API.
+// Override sets the helper's split sizing; Launch reports the last step's.
+function RunFusedSDPADecodeParityEx(QHeads, KVHeads, Dk, StepCnt, StepTokens,
+  Window, CpuWarmupSteps, CaptureAt: integer; Int8KV: boolean;
+  SoftCap: TNeuralFloat; const Override: TFusedSDPASplitOverride;
+  out GpuForwards: integer; out Launch: TFusedSDPASplitLaunch): TNeuralFloat;
 {$IFDEF OpenCL}
 var
   NNCpu, NNGpu: TNNet;
@@ -71100,42 +71620,51 @@ var
   Mixer: TNNetLayer;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
-  InDepth, OutDepth, T, D, SnapLen, SnapSinks, SnapWindow: integer;
+  InDepth, OutDepth, T, D, Row, SnapLen, SnapSinks, SnapWindow: integer;
   Diff: TNeuralFloat;
 begin
   Result := 0;
   GpuForwards := 0;
+  Launch := Default(TFusedSDPASplitLaunch);
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then Exit;
   InDepth := (QHeads + 2 * KVHeads) * Dk;
   OutDepth := QHeads * Dk;
   NNCpu := TNNet.Create();
   NNGpu := TNNet.Create();
-  StepIn := TNNetVolume.Create(1, 1, InDepth);
+  StepIn := TNNetVolume.Create(StepTokens, 1, InDepth);
   SnapK := TNNetVolume.Create();
   SnapV := TNNetVolume.Create();
   SnapKQ := TNNetVolumeQuant8.Create();
   SnapVQ := TNNetVolumeQuant8.Create();
   try
-    NNCpu.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+    NNCpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
     LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, Window, SoftCap);
     NNCpu.AddLayer(LCpu);
     NNCpu.AddLayer(TNNetSiLU.Create());
     NNCpu.SetTrainable(False, False);
 
-    NNGpu.AddLayer(TNNetInput.Create(1, 1, InDepth, 1));
+    NNGpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
     LGpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, True, Window, SoftCap);
     Mixer := NNGpu.AddLayer(LGpu);
     NNGpu.AddLayer(TNNetSiLU.Create());
     NNGpu.SetTrainable(False, False);
 
-    LCpu.BeginIncrementalDecode(StepCnt, Int8KV);
-    LGpu.BeginIncrementalDecode(StepCnt, Int8KV);
+    LCpu.BeginIncrementalDecode(StepCnt * StepTokens, Int8KV);
+    LGpu.BeginIncrementalDecode(StepCnt * StepTokens, Int8KV);
     for T := 0 to StepCnt - 1 do
     begin
       // The CPU network warms the OpenCL network's cache too: both run the same
       // rows, so arming OpenCL late leaves a cache the host built.
       if T = CpuWarmupSteps then
+      begin
         NNGpu.EnableOpenCL(PlatformId, DeviceId);
+        LGpu.FusedSDPACL.ForcedSplits := Override.Splits;
+        LGpu.FusedSDPACL.ForcedChunkRows := Override.ChunkRows;
+        if Override.UsableLocalMemBytes > 0 then
+          LGpu.FusedSDPACL.ForcedLocalMemBytes := Override.UsableLocalMemBytes
+            + LGpu.FusedSDPACL.StaticLocalMemBytes(Int8KV)
+            + csFusedSDPALocalMemReserveBytes;
+      end;
       if (CaptureAt >= 0) and (T = CaptureAt + 1) then
       begin
         if Int8KV
@@ -71144,15 +71673,18 @@ begin
           else LGpu.RestoreCacheState(SnapK, SnapV, SnapLen, SnapSinks,
             SnapWindow);
       end;
-      for D := 0 to InDepth - 1 do StepIn[0, 0, D] := 1.5 * (Random - 0.5);
+      for Row := 0 to StepTokens - 1 do
+        for D := 0 to InDepth - 1 do
+          StepIn[Row, 0, D] := 1.5 * (Random - 0.5);
       NNCpu.Compute(StepIn);
       NNGpu.Compute(StepIn);
-      for D := 0 to OutDepth - 1 do
-      begin
-        Diff := Abs(NNCpu.GetLastLayer.Output[0, 0, D] -
-                    NNGpu.GetLastLayer.Output[0, 0, D]);
-        if Diff > Result then Result := Diff;
-      end;
+      for Row := 0 to StepTokens - 1 do
+        for D := 0 to OutDepth - 1 do
+        begin
+          Diff := Abs(NNCpu.GetLastLayer.Output[Row, 0, D] -
+                      NNGpu.GetLastLayer.Output[Row, 0, D]);
+          if Diff > Result then Result := Diff;
+        end;
       if (CaptureAt >= 0) and (T = CaptureAt) then
       begin
         if Int8KV
@@ -71163,6 +71695,16 @@ begin
       end;
     end;
     GpuForwards := Mixer.ForwardGPUCnt;
+    if Assigned(LGpu.FusedSDPACL) then
+    begin
+      Launch.Splits := LGpu.FusedSDPACL.LastSplits;
+      Launch.ChunkRows := LGpu.FusedSDPACL.LastChunkRows;
+      Launch.ScratchBytes := integer(LGpu.FusedSDPACL.LastScratchBytes);
+      Launch.StaticLocalBytes := LGpu.FusedSDPACL.StaticLocalMemBytes(Int8KV);
+      if LGpu.FusedSDPACL.ForcedLocalMemBytes > 0
+        then Launch.LocalMemBytes := LGpu.FusedSDPACL.ForcedLocalMemBytes
+        else Launch.LocalMemBytes := LGpu.FusedSDPACL.ForwardKernel().DeviceLocalMemSize();
+    end;
     LGpu.EndIncrementalDecode();
     LCpu.EndIncrementalDecode();
   finally
@@ -71174,8 +71716,21 @@ end;
 begin
   Result := 0;
   GpuForwards := 0;
+  Launch := Default(TFusedSDPASplitLaunch);
 end;
 {$ENDIF}
+
+// The automatic split sizing, for the tests that do not force it.
+function RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, StepTokens,
+  Window, CpuWarmupSteps, CaptureAt: integer; Int8KV: boolean;
+  SoftCap: TNeuralFloat; out GpuForwards: integer): TNeuralFloat;
+var
+  Launch: TFusedSDPASplitLaunch;
+begin
+  Result := RunFusedSDPADecodeParityEx(QHeads, KVHeads, Dk, StepCnt,
+    StepTokens, Window, CpuWarmupSteps, CaptureAt, Int8KV, SoftCap,
+    FusedSDPASplitOverride(0, 0, 0), GpuForwards, Launch);
+end;
 
 procedure TTestNeuralNumerical.FusedSDPADecodeResidentOpenCLParity;
 {$IFDEF OpenCL}
@@ -71209,8 +71764,9 @@ begin
   finally
     NNProbe.Free;
   end;
-  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
-    {CpuWarmupSteps=}0, SnapshotStep, {Int8KV=}False, {SoftCap=}0, GpuForwards);
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt,
+    {StepTokens=}1, {Window=}0, {CpuWarmupSteps=}0, SnapshotStep,
+    {Int8KV=}False, {SoftCap=}0, GpuForwards);
   WriteLn('  FusedSDPA OpenCL decode: max|diff|=', MaxDiff:0:9,
     ' gpu forwards=', GpuForwards);
   AssertEquals('every decode step must run on OpenCL', StepCnt, GpuForwards);
@@ -71239,9 +71795,9 @@ begin
     Exit;
   end;
   RandSeed := 20260820;
-  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, Window,
-    {CpuWarmupSteps=}0, {CaptureAt=}-1, {Int8KV=}False, {SoftCap=}5.0,
-    GpuForwards);
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt,
+    {StepTokens=}1, Window, {CpuWarmupSteps=}0, {CaptureAt=}-1,
+    {Int8KV=}False, {SoftCap=}5.0, GpuForwards);
   WriteLn('  FusedSDPA OpenCL windowed decode: max|diff|=', MaxDiff:0:9,
     ' gpu forwards=', GpuForwards);
   AssertEquals('every decode step must run on OpenCL', StepCnt, GpuForwards);
@@ -71272,8 +71828,9 @@ begin
     Exit;
   end;
   RandSeed := 20260821;
-  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
-    WarmupSteps, {CaptureAt=}-1, {Int8KV=}False, {SoftCap=}0, GpuForwards);
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt,
+    {StepTokens=}1, {Window=}0, WarmupSteps, {CaptureAt=}-1, {Int8KV=}False,
+    {SoftCap=}0, GpuForwards);
   WriteLn('  FusedSDPA OpenCL cache handoff: max|diff|=', MaxDiff:0:9,
     ' gpu forwards=', GpuForwards);
   AssertEquals('only the steps after the handoff run on OpenCL',
@@ -71308,8 +71865,9 @@ begin
     Exit;
   end;
   RandSeed := 20260822;
-  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
-    {CpuWarmupSteps=}0, SnapshotStep, {Int8KV=}True, {SoftCap=}0, GpuForwards);
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt,
+    {StepTokens=}1, {Window=}0, {CpuWarmupSteps=}0, SnapshotStep,
+    {Int8KV=}True, {SoftCap=}0, GpuForwards);
   WriteLn('  FusedSDPA OpenCL int8 decode: max|diff|=', MaxDiff:0:9,
     ' gpu forwards=', GpuForwards);
   AssertEquals('every int8 decode step must run on OpenCL', StepCnt,
@@ -71339,9 +71897,9 @@ begin
     Exit;
   end;
   RandSeed := 20260823;
-  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, Window,
-    {CpuWarmupSteps=}0, {CaptureAt=}-1, {Int8KV=}True, {SoftCap=}5.0,
-    GpuForwards);
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt,
+    {StepTokens=}1, Window, {CpuWarmupSteps=}0, {CaptureAt=}-1,
+    {Int8KV=}True, {SoftCap=}5.0, GpuForwards);
   WriteLn('  FusedSDPA OpenCL int8 windowed decode: max|diff|=', MaxDiff:0:9,
     ' gpu forwards=', GpuForwards);
   AssertEquals('every int8 decode step must run on OpenCL', StepCnt,
@@ -71373,14 +71931,81 @@ begin
     Exit;
   end;
   RandSeed := 20260824;
-  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, {Window=}0,
-    WarmupSteps, {CaptureAt=}-1, {Int8KV=}True, {SoftCap=}0, GpuForwards);
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt,
+    {StepTokens=}1, {Window=}0, WarmupSteps, {CaptureAt=}-1, {Int8KV=}True,
+    {SoftCap=}0, GpuForwards);
   WriteLn('  FusedSDPA OpenCL int8 cache handoff: max|diff|=', MaxDiff:0:9,
     ' gpu forwards=', GpuForwards);
   AssertEquals('only the steps after the handoff run on OpenCL',
     StepCnt - WarmupSteps, GpuForwards);
   AssertTrue('an int8 cache built on the CPU then handed to OpenCL: max |diff| '
     + '= ' + FloatToStr(MaxDiff) + ' must be < 1e-3', MaxDiff < 1e-3);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAMultiTokenStepOpenCLParity;
+{$IFDEF OpenCL}
+const
+  // 20 rows per step, so one launch carries 40 (KV head, token row) pairs.
+  QHeads = 4; KVHeads = 2; Dk = 3; StepCnt = 3; StepTokens = 20;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxDiff: TNeuralFloat;
+  GpuForwards: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260825;
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, StepTokens,
+    {Window=}0, {CpuWarmupSteps=}0, {CaptureAt=}-1, {Int8KV=}False,
+    {SoftCap=}0, GpuForwards);
+  WriteLn('  FusedSDPA OpenCL 20-token step: max|diff|=', MaxDiff:0:9,
+    ' gpu forwards=', GpuForwards);
+  AssertEquals('every 20-token step must run on OpenCL', StepCnt, GpuForwards);
+  AssertTrue('OpenCL 20-token step vs CPU: max |diff| = ' +
+    FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAInt8MultiTokenStepOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 3; StepCnt = 3; StepTokens = 18; Window = 7;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  MaxDiff: TNeuralFloat;
+  GpuForwards: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260826;
+  // Window = 7 over 18-row steps, so the mask slides WITHIN a step: the rows
+  // of one forward have different jStart values.
+  MaxDiff := RunFusedSDPADecodeParity(QHeads, KVHeads, Dk, StepCnt, StepTokens,
+    Window, {CpuWarmupSteps=}0, {CaptureAt=}-1, {Int8KV=}True, {SoftCap=}5.0,
+    GpuForwards);
+  WriteLn('  FusedSDPA OpenCL int8 18-token step: max|diff|=', MaxDiff:0:9,
+    ' gpu forwards=', GpuForwards);
+  AssertEquals('every int8 18-token step must run on OpenCL', StepCnt,
+    GpuForwards);
+  AssertTrue('windowed soft-capped int8 18-token step: max |diff| = ' +
+    FloatToStr(MaxDiff) + ' must be < 1e-3', MaxDiff < 1e-3);
 end;
 {$ELSE}
 begin
@@ -71540,6 +72165,376 @@ begin
   AssertEquals('the built rows must quantize identically', 0, ExactDiff);
   AssertTrue('no code may differ by more than one step, saw ' +
     IntToStr(MaxCodeDiff), MaxCodeDiff <= 1);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+function TTestNeuralNumerical.CheckFusedSDPASplitCase(const What: string;
+  QHeads, KVHeads, Dk, StepCnt, StepTokens, Window: integer; Int8KV: boolean;
+  SoftCap, Tolerance: TNeuralFloat; const Override: TFusedSDPASplitOverride;
+  ExpectedGpuForwards: integer): TFusedSDPASplitLaunch;
+var
+  MaxDiff: TNeuralFloat;
+  GpuForwards: integer;
+begin
+  MaxDiff := RunFusedSDPADecodeParityEx(QHeads, KVHeads, Dk, StepCnt,
+    StepTokens, Window, {CpuWarmupSteps=}0, {CaptureAt=}-1, Int8KV, SoftCap,
+    Override, GpuForwards, Result);
+  WriteLn('  FusedSDPA OpenCL ', What, ': max|diff|=', MaxDiff:0:9,
+    ' gpu forwards=', GpuForwards, ' splits=', Result.Splits,
+    ' chunk rows=', Result.ChunkRows, ' scratch bytes=', Result.ScratchBytes,
+    ' kernel local bytes=', Result.StaticLocalBytes);
+  AssertEquals(What + ': OpenCL forward count', ExpectedGpuForwards,
+    GpuForwards);
+  AssertTrue(What + ': max |diff| = ' + FloatToStr(MaxDiff) +
+    ' must be < ' + FloatToStr(Tolerance), MaxDiff < Tolerance);
+end;
+
+procedure TTestNeuralNumerical.FusedSDPASplitLongContextOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 11; StepCnt = 40; ChunkRows = 12;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Launch: TFusedSDPASplitLaunch;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  AssertTrue('the last chunk is partially filled', StepCnt mod ChunkRows <> 0);
+  RandSeed := 20260901;
+  Launch := CheckFusedSDPASplitCase('split long context', QHeads, KVHeads, Dk,
+    StepCnt, {StepTokens=}1, {Window=}0, {Int8KV=}False, {SoftCap=}0, 1e-4,
+    FusedSDPASplitOverride(0, ChunkRows, 0), StepCnt);
+  AssertEquals('rows per chunk as forced', ChunkRows, Launch.ChunkRows);
+  AssertTrue('the last step runs at least three chunks', Launch.Splits >= 3);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAInt8SplitLongContextOpenCLParity;
+{$IFDEF OpenCL}
+const
+  // Dk = 19: one 16-code vector load plus a three-code remainder per row.
+  QHeads = 4; KVHeads = 2; Dk = 19; StepCnt = 40; ChunkRows = 12;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Launch: TFusedSDPASplitLaunch;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260902;
+  Launch := CheckFusedSDPASplitCase('int8 split long context', QHeads, KVHeads,
+    Dk, StepCnt, {StepTokens=}1, {Window=}0, {Int8KV=}True, {SoftCap=}0, 1e-3,
+    FusedSDPASplitOverride(0, ChunkRows, 0), StepCnt);
+  AssertEquals('rows per chunk as forced', ChunkRows, Launch.ChunkRows);
+  AssertTrue('the last step runs at least three chunks', Launch.Splits >= 3);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPASplitEmptyChunksOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 8; StepCnt = 3; StepTokens = 20; ChunkRows = 8;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Launch: TFusedSDPASplitLaunch;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260903;
+  Launch := CheckFusedSDPASplitCase('split empty chunks', QHeads, KVHeads, Dk,
+    StepCnt, StepTokens, {Window=}0, {Int8KV=}False, {SoftCap=}0, 1e-4,
+    FusedSDPASplitOverride(0, ChunkRows, 0), StepCnt);
+  AssertTrue('the early rows of a step leave later chunks empty',
+    Launch.Splits * Launch.ChunkRows > StepTokens);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAInt8SplitEmptyChunksOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 8; StepCnt = 3; StepTokens = 20; ChunkRows = 8;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Launch: TFusedSDPASplitLaunch;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260904;
+  Launch := CheckFusedSDPASplitCase('int8 split empty chunks', QHeads, KVHeads,
+    Dk, StepCnt, StepTokens, {Window=}0, {Int8KV=}True, {SoftCap=}0, 1e-3,
+    FusedSDPASplitOverride(0, ChunkRows, 0), StepCnt);
+  AssertTrue('the early rows of a step leave later chunks empty',
+    Launch.Splits * Launch.ChunkRows > StepTokens);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPASplitWindowOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 8; StepCnt = 2; StepTokens = 20; Window = 5;
+  ChunkRows = 4;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Launch: TFusedSDPASplitLaunch;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260905;
+  Launch := CheckFusedSDPASplitCase('split window', QHeads, KVHeads, Dk,
+    StepCnt, StepTokens, Window, {Int8KV=}False, {SoftCap=}5.0, 1e-4,
+    FusedSDPASplitOverride(0, ChunkRows, 0), StepCnt);
+  // Step 1: row 0 sees cache rows [16, 21), so the chunk base is 16 and the
+  // span to row 19's slot 39 is 24 rows, six chunks; row 19's window start 35
+  // empties the first four of them.
+  AssertEquals('chunks over the window span of the second step', 6,
+    Launch.Splits);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAInt8SplitWindowOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 8; StepCnt = 2; StepTokens = 20; Window = 5;
+  ChunkRows = 4;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Launch: TFusedSDPASplitLaunch;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260906;
+  Launch := CheckFusedSDPASplitCase('int8 split window', QHeads, KVHeads, Dk,
+    StepCnt, StepTokens, Window, {Int8KV=}True, {SoftCap=}5.0, 1e-3,
+    FusedSDPASplitOverride(0, ChunkRows, 0), StepCnt);
+  AssertEquals('chunks over the window span of the second step', 6,
+    Launch.Splits);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPASplitGroupSizeOneOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 3; KVHeads = 3; Dk = 6; StepCnt = 30; ChunkRows = 8;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Launch: TFusedSDPASplitLaunch;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260907;
+  Launch := CheckFusedSDPASplitCase('int8 split GroupSize 1', QHeads, KVHeads,
+    Dk, StepCnt, {StepTokens=}1, {Window=}0, {Int8KV=}True, {SoftCap=}0, 1e-3,
+    FusedSDPASplitOverride(0, ChunkRows, 0), StepCnt);
+  AssertEquals('chunks at the last step', 4, Launch.Splits);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPASplitMQAOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 18; KVHeads = 1; Dk = 4; StepCnt = 30; ChunkRows = 8;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Launch: TFusedSDPASplitLaunch;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260908;
+  Launch := CheckFusedSDPASplitCase('split MQA 18 heads', QHeads, KVHeads, Dk,
+    StepCnt, {StepTokens=}1, {Window=}0, {Int8KV=}False, {SoftCap=}0, 1e-4,
+    FusedSDPASplitOverride(0, ChunkRows, 0), StepCnt);
+  AssertEquals('chunks at the last step', 4, Launch.Splits);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPASplitLocalMemShrinkOpenCLParity;
+{$IFDEF OpenCL}
+const
+  // 280 floats: 256 of reduction scratch, the 2x8 query tile, the per-head
+  // max and sum, and room for exactly two score rows per head.
+  QHeads = 4; KVHeads = 2; Dk = 8; StepCnt = 140; UsableLocalMemBytes = 280 * 4;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Launch: TFusedSDPASplitLaunch;
+  GroupsPerUnit, MinChunkRows, MaxSplits, MaxChunkRows: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  FusedSDPASplitSizing(GroupsPerUnit, MinChunkRows, MaxSplits, MaxChunkRows);
+  AssertTrue('the context outgrows MaxSplits chunks of two rows',
+    StepCnt > 2 * MaxSplits);
+  RandSeed := 20260909;
+  Launch := CheckFusedSDPASplitCase('split local-memory shrink', QHeads,
+    KVHeads, Dk, StepCnt, {StepTokens=}1, {Window=}0, {Int8KV=}False,
+    {SoftCap=}0, 1e-4, FusedSDPASplitOverride(0, 0, UsableLocalMemBytes), StepCnt);
+  AssertEquals('the budget shrinks the chunk to two rows', 2, Launch.ChunkRows);
+  AssertTrue('the chunk count passes the configured maximum',
+    Launch.Splits > MaxSplits);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPASplitQueryTileFallbackOpenCLParity;
+{$IFDEF OpenCL}
+const
+  // 275 floats: one short of the query tile plus one score row per head.
+  QHeads = 4; KVHeads = 2; Dk = 8; StepCnt = 5; UsableLocalMemBytes = 275 * 4;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260910;
+  CheckFusedSDPASplitCase('split query-tile fallback', QHeads, KVHeads, Dk,
+    StepCnt, {StepTokens=}1, {Window=}0, {Int8KV=}False, {SoftCap=}0, 1e-4,
+    FusedSDPASplitOverride(0, 0, UsableLocalMemBytes), {ExpectedGpuForwards=}0);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAInt8SplitLocalMemHeadroomOpenCLParity;
+{$IFDEF OpenCL}
+const
+  // 300 usable floats: 256 of reduction scratch, the 2x16 query tile, the
+  // per-head max and sum, and room for exactly four score rows per head.
+  QHeads = 4; KVHeads = 2; Dk = 16; StepCnt = 24; UsableLocalMemBytes = 300 * 4;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Launch: TFusedSDPASplitLaunch;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260911;
+  Launch := CheckFusedSDPASplitCase('int8 split local-memory headroom', QHeads,
+    KVHeads, Dk, StepCnt, {StepTokens=}1, {Window=}0, {Int8KV=}True,
+    {SoftCap=}0, 1e-3, FusedSDPASplitOverride(0, 0, UsableLocalMemBytes), StepCnt);
+  AssertEquals('the budget shrinks the chunk to four rows', 4, Launch.ChunkRows);
+  AssertEquals('six chunks cover the 24 rows', 6, Launch.Splits);
+  AssertTrue('the forced figure exceeds the usable budget by the reserve',
+    Launch.LocalMemBytes >= UsableLocalMemBytes + csFusedSDPALocalMemReserveBytes);
+  AssertTrue('the scratch leaves the kernel local memory and the reserve free',
+    Launch.ScratchBytes <= Launch.LocalMemBytes - Launch.StaticLocalBytes
+      - csFusedSDPALocalMemReserveBytes);
+  AssertEquals('the scratch fills the usable budget exactly',
+    UsableLocalMemBytes, Launch.ScratchBytes);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPASplitChunkRowsCapOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 8; StepCnt = 2; StepTokens = 300;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Launch: TFusedSDPASplitLaunch;
+  GroupsPerUnit, MinChunkRows, MaxSplits, MaxChunkRows, SpanRows: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  FusedSDPASplitSizing(GroupsPerUnit, MinChunkRows, MaxSplits, MaxChunkRows);
+  SpanRows := StepCnt * StepTokens;
+  AssertTrue('the last step spans more rows than one chunk may hold',
+    SpanRows > MaxChunkRows);
+  RandSeed := 20260912;
+  Launch := CheckFusedSDPASplitCase('split chunk-rows cap', QHeads, KVHeads,
+    Dk, StepCnt, StepTokens, {Window=}0, {Int8KV=}False, {SoftCap=}0, 1e-4,
+    FusedSDPASplitOverride({Splits=}1, 0, 0), StepCnt);
+  AssertEquals('the cap bounds the chunk', MaxChunkRows, Launch.ChunkRows);
+  AssertEquals('the chunk count grows past the forced one to cover the span',
+    (SpanRows + MaxChunkRows - 1) div MaxChunkRows, Launch.Splits);
 end;
 {$ELSE}
 begin

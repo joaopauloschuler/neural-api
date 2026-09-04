@@ -22,12 +22,70 @@ uses
   Classes, SysUtils, Math, fpcunit, testregistry, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralmxfp4, neuralnf4, neuralpretrained, neuralhftokenizer, neuralaudio,
+  neuralchatengine,
   neuraldecode, neuraldiffusion;
 
 type
+  // One greedy chat turn through TChatEngine, as the --prefill-window parity
+  // harnesses compare it: the reply, its token count and the cached ids.
+  TChatTurnRecord = record
+    Reply: string;
+    Completion: integer;
+    Cached: TNeuralIntegerArray;
+  end;
+
   TTestNeuralPretrained = class(TTestCase)
   private
+    FNotices: string; // CaptureNotice accumulator
     function FixturePath(const FileName: string): string;
+    // The tiny_qwen3_5 hybrid fixture as an inference net whose input width
+    // (the streamed window) is pSeqLen tokens; pWeightOwner builds it
+    // borrowing that net's weights from a checkpoint path that does not exist.
+    function BuildQwen35FixtureTwin(pSeqLen: integer;
+      pQuantizeInt8: boolean = false; pWeightOwner: TNNet = nil): TNNet;
+    // Largest |A[i] - B[i]| over two volumes of the same size.
+    function MaxAbsVolumeDiff(A, B: TNNetVolume): double;
+    // Windows of StepTokens through WindowSession over the first
+    // PrefillTokenCount tokens, snapshot handoff, then width-1 for the rest.
+    // The first HiddenOnlyTokenCount tokens step with StepForwardToHidden
+    // (their Logits rows stay zero).
+    procedure RunWindowedPrefillStream(WindowSession,
+      TailSession: TNNetStreamingDecoder; const Tokens: array of integer;
+      StepTokens, PrefillTokenCount: integer; Logits: TNNetVolume;
+      HiddenOnlyTokenCount: integer = 0);
+    // Largest |A[i] - B[i]| over the rows FromRow.. of two (T,1,V) volumes.
+    function MaxAbsRowDiffFrom(A, B: TNNetVolume; FromRow: integer): double;
+    // Cache-checkpoint resume on one tiny_qwen3_5 width-1 session: run to p,
+    // capture, run on, TruncateTo(p) + RestoreStateFrom, same tail bit for bit.
+    procedure RunQwen35StateCheckpointResume(Int8KV, UseOpenCL: boolean);
+    // The same across the twins: captured on the width-4 twin, restored into
+    // the width-1 session after the snapshot handoff.
+    procedure RunQwen35StateCheckpointTwinHandoff(Int8KV, UseOpenCL: boolean);
+    // Bytes the checkpoint formula must report for Net's recurrent layers.
+    function ExpectedStateCheckpointBytes(Net: TNNet): int64;
+    // A temp HF-style directory (model.safetensors, config.json,
+    // tokenizer.json) of the tiny_<Stem> fixture for TChatEngine.LoadModel;
+    // the tokenizer is the qwen35 one for every stem (the engine tests feed
+    // ids directly).
+    function MakeChatModelDir(const Stem: string): string;
+    function MakeQwen35ChatModelDir(): string;
+    procedure RemoveChatModelDir(const Dir: string);
+    // TChatEngine.OnNotice sink: every notice line appended to FNotices.
+    procedure CaptureNotice(const S: string);
+    // Two greedy chat turns per --prefill-window value in {0, 4, 6}; every
+    // value must produce the same tokens as the token-by-token prefill.
+    procedure RunQwen35ChatPrefillWindowParity(const ExtraArgs: array of string);
+    // Two greedy chat turns with --prefill-window 6 --prefill-tail-window 2
+    // against the token-by-token prefill; per-stage window counts asserted.
+    procedure RunQwen35ChatPrefillLadderParity(const ExtraArgs: array of string);
+    // Turn 1 prompt P, then a second prompt that diverges at P's start,
+    // inside P, re-renders the reply (P+X) or echoes it (P+R+Y), each
+    // against a fresh engine.
+    procedure RunQwen35ChatCheckpointResume(const ExtraArgs: array of string;
+      Ladder: boolean; Turn1Len: integer);
+    // Reply, completion count and cached ids equal.
+    procedure AssertSameChatTurn(const Expected, Actual: TChatTurnRecord;
+      const What: string);
     {$IFDEF OpenCL}
     // First OpenCL platform/device on the box; false when there is none, which
     // every caller reports as a SKIP.
@@ -36,7 +94,30 @@ type
     // CPU-vs-OpenCL streamed decode: two inference twins of the same
     // checkpoint at SeqLen=1, one armed for OpenCL, stepped side by side.
     procedure RunStreamedDecodeOpenCLParity(const Stem: string);
+    // Every layer of AClass in Net ran at least one forward on the device.
+    procedure AssertAllOnDevice(Net: TNNet; AClass: TClass;
+      const What: string);
+    // Windowed prefill on OpenCL twins against the host, FP32 or int8 KV.
+    procedure RunWindowedPrefillOpenCLParity(Int8KV: boolean);
+    // Every recurrent layer of Net keeps its decode state in OpenCL memory,
+    // and every TNNetFusedSDPA its KV cache.
+    procedure AssertRecurrentStateOnOpenCL(Net: TNNet; const What: string);
+    procedure AssertKVCacheOnOpenCL(Net: TNNet; const What: string);
+    // Every layer of Linked that borrows weights holds the same resident
+    // device codes / vocab table handle as its owner; returns how many.
+    function AssertDeviceWeightsBorrowed(Linked: TNNet;
+      const What: string): integer;
     {$ENDIF}
+    // Every weight-bearing layer of Linked borrows from Owner, and Linked
+    // reports no weights and no quantized bytes of its own; returns how many
+    // layers borrow.
+    function AssertWeightsLinked(Linked, Owner: TNNet;
+      const What: string): integer;
+    // The tiny_llama_q8 fixture as an int4 inference net of input width
+    // pSeqLen; pWeightOwner builds it borrowing that net's (int4) weights
+    // from a checkpoint path that does not exist.
+    function BuildLlamaInt4FixtureTwin(pSeqLen: integer;
+      pWeightOwner: TNNet = nil): TNNet;
     procedure RunConvNeXtParity(const Base: string);
     procedure RunResNetParity(const Base: string);
     procedure RunRegNetParity(const Base: string);
@@ -256,9 +337,47 @@ type
     procedure TestQwen35LogitParity;
     procedure TestQwen35QProjStagedSlabSliceParity;
     procedure TestQwen35StreamedDecodeParity;
+    procedure TestQwen35WindowedPrefillParity;
+    procedure TestQwen35WindowCausality;
+    procedure TestQwen35WindowAtNonZeroPosition;
+    procedure TestQwen35WindowedPrefillSnapshotHandoff;
+    procedure TestQwen35WindowedPrefillToHiddenParity;
+    procedure TestQwen35WindowedPrefillOpenCLParity;
+    procedure TestQwen35WindowedPrefillOpenCLInt8KVParity;
+    procedure TestQwen35LinkedWeightsInt8Parity;
+    procedure TestLlamaLinkedWeightsInt4Parity;
+    procedure TestQwen35LinkedWeightsOpenCLParity;
+    procedure TestLlamaLinkedWeightsInt4OpenCLParity;
     procedure TestQwen35StreamedDecodeOpenCLParity;
     procedure TestQwen2StreamedDecodeOpenCLParity;
     procedure TestQwen35TurnBoundaryResumeParity;
+    procedure TestQwen35StateCheckpointResumeParity;
+    procedure TestQwen35StateCheckpointResumeInt8KVParity;
+    procedure TestQwen35StateCheckpointTwinHandoffParity;
+    procedure TestQwen35StateCheckpointOpenCLParity;
+    procedure TestQwen35StateCheckpointOpenCLInt8KVParity;
+    procedure TestQwen35StateCheckpointOpenCLTwinHandoffParity;
+    procedure TestMambaStateCheckpointResumeParity;
+    procedure TestQwen35ChatPrefillWindowParity;
+    procedure TestQwen35ChatPrefillWindowInt8KVParity;
+    procedure TestQwen35ChatPrefillWindowOpenCLParity;
+    procedure TestQwen35ChatPrefillWindowInt8WeightsParity;
+    procedure TestQwen35ChatPrefillWindowInt8WeightsOpenCLParity;
+    procedure TestMambaChatPrefillWindowFallback;
+    procedure TestQwen35ChatPrefillLadderParity;
+    procedure TestQwen35ChatPrefillLadderInt8KVParity;
+    procedure TestQwen35ChatPrefillLadderOpenCLParity;
+    procedure TestQwen35ChatCheckpointResume;
+    procedure TestQwen35ChatCheckpointLadder;
+    procedure TestQwen35ChatCheckpointInt8KV;
+    procedure TestQwen35ChatCheckpointOpenCL;
+    procedure TestQwen35ChatCheckpointRetention;
+    procedure TestQwen35ChatCheckpointFlagErrors;
+    procedure TestQwen35ChatPrefillTailWindowErrors;
+    procedure TestQwen35BorrowedTwinBuild;
+    procedure TestQwen35BorrowedTwinInferenceMemory;
+    procedure TestLlamaBorrowedTwinInt4Parity;
+    procedure TestLlamaBorrowedTwinInt4OpenCLParity;
     procedure TestQwen35MoeLogitParity;
     procedure TestGptOssLogitParity;
     procedure TestGptOssMXFP4LogitParity;
@@ -698,6 +817,8 @@ type
     procedure TestBertPoolSentenceEmbedding;
     procedure TestPoolSentenceEmbeddingModes;
     procedure TestEmbedInstructionPrefixTable;
+    procedure TestUtf8IncompleteTailLen;
+    procedure TestTakeCompleteUtf8StreamsWholeCodepoints;
     procedure TestPearsonAndSpearmanCorrelation;
     procedure TestSTSReport;
     procedure TestRetrievalReport;
@@ -9149,7 +9270,1106 @@ begin
   end;
 end;
 
+function TTestNeuralPretrained.BuildQwen35FixtureTwin(pSeqLen: integer;
+  pQuantizeInt8: boolean = false; pWeightOwner: TNNet = nil): TNNet;
+var
+  Config: TLlamaConfig;
+  WeightsFile: string;
+begin
+  // A borrowing build never opens the checkpoint, so a path that does not
+  // exist proves it.
+  if Assigned(pWeightOwner)
+    then WeightsFile := ExtractFilePath(FixturePath('tiny_qwen3_5_config.json')) +
+      'does_not_exist_tiny_qwen3_5.safetensors'
+    else WeightsFile := FixturePath('tiny_qwen3_5.safetensors');
+  Result := BuildQwen35FromSafeTensorsEx(WeightsFile, Config, pSeqLen,
+    {pTrainable=}false, FixturePath('tiny_qwen3_5_config.json'),
+    pQuantizeInt8, pWeightOwner);
+end;
+
+function TTestNeuralPretrained.MaxAbsVolumeDiff(A, B: TNNetVolume): double;
+var
+  Pos, MaxPos: integer;
+  Diff: double;
+begin
+  AssertEquals('compared volumes have the same size', A.Size, B.Size);
+  Result := 0;
+  MaxPos := A.Size - 1;
+  for Pos := 0 to MaxPos do
+  begin
+    Diff := Abs(A.FData[Pos] - B.FData[Pos]);
+    if Diff > Result then Result := Diff;
+  end;
+end;
+
+// The production prefill shape: the first PrefillTokenCount tokens go through
+// WindowSession in whole windows of StepTokens (never padded), the state
+// crosses to TailSession through Snapshot/RestoreSnapshot, and every
+// remaining token (the prefill tail and the decoded continuation) is stepped
+// one at a time on TailSession. Logits receives one row per token so runs of
+// any window width compare row by row. TNNet.Compute only prints on a width
+// mismatch, so both input widths are asserted before anything is fed.
+// Passing the same session twice is the plain width-1 reference stream.
+// HiddenOnlyTokenCount > 0 is the production prefill: those leading tokens
+// (every whole window, then the width-1 tail up to that count) step with
+// StepForwardToHidden, so the LM head of either net must not run - its
+// host Output keeps a sentinel until the first full step. Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunWindowedPrefillStream(WindowSession,
+  TailSession: TNNetStreamingDecoder; const Tokens: array of integer;
+  StepTokens, PrefillTokenCount: integer; Logits: TNNetVolume;
+  HiddenOnlyTokenCount: integer = 0);
+const
+  Sentinel = -12345.0;
+var
+  WindowIn, TailIn, StepOut: TNNetVolume;
+  Snap: TNNetDecoderSessionSnapshot;
+  Pos, Row, Vocab, TokenCount, WindowCount, WindowPos: integer;
+  MaxRowPos, MaxWindowPos: integer;
+
+  procedure AssertHeadUntouched(Net: TNNet; const What: string);
+  var
+    Head: TNNetVolume;
+  begin
+    Head := Net.GetLastLayer().Output;
+    AssertEquals(What + ': the LM head ran during a hidden-only step (first)',
+      Sentinel, Head.FData[0], 0.0);
+    AssertEquals(What + ': the LM head ran during a hidden-only step (last)',
+      Sentinel, Head.FData[Head.Size - 1], 0.0);
+  end;
+
+begin
+  TokenCount := Length(Tokens);
+  Vocab := TailSession.Output().Depth;
+  AssertEquals('window net input width', StepTokens,
+    WindowSession.Net.GetFirstLayer().Output.SizeX);
+  AssertEquals('tail net input width', 1,
+    TailSession.Net.GetFirstLayer().Output.SizeX);
+  AssertTrue('prefill fits the token list', PrefillTokenCount <= TokenCount);
+  AssertTrue('the hidden-only tokens cover every whole window',
+    (HiddenOnlyTokenCount = 0) or
+    (HiddenOnlyTokenCount >= (PrefillTokenCount div StepTokens) * StepTokens));
+  Logits.ReSize(TokenCount, 1, Vocab);
+  Logits.Fill(0);
+  WindowIn := TNNetVolume.Create(StepTokens, 1, 1);
+  TailIn := TNNetVolume.Create(1, 1, 1);
+  try
+    WindowSession.Reset();
+    TailSession.Reset();
+    if HiddenOnlyTokenCount > 0 then
+    begin
+      WindowSession.Net.GetLastLayer().Output.Fill(Sentinel);
+      TailSession.Net.GetLastLayer().Output.Fill(Sentinel);
+    end;
+    WindowCount := PrefillTokenCount div StepTokens;
+    MaxWindowPos := WindowCount - 1;
+    MaxRowPos := StepTokens - 1;
+    Pos := 0;
+    for WindowPos := 0 to MaxWindowPos do
+    begin
+      for Row := 0 to MaxRowPos do WindowIn.FData[Row] := Tokens[Pos + Row];
+      if Pos < HiddenOnlyTokenCount then
+      begin
+        WindowSession.StepForwardToHidden(WindowIn, Pos);
+        AssertHeadUntouched(WindowSession.Net, 'window at ' + IntToStr(Pos));
+      end
+      else
+      begin
+        WindowSession.StepForward(WindowIn, Pos);
+        StepOut := WindowSession.Output();
+        AssertEquals('window logits hold one row per token at ' + IntToStr(Pos),
+          StepTokens * Vocab, StepOut.Size);
+        Move(StepOut.FData[0], Logits.FData[Pos * Vocab],
+          StepTokens * Vocab * SizeOf(TNeuralFloat));
+      end;
+      Inc(Pos, StepTokens);
+    end;
+    if (WindowSession <> TailSession) and (Pos > 0) then
+    begin
+      Snap := WindowSession.Snapshot();
+      try
+        TailSession.RestoreSnapshot(Snap);
+      finally
+        Snap.Free;
+      end;
+    end;
+    while Pos < TokenCount do
+    begin
+      TailIn.FData[0] := Tokens[Pos];
+      if Pos < HiddenOnlyTokenCount then
+      begin
+        TailSession.StepForwardToHidden(TailIn, Pos);
+        AssertHeadUntouched(TailSession.Net, 'width-1 at ' + IntToStr(Pos));
+      end
+      else
+      begin
+        TailSession.StepForward(TailIn, Pos);
+        StepOut := TailSession.Output();
+        AssertEquals('width-1 logits hold one row at ' + IntToStr(Pos),
+          Vocab, StepOut.Size);
+        Move(StepOut.FData[0], Logits.FData[Pos * Vocab],
+          Vocab * SizeOf(TNeuralFloat));
+      end;
+      Inc(Pos);
+    end;
+  finally
+    TailIn.Free;
+    WindowIn.Free;
+  end;
+end;
+
+function TTestNeuralPretrained.MaxAbsRowDiffFrom(A, B: TNNetVolume;
+  FromRow: integer): double;
+var
+  Pos, MaxPos: integer;
+  Diff: double;
+begin
+  Result := 0;
+  AssertEquals('row-diff volumes share a size', A.Size, B.Size);
+  AssertEquals('row-diff volumes share a depth', A.Depth, B.Depth);
+  MaxPos := A.Size - 1;
+  for Pos := FromRow * A.Depth to MaxPos do
+  begin
+    Diff := Abs(A.FData[Pos] - B.FData[Pos]);
+    if Diff > Result then Result := Diff;
+  end;
+end;
+
+// Batched-prefill parity through the whole Qwen3.5 hybrid stack (DeltaNet
+// recurrence + conv state + KV-cached fused SDPA + RoPE offsets): the full
+// 16-token forward, the width-1 stream, 4-token windows (they divide the
+// prompt) and 6-token windows (two windows, then a 4-token tail stepped at
+// width 1 after the snapshot handoff) must all agree within 2e-4.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35WindowedPrefillParity;
+const
+  SeqLen = 16;
+var
+  Full, Twin1, Twin4, Twin6: TNNet;
+  Config: TLlamaConfig;
+  Session1, Session4, Session6: TNNetStreamingDecoder;
+  FullIn, FullOut, Logits1, Logits4, Logits6: TNNetVolume;
+  Toks: array[0..SeqLen - 1] of integer;
+  T, Vocab: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  Full := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5.safetensors'), Config, {SeqLen=}0,
+    {pTrainable=}false, FixturePath('tiny_qwen3_5_config.json'));
+  Twin1 := nil; Twin4 := nil; Twin6 := nil;
+  Session1 := nil; Session4 := nil; Session6 := nil;
+  FullIn := TNNetVolume.Create(SeqLen, 1, 1);
+  FullOut := TNNetVolume.Create();
+  Logits1 := TNNetVolume.Create();
+  Logits4 := TNNetVolume.Create();
+  Logits6 := TNNetVolume.Create();
+  try
+    Vocab := Config.VocabSize;
+    for T := 0 to SeqLen - 1 do
+    begin
+      Toks[T] := (5 * T + 2) mod Vocab;
+      FullIn.FData[T] := Toks[T];
+    end;
+    Full.Compute(FullIn);
+    Full.GetOutput(FullOut);
+    AssertEquals('full forward logits', SeqLen * Vocab, FullOut.Size);
+    Twin1 := BuildQwen35FixtureTwin(1);
+    Twin4 := BuildQwen35FixtureTwin(4);
+    Twin6 := BuildQwen35FixtureTwin(6);
+    Session1 := TNNetStreamingDecoder.Create(Twin1, SeqLen);
+    Session4 := TNNetStreamingDecoder.Create(Twin4, SeqLen);
+    Session6 := TNNetStreamingDecoder.Create(Twin6, SeqLen);
+    AssertTrue('recurrent-state layers collected', Session4.SSMCount > 0);
+    AssertTrue('attention layers collected', Session4.SDPACount > 0);
+    RunWindowedPrefillStream(Session1, Session1, Toks, 1, SeqLen, Logits1);
+    RunWindowedPrefillStream(Session4, Session1, Toks, 4, SeqLen, Logits4);
+    RunWindowedPrefillStream(Session6, Session1, Toks, 6, SeqLen, Logits6);
+    MaxDiff := MaxAbsVolumeDiff(FullOut, Logits1);
+    AssertTrue('width-1 stream vs full forward: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 2e-4', MaxDiff < 2e-4);
+    MaxDiff := MaxAbsVolumeDiff(FullOut, Logits4);
+    AssertTrue('4-token windows vs full forward: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 2e-4', MaxDiff < 2e-4);
+    MaxDiff := MaxAbsVolumeDiff(FullOut, Logits6);
+    AssertTrue('6-token windows + width-1 tail vs full forward: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 2e-4', MaxDiff < 2e-4);
+    MaxDiff := MaxAbsVolumeDiff(Logits1, Logits4);
+    AssertTrue('4-token windows vs width-1 stream: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 2e-4', MaxDiff < 2e-4);
+  finally
+    Logits6.Free;
+    Logits4.Free;
+    Logits1.Free;
+    FullOut.Free;
+    FullIn.Free;
+    Session6.Free;
+    Session4.Free;
+    Session1.Free;
+    Twin6.Free;
+    Twin4.Free;
+    Twin1.Free;
+    Full.Free;
+  end;
+end;
+
+// Intra-window causality at tolerance 0: two 4-token windows that differ
+// only in row 1 give bit-identical row-0 logits (row 1 must move, so the
+// changed token is known to have reached the net). Checked for a window at
+// position 0 and for a window that follows an earlier window, where the
+// attention scores run against a non-empty cache. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35WindowCausality;
+const
+  WindowLen = 4;
+  Toks: array[0..7] of integer = (7, 3, 10, 1, 8, 5, 2, 9);
+var
+  Twin: TNNet;
+  Session: TNNetStreamingDecoder;
+  WindowIn, RowA, RowB, RowA1, RowB1: TNNetVolume;
+  Vocab: integer;
+
+  procedure RunWindowAt(FirstWindowPos, ChangedRow1Token: integer;
+    Row0, Row1: TNNetVolume);
+  var
+    Row: integer;
+  begin
+    Session.Reset();
+    if FirstWindowPos > 0 then
+    begin
+      for Row := 0 to WindowLen - 1 do WindowIn.FData[Row] := Toks[Row];
+      Session.StepForward(WindowIn, 0);
+    end;
+    for Row := 0 to WindowLen - 1 do
+      WindowIn.FData[Row] := Toks[FirstWindowPos + Row];
+    if ChangedRow1Token >= 0 then WindowIn.FData[1] := ChangedRow1Token;
+    Session.StepForward(WindowIn, FirstWindowPos);
+    AssertEquals('window logits hold one row per token',
+      WindowLen * Vocab, Session.Output().Size);
+    Row0.ReSize(1, 1, Vocab);
+    Row1.ReSize(1, 1, Vocab);
+    Move(Session.Output().FData[0], Row0.FData[0], Vocab * SizeOf(TNeuralFloat));
+    Move(Session.Output().FData[Vocab], Row1.FData[0],
+      Vocab * SizeOf(TNeuralFloat));
+  end;
+
+  procedure CheckCausalityAt(FirstWindowPos: integer);
+  var
+    ChangedToken: integer;
+  begin
+    ChangedToken := (Toks[FirstWindowPos + 1] + 1) mod Vocab;
+    RunWindowAt(FirstWindowPos, -1, RowA, RowA1);
+    RunWindowAt(FirstWindowPos, ChangedToken, RowB, RowB1);
+    AssertEquals('row 0 ignores row 1 (window at ' +
+      IntToStr(FirstWindowPos) + ')', 0.0, MaxAbsVolumeDiff(RowA, RowB), 0.0);
+    AssertTrue('row 1 sees its own token (window at ' +
+      IntToStr(FirstWindowPos) + ')', MaxAbsVolumeDiff(RowA1, RowB1) > 0);
+  end;
+
+begin
+  RandSeed := 424242;
+  Twin := BuildQwen35FixtureTwin(WindowLen);
+  Session := nil;
+  WindowIn := TNNetVolume.Create(WindowLen, 1, 1);
+  RowA := TNNetVolume.Create();
+  RowB := TNNetVolume.Create();
+  RowA1 := TNNetVolume.Create();
+  RowB1 := TNNetVolume.Create();
+  try
+    Session := TNNetStreamingDecoder.Create(Twin, 2 * WindowLen);
+    Vocab := Session.Output().Depth;
+    AssertEquals('window net input width', WindowLen,
+      Twin.GetFirstLayer().Output.SizeX);
+    CheckCausalityAt(0);
+    CheckCausalityAt(WindowLen);
+  finally
+    RowB1.Free;
+    RowA1.Free;
+    RowB.Free;
+    RowA.Free;
+    WindowIn.Free;
+    Session.Free;
+    Twin.Free;
+  end;
+end;
+
+// A window whose first token sits at a NON-ZERO absolute position: the
+// width-1 session streams the first 8 tokens, its snapshot is restored into
+// the 4-token window net, and the two windows at positions 8 and 12 must
+// match the width-1 stream. RoPE is relative, so a window rotated from
+// position 0 instead of 8 is invisible to a full-vs-windowed comparison that
+// starts at 0; this comparison against cached keys at their true positions
+// catches it. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35WindowAtNonZeroPosition;
+const
+  SeqLen = 16;
+  PrefixLen = 8;
+  WindowLen = 4;
+var
+  Twin1, Twin4: TNNet;
+  Session1, Session4: TNNetStreamingDecoder;
+  Snap: TNNetDecoderSessionSnapshot;
+  Logits1, StepIn, WindowIn, WindowLogits: TNNetVolume;
+  Toks: array[0..SeqLen - 1] of integer;
+  T, Row, Vocab, WindowStart: integer;
+  MaxDiff: double;
+begin
+  RandSeed := 424242;
+  Twin1 := BuildQwen35FixtureTwin(1);
+  Twin4 := nil;
+  Session1 := nil; Session4 := nil; Snap := nil;
+  Logits1 := TNNetVolume.Create();
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  WindowIn := TNNetVolume.Create(WindowLen, 1, 1);
+  WindowLogits := TNNetVolume.Create();
+  try
+    Twin4 := BuildQwen35FixtureTwin(WindowLen);
+    Session1 := TNNetStreamingDecoder.Create(Twin1, SeqLen);
+    Session4 := TNNetStreamingDecoder.Create(Twin4, SeqLen);
+    Vocab := Session1.Output().Depth;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    RunWindowedPrefillStream(Session1, Session1, Toks, 1, SeqLen, Logits1);
+    AssertEquals('window net input width', WindowLen,
+      Twin4.GetFirstLayer().Output.SizeX);
+    // The width-1 prefix again, stopped where the windows take over.
+    Session1.Reset();
+    StepIn.ReSize(1, 1, 1);
+    for T := 0 to PrefixLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[T];
+      Session1.StepForward(StepIn, T);
+    end;
+    Snap := Session1.Snapshot();
+    Session4.Reset();
+    Session4.RestoreSnapshot(Snap);
+    WindowLogits.ReSize(WindowLen, 1, Vocab);
+    WindowStart := PrefixLen;
+    while WindowStart < SeqLen do
+    begin
+      for Row := 0 to WindowLen - 1 do
+        WindowIn.FData[Row] := Toks[WindowStart + Row];
+      Session4.StepForward(WindowIn, WindowStart);
+      AssertEquals('window logits hold one row per token',
+        WindowLen * Vocab, Session4.Output().Size);
+      WindowLogits.Copy(Session4.Output());
+      MaxDiff := 0;
+      for Row := 0 to WindowLen * Vocab - 1 do
+        MaxDiff := Max(MaxDiff, Abs(WindowLogits.FData[Row] -
+          Logits1.FData[WindowStart * Vocab + Row]));
+      AssertTrue('window at position ' + IntToStr(WindowStart) +
+        ' vs width-1 stream: max |diff| = ' + FloatToStr(MaxDiff) +
+        ' must be < 2e-4', MaxDiff < 2e-4);
+      Inc(WindowStart, WindowLen);
+    end;
+  finally
+    Snap.Free;
+    WindowLogits.Free;
+    WindowIn.Free;
+    StepIn.Free;
+    Logits1.Free;
+    Session4.Free;
+    Session1.Free;
+    Twin4.Free;
+    Twin1.Free;
+  end;
+end;
+
+// Snapshot handoff at tolerance 0: an 8-token prompt prefilled as two
+// 4-token windows on the window net, snapshot, restored into the width-1 net
+// and continued for 8 more tokens must reproduce the all-width-1 stream
+// bit for bit, with the FP32 KV cache and with the int8 KV cache.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35WindowedPrefillSnapshotHandoff;
+const
+  SeqLen = 16;
+  PromptLen = 8;
+  WindowLen = 4;
+var
+  Twin1, Twin4: TNNet;
+  Toks: array[0..SeqLen - 1] of integer;
+  T, Vocab: integer;
+
+  procedure CheckHandoff(Int8KV: boolean);
+  var
+    Session1, Session4: TNNetStreamingDecoder;
+    LogitsRef, LogitsHandoff: TNNetVolume;
+    Mode: string;
+  begin
+    Mode := BoolToStr(Int8KV, 'int8 KV', 'FP32 KV');
+    Session1 := TNNetStreamingDecoder.Create(Twin1, SeqLen, Int8KV);
+    Session4 := nil;
+    LogitsRef := TNNetVolume.Create();
+    LogitsHandoff := TNNetVolume.Create();
+    try
+      Session4 := TNNetStreamingDecoder.Create(Twin4, SeqLen, Int8KV);
+      RunWindowedPrefillStream(Session1, Session1, Toks, 1, SeqLen, LogitsRef);
+      RunWindowedPrefillStream(Session4, Session1, Toks, WindowLen, PromptLen,
+        LogitsHandoff);
+      AssertEquals('windowed prefill + handoff vs all-width-1 (' + Mode + ')',
+        0.0, MaxAbsVolumeDiff(LogitsRef, LogitsHandoff), 0.0);
+    finally
+      LogitsHandoff.Free;
+      LogitsRef.Free;
+      Session4.Free;
+      Session1.Free;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  Twin1 := BuildQwen35FixtureTwin(1);
+  Twin4 := nil;
+  try
+    Twin4 := BuildQwen35FixtureTwin(WindowLen);
+    Vocab := Twin1.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    CheckHandoff(false);
+    CheckHandoff(true);
+  finally
+    Twin4.Free;
+    Twin1.Free;
+  end;
+end;
+
+// The production prefill shape with the LM head skipped: the first PromptLen
+// tokens step with StepForwardToHidden (whole windows on the width-4 twin,
+// the snapshot handoff, then the width-1 tail), every later token is a full
+// step. The rows after the prefill must be bit-identical to the all-width-1
+// full-step reference, with the FP32 and the int8 KV cache, on the serial
+// loop and on the layer-graph scheduler: no state lives past the LM-head
+// input. The width-1-only variant (no twin) covers today's default path.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35WindowedPrefillToHiddenParity;
+const
+  SeqLen = 16;
+  PromptLen = 10;
+  WindowLen = 4;
+var
+  Twin1, Twin4: TNNet;
+  Toks: array[0..SeqLen - 1] of integer;
+  T, Vocab: integer;
+
+  procedure CheckPrefill(Int8KV, Parallel: boolean);
+  var
+    Session1, Session4: TNNetStreamingDecoder;
+    LogitsRef, LogitsHidden: TNNetVolume;
+    Mode: string;
+  begin
+    Mode := BoolToStr(Int8KV, 'int8 KV', 'FP32 KV') +
+      BoolToStr(Parallel, ', parallel', ', serial');
+    Session1 := TNNetStreamingDecoder.Create(Twin1, SeqLen, Int8KV);
+    Session4 := nil;
+    LogitsRef := TNNetVolume.Create();
+    LogitsHidden := TNNetVolume.Create();
+    try
+      Session4 := TNNetStreamingDecoder.Create(Twin4, SeqLen, Int8KV);
+      Session1.Parallel := Parallel;
+      Session4.Parallel := Parallel;
+      AssertTrue('the LM head is the only layer past the hidden slot',
+        Twin1.GetLastLayerIdx() = Session1.HiddenLayer().LayerIdx + 1);
+      AssertTrue('the hidden slot is the final norm',
+        Session1.HiddenLayer() is TNNetTokenRMSNorm);
+      RunWindowedPrefillStream(Session1, Session1, Toks, 1, SeqLen, LogitsRef);
+      RunWindowedPrefillStream(Session4, Session1, Toks, WindowLen, PromptLen,
+        LogitsHidden, PromptLen);
+      AssertEquals('windows + width-1 tail to the hidden slot, then full' +
+        ' steps (' + Mode + ')', 0.0,
+        MaxAbsRowDiffFrom(LogitsRef, LogitsHidden, PromptLen), 0.0);
+      AssertEquals('the hidden-only rows hold no logits (' + Mode + ')', 0.0,
+        LogitsHidden.FData[(PromptLen - 1) * Vocab], 0.0);
+      RunWindowedPrefillStream(Session1, Session1, Toks, 1, PromptLen,
+        LogitsHidden, PromptLen);
+      AssertEquals('width-1 prefill to the hidden slot, then full steps (' +
+        Mode + ')', 0.0,
+        MaxAbsRowDiffFrom(LogitsRef, LogitsHidden, PromptLen), 0.0);
+    finally
+      LogitsHidden.Free;
+      LogitsRef.Free;
+      Session4.Free;
+      Session1.Free;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  Twin1 := BuildQwen35FixtureTwin(1);
+  Twin4 := nil;
+  try
+    Twin4 := BuildQwen35FixtureTwin(WindowLen);
+    Vocab := Twin1.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    CheckPrefill({Int8KV=}false, {Parallel=}false);
+    CheckPrefill({Int8KV=}true, {Parallel=}false);
+    CheckPrefill({Int8KV=}false, {Parallel=}true);
+  finally
+    Twin4.Free;
+    Twin1.Free;
+  end;
+end;
+
+// The device path of the batched prefill, FP32 KV cache.
+procedure TTestNeuralPretrained.TestQwen35WindowedPrefillOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  RunWindowedPrefillOpenCLParity({Int8KV=}false);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+// The same with the int8 KV cache, the ChatTerminal default under int8 and
+// int4 weights: cai_sdpa_append_kv_int8 quantizes every window row.
+procedure TTestNeuralPretrained.TestQwen35WindowedPrefillOpenCLInt8KVParity;
+begin
+  {$IFDEF OpenCL}
+  RunWindowedPrefillOpenCLParity({Int8KV=}true);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+function TTestNeuralPretrained.AssertWeightsLinked(Linked, Owner: TNNet;
+  const What: string): integer;
+var
+  LayerPos, MaxLayerPos: integer;
+  OwnerLayer, LinkedLayer: TNNetLayer;
+  LinkedBytes: int64;
+begin
+  Result := 0;
+  LinkedBytes := 0;
+  AssertEquals(What + ': layer counts', Owner.CountLayers(),
+    Linked.CountLayers());
+  MaxLayerPos := Owner.CountLayers() - 1;
+  for LayerPos := 0 to MaxLayerPos do
+  begin
+    OwnerLayer := Owner.Layers[LayerPos];
+    LinkedLayer := Linked.Layers[LayerPos];
+    if OwnerLayer.CountWeights() > 0 then
+    begin
+      AssertTrue(What + ': layer ' + IntToStr(LayerPos) + ' (' +
+        OwnerLayer.ClassName + ') borrows', LinkedLayer.WeightOwner = OwnerLayer);
+      AssertTrue(What + ': layer ' + IntToStr(LayerPos) +
+        ' links the neurons', LinkedLayer.LinkedNeurons);
+      Inc(Result);
+    end;
+    AssertEquals(What + ': layer ' + IntToStr(LayerPos) + ' (' +
+      LinkedLayer.ClassName + ') reports no weights of its own', 0,
+      LinkedLayer.CountWeights());
+    if LinkedLayer is TNNetLayerConcatedWeights then
+      LinkedBytes := LinkedBytes +
+        TNNetLayerConcatedWeights(LinkedLayer).Int8QuantizedSizeBytes()
+    else if LinkedLayer is TNNetEmbedding then
+      LinkedBytes := LinkedBytes +
+        TNNetEmbedding(LinkedLayer).Int8QuantizedSizeBytes();
+  end;
+  AssertEquals(What + ': quantized bytes held by the linked net', 0,
+    LinkedBytes);
+  AssertTrue(What + ': some layer borrows', Result > 0);
+end;
+
+function TTestNeuralPretrained.BuildLlamaInt4FixtureTwin(
+  pSeqLen: integer; pWeightOwner: TNNet = nil): TNNet;
+var
+  Config: TLlamaConfig;
+  WeightsFile: string;
+begin
+  if Assigned(pWeightOwner)
+    then WeightsFile := ExtractFilePath(FixturePath('tiny_llama_q8_config.json')) +
+      'does_not_exist_tiny_llama_q8.safetensors'
+    else WeightsFile := FixturePath('tiny_llama_q8.safetensors');
+  Result := BuildLlamaFromSafeTensorsEx(WeightsFile, Config, pSeqLen,
+    {pTrainable=}false, FixturePath('tiny_llama_q8_config.json'),
+    {pQuantizeInt8=}true, pWeightOwner);
+  // A borrowing twin holds the owner's int4 tables already; its own
+  // QuantizeWeightsInt4 would have nothing to convert.
+  if not Assigned(pWeightOwner) then
+    AssertTrue('int4 layers in the tiny llama twin',
+      Result.QuantizeWeightsInt4() > 0);
+end;
+
+// A width-6 twin computing with the width-1 net's int8 tables (Phase 5 of
+// docs/BATCHED-PREFILL-DESIGN.md): the same windows through a twin that
+// quantized its own copy must give bit-identical logits, while the linked
+// twin owns no weight bytes. The owner is freed last here. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35LinkedWeightsInt8Parity;
+const
+  SeqLen = 16;
+  WindowLen = 6;
+var
+  Owner, Reference, Linked: TNNet;
+  SessionOwner, SessionReference, SessionLinked: TNNetStreamingDecoder;
+  LogitsReference, LogitsLinked: TNNetVolume;
+  Toks: array[0..SeqLen - 1] of integer;
+  T, Vocab, LinkedCount: integer;
+  ReferenceBytes: int64;
+begin
+  Owner := BuildQwen35FixtureTwin(1);
+  Reference := nil; Linked := nil;
+  SessionOwner := nil; SessionReference := nil; SessionLinked := nil;
+  LogitsReference := TNNetVolume.Create();
+  LogitsLinked := TNNetVolume.Create();
+  try
+    Owner.QuantizeWeightsInt8();
+    Reference := BuildQwen35FixtureTwin(WindowLen);
+    Reference.QuantizeWeightsInt8();
+    // Built with FP32 rows on purpose: the link must free them.
+    Linked := BuildQwen35FixtureTwin(WindowLen);
+    LinkedCount := Linked.LinkWeightsFrom(Owner);
+    AssertEquals('layers linked', AssertWeightsLinked(Linked, Owner, 'int8'),
+      LinkedCount);
+    ReferenceBytes := 0;
+    for T := 0 to Reference.CountLayers() - 1 do
+      if Reference.Layers[T] is TNNetLayerConcatedWeights then
+        ReferenceBytes := ReferenceBytes +
+          TNNetLayerConcatedWeights(Reference.Layers[T]).Int8QuantizedSizeBytes();
+    AssertTrue('the unlinked twin really holds int8 bytes', ReferenceBytes > 0);
+    Vocab := Owner.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    SessionOwner := TNNetStreamingDecoder.Create(Owner, SeqLen);
+    SessionReference := TNNetStreamingDecoder.Create(Reference, SeqLen);
+    SessionLinked := TNNetStreamingDecoder.Create(Linked, SeqLen);
+    RunWindowedPrefillStream(SessionReference, SessionOwner, Toks, WindowLen,
+      SeqLen, LogitsReference);
+    RunWindowedPrefillStream(SessionLinked, SessionOwner, Toks, WindowLen,
+      SeqLen, LogitsLinked);
+    AssertEquals('linked twin vs its own-copy twin: bit-identical logits',
+      0.0, MaxAbsVolumeDiff(LogitsReference, LogitsLinked), 0.0);
+  finally
+    LogitsLinked.Free;
+    LogitsReference.Free;
+    SessionLinked.Free;
+    SessionReference.Free;
+    SessionOwner.Free;
+    Linked.Free;
+    Reference.Free;
+    Owner.Free;
+  end;
+end;
+
+// Int4 tables borrowed across widths on the tiny llama (its rows are a
+// multiple of the Q4_0 block): a width-4 full forward on the linked twin
+// equals the twin that requantized its own copy, bit for bit. The owner is
+// freed FIRST here: the linked layers detach and are then freed without it.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLlamaLinkedWeightsInt4Parity;
+const
+  SeqLen = 4;
+var
+  Owner, Reference, Linked: TNNet;
+  Input, OutReference, OutLinked: TNNetVolume;
+  T, Vocab, LayerPos, Int4Linked: integer;
+begin
+  Owner := BuildLlamaInt4FixtureTwin(1);
+  Reference := nil; Linked := nil;
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutReference := TNNetVolume.Create();
+  OutLinked := TNNetVolume.Create();
+  try
+    Reference := BuildLlamaInt4FixtureTwin(SeqLen);
+    // Built int8-armed, as the importers build a quantized net, then linked
+    // to the int4 owner: the link switches it to int4 and arms its int8 input.
+    Linked := BuildLlamaInt4FixtureTwin(SeqLen);
+    AssertTrue('layers linked', Linked.LinkWeightsFrom(Owner) > 0);
+    AssertWeightsLinked(Linked, Owner, 'int4');
+    Int4Linked := 0;
+    for LayerPos := 0 to Linked.CountLayers() - 1 do
+      if (Linked.Layers[LayerPos] is TNNetLayerConcatedWeights) and
+        TNNetLayerConcatedWeights(Linked.Layers[LayerPos]).WeightsQuantizedInt4
+        then Inc(Int4Linked);
+    AssertTrue('int4 layers on the linked twin', Int4Linked > 0);
+    Vocab := Owner.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Input.FData[T] := (3 * T + 1) mod Vocab;
+    Reference.Compute(Input);
+    Reference.GetOutput(OutReference);
+    Linked.Compute(Input);
+    Linked.GetOutput(OutLinked);
+    AssertTrue('logits produced', OutReference.Size = SeqLen * Vocab);
+    AssertEquals('linked int4 twin vs its own-copy twin: bit-identical',
+      0.0, MaxAbsVolumeDiff(OutReference, OutLinked), 0.0);
+    FreeAndNil(Owner);
+    for LayerPos := 0 to Linked.CountLayers() - 1 do
+      AssertTrue('layer ' + IntToStr(LayerPos) + ' detached from the freed ' +
+        'owner', Linked.Layers[LayerPos].WeightOwner = nil);
+  finally
+    OutLinked.Free;
+    OutReference.Free;
+    Input.Free;
+    Linked.Free;
+    Reference.Free;
+    Owner.Free;
+  end;
+end;
+
 {$IFDEF OpenCL}
+function TTestNeuralPretrained.AssertDeviceWeightsBorrowed(Linked: TNNet;
+  const What: string): integer;
+var
+  LayerPos, MaxLayerPos: integer;
+  LinkedLayer, OwnerLayer: TNNetLayer;
+begin
+  Result := 0;
+  MaxLayerPos := Linked.CountLayers() - 1;
+  for LayerPos := 0 to MaxLayerPos do
+  begin
+    LinkedLayer := Linked.Layers[LayerPos];
+    OwnerLayer := LinkedLayer.WeightOwner;
+    if not Assigned(OwnerLayer) then continue;
+    if LinkedLayer is TNNetLayerConcatedWeights then
+    begin
+      if TNNetLayerConcatedWeights(OwnerLayer).OpenCLCodesBuffer() = nil then
+        continue;
+      AssertTrue(What + ': layer ' + IntToStr(LayerPos) + ' (' +
+        LinkedLayer.ClassName + ') borrows its device codes',
+        TNNetLayerConcatedWeights(LinkedLayer).OpenCLCodesBorrowed());
+      AssertTrue(What + ': layer ' + IntToStr(LayerPos) +
+        ' holds the owner''s codes handle',
+        TNNetLayerConcatedWeights(LinkedLayer).OpenCLCodesBuffer() =
+        TNNetLayerConcatedWeights(OwnerLayer).OpenCLCodesBuffer());
+      Inc(Result);
+    end
+    else if LinkedLayer is TNNetEmbedding then
+    begin
+      AssertTrue(What + ': the owner embedding table is resident',
+        TNNetEmbedding(OwnerLayer).OpenCLTableBuffer() <> nil);
+      AssertTrue(What + ': layer ' + IntToStr(LayerPos) +
+        ' holds the owner''s vocab table handle',
+        TNNetEmbedding(LinkedLayer).OpenCLTableBuffer() =
+        TNNetEmbedding(OwnerLayer).OpenCLTableBuffer());
+      Inc(Result);
+    end;
+  end;
+  AssertTrue(What + ': some layer borrows device weights', Result > 0);
+end;
+{$ENDIF}
+
+// The device half of the weight link: a width-4 OpenCL twin enabled inside
+// the owner's context (EnableOpenCLInContextOf) retains the owner's resident
+// int8 codes and vocab table - one handle, no second upload - and its
+// windowed prefill equals a twin that uploaded its own copy, bit for bit.
+// The owner net is freed first. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35LinkedWeightsOpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 16;
+  WindowLen = 4;
+  PromptLen = 12;
+var
+  Owner, Reference, Linked: TNNet;
+  SessionOwner, SessionReference, SessionLinked: TNNetStreamingDecoder;
+  LogitsReference, LogitsLinked: TNNetVolume;
+  Toks: array[0..SeqLen - 1] of integer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, Vocab: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Owner := BuildQwen35FixtureTwin(1);
+  Reference := nil; Linked := nil;
+  SessionOwner := nil; SessionReference := nil; SessionLinked := nil;
+  LogitsReference := TNNetVolume.Create();
+  LogitsLinked := TNNetVolume.Create();
+  try
+    Owner.QuantizeWeightsInt8();
+    Reference := BuildQwen35FixtureTwin(WindowLen);
+    Reference.QuantizeWeightsInt8();
+    Linked := BuildQwen35FixtureTwin(WindowLen);
+    AssertTrue('layers linked', Linked.LinkWeightsFrom(Owner) > 0);
+    Owner.EnableOpenCL(PlatformId, DeviceId);
+    Reference.EnableOpenCL(PlatformId, DeviceId);
+    Linked.EnableOpenCLInContextOf(Owner);
+    AssertWeightsLinked(Linked, Owner, 'int8 device');
+    AssertDeviceWeightsBorrowed(Linked, 'int8 device');
+    Vocab := Owner.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    SessionOwner := TNNetStreamingDecoder.Create(Owner, SeqLen);
+    SessionReference := TNNetStreamingDecoder.Create(Reference, SeqLen);
+    SessionLinked := TNNetStreamingDecoder.Create(Linked, SeqLen);
+    RunWindowedPrefillStream(SessionReference, SessionOwner, Toks, WindowLen,
+      PromptLen, LogitsReference);
+    RunWindowedPrefillStream(SessionLinked, SessionOwner, Toks, WindowLen,
+      PromptLen, LogitsLinked);
+    AssertAllOnDevice(Linked, TNNetPointwiseConvLinear, 'linked twin');
+    AssertAllOnDevice(Linked, TNNetEmbedding, 'linked twin');
+    AssertEquals('linked device twin vs its own-copy device twin: ' +
+      'bit-identical logits', 0.0,
+      MaxAbsVolumeDiff(LogitsReference, LogitsLinked), 0.0);
+    FreeAndNil(SessionOwner);
+    FreeAndNil(Owner);
+  finally
+    LogitsLinked.Free;
+    LogitsReference.Free;
+    SessionLinked.Free;
+    SessionReference.Free;
+    SessionOwner.Free;
+    Linked.Free;
+    Reference.Free;
+    Owner.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Int4 device codes borrowed across widths: the width-4 linked twin, enabled
+// in the owner's context, shares the owner's packed-nibble and block-scale
+// buffers and matches its own-copy twin bit for bit. The linked net is freed
+// first here. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLlamaLinkedWeightsInt4OpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 4;
+var
+  Owner, Reference, Linked: TNNet;
+  Input, OutReference, OutLinked: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, Vocab: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Owner := BuildLlamaInt4FixtureTwin(1);
+  Reference := nil; Linked := nil;
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutReference := TNNetVolume.Create();
+  OutLinked := TNNetVolume.Create();
+  try
+    Reference := BuildLlamaInt4FixtureTwin(SeqLen);
+    Linked := BuildLlamaInt4FixtureTwin(SeqLen);
+    AssertTrue('layers linked', Linked.LinkWeightsFrom(Owner) > 0);
+    Owner.EnableOpenCL(PlatformId, DeviceId);
+    Reference.EnableOpenCL(PlatformId, DeviceId);
+    Linked.EnableOpenCLInContextOf(Owner);
+    AssertWeightsLinked(Linked, Owner, 'int4 device');
+    AssertDeviceWeightsBorrowed(Linked, 'int4 device');
+    Vocab := Owner.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Input.FData[T] := (3 * T + 1) mod Vocab;
+    Reference.Compute(Input);
+    Reference.GetOutput(OutReference);
+    Linked.Compute(Input);
+    Linked.GetOutput(OutLinked);
+    AssertAllOnDevice(Linked, TNNetPointwiseConvLinear, 'linked int4 twin');
+    AssertEquals('linked int4 device twin vs its own-copy device twin: ' +
+      'bit-identical', 0.0, MaxAbsVolumeDiff(OutReference, OutLinked), 0.0);
+    FreeAndNil(Linked);
+  finally
+    OutLinked.Free;
+    OutReference.Free;
+    Input.Free;
+    Linked.Free;
+    Reference.Free;
+    Owner.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+{$IFDEF OpenCL}
+procedure TTestNeuralPretrained.AssertAllOnDevice(Net: TNNet; AClass: TClass;
+  const What: string);
+var
+  LayerPos, MaxLayerPos, Total, OnDevice: integer;
+begin
+  Total := 0;
+  OnDevice := 0;
+  MaxLayerPos := Net.CountLayers() - 1;
+  for LayerPos := 0 to MaxLayerPos do
+    if Net.Layers[LayerPos].ClassType = AClass then
+    begin
+      Inc(Total);
+      if Net.Layers[LayerPos].ForwardGPUCnt > 0 then Inc(OnDevice);
+    end;
+  AssertTrue(What + ' has ' + AClass.ClassName + ' layers', Total > 0);
+  AssertEquals(What + ': ' + AClass.ClassName + ' layers that reached the device',
+    Total, OnDevice);
+end;
+
+// The batched prefill on the device: a 46-token prompt as two 20-row windows
+// on an OpenCL twin plus a 6-token tail, the snapshot handed to an OpenCL
+// width-1 twin, then 6 more tokens one at a time. 20 rows put twenty token
+// rows into one split-row launch, and 20 does not divide 46, so the tail path
+// runs. The fixture
+// config says max_position_embeddings 16, which the importer only uses to
+// bound the input width (default RoPE has no table), so the twins are built
+// from a temporary copy that says 64. The device run
+// must match the host's width-1 stream and the host's identical windowed run
+// within 1e-3, and every TNNetFusedSDPA and TNNetCellMulByCell of both OpenCL
+// twins must have run on the device - without that an unarmed path compares
+// the host with itself. The last block reads the intra-window causal bound
+// straight off the device: two windows that differ only in row 1 give
+// bit-identical row-0 logits, at position 0 and after a previous window.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunWindowedPrefillOpenCLParity(Int8KV: boolean);
+const
+  SeqLen = 52;
+  PromptLen = 46;
+  WindowLen = 20;
+var
+  TwinCPU1, TwinCPUW, TwinCL1, TwinCLW: TNNet;
+  SessionCPU1, SessionCPUW, SessionCL1, SessionCLW: TNNetStreamingDecoder;
+  LogitsCPU1, LogitsCPUW, LogitsCL, LogitsCLHidden, RowZero, Win: TNNetVolume;
+  Toks: array[0..SeqLen - 1] of integer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, Vocab, MaxRowPos: integer;
+  Mode, WideConfigPath: string;
+  WideConfig: TStringList;
+  DiffHost, DiffWidth1, DiffHidden: double;
+
+  function BuildWideTwin(pSeqLen: integer): TNNet;
+  var
+    Config: TLlamaConfig;
+  begin
+    Result := BuildQwen35FromSafeTensorsEx(
+      FixturePath('tiny_qwen3_5.safetensors'), Config, pSeqLen,
+      {pTrainable=}false, WideConfigPath);
+  end;
+
+  // Feeds the window starting at FirstPos on the OpenCL twin (after the window
+  // at 0 when FirstPos > 0), once as is and once with row 1 changed; row 0's
+  // logits must not move and row 1's must.
+  procedure CheckRowZeroCausality(FirstPos: integer);
+  var
+    Row, OtherTok: integer;
+    RowOneDiff: double;
+  begin
+    OtherTok := (Toks[FirstPos + 1] + 7) mod Vocab;
+    AssertTrue('the second window token really changes',
+      OtherTok <> Toks[FirstPos + 1]);
+    SessionCLW.Reset();
+    if FirstPos > 0 then
+    begin
+      for Row := 0 to MaxRowPos do Win.FData[Row] := Toks[Row];
+      SessionCLW.StepForward(Win, 0);
+    end;
+    for Row := 0 to MaxRowPos do Win.FData[Row] := Toks[FirstPos + Row];
+    SessionCLW.StepForward(Win, FirstPos);
+    RowZero.Copy(SessionCLW.Output());
+    SessionCLW.Reset();
+    if FirstPos > 0 then
+    begin
+      for Row := 0 to MaxRowPos do Win.FData[Row] := Toks[Row];
+      SessionCLW.StepForward(Win, 0);
+    end;
+    for Row := 0 to MaxRowPos do Win.FData[Row] := Toks[FirstPos + Row];
+    Win.FData[1] := OtherTok;
+    SessionCLW.StepForward(Win, FirstPos);
+    // Same kernels in the same order for row 0's work-groups, so any
+    // difference is row 1 leaking backwards - exact, not a tolerance.
+    for Row := 0 to Vocab - 1 do
+      AssertEquals(Mode + ' at ' + IntToStr(FirstPos) + ': row 0 logit ' +
+        IntToStr(Row) + ' must not depend on the row 1 token',
+        RowZero.FData[Row], SessionCLW.Output().FData[Row], 0.0);
+    RowOneDiff := 0;
+    for Row := 0 to Vocab - 1 do
+      RowOneDiff := Max(RowOneDiff, Abs(RowZero.FData[Vocab + Row] -
+        SessionCLW.Output().FData[Vocab + Row]));
+    AssertTrue(Mode + ' at ' + IntToStr(FirstPos) +
+      ': row 1 logits move with the row 1 token', RowOneDiff > 0);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  AssertTrue('the window does not divide the prompt',
+    PromptLen mod WindowLen <> 0);
+  Mode := BoolToStr(Int8KV, 'int8 KV', 'FP32 KV');
+  RandSeed := 424242;
+  WideConfigPath := IncludeTrailingPathDelimiter(GetTempDir(false)) +
+    'cai_qwen35_wide_' + IntToStr(Random(1000000)) + '_config.json';
+  WideConfig := TStringList.Create();
+  try
+    WideConfig.LoadFromFile(FixturePath('tiny_qwen3_5_config.json'));
+    WideConfig.Text := StringReplace(WideConfig.Text,
+      '"max_position_embeddings": 16', '"max_position_embeddings": 64', []);
+    AssertTrue('the wide config carries the larger context',
+      Pos('"max_position_embeddings": 64', WideConfig.Text) > 0);
+    WideConfig.SaveToFile(WideConfigPath);
+  finally
+    WideConfig.Free;
+  end;
+  TwinCPU1 := nil; TwinCPUW := nil; TwinCL1 := nil; TwinCLW := nil;
+  SessionCPU1 := nil; SessionCPUW := nil; SessionCL1 := nil; SessionCLW := nil;
+  LogitsCPU1 := TNNetVolume.Create();
+  LogitsCPUW := TNNetVolume.Create();
+  LogitsCL := TNNetVolume.Create();
+  LogitsCLHidden := TNNetVolume.Create();
+  RowZero := TNNetVolume.Create();
+  Win := TNNetVolume.Create(WindowLen, 1, 1);
+  try
+    TwinCPU1 := BuildWideTwin(1);
+    TwinCPUW := BuildWideTwin(WindowLen);
+    TwinCL1 := BuildWideTwin(1);
+    TwinCLW := BuildWideTwin(WindowLen);
+    TwinCL1.EnableOpenCL(PlatformId, DeviceId);
+    TwinCLW.EnableOpenCL(PlatformId, DeviceId);
+    Vocab := TwinCPU1.GetLastLayer().Output.Depth;
+    MaxRowPos := WindowLen - 1;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    SessionCPU1 := TNNetStreamingDecoder.Create(TwinCPU1, SeqLen, Int8KV);
+    SessionCPUW := TNNetStreamingDecoder.Create(TwinCPUW, SeqLen, Int8KV);
+    SessionCL1 := TNNetStreamingDecoder.Create(TwinCL1, SeqLen, Int8KV);
+    SessionCLW := TNNetStreamingDecoder.Create(TwinCLW, SeqLen, Int8KV);
+    RunWindowedPrefillStream(SessionCPU1, SessionCPU1, Toks, 1, SeqLen,
+      LogitsCPU1);
+    RunWindowedPrefillStream(SessionCPUW, SessionCPU1, Toks, WindowLen,
+      PromptLen, LogitsCPUW);
+    RunWindowedPrefillStream(SessionCLW, SessionCL1, Toks, WindowLen,
+      PromptLen, LogitsCL);
+    DiffHost := MaxAbsVolumeDiff(LogitsCPUW, LogitsCL);
+    DiffWidth1 := MaxAbsVolumeDiff(LogitsCPU1, LogitsCL);
+    // The production prefill: every prompt token stops at the LM-head input
+    // (both twins skip their LM head), then the full decode steps must still
+    // match the host and the fused attention must still be on the device.
+    RunWindowedPrefillStream(SessionCLW, SessionCL1, Toks, WindowLen,
+      PromptLen, LogitsCLHidden, PromptLen);
+    DiffHidden := MaxAbsRowDiffFrom(LogitsCPU1, LogitsCLHidden, PromptLen);
+
+    AssertAllOnDevice(TwinCLW, TNNetFusedSDPA, Mode + ' window twin');
+    AssertAllOnDevice(TwinCLW, TNNetCellMulByCell, Mode + ' window twin');
+    AssertAllOnDevice(TwinCL1, TNNetFusedSDPA, Mode + ' width-1 twin');
+    AssertAllOnDevice(TwinCL1, TNNetCellMulByCell, Mode + ' width-1 twin');
+    AssertTrue(Mode + ' windowed device vs windowed host: max |diff| = ' +
+      FloatToStr(DiffHost) + ' must be < 1e-3', DiffHost < 1e-3);
+    AssertTrue(Mode + ' windowed device vs width-1 host: max |diff| = ' +
+      FloatToStr(DiffWidth1) + ' must be < 1e-3', DiffWidth1 < 1e-3);
+    AssertTrue(Mode + ' prefill to the hidden slot on the device, decode vs' +
+      ' width-1 host: max |diff| = ' + FloatToStr(DiffHidden) +
+      ' must be < 1e-3', DiffHidden < 1e-3);
+
+    CheckRowZeroCausality(0);
+    CheckRowZeroCausality(WindowLen);
+  finally
+    Win.Free;
+    RowZero.Free;
+    LogitsCLHidden.Free;
+    LogitsCL.Free;
+    LogitsCPUW.Free;
+    LogitsCPU1.Free;
+    SessionCLW.Free;
+    SessionCL1.Free;
+    SessionCPUW.Free;
+    SessionCPU1.Free;
+    TwinCLW.Free;
+    TwinCL1.Free;
+    TwinCPUW.Free;
+    TwinCPU1.Free;
+    DeleteFile(WideConfigPath);
+  end;
+end;
+
 function TTestNeuralPretrained.AcquireFirstOpenCLDevice(
   out APlatform: cl_platform_id; out ADevice: cl_device_id): boolean;
 var
@@ -9347,6 +10567,2146 @@ begin
     Twin.Free;
   end;
 end;
+
+function TTestNeuralPretrained.ExpectedStateCheckpointBytes(Net: TNNet): int64;
+var
+  LayerPos, MaxLayerPos: integer;
+  Layer: TNNetLayer;
+begin
+  Result := 0;
+  MaxLayerPos := Net.CountLayers() - 1;
+  for LayerPos := 0 to MaxLayerPos do
+  begin
+    Layer := Net.Layers[LayerPos];
+    if Layer is TNNetRecurrentDecodeBase then
+      Result := Result + TNNetRecurrentDecodeBase(Layer).StateBytes() +
+        SizeOf(integer);
+  end;
+end;
+
+{$IFDEF OpenCL}
+procedure TTestNeuralPretrained.AssertRecurrentStateOnOpenCL(Net: TNNet;
+  const What: string);
+var
+  LayerPos, MaxLayerPos, Total: integer;
+  Layer: TNNetLayer;
+begin
+  Total := 0;
+  MaxLayerPos := Net.CountLayers() - 1;
+  for LayerPos := 0 to MaxLayerPos do
+  begin
+    Layer := Net.Layers[LayerPos];
+    if Layer is TNNetRecurrentDecodeBase then
+    begin
+      Inc(Total);
+      AssertTrue(What + ': ' + Layer.ClassName + ' at ' + IntToStr(LayerPos) +
+        ' keeps its decode state in OpenCL memory',
+        TNNetRecurrentDecodeBase(Layer).StateOnOpenCL());
+    end;
+  end;
+  AssertTrue(What + ' has recurrent layers', Total > 0);
+end;
+
+procedure TTestNeuralPretrained.AssertKVCacheOnOpenCL(Net: TNNet;
+  const What: string);
+var
+  LayerPos, MaxLayerPos, Total: integer;
+  Layer: TNNetLayer;
+begin
+  Total := 0;
+  MaxLayerPos := Net.CountLayers() - 1;
+  for LayerPos := 0 to MaxLayerPos do
+  begin
+    Layer := Net.Layers[LayerPos];
+    if Layer is TNNetFusedSDPA then
+    begin
+      Inc(Total);
+      AssertTrue(What + ': TNNetFusedSDPA at ' + IntToStr(LayerPos) +
+        ' keeps its KV cache in OpenCL memory',
+        TNNetFusedSDPA(Layer).CacheOnOpenCL);
+    end;
+  end;
+  AssertTrue(What + ' has fused attention layers', Total > 0);
+end;
+{$ENDIF}
+
+// One width-1 session: an uninterrupted run is the reference; the checkpoint
+// run feeds to CheckPos, captures, feeds on to RunOnTo, rewinds the K/V
+// caches with TruncateTo(CheckPos), restores the recurrent half and feeds the
+// tail again - bit for bit the reference, twice from the same checkpoint. On
+// OpenCL the recurrent state and the KV cache must stay resident across the
+// capture, the truncate and the restore (F16, F17). Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunQwen35StateCheckpointResume(Int8KV,
+  UseOpenCL: boolean);
+const
+  SeqLen   = 12;
+  CheckPos = 5;
+  RunOnTo  = 9;
+var
+  Twin: TNNet;
+  Config: TLlamaConfig;
+  Session: TNNetStreamingDecoder;
+  Chk: TNNetDecoderStateCheckpoint;
+  StepIn: TNNetVolume;
+  RefOut: array[0..SeqLen - 1] of array of TNeuralFloat;
+  Toks: array[0..SeqLen - 1] of integer;
+  {$IFDEF OpenCL}
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  {$ENDIF}
+  T, V, Vocab: integer;
+  Mode: string;
+  Raised: boolean;
+
+  procedure FeedRecording(FromPos, ToPos: integer);
+  var
+    P, Dim: integer;
+  begin
+    for P := FromPos to ToPos - 1 do
+    begin
+      StepIn.FData[0] := Toks[P];
+      Session.StepForward(StepIn, P);
+      SetLength(RefOut[P], Vocab);
+      for Dim := 0 to Vocab - 1 do RefOut[P][Dim] := Session.Output().FData[Dim];
+    end;
+  end;
+
+  procedure FeedAndCheck(FromPos, ToPos: integer; const What: string);
+  var
+    P, Dim: integer;
+  begin
+    for P := FromPos to ToPos - 1 do
+    begin
+      StepIn.FData[0] := Toks[P];
+      Session.StepForward(StepIn, P);
+      for Dim := 0 to Vocab - 1 do
+        AssertEquals(Mode + ' ' + What + ': logit pos ' + IntToStr(P) +
+          ' tok ' + IntToStr(Dim), RefOut[P][Dim],
+          Session.Output().FData[Dim], 0.0);
+    end;
+  end;
+
+begin
+  Mode := BoolToStr(Int8KV, 'int8 KV', 'FP32 KV');
+  if UseOpenCL then
+  begin
+    {$IFDEF OpenCL}
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    Mode := Mode + ' OpenCL';
+    {$ELSE}
+    AssertTrue('OpenCL not compiled in: SKIP', true);
+    Exit;
+    {$ENDIF}
+  end;
+  RandSeed := 424242;
+  Twin := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5.safetensors'),
+    Config, {SeqLen=}1, {pTrainable=}false,
+    FixturePath('tiny_qwen3_5_config.json'));
+  Session := nil; Chk := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    {$IFDEF OpenCL}
+    if UseOpenCL then Twin.EnableOpenCL(PlatformId, DeviceId);
+    {$ENDIF}
+    Vocab := Config.VocabSize;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    Session := TNNetStreamingDecoder.Create(Twin, SeqLen, Int8KV);
+    AssertTrue('recurrent layers present', Session.SSMCount > 0);
+    AssertTrue('attention layers present', Session.SDPACount > 0);
+    Session.Reset();
+    FeedRecording(0, SeqLen);
+
+    Chk := Session.NewStateCheckpoint();
+    AssertTrue(Mode + ': the checkpoint is sized', Chk.Sized);
+    AssertEquals(Mode + ': one checkpoint entry per recurrent layer',
+      Session.SSMCount, Chk.LayerCount);
+    AssertEquals(Mode + ': checkpoint bytes follow the StateBytes formula',
+      ExpectedStateCheckpointBytes(Twin), Chk.Bytes());
+    if UseOpenCL
+      then AssertEquals(Mode + ': every recurrent layer holds an OpenCL slot',
+        Session.SSMCount, Chk.OpenCLSlotCount)
+      else AssertEquals(Mode + ': no OpenCL slots on the host',
+        0, Chk.OpenCLSlotCount);
+    AssertEquals(Mode + ': OpenCL bytes', Chk.OpenCLBytes() > 0, UseOpenCL);
+
+    Session.Reset();
+    FeedAndCheck(0, CheckPos, 'before the checkpoint');
+    {$IFDEF OpenCL}
+    if UseOpenCL then
+    begin
+      AssertAllOnDevice(Twin, TNNetGatedDeltaNet, Mode);
+      AssertAllOnDevice(Twin, TNNetDepthwiseConv1D, Mode);
+      AssertAllOnDevice(Twin, TNNetFusedSDPA, Mode);
+      AssertRecurrentStateOnOpenCL(Twin, Mode + ' before the capture');
+    end;
+    {$ENDIF}
+    Session.CaptureStateInto(Chk);
+    Chk.Position := CheckPos;
+    {$IFDEF OpenCL}
+    if UseOpenCL then
+      AssertRecurrentStateOnOpenCL(Twin, Mode + ' after the capture (F16)');
+    {$ENDIF}
+    FeedAndCheck(CheckPos, RunOnTo, 'after the checkpoint');
+    AssertEquals(Mode + ': cache length before the rewind', RunOnTo,
+      Session.SDPACacheLength(0));
+
+    Session.TruncateTo(CheckPos);
+    AssertEquals(Mode + ': cache length after the rewind', CheckPos,
+      Session.SDPACacheLength(0));
+    {$IFDEF OpenCL}
+    if UseOpenCL then
+      AssertKVCacheOnOpenCL(Twin, Mode + ' after TruncateTo (F17)');
+    {$ENDIF}
+    Session.RestoreStateFrom(Chk);
+    {$IFDEF OpenCL}
+    if UseOpenCL then
+      AssertRecurrentStateOnOpenCL(Twin, Mode + ' after the restore');
+    {$ENDIF}
+    FeedAndCheck(CheckPos, SeqLen, 'first resume');
+
+    // The checkpoint is a copy: a second resume from it reads the same state.
+    Session.TruncateTo(CheckPos);
+    Session.RestoreStateFrom(Chk);
+    FeedAndCheck(CheckPos, SeqLen, 'second resume');
+
+    Raised := false;
+    try
+      Session.TruncateTo(SeqLen + 1);
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue(Mode + ': TruncateTo past the cache length raises', Raised);
+  finally
+    Chk.Free;
+    Session.Free;
+    StepIn.Free;
+    Twin.Free;
+  end;
+end;
+
+// The engine's resume path across the twins: the width-4 twin prefills two
+// windows, the checkpoint is captured on ITS layers at 8, the twin feeds one
+// more window, the whole state is handed to the width-1 session by snapshot
+// (as SwitchTo does), the session rewinds to 8 with TruncateTo and restores
+// the twin's checkpoint. The tail must match, bit for bit, the tail after a
+// snapshot handoff taken at 8. Under OpenCL the twin shares the session's
+// context (EnableOpenCLInContextOf), so the slots are reachable from both.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunQwen35StateCheckpointTwinHandoff(Int8KV,
+  UseOpenCL: boolean);
+const
+  SeqLen    = 12;
+  WindowLen = 4;
+  CheckPos  = 8;
+var
+  Twin1, TwinW: TNNet;
+  Config: TLlamaConfig;
+  Session1, SessionW: TNNetStreamingDecoder;
+  Chk: TNNetDecoderStateCheckpoint;
+  Snap: TNNetDecoderSessionSnapshot;
+  StepIn, WindowIn: TNNetVolume;
+  RefOut: array[0..SeqLen - 1] of array of TNeuralFloat;
+  Toks: array[0..SeqLen - 1] of integer;
+  {$IFDEF OpenCL}
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  {$ENDIF}
+  T, P, Dim, Vocab: integer;
+  Mode: string;
+
+  procedure FeedWindows(FromPos, ToPos: integer);
+  var
+    Pos, Row: integer;
+  begin
+    Pos := FromPos;
+    while Pos < ToPos do
+    begin
+      for Row := 0 to WindowLen - 1 do WindowIn.FData[Row] := Toks[Pos + Row];
+      SessionW.StepForward(WindowIn, Pos);
+      Inc(Pos, WindowLen);
+    end;
+  end;
+
+  procedure HandOff();
+  begin
+    Snap := SessionW.Snapshot();
+    try
+      Session1.RestoreSnapshot(Snap);
+    finally
+      Snap.Free;
+    end;
+  end;
+
+begin
+  Mode := BoolToStr(Int8KV, 'int8 KV', 'FP32 KV');
+  if UseOpenCL then
+  begin
+    {$IFDEF OpenCL}
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    Mode := Mode + ' OpenCL';
+    {$ELSE}
+    AssertTrue('OpenCL not compiled in: SKIP', true);
+    Exit;
+    {$ENDIF}
+  end;
+  AssertTrue('the checkpoint sits on a window boundary',
+    CheckPos mod WindowLen = 0);
+  RandSeed := 424242;
+  Twin1 := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5.safetensors'),
+    Config, {SeqLen=}1, {pTrainable=}false,
+    FixturePath('tiny_qwen3_5_config.json'));
+  TwinW := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5.safetensors'),
+    Config, WindowLen, {pTrainable=}false,
+    FixturePath('tiny_qwen3_5_config.json'));
+  Session1 := nil; SessionW := nil; Chk := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  WindowIn := TNNetVolume.Create(WindowLen, 1, 1);
+  try
+    {$IFDEF OpenCL}
+    if UseOpenCL then
+    begin
+      Twin1.EnableOpenCL(PlatformId, DeviceId);
+      TwinW.EnableOpenCLInContextOf(Twin1);
+    end;
+    {$ENDIF}
+    Vocab := Config.VocabSize;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    Session1 := TNNetStreamingDecoder.Create(Twin1, SeqLen, Int8KV);
+    SessionW := TNNetStreamingDecoder.Create(TwinW, SeqLen, Int8KV);
+
+    // Reference: handoff at CheckPos, then the width-1 tail.
+    SessionW.Reset();
+    Session1.Reset();
+    FeedWindows(0, CheckPos);
+    HandOff();
+    for P := CheckPos to SeqLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[P];
+      Session1.StepForward(StepIn, P);
+      SetLength(RefOut[P], Vocab);
+      for Dim := 0 to Vocab - 1 do RefOut[P][Dim] := Session1.Output().FData[Dim];
+    end;
+
+    // Checkpoint run: capture on the twin at CheckPos, run the twin on to the
+    // end, hand everything off, rewind the session and restore the twin's
+    // checkpoint into it.
+    Chk := SessionW.NewStateCheckpoint();
+    AssertEquals(Mode + ': one entry per recurrent layer of the twin',
+      SessionW.SSMCount, Chk.LayerCount);
+    if UseOpenCL then
+      AssertEquals(Mode + ': every recurrent layer of the twin holds an OpenCL slot',
+        SessionW.SSMCount, Chk.OpenCLSlotCount);
+    SessionW.Reset();
+    Session1.Reset();
+    FeedWindows(0, CheckPos);
+    SessionW.CaptureStateInto(Chk);
+    Chk.Position := CheckPos;
+    {$IFDEF OpenCL}
+    if UseOpenCL then
+      AssertRecurrentStateOnOpenCL(TwinW, Mode + ' twin after the capture');
+    {$ENDIF}
+    FeedWindows(CheckPos, SeqLen);
+    HandOff();
+    AssertEquals(Mode + ': the session holds the whole prompt', SeqLen,
+      Session1.SDPACacheLength(0));
+    Session1.TruncateTo(CheckPos);
+    Session1.RestoreStateFrom(Chk);
+    {$IFDEF OpenCL}
+    if UseOpenCL then
+      AssertRecurrentStateOnOpenCL(Twin1, Mode + ' session after the restore');
+    {$ENDIF}
+    for P := CheckPos to SeqLen - 1 do
+    begin
+      StepIn.FData[0] := Toks[P];
+      Session1.StepForward(StepIn, P);
+      for Dim := 0 to Vocab - 1 do
+        AssertEquals(Mode + ' twin checkpoint resume: logit pos ' +
+          IntToStr(P) + ' tok ' + IntToStr(Dim), RefOut[P][Dim],
+          Session1.Output().FData[Dim], 0.0);
+    end;
+  finally
+    Chk.Free;
+    SessionW.Free;
+    Session1.Free;
+    WindowIn.Free;
+    StepIn.Free;
+    TwinW.Free;
+    Twin1.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestQwen35StateCheckpointResumeParity;
+begin
+  RunQwen35StateCheckpointResume({Int8KV=}false, {UseOpenCL=}false);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35StateCheckpointResumeInt8KVParity;
+begin
+  RunQwen35StateCheckpointResume({Int8KV=}true, {UseOpenCL=}false);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35StateCheckpointTwinHandoffParity;
+begin
+  RunQwen35StateCheckpointTwinHandoff({Int8KV=}false, {UseOpenCL=}false);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35StateCheckpointOpenCLParity;
+begin
+  RunQwen35StateCheckpointResume({Int8KV=}false, {UseOpenCL=}true);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35StateCheckpointOpenCLInt8KVParity;
+begin
+  RunQwen35StateCheckpointResume({Int8KV=}true, {UseOpenCL=}true);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35StateCheckpointOpenCLTwinHandoffParity;
+begin
+  RunQwen35StateCheckpointTwinHandoff({Int8KV=}true, {UseOpenCL=}true);
+end;
+
+// The host route on a pure recurrent net (tiny_mamba: TNNetSelectiveSSM plus
+// the conv state, no attention): the checkpoint holds every recurrent layer in
+// host volumes, TruncateTo has nothing to rewind, and the resumed tail matches
+// the uninterrupted run bit for bit. A checkpoint sized for this roster must
+// be refused by a session of another architecture. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestMambaStateCheckpointResumeParity;
+const
+  SeqLen   = 10;
+  CheckPos = 4;
+  RunOnTo  = 7;
+var
+  NN, Qwen: TNNet;
+  Config: TMambaConfig;
+  QwenConfig: TLlamaConfig;
+  Session, QwenSession: TNNetStreamingDecoder;
+  Chk: TNNetDecoderStateCheckpoint;
+  StepIn: TNNetVolume;
+  RefOut: array[0..SeqLen - 1] of array of TNeuralFloat;
+  Toks: array[0..SeqLen - 1] of integer;
+  T, Vocab: integer;
+  Raised: boolean;
+
+  procedure Feed(FromPos, ToPos: integer; Recording: boolean; const What: string);
+  var
+    P, Dim: integer;
+  begin
+    for P := FromPos to ToPos - 1 do
+    begin
+      StepIn.FData[0] := Toks[P];
+      Session.StepForward(StepIn, P);
+      if Recording then
+      begin
+        SetLength(RefOut[P], Vocab);
+        for Dim := 0 to Vocab - 1 do RefOut[P][Dim] := Session.Output().FData[Dim];
+      end
+      else
+        for Dim := 0 to Vocab - 1 do
+          AssertEquals('mamba ' + What + ': logit pos ' + IntToStr(P) +
+            ' tok ' + IntToStr(Dim), RefOut[P][Dim],
+            Session.Output().FData[Dim], 0.0);
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  NN := BuildMambaFromSafeTensorsEx(FixturePath('tiny_mamba.safetensors'),
+    Config, {SeqLen=}1, {pTrainable=}false,
+    FixturePath('tiny_mamba_config.json'));
+  Qwen := BuildQwen35FromSafeTensorsEx(
+    FixturePath('tiny_qwen3_5.safetensors'),
+    QwenConfig, {SeqLen=}1, {pTrainable=}false,
+    FixturePath('tiny_qwen3_5_config.json'));
+  Session := nil; QwenSession := nil; Chk := nil;
+  StepIn := TNNetVolume.Create(1, 1, 1);
+  try
+    Vocab := Config.VocabSize;
+    for T := 0 to SeqLen - 1 do Toks[T] := (3 * T + 1) mod Vocab;
+    Session := TNNetStreamingDecoder.Create(NN, SeqLen);
+    AssertTrue('mamba recurrent layers present', Session.SSMCount > 0);
+    AssertEquals('mamba has no attention cache', 0, Session.SDPACount);
+    Session.Reset();
+    Feed(0, SeqLen, true, '');
+
+    Chk := Session.NewStateCheckpoint();
+    AssertEquals('mamba: one entry per recurrent layer', Session.SSMCount,
+      Chk.LayerCount);
+    AssertEquals('mamba: host route only', 0, Chk.OpenCLSlotCount);
+    AssertEquals('mamba: checkpoint bytes follow the StateBytes formula',
+      ExpectedStateCheckpointBytes(NN), Chk.Bytes());
+    Session.Reset();
+    Feed(0, CheckPos, false, 'before the checkpoint');
+    Session.CaptureStateInto(Chk);
+    Feed(CheckPos, RunOnTo, false, 'after the checkpoint');
+    Session.TruncateTo(CheckPos);
+    Session.RestoreStateFrom(Chk);
+    Feed(CheckPos, SeqLen, false, 'resume');
+
+    QwenSession := TNNetStreamingDecoder.Create(Qwen, SeqLen);
+    QwenSession.Reset();
+    Raised := false;
+    try
+      QwenSession.RestoreStateFrom(Chk);
+    except
+      on E: Exception do Raised := true;
+    end;
+    AssertTrue('a checkpoint of another architecture is refused', Raised);
+  finally
+    Chk.Free;
+    QwenSession.Free;
+    Session.Free;
+    StepIn.Free;
+    Qwen.Free;
+    NN.Free;
+  end;
+end;
+
+function TTestNeuralPretrained.MakeChatModelDir(const Stem: string): string;
+begin
+  Result := IncludeTrailingPathDelimiter(GetTempDir(false)) +
+    'cai_chat_' + Stem + '_' + IntToStr(Random(1000000)) + DirectorySeparator;
+  ForceDirectories(Result);
+  CopyFileTo(FixturePath('tiny_' + Stem + '.safetensors'),
+    Result + 'model.safetensors');
+  CopyFileTo(FixturePath('tiny_' + Stem + '_config.json'),
+    Result + 'config.json');
+  CopyFileTo(FixturePath('tiny_bpe_split_qwen35_tokenizer.json'),
+    Result + 'tokenizer.json');
+end;
+
+function TTestNeuralPretrained.MakeQwen35ChatModelDir(): string;
+begin
+  Result := MakeChatModelDir('qwen3_5');
+end;
+
+procedure TTestNeuralPretrained.CaptureNotice(const S: string);
+begin
+  FNotices := FNotices + S + LineEnding;
+end;
+
+procedure TTestNeuralPretrained.RemoveChatModelDir(const Dir: string);
+begin
+  DeleteFile(Dir + 'model.safetensors');
+  DeleteFile(Dir + 'config.json');
+  DeleteFile(Dir + 'tokenizer.json');
+  RemoveDir(Dir);
+end;
+
+// Engine-level parity of --prefill-window on the tiny_qwen3_5 hybrid: the
+// same two greedy turns with windows of 0 (token by token), 4 (turn 1: one
+// window + a 2-token tail; turn 2: one window + a 1-token tail) and 6
+// (turn 1: exactly one window, no tail; turn 2: no whole window, all width
+// 1) must produce identical replies and identical cached token sequences.
+// Turn 2 extends turn 1, so the turn-boundary snapshot is resumed - into
+// the window session when a window runs first. Prompt ids are fed directly (the fixture vocab is 13
+// ids, the tokenizer only decodes). The window counts are asserted so the
+// test cannot pass by never using the twin. Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunQwen35ChatPrefillWindowParity(
+  const ExtraArgs: array of string);
+const
+  Ctx = 16;
+  Turn1Len = 7;
+  Turn2Extra = 6;
+  MaxNew = 2;
+  Vocab = 13;
+  WindowChoices: array[0..2] of integer = (0, 4, 6);
+var
+  Dir, ErrorMsg: string;
+  Reference: array[0..1] of TChatTurnRecord;
+  Current: array[0..1] of TChatTurnRecord;
+  Choice, T: integer;
+
+  procedure RunEngine(WindowLen: integer; var Turns: array of TChatTurnRecord);
+  var
+    Engine: TChatEngine;
+    Opt: TChatOptions;
+    Args: TStringList;
+    Prompt: TNeuralIntegerArray;
+    Pos, FedCount, Extra: integer;
+    ParsedOK, LoadedOK: boolean;
+  begin
+    Engine := TChatEngine.Create();
+    Args := TStringList.Create();
+    try
+      Args.Add(Dir);
+      Args.Add('--greedy');
+      Args.Add('--fp32');
+      Args.Add('--cpu');
+      Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
+      Args.Add('--max-new-tokens'); Args.Add(IntToStr(MaxNew));
+      Args.Add('--prefill-window'); Args.Add(IntToStr(WindowLen));
+      for Extra := 0 to High(ExtraArgs) do Args.Add(ExtraArgs[Extra]);
+      ParsedOK := ParseArgs(Args, Opt);
+      AssertTrue('chat options parse: ' + Opt.ErrorMsg, ParsedOK);
+      AssertEquals('--prefill-window parsed', WindowLen, Opt.PrefillWindow);
+      LoadedOK := Engine.LoadModel(Opt, ErrorMsg);
+      AssertTrue('LoadModel: ' + ErrorMsg, LoadedOK);
+      AssertEquals('twin present exactly when a window is requested',
+        WindowLen > 0, Assigned(Engine.WindowNN));
+      if WindowLen > 0 then
+      begin
+        AssertEquals('twin input width', WindowLen,
+          Engine.WindowNN.GetFirstLayer().Output.SizeX);
+        // The twin borrows every weight of the width-1 net: same layer count
+        // and class per index, WeightOwner set on every weight-bearing
+        // layer, no weights or quantized bytes of its own, and not one FP32
+        // row or int8 code sized while it was built.
+        AssertTrue('the qwen3_5 twin borrows', Engine.WindowBorrowsWeights);
+        AssertWeightsLinked(Engine.WindowNN, Engine.NN, 'engine twin');
+        AssertEquals('twin CountWeights', 0, Engine.WindowNN.CountWeights());
+        AssertEquals('twin sized no weight storage of its own', 0,
+          Engine.WindowNN.WeightElementsSized());
+        AssertTrue('the width-1 net sized its own rows',
+          Engine.NN.WeightElementsSized() > 0);
+      end;
+      AssertEquals('width-1 net input width', 1,
+        Engine.NN.GetFirstLayer().Output.SizeX);
+      // Turn 1: Turn1Len prompt ids; Turn1Len-1 of them are prefilled.
+      SetLength(Prompt, Turn1Len);
+      for Pos := 0 to Turn1Len - 1 do Prompt[Pos] := (5 * Pos + 2) mod Vocab;
+      Turns[0].Reply := Engine.GenerateFromIds(Prompt, Engine.Opt);
+      Turns[0].Completion := Engine.LastCompletionTokens;
+      Turns[0].Cached := Copy(Engine.CachedTokens);
+      FedCount := Turn1Len - 1;
+      if WindowLen > 0 then
+        AssertEquals('turn 1 windows (window ' + IntToStr(WindowLen) + ')',
+          FedCount div WindowLen, Engine.LastPrefillWindows)
+      else AssertEquals('no windows without the twin', 0,
+        Engine.LastPrefillWindows);
+      AssertTrue('turn 1 produced tokens', Turns[0].Completion > 0);
+      // Turn 2 extends the cached sequence by Turn2Extra ids, so the turn
+      // boundary snapshot resumes and only the new ids are prefilled.
+      SetLength(Prompt, Length(Turns[0].Cached) + Turn2Extra);
+      for Pos := 0 to High(Turns[0].Cached) do Prompt[Pos] := Turns[0].Cached[Pos];
+      for Pos := 0 to Turn2Extra - 1 do
+        Prompt[Length(Turns[0].Cached) + Pos] := (7 * Pos + 3) mod Vocab;
+      AssertTrue('turn 2 prompt fits the context', Length(Prompt) < Ctx);
+      Turns[1].Reply := Engine.GenerateFromIds(Prompt, Engine.Opt);
+      Turns[1].Completion := Engine.LastCompletionTokens;
+      Turns[1].Cached := Copy(Engine.CachedTokens);
+      FedCount := Turn2Extra - 1;
+      if WindowLen > 0 then
+        AssertEquals('turn 2 windows (window ' + IntToStr(WindowLen) + ')',
+          FedCount div WindowLen, Engine.LastPrefillWindows);
+      AssertTrue('turn 2 produced tokens', Turns[1].Completion > 0);
+      {$IFDEF OpenCL}
+      // Under --gpu the fused attention of both nets must have stayed on the
+      // device; otherwise the run compares the host path with itself.
+      if Opt.Gpu then
+      begin
+        AssertAllOnDevice(Engine.NN, TNNetFusedSDPA, 'width-1 net');
+        if Assigned(Engine.WindowNN) then
+        begin
+          AssertAllOnDevice(Engine.WindowNN, TNNetFusedSDPA, 'window net');
+          // Quantized weights: the twin holds the width-1 net's resident
+          // codes and vocab table, one handle each, no second upload.
+          if Opt.WeightMode <> cwmFP32 then
+            AssertDeviceWeightsBorrowed(Engine.WindowNN, 'window net');
+        end;
+      end;
+      {$ENDIF}
+    finally
+      Args.Free;
+      Engine.Free;
+    end;
+  end;
+
+begin
+  RandSeed := 424242;
+  Dir := MakeQwen35ChatModelDir();
+  try
+    RunEngine(WindowChoices[0], Reference);
+    AssertTrue('the reference decoded past the prompt',
+      Length(Reference[1].Cached) >= Turn1Len + Turn2Extra);
+    for Choice := 1 to High(WindowChoices) do
+    begin
+      RunEngine(WindowChoices[Choice], Current);
+      for T := 0 to 1 do
+        AssertSameChatTurn(Reference[T], Current[T], 'window ' +
+          IntToStr(WindowChoices[Choice]) + ' turn ' + IntToStr(T + 1));
+    end;
+  finally
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.AssertSameChatTurn(const Expected,
+  Actual: TChatTurnRecord; const What: string);
+var
+  Pos: integer;
+begin
+  AssertEquals(What + ': reply text', Expected.Reply, Actual.Reply);
+  AssertEquals(What + ': completion tokens', Expected.Completion,
+    Actual.Completion);
+  AssertEquals(What + ': cached token count', Length(Expected.Cached),
+    Length(Actual.Cached));
+  for Pos := 0 to High(Expected.Cached) do
+    AssertEquals(What + ': cached token ' + IntToStr(Pos),
+      Expected.Cached[Pos], Actual.Cached[Pos]);
+end;
+
+// Engine-level parity of the prefill ladder (Phase 5 step C) on the
+// tiny_qwen3_5 hybrid: --prefill-window 6 --prefill-tail-window 2 against
+// the token-by-token prefill over two greedy turns. Turn 1 feeds 9 tokens:
+// one window of 6 on the width-6 twin, one of 2 on the tail twin, one
+// single step. Turn 2 resumes the turn-boundary snapshot (into the tail
+// session, which steps first) and feeds 5: no width-6 window, two tail
+// windows, one single step. Replies and cached ids must be identical and the
+// per-stage counts are asserted so the test cannot pass by skipping a twin.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunQwen35ChatPrefillLadderParity(
+  const ExtraArgs: array of string);
+const
+  Ctx = 24;
+  Turn1Len = 10;
+  Turn2Extra = 6;
+  MaxNew = 2;
+  Vocab = 13;
+  WindowLen = 6;
+  TailLen = 2;
+var
+  Dir, ErrorMsg: string;
+  Reference: array[0..1] of TChatTurnRecord;
+  Current: array[0..1] of TChatTurnRecord;
+  T: integer;
+
+  procedure RunEngine(Ladder: boolean; var Turns: array of TChatTurnRecord);
+  var
+    Engine: TChatEngine;
+    Opt: TChatOptions;
+    Args: TStringList;
+    Prompt: TNeuralIntegerArray;
+    Pos, Extra: integer;
+    ParsedOK, LoadedOK: boolean;
+  begin
+    Engine := TChatEngine.Create();
+    Args := TStringList.Create();
+    try
+      Args.Add(Dir);
+      Args.Add('--greedy');
+      Args.Add('--fp32');
+      Args.Add('--cpu');
+      Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
+      Args.Add('--max-new-tokens'); Args.Add(IntToStr(MaxNew));
+      if Ladder then
+      begin
+        Args.Add('--prefill-window'); Args.Add(IntToStr(WindowLen));
+        Args.Add('--prefill-tail-window'); Args.Add(IntToStr(TailLen));
+      end;
+      for Extra := 0 to High(ExtraArgs) do Args.Add(ExtraArgs[Extra]);
+      ParsedOK := ParseArgs(Args, Opt);
+      AssertTrue('chat options parse: ' + Opt.ErrorMsg, ParsedOK);
+      LoadedOK := Engine.LoadModel(Opt, ErrorMsg);
+      AssertTrue('LoadModel: ' + ErrorMsg, LoadedOK);
+      AssertEquals('twin present exactly when a window is requested',
+        Ladder, Assigned(Engine.WindowNN));
+      AssertEquals('tail twin present exactly when a window is requested',
+        Ladder, Assigned(Engine.TailNN));
+      if Ladder then
+      begin
+        AssertEquals('resolved tail width', TailLen, Engine.Opt.PrefillTailWindow);
+        AssertEquals('twin input width', WindowLen,
+          Engine.WindowNN.GetFirstLayer().Output.SizeX);
+        AssertEquals('tail twin input width', TailLen,
+          Engine.TailNN.GetFirstLayer().Output.SizeX);
+        AssertEquals('tail window volume width', TailLen, Engine.TailIn.SizeX);
+        AssertTrue('the tail session wraps the tail twin',
+          Engine.TailSession.Net = Engine.TailNN);
+        AssertTrue('transfer snapshot allocated once at load',
+          Assigned(Engine.TransferSnap));
+        // Both twins borrow every weight of the width-1 net.
+        AssertTrue('the qwen3_5 twins borrow', Engine.WindowBorrowsWeights);
+        AssertWeightsLinked(Engine.WindowNN, Engine.NN, 'window twin');
+        AssertWeightsLinked(Engine.TailNN, Engine.NN, 'tail twin');
+        AssertEquals('tail twin CountWeights', 0, Engine.TailNN.CountWeights());
+        AssertEquals('tail twin sized no weight storage of its own', 0,
+          Engine.TailNN.WeightElementsSized());
+      end
+      else AssertEquals('no tail width without a window', 1,
+        Engine.Opt.PrefillTailWindow);
+      // Turn 1: Turn1Len prompt ids; Turn1Len-1 = 9 of them are prefilled.
+      SetLength(Prompt, Turn1Len);
+      for Pos := 0 to Turn1Len - 1 do Prompt[Pos] := (5 * Pos + 2) mod Vocab;
+      Turns[0].Reply := Engine.GenerateFromIds(Prompt, Engine.Opt);
+      Turns[0].Completion := Engine.LastCompletionTokens;
+      Turns[0].Cached := Copy(Engine.CachedTokens);
+      if Ladder then
+      begin
+        AssertEquals('turn 1 windows of 6', 1, Engine.LastPrefillWindows);
+        AssertEquals('turn 1 tail windows of 2', 1,
+          Engine.LastPrefillTailWindows);
+      end
+      else
+      begin
+        AssertEquals('no windows without the twin', 0,
+          Engine.LastPrefillWindows);
+        AssertEquals('no tail windows without the twin', 0,
+          Engine.LastPrefillTailWindows);
+      end;
+      AssertTrue('turn 1 produced tokens', Turns[0].Completion > 0);
+      AssertTrue('the width-1 session holds the state after a turn',
+        Engine.ActiveSession = Engine.Session);
+      // Turn 2 extends the cached sequence by Turn2Extra ids: the turn
+      // boundary snapshot resumes and only the 5 new ids are prefilled,
+      // fewer than a width-6 window, so only the tail twin runs windows.
+      SetLength(Prompt, Length(Turns[0].Cached) + Turn2Extra);
+      for Pos := 0 to High(Turns[0].Cached) do Prompt[Pos] := Turns[0].Cached[Pos];
+      for Pos := 0 to Turn2Extra - 1 do
+        Prompt[Length(Turns[0].Cached) + Pos] := (7 * Pos + 3) mod Vocab;
+      AssertTrue('turn 2 prompt fits the context', Length(Prompt) < Ctx);
+      Turns[1].Reply := Engine.GenerateFromIds(Prompt, Engine.Opt);
+      Turns[1].Completion := Engine.LastCompletionTokens;
+      Turns[1].Cached := Copy(Engine.CachedTokens);
+      if Ladder then
+      begin
+        AssertEquals('turn 2 windows of 6', 0, Engine.LastPrefillWindows);
+        AssertEquals('turn 2 tail windows of 2', 2,
+          Engine.LastPrefillTailWindows);
+      end;
+      AssertTrue('turn 2 produced tokens', Turns[1].Completion > 0);
+      {$IFDEF OpenCL}
+      // Under --gpu the fused attention of all three nets must have stayed
+      // on the device; otherwise the run compares the host path with itself.
+      if Opt.Gpu then
+      begin
+        AssertAllOnDevice(Engine.NN, TNNetFusedSDPA, 'width-1 net');
+        if Ladder then
+        begin
+          AssertAllOnDevice(Engine.WindowNN, TNNetFusedSDPA, 'window net');
+          AssertAllOnDevice(Engine.TailNN, TNNetFusedSDPA, 'tail net');
+          if Opt.WeightMode <> cwmFP32 then
+          begin
+            AssertDeviceWeightsBorrowed(Engine.WindowNN, 'window net');
+            AssertDeviceWeightsBorrowed(Engine.TailNN, 'tail net');
+          end;
+        end;
+      end;
+      {$ENDIF}
+    finally
+      Args.Free;
+      Engine.Free;
+    end;
+  end;
+
+begin
+  RandSeed := 434343;
+  Dir := MakeQwen35ChatModelDir();
+  try
+    RunEngine(false, Reference);
+    AssertTrue('the reference decoded past the prompt',
+      Length(Reference[1].Cached) >= Turn1Len + Turn2Extra);
+    RunEngine(true, Current);
+    for T := 0 to 1 do
+      AssertSameChatTurn(Reference[T], Current[T],
+        'ladder 6/2 turn ' + IntToStr(T + 1));
+  finally
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+// Engine-level parity of the cache checkpoints on the tiny_qwen3_5 hybrid.
+// Turn 1 feeds prompt P (Turn1Len ids) and produces reply R. The second
+// prompt then takes one of four shapes, each answered by the warm engine and
+// by a fresh engine that sees only that prompt; both must produce the same
+// reply and cached ids (tolerance 0):
+//   start: P changed at id 0, then X - nothing to resume from, reused 0;
+//   inside: P changed at id |P| div 2, then X - the deepest checkpoint at or
+//     below the divergence is resumed (a window checkpoint with the ladder,
+//     within one window of the divergence; none without it);
+//   re-rendered: P + X with X[0] <> R[0] - the end-of-prompt checkpoint
+//     resumes at |P|-1 (P's last id, fed as turn 1's first decode input, is
+//     not in the cache) and |X| tokens are prefilled;
+//   echo: P + R + Y - the end-of-reply checkpoint is deeper and wins.
+// With the ladder (--prefill-window 6 --prefill-tail-window 2) Turn1Len 7, 9
+// and 10 put the end of P in the window, tail and width-1 session, and 17
+// puts a window checkpoint below the inside divergence. Prompt ids are fed
+// directly (the fixture vocab is 13 ids). Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunQwen35ChatCheckpointResume(
+  const ExtraArgs: array of string; Ladder: boolean; Turn1Len: integer);
+const
+  Ctx = 40;
+  MaxNew = 3;
+  Vocab = 13;
+  WindowLen = 6;
+  TailLen = 2;
+  ExtraLen = 5;
+type
+  TSecondPrompt = (spStart, spInside, spReRendered, spEcho);
+const
+  CaseName: array[TSecondPrompt] of string = ('start', 'inside',
+    're-rendered', 'echo');
+var
+  Dir, Tag: string;
+
+  function NewEngine(): TChatEngine;
+  var
+    Opt: TChatOptions;
+    Args: TStringList;
+    ErrorMsg: string;
+    Extra: integer;
+    ParsedOK, LoadedOK: boolean;
+  begin
+    Result := TChatEngine.Create();
+    Args := TStringList.Create();
+    try
+      Args.Add(Dir);
+      Args.Add('--greedy');
+      Args.Add('--fp32');
+      Args.Add('--cpu');
+      Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
+      Args.Add('--max-new-tokens'); Args.Add(IntToStr(MaxNew));
+      if Ladder then
+      begin
+        Args.Add('--prefill-window'); Args.Add(IntToStr(WindowLen));
+        Args.Add('--prefill-tail-window'); Args.Add(IntToStr(TailLen));
+      end;
+      for Extra := 0 to High(ExtraArgs) do Args.Add(ExtraArgs[Extra]);
+      ParsedOK := ParseArgs(Args, Opt);
+      AssertTrue(Tag + 'chat options parse: ' + Opt.ErrorMsg, ParsedOK);
+      LoadedOK := Result.LoadModel(Opt, ErrorMsg);
+      AssertTrue(Tag + 'LoadModel: ' + ErrorMsg, LoadedOK);
+      AssertTrue(Tag + 'the fixture is a hybrid (checkpoint route)',
+        Result.StateReuseOK);
+      AssertEquals(Tag + 'the store is sized at load',
+        Result.Opt.CacheCheckpoints, Length(Result.Checkpoints));
+      AssertTrue(Tag + 'the default store holds at least two checkpoints',
+        Length(Result.Checkpoints) >= 2);
+      AssertEquals(Tag + 'twins present exactly with the ladder', Ladder,
+        Assigned(Result.WindowNN) and Assigned(Result.TailNN));
+      // Under --gpu the slots live in OpenCL memory (a capture is a copy
+      // between resident buffers); on the CPU they are host volumes.
+      AssertEquals(Tag + 'checkpoint slots in OpenCL memory exactly under --gpu',
+        Result.Opt.Gpu, Result.Checkpoints[0].OpenCLSlotCount > 0);
+    finally
+      Args.Free;
+    end;
+  end;
+
+  function HoldsPosition(Engine: TChatEngine; Position: integer): boolean;
+  var
+    SlotPos: integer;
+  begin
+    Result := false;
+    for SlotPos := 0 to High(Engine.Checkpoints) do
+      if Engine.Checkpoints[SlotPos].Position = Position then exit(true);
+  end;
+
+  function DeepestHeldAtOrBelow(Engine: TChatEngine; Limit: integer): integer;
+  var
+    SlotPos: integer;
+  begin
+    Result := 0;
+    for SlotPos := 0 to High(Engine.Checkpoints) do
+      if (Engine.Checkpoints[SlotPos].Position <= Limit) and
+        (Engine.Checkpoints[SlotPos].Position > Result) then
+        Result := Engine.Checkpoints[SlotPos].Position;
+  end;
+
+  procedure RunTurn(Engine: TChatEngine; const Prompt: TNeuralIntegerArray;
+    var Turn: TChatTurnRecord);
+  begin
+    AssertTrue(Tag + 'prompt fits the context', Length(Prompt) < Ctx);
+    Turn.Reply := Engine.GenerateFromIds(Prompt, Engine.Opt);
+    Turn.Completion := Engine.LastCompletionTokens;
+    Turn.Cached := Copy(Engine.CachedTokens);
+    AssertTrue(Tag + 'the width-1 session holds the state after a turn',
+      Engine.ActiveSession = Engine.Session);
+    // The store never claims a position past the cached sequence, and the
+    // two turn-boundary checkpoints are always held.
+    AssertEquals(Tag + 'no checkpoint past the cached sequence',
+      Length(Turn.Cached), DeepestHeldAtOrBelow(Engine, Ctx));
+    AssertTrue(Tag + 'end-of-prompt checkpoint held',
+      HoldsPosition(Engine, Length(Prompt) - 1));
+    AssertTrue(Tag + 'end-of-reply checkpoint held',
+      HoldsPosition(Engine, Length(Turn.Cached)));
+  end;
+
+  procedure AssertOnDevice(Engine: TChatEngine; const What: string);
+  begin
+    {$IFDEF OpenCL}
+    // Under --gpu the fused attention of every net must have stayed on the
+    // device; otherwise the run compares the host path with itself.
+    if Engine.Opt.Gpu then
+    begin
+      AssertAllOnDevice(Engine.NN, TNNetFusedSDPA, What + ' width-1 net');
+      if Ladder then
+      begin
+        AssertAllOnDevice(Engine.WindowNN, TNNetFusedSDPA, What + ' window net');
+        AssertAllOnDevice(Engine.TailNN, TNNetFusedSDPA, What + ' tail net');
+      end;
+    end;
+    {$ENDIF}
+  end;
+
+  procedure CheckCase(Kind: TSecondPrompt);
+  var
+    Warm, Fresh: TChatEngine;
+    Prompt1, Prompt2: TNeuralIntegerArray;
+    Turn1, Warm2, Fresh2: TChatTurnRecord;
+    Pos, FedCount, DivPos, ExpectedReused, ExpectedPrefix: integer;
+  begin
+    Tag := CaseName[Kind] + ' (turn 1 of ' + IntToStr(Turn1Len) + '): ';
+    Warm := NewEngine();
+    Fresh := NewEngine();
+    try
+      SetLength(Prompt1, Turn1Len);
+      for Pos := 0 to Turn1Len - 1 do Prompt1[Pos] := (5 * Pos + 2) mod Vocab;
+      RunTurn(Warm, Prompt1, Turn1);
+      // Two reply tokens at least, so the cached sequence runs past P and a
+      // re-rendered X can differ from R at its first id.
+      AssertTrue(Tag + 'turn 1 produced at least two tokens',
+        Turn1.Completion >= 2);
+      FedCount := Turn1Len - 1;
+      AssertEquals(Tag + 'turn 1 reused nothing', 0, Warm.LastReusedTokens);
+      AssertEquals(Tag + 'turn 1 shared no prefix', 0, Warm.LastPrefixTokens);
+      AssertEquals(Tag + 'turn 1 saw an empty cache', 0, Warm.LastCachedTokens);
+      AssertEquals(Tag + 'turn 1 prefill count', FedCount,
+        Warm.LastPrefillTokens);
+      if Ladder then
+      begin
+        AssertEquals(Tag + 'turn 1 windows of 6', FedCount div WindowLen,
+          Warm.LastPrefillWindows);
+        AssertEquals(Tag + 'turn 1 tail windows of 2',
+          (FedCount mod WindowLen) div TailLen, Warm.LastPrefillTailWindows);
+        // Every window the width-6 twin fed left a checkpoint at its end.
+        for Pos := 1 to FedCount div WindowLen do
+          AssertTrue(Tag + 'window checkpoint at ' + IntToStr(Pos * WindowLen),
+            HoldsPosition(Warm, Pos * WindowLen));
+      end;
+      AssertTrue(Tag + 'the cached sequence starts with P',
+        CommonPrefixLen(Turn1.Cached, Prompt1) = Turn1Len);
+      SetLength(Prompt2, Turn1Len + ExtraLen);
+      Move(Prompt1[0], Prompt2[0], Turn1Len * csIntegerSize);
+      for Pos := 0 to ExtraLen - 1 do
+        Prompt2[Turn1Len + Pos] := (7 * Pos + 3) mod Vocab;
+      case Kind of
+        spStart:
+        begin
+          Prompt2[0] := (Prompt1[0] + 1) mod Vocab;
+          ExpectedPrefix := 0;
+          ExpectedReused := 0;
+        end;
+        spInside:
+        begin
+          DivPos := Turn1Len div 2;
+          Prompt2[DivPos] := (Prompt1[DivPos] + 1) mod Vocab;
+          ExpectedPrefix := DivPos;
+          ExpectedReused := DeepestHeldAtOrBelow(Warm, DivPos);
+          if Ladder and (DivPos >= WindowLen) then
+            AssertTrue(Tag + 'a window checkpoint within one window below' +
+              ' the divergence', (ExpectedReused > 0) and
+              (DivPos - ExpectedReused < WindowLen))
+          else
+            AssertEquals(Tag + 'no checkpoint below the divergence', 0,
+              ExpectedReused);
+        end;
+        spReRendered:
+        begin
+          Prompt2[Turn1Len] := (Turn1.Cached[Turn1Len] + 1) mod Vocab;
+          ExpectedPrefix := Turn1Len;
+          ExpectedReused := FedCount;
+        end;
+        else
+        begin
+          SetLength(Prompt2, Length(Turn1.Cached) + ExtraLen);
+          Move(Turn1.Cached[0], Prompt2[0], Length(Turn1.Cached) * csIntegerSize);
+          for Pos := 0 to ExtraLen - 1 do
+            Prompt2[Length(Turn1.Cached) + Pos] := (7 * Pos + 3) mod Vocab;
+          ExpectedPrefix := Length(Turn1.Cached);
+          ExpectedReused := Length(Turn1.Cached);
+        end;
+      end;
+      RunTurn(Warm, Prompt2, Warm2);
+      AssertEquals(Tag + 'turn 2 reused', ExpectedReused,
+        Warm.LastReusedTokens);
+      AssertEquals(Tag + 'turn 2 prefix', ExpectedPrefix,
+        Warm.LastPrefixTokens);
+      AssertEquals(Tag + 'turn 2 cached count', Length(Turn1.Cached),
+        Warm.LastCachedTokens);
+      AssertEquals(Tag + 'turn 2 prefill count',
+        Length(Prompt2) - 1 - ExpectedReused, Warm.LastPrefillTokens);
+      AssertTrue(Tag + 'turn 2 produced tokens', Warm2.Completion > 0);
+      RunTurn(Fresh, Prompt2, Fresh2);
+      AssertEquals(Tag + 'the fresh engine reused nothing', 0,
+        Fresh.LastReusedTokens);
+      AssertSameChatTurn(Fresh2, Warm2, Tag + 'turn 2 vs fresh engine');
+      AssertOnDevice(Warm, Tag + 'warm');
+      AssertOnDevice(Fresh, Tag + 'fresh');
+    finally
+      Fresh.Free;
+      Warm.Free;
+    end;
+  end;
+
+var
+  Kind: TSecondPrompt;
+begin
+  RandSeed := 454545;
+  Dir := MakeQwen35ChatModelDir();
+  try
+    for Kind := Low(TSecondPrompt) to High(TSecondPrompt) do CheckCase(Kind);
+  finally
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatCheckpointResume;
+var
+  Args: TStringList;
+  Opt: TChatOptions;
+begin
+  Args := TStringList.Create();
+  try
+    AssertEquals('not given until LoadModel resolves it', -1,
+      DefaultChatOptions().CacheCheckpoints);
+    Args.Add('/tmp/model'); Args.Add('--cache-checkpoints'); Args.Add('4');
+    AssertTrue('--cache-checkpoints 4 parses', ParseArgs(Args, Opt));
+    AssertEquals('--cache-checkpoints value', 4, Opt.CacheCheckpoints);
+    Args.Clear();
+    Args.Add('/tmp/model'); Args.Add('--cache-checkpoints'); Args.Add('-3');
+    AssertFalse('a negative count is refused', ParseArgs(Args, Opt));
+    AssertTrue('the refusal names the flag: ' + Opt.ErrorMsg,
+      Pos('--cache-checkpoints', Opt.ErrorMsg) > 0);
+  finally
+    Args.Free;
+  end;
+  // Token-by-token prefill, FP32 KV, the default parallel forward (the two
+  // turn-boundary checkpoints only); then the ladder with a window
+  // checkpoint below the inside divergence.
+  RunQwen35ChatCheckpointResume(['--kv-fp32'], false, 10);
+  RunQwen35ChatCheckpointResume(['--kv-fp32'], true, 17);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatCheckpointLadder;
+begin
+  // The end of P inside the width-6 window session (6 fed), the tail
+  // session (6 + 2) and the width-1 session (6 + 2 + 1).
+  RunQwen35ChatCheckpointResume(['--kv-fp32'], true, 7);
+  RunQwen35ChatCheckpointResume(['--kv-fp32'], true, 9);
+  RunQwen35ChatCheckpointResume(['--kv-fp32'], true, 10);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatCheckpointInt8KV;
+begin
+  // int8 KV cache: TruncateTo rewinds the code/scale planes in place.
+  RunQwen35ChatCheckpointResume(['--kv-int8', '--serial'], true, 17);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatCheckpointOpenCL;
+begin
+  {$IFDEF OpenCL}
+  // The production path on a GPU, with and without the ladder; the harness
+  // asserts every TNNetFusedSDPA of every net reached the device, and the
+  // store's slots live in OpenCL memory.
+  RunQwen35ChatCheckpointResume(['--int8', '--kv-int8', '--serial',
+    '--gpu'], true, 17);
+  RunQwen35ChatCheckpointResume(['--int8', '--kv-int8', '--serial',
+    '--gpu'], false, 10);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+// The retention rule on a store of 3 slots with the 6/2 ladder (band width
+// 2, the finest capture spacing): after each turn the engine's held
+// positions must equal those of a simulation of the band rule over the same
+// capture sequence (every window end, the tail window ends, the end of the
+// prompt, the end of the reply), the two turn-boundary checkpoints are
+// always held, and the second turn, which resumes inside the first prompt,
+// reuses the slots: same slot count, same bytes. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35ChatCheckpointRetention;
+const
+  Ctx = 40;
+  StoreSize = 3;
+  WindowLen = 6;
+  TailLen = 2;
+  Vocab = 13;
+  Prompt1Len = 30;
+  DivPos = 28;    // turn 2 changes this id of prompt 1
+  ExtraLen = 5;
+  MaxNew = 3;
+var
+  Dir: string;
+  Engine: TChatEngine;
+  Prompt: TNeuralIntegerArray;
+  Turn: TChatTurnRecord;
+  Sim: array[0..StoreSize - 1] of integer; // the simulation's positions
+  BytesBefore: int64;
+  Pos: integer;
+
+  function StoreBytes(): int64;
+  var
+    SlotPos: integer;
+  begin
+    Result := 0;
+    for SlotPos := 0 to High(Engine.Checkpoints) do
+      Result := Result + Engine.Checkpoints[SlotPos].Bytes();
+  end;
+
+  // The band rule as section 7.3 states it: drop what the sequence no longer
+  // vouches for, keep the deepest held checkpoint per band of distance from
+  // the capture about to land, evict the farthest one when every slot is
+  // taken, then insert.
+  procedure SimCapture(Position: integer);
+  var
+    SlotPos, OtherPos, Live, Farthest, Distance: integer;
+    Dropped: boolean;
+  begin
+    for SlotPos := 0 to StoreSize - 1 do
+      if Sim[SlotPos] = Position then exit;
+    for SlotPos := 0 to StoreSize - 1 do
+      if Sim[SlotPos] > Position then Sim[SlotPos] := 0;
+    for SlotPos := 0 to StoreSize - 1 do
+    begin
+      if Sim[SlotPos] <= 0 then continue;
+      Distance := Position - Sim[SlotPos];
+      Dropped := false;
+      for OtherPos := 0 to StoreSize - 1 do
+        if (OtherPos <> SlotPos) and (Sim[OtherPos] > Sim[SlotPos]) and
+          (Engine.CheckpointBand(Position - Sim[OtherPos]) =
+           Engine.CheckpointBand(Distance)) then Dropped := true;
+      if Dropped then Sim[SlotPos] := 0;
+    end;
+    Live := 0;
+    for SlotPos := 0 to StoreSize - 1 do
+      if Sim[SlotPos] > 0 then Inc(Live);
+    if Live >= StoreSize then
+    begin
+      Farthest := -1;
+      for SlotPos := 0 to StoreSize - 1 do
+        if (Sim[SlotPos] > 0) and
+          ((Farthest < 0) or (Sim[SlotPos] < Sim[Farthest])) then
+          Farthest := SlotPos;
+      Sim[Farthest] := 0;
+    end;
+    for SlotPos := 0 to StoreSize - 1 do
+      if Sim[SlotPos] <= 0 then
+      begin
+        Sim[SlotPos] := Position;
+        exit;
+      end;
+    Fail('simulation: no free slot');
+  end;
+
+  // Replays the ladder's capture sequence for a prefill from Reused to the
+  // end of a Len-id prompt, then the reply end.
+  procedure SimTurn(Reused, Len, ReplyEnd: integer);
+  var
+    Fed, Windows, Tails, WindowPos: integer;
+  begin
+    for WindowPos := 0 to StoreSize - 1 do
+      if Sim[WindowPos] > Reused then Sim[WindowPos] := 0;
+    Fed := Reused;
+    Windows := (Len - 1 - Reused) div WindowLen;
+    for WindowPos := 1 to Windows do
+    begin
+      Inc(Fed, WindowLen);
+      SimCapture(Fed);
+    end;
+    Tails := (Len - 1 - Fed) div TailLen;
+    for WindowPos := 1 to Tails do
+    begin
+      Inc(Fed, TailLen);
+      SimCapture(Fed);
+    end;
+    SimCapture(Len - 1);
+    SimCapture(ReplyEnd);
+  end;
+
+  procedure AssertStoreMatchesSimulation(const What: string);
+  var
+    SlotPos, OtherPos, Found: integer;
+  begin
+    AssertEquals(What + ': slot count', StoreSize, Length(Engine.Checkpoints));
+    for SlotPos := 0 to StoreSize - 1 do
+    begin
+      if Sim[SlotPos] <= 0 then continue;
+      Found := 0;
+      for OtherPos := 0 to StoreSize - 1 do
+        if Engine.Checkpoints[OtherPos].Position = Sim[SlotPos] then Inc(Found);
+      AssertEquals(What + ': simulated position ' + IntToStr(Sim[SlotPos]) +
+        ' held once', 1, Found);
+    end;
+    for SlotPos := 0 to StoreSize - 1 do
+    begin
+      if Engine.Checkpoints[SlotPos].Position <= 0 then continue;
+      Found := 0;
+      for OtherPos := 0 to StoreSize - 1 do
+        if Sim[OtherPos] = Engine.Checkpoints[SlotPos].Position then Inc(Found);
+      AssertEquals(What + ': held position ' +
+        IntToStr(Engine.Checkpoints[SlotPos].Position) + ' simulated', 1,
+        Found);
+    end;
+  end;
+
+  procedure RunTurn();
+  begin
+    Turn.Reply := Engine.GenerateFromIds(Prompt, Engine.Opt);
+    Turn.Completion := Engine.LastCompletionTokens;
+    Turn.Cached := Copy(Engine.CachedTokens);
+  end;
+
+var
+  Args: TStringList;
+  Opt: TChatOptions;
+  ErrorMsg: string;
+  ParsedOK, LoadedOK: boolean;
+begin
+  RandSeed := 464646;
+  Dir := MakeQwen35ChatModelDir();
+  Engine := TChatEngine.Create();
+  Args := TStringList.Create();
+  try
+    Args.Add(Dir);
+    Args.Add('--greedy'); Args.Add('--fp32'); Args.Add('--cpu');
+    Args.Add('--kv-fp32'); Args.Add('--serial');
+    Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
+    Args.Add('--max-new-tokens'); Args.Add(IntToStr(MaxNew));
+    Args.Add('--prefill-window'); Args.Add(IntToStr(WindowLen));
+    Args.Add('--prefill-tail-window'); Args.Add(IntToStr(TailLen));
+    Args.Add('--cache-checkpoints'); Args.Add(IntToStr(StoreSize));
+    ParsedOK := ParseArgs(Args, Opt);
+    AssertTrue('chat options parse: ' + Opt.ErrorMsg, ParsedOK);
+    LoadedOK := Engine.LoadModel(Opt, ErrorMsg);
+    AssertTrue('LoadModel: ' + ErrorMsg, LoadedOK);
+    AssertEquals('store of 3', StoreSize, Length(Engine.Checkpoints));
+    AssertEquals('band width is the tail window', TailLen,
+      Engine.CheckpointBandWidth);
+    AssertEquals('band ratio (Ctx / W)^(1 / N)',
+      Power(Ctx / TailLen, 1 / StoreSize), Engine.CheckpointBandRatio, 1e-9);
+    // The bands as the rule states them, at this ratio (about 2.71):
+    // [2, 5.4), [5.4, 14.7), [14.7, 40).
+    AssertEquals('below W is band 0', 0, Engine.CheckpointBand(1));
+    AssertEquals('W is band 0', 0, Engine.CheckpointBand(2));
+    AssertEquals('5 is band 0', 0, Engine.CheckpointBand(5));
+    AssertEquals('6 is band 1', 1, Engine.CheckpointBand(6));
+    AssertEquals('14 is band 1', 1, Engine.CheckpointBand(14));
+    AssertEquals('15 is band 2', 2, Engine.CheckpointBand(15));
+    AssertEquals('past the context is the last band', StoreSize - 1,
+      Engine.CheckpointBand(Ctx * 2));
+    for Pos := 0 to StoreSize - 1 do
+    begin
+      Sim[Pos] := 0;
+      AssertEquals('slot ' + IntToStr(Pos) + ' starts free', 0,
+        Engine.Checkpoints[Pos].Position);
+    end;
+    BytesBefore := StoreBytes();
+    AssertTrue('the slots hold state bytes at load', BytesBefore > 0);
+
+    SetLength(Prompt, Prompt1Len);
+    for Pos := 0 to Prompt1Len - 1 do Prompt[Pos] := (5 * Pos + 2) mod Vocab;
+    RunTurn();
+    AssertTrue('turn 1 produced tokens', Turn.Completion > 0);
+    AssertEquals('turn 1 windows', (Prompt1Len - 1) div WindowLen,
+      Engine.LastPrefillWindows);
+    SimTurn(0, Prompt1Len, Length(Turn.Cached));
+    AssertStoreMatchesSimulation('after turn 1');
+    AssertEquals('turn 1 kept the slot bytes', BytesBefore, StoreBytes());
+
+    // Turn 2 diverges at DivPos: the deepest checkpoint at or below it is
+    // resumed and the ones past it are dropped before the new captures.
+    SetLength(Prompt, Prompt1Len + ExtraLen);
+    for Pos := 0 to Prompt1Len - 1 do Prompt[Pos] := (5 * Pos + 2) mod Vocab;
+    Prompt[DivPos] := (Prompt[DivPos] + 1) mod Vocab;
+    for Pos := 0 to ExtraLen - 1 do
+      Prompt[Prompt1Len + Pos] := (7 * Pos + 3) mod Vocab;
+    RunTurn();
+    AssertEquals('turn 2 prefix', DivPos, Engine.LastPrefixTokens);
+    AssertTrue('turn 2 resumed a checkpoint', Engine.LastReusedTokens > 0);
+    AssertTrue('turn 2 resumed at or below the divergence',
+      Engine.LastReusedTokens <= DivPos);
+    SimTurn(Engine.LastReusedTokens, Length(Prompt), Length(Turn.Cached));
+    AssertStoreMatchesSimulation('after turn 2');
+    AssertEquals('turn 2 kept the slot bytes', BytesBefore, StoreBytes());
+  finally
+    Args.Free;
+    Engine.Free;
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+// --cache-checkpoints validation in LoadModel: 1 and 2049 stop the load, 0
+// loads with no store (a re-sent prompt re-prefills), the default on the CPU
+// is 8 slots, and a pure-attention net says the flag is inert and keeps the
+// KV-cache truncation route. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35ChatCheckpointFlagErrors;
+const
+  Ctx = 16;
+  PromptLen = 7;
+  Vocab = 13;
+var
+  Dir, ErrorMsg: string;
+  Prompt: TNeuralIntegerArray;
+  TokenPos: integer;
+
+  // Parses and loads Dir with the given flags. ExpectError = '' means the
+  // load must succeed; otherwise it must fail and the message must contain
+  // ExpectError (the engine is still returned, unloaded).
+  function RunEngine(const ModelDir: string; const Flags: array of string;
+    const ExpectError: string = ''): TChatEngine;
+  var
+    Args: TStringList;
+    Opt: TChatOptions;
+    ArgPos: integer;
+    ParsedOK, LoadedOK: boolean;
+  begin
+    Result := TChatEngine.Create();
+    Args := TStringList.Create();
+    try
+      Args.Add(ModelDir);
+      Args.Add('--greedy'); Args.Add('--fp32'); Args.Add('--cpu');
+      Args.Add('--serial');
+      Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
+      Args.Add('--max-new-tokens'); Args.Add('2');
+      for ArgPos := 0 to High(Flags) do Args.Add(Flags[ArgPos]);
+      ParsedOK := ParseArgs(Args, Opt);
+      AssertTrue('chat options parse: ' + Opt.ErrorMsg, ParsedOK);
+      FNotices := '';
+      Result.OnNotice := @CaptureNotice;
+      ErrorMsg := '';
+      LoadedOK := Result.LoadModel(Opt, ErrorMsg);
+      if ExpectError = '' then
+        AssertTrue('LoadModel: ' + ErrorMsg, LoadedOK)
+      else
+      begin
+        AssertFalse('LoadModel must refuse: ' + ExpectError, LoadedOK);
+        AssertTrue('error names the cause (' + ErrorMsg + ')',
+          Pos(ExpectError, ErrorMsg) > 0);
+      end;
+    finally
+      Args.Free;
+    end;
+  end;
+
+var
+  Engine: TChatEngine;
+begin
+  RandSeed := 474747;
+  Dir := MakeQwen35ChatModelDir();
+  SetLength(Prompt, PromptLen);
+  for TokenPos := 0 to PromptLen - 1 do
+    Prompt[TokenPos] := (5 * TokenPos + 2) mod Vocab;
+  try
+    Engine := RunEngine(Dir, ['--cache-checkpoints', '1'],
+      '--cache-checkpoints 1: must be 0 (off) or 2 to 2048');
+    Engine.Free;
+    Engine := RunEngine(Dir, ['--cache-checkpoints', '2049'],
+      '--cache-checkpoints 2049: must be 0 (off) or 2 to 2048');
+    Engine.Free;
+    // 0: the route is off, a re-sent prompt re-prefills everything.
+    Engine := RunEngine(Dir, ['--cache-checkpoints', '0']);
+    try
+      AssertTrue('the OFF notice', Pos('cache checkpoints OFF', FNotices) > 0);
+      AssertEquals('no store at 0', 0, Length(Engine.Checkpoints));
+      Engine.GenerateFromIds(Prompt, Engine.Opt);
+      Engine.GenerateFromIds(Prompt, Engine.Opt);
+      AssertEquals('re-sent prompt reused nothing at 0', 0,
+        Engine.LastReusedTokens);
+      // The cache holds the whole prompt (its last id was the first decode
+      // input), so the shared prefix is the prompt itself.
+      AssertEquals('the prefix diagnostic still reports the shared ids',
+        PromptLen, Engine.LastPrefixTokens);
+      AssertEquals('re-sent prompt prefilled everything', PromptLen - 1,
+        Engine.LastPrefillTokens);
+    finally
+      Engine.Free;
+    end;
+    // Not given: 8 slots on the CPU, and the ON notice names the store.
+    Engine := RunEngine(Dir, []);
+    try
+      AssertEquals('CPU default', 8, Engine.Opt.CacheCheckpoints);
+      AssertEquals('8 slots', 8, Length(Engine.Checkpoints));
+      AssertTrue('the ON notice', Pos('cache checkpoints ON', FNotices) > 0);
+      AssertTrue('the ON notice says where the store lives',
+        Pos('in host RAM', FNotices) > 0);
+      AssertEquals('band width without a twin: half the context', Ctx div 2,
+        Engine.CheckpointBandWidth);
+      Engine.GenerateFromIds(Prompt, Engine.Opt);
+      Engine.GenerateFromIds(Prompt, Engine.Opt);
+      AssertEquals('re-sent prompt resumed at its end', PromptLen - 1,
+        Engine.LastReusedTokens);
+      AssertEquals('re-sent prompt prefilled nothing', 0,
+        Engine.LastPrefillTokens);
+    finally
+      Engine.Free;
+    end;
+    // --no-cache-reuse sizes no store either.
+    Engine := RunEngine(Dir, ['--no-cache-reuse']);
+    try
+      AssertEquals('no store under --no-cache-reuse', 0,
+        Length(Engine.Checkpoints));
+    finally
+      Engine.Free;
+    end;
+  finally
+    RemoveChatModelDir(Dir);
+  end;
+  // A pure-attention net: the flag is inert with a notice, the KV-cache
+  // truncation route stays.
+  Dir := MakeChatModelDir('qwen2');
+  try
+    Engine := RunEngine(Dir, ['--cache-checkpoints', '4']);
+    try
+      AssertTrue('pure attention: KV-cache reuse route', Engine.ReuseOK);
+      AssertFalse('pure attention: no checkpoint route', Engine.StateReuseOK);
+      AssertEquals('pure attention: no store', 0, Length(Engine.Checkpoints));
+      AssertTrue('pure attention: the inert notice',
+        Pos('--cache-checkpoints 4 ignored', FNotices) > 0);
+      AssertTrue('pure attention: the KV-cache reuse notice',
+        Pos('KV-cache reuse ON', FNotices) > 0);
+    finally
+      Engine.Free;
+    end;
+  finally
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatPrefillLadderParity;
+var
+  Args: TStringList;
+  Opt: TChatOptions;
+begin
+  Args := TStringList.Create();
+  try
+    Args.Add('/tmp/model'); Args.Add('--prefill-tail-window'); Args.Add('-1');
+    AssertFalse('--prefill-tail-window -1 is rejected', ParseArgs(Args, Opt));
+    Args.Clear;
+    Args.Add('/tmp/model'); Args.Add('--prefill-tail-window'); Args.Add('8');
+    AssertTrue('--prefill-tail-window 8 parses', ParseArgs(Args, Opt));
+    AssertEquals('--prefill-tail-window value', 8, Opt.PrefillTailWindow);
+    AssertEquals('--prefill-tail-window default is auto', 0,
+      DefaultChatOptions().PrefillTailWindow);
+  finally
+    Args.Free;
+  end;
+  // FP32 KV cache on the default (layer-graph parallel) forward.
+  RunQwen35ChatPrefillLadderParity(['--kv-fp32']);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatPrefillLadderInt8KVParity;
+begin
+  // int8 KV cache on the serial forward: the codes cross twin to twin to
+  // the width-1 session verbatim.
+  RunQwen35ChatPrefillLadderParity(['--kv-int8', '--serial']);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatPrefillLadderOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  // The production path on a GPU: int8 codes resident once, retained by
+  // both twins through EnableOpenCLInContextOf; the harness asserts every
+  // TNNetFusedSDPA of the three nets reached the device.
+  RunQwen35ChatPrefillLadderParity(['--int8', '--kv-int8', '--serial',
+    '--gpu']);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+// The tail width resolution in LoadModel: a T not below N is ignored with a
+// notice (no tail twin, LastPrefillTailWindows stays 0), the default 16 is
+// not below a window of 4 so auto builds none and says so, and T without
+// --prefill-window is ignored with a notice. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35ChatPrefillTailWindowErrors;
+const
+  Ctx = 16;
+  PromptLen = 7;
+  Vocab = 13;
+var
+  Dir, ErrorMsg: string;
+  Prompt: TNeuralIntegerArray;
+  TokenPos: integer;
+
+  // Parses and loads with the given window flags. ExpectError = '' means the
+  // load must succeed; otherwise the load must fail and the message must
+  // contain ExpectError (the engine is still returned, unloaded).
+  function RunEngine(const WindowArgs: array of string;
+    const ExpectError: string = ''): TChatEngine;
+  var
+    Args: TStringList;
+    Opt: TChatOptions;
+    ArgPos: integer;
+    ParsedOK, LoadedOK: boolean;
+  begin
+    Result := TChatEngine.Create();
+    Args := TStringList.Create();
+    try
+      Args.Add(Dir);
+      Args.Add('--greedy'); Args.Add('--fp32'); Args.Add('--cpu');
+      Args.Add('--serial');
+      Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
+      Args.Add('--max-new-tokens'); Args.Add('1');
+      for ArgPos := 0 to High(WindowArgs) do Args.Add(WindowArgs[ArgPos]);
+      ParsedOK := ParseArgs(Args, Opt);
+      AssertTrue('chat options parse: ' + Opt.ErrorMsg, ParsedOK);
+      FNotices := '';
+      Result.OnNotice := @CaptureNotice;
+      ErrorMsg := '';
+      LoadedOK := Result.LoadModel(Opt, ErrorMsg);
+      if ExpectError = '' then
+      begin
+        AssertTrue('LoadModel: ' + ErrorMsg, LoadedOK);
+        Result.GenerateFromIds(Prompt, Result.Opt);
+      end
+      else
+      begin
+        AssertFalse('LoadModel must refuse: ' + ExpectError, LoadedOK);
+        AssertTrue('error names the cause (' + ErrorMsg + ')',
+          Pos(ExpectError, ErrorMsg) > 0);
+      end;
+    finally
+      Args.Free;
+    end;
+  end;
+
+var
+  Engine: TChatEngine;
+begin
+  RandSeed := 454545;
+  Dir := MakeQwen35ChatModelDir();
+  SetLength(Prompt, PromptLen);
+  for TokenPos := 0 to PromptLen - 1 do
+    Prompt[TokenPos] := (5 * TokenPos + 2) mod Vocab;
+  try
+    // A user-given value that cannot be honoured stops the load.
+    Engine := RunEngine(['--prefill-window', '4', '--prefill-tail-window', '4'],
+      '--prefill-tail-window 4: must be below --prefill-window 4');
+    Engine.Free;
+    Engine := RunEngine(['--prefill-tail-window', '2'],
+      '--prefill-tail-window 2: needs --prefill-window');
+    Engine.Free;
+    Engine := RunEngine(['--prefill-window', IntToStr(Ctx)],
+      Format('--prefill-window %d: must be below the context of %d',
+        [Ctx, Ctx]));
+    Engine.Free;
+    // A width the engine derived on its own is a notice, not an error.
+    Engine := RunEngine(['--prefill-window', '4']);
+    try
+      AssertTrue('auto below a window of 4 builds no tail twin',
+        Pos('no tail twin, the default tail width', FNotices) > 0);
+      AssertTrue('no tail twin (auto)', Engine.TailNN = nil);
+      AssertEquals('resolved to no tail twin (auto)', 1,
+        Engine.Opt.PrefillTailWindow);
+      AssertEquals('the width-4 twin still ran', 1, Engine.LastPrefillWindows);
+      AssertEquals('no tail windows', 0, Engine.LastPrefillTailWindows);
+    finally
+      Engine.Free;
+    end;
+    // 1 is the explicit "no tail twin" and is always accepted.
+    Engine := RunEngine(['--prefill-window', '4', '--prefill-tail-window', '1']);
+    try
+      AssertTrue('no tail twin (explicit 1)', Engine.TailNN = nil);
+      AssertEquals('the width-4 twin ran', 1, Engine.LastPrefillWindows);
+    finally
+      Engine.Free;
+    end;
+  finally
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatPrefillWindowParity;
+var
+  Args: TStringList;
+  Opt: TChatOptions;
+begin
+  // The parser rejects a one-token window (it would be today's path twice).
+  Args := TStringList.Create();
+  try
+    Args.Add('/tmp/model'); Args.Add('--prefill-window'); Args.Add('1');
+    AssertFalse('--prefill-window 1 is rejected', ParseArgs(Args, Opt));
+    Args.Clear;
+    Args.Add('/tmp/model'); Args.Add('--prefill-window'); Args.Add('64');
+    AssertTrue('--prefill-window 64 parses', ParseArgs(Args, Opt));
+    AssertEquals('--prefill-window value', 64, Opt.PrefillWindow);
+  finally
+    Args.Free;
+  end;
+  // FP32 KV cache on the default (layer-graph parallel) forward.
+  RunQwen35ChatPrefillWindowParity(['--kv-fp32']);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatPrefillWindowInt8KVParity;
+begin
+  // int8 KV cache on the serial forward: the window session's int8 codes
+  // cross to the width-1 session verbatim.
+  RunQwen35ChatPrefillWindowParity(['--kv-int8', '--serial']);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatPrefillWindowOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  // ParseArgs takes the last of --cpu/--gpu, so --gpu here overrides the
+  // harness's --cpu: both nets are armed for OpenCL, the KV cache is int8
+  // (the ChatTerminal default under int8 and int4 weights) and the forward is
+  // serial. The harness asserts every TNNetFusedSDPA reached the device.
+  RunQwen35ChatPrefillWindowParity(['--kv-int8', '--serial', '--gpu']);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatPrefillWindowInt8WeightsParity;
+begin
+  // int8 weights (the ChatTerminal default): the twin borrows the width-1
+  // net's int8 tables; --int8 after the harness's --fp32 wins.
+  RunQwen35ChatPrefillWindowParity(['--int8', '--kv-int8', '--serial']);
+end;
+
+procedure TTestNeuralPretrained.TestQwen35ChatPrefillWindowInt8WeightsOpenCLParity;
+begin
+  {$IFDEF OpenCL}
+  // The production path on a GPU: int8 codes resident once, retained by the
+  // twin through EnableOpenCLInContextOf.
+  RunQwen35ChatPrefillWindowParity(['--int8', '--kv-int8', '--serial',
+    '--gpu']);
+  {$ELSE}
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+  {$ENDIF}
+end;
+
+// A model_type outside the Llama builder (tiny_mamba) keeps the full second
+// build: LoadModel says so, the twin holds its own weights and borrows none,
+// and both prefill widths still produce the same greedy reply. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestMambaChatPrefillWindowFallback;
+const
+  Ctx = 16;
+  PromptLen = 7;
+  Vocab = 13;
+var
+  Dir, ErrorMsg: string;
+  Prompt: TNeuralIntegerArray;
+  TokenPos: integer;
+  ReplyNoWindow, ReplyWindow: string;
+
+  function RunEngine(WindowLen: integer; out Reply: string): TChatEngine;
+  var
+    Args: TStringList;
+    Opt: TChatOptions;
+  begin
+    Result := TChatEngine.Create();
+    Args := TStringList.Create();
+    try
+      Args.Add(Dir);
+      Args.Add('--greedy'); Args.Add('--fp32'); Args.Add('--cpu');
+      Args.Add('--serial');
+      Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
+      Args.Add('--max-new-tokens'); Args.Add('2');
+      Args.Add('--prefill-window'); Args.Add(IntToStr(WindowLen));
+      // A tail width without a window is a load error, so only the windowed
+      // run asks for one.
+      if WindowLen > 0 then
+      begin
+        Args.Add('--prefill-tail-window'); Args.Add('2');
+      end;
+      AssertTrue('chat options parse', ParseArgs(Args, Opt));
+      FNotices := '';
+      Result.OnNotice := @CaptureNotice;
+      AssertTrue('LoadModel: ' + ErrorMsg, Result.LoadModel(Opt, ErrorMsg));
+      Reply := Result.GenerateFromIds(Prompt, Result.Opt);
+    finally
+      Args.Free;
+    end;
+  end;
+
+var
+  Engine: TChatEngine;
+  LayerPos: integer;
+begin
+  RandSeed := 515151;
+  AssertFalse('mamba is outside the Llama builder',
+    PretrainedModelTypeCanBorrowWeights('mamba'));
+  AssertTrue('qwen3_5 is inside it',
+    PretrainedModelTypeCanBorrowWeights('qwen3_5'));
+  Dir := MakeChatModelDir('mamba');
+  SetLength(Prompt, PromptLen);
+  for TokenPos := 0 to PromptLen - 1 do
+    Prompt[TokenPos] := (5 * TokenPos + 2) mod Vocab;
+  try
+    Engine := RunEngine(0, ReplyNoWindow);
+    try
+      AssertTrue('no twin without a window', Engine.WindowNN = nil);
+    finally
+      Engine.Free;
+    end;
+    Engine := RunEngine(4, ReplyWindow);
+    try
+      AssertTrue('the fallback notice names the full second build',
+        Pos('full second build', FNotices) > 0);
+      AssertTrue('twin present', Assigned(Engine.WindowNN));
+      AssertFalse('the mamba twin does not borrow', Engine.WindowBorrowsWeights);
+      AssertEquals('the twin holds a full copy of the weights',
+        Engine.NN.CountWeights(), Engine.WindowNN.CountWeights());
+      AssertTrue('the twin sized its own rows',
+        Engine.WindowNN.WeightElementsSized() > 0);
+      for LayerPos := 0 to Engine.WindowNN.CountLayers() - 1 do
+        AssertTrue('layer ' + IntToStr(LayerPos) + ' owns its weights',
+          Engine.WindowNN.Layers[LayerPos].WeightOwner = nil);
+      AssertEquals('one window fed', 1, Engine.LastPrefillWindows);
+      // No tail twin on the fallback: a third copy of the weights is not
+      // worth the leftover single steps, and the notice says so.
+      AssertTrue('the fallback notice refuses the tail twin',
+        Pos('no tail twin on the full second build', FNotices) > 0);
+      AssertTrue('no tail twin on the fallback', Engine.TailNN = nil);
+      AssertEquals('resolved to no tail twin', 1, Engine.Opt.PrefillTailWindow);
+      AssertEquals('no tail windows', 0, Engine.LastPrefillTailWindows);
+    finally
+      Engine.Free;
+    end;
+    AssertEquals('windowed and token-by-token replies agree',
+      ReplyNoWindow, ReplyWindow);
+  finally
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+// The builder route of the borrowing twin (Phase 5 step B): built from a
+// checkpoint path that does not exist, so no reader is opened; every
+// weight-bearing layer links the owner's layer at the same index, not one
+// FP32 row or int8 code is sized, and its windowed prefill equals a twin
+// that quantized its own copy, bit for bit. A twin built with the other
+// fused-attention setting has another graph and is refused. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35BorrowedTwinBuild;
+const
+  SeqLen = 16;
+  WindowLen = 6;
+var
+  Owner, Reference, Twin, Mismatched: TNNet;
+  SessionOwner, SessionReference, SessionTwin: TNNetStreamingDecoder;
+  LogitsReference, LogitsTwin: TNNetVolume;
+  Toks: array[0..SeqLen - 1] of integer;
+  T, Vocab: integer;
+  Refused: boolean;
+begin
+  Owner := BuildQwen35FixtureTwin(1, {pQuantizeInt8=}true);
+  Reference := nil; Twin := nil; Mismatched := nil;
+  SessionOwner := nil; SessionReference := nil; SessionTwin := nil;
+  LogitsReference := TNNetVolume.Create();
+  LogitsTwin := TNNetVolume.Create();
+  try
+    AssertTrue('the owner sized its own storage',
+      Owner.WeightElementsSized() > 0);
+    Reference := BuildQwen35FixtureTwin(WindowLen, {pQuantizeInt8=}true);
+    Twin := BuildQwen35FixtureTwin(WindowLen, {pQuantizeInt8=}true, Owner);
+    AssertWeightsLinked(Twin, Owner, 'borrowed build');
+    AssertEquals('the twin sized no weight storage', 0,
+      Twin.WeightElementsSized());
+    AssertEquals('twin input width', WindowLen,
+      Twin.GetFirstLayer().Output.SizeX);
+    Vocab := Owner.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Toks[T] := (5 * T + 2) mod Vocab;
+    SessionOwner := TNNetStreamingDecoder.Create(Owner, SeqLen);
+    SessionReference := TNNetStreamingDecoder.Create(Reference, SeqLen);
+    SessionTwin := TNNetStreamingDecoder.Create(Twin, SeqLen);
+    RunWindowedPrefillStream(SessionReference, SessionOwner, Toks, WindowLen,
+      SeqLen, LogitsReference);
+    RunWindowedPrefillStream(SessionTwin, SessionOwner, Toks, WindowLen,
+      SeqLen, LogitsTwin);
+    AssertEquals('borrowed twin vs its own-copy twin: bit-identical logits',
+      0.0, MaxAbsVolumeDiff(LogitsReference, LogitsTwin), 0.0);
+    // Graph mismatch: per-head attention wiring instead of the fused layer.
+    Refused := false;
+    NeuralAllowFusedAttention := false;
+    try
+      try
+        Mismatched := BuildQwen35FixtureTwin(WindowLen, {pQuantizeInt8=}true,
+          Owner);
+      except
+        on E: Exception do Refused := true;
+      end;
+    finally
+      NeuralAllowFusedAttention := true;
+    end;
+    AssertTrue('a twin with another graph is refused', Refused);
+    AssertTrue('nothing built on refusal', Mismatched = nil);
+  finally
+    LogitsTwin.Free;
+    LogitsReference.Free;
+    SessionTwin.Free;
+    SessionReference.Free;
+    SessionOwner.Free;
+    Mismatched.Free;
+    Twin.Free; // the engine order: the borrower before its owner
+    Reference.Free;
+    Owner.Free;
+  end;
+end;
+
+// An inference-only twin costs its activations only. Inside the decode
+// session production wraps it in, the width-256 borrowing twin's
+// NonWeightBytes stay within 2x its layer outputs (the convolution kernels'
+// FOutputRaw and bias rows are the rest); every TNNetGatedDeltaNet keeps one
+// scratch row and two matrix-state rows instead of 256 BPTT rows; the same
+// graph built trainable costs more than twice as much; SetTrainable(true)
+// after the build brings the BPTT caches back; and the inference forward
+// (two alternating state rows) equals the trainable forward bit for bit.
+// The fixture config caps the context at 16, so a copy with a 4096 cap is
+// written to a temp file. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwen35BorrowedTwinInferenceMemory;
+const
+  WindowLen = 256;
+  ParitySeqLen = 16;
+var
+  Owner, Twin, Trained, Inference16, Trained16, Solo: TNNet;
+  Session: TNNetStreamingDecoder;
+  Config: TLlamaConfig;
+  Cfg: TStringList;
+  CfgPath: string;
+  LayerCnt, LastLayerIdx, DeltaCnt, T: integer;
+  ActivationBytes, TwinBytes, TrainedBytes, SoloInferenceBytes: int64;
+  TwinLayer, TrainedLayer, FirstTrainedDelta: TNNetLayer;
+  In16, OutInference, OutTrained: TNNetVolume;
+begin
+  Cfg := TStringList.Create();
+  CfgPath := IncludeTrailingPathDelimiter(GetTempDir(false)) +
+    'cai_qwen35_ctx4096_' + IntToStr(Random(1000000)) + '.json';
+  Owner := nil; Twin := nil; Trained := nil; Session := nil;
+  Inference16 := nil; Trained16 := nil; Solo := nil;
+  In16 := TNNetVolume.Create(ParitySeqLen, 1, 1);
+  OutInference := TNNetVolume.Create();
+  OutTrained := TNNetVolume.Create();
+  try
+    Cfg.LoadFromFile(FixturePath('tiny_qwen3_5_config.json'));
+    Cfg.Text := StringReplace(Cfg.Text, '"max_position_embeddings": 16',
+      '"max_position_embeddings": 4096', []);
+    AssertTrue('context cap rewritten', Pos('4096', Cfg.Text) > 0);
+    Cfg.SaveToFile(CfgPath);
+    Owner := BuildQwen35FromSafeTensorsEx(
+      FixturePath('tiny_qwen3_5.safetensors'), Config, 1,
+      {pTrainable=}false, CfgPath);
+    // A borrowing build never opens the checkpoint (BuildQwen35FixtureTwin).
+    Twin := BuildQwen35FromSafeTensorsEx(
+      ExtractFilePath(FixturePath('tiny_qwen3_5_config.json')) +
+      'does_not_exist_tiny_qwen3_5.safetensors', Config,
+      WindowLen, {pTrainable=}false, CfgPath, {pQuantizeInt8=}false, Owner);
+    Trained := BuildQwen35FromSafeTensorsEx(
+      FixturePath('tiny_qwen3_5.safetensors'), Config, WindowLen,
+      {pTrainable=}true, CfgPath);
+    AssertEquals('the twin sized no weight storage', 0,
+      Twin.WeightElementsSized());
+    AssertEquals('same graph', Trained.CountLayers(), Twin.CountLayers());
+    Session := TNNetStreamingDecoder.Create(Twin, 2 * WindowLen);
+    ActivationBytes := 0;
+    LastLayerIdx := Twin.GetLastLayerIdx();
+    for LayerCnt := 0 to LastLayerIdx do
+      ActivationBytes := ActivationBytes +
+        int64(Twin.Layers[LayerCnt].Output.Size) * csNeuralFloatSize;
+    TwinBytes := Twin.NonWeightBytes();
+    TrainedBytes := Trained.NonWeightBytes();
+    AssertTrue(Format('twin non-weight bytes %d within 2x its activations %d',
+      [TwinBytes, ActivationBytes]), TwinBytes <= 2 * ActivationBytes);
+    AssertTrue(Format('trainable net %d bytes costs more than twice the twin %d',
+      [TrainedBytes, TwinBytes]), TrainedBytes > 2 * TwinBytes);
+    DeltaCnt := 0;
+    FirstTrainedDelta := nil;
+    for LayerCnt := 0 to LastLayerIdx do
+    begin
+      TwinLayer := Twin.Layers[LayerCnt];
+      TrainedLayer := Trained.Layers[LayerCnt];
+      AssertEquals('layer class at ' + IntToStr(LayerCnt),
+        TrainedLayer.ClassName, TwinLayer.ClassName);
+      if TwinLayer is TNNetGatedDeltaNet then
+      begin
+        Inc(DeltaCnt);
+        if FirstTrainedDelta = nil then FirstTrainedDelta := TrainedLayer;
+        // One scratch row, two state rows and FDecS against 256 BPTT rows.
+        AssertTrue(Format('DeltaNet at %d: twin %d bytes vs trainable %d',
+          [LayerCnt, TwinLayer.NonWeightBytes(), TrainedLayer.NonWeightBytes()]),
+          8 * TwinLayer.NonWeightBytes() < TrainedLayer.NonWeightBytes());
+      end;
+      if TwinLayer is TNNetFusedSDPA then
+        // No SeqLen x SeqLen x heads score map inside a decode session: the
+        // layer holds its output and the KV cache of 2*WindowLen rows.
+        AssertTrue(Format('attention at %d: twin %d bytes, output %d',
+          [LayerCnt, TwinLayer.NonWeightBytes(), TwinLayer.Output.Size *
+           csNeuralFloatSize]),
+          TwinLayer.NonWeightBytes() <=
+          int64(TwinLayer.Output.Size) * csNeuralFloatSize +
+          int64(2 * WindowLen) * TwinLayer.Output.Depth * 4 * csNeuralFloatSize);
+    end;
+    AssertEquals('DeltaNet layers compared', 6, DeltaCnt);
+    // SetTrainable(true) after the build: the standalone layer, built
+    // inference-only at the same shapes, grows to the trainable layer's bytes.
+    Solo := TNNet.Create();
+    Solo.AddLayer(TNNetInput.Create(WindowLen, 1,
+      FirstTrainedDelta.PrevLayer.Output.Depth));
+    Solo.AddLayer(TNNetGatedDeltaNet.Create(Config.LinearNumKHeads,
+      Config.LinearNumVHeads, Config.LinearKeyHeadDim,
+      Config.LinearValueHeadDim, Config.RmsNormEps).SetTrainable(false));
+    SoloInferenceBytes := Solo.GetLastLayer().NonWeightBytes();
+    AssertTrue('inference-only DeltaNet below the trainable one',
+      8 * SoloInferenceBytes < FirstTrainedDelta.NonWeightBytes());
+    // TNNetLayer.SetTrainable(true) leaves the two error buffers to
+    // SetPrevLayer, so the flipped layer is short of exactly those (they hold
+    // one element each until then); the BPTT caches themselves come back.
+    Solo.SetTrainable({pTrainable=}true, {pLowMemory=}false);
+    AssertEquals('SetTrainable(true) restores the BPTT caches',
+      FirstTrainedDelta.NonWeightBytes() -
+      2 * (int64(FirstTrainedDelta.Output.Size) - 1) * csNeuralFloatSize,
+      Solo.GetLastLayer().NonWeightBytes());
+    Solo.SetTrainable({pTrainable=}false);
+    AssertEquals('SetTrainable(false) releases them again',
+      SoloInferenceBytes, Solo.GetLastLayer().NonWeightBytes());
+    // Bit-exact forward: the inference net's two alternating state rows
+    // against the trainable net's per-step cache, full width, no session.
+    Inference16 := BuildQwen35FromSafeTensorsEx(
+      FixturePath('tiny_qwen3_5.safetensors'), Config, ParitySeqLen,
+      {pTrainable=}false, CfgPath);
+    Trained16 := BuildQwen35FromSafeTensorsEx(
+      FixturePath('tiny_qwen3_5.safetensors'), Config, ParitySeqLen,
+      {pTrainable=}true, CfgPath);
+    for T := 0 to ParitySeqLen - 1 do
+      In16.FData[T] := (5 * T + 2) mod Config.VocabSize;
+    Inference16.Compute(In16);
+    Inference16.GetOutput(OutInference);
+    Trained16.Compute(In16);
+    Trained16.GetOutput(OutTrained);
+    AssertEquals('logits rows', ParitySeqLen * Config.VocabSize,
+      OutInference.Size);
+    AssertEquals('inference forward vs trainable forward: bit-identical',
+      0.0, MaxAbsVolumeDiff(OutTrained, OutInference), 0.0);
+  finally
+    OutTrained.Free;
+    OutInference.Free;
+    In16.Free;
+    Trained16.Free;
+    Inference16.Free;
+    Solo.Free;
+    Session.Free;
+    Twin.Free; // the borrower before its owner
+    Trained.Free;
+    Owner.Free;
+    DeleteFile(CfgPath);
+    Cfg.Free;
+  end;
+end;
+
+// The borrowing build under an int4 owner (tiny_llama_q8, Q4_0-sized rows):
+// the twin links the int4 tables, arms its own int8 input copy, sizes no
+// storage, and its width-4 forward equals a twin that requantized its own
+// copy, bit for bit. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLlamaBorrowedTwinInt4Parity;
+const
+  SeqLen = 4;
+var
+  Owner, Reference, Twin: TNNet;
+  Input, OutReference, OutTwin: TNNetVolume;
+  T, Vocab, LayerPos, Int4Linked: integer;
+  TwinLayer: TNNetLayerConcatedWeights;
+begin
+  Owner := BuildLlamaInt4FixtureTwin(1);
+  Reference := nil; Twin := nil;
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutReference := TNNetVolume.Create();
+  OutTwin := TNNetVolume.Create();
+  try
+    Reference := BuildLlamaInt4FixtureTwin(SeqLen);
+    Twin := BuildLlamaInt4FixtureTwin(SeqLen, Owner);
+    AssertWeightsLinked(Twin, Owner, 'borrowed int4');
+    AssertEquals('the twin sized no weight storage', 0,
+      Twin.WeightElementsSized());
+    Int4Linked := 0;
+    for LayerPos := 0 to Twin.CountLayers() - 1 do
+      if Twin.Layers[LayerPos] is TNNetLayerConcatedWeights then
+      begin
+        TwinLayer := TNNetLayerConcatedWeights(Twin.Layers[LayerPos]);
+        if TwinLayer.WeightsQuantizedInt4 then
+        begin
+          Inc(Int4Linked);
+          AssertTrue('int4 layer ' + IntToStr(LayerPos) +
+            ' armed its int8 input copy', Assigned(TwinLayer.InputCopyInt8));
+        end;
+      end;
+    AssertTrue('int4 layers on the borrowed twin', Int4Linked > 0);
+    Vocab := Owner.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Input.FData[T] := (3 * T + 1) mod Vocab;
+    Reference.Compute(Input);
+    Reference.GetOutput(OutReference);
+    Twin.Compute(Input);
+    Twin.GetOutput(OutTwin);
+    AssertTrue('logits produced', OutReference.Size = SeqLen * Vocab);
+    AssertEquals('borrowed int4 twin vs its own-copy twin: bit-identical',
+      0.0, MaxAbsVolumeDiff(OutReference, OutTwin), 0.0);
+  finally
+    OutTwin.Free;
+    OutReference.Free;
+    Input.Free;
+    Twin.Free;
+    Reference.Free;
+    Owner.Free;
+  end;
+end;
+
+// Same under OpenCL (PoCL here): the borrowed twin armed in the owner's
+// context holds the owner's resident int4 codes, runs its projections on the
+// device and matches a twin that uploaded its own copy. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLlamaBorrowedTwinInt4OpenCLParity;
+{$IFDEF OpenCL}
+const
+  SeqLen = 4;
+var
+  Owner, Reference, Twin: TNNet;
+  Input, OutReference, OutTwin: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  T, Vocab: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  Owner := BuildLlamaInt4FixtureTwin(1);
+  Reference := nil; Twin := nil;
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutReference := TNNetVolume.Create();
+  OutTwin := TNNetVolume.Create();
+  try
+    Reference := BuildLlamaInt4FixtureTwin(SeqLen);
+    Twin := BuildLlamaInt4FixtureTwin(SeqLen, Owner);
+    Owner.EnableOpenCL(PlatformId, DeviceId);
+    Reference.EnableOpenCL(PlatformId, DeviceId);
+    Twin.EnableOpenCLInContextOf(Owner);
+    AssertWeightsLinked(Twin, Owner, 'borrowed int4 device');
+    AssertDeviceWeightsBorrowed(Twin, 'borrowed int4 device');
+    AssertEquals('the twin sized no weight storage', 0,
+      Twin.WeightElementsSized());
+    Vocab := Owner.GetLastLayer().Output.Depth;
+    for T := 0 to SeqLen - 1 do Input.FData[T] := (3 * T + 1) mod Vocab;
+    Reference.Compute(Input);
+    Reference.GetOutput(OutReference);
+    Twin.Compute(Input);
+    Twin.GetOutput(OutTwin);
+    AssertAllOnDevice(Twin, TNNetPointwiseConvLinear, 'borrowed int4 twin');
+    AssertEquals('borrowed int4 device twin vs its own-copy device twin: ' +
+      'bit-identical', 0.0, MaxAbsVolumeDiff(OutReference, OutTwin), 0.0);
+    FreeAndNil(Twin);
+  finally
+    OutTwin.Free;
+    OutReference.Free;
+    Input.Free;
+    Twin.Free;
+    Reference.Free;
+    Owner.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 // Verifies the Qwen3.5/3.6-MoE hybrid import (HF model_type "qwen3_5_moe",
 // architectures ["Qwen3_5MoeForConditionalGeneration"], e.g.
@@ -13603,6 +16963,58 @@ begin
     EmbedInstructionPrefix(efGteQwen2, False, 'Find the answer'));
   AssertEquals('apply prepend', 'query: hello world',
     ApplyEmbedInstruction(efE5, True, 'hello world'));
+end;
+
+// The hold-back length for the tail of a streamed piece: 0 for ASCII and
+// whole codepoints, the sequence-so-far length for a lead byte whose
+// continuation bytes are still in the next token, 0 for bytes no sequence
+// could complete (so a garbage byte is never held forever).
+procedure TTestNeuralPretrained.TestUtf8IncompleteTailLen;
+begin
+  AssertEquals('empty', 0, Utf8IncompleteTailLen(''));
+  AssertEquals('ascii', 0, Utf8IncompleteTailLen('abc'));
+  AssertEquals('whole 2-byte', 0, Utf8IncompleteTailLen('caf' + #$C3#$A9));
+  AssertEquals('whole 3-byte', 0, Utf8IncompleteTailLen(#$E2#$82#$AC));
+  AssertEquals('whole 4-byte', 0, Utf8IncompleteTailLen('a' + #$F0#$9F#$98#$80));
+  AssertEquals('2-byte lead alone', 1, Utf8IncompleteTailLen('caf' + #$C3));
+  AssertEquals('3-byte lead alone', 1, Utf8IncompleteTailLen(#$E2));
+  AssertEquals('3-byte with one cont', 2, Utf8IncompleteTailLen('x' + #$E2#$82));
+  AssertEquals('4-byte with three cont', 3,
+    Utf8IncompleteTailLen(#$F0#$9F#$98));
+  AssertEquals('stray continuation', 0, Utf8IncompleteTailLen('a' + #$A9));
+  AssertEquals('four continuations', 0,
+    Utf8IncompleteTailLen(#$F0#$80#$80#$80#$80));
+  AssertEquals('invalid lead', 0, Utf8IncompleteTailLen(#$FF));
+end;
+
+// Drives the streaming helper the way EmitToken does, with an emoji split
+// 2+2 and an accented letter split 1+1 across tokens: every returned chunk
+// is whole codepoints, the concatenation is the untouched input, and a
+// leftover lead byte stays pending for the end-of-reply flush.
+procedure TTestNeuralPretrained.TestTakeCompleteUtf8StreamsWholeCodepoints;
+var
+  Pending, Chunk, Joined: string;
+begin
+  Pending := '';
+  Chunk := TakeCompleteUtf8(Pending, 'ab' + #$F0#$9F);
+  AssertEquals('emoji part 1 out', 'ab', Chunk);
+  AssertEquals('emoji part 1 pending', #$F0#$9F, Pending);
+  Joined := Chunk;
+  Chunk := TakeCompleteUtf8(Pending, #$98#$80 + 'c' + #$C3);
+  AssertEquals('emoji completes', 'ab' + #$F0#$9F#$98#$80 + 'c', Joined + Chunk);
+  AssertEquals('accent lead pending', #$C3, Pending);
+  Joined := Joined + Chunk;
+  Chunk := TakeCompleteUtf8(Pending, #$A9 + 'd');
+  Joined := Joined + Chunk;
+  AssertEquals('accent completes', '', Pending);
+  AssertEquals('joined equals input',
+    'ab' + #$F0#$9F#$98#$80 + 'c' + #$C3#$A9 + 'd', Joined);
+  Chunk := TakeCompleteUtf8(Pending, 'e' + #$E2#$82);
+  AssertEquals('tail held', 'e', Chunk);
+  AssertEquals('tail pending', #$E2#$82, Pending);
+  Chunk := TakeCompleteUtf8(Pending, '');
+  AssertEquals('empty piece emits nothing', '', Chunk);
+  AssertEquals('empty piece keeps pending', #$E2#$82, Pending);
 end;
 
 // Pearson on a perfectly linear pair = 1; Spearman on a monotone-but-

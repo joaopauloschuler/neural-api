@@ -3672,7 +3672,7 @@ procedure TTestNeuralDecode.TestStreamingDecoderRepeatedTurnResumeBitIdenticalQw
 const
   TotalLen = 9;
   // Turn boundaries: the session is snapshotted after feeding this many
-  // tokens, mirroring TChatEngine's TurnSnapPos = Len - 1 capture.
+  // tokens, mirroring TChatEngine's end-of-reply checkpoint at Len - 1.
   Bound1 = 3;
   Bound2 = 6;
   Toks: array[0..8] of integer = (2, 8, 4, 11, 6, 1, 9, 3, 7);

@@ -453,6 +453,21 @@ type
       FDepartingBranchesCnt: integer;
       FBackPropCallCurrentCnt: integer;
       FLinkedNeurons: boolean;
+      // Weight borrowing (LinkWeightsFrom): a borrower reads FWeightOwner's
+      // neurons (and, per class, its quantized tables and resident device
+      // codes) at its own input width, in any net. The owner lists its
+      // borrowers (nil until one links) and detaches them when it is freed,
+      // so either side may be destroyed first. Coded by Claude (AI).
+      FWeightOwner: TNNetLayer;
+      FWeightBorrowers: TList;
+      // Build-time borrowing (TNNet.BuildWeightOwner): True from the moment
+      // this layer skipped sizing its weight rows until LinkBuildWeightOwner
+      // links it; a layer left pending is a graph mismatch.
+      FBuildLinkPending: boolean;
+      // FP32 weight elements (or int8 codes) this layer allocated for its own
+      // rows through SetNumWeightsForAllNeurons, ArmBuildQuantInt8Storage or
+      // its constructor; a layer built borrowing reports 0. Coded by Claude (AI).
+      FWeightElementsSized: int64;
       FCanNormalizeDelta: boolean;
       FCanSetNumWeightsForAllNeurons: boolean;
       // When False, SetNumWeightsForAllNeurons skips allocating the per-neuron
@@ -558,6 +573,25 @@ type
       // no-op: layers whose ComputeRange reads FPrevLayer.Output directly
       // (FullConnect) need nothing. Coded by Claude (AI).
       procedure PrepareChunkedForward(); virtual;
+      // The neuron-list half of LinkWeightsFrom: frees this layer's neurons,
+      // points FNeurons at Owner's, registers the link. False (nothing
+      // changed) when Owner is not a same-class, same-count, unlinked layer.
+      function LinkNeuronsFrom(Owner: TNNetLayer): boolean;
+      // Called by the owner as it is destroyed: replaces every borrowed
+      // reference with empty storage this layer owns. The layer must not
+      // compute afterwards. Descendants that alias more than the neuron list
+      // extend it. Coded by Claude (AI).
+      procedure DetachFromWeightOwner(); virtual;
+      // Detaches every borrower of this layer (idempotent); descendants call
+      // it BEFORE freeing anything a borrower aliases.
+      procedure UnlinkWeightBorrowers();
+      // True, and the link marked pending, when the owning net builds
+      // borrowing (TNNet.BuildWeightOwner): the caller sizes no weight rows.
+      function DeferWeightSizingToBuildLink(): boolean;
+      // TNNet calls it once the layer index is final: links this layer to the
+      // owner net's layer at the same index (same class), raising on a graph
+      // mismatch or a refused link. Coded by Claude (AI).
+      procedure LinkBuildWeightOwner();
     public
       // Fast (array) mirror of the FNeurons list: same TNNetNeuron references,
       // indexed directly without the TNNetNeuronList method/bounds overhead.
@@ -604,6 +638,9 @@ type
       // True when the previous layer left its finished output in device memory
       // and exposes both handles, so this layer may bind it. Coded by Claude (AI).
       function PrevOutputOnOpenCL(): boolean;
+      // Tiled-GEMM launches of this layer's FDotCL so far (0 without one): the
+      // test hook proving a window forward took the tiled int8/int4 kernel.
+      function OpenCLTiledGemmLaunchCount(): integer;
       // Force (pForce=True) or release (False) the OpenCL path on this layer,
       // bypassing the per-layer size verdict in WillOpenCL. Used by the GPU
       // parity tests to exercise the device path on tiny tensors. Coded by Claude (AI).
@@ -669,6 +706,9 @@ type
       // quantized layers (whose FP32 volumes are shrunk to one element)
       // can report their real parameter count.
       function CountWeights(): int64; virtual;
+      // Bytes of every TNNetVolume this layer owns apart from its neurons'
+      // weight rows and quantized tables: activations, error buffers, caches.
+      function NonWeightBytes(): int64; virtual;
       // Returns the number of neurons in the layer.
       function CountNeurons(): integer; {$IFDEF Release} inline; {$ENDIF}
       // Multiplies all weights in the layer by value V.
@@ -832,6 +872,13 @@ type
       // overrides" implementation block for auditability. Coded by Claude (AI).
       procedure AppendInputLayers(pList: TList); virtual;
 
+      // Computes with Owner's weights (neurons, and per class its quantized
+      // tables and resident device codes) at this layer's own input width, in
+      // any net; inference-only afterwards. Order: Owner's weight state final,
+      // this layer attached (SetPrevLayer), OpenCL enabled AFTER the link
+      // (EnableOpenCLInContextOf). False when Owner is unsuitable. Coded by Claude (AI).
+      function LinkWeightsFrom(Owner: TNNetLayer): boolean; virtual;
+
       // Low-memory inference predicates (Coded by Claude (AI)):
       // SupportsLowMemory is True only for layer classes that implement a
       // per-neuron CPU forward path (default False = safe). WillOpenCL
@@ -869,6 +916,12 @@ type
       property ForwardGPUCnt: integer read FForwardGPUCnt write FForwardGPUCnt;
       property ForwardCPUCnt: integer read FForwardCPUCnt write FForwardCPUCnt;
       property LinkedNeurons: boolean read FLinkedNeurons;
+      // The layer whose weights this one borrows (nil: none, or the owner is
+      // already gone).
+      property WeightOwner: TNNetLayer read FWeightOwner;
+      // Weight elements this layer allocated for rows of its own (test hook
+      // for the borrowing build: 0 on every linked layer).
+      property WeightElementsSized: int64 read FWeightElementsSized;
       {$IFDEF OpenCL}
       property HasOpenCL: boolean read FHasOpenCL;
       property ShouldOpenCL:boolean read FShouldOpenCL;
@@ -926,6 +979,9 @@ type
       // Rows written since BeginInt4QuantImport; EndInt4QuantImport checks it
       // against FNeurons.Count before it commits the conversion.
       FQuantInt4ImportedRows: integer;
+      // True while FQuantTable and FQuantTableInt4 are FWeightOwner's objects
+      // (LinkWeightsFrom): never freed, requantized or uploaded here.
+      FLinkedWeightTables: boolean;
       // Int8 copy of the forward input (Int8InputSource), nil until
       // EnableInt8Input sizes it: most layers never run an int8 input.
       FInputCopyInt8: TNNetVolumeQuant8;
@@ -944,12 +1000,26 @@ type
       // Commits the int4 weight state once FQuantTableInt4 holds every row:
       // int8 table and FP32 rows dropped, caches shrunk, int8 input armed.
       procedure FinishInt4WeightConversion(); virtual;
+      // Arms the int4 planes of the int8 input copy after the layer went int4
+      // (own conversion or link); only the convolution has such planes.
+      procedure ArmInt4InputPlanes(); virtual;
+      procedure DetachFromWeightOwner(); override;
+      {$IFDEF OpenCL}
+      // Arms FDotCL from the owner's resident codes (retained, not copied);
+      // False when the owner is unarmed or in another context.
+      function BorrowOwnerOpenCLCodes(VBs: TNNetVolume): boolean;
+      {$ENDIF}
       procedure AfterWeightUpdate(); override;
       procedure BuildBiasOutput(); {$IFDEF Release} inline; {$ENDIF}
     public
       constructor Create(); override;
       destructor Destroy(); override;
       procedure RefreshNeuronWeightList();
+      // Neurons plus, when Owner is int8/int4, its tables by reference (this
+      // layer's own rows and tables are freed); a later EnableOpenCL then
+      // retains Owner's resident codes. Needs SetPrevLayer and an owner row
+      // width equal to this layer's FVectorSize. Coded by Claude (AI).
+      function LinkWeightsFrom(Owner: TNNetLayer): boolean; override;
       // Converts the FP32 weights to per-output-channel symmetric int8
       // (scale = max|row|/127, round-to-nearest) and frees the FP32 weight
       // storage. INFERENCE-ONLY afterwards: Backpropagate raises. No-op on
@@ -1006,6 +1076,7 @@ type
       // Bytes held by the int8 container (codes + scales).
       // Coded by Claude (AI).
       function Int8QuantizedSizeBytes(): int64;
+      function NonWeightBytes(): int64; override;
       // Copies the int8 weight-only storage out for direct re-export (e.g.
       // the GGUF writer's Q8_0-from-int8 path) without dequantizing: pCodes
       // receives NumRows*VS row-major symmetric codes, pScales the NumRows
@@ -1054,6 +1125,10 @@ type
       procedure PrepareInt4DotCL(VBs: TNNetVolume);
       // True when this layer runs its int8 forward with the FP16 B operand.
       property FP16Active: boolean read FFP16Active;
+      // Test hooks: the resident weight codes FDotCL holds (nil when unarmed)
+      // and whether they are a retained reference to the owner's buffer.
+      function OpenCLCodesBuffer(): cl_mem;
+      function OpenCLCodesBorrowed(): boolean;
       {$ENDIF}
   end;
 
@@ -2159,6 +2234,10 @@ type
   public
     constructor Create(NN: TNNet; const pKernelName: string);
     destructor Destroy(); override;
+    // A fresh READ_WRITE buffer of Bytes in this helper's context, owned by the
+    // caller; and a blocking upload of V into an existing buffer.
+    function NewOpenCLBuffer(Bytes: csize_t): cl_mem;
+    procedure UploadToOpenCLBuffer(Buf: cl_mem; V: TNNetVolume);
   end;
 
   // OpenCL device forward for the GLU-family gated feed-forward activations
@@ -4226,6 +4305,7 @@ type
     function ComputeTiled(): boolean;
     procedure SetBlockCausalSeg(pValue: boolean);
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    function NonWeightBytes(): int64; override;
   protected
     // Shape contract, overridable by the fused multi-head subclass
     // (TNNetFusedSDPA): expected packed input depth, output depth, and the
@@ -4450,28 +4530,39 @@ type
   end;
 
 {$IFDEF OpenCL}
+const
+  // Lanes per work-group of every TNNetFusedSDPACL launch. A power of two (the
+  // tree reductions halve it) within every device's max work-group size.
+  csFusedSDPALocalSize = 256;
+  // Local memory left unrequested per work-group: NVIDIA keeps about 1 KB per
+  // work-group for the driver and rejects (CL_OUT_OF_RESOURCES) a launch taking it.
+  csFusedSDPALocalMemReserveBytes = 1024;
+
+type
   /// OpenCL forward helper for the cached decode step of the fused multi-head
-  // attention (TNNetFusedSDPA). Binds TWO entry points, cai_sdpa_append_kv and
-  // cai_sdpa_decode, against the SAME shared program and therefore the same
-  // command queue: the queue is in-order, so enqueueing the append before the
-  // decode is the whole synchronization story and no host wait sits between
-  // them. Two cl_kernel handles rather than one launched twice, because
+  // attention (TNNetFusedSDPA). Binds FIVE entry points against the SAME shared
+  // program and therefore one in-order command queue: the FP32 and int8
+  // appends, the FP32 and int8 split-row attention (pass 1, one work-group per
+  // (KV head, token row, chunk of cache rows)) and the merge (pass 2, one
+  // work-group per (query head, token row), both formats). Enqueue order on the
+  // in-order queue is the whole synchronization story; no host wait sits
+  // between the launches. One cl_kernel handle per entry point, because
   // clSetKernelArg on a kernel with a launch still in flight is undefined.
   // The KV cache is resident and appended to in place, so a decode session
-  // steps without moving the cache. Forward-only; the cache is FP32 or int8,
-  // one entry-point pair each, and only one format is resident at a time.
-  // Coded by Claude (AI).
+  // steps without moving the cache. A step carries X.SizeX token rows (one
+  // decode token or a prefill window). Forward-only; only one cache format is
+  // resident at a time. Coded by Claude (AI).
   TNNetFusedSDPACL = class(TNNetKernelCL)
   private
-    // Further entry points on FKernel's program and queue: the FP32 append and
-    // the int8 append/decode pair. Owned here: clReleaseKernel in the destructor.
-    FAppendKernel, FAppendInt8Kernel, FDecodeInt8Kernel: cl_kernel;
+    // Further entry points on FKernel's program and queue (FKernel itself is
+    // the FP32 pass 1). Owned here: clReleaseKernel in the destructor.
+    FAppendKernel, FAppendInt8Kernel, FSplitInt8Kernel, FMergeKernel: cl_kernel;
     // Persistent device buffers (grow-only), reused every forward. FBufK/FBufV
     // are the resident cache, sized once at MaxContext and advanced in place;
-    // FBufScores is the per-head score band, written and read inside one
-    // launch and never moved to RAM.
-    FBufX, FBufK, FBufV, FBufScores, FBufY: cl_mem;
-    FCapX, FCapK, FCapV, FCapScores, FCapY: csize_t;
+    // FBufPartials holds the per-(query head, token row, chunk) partial softmax
+    // states pass 1 writes and pass 2 reads, never moved to RAM.
+    FBufX, FBufK, FBufV, FBufPartials, FBufY: cl_mem;
+    FCapX, FCapK, FCapV, FCapPartials, FCapY: csize_t;
     // The int8 cache, code plane and scale plane apart, laid out exactly as
     // FKCacheQ/FVCacheQ are in RAM. Only one format is ever resident: the layer
     // may not switch formats with a non-empty cache.
@@ -4481,12 +4572,39 @@ type
     // FBufY can name the queue that produced it. Nil before the first forward,
     // which is what tells a consumer there is nothing to bind yet.
     FOutputKernel: TNeuralKernel;
+    // Test-only overrides of the split sizing, 0 = automatic: the chunk count,
+    // the rows per chunk, and the local-memory budget in bytes.
+    FForcedSplits, FForcedChunkRows, FForcedLocalMemBytes: integer;
+    // The pass-1 geometry of the last forward, for tests and profiles.
+    FLastSplits, FLastChunkRows: integer;
+    FLastScratchBytes: csize_t;
+    // CL_KERNEL_LOCAL_MEM_SIZE of the FP32 and the int8 pass-1 kernel, queried
+    // once at Create: the local memory the kernel takes beside the scratch.
+    FSplitStaticLocalBytes, FSplitInt8StaticLocalBytes: integer;
     // Size the four int8 cache buffers for the whole MaxContext allocation.
     // Grow-only, so a decode session sizes them once.
     procedure EnsureCacheBuffersInt8(KVHeads, CacheMax, Dk: integer);
-    // The score band and the result, shared by both cache formats.
-    procedure PrepareResultBuffers(Y: TNNetVolume; QHeads, CacheMax: integer;
-      out bufScores, bufY: cl_mem);
+    // Scratch floats one pass-1 work-group of the named cache format may ask
+    // for: the device figure (or the forced one) less the kernel's own local
+    // memory and csFusedSDPALocalMemReserveBytes.
+    function LocalMemFloats(Int8KV: boolean): integer;
+    // Chunk count and rows per chunk of pass 1 for a step whose live cache rows
+    // span SpanRows, sized to fill the device within the local-memory budget.
+    procedure ChooseSplit(KVHeads, TokenCnt, GroupSize, Dk, SpanRows: integer;
+      Int8KV: boolean; out Splits, ChunkRows: integer);
+    // The partial-state buffer and the result, shared by both cache formats.
+    procedure PrepareResultBuffers(Y: TNNetVolume; QHeads, TokenCnt, Splits,
+      Dk: integer; out bufPartials, bufY: cl_mem);
+    // The pass-1 arguments both cache formats share (indices 0..14): the chunk
+    // geometry, the masking constants, the score constants and the input.
+    procedure SetSplitCommonArgs(kSplit: cl_kernel; KVHeads, TokenCnt, Splits,
+      ChunkRows, ChunkBase, GroupSize, Dk, CacheMax, CacheSlot, Window,
+      XStride: integer; InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
+      bufX: cl_mem);
+    // Pass 2 on FKernel's queue: merges the chunks of every (query head, token
+    // row) into Y.
+    procedure RunMerge(bufPartials, bufY: cl_mem; QHeads, TokenCnt, Splits, Dk,
+      YStride: integer);
     // Name the queue that produced Y, and read Y back unless the caller keeps it.
     procedure FinishForward(bufY: cl_mem; Y: TNNetVolume;
       pKeepResultOnOpenCL: boolean);
@@ -4497,9 +4615,15 @@ type
     // per forward: EnsureOutputBuffer replaces the handle when Y grows.
     function ResultBuffer(): cl_mem;
     function OutputKernel(): TNeuralKernel;
-    // The kernel both entry points run on, for a source layer that has to wait
-    // on the right queue before its buffer is read.
+    // The kernel every entry point runs on, for a source layer that has to
+    // wait on the right queue before its buffer is read.
     function ForwardKernel(): TNeuralKernel;
+    // True when the query tile (GroupSize*Dk floats) plus one score row fits
+    // the local-memory budget; otherwise the layer must keep the host path.
+    function QueryTileFits(GroupSize, Dk: integer; Int8KV: boolean): boolean;
+    // The local memory the pass-1 kernel of the named cache format declares
+    // itself, in bytes, as CL_KERNEL_LOCAL_MEM_SIZE reported it at Create.
+    function StaticLocalMemBytes(Int8KV: boolean): integer;
     // Size the resident cache for K and V (whole MaxContext allocation) and
     // move its LIVE PREFIX - CacheLen rows of each of the KVHeads head-major
     // planes - in the named direction. Call on a path transition, not per token.
@@ -4513,29 +4637,39 @@ type
       KVHeads, CacheMax, CacheLen, Dk: integer);
     procedure DownloadCacheInt8(K, V: TNNetVolumeQuant8;
       KVHeads, CacheMax, CacheLen, Dk: integer);
-    // One cached decode step: append the token's KV rows at slot CacheSlot,
-    // then attend over the live cache [.. CacheSlot] and write Y. X is the
-    // single packed [Q|K|V] token row, K and V size the resident cache.
-    // CacheLen is the live length AFTER the append. The layer supplies the
-    // packed widths QW/KW and the score constants so the input layout and the
-    // masking rules are stated in one place only.
+    // One cached decode step of X.SizeX token rows: append their KV rows at
+    // the cache slots CacheSlot.., then attend and write Y. X is the packed
+    // [Q|K|V] input, one row per token, and K and V size the resident cache.
+    // Token row t attends the cache up to and including its OWN slot
+    // CacheSlot+t, so a width-K window agrees with K single-token steps. The
+    // layer supplies the packed widths QW/KW and the score constants so the
+    // input layout and the masking rules are stated in one place only.
     // pExternalSrc BORROWS an already-resident input in place of uploading X,
     // which is then unread; the borrowed buffer is never released here.
     // pKeepResultOnOpenCL leaves the result in ResultBuffer for the next layer
     // instead of reading it back into Y.
     procedure Compute(X, Y, K, V: TNNetVolume;
-      QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheLen, CacheSlot,
+      QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheSlot,
       QW, KW, Window: integer;
       InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
       pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
-    // The same decode step over the int8 cache: the append quantizes the token's
-    // KV rows into K and V rather than copying them, and the attention reads the
-    // codes with the row scale folded in. Same arguments otherwise.
+    // The same decode step over the int8 cache: the append quantizes the token
+    // rows' KV into K and V rather than copying them, and the attention reads
+    // the codes with the row scale folded in. Same arguments otherwise.
     procedure ComputeInt8(X, Y: TNNetVolume; K, V: TNNetVolumeQuant8;
-      QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheLen, CacheSlot,
+      QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheSlot,
       QW, KW, Window: integer;
       InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
       pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+    // Test-only split-sizing overrides (0 = automatic) and the geometry of
+    // the last forward's pass 1.
+    property ForcedSplits: integer read FForcedSplits write FForcedSplits;
+    property ForcedChunkRows: integer read FForcedChunkRows write FForcedChunkRows;
+    property ForcedLocalMemBytes: integer read FForcedLocalMemBytes
+      write FForcedLocalMemBytes;
+    property LastSplits: integer read FLastSplits;
+    property LastChunkRows: integer read FLastChunkRows;
+    property LastScratchBytes: csize_t read FLastScratchBytes;
   end;
 {$ENDIF}
 
@@ -4588,8 +4722,8 @@ type
     FCacheBaseLen: integer;     // cache length BEFORE this forward's appends
     FChunkPrecomputed: boolean; // prep already produced FOutput (rare; see below)
     {$IFDEF OpenCL}
-    // Cached-decode forward in OpenCL memory (cai_sdpa_append_kv +
-    // cai_sdpa_decode), with the FP32 KV cache resident and appended in place.
+    // Cached-decode forward in OpenCL memory (append, split-row attention,
+    // merge), with the KV cache resident and appended in place.
     FFusedSDPACL: TNNetFusedSDPACL;
     // True while the live KV cache sits in FFusedSDPACL's buffers rather than
     // in FKCache/FVCache. Every host reader or mutator goes through
@@ -4616,8 +4750,9 @@ type
     // Serial cached forward (append + score); handles the eviction paths.
     procedure ComputeIncrementalFused();
     {$IFDEF OpenCL}
-    // Single-token cached forward in OpenCL memory: cai_sdpa_append_kv then
-    // cai_sdpa_decode, one launch each, on the helper's one in-order queue.
+    // Cached forward of the input's token rows in OpenCL memory: the append,
+    // the split-row attention and the merge, one launch each, on the helper's
+    // one in-order queue.
     procedure ComputeOpenCL();
     // Move the KV cache between FKCache/FVCache and the helper's resident
     // buffers. Both are no-ops when the cache is already where it is wanted.
@@ -4654,6 +4789,10 @@ type
     function WillOpenCL(): boolean; override;
     function OpenCLOutputBuffer(): cl_mem; override;
     function OpenCLOutputKernel(): TNeuralKernel; override;
+    // True while the live KV cache sits in FFusedSDPACL's buffers.
+    property CacheOnOpenCL: boolean read FCacheOnOpenCL;
+    // The decode helper, nil until EnableOpenCL; tests set its split overrides.
+    property FusedSDPACL: TNNetFusedSDPACL read FFusedSDPACL;
     {$ENDIF}
     property QHeads: integer read FQHeads;
     property KVHeads: integer read FKVHeads;
@@ -5116,6 +5255,10 @@ type
     // Reads the live history buffer back into Hist (blocking). Nothing to read
     // before the first UploadHistory, which the caller tracks.
     procedure DownloadHistory(Hist: TNNetVolume);
+    // Copies between the live history buffer and Slot, both in OpenCL memory,
+    // on the decode queue. CopyHistoryFrom sizes the two buffers for Hist.
+    procedure CopyHistoryTo(Slot: cl_mem; Bytes: csize_t);
+    procedure CopyHistoryFrom(Slot: cl_mem; Hist: TNNetVolume);
     // Incremental-decode forward: same arguments as Compute (Off is always
     // K-1, the causal offset), plus the resident history the launch reads and
     // advances. UploadHistory must have run for this session.
@@ -5159,6 +5302,10 @@ type
     // Reads the state bank back into S (blocking). Nothing to read before the
     // first UploadState, which the caller tracks.
     procedure DownloadState(S: TNNetVolume);
+    // Copies between the state bank and Slot, both in OpenCL memory, on this
+    // helper's queue. CopyStateFrom sizes the bank for S.
+    procedure CopyStateTo(Slot: cl_mem; Bytes: csize_t);
+    procedure CopyStateFrom(Slot: cl_mem; S: TNNetVolume);
     // ALog / DtBias / NormW are Neurons[0..2]'s weights; X is the packed
     // [q|k|v|z|b|a] input and Y receives the gated read-out. S sizes the
     // resident state bank. The six channel offsets come from the layer so the
@@ -5282,9 +5429,19 @@ type
     procedure Gather(W: TNNetVolume; QuantTable: TNNetVolumeQuant8;
       const TokenRows: array of integer; Y: TNNetVolume;
       NumTokens, EmbeddingSize, VocabSize: integer);
+    // Uploads the table now when it is not resident yet (Gather does it
+    // lazily), so a borrower can retain it before its first forward.
+    procedure EnsureTableResident(W: TNNetVolume; QuantTable: TNNetVolumeQuant8;
+      VocabSize, EmbeddingSize: integer);
+    // Retains Owner's resident table (same entry point, same context) in place
+    // of uploading one; False when it cannot. Owner's blocking upload is
+    // complete before this returns, whatever queue Gather rides.
+    function BorrowTableFrom(Owner: TNNetEmbeddingCL): boolean;
     // Which entry point this helper bound: the owning layer rebuilds it when its
     // own quantization state no longer matches.
     property Int8: boolean read FInt8;
+    // The resident vocab table (nil until uploaded or borrowed): test hook.
+    property TableBuffer: cl_mem read FBufW;
     // FBufY and the queue that owns its contents - what a layer running Gather
     // answers OpenCLOutputBuffer/OpenCLOutputKernel with.
     function OutputBuffer(): cl_mem;
@@ -7888,16 +8045,36 @@ type
     // table's memory AND per-token bandwidth to ~1/4. Backpropagate raises.
     FQuantInt8: boolean;
     FQuantTable: TNNetVolumeQuant8;
+    // True while FQuantTable is FWeightOwner's object (LinkWeightsFrom).
+    FLinkedQuantTable: boolean;
     {$IFDEF OpenCL}
     FTokenRows: array of integer;
     FEmbeddingCL: TNNetEmbeddingCL;
     procedure ComputeOpenCL();
     // Creates FEmbeddingCL, or rebuilds it when a quantize/dequantize flip left
     // it bound to the wrong neural.cl entry point. No-op without FHasOpenCL.
+    // A borrower then retains its owner's resident table.
     procedure ArmEmbeddingCL();
+    // Points FEmbeddingCL at the owner's resident table; the owner uploads it
+    // now if it has not yet. No-op unless linked and both are OpenCL-armed.
+    procedure BorrowOwnerOpenCLTable();
     {$ENDIF}
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    function NonWeightBytes(): int64; override;
+  protected
+    procedure DetachFromWeightOwner(); override;
   public
+    // Neurons plus, when Owner is int8, its vocab table by reference; the
+    // gather then reads the owner's codes, and a later EnableOpenCL retains
+    // the owner's resident table. Coded by Claude (AI).
+    function LinkWeightsFrom(Owner: TNNetLayer): boolean; override;
+    {$IFDEF OpenCL}
+    // Uploads the vocab table now (the device gather otherwise does it lazily
+    // on the first forward); no-op unless OpenCL-armed.
+    procedure EnsureOpenCLTableResident();
+    // Test hook: the resident vocab table (nil until uploaded or borrowed).
+    function OpenCLTableBuffer(): cl_mem;
+    {$ENDIF}
     // pTrainable=false skips the training-only Delta/BackInertia volumes
     // (2x the vocab table) that the default-trainable sizing allocates in
     // the constructor - a later SetTrainable(true) restores them (see
@@ -7908,10 +8085,14 @@ type
     // vocab table (VocabSize x EmbeddingSize floats, the single largest
     // tensor of an LLM checkpoint) is never allocated at all; the importer
     // then fills the codes via ImportInt8QuantRow or the
-    // EnsureWritableImportWeights round-trip. Coded by Claude (AI).
+    // EnsureWritableImportWeights round-trip. pWeightOwner (a same-shape
+    // TNNetEmbedding of an already-loaded net) allocates no table at all:
+    // the layer links to it here (LinkWeightsFrom) - the table is sized in
+    // this constructor, before any net can see the layer. Coded by Claude (AI).
     constructor Create(pVocabSize, pEmbeddingSize: integer;
       EncodeZero: integer = 0; ScaleEmbedding: TNeuralFloat = 0.02;
-      pTrainable: boolean = true; pQuantizeInt8: boolean = false); reintroduce;
+      pTrainable: boolean = true; pQuantizeInt8: boolean = false;
+      pWeightOwner: TNNetLayer = nil); reintroduce;
     destructor Destroy; override;
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
@@ -8305,6 +8486,7 @@ type
       destructor Destroy(); override;
       function SetTrainable(pTrainable: boolean = False; pLowMemory: boolean = True): TNNetLayer; override;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      function NonWeightBytes(): int64; override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -8346,6 +8528,7 @@ type
       function ShouldBindPrevOutputOnOpenCL(): boolean;
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      function NonWeightBytes(): int64; override;
       // Releases FNormalized / FInvRMS / FGainGradScratch: they are read only
       // by Backpropagate, so an inference-only layer neither fills nor needs
       // them. ComputeRange keys the x_hat snapshot on FNormalized's size.
@@ -9424,6 +9607,21 @@ type
       // Snapshot / fork: copy the persisted state and step count out / back.
       procedure CaptureState(Dst: TNNetVolume; out Steps: integer); virtual; abstract;
       procedure RestoreState(Src: TNNetVolume; Steps: integer); virtual; abstract;
+      // Bytes of the persisted decode state, so a checkpoint store can size one
+      // slot per layer before any decode step runs. Valid after Begin.
+      function StateBytes(): int64; virtual; abstract;
+      // True while the live decode state sits in OpenCL memory rather than in
+      // the layer's RAM volume (false for a layer without an OpenCL path).
+      function StateOnOpenCL(): boolean; virtual;
+      {$IFDEF OpenCL}
+      // A fresh StateBytes-sized buffer in this layer's OpenCL context, owned
+      // by the caller (clReleaseMemObject); nil when the layer has no OpenCL path.
+      function NewStateSlotOnOpenCL(): cl_mem; virtual;
+      // Copy the live state into / out of Slot without leaving OpenCL memory
+      // (a RAM-resident state is uploaded, never downloaded); Steps travel too.
+      procedure CaptureStateToOpenCL(Slot: cl_mem; out Steps: integer); virtual;
+      procedure RestoreStateFromOpenCL(Slot: cl_mem; Steps: integer); virtual;
+      {$ENDIF}
       property DecodeEnabled: boolean read FDecodeEnabled;
       property DecodeSteps: integer read FDecodeSteps;
   end;
@@ -9524,6 +9722,7 @@ type
       // table dirty for anything that does go through the weight-update path.
       procedure PrepareTapTables();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      function NonWeightBytes(): int64; override;
       procedure ComputeCPU(); {$IFDEF Release} inline; {$ENDIF}
       procedure ComputeDecodeCPU();
       // Ranged kernels shared by the serial forwards (full-width call) and the
@@ -9571,6 +9770,13 @@ type
       procedure ResetState(); override;
       procedure CaptureState(Dst: TNNetVolume; out Steps: integer); override;
       procedure RestoreState(Src: TNNetVolume; Steps: integer); override;
+      function StateBytes(): int64; override;
+      function StateOnOpenCL(): boolean; override;
+      {$IFDEF OpenCL}
+      function NewStateSlotOnOpenCL(): cl_mem; override;
+      procedure CaptureStateToOpenCL(Slot: cl_mem; out Steps: integer); override;
+      procedure RestoreStateFromOpenCL(Slot: cl_mem; Steps: integer); override;
+      {$ENDIF}
       // Frozen chunk-eligibility (see TNNetLayerThreading.ChunkEligible): CPU
       // forward only (not WillOpenCL - matching TNNetConvolution's conservative
       // rule, even though decode steps never dispatch to the device). The
@@ -10659,6 +10865,10 @@ type
       FDecSOnOpenCL: boolean;
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      function NonWeightBytes(): int64; override;
+      // Sizes the per-timestep caches for the current input width and
+      // trainability (SetPrevLayer and SetTrainable both call it).
+      procedure SizeSequenceCaches();
       procedure FreeBackpropScratch();
       // Ranged forward kernel shared by the serial Compute() (full-width call)
       // and the threaded chunk path: K-HEADS [FirstKh..LastKh] only, i.e.
@@ -10708,6 +10918,13 @@ type
       procedure ResetState(); override;
       procedure CaptureState(Dst: TNNetVolume; out Steps: integer); override;
       procedure RestoreState(Src: TNNetVolume; Steps: integer); override;
+      function StateBytes(): int64; override;
+      function StateOnOpenCL(): boolean; override;
+      {$IFDEF OpenCL}
+      function NewStateSlotOnOpenCL(): cl_mem; override;
+      procedure CaptureStateToOpenCL(Slot: cl_mem; out Steps: integer); override;
+      procedure RestoreStateFromOpenCL(Slot: cl_mem; Steps: integer); override;
+      {$ENDIF}
       // Frozen chunk-eligibility (see TNNetLayerThreading.ChunkEligible): the
       // k-head axis has independent work in BOTH modes (the per-head t-scan is
       // the sequential part; heads never interact), and this layer has no
@@ -10875,6 +11092,7 @@ type
       procedure ResetState(); override;
       procedure CaptureState(Dst: TNNetVolume; out Steps: integer); override;
       procedure RestoreState(Src: TNNetVolume; Steps: integer); override;
+      function StateBytes(): int64; override;
   end;
 
   /// TNNetCrossWKV: a TWO-SOURCE key/value variant of the RWKV-4 WKV
@@ -11718,6 +11936,7 @@ type
       procedure ResetState(); override;
       procedure CaptureState(Dst: TNNetVolume; out Steps: integer); override;
       procedure RestoreState(Src: TNNetVolume; Steps: integer); override;
+      function StateBytes(): int64; override;
   end;
 
   /// TNNetMamba2: the Mamba-2 / State-Space Duality (SSD) sequence mixer
@@ -12125,11 +12344,8 @@ type
   // This layer does a channel normalization without zero centering and trainable parameters.
   TNNetChannelNorm = class(TNNetChannelShiftBase)
     private
-      FAuxOutput: TNNetVolume;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
-      constructor Create(); override;
-      destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
   end;
@@ -12138,11 +12354,9 @@ type
   // trainable parameters.
   TNNetChannelStdNormalization = class(TNNetChannelZeroCenter)
     private
-      FAuxOutput: TNNetVolume;
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     public
       constructor Create(); override;
-      destructor Destroy(); override;
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure InitDefault(); override;
@@ -14599,6 +14813,7 @@ type
       {$ENDIF}
       procedure PrepareInputForConvolutionFast();
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      function NonWeightBytes(): int64; override;
       function ShouldUseInterleavedDotProduct:boolean; {$IFDEF Release} inline; {$ENDIF}
     public
       constructor Create(pNumFeatures, pFeatureSize, pInputPadding, pStride: integer; pSuppressBias: integer = 0); overload; virtual;
@@ -14614,6 +14829,7 @@ type
       // per-forward int8 routines never allocate. Coded by Claude (AI).
       procedure EnableInt8Input(); override;
       procedure DisableInt8Input(); override;
+      procedure ArmInt4InputPlanes(); override;
       // Byte im2col: FInputCopyInt8 -> FInputPreparedInt8 in exactly the layout
       // of PrepareInputForConvolutionFast. Needs EnableInt8Input. Coded by Claude (AI).
       procedure PrepareInputForConvolutionInt8();
@@ -14856,7 +15072,6 @@ type
       FLinkedLayer: TNNetConvolution;
     public
       constructor Create(LinkedLayer: TNNetLayer); overload; virtual;
-      destructor Destroy; override;
       // Shared-weight convolutions depend on FConcatedWeights (snapshotted or
       // rebuilt per forward), so they cannot drop it for low-memory mode.
       function SupportsLowMemory(): boolean; override;
@@ -17592,8 +17807,10 @@ type
       destructor Destroy(); override;
       // The classic serial layer loop (layers computed in index order) -
       // ComputeParallel's fallback. Virtual abstract: implemented by
-      // TNNet, where the training semantics live. Coded by Claude (AI).
-      procedure ComputeSerial(FromLayerIdx: integer = 0); virtual; abstract;
+      // TNNet, where the training semantics live. EndLayerIdx (inclusive)
+      // stops the pass early; -1 = the last layer. Coded by Claude (AI).
+      procedure ComputeSerial(FromLayerIdx: integer = 0;
+        EndLayerIdx: integer = -1); virtual; abstract;
       function CountLayers(): integer;
       function GetLastLayerIdx(): integer; {$IFDEF Release} inline; {$ENDIF}
       // Resets every layer's inference-scheduler state (FComputeState) to
@@ -17611,8 +17828,11 @@ type
       // straight-line nets, single-core hosts, FDetectAnomaly (worker
       // exceptions would not carry the anomaly report) and OpenCL-enabled
       // nets (a single device command queue serializes anyway).
+      // EndLayerIdx (inclusive) stops the pass early: layers past it are
+      // neither scheduled nor waited on; -1 = the last layer.
       // Coded by Claude (AI).
-      procedure ComputeParallel(FromLayerIdx: integer = 0);
+      procedure ComputeParallel(FromLayerIdx: integer = 0;
+        EndLayerIdx: integer = -1);
       // One-line diagnostic of how parallel the inference scheduler actually
       // ran since the last ResetSchedulerStats:
       //   width W       - static max independent layers the topology allows
@@ -17718,6 +17938,13 @@ type
       // existing per-block sweeps flip every LATER layer onto the quantized
       // construction path with no importer changes. Coded by Claude (AI).
       FBuildQuantInt8: boolean;
+      // BORROWING BUILD. While set, every layer attached to this net sizes no
+      // weight rows (TNNetLayer.DeferWeightSizingToBuildLink) and, once its
+      // index is final, links to FBuildWeightOwner's layer at the same index
+      // (TNNetLayer.LinkBuildWeightOwner, which raises on a graph mismatch).
+      // The builder sets it before the first AddLayer and clears it after the
+      // graph; the owner's weight state must be final. Coded by Claude (AI).
+      FBuildWeightOwner: TNNet;
       {$IFDEF OpenCL}
       // FP16 ACTIVATION MODE. When true, an int8 convolution runs its device
       // forward with the half B operand (cai_dot_product_int8_h and friends)
@@ -17730,6 +17957,11 @@ type
       // Coded by Claude (AI).
       FOpenCLFP16: boolean;
       FDotProductKernel: TNeuralKernel;
+      // Retained references to the context and program FDotProductKernel
+      // borrows under EnableOpenCLInContextOf; nil when this net compiled its
+      // own. Released after FDotProductKernel goes.
+      FBorrowedOpenCLContext: cl_context;
+      FBorrowedOpenCLProgram: cl_program;
       // Net-wide cache of borrowed-program helper kernels, one TNeuralKernel per
       // distinct neural.cl entry point (cai_token_norm, cai_group_norm, ...),
       // SHARED by every layer of that type instead of one handle per layer
@@ -19469,14 +19701,18 @@ type
       // at FromLayerIdx.
       // Dispatches to ComputeSerial when Parallel is false (default), or to
       // ComputeParallel (layer-graph parallel scheduler) when Parallel
-      // is true. Coded by Claude (AI).
-      procedure Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0; Parallel: boolean = false); overload;
+      // is true. EndLayerIdx (inclusive) stops the forward early (-1 = the
+      // last layer): layers past it do not run and their Output is stale;
+      // under OpenCL nothing is downloaded, the queue is only drained.
+      // Coded by Claude (AI).
+      procedure Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0; Parallel: boolean = false; EndLayerIdx: integer = -1); overload;
       // The classic serial layer loop (layers computed in index order).
       // Always used while FIsTrainable is True - backpropagation requires
       // the strict ordering - and as ComputeParallel's fallback
       // (declared virtual abstract in TNNetExecutionPlanner).
       // Coded by Claude (AI).
-      procedure ComputeSerial(FromLayerIdx: integer = 0); override;
+      procedure ComputeSerial(FromLayerIdx: integer = 0;
+        EndLayerIdx: integer = -1); override;
       // Computes the forward pass with pInput.
       procedure Compute(pInput: array of TNNetVolume; Parallel: boolean = false); overload;
       // Computes the forward pass with pInput.
@@ -19546,6 +19782,12 @@ type
       // QuantizeWeightsInt8 sweep sets it automatically otherwise.
       property BuildQuantInt8: boolean
         read FBuildQuantInt8 write FBuildQuantInt8; // Coded by Claude (AI).
+      // The net whose weights every layer attached from now on borrows (see
+      // FBuildWeightOwner); nil = the layers size their own rows.
+      property BuildWeightOwner: TNNet
+        read FBuildWeightOwner write FBuildWeightOwner;
+      // Sum of every layer's WeightElementsSized: 0 for a net built borrowing.
+      function WeightElementsSized(): int64;
       // Q4_0-quantizes every layer that SupportsInt4Weights and returns how
       // many hold int4 weights afterwards. Coded by Claude (AI).
       function QuantizeWeightsInt4(): integer;
@@ -19553,6 +19795,10 @@ type
       // how many. Run it after the net is built and after QuantizeWeightsInt8 -
       // a layer still holding FP32 weights is skipped. Coded by Claude (AI).
       function EnableInt8Input(): integer;
+      // Links every weight-bearing layer to the same-index layer of Owner
+      // (TNNetLayer.LinkWeightsFrom; same architecture at another input width).
+      // Owner's weight state final, before EnableOpenCL; returns the count. Coded by Claude (AI).
+      function LinkWeightsFrom(Owner: TNNet): integer;
       // Returns every layer to the FP32 input path. Coded by Claude (AI).
       procedure DisableInt8Input();
       {$IFDEF OpenCL}
@@ -19670,6 +19916,14 @@ type
       {$IFDEF OpenCL}
       procedure DisableOpenCL();
       procedure EnableOpenCL(platform_id: cl_platform_id; device_id: cl_device_id; pHasSharedKernel:boolean = true);
+      // EnableOpenCL inside Owner's armed context/program (own command queue),
+      // so layers linked to Owner's retain its resident weights instead of
+      // uploading a copy. Owner first; either net may be freed first. Coded by Claude (AI).
+      procedure EnableOpenCLInContextOf(Owner: TNNet;
+        pHasSharedKernel: boolean = true);
+      // Drops the retained context/program of EnableOpenCLInContextOf (no-op
+      // otherwise); DisableOpenCL and Destroy call it after the root kernel.
+      procedure ReleaseBorrowedOpenCLContext();
       // Returns the one net-wide helper kernel bound to the given neural.cl entry
       // point, building it lazily against FDotProductKernel's already-compiled
       // program on first request and caching it. Layers' *CL helpers borrow this
@@ -19700,6 +19954,8 @@ type
       function CountNeurons(): integer;
       // Int64: billion-parameter checkpoints overflow a 32-bit total.
       function CountWeights(): int64;
+      // Sum of every layer's NonWeightBytes.
+      function NonWeightBytes(): int64;
       function SummaryString(): string;
       procedure PrintSummary();
       // Unified-diff-style architecture comparison.
@@ -21750,6 +22006,10 @@ type
 
       // custom layers support
       function ShouldIncDepartingBranchesCnt(pLayer: TNNetLayer):boolean; virtual;
+      // Adds pLayer to FLayers, assigns its index and, under a borrowing
+      // build (FBuildWeightOwner), links it to the owner's layer at that
+      // index. Every AddLayer route ends here. Coded by Claude (AI).
+      procedure RegisterLayer(pLayer: TNNetLayer);
 
       // Anomaly detection (port of torch.autograd.set_detect_anomaly).
       // When DetectAnomaly is True, Compute scans every layer's Output for
@@ -22381,6 +22641,20 @@ var
   {$ENDIF}
 
 implementation
+
+// nil-tolerant byte counts for NonWeightBytes.
+function VolumeBytes(V: TNNetVolume): int64;
+begin
+  if Assigned(V) then Result := int64(V.Size) * csNeuralFloatSize
+  else Result := 0;
+end;
+
+function Quant8Bytes(Q: TNNetVolumeQuant8): int64;
+begin
+  if Assigned(Q) then
+    Result := int64(Q.Size) * csShortIntSize + VolumeBytes(Q.ScaleData)
+  else Result := 0;
+end;
 
 // Quickselect order statistic, defined further below beside the pruning paths
 // that were its first callers; declared here so LayerSensitivityReport can use
@@ -32945,6 +33219,7 @@ begin
     FVCacheQ.ReSize(0, 0, 0);
   end;
   SetLength(FCacheScores, MaxContext);
+  FAttn.ReSize(1, 1, 1); // the cached path scores into FCacheScores
   FCacheMax := MaxContext;
   FCacheLen := 0;
   FCacheEnabled := true;
@@ -32961,6 +33236,10 @@ procedure TNNetScaledDotProductAttention.EndIncrementalDecode();
 begin
   ForceCacheOnRAM();
   FCacheEnabled := false;
+  // The full-sequence forward and Backpropagate read FAttn again.
+  if Assigned(FPrevLayer) then
+    FAttn.ReSize(FPrevLayer.FOutput.SizeX,
+      FPrevLayer.FOutput.SizeX * AttnHeadCount(), 1);
   FCacheLen := 0;
   FEvictSinks := 0;
   FEvictWindow := 0;
@@ -32977,22 +33256,16 @@ end;
 
 procedure TNNetScaledDotProductAttention.TruncateCache(NewLength: integer);
 begin
-  ForceCacheOnRAM();
   if not FCacheEnabled then
-  begin
-    FErrorProc('TNNetScaledDotProductAttention.TruncateCache requires the ' +
-      'cached path. Call BeginIncrementalDecode first.');
-    exit;
-  end;
+    raise Exception.Create('TNNetScaledDotProductAttention.TruncateCache' +
+      ' requires the cached path. Call BeginIncrementalDecode first.');
   if (NewLength < 0) or (NewLength > FCacheLen) then
-  begin
-    FErrorProc('TNNetScaledDotProductAttention.TruncateCache requires ' +
-      '0 <= NewLength <= CacheLength. Got NewLength=' + IntToStr(NewLength) +
-      ', CacheLength=' + IntToStr(FCacheLen));
-    exit;
-  end;
-  // One-field rewind: the preallocated K/V buffers keep their storage and the
-  // truncated slots are overwritten by the next append.
+    raise Exception.Create('TNNetScaledDotProductAttention.TruncateCache' +
+      ' requires 0 <= NewLength <= CacheLength. Got NewLength=' +
+      IntToStr(NewLength) + ', CacheLength=' + IntToStr(FCacheLen));
+  // One-field rewind: the preallocated K/V buffers keep their storage, the
+  // truncated slots are overwritten by the next append, and a cache resident
+  // in OpenCL memory stays there (the kernels take the slot per launch).
   FCacheLen := NewLength;
 end;
 
@@ -33470,8 +33743,11 @@ begin
   SetOutputErrorSize(FOutput);
   // Attention weights: rows = queries (i), cols = keys (j). Use X=key, Y=query;
   // with H > 1 attention maps (fused subclass), head h's map occupies the
-  // Y-row band [h*SeqLen .. (h+1)*SeqLen-1].
-  FAttn.ReSize(pPrevLayer.FOutput.SizeX,
+  // Y-row band [h*SeqLen .. (h+1)*SeqLen-1]. The KV-cached decode scores into
+  // FCacheScores instead, so a layer inside a decode session keeps FAttn
+  // collapsed (BeginIncrementalDecode) until EndIncrementalDecode.
+  if FCacheEnabled then FAttn.ReSize(1, 1, 1)
+  else FAttn.ReSize(pPrevLayer.FOutput.SizeX,
     pPrevLayer.FOutput.SizeX * AttnHeadCount(), 1);
   if Assigned(FSegLayer) then
   begin
@@ -33489,6 +33765,18 @@ begin
       FErrorProc('TNNetScaledDotProductAttention: segment masking is not ' +
         'supported on the KV-cache incremental-decode path.');
   end;
+end;
+
+function TNNetScaledDotProductAttention.NonWeightBytes(): int64;
+begin
+  Result := inherited NonWeightBytes() + VolumeBytes(FAttn) +
+    VolumeBytes(FKCache) + VolumeBytes(FVCache) +
+    Quant8Bytes(FKCacheQ) + Quant8Bytes(FVCacheQ) +
+    int64(Length(FCacheScores)) * csNeuralFloatSize;
+  {$IFDEF OpenCL}
+  Result := Result + VolumeBytes(FQRowBuf) + VolumeBytes(FKInterBuf) +
+    VolumeBytes(FVRowBuf);
+  {$ENDIF}
 end;
 
 function TNNetScaledDotProductAttention.InputDepthRequired(): integer;
@@ -34650,9 +34938,9 @@ end;
 function TNNetFusedSDPA.ChunkEligible(): boolean;
 begin
   Result := (FNN <> nil) and FNN.FIntraLayerThreading;
-  // One cai_sdpa_decode launch already runs every query head in its own
-  // work-group, so splitting the head axis across workers would only add a
-  // second producer for the same output.
+  // One cai_sdpa_decode_split launch already runs every KV head and chunk in
+  // its own work-group, so splitting the head axis across workers would only
+  // add a second producer for the same output.
   {$IFDEF OpenCL} if Result then Result := not WillOpenCL(); {$ENDIF}
 end;
 
@@ -34705,17 +34993,20 @@ begin
             and (FShouldOpenCL or FForceOpenCL
                  or ((not FIsTrainable) and PrevOutputOnOpenCL()));
   if not Result then exit;
-  // Scope: ONE committed token over the FP32 or the int8 cache, with only the
-  // causal and sliding-window masks live. Prefill, eviction, segment masking,
-  // prefix-LM, the bidirectional window and a full cache all keep the host
-  // path, which stays exactly as it was. The exact-class test mirrors the
-  // inherited one: a subclass with different score math would inherit this
-  // path and silently lose its extra term.
+  // Scope: a window of committed tokens - one decode token or a prefill
+  // window - over the FP32 or the int8 cache, with only the causal and
+  // sliding-window masks live. Eviction, segment masking, prefix-LM, the
+  // bidirectional window and a cache without room for the whole window keep
+  // the host path, which stays exactly as it was. The exact-class test mirrors
+  // the inherited one: a subclass with different score math would inherit
+  // this path and silently lose its extra term.
   Result := (not FIsTrainable) and (Self.ClassType = TNNetFusedSDPA)
-    and Assigned(FPrevLayer) and (FPrevLayer.FOutput.SizeX = 1)
+    and Assigned(FPrevLayer)
     and (FEvictSinks = 0)
     and (not Assigned(FSegLayer)) and (FPrefixLen = 0)
-    and (not FBidirectionalWindow) and (FCacheLen < FCacheMax);
+    and (not FBidirectionalWindow)
+    and (FCacheLen + FPrevLayer.FOutput.SizeX <= FCacheMax)
+    and FFusedSDPACL.QueryTileFits(FGroupSize, FDk, FKVQuantInt8);
 end;
 
 function TNNetFusedSDPA.OpenCLOutputBuffer(): cl_mem;
@@ -34755,13 +35046,16 @@ begin
   FCacheOnOpenCL := false;
 end;
 
-// One decode step with the KV cache in OpenCL memory: the append and the
-// attention are two launches on ONE in-order queue, so nothing crosses to the
-// host per token. The host keeps FCacheLen, which is the only cache state the
+// One decode step of the input's token rows with the KV cache in OpenCL
+// memory: the append, the split-row attention and the merge are three launches
+// on ONE in-order queue, so nothing crosses to the host per step. Row t of the step attends the cache
+// up to and including its own slot, so a window is exactly what the host path
+// computes. The host keeps FCacheLen, which is the only cache state the
 // kernels do not own.
 procedure TNNetFusedSDPA.ComputeOpenCL();
 var
   SourceBuffer: cl_mem;
+  TokenCnt: integer;
 begin
   if PrevOutputOnOpenCL() then
   begin
@@ -34775,6 +35069,7 @@ begin
   end;
   EnsureCacheOnOpenCL();
   FCacheBaseLen := FCacheLen;
+  TokenCnt := FPrevLayer.FOutput.SizeX;
   // The result stays in OpenCL memory for the next layer to bind. WillOpenCL is
   // inference-only, so no host reader is left behind: anything that wants
   // FOutput calls ForceOutputOnRAM, which MoveOutputToRAM answers from the two
@@ -34782,16 +35077,16 @@ begin
   if FKVQuantInt8 then
     FFusedSDPACL.ComputeInt8(FPrevLayer.FOutput, FOutput, FKCacheQ, FVCacheQ,
       FQHeads, FKVHeads, FGroupSize, FDk, FCacheMax,
-      {CacheLen=}FCacheLen + 1, {CacheSlot=}FCacheLen, FQW, FKW, FWindow,
+      {CacheSlot=}FCacheLen, FQW, FKW, FWindow,
       FInvSqrtDk, FScoreSoftCap, FInvScoreSoftCap,
       SourceBuffer, {pKeepResultOnOpenCL=}true)
   else
     FFusedSDPACL.Compute(FPrevLayer.FOutput, FOutput, FKCache, FVCache,
       FQHeads, FKVHeads, FGroupSize, FDk, FCacheMax,
-      {CacheLen=}FCacheLen + 1, {CacheSlot=}FCacheLen, FQW, FKW, FWindow,
+      {CacheSlot=}FCacheLen, FQW, FKW, FWindow,
       FInvSqrtDk, FScoreSoftCap, FInvScoreSoftCap,
       SourceBuffer, {pKeepResultOnOpenCL=}true);
-  Inc(FCacheLen);
+  Inc(FCacheLen, TokenCnt);
   FOutputOnOpenCL := true;
   FOutputOnRAM := false;
 end;
@@ -34831,6 +35126,7 @@ begin
     FVCacheQ.ReSize(0, 0, 0);
   end;
   SetLength(FCacheScores, pMaxContext * FQHeads);
+  FAttn.ReSize(1, 1, 1); // the cached path scores into FCacheScores
   FCacheMax := pMaxContext;
   FCacheLen := 0;
   FCacheEnabled := true;
@@ -34950,7 +35246,6 @@ begin
           Inc(posV, RowStride);
         end;
         // Softmax Jacobian.
-        SumDAttnAttn := 0;
         SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[AttnRow], SeqLen);
         for j := 0 to SeqLenM1 do
           FdScoreBuf[j] := FAttn.FData[AttnRow + j] *
@@ -37203,7 +37498,6 @@ begin
         Inc(posV, RowStride);
       end;
       // ---- Softmax Jacobian: dScore[j] = Attn[j]*(dAttn[j] - sum_k dAttn[k]*Attn[k]) ----
-      SumDAttnAttn := 0;
       SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[AttnRow], KVLen);
       for j := 0 to KVLenM1 do
         FdScoreBuf[j] := FAttn.FData[AttnRow + j] * (FdAttnBuf[j] - SumDAttnAttn);
@@ -37442,6 +37736,16 @@ begin
   FNN.UnregisterOpenCLOwned(Self);
   FNN.FreeKernelIfNotShared(FKernelName, FKernel);
   inherited Destroy();
+end;
+
+function TNNetKernelCL.NewOpenCLBuffer(Bytes: csize_t): cl_mem;
+begin
+  Result := FKernel.CreateBuffer(CL_MEM_READ_WRITE, Bytes);
+end;
+
+procedure TNNetKernelCL.UploadToOpenCLBuffer(Buf: cl_mem; V: TNNetVolume);
+begin
+  FKernel.WriteBuffer(Buf, V, CL_TRUE);
 end;
 
 procedure TNNetKernelCL.UploadInt8Table(var pCodeBuf: cl_mem;
@@ -38070,6 +38374,20 @@ begin
   FDecodeKernel.ReadBuffer(HistBuffer, Hist, CL_TRUE);
 end;
 
+procedure TNNetDepthwiseConv1DCL.CopyHistoryTo(Slot: cl_mem; Bytes: csize_t);
+begin
+  FDecodeKernel.CopyBuffer(LiveHistoryBuffer(), Slot, Bytes);
+  // The slot may be read next by another net's queue, so the copy completes here.
+  FDecodeKernel.Finish();
+end;
+
+procedure TNNetDepthwiseConv1DCL.CopyHistoryFrom(Slot: cl_mem; Hist: TNNetVolume);
+begin
+  FDecodeKernel.EnsureOutputBuffer(FBufHistA, FCapHistA, Hist);
+  FDecodeKernel.EnsureOutputBuffer(FBufHistB, FCapHistB, Hist);
+  FDecodeKernel.CopyBuffer(Slot, LiveHistoryBuffer(), Hist.GetMemSize());
+end;
+
 procedure TNNetDepthwiseConv1DCL.ComputeDecode(PackedW, Bias, X, Y: TNNetVolume;
   SeqLen, Channels, Ksize, SuppressBias: integer; NewW: boolean = true;
   pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
@@ -38198,6 +38516,19 @@ begin
   FKernel.ReadBuffer(FBufS, S, CL_TRUE);
 end;
 
+procedure TNNetGatedDeltaNetCL.CopyStateTo(Slot: cl_mem; Bytes: csize_t);
+begin
+  FKernel.CopyBuffer(FBufS, Slot, Bytes);
+  // The slot may be read next by another net's queue, so the copy completes here.
+  FKernel.Finish();
+end;
+
+procedure TNNetGatedDeltaNetCL.CopyStateFrom(Slot: cl_mem; S: TNNetVolume);
+begin
+  FKernel.EnsureOutputBuffer(FBufS, FCapS, S);
+  FKernel.CopyBuffer(Slot, FBufS, S.GetMemSize());
+end;
+
 procedure TNNetGatedDeltaNetCL.Compute(ALog, DtBias, NormW, X, Y, S: TNNetVolume;
   SeqLen, NumVHeads, HeadDimK, HeadDimV, Rep, InDepth: integer;
   QOff, KOff, VOff, ZOff, BOff, AOff: integer; ResetState: boolean;
@@ -38269,24 +38600,28 @@ end;
 
 constructor TNNetFusedSDPACL.Create(NN: TNNet);
 begin
-  inherited Create(NN, 'cai_sdpa_decode');
-  // Second entry point on the SAME TNeuralKernel, so both launches land on one
-  // in-order queue and the append is complete before the decode reads it.
+  inherited Create(NN, 'cai_sdpa_decode_split');
+  // Further entry points on the SAME TNeuralKernel, so every launch lands on
+  // one in-order queue and each pass is complete before the next reads it.
   FAppendKernel := FKernel.CreateKernel('cai_sdpa_append_kv');
   FAppendInt8Kernel := FKernel.CreateKernel('cai_sdpa_append_kv_int8');
-  FDecodeInt8Kernel := FKernel.CreateKernel('cai_sdpa_decode_int8');
+  FSplitInt8Kernel := FKernel.CreateKernel('cai_sdpa_decode_split_int8');
+  FMergeKernel := FKernel.CreateKernel('cai_sdpa_decode_merge');
+  FSplitStaticLocalBytes := FKernel.KernelLocalMemSize(FKernel.Kernel);
+  FSplitInt8StaticLocalBytes := FKernel.KernelLocalMemSize(FSplitInt8Kernel);
 end;
 
 destructor TNNetFusedSDPACL.Destroy();
 begin
   if Assigned(FAppendKernel)     then clReleaseKernel(FAppendKernel);
   if Assigned(FAppendInt8Kernel) then clReleaseKernel(FAppendInt8Kernel);
-  if Assigned(FDecodeInt8Kernel) then clReleaseKernel(FDecodeInt8Kernel);
-  if Assigned(FBufX)       then clReleaseMemObject(FBufX);
-  if Assigned(FBufK)       then clReleaseMemObject(FBufK);
-  if Assigned(FBufV)       then clReleaseMemObject(FBufV);
-  if Assigned(FBufScores)  then clReleaseMemObject(FBufScores);
-  if Assigned(FBufY)       then clReleaseMemObject(FBufY);
+  if Assigned(FSplitInt8Kernel)  then clReleaseKernel(FSplitInt8Kernel);
+  if Assigned(FMergeKernel)      then clReleaseKernel(FMergeKernel);
+  if Assigned(FBufX)        then clReleaseMemObject(FBufX);
+  if Assigned(FBufK)        then clReleaseMemObject(FBufK);
+  if Assigned(FBufV)        then clReleaseMemObject(FBufV);
+  if Assigned(FBufPartials) then clReleaseMemObject(FBufPartials);
+  if Assigned(FBufY)        then clReleaseMemObject(FBufY);
   if Assigned(FBufKCodes)  then clReleaseMemObject(FBufKCodes);
   if Assigned(FBufKScales) then clReleaseMemObject(FBufKScales);
   if Assigned(FBufVCodes)  then clReleaseMemObject(FBufVCodes);
@@ -38321,12 +38656,126 @@ begin
   FKernel.EnsureBuffer(FBufVScales, FCapVScales, CL_MEM_READ_WRITE, ScaleBytes);
 end;
 
-procedure TNNetFusedSDPACL.PrepareResultBuffers(Y: TNNetVolume;
-  QHeads, CacheMax: integer; out bufScores, bufY: cl_mem);
+function TNNetFusedSDPACL.StaticLocalMemBytes(Int8KV: boolean): integer;
 begin
-  bufScores := FKernel.EnsureBuffer(FBufScores, FCapScores, CL_MEM_READ_WRITE,
-    QHeads * CacheMax * csNeuralFloatSize);
+  if Int8KV
+    then Result := FSplitInt8StaticLocalBytes
+    else Result := FSplitStaticLocalBytes;
+end;
+
+function TNNetFusedSDPACL.LocalMemFloats(Int8KV: boolean): integer;
+var
+  LocalMemBytes: integer;
+begin
+  if FForcedLocalMemBytes > 0
+    then LocalMemBytes := FForcedLocalMemBytes
+    else LocalMemBytes := FKernel.DeviceLocalMemSize();
+  Result := (LocalMemBytes - StaticLocalMemBytes(Int8KV)
+    - csFusedSDPALocalMemReserveBytes) div csNeuralFloatSize;
+end;
+
+function TNNetFusedSDPACL.QueryTileFits(GroupSize, Dk: integer;
+  Int8KV: boolean): boolean;
+begin
+  // Reduction scratch + query tile + per-head max and sum + one score row.
+  Result := LocalMemFloats(Int8KV) - csFusedSDPALocalSize - GroupSize * Dk
+    - 2 * GroupSize >= GroupSize;
+end;
+
+procedure TNNetFusedSDPACL.ChooseSplit(KVHeads, TokenCnt, GroupSize, Dk,
+  SpanRows: integer; Int8KV: boolean; out Splits, ChunkRows: integer);
+var
+  GroupsPerUnit, MinChunkRows, MaxSplits, MaxChunkRows: integer;
+  RowPairs, TargetGroups, MaxSplitsBySpan, MaxChunkRowsByLocalMem: integer;
+begin
+  FusedSDPASplitSizing(GroupsPerUnit, MinChunkRows, MaxSplits, MaxChunkRows);
+  if FForcedChunkRows > 0 then ChunkRows := FForcedChunkRows
+  else
+  begin
+    if FForcedSplits > 0 then Splits := FForcedSplits
+    else
+    begin
+      // Enough work-groups to fill the device, but never chunks shorter than
+      // MinChunkRows and never more than MaxSplits partial states per head.
+      RowPairs := KVHeads * TokenCnt;
+      TargetGroups := FKernel.DeviceMaxComputeUnits() * GroupsPerUnit;
+      Splits := (TargetGroups + RowPairs - 1) div RowPairs;
+      MaxSplitsBySpan := (SpanRows + MinChunkRows - 1) div MinChunkRows;
+      if Splits > MaxSplitsBySpan then Splits := MaxSplitsBySpan;
+      if Splits > MaxSplits then Splits := MaxSplits;
+      if Splits < 1 then Splits := 1;
+    end;
+    ChunkRows := (SpanRows + Splits - 1) div Splits;
+    if ChunkRows > MaxChunkRows then ChunkRows := MaxChunkRows;
+  end;
+  // The score tile must fit beside the query tile, the per-head max and sum
+  // and the reduction scratch; a shorter chunk means more chunks, past
+  // MaxSplits if it must. QueryTileFits keeps a row of room, so this is >= 1.
+  MaxChunkRowsByLocalMem := (LocalMemFloats(Int8KV) - csFusedSDPALocalSize
+    - GroupSize * Dk - 2 * GroupSize) div GroupSize;
+  if ChunkRows > MaxChunkRowsByLocalMem then ChunkRows := MaxChunkRowsByLocalMem;
+  if ChunkRows < 1 then ChunkRows := 1;
+  Splits := (SpanRows + ChunkRows - 1) div ChunkRows;
+  if Splits < 1 then Splits := 1;
+  FLastSplits := Splits;
+  FLastChunkRows := ChunkRows;
+end;
+
+procedure TNNetFusedSDPACL.PrepareResultBuffers(Y: TNNetVolume;
+  QHeads, TokenCnt, Splits, Dk: integer; out bufPartials, bufY: cl_mem);
+begin
+  bufPartials := FKernel.EnsureBuffer(FBufPartials, FCapPartials,
+    CL_MEM_READ_WRITE,
+    csize_t(QHeads) * TokenCnt * Splits * (Dk + 2) * csNeuralFloatSize);
   bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
+end;
+
+procedure TNNetFusedSDPACL.SetSplitCommonArgs(kSplit: cl_kernel;
+  KVHeads, TokenCnt, Splits, ChunkRows, ChunkBase, GroupSize, Dk, CacheMax,
+  CacheSlot, Window, XStride: integer;
+  InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat; bufX: cl_mem);
+var
+  fInvSqrtDk, fSoftCap, fInvSoftCap: single;
+begin
+  fInvSqrtDk := InvSqrtDk;
+  fSoftCap := ScoreSoftCap;
+  fInvSoftCap := InvScoreSoftCap;
+  clSetKernelArg(kSplit,  0, csLongintSize, @KVHeads);
+  clSetKernelArg(kSplit,  1, csLongintSize, @TokenCnt);
+  clSetKernelArg(kSplit,  2, csLongintSize, @Splits);
+  clSetKernelArg(kSplit,  3, csLongintSize, @ChunkRows);
+  clSetKernelArg(kSplit,  4, csLongintSize, @ChunkBase);
+  clSetKernelArg(kSplit,  5, csLongintSize, @GroupSize);
+  clSetKernelArg(kSplit,  6, csLongintSize, @Dk);
+  clSetKernelArg(kSplit,  7, csLongintSize, @CacheMax);
+  clSetKernelArg(kSplit,  8, csLongintSize, @CacheSlot);
+  clSetKernelArg(kSplit,  9, csLongintSize, @Window);
+  clSetKernelArg(kSplit, 10, csLongintSize, @XStride);
+  clSetKernelArg(kSplit, 11, csNeuralFloatSize, @fInvSqrtDk);
+  clSetKernelArg(kSplit, 12, csNeuralFloatSize, @fSoftCap);
+  clSetKernelArg(kSplit, 13, csNeuralFloatSize, @fInvSoftCap);
+  clSetKernelArg(kSplit, 14, csCLMemSize, @bufX);
+end;
+
+procedure TNNetFusedSDPACL.RunMerge(bufPartials, bufY: cl_mem;
+  QHeads, TokenCnt, Splits, Dk, YStride: integer);
+var
+  kMerge: cl_kernel;
+begin
+  kMerge := FMergeKernel;
+  clSetKernelArg(kMerge, 0, csLongintSize, @QHeads);
+  clSetKernelArg(kMerge, 1, csLongintSize, @TokenCnt);
+  clSetKernelArg(kMerge, 2, csLongintSize, @Splits);
+  clSetKernelArg(kMerge, 3, csLongintSize, @Dk);
+  clSetKernelArg(kMerge, 4, csLongintSize, @YStride);
+  clSetKernelArg(kMerge, 5, csCLMemSize, @bufPartials);
+  clSetKernelArg(kMerge, 6, csCLMemSize, @bufY);
+  // Reduction scratch, then one weight per chunk.
+  clSetKernelArg(kMerge, 7, (csFusedSDPALocalSize + Splits) * csNeuralFloatSize,
+    nil);
+  // One work-group of csFusedSDPALocalSize lanes per (query head, token row).
+  FKernel.RunKernel2D(kMerge, csFusedSDPALocalSize, QHeads * TokenCnt,
+    csFusedSDPALocalSize, 1);
 end;
 
 procedure TNNetFusedSDPACL.FinishForward(bufY: cl_mem; Y: TNNetVolume;
@@ -38386,25 +38835,48 @@ begin
   end;
 end;
 
+// Local memory of one pass-1 work-group, in bytes: the reduction scratch, the
+// query tile, the score tile and the per-head max and sum.
+function SplitScratchBytes(GroupSize, Dk, ChunkRows: integer): csize_t;
+begin
+  Result := (csFusedSDPALocalSize + GroupSize * Dk + ChunkRows * GroupSize
+    + 2 * GroupSize) * csNeuralFloatSize;
+end;
+
+// The cache rows a step can attend span [ChunkBase, CacheSlot + TokenCnt):
+// ChunkBase is token row 0's sliding-window start, below which no row of the
+// step looks, so the chunks cover only rows some token row can see.
+procedure FusedSDPALiveSpan(TokenCnt, CacheSlot, Window: integer;
+  out ChunkBase, SpanRows: integer);
+begin
+  if (Window > 0) and (CacheSlot + 1 > Window)
+    then ChunkBase := CacheSlot + 1 - Window
+    else ChunkBase := 0;
+  SpanRows := CacheSlot + TokenCnt - ChunkBase;
+end;
+
 procedure TNNetFusedSDPACL.Compute(X, Y, K, V: TNNetVolume;
-  QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheLen, CacheSlot,
+  QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheSlot,
   QW, KW, Window: integer;
   InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
   pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
-const
-  // Lanes per head. Power-of-two (the tree reductions halve it) and within
-  // every device's max work-group size (T4 = 1024, PoCL CPU larger).
-  cLocalSize = 256;
 var
-  bufX, bufK, bufV, bufScores, bufY: cl_mem;
-  kAppend, kDecode: cl_kernel;
-  fInvSqrtDk, fSoftCap, fInvSoftCap: single;
+  bufX, bufK, bufV, bufPartials, bufY: cl_mem;
+  kAppend, kSplit: cl_kernel;
+  TokenCnt, XStride, YStride: integer;
+  ChunkBase, SpanRows, Splits, ChunkRows: integer;
 begin
   kAppend := FAppendKernel;
-  kDecode := FKernel.Kernel;
-  fInvSqrtDk := InvSqrtDk;
-  fSoftCap := ScoreSoftCap;
-  fInvSoftCap := InvScoreSoftCap;
+  kSplit := FKernel.Kernel;
+  // The step's token rows and both row strides come from the volumes the
+  // buffers hold, so the launch cannot disagree with what it indexes.
+  TokenCnt := X.SizeX;
+  XStride := X.Depth;
+  YStride := Y.Depth;
+  FusedSDPALiveSpan(TokenCnt, CacheSlot, Window, ChunkBase, SpanRows);
+  ChooseSplit(KVHeads, TokenCnt, GroupSize, Dk, SpanRows, {Int8KV=}false,
+    Splits, ChunkRows);
+  FLastScratchBytes := SplitScratchBytes(GroupSize, Dk, ChunkRows);
   if pExternalSrc <> nil
     then bufX := pExternalSrc
     else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
@@ -38412,35 +38884,33 @@ begin
   // its contents across every forward of the session.
   bufK := FKernel.EnsureOutputBuffer(FBufK, FCapK, K);
   bufV := FKernel.EnsureOutputBuffer(FBufV, FCapV, V);
-  PrepareResultBuffers(Y, QHeads, CacheMax, bufScores, bufY);
-  clSetKernelArg(kAppend, 0, csLongintSize, @KVHeads);
-  clSetKernelArg(kAppend, 1, csLongintSize, @Dk);
-  clSetKernelArg(kAppend, 2, csLongintSize, @CacheMax);
-  clSetKernelArg(kAppend, 3, csLongintSize, @CacheSlot);
-  clSetKernelArg(kAppend, 4, csLongintSize, @QW);
-  clSetKernelArg(kAppend, 5, csLongintSize, @KW);
-  clSetKernelArg(kAppend, 6, csCLMemSize, @bufX);
-  clSetKernelArg(kAppend, 7, csCLMemSize, @bufK);
-  clSetKernelArg(kAppend, 8, csCLMemSize, @bufV);
-  FKernel.RunKernel2D(kAppend, cLocalSize, KVHeads, cLocalSize, 1);
-  clSetKernelArg(kDecode,  0, csLongintSize, @QHeads);
-  clSetKernelArg(kDecode,  1, csLongintSize, @GroupSize);
-  clSetKernelArg(kDecode,  2, csLongintSize, @Dk);
-  clSetKernelArg(kDecode,  3, csLongintSize, @CacheMax);
-  clSetKernelArg(kDecode,  4, csLongintSize, @CacheLen);
-  clSetKernelArg(kDecode,  5, csLongintSize, @Window);
-  clSetKernelArg(kDecode,  6, csNeuralFloatSize, @fInvSqrtDk);
-  clSetKernelArg(kDecode,  7, csNeuralFloatSize, @fSoftCap);
-  clSetKernelArg(kDecode,  8, csNeuralFloatSize, @fInvSoftCap);
-  clSetKernelArg(kDecode,  9, csCLMemSize, @bufX);
-  clSetKernelArg(kDecode, 10, csCLMemSize, @bufK);
-  clSetKernelArg(kDecode, 11, csCLMemSize, @bufV);
-  clSetKernelArg(kDecode, 12, csCLMemSize, @bufScores);
-  clSetKernelArg(kDecode, 13, csCLMemSize, @bufY);
-  // Reduction scratch, then the head's query row.
-  clSetKernelArg(kDecode, 14, (cLocalSize + Dk) * csNeuralFloatSize, nil);
-  // One work-group of cLocalSize lanes per query head.
-  FKernel.RunKernel2D(kDecode, cLocalSize, QHeads, cLocalSize, 1);
+  PrepareResultBuffers(Y, QHeads, TokenCnt, Splits, Dk, bufPartials, bufY);
+  clSetKernelArg(kAppend,  0, csLongintSize, @KVHeads);
+  clSetKernelArg(kAppend,  1, csLongintSize, @TokenCnt);
+  clSetKernelArg(kAppend,  2, csLongintSize, @Dk);
+  clSetKernelArg(kAppend,  3, csLongintSize, @CacheMax);
+  clSetKernelArg(kAppend,  4, csLongintSize, @CacheSlot);
+  clSetKernelArg(kAppend,  5, csLongintSize, @QW);
+  clSetKernelArg(kAppend,  6, csLongintSize, @KW);
+  clSetKernelArg(kAppend,  7, csLongintSize, @XStride);
+  clSetKernelArg(kAppend,  8, csCLMemSize, @bufX);
+  clSetKernelArg(kAppend,  9, csCLMemSize, @bufK);
+  clSetKernelArg(kAppend, 10, csCLMemSize, @bufV);
+  // One work-group of csFusedSDPALocalSize lanes per (KV head, token row).
+  FKernel.RunKernel2D(kAppend, csFusedSDPALocalSize, KVHeads * TokenCnt,
+    csFusedSDPALocalSize, 1);
+  SetSplitCommonArgs(kSplit, KVHeads, TokenCnt, Splits, ChunkRows, ChunkBase,
+    GroupSize, Dk, CacheMax, CacheSlot, Window, XStride,
+    InvSqrtDk, ScoreSoftCap, InvScoreSoftCap, bufX);
+  clSetKernelArg(kSplit, 15, csCLMemSize, @bufK);
+  clSetKernelArg(kSplit, 16, csCLMemSize, @bufV);
+  clSetKernelArg(kSplit, 17, csCLMemSize, @bufPartials);
+  clSetKernelArg(kSplit, 18, FLastScratchBytes, nil);
+  // One work-group of csFusedSDPALocalSize lanes per (KV head, token row,
+  // chunk), then the merge per (query head, token row).
+  FKernel.RunKernel2D(kSplit, csFusedSDPALocalSize,
+    KVHeads * TokenCnt * Splits, csFusedSDPALocalSize, 1);
+  RunMerge(bufPartials, bufY, QHeads, TokenCnt, Splits, Dk, YStride);
   FinishForward(bufY, Y, pKeepResultOnOpenCL);
 end;
 
@@ -38509,65 +38979,64 @@ begin
 end;
 
 procedure TNNetFusedSDPACL.ComputeInt8(X, Y: TNNetVolume; K, V: TNNetVolumeQuant8;
-  QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheLen, CacheSlot,
+  QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheSlot,
   QW, KW, Window: integer;
   InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
   pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
-const
-  // Lanes per head, as in Compute: a power of two, because both the append's
-  // max-abs reduction and the decode's tree reductions halve it.
-  cLocalSize = 256;
 var
-  bufX, bufScores, bufY: cl_mem;
-  kAppend, kDecode: cl_kernel;
-  fInvSqrtDk, fSoftCap, fInvSoftCap: single;
+  bufX, bufPartials, bufY: cl_mem;
+  kAppend, kSplit: cl_kernel;
+  TokenCnt, XStride, YStride: integer;
+  ChunkBase, SpanRows, Splits, ChunkRows: integer;
 begin
   kAppend := FAppendInt8Kernel;
-  kDecode := FDecodeInt8Kernel;
-  fInvSqrtDk := InvSqrtDk;
-  fSoftCap := ScoreSoftCap;
-  fInvSoftCap := InvScoreSoftCap;
+  kSplit := FSplitInt8Kernel;
+  TokenCnt := X.SizeX;
+  XStride := X.Depth;
+  YStride := Y.Depth;
+  FusedSDPALiveSpan(TokenCnt, CacheSlot, Window, ChunkBase, SpanRows);
+  ChooseSplit(KVHeads, TokenCnt, GroupSize, Dk, SpanRows, {Int8KV=}true,
+    Splits, ChunkRows);
+  FLastScratchBytes := SplitScratchBytes(GroupSize, Dk, ChunkRows);
   if pExternalSrc <> nil
     then bufX := pExternalSrc
     else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
   // Grow-only and never written here, so a cache uploaded by UploadCacheInt8
   // keeps its contents across every forward of the session.
   EnsureCacheBuffersInt8(KVHeads, CacheMax, Dk);
-  PrepareResultBuffers(Y, QHeads, CacheMax, bufScores, bufY);
+  PrepareResultBuffers(Y, QHeads, TokenCnt, Splits, Dk, bufPartials, bufY);
   clSetKernelArg(kAppend,  0, csLongintSize, @KVHeads);
-  clSetKernelArg(kAppend,  1, csLongintSize, @Dk);
-  clSetKernelArg(kAppend,  2, csLongintSize, @CacheMax);
-  clSetKernelArg(kAppend,  3, csLongintSize, @CacheSlot);
-  clSetKernelArg(kAppend,  4, csLongintSize, @QW);
-  clSetKernelArg(kAppend,  5, csLongintSize, @KW);
-  clSetKernelArg(kAppend,  6, csCLMemSize, @bufX);
-  clSetKernelArg(kAppend,  7, csCLMemSize, @FBufKCodes);
-  clSetKernelArg(kAppend,  8, csCLMemSize, @FBufKScales);
-  clSetKernelArg(kAppend,  9, csCLMemSize, @FBufVCodes);
-  clSetKernelArg(kAppend, 10, csCLMemSize, @FBufVScales);
+  clSetKernelArg(kAppend,  1, csLongintSize, @TokenCnt);
+  clSetKernelArg(kAppend,  2, csLongintSize, @Dk);
+  clSetKernelArg(kAppend,  3, csLongintSize, @CacheMax);
+  clSetKernelArg(kAppend,  4, csLongintSize, @CacheSlot);
+  clSetKernelArg(kAppend,  5, csLongintSize, @QW);
+  clSetKernelArg(kAppend,  6, csLongintSize, @KW);
+  clSetKernelArg(kAppend,  7, csLongintSize, @XStride);
+  clSetKernelArg(kAppend,  8, csCLMemSize, @bufX);
+  clSetKernelArg(kAppend,  9, csCLMemSize, @FBufKCodes);
+  clSetKernelArg(kAppend, 10, csCLMemSize, @FBufKScales);
+  clSetKernelArg(kAppend, 11, csCLMemSize, @FBufVCodes);
+  clSetKernelArg(kAppend, 12, csCLMemSize, @FBufVScales);
   // Reduction scratch for the row maximum.
-  clSetKernelArg(kAppend, 11, cLocalSize * csNeuralFloatSize, nil);
-  FKernel.RunKernel2D(kAppend, cLocalSize, KVHeads, cLocalSize, 1);
-  clSetKernelArg(kDecode,  0, csLongintSize, @QHeads);
-  clSetKernelArg(kDecode,  1, csLongintSize, @GroupSize);
-  clSetKernelArg(kDecode,  2, csLongintSize, @Dk);
-  clSetKernelArg(kDecode,  3, csLongintSize, @CacheMax);
-  clSetKernelArg(kDecode,  4, csLongintSize, @CacheLen);
-  clSetKernelArg(kDecode,  5, csLongintSize, @Window);
-  clSetKernelArg(kDecode,  6, csNeuralFloatSize, @fInvSqrtDk);
-  clSetKernelArg(kDecode,  7, csNeuralFloatSize, @fSoftCap);
-  clSetKernelArg(kDecode,  8, csNeuralFloatSize, @fInvSoftCap);
-  clSetKernelArg(kDecode,  9, csCLMemSize, @bufX);
-  clSetKernelArg(kDecode, 10, csCLMemSize, @FBufKCodes);
-  clSetKernelArg(kDecode, 11, csCLMemSize, @FBufKScales);
-  clSetKernelArg(kDecode, 12, csCLMemSize, @FBufVCodes);
-  clSetKernelArg(kDecode, 13, csCLMemSize, @FBufVScales);
-  clSetKernelArg(kDecode, 14, csCLMemSize, @bufScores);
-  clSetKernelArg(kDecode, 15, csCLMemSize, @bufY);
-  // Reduction scratch, then the head's query row.
-  clSetKernelArg(kDecode, 16, (cLocalSize + Dk) * csNeuralFloatSize, nil);
-  // One work-group of cLocalSize lanes per query head.
-  FKernel.RunKernel2D(kDecode, cLocalSize, QHeads, cLocalSize, 1);
+  clSetKernelArg(kAppend, 13, csFusedSDPALocalSize * csNeuralFloatSize, nil);
+  // One work-group of csFusedSDPALocalSize lanes per (KV head, token row).
+  FKernel.RunKernel2D(kAppend, csFusedSDPALocalSize, KVHeads * TokenCnt,
+    csFusedSDPALocalSize, 1);
+  SetSplitCommonArgs(kSplit, KVHeads, TokenCnt, Splits, ChunkRows, ChunkBase,
+    GroupSize, Dk, CacheMax, CacheSlot, Window, XStride,
+    InvSqrtDk, ScoreSoftCap, InvScoreSoftCap, bufX);
+  clSetKernelArg(kSplit, 15, csCLMemSize, @FBufKCodes);
+  clSetKernelArg(kSplit, 16, csCLMemSize, @FBufKScales);
+  clSetKernelArg(kSplit, 17, csCLMemSize, @FBufVCodes);
+  clSetKernelArg(kSplit, 18, csCLMemSize, @FBufVScales);
+  clSetKernelArg(kSplit, 19, csCLMemSize, @bufPartials);
+  clSetKernelArg(kSplit, 20, FLastScratchBytes, nil);
+  // One work-group of csFusedSDPALocalSize lanes per (KV head, token row,
+  // chunk), then the merge per (query head, token row).
+  FKernel.RunKernel2D(kSplit, csFusedSDPALocalSize,
+    KVHeads * TokenCnt * Splits, csFusedSDPALocalSize, 1);
+  RunMerge(bufPartials, bufY, QHeads, TokenCnt, Splits, Dk, YStride);
   FinishForward(bufY, Y, pKeepResultOnOpenCL);
 end;
 
@@ -38884,14 +39353,7 @@ begin
   // The weight table is constant across forwards (until a weight update fires
   // InvalidateWeightCache), so upload it once and keep it resident. Only the
   // tiny per-token row list and the output volume move each call.
-  if not FWeightCached then
-  begin
-    if FInt8
-      then UploadInt8Table(FBufW, FCapW, FBufScales, FCapScales,
-             QuantTable.DataPtr, QuantTable.ScalePtr, VocabSize, EmbeddingSize)
-      else FKernel.EnsureWriteBuffer(FBufW, FCapW, W, {DoWrite}true);
-    FWeightCached := true;
-  end;
+  EnsureTableResident(W, QuantTable, VocabSize, EmbeddingSize);
   // Upload the host-resolved per-token source rows; allocate the device result.
   // (bufRows is a raw byte buffer from a host int array, not a volume; use the
   // byte-size EnsureBuffer overload then write it explicitly.)
@@ -38911,6 +39373,44 @@ begin
   // a consumer orders itself with OpenCLWaitOutputIfAnotherQueue. Buffers are
   // persistent (FBuf*), reused next forward - not released here.
   FKernel.RunKernel(k, NumTokens * EmbeddingSize);
+end;
+
+procedure TNNetEmbeddingCL.EnsureTableResident(W: TNNetVolume;
+  QuantTable: TNNetVolumeQuant8; VocabSize, EmbeddingSize: integer);
+begin
+  if FWeightCached then exit;
+  if FInt8
+    then UploadInt8Table(FBufW, FCapW, FBufScales, FCapScales,
+           QuantTable.DataPtr, QuantTable.ScalePtr, VocabSize, EmbeddingSize)
+    else FKernel.EnsureWriteBuffer(FBufW, FCapW, W, {DoWrite}true);
+  FWeightCached := true;
+end;
+
+// After a borrow, an InvalidateWeightCache on this helper makes the next
+// Gather rewrite the shared buffer with the same table (both layers read one
+// host table), which is harmless; the layer re-borrows after its weight hook
+// so that path is not normally taken. Coded by Claude (AI).
+function TNNetEmbeddingCL.BorrowTableFrom(Owner: TNNetEmbeddingCL): boolean;
+begin
+  Result := false;
+  if (not Assigned(Owner)) or (Owner = Self) then exit;
+  if (Owner.FInt8 <> FInt8) or (not Owner.FWeightCached) then exit;
+  if Owner.FKernel.Context <> FKernel.Context then exit;
+  if Assigned(FBufW) then clReleaseMemObject(FBufW);
+  if Assigned(FBufScales) then clReleaseMemObject(FBufScales);
+  FBufScales := nil;
+  FCapScales := 0;
+  clRetainMemObject(Owner.FBufW);
+  FBufW := Owner.FBufW;
+  FCapW := Owner.FCapW;
+  if Assigned(Owner.FBufScales) then
+  begin
+    clRetainMemObject(Owner.FBufScales);
+    FBufScales := Owner.FBufScales;
+    FCapScales := Owner.FCapScales;
+  end;
+  FWeightCached := true;
+  Result := true;
 end;
 
 function TNNetEmbeddingCL.OutputBuffer(): cl_mem;
@@ -43060,7 +43560,6 @@ begin
           Inc(posV, RowStride);
         end;
         // ---- Softmax Jacobian: dScore[j] = Attn[j]*(dAttn[j] - sum_k dAttn[k]*Attn[k]) ----
-        SumDAttnAttn := 0;
         SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[AttnRow], SeqLen);
         for j := 0 to SeqLenM1 do
           FdScoreBuf[j] := FAttn.FData[AttnRow + j] * (FdAttnBuf[j] - SumDAttnAttn);
@@ -43517,7 +44016,6 @@ begin
       Inc(posV, RowStride);
     end;
     // ---- Softmax Jacobian ----
-    SumDAttnAttn := 0;
     SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[AttnRow], SeqLen);
     for j := 0 to SeqLenM1 do
       FdScoreBuf[j] := FAttn.FData[AttnRow + j] * (FdAttnBuf[j] - SumDAttnAttn);
@@ -43982,7 +44480,6 @@ begin
       Inc(posV, RowStride);
     end;
     // ---- softmax Jacobian -> dScore ----
-    SumDAttnAttn := 0;
     SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[AttnRow], SeqLen);
     for j := 0 to SeqLenM1 do
       FdScoreBuf[j] := FAttn.FData[AttnRow + j] * (FdAttnBuf[j] - SumDAttnAttn);
@@ -44374,7 +44871,6 @@ begin
       Inc(posV, RowStride);
     end;
     // ---- softmax Jacobian -> dScore ----
-    SumDAttnAttn := 0;
     SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[AttnRow], SeqLen);
     for j := 0 to SeqLenM1 do
       FdScoreBuf[j] := FAttn.FData[AttnRow + j] * (FdAttnBuf[j] - SumDAttnAttn);
@@ -45657,7 +46153,6 @@ begin
       end;
       // ---- Softmax Jacobian over the augmented row ----
       // dScore[m] = w[m] * (dAttn[m] - sum_k dAttn[k]*w[k])
-      SumDAttnAttn := 0;
       SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FSinkAttn.FData[Row], AugLen);
       for j := 0 to AugLenM1 do
         FdScoreBuf[j] := FSinkAttn.FData[Row + j] * (FdAttnBuf[j] - SumDAttnAttn);
@@ -46417,7 +46912,7 @@ var
   RowStride, posE, posF, attnBase, posR, baseE, baseF: integer;
   dOutPtr, qPtr, dQPtr, dKpPtr, dVpPtr: pointer;
   Prev, PrevErr, E, F, dE, dF: TNNetVolume;
-  posdE, posdF: integer;
+  posdE: integer;
   SumDAttnAttn, A, dS, Coef, NegLr: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -46460,7 +46955,6 @@ begin
           Inc(posR, FDk);
         end;
         // Softmax Jacobian: dScore[r] = Attn[r]*(dAttn[r] - sum_k dAttn[k]*Attn[k]).
-        SumDAttnAttn := 0;
         SumDAttnAttn := TNNetVolume.DotProduct(@FdAttnBuf[0], @FAttn.FData[attnBase], FProjDim);
         for r := 0 to ProjDimM1 do
           FdScoreBuf[r] := FAttn.FData[attnBase + r] * (FdAttnBuf[r] - SumDAttnAttn);
@@ -46498,23 +46992,25 @@ begin
         baseF := F.GetRawPos(0, r);              // #11: F row base (depth 1)
         posE := FDk;                             // s=0 K-region offset (#12)
         posF := 2 * FDk;                         // s=0 V-region offset (#12)
+        // dE/dF share shape (SeqLen, ProjDim, 1), so one carried offset (#12)
+        // indexes both; depth 1 makes the per-s step 1.
+        posdE := dE.GetRawPos(0, r);
         for s := 0 to SeqLenM1 do
         begin
-          // #3 RMW: compute each delta's flat offset once, reuse for read+write.
-          posdE := dE.GetRawPos(s, r);
+          // #3 RMW: one flat offset per delta pair, reused for read+write.
           dE.FData[posdE] := dE.FData[posdE] + NegLr * TNNetVolume.DotProduct(
             dKpPtr, Prev.GetRawPtr(posE), FDk);
           Coef := E.FData[baseE + s];
           if Coef <> 0 then
             TNNetVolume.MulAdd(PrevErr.GetRawPtr(posE), dKpPtr, Coef, FDk);
-          posdF := dF.GetRawPos(s, r);
-          dF.FData[posdF] := dF.FData[posdF] + NegLr * TNNetVolume.DotProduct(
+          dF.FData[posdE] := dF.FData[posdE] + NegLr * TNNetVolume.DotProduct(
             dVpPtr, Prev.GetRawPtr(posF), FDk);
           Coef := F.FData[baseF + s];
           if Coef <> 0 then
             TNNetVolume.MulAdd(PrevErr.GetRawPtr(posF), dVpPtr, Coef, FDk);
           Inc(posE, RowStride);
           Inc(posF, RowStride);
+          Inc(posdE);
         end;
       end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -47583,6 +48079,7 @@ var
   SeqLen, Depth, HalfD, NumPrefix: integer;
   SeqLenM1, HalfDM1, DepthM1: integer;
   pos, n, c, base: integer;
+  idxCS, idx, idxHi, idxOut: integer;
   basePrev0, baseOut0: integer;
   cs, sn, x0, x1: TNeuralFloat;
   Prev: TNNetVolume;
@@ -47614,12 +48111,16 @@ begin
       // rotate_half pairing: channel c (c<HalfD) with c+HalfD.
       for c := 0 to HalfDM1 do
       begin
-        cs := FCos[base + c];
-        sn := FSin[base + c];
-        x0 := Prev.FData[basePrev0 + c];
-        x1 := Prev.FData[basePrev0 + c + HalfD];
-        FOutput.FData[baseOut0 + c]         := cs * x0 - sn * x1;
-        FOutput.FData[baseOut0 + c + HalfD] := cs * x1 + sn * x0;
+        idxCS := base + c;           // #4: shared by the cos and sin reads
+        cs := FCos[idxCS];
+        sn := FSin[idxCS];
+        idx := basePrev0 + c;        // #4: base+c formed once per volume
+        idxHi := idx + HalfD;
+        x0 := Prev.FData[idx];
+        x1 := Prev.FData[idxHi];
+        idxOut := baseOut0 + c;
+        FOutput.FData[idxOut]         := cs * x0 - sn * x1;
+        FOutput.FData[idxOut + HalfD] := cs * x1 + sn * x0;
       end;
     end;
   end;
@@ -47632,6 +48133,7 @@ var
   SeqLen, Depth, HalfD, NumPrefix: integer;
   SeqLenM1, HalfDM1, DepthM1: integer;
   pos, n, c, base: integer;
+  idxCS, idxG, idx, idxHi: integer;
   basePrevErr0, baseOutErr0: integer;
   cs, sn, gy0, gy1: TNeuralFloat;
   PrevErr: TNNetVolume;
@@ -47669,14 +48171,17 @@ begin
         // Transpose of the forward rotation.
         for c := 0 to HalfDM1 do
         begin
-          cs := FCos[base + c];
-          sn := FSin[base + c];
-          gy0 := FOutputError.FData[baseOutErr0 + c];
-          gy1 := FOutputError.FData[baseOutErr0 + c + HalfD];
-          PrevErr.FData[basePrevErr0 + c] :=
-            PrevErr.FData[basePrevErr0 + c] + (cs * gy0 + sn * gy1);
-          PrevErr.FData[basePrevErr0 + c + HalfD] :=
-            PrevErr.FData[basePrevErr0 + c + HalfD] + (cs * gy1 - sn * gy0);
+          idxCS := base + c;             // #4: shared by the cos and sin reads
+          cs := FCos[idxCS];
+          sn := FSin[idxCS];
+          idxG := baseOutErr0 + c;
+          gy0 := FOutputError.FData[idxG];
+          gy1 := FOutputError.FData[idxG + HalfD];
+          // #3 RMW: each accumulate's flat offset computed once, not twice.
+          idx := basePrevErr0 + c;
+          idxHi := idx + HalfD;
+          PrevErr.FData[idx]   := PrevErr.FData[idx]   + (cs * gy0 + sn * gy1);
+          PrevErr.FData[idxHi] := PrevErr.FData[idxHi] + (cs * gy1 - sn * gy0);
         end;
       end;
     end;
@@ -47710,10 +48215,64 @@ begin
   HasDeriv := (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size);
   // Two-pass: fill FOutput with softplus(x), vectorize tanh in place
   // (Tanh), then a scalar finishing pass reads tanh(softplus(x)) back.
-  // When the derivative pass will run, the exp(x) the first pass already
-  // computed is parked in FOutputErrorDeriv (sized to match FOutput exactly
-  // under HasDeriv) so the second pass reads it back instead of recomputing it;
-  // each slot is read before it is overwritten with the final derivative.
+  // When the derivative pass will run, exp(x) is parked in FOutputErrorDeriv
+  // (sized to match FOutput exactly under HasDeriv) so the second pass reads
+  // it back instead of recomputing it; each slot is read before it is
+  // overwritten with the final derivative.
+  {$IFDEF AVXANY}
+  // exp(x) is batched 8-wide via the elementwise Exp kernel (#19). The exp
+  // argument is clamped into [-88, 88] so the AVXExp scalar tail (plain
+  // pcr_expf, no internal clamp) never overflows on extreme inputs; the
+  // saturated x > 20 branch below ignores the clamped exp entirely, and below
+  // -88 the exp underflows to a negligible denormal either way.
+  if HasDeriv then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 88 then x := 88 else if x < -88 then x := -88;
+      FOutputErrorDeriv.FData[OutputCnt] := x;
+    end;
+    TNNetVolume.Exp(@FOutputErrorDeriv.FData[0], @FOutputErrorDeriv.FData[0],
+      LocalPrevOutput.Size);
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      // Numerically-stable softplus; tanh saturates correctly at both extremes.
+      if x > 20 then
+        FOutput.FData[OutputCnt] := x
+      else
+      begin
+        expVal := FOutputErrorDeriv.FData[OutputCnt];
+        if x < -20 then
+          FOutput.FData[OutputCnt] := expVal
+        else
+          FOutput.FData[OutputCnt] := pcr_log1pf(expVal);
+      end;
+    end;
+  end
+  else
+  begin
+    // No park buffer here: FOutput itself hosts exp(x), and the finishing pass
+    // reads each slot before overwriting it with softplus(x).
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 88 then x := 88 else if x < -88 then x := -88;
+      FOutput.FData[OutputCnt] := x;
+    end;
+    TNNetVolume.Exp(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 20 then
+        FOutput.FData[OutputCnt] := x
+      else if x >= -20 then
+        FOutput.FData[OutputCnt] := pcr_log1pf(FOutput.FData[OutputCnt]);
+      // x < -20: FOutput already holds exp(x), the softplus limit.
+    end;
+  end;
+  {$ELSE}
   if HasDeriv then
   begin
     for OutputCnt := 0 to SizeM1 do
@@ -47746,6 +48305,7 @@ begin
         FOutput.FData[OutputCnt] := pcr_log1pf(NeuralExp(x));
     end;
   end;
+  {$ENDIF}
   TNNetVolume.Tanh(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
   if HasDeriv then
   begin
@@ -47921,6 +48481,49 @@ begin
   // exactly under HasDeriv) as well; the second pass reads each slot back
   // before overwriting it with the final derivative, halving the mid-band
   // transcendental count.
+  {$IFDEF AVXANY}
+  // exp(x) is batched 8-wide via the elementwise Exp kernel (#19), hosted in
+  // FOutput until softplus overwrites it. The exp argument is clamped into
+  // [-88, 88] so the AVXExp scalar tail (plain pcr_expf, no internal clamp)
+  // never overflows on extreme inputs; the saturated x > 30 branch below
+  // ignores the clamped exp entirely, and below -88 the exp underflows to a
+  // negligible denormal either way.
+  for OutputCnt := 0 to SizeM1 do
+  begin
+    x := LocalPrevOutput.FData[OutputCnt];
+    if x > 88 then x := 88 else if x < -88 then x := -88;
+    FOutput.FData[OutputCnt] := x;
+  end;
+  TNNetVolume.Exp(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
+  if HasDeriv then
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 30 then
+        FOutput.FData[OutputCnt] := x
+      else if x >= -30 then
+      begin
+        sp := pcr_log1pf(FOutput.FData[OutputCnt]);
+        FOutputErrorDeriv.FData[OutputCnt] := sp;
+        FOutput.FData[OutputCnt] := sp;
+      end;
+      // x < -30: FOutput already holds exp(x), the softplus limit.
+    end;
+  end
+  else
+  begin
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      x := LocalPrevOutput.FData[OutputCnt];
+      if x > 30 then
+        FOutput.FData[OutputCnt] := x
+      else if x >= -30 then
+        FOutput.FData[OutputCnt] := pcr_log1pf(FOutput.FData[OutputCnt]);
+      // x < -30: FOutput already holds exp(x), the softplus limit.
+    end;
+  end;
+  {$ELSE}
   if HasDeriv then
   begin
     for OutputCnt := 0 to SizeM1 do
@@ -47951,6 +48554,7 @@ begin
         FOutput.FData[OutputCnt] := pcr_log1pf(NeuralExp(x));
     end;
   end;
+  {$ENDIF}
   TNNetVolume.Erf(@FOutput.FData[0], @FOutput.FData[0], LocalPrevOutput.Size);
   if HasDeriv then
   begin
@@ -48247,16 +48851,23 @@ begin
   // The input is a single depth-contiguous elementwise segment. exp(beta*x) -- the
   // transcendental shared by the output ln(1+exp) and the sigmoid derivative -- is
   // batched 8-wide via AVXExp (the vector exp PointwiseSoftMax uses) into a scratch
-  // buffer; ExpBuf holds exp(beta*x) clamped into AVXExp's safe [exp(Lo),exp(Hi)]
-  // range, never overflowing. The exact scalar BetaX>30 / BetaX<-30 thresholds are
-  // reapplied in the scalar finishing pass so saturation matches the scalar path:
-  // for those clamped lanes the precomputed exp is ignored entirely.
+  // buffer. The exact scalar BetaX>30 / BetaX<-30 thresholds are reapplied in the
+  // scalar finishing pass so saturation matches the scalar path: for those clamped
+  // lanes the precomputed exp is ignored entirely.
   Size := LocalPrevOutput.Size;
   if Size > 0 then
   begin
     if Length(FBetaXBuf) <> Size then SetLength(FBetaXBuf, Size); // rule #17: lazy amortized resize
-    Move(LocalPrevOutput.FData[0], FBetaXBuf[0], Size * csNeuralFloatSize);
-    TNNetVolume.Mul(@FBetaXBuf[0], Beta, Size);
+    // One fused scalar pass builds beta*x, clamped into [-88, 88] so the AVXExp
+    // scalar tail (plain pcr_expf, no internal clamp) never overflows on extreme
+    // inputs. The finishing pass reads FBetaXBuf only for the +/-30 saturation
+    // comparisons, which the clamp preserves.
+    for OutputCnt := 0 to SizeM1 do
+    begin
+      BetaX := Beta * LocalPrevOutput.FData[OutputCnt];
+      if BetaX > 88 then BetaX := 88 else if BetaX < -88 then BetaX := -88;
+      FBetaXBuf[OutputCnt] := BetaX;
+    end;
     if Length(FExpBuf) <> Size then SetLength(FExpBuf, Size); // rule #17: lazy amortized resize
     TNNetVolume.Exp(TNeuralFloatArrPtr(@FExpBuf[0]), TNeuralFloatArrPtr(@FBetaXBuf[0]), Size);
     if (FOutput.Size = FOutputError.Size) and (FOutputErrorDeriv.Size = FOutput.Size) then
@@ -48445,7 +49056,7 @@ var
   MaxPrevOutputErrorPos: integer;
   StartTime: double;
   localNeuron: TNNetNeuron;
-  gradBeta, beta, invBeta, x, betaX, sig, y: TNeuralFloat;
+  gradBeta, beta, invBeta, x, betaX, sig, y, expBetaX: TNeuralFloat;
   i: integer;
   LocalPrevOutput: TNNetVolume;
   HasDeriv: boolean;
@@ -48494,13 +49105,17 @@ begin
       end
       else if betaX < -30 then
       begin
-        sig := NeuralExp(betaX);
-        y := invBeta * pcr_logf(1 + NeuralExp(betaX));
+        // One exp serves both: sigmoid(z) -> e^z here (#4).
+        expBetaX := NeuralExp(betaX);
+        sig := expBetaX;
+        y := invBeta * pcr_logf(1 + expBetaX);
       end
       else
       begin
-        sig := 1 / (1 + NeuralExp(-betaX));
-        y := invBeta * pcr_logf(1 + NeuralExp(betaX));
+        // One exp serves both, as Compute does: 1/(1+e^-z) = e^z/(1+e^z).
+        expBetaX := NeuralExp(betaX);
+        sig := expBetaX / (1 + expBetaX);
+        y := invBeta * pcr_logf(1 + expBetaX);
       end;
       gradBeta := gradBeta + FOutputError.Raw[i] * invBeta * (x * sig - y);
     end;
@@ -48587,11 +49202,9 @@ begin
   begin
     if Alpha = 0 then
     begin
-      for OutputCnt := 0 to SizeM1 do
-      begin
-        FOutput.FData[OutputCnt] := LocalPrevOutput.FData[OutputCnt];
-        FOutputErrorDeriv.FData[OutputCnt] := 1.0;
-      end;
+      // Identity: bulk copy + fill (#13) instead of a scalar per-element loop.
+      FOutput.Copy(LocalPrevOutput);
+      FOutputErrorDeriv.Fill(1.0);
     end
     else if Alpha < 0 then
     begin
@@ -54253,13 +54866,6 @@ begin
   FNeurons := LinkedLayer.FNeurons;
   FLinkedNeurons := true;
   FCanNormalizeDelta := false;
-end;
-
-destructor TNNetConvolutionSharedWeights.Destroy;
-begin
-  // recreate a new neural list to allow the destroy to work.
-  FNeurons := TNNetNeuronList.Create();
-  inherited Destroy;
 end;
 
 function TNNetConvolutionSharedWeights.SupportsLowMemory(): boolean;
@@ -61434,6 +62040,33 @@ begin
   ResetState();
 end;
 
+function TNNetRecurrentDecodeBase.StateOnOpenCL(): boolean;
+begin
+  Result := false;
+end;
+
+{$IFDEF OpenCL}
+function TNNetRecurrentDecodeBase.NewStateSlotOnOpenCL(): cl_mem;
+begin
+  Result := nil;
+end;
+
+procedure TNNetRecurrentDecodeBase.CaptureStateToOpenCL(Slot: cl_mem;
+  out Steps: integer);
+begin
+  Steps := FDecodeSteps;
+  raise Exception.Create(ClassName + '.CaptureStateToOpenCL: this layer keeps' +
+    ' its decode state in RAM; use CaptureState.');
+end;
+
+procedure TNNetRecurrentDecodeBase.RestoreStateFromOpenCL(Slot: cl_mem;
+  Steps: integer);
+begin
+  raise Exception.Create(ClassName + '.RestoreStateFromOpenCL: this layer keeps' +
+    ' its decode state in RAM; use RestoreState.');
+end;
+{$ENDIF}
+
 constructor TNNetDepthwiseConv1D.Create(pKernelSize: integer; pCausal: boolean = true; pSuppressBias: integer = 0);
 begin
   inherited Create();
@@ -61460,6 +62093,12 @@ begin
   {$IFDEF OpenCL}
   FGpuWeightsDirty := true; // next device forward re-packs + re-uploads kernels
   {$ENDIF}
+end;
+
+function TNNetDepthwiseConv1D.NonWeightBytes(): int64;
+begin
+  Result := inherited NonWeightBytes() + VolumeBytes(FDecHist) +
+    VolumeBytes(FTapW) + VolumeBytes(FTapBias);
 end;
 
 procedure TNNetDepthwiseConv1D.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -61823,6 +62462,50 @@ begin
   FDecodeSteps := Steps;
   {$IFDEF OpenCL} FDecHistOnOpenCL := false; {$ENDIF}
 end;
+
+function TNNetDepthwiseConv1D.StateBytes(): int64;
+begin
+  Result := FDecHist.GetMemSize();
+end;
+
+function TNNetDepthwiseConv1D.StateOnOpenCL(): boolean;
+begin
+  {$IFDEF OpenCL} Result := FDecHistOnOpenCL; {$ELSE} Result := false; {$ENDIF}
+end;
+
+{$IFDEF OpenCL}
+function TNNetDepthwiseConv1D.NewStateSlotOnOpenCL(): cl_mem;
+begin
+  if Assigned(FDepthwise1DCL)
+    then Result := FDepthwise1DCL.NewOpenCLBuffer(FDecHist.GetMemSize())
+    else Result := nil;
+end;
+
+procedure TNNetDepthwiseConv1D.CaptureStateToOpenCL(Slot: cl_mem;
+  out Steps: integer);
+begin
+  if not Assigned(FDepthwise1DCL) then
+    raise Exception.Create('TNNetDepthwiseConv1D.CaptureStateToOpenCL: the' +
+      ' layer has no OpenCL path.');
+  // The live history is wherever the flag says; a RAM-resident one is uploaded
+  // straight into the slot so the layer's own buffers are never touched.
+  if FDecHistOnOpenCL
+    then FDepthwise1DCL.CopyHistoryTo(Slot, FDecHist.GetMemSize())
+    else FDepthwise1DCL.UploadToOpenCLBuffer(Slot, FDecHist);
+  Steps := FDecodeSteps;
+end;
+
+procedure TNNetDepthwiseConv1D.RestoreStateFromOpenCL(Slot: cl_mem;
+  Steps: integer);
+begin
+  if not Assigned(FDepthwise1DCL) then
+    raise Exception.Create('TNNetDepthwiseConv1D.RestoreStateFromOpenCL: the' +
+      ' layer has no OpenCL path.');
+  FDepthwise1DCL.CopyHistoryFrom(Slot, FDecHist);
+  FDecHistOnOpenCL := true;
+  FDecodeSteps := Steps;
+end;
+{$ENDIF}
 
 {$IFDEF OpenCL}
 procedure TNNetDepthwiseConv1D.DisableOpenCL();
@@ -63292,6 +63975,11 @@ begin
   Move(Src.FData[FChannels],     FDecBB.FData[0], RowBytes);
   Move(Src.FData[2 * FChannels], FDecPP.FData[0], RowBytes);
   FDecodeSteps := Steps;
+end;
+
+function TNNetWKV.StateBytes(): int64;
+begin
+  Result := 3 * FChannels * csNeuralFloatSize;
 end;
 
 procedure TNNetWKV.Backpropagate();
@@ -69861,7 +70549,60 @@ end;
 function TNNetGatedDeltaNet.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 begin
   Result := inherited SetTrainable(pTrainable, pLowMemory);
-  if not pTrainable then FreeBackpropScratch();
+  if Assigned(FPrevLayer) then SizeSequenceCaches()
+  else if not pTrainable then FreeBackpropScratch();
+end;
+
+function TNNetGatedDeltaNet.NonWeightBytes(): int64;
+begin
+  Result := inherited NonWeightBytes() +
+    VolumeBytes(FQn) + VolumeBytes(FKn) + VolumeBytes(FQInv) + VolumeBytes(FKInv) +
+    VolumeBytes(FBeta) + VolumeBytes(FDecay) + VolumeBytes(FSp) +
+    VolumeBytes(FErr) + VolumeBytes(FO) + VolumeBytes(FRInv) + VolumeBytes(FS) +
+    VolumeBytes(FGS) + VolumeBytes(FGradA) + VolumeBytes(FGradDtB) +
+    VolumeBytes(FGradW) + VolumeBytes(FDecS);
+end;
+
+// Training keeps every step's q/k norms, gates, read-out and matrix state for
+// the right-to-left BPTT. An inference-only layer reads each of them within
+// the step that wrote it, so it keeps one row of per-token scratch and two
+// matrix-state rows that alternate (the incremental decode aliases FDecS and
+// touches none of them); the backward accumulators collapse with them.
+procedure TNNetGatedDeltaNet.SizeSequenceCaches();
+var
+  CacheRows, StateRows, Hk, Hv, Dk, Dv: integer;
+begin
+  Hk := FNumKHeads; Hv := FNumVHeads; Dk := FHeadDimK; Dv := FHeadDimV;
+  if FIsTrainable then
+  begin
+    CacheRows := FOutput.SizeX;
+    StateRows := FOutput.SizeX;
+  end
+  else
+  begin
+    CacheRows := 1;
+    StateRows := Min(FOutput.SizeX, 2);
+  end;
+  FQn.ReSize(CacheRows, 1, Hk * Dk);  FKn.ReSize(CacheRows, 1, Hk * Dk);
+  FQInv.ReSize(CacheRows, 1, Hk);     FKInv.ReSize(CacheRows, 1, Hk);
+  FBeta.ReSize(CacheRows, 1, Hv);     FDecay.ReSize(CacheRows, 1, Hv);
+  FSp.ReSize(CacheRows, 1, Hv);
+  FErr.ReSize(CacheRows, 1, Hv * Dv); FO.ReSize(CacheRows, 1, Hv * Dv);
+  FRInv.ReSize(CacheRows, 1, Hv);
+  FS.ReSize(StateRows, Hv * Dk, Dv);
+  if FIsTrainable then
+  begin
+    FGS.ReSize(Hv * Dk, 1, Dv);
+    FGradA.ReSize(1, 1, Hv); FGradDtB.ReSize(1, 1, Hv); FGradW.ReSize(1, 1, Dv);
+    SetLength(FgoBuf, Dv); SetLength(FgrBuf, Dv); SetLength(FgvBuf, Dv);
+    SetLength(FgqBuf, Hk * Dk); SetLength(FgkBuf, Hk * Dk);
+  end
+  else
+  begin
+    FGS.ReSize(1, 1, 1);
+    FGradA.ReSize(1, 1, 1); FGradDtB.ReSize(1, 1, 1); FGradW.ReSize(1, 1, 1);
+    FreeBackpropScratch();
+  end;
 end;
 
 destructor TNNetGatedDeltaNet.Destroy();
@@ -69915,36 +70656,28 @@ begin
   FOutput.ReSize(SeqLen, 1, Hv * Dv);
   SetOutputErrorSize(FOutput);
   if FNeurons.Count < 3 then AddMissingNeurons(3);
-  FNeurons[0].FWeights.ReSize(Hv, 1, 1);  // A_log
-  FNeurons[1].FWeights.ReSize(Hv, 1, 1);  // dt_bias
-  FNeurons[2].FWeights.ReSize(Dv, 1, 1);  // norm gain w (shared across heads)
-  // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
-  if FIsTrainable then
-    for ii := 0 to 2 do
-    begin
-      FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
-      FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
-    end;
-  FQn.ReSize(SeqLen, 1, Hk * Dk);  FKn.ReSize(SeqLen, 1, Hk * Dk);
-  FQInv.ReSize(SeqLen, 1, Hk);     FKInv.ReSize(SeqLen, 1, Hk);
-  FBeta.ReSize(SeqLen, 1, Hv);     FDecay.ReSize(SeqLen, 1, Hv);
-  FSp.ReSize(SeqLen, 1, Hv);
-  FErr.ReSize(SeqLen, 1, Hv * Dv); FO.ReSize(SeqLen, 1, Hv * Dv);
-  FRInv.ReSize(SeqLen, 1, Hv);
-  FS.ReSize(SeqLen, Hv * Dk, Dv);
+  // The rows are sized here, not through SetNumWeightsForAllNeurons (they
+  // differ per neuron), so the borrowing build is honoured here too.
+  if not DeferWeightSizingToBuildLink() then
+  begin
+    Inc(FWeightElementsSized, 2 * Hv + Dv);
+    FNeurons[0].FWeights.ReSize(Hv, 1, 1);  // A_log
+    FNeurons[1].FWeights.ReSize(Hv, 1, 1);  // dt_bias
+    FNeurons[2].FWeights.ReSize(Dv, 1, 1);  // norm gain w (shared across heads)
+    // Backprop-only per-neuron weight mirrors: skip on inference-only layers.
+    if FIsTrainable then
+      for ii := 0 to 2 do
+      begin
+        FNeurons[ii].FDelta.ReSize(FNeurons[ii].FWeights);
+        FNeurons[ii].FBackInertia.ReSize(FNeurons[ii].FWeights);
+      end;
+  end;
+  SizeSequenceCaches();
   // Persistent per-head ea buffer (forward + backward), sized once at setup so
   // the threaded ComputeCPURange never resizes on the hot path (rule #17); the
   // disjoint k-head ranges write/read disjoint [FirstH..LastH] slots.
   SetLength(FEaBuf, Hv);
-  FGS.ReSize(Hv * Dk, 1, Dv);
-  FGradA.ReSize(1, 1, Hv); FGradDtB.ReSize(1, 1, Hv); FGradW.ReSize(1, 1, Dv);
   FDecS.ReSize(1, 1, Hv * Dk * Dv);
-  // Backprop-only scratch: skip on inference-only layers.
-  if FIsTrainable then
-  begin
-    SetLength(FgoBuf, Dv); SetLength(FgrBuf, Dv); SetLength(FgvBuf, Dv);
-    SetLength(FgqBuf, Hk * Dk); SetLength(FgkBuf, Hk * Dk);
-  end;
   InitDefault();
 end;
 
@@ -69991,11 +70724,12 @@ var
   SeqLenM1, DkM1, DvM1: integer;
   Hk, Hv, Dk, Dv, DkDv, HkDk, HvDv: integer;
   FirstH, LastH: integer;
-  qb, kb, cb, ob, sBase, thv, knBase, hDv, zOff: integer;
+  qb, kb, cb, ob, thv, knBase, hDv, hDkDv, zOff: integer;
   tHkDk, tHk, khDk, idxK, tHvB, tHvDv: integer;
+  CacheRow, StateBase, PrevStateBase, HvDkDv: integer;
   sumq, qinv, kinv, betav, pre, sp, ea, gval, decv: TNeuralFloat;
   msq, rinv, zv, sig, eps, scale: TNeuralFloat;
-  decode: boolean;
+  decode, KeepSteps: boolean;
   XtPtr, OutPtr, PrevSPtr, CurSPtr: TNeuralFloatArrPtr;
 begin
   Prev := FPrevLayer.FOutput;
@@ -70004,7 +70738,7 @@ begin
   NormW := FNeurons[2].FWeights;
   SeqLen := FOutput.SizeX;
   Hk := FNumKHeads; Hv := FNumVHeads; Dk := FHeadDimK; Dv := FHeadDimV;
-  HkDk := Hk * Dk; HvDv := Hv * Dv; DkDv := Dk * Dv;
+  HkDk := Hk * Dk; HvDv := Hv * Dv; DkDv := Dk * Dv; HvDkDv := Hv * DkDv;
   SeqLenM1 := SeqLen - 1;
   DkM1 := Dk - 1; DvM1 := Dv - 1;
   FirstH := FirstKh * FRep;
@@ -70012,6 +70746,10 @@ begin
   eps := FEps;
   scale := FScale;
   decode := FDecodeEnabled;
+  // Training keeps every step's caches for BPTT; inference reuses row 0 of
+  // the per-token caches and alternates between the two matrix-state rows
+  // (SizeSequenceCaches).
+  KeepSteps := FIsTrainable;
   // Rule #5/#8: ea_h = exp(min(A_log_h, 30)) invariant across t; precompute once
   // for this range's value heads into the persistent buffer (rule #17). Disjoint
   // k-head ranges touch disjoint [FirstH..LastH] slots, so this is race-free.
@@ -70021,12 +70759,24 @@ begin
   begin
     XtPtr := Prev.GetRawPtr(t, 0);
     OutPtr := FOutput.GetRawPtr(t, 0);
+    if KeepSteps then
+    begin
+      CacheRow := t;
+      StateBase := t * HvDkDv;
+      PrevStateBase := StateBase - HvDkDv;
+    end
+    else
+    begin
+      CacheRow := 0;
+      StateBase := (t and 1) * HvDkDv;
+      PrevStateBase := HvDkDv - StateBase;
+    end;
     // --- q/k per-head L2 norm (eps INSIDE the squared sum, HF-exact); q also
     // picks up the 1/sqrt(Dk) scale so the kernel consumes it as-is.
-    tHkDk := t * HkDk;                    // #11: invariant across the kh loop
-    tHk := t * Hk;
-    tHvB := t * Hv;                        // #11: invariant across the h loop
-    tHvDv := t * HvDv;
+    tHkDk := CacheRow * HkDk;              // #11: invariant across the kh loop
+    tHk := CacheRow * Hk;
+    tHvB := CacheRow * Hv;                 // #11: invariant across the h loop
+    tHvDv := CacheRow * HvDv;
     for kh := FirstKh to LastKh do
     begin
       khDk := kh * Dk;                    // #4: kh*Dk formed once (qb, cb, kb)
@@ -70074,9 +70824,9 @@ begin
       end
       else
       begin
-        sBase := thv * DkDv;
-        CurSPtr := @FS.FData[sBase];
-        if t > 0 then PrevSPtr := @FS.FData[sBase - Hv * DkDv]
+        hDkDv := h * DkDv;
+        CurSPtr := @FS.FData[StateBase + hDkDv];
+        if t > 0 then PrevSPtr := @FS.FData[PrevStateBase + hDkDv]
         else PrevSPtr := nil;
       end;
       knBase := tHkDk + kh * Dk;
@@ -70152,6 +70902,8 @@ begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
+  // An inference-only layer holds no per-step caches to walk (SizeSequenceCaches).
+  if not FIsTrainable then exit;
   StartTime := Now();
   NA := FNeurons[0]; NDtB := FNeurons[1]; NNorm := FNeurons[2];
   ALog := NA.FWeights; DtB := NDtB.FWeights; NormW := NNorm.FWeights;
@@ -70347,6 +71099,50 @@ begin
   FDecodeSteps := Steps;
   {$IFDEF OpenCL} FDecSOnOpenCL := false; {$ENDIF}
 end;
+
+function TNNetGatedDeltaNet.StateBytes(): int64;
+begin
+  Result := FDecS.GetMemSize();
+end;
+
+function TNNetGatedDeltaNet.StateOnOpenCL(): boolean;
+begin
+  {$IFDEF OpenCL} Result := FDecSOnOpenCL; {$ELSE} Result := false; {$ENDIF}
+end;
+
+{$IFDEF OpenCL}
+function TNNetGatedDeltaNet.NewStateSlotOnOpenCL(): cl_mem;
+begin
+  if Assigned(FGatedDeltaNetCL)
+    then Result := FGatedDeltaNetCL.NewOpenCLBuffer(FDecS.GetMemSize())
+    else Result := nil;
+end;
+
+procedure TNNetGatedDeltaNet.CaptureStateToOpenCL(Slot: cl_mem;
+  out Steps: integer);
+begin
+  if not Assigned(FGatedDeltaNetCL) then
+    raise Exception.Create('TNNetGatedDeltaNet.CaptureStateToOpenCL: the' +
+      ' layer has no OpenCL path.');
+  // The live state is wherever the flag says; a RAM-resident one is uploaded
+  // straight into the slot so the layer's own bank is never touched.
+  if FDecSOnOpenCL
+    then FGatedDeltaNetCL.CopyStateTo(Slot, FDecS.GetMemSize())
+    else FGatedDeltaNetCL.UploadToOpenCLBuffer(Slot, FDecS);
+  Steps := FDecodeSteps;
+end;
+
+procedure TNNetGatedDeltaNet.RestoreStateFromOpenCL(Slot: cl_mem;
+  Steps: integer);
+begin
+  if not Assigned(FGatedDeltaNetCL) then
+    raise Exception.Create('TNNetGatedDeltaNet.RestoreStateFromOpenCL: the' +
+      ' layer has no OpenCL path.');
+  FGatedDeltaNetCL.CopyStateFrom(Slot, FDecS);
+  FDecSOnOpenCL := true;
+  FDecodeSteps := Steps;
+end;
+{$ENDIF}
 
 procedure TNNetGatedDeltaNet.AfterWeightUpdate();
 begin
@@ -73334,6 +74130,11 @@ begin
   FDecodeSteps := Steps;
 end;
 
+function TNNetSelectiveSSM.StateBytes(): int64;
+begin
+  Result := FDecH.GetMemSize();
+end;
+
 procedure TNNetSelectiveSSM.Backpropagate();
 var
   StartTime: double;
@@ -75378,10 +76179,15 @@ var
   OutX, OutY: integer;
   OutputRawPos: integer;
   InputRawPtr: TNeuralFloatPtr;
+  LocalNeedsArgMin: boolean;
 begin
   MaxX := FInputCopy.SizeX - 1;
   MaxY := FInputCopy.SizeY - 1;
   MaxD := FInputCopy.Depth - 1;
+  // #20: one test per forward instead of a branch inside the depth loop. Only
+  // the pooling backward reads FMaxPosX/FMaxPosY, so an inference-only layer
+  // skips the argmin bookkeeping (mirrors TNNetMaxPool.ComputeDefaultStride).
+  LocalNeedsArgMin := FIsTrainable;
 
   for CntY := 0 to MaxY do
   begin
@@ -75391,16 +76197,29 @@ begin
       OutX := FInputDivPool[CntX]; //CntX div FPoolSize;
       OutputRawPos := FOutput.GetRawPos(OutX, OutY);
       InputRawPtr := FInputCopy.GetRawPtr(CntX, CntY);
-      for CntD := 0 to MaxD do
+      if LocalNeedsArgMin then
       begin
-        if InputRawPtr^ < FOutput.FData[OutputRawPos] then
+        for CntD := 0 to MaxD do
         begin
-          FOutput.FData[OutputRawPos] := InputRawPtr^;
-          FMaxPosX[OutputRawPos] := CntX;
-          FMaxPosY[OutputRawPos] := CntY;
+          if InputRawPtr^ < FOutput.FData[OutputRawPos] then
+          begin
+            FOutput.FData[OutputRawPos] := InputRawPtr^;
+            FMaxPosX[OutputRawPos] := CntX;
+            FMaxPosY[OutputRawPos] := CntY;
+          end;
+          Inc(OutputRawPos);
+          Inc(InputRawPtr);
         end;
-        Inc(OutputRawPos);
-        Inc(InputRawPtr);
+      end
+      else
+      begin
+        for CntD := 0 to MaxD do
+        begin
+          if InputRawPtr^ < FOutput.FData[OutputRawPos] then
+            FOutput.FData[OutputRawPos] := InputRawPtr^;
+          Inc(OutputRawPos);
+          Inc(InputRawPtr);
+        end;
       end;
     end;
   end; // of for CntD
@@ -75435,8 +76254,9 @@ begin
     begin
       InX := CntOutputX * FStride;
       InXMax := Min(InX + LocalPoolSizeM1, InputSizeXM1);
-      OutputRawPos := Output.GetRawPos(CntOutputX, CntOutputY);
-      OutputRawPtr := FOutput.GetRawPtr(CntOutputX, CntOutputY);
+      // #4: one offset computation; the pointer is the same offset dereferenced.
+      OutputRawPos := FOutput.GetRawPos(CntOutputX, CntOutputY);
+      OutputRawPtr := FOutput.GetRawPtr(OutputRawPos);
       // Mirrors TNNetMaxPool.ComputeWithStride: each window cell is one
       // depth-contiguous strip, so the reduction walks the depth axis with
       // pointers instead of re-indexing FInputCopy per element. Window cells
@@ -75540,28 +76360,16 @@ begin
   FAuxDepth.ReSize(1, 1, FOutput.Depth);
 end;
 
-constructor TNNetChannelNorm.Create;
-begin
-  inherited Create();
-  FAuxOutput := TNNetVolume.Create();
-end;
-
-destructor TNNetChannelNorm.Destroy;
-begin
-  FAuxOutput.Free;
-  inherited Destroy;
-end;
-
 procedure TNNetChannelNorm.Compute;
 var
   StartTime: double;
 begin
   StartTime := Now();
   inherited Compute;
-  FAuxOutput.Copy(FOutput);
-  FAuxOutput.Mul(FAuxOutput);
+  // #13: per-channel sum of squares in one fused pass (dst += src*src per
+  // element, same rounding), skipping the whole-volume squared snapshot.
   FAuxDepth.Fill(0);
-  FAuxDepth.AddSumChannel(FAuxOutput);
+  FAuxDepth.AddSumSqrChannel(FOutput);
   FAuxDepth.VSqrt();
   FAuxDepth.Divi(FOutputChannelSize);
   FAuxDepth.PowMinus1();
@@ -75706,21 +76514,13 @@ procedure TNNetChannelStdNormalization.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
   SetNumWeightsForAllNeurons(1, 1, FOutput.Depth);
-  FAuxOutput.ReSize(FOutput);
   InitDefault();
 end;
 
 constructor TNNetChannelStdNormalization.Create();
 begin
   inherited Create();
-  FAuxOutput := TNNetVolume.Create();
   InitDefault;
-end;
-
-destructor TNNetChannelStdNormalization.Destroy();
-begin
-  FAuxOutput.Free;
-  inherited Destroy();
 end;
 
 procedure TNNetChannelStdNormalization.Compute();
@@ -75741,10 +76541,10 @@ begin
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
   StartTime := Now();
-  FAuxOutput.Copy(FOutput);
-  FAuxOutput.Mul(FAuxOutput);
+  // #13: per-channel sum of squares in one fused pass (dst += src*src per
+  // element, same rounding), skipping the whole-volume squared snapshot.
   FAuxDepth.Fill(0);
-  FAuxDepth.AddSumChannel(FAuxOutput);
+  FAuxDepth.AddSumSqrChannel(FOutput);
   FAuxDepth.Divi(FOutputChannelSize);
   FAuxDepth.VSqrt();
   FAuxDepth.Add(-1);
@@ -76187,18 +76987,19 @@ begin
   //   d(gamma)[c] = sum_t OutputError[t,c] * x_hat[t,c]
   //   d(beta)[c]  = sum_t OutputError[t,c]
   // Accumulate the (positive) sums into depth scratch via the 3-pointer MulAdd
-  // (gamma scratch += OE .* x_hat) and the 2-pointer MulAdd (beta scratch += OE),
-  // then fold the -LR scale into each FDelta in one vectorized MulAdd to
-  // preserve the exact scalar semantics.
+  // (gamma scratch += OE .* x_hat) and a plain Add (beta scratch += OE; x*1+y
+  // = x+y exactly, so the scale-1 accumulate needs no multiply), then fold the
+  // -LR scale into each FDelta in one vectorized MulAdd to preserve the exact
+  // scalar semantics.
   FGammaGradScratch.Fill(0);
   FBetaGradScratch.Fill(0);
   for TokenCnt := 0 to TokenMax do
   begin
     BaseIdx := TokenCnt * Depth;
-    TNNetVolume.MulAdd(GammaGradPtr,
-      FOutputError.GetRawPtr(BaseIdx), FNormalized.GetRawPtr(BaseIdx), Depth);
-    TNNetVolume.MulAdd(BetaGradPtr,
-      FOutputError.GetRawPtr(BaseIdx), 1, Depth);
+    OEPtr := FOutputError.GetRawPtr(BaseIdx);
+    TNNetVolume.MulAdd(GammaGradPtr, OEPtr, FNormalized.GetRawPtr(BaseIdx),
+      Depth);
+    TNNetVolume.Add(BetaGradPtr, OEPtr, Depth);
   end;
   TNNetVolume.MulAdd(FNeurons[0].FDelta.GetRawPtr(), GammaGradPtr,
     -FLearningRate, Depth);
@@ -76280,6 +77081,11 @@ begin
     if Assigned(FPrevLayer) then FNormalized.ReSize(FOutput);
   end
   else FreeBackpropScratch();
+end;
+
+function TNNetRMSNorm.NonWeightBytes(): int64;
+begin
+  Result := inherited NonWeightBytes() + VolumeBytes(FNormalized);
 end;
 
 procedure TNNetRMSNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -76539,6 +77345,12 @@ begin
     end;
   end
   else FreeBackpropScratch();
+end;
+
+function TNNetTokenRMSNorm.NonWeightBytes(): int64;
+begin
+  Result := inherited NonWeightBytes() + VolumeBytes(FNormalized) +
+    VolumeBytes(FInvRMS) + VolumeBytes(FGainGradScratch);
 end;
 
 procedure TNNetTokenRMSNorm.SetPrevLayer(pPrevLayer: TNNetLayer);
@@ -76861,8 +77673,9 @@ end;
 procedure TNNetLlama4AttnTemperature.Compute();
 var
   StartTime: double;
-  SeqLen, Depth, pos, k, BaseIdx, SeqLenM1, DepthM1: integer;
-  Scale: TNeuralFloat;
+  SeqLen, Depth, pos, BaseIdx, SeqLenM1: integer;
+  FloorVal, PrevFloorVal: integer;
+  InvFloorScale, Scale: TNeuralFloat;
 begin
   StartTime := Now();
   {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
@@ -76870,15 +77683,29 @@ begin
   SeqLen := FOutput.SizeX;
   Depth := FOutput.Depth;
   SeqLenM1 := SeqLen - 1;
-  DepthM1 := Depth - 1;
+  // #21: one reciprocal per call instead of a divide per position. No gradient
+  // check watches this layer; a run boundary can shift by at most one position.
+  InvFloorScale := 1 / FFloorScale;
+  // f(pos) = log1p(floor((pos+1)/floor_scale))*attn_scale + 1 is a step
+  // function: the floor value is constant over runs of floor_scale positions,
+  // so the log runs only when the floor value steps (#5 across the run).
+  PrevFloorVal := -1;
+  Scale := 1;
+  BaseIdx := 0;
   for pos := 0 to SeqLenM1 do
   begin
-    // f(pos) = log1p(floor((pos+1)/floor_scale))*attn_scale + 1.
-    Scale := pcr_logf(1 + Floor((pos + FPositionOffset + 1) / FFloorScale)) *
-      FAttnScale + 1;
-    BaseIdx := pos * Depth;
+    FloorVal := Floor((pos + FPositionOffset + 1) * InvFloorScale);
+    if FloorVal <> PrevFloorVal then
+    begin
+      Scale := pcr_logf(1 + FloorVal) * FAttnScale + 1;
+      PrevFloorVal := FloorVal;
+    end;
     // Rule #13: uniform per-token scale over the contiguous depth run -> AVX.
-    TNNetVolume.Mul(FOutput.GetRawPtr(BaseIdx), Scale, Depth);
+    // x * 1.0 is exact for every float, so the Scale = 1 run (floor value 0,
+    // the whole early context) skips the pass outright.
+    if Scale <> 1 then
+      TNNetVolume.Mul(FOutput.GetRawPtr(BaseIdx), Scale, Depth);
+    Inc(BaseIdx, Depth);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -76886,8 +77713,9 @@ end;
 procedure TNNetLlama4AttnTemperature.Backpropagate();
 var
   StartTime: double;
-  SeqLen, Depth, pos, k, BaseIdx, SeqLenM1, DepthM1: integer;
-  Scale: TNeuralFloat;
+  SeqLen, Depth, pos, BaseIdx, SeqLenM1: integer;
+  FloorVal, PrevFloorVal: integer;
+  InvFloorScale, Scale: TNeuralFloat;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -76900,15 +77728,24 @@ begin
     SeqLen := FOutput.SizeX;
     Depth := FOutput.Depth;
     SeqLenM1 := SeqLen - 1;
-    DepthM1 := Depth - 1;
+    // Same step-function collapse as Compute: one reciprocal (#21) and one log
+    // per run of floor_scale positions instead of one of each per position.
+    InvFloorScale := 1 / FFloorScale;
+    PrevFloorVal := -1;
+    Scale := 1;
+    BaseIdx := 0;
     for pos := 0 to SeqLenM1 do
     begin
-      Scale := pcr_logf(1 + Floor((pos + FPositionOffset + 1) / FFloorScale)) *
-        FAttnScale + 1;
-      BaseIdx := pos * Depth;
+      FloorVal := Floor((pos + FPositionOffset + 1) * InvFloorScale);
+      if FloorVal <> PrevFloorVal then
+      begin
+        Scale := pcr_logf(1 + FloorVal) * FAttnScale + 1;
+        PrevFloorVal := FloorVal;
+      end;
       // Rule #13: uniform per-token scaled accumulate over the depth run -> AVX.
       TNNetVolume.MulAdd(FPrevLayer.FOutputError.GetRawPtr(BaseIdx),
         FOutputError.GetRawPtr(BaseIdx), Scale, Depth);
+      Inc(BaseIdx, Depth);
     end;
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
@@ -76976,10 +77813,10 @@ procedure TNNetRMSNormGated.Compute();
 var
   StartTime: double;
   W: TNNetVolume;
-  MeanSqr, s: TNeuralFloat;
-  SizeX, SizeY, Depth, x, y, d: integer;
-  SizeXM1, SizeYM1, DepthM1: integer;
-  Pos: integer;
+  MeanSqr: TNeuralFloat;
+  SizeX, SizeY, Depth, x, y: integer;
+  SizeXM1, SizeYM1: integer;
+  sPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
   inherited Compute;
@@ -76997,15 +77834,16 @@ begin
   Depth := FOutput.Depth;
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
-  DepthM1 := Depth - 1;
   SizeXM1 := SizeX - 1;
   SizeYM1 := SizeY - 1;
   if Length(FsByDepthBuf) < Depth then SetLength(FsByDepthBuf, Depth);
-  for d := 0 to DepthM1 do FsByDepthBuf[d] := Sigmoid(W.Raw[d]);
+  // #19: one vectorized pass over the contiguous gate logits instead of a
+  // scalar sigmoid per channel.
+  sPtr := TNeuralFloatArrPtr(@FsByDepthBuf[0]);
+  TNNetVolume.Sigmoid(sPtr, W.GetRawPtr(), Depth);
   for x := 0 to SizeXM1 do
     for y := 0 to SizeYM1 do
-      TNNetVolume.Mul(FOutput.GetRawPtr(x, y),
-        TNeuralFloatArrPtr(@FsByDepthBuf[0]), Depth);
+      TNNetVolume.Mul(FOutput.GetRawPtr(x, y), sPtr, Depth);
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
 
@@ -77015,9 +77853,9 @@ var
   localNeuron: TNNetNeuron;
   W: TNNetVolume;
   FloatSize, SumDxHatXHat, s, sDeriv, g: TNeuralFloat;
-  SizeX, SizeY, Depth, x, y, d, Cnt, SizeM1: integer;
+  SizeX, SizeY, Depth, x, y, d: integer;
   SizeXM1, SizeYM1, DepthM1: integer;
-  Base, Pos: integer;
+  sPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
@@ -77029,13 +77867,13 @@ begin
   SizeX := FOutput.SizeX;
   SizeY := FOutput.SizeY;
   FloatSize := FOutput.Size;
-  SizeM1 := FOutput.Size - 1;
   SizeXM1 := SizeX - 1;
   SizeYM1 := SizeY - 1;
   DepthM1 := Depth - 1;
 
-  // Precompute per-channel sigmoid s_d once.
-  for d := 0 to DepthM1 do FsByDepthBuf[d] := Sigmoid(W.Raw[d]);
+  // Precompute per-channel sigmoid s_d once (#19: one vectorized pass).
+  sPtr := TNeuralFloatArrPtr(@FsByDepthBuf[0]);
+  TNNetVolume.Sigmoid(sPtr, W.GetRawPtr(), Depth);
 
   // Gradient w.r.t. each gate logit g[d]:
   //   dL/dg[d] = sum_{x,y} OutputError[x,y,d] * n[x,y,d] * s_d*(1 - s_d).
@@ -77068,18 +77906,13 @@ begin
     //   dxhat[x,y,d] = OutputError[x,y,d] * s_d
     //   dx = invRMS * ( dxhat - xhat * mean(dxhat * xhat) )
     // where xhat = n (the normalized activation cached in FNormalized).
-    SumDxHatXHat := 0;
-    // dxhat[x,y,:] = OutputError[x,y,:] * s_d : per-row copy then #13 elementwise
-    // scale by the per-channel s vector (mirrors the Compute gate scaling).
+    // dxhat = OutputError .* s_d : one whole-volume copy (#13 -- the per-row
+    // Moves over the full (x,y) nest are collectively exactly this), then the
+    // per-row elementwise scale by the per-channel s vector.
+    FOutputErrorDeriv.Copy(FOutputError);
     for x := 0 to SizeXM1 do
       for y := 0 to SizeYM1 do
-      begin
-        Base := FOutputError.GetRawPos(x, y);
-        system.Move(FOutputError.FData[Base], FOutputErrorDeriv.FData[Base],
-          Depth * csNeuralFloatSize);
-        TNNetVolume.Mul(FOutputErrorDeriv.GetRawPtr(Base),
-          TNeuralFloatArrPtr(@FsByDepthBuf[0]), Depth);
-      end;
+        TNNetVolume.Mul(FOutputErrorDeriv.GetRawPtr(x, y), sPtr, Depth);
     // #13 reduction: SumDxHatXHat = sum(dxhat .* xhat) over the whole volume.
     SumDxHatXHat := TNNetVolume.DotProduct(FOutputErrorDeriv.GetRawPtr(),
       FNormalized.GetRawPtr(), FOutput.Size);
@@ -77171,10 +78004,11 @@ begin
   aLN  := ExpLN  / (ExpLN + ExpRMS);
   aRMS := ExpRMS / (ExpLN + ExpRMS);
 
-  // --- output: y = a_ln * L + a_rms * R --- (#13 bulk; aLN,aRMS invariant)
+  // --- output: y = a_ln * L + a_rms * R --- (#13 bulk; aLN,aRMS invariant).
+  // MulMulAdd fuses the Mul + MulAdd pair into one pass with identical
+  // rounding (separate vmulps pair + vaddps, no FMA).
   FOutput.Copy(FNormLN);
-  FOutput.Mul(aLN);
-  FOutput.MulAdd(aRMS, FNormRMS);
+  FOutput.MulMulAdd(aLN, aRMS, FNormRMS);
 
   FForwardTime := FForwardTime + (Now() - StartTime);
 end;
@@ -77372,7 +78206,7 @@ var
   MaxOutputX: integer;
   StartTime: double;
   x, y, PixelIdx, Depth: integer;
-  SumSqr, InvRMS: TNeuralFloat;
+  SumSqr, InvRMS, InvDepth: TNeuralFloat;
   OutPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
@@ -77410,14 +78244,16 @@ begin
   //   sum-of-squares via DotProduct(ptr, ptr, Depth), rescale via Mul.
   PixelIdx := 0;
   MaxOutputY := FOutput.SizeY - 1;
+  MaxOutputX := FOutput.SizeX - 1;
+  // #21: one reciprocal per call; every pixel's mean-of-squares is a multiply.
+  InvDepth := 1 / Depth;
   for y := 0 to MaxOutputY do
   begin
-    MaxOutputX := FOutput.SizeX - 1;
     for x := 0 to MaxOutputX do
     begin
       OutPtr := FOutput.GetRawPtr(x, y);
       SumSqr := TNNetVolume.DotProduct(OutPtr, OutPtr, Depth);
-      InvRMS := pcr_rsqrtf(SumSqr / Depth + FPixelNormEpsilon);
+      InvRMS := pcr_rsqrtf(SumSqr * InvDepth + FPixelNormEpsilon);
       FInvRMS[PixelIdx] := InvRMS;
       TNNetVolume.Mul(OutPtr, InvRMS, Depth);
       Inc(PixelIdx);
@@ -77434,7 +78270,7 @@ var
   MaxOutputX: integer;
   StartTime: double;
   x, y, PixelIdx, Depth: integer;
-  SumDyY, InvRMS, DepthF: TNeuralFloat;
+  SumDyY, InvRMS, InvDepth: TNeuralFloat;
   YPtr, GyPtr, PrevErrPtr: TNeuralFloatArrPtr;
 begin
   Inc(FBackPropCallCurrentCnt);
@@ -77452,19 +78288,20 @@ begin
     // run we can feed to the depth-contiguous TNNetVolume primitives
     // (DotProduct for the SumDyY projection; two MulAdd for the update),
     // mirroring TNNetL2Normalize.BackpropagatePerDepth.
-    DepthF := Depth;
+    // #21: one reciprocal per call; every pixel's mean projection is a multiply.
+    InvDepth := 1 / Depth;
     PixelIdx := 0;
     MaxOutputY := FOutput.SizeY - 1;
+    MaxOutputX := FOutput.SizeX - 1;
     for y := 0 to MaxOutputY do
     begin
-      MaxOutputX := FOutput.SizeX - 1;
       for x := 0 to MaxOutputX do
       begin
         YPtr := FNormalized.GetRawPtr(x, y);
         GyPtr := FOutputError.GetRawPtr(x, y);
         PrevErrPtr := FPrevLayer.FOutputError.GetRawPtr(x, y);
         InvRMS := FInvRMS[PixelIdx];
-        SumDyY := TNNetVolume.DotProduct(GyPtr, YPtr, Depth) / DepthF;
+        SumDyY := TNNetVolume.DotProduct(GyPtr, YPtr, Depth) * InvDepth;
         // prevErr += InvRMS*gy - (InvRMS*SumDyY)*y
         TNNetVolume.MulAdd(PrevErrPtr, GyPtr, InvRMS, Depth);
         TNNetVolume.MulAdd(PrevErrPtr, YPtr, -(InvRMS * SumDyY), Depth);
@@ -77635,8 +78472,8 @@ begin
     // below (same x,y order, same centered-variance formula).
     NeuralPerChannelMeanInvStd(FOutput, FMeanScratch, FInvStdScratch,
       FSumScratch, FSumSqScratch, FGroupNormEpsilon);
-    for GroupCnt := 0 to FGroupsM1 do
-      FInvStdDev[GroupCnt] := FInvStdScratch.FData[GroupCnt];
+    // #13: contiguous copy of the per-group inv-std vector.
+    Move(FInvStdScratch.FData[0], FInvStdDev[0], FGroups * csNeuralFloatSize);
     MeanPtr := TNeuralFloatArrPtr(FMeanScratch.GetRawPtr(0));
     InvStdPtr := TNeuralFloatArrPtr(FInvStdScratch.GetRawPtr(0));
     for CntX := 0 to MaxOutputX do
@@ -78016,7 +78853,10 @@ begin
       //    so the persistent cache is pure overhead.
       //  - int4: same as int8 - the FP32 rows are gone, the kernels read
       //    FQuantTableInt4.
-      if not FQuantInt8 and not FQuantInt4 and not ActiveLowMemory() then
+      //  - a pending build link: the rows are one-element placeholders until
+      //    LinkBuildWeightOwner points them at the owner's.
+      if not FQuantInt8 and not FQuantInt4 and not ActiveLowMemory() and
+        not FBuildLinkPending then
       begin
         FNeuronWeightList.ConcatInto(FConcatedWeights);
         if FShouldInterleaveWeights then
@@ -78068,6 +78908,7 @@ begin
   FQuantWSizeD := d;
   // ReSize does no zero fill, so the arming state is written explicitly:
   // zero codes = zero weights, unit scales.
+  Inc(FWeightElementsSized, int64(FNeurons.Count) * V);
   FQuantTable.ReSize(FNeurons.Count, 1, V);
   FQuantTable.Fill(0);
   FQuantTable.ScaleData.Fill(1);
@@ -78083,6 +78924,8 @@ end;
 procedure TNNetLayerConcatedWeights.SetNumWeightsForAllNeurons(
   NumWeights: integer);
 begin
+  // A borrowing build sizes nothing, not even the int8 container.
+  if DeferWeightSizingToBuildLink() then exit;
   if ArmBuildQuantInt8Storage(NumWeights, 1, 1) then exit;
   inherited SetNumWeightsForAllNeurons(NumWeights);
 end;
@@ -78090,6 +78933,7 @@ end;
 procedure TNNetLayerConcatedWeights.SetNumWeightsForAllNeurons(
   x, y, d: integer);
 begin
+  if DeferWeightSizingToBuildLink() then exit;
   if ArmBuildQuantInt8Storage(x, y, d) then exit;
   inherited SetNumWeightsForAllNeurons(x, y, d);
 end;
@@ -78490,10 +79334,104 @@ begin
     FQuantTable.Scale[NeuronIdx, 0] := 1;
 end;
 
+function TNNetLayerConcatedWeights.NonWeightBytes(): int64;
+begin
+  Result := inherited NonWeightBytes() + VolumeBytes(FConcatedWeights) +
+    VolumeBytes(FConcatedWInter) + VolumeBytes(FBiasOutput) +
+    Quant8Bytes(FInputCopyInt8);
+end;
+
 function TNNetLayerConcatedWeights.Int8QuantizedSizeBytes(): int64;
 begin
   // Both containers: the empty one reports 0, and a layer holds at most one.
+  // Borrowed tables are the owner's bytes.
+  if FLinkedWeightTables then exit(0);
   Result := FQuantTable.GetMemSize() + FQuantTableInt4.GetMemSize();
+end;
+
+function TNNetLayerConcatedWeights.LinkWeightsFrom(Owner: TNNetLayer): boolean;
+var
+  OwnerCW: TNNetLayerConcatedWeights;
+  OwnerQuantized: boolean;
+begin
+  Result := false;
+  if (not Assigned(Owner)) or (Owner.ClassType <> Self.ClassType) then
+  begin
+    FErrorProc(ClassName + '.LinkWeightsFrom: owner must be a layer of the ' +
+      'same class.');
+    exit;
+  end;
+  OwnerCW := TNNetLayerConcatedWeights(Owner);
+  OwnerQuantized := OwnerCW.FQuantInt8 or OwnerCW.FQuantInt4;
+  if OwnerQuantized and (OwnerCW.FQuantVectorSize <> FVectorSize) then
+  begin
+    FErrorProc(ClassName + '.LinkWeightsFrom: owner rows have ' +
+      IntToStr(OwnerCW.FQuantVectorSize) + ' weights, this layer expects ' +
+      IntToStr(FVectorSize) + ' (call SetPrevLayer first).');
+    exit;
+  end;
+  if (FQuantInt8 or FQuantInt4) and (not OwnerQuantized) then
+  begin
+    FErrorProc(ClassName + '.LinkWeightsFrom: this layer is quantized but ' +
+      'the owner holds FP32 rows.');
+    exit;
+  end;
+  {$IFDEF OpenCL}
+  if FHasOpenCL then
+  begin
+    FErrorProc(ClassName + '.LinkWeightsFrom: link before EnableOpenCL - the ' +
+      'device already holds this layer''s own weights.');
+    exit;
+  end;
+  {$ENDIF}
+  // An own int4 state left an int8 input copy behind that an int8 owner does
+  // not use; it comes back below when the owner is int4.
+  if OwnerCW.FQuantInt8 and FQuantInt4 then DisableInt8Input();
+  if not LinkNeuronsFrom(Owner) then exit;
+  // The weight list pointed at the rows LinkNeuronsFrom just freed.
+  RefreshNeuronWeightList();
+  if OwnerQuantized then
+  begin
+    FQuantTable.Free;
+    FQuantTableInt4.Free;
+    FQuantTable := OwnerCW.FQuantTable;
+    FQuantTableInt4 := OwnerCW.FQuantTableInt4;
+    FLinkedWeightTables := true;
+    FQuantInt8 := OwnerCW.FQuantInt8;
+    FQuantInt4 := OwnerCW.FQuantInt4;
+    FQuantVectorSize := OwnerCW.FQuantVectorSize;
+    FQuantWSizeX := OwnerCW.FQuantWSizeX;
+    FQuantWSizeY := OwnerCW.FQuantWSizeY;
+    FQuantWSizeD := OwnerCW.FQuantWSizeD;
+    FConcatedWeights.ReSize(1, 1, 1);
+    FConcatedWInter.ReSize(1, 1, 1);
+    if FQuantInt4 then
+    begin
+      EnableInt8Input();
+      ArmInt4InputPlanes();
+    end;
+  end;
+  // FP32 owner: this layer keeps its own concatenated caches, rebuilt from
+  // the shared rows here (only the rows themselves are shared).
+  AfterWeightUpdate();
+  Result := true;
+end;
+
+procedure TNNetLayerConcatedWeights.ArmInt4InputPlanes();
+begin
+end;
+
+procedure TNNetLayerConcatedWeights.DetachFromWeightOwner();
+begin
+  if not Assigned(FWeightOwner) then exit;
+  inherited DetachFromWeightOwner();
+  if FLinkedWeightTables then
+  begin
+    FQuantTable := TNNetVolumeQuant8.Create();
+    FQuantTableInt4 := TNNetVolumeQuant4.Create();
+    FLinkedWeightTables := false;
+  end;
+  RefreshNeuronWeightList();
 end;
 
 function TNNetLayerConcatedWeights.CountWeights(): int64;
@@ -78584,11 +79522,16 @@ end;
 
 destructor TNNetLayerConcatedWeights.Destroy();
 begin
+  // Borrowers alias the tables freed below, so they are detached first.
+  UnlinkWeightBorrowers();
   // Virtual: a convolution frees its int8 im2col buffer here too.
   DisableInt8Input();
   FBiasOutput.Free;
-  FQuantTable.Free;
-  FQuantTableInt4.Free;
+  if not FLinkedWeightTables then
+  begin
+    FQuantTable.Free;
+    FQuantTableInt4.Free;
+  end;
   FConcatedWeights.Free;
   FNeuronWeightList.Free;
   FConcatedWInter.Free;
@@ -78771,6 +79714,7 @@ begin
   NumAs := FNeurons.Count;
   if (not Assigned(FDotCL)) or (NumAs = 0) or (FQuantVectorSize = 0) or
     (VBs.Size = 0) then exit;
+  if BorrowOwnerOpenCLCodes(VBs) then exit;
   CodesPtr := FQuantTable.DataPtr;   // #13: one base pointer for the transpose
   SetLength(Inter, NumAs * FQuantVectorSize);
   VSizeM1 := FQuantVectorSize - 1;
@@ -78813,6 +79757,7 @@ begin
   NumAs := FNeurons.Count;
   if (not Assigned(FDotCL)) or (NumAs = 0) or (FQuantVectorSize = 0) or
     (VBs.Size = 0) or (FQuantTableInt4.Depth <> FQuantVectorSize) then exit;
+  if BorrowOwnerOpenCLCodes(VBs) then exit;
   MaxBlockPos := FQuantTableInt4.BlocksPerRow - 1;
   SetLength(PackedCodes, NumAs * FQuantTableInt4.PackedRowBytes);
   SetLength(BlockScales, NumAs * FQuantTableInt4.BlocksPerRow);
@@ -78841,6 +79786,37 @@ begin
   end;
   FDotCL.PrepareForComputeInt4(@PackedCodes[0], @BlockScales[0], NumAs,
     FQuantVectorSize, VBs);
+end;
+
+// A borrower that cannot borrow (owner not OpenCL-armed yet, or armed in
+// another context - EnableOpenCLInContextOf is the route that shares one)
+// reports it and uploads its own copy: correct, but the duplication the link
+// exists to remove. Coded by Claude (AI).
+function TNNetLayerConcatedWeights.BorrowOwnerOpenCLCodes(
+  VBs: TNNetVolume): boolean;
+var
+  OwnerCW: TNNetLayerConcatedWeights;
+begin
+  Result := false;
+  if not (FLinkedWeightTables and Assigned(FWeightOwner)) then exit;
+  OwnerCW := TNNetLayerConcatedWeights(FWeightOwner);
+  if Assigned(OwnerCW.FDotCL) then
+    Result := FDotCL.PrepareForComputeBorrowingCodes(OwnerCW.FDotCL, VBs,
+      FFP16Active);
+  if not Result then
+    FErrorProc(ClassName + '.PrepareInt8DotCL: layer ' + IntToStr(FLayerIdx) +
+      ' could not borrow its owner''s resident codes (owner not armed, or ' +
+      'another OpenCL context) - uploading a second copy.');
+end;
+
+function TNNetLayerConcatedWeights.OpenCLCodesBuffer(): cl_mem;
+begin
+  if Assigned(FDotCL) then Result := FDotCL.CodesBuffer else Result := nil;
+end;
+
+function TNNetLayerConcatedWeights.OpenCLCodesBorrowed(): boolean;
+begin
+  Result := Assigned(FDotCL) and FDotCL.CodesBorrowed;
 end;
 {$ENDIF}
 
@@ -79148,6 +80124,9 @@ begin
   // pass still has readers of Output that never call ForceOutputOnRAM.
   if FIsTrainable or (not FHasOpenCL) then exit;
   if (not Assigned(FSumKernel)) or (not Assigned(FSumBuffer)) then exit;
+  // EnableOpenCL sized FSumBuffer for the output of that moment; a wider
+  // output would overrun it, so such a forward stays on the host.
+  if FOutput.Size > FSumBufSize then exit;
   // A single source is a copy, not a sum: nothing to win on the device.
   if FPrevOutput.Count < 2 then exit;
   Result := SourcesReadyOnOpenCL(FSumKernel);
@@ -98051,6 +99030,9 @@ begin
   // pass still has readers of Output that never call ForceOutputOnRAM.
   if FIsTrainable or (not FHasOpenCL) then exit;
   if (not Assigned(FConcatKernel)) or (not Assigned(FConcatBuffer)) then exit;
+  // EnableOpenCL sized FConcatBuffer for the output of that moment; a wider
+  // output would overrun it, so such a forward stays on the host.
+  if FOutput.Size > FConcatBufSize then exit;
   Result := SourcesReadyOnOpenCL(FConcatKernel);
 end;
 
@@ -98453,6 +99435,9 @@ begin
   if FIsTrainable or (not FHasOpenCL) then exit;
   if (not Assigned(FSplitKernel)) or (not Assigned(FSplitBuffer)) or
      (not Assigned(FChannelIdxBuffer)) then exit;
+  // EnableOpenCL sized FSplitBuffer for the output of that moment; a wider
+  // output would overrun it, so such a forward stays on the host.
+  if FOutput.Size > FSplitBufSize then exit;
   if not PrevOutputOnOpenCL() then exit;
   // The source is in host memory too, so the CPU gather moves nothing while the
   // device gather would still have to download its slice.
@@ -104855,6 +105840,15 @@ begin
 end;
 
 { TNNetConvolution }
+// A pointwise convolution reads the previous output as its im2col, so
+// FInputPrepared is only owned (and counted) by the spatial case.
+function TNNetConvolutionBase.NonWeightBytes(): int64;
+begin
+  Result := inherited NonWeightBytes() + Quant8Bytes(FInputPreparedInt8) +
+    VolumeBytes(FPrevLayerErrorPadded);
+  if not FPointwise then Result := Result + VolumeBytes(FInputPrepared);
+end;
+
 procedure TNNetConvolutionBase.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
@@ -105548,7 +106542,12 @@ end;
 procedure TNNetConvolution.FinishInt4WeightConversion();
 begin
   inherited FinishInt4WeightConversion();
-  if FQuantInt4 and Assigned(FInputPreparedInt8) and
+  if FQuantInt4 then ArmInt4InputPlanes();
+end;
+
+procedure TNNetConvolutionBase.ArmInt4InputPlanes();
+begin
+  if Assigned(FInputPreparedInt8) and
     (not FInputPreparedInt8.HasInt4InputPlanes) then
     FInputPreparedInt8.EnableInt4InputPlanes();
 end;
@@ -108547,7 +109546,8 @@ end;
 
 constructor TNNetEmbedding.Create(pVocabSize, pEmbeddingSize: integer;
   EncodeZero: integer = 0; ScaleEmbedding: TNeuralFloat = 0.02;
-  pTrainable: boolean = true; pQuantizeInt8: boolean = false);
+  pTrainable: boolean = true; pQuantizeInt8: boolean = false;
+  pWeightOwner: TNNetLayer = nil);
 begin
   inherited Create();
   FQuantTable := TNNetVolumeQuant8.Create();
@@ -108565,14 +109565,24 @@ begin
   // SetNumWeightsForAllNeurons then skips the Delta/BackInertia volumes
   // whose transient allocation would otherwise drive the process to a
   // 3x-vocab-table FP32 high-water mark the allocator never returns.
-  FIsTrainable := pTrainable and (not pQuantizeInt8);
-  if pQuantizeInt8 then
+  FIsTrainable := pTrainable and (not pQuantizeInt8) and
+    (not Assigned(pWeightOwner));
+  if Assigned(pWeightOwner) then
+  begin
+    // No table of any kind: the owner's rows or int8 table are read by
+    // reference. A refused link (shape or class mismatch) is a build error.
+    if not LinkWeightsFrom(pWeightOwner) then
+      raise Exception.Create('TNNetEmbedding.Create: could not borrow the ' +
+        'table of the given owner layer (see the message above).');
+  end
+  else if pQuantizeInt8 then
   begin
     // Arm the int8 container directly: zero codes (dequantized weight 0 -
     // a valid forward), unit scales (the zero-row convention). ReSize does
     // not fill, so the scales are set explicitly. The FP32 table is never
     // allocated; DequantizeWeightsInt8 can still restore writable rows for
     // the FP32 import path.
+    Inc(FWeightElementsSized, int64(pVocabSize) * pEmbeddingSize);
     FQuantTable.ReSize(pVocabSize, 1, pEmbeddingSize);
     FQuantTable.Fill(0);
     FQuantTable.ScaleData.Fill(1);
@@ -108592,7 +109602,9 @@ end;
 
 destructor TNNetEmbedding.Destroy;
 begin
-  FQuantTable.Free;
+  // Borrowers alias the table freed below, so they are detached first.
+  UnlinkWeightBorrowers();
+  if not FLinkedQuantTable then FQuantTable.Free;
   SetLength(FInputTokens, 0);
   {$IFDEF OpenCL}
   SetLength(FTokenRows, 0);
@@ -108628,6 +109640,35 @@ begin
   end;
   if not Assigned(FEmbeddingCL) then
     FEmbeddingCL := TNNetEmbeddingCL.Create(FNN, FQuantInt8);
+  BorrowOwnerOpenCLTable();
+end;
+
+procedure TNNetEmbedding.BorrowOwnerOpenCLTable();
+var
+  OwnerEmbedding: TNNetEmbedding;
+begin
+  if (not Assigned(FWeightOwner)) or (not Assigned(FEmbeddingCL)) then exit;
+  OwnerEmbedding := TNNetEmbedding(FWeightOwner);
+  if not Assigned(OwnerEmbedding.FEmbeddingCL) then exit;
+  OwnerEmbedding.EnsureOpenCLTableResident();
+  if not FEmbeddingCL.BorrowTableFrom(OwnerEmbedding.FEmbeddingCL) then
+    FErrorProc('TNNetEmbedding.BorrowOwnerOpenCLTable: layer ' +
+      IntToStr(FLayerIdx) + ' could not borrow its owner''s resident vocab ' +
+      'table (another OpenCL context, or a quantization mismatch) - ' +
+      'uploading a second copy.');
+end;
+
+procedure TNNetEmbedding.EnsureOpenCLTableResident();
+begin
+  if not Assigned(FEmbeddingCL) then exit;
+  FEmbeddingCL.EnsureTableResident(FNeurons[0].Weights, FQuantTable,
+    FVocabSize, FEmbeddingSize);
+end;
+
+function TNNetEmbedding.OpenCLTableBuffer(): cl_mem;
+begin
+  if Assigned(FEmbeddingCL) then Result := FEmbeddingCL.TableBuffer
+  else Result := nil;
 end;
 
 // Three routes in, and two blocks. FShouldOpenCL is pinned False here (the
@@ -108669,6 +109710,8 @@ begin
   // they change which entry point the gather needs.
   ArmEmbeddingCL();
   if Assigned(FEmbeddingCL) then FEmbeddingCL.InvalidateWeightCache();
+  // A borrower's table is the owner's buffer: re-borrow rather than re-upload.
+  BorrowOwnerOpenCLTable();
 end;
 
 // Device token-gather forward faithful to the scalar Compute() below. The
@@ -108815,9 +109858,74 @@ begin
     FQuantTable.Scale[RowIdx, 0] := 1;
 end;
 
+function TNNetEmbedding.NonWeightBytes(): int64;
+begin
+  Result := inherited NonWeightBytes() +
+    int64(Length(FInputTokens)) * csIntegerSize;
+end;
+
 function TNNetEmbedding.Int8QuantizedSizeBytes(): int64;
 begin
+  // A borrowed table is the owner's bytes.
+  if FLinkedQuantTable then exit(0);
   Result := FQuantTable.GetMemSize();
+end;
+
+function TNNetEmbedding.LinkWeightsFrom(Owner: TNNetLayer): boolean;
+var
+  OwnerEmbedding: TNNetEmbedding;
+begin
+  Result := false;
+  if (not Assigned(Owner)) or (Owner.ClassType <> Self.ClassType) then
+  begin
+    FErrorProc('TNNetEmbedding.LinkWeightsFrom: owner must be a layer of the ' +
+      'same class.');
+    exit;
+  end;
+  OwnerEmbedding := TNNetEmbedding(Owner);
+  if (OwnerEmbedding.FVocabSize <> FVocabSize) or
+    (OwnerEmbedding.FEmbeddingSize <> FEmbeddingSize) then
+  begin
+    FErrorProc('TNNetEmbedding.LinkWeightsFrom: owner table is ' +
+      IntToStr(OwnerEmbedding.FVocabSize) + 'x' +
+      IntToStr(OwnerEmbedding.FEmbeddingSize) + ', this layer''s is ' +
+      IntToStr(FVocabSize) + 'x' + IntToStr(FEmbeddingSize) + '.');
+    exit;
+  end;
+  {$IFDEF OpenCL}
+  if FHasOpenCL then
+  begin
+    FErrorProc('TNNetEmbedding.LinkWeightsFrom: link before EnableOpenCL.');
+    exit;
+  end;
+  {$ENDIF}
+  if not LinkNeuronsFrom(Owner) then exit;
+  if OwnerEmbedding.FQuantInt8 then
+  begin
+    FQuantTable.Free;
+    FQuantTable := OwnerEmbedding.FQuantTable;
+    FLinkedQuantTable := true;
+    FQuantInt8 := true;
+  end
+  else if FQuantInt8 then
+  begin
+    // FP32 owner rows replace this layer's own int8 table.
+    FQuantTable.ReSize(0, 0, 0);
+    FQuantInt8 := false;
+  end;
+  AfterWeightUpdate();
+  Result := true;
+end;
+
+procedure TNNetEmbedding.DetachFromWeightOwner();
+begin
+  if not Assigned(FWeightOwner) then exit;
+  inherited DetachFromWeightOwner();
+  if FLinkedQuantTable then
+  begin
+    FQuantTable := TNNetVolumeQuant8.Create();
+    FLinkedQuantTable := false;
+  end;
 end;
 
 function TNNetEmbedding.CountWeights(): int64;
@@ -109432,6 +110540,7 @@ begin
   inherited Create();
   ClearTime();
   FIsTrainable := true;
+  FBuildWeightOwner := nil;
   {$IFDEF OpenCL}
   FDotProductKernel := nil;
   FSharedKernels := nil;
@@ -109459,6 +110568,7 @@ begin
     FSharedKernels.Free;
   end;
   if FDotProductKernel <> nil then FDotProductKernel.Free;
+  ReleaseBorrowedOpenCLContext();
   // The list tracks helper objects it does not own; FLayers freed them above.
   if Assigned(FOpenCLOwned) then FOpenCLOwned.Free;
   {$ENDIF}
@@ -109483,6 +110593,16 @@ begin
       Result := Result + FLayers[LayerCnt].CountNeurons();
     end;
   end;
+end;
+
+function TNNet.NonWeightBytes(): int64;
+var
+  LayerCnt, LastLayerIdx: integer;
+begin
+  Result := 0;
+  LastLayerIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+    Result := Result + FLayers[LayerCnt].NonWeightBytes();
 end;
 
 function TNNet.CountWeights(): int64;
@@ -122626,18 +123746,9 @@ var
   MaxCountNeuronPos: integer;
   MaxCollectNeuronPos: integer;
   MaxCollectWeightPos: integer;
-  MaxLayerCountNeuronPos: integer;
-  MaxLayerCollectNeuronPos: integer;
-  MaxLayerCollectWeightPos: integer;
   MaxPruneNeuronPos: integer;
   MaxPruneWeightPos: integer;
   MaxLossOutputPos: integer;
-  MaxKneeCollectNeuronPos: integer;
-  MaxKneeCollectWeightPos: integer;
-  MaxKneeCountNeuronPos: integer;
-  MaxKneeLayerCollectNeuronPos: integer;
-  MaxKneeLayerCollectWeightPos: integer;
-  MaxKneeScanNeuronPos: integer;
   MaxKneeScanWeightPos: integer;
   Lines: TStringList;
   Levels: array of TNeuralFloat;
@@ -122646,6 +123757,13 @@ var
   LevelRealised: array of TNeuralFloat;
   TrLayerIdx: array of integer;
   AllAbs: array of TNeuralFloat;
+  // Invariant |w| pool: weights are restored exactly from Snapshot after each
+  // level, so the pooled magnitudes are collected once and copied into the
+  // AllAbs/LayerAbs scratch per level (SelectKthSmallest permutes the scratch).
+  AllAbsMaster: array of TNeuralFloat;
+  LayerWeightCount: array of integer;  // weights per trainable layer
+  LayerOffset: array of integer;       // slice start of each layer in the pool
+  MaxLayerWeightCount: integer;
   KneePrunedFrac: array of TNeuralFloat;
   KneeWeights: array of integer;
   KneeZeroed: array of integer;
@@ -122656,7 +123774,9 @@ var
   MPLastLayerIdx, MPUsedSamplesM1, MPNumLevelsM1, MPTrainM1, MPBaselineHigh: integer;
   Layer: TNNetLayer;
   Neuron: TNNetNeuron;
-  W, AbsW, Threshold, S, AccLoss, AccAcc, SampleLoss, Tgt, Diff: TNeuralFloat;
+  LblVol: TNNetVolume;
+  CommonSize: integer;
+  AbsW, Threshold, S, AccLoss, AccAcc, SampleLoss, Diff: TNeuralFloat;
   BaseLoss, BaseAcc, BarVal, MaxBarVal, RealisedFrac: TNeuralFloat;
   HasLabels, RestoreNeeded: boolean;
   Output: TNNetVolume;
@@ -122693,6 +123813,7 @@ begin
 
     // ---- collect trainable layers (Neurons with a non-empty weight tensor). --
     SetLength(TrLayerIdx, 0);
+    SetLength(LayerWeightCount, 0);
     TotalWeights := 0;
     MPLastLayerIdx := NN.GetLastLayerIdx();
     for LayerIdx := 0 to MPLastLayerIdx do
@@ -122702,10 +123823,14 @@ begin
       if Layer.Neurons[0].Weights = nil then Continue;
       if Layer.Neurons[0].Weights.Size = 0 then Continue;
       SetLength(TrLayerIdx, Length(TrLayerIdx) + 1);
+      SetLength(LayerWeightCount, Length(LayerWeightCount) + 1);
       TrLayerIdx[High(TrLayerIdx)] := LayerIdx;
       MaxCountNeuronPos := Layer.Neurons.Count - 1;
+      PerLayerCount := 0;
       for NeuronIdx := 0 to MaxCountNeuronPos do
-        TotalWeights := TotalWeights + Layer.Neurons[NeuronIdx].Weights.Size;
+        PerLayerCount := PerLayerCount + Layer.Neurons[NeuronIdx].Weights.Size;
+      LayerWeightCount[High(LayerWeightCount)] := PerLayerCount;
+      TotalWeights := TotalWeights + PerLayerCount;
     end;
     TrainableLayers := Length(TrLayerIdx);
 
@@ -122768,6 +123893,33 @@ begin
     SetLength(KneeZeroed, TrainableLayers);
     SetLength(AllAbs, TotalWeights);
 
+    // ---- collect the |w| pool ONCE (layer slices in TrLayerIdx order). ----
+    // The per-level threshold scans work on scratch copies of this pool: one
+    // Move per level replaces re-walking every neuron's weight list.
+    SetLength(AllAbsMaster, TotalWeights);
+    SetLength(LayerOffset, TrainableLayers);
+    MaxLayerWeightCount := 0;
+    K := 0;
+    for I := 0 to MPTrainM1 do
+    begin
+      LayerOffset[I] := K;
+      if LayerWeightCount[I] > MaxLayerWeightCount then
+        MaxLayerWeightCount := LayerWeightCount[I];
+      Layer := NN.Layers[TrLayerIdx[I]];
+      MaxCollectNeuronPos := Layer.Neurons.Count - 1;
+      for NeuronIdx := 0 to MaxCollectNeuronPos do
+      begin
+        Neuron := Layer.Neurons[NeuronIdx];
+        MaxCollectWeightPos := Neuron.Weights.Size - 1;
+        for LayerIdx := 0 to MaxCollectWeightPos do
+        begin
+          AllAbsMaster[K] := Abs(Neuron.Weights.FData[LayerIdx]);
+          Inc(K);
+        end;
+      end;
+    end;
+    if PerLayer then SetLength(LayerAbs, MaxLayerWeightCount);
+
     for LvIdx := 0 to MPNumLevelsM1 do
     begin
       S := Levels[LvIdx] / 100.0;
@@ -122776,23 +123928,9 @@ begin
       // ---- compute & apply threshold(s), zeroing |w| <= threshold in place. --
       if not PerLayer then
       begin
-        // GLOBAL: pool all |w|, sort, cut at s-percentile.
-        K := 0;
-        for I := 0 to MPTrainM1 do
-        begin
-          Layer := NN.Layers[TrLayerIdx[I]];
-          MaxCollectNeuronPos := Layer.Neurons.Count - 1;
-          for NeuronIdx := 0 to MaxCollectNeuronPos do
-          begin
-            Neuron := Layer.Neurons[NeuronIdx];
-            MaxCollectWeightPos := Neuron.Weights.Size - 1;
-            for LayerIdx := 0 to MaxCollectWeightPos do
-            begin
-              AllAbs[K] := Abs(Neuron.Weights.FData[LayerIdx]);
-              Inc(K);
-            end;
-          end;
-        end;
+        // GLOBAL: refresh the scratch from the invariant pool, cut at the
+        // s-percentile.
+        Move(AllAbsMaster[0], AllAbs[0], TotalWeights * csNeuralFloatSize);
         CutIdx := Trunc(S * TotalWeights);
         if CutIdx < 0 then CutIdx := 0;
         if CutIdx > TotalWeights then CutIdx := TotalWeights;
@@ -122809,29 +123947,16 @@ begin
       for I := 0 to MPTrainM1 do
       begin
         Layer := NN.Layers[TrLayerIdx[I]];
-        KneeWeights[I] := 0;
+        KneeWeights[I] := LayerWeightCount[I];
         KneeZeroed[I] := 0;
-        MaxLayerCountNeuronPos := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to MaxLayerCountNeuronPos do
-          KneeWeights[I] := KneeWeights[I] + Layer.Neurons[NeuronIdx].Weights.Size;
 
         if PerLayer then
         begin
-          // PER-LAYER: sort this layer's |w|, cut at s-percentile.
-          PerLayerCount := KneeWeights[I];
-          SetLength(LayerAbs, PerLayerCount);
-          K := 0;
-          MaxLayerCollectNeuronPos := Layer.Neurons.Count - 1;
-          for NeuronIdx := 0 to MaxLayerCollectNeuronPos do
-          begin
-            Neuron := Layer.Neurons[NeuronIdx];
-            MaxLayerCollectWeightPos := Neuron.Weights.Size - 1;
-            for LayerIdx := 0 to MaxLayerCollectWeightPos do
-            begin
-              LayerAbs[K] := Abs(Neuron.Weights.FData[LayerIdx]);
-              Inc(K);
-            end;
-          end;
+          // PER-LAYER: refresh this layer's slice of the invariant pool,
+          // cut at the s-percentile.
+          PerLayerCount := LayerWeightCount[I];
+          Move(AllAbsMaster[LayerOffset[I]], LayerAbs[0],
+            PerLayerCount * csNeuralFloatSize);
           PerLayerCut := Trunc(S * PerLayerCount);
           if PerLayerCut <= 0 then Threshold := -1
           else if PerLayerCut >= PerLayerCount then
@@ -122841,19 +123966,23 @@ begin
             PerLayerCut - 1);
         end;
 
-        MaxPruneNeuronPos := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to MaxPruneNeuronPos do
+        // Threshold < 0 means "zero nothing": skip the whole scan.
+        if Threshold >= 0 then
         begin
-          Neuron := Layer.Neurons[NeuronIdx];
-          MaxPruneWeightPos := Neuron.Weights.Size - 1;
-          for LayerIdx := 0 to MaxPruneWeightPos do
+          MaxPruneNeuronPos := Layer.Neurons.Count - 1;
+          for NeuronIdx := 0 to MaxPruneNeuronPos do
           begin
-            AbsW := Abs(Neuron.Weights.FData[LayerIdx]);
-            if (Threshold >= 0) and (AbsW <= Threshold) then
+            Neuron := Layer.Neurons[NeuronIdx];
+            MaxPruneWeightPos := Neuron.Weights.Size - 1;
+            for LayerIdx := 0 to MaxPruneWeightPos do
             begin
-              Neuron.Weights.FData[LayerIdx] := 0;
-              Inc(KneeZeroed[I]);
-              Inc(ZeroedTotal);
+              AbsW := Abs(Neuron.Weights.FData[LayerIdx]);
+              if AbsW <= Threshold then
+              begin
+                Neuron.Weights.FData[LayerIdx] := 0;
+                Inc(KneeZeroed[I]);
+                Inc(ZeroedTotal);
+              end;
             end;
           end;
         end;
@@ -122873,27 +124002,38 @@ begin
       begin
         NN.Compute(Samples[SampleIdx]);
         Output := NN.GetLastLayer.Output;
-        SampleLoss := 0;
-        MaxLossOutputPos := Output.Size - 1;
-        for I := 0 to MaxLossOutputPos do
+        if HasLabels then
         begin
-          if HasLabels then
+          LblVol := Labels[SampleIdx];
+          SampleLoss := 0;
+          // Head: elementwise MSE over the overlapping prefix. Tail (label
+          // shorter than the output): the target is 0, so the remainder is a
+          // vectorized sum of squares.
+          CommonSize := Output.Size;
+          if LblVol.Size < CommonSize then CommonSize := LblVol.Size;
+          MaxLossOutputPos := CommonSize - 1;
+          for I := 0 to MaxLossOutputPos do
           begin
-            if I < Labels[SampleIdx].Size then Tgt := Labels[SampleIdx].Raw[I]
-            else Tgt := 0;
-          end
-          else
-            Tgt := Baseline[SampleIdx].Raw[I];
-          Diff := Output.Raw[I] - Tgt;
-          SampleLoss := SampleLoss + Diff * Diff;
-        end;
+            Diff := Output.Raw[I] - LblVol.Raw[I];
+            SampleLoss := SampleLoss + Diff * Diff;
+          end;
+          if CommonSize < Output.Size then
+            SampleLoss := SampleLoss + TNNetVolume.DotProduct(
+              TNeuralFloatArrPtr(@Output.FData[CommonSize]),
+              TNeuralFloatArrPtr(@Output.FData[CommonSize]),
+              Output.Size - CommonSize);
+        end
+        else
+          // Baseline outputs were copied from this same net, so the sizes
+          // match by construction.
+          SampleLoss := Output.GetDistanceSqr(Baseline[SampleIdx]);
         if Output.Size > 0 then SampleLoss := SampleLoss / Output.Size;
         AccLoss := AccLoss + SampleLoss;
 
         if HasLabels then
         begin
           PredClass := Output.GetClass();
-          TrueClass := Labels[SampleIdx].GetClass();
+          TrueClass := LblVol.GetClass();
           if PredClass = TrueClass then AccAcc := AccAcc + 1.0;
         end;
       end;
@@ -122982,29 +124122,10 @@ begin
     // ---- (c) per-layer pruned fraction AT THE KNEE. ----
     // Re-apply the knee threshold once to read per-layer pruned counts.
     S := KneeSparsity / 100.0;
-    for I := 0 to MPTrainM1 do
-    begin
-      KneeZeroed[I] := 0;
-      KneeWeights[I] := 0;
-    end;
     if not PerLayer then
     begin
-      K := 0;
-      for I := 0 to MPTrainM1 do
-      begin
-        Layer := NN.Layers[TrLayerIdx[I]];
-        MaxKneeCollectNeuronPos := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to MaxKneeCollectNeuronPos do
-        begin
-          Neuron := Layer.Neurons[NeuronIdx];
-          MaxKneeCollectWeightPos := Neuron.Weights.Size - 1;
-          for LayerIdx := 0 to MaxKneeCollectWeightPos do
-          begin
-            AllAbs[K] := Abs(Neuron.Weights.FData[LayerIdx]);
-            Inc(K);
-          end;
-        end;
-      end;
+      // The weights are restored, so the invariant pool is still exact.
+      Move(AllAbsMaster[0], AllAbs[0], TotalWeights * csNeuralFloatSize);
       CutIdx := Trunc(S * TotalWeights);
       if CutIdx <= 0 then Threshold := -1
       else if CutIdx >= TotalWeights then
@@ -123013,26 +124134,11 @@ begin
     end;
     for I := 0 to MPTrainM1 do
     begin
-      Layer := NN.Layers[TrLayerIdx[I]];
       if PerLayer then
       begin
-        PerLayerCount := 0;
-        MaxKneeCountNeuronPos := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to MaxKneeCountNeuronPos do
-          PerLayerCount := PerLayerCount + Layer.Neurons[NeuronIdx].Weights.Size;
-        SetLength(LayerAbs, PerLayerCount);
-        K := 0;
-        MaxKneeLayerCollectNeuronPos := Layer.Neurons.Count - 1;
-        for NeuronIdx := 0 to MaxKneeLayerCollectNeuronPos do
-        begin
-          Neuron := Layer.Neurons[NeuronIdx];
-          MaxKneeLayerCollectWeightPos := Neuron.Weights.Size - 1;
-          for LayerIdx := 0 to MaxKneeLayerCollectWeightPos do
-          begin
-            LayerAbs[K] := Abs(Neuron.Weights.FData[LayerIdx]);
-            Inc(K);
-          end;
-        end;
+        PerLayerCount := LayerWeightCount[I];
+        Move(AllAbsMaster[LayerOffset[I]], LayerAbs[0],
+          PerLayerCount * csNeuralFloatSize);
         PerLayerCut := Trunc(S * PerLayerCount);
         if PerLayerCut <= 0 then Threshold := -1
         else if PerLayerCut >= PerLayerCount then
@@ -123041,17 +124147,15 @@ begin
         else Threshold := SelectKthSmallest(LayerAbs, PerLayerCount,
           PerLayerCut - 1);
       end;
-      MaxKneeScanNeuronPos := Layer.Neurons.Count - 1;
-      for NeuronIdx := 0 to MaxKneeScanNeuronPos do
+      // Count against this layer's slice of the pool: the weights are
+      // restored, so the pool holds exactly the layer's |w| values.
+      KneeWeights[I] := LayerWeightCount[I];
+      KneeZeroed[I] := 0;
+      if Threshold >= 0 then
       begin
-        Neuron := Layer.Neurons[NeuronIdx];
-        MaxKneeScanWeightPos := Neuron.Weights.Size - 1;
-        for LayerIdx := 0 to MaxKneeScanWeightPos do
-        begin
-          Inc(KneeWeights[I]);
-          AbsW := Abs(Neuron.Weights.FData[LayerIdx]);
-          if (Threshold >= 0) and (AbsW <= Threshold) then Inc(KneeZeroed[I]);
-        end;
+        MaxKneeScanWeightPos := LayerOffset[I] + LayerWeightCount[I] - 1;
+        for K := LayerOffset[I] to MaxKneeScanWeightPos do
+          if AllAbsMaster[K] <= Threshold then Inc(KneeZeroed[I]);
       end;
       if KneeWeights[I] > 0 then
         KneePrunedFrac[I] := KneeZeroed[I] / KneeWeights[I]
@@ -123167,6 +124271,8 @@ var
   MeanConf: array of TNeuralFloat;
   PredClass: array of integer;
   MaxLogit, SumExp, Z, PEnt, EEnt, ExpEntAcc, TopMean, TopM2, Delta2: TNeuralFloat;
+  InvTemp, InvSum: TNeuralFloat;
+  ProbPtr: TNeuralFloatArrPtr;
   ModalArg, Flips, BestArg, BestCount: integer;
   ArgCount: array of integer;
   // histogram of BALD
@@ -123274,6 +124380,8 @@ begin
     NN.EnableDropouts(True);
 
     SetLength(Prob, NumClasses);
+    ProbPtr := TNeuralFloatArrPtr(@Prob[0]);
+    InvTemp := 1.0 / Temperature;
     SetLength(MeanProb, NumClasses);
     SetLength(PassArgmax, NumPasses);
     SetLength(TopProbHist, NumPasses);
@@ -123310,61 +124418,56 @@ begin
         begin
           // Output is already a probability vector p. Temperature scaling on
           // a probability is p^(1/T) renormalised (== softmax(logit/T) up to
-          // an additive constant); T=1 is the identity.
+          // an additive constant); T=1 is the identity, so the transcendental
+          // pair is skipped entirely in that common case.
           SumExp := 0;
-          for ClassIdx := 0 to MCNumClassesM1 do
+          if Temperature = 1.0 then
           begin
-            Z := Output.Raw[ClassIdx];
-            if Z < cEps then Z := cEps;
-            if Temperature <> 1.0 then Z := NeuralExp(pcr_logf(Z) / Temperature);
-            Prob[ClassIdx] := Z;
-            SumExp := SumExp + Z;
-          end;
-          if SumExp <= 0 then SumExp := cEps;
-          for ClassIdx := 0 to MCNumClassesM1 do
-            Prob[ClassIdx] := Prob[ClassIdx] / SumExp;
-        end
-        else if IsLogHead then
-        begin
-          // Output is log p. Recover p via exp, then temperature-renormalise
-          // as in the prob-head case (log p / T -> exp -> renormalise).
-          SumExp := 0;
-          MaxLogit := Output.Raw[0] / Temperature;
-          for ClassIdx := 1 to MCNumClassesM1 do
+            for ClassIdx := 0 to MCNumClassesM1 do
+            begin
+              Z := Output.Raw[ClassIdx];
+              if Z < cEps then Z := cEps;
+              Prob[ClassIdx] := Z;
+              SumExp := SumExp + Z;
+            end;
+          end
+          else
           begin
-            Z := Output.Raw[ClassIdx] / Temperature;
-            if Z > MaxLogit then MaxLogit := Z;
+            for ClassIdx := 0 to MCNumClassesM1 do
+            begin
+              Z := Output.Raw[ClassIdx];
+              if Z < cEps then Z := cEps;
+              Z := NeuralExp(pcr_logf(Z) * InvTemp);
+              Prob[ClassIdx] := Z;
+              SumExp := SumExp + Z;
+            end;
           end;
-          for ClassIdx := 0 to MCNumClassesM1 do
-          begin
-            Z := NeuralExp((Output.Raw[ClassIdx] / Temperature) - MaxLogit);
-            Prob[ClassIdx] := Z;
-            SumExp := SumExp + Z;
-          end;
-          if SumExp <= 0 then SumExp := cEps;
-          for ClassIdx := 0 to MCNumClassesM1 do
-            Prob[ClassIdx] := Prob[ClassIdx] / SumExp;
         end
         else
         begin
-          // Raw logits: numerically-stable softmax(z / Temperature).
-          MaxLogit := Output.Raw[0] / Temperature;
-          for ClassIdx := 1 to MCNumClassesM1 do
+          // Log-softmax head (Output = log p) and raw logits share the same
+          // math: numerically-stable softmax(Output / Temperature). At T=1
+          // both passes run vectorized straight off the output volume; T<>1
+          // pre-scales once into Prob so no element is divided twice.
+          if Temperature = 1.0 then
           begin
-            Z := Output.Raw[ClassIdx] / Temperature;
-            if Z > MaxLogit then MaxLogit := Z;
-          end;
-          SumExp := 0;
-          for ClassIdx := 0 to MCNumClassesM1 do
+            MaxLogit := TNNetVolume.MaxValue(Output.DataPtr, NumClasses);
+            SumExp := TNNetVolume.ExpShiftSum(ProbPtr, Output.DataPtr,
+              MaxLogit, NumClasses);
+          end
+          else
           begin
-            Z := NeuralExp((Output.Raw[ClassIdx] / Temperature) - MaxLogit);
-            Prob[ClassIdx] := Z;
-            SumExp := SumExp + Z;
+            for ClassIdx := 0 to MCNumClassesM1 do
+              Prob[ClassIdx] := Output.Raw[ClassIdx] * InvTemp;
+            MaxLogit := TNNetVolume.MaxValue(ProbPtr, NumClasses);
+            SumExp := TNNetVolume.ExpShiftSum(ProbPtr, ProbPtr,
+              MaxLogit, NumClasses);
           end;
-          if SumExp <= 0 then SumExp := cEps;
-          for ClassIdx := 0 to MCNumClassesM1 do
-            Prob[ClassIdx] := Prob[ClassIdx] / SumExp;
         end;
+        if SumExp <= 0 then SumExp := cEps;
+        InvSum := 1.0 / SumExp;
+        for ClassIdx := 0 to MCNumClassesM1 do
+          Prob[ClassIdx] := Prob[ClassIdx] * InvSum;
 
         // per-pass entropy H[p_t] (aleatoric contribution).
         PEnt := 0;
@@ -123611,7 +124714,6 @@ const
   cTransformCount = 4;
 var
   MaxCheckSamplePos: integer;
-  MaxCheckOutputPos: integer;
   TransformM1, EqCBinsM1, CountedM1: integer;
   Lines: TStringList;
   TName: array[0 .. cTransformCount - 1] of string;
@@ -123619,9 +124721,9 @@ var
   TIdx, SampleIdx, I, BinIdx, UsedSamples: integer;
   ShapeX, ShapeY, ShapeD: integer;
   IsImage: boolean;
-  Base, Trans: TNNetVolume;
+  Base, Trans, OutVol: TNNetVolume;
   BaseClass: integer;
-  BaseNorm, Diff, SumSq, DeltaL2, RelErr: TNeuralFloat;
+  BaseNorm, SumSq, DeltaL2, RelErr: TNeuralFloat;
   Counted, AgreeCount, SkippedZero: integer;
   AccErr, MaxErr, MeanErr, AgreeRate: TNeuralFloat;
   // per-sample relative errors for this transform (for the histogram)
@@ -123700,9 +124802,11 @@ begin
       ['Transform', 'InvarErr', 'Top1-Agree', 'Skipped', 'Verdict']));
     Lines.Add(StringOfChar('-', 92));
 
+    // Sized once to the acceptance cap; only the first Counted entries are
+    // read, so no per-sample regrow and no truncation are needed.
+    SetLength(PerSampleErr, Samples.Count);
     for TIdx := 0 to TransformM1 do
     begin
-      SetLength(PerSampleErr, 0);
       AccErr := 0;
       MaxErr := 0;
       Counted := 0;
@@ -123722,25 +124826,20 @@ begin
         TNet[TIdx].Compute(Samples[SampleIdx]);
         Trans := TNet[TIdx].GetLastLayer.Output;
         NN.Compute(Trans);
-        // NN.GetLastLayer.Output now holds f(T(x)).
+        OutVol := NN.GetLastLayer.Output; // f(T(x))
 
         Inc(UsedSamples);
 
         // top-1 agreement.
-        if NN.GetLastLayer.Output.GetClass() = BaseClass then Inc(AgreeCount);
+        if OutVol.GetClass() = BaseClass then Inc(AgreeCount);
 
-        // relative L2 invariance error.
+        // relative L2 invariance error, as two vectorized reductions.
         SumSq := 0;
         BaseNorm := 0;
-        if NN.GetLastLayer.Output.Size = Base.Size then
+        if OutVol.Size = Base.Size then
         begin
-          MaxCheckOutputPos := Base.Size - 1;
-          for I := 0 to MaxCheckOutputPos do
-          begin
-            Diff := NN.GetLastLayer.Output.Raw[I] - Base.Raw[I];
-            SumSq := SumSq + Diff * Diff;
-            BaseNorm := BaseNorm + Base.Raw[I] * Base.Raw[I];
-          end;
+          SumSq := OutVol.GetDistanceSqr(Base);
+          BaseNorm := Base.GetSumSqr();
         end;
         DeltaL2 := Sqrt(SumSq);
         BaseNorm := Sqrt(BaseNorm);
@@ -123753,7 +124852,6 @@ begin
         AccErr := AccErr + RelErr;
         if RelErr > MaxErr then MaxErr := RelErr;
         Inc(Counted);
-        SetLength(PerSampleErr, Counted);
         PerSampleErr[Counted - 1] := RelErr;
       end;
 
@@ -124126,7 +125224,6 @@ class function TNNet.AdversarialRobustnessReport(
 ): string;
 var
   MaxGradPos: integer;
-  MaxAdvPos: integer;
   NM1, NEpsM1, NClassesM1, EpsListM1, EpsLenM1: integer;
   Lines: TStringList;
   N, NClasses, OutSize, NEps, MedianIdx: integer;
@@ -124139,9 +125236,9 @@ var
   Acc: array of TNeuralFloat;
   // per-class accuracy at median eps
   ClassTotal, ClassCorrect: array of integer;
-  Grad, Adv: TNNetVolume;
+  Grad, Adv, Target, SampleVol: TNNetVolume;
   HaveZero: boolean;
-  Tmp: TNeuralFloat;
+  Tmp, EpsE: TNeuralFloat;
   PredCls: integer;
   AccClean, AccMedian, Drop: TNeuralFloat;
   Verdict: string;
@@ -124167,38 +125264,31 @@ var
   // into GradOut (assumed already sized to X).
   procedure InputLossGrad(X: TNNetVolume; TrueClass: integer; GradOut: TNNetVolume);
   var
-    Gi, GradOutM1: integer;
-    Target: TNNetVolume;
     InLayer: TNNetLayer;
+    ValidClass: boolean;
   begin
     NN.ClearDeltas();
     NN.Compute(X);
-    Target := TNNetVolume.Create(NN.GetLastLayer.Output.Size, 1, 1);
-    try
-      Target.Fill(0);
-      if (TrueClass >= 0) and (TrueClass < Target.Size) then
-        Target.Raw[TrueClass] := 1.0;
-      // TNNet.Backpropagate sets last-layer error = Output - Target (the
-      // cross-entropy gradient) and runs the backward chain.
-      NN.Backpropagate(Target);
-    finally
-      Target.Free;
-    end;
-    GradOut.Fill(0);
+    // Target is the caller-owned all-zero scratch: raise the one-hot bit,
+    // backpropagate, then lower it so the scratch stays all-zero.
+    ValidClass := (TrueClass >= 0) and (TrueClass < Target.Size);
+    if ValidClass then Target.Raw[TrueClass] := 1.0;
+    // TNNet.Backpropagate sets last-layer error = Output - Target (the
+    // cross-entropy gradient) and runs the backward chain.
+    NN.Backpropagate(Target);
+    if ValidClass then Target.Raw[TrueClass] := 0;
     InLayer := NN.Layers[0];
     if (InLayer.OutputError <> nil) and
        (InLayer.OutputError.Size = GradOut.Size) then
-    begin
-      GradOutM1 := GradOut.Size - 1;
-      for Gi := 0 to GradOutM1 do
-        GradOut.Raw[Gi] := InLayer.OutputError.Raw[Gi];
-    end;
+      GradOut.Copy(InLayer.OutputError)
+    else
+      GradOut.Fill(0);
   end;
 
 begin
   Result := '';
   Lines := TStringList.Create();
-  Grad := nil; Adv := nil;
+  Grad := nil; Adv := nil; Target := nil;
   try
     if NN = nil then
     begin
@@ -124289,28 +125379,36 @@ begin
 
     Grad := TNNetVolume.Create(Samples[0]);
     Adv := TNNetVolume.Create(Samples[0]);
+    // One-hot scratch for InputLossGrad, created once for the whole report;
+    // the callee raises and lowers a single element per call.
+    Target := TNNetVolume.Create(OutSize, 1, 1);
+    Target.Fill(0);
 
     for I := 0 to NM1 do
     begin
+      SampleVol := Samples[I];
       // Clean forward: record argmax and max-softmax confidence.
-      NN.Compute(Samples[I]);
+      NN.Compute(SampleVol);
       CleanArgmax[I] := NN.GetLastLayer.Output.GetClass();
       CleanConf[I] := NN.GetLastLayer.Output.GetMax();
       CritEps[I] := -1;  // assume survives until proven otherwise
 
       // Input loss gradient (one backward pass), then its sign.
-      Grad.ReSize(Samples[I]);
-      Adv.ReSize(Samples[I]);
-      InputLossGrad(Samples[I], Labels[I], Grad);
+      Grad.ReSize(SampleVol);
+      Adv.ReSize(SampleVol);
+      InputLossGrad(SampleVol, Labels[I], Grad);
       MaxGradPos := Grad.Size - 1;
       for J := 0 to MaxGradPos do Grad.Raw[J] := SignF(Grad.Raw[J]);
 
       for E := 0 to NEpsM1 do
       begin
         // x_adv = x + eps * sign(grad); eps=0 reproduces the clean input.
-        MaxAdvPos := Adv.Size - 1;
-        for J := 0 to MaxAdvPos do
-          Adv.Raw[J] := Samples[I].Raw[J] + Eps[E] * Grad.Raw[J];
+        // Bulk copy + vectorized MulAdd beat the fused scalar loop here: the
+        // scalar form pays three property accessors per element, the two
+        // bulk passes run at memcpy/SIMD speed.
+        EpsE := Eps[E];
+        Adv.Copy(SampleVol);
+        TNNetVolume.MulAdd(Adv.DataPtr, Grad.DataPtr, EpsE, Adv.Size);
         NN.Compute(Adv);
         PredCls := NN.GetLastLayer.Output.GetClass();
         if PredCls = Labels[I] then Inc(CorrectAtEps[E]);
@@ -124473,6 +125571,7 @@ begin
   finally
     if Grad <> nil then Grad.Free;
     if Adv <> nil then Adv.Free;
+    if Target <> nil then Target.Free;
     Lines.Free;
   end;
 end;
@@ -128483,9 +129582,25 @@ begin
     if ShouldIncDepartingBranchesCnt(pLayer)
       then AfterLayer.IncDepartingBranchesCnt();
   end;
+  RegisterLayer(pLayer);
+  Result := pLayer;
+end;
+
+procedure TNNet.RegisterLayer(pLayer: TNNetLayer);
+begin
   FLayers.Add(pLayer);
   pLayer.FLayerIdx := GetLastLayerIdx();
-  Result := pLayer;
+  if Assigned(FBuildWeightOwner) then pLayer.LinkBuildWeightOwner();
+end;
+
+function TNNet.WeightElementsSized(): int64;
+var
+  LayerCnt, LastLayerIdx: integer;
+begin
+  Result := 0;
+  LastLayerIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+    Result := Result + FLayers[LayerCnt].FWeightElementsSized;
 end;
 
 function TNNet.AddLayer(strData: string):TNNetLayer;
@@ -129863,8 +130978,7 @@ begin
   begin
     pLayer.NN := Self;
     pLayer.SetPrevLayer(pAfterLayer);
-    FLayers.Add(pLayer);
-    pLayer.FLayerIdx := GetLastLayerIdx();
+    RegisterLayer(pLayer);
     if (ShouldIncDepartingBranchesCnt(pLayer)) then pAfterLayer.IncDepartingBranchesCnt();
     Result := pLayer;
   end
@@ -129883,8 +130997,7 @@ begin
     pLayer.SetPrevLayer(FLayers[pAfterLayerIdx]);
     if (ShouldIncDepartingBranchesCnt(pLayer)) then FLayers[pAfterLayerIdx].IncDepartingBranchesCnt();
   end;
-  FLayers.Add(pLayer);
-  pLayer.FLayerIdx := GetLastLayerIdx();
+  RegisterLayer(pLayer);
   Result := pLayer;
 end;
 
@@ -130028,7 +131141,7 @@ begin
   end;
 end;
 
-procedure TNNet.Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0; Parallel: boolean = false);
+procedure TNNet.Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0; Parallel: boolean = false; EndLayerIdx: integer = -1);
 var
   StartTime: double;
   {$IFDEF OpenCL}
@@ -130041,15 +131154,29 @@ begin
     if FLayers[FromLayerIdx].FOutput.Size = pInput.Size then
     begin
       FLayers[FromLayerIdx].FOutput.CopyNoChecks(pInput);
+      if (EndLayerIdx < 0) or (EndLayerIdx > GetLastLayerIdx())
+        then EndLayerIdx := GetLastLayerIdx();
+      if EndLayerIdx < FromLayerIdx then
+      begin
+        FErrorProc('Compute - EndLayerIdx ' + IntToStr(EndLayerIdx) +
+          ' is before FromLayerIdx ' + IntToStr(FromLayerIdx) + '.');
+        exit;
+      end;
       // Trainable nets need the strict serial layer order (backpropagation
       // pairs with it); inference-only nets (SetTrainable(False)) may run
       // independent layers in parallel. Coded by Claude (AI).
       if Parallel
-        then ComputeParallel(FromLayerIdx)
-        else ComputeSerial(FromLayerIdx);
+        then ComputeParallel(FromLayerIdx, EndLayerIdx)
+        else ComputeSerial(FromLayerIdx, EndLayerIdx);
       {$IFDEF OpenCL}
       StartOpenCLQueueTime := Now();
-      GetLastLayer().ForceOutputOnRAM();
+      // A full forward settles the logits on the host. A forward cut short
+      // has no host reader, so it only drains the queue: the upload of the
+      // next input must not overtake a non-blocking write still reading the
+      // host buffers of this pass.
+      if EndLayerIdx = GetLastLayerIdx()
+        then GetLastLayer().ForceOutputOnRAM()
+        else if Assigned(FDotProductKernel) then FDotProductKernel.Finish();
       FNNetForwardTimeQueueOpenCL := FNNetForwardTimeQueueOpenCL + (Now() - StartOpenCLQueueTime);
       {$ENDIF}
     end else
@@ -130068,12 +131195,14 @@ begin
   FNNetForwardTime := FNNetForwardTime + (Now() - StartTime);
 end;
 
-procedure TNNet.ComputeSerial(FromLayerIdx: integer = 0);
+procedure TNNet.ComputeSerial(FromLayerIdx: integer = 0;
+  EndLayerIdx: integer = -1);
 var
   LayerCnt: integer;
   LastLayer: integer;
 begin
   LastLayer := GetLastLayerIdx();
+  if (EndLayerIdx >= 0) and (EndLayerIdx < LastLayer) then LastLayer := EndLayerIdx;
   // Serial forward is fully single-threaded: the compute path picks the
   // threading mode so callers only choose serial vs parallel (no separate
   // intra-layer knob). ComputeParallel does the inverse (enables it).
@@ -130389,10 +131518,14 @@ begin
   // dependent's unmet-dependency counter and enqueue those that hit zero.
   // This replaces the old full-range re-sweep (O(L^2) per pass) with
   // O(L + edges) total queue traffic.
+  // A dependent past FSchedLast is outside this pass (Compute with an end
+  // layer): its in-degree was never seeded, so it is neither counted nor
+  // enqueued.
   DependentsHigh := High(FSchedDependents[pLayerIdx]);
   for DepCnt := 0 to DependentsHigh do
   begin
     DependentIdx := FSchedDependents[pLayerIdx][DepCnt];
+    if DependentIdx > FSchedLast then continue;
     if NeuralAtomicDecrement(FSchedInDeg[DependentIdx]) = 0
       then SchedEnqueueReady(DependentIdx);
   end;
@@ -130534,7 +131667,8 @@ begin
   end;
 end;
 
-procedure TNNetExecutionPlanner.ComputeParallel(FromLayerIdx: integer = 0);
+procedure TNNetExecutionPlanner.ComputeParallel(FromLayerIdx: integer = 0;
+  EndLayerIdx: integer = -1);
 var
   LayerCnt, DepCnt: integer;
   LastLayer: integer;
@@ -130544,6 +131678,7 @@ var
   FromLayerIdxM1: integer;
 begin
   LastLayer := GetLastLayerIdx();
+  if (EndLayerIdx >= 0) and (EndLayerIdx < LastLayer) then LastLayer := EndLayerIdx;
   // Parallel forward also drives intra-layer threading (big WillThread layers
   // split across the pool); the compute path picks the threading mode so
   // callers only choose serial vs parallel. ComputeSerial does the inverse.
@@ -130566,7 +131701,7 @@ begin
   then
   begin
     Inc(FSchedSerialPassCnt);
-    ComputeSerial(FromLayerIdx); // the classic serial layer loop
+    ComputeSerial(FromLayerIdx, LastLayer); // the classic serial layer loop
     exit;
   end;
   Inc(FSchedParallelPassCnt);
@@ -130586,7 +131721,7 @@ begin
     FLayers[LayerCnt].FComputeState := 2;
   end;
   FSchedFrom := FromLayerIdx;
-  FSchedLast := LastLayer;
+  FSchedLast := LastLayer; // the pass ends here: RunEpilogue wakes no layer past it
   FSchedRemaining := LastLayer - FromLayerIdx + 1;
   FSchedFailed := 0;
   FSchedErrorMsg := '';
@@ -131599,6 +132734,50 @@ begin
     FreeAndNil(FSharedKernels);
   end;
   if Assigned(FDotProductKernel) then FreeAndNil(FDotProductKernel);
+  ReleaseBorrowedOpenCLContext();
+end;
+
+procedure TNNet.ReleaseBorrowedOpenCLContext();
+begin
+  if Assigned(FBorrowedOpenCLProgram) then clReleaseProgram(FBorrowedOpenCLProgram);
+  if Assigned(FBorrowedOpenCLContext) then clReleaseContext(FBorrowedOpenCLContext);
+  FBorrowedOpenCLProgram := nil;
+  FBorrowedOpenCLContext := nil;
+end;
+
+procedure TNNet.EnableOpenCLInContextOf(Owner: TNNet;
+  pHasSharedKernel: boolean = true);
+var
+  LayerCnt: integer;
+  LastLayerIdx: integer;
+begin
+  if (not Assigned(Owner)) or (Owner = Self) or
+    (not Assigned(Owner.FDotProductKernel)) or
+    (not Assigned(Owner.FDotProductKernel.Context)) or
+    (not Assigned(Owner.FDotProductKernel.Prog)) then
+  begin
+    FErrorProc('EnableOpenCLInContextOf: the owner net is not OpenCL-armed - ' +
+      'call its EnableOpenCL first.');
+    exit;
+  end;
+  if Assigned(FDotProductKernel) then DisableOpenCL();
+  FHasSharedKernel := pHasSharedKernel;
+  // Own command queue (pSharedQueue false): the two nets enqueue independently.
+  // Ordering against the owner's weight uploads needs nothing more, because
+  // every resident weight a borrower retains was written with a blocking
+  // upload before the borrow. The explicit retains keep the context and
+  // program alive when the owner net is disabled or freed first.
+  FDotProductKernel := TNeuralKernel.CreateFromProgram(Owner.FDotProductKernel,
+    'cai_dot_product', {pHideMessages=}true, {pSharedQueue=}false);
+  clRetainContext(Owner.FDotProductKernel.Context);
+  clRetainProgram(Owner.FDotProductKernel.Prog);
+  FBorrowedOpenCLContext := Owner.FDotProductKernel.Context;
+  FBorrowedOpenCLProgram := Owner.FDotProductKernel.Prog;
+  LastLayerIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+  begin
+    FLayers[LayerCnt].EnableOpenCL(FDotProductKernel);
+  end;
 end;
 
 procedure TNNet.EnableOpenCL(platform_id: cl_platform_id;
@@ -132030,6 +133209,34 @@ begin
   end;
 end;
 
+function TNNet.LinkWeightsFrom(Owner: TNNet): integer;
+var
+  LayerCnt: integer;
+  OwnerLayer: TNNetLayer;
+  LastLayerIdx: integer;
+begin
+  Result := 0;
+  if (not Assigned(Owner)) or (Owner = Self) then exit;
+  if Owner.CountLayers() <> CountLayers() then
+  begin
+    FErrorProc('TNNet.LinkWeightsFrom: the owner has ' +
+      IntToStr(Owner.CountLayers()) + ' layers, this net ' +
+      IntToStr(CountLayers()) + '.');
+    exit;
+  end;
+  LastLayerIdx := GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+  begin
+    OwnerLayer := Owner.FLayers[LayerCnt];
+    // Weightless layers, and owner layers that only link another layer's
+    // neurons themselves, have nothing to lend.
+    if OwnerLayer.CountWeights() = 0 then continue;
+    // A borrowing build linked the layer as it was attached.
+    if FLayers[LayerCnt].FWeightOwner = OwnerLayer then Inc(Result)
+    else if FLayers[LayerCnt].LinkWeightsFrom(OwnerLayer) then Inc(Result);
+  end;
+end;
+
 function TNNet.EnableInt8Input(): integer;
 var
   LayerCnt: integer;
@@ -132075,7 +133282,7 @@ var
   OldW, OldHeadW: TNNetVolume;
   MeanRow: array of TNeuralFloat;
   OldBias: array of TNeuralFloat;
-  MeanBias: TNeuralFloat;
+  MeanBias, InvVocab: TNeuralFloat;
   HeadVecSize: integer;
   LastLayerIdx: integer;
   EmbSizeM1, OldVocabM1, CopyRowsM1, NewVocabSizeM1, HeadVecSizeM1: integer;
@@ -132136,15 +133343,15 @@ begin
     // Mean of the existing rows (HF convention for new token rows).
     SetLength(MeanRow, EmbSize);
     for ColCnt := 0 to EmbSizeM1 do MeanRow[ColCnt] := 0;
+    InvVocab := 1 / OldVocab;
     for RowCnt := 0 to OldVocabM1 do
     begin
       rowBase := RowCnt * EmbSize;
-      for ColCnt := 0 to EmbSizeM1 do
-        MeanRow[ColCnt] := MeanRow[ColCnt] +
-          OldW.FData[rowBase + ColCnt];
+      // Bulk row accumulate (#13), matching the LM-head twin below.
+      TNNetVolume.Add(@MeanRow[0], @OldW.FData[rowBase], EmbSize);
     end;
-    for ColCnt := 0 to EmbSizeM1 do
-      MeanRow[ColCnt] := MeanRow[ColCnt] / OldVocab;
+    // #21 reciprocal-multiply; cold path, no gradient check watches it.
+    TNNetVolume.Mul(@MeanRow[0], InvVocab, EmbSize);
     EmbLayer.SetNumWeightsForAllNeurons(NewVocabSize, 1, EmbSize);
     CopyRows := Min(OldVocab, NewVocabSize);
     CopyRowsM1 := CopyRows - 1;
@@ -132192,9 +133399,10 @@ begin
         OldBias[RowCnt] := Head.Neurons[RowCnt].BiasWeight;
         MeanBias := MeanBias + Head.Neurons[RowCnt].BiasWeight;
       end;
-      for ColCnt := 0 to HeadVecSizeM1 do
-        MeanRow[ColCnt] := MeanRow[ColCnt] / OldVocab;
-      MeanBias := MeanBias / OldVocab;
+      // #21 reciprocal-multiply; cold path, no gradient check watches it.
+      InvVocab := 1 / OldVocab;
+      TNNetVolume.Mul(@MeanRow[0], InvVocab, HeadVecSize);
+      MeanBias := MeanBias * InvVocab;
       // Adjust the neuron count, then rebuild the layer geometry through
       // SetPrevLayer: output volumes, vector sizes, concatenated-weight
       // caches and tiling all derive from FNeurons.Count there. It re-inits
@@ -133482,6 +134690,18 @@ begin
     end;
   end
   else
+  if FActivationFn = @Swish then
+  begin
+    // Swish(x) = x * sigmoid(x). Batched sigmoid into the output slice, then an
+    // in-place multiply by the raw input (both kernels fall back to scalar
+    // loops on non-AVX builds). Replaces a per-element indirect call plus a
+    // scalar exponential; parity with the scalar Swish() is within ~1e-6.
+    TNNetVolume.Sigmoid(@FOutput.FData[pFirst], @FOutputRaw.FData[pFirst],
+      pLast - pFirst + 1);
+    TNNetVolume.Mul(@FOutput.FData[pFirst], @FOutputRaw.FData[pFirst],
+      pLast - pFirst + 1);
+  end
+  else
   begin
     for OutputCnt := pFirst to pLast do
       FOutput.FData[OutputCnt] := FActivationFn(FOutputRaw.FData[OutputCnt]);
@@ -133503,6 +134723,121 @@ begin
   begin
     FArrNeurons[NeuronIdx] := FNeurons[NeuronIdx];
   end;
+end;
+
+function TNNetLayer.LinkNeuronsFrom(Owner: TNNetLayer): boolean;
+begin
+  Result := false;
+  if (not Assigned(Owner)) or (Owner = Self) then exit;
+  if Owner.ClassType <> Self.ClassType then
+  begin
+    FErrorProc(ClassName + '.LinkWeightsFrom: owner is a ' + Owner.ClassName +
+      ', not the same class.');
+    exit;
+  end;
+  if FLinkedNeurons or Owner.FLinkedNeurons then
+  begin
+    FErrorProc(ClassName + '.LinkWeightsFrom: layer ' + IntToStr(FLayerIdx) +
+      ' or its owner already links another layer''s neurons.');
+    exit;
+  end;
+  if Owner.FNeurons.Count <> FNeurons.Count then
+  begin
+    FErrorProc(ClassName + '.LinkWeightsFrom: owner has ' +
+      IntToStr(Owner.FNeurons.Count) + ' neurons, this layer ' +
+      IntToStr(FNeurons.Count) + '.');
+    exit;
+  end;
+  FNeurons.Free;
+  FNeurons := Owner.FNeurons;
+  FLinkedNeurons := true;
+  FCanNormalizeDelta := false;
+  // Borrowed weights are read-only here: the owner trains (or, quantized,
+  // nobody does).
+  FIsTrainable := false;
+  FWeightOwner := Owner;
+  if not Assigned(Owner.FWeightBorrowers) then
+    Owner.FWeightBorrowers := TList.Create();
+  Owner.FWeightBorrowers.Add(Self);
+  BuildArrNeurons();
+  Result := true;
+end;
+
+function TNNetLayer.LinkWeightsFrom(Owner: TNNetLayer): boolean;
+begin
+  Result := LinkNeuronsFrom(Owner);
+  // Derived per-layer caches (tap tables, exp(A_log), ...) are rebuilt from
+  // the shared neurons by the same hook a weight load fires.
+  if Result then AfterWeightUpdate();
+end;
+
+procedure TNNetLayer.DetachFromWeightOwner();
+begin
+  if not Assigned(FWeightOwner) then exit;
+  FWeightOwner := nil;
+  FNeurons := TNNetNeuronList.Create();
+  FLinkedNeurons := false;
+  SetLength(FArrNeurons, 0);
+end;
+
+function TNNetLayer.DeferWeightSizingToBuildLink(): boolean;
+begin
+  Result := Assigned(FNN) and Assigned(FNN.FBuildWeightOwner) and
+    (FNeurons.Count > 0) and FCanSetNumWeightsForAllNeurons and
+    (not FLinkedNeurons);
+  if Result then FBuildLinkPending := true;
+end;
+
+// Raises instead of reporting through FErrorProc: a twin whose graph differs
+// from its owner's would compute garbage silently, and the build is the one
+// place where the mismatch is cheap to stop. Coded by Claude (AI).
+procedure TNNetLayer.LinkBuildWeightOwner();
+var
+  OwnerNet: TNNet;
+  OwnerLayer: TNNetLayer;
+begin
+  OwnerNet := FNN.FBuildWeightOwner;
+  if FLayerIdx >= OwnerNet.CountLayers() then
+    raise Exception.Create(ClassName + '.LinkBuildWeightOwner: layer ' +
+      IntToStr(FLayerIdx) + ' has no counterpart - the owner net has only ' +
+      IntToStr(OwnerNet.CountLayers()) + ' layers (graph mismatch).');
+  OwnerLayer := OwnerNet.FLayers[FLayerIdx];
+  if OwnerLayer.ClassType <> Self.ClassType then
+    raise Exception.Create(ClassName + '.LinkBuildWeightOwner: layer ' +
+      IntToStr(FLayerIdx) + ' is a ' + ClassName + ' but the owner''s is a ' +
+      OwnerLayer.ClassName + ' (graph mismatch).');
+  if FWeightOwner = OwnerLayer then
+  begin
+    // Linked already (a TNNetEmbedding links in its constructor).
+    FBuildLinkPending := false;
+    exit;
+  end;
+  if OwnerLayer.CountWeights() = 0 then
+  begin
+    if FBuildLinkPending then
+      raise Exception.Create(ClassName + '.LinkBuildWeightOwner: layer ' +
+        IntToStr(FLayerIdx) + ' skipped sizing its rows but the owner''s ' +
+        'layer has no weights to lend.');
+    exit;
+  end;
+  // Cleared before the link: LinkWeightsFrom rebuilds the derived caches
+  // through AfterWeightUpdate, which a pending link keeps empty.
+  FBuildLinkPending := false;
+  if not LinkWeightsFrom(OwnerLayer) then
+    raise Exception.Create(ClassName + '.LinkBuildWeightOwner: layer ' +
+      IntToStr(FLayerIdx) + ' could not borrow the owner''s weights (see ' +
+      'the message above).');
+end;
+
+procedure TNNetLayer.UnlinkWeightBorrowers();
+var
+  BorrowerPos, MaxBorrowerPos: integer;
+begin
+  if not Assigned(FWeightBorrowers) then exit;
+  MaxBorrowerPos := FWeightBorrowers.Count - 1;
+  for BorrowerPos := 0 to MaxBorrowerPos do
+    TNNetLayer(FWeightBorrowers[BorrowerPos]).DetachFromWeightOwner();
+  FreeAndNil(FWeightBorrowers);
 end;
 
 { TNNetLayer }
@@ -133551,11 +134886,15 @@ begin
   {$IFDEF OpenCL}
   ReleaseDotProductCL();
   {$ENDIF}
+  UnlinkWeightBorrowers();
+  if Assigned(FWeightOwner) then FWeightOwner.FWeightBorrowers.Remove(Self);
   FOutputError.Free;
   FOutputErrorDeriv.Free;
   FOutputRaw.Free;
   FOutput.Free;
-  FNeurons.Free;
+  // A linked neuron list belongs to its owner (TNNetConvolutionSharedWeights
+  // or a LinkWeightsFrom owner).
+  if not FLinkedNeurons then FNeurons.Free;
   if Assigned(FPruneMask) then FPruneMask.Free;
   // Muon scratch (only allocated on layers that ran the matrix Muon path).
   if Assigned(FMuonMmat) then
@@ -133611,6 +134950,11 @@ end;
 function TNNetLayer.PrevOutputOnOpenCL(): boolean;
 begin
   Result := Assigned(FPrevLayer) and FPrevLayer.OutputBindableOnOpenCL();
+end;
+
+function TNNetLayer.OpenCLTiledGemmLaunchCount(): integer;
+begin
+  if Assigned(FDotCL) then Result := FDotCL.TiledGemmLaunchCount else Result := 0;
 end;
 
 function TNNetLayer.GetDotCLWaitBeta(): TNeuralFloat;
@@ -134054,6 +135398,12 @@ begin
   Result := Self;
 end;
 
+function TNNetLayer.NonWeightBytes(): int64;
+begin
+  Result := VolumeBytes(FOutput) + VolumeBytes(FOutputRaw) +
+    VolumeBytes(FOutputError) + VolumeBytes(FOutputErrorDeriv);
+end;
+
 function TNNetLayer.SetTrainable(pTrainable: boolean; pLowMemory: boolean): TNNetLayer;
 var
   MaxLayer: integer;
@@ -134356,8 +135706,10 @@ var
   MaxNeuronPos: integer;
   Cnt: integer;
 begin
+  if DeferWeightSizingToBuildLink() then exit;
   if (FNeurons.Count > 0) and (FCanSetNumWeightsForAllNeurons) then
   begin
+    Inc(FWeightElementsSized, int64(FNeurons.Count) * NumWeights);
     MaxNeuronPos := FNeurons.Count-1;
     for Cnt := 0 to MaxNeuronPos do
     begin
@@ -134380,8 +135732,10 @@ var
   Cnt: integer;
   N: TNNetNeuron;
 begin
+  if DeferWeightSizingToBuildLink() then exit;
   if (FNeurons.Count > 0) and (FCanSetNumWeightsForAllNeurons) then
   begin
+    Inc(FWeightElementsSized, int64(FNeurons.Count) * x * y * d);
     MaxNeuronPos := FNeurons.Count-1;
     for Cnt := 0 to MaxNeuronPos do
     begin
