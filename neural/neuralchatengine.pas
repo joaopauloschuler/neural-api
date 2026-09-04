@@ -366,8 +366,13 @@ type
     // band 0..N-1 (the rule RetainCheckpointsBefore keeps one checkpoint per).
     function CheckpointBand(Distance: integer): integer;
   private
+    // Bytes of an unfinished UTF-8 sequence EmitToken is holding until the
+    // token that completes it arrives (a codepoint can straddle two tokens).
+    PendingUtf8: string;
     procedure Notice(const S: string);
     procedure EmitToken(const S: string);
+    // Emits U+FFFD for anything still held in PendingUtf8 at reply end.
+    procedure FlushPendingUtf8();
     // Cache checkpoints (see the Checkpoints field).
     // The live checkpoint with the largest Position at or below Limit; nil
     // when none (a full reset follows).
@@ -401,12 +406,24 @@ function ArgMaxRow(Row: TNNetVolume): integer;
 function TailMatches(const Tokens: TNeuralIntegerArray; Len: integer;
   const Marker: TNeuralIntegerArray): boolean;
 function CommonPrefixLen(const A, B: TNeuralIntegerArray): integer;
+// Number of trailing bytes of S that open a UTF-8 sequence S has not
+// finished (0 when S ends on a whole codepoint, on ASCII, or on bytes no
+// sequence could still complete).
+function Utf8IncompleteTailLen(const S: string): integer;
+// Streaming helper: Pending + S with any unfinished trailing UTF-8 sequence
+// held back into Pending. What is returned is always whole codepoints, so a
+// client decoding every chunk on its own never sees half a character.
+function TakeCompleteUtf8(var Pending: string; const S: string): string;
 function ReadModelType(const ConfigFile: string): string;
 function ReadConfigInt(const ConfigFile, Field: string;
   Default: integer): integer;
 function ReadGenerationConfig(const FileName: string): TGenConfigDefaults;
 procedure ApplySamplingDefaults(var Opt: TChatOptions;
   const Cfg: TGenConfigDefaults);
+
+const
+  // U+FFFD, emitted for bytes that never completed a sequence.
+  Utf8ReplacementChar = #$EF#$BF#$BD;
 
 implementation
 
@@ -936,6 +953,37 @@ begin
   while (Result < N) and (A[Result] = B[Result]) do Inc(Result);
 end;
 
+function Utf8IncompleteTailLen(const S: string): integer;
+var
+  Len, Pos, Need: integer;
+  B: byte;
+begin
+  Result := 0;
+  Len := Length(S);
+  Pos := Len;
+  // Back over at most three continuation bytes to the candidate lead byte.
+  while (Pos > 0) and (Len - Pos < 3) and ((Ord(S[Pos]) and $C0) = $80) do
+    Dec(Pos);
+  if Pos = 0 then exit;
+  B := Ord(S[Pos]);
+  if (B and $E0) = $C0 then Need := 2
+  else if (B and $F0) = $E0 then Need := 3
+  else if (B and $F8) = $F0 then Need := 4
+  else exit; // ASCII, a run of stray continuation bytes, or an invalid lead
+  if Len - Pos + 1 < Need then Result := Len - Pos + 1;
+end;
+
+function TakeCompleteUtf8(var Pending: string; const S: string): string;
+var
+  HoldLen, WholeLen: integer;
+begin
+  Result := Pending + S;
+  WholeLen := Length(Result);
+  HoldLen := Utf8IncompleteTailLen(Result);
+  Pending := Copy(Result, WholeLen - HoldLen + 1, HoldLen);
+  SetLength(Result, WholeLen - HoldLen);
+end;
+
 // Reads config.json's model_type for the one-line summary ('' on trouble).
 // fpjson gotcha: TJSONParser with options [] (GetJSON mangles non-ASCII).
 function ReadModelType(const ConfigFile: string): string;
@@ -1211,8 +1259,19 @@ begin
 end;
 
 procedure TChatEngine.EmitToken(const S: string);
+var
+  Whole: string;
 begin
-  if Assigned(OnToken) then OnToken(S);
+  if not Assigned(OnToken) then exit;
+  Whole := TakeCompleteUtf8(PendingUtf8, S);
+  if Whole <> '' then OnToken(Whole);
+end;
+
+procedure TChatEngine.FlushPendingUtf8();
+begin
+  if PendingUtf8 = '' then exit;
+  PendingUtf8 := '';
+  if Assigned(OnToken) then OnToken(Utf8ReplacementChar);
 end;
 
 function TChatEngine.CheckpointBand(Distance: integer): integer;
@@ -2139,6 +2198,7 @@ begin
   GenCap := 0;
   Emitted := '';
   EmLen := 0;
+  PendingUtf8 := '';
   // Streamed emission strategy, resolved once (#20/#27). When Decode is an
   // exact left-to-right concatenation of the per-id pieces, each step needs
   // to detokenize ONLY the new id; otherwise (WordPiece space-join, or a
@@ -2425,6 +2485,13 @@ begin
     if (DecLen > EmLen) and
       (Incremental or (EmLen = 0) or CompareMem(@Result[1], @Emitted[1], EmLen))
       then EmitToken(Copy(Result, EmLen + 1, DecLen - EmLen));
+    // A reply can end on a stray lead byte (a byte-level BPE model may stop
+    // mid-codepoint). The stream and the returned text both get U+FFFD in
+    // its place, so a JSON body built from either stays valid UTF-8.
+    FlushPendingUtf8();
+    EmLen := Utf8IncompleteTailLen(Result);
+    if EmLen > 0 then
+      Result := Copy(Result, 1, DecLen - EmLen) + Utf8ReplacementChar;
     if Assigned(OnReplyDone) then OnReplyDone();
     // Record the sequence now resident in the cache for the next call's
     // prefix diff: every token that was FED is cached (positions 0..Len-2);

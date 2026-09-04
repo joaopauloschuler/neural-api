@@ -817,6 +817,8 @@ type
     procedure TestBertPoolSentenceEmbedding;
     procedure TestPoolSentenceEmbeddingModes;
     procedure TestEmbedInstructionPrefixTable;
+    procedure TestUtf8IncompleteTailLen;
+    procedure TestTakeCompleteUtf8StreamsWholeCodepoints;
     procedure TestPearsonAndSpearmanCorrelation;
     procedure TestSTSReport;
     procedure TestRetrievalReport;
@@ -16961,6 +16963,58 @@ begin
     EmbedInstructionPrefix(efGteQwen2, False, 'Find the answer'));
   AssertEquals('apply prepend', 'query: hello world',
     ApplyEmbedInstruction(efE5, True, 'hello world'));
+end;
+
+// The hold-back length for the tail of a streamed piece: 0 for ASCII and
+// whole codepoints, the sequence-so-far length for a lead byte whose
+// continuation bytes are still in the next token, 0 for bytes no sequence
+// could complete (so a garbage byte is never held forever).
+procedure TTestNeuralPretrained.TestUtf8IncompleteTailLen;
+begin
+  AssertEquals('empty', 0, Utf8IncompleteTailLen(''));
+  AssertEquals('ascii', 0, Utf8IncompleteTailLen('abc'));
+  AssertEquals('whole 2-byte', 0, Utf8IncompleteTailLen('caf' + #$C3#$A9));
+  AssertEquals('whole 3-byte', 0, Utf8IncompleteTailLen(#$E2#$82#$AC));
+  AssertEquals('whole 4-byte', 0, Utf8IncompleteTailLen('a' + #$F0#$9F#$98#$80));
+  AssertEquals('2-byte lead alone', 1, Utf8IncompleteTailLen('caf' + #$C3));
+  AssertEquals('3-byte lead alone', 1, Utf8IncompleteTailLen(#$E2));
+  AssertEquals('3-byte with one cont', 2, Utf8IncompleteTailLen('x' + #$E2#$82));
+  AssertEquals('4-byte with three cont', 3,
+    Utf8IncompleteTailLen(#$F0#$9F#$98));
+  AssertEquals('stray continuation', 0, Utf8IncompleteTailLen('a' + #$A9));
+  AssertEquals('four continuations', 0,
+    Utf8IncompleteTailLen(#$F0#$80#$80#$80#$80));
+  AssertEquals('invalid lead', 0, Utf8IncompleteTailLen(#$FF));
+end;
+
+// Drives the streaming helper the way EmitToken does, with an emoji split
+// 2+2 and an accented letter split 1+1 across tokens: every returned chunk
+// is whole codepoints, the concatenation is the untouched input, and a
+// leftover lead byte stays pending for the end-of-reply flush.
+procedure TTestNeuralPretrained.TestTakeCompleteUtf8StreamsWholeCodepoints;
+var
+  Pending, Chunk, Joined: string;
+begin
+  Pending := '';
+  Chunk := TakeCompleteUtf8(Pending, 'ab' + #$F0#$9F);
+  AssertEquals('emoji part 1 out', 'ab', Chunk);
+  AssertEquals('emoji part 1 pending', #$F0#$9F, Pending);
+  Joined := Chunk;
+  Chunk := TakeCompleteUtf8(Pending, #$98#$80 + 'c' + #$C3);
+  AssertEquals('emoji completes', 'ab' + #$F0#$9F#$98#$80 + 'c', Joined + Chunk);
+  AssertEquals('accent lead pending', #$C3, Pending);
+  Joined := Joined + Chunk;
+  Chunk := TakeCompleteUtf8(Pending, #$A9 + 'd');
+  Joined := Joined + Chunk;
+  AssertEquals('accent completes', '', Pending);
+  AssertEquals('joined equals input',
+    'ab' + #$F0#$9F#$98#$80 + 'c' + #$C3#$A9 + 'd', Joined);
+  Chunk := TakeCompleteUtf8(Pending, 'e' + #$E2#$82);
+  AssertEquals('tail held', 'e', Chunk);
+  AssertEquals('tail pending', #$E2#$82, Pending);
+  Chunk := TakeCompleteUtf8(Pending, '');
+  AssertEquals('empty piece emits nothing', '', Chunk);
+  AssertEquals('empty piece keeps pending', #$E2#$82, Pending);
 end;
 
 // Pearson on a perfectly linear pair = 1; Spearman on a monotone-but-
