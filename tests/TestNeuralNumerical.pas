@@ -14,12 +14,17 @@ uses
 
 type
   // Test-only split-sizing overrides handed to TNNetFusedSDPACL (0 = automatic).
+  // UsableLocalMemBytes is the scratch budget the score tile is sized against;
+  // the helper adds the kernel's own local memory and the reserve back on top
+  // to make the forced device figure.
   TFusedSDPASplitOverride = record
-    Splits, ChunkRows, LocalMemBytes: integer;
+    Splits, ChunkRows, UsableLocalMemBytes: integer;
   end;
-  // The pass-1 geometry of the last decode step, read back for the assertions.
+  // The pass-1 geometry of the last decode step, read back for the assertions:
+  // the chunking, the scratch it asked for, the kernel's own local memory and
+  // the local-memory figure (forced or device) it was sized against.
   TFusedSDPASplitLaunch = record
-    Splits, ChunkRows: integer;
+    Splits, ChunkRows, StaticLocalBytes, LocalMemBytes, ScratchBytes: integer;
   end;
 
   TTestNeuralNumerical = class(TTestCase)
@@ -437,6 +442,13 @@ type
     procedure FusedSDPASplitLocalMemShrinkOpenCLParity;
     // A budget too small for the query tile keeps the layer on the host path.
     procedure FusedSDPASplitQueryTileFallbackOpenCLParity;
+    // A forced local-memory figure on the int8 kernel: the scratch of every
+    // launch stays within the figure less the kernel's own local memory and
+    // csFusedSDPALocalMemReserveBytes, so the device keeps its headroom.
+    procedure FusedSDPAInt8SplitLocalMemHeadroomOpenCLParity;
+    // A 600-row span with one forced chunk: csFusedSDPAMaxChunkRows caps the
+    // chunk and the chunk count grows to cover the span.
+    procedure FusedSDPASplitChunkRowsCapOpenCLParity;
     // The int8 append kernel against QuantizeCacheRow: row scales within one
     // ulp, codes within one step, and codes exactly equal on rows built to
     // stress the quantizer - all zeros, one outlier, flat, exact midpoints.
@@ -71580,11 +71592,11 @@ end;
 {$ENDIF}
 
 function FusedSDPASplitOverride(Splits, ChunkRows,
-  LocalMemBytes: integer): TFusedSDPASplitOverride;
+  UsableLocalMemBytes: integer): TFusedSDPASplitOverride;
 begin
   Result.Splits := Splits;
   Result.ChunkRows := ChunkRows;
-  Result.LocalMemBytes := LocalMemBytes;
+  Result.UsableLocalMemBytes := UsableLocalMemBytes;
 end;
 
 // Shared body of the cached-decode parity tests: runs StepCnt decode steps of
@@ -71613,8 +71625,7 @@ var
 begin
   Result := 0;
   GpuForwards := 0;
-  Launch.Splits := 0;
-  Launch.ChunkRows := 0;
+  Launch := Default(TFusedSDPASplitLaunch);
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then Exit;
   InDepth := (QHeads + 2 * KVHeads) * Dk;
   OutDepth := QHeads * Dk;
@@ -71649,7 +71660,10 @@ begin
         NNGpu.EnableOpenCL(PlatformId, DeviceId);
         LGpu.FusedSDPACL.ForcedSplits := Override.Splits;
         LGpu.FusedSDPACL.ForcedChunkRows := Override.ChunkRows;
-        LGpu.FusedSDPACL.ForcedLocalMemBytes := Override.LocalMemBytes;
+        if Override.UsableLocalMemBytes > 0 then
+          LGpu.FusedSDPACL.ForcedLocalMemBytes := Override.UsableLocalMemBytes
+            + LGpu.FusedSDPACL.StaticLocalMemBytes(Int8KV)
+            + csFusedSDPALocalMemReserveBytes;
       end;
       if (CaptureAt >= 0) and (T = CaptureAt + 1) then
       begin
@@ -71685,6 +71699,11 @@ begin
     begin
       Launch.Splits := LGpu.FusedSDPACL.LastSplits;
       Launch.ChunkRows := LGpu.FusedSDPACL.LastChunkRows;
+      Launch.ScratchBytes := integer(LGpu.FusedSDPACL.LastScratchBytes);
+      Launch.StaticLocalBytes := LGpu.FusedSDPACL.StaticLocalMemBytes(Int8KV);
+      if LGpu.FusedSDPACL.ForcedLocalMemBytes > 0
+        then Launch.LocalMemBytes := LGpu.FusedSDPACL.ForcedLocalMemBytes
+        else Launch.LocalMemBytes := LGpu.FusedSDPACL.ForwardKernel().DeviceLocalMemSize();
     end;
     LGpu.EndIncrementalDecode();
     LCpu.EndIncrementalDecode();
@@ -71697,8 +71716,7 @@ end;
 begin
   Result := 0;
   GpuForwards := 0;
-  Launch.Splits := 0;
-  Launch.ChunkRows := 0;
+  Launch := Default(TFusedSDPASplitLaunch);
 end;
 {$ENDIF}
 
@@ -72167,7 +72185,8 @@ begin
     Override, GpuForwards, Result);
   WriteLn('  FusedSDPA OpenCL ', What, ': max|diff|=', MaxDiff:0:9,
     ' gpu forwards=', GpuForwards, ' splits=', Result.Splits,
-    ' chunk rows=', Result.ChunkRows);
+    ' chunk rows=', Result.ChunkRows, ' scratch bytes=', Result.ScratchBytes,
+    ' kernel local bytes=', Result.StaticLocalBytes);
   AssertEquals(What + ': OpenCL forward count', ExpectedGpuForwards,
     GpuForwards);
   AssertTrue(What + ': max |diff| = ' + FloatToStr(MaxDiff) +
@@ -72400,25 +72419,25 @@ procedure TTestNeuralNumerical.FusedSDPASplitLocalMemShrinkOpenCLParity;
 const
   // 280 floats: 256 of reduction scratch, the 2x8 query tile, the per-head
   // max and sum, and room for exactly two score rows per head.
-  QHeads = 4; KVHeads = 2; Dk = 8; StepCnt = 140; LocalMemBytes = 280 * 4;
+  QHeads = 4; KVHeads = 2; Dk = 8; StepCnt = 140; UsableLocalMemBytes = 280 * 4;
 var
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
   Launch: TFusedSDPASplitLaunch;
-  GroupsPerUnit, MinChunkRows, MaxSplits: integer;
+  GroupsPerUnit, MinChunkRows, MaxSplits, MaxChunkRows: integer;
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
     AssertTrue('no OpenCL device: SKIP', true);
     Exit;
   end;
-  FusedSDPASplitSizing(GroupsPerUnit, MinChunkRows, MaxSplits);
+  FusedSDPASplitSizing(GroupsPerUnit, MinChunkRows, MaxSplits, MaxChunkRows);
   AssertTrue('the context outgrows MaxSplits chunks of two rows',
     StepCnt > 2 * MaxSplits);
   RandSeed := 20260909;
   Launch := CheckFusedSDPASplitCase('split local-memory shrink', QHeads,
     KVHeads, Dk, StepCnt, {StepTokens=}1, {Window=}0, {Int8KV=}False,
-    {SoftCap=}0, 1e-4, FusedSDPASplitOverride(0, 0, LocalMemBytes), StepCnt);
+    {SoftCap=}0, 1e-4, FusedSDPASplitOverride(0, 0, UsableLocalMemBytes), StepCnt);
   AssertEquals('the budget shrinks the chunk to two rows', 2, Launch.ChunkRows);
   AssertTrue('the chunk count passes the configured maximum',
     Launch.Splits > MaxSplits);
@@ -72433,7 +72452,7 @@ procedure TTestNeuralNumerical.FusedSDPASplitQueryTileFallbackOpenCLParity;
 {$IFDEF OpenCL}
 const
   // 275 floats: one short of the query tile plus one score row per head.
-  QHeads = 4; KVHeads = 2; Dk = 8; StepCnt = 5; LocalMemBytes = 275 * 4;
+  QHeads = 4; KVHeads = 2; Dk = 8; StepCnt = 5; UsableLocalMemBytes = 275 * 4;
 var
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
@@ -72446,7 +72465,76 @@ begin
   RandSeed := 20260910;
   CheckFusedSDPASplitCase('split query-tile fallback', QHeads, KVHeads, Dk,
     StepCnt, {StepTokens=}1, {Window=}0, {Int8KV=}False, {SoftCap=}0, 1e-4,
-    FusedSDPASplitOverride(0, 0, LocalMemBytes), {ExpectedGpuForwards=}0);
+    FusedSDPASplitOverride(0, 0, UsableLocalMemBytes), {ExpectedGpuForwards=}0);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPAInt8SplitLocalMemHeadroomOpenCLParity;
+{$IFDEF OpenCL}
+const
+  // 300 usable floats: 256 of reduction scratch, the 2x16 query tile, the
+  // per-head max and sum, and room for exactly four score rows per head.
+  QHeads = 4; KVHeads = 2; Dk = 16; StepCnt = 24; UsableLocalMemBytes = 300 * 4;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Launch: TFusedSDPASplitLaunch;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260911;
+  Launch := CheckFusedSDPASplitCase('int8 split local-memory headroom', QHeads,
+    KVHeads, Dk, StepCnt, {StepTokens=}1, {Window=}0, {Int8KV=}True,
+    {SoftCap=}0, 1e-3, FusedSDPASplitOverride(0, 0, UsableLocalMemBytes), StepCnt);
+  AssertEquals('the budget shrinks the chunk to four rows', 4, Launch.ChunkRows);
+  AssertEquals('six chunks cover the 24 rows', 6, Launch.Splits);
+  AssertTrue('the forced figure exceeds the usable budget by the reserve',
+    Launch.LocalMemBytes >= UsableLocalMemBytes + csFusedSDPALocalMemReserveBytes);
+  AssertTrue('the scratch leaves the kernel local memory and the reserve free',
+    Launch.ScratchBytes <= Launch.LocalMemBytes - Launch.StaticLocalBytes
+      - csFusedSDPALocalMemReserveBytes);
+  AssertEquals('the scratch fills the usable budget exactly',
+    UsableLocalMemBytes, Launch.ScratchBytes);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.FusedSDPASplitChunkRowsCapOpenCLParity;
+{$IFDEF OpenCL}
+const
+  QHeads = 4; KVHeads = 2; Dk = 8; StepCnt = 2; StepTokens = 300;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Launch: TFusedSDPASplitLaunch;
+  GroupsPerUnit, MinChunkRows, MaxSplits, MaxChunkRows, SpanRows: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  FusedSDPASplitSizing(GroupsPerUnit, MinChunkRows, MaxSplits, MaxChunkRows);
+  SpanRows := StepCnt * StepTokens;
+  AssertTrue('the last step spans more rows than one chunk may hold',
+    SpanRows > MaxChunkRows);
+  RandSeed := 20260912;
+  Launch := CheckFusedSDPASplitCase('split chunk-rows cap', QHeads, KVHeads,
+    Dk, StepCnt, StepTokens, {Window=}0, {Int8KV=}False, {SoftCap=}0, 1e-4,
+    FusedSDPASplitOverride({Splits=}1, 0, 0), StepCnt);
+  AssertEquals('the cap bounds the chunk', MaxChunkRows, Launch.ChunkRows);
+  AssertEquals('the chunk count grows past the forced one to cover the span',
+    (SpanRows + MaxChunkRows - 1) div MaxChunkRows, Launch.Splits);
 end;
 {$ELSE}
 begin

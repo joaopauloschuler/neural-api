@@ -4534,6 +4534,9 @@ const
   // Lanes per work-group of every TNNetFusedSDPACL launch. A power of two (the
   // tree reductions halve it) within every device's max work-group size.
   csFusedSDPALocalSize = 256;
+  // Local memory left unrequested per work-group: NVIDIA keeps about 1 KB per
+  // work-group for the driver and rejects (CL_OUT_OF_RESOURCES) a launch taking it.
+  csFusedSDPALocalMemReserveBytes = 1024;
 
 type
   /// OpenCL forward helper for the cached decode step of the fused multi-head
@@ -4574,16 +4577,21 @@ type
     FForcedSplits, FForcedChunkRows, FForcedLocalMemBytes: integer;
     // The pass-1 geometry of the last forward, for tests and profiles.
     FLastSplits, FLastChunkRows: integer;
+    FLastScratchBytes: csize_t;
+    // CL_KERNEL_LOCAL_MEM_SIZE of the FP32 and the int8 pass-1 kernel, queried
+    // once at Create: the local memory the kernel takes beside the scratch.
+    FSplitStaticLocalBytes, FSplitInt8StaticLocalBytes: integer;
     // Size the four int8 cache buffers for the whole MaxContext allocation.
     // Grow-only, so a decode session sizes them once.
     procedure EnsureCacheBuffersInt8(KVHeads, CacheMax, Dk: integer);
-    // Local memory one work-group may use, in floats: the forced budget when a
-    // test set one, otherwise the device's CL_DEVICE_LOCAL_MEM_SIZE.
-    function LocalMemFloats(): integer;
+    // Scratch floats one pass-1 work-group of the named cache format may ask
+    // for: the device figure (or the forced one) less the kernel's own local
+    // memory and csFusedSDPALocalMemReserveBytes.
+    function LocalMemFloats(Int8KV: boolean): integer;
     // Chunk count and rows per chunk of pass 1 for a step whose live cache rows
     // span SpanRows, sized to fill the device within the local-memory budget.
     procedure ChooseSplit(KVHeads, TokenCnt, GroupSize, Dk, SpanRows: integer;
-      out Splits, ChunkRows: integer);
+      Int8KV: boolean; out Splits, ChunkRows: integer);
     // The partial-state buffer and the result, shared by both cache formats.
     procedure PrepareResultBuffers(Y: TNNetVolume; QHeads, TokenCnt, Splits,
       Dk: integer; out bufPartials, bufY: cl_mem);
@@ -4612,7 +4620,10 @@ type
     function ForwardKernel(): TNeuralKernel;
     // True when the query tile (GroupSize*Dk floats) plus one score row fits
     // the local-memory budget; otherwise the layer must keep the host path.
-    function QueryTileFits(GroupSize, Dk: integer): boolean;
+    function QueryTileFits(GroupSize, Dk: integer; Int8KV: boolean): boolean;
+    // The local memory the pass-1 kernel of the named cache format declares
+    // itself, in bytes, as CL_KERNEL_LOCAL_MEM_SIZE reported it at Create.
+    function StaticLocalMemBytes(Int8KV: boolean): integer;
     // Size the resident cache for K and V (whole MaxContext allocation) and
     // move its LIVE PREFIX - CacheLen rows of each of the KVHeads head-major
     // planes - in the named direction. Call on a path transition, not per token.
@@ -4658,6 +4669,7 @@ type
       write FForcedLocalMemBytes;
     property LastSplits: integer read FLastSplits;
     property LastChunkRows: integer read FLastChunkRows;
+    property LastScratchBytes: csize_t read FLastScratchBytes;
   end;
 {$ENDIF}
 
@@ -34994,7 +35006,7 @@ begin
     and (not Assigned(FSegLayer)) and (FPrefixLen = 0)
     and (not FBidirectionalWindow)
     and (FCacheLen + FPrevLayer.FOutput.SizeX <= FCacheMax)
-    and FFusedSDPACL.QueryTileFits(FGroupSize, FDk);
+    and FFusedSDPACL.QueryTileFits(FGroupSize, FDk, FKVQuantInt8);
 end;
 
 function TNNetFusedSDPA.OpenCLOutputBuffer(): cl_mem;
@@ -38595,6 +38607,8 @@ begin
   FAppendInt8Kernel := FKernel.CreateKernel('cai_sdpa_append_kv_int8');
   FSplitInt8Kernel := FKernel.CreateKernel('cai_sdpa_decode_split_int8');
   FMergeKernel := FKernel.CreateKernel('cai_sdpa_decode_merge');
+  FSplitStaticLocalBytes := FKernel.KernelLocalMemSize(FKernel.Kernel);
+  FSplitInt8StaticLocalBytes := FKernel.KernelLocalMemSize(FSplitInt8Kernel);
 end;
 
 destructor TNNetFusedSDPACL.Destroy();
@@ -38642,27 +38656,39 @@ begin
   FKernel.EnsureBuffer(FBufVScales, FCapVScales, CL_MEM_READ_WRITE, ScaleBytes);
 end;
 
-function TNNetFusedSDPACL.LocalMemFloats(): integer;
+function TNNetFusedSDPACL.StaticLocalMemBytes(Int8KV: boolean): integer;
 begin
-  if FForcedLocalMemBytes > 0
-    then Result := FForcedLocalMemBytes div csNeuralFloatSize
-    else Result := FKernel.DeviceLocalMemSize() div csNeuralFloatSize;
+  if Int8KV
+    then Result := FSplitInt8StaticLocalBytes
+    else Result := FSplitStaticLocalBytes;
 end;
 
-function TNNetFusedSDPACL.QueryTileFits(GroupSize, Dk: integer): boolean;
+function TNNetFusedSDPACL.LocalMemFloats(Int8KV: boolean): integer;
+var
+  LocalMemBytes: integer;
+begin
+  if FForcedLocalMemBytes > 0
+    then LocalMemBytes := FForcedLocalMemBytes
+    else LocalMemBytes := FKernel.DeviceLocalMemSize();
+  Result := (LocalMemBytes - StaticLocalMemBytes(Int8KV)
+    - csFusedSDPALocalMemReserveBytes) div csNeuralFloatSize;
+end;
+
+function TNNetFusedSDPACL.QueryTileFits(GroupSize, Dk: integer;
+  Int8KV: boolean): boolean;
 begin
   // Reduction scratch + query tile + per-head max and sum + one score row.
-  Result := LocalMemFloats() - csFusedSDPALocalSize - GroupSize * Dk
+  Result := LocalMemFloats(Int8KV) - csFusedSDPALocalSize - GroupSize * Dk
     - 2 * GroupSize >= GroupSize;
 end;
 
 procedure TNNetFusedSDPACL.ChooseSplit(KVHeads, TokenCnt, GroupSize, Dk,
-  SpanRows: integer; out Splits, ChunkRows: integer);
+  SpanRows: integer; Int8KV: boolean; out Splits, ChunkRows: integer);
 var
-  GroupsPerUnit, MinChunkRows, MaxSplits: integer;
+  GroupsPerUnit, MinChunkRows, MaxSplits, MaxChunkRows: integer;
   RowPairs, TargetGroups, MaxSplitsBySpan, MaxChunkRowsByLocalMem: integer;
 begin
-  FusedSDPASplitSizing(GroupsPerUnit, MinChunkRows, MaxSplits);
+  FusedSDPASplitSizing(GroupsPerUnit, MinChunkRows, MaxSplits, MaxChunkRows);
   if FForcedChunkRows > 0 then ChunkRows := FForcedChunkRows
   else
   begin
@@ -38680,11 +38706,12 @@ begin
       if Splits < 1 then Splits := 1;
     end;
     ChunkRows := (SpanRows + Splits - 1) div Splits;
+    if ChunkRows > MaxChunkRows then ChunkRows := MaxChunkRows;
   end;
   // The score tile must fit beside the query tile, the per-head max and sum
   // and the reduction scratch; a shorter chunk means more chunks, past
   // MaxSplits if it must. QueryTileFits keeps a row of room, so this is >= 1.
-  MaxChunkRowsByLocalMem := (LocalMemFloats() - csFusedSDPALocalSize
+  MaxChunkRowsByLocalMem := (LocalMemFloats(Int8KV) - csFusedSDPALocalSize
     - GroupSize * Dk - 2 * GroupSize) div GroupSize;
   if ChunkRows > MaxChunkRowsByLocalMem then ChunkRows := MaxChunkRowsByLocalMem;
   if ChunkRows < 1 then ChunkRows := 1;
@@ -38847,7 +38874,9 @@ begin
   XStride := X.Depth;
   YStride := Y.Depth;
   FusedSDPALiveSpan(TokenCnt, CacheSlot, Window, ChunkBase, SpanRows);
-  ChooseSplit(KVHeads, TokenCnt, GroupSize, Dk, SpanRows, Splits, ChunkRows);
+  ChooseSplit(KVHeads, TokenCnt, GroupSize, Dk, SpanRows, {Int8KV=}false,
+    Splits, ChunkRows);
+  FLastScratchBytes := SplitScratchBytes(GroupSize, Dk, ChunkRows);
   if pExternalSrc <> nil
     then bufX := pExternalSrc
     else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
@@ -38876,7 +38905,7 @@ begin
   clSetKernelArg(kSplit, 15, csCLMemSize, @bufK);
   clSetKernelArg(kSplit, 16, csCLMemSize, @bufV);
   clSetKernelArg(kSplit, 17, csCLMemSize, @bufPartials);
-  clSetKernelArg(kSplit, 18, SplitScratchBytes(GroupSize, Dk, ChunkRows), nil);
+  clSetKernelArg(kSplit, 18, FLastScratchBytes, nil);
   // One work-group of csFusedSDPALocalSize lanes per (KV head, token row,
   // chunk), then the merge per (query head, token row).
   FKernel.RunKernel2D(kSplit, csFusedSDPALocalSize,
@@ -38966,7 +38995,9 @@ begin
   XStride := X.Depth;
   YStride := Y.Depth;
   FusedSDPALiveSpan(TokenCnt, CacheSlot, Window, ChunkBase, SpanRows);
-  ChooseSplit(KVHeads, TokenCnt, GroupSize, Dk, SpanRows, Splits, ChunkRows);
+  ChooseSplit(KVHeads, TokenCnt, GroupSize, Dk, SpanRows, {Int8KV=}true,
+    Splits, ChunkRows);
+  FLastScratchBytes := SplitScratchBytes(GroupSize, Dk, ChunkRows);
   if pExternalSrc <> nil
     then bufX := pExternalSrc
     else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
@@ -39000,7 +39031,7 @@ begin
   clSetKernelArg(kSplit, 17, csCLMemSize, @FBufVCodes);
   clSetKernelArg(kSplit, 18, csCLMemSize, @FBufVScales);
   clSetKernelArg(kSplit, 19, csCLMemSize, @bufPartials);
-  clSetKernelArg(kSplit, 20, SplitScratchBytes(GroupSize, Dk, ChunkRows), nil);
+  clSetKernelArg(kSplit, 20, FLastScratchBytes, nil);
   // One work-group of csFusedSDPALocalSize lanes per (KV head, token row,
   // chunk), then the merge per (query head, token row).
   FKernel.RunKernel2D(kSplit, csFusedSDPALocalSize,
