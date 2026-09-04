@@ -98,6 +98,9 @@ type
     // Cached CL_DEVICE_MAX_WORK_GROUP_SIZE of FCurrentDevice, 0 while not
     // yet queried.
     FMaxWorkGroupSize: integer;
+    // Cached CL_DEVICE_LOCAL_MEM_SIZE of FCurrentDevice in bytes, 0 while not
+    // yet queried.
+    FLocalMemSize: integer;
     FOpenCLProgramSource: TStringList;
 
     FContext: cl_context;        // OpenCL compute context
@@ -170,6 +173,9 @@ type
     // CL_DEVICE_MAX_WORK_GROUP_SIZE of the current device, 1 when the query
     // fails. Cached after the first call.
     function DeviceMaxWorkGroupSize(): integer;
+    // CL_DEVICE_LOCAL_MEM_SIZE of the current device in bytes, capped at
+    // MaxInt; 16 KB when the query fails. Cached after the first call.
+    function DeviceLocalMemSize(): integer;
     // CL_KERNEL_WORK_GROUP_SIZE of pKernel on the current device (register
     // use can cap it below the device limit), 0 when the query fails.
     function KernelMaxWorkGroupSize(pKernel: cl_kernel): integer;
@@ -610,6 +616,11 @@ type
 /// (read once, at first use) or SetTiledGemmMinColumns was called.
 function TiledGemmMinColumns(): integer;
 procedure SetTiledGemmMinColumns(pValue: integer);
+
+/// Split-row SDPA decode sizing (TNNetFusedSDPACL): csFusedSDPA* defaults
+/// unless NEURAL_SDPA_GROUPS_PER_UNIT / _MIN_CHUNK_ROWS / _MAX_SPLITS are set.
+procedure FusedSDPASplitSizing(out GroupsPerUnit, MinChunkRows,
+  MaxSplits: integer);
 
 implementation
 uses math;
@@ -1228,31 +1239,60 @@ const
   csInt4SplitKThreadsPerUnit = 1024;
   csInt4SplitKMinSlab = 128;
   csInt4SplitKMaxSplits = 64;
+  /// Split-row SDPA decode: pass 1 aims for this many work-groups per compute
+  /// unit, never cuts a chunk below MinChunkRows cache rows, and never splits
+  /// a (KV head, token row) into more than MaxSplits chunks, because each
+  /// chunk costs a partial state the merge pass has to read.
+  csFusedSDPAGroupsPerUnit = 4;
+  csFusedSDPAMinChunkRows = 64;
+  csFusedSDPAMaxSplits = 64;
 
 var
   vInt4SplitKOverridesLoaded: boolean = false;
   vInt4SplitKThreadsPerUnit: integer = csInt4SplitKThreadsPerUnit;
   vInt4SplitKMinSlab: integer = csInt4SplitKMinSlab;
   vInt4SplitKMaxSplits: integer = csInt4SplitKMaxSplits;
+  vFusedSDPASplitOverridesLoaded: boolean = false;
+  vFusedSDPAGroupsPerUnit: integer = csFusedSDPAGroupsPerUnit;
+  vFusedSDPAMinChunkRows: integer = csFusedSDPAMinChunkRows;
+  vFusedSDPAMaxSplits: integer = csFusedSDPAMaxSplits;
+
+// Replaces pValue with the environment variable pName when it holds a
+// positive integer; otherwise leaves it alone.
+procedure ReadPositiveIntOverride(const pName: string; var pValue: integer);
+var
+  EnvValue: string;
+  Parsed: integer;
+begin
+  EnvValue := GetEnvironmentVariable(pName);
+  if (EnvValue <> '') and TryStrToInt(EnvValue, Parsed) and (Parsed > 0) then
+    pValue := Parsed;
+end;
 
 // Reads the NEURAL_INT4_SPLITK_THREADS / _MINSLAB / _MAXSPLITS environment
 // overrides once, so a split-sizing sweep needs no rebuild per point.
 procedure LoadInt4SplitKOverrides();
-  procedure ReadOverride(const pName: string; var pValue: integer);
-  var
-    EnvValue: string;
-    Parsed: integer;
-  begin
-    EnvValue := GetEnvironmentVariable(pName);
-    if (EnvValue <> '') and TryStrToInt(EnvValue, Parsed) and (Parsed > 0) then
-      pValue := Parsed;
-  end;
 begin
   if vInt4SplitKOverridesLoaded then exit;
   vInt4SplitKOverridesLoaded := true;
-  ReadOverride('NEURAL_INT4_SPLITK_THREADS', vInt4SplitKThreadsPerUnit);
-  ReadOverride('NEURAL_INT4_SPLITK_MINSLAB', vInt4SplitKMinSlab);
-  ReadOverride('NEURAL_INT4_SPLITK_MAXSPLITS', vInt4SplitKMaxSplits);
+  ReadPositiveIntOverride('NEURAL_INT4_SPLITK_THREADS', vInt4SplitKThreadsPerUnit);
+  ReadPositiveIntOverride('NEURAL_INT4_SPLITK_MINSLAB', vInt4SplitKMinSlab);
+  ReadPositiveIntOverride('NEURAL_INT4_SPLITK_MAXSPLITS', vInt4SplitKMaxSplits);
+end;
+
+procedure FusedSDPASplitSizing(out GroupsPerUnit, MinChunkRows,
+  MaxSplits: integer);
+begin
+  if not vFusedSDPASplitOverridesLoaded then
+  begin
+    vFusedSDPASplitOverridesLoaded := true;
+    ReadPositiveIntOverride('NEURAL_SDPA_GROUPS_PER_UNIT', vFusedSDPAGroupsPerUnit);
+    ReadPositiveIntOverride('NEURAL_SDPA_MIN_CHUNK_ROWS', vFusedSDPAMinChunkRows);
+    ReadPositiveIntOverride('NEURAL_SDPA_MAX_SPLITS', vFusedSDPAMaxSplits);
+  end;
+  GroupsPerUnit := vFusedSDPAGroupsPerUnit;
+  MinChunkRows := vFusedSDPAMinChunkRows;
+  MaxSplits := vFusedSDPAMaxSplits;
 end;
 
 var
@@ -2513,6 +2553,7 @@ begin
   FCurrentDevice := pDeviceId;
   FMaxComputeUnits := 0;
   FMaxWorkGroupSize := 0;
+  FLocalMemSize := 0;
 end;
 
 procedure TEasyOpenCL.CompileProgramFromFile(filename: string);
@@ -2752,6 +2793,29 @@ begin
     if GroupSize > 0 then Result := GroupSize;
   end;
   FMaxWorkGroupSize := Result;
+end;
+
+function TEasyOpenCL.DeviceLocalMemSize(): integer;
+const
+  csLocalMemFallbackBytes = 16384;
+var
+  LocalBytes: cl_ulong;
+  BytesWritten: csize_t;
+begin
+  Result := FLocalMemSize;
+  if Result > 0 then exit;
+  Result := csLocalMemFallbackBytes;
+  if FCurrentDevice = nil then exit;
+  LocalBytes := 0;
+  if clGetDeviceInfo(FCurrentDevice, CL_DEVICE_LOCAL_MEM_SIZE,
+    SizeOf(LocalBytes), @LocalBytes, {$IFDEF FPC}BytesWritten{$ELSE}@BytesWritten{$ENDIF}) = CL_SUCCESS then
+  begin
+    if LocalBytes > 0 then
+    begin
+      if LocalBytes > MaxInt then Result := MaxInt else Result := LocalBytes;
+    end;
+  end;
+  FLocalMemSize := Result;
 end;
 
 function TEasyOpenCL.KernelMaxWorkGroupSize(pKernel: cl_kernel): integer;

@@ -10193,9 +10193,9 @@ end;
 
 // The batched prefill on the device: a 46-token prompt as two 20-row windows
 // on an OpenCL twin plus a 6-token tail, the snapshot handed to an OpenCL
-// width-1 twin, then 6 more tokens one at a time. 20 rows exceed the 16-row
-// score band, so cai_sdpa_decode walks two rows per band on the first four
-// band rows, and 20 does not divide 46, so the tail path runs. The fixture
+// width-1 twin, then 6 more tokens one at a time. 20 rows put twenty token
+// rows into one split-row launch, and 20 does not divide 46, so the tail path
+// runs. The fixture
 // config says max_position_embeddings 16, which the importer only uses to
 // bound the input width (default RoPE has no table), so the twins are built
 // from a temporary copy that says 64. The device run
@@ -10281,8 +10281,6 @@ begin
     AssertTrue('no OpenCL device: SKIP', true);
     Exit;
   end;
-  AssertTrue('the window is wider than the score band',
-    WindowLen > csFusedSDPABandRows);
   AssertTrue('the window does not divide the prompt',
     PromptLen mod WindowLen <> 0);
   Mode := BoolToStr(Int8KV, 'int8 KV', 'FP32 KV');

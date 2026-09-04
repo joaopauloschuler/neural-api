@@ -4531,41 +4531,35 @@ type
 
 {$IFDEF OpenCL}
 const
-  // Score-band rows per query head in cai_sdpa_decode / cai_sdpa_decode_int8:
-  // work-group (head, r) scores window rows r, r+16, r+32, ... over ONE
-  // FCacheMax-float band, so a K-row window costs FQHeads*16*FCacheMax floats
-  // of band whatever K is (32 heads at a 32768 context: 64 MiB) while still
-  // launching FQHeads*16 work-groups of 256 lanes. Fewer rows would halve the
-  // band but also the work-groups a decode token can fill a GPU with; more
-  // would grow a band that already exceeds the window's own KV rows.
-  csFusedSDPABandRows = 16;
+  // Lanes per work-group of every TNNetFusedSDPACL launch. A power of two (the
+  // tree reductions halve it) within every device's max work-group size.
+  csFusedSDPALocalSize = 256;
 
 type
   /// OpenCL forward helper for the cached decode step of the fused multi-head
-  // attention (TNNetFusedSDPA). Binds TWO entry points, cai_sdpa_append_kv and
-  // cai_sdpa_decode, against the SAME shared program and therefore the same
-  // command queue: the queue is in-order, so enqueueing the append before the
-  // decode is the whole synchronization story and no host wait sits between
-  // them. Two cl_kernel handles rather than one launched twice, because
+  // attention (TNNetFusedSDPA). Binds FIVE entry points against the SAME shared
+  // program and therefore one in-order command queue: the FP32 and int8
+  // appends, the FP32 and int8 split-row attention (pass 1, one work-group per
+  // (KV head, token row, chunk of cache rows)) and the merge (pass 2, one
+  // work-group per (query head, token row), both formats). Enqueue order on the
+  // in-order queue is the whole synchronization story; no host wait sits
+  // between the launches. One cl_kernel handle per entry point, because
   // clSetKernelArg on a kernel with a launch still in flight is undefined.
   // The KV cache is resident and appended to in place, so a decode session
   // steps without moving the cache. A step carries X.SizeX token rows (one
-  // decode token or a prefill window); the append writes them all in one
-  // launch and the decode scores them in one launch over csFusedSDPABandRows
-  // rows of score band per query head. Forward-only; the cache is FP32 or
-  // int8, one entry-point pair each, and only one format is resident at a
-  // time. Coded by Claude (AI).
+  // decode token or a prefill window). Forward-only; only one cache format is
+  // resident at a time. Coded by Claude (AI).
   TNNetFusedSDPACL = class(TNNetKernelCL)
   private
-    // Further entry points on FKernel's program and queue: the FP32 append and
-    // the int8 append/decode pair. Owned here: clReleaseKernel in the destructor.
-    FAppendKernel, FAppendInt8Kernel, FDecodeInt8Kernel: cl_kernel;
+    // Further entry points on FKernel's program and queue (FKernel itself is
+    // the FP32 pass 1). Owned here: clReleaseKernel in the destructor.
+    FAppendKernel, FAppendInt8Kernel, FSplitInt8Kernel, FMergeKernel: cl_kernel;
     // Persistent device buffers (grow-only), reused every forward. FBufK/FBufV
     // are the resident cache, sized once at MaxContext and advanced in place;
-    // FBufScores is the per-head score band, written and read inside one
-    // launch and never moved to RAM.
-    FBufX, FBufK, FBufV, FBufScores, FBufY: cl_mem;
-    FCapX, FCapK, FCapV, FCapScores, FCapY: csize_t;
+    // FBufPartials holds the per-(query head, token row, chunk) partial softmax
+    // states pass 1 writes and pass 2 reads, never moved to RAM.
+    FBufX, FBufK, FBufV, FBufPartials, FBufY: cl_mem;
+    FCapX, FCapK, FCapV, FCapPartials, FCapY: csize_t;
     // The int8 cache, code plane and scale plane apart, laid out exactly as
     // FKCacheQ/FVCacheQ are in RAM. Only one format is ever resident: the layer
     // may not switch formats with a non-empty cache.
@@ -4575,13 +4569,34 @@ type
     // FBufY can name the queue that produced it. Nil before the first forward,
     // which is what tells a consumer there is nothing to bind yet.
     FOutputKernel: TNeuralKernel;
+    // Test-only overrides of the split sizing, 0 = automatic: the chunk count,
+    // the rows per chunk, and the local-memory budget in bytes.
+    FForcedSplits, FForcedChunkRows, FForcedLocalMemBytes: integer;
+    // The pass-1 geometry of the last forward, for tests and profiles.
+    FLastSplits, FLastChunkRows: integer;
     // Size the four int8 cache buffers for the whole MaxContext allocation.
     // Grow-only, so a decode session sizes them once.
     procedure EnsureCacheBuffersInt8(KVHeads, CacheMax, Dk: integer);
-    // The score band and the result, shared by both cache formats. The band
-    // carries BandRows FCacheMax-float rows per query head.
-    procedure PrepareResultBuffers(Y: TNNetVolume; QHeads, BandRows,
-      CacheMax: integer; out bufScores, bufY: cl_mem);
+    // Local memory one work-group may use, in floats: the forced budget when a
+    // test set one, otherwise the device's CL_DEVICE_LOCAL_MEM_SIZE.
+    function LocalMemFloats(): integer;
+    // Chunk count and rows per chunk of pass 1 for a step whose live cache rows
+    // span SpanRows, sized to fill the device within the local-memory budget.
+    procedure ChooseSplit(KVHeads, TokenCnt, GroupSize, Dk, SpanRows: integer;
+      out Splits, ChunkRows: integer);
+    // The partial-state buffer and the result, shared by both cache formats.
+    procedure PrepareResultBuffers(Y: TNNetVolume; QHeads, TokenCnt, Splits,
+      Dk: integer; out bufPartials, bufY: cl_mem);
+    // The pass-1 arguments both cache formats share (indices 0..14): the chunk
+    // geometry, the masking constants, the score constants and the input.
+    procedure SetSplitCommonArgs(kSplit: cl_kernel; KVHeads, TokenCnt, Splits,
+      ChunkRows, ChunkBase, GroupSize, Dk, CacheMax, CacheSlot, Window,
+      XStride: integer; InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
+      bufX: cl_mem);
+    // Pass 2 on FKernel's queue: merges the chunks of every (query head, token
+    // row) into Y.
+    procedure RunMerge(bufPartials, bufY: cl_mem; QHeads, TokenCnt, Splits, Dk,
+      YStride: integer);
     // Name the queue that produced Y, and read Y back unless the caller keeps it.
     procedure FinishForward(bufY: cl_mem; Y: TNNetVolume;
       pKeepResultOnOpenCL: boolean);
@@ -4592,9 +4607,12 @@ type
     // per forward: EnsureOutputBuffer replaces the handle when Y grows.
     function ResultBuffer(): cl_mem;
     function OutputKernel(): TNeuralKernel;
-    // The kernel both entry points run on, for a source layer that has to wait
-    // on the right queue before its buffer is read.
+    // The kernel every entry point runs on, for a source layer that has to
+    // wait on the right queue before its buffer is read.
     function ForwardKernel(): TNeuralKernel;
+    // True when the query tile (GroupSize*Dk floats) plus one score row fits
+    // the local-memory budget; otherwise the layer must keep the host path.
+    function QueryTileFits(GroupSize, Dk: integer): boolean;
     // Size the resident cache for K and V (whole MaxContext allocation) and
     // move its LIVE PREFIX - CacheLen rows of each of the KVHeads head-major
     // planes - in the named direction. Call on a path transition, not per token.
@@ -4632,6 +4650,14 @@ type
       QW, KW, Window: integer;
       InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
       pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+    // Test-only split-sizing overrides (0 = automatic) and the geometry of
+    // the last forward's pass 1.
+    property ForcedSplits: integer read FForcedSplits write FForcedSplits;
+    property ForcedChunkRows: integer read FForcedChunkRows write FForcedChunkRows;
+    property ForcedLocalMemBytes: integer read FForcedLocalMemBytes
+      write FForcedLocalMemBytes;
+    property LastSplits: integer read FLastSplits;
+    property LastChunkRows: integer read FLastChunkRows;
   end;
 {$ENDIF}
 
@@ -4684,8 +4710,8 @@ type
     FCacheBaseLen: integer;     // cache length BEFORE this forward's appends
     FChunkPrecomputed: boolean; // prep already produced FOutput (rare; see below)
     {$IFDEF OpenCL}
-    // Cached-decode forward in OpenCL memory (cai_sdpa_append_kv +
-    // cai_sdpa_decode), with the FP32 KV cache resident and appended in place.
+    // Cached-decode forward in OpenCL memory (append, split-row attention,
+    // merge), with the KV cache resident and appended in place.
     FFusedSDPACL: TNNetFusedSDPACL;
     // True while the live KV cache sits in FFusedSDPACL's buffers rather than
     // in FKCache/FVCache. Every host reader or mutator goes through
@@ -4712,9 +4738,9 @@ type
     // Serial cached forward (append + score); handles the eviction paths.
     procedure ComputeIncrementalFused();
     {$IFDEF OpenCL}
-    // Cached forward of the input's token rows in OpenCL memory:
-    // cai_sdpa_append_kv then cai_sdpa_decode, one launch each, on the
-    // helper's one in-order queue.
+    // Cached forward of the input's token rows in OpenCL memory: the append,
+    // the split-row attention and the merge, one launch each, on the helper's
+    // one in-order queue.
     procedure ComputeOpenCL();
     // Move the KV cache between FKCache/FVCache and the helper's resident
     // buffers. Both are no-ops when the cache is already where it is wanted.
@@ -4753,6 +4779,8 @@ type
     function OpenCLOutputKernel(): TNeuralKernel; override;
     // True while the live KV cache sits in FFusedSDPACL's buffers.
     property CacheOnOpenCL: boolean read FCacheOnOpenCL;
+    // The decode helper, nil until EnableOpenCL; tests set its split overrides.
+    property FusedSDPACL: TNNetFusedSDPACL read FFusedSDPACL;
     {$ENDIF}
     property QHeads: integer read FQHeads;
     property KVHeads: integer read FKVHeads;
@@ -34898,9 +34926,9 @@ end;
 function TNNetFusedSDPA.ChunkEligible(): boolean;
 begin
   Result := (FNN <> nil) and FNN.FIntraLayerThreading;
-  // One cai_sdpa_decode launch already runs every query head in its own
-  // work-group, so splitting the head axis across workers would only add a
-  // second producer for the same output.
+  // One cai_sdpa_decode_split launch already runs every KV head and chunk in
+  // its own work-group, so splitting the head axis across workers would only
+  // add a second producer for the same output.
   {$IFDEF OpenCL} if Result then Result := not WillOpenCL(); {$ENDIF}
 end;
 
@@ -34965,7 +34993,8 @@ begin
     and (FEvictSinks = 0)
     and (not Assigned(FSegLayer)) and (FPrefixLen = 0)
     and (not FBidirectionalWindow)
-    and (FCacheLen + FPrevLayer.FOutput.SizeX <= FCacheMax);
+    and (FCacheLen + FPrevLayer.FOutput.SizeX <= FCacheMax)
+    and FFusedSDPACL.QueryTileFits(FGroupSize, FDk);
 end;
 
 function TNNetFusedSDPA.OpenCLOutputBuffer(): cl_mem;
@@ -35006,8 +35035,8 @@ begin
 end;
 
 // One decode step of the input's token rows with the KV cache in OpenCL
-// memory: the append and the attention are two launches on ONE in-order queue,
-// so nothing crosses to the host per step. Row t of the step attends the cache
+// memory: the append, the split-row attention and the merge are three launches
+// on ONE in-order queue, so nothing crosses to the host per step. Row t of the step attends the cache
 // up to and including its own slot, so a window is exactly what the host path
 // computes. The host keeps FCacheLen, which is the only cache state the
 // kernels do not own.
@@ -38559,24 +38588,26 @@ end;
 
 constructor TNNetFusedSDPACL.Create(NN: TNNet);
 begin
-  inherited Create(NN, 'cai_sdpa_decode');
-  // Second entry point on the SAME TNeuralKernel, so both launches land on one
-  // in-order queue and the append is complete before the decode reads it.
+  inherited Create(NN, 'cai_sdpa_decode_split');
+  // Further entry points on the SAME TNeuralKernel, so every launch lands on
+  // one in-order queue and each pass is complete before the next reads it.
   FAppendKernel := FKernel.CreateKernel('cai_sdpa_append_kv');
   FAppendInt8Kernel := FKernel.CreateKernel('cai_sdpa_append_kv_int8');
-  FDecodeInt8Kernel := FKernel.CreateKernel('cai_sdpa_decode_int8');
+  FSplitInt8Kernel := FKernel.CreateKernel('cai_sdpa_decode_split_int8');
+  FMergeKernel := FKernel.CreateKernel('cai_sdpa_decode_merge');
 end;
 
 destructor TNNetFusedSDPACL.Destroy();
 begin
   if Assigned(FAppendKernel)     then clReleaseKernel(FAppendKernel);
   if Assigned(FAppendInt8Kernel) then clReleaseKernel(FAppendInt8Kernel);
-  if Assigned(FDecodeInt8Kernel) then clReleaseKernel(FDecodeInt8Kernel);
-  if Assigned(FBufX)       then clReleaseMemObject(FBufX);
-  if Assigned(FBufK)       then clReleaseMemObject(FBufK);
-  if Assigned(FBufV)       then clReleaseMemObject(FBufV);
-  if Assigned(FBufScores)  then clReleaseMemObject(FBufScores);
-  if Assigned(FBufY)       then clReleaseMemObject(FBufY);
+  if Assigned(FSplitInt8Kernel)  then clReleaseKernel(FSplitInt8Kernel);
+  if Assigned(FMergeKernel)      then clReleaseKernel(FMergeKernel);
+  if Assigned(FBufX)        then clReleaseMemObject(FBufX);
+  if Assigned(FBufK)        then clReleaseMemObject(FBufK);
+  if Assigned(FBufV)        then clReleaseMemObject(FBufV);
+  if Assigned(FBufPartials) then clReleaseMemObject(FBufPartials);
+  if Assigned(FBufY)        then clReleaseMemObject(FBufY);
   if Assigned(FBufKCodes)  then clReleaseMemObject(FBufKCodes);
   if Assigned(FBufKScales) then clReleaseMemObject(FBufKScales);
   if Assigned(FBufVCodes)  then clReleaseMemObject(FBufVCodes);
@@ -38611,12 +38642,113 @@ begin
   FKernel.EnsureBuffer(FBufVScales, FCapVScales, CL_MEM_READ_WRITE, ScaleBytes);
 end;
 
-procedure TNNetFusedSDPACL.PrepareResultBuffers(Y: TNNetVolume;
-  QHeads, BandRows, CacheMax: integer; out bufScores, bufY: cl_mem);
+function TNNetFusedSDPACL.LocalMemFloats(): integer;
 begin
-  bufScores := FKernel.EnsureBuffer(FBufScores, FCapScores, CL_MEM_READ_WRITE,
-    QHeads * BandRows * CacheMax * csNeuralFloatSize);
+  if FForcedLocalMemBytes > 0
+    then Result := FForcedLocalMemBytes div csNeuralFloatSize
+    else Result := FKernel.DeviceLocalMemSize() div csNeuralFloatSize;
+end;
+
+function TNNetFusedSDPACL.QueryTileFits(GroupSize, Dk: integer): boolean;
+begin
+  // Reduction scratch + query tile + per-head max and sum + one score row.
+  Result := LocalMemFloats() - csFusedSDPALocalSize - GroupSize * Dk
+    - 2 * GroupSize >= GroupSize;
+end;
+
+procedure TNNetFusedSDPACL.ChooseSplit(KVHeads, TokenCnt, GroupSize, Dk,
+  SpanRows: integer; out Splits, ChunkRows: integer);
+var
+  GroupsPerUnit, MinChunkRows, MaxSplits: integer;
+  RowPairs, TargetGroups, MaxSplitsBySpan, MaxChunkRowsByLocalMem: integer;
+begin
+  FusedSDPASplitSizing(GroupsPerUnit, MinChunkRows, MaxSplits);
+  if FForcedChunkRows > 0 then ChunkRows := FForcedChunkRows
+  else
+  begin
+    if FForcedSplits > 0 then Splits := FForcedSplits
+    else
+    begin
+      // Enough work-groups to fill the device, but never chunks shorter than
+      // MinChunkRows and never more than MaxSplits partial states per head.
+      RowPairs := KVHeads * TokenCnt;
+      TargetGroups := FKernel.DeviceMaxComputeUnits() * GroupsPerUnit;
+      Splits := (TargetGroups + RowPairs - 1) div RowPairs;
+      MaxSplitsBySpan := (SpanRows + MinChunkRows - 1) div MinChunkRows;
+      if Splits > MaxSplitsBySpan then Splits := MaxSplitsBySpan;
+      if Splits > MaxSplits then Splits := MaxSplits;
+      if Splits < 1 then Splits := 1;
+    end;
+    ChunkRows := (SpanRows + Splits - 1) div Splits;
+  end;
+  // The score tile must fit beside the query tile, the per-head max and sum
+  // and the reduction scratch; a shorter chunk means more chunks, past
+  // MaxSplits if it must. QueryTileFits keeps a row of room, so this is >= 1.
+  MaxChunkRowsByLocalMem := (LocalMemFloats() - csFusedSDPALocalSize
+    - GroupSize * Dk - 2 * GroupSize) div GroupSize;
+  if ChunkRows > MaxChunkRowsByLocalMem then ChunkRows := MaxChunkRowsByLocalMem;
+  if ChunkRows < 1 then ChunkRows := 1;
+  Splits := (SpanRows + ChunkRows - 1) div ChunkRows;
+  if Splits < 1 then Splits := 1;
+  FLastSplits := Splits;
+  FLastChunkRows := ChunkRows;
+end;
+
+procedure TNNetFusedSDPACL.PrepareResultBuffers(Y: TNNetVolume;
+  QHeads, TokenCnt, Splits, Dk: integer; out bufPartials, bufY: cl_mem);
+begin
+  bufPartials := FKernel.EnsureBuffer(FBufPartials, FCapPartials,
+    CL_MEM_READ_WRITE,
+    csize_t(QHeads) * TokenCnt * Splits * (Dk + 2) * csNeuralFloatSize);
   bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
+end;
+
+procedure TNNetFusedSDPACL.SetSplitCommonArgs(kSplit: cl_kernel;
+  KVHeads, TokenCnt, Splits, ChunkRows, ChunkBase, GroupSize, Dk, CacheMax,
+  CacheSlot, Window, XStride: integer;
+  InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat; bufX: cl_mem);
+var
+  fInvSqrtDk, fSoftCap, fInvSoftCap: single;
+begin
+  fInvSqrtDk := InvSqrtDk;
+  fSoftCap := ScoreSoftCap;
+  fInvSoftCap := InvScoreSoftCap;
+  clSetKernelArg(kSplit,  0, csLongintSize, @KVHeads);
+  clSetKernelArg(kSplit,  1, csLongintSize, @TokenCnt);
+  clSetKernelArg(kSplit,  2, csLongintSize, @Splits);
+  clSetKernelArg(kSplit,  3, csLongintSize, @ChunkRows);
+  clSetKernelArg(kSplit,  4, csLongintSize, @ChunkBase);
+  clSetKernelArg(kSplit,  5, csLongintSize, @GroupSize);
+  clSetKernelArg(kSplit,  6, csLongintSize, @Dk);
+  clSetKernelArg(kSplit,  7, csLongintSize, @CacheMax);
+  clSetKernelArg(kSplit,  8, csLongintSize, @CacheSlot);
+  clSetKernelArg(kSplit,  9, csLongintSize, @Window);
+  clSetKernelArg(kSplit, 10, csLongintSize, @XStride);
+  clSetKernelArg(kSplit, 11, csNeuralFloatSize, @fInvSqrtDk);
+  clSetKernelArg(kSplit, 12, csNeuralFloatSize, @fSoftCap);
+  clSetKernelArg(kSplit, 13, csNeuralFloatSize, @fInvSoftCap);
+  clSetKernelArg(kSplit, 14, csCLMemSize, @bufX);
+end;
+
+procedure TNNetFusedSDPACL.RunMerge(bufPartials, bufY: cl_mem;
+  QHeads, TokenCnt, Splits, Dk, YStride: integer);
+var
+  kMerge: cl_kernel;
+begin
+  kMerge := FMergeKernel;
+  clSetKernelArg(kMerge, 0, csLongintSize, @QHeads);
+  clSetKernelArg(kMerge, 1, csLongintSize, @TokenCnt);
+  clSetKernelArg(kMerge, 2, csLongintSize, @Splits);
+  clSetKernelArg(kMerge, 3, csLongintSize, @Dk);
+  clSetKernelArg(kMerge, 4, csLongintSize, @YStride);
+  clSetKernelArg(kMerge, 5, csCLMemSize, @bufPartials);
+  clSetKernelArg(kMerge, 6, csCLMemSize, @bufY);
+  // Reduction scratch, then one weight per chunk.
+  clSetKernelArg(kMerge, 7, (csFusedSDPALocalSize + Splits) * csNeuralFloatSize,
+    nil);
+  // One work-group of csFusedSDPALocalSize lanes per (query head, token row).
+  FKernel.RunKernel2D(kMerge, csFusedSDPALocalSize, QHeads * TokenCnt,
+    csFusedSDPALocalSize, 1);
 end;
 
 procedure TNNetFusedSDPACL.FinishForward(bufY: cl_mem; Y: TNNetVolume;
@@ -38676,33 +38808,46 @@ begin
   end;
 end;
 
+// Local memory of one pass-1 work-group, in bytes: the reduction scratch, the
+// query tile, the score tile and the per-head max and sum.
+function SplitScratchBytes(GroupSize, Dk, ChunkRows: integer): csize_t;
+begin
+  Result := (csFusedSDPALocalSize + GroupSize * Dk + ChunkRows * GroupSize
+    + 2 * GroupSize) * csNeuralFloatSize;
+end;
+
+// The cache rows a step can attend span [ChunkBase, CacheSlot + TokenCnt):
+// ChunkBase is token row 0's sliding-window start, below which no row of the
+// step looks, so the chunks cover only rows some token row can see.
+procedure FusedSDPALiveSpan(TokenCnt, CacheSlot, Window: integer;
+  out ChunkBase, SpanRows: integer);
+begin
+  if (Window > 0) and (CacheSlot + 1 > Window)
+    then ChunkBase := CacheSlot + 1 - Window
+    else ChunkBase := 0;
+  SpanRows := CacheSlot + TokenCnt - ChunkBase;
+end;
+
 procedure TNNetFusedSDPACL.Compute(X, Y, K, V: TNNetVolume;
   QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheSlot,
   QW, KW, Window: integer;
   InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
   pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
-const
-  // Lanes per head. Power-of-two (the tree reductions halve it) and within
-  // every device's max work-group size (T4 = 1024, PoCL CPU larger).
-  cLocalSize = 256;
 var
-  bufX, bufK, bufV, bufScores, bufY: cl_mem;
-  kAppend, kDecode: cl_kernel;
-  TokenCnt, BandRows, XStride, YStride: integer;
-  fInvSqrtDk, fSoftCap, fInvSoftCap: single;
+  bufX, bufK, bufV, bufPartials, bufY: cl_mem;
+  kAppend, kSplit: cl_kernel;
+  TokenCnt, XStride, YStride: integer;
+  ChunkBase, SpanRows, Splits, ChunkRows: integer;
 begin
   kAppend := FAppendKernel;
-  kDecode := FKernel.Kernel;
+  kSplit := FKernel.Kernel;
   // The step's token rows and both row strides come from the volumes the
   // buffers hold, so the launch cannot disagree with what it indexes.
   TokenCnt := X.SizeX;
   XStride := X.Depth;
   YStride := Y.Depth;
-  BandRows := TokenCnt;
-  if BandRows > csFusedSDPABandRows then BandRows := csFusedSDPABandRows;
-  fInvSqrtDk := InvSqrtDk;
-  fSoftCap := ScoreSoftCap;
-  fInvSoftCap := InvScoreSoftCap;
+  FusedSDPALiveSpan(TokenCnt, CacheSlot, Window, ChunkBase, SpanRows);
+  ChooseSplit(KVHeads, TokenCnt, GroupSize, Dk, SpanRows, Splits, ChunkRows);
   if pExternalSrc <> nil
     then bufX := pExternalSrc
     else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
@@ -38710,7 +38855,7 @@ begin
   // its contents across every forward of the session.
   bufK := FKernel.EnsureOutputBuffer(FBufK, FCapK, K);
   bufV := FKernel.EnsureOutputBuffer(FBufV, FCapV, V);
-  PrepareResultBuffers(Y, QHeads, BandRows, CacheMax, bufScores, bufY);
+  PrepareResultBuffers(Y, QHeads, TokenCnt, Splits, Dk, bufPartials, bufY);
   clSetKernelArg(kAppend,  0, csLongintSize, @KVHeads);
   clSetKernelArg(kAppend,  1, csLongintSize, @TokenCnt);
   clSetKernelArg(kAppend,  2, csLongintSize, @Dk);
@@ -38722,31 +38867,21 @@ begin
   clSetKernelArg(kAppend,  8, csCLMemSize, @bufX);
   clSetKernelArg(kAppend,  9, csCLMemSize, @bufK);
   clSetKernelArg(kAppend, 10, csCLMemSize, @bufV);
-  // One work-group of cLocalSize lanes per (KV head, token row).
-  FKernel.RunKernel2D(kAppend, cLocalSize, KVHeads * TokenCnt, cLocalSize, 1);
-  clSetKernelArg(kDecode,  0, csLongintSize, @QHeads);
-  clSetKernelArg(kDecode,  1, csLongintSize, @TokenCnt);
-  clSetKernelArg(kDecode,  2, csLongintSize, @BandRows);
-  clSetKernelArg(kDecode,  3, csLongintSize, @GroupSize);
-  clSetKernelArg(kDecode,  4, csLongintSize, @Dk);
-  clSetKernelArg(kDecode,  5, csLongintSize, @CacheMax);
-  clSetKernelArg(kDecode,  6, csLongintSize, @CacheSlot);
-  clSetKernelArg(kDecode,  7, csLongintSize, @Window);
-  clSetKernelArg(kDecode,  8, csLongintSize, @XStride);
-  clSetKernelArg(kDecode,  9, csLongintSize, @YStride);
-  clSetKernelArg(kDecode, 10, csNeuralFloatSize, @fInvSqrtDk);
-  clSetKernelArg(kDecode, 11, csNeuralFloatSize, @fSoftCap);
-  clSetKernelArg(kDecode, 12, csNeuralFloatSize, @fInvSoftCap);
-  clSetKernelArg(kDecode, 13, csCLMemSize, @bufX);
-  clSetKernelArg(kDecode, 14, csCLMemSize, @bufK);
-  clSetKernelArg(kDecode, 15, csCLMemSize, @bufV);
-  clSetKernelArg(kDecode, 16, csCLMemSize, @bufScores);
-  clSetKernelArg(kDecode, 17, csCLMemSize, @bufY);
-  // Reduction scratch, then the head's query row.
-  clSetKernelArg(kDecode, 18, (cLocalSize + Dk) * csNeuralFloatSize, nil);
-  // One work-group of cLocalSize lanes per (query head, band row); each walks
-  // the window rows that share its band.
-  FKernel.RunKernel2D(kDecode, cLocalSize, QHeads * BandRows, cLocalSize, 1);
+  // One work-group of csFusedSDPALocalSize lanes per (KV head, token row).
+  FKernel.RunKernel2D(kAppend, csFusedSDPALocalSize, KVHeads * TokenCnt,
+    csFusedSDPALocalSize, 1);
+  SetSplitCommonArgs(kSplit, KVHeads, TokenCnt, Splits, ChunkRows, ChunkBase,
+    GroupSize, Dk, CacheMax, CacheSlot, Window, XStride,
+    InvSqrtDk, ScoreSoftCap, InvScoreSoftCap, bufX);
+  clSetKernelArg(kSplit, 15, csCLMemSize, @bufK);
+  clSetKernelArg(kSplit, 16, csCLMemSize, @bufV);
+  clSetKernelArg(kSplit, 17, csCLMemSize, @bufPartials);
+  clSetKernelArg(kSplit, 18, SplitScratchBytes(GroupSize, Dk, ChunkRows), nil);
+  // One work-group of csFusedSDPALocalSize lanes per (KV head, token row,
+  // chunk), then the merge per (query head, token row).
+  FKernel.RunKernel2D(kSplit, csFusedSDPALocalSize,
+    KVHeads * TokenCnt * Splits, csFusedSDPALocalSize, 1);
+  RunMerge(bufPartials, bufY, QHeads, TokenCnt, Splits, Dk, YStride);
   FinishForward(bufY, Y, pKeepResultOnOpenCL);
 end;
 
@@ -38819,33 +38954,26 @@ procedure TNNetFusedSDPACL.ComputeInt8(X, Y: TNNetVolume; K, V: TNNetVolumeQuant
   QW, KW, Window: integer;
   InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
   pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
-const
-  // Lanes per head, as in Compute: a power of two, because both the append's
-  // max-abs reduction and the decode's tree reductions halve it.
-  cLocalSize = 256;
 var
-  bufX, bufScores, bufY: cl_mem;
-  kAppend, kDecode: cl_kernel;
-  TokenCnt, BandRows, XStride, YStride: integer;
-  fInvSqrtDk, fSoftCap, fInvSoftCap: single;
+  bufX, bufPartials, bufY: cl_mem;
+  kAppend, kSplit: cl_kernel;
+  TokenCnt, XStride, YStride: integer;
+  ChunkBase, SpanRows, Splits, ChunkRows: integer;
 begin
   kAppend := FAppendInt8Kernel;
-  kDecode := FDecodeInt8Kernel;
+  kSplit := FSplitInt8Kernel;
   TokenCnt := X.SizeX;
   XStride := X.Depth;
   YStride := Y.Depth;
-  BandRows := TokenCnt;
-  if BandRows > csFusedSDPABandRows then BandRows := csFusedSDPABandRows;
-  fInvSqrtDk := InvSqrtDk;
-  fSoftCap := ScoreSoftCap;
-  fInvSoftCap := InvScoreSoftCap;
+  FusedSDPALiveSpan(TokenCnt, CacheSlot, Window, ChunkBase, SpanRows);
+  ChooseSplit(KVHeads, TokenCnt, GroupSize, Dk, SpanRows, Splits, ChunkRows);
   if pExternalSrc <> nil
     then bufX := pExternalSrc
     else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
   // Grow-only and never written here, so a cache uploaded by UploadCacheInt8
   // keeps its contents across every forward of the session.
   EnsureCacheBuffersInt8(KVHeads, CacheMax, Dk);
-  PrepareResultBuffers(Y, QHeads, BandRows, CacheMax, bufScores, bufY);
+  PrepareResultBuffers(Y, QHeads, TokenCnt, Splits, Dk, bufPartials, bufY);
   clSetKernelArg(kAppend,  0, csLongintSize, @KVHeads);
   clSetKernelArg(kAppend,  1, csLongintSize, @TokenCnt);
   clSetKernelArg(kAppend,  2, csLongintSize, @Dk);
@@ -38860,34 +38988,24 @@ begin
   clSetKernelArg(kAppend, 11, csCLMemSize, @FBufVCodes);
   clSetKernelArg(kAppend, 12, csCLMemSize, @FBufVScales);
   // Reduction scratch for the row maximum.
-  clSetKernelArg(kAppend, 13, cLocalSize * csNeuralFloatSize, nil);
-  // One work-group of cLocalSize lanes per (KV head, token row).
-  FKernel.RunKernel2D(kAppend, cLocalSize, KVHeads * TokenCnt, cLocalSize, 1);
-  clSetKernelArg(kDecode,  0, csLongintSize, @QHeads);
-  clSetKernelArg(kDecode,  1, csLongintSize, @TokenCnt);
-  clSetKernelArg(kDecode,  2, csLongintSize, @BandRows);
-  clSetKernelArg(kDecode,  3, csLongintSize, @GroupSize);
-  clSetKernelArg(kDecode,  4, csLongintSize, @Dk);
-  clSetKernelArg(kDecode,  5, csLongintSize, @CacheMax);
-  clSetKernelArg(kDecode,  6, csLongintSize, @CacheSlot);
-  clSetKernelArg(kDecode,  7, csLongintSize, @Window);
-  clSetKernelArg(kDecode,  8, csLongintSize, @XStride);
-  clSetKernelArg(kDecode,  9, csLongintSize, @YStride);
-  clSetKernelArg(kDecode, 10, csNeuralFloatSize, @fInvSqrtDk);
-  clSetKernelArg(kDecode, 11, csNeuralFloatSize, @fSoftCap);
-  clSetKernelArg(kDecode, 12, csNeuralFloatSize, @fInvSoftCap);
-  clSetKernelArg(kDecode, 13, csCLMemSize, @bufX);
-  clSetKernelArg(kDecode, 14, csCLMemSize, @FBufKCodes);
-  clSetKernelArg(kDecode, 15, csCLMemSize, @FBufKScales);
-  clSetKernelArg(kDecode, 16, csCLMemSize, @FBufVCodes);
-  clSetKernelArg(kDecode, 17, csCLMemSize, @FBufVScales);
-  clSetKernelArg(kDecode, 18, csCLMemSize, @bufScores);
-  clSetKernelArg(kDecode, 19, csCLMemSize, @bufY);
-  // Reduction scratch, then the head's query row.
-  clSetKernelArg(kDecode, 20, (cLocalSize + Dk) * csNeuralFloatSize, nil);
-  // One work-group of cLocalSize lanes per (query head, band row); each walks
-  // the window rows that share its band.
-  FKernel.RunKernel2D(kDecode, cLocalSize, QHeads * BandRows, cLocalSize, 1);
+  clSetKernelArg(kAppend, 13, csFusedSDPALocalSize * csNeuralFloatSize, nil);
+  // One work-group of csFusedSDPALocalSize lanes per (KV head, token row).
+  FKernel.RunKernel2D(kAppend, csFusedSDPALocalSize, KVHeads * TokenCnt,
+    csFusedSDPALocalSize, 1);
+  SetSplitCommonArgs(kSplit, KVHeads, TokenCnt, Splits, ChunkRows, ChunkBase,
+    GroupSize, Dk, CacheMax, CacheSlot, Window, XStride,
+    InvSqrtDk, ScoreSoftCap, InvScoreSoftCap, bufX);
+  clSetKernelArg(kSplit, 15, csCLMemSize, @FBufKCodes);
+  clSetKernelArg(kSplit, 16, csCLMemSize, @FBufKScales);
+  clSetKernelArg(kSplit, 17, csCLMemSize, @FBufVCodes);
+  clSetKernelArg(kSplit, 18, csCLMemSize, @FBufVScales);
+  clSetKernelArg(kSplit, 19, csCLMemSize, @bufPartials);
+  clSetKernelArg(kSplit, 20, SplitScratchBytes(GroupSize, Dk, ChunkRows), nil);
+  // One work-group of csFusedSDPALocalSize lanes per (KV head, token row,
+  // chunk), then the merge per (query head, token row).
+  FKernel.RunKernel2D(kSplit, csFusedSDPALocalSize,
+    KVHeads * TokenCnt * Splits, csFusedSDPALocalSize, 1);
+  RunMerge(bufPartials, bufY, QHeads, TokenCnt, Splits, Dk, YStride);
   FinishForward(bufY, Y, pKeepResultOnOpenCL);
 end;
 
