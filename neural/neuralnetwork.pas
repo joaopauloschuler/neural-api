@@ -50,6 +50,7 @@ uses
   {$IFDEF FPC}
   fgl,
   {$ENDIF}
+  {$IFNDEF FPC} neuraldelphi, {$ENDIF}
   Classes, SysUtils, math, syncobjs, neuralvolume, neuralgeneric,
   neuralbyteprediction, neuralcache, neuralab, neuralthread,
   pascoremath32, pascoremathhelperfuncs;
@@ -15621,7 +15622,7 @@ type
     FsBuf, FdBuf: array of Double;                 // ComputeCPU split bands
     FIlsBuf, FIldBuf: array of Double;             // InverseChannel working bands
     FgsBuf, FgdBuf, FsFBuf, FdFBuf, FoddInBuf: array of Double; // BackpropagateCPU
-    FhistSBuf, FhistDBuf: array of array of Double; // [step][FHalf] pre-step forward state
+    FhistSBuf, FhistDBuf: {$IFDEF FPC}array of array of Double;{$ELSE}TNeuralDoubleDynArr2D;{$ENDIF}// [step][FHalf] pre-step forward state
     procedure BuildFilter();
     function TapPtr(): TNNetVolume;     // weights when learnable, nil otherwise
     function GetTap(idx: integer): TNeuralFloat;
@@ -22636,10 +22637,6 @@ var
   // Coded by Claude (AI).
   function NeuralInt8QuantizableClass(pLayer: TNNetLayer): boolean;
 
-  {$IFNDEF FPC}
-  procedure FillDWord(var X; Count: NativeUInt; Value: Cardinal);
-  {$ENDIF}
-
 implementation
 
 // nil-tolerant byte counts for NonWeightBytes.
@@ -22671,23 +22668,6 @@ function SelectKthSmallest(var Arr: array of TNeuralFloat;
 // FShouldOpenCL (compared against cNeuralOpenCLMinWork) and WillOpenCL routes the
 // forward, exactly as TNNetConvolution. NeuralForceOpenCL bypasses the size
 // verdict for the parity tests. Coded by Claude (AI).
-{$ENDIF}
-
-{$IFNDEF FPC}
-procedure FillDWord(var X; Count: NativeUInt; Value: Cardinal);
-var
-  P: PCardinal;
-  I: NativeUInt;
-  CountM1: NativeUInt;
-begin
-  P := @X;
-  CountM1 := Count - 1;
-  for I := 0 to CountM1 do
-  begin
-    P^ := Value;
-    Inc(P);
-  end;
-end;
 {$ENDIF}
 
 function BoolToString(B: Boolean; const TrueS, FalseS: string): String; inline;
@@ -87608,7 +87588,7 @@ var
   TwoDepth, PadIdx, HalfBytes: integer;
   PrevOut, LocalPrevError, W, WDelta: TNNetVolume;
   tap, g, dsum: Double;
-  histRow: array of Double;
+  histRow: {$IFDEF FPC}array of Double;{$ELSE} TNeuralDoubleDynArr; {$ENDIF}
   offRow: {$IFDEF FPC}array of integer{$ELSE} TNeuralIntegerArray {$ENDIF};
   haveTapGrad, havePrev: boolean;
 begin
