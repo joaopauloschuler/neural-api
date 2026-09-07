@@ -52921,7 +52921,7 @@ begin
             DestPos := DestBase + TapOfs;
             for groupCount := 0 to GroupMax do
             begin
-              {$IFDEF AVXANY}
+              {$IF Defined(AVXANY) and Defined(FPC)}
               SourceRawPos := FInputCopy.GetRawPtr(SrcPos);
               DestRawPos := FInputPrepared.GetRawPtr(DestPos);
               asm_dword_copy;
@@ -99151,7 +99151,7 @@ begin
     begin
       for Y := 0 to MaxY do
       begin
-        {$IFDEF AVXANY}
+        {$IF Defined(AVXANY) and Defined(FPC)}
         SourceRawPos := LocalOutput.GetRawPtr(X,Y,OrigChannel);
         DestRawPos := FOutput.GetRawPtr(X,Y,OutputDeepCnt);
         asm_dword_copy;
@@ -106594,7 +106594,7 @@ begin
         DstPos := FInputPrepared.GetRawPos(OutputCntX, OutputCntY);
         for yCount := 0 to FeatSizeYMax do
         begin
-          {$IFDEF AVXANY}
+          {$IF Defined(AVXANY) and Defined(FPC)}
           SourceRawPos := FInputCopy.GetRawPtr(SrcPos);
           DestRawPos := FInputPrepared.GetRawPtr(DstPos);
           asm_dword_copy;
