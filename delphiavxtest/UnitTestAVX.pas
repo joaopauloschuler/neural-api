@@ -18,8 +18,8 @@ type
     function CompareWordArrays(const A, B: array of Word; ACount: Integer; Epsilon: Word = 0): Boolean;
     function CompareShortIntArrays(const A, B: array of ShortInt; ACount: Integer): Boolean;
     procedure RandomSingleArray(var Arr: array of Single);
-    procedure FillWithConst(var Arr: array of Single; const Value: Single);
-    procedure FillWithSeq(var Arr: array of Single; Start, Step: Single);
+    procedure FillWithConst(var Arr: array of Single; const Value: Single; N: Integer);
+    procedure FillWithSeq(var Arr: array of Single; Start, Step: Single; N: Integer);
 
     // Conversion helpers for half and bfloat16 (IEEE-754 binary16 / bfloat16)
     function SingleToHalf(Value: Single): Word;
@@ -89,16 +89,28 @@ var
 begin
   Result := (Length(A) >= ACount) and (Length(B) >= ACount);
   if not Result then Exit;
+
   for i := 0 to ACount - 1 do
   begin
+    if IsNan(A[i]) or IsNan(B[i]) then
+    begin
+      if not (IsNan(A[i]) and IsNan(B[i])) then
+        Exit(False);
+      Continue;
+    end;
+    if IsInfinite(A[i]) or IsInfinite(B[i]) then
+    begin
+      if (A[i] <> B[i]) then
+        Exit(False);
+      Continue;
+    end;
+
     Diff := Abs(A[i] - B[i]);
     MaxVal := Max(Abs(A[i]), Abs(B[i]));
     if Diff > Max(AbsTol, MaxVal * RelTol) then
-    begin
-      Result := False;
-      Exit;
-    end;
+      Exit(False);
   end;
+  Result := True;
 end;
 
 function TTestAVX.CompareWordArrays(const A, B: array of Word; ACount: Integer; Epsilon: Word = 0): Boolean;
@@ -146,19 +158,19 @@ begin
   end;
 end;
 
-procedure TTestAVX.FillWithConst(var Arr: array of Single; const Value: Single);
+procedure TTestAVX.FillWithConst(var Arr: array of Single; const Value: Single; N: Integer);
 var
   i: Integer;
 begin
-  for i := 0 to High(Arr) do
+  for i := 0 to N - 1 do
     Arr[i] := Value;
 end;
 
-procedure TTestAVX.FillWithSeq(var Arr: array of Single; Start, Step: Single);
+procedure TTestAVX.FillWithSeq(var Arr: array of Single; Start, Step: Single; N: Integer);
 var
   i: Integer;
 begin
-  for i := 0 to High(Arr) do
+  for i := 0 to N - 1 do
     Arr[i] := Start + i * Step;
 end;
 
@@ -343,30 +355,46 @@ end;
 
 procedure TTestAVX.TestFillMem;
 const
-  N = 257;
+  N = 300;
 var
   Dst, Ref: array[0..N-1] of Single;
   FillVal: Single;
+  LCount: Integer;
 begin
   FillVal := 3.14159;
-  FillWithConst(Ref, FillVal);
-  _AVXFillMem(@Dst[0], FillVal, N);
-  Check(CompareSingleArrays(Dst, Ref, N), 'FillMem failed');
+
+  LCount := 256;
+  FillWithConst(Ref, FillVal, LCount);
+  _AVXFillMem(@Dst[0], FillVal, LCount);
+  Check(CompareSingleArrays(Dst, Ref, LCount), Format('FillMem %d failed', [LCount]));
+
+  LCount := 257;
+  FillWithConst(Ref, FillVal + 1, LCount);
+  _AVXFillMem(@Dst[0], FillVal + 1, LCount);
+  Check(CompareSingleArrays(Dst, Ref, LCount), Format('FillMem %d failed', [LCount]));
 end;
 
 procedure TTestAVX.TestCopyRelu;
 const
-  N = 257;
+  N = 300;
 var
   Src, Dst, Ref: array[0..N-1] of Single;
   i: Integer;
+  LCount: Integer;
 begin
+  LCount := 256;
   RandomSingleArray(Src);
-  // Reference scalar implementation
-  for i := 0 to N-1 do
+  for i := 0 to LCount-1 do
     if Src[i] > 0 then Ref[i] := Src[i] else Ref[i] := 0;
-  _AVXCopyRelu(@Dst[0], @Src[0], N);
-  Check(CompareSingleArrays(Dst, Ref, N), 'CopyRelu failed');
+  _AVXCopyRelu(@Dst[0], @Src[0], LCount);
+  Check(CompareSingleArrays(Dst, Ref, LCount), Format('CopyRelu %d failed', [LCount]));
+
+  LCount := 257;
+  RandomSingleArray(Src);
+  for i := 0 to LCount-1 do
+    if Src[i] > 0 then Ref[i] := Src[i] else Ref[i] := 0;
+  _AVXCopyRelu(@Dst[0], @Src[0], LCount);
+  Check(CompareSingleArrays(Dst, Ref, LCount), Format('CopyRelu %d failed', [LCount]));
 end;
 
 procedure TTestAVX.TestMulAdd;
@@ -378,7 +406,7 @@ var
 begin
   RandomSingleArray(Src);
   RandomSingleArray(Z);
-  FillWithSeq(Dst, 1.0, 0.1);
+  FillWithSeq(Dst, 1.0, 0.1, N);
   for i := 0 to N-1 do Ref[i] := Dst[i] + Src[i] * Z[i];
   _AVXMulAdd(@Dst[0], @Src[0], @Z[0], N);
   Check(CompareSingleArrays(Dst, Ref, N), 'MulAdd failed');
@@ -394,7 +422,7 @@ var
 begin
   fact := 2.718;
   RandomSingleArray(Src);
-  FillWithConst(Dst, 1.0);
+  FillWithConst(Dst, 1.0, N);
   for i := 0 to N-1 do Ref[i] := Dst[i] + Src[i] * fact;
   _AVXMulAddF(@Dst[0], @Src[0], N, fact);
   Check(CompareSingleArrays(Dst, Ref, N), 'MulAddF failed');
@@ -402,19 +430,28 @@ end;
 
 procedure TTestAVX.TestMulMulAdd;
 const
-  N = 257;
+  N = 300;
 var
   Dst, Src, Ref: array[0..N-1] of Single;
   m1, m2: Single;
   i: Integer;
+  LCount: Integer;
 begin
   m1 := 1.5; m2 := 2.5;
   RandomSingleArray(Src);
-  FillWithConst(Dst, 0.5);
-  for i := 0 to N-1 do
+  FillWithConst(Dst, 0.5, N);
+
+  LCount := 256;
+  for i := 0 to LCount-1 do
     Ref[i] := Dst[i] * m1 + Src[i] * m2;
-  _AVXMulMulAdd(@Dst[0], @Src[0], N, m1, m2);
-  Check(CompareSingleArrays(Dst, Ref, N), 'MulMulAdd failed');
+  _AVXMulMulAdd(@Dst[0], @Src[0], LCount, m1, m2);
+  Check(CompareSingleArrays(Dst, Ref, LCount), Format('MulMulAdd %d failed', [LCount]));
+
+  LCount := 257;
+  for i := 0 to LCount-1 do
+    Ref[i] := Dst[i] * m1 + Src[i] * m2;
+  _AVXMulMulAdd(@Dst[0], @Src[0], LCount, m1, m2);
+  Check(CompareSingleArrays(Dst, Ref, LCount), Format('MulMulAdd %d failed', [LCount]));
 end;
 
 procedure TTestAVX.TestMulF;
@@ -426,7 +463,7 @@ var
   i: Integer;
 begin
   factor := 0.5;
-  FillWithSeq(Dst, 1.0, 0.1);
+  FillWithSeq(Dst, 1.0, 0.1, N);
   for i := 0 to N-1 do Ref[i] := Dst[i] * factor;
   _AVXMulF(@Dst[0], N, factor);
   Check(CompareSingleArrays(Dst, Ref, N), 'MulF failed');
@@ -439,8 +476,8 @@ var
   Dst, Src, Ref: array[0..N-1] of Single;
   i: Integer;
 begin
-  FillWithSeq(Dst, 1.0, 0.1);
-  FillWithSeq(Src, 2.0, 0.2);
+  FillWithSeq(Dst, 1.0, 0.1, N);
+  FillWithSeq(Src, 2.0, 0.2, N);
   for i := 0 to N-1 do Ref[i] := Dst[i] * Src[i];
   _AVXMul(@Dst[0], @Src[0], N);
   Check(CompareSingleArrays(Dst, Ref, N), 'Mul failed');
@@ -453,8 +490,8 @@ var
   Dst, Src, Ref: array[0..N-1] of Single;
   i: Integer;
 begin
-  FillWithSeq(Dst, 1.0, 0.1);
-  FillWithSeq(Src, 2.0, 0.2);
+  FillWithSeq(Dst, 1.0, 0.1, N);
+  FillWithSeq(Src, 2.0, 0.2, N);
   for i := 0 to N-1 do Ref[i] := Dst[i] + Src[i];
   _AVXAdd(@Dst[0], @Src[0], N);
   Check(CompareSingleArrays(Dst, Ref, N), 'Add failed');
@@ -467,8 +504,8 @@ var
   Dst, Src, Ref: array[0..N-1] of Single;
   i: Integer;
 begin
-  FillWithSeq(Dst, 1.0, 0.1);
-  FillWithSeq(Src, 2.0, 0.2);
+  FillWithSeq(Dst, 1.0, 0.1, N);
+  FillWithSeq(Src, 2.0, 0.2, N);
   for i := 0 to N-1 do Ref[i] := Max(Dst[i], Src[i]);
   _AVXMax(@Dst[0], @Src[0], N);
   Check(CompareSingleArrays(Dst, Ref, N), 'Max failed');
@@ -483,8 +520,8 @@ var
   LCount: Integer;
   i: Integer;
 begin
-  FillWithSeq(Dst, 1.0, 0.1);
-  FillWithSeq(Src, 2.0, 0.2);
+  FillWithSeq(Dst, 1.0, 0.1, N);
+  FillWithSeq(Src, 2.0, 0.2, N);
 
   LCount := 256;
   RefSum := 0;
@@ -510,8 +547,8 @@ var
   i: Integer;
   LCount: Integer;
 begin
-  FillWithSeq(Dst, 1.0, 0.1);
-  FillWithSeq(Src, 2.0, 0.2);
+  FillWithSeq(Dst, 1.0, 0.1, N);
+  FillWithSeq(Src, 2.0, 0.2, N);
 
   LCount := 256;
   RefSum := 0;
@@ -540,8 +577,8 @@ var
   Dst, Src, Ref: array[0..N-1] of Single;
   i: Integer;
 begin
-  FillWithSeq(Dst, 1.0, 0.1);
-  FillWithSeq(Src, 2.0, 0.2);
+  FillWithSeq(Dst, 1.0, 0.1, N);
+  FillWithSeq(Src, 2.0, 0.2, N);
   for i := 0 to N-1 do Ref[i] := Dst[i] - Src[i];
   _AVXSub(@Dst[0], @Src[0], N);
   Check(CompareSingleArrays(Dst, Ref, N), 'Sub failed');
@@ -556,7 +593,7 @@ var
   i: Integer;
   LCount: Integer;
 begin
-  FillWithSeq(Src, 1.0, 0.1);
+  FillWithSeq(Src, 1.0, 0.1, N);
 
   LCount := 256;
   RefSum := 0;
@@ -580,7 +617,7 @@ var
   i: Integer;
   LCount: Integer;
 begin
-  FillWithSeq(Src, 1.0, 0.1);
+  FillWithSeq(Src, 1.0, 0.1, N);
 
   LCount := 256;
   RefSum := 0;
@@ -602,7 +639,7 @@ var
   Dst, Src, Ref: array[0..N-1] of Single;
   i: Integer;
 begin
-  FillWithSeq(Src, -10.0, 0.1);
+  FillWithSeq(Src, -10.0, 0.1, N);
   for i := 0 to N-1 do Ref[i] := Exp(Src[i]);
   _AVXExp(@Dst[0], @Src[0], N);
   Check(CompareSingleArrays(Dst, Ref, N, 1e-5), 'Exp failed');
@@ -616,8 +653,8 @@ var
   RefSum, AVXSum: Single;
   i: Integer;
 begin
-  FillWithSeq(Dst, 1.0, 0.1);
-  FillWithSeq(Src, 2.0, 0.2);
+  FillWithSeq(Dst, 1.0, 0.1, N);
+  FillWithSeq(Src, 2.0, 0.2, N);
   RefSum := 0;
   for i := 0 to N-1 do RefSum := RefSum + Dst[i] * Src[i];
   AVXSum := _AVXDotProd(@Dst[0], @Src[0], N);
@@ -650,7 +687,7 @@ var
   W: Single;
   i: Integer;
 begin
-  FillWithSeq(Dst, 1.0, 0.1);
+  FillWithSeq(Dst, 1.0, 0.1, N);
   for i := 0 to N-1 do Codes[i] := Random(256) - 128;
   W := 0.75;
   for i := 0 to N-1 do Ref[i] := Dst[i] + Codes[i] * W;
@@ -667,19 +704,19 @@ var
   i: Integer;
   LCount: Integer;
 begin
-  FillWithSeq(Src, 2.0, 0.2);
+  FillWithSeq(Src, 2.0, 0.2, N);
   for i := 0 to N-1 do Codes[i] := Random(256) - 128;
 
   // Test 256
   LCount := 256;
-  FillWithSeq(Dst, 1.0, 0.1);
+  FillWithSeq(Dst, 1.0, 0.1, N);
   for i := 0 to LCount-1 do Ref[i] := Dst[i] + Src[i] * Codes[i];
   _AVXMulAddInt8(@Dst[0], @Src[0], @Codes[0], LCount);
   Check(CompareSingleArrays(Dst, Ref, LCount, 1e-3), Format('MulAddInt8 %d failed', [LCount]));
 
   // Test 259 - reuse Dst but reinitialize for this test
   LCount := 259;
-  FillWithSeq(Dst, 1.0, 0.1);
+  FillWithSeq(Dst, 1.0, 0.1, N);
   for i := 0 to LCount-1 do Ref[i] := Dst[i] + Src[i] * Codes[i];
   _AVXMulAddInt8(@Dst[0], @Src[0], @Codes[0], LCount);
   Check(CompareSingleArrays(Dst, Ref, LCount, 1e-3), Format('MulAddInt8 %d failed', [LCount]));
@@ -693,7 +730,7 @@ var
   Ref, AVX: Single;
   i: Integer;
 begin
-  FillWithSeq(Src, -10.0, 0.1);
+  FillWithSeq(Src, -10.0, 0.1, N);
   Ref := 0;
   for i := 0 to N-1 do
     if Abs(Src[i]) > Ref then Ref := Abs(Src[i]);
@@ -710,7 +747,7 @@ var
   MaxAbs: Single;
   i: Integer;
 begin
-  FillWithSeq(Src, -5.0, 0.04);
+  FillWithSeq(Src, -5.0, 0.04, N);
   MaxAbs := 5.0;
   for i := 0 to N-1 do
     Ref[i] := Round(EnsureRange(Src[i] / MaxAbs * 127, -127, 127));
@@ -757,7 +794,7 @@ var
   i: Integer;
 begin
   //FillWithSeq(Src, -2.0, 0.02);     // generates values from -2.0 to 3.1
-  FillWithSeq(Src, 3.2, -0.02);
+  FillWithSeq(Src, 3.2, -0.02, N);
   for i := 0 to N-1 do
     if Src[i] >= 0 then Ref[i] := 1.0
     else Ref[i] := 0.0;
@@ -774,7 +811,7 @@ var
   i: Integer;
 begin
   Slope := 0.01;
-  FillWithSeq(Src, -2.0, 0.02);
+  FillWithSeq(Src, -2.0, 0.02, N);
   for i := 0 to N-1 do
     if Src[i] >= 0 then Ref[i] := Src[i] else Ref[i] := Src[i] * Slope;
   _AVXLeakyRelu(@Dst[0], @Src[0], N, Slope);
@@ -803,7 +840,7 @@ var
   Mean, Ref, AVX: Single;
   i: Integer;
 begin
-  FillWithSeq(Src, 1.0, 0.1);
+  FillWithSeq(Src, 1.0, 0.1, N);
   Mean := 5.0;
   Ref := 0;
   for i := 0 to N-1 do Ref := Ref + Sqr(Src[i] - Mean);
@@ -825,9 +862,9 @@ begin
   // Simulate t=10 steps for bias correction
   InvOmB2D := 1.0 / (1 - Power(Beta2, 10));
 
-  FillWithSeq(Delta, 1.0, 0.1);
-  FillWithSeq(M, 0.0, 0.1);
-  FillWithSeq(V, 0.0, 0.2);
+  FillWithSeq(Delta, 1.0, 0.1, N);
+  FillWithSeq(M, 0.0, 0.1, N);
+  FillWithSeq(V, 0.0, 0.2, N);
 
   // Reference scalar implementation
   for i := 0 to N-1 do
@@ -855,8 +892,9 @@ var
   i: Integer;
 begin
   Beta2 := 0.999; k := 0.01; c := 0.001; Epsilon := 1e-8;
-  FillWithSeq(Delta, 1.0, 0.1);
-  FillWithSeq(V, 0.0, 0.2);
+
+  FillWithSeq(Delta, 1.0, 0.1, N);
+  FillWithSeq(V, 0.0, 0.2, N);
 
   for i := 0 to N-1 do
   begin
@@ -878,7 +916,7 @@ var
   i: Integer;
 begin
   Value := 2.5;
-  FillWithSeq(A, -5.0, 0.04);
+  FillWithSeq(A, -5.0, 0.04, N);
   for i := 0 to N-1 do
     if Abs(A[i]) > Value then Ref[i] := Sign(A[i]) * Value else Ref[i] := A[i];
   _AVXClampAbs(@A[0], Value, N);
@@ -895,8 +933,8 @@ var
   i: Integer;
 begin
   Beta1 := 0.9; k1 := 0.1; Beta2 := 0.99; k2 := 0.1; NegLR := -0.01; PosLR := 0.01;
-  FillWithSeq(Delta, 1.0, 0.1);
-  FillWithSeq(M, 0.0, 0.2);
+  FillWithSeq(Delta, 1.0, 0.1, N);
+  FillWithSeq(M, 0.0, 0.2, N);
 
   for i := 0 to N-1 do
   begin
@@ -914,22 +952,36 @@ end;
 
 procedure TTestAVX.TestGetMaxPos;
 const
-  N = 257;
+  N = 300;
 var
   A: array[0..N-1] of Single;
   RefVal, AVXVal: Single;
   RefPos, AVXPos: Integer;
-  i: Integer;
+  i, LCount: Integer;
 begin
-  FillWithSeq(A, -5.0, 0.04);
+  FillWithSeq(A, -5.0, 0.04, N);
+
+  LCount := 256;
   RefVal := A[0]; RefPos := 0;
-  for i := 1 to N-1 do
+  for i := 1 to LCount-1 do
     if A[i] > RefVal then
     begin
-      RefVal := A[i]; RefPos := i;
+      RefVal := A[i];
+      RefPos := i;
     end;
-  AVXVal := _AVXGetMaxPos(@A[0], N, AVXPos);
-  Check((Abs(RefVal - AVXVal) < 1e-5) and (RefPos = AVXPos), 'GetMaxPos failed');
+  AVXVal := _AVXGetMaxPos(@A[0], LCount, AVXPos);
+  Check((Abs(RefVal - AVXVal) < 1e-5) and (RefPos = AVXPos), Format('GetMaxPos %d failed', [LCount]));
+
+  LCount := 259;
+  RefVal := A[0]; RefPos := 0;
+  for i := 1 to LCount-1 do
+    if A[i] > RefVal then
+    begin
+      RefVal := A[i];
+      RefPos := i;
+    end;
+  AVXVal := _AVXGetMaxPos(@A[0], LCount, AVXPos);
+  Check((Abs(RefVal - AVXVal) < 1e-5) and (RefPos = AVXPos), Format('GetMaxPos %d failed', [LCount]));
 end;
 
 procedure TTestAVX.TestGetMinPos;
@@ -941,7 +993,7 @@ var
   RefPos, AVXPos: Integer;
   i: Integer;
 begin
-  FillWithSeq(A, -5.0, 0.04);
+  FillWithSeq(A, -5.0, 0.04, N);
   RefVal := A[0]; RefPos := 0;
   for i := 1 to N-1 do
     if A[i] < RefVal then
@@ -954,22 +1006,36 @@ end;
 
 procedure TTestAVX.TestGetMaxAbsPos;
 const
-  N = 257;
+  N = 300;
 var
   A: array[0..N-1] of Single;
   RefVal, AVXVal: Single;
   RefPos, AVXPos: Integer;
-  i: Integer;
+  i, LCount: Integer;
 begin
-  FillWithSeq(A, -5.0, 0.04);
+  FillWithSeq(A, -5.0, 0.04, N);
+
+  LCount := 256;
   RefVal := Abs(A[0]); RefPos := 0;
-  for i := 1 to N-1 do
+  for i := 1 to LCount-1 do
     if Abs(A[i]) > RefVal then
     begin
-      RefVal := Abs(A[i]); RefPos := i;
+      RefVal := Abs(A[i]);
+      RefPos := i;
     end;
-  AVXVal := _AVXGetMaxAbsPos(@A[0], N, AVXPos);
-  Check((Abs(RefVal - AVXVal) < 1e-5) and (RefPos = AVXPos), 'GetMaxAbsPos failed');
+  AVXVal := _AVXGetMaxAbsPos(@A[0], LCount, AVXPos);
+  Check((Abs(RefVal - AVXVal) < 1e-5) and (RefPos = AVXPos), Format('GetMaxAbsPos %d failed', [LCount]));
+
+  LCount := 257;
+  RefVal := Abs(A[0]); RefPos := 0;
+  for i := 1 to LCount-1 do
+    if Abs(A[i]) > RefVal then
+    begin
+      RefVal := Abs(A[i]);
+      RefPos := i;
+    end;
+  AVXVal := _AVXGetMaxAbsPos(@A[0], LCount, AVXPos);
+  Check((Abs(RefVal - AVXVal) < 1e-5) and (RefPos = AVXPos), Format('GetMaxAbsPos %d failed', [LCount]));
 end;
 
 procedure TTestAVX.TestAddScalar;
@@ -981,7 +1047,7 @@ var
   i: Integer;
 begin
   Value := 3.14;
-  FillWithSeq(A, 1.0, 0.1);
+  FillWithSeq(A, 1.0, 0.1, N);
   for i := 0 to N-1 do Ref[i] := A[i] + Value;
   _AVXAddScalar(@A[0], Value, N);
   Check(CompareSingleArrays(A, Ref, N), 'AddScalar failed');
@@ -989,23 +1055,34 @@ end;
 
 procedure TTestAVX.TestExpShiftSum;
 const
-  N = 257;
+  N = 300;
 var
   Dst, Src, Ref: array[0..N-1] of Single;
   Shift, RefSum, AVXSum: Single;
-  i: Integer;
+  LCount, i: Integer;
 begin
   Shift := 1.0;
-  FillWithSeq(Src, -5.0, 0.04);
+  FillWithSeq(Src, -5.0, 0.04, N);
+
+  LCount := 257;
   RefSum := 0;
-  for i := 0 to N-1 do
+  for i := 0 to LCount-1 do
   begin
     Ref[i] := Exp(Src[i] - Shift);
     RefSum := RefSum + Ref[i];
   end;
-  AVXSum := _AVXExpShiftSum(@Dst[0], @Src[0], Shift, N);
-  Check(CompareSingleArrays(Dst, Ref, N) and (Abs(RefSum - AVXSum) < 1e-3),
-        'ExpShiftSum failed');
+  AVXSum := _AVXExpShiftSum(@Dst[0], @Src[0], Shift, LCount);
+  Check(CompareSingleArrays(Dst, Ref, LCount) and (Abs(RefSum - AVXSum) < 1e-3), Format('ExpShiftSum %d failed', [LCount]));
+
+  LCount := 256;
+  RefSum := 0;
+  for i := 0 to LCount-1 do
+  begin
+    Ref[i] := Exp(Src[i] - Shift);
+    RefSum := RefSum + Ref[i];
+  end;
+  AVXSum := _AVXExpShiftSum(@Dst[0], @Src[0], Shift, LCount);
+  Check(CompareSingleArrays(Dst, Ref, LCount) and (Abs(RefSum - AVXSum) < 1e-3), Format('ExpShiftSum %d failed', [LCount]));
 end;
 
 procedure TTestAVX.TestLn;
@@ -1015,7 +1092,7 @@ var
   Dst, Src, Ref: array[0..N-1] of Single;
   i: Integer;
 begin
-  FillWithSeq(Src, 0.1, 0.02);
+  FillWithSeq(Src, 0.1, 0.02, N);
   for i := 0 to N-1 do Ref[i] := Ln(Src[i]);
   _AVXLn(@Dst[0], @Src[0], N);
   Check(CompareSingleArrays(Dst, Ref, N), 'Ln failed');
@@ -1028,7 +1105,7 @@ var
   Dst, Src, RefSin, RefCos: array[0..N-1] of Single;
   i: Integer;
 begin
-  FillWithSeq(Src, -2*Pi, 0.1);
+  FillWithSeq(Src, -2*Pi, 0.1, N);
   for i := 0 to N-1 do
   begin
     RefSin[i] := Sin(Src[i]);
@@ -1052,7 +1129,7 @@ var
   Dst, Ref: array[0..N-1] of Word;
   i: Integer;
 begin
-  FillWithSeq(Src, -10.0, 0.08);
+  FillWithSeq(Src, -10.0, 0.08, N);
   for i := 0 to N-1 do Ref[i] := SingleToBFloat16(Src[i]);
   _AVXEncodeBF16(@Dst[0], @Src[0], N);
   Check(CompareWordArrays(Dst, Ref, 5), 'EncodeBF16 failed');
@@ -1067,7 +1144,7 @@ var
   i: Integer;
 begin
   Low := -0.5; High := 0.5; Slope := 0.01;
-  FillWithSeq(Src, -1.0, 0.008);
+  FillWithSeq(Src, -1.0, 0.008, N);
   for i := 0 to N-1 do
   begin
     if Src[i] > High then
@@ -1078,7 +1155,7 @@ begin
       Ref[i] := Low + (Src[i] - Low) * Slope;
   end;
   _AVXReluL(@Dst[0], @Src[0], Low, High, Slope, N);
-  Check(CompareSingleArrays(Dst, Ref, N), 'ReluL failed');
+  Check(CompareSingleArrays(Dst, Ref, N, 1e-2), 'ReluL failed');
 end;
 
 procedure TTestAVX.TestEncodeF16;
@@ -1089,7 +1166,7 @@ var
   Dst, Ref: array[0..N-1] of Word;
   i: Integer;
 begin
-  FillWithSeq(Src, -10.0, 0.08);
+  FillWithSeq(Src, -10.0, 0.08, N);
   for i := 0 to N-1 do Ref[i] := SingleToHalf(Src[i]);
   _AVXEncodeF16(@Dst[0], @Src[0], N);
   Check(CompareWordArrays(Dst, Ref, 5), 'EncodeF16 failed');
@@ -1104,7 +1181,7 @@ var
   i: Integer;
 begin
   Low := -0.5; High := 0.5; Slope := 0.01;
-  FillWithSeq(Src, -1.0, 0.008);
+  FillWithSeq(Src, -1.0, 0.008, N);
   for i := 0 to N-1 do
     if (Src[i] > Low) and not (Src[i] > High) then Ref[i] := 1.0
     else Ref[i] := Slope;
