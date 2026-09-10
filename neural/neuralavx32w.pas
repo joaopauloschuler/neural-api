@@ -365,8 +365,8 @@ end;
     EAX = dst : PSingle
     EDX = src : PSingle
     ECX = N   : Integer
-    [EBP+8]  = mulOp1 : Single (const, stack parameter)
-    [EBP+12] = mulOp2 : Single (const, stack parameter)
+    [EBP+12]  = mulOp1 : Single (const, stack parameter)
+    [EBP+8] = mulOp2 : Single (const, stack parameter)
 
   vzeroupper is called before exit to avoid AVX-SSE transition penalties.
 -----------------------------------------------------------------------------}
@@ -383,8 +383,8 @@ asm
   test ecx, ecx
   jle @Exit
 
-  vbroadcastss ymm0, [ebp+8]   // ymm0 = mulOp1
-  vbroadcastss ymm1, [ebp+12]    // ymm1 = mulOp2
+  vbroadcastss ymm0, [ebp+12]   // ymm0 = mulOp1
+  vbroadcastss ymm1, [ebp+8]  // ymm1 = mulOp2
 
   // Compute bulk count (multiple of 16) and tail (0..15)
   mov eax, ecx
@@ -400,15 +400,15 @@ asm
   // Block 0: elements 0..7
   vmovups ymm2, [edi]       // load dst[0..7]
   vmovups ymm3, [esi]       // load src[0..7]
-  vmulps  ymm2, ymm2, ymm1  // dst * mulOp1
-  vfmadd231ps ymm2, ymm3, ymm0   // + src * mulOp2
+  vmulps  ymm2, ymm2, ymm0  // dst * mulOp1
+  vfmadd231ps ymm2, ymm3, ymm1   // + src * mulOp2
   vmovups [edi], ymm2       // store back
 
   // Block 1: elements 8..15
   vmovups ymm4, [edi+32]
   vmovups ymm5, [esi+32]
-  vmulps  ymm4, ymm4, ymm1
-  vfmadd231ps ymm4, ymm5, ymm0
+  vmulps  ymm4, ymm4, ymm0
+  vfmadd231ps ymm4, ymm5, ymm1
   vmovups [edi+32], ymm4
 
   add edi, 64             // advance by 16*4 = 64 bytes
@@ -429,8 +429,8 @@ asm
 
   vmovups ymm2, [edi]
   vmovups ymm3, [esi]
-  vmulps  ymm2, ymm2, ymm1
-  vfmadd231ps ymm2, ymm3, ymm0
+  vmulps  ymm2, ymm2, ymm0
+  vfmadd231ps ymm2, ymm3, ymm1
   vmovups [edi], ymm2
   add edi, 32
   add esi, 32
@@ -445,8 +445,8 @@ asm
 @ScalarLoop:
   vmovss xmm2, [edi + eax*4]
   vmovss xmm3, [esi + eax*4]
-  vmulss xmm2, xmm2, xmm1
-  vfmadd231ss xmm2, xmm3, xmm0
+  vmulss xmm2, xmm2, xmm0
+  vfmadd231ss xmm2, xmm3, xmm1
   vmovss [edi + eax*4], xmm2
   inc eax
   cmp eax, ecx
@@ -594,17 +594,23 @@ end;
 {-----------------------------------------------------------------------------
   AVX2 ReLU copy: dst[i] = max(0, src[i]).
   Uses 256-bit YMM registers, processes 32 elements per iteration.
-  Parameters (register): EAX=dst, EDX=src, ECX=N.
+  Win32 register calling convention:
+    EAX = dst, EDX = src, ECX = N.
+  ReLU semantics match: if x > 0 then x else 0.
+  NaN and -0.0 both map to 0.
 -----------------------------------------------------------------------------}
-procedure _AVX2CopyRelu( dst : PSingle; src : PSingle; N : Integer);
+procedure _AVX2CopyRelu(dst: PSingle; src: PSingle; N: Integer);
 asm
-  imul ecx, -4                 // N := -N for reverse traversal
-  sub eax, ecx                 // Adjust dst pointer
-  sub edx, ecx                 // Adjust src pointer
+  // ecx = -4 * N for reverse traversal
+  neg ecx
+  shl ecx, 2
 
-  vxorps ymm5, ymm5, ymm5      // Zero constant for max
+  // Adjust pointers to end of arrays
+  sub eax, ecx
+  sub edx, ecx
 
-  // Main loop: 32 elements per iteration
+  vxorps ymm5, ymm5, ymm5      // ymm5 = 0
+
 @Loop1:
   add ecx, 128
   jg @loopEnd1
@@ -614,10 +620,19 @@ asm
   vmovups ymm2, [edx + ecx - 64]
   vmovups ymm3, [edx + ecx - 32]
 
-  vmaxps ymm0, ymm5, ymm0
-  vmaxps ymm1, ymm5, ymm1
-  vmaxps ymm2, ymm5, ymm2
-  vmaxps ymm3, ymm5, ymm3
+  // ReLU: if x > 0 then x else 0
+  // mask = (0 < x); blend picks x when mask set, else 0.
+  vcmpltps ymm4, ymm5, ymm0
+  vblendvps ymm0, ymm5, ymm0, ymm4
+
+  vcmpltps ymm4, ymm5, ymm1
+  vblendvps ymm1, ymm5, ymm1, ymm4
+
+  vcmpltps ymm4, ymm5, ymm2
+  vblendvps ymm2, ymm5, ymm2, ymm4
+
+  vcmpltps ymm4, ymm5, ymm3
+  vblendvps ymm3, ymm5, ymm3, ymm4
 
   vmovups [eax + ecx - 128], ymm0
   vmovups [eax + ecx - 96],  ymm1
@@ -630,13 +645,13 @@ asm
   sub ecx, 128
   jz @loop3End
 
-  // Handle 4-element groups (XMM)
 @Loop2:
   add ecx, 16
   jg @Loop2End
 
   vmovups xmm0, [edx + ecx - 16]
-  vmaxps xmm0, xmm5, xmm0
+  vcmpltps xmm4, xmm5, xmm0
+  vblendvps xmm0, xmm5, xmm0, xmm4
   vmovups [eax + ecx - 16], xmm0
   jmp @Loop2
 
@@ -644,13 +659,13 @@ asm
   sub ecx, 16
   jz @loop3End
 
-  // Handle last 0..3 elements (scalar)
 @loop3:
   add ecx, 4
   jg @loop3End
 
   vmovss xmm0, [edx + ecx - 4]
-  vmaxss xmm0, xmm5, xmm0
+  vcmpltss xmm4, xmm5, xmm0
+  vblendvps xmm0, xmm5, xmm0, xmm4
   vmovss [eax + ecx - 4], xmm0
   jmp @loop3
 
@@ -3058,118 +3073,116 @@ end;
   Parameters: EAX=PtrA, EDX=NumElements, ECX=Pos (out pointer).
   Returns max value via ST(0).
 -----------------------------------------------------------------------------}
-function _AVX2GetMaxPos( PtrA : PSingle; NumElements : Integer; out Position : Integer ) : Single;
+function _AVX2GetMaxPos(PtrA: PSingle; NumElements: Integer; out Position: Integer): Single;
 asm
   push ebx
   push esi
   push edi
   sub esp, 128
 
-  mov esi, eax
-  mov ebx, ecx
-  mov eax, edx
-  mov [esp+124], esi           // save original PtrA
+  mov esi, eax                // esi = PtrA
+  mov ebx, ecx                // ebx = @Position (out parameter)
+  mov eax, edx                // eax = NumElements
+  mov [esp+124], esi          // save original PtrA
 
   test eax, eax
   jle @Zero
 
+  // Split into bulk (multiples of 8) and tail (0..7)
   mov edx, eax
-  and edx, 7
-  sub eax, edx
-  mov [esp+120], eax           // store bulk count
+  and edx, 7                  // tail count
+  sub eax, edx                // bulk element count
+  mov [esp+120], eax          // store bulk count (in elements)
 
-  // Load seed indices 0..7
+  // Load lane indices 0..7 (seed)
   vmovdqu ymm1, yword ptr [cAVXArgLaneSeed]
 
   // Generate step vector of 8's
   mov [esp+64], 8
   vpbroadcastd ymm2, [esp+64]
 
-  // Seed with first 8 elements
-  vmovups ymm0, [esi]
-
+  // Load first 8 elements as initial candidates
+  vmovups ymm0, [esi]         // ymm0 = max values
   add esi, 32
+
   mov ecx, [esp+120]
-  shr ecx, 3
-  dec ecx
-  jz @Fold
+  shr ecx, 3                  // number of full 8-element blocks
+  dec ecx                     // we already processed the first block
+  jz @Fold                    // if only one block, skip bulk loop
 
 @BulkLoop:
-  vmovups ymm3, [esi]
-  vpaddd ymm4, ymm1, ymm2      // new indices = current + 8
-  vcmpps ymm5, ymm3, ymm0, 6   // ymm3 > ymm0 ?
-  vblendvps ymm0, ymm0, ymm3, ymm5
-  vblendvps ymm1, ymm1, ymm4, ymm5
+  vmovups ymm3, [esi]         // load next 8 values
+  vpaddd ymm4, ymm1, ymm2     // new indices = current + 8
+  vcmpps ymm5, ymm3, ymm0, 22 // ymm3 > ymm0 ?  (condition code 22 = greater-than)
+  vblendvps ymm0, ymm0, ymm3, ymm5   // update max values
+  vblendvps ymm1, ymm1, ymm4, ymm5   // update corresponding indices
   add esi, 32
   dec ecx
   jnz @BulkLoop
 
 @Fold:
-  // Reduce 8 lanes to scalar max while keeping the corresponding index
-  // Extract high 128-bit halves
-  vextractf128 xmm2, ymm0, 1    // high values
-  vextracti128 xmm3, ymm1, 1    // high indices
+  // Reduce 8 lanes to scalar while preserving the index of the maximum
+  vextractf128 xmm2, ymm0, 1   // high 4 values
+  vextracti128 xmm3, ymm1, 1   // high 4 indices
 
-  // Compare low vs high values, select the greater
-  vcmpps xmm5, xmm0, xmm2, 6    // mask: low > high ?
-  vblendvps xmm6, xmm3, xmm1, xmm5 // select indices: if low > high, take low index else high index
-  vmaxps xmm0, xmm0, xmm2       // max values (low/high combined)
+  vcmpps xmm5, xmm0, xmm2, 22  // low > high ?
+  vblendvps xmm6, xmm3, xmm1, xmm5 // select indices
+  vmaxps xmm0, xmm0, xmm2      // max values (low/high combined)
 
-  // Now xmm0 has 4 max values, xmm6 has corresponding indices
   // Reduce to 2 lanes
-  vpshufd xmm2, xmm0, $55       // [1,1,1,1]
-  vpshufd xmm3, xmm6, $55       // indices for [1]
-  vcmpps xmm5, xmm0, xmm2, 6
+  vpshufd xmm2, xmm0, $55      // shuffle: lane 1 broadcast
+  vpshufd xmm3, xmm6, $55
+  vcmpps xmm5, xmm0, xmm2, 22
   vblendvps xmm4, xmm3, xmm6, xmm5
   vmaxss xmm0, xmm0, xmm2
   vmovdqa xmm6, xmm4
 
   // Reduce to 1 lane
-  vpshufd xmm2, xmm0, $AA       // [2,2,2,2]
+  vpshufd xmm2, xmm0, $AA
   vpshufd xmm3, xmm6, $AA
-  vcmpps xmm5, xmm0, xmm2, 6
+  vcmpps xmm5, xmm0, xmm2, 22
   vblendvps xmm4, xmm3, xmm6, xmm5
   vmaxss xmm0, xmm0, xmm2
   vmovdqa xmm6, xmm4
 
-  vpshufd xmm2, xmm0, $FF       // [3,3,3,3]
+  vpshufd xmm2, xmm0, $FF
   vpshufd xmm3, xmm6, $FF
-  vcmpps xmm5, xmm0, xmm2, 6
+  vcmpps xmm5, xmm0, xmm2, 22
   vblendvps xmm4, xmm3, xmm6, xmm5
   vmaxss xmm0, xmm0, xmm2
   vmovdqa xmm6, xmm4
 
-  // Now xmm0[0] = max value, xmm6[0] = corresponding index
+  // Now xmm0[0] = maximum value, xmm6[0] = corresponding index
   vmovss [esp], xmm0
-  vmovd [esp+96], xmm6          // store the scalar index
+  vmovd [esp+96], xmm6
 
   vzeroupper
 
-  // Since we have already the max and index, we can skip scanning.
-  mov eax, [esp+96]             // load index
-  movss xmm0, [esp]             // load max value
+  mov eax, [esp+96]           // load index of maximum from bulk
 
-  // Tail handling (still needed if there were remaining elements)
+  // ---- Tail handling (0..7 elements) ----
   test edx, edx
   jz @TailDone
 
-  mov esi, [esp+124]
-  add esi, [esp+120]
-  mov edi, [esp+120]
+  // FIX: pointer offset must be in bytes: bulk_count * 4
+  mov esi, [esp+124]          // restore original PtrA
+  mov edi, [esp+120]          // bulk element count (base index)
+  lea esi, [esi + edi*4]      // point to the start of tail elements
+
   xor ecx, ecx
 @TailLoop:
   vmovss xmm1, [esi + ecx*4]
-  comiss xmm1, xmm0
-  jbe @TailSkip
+  comiss xmm1, xmm0           // compare current with current maximum
+  jbe @TailSkip               // if <=, skip (keep first occurrence)
   movss xmm0, xmm1
-  lea eax, [edi + ecx]
+  lea eax, [edi + ecx]        // new position = bulk_count + tail_index
 @TailSkip:
   inc ecx
   cmp ecx, edx
   jl @TailLoop
 
 @TailDone:
-  mov [ebx], eax
+  mov [ebx], eax              // store final position
   jmp @Exit
 
 @Zero:
@@ -3178,8 +3191,7 @@ asm
 
 @Exit:
   vmovss [esp], xmm0
-  fld dword ptr [esp]
-
+  fld dword ptr [esp]         // return Single via ST(0)
   add esp, 128
   pop edi
   pop esi
@@ -3197,63 +3209,64 @@ end;
   Parameters: EAX=PtrA, EDX=NumElements, ECX=Position (out).
   Returns: min value via ST(0).
 -----------------------------------------------------------------------------}
-function _AVX2GetMinPos( PtrA : PSingle; NumElements : Integer; out Position : Integer ) : Single;
+function _AVX2GetMinPos(PtrA: PSingle; NumElements: Integer; out Position: Integer): Single;
 asm
   push ebx
   push esi
   push edi
   sub esp, 128
 
-  mov esi, eax
-  mov ebx, ecx
-  mov eax, edx
-  mov [esp+124], esi           // save original PtrA
+  mov esi, eax                // esi = PtrA
+  mov ebx, ecx                // ebx = @Position (out parameter)
+  mov eax, edx                // eax = NumElements
+  mov [esp+124], esi          // save original PtrA
 
   test eax, eax
   jle @Zero
 
+  // Split into bulk (multiples of 8) and tail (0..7)
   mov edx, eax
-  and edx, 7                   // tail count (0..7)
-  sub eax, edx                 // bulk count
-  mov [esp+120], eax           // store bulk count
+  and edx, 7                  // tail count
+  sub eax, edx                // bulk element count
+  mov [esp+120], eax          // store bulk count (in elements)
 
-  // Load seed indices 0..7
+  // Load lane indices 0..7 (seed)
   vmovdqu ymm1, yword ptr [cAVXArgLaneSeed]
 
   // Generate step vector of 8's
   mov [esp+64], 8
   vpbroadcastd ymm2, [esp+64]
 
-  // Seed with first 8 elements
-  vmovups ymm0, [esi]
-
+  // Load first 8 elements as initial candidates
+  vmovups ymm0, [esi]         // ymm0 = min values
   add esi, 32
+
   mov ecx, [esp+120]
-  shr ecx, 3
-  dec ecx
-  jz @Fold
+  shr ecx, 3                  // number of full 8-element blocks
+  dec ecx                     // we already processed the first block
+  jz @Fold                    // if only one block, skip bulk loop
 
 @BulkLoop:
-  vmovups ymm3, [esi]
-  vpaddd ymm4, ymm1, ymm2      // new indices = current + 8
-  vcmpps ymm5, ymm3, ymm0, 17   // ymm3 < ymm0 ?
-  vblendvps ymm0, ymm0, ymm3, ymm5
-  vblendvps ymm1, ymm1, ymm4, ymm5
+  vmovups ymm3, [esi]         // load next 8 values
+  vpaddd ymm4, ymm1, ymm2     // new indices = current + 8
+  vcmpps ymm5, ymm3, ymm0, 17 // ymm3 < ymm0 ?
+  vblendvps ymm0, ymm0, ymm3, ymm5   // update min values
+  vblendvps ymm1, ymm1, ymm4, ymm5   // update corresponding indices
   add esi, 32
   dec ecx
   jnz @BulkLoop
 
 @Fold:
-  // Reduce 8 lanes to scalar min while keeping the corresponding index
-  vextractf128 xmm2, ymm0, 1    // high values
-  vextracti128 xmm3, ymm1, 1    // high indices
+  // Reduce 8 lanes to scalar while preserving the index of the minimum
+  vextractf128 xmm2, ymm0, 1   // high 4 values
+  vextracti128 xmm3, ymm1, 1   // high 4 indices
 
-  vcmpps xmm5, xmm0, xmm2, 17   // low < high ?
+  vcmpps xmm5, xmm0, xmm2, 17  // low < high ?
   vblendvps xmm6, xmm3, xmm1, xmm5 // select indices
-  vminps xmm0, xmm0, xmm2       // min values (low/high combined)
+  vminps xmm0, xmm0, xmm2      // min values (low/high combined)
 
   // Reduce to 2 lanes
-  vpshufd xmm2, xmm0, $55
+  vpshufd xmm2, xmm0, $55      // shuffle: lane 1 broadcast
   vpshufd xmm3, xmm6, $55
   vcmpps xmm5, xmm0, xmm2, 17
   vblendvps xmm4, xmm3, xmm6, xmm5
@@ -3275,36 +3288,37 @@ asm
   vminss xmm0, xmm0, xmm2
   vmovdqa xmm6, xmm4
 
-  // Now xmm0[0] = min value, xmm6[0] = corresponding index
+  // Now xmm0[0] = minimum value, xmm6[0] = corresponding index
   vmovss [esp], xmm0
   vmovd [esp+96], xmm6
 
   vzeroupper
 
-  mov eax, [esp+96]             // load index
-  movss xmm0, [esp]             // load min value
+  mov eax, [esp+96]           // load index of minimum from bulk
 
-  // Tail handling (0..7 elements)
+  // ---- Tail handling (0..7 elements) ----
   test edx, edx
   jz @TailDone
 
-  mov esi, [esp+124]
-  add esi, [esp+120]
-  mov edi, [esp+120]
+  // FIX: pointer offset must be in bytes: bulk_count * 4
+  mov esi, [esp+124]          // restore original PtrA
+  mov edi, [esp+120]          // bulk element count (base index)
+  lea esi, [esi + edi*4]      // point to the start of tail elements
+
   xor ecx, ecx
 @TailLoop:
   vmovss xmm1, [esi + ecx*4]
-  comiss xmm1, xmm0
-  jae @TailSkip
+  comiss xmm1, xmm0           // compare current with current minimum
+  jae @TailSkip               // if >=, skip (keep first occurrence)
   movss xmm0, xmm1
-  lea eax, [edi + ecx]
+  lea eax, [edi + ecx]        // new position = bulk_count + tail_index
 @TailSkip:
   inc ecx
   cmp ecx, edx
   jl @TailLoop
 
 @TailDone:
-  mov [ebx], eax
+  mov [ebx], eax              // store final position
   jmp @Exit
 
 @Zero:
@@ -3313,8 +3327,7 @@ asm
 
 @Exit:
   vmovss [esp], xmm0
-  fld dword ptr [esp]
-
+  fld dword ptr [esp]         // return Single via ST(0)
   add esp, 128
   pop edi
   pop esi
@@ -3330,8 +3343,7 @@ end;
   AVX2 max absolute value and first occurrence index (32-bit, 8 elements/loop).
   Parameters: EAX = PtrA, EDX = NumElements, ECX = Position (out pointer).
   Returns: max absolute value via ST(0).
-  This is a direct adaptation of _AVX2GetMaxPos, with absolute value applied
-  to every loaded element before comparison.
+  This is _AVX2GetMaxPos with absolute value applied to loaded elements.
 -----------------------------------------------------------------------------}
 function _AVX2GetMaxAbsPos(PtrA: PSingle; NumElements: Integer; out Position: Integer): Single;
 asm
@@ -3340,20 +3352,21 @@ asm
   push edi
   sub esp, 128
 
-  mov esi, eax
-  mov ebx, ecx
-  mov eax, edx
-  mov [esp+124], esi           // save original PtrA
+  mov esi, eax                // esi = PtrA
+  mov ebx, ecx                // ebx = @Position (out parameter)
+  mov eax, edx                // eax = NumElements
+  mov [esp+124], esi          // save original PtrA
 
   test eax, eax
   jle @Zero
 
+  // Split into bulk (multiples of 8) and tail (0..7)
   mov edx, eax
-  and edx, 7
-  sub eax, edx
-  mov [esp+120], eax           // store bulk count (in elements)
+  and edx, 7                  // tail count
+  sub eax, edx                // bulk element count
+  mov [esp+120], eax          // store bulk count (in elements)
 
-  // Load absolute mask into ymm7
+  // Load absolute mask into ymm7 (clears sign bit)
   vmovdqu ymm7, yword ptr [cAVXArgAbsMask]
 
   // Load lane offsets 0..7
@@ -3363,21 +3376,21 @@ asm
   mov [esp+64], 8
   vpbroadcastd ymm2, [esp+64]
 
-  vmovdqa ymm6, ymm2            // ymm6 = {8,8,8,8,8,8,8,8}
+  vmovdqa ymm6, ymm2          // ymm6 = {8,8,8,8,8,8,8,8} (base for indices)
 
   // Seed with first 8 elements, take absolute values
   vmovups ymm0, [esi]
-  vandps ymm0, ymm0, ymm7
+  vandps ymm0, ymm0, ymm7     // abs
 
   add esi, 32
   mov ecx, [esp+120]
-  shr ecx, 3
-  dec ecx
+  shr ecx, 3                  // number of full blocks
+  dec ecx                     // first block already processed
   jz @Fold
 
 @BulkLoop:
   vmovups ymm3, [esi]
-  vandps ymm3, ymm3, ymm7      // absolute values
+  vandps ymm3, ymm3, ymm7     // abs
 
   vmovdqu ymm4, yword ptr [cAVXArgLaneSeed]   // lane offsets
   vpaddd ymm4, ymm6, ymm4                     // absolute indices = base + offset
@@ -3389,7 +3402,6 @@ asm
 
   add esi, 32
   dec ecx
-
   jnz @BulkLoop
 
 @Fold:
@@ -3422,35 +3434,38 @@ asm
   vmaxss xmm0, xmm0, xmm2
   vmovdqa xmm6, xmm4
 
+  // Now xmm0[0] = maximum absolute value, xmm6[0] = corresponding index
   vmovss [esp], xmm0
   vmovd [esp+96], xmm6
 
   vzeroupper
 
-  mov eax, [esp+96]
-  movss xmm0, [esp]
+  mov eax, [esp+96]           // index from bulk
 
+  // ---- Tail handling (0..7 elements) ----
   test edx, edx
   jz @TailDone
 
-  mov esi, [esp+124]
-  add esi, [esp+120]
-  mov edi, [esp+120]
+  // FIX: pointer offset must be in bytes: bulk_count * 4
+  mov esi, [esp+124]          // restore original PtrA
+  mov edi, [esp+120]          // bulk element count (base index)
+  lea esi, [esi + edi*4]      // point to start of tail elements
+
   xor ecx, ecx
 @TailLoop:
   vmovss xmm1, [esi + ecx*4]
-  vandps xmm1, xmm1, xmm7
-  comiss xmm1, xmm0
-  jbe @TailSkip
+  vandps xmm1, xmm1, xmm7     // absolute value (xmm7 is low part of ymm7)
+  comiss xmm1, xmm0           // compare with current max
+  jbe @TailSkip               // if <=, keep first occurrence
   movss xmm0, xmm1
-  lea eax, [edi + ecx]
+  lea eax, [edi + ecx]        // new position = bulk_count + tail_index
 @TailSkip:
   inc ecx
   cmp ecx, edx
   jl @TailLoop
 
 @TailDone:
-  mov [ebx], eax
+  mov [ebx], eax              // store final position
   jmp @Exit
 
 @Zero:
@@ -3459,13 +3474,11 @@ asm
 
 @Exit:
   vmovss [esp], xmm0
-  fld dword ptr [esp]
-
+  fld dword ptr [esp]         // return Single via ST(0)
   add esp, 128
   pop edi
   pop esi
   pop ebx
-
 end;
 
 function _AVX512GetMaxAbsPos( PtrA : PSingle; NumElements : integer; out Position : integer ) : single; inline;

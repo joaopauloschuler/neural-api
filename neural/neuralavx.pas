@@ -8,6 +8,9 @@ interface
    This unit is only for Delphi
 {$ENDIF}
 
+uses
+  {$IFDEF CPU64} neuralavx64w {$ELSE} neuralavx32w {$ENDIF};
+
 procedure _AVXFillMem( dst : PSingle; FillOp : Single; NumElements : Integer ); inline;
 procedure _AVXCopyRelu( dst : PSingle; src : PSingle; N : Integer ); inline;
 procedure _AVXMulAdd( dst : PSingle; src : PSingle; z : PSingle; N : Integer ); inline;
@@ -57,12 +60,7 @@ procedure _AVXReluLGateMask(dst, src: Pointer; LowLimit, HighLimit, Slope: Singl
 implementation
 
 uses
-  SysUtils, Math,
-  {$IFDEF CPU64}
-  neuralavx64w
-  {$ELSE}
-  neuralavx32w
-  {$ENDIF};
+  SysUtils, Math;
 
 {-----------------------------------------------------------------------------
   _AVXFillMem: dst[i] := FillOp for i = 0..NumElements-1.
@@ -183,7 +181,7 @@ end;
 procedure _AVXSub( dst : PSingle; src : PSingle; N : Integer );
 begin
   {$IFDEF AVX64}
-  _AVX512SubPair(dst, src, N);
+  _AVX512Sub(dst, src, N);
   {$ELSE}
   _AVX2Sub(dst, src, N);
   {$ENDIF}
