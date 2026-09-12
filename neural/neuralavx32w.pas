@@ -1246,37 +1246,31 @@ asm
   mov eax, src
   mov ecx, N
 
-  vxorps ymm0, ymm0, ymm0    // accumulator (8 lanes)
+  vxorps ymm0, ymm0, ymm0
+  vxorps xmm1, xmm1, xmm1        
 
-  // ---- Main loop: process 32 elements per iteration ----
 @Loop32:
   cmp ecx, 32
-  jl @Loop4
-
+  jl @Loop8                       
   vaddps ymm0, ymm0, [eax]
   vaddps ymm0, ymm0, [eax+32]
   vaddps ymm0, ymm0, [eax+64]
   vaddps ymm0, ymm0, [eax+96]
-
   add eax, 128
   sub ecx, 32
   jmp @Loop32
 
-@Loop4:
-  cmp ecx, 4
+@Loop8:
+  cmp ecx, 8
   jl @Tail
-
-  vaddps xmm0, xmm0, [eax]
-  add eax, 16
-  sub ecx, 4
-  jmp @Loop4
+  vaddps ymm0, ymm0, [eax]        
+  add eax, 32
+  sub ecx, 8
+  jmp @Loop8
 
 @Tail:
   test ecx, ecx
   jz @Done
-
-  // Tail accumulator in xmm1
-  vxorps xmm1, xmm1, xmm1
 @ScalarLoop:
   vaddss xmm1, xmm1, [eax]
   add eax, 4
@@ -1284,16 +1278,12 @@ asm
   jnz @ScalarLoop
 
 @Done:
-  // ---- Horizontal sum of ymm0 (8 lanes) into xmm0 ----
   vextractf128 xmm2, ymm0, 1
   vaddps xmm0, xmm0, xmm2
   vhaddps xmm0, xmm0, xmm0
   vhaddps xmm0, xmm0, xmm0
-
-  // ---- Add tail sum ----
   vaddss xmm0, xmm0, xmm1
 
-  // ---- Return via ST(0) ----
   movss dword ptr [esp], xmm0
   fld dword ptr [esp]
 
