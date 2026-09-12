@@ -50,6 +50,7 @@ uses
   {$IFDEF FPC}
   fgl,
   {$ENDIF}
+  {$IFNDEF FPC} neuraldelphi, {$ENDIF}
   Classes, SysUtils, math, syncobjs, neuralvolume, neuralgeneric,
   neuralbyteprediction, neuralcache, neuralab, neuralthread,
   pascoremath32, pascoremathhelperfuncs;
@@ -127,6 +128,16 @@ const
   csDWT1DHaar  = 0;   // unnormalised Haar (default)
   csDWT1DCDF53 = 1;   // CDF / LeGall 5/3
   csDWT1DDaub4 = 2;   // Daubechies-4 (db2) lifting
+
+{$IFDEF OpenCL}
+const
+  // Lanes per work-group of every TNNetFusedSDPACL launch. A power of two (the
+  // tree reductions halve it) within every device's max work-group size.
+  csFusedSDPALocalSize = 256;
+  // Local memory left unrequested per work-group: NVIDIA keeps about 1 KB per
+  // work-group for the driver and rejects (CL_OUT_OF_RESOURCES) a launch taking it.
+  csFusedSDPALocalMemReserveBytes = 1024;
+{$ENDIF OpenCL}
 
 type
   TNNetLayer = class;
@@ -4530,15 +4541,6 @@ type
   end;
 
 {$IFDEF OpenCL}
-const
-  // Lanes per work-group of every TNNetFusedSDPACL launch. A power of two (the
-  // tree reductions halve it) within every device's max work-group size.
-  csFusedSDPALocalSize = 256;
-  // Local memory left unrequested per work-group: NVIDIA keeps about 1 KB per
-  // work-group for the driver and rejects (CL_OUT_OF_RESOURCES) a launch taking it.
-  csFusedSDPALocalMemReserveBytes = 1024;
-
-type
   /// OpenCL forward helper for the cached decode step of the fused multi-head
   // attention (TNNetFusedSDPA). Binds FIVE entry points against the SAME shared
   // program and therefore one in-order command queue: the FP32 and int8
@@ -15621,7 +15623,7 @@ type
     FsBuf, FdBuf: array of Double;                 // ComputeCPU split bands
     FIlsBuf, FIldBuf: array of Double;             // InverseChannel working bands
     FgsBuf, FgdBuf, FsFBuf, FdFBuf, FoddInBuf: array of Double; // BackpropagateCPU
-    FhistSBuf, FhistDBuf: array of array of Double; // [step][FHalf] pre-step forward state
+    FhistSBuf, FhistDBuf: {$IFDEF FPC}array of array of Double;{$ELSE}TNeuralDoubleDynArr2D;{$ENDIF}// [step][FHalf] pre-step forward state
     procedure BuildFilter();
     function TapPtr(): TNNetVolume;     // weights when learnable, nil otherwise
     function GetTap(idx: integer): TNeuralFloat;
@@ -22636,10 +22638,6 @@ var
   // Coded by Claude (AI).
   function NeuralInt8QuantizableClass(pLayer: TNNetLayer): boolean;
 
-  {$IFNDEF FPC}
-  procedure FillDWord(var X; Count: NativeUInt; Value: Cardinal);
-  {$ENDIF}
-
 implementation
 
 // nil-tolerant byte counts for NonWeightBytes.
@@ -22671,23 +22669,6 @@ function SelectKthSmallest(var Arr: array of TNeuralFloat;
 // FShouldOpenCL (compared against cNeuralOpenCLMinWork) and WillOpenCL routes the
 // forward, exactly as TNNetConvolution. NeuralForceOpenCL bypasses the size
 // verdict for the parity tests. Coded by Claude (AI).
-{$ENDIF}
-
-{$IFNDEF FPC}
-procedure FillDWord(var X; Count: NativeUInt; Value: Cardinal);
-var
-  P: PCardinal;
-  I: NativeUInt;
-  CountM1: NativeUInt;
-begin
-  P := @X;
-  CountM1 := Count - 1;
-  for I := 0 to CountM1 do
-  begin
-    P^ := Value;
-    Inc(P);
-  end;
-end;
 {$ENDIF}
 
 function BoolToString(B: Boolean; const TrueS, FalseS: string): String; inline;
@@ -52941,7 +52922,7 @@ begin
             DestPos := DestBase + TapOfs;
             for groupCount := 0 to GroupMax do
             begin
-              {$IFDEF AVXANY}
+              {$IF Defined(AVXANY) and Defined(FPC)}
               SourceRawPos := FInputCopy.GetRawPtr(SrcPos);
               DestRawPos := FInputPrepared.GetRawPtr(DestPos);
               asm_dword_copy;
@@ -87608,7 +87589,7 @@ var
   TwoDepth, PadIdx, HalfBytes: integer;
   PrevOut, LocalPrevError, W, WDelta: TNNetVolume;
   tap, g, dsum: Double;
-  histRow: array of Double;
+  histRow: {$IFDEF FPC}array of Double;{$ELSE} TNeuralDoubleDynArr; {$ENDIF}
   offRow: {$IFDEF FPC}array of integer{$ELSE} TNeuralIntegerArray {$ENDIF};
   haveTapGrad, havePrev: boolean;
 begin
@@ -99171,7 +99152,7 @@ begin
     begin
       for Y := 0 to MaxY do
       begin
-        {$IFDEF AVXANY}
+        {$IF Defined(AVXANY) and Defined(FPC)}
         SourceRawPos := LocalOutput.GetRawPtr(X,Y,OrigChannel);
         DestRawPos := FOutput.GetRawPtr(X,Y,OutputDeepCnt);
         asm_dword_copy;
@@ -106614,7 +106595,7 @@ begin
         DstPos := FInputPrepared.GetRawPos(OutputCntX, OutputCntY);
         for yCount := 0 to FeatSizeYMax do
         begin
-          {$IFDEF AVXANY}
+          {$IF Defined(AVXANY) and Defined(FPC)}
           SourceRawPos := FInputCopy.GetRawPtr(SrcPos);
           DestRawPos := FInputPrepared.GetRawPtr(DstPos);
           asm_dword_copy;

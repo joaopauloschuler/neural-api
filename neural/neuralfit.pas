@@ -2024,7 +2024,7 @@ begin
   FinalInertia := LocalNN.GetInertiaSum();
   if InitialWeightSum <> FinalWeightSum then
   begin
-    FErrorProc('Weights changed from '+FloatToStr(FinalWeightSum)+' to '+FloatToStr(FinalWeightSum));
+    FErrorProc('Weights changed from '+FloatToStr(InitialWeightSum)+' to '+FloatToStr(FinalWeightSum));
   end;
   if FinalInertia <> FinalInertia then
   begin
