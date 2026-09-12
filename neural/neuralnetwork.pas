@@ -129,6 +129,16 @@ const
   csDWT1DCDF53 = 1;   // CDF / LeGall 5/3
   csDWT1DDaub4 = 2;   // Daubechies-4 (db2) lifting
 
+{$IFDEF OpenCL}
+const
+  // Lanes per work-group of every TNNetFusedSDPACL launch. A power of two (the
+  // tree reductions halve it) within every device's max work-group size.
+  csFusedSDPALocalSize = 256;
+  // Local memory left unrequested per work-group: NVIDIA keeps about 1 KB per
+  // work-group for the driver and rejects (CL_OUT_OF_RESOURCES) a launch taking it.
+  csFusedSDPALocalMemReserveBytes = 1024;
+{$ENDIF OpenCL}
+
 type
   TNNetLayer = class;
   TNNet = class;
@@ -4531,15 +4541,6 @@ type
   end;
 
 {$IFDEF OpenCL}
-const
-  // Lanes per work-group of every TNNetFusedSDPACL launch. A power of two (the
-  // tree reductions halve it) within every device's max work-group size.
-  csFusedSDPALocalSize = 256;
-  // Local memory left unrequested per work-group: NVIDIA keeps about 1 KB per
-  // work-group for the driver and rejects (CL_OUT_OF_RESOURCES) a launch taking it.
-  csFusedSDPALocalMemReserveBytes = 1024;
-
-type
   /// OpenCL forward helper for the cached decode step of the fused multi-head
   // attention (TNNetFusedSDPA). Binds FIVE entry points against the SAME shared
   // program and therefore one in-order command queue: the FP32 and int8
