@@ -164,14 +164,18 @@ type
     function ChooseWorst: longint;
 
     // evaluates a  plan.
-    function EvalPlan(I: longint): extended;
+    function EvalPlan(I: longint): longint;
 
-    // choose the best plan to be used using the evaluation based on the next step of each plan.
-    function ChooseBestPlanBasedOnNextStep(var CurrentState: array of byte): longint;
+    // choose the best plan to be used using the evaluation based on the next
+    // step of each plan. NextStep returns the winner's own next step index,
+    // already computed by the evaluation (-1 when the winner has none).
+    function ChooseBestPlanBasedOnNextStep(var CurrentState: array of byte;
+      out NextStep: longint): longint;
 
     // evaluates how good a plan is based on the next step of the plan.
+    // NextStep receives the step index the evaluation looked up.
     function EvalPlanBasedOnNextStep(var CurrentState: array of byte;
-      PlanIndex: longint): extended;
+      PlanIndex: longint; out NextStep: longint): longint;
 
   public
     // List of plans.
@@ -363,28 +367,23 @@ function TCompositePlan.ToAct(ST: array of byte;
   var Action: byte; var LastAct: boolean;
   var FutureS: array of byte): boolean;
 var
-  I, AcI, C: longint;
-  PlansHi: longint;
+  AcI, C: longint;
 begin
   ToAct := False;
   LastAct := False;
 
-  C := ChooseBestPlanBasedOnNextStep(ST);
-
-  PlansHi := High(Plans);
-  for I := Low(Plans) to PlansHi do
+  // The chooser scores every plan with the very lookup this needs, and a plan
+  // with no next step scores 100000 while a usable one scores at most
+  // MaxStates. So the winner has a next step whenever any plan does, and
+  // walking the remaining plans could only repeat -1.
+  C := ChooseBestPlanBasedOnNextStep(ST, AcI);
+  if AcI <> -1 then
   begin
-    AcI := Plans[C].GetNextStep(ST);
-    if AcI <> -1 then
-    begin
-      Action := Plans[C].Action(AcI);
-      LastUsedPlan := C;
-      ToAct := True;
-      LastAct := (Plans[C].FPlan.NumStates - 1 = AcI);
-      ABCopy(FutureS, Plans[C].FPlan.ListStates[AcI]);
-      exit;
-    end;
-    C := (C + 1) mod MaxPlans;
+    Action := Plans[C].Action(AcI);
+    LastUsedPlan := C;
+    ToAct := True;
+    LastAct := (Plans[C].FPlan.NumStates - 1 = AcI);
+    ABCopy(FutureS, Plans[C].FPlan.ListStates[AcI]);
   end;
 end;
 
@@ -392,8 +391,8 @@ function TCompositePlan.ChooseWorst: longint;
 var
   I: longint;
   WorstPlan: longint;
-  WorstPlanEvaluation: extended;
-  PlanEvaluation: extended;
+  WorstPlanEvaluation: longint;
+  PlanEvaluation: longint;
   PlansHi: longint;
 begin
   WorstPlan := 0;
@@ -413,32 +412,35 @@ begin
 end;
 
 function TCompositePlan.ChooseBestPlanBasedOnNextStep(
-  var CurrentState: array of byte): longint;
+  var CurrentState: array of byte; out NextStep: longint): longint;
 var
   I: longint;
   BestPlan: longint;
-  BestPlanEvaluation: extended;
-  PlanEvaluation: extended;
+  BestPlanEvaluation: longint;
+  PlanEvaluation: longint;
+  PlanNextStep: longint;
   PlansHi: longint;
 begin
   BestPlan := 0;
+  NextStep := -1;
   BestPlanEvaluation := 1000000;
   PlansHi := High(Plans);
   for I := Low(Plans) to PlansHi do
   begin
-    PlanEvaluation := EvalPlanBasedOnNextStep(CurrentState, I);
+    PlanEvaluation := EvalPlanBasedOnNextStep(CurrentState, I, PlanNextStep);
     if (PlanEvaluation < BestPlanEvaluation) or
       ((PlanEvaluation = BestPlanEvaluation) and (Random(2) = 0)) then
     begin
       BestPlanEvaluation := PlanEvaluation;
       BestPlan := I;
+      NextStep := PlanNextStep;
     end;
   end;
   ChooseBestPlanBasedOnNextStep := BestPlan;
 end;
 
 // the bigger the number, the worse is.
-function TCompositePlan.EvalPlan(I: longint): extended;
+function TCompositePlan.EvalPlan(I: longint): longint;
 begin
   if not (Plans[I].Found) then
     EvalPlan := 100000
@@ -447,11 +449,13 @@ begin
 end;
 
 function TCompositePlan.EvalPlanBasedOnNextStep(
-  var CurrentState: array of byte; PlanIndex: longint): extended; // quanto maior, pior
+  var CurrentState: array of byte; PlanIndex: longint;
+  out NextStep: longint): longint; // quanto maior, pior
 var
   ACI: longint;
 begin
   AcI := Plans[PlanIndex].GetNextStep(CurrentState);
+  NextStep := AcI;
   if (AcI = -1) then
     EvalPlanBasedOnNextStep := 100000
   else
@@ -620,8 +624,31 @@ begin
 end;
 
 procedure TActionStateList.RemoveAllCicles;
+var
+  I, J, IM1: longint;
+  Removed: boolean;
 begin
-  while RemoveCicles do ;
+  // Same removal order as repeated RemoveCicles calls, without the restart:
+  // RemoveSubList(J+1, I) is applied at the HIGHEST index I that still matches
+  // an earlier state, so once it returns nothing above J can match anything
+  // below it and the downward scan may resume straight at J.
+  I := NumStates - 1;
+  while I >= 1 do
+  begin
+    IM1 := I - 1;
+    Removed := False;
+    for J := 0 to IM1 do
+    begin
+      if ABCmp(ListStates[J], ListStates[I]) then
+      begin
+        RemoveSubList(J + 1, I);
+        I := J;
+        Removed := True;
+        Break;
+      end;
+    end;
+    if not Removed then Dec(I);
+  end;
 end;
 
 function TryToBuildSubPath
@@ -668,22 +695,29 @@ function BuildPlanFn(
   {input}  planSize: longint;
   {input}  PPred: TProcPred;
   {input}  NumberActions: longint): extended;
+var
+  Cicles: longint;
+  Action: integer;
+  PlanFound: boolean;
+  Prefered: boolean;
+  PreferedAct: byte;
+  // Candidate-state scratch shared by both nested choosers: pState keeps its
+  // length for the whole build, so one allocation covers every call (#17).
+  ScratchState: TState;
 
   function ChooseRandomAction(var State: array of byte): integer;
   var
     I: integer;
-    NewState: TState;
     Action: byte;
     NumberActionsM1: integer;
   begin
-    SetLength(NewState, Length(State));
     NumberActionsM1 := NumberActions - 1;
     for I := 0 to NumberActionsM1 do
     begin
       Action := random(NumberActions);
-      ABCopy(NewState, State);
-      PPred(NewState, Action);
-      if (aNewPlan.FastExists(NewState) = -1) then
+      ABCopy(ScratchState, State);
+      PPred(ScratchState, Action);
+      if (aNewPlan.FastExists(ScratchState) = -1) then
       begin
         ChooseRandomAction := Action;
         exit;
@@ -700,31 +734,24 @@ function BuildPlanFn(
   function ChooseActionIn1Step(var State: array of byte): integer;
   var
     I: integer;
-    NewState: TState;
     NumberActionsM1: integer;
   begin
     ChooseActionIn1Step := -1;
-    SetLength(NewState, Length(State));
     NumberActionsM1 := NumberActions - 1;
     for I := 0 to NumberActionsM1 do
     begin
-      ABCopy(NewState, State);
-      if PPred(NewState, I) then
+      ABCopy(ScratchState, State);
+      if PPred(ScratchState, I) then
       begin
         ChooseActionIn1Step := I;
-        ABCopy(State, NewState);
+        ABCopy(State, ScratchState);
         exit;
       end;
     end;
   end;
 
-var
-  Cicles: longint;
-  Action: integer;
-  PlanFound: boolean;
-  Prefered: boolean;
-  PreferedAct: byte;
 begin
+  SetLength(ScratchState, Length(pState));
   Prefered := (random(2) > 0);
   PreferedAct := random(NumberActions);
   BuildPlanFn := 0;

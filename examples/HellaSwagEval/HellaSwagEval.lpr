@@ -109,23 +109,31 @@ procedure TrainModel(NN: TNNet);
 // so train and eval see identically-encoded inputs.
 var
   Input, Target: TNNetVolume;
-  Pass, Line, T: integer;
-  Toks, Prefix: TNeuralIntegerArray;
+  Pass, Line, T, I, PrefLen, MaxTok: integer;
+  Toks: TNeuralIntegerArray;
+  CorpusToks: array[0..High(cCorpus)] of TNeuralIntegerArray;
 begin
   Input := TNNetVolume.Create(cContextLen, 1, 1);
   Target := TNNetVolume.Create(NN.GetLastLayer().Output);
   try
+    // The corpus is constant: encode each line once, not once per pass.
+    for Line := 0 to High(cCorpus) do
+      CorpusToks[Line] := Encode(cCorpus[Line]);
     for Pass := 1 to cTrainPasses do
       for Line := 0 to High(cCorpus) do
       begin
-        Toks := Encode(cCorpus[Line]);
-        for T := 1 to High(Toks) do
+        Toks := CorpusToks[Line];
+        MaxTok := High(Toks);
+        for T := 1 to MaxTok do
         begin
-          // Prefix Toks[0..T-1] (clipped to the window), reversed into Input.
-          Prefix := Copy(Toks, Max(0, T - cContextLen),
-            Min(T, cContextLen));
+          // Prefix Toks[0..T-1] (clipped to the window), reversed into Input:
+          // Input[I] = Toks[T-1-I], the layout CopyReversedNoChecksIntArr
+          // produces (most-recent char at index 0) -- written directly, with
+          // no per-step prefix array.
+          PrefLen := Min(T, cContextLen);
           Input.Fill(0);
-          Input.CopyReversedNoChecksIntArr(Prefix);
+          for I := 0 to PrefLen - 1 do
+            Input.FData[I] := Toks[T - 1 - I];
           Target.Fill(0);
           Target.FData[Toks[T]] := 1.0;
           NN.Compute(Input);

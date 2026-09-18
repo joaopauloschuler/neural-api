@@ -3654,7 +3654,7 @@ procedure TNeuralImageFit.RunNNThread(index, threadnum: integer);
 var
   BlockSize, BlockSizeRest, CropSizeX, CropSizeY: integer;
   LocalNN: TNNet;
-  ImgInput, ImgInputCp, PartnerInput: TNNetVolume;
+  ImgInput, ImgInputCp: TNNetVolume;
   LocalImg, LocalPartner: TNNetVolume;
   pOutput, vOutput: TNNetVolume;
   I, ImgIdx, PartnerIdx, PartnerTag: integer;
@@ -3670,7 +3670,6 @@ var
 begin
   ImgInput := TNNetVolume.Create();
   ImgInputCp := TNNetVolume.Create();
-  PartnerInput := TNNetVolume.Create();
   pOutput := TNNetVolume.Create(FNumClasses,1,1);
   vOutput := TNNetVolume.Create(FNumClasses,1,1);
 
@@ -3778,19 +3777,21 @@ begin
        and ( (FBatchAugProb >= 1.0) or (Random() < FBatchAugProb) ) then
     begin
       PartnerIdx := Random(FImgVolumes.Count);
+      // The partner is only ever READ here (MixVolumes reads B, CutMix Moves
+      // rows out of it), so the training volume is blended in place: no
+      // per-sample image copy.
       LocalPartner := FImgVolumes[PartnerIdx];
-      PartnerInput.Copy(LocalPartner);
       PartnerTag := LocalPartner.Tag;
       if (PartnerTag < FNumClasses)
-         and (PartnerInput.SizeX = ImgInput.SizeX)
-         and (PartnerInput.SizeY = ImgInput.SizeY)
-         and (PartnerInput.Depth = ImgInput.Depth) then
+         and (LocalPartner.SizeX = ImgInput.SizeX)
+         and (LocalPartner.SizeY = ImgInput.SizeY)
+         and (LocalPartner.Depth = ImgInput.Depth) then
       begin
         MixLambda := RandomBetaValue(FBatchAugAlpha);
         if FBatchAugMode = bamMixup then
         begin
           // ImgInput := lambda*ImgInput + (1-lambda)*Partner
-          MixVolumes(ImgInput, ImgInput, PartnerInput, MixLambda);
+          MixVolumes(ImgInput, ImgInput, LocalPartner, MixLambda);
           DidBatchMix := true;
         end
         else // bamCutMix
@@ -3811,7 +3812,7 @@ begin
             CutBase := ImgInput.GetRawPos(CutX0, CutY0, 0);
             for CutY := CutY0 to CutYMax do
             begin
-              Move(PartnerInput.FData[CutBase], ImgInput.FData[CutBase], CutRowBytes);
+              Move(LocalPartner.FData[CutBase], ImgInput.FData[CutBase], CutRowBytes);
               Inc(CutBase, CutRowStride);
             end;
           end;
@@ -3922,7 +3923,6 @@ begin
   {$IFDEF HASTHREADS}LeaveCriticalSection(FCritSec);{$ENDIF}
   ImgInputCp.Free;
   ImgInput.Free;
-  PartnerInput.Free;
   vOutput.Free;
   pOutput.Free;
 end;

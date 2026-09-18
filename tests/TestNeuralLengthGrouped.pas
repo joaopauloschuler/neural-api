@@ -194,16 +194,18 @@ end;
 procedure TTestNeuralLengthGrouped.TestApplyLossMaskZeroesPadTargets;
 var
   B: TNNetLengthGroupedBatcher;
-  Desired, Actual: TNNetVolume;
+  Desired, Actual, Snapshot: TNNetVolume;
   SeqLen, RealLen, P, D: integer;
 begin
   B := MakeSkewedBatcher(8, 2, 4, 50, cTestVocab);
   Desired := TNNetVolume.Create(8, 1, cTestVocab);
   Actual := TNNetVolume.Create(8, 1, cTestVocab);
+  Snapshot := TNNetVolume.Create(8, 1, cTestVocab);
   try
     B.Reseed(5);
     B.BuildBatches();
     B.GetTrainingPair(0, 0, Desired, Actual); // Desired = real targets; reuse
+    Snapshot.Copy(Desired);
     // Fabricate a non-trivial "network output".
     for P := 0 to Actual.SizeX - 1 do
       for D := 0 to cTestVocab - 1 do
@@ -216,9 +218,13 @@ begin
         if P > RealLen - 2 then
           // Non-predictable: Desired must now equal Actual (zero error).
           AssertEquals('masked pos Desired := Actual',
-            Actual[P, 0, D], Desired[P, 0, D], 1e-7);
+            Actual[P, 0, D], Desired[P, 0, D], 1e-7)
+        else
+          // Predictable head: the real one-hot targets must be untouched.
+          AssertEquals('unmasked pos preserved',
+            Snapshot[P, 0, D], Desired[P, 0, D], 1e-7);
   finally
-    Desired.Free; Actual.Free; B.Free;
+    Desired.Free; Actual.Free; Snapshot.Free; B.Free;
   end;
 end;
 

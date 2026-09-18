@@ -93,9 +93,10 @@ the chat template rejects the turn (e.g. --system on a format without a
 system role).
 
 --stats prints per-turn timing to stderr (kept off stdout so piped model
-output stays clean): time-to-first-token (prefill + the first decode step)
-and the steady-state decode rate in tok/s (measured over the tokens after
-the first, so prefill is excluded).
+output stays clean): time-to-first-token (prefill + the first decode step),
+the prefill rate in tok/s (prefilled tokens over TTFT minus one mean decode
+step; omitted when nothing was prefilled) and the steady-state decode rate
+in tok/s (measured over the tokens after the first, so prefill is excluded).
 
 --selftest runs the argument-parsing / prompt-assembly / REPL-command unit
 checks (no model needed) and exits.
@@ -108,8 +109,11 @@ reply), so the session diffs the new prompt against the cached token ids
 tokens - time-to-first-token stays roughly flat instead of growing with the
 conversation. Correct independent of tokenizer round-tripping (the diff
 always finds the true shared prefix; /system and /reset just diverge earlier).
-Pure-attention models only: a recurrent (SSM) state cannot be position-
-truncated, so those (and --no-cache-reuse) fall back to a full re-prefill.
+A recurrent (SSM) state cannot be position-truncated, so a hybrid/recurrent
+net resumes instead from the deepest cache checkpoint (the recurrent state
+captured after every prefill window and at the turn boundaries;
+--cache-checkpoints N sizes the store) at or below that prefix.
+--no-cache-reuse turns both routes off (full re-prefill).
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler
 
@@ -270,22 +274,40 @@ begin
     Check(Opt.CtxLen = 128, '--ctx');
     Check(Opt.FormatName = 'chatml', '--format');
     Check(Opt.SystemPrompt = 'Be brief.', '--system');
-    Check(Opt.Int8, '--int8');
+    Check(Opt.WeightMode = cwmInt8, '--int8');
     Check(Opt.Stats, '--stats');
     Check(Opt.Profile, '--profile');
 
-    // int8 is the default; --fp32 opts into full-precision weights.
+    // int8 is the default; --fp32 and --int4 opt out. The last flag wins.
     Args.Clear;
     Args.Add('/tmp/model');
-    Check(ParseArgs(Args, Opt) and Opt.Int8, 'int8 is the default weight mode');
+    Check(ParseArgs(Args, Opt) and (Opt.WeightMode = cwmInt8),
+      'int8 is the default weight mode');
     Args.Clear;
     Args.Add('/tmp/model');
     Args.Add('--fp32');
-    Check(ParseArgs(Args, Opt) and not Opt.Int8, '--fp32 disables int8');
+    Check(ParseArgs(Args, Opt) and (Opt.WeightMode = cwmFP32),
+      '--fp32 selects fp32 weights');
     Args.Clear;
     Args.Add('/tmp/model');
     Args.Add('--fp32'); Args.Add('--int8');
-    Check(ParseArgs(Args, Opt) and Opt.Int8, '--int8 re-enables it');
+    Check(ParseArgs(Args, Opt) and (Opt.WeightMode = cwmInt8),
+      '--int8 re-selects int8');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--int4');
+    Check(ParseArgs(Args, Opt) and (Opt.WeightMode = cwmInt4),
+      '--int4 selects int4 weights');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--int4'); Args.Add('--fp32');
+    Check(ParseArgs(Args, Opt) and (Opt.WeightMode = cwmFP32),
+      '--int4 --fp32 ends fp32');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--fp32'); Args.Add('--int4');
+    Check(ParseArgs(Args, Opt) and (Opt.WeightMode = cwmInt4),
+      '--fp32 --int4 ends int4');
 
     // --stats is off by default.
     Args.Clear;
@@ -323,6 +345,11 @@ begin
     Args.Add('--fp32');
     Check(ParseArgs(Args, Opt) and not Opt.KVInt8,
       '--fp32 weights default to the FP32 KV cache');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--int4');
+    Check(ParseArgs(Args, Opt) and Opt.KVInt8,
+      '--int4 weights default to the int8 KV cache');
     Args.Clear;
     Args.Add('/tmp/model');
     Args.Add('--kv-fp32');
@@ -396,6 +423,16 @@ begin
     Args.Add('--no-gpu-shared-kernel');
     Check(ParseArgs(Args, Opt) and not Opt.GpuSharedKernel,
       '--no-gpu-shared-kernel parses');
+
+    // FP32 activations in the int8 matmuls unless --experimental-fp16 asks for halves.
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Check(ParseArgs(Args, Opt) and not Opt.ExperimentalFP16,
+      'FP32 activations by default');
+    Args.Clear;
+    Args.Add('/tmp/model');
+    Args.Add('--experimental-fp16');
+    Check(ParseArgs(Args, Opt) and Opt.ExperimentalFP16, '--experimental-fp16 parses');
 
     // -p: empty (interactive REPL) by default, holds the one-shot prompt when
     // given, and needs a value.

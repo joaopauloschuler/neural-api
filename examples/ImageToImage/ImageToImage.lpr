@@ -227,29 +227,33 @@ var
     UseFixtures := (PixPath = '') or (EncPath = '') or (DecPath = '');
   end;
 
-// Center-crop the (Sx,Sy,*)->(NewS,NewS,*) region of Src into Dst.
+// Center-crop the (Sx,Sy,*)->(NewS,NewS,*) region of Src into Dst. A cropped
+// row is a contiguous run of NewS*Depth floats in both volumes (depth is the
+// innermost axis), so each row is one Move.
 procedure CenterCrop(Src, Dst: TNNetVolume; NewS: integer);
-var ox, oy, x, y, c: integer;
+var ox, oy, y, RowBytes: integer;
 begin
   Dst.ReSize(NewS, NewS, Src.Depth);
   ox := (Src.SizeX - NewS) div 2;
   oy := (Src.SizeY - NewS) div 2;
+  RowBytes := NewS * Src.Depth * csNeuralFloatSize;
   for y := 0 to NewS - 1 do
-    for x := 0 to NewS - 1 do
-      for c := 0 to Src.Depth - 1 do
-        Dst[x, y, c] := Src[ox + x, oy + y, c];
+    Move(Src.FData[Src.GetRawPos(ox, oy + y)],
+      Dst.FData[Dst.GetRawPos(0, y)], RowBytes);
 end;
 
-// Write the (NewS,NewS,*) Patch back into the center of Dst (inverse of crop).
+// Write the (NewS,NewS,*) Patch back into the center of Dst (inverse of crop;
+// same per-row contiguity, one Move per row).
 procedure PasteCenter(Patch, Dst: TNNetVolume);
-var ox, oy, x, y, c: integer;
+var ox, oy, y, MaxY, RowBytes: integer;
 begin
   ox := (Dst.SizeX - Patch.SizeX) div 2;
   oy := (Dst.SizeY - Patch.SizeY) div 2;
-  for y := 0 to Patch.SizeY - 1 do
-    for x := 0 to Patch.SizeX - 1 do
-      for c := 0 to Patch.Depth - 1 do
-        Dst[ox + x, oy + y, c] := Patch[x, y, c];
+  RowBytes := Patch.SizeX * Patch.Depth * csNeuralFloatSize;
+  MaxY := Patch.SizeY - 1;
+  for y := 0 to MaxY do
+    Move(Patch.FData[Patch.GetRawPos(0, y)],
+      Dst.FData[Dst.GetRawPos(ox, oy + y)], RowBytes);
 end;
 
 // Build the inpainting MASK over a (Sx,Sy,Depth) latent: 1 = REGENERATE this

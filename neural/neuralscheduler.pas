@@ -343,7 +343,11 @@ end;
 
 function TReduceLROnPlateau.IsBetter(a, best: TNeuralFloat): boolean;
 begin
-  // Mirrors torch ReduceLROnPlateau._is_better.
+  // Mirrors torch ReduceLROnPlateau._is_better, including its behaviour on
+  // negative metrics: the relative bar is best*(1 -/+ threshold), so when best
+  // is negative the bar moves toward zero and the required improvement flips
+  // sign (a negative loss must get LESS negative to count as better). Kept as
+  // is for parity with torch; use ptAbs when the metric can go negative.
   case FMode of
     pmMin:
       if FThresholdMode = ptRel then

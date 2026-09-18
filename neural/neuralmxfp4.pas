@@ -88,6 +88,10 @@ var
   ScaleVal, NaNVal: single;
   PackedByte: byte;
   NumBlocksM1, ElemsM1, BytesM1: Int64;
+  // The block scale is a power of two, so folding it into the 16-entry code
+  // table once per block is exact and drops the per-element multiply.
+  ScaledLut: array[0..15] of single;
+  LutIdx: integer;
 begin
   if (Blocks = nil) or (Scales = nil) or (Dest = nil) then
     raise EMXFP4Error.Create('DequantizeMXFP4: nil pointer.');
@@ -111,12 +115,16 @@ begin
     end;
     // 2^(byte - 127). Ldexp keeps it exact and avoids Exp/Power rounding.
     ScaleVal := Ldexp(1.0, Integer(ScaleByte) - MXFP4_E8M0_BIAS);
+    for LutIdx := 0 to 15 do
+      ScaledLut[LutIdx] := cMXFP4Lut[LutIdx] * ScaleVal;
     for i := 0 to BytesM1 do
     begin
-      PackedByte := (BlkPtr + i)^;
+      PackedByte := BlkPtr^;
       // Low nibble -> even element, high nibble -> odd element.
-      Outp[2 * i]     := cMXFP4Lut[PackedByte and $0F] * ScaleVal;
-      Outp[2 * i + 1] := cMXFP4Lut[(PackedByte shr 4) and $0F] * ScaleVal;
+      Outp^ := ScaledLut[PackedByte and $0F];
+      (Outp + 1)^ := ScaledLut[PackedByte shr 4];
+      Inc(BlkPtr);
+      Inc(Outp, 2);
     end;
   end;
 end;

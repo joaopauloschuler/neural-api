@@ -65,6 +65,8 @@ const
 var
   GAngle: array[0..cTasks - 1] of TNeuralFloat;  // per-task rotation angle
   GScale: array[0..cTasks - 1] of TNeuralFloat;  // per-task scale
+  GCosS:  array[0..cTasks - 1] of TNeuralFloat;  // s_t * cos(theta_t), fixed
+  GSinS:  array[0..cTasks - 1] of TNeuralFloat;  // s_t * sin(theta_t), fixed
 
   // Define the cTasks distinct teacher maps (unknown to the models).
   procedure InitTasks;
@@ -74,6 +76,10 @@ var
     begin
       GAngle[T] := (Pi / 2.0) * T / cTasks + 0.15; // spread the rotations out
       GScale[T] := 0.6 + 0.25 * T;                 // a different scale each task
+      // The rotation matrix entries are fixed per task; precompute them so the
+      // per-sample teacher map is four multiply-adds, no trig.
+      GCosS[T] := GScale[T] * Cos(GAngle[T]);
+      GSinS[T] := GScale[T] * Sin(GAngle[T]);
     end;
   end;
 
@@ -82,21 +88,21 @@ var
     out y0, y1: TNeuralFloat);
   var c, s: TNeuralFloat;
   begin
-    c := GScale[T] * Cos(GAngle[T]);
-    s := GScale[T] * Sin(GAngle[T]);
+    c := GCosS[T];
+    s := GSinS[T];
     y0 := c * x0 - s * x1;
     y1 := s * x0 + c * x1;
   end;
 
   // One (input, target) pair for task T, plus the one-hot task context.
   procedure MakePair(T: integer; FeatV, CtxV, TargetV: TNNetVolume);
-  var x0, x1, y0, y1: TNeuralFloat; I: integer;
+  var x0, x1, y0, y1: TNeuralFloat;
   begin
     x0 := Random * 2.0 - 1.0;
     x1 := Random * 2.0 - 1.0;
     FeatV.FData[0] := x0;
     FeatV.FData[1] := x1;
-    for I := 0 to cTasks - 1 do CtxV.FData[I] := 0;
+    CtxV.Fill(0);
     CtxV.FData[T] := 1;                 // one-hot task id
     ApplyTask(T, x0, x1, y0, y1);
     TargetV.FData[0] := y0;

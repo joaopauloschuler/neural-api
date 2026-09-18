@@ -41,7 +41,8 @@ Coded by Claude (AI).
 uses {$IFDEF UNIX} cthreads, {$ENDIF}
   Classes, SysUtils, Math,
   neuralnetwork,
-  neuralvolume;
+  neuralvolume,
+  pascoremath32;
 
 const
   cWidth   = 12;      // fixed stack width (the per-block vector size)
@@ -94,7 +95,7 @@ var
     begin
       Acc := 0;
       for J := 0 to cWidth - 1 do Acc := Acc + GW1[I, J] * InputV.FData[J];
-      Hid[I] := Tanh(Acc);
+      Hid[I] := pcr_tanhf(Acc);
     end;
     for I := 0 to cWidth - 1 do
     begin
@@ -105,17 +106,9 @@ var
   end;
 
   function MeanSquaredError(Output, Target: TNNetVolume): TNeuralFloat;
-  var
-    I: integer;
-    diff: TNeuralFloat;
   begin
-    Result := 0;
-    for I := 0 to Output.Size - 1 do
-    begin
-      diff := Output.FData[I] - Target.FData[I];
-      Result := Result + diff * diff;
-    end;
-    Result := Result / Output.Size;
+    // SIMD sum of squared differences.
+    Result := Output.GetDistanceSqr(Target) / Output.Size;
   end;
 
   // Build a depth-D stack of shape-preserving blocks over cWidth, then a linear
@@ -188,15 +181,25 @@ var
   // a per-layer "how open did this layer choose to be" readout.
   procedure ReportMeanGate(NN: TNNet);
   var
-    I, K, L, NHigh, HiCnt: integer;
+    I, L, NHigh, HiCnt: integer;
     InputV, TargetV: TNNetVolume;
     SumT: array of TNeuralFloat;
-    HW: TNNetHighway;
+    HighLayers: array of TNNetHighway;
   begin
+    // Gather the Highway layers once; the sample loop then walks a flat array
+    // and sums each gate with one SIMD GetSum instead of a scalar K-loop.
     NHigh := 0;
     for L := 0 to NN.CountLayers - 1 do
       if NN.Layers[L] is TNNetHighway then Inc(NHigh);
     SetLength(SumT, NHigh);
+    SetLength(HighLayers, NHigh);
+    HiCnt := 0;
+    for L := 0 to NN.CountLayers - 1 do
+      if NN.Layers[L] is TNNetHighway then
+      begin
+        HighLayers[HiCnt] := NN.Layers[L] as TNNetHighway;
+        Inc(HiCnt);
+      end;
     for I := 0 to NHigh - 1 do SumT[I] := 0;
 
     RandSeed := 99991;
@@ -207,15 +210,8 @@ var
       begin
         MakePair(InputV, TargetV);
         NN.Compute(InputV);
-        HiCnt := 0;
-        for L := 0 to NN.CountLayers - 1 do
-          if NN.Layers[L] is TNNetHighway then
-          begin
-            HW := NN.Layers[L] as TNNetHighway;
-            for K := 0 to HW.TransformGate.Size - 1 do
-              SumT[HiCnt] := SumT[HiCnt] + HW.TransformGate.FData[K];
-            Inc(HiCnt);
-          end;
+        for L := 0 to NHigh - 1 do
+          SumT[L] := SumT[L] + HighLayers[L].TransformGate.GetSum();
       end;
     finally
       InputV.Free;

@@ -755,15 +755,68 @@ function RenderChatMLCore(const Messages: array of TChatMessage;
   var Spans: TChatSpanArray): string;
 var
   Cnt, ContentStart, FirstMessage, MessagesHi, LastQueryIdx: integer;
+  OutLen, PreSize, Idx: integer;
   Content, Reasoning: string;
+
+  // Appends to Result through a write index over a geometrically grown
+  // buffer, so a conversation of N turns costs O(total length) instead of a
+  // reallocation and a full copy per fragment (#23). Result is truncated to
+  // OutLen once, at the end.
+  procedure Append(const S: string);
+  var
+    AppendLen, Capacity: integer;
+  begin
+    AppendLen := Length(S);
+    if AppendLen = 0 then Exit;
+    Capacity := Length(Result);
+    if OutLen + AppendLen > Capacity then
+    begin
+      Capacity := Capacity * 2;
+      if Capacity < OutLen + AppendLen then Capacity := OutLen + AppendLen;
+      SetLength(Result, Capacity);
+    end;
+    Move(S[1], Result[OutLen + 1], AppendLen);
+    Inc(OutLen, AppendLen);
+  end;
+
+  // Single-character form: avoids the char-to-string temporary Append would
+  // need for the newlines that separate every ChatML field.
+  procedure AppendCh(C: char);
+  var
+    Capacity: integer;
+  begin
+    Capacity := Length(Result);
+    if OutLen + 1 > Capacity then
+    begin
+      Capacity := Capacity * 2;
+      if Capacity < OutLen + 1 then Capacity := OutLen + 1;
+      SetLength(Result, Capacity);
+    end;
+    Inc(OutLen);
+    Result[OutLen] := C;
+  end;
+
 begin
   Result := '';
+  OutLen := 0;
   SetLength(Spans, 0);
+  MessagesHi := High(Messages);
+  // Every turn contributes its role and content plus a fixed frame; presize to
+  // that so the common case never grows the buffer at all.
+  PreSize := 256;
+  for Idx := 0 to MessagesHi do
+    PreSize := PreSize + Length(Messages[Idx].Role) +
+      Length(Messages[Idx].Content) + 48;
+  SetLength(Result, PreSize);
   if Opts.InjectQwenDefaultSystem and
     not ((Length(Messages) > 0) and (Messages[0].Role = 'system')) then
-    Result := Result + '<|im_start|>system' + #10 + csQwenDefaultSystem +
-      '<|im_end|>' + #10;
-  MessagesHi := High(Messages);
+  begin
+    Append('<|im_start|>system');
+    AppendCh(#10);
+    Append(csQwenDefaultSystem);
+    Append('<|im_end|>');
+    AppendCh(#10);
+  end;
   FirstMessage := 0;
   // Qwen3.8: the leading system message is consumed here, led by the
   // reasoning-effort instruction; an empty one leaves the instruction
@@ -781,8 +834,13 @@ begin
     else if Content = '' then
       Content := Opts.ReasoningInstructions;
     if Content <> '' then
-      Result := Result + '<|im_start|>system' + #10 + Content +
-        '<|im_end|>' + #10;
+    begin
+      Append('<|im_start|>system');
+      AppendCh(#10);
+      Append(Content);
+      Append('<|im_end|>');
+      AppendCh(#10);
+    end;
   end;
   // Qwen3.5/3.6: index of the last real user query -- the last user turn
   // whose trimmed content is not a <tool_response>...</tool_response>
@@ -805,27 +863,46 @@ begin
   begin
     Content := Messages[Cnt].Content;
     if Opts.TrimContents then Content := PyStrip(Content);
-    Result := Result + '<|im_start|>' + Messages[Cnt].Role + #10;
+    Append('<|im_start|>');
+    Append(Messages[Cnt].Role);
+    AppendCh(#10);
     if Messages[Cnt].Role = 'assistant' then
       case Opts.ThinkStyle of
         tsSplitBeforeLastQuery:
           begin
             SplitQwenThink(Content, Reasoning);
             if Cnt > LastQueryIdx then
-              Result := Result + '<think>' + #10 + Reasoning + #10 +
-                '</think>' + #10#10;
+            begin
+              Append('<think>');
+              AppendCh(#10);
+              Append(Reasoning);
+              AppendCh(#10);
+              Append('</think>');
+              Append(#10#10);
+            end;
           end;
         tsEmptyFrameAlways:
-          Result := Result + '<think>' + #10#10 + '</think>' + #10#10;
+          begin
+            Append('<think>');
+            Append(#10#10);
+            Append('</think>');
+            Append(#10#10);
+          end;
       end;
-    ContentStart := Length(Result) + 1;
-    Result := Result + Content;
+    ContentStart := OutLen + 1;
+    Append(Content);
     if Messages[Cnt].Role = 'assistant' then
       AddSpan(Spans, ContentStart, Length(Content));
-    Result := Result + '<|im_end|>' + #10;
+    Append('<|im_end|>');
+    AppendCh(#10);
   end;
   if AddGenerationPrompt then
-    Result := Result + '<|im_start|>assistant' + #10 + Opts.GenPromptSuffix;
+  begin
+    Append('<|im_start|>assistant');
+    AppendCh(#10);
+    Append(Opts.GenPromptSuffix);
+  end;
+  SetLength(Result, OutLen);
 end;
 
 function RenderChatML(const Messages: array of TChatMessage;
@@ -1099,10 +1176,18 @@ type
     FBos, FEos: string;
     FVars: array of TJVarBinding;
     FOutput: string;
+    // characters of FOutput actually written; FOutput itself is a buffer that
+    // grows geometrically and is truncated once, in Render.
+    FOutLen: integer;
     // chunk stream
     FChunks: array of record
       Kind: char;   // 'T' text, 'O' output {{ }}, 'S' statement {% %}
       Text: string; // payload (for 'O'/'S' the inner expression, trimmed)
+      // 'S' chunks only: Text split into its leading keyword and the
+      // remainder. Every block walk (FindMatchingEnd, ExecIf, ExecRange)
+      // needs this split, and a nested loop re-walks the same chunks once
+      // per iteration, so it is computed once at tokenize time (#27).
+      Kw, Rest: string;
     end;
     procedure Tokenize;
     procedure Fail(const Msg: string);
@@ -1128,6 +1213,7 @@ type
     function ParsePrimary(const S: string; var P: integer): TJValue;
     procedure SkipWs(const S: string; var P: integer);
     function PeekWord(const S: string; P: integer; const W: string): boolean;
+    procedure Emit(const S: string);
     // block execution: render chunk range [Lo..Hi) into FOutput
     procedure ExecRange(Lo, Hi: integer);
     procedure ExecIf(Lo, EndIdx: integer; const FirstCond: string);
@@ -1285,9 +1371,13 @@ end;
 // whitespace from line start up to a block tag is stripped. {%- strips all
 // whitespace before; -%} strips all whitespace after (overrides the block
 // defaults). Same for {{- -}}.
+// Splits a statement chunk into its leading keyword and the remainder.
+procedure StatementKeyword(const Body: string;
+  out Kw, Rest: string); forward;
+
 procedure TJInterp.Tokenize;
 var
-  P, Len, TagStart, TagEnd: integer;
+  P, Len, TagStart, TagEnd, ChunkCount: integer;
   T: string;
   IsStmt, TrimLeft, TrimRight: boolean;
   Inner, PrevText: string;
@@ -1295,14 +1385,30 @@ var
 
   procedure AddChunk(Kind: char; const Txt: string);
   begin
-    SetLength(FChunks, Length(FChunks) + 1);
-    FChunks[High(FChunks)].Kind := Kind;
-    FChunks[High(FChunks)].Text := Txt;
+    if ChunkCount = Length(FChunks) then
+    begin
+      // geometric growth: a template is thousands of chunks long and the
+      // stream is appended one chunk at a time (#23).
+      if ChunkCount = 0 then SetLength(FChunks, 16)
+      else SetLength(FChunks, ChunkCount * 2);
+    end;
+    FChunks[ChunkCount].Kind := Kind;
+    FChunks[ChunkCount].Text := Txt;
+    if Kind = 'S'
+    then StatementKeyword(Txt, FChunks[ChunkCount].Kw,
+      FChunks[ChunkCount].Rest)
+    else
+    begin
+      FChunks[ChunkCount].Kw := '';
+      FChunks[ChunkCount].Rest := '';
+    end;
+    Inc(ChunkCount);
   end;
 
 begin
   T := FTemplate;
   Len := Length(T);
+  ChunkCount := 0;
   P := 1;
   while P <= Len do
   begin
@@ -1348,17 +1454,18 @@ begin
     Inner := Trim(Inner);
 
     // apply left-side whitespace control to the previously emitted TEXT.
-    if Length(FChunks) > 0 then
+    if ChunkCount > 0 then
     begin
-      if FChunks[High(FChunks)].Kind = 'T' then
+      if FChunks[ChunkCount - 1].Kind = 'T' then
       begin
-        PrevText := FChunks[High(FChunks)].Text;
+        PrevText := FChunks[ChunkCount - 1].Text;
         if TrimLeft then
         begin
-          // strip ALL trailing whitespace
-          while (Length(PrevText) > 0) and
-            (PrevText[Length(PrevText)] in [' ', #9, #10, #13]) do
-            Delete(PrevText, Length(PrevText), 1);
+          // strip ALL trailing whitespace: scan back to the cut and truncate
+          // once, instead of one Delete (and one string move) per character.
+          K := Length(PrevText);
+          while (K > 0) and (PrevText[K] in [' ', #9, #10, #13]) do Dec(K);
+          SetLength(PrevText, K);
         end
         else if IsStmt then
         begin
@@ -1368,7 +1475,7 @@ begin
           if (K = 0) or (PrevText[K] = #10) then
             SetLength(PrevText, K);
         end;
-        FChunks[High(FChunks)].Text := PrevText;
+        FChunks[ChunkCount - 1].Text := PrevText;
       end;
     end;
 
@@ -1388,6 +1495,7 @@ begin
       else if (P <= Len) and (T[P] = #10) then Inc(P);
     end;
   end;
+  SetLength(FChunks, ChunkCount);
 end;
 
 procedure TJInterp.SkipWs(const S: string; var P: integer);
@@ -1398,12 +1506,18 @@ end;
 function TJInterp.PeekWord(const S: string; P: integer;
   const W: string): boolean;
 var
-  E: integer;
+  I, E, WordLen, SrcLen: integer;
 begin
-  // matches keyword W at P followed by a non-identifier char (word boundary)
-  if Copy(S, P, Length(W)) <> W then Exit(false);
-  E := P + Length(W);
-  Result := (E > Length(S)) or not (S[E] in
+  // matches keyword W at P followed by a non-identifier char (word boundary).
+  // Compared in place: a probe that fails on its first character must not cost
+  // the allocation of a Copy (#23).
+  WordLen := Length(W);
+  SrcLen := Length(S);
+  E := P + WordLen;
+  if (P < 1) or (E - 1 > SrcLen) then Exit(false);
+  for I := 1 to WordLen do
+    if S[P + I - 1] <> W[I] then Exit(false);
+  Result := (E > SrcLen) or not (S[E] in
     ['a'..'z', 'A'..'Z', '0'..'9', '_']);
 end;
 
@@ -1490,13 +1604,28 @@ begin
     Exit;
   end;
   // relational / equality operators
+  // Two direct character tests per operator instead of four Copy allocations
+  // (#23); the two-character forms are checked first so '<=' still wins
+  // over '<'.
   Op := '';
-  if Copy(S, P, 2) = '==' then Op := '=='
-  else if Copy(S, P, 2) = '!=' then Op := '!='
-  else if Copy(S, P, 2) = '<=' then Op := '<='
-  else if Copy(S, P, 2) = '>=' then Op := '>='
-  else if (P <= Length(S)) and (S[P] = '<') then Op := '<'
-  else if (P <= Length(S)) and (S[P] = '>') then Op := '>';
+  if P <= Length(S) then
+  begin
+    if P < Length(S) then
+    begin
+      if S[P + 1] = '=' then
+        case S[P] of
+          '=': Op := '==';
+          '!': Op := '!=';
+          '<': Op := '<=';
+          '>': Op := '>=';
+        end;
+    end;
+    if Op = '' then
+      case S[P] of
+        '<': Op := '<';
+        '>': Op := '>';
+      end;
+  end;
   if Op = '' then Exit;
   Inc(P, Length(Op));
   R := ParseConcat(S, P);
@@ -1798,22 +1927,17 @@ end;
 function TJInterp.FindMatchingEnd(Lo: integer;
   const OpenKw, EndKw: string): integer;
 var
-  I, Depth, P: integer;
-  Kw, Body: string;
+  I, Depth, ChunkCount: integer;
 begin
   Depth := 1;
   I := Lo;
-  while I < Length(FChunks) do
+  ChunkCount := Length(FChunks);
+  while I < ChunkCount do
   begin
     if FChunks[I].Kind = 'S' then
     begin
-      Body := FChunks[I].Text;
-      P := 1;
-      while (P <= Length(Body)) and (Body[P] in
-        ['a'..'z', 'A'..'Z', '_']) do Inc(P);
-      Kw := Copy(Body, 1, P - 1);
-      if Kw = OpenKw then Inc(Depth)
-      else if Kw = EndKw then
+      if FChunks[I].Kw = OpenKw then Inc(Depth)
+      else if FChunks[I].Kw = EndKw then
       begin
         Dec(Depth);
         if Depth = 0 then Exit(I);
@@ -1836,7 +1960,6 @@ begin
     Copy(S, P, MaxInt));
 end;
 
-// Splits a statement chunk into its leading keyword and the remainder.
 procedure StatementKeyword(const Body: string;
   out Kw, Rest: string);
 var
@@ -1867,7 +1990,7 @@ begin
   begin
     if FChunks[I].Kind = 'S' then
     begin
-      StatementKeyword(FChunks[I].Text, Kw, Rest);
+      Kw := FChunks[I].Kw;
       if (Kw = 'if') or (Kw = 'for') then Inc(Depth)
       else if (Kw = 'endif') or (Kw = 'endfor') then Dec(Depth)
       else if (Depth = 0) and ((Kw = 'elif') or (Kw = 'else')) then
@@ -1878,7 +2001,7 @@ begin
           ExecRange(ClauseStart, I);
           Taken := true;
         end;
-        if Kw = 'elif' then CurCond := Rest
+        if Kw = 'elif' then CurCond := FChunks[I].Rest
         else CurCond := 'true'; // else clause always passes if reached
         ClauseStart := I + 1;
       end;
@@ -1887,6 +2010,27 @@ begin
   end;
   if (not Taken) and Truthy(EvalFullExpr(CurCond)) then
     ExecRange(ClauseStart, EndIdx);
+end;
+
+// Appends S to the output buffer. A template render appends once per text
+// chunk and once per {{ }} expression, so the buffer doubles instead of being
+// reallocated to the exact length on every append (#23).
+procedure TJInterp.Emit(const S: string);
+var
+  AppendLen, Needed, Capacity: integer;
+begin
+  AppendLen := Length(S);
+  if AppendLen = 0 then Exit;
+  Needed := FOutLen + AppendLen;
+  Capacity := Length(FOutput);
+  if Needed > Capacity then
+  begin
+    Capacity := Capacity * 2;
+    if Capacity < Needed then Capacity := Needed;
+    SetLength(FOutput, Capacity);
+  end;
+  Move(S[1], FOutput[FOutLen + 1], AppendLen);
+  Inc(FOutLen, AppendLen);
 end;
 
 procedure TJInterp.ExecRange(Lo, Hi: integer);
@@ -1900,15 +2044,16 @@ begin
   while I < Hi do
   begin
     case FChunks[I].Kind of
-      'T': begin FOutput := FOutput + FChunks[I].Text; Inc(I); end;
+      'T': begin Emit(FChunks[I].Text); Inc(I); end;
       'O':
         begin
-          FOutput := FOutput + ToStr(EvalFullExpr(FChunks[I].Text));
+          Emit(ToStr(EvalFullExpr(FChunks[I].Text)));
           Inc(I);
         end;
       'S':
         begin
-          StatementKeyword(FChunks[I].Text, Kw, Rest);
+          Kw := FChunks[I].Kw;
+          Rest := FChunks[I].Rest;
           if Kw = 'for' then
           begin
             EndIdx := FindMatchingEnd(I + 1, 'for', 'endfor');
@@ -1973,7 +2118,12 @@ function TJInterp.Render: string;
 begin
   Tokenize;
   FOutput := '';
+  FOutLen := 0;
+  // The rendered text is at least the size of the literal parts of the
+  // template; start there so short templates never grow at all.
+  SetLength(FOutput, Length(FTemplate));
   ExecRange(0, Length(FChunks));
+  SetLength(FOutput, FOutLen);
   Result := FOutput;
 end;
 

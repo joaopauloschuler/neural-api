@@ -59,14 +59,13 @@ const
     NN.AddLayer(TNNetFullConnectLinear.Create(cClasses));
   end;
 
-  // One labelled sample: class C cluster + per-feature noise, one-hot target.
-  procedure MakePair(out X, Y: TNNetVolume);
+  // One labelled sample into caller-owned volumes: class C cluster +
+  // per-feature noise, one-hot target.
+  procedure FillPair(X, Y: TNNetVolume);
   var
     C, I: integer;
   begin
     C := Random(cClasses);
-    X := TNNetVolume.Create(cInDim, 1, 1);
-    Y := TNNetVolume.Create(cClasses, 1, 1);
     X.Raw[0] := Centers[C][0] + (Random - 0.5) * 0.8;
     X.Raw[1] := Centers[C][1] + (Random - 0.5) * 0.8;
     for I := 2 to cInDim - 1 do
@@ -75,26 +74,36 @@ const
     Y.Raw[C] := 1.0;
   end;
 
+  // Allocating form, for callers that hand the volumes' ownership away.
+  procedure MakePair(out X, Y: TNNetVolume);
+  begin
+    X := TNNetVolume.Create(cInDim, 1, 1);
+    Y := TNNetVolume.Create(cClasses, 1, 1);
+    FillPair(X, Y);
+  end;
+
   procedure TrainOnce(NN: TNNet; Epochs, Batch: integer);
   var
     Ep, B: integer;
     X, Yt: TNNetVolume;
   begin
-    for Ep := 1 to Epochs do
-    begin
-      NN.ClearDeltas();
-      for B := 1 to Batch do
+    X  := TNNetVolume.Create(cInDim, 1, 1);
+    Yt := TNNetVolume.Create(cClasses, 1, 1);
+    try
+      for Ep := 1 to Epochs do
       begin
-        MakePair(X, Yt);
-        try
+        NN.ClearDeltas();
+        for B := 1 to Batch do
+        begin
+          FillPair(X, Yt);
           NN.Compute(X);
           NN.Backpropagate(Yt);
-        finally
-          X.Free;
-          Yt.Free;
         end;
+        NN.UpdateWeights();
       end;
-      NN.UpdateWeights();
+    finally
+      X.Free;
+      Yt.Free;
     end;
   end;
 

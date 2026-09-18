@@ -55,6 +55,7 @@ type
     procedure TestNFDDecomposesPrecomposedInput;
     procedure TestNFKCFoldsCompatibilityForms;
     procedure TestNFKDFoldsCompatibilityForms;
+    procedure TestNormalizeReordersMarkRunWithAstralCodePoints;
     procedure TestNFKCNormalizerFoldsTokenIds;
     procedure TestNFCNormalizerFoldsTokenIds;
     // Encode's added-token scan is gated by a first-byte table; the gate
@@ -721,6 +722,36 @@ begin
   hangulD := #$E1#$84#$80 + #$E1#$85#$A1 + #$E1#$86#$A8;
   AssertEquals('NFC composes Hangul jamo to syllable', #$EA#$B0#$81,
     TNeuralHFTokenizer.NormalizeUnicodeText(hangulD, True));
+end;
+
+// A mark run long enough to force MULTIPLE canonical-ordering swaps, mixed
+// with a 4-byte (astral) codepoint and a precomposed letter, in all four
+// forms. This pins two things at once: the backtracking branch of the
+// canonical-ordering pass, and the 4-byte case of the UTF-8 re-encode that
+// builds the result. Expected values from Python unicodedata.normalize.
+procedure TTestNeuralHFTokenizer.TestNormalizeReordersMarkRunWithAstralCodePoints;
+var
+  Src, OrderedRun: string;
+begin
+  // 'q' + U+0301 (ccc 230) + U+0316 (ccc 220) + U+0328 (ccc 202)
+  //     + U+1D400 MATHEMATICAL BOLD CAPITAL A (4 UTF-8 bytes) + U+00E9.
+  // The three marks arrive in DESCENDING class order, so ordering them needs
+  // the pass to walk back more than one position; none composes onto 'q'.
+  Src := 'q' + #$CC#$81 + #$CC#$96 + #$CC#$A8 + #$F0#$9D#$90#$80 + #$C3#$A9;
+  OrderedRun := 'q' + #$CC#$A8 + #$CC#$96 + #$CC#$81;
+  AssertEquals('NFC orders mark run, keeps astral CP',
+    OrderedRun + #$F0#$9D#$90#$80 + #$C3#$A9,
+    TNeuralHFTokenizer.NormalizeUnicodeText(Src, True));
+  AssertEquals('NFD orders mark run, decomposes U+00E9',
+    OrderedRun + #$F0#$9D#$90#$80 + 'e' + #$CC#$81,
+    TNeuralHFTokenizer.NormalizeUnicodeText(Src, False));
+  // NFKC additionally folds U+1D400 to 'A'.
+  AssertEquals('NFKC orders mark run, folds astral CP to A',
+    OrderedRun + 'A' + #$C3#$A9,
+    TNeuralHFTokenizer.NormalizeUnicodeText(Src, True, True));
+  AssertEquals('NFKD orders mark run, folds astral CP to A',
+    OrderedRun + 'A' + 'e' + #$CC#$81,
+    TNeuralHFTokenizer.NormalizeUnicodeText(Src, False, True));
 end;
 
 // Canonical NFD: PRECOMPOSED input must decompose to base + combining mark(s),

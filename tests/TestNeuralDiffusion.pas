@@ -35,8 +35,14 @@ uses
 type
   TTestNeuralDiffusion = class(TTestCase)
   private
+    // Timesteps recorded by RecordingModel, in call order.
+    FRecT: array[0..63] of integer;
+    FRecN: integer;
     // The analytic stand-in model used by both the oracle and the DDIM test.
     procedure ToyModel(Xt, Output: TNNetVolume; Tt: integer);
+    // A do-nothing denoiser that records the timesteps the driver visits, so a
+    // test can see the schedule the (private) spacing builder produced.
+    procedure RecordingModel(Xt, Output: TNNetVolume; Tt: integer);
     // An "oracle" CONSISTENCY model for the LCM tests: it already knows the clean
     // image gLCMTarget and, fed any noised x_t at any t, returns the raw eps such
     // that the FULL consistency map f(x_t,t)=c_skip*x_t+c_out*x0_hat lands exactly
@@ -58,10 +64,13 @@ type
     procedure TestDPMSolverVsOracle;
     procedure TestUniPCVsOracle;
     procedure TestHeunVsOracle;
+    procedure TestHeunZeroSigmaRunsFinite;
     procedure TestMinSNRWeight;
     procedure TestDDPMRunsNoNaN;
     procedure TestEulerAncestralZeroEtaMatchesDDIM;
     procedure TestKarrasSpacingSigmaMonotone;
+    procedure TestKarrasSnapMatchesNearestSigmaScan;
+    procedure TestSNRWeightClosedForm;
     procedure TestKarrasEulerAncestralRunsNoNaN;
     procedure TestLCMBoundaryScalings;
     procedure TestLCMConsistencyFixedPoint;
@@ -124,6 +133,14 @@ begin
   s := Sin(0.01 * Tt);
   for i := 0 to Xt.Size - 1 do
     Output.FData[i] := s * Xt.FData[i];
+end;
+
+procedure TTestNeuralDiffusion.RecordingModel(Xt, Output: TNNetVolume;
+  Tt: integer);
+begin
+  if FRecN <= High(FRecT) then FRecT[FRecN] := Tt;
+  Inc(FRecN);
+  Output.Fill(0);
 end;
 
 var
@@ -441,6 +458,29 @@ begin
   end;
 end;
 
+procedure TTestNeuralDiffusion.TestHeunZeroSigmaRunsFinite;
+var
+  Sched: TNNetDiffusionScheduler;
+  X: TNNetVolume;
+  i: integer;
+begin
+  // Beta1 = 0 makes alpha_bar_1 exactly 1, so SigmaOf(1) = 0. With uniform
+  // spacing and NumSteps = T the Heun driver visits Tt = 1 (sigma = 0) and
+  // Tt = 2 -> TtPrev = 1 (sigma_next = 0). Both reciprocals must stay finite.
+  Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, 0.0, cBetaT);
+  X := TNNetVolume.Create(cN, 1, 1);
+  try
+    AssertEquals('sigma at Tt=1 is 0', 0.0, Sched.SigmaAt[1], 0.0);
+    for i := 0 to cN - 1 do X.FData[i] := (i - cN / 2) * 0.3;
+    Sched.Sample(X, @ToyModel, cT, smHeun, 0.0, tsUniform);
+    for i := 0 to cN - 1 do
+      AssertFalse('heun zero-sigma finite @ ' + IntToStr(i),
+        IsNan(X.FData[i]) or IsInfinite(X.FData[i]));
+  finally
+    Sched.Free; X.Free;
+  end;
+end;
+
 procedure TTestNeuralDiffusion.TestMinSNRWeight;
 var
   SchedE, SchedV: TNNetDiffusionScheduler;
@@ -547,6 +587,73 @@ begin
     AssertTrue('sigma_T > sigma_1', Sched.SigmaAt[cT] > Sched.SigmaAt[1]);
   finally
     Sched.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestKarrasSnapMatchesNearestSigmaScan;
+var
+  Sched: TNNetDiffusionScheduler;
+  X: TNNetVolume;
+  k, t, best: integer;
+  d, bestD, invRho, pMax, pMin, frac: double;
+  target: TNeuralFloat;
+const
+  cRho = 7.0;
+begin
+  // The Karras spacing snaps each warped sigma back to the timestep whose
+  // schedule sigma is NEAREST. The scheduler searches its precomputed sigma
+  // table; this pins that search against the defining exhaustive scan over the
+  // public SigmaAt, including the tie rule (lowest timestep wins).
+  Sched := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  X := TNNetVolume.Create(cN, 1, 1);
+  try
+    for k := 0 to cN - 1 do X.FData[k] := 0.1 * k;
+    FRecN := 0;
+    Sched.Sample(X, @RecordingModel, cSteps, smDDIM, 0.0, tsKarras);
+    AssertEquals('one denoiser call per step', cSteps, FRecN);
+    invRho := 1.0 / cRho;
+    pMax := Power(Sched.SigmaAt[cT], invRho);
+    pMin := Power(Sched.SigmaAt[1], invRho);
+    for k := 0 to cSteps - 1 do
+    begin
+      frac := k / (cSteps - 1);
+      target := Power(pMax + frac * (pMin - pMax), cRho);
+      best := 1; bestD := Abs(Sched.SigmaAt[1] - target);
+      for t := 2 to cT do
+      begin
+        d := Abs(Sched.SigmaAt[t] - target);
+        if d < bestD then begin bestD := d; best := t; end;
+      end;
+      AssertEquals('karras snap @ ' + IntToStr(k), best, FRecT[k]);
+    end;
+  finally
+    Sched.Free; X.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestSNRWeightClosedForm;
+var
+  SchedE, SchedV: TNNetDiffusionScheduler;
+  t: integer;
+  ab, snr, clamped: double;
+begin
+  // SNR(t) = exp(2*lambda_t) = ab_t/(1-ab_t). Pin the weights against that
+  // closed form over the WHOLE schedule (the oracle test probes 5 timesteps).
+  SchedE := TNNetDiffusionScheduler.Create(cT, dsLinear, dpEps, cBeta1, cBetaT);
+  SchedV := TNNetDiffusionScheduler.Create(cT, dsLinear, dpV, cBeta1, cBetaT);
+  try
+    for t := 1 to cT do
+    begin
+      ab := SchedE.AlphaBar[t];
+      snr := ab / (1.0 - ab);
+      if snr < 5.0 then clamped := snr else clamped := 5.0;
+      AssertEquals('eps weight @ ' + IntToStr(t),
+        clamped / snr, SchedE.SNRWeight(t, 5.0), 1e-6);
+      AssertEquals('v weight @ ' + IntToStr(t),
+        clamped / (snr + 1.0), SchedV.SNRWeight(t, 5.0), 1e-6);
+    end;
+  finally
+    SchedE.Free; SchedV.Free;
   end;
 end;
 

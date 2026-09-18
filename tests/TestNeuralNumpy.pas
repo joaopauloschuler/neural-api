@@ -32,7 +32,9 @@ type
     procedure TestNpyInt32RoundTrip;
     procedure TestNpyInt8RoundTrip;
     procedure TestNpy2DShapeMapping;
+    procedure TestNpyInt16AndInt64RoundTrip;
     procedure TestNpzNamedSetRoundTrip;
+    procedure TestCrc32KnownVectorsAndTailLengths;
     procedure TestRejectFortranOrder;
     procedure TestRejectObjectDtype;
     procedure TestNumpyCrossCheckFixture;
@@ -185,6 +187,42 @@ begin
   end;
 end;
 
+procedure TTestNeuralNumpy.TestNpyInt16AndInt64RoundTrip;
+var
+  V, R: TNNetVolume;
+  fn: string;
+  i: integer;
+begin
+  // i2 and i8, both signed extremes, through the writer's typed-store arms.
+  V := TNNetVolume.Create(5, 1, 1);
+  V.FData[0] := -32768; V.FData[1] := -1; V.FData[2] := 0;
+  V.FData[3] := 1; V.FData[4] := 32767;
+  R := nil;
+  fn := TmpName('i16.npy');
+  try
+    SaveVolumeToNpy(fn, V, [], 'i2');
+    R := LoadVolumeFromNpy(fn);
+    for i := 0 to 4 do
+      AssertEquals('i16 element ' + IntToStr(i), V.FData[i], R.FData[i], 0.0);
+  finally
+    V.Free; R.Free; DeleteFile(fn);
+  end;
+  // i8: values a single can hold exactly, including a large negative one.
+  V := TNNetVolume.Create(4, 1, 1);
+  V.FData[0] := -2097152; V.FData[1] := -1; V.FData[2] := 0;
+  V.FData[3] := 2097152;
+  R := nil;
+  fn := TmpName('i64.npy');
+  try
+    SaveVolumeToNpy(fn, V, [], 'i8');
+    R := LoadVolumeFromNpy(fn);
+    for i := 0 to 3 do
+      AssertEquals('i64 element ' + IntToStr(i), V.FData[i], R.FData[i], 0.0);
+  finally
+    V.Free; R.Free; DeleteFile(fn);
+  end;
+end;
+
 procedure TTestNeuralNumpy.TestNpzNamedSetRoundTrip;
 var
   A, B, RA, RB: TNNetVolume;
@@ -220,6 +258,40 @@ begin
   finally
     W.Free; Reader.Free;
     A.Free; B.Free; RA.Free; RB.Free; DeleteFile(fn);
+  end;
+end;
+
+procedure TTestNeuralNumpy.TestCrc32KnownVectorsAndTailLengths;
+// Reference CRC-32: the textbook byte-at-a-time loop, independent of the
+// slice-by-4 tables the writer uses.
+  function RefCrc32(const B: TBytes): Cardinal;
+  var i, j: integer; c, t: Cardinal;
+  begin
+    c := $FFFFFFFF;
+    for i := 0 to High(B) do
+    begin
+      t := (c xor B[i]) and $FF;
+      for j := 0 to 7 do
+        if (t and 1) <> 0 then t := $EDB88320 xor (t shr 1) else t := t shr 1;
+      c := t xor (c shr 8);
+    end;
+    Result := c xor $FFFFFFFF;
+  end;
+var
+  B: TBytes;
+  Len, i: integer;
+begin
+  // The canonical CRC-32 check value: crc32("123456789") = $CBF43926.
+  SetLength(B, 9);
+  for i := 0 to 8 do B[i] := Ord('1') + i;
+  AssertEquals('crc32("123456789")', $CBF43926, Crc32Of(B));
+  AssertEquals('empty buffer', 0, Crc32Of(nil));
+  // Every tail length 0..3 past the four-byte bulk step.
+  for Len := 0 to 37 do
+  begin
+    SetLength(B, Len);
+    for i := 0 to Len - 1 do B[i] := (i * 37 + 11) and $FF;
+    AssertEquals('length ' + IntToStr(Len), RefCrc32(B), Crc32Of(B));
   end;
 end;
 

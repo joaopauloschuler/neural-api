@@ -101,16 +101,19 @@ end;
 
 procedure LoadRGBVolumeIntoTImage(V:TNNetVolume; Image:TImage);
 var
-  I, J, MaxX, MaxY: integer;
+  CountX, CountY, MaxX, MaxY: integer;
+  LocalCanvas: TCanvas;
 begin
   MaxX := V.SizeX - 1;
   MaxY := V.SizeY - 1;
+  // Image.Canvas is a property getter, and it does not change across the sweep.
+  LocalCanvas := Image.Canvas;
 
-  for I := 0 to MaxX do
+  for CountY := 0 to MaxY do
   begin
-    for J := 0 to MaxY do
+    for CountX := 0 to MaxX do
     begin
-      Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(V.AsByte[J,I,0], V.AsByte[J,I,1], V.AsByte[J,I,2]);
+      LocalCanvas.Pixels[CountX, CountY] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(V.AsByte[CountX,CountY,0], V.AsByte[CountX,CountY,1], V.AsByte[CountX,CountY,2]);
     end;
   end;
 end;
@@ -145,116 +148,123 @@ begin
 
   Vol.ReSize(MaxX + 1, MaxY + 1, 3);
 
-  for CountX := 0 to MaxX do
+  // CountX is the inner loop so the volume is written down one contiguous row
+  // at a time, and the row offset advances by the depth instead of being
+  // recomputed. The pixel each slot receives is unchanged.
+  for CountY := 0 to MaxY do
   begin
-    for CountY := 0 to MaxY do
+    RawPos := Vol.GetRawPos(0, CountY, 0);
+    for CountX := 0 to MaxX do
     begin
       LocalColor := LocalCanvas.Pixels[CountX, CountY];
-      RawPos := Vol.GetRawPos(CountX, CountY, 0);
 
       Vol.FData[RawPos]     := LocalColor          and $000000ff; // red
       Vol.FData[RawPos + 1] := (LocalColor shr 8)  and $000000ff; // green
       Vol.FData[RawPos + 2] := (LocalColor shr 16) and $000000ff; // blue
+      Inc(RawPos, 3);
     end;
   end;
 end;
 
 procedure LoadVolumeIntoTImage(V:TNNetVolume; Image:TImage; color_encoding: integer = csEncodeRGB);
 var
-  I, J: integer;
+  CountX, CountY: integer;
   MaxX, MaxY: integer;
   bG: byte;
   H,S,A,B,R,G: TNeuralFloat;
+  LocalCanvas: TCanvas;
 begin
   R := 0;
   G := 0;
   B := 0;
   MaxX := V.SizeX - 1;
   MaxY := V.SizeY - 1;
+  // Image.Canvas is a property getter, and it does not change across the sweep.
+  LocalCanvas := Image.Canvas;
 
   if V.Depth = 1 then
   begin
-    for I := 0 to MaxX do
+    for CountY := 0 to MaxY do
     begin
-      for J := 0 to MaxY do
+      for CountX := 0 to MaxX do
       begin
         if color_encoding = csEncodeLAB then
         begin
-          bG := RoundAsByte(V[J,I,0]*2.5);
+          bG := RoundAsByte(V[CountX,CountY,0]*2.5);
         end
         else if ( (color_encoding = csEncodeHSL) or (color_encoding = csEncodeHSV) ) then
         begin
-          bG := RoundAsByte(V[J,I,0]*255);
+          bG := RoundAsByte(V[CountX,CountY,0]*255);
         end
         else
         begin
           // RGB and Gray
-          bG := RoundAsByte(V[J,I,0]);
+          bG := RoundAsByte(V[CountX,CountY,0]);
         end;
-        Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(bG, bG, bG);
+        LocalCanvas.Pixels[CountX, CountY] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(bG, bG, bG);
       end;
     end;
   end
   else if V.Depth = 2 then
   begin
-    for I := 0 to MaxX do
+    for CountY := 0 to MaxY do
     begin
-      for J := 0 to MaxY do
+      for CountX := 0 to MaxX do
       begin
         if color_encoding = csEncodeLAB then
         begin
-          A := V[J,I,0];
-          B := V[J,I,1];
+          A := V[CountX,CountY,0];
+          B := V[CountX,CountY,1];
           lab2rgb(60, A, B, R, G, B);
         end
         else if color_encoding = csEncodeHSL then
         begin
-          H := V[J,I,0];
-          S := V[J,I,1];
+          H := V[CountX,CountY,0];
+          S := V[CountX,CountY,1];
           hsl2rgb(H, S, 0.6, R, G, B);
         end
         else if color_encoding = csEncodeHSV then
         begin
-          H := V[J,I,0];
-          S := V[J,I,1];
+          H := V[CountX,CountY,0];
+          S := V[CountX,CountY,1];
           hsv2rgb(H, S, 0.6, R, G, B);
         end
         else if color_encoding = csEncodeRGB then
         begin
-          R := V[J,I,0];
+          R := V[CountX,CountY,0];
           G := 0;
-          B := V[J,I,1];
+          B := V[CountX,CountY,1];
         end;
-        Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(RoundAsByte(R), RoundAsByte(G), RoundAsByte(B));
+        LocalCanvas.Pixels[CountX, CountY] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(RoundAsByte(R), RoundAsByte(G), RoundAsByte(B));
       end;
     end;
   end
   else if V.Depth > 2 then
   begin
-    for I := 0 to MaxX do
+    for CountY := 0 to MaxY do
     begin
-      for J := 0 to MaxY do
+      for CountX := 0 to MaxX do
       begin
         if color_encoding = csEncodeLAB then
         begin
-          lab2rgb(V[J,I,0], V[J,I,1], V[J,I,2], R, G, B);
+          lab2rgb(V[CountX,CountY,0], V[CountX,CountY,1], V[CountX,CountY,2], R, G, B);
         end
         else if color_encoding = csEncodeHSL then
         begin
-          hsl2rgb(V[J,I,0], V[J,I,1], V[J,I,2], R, G, B);
+          hsl2rgb(V[CountX,CountY,0], V[CountX,CountY,1], V[CountX,CountY,2], R, G, B);
         end
         else if color_encoding = csEncodeHSV then
         begin
-          hsv2rgb(V[J,I,0], V[J,I,1], V[J,I,2], R, G, B);
+          hsv2rgb(V[CountX,CountY,0], V[CountX,CountY,1], V[CountX,CountY,2], R, G, B);
         end
         else if color_encoding = csEncodeRGB then
         begin
-          R := V[J,I,0];
-          G := V[J,I,1];
-          B := V[J,I,2];
+          R := V[CountX,CountY,0];
+          G := V[CountX,CountY,1];
+          B := V[CountX,CountY,2];
         end;
-        //WriteLn(V[J,I,0]:10:5, ' ', V[J,I,1]:10:5, ' ', V[J,I,2]:10:5, ' - ', R:10:5, ' ', G:10:5, ' ', B:10:5);
-        Image.Canvas.Pixels[J, I] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(RoundAsByte(R), RoundAsByte(G), RoundAsByte(B));
+        //WriteLn(V[CountX,CountY,0]:10:5, ' ', V[CountX,CountY,1]:10:5, ' ', V[CountX,CountY,2]:10:5, ' - ', R:10:5, ' ', G:10:5, ' ', B:10:5);
+        LocalCanvas.Pixels[CountX, CountY] := {$IFDEF FPC}RGBToColor{$ELSE}RGB{$ENDIF}(RoundAsByte(R), RoundAsByte(G), RoundAsByte(B));
       end;
     end;
   end;

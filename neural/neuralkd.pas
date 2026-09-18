@@ -100,7 +100,7 @@ Weight updates use the student's per-layer learning rate/inertia
 interface
 
 uses
-  Classes, SysUtils, Math, neuralnetwork, neuralvolume, pascoremath32;
+  Classes, SysUtils, Math, neuralnetwork, neuralvolume;
 
 type
   /// Trainer-level helper implementing classic Hinton knowledge distillation:
@@ -126,9 +126,11 @@ type
       // Returns the LINEAR logit layer (the one feeding the trailing softmax)
       // and validates the net ends in linear-logits -> softmax.
       function LogitLayer(NN: TNNet): TNNetLayer;
-      // Softmax of (Logits / Temp) into Dest (numerically stable).
+      // Softmax of (Logits / Temp) into Dest (numerically stable). Shift and
+      // SumExp are the stabilizing terms: ln Dest_i = Logits_i/Temp - Shift -
+      // ln(SumExp), which the closed-form KL below consumes.
       procedure SoftenLogits(Logits: TNNetVolume; Temp: TNeuralFloat;
-        Dest: TNNetVolume);
+        Dest: TNNetVolume; out Shift, SumExp: TNeuralFloat);
     public
       constructor Create(pTeacher, pStudent: TNNet;
         pAlpha: TNeuralFloat = 0.5; pTemperature: TNeuralFloat = 2.0;
@@ -214,22 +216,23 @@ begin
 end;
 
 procedure TNeuralKDTrainer.SoftenLogits(Logits: TNNetVolume;
-  Temp: TNeuralFloat; Dest: TNNetVolume);
+  Temp: TNeuralFloat; Dest: TNNetVolume; out Shift, SumExp: TNeuralFloat);
 var
-  MaxLogit, SumExp, InvTemp: TNeuralFloat;
+  InvTemp: TNeuralFloat;
 begin
   if Dest.Size <> Logits.Size then Dest.ReSize(Logits);
   // Numerically stable softmax over (Logits / Temp). The temperature divide is
   // loop-invariant: one reciprocal, then a multiply per element (#5).
   InvTemp := 1.0 / Temp;
   // #18: Temp > 0, so scaling after the max gives the same shift.
-  MaxLogit := TNNetVolume.MaxValue(Logits.DataPtr, Logits.Size) * InvTemp;
+  Shift := TNNetVolume.MaxValue(Logits.DataPtr, Logits.Size) * InvTemp;
   // #19: the whole volume is one contiguous run and the temperature scale is
   // already folded out of the shift, so Dest gets the scaled copy and then one
   // fused pass exponentiates and sums it.
   Dest.CopyNoChecks(Logits);
-  Dest.Mul(InvTemp);
-  SumExp := TNNetVolume.ExpShiftSum(Dest.DataPtr, Dest.DataPtr, MaxLogit,
+  // At Temp = 1 the scale is the exact identity, so the whole pass is skipped.
+  if InvTemp <> 1.0 then Dest.Mul(InvTemp);
+  SumExp := TNNetVolume.ExpShiftSum(Dest.DataPtr, Dest.DataPtr, Shift,
     Dest.Size);
   // Dest and Logits have the same Size (ReSized above), so the normalization
   // spans exactly the range written: one AVX scale instead of N divides (#18).
@@ -240,8 +243,9 @@ function TNeuralKDTrainer.ComputeLoss(pInput: TNNetVolume;
   HardLabel: integer): TNeuralFloat;
 var
   StudentLogits, TeacherLogits: TNNetVolume;
-  I, TeacherSoftSizeM1: integer;
-  PHard: TNeuralFloat;
+  PHard, InvTemp: TNeuralFloat;
+  HardShift, HardSumExp: TNeuralFloat;
+  StudentShift, StudentSumExp, TeacherShift, TeacherSumExp: TNeuralFloat;
 begin
   // Forward passes. The teacher is run forward only -> never updated.
   FStudent.Compute(pInput);
@@ -250,20 +254,28 @@ begin
   TeacherLogits := LogitLayer(FTeacher).Output;
 
   // Hard-label cross-entropy uses the T=1 student distribution.
-  SoftenLogits(StudentLogits, 1.0, FStudentHard);
+  SoftenLogits(StudentLogits, 1.0, FStudentHard, HardShift, HardSumExp);
   PHard := Max(FStudentHard.FData[HardLabel], FProbFloor);
   FLastHardLoss := -Ln(PHard);
 
   // Soft KL term uses the temperature-softened distributions.
-  SoftenLogits(StudentLogits, FTemperature, FStudentSoft);
-  SoftenLogits(TeacherLogits, FTemperature, FTeacherSoft);
-  // KL(qS || pS) = sum_i qS_i * (ln qS_i - ln pS_i).
-  FLastKL := 0;
-  TeacherSoftSizeM1 := FTeacherSoft.Size - 1;
-  for I := 0 to TeacherSoftSizeM1 do
-    FLastKL := FLastKL + FTeacherSoft.FData[I] *
-      ( pcr_logf(Max(FTeacherSoft.FData[I], FProbFloor)) -
-        pcr_logf(Max(FStudentSoft.FData[I], FProbFloor)) );
+  SoftenLogits(StudentLogits, FTemperature, FStudentSoft,
+    StudentShift, StudentSumExp);
+  SoftenLogits(TeacherLogits, FTemperature, FTeacherSoft,
+    TeacherShift, TeacherSumExp);
+  // KL(qS || pS) = sum_i qS_i * (ln qS_i - ln pS_i) in closed form: both log
+  // probabilities are affine in the logits, ln qS_i = zt_i/T - TeacherShift -
+  // ln(TeacherSumExp) and likewise for pS, and sum_i qS_i = 1, so the per-class
+  // logs collapse into two dot products plus the four stabilizing scalars. That
+  // replaces 2*Vocab pcr_logf calls with two AVX passes (#13).
+  InvTemp := 1.0 / FTemperature;
+  FLastKL :=
+    InvTemp * ( TNNetVolume.DotProduct(FTeacherSoft.DataPtr,
+                  TeacherLogits.DataPtr, FTeacherSoft.Size) -
+                TNNetVolume.DotProduct(FTeacherSoft.DataPtr,
+                  StudentLogits.DataPtr, FTeacherSoft.Size) )
+    - TeacherShift - Ln(TeacherSumExp)
+    + StudentShift + Ln(StudentSumExp);
 
   FLastLoss := FAlpha * FLastHardLoss
              + (1 - FAlpha) * Sqr(FTemperature) * FLastKL;

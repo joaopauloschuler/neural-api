@@ -43,64 +43,55 @@ const
   CodeSize = 24;    // number of distinct key/value atoms in the codebook
   Trials   = 40;    // random codebooks averaged per capacity point
 
+const
+  cAtomBytes = N * csNeuralFloatSize;        // one atom's payload, for Move()
+
 var
   Keys, Vals: array of TNNetVolume;          // codebook atoms (1,1,N)
   BindNet, UnbindNet: TNNet;
-  TmpL, TmpR, Trace, Query: TNNetVolume;
+  HRRInput, Bound, Trace, Query: TNNetVolume; // persistent work volumes
 
 // Fill V with a random zero-mean unit-norm n-vector (the standard HRR atom).
 procedure SampleAtom(V: TNNetVolume);
 var i: integer; norm: TNeuralFloat;
 begin
   for i := 0 to N - 1 do V.Raw[i] := V.RandomGaussianValue();
-  norm := 0;
-  for i := 0 to N - 1 do norm := norm + V.Raw[i] * V.Raw[i];
-  norm := Sqrt(norm);
+  norm := Sqrt(V.GetSumSqr());
   if norm < 1e-12 then norm := 1e-12;
-  for i := 0 to N - 1 do V.Raw[i] := V.Raw[i] / norm;
+  V.Mul(1.0 / norm);
 end;
 
-// Pack left|right into a (1,1,2N) volume and run the given weightless net.
-function RunHRR(Net: TNNet; ALeft, ARight: TNNetVolume): TNNetVolume;
-var i: integer; Inp: TNNetVolume;
+// Pack left|right into the persistent (1,1,2N) input, run the given weightless
+// net and copy its output into Dest. No per-call allocation.
+procedure RunHRR(Net: TNNet; ALeft, ARight, Dest: TNNetVolume);
 begin
-  Inp := TNNetVolume.Create(1, 1, 2 * N);
-  try
-    for i := 0 to N - 1 do
-    begin
-      Inp.Raw[i]     := ALeft.Raw[i];
-      Inp.Raw[N + i] := ARight.Raw[i];
-    end;
-    Net.Compute(Inp);
-    Result := TNNetVolume.Create(1, 1, N);
-    Result.Copy(Net.GetLastLayer.Output);
-  finally
-    Inp.Free;
-  end;
+  Move(ALeft.FData[0],  HRRInput.FData[0], cAtomBytes);
+  Move(ARight.FData[0], HRRInput.FData[N], cAtomBytes);
+  Net.Compute(HRRInput);
+  Dest.Copy(Net.GetLastLayer.Output);
 end;
 
 function Cosine(A, B: TNNetVolume): TNeuralFloat;
-var i: integer; dot, na, nb: TNeuralFloat;
+var dot, na, nb: TNeuralFloat;
 begin
-  dot := 0; na := 0; nb := 0;
-  for i := 0 to N - 1 do
-  begin
-    dot := dot + A.Raw[i] * B.Raw[i];
-    na  := na  + A.Raw[i] * A.Raw[i];
-    nb  := nb  + B.Raw[i] * B.Raw[i];
-  end;
+  dot := A.DotProduct(B);
+  na  := A.GetSumSqr();
+  nb  := B.GetSumSqr();
   if (na < 1e-12) or (nb < 1e-12) then Result := 0
   else Result := dot / (Sqrt(na) * Sqrt(nb));
 end;
 
 // Nearest value-codebook index by cosine similarity (the cleanup memory).
+// The value atoms are unit-norm (SampleAtom) and the query's own norm is the
+// same for every candidate, so the cosine argmax equals the dot-product argmax
+// -- one SIMD dot per candidate, no norms in the loop.
 function CleanupNearestVal(Q: TNNetVolume): integer;
 var i, best: integer; bestSim, sim: TNeuralFloat;
 begin
-  best := 0; bestSim := -2;
+  best := 0; bestSim := -1e30;
   for i := 0 to CodeSize - 1 do
   begin
-    sim := Cosine(Q, Vals[i]);
+    sim := Q.DotProduct(Vals[i]);
     if sim > bestSim then begin bestSim := sim; best := i; end;
   end;
   Result := best;
@@ -121,11 +112,8 @@ end;
 function CapacityAt(P: integer): TNeuralFloat;
 var
   trial, i, k, queryKey, recovered, hits, total: integer;
-  perm: array of integer;
-  bound: TNNetVolume;
 begin
   hits := 0; total := 0;
-  SetLength(perm, CodeSize);
   for trial := 1 to Trials do
   begin
     // fresh random codebook each trial
@@ -133,26 +121,20 @@ begin
     begin
       SampleAtom(Keys[i]);
       SampleAtom(Vals[i]);
-      perm[i] := i;
     end;
     // choose P distinct pairs (use the first P indices of the codebook)
     Trace.Fill(0);
     for k := 0 to P - 1 do
     begin
-      bound := RunHRR(BindNet, Keys[k], Vals[k]);
-      try
-        Trace.Add(bound);          // superpose key_k (*) val_k
-      finally
-        bound.Free;
-      end;
+      RunHRR(BindNet, Keys[k], Vals[k], Bound);
+      Trace.Add(Bound);            // superpose key_k (*) val_k
     end;
     // query the trace by each stored key and clean up
     for queryKey := 0 to P - 1 do
     begin
-      Query.Free;
       // unbind(a=trace, b=key) = trace (conv) involution(key) = inv(key) (conv) trace,
       // the HRR query that recovers an approximate copy of the bound value.
-      Query := RunHRR(UnbindNet, Trace, Keys[queryKey]);
+      RunHRR(UnbindNet, Trace, Keys[queryKey], Query);
       recovered := CleanupNearestVal(Query);
       if recovered = queryKey then Inc(hits);
       Inc(total);
@@ -162,29 +144,21 @@ begin
 end;
 
 procedure SinglePairSanity;
-var bound, q: TNNetVolume; nearest: integer; sim: TNeuralFloat;
+var nearest: integer; sim: TNeuralFloat;
 begin
   SampleAtom(Keys[0]); SampleAtom(Vals[0]);
   SampleAtom(Keys[1]); SampleAtom(Vals[1]);
-  bound := RunHRR(BindNet, Keys[0], Vals[0]);   // t = key0 (*) val0
-  try
-    WriteLn('Single-pair sanity (1 pair stored):');
-    WriteLn('  cos(bind(key0,val0), val0)      = ', Cosine(bound, Vals[0]):0:4,
-            '   (bound trace is DISSIMILAR to its filler -- by design)');
-    q := RunHRR(UnbindNet, bound, Keys[0]);     // unbind by correct key
-    try
-      sim := Cosine(q, Vals[0]);
-      nearest := CleanupNearestVal(q);
-      WriteLn('  cos(unbind(key0, t), val0)      = ', sim:0:4,
-              '   (recovers an APPROXIMATE copy of val0)');
-      WriteLn('  cleanup nearest value index     = ', nearest,
-              '   (expected 0)  ', BoolToStr(nearest = 0, 'OK', 'MISS'));
-    finally
-      q.Free;
-    end;
-  finally
-    bound.Free;
-  end;
+  RunHRR(BindNet, Keys[0], Vals[0], Bound);     // t = key0 (*) val0
+  WriteLn('Single-pair sanity (1 pair stored):');
+  WriteLn('  cos(bind(key0,val0), val0)      = ', Cosine(Bound, Vals[0]):0:4,
+          '   (bound trace is DISSIMILAR to its filler -- by design)');
+  RunHRR(UnbindNet, Bound, Keys[0], Query);     // unbind by correct key
+  sim := Cosine(Query, Vals[0]);
+  nearest := CleanupNearestVal(Query);
+  WriteLn('  cos(unbind(key0, t), val0)      = ', sim:0:4,
+          '   (recovers an APPROXIMATE copy of val0)');
+  WriteLn('  cleanup nearest value index     = ', nearest,
+          '   (expected 0)  ', BoolToStr(nearest = 0, 'OK', 'MISS'));
 end;
 
 var
@@ -206,10 +180,10 @@ begin
     Keys[i] := TNNetVolume.Create(1, 1, N);
     Vals[i] := TNNetVolume.Create(1, 1, N);
   end;
-  TmpL  := TNNetVolume.Create(1, 1, N);
-  TmpR  := TNNetVolume.Create(1, 1, N);
-  Trace := TNNetVolume.Create(1, 1, N);
-  Query := TNNetVolume.Create(1, 1, N);
+  HRRInput := TNNetVolume.Create(1, 1, 2 * N);
+  Bound    := TNNetVolume.Create(1, 1, N);
+  Trace    := TNNetVolume.Create(1, 1, N);
+  Query    := TNNetVolume.Create(1, 1, N);
 
   BuildNets;
   try
@@ -236,6 +210,6 @@ begin
       Keys[i].Free;
       Vals[i].Free;
     end;
-    TmpL.Free; TmpR.Free; Trace.Free; Query.Free;
+    HRRInput.Free; Bound.Free; Trace.Free; Query.Free;
   end;
 end.

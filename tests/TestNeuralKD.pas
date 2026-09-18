@@ -21,6 +21,9 @@ type
     procedure ReadProbs(NN: TNNet; pInput: TNNetVolume; Dest: TNNetVolume);
     // Snapshot every weight + bias of NN into a flat array.
     function Snapshot(NN: TNNet): TNeuralFloatDynArr;
+    // Reference stable softmax of (Logits/Temp) into Dest, scalar Ln/Exp only.
+    procedure RefSoften(Logits: TNNetVolume; Temp: TNeuralFloat;
+      Dest: TNNetVolume);
   published
     // alpha=1 (pure hard label): one KD step must equal an ordinary
     // cross-entropy SGD step (identical weight movement to a hand-run
@@ -32,6 +35,9 @@ type
     // The teacher net is frozen: every teacher weight is bit-identical after
     // many KD steps.
     procedure TestTeacherWeightsUnchanged;
+    // LastKL closed form must match the reference sum_i q_i*(ln q_i - ln p_i)
+    // over random logits and several temperatures.
+    procedure TestClosedFormKLMatchesLogSum;
     // Finite-difference check of dLoss/dWeight (blended alpha, T>1) against
     // the implemented backward (LR=1, inertia=0, batch mode: grad = -Delta).
     procedure TestFiniteDifferenceGradient;
@@ -230,6 +236,81 @@ begin
   Trainer.Free;
   Student.Free;
   Teacher.Free;
+  Input.Free;
+end;
+
+procedure TTestNeuralKD.RefSoften(Logits: TNNetVolume; Temp: TNeuralFloat;
+  Dest: TNNetVolume);
+var
+  I, SizeM1: integer;
+  MaxLogit, SumExp: TNeuralFloat;
+begin
+  Dest.ReSize(Logits);
+  SizeM1 := Logits.Size - 1;
+  MaxLogit := Logits.FData[0] / Temp;
+  for I := 1 to SizeM1 do
+    MaxLogit := Max(MaxLogit, Logits.FData[I] / Temp);
+  SumExp := 0;
+  for I := 0 to SizeM1 do
+  begin
+    Dest.FData[I] := Exp(Logits.FData[I] / Temp - MaxLogit);
+    SumExp := SumExp + Dest.FData[I];
+  end;
+  for I := 0 to SizeM1 do Dest.FData[I] := Dest.FData[I] / SumExp;
+end;
+
+procedure TTestNeuralKD.TestClosedFormKLMatchesLogSum;
+const
+  csProbFloor = 1e-9;
+  csTemps: array[0..3] of TNeuralFloat = (1.0, 1.5, 2.0, 4.0);
+var
+  Teacher, Student: TNNet;
+  Trainer: TNeuralKDTrainer;
+  Input, StudentSoft, TeacherSoft: TNNetVolume;
+  TempIdx, Trial, I, SizeM1: integer;
+  RefKL, Temp: TNeuralFloat;
+begin
+  RandSeed := 909091;
+  Input := TNNetVolume.Create(csInW, 1, csInD);
+  StudentSoft := TNNetVolume.Create();
+  TeacherSoft := TNNetVolume.Create();
+  RandSeed := 1234;
+  Teacher := BuildTinyNet(csInW, csInD, csHidden, csVocab);
+  RandSeed := 4321;
+  Student := BuildTinyNet(csInW, csInD, csHidden, csVocab);
+
+  for TempIdx := 0 to Length(csTemps) - 1 do
+  begin
+    Temp := csTemps[TempIdx];
+    Trainer := TNeuralKDTrainer.Create(Teacher, Student, {alpha=}0.5, Temp);
+    for Trial := 0 to 4 do
+    begin
+      Input.Randomize();
+      Input.Mul(3.0);   // widen the logit spread without underflowing.
+      Trainer.ComputeLoss(Input, Trial mod csVocab);
+
+      // Reference: the floored per-class log sum the closed form replaced.
+      RefSoften(Student.GetLastLayer().PrevLayer.Output, Temp, StudentSoft);
+      RefSoften(Teacher.GetLastLayer().PrevLayer.Output, Temp, TeacherSoft);
+      RefKL := 0;
+      SizeM1 := TeacherSoft.Size - 1;
+      for I := 0 to SizeM1 do
+        RefKL := RefKL + TeacherSoft.FData[I] *
+          ( Ln(Max(TeacherSoft.FData[I], csProbFloor)) -
+            Ln(Max(StudentSoft.FData[I], csProbFloor)) );
+
+      AssertTrue(Format('KD closed-form KL mismatch at T=%g trial %d: ' +
+        'closed=%g reference=%g', [Temp, Trial, Trainer.LastKL, RefKL]),
+        Abs(Trainer.LastKL - RefKL) <= 1e-4 * Max(1.0, Abs(RefKL)));
+      AssertTrue('KL must be non-negative', Trainer.LastKL > -1e-4);
+    end;
+    Trainer.Free;
+  end;
+
+  Student.Free;
+  Teacher.Free;
+  TeacherSoft.Free;
+  StudentSoft.Free;
   Input.Free;
 end;
 

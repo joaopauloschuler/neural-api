@@ -1121,6 +1121,7 @@ procedure TNeuralGRPOTrainer.SampleCompletion(const Prompt: array of integer;
 var
   T, I, Vocab, Picked, FMaxNewTokensM1, VocabM1: integer;
   Y: TNNetVolume;
+  SampleSrc: TNeuralFloatArrPtr;
   R, Acc, Sum, MaxLogit, P, InvTemp: TNeuralFloat;
   Last: TNNetLayer;
 begin
@@ -1145,12 +1146,11 @@ begin
     // sampling is invariant to -> sample straight from Y.
     if InvTemp = 1.0 then
     begin
-      Sum := 0;
-      for I := 0 to VocabM1 do
-      begin
-        FProbs[I] := Y.FData[I];
-        Sum := Sum + FProbs[I];
-      end;
+      // Sample straight out of the layer output: the cumulative walk below
+      // only reads the values, so the Vocab-long copy into FProbs is dead
+      // work and the sum is one vectorized pass (#13/#19).
+      SampleSrc := Y.DataPtr;
+      Sum := Y.GetSum();
     end
     else
     begin
@@ -1165,12 +1165,13 @@ begin
       // accumulate are a single fused vectorized pass.
       Sum := TNNetVolume.ExpShiftSum(Addr(FProbs[0]), Addr(FProbs[0]),
         MaxLogit, Vocab);
+      SampleSrc := TNeuralFloatArrPtr(Addr(FProbs[0]));
     end;
     R := Random * Sum;
-    Acc := 0; Picked := Vocab - 1;
+    Acc := 0; Picked := VocabM1;
     for I := 0 to VocabM1 do
     begin
-      Acc := Acc + FProbs[I];
+      Acc := Acc + SampleSrc^[I];
       if R <= Acc then begin Picked := I; Break; end;
     end;
     Completion[T] := Picked;

@@ -561,9 +561,13 @@ type
       FDocCount: integer;
       FWindows: TNNetAAInteger;
       FIsPacked: boolean;
+      // Segment-id scratch reused by GetSegmentVolume; grown at most once.
+      FSegIdScratch: TNeuralIntegerArray;
       procedure RequirePacked();
       procedure PackSplit();
       procedure PackGreedyBins(OneDocPerWindow: boolean);
+      procedure BuildSegmentIds(WindowIdx: integer;
+        var pIds: TNeuralIntegerArray);
     public
       constructor Create(pContextLen: integer;
         pMode: TNNetPackingMode = pmSplitAcrossWindows;
@@ -848,6 +852,9 @@ type
       FRngState: cardinal;
       FOrder: TNeuralIntegerArray;   // sample indices in emission order
       FBatchCount: integer;
+      // Per-batch pad length (max member length), filled by BuildBatches so
+      // BatchSeqLen is an array read instead of a rescan of the batch.
+      FBatchSeqLens: TNeuralIntegerArray;
       FIsBuilt: boolean;
       function NextRandom(): TNeuralFloat;
       function NextRandomInt(N: integer): integer;
@@ -983,6 +990,23 @@ begin
 end;
 {$ENDIF}
 
+// Appends S to Buffer at write position Len, doubling the buffer when it no
+// longer fits. Buffer is over-allocated, so Len - not Length(Buffer) - is the
+// live length; the caller truncates once at the end. This keeps token-by-token
+// text generation linear instead of reallocating and copying on every token.
+procedure AppendToStringBuffer(var Buffer: string; var Len: integer;
+  const S: string);
+var
+  AddLen, Needed: integer;
+begin
+  AddLen := Length(S);
+  if AddLen = 0 then exit;
+  Needed := Len + AddLen;
+  if Needed > Length(Buffer) then SetLength(Buffer, Needed * 2);
+  Move(S[1], Buffer[Len + 1], AddLen * SizeOf(Char));
+  Len := Needed;
+end;
+
 function GenerateStringFromChars(NN: TNNet; InputString: string;
   oSampler: TNNetSamplerBase): string;
 var
@@ -1047,10 +1071,13 @@ var
   NextTokenStr: string;
   Tokens: TNeuralIntegerArray;
   TokenCnt: integer;
+  ResLen: integer;
 begin
   InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
   OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
   Result := InputString;
+  ResLen := Length(InputString);
+  SetLength(Result, ResLen + 256);   // over-allocate; ResLen is the live length
   Dict.StringToIntegerArray(InputString, Tokens);
   TokenCnt := Length(Tokens);
   repeat
@@ -1062,12 +1089,14 @@ begin
     if NextTokenInt < Dict.Count then
     begin
       NextTokenStr := Dict.IntegerToWord(NextTokenInt);
-      Result := Result + ' ' + NextTokenStr;
+      AppendToStringBuffer(Result, ResLen, ' ');
+      AppendToStringBuffer(Result, ResLen, NextTokenStr);
     end;
     TokenCnt := TokenCnt + 1;
     SetLength(Tokens, TokenCnt);
     Tokens[TokenCnt - 1] := NextTokenInt;
   until (NextTokenInt < 2) or (TokenCnt>=InputVolume.SizeX);
+  SetLength(Result, ResLen);
   SetLength(Tokens, 0);
   InputVolume.Free;
   OutputVolume.Free;
@@ -1081,6 +1110,7 @@ var
   NextTokenInt: integer;
   Tokens: TNeuralIntegerArray;
   TokenCnt: integer;
+  ResLen: integer;
 begin
   InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
   OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
@@ -1089,6 +1119,8 @@ begin
     InputString := Copy(InputString, Length(inputString) - InputVolume.SizeX + 1,InputVolume.SizeX);
   end;
   Result := InputString;
+  ResLen := Length(InputString);
+  SetLength(Result, ResLen + 256);   // over-allocate; ResLen is the live length
   Tokens := StringToArrayOfInteger(InputString);
   TokenCnt := Length(Tokens);
   repeat
@@ -1101,12 +1133,13 @@ begin
     else NextTokenInt := OutputVolume.GetClassOnPixel(TokenCnt - 1, 0);
     if NextTokenInt < 256 then
     begin
-      Result := Result + Chr(NextTokenInt);
+      AppendToStringBuffer(Result, ResLen, Chr(NextTokenInt));
     end;
     TokenCnt := TokenCnt + 1;
     SetLength(Tokens, TokenCnt);
     Tokens[TokenCnt - 1] := NextTokenInt;
   until (NextTokenInt < 2) or (TokenCnt>=InputVolume.SizeX);
+  SetLength(Result, ResLen);
   SetLength(Tokens, 0);
   InputVolume.Free;
   OutputVolume.Free;
@@ -1122,11 +1155,14 @@ var
   Tokens: TNeuralIntegerArray;
   TokenCnt: integer;
   VocabCount: integer;
+  ResLen: integer;
 begin
   VocabCount := Dict.GetVocabCount();
   InputVolume := TNNetVolume.Create(NN.GetFirstLayer.Output);
   OutputVolume := TNNetVolume.Create(NN.GetLastLayer().Output);
   Result := InputString;
+  ResLen := Length(InputString);
+  SetLength(Result, ResLen + 256);   // over-allocate; ResLen is the live length
   Dict.Tokenize(InputString, Tokens);
   TokenCnt := Length(Tokens);
   repeat
@@ -1140,15 +1176,15 @@ begin
     if NextTokenInt < VocabCount then
     begin
       NextTokenStr := Dict.DeTokenize(NextTokenInt);
-      // todo: make a more efficient code.
-      if Dict.TokenizerHasSeparator
-      then Result := Result + ' ' + NextTokenStr
-      else Result := Result + NextTokenStr
+      if Dict.TokenizerHasSeparator then
+        AppendToStringBuffer(Result, ResLen, ' ');
+      AppendToStringBuffer(Result, ResLen, NextTokenStr);
     end;
     TokenCnt := TokenCnt + 1;
     SetLength(Tokens, TokenCnt);
     Tokens[TokenCnt - 1] := NextTokenInt;
   until (NextTokenInt < 2) or (TokenCnt>=InputVolume.SizeX);
+  SetLength(Result, ResLen);
   SetLength(Tokens, 0);
   InputVolume.Free;
   OutputVolume.Free;
@@ -1310,10 +1346,16 @@ end;
 // window boundary; only the final partial window is padded.
 procedure TNNetSequencePacker.PackSplit();
 var
-  StreamLen, DocIdx, I, Pos, WinCount, W: integer;
+  StreamLen, DocIdx, Pos, WinCount, W: integer;
   Stream: TNeuralIntegerArray;
   DocM1, WinM1, ContextM1: integer;
   DocLenM1: integer;
+  WBase, Avail: integer;
+  {$IFDEF FPC}
+  Win: array of integer;
+  {$ELSE}
+  Win: TNeuralIntegerArray;
+  {$ENDIF}
 begin
   StreamLen := 0;
   DocM1 := FDocCount - 1;
@@ -1339,13 +1381,16 @@ begin
   for W := 0 to WinM1 do
   begin
     SetLength(FWindows[W], FContextLen);
-    for I := 0 to ContextM1 do
-    begin
-      Pos := W * FContextLen + I;
-      if Pos < StreamLen
-      then FWindows[W][I] := Stream[Pos]
-      else FWindows[W][I] := FPadToken;
-    end;
+    Win := FWindows[W];
+    WBase := W * FContextLen;
+    // The window's slice of the stream is contiguous: copy it in one Move and
+    // pad whatever the (only ever final) short window leaves over.
+    Avail := StreamLen - WBase;
+    if Avail > FContextLen then Avail := FContextLen;
+    if Avail < 0 then Avail := 0;
+    if Avail > 0 then Move(Stream[WBase], Win[0], Avail * csIntegerSize);
+    if Avail <= ContextM1 then
+      FillDWord(Win[Avail], FContextLen - Avail, DWord(FPadToken));
   end;
   SetLength(Stream, 0);
 end;
@@ -1355,17 +1400,19 @@ end;
 // longer than ContextLen-1 tokens are truncated so doc+separator always fits.
 procedure TNNetSequencePacker.PackGreedyBins(OneDocPerWindow: boolean);
 var
-  DocIdx, DocLen, I, Pos, W: integer;
+  DocIdx, DocLen, Pos, W: integer;
   DocM1: integer;
-  DocLenM1: integer;
+  {$IFDEF FPC}
+  Win: array of integer;
+  {$ELSE}
+  Win: TNeuralIntegerArray;
+  {$ENDIF}
 
   procedure PadAndCloseCurrent();
-  var
-    P: integer;
-    ContextM1: integer;
   begin
-    ContextM1 := FContextLen - 1;
-    for P := Pos to ContextM1 do FWindows[W][P] := FPadToken;
+    // The tail is one contiguous run of the pad token.
+    if Pos < FContextLen then
+      FillDWord(FWindows[W][Pos], FContextLen - Pos, DWord(FPadToken));
     Pos := FContextLen;
   end;
 
@@ -1391,13 +1438,12 @@ begin
       if W >= 0 then PadAndCloseCurrent();
       OpenNewWindow();
     end;
-    DocLenM1 := DocLen - 1;
-    for I := 0 to DocLenM1 do
-    begin
-      FWindows[W][Pos] := FDocs[DocIdx][I];
-      Inc(Pos);
-    end;
-    FWindows[W][Pos] := FSeparatorToken;
+    Win := FWindows[W];
+    // The document's leading DocLen tokens land contiguously at Pos.
+    if DocLen > 0 then
+      Move(FDocs[DocIdx][0], Win[Pos], DocLen * csIntegerSize);
+    Inc(Pos, DocLen);
+    Win[Pos] := FSeparatorToken;
     Inc(Pos);
   end;
   if W >= 0 then PadAndCloseCurrent();
@@ -1439,40 +1485,53 @@ begin
 end;
 
 function TNNetSequencePacker.GetSegmentIds(WindowIdx: integer): TNeuralIntegerArray;
-var
-  Pos, SegId, PadId: integer;
-  ContextM1: integer;
 begin
   RequirePacked();
   SetLength(Result, FContextLen);
+  BuildSegmentIds(WindowIdx, Result);
+end;
+
+// Writes FContextLen segment ids into pIds, which the caller sizes.
+procedure TNNetSequencePacker.BuildSegmentIds(WindowIdx: integer;
+  var pIds: TNeuralIntegerArray);
+var
+  Pos, SegId, PadId, Tok: integer;
+  ContextM1: integer;
+  {$IFDEF FPC}
+  Win: array of integer;
+  {$ELSE}
+  Win: TNeuralIntegerArray;
+  {$ENDIF}
+begin
   // First pass: real/separator tokens get an incrementing document id; a new
   // document opens right after each separator. Pad positions are tagged -1 and
   // reassigned a single shared id below.
   SegId := 0;
   ContextM1 := FContextLen - 1;
+  Win := FWindows[WindowIdx];
   for Pos := 0 to ContextM1 do
   begin
-    if FWindows[WindowIdx][Pos] = FPadToken then
+    Tok := Win[Pos];
+    if Tok = FPadToken then
     begin
-      Result[Pos] := -1;
+      pIds[Pos] := -1;
     end
     else
     begin
-      Result[Pos] := SegId;
-      if FWindows[WindowIdx][Pos] = FSeparatorToken then Inc(SegId);
+      pIds[Pos] := SegId;
+      if Tok = FSeparatorToken then Inc(SegId);
     end;
   end;
   // Pads share one id distinct from every real-document id (= SegId, the next
   // unused value), so a pad never matches any real document.
   PadId := SegId;
   for Pos := 0 to ContextM1 do
-    if Result[Pos] = -1 then Result[Pos] := PadId;
+    if pIds[Pos] = -1 then pIds[Pos] := PadId;
 end;
 
 procedure TNNetSequencePacker.GetSegmentVolume(WindowIdx: integer;
   pSegment: TNNetVolume);
 var
-  Ids: TNeuralIntegerArray;
   Pos: integer;
   ContextM1: integer;
 begin
@@ -1482,11 +1541,13 @@ begin
     raise Exception.Create('TNNetSequencePacker.GetSegmentVolume: pSegment ' +
       'must be (ContextLen,1,1). Got (' + IntToStr(pSegment.SizeX) + ',' +
       IntToStr(pSegment.SizeY) + ',' + IntToStr(pSegment.Depth) + ').');
-  Ids := GetSegmentIds(WindowIdx);
+  // Reuse a scratch row instead of allocating a fresh id array per call.
+  if Length(FSegIdScratch) <> FContextLen then
+    SetLength(FSegIdScratch, FContextLen);
+  BuildSegmentIds(WindowIdx, FSegIdScratch);
   ContextM1 := FContextLen - 1;
   for Pos := 0 to ContextM1 do
-    pSegment.FData[Pos] := Ids[Pos];
-  SetLength(Ids, 0);
+    pSegment.FData[Pos] := FSegIdScratch[Pos];
 end;
 
 function TNNetSequencePacker.IsTargetPredictable(WindowIdx, Pos: integer): boolean;
@@ -1534,7 +1595,7 @@ procedure TNNetSequencePacker.GetTrainingPair(WindowIdx: integer;
   pInput, pTarget: TNNetVolume);
 var
   Pos, Token: integer;
-  ContextM1, ContextM2, InputDepth: integer;
+  ContextM1, ContextM2, InputDepth, TargetDepth: integer;
   IsIdInput: boolean;
   {$IFDEF FPC}
   Win: array of integer;
@@ -1549,11 +1610,14 @@ begin
   if pTarget.SizeX <> FContextLen then
     raise Exception.Create('TNNetSequencePacker.GetTrainingPair: target SizeX ' +
       IntToStr(pTarget.SizeX) + ' <> ContextLen ' + IntToStr(FContextLen) + '.');
-  pInput.Fill(0);
   ContextM1 := FContextLen - 1;
   ContextM2 := FContextLen - 2;
   InputDepth := pInput.Depth;
   IsIdInput := (InputDepth = 1);
+  // The token-id branch writes every slot, so pre-zeroing is only needed when
+  // the volume has slots the loop below does not reach (SizeY > 1) or when the
+  // one-hot branch leaves the non-selected depths untouched.
+  if not (IsIdInput and (pInput.Size = FContextLen)) then pInput.Fill(0);
   Win := FWindows[WindowIdx];
   for Pos := 0 to ContextM1 do
   begin
@@ -1564,13 +1628,12 @@ begin
     then pInput[Pos, 0, Token] := 1;             // one-hot across depth
   end;
   pTarget.Fill(0);
+  TargetDepth := pTarget.Depth;   // #5/#8: invariant property getter
   for Pos := 0 to ContextM2 do
   begin
-    if Win[Pos + 1] <> FPadToken then
-    begin
-      Token := Win[Pos + 1];
-      if Token < pTarget.Depth then pTarget[Pos, 0, Token] := 1;
-    end;
+    Token := Win[Pos + 1];
+    if (Token <> FPadToken) and (Token < TargetDepth) then
+      pTarget[Pos, 0, Token] := 1;
   end;
 end;
 
@@ -1578,7 +1641,7 @@ procedure TNNetSequencePacker.ApplyLossMask(WindowIdx: integer;
   Desired, Actual: TNNetVolume);
 var
   Pos: integer;
-  ContextM1, DepthM1, DesBase, ActBase, CopyBytes: integer;
+  ContextM1, ContextM2, DepthM1, DesBase, ActBase, CopyBytes: integer;
   DesStride, ActStride: integer;
   {$IFDEF FPC}
   Win: array of integer;
@@ -1595,14 +1658,18 @@ begin
   ActBase := 0;
   DesStride := Desired.GetRawPos(1, 0);
   ActStride := Actual.GetRawPos(1, 0);
-  for Pos := 0 to ContextM1 do
+  // not IsTargetPredictable: next token is pad, or - for the last slot, peeled
+  // below - there is no Pos+1 target at all.
+  ContextM2 := FContextLen - 2;
+  for Pos := 0 to ContextM2 do
   begin
-    // not IsTargetPredictable: last slot (no Pos+1 target) or next token is pad
-    if (Pos >= ContextM1) or (Win[Pos + 1] = FPadToken) then
+    if Win[Pos + 1] = FPadToken then
       Move(Actual.FData[ActBase], Desired.FData[DesBase], CopyBytes);
     Inc(DesBase, DesStride);
     Inc(ActBase, ActStride);
   end;
+  if ContextM1 >= 0 then
+    Move(Actual.FData[ActBase], Desired.FData[DesBase], CopyBytes);
 end;
 
 { TNNetMaskedLMCollator }
@@ -2072,6 +2139,7 @@ procedure TNNetLengthGroupedBatcher.Clear();
 begin
   SetLength(FSamples, 0);
   SetLength(FOrder, 0);
+  SetLength(FBatchSeqLens, 0);
   FSampleCount := 0;
   FBatchCount := 0;
   FIsBuilt := false;
@@ -2173,6 +2241,7 @@ procedure TNNetLengthGroupedBatcher.BuildBatches();
 var
   Mega, Lo, Hi, I, LongestPos, Tmp: integer;
   SampleM1: integer;
+  Flat, L, MaxLen, BatchM1: integer;
 begin
   if FSampleCount < 1 then
     raise Exception.Create(
@@ -2207,6 +2276,25 @@ begin
   end;
   // 5. partition into BatchSize chunks.
   FBatchCount := (FSampleCount + FBatchSize - 1) div FBatchSize;
+  // Cache each batch's pad length (its max member length) so per-sample
+  // BatchSeqLen callers read one array element instead of rescanning the batch.
+  SetLength(FBatchSeqLens, FBatchCount);
+  Flat := 0;
+  BatchM1 := FBatchCount - 1;
+  SampleM1 := FSampleCount - 1;
+  for I := 0 to BatchM1 do
+  begin
+    MaxLen := 0;
+    Hi := Flat + FBatchSize - 1;
+    if Hi > SampleM1 then Hi := SampleM1;
+    while Flat <= Hi do
+    begin
+      L := Length(FSamples[FOrder[Flat]]);
+      if L > MaxLen then MaxLen := L;
+      Inc(Flat);
+    end;
+    FBatchSeqLens[I] := MaxLen;
+  end;
   FIsBuilt := true;
 end;
 
@@ -2244,18 +2332,12 @@ begin
 end;
 
 function TNNetLengthGroupedBatcher.BatchSeqLen(BatchIdx: integer): integer;
-var
-  W, L: integer;
-  MaxW: integer;
 begin
   RequireBuilt();
-  Result := 0;
-  MaxW := BatchSize(BatchIdx) - 1;
-  for W := 0 to MaxW do
-  begin
-    L := SampleLenOf(BatchIdx, W);
-    if L > Result then Result := L;
-  end;
+  if (BatchIdx < 0) or (BatchIdx >= FBatchCount) then
+    raise Exception.Create(
+      'TNNetLengthGroupedBatcher.BatchSeqLen: bad batch index.');
+  Result := FBatchSeqLens[BatchIdx];
 end;
 
 procedure TNNetLengthGroupedBatcher.GetTrainingPair(BatchIdx, WithinIdx: integer;
@@ -2263,7 +2345,8 @@ procedure TNNetLengthGroupedBatcher.GetTrainingPair(BatchIdx, WithinIdx: integer
 var
   Sample: TNeuralIntegerArray;
   SeqLen, Len, Pos, Token: integer;
-  SeqM1, LenM2: integer;
+  SeqM1, LenM1, LenM2: integer;
+  InputDepth, TargetDepth: integer;
   IsIdInput: boolean;
 begin
   RequireBuilt();
@@ -2279,67 +2362,106 @@ begin
   Sample := FSamples[SampleIndexOf(BatchIdx, WithinIdx)];
   Len := Length(Sample);
   // Input: real tokens then right-padding to the batch's seq len.
-  pInput.Fill(0);
   SeqM1 := SeqLen - 1;
+  LenM1 := Len - 1;
   LenM2 := Len - 2;
-  IsIdInput := (pInput.Depth = 1);
-  for Pos := 0 to SeqM1 do
+  InputDepth := pInput.Depth;   // #5/#8: invariant property getter
+  IsIdInput := (InputDepth = 1);
+  // The token-id branch writes every slot up to SeqM1 (pad tail included), so
+  // pre-zeroing is only needed when the volume has slots the loops below do
+  // not reach or when the one-hot branch leaves non-selected depths untouched.
+  if not (IsIdInput and (pInput.Size = SeqLen)) then pInput.Fill(0);
+  // #20: real tokens (Len <= SeqLen by BatchSeqLen's definition), then the
+  // pad tail with its position-invariant token test hoisted.
+  for Pos := 0 to LenM1 do
   begin
-    if Pos < Len then Token := Sample[Pos] else Token := FPadToken;
+    Token := Sample[Pos];
     if IsIdInput
     then pInput.FData[Pos] := Token
-    else if (Token >= 0) and (Token < pInput.Depth)
+    else if (Token >= 0) and (Token < InputDepth)
     then pInput[Pos, 0, Token] := 1;
+  end;
+  if IsIdInput then
+  begin
+    for Pos := Len to SeqM1 do pInput.FData[Pos] := FPadToken;
+  end
+  else if (FPadToken >= 0) and (FPadToken < InputDepth) then
+  begin
+    for Pos := Len to SeqM1 do pInput[Pos, 0, FPadToken] := 1;
   end;
   // Target: per-position one-hot of the NEXT real token (positions 0..Len-2);
   // every padded position and the sample's last real token carry no target.
   pTarget.Fill(0);
+  TargetDepth := pTarget.Depth;   // #5/#8: invariant property getter
   for Pos := 0 to LenM2 do
   begin
     Token := Sample[Pos + 1];
-    if (Token >= 0) and (Token < pTarget.Depth) then pTarget[Pos, 0, Token] := 1;
+    if (Token >= 0) and (Token < TargetDepth) then pTarget[Pos, 0, Token] := 1;
   end;
 end;
 
 procedure TNNetLengthGroupedBatcher.ApplyLossMask(BatchIdx, WithinIdx: integer;
   Desired, Actual: TNNetVolume);
 var
-  SeqLen, Len, Pos: integer;
-  SeqM1, DepthM1, DesBase, ActBase, CopyBytes: integer;
+  SeqLen, Len, Pos, StartPos: integer;
+  SeqM1, Depth, DesBase, ActBase, CopyBytes: integer;
+  DesStride, ActStride: integer;
 begin
   RequireBuilt();
   SeqLen := BatchSeqLen(BatchIdx);
   Len := SampleLenOf(BatchIdx, WithinIdx);
+  // Predictable iff a next real token exists (Pos in 0..Len-2), so the masked
+  // positions form one contiguous tail: Len-1..SeqLen-1.
+  StartPos := Len - 1;
+  if StartPos < 0 then StartPos := 0;
   SeqM1 := SeqLen - 1;
-  DepthM1 := Desired.Depth - 1;
-  CopyBytes := (DepthM1 + 1) * csNeuralFloatSize;
-  for Pos := 0 to SeqM1 do
+  if StartPos > SeqM1 then exit;
+  Depth := Desired.Depth;
+  if Depth = Actual.Depth then
   begin
-    // Predictable iff a next real token exists: Pos in 0..Len-2.
-    if Pos > Len - 2 then
+    // Both pairs use GetTrainingPair's layout (positions on X, targets on
+    // depth, row y = 0), where consecutive positions are Depth floats apart:
+    // the whole tail is one contiguous block per volume.
+    Move(Actual.FData[Actual.GetRawPos(StartPos, 0, 0)],
+      Desired.FData[Desired.GetRawPos(StartPos, 0, 0)],
+      (SeqLen - StartPos) * Depth * csNeuralFloatSize);
+  end
+  else
+  begin
+    // Depth mismatch: per-position copy with carried offsets (#12).
+    CopyBytes := Depth * csNeuralFloatSize;
+    DesBase := Desired.GetRawPos(StartPos, 0, 0);
+    ActBase := Actual.GetRawPos(StartPos, 0, 0);
+    DesStride := Desired.GetRawPos(1, 0);
+    ActStride := Actual.GetRawPos(1, 0);
+    for Pos := StartPos to SeqM1 do
     begin
-      DesBase := Desired.GetRawPos(Pos, 0, 0);
-      ActBase := Actual.GetRawPos(Pos, 0, 0);
       Move(Actual.FData[ActBase], Desired.FData[DesBase], CopyBytes);
+      Inc(DesBase, DesStride);
+      Inc(ActBase, ActStride);
     end;
   end;
 end;
 
 function TNNetLengthGroupedBatcher.TotalPadTokens(): int64;
 var
-  B, W, SeqLen: integer;
+  B, W, SeqLen, Flat: integer;
   BatchM1: integer;
   BatchSizeM1: integer;
 begin
   RequireBuilt();
   Result := 0;
   BatchM1 := FBatchCount - 1;
+  Flat := 0;
   for B := 0 to BatchM1 do
   begin
-    SeqLen := BatchSeqLen(B);
+    SeqLen := FBatchSeqLens[B];
     BatchSizeM1 := BatchSize(B) - 1;
     for W := 0 to BatchSizeM1 do
-      Result := Result + (SeqLen - SampleLenOf(B, W));
+    begin
+      Result := Result + (SeqLen - Length(FSamples[FOrder[Flat]]));
+      Inc(Flat);
+    end;
   end;
 end;
 

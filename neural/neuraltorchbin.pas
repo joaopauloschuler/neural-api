@@ -558,6 +558,8 @@ var
   Node, ValNode: TPickleNode;
   EntryName: string;
   MemoHi, LongLenM1, NodeItemsHi, RootKeysHi, NodeShapeHi, OwnedMax: integer;
+  PairCnt, KeyBase: integer;
+  HasNested: boolean;
 
   procedure Fail(const Msg: string);
   begin
@@ -680,6 +682,36 @@ var
     SetLength(Dict.Vals, n + 1);
     Dict.Keys[n] := Key;
     Dict.Vals[n] := Value;
+  end;
+
+  // Copies Src's entries into the flat dict Dst, joining nested sub-dict
+  // levels with a dot exactly as torch's own state_dict names them. A
+  // non-string key is copied verbatim so the materialization loop below
+  // still rejects it loudly.
+  procedure FlattenInto(Src, Dst: TPickleNode; const Prefix: string);
+  var
+    n, SrcKeysHi: integer;
+    KeyNode: TPickleNode;
+    FullName: string;
+  begin
+    SrcKeysHi := High(Src.Keys);
+    for n := 0 to SrcKeysHi do
+    begin
+      if Src.Keys[n].Kind <> pkStr then
+      begin
+        DictSetItem(Dst, Src.Keys[n], Src.Vals[n]);
+        continue;
+      end;
+      FullName := Prefix + Src.Keys[n].StrVal;
+      if Src.Vals[n].Kind = pkDict then
+        FlattenInto(Src.Vals[n], Dst, FullName + '.')
+      else
+      begin
+        KeyNode := NewNode(pkStr);
+        KeyNode.StrVal := FullName;
+        DictSetItem(Dst, KeyNode, Src.Vals[n]);
+      end;
+    end;
   end;
 
   function TupleN(Count: integer): TPickleNode;
@@ -940,12 +972,19 @@ begin
             if Length(Node.Items) mod 2 <> 0 then
               Fail('SETITEMS with an odd number of stack entries');
             if StackTop < 0 then Fail('SETITEMS on an empty stack');
-            i := 0;
-            while i < Length(Node.Items) do
+            ValNode := Stack[StackTop];
+            if ValNode.Kind <> pkDict then Fail('SETITEM(S) on a non-dict');
+            // The whole batch is sized once: a state_dict arrives as one
+            // SETITEMS of every tensor, so appending pair by pair would
+            // regrow both arrays per key.
+            PairCnt := Length(Node.Items) shr 1;
+            KeyBase := Length(ValNode.Keys);
+            SetLength(ValNode.Keys, KeyBase + PairCnt);
+            SetLength(ValNode.Vals, KeyBase + PairCnt);
+            for i := 0 to PairCnt - 1 do
             begin
-              DictSetItem(Stack[StackTop], Node.Items[i],
-                Node.Items[i + 1]);
-              i := i + 2;
+              ValNode.Keys[KeyBase + i] := Node.Items[2 * i];
+              ValNode.Vals[KeyBase + i] := Node.Items[2 * i + 1];
             end;
           end;
         $61: // APPEND 'a'
@@ -1011,6 +1050,22 @@ begin
       end;
     end;
 
+    // ---- flatten a composite checkpoint ---------------------------------
+    // Composite adapters (e.g. IP-Adapter's ip-adapter_sd15.bin) group their
+    // tensors in nested sub-dicts: {'image_proj': {'proj.weight': ...},
+    // 'ip_adapter': {'1.to_k_ip.weight': ...}}. torch joins state_dict name
+    // levels with a dot, so flatten them into that same flat naming.
+    HasNested := false;
+    RootKeysHi := High(Root.Keys);
+    for i := 0 to RootKeysHi do
+      if Root.Vals[i].Kind = pkDict then begin HasNested := true; break; end;
+    if HasNested then
+    begin
+      Node := NewNode(pkDict);
+      FlattenInto(Root, Node, '');
+      Root := Node;
+    end;
+
     // ---- materialize the tensor table from the unpickled state_dict ----
     // Appends to FTensors: with a sharded checkpoint each shard's
     // state_dict contributes its own tensors (duplicate names across
@@ -1048,6 +1103,7 @@ begin
         NumElements := NumElements * Node.Shape[j];
       end;
       FTensors[TensorCnt].Name := Root.Keys[i].StrVal;
+      AddTensorToIndex(TensorCnt);
       FTensors[TensorCnt].Shard := FCurShard;
       FTensors[TensorCnt].DType :=
         DTypeOfStorageClass(Node.StorageDType, ElemSize);
