@@ -193,16 +193,35 @@ procedure _AVX512EncodeF16(dst, src: Pointer; N: integer); inline;
 procedure _AVX2ReluLGateMask(dst, src: Pointer; LowLimit, HighLimit, Slope: Single; N: integer); register; assembler;
 procedure _AVX512ReluLGateMask(dst, src: Pointer; LowLimit, HighLimit, Slope: Single; N: integer); inline;
 
+// Coded by DeepSeek (AI)
+function _AVX2DotProductInt8Int8(dst, src: PShortInt; NumElements: integer): integer; register; assembler;
+function _AVX512DotProductInt8Int8(dst, src: PShortInt; NumElements: integer): integer; inline;
+
+// Coded by DeepSeek (AI)
+function _AVX2DotProductInt4Int8(PtrPacked: PByte; PtrBlockScales: PSingle; PtrB: PShortInt;
+  PtrBlockSum8: PSingle; NumBlocks: integer): Single; register; assembler;
+function _AVX512DotProductInt4Int8(PtrPacked: PByte; PtrBlockScales: PSingle; PtrB: PShortInt;
+  PtrBlockSum8: PSingle; NumBlocks: integer): Single; inline;
+
+// Coded by DeepSeek (AI)
+procedure _AVX2ReluGrad(PtrDst, PtrErr, PtrRaw: Pointer; NumElements: integer); register; assembler;
+procedure _AVX512ReluGrad(PtrDst, PtrErr, PtrRaw: Pointer; NumElements: integer); inline;
+
+// Coded by DeepSeek (AI)
+procedure _AVX2SinCosBoth(pDstSin, pDstCos, pSrc: PSingle; NumElements: integer); register; assembler;
+procedure _AVX512SinCosBoth(pDstSin, pDstCos, pSrc: PSingle; NumElements: integer); inline;
 
 implementation
 
 
 {-----------------------------------------------------------------------------
   AVX2 scalar multiply-add: dst[i] = dst[i] + fact * src[i].
-  Optimized for Win32: processes 16 elements per iteration using 2 YMM blocks
-  due to register constraints (ymm0-ymm7 only).
-  Parameters: EAX=dst, EDX=src, ECX=N, fact at [EBP+8] (stack parameter).
-  Uses FMA instructions (requires AVX2+FMA capable CPU).
+  Win32 calling convention (Delphi inline asm):
+    EAX = dst, EDX = src, ECX = N, [EBP+8] = fact.
+  Bulk: 16 elements per iteration (2 YMM blocks).
+  Tail: one 8-element YMM block, then scalar 0..7.
+  A single vzeroupper at @Exit only; intermediate vzeroupper would clear
+  the upper 128 bits of ymm0 and break the 8-element tail block.
 -----------------------------------------------------------------------------}
 procedure _AVX2MulAddF( dst : PSingle; src : PSingle; N : Integer; const fact : Single);
 asm
@@ -212,52 +231,49 @@ asm
 
   mov edi, eax            // dst pointer
   mov esi, edx            // src pointer
-  mov ecx, ecx            // N (already in ECX)
+  // ecx already holds N
+
   test ecx, ecx
   jle @Exit
 
-  // Broadcast factor to all lanes
-  vbroadcastss ymm0, [ebp+8]   // ymm0 = fact (fact is the 4th parameter, at [EBP+8])
+  // Broadcast fact into all 8 lanes of ymm0
+  vbroadcastss ymm0, [ebp+8]
 
-  // Compute bulk count (multiple of 16) and tail (0..15)
+  // bulk = N - (N mod 16); tail = N mod 16
   mov eax, ecx
-  and eax, 15             // tail = N mod 16
-  mov ebx, eax            // save tail
-  sub ecx, eax            // bulk = N - tail
+  and eax, 15
+  mov ebx, eax            // ebx = tail
+  sub ecx, eax
   mov eax, ecx
   shr eax, 4              // number of 16-element chunks
   jz @Tail
 
-  // ---- Main loop: 16 elements per iteration (2 YMM blocks) ----
 @BulkLoop:
-  // Block 0: elements 0..7
-  vmovups ymm1, [esi]       // src
-  vmovups ymm2, [edi]       // dst
-  vfmadd231ps ymm2, ymm1, ymm0   // dst = dst + src * fact
+  vmovups ymm1, [esi]
+  vmovups ymm2, [edi]
+  vfmadd231ps ymm2, ymm1, ymm0
   vmovups [edi], ymm2
 
-  // Block 1: elements 8..15
   vmovups ymm3, [esi+32]
   vmovups ymm4, [edi+32]
   vfmadd231ps ymm4, ymm3, ymm0
   vmovups [edi+32], ymm4
 
-  add edi, 64             // advance by 16*4 = 64 bytes
+  add edi, 64
   add esi, 64
   dec eax
   jnz @BulkLoop
-
-  vzeroupper
+  // NO vzeroupper here.
 
 @Tail:
-  mov ecx, ebx            // restore tail count (0..15)
+  mov ecx, ebx            // restore tail (0..15)
   test ecx, ecx
   jz @Exit
 
-  // Process 8-element chunks if tail >= 8
   cmp ecx, 8
   jl @ScalarTail
 
+  // 8-element chunk: ymm0 still holds the full 8-lane fact
   vmovups ymm1, [esi]
   vmovups ymm2, [edi]
   vfmadd231ps ymm2, ymm1, ymm0
@@ -265,17 +281,16 @@ asm
   add edi, 32
   add esi, 32
   sub ecx, 8
-  vzeroupper
+  // NO vzeroupper here.
 
 @ScalarTail:
-  // Last 0..7 elements handled one by one
   test ecx, ecx
   jz @Exit
   xor eax, eax
 @ScalarLoop:
   vmovss xmm1, [esi + eax*4]
   vmovss xmm2, [edi + eax*4]
-  vfmadd231ss xmm2, xmm1, xmm0   // scalar FMA
+  vfmadd231ss xmm2, xmm1, xmm0
   vmovss [edi + eax*4], xmm2
   inc eax
   cmp eax, ecx
@@ -3554,6 +3569,12 @@ end;
   AVX2 exp-shift-sum: dst[i] = exp(src[i] - Shift), returns sum of dst.
   Bulk: 8 elements per loop. Tail: scalar.
   Parameters: EAX=dst, EDX=src, ECX=N, [EBP+8]=Shift (compiler-provided EBP).
+
+  Minimal fix vs the previous version: the four constants
+  xmm0/xmm1/xmm2/xmm3 are loaded INSIDE @TailLoop instead of once before
+  it. The polynomial body overwrites those registers on every iteration,
+  so pre-loop loading made every tail element after the first use stale
+  values. Only exposed when tail > 1 (N=257/256 tests never hit it).
 -----------------------------------------------------------------------------}
 function _AVX2ExpShiftSum(dst: PSingle; src: PSingle; Shift: Single; N: Integer): Single;
 asm
@@ -3592,7 +3613,7 @@ asm
   vbroadcastss ymm2, dword ptr [cAVXLog2e]    // log2(e)
   vbroadcastss ymm3, dword ptr [cAVXLn2]      // ln(2)
   vpbroadcastd ymm4, dword ptr [cAVXExp127]   // 127
-  vbroadcastss ymm5, dword ptr [ebp+8]   // reload Shift
+  vbroadcastss ymm5, dword ptr [ebp+8]        // reload Shift
 
   // Load source and subtract shift
   vmovups ymm7, [esi]
@@ -3607,7 +3628,6 @@ asm
   vmulps  ymm2, ymm0, ymm3       // ymm2 = g = f * ln2
 
   // Polynomial: 2^f = P6*g^6 + ... + P0
-  // Use ymm3 as accumulator, ymm0 as temp
   vbroadcastss ymm3, dword ptr [cAVXExpP6]
   vbroadcastss ymm0, dword ptr [cAVXExpP5]
   vfmadd213ps ymm3, ymm2, ymm0
@@ -3630,13 +3650,12 @@ asm
   vmulps ymm7, ymm3, ymm1
   vmovups [edi], ymm7
 
-  // Accumulate into ymm6 (ymm6 is never overwritten in the loop)
+  // Accumulate into ymm6 (never overwritten in the loop)
   vaddps ymm6, ymm6, ymm7
 
   add esi, 32
   add edi, 32
   dec ecx
-
   jnz @BulkLoop
 
 @TailBulkDone:
@@ -3653,12 +3672,10 @@ asm
   jz @Done
 
   // ---------- Tail (0..7) scalar ----------
-  vbroadcastss xmm0, dword ptr [cAVXExpHi]
-  vbroadcastss xmm1, dword ptr [cAVXExpLo]
-  vbroadcastss xmm2, dword ptr [cAVXLog2e]
-  vbroadcastss xmm3, dword ptr [cAVXLn2]
+  // xmm0/xmm1/xmm2/xmm3 are loaded inside @TailLoop, NOT here: the
+  // polynomial body overwrites them each iteration.
   vmovd xmm4, [cAVXExp127]          // use xmm4 for scalar 127
-  vpbroadcastd xmm4, xmm4           // broadcast to all lanes of xmm4 (for consistency)
+  vpbroadcastd xmm4, xmm4
 
   lea ebx, [ebp+8]
   vbroadcastss xmm5, [ebx]
@@ -3667,6 +3684,14 @@ asm
   vxorps xmm6, xmm6, xmm6      // tail sum
 
 @TailLoop:
+  // Reload constants on EVERY iteration. The polynomial body overwrites
+  // xmm0/xmm1/xmm2/xmm3, so loading them once before the loop would make
+  // every iteration after the first use stale values.
+  vbroadcastss xmm0, dword ptr [cAVXExpHi]
+  vbroadcastss xmm1, dword ptr [cAVXExpLo]
+  vbroadcastss xmm2, dword ptr [cAVXLog2e]
+  vbroadcastss xmm3, dword ptr [cAVXLn2]
+
   vmovss xmm7, [esi + ecx*4]
   vsubss xmm7, xmm7, xmm5
   vminss xmm7, xmm7, xmm0
@@ -3675,7 +3700,6 @@ asm
   vmulss xmm0, xmm7, xmm2
   vroundss xmm1, xmm0, xmm0, 0
   vsubss xmm0, xmm0, xmm1
-
   vmulss xmm2, xmm0, xmm3
 
   vmovss xmm3, dword ptr [cAVXExpP6]
@@ -3720,7 +3744,6 @@ asm
   pop ebx
   pop edi
   pop esi
-
 end;
 
 function _AVX512ExpShiftSum( dst : PSingle; src : PSingle; Shift : single; N : integer ) : single;
@@ -4626,5 +4649,573 @@ begin
   _AVX2ReluLGateMask(dst, src, LowLimit, HighLimit, Slope, N);
 end;
 
+{-----------------------------------------------------------------------------
+  AVX2 dot product for Int8 x Int8, 32 elements per iteration.
+
+  Win32 register convention:
+    EAX = dst : PShortInt
+    EDX = src : PShortInt
+    ECX = NumElements : Integer
+  Return value in EAX (Integer).
+-----------------------------------------------------------------------------}
+function _AVX2DotProductInt8Int8(dst, src: PShortInt; NumElements: integer): integer; register; assembler;
+asm
+  push ebx
+  push esi
+  push edi
+
+  xor edi, edi           // edi = result accumulator
+
+  test ecx, ecx
+  jle @Done
+
+  mov esi, eax           // esi = dst (advancing)
+  // edx = src (advancing)
+  // ecx = NumElements
+
+  mov eax, ecx
+  and eax, 31            // eax = tail count (0..31)
+  sub ecx, eax           // ecx = bulk count (multiple of 32)
+
+  vpxor ymm0, ymm0, ymm0
+  vpcmpeqw ymm1, ymm1, ymm1
+  vpsrlw ymm1, ymm1, 15  // ymm1 = all int16 1
+
+  test ecx, ecx
+  jz @TailEntry
+
+  shr ecx, 5             // number of 32-element blocks
+
+@Loop:
+  vmovdqu ymm2, [esi]
+  vmovdqu ymm3, [edx]
+  vpsignb ymm3, ymm3, ymm2
+  vpabsb ymm2, ymm2
+  vpmaddubsw ymm2, ymm2, ymm3
+  vpmaddwd ymm2, ymm2, ymm1
+  vpaddd ymm0, ymm0, ymm2
+  add esi, 32
+  add edx, 32
+  dec ecx
+  jnz @Loop
+
+  // Horizontal reduction of ymm0 -> edi
+  vextracti128 xmm2, ymm0, 1
+  vpaddd xmm0, xmm0, xmm2
+  vpshufd xmm2, xmm0, $4E
+  vpaddd xmm0, xmm0, xmm2
+  vpshufd xmm2, xmm0, $B1
+  vpaddd xmm0, xmm0, xmm2
+  vmovd edi, xmm0
+
+@TailEntry:
+  test eax, eax
+  jz @Done
+
+@TailLoop:
+  movsx ebx, byte ptr [esi]
+  movsx ecx, byte ptr [edx]
+  imul ebx, ecx
+  add edi, ebx
+  inc esi
+  inc edx
+  dec eax
+  jnz @TailLoop
+
+@Done:
+  mov eax, edi
+  vzeroupper
+  pop edi
+  pop esi
+  pop ebx
+end;
+
+function _AVX512DotProductInt8Int8(dst, src: PShortInt; NumElements: integer): integer; inline;
+begin
+  Result := _AVX2DotProductInt8Int8(dst, src, NumElements);
+end;
+
+{-----------------------------------------------------------------------------
+  AVX2 Int4 x Int8 block dot product, two 32-element blocks per iteration.
+
+  Win32 register convention:
+    EAX = PtrPacked      : PByte
+    EDX = PtrBlockScales : PSingle
+    ECX = PtrB           : PShortInt
+    [EBP+12]  = PtrBlockSum8 : PSingle
+    [EBP+8] = NumBlocks    : Integer
+
+  Return value in ST(0) (Single).
+-----------------------------------------------------------------------------}
+function _AVX2DotProductInt4Int8(PtrPacked: PByte; PtrBlockScales: PSingle;
+  PtrB: PShortInt; PtrBlockSum8: PSingle; NumBlocks: integer): Single; register; assembler;
+asm
+  push ebx
+  push esi
+  push edi
+  sub esp, 16
+
+  mov [esp], edx         // save original PtrBlockScales
+
+  mov ebx, [ebp+8]      // ebx = NumBlocks
+  test ebx, ebx
+  jle @ZeroResult
+
+  // EAX = PtrPacked (advancing)
+  // EDX = PtrBlockScales (advancing)
+  // ECX = PtrB (advancing)
+  // EBX = NumBlocks
+  // ESI = PtrBlockSum8
+  // EDI = counter / temp
+
+  // Setup vector constants
+  vxorps ymm0, ymm0, ymm0
+  vxorps ymm1, ymm1, ymm1
+
+  vpcmpeqw ymm7, ymm7, ymm7
+  vpsrlw ymm7, ymm7, 15       // words = 1
+
+  vpcmpeqw ymm5, ymm5, ymm5
+  vpsrlw ymm5, ymm5, 12
+  vpackuswb ymm5, ymm5, ymm5  // bytes = 0x0F (nibble mask)
+
+  vpcmpeqd ymm6, ymm6, ymm6
+  vpsrld ymm6, ymm6, 31       // dwords = 1
+  vperm2i128 ymm6, ymm1, ymm6, $20  // [0 0 0 0 | 1 1 1 1]
+
+  // Pairs loop
+  mov edi, ebx
+  shr edi, 1
+  test edi, edi
+  jz @PairsDone
+
+@PairLoop:
+  vmovdqu ymm2, [eax]
+  vpsrlw ymm3, ymm2, 4
+  vpand ymm2, ymm2, ymm5
+  vpand ymm3, ymm3, ymm5
+  vmovdqu ymm4, [ecx]
+  vpmaddubsw ymm2, ymm2, ymm4
+  vmovdqu ymm4, [ecx+32]
+  vpmaddubsw ymm3, ymm3, ymm4
+  vpaddw ymm2, ymm2, ymm3
+  vpmaddwd ymm2, ymm2, ymm7
+  vcvtdq2ps ymm2, ymm2
+  vmovsd xmm4, [edx]
+  vpermps ymm4, ymm6, ymm4
+  vfmadd231ps ymm0, ymm2, ymm4
+  add eax, 32
+  add ecx, 64
+  add edx, 8
+  dec edi
+  jnz @PairLoop
+
+@PairsDone:
+  test ebx, 1
+  jz @Correction
+
+  vmovdqu xmm2, [eax]
+  vpsrlw xmm3, xmm2, 4
+  vinserti128 ymm2, ymm2, xmm3, 1
+  vpand ymm2, ymm2, ymm5
+  vmovdqu ymm4, [ecx]
+  vpmaddubsw ymm2, ymm2, ymm4
+  vpmaddwd ymm2, ymm2, ymm7
+  vcvtdq2ps ymm2, ymm2
+  vbroadcastss ymm4, [edx]
+  vfmadd231ps ymm1, ymm2, ymm4
+
+@Correction:
+  mov esi, [ebp+12]       // PtrBlockSum8
+  mov edi, ebx
+  shr edi, 3             // NumOctets
+  test edi, edi
+  jz @Reduce
+
+  mov eax, [esp]         // original PtrBlockScales
+
+@CorrLoop:
+  vmovups ymm2, [eax]
+  vmovups ymm3, [esi]
+  vfnmadd231ps ymm1, ymm2, ymm3
+  add eax, 32
+  add esi, 32
+  dec edi
+  jnz @CorrLoop
+
+@Reduce:
+  vaddps ymm0, ymm0, ymm1
+  vextractf128 xmm2, ymm0, 1
+  vaddps xmm0, xmm0, xmm2
+  vhaddps xmm0, xmm0, xmm0
+  vhaddps xmm0, xmm0, xmm0
+
+  // Scalar tail correction
+  mov edi, ebx
+  shr edi, 3
+  shl edi, 3             // edi = NumOctets * 8
+  cmp edi, ebx
+  jge @StoreResult
+
+  mov eax, [esp]         // original PtrBlockScales
+  mov esi, [ebp+12]       // PtrBlockSum8
+  lea eax, [eax + edi*4]
+  lea esi, [esi + edi*4]
+  sub ebx, edi
+  mov edi, ebx
+
+@ScalarTail:
+  vmovss xmm2, [eax]
+  vmulss xmm2, xmm2, [esi]
+  vsubss xmm0, xmm0, xmm2
+  add eax, 4
+  add esi, 4
+  dec edi
+  jnz @ScalarTail
+
+@StoreResult:
+  vmovss [esp+12], xmm0
+  fld dword ptr [esp+12]
+  jmp @Exit
+
+@ZeroResult:
+  fldz
+
+@Exit:
+  vzeroupper
+  add esp, 16
+  pop edi
+  pop esi
+  pop ebx
+end;
+
+function _AVX512DotProductInt4Int8(PtrPacked: PByte; PtrBlockScales: PSingle; PtrB: PShortInt;
+  PtrBlockSum8: PSingle; NumBlocks: integer): Single; inline;
+begin
+  Result := _AVX2DotProductInt4Int8(PtrPacked, PtrBlockScales, PtrB, PtrBlockSum8, NumBlocks);
+end;
+
+{-----------------------------------------------------------------------------
+  AVX2 ReLU backward masked select:
+    dst[i] := err[i]  where raw[i] > 0, else 0.0
+
+  Win32 register convention:
+    EAX = PtrDst      : Pointer
+    EDX = PtrErr      : Pointer
+    ECX = PtrRaw      : Pointer
+    [EBP+8] = NumElements : Integer
+-----------------------------------------------------------------------------}
+procedure _AVX2ReluGrad(PtrDst, PtrErr, PtrRaw: Pointer; NumElements: integer); register; assembler;
+asm
+  push ebx
+  push esi
+  push edi
+
+  mov ebx, [ebp+8]       // ebx = NumElements
+  test ebx, ebx
+  jle @Done
+
+  vxorps ymm3, ymm3, ymm3
+
+  mov esi, ebx
+  and esi, 7             // tail count
+  mov edi, ebx
+  and edi, $FFFFFFF8     // localNumElements (multiple of 8)
+
+  test edi, edi
+  jz @TailSetup
+
+  // 32-element loop
+  mov edi, edi
+  shr edi, 5
+  test edi, edi
+  jz @SmallLoop
+
+@LargeLoop:
+  vmovups ymm0, [ecx]
+  vmovups ymm1, [ecx+32]
+  vmovups ymm4, [ecx+64]
+  vmovups ymm5, [ecx+96]
+  vcmpps ymm0, ymm0, ymm3, 14
+  vcmpps ymm1, ymm1, ymm3, 14
+  vcmpps ymm4, ymm4, ymm3, 14
+  vcmpps ymm5, ymm5, ymm3, 14
+  vandps ymm0, ymm0, [edx]
+  vandps ymm1, ymm1, [edx+32]
+  vandps ymm4, ymm4, [edx+64]
+  vandps ymm5, ymm5, [edx+96]
+  vmovups [eax], ymm0
+  vmovups [eax+32], ymm1
+  vmovups [eax+64], ymm4
+  vmovups [eax+96], ymm5
+  add ecx, 128
+  add edx, 128
+  add eax, 128
+  dec edi
+  jnz @LargeLoop
+
+@SmallLoop:
+  // 8-element loop for remaining 8..31 elements
+  mov edi, ebx
+  and edi, $FFFFFFF8
+  and edi, $1F
+  shr edi, 3
+  test edi, edi
+  jz @TailSetup
+
+@SmallLoopBody:
+  vmovups ymm0, [ecx]
+  vcmpps ymm0, ymm0, ymm3, 14
+  vandps ymm0, ymm0, [edx]
+  vmovups [eax], ymm0
+  add ecx, 32
+  add edx, 32
+  add eax, 32
+  dec edi
+  jnz @SmallLoopBody
+
+@TailSetup:
+  vzeroupper
+  test esi, esi
+  jz @Done
+  mov edi, esi
+
+@TailLoop:
+  vmovss xmm0, [ecx]
+  vxorps xmm1, xmm1, xmm1
+  vucomiss xmm0, xmm1
+  jbe @TailZero
+  vmovss xmm2, [edx]
+  vmovss [eax], xmm2
+  jmp @TailNext
+@TailZero:
+  vmovss [eax], xmm1
+@TailNext:
+  add ecx, 4
+  add edx, 4
+  add eax, 4
+  dec edi
+  jnz @TailLoop
+
+@Done:
+  vzeroupper
+  pop edi
+  pop esi
+  pop ebx
+end;
+
+procedure _AVX512ReluGrad(PtrDst, PtrErr, PtrRaw: Pointer; NumElements: integer); inline;
+begin
+  _AVX2ReluGrad(PtrDst, PtrErr, PtrRaw, NumElements);
+end;
+
+{-----------------------------------------------------------------------------
+  AVXSinCosBoth: sin and cos of the same src in one pass.
+  Win32 register convention:
+    EAX = pDstSin     : PSingle
+    EDX = pDstCos     : PSingle
+    ECX = pSrc        : PSingle
+    [EBP+8] = NumElements : Integer
+
+  Only YMM0-YMM7 available on Win32. All volatile, no save/restore.
+  Scalar constant memory references use dword ptr to disambiguate size.
+-----------------------------------------------------------------------------}
+procedure _AVX2SinCosBoth(pDstSin, pDstCos, pSrc: PSingle; NumElements: integer); register; assembler;
+asm
+  push ebx
+  push esi
+  push edi
+  sub esp, 8             // [esp] = j, [esp+4] = sign_x
+
+  mov ebx, [ebp+8]       // ebx = NumElements
+  test ebx, ebx
+  jle @ExitCleanup
+
+  mov esi, ebx
+  and esi, 7             // tail count
+  mov edi, ebx
+  shr edi, 3             // 8-element iterations
+
+  test edi, edi
+  jz @TailEntry
+
+  // Constants kept in registers (Win32: volatile)
+  vmovups ymm6, [cAVXSC_4i]
+  vmovups ymm7, [cAVXSC_2i]
+
+@VectorLoop:
+  vmovups ymm0, [ecx]                          // x
+  vmovups ymm3, [cAVXSinCosSignMask]
+  vandps ymm3, ymm3, ymm0                      // sign_x
+  vandps ymm1, ymm0, [cAVXArgAbsMask]          // |x|
+  vmulps ymm2, ymm1, [cAVXSC_FOPI]
+  vcvttps2dq ymm4, ymm2                        // j
+  vmovups ymm0, [cAVXSC_1i]
+  vpaddd ymm4, ymm4, ymm0
+  vmovups ymm0, [cAVXSC_NOT1i]
+  vpand ymm4, ymm4, ymm0
+  vcvtdq2ps ymm0, ymm4
+  vfmadd231ps ymm1, ymm0, [cAVXSC_DP1]
+  vfmadd231ps ymm1, ymm0, [cAVXSC_DP2]
+  vfmadd231ps ymm1, ymm0, [cAVXSC_DP3]
+  vmulps ymm2, ymm1, ymm1
+
+  // sin candidate -> YMM5
+  vbroadcastss ymm5, dword ptr [cAVXSinP3]
+  vbroadcastss ymm0, dword ptr [cAVXSinP2]
+  vfmadd213ps ymm5, ymm2, ymm0
+  vbroadcastss ymm0, dword ptr [cAVXSinP1]
+  vfmadd213ps ymm5, ymm2, ymm0
+  vmulps ymm5, ymm5, ymm2
+  vmulps ymm5, ymm5, ymm1
+  vaddps ymm5, ymm5, ymm1
+
+  // cos candidate -> YMM0
+  vmovups ymm0, [cAVXSC_CosP0]
+  vbroadcastss ymm1, dword ptr [cAVXCosQ2]
+  vfmadd213ps ymm0, ymm2, ymm1
+  vbroadcastss ymm1, dword ptr [cAVXCosQ1]
+  vfmadd213ps ymm0, ymm2, ymm1
+  vmulps ymm0, ymm0, ymm2
+  vmulps ymm0, ymm0, ymm2
+  vbroadcastss ymm1, dword ptr [cAVXSC_Half]
+  vmulps ymm1, ymm2, ymm1
+  vsubps ymm0, ymm0, ymm1
+  vbroadcastss ymm1, dword ptr [cAVX8SSOne]
+  vaddps ymm0, ymm0, ymm1
+
+  // sin(x)
+  vpand ymm1, ymm4, ymm6
+  vpslld ymm1, ymm1, 29
+  vxorps ymm1, ymm1, ymm3
+  vpand ymm2, ymm4, ymm7
+  vpcmpeqd ymm2, ymm2, ymm7
+  vblendvps ymm2, ymm5, ymm0, ymm2
+  vxorps ymm2, ymm2, ymm1
+  vmovups [eax], ymm2
+
+  // cos(x)
+  vpsubd ymm4, ymm4, ymm7
+  vpandn ymm1, ymm4, ymm6
+  vpslld ymm1, ymm1, 29
+  vpand ymm2, ymm4, ymm7
+  vpcmpeqd ymm2, ymm2, ymm7
+  vblendvps ymm2, ymm5, ymm0, ymm2
+  vxorps ymm2, ymm2, ymm1
+  vmovups [edx], ymm2
+
+  add ecx, 32
+  add eax, 32
+  add edx, 32
+  dec edi
+  jnz @VectorLoop
+
+@TailEntry:
+  test esi, esi
+  jz @ExitCleanup
+  mov edi, esi
+  vbroadcastss xmm7, dword ptr [cAVXSC_FOPI]     // xmm7 = 4/pi, KEEP IT
+
+@TailLoop:
+  vmovss xmm0, [ecx]
+  vmovd esi, xmm0
+  mov ebx, esi
+  and ebx, $80000000
+  mov [esp+4], ebx
+  and esi, $7FFFFFFF
+  vmovd xmm1, esi
+
+  vmulss xmm2, xmm1, xmm7      // uses 4/pi (xmm7 preserved)
+  vcvttss2si esi, xmm2
+  add esi, 1
+  and esi, -2
+  mov [esp], esi
+  vcvtsi2ss xmm2, xmm2, esi
+
+  vmovss xmm3, dword ptr [cAVXSC_DP1]
+  vfmadd231ss xmm1, xmm2, xmm3
+  vmovss xmm3, dword ptr [cAVXSC_DP2]
+  vfmadd231ss xmm1, xmm2, xmm3
+  vmovss xmm3, dword ptr [cAVXSC_DP3]
+  vfmadd231ss xmm1, xmm2, xmm3
+  vmulss xmm4, xmm1, xmm1
+
+  // cos candidate -> xmm5
+  vmovss xmm5, dword ptr [cAVXSC_CosP0]
+  vmovss xmm6, dword ptr [cAVXCosQ2]
+  vfmadd213ss xmm5, xmm4, xmm6
+  vmovss xmm6, dword ptr [cAVXCosQ1]
+  vfmadd213ss xmm5, xmm4, xmm6
+  vmulss xmm5, xmm5, xmm4
+  vmulss xmm5, xmm5, xmm4
+  vmovss xmm6, dword ptr [cAVXSC_Half]
+  vmulss xmm6, xmm4, xmm6
+  vsubss xmm5, xmm5, xmm6
+  vmovss xmm6, dword ptr [cAVX8SSOne]
+  vaddss xmm5, xmm5, xmm6
+
+  // sin candidate -> xmm6 (uses xmm3, NOT xmm7)
+  vmovss xmm6, dword ptr [cAVXSinP3]
+  vmovss xmm3, dword ptr [cAVXSinP2]           // was xmm7 -> now xmm3
+  vfmadd213ss xmm6, xmm4, xmm3
+  vmovss xmm3, dword ptr [cAVXSinP1]           // was xmm7 -> now xmm3
+  vfmadd213ss xmm6, xmm4, xmm3
+  vmulss xmm6, xmm6, xmm4
+  vmulss xmm6, xmm6, xmm1
+  vaddss xmm6, xmm6, xmm1
+
+  // sin(x)
+  mov esi, [esp]
+  mov ebx, esi
+  and ebx, 4
+  shl ebx, 29
+  xor ebx, [esp+4]
+  test esi, 2
+  jz @SinUseSin
+  vmovaps xmm0, xmm5
+  jmp @SinApplySign
+@SinUseSin:
+  vmovaps xmm0, xmm6
+@SinApplySign:
+  vmovd xmm3, ebx                              // was xmm7 -> now xmm3
+  vxorps xmm0, xmm0, xmm3
+  vmovss [eax], xmm0
+
+  // cos(x)
+  mov esi, [esp]
+  sub esi, 2
+  mov ebx, esi
+  not ebx
+  and ebx, 4
+  shl ebx, 29
+  test esi, 2
+  jz @CosUseSin
+  vmovaps xmm0, xmm5
+  jmp @CosApplySign
+@CosUseSin:
+  vmovaps xmm0, xmm6
+@CosApplySign:
+  vmovd xmm3, ebx                              // was xmm7 -> now xmm3
+  vxorps xmm0, xmm0, xmm3
+  vmovss [edx], xmm0
+
+  add ecx, 4
+  add eax, 4
+  add edx, 4
+  dec edi
+  jnz @TailLoop
+
+@ExitCleanup:
+  vzeroupper
+  add esp, 8
+  pop edi
+  pop esi
+  pop ebx
+end;
+
+procedure _AVX512SinCosBoth(pDstSin, pDstCos, pSrc: PSingle; NumElements: integer); inline;
+begin
+  _AVX2SinCosBoth(pDstSin, pDstCos, pSrc, NumElements);
+end;
 
 end.

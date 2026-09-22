@@ -55,12 +55,21 @@ procedure _AVXEncodeBF16( dst: PSingle; src : PSingle; N : integer ); inline;
 procedure _AVXReluL(dst, src: Pointer; LowLimit, HighLimit, Slope: Single; N: integer); inline;
 procedure _AVXEncodeF16(dst, src: Pointer; N: integer); inline;
 procedure _AVXReluLGateMask(dst, src: Pointer; LowLimit, HighLimit, Slope: Single; N: integer); inline;
-
+function _AVXDotProductInt8Int8(dst, src: PShortInt; NumElements: integer): integer; inline;
+function _AVXDotProductInt4Int8(PtrPacked: PByte; PtrBlockScales: PSingle; PtrB: PShortInt;
+  PtrBlockSum8: PSingle; NumBlocks: integer): Single; inline;
+procedure _AVXReluGrad(PtrDst, PtrErr, PtrRaw: Pointer; NumElements: integer); inline;
+procedure _AVXSinCosBoth(pDstSin, pDstCos, pSrc: PSingle; NumElements: integer); inline;
 
 implementation
 
 uses
   SysUtils, Math;
+
+{.$DEFINE TRACE}
+
+
+{$POINTERMATH ON}
 
 {-----------------------------------------------------------------------------
   _AVXFillMem: dst[i] := FillOp for i = 0..NumElements-1.
@@ -70,6 +79,16 @@ procedure _AVXFillMem( dst : PSingle; FillOp : Single; NumElements : Integer );
 var
   localNumElements, MissedElements: Integer;
 begin
+  {$IFDEF TRACE}
+  localNumElements := 0;
+  while localNumElements < NumElements do
+  begin
+    dst[localNumElements] := FillOp;
+    Inc(localNumElements);
+  end;
+  Exit;
+  {$ENDIF}
+
   MissedElements := NumElements and 3;
   localNumElements := NumElements xor MissedElements;
 
@@ -82,8 +101,6 @@ begin
     {$ENDIF}
   end;
 
-  {$PUSHOPT}
-    {$POINTERMATH ON}
   if MissedElements > 0 then
   begin
     dst[localNumElements] := FillOp;
@@ -94,11 +111,16 @@ begin
         dst[localNumElements + 2] := FillOp;
     end;
   end;
-  {$POPOPT}
 end;
 
 procedure _AVXMulMulAdd( dst : PSingle; src : PSingle; N : Integer; const mulOp1, mulOp2 : Single );
 begin
+  {$IFDEF TRACE}
+  for var i := 0 to N - 1 do
+    dst[i] := dst[i] * mulOp1 + src[i] * mulOp2;
+  Exit;
+  {$ENDIF}
+
   {$IFDEF AVX64}
   _AVX512MulMulAdd(dst, src, N, mulOp1, mulOp2);
   {$ELSE}
@@ -126,6 +148,12 @@ end;
 
 procedure _AVXMulF( dst : PSingle; N : Integer; const factor : Single );
 begin
+  {$IFDEF TRACE}
+  for var i := 0 to N - 1 do
+    dst[i] := dst[i] * factor;
+  Exit;
+  {$ENDIF}
+
   {$IFDEF AVX64}
   _AVX512MulF(dst, N, factor);
   {$ELSE}
@@ -144,6 +172,12 @@ end;
 
 procedure _AVXAdd( dst : PSingle; src : PSingle; N : Integer );
 begin
+  {$IFDEF TRACE}
+  for var i := 0 to N - 1 do
+    dst[i] := dst[i] + src[i];
+  Exit;
+  {$ENDIF}
+
   {$IFDEF AVX64}
   _AVX512Add(dst, src, N);
   {$ELSE}
@@ -189,6 +223,13 @@ end;
 
 function _AVXGetSum( src : PSingle; N : Integer ) : Single;
 begin
+  {$IFDEF TRACE}
+  Result := 0;
+  for var i := 0 to N - 1 do
+    Result := Result + src[i];
+  Exit;
+  {$ENDIF}
+
   {$IFDEF AVX64}
   Result := _AVX512GetSum(src, N);
   {$ELSE}
@@ -198,6 +239,13 @@ end;
 
 function _AVXGetSumSqr( src : PSingle; N : Integer ) : Single;
 begin
+  {$IFDEF TRACE}
+  Result := 0;
+  for var i := 0 to N - 1 do
+    Result := Result + src[i] * src[i];
+  Exit;
+  {$ENDIF}
+
   {$IFDEF AVX64}
   Result := _AVX512GetSumSqr(src, N);
   {$ELSE}
@@ -216,6 +264,13 @@ end;
 
 function _AVXDotProd( dst : PSingle; src : PSingle; N : Integer ) : Single;
 begin
+  {$IFDEF TRACE}
+  Result := 0;
+  for var i := 0 to N - 1 do
+    Result := Result + dst[i] * src[i];
+  Exit;
+  {$ENDIF}
+
   {$IFDEF AVX64}
   Result := _AVX512DotProd(dst, src, N);
   {$ELSE}
@@ -225,6 +280,12 @@ end;
 
 procedure _AVXMulAddF( dst : PSingle; src : PSingle; N : Integer; const fact : Single );
 begin
+  {$IFDEF TRACE}
+  for var i := 0 to N - 1 do
+    dst[i] := dst[i] * src[i] + fact;
+  Exit;
+  {$ENDIF}
+
   {$IFDEF AVX64}
   _AVX512MulAddF(dst, src, N, fact);
   {$ELSE}
@@ -335,6 +396,34 @@ procedure _AVXAdamDelta( PtrDelta, PtrM, PtrV : PSingle;
   Beta1, OmBeta1, Beta2, OmBeta2, InvOmB2D, Epsilon, kLR : Single;
   NumElements : Integer ); inline;
 begin
+  {$IFDEF TRACE}
+  if NumElements <= 0 then exit;
+
+  var I: integer;
+  var g, m, v, t1, t2: Single;
+
+  for I := 0 to NumElements - 1 do
+  begin
+    g  := PtrDelta[I];
+    t1 := Beta1 * PtrM[I];
+    t2 := OmBeta1 * g;
+    m  := t1 + t2;
+    t1 := g * g;
+    t2 := OmBeta2 * t1;
+    t1 := Beta2 * PtrV[I];
+    v  := t2 + t1;
+    PtrM[I] := m;
+    PtrV[I] := v;
+    t1 := v * InvOmB2D;
+    t1 := Sqrt(t1);
+    t1 := t1 + Epsilon;
+    t2 := kLR * m;
+    PtrDelta[I] := t2 / t1;
+  end;
+  Exit;
+  {$ENDIF}
+
+
   {$IFDEF AVX64}
   _AVX512AdamDelta(PtrDelta, PtrM, PtrV, Beta1, OmBeta1, Beta2, OmBeta2, InvOmB2D, Epsilon, kLR, NumElements);
   {$ELSE}
@@ -371,6 +460,20 @@ end;
 
 function _AVXGetMaxPos( PtrA : PSingle; NumElements : Integer; out Position : integer ) : Single;
 begin
+  {$IFDEF TRACE}
+  Position := 0;
+  Result := PtrA[0];
+  for var i := 1 to NumElements - 1 do
+  begin
+    if PtrA[i] > Result then
+    begin
+      Result := PtrA[i];
+      Position := i;
+    end;
+  end;
+  Exit;
+  {$ENDIF}
+
   {$IFDEF AVX64}
   Result := _AVX512GetMaxPos(PtrA, NumElements, Position);
   {$ELSE}
@@ -380,6 +483,20 @@ end;
 
 function _AVXGetMinPos( PtrA : PSingle; NumElements : Integer; out Position : Integer ) : Single; inline;
 begin
+  {$IFDEF TRACE}
+  Position := 0;
+  Result := PtrA[0];
+  for var i := 1 to NumElements - 1 do
+  begin
+    if PtrA[i] < Result then
+    begin
+      Result := PtrA[i];
+      Position := i;
+    end;
+  end;
+  Exit;
+  {$ENDIF}
+
   {$IFDEF AVX64}
   Result := _AVX512GetMinPos(PtrA, NumElements, Position);
   {$ELSE}
@@ -465,6 +582,43 @@ begin
   _AVX512ReluLGateMask(dst, src, LowLimit, HighLimit, Slope, N);
   {$ELSE}
   _AVX2ReluLGateMask(dst, src, LowLimit, HighLimit, Slope, N);
+  {$ENDIF}
+end;
+
+function _AVXDotProductInt8Int8(dst, src: PShortInt; NumElements: integer): integer; inline;
+begin
+  {$IFDEF AVX64}
+  Result := _AVX512DotProductInt8Int8(dst, src, NumElements);
+  {$ELSE}
+  Result := _AVX2DotProductInt8Int8(dst, src, NumElements);
+  {$ENDIF}
+end;
+
+function _AVXDotProductInt4Int8(PtrPacked: PByte; PtrBlockScales: PSingle; PtrB: PShortInt;
+  PtrBlockSum8: PSingle; NumBlocks: integer): Single; inline;
+begin
+  {$IFDEF AVX64}
+  Result := _AVX512DotProductInt4Int8(PtrPacked, PtrBlockScales, PtrB, PtrBlockSum8, NumBlocks);
+  {$ELSE}
+  Result := _AVX2DotProductInt4Int8(PtrPacked, PtrBlockScales, PtrB, PtrBlockSum8, NumBlocks);
+  {$ENDIF}
+end;
+
+procedure _AVXReluGrad(PtrDst, PtrErr, PtrRaw: Pointer; NumElements: integer); inline;
+begin
+  {$IFDEF AVX64}
+  _AVX512ReluGrad(PtrDst, PtrErr, PtrRaw, NumElements);
+  {$ELSE}
+  _AVX2ReluGrad(PtrDst, PtrErr, PtrRaw, NumElements);
+  {$ENDIF}
+end;
+
+procedure _AVXSinCosBoth(pDstSin, pDstCos, pSrc: PSingle; NumElements: integer); register; assembler;
+begin
+  {$IFDEF AVX64}
+  _AVX512SinCosBoth(pDstSin, pDstCos, pSrc, NumElements);
+  {$ELSE}
+  _AVX2SinCosBoth(pDstSin, pDstCos, pSrc, NumElements);
   {$ENDIF}
 end;
 

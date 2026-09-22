@@ -2141,6 +2141,11 @@ end;
 // sum never saturates while codes stay in [-127, 127]. Coded by Claude (AI).
 function AVXDotProductInt8Int8(PtrA, PtrB: TNeuralInt8ArrPtr;
   NumElements: integer): integer;
+{$IFNDEF FPC}
+begin
+  Result := _AVXDotProductInt8Int8(PShortInt(PtrA), PShortInt(PtrB), NumElements);
+end;
+{$ELSE}
 var
   vRes: integer;
   localNumElements, MissedElements, I, MaxTailPos: integer;
@@ -2194,6 +2199,7 @@ begin
       Result := Result + PtrA^[I] * PtrB^[I];
   end;
 end;
+{$ENDIF FPC}
 
 // Int4 x int8 block dot product. Two blocks per iteration: one 32-byte load
 // unpacks (mask only) into [lo nibbles of both blocks | hi nibbles of both
@@ -2206,6 +2212,11 @@ end;
 function AVXDotProductInt4Int8(PtrPacked: TNeuralByteArrPtr;
   PtrBlockScales: TNeuralFloatArrPtr; PtrB: TNeuralInt8ArrPtr;
   PtrBlockSum8: TNeuralFloatArrPtr; NumBlocks: integer): Single;
+{$IFNDEF FPC}
+begin
+  Result := _AVXDotProductInt4Int8(PByte(PtrPacked), PSingle(PtrBlockScales), PShortInt(PtrB), PSingle(PtrBlockSum8), NumBlocks);
+end;
+{$ELSE}
 var
   vRes: Single;
   NumPairs, OddBlock, NumOctets, BlockIdx: integer;
@@ -2298,6 +2309,7 @@ begin
   for BlockIdx := NumOctets * 8 to NumBlocks - 1 do
     Result := Result - PtrBlockScales^[BlockIdx] * PtrBlockSum8^[BlockIdx];
 end;
+{$ENDIF FPC}
 
 // Fused int8 axpy PtrA[i] += W * PtrCodes[i]: AVXDotProductInt8's byte->float
 // front end (vpmovsxbd + vcvtdq2ps, the codes stream at 1 byte/element and the
@@ -2506,7 +2518,7 @@ function AVXMaxAbsFinite(PtrA: TNeuralFloatArrPtr;
   NumElements: integer): Single;
 {$IFNDEF FPC}
 begin
-  _AVXMaxAbsFinite(PSingle(PtrA), NumElements);
+  Result := _AVXMaxAbsFinite(PSingle(PtrA), NumElements);
 end;
 {$ELSE}
 var
@@ -3120,6 +3132,11 @@ end;
 // Coded by Claude (AI).
 procedure AVXReluGrad(PtrDst, PtrErr, PtrRaw: TNeuralFloatArrPtr;
   NumElements: integer);
+{$IFNDEF FPC}
+begin
+  _AVXReluGrad(PtrDst, PtrErr, PtrRaw, NumElements);
+end;
+{$ELSE}
 var
   localNumElements, i, NumElementsM1: integer;
 begin
@@ -3190,6 +3207,7 @@ begin
   for i := localNumElements to NumElementsM1 do
     if PtrRaw^[i] > 0 then PtrDst^[i] := PtrErr^[i] else PtrDst^[i] := 0;
 end;
+{$ENDIF FPC}
 
 // dst[i] := 1.0 when src[i] >= 0, else 0.0 -- the ReLU derivative gate mask.
 // The non-signaling GE_OQ predicate (29) is false for NaN and true for -0.0,
@@ -16195,7 +16213,7 @@ end;
 function AVXSumDiff(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single; {$IFNDEF FPC} inline; {$ENDIF} overload;
 {$IFNDEF FPC}
 begin
-  _AVXSumDiff(PSingle(PtrA), PSingle(PtrB), NumElements);
+  Result := _AVXSumDiff(PSingle(PtrA), PSingle(PtrB), NumElements);
 end;
 {$ELSE}
 var
@@ -18160,7 +18178,7 @@ end;
 function AVXSumDiff(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
 {$IFNDEF FPC}
 begin
-  _AVXSumDiff(PSingle(PtrA), PSingle(PtrB), NumElements);
+  Result := _AVXSumDiff(PSingle(PtrA), PSingle(PtrB), NumElements);
 end;
 {$ELSE}
 var
@@ -18288,7 +18306,7 @@ end;
 function AVXDistanceSqr(PtrA, PtrB: TNeuralFloatArrPtr; NumElements: integer): Single;
 {$IFNDEF FPC}
 begin
-  _AVXDistanceSqr(PSingle(PtrA), PSingle(PtrB), NumElements);
+  Result := _AVXDistanceSqr(PSingle(PtrA), PSingle(PtrB), NumElements);
 end;
 {$ELSE}
 var
@@ -18508,7 +18526,7 @@ end;
 function AVXGetSum(PtrA: TNeuralFloatArrPtr; NumElements: integer): Single;
 {$IFNDEF FPC}
 begin
-  _AVXGetSum(PSingle(PtrA), NumElements);
+  Result := _AVXGetSum(PSingle(PtrA), NumElements);
 end;
 {$ELSE}
 var
@@ -18630,7 +18648,7 @@ end;
 function AVXGetSumSqr(PtrA: TNeuralFloatArrPtr; NumElements: integer): Single;
 {$IFNDEF FPC}
 begin
-  _AVXGetSumSqr(PSingle(PtrA), NumElements);
+  Result := _AVXGetSumSqr(PSingle(PtrA), NumElements);
 end;
 {$ELSE}
 var
@@ -19585,6 +19603,11 @@ end;
   sources swapped, so the results are bit-identical to Sin followed by Cos. }
 procedure AVXSinCosBoth(pDstSin, pDstCos, pSrc: TNeuralFloatArrPtr; NumElements: integer);
 {$IFDEF AVX2}
+  {$IFNDEF FPC}
+begin
+  _AVXSinCosBoth(PSingle(pDstSin), PSingle(pDstCos), PSingle(pSrc), NumElements);
+end;
+  {$ELSE}
 var
   localNumElements, MissedElements, I, NumElementsM1: integer;
   S, C: Single;
@@ -19674,6 +19697,7 @@ begin
     pDstCos^[I] := C;
   end;
 end;
+  {$ENDIF FPC}
 {$ELSE}
 var
   I, NumElementsM1: integer;

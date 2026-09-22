@@ -95,6 +95,49 @@ const
                                                 $80000000, $80000000, $80000000, $80000000);
 
 
+// ---- Constants for AVX2 Sin/Cos Both ----
+
+// j = (trunc(|x|*4/pi) + 1) & ~1
+const
+  cAVXSC_FOPI: array[0..7] of Single =
+    (1.2732395447351627, 1.2732395447351627, 1.2732395447351627, 1.2732395447351627,
+     1.2732395447351627, 1.2732395447351627, 1.2732395447351627, 1.2732395447351627);
+
+  cAVXSC_Half: array[0..7] of Single =
+    (0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5);
+
+  // r = |x| + y*DP1 + y*DP2 + y*DP3  (avx_mathfun reduction coefficients)
+  cAVXSC_DP1: array[0..7] of Single =
+    (-0.78515625, -0.78515625, -0.78515625, -0.78515625,
+     -0.78515625, -0.78515625, -0.78515625, -0.78515625);
+
+  cAVXSC_DP2: array[0..7] of Single =
+    (-2.4187564849853515625e-4, -2.4187564849853515625e-4,
+     -2.4187564849853515625e-4, -2.4187564849853515625e-4,
+     -2.4187564849853515625e-4, -2.4187564849853515625e-4,
+     -2.4187564849853515625e-4, -2.4187564849853515625e-4);
+
+  cAVXSC_DP3: array[0..7] of Single =
+    (-3.77489497744594108e-8, -3.77489497744594108e-8,
+     -3.77489497744594108e-8, -3.77489497744594108e-8,
+     -3.77489497744594108e-8, -3.77489497744594108e-8,
+     -3.77489497744594108e-8, -3.77489497744594108e-8);
+
+  // Highest-power cos coefficient (the remaining ones reuse cAVXCosQ2, cAVXCosQ1)
+  cAVXSC_CosP0: array[0..7] of Single =
+    (2.443315711809948e-5, 2.443315711809948e-5,
+     2.443315711809948e-5, 2.443315711809948e-5,
+     2.443315711809948e-5, 2.443315711809948e-5,
+     2.443315711809948e-5, 2.443315711809948e-5);
+
+  // Integer vectors used by the bit-twiddling reductions
+  cAVXSC_1i: array[0..7] of Integer = (1, 1, 1, 1, 1, 1, 1, 1);
+  cAVXSC_2i: array[0..7] of Integer = (2, 2, 2, 2, 2, 2, 2, 2);
+  cAVXSC_4i: array[0..7] of Integer = (4, 4, 4, 4, 4, 4, 4, 4);
+  cAVXSC_NOT1i: array[0..7] of UInt32 =
+    ($FFFFFFFE, $FFFFFFFE, $FFFFFFFE, $FFFFFFFE,
+     $FFFFFFFE, $FFFFFFFE, $FFFFFFFE, $FFFFFFFE);
+
 implementation
 
 end.
