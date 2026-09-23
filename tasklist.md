@@ -1804,9 +1804,10 @@ rather than acted on.
         the `x` venv; a script that builds tiny random-weight versions of each
         component and writes float64 inputs/outputs to `tests/fixtures/`.
         Done: `tools/make_pico_qwenimage21_fixture.py` -> `tests/fixtures/tiny_qwenimage21/` (pico diffusers folder), `qwenimage21_{scheduler_oracle,prompt_tokens}.json`, `tiny_qwenimage21_{text_encoder,rope,transformer,vae,pipeline}_io.json`.
-  - [ ] A1. Flow-matching Euler scheduler in `neuraldiffusion.pas` (decide: extend
+  - [x] A1. Flow-matching Euler scheduler in `neuraldiffusion.pas` (decide: extend
         `TNNetDiffusionScheduler` or a new class): dynamic exponential shift,
         `shift_terminal`, velocity step. JSON oracle test. Independent.
+        Done: new class `TNNetFlowMatchEulerScheduler` (CalculateShift, TimeShift, SetSigmas, SetTimesteps, Step); tests `TestFlowMatch*` in `tests/TestNeuralDiffusion.pas`.
   - [ ] A2. Qwen3-VL text encoder as prompt encoder: route `qwen3_vl` to the Qwen3
         builder (`model.language_model.` prefix, skip `model.visual.*` and `lm_head`,
         int8 load); test that text-only interleaved M-RoPE equals 1D RoPE; API returning

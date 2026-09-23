@@ -21,6 +21,9 @@ Tests for neuraldiffusion.pas: the reusable diffusion noise-scheduler / sampler.
  - The Karras sigma table sigma_t = sqrt((1-ab_t)/ab_t) is strictly increasing,
    and a full Karras-spaced stochastic Euler-ancestral run is finite and stays
    near the DDIM baseline.
+ - TNNetFlowMatchEulerScheduler matches the Qwen-Image-2.1 diffusers oracle
+   (tests/fixtures/qwenimage21_scheduler_oracle.json, from
+   tools/make_pico_qwenimage21_fixture.py): mu, sigmas, timesteps, two steps.
 Coded by Claude (AI).
 *)
 
@@ -30,7 +33,7 @@ interface
 
 uses
   Classes, SysUtils, Math, fpcunit, testregistry,
-  neuralvolume, neuraldiffusion;
+  fpjson, jsonparser, neuralvolume, neuraldiffusion;
 
 type
   TTestNeuralDiffusion = class(TTestCase)
@@ -75,6 +78,10 @@ type
     procedure TestLCMBoundaryScalings;
     procedure TestLCMConsistencyFixedPoint;
     procedure TestLCMReproducible;
+    procedure TestFlowMatchCalculateShiftVsOracle;
+    procedure TestFlowMatchSigmasVsOracle;
+    procedure TestFlowMatchStepVsOracle;
+    procedure TestFlowMatchStaticAndLinearShift;
   end;
 
 implementation
@@ -790,6 +797,214 @@ begin
   finally
     gLCMTarget := nil; gLCMSched := nil;
     SchedA.Free; SchedB.Free; XA.Free; XB.Free; Target.Free;
+  end;
+end;
+
+const
+  cFlowOracleFile = 'qwenimage21_scheduler_oracle.json';
+
+// Parses tests/fixtures/<FileName> (run from the repo root or from tests/).
+function LoadFlowOracle(const FileName: string): TJSONObject;
+var
+  Path: string;
+  SS: TStringStream;
+  Parser: TJSONParser;
+begin
+  Path := 'fixtures' + DirectorySeparator + FileName;
+  if not FileExists(Path) then
+    Path := 'tests' + DirectorySeparator + 'fixtures' + DirectorySeparator +
+      FileName;
+  if not FileExists(Path) then
+    raise Exception.Create('Fixture not found: ' + FileName +
+      ' (run tools/make_pico_qwenimage21_fixture.py).');
+  SS := TStringStream.Create('');
+  try
+    SS.LoadFromFile(Path);
+    Parser := TJSONParser.Create(SS.DataString, []);
+    try
+      Result := Parser.Parse as TJSONObject;
+    finally
+      Parser.Free;
+    end;
+  finally
+    SS.Free;
+  end;
+end;
+
+// The Qwen-Image-2.1 scheduler_config.json settings stored in the oracle.
+function CreateFlowSchedulerFromOracle(Config: TJSONObject): TNNetFlowMatchEulerScheduler;
+begin
+  TAssert.AssertEquals('time_shift_type', 'exponential', Config.Get('time_shift_type', ''));
+  Result := TNNetFlowMatchEulerScheduler.Create(
+    Config.Get('num_train_timesteps', 0), Config.Get('shift', 0.0),
+    Config.Get('use_dynamic_shifting', false), ftsExponential,
+    Config.Get('shift_terminal', 0.0));
+end;
+
+function OracleMu(Config, CaseObj: TJSONObject): double;
+begin
+  Result := TNNetFlowMatchEulerScheduler.CalculateShift(
+    CaseObj.Get('image_seq_len', 0), Config.Get('base_image_seq_len', 0),
+    Config.Get('max_image_seq_len', 0), Config.Get('base_shift', 0.0),
+    Config.Get('max_shift', 0.0));
+end;
+
+procedure TTestNeuralDiffusion.TestFlowMatchCalculateShiftVsOracle;
+var
+  Root, Config, CaseObj: TJSONObject;
+  Cases: TJSONArray;
+  CasePos: integer;
+begin
+  // mu is linear in the token count and extrapolates past 8192 and below 256.
+  Root := LoadFlowOracle(cFlowOracleFile);
+  try
+    Config := Root.Objects['config'];
+    Cases := Root.Arrays['cases'];
+    AssertEquals('oracle case count', 6, Cases.Count);
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CasePos];
+      AssertEquals('mu case ' + IntToStr(CasePos),
+        CaseObj.Get('mu', 0.0), OracleMu(Config, CaseObj), 1e-12);
+    end;
+  finally
+    Root.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestFlowMatchSigmasVsOracle;
+var
+  Root, Config, CaseObj: TJSONObject;
+  Cases, Expected, Linspace: TJSONArray;
+  Sched, SchedFromList: TNNetFlowMatchEulerScheduler;
+  CasePos, SigmaPos, NumSteps: integer;
+  InputSigmas: array of double;
+begin
+  // The schedule is computed in double, so it must match the float64 oracle
+  // to rounding (1e-12); diffusers' own float32 table differs by ~1e-7.
+  Root := LoadFlowOracle(cFlowOracleFile);
+  try
+    Config := Root.Objects['config'];
+    Cases := Root.Arrays['cases'];
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CasePos];
+      NumSteps := CaseObj.Get('num_steps', 0);
+      Sched := CreateFlowSchedulerFromOracle(Config);
+      SchedFromList := CreateFlowSchedulerFromOracle(Config);
+      try
+        Sched.SetTimesteps(NumSteps, CaseObj.Get('mu', 0.0));
+        AssertEquals('num steps', NumSteps, Sched.NumSteps);
+        Linspace := CaseObj.Arrays['sigmas_linspace'];
+        SetLength(InputSigmas, Linspace.Count);
+        for SigmaPos := 0 to Linspace.Count - 1 do
+          InputSigmas[SigmaPos] := Linspace.Floats[SigmaPos];
+        SchedFromList.SetSigmas(InputSigmas, CaseObj.Get('mu', 0.0));
+        Expected := CaseObj.Arrays['sigmas_f64'];
+        AssertEquals('sigma count', NumSteps + 1, Expected.Count);
+        for SigmaPos := 0 to NumSteps do
+        begin
+          AssertEquals('sigma case ' + IntToStr(CasePos) + ' @ ' +
+            IntToStr(SigmaPos), Expected.Floats[SigmaPos],
+            Sched.Sigma[SigmaPos], 1e-12);
+          AssertEquals('sigma from list case ' + IntToStr(CasePos) + ' @ ' +
+            IntToStr(SigmaPos), Expected.Floats[SigmaPos],
+            SchedFromList.Sigma[SigmaPos], 1e-12);
+        end;
+        AssertEquals('last shifted sigma = shift_terminal',
+          Config.Get('shift_terminal', 0.0), Sched.Sigma[NumSteps - 1], 1e-12);
+        Expected := CaseObj.Arrays['timesteps_f64'];
+        for SigmaPos := 0 to NumSteps - 1 do
+          AssertEquals('timestep case ' + IntToStr(CasePos) + ' @ ' +
+            IntToStr(SigmaPos), Expected.Floats[SigmaPos],
+            Sched.Timestep[SigmaPos], 1e-9);
+      finally
+        Sched.Free;
+        SchedFromList.Free;
+      end;
+    end;
+  finally
+    Root.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestFlowMatchStepVsOracle;
+var
+  Root, Config, CaseObj: TJSONObject;
+  Cases, SampleData, Velocities, Outputs, Expected: TJSONArray;
+  Sched: TNNetFlowMatchEulerScheduler;
+  Sample, Velocity: TNNetVolume;
+  CasePos, StepPos, ElementPos: integer;
+begin
+  // Two Euler steps in single precision against the float64 formula. The
+  // values are O(1) and each step adds one rounding, so 2e-6 absolute is
+  // ~10 single-precision ulps.
+  Root := LoadFlowOracle(cFlowOracleFile);
+  Sample := TNNetVolume.Create;
+  Velocity := TNNetVolume.Create;
+  try
+    Config := Root.Objects['config'];
+    Cases := Root.Arrays['cases'];
+    for CasePos := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := Cases.Objects[CasePos];
+      SampleData := CaseObj.Arrays['step_sample'];
+      Velocities := CaseObj.Arrays['step_velocity'];
+      Outputs := CaseObj.Arrays['step_out_f64'];
+      Sample.ReSize(SampleData.Count, 1, 1);
+      Velocity.ReSize(SampleData.Count, 1, 1);
+      for ElementPos := 0 to SampleData.Count - 1 do
+        Sample.FData[ElementPos] := SampleData.Floats[ElementPos];
+      Sched := CreateFlowSchedulerFromOracle(Config);
+      try
+        Sched.SetTimesteps(CaseObj.Get('num_steps', 0), OracleMu(Config, CaseObj));
+        for StepPos := 0 to Velocities.Count - 1 do
+        begin
+          for ElementPos := 0 to SampleData.Count - 1 do
+            Velocity.FData[ElementPos] :=
+              Velocities.Arrays[StepPos].Floats[ElementPos];
+          Sched.Step(Sample, Velocity, StepPos);
+          Expected := Outputs.Arrays[StepPos];
+          for ElementPos := 0 to SampleData.Count - 1 do
+            AssertEquals('step case ' + IntToStr(CasePos) + ' step ' +
+              IntToStr(StepPos) + ' @ ' + IntToStr(ElementPos),
+              Expected.Floats[ElementPos], Sample.FData[ElementPos], 2e-6);
+        end;
+      finally
+        Sched.Free;
+      end;
+    end;
+  finally
+    Root.Free;
+    Sample.Free;
+    Velocity.Free;
+  end;
+end;
+
+procedure TTestNeuralDiffusion.TestFlowMatchStaticAndLinearShift;
+var
+  Sched: TNNetFlowMatchEulerScheduler;
+begin
+  // Static shift 3 (SD3): sigma' = 3s / (1 + 2s); no terminal stretch.
+  Sched := TNNetFlowMatchEulerScheduler.Create(1000, 3.0);
+  try
+    Sched.SetSigmas([1.0, 0.5, 0.25]);
+    AssertEquals('static shift s=1', 1.0, Sched.Sigma[0], 1e-15);
+    AssertEquals('static shift s=0.5', 0.75, Sched.Sigma[1], 1e-15);
+    AssertEquals('static shift s=0.25', 0.5, Sched.Sigma[2], 1e-15);
+    AssertEquals('final sigma', 0.0, Sched.Sigma[3], 0);
+    AssertEquals('timestep', 750.0, Sched.Timestep[1], 1e-12);
+  finally
+    Sched.Free;
+  end;
+  // Linear dynamic shift: sigma' = mu / (mu + 1/s - 1); mu = 2, s = 0.5 -> 2/3.
+  Sched := TNNetFlowMatchEulerScheduler.Create(1000, 1.0, true, ftsLinear);
+  try
+    Sched.SetSigmas([0.5], 2.0);
+    AssertEquals('linear shift', 2 / 3, Sched.Sigma[0], 1e-15);
+    AssertEquals('num steps', 1, Sched.NumSteps);
+  finally
+    Sched.Free;
   end;
 end;
 

@@ -28,6 +28,8 @@ WHAT IT PROVIDES
     equivalent eps internally so all the updates share one code path.
   * A classifier-free-guidance (CFG) MIXER: given eps_cond and eps_uncond and a
     guidance weight w, returns eps_uncond + w*(eps_cond - eps_uncond).
+  * TNNetFlowMatchEulerScheduler: a separate flow-matching (rectified-flow)
+    Euler sampler with static or resolution-dependent sigma shifting.
 
 MODEL-AGNOSTIC. The denoiser is supplied by the CALLER as a Pascal
 procedure-of-object (TNNetDenoiseCallback): given a noisy volume x_t and an
@@ -287,6 +289,65 @@ type
     // timestep with fresh Gaussian noise. Leaves the sampled x0 in X.
     procedure LCMSample(X: TNNetVolume; Denoise: TNNetDenoiseCallback;
       NumSteps: integer = 4; Spacing: TNNetTimestepSpacing = tsUniform);
+  end;
+
+  // Resolution-dependent sigma shift of a flow-matching schedule, mu > 0:
+  //   ftsExponential : sigma' = e^mu / (e^mu + (1/sigma - 1))  (FLUX, Qwen-Image)
+  //   ftsLinear      : sigma' = mu   / (mu   + (1/sigma - 1))
+  TNNetFlowTimeShift = (ftsExponential, ftsLinear);
+
+  { TNNetFlowMatchEulerScheduler }
+  // Deterministic Euler sampler for rectified-flow models that predict the
+  // velocity v = noise - x0 (diffusers FlowMatchEulerDiscreteScheduler): sigma
+  // runs from ~1 (noise) to 0 (clean), x_next = x + (sigma_next - sigma)*v. The
+  // schedule is the sigma list itself, in double (N+1 values, not a hot path).
+  // Coded by Claude (AI).
+  TNNetFlowMatchEulerScheduler = class(TObject)
+  private
+    FNumTrainTimesteps: integer;
+    FShift: double;
+    FUseDynamicShifting: boolean;
+    FTimeShiftType: TNNetFlowTimeShift;
+    FShiftTerminal: double;
+    // NumSteps + 1 entries, descending, the last one 0 (the clean sample).
+    FSigmas: array of double;
+    function GetNumSteps: integer;
+    function GetSigma(StepIndex: integer): double;
+    function GetTimestep(StepIndex: integer): double;
+  public
+    // pShift is the static shift, ignored when pUseDynamicShifting is true
+    // (then SetSigmas needs mu). pShiftTerminal = 0 disables the terminal stretch.
+    constructor Create(pNumTrainTimesteps: integer = 1000;
+      pShift: double = 1.0; pUseDynamicShifting: boolean = false;
+      pTimeShiftType: TNNetFlowTimeShift = ftsExponential;
+      pShiftTerminal: double = 0.0);
+    // diffusers calculate_shift: mu linear in the image token count through
+    // (BaseSeqLen, BaseShift) and (MaxSeqLen, MaxShift); extrapolates outside.
+    class function CalculateShift(ImageSeqLen: integer;
+      BaseSeqLen: integer = 256; MaxSeqLen: integer = 4096;
+      BaseShift: double = 0.5; MaxShift: double = 1.15): double;
+    // Applies the dynamic time shift of type TimeShiftType to one sigma in (0, 1].
+    function TimeShift(Mu, Sigma: double): double;
+    // diffusers set_timesteps(sigmas=...): shift (static or dynamic with Mu),
+    // stretch to ShiftTerminal, append the final sigma 0.
+    procedure SetSigmas(const Sigmas: array of double; Mu: double = 0.0);
+    // SetSigmas with linspace(1, 1/NumSteps, NumSteps), the input sigmas the
+    // FLUX and Qwen-Image pipelines pass.
+    procedure SetTimesteps(NumSteps: integer; Mu: double = 0.0);
+    // One Euler step in place: Sample += (Sigma[StepIndex+1] - Sigma[StepIndex])
+    // * Velocity, where Velocity is the model output at Timestep[StepIndex].
+    procedure Step(Sample, Velocity: TNNetVolume; StepIndex: integer);
+
+    property NumSteps: integer read GetNumSteps;
+    // Sigma[0..NumSteps]; Sigma[NumSteps] = 0.
+    property Sigma[StepIndex: integer]: double read GetSigma;
+    // Timestep[0..NumSteps-1] = Sigma * NumTrainTimesteps (the model input).
+    property Timestep[StepIndex: integer]: double read GetTimestep;
+    property NumTrainTimesteps: integer read FNumTrainTimesteps;
+    property Shift: double read FShift;
+    property UseDynamicShifting: boolean read FUseDynamicShifting;
+    property TimeShiftType: TNNetFlowTimeShift read FTimeShiftType;
+    property ShiftTerminal: double read FShiftTerminal;
   end;
 
 implementation
@@ -1282,6 +1343,116 @@ begin
     Pred.Free;
     X0.Free;
   end;
+end;
+
+{ TNNetFlowMatchEulerScheduler }
+
+constructor TNNetFlowMatchEulerScheduler.Create(pNumTrainTimesteps: integer;
+  pShift: double; pUseDynamicShifting: boolean;
+  pTimeShiftType: TNNetFlowTimeShift; pShiftTerminal: double);
+begin
+  inherited Create;
+  if pNumTrainTimesteps < 1 then
+    raise Exception.Create('Flow-matching NumTrainTimesteps must be >= 1.');
+  FNumTrainTimesteps := pNumTrainTimesteps;
+  FShift := pShift;
+  FUseDynamicShifting := pUseDynamicShifting;
+  FTimeShiftType := pTimeShiftType;
+  FShiftTerminal := pShiftTerminal;
+  SetLength(FSigmas, 0);
+end;
+
+class function TNNetFlowMatchEulerScheduler.CalculateShift(ImageSeqLen: integer;
+  BaseSeqLen: integer; MaxSeqLen: integer; BaseShift: double;
+  MaxShift: double): double;
+var
+  Slope, Intercept: double;
+begin
+  Slope := (MaxShift - BaseShift) / (MaxSeqLen - BaseSeqLen);
+  Intercept := BaseShift - Slope * BaseSeqLen;
+  Result := ImageSeqLen * Slope + Intercept;
+end;
+
+function TNNetFlowMatchEulerScheduler.TimeShift(Mu, Sigma: double): double;
+var
+  Numerator: double;
+begin
+  if Sigma <= 0 then Exit(0);
+  if FTimeShiftType = ftsExponential then Numerator := Exp(Mu)
+  else Numerator := Mu;
+  Result := Numerator / (Numerator + (1 / Sigma - 1));
+end;
+
+procedure TNNetFlowMatchEulerScheduler.SetSigmas(const Sigmas: array of double;
+  Mu: double);
+var
+  SigmaPos, MaxSigmaPos: integer;
+  Shifted, StretchScale: double;
+begin
+  if Length(Sigmas) < 1 then
+    raise Exception.Create('Flow-matching schedule needs at least one sigma.');
+  MaxSigmaPos := High(Sigmas);
+  SetLength(FSigmas, Length(Sigmas) + 1);
+  for SigmaPos := 0 to MaxSigmaPos do
+  begin
+    if FUseDynamicShifting then Shifted := TimeShift(Mu, Sigmas[SigmaPos])
+    else Shifted := FShift * Sigmas[SigmaPos] /
+      (1 + (FShift - 1) * Sigmas[SigmaPos]);
+    FSigmas[SigmaPos] := Shifted;
+  end;
+  // shift_terminal: rescale 1 - sigma so the last sigma lands on ShiftTerminal.
+  if FShiftTerminal <> 0 then
+  begin
+    StretchScale := (1 - FSigmas[MaxSigmaPos]) / (1 - FShiftTerminal);
+    for SigmaPos := 0 to MaxSigmaPos do
+      FSigmas[SigmaPos] := 1 - (1 - FSigmas[SigmaPos]) / StretchScale;
+  end;
+  FSigmas[MaxSigmaPos + 1] := 0;
+end;
+
+procedure TNNetFlowMatchEulerScheduler.SetTimesteps(NumSteps: integer;
+  Mu: double);
+var
+  Sigmas: array of double;
+  SigmaPos, MaxSigmaPos: integer;
+  SigmaStride: double;
+begin
+  if NumSteps < 1 then
+    raise Exception.Create('Flow-matching NumSteps must be >= 1.');
+  SetLength(Sigmas, NumSteps);
+  MaxSigmaPos := NumSteps - 1;
+  if MaxSigmaPos > 0 then SigmaStride := (1 / NumSteps - 1) / MaxSigmaPos
+  else SigmaStride := 0;
+  for SigmaPos := 0 to MaxSigmaPos do
+    Sigmas[SigmaPos] := 1 + SigmaPos * SigmaStride;
+  // numpy linspace pins the endpoint exactly.
+  Sigmas[MaxSigmaPos] := 1 / NumSteps;
+  SetSigmas(Sigmas, Mu);
+end;
+
+function TNNetFlowMatchEulerScheduler.GetNumSteps: integer;
+begin
+  Result := Length(FSigmas) - 1;
+  if Result < 0 then Result := 0;
+end;
+
+function TNNetFlowMatchEulerScheduler.GetSigma(StepIndex: integer): double;
+begin
+  Result := FSigmas[StepIndex];
+end;
+
+function TNNetFlowMatchEulerScheduler.GetTimestep(StepIndex: integer): double;
+begin
+  Result := FSigmas[StepIndex] * FNumTrainTimesteps;
+end;
+
+procedure TNNetFlowMatchEulerScheduler.Step(Sample, Velocity: TNNetVolume;
+  StepIndex: integer);
+begin
+  if (StepIndex < 0) or (StepIndex >= GetNumSteps) then
+    raise Exception.Create('Flow-matching step index ' + IntToStr(StepIndex) +
+      ' outside 0..' + IntToStr(GetNumSteps - 1) + '.');
+  Sample.MulAdd(FSigmas[StepIndex + 1] - FSigmas[StepIndex], Velocity);
 end;
 
 end.
