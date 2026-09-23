@@ -535,8 +535,8 @@ uses
   {$ENDIF}
   Classes, SysUtils, Math, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralthread, neuralsafetensors, neuraltorchbin,
-  neuralgguf, neuralhftokenizer, neuralmxfp4, neuralnf4, neuralaudio,
-  neuraldiffusion, pascoremath32;
+  neuralgguf, neuralhftokenizer, neuralchat, neuralmxfp4, neuralnf4,
+  neuralaudio, neuraldiffusion, pascoremath32;
 
 type
   EPretrainedImportError = class(Exception);
@@ -1058,10 +1058,12 @@ function LlamaConfigToString(const Config: TLlamaConfig): string;
 // A layer count or class mismatch raises. Arm it afterwards with
 // TNNet.EnableOpenCLInContextOf(owner), after the owner's EnableOpenCL, and
 // free it before the owner. Coded by Claude (AI).
+// pStopBeforeFinalNorm: the net ends at the last decoder block's residual
+// sum (no final RMSNorm, no LM head); norm.weight and lm_head are not loaded.
 function BuildLlamaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true; pQuantizeInt8: boolean = false;
-  pWeightOwner: TNNet = nil): TNNet;
+  pWeightOwner: TNNet = nil; pStopBeforeFinalNorm: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
@@ -8589,6 +8591,48 @@ procedure Qwen2VLRunLogits(TextNet: TNNet; const Config: TQwen2VLConfig;
   ImageGridH, ImageGridW: integer; Logits: TNNetVolume);
 
 // ===========================================================================
+// QWEN3-VL TEXT DECODER AS A PROMPT ENCODER (model_type "qwen3_vl"; the
+// Qwen-Image-2.1 text_encoder). The text decoder is a dense Qwen3 decoder built
+// by the Llama builder; model.visual.* is skipped. For text-only input the
+// interleaved M-RoPE positions are equal on all three axes, so plain 1-D
+// rotate-half RoPE is exact; image/video placeholder ids are refused.
+// ---------------------------------------------------------------------------
+const
+  csQwenImage21SystemPrompt = 'Comprehend and analyze the provided prompt.';
+
+type
+  TQwen3VLConfig = record
+    Text: TLlamaConfig;    // the Qwen3 text decoder (text_config)
+    ImageTokenId: integer; // image_token_id (<|image_pad|>); -1 = absent
+    VideoTokenId: integer; // video_token_id (<|video_pad|>); -1 = absent
+  end;
+
+// Reads a HF Qwen3-VL config.json: text_config through
+// ReadLlamaConfigFromJSONFile plus the wrapper's image/video token ids.
+function ReadQwen3VLConfigFromJSONFile(const FileName: string): TQwen3VLConfig;
+
+// Builds the Qwen3-VL text decoder WITHOUT the final RMSNorm and LM head: input
+// (pSeqLen,1,1) token ids, output (pSeqLen,1,hidden) = last block before norm.
+function BuildQwen3VLTextEncoderFromSafeTensors(const FileName: string;
+  out Config: TQwen3VLConfig; pSeqLen: integer;
+  pQuantizeInt8: boolean = false; const ConfigFileName: string = ''): TNNet;
+
+// Runs Encoder on TokenIds (right-padded to its SeqLen; causal, so rows stay
+// exact) and returns rows DropCount.. as (Length(TokenIds)-DropCount,1,hidden).
+procedure Qwen3VLEncodeHiddenStates(Encoder: TNNet;
+  const Config: TQwen3VLConfig; const TokenIds: array of integer;
+  DropCount: integer; HiddenStates: TNNetVolume);
+
+// The Qwen-Image-2.1 text-to-image ChatML prompt (system message, user Prompt,
+// assistant opener); an empty Prompt becomes ' ' as in the diffusers pipeline.
+function QwenImage21TextToImagePrompt(const Prompt: string): string;
+
+// Tokenizes QwenImage21TextToImagePrompt(Prompt). DropCount = token count of
+// the rendered system message alone (the pipeline's drop_idx).
+function QwenImage21EncodeTextToImagePrompt(Tokenizer: TNeuralHFTokenizer;
+  const Prompt: string; out DropCount: integer): TNeuralIntegerArray;
+
+// ===========================================================================
 // RAFT OPTICAL-FLOW IMPORT (model_type "raft_small", the torchvision
 // raft_small architecture, Teed & Deng 2020 "RAFT", arXiv:2003.12039) - the
 // FIRST optical-flow vertical and the first TWO-image-in / dense-2-channel-out
@@ -12297,6 +12341,7 @@ function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
 // gpt_neo, gpt_neox, gptj, phi, llama, mistral, qwen2, qwen3, qwen3_moe,
+// qwen3_vl (text decoder only, 1-D RoPE; vision tower skipped),
 // qwen3_5, qwen3_5_moe (Qwen3.5/3.6 hybrid DeltaNet+attention text
 // decoders; vision tower and MTP head skipped), gemma,
 // gemma2, gemma3_text, rwkv, mamba, falcon_mamba, bloom, falcon (legacy
@@ -12332,8 +12377,8 @@ function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
 
 // True for the config.json model_type values BuildFromPretrained routes
 // through the Llama builder (llama, mistral, qwen2, qwen3, qwen3_moe,
-// qwen3_5, qwen3_5_moe, gemma, gemma2, gemma3_text, phi3, olmo2, olmoe,
-// mixtral, glm4, granite, granitemoe, minicpm, bitnet) - the families whose
+// qwen3_vl, qwen3_5, qwen3_5_moe, gemma, gemma2, gemma3_text, phi3, olmo2,
+// olmoe, mixtral, glm4, granite, granitemoe, minicpm, bitnet) - the families whose
 // twin can borrow an already-loaded net's weights (pWeightOwner).
 function PretrainedModelTypeCanBorrowWeights(const ModelType: string): boolean;
 
@@ -13620,8 +13665,12 @@ var
   HeadDimField, SlidingWindowField, FloatField: TJSONData;
   MoEMlpOnlyArr, ClipQKVField: TJSONData;
   TextCfgField, LayerTypesArr: TJSONData;
+  RopeParamsField: TJSONData;
   LayerTypeStr: string;
   FullAttnInterval: integer;
+  TieFromWrapper: boolean;
+  MRoPESectionArr: TJSONArray;
+  MRoPEPairCount, MaxSectionPos: integer;
   i: integer;
   MoEMax: integer;
   DimModelBase: integer;
@@ -13666,26 +13715,37 @@ begin
         '" is not a JSON object.');
     Obj := TJSONObject(Root);
     ModelType := Obj.Get('model_type', 'llama');
+    TieFromWrapper := False;
     // Qwen3.5 / Qwen3.6 (multimodal wrapper configs, e.g. Qwen3.6-27B /
     // Qwen3.6-35B-A3B): the TEXT decoder fields live NESTED under
     // "text_config" (top-level model_type qwen3_5 / qwen3_5_moe, inner
     // model_type qwen3_5_text / qwen3_5_moe_text). Descend into the nested
     // object when present (a flat text-only config is also accepted
     // defensively) and normalize the *_text spellings to the dispatch names.
+    // Qwen3-VL (qwen3_vl / qwen3_vl_text) nests its Qwen3 text decoder the
+    // same way; only that text decoder is read here.
     if (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_moe') or
-       (ModelType = 'qwen3_5_text') or (ModelType = 'qwen3_5_moe_text') then
+       (ModelType = 'qwen3_5_text') or (ModelType = 'qwen3_5_moe_text') or
+       (ModelType = 'qwen3_vl') or (ModelType = 'qwen3_vl_text') then
     begin
       TextCfgField := Obj.Find('text_config');
       if (TextCfgField <> nil) and (TextCfgField is TJSONObject) then
+      begin
+        // tie_word_embeddings belongs to the wrapper config; the nested
+        // text_config usually omits it.
+        TieFromWrapper := Obj.Get('tie_word_embeddings', False);
         Obj := TJSONObject(TextCfgField);
+      end;
       if (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_text') then
         ModelType := 'qwen3_5'
+      else if (ModelType = 'qwen3_vl') or (ModelType = 'qwen3_vl_text') then
+        ModelType := 'qwen3_vl'
       else
         ModelType := 'qwen3_5_moe';
     end;
     if (ModelType <> 'llama') and (ModelType <> 'mistral') and
        (ModelType <> 'qwen2') and (ModelType <> 'qwen3') and
-       (ModelType <> 'qwen3_moe') and
+       (ModelType <> 'qwen3_moe') and (ModelType <> 'qwen3_vl') and
        (ModelType <> 'qwen3_5') and (ModelType <> 'qwen3_5_moe') and
        (ModelType <> 'gemma') and (ModelType <> 'gemma2') and
        (ModelType <> 'gemma3_text') and (ModelType <> 'phi3') and
@@ -13697,7 +13757,7 @@ begin
        (ModelType <> 'minicpm') then
       ImportError('Llama import: config model_type is "' + ModelType +
         '" - only "llama", "mistral", "qwen2", "qwen3", "qwen3_moe", ' +
-        '"qwen3_5", "qwen3_5_moe", ' +
+        '"qwen3_vl", "qwen3_5", "qwen3_5_moe", ' +
         '"gemma", "gemma2", "gemma3_text", "phi3", "olmo2", "olmoe", ' +
         '"mixtral", "glm4", "granite", "granitemoe", "bitnet", ' +
         '"internlm2" and "minicpm" are supported here ' +
@@ -13728,7 +13788,7 @@ begin
     // Gemma2Config default is tie_word_embeddings=true); the other families
     // default off.
     Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings',
-      (ModelType = 'gemma') or (ModelType = 'gemma2') or
+      TieFromWrapper or (ModelType = 'gemma') or (ModelType = 'gemma2') or
       (ModelType = 'gemma3_text'));
     // An explicit head_dim is honored even when it is DECOUPLED from
     // hidden_size/num_attention_heads (Qwen3-0.6B: head_dim=128 with
@@ -13862,7 +13922,7 @@ begin
         ImportError('Llama import: Qwen2 use_sliding_window=true (per-layer ' +
           'max_window_layers windowing) is not wired into this importer yet.');
     end
-    else if ModelType = 'qwen3' then
+    else if (ModelType = 'qwen3') or (ModelType = 'qwen3_vl') then
     begin
       // Qwen3 dropped the Qwen2 q/k/v biases (attention_bias defaults to
       // false) and added per-head RMSNorm on q/k before RoPE.
@@ -13871,6 +13931,40 @@ begin
       if Obj.Get('use_sliding_window', False) then
         ImportError('Llama import: Qwen3 use_sliding_window=true (per-layer ' +
           'max_window_layers windowing) is not wired into this importer yet.');
+      // Qwen3-VL text decoder: interleaved M-RoPE, whose three position
+      // streams are equal for text, so plain 1-D rotate-half RoPE is exact.
+      // Image/video tokens are refused at encode time (Qwen3VLEncodeHiddenStates).
+      if ModelType = 'qwen3_vl' then
+      begin
+        RopeParamsField := Obj.Find('rope_parameters');
+        if (RopeParamsField = nil) or not (RopeParamsField is TJSONObject) then
+          RopeParamsField := Obj.Find('rope_scaling');
+        if (RopeParamsField <> nil) and (RopeParamsField is TJSONObject) then
+        begin
+          LayerTypeStr := TJSONObject(RopeParamsField).Get('rope_type',
+            TJSONObject(RopeParamsField).Get('type', 'default'));
+          if LayerTypeStr <> 'default' then
+            ImportError('Llama import: Qwen3-VL rope_type "' + LayerTypeStr +
+              '" is not supported - only "default" (M-RoPE without ' +
+              'scaling) reduces to 1-D RoPE for text.');
+          Result.RopeTheta := TJSONObject(RopeParamsField).Get('rope_theta',
+            Result.RopeTheta);
+          if TJSONObject(RopeParamsField).Find('mrope_section') is TJSONArray then
+          begin
+            MRoPESectionArr :=
+              TJSONArray(TJSONObject(RopeParamsField).Find('mrope_section'));
+            MRoPEPairCount := 0;
+            MaxSectionPos := MRoPESectionArr.Count - 1;
+            for i := 0 to MaxSectionPos do
+              Inc(MRoPEPairCount, MRoPESectionArr.Integers[i]);
+            if (Result.HeadDim > 0) and
+               (2 * MRoPEPairCount <> Result.HeadDim) then
+              ImportError('Llama import: Qwen3-VL mrope_section sums to ' +
+                IntToStr(MRoPEPairCount) + ' channel pairs, expected ' +
+                'head_dim/2 = ' + IntToStr(Result.HeadDim div 2) + '.');
+          end;
+        end;
+      end;
     end
     else if ModelType = 'qwen3_moe' then
     begin
@@ -15824,6 +15918,12 @@ begin
   QHeadCW := nil;
   if LMHead is TNNetLayerConcatedWeights then
     QHeadCW := TNNetLayerConcatedWeights(LMHead);
+  // A nil LMHead loads the embedding only; the head tensor is marked consumed.
+  if LMHead = nil then
+  begin
+    TieWordEmbeddings := false;
+    if Reader.HasTensor(LMHeadName) then Consumed.Add(LMHeadName);
+  end;
   if EmbDirect and TieWordEmbeddings then
     EmbDirect := (QHeadCW <> nil) and QHeadCW.WeightsQuantizedInt8 and
       (QHeadCW.QuantInt8VectorSize = HiddenSize) and
@@ -15871,7 +15971,7 @@ begin
       // A redundant serialized lm_head.weight is ignorable when tied.
       if Reader.HasTensor(LMHeadName) then Consumed.Add(LMHeadName);
     end
-    else
+    else if LMHead <> nil then
     begin
       LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
         HiddenSize, VocabSize, 0, -1, 0, '', LogitScaleFold);
@@ -15916,7 +16016,7 @@ begin
     // A redundant serialized lm_head.weight is ignorable when tied.
     if Reader.HasTensor(LMHeadName) then Consumed.Add(LMHeadName);
   end
-  else
+  else if LMHead <> nil then
   begin
     LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
       HiddenSize, VocabSize, 0, -1, 0, '', LogitScaleFold);
@@ -16458,12 +16558,13 @@ end;
 // the same index (TNNet.BuildWeightOwner); nothing is read from pReader
 // (nil is accepted), no tensor is loaded, no FP32 or int8 weight storage is
 // allocated, and no quantize sweep runs. A layer count or class mismatch
-// raises. Coded by Claude (AI).
+// raises. pStopBeforeFinalNorm: see BuildLlamaFromSafeTensorsWithConfig.
+// Coded by Claude (AI).
 function BuildLlamaFromTensorReaderWithConfig(
   pReader: TNNetSafeTensorsReader; const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true; pQuantizeInt8: boolean = false;
-  pWeightOwner: TNNet = nil): TNNet;
+  pWeightOwner: TNNet = nil; pStopBeforeFinalNorm: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -16664,7 +16765,7 @@ begin
             IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
             '], got ' +
             Reader.ShapeAsString(Config.Prefix + 'embed_tokens.weight'));
-        if (not Config.TieWordEmbeddings) and
+        if (not Config.TieWordEmbeddings) and (not pStopBeforeFinalNorm) and
            (not Reader.HasTensor(LMHeadName)) then
           ImportError('Llama import: config says tie_word_embeddings=false ' +
             'but "' + LMHeadName + '" is missing from ' + Reader.FileName + '.');
@@ -17177,15 +17278,23 @@ begin
         if not pTrainable then NN.SetTrainable();
         if QuantizeSweeps then NN.QuantizeWeightsInt8();
       end;
-      FinalNorm := NN.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
-      LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
-      // Config.FinalLogitSoftCap (Gemma-2): the LM-head logits are squashed
-      // to cap*tanh(logits/cap) - a plain TNNetSoftCapping after the head
-      // (HF applies it to the logits before any sampling softmax).
-      if Config.FinalLogitSoftCap > 0 then
-        NN.AddLayer( TNNetSoftCapping.Create(Config.FinalLogitSoftCap) );
+      if pStopBeforeFinalNorm then
+      begin
+        FinalNorm := nil;
+        LMHead := nil;
+      end
+      else
+      begin
+        FinalNorm := NN.AddLayer(
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
+        LMHead := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+        // Config.FinalLogitSoftCap (Gemma-2): the LM-head logits are squashed
+        // to cap*tanh(logits/cap) - a plain TNNetSoftCapping after the head
+        // (HF applies it to the logits before any sampling softmax).
+        if Config.FinalLogitSoftCap > 0 then
+          NN.AddLayer( TNNetSoftCapping.Create(Config.FinalLogitSoftCap) );
+      end;
       if not pTrainable then NN.SetTrainable();
       if QuantizeSweeps then NN.QuantizeWeightsInt8();
 
@@ -17794,8 +17903,9 @@ begin
         // Re-quantize the block just refilled with checkpoint weights.
         if QuantizeSweeps then NN.QuantizeWeightsInt8();
       end;
-      LoadLlamaRMSNormWeights(Reader, FinalNorm,
-        Config.Prefix + 'norm.weight', Config.HiddenSize, NormGainOffset);
+      if FinalNorm <> nil then
+        LoadLlamaRMSNormWeights(Reader, FinalNorm,
+          Config.Prefix + 'norm.weight', Config.HiddenSize, NormGainOffset);
       MarkConsumed(Config.Prefix + 'norm.weight');
 
       // Final sweep: everything refilled above ends int8-quantized.
@@ -17810,13 +17920,14 @@ begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
         if Pos('rotary_emb.inv_freq', TensorNameStr) > 0 then continue;
-        // Qwen3.5 / Qwen3.6 multimodal checkpoints: the vision tower
-        // (model.visual.*) and the multi-token-prediction head (mtp.*) are
+        // Qwen3.5 / Qwen3.6 / Qwen3-VL multimodal checkpoints: the vision
+        // tower (model.visual.*) and the multi-token-prediction head (mtp.*) are
         // OUT OF SCOPE for the text decoder - HF's ForCausalLM route
         // ignores them too (_keys_to_ignore_on_load_unexpected), so they
         // are SKIPPED here, not errors.
         if ((Config.ModelType = 'qwen3_5') or
-            (Config.ModelType = 'qwen3_5_moe')) and
+            (Config.ModelType = 'qwen3_5_moe') or
+            (Config.ModelType = 'qwen3_vl')) and
            ((Pos('model.visual.', TensorNameStr) = 1) or
             (Pos('visual.', TensorNameStr) = 1) or
             (Pos('model.mtp.', TensorNameStr) = 1) or
@@ -17841,7 +17952,7 @@ end;
 function BuildLlamaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true; pQuantizeInt8: boolean = false;
-  pWeightOwner: TNNet = nil): TNNet;
+  pWeightOwner: TNNet = nil; pStopBeforeFinalNorm: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
@@ -17850,7 +17961,7 @@ begin
   if Assigned(pWeightOwner) then Reader := nil
   else Reader := CreatePretrainedTensorReader(FileName);
   Result := BuildLlamaFromTensorReaderWithConfig(Reader, FileName, Config,
-    pSeqLen, pTrainable, pQuantizeInt8, pWeightOwner);
+    pSeqLen, pTrainable, pQuantizeInt8, pWeightOwner, pStopBeforeFinalNorm);
 end;
 
 function BuildLlamaFromGGUFEx(const FileName: string;
@@ -80452,6 +80563,103 @@ begin
   end;
 end;
 
+function ReadQwen3VLConfigFromJSONFile(const FileName: string): TQwen3VLConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+begin
+  Result.Text := ReadLlamaConfigFromJSONFile(FileName);
+  if Result.Text.ModelType <> 'qwen3_vl' then
+    ImportError('Qwen3-VL import: config model_type is "' +
+      Result.Text.ModelType + '", expected "qwen3_vl".');
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    Result.ImageTokenId := TJSONObject(Root).Get('image_token_id', -1);
+    Result.VideoTokenId := TJSONObject(Root).Get('video_token_id', -1);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function BuildQwen3VLTextEncoderFromSafeTensors(const FileName: string;
+  out Config: TQwen3VLConfig; pSeqLen: integer;
+  pQuantizeInt8: boolean = false; const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if pSeqLen < 1 then
+    ImportError('Qwen3-VL text encoder: pSeqLen must be >= 1 (the prompt ' +
+      'token count), got ' + IntToStr(pSeqLen) + '.');
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadQwen3VLConfigFromJSONFile(ConfigPath);
+  Result := BuildLlamaFromSafeTensorsWithConfig(FileName, Config.Text, pSeqLen,
+    {pTrainable=}false, pQuantizeInt8, {pWeightOwner=}nil,
+    {pStopBeforeFinalNorm=}true);
+end;
+
+procedure Qwen3VLEncodeHiddenStates(Encoder: TNNet;
+  const Config: TQwen3VLConfig; const TokenIds: array of integer;
+  DropCount: integer; HiddenStates: TNNetVolume);
+var
+  Input: TNNetVolume;
+  SeqLen, TokenCount, MaxTokenPos, TokenPos: integer;
+begin
+  SeqLen := Encoder.GetFirstLayer().Output.SizeX;
+  TokenCount := Length(TokenIds);
+  if (TokenCount < 1) or (TokenCount > SeqLen) then
+    ImportError('Qwen3VLEncodeHiddenStates: ' + IntToStr(TokenCount) +
+      ' token ids do not fit the encoder''s SeqLen ' + IntToStr(SeqLen) +
+      ' (need 1..SeqLen).');
+  if (DropCount < 0) or (DropCount >= TokenCount) then
+    ImportError('Qwen3VLEncodeHiddenStates: DropCount ' +
+      IntToStr(DropCount) + ' must be in [0, ' + IntToStr(TokenCount) + ').');
+  MaxTokenPos := TokenCount - 1;
+  for TokenPos := 0 to MaxTokenPos do
+    if ((Config.ImageTokenId >= 0) and
+        (TokenIds[TokenPos] = Config.ImageTokenId)) or
+       ((Config.VideoTokenId >= 0) and
+        (TokenIds[TokenPos] = Config.VideoTokenId)) then
+      ImportError('Qwen3VLEncodeHiddenStates: token ' + IntToStr(TokenPos) +
+        ' is an image/video placeholder (id ' + IntToStr(TokenIds[TokenPos]) +
+        '); vision input needs the vision tower and 3-D M-RoPE positions, ' +
+        'which this text-only encoder does not have.');
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  try
+    Input.Fill(0);
+    for TokenPos := 0 to MaxTokenPos do
+      Input.FData[TokenPos] := TokenIds[TokenPos];
+    Encoder.Compute(Input);
+    HiddenStates.CopyCropping(Encoder.GetLastLayer().Output, DropCount, 0,
+      TokenCount - DropCount, 1);
+  finally
+    Input.Free;
+  end;
+end;
+
+function QwenImage21TextToImagePrompt(const Prompt: string): string;
+var
+  UserText: string;
+begin
+  if Prompt = '' then UserText := ' ' else UserText := Prompt;
+  Result := ApplyChatTemplate(cfChatML,
+    [ChatMessage('system', csQwenImage21SystemPrompt),
+     ChatMessage('user', UserText)], {AddGenerationPrompt=}true);
+end;
+
+function QwenImage21EncodeTextToImagePrompt(Tokenizer: TNeuralHFTokenizer;
+  const Prompt: string; out DropCount: integer): TNeuralIntegerArray;
+begin
+  DropCount := Length(EncodeChat(Tokenizer, cfChatML,
+    [ChatMessage('system', csQwenImage21SystemPrompt)],
+    {AddGenerationPrompt=}false));
+  Result := Tokenizer.Encode(QwenImage21TextToImagePrompt(Prompt));
+end;
+
 // ===========================================================================
 // RAFT optical-flow importer (model_type "raft_small"). See the interface
 // section for the architecture summary. Coded by Claude (AI).
@@ -80913,7 +81121,7 @@ function PretrainedModelTypeCanBorrowWeights(const ModelType: string): boolean;
 begin
   Result := (ModelType = 'llama') or (ModelType = 'mistral') or
     (ModelType = 'qwen2') or (ModelType = 'qwen3') or
-    (ModelType = 'qwen3_moe') or
+    (ModelType = 'qwen3_moe') or (ModelType = 'qwen3_vl') or
     (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_moe') or
     (ModelType = 'gemma') or (ModelType = 'gemma2') or
     (ModelType = 'gemma3_text') or (ModelType = 'phi3') or
@@ -81145,8 +81353,8 @@ begin
     Result := BuildLlama4FromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if PretrainedModelTypeCanBorrowWeights(ModelType) then
-    // llama, mistral, qwen2, qwen3, qwen3_moe, qwen3_5, qwen3_5_moe, gemma,
-    // gemma2, gemma3_text, phi3, olmo2, olmoe, mixtral, glm4, granite,
+    // llama, mistral, qwen2, qwen3, qwen3_moe, qwen3_vl, qwen3_5,
+    // qwen3_5_moe, gemma, gemma2, gemma3_text, phi3, olmo2, olmoe, mixtral, glm4, granite,
     // granitemoe, minicpm, bitnet - the one Llama builder, so these are also
     // the families whose twin can borrow a loaded net's weights.
     // 'glm4' (architectures ["Glm4ForCausalLM"], THUDM/GLM-4-9B-0414 etc.)

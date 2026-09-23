@@ -22,7 +22,7 @@ uses
   Classes, SysUtils, Math, fpcunit, testregistry, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralmxfp4, neuralnf4, neuralpretrained, neuralhftokenizer, neuralaudio,
-  neuralchatengine,
+  neuralchatengine, neuralchat,
   neuraldecode, neuraldiffusion;
 
 type
@@ -45,6 +45,10 @@ type
       pQuantizeInt8: boolean = false; pWeightOwner: TNNet = nil): TNNet;
     // Largest |A[i] - B[i]| over two volumes of the same size.
     function MaxAbsVolumeDiff(A, B: TNNetVolume): double;
+    // Loads a {"shape": [T, C], "data": [...]} oracle tensor of Root as a
+    // (T,1,C) token-major volume.
+    procedure LoadOracleTokenTensor(Root: TJSONData; const Key: string;
+      Dest: TNNetVolume);
     // Windows of StepTokens through WindowSession over the first
     // PrefillTokenCount tokens, snapshot handoff, then width-1 for the rest.
     // The first HiddenOnlyTokenCount tokens step with StepForwardToHidden
@@ -671,6 +675,10 @@ type
     procedure TestPaliGemmaLogitParity;
     procedure TestQwen2VLMRoPEPositionIds;
     procedure TestQwen2VLLogitParity;
+    procedure TestQwen3VLTextEncoderPreNormParity;
+    procedure TestQwen3VLTextOnlyMRoPEEqualsRoPE;
+    procedure TestQwenImage21PromptTemplateIds;
+    procedure TestQwen3VLTextEncoderInt8Drift;
     procedure TestQwen2AudioConfigFromJSONFile;
     procedure TestQwen2AudioParity;
     procedure TestViTConfigFromJSONFile;
@@ -9300,6 +9308,26 @@ begin
     Diff := Abs(A.FData[Pos] - B.FData[Pos]);
     if Diff > Result then Result := Diff;
   end;
+end;
+
+procedure TTestNeuralPretrained.LoadOracleTokenTensor(Root: TJSONData;
+  const Key: string; Dest: TNNetVolume);
+var
+  TensorObj: TJSONObject;
+  ShapeArr, DataArr: TJSONArray;
+  MaxDataPos, DataPos: integer;
+begin
+  TensorObj := TJSONObject(TJSONObject(Root).Find(Key));
+  AssertTrue('oracle tensor "' + Key + '" present', TensorObj <> nil);
+  ShapeArr := TJSONArray(TensorObj.Find('shape'));
+  DataArr := TJSONArray(TensorObj.Find('data'));
+  AssertEquals('oracle tensor "' + Key + '" rank', 2, ShapeArr.Count);
+  Dest.ReSize(ShapeArr.Integers[0], 1, ShapeArr.Integers[1]);
+  AssertEquals('oracle tensor "' + Key + '" data size', Dest.Size,
+    DataArr.Count);
+  MaxDataPos := DataArr.Count - 1;
+  for DataPos := 0 to MaxDataPos do
+    Dest.FData[DataPos] := DataArr.Floats[DataPos];
 end;
 
 // The production prefill shape: the first PrefillTokenCount tokens go through
@@ -24865,6 +24893,309 @@ begin
     VisualScratch.Free;
     RefJson.Free;
     TextNet.Free;
+  end;
+end;
+
+// Qwen-Image-2.1 text encoder (tests/fixtures/tiny_qwenimage21/text_encoder,
+// a pico Qwen3-VL: 2 layers, 4 q / 2 kv heads, head_dim 16, qk-norm, a
+// 1-block vision tower and an untied lm_head, all BF16). The transformer reads
+// the LAST decoder block's output BEFORE the final RMSNorm; the float64 HF
+// oracle holds it for 14 token ids. Weights are BF16 (exact in float32), so
+// the only error is float32 compute: tolerance 1e-4 absolute on values up to
+// 5.5 (measured max 2.7e-6).
+// Also covers: the padded build (SeqLen 20 > 14 tokens; the causal mask keeps
+// the first rows exact), the drop, and the BuildFromPretrained LM route whose
+// final-norm input/output must match the same oracle.
+procedure TTestNeuralPretrained.TestQwen3VLTextEncoderPreNormParity;
+var
+  Encoder, LMNet: TNNet;
+  Config: TQwen3VLConfig;
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  IdsArr: TJSONArray;
+  TokenIds: array of integer;
+  Expected, ExpectedDropped, ExpectedNormed, Hidden: TNNetVolume;
+  TokenCount, DropCount, TokenPos, LayerCnt, LastIdx: integer;
+  MaxDiff: double;
+begin
+  RefJson := TStringList.Create;
+  Expected := TNNetVolume.Create;
+  ExpectedDropped := TNNetVolume.Create;
+  ExpectedNormed := TNNetVolume.Create;
+  Hidden := TNNetVolume.Create;
+  RefRoot := nil;
+  Encoder := nil;
+  LMNet := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_text_encoder_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    IdsArr := TJSONArray(TJSONObject(RefRoot).Find('token_ids'));
+    TokenCount := IdsArr.Count;
+    SetLength(TokenIds, TokenCount);
+    for TokenPos := 0 to TokenCount - 1 do
+      TokenIds[TokenPos] := IdsArr.Integers[TokenPos];
+    DropCount := TJSONObject(RefRoot).Get('drop_idx', 0);
+    LoadOracleTokenTensor(RefRoot, 'hidden_last_layer', Expected);
+    LoadOracleTokenTensor(RefRoot, 'prompt_embeds', ExpectedDropped);
+    LoadOracleTokenTensor(RefRoot, 'hidden_after_final_norm', ExpectedNormed);
+
+    Encoder := BuildQwen3VLTextEncoderFromSafeTensors(
+      FixturePath('tiny_qwenimage21/text_encoder/model.safetensors'), Config,
+      {pSeqLen=}TokenCount);
+    AssertEquals('model_type', 'qwen3_vl', Config.Text.ModelType);
+    AssertEquals('layers', 2, Config.Text.NumLayers);
+    AssertEquals('heads', 4, Config.Text.NumHeads);
+    AssertEquals('kv_heads', 2, Config.Text.NumKVHeads);
+    AssertEquals('head_dim', 16, Config.Text.HeadDim);
+    AssertTrue('qk_norm', Config.Text.QKNorm);
+    AssertFalse('qkv_bias', Config.Text.QKVBias);
+    AssertFalse('untied', Config.Text.TieWordEmbeddings);
+    AssertFalse('text path uses 1-D RoPE', Config.Text.MRoPEEnabled);
+    AssertEquals('rope_theta', 5000000.0, Config.Text.RopeTheta, 1.0);
+    AssertEquals('prefix', 'model.language_model.', Config.Text.Prefix);
+    AssertEquals('image_token_id', 290, Config.ImageTokenId);
+    AssertEquals('video_token_id', 291, Config.VideoTokenId);
+    AssertTrue('encoder ends at the last block residual sum',
+      Encoder.GetLastLayer() is TNNetSum);
+    AssertEquals('encoder output depth = hidden', Config.Text.HiddenSize,
+      Encoder.GetLastLayer().Output.Depth);
+    for LayerCnt := 0 to Encoder.GetLastLayerIdx() do
+      AssertFalse('no LM head layer in the encoder (layer ' +
+        IntToStr(LayerCnt) + ')',
+        (Encoder.Layers[LayerCnt] is TNNetPointwiseConvLinear) and
+        (Encoder.Layers[LayerCnt].Output.Depth = Config.Text.VocabSize));
+
+    Qwen3VLEncodeHiddenStates(Encoder, Config, TokenIds, 0, Hidden);
+    AssertEquals('rows', TokenCount, Hidden.SizeX);
+    AssertEquals('depth', 64, Hidden.Depth);
+    MaxDiff := MaxAbsVolumeDiff(Hidden, Expected);
+    AssertTrue('pre-norm hidden states: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+    Qwen3VLEncodeHiddenStates(Encoder, Config, TokenIds, DropCount, Hidden);
+    AssertEquals('dropped rows', TokenCount - DropCount, Hidden.SizeX);
+    MaxDiff := MaxAbsVolumeDiff(Hidden, ExpectedDropped);
+    AssertTrue('prompt_embeds (drop ' + IntToStr(DropCount) +
+      '): max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
+      MaxDiff < 1e-4);
+    FreeAndNil(Encoder);
+
+    Encoder := BuildQwen3VLTextEncoderFromSafeTensors(
+      FixturePath('tiny_qwenimage21/text_encoder/model.safetensors'), Config,
+      {pSeqLen=}TokenCount + 6);
+    Qwen3VLEncodeHiddenStates(Encoder, Config, TokenIds, DropCount, Hidden);
+    MaxDiff := MaxAbsVolumeDiff(Hidden, ExpectedDropped);
+    AssertTrue('right-padded encoder: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-4', MaxDiff < 1e-4);
+
+    LMNet := BuildFromPretrained(
+      FixturePath('tiny_qwenimage21/text_encoder/model.safetensors'),
+      {pSeqLen=}TokenCount, {pTrainable=}false);
+    Hidden.ReSize(TokenCount, 1, 1);
+    for TokenPos := 0 to TokenCount - 1 do
+      Hidden.FData[TokenPos] := TokenIds[TokenPos];
+    LMNet.Compute(Hidden);
+    LastIdx := LMNet.GetLastLayerIdx();
+    AssertEquals('LM route: logits depth = vocab', 300,
+      LMNet.GetLastLayer().Output.Depth);
+    AssertTrue('LM route: final RMSNorm before the head',
+      LMNet.Layers[LastIdx - 1] is TNNetTokenRMSNorm);
+    MaxDiff := MaxAbsVolumeDiff(LMNet.Layers[LastIdx - 2].Output, Expected);
+    AssertTrue('LM route: final-norm input max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    MaxDiff := MaxAbsVolumeDiff(LMNet.Layers[LastIdx - 1].Output,
+      ExpectedNormed);
+    AssertTrue('LM route: final-norm output max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    LMNet.Free;
+    Encoder.Free;
+    RefRoot.Free;
+    Hidden.Free;
+    ExpectedNormed.Free;
+    ExpectedDropped.Free;
+    Expected.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Text-only interleaved M-RoPE (mrope_section [4,2,2]) with equal T/H/W
+// positions equals plain 1-D rotate-half RoPE: the two float64 oracles agree
+// exactly, and the encoder (1-D RoPE, no TNNetMRotaryEmbedding) matches both.
+// An image/video placeholder id must be refused, not rotated as text.
+procedure TTestNeuralPretrained.TestQwen3VLTextOnlyMRoPEEqualsRoPE;
+var
+  Encoder: TNNet;
+  Config: TQwen3VLConfig;
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  IdsArr, MRoPEData, RoPEData: TJSONArray;
+  TokenIds: array of integer;
+  ExpectedMRoPE, ExpectedRoPE, Hidden: TNNetVolume;
+  TokenCount, TokenPos, DataPos, LayerCnt: integer;
+  OracleDiff, MaxDiff: double;
+  Refused: boolean;
+begin
+  RefJson := TStringList.Create;
+  ExpectedMRoPE := TNNetVolume.Create;
+  ExpectedRoPE := TNNetVolume.Create;
+  Hidden := TNNetVolume.Create;
+  RefRoot := nil;
+  Encoder := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_text_encoder_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    MRoPEData := TJSONArray(TJSONObject(TJSONObject(RefRoot).Find(
+      'hidden_last_layer')).Find('data'));
+    RoPEData := TJSONArray(TJSONObject(TJSONObject(RefRoot).Find(
+      'hidden_last_layer_1d_rope')).Find('data'));
+    AssertEquals('oracle sizes', MRoPEData.Count, RoPEData.Count);
+    OracleDiff := 0;
+    for DataPos := 0 to MRoPEData.Count - 1 do
+      OracleDiff := Max(OracleDiff,
+        Abs(MRoPEData.Floats[DataPos] - RoPEData.Floats[DataPos]));
+    AssertTrue('float64 M-RoPE and 1-D RoPE oracles agree: max |diff| = ' +
+      FloatToStr(OracleDiff), OracleDiff <= 1e-12);
+    LoadOracleTokenTensor(RefRoot, 'hidden_last_layer', ExpectedMRoPE);
+    LoadOracleTokenTensor(RefRoot, 'hidden_last_layer_1d_rope', ExpectedRoPE);
+    IdsArr := TJSONArray(TJSONObject(RefRoot).Find('token_ids'));
+    TokenCount := IdsArr.Count;
+    SetLength(TokenIds, TokenCount);
+    for TokenPos := 0 to TokenCount - 1 do
+      TokenIds[TokenPos] := IdsArr.Integers[TokenPos];
+
+    Encoder := BuildQwen3VLTextEncoderFromSafeTensors(
+      FixturePath('tiny_qwenimage21/text_encoder/model.safetensors'), Config,
+      {pSeqLen=}TokenCount);
+    for LayerCnt := 0 to Encoder.GetLastLayerIdx() do
+      AssertFalse('no M-RoPE layer on the text path (layer ' +
+        IntToStr(LayerCnt) + ')',
+        Encoder.Layers[LayerCnt] is TNNetMRotaryEmbedding);
+    Qwen3VLEncodeHiddenStates(Encoder, Config, TokenIds, 0, Hidden);
+    MaxDiff := MaxAbsVolumeDiff(Hidden, ExpectedRoPE);
+    AssertTrue('encoder vs 1-D RoPE oracle: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+    MaxDiff := MaxAbsVolumeDiff(Hidden, ExpectedMRoPE);
+    AssertTrue('encoder vs M-RoPE oracle: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+
+    TokenIds[3] := Config.ImageTokenId;
+    Refused := false;
+    try
+      Qwen3VLEncodeHiddenStates(Encoder, Config, TokenIds, 0, Hidden);
+    except
+      on E: EPretrainedImportError do Refused := true;
+    end;
+    AssertTrue('an image placeholder id must be refused', Refused);
+  finally
+    Encoder.Free;
+    RefRoot.Free;
+    Hidden.Free;
+    ExpectedRoPE.Free;
+    ExpectedMRoPE.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Qwen-Image-2.1 text-to-image template and drop count. The template string
+// must equal the real pipeline's (fixture from the real Qwen-Image-2.1
+// processor); the fixture's ids are consistent with drop_idx = 14 = the
+// system message's token count. The real tokenizer.json (~11 MB) is not
+// committed, so QwenImage21EncodeTextToImagePrompt's derivation is checked
+// with the tiny Qwen2 BPE fixture: DropCount = token count of the rendered
+// system message, and the prompt ids start with exactly those tokens.
+procedure TTestNeuralPretrained.TestQwenImage21PromptTemplateIds;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Cases, SysArr, InputArr, EmbedArr: TJSONArray;
+  CaseObj: TJSONObject;
+  Tokenizer: TNeuralHFTokenizer;
+  SystemIds, PromptIds: TNeuralIntegerArray;
+  CaseCnt, TokenPos, DropIdx, DropCount: integer;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Tokenizer := TNeuralHFTokenizer.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('qwenimage21_prompt_tokens.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    AssertEquals('system prompt', csQwenImage21SystemPrompt,
+      TJSONObject(RefRoot).Get('system_prompt', ''));
+    AssertEquals('rendered system message',
+      TJSONObject(RefRoot).Get('system_chat_template_text', ''),
+      ApplyChatTemplate(cfChatML,
+        [ChatMessage('system', csQwenImage21SystemPrompt)], false));
+    SysArr := TJSONArray(TJSONObject(RefRoot).Find('system_token_ids'));
+    DropIdx := TJSONObject(RefRoot).Get('drop_idx', 0);
+    AssertEquals('drop_idx', 14, DropIdx);
+    AssertEquals('drop_idx = system message token count', SysArr.Count,
+      DropIdx);
+    Cases := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertEquals('cases', 3, Cases.Count);
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := TJSONObject(Cases.Items[CaseCnt]);
+      AssertEquals('template text, case ' + IntToStr(CaseCnt),
+        CaseObj.Get('template_text', ''),
+        QwenImage21TextToImagePrompt(CaseObj.Get('prompt', '')));
+      InputArr := TJSONArray(CaseObj.Find('input_ids'));
+      EmbedArr := TJSONArray(CaseObj.Find('embed_ids'));
+      for TokenPos := 0 to DropIdx - 1 do
+        AssertEquals('system prefix id ' + IntToStr(TokenPos),
+          SysArr.Integers[TokenPos], InputArr.Integers[TokenPos]);
+      AssertEquals('embed ids = input ids after the drop',
+        InputArr.Count - DropIdx, EmbedArr.Count);
+      for TokenPos := 0 to EmbedArr.Count - 1 do
+        AssertEquals('embed id ' + IntToStr(TokenPos),
+          InputArr.Integers[DropIdx + TokenPos], EmbedArr.Integers[TokenPos]);
+    end;
+    AssertEquals('an empty prompt becomes a space',
+      QwenImage21TextToImagePrompt(' '), QwenImage21TextToImagePrompt(''));
+
+    Tokenizer.LoadFromFile(FixturePath('tiny_bpe_split_qwen2_tokenizer.json'));
+    PromptIds := QwenImage21EncodeTextToImagePrompt(Tokenizer,
+      'A red fox in the snow', DropCount);
+    SystemIds := Tokenizer.Encode(ApplyChatTemplate(cfChatML,
+      [ChatMessage('system', csQwenImage21SystemPrompt)], false));
+    AssertEquals('DropCount = system message token count', Length(SystemIds),
+      DropCount);
+    AssertTrue('prompt longer than the system message',
+      Length(PromptIds) > DropCount);
+    for TokenPos := 0 to DropCount - 1 do
+      AssertEquals('prompt starts with the system tokens, id ' +
+        IntToStr(TokenPos), SystemIds[TokenPos], PromptIds[TokenPos]);
+  finally
+    Tokenizer.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// int8 load of the Qwen3-VL text encoder (the 8B needs it: ~8 GB int8). The
+// armed build streams every projection straight into int8; its pre-norm
+// hidden states must stay within 5% of the largest FP32 hidden value (pico
+// widths overstate int8 drift; measured 1.9%).
+procedure TTestNeuralPretrained.TestQwen3VLTextEncoderInt8Drift;
+var
+  NNFP32, NNQ: TNNet;
+  Config: TQwen3VLConfig;
+begin
+  NNFP32 := nil;
+  NNQ := nil;
+  try
+    NNFP32 := BuildQwen3VLTextEncoderFromSafeTensors(
+      FixturePath('tiny_qwenimage21/text_encoder/model.safetensors'), Config,
+      {pSeqLen=}14);
+    NNQ := BuildQwen3VLTextEncoderFromSafeTensors(
+      FixturePath('tiny_qwenimage21/text_encoder/model.safetensors'), Config,
+      {pSeqLen=}14, {pQuantizeInt8=}true);
+    // 2 blocks x (q, k, v, o, gate|up, down).
+    AssertInt8DriftPair('Qwen3-VL text encoder', NNFP32, NNQ, 14,
+      Config.Text.VocabSize, {MinQuantLayers=}12, {MaxRelDrift=}5e-2,
+      {TwoChannelInput=}false);
+  finally
+    NNQ.Free;
+    NNFP32.Free;
   end;
 end;
 

@@ -1808,10 +1808,11 @@ rather than acted on.
         `TNNetDiffusionScheduler` or a new class): dynamic exponential shift,
         `shift_terminal`, velocity step. JSON oracle test. Independent.
         Done: new class `TNNetFlowMatchEulerScheduler` (CalculateShift, TimeShift, SetSigmas, SetTimesteps, Step); tests `TestFlowMatch*` in `tests/TestNeuralDiffusion.pas`.
-  - [ ] A2. Qwen3-VL text encoder as prompt encoder: route `qwen3_vl` to the Qwen3
+  - [x] A2. Qwen3-VL text encoder as prompt encoder: route `qwen3_vl` to the Qwen3
         builder (`model.language_model.` prefix, skip `model.visual.*` and `lm_head`,
         int8 load); test that text-only interleaved M-RoPE equals 1D RoPE; API returning
         pre-final-norm last-layer hidden states; template + tokenization + drop_idx.
+        Done: `BuildQwen3VLTextEncoderFromSafeTensors` (Llama builder, `pStopBeforeFinalNorm`), `Qwen3VLEncodeHiddenStates`, `QwenImage21TextToImagePrompt`, `QwenImage21EncodeTextToImagePrompt`; `qwen3_vl` also in `BuildFromPretrained`; tests `TestQwen3VL*`, `TestQwenImage21PromptTemplateIds`.
   - [ ] A3. Qwen-Image RoPE: extend `TNNetMRotaryEmbedding` for the consecutive-pair
         layout, 16/56/56 sections and negative positions; position builder (text
         0..L-1, image frame = L, centred h/w grid).
