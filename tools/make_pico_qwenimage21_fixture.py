@@ -27,7 +27,8 @@ Outputs (all under tests/fixtures/):
   tiny_qwenimage21_vae_io.json             A6: latent de-normalisation + decode
   tiny_qwenimage21_vae_tiled_io.json       A6: 64x64 decode, whole and tiled
   tiny_qwenimage21_pipeline_io.json        A7: pico pipeline, fixed latents and
-                                           fixed prompt embeds
+                                           fixed prompt embeds (32x64)
+  tiny_qwenimage21_pipeline_64_io.json     A7: the same at 64x64
 
 Precision. Weights are rounded to their storage dtype (BF16 for the text
 encoder and transformer, F32 for the VAE) and every forward then runs in
@@ -139,6 +140,7 @@ VAE_TILINGS = [(32, 16), (48, 32)]    # (tile_sample_min, tile_sample_stride) in
 VAE_DUPUP_CASES = [(8, 8, 2), (8, 4, 2), (4, 2, 1), (3, 6, 2), (4, 4, 1)]  # (in, out, factor_t)
 
 PIPE_HEIGHT, PIPE_WIDTH, PIPE_STEPS = 32, 64, 3
+PIPE_64_SIZE = 64                     # the square dev-box size of the A7 example
 
 
 # ---------------- JSON helpers ----------------
@@ -828,11 +830,12 @@ class TemplateOnlyProcessor:
         return [[0] * self.drop_idx]
 
 
-def make_pipeline_oracle(transformer, vae, text_encoder, embeds):
+def make_pipeline_oracle(transformer, vae, text_encoder, embeds, height=PIPE_HEIGHT, width=PIPE_WIDTH,
+                         file_name="tiny_qwenimage21_pipeline_io.json"):
     scheduler = FlowMatchEulerDiscreteScheduler.from_config(SCHEDULER_CONFIG)
     pipe = QwenImage21Pipeline(scheduler=scheduler, vae=vae, text_encoder=text_encoder,
                                processor=TemplateOnlyProcessor(TE_DROP_IDX), transformer=transformer)
-    latent_h, latent_w = 2 * (PIPE_HEIGHT // 32), 2 * (PIPE_WIDTH // 32)
+    latent_h, latent_w = 2 * (height // 32), 2 * (width // 32)
     gen = torch.Generator().manual_seed(17)
     initial = torch.randn(1, latent_h * latent_w, TR_CHANNELS, generator=gen, dtype=torch.float64)
     prompt_embeds = embeds[None].clone()
@@ -855,7 +858,7 @@ def make_pipeline_oracle(transformer, vae, text_encoder, embeds):
 
         vae.decode = recording_decode
         try:
-            image = pipe(prompt_embeds=prompt_embeds, height=PIPE_HEIGHT, width=PIPE_WIDTH,
+            image = pipe(prompt_embeds=prompt_embeds, height=height, width=width,
                          num_inference_steps=PIPE_STEPS, latents=initial.clone(), output_type="pt",
                          callback_on_step_end=on_step, use_kv_cache=use_kv_cache).images
         finally:
@@ -867,8 +870,8 @@ def make_pipeline_oracle(transformer, vae, text_encoder, embeds):
         image_nocache, step_latents_nocache, *_ = run(False)
     cache_vs_nocache = max_abs_diff(step_latents[-1], step_latents_nocache[-1])
     assert cache_vs_nocache < 1e-12, cache_vs_nocache
-    write_json("tiny_qwenimage21_pipeline_io.json", {
-        "height": PIPE_HEIGHT, "width": PIPE_WIDTH, "num_inference_steps": PIPE_STEPS,
+    write_json(file_name, {
+        "height": height, "width": width, "num_inference_steps": PIPE_STEPS,
         "latent_grid": [1, latent_h, latent_w],
         "prompt_embeds": tensor_json(prompt_embeds[0]),
         "initial_latents": tensor_json(initial[0]),
@@ -915,6 +918,9 @@ def main():
     time_conv_calls = make_vae_oracle(vae, vae_reloaded)
     make_pipeline_oracle(transformer, vae, text_encoder, embeds)
     make_vae_tiled_oracle(vae)
+    # Last, so every fixture above is unchanged by its addition.
+    make_pipeline_oracle(transformer, vae, text_encoder, embeds, PIPE_64_SIZE, PIPE_64_SIZE,
+                         "tiny_qwenimage21_pipeline_64_io.json")
     print(f"time_conv calls during a single-image decode: {time_conv_calls}")
 
 

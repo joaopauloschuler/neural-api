@@ -1837,7 +1837,7 @@ rather than acted on.
         tiled decode (2048x2048 full-resolution activations are ~2.4 GB each). Pico
         parity. Independent.
         Done: class `TQwenImage21VaeDecoder` (1x1-latent weight owner + borrowing sized net; `Decode`, `DecodeTiled` = diffusers tiled_decode), `ReadQwenImage21VaeConfig`, `BuildQwenImage21VaeDecoderNet`, `LoadQwenImage21VaeDecoderWeights` (skips time_conv, folds latents_mean/std into post_quant_conv), `QwenImage21DupUpChannels` + `AddQwenImage21DupUp`; conv kernels now clamp to the PADDED input; tests `TestQwenImage21Vae*`. Real-size activations (weights 1.01 GB): 0.58 GB at 64x64, ~9.3 GB at 256x256 (one default tile), ~149 GB untiled at 1024x1024, ~73% of it per-conv im2col/pad/raw buffers.
-  - [ ] A7. Pipeline + `examples/QwenImage` CLI: read the `model_index.json` folder,
+  - [x] A7. Pipeline + `examples/QwenImage` CLI: read the `model_index.json` folder,
         tokenize, encode, free the text encoder, denoise, decode, save PNG WITH ALPHA
         (check that `SaveImageFromVolumeIntoFile` writes RGBA). `--width --height
         --steps --seed --int8/--int4 --opencl`. End-to-end pico parity with fixed
@@ -1845,6 +1845,7 @@ rather than acted on.
         pico checkpoint on the dev box (extend the generator with a 64x64 case);
         real weights on the GPU box, a 256x256 smoke test first, then 1024x1024 and
         beyond, compared per step against diffusers with the same initial latents.
+        Done: class `TQwenImage21Pipeline` (neuralpretrained.pas: `TokenizePrompt`, `EncodeTokenIds`, `MakeInitialLatents`, `Denoise`, `DecodeLatents`, `GenerateFromEmbeds`, `Generate`, `RoundDownImageSide`, events `OnPhase`/`OnStep`), `TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfig` + `ShiftForImageSeqLen`, RGBA PNG in `SaveImageFromVolumeIntoFile` / `LoadImageIntoVolume(.., pWithAlpha)`; `examples/QwenImage` (`--model --prompt --output --width --height --steps --seed --int8|--int4 --int8-input --vae-tile S[,T] --token-ids --drop-count`, no `--opencl`); tests `TestQwenImage21Pipeline*`, `TestQwen3VLEncodeRefusesOutOfVocabIds`, `TestFlowMatchFromDiffusersConfig`, `TestSaveImageRGBAPngRoundTrip`; fixture `tiny_qwenimage21_pipeline_64_io.json`. Real weights NOT yet run.
   - [ ] A8. Docs: README entry marked "planned (coded)" until a user-tested real run.
   Phase B — speed (after a first real measurement on the GPU box):
   - [ ] B1. OpenCL for the step pass: GEMM projections (4096 x 4096 activations) and

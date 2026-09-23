@@ -82,6 +82,7 @@ type
     procedure TestFlowMatchSigmasVsOracle;
     procedure TestFlowMatchStepVsOracle;
     procedure TestFlowMatchStaticAndLinearShift;
+    procedure TestFlowMatchFromDiffusersConfig;
   end;
 
 implementation
@@ -1006,6 +1007,61 @@ begin
   finally
     Sched.Free;
   end;
+end;
+
+// CreateFromDiffusersConfig on the real Qwen-Image-2.1 scheduler_config.json
+// (copied into the pico folder): every field, mu at both ends of the line, the
+// 3-step schedule the pipeline oracle recorded, and a refused Karras config.
+procedure TTestNeuralDiffusion.TestFlowMatchFromDiffusersConfig;
+var
+  Sched: TNNetFlowMatchEulerScheduler;
+  ConfigFile, KarrasFile: string;
+  Lines: TStringList;
+  Refused: boolean;
+begin
+  ConfigFile := 'fixtures' + DirectorySeparator + 'tiny_qwenimage21' +
+    DirectorySeparator + 'scheduler' + DirectorySeparator +
+    'scheduler_config.json';
+  if not FileExists(ConfigFile) then
+    ConfigFile := 'tests' + DirectorySeparator + ConfigFile;
+  Sched := TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfig(ConfigFile);
+  try
+    AssertEquals('num_train_timesteps', 1000, Sched.NumTrainTimesteps);
+    AssertTrue('use_dynamic_shifting', Sched.UseDynamicShifting);
+    AssertTrue('exponential', Sched.TimeShiftType = ftsExponential);
+    AssertEquals('shift_terminal', 0.02, Sched.ShiftTerminal, 1e-15);
+    AssertEquals('base_image_seq_len', 256, Sched.BaseImageSeqLen);
+    AssertEquals('max_image_seq_len', 8192, Sched.MaxImageSeqLen);
+    AssertEquals('mu at 256 tokens', 0.5, Sched.ShiftForImageSeqLen(256), 1e-12);
+    AssertEquals('mu at 8192 tokens', 0.9, Sched.ShiftForImageSeqLen(8192),
+      1e-12);
+    // tiny_qwenimage21_pipeline_io.json: 8 image tokens, 3 steps (float32).
+    Sched.SetTimesteps(3, Sched.ShiftForImageSeqLen(8));
+    AssertEquals('sigma 0', 1.0, Sched.Sigma[0], 1e-7);
+    AssertEquals('sigma 1', 0.5823222398757935, Sched.Sigma[1], 1e-7);
+    AssertEquals('sigma 2', 0.019999980926513672, Sched.Sigma[2], 1e-7);
+  finally
+    Sched.Free;
+  end;
+  KarrasFile := GetTempDir(true) + 'karras_scheduler_config.json';
+  Lines := TStringList.Create;
+  try
+    Lines.Text := '{"use_karras_sigmas": true}';
+    Lines.SaveToFile(KarrasFile);
+  finally
+    Lines.Free;
+  end;
+  Refused := false;
+  try
+    try
+      TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfig(KarrasFile).Free;
+    except
+      on Exception do Refused := true;
+    end;
+  finally
+    DeleteFile(KarrasFile);
+  end;
+  AssertTrue('Karras sigmas are refused', Refused);
 end;
 
 initialization

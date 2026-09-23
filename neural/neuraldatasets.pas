@@ -187,8 +187,12 @@ type
     TrainingProp, ValidationProp, TestProp: single);
 
   {$IFDEF FPC}
-  procedure LoadImageIntoVolume(M: TFPMemoryImage; Vol:TNNetVolume);
+  // Vol becomes (W,H,3) RGB, or (W,H,4) RGBA with pWithAlpha; 0..255 each.
+  procedure LoadImageIntoVolume(M: TFPMemoryImage; Vol:TNNetVolume;
+    pWithAlpha: boolean = false);
+  // Depth 4 carries the 4th channel as alpha; smaller depths are opaque.
   procedure LoadVolumeIntoImage(Vol:TNNetVolume; M: TFPMemoryImage);
+  // A depth-4 volume saved as .png keeps its alpha channel (0..255 each).
   function SaveImageFromVolumeIntoFile(V:TNNetVolume; ImageFileName:string):boolean;
   {$ENDIF}
 
@@ -2867,22 +2871,41 @@ function SaveImageFromVolumeIntoFile(V: TNNetVolume; ImageFileName: string
   ): boolean;
 var
   M: TFPMemoryImage;
+  PngWriter: TFPWriterPNG;
 begin
   M := TFPMemoryImage.Create(V.SizeX, V.SizeY);
-  LoadVolumeIntoImage(V, M);
-  Result := M.SaveToFile(ImageFileName);
-  M.Free;
+  PngWriter := nil;
+  try
+    LoadVolumeIntoImage(V, M);
+    if (V.Depth = 4) and (LowerCase(ExtractFileExt(ImageFileName)) = '.png') then
+    begin
+      // The default PNG writer drops alpha. With UseAlpha, an alpha stored as
+      // byte shl 8 (never $FFFF) makes it write 8-bit colour type 6, RGBA.
+      PngWriter := TFPWriterPNG.Create;
+      PngWriter.UseAlpha := true;
+      PngWriter.WordSized := false;
+      M.SaveToFile(ImageFileName, PngWriter);
+      Result := true;
+    end
+    else
+      Result := M.SaveToFile(ImageFileName);
+  finally
+    PngWriter.Free;
+    M.Free;
+  end;
 end;
 
-procedure LoadImageIntoVolume(M: TFPMemoryImage; Vol:TNNetVolume);
+procedure LoadImageIntoVolume(M: TFPMemoryImage; Vol:TNNetVolume;
+  pWithAlpha: boolean);
 var
   CountX, CountY, MaxX, MaxY: integer;
   LocalColor: TFPColor;
-  RawPos: integer;
+  RawPos, PixelStride: integer;
 begin
   MaxX := M.Width - 1;
   MaxY := M.Height - 1;
-  Vol.ReSize(MaxX + 1, MaxY + 1, 3);
+  if pWithAlpha then PixelStride := 4 else PixelStride := 3;
+  Vol.ReSize(MaxX + 1, MaxY + 1, PixelStride);
 
   for CountY := 0 to MaxY do
   begin
@@ -2894,7 +2917,8 @@ begin
       Vol.FData[RawPos]     := LocalColor.red shr 8;
       Vol.FData[RawPos + 1] := LocalColor.green shr 8;
       Vol.FData[RawPos + 2] := LocalColor.blue shr 8;
-      Inc(RawPos, 3);
+      if pWithAlpha then Vol.FData[RawPos + 3] := LocalColor.alpha shr 8;
+      Inc(RawPos, PixelStride);
     end;
   end;
 end;
@@ -2903,11 +2927,15 @@ procedure LoadVolumeIntoImage(Vol: TNNetVolume; M: TFPMemoryImage);
 var
   CountX, CountY, MaxX, MaxY: integer;
   LocalColor: TFPColor;
-  RawPos: integer;
+  RawPos, PixelStride: integer;
+  HasAlpha: boolean;
 begin
   MaxX := Vol.SizeX - 1;
   MaxY := Vol.SizeY - 1;
   M.SetSize(Vol.SizeX, Vol.SizeY);
+  HasAlpha := Vol.Depth = 4;
+  if HasAlpha then PixelStride := 4 else PixelStride := 3;
+  LocalColor.alpha := alphaOpaque;
   for CountY := 0 to MaxY do
   begin
     RawPos := Vol.GetRawPos(0, CountY, 0);
@@ -2916,8 +2944,10 @@ begin
       LocalColor.red := NeuronForceMinMax(Round(Vol.FData[RawPos]),0,255) shl 8;
       LocalColor.green := NeuronForceMinMax(Round(Vol.FData[RawPos + 1]),0,255) shl 8;
       LocalColor.blue := NeuronForceMinMax(Round(Vol.FData[RawPos + 2]),0, 255) shl 8;
+      if HasAlpha then
+        LocalColor.alpha := NeuronForceMinMax(Round(Vol.FData[RawPos + 3]),0,255) shl 8;
       M.Colors[CountX, CountY] := LocalColor;
-      Inc(RawPos, 3);
+      Inc(RawPos, PixelStride);
     end;
   end;
 end;

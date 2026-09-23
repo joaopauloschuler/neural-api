@@ -309,6 +309,9 @@ type
     FUseDynamicShifting: boolean;
     FTimeShiftType: TNNetFlowTimeShift;
     FShiftTerminal: double;
+    // calculate_shift's two (image token count, mu) points.
+    FBaseImageSeqLen, FMaxImageSeqLen: integer;
+    FBaseShift, FMaxShift: double;
     // NumSteps + 1 entries, descending, the last one 0 (the clean sample).
     FSigmas: array of double;
     function GetNumSteps: integer;
@@ -321,11 +324,17 @@ type
       pShift: double = 1.0; pUseDynamicShifting: boolean = false;
       pTimeShiftType: TNNetFlowTimeShift = ftsExponential;
       pShiftTerminal: double = 0.0);
+    // Reads a diffusers FlowMatchEulerDiscreteScheduler scheduler_config.json;
+    // raises on a setting this class does not implement (Karras sigmas, ...).
+    constructor CreateFromDiffusersConfig(const FileName: string);
     // diffusers calculate_shift: mu linear in the image token count through
     // (BaseSeqLen, BaseShift) and (MaxSeqLen, MaxShift); extrapolates outside.
     class function CalculateShift(ImageSeqLen: integer;
       BaseSeqLen: integer = 256; MaxSeqLen: integer = 4096;
       BaseShift: double = 0.5; MaxShift: double = 1.15): double;
+    // CalculateShift through this scheduler's BaseImageSeqLen/MaxImageSeqLen
+    // and BaseShift/MaxShift (the pipelines' mu for ImageSeqLen image tokens).
+    function ShiftForImageSeqLen(ImageSeqLen: integer): double;
     // Applies the dynamic time shift of type TimeShiftType to one sigma in (0, 1].
     function TimeShift(Mu, Sigma: double): double;
     // diffusers set_timesteps(sigmas=...): shift (static or dynamic with Mu),
@@ -348,9 +357,16 @@ type
     property UseDynamicShifting: boolean read FUseDynamicShifting;
     property TimeShiftType: TNNetFlowTimeShift read FTimeShiftType;
     property ShiftTerminal: double read FShiftTerminal;
+    property BaseImageSeqLen: integer read FBaseImageSeqLen;
+    property MaxImageSeqLen: integer read FMaxImageSeqLen;
+    property BaseShift: double read FBaseShift;
+    property MaxShift: double read FMaxShift;
   end;
 
 implementation
+
+uses
+  fpjson, jsonparser;
 
 constructor TNNetDiffusionScheduler.Create(pT: integer;
   pSchedule: TNNetBetaSchedule; pPrediction: TNNetPredictionType;
@@ -1359,7 +1375,69 @@ begin
   FUseDynamicShifting := pUseDynamicShifting;
   FTimeShiftType := pTimeShiftType;
   FShiftTerminal := pShiftTerminal;
+  // The diffusers pipelines' calculate_shift defaults.
+  FBaseImageSeqLen := 256;
+  FMaxImageSeqLen := 4096;
+  FBaseShift := 0.5;
+  FMaxShift := 1.15;
   SetLength(FSigmas, 0);
+end;
+
+constructor TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfig(
+  const FileName: string);
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  Obj: TJSONObject;
+  ShiftTypeName: string;
+  ShiftType: TNNetFlowTimeShift;
+
+  procedure RefuseFlag(const Key: string);
+  begin
+    if Obj.Get(Key, false) then
+      raise Exception.Create('Flow-matching scheduler config ' + FileName +
+        ': "' + Key + '" = true is not implemented.');
+  end;
+
+begin
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      raise Exception.Create('Flow-matching scheduler config ' + FileName +
+        ' is not a JSON object.');
+    Obj := TJSONObject(Root);
+    RefuseFlag('use_karras_sigmas');
+    RefuseFlag('use_exponential_sigmas');
+    RefuseFlag('use_beta_sigmas');
+    RefuseFlag('invert_sigmas');
+    RefuseFlag('stochastic_sampling');
+    ShiftTypeName := Obj.Get('time_shift_type', 'exponential');
+    if ShiftTypeName = 'exponential' then ShiftType := ftsExponential
+    else if ShiftTypeName = 'linear' then ShiftType := ftsLinear
+    else
+      raise Exception.Create('Flow-matching scheduler config ' + FileName +
+        ': unknown time_shift_type "' + ShiftTypeName + '".');
+    Create(Obj.Get('num_train_timesteps', 1000), Obj.Get('shift', 1.0),
+      Obj.Get('use_dynamic_shifting', false), ShiftType,
+      Obj.Get('shift_terminal', 0.0));
+    FBaseImageSeqLen := Obj.Get('base_image_seq_len', FBaseImageSeqLen);
+    FMaxImageSeqLen := Obj.Get('max_image_seq_len', FMaxImageSeqLen);
+    FBaseShift := Obj.Get('base_shift', FBaseShift);
+    FMaxShift := Obj.Get('max_shift', FMaxShift);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function TNNetFlowMatchEulerScheduler.ShiftForImageSeqLen(
+  ImageSeqLen: integer): double;
+begin
+  Result := CalculateShift(ImageSeqLen, FBaseImageSeqLen, FMaxImageSeqLen,
+    FBaseShift, FMaxShift);
 end;
 
 class function TNNetFlowMatchEulerScheduler.CalculateShift(ImageSeqLen: integer;

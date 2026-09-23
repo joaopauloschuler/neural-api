@@ -37,6 +37,10 @@ type
   TTestNeuralPretrained = class(TTestCase)
   private
     FNotices: string; // CaptureNotice accumulator
+    // TQwenImage21Pipeline OnPhase / OnStep records.
+    FQwenImage21Phases: array of TQwenImage21PipelinePhase;
+    FQwenImage21StepLatents: array of TNNetVolume;
+    FQwenImage21StepTimesteps: array of double;
     function FixturePath(const FileName: string): string;
     // The tiny_qwen3_5 hybrid fixture as an inference net whose input width
     // (the streamed window) is pSeqLen tokens; pWeightOwner builds it
@@ -62,6 +66,13 @@ type
       TJSONData;
     // The pico diffusers transformer folder (FixturePath takes files only).
     function QwenImage21TransformerFolder(): string;
+    // TQwenImage21Pipeline over the pico folder vs a pipeline oracle, from
+    // its prompt_embeds or (FromTokenIds) from the A2 token ids.
+    procedure CheckQwenImage21PipelineOracle(const FixtureName: string;
+      FromTokenIds: boolean);
+    procedure RecordQwenImage21Phase(Phase: TQwenImage21PipelinePhase);
+    procedure RecordQwenImage21Step(StepIndex, StepCount: integer;
+      Timestep: double; Latents: TNNetVolume);
     // Loads a {"shape": [C, H, W], ...} oracle image of Root as a (W,H,C) volume.
     procedure LoadOracleImageTensor(Root: TJSONData; const Key: string;
       Dest: TNNetVolume);
@@ -709,6 +720,12 @@ type
     procedure TestQwenImage21VaeDecoderParity;
     procedure TestQwenImage21VaeDecoderTiledParity;
     procedure TestQwen3VLTextEncoderInt8Drift;
+    procedure TestQwenImage21PipelineParity;
+    procedure TestQwenImage21Pipeline64Parity;
+    procedure TestQwenImage21PipelineFromTokenIds;
+    procedure TestQwenImage21PipelineImageSideRounding;
+    procedure TestQwenImage21PipelineSeededLatents;
+    procedure TestQwen3VLEncodeRefusesOutOfVocabIds;
     procedure TestQwen2AudioConfigFromJSONFile;
     procedure TestQwen2AudioParity;
     procedure TestViTConfigFromJSONFile;
@@ -26298,6 +26315,297 @@ begin
     Decoder.Free;
     RefRoot.Free;
     RefJson.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.RecordQwenImage21Phase(
+  Phase: TQwenImage21PipelinePhase);
+begin
+  SetLength(FQwenImage21Phases, Length(FQwenImage21Phases) + 1);
+  FQwenImage21Phases[High(FQwenImage21Phases)] := Phase;
+end;
+
+procedure TTestNeuralPretrained.RecordQwenImage21Step(StepIndex,
+  StepCount: integer; Timestep: double; Latents: TNNetVolume);
+begin
+  AssertEquals('step index', Length(FQwenImage21StepLatents), StepIndex);
+  SetLength(FQwenImage21StepLatents, StepIndex + 1);
+  SetLength(FQwenImage21StepTimesteps, StepIndex + 1);
+  FQwenImage21StepLatents[StepIndex] := TNNetVolume.Create;
+  FQwenImage21StepLatents[StepIndex].Copy(Latents);
+  FQwenImage21StepTimesteps[StepIndex] := Timestep;
+end;
+
+// Float32 vs the float64 diffusers oracle. Timesteps 5e-4: the oracle's are
+// float32 sigma * 1000 (ulp 6e-5 at 582). Latents 5e-5: A5 velocities ~1e-5,
+// |dt| <= 1 per step (measured 8.0e-6). De-normalised 2e-4 (latents_std up
+// to 3.8; measured 2.2e-5). Image 5e-5, A6's VAE budget (measured 3.0e-6).
+procedure TTestNeuralPretrained.CheckQwenImage21PipelineOracle(
+  const FixtureName: string; FromTokenIds: boolean);
+const
+  LatentTolerance = 5e-5;
+  DenormalisedTolerance = 2e-4;
+  ImageTolerance = 5e-5;
+var
+  RefJson: TStringList;
+  RefRoot, TextRoot: TJSONData;
+  SigmaArr, TimestepArr, StepArr, IdsArr: TJSONArray;
+  Pipeline: TQwenImage21Pipeline;
+  VaeConfig: TQwenImage21VaeConfig;
+  Embeds, Initial, Expected, Image, Decoded: TNNetVolume;
+  TokenIds: TNeuralIntegerArray;
+  ExpectedPhases: array of TQwenImage21PipelinePhase;
+  Width, Height, StepCount, StepPos, TokenPos, ChannelPos, Depth: integer;
+  MaxDiff: double;
+
+  procedure AssertMaxDiff(Actual: TNNetVolume; Tolerance: double;
+    const What: string);
+  begin
+    MaxDiff := MaxAbsVolumeDiff(Actual, Expected);
+    AssertTrue(FixtureName + ' ' + What + ': max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < ' + FloatToStr(Tolerance),
+      MaxDiff < Tolerance);
+  end;
+
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  TextRoot := nil;
+  Pipeline := nil;
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  Decoded := TNNetVolume.Create;
+  SetLength(FQwenImage21Phases, 0);
+  SetLength(FQwenImage21StepLatents, 0);
+  try
+    RefJson.LoadFromFile(FixturePath(FixtureName));
+    RefRoot := GetJSON(RefJson.Text);
+    Width := TJSONObject(RefRoot).Get('width', 0);
+    Height := TJSONObject(RefRoot).Get('height', 0);
+    StepCount := TJSONObject(RefRoot).Get('num_inference_steps', 0);
+    Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    Pipeline.OnPhase := @RecordQwenImage21Phase;
+    Pipeline.OnStep := @RecordQwenImage21Step;
+    if FromTokenIds then
+    begin
+      RefJson.LoadFromFile(
+        FixturePath('tiny_qwenimage21_text_encoder_io.json'));
+      TextRoot := GetJSON(RefJson.Text);
+      IdsArr := TJSONArray(TJSONObject(TextRoot).Find('token_ids'));
+      SetLength(TokenIds, IdsArr.Count);
+      for TokenPos := 0 to IdsArr.Count - 1 do
+        TokenIds[TokenPos] := IdsArr.Integers[TokenPos];
+      Pipeline.EncodeTokenIds(TokenIds,
+        TJSONObject(TextRoot).Get('drop_idx', 0), Embeds);
+      LoadOracleTokenTensor(RefRoot, 'prompt_embeds', Expected);
+      AssertMaxDiff(Embeds, 1e-4, 'prompt_embeds from token ids');
+    end
+    else
+      LoadOracleTokenTensor(RefRoot, 'prompt_embeds', Embeds);
+    LoadOracleTokenTensor(RefRoot, 'initial_latents', Initial);
+    Pipeline.GenerateFromEmbeds(Embeds, Width, Height, StepCount,
+      {Seed=}0, Image, Initial);
+
+    SetLength(ExpectedPhases, 0);
+    if FromTokenIds then
+      ExpectedPhases := [qppLoadTextEncoder, qppEncodePrompt];
+    ExpectedPhases := Concat(ExpectedPhases, [qppLoadTransformer,
+      qppEncodePrefix, qppDenoise, qppLoadVae, qppDecode, qppDone]);
+    AssertEquals('phase count', Length(ExpectedPhases),
+      Length(FQwenImage21Phases));
+    for StepPos := 0 to High(ExpectedPhases) do
+      AssertTrue('phase ' + IntToStr(StepPos),
+        ExpectedPhases[StepPos] = FQwenImage21Phases[StepPos]);
+
+    SigmaArr := TJSONArray(TJSONObject(RefRoot).Find('sigmas'));
+    TimestepArr := TJSONArray(TJSONObject(RefRoot).Find('timesteps'));
+    StepArr := TJSONArray(TJSONObject(RefRoot).Find('step_latents'));
+    AssertEquals('steps run', StepCount, Length(FQwenImage21StepLatents));
+    AssertEquals('oracle steps', StepCount, StepArr.Count);
+    for StepPos := 0 to StepCount do
+      AssertEquals('sigma ' + IntToStr(StepPos), SigmaArr.Floats[StepPos],
+        Pipeline.Scheduler.Sigma[StepPos], 1e-6);
+    for StepPos := 0 to StepCount - 1 do
+    begin
+      AssertEquals('timestep ' + IntToStr(StepPos),
+        TimestepArr.Floats[StepPos], FQwenImage21StepTimesteps[StepPos], 5e-4);
+      LoadOracleTokenTensorObject(StepArr.Items[StepPos], 'step_latents',
+        Expected);
+      AssertMaxDiff(FQwenImage21StepLatents[StepPos], LatentTolerance,
+        'latents after step ' + IntToStr(StepPos));
+    end;
+    LoadOracleTokenTensor(RefRoot, 'final_latents', Expected);
+    AssertMaxDiff(FQwenImage21StepLatents[StepCount - 1], LatentTolerance,
+      'final latents');
+    // The decoder folds the de-normalisation into post_quant_conv; check the
+    // token -> (w, h) layout against the oracle's de-normalised VAE input.
+    VaeConfig := ReadQwenImage21VaeConfig(
+      FixturePath('tiny_qwenimage21/vae/config.json'));
+    Decoded.Copy(FQwenImage21StepLatents[StepCount - 1]);
+    Depth := Decoded.Depth;
+    Decoded.ReSize(Width div csQwenImage21PixelsPerLatent,
+      Height div csQwenImage21PixelsPerLatent, Depth);
+    for TokenPos := 0 to Decoded.SizeX * Decoded.SizeY - 1 do
+      for ChannelPos := 0 to Depth - 1 do
+        Decoded.FData[TokenPos * Depth + ChannelPos] :=
+          Decoded.FData[TokenPos * Depth + ChannelPos] *
+          VaeConfig.LatentsStd[ChannelPos] + VaeConfig.LatentsMean[ChannelPos];
+    LoadOracleImageTensor(RefRoot, 'vae_input_denormalized', Expected);
+    AssertMaxDiff(Decoded, DenormalisedTolerance, 'de-normalised VAE input');
+
+    AssertEquals('image width', Width, Image.SizeX);
+    AssertEquals('image height', Height, Image.SizeY);
+    AssertEquals('RGBA', 4, Image.Depth);
+    LoadOracleImageTensor(RefRoot, 'image', Expected);
+    AssertMaxDiff(Image, ImageTolerance, 'image in [0, 1]');
+    Decoded.Copy(Image);
+    Decoded.Mul(2);
+    Decoded.Add(-1);
+    LoadOracleImageTensor(RefRoot, 'decoded', Expected);
+    AssertMaxDiff(Decoded, 2 * ImageTolerance, 'decoded in [-1, 1]');
+  finally
+    for StepPos := 0 to High(FQwenImage21StepLatents) do
+      FQwenImage21StepLatents[StepPos].Free;
+    SetLength(FQwenImage21StepLatents, 0);
+    Decoded.Free;
+    Image.Free;
+    Expected.Free;
+    Initial.Free;
+    Embeds.Free;
+    Pipeline.Free;
+    TextRoot.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// 32x64, 3 steps, the oracle's initial latents and prompt_embeds.
+procedure TTestNeuralPretrained.TestQwenImage21PipelineParity;
+begin
+  CheckQwenImage21PipelineOracle('tiny_qwenimage21_pipeline_io.json', false);
+end;
+
+// 64x64 (a 4x4 latent grid), the size the example smoke-runs.
+procedure TTestNeuralPretrained.TestQwenImage21Pipeline64Parity;
+begin
+  CheckQwenImage21PipelineOracle('tiny_qwenimage21_pipeline_64_io.json', false);
+end;
+
+// End to end from the A2 token ids: the pico text encoder builds, encodes,
+// is freed, and its output drives the 64x64 run.
+procedure TTestNeuralPretrained.TestQwenImage21PipelineFromTokenIds;
+begin
+  CheckQwenImage21PipelineOracle('tiny_qwenimage21_pipeline_64_io.json', true);
+end;
+
+// Sides round DOWN to a multiple of 32 (diffusers: width // 32 * 32); below
+// 32 is refused, and the stages refuse a side that is not a multiple.
+procedure TTestNeuralPretrained.TestQwenImage21PipelineImageSideRounding;
+var
+  Pipeline: TQwenImage21Pipeline;
+  Latents: TNNetVolume;
+  Refused: boolean;
+begin
+  AssertEquals('1024', 1024, TQwenImage21Pipeline.RoundDownImageSide(1024));
+  AssertEquals('1000', 992, TQwenImage21Pipeline.RoundDownImageSide(1000));
+  AssertEquals('63', 32, TQwenImage21Pipeline.RoundDownImageSide(63));
+  AssertEquals('32', 32, TQwenImage21Pipeline.RoundDownImageSide(32));
+  Refused := false;
+  try
+    TQwenImage21Pipeline.RoundDownImageSide(31);
+  except
+    on EPretrainedImportError do Refused := true;
+  end;
+  AssertTrue('31 is refused', Refused);
+  Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+    FixturePath('tiny_qwenimage21/model_index.json')));
+  Latents := TNNetVolume.Create;
+  try
+    Refused := false;
+    try
+      Pipeline.MakeInitialLatents(48, 64, 1, Latents);
+    except
+      on EPretrainedImportError do Refused := true;
+    end;
+    AssertTrue('48 wide is refused by the stages', Refused);
+  finally
+    Latents.Free;
+    Pipeline.Free;
+  end;
+end;
+
+// MakeInitialLatents: (tokens,1,in_channels), repeatable per seed, different
+// across seeds, roughly standard normal, and the global RandSeed restored.
+procedure TTestNeuralPretrained.TestQwenImage21PipelineSeededLatents;
+var
+  Pipeline: TQwenImage21Pipeline;
+  LatentsA, LatentsB: TNNetVolume;
+  SeedBefore: cardinal;
+begin
+  Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+    FixturePath('tiny_qwenimage21/model_index.json')));
+  LatentsA := TNNetVolume.Create;
+  LatentsB := TNNetVolume.Create;
+  try
+    SeedBefore := RandSeed;
+    Pipeline.MakeInitialLatents(128, 64, 42, LatentsA);
+    AssertEquals('RandSeed restored', int64(SeedBefore), int64(RandSeed));
+    AssertEquals('tokens = (64/16) * (128/16)', 32, LatentsA.SizeX);
+    AssertEquals('one row', 1, LatentsA.SizeY);
+    AssertEquals('in_channels', Pipeline.TransformerConfig.InChannels,
+      LatentsA.Depth);
+    Pipeline.MakeInitialLatents(128, 64, 42, LatentsB);
+    AssertEquals('same seed, same latents', 0, MaxAbsVolumeDiff(LatentsA,
+      LatentsB), 0);
+    Pipeline.MakeInitialLatents(128, 64, 43, LatentsB);
+    AssertTrue('another seed, other latents',
+      MaxAbsVolumeDiff(LatentsA, LatentsB) > 0.1);
+    AssertEquals('mean ~ 0', 0, LatentsA.GetAvg(), 0.2);
+    AssertEquals('variance ~ 1', 1, LatentsA.GetVariance(), 0.3);
+  finally
+    LatentsB.Free;
+    LatentsA.Free;
+    Pipeline.Free;
+  end;
+end;
+
+// A token id outside 0..vocab-1 (a real-tokenizer id fed to the pico encoder)
+// is refused before the embedding reads past its table.
+procedure TTestNeuralPretrained.TestQwen3VLEncodeRefusesOutOfVocabIds;
+var
+  Encoder: TNNet;
+  Config: TQwen3VLConfig;
+  Hidden: TNNetVolume;
+  Refused: boolean;
+begin
+  Hidden := TNNetVolume.Create;
+  Encoder := BuildQwen3VLTextEncoderFromSafeTensors(
+    FixturePath('tiny_qwenimage21/text_encoder/model.safetensors'), Config,
+    {pSeqLen=}3);
+  try
+    AssertEquals('pico vocab', 300, Config.Text.VocabSize);
+    Qwen3VLEncodeHiddenStates(Encoder, Config, [1, 299, 2], 0, Hidden);
+    AssertEquals('ids up to vocab-1 encode', 3, Hidden.SizeX);
+    Refused := false;
+    try
+      Qwen3VLEncodeHiddenStates(Encoder, Config, [1, 300, 2], 0, Hidden);
+    except
+      on EPretrainedImportError do Refused := true;
+    end;
+    AssertTrue('id = vocab is refused', Refused);
+    Refused := false;
+    try
+      Qwen3VLEncodeHiddenStates(Encoder, Config, [-1, 1, 2], 0, Hidden);
+    except
+      on EPretrainedImportError do Refused := true;
+    end;
+    AssertTrue('a negative id is refused', Refused);
+  finally
+    Encoder.Free;
+    Hidden.Free;
   end;
 end;
 

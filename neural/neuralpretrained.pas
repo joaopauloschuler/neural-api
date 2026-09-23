@@ -8865,6 +8865,97 @@ type
     property SkippedTensorCount: integer read FSkippedTensorCount;
   end;
 
+const
+  // One latent (= one transformer token) covers 16x16 pixels; the pipeline
+  // rounds each image side DOWN to a multiple of 32, as diffusers does.
+  csQwenImage21PixelsPerLatent = 16;
+  csQwenImage21ImageSideMultiple = 32;
+
+type
+  // The stages of TQwenImage21Pipeline; OnPhase fires as each one starts.
+  TQwenImage21PipelinePhase = (qppLoadTextEncoder, qppEncodePrompt,
+    qppLoadTransformer, qppEncodePrefix, qppDenoise, qppLoadVae, qppDecode,
+    qppDone);
+  TQwenImage21PhaseEvent = procedure(Phase: TQwenImage21PipelinePhase)
+    of object;
+  // Fired after denoising step StepIndex (0-based) of StepCount; Latents holds
+  // the sample after that step, Timestep = sigma * 1000 of the step.
+  TQwenImage21StepEvent = procedure(StepIndex, StepCount: integer;
+    Timestep: double; Latents: TNNetVolume) of object;
+
+  // Qwen-Image-2.1 text-to-image (diffusers QwenImage21Pipeline, no guidance)
+  // over a model_index.json folder. Each component (text encoder, transformer,
+  // VAE decoder) is loaded when its stage starts and freed when it ends, so
+  // peak memory is the largest component, not the sum. Latents are
+  // (GridH*GridW,1,in_channels) in row-major (h, w) token order.
+  // Coded by Claude (AI).
+  TQwenImage21Pipeline = class(TObject)
+  private
+    FModelFolder: string;
+    FScheduler: TNNetFlowMatchEulerScheduler;
+    FTransformerConfig: TQwenImage21TransformerConfig;
+    FTransformerFormat: TQwenImage21WeightFormat;
+    FInt8Input, FTextEncoderInt8: boolean;
+    FVaeTileSize, FVaeTileStride: integer;
+    FOnPhase: TQwenImage21PhaseEvent;
+    FOnStep: TQwenImage21StepEvent;
+    procedure DoPhase(Phase: TQwenImage21PipelinePhase);
+    function ComponentFolder(const Component: string): string;
+    procedure CheckImageSize(Width, Height: integer);
+  public
+    // Reads model_index.json, scheduler/scheduler_config.json and
+    // transformer/config.json; no weights are loaded here.
+    constructor Create(const ModelFolder: string);
+    destructor Destroy(); override;
+    // Side rounded down to a multiple of 32 (diffusers does the same after a
+    // warning); raises when that leaves less than 32.
+    class function RoundDownImageSide(Side: integer): integer;
+    // Tokenizes the text-to-image template with processor/tokenizer.json.
+    function TokenizePrompt(const Prompt: string;
+      out DropCount: integer): TNeuralIntegerArray;
+    // Builds text_encoder/ sized to the token count, encodes, frees it.
+    // PromptEmbeds becomes (Length(TokenIds)-DropCount,1,hidden).
+    procedure EncodeTokenIds(const TokenIds: array of integer;
+      DropCount: integer; PromptEmbeds: TNNetVolume);
+    procedure EncodePrompt(const Prompt: string; PromptEmbeds: TNNetVolume);
+    // Standard-normal latents for a Width x Height image from Seed (FPC RNG;
+    // the global RandSeed is restored). Torch's noise is not reproducible.
+    procedure MakeInitialLatents(Width, Height: integer; Seed: cardinal;
+      Latents: TNNetVolume);
+    // Loads transformer/, runs StepCount Euler steps on Latents in place (the
+    // initial noise in, the clean latents out), frees the transformer.
+    procedure Denoise(PromptEmbeds: TNNetVolume; Width, Height,
+      StepCount: integer; Latents: TNNetVolume);
+    // Loads vae/, decodes (tiled when the image exceeds one VaeTileSize tile)
+    // and frees it. Image becomes (Width,Height,4) RGBA in [0, 1].
+    procedure DecodeLatents(Latents: TNNetVolume; Width, Height: integer;
+      Image: TNNetVolume);
+    // Denoise + DecodeLatents; InitialLatents = nil draws them from Seed.
+    // Width and Height are rounded down with RoundDownImageSide.
+    procedure GenerateFromEmbeds(PromptEmbeds: TNNetVolume; Width, Height,
+      StepCount: integer; Seed: cardinal; Image: TNNetVolume;
+      InitialLatents: TNNetVolume = nil);
+    procedure Generate(const Prompt: string; Width, Height, StepCount: integer;
+      Seed: cardinal; Image: TNNetVolume);
+    property ModelFolder: string read FModelFolder;
+    property Scheduler: TNNetFlowMatchEulerScheduler read FScheduler;
+    property TransformerConfig: TQwenImage21TransformerConfig
+      read FTransformerConfig;
+    // Transformer block weights (qiwFP32 at real size runs a slow kernel).
+    property TransformerFormat: TQwenImage21WeightFormat
+      read FTransformerFormat write FTransformerFormat;
+    // int8 activations into the transformer's int8/int4 projections.
+    property Int8Input: boolean read FInt8Input write FInt8Input;
+    property TextEncoderInt8: boolean read FTextEncoderInt8
+      write FTextEncoderInt8;
+    // VAE tile in pixels (multiples of 16); default 128/96 keeps a real-size
+    // tile's activations near 2.3 GB.
+    property VaeTileSize: integer read FVaeTileSize write FVaeTileSize;
+    property VaeTileStride: integer read FVaeTileStride write FVaeTileStride;
+    property OnPhase: TQwenImage21PhaseEvent read FOnPhase write FOnPhase;
+    property OnStep: TQwenImage21StepEvent read FOnStep write FOnStep;
+  end;
+
 // ===========================================================================
 // RAFT OPTICAL-FLOW IMPORT (model_type "raft_small", the torchvision
 // raft_small architecture, Teed & Deng 2020 "RAFT", arXiv:2003.12039) - the
@@ -81466,6 +81557,12 @@ begin
       IntToStr(DropCount) + ' must be in [0, ' + IntToStr(TokenCount) + ').');
   MaxTokenPos := TokenCount - 1;
   for TokenPos := 0 to MaxTokenPos do
+  begin
+    if (TokenIds[TokenPos] < 0) or
+       (TokenIds[TokenPos] >= Config.Text.VocabSize) then
+      ImportError('Qwen3VLEncodeHiddenStates: token ' + IntToStr(TokenPos) +
+        ' has id ' + IntToStr(TokenIds[TokenPos]) + ', outside the ' +
+        'vocabulary 0..' + IntToStr(Config.Text.VocabSize - 1) + '.');
     if ((Config.ImageTokenId >= 0) and
         (TokenIds[TokenPos] = Config.ImageTokenId)) or
        ((Config.VideoTokenId >= 0) and
@@ -81474,6 +81571,7 @@ begin
         ' is an image/video placeholder (id ' + IntToStr(TokenIds[TokenPos]) +
         '); vision input needs the vision tower and 3-D M-RoPE positions, ' +
         'which this text-only encoder does not have.');
+  end;
   Input := TNNetVolume.Create(SeqLen, 1, 1);
   try
     Input.Fill(0);
@@ -81916,6 +82014,14 @@ begin
     Hidden, Hidden);
 end;
 
+// Folder + Stem + '.safetensors.index.json' when that sharded index exists,
+// else Folder + Stem + '.safetensors'. Folder ends with a path delimiter.
+function SafeTensorsFolderWeightsFile(const Folder, Stem: string): string;
+begin
+  Result := Folder + Stem + '.safetensors.index.json';
+  if not FileExists(Result) then Result := Folder + Stem + '.safetensors';
+end;
+
 constructor TQwenImage21Transformer.Create(const TransformerFolder: string;
   pWeightFormat: TQwenImage21WeightFormat; pInt8Input: boolean);
 var
@@ -81934,9 +82040,8 @@ begin
   FInt8Input := pInt8Input;
   Folder := IncludeTrailingPathDelimiter(TransformerFolder);
   FConfig := ReadQwenImage21TransformerConfig(Folder + 'config.json');
-  WeightsFile := Folder + 'diffusion_pytorch_model.safetensors.index.json';
-  if not FileExists(WeightsFile) then
-    WeightsFile := Folder + 'diffusion_pytorch_model.safetensors';
+  WeightsFile := SafeTensorsFolderWeightsFile(Folder,
+    'diffusion_pytorch_model');
   FTimestepInput := TNNetVolume.Create(1, 1, 1);
   Reader := TNNetSafeTensorsReader.Create(WeightsFile);
   try
@@ -82217,6 +82322,252 @@ end;
 function TQwenImage21Transformer.GetModulation(): TNNetVolume;
 begin
   Result := FModulationLayer.Output;
+end;
+
+constructor TQwenImage21Pipeline.Create(const ModelFolder: string);
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  IndexFile, PipelineClass: string;
+begin
+  inherited Create();
+  FModelFolder := IncludeTrailingPathDelimiter(ModelFolder);
+  IndexFile := FModelFolder + 'model_index.json';
+  if not FileExists(IndexFile) then
+    ImportError('TQwenImage21Pipeline: ' + IndexFile + ' not found.');
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(IndexFile);
+    Root := GetJSON(JsonText.Text);
+    PipelineClass := '';
+    if Root is TJSONObject then
+      PipelineClass := TJSONObject(Root).Get('_class_name', '');
+    if PipelineClass <> 'QwenImage21Pipeline' then
+      ImportError('TQwenImage21Pipeline: ' + IndexFile + ' names "' +
+        PipelineClass + '", expected "QwenImage21Pipeline".');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+  FScheduler := TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfig(
+    ComponentFolder('scheduler') + 'scheduler_config.json');
+  FTransformerConfig := ReadQwenImage21TransformerConfig(
+    ComponentFolder('transformer') + 'config.json');
+  FTransformerFormat := qiwFP32;
+  FVaeTileSize := 128;
+  FVaeTileStride := 96;
+end;
+
+destructor TQwenImage21Pipeline.Destroy();
+begin
+  FScheduler.Free;
+  inherited Destroy();
+end;
+
+procedure TQwenImage21Pipeline.DoPhase(Phase: TQwenImage21PipelinePhase);
+begin
+  if Assigned(FOnPhase) then FOnPhase(Phase);
+end;
+
+function TQwenImage21Pipeline.ComponentFolder(const Component: string): string;
+begin
+  Result := FModelFolder + Component + PathDelim;
+end;
+
+procedure TQwenImage21Pipeline.CheckImageSize(Width, Height: integer);
+begin
+  if (Width < csQwenImage21ImageSideMultiple) or
+     (Height < csQwenImage21ImageSideMultiple) or
+     (Width mod csQwenImage21ImageSideMultiple <> 0) or
+     (Height mod csQwenImage21ImageSideMultiple <> 0) then
+    ImportError('TQwenImage21Pipeline: image ' + IntToStr(Width) + 'x' +
+      IntToStr(Height) + ' must have sides that are positive multiples of ' +
+      IntToStr(csQwenImage21ImageSideMultiple) + ' (see RoundDownImageSide).');
+end;
+
+class function TQwenImage21Pipeline.RoundDownImageSide(Side: integer): integer;
+begin
+  Result := (Side div csQwenImage21ImageSideMultiple) *
+    csQwenImage21ImageSideMultiple;
+  if Result < csQwenImage21ImageSideMultiple then
+    ImportError('TQwenImage21Pipeline: image side ' + IntToStr(Side) +
+      ' is below the minimum ' + IntToStr(csQwenImage21ImageSideMultiple) +
+      '.');
+end;
+
+function TQwenImage21Pipeline.TokenizePrompt(const Prompt: string;
+  out DropCount: integer): TNeuralIntegerArray;
+var
+  Tokenizer: TNeuralHFTokenizer;
+  TokenizerFile: string;
+begin
+  TokenizerFile := ComponentFolder('processor') + 'tokenizer.json';
+  if not FileExists(TokenizerFile) then
+    ImportError('TQwenImage21Pipeline: ' + TokenizerFile + ' not found.');
+  Tokenizer := TNeuralHFTokenizer.Create();
+  try
+    Tokenizer.LoadFromFile(TokenizerFile);
+    Result := QwenImage21EncodeTextToImagePrompt(Tokenizer, Prompt, DropCount);
+  finally
+    Tokenizer.Free;
+  end;
+end;
+
+procedure TQwenImage21Pipeline.EncodeTokenIds(const TokenIds: array of integer;
+  DropCount: integer; PromptEmbeds: TNNetVolume);
+var
+  Encoder: TNNet;
+  Config: TQwen3VLConfig;
+begin
+  DoPhase(qppLoadTextEncoder);
+  Encoder := BuildQwen3VLTextEncoderFromSafeTensors(
+    SafeTensorsFolderWeightsFile(ComponentFolder('text_encoder'), 'model'),
+    Config,
+    Length(TokenIds), FTextEncoderInt8);
+  try
+    if Config.Text.HiddenSize <> FTransformerConfig.ContextInDim then
+      ImportError('TQwenImage21Pipeline: the text encoder hidden size ' +
+        IntToStr(Config.Text.HiddenSize) + ' differs from the transformer''s ' +
+        'context_in_dim ' + IntToStr(FTransformerConfig.ContextInDim) + '.');
+    DoPhase(qppEncodePrompt);
+    Qwen3VLEncodeHiddenStates(Encoder, Config, TokenIds, DropCount,
+      PromptEmbeds);
+  finally
+    Encoder.Free;
+  end;
+end;
+
+procedure TQwenImage21Pipeline.EncodePrompt(const Prompt: string;
+  PromptEmbeds: TNNetVolume);
+var
+  TokenIds: TNeuralIntegerArray;
+  DropCount: integer;
+begin
+  TokenIds := TokenizePrompt(Prompt, DropCount);
+  EncodeTokenIds(TokenIds, DropCount, PromptEmbeds);
+end;
+
+procedure TQwenImage21Pipeline.MakeInitialLatents(Width, Height: integer;
+  Seed: cardinal; Latents: TNNetVolume);
+var
+  SavedSeed: cardinal;
+begin
+  CheckImageSize(Width, Height);
+  Latents.ReSize((Width div csQwenImage21PixelsPerLatent) *
+    (Height div csQwenImage21PixelsPerLatent), 1,
+    FTransformerConfig.InChannels);
+  SavedSeed := RandSeed;
+  RandSeed := Seed;
+  Latents.RandomizeGaussian(1.0);
+  RandSeed := SavedSeed;
+end;
+
+procedure TQwenImage21Pipeline.Denoise(PromptEmbeds: TNNetVolume; Width,
+  Height, StepCount: integer; Latents: TNNetVolume);
+var
+  Transformer: TQwenImage21Transformer;
+  Velocity: TNNetVolume;
+  GridH, GridW, StepPos, MaxStepPos: integer;
+begin
+  CheckImageSize(Width, Height);
+  GridH := Height div csQwenImage21PixelsPerLatent;
+  GridW := Width div csQwenImage21PixelsPerLatent;
+  // mu from the image token count, as the diffusers pipeline computes it.
+  FScheduler.SetTimesteps(StepCount,
+    FScheduler.ShiftForImageSeqLen(GridH * GridW));
+  DoPhase(qppLoadTransformer);
+  Velocity := TNNetVolume.Create();
+  Transformer := nil;
+  try
+    Transformer := TQwenImage21Transformer.Create(
+      ComponentFolder('transformer'), FTransformerFormat, FInt8Input);
+    DoPhase(qppEncodePrefix);
+    Transformer.EncodePrefix(PromptEmbeds);
+    DoPhase(qppDenoise);
+    MaxStepPos := StepCount - 1;
+    for StepPos := 0 to MaxStepPos do
+    begin
+      // The pipeline passes timestep / 1000 = sigma.
+      Transformer.PredictVelocity(Latents, FScheduler.Sigma[StepPos], GridH,
+        GridW, Velocity);
+      FScheduler.Step(Latents, Velocity, StepPos);
+      if Assigned(FOnStep) then
+        FOnStep(StepPos, StepCount, FScheduler.Timestep[StepPos], Latents);
+    end;
+  finally
+    Transformer.Free;
+    Velocity.Free;
+  end;
+end;
+
+procedure TQwenImage21Pipeline.DecodeLatents(Latents: TNNetVolume; Width,
+  Height: integer; Image: TNNetVolume);
+var
+  Vae: TQwenImage21VaeDecoder;
+  LatentImage: TNNetVolume;
+  GridH, GridW: integer;
+begin
+  CheckImageSize(Width, Height);
+  GridH := Height div csQwenImage21PixelsPerLatent;
+  GridW := Width div csQwenImage21PixelsPerLatent;
+  if Latents.Size <> GridH * GridW * Latents.Depth then
+    ImportError('TQwenImage21Pipeline.DecodeLatents: ' +
+      IntToStr(Latents.SizeX) + 'x' + IntToStr(Latents.SizeY) +
+      ' latent tokens do not form a ' + IntToStr(GridW) + 'x' +
+      IntToStr(GridH) + ' grid.');
+  DoPhase(qppLoadVae);
+  LatentImage := TNNetVolume.Create();
+  Vae := nil;
+  try
+    Vae := TQwenImage21VaeDecoder.Create(ComponentFolder('vae'));
+    // Token h * GridW + w is pixel (w, h) of a (GridW, GridH, C) volume.
+    LatentImage.Copy(Latents);
+    LatentImage.ReSize(GridW, GridH, Latents.Depth);
+    DoPhase(qppDecode);
+    Vae.DecodeTiled(LatentImage, Image, FVaeTileSize, FVaeTileStride);
+  finally
+    Vae.Free;
+    LatentImage.Free;
+  end;
+  // The decoder clamps to [-1, 1]; the pipeline postprocess is x / 2 + 0.5.
+  Image.Mul(0.5);
+  Image.Add(0.5);
+end;
+
+procedure TQwenImage21Pipeline.GenerateFromEmbeds(PromptEmbeds: TNNetVolume;
+  Width, Height, StepCount: integer; Seed: cardinal; Image: TNNetVolume;
+  InitialLatents: TNNetVolume);
+var
+  Latents: TNNetVolume;
+  RoundedWidth, RoundedHeight: integer;
+begin
+  RoundedWidth := RoundDownImageSide(Width);
+  RoundedHeight := RoundDownImageSide(Height);
+  Latents := TNNetVolume.Create();
+  try
+    if Assigned(InitialLatents) then Latents.Copy(InitialLatents)
+    else MakeInitialLatents(RoundedWidth, RoundedHeight, Seed, Latents);
+    Denoise(PromptEmbeds, RoundedWidth, RoundedHeight, StepCount, Latents);
+    DecodeLatents(Latents, RoundedWidth, RoundedHeight, Image);
+  finally
+    Latents.Free;
+  end;
+  DoPhase(qppDone);
+end;
+
+procedure TQwenImage21Pipeline.Generate(const Prompt: string; Width, Height,
+  StepCount: integer; Seed: cardinal; Image: TNNetVolume);
+var
+  PromptEmbeds: TNNetVolume;
+begin
+  PromptEmbeds := TNNetVolume.Create();
+  try
+    EncodePrompt(Prompt, PromptEmbeds);
+    GenerateFromEmbeds(PromptEmbeds, Width, Height, StepCount, Seed, Image);
+  finally
+    PromptEmbeds.Free;
+  end;
 end;
 
 // ===========================================================================
