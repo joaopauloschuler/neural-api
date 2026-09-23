@@ -50,21 +50,10 @@ script downloads tokenizer.json, tokenizer_config.json and chat_template.jinja
 """
 import argparse
 import copy
-import importlib.machinery
 import json
 import math
 import os
 import shutil
-import sys
-import types
-
-# The venv's torchaudio is a CUDA build that cannot load next to the CPU torch;
-# transformers imports it only for audio utilities, so an empty module suffices.
-if "torchaudio" not in sys.modules:
-    _torchaudio_stub = types.ModuleType("torchaudio")
-    _torchaudio_stub.__spec__ = importlib.machinery.ModuleSpec("torchaudio", None)
-    _torchaudio_stub.__version__ = "0"
-    sys.modules["torchaudio"] = _torchaudio_stub
 
 import numpy as np
 import torch
