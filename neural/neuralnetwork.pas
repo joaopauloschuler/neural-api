@@ -573,9 +573,8 @@ type
       // no-op: layers whose ComputeRange reads FPrevLayer.Output directly
       // (FullConnect) need nothing. Coded by Claude (AI).
       procedure PrepareChunkedForward(); virtual;
-      // The neuron-list half of LinkWeightsFrom: frees this layer's neurons,
-      // points FNeurons at Owner's, registers the link. False (nothing
-      // changed) when Owner is not a same-class, same-count, unlinked layer.
+      // The neuron-list half of LinkWeightsFrom: frees this layer's own neurons
+      // (a borrower re-links, freeing nothing), points FNeurons at Owner's.
       function LinkNeuronsFrom(Owner: TNNetLayer): boolean;
       // Called by the owner as it is destroyed: replaces every borrowed
       // reference with empty storage this layer owns. The layer must not
@@ -876,7 +875,9 @@ type
       // tables and resident device codes) at this layer's own input width, in
       // any net; inference-only afterwards. Order: Owner's weight state final,
       // this layer attached (SetPrevLayer), OpenCL enabled AFTER the link
-      // (EnableOpenCLInContextOf). False when Owner is unsuitable. Coded by Claude (AI).
+      // (EnableOpenCLInContextOf). False when Owner is unsuitable. A borrower
+      // may call it again to re-link to another same-shape owner (no copy).
+      // Coded by Claude (AI).
       function LinkWeightsFrom(Owner: TNNetLayer): boolean; virtual;
 
       // Low-memory inference predicates (Coded by Claude (AI)):
@@ -1015,10 +1016,8 @@ type
       constructor Create(); override;
       destructor Destroy(); override;
       procedure RefreshNeuronWeightList();
-      // Neurons plus, when Owner is int8/int4, its tables by reference (this
-      // layer's own rows and tables are freed); a later EnableOpenCL then
-      // retains Owner's resident codes. Needs SetPrevLayer and an owner row
-      // width equal to this layer's FVectorSize. Coded by Claude (AI).
+      // Neurons plus, when Owner is int8/int4, its tables by reference; a later
+      // EnableOpenCL retains Owner's codes. Needs SetPrevLayer. Coded by Claude (AI).
       function LinkWeightsFrom(Owner: TNNetLayer): boolean; override;
       // Converts the FP32 weights to per-output-channel symmetric int8
       // (scale = max|row|/127, round-to-nearest) and frees the FP32 weight
@@ -79588,8 +79587,12 @@ begin
   RefreshNeuronWeightList();
   if OwnerQuantized then
   begin
-    FQuantTable.Free;
-    FQuantTableInt4.Free;
+    // A re-link holds the previous owner's tables: those are not freed.
+    if not FLinkedWeightTables then
+    begin
+      FQuantTable.Free;
+      FQuantTableInt4.Free;
+    end;
     FQuantTable := OwnerCW.FQuantTable;
     FQuantTableInt4 := OwnerCW.FQuantTableInt4;
     FLinkedWeightTables := true;
@@ -79659,6 +79662,13 @@ var
   MaxNeurons: integer;
   BiasValue: TNeuralFloatPtr;
 begin
+  // Every convolution reader checks FSuppressBias first, so a bias-free
+  // convolution neither sizes nor fills the per-position bias copy.
+  if (FSuppressBias <> 0) and (Self is TNNetConvolution) then
+  begin
+    FBiasOutput.ReSize(1, 1, 1);
+    exit;
+  end;
   MaxNeurons := FNeurons.Count - 1;
   FBiasOutput.ReSize(FOutputRaw);
   if High(FArrNeurons) < MaxNeurons then BuildArrNeurons();
@@ -79746,12 +79756,13 @@ var
   MaxNeuronPos: integer;
   NeuronCnt: integer;
 begin
-  FNeuronWeightList.Clear;
-
+  // Count, not Clear + Add: a re-link refreshes the list with its capacity
+  // kept (the list does not own the volumes).
+  FNeuronWeightList.Count := FNeurons.Count;
   MaxNeuronPos := FNeurons.Count - 1;
   for NeuronCnt := 0 to MaxNeuronPos do
   begin
-    FNeuronWeightList.Add(FNeurons[NeuronCnt].Weights);
+    FNeuronWeightList[NeuronCnt] := FNeurons[NeuronCnt].Weights;
   end;
 end;
 
@@ -134933,7 +134944,10 @@ begin
       ', not the same class.');
     exit;
   end;
-  if FLinkedNeurons or Owner.FLinkedNeurons then
+  // A LinkWeightsFrom borrower may re-link; other linked lists (shared-weight
+  // convolutions) and owners that borrow themselves may not.
+  if (FLinkedNeurons and not Assigned(FWeightOwner)) or
+     Owner.FLinkedNeurons then
   begin
     FErrorProc(ClassName + '.LinkWeightsFrom: layer ' + IntToStr(FLayerIdx) +
       ' or its owner already links another layer''s neurons.');
@@ -134946,7 +134960,11 @@ begin
       IntToStr(FNeurons.Count) + '.');
     exit;
   end;
-  FNeurons.Free;
+  // Re-link: FNeurons is the previous owner's list, so it is released, not
+  // freed.
+  if Assigned(FWeightOwner)
+    then FWeightOwner.FWeightBorrowers.Remove(Self)
+    else FNeurons.Free;
   FNeurons := Owner.FNeurons;
   FLinkedNeurons := true;
   FCanNormalizeDelta := false;

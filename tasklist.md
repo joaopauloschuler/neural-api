@@ -1823,7 +1823,7 @@ rather than acted on.
         prefill where they fit; fold the zero-centred +1 into the RMSNorm weight at
         load. Single-block parity vs HF.
         Done: `AddQwenImage21Block` (qibStep / qibPrefix), `AddQwenImage21Modulation`, `AddQwenImage21TextProjection`, `LoadQwenImage21BlockWeights`, `ReadQwenImage21TransformerConfig`; `TNNetFusedSDPA` gained `CachedForwardNonCausal` + `AppendCacheRowsFrom`; tests `TestQwenImage21StepBlockParity`, `TestQwenImage21PrefixBlockKVParity`, `TestCachedForwardNonCausal`.
-  - [ ] A5. `BuildQwenImage21Transformer`: a PREFIX network (text tokens, causal, t=0
+  - [x] A5. `BuildQwenImage21Transformer`: a PREFIX network (text tokens, causal, t=0
         modulation, emits per-layer K/V) and a STEP network (target tokens); timestep
         embedding, shared modulation computed once per step, `norm_out`, `proj_out`;
         sharded diffusers-folder loader. Parity vs HF extract and cached modes.
@@ -1831,6 +1831,7 @@ rather than acted on.
         at block i's weights before block i runs (each block keeps its own KV cache);
         32 blocks in one TNNet would need ~64 GB of activations at 1024x1024 (~2 GB
         per block at N=4096). One code path for every image size.
+        Done: class `TQwenImage21Transformer` (weight store `BlockStore[i]`, `SelectBlockWeights` re-links via `TNNet.LinkWeightsFrom`, `EncodePrefix`, `PredictVelocity`, `qiwFP32/qiwInt8/qiwInt4`), `QwenImage21SetRopePositions`; `TNNetLayer.LinkWeightsFrom` may re-link; tests `TestQwenImage21Transformer*`.
   - [ ] A6. VAE decoder: first check whether image decode ever runs `time_conv`;
         channel RMSNorm, DupUp shortcuts, mid attention, latent de-normalisation,
         tiled decode (2048x2048 full-resolution activations are ~2.4 GB each). Pico

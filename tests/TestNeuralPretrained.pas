@@ -51,12 +51,17 @@ type
       Dest: TNNetVolume);
     procedure LoadOracleTokenTensorObject(TensorObj: TJSONData;
       const What: string; Dest: TNNetVolume);
-    // Block 0 of the pico Qwen-Image-2.1 transformer in the step pass over a
-    // GridH x GridW image; Layers[1] is the (1,1,4*hidden) modulation input.
+    // Block BlockIdx of the pico Qwen-Image-2.1 transformer in the step pass
+    // over a GridH x GridW image; Layers[1] is the (1,1,4*hidden) modulation.
     function BuildQwenImage21StepBlockNet(
       const Config: TQwenImage21TransformerConfig;
-      Reader: TNNetSafeTensorsReader; PrefixCount, GridH, GridW: integer;
-      out Block: TQwenImage21BlockLayers): TNNet;
+      Reader: TNNetSafeTensorsReader; PrefixCount, GridH, GridW,
+      BlockIdx: integer; out Block: TQwenImage21BlockLayers): TNNet;
+    // Loads the pico transformer oracle; GridH/GridW from img_shapes[0].
+    function LoadQwenImage21TransformerOracle(out GridH, GridW: integer):
+      TJSONData;
+    // The pico diffusers transformer folder (FixturePath takes files only).
+    function QwenImage21TransformerFolder(): string;
     // Windows of StepTokens through WindowSession over the first
     // PrefillTokenCount tokens, snapshot handoff, then width-1 for the rest.
     // The first HiddenOnlyTokenCount tokens step with StepForwardToHidden
@@ -690,6 +695,12 @@ type
     procedure TestQwenImage21RopeForward;
     procedure TestQwenImage21StepBlockParity;
     procedure TestQwenImage21PrefixBlockKVParity;
+    procedure TestQwenImage21TransformerParity;
+    procedure TestQwenImage21TransformerWeightSwap;
+    procedure TestQwenImage21TransformerSharedWeightStore;
+    procedure TestQwenImage21TransformerOpenCLGuard;
+    procedure TestQwenImage21TransformerStepReplay;
+    procedure TestQwenImage21TransformerQuantizedDrift;
     procedure TestQwen3VLTextEncoderInt8Drift;
     procedure TestQwen2AudioConfigFromJSONFile;
     procedure TestQwen2AudioParity;
@@ -25330,8 +25341,8 @@ end;
 
 function TTestNeuralPretrained.BuildQwenImage21StepBlockNet(
   const Config: TQwenImage21TransformerConfig;
-  Reader: TNNetSafeTensorsReader; PrefixCount, GridH, GridW: integer;
-  out Block: TQwenImage21BlockLayers): TNNet;
+  Reader: TNNetSafeTensorsReader; PrefixCount, GridH, GridW,
+  BlockIdx: integer; out Block: TQwenImage21BlockLayers): TNNet;
 var
   XInput, ModulationInput: TNNetLayer;
   PosF, PosH, PosW: TNeuralIntegerArray;
@@ -25345,7 +25356,7 @@ begin
   AddQwenImage21Block(Result, XInput,
     AddQwenImage21Modulation(Result, ModulationInput, Config.Hidden), Config,
     qibStep, PrefixCount, Block);
-  LoadQwenImage21BlockWeights(Reader, Block, Config, 0);
+  LoadQwenImage21BlockWeights(Reader, Block, Config, BlockIdx);
   // The step pass carries only the image tokens: the tail of the joint layout.
   BuildQwenImage21RopePositions([PrefixCount, 0], [GridH], [GridW],
     PosF, PosH, PosW);
@@ -25406,7 +25417,7 @@ begin
     Reader := TNNetSafeTensorsReader.Create(FixturePath(
       'tiny_qwenimage21/transformer/diffusion_pytorch_model.safetensors.index.json'));
     NN := BuildQwenImage21StepBlockNet(Config, Reader, PrefixCount, GridH,
-      GridW, Block);
+      GridW, 0, Block);
     AssertEquals('the step attention sizes no prefill score map', 1,
       Block.Attn.AttentionWeights.Size);
     AssertEquals('cache capacity = prefix + image tokens',
@@ -25528,7 +25539,7 @@ begin
     end;
     // Hand block 0's exported K/V to the step pass.
     StepNet := BuildQwenImage21StepBlockNet(Config, Reader, PrefixCount, GridH,
-      GridW, StepBlock);
+      GridW, 0, StepBlock);
     StepBlock.Attn.AppendCacheRowsFrom(Blocks[0].KRope.Output,
       Blocks[0].VProj.Output);
     BlockObj := TJSONObject(RefRoot).Find('block0_cached');
@@ -25552,6 +25563,455 @@ begin
     Embeds.Free;
     RefRoot.Free;
     RefJson.Free;
+  end;
+end;
+
+function TTestNeuralPretrained.QwenImage21TransformerFolder(): string;
+begin
+  Result := ExtractFileDir(
+    FixturePath('tiny_qwenimage21/transformer/config.json'));
+end;
+
+function TTestNeuralPretrained.LoadQwenImage21TransformerOracle(out GridH,
+  GridW: integer): TJSONData;
+var
+  RefJson: TStringList;
+  ShapeArr: TJSONArray;
+begin
+  RefJson := TStringList.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_transformer_io.json'));
+    Result := GetJSON(RefJson.Text);
+  finally
+    RefJson.Free;
+  end;
+  ShapeArr := TJSONArray(
+    TJSONArray(TJSONObject(Result).Find('img_shapes')).Items[0]);
+  GridH := ShapeArr.Integers[1];
+  GridW := ShapeArr.Integers[2];
+end;
+
+// The whole pico transformer (2 blocks) against diffusers: temb and modulation
+// for t = 0.9, 0 and 0.35, both blocks' extract-mode prefix K/V, the image rows
+// of the extract output (step 1) and the cached output (step 2: t = 0.35, new
+// latents). Float32 against a float64 oracle with BF16-rounded weights. The t=0
+// prefix K/V stay within 1e-5 (measured 9.5e-7). A sampled t puts float32
+// sinusoid arguments up to 1000 rad (~3e-5 rad rounding, as in diffusers' own
+// float32 forward): 5e-5 (measured 8.1e-6 on temb, 9.9e-6 on velocities ~3.5).
+procedure TTestNeuralPretrained.TestQwenImage21TransformerParity;
+const
+  TimestepTolerance = 5e-5;
+var
+  RefRoot: TJSONData;
+  CacheKArr, CacheVArr: TJSONArray;
+  Transformer: TQwenImage21Transformer;
+  Embeds, Latents, Rows, Expected, Velocity: TNNetVolume;
+  GridH, GridW, PrefixCount, BlockPos: integer;
+  WorstDiff: double;
+
+  procedure AssertClose(Actual: TNNetVolume; Tolerance: double;
+    const What: string);
+  var
+    MaxDiff: double;
+  begin
+    MaxDiff := MaxAbsVolumeDiff(Actual, Expected);
+    if MaxDiff > WorstDiff then WorstDiff := MaxDiff;
+    AssertTrue(What + ': max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < ' + FloatToStr(Tolerance), MaxDiff < Tolerance);
+  end;
+
+  procedure AssertOracleRow(const Key: string; RowPos: integer;
+    Actual: TNNetVolume; const What: string);
+  begin
+    LoadOracleTokenTensor(RefRoot, Key, Rows);
+    Expected.CopyCropping(Rows, RowPos, 0, 1, 1);
+    AssertClose(Actual, TimestepTolerance, What);
+  end;
+
+begin
+  RefRoot := nil;
+  Transformer := nil;
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Rows := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Velocity := TNNetVolume.Create;
+  WorstDiff := 0;
+  try
+    RefRoot := LoadQwenImage21TransformerOracle(GridH, GridW);
+    PrefixCount := TJSONObject(RefRoot).Get('text_len', 0);
+    Transformer := TQwenImage21Transformer.Create(
+      QwenImage21TransformerFolder());
+    AssertEquals('blocks', 2, Transformer.Config.NumLayers);
+    // Oracle rows: [sampled t, t = 0].
+    Transformer.ComputeModulation(0.9);
+    AssertOracleRow('temb_1', 0, Transformer.TimestepEmbedding, 'temb t=0.9');
+    AssertOracleRow('modulation_1', 0, Transformer.Modulation,
+      'modulation t=0.9');
+    Transformer.ComputeModulation(0);
+    AssertOracleRow('temb_1', 1, Transformer.TimestepEmbedding, 'temb t=0');
+    AssertOracleRow('modulation_1', 1, Transformer.Modulation,
+      'modulation t=0');
+    Transformer.ComputeModulation(0.35);
+    AssertOracleRow('temb_2', 0, Transformer.TimestepEmbedding,
+      'temb t=0.35');
+    AssertOracleRow('modulation_2', 0, Transformer.Modulation,
+      'modulation t=0.35');
+    LoadOracleTokenTensor(RefRoot, 'encoder_hidden_states', Embeds);
+    Transformer.EncodePrefix(Embeds);
+    AssertEquals('prefix length', PrefixCount, Transformer.PrefixLength);
+    CacheKArr := TJSONArray(TJSONObject(RefRoot).Find('cache_k'));
+    CacheVArr := TJSONArray(TJSONObject(RefRoot).Find('cache_v'));
+    for BlockPos := 0 to 1 do
+    begin
+      LoadOracleTokenTensorObject(CacheKArr.Items[BlockPos], 'cache_k',
+        Expected);
+      AssertClose(Transformer.PrefixKeys[BlockPos], 1e-5,
+        'prefix K, block ' + IntToStr(BlockPos));
+      LoadOracleTokenTensorObject(CacheVArr.Items[BlockPos], 'cache_v',
+        Expected);
+      AssertClose(Transformer.PrefixValues[BlockPos], 1e-5,
+        'prefix V, block ' + IntToStr(BlockPos));
+    end;
+    LoadOracleTokenTensor(RefRoot, 'latents_1', Latents);
+    Transformer.PredictVelocity(Latents, 0.9, GridH, GridW, Velocity);
+    LoadOracleTokenTensor(RefRoot, 'extract_output', Rows);
+    Expected.CopyCropping(Rows, PrefixCount, 0, GridH * GridW, 1);
+    AssertClose(Velocity, TimestepTolerance,
+      'step 1 velocity vs the extract output image rows');
+    LoadOracleTokenTensor(RefRoot, 'latents_2', Latents);
+    Transformer.PredictVelocity(Latents, 0.35, GridH, GridW, Velocity);
+    LoadOracleTokenTensor(RefRoot, 'cached_output', Expected);
+    AssertClose(Velocity, TimestepTolerance,
+      'step 2 velocity vs the cached output');
+    WriteLn('  Qwen-Image-2.1 transformer parity: worst max|diff|=',
+      WorstDiff:0:9);
+  finally
+    Transformer.Free;
+    Velocity.Free;
+    Expected.Free;
+    Rows.Free;
+    Latents.Free;
+    Embeds.Free;
+    RefRoot.Free;
+  end;
+end;
+
+// The reusable step block re-linked to block 1 must compute exactly what a
+// block built and loaded with block 1's weights computes (same kernels, shapes
+// and weights), and re-linking back to block 0 must replay block 0 bit for bit.
+procedure TTestNeuralPretrained.TestQwenImage21TransformerWeightSwap;
+var
+  RefRoot, BlockObj: TJSONData;
+  Transformer: TQwenImage21Transformer;
+  Reader: TNNetSafeTensorsReader;
+  Reference: TNNet;
+  ReferenceBlock: TQwenImage21BlockLayers;
+  Embeds, Hidden, ModulationRows, Block0Output, Block1Output: TNNetVolume;
+  GridH, GridW, MaxModulationPos, ModulationPos: integer;
+
+  procedure RunStepAsBlock(BlockIdx: integer; Output: TNNetVolume);
+  begin
+    Transformer.SelectBlockWeights(Transformer.StepNet, BlockIdx);
+    Transformer.StepBlock.Attn.TruncateCache(0);
+    Transformer.StepBlock.Attn.AppendCacheRowsFrom(
+      Transformer.PrefixKeys[BlockIdx], Transformer.PrefixValues[BlockIdx]);
+    Transformer.StepNet.Compute(Hidden);
+    Output.Copy(Transformer.StepNet.GetLastLayer().Output);
+  end;
+
+begin
+  RefRoot := nil;
+  Transformer := nil;
+  Reader := nil;
+  Reference := nil;
+  Embeds := TNNetVolume.Create;
+  Hidden := TNNetVolume.Create;
+  ModulationRows := TNNetVolume.Create;
+  Block0Output := TNNetVolume.Create;
+  Block1Output := TNNetVolume.Create;
+  try
+    RefRoot := LoadQwenImage21TransformerOracle(GridH, GridW);
+    LoadOracleTokenTensor(RefRoot, 'encoder_hidden_states', Embeds);
+    BlockObj := TJSONObject(RefRoot).Find('block0_cached');
+    LoadOracleTokenTensor(BlockObj, 'hidden_in', Hidden);
+    LoadOracleTokenTensor(BlockObj, 'modulation', ModulationRows);
+    Transformer := TQwenImage21Transformer.Create(
+      QwenImage21TransformerFolder());
+    Transformer.EncodePrefix(Embeds);
+    Transformer.PrepareStepPass(GridH, GridW);
+    MaxModulationPos := 4 * Transformer.Config.Hidden - 1;
+    for ModulationPos := 0 to MaxModulationPos do
+      Transformer.StepNet.Layers[1].Output.FData[ModulationPos] :=
+        ModulationRows.FData[ModulationPos];
+    RunStepAsBlock(0, Block0Output);
+    RunStepAsBlock(1, Block1Output);
+    AssertTrue('blocks 0 and 1 differ',
+      MaxAbsVolumeDiff(Block0Output, Block1Output) > 1e-3);
+    Reader := TNNetSafeTensorsReader.Create(FixturePath(
+      'tiny_qwenimage21/transformer/diffusion_pytorch_model.safetensors.index.json'));
+    Reference := BuildQwenImage21StepBlockNet(Transformer.Config, Reader,
+      Transformer.PrefixLength, GridH, GridW, 1, ReferenceBlock);
+    ReferenceBlock.Attn.AppendCacheRowsFrom(Transformer.PrefixKeys[1],
+      Transformer.PrefixValues[1]);
+    for ModulationPos := 0 to MaxModulationPos do
+      Reference.Layers[1].Output.FData[ModulationPos] :=
+        ModulationRows.FData[ModulationPos];
+    Reference.Compute(Hidden);
+    AssertEquals('re-linked to block 1 vs a block-1 build', 0,
+      MaxAbsVolumeDiff(Block1Output, Reference.GetLastLayer().Output), 0);
+    RunStepAsBlock(0, Block1Output);
+    AssertEquals('re-linked back to block 0', 0,
+      MaxAbsVolumeDiff(Block0Output, Block1Output), 0);
+  finally
+    Reference.Free;
+    Reader.Free;
+    Transformer.Free;
+    Block1Output.Free;
+    Block0Output.Free;
+    ModulationRows.Free;
+    Hidden.Free;
+    Embeds.Free;
+    RefRoot.Free;
+  end;
+end;
+
+// The prefix and step blocks own no weight rows: every weight layer of both
+// holds the stored block's neuron list itself (one allocation per block).
+procedure TTestNeuralPretrained.TestQwenImage21TransformerSharedWeightStore;
+var
+  RefRoot: TJSONData;
+  Transformer: TQwenImage21Transformer;
+  Embeds: TNNetVolume;
+  GridH, GridW, BlockPos: integer;
+
+  procedure AssertBorrows(Layer, StoreLayer: TNNetLayer; const What: string);
+  begin
+    AssertTrue(What + ': owner is the stored layer',
+      Layer.WeightOwner = StoreLayer);
+    AssertTrue(What + ': the stored neuron list itself',
+      Layer.Neurons = StoreLayer.Neurons);
+  end;
+
+  procedure AssertBlockBorrows(const Block, Store: TQwenImage21BlockLayers;
+    const What: string);
+  begin
+    AssertBorrows(Block.QProj, Store.QProj, What + ' to_q');
+    AssertBorrows(Block.KProj, Store.KProj, What + ' to_k');
+    AssertBorrows(Block.VProj, Store.VProj, What + ' to_v');
+    AssertBorrows(Block.QNorm, Store.QNorm, What + ' norm_q');
+    AssertBorrows(Block.KNorm, Store.KNorm, What + ' norm_k');
+    AssertBorrows(Block.OutProj, Store.OutProj, What + ' to_out');
+    AssertBorrows(Block.GateUp, Store.GateUp, What + ' proj|gate_layer');
+    AssertBorrows(Block.Down, Store.Down, What + ' out');
+  end;
+
+begin
+  RefRoot := nil;
+  Transformer := nil;
+  Embeds := TNNetVolume.Create;
+  try
+    RefRoot := LoadQwenImage21TransformerOracle(GridH, GridW);
+    LoadOracleTokenTensor(RefRoot, 'encoder_hidden_states', Embeds);
+    Transformer := TQwenImage21Transformer.Create(
+      QwenImage21TransformerFolder());
+    Transformer.EncodePrefix(Embeds);
+    Transformer.PrepareStepPass(GridH, GridW);
+    AssertEquals('prefix block sized no weights', 0,
+      Transformer.PrefixNet.WeightElementsSized());
+    AssertEquals('step block sized no weights', 0,
+      Transformer.StepNet.WeightElementsSized());
+    AssertTrue('the store holds the weights',
+      Transformer.BlockStore[0].WeightElementsSized() > 0);
+    AssertTrue('each block has its own store',
+      Transformer.BlockStoreLayers[0].GateUp.Neurons <>
+      Transformer.BlockStoreLayers[1].GateUp.Neurons);
+    for BlockPos := 1 downto 0 do
+    begin
+      Transformer.SelectBlockWeights(Transformer.PrefixNet, BlockPos);
+      Transformer.SelectBlockWeights(Transformer.StepNet, BlockPos);
+      AssertBlockBorrows(Transformer.PrefixBlock,
+        Transformer.BlockStoreLayers[BlockPos],
+        'prefix block as block ' + IntToStr(BlockPos));
+      AssertBlockBorrows(Transformer.StepBlock,
+        Transformer.BlockStoreLayers[BlockPos],
+        'step block as block ' + IntToStr(BlockPos));
+    end;
+  finally
+    Transformer.Free;
+    Embeds.Free;
+    RefRoot.Free;
+  end;
+end;
+
+// A re-link leaves a device copy of the weights stale, so SelectBlockWeights
+// (and therefore PredictVelocity) must refuse a block net with OpenCL enabled.
+procedure TTestNeuralPretrained.TestQwenImage21TransformerOpenCLGuard;
+{$IFDEF OpenCL}
+var
+  RefRoot: TJSONData;
+  Transformer: TQwenImage21Transformer;
+  Embeds, Latents, Velocity: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  GridH, GridW: integer;
+  Refused: boolean;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RefRoot := nil;
+  Transformer := nil;
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Velocity := TNNetVolume.Create;
+  try
+    RefRoot := LoadQwenImage21TransformerOracle(GridH, GridW);
+    LoadOracleTokenTensor(RefRoot, 'encoder_hidden_states', Embeds);
+    LoadOracleTokenTensor(RefRoot, 'latents_1', Latents);
+    Transformer := TQwenImage21Transformer.Create(
+      QwenImage21TransformerFolder());
+    Transformer.EncodePrefix(Embeds);
+    Transformer.PrepareStepPass(GridH, GridW);
+    Transformer.StepNet.EnableOpenCL(PlatformId, DeviceId);
+    Refused := false;
+    try
+      Transformer.PredictVelocity(Latents, 0.9, GridH, GridW, Velocity);
+    except
+      on E: Exception do
+      begin
+        WriteLn('  Qwen-Image-2.1 OpenCL guard: ', E.Message);
+        Refused := Pos('OpenCL', E.Message) > 0;
+      end;
+    end;
+    AssertTrue('PredictVelocity refuses an OpenCL step block', Refused);
+  finally
+    Transformer.Free;
+    Velocity.Free;
+    Latents.Free;
+    Embeds.Free;
+    RefRoot.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Every PredictVelocity rebuilds each block's cache from the stored prefix
+// K/V, so a repeated call replays bit for bit, also after another step ran.
+procedure TTestNeuralPretrained.TestQwenImage21TransformerStepReplay;
+var
+  RefRoot: TJSONData;
+  Transformer: TQwenImage21Transformer;
+  Embeds, Latents, OtherLatents, FirstVelocity, Velocity: TNNetVolume;
+  GridH, GridW: integer;
+begin
+  RefRoot := nil;
+  Transformer := nil;
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  OtherLatents := TNNetVolume.Create;
+  FirstVelocity := TNNetVolume.Create;
+  Velocity := TNNetVolume.Create;
+  try
+    RefRoot := LoadQwenImage21TransformerOracle(GridH, GridW);
+    LoadOracleTokenTensor(RefRoot, 'encoder_hidden_states', Embeds);
+    LoadOracleTokenTensor(RefRoot, 'latents_1', Latents);
+    LoadOracleTokenTensor(RefRoot, 'latents_2', OtherLatents);
+    Transformer := TQwenImage21Transformer.Create(
+      QwenImage21TransformerFolder());
+    Transformer.EncodePrefix(Embeds);
+    Transformer.PredictVelocity(Latents, 0.9, GridH, GridW, FirstVelocity);
+    Transformer.PredictVelocity(Latents, 0.9, GridH, GridW, Velocity);
+    AssertEquals('immediate replay', 0,
+      MaxAbsVolumeDiff(FirstVelocity, Velocity), 0);
+    Transformer.PredictVelocity(OtherLatents, 0.35, GridH, GridW, Velocity);
+    Transformer.PredictVelocity(Latents, 0.9, GridH, GridW, Velocity);
+    AssertEquals('replay after another step', 0,
+      MaxAbsVolumeDiff(FirstVelocity, Velocity), 0);
+  finally
+    Transformer.Free;
+    Velocity.Free;
+    FirstVelocity.Free;
+    OtherLatents.Free;
+    Latents.Free;
+    Embeds.Free;
+    RefRoot.Free;
+  end;
+end;
+
+// int8 and int4 block weights (and int8 x int8 projections) against the FP32
+// transformer: the step block links the stored int8 table by reference (no
+// table bytes of its own), and the velocity drifts less than the stated share
+// of its largest FP32 value (measured 0.19% int8, 0.45% int8 x int8, 3.1% int4).
+procedure TTestNeuralPretrained.TestQwenImage21TransformerQuantizedDrift;
+var
+  RefRoot: TJSONData;
+  Reference, Quantized: TQwenImage21Transformer;
+  Embeds, Latents, ReferenceVelocity, Velocity: TNNetVolume;
+  GridH, GridW: integer;
+
+  procedure AssertDrift(pWeightFormat: TQwenImage21WeightFormat;
+    pInt8Input: boolean; MaxRelDrift: double; const What: string);
+  var
+    RelDrift: double;
+  begin
+    Quantized := TQwenImage21Transformer.Create(
+      QwenImage21TransformerFolder(), pWeightFormat, pInt8Input);
+    try
+      Quantized.EncodePrefix(Embeds);
+      Quantized.PredictVelocity(Latents, 0.9, GridH, GridW, Velocity);
+      if pWeightFormat = qiwInt8 then
+      begin
+        AssertTrue(What + ': step to_q is int8', TNNetLayerConcatedWeights(
+          Quantized.StepBlock.QProj).WeightsQuantizedInt8);
+        AssertEquals(What + ': step to_q holds no table of its own', 0,
+          TNNetLayerConcatedWeights(
+            Quantized.StepBlock.QProj).Int8QuantizedSizeBytes());
+      end
+      else
+        AssertTrue(What + ': step to_q is int4', TNNetLayerConcatedWeights(
+          Quantized.StepBlock.QProj).WeightsQuantizedInt4);
+      RelDrift := MaxAbsVolumeDiff(Velocity, ReferenceVelocity) /
+        ReferenceVelocity.GetMaxAbs();
+      WriteLn('  Qwen-Image-2.1 ', What, ' velocity drift: ', RelDrift:0:5);
+      AssertTrue(What + ': relative drift ' + FloatToStr(RelDrift) +
+        ' must be < ' + FloatToStr(MaxRelDrift), RelDrift < MaxRelDrift);
+    finally
+      FreeAndNil(Quantized);
+    end;
+  end;
+
+begin
+  RefRoot := nil;
+  Reference := nil;
+  Quantized := nil;
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  ReferenceVelocity := TNNetVolume.Create;
+  Velocity := TNNetVolume.Create;
+  try
+    RefRoot := LoadQwenImage21TransformerOracle(GridH, GridW);
+    LoadOracleTokenTensor(RefRoot, 'encoder_hidden_states', Embeds);
+    LoadOracleTokenTensor(RefRoot, 'latents_1', Latents);
+    Reference := TQwenImage21Transformer.Create(
+      QwenImage21TransformerFolder());
+    Reference.EncodePrefix(Embeds);
+    Reference.PredictVelocity(Latents, 0.9, GridH, GridW, ReferenceVelocity);
+    AssertDrift(qiwInt8, false, 0.02, 'int8');
+    AssertDrift(qiwInt8, true, 0.02, 'int8 x int8');
+    AssertDrift(qiwInt4, false, 0.10, 'int4');
+  finally
+    Reference.Free;
+    Velocity.Free;
+    ReferenceVelocity.Free;
+    Latents.Free;
+    Embeds.Free;
+    RefRoot.Free;
   end;
 end;
 
