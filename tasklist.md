@@ -1847,6 +1847,16 @@ rather than acted on.
   - [ ] C3. Edit pipeline: condition-image latents in the prefix, bidirectional
         within each image block; `<image1>` template; RoPE for several image blocks;
         up to 10 reference images.
+- [ ] Flow-matching sampler clean-ups surfaced by `TNNetFlowMatchEulerScheduler`
+      (fd99162f):
+  - [ ] `examples/F5TTS/F5TTS.lpr` (~108-122): replace the per-element Euler loop
+        `Xt.FData[i] + dt*Vel.FData[i]` with `TNNetVolume.MulAdd`. Upstream F5-TTS
+        also uses sway sampling, which the scheduler does not cover.
+  - [ ] `examples/FlowMatching/FlowMatching.lpr` (~296-312): optionally drive the
+        loop with `TNNetFlowMatchEulerScheduler`. The example integrates t from 0
+        (noise) to 1 (data) with dt = 1/N and no shift, so it needs time = 1 - sigma
+        and a reversed velocity sign; the gain is small (the loop is already one
+        `MulAdd` per step).
 
 ## OpenCL forward coverage — layers still on the host
 
