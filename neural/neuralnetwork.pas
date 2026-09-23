@@ -4713,7 +4713,8 @@ type
   /// OpenCL offload (CPU only - per-head SDPA remains for those). Training
   /// backward IS implemented (per-head mirror of the single-head backward).
   /// Serialization: FStruct[5] = QHeads, FStruct[6] = KVHeads on top of the
-  /// inherited [0]=HeadDim, [1]=causal, [2]=window, FFloatSt[0]=soft-cap.
+  /// inherited [0]=HeadDim, [1]=causal, [2]=window, FFloatSt[0]=soft-cap;
+  /// FStruct[7] = CachedForwardNonCausal.
   // Coded by Claude (AI).
   TNNetFusedSDPA = class(TNNetScaledDotProductAttention)
   private
@@ -4721,6 +4722,9 @@ type
     FQW, FKW: integer;          // Hq*HeadDim / Hkv*HeadDim channel widths
     FCacheBaseLen: integer;     // cache length BEFORE this forward's appends
     FChunkPrecomputed: boolean; // prep already produced FOutput (rare; see below)
+    // True: every token row of a cached forward attends the whole cache,
+    // including the rows that forward appended (no causal order among them).
+    FCachedForwardNonCausal: boolean;
     {$IFDEF OpenCL}
     // Cached-decode forward in OpenCL memory (append, split-row attention,
     // merge), with the KV cache resident and appended in place.
@@ -4732,6 +4736,13 @@ type
     {$ENDIF}
     // Append input token p's K/V rows (all KV heads) to cache slot FCacheLen.
     procedure AppendRow(p: integer);
+    // Append one token's K and V rows to cache slot FCacheLen. KRow/VRow each
+    // point at FKVHeads*HeadDim floats, head after head.
+    procedure AppendKVRow(KRow, VRow: TNeuralFloatArrPtr);
+    // Score every input token row, heads h1..h2, over the live cache: up to
+    // its own slot, or the whole cache when FCachedForwardNonCausal.
+    procedure ComputeCachedRows(h1, h2: integer);
+    procedure SetCachedForwardNonCausal(pValue: boolean);
     // StreamingLLM eviction step: drop the oldest window row (slot
     // FEvictSinks), shifting the later rows (and per-head scales) left.
     procedure EvictOldestWindowRow();
@@ -4772,11 +4783,15 @@ type
   public
     constructor Create(pQHeads, pKVHeads, pHeadDim: integer;
       pCausalMask: boolean = false; pWindow: integer = 0;
-      pScoreSoftCap: TNeuralFloat = 0); reintroduce; overload;
+      pScoreSoftCap: TNeuralFloat = 0;
+      pCachedForwardNonCausal: boolean = false); reintroduce; overload;
     procedure Compute(); override;
     procedure Backpropagate(); override;
     procedure BeginIncrementalDecode(pMaxContext: integer;
       pInt8KV: boolean = false); override;
+    // Appends K.SizeX token rows of externally computed keys and values (each
+    // (Rows,1,KVHeads*HeadDim), already position-encoded) at slot CacheLength.
+    procedure AppendCacheRowsFrom(K, V: TNNetVolume);
     procedure EnableInt8KV(); override;
     procedure DisableInt8KV(); override;
     procedure PrepareChunkedForward(); override;
@@ -4796,6 +4811,10 @@ type
     {$ENDIF}
     property QHeads: integer read FQHeads;
     property KVHeads: integer read FKVHeads;
+    // See FCachedForwardNonCausal. Keeps the host path: the OpenCL decode
+    // kernels bound every row by its own slot. Eviction must be off.
+    property CachedForwardNonCausal: boolean read FCachedForwardNonCausal
+      write SetCachedForwardNonCausal;
   end;
 
   /// Cross-Attention (single head, parameter-free) with SEPARATE query and
@@ -34475,7 +34494,8 @@ end;
 { TNNetFusedSDPA }
 
 constructor TNNetFusedSDPA.Create(pQHeads, pKVHeads, pHeadDim: integer;
-  pCausalMask: boolean; pWindow: integer; pScoreSoftCap: TNeuralFloat);
+  pCausalMask: boolean; pWindow: integer; pScoreSoftCap: TNeuralFloat;
+  pCachedForwardNonCausal: boolean);
 begin
   // The inherited constructor sets FDk = pHeadDim, FInvSqrtDk, the mask /
   // soft-cap machinery and FStruct[0..4] / FFloatSt[0] exactly as the
@@ -34502,6 +34522,13 @@ begin
   FStruct[6] := FKVHeads;
   FChunkPrecomputed := false;
   FCacheBaseLen := 0;
+  SetCachedForwardNonCausal(pCachedForwardNonCausal);
+end;
+
+procedure TNNetFusedSDPA.SetCachedForwardNonCausal(pValue: boolean);
+begin
+  FCachedForwardNonCausal := pValue;
+  if pValue then FStruct[7] := 1 else FStruct[7] := 0;
 end;
 
 function TNNetFusedSDPA.InputDepthRequired(): integer;
@@ -34615,19 +34642,23 @@ end;
 
 procedure TNNetFusedSDPA.AppendRow(p: integer);
 var
-  g, ScaleSlot, RowBase, KVHeadsM1: integer;
-  pBase, gFDk, RowStep, RowBytesFP, PVBase: integer;
+  pBase: integer;
   Prev: TNNetVolume;
 begin
   Prev := FPrevLayer.FOutput;
-  KVHeadsM1 := FKVHeads - 1;
-  // Carried offsets (#4/#6/#11): pBase is this token's Prev row base (invariant
-  // across g); g*FDk advances by a constant FDk per head; the plane scale slot
-  // by FCacheMax; the FP32 row base by FCacheMax*FDk. FQW+g*FDk / FQW+FKW+g*FDk
-  // become pBase + (FQW / FQW+FKW) + gFDk.
   pBase := Prev.GetRawPos(p, 0);
+  AppendKVRow(Prev.GetRawPtr(pBase + FQW), Prev.GetRawPtr(pBase + FQW + FKW));
+end;
+
+procedure TNNetFusedSDPA.AppendKVRow(KRow, VRow: TNeuralFloatArrPtr);
+var
+  g, ScaleSlot, RowBase, KVHeadsM1: integer;
+  gFDk, RowStep, RowBytesFP: integer;
+begin
+  KVHeadsM1 := FKVHeads - 1;
+  // Carried offsets (#4/#6/#11): g*FDk advances by a constant FDk per head;
+  // the plane scale slot by FCacheMax; the FP32 row base by FCacheMax*FDk.
   gFDk := 0;
-  PVBase := FQW + FKW;
   // HEAD-MAJOR planes: head g's row for position FCacheLen lands at plane
   // slot g*MaxContext + FCacheLen. One small write per KV head buys the
   // decode loop a CONTIGUOUS per-head key/value stream (see the class note).
@@ -34638,10 +34669,8 @@ begin
     ScaleSlot := FCacheLen;                 // g=0 scale slot
     for g := 0 to KVHeadsM1 do
     begin
-      QuantizeCacheRow(Prev.GetRawPtr(pBase + FQW + gFDk),
-        FKCacheQ, ScaleSlot);
-      QuantizeCacheRow(Prev.GetRawPtr(pBase + PVBase + gFDk),
-        FVCacheQ, ScaleSlot);
+      QuantizeCacheRow(TNeuralFloatArrPtr(@KRow^[gFDk]), FKCacheQ, ScaleSlot);
+      QuantizeCacheRow(TNeuralFloatArrPtr(@VRow^[gFDk]), FVCacheQ, ScaleSlot);
       Inc(gFDk, FDk);
       Inc(ScaleSlot, FCacheMax);
     end;
@@ -34653,15 +34682,56 @@ begin
     RowStep := FCacheMax * FDk;
     for g := 0 to KVHeadsM1 do
     begin
-      Move(Prev.GetRawPtr(pBase + FQW + gFDk)^,
-        FKCache.FData[RowBase], RowBytesFP);
-      Move(Prev.GetRawPtr(pBase + PVBase + gFDk)^,
-        FVCache.FData[RowBase], RowBytesFP);
+      Move(KRow^[gFDk], FKCache.FData[RowBase], RowBytesFP);
+      Move(VRow^[gFDk], FVCache.FData[RowBase], RowBytesFP);
       Inc(gFDk, FDk);
       Inc(RowBase, RowStep);
     end;
   end;
   Inc(FCacheLen);
+end;
+
+procedure TNNetFusedSDPA.AppendCacheRowsFrom(K, V: TNNetVolume);
+var
+  RowCount, MaxRowPos, RowPos, RowOffset: integer;
+begin
+  ForceCacheOnRAM();
+  if not FCacheEnabled then
+  begin
+    FErrorProc('TNNetFusedSDPA.AppendCacheRowsFrom requires the cached ' +
+      'path. Call BeginIncrementalDecode first.');
+    exit;
+  end;
+  if FEvictSinks > 0 then
+  begin
+    FErrorProc('TNNetFusedSDPA.AppendCacheRowsFrom does not support ' +
+      'eviction.');
+    exit;
+  end;
+  if (K.Depth <> FKW) or (K.SizeY <> 1) or (V.SizeX <> K.SizeX) or
+     (V.SizeY <> 1) or (V.Depth <> FKW) then
+  begin
+    FErrorProc('TNNetFusedSDPA.AppendCacheRowsFrom needs K and V of shape ' +
+      '(Rows, 1, ' + IntToStr(FKW) + '). Got K ' + IntToStr(K.SizeX) + 'x' +
+      IntToStr(K.SizeY) + 'x' + IntToStr(K.Depth) + ', V ' +
+      IntToStr(V.SizeX) + 'x' + IntToStr(V.SizeY) + 'x' + IntToStr(V.Depth));
+    exit;
+  end;
+  RowCount := K.SizeX;
+  if FCacheLen + RowCount > FCacheMax then
+  begin
+    FErrorProc('TNNetFusedSDPA KV cache overflow: ' + IntToStr(FCacheLen) +
+      ' cached + ' + IntToStr(RowCount) + ' appended > MaxContext=' +
+      IntToStr(FCacheMax) + '.');
+    exit;
+  end;
+  MaxRowPos := RowCount - 1;
+  RowOffset := 0;
+  for RowPos := 0 to MaxRowPos do
+  begin
+    AppendKVRow(K.GetRawPtr(RowOffset), V.GetRawPtr(RowOffset));
+    Inc(RowOffset, FKW);
+  end;
 end;
 
 procedure TNNetFusedSDPA.EvictOldestWindowRow();
@@ -34859,6 +34929,12 @@ begin
   QHeadsM1 := FQHeads - 1;
   if FEvictSinks > 0 then
   begin
+    if FCachedForwardNonCausal and (SeqLenM1 > 0) then
+    begin
+      FErrorProc('TNNetFusedSDPA: CachedForwardNonCausal does not support ' +
+        'eviction on a multi-token forward.');
+      exit;
+    end;
     // Eviction interleaves with the appends (evict BEFORE each append, like
     // the single-head path), so score each token right after its append over
     // the then-live cache.
@@ -34871,14 +34947,34 @@ begin
   end
   else
   begin
-    // Bulk append, then exact-causal scoring: token p attends the cache up to
-    // and including its own row (base length + p + 1) - identical semantics
-    // to the single-head append-then-score loop.
     AppendCacheRows();
-    for p := 0 to SeqLenM1 do
-      ComputeCachedToken(p, 0, QHeadsM1, FCacheBaseLen + p + 1);
+    ComputeCachedRows(0, QHeadsM1);
   end;
   FForwardTime := FForwardTime + (Now() - StartTime);
+end;
+
+procedure TNNetFusedSDPA.ComputeCachedRows(h1, h2: integer);
+var
+  p, SeqLenM1, LiveLen, LiveLenStep: integer;
+begin
+  SeqLenM1 := FPrevLayer.FOutput.SizeX - 1;
+  // Causal: token p attends the cache up to and including its own row (base
+  // length + p + 1), the single-head append-then-score semantics.
+  if FCachedForwardNonCausal then
+  begin
+    LiveLen := FCacheLen;
+    LiveLenStep := 0;
+  end
+  else
+  begin
+    LiveLen := FCacheBaseLen + 1;
+    LiveLenStep := 1;
+  end;
+  for p := 0 to SeqLenM1 do
+  begin
+    ComputeCachedToken(p, h1, h2, LiveLen);
+    Inc(LiveLen, LiveLenStep);
+  end;
 end;
 
 procedure TNNetFusedSDPA.Compute();
@@ -34946,16 +35042,9 @@ begin
 end;
 
 procedure TNNetFusedSDPA.ComputeRange(StartRange, FinRange: integer);
-var
-  p, SeqLenM1: integer;
 begin
   if FChunkPrecomputed then exit; // prep already produced FOutput
-  if FCacheEnabled then
-  begin
-    SeqLenM1 := FPrevLayer.FOutput.SizeX - 1;
-    for p := 0 to SeqLenM1 do
-      ComputeCachedToken(p, StartRange, FinRange, FCacheBaseLen + p + 1);
-  end
+  if FCacheEnabled then ComputeCachedRows(StartRange, FinRange)
   else ComputePrefillHeads(StartRange, FinRange);
 end;
 
@@ -35020,13 +35109,14 @@ begin
   // Scope: a window of committed tokens - one decode token or a prefill
   // window - over the FP32 or the int8 cache, with only the causal and
   // sliding-window masks live. Eviction, segment masking, prefix-LM, the
-  // bidirectional window and a cache without room for the whole window keep
-  // the host path, which stays exactly as it was. The exact-class test mirrors
+  // bidirectional window, CachedForwardNonCausal and a cache without room
+  // for the whole window keep the host path, which stays exactly as it was.
+  // The exact-class test mirrors
   // the inherited one: a subclass with different score math would inherit
   // this path and silently lose its extra term.
   Result := (not FIsTrainable) and (Self.ClassType = TNNetFusedSDPA)
     and Assigned(FPrevLayer)
-    and (FEvictSinks = 0)
+    and (FEvictSinks = 0) and (not FCachedForwardNonCausal)
     and (not Assigned(FSegLayer)) and (FPrefixLen = 0)
     and (not FBidirectionalWindow)
     and (FCacheLen + FPrevLayer.FOutput.SizeX <= FCacheMax)
@@ -128887,7 +128977,7 @@ begin
       'TNNetLogitNormalize' :       Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]);
       'TNNetClamp' :                Result := TNNetClamp.Create(Ft[0], Ft[1]);
       'TNNetScaledDotProductAttention' : Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0], St[3] = 1, SegSrc);
-      'TNNetFusedSDPA' : Result := TNNetFusedSDPA.Create(St[5], St[6], St[0], St[1] = 1, St[2], Ft[0]);
+      'TNNetFusedSDPA' : Result := TNNetFusedSDPA.Create(St[5], St[6], St[0], St[1] = 1, St[2], Ft[0], St[7] = 1);
       'TNNetCrossAttention' :       Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]);
       'TNNetAffineGridSample' :     Result := TNNetAffineGridSample.Create(aL[0]);
       'TNNetGridSample' :           Result := TNNetGridSample.Create(aL[0], TNNetGridSampleInterp(St[0]), TNNetGridSamplePad(St[1]), St[2] = 1);
@@ -129331,7 +129421,7 @@ begin
       if S[0] = 'TNNetLogitNormalize' then Result := TNNetLogitNormalize.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetClamp' then Result := TNNetClamp.Create(Ft[0], Ft[1]) else
       if S[0] = 'TNNetScaledDotProductAttention' then Result := TNNetScaledDotProductAttention.Create(St[0], St[1] = 1, St[2], Ft[0], St[3] = 1, SegSrc) else
-      if S[0] = 'TNNetFusedSDPA' then Result := TNNetFusedSDPA.Create(St[5], St[6], St[0], St[1] = 1, St[2], Ft[0]) else
+      if S[0] = 'TNNetFusedSDPA' then Result := TNNetFusedSDPA.Create(St[5], St[6], St[0], St[1] = 1, St[2], Ft[0], St[7] = 1) else
       if S[0] = 'TNNetCrossAttention' then Result := TNNetCrossAttention.Create(St[0], St[1] = 1, aL[0]) else
       if S[0] = 'TNNetAffineGridSample' then Result := TNNetAffineGridSample.Create(aL[0]) else
       if S[0] = 'TNNetGridSample' then Result := TNNetGridSample.Create(aL[0], TNNetGridSampleInterp(St[0]), TNNetGridSamplePad(St[1]), St[2] = 1) else

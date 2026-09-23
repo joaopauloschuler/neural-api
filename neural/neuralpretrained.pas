@@ -8637,6 +8637,73 @@ function QwenImage21EncodeTextToImagePrompt(Tokenizer: TNeuralHFTokenizer;
 procedure BuildQwenImage21RopePositions(const TextLengths, GridHeights,
   GridWidths: array of integer; var PosF, PosH, PosW: TNeuralIntegerArray);
 
+type
+  // The diffusers QwenImage21Transformer2DModel config.json fields.
+  TQwenImage21TransformerConfig = record
+    NumLayers, NumHeads, HeadDim, Hidden, MlpHidden: integer;
+    InChannels, OutChannels, ContextInDim: integer;
+    AxesDims: array[0..2] of integer; // rotary dims per (frame, h, w) axis
+    Eps: TNeuralFloat;
+  end;
+
+  // The four per-step vectors every block reads, each (1,1,Hidden): 1+scale1,
+  // tanh(gate1), 1+scale2, tanh(gate2).
+  TQwenImage21Modulation = record
+    OnePlusScale1, TanhGate1, OnePlusScale2, TanhGate2: TNNetLayer;
+  end;
+
+  // Prefix pass: text tokens, causal, plain prefill. Step pass: target-image
+  // tokens attending [cached prefix K/V ; own K/V] with no causal mask.
+  TQwenImage21BlockMode = (qibPrefix, qibStep);
+
+  // The layers of one block that carry weights or run-time state.
+  TQwenImage21BlockLayers = record
+    QProj, KProj, VProj: TNNetLayer;  // to_q / to_k / to_v
+    QNorm, KNorm: TNNetLayer;         // norm_q / norm_k (TNNetHeadRMSNorm)
+    QRope, KRope: TNNetAxialRotaryEmbedding;
+    Attn: TNNetFusedSDPA;
+    OutProj: TNNetLayer;              // to_out.0
+    GateUp: TNNetLayer;               // [proj | gate_layer], read by TNNetSwiGLU
+    Down: TNNetLayer;                 // img_mlp.out
+  end;
+
+  // txt_in: zero-centred RMSNorm -> Linear -> GELU(tanh) -> Linear.
+  TQwenImage21TextProjectionLayers = record
+    Norm, InLayer, OutLayer: TNNetLayer;
+  end;
+
+function ReadQwenImage21TransformerConfig(
+  const FileName: string): TQwenImage21TransformerConfig;
+
+// Slices a (1,1,4*Hidden) [scale1|gate1|scale2|gate2] modulation layer into
+// the four block inputs; build it once per net and hand it to every block.
+function AddQwenImage21Modulation(NN: TNNet; ModulationLayer: TNNetLayer;
+  Hidden: integer): TQwenImage21Modulation;
+
+// One single-stream block over XInput (SeqLen,1,Hidden); returns its output.
+// qibStep needs pPrefixCapacity >= the prefix token count (see the impl).
+function AddQwenImage21Block(NN: TNNet; XInput: TNNetLayer;
+  const Modulation: TQwenImage21Modulation;
+  const Config: TQwenImage21TransformerConfig; Mode: TQwenImage21BlockMode;
+  pPrefixCapacity: integer; out Block: TQwenImage21BlockLayers;
+  pTrainable: boolean = false): TNNetLayer;
+
+// Loads transformer_blocks.{BlockIdx}.* into Block (bias-free Linears).
+procedure LoadQwenImage21BlockWeights(Reader: TNNetSafeTensorsReader;
+  const Block: TQwenImage21BlockLayers;
+  const Config: TQwenImage21TransformerConfig; BlockIdx: integer);
+
+// txt_in over XInput (SeqLen,1,ContextInDim); returns the (SeqLen,1,Hidden)
+// output.
+function AddQwenImage21TextProjection(NN: TNNet; XInput: TNNetLayer;
+  const Config: TQwenImage21TransformerConfig;
+  out TextIn: TQwenImage21TextProjectionLayers;
+  pTrainable: boolean = false): TNNetLayer;
+
+procedure LoadQwenImage21TextProjectionWeights(Reader: TNNetSafeTensorsReader;
+  const TextIn: TQwenImage21TextProjectionLayers;
+  const Config: TQwenImage21TransformerConfig);
+
 // ===========================================================================
 // RAFT OPTICAL-FLOW IMPORT (model_type "raft_small", the torchvision
 // raft_small architecture, Teed & Deng 2020 "RAFT", arXiv:2003.12039) - the
@@ -80716,6 +80783,245 @@ begin
       end;
     Inc(Position, Max(GridHeights[RunCnt], GridWidths[RunCnt]));
   end;
+end;
+
+const
+  // diffusers QwenImage21Rope(theta=10000): fixed, not in config.json.
+  csQwenImage21RopeTheta = 10000;
+
+function ReadQwenImage21TransformerConfig(
+  const FileName: string): TQwenImage21TransformerConfig;
+var
+  JsonText: TStringList;
+  Root, OutChannelsData: TJSONData;
+  Obj: TJSONObject;
+  AxesArr: TJSONArray;
+  AxisPos, PatchSize, MlpRatio: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('Qwen-Image-2.1 transformer: config file not found: ' +
+      FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('Qwen-Image-2.1 transformer: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.NumLayers := Obj.Get('num_layers', 32);
+    Result.NumHeads := Obj.Get('num_attention_heads', 32);
+    Result.HeadDim := Obj.Get('attention_head_dim', 128);
+    MlpRatio := Obj.Get('mlp_ratio', 3);
+    Result.InChannels := Obj.Get('in_channels', 64);
+    OutChannelsData := Obj.Find('out_channels');
+    if (OutChannelsData = nil) or (OutChannelsData.JSONType = jtNull) then
+      Result.OutChannels := Result.InChannels
+    else
+      Result.OutChannels := OutChannelsData.AsInteger;
+    Result.ContextInDim := Obj.Get('context_in_dim', 4096);
+    Result.Eps := Obj.Get('eps', 1e-6);
+    PatchSize := Obj.Get('patch_size', 1);
+    Result.AxesDims[0] := 16;
+    Result.AxesDims[1] := 56;
+    Result.AxesDims[2] := 56;
+    AxesArr := TJSONArray(Obj.Find('axes_dims_rope', jtArray));
+    if AxesArr <> nil then
+    begin
+      if AxesArr.Count <> 3 then
+        ImportError('Qwen-Image-2.1 transformer: axes_dims_rope must hold ' +
+          '3 entries, got ' + IntToStr(AxesArr.Count) + '.');
+      for AxisPos := 0 to 2 do
+        Result.AxesDims[AxisPos] := AxesArr.Integers[AxisPos];
+    end;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+  Result.Hidden := Result.NumHeads * Result.HeadDim;
+  Result.MlpHidden := MlpRatio * Result.Hidden;
+  if PatchSize <> 1 then
+    ImportError('Qwen-Image-2.1 transformer: patch_size ' +
+      IntToStr(PatchSize) + ' is not supported (2.1 uses 1).');
+  if (Result.NumLayers < 1) or (Result.NumHeads < 1) or
+     (Result.HeadDim < 2) or (MlpRatio < 1) then
+    ImportError('Qwen-Image-2.1 transformer: config "' + FileName +
+      '" has a non-positive layer, head or MLP size.');
+  if Odd(Result.AxesDims[0]) or Odd(Result.AxesDims[1]) or
+     Odd(Result.AxesDims[2]) or
+     (Result.AxesDims[0] + Result.AxesDims[1] + Result.AxesDims[2] <>
+      Result.HeadDim) then
+    ImportError('Qwen-Image-2.1 transformer: axes_dims_rope must be even ' +
+      'and sum to attention_head_dim ' + IntToStr(Result.HeadDim) + '.');
+end;
+
+function AddQwenImage21Modulation(NN: TNNet; ModulationLayer: TNNetLayer;
+  Hidden: integer): TQwenImage21Modulation;
+begin
+  if ModulationLayer.Output.Size <> 4 * Hidden then
+    ImportError('AddQwenImage21Modulation: the modulation layer holds ' +
+      IntToStr(ModulationLayer.Output.Size) + ' values, expected 4*' +
+      IntToStr(Hidden) + '.');
+  Result.OnePlusScale1 := NN.AddLayerAfter(TNNetAddConstant.Create(1.0),
+    NN.AddLayerAfter(TNNetSplitChannels.Create(0, Hidden), ModulationLayer));
+  Result.TanhGate1 := NN.AddLayerAfter(TNNetHyperbolicTangent.Create(),
+    NN.AddLayerAfter(TNNetSplitChannels.Create(Hidden, Hidden),
+      ModulationLayer));
+  Result.OnePlusScale2 := NN.AddLayerAfter(TNNetAddConstant.Create(1.0),
+    NN.AddLayerAfter(TNNetSplitChannels.Create(2 * Hidden, Hidden),
+      ModulationLayer));
+  Result.TanhGate2 := NN.AddLayerAfter(TNNetHyperbolicTangent.Create(),
+    NN.AddLayerAfter(TNNetSplitChannels.Create(3 * Hidden, Hidden),
+      ModulationLayer));
+end;
+
+function AddQwenImage21Block(NN: TNNet; XInput: TNNetLayer;
+  const Modulation: TQwenImage21Modulation;
+  const Config: TQwenImage21TransformerConfig; Mode: TQwenImage21BlockMode;
+  pPrefixCapacity: integer; out Block: TQwenImage21BlockLayers;
+  pTrainable: boolean): TNNetLayer;
+var
+  Hidden, HeadDim: integer;
+  Norm1, Modulated1, Gated1, Residual1: TNNetLayer;
+  Norm2, Modulated2, Gated2: TNNetLayer;
+begin
+  Hidden := Config.Hidden;
+  HeadDim := Config.HeadDim;
+  if XInput.Output.Depth <> Hidden then
+    ImportError('AddQwenImage21Block: input depth ' +
+      IntToStr(XInput.Output.Depth) + ' <> hidden ' + IntToStr(Hidden) + '.');
+  if (Mode = qibStep) and (pPrefixCapacity < 0) then
+    ImportError('AddQwenImage21Block: pPrefixCapacity must be >= 0.');
+  // ---- attention branch: x + tanh(gate1) * attn(LN(x) * (1 + scale1)) ----
+  // Non-affine LayerNorm: TNNetTokenLayerNorm keeps its default gamma=1, beta=0.
+  Norm1 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.Eps).SetTrainable(pTrainable), XInput);
+  Modulated1 := NN.AddLayer(
+    TNNetChannelMulByLayer.Create(Norm1, Modulation.OnePlusScale1));
+  Block.QProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable),
+    Modulated1);
+  Block.KProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable),
+    Modulated1);
+  Block.VProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable),
+    Modulated1);
+  Block.QNorm := NN.AddLayerAfter(
+    TNNetHeadRMSNorm.Create(HeadDim, Config.Eps).SetTrainable(pTrainable),
+    Block.QProj);
+  Block.KNorm := NN.AddLayerAfter(
+    TNNetHeadRMSNorm.Create(HeadDim, Config.Eps).SetTrainable(pTrainable),
+    Block.KProj);
+  // Consecutive (real, imag) pairs: the checkpoint rows need no permutation.
+  Block.QRope := TNNetAxialRotaryEmbedding.Create(csQwenImage21RopeTheta,
+    Config.AxesDims[0] div 2, Config.AxesDims[1] div 2,
+    Config.AxesDims[2] div 2, HeadDim);
+  NN.AddLayerAfter(Block.QRope, Block.QNorm);
+  Block.KRope := TNNetAxialRotaryEmbedding.Create(csQwenImage21RopeTheta,
+    Config.AxesDims[0] div 2, Config.AxesDims[1] div 2,
+    Config.AxesDims[2] div 2, HeadDim);
+  NN.AddLayerAfter(Block.KRope, Block.KNorm);
+  NN.AddLayer(TNNetDeepConcat.Create([Block.QRope, Block.KRope, Block.VProj]));
+  Block.Attn := TNNetFusedSDPA.Create(Config.NumHeads, Config.NumHeads,
+    HeadDim, {pCausalMask=}Mode = qibPrefix, {pWindow=}0, {pScoreSoftCap=}0,
+    {pCachedForwardNonCausal=}Mode = qibStep);
+  Block.Attn.SetTrainable(pTrainable);
+  // Armed BEFORE AddLayer, so SetPrevLayer never sizes the Heads x SeqLen x
+  // SeqLen prefill score map. The caller fills the prefix K/V with
+  // AppendCacheRowsFrom and calls TruncateCache(prefix length) before each step.
+  if Mode = qibStep then
+    Block.Attn.BeginIncrementalDecode(pPrefixCapacity + XInput.Output.SizeX);
+  NN.AddLayer(Block.Attn);
+  Block.OutProj := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable));
+  Gated1 := NN.AddLayer(
+    TNNetChannelMulByLayer.Create(Block.OutProj, Modulation.TanhGate1));
+  Residual1 := NN.AddLayer(TNNetSum.Create([Gated1, XInput]));
+  // ---- SwiGLU MLP branch: out(silu(gate_layer(h)) * proj(h)) ----
+  Norm2 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.Eps).SetTrainable(pTrainable), Residual1);
+  Modulated2 := NN.AddLayer(
+    TNNetChannelMulByLayer.Create(Norm2, Modulation.OnePlusScale2));
+  Block.GateUp := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(2 * Config.MlpHidden).SetTrainable(pTrainable),
+    Modulated2);
+  NN.AddLayer(TNNetSwiGLU.Create());
+  Block.Down := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Hidden).SetTrainable(pTrainable));
+  Gated2 := NN.AddLayer(
+    TNNetChannelMulByLayer.Create(Block.Down, Modulation.TanhGate2));
+  Result := NN.AddLayer(TNNetSum.Create([Gated2, Residual1]));
+  if not pTrainable then NN.SetTrainable();
+end;
+
+procedure LoadQwenImage21BlockWeights(Reader: TNNetSafeTensorsReader;
+  const Block: TQwenImage21BlockLayers;
+  const Config: TQwenImage21TransformerConfig; BlockIdx: integer);
+var
+  Prefix: string;
+  Hidden, MlpHidden: integer;
+begin
+  Prefix := 'transformer_blocks.' + IntToStr(BlockIdx) + '.';
+  Hidden := Config.Hidden;
+  MlpHidden := Config.MlpHidden;
+  LoadLlamaLinearWeights(Reader, Block.QProj, Prefix + 'attn.to_q.weight',
+    Hidden, Hidden);
+  LoadLlamaLinearWeights(Reader, Block.KProj, Prefix + 'attn.to_k.weight',
+    Hidden, Hidden);
+  LoadLlamaLinearWeights(Reader, Block.VProj, Prefix + 'attn.to_v.weight',
+    Hidden, Hidden);
+  LoadLlamaRMSNormWeights(Reader, Block.QNorm, Prefix + 'attn.norm_q.weight',
+    Config.HeadDim);
+  LoadLlamaRMSNormWeights(Reader, Block.KNorm, Prefix + 'attn.norm_k.weight',
+    Config.HeadDim);
+  LoadLlamaLinearWeights(Reader, Block.OutProj,
+    Prefix + 'attn.to_out.0.weight', Hidden, Hidden);
+  // TNNetSwiGLU computes FIRSTHALF * silu(SECONDHALF): proj fills neurons
+  // 0..MlpHidden-1, gate_layer the rest; only the second call flushes.
+  LoadLlamaLinearWeights(Reader, Block.GateUp, Prefix + 'img_mlp.proj.weight',
+    Hidden, MlpHidden, 0, 2 * MlpHidden, {RotaryHeadDim=}0, {BiasName=}'',
+    {Scale=}1.0, {RotaryDims=}0, {SrcRowBase=}0, {SrcRows=}0,
+    {pFlatSlabRows=}false, {pDeferFlush=}true);
+  LoadLlamaLinearWeights(Reader, Block.GateUp,
+    Prefix + 'img_mlp.gate_layer.weight', Hidden, MlpHidden, MlpHidden,
+    2 * MlpHidden);
+  LoadLlamaLinearWeights(Reader, Block.Down, Prefix + 'img_mlp.out.weight',
+    MlpHidden, Hidden);
+end;
+
+function AddQwenImage21TextProjection(NN: TNNet; XInput: TNNetLayer;
+  const Config: TQwenImage21TransformerConfig;
+  out TextIn: TQwenImage21TextProjectionLayers;
+  pTrainable: boolean): TNNetLayer;
+begin
+  if XInput.Output.Depth <> Config.ContextInDim then
+    ImportError('AddQwenImage21TextProjection: input depth ' +
+      IntToStr(XInput.Output.Depth) + ' <> context_in_dim ' +
+      IntToStr(Config.ContextInDim) + '.');
+  TextIn.Norm := NN.AddLayerAfter(
+    TNNetTokenRMSNorm.Create(Config.Eps).SetTrainable(pTrainable), XInput);
+  TextIn.InLayer := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.Hidden).SetTrainable(pTrainable));
+  NN.AddLayer(TNNetGELU.Create()); // nn.GELU(approximate="tanh")
+  TextIn.OutLayer := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.Hidden).SetTrainable(pTrainable));
+  Result := TextIn.OutLayer;
+  if not pTrainable then NN.SetTrainable();
+end;
+
+procedure LoadQwenImage21TextProjectionWeights(Reader: TNNetSafeTensorsReader;
+  const TextIn: TQwenImage21TextProjectionLayers;
+  const Config: TQwenImage21TransformerConfig);
+begin
+  // Zero-centred RMSNorm: the checkpoint stores scale - 1.
+  LoadLlamaRMSNormWeights(Reader, TextIn.Norm, 'txt_in.text_norm.weight',
+    Config.ContextInDim, {GainOffset=}1);
+  LoadLlamaLinearWeights(Reader, TextIn.InLayer, 'txt_in.in_layer.weight',
+    Config.ContextInDim, Config.Hidden);
+  LoadLlamaLinearWeights(Reader, TextIn.OutLayer, 'txt_in.out_layer.weight',
+    Config.Hidden, Config.Hidden);
 end;
 
 // ===========================================================================

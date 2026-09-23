@@ -1817,11 +1817,12 @@ rather than acted on.
         layout, 16/56/56 sections and negative positions; position builder (text
         0..L-1, image frame = L, centred h/w grid).
         Done: subclass `TNNetAxialRotaryEmbedding` (per-axis tables; M-RoPE gained `pRotaryHeadDim` head tiling), `BuildQwenImage21RopePositions`; tests `TestQwenImage21Rope*`, `TestAxialRoPE*`, `AxialRoPEOpenCLParity`, `TestMRoPETiledMatchesPerHead`.
-  - [ ] A4. Transformer block, step pass: image-token queries attend (no causal mask)
+  - [x] A4. Transformer block, step pass: image-token queries attend (no causal mask)
         to [cached prefix K/V ; own K/V]. Reuse `TNNetHeadRMSNorm`, `TNNetLayerNorm`,
         `TNNetFiLM` / `TNNetChannelMulByLayer`, the fused SDPA KV cache and batched
         prefill where they fit; fold the zero-centred +1 into the RMSNorm weight at
         load. Single-block parity vs HF.
+        Done: `AddQwenImage21Block` (qibStep / qibPrefix), `AddQwenImage21Modulation`, `AddQwenImage21TextProjection`, `LoadQwenImage21BlockWeights`, `ReadQwenImage21TransformerConfig`; `TNNetFusedSDPA` gained `CachedForwardNonCausal` + `AppendCacheRowsFrom`; tests `TestQwenImage21StepBlockParity`, `TestQwenImage21PrefixBlockKVParity`, `TestCachedForwardNonCausal`.
   - [ ] A5. `BuildQwenImage21Transformer`: a PREFIX network (text tokens, causal, t=0
         modulation, emits per-layer K/V) and a STEP network (target tokens); timestep
         embedding, shared modulation computed once per step, `norm_out`, `proj_out`;

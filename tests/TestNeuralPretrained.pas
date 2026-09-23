@@ -45,10 +45,18 @@ type
       pQuantizeInt8: boolean = false; pWeightOwner: TNNet = nil): TNNet;
     // Largest |A[i] - B[i]| over two volumes of the same size.
     function MaxAbsVolumeDiff(A, B: TNNetVolume): double;
-    // Loads a {"shape": [T, C], "data": [...]} oracle tensor of Root as a
-    // (T,1,C) token-major volume.
+    // Loads a {"shape": [T, C, ...], "data": [...]} oracle tensor of Root as a
+    // (T,1,C*...) token-major volume.
     procedure LoadOracleTokenTensor(Root: TJSONData; const Key: string;
       Dest: TNNetVolume);
+    procedure LoadOracleTokenTensorObject(TensorObj: TJSONData;
+      const What: string; Dest: TNNetVolume);
+    // Block 0 of the pico Qwen-Image-2.1 transformer in the step pass over a
+    // GridH x GridW image; Layers[1] is the (1,1,4*hidden) modulation input.
+    function BuildQwenImage21StepBlockNet(
+      const Config: TQwenImage21TransformerConfig;
+      Reader: TNNetSafeTensorsReader; PrefixCount, GridH, GridW: integer;
+      out Block: TQwenImage21BlockLayers): TNNet;
     // Windows of StepTokens through WindowSession over the first
     // PrefillTokenCount tokens, snapshot handoff, then width-1 for the rest.
     // The first HiddenOnlyTokenCount tokens step with StepForwardToHidden
@@ -680,6 +688,8 @@ type
     procedure TestQwenImage21PromptTemplateIds;
     procedure TestQwenImage21RopePositions;
     procedure TestQwenImage21RopeForward;
+    procedure TestQwenImage21StepBlockParity;
+    procedure TestQwenImage21PrefixBlockKVParity;
     procedure TestQwen3VLTextEncoderInt8Drift;
     procedure TestQwen2AudioConfigFromJSONFile;
     procedure TestQwen2AudioParity;
@@ -9314,19 +9324,27 @@ end;
 
 procedure TTestNeuralPretrained.LoadOracleTokenTensor(Root: TJSONData;
   const Key: string; Dest: TNNetVolume);
-var
-  TensorObj: TJSONObject;
-  ShapeArr, DataArr: TJSONArray;
-  MaxDataPos, DataPos: integer;
 begin
-  TensorObj := TJSONObject(TJSONObject(Root).Find(Key));
-  AssertTrue('oracle tensor "' + Key + '" present', TensorObj <> nil);
-  ShapeArr := TJSONArray(TensorObj.Find('shape'));
-  DataArr := TJSONArray(TensorObj.Find('data'));
-  AssertEquals('oracle tensor "' + Key + '" rank', 2, ShapeArr.Count);
-  Dest.ReSize(ShapeArr.Integers[0], 1, ShapeArr.Integers[1]);
-  AssertEquals('oracle tensor "' + Key + '" data size', Dest.Size,
-    DataArr.Count);
+  LoadOracleTokenTensorObject(TJSONObject(Root).Find(Key),
+    'oracle tensor "' + Key + '"', Dest);
+end;
+
+procedure TTestNeuralPretrained.LoadOracleTokenTensorObject(
+  TensorObj: TJSONData; const What: string; Dest: TNNetVolume);
+var
+  ShapeArr, DataArr: TJSONArray;
+  MaxDataPos, DataPos, MaxDimPos, DimPos, RowWidth: integer;
+begin
+  AssertTrue(What + ' present', TensorObj is TJSONObject);
+  ShapeArr := TJSONArray(TJSONObject(TensorObj).Find('shape'));
+  DataArr := TJSONArray(TJSONObject(TensorObj).Find('data'));
+  AssertTrue(What + ' rank >= 2', ShapeArr.Count >= 2);
+  RowWidth := 1;
+  MaxDimPos := ShapeArr.Count - 1;
+  for DimPos := 1 to MaxDimPos do
+    RowWidth := RowWidth * ShapeArr.Integers[DimPos];
+  Dest.ReSize(ShapeArr.Integers[0], 1, RowWidth);
+  AssertEquals(What + ' data size', Dest.Size, DataArr.Count);
   MaxDataPos := DataArr.Count - 1;
   for DataPos := 0 to MaxDataPos do
     Dest.FData[DataPos] := DataArr.Floats[DataPos];
@@ -25305,6 +25323,233 @@ begin
     end;
   finally
     Input.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+function TTestNeuralPretrained.BuildQwenImage21StepBlockNet(
+  const Config: TQwenImage21TransformerConfig;
+  Reader: TNNetSafeTensorsReader; PrefixCount, GridH, GridW: integer;
+  out Block: TQwenImage21BlockLayers): TNNet;
+var
+  XInput, ModulationInput: TNNetLayer;
+  PosF, PosH, PosW: TNeuralIntegerArray;
+  TokenCount: integer;
+begin
+  TokenCount := GridH * GridW;
+  Result := TNNet.Create();
+  XInput := Result.AddLayer(TNNetInput.Create(TokenCount, 1, Config.Hidden));
+  ModulationInput := Result.AddLayer(
+    TNNetInput.Create(1, 1, 4 * Config.Hidden));
+  AddQwenImage21Block(Result, XInput,
+    AddQwenImage21Modulation(Result, ModulationInput, Config.Hidden), Config,
+    qibStep, PrefixCount, Block);
+  LoadQwenImage21BlockWeights(Reader, Block, Config, 0);
+  // The step pass carries only the image tokens: the tail of the joint layout.
+  BuildQwenImage21RopePositions([PrefixCount, 0], [GridH], [GridW],
+    PosF, PosH, PosW);
+  Block.QRope.SetPositions(Copy(PosF, PrefixCount, TokenCount),
+    Copy(PosH, PrefixCount, TokenCount), Copy(PosW, PrefixCount, TokenCount));
+  Block.KRope.SetPositions(Copy(PosF, PrefixCount, TokenCount),
+    Copy(PosH, PrefixCount, TokenCount), Copy(PosW, PrefixCount, TokenCount));
+end;
+
+// Block 0 of the pico transformer in the step pass: 24 image tokens attend
+// [9 cached prefix K/V ; own K/V] with no causal mask. The oracle is float64
+// with BF16-rounded weights; the float32 forward stays within 1e-5 (measured
+// 2.4e-7 on outputs of magnitude ~3). A rewind to the prefix must replay the
+// step bit for bit.
+procedure TTestNeuralPretrained.TestQwenImage21StepBlockParity;
+var
+  RefJson: TStringList;
+  RefRoot, BlockObj: TJSONData;
+  ShapeArr: TJSONArray;
+  Config: TQwenImage21TransformerConfig;
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Block: TQwenImage21BlockLayers;
+  Hidden, Modulation, CacheK, CacheV, Expected, FirstOutput: TNNetVolume;
+  PrefixCount, GridH, GridW, MaxModulationPos, ModulationPos: integer;
+  MaxDiff: double;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Reader := nil;
+  NN := nil;
+  Hidden := TNNetVolume.Create;
+  Modulation := TNNetVolume.Create;
+  CacheK := TNNetVolume.Create;
+  CacheV := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  FirstOutput := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_transformer_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    PrefixCount := TJSONObject(RefRoot).Get('text_len', 0);
+    ShapeArr := TJSONArray(
+      TJSONArray(TJSONObject(RefRoot).Find('img_shapes')).Items[0]);
+    GridH := ShapeArr.Integers[1];
+    GridW := ShapeArr.Integers[2];
+    BlockObj := TJSONObject(RefRoot).Find('block0_cached');
+    LoadOracleTokenTensor(BlockObj, 'hidden_in', Hidden);
+    LoadOracleTokenTensor(BlockObj, 'modulation', Modulation);
+    LoadOracleTokenTensor(BlockObj, 'cache_k', CacheK);
+    LoadOracleTokenTensor(BlockObj, 'cache_v', CacheV);
+    LoadOracleTokenTensor(BlockObj, 'output', Expected);
+    Config := ReadQwenImage21TransformerConfig(
+      FixturePath('tiny_qwenimage21/transformer/config.json'));
+    AssertEquals('hidden', 32, Config.Hidden);
+    AssertEquals('mlp hidden', 96, Config.MlpHidden);
+    AssertEquals('frame axis dims', 4, Config.AxesDims[0]);
+    AssertEquals('image tokens', GridH * GridW, Hidden.SizeX);
+    Reader := TNNetSafeTensorsReader.Create(FixturePath(
+      'tiny_qwenimage21/transformer/diffusion_pytorch_model.safetensors.index.json'));
+    NN := BuildQwenImage21StepBlockNet(Config, Reader, PrefixCount, GridH,
+      GridW, Block);
+    AssertEquals('the step attention sizes no prefill score map', 1,
+      Block.Attn.AttentionWeights.Size);
+    AssertEquals('cache capacity = prefix + image tokens',
+      PrefixCount + GridH * GridW, Block.Attn.MaxContext);
+    Block.Attn.AppendCacheRowsFrom(CacheK, CacheV);
+    AssertEquals('prefix rows cached', PrefixCount, Block.Attn.CacheLength);
+    // Row 0 of the modulation is the sampled timestep's, which image tokens use.
+    MaxModulationPos := 4 * Config.Hidden - 1;
+    for ModulationPos := 0 to MaxModulationPos do
+      NN.Layers[1].Output.FData[ModulationPos] :=
+        Modulation.FData[ModulationPos];
+    NN.Compute(Hidden);
+    MaxDiff := MaxAbsVolumeDiff(NN.GetLastLayer().Output, Expected);
+    AssertTrue('step block vs diffusers: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 1e-5', MaxDiff < 1e-5);
+    FirstOutput.Copy(NN.GetLastLayer().Output);
+    Block.Attn.TruncateCache(PrefixCount);
+    NN.Compute(Hidden);
+    AssertEquals('replay after TruncateCache(prefix)', 0,
+      MaxAbsVolumeDiff(FirstOutput, NN.GetLastLayer().Output), 0);
+  finally
+    NN.Free;
+    Reader.Free;
+    FirstOutput.Free;
+    Expected.Free;
+    CacheV.Free;
+    CacheK.Free;
+    Modulation.Free;
+    Hidden.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Prefix pass over the 9 text tokens: txt_in, then blocks 0 and 1 in causal
+// prefix mode with the t=0 modulation row. Their post-RoPE K and V must match
+// the diffusers extract-mode cache of both layers (1e-5, measured 9.5e-7),
+// and block 0's exported K/V must drive the step block to the oracle output.
+procedure TTestNeuralPretrained.TestQwenImage21PrefixBlockKVParity;
+var
+  RefJson: TStringList;
+  RefRoot, BlockObj: TJSONData;
+  ShapeArr, CacheKArr, CacheVArr: TJSONArray;
+  Config: TQwenImage21TransformerConfig;
+  Reader: TNNetSafeTensorsReader;
+  NN, StepNet: TNNet;
+  TextIn: TQwenImage21TextProjectionLayers;
+  Blocks: array[0..1] of TQwenImage21BlockLayers;
+  StepBlock: TQwenImage21BlockLayers;
+  Modulation: TQwenImage21Modulation;
+  BlockInput: TNNetLayer;
+  Embeds, ModulationRows, Expected, StepHidden: TNNetVolume;
+  PosF, PosH, PosW: TNeuralIntegerArray;
+  PrefixCount, GridH, GridW, BlockPos, TimeZeroRowOffset: integer;
+  MaxModulationPos, ModulationPos: integer;
+  MaxDiff: double;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Reader := nil;
+  NN := nil;
+  StepNet := nil;
+  Embeds := TNNetVolume.Create;
+  ModulationRows := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  StepHidden := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_transformer_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    PrefixCount := TJSONObject(RefRoot).Get('text_len', 0);
+    ShapeArr := TJSONArray(
+      TJSONArray(TJSONObject(RefRoot).Find('img_shapes')).Items[0]);
+    GridH := ShapeArr.Integers[1];
+    GridW := ShapeArr.Integers[2];
+    LoadOracleTokenTensor(RefRoot, 'encoder_hidden_states', Embeds);
+    LoadOracleTokenTensor(RefRoot, 'modulation_1', ModulationRows);
+    CacheKArr := TJSONArray(TJSONObject(RefRoot).Find('cache_k'));
+    CacheVArr := TJSONArray(TJSONObject(RefRoot).Find('cache_v'));
+    Config := ReadQwenImage21TransformerConfig(
+      FixturePath('tiny_qwenimage21/transformer/config.json'));
+    AssertEquals('text tokens', PrefixCount, Embeds.SizeX);
+    Reader := TNNetSafeTensorsReader.Create(FixturePath(
+      'tiny_qwenimage21/transformer/diffusion_pytorch_model.safetensors.index.json'));
+    NN := TNNet.Create();
+    NN.AddLayer(TNNetInput.Create(PrefixCount, 1, Config.ContextInDim));
+    Modulation := AddQwenImage21Modulation(NN,
+      NN.AddLayer(TNNetInput.Create(1, 1, 4 * Config.Hidden)), Config.Hidden);
+    BlockInput := AddQwenImage21TextProjection(NN, NN.Layers[0], Config,
+      TextIn);
+    LoadQwenImage21TextProjectionWeights(Reader, TextIn, Config);
+    BuildQwenImage21RopePositions([PrefixCount], [], [], PosF, PosH, PosW);
+    for BlockPos := 0 to 1 do
+    begin
+      BlockInput := AddQwenImage21Block(NN, BlockInput, Modulation, Config,
+        qibPrefix, 0, Blocks[BlockPos]);
+      LoadQwenImage21BlockWeights(Reader, Blocks[BlockPos], Config, BlockPos);
+      Blocks[BlockPos].QRope.SetPositions(PosF, PosH, PosW);
+      Blocks[BlockPos].KRope.SetPositions(PosF, PosH, PosW);
+    end;
+    // Text tokens take the t = 0 row (row 1) of the modulation.
+    MaxModulationPos := 4 * Config.Hidden - 1;
+    TimeZeroRowOffset := 4 * Config.Hidden;
+    for ModulationPos := 0 to MaxModulationPos do
+      NN.Layers[1].Output.FData[ModulationPos] :=
+        ModulationRows.FData[TimeZeroRowOffset + ModulationPos];
+    NN.Compute(Embeds);
+    for BlockPos := 0 to 1 do
+    begin
+      LoadOracleTokenTensorObject(CacheKArr.Items[BlockPos], 'cache_k',
+        Expected);
+      MaxDiff := MaxAbsVolumeDiff(Blocks[BlockPos].KRope.Output, Expected);
+      AssertTrue('prefix K, layer ' + IntToStr(BlockPos) + ': max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+      LoadOracleTokenTensorObject(CacheVArr.Items[BlockPos], 'cache_v',
+        Expected);
+      MaxDiff := MaxAbsVolumeDiff(Blocks[BlockPos].VProj.Output, Expected);
+      AssertTrue('prefix V, layer ' + IntToStr(BlockPos) + ': max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+    end;
+    // Hand block 0's exported K/V to the step pass.
+    StepNet := BuildQwenImage21StepBlockNet(Config, Reader, PrefixCount, GridH,
+      GridW, StepBlock);
+    StepBlock.Attn.AppendCacheRowsFrom(Blocks[0].KRope.Output,
+      Blocks[0].VProj.Output);
+    BlockObj := TJSONObject(RefRoot).Find('block0_cached');
+    LoadOracleTokenTensor(BlockObj, 'modulation', ModulationRows);
+    for ModulationPos := 0 to MaxModulationPos do
+      StepNet.Layers[1].Output.FData[ModulationPos] :=
+        ModulationRows.FData[ModulationPos];
+    LoadOracleTokenTensor(BlockObj, 'hidden_in', StepHidden);
+    LoadOracleTokenTensor(BlockObj, 'output', Expected);
+    StepNet.Compute(StepHidden);
+    MaxDiff := MaxAbsVolumeDiff(StepNet.GetLastLayer().Output, Expected);
+    AssertTrue('step block on exported prefix K/V: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+  finally
+    StepNet.Free;
+    NN.Free;
+    Reader.Free;
+    StepHidden.Free;
+    Expected.Free;
+    ModulationRows.Free;
+    Embeds.Free;
     RefRoot.Free;
     RefJson.Free;
   end;
