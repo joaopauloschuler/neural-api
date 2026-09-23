@@ -1827,7 +1827,10 @@ rather than acted on.
         modulation, emits per-layer K/V) and a STEP network (target tokens); timestep
         embedding, shared modulation computed once per step, `norm_out`, `proj_out`;
         sharded diffusers-folder loader. Parity vs HF extract and cached modes.
-        Depends on A3 + A4.
+        Depends on A3 + A4. Memory: ONE reusable step block whose layers are pointed
+        at block i's weights before block i runs (each block keeps its own KV cache);
+        32 blocks in one TNNet would need ~64 GB of activations at 1024x1024 (~2 GB
+        per block at N=4096). One code path for every image size.
   - [ ] A6. VAE decoder: first check whether image decode ever runs `time_conv`;
         channel RMSNorm, DupUp shortcuts, mid attention, latent de-normalisation,
         tiled decode (2048x2048 full-resolution activations are ~2.4 GB each). Pico
@@ -1836,7 +1839,10 @@ rather than acted on.
         tokenize, encode, free the text encoder, denoise, decode, save PNG WITH ALPHA
         (check that `SaveImageFromVolumeIntoFile` writes RGBA). `--width --height
         --steps --seed --int8/--int4 --opencl`. End-to-end pico parity with fixed
-        initial latents (torch RNG is not reproducible).
+        initial latents (torch RNG is not reproducible). Test sizes: 64x64 with the
+        pico checkpoint on the dev box (extend the generator with a 64x64 case);
+        real weights on the GPU box, a 256x256 smoke test first, then 1024x1024 and
+        beyond, compared per step against diffusers with the same initial latents.
   - [ ] A8. Docs: README entry marked "planned (coded)" until a user-tested real run.
   Phase B — speed (after a first real measurement on the GPU box):
   - [ ] B1. OpenCL for the step pass: GEMM projections (4096 x 4096 activations) and
