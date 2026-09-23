@@ -7509,7 +7509,10 @@ type
     function ShouldBindPrevOutputOnOpenCL(): boolean;
     procedure ComputeOpenCL();
     {$ENDIF}
-    procedure BuildThetaCache(pDepth: integer);
+    procedure BuildThetaCache(pDepth: integer); virtual;
+    // Channel width one rotation schedule covers: FStruct[6] (the per-head dim)
+    // when it tiles pDepth, else pDepth. Coded by Claude (AI).
+    function RotaryTileDepth(pDepth: integer): integer;
     procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
     // Slice of the flattened (token, channel-pair) rotation space
     // [0..SeqLen*HalfD-1] (pair p = token p div HalfD, pair-index p mod HalfD).
@@ -7608,10 +7611,13 @@ type
   // importer permutes q/k rows to it) the duplication collapses, so pair k
   // simply belongs to the section it falls in over [0, Depth/2).
   // Positions are NOT serialized (they are per-prompt run-time state set by
-  // SetPositions); mrope_section IS, in FStruct[8..10]. The frequency schedule
+  // SetPositions); mrope_section IS, in FStruct[3..5]. The frequency schedule
   // (FFloatSt[0]=base, scaling slots) is inherited unchanged, so a saved
   // M-RoPE layer reloads with the right theta cache and an EMPTY position set
   // (the caller re-supplies positions before the next forward).
+  // pRotaryHeadDim > 0 (FStruct[6]) applies one layer to a whole multi-head
+  // (SeqLen, 1, Heads*pRotaryHeadDim) projection: the sections then sum to
+  // pRotaryHeadDim/2 and every head rotates by the same per-token angles.
   // Coded by Claude (AI).
   TNNetMRotaryEmbedding = class(TNNetRotaryEmbedding)
   protected
@@ -7655,7 +7661,8 @@ type
       pYarnAlpha: TNeuralFloat = 1.0;
       pYarnBeta: TNeuralFloat = 32.0;
       pLongAttnFactor: TNeuralFloat = 0.0;
-      pYarnTruncate: boolean = true); overload;
+      pYarnTruncate: boolean = true;
+      pRotaryHeadDim: integer = 0); overload;
     destructor Destroy(); override;
     {$IFDEF OpenCL}
     function WillOpenCL(): boolean; override;
@@ -7679,6 +7686,23 @@ type
     // into the parent's 1-D kernel with the wrong per-pair angles.
     // Coded by Claude (AI).
     function ChunkEligible(): boolean; override;
+  end;
+
+  /// Axial 3-D rotary embedding (Qwen-Image-2.1 QwenImage21Rope, Flux EmbedND).
+  // A TNNetMRotaryEmbedding whose three sections each carry their OWN frequency
+  // table over the section's own width: pair j of a section with S pairs uses
+  // theta_j = base^(-j/S) (M-RoPE uses one table over the whole head). Pairs
+  // stay consecutive (2k, 2k+1) = (real, imag); positions may be negative.
+  // No scaling modes. Serialized: FFloatSt[0]=base, FStruct[3..5]=sections,
+  // FStruct[6]=per-head dim (0 = the whole depth is one head).
+  // Coded by Claude (AI).
+  TNNetAxialRotaryEmbedding = class(TNNetMRotaryEmbedding)
+  protected
+    procedure BuildThetaCache(pDepth: integer); override;
+  public
+    // pSectionT/H/W: channel-PAIR counts per axis (Qwen-Image-2.1: 8, 28, 28).
+    constructor Create(pBase: TNeuralFloat;
+      pSectionT, pSectionH, pSectionW, pRotaryHeadDim: integer); overload;
   end;
 
   /// 2-D axial Rotary Position Embedding for vision transformers (DINOv3).
@@ -47265,6 +47289,14 @@ begin
   Result := FFloatSt[3];
 end;
 
+function TNNetRotaryEmbedding.RotaryTileDepth(pDepth: integer): integer;
+begin
+  if (FStruct[6] > 0) and (FStruct[6] < pDepth) then
+    Result := FStruct[6]
+  else
+    Result := pDepth;
+end;
+
 procedure TNNetRotaryEmbedding.BuildThetaCache(pDepth: integer);
 var
   HalfD, pairIdx: integer;
@@ -47303,10 +47335,7 @@ begin
   SetLength(FTheta, HalfD);
   // Head-tiled mode: schedule over the per-head dim and repeat it across heads.
   // FStruct[6] = 0 collapses to EffDepth = pDepth / effIdx = pairIdx (no-op).
-  if (FStruct[6] > 0) and (FStruct[6] < pDepth) then
-    EffDepth := FStruct[6]
-  else
-    EffDepth := pDepth;
+  EffDepth := RotaryTileDepth(pDepth);
   HalfPeriod := EffDepth div 2;
   // Partial rotary: the tile stride stays HalfPeriod, but the schedule
   // denominator narrows to the rotary width and the trailing pairs of each tile
@@ -47664,15 +47693,20 @@ constructor TNNetMRotaryEmbedding.Create(pBase: TNeuralFloat;
   pScalingMode: TNNetRoPEScalingMode; pScaleFactor: TNeuralFloat;
   pOriginalContextLen: integer; pYarnAlpha: TNeuralFloat;
   pYarnBeta: TNeuralFloat; pLongAttnFactor: TNeuralFloat;
-  pYarnTruncate: boolean);
+  pYarnTruncate: boolean; pRotaryHeadDim: integer);
 begin
   inherited Create(pBase, pScalingMode, pScaleFactor, pOriginalContextLen,
-    pYarnAlpha, pYarnBeta, pLongAttnFactor, pYarnTruncate);
+    pYarnAlpha, pYarnBeta, pLongAttnFactor, pYarnTruncate, pRotaryHeadDim);
   if (pSectionT < 0) or (pSectionH < 0) or (pSectionW < 0) or
      ((pSectionT + pSectionH + pSectionW) <= 0) then
     FErrorProc('TNNetMRotaryEmbedding requires non-negative mrope_section ' +
       'counts that sum to a positive value. Got (' + IntToStr(pSectionT) +
       ',' + IntToStr(pSectionH) + ',' + IntToStr(pSectionW) + ').');
+  if (pRotaryHeadDim > 0) and
+     (2 * (pSectionT + pSectionH + pSectionW) <> pRotaryHeadDim) then
+    FErrorProc('TNNetMRotaryEmbedding: 2 * mrope_section sum (' +
+      IntToStr(2 * (pSectionT + pSectionH + pSectionW)) +
+      ') must equal the head dim (' + IntToStr(pRotaryHeadDim) + ').');
   FMSection[0] := pSectionT;
   FMSection[1] := pSectionH;
   FMSection[2] := pSectionW;
@@ -47734,9 +47768,10 @@ end;
 procedure TNNetMRotaryEmbedding.ComputeOpenCL();
 var
   SeqLen, Depth, HalfD: integer;
-  HalfDM1: integer;
+  HalfTile, HalfTileM1, MaxHeadPos, HeadCnt, HeadAngleRow: integer;
   pos, k, sec, idx, StartRow, p, baseRow: integer;
   kStart, kEnd, idxOfs, SecT, SecTH: integer;
+  Angle: TNeuralFloat;
   CanReuse: boolean;
   FAngleCacheRowsM1, SeqLenM1: integer;
 begin
@@ -47744,7 +47779,9 @@ begin
   Depth := FPrevLayer.FOutput.Depth;
   SeqLen := FPrevLayer.FOutput.SizeX;
   HalfD := Depth shr 1; // #15: div 2, dimension is non-negative
-  HalfDM1 := HalfD - 1;
+  HalfTile := RotaryTileDepth(Depth) shr 1;
+  HalfTileM1 := HalfTile - 1;
+  MaxHeadPos := HalfD div HalfTile - 1;
   // Decide whether the cached prefix is still valid for this forward. It is when
   // the geometry/offset are unchanged, the cache is non-empty but no longer than
   // the request, and every cached leading position matches the current one.
@@ -47780,11 +47817,19 @@ begin
         0: begin kStart := 0;     kEnd := SecT - 1;  idx := FPosT[pos]; end;
         1: begin kStart := SecT;  kEnd := SecTH - 1; idx := FPosH[pos]; end;
       else
-        begin kStart := SecTH; kEnd := HalfDM1; idx := FPosW[pos]; end;
+        begin kStart := SecTH; kEnd := HalfTileM1; idx := FPosW[pos]; end;
       end;
       idxOfs := idx + FPositionOffset;
       for k := kStart to kEnd do
-        FAngleTable.FData[baseRow + k] := idxOfs * FTheta[k];
+      begin
+        Angle := idxOfs * FTheta[k];
+        HeadAngleRow := baseRow + k;
+        for HeadCnt := 0 to MaxHeadPos do
+        begin
+          FAngleTable.FData[HeadAngleRow] := Angle;
+          Inc(HeadAngleRow, HalfTile);
+        end;
+      end;
     end;
   end;
   // Match FOutput to the active prefix length. SetPrevLayer sized it to the
@@ -47857,8 +47902,8 @@ end;
 procedure TNNetMRotaryEmbedding.Compute();
 var
   StartTime: double;
-  SeqLen, Depth, HalfD: integer;
-  SeqLenM1, HalfDM1: integer;
+  SeqLen, Depth, HalfD, TileDepth: integer;
+  SeqLenM1, HalfTileM1, MaxHeadPos, HeadCnt, HeadPairPos: integer;
   pos, k, idx, sec: integer;
   base, i0, kStart, kEnd, idxOfs, SecT, SecTH: integer;
   Angle, c, s, x0, x1: TNeuralFloat;
@@ -47870,15 +47915,19 @@ begin
   SeqLen := Prev.SizeX;
   Depth := Prev.Depth;
   HalfD := Depth shr 1; // #15: div 2, dimension is non-negative
+  TileDepth := RotaryTileDepth(Depth);
   if Length(FTheta) <> HalfD then BuildThetaCache(Depth);
   if Length(FPosT) <> SeqLen then
     FErrorProc('TNNetMRotaryEmbedding: positions (' + IntToStr(Length(FPosT)) +
       ') do not match SeqLen (' + IntToStr(SeqLen) +
       '). Call SetPositions before the forward pass.');
-  if (FMSection[0] + FMSection[1] + FMSection[2]) <> HalfD then
+  if (Depth mod TileDepth) <> 0 then
+    FErrorProc('TNNetMRotaryEmbedding: Depth (' + IntToStr(Depth) +
+      ') is not a multiple of the head dim (' + IntToStr(TileDepth) + ').');
+  if 2 * (FMSection[0] + FMSection[1] + FMSection[2]) <> TileDepth then
     FErrorProc('TNNetMRotaryEmbedding: mrope_section sum (' +
       IntToStr(FMSection[0] + FMSection[1] + FMSection[2]) +
-      ') must equal Depth/2 (' + IntToStr(HalfD) + ').');
+      ') must equal the head dim / 2 (' + IntToStr(TileDepth shr 1) + ').');
   {$IFDEF OpenCL}
   // Device forward builds the per-(token,pair) angle table on the host (same
   // section-position resolution as the scalar loop below) and applies the
@@ -47894,10 +47943,12 @@ begin
   else Inc(FForwardCPUCnt);
   {$ENDIF}
   SeqLenM1 := SeqLen - 1;
-  HalfDM1 := HalfD - 1;
+  HalfTileM1 := (TileDepth shr 1) - 1;
+  MaxHeadPos := Depth div TileDepth - 1;
   // The three sections are CONTIGUOUS k ranges (see SectionOfPair), so walk
   // them one at a time (#20): the per-k section test and position lookup both
   // leave the inner loop, which then carries one loop-invariant position.
+  // Every head shares the pair's angle, so one sincos serves all heads.
   SecT := FMSection[0];
   SecTH := FMSection[0] + FMSection[1];
   for pos := 0 to SeqLenM1 do
@@ -47909,7 +47960,7 @@ begin
         0: begin kStart := 0;     kEnd := SecT - 1;  idx := FPosT[pos]; end;
         1: begin kStart := SecT;  kEnd := SecTH - 1; idx := FPosH[pos]; end;
       else
-        begin kStart := SecTH; kEnd := HalfDM1; idx := FPosW[pos]; end;
+        begin kStart := SecTH; kEnd := HalfTileM1; idx := FPosW[pos]; end;
       end;
       idxOfs := idx + FPositionOffset;
       i0 := base + 2 * kStart;   // pair k occupies slots base+2k, base+2k+1
@@ -47917,10 +47968,15 @@ begin
       begin
         Angle := idxOfs * FTheta[k];
         pcr_sincosf(Angle, s, c);
-        x0 := Prev.FData[i0];
-        x1 := Prev.FData[i0 + 1];
-        FOutput.FData[i0]     := FOutScale * (c * x0 - s * x1);
-        FOutput.FData[i0 + 1] := FOutScale * (s * x0 + c * x1);
+        HeadPairPos := i0;
+        for HeadCnt := 0 to MaxHeadPos do
+        begin
+          x0 := Prev.FData[HeadPairPos];
+          x1 := Prev.FData[HeadPairPos + 1];
+          FOutput.FData[HeadPairPos]     := FOutScale * (c * x0 - s * x1);
+          FOutput.FData[HeadPairPos + 1] := FOutScale * (s * x0 + c * x1);
+          Inc(HeadPairPos, TileDepth);
+        end;
         Inc(i0, 2);
       end;
     end;
@@ -47931,8 +47987,8 @@ end;
 procedure TNNetMRotaryEmbedding.Backpropagate();
 var
   StartTime: double;
-  SeqLen, Depth, HalfD: integer;
-  SeqLenM1, HalfDM1: integer;
+  SeqLen, Depth, HalfD, TileDepth: integer;
+  SeqLenM1, HalfTileM1, MaxHeadPos, HeadCnt, HeadPairPos: integer;
   pos, k, idx, sec: integer;
   base, i0, kStart, kEnd, idxOfs, SecT, SecTH: integer;
   Angle, c, s, gy0, gy1: TNeuralFloat;
@@ -47950,10 +48006,12 @@ begin
     SeqLen := FOutput.SizeX;
     Depth := FOutput.Depth;
     HalfD := Depth shr 1; // #15: div 2, dimension is non-negative
+    TileDepth := RotaryTileDepth(Depth);
     SeqLenM1 := SeqLen - 1;
-    HalfDM1 := HalfD - 1;
+    HalfTileM1 := (TileDepth shr 1) - 1;
+    MaxHeadPos := Depth div TileDepth - 1;
     if Length(FTheta) <> HalfD then BuildThetaCache(Depth);
-    // Same contiguous-section split as Compute (#20).
+    // Same contiguous-section split and shared per-head angle as Compute (#20).
     SecT := FMSection[0];
     SecTH := FMSection[0] + FMSection[1];
     for pos := 0 to SeqLenM1 do
@@ -47965,7 +48023,7 @@ begin
           0: begin kStart := 0;     kEnd := SecT - 1;  idx := FPosT[pos]; end;
           1: begin kStart := SecT;  kEnd := SecTH - 1; idx := FPosH[pos]; end;
         else
-          begin kStart := SecTH; kEnd := HalfDM1; idx := FPosW[pos]; end;
+          begin kStart := SecTH; kEnd := HalfTileM1; idx := FPosW[pos]; end;
         end;
         idxOfs := idx + FPositionOffset;
         i0 := base + 2 * kStart;   // pair k occupies slots base+2k, base+2k+1
@@ -47973,10 +48031,15 @@ begin
         begin
           Angle := idxOfs * FTheta[k];
           pcr_sincosf(Angle, s, c);
-          gy0 := FOutputError.FData[i0];
-          gy1 := FOutputError.FData[i0 + 1];
-          PrevErr.FData[i0]     := PrevErr.FData[i0]     + FOutScale * (c * gy0 + s * gy1);
-          PrevErr.FData[i0 + 1] := PrevErr.FData[i0 + 1] + FOutScale * (-s * gy0 + c * gy1);
+          HeadPairPos := i0;
+          for HeadCnt := 0 to MaxHeadPos do
+          begin
+            gy0 := FOutputError.FData[HeadPairPos];
+            gy1 := FOutputError.FData[HeadPairPos + 1];
+            PrevErr.FData[HeadPairPos]     := PrevErr.FData[HeadPairPos]     + FOutScale * (c * gy0 + s * gy1);
+            PrevErr.FData[HeadPairPos + 1] := PrevErr.FData[HeadPairPos + 1] + FOutScale * (-s * gy0 + c * gy1);
+            Inc(HeadPairPos, TileDepth);
+          end;
           Inc(i0, 2);
         end;
       end;
@@ -47984,6 +48047,49 @@ begin
     FBackwardTime := FBackwardTime + (Now() - StartTime);
   end;
   if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
+end;
+
+{ TNNetAxialRotaryEmbedding }
+
+constructor TNNetAxialRotaryEmbedding.Create(pBase: TNeuralFloat;
+  pSectionT, pSectionH, pSectionW, pRotaryHeadDim: integer);
+begin
+  inherited Create(pBase, pSectionT, pSectionH, pSectionW, rsmNone, 1.0, 0,
+    1.0, 32.0, 0.0, true, pRotaryHeadDim);
+end;
+
+procedure TNNetAxialRotaryEmbedding.BuildThetaCache(pDepth: integer);
+var
+  HalfD, HalfTile, PairPos, MaxPairPos, SectionCnt, SectionStart: integer;
+  AxisPairCnt, MaxAxisPairPos: integer;
+  LogBase: TNeuralFloat;
+begin
+  HalfD := pDepth shr 1;
+  HalfTile := RotaryTileDepth(pDepth) shr 1;
+  MaxPairPos := HalfD - 1;
+  SetLength(FTheta, HalfD);
+  FOutScale := 1.0;
+  if FStruct[3] + FStruct[4] + FStruct[5] <> HalfTile then
+  begin
+    FErrorProc('TNNetAxialRotaryEmbedding: section sum (' +
+      IntToStr(FStruct[3] + FStruct[4] + FStruct[5]) +
+      ') must equal the head dim / 2 (' + IntToStr(HalfTile) + ').');
+    exit;
+  end;
+  LogBase := pcr_logf(FFloatSt[0]);
+  // First head: each section is its own schedule base^(-j/S), j = 0..S-1.
+  SectionStart := 0;
+  for SectionCnt := 0 to 2 do
+  begin
+    MaxAxisPairPos := FStruct[3 + SectionCnt] - 1;
+    for AxisPairCnt := 0 to MaxAxisPairPos do
+      FTheta[SectionStart + AxisPairCnt] :=
+        NeuralExp(-(AxisPairCnt / FStruct[3 + SectionCnt]) * LogBase);
+    Inc(SectionStart, FStruct[3 + SectionCnt]);
+  end;
+  // Later heads repeat the first head's table.
+  for PairPos := HalfTile to MaxPairPos do
+    FTheta[PairPos] := FTheta[PairPos - HalfTile];
 end;
 
 { TNNetVisionRoPE2D }
@@ -128818,7 +128924,8 @@ begin
       'TNNetCausalLinearAttention' : Result := TNNetCausalLinearAttention.Create(St[0]);
       'TNNetLinformerAttention' :   Result := TNNetLinformerAttention.Create(St[0], St[1]);
       'TNNetRotaryEmbedding' :      Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0, St[6], St[7]);
-      'TNNetMRotaryEmbedding' :     Result := TNNetMRotaryEmbedding.Create(Ft[0], St[3], St[4], St[5], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0);
+      'TNNetMRotaryEmbedding' :     Result := TNNetMRotaryEmbedding.Create(Ft[0], St[3], St[4], St[5], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0, St[6]);
+      'TNNetAxialRotaryEmbedding' : Result := TNNetAxialRotaryEmbedding.Create(Ft[0], St[3], St[4], St[5], St[6]);
       'TNNetVisionRoPE2D' :         Result := TNNetVisionRoPE2D.Create(St[0], St[1], St[2], Ft[0]);
       'TNNetReLUSqrt':              Result := TNNetReLUSqrt.Create();
       'TNNetReLUL' :                Result := TNNetReLUL.Create(St[0], St[1], St[2]);
@@ -129261,7 +129368,8 @@ begin
       if S[0] = 'TNNetCausalLinearAttention' then Result := TNNetCausalLinearAttention.Create(St[0]) else
       if S[0] = 'TNNetLinformerAttention' then Result := TNNetLinformerAttention.Create(St[0], St[1]) else
       if S[0] = 'TNNetRotaryEmbedding' then Result := TNNetRotaryEmbedding.Create(Ft[0], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0, St[6], St[7]) else
-      if S[0] = 'TNNetMRotaryEmbedding' then Result := TNNetMRotaryEmbedding.Create(Ft[0], St[3], St[4], St[5], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0) else
+      if S[0] = 'TNNetMRotaryEmbedding' then Result := TNNetMRotaryEmbedding.Create(Ft[0], St[3], St[4], St[5], TNNetRoPEScalingMode(St[0]), Ft[1], St[1], Ft[2], Ft[3], Ft[4], St[2] = 0, St[6]) else
+      if S[0] = 'TNNetAxialRotaryEmbedding' then Result := TNNetAxialRotaryEmbedding.Create(Ft[0], St[3], St[4], St[5], St[6]) else
       if S[0] = 'TNNetVisionRoPE2D' then Result := TNNetVisionRoPE2D.Create(St[0], St[1], St[2], Ft[0]) else
       if S[0] = 'TNNetReLUSqrt' then Result := TNNetReLUSqrt.Create() else
       if S[0] = 'TNNetReLUL' then Result := TNNetReLUL.Create(St[0], St[1], St[2]) else

@@ -8632,6 +8632,11 @@ function QwenImage21TextToImagePrompt(const Prompt: string): string;
 function QwenImage21EncodeTextToImagePrompt(Tokenizer: TNeuralHFTokenizer;
   const Prompt: string; out DropCount: integer): TNeuralIntegerArray;
 
+// 3-axis RoPE positions for text[0], image[0], text[1], ..., text[N] (N images,
+// N+1 text runs, which may be empty). Feed them to TNNetAxialRotaryEmbedding.
+procedure BuildQwenImage21RopePositions(const TextLengths, GridHeights,
+  GridWidths: array of integer; var PosF, PosH, PosW: TNeuralIntegerArray);
+
 // ===========================================================================
 // RAFT OPTICAL-FLOW IMPORT (model_type "raft_small", the torchvision
 // raft_small architecture, Teed & Deng 2020 "RAFT", arXiv:2003.12039) - the
@@ -80658,6 +80663,59 @@ begin
     [ChatMessage('system', csQwenImage21SystemPrompt)],
     {AddGenerationPrompt=}false));
   Result := Tokenizer.Encode(QwenImage21TextToImagePrompt(Prompt));
+end;
+
+procedure BuildQwenImage21RopePositions(const TextLengths, GridHeights,
+  GridWidths: array of integer; var PosF, PosH, PosW: TNeuralIntegerArray);
+var
+  MaxImagePos, MaxRunPos, RunCnt, MaxTextPos, TextCnt: integer;
+  TokenCount, TokenPos, Position, RowCnt, ColCnt: integer;
+  MinRow, MaxRow, MinCol, MaxCol: integer;
+begin
+  if (Length(GridHeights) <> Length(GridWidths)) or
+     (Length(TextLengths) <> Length(GridHeights) + 1) then
+    ImportError('BuildQwenImage21RopePositions: expected N image grids and ' +
+      'N+1 text lengths.');
+  MaxImagePos := Length(GridHeights) - 1;
+  MaxRunPos := Length(TextLengths) - 1;
+  TokenCount := 0;
+  for RunCnt := 0 to MaxRunPos do
+    Inc(TokenCount, TextLengths[RunCnt]);
+  for RunCnt := 0 to MaxImagePos do
+    Inc(TokenCount, GridHeights[RunCnt] * GridWidths[RunCnt]);
+  SetLength(PosF, TokenCount);
+  SetLength(PosH, TokenCount);
+  SetLength(PosW, TokenCount);
+  TokenPos := 0;
+  Position := 0;
+  for RunCnt := 0 to MaxRunPos do
+  begin
+    // Text run: one shared position per token on all three axes.
+    MaxTextPos := TextLengths[RunCnt] - 1;
+    for TextCnt := 0 to MaxTextPos do
+    begin
+      PosF[TokenPos] := Position;
+      PosH[TokenPos] := Position;
+      PosW[TokenPos] := Position;
+      Inc(Position);
+      Inc(TokenPos);
+    end;
+    if RunCnt > MaxImagePos then break;
+    // Image block: frame fixed at Position, (h, w) grid centred on zero.
+    MinRow := -(GridHeights[RunCnt] - GridHeights[RunCnt] div 2);
+    MaxRow := GridHeights[RunCnt] div 2 - 1;
+    MinCol := -(GridWidths[RunCnt] - GridWidths[RunCnt] div 2);
+    MaxCol := GridWidths[RunCnt] div 2 - 1;
+    for RowCnt := MinRow to MaxRow do
+      for ColCnt := MinCol to MaxCol do
+      begin
+        PosF[TokenPos] := Position;
+        PosH[TokenPos] := RowCnt;
+        PosW[TokenPos] := ColCnt;
+        Inc(TokenPos);
+      end;
+    Inc(Position, Max(GridHeights[RunCnt], GridWidths[RunCnt]));
+  end;
 end;
 
 // ===========================================================================

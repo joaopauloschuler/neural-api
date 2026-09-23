@@ -637,6 +637,9 @@ type
     // OpenCL M-RoPE incremental-decode angle-table cache parity: the cached
     // extending-sequence path must equal a per-step full recompute.
     procedure MRoPEOpenCLIncrementalCacheParity;
+    // Head-tiled TNNetAxialRotaryEmbedding (negative positions) through the
+    // same host angle table + cai_mrope kernel, vs CPU.
+    procedure AxialRoPEOpenCLParity;
     // OpenCL whole-volume mean/variance (LayerNorm) and mean-square (RMSNorm)
     // forward offload parity (vs CPU) for TNNetLayerNorm / TNNetRMSNorm, which
     // collapse the whole SizeX*SizeY*Depth sample into one cai_token_norm token.
@@ -1416,6 +1419,9 @@ type
     procedure TestRoPEPartialTiledGradientCheck;
     procedure TestRoPEPartialSerializationRoundTrip;
     procedure TestRoPEPartialExceedsWidthGuard;
+    procedure TestMRoPETiledMatchesPerHead;
+    procedure TestAxialRoPEGradientCheck;
+    procedure TestAxialRoPESerializationRoundTrip;
     procedure TestRoPEScalingNoneBitIdentical;
     procedure TestRoPEScalingPIHalfPositions;
     procedure TestRoPEScalingNTKDimSelective;
@@ -16039,6 +16045,124 @@ begin
   finally
     NN.Free;
     Capture.Free;
+  end;
+end;
+
+// Untiled M-RoPE must keep its single frequency table base^(-2k/Depth) with
+// the section's position per pair, and the head-tiled layer (pRotaryHeadDim)
+// must equal one untiled layer per head bit for bit. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestMRoPETiledMatchesPerHead;
+const
+  SeqLen = 4; Heads = 3; HeadDim = 8;
+  PosT: array[0..3] of integer = (0, 1, 1, 5);
+  PosH: array[0..3] of integer = (0, 2, -1, 5);
+  PosW: array[0..3] of integer = (0, 3, 4, 5);
+var
+  Tiled, Ref: TNNet;
+  Input: TNNetVolume;
+  InputLayer, HeadRope: TNNetLayer;
+  HeadOutputs: array of TNNetLayer;
+  HeadCnt, TokenPos, PairPos, ChannelPos, PairPosInHead, AxisPos: integer;
+  Angle, x0, x1: TNeuralFloat;
+begin
+  Tiled := TNNet.Create();
+  Ref := TNNet.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, Heads * HeadDim);
+  try
+    Tiled.AddLayer(TNNetInput.Create(SeqLen, 1, Heads * HeadDim, 1));
+    TNNetMRotaryEmbedding(Tiled.AddLayer(TNNetMRotaryEmbedding.Create(10000.0,
+      2, 1, 1, rsmNone, 1.0, 0, 1.0, 32.0, 0.0, true, HeadDim))).SetPositions(
+      PosT, PosH, PosW);
+    SetLength(HeadOutputs, Heads);
+    InputLayer := Ref.AddLayer(TNNetInput.Create(SeqLen, 1, Heads * HeadDim, 1));
+    for HeadCnt := 0 to Heads - 1 do
+    begin
+      HeadRope := Ref.AddLayerAfter(
+        TNNetSplitChannels.Create(HeadCnt * HeadDim, HeadDim), InputLayer);
+      HeadRope := Ref.AddLayerAfter(
+        TNNetMRotaryEmbedding.Create(10000.0, 2, 1, 1), HeadRope);
+      TNNetMRotaryEmbedding(HeadRope).SetPositions(PosT, PosH, PosW);
+      HeadOutputs[HeadCnt] := HeadRope;
+    end;
+    Ref.AddLayer(TNNetDeepConcat.Create(HeadOutputs));
+    for ChannelPos := 0 to Input.Size - 1 do
+      Input.FData[ChannelPos] := Sin(ChannelPos * 0.37) * 0.9 - 0.15;
+    Tiled.Compute(Input);
+    Ref.Compute(Input);
+    for ChannelPos := 0 to Input.Size - 1 do
+      AssertEquals('tiled M-RoPE = per-head M-RoPE at ' + IntToStr(ChannelPos),
+        Ref.GetLastLayer.Output.FData[ChannelPos],
+        Tiled.GetLastLayer.Output.FData[ChannelPos], 0);
+    // Pairs 0-1 read PosT, pair 2 PosH, pair 3 PosW; one table over HeadDim.
+    for TokenPos := 0 to SeqLen - 1 do
+      for PairPos := 0 to Heads * HeadDim div 2 - 1 do
+      begin
+        PairPosInHead := PairPos mod (HeadDim div 2);
+        case PairPosInHead of
+          0, 1: AxisPos := PosT[TokenPos];
+          2: AxisPos := PosH[TokenPos];
+        else AxisPos := PosW[TokenPos];
+        end;
+        Angle := AxisPos * Exp(-2.0 * PairPosInHead / HeadDim * Ln(10000.0));
+        x0 := Input[TokenPos, 0, 2 * PairPos];
+        x1 := Input[TokenPos, 0, 2 * PairPos + 1];
+        AssertEquals('M-RoPE single table y0', Cos(Angle) * x0 - Sin(Angle) * x1,
+          Tiled.GetLastLayer.Output[TokenPos, 0, 2 * PairPos], 1e-5);
+        AssertEquals('M-RoPE single table y1', Sin(Angle) * x0 + Cos(Angle) * x1,
+          Tiled.GetLastLayer.Output[TokenPos, 0, 2 * PairPos + 1], 1e-5);
+      end;
+  finally
+    Tiled.Free;
+    Ref.Free;
+    Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAxialRoPEGradientCheck;
+var
+  Rope: TNNetAxialRotaryEmbedding;
+begin
+  // 2 tokens x 2 heads of head_dim 6 (one pair per axis), negative positions.
+  Rope := TNNetAxialRotaryEmbedding.Create(10000.0, 1, 1, 1, 6);
+  Rope.SetPositions([0, 3], [0, -2], [0, -1]);
+  LayerInputGradientCheck(Self, Rope, 'AxialRoPE', 2, 1, 12, 0.01);
+end;
+
+procedure TTestNeuralNumerical.TestAxialRoPESerializationRoundTrip;
+const
+  PosF: array[0..2] of integer = (0, 1, 1);
+  PosH: array[0..2] of integer = (0, -1, 0);
+  PosW: array[0..2] of integer = (0, -2, 1);
+var
+  NN, NN2: TNNet;
+  Input: TNNetVolume;
+  ChannelPos: integer;
+begin
+  // The class, sections and head dim must survive a reload (positions are
+  // run-time state the caller re-supplies).
+  NN := TNNet.Create();
+  NN2 := TNNet.Create();
+  Input := TNNetVolume.Create(3, 1, 16);
+  try
+    NN.AddLayer(TNNetInput.Create(3, 1, 16, 1));
+    TNNetAxialRotaryEmbedding(NN.AddLayer(TNNetAxialRotaryEmbedding.Create(
+      100.0, 1, 2, 1, 8))).SetPositions(PosF, PosH, PosW);
+    for ChannelPos := 0 to Input.Size - 1 do
+      Input.FData[ChannelPos] := Cos(ChannelPos * 0.29) * 0.7;
+    NN.Compute(Input);
+    NN2.LoadFromString(NN.SaveToString());
+    AssertTrue('reloaded class', NN2.Layers[1] is TNNetAxialRotaryEmbedding);
+    AssertEquals('save -> load -> save', NN.SaveToString(), NN2.SaveToString());
+    TNNetAxialRotaryEmbedding(NN2.Layers[1]).SetPositions(PosF, PosH, PosW);
+    NN2.Compute(Input);
+    for ChannelPos := 0 to Input.Size - 1 do
+      AssertEquals('axial RoPE round-trip at ' + IntToStr(ChannelPos),
+        NN.GetLastLayer.Output.FData[ChannelPos],
+        NN2.GetLastLayer.Output.FData[ChannelPos], 0);
+  finally
+    NN.Free;
+    NN2.Free;
+    Input.Free;
   end;
 end;
 
@@ -70364,6 +70488,66 @@ begin
     WriteLn('  M-RoPE OpenCL parity: max|diff|=', MaxDiff:0:9);
     AssertTrue('M-RoPE OpenCL vs CPU parity: max |diff| = ' +
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.AxialRoPEOpenCLParity;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  Rope: TNNetAxialRotaryEmbedding;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  ChannelPos, TokenPos: integer;
+  PosF, PosH, PosW: array of integer;
+  MaxDiff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(7, 1, 32); // 2 heads x head_dim 16
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(7, 1, 32, 1));
+    Rope := TNNetAxialRotaryEmbedding.Create(10000.0, 2, 3, 3, 16);
+    NN.AddLayer(Rope);
+    SetLength(PosF, 7); SetLength(PosH, 7); SetLength(PosW, 7);
+    for TokenPos := 0 to 6 do
+    begin
+      PosF[TokenPos] := TokenPos div 2;
+      PosH[TokenPos] := TokenPos - 4;
+      PosW[TokenPos] := 2 - TokenPos;
+    end;
+    Rope.SetPositions(PosF, PosH, PosW);
+    for ChannelPos := 0 to Input.Size - 1 do
+      Input.Raw[ChannelPos] := 0.5 * Sin(ChannelPos * 0.37) - 0.2;
+    NN.Compute(Input);
+    OutCPU.Copy(NN.GetLastLayer.Output);
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      NN.Compute(Input);
+      MaxDiff := 0;
+      for ChannelPos := 0 to OutCPU.Size - 1 do
+        MaxDiff := Max(MaxDiff,
+          Abs(OutCPU.Raw[ChannelPos] - NN.GetLastLayer.Output.Raw[ChannelPos]));
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    WriteLn('  axial RoPE OpenCL parity: max|diff|=', MaxDiff:0:9);
+    AssertTrue('axial RoPE OpenCL vs CPU: max |diff| = ' + FloatToStr(MaxDiff),
+      MaxDiff < 1e-4);
   finally
     OutCPU.Free; Input.Free; NN.Free;
   end;

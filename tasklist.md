@@ -1813,9 +1813,10 @@ rather than acted on.
         int8 load); test that text-only interleaved M-RoPE equals 1D RoPE; API returning
         pre-final-norm last-layer hidden states; template + tokenization + drop_idx.
         Done: `BuildQwen3VLTextEncoderFromSafeTensors` (Llama builder, `pStopBeforeFinalNorm`), `Qwen3VLEncodeHiddenStates`, `QwenImage21TextToImagePrompt`, `QwenImage21EncodeTextToImagePrompt`; `qwen3_vl` also in `BuildFromPretrained`; tests `TestQwen3VL*`, `TestQwenImage21PromptTemplateIds`.
-  - [ ] A3. Qwen-Image RoPE: extend `TNNetMRotaryEmbedding` for the consecutive-pair
+  - [x] A3. Qwen-Image RoPE: extend `TNNetMRotaryEmbedding` for the consecutive-pair
         layout, 16/56/56 sections and negative positions; position builder (text
         0..L-1, image frame = L, centred h/w grid).
+        Done: subclass `TNNetAxialRotaryEmbedding` (per-axis tables; M-RoPE gained `pRotaryHeadDim` head tiling), `BuildQwenImage21RopePositions`; tests `TestQwenImage21Rope*`, `TestAxialRoPE*`, `AxialRoPEOpenCLParity`, `TestMRoPETiledMatchesPerHead`.
   - [ ] A4. Transformer block, step pass: image-token queries attend (no causal mask)
         to [cached prefix K/V ; own K/V]. Reuse `TNNetHeadRMSNorm`, `TNNetLayerNorm`,
         `TNNetFiLM` / `TNNetChannelMulByLayer`, the fused SDPA KV cache and batched

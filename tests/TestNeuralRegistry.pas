@@ -540,6 +540,9 @@ begin
     // Fused multi-head SDPA (GQA 2 q-heads / 1 kv-head, head_dim 4:
     // packed depth (2 + 2*1)*4 = 16).
     379: begin AddSeqInput(ANet); Exit(L('TNNetFusedSDPA', TNNetFusedSDPA.Create(2, 1, 4, {Causal=}true))); end;
+
+    // Axial 3-axis RoPE (depth 16 = 2 heads x head_dim 8, sections 1/2/1).
+    380: begin AddSeqInput(ANet); Exit(L('TNNetAxialRotaryEmbedding', TNNetAxialRotaryEmbedding.Create(10000.0, 1, 2, 1, 8))); end;
     else
       Result := False;
   end;

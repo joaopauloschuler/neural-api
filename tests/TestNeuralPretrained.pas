@@ -678,6 +678,8 @@ type
     procedure TestQwen3VLTextEncoderPreNormParity;
     procedure TestQwen3VLTextOnlyMRoPEEqualsRoPE;
     procedure TestQwenImage21PromptTemplateIds;
+    procedure TestQwenImage21RopePositions;
+    procedure TestQwenImage21RopeForward;
     procedure TestQwen3VLTextEncoderInt8Drift;
     procedure TestQwen2AudioConfigFromJSONFile;
     procedure TestQwen2AudioParity;
@@ -25166,6 +25168,143 @@ begin
         IntToStr(TokenPos), SystemIds[TokenPos], PromptIds[TokenPos]);
   finally
     Tokenizer.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// Reads one tiny_qwenimage21_rope_io.json case into the builder's arguments
+// (text before the image, the image grid, text after it).
+procedure ReadQwenImage21RopeCase(CaseObj: TJSONObject;
+  out TextBefore, GridH, GridW, TextAfter: integer);
+var
+  MaskArr, ShapeArr: TJSONArray;
+begin
+  MaskArr := TJSONArray(CaseObj.Find('image_pad_mask'));
+  ShapeArr := TJSONArray(TJSONArray(CaseObj.Find('img_shapes')).Items[0]);
+  GridH := ShapeArr.Integers[1];
+  GridW := ShapeArr.Integers[2];
+  TextBefore := 0;
+  while MaskArr.Integers[TextBefore] = 0 do Inc(TextBefore);
+  TextAfter := MaskArr.Count - TextBefore - GridH * GridW;
+end;
+
+// BuildQwenImage21RopePositions must reproduce the diffusers QwenImage21Rope
+// (frame, h, w) indices exactly: odd grid, even grid, trailing text.
+procedure TTestNeuralPretrained.TestQwenImage21RopePositions;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Cases, PosArr: TJSONArray;
+  CaseObj: TJSONObject;
+  PosF, PosH, PosW: TNeuralIntegerArray;
+  CaseCnt, TokenPos, TextBefore, GridH, GridW, TextAfter: integer;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_rope_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Cases := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    AssertEquals('cases', 3, Cases.Count);
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := TJSONObject(Cases.Items[CaseCnt]);
+      ReadQwenImage21RopeCase(CaseObj, TextBefore, GridH, GridW, TextAfter);
+      BuildQwenImage21RopePositions([TextBefore, TextAfter], [GridH], [GridW],
+        PosF, PosH, PosW);
+      PosArr := TJSONArray(TJSONObject(CaseObj.Find('positions_fhw')).Find('data'));
+      AssertEquals('token count, case ' + IntToStr(CaseCnt),
+        PosArr.Count div 3, Length(PosF));
+      for TokenPos := 0 to Length(PosF) - 1 do
+      begin
+        AssertEquals('frame, case ' + IntToStr(CaseCnt) + ' token ' +
+          IntToStr(TokenPos), PosArr.Integers[3 * TokenPos], PosF[TokenPos]);
+        AssertEquals('h, case ' + IntToStr(CaseCnt) + ' token ' +
+          IntToStr(TokenPos), PosArr.Integers[3 * TokenPos + 1], PosH[TokenPos]);
+        AssertEquals('w, case ' + IntToStr(CaseCnt) + ' token ' +
+          IntToStr(TokenPos), PosArr.Integers[3 * TokenPos + 2], PosW[TokenPos]);
+      end;
+    end;
+    // Two image blocks (editing layout): the second block's frame continues
+    // after the first block's max(H, W) advance and the text between them.
+    BuildQwenImage21RopePositions([1, 1, 0], [2, 1], [1, 3], PosF, PosH, PosW);
+    AssertEquals('two-image token count', 1 + 2 + 1 + 3, Length(PosF));
+    AssertEquals('first image frame', 1, PosF[1]);
+    AssertEquals('first image h', -1, PosH[1]);
+    AssertEquals('middle text', 3, PosF[3]);
+    AssertEquals('middle text h', 3, PosH[3]);
+    AssertEquals('second image frame', 4, PosF[4]);
+    AssertEquals('second image w', -2, PosW[4]);
+    AssertEquals('second image h', -1, PosH[6]);
+  finally
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// TNNetAxialRotaryEmbedding over the whole (S, 1, heads*head_dim) query must
+// match the float64 diffusers rotation. Tolerance 1e-5: float32 angles at
+// |position| <= 6 and |q| <= 2 leave a few ulps (HF float32 itself: 2.8e-7).
+procedure TTestNeuralPretrained.TestQwenImage21RopeForward;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Cases, AxesArr, ShapeArr, QArr, RotArr: TJSONArray;
+  CaseObj: TJSONObject;
+  NN: TNNet;
+  Rope: TNNetAxialRotaryEmbedding;
+  Input: TNNetVolume;
+  PosF, PosH, PosW: TNeuralIntegerArray;
+  CaseCnt, DataPos, TextBefore, GridH, GridW, TextAfter: integer;
+  SeqLen, Heads, HeadDim: integer;
+  Theta, MaxDiff: TNeuralFloat;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Input := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_rope_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Theta := TJSONObject(RefRoot).Get('theta', 0.0);
+    AxesArr := TJSONArray(TJSONObject(RefRoot).Find('axes_dim'));
+    Cases := TJSONArray(TJSONObject(RefRoot).Find('cases'));
+    for CaseCnt := 0 to Cases.Count - 1 do
+    begin
+      CaseObj := TJSONObject(Cases.Items[CaseCnt]);
+      ReadQwenImage21RopeCase(CaseObj, TextBefore, GridH, GridW, TextAfter);
+      BuildQwenImage21RopePositions([TextBefore, TextAfter], [GridH], [GridW],
+        PosF, PosH, PosW);
+      ShapeArr := TJSONArray(TJSONObject(CaseObj.Find('query')).Find('shape'));
+      SeqLen := ShapeArr.Integers[1];
+      Heads := ShapeArr.Integers[2];
+      HeadDim := ShapeArr.Integers[3];
+      QArr := TJSONArray(TJSONObject(CaseObj.Find('query')).Find('data'));
+      RotArr := TJSONArray(TJSONObject(CaseObj.Find('query_rotated')).Find('data'));
+      Input.ReSize(SeqLen, 1, Heads * HeadDim);
+      for DataPos := 0 to QArr.Count - 1 do
+        Input.FData[DataPos] := QArr.Floats[DataPos];
+      NN := TNNet.Create();
+      try
+        NN.AddLayer(TNNetInput.Create(SeqLen, 1, Heads * HeadDim, 1));
+        Rope := TNNetAxialRotaryEmbedding.Create(Theta,
+          AxesArr.Integers[0] div 2, AxesArr.Integers[1] div 2,
+          AxesArr.Integers[2] div 2, HeadDim);
+        NN.AddLayer(Rope);
+        Rope.SetPositions(PosF, PosH, PosW);
+        NN.Compute(Input);
+        MaxDiff := 0;
+        for DataPos := 0 to RotArr.Count - 1 do
+          MaxDiff := Max(MaxDiff, Abs(RotArr.Floats[DataPos] -
+            NN.GetLastLayer.Output.FData[DataPos]));
+        AssertTrue('axial RoPE vs diffusers, case ' + IntToStr(CaseCnt) +
+          ' max diff ' + FloatToStr(MaxDiff), MaxDiff < 1e-5);
+      finally
+        NN.Free;
+      end;
+    end;
+  finally
+    Input.Free;
     RefRoot.Free;
     RefJson.Free;
   end;
