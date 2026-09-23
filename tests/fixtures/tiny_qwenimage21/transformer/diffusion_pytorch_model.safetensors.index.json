@@ -1,0 +1,34 @@
+{
+  "metadata": {
+    "total_size": 90368
+  },
+  "weight_map": {
+    "img_in.weight": "diffusion_pytorch_model-00001-of-00002.safetensors",
+    "modulation.1.weight": "diffusion_pytorch_model-00001-of-00002.safetensors",
+    "norm_out.linear.weight": "diffusion_pytorch_model-00002-of-00002.safetensors",
+    "proj_out.weight": "diffusion_pytorch_model-00002-of-00002.safetensors",
+    "time_text_embed.timestep_embedder.linear_1.weight": "diffusion_pytorch_model-00001-of-00002.safetensors",
+    "time_text_embed.timestep_embedder.linear_2.weight": "diffusion_pytorch_model-00001-of-00002.safetensors",
+    "transformer_blocks.0.attn.norm_k.weight": "diffusion_pytorch_model-00001-of-00002.safetensors",
+    "transformer_blocks.0.attn.norm_q.weight": "diffusion_pytorch_model-00001-of-00002.safetensors",
+    "transformer_blocks.0.attn.to_k.weight": "diffusion_pytorch_model-00001-of-00002.safetensors",
+    "transformer_blocks.0.attn.to_out.0.weight": "diffusion_pytorch_model-00001-of-00002.safetensors",
+    "transformer_blocks.0.attn.to_q.weight": "diffusion_pytorch_model-00001-of-00002.safetensors",
+    "transformer_blocks.0.attn.to_v.weight": "diffusion_pytorch_model-00001-of-00002.safetensors",
+    "transformer_blocks.0.img_mlp.gate_layer.weight": "diffusion_pytorch_model-00002-of-00002.safetensors",
+    "transformer_blocks.0.img_mlp.out.weight": "diffusion_pytorch_model-00002-of-00002.safetensors",
+    "transformer_blocks.0.img_mlp.proj.weight": "diffusion_pytorch_model-00001-of-00002.safetensors",
+    "transformer_blocks.1.attn.norm_k.weight": "diffusion_pytorch_model-00002-of-00002.safetensors",
+    "transformer_blocks.1.attn.norm_q.weight": "diffusion_pytorch_model-00002-of-00002.safetensors",
+    "transformer_blocks.1.attn.to_k.weight": "diffusion_pytorch_model-00002-of-00002.safetensors",
+    "transformer_blocks.1.attn.to_out.0.weight": "diffusion_pytorch_model-00002-of-00002.safetensors",
+    "transformer_blocks.1.attn.to_q.weight": "diffusion_pytorch_model-00002-of-00002.safetensors",
+    "transformer_blocks.1.attn.to_v.weight": "diffusion_pytorch_model-00002-of-00002.safetensors",
+    "transformer_blocks.1.img_mlp.gate_layer.weight": "diffusion_pytorch_model-00002-of-00002.safetensors",
+    "transformer_blocks.1.img_mlp.out.weight": "diffusion_pytorch_model-00002-of-00002.safetensors",
+    "transformer_blocks.1.img_mlp.proj.weight": "diffusion_pytorch_model-00002-of-00002.safetensors",
+    "txt_in.in_layer.weight": "diffusion_pytorch_model-00001-of-00002.safetensors",
+    "txt_in.out_layer.weight": "diffusion_pytorch_model-00001-of-00002.safetensors",
+    "txt_in.text_norm.weight": "diffusion_pytorch_model-00001-of-00002.safetensors"
+  }
+}

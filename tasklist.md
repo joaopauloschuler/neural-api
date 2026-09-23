@@ -1800,9 +1800,10 @@ rather than acted on.
         steps (2048x2048 ~6x more). Compute-bound GEMM, not decode GEMV. int8:
         transformer ~7 GB, text encoder ~8 GB, loaded one after the other.
   Phase A — text-to-image, correctness first:
-  - [ ] A0. Parity oracle: install diffusers (git main) + transformers >= 5.17 into
+  - [x] A0. Parity oracle: install diffusers (git main) + transformers >= 5.17 into
         the `x` venv; a script that builds tiny random-weight versions of each
         component and writes float64 inputs/outputs to `tests/fixtures/`.
+        Done: `tools/make_pico_qwenimage21_fixture.py` -> `tests/fixtures/tiny_qwenimage21/` (pico diffusers folder), `qwenimage21_{scheduler_oracle,prompt_tokens}.json`, `tiny_qwenimage21_{text_encoder,rope,transformer,vae,pipeline}_io.json`.
   - [ ] A1. Flow-matching Euler scheduler in `neuraldiffusion.pas` (decide: extend
         `TNNetDiffusionScheduler` or a new class): dynamic exponential shift,
         `shift_terminal`, velocity step. JSON oracle test. Independent.
