@@ -25,6 +25,7 @@ Outputs (all under tests/fixtures/):
                                            block 0 in cached mode, temb,
                                            modulation
   tiny_qwenimage21_vae_io.json             A6: latent de-normalisation + decode
+  tiny_qwenimage21_vae_tiled_io.json       A6: 64x64 decode, whole and tiled
   tiny_qwenimage21_pipeline_io.json        A7: pico pipeline, fixed latents and
                                            fixed prompt embeds
 
@@ -133,6 +134,9 @@ VAE_BASE = 2                          # real: encoder 96, decoder 144
 VAE_DECODER_BASE = 3
 VAE_DIM_MULT = [1, 2, 4, 8, 8]        # the real dim_mult: same shortcuts, 16x spatial
 VAE_LATENT_HW = (2, 3)
+VAE_LATENT_TILED_HW = (4, 4)          # a 64x64 image
+VAE_TILINGS = [(32, 16), (48, 32)]    # (tile_sample_min, tile_sample_stride) in pixels
+VAE_DUPUP_CASES = [(8, 8, 2), (8, 4, 2), (4, 2, 1), (3, 6, 2), (4, 4, 1)]  # (in, out, factor_t)
 
 PIPE_HEIGHT, PIPE_WIDTH, PIPE_STEPS = 32, 64, 3
 
@@ -766,6 +770,47 @@ def make_vae_oracle(vae, reloaded):
     return len(calls)
 
 
+def make_vae_tiled_oracle(vae):
+    """A 4x4 latent (64x64 image) decoded whole and with diffusers' tiled_decode at two tilings."""
+    gen = torch.Generator().manual_seed(19)
+    latents = torch.randn(1, VAE_Z, 1, *VAE_LATENT_TILED_HW, generator=gen, dtype=torch.float64)
+    denormalized = denormalize_latents(vae, latents)
+    tiled_vae = copy.deepcopy(vae)
+    cases = []
+    with torch.no_grad():
+        whole = vae.decode(denormalized, return_dict=False)[0]
+        for tile_size, tile_stride in VAE_TILINGS:
+            tiled_vae.enable_tiling(tile_sample_min_height=tile_size, tile_sample_min_width=tile_size,
+                                    tile_sample_stride_height=tile_stride,
+                                    tile_sample_stride_width=tile_stride)
+            tiled = tiled_vae.decode(denormalized, return_dict=False)[0]
+            with NativeReference():
+                native = tiled_vae.decode(denormalized, return_dict=False)[0]
+            cases.append({"tile_sample_size": tile_size, "tile_sample_stride": tile_stride,
+                          "decoded": tensor_json(tiled[0, :, 0]),
+                          "tiled_vs_whole_maxabs_diff": max_abs_diff(tiled, whole),
+                          "native_hf_maxabs_diff": max_abs_diff(tiled, native)})
+    dupup_cases = []
+    for in_channels, out_channels, factor_t in VAE_DUPUP_CASES:
+        dupup_input = torch.randn(1, in_channels, 1, 2, 3, generator=gen, dtype=torch.float64)
+        dupup = vae_module.QwenImage21DupUp3D(in_channels, out_channels, factor_t=factor_t, factor_s=2)
+        dupup_output = dupup(dupup_input, first_chunk=True)
+        dupup_cases.append({"in_channels": in_channels, "out_channels": out_channels, "factor_t": factor_t,
+                            "input": tensor_json(dupup_input[0, :, 0]),
+                            "output": tensor_json(dupup_output[0, :, 0])})
+    write_json("tiny_qwenimage21_vae_tiled_io.json", {
+        "latents_normalized": tensor_json(latents[0, :, 0]),
+        "decoded_whole": tensor_json(whole[0, :, 0]),
+        "tilings": cases,
+        "dupup_cases": dupup_cases,
+        "note": "decoded_whole = vae.decode(latents * latents_std + latents_mean) without tiling; "
+                "tilings[i].decoded = the same with vae.enable_tiling(tile_sample_min = tile_sample_size, "
+                "tile_sample_stride = tile_sample_stride) on both axes. RGBA (C,H,W) after the [-1,1] clamp. "
+                "dupup_cases: QwenImage21DupUp3D(in, out, factor_t, factor_s=2)(input, first_chunk=True) on "
+                "one frame, (C,H,W).",
+    })
+
+
 # ---------------- A7: pico pipeline ----------------
 class TemplateOnlyProcessor:
     """QwenImage21Pipeline.__init__ reads drop_idx and the <|image_pad|> id from its processor; with
@@ -869,6 +914,7 @@ def main():
     vae, vae_reloaded = make_vae()
     time_conv_calls = make_vae_oracle(vae, vae_reloaded)
     make_pipeline_oracle(transformer, vae, text_encoder, embeds)
+    make_vae_tiled_oracle(vae)
     print(f"time_conv calls during a single-image decode: {time_conv_calls}")
 
 

@@ -62,6 +62,9 @@ type
       TJSONData;
     // The pico diffusers transformer folder (FixturePath takes files only).
     function QwenImage21TransformerFolder(): string;
+    // Loads a {"shape": [C, H, W], ...} oracle image of Root as a (W,H,C) volume.
+    procedure LoadOracleImageTensor(Root: TJSONData; const Key: string;
+      Dest: TNNetVolume);
     // Windows of StepTokens through WindowSession over the first
     // PrefillTokenCount tokens, snapshot handoff, then width-1 for the rest.
     // The first HiddenOnlyTokenCount tokens step with StepForwardToHidden
@@ -701,6 +704,10 @@ type
     procedure TestQwenImage21TransformerOpenCLGuard;
     procedure TestQwenImage21TransformerStepReplay;
     procedure TestQwenImage21TransformerQuantizedDrift;
+    procedure TestQwenImage21VaeDupUpMapping;
+    procedure TestQwenImage21VaeDecoderTensorSet;
+    procedure TestQwenImage21VaeDecoderParity;
+    procedure TestQwenImage21VaeDecoderTiledParity;
     procedure TestQwen3VLTextEncoderInt8Drift;
     procedure TestQwen2AudioConfigFromJSONFile;
     procedure TestQwen2AudioParity;
@@ -26012,6 +26019,285 @@ begin
     Latents.Free;
     Embeds.Free;
     RefRoot.Free;
+  end;
+end;
+
+procedure TTestNeuralPretrained.LoadOracleImageTensor(Root: TJSONData;
+  const Key: string; Dest: TNNetVolume);
+var
+  ShapeArr: TJSONArray;
+  ChannelMajor: TNNetVolume;
+begin
+  ShapeArr := TJSONArray(TJSONObject(TJSONObject(Root).Find(Key)).Find('shape'));
+  AssertEquals('oracle image "' + Key + '" is (C,H,W)', 3, ShapeArr.Count);
+  ChannelMajor := TNNetVolume.Create;
+  try
+    // (C,1,H*W) -> (H*W,1,C) -> (W,H,C): the pixel order is row-major in both.
+    LoadOracleTokenTensor(Root, Key, ChannelMajor);
+    Dest.CopyTransposingXD(ChannelMajor);
+    Dest.ReSize(ShapeArr.Integers[2], ShapeArr.Integers[1],
+      ShapeArr.Integers[0]);
+  finally
+    ChannelMajor.Free;
+  end;
+end;
+
+// AddQwenImage21DupUp (TNNetGatherChannels + TNNetPixelShuffle(2)) against
+// diffusers' own QwenImage21DupUp3D(first_chunk=True) on the five oracle
+// cases; a pure copy, so exact. Also pins the real decoder's three mappings.
+procedure TTestNeuralPretrained.TestQwenImage21VaeDupUpMapping;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Cases: TJSONArray;
+  CaseObj: TJSONData;
+  NN: TNNet;
+  Input, Expected: TNNetVolume;
+  Channels: TNeuralIntegerArray;
+  CasePos, MaxCasePos, ChannelPos, OffsetPos: integer;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Input := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_vae_tiled_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    Cases := TJSONArray(TJSONObject(RefRoot).Find('dupup_cases'));
+    AssertEquals('oracle DupUp cases', 5, Cases.Count);
+    MaxCasePos := Cases.Count - 1;
+    for CasePos := 0 to MaxCasePos do
+    begin
+      CaseObj := Cases.Items[CasePos];
+      LoadOracleImageTensor(CaseObj, 'input', Input);
+      LoadOracleImageTensor(CaseObj, 'output', Expected);
+      NN := TNNet.Create();
+      try
+        NN.AddLayer(TNNetInput.Create(Input.SizeX, Input.SizeY, Input.Depth));
+        AddQwenImage21DupUp(NN, NN.Layers[0],
+          TJSONObject(CaseObj).Get('out_channels', 0),
+          TJSONObject(CaseObj).Get('factor_t', 0));
+        NN.Compute(Input);
+        AssertEquals('DupUp case ' + IntToStr(CasePos) + ' output width',
+          Expected.SizeX, NN.GetLastLayer().Output.SizeX);
+        AssertEquals('DupUp case ' + IntToStr(CasePos) + ' output depth',
+          Expected.Depth, NN.GetLastLayer().Output.Depth);
+        AssertEquals('DupUp case ' + IntToStr(CasePos) + ' vs diffusers', 0,
+          MaxAbsVolumeDiff(NN.GetLastLayer().Output, Expected), 0);
+      finally
+        NN.Free;
+      end;
+    end;
+    // up_blocks.0/1 (1152 -> 1152, factor_t 2): every 2x2 block is channel c.
+    // up_blocks.2 (1152 -> 576, factor_t 2): channel 2c+1, the last temporal
+    // copy. up_blocks.3 (576 -> 288, factor_t 1): channel 2c + y offset.
+    Channels := QwenImage21DupUpChannels(1152, 1152, 2);
+    for ChannelPos := 0 to 1151 do
+      for OffsetPos := 0 to 3 do
+        AssertEquals('1152->1152', ChannelPos,
+          Channels[ChannelPos * 4 + OffsetPos]);
+    Channels := QwenImage21DupUpChannels(1152, 576, 2);
+    for ChannelPos := 0 to 575 do
+      for OffsetPos := 0 to 3 do
+        AssertEquals('1152->576', 2 * ChannelPos + 1,
+          Channels[ChannelPos * 4 + OffsetPos]);
+    Channels := QwenImage21DupUpChannels(576, 288, 1);
+    for ChannelPos := 0 to 287 do
+      for OffsetPos := 0 to 3 do
+        AssertEquals('576->288', 2 * ChannelPos + (OffsetPos mod 2),
+          Channels[ChannelPos * 4 + OffsetPos]);
+  finally
+    Expected.Free;
+    Input.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// The pico checkpoint carries the real tensor set. The loader must consume
+// every decoder tensor except the 3 x 2 time_conv ones, allocate nothing for
+// those, and refuse both a missing and an unused tensor.
+procedure TTestNeuralPretrained.TestQwenImage21VaeDecoderTensorSet;
+const
+  WeightsFile = 'tiny_qwenimage21/vae/diffusion_pytorch_model.safetensors';
+var
+  Decoder: TQwenImage21VaeDecoder;
+  Reader: TNNetSafeTensorsReader;
+  Config: TQwenImage21VaeConfig;
+  TensorName: string;
+  TensorPos, MaxTensorPos: integer;
+  ExpectedWeights, TimeConvTensors: int64;
+  Failed: boolean;
+begin
+  Decoder := nil;
+  Reader := nil;
+  try
+    Config := ReadQwenImage21VaeConfig(
+      FixturePath('tiny_qwenimage21/vae/config.json'));
+    AssertEquals('z_dim', 16, Config.ZDim);
+    AssertEquals('decoder widths', 24, Config.DecoderDims[0]);
+    AssertEquals('last decoder width', 3, Config.DecoderDims[5]);
+    AssertTrue('up_blocks.0 is upsample3d', Config.TemporalUpsample[0]);
+    AssertFalse('up_blocks.3 is upsample2d', Config.TemporalUpsample[3]);
+    Reader := TNNetSafeTensorsReader.Create(FixturePath(WeightsFile));
+    ExpectedWeights := 0;
+    TimeConvTensors := 0;
+    MaxTensorPos := Reader.Count - 1;
+    for TensorPos := 0 to MaxTensorPos do
+    begin
+      TensorName := Reader.TensorName(TensorPos);
+      if (Pos('decoder.', TensorName) <> 1) and
+         (Pos('post_quant_conv.', TensorName) <> 1) then continue;
+      if Pos('.time_conv.', TensorName) > 0 then Inc(TimeConvTensors)
+      else if Pos('.bias', TensorName) = 0 then
+        Inc(ExpectedWeights, Reader.ElementCount(TensorName));
+    end;
+    AssertEquals('time_conv tensors in the checkpoint', 6, TimeConvTensors);
+    Decoder := TQwenImage21VaeDecoder.CreateFromReader(Reader, Config);
+    AssertEquals('time_conv tensors skipped', 6, Decoder.SkippedTensorCount);
+    AssertEquals('weights allocated = checkpoint minus time_conv',
+      ExpectedWeights, Decoder.WeightOwner.CountWeights());
+    Decoder.PrepareNet(3, 2);
+    AssertEquals('the sized net borrows every weight', 0,
+      Decoder.Net.CountWeights());
+    AssertEquals('the sized net output', 48, Decoder.Net.GetLastLayer().Output.SizeX);
+    FreeAndNil(Decoder);
+    Reader.RenameTensor('decoder.up_blocks.0.upsampler.time_conv.weight',
+      'decoder.up_blocks.0.upsampler.extra.weight');
+    Failed := false;
+    try
+      TQwenImage21VaeDecoder.CreateFromReader(Reader, Config).Free;
+    except
+      on EPretrainedImportError do Failed := true;
+    end;
+    AssertTrue('an unused decoder tensor is refused', Failed);
+    Reader.RenameTensor('decoder.up_blocks.0.upsampler.extra.weight',
+      'decoder.up_blocks.0.upsampler.time_conv.weight');
+    Reader.RenameTensor('decoder.norm_out.gamma', 'decoder.norm_out.scale');
+    Failed := false;
+    try
+      TQwenImage21VaeDecoder.CreateFromReader(Reader, Config).Free;
+    except
+      on EPretrainedImportError do Failed := true;
+    end;
+    AssertTrue('a missing decoder tensor is refused', Failed);
+  finally
+    Decoder.Free;
+    Reader.Free;
+  end;
+end;
+
+// Pico decoder vs the float64 diffusers oracle (F32 weights, float32
+// compute): the 2x3 latent before and after the clamp, then the 4x4 one.
+// Hidden activations grow to |x| ~ 41 by up_blocks.4 and the float32 error
+// grows with them (~1.4e-6 relative there); outputs are |x| <= 0.7. Measured
+// max |diff|: 1.3e-5 (2x3), 2.1e-6 (4x4); tolerance 5e-5.
+procedure TTestNeuralPretrained.TestQwenImage21VaeDecoderParity;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Decoder: TQwenImage21VaeDecoder;
+  Latent, Expected, Image: TNNetVolume;
+  MaxDiff: double;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Decoder := nil;
+  Latent := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  try
+    Decoder := TQwenImage21VaeDecoder.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/vae/config.json')));
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_vae_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    AssertEquals('diffusers ran time_conv', 0,
+      TJSONObject(RefRoot).Get('time_conv_calls_during_decode', -1));
+    LoadOracleImageTensor(RefRoot, 'latents_normalized', Latent);
+    AssertEquals('latent width', 3, Latent.SizeX);
+    Decoder.Decode(Latent, Image);
+    LoadOracleImageTensor(RefRoot, 'decoder_raw', Expected);
+    MaxDiff := MaxAbsVolumeDiff(Decoder.Net.GetLastLayer().Output, Expected);
+    AssertTrue('raw decoder output: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 5e-5', MaxDiff < 5e-5);
+    LoadOracleImageTensor(RefRoot, 'decoded', Expected);
+    AssertEquals('image width', 48, Image.SizeX);
+    AssertEquals('image height', 32, Image.SizeY);
+    AssertEquals('RGBA', 4, Image.Depth);
+    MaxDiff := MaxAbsVolumeDiff(Image, Expected);
+    AssertTrue('clamped image: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 5e-5', MaxDiff < 5e-5);
+    RefRoot.Free;
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_vae_tiled_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    LoadOracleImageTensor(RefRoot, 'latents_normalized', Latent);
+    LoadOracleImageTensor(RefRoot, 'decoded_whole', Expected);
+    Decoder.Decode(Latent, Image);
+    MaxDiff := MaxAbsVolumeDiff(Image, Expected);
+    AssertTrue('64x64 image: max |diff| = ' + FloatToStr(MaxDiff) +
+      ' must be < 5e-5', MaxDiff < 5e-5);
+  finally
+    Image.Free;
+    Expected.Free;
+    Latent.Free;
+    Decoder.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+
+// DecodeTiled vs diffusers' tiled_decode on the 4x4 latent at two tilings:
+// 32-pixel tiles every 16 (four tile shapes, 1-latent edge tiles) and 48
+// every 32. A latent no larger than one tile takes the plain decode. Same
+// float32 budget as TestQwenImage21VaeDecoderParity (measured 3.5e-6, 6.0e-6).
+procedure TTestNeuralPretrained.TestQwenImage21VaeDecoderTiledParity;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Tilings: TJSONArray;
+  TilingObj: TJSONObject;
+  Decoder: TQwenImage21VaeDecoder;
+  Latent, Expected, Image: TNNetVolume;
+  TilingPos, MaxTilingPos: integer;
+  MaxDiff: double;
+begin
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Decoder := nil;
+  Latent := TNNetVolume.Create;
+  Expected := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  try
+    Decoder := TQwenImage21VaeDecoder.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/vae/config.json')));
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_vae_tiled_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    LoadOracleImageTensor(RefRoot, 'latents_normalized', Latent);
+    Tilings := TJSONArray(TJSONObject(RefRoot).Find('tilings'));
+    AssertEquals('oracle tilings', 2, Tilings.Count);
+    MaxTilingPos := Tilings.Count - 1;
+    for TilingPos := 0 to MaxTilingPos do
+    begin
+      TilingObj := TJSONObject(Tilings.Items[TilingPos]);
+      LoadOracleImageTensor(TilingObj, 'decoded', Expected);
+      Decoder.DecodeTiled(Latent, Image, TilingObj.Get('tile_sample_size', 0),
+        TilingObj.Get('tile_sample_stride', 0));
+      MaxDiff := MaxAbsVolumeDiff(Image, Expected);
+      AssertTrue('tiling ' + IntToStr(TilingPos) + ': max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 5e-5', MaxDiff < 5e-5);
+    end;
+    LoadOracleImageTensor(RefRoot, 'decoded_whole', Expected);
+    Decoder.DecodeTiled(Latent, Image, 64, 48);
+    MaxDiff := MaxAbsVolumeDiff(Image, Expected);
+    AssertTrue('one-tile latent = whole decode: max |diff| = ' +
+      FloatToStr(MaxDiff) + ' must be < 5e-5', MaxDiff < 5e-5);
+  finally
+    Image.Free;
+    Expected.Free;
+    Latent.Free;
+    Decoder.Free;
+    RefRoot.Free;
+    RefJson.Free;
   end;
 end;
 

@@ -1832,10 +1832,11 @@ rather than acted on.
         32 blocks in one TNNet would need ~64 GB of activations at 1024x1024 (~2 GB
         per block at N=4096). One code path for every image size.
         Done: class `TQwenImage21Transformer` (weight store `BlockStore[i]`, `SelectBlockWeights` re-links via `TNNet.LinkWeightsFrom`, `EncodePrefix`, `PredictVelocity`, `qiwFP32/qiwInt8/qiwInt4`), `QwenImage21SetRopePositions`; `TNNetLayer.LinkWeightsFrom` may re-link; tests `TestQwenImage21Transformer*`.
-  - [ ] A6. VAE decoder: first check whether image decode ever runs `time_conv`;
+  - [x] A6. VAE decoder: first check whether image decode ever runs `time_conv`;
         channel RMSNorm, DupUp shortcuts, mid attention, latent de-normalisation,
         tiled decode (2048x2048 full-resolution activations are ~2.4 GB each). Pico
         parity. Independent.
+        Done: class `TQwenImage21VaeDecoder` (1x1-latent weight owner + borrowing sized net; `Decode`, `DecodeTiled` = diffusers tiled_decode), `ReadQwenImage21VaeConfig`, `BuildQwenImage21VaeDecoderNet`, `LoadQwenImage21VaeDecoderWeights` (skips time_conv, folds latents_mean/std into post_quant_conv), `QwenImage21DupUpChannels` + `AddQwenImage21DupUp`; conv kernels now clamp to the PADDED input; tests `TestQwenImage21Vae*`. Real-size activations (weights 1.01 GB): 0.58 GB at 64x64, ~9.3 GB at 256x256 (one default tile), ~149 GB untiled at 1024x1024, ~73% of it per-conv im2col/pad/raw buffers.
   - [ ] A7. Pipeline + `examples/QwenImage` CLI: read the `model_index.json` folder,
         tokenize, encode, free the text encoder, denoise, decode, save PNG WITH ALPHA
         (check that `SaveImageFromVolumeIntoFile` writes RGBA). `--width --height

@@ -106117,8 +106117,10 @@ end;
 procedure TNNetConvolutionAbstract.SetPrevLayer(pPrevLayer: TNNetLayer);
 begin
   inherited SetPrevLayer(pPrevLayer);
-  FFeatureSizeX := Min(FFeatureSizeX, pPrevLayer.Output.SizeX);
-  FFeatureSizeY := Min(FFeatureSizeY, pPrevLayer.Output.SizeY);
+  // A kernel only has to fit the PADDED input: a 3x3 pad-1 conv on a 1x1 input
+  // keeps its 3x3 weights, as in PyTorch.
+  FFeatureSizeX := Min(FFeatureSizeX, pPrevLayer.Output.SizeX + 2 * FPadding);
+  FFeatureSizeY := Min(FFeatureSizeY, pPrevLayer.Output.SizeY + 2 * FPadding);
   SetNumWeightsForAllNeurons(FFeatureSizeX, FFeatureSizeY, pPrevLayer.Output.Depth);
   FFeatureSizeYMinus1 := FFeatureSizeY - 1;
   FFeatureSizeXMinus1 := FFeatureSizeX - 1;
