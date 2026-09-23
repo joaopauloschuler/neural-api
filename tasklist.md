@@ -1752,21 +1752,99 @@ rather than acted on.
   - [ ] timm naming variant.
   - [ ] downsample-in-first-stage=true real configs (code handles it, untested
         on a real ckpt).
-- [ ] Qwen-Image text-to-image MMDiT importer (`BuildQwenImageFromSafeTensors[Ex]`,
-      Qwen/Qwen-Image, model_type `qwen_image`). The 2025 flagship open text-to-image
-      model: a Qwen2.5-VL text encoder (LANDED — `BuildQwen2VL`-family) feeds an
-      MMDiT-style double-stream diffusion transformer over packed VAE latents, with a
-      16-channel VAE decoder (the landed `BuildVaeDecoder` path) producing the image.
-      Almost entirely a wiring job over already-landed pieces: the MMDiT joint-attention
-      blocks (the SD3/FLUX `MMDiT` task's building blocks), the landed
-      `TNNetDiffusionScheduler` (flow-matching/Euler sampling already supported), the
-      VAE decoder and the Qwen2.5-VL prompt encoder. New work is the config-driven
-      block stacking + the modulation (AdaLN-Zero) timestep/text conditioning wiring and
-      the 2-D RoPE over latent patches. Pico fixture + `TestQwenImage*Parity` < 1e-4 vs a
-      float64 HF `QwenImagePipeline` transformer forward on a fixed latent/text pair.
-      Real value: a current state-of-the-art open text-to-image generator runnable as a
-      single native binary, reusing the diffusion + VAE + Qwen-VL infrastructure already
-      in the repo.
+- [ ] Qwen-Image-2.1 text-to-image and image editing (Qwen/Qwen-Image-2.1, diffusers
+      `QwenImage21Pipeline`, Qwen Research License). Target: Phase A (text-to-image)
+      first, 1024x1024 on the OpenCL GPU box, branch a19; B and C are recorded, not
+      scheduled. One Opus agent per task, run serially, test + commit after each.
+      Reference: diffusers `transformer_qwenimage21.py`, `autoencoder_kl_qwenimage21.py`,
+      `pipelines/qwenimage21/pipeline_qwenimage21.py` (merged 2026-09-18).
+      Checkpoint facts (from the configs and safetensors headers):
+      - text encoder `text_encoder/`: Qwen3-VL-8B (`qwen3_vl`). Text part = Qwen3 dense
+        decoder, 36 layers, hidden 4096, 32 q / 8 kv heads, head_dim 128, per-head QK
+        RMSNorm, rope_theta 5e6, interleaved M-RoPE [24,20,20]. For a text-only prompt
+        the three M-RoPE positions are equal, so it reduces to plain 1D RoPE. The
+        transformer reads the LAST decoder layer's output BEFORE the final RMSNorm
+        (diffusers hooks the norm away), minus the system-prompt tokens (drop_idx =
+        tokenized length of the system message). Prompt template:
+        `<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n
+        <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n`.
+      - transformer `transformer/`: 7B, BF16, 2 shards, NO biases anywhere. 32
+        SINGLE-stream blocks, dim 4096, 32 heads x 128, SwiGLU 12288 (`gate_layer`,
+        `proj`, `out`). Block: non-affine LayerNorm -> x(1+scale) -> attention (QK
+        RMSNorm, 3-axis RoPE) -> residual with tanh(gate); same again for the MLP.
+        ONE shared `modulation` Linear 4096->16384 (scale1, gate1, scale2, gate2) feeds
+        every block. `txt_in` = zero-centred RMSNorm (stored weight-1) -> Linear ->
+        GELU-tanh -> Linear. `img_in` Linear 64->4096. `norm_out` = non-affine LayerNorm
+        x (1+scale), no shift. `proj_out` 4096->64. Timestep embedding: t in [0,1] x
+        1000, cos half FIRST then sin, dim 256 -> Linear -> SiLU -> Linear.
+      - attention mask: block-causal, `(q >= kv) or same_image_block`. With
+        `causal_condition`, text and condition-image tokens take modulation from t=0,
+        so their K/V are step-independent: the pipeline computes them once (extract)
+        and later steps run only the target-image tokens against the cached prefix
+        (cached). RoPE: axes (frame, h, w) = (16, 56, 56) dims, theta 10000,
+        consecutive-pair (complex) layout; text tokens get position p on all 3 axes;
+        an image block gets frame = position after the preceding text and an (h, w)
+        grid centred on zero (negative indices allowed).
+      - VAE `vae/` (`AutoencoderKLQwenImage21`, F32): 2D for images (all conv weights
+        [out,in,3,3]) despite the Wan-style names. RGBA in/out, z_dim 64, 16x spatial.
+        Encoder base 96, decoder base 144 (up to 1152 channels). Channel RMSNorm
+        (F.normalize x sqrt(C) x gamma), SiLU, residual AvgDown/DupUp shortcuts,
+        nearest-exact upsample + conv, single-head mid-block attention. Latents are
+        de-normalised with 64 `latents_mean` / `latents_std` values before decode.
+      - scheduler: `FlowMatchEulerDiscreteScheduler`, sigmas = linspace(1, 1/N, N),
+        exponential dynamic shift, mu linear in image token count (256 -> 0.5,
+        8192 -> 0.9), `shift_terminal` 0.02; x += (sigma_next - sigma) * v. Guidance
+        `true_cfg_scale` defaults to 1.0 (off): one transformer pass per step. Default
+        40 steps.
+      - cost: 1024x1024 = 4096 image tokens, ~66 TFLOP per step, ~2.6 PFLOP for 40
+        steps (2048x2048 ~6x more). Compute-bound GEMM, not decode GEMV. int8:
+        transformer ~7 GB, text encoder ~8 GB, loaded one after the other.
+  Phase A — text-to-image, correctness first:
+  - [ ] A0. Parity oracle: install diffusers (git main) + transformers >= 5.17 into
+        the `x` venv; a script that builds tiny random-weight versions of each
+        component and writes float64 inputs/outputs to `tests/fixtures/`.
+  - [ ] A1. Flow-matching Euler scheduler in `neuraldiffusion.pas` (decide: extend
+        `TNNetDiffusionScheduler` or a new class): dynamic exponential shift,
+        `shift_terminal`, velocity step. JSON oracle test. Independent.
+  - [ ] A2. Qwen3-VL text encoder as prompt encoder: route `qwen3_vl` to the Qwen3
+        builder (`model.language_model.` prefix, skip `model.visual.*` and `lm_head`,
+        int8 load); test that text-only interleaved M-RoPE equals 1D RoPE; API returning
+        pre-final-norm last-layer hidden states; template + tokenization + drop_idx.
+  - [ ] A3. Qwen-Image RoPE: extend `TNNetMRotaryEmbedding` for the consecutive-pair
+        layout, 16/56/56 sections and negative positions; position builder (text
+        0..L-1, image frame = L, centred h/w grid).
+  - [ ] A4. Transformer block, step pass: image-token queries attend (no causal mask)
+        to [cached prefix K/V ; own K/V]. Reuse `TNNetHeadRMSNorm`, `TNNetLayerNorm`,
+        `TNNetFiLM` / `TNNetChannelMulByLayer`, the fused SDPA KV cache and batched
+        prefill where they fit; fold the zero-centred +1 into the RMSNorm weight at
+        load. Single-block parity vs HF.
+  - [ ] A5. `BuildQwenImage21Transformer`: a PREFIX network (text tokens, causal, t=0
+        modulation, emits per-layer K/V) and a STEP network (target tokens); timestep
+        embedding, shared modulation computed once per step, `norm_out`, `proj_out`;
+        sharded diffusers-folder loader. Parity vs HF extract and cached modes.
+        Depends on A3 + A4.
+  - [ ] A6. VAE decoder: first check whether image decode ever runs `time_conv`;
+        channel RMSNorm, DupUp shortcuts, mid attention, latent de-normalisation,
+        tiled decode (2048x2048 full-resolution activations are ~2.4 GB each). Pico
+        parity. Independent.
+  - [ ] A7. Pipeline + `examples/QwenImage` CLI: read the `model_index.json` folder,
+        tokenize, encode, free the text encoder, denoise, decode, save PNG WITH ALPHA
+        (check that `SaveImageFromVolumeIntoFile` writes RGBA). `--width --height
+        --steps --seed --int8/--int4 --opencl`. End-to-end pico parity with fixed
+        initial latents (torch RNG is not reproducible).
+  - [ ] A8. Docs: README entry marked "planned (coded)" until a user-tested real run.
+  Phase B — speed (after a first real measurement on the GPU box):
+  - [ ] B1. OpenCL for the step pass: GEMM projections (4096 x 4096 activations) and
+        a tiled non-causal SDPA over ~4096 queries x (4096 + L) keys.
+  - [ ] B2. VAE decode speed: 3x3 convolutions at 1152 channels.
+  - [ ] B3. Optional guidance (negative prompt) with its own prefix cache.
+  Phase C — editing and reference images:
+  - [ ] C1. Qwen3-VL vision tower: 27-layer ViT, patch 16, 2x2 merge, DeepStack
+        features from layers 8/16/24 injected into the LLM (likely 2 tasks).
+  - [ ] C2. VAE encoder.
+  - [ ] C3. Edit pipeline: condition-image latents in the prefix, bidirectional
+        within each image block; `<image1>` template; RoPE for several image blocks;
+        up to 10 reference images.
 
 ## OpenCL forward coverage — layers still on the host
 
