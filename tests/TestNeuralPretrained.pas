@@ -23,7 +23,7 @@ uses
   neuralvolume, neuralnetwork, neuralsafetensors, neuraltorchbin,
   neuralgguf, neuralmxfp4, neuralnf4, neuralpretrained, neuralhftokenizer, neuralaudio,
   neuralchatengine, neuralchat,
-  neuraldecode, neuraldiffusion;
+  neuraldecode, neuraldiffusion, neuralthread;
 
 type
   // One greedy chat turn through TChatEngine, as the --prefill-window parity
@@ -726,6 +726,7 @@ type
     procedure TestQwenImage21PipelineImageSideRounding;
     procedure TestQwenImage21PipelineSeededLatents;
     procedure TestQwen3VLEncodeRefusesOutOfVocabIds;
+    procedure TestQwenImage21ParallelMatchesSerial;
     procedure TestQwen2AudioConfigFromJSONFile;
     procedure TestQwen2AudioParity;
     procedure TestViTConfigFromJSONFile;
@@ -26539,6 +26540,89 @@ end;
 
 // MakeInitialLatents: (tokens,1,in_channels), repeatable per seed, different
 // across seeds, roughly standard normal, and the global RandSeed restored.
+// The parallel layer scheduler (with intra-layer threading) gives the serial
+// results bit for bit: text encoder, transformer prefix + step, VAE decode.
+procedure TTestNeuralPretrained.TestQwenImage21ParallelMatchesSerial;
+const
+  TokenIds: array[0..13] of integer = (11, 48, 85, 122, 159, 196, 233, 270,
+    7, 44, 81, 118, 155, 192);
+  GridH = 4;
+  GridW = 4;
+var
+  Encoder: TNNet;
+  Config: TQwen3VLConfig;
+  Transformer: TQwenImage21Transformer;
+  Decoder: TQwenImage21VaeDecoder;
+  EmbedsSerial, EmbedsParallel, Latents, VelocitySerial, VelocityParallel,
+    LatentImage, ImageSerial, ImageParallel: TNNetVolume;
+begin
+  EmbedsSerial := TNNetVolume.Create;
+  EmbedsParallel := TNNetVolume.Create;
+  Latents := TNNetVolume.Create(GridH * GridW, 1, 16);
+  VelocitySerial := TNNetVolume.Create;
+  VelocityParallel := TNNetVolume.Create;
+  LatentImage := TNNetVolume.Create(GridW, GridH, 16);
+  ImageSerial := TNNetVolume.Create;
+  ImageParallel := TNNetVolume.Create;
+  Encoder := nil;
+  Transformer := nil;
+  Decoder := nil;
+  try
+    Encoder := BuildQwen3VLTextEncoderFromSafeTensors(
+      FixturePath('tiny_qwenimage21/text_encoder/model.safetensors'), Config,
+      {pSeqLen=}Length(TokenIds));
+    Qwen3VLEncodeHiddenStates(Encoder, Config, TokenIds, 5, EmbedsSerial,
+      {Parallel=}false);
+    PrepareInferenceThreads(Encoder, true, 0);
+    Qwen3VLEncodeHiddenStates(Encoder, Config, TokenIds, 5, EmbedsParallel,
+      {Parallel=}true);
+    AssertEquals('text encoder', 0, MaxAbsVolumeDiff(EmbedsSerial,
+      EmbedsParallel), 0);
+
+    RandSeed := 7;
+    Latents.RandomizeGaussian();
+    Transformer := TQwenImage21Transformer.Create(
+      QwenImage21TransformerFolder());
+    Transformer.Parallel := false;
+    Transformer.EncodePrefix(EmbedsSerial);
+    Transformer.PredictVelocity(Latents, 0.5, GridH, GridW, VelocitySerial);
+    FreeAndNil(Transformer);
+    Transformer := TQwenImage21Transformer.Create(
+      QwenImage21TransformerFolder());
+    AssertTrue('parallel by default', Transformer.Parallel);
+    Transformer.EncodePrefix(EmbedsSerial);
+    Transformer.PredictVelocity(Latents, 0.5, GridH, GridW, VelocityParallel);
+    if NeuralDefaultThreadCount > 1 then
+      AssertTrue('the step net ran the parallel scheduler',
+        Transformer.StepNet.SchedulerWorkerCount() > 1);
+    AssertEquals('transformer velocity', 0, MaxAbsVolumeDiff(VelocitySerial,
+      VelocityParallel), 0);
+
+    LatentImage.RandomizeGaussian();
+    Decoder := TQwenImage21VaeDecoder.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/vae/config.json')));
+    Decoder.Parallel := false;
+    Decoder.Decode(LatentImage, ImageSerial);
+    Decoder.ReleaseNet();
+    Decoder.Parallel := true;
+    Decoder.Decode(LatentImage, ImageParallel);
+    AssertEquals('VAE decode', 0, MaxAbsVolumeDiff(ImageSerial,
+      ImageParallel), 0);
+  finally
+    Decoder.Free;
+    Transformer.Free;
+    Encoder.Free;
+    ImageParallel.Free;
+    ImageSerial.Free;
+    LatentImage.Free;
+    VelocityParallel.Free;
+    VelocitySerial.Free;
+    Latents.Free;
+    EmbedsParallel.Free;
+    EmbedsSerial.Free;
+  end;
+end;
+
 procedure TTestNeuralPretrained.TestQwenImage21PipelineSeededLatents;
 var
   Pipeline: TQwenImage21Pipeline;

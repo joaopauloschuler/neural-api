@@ -18,6 +18,7 @@ USAGE
   QwenImage --model DIR [--prompt TEXT] [--output FILE.png]
             [--width 1024] [--height 1024] [--steps 40] [--seed 42]
             [--int8 | --int4] [--int8-input] [--vae-tile SIZE[,STRIDE]]
+            [--serial] [--max-threads N]
             [--token-ids ID,ID,... --drop-count N]
 Run with --help for what each flag does.
 
@@ -37,7 +38,7 @@ uses
   // FPC then pulls in cmem itself, so naming it here is a duplicate.
   {$IFDEF UNIX}cthreads, {$IFNDEF Debug}cmem,{$ENDIF}{$ENDIF}
   SysUtils, Classes,
-  neuralvolume, neuralnetwork, neuralpretrained, neuraldatasets;
+  neuralvolume, neuralnetwork, neuralpretrained, neuraldatasets, neuralthread;
 
 const
   csDefaultPrompt = 'A capybara wearing a wizard hat, reading a book by ' +
@@ -169,6 +170,10 @@ begin
     'int8/int4 projections (needs --int8 or --int4)');
   WriteLn('  --vae-tile S[,T]     VAE tile S pixels every T pixels, multiples ',
     'of 16 (default 128,96)');
+  WriteLn('  --serial             single-threaded forward passes (default: ',
+    'the parallel layer scheduler with intra-layer threading)');
+  WriteLn('  --max-threads N      cap the parallel forward at N worker threads ',
+    '(default: every CPU thread)');
   WriteLn('  --token-ids LIST     comma-separated prompt token ids instead of ',
     '--prompt (no processor/ needed)');
   WriteLn('  --drop-count N       leading system-prompt tokens to drop with ',
@@ -199,8 +204,8 @@ var
   ModelFolder, Prompt, OutputFile, TokenList, Arg, TileArg: string;
   Width, Height, StepCount, DropCount, ArgPos, CommaPos: integer;
   Seed: cardinal;
-  UseInt8, UseInt4, UseInt8Input: boolean;
-  VaeTileSize, VaeTileStride: integer;
+  UseInt8, UseInt4, UseInt8Input, UseSerial: boolean;
+  VaeTileSize, VaeTileStride, MaxThreads: integer;
   Pipeline: TQwenImage21Pipeline;
   Reporter: TQwenImageReporter;
   PromptEmbeds, Image: TNNetVolume;
@@ -231,6 +236,8 @@ begin
   UseInt8 := false;
   UseInt4 := false;
   UseInt8Input := false;
+  UseSerial := false;
+  MaxThreads := 0;
   VaeTileSize := 128;
   VaeTileStride := 96;
   ArgPos := 1;
@@ -247,6 +254,8 @@ begin
     else if Arg = '--int8' then UseInt8 := true
     else if Arg = '--int4' then UseInt4 := true
     else if Arg = '--int8-input' then UseInt8Input := true
+    else if Arg = '--serial' then UseSerial := true
+    else if Arg = '--max-threads' then MaxThreads := StrToInt(NextArg())
     else if Arg = '--token-ids' then TokenList := NextArg()
     else if Arg = '--drop-count' then DropCount := StrToInt(NextArg())
     else if Arg = '--vae-tile' then
@@ -292,6 +301,11 @@ begin
     WriteLn('--int8-input needs --int8 or --int4.');
     Halt(2);
   end;
+  if MaxThreads < 0 then
+  begin
+    WriteLn('--max-threads: must be at least 1.');
+    Halt(2);
+  end;
 
   StartTime := GetTickCount64;
   Reporter := TQwenImageReporter.Create();
@@ -307,6 +321,8 @@ begin
     Pipeline.Int8Input := UseInt8Input;
     Pipeline.VaeTileSize := VaeTileSize;
     Pipeline.VaeTileStride := VaeTileStride;
+    Pipeline.Parallel := not UseSerial;
+    Pipeline.MaxThreads := MaxThreads;
     Pipeline.OnPhase := @Reporter.OnPhase;
     Pipeline.OnStep := @Reporter.OnStep;
     Width := TQwenImage21Pipeline.RoundDownImageSide(Width);
@@ -319,6 +335,11 @@ begin
       WriteLn('Weights    : transformer int4, text encoder int8')
     else WriteLn('Weights    : FP32');
     WriteLn('VAE tiles  : ', VaeTileSize, ' px every ', VaeTileStride, ' px');
+    if UseSerial then WriteLn('Threads    : serial (single-threaded)')
+    else if MaxThreads > 0 then
+      WriteLn('Threads    : parallel, at most ', MaxThreads, ' workers')
+    else WriteLn('Threads    : parallel, every CPU thread (',
+      NeuralDefaultThreadCount, ')');
     if TokenList <> '' then
     begin
       TokenIds := ParseTokenIds(TokenList);

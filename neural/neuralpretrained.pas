@@ -8621,7 +8621,12 @@ function BuildQwen3VLTextEncoderFromSafeTensors(const FileName: string;
 // exact) and returns rows DropCount.. as (Length(TokenIds)-DropCount,1,hidden).
 procedure Qwen3VLEncodeHiddenStates(Encoder: TNNet;
   const Config: TQwen3VLConfig; const TokenIds: array of integer;
-  DropCount: integer; HiddenStates: TNNetVolume);
+  DropCount: integer; HiddenStates: TNNetVolume; Parallel: boolean = false);
+
+// Caps NN's worker pool at MaxThreads (0 = every CPU thread) and starts it, so
+// repeated parallel passes reuse the workers; does nothing when not Parallel.
+procedure PrepareInferenceThreads(NN: TNNet; Parallel: boolean;
+  MaxThreads: integer);
 
 // The Qwen-Image-2.1 text-to-image ChatML prompt (system message, user Prompt,
 // assistant opener); an empty Prompt becomes ' ' as in the diffusers pipeline.
@@ -8741,6 +8746,8 @@ type
     FPrefixKeys, FPrefixValues: array of TNNetVolume;
     FPrefixLength: integer;
     FStepGridH, FStepGridW: integer;
+    FParallel: boolean;
+    FMaxThreads: integer;
     procedure BuildBlockNet(NN: TNNet; TokenCount: integer;
       Mode: TQwenImage21BlockMode; PrefixCapacity: integer;
       out Block: TQwenImage21BlockLayers);
@@ -8792,6 +8799,11 @@ type
     property PrefixLength: integer read FPrefixLength;
     property TimestepEmbedding: TNNetVolume read GetTimestepEmbedding;
     property Modulation: TNNetVolume read GetModulation;
+    // Prefix and step blocks run the parallel layer scheduler with intra-layer
+    // threading (default true); set both before EncodePrefix.
+    property Parallel: boolean read FParallel write FParallel;
+    // Worker cap for those passes; 0 = every CPU thread.
+    property MaxThreads: integer read FMaxThreads write FMaxThreads;
   end;
 
 type
@@ -8841,6 +8853,8 @@ type
     FNet: TNNet;
     FNetLatentW, FNetLatentH: integer;
     FSkippedTensorCount: integer;
+    FParallel: boolean;
+    FMaxThreads: integer;
     procedure LoadFromReader(Reader: TNNetSafeTensorsReader);
   public
     // Reads config.json and diffusion_pytorch_model.safetensors of VaeFolder.
@@ -8863,6 +8877,10 @@ type
     property Net: TNNet read FNet;
     // time_conv weights present in the checkpoint and not loaded.
     property SkippedTensorCount: integer read FSkippedTensorCount;
+    // Parallel layer scheduler with intra-layer threading (default true) and
+    // its worker cap (0 = every CPU thread); read when Net is (re)built.
+    property Parallel: boolean read FParallel write FParallel;
+    property MaxThreads: integer read FMaxThreads write FMaxThreads;
   end;
 
 const
@@ -8897,6 +8915,8 @@ type
     FTransformerFormat: TQwenImage21WeightFormat;
     FInt8Input, FTextEncoderInt8: boolean;
     FVaeTileSize, FVaeTileStride: integer;
+    FParallel: boolean;
+    FMaxThreads: integer;
     FOnPhase: TQwenImage21PhaseEvent;
     FOnStep: TQwenImage21StepEvent;
     procedure DoPhase(Phase: TQwenImage21PipelinePhase);
@@ -8952,6 +8972,10 @@ type
     // tile's activations near 2.3 GB.
     property VaeTileSize: integer read FVaeTileSize write FVaeTileSize;
     property VaeTileStride: integer read FVaeTileStride write FVaeTileStride;
+    // Every component runs the parallel layer scheduler with intra-layer
+    // threading (default true), capped at MaxThreads workers (0 = all).
+    property Parallel: boolean read FParallel write FParallel;
+    property MaxThreads: integer read FMaxThreads write FMaxThreads;
     property OnPhase: TQwenImage21PhaseEvent read FOnPhase write FOnPhase;
     property OnStep: TQwenImage21StepEvent read FOnStep write FOnStep;
   end;
@@ -68449,6 +68473,8 @@ var
   Reader: TNNetSafeTensorsReader;
 begin
   inherited Create();
+  FParallel := true;
+  FMaxThreads := 0;
   Folder := IncludeTrailingPathDelimiter(VaeFolder);
   FConfig := ReadQwenImage21VaeConfig(Folder + 'config.json');
   Reader := TNNetSafeTensorsReader.Create(Folder +
@@ -68464,6 +68490,8 @@ constructor TQwenImage21VaeDecoder.CreateFromReader(
   Reader: TNNetSafeTensorsReader; const Config: TQwenImage21VaeConfig);
 begin
   inherited Create();
+  FParallel := true;
+  FMaxThreads := 0;
   FConfig := Config;
   LoadFromReader(Reader);
 end;
@@ -68500,6 +68528,7 @@ begin
   FNet.BuildWeightOwner := FWeightOwner;
   BuildQwenImage21VaeDecoderNet(FNet, FConfig, LatentW, LatentH);
   FNet.BuildWeightOwner := nil;
+  PrepareInferenceThreads(FNet, FParallel, FMaxThreads);
   FNetLatentW := LatentW;
   FNetLatentH := LatentH;
 end;
@@ -68518,7 +68547,7 @@ begin
       IntToStr(Latent.Depth) + ' channels, expected z_dim = ' +
       IntToStr(FConfig.ZDim) + '.');
   PrepareNet(Latent.SizeX, Latent.SizeY);
-  FNet.Compute(Latent);
+  FNet.Compute(Latent, 0, FParallel);
   FNet.GetLastLayer().ForceOutputOnRAM();
   Image.Copy(FNet.GetLastLayer().Output);
   Image.ForceMaxRange(1.0);
@@ -68586,7 +68615,7 @@ begin
         LatentTile.CopyCropping(Latent,
           (ShapeTilePos mod ColumnCount) * TileLatentStride,
           (ShapeTilePos div ColumnCount) * TileLatentStride, TileW, TileH);
-        FNet.Compute(LatentTile);
+        FNet.Compute(LatentTile, 0, FParallel);
         FNet.GetLastLayer().ForceOutputOnRAM();
         Tiles[ShapeTilePos] := TNNetVolume.Create();
         Tiles[ShapeTilePos].Copy(FNet.GetLastLayer().Output);
@@ -81541,7 +81570,7 @@ end;
 
 procedure Qwen3VLEncodeHiddenStates(Encoder: TNNet;
   const Config: TQwen3VLConfig; const TokenIds: array of integer;
-  DropCount: integer; HiddenStates: TNNetVolume);
+  DropCount: integer; HiddenStates: TNNetVolume; Parallel: boolean);
 var
   Input: TNNetVolume;
   SeqLen, TokenCount, MaxTokenPos, TokenPos: integer;
@@ -81577,12 +81606,21 @@ begin
     Input.Fill(0);
     for TokenPos := 0 to MaxTokenPos do
       Input.FData[TokenPos] := TokenIds[TokenPos];
-    Encoder.Compute(Input);
+    Encoder.Compute(Input, 0, Parallel);
     HiddenStates.CopyCropping(Encoder.GetLastLayer().Output, DropCount, 0,
       TokenCount - DropCount, 1);
   finally
     Input.Free;
   end;
+end;
+
+procedure PrepareInferenceThreads(NN: TNNet; Parallel: boolean;
+  MaxThreads: integer);
+begin
+  if not Parallel then exit;
+  // Set before StartThreadWorkers: the pool is created at the capped size.
+  if MaxThreads > 0 then NN.MaxThreadNum := MaxThreads;
+  NN.StartThreadWorkers();
 end;
 
 function QwenImage21TextToImagePrompt(const Prompt: string): string;
@@ -82038,6 +82076,8 @@ begin
       'weights.');
   FWeightFormat := pWeightFormat;
   FInt8Input := pInt8Input;
+  FParallel := true;
+  FMaxThreads := 0;
   Folder := IncludeTrailingPathDelimiter(TransformerFolder);
   FConfig := ReadQwenImage21TransformerConfig(Folder + 'config.json');
   WeightsFile := SafeTensorsFolderWeightsFile(Folder,
@@ -82188,6 +82228,7 @@ begin
     BuildBlockNet(FPrefixNet, TokenCount, qibPrefix, 0, FPrefixBlock);
     FPrefixNet.BuildWeightOwner := nil;
     if FInt8Input then FPrefixNet.EnableInt8Input();
+    PrepareInferenceThreads(FPrefixNet, FParallel, FMaxThreads);
     BuildQwenImage21RopePositions([TokenCount], [], [], PosF, PosH, PosW);
     QwenImage21SetRopePositions(FPrefixNet, PosF, PosH, PosW);
     FPrefixLength := TokenCount;
@@ -82204,8 +82245,8 @@ begin
   begin
     SelectBlockWeights(FPrefixNet, BlockCnt);
     if BlockCnt < MaxBlockPos
-      then FPrefixNet.Compute(BlockInput)
-      else FPrefixNet.Compute(BlockInput, 0, false, LastBlockEndIdx);
+      then FPrefixNet.Compute(BlockInput, 0, FParallel)
+      else FPrefixNet.Compute(BlockInput, 0, FParallel, LastBlockEndIdx);
     FPrefixBlock.KRope.ForceOutputOnRAM();
     FPrefixBlock.VProj.ForceOutputOnRAM();
     FPrefixKeys[BlockCnt].Copy(FPrefixBlock.KRope.Output);
@@ -82238,6 +82279,7 @@ begin
   BuildBlockNet(FStepNet, TokenCount, qibStep, FPrefixLength, FStepBlock);
   FStepNet.BuildWeightOwner := nil;
   if FInt8Input then FStepNet.EnableInt8Input();
+  PrepareInferenceThreads(FStepNet, FParallel, FMaxThreads);
   FOutputNet := TNNet.Create();
   FOutputNet.BuildWeightOwner := FOutputOwner;
   BuildOutputNet(FOutputNet, TokenCount);
@@ -82284,7 +82326,7 @@ begin
         'block ' + IntToStr(BlockCnt) + ' cached ' +
         IntToStr(FStepBlock.Attn.CacheLength) + ' prefix rows, expected ' +
         IntToStr(FPrefixLength) + '.');
-    FStepNet.Compute(BlockInput);
+    FStepNet.Compute(BlockInput, 0, FParallel);
     BlockInput := FStepNet.GetLastLayer().Output;
   end;
   FOutputNet.Compute(BlockInput);
@@ -82357,6 +82399,8 @@ begin
   FTransformerFormat := qiwFP32;
   FVaeTileSize := 128;
   FVaeTileStride := 96;
+  FParallel := true;
+  FMaxThreads := 0;
 end;
 
 destructor TQwenImage21Pipeline.Destroy();
@@ -82426,13 +82470,14 @@ begin
     Config,
     Length(TokenIds), FTextEncoderInt8);
   try
+    PrepareInferenceThreads(Encoder, FParallel, FMaxThreads);
     if Config.Text.HiddenSize <> FTransformerConfig.ContextInDim then
       ImportError('TQwenImage21Pipeline: the text encoder hidden size ' +
         IntToStr(Config.Text.HiddenSize) + ' differs from the transformer''s ' +
         'context_in_dim ' + IntToStr(FTransformerConfig.ContextInDim) + '.');
     DoPhase(qppEncodePrompt);
     Qwen3VLEncodeHiddenStates(Encoder, Config, TokenIds, DropCount,
-      PromptEmbeds);
+      PromptEmbeds, FParallel);
   finally
     Encoder.Free;
   end;
@@ -82482,6 +82527,8 @@ begin
   try
     Transformer := TQwenImage21Transformer.Create(
       ComponentFolder('transformer'), FTransformerFormat, FInt8Input);
+    Transformer.Parallel := FParallel;
+    Transformer.MaxThreads := FMaxThreads;
     DoPhase(qppEncodePrefix);
     Transformer.EncodePrefix(PromptEmbeds);
     DoPhase(qppDenoise);
@@ -82521,6 +82568,8 @@ begin
   Vae := nil;
   try
     Vae := TQwenImage21VaeDecoder.Create(ComponentFolder('vae'));
+    Vae.Parallel := FParallel;
+    Vae.MaxThreads := FMaxThreads;
     // Token h * GridW + w is pixel (w, h) of a (GridW, GridH, C) volume.
     LatentImage.Copy(Latents);
     LatentImage.ReSize(GridW, GridH, Latents.Depth);
