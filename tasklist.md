@@ -1845,8 +1845,20 @@ rather than acted on.
         pico checkpoint on the dev box (extend the generator with a 64x64 case);
         real weights on the GPU box, a 256x256 smoke test first, then 1024x1024 and
         beyond, compared per step against diffusers with the same initial latents.
-        Done: class `TQwenImage21Pipeline` (neuralpretrained.pas: `TokenizePrompt`, `EncodeTokenIds`, `MakeInitialLatents`, `Denoise`, `DecodeLatents`, `GenerateFromEmbeds`, `Generate`, `RoundDownImageSide`, events `OnPhase`/`OnStep`), `TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfig` + `ShiftForImageSeqLen`, RGBA PNG in `SaveImageFromVolumeIntoFile` / `LoadImageIntoVolume(.., pWithAlpha)`; `examples/QwenImage` (`--model --prompt --output --width --height --steps --seed --int8|--int4 --int8-input --vae-tile S[,T] --token-ids --drop-count`, no `--opencl`); tests `TestQwenImage21Pipeline*`, `TestQwen3VLEncodeRefusesOutOfVocabIds`, `TestFlowMatchFromDiffusersConfig`, `TestSaveImageRGBAPngRoundTrip`; fixture `tiny_qwenimage21_pipeline_64_io.json`. Real weights NOT yet run.
-  - [ ] A8. Docs: README entry marked "planned (coded)" until a user-tested real run.
+        Done: class `TQwenImage21Pipeline` (neuralpretrained.pas: `TokenizePrompt`, `EncodeTokenIds`, `MakeInitialLatents`, `Denoise`, `DecodeLatents`, `GenerateFromEmbeds`, `Generate`, `RoundDownImageSide`, events `OnPhase`/`OnStep`), `TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfig` + `ShiftForImageSeqLen`, RGBA PNG in `SaveImageFromVolumeIntoFile` / `LoadImageIntoVolume(.., pWithAlpha)`; `examples/QwenImage` (`--model --prompt --output --width --height --steps --seed --int8|--int4 --int8-input --vae-tile S[,T] --token-ids --drop-count`, no `--opencl`); tests `TestQwenImage21Pipeline*`, `TestQwen3VLEncodeRefusesOutOfVocabIds`, `TestFlowMatchFromDiffusersConfig`, `TestSaveImageRGBAPngRoundTrip`; fixture `tiny_qwenimage21_pipeline_64_io.json`.
+        Follow-ups: `cthreads` in the example's uses clause (a26c3f72; without it the
+        first worker thread aborted with runtime error 232); parallel forward on every
+        core (74fa882d: `Parallel` / `MaxThreads` on the pipeline, transformer and VAE,
+        `PrepareInferenceThreads`, CLI `--serial` / `--max-threads N`; bit-identical to
+        serial). First real run (user, 2026-09-24, real Qwen/Qwen-Image-2.1, 12 threads):
+        256x256, `--int4`, 10 steps -> the image shows a fox. Step time 16.4 s int4,
+        34.3 s int8 (was ~162 s int8 single-threaded); load transformer 148 s int4 /
+        64 s int8; VAE decode 31 s.
+  - [ ] A8. Docs: README entry for Qwen-Image-2.1 text-to-image on the CPU, listed as
+        user-tested with the exact configuration (256x256, `--int4`, 10 steps, 2026-09-24).
+        Build line and binary path: `cd examples/QwenImage && lazbuild -B QwenImage.lpi`
+        writes `bin/x86_64-linux/bin/QwenImage` at the REPO ROOT (the A7 report gave a
+        path inside `examples/QwenImage`, which is wrong).
   - [ ] A9. Keep-loaded mode + REPL: `TQwenImage21Pipeline` gains `LoadComponents` /
         `UnloadComponents` so `Generate` reuses loaded weights (the one-shot CLI keeps
         today's load-and-free order). The text encoder is built once for a maximum
@@ -1857,9 +1869,24 @@ rather than acted on.
         `/tile SIZE[,STRIDE]`, `/quit`; print resident memory at startup. Test: two
         prompts through one loaded pipeline equal two one-shot runs (pico). Estimated
         resident at 1024x1024: ~19 GB int8, ~16 GB int4 (test boxes have 50-150 GB).
+        Removes the per-image loads measured on the first real run: text encoder
+        49-67 s, transformer 64 s int8 / 148 s int4.
   Phase B — speed (after a first real measurement on the GPU box):
+  - [ ] B0. CPU many-token int8/int4 projections. Evidence: at 256x256 a step is
+        34.3 s int8 and 16.4 s int4 (~2.1x, the weight-byte ratio), i.e. ~105 GFLOPS
+        and ~53 GB/s: the projections stream all ~7 GB of block weights once per
+        TOKEN instead of reusing each weight row across the 256 tokens. Step 1
+        (read-only): which kernel a many-token `TNNetPointwiseConvLinear` int8/int4
+        forward runs in inference-only low-memory mode, and whether the
+        `--prefill-window` batched path (27B TTFT 341 -> 53.9 s) can be reused; report
+        + proposed fix. Step 2: the fix, after approval. At 1024x1024 (16x the tokens)
+        today's rate is ~9 min per step.
   - [ ] B1. OpenCL for the step pass: GEMM projections (4096 x 4096 activations) and
-        a tiled non-causal SDPA over ~4096 queries x (4096 + L) keys.
+        a tiled non-causal SDPA over ~4096 queries x (4096 + L) keys. Constraints from
+        A4/A5: `SelectBlockWeights` refuses OpenCL today, so all 32 blocks' weights
+        must stay resident on the GPU (int8 ~7 GB) and the swap must select their
+        OpenCL buffers instead of re-uploading; `TNNetFusedSDPA.WillOpenCL` refuses
+        `CachedForwardNonCausal`, so the non-causal cached attention needs a kernel.
   - [ ] B2. VAE decode speed: 3x3 convolutions at 1152 channels.
   - [ ] B3. Optional guidance (negative prompt) with its own prefix cache.
   Phase C — editing and reference images:
