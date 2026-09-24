@@ -33,6 +33,9 @@ any later version.
 {$mode objfpc}{$H+}
 
 uses
+  // cmem is skipped in the Debug build mode: it enables Valgrind (-gv), and
+  // FPC then pulls in cmem itself, so naming it here is a duplicate.
+  {$IFDEF UNIX}cthreads, {$IFNDEF Debug}cmem,{$ENDIF}{$ENDIF}
   SysUtils, Classes,
   neuralvolume, neuralnetwork, neuralpretrained, neuraldatasets;
 
