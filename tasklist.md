@@ -1847,6 +1847,16 @@ rather than acted on.
         beyond, compared per step against diffusers with the same initial latents.
         Done: class `TQwenImage21Pipeline` (neuralpretrained.pas: `TokenizePrompt`, `EncodeTokenIds`, `MakeInitialLatents`, `Denoise`, `DecodeLatents`, `GenerateFromEmbeds`, `Generate`, `RoundDownImageSide`, events `OnPhase`/`OnStep`), `TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfig` + `ShiftForImageSeqLen`, RGBA PNG in `SaveImageFromVolumeIntoFile` / `LoadImageIntoVolume(.., pWithAlpha)`; `examples/QwenImage` (`--model --prompt --output --width --height --steps --seed --int8|--int4 --int8-input --vae-tile S[,T] --token-ids --drop-count`, no `--opencl`); tests `TestQwenImage21Pipeline*`, `TestQwen3VLEncodeRefusesOutOfVocabIds`, `TestFlowMatchFromDiffusersConfig`, `TestSaveImageRGBAPngRoundTrip`; fixture `tiny_qwenimage21_pipeline_64_io.json`. Real weights NOT yet run.
   - [ ] A8. Docs: README entry marked "planned (coded)" until a user-tested real run.
+  - [ ] A9. Keep-loaded mode + REPL: `TQwenImage21Pipeline` gains `LoadComponents` /
+        `UnloadComponents` so `Generate` reuses loaded weights (the one-shot CLI keeps
+        today's load-and-free order). The text encoder is built once for a maximum
+        prompt length (padding is exact, A2); prefix/step/VAE nets are rebuilt per
+        image by borrowing weights; activations are freed between images, weights
+        kept. `examples/QwenImage --repl`: one prompt per line, numbered output
+        files, `/size WxH`, `/steps N`, `/seed N` (else the seed increments),
+        `/tile SIZE[,STRIDE]`, `/quit`; print resident memory at startup. Test: two
+        prompts through one loaded pipeline equal two one-shot runs (pico). Estimated
+        resident at 1024x1024: ~19 GB int8, ~16 GB int4 (test boxes have 50-150 GB).
   Phase B — speed (after a first real measurement on the GPU box):
   - [ ] B1. OpenCL for the step pass: GEMM projections (4096 x 4096 activations) and
         a tiled non-causal SDPA over ~4096 queries x (4096 + L) keys.
