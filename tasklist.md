@@ -1872,6 +1872,36 @@ rather than acted on.
         Removes the per-image loads measured on the first real run: text encoder
         49-67 s, transformer 64 s int8 / 148 s int4.
   Phase B — speed (after a first real measurement on the GPU box):
+  - [ ] B1. OpenCL for the transformer step pass. Int4 is required; int8 comes along
+        with it (the tiled OpenCL kernels share one layout). The text encoder and
+        the VAE stay on the CPU in this task. Target GPUs have 24-100 GB of memory.
+        Runs BEFORE B0 and A9 (user decision, 2026-09-25).
+        Already in the library: `cai_dot_product_int4_tiled` / `_int8_tiled`
+        (many-token projections, used by --prefill-window); resident-codes sharing
+        (`EnableOpenCLInContextOf`, `BorrowOwnerOpenCLCodes`); OpenCL paths for
+        TokenLayerNorm, ChannelMulByLayer, HeadRMSNorm (via TokenRMSNorm), axial
+        RoPE (via M-RoPE), DeepConcat, Sum, SwiGLU.
+        Estimate (not measured): 1024x1024 step ~57 TFLOP of projections + ~18
+        TFLOP of attention, limited by arithmetic, so int4 saves GPU memory
+        (~4.4 GB of weights vs ~7 GB int8), not time.
+    - [ ] B1a. Read-only: build the pico step net with OpenCL (PoCL), list every
+          layer that runs on the host or downloads its output to RAM. Suspect:
+          `TNNetMRotaryEmbedding.WillOpenCL` does not accept a source already in
+          OpenCL memory. Report, no code.
+    - [ ] B1b. All 32 blocks' int4/int8 codes resident in OpenCL memory, one
+          context. `SelectBlockWeights` swaps only the codes/scales/block-scales
+          handles (today's `PrepareForComputeBorrowingCodes` re-creates the
+          64-400 MB result and input buffers on every call, so it cannot be used
+          per block). Parity test: pico, PoCL vs CPU.
+    - [ ] B1c. Tiled non-causal attention OpenCL kernel for
+          `CachedForwardNonCausal` (query tile + key tile in local memory, online
+          softmax, keys = text prefix + image rows). The decode kernel
+          (`cai_sdpa_decode_split`) re-reads all K/V per query row: ~540 GB per
+          block at 1024x1024. Parity test: pico, PoCL vs CPU.
+    - [ ] B1d. Fix the layers B1a finds downloading their output to RAM.
+    - [ ] B1e. Pipeline wiring + `examples/QwenImage --gpu` (int4 and int8). User
+          runs on the GPU box: 256x256 first, then 1024x1024 and larger; record
+          s/step and peak GPU memory.
   - [ ] B0. CPU many-token int8/int4 projections. Evidence: at 256x256 a step is
         34.3 s int8 and 16.4 s int4 (~2.1x, the weight-byte ratio), i.e. ~105 GFLOPS
         and ~53 GB/s: the projections stream all ~7 GB of block weights once per
@@ -1881,13 +1911,9 @@ rather than acted on.
         `--prefill-window` batched path (27B TTFT 341 -> 53.9 s) can be reused; report
         + proposed fix. Step 2: the fix, after approval. At 1024x1024 (16x the tokens)
         today's rate is ~9 min per step.
-  - [ ] B1. OpenCL for the step pass: GEMM projections (4096 x 4096 activations) and
-        a tiled non-causal SDPA over ~4096 queries x (4096 + L) keys. Constraints from
-        A4/A5: `SelectBlockWeights` refuses OpenCL today, so all 32 blocks' weights
-        must stay resident on the GPU (int8 ~7 GB) and the swap must select their
-        OpenCL buffers instead of re-uploading; `TNNetFusedSDPA.WillOpenCL` refuses
-        `CachedForwardNonCausal`, so the non-causal cached attention needs a kernel.
   - [ ] B2. VAE decode speed: 3x3 convolutions at 1152 channels.
+        Estimate (not measured): a CPU VAE decode at 1024x1024 is ~8 min (16x the
+        31 s measured at 256x256), so it is the next bottleneck once B1 lands.
   - [ ] B3. Optional guidance (negative prompt) with its own prefix cache.
   Phase C — editing and reference images:
   - [ ] C1. Qwen3-VL vision tower: 27-layer ViT, patch 16, 2x2 merge, DeepStack
