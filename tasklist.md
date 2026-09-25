@@ -1884,24 +1884,71 @@ rather than acted on.
         Estimate (not measured): 1024x1024 step ~57 TFLOP of projections + ~18
         TFLOP of attention, limited by arithmetic, so int4 saves GPU memory
         (~4.4 GB of weights vs ~7 GB int8), not time.
-    - [ ] B1a. Read-only: build the pico step net with OpenCL (PoCL), list every
-          layer that runs on the host or downloads its output to RAM. Suspect:
-          `TNNetMRotaryEmbedding.WillOpenCL` does not accept a source already in
-          OpenCL memory. Report, no code.
+    - [x] B1a. Read-only audit (2026-09-25, pico block 0 on PoCL, transfer trace;
+          probe in the session scratchpad, not in the repo). Only 9 of the
+          block's 31 layers run on OpenCL (6 projections, QNorm/KNorm, SwiGLU);
+          the activation chain leaves OpenCL memory ~6 times per block, ~1 GB of
+          transfers per block at 1024x1024 (estimate). Parity where OpenCL runs:
+          int8 block 2.7e-7, int4 tiled GEMM 1.1e-6, HeadRMSNorm + forced axial
+          RoPE 7.2e-7. PARITY-TEST TRAP: the CPU int4 path quantizes the input to
+          int8, OpenCL keeps it FP32 (3.6e-2 apart, both correct), so B1 parity
+          tests compare against an FP32-input oracle. Verified arming order that
+          shares one copy of the codes: BlockStore[0].EnableOpenCL, then
+          EnableOpenCLInContextOf(BlockStore[0]) for blocks 1-31 and the step net.
     - [ ] B1b. All 32 blocks' int4/int8 codes resident in OpenCL memory, one
-          context. `SelectBlockWeights` swaps only the codes/scales/block-scales
-          handles (today's `PrepareForComputeBorrowingCodes` re-creates the
-          64-400 MB result and input buffers on every call, so it cannot be used
-          per block). Parity test: pico, PoCL vs CPU.
+          context, uploaded once. `SelectBlockWeights` swaps only handles: in
+          `TDotProductSharedKernel` FCodesBuffer / FScalesBuffer /
+          FBlockScalesBuffer (+ caps, FCodesBorrowed, FInt8Ready/FInt4Ready;
+          retain new, release old), AND re-set the tiled OpenCL kernel's args
+          4/9/10 (`PrepareTiled` binds them once; split-K and single-pass compare
+          handles and re-bind by themselves). `PrepareForComputeBorrowingCodes`
+          cannot be used per block (it re-creates the result and input buffers,
+          403 MB for GateUp at 4096 tokens). Layer side:
+          `TNNetLayerConcatedWeights.LinkWeightsFrom` refuses when FHasOpenCL, and
+          the host tables (FQuantTable, FQuantTableInt4, FWeightOwner, FNeurons)
+          must follow the swap for the CPU fallback. The prefix net stays on the
+          CPU. Parity test: pico, PoCL vs FP32-input oracle.
     - [ ] B1c. Tiled non-causal attention OpenCL kernel for
           `CachedForwardNonCausal` (query tile + key tile in local memory, online
           softmax, keys = text prefix + image rows). The decode kernel
           (`cai_sdpa_decode_split`) re-reads all K/V per query row: ~540 GB per
-          block at 1024x1024. Parity test: pico, PoCL vs CPU.
-    - [ ] B1d. Fix the layers B1a finds downloading their output to RAM.
+          block at 1024x1024. Keep the 32 blocks' prefix K/V resident once per
+          prompt (today `AppendCacheRowsFrom` goes through the host and
+          `UploadCache` re-uploads them every block of every step); the image
+          rows' K/V can be read straight from the packed QKV input. `WillOpenCL`
+          accepts FCachedForwardNonCausal when the new kernel fits (its own
+          local-memory test, not `QueryTileFits`). Parity test: pico, PoCL vs CPU.
+    - [ ] B1d. Layers that send the activations back to RAM (B1a), worst first:
+      - [ ] B1d1. `TNNetChannelMulByLayer` x4: the modulation operand is a host
+            row (TNNetAddConstant has no OpenCL path; SplitChannels/Tanh follow
+            their host source). Accept a host-only FLayerMul of Depth floats,
+            upload it to a small per-layer buffer once per step.
+      - [ ] B1d2. `TNNetTokenLayerNorm` x2: FShouldOpenCL pinned false
+            (deliberate: OpenCLForwardBenchmark ~0.54x standalone), Compute
+            downloads before WillOpenCL, no residency clause, no bind/keep, no
+            OpenCLOutputBuffer. Mirror TNNetTokenRMSNorm; one work-item per token
+            is weak at depth 4096.
+      - [ ] B1d3. `TNNetAxialRotaryEmbedding` x2 (via TNNetMRotaryEmbedding):
+            Compute downloads before WillOpenCL, no residency clause,
+            `TNNetMRoPECL.Rotate` has no bind/keep and uploads the whole angle
+            table every forward (32x redundant across heads). Add bind/keep as
+            TNNetRoPECL.Rotate has; keep the table resident, re-upload only when
+            positions change.
+      - [ ] B1d4. Block boundary: TNNet.Compute downloads the last layer and
+            TNNetInput re-uploads it every block. Copy block i's output buffer
+            into the next pass's input inside OpenCL memory; download only after
+            block 31.
+      TNNetSum and TNNetDeepConcat follow once these are fixed.
     - [ ] B1e. Pipeline wiring + `examples/QwenImage --gpu` (int4 and int8). User
           runs on the GPU box: 256x256 first, then 1024x1024 and larger; record
           s/step and peak GPU memory.
+      Risks from B1a (not measured): the tiled int4/int8 OpenCL kernel streams
+      the whole weight matrix once per 16-token tile (~35 GB of int4 codes per
+      block at 4096 tokens unless L2 absorbs it; a wider token tile is the likely
+      fix); if a device rejects the tiled kernel, int4 falls back to split-K
+      (correct, very slow); kernel int32 indices overflow past ~87k tokens; the
+      GateUp result buffer (403 MB at 4096 tokens) can hit
+      CL_DEVICE_MAX_MEM_ALLOC_SIZE at larger images.
   - [ ] B0. CPU many-token int8/int4 projections. Evidence: at 256x256 a step is
         34.3 s int8 and 16.4 s int4 (~2.1x, the weight-byte ratio), i.e. ~105 GFLOPS
         and ~53 GB/s: the projections stream all ~7 GB of block weights once per
