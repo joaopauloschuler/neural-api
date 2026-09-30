@@ -571,6 +571,9 @@ type
     // axis; the launch counter proves the tiled path ran. Coded by Claude (AI).
     procedure TestTiledGemmInt8OpenCLParity;
     procedure TestTiledGemmInt4OpenCLParity;
+    // LinkWeightsFrom on an OpenCL-armed int8/int4 pointwise conv takes the new
+    // owner's resident codes by handle (tiled and untiled launches).
+    procedure TestLinkWeightsSwapsOpenCLCodes;
     // OpenCL single-launch fused-mixture forward parity (vs the fused CPU
     // forward) for TNNetMoEExpertBankDown: the whole gate-weighted expert
     // mixture of one MoE block in one kernel, reading the gate|up bank's slot
@@ -68825,6 +68828,141 @@ begin
     @Swish, @SwishDerivative, 0, true);
   RunPointwise('130 col 160x257 tanh bias', 130, 160, 257,
     @HiperbolicTangent, @HiperbolicTangentDerivative, 0, true);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// C runs on owner A's codes (and bias), re-links to owner B and must equal B
+// bit for bit; a differently shaped owner is refused. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestLinkWeightsSwapsOpenCLCodes;
+{$IFDEF OpenCL}
+const
+  csColumns = 24; // above csTiledGemmMinColumns: the tiled GEMM runs
+  csInputs = 64;  // two Q4_0 blocks
+  csNeurons = 40;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CasePos: integer;
+
+  function BuildNet(pNeurons: integer; pSeed: integer;
+    pInt4, pBiased: boolean): TNNet;
+  var
+    NeuronCnt, WeightCnt, SuppressBias: integer;
+    Weights: TNNetVolume;
+  begin
+    if pBiased then SuppressBias := 0 else SuppressBias := 1;
+    Result := TNNet.Create();
+    Result.AddLayer(TNNetInput.Create(csColumns, 1, csInputs));
+    Result.AddLayer(TNNetPointwiseConvLinear.Create(pNeurons, SuppressBias));
+    for NeuronCnt := 0 to pNeurons - 1 do
+    begin
+      Weights := Result.GetLastLayer().Neurons[NeuronCnt].Weights;
+      for WeightCnt := 0 to Weights.Size - 1 do
+        Weights.FData[WeightCnt] :=
+          0.5 * Sin((NeuronCnt + 1) * 0.37 + WeightCnt * 0.11 + pSeed);
+      Result.GetLastLayer().Neurons[NeuronCnt].BiasWeight :=
+        0.3 * Cos(NeuronCnt * 0.7 + 2 * pSeed);
+    end;
+    Result.UpdateWeights();
+    Result.SetTrainable(false);
+    if pInt4 then Result.QuantizeWeightsInt4()
+    else Result.QuantizeWeightsInt8();
+  end;
+
+  procedure RunCase(pInt4, pTiled, pBiased: boolean);
+  var
+    NetA, NetB, NetC, NetWide: TNNet;
+    LayerB, LayerC: TNNetLayerConcatedWeights;
+    Input, OutA, OutB, OutC: TNNetVolume;
+    CaseName: string;
+    TiledBefore, i: integer;
+  begin
+    if pInt4 then CaseName := 'int4' else CaseName := 'int8';
+    if pTiled then CaseName := CaseName + ' tiled'
+    else CaseName := CaseName + ' untiled';
+    if pBiased then CaseName := CaseName + ' biased';
+    NetA := BuildNet(csNeurons, 1, pInt4, pBiased);
+    NetB := BuildNet(csNeurons, 2, pInt4, pBiased);
+    NetWide := BuildNet(csNeurons + 8, 3, pInt4, pBiased);
+    NetC := BuildNet(csNeurons, 4, pInt4, pBiased);
+    Input := TNNetVolume.Create(csColumns, 1, csInputs);
+    OutA := TNNetVolume.Create();
+    OutB := TNNetVolume.Create();
+    OutC := TNNetVolume.Create();
+    try
+      for i := 0 to Input.Size - 1 do
+        Input.FData[i] := 0.7 * Cos(i * 0.029) - 0.1;
+      AssertEquals(CaseName + ': C linked to A', 1, NetC.LinkWeightsFrom(NetA));
+      NetA.EnableOpenCL(PlatformId, DeviceId);
+      NetB.EnableOpenCLInContextOf(NetA);
+      NetWide.EnableOpenCLInContextOf(NetA);
+      NetC.EnableOpenCLInContextOf(NetA);
+      NetA.ForceOpenCL(true);
+      NetB.ForceOpenCL(true);
+      NetC.ForceOpenCL(true);
+      if pTiled then SetTiledGemmMinColumns(csTiledGemmMinColumns)
+      else SetTiledGemmMinColumns(0);
+      LayerB := TNNetLayerConcatedWeights(NetB.GetLastLayer());
+      LayerC := TNNetLayerConcatedWeights(NetC.GetLastLayer());
+      AssertTrue(CaseName + ': C armed on A''s codes',
+        LayerC.OpenCLCodesBorrowed());
+      NetA.Compute(Input);
+      NetA.GetOutput(OutA);
+      NetB.Compute(Input);
+      NetB.GetOutput(OutB);
+      AssertTrue(CaseName + ': owners differ', OutA.SumDiff(OutB) > 1e-2);
+      NetC.Compute(Input);
+      NetC.GetOutput(OutC);
+      AssertEquals(CaseName + ': C on A''s codes', 0, OutA.SumDiff(OutC), 0);
+      TiledBefore := LayerC.OpenCLTiledGemmLaunchCount();
+      AssertEquals(CaseName + ': C re-linked to B', 1,
+        NetC.LinkWeightsFrom(NetB));
+      AssertTrue(CaseName + ': C holds B''s codes handle',
+        LayerC.OpenCLCodesBuffer() = LayerB.OpenCLCodesBuffer());
+      AssertTrue(CaseName + ': C borrows', LayerC.OpenCLCodesBorrowed());
+      NetC.Compute(Input);
+      NetC.GetOutput(OutC);
+      AssertEquals(CaseName + ': C re-linked to B vs B', 0,
+        OutB.SumDiff(OutC), 0);
+      AssertTrue(CaseName + ': C ran on OpenCL', LayerC.ForwardGPUCnt = 2);
+      if pTiled then
+        AssertEquals(CaseName + ': tiled launch after the swap',
+          TiledBefore + 1, LayerC.OpenCLTiledGemmLaunchCount())
+      else
+        AssertEquals(CaseName + ': no tiled launch', 0,
+          LayerC.OpenCLTiledGemmLaunchCount());
+      AssertEquals(CaseName + ': a differently shaped owner is refused', 0,
+        NetC.LinkWeightsFrom(NetWide));
+      AssertTrue(CaseName + ': the refusal kept B''s codes',
+        LayerC.OpenCLCodesBuffer() = LayerB.OpenCLCodesBuffer());
+      AssertTrue(CaseName + ': the refusal kept B as the owner',
+        LayerC.WeightOwner = LayerB);
+    finally
+      SetTiledGemmMinColumns(csTiledGemmMinColumns);
+      OutC.Free;
+      OutB.Free;
+      OutA.Free;
+      Input.Free;
+      NetC.Free;
+      NetWide.Free;
+      NetB.Free;
+      NetA.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CasePos := 0 to 7 do
+    RunCase({pInt4=}(CasePos and 1) <> 0, {pTiled=}(CasePos and 2) = 0,
+      {pBiased=}(CasePos and 4) <> 0);
 end;
 {$ELSE}
 begin

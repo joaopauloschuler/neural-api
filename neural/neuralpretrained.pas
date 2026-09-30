@@ -8748,6 +8748,12 @@ type
     FStepGridH, FStepGridW: integer;
     FParallel: boolean;
     FMaxThreads: integer;
+    {$IFDEF OpenCL}
+    // Set by EnableOpenCL: every block store holds its codes in OpenCL memory;
+    // PrepareStepPass arms each rebuilt step net in BlockStore[0]'s context.
+    FOpenCLEnabled: boolean;
+    FOpenCLHasSharedKernel: boolean;
+    {$ENDIF}
     procedure BuildBlockNet(NN: TNNet; TokenCount: integer;
       Mode: TQwenImage21BlockMode; PrefixCapacity: integer;
       out Block: TQwenImage21BlockLayers);
@@ -8780,9 +8786,16 @@ type
     procedure ComputeModulation(Timestep: TNeuralFloat);
     // (Re)builds StepNet for a GridH x GridW image; needs EncodePrefix first.
     procedure PrepareStepPass(GridH, GridW: integer);
-    // Re-links the reusable block of NN (PrefixNet or StepNet) to block
-    // BlockIdx's stored weights. Raises when a layer of NN has OpenCL enabled.
+    // Re-links NN's (PrefixNet or StepNet) block to block BlockIdx's weights.
+    // Raises when a layer refuses; NN then mixes blocks and must be rebuilt.
     procedure SelectBlockWeights(NN: TNNet; BlockIdx: integer);
+    {$IFDEF OpenCL}
+    // Uploads every block's int8/int4 codes once, in one OpenCL context, and
+    // arms StepNet there (SelectBlockWeights swaps handles); PrefixNet: CPU.
+    procedure EnableOpenCL(pPlatform: cl_platform_id; pDevice: cl_device_id;
+      pHasSharedKernel: boolean = true);
+    property OpenCLEnabled: boolean read FOpenCLEnabled;
+    {$ENDIF}
     property Config: TQwenImage21TransformerConfig read FConfig;
     property WeightFormat: TQwenImage21WeightFormat read FWeightFormat;
     property PrefixNet: TNNet read FPrefixNet;
@@ -82160,32 +82173,47 @@ begin
   FStepGridW := 0;
 end;
 
+// A layer with weights in OpenCL memory links only when they can follow by
+// handle; otherwise it refuses and the short count raises (no stale weights).
 procedure TQwenImage21Transformer.SelectBlockWeights(NN: TNNet;
   BlockIdx: integer);
-{$IFDEF OpenCL}
-var
-  LayerCnt, LastLayerIdx: integer;
-{$ENDIF}
 begin
   if (BlockIdx < 0) or (BlockIdx >= FConfig.NumLayers) then
     raise Exception.Create('TQwenImage21Transformer.SelectBlockWeights: ' +
       'block ' + IntToStr(BlockIdx) + ' is outside 0..' +
       IntToStr(FConfig.NumLayers - 1) + '.');
-  {$IFDEF OpenCL}
-  // A layer with OpenCL enabled keeps a device copy of its weights, which a
-  // re-link would leave stale. The device path is task B1's design.
-  LastLayerIdx := NN.GetLastLayerIdx();
-  for LayerCnt := 0 to LastLayerIdx do
-    if NN.Layers[LayerCnt].HasOpenCL then
-      raise Exception.Create('TQwenImage21Transformer.SelectBlockWeights: ' +
-        'layer ' + IntToStr(LayerCnt) + ' has OpenCL enabled; the block ' +
-        'weight swap runs on the CPU only.');
-  {$ENDIF}
   if NN.LinkWeightsFrom(FBlockStore[BlockIdx]) <> FBlockWeightLayerCount then
     raise Exception.Create('TQwenImage21Transformer.SelectBlockWeights: ' +
       'block ' + IntToStr(BlockIdx) + ' could not be linked (see the ' +
-      'message above).');
+      'message above; a layer with OpenCL enabled links only when its ' +
+      'resident OpenCL codes can follow by handle).');
 end;
+
+{$IFDEF OpenCL}
+procedure TQwenImage21Transformer.EnableOpenCL(pPlatform: cl_platform_id;
+  pDevice: cl_device_id; pHasSharedKernel: boolean);
+var
+  BlockCnt, MaxBlockPos: integer;
+begin
+  if FOpenCLEnabled then exit;
+  if FWeightFormat = qiwFP32 then
+    raise Exception.Create('TQwenImage21Transformer.EnableOpenCL: needs int8 ' +
+      'or int4 block weights (only resident codes follow SelectBlockWeights).');
+  FBlockStore[0].EnableOpenCL(pPlatform, pDevice, pHasSharedKernel);
+  if not FBlockStoreLayers[0].QProj.HasOpenCL then
+    raise Exception.Create('TQwenImage21Transformer.EnableOpenCL: the ' +
+      'OpenCL program is unavailable (see the message above).');
+  // One context: a borrowed cl_mem is only valid in the context that made it.
+  MaxBlockPos := FConfig.NumLayers - 1;
+  for BlockCnt := 1 to MaxBlockPos do
+    FBlockStore[BlockCnt].EnableOpenCLInContextOf(FBlockStore[0],
+      pHasSharedKernel);
+  FOpenCLHasSharedKernel := pHasSharedKernel;
+  FOpenCLEnabled := true;
+  if Assigned(FStepNet) then
+    FStepNet.EnableOpenCLInContextOf(FBlockStore[0], pHasSharedKernel);
+end;
+{$ENDIF}
 
 procedure TQwenImage21Transformer.ComputeModulation(Timestep: TNeuralFloat);
 begin
@@ -82280,6 +82308,10 @@ begin
   FStepNet.BuildWeightOwner := nil;
   if FInt8Input then FStepNet.EnableInt8Input();
   PrepareInferenceThreads(FStepNet, FParallel, FMaxThreads);
+  {$IFDEF OpenCL}
+  if FOpenCLEnabled then
+    FStepNet.EnableOpenCLInContextOf(FBlockStore[0], FOpenCLHasSharedKernel);
+  {$ENDIF}
   FOutputNet := TNNet.Create();
   FOutputNet.BuildWeightOwner := FOutputOwner;
   BuildOutputNet(FOutputNet, TokenCount);

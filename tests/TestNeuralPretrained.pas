@@ -138,6 +138,17 @@ type
     // device codes / vocab table handle as its owner; returns how many.
     function AssertDeviceWeightsBorrowed(Linked: TNNet;
       const What: string): integer;
+    // The six step-block projections of Transformer run on OpenCL whatever
+    // the size verdict says (the pico shapes are below it).
+    procedure ForceQwenImage21StepProjectionsOpenCL(
+      Transformer: TQwenImage21Transformer);
+    // Every step-block projection borrows the resident codes handle of block
+    // BlockIdx's store, which owns it (not borrowed).
+    procedure AssertQwenImage21StepCodes(Transformer: TQwenImage21Transformer;
+      BlockIdx: integer; const What: string);
+    // Every step-block projection still has block BlockIdx's store as owner.
+    procedure AssertQwenImage21StepOwners(Transformer: TQwenImage21Transformer;
+      BlockIdx: integer; const What: string);
     {$ENDIF}
     // Every weight-bearing layer of Linked borrows from Owner, and Linked
     // reports no weights and no quantized bytes of its own; returns how many
@@ -713,6 +724,8 @@ type
     procedure TestQwenImage21TransformerWeightSwap;
     procedure TestQwenImage21TransformerSharedWeightStore;
     procedure TestQwenImage21TransformerOpenCLGuard;
+    procedure TestQwenImage21TransformerOpenCLSwapParity;
+    procedure TestQwenImage21TransformerOpenCLCodesResident;
     procedure TestQwenImage21TransformerStepReplay;
     procedure TestQwenImage21TransformerQuantizedDrift;
     procedure TestQwenImage21VaeDupUpMapping;
@@ -25869,8 +25882,8 @@ begin
   end;
 end;
 
-// A re-link leaves a device copy of the weights stale, so SelectBlockWeights
-// (and therefore PredictVelocity) must refuse a block net with OpenCL enabled.
+// FP32 weights in OpenCL memory cannot follow a re-link by handle, so
+// SelectBlockWeights refuses them; EnableOpenCL needs int8/int4 weights.
 procedure TTestNeuralPretrained.TestQwenImage21TransformerOpenCLGuard;
 {$IFDEF OpenCL}
 var
@@ -25898,6 +25911,13 @@ begin
     LoadOracleTokenTensor(RefRoot, 'latents_1', Latents);
     Transformer := TQwenImage21Transformer.Create(
       QwenImage21TransformerFolder());
+    Refused := false;
+    try
+      Transformer.EnableOpenCL(PlatformId, DeviceId);
+    except
+      on E: Exception do Refused := Pos('int8', E.Message) > 0;
+    end;
+    AssertTrue('EnableOpenCL refuses FP32 block weights', Refused);
     Transformer.EncodePrefix(Embeds);
     Transformer.PrepareStepPass(GridH, GridW);
     Transformer.StepNet.EnableOpenCL(PlatformId, DeviceId);
@@ -25908,12 +25928,410 @@ begin
       on E: Exception do
       begin
         WriteLn('  Qwen-Image-2.1 OpenCL guard: ', E.Message);
-        Refused := Pos('OpenCL', E.Message) > 0;
+        Refused := true;
       end;
     end;
     AssertTrue('PredictVelocity refuses an OpenCL step block', Refused);
+    // Block 0 is the build link; block 1's FP32 projections were refused.
+    AssertQwenImage21StepOwners(Transformer, 0, 'refused FP32 projections');
   finally
     Transformer.Free;
+    Velocity.Free;
+    Latents.Free;
+    Embeds.Free;
+    RefRoot.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+{$IFDEF OpenCL}
+procedure TTestNeuralPretrained.ForceQwenImage21StepProjectionsOpenCL(
+  Transformer: TQwenImage21Transformer);
+begin
+  Transformer.StepBlock.QProj.ForceOpenCL(true);
+  Transformer.StepBlock.KProj.ForceOpenCL(true);
+  Transformer.StepBlock.VProj.ForceOpenCL(true);
+  Transformer.StepBlock.OutProj.ForceOpenCL(true);
+  Transformer.StepBlock.GateUp.ForceOpenCL(true);
+  Transformer.StepBlock.Down.ForceOpenCL(true);
+end;
+
+procedure TTestNeuralPretrained.AssertQwenImage21StepCodes(
+  Transformer: TQwenImage21Transformer; BlockIdx: integer; const What: string);
+var
+  Step, Store: TQwenImage21BlockLayers;
+
+  procedure AssertLayer(StepLayer, StoreLayer: TNNetLayer; const Name: string);
+  var
+    StepCW, StoreCW: TNNetLayerConcatedWeights;
+  begin
+    StepCW := TNNetLayerConcatedWeights(StepLayer);
+    StoreCW := TNNetLayerConcatedWeights(StoreLayer);
+    AssertTrue(What + ' ' + Name + ': the store holds its own codes',
+      (StoreCW.OpenCLCodesBuffer() <> nil) and
+      (not StoreCW.OpenCLCodesBorrowed()));
+    AssertTrue(What + ' ' + Name + ': the step layer borrows',
+      StepCW.OpenCLCodesBorrowed());
+    AssertTrue(What + ' ' + Name + ': the step layer holds block ' +
+      IntToStr(BlockIdx) + '''s codes handle',
+      StepCW.OpenCLCodesBuffer() = StoreCW.OpenCLCodesBuffer());
+  end;
+
+begin
+  AssertQwenImage21StepOwners(Transformer, BlockIdx, What);
+  Step := Transformer.StepBlock;
+  Store := Transformer.BlockStoreLayers[BlockIdx];
+  AssertLayer(Step.QProj, Store.QProj, 'to_q');
+  AssertLayer(Step.KProj, Store.KProj, 'to_k');
+  AssertLayer(Step.VProj, Store.VProj, 'to_v');
+  AssertLayer(Step.OutProj, Store.OutProj, 'to_out');
+  AssertLayer(Step.GateUp, Store.GateUp, 'proj|gate_layer');
+  AssertLayer(Step.Down, Store.Down, 'out');
+end;
+
+procedure TTestNeuralPretrained.AssertQwenImage21StepOwners(
+  Transformer: TQwenImage21Transformer; BlockIdx: integer; const What: string);
+var
+  Step, Store: TQwenImage21BlockLayers;
+begin
+  Step := Transformer.StepBlock;
+  Store := Transformer.BlockStoreLayers[BlockIdx];
+  AssertTrue(What + ': step projections owned by block ' + IntToStr(BlockIdx),
+    (Step.QProj.WeightOwner = Store.QProj) and
+    (Step.KProj.WeightOwner = Store.KProj) and
+    (Step.VProj.WeightOwner = Store.VProj) and
+    (Step.OutProj.WeightOwner = Store.OutProj) and
+    (Step.GateUp.WeightOwner = Store.GateUp) and
+    (Step.Down.WeightOwner = Store.Down));
+end;
+{$ENDIF}
+
+// SelectBlockWeights (handle swap) vs a step net re-armed per block: bit for
+// bit, tiled and untiled; then the velocity vs the CPU (int4: CPU int8 input).
+procedure TTestNeuralPretrained.TestQwenImage21TransformerOpenCLSwapParity;
+{$IFDEF OpenCL}
+var
+  RefRoot, BlockObj: TJSONData;
+  Swapped, Rearmed, OnCPU: TQwenImage21Transformer;
+  Embeds, Latents, Hidden, ModulationRows: TNNetVolume;
+  OutSwapped, OutRearmed: TNNetVolume;
+  VelocityOpenCL, VelocityReplay, VelocityCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  GridH, GridW: integer;
+
+  procedure SetStepModulation(Transformer: TQwenImage21Transformer);
+  var
+    ModulationPos, MaxModulationPos: integer;
+  begin
+    MaxModulationPos := 4 * Transformer.Config.Hidden - 1;
+    for ModulationPos := 0 to MaxModulationPos do
+      Transformer.StepNet.Layers[1].Output.FData[ModulationPos] :=
+        ModulationRows.FData[ModulationPos];
+  end;
+
+  procedure RunBlockChain(Transformer: TQwenImage21Transformer;
+    Rearm: boolean; Output: TNNetVolume; const What: string);
+  var
+    BlockCnt, MaxBlockPos: integer;
+  begin
+    Output.Copy(Hidden);
+    MaxBlockPos := Transformer.Config.NumLayers - 1;
+    for BlockCnt := 0 to MaxBlockPos do
+    begin
+      if Rearm then
+      begin
+        Transformer.StepNet.DisableOpenCL();
+        Transformer.SelectBlockWeights(Transformer.StepNet, BlockCnt);
+        Transformer.StepNet.EnableOpenCLInContextOf(Transformer.BlockStore[0]);
+        ForceQwenImage21StepProjectionsOpenCL(Transformer);
+      end
+      else
+        Transformer.SelectBlockWeights(Transformer.StepNet, BlockCnt);
+      AssertQwenImage21StepCodes(Transformer, BlockCnt,
+        What + ', block ' + IntToStr(BlockCnt));
+      Transformer.StepBlock.Attn.TruncateCache(0);
+      Transformer.StepBlock.Attn.AppendCacheRowsFrom(
+        Transformer.PrefixKeys[BlockCnt], Transformer.PrefixValues[BlockCnt]);
+      Transformer.StepNet.Compute(Output);
+      Output.Copy(Transformer.StepNet.GetLastLayer().Output);
+    end;
+  end;
+
+  procedure RunFormat(pWeightFormat: TQwenImage21WeightFormat;
+    const FormatName: string; VelocityTolerance: double;
+    RelativeTolerance: boolean);
+  var
+    Tiled: boolean;
+    What: string;
+    TiledPos, GPUBefore, TiledBefore, BlockCount: integer;
+    Diff, Bound: double;
+  begin
+    Swapped := nil;
+    Rearmed := nil;
+    OnCPU := nil;
+    try
+      Rearmed := TQwenImage21Transformer.Create(QwenImage21TransformerFolder(),
+        pWeightFormat);
+      Rearmed.EncodePrefix(Embeds);
+      Rearmed.PrepareStepPass(GridH, GridW);
+      Rearmed.EnableOpenCL(PlatformId, DeviceId);
+      ForceQwenImage21StepProjectionsOpenCL(Rearmed);
+      SetStepModulation(Rearmed);
+      // Armed before the step net exists: PrepareStepPass arms it.
+      Swapped := TQwenImage21Transformer.Create(QwenImage21TransformerFolder(),
+        pWeightFormat);
+      Swapped.EnableOpenCL(PlatformId, DeviceId);
+      Swapped.EncodePrefix(Embeds);
+      Swapped.PrepareStepPass(GridH, GridW);
+      AssertTrue(FormatName + ': the rebuilt step net is armed',
+        Swapped.StepBlock.QProj.HasOpenCL);
+      AssertTrue(FormatName + ': the prefix net stays on the CPU',
+        not Swapped.PrefixBlock.QProj.HasOpenCL);
+      ForceQwenImage21StepProjectionsOpenCL(Swapped);
+      SetStepModulation(Swapped);
+      BlockCount := Swapped.Config.NumLayers;
+      for TiledPos := 0 to 1 do
+      begin
+        Tiled := TiledPos = 0;
+        if Tiled then SetTiledGemmMinColumns(csTiledGemmMinColumns)
+        else SetTiledGemmMinColumns(0);
+        if Tiled then What := FormatName + ' tiled'
+        else What := FormatName + ' untiled';
+        GPUBefore := Swapped.StepBlock.GateUp.ForwardGPUCnt;
+        TiledBefore := Swapped.StepBlock.GateUp.OpenCLTiledGemmLaunchCount();
+        RunBlockChain(Swapped, false, OutSwapped, What + ' swapped');
+        RunBlockChain(Rearmed, true, OutRearmed, What + ' re-armed');
+        AssertEquals(What + ': GateUp ran on OpenCL once per block',
+          BlockCount, Swapped.StepBlock.GateUp.ForwardGPUCnt - GPUBefore);
+        if Tiled then
+          AssertEquals(What + ': tiled GEMM once per block', BlockCount,
+            Swapped.StepBlock.GateUp.OpenCLTiledGemmLaunchCount() - TiledBefore)
+        else
+          AssertEquals(What + ': no tiled GEMM', TiledBefore,
+            Swapped.StepBlock.GateUp.OpenCLTiledGemmLaunchCount());
+        AssertEquals(What + ': swapped vs re-armed, bit for bit', 0,
+          MaxAbsVolumeDiff(OutSwapped, OutRearmed), 0);
+      end;
+      SetTiledGemmMinColumns(csTiledGemmMinColumns);
+      Swapped.PredictVelocity(Latents, 0.9, GridH, GridW, VelocityOpenCL);
+      Swapped.PredictVelocity(Latents, 0.9, GridH, GridW, VelocityReplay);
+      AssertEquals(FormatName + ': OpenCL velocity replays bit for bit', 0,
+        MaxAbsVolumeDiff(VelocityOpenCL, VelocityReplay), 0);
+      OnCPU := TQwenImage21Transformer.Create(QwenImage21TransformerFolder(),
+        pWeightFormat);
+      OnCPU.EncodePrefix(Embeds);
+      OnCPU.PredictVelocity(Latents, 0.9, GridH, GridW, VelocityCPU);
+      Diff := MaxAbsVolumeDiff(VelocityOpenCL, VelocityCPU);
+      if RelativeTolerance
+        then Bound := VelocityTolerance * VelocityCPU.GetMaxAbs()
+        else Bound := VelocityTolerance;
+      WriteLn('  Qwen-Image-2.1 ', FormatName, ' OpenCL vs CPU velocity: ',
+        'max|diff|=', Diff:0:9, ' max|v|=', VelocityCPU.GetMaxAbs():0:4);
+      AssertTrue(FormatName + ': OpenCL vs CPU velocity max|diff| ' +
+        FloatToStr(Diff) + ' must be < ' + FloatToStr(Bound), Diff < Bound);
+    finally
+      SetTiledGemmMinColumns(csTiledGemmMinColumns);
+      FreeAndNil(OnCPU);
+      FreeAndNil(Swapped);
+      FreeAndNil(Rearmed);
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RefRoot := nil;
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Hidden := TNNetVolume.Create;
+  ModulationRows := TNNetVolume.Create;
+  OutSwapped := TNNetVolume.Create;
+  OutRearmed := TNNetVolume.Create;
+  VelocityOpenCL := TNNetVolume.Create;
+  VelocityReplay := TNNetVolume.Create;
+  VelocityCPU := TNNetVolume.Create;
+  try
+    RefRoot := LoadQwenImage21TransformerOracle(GridH, GridW);
+    LoadOracleTokenTensor(RefRoot, 'encoder_hidden_states', Embeds);
+    LoadOracleTokenTensor(RefRoot, 'latents_1', Latents);
+    BlockObj := TJSONObject(RefRoot).Find('block0_cached');
+    LoadOracleTokenTensor(BlockObj, 'hidden_in', Hidden);
+    LoadOracleTokenTensor(BlockObj, 'modulation', ModulationRows);
+    RunFormat(qiwInt8, 'int8', 1e-5, false);
+    RunFormat(qiwInt4, 'int4', 0.01, true);
+  finally
+    VelocityCPU.Free;
+    VelocityReplay.Free;
+    VelocityOpenCL.Free;
+    OutRearmed.Free;
+    OutSwapped.Free;
+    ModulationRows.Free;
+    Hidden.Free;
+    Latents.Free;
+    Embeds.Free;
+    RefRoot.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Codes upload once (store handles fixed across steps and rebuilds); links that
+// cannot follow by handle are refused and leave owners and handles unchanged.
+procedure TTestNeuralPretrained.TestQwenImage21TransformerOpenCLCodesResident;
+{$IFDEF OpenCL}
+var
+  RefRoot: TJSONData;
+  Transformer, OtherContext: TQwenImage21Transformer;
+  Embeds, Latents, Velocity: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  GridH, GridW: integer;
+
+  procedure RunFormat(pWeightFormat: TQwenImage21WeightFormat;
+    const FormatName: string);
+  var
+    StoreCodes: array of array[0..5] of cl_mem;
+    BlockCnt, MaxBlockPos, OtherPos: integer;
+    Refused: boolean;
+
+    function StoreProjection(BlockIdx, ProjectionIdx: integer):
+      TNNetLayerConcatedWeights;
+    var
+      Store: TQwenImage21BlockLayers;
+    begin
+      Store := Transformer.BlockStoreLayers[BlockIdx];
+      case ProjectionIdx of
+        0: Result := TNNetLayerConcatedWeights(Store.QProj);
+        1: Result := TNNetLayerConcatedWeights(Store.KProj);
+        2: Result := TNNetLayerConcatedWeights(Store.VProj);
+        3: Result := TNNetLayerConcatedWeights(Store.OutProj);
+        4: Result := TNNetLayerConcatedWeights(Store.GateUp);
+      else Result := TNNetLayerConcatedWeights(Store.Down);
+      end;
+    end;
+
+    procedure AssertStoresUnchanged(const What: string);
+    var
+      BlockPos, ProjectionPos: integer;
+    begin
+      for BlockPos := 0 to MaxBlockPos do
+        for ProjectionPos := 0 to 5 do
+          AssertTrue(What + ': block ' + IntToStr(BlockPos) + ' projection ' +
+            IntToStr(ProjectionPos) + ' kept its uploaded codes',
+            StoreProjection(BlockPos, ProjectionPos).OpenCLCodesBuffer() =
+            StoreCodes[BlockPos][ProjectionPos]);
+    end;
+
+  var
+    ProjectionPos: integer;
+    LastCodes, OwnContextCodes: cl_mem;
+  begin
+    Transformer := nil;
+    OtherContext := nil;
+    try
+      Transformer := TQwenImage21Transformer.Create(
+        QwenImage21TransformerFolder(), pWeightFormat);
+      Transformer.EncodePrefix(Embeds);
+      Transformer.EnableOpenCL(PlatformId, DeviceId);
+      MaxBlockPos := Transformer.Config.NumLayers - 1;
+      SetLength(StoreCodes, MaxBlockPos + 1);
+      for BlockCnt := 0 to MaxBlockPos do
+        for ProjectionPos := 0 to 5 do
+        begin
+          StoreCodes[BlockCnt][ProjectionPos] :=
+            StoreProjection(BlockCnt, ProjectionPos).OpenCLCodesBuffer();
+          AssertTrue(FormatName + ': block ' + IntToStr(BlockCnt) +
+            ' codes are resident', StoreCodes[BlockCnt][ProjectionPos] <> nil);
+          for OtherPos := 0 to BlockCnt - 1 do
+            AssertTrue(FormatName + ': blocks hold separate codes',
+              StoreCodes[OtherPos][ProjectionPos] <>
+              StoreCodes[BlockCnt][ProjectionPos]);
+        end;
+      Transformer.PrepareStepPass(GridH, GridW);
+      AssertQwenImage21StepCodes(Transformer, 0, FormatName + ' built');
+      Transformer.PredictVelocity(Latents, 0.9, GridH, GridW, Velocity);
+      Transformer.PredictVelocity(Latents, 0.35, GridH, GridW, Velocity);
+      AssertQwenImage21StepCodes(Transformer, MaxBlockPos,
+        FormatName + ' after two steps');
+      Transformer.PrepareStepPass(GridW, GridH);
+      AssertQwenImage21StepCodes(Transformer, 0, FormatName + ' rebuilt');
+      Transformer.PredictVelocity(Latents, 0.9, GridH, GridW, Velocity);
+      AssertQwenImage21StepCodes(Transformer, MaxBlockPos,
+        FormatName + ' rebuilt back');
+      AssertStoresUnchanged(FormatName);
+      LastCodes := TNNetLayerConcatedWeights(
+        Transformer.StepBlock.QProj).OpenCLCodesBuffer();
+      AssertFalse(FormatName + ': to_q refuses the GateUp shape',
+        Transformer.StepBlock.QProj.LinkWeightsFrom(
+          Transformer.BlockStoreLayers[0].GateUp));
+      AssertTrue(FormatName + ': the refused shape changed nothing',
+        (TNNetLayerConcatedWeights(Transformer.StepBlock.QProj).
+        OpenCLCodesBuffer() = LastCodes) and
+        (Transformer.StepBlock.QProj.WeightOwner =
+        Transformer.BlockStoreLayers[MaxBlockPos].QProj));
+      OtherContext := TQwenImage21Transformer.Create(
+        QwenImage21TransformerFolder(), pWeightFormat);
+      OtherContext.EnableOpenCL(PlatformId, DeviceId);
+      AssertFalse(FormatName + ': to_q refuses codes of another context',
+        Transformer.StepBlock.QProj.LinkWeightsFrom(
+          OtherContext.BlockStoreLayers[0].QProj));
+      AssertTrue(FormatName + ': the refused context changed nothing',
+        (TNNetLayerConcatedWeights(Transformer.StepBlock.QProj).
+        OpenCLCodesBuffer() = LastCodes) and
+        (Transformer.StepBlock.QProj.WeightOwner =
+        Transformer.BlockStoreLayers[MaxBlockPos].QProj));
+      // A step net armed in a context of its own cannot follow the stores.
+      Transformer.StepNet.EnableOpenCL(PlatformId, DeviceId);
+      OwnContextCodes := TNNetLayerConcatedWeights(
+        Transformer.StepBlock.QProj).OpenCLCodesBuffer();
+      Refused := false;
+      try
+        Transformer.SelectBlockWeights(Transformer.StepNet, 0);
+      except
+        on E: Exception do Refused := true;
+      end;
+      AssertTrue(FormatName + ': SelectBlockWeights raises for a step net ' +
+        'in its own OpenCL context', Refused);
+      AssertQwenImage21StepOwners(Transformer, MaxBlockPos,
+        FormatName + ' refused own-context projections');
+      AssertTrue(FormatName + ': the refused to_q kept its own codes',
+        (OwnContextCodes <> nil) and (TNNetLayerConcatedWeights(
+        Transformer.StepBlock.QProj).OpenCLCodesBuffer() = OwnContextCodes));
+      AssertStoresUnchanged(FormatName + ' after the refusals');
+    finally
+      FreeAndNil(OtherContext);
+      FreeAndNil(Transformer);
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RefRoot := nil;
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  Velocity := TNNetVolume.Create;
+  try
+    RefRoot := LoadQwenImage21TransformerOracle(GridH, GridW);
+    LoadOracleTokenTensor(RefRoot, 'encoder_hidden_states', Embeds);
+    LoadOracleTokenTensor(RefRoot, 'latents_1', Latents);
+    RunFormat(qiwInt8, 'int8');
+    RunFormat(qiwInt4, 'int4');
+  finally
     Velocity.Free;
     Latents.Free;
     Embeds.Free;

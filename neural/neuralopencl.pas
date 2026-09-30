@@ -413,10 +413,10 @@ type
       FBoundMainSize, FBoundMainUseBias: longint;
       FBoundMainAsBuffer, FBoundMainResultBuffer, FBoundMainBiasBuffer: cl_mem;
       /// Single-pass twin for ComputeResidentCodes: shape (args 0-3), codes
-      /// (5), result (7) and scales (10) are fixed after
-      /// PrepareForComputeInt8/Int4 (both start from UnprepareForCompute, which
-      /// clears this); the activation (4), B operand (6) and bias pair (8/9)
-      /// are set per call. Coded by Claude (AI).
+      /// (5), result (7) and scales (10) survive between launches until
+      /// UnprepareForCompute or BorrowCodesKeepingBuffers (a new codes/scales
+      /// handle) clears this; the activation (4), B operand (6) and bias pair
+      /// (8/9) are set per call. Coded by Claude (AI).
       FSinglePassArgsBound: boolean;
       FBoundSPThreadCount, FBoundSPNumAs, FBoundSPNumBs, FBoundSPSize: longint;
       FBoundSPCodesBuffer, FBoundSPResultBuffer, FBoundSPScalesBuffer: cl_mem;
@@ -424,9 +424,10 @@ type
       /// a window of FNumBs >= TiledGemmMinColumns columns: one work-group per
       /// tile of rows x columns reads each weight code once per column tile.
       /// The handle is owned here and bound lazily by PrepareTiled, which also
-      /// sets the arguments that never change while it lives: shape, codes,
-      /// result and scales are fixed from PrepareForComputeInt8/Int4 to
-      /// UnprepareForCompute, which releases the handle. FTiledRejected
+      /// sets the arguments that are not per call: shape and result are fixed
+      /// from PrepareForComputeInt8/Int4 to UnprepareForCompute (which releases
+      /// the handle); codes and scales are re-set by BorrowCodesKeepingBuffers
+      /// when it swaps their handles (BindTiledCodesArgs). FTiledRejected
       /// remembers a device that refused the kernel or its work-group size, so
       /// the fallback is decided once. FTiledLaunchCount is the test hook that
       /// proves the tiled path ran. Coded by Claude (AI).
@@ -435,9 +436,16 @@ type
       FTiledLaunchCount: integer;
       /// True while FCodesBuffer / FScalesBuffer / FBlockScalesBuffer are
       /// retained references to another instance's resident weights
-      /// (PrepareForComputeBorrowingCodes); the release in UnprepareForCompute
+      /// (PrepareForComputeBorrowingCodes, or BorrowCodesKeepingBuffers, which
+      /// swaps them for another owner's); the release in UnprepareForCompute
       /// is the same clReleaseMemObject either way. Coded by Claude (AI).
       FCodesBorrowed: boolean;
+      /// Retains Owner's codes/scales/block-scales as this instance's and sets
+      /// FCodesBorrowed; the caller releases any handles it replaces.
+      procedure RetainCodesOf(Owner: TDotProductSharedKernel);
+      /// Sets the tiled kernel's codes (4), scales (9) and, for int4, block
+      /// scales (10) arguments from the current handles.
+      function BindTiledCodesArgs(): integer;
 
       /// How many slabs to cut the reduction axis into for the current shape:
       /// 1 means the launch already fills the device, so ComputeInt8 keeps the
@@ -547,6 +555,17 @@ type
       /// armed in this instance's context; False leaves this one unarmed. Coded by Claude (AI).
       function PrepareForComputeBorrowingCodes(Owner: TDotProductSharedKernel;
         VBs: TNNetVolume; pFP16: boolean = false): boolean;
+      /// True when BorrowCodesKeepingBuffers(Owner) applies: both armed in the
+      /// same weight mode, same rows and row size, same OpenCL context.
+      function CanBorrowCodesKeepingBuffers(
+        Owner: TDotProductSharedKernel): boolean;
+      /// Retains Owner's resident codes/scales in place of this instance's (no
+      /// upload); B and result buffers stay. False when the check fails.
+      function BorrowCodesKeepingBuffers(
+        Owner: TDotProductSharedKernel): boolean;
+      /// Re-uploads VBias into the resident bias buffer when one exists (a
+      /// launch with a bias created it); a no-op otherwise.
+      procedure RefreshResidentBias(VBias: TNNetVolume);
       /// Int4 twin of ComputeInt8: same B operand, bias, activation and result
       /// contract, against the codes PrepareForComputeInt4 armed. Coded by Claude (AI).
       procedure ComputeInt4(VBs: TNNetVolume; pActFN: longint;
@@ -1194,19 +1213,7 @@ begin
   FFP16Activations := Owner.FInt8Ready and pFP16 and Assigned(FFP16Kernel) and
     Assigned(FFP16Kernel.Kernel);
 
-  clRetainMemObject(Owner.FCodesBuffer);
-  FCodesBuffer := Owner.FCodesBuffer;
-  FCapCodes := Owner.FCapCodes;
-  clRetainMemObject(Owner.FScalesBuffer);
-  FScalesBuffer := Owner.FScalesBuffer;
-  FCapScales := Owner.FCapScales;
-  if Assigned(Owner.FBlockScalesBuffer) then
-  begin
-    clRetainMemObject(Owner.FBlockScalesBuffer);
-    FBlockScalesBuffer := Owner.FBlockScalesBuffer;
-    FCapBlockScales := Owner.FCapBlockScales;
-  end;
-  FCodesBorrowed := true;
+  RetainCodesOf(Owner);
 
   NeededResult := FNumAs * FNumBs * csNeuralFloatSize;
   FResultBuffer := FDotProductKernel.CreateOutputBuffer(NeededResult);
@@ -1227,6 +1234,87 @@ begin
   FInt8Ready := Owner.FInt8Ready;
   FInt4Ready := Owner.FInt4Ready;
   Result := true;
+end;
+
+function TDotProductSharedKernel.CanBorrowCodesKeepingBuffers(
+  Owner: TDotProductSharedKernel): boolean;
+begin
+  Result := Assigned(Owner) and (Owner <> Self) and
+    (FInt8Ready or FInt4Ready) and
+    (Owner.FInt8Ready = FInt8Ready) and (Owner.FInt4Ready = FInt4Ready) and
+    (Owner.FNumAs = FNumAs) and (Owner.FSize = FSize) and
+    Assigned(Owner.FCodesBuffer) and Assigned(Owner.FScalesBuffer) and
+    ((not FInt4Ready) or Assigned(Owner.FBlockScalesBuffer)) and
+    (Owner.FDotProductKernel.Context = FDotProductKernel.Context);
+end;
+
+// Launches already enqueued keep the buffers they were given: OpenCL defers a
+// buffer's release until the commands using it finish. Coded by Claude (AI).
+function TDotProductSharedKernel.BorrowCodesKeepingBuffers(
+  Owner: TDotProductSharedKernel): boolean;
+var
+  OldCodes, OldScales, OldBlockScales: cl_mem;
+begin
+  Result := CanBorrowCodesKeepingBuffers(Owner);
+  if not Result then exit;
+  // Retain before release: Owner's buffers may already be the current ones.
+  OldCodes := FCodesBuffer;
+  OldScales := FScalesBuffer;
+  OldBlockScales := FBlockScalesBuffer;
+  RetainCodesOf(Owner);
+  clReleaseMemObject(OldCodes);
+  clReleaseMemObject(OldScales);
+  if Assigned(OldBlockScales) then clReleaseMemObject(OldBlockScales);
+  // A released handle value can be reused by a later buffer, so the cached
+  // split-K and single-pass bindings are dropped rather than compared.
+  FSplitKArgsBound := false;
+  FSinglePassArgsBound := false;
+  if Assigned(FTiledKernel) and (BindTiledCodesArgs() <> CL_SUCCESS) then
+  begin
+    // PrepareTiled binds a fresh handle to the new buffers on the next launch.
+    clReleaseKernel(FTiledKernel);
+    FTiledKernel := nil;
+  end;
+end;
+
+procedure TDotProductSharedKernel.RetainCodesOf(Owner: TDotProductSharedKernel);
+begin
+  clRetainMemObject(Owner.FCodesBuffer);
+  FCodesBuffer := Owner.FCodesBuffer;
+  FCapCodes := Owner.FCapCodes;
+  clRetainMemObject(Owner.FScalesBuffer);
+  FScalesBuffer := Owner.FScalesBuffer;
+  FCapScales := Owner.FCapScales;
+  if Assigned(Owner.FBlockScalesBuffer) then
+  begin
+    clRetainMemObject(Owner.FBlockScalesBuffer);
+    FCapBlockScales := Owner.FCapBlockScales;
+  end
+  else FCapBlockScales := 0;
+  FBlockScalesBuffer := Owner.FBlockScalesBuffer;
+  FCodesBorrowed := true;
+end;
+
+function TDotProductSharedKernel.BindTiledCodesArgs(): integer;
+begin
+  Result := clSetKernelArg(FTiledKernel, 4, csCLMemSize, @FCodesBuffer);
+  Result := Result or clSetKernelArg(FTiledKernel, 9, csCLMemSize,
+    @FScalesBuffer);
+  if FInt4Ready then
+    Result := Result or clSetKernelArg(FTiledKernel, 10, csCLMemSize,
+      @FBlockScalesBuffer);
+end;
+
+procedure TDotProductSharedKernel.RefreshResidentBias(VBias: TNNetVolume);
+var
+  err: integer;
+begin
+  if (VBias = nil) or (FBiasBuffer = nil) then exit;
+  err := CL_SUCCESS;
+  PrepareBiasOperand(VBias, {NewVBias=}true, err);
+  if err <> CL_SUCCESS then
+    ErrorProc('Error: TDotProductSharedKernel.RefreshResidentBias - failed ' +
+      'uploading the bias: ' + IntToStr(err));
 end;
 
 const
@@ -1363,11 +1451,8 @@ begin
   err := clSetKernelArg(FTiledKernel, 0, csLongintSize, @FNumAs);
   err := err or clSetKernelArg(FTiledKernel, 1, csLongintSize, @FNumBs);
   err := err or clSetKernelArg(FTiledKernel, 2, csLongintSize, @FSize);
-  err := err or clSetKernelArg(FTiledKernel, 4, csCLMemSize, @FCodesBuffer);
   err := err or clSetKernelArg(FTiledKernel, 6, csCLMemSize, @FResultBuffer);
-  err := err or clSetKernelArg(FTiledKernel, 9, csCLMemSize, @FScalesBuffer);
-  if FInt4Ready then
-    err := err or clSetKernelArg(FTiledKernel, 10, csCLMemSize, @FBlockScalesBuffer);
+  err := err or BindTiledCodesArgs();
   if err <> CL_SUCCESS then
   begin
     ErrorProc('Error: TDotProductSharedKernel.PrepareTiled - failed setting ' +

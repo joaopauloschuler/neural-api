@@ -1016,8 +1016,8 @@ type
       constructor Create(); override;
       destructor Destroy(); override;
       procedure RefreshNeuronWeightList();
-      // Neurons plus, when Owner is int8/int4, its tables by reference; a later
-      // EnableOpenCL retains Owner's codes. Needs SetPrevLayer. Coded by Claude (AI).
+      // Neurons plus, when Owner is int8/int4, its tables and resident OpenCL
+      // codes by reference. Needs SetPrevLayer. Coded by Claude (AI).
       function LinkWeightsFrom(Owner: TNNetLayer): boolean; override;
       // Converts the FP32 weights to per-output-channel symmetric int8
       // (scale = max|row|/127, round-to-nearest) and frees the FP32 weight
@@ -79548,6 +79548,9 @@ function TNNetLayerConcatedWeights.LinkWeightsFrom(Owner: TNNetLayer): boolean;
 var
   OwnerCW: TNNetLayerConcatedWeights;
   OwnerQuantized: boolean;
+  {$IFDEF OpenCL}
+  ShouldSwapOpenCLCodes: boolean;
+  {$ENDIF}
 begin
   Result := false;
   if (not Assigned(Owner)) or (Owner.ClassType <> Self.ClassType) then
@@ -79572,10 +79575,23 @@ begin
     exit;
   end;
   {$IFDEF OpenCL}
-  if FHasOpenCL then
+  // Resident codes follow the link by handle; any other weights already in
+  // OpenCL memory would go stale, so those layers refuse.
+  ShouldSwapOpenCLCodes := FHasOpenCL and Assigned(FDotCL) and
+    (FDotCL.Int8Ready or FDotCL.Int4Ready);
+  if ShouldSwapOpenCLCodes and not (Assigned(OwnerCW.FDotCL) and
+    FDotCL.CanBorrowCodesKeepingBuffers(OwnerCW.FDotCL)) then
   begin
-    FErrorProc(ClassName + '.LinkWeightsFrom: link before EnableOpenCL - the ' +
-      'device already holds this layer''s own weights.');
+    FErrorProc(ClassName + '.LinkWeightsFrom: layer ' + IntToStr(FLayerIdx) +
+      ' holds resident OpenCL codes, and the owner''s are not resident in ' +
+      'the same OpenCL context with the same shape and format.');
+    exit;
+  end;
+  if FHasOpenCL and (not ShouldSwapOpenCLCodes) and
+    not (FQuantInt8 or FQuantInt4) then
+  begin
+    FErrorProc(ClassName + '.LinkWeightsFrom: link before EnableOpenCL - ' +
+      'OpenCL memory already holds this layer''s own FP32 weights.');
     exit;
   end;
   {$ENDIF}
@@ -79610,9 +79626,22 @@ begin
       ArmInt4InputPlanes();
     end;
   end;
+  {$IFDEF OpenCL}
+  // CanBorrowCodesKeepingBuffers passed above; a failure here would leave the
+  // host tables and the OpenCL codes on different owners.
+  if ShouldSwapOpenCLCodes and
+    not FDotCL.BorrowCodesKeepingBuffers(OwnerCW.FDotCL) then
+    raise Exception.Create(ClassName + '.LinkWeightsFrom: internal error - ' +
+      'layer ' + IntToStr(FLayerIdx) + ' linked the owner''s host tables but ' +
+      'not its resident OpenCL codes.');
+  {$ENDIF}
   // FP32 owner: this layer keeps its own concatenated caches, rebuilt from
   // the shared rows here (only the rows themselves are shared).
   AfterWeightUpdate();
+  {$IFDEF OpenCL}
+  // The fused bias add reads a resident copy of FBiasOutput, just rebuilt.
+  if ShouldSwapOpenCLCodes then FDotCL.RefreshResidentBias(FBiasOutput);
+  {$ENDIF}
   Result := true;
 end;
 
@@ -79910,7 +79939,8 @@ end;
 // Interleaves FQuantTable's codes into the device layout (codes[a + i*NumAs],
 // the same transposed indexing cai_dot_product uses for FP32 weights, so
 // adjacent work-items read adjacent bytes) and arms FDotCL's resident int8 mode
-// against VBs. One-time: the codes/scales are immutable after quantization.
+// against VBs. One upload per owner: a later link swaps the handle
+// (LinkWeightsFrom), never re-uploads.
 // Coded by Claude (AI).
 procedure TNNetLayerConcatedWeights.PrepareInt8DotCL(VBs: TNNetVolume);
 var
@@ -79943,7 +79973,8 @@ end;
 // Device layout: packed[a + p*NumAs] holds codes k=2p (low nibble) and k+1
 // (high nibble) of row a, scales[a + blk*NumAs] the row's block scale; the
 // Q4_0 row keeps element j and j+16 of a block in one byte, so the pairs are
-// rebuilt here. One-time: the table is immutable after quantization.
+// rebuilt here. One upload per owner: a later link swaps the handle
+// (LinkWeightsFrom), never re-uploads.
 // Coded by Claude (AI).
 procedure TNNetLayerConcatedWeights.PrepareInt4DotCL(VBs: TNNetVolume);
 var
@@ -106629,7 +106660,7 @@ end;
 
 // Quantized device forward. The A operand is the RESIDENT interleaved code
 // buffer + scales armed by EnableOpenCL (PrepareInt8DotCL or PrepareInt4DotCL);
-// weights never re-upload (quantized layers are inference-only). Everything
+// weights never re-upload; LinkWeightsFrom may swap the handles. Everything
 // else mirrors ComputeOpenCL: same fused bias/activation verdict, same
 // device-im2col option (the B side is unchanged - cai_im2col gathers into the
 // same FInputBufferBs the int8 GEMM reads), same result loading.
@@ -109357,9 +109388,9 @@ end;
 // Int8-quantized device forward. Mirrors ComputeOpenCL's fused bias/activation
 // verdict, but the A operand is the RESIDENT interleaved code buffer + per-row
 // scales armed by EnableOpenCL (via PrepareInt8DotCL): the weights are never
-// re-uploaded (quantized layers are inference-only, so they never change) and
-// only the input vector travels to the device each forward. The bias buffer
-// uploads once (fresh-allocation force inside ComputeInt8) and stays resident.
+// re-uploaded (LinkWeightsFrom may swap their handles) and only the input
+// vector travels to the device each forward. The bias buffer uploads on its
+// first launch and again when LinkWeightsFrom swaps the codes.
 // Coded by Claude (AI).
 procedure TNNetFullConnect.ComputeOpenCLInt8();
 var
