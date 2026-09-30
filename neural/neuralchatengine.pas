@@ -1413,6 +1413,9 @@ var
   TwinBytes: int64;             // the prefill twins' NonWeightBytes
   CheckpointsGiven: boolean;    // --cache-checkpoints N was on the command line
   OpenCLOn: boolean;            // OpenCL offload is live (not fallen back)
+  {$IFDEF OpenCL}
+  OpenCLProblem: string;        // why --gpu fell back to the CPU
+  {$ENDIF}
   SlotPos: integer;
 begin
   Result := false;
@@ -1733,66 +1736,53 @@ begin
   if Opt.Gpu then
   begin
     GpuCL := TEasyOpenCL.Create();
-    if GpuCL.GetPlatformCount() = 0 then
+    if not GpuCL.SelectPlatformAndDevice(Opt.GpuPlatform, Opt.GpuDevice,
+      OpenCLProblem) then
     begin
-      Notice('[--gpu: no OpenCL platform found - falling back to CPU]');
+      Notice('[--gpu: ' + OpenCLProblem + ' - falling back to CPU]');
       FreeAndNil(GpuCL);
     end
     else
     begin
-      if (Opt.GpuPlatform < 0) or
-        (Opt.GpuPlatform >= GpuCL.GetPlatformCount()) then Opt.GpuPlatform := 0;
-      GpuCL.SetCurrentPlatform(GpuCL.PlatformIds[Opt.GpuPlatform]);
-      if GpuCL.GetDeviceCount() = 0 then
+      Notice('[--gpu: OpenCL on ' + GpuCL.PlatformNames[Opt.GpuPlatform] +
+        ' / ' + GpuCL.DeviceNames[Opt.GpuDevice] + ']');
+      if not Opt.GpuSharedKernel then
+        Notice('[--no-gpu-shared-kernel: per-layer kernels and command queues - ' +
+          'each layer waits for its sources, so --profile charges GPU time to ' +
+          'layers instead of the queue drain; slower than shared]');
+      if Opt.WeightMode = cwmInt4 then
+        Notice('[--int4 with --gpu: cai_dot_product_int4_splitk reads the' +
+          ' packed codes at half the int8 traffic; activations stay FP32]');
+      if Opt.ExperimentalFP16 then
+        Notice('[--experimental-fp16: under construction -' +
+          ' half-precision activations in the int8 matmuls; weights stay' +
+          ' int8, logits are not bit-exact. A device that rejects' +
+          ' cai_dot_product_int8_h keeps the FP32 activations]');
+      LoadStart := GetTickCount64();
+      // Read by TNNetLayerConcatedWeights.EnableOpenCL when it acquires the
+      // half kernel, so it must be assigned before the call below: that is
+      // what sizes the half B buffer, and a later write does nothing.
+      NN.OpenCLFP16 := Opt.ExperimentalFP16;
+      NN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
+        GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
+      if Assigned(WindowNN) then
       begin
-        Notice('[--gpu: no OpenCL device on platform ' +
-          GpuCL.PlatformNames[Opt.GpuPlatform] + ' - falling back to CPU]');
-        FreeAndNil(GpuCL);
-      end
-      else
-      begin
-        if (Opt.GpuDevice < 0) or
-          (Opt.GpuDevice >= GpuCL.GetDeviceCount()) then Opt.GpuDevice := 0;
-        Notice('[--gpu: OpenCL on ' + GpuCL.PlatformNames[Opt.GpuPlatform] +
-          ' / ' + GpuCL.DeviceNames[Opt.GpuDevice] + ']');
-        if not Opt.GpuSharedKernel then
-          Notice('[--no-gpu-shared-kernel: per-layer kernels and command queues - ' +
-            'each layer waits for its sources, so --profile charges GPU time to ' +
-            'layers instead of the queue drain; slower than shared]');
-        if Opt.WeightMode = cwmInt4 then
-          Notice('[--int4 with --gpu: cai_dot_product_int4_splitk reads the' +
-            ' packed codes at half the int8 traffic; activations stay FP32]');
-        if Opt.ExperimentalFP16 then
-          Notice('[--experimental-fp16: under construction -' +
-            ' half-precision activations in the int8 matmuls; weights stay' +
-            ' int8, logits are not bit-exact. A device that rejects' +
-            ' cai_dot_product_int8_h keeps the FP32 activations]');
-        LoadStart := GetTickCount64();
-        // Read by TNNetLayerConcatedWeights.EnableOpenCL when it acquires the
-        // half kernel, so it must be assigned before the call below: that is
-        // what sizes the half B buffer, and a later write does nothing.
-        NN.OpenCLFP16 := Opt.ExperimentalFP16;
-        NN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
-          GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
-        if Assigned(WindowNN) then
-        begin
-          WindowNN.OpenCLFP16 := Opt.ExperimentalFP16;
-          // A borrowing twin must live in NN's OpenCL context to retain
-          // NN's resident codes (a context of its own cannot share cl_mem).
-          if WindowBorrowsWeights then
-            WindowNN.EnableOpenCLInContextOf(NN, Opt.GpuSharedKernel)
-          else
-            WindowNN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
-              GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
-        end;
-        if Assigned(TailNN) then // only built when it borrows
-        begin
-          TailNN.OpenCLFP16 := Opt.ExperimentalFP16;
-          TailNN.EnableOpenCLInContextOf(NN, Opt.GpuSharedKernel);
-        end;
-        Notice(Format('GPU weights uploaded in %.1fs.',
-          [(GetTickCount64() - LoadStart) / 1000]));
+        WindowNN.OpenCLFP16 := Opt.ExperimentalFP16;
+        // A borrowing twin must live in NN's OpenCL context to retain
+        // NN's resident codes (a context of its own cannot share cl_mem).
+        if WindowBorrowsWeights then
+          WindowNN.EnableOpenCLInContextOf(NN, Opt.GpuSharedKernel)
+        else
+          WindowNN.EnableOpenCL(GpuCL.PlatformIds[Opt.GpuPlatform],
+            GpuCL.Devices[Opt.GpuDevice], Opt.GpuSharedKernel);
       end;
+      if Assigned(TailNN) then // only built when it borrows
+      begin
+        TailNN.OpenCLFP16 := Opt.ExperimentalFP16;
+        TailNN.EnableOpenCLInContextOf(NN, Opt.GpuSharedKernel);
+      end;
+      Notice(Format('GPU weights uploaded in %.1fs.',
+        [(GetTickCount64() - LoadStart) / 1000]));
     end;
   end;
   {$ENDIF}
