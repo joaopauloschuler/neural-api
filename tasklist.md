@@ -1890,6 +1890,12 @@ rather than acted on.
         encoder 39.8 s; VAE decode 33.3 s (CPU); peak RSS 8.8 GB. 2.2 s/step is
         ~1.6 TFLOPS of projections, far below the L4, so host layers,
         transfers and synchronisation dominate at 256 tokens.
+        Second GPU run (user, 2026-09-30, L4): 1024x1024 --int4, 10 steps:
+        36.3 s/step (16.5x the 256x256 step for 16x the tokens: linear, so
+        attention does not dominate; ~75 TFLOP/step, ~2 TFLOPS achieved),
+        denoise 370.4 s, VAE decode 528.2 s (CPU, now the largest cost), load
+        transformer 245.2 s, peak RSS 10.9 GB. B1f runs before B1d2 to tell
+        the int4 projection kernel, the host layers and the transfers apart.
     - [ ] B1f. Per-layer time profile of one GPU step (user's GPU box), to
           measure where the step time goes before further kernel work.
     - [ ] B1g. Transformer load time with OpenCL (240 s vs 148 s on the CPU):
