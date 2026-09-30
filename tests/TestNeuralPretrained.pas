@@ -740,6 +740,7 @@ type
     procedure TestQwenImage21PipelineSeededLatents;
     procedure TestQwen3VLEncodeRefusesOutOfVocabIds;
     procedure TestQwenImage21ParallelMatchesSerial;
+    procedure TestQwenImage21PipelineOpenCL;
     procedure TestQwen2AudioConfigFromJSONFile;
     procedure TestQwen2AudioParity;
     procedure TestViTConfigFromJSONFile;
@@ -26079,13 +26080,15 @@ var
         pWeightFormat);
       Rearmed.EncodePrefix(Embeds);
       Rearmed.PrepareStepPass(GridH, GridW);
-      Rearmed.EnableOpenCL(PlatformId, DeviceId);
+      AssertTrue(FormatName + ': re-armed transformer arms OpenCL',
+        Rearmed.EnableOpenCL(PlatformId, DeviceId));
       ForceQwenImage21StepProjectionsOpenCL(Rearmed);
       SetStepModulation(Rearmed);
       // Armed before the step net exists: PrepareStepPass arms it.
       Swapped := TQwenImage21Transformer.Create(QwenImage21TransformerFolder(),
         pWeightFormat);
-      Swapped.EnableOpenCL(PlatformId, DeviceId);
+      AssertTrue(FormatName + ': swapped transformer arms OpenCL',
+        Swapped.EnableOpenCL(PlatformId, DeviceId));
       Swapped.EncodePrefix(Embeds);
       Swapped.PrepareStepPass(GridH, GridW);
       AssertTrue(FormatName + ': the rebuilt step net is armed',
@@ -26243,7 +26246,8 @@ var
       Transformer := TQwenImage21Transformer.Create(
         QwenImage21TransformerFolder(), pWeightFormat);
       Transformer.EncodePrefix(Embeds);
-      Transformer.EnableOpenCL(PlatformId, DeviceId);
+      AssertTrue(FormatName + ': transformer arms OpenCL',
+        Transformer.EnableOpenCL(PlatformId, DeviceId));
       MaxBlockPos := Transformer.Config.NumLayers - 1;
       SetLength(StoreCodes, MaxBlockPos + 1);
       for BlockCnt := 0 to MaxBlockPos do
@@ -26282,7 +26286,8 @@ var
         Transformer.BlockStoreLayers[MaxBlockPos].QProj));
       OtherContext := TQwenImage21Transformer.Create(
         QwenImage21TransformerFolder(), pWeightFormat);
-      OtherContext.EnableOpenCL(PlatformId, DeviceId);
+      AssertTrue(FormatName + ': second-context transformer arms OpenCL',
+        OtherContext.EnableOpenCL(PlatformId, DeviceId));
       AssertFalse(FormatName + ': to_q refuses codes of another context',
         Transformer.StepBlock.QProj.LinkWeightsFrom(
           OtherContext.BlockStoreLayers[0].QProj));
@@ -27040,6 +27045,112 @@ begin
     EmbedsSerial.Free;
   end;
 end;
+
+// The pipeline with the transformer step pass on OpenCL (int8) matches the CPU
+// run; with FP32 weights the request falls back to the CPU, bit for bit.
+procedure TTestNeuralPretrained.TestQwenImage21PipelineOpenCL;
+{$IFDEF OpenCL}
+const
+  FixtureName = 'tiny_qwenimage21_pipeline_64_io.json';
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Transformer: TQwenImage21Transformer;
+  Embeds, Initial, Velocity, ImageCPU, ImageOpenCL, ImageFP32CPU,
+    ImageFP32Requested: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Width, Height, StepCount: integer;
+  Diff: double;
+
+  procedure RunPipeline(pWeightFormat: TQwenImage21WeightFormat;
+    RequestOpenCL, ExpectOnOpenCL: boolean; Image: TNNetVolume;
+    const What: string);
+  var
+    Pipeline: TQwenImage21Pipeline;
+  begin
+    Pipeline := TQwenImage21Pipeline.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/model_index.json')));
+    try
+      Pipeline.TransformerFormat := pWeightFormat;
+      if RequestOpenCL then Pipeline.EnableOpenCL(PlatformId, DeviceId);
+      Pipeline.GenerateFromEmbeds(Embeds, Width, Height, StepCount,
+        {Seed=}0, Image, Initial);
+      AssertTrue(What + ': TransformerOnOpenCL',
+        Pipeline.TransformerOnOpenCL = ExpectOnOpenCL);
+    finally
+      Pipeline.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Transformer := nil;
+  Embeds := TNNetVolume.Create;
+  Initial := TNNetVolume.Create;
+  Velocity := TNNetVolume.Create;
+  ImageCPU := TNNetVolume.Create;
+  ImageOpenCL := TNNetVolume.Create;
+  ImageFP32CPU := TNNetVolume.Create;
+  ImageFP32Requested := TNNetVolume.Create;
+  try
+    RefJson.LoadFromFile(FixturePath(FixtureName));
+    RefRoot := GetJSON(RefJson.Text);
+    Width := TJSONObject(RefRoot).Get('width', 0);
+    Height := TJSONObject(RefRoot).Get('height', 0);
+    StepCount := TJSONObject(RefRoot).Get('num_inference_steps', 0);
+    LoadOracleTokenTensor(RefRoot, 'prompt_embeds', Embeds);
+    LoadOracleTokenTensor(RefRoot, 'initial_latents', Initial);
+    // Without ForceOpenCL, the pico projections' own size verdict takes the
+    // OpenCL path, so the pipeline run below exercises it.
+    Transformer := TQwenImage21Transformer.Create(
+      QwenImage21TransformerFolder(), qiwInt8);
+    AssertTrue('int8 transformer arms OpenCL',
+      Transformer.EnableOpenCL(PlatformId, DeviceId));
+    Transformer.EncodePrefix(Embeds);
+    Transformer.PredictVelocity(Initial, 0.9,
+      Height div csQwenImage21PixelsPerLatent,
+      Width div csQwenImage21PixelsPerLatent, Velocity);
+    AssertTrue('GateUp ran on OpenCL',
+      Transformer.StepBlock.GateUp.ForwardGPUCnt > 0);
+    FreeAndNil(Transformer);
+
+    RunPipeline(qiwInt8, false, false, ImageCPU, 'int8 CPU');
+    RunPipeline(qiwInt8, true, true, ImageOpenCL, 'int8 OpenCL');
+    Diff := MaxAbsVolumeDiff(ImageOpenCL, ImageCPU);
+    WriteLn('  Qwen-Image-2.1 pipeline int8 OpenCL vs CPU image: max|diff|=',
+      Diff:0:9);
+    AssertTrue('int8 OpenCL vs CPU image max|diff| ' + FloatToStr(Diff) +
+      ' must be < 1e-4', Diff < 1e-4);
+    RunPipeline(qiwFP32, false, false, ImageFP32CPU, 'FP32 CPU');
+    RunPipeline(qiwFP32, true, false, ImageFP32Requested,
+      'FP32 with OpenCL requested');
+    AssertEquals('FP32 with OpenCL requested runs on the CPU, bit for bit', 0,
+      MaxAbsVolumeDiff(ImageFP32Requested, ImageFP32CPU), 0);
+  finally
+    Transformer.Free;
+    ImageFP32Requested.Free;
+    ImageFP32CPU.Free;
+    ImageOpenCL.Free;
+    ImageCPU.Free;
+    Velocity.Free;
+    Initial.Free;
+    Embeds.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
 
 procedure TTestNeuralPretrained.TestQwenImage21PipelineSeededLatents;
 var

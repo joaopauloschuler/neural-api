@@ -2,8 +2,9 @@ program QwenImage;
 (*
 QwenImage: Qwen-Image-2.1 text-to-image from a diffusers checkpoint folder
 (Qwen/Qwen-Image-2.1: model_index.json, processor/, text_encoder/,
-transformer/, vae/, scheduler/), on the CPU, through TQwenImage21Pipeline
-(neural/neuralpretrained.pas):
+transformer/, vae/, scheduler/), through TQwenImage21Pipeline
+(neural/neuralpretrained.pas). The transformer step pass runs on OpenCL by
+default (int8/int4 weights); everything else runs on the CPU:
 
   prompt -> processor/tokenizer.json -> Qwen3-VL text encoder (freed)
     -> transformer prefix pass (text K/V, once)
@@ -19,6 +20,8 @@ USAGE
             [--width 1024] [--height 1024] [--steps 40] [--seed 42]
             [--int8 | --int4] [--int8-input] [--vae-tile SIZE[,STRIDE]]
             [--serial] [--max-threads N]
+            [--gpu | --cpu] [--gpu-platform N] [--gpu-device N]
+            [--no-gpu-shared-kernel]
             [--token-ids ID,ID,... --drop-count N]
 Run with --help for what each flag does.
 
@@ -37,7 +40,7 @@ uses
   // cmem is skipped in the Debug build mode: it enables Valgrind (-gv), and
   // FPC then pulls in cmem itself, so naming it here is a duplicate.
   {$IFDEF UNIX}cthreads, {$IFNDEF Debug}cmem,{$ENDIF}{$ENDIF}
-  SysUtils, Classes,
+  SysUtils, Classes, {$IFDEF OpenCL}neuralopencl,{$ENDIF}
   neuralvolume, neuralnetwork, neuralpretrained, neuraldatasets, neuralthread;
 
 const
@@ -149,7 +152,8 @@ end;
 
 procedure PrintHelp();
 begin
-  WriteLn('QwenImage: Qwen-Image-2.1 text-to-image (CPU).');
+  WriteLn('QwenImage: Qwen-Image-2.1 text-to-image (CPU; OpenCL for the ',
+    'transformer step pass).');
   WriteLn('  --model DIR          diffusers folder with model_index.json (required)');
   WriteLn('  --prompt TEXT        prompt (default: "', csDefaultPrompt, '")');
   WriteLn('  --output FILE        image file; .png keeps the alpha channel ',
@@ -178,8 +182,20 @@ begin
     '--prompt (no processor/ needed)');
   WriteLn('  --drop-count N       leading system-prompt tokens to drop with ',
     '--token-ids (default 0)');
-  WriteLn('OpenCL is not offered: the transformer''s weight swap runs on the ',
-    'CPU only (tasklist B1).');
+  WriteLn('  --gpu                OpenCL for the transformer step pass ',
+    '(DEFAULT when built with -dOpenCL);');
+  WriteLn('                       needs --int8 or --int4 (FP32 weights run ',
+    'on the CPU). The text encoder,');
+  WriteLn('                       the transformer prefix pass and the VAE ',
+    'always run on the CPU.');
+  WriteLn('  --cpu                run everything on the CPU');
+  WriteLn('  --gpu-platform N     OpenCL platform index (default 0)');
+  WriteLn('  --gpu-device N       OpenCL device index within the platform ',
+    '(default 0)');
+  WriteLn('  --no-gpu-shared-kernel  give each layer private OpenCL kernels ',
+    'and command queue instead');
+  WriteLn('                       of the net-wide shared ones (default: ',
+    'shared, which is faster)');
 end;
 
 function ParseTokenIds(const List: string): TNeuralIntegerArray;
@@ -205,6 +221,14 @@ var
   Width, Height, StepCount, DropCount, ArgPos, CommaPos: integer;
   Seed: cardinal;
   UseInt8, UseInt4, UseInt8Input, UseSerial: boolean;
+  UseOpenCL, HasSharedKernel: boolean;
+  OpenCLPlatform, OpenCLDevice: integer;
+  ComputeText: string;
+  {$IFDEF OpenCL}
+  OpenCLDevices: TEasyOpenCL;
+  OpenCLProblem: string;
+  RequestedPlatform, RequestedDevice: integer;
+  {$ENDIF}
   VaeTileSize, VaeTileStride, MaxThreads: integer;
   Pipeline: TQwenImage21Pipeline;
   Reporter: TQwenImageReporter;
@@ -240,6 +264,10 @@ begin
   MaxThreads := 0;
   VaeTileSize := 128;
   VaeTileStride := 96;
+  UseOpenCL := {$IFDEF OpenCL}true{$ELSE}false{$ENDIF};
+  OpenCLPlatform := 0;
+  OpenCLDevice := 0;
+  HasSharedKernel := true;
   ArgPos := 1;
   while ArgPos <= ParamCount do
   begin
@@ -258,6 +286,11 @@ begin
     else if Arg = '--max-threads' then MaxThreads := StrToInt(NextArg())
     else if Arg = '--token-ids' then TokenList := NextArg()
     else if Arg = '--drop-count' then DropCount := StrToInt(NextArg())
+    else if Arg = '--gpu' then UseOpenCL := true
+    else if Arg = '--cpu' then UseOpenCL := false
+    else if Arg = '--gpu-platform' then OpenCLPlatform := StrToInt(NextArg())
+    else if Arg = '--gpu-device' then OpenCLDevice := StrToInt(NextArg())
+    else if Arg = '--no-gpu-shared-kernel' then HasSharedKernel := false
     else if Arg = '--vae-tile' then
     begin
       TileArg := NextArg();
@@ -312,6 +345,9 @@ begin
   PromptEmbeds := TNNetVolume.Create();
   Image := TNNetVolume.Create();
   Pipeline := nil;
+  {$IFDEF OpenCL}
+  OpenCLDevices := nil;
+  {$ENDIF}
   try
   try
     Pipeline := TQwenImage21Pipeline.Create(ModelFolder);
@@ -325,6 +361,47 @@ begin
     Pipeline.MaxThreads := MaxThreads;
     Pipeline.OnPhase := @Reporter.OnPhase;
     Pipeline.OnStep := @Reporter.OnStep;
+    if UseOpenCL then ComputeText := 'CPU' else ComputeText := 'CPU (--cpu)';
+    {$IFDEF OpenCL}
+    if UseOpenCL and not (UseInt8 or UseInt4) then
+    begin
+      WriteLn('[OpenCL: the transformer step pass needs --int8 or --int4 - ',
+        'FP32 weights run on the CPU]');
+      ComputeText := 'CPU (FP32 weights)';
+      UseOpenCL := false;
+    end;
+    if UseOpenCL then
+    begin
+      OpenCLDevices := TEasyOpenCL.Create();
+      RequestedPlatform := OpenCLPlatform;
+      RequestedDevice := OpenCLDevice;
+      if OpenCLDevices.SelectPlatformAndDevice(OpenCLPlatform, OpenCLDevice,
+        OpenCLProblem) then
+      begin
+        if OpenCLPlatform <> RequestedPlatform then
+          WriteLn('[--gpu-platform ', RequestedPlatform, ' out of range, ',
+            'using ', OpenCLPlatform, ']');
+        if OpenCLDevice <> RequestedDevice then
+          WriteLn('[--gpu-device ', RequestedDevice, ' out of range, using ',
+            OpenCLDevice, ']');
+        Pipeline.EnableOpenCL(OpenCLDevices.PlatformIds[OpenCLPlatform],
+          OpenCLDevices.Devices[OpenCLDevice], HasSharedKernel);
+        ComputeText := 'OpenCL requested on ' +
+          OpenCLDevices.PlatformNames[OpenCLPlatform] + ' / ' +
+          OpenCLDevices.DeviceNames[OpenCLDevice] + ' (transformer step pass';
+        if not HasSharedKernel then
+          ComputeText := ComputeText + ', per-layer kernels';
+        ComputeText := ComputeText + '); the rest on the CPU';
+      end
+      else
+      begin
+        WriteLn('[--gpu: ', OpenCLProblem, ' - falling back to CPU]');
+        ComputeText := 'CPU (' + OpenCLProblem + ')';
+      end;
+    end;
+    {$ELSE}
+    ComputeText := 'CPU (built without OpenCL)';
+    {$ENDIF}
     Width := TQwenImage21Pipeline.RoundDownImageSide(Width);
     Height := TQwenImage21Pipeline.RoundDownImageSide(Height);
     WriteLn('Model      : ', ModelFolder);
@@ -334,6 +411,7 @@ begin
     else if UseInt4 then
       WriteLn('Weights    : transformer int4, text encoder int8')
     else WriteLn('Weights    : FP32');
+    WriteLn('Compute    : ', ComputeText);
     WriteLn('VAE tiles  : ', VaeTileSize, ' px every ', VaeTileStride, ' px');
     if UseSerial then WriteLn('Threads    : serial (single-threaded)')
     else if MaxThreads > 0 then
@@ -355,6 +433,11 @@ begin
     Pipeline.EncodeTokenIds(TokenIds, DropCount, PromptEmbeds);
     Pipeline.GenerateFromEmbeds(PromptEmbeds, Width, Height, StepCount, Seed,
       Image);
+    if Pipeline.TransformerOnOpenCL then
+      WriteLn('Compute    : the transformer step pass ran on OpenCL')
+    else if UseOpenCL then
+      WriteLn('Compute    : the transformer step pass ran on the CPU ',
+        '(see the notice above)');
     Image.Mul(255);
     if not SaveImageFromVolumeIntoFile(Image, OutputFile) then
       raise Exception.Create('could not write ' + OutputFile);
@@ -363,6 +446,9 @@ begin
       ' s; ', MemoryReport());
   finally
     Pipeline.Free;
+    {$IFDEF OpenCL}
+    OpenCLDevices.Free;
+    {$ENDIF}
     Image.Free;
     PromptEmbeds.Free;
     Reporter.Free;

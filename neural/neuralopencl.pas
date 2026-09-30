@@ -137,6 +137,10 @@ type
 
     procedure SetCurrentPlatform(pPlatformId: cl_platform_id);
     procedure SetCurrentDevice(pDeviceId: cl_device_id);
+    // Makes platform PlatformIdx and its device DeviceIdx current (an index out
+    // of range becomes 0); false, with Problem saying why, when none exists.
+    function SelectPlatformAndDevice(var PlatformIdx, DeviceIdx: integer;
+      out Problem: string): boolean;
 
     procedure CompileProgramFromFile(filename:string); overload;
     procedure CompileProgram(programsource: TStrings); overload;
@@ -2649,6 +2653,29 @@ begin
   FMaxComputeUnits := 0;
   FMaxWorkGroupSize := 0;
   FLocalMemSize := 0;
+end;
+
+function TEasyOpenCL.SelectPlatformAndDevice(var PlatformIdx,
+  DeviceIdx: integer; out Problem: string): boolean;
+begin
+  Result := false;
+  Problem := '';
+  if GetPlatformCount() = 0 then
+  begin
+    Problem := 'no OpenCL platform found';
+    exit;
+  end;
+  if (PlatformIdx < 0) or (PlatformIdx >= GetPlatformCount()) then
+    PlatformIdx := 0;
+  SetCurrentPlatform(FPlatformIds[PlatformIdx]);
+  if GetDeviceCount() = 0 then
+  begin
+    Problem := 'no OpenCL device on platform ' + FPlatformNames[PlatformIdx];
+    exit;
+  end;
+  if (DeviceIdx < 0) or (DeviceIdx >= GetDeviceCount()) then DeviceIdx := 0;
+  SetCurrentDevice(FDevices[DeviceIdx]);
+  Result := true;
 end;
 
 procedure TEasyOpenCL.CompileProgramFromFile(filename: string);

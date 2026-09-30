@@ -8791,9 +8791,9 @@ type
     procedure SelectBlockWeights(NN: TNNet; BlockIdx: integer);
     {$IFDEF OpenCL}
     // Uploads every block's int8/int4 codes once, in one OpenCL context, and
-    // arms StepNet there (SelectBlockWeights swaps handles); PrefixNet: CPU.
-    procedure EnableOpenCL(pPlatform: cl_platform_id; pDevice: cl_device_id;
-      pHasSharedKernel: boolean = true);
+    // arms StepNet there; false (nothing armed) if the program fails to build.
+    function EnableOpenCL(pPlatform: cl_platform_id; pDevice: cl_device_id;
+      pHasSharedKernel: boolean = true): boolean;
     property OpenCLEnabled: boolean read FOpenCLEnabled;
     {$ENDIF}
     property Config: TQwenImage21TransformerConfig read FConfig;
@@ -8932,7 +8932,14 @@ type
     FMaxThreads: integer;
     FOnPhase: TQwenImage21PhaseEvent;
     FOnStep: TQwenImage21StepEvent;
+    FTransformerOnOpenCL: boolean;
+    {$IFDEF OpenCL}
+    FOpenCLRequested, FOpenCLHasSharedKernel: boolean;
+    FOpenCLPlatform: cl_platform_id;
+    FOpenCLDevice: cl_device_id;
+    {$ENDIF}
     procedure DoPhase(Phase: TQwenImage21PipelinePhase);
+    procedure EnableTransformerOpenCL(Transformer: TQwenImage21Transformer);
     function ComponentFolder(const Component: string): string;
     procedure CheckImageSize(Width, Height: integer);
   public
@@ -8970,6 +8977,15 @@ type
       InitialLatents: TNNetVolume = nil);
     procedure Generate(const Prompt: string; Width, Height, StepCount: integer;
       Seed: cardinal; Image: TNNetVolume);
+    {$IFDEF OpenCL}
+    // Denoise runs the transformer step pass on this OpenCL device (int8/int4
+    // weights); text encoder, prefix pass and VAE stay on the CPU.
+    procedure EnableOpenCL(pPlatform: cl_platform_id; pDevice: cl_device_id;
+      pHasSharedKernel: boolean = true);
+    {$ENDIF}
+    // The last Denoise ran the step pass with OpenCL armed; when the request
+    // could not be met, Denoise printed why and ran it on the CPU.
+    property TransformerOnOpenCL: boolean read FTransformerOnOpenCL;
     property ModelFolder: string read FModelFolder;
     property Scheduler: TNNetFlowMatchEulerScheduler read FScheduler;
     property TransformerConfig: TQwenImage21TransformerConfig
@@ -82190,19 +82206,23 @@ begin
 end;
 
 {$IFDEF OpenCL}
-procedure TQwenImage21Transformer.EnableOpenCL(pPlatform: cl_platform_id;
-  pDevice: cl_device_id; pHasSharedKernel: boolean);
+function TQwenImage21Transformer.EnableOpenCL(pPlatform: cl_platform_id;
+  pDevice: cl_device_id; pHasSharedKernel: boolean): boolean;
 var
   BlockCnt, MaxBlockPos: integer;
 begin
+  Result := true;
   if FOpenCLEnabled then exit;
   if FWeightFormat = qiwFP32 then
     raise Exception.Create('TQwenImage21Transformer.EnableOpenCL: needs int8 ' +
       'or int4 block weights (only resident codes follow SelectBlockWeights).');
   FBlockStore[0].EnableOpenCL(pPlatform, pDevice, pHasSharedKernel);
+  // TNNet.EnableOpenCL has printed why the program is unavailable.
   if not FBlockStoreLayers[0].QProj.HasOpenCL then
-    raise Exception.Create('TQwenImage21Transformer.EnableOpenCL: the ' +
-      'OpenCL program is unavailable (see the message above).');
+  begin
+    FBlockStore[0].DisableOpenCL();
+    exit(false);
+  end;
   // One context: a borrowed cl_mem is only valid in the context that made it.
   MaxBlockPos := FConfig.NumLayers - 1;
   for BlockCnt := 1 to MaxBlockPos do
@@ -82561,6 +82581,7 @@ begin
       ComponentFolder('transformer'), FTransformerFormat, FInt8Input);
     Transformer.Parallel := FParallel;
     Transformer.MaxThreads := FMaxThreads;
+    EnableTransformerOpenCL(Transformer);
     DoPhase(qppEncodePrefix);
     Transformer.EncodePrefix(PromptEmbeds);
     DoPhase(qppDenoise);
@@ -82579,6 +82600,34 @@ begin
     Velocity.Free;
   end;
 end;
+
+procedure TQwenImage21Pipeline.EnableTransformerOpenCL(
+  Transformer: TQwenImage21Transformer);
+begin
+  FTransformerOnOpenCL := false;
+  {$IFDEF OpenCL}
+  if not FOpenCLRequested then exit;
+  if FTransformerFormat = qiwFP32 then
+    WriteLn('[OpenCL: the transformer step pass needs int8 or int4 weights, ' +
+      'not FP32 - running it on the CPU]')
+  else if Transformer.EnableOpenCL(FOpenCLPlatform, FOpenCLDevice,
+    FOpenCLHasSharedKernel) then FTransformerOnOpenCL := true
+  else
+    WriteLn('[OpenCL: program unavailable - running the transformer step ' +
+      'pass on the CPU]');
+  {$ENDIF}
+end;
+
+{$IFDEF OpenCL}
+procedure TQwenImage21Pipeline.EnableOpenCL(pPlatform: cl_platform_id;
+  pDevice: cl_device_id; pHasSharedKernel: boolean);
+begin
+  FOpenCLRequested := true;
+  FOpenCLPlatform := pPlatform;
+  FOpenCLDevice := pDevice;
+  FOpenCLHasSharedKernel := pHasSharedKernel;
+end;
+{$ENDIF}
 
 procedure TQwenImage21Pipeline.DecodeLatents(Latents: TNNetVolume; Width,
   Height: integer; Image: TNNetVolume);
