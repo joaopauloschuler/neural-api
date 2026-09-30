@@ -499,6 +499,7 @@ type
     // cannot tell the two apart, so the test also fills the source layer's host
     // output with a sentinel and asserts nothing overwrote it. Coded by Claude (AI).
     procedure TestPointwiseConvResidentInputOpenCLParity;
+    procedure TestLayerProfilingOpenCLCounts;
     // The fully-connected case of the same bind, over both weight formats: FP32
     // through cai_dot_product and int8 through cai_dot_product_int8. Same
     // sentinel probe on the source layer. Coded by Claude (AI).
@@ -66421,6 +66422,62 @@ begin
         MaxDiff < 1e-4);
     finally
       OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// TNNet.LayerProfiling on OpenCL, with shared and with private kernels: a
+// layer on OpenCL counts one profiled forward per pass, and the input layer
+// counts its uploads. Coded by Claude (AI).
+procedure TTestNeuralNumerical.TestLayerProfilingOpenCLCounts;
+{$IFDEF OpenCL}
+const
+  PassCount = 3;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  InputLayer, PointwiseConv: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  PassCnt, KernelModeCnt: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for KernelModeCnt := 0 to 1 do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(6, 6, 8);
+    try
+      InputLayer := NN.AddLayer(TNNetInput.Create(6, 6, 8, 1));
+      PointwiseConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(4));
+      NN.SetTrainable(False, False);
+      Input.FillForDebug();
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId,
+        {pHasSharedKernel=}KernelModeCnt = 0);
+      NN.LayerProfiling := true;
+      NN.ClearTime();
+      for PassCnt := 1 to PassCount do NN.Compute(Input);
+      NN.ForceOpenCL(False);
+      AssertEquals('pointwise conv on OpenCL every pass', PassCount,
+        PointwiseConv.ForwardGPUCnt);
+      AssertEquals('profiled forwards = passes', PassCount,
+        PointwiseConv.ProfiledForwardCnt);
+      AssertTrue('the input layer counts its uploads',
+        InputLayer.ProfiledTransfers.UploadCount > 0);
+      AssertTrue('upload bytes counted',
+        InputLayer.ProfiledTransfers.UploadBytes >= Input.Size * 4);
+    finally
       Input.Free;
       NN.Free;
     end;

@@ -21,7 +21,7 @@ USAGE
             [--int8 | --int4] [--int8-input] [--vae-tile SIZE[,STRIDE]]
             [--serial] [--max-threads N]
             [--gpu | --cpu] [--gpu-platform N] [--gpu-device N]
-            [--no-gpu-shared-kernel]
+            [--no-gpu-shared-kernel] [--profile]
             [--token-ids ID,ID,... --drop-count N]
 Run with --help for what each flag does.
 
@@ -196,6 +196,17 @@ begin
     'and command queue instead');
   WriteLn('                       of the net-wide shared ones (default: ',
     'shared, which is faster)');
+  WriteLn('  --profile            after the image, per-layer time of the ',
+    'transformer step pass (by block');
+  WriteLn('                       role and by layer class, summed over the ',
+    'blocks and steps) and of the');
+  WriteLn('                       prefix pass. The OpenCL queue is drained ',
+    'after every layer that fed it,');
+  WriteLn('                       so each row includes its kernels and ',
+    'transfers; steps run slower.');
+  WriteLn('                       With --no-gpu-shared-kernel the layer ',
+    'queues are private: the table header');
+  WriteLn('                       says which queues are drained.');
 end;
 
 function ParseTokenIds(const List: string): TNeuralIntegerArray;
@@ -220,7 +231,7 @@ var
   ModelFolder, Prompt, OutputFile, TokenList, Arg, TileArg: string;
   Width, Height, StepCount, DropCount, ArgPos, CommaPos: integer;
   Seed: cardinal;
-  UseInt8, UseInt4, UseInt8Input, UseSerial: boolean;
+  UseInt8, UseInt4, UseInt8Input, UseSerial, UseProfile: boolean;
   UseOpenCL, HasSharedKernel: boolean;
   OpenCLPlatform, OpenCLDevice: integer;
   ComputeText: string;
@@ -261,6 +272,7 @@ begin
   UseInt4 := false;
   UseInt8Input := false;
   UseSerial := false;
+  UseProfile := false;
   MaxThreads := 0;
   VaeTileSize := 128;
   VaeTileStride := 96;
@@ -291,6 +303,7 @@ begin
     else if Arg = '--gpu-platform' then OpenCLPlatform := StrToInt(NextArg())
     else if Arg = '--gpu-device' then OpenCLDevice := StrToInt(NextArg())
     else if Arg = '--no-gpu-shared-kernel' then HasSharedKernel := false
+    else if Arg = '--profile' then UseProfile := true
     else if Arg = '--vae-tile' then
     begin
       TileArg := NextArg();
@@ -359,6 +372,7 @@ begin
     Pipeline.VaeTileStride := VaeTileStride;
     Pipeline.Parallel := not UseSerial;
     Pipeline.MaxThreads := MaxThreads;
+    Pipeline.LayerProfiling := UseProfile;
     Pipeline.OnPhase := @Reporter.OnPhase;
     Pipeline.OnStep := @Reporter.OnStep;
     if UseOpenCL then ComputeText := 'CPU' else ComputeText := 'CPU (--cpu)';
@@ -444,6 +458,11 @@ begin
     WriteLn('Wrote ', OutputFile, ' (', Image.SizeX, 'x', Image.SizeY, 'x',
       Image.Depth, ') in ', ((GetTickCount64 - StartTime) / 1000):0:1,
       ' s; ', MemoryReport());
+    if UseProfile then
+    begin
+      WriteLn;
+      Write(Pipeline.TransformerProfileReport);
+    end;
   finally
     Pipeline.Free;
     {$IFDEF OpenCL}

@@ -83,6 +83,11 @@ type
   TDeviceNames = array of string;
   TDevices = array of cl_device_id;
 
+  // Host<->OpenCL transfers issued through TEasyOpenCL's Write/Read routines.
+  TOpenCLTransferCounts = record
+    UploadCount, UploadBytes, DownloadCount, DownloadBytes: Int64;
+  end;
+
   { TEasyOpenCL }
   TEasyOpenCL = class(TMObject)
   private
@@ -648,6 +653,22 @@ procedure SetTiledGemmMinColumns(pValue: integer);
 /// _MAX_CHUNK_ROWS are set.
 procedure FusedSDPASplitSizing(out GroupsPerUnit, MinChunkRows, MaxSplits,
   MaxChunkRows: integer);
+
+var
+  // While true, TEasyOpenCL's Write/Read routines add every transfer to the
+  // calling thread's OpenCLThreadTransfers; TNNet.LayerProfiling sets it.
+  // It stays on once set: one threadvar add per transfer from then on.
+  OpenCLTransferCounting: boolean = false;
+
+threadvar
+  OpenCLThreadTransfers: TOpenCLTransferCounts;
+
+// Total += Counts.
+procedure AddOpenCLTransferCounts(var Total: TOpenCLTransferCounts;
+  const Counts: TOpenCLTransferCounts);
+// Total += After - Before: the transfers between two snapshots.
+procedure AddOpenCLTransferDelta(var Total: TOpenCLTransferCounts;
+  const After, Before: TOpenCLTransferCounts);
 
 implementation
 uses math;
@@ -2789,8 +2810,39 @@ begin
   Result := UnmapMemObject(buffer, mapped_ptr);
 end;
 
+procedure AddOpenCLTransferCounts(var Total: TOpenCLTransferCounts;
+  const Counts: TOpenCLTransferCounts);
+begin
+  Inc(Total.UploadCount, Counts.UploadCount);
+  Inc(Total.UploadBytes, Counts.UploadBytes);
+  Inc(Total.DownloadCount, Counts.DownloadCount);
+  Inc(Total.DownloadBytes, Counts.DownloadBytes);
+end;
+
+procedure AddOpenCLTransferDelta(var Total: TOpenCLTransferCounts;
+  const After, Before: TOpenCLTransferCounts);
+begin
+  Inc(Total.UploadCount, After.UploadCount - Before.UploadCount);
+  Inc(Total.UploadBytes, After.UploadBytes - Before.UploadBytes);
+  Inc(Total.DownloadCount, After.DownloadCount - Before.DownloadCount);
+  Inc(Total.DownloadBytes, After.DownloadBytes - Before.DownloadBytes);
+end;
+
+procedure CountOpenCLUpload(Bytes: csize_t);
+begin
+  Inc(OpenCLThreadTransfers.UploadCount);
+  Inc(OpenCLThreadTransfers.UploadBytes, Bytes);
+end;
+
+procedure CountOpenCLDownload(Bytes: csize_t);
+begin
+  Inc(OpenCLThreadTransfers.DownloadCount);
+  Inc(OpenCLThreadTransfers.DownloadBytes, Bytes);
+end;
+
 function TEasyOpenCL.WriteBuffer(buffer: cl_mem; cb: csize_t; ptr: Pointer; blocking: cl_bool): integer;
 begin
+  if OpenCLTransferCounting then CountOpenCLUpload(cb);
   Result := clEnqueueWriteBuffer(FCommands, buffer, blocking, 0, cb, ptr, 0, nil, nil);
   if (Result <> CL_SUCCESS) then
   begin
@@ -2800,6 +2852,7 @@ end;
 
 function TEasyOpenCL.ReadBuffer(buffer: cl_mem; cb: csize_t; ptr: Pointer; blocking: cl_bool): integer;
 begin
+  if OpenCLTransferCounting then CountOpenCLDownload(cb);
   Result := clEnqueueReadBuffer(FCommands, buffer, blocking, 0, cb, ptr, 0, nil, nil);
   if (Result <> CL_SUCCESS) then
   begin
@@ -2811,6 +2864,7 @@ end;
 
 function TEasyOpenCL.WriteBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool): integer;
 begin
+  if OpenCLTransferCounting then CountOpenCLUpload(cb);
   Result := clEnqueueWriteBuffer(FCommands, buffer, blocking, offsetBytes, cb, ptr, 0, nil, nil);
   if (Result <> CL_SUCCESS) then
   begin
@@ -2821,6 +2875,7 @@ end;
 
 function TEasyOpenCL.ReadBufferAt(buffer: cl_mem; offsetBytes, cb: csize_t; ptr: Pointer; blocking: cl_bool): integer;
 begin
+  if OpenCLTransferCounting then CountOpenCLDownload(cb);
   Result := clEnqueueReadBuffer(FCommands, buffer, blocking, offsetBytes, cb, ptr, 0, nil, nil);
   if (Result <> CL_SUCCESS) then
   begin

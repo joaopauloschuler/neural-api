@@ -1896,8 +1896,13 @@ rather than acted on.
         denoise 370.4 s, VAE decode 528.2 s (CPU, now the largest cost), load
         transformer 245.2 s, peak RSS 10.9 GB. B1f runs before B1d2 to tell
         the int4 projection kernel, the host layers and the transfers apart.
-    - [ ] B1f. Per-layer time profile of one GPU step (user's GPU box), to
+    - [x] B1f. Per-layer time profile of one GPU step (user's GPU box), to
           measure where the step time goes before further kernel work.
+          DONE: `examples/QwenImage --profile` (TNNet.LayerProfiling drains the
+          net queue and the layer's output queue after every layer that
+          enqueued OpenCL work; per-role and per-class tables with OpenCL
+          forwards and host<->OpenCL transfer counts/MB). User run pending:
+          `--int4 --width 1024 --height 1024 --steps 2 --profile`.
     - [ ] B1g. Transformer load time with OpenCL (240 s vs 148 s on the CPU):
           find the extra ~92 s (suspect: the host-side int4 repack loop in
           `PrepareInt4DotCL`, one nested call per weight pair; unverified).

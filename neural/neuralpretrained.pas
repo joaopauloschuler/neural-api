@@ -8672,6 +8672,10 @@ type
     Down: TNNetLayer;                 // img_mlp.out
     // TNNetChannelMulByLayer: norm x (1 + scale), branch output x tanh(gate).
     Modulated1, Gated1, Modulated2, Gated2: TNNetLayer;
+    Norm1, Norm2: TNNetLayer;         // TNNetTokenLayerNorm, non-affine
+    QKV: TNNetLayer;                  // TNNetDeepConcat [QRope|KRope|VProj]
+    SwiGLU: TNNetLayer;               // silu(gate) * proj over GateUp
+    Residual1, Residual2: TNNetLayer; // TNNetSum, the block's two residuals
   end;
 
   // txt_in: zero-centred RMSNorm -> Linear -> GELU(tanh) -> Linear.
@@ -8750,6 +8754,11 @@ type
     FStepGridH, FStepGridW: integer;
     FParallel: boolean;
     FMaxThreads: integer;
+    // LayerProfiling: wall time of the last EncodePrefix and of every
+    // PredictVelocity since it, in ms.
+    FLayerProfiling: boolean;
+    FProfilePrefixMs: double;
+    FProfileStepMs: array of double;
     {$IFDEF OpenCL}
     // Set by EnableOpenCL: every block store holds its codes in OpenCL memory;
     // PrepareStepPass arms each rebuilt step net in BlockStore[0]'s context.
@@ -8777,6 +8786,10 @@ type
     function GetPrefixValues(BlockIdx: integer): TNNetVolume;
     function GetTimestepEmbedding(): TNNetVolume;
     function GetModulation(): TNNetVolume;
+    procedure SetLayerProfiling(Value: boolean);
+    // One group name per layer of a BuildBlockNet net: Block's role names.
+    function BlockGroupNames(NN: TNNet;
+      const Block: TQwenImage21BlockLayers): TStringArray;
   public
     // Loads config.json and diffusion_pytorch_model(.safetensors.index.json)
     // from a diffusers transformer folder. pInt8Input needs int8/int4 weights.
@@ -8830,6 +8843,11 @@ type
     property Parallel: boolean read FParallel write FParallel;
     // Worker cap for those passes; 0 = every CPU thread.
     property MaxThreads: integer read FMaxThreads write FMaxThreads;
+    // TNNet.LayerProfiling on every pass (OpenCL drained per layer: slower);
+    // ProfileReport then covers the last EncodePrefix and the steps after it.
+    property LayerProfiling: boolean read FLayerProfiling
+      write SetLayerProfiling;
+    function ProfileReport(): string;
   end;
 
 type
@@ -8946,6 +8964,8 @@ type
     FOnPhase: TQwenImage21PhaseEvent;
     FOnStep: TQwenImage21StepEvent;
     FTransformerOnOpenCL: boolean;
+    FLayerProfiling: boolean;
+    FTransformerProfileReport: string;
     {$IFDEF OpenCL}
     FOpenCLRequested, FOpenCLHasSharedKernel: boolean;
     FOpenCLPlatform: cl_platform_id;
@@ -9020,6 +9040,11 @@ type
     property MaxThreads: integer read FMaxThreads write FMaxThreads;
     property OnPhase: TQwenImage21PhaseEvent read FOnPhase write FOnPhase;
     property OnStep: TQwenImage21StepEvent read FOnStep write FOnStep;
+    // TQwenImage21Transformer.LayerProfiling for Denoise, which then leaves
+    // the transformer's ProfileReport in TransformerProfileReport.
+    property LayerProfiling: boolean read FLayerProfiling
+      write FLayerProfiling;
+    property TransformerProfileReport: string read FTransformerProfileReport;
   end;
 
 // ===========================================================================
@@ -81835,7 +81860,6 @@ function AddQwenImage21Block(NN: TNNet; XInput: TNNetLayer;
   pTrainable: boolean): TNNetLayer;
 var
   Hidden, HeadDim: integer;
-  Norm1, Residual1, Norm2: TNNetLayer;
 begin
   Hidden := Config.Hidden;
   HeadDim := Config.HeadDim;
@@ -81846,10 +81870,10 @@ begin
     ImportError('AddQwenImage21Block: pPrefixCapacity must be >= 0.');
   // ---- attention branch: x + tanh(gate1) * attn(LN(x) * (1 + scale1)) ----
   // Non-affine LayerNorm: TNNetTokenLayerNorm keeps its default gamma=1, beta=0.
-  Norm1 := NN.AddLayerAfter(
+  Block.Norm1 := NN.AddLayerAfter(
     TNNetTokenLayerNorm.Create(Config.Eps).SetTrainable(pTrainable), XInput);
   Block.Modulated1 := NN.AddLayer(
-    TNNetChannelMulByLayer.Create(Norm1, Modulation.OnePlusScale1));
+    TNNetChannelMulByLayer.Create(Block.Norm1, Modulation.OnePlusScale1));
   Block.QProj := NN.AddLayerAfter(
     TNNetPointwiseConvLinear.Create(Hidden,
       {pSuppressBias=}1).SetTrainable(pTrainable),
@@ -81877,7 +81901,8 @@ begin
     Config.AxesDims[0] div 2, Config.AxesDims[1] div 2,
     Config.AxesDims[2] div 2, HeadDim);
   NN.AddLayerAfter(Block.KRope, Block.KNorm);
-  NN.AddLayer(TNNetDeepConcat.Create([Block.QRope, Block.KRope, Block.VProj]));
+  Block.QKV := NN.AddLayer(
+    TNNetDeepConcat.Create([Block.QRope, Block.KRope, Block.VProj]));
   Block.Attn := TNNetFusedSDPA.Create(Config.NumHeads, Config.NumHeads,
     HeadDim, {pCausalMask=}Mode = qibPrefix, {pWindow=}0, {pScoreSoftCap=}0,
     {pCachedForwardNonCausal=}Mode = qibStep);
@@ -81893,23 +81918,26 @@ begin
       {pSuppressBias=}1).SetTrainable(pTrainable));
   Block.Gated1 := NN.AddLayer(
     TNNetChannelMulByLayer.Create(Block.OutProj, Modulation.TanhGate1));
-  Residual1 := NN.AddLayer(TNNetSum.Create([Block.Gated1, XInput]));
+  Block.Residual1 := NN.AddLayer(TNNetSum.Create([Block.Gated1, XInput]));
   // ---- SwiGLU MLP branch: out(silu(gate_layer(h)) * proj(h)) ----
-  Norm2 := NN.AddLayerAfter(
-    TNNetTokenLayerNorm.Create(Config.Eps).SetTrainable(pTrainable), Residual1);
+  Block.Norm2 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.Eps).SetTrainable(pTrainable),
+    Block.Residual1);
   Block.Modulated2 := NN.AddLayer(
-    TNNetChannelMulByLayer.Create(Norm2, Modulation.OnePlusScale2));
+    TNNetChannelMulByLayer.Create(Block.Norm2, Modulation.OnePlusScale2));
   Block.GateUp := NN.AddLayerAfter(
     TNNetPointwiseConvLinear.Create(2 * Config.MlpHidden,
       {pSuppressBias=}1).SetTrainable(pTrainable),
     Block.Modulated2);
-  NN.AddLayer(TNNetSwiGLU.Create());
+  Block.SwiGLU := NN.AddLayer(TNNetSwiGLU.Create());
   Block.Down := NN.AddLayer(
     TNNetPointwiseConvLinear.Create(Hidden,
       {pSuppressBias=}1).SetTrainable(pTrainable));
   Block.Gated2 := NN.AddLayer(
     TNNetChannelMulByLayer.Create(Block.Down, Modulation.TanhGate2));
-  Result := NN.AddLayer(TNNetSum.Create([Block.Gated2, Residual1]));
+  Block.Residual2 := NN.AddLayer(TNNetSum.Create([Block.Gated2,
+    Block.Residual1]));
+  Result := Block.Residual2;
   if not pTrainable then NN.SetTrainable();
 end;
 
@@ -82307,6 +82335,7 @@ var
   PosF, PosH, PosW: TNeuralIntegerArray;
   BlockInput: TNNetVolume;
   TokenCount, BlockCnt, MaxBlockPos, LastBlockEndIdx: integer;
+  PrefixStart: TDateTime;
 begin
   TokenCount := TextHidden.SizeX;
   if (TokenCount < 1) or (TextHidden.SizeY <> 1) or
@@ -82339,7 +82368,16 @@ begin
     BuildQwenImage21RopePositions([TokenCount], [], [], PosF, PosH, PosW);
     QwenImage21SetRopePositions(FPrefixNet, PosF, PosH, PosW);
     FPrefixLength := TokenCount;
+    SetLayerProfiling(FLayerProfiling);
   end;
+  if FLayerProfiling then
+  begin
+    FTextInNet.ClearTime();
+    FPrefixNet.ClearTime();
+    FPrefixNet.ResetSchedulerStats();
+    SetLength(FProfileStepMs, 0);
+  end;
+  PrefixStart := Now();
   ComputeModulation(0);
   FPrefixNet.Layers[1].Output.Copy(FModulationLayer.Output);
   FTextInNet.Compute(TextHidden);
@@ -82360,6 +82398,7 @@ begin
     FPrefixValues[BlockCnt].Copy(FPrefixBlock.VProj.Output);
     BlockInput := FPrefixNet.GetLastLayer().Output;
   end;
+  FProfilePrefixMs := (Now() - PrefixStart) * MSecsPerDay;
 end;
 
 procedure TQwenImage21Transformer.PrepareStepPass(GridH, GridW: integer);
@@ -82404,13 +82443,16 @@ begin
     Copy(PosW, FPrefixLength, TokenCount));
   FStepGridH := GridH;
   FStepGridW := GridW;
+  SetLayerProfiling(FLayerProfiling);
+  SetLength(FProfileStepMs, 0);
 end;
 
 procedure TQwenImage21Transformer.PredictVelocity(Latents: TNNetVolume;
   Timestep: TNeuralFloat; GridH, GridW: integer; Velocity: TNNetVolume);
 var
   BlockInput: TNNetVolume;
-  BlockCnt, MaxBlockPos: integer;
+  BlockCnt, MaxBlockPos, StepCnt: integer;
+  StepStart: TDateTime;
 begin
   PrepareStepPass(GridH, GridW);
   if (Latents.SizeX <> GridH * GridW) or (Latents.SizeY <> 1) or
@@ -82420,6 +82462,15 @@ begin
       IntToStr(FConfig.InChannels) + ') latents, got ' +
       IntToStr(Latents.SizeX) + 'x' + IntToStr(Latents.SizeY) + 'x' +
       IntToStr(Latents.Depth) + '.');
+  if FLayerProfiling and (Length(FProfileStepMs) = 0) then
+  begin
+    FTimestepNet.ClearTime();
+    FImageInNet.ClearTime();
+    FStepNet.ClearTime();
+    FStepNet.ResetSchedulerStats();
+    FOutputNet.ClearTime();
+  end;
+  StepStart := Now();
   ComputeModulation(Timestep);
   FStepNet.Layers[1].Output.Copy(FModulationLayer.Output);
   FOutputNet.Layers[1].Output.Copy(FNormOutScaleLayer.Output);
@@ -82430,12 +82481,23 @@ begin
   begin
     SelectBlockWeights(FStepNet, BlockCnt);
     LoadStepPrefix(BlockCnt);
+    // The prefix K/V copy is enqueued outside StepNet.Compute: under
+    // profiling it is drained here, in the time outside the nets.
+    {$IFDEF OpenCL}
+    if FLayerProfiling then FStepBlock.Attn.FinishOpenCLQueues();
+    {$ENDIF}
     FStepNet.Compute(BlockInput, 0, FParallel);
     BlockInput := FStepNet.GetLastLayer().Output;
   end;
   FOutputNet.Compute(BlockInput);
   FOutputNet.GetLastLayer().ForceOutputOnRAM();
   Velocity.Copy(FOutputNet.GetLastLayer().Output);
+  if FLayerProfiling then
+  begin
+    StepCnt := Length(FProfileStepMs);
+    SetLength(FProfileStepMs, StepCnt + 1);
+    FProfileStepMs[StepCnt] := (Now() - StepStart) * MSecsPerDay;
+  end;
 end;
 
 function TQwenImage21Transformer.GetBlockStore(BlockIdx: integer): TNNet;
@@ -82468,6 +82530,122 @@ end;
 function TQwenImage21Transformer.GetModulation(): TNNetVolume;
 begin
   Result := FModulationLayer.Output;
+end;
+
+procedure TQwenImage21Transformer.SetLayerProfiling(Value: boolean);
+var
+  Nets: array[0..5] of TNNet;
+  NetPos: integer;
+begin
+  FLayerProfiling := Value;
+  Nets[0] := FTimestepNet;
+  Nets[1] := FTextInNet;
+  Nets[2] := FPrefixNet;
+  Nets[3] := FImageInNet;
+  Nets[4] := FStepNet;
+  Nets[5] := FOutputNet;
+  for NetPos := Low(Nets) to High(Nets) do
+    if Assigned(Nets[NetPos]) then Nets[NetPos].LayerProfiling := Value;
+end;
+
+function TQwenImage21Transformer.BlockGroupNames(NN: TNNet;
+  const Block: TQwenImage21BlockLayers): TStringArray;
+
+  procedure AssignGroup(Layer: TNNetLayer; const GroupName: string);
+  begin
+    if Assigned(Layer) then Result[Layer.LayerIdx] := GroupName;
+  end;
+
+var
+  LayerCnt, MaxLayerPos: integer;
+begin
+  MaxLayerPos := NN.GetLastLayerIdx();
+  SetLength(Result, MaxLayerPos + 1);
+  // BuildBlockNet: layer 0 is the block input, then the modulation input and
+  // its slice/offset/tanh chain up to Norm1.
+  Result[0] := 'BlockInput';
+  for LayerCnt := 1 to MaxLayerPos do
+    if LayerCnt < Block.Norm1.LayerIdx
+      then Result[LayerCnt] := 'Modulation chain'
+      else Result[LayerCnt] := '';
+  AssignGroup(Block.Norm1, 'Norm1');
+  AssignGroup(Block.Modulated1, 'Modulated1');
+  AssignGroup(Block.QProj, 'QProj');
+  AssignGroup(Block.KProj, 'KProj');
+  AssignGroup(Block.VProj, 'VProj');
+  AssignGroup(Block.QNorm, 'QNorm');
+  AssignGroup(Block.KNorm, 'KNorm');
+  AssignGroup(Block.QRope, 'QRope');
+  AssignGroup(Block.KRope, 'KRope');
+  AssignGroup(Block.QKV, 'QKV concat');
+  AssignGroup(Block.Attn, 'Attn');
+  AssignGroup(Block.OutProj, 'OutProj');
+  AssignGroup(Block.Gated1, 'Gated1');
+  AssignGroup(Block.Residual1, 'Residual1');
+  AssignGroup(Block.Norm2, 'Norm2');
+  AssignGroup(Block.Modulated2, 'Modulated2');
+  AssignGroup(Block.GateUp, 'GateUp');
+  AssignGroup(Block.SwiGLU, 'SwiGLU');
+  AssignGroup(Block.Down, 'Down');
+  AssignGroup(Block.Gated2, 'Gated2');
+  AssignGroup(Block.Residual2, 'Residual2');
+end;
+
+function TQwenImage21Transformer.ProfileReport(): string;
+var
+  Lines: TStringList;
+  StepCnt, StepPos, MaxStepPos: integer;
+  WallMs, TimestepMs, ImageInMs, BlocksMs, OutputMs: double;
+  StepWalls: string;
+begin
+  Lines := TStringList.Create;
+  try
+    StepCnt := Length(FProfileStepMs);
+    if Assigned(FStepNet) and (StepCnt > 0) then
+    begin
+      WallMs := 0;
+      StepWalls := '';
+      MaxStepPos := StepCnt - 1;
+      for StepPos := 0 to MaxStepPos do
+      begin
+        WallMs := WallMs + FProfileStepMs[StepPos];
+        StepWalls := StepWalls + Format(' %.1f', [FProfileStepMs[StepPos]]);
+      end;
+      TimestepMs := FTimestepNet.NNetForwardTime * MSecsPerDay;
+      ImageInMs := FImageInNet.NNetForwardTime * MSecsPerDay;
+      BlocksMs := FStepNet.NNetForwardTime * MSecsPerDay;
+      OutputMs := FOutputNet.NNetForwardTime * MSecsPerDay;
+      Lines.Add(Format('[profile] transformer step pass: %d step(s) of %d ' +
+        'image tokens, %d blocks per step through one reused StepNet',
+        [StepCnt, FStepGridH * FStepGridW, FConfig.NumLayers]));
+      Lines.Add('[profile] step wall ms:' + StepWalls + Format(' (mean %.1f)',
+        [WallMs / StepCnt]));
+      Lines.Add(Format('[profile] mean ms/step: StepNet.Compute x %d %.1f | ' +
+        'timestep net %.1f | image-in net %.1f | output net %.1f | outside ' +
+        'the nets (weight swap, prefix K/V load) %.1f', [FConfig.NumLayers,
+        BlocksMs / StepCnt, TimestepMs / StepCnt, ImageInMs / StepCnt,
+        OutputMs / StepCnt, (WallMs - BlocksMs - TimestepMs - ImageInMs -
+        OutputMs) / StepCnt]));
+      Lines.Add('[profile] StepNet by block role, summed over blocks and ' +
+        'steps (pass = one step):');
+      Lines.Add(TNNet.LayerGroupTimingReport(FStepNet,
+        BlockGroupNames(FStepNet, FStepBlock), StepCnt));
+      Lines.Add('[profile] StepNet by layer class:');
+      Lines.Add(TNNet.LayerGroupTimingReport(FStepNet, [], StepCnt));
+    end;
+    if Assigned(FPrefixNet) then
+    begin
+      Lines.Add(Format('[profile] transformer prefix pass: %d text tokens, ' +
+        'wall %.1f ms (txt_in net %.1f ms)', [FPrefixLength, FProfilePrefixMs,
+        FTextInNet.NNetForwardTime * MSecsPerDay]));
+      Lines.Add('[profile] PrefixNet by block role, summed over blocks:');
+      Lines.Add(TNNet.LayerGroupTimingReport(FPrefixNet,
+        BlockGroupNames(FPrefixNet, FPrefixBlock), 1));
+    end;
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
 end;
 
 constructor TQwenImage21Pipeline.Create(const ModelFolder: string);
@@ -82626,6 +82804,7 @@ begin
   FScheduler.SetTimesteps(StepCount,
     FScheduler.ShiftForImageSeqLen(GridH * GridW));
   DoPhase(qppLoadTransformer);
+  FTransformerProfileReport := '';
   Velocity := TNNetVolume.Create();
   Transformer := nil;
   try
@@ -82634,6 +82813,7 @@ begin
     Transformer.Parallel := FParallel;
     Transformer.MaxThreads := FMaxThreads;
     EnableTransformerOpenCL(Transformer);
+    Transformer.LayerProfiling := FLayerProfiling;
     DoPhase(qppEncodePrefix);
     Transformer.EncodePrefix(PromptEmbeds);
     DoPhase(qppDenoise);
@@ -82647,6 +82827,8 @@ begin
       if Assigned(FOnStep) then
         FOnStep(StepPos, StepCount, FScheduler.Timestep[StepPos], Latents);
     end;
+    if FLayerProfiling then
+      FTransformerProfileReport := Transformer.ProfileReport();
   finally
     Transformer.Free;
     Velocity.Free;
