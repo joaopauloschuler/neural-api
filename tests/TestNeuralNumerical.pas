@@ -453,6 +453,12 @@ type
     // ulp, codes within one step, and codes exactly equal on rows built to
     // stress the quantizer - all zeros, one outlier, flat, exact midpoints.
     procedure FusedSDPAInt8AppendOpenCLParity;
+    // CachedForwardNonCausal on cai_sdpa_noncausal_tiled vs the CPU: head dims
+    // 5 to 128, GQA, prefixes of 0 to 40 rows, ragged query and key tiles, a
+    // bound or uploaded source, the prefix appended in OpenCL memory or from the
+    // host, the 16-row key-tile fallback, and two host-path cases (a budget
+    // too small for any tile, an int8 KV cache) that must match exactly.
+    procedure FusedSDPANonCausalOpenCLParity;
     // OpenCL tap-diagonal coefficient-GEMV forward offload parity (vs CPU) for
     // TNNetKANConv (Chebyshev and B-spline basis).
     procedure TestKANConvOpenCLParity;
@@ -72328,6 +72334,177 @@ begin
     GpuForwards);
   AssertTrue('windowed soft-capped int8 18-token step: max |diff| = ' +
     FloatToStr(MaxDiff) + ' must be < 1e-3', MaxDiff < 1e-3);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Tolerance: 1e-5 of max(1, max|y|). The kernel sums the same products as the
+// host but in another order (online softmax, key tiles), so float32 rounding
+// differs by a few ulp per key; a wrong row, head, tile edge or rescale moves
+// the output by order 1e-1.
+procedure TTestNeuralNumerical.FusedSDPANonCausalOpenCLParity;
+{$IFDEF OpenCL}
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  // ExpectOpenCL false: the host path must run and match the CPU exactly.
+  // ExpectedKeyTileRows > 0 asserts the key tile the launch used.
+  procedure RunCase(QHeads, KVHeads, Dk, PrefixLen, StepTokens, Window: integer;
+    SoftCap: TNeuralFloat; ForcedQueryTileRows, ForcedKeyTileRows,
+    UsableLocalMemBytes, ExpectedKeyTileRows: integer;
+    HostSource, ResidentPrefix, Int8KV, ExpectOpenCL: boolean);
+  var
+    NNCpu, NNGpu: TNNet;
+    LCpu, LGpu: TNNetFusedSDPA;
+    StepIn, PrefixK, PrefixV: TNNetVolume;
+    KVRows: TNNetKVRowsOnOpenCL;
+    InDepth, KW, Pass, Pos: integer;
+    MaxPrefixPos, MaxStepInPos, MaxOutputPos: integer;
+    Diff, MaxDiff, MaxAbsCpu, Bound: TNeuralFloat;
+    What: string;
+  begin
+    What := Format('Hq=%d Hkv=%d Dk=%d L=%d T=%d W=%d cap=%.1f tiles=%dx%d ' +
+      'mem=%d host=%s resident=%s int8kv=%s', [QHeads, KVHeads, Dk, PrefixLen,
+      StepTokens, Window, SoftCap, ForcedQueryTileRows, ForcedKeyTileRows,
+      UsableLocalMemBytes, BoolToStr(HostSource, true),
+      BoolToStr(ResidentPrefix, true), BoolToStr(Int8KV, true)]);
+    InDepth := (QHeads + 2 * KVHeads) * Dk;
+    KW := KVHeads * Dk;
+    KVRows.Buffer := nil;
+    KVRows.RowCount := 0;
+    NNCpu := TNNet.Create();
+    NNGpu := TNNet.Create();
+    StepIn := TNNetVolume.Create(StepTokens, 1, InDepth);
+    PrefixK := TNNetVolume.Create(PrefixLen, 1, KW);
+    PrefixV := TNNetVolume.Create(PrefixLen, 1, KW);
+    try
+      NNCpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
+      LCpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, False, Window, SoftCap,
+        {pCachedForwardNonCausal=}True);
+      LCpu.BeginIncrementalDecode(PrefixLen + StepTokens, Int8KV);
+      NNCpu.AddLayer(LCpu);
+      NNCpu.SetTrainable(False, False);
+      NNGpu.AddLayer(TNNetInput.Create(StepTokens, 1, InDepth, 1));
+      // TNNetIdentity computes on the host, so the attention uploads its input.
+      if HostSource then NNGpu.AddLayer(TNNetIdentity.Create());
+      LGpu := TNNetFusedSDPA.Create(QHeads, KVHeads, Dk, False, Window, SoftCap,
+        {pCachedForwardNonCausal=}True);
+      LGpu.BeginIncrementalDecode(PrefixLen + StepTokens, Int8KV);
+      NNGpu.AddLayer(LGpu);
+      NNGpu.SetTrainable(False, False);
+      NNGpu.EnableOpenCL(PlatformId, DeviceId);
+      LGpu.FusedSDPACL.ForcedQueryTileRows := ForcedQueryTileRows;
+      LGpu.FusedSDPACL.ForcedKeyTileRows := ForcedKeyTileRows;
+      if UsableLocalMemBytes > 0 then
+        LGpu.FusedSDPACL.ForcedLocalMemBytes := UsableLocalMemBytes
+          + csFusedSDPALocalMemReserveBytes;
+      // Wide enough that the running max moves between key tiles, so a
+      // missing rescale shows.
+      MaxPrefixPos := PrefixK.Size - 1;
+      for Pos := 0 to MaxPrefixPos do
+      begin
+        PrefixK.FData[Pos] := 3 * (Random - 0.5);
+        PrefixV.FData[Pos] := 3 * (Random - 0.5);
+      end;
+      if ResidentPrefix then
+        KVRows := LGpu.NewCacheRowsOnOpenCL(PrefixK, PrefixV);
+      MaxStepInPos := StepIn.Size - 1;
+      MaxOutputPos := LCpu.Output.Size - 1;
+      MaxDiff := 0;
+      MaxAbsCpu := 0;
+      for Pass := 0 to 1 do
+      begin
+        for Pos := 0 to MaxStepInPos do StepIn.FData[Pos] := 3 * (Random - 0.5);
+        LCpu.TruncateCache(0);
+        LCpu.AppendCacheRowsFrom(PrefixK, PrefixV);
+        LGpu.TruncateCache(0);
+        if ResidentPrefix
+          then LGpu.AppendCacheRowsFromOpenCL(KVRows)
+          else LGpu.AppendCacheRowsFrom(PrefixK, PrefixV);
+        NNCpu.Compute(StepIn);
+        NNGpu.Compute(StepIn);
+        AssertEquals(What + ': cache rows after pass ' + IntToStr(Pass),
+          LCpu.CacheLength, LGpu.CacheLength);
+        for Pos := 0 to MaxOutputPos do
+        begin
+          Diff := Abs(LCpu.Output.FData[Pos] - LGpu.Output.FData[Pos]);
+          if Diff > MaxDiff then MaxDiff := Diff;
+          if Abs(LCpu.Output.FData[Pos]) > MaxAbsCpu then
+            MaxAbsCpu := Abs(LCpu.Output.FData[Pos]);
+        end;
+      end;
+      Bound := 1e-5 * Max(1, MaxAbsCpu);
+      WriteLn('  FusedSDPA OpenCL non-causal ', What, ': max|diff|=',
+        MaxDiff:0:9, ' max|y|=', MaxAbsCpu:0:4, ' gpu forwards=',
+        LGpu.ForwardGPUCnt, ' tiles=', LGpu.FusedSDPACL.LastQueryTileRows, 'x',
+        LGpu.FusedSDPACL.LastKeyTileRows);
+      if not ExpectOpenCL then
+      begin
+        AssertEquals(What + ': the host path ran', 0, LGpu.ForwardGPUCnt);
+        AssertEquals(What + ': the host path matches the CPU exactly', 0,
+          MaxDiff, 0);
+        exit;
+      end;
+      AssertTrue(What + ': max|diff| ' + FloatToStr(MaxDiff) + ' must be < ' +
+        FloatToStr(Bound), MaxDiff < Bound);
+      AssertEquals(What + ': both forwards ran on OpenCL', 2,
+        LGpu.ForwardGPUCnt);
+      AssertTrue(What + ': the output stays in OpenCL memory',
+        LGpu.OutputBindableOnOpenCL());
+      AssertEquals(What + ': the input source was ' +
+        BoolToStr(HostSource, 'uploaded', 'bound'), not HostSource,
+        LGpu.PrevOutputOnOpenCL());
+      if ExpectedKeyTileRows > 0 then
+        AssertEquals(What + ': key tile rows', ExpectedKeyTileRows,
+          LGpu.FusedSDPACL.LastKeyTileRows);
+      if ForcedQueryTileRows > 0 then
+        AssertEquals(What + ': query tile rows',
+          Min(ForcedQueryTileRows, StepTokens),
+          LGpu.FusedSDPACL.LastQueryTileRows)
+      else
+        AssertTrue(What + ': automatic query tile rows within 1..T',
+          (LGpu.FusedSDPACL.LastQueryTileRows >= 1) and
+          (LGpu.FusedSDPACL.LastQueryTileRows <= StepTokens));
+    finally
+      if Assigned(KVRows.Buffer) then clReleaseMemObject(KVRows.Buffer);
+      PrefixV.Free; PrefixK.Free; StepIn.Free; NNGpu.Free; NNCpu.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 20260930;
+  // Qwen-Image head dimension, automatic tiles, fewer rows than a tile.
+  RunCase(2, 2, 128, 7, 5, 0, 0, 0, 0, 0, 32, False, True, False, True);
+  // No prefix; the rows fill exactly one query tile and two key tiles.
+  RunCase(2, 2, 16, 0, 16, 0, 0, 16, 8, 0, 8, True, False, False, True);
+  // One prefix row; 37 rows over 16-row query tiles and 38 keys over 8-row
+  // key tiles leave a partial last tile on both axes.
+  RunCase(2, 2, 16, 1, 37, 0, 0, 16, 8, 0, 8, True, True, False, True);
+  // GQA groups of 2, Dk off the lane width, and the soft-cap.
+  RunCase(4, 2, 5, 3, 9, 0, 5.0, 4, 3, 0, 3, False, True, False, True);
+  // Head dimension 128, GQA group of 3, several tiles on both axes.
+  RunCase(3, 1, 128, 40, 70, 0, 0, 32, 16, 0, 16, True, True, False, True);
+  // A sliding window: the first 7 of the 17 cache rows are out of reach.
+  RunCase(2, 1, 8, 6, 11, 10, 0, 4, 4, 0, 4, False, True, False, True);
+  // Automatic tiles over several query and key tiles.
+  RunCase(2, 2, 64, 20, 150, 0, 0, 0, 0, 0, 32, False, True, False, True);
+  // 24000 usable bytes at Dk=128 fit fewer than 16 query rows beside a 32-row
+  // key tile, so the automatic sizing falls back to 16-row key tiles.
+  RunCase(2, 2, 128, 7, 37, 0, 0, 0, 0, 24000, 16, False, True, False, True);
+  // 1 KB of usable local memory holds no Dk=128 tile: the host path runs,
+  // reading back the prefix the OpenCL-side append left resident.
+  RunCase(2, 2, 128, 7, 5, 0, 0, 0, 0, 1024, 0, True, True, False, False);
+  // An int8 KV cache keeps the host path.
+  RunCase(2, 2, 16, 4, 9, 0, 0, 0, 0, 0, 0, False, False, True, False);
 end;
 {$ELSE}
 begin

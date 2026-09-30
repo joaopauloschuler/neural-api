@@ -1895,7 +1895,9 @@ rather than acted on.
           tests compare against an FP32-input oracle. Verified arming order that
           shares one copy of the codes: BlockStore[0].EnableOpenCL, then
           EnableOpenCLInContextOf(BlockStore[0]) for blocks 1-31 and the step net.
-    - [ ] B1b. All 32 blocks' int4/int8 codes resident in OpenCL memory, one
+    - [x] B1b. All 32 blocks' int4/int8 codes resident in OpenCL memory, one
+          DONE 88aad8ca (handle swap + RefreshResidentBias); GPU-by-default CLI
+          with --cpu: 807d61c5.
           context, uploaded once. `SelectBlockWeights` swaps only handles: in
           `TDotProductSharedKernel` FCodesBuffer / FScalesBuffer /
           FBlockScalesBuffer (+ caps, FCodesBorrowed, FInt8Ready/FInt4Ready;
@@ -1908,7 +1910,7 @@ rather than acted on.
           the host tables (FQuantTable, FQuantTableInt4, FWeightOwner, FNeurons)
           must follow the swap for the CPU fallback. The prefix net stays on the
           CPU. Parity test: pico, PoCL vs FP32-input oracle.
-    - [ ] B1c. Tiled non-causal attention OpenCL kernel for
+    - [x] B1c. Tiled non-causal attention OpenCL kernel for
           `CachedForwardNonCausal` (query tile + key tile in local memory, online
           softmax, keys = text prefix + image rows). The decode kernel
           (`cai_sdpa_decode_split`) re-reads all K/V per query row: ~540 GB per
@@ -1918,6 +1920,16 @@ rather than acted on.
           rows' K/V can be read straight from the packed QKV input. `WillOpenCL`
           accepts FCachedForwardNonCausal when the new kernel fits (its own
           local-memory test, not `QueryTileFits`). Parity test: pico, PoCL vs CPU.
+          DONE: `cai_sdpa_noncausal_tiled` (query tile x key tile in local
+          memory, online softmax; PoCL 64x32 tiles, NVIDIA 48 KB computed 26x32);
+          prefix K/V uploaded once per EncodePrefix and appended per block inside
+          OpenCL memory (`NewCacheRowsOnOpenCL` / `AppendCacheRowsFromOpenCL`).
+          Parity vs CPU 1.8e-7..3.0e-7 (layer), 6.0e-7 (pico velocity). Resident
+          prefixes cost NumLayers x L x hidden x 8 B of OpenCL memory (~256 MB at
+          L=256, ~1 GB at L=1024). Deferred until a GPU measurement:
+          - [ ] O accumulator in private registers (raises R on 48 KB devices).
+          - [ ] Register-blocked score and P.V loops (today 2 local reads per mad).
+          - [ ] Tree reduction for the running-max fold (one lane per row today).
     - [ ] B1d. Layers that send the activations back to RAM (B1a), worst first:
       - [ ] B1d1. `TNNetChannelMulByLayer` x4: the modulation operand is a host
             row (TNNetAddConstant has no OpenCL path; SplitChannels/Tanh follow

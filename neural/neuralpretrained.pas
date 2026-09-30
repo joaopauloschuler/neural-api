@@ -8753,7 +8753,15 @@ type
     // PrepareStepPass arms each rebuilt step net in BlockStore[0]'s context.
     FOpenCLEnabled: boolean;
     FOpenCLHasSharedKernel: boolean;
+    // Block i's prefix K rows then V rows in OpenCL memory, uploaded by the
+    // first step after EncodePrefix (nil before), and the uploads so far.
+    FPrefixKVOnOpenCL: array of TNNetKVRowsOnOpenCL;
+    FPrefixKVUploadCount: integer;
+    procedure ReleasePrefixKVOnOpenCL();
     {$ENDIF}
+    // Rewinds the step attention cache and fills it with block BlockIdx's
+    // prefix rows, inside OpenCL memory when the step attention runs there.
+    procedure LoadStepPrefix(BlockIdx: integer);
     procedure BuildBlockNet(NN: TNNet; TokenCount: integer;
       Mode: TQwenImage21BlockMode; PrefixCapacity: integer;
       out Block: TQwenImage21BlockLayers);
@@ -8795,6 +8803,9 @@ type
     function EnableOpenCL(pPlatform: cl_platform_id; pDevice: cl_device_id;
       pHasSharedKernel: boolean = true): boolean;
     property OpenCLEnabled: boolean read FOpenCLEnabled;
+    // Blocks' prefix K/V uploads to OpenCL memory since Create: one per block
+    // per EncodePrefix, however many steps follow.
+    property PrefixKVUploadCount: integer read FPrefixKVUploadCount;
     {$ENDIF}
     property Config: TQwenImage21TransformerConfig read FConfig;
     property WeightFormat: TQwenImage21WeightFormat read FWeightFormat;
@@ -82131,10 +82142,12 @@ begin
     SetLength(FBlockStoreLayers, FConfig.NumLayers);
     SetLength(FPrefixKeys, FConfig.NumLayers);
     SetLength(FPrefixValues, FConfig.NumLayers);
+    {$IFDEF OpenCL} SetLength(FPrefixKVOnOpenCL, FConfig.NumLayers); {$ENDIF}
     for BlockCnt := 0 to MaxBlockPos do
     begin
       FPrefixKeys[BlockCnt] := TNNetVolume.Create();
       FPrefixValues[BlockCnt] := TNNetVolume.Create();
+      {$IFDEF OpenCL} FPrefixKVOnOpenCL[BlockCnt].Buffer := nil; {$ENDIF}
       BlockNet := TNNet.Create();
       FBlockStore[BlockCnt] := BlockNet;
       // Armed before the build: the loader streams rows straight into int8.
@@ -82163,6 +82176,7 @@ var
   BlockCnt, MaxBlockPos: integer;
 begin
   FreeStepPass();
+  {$IFDEF OpenCL} ReleasePrefixKVOnOpenCL(); {$ENDIF}
   FPrefixNet.Free;
   FTextInNet.Free;
   MaxBlockPos := Length(FBlockStore) - 1;
@@ -82233,7 +82247,49 @@ begin
   if Assigned(FStepNet) then
     FStepNet.EnableOpenCLInContextOf(FBlockStore[0], pHasSharedKernel);
 end;
+
+procedure TQwenImage21Transformer.ReleasePrefixKVOnOpenCL();
+var
+  BlockCnt, MaxBlockPos: integer;
+begin
+  MaxBlockPos := Length(FPrefixKVOnOpenCL) - 1;
+  for BlockCnt := 0 to MaxBlockPos do
+    if Assigned(FPrefixKVOnOpenCL[BlockCnt].Buffer) then
+    begin
+      clReleaseMemObject(FPrefixKVOnOpenCL[BlockCnt].Buffer);
+      FPrefixKVOnOpenCL[BlockCnt].Buffer := nil;
+    end;
+end;
 {$ENDIF}
+
+// An OpenCL-side append, not a second key source: the kernel reads one
+// head-major cache, and both paths keep the same CacheLength.
+procedure TQwenImage21Transformer.LoadStepPrefix(BlockIdx: integer);
+var
+  Attn: TNNetFusedSDPA;
+begin
+  Attn := FStepBlock.Attn;
+  Attn.TruncateCache(0);
+  {$IFDEF OpenCL}
+  if Attn.WillOpenCL() then
+  begin
+    if not Assigned(FPrefixKVOnOpenCL[BlockIdx].Buffer) then
+    begin
+      FPrefixKVOnOpenCL[BlockIdx] := Attn.NewCacheRowsOnOpenCL(
+        FPrefixKeys[BlockIdx], FPrefixValues[BlockIdx]);
+      Inc(FPrefixKVUploadCount);
+    end;
+    Attn.AppendCacheRowsFromOpenCL(FPrefixKVOnOpenCL[BlockIdx]);
+  end
+  else
+  {$ENDIF}
+    Attn.AppendCacheRowsFrom(FPrefixKeys[BlockIdx], FPrefixValues[BlockIdx]);
+  if Attn.CacheLength <> FPrefixLength then
+    raise Exception.Create('TQwenImage21Transformer.PredictVelocity: ' +
+      'block ' + IntToStr(BlockIdx) + ' cached ' +
+      IntToStr(Attn.CacheLength) + ' prefix rows, expected ' +
+      IntToStr(FPrefixLength) + '.');
+end;
 
 procedure TQwenImage21Transformer.ComputeModulation(Timestep: TNeuralFloat);
 begin
@@ -82258,6 +82314,8 @@ begin
       '(L,1,' + IntToStr(FConfig.ContextInDim) + ') text hidden states, got ' +
       IntToStr(TextHidden.SizeX) + 'x' + IntToStr(TextHidden.SizeY) + 'x' +
       IntToStr(TextHidden.Depth) + '.');
+  // The rows below replace every block's prefix K/V.
+  {$IFDEF OpenCL} ReleasePrefixKVOnOpenCL(); {$ENDIF}
   if TokenCount <> FPrefixLength then
   begin
     // The step pass caches prefix + image rows, so it is rebuilt too.
@@ -82370,14 +82428,7 @@ begin
   for BlockCnt := 0 to MaxBlockPos do
   begin
     SelectBlockWeights(FStepNet, BlockCnt);
-    FStepBlock.Attn.TruncateCache(0);
-    FStepBlock.Attn.AppendCacheRowsFrom(FPrefixKeys[BlockCnt],
-      FPrefixValues[BlockCnt]);
-    if FStepBlock.Attn.CacheLength <> FPrefixLength then
-      raise Exception.Create('TQwenImage21Transformer.PredictVelocity: ' +
-        'block ' + IntToStr(BlockCnt) + ' cached ' +
-        IntToStr(FStepBlock.Attn.CacheLength) + ' prefix rows, expected ' +
-        IntToStr(FPrefixLength) + '.');
+    LoadStepPrefix(BlockCnt);
     FStepNet.Compute(BlockInput, 0, FParallel);
     BlockInput := FStepNet.GetLastLayer().Output;
   end;

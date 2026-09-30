@@ -726,6 +726,7 @@ type
     procedure TestQwenImage21TransformerOpenCLGuard;
     procedure TestQwenImage21TransformerOpenCLSwapParity;
     procedure TestQwenImage21TransformerOpenCLCodesResident;
+    procedure TestQwenImage21TransformerOpenCLAttention;
     procedure TestQwenImage21TransformerStepReplay;
     procedure TestQwenImage21TransformerQuantizedDrift;
     procedure TestQwenImage21VaeDupUpMapping;
@@ -26338,6 +26339,102 @@ begin
     RunFormat(qiwInt4, 'int4');
   finally
     Velocity.Free;
+    Latents.Free;
+    Embeds.Free;
+    RefRoot.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// The step attention runs on OpenCL in every block and matches the CPU (int8,
+// 1e-5 as the swap test), and the prefix K/V goes up once per EncodePrefix.
+procedure TTestNeuralPretrained.TestQwenImage21TransformerOpenCLAttention;
+{$IFDEF OpenCL}
+const
+  Timesteps: array[0..1] of TNeuralFloat = (0.9, 0.35);
+var
+  RefRoot: TJSONData;
+  OnOpenCL, OnCPU: TQwenImage21Transformer;
+  Embeds, Latents, VelocityOpenCL, VelocityCPU: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  GridH, GridW, BlockCount, StepPos, GPUBefore: integer;
+  Diff: double;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RefRoot := nil;
+  OnOpenCL := nil;
+  OnCPU := nil;
+  Embeds := TNNetVolume.Create;
+  Latents := TNNetVolume.Create;
+  VelocityOpenCL := TNNetVolume.Create;
+  VelocityCPU := TNNetVolume.Create;
+  try
+    RefRoot := LoadQwenImage21TransformerOracle(GridH, GridW);
+    LoadOracleTokenTensor(RefRoot, 'encoder_hidden_states', Embeds);
+    LoadOracleTokenTensor(RefRoot, 'latents_1', Latents);
+    OnOpenCL := TQwenImage21Transformer.Create(QwenImage21TransformerFolder(),
+      qiwInt8);
+    AssertTrue('transformer arms OpenCL',
+      OnOpenCL.EnableOpenCL(PlatformId, DeviceId));
+    OnOpenCL.EncodePrefix(Embeds);
+    OnOpenCL.PrepareStepPass(GridH, GridW);
+    OnCPU := TQwenImage21Transformer.Create(QwenImage21TransformerFolder(),
+      qiwInt8);
+    OnCPU.EncodePrefix(Embeds);
+    BlockCount := OnOpenCL.Config.NumLayers;
+    AssertEquals('nothing uploaded before the first step', 0,
+      OnOpenCL.PrefixKVUploadCount);
+    for StepPos := 0 to 1 do
+    begin
+      GPUBefore := OnOpenCL.StepBlock.Attn.ForwardGPUCnt;
+      OnOpenCL.PredictVelocity(Latents, Timesteps[StepPos], GridH, GridW,
+        VelocityOpenCL);
+      AssertEquals('step ' + IntToStr(StepPos) +
+        ': the attention ran on OpenCL in every block', BlockCount,
+        OnOpenCL.StepBlock.Attn.ForwardGPUCnt - GPUBefore);
+      OnCPU.PredictVelocity(Latents, Timesteps[StepPos], GridH, GridW,
+        VelocityCPU);
+      Diff := MaxAbsVolumeDiff(VelocityOpenCL, VelocityCPU);
+      WriteLn('  Qwen-Image-2.1 OpenCL attention, step ', StepPos,
+        ': velocity max|diff|=', Diff:0:9, ' max|v|=',
+        VelocityCPU.GetMaxAbs():0:4);
+      AssertTrue('step ' + IntToStr(StepPos) + ': velocity max|diff| ' +
+        FloatToStr(Diff) + ' must be < 1e-5', Diff < 1e-5);
+    end;
+    AssertEquals('two steps uploaded each block''s prefix once', BlockCount,
+      OnOpenCL.PrefixKVUploadCount);
+    // A new grid rebuilds the step net; the uploaded prefix rows carry over.
+    OnOpenCL.PredictVelocity(Latents, Timesteps[0], GridW, GridH,
+      VelocityOpenCL);
+    OnCPU.PredictVelocity(Latents, Timesteps[0], GridW, GridH, VelocityCPU);
+    Diff := MaxAbsVolumeDiff(VelocityOpenCL, VelocityCPU);
+    WriteLn('  Qwen-Image-2.1 OpenCL attention, ', GridW, 'x', GridH,
+      ' grid: velocity max|diff|=', Diff:0:9);
+    AssertTrue('rebuilt grid: velocity max|diff| ' + FloatToStr(Diff) +
+      ' must be < 1e-5', Diff < 1e-5);
+    AssertEquals('the rebuilt step net still ran attention on OpenCL',
+      BlockCount, OnOpenCL.StepBlock.Attn.ForwardGPUCnt);
+    AssertEquals('a rebuilt step net reuses the uploaded prefix', BlockCount,
+      OnOpenCL.PrefixKVUploadCount);
+    OnOpenCL.EncodePrefix(Embeds);
+    OnOpenCL.PredictVelocity(Latents, Timesteps[0], GridH, GridW,
+      VelocityOpenCL);
+    AssertEquals('a new prefix is uploaded again, once per block',
+      2 * BlockCount, OnOpenCL.PrefixKVUploadCount);
+  finally
+    OnCPU.Free;
+    OnOpenCL.Free;
+    VelocityCPU.Free;
+    VelocityOpenCL.Free;
     Latents.Free;
     Embeds.Free;
     RefRoot.Free;

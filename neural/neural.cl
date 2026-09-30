@@ -2971,6 +2971,8 @@ __kernel void cai_gated_delta_net
 // Token row t starts at t*FXStride in FX and is [ Q (FQW) | K (FKW) | V (FKW) ],
 // so head g's key slice starts at t*FXStride + FQW + g*FDk and its value slice
 // FKW further on.
+// FKW is only that distance, so a source holding every K row and then every V
+// row appends with FQW = 0, FXStride = the K width and FKW = rows * K width.
 // This kernel and cai_sdpa_decode_split share one command queue and are
 // enqueued in that order, so the in-order queue makes the appended rows visible -
 // there is no cross-work-group synchronization and none is needed.
@@ -3315,6 +3317,177 @@ __kernel void cai_sdpa_decode_merge
     for (c = 0; c < FSplits; c++)
       acc = mad(weight[c], part[c * PartialStride + 2 + d], acc);
     FY[yBase + d] = acc * InvSumExp;
+  }
+}
+
+// NON-CAUSAL TILED CACHED ATTENTION, FP32 KV CACHE (TNNetFusedSDPA with
+// CachedForwardNonCausal). ONE WORK-GROUP PER (QUERY HEAD h, QUERY TILE):
+// dimension 1 of the launch carries h*QueryTiles + tile, and the group owns the
+// token rows [tile*FQueryTileRows, +FQueryTileRows) clipped to FTokenCnt. Every
+// row attends the same cache rows [FKeyStart, FKeyEnd) of KV head
+// h / FGroupSize, with no mask. The keys are walked in tiles of FKeyTileRows
+// staged in local memory, so each K and V row is read from global memory once
+// per query tile rather than once per query row.
+//
+// ONLINE SOFTMAX per query row: m = the running max score, l = the running sum
+// of exp(s - m), O = the running sum of exp(s - m) * V. A key tile that raises
+// m to m' first rescales l and O by exp(m - m'). The result is O / l, zero
+// when l = 0 as the host path does. Scores are scaled and soft-capped exactly
+// as cai_sdpa_decode_split scores them.
+//
+// Launch 2-D with local (LX, LY) and global (LX, LY * FQHeads * QueryTiles).
+// Lane (lx, ly) walks query rows ly, ly+LY, ... and key rows or head-dim
+// columns lx, lx+LX, ..., so no lane index is ever divided (see the PoCL note
+// in cai_sdpa_decode_split). FScratch is R*(FDk+1) + R*FDk + C*(FDk+1) +
+// R*(C+1) + 3*R floats of __local memory (R = FQueryTileRows, C =
+// FKeyTileRows): the query tile, the output accumulator, the K-then-V tile, the
+// score tile and the per-row max, sum and rescale factor. The query, K/V and
+// score rows carry one float of padding, so the rows a warp reads at once
+// (broadcast or not) sit in different banks.
+// Coded by Claude (AI).
+__kernel void cai_sdpa_noncausal_tiled
+(
+  const int FQHeads,
+  const int FGroupSize,
+  const int FTokenCnt,
+  const int FQueryTileRows,
+  const int FKeyTileRows,
+  const int FDk,
+  const int FCacheMax,
+  const int FKeyStart,
+  const int FKeyEnd,
+  const int FXStride,
+  const int FYStride,
+  const float FInvSqrtDk,
+  const float FScoreSoftCap,
+  const float FInvScoreSoftCap,
+  __global const float* FX,
+  __global const float* FKCache,
+  __global const float* FVCache,
+  __global float* FY,
+  __local float* FScratch
+)
+{
+  const int lx = get_local_id(0);
+  const int ly = get_local_id(1);
+  const int LX = get_local_size(0);
+  const int LY = get_local_size(1);
+  const int gid = get_group_id(1);
+  const int QueryTiles = (FTokenCnt + FQueryTileRows - 1) / FQueryTileRows;
+  const int h = gid / QueryTiles;
+  if (h >= FQHeads) return;
+  int r, c, d, kt;
+  const int Row0 = (gid - h * QueryTiles) * FQueryTileRows;
+  const int RowsLive = min(FQueryTileRows, FTokenCnt - Row0);
+  const int KVRowStride = FDk + 1;
+  const int SRowStride = FKeyTileRows + 1;
+
+  __local float* qTile = FScratch;
+  __local float* oTile = qTile + FQueryTileRows * KVRowStride;
+  __local float* kvTile = oTile + FQueryTileRows * FDk;
+  __local float* sTile = kvTile + FKeyTileRows * KVRowStride;
+  __local float* rowMax = sTile + FQueryTileRows * SRowStride;
+  __local float* rowSum = rowMax + FQueryTileRows;
+  __local float* rowScale = rowSum + FQueryTileRows;
+
+  const int plane = (h / FGroupSize) * FCacheMax * FDk;
+  __global const float* qsrc = FX + Row0 * FXStride + h * FDk;
+  for (r = ly; r < RowsLive; r += LY)
+    for (d = lx; d < FDk; d += LX)
+    {
+      qTile[r * KVRowStride + d] = qsrc[r * FXStride + d];
+      oTile[r * FDk + d] = 0.0f;
+    }
+  if (lx == 0)
+    for (r = ly; r < RowsLive; r += LY)
+    {
+      rowMax[r] = -1e30f;
+      rowSum[r] = 0.0f;
+    }
+
+  for (kt = FKeyStart; kt < FKeyEnd; kt += FKeyTileRows)
+  {
+    const int KeysLive = min(FKeyTileRows, FKeyEnd - kt);
+    __global const float* ksrc = FKCache + plane + kt * FDk;
+    __global const float* vsrc = FVCache + plane + kt * FDk;
+    // The previous tile's value reads (and, first time round, the query load)
+    // are finished before the K tile overwrites the shared tile.
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (c = ly; c < KeysLive; c += LY)
+      for (d = lx; d < FDk; d += LX)
+        kvTile[c * KVRowStride + d] = ksrc[c * FDk + d];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (r = ly; r < RowsLive; r += LY)
+    {
+      __local const float* qrow = qTile + r * KVRowStride;
+      for (c = lx; c < KeysLive; c += LX)
+      {
+        __local const float* krow = kvTile + c * KVRowStride;
+        float acc = 0.0f;
+        for (d = 0; d < FDk; d++) acc = mad(qrow[d], krow[d], acc);
+        float sc = acc * FInvSqrtDk;
+        if (FScoreSoftCap > 0.0f)
+          sc = FScoreSoftCap * tanh(sc * FInvScoreSoftCap);
+        sTile[r * SRowStride + c] = sc;
+      }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // The V tile replaces the K tile while one lane per row folds the tile's
+    // scores into the running max. The exponent is clamped so the first
+    // tile's -1e30 never reaches exp; exp(-80) against l = 0 and O = 0 is 0.
+    for (c = ly; c < KeysLive; c += LY)
+      for (d = lx; d < FDk; d += LX)
+        kvTile[c * KVRowStride + d] = vsrc[c * FDk + d];
+    if (lx == 0)
+      for (r = ly; r < RowsLive; r += LY)
+      {
+        __local const float* srow = sTile + r * SRowStride;
+        const float OldMax = rowMax[r];
+        float m = OldMax;
+        for (c = 0; c < KeysLive; c++) m = fmax(m, srow[c]);
+        rowScale[r] = exp(fmax(OldMax - m, -80.0f));
+        rowMax[r] = m;
+      }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (r = ly; r < RowsLive; r += LY)
+    {
+      __local float* srow = sTile + r * SRowStride;
+      const float m = rowMax[r];
+      for (c = lx; c < KeysLive; c += LX) srow[c] = exp(srow[c] - m);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (r = ly; r < RowsLive; r += LY)
+    {
+      __local const float* prow = sTile + r * SRowStride;
+      const float RowRescale = rowScale[r];
+      for (d = lx; d < FDk; d += LX)
+      {
+        float acc = 0.0f;
+        for (c = 0; c < KeysLive; c++)
+          acc = mad(prow[c], kvTile[c * KVRowStride + d], acc);
+        oTile[r * FDk + d] = mad(oTile[r * FDk + d], RowRescale, acc);
+      }
+      if (lx == 0)
+      {
+        float TileSum = 0.0f;
+        for (c = 0; c < KeysLive; c++) TileSum += prow[c];
+        rowSum[r] = mad(rowSum[r], RowRescale, TileSum);
+      }
+    }
+  }
+  barrier(CLK_LOCAL_MEM_FENCE);
+
+  __global float* ydst = FY + Row0 * FYStride + h * FDk;
+  for (r = ly; r < RowsLive; r += LY)
+  {
+    const float RowTotal = rowSum[r];
+    const float InvRowTotal = (RowTotal > 0.0f) ? (1.0f / RowTotal) : 0.0f;
+    for (d = lx; d < FDk; d += LX)
+      ydst[r * FYStride + d] = oTile[r * FDk + d] * InvRowTotal;
   }
 }
 

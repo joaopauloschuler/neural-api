@@ -4536,14 +4536,29 @@ const
   // Local memory left unrequested per work-group: NVIDIA keeps about 1 KB per
   // work-group for the driver and rejects (CL_OUT_OF_RESOURCES) a launch taking it.
   csFusedSDPALocalMemReserveBytes = 1024;
+  // Lanes of a cai_sdpa_noncausal_tiled work-group: X walks key rows and
+  // head-dim columns, Y walks query rows.
+  csFusedSDPATileLanesX = 16;
+  csFusedSDPATileLanesY = 16;
+  // Key rows per tile and the most query rows per tile of that launch.
+  csFusedSDPAKeyTileRows = 32;
+  csFusedSDPAMaxQueryTileRows = 64;
 
 type
+  // RowCount token rows of external K and V in OpenCL memory, all K rows then
+  // all V rows (TNNetFusedSDPA.NewCacheRowsOnOpenCL); the owner releases Buffer.
+  TNNetKVRowsOnOpenCL = record
+    Buffer: cl_mem;
+    RowCount: integer;
+  end;
+
   /// OpenCL forward helper for the cached decode step of the fused multi-head
-  // attention (TNNetFusedSDPA). Binds FIVE entry points against the SAME shared
+  // attention (TNNetFusedSDPA). Binds SIX entry points against the SAME shared
   // program and therefore one in-order command queue: the FP32 and int8
   // appends, the FP32 and int8 split-row attention (pass 1, one work-group per
-  // (KV head, token row, chunk of cache rows)) and the merge (pass 2, one
-  // work-group per (query head, token row), both formats). Enqueue order on the
+  // (KV head, token row, chunk of cache rows)), the merge (pass 2, one
+  // work-group per (query head, token row), both formats) and the non-causal
+  // tiled attention (one work-group per (query head, query tile)). Enqueue order on the
   // in-order queue is the whole synchronization story; no host wait sits
   // between the launches. One cl_kernel handle per entry point, because
   // clSetKernelArg on a kernel with a launch still in flight is undefined.
@@ -4556,6 +4571,13 @@ type
     // Further entry points on FKernel's program and queue (FKernel itself is
     // the FP32 pass 1). Owned here: clReleaseKernel in the destructor.
     FAppendKernel, FAppendInt8Kernel, FSplitInt8Kernel, FMergeKernel: cl_kernel;
+    // cai_sdpa_noncausal_tiled, the cached forward with no mask; nil when the
+    // program lacks it. Its own local memory and work-group limit, from Create.
+    FNonCausalKernel: cl_kernel;
+    FNonCausalStaticLocalBytes, FNonCausalMaxWorkGroupSize: integer;
+    // Test-only tile overrides (0 = automatic) and the last launch's tiles.
+    FForcedQueryTileRows, FForcedKeyTileRows: integer;
+    FLastQueryTileRows, FLastKeyTileRows: integer;
     // Persistent device buffers (grow-only), reused every forward. FBufK/FBufV
     // are the resident cache, sized once at MaxContext and advanced in place;
     // FBufPartials holds the per-(query head, token row, chunk) partial softmax
@@ -4587,6 +4609,24 @@ type
     // for: the device figure (or the forced one) less the kernel's own local
     // memory and csFusedSDPALocalMemReserveBytes.
     function LocalMemFloats(Int8KV: boolean): integer;
+    // The same budget beside a kernel that declares StaticLocalBytes itself.
+    function LocalMemFloatsBeside(StaticLocalBytes: integer): integer;
+    // Tile rows of cai_sdpa_noncausal_tiled for head dimension Dk: as many
+    // query rows as the local-memory budget allows, capped (or the forced ones).
+    procedure ChooseNonCausalTiles(Dk: integer;
+      out QueryTileRows, KeyTileRows: integer);
+    // The step input's buffer: pExternalSrc when bound, else X uploaded.
+    function StepSourceBuffer(X: TNNetVolume; pExternalSrc: cl_mem): cl_mem;
+    // The resident FP32 cache buffers, sized for K and V (grow-only, never
+    // written here, so an uploaded cache keeps its contents).
+    procedure EnsureCacheBuffers(K, V: TNNetVolume; out bufK, bufV: cl_mem);
+    // The three score constants as single-precision args FirstArg.. of k.
+    procedure SetScoreArgs(k: cl_kernel; FirstArg: integer;
+      InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat);
+    // cai_sdpa_append_kv: TokenCnt source rows into cache slots CacheSlot..;
+    // row t's K slice starts at t*SrcStride + QW and its V slice KVOffset on.
+    procedure RunAppend(bufSrc, bufK, bufV: cl_mem; KVHeads, TokenCnt, Dk,
+      CacheMax, CacheSlot, QW, KVOffset, SrcStride: integer);
     // Chunk count and rows per chunk of pass 1 for a step whose live cache rows
     // span SpanRows, sized to fill the device within the local-memory budget.
     procedure ChooseSplit(KVHeads, TokenCnt, GroupSize, Dk, SpanRows: integer;
@@ -4620,6 +4660,9 @@ type
     // True when the query tile (GroupSize*Dk floats) plus one score row fits
     // the local-memory budget; otherwise the layer must keep the host path.
     function QueryTileFits(GroupSize, Dk: integer; Int8KV: boolean): boolean;
+    // True when cai_sdpa_noncausal_tiled exists and its tiles for head
+    // dimension Dk fit the local memory and the work-group limit.
+    function NonCausalTilesFit(Dk: integer): boolean;
     // The local memory the pass-1 kernel of the named cache format declares
     // itself, in bytes, as CL_KERNEL_LOCAL_MEM_SIZE reported it at Create.
     function StaticLocalMemBytes(Int8KV: boolean): integer;
@@ -4660,6 +4703,20 @@ type
       QW, KW, Window: integer;
       InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
       pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+    // Compute's arguments over the FP32 cache, but every token row attends the
+    // whole live cache (the appended rows included), with no mask.
+    procedure ComputeNonCausal(X, Y, K, V: TNNetVolume;
+      QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheSlot,
+      QW, KW, Window: integer;
+      InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
+      pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+    // K's rows then V's rows, each (Rows,1,KW), in a new buffer for
+    // AppendKVRows; the caller releases its Buffer.
+    function NewKVRowsBuffer(K, V: TNNetVolume): TNNetKVRowsOnOpenCL;
+    // Appends every row of KVRows to the resident FP32 cache at slot
+    // CacheSlot, in OpenCL memory. K and V size the cache.
+    procedure AppendKVRows(const KVRows: TNNetKVRowsOnOpenCL; K, V: TNNetVolume;
+      KVHeads, Dk, CacheMax, CacheSlot, KW: integer);
     // Test-only split-sizing overrides (0 = automatic) and the geometry of
     // the last forward's pass 1.
     property ForcedSplits: integer read FForcedSplits write FForcedSplits;
@@ -4669,6 +4726,12 @@ type
     property LastSplits: integer read FLastSplits;
     property LastChunkRows: integer read FLastChunkRows;
     property LastScratchBytes: csize_t read FLastScratchBytes;
+    property ForcedQueryTileRows: integer read FForcedQueryTileRows
+      write FForcedQueryTileRows;
+    property ForcedKeyTileRows: integer read FForcedKeyTileRows
+      write FForcedKeyTileRows;
+    property LastQueryTileRows: integer read FLastQueryTileRows;
+    property LastKeyTileRows: integer read FLastKeyTileRows;
   end;
 {$ENDIF}
 
@@ -4708,8 +4771,8 @@ type
   /// PrepareChunkedForward.
   ///
   /// Scope v1: causal / sliding-window masks and the Gemma-2 score soft-cap;
-  /// NO segment masking, prefix-LM, bidirectional window, tiled forward or
-  /// OpenCL offload (CPU only - per-head SDPA remains for those). Training
+  /// NO segment masking, prefix-LM, bidirectional window or tiled forward.
+  /// OpenCL (TNNetFusedSDPACL) runs the cached forward only. Training
   /// backward IS implemented (per-head mirror of the single-head backward).
   /// Serialization: FStruct[5] = QHeads, FStruct[6] = KVHeads on top of the
   /// inherited [0]=HeadDim, [1]=causal, [2]=window, FFloatSt[0]=soft-cap;
@@ -4759,10 +4822,17 @@ type
     procedure ComputePrefillHeads(h1, h2: integer);
     // Serial cached forward (append + score); handles the eviction paths.
     procedure ComputeIncrementalFused();
+    // True when RowCount rows of external K and V may be appended now: the
+    // cached path is on, eviction off, and they fit. Reports through FErrorProc.
+    function CacheRowsAppendable(RowCount: integer;
+      const Caller: string): boolean;
+    // True when K and V are each (Rows, 1, KVHeads*HeadDim) with equal Rows.
+    function CacheRowsShapeValid(K, V: TNNetVolume;
+      const Caller: string): boolean;
     {$IFDEF OpenCL}
     // Cached forward of the input's token rows in OpenCL memory: the append,
-    // the split-row attention and the merge, one launch each, on the helper's
-    // one in-order queue.
+    // then the split-row attention and the merge (or the non-causal tiled
+    // attention), one launch each, on the helper's one in-order queue.
     procedure ComputeOpenCL();
     // Move the KV cache between FKCache/FVCache and the helper's resident
     // buffers. Both are no-ops when the cache is already where it is wanted.
@@ -4803,6 +4873,12 @@ type
     function WillOpenCL(): boolean; override;
     function OpenCLOutputBuffer(): cl_mem; override;
     function OpenCLOutputKernel(): TNeuralKernel; override;
+    // K's rows then V's rows (AppendCacheRowsFrom's shapes) in a new buffer
+    // in this layer's OpenCL context; the caller releases its Buffer.
+    function NewCacheRowsOnOpenCL(K, V: TNNetVolume): TNNetKVRowsOnOpenCL;
+    // AppendCacheRowsFrom for every row of KVRows, copied inside OpenCL
+    // memory. FP32 cache only.
+    procedure AppendCacheRowsFromOpenCL(const KVRows: TNNetKVRowsOnOpenCL);
     // True while the live KV cache sits in FFusedSDPACL's buffers.
     property CacheOnOpenCL: boolean read FCacheOnOpenCL;
     // The decode helper, nil until EnableOpenCL; tests set its split overrides.
@@ -4810,8 +4886,8 @@ type
     {$ENDIF}
     property QHeads: integer read FQHeads;
     property KVHeads: integer read FKVHeads;
-    // See FCachedForwardNonCausal. Keeps the host path: the OpenCL decode
-    // kernels bound every row by its own slot. Eviction must be off.
+    // See FCachedForwardNonCausal. The OpenCL forward runs the tiled
+    // non-causal kernel over an FP32 cache. Eviction must be off.
     property CachedForwardNonCausal: boolean read FCachedForwardNonCausal
       write SetCachedForwardNonCausal;
   end;
@@ -34690,33 +34766,21 @@ begin
   Inc(FCacheLen);
 end;
 
-procedure TNNetFusedSDPA.AppendCacheRowsFrom(K, V: TNNetVolume);
-var
-  RowCount, MaxRowPos, RowPos, RowOffset: integer;
+function TNNetFusedSDPA.CacheRowsAppendable(RowCount: integer;
+  const Caller: string): boolean;
 begin
-  ForceCacheOnRAM();
+  Result := false;
   if not FCacheEnabled then
   begin
-    FErrorProc('TNNetFusedSDPA.AppendCacheRowsFrom requires the cached ' +
+    FErrorProc('TNNetFusedSDPA.' + Caller + ' requires the cached ' +
       'path. Call BeginIncrementalDecode first.');
     exit;
   end;
   if FEvictSinks > 0 then
   begin
-    FErrorProc('TNNetFusedSDPA.AppendCacheRowsFrom does not support ' +
-      'eviction.');
+    FErrorProc('TNNetFusedSDPA.' + Caller + ' does not support eviction.');
     exit;
   end;
-  if (K.Depth <> FKW) or (K.SizeY <> 1) or (V.SizeX <> K.SizeX) or
-     (V.SizeY <> 1) or (V.Depth <> FKW) then
-  begin
-    FErrorProc('TNNetFusedSDPA.AppendCacheRowsFrom needs K and V of shape ' +
-      '(Rows, 1, ' + IntToStr(FKW) + '). Got K ' + IntToStr(K.SizeX) + 'x' +
-      IntToStr(K.SizeY) + 'x' + IntToStr(K.Depth) + ', V ' +
-      IntToStr(V.SizeX) + 'x' + IntToStr(V.SizeY) + 'x' + IntToStr(V.Depth));
-    exit;
-  end;
-  RowCount := K.SizeX;
   if FCacheLen + RowCount > FCacheMax then
   begin
     FErrorProc('TNNetFusedSDPA KV cache overflow: ' + IntToStr(FCacheLen) +
@@ -34724,6 +34788,29 @@ begin
       IntToStr(FCacheMax) + '.');
     exit;
   end;
+  Result := true;
+end;
+
+function TNNetFusedSDPA.CacheRowsShapeValid(K, V: TNNetVolume;
+  const Caller: string): boolean;
+begin
+  Result := (K.Depth = FKW) and (K.SizeY = 1) and (V.SizeX = K.SizeX) and
+    (V.SizeY = 1) and (V.Depth = FKW);
+  if not Result then
+    FErrorProc('TNNetFusedSDPA.' + Caller + ' needs K and V of shape ' +
+      '(Rows, 1, ' + IntToStr(FKW) + '). Got K ' + IntToStr(K.SizeX) + 'x' +
+      IntToStr(K.SizeY) + 'x' + IntToStr(K.Depth) + ', V ' +
+      IntToStr(V.SizeX) + 'x' + IntToStr(V.SizeY) + 'x' + IntToStr(V.Depth));
+end;
+
+procedure TNNetFusedSDPA.AppendCacheRowsFrom(K, V: TNNetVolume);
+var
+  RowCount, MaxRowPos, RowPos, RowOffset: integer;
+begin
+  ForceCacheOnRAM();
+  if not CacheRowsShapeValid(K, V, 'AppendCacheRowsFrom') then exit;
+  RowCount := K.SizeX;
+  if not CacheRowsAppendable(RowCount, 'AppendCacheRowsFrom') then exit;
   MaxRowPos := RowCount - 1;
   RowOffset := 0;
   for RowPos := 0 to MaxRowPos do
@@ -35100,26 +35187,68 @@ function TNNetFusedSDPA.WillOpenCL(): boolean;
 begin
   // A source already in OpenCL memory puts the layer there whatever the size
   // verdict says: the point is to keep the activation from coming back to RAM
-  // and going up again, not to win on contraction size.
+  // and going up again, not to win on contraction size. The non-causal forward
+  // goes there with a host source too: its work is every token row times every
+  // cache row, which outweighs uploading the rows.
   Result := Assigned(FFusedSDPACL) and FHasOpenCL and FCacheEnabled
             and (FShouldOpenCL or FForceOpenCL
-                 or ((not FIsTrainable) and PrevOutputOnOpenCL()));
+                 or ((not FIsTrainable) and
+                     (FCachedForwardNonCausal or PrevOutputOnOpenCL())));
   if not Result then exit;
   // Scope: a window of committed tokens - one decode token or a prefill
   // window - over the FP32 or the int8 cache, with only the causal and
-  // sliding-window masks live. Eviction, segment masking, prefix-LM, the
-  // bidirectional window, CachedForwardNonCausal and a cache without room
-  // for the whole window keep the host path, which stays exactly as it was.
-  // The exact-class test mirrors
+  // sliding-window masks live, or a CachedForwardNonCausal window over the
+  // FP32 cache. Eviction, segment masking, prefix-LM, the bidirectional
+  // window and a cache without room for the whole window keep the host path,
+  // which stays exactly as it was. The exact-class test mirrors
   // the inherited one: a subclass with different score math would inherit
   // this path and silently lose its extra term.
   Result := (not FIsTrainable) and (Self.ClassType = TNNetFusedSDPA)
     and Assigned(FPrevLayer)
-    and (FEvictSinks = 0) and (not FCachedForwardNonCausal)
+    and (FEvictSinks = 0)
     and (not Assigned(FSegLayer)) and (FPrefixLen = 0)
     and (not FBidirectionalWindow)
-    and (FCacheLen + FPrevLayer.FOutput.SizeX <= FCacheMax)
-    and FFusedSDPACL.QueryTileFits(FGroupSize, FDk, FKVQuantInt8);
+    and (FCacheLen + FPrevLayer.FOutput.SizeX <= FCacheMax);
+  if not Result then exit;
+  if FCachedForwardNonCausal
+    then Result := (not FKVQuantInt8) and FFusedSDPACL.NonCausalTilesFit(FDk)
+    else Result := FFusedSDPACL.QueryTileFits(FGroupSize, FDk, FKVQuantInt8);
+end;
+
+function TNNetFusedSDPA.NewCacheRowsOnOpenCL(
+  K, V: TNNetVolume): TNNetKVRowsOnOpenCL;
+begin
+  Result.Buffer := nil;
+  Result.RowCount := 0;
+  if not Assigned(FFusedSDPACL) then
+  begin
+    FErrorProc('TNNetFusedSDPA.NewCacheRowsOnOpenCL requires OpenCL. Call ' +
+      'EnableOpenCL first.');
+    exit;
+  end;
+  // OpenCL has no empty buffer, and zero rows need none.
+  if CacheRowsShapeValid(K, V, 'NewCacheRowsOnOpenCL') and (K.SizeX > 0) then
+    Result := FFusedSDPACL.NewKVRowsBuffer(K, V);
+end;
+
+procedure TNNetFusedSDPA.AppendCacheRowsFromOpenCL(
+  const KVRows: TNNetKVRowsOnOpenCL);
+var
+  RowCount: integer;
+begin
+  RowCount := KVRows.RowCount;
+  if (not Assigned(FFusedSDPACL)) or FKVQuantInt8 then
+  begin
+    FErrorProc('TNNetFusedSDPA.AppendCacheRowsFromOpenCL requires OpenCL ' +
+      'and the FP32 KV cache.');
+    exit;
+  end;
+  if (not CacheRowsAppendable(RowCount, 'AppendCacheRowsFromOpenCL')) or
+     (RowCount = 0) then exit;
+  EnsureCacheOnOpenCL();
+  FFusedSDPACL.AppendKVRows(KVRows, FKCache, FVCache, FKVHeads, FDk,
+    FCacheMax, {CacheSlot=}FCacheLen, FKW);
+  Inc(FCacheLen, RowCount);
 end;
 
 function TNNetFusedSDPA.OpenCLOutputBuffer(): cl_mem;
@@ -35163,8 +35292,9 @@ end;
 // memory: the append, the split-row attention and the merge are three launches
 // on ONE in-order queue, so nothing crosses to the host per step. Row t of the step attends the cache
 // up to and including its own slot, so a window is exactly what the host path
-// computes. The host keeps FCacheLen, which is the only cache state the
-// kernels do not own.
+// computes; with CachedForwardNonCausal the append and one tiled launch let
+// every row attend the whole cache. The host keeps FCacheLen, which is the only
+// cache state the kernels do not own.
 procedure TNNetFusedSDPA.ComputeOpenCL();
 var
   SourceBuffer: cl_mem;
@@ -35187,7 +35317,13 @@ begin
   // inference-only, so no host reader is left behind: anything that wants
   // FOutput calls ForceOutputOnRAM, which MoveOutputToRAM answers from the two
   // accessors above.
-  if FKVQuantInt8 then
+  if FCachedForwardNonCausal then
+    FFusedSDPACL.ComputeNonCausal(FPrevLayer.FOutput, FOutput, FKCache, FVCache,
+      FQHeads, FKVHeads, FGroupSize, FDk, FCacheMax,
+      {CacheSlot=}FCacheLen, FQW, FKW, FWindow,
+      FInvSqrtDk, FScoreSoftCap, FInvScoreSoftCap,
+      SourceBuffer, {pKeepResultOnOpenCL=}true)
+  else if FKVQuantInt8 then
     FFusedSDPACL.ComputeInt8(FPrevLayer.FOutput, FOutput, FKCacheQ, FVCacheQ,
       FQHeads, FKVHeads, FGroupSize, FDk, FCacheMax,
       {CacheSlot=}FCacheLen, FQW, FKW, FWindow,
@@ -38722,6 +38858,13 @@ begin
   FMergeKernel := FKernel.CreateKernel('cai_sdpa_decode_merge');
   FSplitStaticLocalBytes := FKernel.KernelLocalMemSize(FKernel.Kernel);
   FSplitInt8StaticLocalBytes := FKernel.KernelLocalMemSize(FSplitInt8Kernel);
+  FNonCausalKernel := FKernel.CreateKernel('cai_sdpa_noncausal_tiled');
+  if Assigned(FNonCausalKernel) then
+  begin
+    FNonCausalStaticLocalBytes := FKernel.KernelLocalMemSize(FNonCausalKernel);
+    FNonCausalMaxWorkGroupSize :=
+      FKernel.KernelMaxWorkGroupSize(FNonCausalKernel);
+  end;
 end;
 
 destructor TNNetFusedSDPACL.Destroy();
@@ -38730,6 +38873,7 @@ begin
   if Assigned(FAppendInt8Kernel) then clReleaseKernel(FAppendInt8Kernel);
   if Assigned(FSplitInt8Kernel)  then clReleaseKernel(FSplitInt8Kernel);
   if Assigned(FMergeKernel)      then clReleaseKernel(FMergeKernel);
+  if Assigned(FNonCausalKernel)  then clReleaseKernel(FNonCausalKernel);
   if Assigned(FBufX)        then clReleaseMemObject(FBufX);
   if Assigned(FBufK)        then clReleaseMemObject(FBufK);
   if Assigned(FBufV)        then clReleaseMemObject(FBufV);
@@ -38777,13 +38921,19 @@ begin
 end;
 
 function TNNetFusedSDPACL.LocalMemFloats(Int8KV: boolean): integer;
+begin
+  Result := LocalMemFloatsBeside(StaticLocalMemBytes(Int8KV));
+end;
+
+function TNNetFusedSDPACL.LocalMemFloatsBeside(
+  StaticLocalBytes: integer): integer;
 var
   LocalMemBytes: integer;
 begin
   if FForcedLocalMemBytes > 0
     then LocalMemBytes := FForcedLocalMemBytes
     else LocalMemBytes := FKernel.DeviceLocalMemSize();
-  Result := (LocalMemBytes - StaticLocalMemBytes(Int8KV)
+  Result := (LocalMemBytes - StaticLocalBytes
     - csFusedSDPALocalMemReserveBytes) div csNeuralFloatSize;
 end;
 
@@ -38847,12 +38997,7 @@ procedure TNNetFusedSDPACL.SetSplitCommonArgs(kSplit: cl_kernel;
   KVHeads, TokenCnt, Splits, ChunkRows, ChunkBase, GroupSize, Dk, CacheMax,
   CacheSlot, Window, XStride: integer;
   InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat; bufX: cl_mem);
-var
-  fInvSqrtDk, fSoftCap, fInvSoftCap: single;
 begin
-  fInvSqrtDk := InvSqrtDk;
-  fSoftCap := ScoreSoftCap;
-  fInvSoftCap := InvScoreSoftCap;
   clSetKernelArg(kSplit,  0, csLongintSize, @KVHeads);
   clSetKernelArg(kSplit,  1, csLongintSize, @TokenCnt);
   clSetKernelArg(kSplit,  2, csLongintSize, @Splits);
@@ -38864,9 +39009,7 @@ begin
   clSetKernelArg(kSplit,  8, csLongintSize, @CacheSlot);
   clSetKernelArg(kSplit,  9, csLongintSize, @Window);
   clSetKernelArg(kSplit, 10, csLongintSize, @XStride);
-  clSetKernelArg(kSplit, 11, csNeuralFloatSize, @fInvSqrtDk);
-  clSetKernelArg(kSplit, 12, csNeuralFloatSize, @fSoftCap);
-  clSetKernelArg(kSplit, 13, csNeuralFloatSize, @fInvSoftCap);
+  SetScoreArgs(kSplit, 11, InvSqrtDk, ScoreSoftCap, InvScoreSoftCap);
   clSetKernelArg(kSplit, 14, csCLMemSize, @bufX);
 end;
 
@@ -38907,11 +39050,11 @@ procedure TNNetFusedSDPACL.UploadCache(K, V: TNNetVolume;
   KVHeads, CacheMax, CacheLen, Dk: integer);
 var
   g, KVHeadsM1, PlaneBytes, PrefixBytes, PlaneBase: integer;
+  bufK, bufV: cl_mem;
 begin
   // Full MaxContext allocation, live prefix only on the wire: the rows past
   // CacheLen are never read, so moving them would buy nothing.
-  FKernel.EnsureOutputBuffer(FBufK, FCapK, K);
-  FKernel.EnsureOutputBuffer(FBufV, FCapV, V);
+  EnsureCacheBuffers(K, V, bufK, bufV);
   if CacheLen < 1 then exit;
   KVHeadsM1 := KVHeads - 1;
   PlaneBytes := CacheMax * Dk * csNeuralFloatSize;
@@ -38975,11 +39118,10 @@ procedure TNNetFusedSDPACL.Compute(X, Y, K, V: TNNetVolume;
   pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
 var
   bufX, bufK, bufV, bufPartials, bufY: cl_mem;
-  kAppend, kSplit: cl_kernel;
+  kSplit: cl_kernel;
   TokenCnt, XStride, YStride: integer;
   ChunkBase, SpanRows, Splits, ChunkRows: integer;
 begin
-  kAppend := FAppendKernel;
   kSplit := FKernel.Kernel;
   // The step's token rows and both row strides come from the volumes the
   // buffers hold, so the launch cannot disagree with what it indexes.
@@ -38990,28 +39132,11 @@ begin
   ChooseSplit(KVHeads, TokenCnt, GroupSize, Dk, SpanRows, {Int8KV=}false,
     Splits, ChunkRows);
   FLastScratchBytes := SplitScratchBytes(GroupSize, Dk, ChunkRows);
-  if pExternalSrc <> nil
-    then bufX := pExternalSrc
-    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
-  // Grow-only and never written here, so a cache uploaded by UploadCache keeps
-  // its contents across every forward of the session.
-  bufK := FKernel.EnsureOutputBuffer(FBufK, FCapK, K);
-  bufV := FKernel.EnsureOutputBuffer(FBufV, FCapV, V);
+  bufX := StepSourceBuffer(X, pExternalSrc);
+  EnsureCacheBuffers(K, V, bufK, bufV);
   PrepareResultBuffers(Y, QHeads, TokenCnt, Splits, Dk, bufPartials, bufY);
-  clSetKernelArg(kAppend,  0, csLongintSize, @KVHeads);
-  clSetKernelArg(kAppend,  1, csLongintSize, @TokenCnt);
-  clSetKernelArg(kAppend,  2, csLongintSize, @Dk);
-  clSetKernelArg(kAppend,  3, csLongintSize, @CacheMax);
-  clSetKernelArg(kAppend,  4, csLongintSize, @CacheSlot);
-  clSetKernelArg(kAppend,  5, csLongintSize, @QW);
-  clSetKernelArg(kAppend,  6, csLongintSize, @KW);
-  clSetKernelArg(kAppend,  7, csLongintSize, @XStride);
-  clSetKernelArg(kAppend,  8, csCLMemSize, @bufX);
-  clSetKernelArg(kAppend,  9, csCLMemSize, @bufK);
-  clSetKernelArg(kAppend, 10, csCLMemSize, @bufV);
-  // One work-group of csFusedSDPALocalSize lanes per (KV head, token row).
-  FKernel.RunKernel2D(kAppend, csFusedSDPALocalSize, KVHeads * TokenCnt,
-    csFusedSDPALocalSize, 1);
+  RunAppend(bufX, bufK, bufV, KVHeads, TokenCnt, Dk, CacheMax, CacheSlot,
+    QW, KW, XStride);
   SetSplitCommonArgs(kSplit, KVHeads, TokenCnt, Splits, ChunkRows, ChunkBase,
     GroupSize, Dk, CacheMax, CacheSlot, Window, XStride,
     InvSqrtDk, ScoreSoftCap, InvScoreSoftCap, bufX);
@@ -39025,6 +39150,193 @@ begin
     KVHeads * TokenCnt * Splits, csFusedSDPALocalSize, 1);
   RunMerge(bufPartials, bufY, QHeads, TokenCnt, Splits, Dk, YStride);
   FinishForward(bufY, Y, pKeepResultOnOpenCL);
+end;
+
+function TNNetFusedSDPACL.StepSourceBuffer(X: TNNetVolume;
+  pExternalSrc: cl_mem): cl_mem;
+begin
+  if pExternalSrc <> nil
+    then Result := pExternalSrc
+    else Result := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+end;
+
+procedure TNNetFusedSDPACL.EnsureCacheBuffers(K, V: TNNetVolume;
+  out bufK, bufV: cl_mem);
+begin
+  bufK := FKernel.EnsureOutputBuffer(FBufK, FCapK, K);
+  bufV := FKernel.EnsureOutputBuffer(FBufV, FCapV, V);
+end;
+
+procedure TNNetFusedSDPACL.SetScoreArgs(k: cl_kernel; FirstArg: integer;
+  InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat);
+var
+  fInvSqrtDk, fSoftCap, fInvSoftCap: single;
+begin
+  fInvSqrtDk := InvSqrtDk;
+  fSoftCap := ScoreSoftCap;
+  fInvSoftCap := InvScoreSoftCap;
+  clSetKernelArg(k, FirstArg,     csNeuralFloatSize, @fInvSqrtDk);
+  clSetKernelArg(k, FirstArg + 1, csNeuralFloatSize, @fSoftCap);
+  clSetKernelArg(k, FirstArg + 2, csNeuralFloatSize, @fInvSoftCap);
+end;
+
+procedure TNNetFusedSDPACL.RunAppend(bufSrc, bufK, bufV: cl_mem; KVHeads,
+  TokenCnt, Dk, CacheMax, CacheSlot, QW, KVOffset, SrcStride: integer);
+var
+  kAppend: cl_kernel;
+begin
+  kAppend := FAppendKernel;
+  clSetKernelArg(kAppend,  0, csLongintSize, @KVHeads);
+  clSetKernelArg(kAppend,  1, csLongintSize, @TokenCnt);
+  clSetKernelArg(kAppend,  2, csLongintSize, @Dk);
+  clSetKernelArg(kAppend,  3, csLongintSize, @CacheMax);
+  clSetKernelArg(kAppend,  4, csLongintSize, @CacheSlot);
+  clSetKernelArg(kAppend,  5, csLongintSize, @QW);
+  clSetKernelArg(kAppend,  6, csLongintSize, @KVOffset);
+  clSetKernelArg(kAppend,  7, csLongintSize, @SrcStride);
+  clSetKernelArg(kAppend,  8, csCLMemSize, @bufSrc);
+  clSetKernelArg(kAppend,  9, csCLMemSize, @bufK);
+  clSetKernelArg(kAppend, 10, csCLMemSize, @bufV);
+  // One work-group of csFusedSDPALocalSize lanes per (KV head, token row).
+  FKernel.RunKernel2D(kAppend, csFusedSDPALocalSize, KVHeads * TokenCnt,
+    csFusedSDPALocalSize, 1);
+end;
+
+// Local memory of one cai_sdpa_noncausal_tiled work-group, in floats: the
+// padded query tile, the output accumulator, the padded K/V tile, the padded
+// score tile and the per-row max, sum and rescale factor.
+function NonCausalTileFloats(QueryTileRows, KeyTileRows, Dk: integer): integer;
+begin
+  Result := QueryTileRows * (Dk + 1) + QueryTileRows * Dk
+    + KeyTileRows * (Dk + 1) + QueryTileRows * (KeyTileRows + 1)
+    + 3 * QueryTileRows;
+end;
+
+procedure TNNetFusedSDPACL.ChooseNonCausalTiles(Dk: integer;
+  out QueryTileRows, KeyTileRows: integer);
+var
+  BudgetFloats: integer;
+
+  function QueryRowsThatFit(): integer;
+  begin
+    Result := (BudgetFloats - KeyTileRows * (Dk + 1))
+      div (2 * Dk + KeyTileRows + 5);
+  end;
+
+begin
+  BudgetFloats := LocalMemFloatsBeside(FNonCausalStaticLocalBytes);
+  if FForcedKeyTileRows > 0
+    then KeyTileRows := FForcedKeyTileRows
+    else KeyTileRows := csFusedSDPAKeyTileRows;
+  if FForcedQueryTileRows > 0 then
+  begin
+    QueryTileRows := FForcedQueryTileRows;
+    exit;
+  end;
+  QueryTileRows := QueryRowsThatFit();
+  // Fewer query rows than lane rows leaves lanes idle and re-reads K/V more
+  // often; a key tile one lane row wide buys rows back.
+  if (QueryTileRows < csFusedSDPATileLanesY) and (FForcedKeyTileRows = 0) then
+  begin
+    KeyTileRows := csFusedSDPATileLanesX;
+    QueryTileRows := QueryRowsThatFit();
+  end;
+  if QueryTileRows > csFusedSDPAMaxQueryTileRows then
+    QueryTileRows := csFusedSDPAMaxQueryTileRows;
+end;
+
+function TNNetFusedSDPACL.NonCausalTilesFit(Dk: integer): boolean;
+var
+  QueryTileRows, KeyTileRows: integer;
+begin
+  Result := Assigned(FNonCausalKernel) and (FNonCausalMaxWorkGroupSize >=
+    csFusedSDPATileLanesX * csFusedSDPATileLanesY);
+  if not Result then exit;
+  ChooseNonCausalTiles(Dk, QueryTileRows, KeyTileRows);
+  Result := (QueryTileRows >= 1) and (KeyTileRows >= 1) and
+    (NonCausalTileFloats(QueryTileRows, KeyTileRows, Dk) <=
+     LocalMemFloatsBeside(FNonCausalStaticLocalBytes));
+end;
+
+procedure TNNetFusedSDPACL.ComputeNonCausal(X, Y, K, V: TNNetVolume;
+  QHeads, KVHeads, GroupSize, Dk, CacheMax, CacheSlot,
+  QW, KW, Window: integer;
+  InvSqrtDk, ScoreSoftCap, InvScoreSoftCap: TNeuralFloat;
+  pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
+var
+  bufX, bufK, bufV, bufY: cl_mem;
+  kTiled: cl_kernel;
+  TokenCnt, XStride, YStride, KeyStart, KeyEnd: integer;
+  QueryTileRows, KeyTileRows, QueryTiles: integer;
+begin
+  kTiled := FNonCausalKernel;
+  TokenCnt := X.SizeX;
+  XStride := X.Depth;
+  YStride := Y.Depth;
+  // Every row sees the whole live cache, this step's rows included; a sliding
+  // window keeps its last Window rows, as the host path does.
+  KeyEnd := CacheSlot + TokenCnt;
+  if (Window > 0) and (KeyEnd > Window)
+    then KeyStart := KeyEnd - Window
+    else KeyStart := 0;
+  ChooseNonCausalTiles(Dk, QueryTileRows, KeyTileRows);
+  if QueryTileRows > TokenCnt then QueryTileRows := TokenCnt;
+  QueryTiles := (TokenCnt + QueryTileRows - 1) div QueryTileRows;
+  FLastQueryTileRows := QueryTileRows;
+  FLastKeyTileRows := KeyTileRows;
+  FLastScratchBytes := csize_t(NonCausalTileFloats(QueryTileRows, KeyTileRows,
+    Dk)) * csNeuralFloatSize;
+  bufX := StepSourceBuffer(X, pExternalSrc);
+  EnsureCacheBuffers(K, V, bufK, bufV);
+  bufY := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
+  RunAppend(bufX, bufK, bufV, KVHeads, TokenCnt, Dk, CacheMax, CacheSlot,
+    QW, KW, XStride);
+  clSetKernelArg(kTiled,  0, csLongintSize, @QHeads);
+  clSetKernelArg(kTiled,  1, csLongintSize, @GroupSize);
+  clSetKernelArg(kTiled,  2, csLongintSize, @TokenCnt);
+  clSetKernelArg(kTiled,  3, csLongintSize, @QueryTileRows);
+  clSetKernelArg(kTiled,  4, csLongintSize, @KeyTileRows);
+  clSetKernelArg(kTiled,  5, csLongintSize, @Dk);
+  clSetKernelArg(kTiled,  6, csLongintSize, @CacheMax);
+  clSetKernelArg(kTiled,  7, csLongintSize, @KeyStart);
+  clSetKernelArg(kTiled,  8, csLongintSize, @KeyEnd);
+  clSetKernelArg(kTiled,  9, csLongintSize, @XStride);
+  clSetKernelArg(kTiled, 10, csLongintSize, @YStride);
+  SetScoreArgs(kTiled, 11, InvSqrtDk, ScoreSoftCap, InvScoreSoftCap);
+  clSetKernelArg(kTiled, 14, csCLMemSize, @bufX);
+  clSetKernelArg(kTiled, 15, csCLMemSize, @bufK);
+  clSetKernelArg(kTiled, 16, csCLMemSize, @bufV);
+  clSetKernelArg(kTiled, 17, csCLMemSize, @bufY);
+  clSetKernelArg(kTiled, 18, FLastScratchBytes, nil);
+  FKernel.RunKernel2D(kTiled, csFusedSDPATileLanesX,
+    csFusedSDPATileLanesY * QHeads * QueryTiles,
+    csFusedSDPATileLanesX, csFusedSDPATileLanesY);
+  FinishForward(bufY, Y, pKeepResultOnOpenCL);
+end;
+
+function TNNetFusedSDPACL.NewKVRowsBuffer(
+  K, V: TNNetVolume): TNNetKVRowsOnOpenCL;
+var
+  KBytes, VBytes: csize_t;
+begin
+  KBytes := csize_t(K.Size) * csNeuralFloatSize;
+  VBytes := csize_t(V.Size) * csNeuralFloatSize;
+  Result.RowCount := K.SizeX;
+  Result.Buffer := NewOpenCLBuffer(KBytes + VBytes);
+  FKernel.WriteBufferAt(Result.Buffer, 0, KBytes, K.GetRawPtr(0), CL_TRUE);
+  FKernel.WriteBufferAt(Result.Buffer, KBytes, VBytes, V.GetRawPtr(0),
+    CL_TRUE);
+end;
+
+procedure TNNetFusedSDPACL.AppendKVRows(const KVRows: TNNetKVRowsOnOpenCL;
+  K, V: TNNetVolume; KVHeads, Dk, CacheMax, CacheSlot, KW: integer);
+var
+  bufK, bufV: cl_mem;
+begin
+  EnsureCacheBuffers(K, V, bufK, bufV);
+  // Row t's K slice starts at t*KW and its V slice after all the K rows.
+  RunAppend(KVRows.Buffer, bufK, bufV, KVHeads, KVRows.RowCount, Dk, CacheMax,
+    CacheSlot, {QW=}0, {KVOffset=}KVRows.RowCount * KW, {SrcStride=}KW);
 end;
 
 procedure TNNetFusedSDPACL.UploadCacheInt8(K, V: TNNetVolumeQuant8;
@@ -39111,9 +39423,7 @@ begin
   ChooseSplit(KVHeads, TokenCnt, GroupSize, Dk, SpanRows, {Int8KV=}true,
     Splits, ChunkRows);
   FLastScratchBytes := SplitScratchBytes(GroupSize, Dk, ChunkRows);
-  if pExternalSrc <> nil
-    then bufX := pExternalSrc
-    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+  bufX := StepSourceBuffer(X, pExternalSrc);
   // Grow-only and never written here, so a cache uploaded by UploadCacheInt8
   // keeps its contents across every forward of the session.
   EnsureCacheBuffersInt8(KVHeads, CacheMax, Dk);
