@@ -8670,6 +8670,8 @@ type
     OutProj: TNNetLayer;              // to_out.0
     GateUp: TNNetLayer;               // [proj | gate_layer], read by TNNetSwiGLU
     Down: TNNetLayer;                 // img_mlp.out
+    // TNNetChannelMulByLayer: norm x (1 + scale), branch output x tanh(gate).
+    Modulated1, Gated1, Modulated2, Gated2: TNNetLayer;
   end;
 
   // txt_in: zero-centred RMSNorm -> Linear -> GELU(tanh) -> Linear.
@@ -81833,8 +81835,7 @@ function AddQwenImage21Block(NN: TNNet; XInput: TNNetLayer;
   pTrainable: boolean): TNNetLayer;
 var
   Hidden, HeadDim: integer;
-  Norm1, Modulated1, Gated1, Residual1: TNNetLayer;
-  Norm2, Modulated2, Gated2: TNNetLayer;
+  Norm1, Residual1, Norm2: TNNetLayer;
 begin
   Hidden := Config.Hidden;
   HeadDim := Config.HeadDim;
@@ -81847,20 +81848,20 @@ begin
   // Non-affine LayerNorm: TNNetTokenLayerNorm keeps its default gamma=1, beta=0.
   Norm1 := NN.AddLayerAfter(
     TNNetTokenLayerNorm.Create(Config.Eps).SetTrainable(pTrainable), XInput);
-  Modulated1 := NN.AddLayer(
+  Block.Modulated1 := NN.AddLayer(
     TNNetChannelMulByLayer.Create(Norm1, Modulation.OnePlusScale1));
   Block.QProj := NN.AddLayerAfter(
     TNNetPointwiseConvLinear.Create(Hidden,
       {pSuppressBias=}1).SetTrainable(pTrainable),
-    Modulated1);
+    Block.Modulated1);
   Block.KProj := NN.AddLayerAfter(
     TNNetPointwiseConvLinear.Create(Hidden,
       {pSuppressBias=}1).SetTrainable(pTrainable),
-    Modulated1);
+    Block.Modulated1);
   Block.VProj := NN.AddLayerAfter(
     TNNetPointwiseConvLinear.Create(Hidden,
       {pSuppressBias=}1).SetTrainable(pTrainable),
-    Modulated1);
+    Block.Modulated1);
   Block.QNorm := NN.AddLayerAfter(
     TNNetHeadRMSNorm.Create(HeadDim, Config.Eps).SetTrainable(pTrainable),
     Block.QProj);
@@ -81890,25 +81891,25 @@ begin
   Block.OutProj := NN.AddLayer(
     TNNetPointwiseConvLinear.Create(Hidden,
       {pSuppressBias=}1).SetTrainable(pTrainable));
-  Gated1 := NN.AddLayer(
+  Block.Gated1 := NN.AddLayer(
     TNNetChannelMulByLayer.Create(Block.OutProj, Modulation.TanhGate1));
-  Residual1 := NN.AddLayer(TNNetSum.Create([Gated1, XInput]));
+  Residual1 := NN.AddLayer(TNNetSum.Create([Block.Gated1, XInput]));
   // ---- SwiGLU MLP branch: out(silu(gate_layer(h)) * proj(h)) ----
   Norm2 := NN.AddLayerAfter(
     TNNetTokenLayerNorm.Create(Config.Eps).SetTrainable(pTrainable), Residual1);
-  Modulated2 := NN.AddLayer(
+  Block.Modulated2 := NN.AddLayer(
     TNNetChannelMulByLayer.Create(Norm2, Modulation.OnePlusScale2));
   Block.GateUp := NN.AddLayerAfter(
     TNNetPointwiseConvLinear.Create(2 * Config.MlpHidden,
       {pSuppressBias=}1).SetTrainable(pTrainable),
-    Modulated2);
+    Block.Modulated2);
   NN.AddLayer(TNNetSwiGLU.Create());
   Block.Down := NN.AddLayer(
     TNNetPointwiseConvLinear.Create(Hidden,
       {pSuppressBias=}1).SetTrainable(pTrainable));
-  Gated2 := NN.AddLayer(
+  Block.Gated2 := NN.AddLayer(
     TNNetChannelMulByLayer.Create(Block.Down, Modulation.TanhGate2));
-  Result := NN.AddLayer(TNNetSum.Create([Gated2, Residual1]));
+  Result := NN.AddLayer(TNNetSum.Create([Block.Gated2, Residual1]));
   if not pTrainable then NN.SetTrainable();
 end;
 

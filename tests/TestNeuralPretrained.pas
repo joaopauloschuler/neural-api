@@ -26350,12 +26350,14 @@ begin
 end;
 {$ENDIF}
 
-// The step attention runs on OpenCL in every block and matches the CPU (int8,
-// 1e-5 as the swap test), and the prefix K/V goes up once per EncodePrefix.
+// The step attention and the tanh gates (bound branch output x uploaded row)
+// run on OpenCL in every block and match the CPU (int8, 1e-5 as the swap
+// test), and the prefix K/V goes up once per EncodePrefix.
 procedure TTestNeuralPretrained.TestQwenImage21TransformerOpenCLAttention;
 {$IFDEF OpenCL}
 const
   Timesteps: array[0..1] of TNeuralFloat = (0.9, 0.35);
+  Sentinel = -7777;
 var
   RefRoot: TJSONData;
   OnOpenCL, OnCPU: TQwenImage21Transformer;
@@ -26363,7 +26365,18 @@ var
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
   GridH, GridW, BlockCount, StepPos, GPUBefore: integer;
+  Gated1Before, Gated2Before, Modulated1Before, Modulated2Before: integer;
   Diff: double;
+
+  function SentinelSurvivors(V: TNNetVolume): integer;
+  var
+    Pos: integer;
+  begin
+    Result := 0;
+    for Pos := 0 to V.Size - 1 do
+      if V.FData[Pos] = Sentinel then Inc(Result);
+  end;
+
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
@@ -26396,11 +26409,44 @@ begin
     for StepPos := 0 to 1 do
     begin
       GPUBefore := OnOpenCL.StepBlock.Attn.ForwardGPUCnt;
+      Gated1Before := OnOpenCL.StepBlock.Gated1.ForwardGPUCnt;
+      Gated2Before := OnOpenCL.StepBlock.Gated2.ForwardGPUCnt;
+      Modulated1Before := OnOpenCL.StepBlock.Modulated1.ForwardGPUCnt;
+      Modulated2Before := OnOpenCL.StepBlock.Modulated2.ForwardGPUCnt;
+      // Only the gates read to_out / img_mlp.out: a download would overwrite.
+      OnOpenCL.StepBlock.OutProj.Output.Fill(Sentinel);
+      OnOpenCL.StepBlock.Down.Output.Fill(Sentinel);
       OnOpenCL.PredictVelocity(Latents, Timesteps[StepPos], GridH, GridW,
         VelocityOpenCL);
       AssertEquals('step ' + IntToStr(StepPos) +
         ': the attention ran on OpenCL in every block', BlockCount,
         OnOpenCL.StepBlock.Attn.ForwardGPUCnt - GPUBefore);
+      WriteLn('  Qwen-Image-2.1 step ', StepPos, ' OpenCL forwards (of ',
+        BlockCount, '): Modulated1=',
+        OnOpenCL.StepBlock.Modulated1.ForwardGPUCnt - Modulated1Before,
+        ' Gated1=', OnOpenCL.StepBlock.Gated1.ForwardGPUCnt - Gated1Before,
+        ' Modulated2=',
+        OnOpenCL.StepBlock.Modulated2.ForwardGPUCnt - Modulated2Before,
+        ' Gated2=', OnOpenCL.StepBlock.Gated2.ForwardGPUCnt - Gated2Before);
+      // Norm1/Norm2 (TNNetTokenLayerNorm) still end on the host (B1d2).
+      AssertEquals('step ' + IntToStr(StepPos) + ': Modulated1 on the host', 0,
+        OnOpenCL.StepBlock.Modulated1.ForwardGPUCnt - Modulated1Before);
+      AssertEquals('step ' + IntToStr(StepPos) + ': Modulated2 on the host', 0,
+        OnOpenCL.StepBlock.Modulated2.ForwardGPUCnt - Modulated2Before);
+      AssertEquals('step ' + IntToStr(StepPos) +
+        ': Gated1 ran on OpenCL in every block', BlockCount,
+        OnOpenCL.StepBlock.Gated1.ForwardGPUCnt - Gated1Before);
+      AssertEquals('step ' + IntToStr(StepPos) +
+        ': Gated2 ran on OpenCL in every block', BlockCount,
+        OnOpenCL.StepBlock.Gated2.ForwardGPUCnt - Gated2Before);
+      AssertEquals('step ' + IntToStr(StepPos) +
+        ': Gated1 bound to_out, no download',
+        OnOpenCL.StepBlock.OutProj.Output.Size,
+        SentinelSurvivors(OnOpenCL.StepBlock.OutProj.Output));
+      AssertEquals('step ' + IntToStr(StepPos) +
+        ': Gated2 bound img_mlp.out, no download',
+        OnOpenCL.StepBlock.Down.Output.Size,
+        SentinelSurvivors(OnOpenCL.StepBlock.Down.Output));
       OnCPU.PredictVelocity(Latents, Timesteps[StepPos], GridH, GridW,
         VelocityCPU);
       Diff := MaxAbsVolumeDiff(VelocityOpenCL, VelocityCPU);

@@ -1884,6 +1884,17 @@ rather than acted on.
         Estimate (not measured): 1024x1024 step ~57 TFLOP of projections + ~18
         TFLOP of attention, limited by arithmetic, so int4 saves GPU memory
         (~4.4 GB of weights vs ~7 GB int8), not time.
+        First GPU run (user, 2026-09-30, NVIDIA L4, tip dd2c2971, before B1d):
+        256x256 --int4, 40 steps: 2.2 s/step (CPU int4 16.4 s/step), denoise
+        91.7 s; load transformer 240.3 s (CPU int4 load 148 s); load text
+        encoder 39.8 s; VAE decode 33.3 s (CPU); peak RSS 8.8 GB. 2.2 s/step is
+        ~1.6 TFLOPS of projections, far below the L4, so host layers,
+        transfers and synchronisation dominate at 256 tokens.
+    - [ ] B1f. Per-layer time profile of one GPU step (user's GPU box), to
+          measure where the step time goes before further kernel work.
+    - [ ] B1g. Transformer load time with OpenCL (240 s vs 148 s on the CPU):
+          find the extra ~92 s (suspect: the host-side int4 repack loop in
+          `PrepareInt4DotCL`, one nested call per weight pair; unverified).
     - [x] B1a. Read-only audit (2026-09-25, pico block 0 on PoCL, transfer trace;
           probe in the session scratchpad, not in the repo). Only 9 of the
           block's 31 layers run on OpenCL (6 projections, QNorm/KNorm, SwiGLU);
@@ -1931,10 +1942,22 @@ rather than acted on.
           - [ ] Register-blocked score and P.V loops (today 2 local reads per mad).
           - [ ] Tree reduction for the running-max fold (one lane per row today).
     - [ ] B1d. Layers that send the activations back to RAM (B1a), worst first:
-      - [ ] B1d1. `TNNetChannelMulByLayer` x4: the modulation operand is a host
+      - [x] B1d1. `TNNetChannelMulByLayer` x4: the modulation operand is a host
             row (TNNetAddConstant has no OpenCL path; SplitChannels/Tanh follow
             their host source). Accept a host-only FLayerMul of Depth floats,
             upload it to a small per-layer buffer once per step.
+            DONE: Gated1/Gated2 bind OutProj/Down and upload the host row (16 KB,
+            blocking write) every forward; both TNNetSum layers follow onto
+            OpenCL. Modulated1/2 stay on the host until B1d2. Follow-ups:
+            - [ ] Non-blocking row write + a queue Finish at the end of
+                  TNNet.Compute when the last layer ends on the host (worth it
+                  after B1d2, when these writes are the only mid-block waits).
+            - [ ] Run the modulation chain (SplitChannels, AddConstant, tanh) on
+                  OpenCL so the four rows stay resident for all 32 blocks.
+            - [ ] Shared "bind or upload the operand" helper for
+                  TNNetChannelMulByLayer and TNNetCellMulByCell.
+            - [ ] SE / CBAM / DiT importers now take this OpenCL path with no
+                  OpenCL parity test.
       - [ ] B1d2. `TNNetTokenLayerNorm` x2: FShouldOpenCL pinned false
             (deliberate: OpenCLForwardBenchmark ~0.54x standalone), Compute
             downloads before WillOpenCL, no residency clause, no bind/keep, no

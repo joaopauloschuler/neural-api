@@ -12302,14 +12302,17 @@ type
       // EnableOpenCL and reused by every forward, so no forward pass allocates.
       FMulBuffer: cl_mem;
       FMulBufSize: integer; // element capacity of FMulBuffer
-      // Releases this layer's OpenCL resources: the device buffer, then the
-      // borrowed FMulKernel handle. Called from DisableOpenCL AND from Destroy -
-      // a layer is destroyed without a DisableOpenCL first, so neither may be
-      // the only caller. Coded by Claude (AI).
+      // Copy of a host-only FLayerMul (Depth floats), written every OpenCL
+      // forward; allocated in EnableOpenCL, grow-only.
+      FMulUploadBuffer: cl_mem;
+      FMulUploadCapBytes: csize_t;
+      // Releases this layer's OpenCL resources: its two buffers in OpenCL
+      // memory, then the borrowed FMulKernel handle. Called from DisableOpenCL
+      // AND from Destroy - a layer is destroyed without a DisableOpenCL first,
+      // so neither may be the only caller. Coded by Claude (AI).
       procedure ReleaseMulOpenCL();
-      // Multiplies the already-resident source by the already-resident
-      // per-channel operand into FMulBuffer and leaves the product there. The
-      // caller checks WillOpenCL().
+      // Multiplies the resident per-token source by the per-channel operand
+      // (bound or uploaded) into FMulBuffer. The caller checks WillOpenCL().
       procedure ComputeOpenCL();
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -76381,6 +76384,8 @@ begin
   FMulKernel := nil;
   FMulBuffer := nil;
   FMulBufSize := 0;
+  FMulUploadBuffer := nil;
+  FMulUploadCapBytes := 0;
   {$ENDIF}
 end;
 
@@ -76410,6 +76415,8 @@ begin
     FMulBuffer := DotProductKernel.CreateBuffer(
       CL_MEM_READ_WRITE, FOutput.Size * csNeuralFloatSize);
   end;
+  DotProductKernel.EnsureBuffer(FMulUploadBuffer, FMulUploadCapBytes,
+    CL_MEM_READ_ONLY, FOutput.Depth * csNeuralFloatSize);
 end;
 
 procedure TNNetChannelMulByLayer.ReleaseMulOpenCL();
@@ -76419,6 +76426,12 @@ begin
     clReleaseMemObject(FMulBuffer);
     FMulBuffer := nil;
     FMulBufSize := 0;
+  end;
+  if Assigned(FMulUploadBuffer) then
+  begin
+    clReleaseMemObject(FMulUploadBuffer);
+    FMulUploadBuffer := nil;
+    FMulUploadCapBytes := 0;
   end;
   // With the buffer gone nothing of this layer's output is in OpenCL
   // memory: leaving the flag set would hand a consumer a released buffer.
@@ -76448,8 +76461,10 @@ begin
   if (FLayerWithChannels.Output.Size <> FOutput.Size) or
      (FLayerMul.Output.Size <> FOutput.Depth) or
      (FOutput.Size > FMulBufSize) then exit;
+  // A host-only operand is uploaded into FMulUploadBuffer by ComputeOpenCL.
   Result := FLayerWithChannels.OutputBindableOnOpenCL() and
-    FLayerMul.OutputBindableOnOpenCL();
+    (FLayerMul.OutputBindableOnOpenCL() or (Assigned(FMulUploadBuffer) and
+    (FMulUploadCapBytes >= csize_t(FOutput.Depth) * csNeuralFloatSize)));
 end;
 
 function TNNetChannelMulByLayer.OpenCLOutputBuffer(): cl_mem;
@@ -76469,10 +76484,21 @@ var
   BufferWithChannels, BufferMul: cl_mem;
 begin
   FLayerWithChannels.OpenCLWaitOutputIfAnotherQueue(FMulKernel);
-  FLayerMul.OpenCLWaitOutputIfAnotherQueue(FMulKernel);
   // Read per forward, never cached: a source can replace its result buffer.
   BufferWithChannels := FLayerWithChannels.OpenCLOutputBuffer();
-  BufferMul := FLayerMul.OpenCLOutputBuffer();
+  if FLayerMul.OutputBindableOnOpenCL() then
+  begin
+    FLayerMul.OpenCLWaitOutputIfAnotherQueue(FMulKernel);
+    BufferMul := FLayerMul.OpenCLOutputBuffer();
+  end
+  else
+  begin
+    // Blocking: a forward whose last layer ends on the host does not drain
+    // this queue, and the next forward rewrites FLayerMul.Output on the host.
+    FLayerMul.ForceOutputOnRAM();
+    FMulKernel.WriteBuffer(FMulUploadBuffer, FLayerMul.Output, CL_TRUE);
+    BufferMul := FMulUploadBuffer;
+  end;
   Kern := FMulKernel.Kernel;
   iSize := FOutput.Size;
   // One operand per channel: cai_cell_mul broadcasts it over the positions.

@@ -480,6 +480,9 @@ type
     procedure TestSumOpenCLParity;
     procedure TestCellMulByCellOpenCLParity;
     procedure TestChannelMulByLayerOpenCLParity;
+    // Per-token source x host-only per-channel row (Qwen-Image modulation):
+    // resident source bound + row uploaded per forward; host source on the CPU.
+    procedure TestChannelMulByLayerHostRowOpenCLParity;
     // Device-side channel gather (cai_split_channels) forward parity for
     // TNNetSplitChannels: contiguous slice, single channel, SplitChannelEvery.
     procedure TestSplitChannelsOpenCLParity;
@@ -66088,6 +66091,159 @@ begin
       FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
   finally
     OutCPU.Free;
+    Input.Free;
+    NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestChannelMulByLayerHostRowOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+  csTokenCounts: array[0..3] of integer = (1, 5, 33, 130);
+  csDepths: array[0..3] of integer = (64, 7, 24, 3);
+var
+  NN: TNNet;
+  TokenInput, RowInput, Source, Multiplier: TNNetLayer;
+  MulLayer: TNNetChannelMulByLayer;
+  Input, RowA, RowB, OutA, OutB: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  CasePos, i, TokenCount, Depth, SentinelSurvivors: integer;
+  Diff, MaxDiff: TNeuralFloat;
+
+  function MaxAbsDiffToLastLayer(Expected: TNNetVolume): TNeuralFloat;
+  var
+    Pos: integer;
+  begin
+    AssertEquals('output size', Expected.Size, NN.GetLastLayer.Output.Size);
+    Result := 0;
+    for Pos := 0 to Expected.Size - 1 do
+      Result := Max(Result, Abs(Expected.Raw[Pos] -
+        NN.GetLastLayer.Output.Raw[Pos]));
+  end;
+
+  procedure ComputeWithRow(Row: TNNetVolume);
+  begin
+    RowInput.Output.Copy(Row);
+    NN.Compute(Input);
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CasePos := 0 to High(csTokenCounts) do
+  begin
+    TokenCount := csTokenCounts[CasePos];
+    Depth := csDepths[CasePos];
+    RandSeed := 777 + CasePos;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(TokenCount, 1, Depth);
+    RowA := TNNetVolume.Create(1, 1, Depth);
+    RowB := TNNetVolume.Create(1, 1, Depth);
+    OutA := TNNetVolume.Create();
+    OutB := TNNetVolume.Create();
+    try
+      TokenInput := NN.AddLayer(TNNetInput.Create(TokenCount, 1, Depth));
+      // As in AddQwenImage21Modulation: TNNetAddConstant has no OpenCL path,
+      // so the multiplier is only ever in RAM.
+      RowInput := NN.AddLayer(TNNetInput.Create(1, 1, Depth));
+      Multiplier := NN.AddLayerAfter(TNNetAddConstant.Create(1.0), RowInput);
+      Source := NN.AddLayerAfter(TNNetPointwiseConvLinear.Create(Depth, 1),
+        TokenInput);
+      MulLayer := TNNetChannelMulByLayer.Create(Source, Multiplier);
+      NN.AddLayer(MulLayer);
+      NN.SetTrainable(False, False);
+      Input.RandomizeGaussian();
+      RowA.RandomizeGaussian();
+      RowB.RandomizeGaussian();
+      ComputeWithRow(RowA);
+      OutA.Copy(NN.GetLastLayer.Output);
+      ComputeWithRow(RowB);
+      OutB.Copy(NN.GetLastLayer.Output);
+      AssertEquals('product ran on the CPU before EnableOpenCL', 0,
+        MulLayer.ForwardGPUCnt);
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        ComputeWithRow(RowA);
+        MaxDiff := MaxAbsDiffToLastLayer(OutA);
+        // A download of the source would overwrite the sentinel.
+        Source.Output.Fill(csSentinel);
+        ComputeWithRow(RowB);
+        Diff := MaxAbsDiffToLastLayer(OutB);
+        AssertTrue('the output stays in OpenCL memory',
+          MulLayer.OutputBindableOnOpenCL());
+        SentinelSurvivors := 0;
+        for i := 0 to Source.Output.Size - 1 do
+          if Source.Output.Raw[i] = csSentinel then Inc(SentinelSurvivors);
+        MaxDiff := Max(MaxDiff, Diff);
+        ComputeWithRow(RowA);
+        MaxDiff := Max(MaxDiff, MaxAbsDiffToLastLayer(OutA));
+        AssertFalse('the multiplier is host-only, so the upload path ran',
+          Multiplier.OutputBindableOnOpenCL());
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  ChannelMulByLayer host row ', TokenCount, 'x', Depth,
+        ': max|diff|=', MaxDiff:0:9, ' gpu forwards=', MulLayer.ForwardGPUCnt,
+        ' source sentinels=', SentinelSurvivors, '/', Source.Output.Size);
+      AssertEquals('every OpenCL forward ran the product on OpenCL', 3,
+        MulLayer.ForwardGPUCnt);
+      AssertEquals('the per-token source is bound, not downloaded',
+        Source.Output.Size, SentinelSurvivors);
+      AssertTrue('OpenCL vs CPU with a changing row: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+    finally
+      OutB.Free;
+      OutA.Free;
+      RowB.Free;
+      RowA.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+  // A host per-token source keeps the whole product on the CPU.
+  TokenCount := 9;
+  Depth := 5;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(TokenCount, 1, Depth);
+  RowA := TNNetVolume.Create(1, 1, Depth);
+  OutA := TNNetVolume.Create();
+  try
+    TokenInput := NN.AddLayer(TNNetInput.Create(TokenCount, 1, Depth));
+    RowInput := NN.AddLayer(TNNetInput.Create(1, 1, Depth));
+    Multiplier := NN.AddLayerAfter(TNNetAddConstant.Create(1.0), RowInput);
+    Source := NN.AddLayerAfter(TNNetAddConstant.Create(0.5), TokenInput);
+    MulLayer := TNNetChannelMulByLayer.Create(Source, Multiplier);
+    NN.AddLayer(MulLayer);
+    NN.SetTrainable(False, False);
+    Input.RandomizeGaussian();
+    RowA.RandomizeGaussian();
+    ComputeWithRow(RowA);
+    OutA.Copy(NN.GetLastLayer.Output);
+    NN.ForceOpenCL(True);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    try
+      ComputeWithRow(RowA);
+      MaxDiff := MaxAbsDiffToLastLayer(OutA);
+    finally
+      NN.ForceOpenCL(False);
+    end;
+    AssertEquals('a host per-token source stays on the CPU', 0,
+      MulLayer.ForwardGPUCnt);
+    AssertEquals('host fallback matches exactly', 0, MaxDiff, 0);
+  finally
+    OutA.Free;
+    RowA.Free;
     Input.Free;
     NN.Free;
   end;
