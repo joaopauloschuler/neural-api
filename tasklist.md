@@ -332,6 +332,35 @@ rather than acted on.
       pooling over the variable grid and a padding/attention mask — needs a
       variable-SeqLen vision input, an interpolated/resampled position table,
       and key-padding-masked MAP pooling. Not yet wired.
+- [ ] examples/TCNClassifier — a Temporal Convolutional Network (Bai, Kolter &
+      Koltun 2018, arXiv:1803.01271) for MULTIVARIATE time-series
+      classification, built only from existing layers (no new leaf class). A
+      user asked whether CAI Neural supports a standard TCN; it does, but no
+      example shows the layer structure (`examples/TimeSeriesForecast` is a
+      2-layer univariate causal-conv stack with no residuals). Scope:
+      - Input `(WindowLen, 1, NumFeatures)`: time on X, features on Depth;
+        fixed rolling windows cut from a synthetic multivariate series
+        generated in-code (no downloads, fixed RandSeed).
+      - Residual block: `TNNetCausalConv1D(C, K, 0, Dilation)` -> ReLU ->
+        `TNNetSpatialDropout1D` -> same again -> `TNNetSum` with the skip path
+        (a `TNNetPointwiseConvLinear(C)` 1x1 projection when the channel
+        count changes) -> ReLU. Dropout optional (README must say so).
+      - Dilations 1, 2, 4, 8, 16; print the receptive field
+        (1 + 2*(K-1)*sum(dilations)) and choose WindowLen >= it.
+      - Head: `TNNetCrop(WindowLen-1, 0, 1, 1)` (last time step) ->
+        `TNNetFullConnectLinear(NumClasses)` -> `TNNetSoftMax`; trained with
+        `TNeuralFit`. Report test accuracy vs chance.
+      - Synthetic task should need the long receptive field (e.g. the class
+        depends on an event far back in the window), so a non-dilated stack
+        scores worse; print both.
+      - Pure CPU, under 3 GB (`ulimit -v 3145728`), a few minutes at most;
+        .lpr (with `cthreads` first in uses) + .lpi + README + an
+        examples/README.md entry.
+      Related follow-ups (separate, each needs user OK): a
+      `TNNet.AddTCNBlock` builder; a dilated INPUT-gradient check for
+      `TNNetCausalConv1D` (only the dilated weight gradient is checked
+      today); a faster `TNNetCausalConv1D` forward/backward for narrow
+      InputDepth (one AVX call per tap is overhead-bound at e.g. 5 features).
 
 ### Computer vision & generative models
 
