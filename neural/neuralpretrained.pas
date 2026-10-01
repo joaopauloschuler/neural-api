@@ -8899,7 +8899,19 @@ type
     FSkippedTensorCount: integer;
     FParallel: boolean;
     FMaxThreads: integer;
+    // LayerProfiling: Net's forwards since PrepareNet, and the tables of the
+    // nets ReleaseNet already freed.
+    FLayerProfiling: boolean;
+    FNetPassCount: integer;
+    FReleasedNetsProfile: string;
+    {$IFDEF OpenCL}
+    // Set by EnableOpenCL: a weightless net that owns the OpenCL context and
+    // program; PrepareNet arms every sized net in it.
+    FOpenCLContextNet: TNNet;
+    FOpenCLHasSharedKernel: boolean;
+    {$ENDIF}
     procedure LoadFromReader(Reader: TNNetSafeTensorsReader);
+    function NetProfile(): string;
   public
     // Reads config.json and diffusion_pytorch_model.safetensors of VaeFolder.
     constructor Create(const VaeFolder: string);
@@ -8925,6 +8937,18 @@ type
     // its worker cap (0 = every CPU thread); read when Net is (re)built.
     property Parallel: boolean read FParallel write FParallel;
     property MaxThreads: integer read FMaxThreads write FMaxThreads;
+    {$IFDEF OpenCL}
+    // Builds one OpenCL context and program and arms Net and every later sized
+    // net in it (FP32 weights, one upload per net); false if the build fails.
+    function EnableOpenCL(pPlatform: cl_platform_id; pDevice: cl_device_id;
+      pHasSharedKernel: boolean = true): boolean;
+    function OpenCLEnabled(): boolean;
+    {$ENDIF}
+    // TNNet.LayerProfiling on every sized net (read when Net is (re)built);
+    // ProfileReport has one per-class table per net since Create.
+    property LayerProfiling: boolean read FLayerProfiling
+      write FLayerProfiling;
+    function ProfileReport(): string;
   end;
 
 const
@@ -8963,16 +8987,20 @@ type
     FMaxThreads: integer;
     FOnPhase: TQwenImage21PhaseEvent;
     FOnStep: TQwenImage21StepEvent;
-    FTransformerOnOpenCL: boolean;
+    FTransformerOnOpenCL, FVaeOnOpenCL: boolean;
     FLayerProfiling: boolean;
-    FTransformerProfileReport: string;
+    FTransformerProfileReport, FVaeProfileReport: string;
     {$IFDEF OpenCL}
     FOpenCLRequested, FOpenCLHasSharedKernel: boolean;
     FOpenCLPlatform: cl_platform_id;
     FOpenCLDevice: cl_device_id;
+    // Returns Armed; when false, prints that Component runs on the CPU.
+    function OpenCLArmingResult(Armed: boolean;
+      const Component: string): boolean;
     {$ENDIF}
     procedure DoPhase(Phase: TQwenImage21PipelinePhase);
     procedure EnableTransformerOpenCL(Transformer: TQwenImage21Transformer);
+    procedure EnableVaeOpenCL(Vae: TQwenImage21VaeDecoder);
     function ComponentFolder(const Component: string): string;
     procedure CheckImageSize(Width, Height: integer);
   public
@@ -9011,14 +9039,17 @@ type
     procedure Generate(const Prompt: string; Width, Height, StepCount: integer;
       Seed: cardinal; Image: TNNetVolume);
     {$IFDEF OpenCL}
-    // Denoise runs the transformer step pass on this OpenCL device (int8/int4
-    // weights); text encoder, prefix pass and VAE stay on the CPU.
+    // Denoise runs the transformer step pass (int8/int4 weights) and
+    // DecodeLatents the VAE on this OpenCL device; the rest stays on the CPU.
     procedure EnableOpenCL(pPlatform: cl_platform_id; pDevice: cl_device_id;
       pHasSharedKernel: boolean = true);
     {$ENDIF}
     // The last Denoise ran the step pass with OpenCL armed; when the request
     // could not be met, Denoise printed why and ran it on the CPU.
     property TransformerOnOpenCL: boolean read FTransformerOnOpenCL;
+    // The last DecodeLatents ran the VAE with OpenCL armed; when the request
+    // could not be met, DecodeLatents printed why and ran it on the CPU.
+    property VaeOnOpenCL: boolean read FVaeOnOpenCL;
     property ModelFolder: string read FModelFolder;
     property Scheduler: TNNetFlowMatchEulerScheduler read FScheduler;
     property TransformerConfig: TQwenImage21TransformerConfig
@@ -9040,11 +9071,12 @@ type
     property MaxThreads: integer read FMaxThreads write FMaxThreads;
     property OnPhase: TQwenImage21PhaseEvent read FOnPhase write FOnPhase;
     property OnStep: TQwenImage21StepEvent read FOnStep write FOnStep;
-    // TQwenImage21Transformer.LayerProfiling for Denoise, which then leaves
-    // the transformer's ProfileReport in TransformerProfileReport.
+    // LayerProfiling of the transformer (Denoise) and of the VAE decoder
+    // (DecodeLatents); each leaves its ProfileReport in the property below.
     property LayerProfiling: boolean read FLayerProfiling
       write FLayerProfiling;
     property TransformerProfileReport: string read FTransformerProfileReport;
+    property VaeProfileReport: string read FVaeProfileReport;
   end;
 
 // ===========================================================================
@@ -68566,6 +68598,9 @@ end;
 destructor TQwenImage21VaeDecoder.Destroy();
 begin
   ReleaseNet();
+  {$IFDEF OpenCL}
+  FOpenCLContextNet.Free;
+  {$ENDIF}
   FWeightOwner.Free;
   inherited Destroy();
 end;
@@ -68596,16 +68631,69 @@ begin
   BuildQwenImage21VaeDecoderNet(FNet, FConfig, LatentW, LatentH);
   FNet.BuildWeightOwner := nil;
   PrepareInferenceThreads(FNet, FParallel, FMaxThreads);
+  FNet.LayerProfiling := FLayerProfiling;
+  {$IFDEF OpenCL}
+  if Assigned(FOpenCLContextNet) then
+    FNet.EnableOpenCLInContextOf(FOpenCLContextNet, FOpenCLHasSharedKernel);
+  {$ENDIF}
   FNetLatentW := LatentW;
   FNetLatentH := LatentH;
+  FNetPassCount := 0;
 end;
 
 procedure TQwenImage21VaeDecoder.ReleaseNet();
 begin
+  FReleasedNetsProfile := FReleasedNetsProfile + NetProfile();
   FreeAndNil(FNet);
   FNetLatentW := 0;
   FNetLatentH := 0;
+  FNetPassCount := 0;
 end;
+
+function TQwenImage21VaeDecoder.NetProfile(): string;
+begin
+  Result := '';
+  if not (FLayerProfiling and Assigned(FNet) and (FNetPassCount > 0)) then
+    exit;
+  Result := Format('[profile] VAE decoder net for a %dx%d latent (%dx%d ' +
+    'px), %d pass(es), by layer class:', [FNetLatentW, FNetLatentH,
+    FNetLatentW * FConfig.SpatialScale, FNetLatentH * FConfig.SpatialScale,
+    FNetPassCount]) + sLineBreak +
+    TNNet.LayerGroupTimingReport(FNet, [], FNetPassCount);
+end;
+
+function TQwenImage21VaeDecoder.ProfileReport(): string;
+begin
+  Result := FReleasedNetsProfile + NetProfile();
+end;
+
+{$IFDEF OpenCL}
+// The context net, not WeightOwner: arming WeightOwner would allocate an
+// OpenCL weight buffer per convolution that no forward ever fills.
+function TQwenImage21VaeDecoder.EnableOpenCL(pPlatform: cl_platform_id;
+  pDevice: cl_device_id; pHasSharedKernel: boolean): boolean;
+begin
+  Result := true;
+  if Assigned(FOpenCLContextNet) then exit;
+  FOpenCLContextNet := TNNet.Create();
+  FOpenCLContextNet.AddLayer(TNNetInput.Create(1, 1, 1));
+  FOpenCLContextNet.EnableOpenCL(pPlatform, pDevice, pHasSharedKernel);
+  // TNNet.EnableOpenCL has printed why the program is unavailable.
+  if not FOpenCLContextNet.Layers[0].HasOpenCL then
+  begin
+    FreeAndNil(FOpenCLContextNet);
+    exit(false);
+  end;
+  FOpenCLHasSharedKernel := pHasSharedKernel;
+  if Assigned(FNet) then
+    FNet.EnableOpenCLInContextOf(FOpenCLContextNet, pHasSharedKernel);
+end;
+
+function TQwenImage21VaeDecoder.OpenCLEnabled(): boolean;
+begin
+  Result := Assigned(FOpenCLContextNet);
+end;
+{$ENDIF}
 
 procedure TQwenImage21VaeDecoder.Decode(Latent, Image: TNNetVolume);
 begin
@@ -68615,6 +68703,7 @@ begin
       IntToStr(FConfig.ZDim) + '.');
   PrepareNet(Latent.SizeX, Latent.SizeY);
   FNet.Compute(Latent, 0, FParallel);
+  Inc(FNetPassCount);
   FNet.GetLastLayer().ForceOutputOnRAM();
   Image.Copy(FNet.GetLastLayer().Output);
   Image.ForceMaxRange(1.0);
@@ -68683,6 +68772,7 @@ begin
           (ShapeTilePos mod ColumnCount) * TileLatentStride,
           (ShapeTilePos div ColumnCount) * TileLatentStride, TileW, TileH);
         FNet.Compute(LatentTile, 0, FParallel);
+        Inc(FNetPassCount);
         FNet.GetLastLayer().ForceOutputOnRAM();
         Tiles[ShapeTilePos] := TNNetVolume.Create();
         Tiles[ShapeTilePos].Copy(FNet.GetLastLayer().Output);
@@ -82848,13 +82938,33 @@ begin
   if FTransformerFormat = qiwFP32 then
     WriteLn('[OpenCL: the transformer step pass needs int8 or int4 weights, ' +
       'not FP32 - running it on the CPU]')
-  else if Transformer.EnableOpenCL(FOpenCLPlatform, FOpenCLDevice,
-    FOpenCLHasSharedKernel) then FTransformerOnOpenCL := true
   else
-    WriteLn('[OpenCL: program unavailable - running the transformer step ' +
-      'pass on the CPU]');
+    FTransformerOnOpenCL := OpenCLArmingResult(Transformer.EnableOpenCL(
+      FOpenCLPlatform, FOpenCLDevice, FOpenCLHasSharedKernel),
+      'transformer step pass');
   {$ENDIF}
 end;
+
+procedure TQwenImage21Pipeline.EnableVaeOpenCL(Vae: TQwenImage21VaeDecoder);
+begin
+  FVaeOnOpenCL := false;
+  {$IFDEF OpenCL}
+  if not FOpenCLRequested then exit;
+  FVaeOnOpenCL := OpenCLArmingResult(Vae.EnableOpenCL(FOpenCLPlatform,
+    FOpenCLDevice, FOpenCLHasSharedKernel), 'VAE decode');
+  {$ENDIF}
+end;
+
+{$IFDEF OpenCL}
+function TQwenImage21Pipeline.OpenCLArmingResult(Armed: boolean;
+  const Component: string): boolean;
+begin
+  Result := Armed;
+  if not Armed then
+    WriteLn('[OpenCL: program unavailable - running the ' + Component +
+      ' on the CPU]');
+end;
+{$ENDIF}
 
 {$IFDEF OpenCL}
 procedure TQwenImage21Pipeline.EnableOpenCL(pPlatform: cl_platform_id;
@@ -82883,17 +82993,21 @@ begin
       ' latent tokens do not form a ' + IntToStr(GridW) + 'x' +
       IntToStr(GridH) + ' grid.');
   DoPhase(qppLoadVae);
+  FVaeProfileReport := '';
   LatentImage := TNNetVolume.Create();
   Vae := nil;
   try
     Vae := TQwenImage21VaeDecoder.Create(ComponentFolder('vae'));
     Vae.Parallel := FParallel;
     Vae.MaxThreads := FMaxThreads;
+    Vae.LayerProfiling := FLayerProfiling;
+    EnableVaeOpenCL(Vae);
     // Token h * GridW + w is pixel (w, h) of a (GridW, GridH, C) volume.
     LatentImage.Copy(Latents);
     LatentImage.ReSize(GridW, GridH, Latents.Depth);
     DoPhase(qppDecode);
     Vae.DecodeTiled(LatentImage, Image, FVaeTileSize, FVaeTileStride);
+    FVaeProfileReport := Vae.ProfileReport();
   finally
     Vae.Free;
     LatentImage.Free;

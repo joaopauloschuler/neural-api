@@ -2084,6 +2084,43 @@ rather than acted on.
   - [ ] B2. VAE decode speed: 3x3 convolutions at 1152 channels.
         Estimate (not measured): a CPU VAE decode at 1024x1024 is ~8 min (16x the
         31 s measured at 256x256), so it is the next bottleneck once B1 lands.
+    - [x] B2a. Read-only audit (2026-10-01, pico VAE armed on PoCL: all 44
+          convolutions ran on OpenCL, clamped image 2.5e-6 vs CPU). Limits:
+          the FP32 GEMM is the naive `cai_dot_product` (one work-item per
+          output); every padded 3x3 conv downloads its source, pads on the host
+          and uploads (`ShouldBindPrevOutputAsIm2ColSrc` needs FPadding = 0);
+          Reshape, DeMaxPool, GatherChannels, PixelShuffle, the mid SDPA and its
+          one-source DeepConcat have no resident path, so the residual stream
+          drops to RAM after attention and at every upsampler. Memory with
+          today's per-layer buffers: 3.4 GB at 128 px tiles, 10.7 GB at 256,
+          22.8 GB at 384; untiled 1024 needs ~155 GB and overflows int32 im2col
+          indexing (2.72e9 elements). CPU decode measured ~56 GFLOPS (29 TFLOP
+          with 128/96 tile overlap in 519 s).
+    - [x] B2b. Arm OpenCL on the VAE in the pipeline
+          (`TQwenImage21VaeDecoder.EnableOpenCL`, sized nets in one context).
+          DONE: the CLI arms it by default (also with FP32 transformer
+          weights); closing "Compute :" line names where the VAE ran;
+          --profile prints a VAE table per tile shape. Follow-ups:
+          - [ ] FP32 weight sharing across the tile-shape nets (each uploads
+                the 1 GB of weights again).
+          - [ ] Drop the armed nets' host FConcatedWeights/FConcatedWInter
+                copies (~2 GB) after the upload.
+          - [ ] One OpenCL context per pipeline (today the transformer and the
+                VAE each build the program per image).
+          - [ ] Parallel scheduler + OpenCL on PoCL is 20-90x slower than
+                --serial (CPU oversubscription with PoCL's threads; worker
+                count 4 -> 2 gives 32 s -> 3.3 s). Measure --serial vs default
+                on the L4; cap the workers for CPU OpenCL devices.
+    - [ ] B2c. FP32 tiled GEMM OpenCL kernel (twin of
+          `cai_dot_product_int8_tiled`), used by every FP32 conv/FC with >= 16
+          columns.
+    - [ ] B2d. Padding-aware OpenCL im2col: bind the unpadded resident source.
+    - [ ] B2e. VAE residency gaps: Reshape alias, nearest-2x upsample kernel,
+          DupUp gather/pixel shuffle bind+keep, SDPA output.
+    - [ ] B2f. Later, for big tiles / untiled decode: implicit-GEMM conv (no
+          im2col, folds the 2x upsample), per-row bias instead of the
+          output-sized bias copy, activation buffer reuse by liveness; then
+          256/192 -> 512/384 -> untiled tiles.
   - [ ] B3. Optional guidance (negative prompt) with its own prefix cache.
   Phase C — editing and reference images:
   - [ ] C1. Qwen3-VL vision tower: 27-layer ViT, patch 16, 2x2 merge, DeepStack

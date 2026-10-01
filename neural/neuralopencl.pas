@@ -908,18 +908,21 @@ begin
   FGroupSizeA := GroupSizeA;
   FGroupSizeB := GroupSizeB;
 
+  // A layer armed before its operands are sized (empty volume, or fewer
+  // elements than one row) gets nil buffers: OpenCL rejects 0-byte buffers.
   if (FHostInput) then
   begin
-    FInputBufferAs := FDotProductKernel.CreateHostInputBuffer(VAs);
-    FInputBufferBs := FDotProductKernel.CreateHostInputBuffer(VBs);
+    if VAs.Size > 0 then FInputBufferAs := FDotProductKernel.CreateHostInputBuffer(VAs);
+    if VBs.Size > 0 then FInputBufferBs := FDotProductKernel.CreateHostInputBuffer(VBs);
   end
   else
   begin
-    FInputBufferAs := FDotProductKernel.CreateInputBuffer(VAs);
-    FInputBufferBs := FDotProductKernel.CreateInputBuffer(VBs);
+    if VAs.Size > 0 then FInputBufferAs := FDotProductKernel.CreateInputBuffer(VAs);
+    if VBs.Size > 0 then FInputBufferBs := FDotProductKernel.CreateInputBuffer(VBs);
   end;
 
-  FResultBuffer  := FDotProductKernel.CreateOutputBuffer(FNumAs * FNumBs * csNeuralFloatSize);
+  if FThreadCount > 0 then
+    FResultBuffer := FDotProductKernel.CreateOutputBuffer(FNumAs * FNumBs * csNeuralFloatSize);
   FPreviousComputeTime := 0;
 
   PrepareForCompute := CL_SUCCESS;
@@ -2852,7 +2855,7 @@ begin
   Result := clEnqueueWriteBuffer(FCommands, buffer, blocking, 0, cb, ptr, 0, nil, nil);
   if (Result <> CL_SUCCESS) then
   begin
-    FErrorProc('clCreateBuffer :'+ IntToStr(Result)+ ' Size:'+ IntToStr(cb)+' bytes.');
+    FErrorProc('clEnqueueWriteBuffer :'+ IntToStr(Result)+ ' Size:'+ IntToStr(cb)+' bytes.');
   end;
 end;
 

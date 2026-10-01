@@ -3,8 +3,8 @@ program QwenImage;
 QwenImage: Qwen-Image-2.1 text-to-image from a diffusers checkpoint folder
 (Qwen/Qwen-Image-2.1: model_index.json, processor/, text_encoder/,
 transformer/, vae/, scheduler/), through TQwenImage21Pipeline
-(neural/neuralpretrained.pas). The transformer step pass runs on OpenCL by
-default (int8/int4 weights); everything else runs on the CPU:
+(neural/neuralpretrained.pas). The transformer step pass (int8/int4 weights)
+and the VAE decode run on OpenCL by default; everything else runs on the CPU:
 
   prompt -> processor/tokenizer.json -> Qwen3-VL text encoder (freed)
     -> transformer prefix pass (text K/V, once)
@@ -153,7 +153,7 @@ end;
 procedure PrintHelp();
 begin
   WriteLn('QwenImage: Qwen-Image-2.1 text-to-image (CPU; OpenCL for the ',
-    'transformer step pass).');
+    'transformer step pass and the VAE decode).');
   WriteLn('  --model DIR          diffusers folder with model_index.json (required)');
   WriteLn('  --prompt TEXT        prompt (default: "', csDefaultPrompt, '")');
   WriteLn('  --output FILE        image file; .png keeps the alpha channel ',
@@ -182,12 +182,13 @@ begin
     '--prompt (no processor/ needed)');
   WriteLn('  --drop-count N       leading system-prompt tokens to drop with ',
     '--token-ids (default 0)');
-  WriteLn('  --gpu                OpenCL for the transformer step pass ',
-    '(DEFAULT when built with -dOpenCL);');
-  WriteLn('                       needs --int8 or --int4 (FP32 weights run ',
-    'on the CPU). The text encoder,');
-  WriteLn('                       the transformer prefix pass and the VAE ',
-    'always run on the CPU.');
+  WriteLn('  --gpu                OpenCL for the transformer step pass and ',
+    'the VAE decode (DEFAULT when');
+  WriteLn('                       built with -dOpenCL). The step pass needs ',
+    '--int8 or --int4 (FP32');
+  WriteLn('                       weights run it on the CPU). The text ',
+    'encoder and the transformer');
+  WriteLn('                       prefix pass always run on the CPU.');
   WriteLn('  --cpu                run everything on the CPU');
   WriteLn('  --gpu-platform N     OpenCL platform index (default 0)');
   WriteLn('  --gpu-device N       OpenCL device index within the platform ',
@@ -199,8 +200,10 @@ begin
   WriteLn('  --profile            after the image, per-layer time of the ',
     'transformer step pass (by block');
   WriteLn('                       role and by layer class, summed over the ',
-    'blocks and steps) and of the');
-  WriteLn('                       prefix pass. The OpenCL queue is drained ',
+    'blocks and steps), of the');
+  WriteLn('                       prefix pass and of the VAE decode (by ',
+    'layer class, one table per');
+  WriteLn('                       tile shape). The OpenCL queue is drained ',
     'after every layer that fed it,');
   WriteLn('                       so each row includes its kernels and ',
     'transfers; steps run slower.');
@@ -246,6 +249,12 @@ var
   PromptEmbeds, Image: TNNetVolume;
   TokenIds: TNeuralIntegerArray;
   StartTime: QWord;
+
+  function RanOnText(OnOpenCL: boolean): string;
+  begin
+    if OnOpenCL then Result := 'OpenCL'
+    else Result := 'the CPU (see the notice above)';
+  end;
 
   function NextArg(): string;
   begin
@@ -377,13 +386,6 @@ begin
     Pipeline.OnStep := @Reporter.OnStep;
     if UseOpenCL then ComputeText := 'CPU' else ComputeText := 'CPU (--cpu)';
     {$IFDEF OpenCL}
-    if UseOpenCL and not (UseInt8 or UseInt4) then
-    begin
-      WriteLn('[OpenCL: the transformer step pass needs --int8 or --int4 - ',
-        'FP32 weights run on the CPU]');
-      ComputeText := 'CPU (FP32 weights)';
-      UseOpenCL := false;
-    end;
     if UseOpenCL then
     begin
       OpenCLDevices := TEasyOpenCL.Create();
@@ -402,7 +404,12 @@ begin
           OpenCLDevices.Devices[OpenCLDevice], HasSharedKernel);
         ComputeText := 'OpenCL requested on ' +
           OpenCLDevices.PlatformNames[OpenCLPlatform] + ' / ' +
-          OpenCLDevices.DeviceNames[OpenCLDevice] + ' (transformer step pass';
+          OpenCLDevices.DeviceNames[OpenCLDevice];
+        if UseInt8 or UseInt4 then
+          ComputeText := ComputeText + ' (transformer step pass and VAE decode'
+        else
+          ComputeText := ComputeText + ' (VAE decode; FP32 weights keep the ' +
+            'transformer step pass on the CPU';
         if not HasSharedKernel then
           ComputeText := ComputeText + ', per-layer kernels';
         ComputeText := ComputeText + '); the rest on the CPU';
@@ -415,6 +422,7 @@ begin
     end;
     {$ELSE}
     ComputeText := 'CPU (built without OpenCL)';
+    UseOpenCL := false;
     {$ENDIF}
     Width := TQwenImage21Pipeline.RoundDownImageSide(Width);
     Height := TQwenImage21Pipeline.RoundDownImageSide(Height);
@@ -447,11 +455,10 @@ begin
     Pipeline.EncodeTokenIds(TokenIds, DropCount, PromptEmbeds);
     Pipeline.GenerateFromEmbeds(PromptEmbeds, Width, Height, StepCount, Seed,
       Image);
-    if Pipeline.TransformerOnOpenCL then
-      WriteLn('Compute    : the transformer step pass ran on OpenCL')
-    else if UseOpenCL then
-      WriteLn('Compute    : the transformer step pass ran on the CPU ',
-        '(see the notice above)');
+    if UseOpenCL then
+      WriteLn('Compute    : the transformer step pass ran on ',
+        RanOnText(Pipeline.TransformerOnOpenCL), ', the VAE decode on ',
+        RanOnText(Pipeline.VaeOnOpenCL));
     Image.Mul(255);
     if not SaveImageFromVolumeIntoFile(Image, OutputFile) then
       raise Exception.Create('could not write ' + OutputFile);
@@ -462,6 +469,7 @@ begin
     begin
       WriteLn;
       Write(Pipeline.TransformerProfileReport);
+      Write(Pipeline.VaeProfileReport);
     end;
   finally
     Pipeline.Free;

@@ -733,6 +733,7 @@ type
     procedure TestQwenImage21VaeDecoderTensorSet;
     procedure TestQwenImage21VaeDecoderParity;
     procedure TestQwenImage21VaeDecoderTiledParity;
+    procedure TestQwenImage21VaeDecoderOpenCL;
     procedure TestQwen3VLTextEncoderInt8Drift;
     procedure TestQwenImage21PipelineParity;
     procedure TestQwenImage21Pipeline64Parity;
@@ -27046,6 +27047,90 @@ begin
   end;
 end;
 
+// The pico decoder with OpenCL armed vs the CPU on the 4x4 latent: tiled
+// 32/16 (four tile shapes, each net armed in the one context of EnableOpenCL),
+// then whole, serial (parallel + OpenCL is slow on PoCL; the pipeline test
+// covers it). Only the FP32 summation order differs (measured 3.6e-6, 3.9e-6);
+// tolerance 5e-5 = TestQwenImage21VaeDecoderParity's float32 budget.
+procedure TTestNeuralPretrained.TestQwenImage21VaeDecoderOpenCL;
+{$IFDEF OpenCL}
+const
+  Tolerance = 5e-5;
+var
+  RefJson: TStringList;
+  RefRoot: TJSONData;
+  Decoder: TQwenImage21VaeDecoder;
+  Latent, TiledCPU, WholeCPU, Image: TNNetVolume;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  LayerPos, ConvCount, ConvOnOpenCLCount: integer;
+  Layer: TNNetLayer;
+  MaxDiff: double;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RefJson := TStringList.Create;
+  RefRoot := nil;
+  Decoder := nil;
+  Latent := TNNetVolume.Create;
+  TiledCPU := TNNetVolume.Create;
+  WholeCPU := TNNetVolume.Create;
+  Image := TNNetVolume.Create;
+  try
+    Decoder := TQwenImage21VaeDecoder.Create(ExtractFileDir(
+      FixturePath('tiny_qwenimage21/vae/config.json')));
+    Decoder.Parallel := false;
+    RefJson.LoadFromFile(FixturePath('tiny_qwenimage21_vae_tiled_io.json'));
+    RefRoot := GetJSON(RefJson.Text);
+    LoadOracleImageTensor(RefRoot, 'latents_normalized', Latent);
+    Decoder.Decode(Latent, WholeCPU);
+    Decoder.DecodeTiled(Latent, TiledCPU, 32, 16);
+    AssertFalse('not armed before EnableOpenCL', Decoder.OpenCLEnabled());
+    AssertTrue('EnableOpenCL', Decoder.EnableOpenCL(PlatformId, DeviceId));
+    AssertTrue('the live net is armed', Decoder.Net.Layers[1].HasOpenCL);
+    Decoder.DecodeTiled(Latent, Image, 32, 16);
+    MaxDiff := MaxAbsVolumeDiff(Image, TiledCPU);
+    WriteLn('  Qwen-Image-2.1 VAE tiled 32/16 OpenCL vs CPU: max|diff|=',
+      MaxDiff:0:9);
+    AssertTrue('tiled: max |diff| = ' + FloatToStr(MaxDiff) + ' must be < ' +
+      FloatToStr(Tolerance), MaxDiff < Tolerance);
+    Decoder.Decode(Latent, Image);
+    MaxDiff := MaxAbsVolumeDiff(Image, WholeCPU);
+    WriteLn('  Qwen-Image-2.1 VAE whole 4x4 OpenCL vs CPU: max|diff|=',
+      MaxDiff:0:9);
+    AssertTrue('whole: max |diff| = ' + FloatToStr(MaxDiff) + ' must be < ' +
+      FloatToStr(Tolerance), MaxDiff < Tolerance);
+    ConvCount := 0;
+    ConvOnOpenCLCount := 0;
+    for LayerPos := 0 to Decoder.Net.GetLastLayerIdx() do
+    begin
+      Layer := Decoder.Net.Layers[LayerPos];
+      if not (Layer is TNNetConvolutionBase) then continue;
+      Inc(ConvCount);
+      if Layer.ForwardGPUCnt > 0 then Inc(ConvOnOpenCLCount);
+    end;
+    AssertTrue('the decoder has convolutions', ConvCount > 0);
+    AssertEquals('convolutions that ran on OpenCL', ConvCount,
+      ConvOnOpenCLCount);
+  finally
+    Image.Free;
+    WholeCPU.Free;
+    TiledCPU.Free;
+    Latent.Free;
+    Decoder.Free;
+    RefRoot.Free;
+    RefJson.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
 procedure TTestNeuralPretrained.RecordQwenImage21Phase(
   Phase: TQwenImage21PipelinePhase);
 begin
@@ -27350,8 +27435,9 @@ begin
   end;
 end;
 
-// The pipeline with the transformer step pass on OpenCL (int8) matches the CPU
-// run; with FP32 weights the request falls back to the CPU, bit for bit.
+// The pipeline with the transformer step pass (int8) and the VAE on OpenCL
+// matches the CPU run. With FP32 weights only the step pass falls back to the
+// CPU; the VAE stays on OpenCL (TestQwenImage21VaeDecoderOpenCL's 5e-5).
 procedure TTestNeuralPretrained.TestQwenImage21PipelineOpenCL;
 {$IFDEF OpenCL}
 const
@@ -27382,6 +27468,8 @@ var
         {Seed=}0, Image, Initial);
       AssertTrue(What + ': TransformerOnOpenCL',
         Pipeline.TransformerOnOpenCL = ExpectOnOpenCL);
+      AssertTrue(What + ': VaeOnOpenCL',
+        Pipeline.VaeOnOpenCL = RequestOpenCL);
     finally
       Pipeline.Free;
     end;
@@ -27435,8 +27523,11 @@ begin
     RunPipeline(qiwFP32, false, false, ImageFP32CPU, 'FP32 CPU');
     RunPipeline(qiwFP32, true, false, ImageFP32Requested,
       'FP32 with OpenCL requested');
-    AssertEquals('FP32 with OpenCL requested runs on the CPU, bit for bit', 0,
-      MaxAbsVolumeDiff(ImageFP32Requested, ImageFP32CPU), 0);
+    Diff := MaxAbsVolumeDiff(ImageFP32Requested, ImageFP32CPU);
+    WriteLn('  Qwen-Image-2.1 pipeline FP32, VAE on OpenCL vs CPU image: ',
+      'max|diff|=', Diff:0:9);
+    AssertTrue('FP32 (VAE only on OpenCL) vs CPU image max|diff| ' +
+      FloatToStr(Diff) + ' must be < 5e-5', Diff < 5e-5);
   finally
     Transformer.Free;
     ImageFP32Requested.Free;
