@@ -19760,6 +19760,10 @@ type
       // through SaveToString/LoadFromString. Returns the final-LayerNorm layer so
       // blocks can be stacked. (Coded by Claude (AI).)
       function AddConformerBlock(Heads, d_ff, ConvKernelSize: integer): TNNetLayer;
+      // TCN residual block (Bai et al. 2018) over (SeqLen,1,C): 2x [dilated causal conv -> MovingStdNorm (paper: weight norm) -> ReLU -> SpatialDropout1D],
+      // plus the input (1x1 projection if C <> Channels), then ReLU. DropoutRate=0 / UseNormalization=false omit those layers. Coded by Claude (AI).
+      function AddTCNBlock(Channels, KernelSize, Dilation: integer;
+        DropoutRate: TNeuralFloat = 0; UseNormalization: boolean = false): TNNetLayer;
       // SPIKING block: the canonical linear -> LIF -> rate-readout pipeline of a
       // spiking neural network, over a (T,1,D) spike/feature tensor on the time
       // axis. Wires (1) a per-timestep PointwiseConvLinear projection to pHidden
@@ -84820,6 +84824,33 @@ begin
 
   // ---- (5) Final LayerNorm. -------------------------------------------------
   Result := AddLayer( TNNetLayerNorm.Create() );
+end;
+
+function TNNet.AddTCNBlock(Channels, KernelSize, Dilation: integer;
+  DropoutRate: TNeuralFloat = 0; UseNormalization: boolean = false): TNNetLayer;
+var
+  BlockInput, BranchOutput, Skip: TNNetLayer;
+  ConvCnt: integer;
+begin
+  if GetLastLayer().Output.SizeY <> 1 then
+    FErrorProc('AddTCNBlock requires a (SeqLen,1,C) input (SizeY=1). Got SizeY=' +
+      IntToStr(GetLastLayer().Output.SizeY));
+  BlockInput := GetLastLayer();
+  for ConvCnt := 1 to 2 do
+  begin
+    AddLayer( TNNetCausalConv1D.Create(Channels, KernelSize, 0, Dilation) );
+    // Normalization must not compute per-sample statistics over the window:
+    // TNNetLayerNorm would let future time steps leak into past outputs.
+    if UseNormalization then AddLayer( TNNetMovingStdNormalization.Create() );
+    AddLayer( TNNetReLU.Create() );
+    if DropoutRate > 0 then AddLayer( TNNetSpatialDropout1D.Create(DropoutRate) );
+  end;
+  BranchOutput := GetLastLayer();
+  Skip := BlockInput;
+  if BlockInput.Output.Depth <> Channels then
+    Skip := AddLayerAfter( TNNetPointwiseConvLinear.Create(Channels), BlockInput );
+  AddLayer( TNNetSum.Create([BranchOutput, Skip]) );
+  Result := AddLayer( TNNetReLU.Create() );
 end;
 
 function TNNet.AddSpikingBlock(pHidden: integer; pTau: TNeuralFloat = 2.0;

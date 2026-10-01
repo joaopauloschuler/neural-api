@@ -966,6 +966,11 @@ type
     procedure TestAddConformerBlockShape;
     procedure TestAddConformerBlockSerializationRoundTrip;
     procedure TestAddConformerBlockGradientFlow;
+    procedure TestAddTCNBlockShape;
+    procedure TestAddTCNBlockSkipPaths;
+    procedure TestAddTCNBlockCausality;
+    procedure TestAddTCNBlockSerializationRoundTrip;
+    procedure TestAddTCNBlockGradientFlow;
     procedure TestAddRWKVBlockShape;
     procedure TestAddRWKVBlockSerializationRoundTrip;
     procedure TestAddRWKVBlockGradientFlow;
@@ -42371,6 +42376,244 @@ begin
       FloatToStr(GradSum) + ')', GradAbsMax > 1e-9);
   finally
     NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddTCNBlockShape;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Out: TNNetLayer;
+  i, LayersBefore: integer;
+begin
+  // First block projects 3 -> 8 channels (1x1 skip projection), the second
+  // keeps 8 (identity skip). Plain block: conv,relu,conv,relu,[proj],sum,relu.
+  // With dropout + normalization each conv adds MovingStdNorm and SpatialDropout1D.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(12, 1, 3);
+  try
+    NN.AddLayer(TNNetInput.Create(12, 1, 3));
+    LayersBefore := NN.CountLayers();
+    NN.AddTCNBlock({Channels=}8, {KernelSize=}3, {Dilation=}1);
+    AssertEquals('TCN projecting block layer count', 7, NN.CountLayers() - LayersBefore);
+    LayersBefore := NN.CountLayers();
+    NN.AddTCNBlock({Channels=}8, {KernelSize=}3, {Dilation=}2);
+    AssertEquals('TCN identity-skip block layer count', 6, NN.CountLayers() - LayersBefore);
+    LayersBefore := NN.CountLayers();
+    Out := NN.AddTCNBlock({Channels=}8, {KernelSize=}3, {Dilation=}4,
+      {DropoutRate=}0.1, {UseNormalization=}true);
+    AssertEquals('TCN dropout+norm block layer count', 10, NN.CountLayers() - LayersBefore);
+    AssertTrue('TCN block returns the final ReLU', Out is TNNetReLU);
+    AssertEquals('TCN block output SizeX', 12, Out.Output.SizeX);
+    AssertEquals('TCN block output SizeY', 1, Out.Output.SizeY);
+    AssertEquals('TCN block output Depth', 8, Out.Output.Depth);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.5) * 0.6;
+    NN.Compute(Input);
+    AssertEquals('TCN block computed SizeX', 12, NN.GetLastLayer.Output.SizeX);
+    AssertEquals('TCN block computed Depth', 8, NN.GetLastLayer.Output.Depth);
+  finally
+    NN.Free; Input.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddTCNBlockSkipPaths;
+var
+  NN: TNNet;
+  Input: TNNetVolume;
+  Projection: TNNetLayer;
+  LayerCnt, NeuronCnt, i, InDepth: integer;
+begin
+  // With every causal-conv weight and bias zeroed the branch outputs 0, so the
+  // block output must be ReLU(skip): ReLU(input) for C_in = Channels, and
+  // ReLU(1x1 projection of input) for C_in <> Channels.
+  for InDepth in [4, 3] do
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(7, 1, InDepth);
+    try
+      NN.AddLayer(TNNetInput.Create(7, 1, InDepth));
+      NN.AddTCNBlock({Channels=}4, {KernelSize=}2, {Dilation=}2);
+      Projection := nil;
+      for LayerCnt := 0 to NN.CountLayers() - 1 do
+      begin
+        if NN.Layers[LayerCnt] is TNNetPointwiseConvLinear then
+          Projection := NN.Layers[LayerCnt];
+        if NN.Layers[LayerCnt] is TNNetCausalConv1D then
+          for NeuronCnt := 0 to NN.Layers[LayerCnt].Neurons.Count - 1 do
+          begin
+            NN.Layers[LayerCnt].Neurons[NeuronCnt].Weights.Fill(0);
+            NN.Layers[LayerCnt].Neurons[NeuronCnt].BiasWeight := 0;
+          end;
+      end;
+      AssertEquals('TCN skip projection present iff C_in <> Channels',
+        InDepth <> 4, Assigned(Projection));
+      for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.9) * 1.3;
+      NN.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        if Assigned(Projection) then
+          AssertEquals('TCN projected skip at ' + IntToStr(i),
+            Max(Projection.Output.Raw[i], 0), NN.GetLastLayer.Output.Raw[i], 1e-6)
+        else
+          AssertEquals('TCN identity skip at ' + IntToStr(i),
+            Max(Input.Raw[i], 0), NN.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN.Free; Input.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddTCNBlockCausality;
+const
+  SeqLen = 16;
+  InDepth = 3;
+var
+  NN: TNNet;
+  Input, Perturbed, Desired, Baseline: TNNetVolume;
+  UseNormalization: boolean;
+  i, PerturbT, t, d, Step: integer;
+  AnyChange: boolean;
+begin
+  // Perturbing the input at time PerturbT must leave every output at t < PerturbT
+  // bit-identical. With normalization on, a few training steps first move the
+  // MovingStdNormalization statistics away from their identity start values.
+  for UseNormalization in [false, true] do
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(SeqLen, 1, InDepth);
+    Perturbed := TNNetVolume.Create(SeqLen, 1, InDepth);
+    Desired := TNNetVolume.Create(SeqLen, 1, 6);
+    Baseline := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(SeqLen, 1, InDepth));
+      NN.AddTCNBlock(6, 3, 1, 0.2, UseNormalization);
+      NN.AddTCNBlock(6, 3, 2, 0.2, UseNormalization);
+      NN.SetLearningRate(0.01, 0.0);
+      for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.37) * 1.5 + 0.4;
+      for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.21) + 1.0;
+      if UseNormalization then
+        for Step := 1 to 5 do
+        begin
+          NN.Compute(Input);
+          NN.Backpropagate(Desired);
+        end;
+      NN.EnableDropouts(false);
+      NN.Compute(Input);
+      Baseline.Copy(NN.GetLastLayer.Output);
+      for PerturbT := 1 to SeqLen - 1 do
+      begin
+        Perturbed.Copy(Input);
+        for d := 0 to InDepth - 1 do
+          Perturbed[PerturbT, 0, d] := Perturbed[PerturbT, 0, d] + 2.5;
+        NN.Compute(Perturbed);
+        AnyChange := false;
+        for t := 0 to SeqLen - 1 do
+          for d := 0 to 5 do
+            if t < PerturbT then
+              AssertEquals('TCN causality (norm=' + BoolToStr(UseNormalization, true) +
+                ') perturb t=' + IntToStr(PerturbT) + ' out t=' + IntToStr(t),
+                Baseline[t, 0, d], NN.GetLastLayer.Output[t, 0, d], 0)
+            else if Baseline[t, 0, d] <> NN.GetLastLayer.Output[t, 0, d] then
+              AnyChange := true;
+        AssertTrue('TCN perturb t=' + IntToStr(PerturbT) +
+          ' changes some output at t >= PerturbT', AnyChange);
+      end;
+    finally
+      NN.Free; Input.Free; Perturbed.Free; Desired.Free; Baseline.Free;
+    end;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddTCNBlockSerializationRoundTrip;
+var
+  NN, NN2: TNNet;
+  Input, Desired: TNNetVolume;
+  Saved, Saved2: string;
+  i, Step: integer;
+begin
+  // A projecting block plus an identity-skip block, both with dropout and
+  // normalization on, trained a few steps so the MovingStdNormalization
+  // statistics are not their defaults; dropout is off when outputs are compared.
+  RandSeed := 424242;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(9, 1, 3);
+  Desired := TNNetVolume.Create(9, 1, 5);
+  try
+    NN.AddLayer(TNNetInput.Create(9, 1, 3));
+    NN.AddTCNBlock(5, 3, 1, 0.2, true);
+    NN.AddTCNBlock(5, 3, 2, 0.2, true);
+    NN.SetLearningRate(0.01, 0.0);
+    for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.7) * 2.0 + 0.3;
+    for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.4) + 1.0;
+    for Step := 1 to 3 do
+    begin
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+    end;
+    NN.EnableDropouts(false);
+    NN.Compute(Input);
+
+    Saved := NN.SaveToString();
+    NN2 := TNNet.Create();
+    try
+      NN2.LoadFromString(Saved);
+      NN2.EnableDropouts(false);
+      AssertEquals('TCN block round-trip layer count',
+        NN.CountLayers(), NN2.CountLayers());
+      Saved2 := NN2.SaveToString();
+      AssertEquals('TCN block SaveToString round-trip equality', Saved, Saved2);
+      NN2.Compute(Input);
+      for i := 0 to NN.GetLastLayer.Output.Size - 1 do
+        AssertEquals('TCN block round-trip output at ' + IntToStr(i),
+          NN.GetLastLayer.Output.Raw[i], NN2.GetLastLayer.Output.Raw[i], 1e-6);
+    finally
+      NN2.Free;
+    end;
+  finally
+    NN.Free; Input.Free; Desired.Free;
+  end;
+end;
+
+procedure TTestNeuralNumerical.TestAddTCNBlockGradientFlow;
+var
+  NN: TNNet;
+  Input, Desired: TNNetVolume;
+  i, InDepth: integer;
+  GradAbsMax: TNeuralFloat;
+  AnyNan: boolean;
+begin
+  // One forward+backward must leave the INPUT gradient finite and non-zero on
+  // both skip paths (identity: C_in = Channels; projection: C_in <> Channels).
+  for InDepth in [6, 3] do
+  begin
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(8, 1, InDepth);
+    Desired := TNNetVolume.Create(8, 1, 6);
+    try
+      NN.AddLayer(TNNetInput.Create(8, 1, InDepth, 1));
+      NN.AddTCNBlock(6, 3, 2, 0, true);
+      NN.SetLearningRate(0.01, 0.0);
+      for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.1) * 0.7;
+      for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.6) * 0.3 + 0.5;
+      NN.Compute(Input);
+      NN.Backpropagate(Desired);
+      GradAbsMax := 0; AnyNan := false;
+      for i := 0 to NN.Layers[0].OutputError.Size - 1 do
+      begin
+        if IsNan(NN.Layers[0].OutputError.Raw[i]) or
+           IsInfinite(NN.Layers[0].OutputError.Raw[i]) then AnyNan := true;
+        GradAbsMax := Max(GradAbsMax, Abs(NN.Layers[0].OutputError.Raw[i]));
+      end;
+      AssertTrue('TCN block input gradient finite (C_in=' + IntToStr(InDepth) + ')',
+        not AnyNan);
+      AssertTrue('TCN block input gradient non-zero (C_in=' + IntToStr(InDepth) + ')',
+        GradAbsMax > 1e-9);
+    finally
+      NN.Free; Input.Free; Desired.Free;
+    end;
   end;
 end;
 
