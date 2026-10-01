@@ -1939,6 +1939,15 @@ rather than acted on.
           enqueued OpenCL work; per-role and per-class tables with OpenCL
           forwards and host<->OpenCL transfer counts/MB). User run pending:
           `--int4 --width 1024 --height 1024 --steps 2 --profile`.
+          L4 profile (user, 1024x1024 int4, b03fae2f): 34.6 s/step; transfers
+          22.5 GB up + 12.3 GB down per step at only ~2 GB/s effective, so about
+          half the step is host layers + transfers (Q/K RoPE 5.2 s, Norm2 2.6,
+          QKV concat 1.9, Norm1 1.5, Modulated1/2 2.2, BlockInput 1.0, input
+          uploads in Q/K/V/GateUp ~4). Attention ~7.8 s/step (~1.1 TFLOPS, the
+          weakest OpenCL kernel). Projections with a resident input are fine
+          (OutProj 13.7 ms/block, ~10 TFLOPS). Image-in net 1.16 s/step on the
+          CPU for ~2 GFLOP (odd; look later). Order chosen: B1d2 -> B1d3 ->
+          B1d4, then B2 (VAE 519 s), then the B1c deferred attention items.
     - [ ] B1g. Transformer load time with OpenCL (240 s vs 148 s on the CPU):
           find the extra ~92 s (suspect: the host-side int4 repack loop in
           `PrepareInt4DotCL`, one nested call per weight pair; unverified).
@@ -2005,11 +2014,25 @@ rather than acted on.
                   TNNetChannelMulByLayer and TNNetCellMulByCell.
             - [ ] SE / CBAM / DiT importers now take this OpenCL path with no
                   OpenCL parity test.
-      - [ ] B1d2. `TNNetTokenLayerNorm` x2: FShouldOpenCL pinned false
+      - [x] B1d2. `TNNetTokenLayerNorm` x2: FShouldOpenCL pinned false
             (deliberate: OpenCLForwardBenchmark ~0.54x standalone), Compute
             downloads before WillOpenCL, no residency clause, no bind/keep, no
             OpenCLOutputBuffer. Mirror TNNetTokenRMSNorm; one work-item per token
             is weak at depth 4096.
+            DONE: TNNetTokenLayerNorm binds a resident source and keeps its
+            output (FShouldOpenCL stays pinned for host sources);
+            cai_volume_norm runs one segment per work-group (cai_token_norm
+            removed; TokenRMSNorm/HeadRMSNorm share it); TNNetLayer
+            .PrevOutputOnOpenCLSameSize replaces 5 copies. Norm1/2,
+            Modulated1/2 on OpenCL; Q/K/V/GateUp no longer upload, Norm2 no
+            longer downloads (~10.7 GB/step less at 1024x1024, computed).
+            Follow-ups:
+            - [ ] Shared parent class for the four norm layers' identical
+                  FTokenNormCL / EnableOpenCL / WillOpenCL / output overrides.
+            - [ ] Forced-OpenCL TRAINING through TokenLayerNorm/TokenRMSNorm
+                  never fills FNormalized/FInvStd (FInvRMS): backprop reads
+                  stale values (pre-existing). TNNetRMSNorm.WillOpenCL has no
+                  trainable exclusion.
       - [ ] B1d3. `TNNetAxialRotaryEmbedding` x2 (via TNNetMRotaryEmbedding):
             Compute downloads before WillOpenCL, no residency clause,
             `TNNetMRoPECL.Rotate` has no bind/keep and uploads the whole angle

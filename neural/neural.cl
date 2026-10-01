@@ -1642,84 +1642,29 @@ __kernel void cai_bicubic_scatter
   FDst[g_id] = acc;
 }
 
-// CAI Per-Token Norm (RMSNorm / LayerNorm forward)
+// CAI Segment Norm (RMSNorm / LayerNorm forward)
 // Coded by Claude (AI).
-// Device forward for the per-TOKEN depth-axis normalization layers
-// TNNetTokenRMSNorm and TNNetTokenLayerNorm. The input is a sequence of tokens
-// laid out with the feature vector CONTIGUOUS on the Depth axis: token t occupies
-// FX[t*FDepth .. t*FDepth + FDepth-1]. Each token is normalized INDEPENDENTLY
-// over its FDepth elements, then a per-channel gain (and, for LayerNorm, a bias)
-// is applied. This reproduces the exact scalar arithmetic of the CPU Compute():
+// Forward for every depth-axis norm layer: TNNetTokenRMSNorm / TNNetHeadRMSNorm
+// / TNNetTokenLayerNorm (one segment per token or per token x head) and
+// TNNetRMSNorm / TNNetLayerNorm (one segment = the whole sample). Segment g
+// occupies FX[g*FSize .. g*FSize + FSize-1] and is normalized INDEPENDENTLY by
+// work-group g, which reduces it cooperatively through local memory:
 //   FUseMean == 0 (RMSNorm, no mean subtraction):
 //     ms      = mean(x^2)
 //     invStd  = 1/sqrt(ms + FEps)
-//     y[c]    = FGain[c] * (x[c] * invStd)
-//   FUseMean == 1 (LayerNorm):
+//     y[i]    = FGain[i] * (x[i] * invStd)
+//   FUseMean == 1 (LayerNorm, biased variance as in the CPU Compute()):
 //     mean    = mean(x)
 //     var     = mean((x-mean)^2)
 //     invStd  = 1/sqrt(var + FEps)
-//     y[c]    = FGain[c] * ((x[c]-mean) * invStd) + FBias[c]
-//   FGain : per-channel gain weights, FDepth long.
-//   FBias : per-channel bias weights, FDepth long (ignored when FUseMean == 0).
-//   FX    : input tokens, raw [t*FDepth + c].
-//   FY    : output tokens, raw [t*FDepth + c].
-// One work-item per TOKEN: global size = FNumTokens (dim 0). Keeping the whole
-// per-token reduction inside a single work-item keeps the depth-axis sum order
-// close to the scalar path (parity well under 1e-4).
-__kernel void cai_token_norm
-(
-  const int FNumTokens,
-  const int FDepth,
-  const int FUseMean,
-  const float FEps,
-  __global const float* FGain,
-  __global const float* FBias,
-  __global const float* FX,
-  __global float* FY
-)
-{
-  const int t = get_global_id(0);
-  if (t >= FNumTokens) return;
-  const int base = t * FDepth;
-  float mean = 0.0f;
-  if (FUseMean != 0)
-  {
-    float s = 0.0f;
-    for (int c = 0; c < FDepth; c++) s += FX[base + c];
-    mean = s / (float)FDepth;
-  }
-  // reduction: sum of squares (RMS) or sum of centered squares (LayerNorm var)
-  float ss = 0.0f;
-  for (int c = 0; c < FDepth; c++)
-  {
-    const float v = FX[base + c] - mean;
-    ss = mad(v, v, ss);
-  }
-  const float invStd = 1.0f / sqrt(ss / (float)FDepth + FEps);
-  for (int c = 0; c < FDepth; c++)
-  {
-    const float xhat = (FX[base + c] - mean) * invStd;
-    if (FUseMean != 0)
-      FY[base + c] = mad(FGain[c], xhat, FBias[c]);
-    else
-      FY[base + c] = FGain[c] * xhat;
-  }
-}
-
-// Whole-volume normalization (TNNetRMSNorm with FUseMean=0 / TNNetLayerNorm with
-// FUseMean=1). The WHOLE sample is a single reduction over FSize elements, so the
-// per-token kernel above -- invoked with one token of width FSize -- would put
-// the entire FSize-element reduction AND all FSize output writes on ONE
-// work-item (a pathological serialization: ~100x slower than the parallel token
-// path on a large volume). Instead this kernel runs ONE work-group of get_local_
-// size(0) work-items that cooperatively reduce mean/variance through local
-// memory, then apply the per-ELEMENT gain/bias in parallel via a grid-stride
-// loop. Gain/Bias are FSize long (per element, NOT per channel), matching the
-// scalar TNNetRMSNorm/TNNetLayerNorm which scale the flattened sample. Launch
-// with global size == local size (a single work-group) and a power-of-two local
-// size; pass FScratch as get_local_size(0) floats of __local memory. The CPU
-// reference reduces with an 8-wide AVX accumulator, so this tree reduction --
-// also order-independent in spirit -- stays within the <1e-4 parity bound.
+//     y[i]    = FGain[i] * ((x[i]-mean) * invStd) + FBias[i]
+// FGain/FBias are FSize long and shared by every segment (per channel for the
+// token layers, per element for the whole-volume ones); FBias is not read when
+// FUseMean == 0. Launch one work-group per segment (global size = segments x
+// local size) with a power-of-two local size, and pass FScratch as
+// get_local_size(0) floats of __local memory. The tree reduction differs from
+// the CPU's 8-wide AVX accumulation order only by float rounding (parity well
+// under 1e-4).
 __kernel void cai_volume_norm
 (
   const int FSize,
@@ -1734,6 +1679,9 @@ __kernel void cai_volume_norm
 {
   const int lid = get_local_id(0);
   const int lsize = get_local_size(0);
+  const size_t base = (size_t)get_group_id(0) * (size_t)FSize;
+  __global const float* X = FX + base;
+  __global float* Y = FY + base;
   int s;
 
   // ---- mean (LayerNorm only); RMSNorm leaves mean = 0 ----
@@ -1741,7 +1689,7 @@ __kernel void cai_volume_norm
   if (FUseMean != 0)
   {
     float partial = 0.0f;
-    for (int i = lid; i < FSize; i += lsize) partial += FX[i];
+    for (int i = lid; i < FSize; i += lsize) partial += X[i];
     FScratch[lid] = partial;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (s = lsize >> 1; s > 0; s >>= 1)
@@ -1757,7 +1705,7 @@ __kernel void cai_volume_norm
   float ss = 0.0f;
   for (int i = lid; i < FSize; i += lsize)
   {
-    const float v = FX[i] - mean;
+    const float v = X[i] - mean;
     ss = mad(v, v, ss);
   }
   FScratch[lid] = ss;
@@ -1769,14 +1717,14 @@ __kernel void cai_volume_norm
   }
   const float invStd = 1.0f / sqrt(FScratch[0] / (float)FSize + FEps);
 
-  // ---- apply per-element gain/bias in parallel ----
+  // ---- apply gain/bias in parallel ----
   for (int i = lid; i < FSize; i += lsize)
   {
-    const float xhat = (FX[i] - mean) * invStd;
+    const float xhat = (X[i] - mean) * invStd;
     if (FUseMean != 0)
-      FY[i] = mad(FGain[i], xhat, FBias[i]);
+      Y[i] = mad(FGain[i], xhat, FBias[i]);
     else
-      FY[i] = FGain[i] * xhat;
+      Y[i] = FGain[i] * xhat;
   }
 }
 

@@ -26350,9 +26350,10 @@ begin
 end;
 {$ENDIF}
 
-// The step attention and the tanh gates (bound branch output x uploaded row)
-// run on OpenCL in every block and match the CPU (int8, 1e-5 as the swap
-// test), and the prefix K/V goes up once per EncodePrefix.
+// The step attention, both LayerNorms, the four modulations (bound activation x
+// uploaded row) run on OpenCL in every block with no activation upload into the
+// projections, match the CPU (int8, 1e-5 as the swap test), and the prefix K/V
+// goes up once per EncodePrefix.
 procedure TTestNeuralPretrained.TestQwenImage21TransformerOpenCLAttention;
 {$IFDEF OpenCL}
 const
@@ -26366,7 +26367,24 @@ var
   DeviceId: cl_device_id;
   GridH, GridW, BlockCount, StepPos, GPUBefore: integer;
   Gated1Before, Gated2Before, Modulated1Before, Modulated2Before: integer;
+  Norm1Before, Norm2Before: integer;
+  ProjUploadsBefore, NormDownloadsBefore: Int64;
   Diff: double;
+
+  // Activation uploads into the projections that read the modulated norms.
+  function ProjectionUploads(): Int64;
+  begin
+    Result := OnOpenCL.StepBlock.QProj.ProfiledTransfers.UploadCount +
+      OnOpenCL.StepBlock.KProj.ProfiledTransfers.UploadCount +
+      OnOpenCL.StepBlock.VProj.ProfiledTransfers.UploadCount +
+      OnOpenCL.StepBlock.GateUp.ProfiledTransfers.UploadCount;
+  end;
+
+  function NormDownloads(): Int64;
+  begin
+    Result := OnOpenCL.StepBlock.Norm1.ProfiledTransfers.DownloadCount +
+      OnOpenCL.StepBlock.Norm2.ProfiledTransfers.DownloadCount;
+  end;
 
   function SentinelSurvivors(V: TNNetVolume): integer;
   var
@@ -26400,6 +26418,8 @@ begin
       OnOpenCL.EnableOpenCL(PlatformId, DeviceId));
     OnOpenCL.EncodePrefix(Embeds);
     OnOpenCL.PrepareStepPass(GridH, GridW);
+    // Counts host<->OpenCL transfers per layer (TNNetLayer.ProfiledTransfers).
+    OnOpenCL.LayerProfiling := true;
     OnCPU := TQwenImage21Transformer.Create(QwenImage21TransformerFolder(),
       qiwInt8);
     OnCPU.EncodePrefix(Embeds);
@@ -26413,6 +26433,10 @@ begin
       Gated2Before := OnOpenCL.StepBlock.Gated2.ForwardGPUCnt;
       Modulated1Before := OnOpenCL.StepBlock.Modulated1.ForwardGPUCnt;
       Modulated2Before := OnOpenCL.StepBlock.Modulated2.ForwardGPUCnt;
+      Norm1Before := OnOpenCL.StepBlock.Norm1.ForwardGPUCnt;
+      Norm2Before := OnOpenCL.StepBlock.Norm2.ForwardGPUCnt;
+      ProjUploadsBefore := ProjectionUploads();
+      NormDownloadsBefore := NormDownloads();
       // Only the gates read to_out / img_mlp.out: a download would overwrite.
       OnOpenCL.StepBlock.OutProj.Output.Fill(Sentinel);
       OnOpenCL.StepBlock.Down.Output.Fill(Sentinel);
@@ -26422,17 +26446,36 @@ begin
         ': the attention ran on OpenCL in every block', BlockCount,
         OnOpenCL.StepBlock.Attn.ForwardGPUCnt - GPUBefore);
       WriteLn('  Qwen-Image-2.1 step ', StepPos, ' OpenCL forwards (of ',
-        BlockCount, '): Modulated1=',
+        BlockCount, '): Norm1=',
+        OnOpenCL.StepBlock.Norm1.ForwardGPUCnt - Norm1Before,
+        ' Norm2=', OnOpenCL.StepBlock.Norm2.ForwardGPUCnt - Norm2Before,
+        ' Modulated1=',
         OnOpenCL.StepBlock.Modulated1.ForwardGPUCnt - Modulated1Before,
         ' Gated1=', OnOpenCL.StepBlock.Gated1.ForwardGPUCnt - Gated1Before,
         ' Modulated2=',
         OnOpenCL.StepBlock.Modulated2.ForwardGPUCnt - Modulated2Before,
-        ' Gated2=', OnOpenCL.StepBlock.Gated2.ForwardGPUCnt - Gated2Before);
-      // Norm1/Norm2 (TNNetTokenLayerNorm) still end on the host (B1d2).
-      AssertEquals('step ' + IntToStr(StepPos) + ': Modulated1 on the host', 0,
+        ' Gated2=', OnOpenCL.StepBlock.Gated2.ForwardGPUCnt - Gated2Before,
+        '; projection uploads=', ProjectionUploads() - ProjUploadsBefore,
+        ' norm downloads=', NormDownloads() - NormDownloadsBefore);
+      // Norm1 binds the uploaded block input, Norm2 binds Residual1.
+      AssertEquals('step ' + IntToStr(StepPos) +
+        ': Norm1 ran on OpenCL in every block', BlockCount,
+        OnOpenCL.StepBlock.Norm1.ForwardGPUCnt - Norm1Before);
+      AssertEquals('step ' + IntToStr(StepPos) +
+        ': Norm2 ran on OpenCL in every block', BlockCount,
+        OnOpenCL.StepBlock.Norm2.ForwardGPUCnt - Norm2Before);
+      AssertEquals('step ' + IntToStr(StepPos) +
+        ': Modulated1 ran on OpenCL in every block', BlockCount,
         OnOpenCL.StepBlock.Modulated1.ForwardGPUCnt - Modulated1Before);
-      AssertEquals('step ' + IntToStr(StepPos) + ': Modulated2 on the host', 0,
+      AssertEquals('step ' + IntToStr(StepPos) +
+        ': Modulated2 ran on OpenCL in every block', BlockCount,
         OnOpenCL.StepBlock.Modulated2.ForwardGPUCnt - Modulated2Before);
+      AssertEquals('step ' + IntToStr(StepPos) +
+        ': the norms download nothing', 0,
+        NormDownloads() - NormDownloadsBefore);
+      AssertEquals('step ' + IntToStr(StepPos) +
+        ': Q/K/V/GateUp bind the modulated norms, no upload', 0,
+        ProjectionUploads() - ProjUploadsBefore);
       AssertEquals('step ' + IntToStr(StepPos) +
         ': Gated1 ran on OpenCL in every block', BlockCount,
         OnOpenCL.StepBlock.Gated1.ForwardGPUCnt - Gated1Before);

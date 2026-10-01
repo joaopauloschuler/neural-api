@@ -643,6 +643,9 @@ type
       // True when the previous layer left its finished output in device memory
       // and exposes both handles, so this layer may bind it. Coded by Claude (AI).
       function PrevOutputOnOpenCL(): boolean;
+      // PrevOutputOnOpenCL for a consumer that reads the source as one flat
+      // span of its own output size (guards a reshape since SetPrevLayer).
+      function PrevOutputOnOpenCLSameSize(): boolean;
       // Tiled-GEMM launches of this layer's FDotCL so far (0 without one): the
       // test hook proving a window forward took the tiled int8/int4 kernel.
       function OpenCLTiledGemmLaunchCount(): integer;
@@ -5177,27 +5180,16 @@ type
       Dst: TNNetVolume; NumSrc, Depth: integer);
   end;
 
-  /// OpenCL forward helper for the per-token depth-axis normalization layers
-  // TNNetTokenRMSNorm (UseMean=false) and TNNetTokenLayerNorm (UseMean=true).
-  // Binds the cai_token_norm entry point on the shared dot-product program's
-  // device, uploads the token tensor + gain (+ bias) weights, runs one
-  // work-item per token and reads the normalized result back.
-  // Coded by Claude (AI).
+  /// OpenCL forward of the depth-axis norms: cai_volume_norm, one work-group
+  // per segment (token, head or whole volume). Coded by Claude (AI).
   TNNetTokenNormCL = class(TNNetKernelCL)
   private
-    // Second entry point (cai_volume_norm) for the WHOLE-volume variants
-    // (TNNetRMSNorm / TNNetLayerNorm): a single work-group cooperatively reduces
-    // the whole sample instead of serializing it on one work-item.
-    FVolKernel: TNeuralKernel;
-    FXBuf, FYBuf: TNNetVolume; // host staging for the input/output token tensor
-    // Persistent device buffers (grow-only), reused every forward instead of the
-    // old per-call CreateBuffer/clReleaseMemObject churn. Shared by both the
-    // Normalize and NormalizeWholeVolume paths (a helper instance drives only one).
+    // Persistent OpenCL buffers (grow-only), reused every forward.
     FBufX, FBufGain, FBufBias, FBufY: cl_mem;
     FCapX, FCapGain, FCapBias, FCapY: csize_t;
-    // The kernel of whichever entry point last ran, so a layer that leaves its
-    // result in FBufY can name the queue that produced it. Nil before the first
-    // forward, which is what tells a consumer there is nothing to bind yet.
+    // The kernel that wrote FBufY, so a layer that leaves its result there can
+    // name the queue that produced it. Nil before the first forward, which is
+    // what tells a consumer there is nothing to bind yet.
     FOutputKernel: TNeuralKernel;
   public
     constructor Create(NN: TNNet);
@@ -5206,28 +5198,10 @@ type
     // per forward: EnsureOutputBuffer replaces the handle when Y grows.
     function ResultBuffer(): cl_mem;
     function OutputKernel(): TNeuralKernel;
-    // X holds NumTokens*Depth values [t*Depth + c]; Gain/Bias are Depth long
-    // (Bias may be nil when UseMean is false). Y receives the normalized output
-    // in the same layout. Eps matches the layer's serialized epsilon.
-    // pWeightsDirty=false reuses the resident Gain/Bias copy (see EnsureWriteBuffer).
-    // NumTokens=1 is handed to NormalizeWholeVolume: same result, cooperative
-    // reduction instead of one work-item reading the whole Depth serially.
-    // pExternalSrc and pKeepResultOnOpenCL work as they do there.
+    // Normalizes NumSegments contiguous segments of X into Y; Gain/Bias are
+    // SegmentSize long (Bias nil if not UseMean); pExternalSrc is borrowed.
     procedure Normalize(X: TNNetVolume; Gain, Bias: TNNetVolume; Y: TNNetVolume;
-      NumTokens, Depth: integer; UseMean: boolean; Eps: TNeuralFloat;
-      pWeightsDirty: boolean = true; pExternalSrc: cl_mem = nil;
-      pKeepResultOnOpenCL: boolean = false);
-    // Whole-volume normalization: X is reduced as a single sample of X.Size
-    // elements (mean/variance over the whole volume) and scaled by per-ELEMENT
-    // Gain/Bias (each X.Size long; Bias may be nil when UseMean is false). Used
-    // by TNNetRMSNorm / TNNetLayerNorm. One cooperative work-group; far faster
-    // than Normalize(...,NumTokens=1,...) which serializes on a single lane.
-    // pExternalSrc BORROWS an already-resident input in place of uploading X,
-    // which is then read for its size only; the borrowed buffer is never
-    // released here. pKeepResultOnOpenCL leaves the result in ResultBuffer for
-    // the next layer instead of reading it back into Y.
-    procedure NormalizeWholeVolume(X: TNNetVolume; Gain, Bias: TNNetVolume;
-      Y: TNNetVolume; UseMean: boolean; Eps: TNeuralFloat;
+      NumSegments, SegmentSize: integer; UseMean: boolean; Eps: TNeuralFloat;
       pWeightsDirty: boolean = true; pExternalSrc: cl_mem = nil;
       pKeepResultOnOpenCL: boolean = false);
   end;
@@ -8573,6 +8547,8 @@ type
       FBetaGradScratch: TNNetVolume;  // Depth-length backward beta-grad accumulator
       {$IFDEF OpenCL}
       FTokenNormCL: TNNetTokenNormCL;
+      // Binds a source in OpenCL memory (else uploads it) and leaves the result
+      // there for the next layer.
       procedure ComputeOpenCL();
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -8593,6 +8569,8 @@ type
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
   end;
 
@@ -8610,9 +8588,6 @@ type
       {$IFDEF OpenCL}
       FTokenNormCL: TNNetTokenNormCL;
       procedure ComputeOpenCL();
-      // True when the previous layer's output can be read where it lies, as the
-      // cai_volume_norm input, instead of coming back to RAM to be uploaded.
-      function ShouldBindPrevOutputOnOpenCL(): boolean;
       {$ENDIF}
       // Releases FNormalized: it is read only by Backpropagate, so an
       // inference-only layer neither fills nor needs it. Compute keys the
@@ -8660,9 +8635,6 @@ type
       {$IFDEF OpenCL}
       FTokenNormCL: TNNetTokenNormCL;
       procedure ComputeOpenCL();
-      // True when the previous layer's output can be read where it lies, as the
-      // cai_token_norm input, instead of coming back to RAM to be uploaded.
-      function ShouldBindPrevOutputOnOpenCL(): boolean;
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       function NonWeightBytes(): int64; override;
@@ -9881,9 +9853,6 @@ type
       // buffers. Both are no-ops when the history is already where it is wanted.
       procedure EnsureDecodeHistoryOnOpenCL();
       procedure ForceDecodeHistoryOnRAM();
-      // True when the previous layer's output can be read where it lies, as the
-      // cai_depthwise_conv1d input, instead of coming back to RAM to be uploaded.
-      function ShouldBindPrevOutputOnOpenCL(): boolean;
       {$ENDIF}
       procedure AfterWeightUpdate(); override;
     protected
@@ -18119,7 +18088,7 @@ type
       FBorrowedOpenCLContext: cl_context;
       FBorrowedOpenCLProgram: cl_program;
       // Net-wide cache of borrowed-program helper kernels, one TNeuralKernel per
-      // distinct neural.cl entry point (cai_token_norm, cai_group_norm, ...),
+      // distinct neural.cl entry point (cai_volume_norm, cai_group_norm, ...),
       // SHARED by every layer of that type instead of one handle per layer
       // instance. Keyed by kernel name; built lazily by SharedKernel against
       // FDotProductKernel's program and freed in Destroy. Per-layer state stays
@@ -23380,8 +23349,7 @@ end;
 // reads FOutput on the host, and a trainable layer must keep it there.
 function TNNetPointwiseSoftMax.ShouldBindPrevOutputOnOpenCL(): boolean;
 begin
-  Result := (not FIsTrainable) and PrevOutputOnOpenCL() and
-    (FPrevLayer.FOutput.Size = FOutput.Size);
+  Result := (not FIsTrainable) and PrevOutputOnOpenCLSameSize();
 end;
 
 // Device per-token softmax forward: each (X,Y) position owns a contiguous group
@@ -38279,22 +38247,15 @@ end;
 
 constructor TNNetTokenNormCL.Create(NN: TNNet);
 begin
-  inherited Create(NN, 'cai_token_norm');
-  FVolKernel := NN.GetKernel('cai_volume_norm');
-  FXBuf := TNNetVolume.Create();
-  FYBuf := TNNetVolume.Create();
+  inherited Create(NN, 'cai_volume_norm');
 end;
 
 destructor TNNetTokenNormCL.Destroy();
 begin
-  FXBuf.Free;
-  FYBuf.Free;
-  // Release the persistent device buffers (own memory, not the shared handle).
   if Assigned(FBufX)    then clReleaseMemObject(FBufX);
   if Assigned(FBufGain) then clReleaseMemObject(FBufGain);
   if Assigned(FBufBias) then clReleaseMemObject(FBufBias);
   if Assigned(FBufY)    then clReleaseMemObject(FBufY);
-  FNN.FreeKernelIfNotShared('cai_volume_norm', FVolKernel);
   inherited Destroy();
 end;
 
@@ -38309,32 +38270,31 @@ begin
 end;
 
 procedure TNNetTokenNormCL.Normalize(X: TNNetVolume; Gain, Bias: TNNetVolume;
-  Y: TNNetVolume; NumTokens, Depth: integer; UseMean: boolean; Eps: TNeuralFloat;
-  pWeightsDirty: boolean = true; pExternalSrc: cl_mem = nil;
+  Y: TNNetVolume; NumSegments, SegmentSize: integer; UseMean: boolean;
+  Eps: TNeuralFloat; pWeightsDirty: boolean = true; pExternalSrc: cl_mem = nil;
   pKeepResultOnOpenCL: boolean = false);
+const
+  // Power of two (the tree reduction halves it) and within every device's
+  // maximum work-group size.
+  cMaxLocalSize = 256;
 var
   bufX, bufY, bufGain, bufBias: cl_mem;
   k: cl_kernel;
   iUseMean: longint;
+  LocalSize: csize_t;
   fEps: single;
 begin
-  // A single token is the degenerate launch for cai_token_norm: one work-item
-  // reads the whole Depth serially. cai_volume_norm reduces the same values
-  // with one cooperative work-group, and over a single token the per-channel
-  // Gain/Bias ARE the per-element vectors that entry point wants.
-  if (NumTokens = 1) and (X.Size = Depth) then
-  begin
-    NormalizeWholeVolume(X, Gain, Bias, Y, UseMean, Eps, pWeightsDirty,
-      pExternalSrc, pKeepResultOnOpenCL);
-    exit;
-  end;
   k := FKernel.Kernel;
   if UseMean then iUseMean := 1 else iUseMean := 0;
   fEps := Eps;
-  // Upload the token tensor + the per-channel gain/bias weights; allocate the
-  // device result. The weights re-upload only when they changed. Without a bias
-  // the kernel never reads FBias, so the gain buffer stands in for it: the
-  // argument is a valid handle and no second buffer is allocated or uploaded.
+  // A short segment gets the smallest power-of-two group that covers it, so no
+  // lane idles through the whole launch.
+  LocalSize := 1;
+  while (LocalSize < cMaxLocalSize) and (LocalSize < csize_t(SegmentSize)) do
+    LocalSize := LocalSize * 2;
+  // The weights re-upload only when they changed. Without a bias the kernel
+  // never reads FBias, so the gain buffer stands in for it: the argument is a
+  // valid handle and no second buffer is allocated or uploaded.
   if pExternalSrc <> nil
     then bufX := pExternalSrc
     else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
@@ -38343,74 +38303,23 @@ begin
     then bufBias := FKernel.EnsureWriteBuffer(FBufBias, FCapBias, Bias, pWeightsDirty)
     else bufBias := bufGain;
   bufY    := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
-  clSetKernelArg(k, 0, csLongintSize, @NumTokens);
-  clSetKernelArg(k, 1, csLongintSize, @Depth);
-  clSetKernelArg(k, 2, csLongintSize, @iUseMean);
-  clSetKernelArg(k, 3, csNeuralFloatSize, @fEps);
-  clSetKernelArg(k, 4, csCLMemSize, @bufGain);
-  clSetKernelArg(k, 5, csCLMemSize, @bufBias);
-  clSetKernelArg(k, 6, csCLMemSize, @bufX);
-  clSetKernelArg(k, 7, csCLMemSize, @bufY);
-  // One work-item per token.
-  FKernel.RunKernel(k, NumTokens);
-  FOutputKernel := FKernel;
-  if not pKeepResultOnOpenCL then
-  begin
-    FKernel.Finish();
-    FKernel.ReadBuffer(bufY, Y, CL_TRUE);
-  end;
-  // Buffers are persistent (FBuf*), reused next forward - not released here.
-end;
-
-procedure TNNetTokenNormCL.NormalizeWholeVolume(X: TNNetVolume;
-  Gain, Bias: TNNetVolume; Y: TNNetVolume; UseMean: boolean; Eps: TNeuralFloat;
-  pWeightsDirty: boolean = true; pExternalSrc: cl_mem = nil;
-  pKeepResultOnOpenCL: boolean = false);
-const
-  // Single cooperative work-group. Power-of-two (the tree reduction halves it)
-  // and within every device's max work-group size (T4 = 1024, PoCL CPU larger).
-  cLocalSize = 256;
-var
-  bufX, bufY, bufGain, bufBias: cl_mem;
-  k: cl_kernel;
-  iSize, iUseMean: longint;
-  fEps: single;
-begin
-  k := FVolKernel.Kernel;
-  iSize := X.Size;
-  if UseMean then iUseMean := 1 else iUseMean := 0;
-  fEps := Eps;
-  // Upload the volume + per-element gain/bias; allocate the device result. The
-  // weights re-upload only when they changed. Without a bias the kernel never
-  // reads FBias, so the gain buffer stands in for it: the argument is a valid
-  // handle and no second buffer is allocated or uploaded.
-  if pExternalSrc <> nil
-    then bufX := pExternalSrc
-    else bufX := FVolKernel.EnsureWriteBuffer(FBufX, FCapX, X);
-  bufGain := FVolKernel.EnsureWriteBuffer(FBufGain, FCapGain, Gain, pWeightsDirty);
-  if Assigned(Bias)
-    then bufBias := FVolKernel.EnsureWriteBuffer(FBufBias, FCapBias, Bias, pWeightsDirty)
-    else bufBias := bufGain;
-  bufY    := FVolKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
-  clSetKernelArg(k, 0, csLongintSize, @iSize);
+  clSetKernelArg(k, 0, csLongintSize, @SegmentSize);
   clSetKernelArg(k, 1, csLongintSize, @iUseMean);
   clSetKernelArg(k, 2, csNeuralFloatSize, @fEps);
   clSetKernelArg(k, 3, csCLMemSize, @bufGain);
   clSetKernelArg(k, 4, csCLMemSize, @bufBias);
   clSetKernelArg(k, 5, csCLMemSize, @bufX);
   clSetKernelArg(k, 6, csCLMemSize, @bufY);
-  clSetKernelArg(k, 7, cLocalSize * csNeuralFloatSize, nil); // __local scratch
-  // Exactly one work-group of cLocalSize lanes (global size == local size).
-  FVolKernel.RunKernel2D(k, cLocalSize, 1, cLocalSize, 1);
-  FOutputKernel := FVolKernel;
+  clSetKernelArg(k, 7, LocalSize * csNeuralFloatSize, nil); // __local scratch
+  FKernel.RunKernel2D(k, LocalSize * csize_t(NumSegments), 1, LocalSize, 1);
+  FOutputKernel := FKernel;
   // Keeping the result means no read back: it waits in FBufY until a consumer
   // binds it or a host reader calls ForceOutputOnRAM.
   if not pKeepResultOnOpenCL then
   begin
-    FVolKernel.Finish();
-    FVolKernel.ReadBuffer(bufY, Y, CL_TRUE);
+    FKernel.Finish();
+    FKernel.ReadBuffer(bufY, Y, CL_TRUE);
   end;
-  // Buffers are persistent (FBuf*), reused next forward - not released here.
 end;
 
 { TNNetGroupNormCL }
@@ -63122,17 +63031,6 @@ begin
   else Result := nil;
 end;
 
-// cai_depthwise_conv1d reads its input as SeqLen contiguous Channels-wide rows,
-// the order every TNNetVolume and every producer's buffer already carries, so a
-// source in OpenCL memory binds straight in: no gather, no repacking. WillOpenCL
-// has already excluded a trainable layer, and SetPrevLayer sized FOutput from
-// the source, so the size test only guards a reshape between the two.
-function TNNetDepthwiseConv1D.ShouldBindPrevOutputOnOpenCL(): boolean;
-begin
-  Result := PrevOutputOnOpenCL() and
-    (FPrevLayer.FOutput.Size = FOutput.Size);
-end;
-
 // True-depthwise device forward via the purpose-built cai_depthwise_conv1d
 // kernel (one work-item per output (time, channel) element, NO cross-channel
 // overspend):
@@ -63153,7 +63051,7 @@ var
   SeqLen, Channels, Ksize, off: integer;
   SourceBuffer: cl_mem;
 begin
-  if ShouldBindPrevOutputOnOpenCL() then
+  if PrevOutputOnOpenCLSameSize() then
   begin
     // Read the source where it lies. The result goes to the helper's own output
     // buffer, so input and output are distinct handles and never alias.
@@ -63235,7 +63133,7 @@ var
   SeqLen, Channels, Ksize: integer;
   SourceBuffer: cl_mem;
 begin
-  if ShouldBindPrevOutputOnOpenCL() then
+  if PrevOutputOnOpenCLSameSize() then
   begin
     SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
     FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDepthwise1DCL.DecodeForwardKernel());
@@ -77227,9 +77125,9 @@ begin
   StartTime := Now();
   inherited Compute;
   {$IFDEF OpenCL}
-  // Device forward treats the whole sample as a single "token": the
-  // cai_token_norm kernel reduces mean/variance over the entire Depth=Size
-  // span and applies the per-ELEMENT gamma/beta (NumTokens=1, Depth=Size).
+  // Device forward treats the whole sample as a single segment: the
+  // cai_volume_norm kernel reduces mean/variance over the entire Size span and
+  // applies the per-ELEMENT gamma/beta.
   // Forward-only; training stays on the scalar CPU path below.
   if WillOpenCL() then
   begin
@@ -77283,8 +77181,9 @@ end;
 procedure TNNetLayerNorm.ComputeOpenCL();
 begin
   {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  FTokenNormCL.NormalizeWholeVolume(FOutput, FNeurons[0].FWeights,
-    FNeurons[1].FWeights, FOutput, {UseMean=}true, FLayerNormEpsilon,
+  FTokenNormCL.Normalize(FOutput, FNeurons[0].FWeights,
+    FNeurons[1].FWeights, FOutput, {NumSegments=}1, FOutput.Size,
+    {UseMean=}true, FLayerNormEpsilon,
     {pWeightsDirty=}FAfterWeightUpdateHasBeenCalled);
   FAfterWeightUpdateHasBeenCalled := false;
 end;
@@ -77448,11 +77347,11 @@ var
   XPtr, XHatPtr: TNeuralFloatArrPtr;
 begin
   StartTime := Now();
-  inherited Compute;
-  Depth := FOutput.Depth;
   {$IFDEF OpenCL}
-  // Device forward keeps the per-token activation resident on the GPU between
+  // OpenCL forward keeps the per-token activation in OpenCL memory between
   // attention/FFN blocks (forward-only; training stays on the CPU path below).
+  // It runs BEFORE the inherited copy because that copy opens with a
+  // ForceOutputOnRAM, which is the download ComputeOpenCL exists to avoid.
   if WillOpenCL() then
   begin
     Inc(FForwardGPUCnt);
@@ -77461,7 +77360,13 @@ begin
     exit;
   end
   else Inc(FForwardCPUCnt);
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read whatever a previous OpenCL forward left in the helper's buffer.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   {$ENDIF}
+  inherited Compute;
+  Depth := FOutput.Depth;
   // Token index runs over the flattened (X, Y) positions; the Depth axis is
   // contiguous in memory, so token t occupies FData[t*Depth .. t*Depth+Depth-1].
   // Each per-token segment is depth-contiguous, so the mean / variance
@@ -77508,11 +77413,15 @@ end;
 function TNNetTokenLayerNorm.WillOpenCL(): boolean;
 begin
   Result := Assigned(FTokenNormCL) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL);
+            and (FShouldOpenCL or FForceOpenCL
+                 or ((not FIsTrainable) and PrevOutputOnOpenCL()));
 end;
 
 procedure TNNetTokenLayerNorm.DisableOpenCL();
 begin
+  // FTokenNormCL owns the buffer a kept output lives in, so the host copy has
+  // to be recovered before the helper goes.
+  ForceOutputOnRAM();
   inherited DisableOpenCL();
   FreeAndNil(FTokenNormCL);
 end;
@@ -77524,19 +77433,53 @@ begin
     FTokenNormCL := TNNetTokenNormCL.Create(FNN);
 end;
 
-// Device per-token LayerNorm forward (mean+variance reduction over the Depth
-// axis, then gamma .* x_hat + beta), bit-faithful to the scalar Compute() above.
+function TNNetTokenLayerNorm.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FTokenNormCL) then Result := FTokenNormCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetTokenLayerNorm.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FTokenNormCL) then Result := FTokenNormCL.OutputKernel()
+  else Result := nil;
+end;
+
+// OpenCL per-token LayerNorm forward (mean and biased-variance reduction over
+// the Depth segment, then gamma .* x_hat + beta), the formula of Compute().
 procedure TNNetTokenLayerNorm.ComputeOpenCL();
 var
   Depth, NumTokens: integer;
+  SourceBuffer: cl_mem;
+  KeepOnOpenCL: boolean;
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  // cai_volume_norm reads the tokens as contiguous Depth segments, the order a
+  // source buffer already holds.
+  if PrevOutputOnOpenCLSameSize() then
+  begin
+    // The result goes to the helper's own buffer: input and output never alias.
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FTokenNormCL.OutputKernel());
+  end
+  else
+  begin
+    // Nothing to bind: stage the source in FOutput, which the upload reads.
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+    FOutput.CopyNoChecks(FPrevLayer.FOutput);
+  end;
   Depth := FOutput.Depth;
   NumTokens := FOutput.Size div Depth;
+  // Inference keeps the result in OpenCL memory (a host reader calls
+  // ForceOutputOnRAM); a forced trainable forward reads it back to RAM.
+  KeepOnOpenCL := not FIsTrainable;
   FTokenNormCL.Normalize(FOutput, FNeurons[0].FWeights, FNeurons[1].FWeights,
     FOutput, NumTokens, Depth, {UseMean=}true, FTokenLNEpsilon,
-    {pWeightsDirty=}FAfterWeightUpdateHasBeenCalled);
+    {pWeightsDirty=}FAfterWeightUpdateHasBeenCalled, SourceBuffer,
+    KeepOnOpenCL);
   FAfterWeightUpdateHasBeenCalled := false;
+  FOutputOnOpenCL := KeepOnOpenCL;
+  FOutputOnRAM := not KeepOnOpenCL;
 end;
 {$ENDIF}
 
@@ -77695,7 +77638,7 @@ end;
 function TNNetRMSNorm.WillOpenCL(): boolean;
 begin
   Result := (not FIsTrainable) and Assigned(FTokenNormCL) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL or ShouldBindPrevOutputOnOpenCL());
+            and (FShouldOpenCL or FForceOpenCL or PrevOutputOnOpenCLSameSize());
 end;
 {$ENDIF}
 
@@ -77769,17 +77712,6 @@ begin
   else Result := nil;
 end;
 
-// cai_volume_norm reads its input as a flat FSize span, the order every
-// TNNetVolume and every producer's buffer already carries, so a resident source
-// binds straight in: no gather, no repacking. WillOpenCL has already excluded a
-// trainable layer, and SetPrevLayer sized FOutput from the source, so the size
-// test only guards a reshape between the two.
-function TNNetRMSNorm.ShouldBindPrevOutputOnOpenCL(): boolean;
-begin
-  Result := PrevOutputOnOpenCL() and
-    (FPrevLayer.FOutput.Size = FOutput.Size);
-end;
-
 // Device whole-volume RMSNorm forward: the cai_volume_norm kernel (UseMean=
 // false) cooperatively reduces mean(x^2) over the entire sample with one work-
 // group and applies the per-element gamma. Bias passed nil (no beta).
@@ -77788,7 +77720,7 @@ procedure TNNetRMSNorm.ComputeOpenCL();
 var
   SourceBuffer: cl_mem;
 begin
-  if ShouldBindPrevOutputOnOpenCL() then
+  if PrevOutputOnOpenCLSameSize() then
   begin
     // Read the source where it lies. The result goes to the helper's own output
     // buffer, so input and output are distinct handles and never alias.
@@ -77807,8 +77739,8 @@ begin
   // inference-only, so no host reader is left behind: anything that wants
   // FOutput calls ForceOutputOnRAM, which MoveOutputToRAM answers from the two
   // accessors above.
-  FTokenNormCL.NormalizeWholeVolume(FOutput, FNeurons[0].FWeights, nil,
-    FOutput, {UseMean=}false, FRMSNormEpsilon,
+  FTokenNormCL.Normalize(FOutput, FNeurons[0].FWeights, nil,
+    FOutput, {NumSegments=}1, FOutput.Size, {UseMean=}false, FRMSNormEpsilon,
     {pWeightsDirty=}FAfterWeightUpdateHasBeenCalled, SourceBuffer,
     {pKeepResultOnOpenCL=}true);
   FAfterWeightUpdateHasBeenCalled := false;
@@ -78082,18 +78014,6 @@ begin
   else Result := nil;
 end;
 
-// cai_token_norm reads its input as NumTokens contiguous FNormDim segments, the
-// order every TNNetVolume and every producer's buffer already carries, so a
-// source in OpenCL memory binds straight in: no gather, no repacking.
-// WillOpenCL has already excluded a trainable layer, and SetPrevLayer sized
-// FOutput from the source, so the size test only guards a reshape between the
-// two.
-function TNNetTokenRMSNorm.ShouldBindPrevOutputOnOpenCL(): boolean;
-begin
-  Result := PrevOutputOnOpenCL() and
-    (FPrevLayer.FOutput.Size = FOutput.Size);
-end;
-
 // OpenCL per-token RMSNorm forward (sum-of-squares reduction over the FNormDim
 // segment, no mean subtraction, then gain .* x_hat), bit-faithful to the scalar
 // Compute() above.
@@ -78101,8 +78021,9 @@ procedure TNNetTokenRMSNorm.ComputeOpenCL();
 var
   Depth, NumTokens: integer;
   SourceBuffer: cl_mem;
+  KeepOnOpenCL: boolean;
 begin
-  if ShouldBindPrevOutputOnOpenCL() then
+  if PrevOutputOnOpenCLSameSize() then
   begin
     // Read the source where it lies. The result goes to the helper's own output
     // buffer, so input and output are distinct handles and never alias.
@@ -78119,17 +78040,16 @@ begin
   end;
   Depth := FNormDim;
   NumTokens := FOutput.Size div Depth;
-  // The result stays in OpenCL memory for the next layer to bind. WillOpenCL is
-  // inference-only, so no host reader is left behind: anything that wants
-  // FOutput calls ForceOutputOnRAM, which MoveOutputToRAM answers from the two
-  // accessors above.
+  // Inference keeps the result in OpenCL memory (a host reader calls
+  // ForceOutputOnRAM); a forced trainable forward reads it back to RAM.
+  KeepOnOpenCL := not FIsTrainable;
   FTokenNormCL.Normalize(FOutput, FNeurons[0].FWeights, nil,
     FOutput, NumTokens, Depth, {UseMean=}false, FTokenRMSEpsilon,
     {pWeightsDirty=}FAfterWeightUpdateHasBeenCalled, SourceBuffer,
-    {pKeepResultOnOpenCL=}true);
+    KeepOnOpenCL);
   FAfterWeightUpdateHasBeenCalled := false;
-  FOutputOnOpenCL := true;
-  FOutputOnRAM := false;
+  FOutputOnOpenCL := KeepOnOpenCL;
+  FOutputOnRAM := not KeepOnOpenCL;
 end;
 {$ENDIF}
 
@@ -135766,6 +135686,11 @@ end;
 function TNNetLayer.PrevOutputOnOpenCL(): boolean;
 begin
   Result := Assigned(FPrevLayer) and FPrevLayer.OutputBindableOnOpenCL();
+end;
+
+function TNNetLayer.PrevOutputOnOpenCLSameSize(): boolean;
+begin
+  Result := PrevOutputOnOpenCL() and (FPrevLayer.FOutput.Size = FOutput.Size);
 end;
 
 function TNNetLayer.OpenCLTiledGemmLaunchCount(): integer;

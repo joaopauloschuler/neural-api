@@ -639,8 +639,8 @@ type
     // OpenCL per-token depth-axis norm forward offload parity (vs CPU) for the
     // transformer norm layers TNNetTokenRMSNorm and TNNetTokenLayerNorm.
     procedure TokenRMSNormOpenCLParity;
-    // Single-token (decode) shape: TNNetTokenNormCL.Normalize hands it to the
-    // cooperative cai_volume_norm entry point, which must give the same result.
+    // Single-token (decode) shape: one cai_volume_norm segment on one
+    // cooperative work-group, which must give the CPU result.
     procedure TokenRMSNormDecodeOpenCLParity;
     procedure LayerNormOpenCLParity;
     // OpenCL interleaved-pair rotary (RoPE) forward offload parity (vs CPU).
@@ -655,7 +655,7 @@ type
     procedure AxialRoPEOpenCLParity;
     // OpenCL whole-volume mean/variance (LayerNorm) and mean-square (RMSNorm)
     // forward offload parity (vs CPU) for TNNetLayerNorm / TNNetRMSNorm, which
-    // collapse the whole SizeX*SizeY*Depth sample into one cai_token_norm token.
+    // run the whole SizeX*SizeY*Depth sample as one cai_volume_norm segment.
     procedure WholeVolumeLayerNormOpenCLParity;
     procedure WholeVolumeRMSNormOpenCLParity;
     // TNNetRMSNorm reads a resident source where it lies and leaves its own
@@ -690,6 +690,20 @@ type
     // source in OpenCL memory can put it there - and the projection follows
     // only when the normalized tokens stayed.
     procedure TokenRMSNormResidentChainUnforcedOpenCLParity;
+    // TNNetPointwiseConvLinear -> TNNetTokenLayerNorm -> TNNetPointwiseConvLinear
+    // with ForceOpenCL off, affine and not, small odd to 4096 depths, 1 and
+    // many tokens: the norm binds its source, keeps its output and uploads
+    // gamma/beta again after a weight change.
+    procedure TokenLayerNormResidentChainUnforcedOpenCLParity;
+    // A source left in RAM keeps TNNetTokenLayerNorm on the CPU (its size
+    // verdict stays pinned False), with a bit-identical output.
+    procedure TokenLayerNormHostSourceStaysOnCPU;
+    // TNNetHeadRMSNorm (segment = head_dim < Depth) behind a resident source,
+    // ForceOpenCL off: binds the source, keeps its output, matches the CPU.
+    procedure HeadRMSNormResidentChainUnforcedOpenCLParity;
+    // A trainable TNNetTokenLayerNorm / TNNetTokenRMSNorm forced onto OpenCL
+    // reads its result back and offers no OpenCL output to bind.
+    procedure TokenNormForcedTrainableOutputOnRAM;
     // TEasyOpenCL.CompileProgram owns the PChar copy of its program source
     // (TStrings.GetText StrNew's it), so repeated compiles must not grow the
     // FPC heap; the failing-build path must also survive its build-log read.
@@ -71317,9 +71331,9 @@ end;
 {$ENDIF}
 
 // Per-token RMSNorm device-forward parity at the DECODE shape: one token, so
-// TNNetTokenNormCL.Normalize delegates to the cooperative cai_volume_norm entry
-// point instead of the one-work-item cai_token_norm. d_model exceeds the 256
-// lanes of that work-group, so its strided partial loop runs. Coded by Claude (AI).
+// cai_volume_norm runs a single segment on one work-group. d_model exceeds the
+// 256 lanes of that work-group, so its strided partial loop runs.
+// Coded by Claude (AI).
 procedure TTestNeuralNumerical.TokenRMSNormDecodeOpenCLParity;
 {$IFDEF OpenCL}
 var
@@ -71449,8 +71463,8 @@ end;
 
 // Whole-volume LayerNorm device-forward parity. TNNetLayerNorm normalizes over
 // the ENTIRE SizeX*SizeY*Depth sample (one mean/variance) and applies a
-// per-ELEMENT gamma/beta; the offload feeds cai_token_norm a single token of
-// width Depth=Size. Randomized per-element gamma AND beta. Coded by Claude (AI).
+// per-ELEMENT gamma/beta; the offload runs cai_volume_norm on a single segment
+// of length Size. Randomized per-element gamma AND beta. Coded by Claude (AI).
 procedure TTestNeuralNumerical.WholeVolumeLayerNormOpenCLParity;
 {$IFDEF OpenCL}
 var
@@ -71518,8 +71532,8 @@ end;
 
 // Whole-volume RMSNorm device-forward parity. TNNetRMSNorm divides the ENTIRE
 // SizeX*SizeY*Depth sample by sqrt(mean(x^2)+eps) (no mean subtraction) and
-// applies a per-ELEMENT gamma (no bias); the offload feeds cai_token_norm a
-// single token of width Depth=Size with UseMean=false. Coded by Claude (AI).
+// applies a per-ELEMENT gamma (no bias); the offload runs cai_volume_norm on a
+// single segment of length Size with UseMean=false. Coded by Claude (AI).
 procedure TTestNeuralNumerical.WholeVolumeRMSNormOpenCLParity;
 {$IFDEF OpenCL}
 var
@@ -73630,6 +73644,355 @@ begin
   finally
     OutCPU.Free; Input.Free; NN.Free;
   end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TokenLayerNormResidentChainUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  function MaxAbsDiff(A, B: TNNetVolume): TNeuralFloat;
+  var
+    Pos: integer;
+  begin
+    AssertEquals('size match', A.Size, B.Size);
+    Result := 0;
+    for Pos := 0 to A.Size - 1 do
+      Result := Max(Result, Abs(A.FData[Pos] - B.FData[Pos]));
+  end;
+
+  function SentinelSurvivors(V: TNNetVolume): integer;
+  var
+    Pos: integer;
+  begin
+    Result := 0;
+    for Pos := 0 to V.Size - 1 do
+      if V.FData[Pos] = csSentinel then Inc(Result);
+  end;
+
+  procedure CheckCase(TokenCount, Depth: integer; Affine: boolean);
+  var
+    NN: TNNet;
+    Input, NormCPU, OutCPU: TNNetVolume;
+    SourceConv, Norm, ConsumerConv: TNNetLayer;
+    CaseName: string;
+    Pos, MaxDepthPos: integer;
+    NormDiff, OutDiff: TNeuralFloat;
+  begin
+    CaseName := IntToStr(TokenCount) + 'x' + IntToStr(Depth);
+    if Affine then CaseName := CaseName + ' affine'
+    else CaseName := CaseName + ' non-affine';
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(TokenCount, 1, Depth);
+    NormCPU := TNNetVolume.Create();
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(TokenCount, 1, Depth));
+      SourceConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(Depth));
+      Norm := NN.AddLayer(TNNetTokenLayerNorm.Create(1e-6));
+      ConsumerConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(8));
+      NN.SetTrainable(False, False);
+      MaxDepthPos := Depth - 1;
+      if Affine then
+        for Pos := 0 to MaxDepthPos do
+        begin
+          Norm.Neurons[0].Weights.FData[Pos] := 1.0 + 0.4 * Sin(Pos * 0.7);
+          Norm.Neurons[1].Weights.FData[Pos] := 0.3 * Cos(Pos * 0.45);
+        end;
+      // A per-token offset makes the mean subtraction matter.
+      for Pos := 0 to Input.Size - 1 do
+        Input.FData[Pos] := 0.6 * Sin(Pos * 0.31) + 0.2 * (Pos div Depth) - 0.15;
+
+      NN.Compute(Input);
+      NormCPU.Copy(Norm.Output);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+      AssertFalse(CaseName + ': the norm size verdict stays pinned to the CPU',
+        Norm.ShouldOpenCL);
+
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      // Only a download into these two layers clears the sentinels.
+      SourceConv.Output.Fill(csSentinel);
+      Norm.Output.Fill(csSentinel);
+      NN.Compute(Input);
+      AssertTrue(CaseName + ': a resident source alone puts the norm on OpenCL',
+        Norm.ForwardGPUCnt >= 2);
+      AssertEquals(CaseName + ': the norm binds its source, no download',
+        SourceConv.Output.Size, SentinelSurvivors(SourceConv.Output));
+      AssertEquals(CaseName + ': the consumer binds the norm output, no download',
+        Norm.Output.Size, SentinelSurvivors(Norm.Output));
+      AssertTrue(CaseName + ': the consumer follows onto OpenCL',
+        ConsumerConv.ForwardGPUCnt > 0);
+      OutDiff := MaxAbsDiff(OutCPU, NN.GetLastLayer.Output);
+      AssertTrue(CaseName + ': ForceOutputOnRAM recovers the norm output',
+        Norm.ForceOutputOnRAM());
+      NormDiff := MaxAbsDiff(NormCPU, Norm.Output);
+      WriteLn('  TokenLayerNorm resident ', CaseName, ': norm max|diff|=',
+        NormDiff:0:9, ' out max|diff|=', OutDiff:0:9);
+      // The source projection itself differs by float rounding on OpenCL, so
+      // the bound covers its error times 1/std at depth 4096 (measured 5.7e-6).
+      AssertTrue(CaseName + ': norm max|diff| ' + FloatToStr(NormDiff) +
+        ' must be < 2e-5', NormDiff < 2e-5);
+      AssertTrue(CaseName + ': output max|diff| ' + FloatToStr(OutDiff) +
+        ' must be < 1e-4', OutDiff < 1e-4);
+
+      // InitDefault ends with AfterWeightUpdate (private), the call every
+      // weight change makes; the values written after it must reach OpenCL.
+      Norm.InitDefault();
+      for Pos := 0 to MaxDepthPos do
+      begin
+        Norm.Neurons[0].Weights.FData[Pos] := 0.5 + 0.25 * Cos(Pos * 0.3);
+        Norm.Neurons[1].Weights.FData[Pos] := -0.2 + 0.1 * Sin(Pos * 0.9);
+      end;
+      NN.Compute(Input);
+      Norm.ForceOutputOnRAM();
+      NormCPU.Copy(Norm.Output);
+      NN.DisableOpenCL();
+      NN.Compute(Input);
+      NormDiff := MaxAbsDiff(Norm.Output, NormCPU);
+      WriteLn('  TokenLayerNorm resident ', CaseName,
+        ' after a weight update: norm max|diff|=', NormDiff:0:9);
+      AssertTrue(CaseName + ': updated gamma/beta max|diff| ' +
+        FloatToStr(NormDiff) + ' must be < 2e-5', NormDiff < 2e-5);
+    finally
+      OutCPU.Free; NormCPU.Free; Input.Free; NN.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  CheckCase(5, 3, true);
+  CheckCase(1, 37, false);
+  CheckCase(7, 37, true);
+  CheckCase(3, 300, true);
+  CheckCase(1, 4096, true);
+  CheckCase(6, 4096, false);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TokenLayerNormHostSourceStaysOnCPU;
+{$IFDEF OpenCL}
+var
+  NN: TNNet;
+  Input, OutCPU: TNNetVolume;
+  HostSource, Norm: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  Pos: integer;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  NN := TNNet.Create();
+  Input := TNNetVolume.Create(4, 1, 300);
+  OutCPU := TNNetVolume.Create();
+  try
+    NN.AddLayer(TNNetInput.Create(4, 1, 300));
+    // TNNetAddConstant has no OpenCL path, so its output is in RAM only.
+    HostSource := NN.AddLayer(TNNetAddConstant.Create(0.25));
+    Norm := NN.AddLayer(TNNetTokenLayerNorm.Create());
+    NN.SetTrainable(False, False);
+    for Pos := 0 to Input.Size - 1 do Input.FData[Pos] := 0.6 * Sin(Pos * 0.29);
+    NN.Compute(Input);
+    OutCPU.Copy(Norm.Output);
+    NN.EnableOpenCL(PlatformId, DeviceId);
+    NN.Compute(Input);
+    AssertEquals('the host source ran on the CPU', 0, HostSource.ForwardGPUCnt);
+    AssertEquals('a host source keeps the norm on the CPU', 0,
+      Norm.ForwardGPUCnt);
+    for Pos := 0 to OutCPU.Size - 1 do
+      AssertEquals('bit-identical CPU output at ' + IntToStr(Pos),
+        OutCPU.FData[Pos], Norm.Output.FData[Pos], 0);
+  finally
+    OutCPU.Free; Input.Free; NN.Free;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.HeadRMSNormResidentChainUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  function MaxAbsDiff(A, B: TNNetVolume): TNeuralFloat;
+  var
+    Pos: integer;
+  begin
+    AssertEquals('size match', A.Size, B.Size);
+    Result := 0;
+    for Pos := 0 to A.Size - 1 do
+      Result := Max(Result, Abs(A.FData[Pos] - B.FData[Pos]));
+  end;
+
+  function SentinelSurvivors(V: TNNetVolume): integer;
+  var
+    Pos: integer;
+  begin
+    Result := 0;
+    for Pos := 0 to V.Size - 1 do
+      if V.FData[Pos] = csSentinel then Inc(Result);
+  end;
+
+  procedure CheckCase(TokenCount, HeadCount, HeadDim: integer);
+  var
+    NN: TNNet;
+    Input, NormCPU, OutCPU: TNNetVolume;
+    SourceConv, Norm, ConsumerConv: TNNetLayer;
+    CaseName: string;
+    Depth, Pos, MaxHeadDimPos: integer;
+    NormDiff, OutDiff: TNeuralFloat;
+  begin
+    CaseName := IntToStr(TokenCount) + ' tokens x ' + IntToStr(HeadCount) +
+      ' heads x ' + IntToStr(HeadDim);
+    Depth := HeadCount * HeadDim;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(TokenCount, 1, Depth);
+    NormCPU := TNNetVolume.Create();
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(TokenCount, 1, Depth));
+      SourceConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(Depth));
+      Norm := NN.AddLayer(TNNetHeadRMSNorm.Create(HeadDim, 1e-6));
+      ConsumerConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(8));
+      NN.SetTrainable(False, False);
+      AssertEquals(CaseName + ': one gain per head channel', HeadDim,
+        Norm.Neurons[0].Weights.Size);
+      MaxHeadDimPos := HeadDim - 1;
+      for Pos := 0 to MaxHeadDimPos do
+        Norm.Neurons[0].Weights.FData[Pos] := 1.0 + 0.4 * Sin(Pos * 0.7);
+      for Pos := 0 to Input.Size - 1 do
+        Input.FData[Pos] := 0.6 * Sin(Pos * 0.31) + 0.2 * (Pos div HeadDim);
+
+      NN.Compute(Input);
+      NormCPU.Copy(Norm.Output);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+      AssertFalse(CaseName + ': the norm size verdict stays pinned to the CPU',
+        Norm.ShouldOpenCL);
+
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      SourceConv.Output.Fill(csSentinel);
+      Norm.Output.Fill(csSentinel);
+      NN.Compute(Input);
+      AssertTrue(CaseName + ': a resident source alone puts the norm on OpenCL',
+        Norm.ForwardGPUCnt >= 2);
+      AssertEquals(CaseName + ': the norm binds its source, no download',
+        SourceConv.Output.Size, SentinelSurvivors(SourceConv.Output));
+      AssertEquals(CaseName + ': the consumer binds the norm output, no download',
+        Norm.Output.Size, SentinelSurvivors(Norm.Output));
+      AssertTrue(CaseName + ': the consumer follows onto OpenCL',
+        ConsumerConv.ForwardGPUCnt > 0);
+      OutDiff := MaxAbsDiff(OutCPU, NN.GetLastLayer.Output);
+      AssertTrue(CaseName + ': ForceOutputOnRAM recovers the norm output',
+        Norm.ForceOutputOnRAM());
+      NormDiff := MaxAbsDiff(NormCPU, Norm.Output);
+      WriteLn('  HeadRMSNorm resident ', CaseName, ': norm max|diff|=',
+        NormDiff:0:9, ' out max|diff|=', OutDiff:0:9);
+      AssertTrue(CaseName + ': norm max|diff| ' + FloatToStr(NormDiff) +
+        ' must be < 2e-5', NormDiff < 2e-5);
+      AssertTrue(CaseName + ': output max|diff| ' + FloatToStr(OutDiff) +
+        ' must be < 1e-4', OutDiff < 1e-4);
+    finally
+      OutCPU.Free; NormCPU.Free; Input.Free; NN.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  CheckCase(5, 3, 12);
+  CheckCase(1, 4, 37);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TokenNormForcedTrainableOutputOnRAM;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  procedure CheckLayer(Norm: TNNetLayer; const LayerName: string);
+  var
+    NN: TNNet;
+    Input, OutCPU: TNNetVolume;
+    Pos: integer;
+    MaxDiff: TNeuralFloat;
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(5, 1, 24);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(5, 1, 24));
+      NN.AddLayer(Norm);
+      NN.SetTrainable(True);
+      for Pos := 0 to Input.Size - 1 do
+        Input.FData[Pos] := 0.6 * Sin(Pos * 0.31) - 0.15;
+      NN.Compute(Input);
+      OutCPU.Copy(Norm.Output);
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      Norm.Output.Fill(csSentinel);
+      NN.Compute(Input);
+      AssertTrue(LayerName + ': the forced forward ran on OpenCL',
+        Norm.ForwardGPUCnt > 0);
+      AssertFalse(LayerName + ': a trainable forward offers no OpenCL output',
+        Norm.OutputBindableOnOpenCL());
+      MaxDiff := 0;
+      for Pos := 0 to OutCPU.Size - 1 do
+        MaxDiff := Max(MaxDiff, Abs(OutCPU.FData[Pos] - Norm.Output.FData[Pos]));
+      WriteLn('  ', LayerName, ' forced trainable: host output max|diff|=',
+        MaxDiff:0:9);
+      AssertTrue(LayerName + ': host output max|diff| ' + FloatToStr(MaxDiff) +
+        ' must be < 1e-5', MaxDiff < 1e-5);
+    finally
+      OutCPU.Free; Input.Free; NN.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  CheckLayer(TNNetTokenLayerNorm.Create(), 'TNNetTokenLayerNorm');
+  CheckLayer(TNNetTokenRMSNorm.Create(), 'TNNetTokenRMSNorm');
 end;
 {$ELSE}
 begin
