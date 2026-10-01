@@ -26367,8 +26367,9 @@ var
   DeviceId: cl_device_id;
   GridH, GridW, BlockCount, StepPos, GPUBefore: integer;
   Gated1Before, Gated2Before, Modulated1Before, Modulated2Before: integer;
-  Norm1Before, Norm2Before: integer;
+  Norm1Before, Norm2Before, QRopeBefore, KRopeBefore, QKVBefore: integer;
   ProjUploadsBefore, NormDownloadsBefore: Int64;
+  RopeUploadsBefore, RopeDownloadsBefore, AttnUploadsBefore: Int64;
   Diff: double;
 
   // Activation uploads into the projections that read the modulated norms.
@@ -26384,6 +26385,20 @@ var
   begin
     Result := OnOpenCL.StepBlock.Norm1.ProfiledTransfers.DownloadCount +
       OnOpenCL.StepBlock.Norm2.ProfiledTransfers.DownloadCount;
+  end;
+
+  // The rotations bind QNorm/KNorm; what is left is the angle table.
+  function RopeUploads(): Int64;
+  begin
+    Result := OnOpenCL.StepBlock.QRope.ProfiledTransfers.UploadCount +
+      OnOpenCL.StepBlock.KRope.ProfiledTransfers.UploadCount;
+  end;
+
+  function RopeAndConcatDownloads(): Int64;
+  begin
+    Result := OnOpenCL.StepBlock.QRope.ProfiledTransfers.DownloadCount +
+      OnOpenCL.StepBlock.KRope.ProfiledTransfers.DownloadCount +
+      OnOpenCL.StepBlock.QKV.ProfiledTransfers.DownloadCount;
   end;
 
   function SentinelSurvivors(V: TNNetVolume): integer;
@@ -26435,8 +26450,15 @@ begin
       Modulated2Before := OnOpenCL.StepBlock.Modulated2.ForwardGPUCnt;
       Norm1Before := OnOpenCL.StepBlock.Norm1.ForwardGPUCnt;
       Norm2Before := OnOpenCL.StepBlock.Norm2.ForwardGPUCnt;
+      QRopeBefore := OnOpenCL.StepBlock.QRope.ForwardGPUCnt;
+      KRopeBefore := OnOpenCL.StepBlock.KRope.ForwardGPUCnt;
+      QKVBefore := OnOpenCL.StepBlock.QKV.ForwardGPUCnt;
       ProjUploadsBefore := ProjectionUploads();
       NormDownloadsBefore := NormDownloads();
+      RopeUploadsBefore := RopeUploads();
+      RopeDownloadsBefore := RopeAndConcatDownloads();
+      AttnUploadsBefore :=
+        OnOpenCL.StepBlock.Attn.ProfiledTransfers.UploadCount;
       // Only the gates read to_out / img_mlp.out: a download would overwrite.
       OnOpenCL.StepBlock.OutProj.Output.Fill(Sentinel);
       OnOpenCL.StepBlock.Down.Output.Fill(Sentinel);
@@ -26455,8 +26477,17 @@ begin
         ' Modulated2=',
         OnOpenCL.StepBlock.Modulated2.ForwardGPUCnt - Modulated2Before,
         ' Gated2=', OnOpenCL.StepBlock.Gated2.ForwardGPUCnt - Gated2Before,
+        ' QRope=', OnOpenCL.StepBlock.QRope.ForwardGPUCnt - QRopeBefore,
+        ' KRope=', OnOpenCL.StepBlock.KRope.ForwardGPUCnt - KRopeBefore,
+        ' QKV=', OnOpenCL.StepBlock.QKV.ForwardGPUCnt - QKVBefore,
         '; projection uploads=', ProjectionUploads() - ProjUploadsBefore,
-        ' norm downloads=', NormDownloads() - NormDownloadsBefore);
+        ' norm downloads=', NormDownloads() - NormDownloadsBefore,
+        ' rope uploads=', RopeUploads() - RopeUploadsBefore,
+        ' rope+concat downloads=',
+        RopeAndConcatDownloads() - RopeDownloadsBefore,
+        ' attention uploads=',
+        OnOpenCL.StepBlock.Attn.ProfiledTransfers.UploadCount -
+        AttnUploadsBefore);
       // Norm1 binds the uploaded block input, Norm2 binds Residual1.
       AssertEquals('step ' + IntToStr(StepPos) +
         ': Norm1 ran on OpenCL in every block', BlockCount,
@@ -26476,6 +26507,30 @@ begin
       AssertEquals('step ' + IntToStr(StepPos) +
         ': Q/K/V/GateUp bind the modulated norms, no upload', 0,
         ProjectionUploads() - ProjUploadsBefore);
+      AssertEquals('step ' + IntToStr(StepPos) +
+        ': QRope ran on OpenCL in every block', BlockCount,
+        OnOpenCL.StepBlock.QRope.ForwardGPUCnt - QRopeBefore);
+      AssertEquals('step ' + IntToStr(StepPos) +
+        ': KRope ran on OpenCL in every block', BlockCount,
+        OnOpenCL.StepBlock.KRope.ForwardGPUCnt - KRopeBefore);
+      AssertEquals('step ' + IntToStr(StepPos) +
+        ': the QKV concat ran on OpenCL in every block', BlockCount,
+        OnOpenCL.StepBlock.QKV.ForwardGPUCnt - QKVBefore);
+      AssertEquals('step ' + IntToStr(StepPos) +
+        ': the rotations and the QKV concat download nothing', 0,
+        RopeAndConcatDownloads() - RopeDownloadsBefore);
+      // One grid, one position set: each angle table is uploaded once.
+      if StepPos = 0 then
+        AssertEquals('the first step uploads the two angle tables', 2,
+          RopeUploads() - RopeUploadsBefore)
+      else
+        AssertEquals('step ' + IntToStr(StepPos) +
+          ': the rotations upload nothing', 0,
+          RopeUploads() - RopeUploadsBefore);
+      AssertEquals('step ' + IntToStr(StepPos) +
+        ': the attention binds the QKV concat, no upload', 0,
+        OnOpenCL.StepBlock.Attn.ProfiledTransfers.UploadCount -
+        AttnUploadsBefore);
       AssertEquals('step ' + IntToStr(StepPos) +
         ': Gated1 ran on OpenCL in every block', BlockCount,
         OnOpenCL.StepBlock.Gated1.ForwardGPUCnt - Gated1Before);

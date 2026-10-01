@@ -243,8 +243,10 @@ type
       // DoWrite=false skips the upload (reuse the resident contents) - safe when
       // V is unchanged since the last write: a reallocation (first call or any
       // growth) uploads regardless, because the fresh handle holds nothing.
+      // pBlocking=true returns only after the upload, so V may change at once.
       function EnsureWriteBuffer(var buf: cl_mem; var capBytes: csize_t;
-        V: TNNetVolume; DoWrite: boolean = true): cl_mem;
+        V: TNNetVolume; DoWrite: boolean = true;
+        pBlocking: boolean = false): cl_mem;
       // Ensure a persistent output buffer big enough for V (no upload).
       function EnsureOutputBuffer(var buf: cl_mem; var capBytes: csize_t;
         V: TNNetVolume): cl_mem;
@@ -2394,7 +2396,7 @@ begin
 end;
 
 function TEasyOpenCLV.EnsureWriteBuffer(var buf: cl_mem; var capBytes: csize_t;
-  V: TNNetVolume; DoWrite: boolean = true): cl_mem;
+  V: TNNetVolume; DoWrite: boolean = true; pBlocking: boolean = false): cl_mem;
 var
   PreviousBuffer: cl_mem;
 begin
@@ -2405,7 +2407,11 @@ begin
   // DoWrite=false leaves the resident device copy in place (weights unchanged),
   // but a fresh handle holds nothing, so the first call and any growth upload
   // whatever the caller asked for.
-  if DoWrite or (Result <> PreviousBuffer) then WriteBuffer(Result, V, CL_FALSE);
+  if DoWrite or (Result <> PreviousBuffer) then
+  begin
+    if pBlocking then WriteBuffer(Result, V, CL_TRUE)
+    else WriteBuffer(Result, V, CL_FALSE);
+  end;
 end;
 
 function TEasyOpenCLV.EnsureOutputBuffer(var buf: cl_mem; var capBytes: csize_t;

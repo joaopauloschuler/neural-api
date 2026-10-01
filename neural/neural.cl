@@ -2164,8 +2164,10 @@ __kernel void cai_rope
 // (2k, 2k+1) pair rotation as cai_rope, but the per-(token, pair) ANGLE is
 // resolved on the HOST (which 3-D section position each pair uses, plus the
 // FTheta frequency and any RoPE scaling) and uploaded verbatim as the
-// FAngle[token*FHalfDepth + k] table. The device only applies the pure
-// rotation; FOutScale is the YaRN/LongRoPE output multiplier (1.0 default).
+// FAngle[token*FHalfTile + j] table for ONE head of FHalfTile pairs; every
+// head (FHalfDepth/FHalfTile of them) rotates pair k by the angle of
+// j = k % FHalfTile.
+// FOutScale is the YaRN/LongRoPE output multiplier (1.0 default).
 // One work-item per (token, channel-pair). Bit-faithful to the scalar
 // TNNetMRotaryEmbedding.Compute() so parity is < 1e-4.
 // Coded by Claude (AI).
@@ -2174,6 +2176,7 @@ __kernel void cai_mrope
   const int FSeqLen,
   const int FDepth,
   const int FHalfDepth,
+  const int FHalfTile,
   const float FOutScale,
   __global const float* FAngle,
   __global const float* FX,
@@ -2185,7 +2188,7 @@ __kernel void cai_mrope
   if (gid >= total) return;
   const int k = gid % FHalfDepth;
   const int pos = gid / FHalfDepth;
-  const float angle = FAngle[gid];
+  const float angle = FAngle[pos * FHalfTile + k % FHalfTile];
   const float s = sin(angle);
   const float c = cos(angle);
   const int base = pos * FDepth + 2 * k;

@@ -2033,12 +2033,22 @@ rather than acted on.
                   never fills FNormalized/FInvStd (FInvRMS): backprop reads
                   stale values (pre-existing). TNNetRMSNorm.WillOpenCL has no
                   trainable exclusion.
-      - [ ] B1d3. `TNNetAxialRotaryEmbedding` x2 (via TNNetMRotaryEmbedding):
+      - [x] B1d3. `TNNetAxialRotaryEmbedding` x2 (via TNNetMRotaryEmbedding):
             Compute downloads before WillOpenCL, no residency clause,
             `TNNetMRoPECL.Rotate` has no bind/keep and uploads the whole angle
             table every forward (32x redundant across heads). Add bind/keep as
             TNNetRoPECL.Rotate has; keep the table resident, re-upload only when
             positions change.
+            DONE: TNNetMRotaryEmbedding binds a resident source and keeps its
+            output (no size test: growing decode); the angle table is one
+            head's worth (cai_mrope FHalfTile) and stays resident, re-uploaded
+            only when positions/offset change. QRope/KRope, the QKV concat and
+            the Attn input stay in OpenCL memory (~23.6 GB/step less at
+            1024x1024, computed). Follow-up:
+            - [ ] Qwen2-VL/Qwen3-VL decode: M-RoPE is per head there and the
+                  positions change every token, so the blocking table write
+                  waits ~900 times per token (no worse than before; a
+                  non-blocking write would be safe in current graphs).
       - [ ] B1d4. Block boundary: TNNet.Compute downloads the last layer and
             TNNetInput re-uploads it every block. Copy block i's output buffer
             into the next pass's input inside OpenCL memory; download only after

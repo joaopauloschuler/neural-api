@@ -653,6 +653,10 @@ type
     // Head-tiled TNNetAxialRotaryEmbedding (negative positions) through the
     // same host angle table + cai_mrope kernel, vs CPU.
     procedure AxialRoPEOpenCLParity;
+    // TNNetAxialRotaryEmbedding / TNNetMRotaryEmbedding behind a resident
+    // source, ForceOpenCL off: binds it, keeps its output, uploads the angle
+    // table once per position set.
+    procedure MRoPEResidentChainUnforcedOpenCLParity;
     // OpenCL whole-volume mean/variance (LayerNorm) and mean-square (RMSNorm)
     // forward offload parity (vs CPU) for TNNetLayerNorm / TNNetRMSNorm, which
     // run the whole SizeX*SizeY*Depth sample as one cai_volume_norm segment.
@@ -701,9 +705,9 @@ type
     // TNNetHeadRMSNorm (segment = head_dim < Depth) behind a resident source,
     // ForceOpenCL off: binds the source, keeps its output, matches the CPU.
     procedure HeadRMSNormResidentChainUnforcedOpenCLParity;
-    // A trainable TNNetTokenLayerNorm / TNNetTokenRMSNorm forced onto OpenCL
-    // reads its result back and offers no OpenCL output to bind.
-    procedure TokenNormForcedTrainableOutputOnRAM;
+    // A trainable token norm or M-RoPE layer forced onto OpenCL reads its
+    // result back and offers no OpenCL output to bind.
+    procedure ForcedTrainableOpenCLOutputOnRAM;
     // TEasyOpenCL.CompileProgram owns the PChar copy of its program source
     // (TStrings.GetText StrNew's it), so repeated compiles must not grow the
     // FPC heap; the failing-build path must also survive its build-log read.
@@ -71232,6 +71236,182 @@ begin
 end;
 {$ENDIF}
 
+procedure TTestNeuralNumerical.MRoPEResidentChainUnforcedOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = -7777;
+var
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+
+  function MaxAbsDiff(A, B: TNNetVolume): TNeuralFloat;
+  var
+    Pos: integer;
+  begin
+    AssertEquals('size match', A.Size, B.Size);
+    Result := 0;
+    for Pos := 0 to A.Size - 1 do
+      Result := Max(Result, Abs(A.FData[Pos] - B.FData[Pos]));
+  end;
+
+  function SentinelSurvivors(V: TNNetVolume): integer;
+  var
+    Pos: integer;
+  begin
+    Result := 0;
+    for Pos := 0 to V.Size - 1 do
+      if V.FData[Pos] = csSentinel then Inc(Result);
+  end;
+
+  // Rope rotates TokenCount tokens of Depth channels; HalfTile is the pair
+  // count of one head (the width of the angle table in OpenCL memory).
+  procedure CheckCase(Rope: TNNetMRotaryEmbedding; const CaseName: string;
+    TokenCount, Depth, HalfTile, PositionOffset: integer);
+  var
+    NN: TNNet;
+    Input, RopeA, RopeB, RopeC, OutA: TNNetVolume;
+    SourceConv, ConsumerConv: TNNetLayer;
+    PosT, PosH, PosW, OtherPosW: array of integer;
+    TokenPos, Pos: integer;
+    UploadsAfterWarmup, BytesBeforeChange: Int64;
+    RopeDiff, OutDiff: TNeuralFloat;
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(TokenCount, 1, Depth);
+    RopeA := TNNetVolume.Create();
+    RopeB := TNNetVolume.Create();
+    RopeC := TNNetVolume.Create();
+    OutA := TNNetVolume.Create();
+    SetLength(PosT, TokenCount);
+    SetLength(PosH, TokenCount);
+    SetLength(PosW, TokenCount);
+    SetLength(OtherPosW, TokenCount);
+    try
+      NN.AddLayer(TNNetInput.Create(TokenCount, 1, Depth));
+      SourceConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(Depth));
+      NN.AddLayer(Rope);
+      ConsumerConv := NN.AddLayer(TNNetPointwiseConvLinear.Create(8));
+      NN.SetTrainable(False, False);
+      Rope.PositionOffset := PositionOffset;
+      // Distinct, partly negative T/H/W positions; the second set moves W only.
+      for TokenPos := 0 to TokenCount - 1 do
+      begin
+        PosT[TokenPos] := TokenPos div 3;
+        PosH[TokenPos] := TokenPos - 4;
+        PosW[TokenPos] := 2 - TokenPos;
+        OtherPosW[TokenPos] := 3 * TokenPos + 1;
+      end;
+      for Pos := 0 to Input.Size - 1 do
+        Input.FData[Pos] :=
+          0.6 * Sin(Pos * 0.31) + 0.1 * (Pos div Depth) - 0.15;
+      Rope.SetPositions(PosT, PosH, OtherPosW);
+      NN.Compute(Input);
+      RopeB.Copy(Rope.Output);
+      Rope.PositionOffset := PositionOffset + 5;
+      NN.Compute(Input);
+      RopeC.Copy(Rope.Output);
+      Rope.PositionOffset := PositionOffset;
+      Rope.SetPositions(PosT, PosH, PosW);
+      NN.Compute(Input);
+      RopeA.Copy(Rope.Output);
+      OutA.Copy(NN.GetLastLayer.Output);
+
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.LayerProfiling := true;
+      NN.Compute(Input);
+      UploadsAfterWarmup := Rope.ProfiledTransfers.UploadCount;
+      // Only a download into these two layers clears the sentinels.
+      SourceConv.Output.Fill(csSentinel);
+      Rope.Output.Fill(csSentinel);
+      NN.Compute(Input);
+      NN.Compute(Input);
+      AssertTrue(CaseName + ': a resident source puts the rotation on OpenCL',
+        Rope.ForwardGPUCnt >= 3);
+      AssertEquals(CaseName + ': the warmup uploads only the angle table', 1,
+        UploadsAfterWarmup);
+      AssertEquals(CaseName + ': unchanged positions upload nothing',
+        UploadsAfterWarmup, Rope.ProfiledTransfers.UploadCount);
+      AssertEquals(CaseName + ': the rotation downloads nothing', 0,
+        Rope.ProfiledTransfers.DownloadCount);
+      AssertEquals(CaseName + ': the rotation binds its source, no download',
+        SourceConv.Output.Size, SentinelSurvivors(SourceConv.Output));
+      AssertEquals(CaseName + ': the consumer binds the rotation, no download',
+        Rope.Output.Size, SentinelSurvivors(Rope.Output));
+      AssertTrue(CaseName + ': the consumer follows onto OpenCL',
+        ConsumerConv.ForwardGPUCnt > 0);
+      OutDiff := MaxAbsDiff(OutA, NN.GetLastLayer.Output);
+      AssertTrue(CaseName + ': ForceOutputOnRAM recovers the rotation',
+        Rope.ForceOutputOnRAM());
+      RopeDiff := MaxAbsDiff(RopeA, Rope.Output);
+      WriteLn('  M-RoPE resident ', CaseName, ': rope max|diff|=', RopeDiff:0:9,
+        ' out max|diff|=', OutDiff:0:9);
+      AssertTrue(CaseName + ': rope max|diff| ' + FloatToStr(RopeDiff) +
+        ' must be < 1e-5', RopeDiff < 1e-5);
+      AssertTrue(CaseName + ': output max|diff| ' + FloatToStr(OutDiff) +
+        ' must be < 1e-4', OutDiff < 1e-4);
+
+      // New positions: one upload of one head's table, then none again.
+      BytesBeforeChange := Rope.ProfiledTransfers.UploadBytes;
+      Rope.SetPositions(PosT, PosH, OtherPosW);
+      NN.Compute(Input);
+      NN.Compute(Input);
+      Rope.ForceOutputOnRAM();
+      RopeDiff := MaxAbsDiff(RopeB, Rope.Output);
+      WriteLn('  M-RoPE resident ', CaseName, ' after a position change: ',
+        'rope max|diff|=', RopeDiff:0:9);
+      AssertTrue(CaseName + ': new positions max|diff| ' +
+        FloatToStr(RopeDiff) + ' must be < 1e-5', RopeDiff < 1e-5);
+      AssertEquals(CaseName + ': a position change uploads the table once',
+        UploadsAfterWarmup + 1, Rope.ProfiledTransfers.UploadCount);
+      AssertEquals(CaseName + ': the table holds one head per token',
+        Int64(TokenCount) * HalfTile * SizeOf(TNeuralFloat),
+        Rope.ProfiledTransfers.UploadBytes - BytesBeforeChange);
+
+      // A new PositionOffset with the same positions: one more upload.
+      Rope.PositionOffset := PositionOffset + 5;
+      NN.Compute(Input);
+      NN.Compute(Input);
+      Rope.ForceOutputOnRAM();
+      RopeDiff := MaxAbsDiff(RopeC, Rope.Output);
+      WriteLn('  M-RoPE resident ', CaseName, ' after an offset change: ',
+        'rope max|diff|=', RopeDiff:0:9);
+      AssertTrue(CaseName + ': new offset max|diff| ' +
+        FloatToStr(RopeDiff) + ' must be < 1e-5', RopeDiff < 1e-5);
+      AssertEquals(CaseName + ': an offset change uploads the table once',
+        UploadsAfterWarmup + 2, Rope.ProfiledTransfers.UploadCount);
+    finally
+      OutA.Free; RopeC.Free; RopeB.Free; RopeA.Free; Input.Free; NN.Free;
+    end;
+  end;
+
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  RandSeed := 424242;
+  // The pico Qwen-Image-2.1 geometry: 2 heads x head_dim 16, axes 4/6/6.
+  CheckCase(TNNetAxialRotaryEmbedding.Create(10000.0, 2, 3, 3, 16),
+    'axial 7x(2x16)', 7, 32, 8, 0);
+  // The real geometry per head: head_dim 128, axes 16/56/56.
+  CheckCase(TNNetAxialRotaryEmbedding.Create(10000.0, 8, 28, 28, 128),
+    'axial 9x(4x128)', 9, 512, 64, 0);
+  CheckCase(TNNetAxialRotaryEmbedding.Create(10000.0, 8, 28, 28, 128),
+    'axial 1x(3x128)', 1, 384, 64, 0);
+  // Plain M-RoPE over one whole-depth head, then head-tiled.
+  CheckCase(TNNetMRotaryEmbedding.Create(10000.0, 6, 5, 5),
+    'M-RoPE 7x32', 7, 32, 16, 3);
+  CheckCase(TNNetMRotaryEmbedding.Create(10000.0, 6, 5, 5, rsmNone, 1.0, 0,
+    1.0, 32.0, 0.0, true, {pRotaryHeadDim=}32),
+    'M-RoPE 5x(3x32)', 5, 96, 16, 2);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
 // M-RoPE incremental-decode angle-table cache parity. A growing sequence is fed
 // to the device path step by step (token 1, then 1..2, ... 1..N) so that each
 // forward only EXTENDS the previous positions - exercising the angle-table
@@ -73939,7 +74119,7 @@ begin
 end;
 {$ENDIF}
 
-procedure TTestNeuralNumerical.TokenNormForcedTrainableOutputOnRAM;
+procedure TTestNeuralNumerical.ForcedTrainableOpenCLOutputOnRAM;
 {$IFDEF OpenCL}
 const
   csSentinel = -7777;
@@ -73947,7 +74127,7 @@ var
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
 
-  procedure CheckLayer(Norm: TNNetLayer; const LayerName: string);
+  procedure CheckLayer(Layer: TNNetLayer; const LayerName: string);
   var
     NN: TNNet;
     Input, OutCPU: TNNetVolume;
@@ -73959,23 +74139,24 @@ var
     OutCPU := TNNetVolume.Create();
     try
       NN.AddLayer(TNNetInput.Create(5, 1, 24));
-      NN.AddLayer(Norm);
+      NN.AddLayer(Layer);
       NN.SetTrainable(True);
       for Pos := 0 to Input.Size - 1 do
         Input.FData[Pos] := 0.6 * Sin(Pos * 0.31) - 0.15;
       NN.Compute(Input);
-      OutCPU.Copy(Norm.Output);
+      OutCPU.Copy(Layer.Output);
       NN.ForceOpenCL(True);
       NN.EnableOpenCL(PlatformId, DeviceId);
-      Norm.Output.Fill(csSentinel);
+      Layer.Output.Fill(csSentinel);
       NN.Compute(Input);
       AssertTrue(LayerName + ': the forced forward ran on OpenCL',
-        Norm.ForwardGPUCnt > 0);
+        Layer.ForwardGPUCnt > 0);
       AssertFalse(LayerName + ': a trainable forward offers no OpenCL output',
-        Norm.OutputBindableOnOpenCL());
+        Layer.OutputBindableOnOpenCL());
       MaxDiff := 0;
       for Pos := 0 to OutCPU.Size - 1 do
-        MaxDiff := Max(MaxDiff, Abs(OutCPU.FData[Pos] - Norm.Output.FData[Pos]));
+        MaxDiff := Max(MaxDiff,
+          Abs(OutCPU.FData[Pos] - Layer.Output.FData[Pos]));
       WriteLn('  ', LayerName, ' forced trainable: host output max|diff|=',
         MaxDiff:0:9);
       AssertTrue(LayerName + ': host output max|diff| ' + FloatToStr(MaxDiff) +
@@ -73985,6 +74166,8 @@ var
     end;
   end;
 
+var
+  Rope: TNNetMRotaryEmbedding;
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
@@ -73993,6 +74176,13 @@ begin
   end;
   CheckLayer(TNNetTokenLayerNorm.Create(), 'TNNetTokenLayerNorm');
   CheckLayer(TNNetTokenRMSNorm.Create(), 'TNNetTokenRMSNorm');
+  // 5 tokens, 2 heads x head_dim 12; positions are run-time state.
+  Rope := TNNetAxialRotaryEmbedding.Create(10000.0, 2, 2, 2, 12);
+  Rope.SetPositions([0, 0, 1, 1, 2], [-2, -1, 0, 1, 2], [3, 1, -1, -3, 0]);
+  CheckLayer(Rope, 'TNNetAxialRotaryEmbedding');
+  Rope := TNNetMRotaryEmbedding.Create(10000.0, 4, 4, 4);
+  Rope.SetPositions([0, 1, 2, 3, 4], [0, 2, 4, 1, 3], [1, 1, 0, 2, 5]);
+  CheckLayer(Rope, 'TNNetMRotaryEmbedding');
 end;
 {$ELSE}
 begin

@@ -5452,29 +5452,35 @@ type
 
   /// OpenCL forward helper for the multimodal rotary embedding layer
   // (TNNetMRotaryEmbedding, M-RoPE). Binds the cai_mrope entry point on the
-  // shared dot-product program's device. The host resolves the full per-(token,
-  // channel-pair) rotation ANGLE table (each pair picks its 3-D section position
-  // via SectionOfPair, then multiplies by the RoPE-scaled FTheta), so the device
-  // only applies the plain interleaved-pair rotation - identical math to
-  // TNNetRoPECL, just a per-(token,pair) angle table instead of a per-pair theta.
-  // Runs one work-item per (token, channel-pair). Forward-only (backward on CPU).
+  // shared dot-product program's device. The host resolves one head's
+  // per-(token, channel-pair) rotation ANGLE table (each pair picks its 3-D
+  // section position via SectionOfPair, then multiplies by the RoPE-scaled
+  // FTheta), so the OpenCL kernel only applies the plain interleaved-pair
+  // rotation to every head - identical math to TNNetRoPECL, with a
+  // per-(token,pair) angle table instead of a per-pair theta. Runs one
+  // work-item per (token, channel-pair). Forward-only (backward on CPU).
   // Coded by Claude (AI).
   TNNetMRoPECL = class(TNNetKernelCL)
   private
-    FAngle: TNNetVolume; // host staging for the per-(token,pair) angle table
-    // Persistent device buffers (grow-only), reused every forward.
+    // Persistent OpenCL buffers (grow-only), reused every forward. FBufAngle
+    // keeps the last uploaded angle table between forwards.
     FBufX, FBufAngle, FBufY: cl_mem;
     FCapX, FCapAngle, FCapY: csize_t;
+    // The kernel of the last forward, so a layer that leaves its result in
+    // FBufY can name the queue that produced it. Nil before the first forward.
+    FOutputKernel: TNeuralKernel;
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
-    // X holds SeqLen*Depth values [t*Depth + c] (the previous layer's output);
-    // Angle is the SeqLen*HalfDepth-long precomputed per-(token,pair) rotation
-    // angle table [t*HalfDepth + k] (already section-resolved and RoPE-scaled).
-    // Y receives the rotated output in the same layout. OutScale is the
-    // YaRN/LongRoPE output multiplier (1.0 on the default path).
+    // The buffer the last call wrote Y into, and the kernel that wrote it.
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
+    // TNNetRoPECL.Rotate with one head's angle table [t*HalfTile + j] in place
+    // of Theta; pAngleChanged=false reuses the table already in OpenCL memory.
     procedure Rotate(X: TNNetVolume; Angle: TNNetVolume;
-      Y: TNNetVolume; SeqLen, Depth, HalfDepth: integer; OutScale: TNeuralFloat);
+      Y: TNNetVolume; SeqLen, Depth, HalfDepth, HalfTile: integer;
+      OutScale: TNeuralFloat; pAngleChanged: boolean;
+      pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
   end;
 
   /// OpenCL forward helper for the token-gather embedding layer (TNNetEmbedding).
@@ -7715,18 +7721,18 @@ type
     FMSection: array[0..2] of integer;
     {$IFDEF OpenCL}
     FMRoPECL: TNNetMRoPECL;
-    // Host-built per-(token,pair) rotation angle table [t*HalfD + k], staged
-    // for the device cai_mrope kernel. Normally rebuilt every forward from the
-    // current positions + FTheta, but the prefix is reused across an extending
-    // sequence (KV-cache incremental decode) - see ComputeOpenCL.
+    // Host-built per-(token,pair) rotation angle table of ONE head
+    // [t*HalfTile + j], kept in OpenCL memory by FMRoPECL for cai_mrope.
     FAngleTable: TNNetVolume;
-    // Incremental-decode angle-table cache. FAngleCacheRows is the number of
-    // leading token-rows of FAngleTable already resolved; FCachedPosT/H/W is the
+    // Angle-table cache. FAngleCacheRows is the number of leading token-rows of
+    // FAngleTable already resolved (and uploaded); FCachedPosT/H/W is the
     // (T,H,W) position snapshot they were built from, and FCachedHalfD /
-    // FCachedPosOffset the geometry/offset they assumed. When a new forward only
-    // EXTENDS this prefix (same HalfD, same FPositionOffset, identical leading
-    // positions), only the appended tail rows are recomputed; any mismatch (or
-    // ResetCache) rebuilds the whole table. 0 = empty/invalid cache.
+    // FCachedPosOffset the geometry/offset they assumed. Unchanged positions
+    // reuse the table in OpenCL memory as is; a pure EXTENSION (same HalfD,
+    // same FPositionOffset, identical leading positions) recomputes only the
+    // appended rows and uploads the table again; any other change (or
+    // ResetCache) rebuilds and uploads the whole table. 0 = empty/invalid
+    // cache.
     FAngleCacheRows: integer;
     FCachedPosT, FCachedPosH, FCachedPosW: array of integer;
     FCachedHalfD, FCachedPosOffset: integer;
@@ -7755,6 +7761,10 @@ type
     function WillOpenCL(): boolean; override;
     procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
     procedure DisableOpenCL(); override;
+    // The rotated result stays in FMRoPECL's own buffer for the next layer to
+    // bind; both are nil until EnableOpenCL and the first OpenCL forward.
+    function OpenCLOutputBuffer(): cl_mem; override;
+    function OpenCLOutputKernel(): TNeuralKernel; override;
     // Drops the cached OpenCL angle-table prefix so the next device forward
     // rebuilds the whole table. Call it when starting a fresh sequence (the
     // incremental-decode prefix-reuse would otherwise assume the previous
@@ -39657,20 +39667,30 @@ end;
 constructor TNNetMRoPECL.Create(NN: TNNet);
 begin
   inherited Create(NN, 'cai_mrope');
-  FAngle := TNNetVolume.Create();
 end;
 
 destructor TNNetMRoPECL.Destroy();
 begin
-  FAngle.Free;
   if Assigned(FBufX)     then clReleaseMemObject(FBufX);
   if Assigned(FBufAngle) then clReleaseMemObject(FBufAngle);
   if Assigned(FBufY)     then clReleaseMemObject(FBufY);
   inherited Destroy();
 end;
 
+function TNNetMRoPECL.ResultBuffer(): cl_mem;
+begin
+  Result := FBufY;
+end;
+
+function TNNetMRoPECL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FOutputKernel;
+end;
+
 procedure TNNetMRoPECL.Rotate(X: TNNetVolume; Angle: TNNetVolume;
-  Y: TNNetVolume; SeqLen, Depth, HalfDepth: integer; OutScale: TNeuralFloat);
+  Y: TNNetVolume; SeqLen, Depth, HalfDepth, HalfTile: integer;
+  OutScale: TNeuralFloat; pAngleChanged: boolean;
+  pExternalSrc: cl_mem = nil; pKeepResultOnOpenCL: boolean = false);
 var
   bufX, bufY, bufAngle: cl_mem;
   k: cl_kernel;
@@ -39678,25 +39698,32 @@ var
 begin
   k := FKernel.Kernel;
   fOutScale := OutScale;
-  // The caller hands us the depth-contiguous SeqLen*HalfDepth angle table; copy
-  // it into our staging volume so it uploads through CreateAndWriteBuffer.
-  FAngle.Copy(Angle);
-  // Upload the token tensor + the angle table; allocate the device result.
-  bufX     := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
-  bufAngle := FKernel.EnsureWriteBuffer(FBufAngle, FCapAngle, FAngle);
+  if pExternalSrc <> nil
+    then bufX := pExternalSrc
+    else bufX := FKernel.EnsureWriteBuffer(FBufX, FCapX, X);
+  // A blocking write: the caller rewrites (and may resize) Angle on the host
+  // in a later forward, which must not race a write still in the queue.
+  bufAngle := FKernel.EnsureWriteBuffer(FBufAngle, FCapAngle, Angle,
+    pAngleChanged, {pBlocking=}true);
   bufY     := FKernel.EnsureOutputBuffer(FBufY, FCapY, Y);
   clSetKernelArg(k, 0, csLongintSize, @SeqLen);
   clSetKernelArg(k, 1, csLongintSize, @Depth);
   clSetKernelArg(k, 2, csLongintSize, @HalfDepth);
-  clSetKernelArg(k, 3, csNeuralFloatSize, @fOutScale);
-  clSetKernelArg(k, 4, csCLMemSize, @bufAngle);
-  clSetKernelArg(k, 5, csCLMemSize, @bufX);
-  clSetKernelArg(k, 6, csCLMemSize, @bufY);
+  clSetKernelArg(k, 3, csLongintSize, @HalfTile);
+  clSetKernelArg(k, 4, csNeuralFloatSize, @fOutScale);
+  clSetKernelArg(k, 5, csCLMemSize, @bufAngle);
+  clSetKernelArg(k, 6, csCLMemSize, @bufX);
+  clSetKernelArg(k, 7, csCLMemSize, @bufY);
   // One work-item per (token, channel-pair).
   FKernel.RunKernel(k, SeqLen * HalfDepth);
-  FKernel.Finish();
-  FKernel.ReadBuffer(bufY, Y, CL_TRUE);
-  // Buffers are persistent (FBuf*), reused next forward - not released here.
+  FOutputKernel := FKernel;
+  // Keeping the result means no read back: it waits in FBufY until a consumer
+  // binds it or a host reader calls ForceOutputOnRAM.
+  if not pKeepResultOnOpenCL then
+  begin
+    FKernel.Finish();
+    FKernel.ReadBuffer(bufY, Y, CL_TRUE);
+  end;
 end;
 
 { TNNetEmbeddingCL }
@@ -48088,6 +48115,8 @@ end;
 {$IFDEF OpenCL}
 procedure TNNetMRotaryEmbedding.DisableOpenCL();
 begin
+  // The inherited ForceOutputOnRAM reads a kept output through
+  // OpenCLOutputBuffer, so FMRoPECL must outlive it.
   inherited DisableOpenCL();
   FreeAndNil(FMRoPECL);
 end;
@@ -48102,10 +48131,24 @@ begin
   FAngleCacheRows := 0; // a fresh device-binding starts with an empty cache
 end;
 
+// A bindable source is a route in by itself, as in TNNetRotaryEmbedding.
 function TNNetMRotaryEmbedding.WillOpenCL(): boolean;
 begin
   Result := Assigned(FMRoPECL) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL);
+            and (FShouldOpenCL or FForceOpenCL
+                 or ShouldBindPrevOutputOnOpenCL());
+end;
+
+function TNNetMRotaryEmbedding.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FMRoPECL) then Result := FMRoPECL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetMRotaryEmbedding.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FMRoPECL) then Result := FMRoPECL.OutputKernel()
+  else Result := nil;
 end;
 
 procedure TNNetMRotaryEmbedding.ResetCache();
@@ -48113,35 +48156,34 @@ begin
   FAngleCacheRows := 0;
 end;
 
-// Device M-RoPE forward: the host resolves the per-(token,pair) rotation angle
-// table (each pair's 3-D section position via SectionOfPair, times the
-// RoPE-scaled FTheta), then the device applies the plain interleaved-pair
-// rotation - bit-faithful to the scalar Compute() below.
-//
-// Incremental decode: when a forward only EXTENDS the previous one (same HalfD,
-// same FPositionOffset, and the cached leading positions are a prefix of the
-// current ones), the already-resolved leading rows of FAngleTable are kept and
-// only the appended tail rows are recomputed; the full table is then uploaded
-// (matching the transient-buffer ownership of the base RoPE path). Any geometry/
-// offset/position-prefix change (or ResetCache) rebuilds the whole table, so a
-// stale prefix can never leak into a fresh sequence.
+// OpenCL M-RoPE forward: the host resolves one head's per-(token,pair) angle
+// table, cai_mrope rotates every head with it; bit-faithful to Compute().
 procedure TNNetMRotaryEmbedding.ComputeOpenCL();
 var
   SeqLen, Depth, HalfD: integer;
-  HalfTile, HalfTileM1, MaxHeadPos, HeadCnt, HeadAngleRow: integer;
+  HalfTile, HalfTileM1: integer;
   pos, k, sec, idx, StartRow, p, baseRow: integer;
   kStart, kEnd, idxOfs, SecT, SecTH: integer;
-  Angle: TNeuralFloat;
-  CanReuse: boolean;
+  CanReuse, KeepOnOpenCL: boolean;
   FAngleCacheRowsM1, SeqLenM1: integer;
+  SourceBuffer: cl_mem;
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ShouldBindPrevOutputOnOpenCL() then
+  begin
+    // The result goes to the helper's own buffer: input and output never alias.
+    SourceBuffer := FPrevLayer.OpenCLOutputBuffer();
+    FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FMRoPECL.OutputKernel());
+  end
+  else
+  begin
+    SourceBuffer := nil;
+    FPrevLayer.ForceOutputOnRAM();
+  end;
   Depth := FPrevLayer.FOutput.Depth;
   SeqLen := FPrevLayer.FOutput.SizeX;
   HalfD := Depth shr 1; // #15: div 2, dimension is non-negative
   HalfTile := RotaryTileDepth(Depth) shr 1;
   HalfTileM1 := HalfTile - 1;
-  MaxHeadPos := HalfD div HalfTile - 1;
   // Decide whether the cached prefix is still valid for this forward. It is when
   // the geometry/offset are unchanged, the cache is non-empty but no longer than
   // the request, and every cached leading position matches the current one.
@@ -48157,7 +48199,7 @@ begin
         CanReuse := false;
         break;
       end;
-  FAngleTable.ReSize(HalfD, 1, SeqLen);
+  FAngleTable.ReSize(SeqLen, 1, HalfTile);
   if CanReuse then
     StartRow := FAngleCacheRows // keep the resolved prefix, append the tail
   else
@@ -48170,7 +48212,7 @@ begin
   SecTH := FMSection[0] + FMSection[1];
   for pos := StartRow to SeqLenM1 do
   begin
-    baseRow := pos * HalfD;                  // #11: row base, invariant across k
+    baseRow := pos * HalfTile; // #11: row base, invariant across k
     for sec := 0 to 2 do
     begin
       case sec of
@@ -48181,27 +48223,23 @@ begin
       end;
       idxOfs := idx + FPositionOffset;
       for k := kStart to kEnd do
-      begin
-        Angle := idxOfs * FTheta[k];
-        HeadAngleRow := baseRow + k;
-        for HeadCnt := 0 to MaxHeadPos do
-        begin
-          FAngleTable.FData[HeadAngleRow] := Angle;
-          Inc(HeadAngleRow, HalfTile);
-        end;
-      end;
+        FAngleTable.FData[baseRow + k] := idxOfs * FTheta[k];
     end;
   end;
   // Match FOutput to the active prefix length. SetPrevLayer sized it to the
-  // FULL sequence, but an incremental forward only resolves SeqLen tokens; the
-  // device round-trip (CreateOutputBuffer + ReadBuffer) covers the WHOLE volume,
-  // so a stale-larger FOutput would read uninitialized device memory back into
-  // its tail (nondeterministic garbage). ReSize is a no-op when SeqLen is full.
+  // FULL sequence, but an incremental forward only resolves SeqLen tokens, and
+  // a read back covers the WHOLE volume. ReSize is a no-op when SeqLen is full.
   FOutput.ReSize(SeqLen, 1, Depth);
+  // Inference keeps the result in OpenCL memory (a host reader calls
+  // ForceOutputOnRAM); a forced trainable forward reads it back to RAM.
+  KeepOnOpenCL := not FIsTrainable;
   FMRoPECL.Rotate(FPrevLayer.FOutput, FAngleTable, FOutput,
-    SeqLen, Depth, HalfD, FOutScale);
+    SeqLen, Depth, HalfD, HalfTile, FOutScale,
+    {pAngleChanged=}StartRow < SeqLen, SourceBuffer, KeepOnOpenCL);
+  FOutputOnOpenCL := KeepOnOpenCL;
+  FOutputOnRAM := not KeepOnOpenCL;
   // Snapshot what the now-resolved SeqLen rows assumed, so the next forward can
-  // detect a pure extension.
+  // detect unchanged positions or a pure extension.
   FCachedHalfD := HalfD;
   FCachedPosOffset := FPositionOffset;
   if Length(FCachedPosT) <> SeqLen then
@@ -48227,6 +48265,8 @@ begin
   FMSection[0] := FStruct[3];
   FMSection[1] := FStruct[4];
   FMSection[2] := FStruct[5];
+  // New sections or base: the angle table in OpenCL memory is stale.
+  {$IFDEF OpenCL} FAngleCacheRows := 0; {$ENDIF}
 end;
 
 function TNNetMRotaryEmbedding.SectionOfPair(k: integer): integer;
@@ -48270,7 +48310,8 @@ var
   Prev: TNNetVolume;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  // Only the source's dimensions are read above the OpenCL branch, so the
+  // download stays below it.
   Prev := FPrevLayer.FOutput;
   SeqLen := Prev.SizeX;
   Depth := Prev.Depth;
@@ -48301,6 +48342,11 @@ begin
     exit;
   end
   else Inc(FForwardCPUCnt);
+  FPrevLayer.ForceOutputOnRAM();
+  // The host is about to write FOutput, so a later ForceOutputOnRAM must not
+  // read whatever a previous OpenCL forward left in the helper's buffer.
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
   {$ENDIF}
   SeqLenM1 := SeqLen - 1;
   HalfTileM1 := (TileDepth shr 1) - 1;
