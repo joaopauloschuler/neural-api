@@ -332,7 +332,7 @@ rather than acted on.
       pooling over the variable grid and a padding/attention mask — needs a
       variable-SeqLen vision input, an interpolated/resampled position table,
       and key-padding-masked MAP pooling. Not yet wired.
-- [ ] examples/TCNClassifier — a Temporal Convolutional Network (Bai, Kolter &
+- [x] examples/TCNClassifier — a Temporal Convolutional Network (Bai, Kolter &
       Koltun 2018, arXiv:1803.01271) for MULTIVARIATE time-series
       classification, built only from existing layers (no new leaf class). A
       user asked whether CAI Neural supports a standard TCN; it does, but no
@@ -361,6 +361,12 @@ rather than acted on.
       `TNNetCausalConv1D` (only the dilated weight gradient is checked
       today); a faster `TNNetCausalConv1D` forward/backward for narrow
       InputDepth (one AVX call per tap is overhead-bound at e.g. 5 features).
+      DONE: builder `TNNet.AddTCNBlock` (68cf0d77, tests tightened 777a6d08)
+      and examples/TCNClassifier using it. Measured (window 64, 4 channels,
+      KernelSize 2, receptive field 63): dilated TCN 97.11% test accuracy vs
+      non-dilated baseline 39.46% (receptive field 11, same 4864 weights);
+      chance 25%. Peak RSS 36 MB. The builder and the dilated input-gradient
+      check are done; the narrow-InputDepth speedup is still open.
 
 ### Computer vision & generative models
 
