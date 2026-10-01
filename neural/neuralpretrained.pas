@@ -82424,6 +82424,7 @@ begin
   FStepNet.BuildWeightOwner := FBlockStore[0];
   BuildBlockNet(FStepNet, TokenCount, qibStep, FPrefixLength, FStepBlock);
   FStepNet.BuildWeightOwner := nil;
+  FStepNet.KeepLastOutputOnOpenCL := true;
   if FInt8Input then FStepNet.EnableInt8Input();
   PrepareInferenceThreads(FStepNet, FParallel, FMaxThreads);
   {$IFDEF OpenCL}
@@ -82450,7 +82451,6 @@ end;
 procedure TQwenImage21Transformer.PredictVelocity(Latents: TNNetVolume;
   Timestep: TNeuralFloat; GridH, GridW: integer; Velocity: TNNetVolume);
 var
-  BlockInput: TNNetVolume;
   BlockCnt, MaxBlockPos, StepCnt: integer;
   StepStart: TDateTime;
 begin
@@ -82475,7 +82475,6 @@ begin
   FStepNet.Layers[1].Output.Copy(FModulationLayer.Output);
   FOutputNet.Layers[1].Output.Copy(FNormOutScaleLayer.Output);
   FImageInNet.Compute(Latents);
-  BlockInput := FImageInNet.GetLastLayer().Output;
   MaxBlockPos := FConfig.NumLayers - 1;
   for BlockCnt := 0 to MaxBlockPos do
   begin
@@ -82486,10 +82485,15 @@ begin
     {$IFDEF OpenCL}
     if FLayerProfiling then FStepBlock.Attn.FinishOpenCLQueues();
     {$ENDIF}
-    FStepNet.Compute(BlockInput, 0, FParallel);
-    BlockInput := FStepNet.GetLastLayer().Output;
+    // Block b's output feeds block b + 1 inside OpenCL memory when it is there
+    // (FStepNet.KeepLastOutputOnOpenCL).
+    if BlockCnt = 0
+      then FStepNet.Compute(FImageInNet.GetLastLayer().Output, 0, FParallel)
+      else FStepNet.ComputeFromLayerOutput(FStepNet.GetLastLayer(), 0,
+        FParallel);
   end;
-  FOutputNet.Compute(BlockInput);
+  FStepNet.GetLastLayer().ForceOutputOnRAM();
+  FOutputNet.Compute(FStepNet.GetLastLayer().Output);
   FOutputNet.GetLastLayer().ForceOutputOnRAM();
   Velocity.Copy(FOutputNet.GetLastLayer().Output);
   if FLayerProfiling then
@@ -82622,10 +82626,10 @@ begin
         [WallMs / StepCnt]));
       Lines.Add(Format('[profile] mean ms/step: StepNet.Compute x %d %.1f | ' +
         'timestep net %.1f | image-in net %.1f | output net %.1f | outside ' +
-        'the nets (weight swap, prefix K/V load) %.1f', [FConfig.NumLayers,
-        BlocksMs / StepCnt, TimestepMs / StepCnt, ImageInMs / StepCnt,
-        OutputMs / StepCnt, (WallMs - BlocksMs - TimestepMs - ImageInMs -
-        OutputMs) / StepCnt]));
+        'the nets (weight swap, prefix K/V load, last block download) ' +
+        '%.1f', [FConfig.NumLayers, BlocksMs / StepCnt, TimestepMs / StepCnt,
+        ImageInMs / StepCnt, OutputMs / StepCnt, (WallMs - BlocksMs -
+        TimestepMs - ImageInMs - OutputMs) / StepCnt]));
       Lines.Add('[profile] StepNet by block role, summed over blocks and ' +
         'steps (pass = one step):');
       Lines.Add(TNNet.LayerGroupTimingReport(FStepNet,

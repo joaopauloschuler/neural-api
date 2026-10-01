@@ -25757,6 +25757,7 @@ var
     Transformer.StepBlock.Attn.AppendCacheRowsFrom(
       Transformer.PrefixKeys[BlockIdx], Transformer.PrefixValues[BlockIdx]);
     Transformer.StepNet.Compute(Hidden);
+    Transformer.StepNet.GetLastLayer().ForceOutputOnRAM();
     Output.Copy(Transformer.StepNet.GetLastLayer().Output);
   end;
 
@@ -26060,6 +26061,7 @@ var
       Transformer.StepBlock.Attn.AppendCacheRowsFrom(
         Transformer.PrefixKeys[BlockCnt], Transformer.PrefixValues[BlockCnt]);
       Transformer.StepNet.Compute(Output);
+      Transformer.StepNet.GetLastLayer().ForceOutputOnRAM();
       Output.Copy(Transformer.StepNet.GetLastLayer().Output);
     end;
   end;
@@ -26353,7 +26355,8 @@ end;
 // The step attention, both LayerNorms, the four modulations (bound activation x
 // uploaded row) run on OpenCL in every block with no activation upload into the
 // projections, match the CPU (int8, 1e-5 as the swap test), and the prefix K/V
-// goes up once per EncodePrefix.
+// goes up once per EncodePrefix. The block activation goes up and down once per
+// step, with shared and with private kernels.
 procedure TTestNeuralPretrained.TestQwenImage21TransformerOpenCLAttention;
 {$IFDEF OpenCL}
 const
@@ -26361,7 +26364,7 @@ const
   Sentinel = -7777;
 var
   RefRoot: TJSONData;
-  OnOpenCL, OnCPU: TQwenImage21Transformer;
+  OnOpenCL, OnCPU, OnPrivate: TQwenImage21Transformer;
   Embeds, Latents, VelocityOpenCL, VelocityCPU: TNNetVolume;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
@@ -26371,6 +26374,55 @@ var
   ProjUploadsBefore, NormDownloadsBefore: Int64;
   RopeUploadsBefore, RopeDownloadsBefore, AttnUploadsBefore: Int64;
   Diff: double;
+
+  // Per step: block 0 uploads the image-in output, blocks 1.. copy the previous
+  // block's output inside OpenCL memory, PredictVelocity downloads the last
+  // one.
+  procedure AssertOneActivationTransferPerStep(Transformer:
+    TQwenImage21Transformer; const What: string);
+  var
+    BlockInput: TNNetLayer;
+    UploadsBefore, StepNetDownloadsBefore, DownloadsBefore: Int64;
+    BlockInputGPUBefore: integer;
+
+    function StepNetDownloads(): Int64;
+    var
+      LayerPos, MaxLayerPos: integer;
+    begin
+      Result := 0;
+      MaxLayerPos := Transformer.StepNet.GetLastLayerIdx();
+      for LayerPos := 0 to MaxLayerPos do
+        Inc(Result, Transformer.StepNet.Layers[LayerPos].ProfiledTransfers
+          .DownloadCount);
+    end;
+
+  begin
+    BlockInput := Transformer.StepNet.Layers[0];
+    UploadsBefore := BlockInput.ProfiledTransfers.UploadCount;
+    BlockInputGPUBefore := BlockInput.ForwardGPUCnt;
+    StepNetDownloadsBefore := StepNetDownloads();
+    DownloadsBefore := OpenCLThreadTransfers.DownloadCount;
+    Transformer.PredictVelocity(Latents, Timesteps[0], GridH, GridW,
+      VelocityOpenCL);
+    WriteLn('  Qwen-Image-2.1 ', What, ': BlockInput uploads=',
+      BlockInput.ProfiledTransfers.UploadCount - UploadsBefore,
+      ' StepNet layer downloads=', StepNetDownloads() - StepNetDownloadsBefore,
+      ' step downloads=',
+      OpenCLThreadTransfers.DownloadCount - DownloadsBefore);
+    AssertEquals(What + ': BlockInput uploads once per step', 1,
+      BlockInput.ProfiledTransfers.UploadCount - UploadsBefore);
+    AssertEquals(What + ': BlockInput on OpenCL in every block', BlockCount,
+      BlockInput.ForwardGPUCnt - BlockInputGPUBefore);
+    AssertEquals(What + ': no StepNet layer downloads', 0,
+      StepNetDownloads() - StepNetDownloadsBefore);
+    AssertEquals(What + ': the step downloads once, after the last block', 1,
+      OpenCLThreadTransfers.DownloadCount - DownloadsBefore);
+    OnCPU.PredictVelocity(Latents, Timesteps[0], GridH, GridW, VelocityCPU);
+    Diff := MaxAbsVolumeDiff(VelocityOpenCL, VelocityCPU);
+    WriteLn('  Qwen-Image-2.1 ', What, ': velocity max|diff|=', Diff:0:9);
+    AssertTrue(What + ': velocity max|diff| ' + FloatToStr(Diff) +
+      ' must be < 1e-5', Diff < 1e-5);
+  end;
 
   // Activation uploads into the projections that read the modulated norms.
   function ProjectionUploads(): Int64;
@@ -26419,6 +26471,7 @@ begin
   RefRoot := nil;
   OnOpenCL := nil;
   OnCPU := nil;
+  OnPrivate := nil;
   Embeds := TNNetVolume.Create;
   Latents := TNNetVolume.Create;
   VelocityOpenCL := TNNetVolume.Create;
@@ -26556,6 +26609,15 @@ begin
     end;
     AssertEquals('two steps uploaded each block''s prefix once', BlockCount,
       OnOpenCL.PrefixKVUploadCount);
+    AssertOneActivationTransferPerStep(OnOpenCL, 'shared kernels');
+    OnPrivate := TQwenImage21Transformer.Create(QwenImage21TransformerFolder(),
+      qiwInt8);
+    AssertTrue('transformer arms OpenCL with private kernels',
+      OnPrivate.EnableOpenCL(PlatformId, DeviceId, {pHasSharedKernel=}false));
+    OnPrivate.EncodePrefix(Embeds);
+    OnPrivate.PrepareStepPass(GridH, GridW);
+    OnPrivate.LayerProfiling := true;
+    AssertOneActivationTransferPerStep(OnPrivate, 'private kernels');
     // A new grid rebuilds the step net; the uploaded prefix rows carry over.
     OnOpenCL.PredictVelocity(Latents, Timesteps[0], GridW, GridH,
       VelocityOpenCL);
@@ -26575,6 +26637,7 @@ begin
     AssertEquals('a new prefix is uploaded again, once per block',
       2 * BlockCount, OnOpenCL.PrefixKVUploadCount);
   finally
+    OnPrivate.Free;
     OnCPU.Free;
     OnOpenCL.Free;
     VelocityCPU.Free;

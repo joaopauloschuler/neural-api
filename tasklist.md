@@ -1997,7 +1997,7 @@ rather than acted on.
           - [ ] O accumulator in private registers (raises R on 48 KB devices).
           - [ ] Register-blocked score and P.V loops (today 2 local reads per mad).
           - [ ] Tree reduction for the running-max fold (one lane per row today).
-    - [ ] B1d. Layers that send the activations back to RAM (B1a), worst first:
+    - [x] B1d. Layers that send the activations back to RAM (B1a), worst first:
       - [x] B1d1. `TNNetChannelMulByLayer` x4: the modulation operand is a host
             row (TNNetAddConstant has no OpenCL path; SplitChannels/Tanh follow
             their host source). Accept a host-only FLayerMul of Depth floats,
@@ -2049,10 +2049,18 @@ rather than acted on.
                   positions change every token, so the blocking table write
                   waits ~900 times per token (no worse than before; a
                   non-blocking write would be safe in current graphs).
-      - [ ] B1d4. Block boundary: TNNet.Compute downloads the last layer and
+      - [x] B1d4. Block boundary: TNNet.Compute downloads the last layer and
             TNNetInput re-uploads it every block. Copy block i's output buffer
             into the next pass's input inside OpenCL memory; download only after
             block 31.
+            DONE: TNNet.KeepLastOutputOnOpenCL (a full forward drains the
+            queue instead of downloading the last layer) +
+            TNNet.ComputeFromLayerOutput (TNNetInput.CopyNextInputFrom: its
+            next Compute copies the source buffer with clEnqueueCopyBuffer on
+            the input's queue).
+            PredictVelocity: 1 upload + 1 download of the activation per step
+            instead of 32 + 32 (~4.2 GB/step less at 1024x1024, computed); 31
+            copies inside OpenCL memory (64 MiB each).
       TNNetSum and TNNetDeepConcat follow once these are fixed.
     - [ ] B1e. Pipeline wiring + `examples/QwenImage --gpu` (int4 and int8). User
           runs on the GPU box: 256x256 first, then 1024x1024 and larger; record

@@ -500,6 +500,9 @@ type
     // output with a sentinel and asserts nothing overwrote it. Coded by Claude (AI).
     procedure TestPointwiseConvResidentInputOpenCLParity;
     procedure TestLayerProfilingOpenCLCounts;
+    // TNNet.ComputeFromLayerOutput feeds the last layer back into the input
+    // inside OpenCL memory: one upload, one download, host round-trip parity.
+    procedure TestComputeFromLayerOutputOpenCL;
     // The fully-connected case of the same bind, over both weight formats: FP32
     // through cai_dot_product and int8 through cai_dot_product_int8. Same
     // sentinel probe on the source layer. Coded by Claude (AI).
@@ -66799,6 +66802,99 @@ begin
       AssertTrue('upload bytes counted',
         InputLayer.ProfiledTransfers.UploadBytes >= Input.Size * 4);
     finally
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+procedure TTestNeuralNumerical.TestComputeFromLayerOutputOpenCL;
+{$IFDEF OpenCL}
+const
+  PassCount = 4;
+var
+  NN: TNNet;
+  Input, RoundTrip, BeforeLastPass: TNNetVolume;
+  InputLayer, SumLayer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  PassCnt, KernelModeCnt, InputGPUBefore: integer;
+  TransfersBefore: TOpenCLTransferCounts;
+  Diff: TNeuralFloat;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for KernelModeCnt := 0 to 1 do
+  begin
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(8, 1, 16);
+    RoundTrip := TNNetVolume.Create;
+    BeforeLastPass := TNNetVolume.Create;
+    try
+      InputLayer := NN.AddLayer(TNNetInput.Create(8, 1, 16));
+      NN.AddLayer(TNNetPointwiseConvLinear.Create(16));
+      SumLayer := NN.AddLayer(TNNetSum.Create([NN.GetLastLayer(), InputLayer]));
+      NN.SetTrainable(False, False);
+      NN.MulWeights(0.25);
+      Input.FillForDebug();
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId,
+        {pHasSharedKernel=}KernelModeCnt = 0);
+      // Host round-trip reference: every pass downloads and re-uploads.
+      NN.Compute(Input);
+      for PassCnt := 2 to PassCount do
+      begin
+        if PassCnt = PassCount then
+          BeforeLastPass.Copy(SumLayer.Output);
+        NN.Compute(SumLayer.Output);
+      end;
+      RoundTrip.Copy(SumLayer.Output);
+      NN.KeepLastOutputOnOpenCL := true;
+      NN.LayerProfiling := true;
+      NN.ClearTime();
+      InputGPUBefore := InputLayer.ForwardGPUCnt;
+      TransfersBefore := OpenCLThreadTransfers;
+      NN.Compute(Input);
+      for PassCnt := 2 to PassCount do
+        NN.ComputeFromLayerOutput(SumLayer);
+      AssertEquals('mode ' + IntToStr(KernelModeCnt) +
+        ': no download between passes', 0,
+        OpenCLThreadTransfers.DownloadCount - TransfersBefore.DownloadCount);
+      AssertEquals('mode ' + IntToStr(KernelModeCnt) +
+        ': the input layer uploads once', 1,
+        InputLayer.ProfiledTransfers.UploadCount);
+      AssertEquals('mode ' + IntToStr(KernelModeCnt) +
+        ': the input layer ran on OpenCL every pass', PassCount,
+        InputLayer.ForwardGPUCnt - InputGPUBefore);
+      AssertTrue('mode ' + IntToStr(KernelModeCnt) + ': the sum downloads',
+        SumLayer.ForceOutputOnRAM());
+      AssertEquals('mode ' + IntToStr(KernelModeCnt) +
+        ': one download at the end', 1,
+        OpenCLThreadTransfers.DownloadCount - TransfersBefore.DownloadCount);
+      Diff := SumLayer.Output.SumDiff(RoundTrip);
+      WriteLn('  ComputeFromLayerOutput OpenCL, mode ', KernelModeCnt,
+        ': sum|diff| vs host round-trip=', Diff:0:9);
+      AssertTrue('mode ' + IntToStr(KernelModeCnt) + ': sum|diff| ' +
+        FloatToStr(Diff) + ' must be < 1e-5', Diff < 1e-5);
+      // The input layer reports its OpenCL copy, not the stale host input.
+      AssertTrue('mode ' + IntToStr(KernelModeCnt) + ': the input downloads',
+        InputLayer.ForceOutputOnRAM());
+      Diff := InputLayer.Output.SumDiff(BeforeLastPass);
+      AssertTrue('mode ' + IntToStr(KernelModeCnt) +
+        ': the input holds the last-but-one output, sum|diff| ' +
+        FloatToStr(Diff), Diff < 1e-5);
+      NN.ForceOpenCL(False);
+    finally
+      BeforeLastPass.Free;
+      RoundTrip.Free;
       Input.Free;
       NN.Free;
     end;

@@ -1209,6 +1209,10 @@ type
       // allocator. Owned here and freed in Destroy. Coded by Claude (AI).
       FInputBuffer: cl_mem;
       FInputBufSize: integer; // element capacity of FInputBuffer
+      // Set by CopyNextInputFrom, cleared by the Compute that copies it.
+      FNextOutputSource: TNNetLayer;
+      // FInputBuffer can carry this forward's input.
+      function InputBufferUsable(): boolean;
     {$ENDIF}
     public
       constructor Create(pSize: integer); reintroduce; overload;
@@ -1220,6 +1224,9 @@ type
       procedure DisableOpenCL(); override;
       function OpenCLOutputBuffer(): cl_mem; override;
       function OpenCLOutputKernel(): TNeuralKernel; override;
+      // The next Compute copies Source's resident output into this layer's
+      // OpenCL buffer instead of uploading FOutput. False: nothing changes.
+      function CopyNextInputFrom(Source: TNNetLayer): boolean;
       {$ENDIF}
       // Uploads FOutput and leaves the host copy valid, so both locations hold
       // it and a consumer that declines to bind pays nothing.
@@ -18057,6 +18064,7 @@ type
       FNNetForwardTime: double;
       FNNetForwardTimeQueueOpenCL: double;
       FNNetBackwardTime: double;
+      FKeepLastOutputOnOpenCL: boolean;
       //Layer with Max Delta. You can read after calling GetMaxAbsoluteDelta.
       FMaxDeltaLayer: integer;
       // Net-level mirror of the per-layer FIsTrainable flags: True on Create,
@@ -19843,6 +19851,11 @@ type
       // under OpenCL nothing is downloaded, the queue is only drained.
       // Coded by Claude (AI).
       procedure Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0; Parallel: boolean = false; EndLayerIdx: integer = -1); overload;
+      // Compute(Source.Output, ...); a TNNetInput at FromLayerIdx copies a
+      // resident Source output in OpenCL memory. Source may be the last layer.
+      procedure ComputeFromLayerOutput(Source: TNNetLayer;
+        FromLayerIdx: integer = 0; Parallel: boolean = false;
+        EndLayerIdx: integer = -1);
       // The classic serial layer loop (layers computed in index order).
       // Always used while FIsTrainable is True - backpropagation requires
       // the strict ordering - and as ComputeParallel's fallback
@@ -22167,13 +22180,21 @@ type
       // the flag is enabled; it is OFF by default.
       procedure CheckForwardAnomaly(LayerCnt: integer);
       procedure CheckBackwardAnomaly();
+      // Runs FromLayerIdx..EndLayerIdx once the input layer holds the input,
+      // then downloads the last layer or drains the queue.
+      procedure ComputeFromFilledInput(FromLayerIdx: integer; Parallel: boolean;
+        EndLayerIdx: integer);
 
     published
       property NNetBackwardTime: double read FNNetBackwardTime write FNNetBackwardTime;
       property NNetForwardTime: double read FNNetForwardTime write FNNetForwardTime;
-      // Wall-clock spent inside GetLastLayer().ForceOutputOnRAM(): the OpenCL
-      // queue only executes there, so this is the queue drain, not the copy.
+      // Wall-clock spent draining the OpenCL queue at the end of a forward,
+      // download of the last layer included when it runs.
       property NNetForwardTimeQueueOpenCL: double read FNNetForwardTimeQueueOpenCL write FNNetForwardTimeQueueOpenCL;
+      // A full forward leaves the last layer's output where it ends (a reader
+      // calls ForceOutputOnRAM). False: the forward downloads it.
+      property KeepLastOutputOnOpenCL: boolean read FKeepLastOutputOnOpenCL
+        write FKeepLastOutputOnOpenCL;
       property Layers: TNNetLayerList read FLayers;
       property LearningRate: TNeuralFloat read FLearningRate;
       property MaxDeltaLayer: integer read FMaxDeltaLayer;
@@ -110064,6 +110085,10 @@ end;
 procedure TNNetInput.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   inherited EnableOpenCL(DotProductKernel);
+  // Read back on the old queue: a forward filled by CopyNextInputFrom holds
+  // the input only in FInputBuffer.
+  if Assigned(FInputBuffer) and (FInputBufSize <> FOutput.Size) then
+    ForceOutputOnRAM();
   // The upload runs no kernel, so only the context and the queue are wanted.
   // Putting it on the net-wide queue orders it ahead of every consumer that
   // enqueues there, which is what lets the write below stay non-blocking.
@@ -110085,9 +110110,11 @@ end;
 
 procedure TNNetInput.DisableOpenCL();
 begin
-  // No ForceOutputOnRAM first, unlike every other resident producer: FOutputOnRAM
-  // never went false here, so dropping the device copy loses nothing.
+  // A forward filled by CopyNextInputFrom holds the input only in
+  // FInputBuffer.
+  ForceOutputOnRAM();
   FOutputOnOpenCL := false;
+  FNextOutputSource := nil;
   if Assigned(FInputBuffer) then
   begin
     clReleaseMemObject(FInputBuffer);
@@ -110107,24 +110134,62 @@ function TNNetInput.OpenCLOutputKernel(): TNeuralKernel;
 begin
   Result := FInputKernel;
 end;
+
+// Forward only: every consumer's binding test is forward only, so a trainable
+// net would pay for an input nobody is allowed to read.
+function TNNetInput.InputBufferUsable(): boolean;
+begin
+  Result := (not FIsTrainable) and FHasOpenCL and Assigned(FInputBuffer) and
+    (FOutput.Size <= FInputBufSize);
+end;
+
+// A cl_mem is only valid in the context that made it, hence the context test.
+function TNNetInput.CopyNextInputFrom(Source: TNNetLayer): boolean;
+begin
+  Result := InputBufferUsable() and (Source.FOutput.Size = FOutput.Size) and
+    Source.OutputBindableOnOpenCL() and
+    (Source.OpenCLOutputKernel().Context = FInputKernel.Context);
+  if Result then FNextOutputSource := Source;
+end;
 {$ENDIF}
 
 procedure TNNetInput.Compute();
 var
   StartTime: double;
+  {$IFDEF OpenCL}
+  Source: TNNetLayer;
+  {$ENDIF}
 begin
   // The inherited Compute does not time itself, so the whole body is timed here
   // and the upload below is part of what this layer costs.
   StartTime := Now();
   inherited Compute();
   {$IFDEF OpenCL}
+  if Assigned(FNextOutputSource) then
+  begin
+    Source := FNextOutputSource;
+    FNextOutputSource := nil;
+    // On FInputKernel's queue, as the upload is: consumers on another queue
+    // wait for it through OpenCLWaitOutputIfAnotherQueue.
+    Source.OpenCLWaitOutputIfAnotherQueue(FInputKernel);
+    if FInputKernel.CopyBuffer(Source.OpenCLOutputBuffer(), FInputBuffer,
+      FOutput.Size * csNeuralFloatSize) = CL_SUCCESS then
+    begin
+      // FOutput still holds the previous host input; ForceOutputOnRAM reads
+      // this buffer back.
+      FOutputOnOpenCL := true;
+      FOutputOnRAM := false;
+      Inc(FForwardGPUCnt);
+      FForwardTime := FForwardTime + (Now() - StartTime);
+      exit;
+    end;
+    Source.ForceOutputOnRAM();
+    FOutput.CopyNoChecks(Source.FOutput);
+  end;
   // TNNet.Compute wrote FOutput from the host just before this call.
   FOutputOnRAM := true;
   FOutputOnOpenCL := false;
-  // Forward only: every consumer's binding test is forward only, so a trainable
-  // net would pay an upload nobody is allowed to read.
-  if FIsTrainable or (not FHasOpenCL) or (not Assigned(FInputBuffer)) or
-    (FOutput.Size > FInputBufSize) then
+  if not InputBufferUsable() then
   begin
     // Host-only forward: the output is offered in RAM alone, as on a
     // non-OpenCL build.
@@ -131906,12 +131971,71 @@ begin
   end;
 end;
 
+procedure TNNet.ComputeFromFilledInput(FromLayerIdx: integer; Parallel: boolean;
+  EndLayerIdx: integer);
+{$IFDEF OpenCL}
+var
+  StartOpenCLQueueTime: double;
+{$ENDIF}
+begin
+  if (EndLayerIdx < 0) or (EndLayerIdx > GetLastLayerIdx())
+    then EndLayerIdx := GetLastLayerIdx();
+  if EndLayerIdx < FromLayerIdx then
+  begin
+    FErrorProc('Compute - EndLayerIdx ' + IntToStr(EndLayerIdx) +
+      ' is before FromLayerIdx ' + IntToStr(FromLayerIdx) + '.');
+    exit;
+  end;
+  // Trainable nets need the strict serial layer order (backpropagation
+  // pairs with it); inference-only nets (SetTrainable(False)) may run
+  // independent layers in parallel. Coded by Claude (AI).
+  if Parallel
+    then ComputeParallel(FromLayerIdx, EndLayerIdx)
+    else ComputeSerial(FromLayerIdx, EndLayerIdx);
+  {$IFDEF OpenCL}
+  StartOpenCLQueueTime := Now();
+  // A full forward settles the logits on the host. A forward cut short, or
+  // one whose caller keeps the last output in OpenCL memory, has no host
+  // reader, so it only drains the queue: the upload of the next input must
+  // not overtake a non-blocking write still reading the host buffers of
+  // this pass.
+  if (EndLayerIdx = GetLastLayerIdx()) and not FKeepLastOutputOnOpenCL
+    then GetLastLayer().ForceOutputOnRAM()
+    else if Assigned(FDotProductKernel) then FDotProductKernel.Finish();
+  FNNetForwardTimeQueueOpenCL := FNNetForwardTimeQueueOpenCL +
+    (Now() - StartOpenCLQueueTime);
+  {$ENDIF}
+end;
+
+procedure TNNet.ComputeFromLayerOutput(Source: TNNetLayer;
+  FromLayerIdx: integer = 0; Parallel: boolean = false;
+  EndLayerIdx: integer = -1);
+{$IFDEF OpenCL}
+var
+  StartTime: double;
+{$ENDIF}
+begin
+  {$IFDEF OpenCL}
+  // An EndLayerIdx before FromLayerIdx takes the host route, which reports it
+  // without leaving a copy armed for the next forward.
+  if (FLayers.Count > FromLayerIdx + 1) and
+    ((EndLayerIdx < 0) or (EndLayerIdx >= FromLayerIdx)) and
+    (FLayers[FromLayerIdx] is TNNetInput) and
+    TNNetInput(FLayers[FromLayerIdx]).CopyNextInputFrom(Source) then
+  begin
+    StartTime := Now();
+    ComputeFromFilledInput(FromLayerIdx, Parallel, EndLayerIdx);
+    FNNetForwardTime := FNNetForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  {$ENDIF}
+  Source.ForceOutputOnRAM();
+  Compute(Source.FOutput, FromLayerIdx, Parallel, EndLayerIdx);
+end;
+
 procedure TNNet.Compute(pInput: TNNetVolume; FromLayerIdx:integer = 0; Parallel: boolean = false; EndLayerIdx: integer = -1);
 var
   StartTime: double;
-  {$IFDEF OpenCL}
-  StartOpenCLQueueTime: double;
-  {$ENDIF}
 begin
   StartTime := Now();
   if FLayers.Count > FromLayerIdx + 1 then
@@ -131919,31 +132043,7 @@ begin
     if FLayers[FromLayerIdx].FOutput.Size = pInput.Size then
     begin
       FLayers[FromLayerIdx].FOutput.CopyNoChecks(pInput);
-      if (EndLayerIdx < 0) or (EndLayerIdx > GetLastLayerIdx())
-        then EndLayerIdx := GetLastLayerIdx();
-      if EndLayerIdx < FromLayerIdx then
-      begin
-        FErrorProc('Compute - EndLayerIdx ' + IntToStr(EndLayerIdx) +
-          ' is before FromLayerIdx ' + IntToStr(FromLayerIdx) + '.');
-        exit;
-      end;
-      // Trainable nets need the strict serial layer order (backpropagation
-      // pairs with it); inference-only nets (SetTrainable(False)) may run
-      // independent layers in parallel. Coded by Claude (AI).
-      if Parallel
-        then ComputeParallel(FromLayerIdx, EndLayerIdx)
-        else ComputeSerial(FromLayerIdx, EndLayerIdx);
-      {$IFDEF OpenCL}
-      StartOpenCLQueueTime := Now();
-      // A full forward settles the logits on the host. A forward cut short
-      // has no host reader, so it only drains the queue: the upload of the
-      // next input must not overtake a non-blocking write still reading the
-      // host buffers of this pass.
-      if EndLayerIdx = GetLastLayerIdx()
-        then GetLastLayer().ForceOutputOnRAM()
-        else if Assigned(FDotProductKernel) then FDotProductKernel.Finish();
-      FNNetForwardTimeQueueOpenCL := FNNetForwardTimeQueueOpenCL + (Now() - StartOpenCLQueueTime);
-      {$ENDIF}
+      ComputeFromFilledInput(FromLayerIdx, Parallel, EndLayerIdx);
     end else
     begin
       FErrorProc
