@@ -42418,17 +42418,20 @@ begin
 end;
 
 procedure TTestNeuralNumerical.TestAddTCNBlockSkipPaths;
+const
+  InDepths: array[0..1] of integer = (4, 3); // identity skip, then projection
 var
   NN: TNNet;
   Input: TNNetVolume;
   Projection: TNNetLayer;
-  LayerCnt, NeuronCnt, i, InDepth: integer;
+  LayerCnt, NeuronCnt, i, InDepth, CaseCnt: integer;
 begin
   // With every causal-conv weight and bias zeroed the branch outputs 0, so the
   // block output must be ReLU(skip): ReLU(input) for C_in = Channels, and
   // ReLU(1x1 projection of input) for C_in <> Channels.
-  for InDepth in [4, 3] do
+  for CaseCnt := 0 to High(InDepths) do
   begin
+    InDepth := InDepths[CaseCnt];
     RandSeed := 424242;
     NN := TNNet.Create();
     Input := TNNetVolume.Create(7, 1, InDepth);
@@ -42449,6 +42452,9 @@ begin
       end;
       AssertEquals('TCN skip projection present iff C_in <> Channels',
         InDepth <> 4, Assigned(Projection));
+      if Assigned(Projection) then
+        AssertTrue('TCN skip projection reads the block input',
+          Projection.PrevLayer = NN.Layers[0]);
       for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.9) * 1.3;
       NN.Compute(Input);
       for i := 0 to NN.GetLastLayer.Output.Size - 1 do
@@ -42577,17 +42583,38 @@ begin
 end;
 
 procedure TTestNeuralNumerical.TestAddTCNBlockGradientFlow;
+const
+  InDepths: array[0..1] of integer = (6, 3); // identity skip, then projection
+  cEps = 1e-3;
 var
   NN: TNNet;
-  Input, Desired: TNNetVolume;
-  i, InDepth: integer;
-  GradAbsMax: TNeuralFloat;
+  Input, Perturbed, Desired, AnalyticGrad: TNNetVolume;
+  i, InDepth, CaseCnt: integer;
+  GradAbsMax, LossPlus, LossMinus, NumericGrad: TNeuralFloat;
   AnyNan: boolean;
-begin
-  // One forward+backward must leave the INPUT gradient finite and non-zero on
-  // both skip paths (identity: C_in = Channels; projection: C_in <> Channels).
-  for InDepth in [6, 3] do
+
+  function LossAt(AInput: TNNetVolume): TNeuralFloat;
+  var
+    m: integer;
+    Diff: TNeuralFloat;
   begin
+    NN.Compute(AInput);
+    Result := 0;
+    for m := 0 to NN.GetLastLayer.Output.Size - 1 do
+    begin
+      Diff := NN.GetLastLayer.Output.Raw[m] - Desired.Raw[m];
+      Result := Result + 0.5 * Diff * Diff;
+    end;
+  end;
+
+begin
+  // Part 1, normalization on: one forward+backward must leave the INPUT gradient
+  // finite and non-zero. Part 2, normalization and dropout off (the
+  // MovingStdNormalization backward is approximate): exact central-difference
+  // input-gradient check. Both parts run on the identity and projection skips.
+  for CaseCnt := 0 to High(InDepths) do
+  begin
+    InDepth := InDepths[CaseCnt];
     RandSeed := 424242;
     NN := TNNet.Create();
     Input := TNNetVolume.Create(8, 1, InDepth);
@@ -42613,6 +42640,39 @@ begin
         GradAbsMax > 1e-9);
     finally
       NN.Free; Input.Free; Desired.Free;
+    end;
+
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(8, 1, InDepth);
+    Perturbed := TNNetVolume.Create(8, 1, InDepth);
+    Desired := TNNetVolume.Create(8, 1, 6);
+    AnalyticGrad := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(8, 1, InDepth, 1));
+      NN.AddTCNBlock(6, 3, 2);
+      NN.SetLearningRate(1.0, 0.0);
+      NN.SetBatchUpdate(True);
+      for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 1.1) * 0.7;
+      for i := 0 to Desired.Size - 1 do Desired.Raw[i] := Cos(i * 0.6) * 0.3 + 0.5;
+      NN.Compute(Input);
+      NN.Layers[0].OutputError.Fill(0);
+      NN.Backpropagate(Desired);
+      // Copied now: every later Compute clears the input layer's OutputError.
+      AnalyticGrad.Copy(NN.Layers[0].OutputError);
+      for i := 0 to Input.Size - 1 do
+      begin
+        Perturbed.Copy(Input);
+        Perturbed.Raw[i] := Input.Raw[i] + cEps;
+        LossPlus := LossAt(Perturbed);
+        Perturbed.Raw[i] := Input.Raw[i] - cEps;
+        LossMinus := LossAt(Perturbed);
+        NumericGrad := (LossPlus - LossMinus) / (2 * cEps);
+        AssertEquals('TCN block exact input gradient (C_in=' + IntToStr(InDepth) +
+          ') at ' + IntToStr(i), NumericGrad, AnalyticGrad.Raw[i], 1e-3);
+      end;
+    finally
+      NN.Free; Input.Free; Perturbed.Free; Desired.Free; AnalyticGrad.Free;
     end;
   end;
 end;

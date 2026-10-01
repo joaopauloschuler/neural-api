@@ -19760,8 +19760,8 @@ type
       // through SaveToString/LoadFromString. Returns the final-LayerNorm layer so
       // blocks can be stacked. (Coded by Claude (AI).)
       function AddConformerBlock(Heads, d_ff, ConvKernelSize: integer): TNNetLayer;
-      // TCN residual block (Bai et al. 2018) over (SeqLen,1,C): 2x [dilated causal conv -> MovingStdNorm (paper: weight norm) -> ReLU -> SpatialDropout1D],
-      // plus the input (1x1 projection if C <> Channels), then ReLU. DropoutRate=0 / UseNormalization=false omit those layers. Coded by Claude (AI).
+      // TCN block (SeqLen,1,C): 2x [CausalConv1D, opt. MovingStdNorm, ReLU,
+      // opt. dropout] + skip (1x1 if C<>Channels), ReLU. Coded by Claude (AI).
       function AddTCNBlock(Channels, KernelSize, Dilation: integer;
         DropoutRate: TNeuralFloat = 0; UseNormalization: boolean = false): TNNetLayer;
       // SPIKING block: the canonical linear -> LIF -> rate-readout pipeline of a
@@ -84832,9 +84832,6 @@ var
   BlockInput, BranchOutput, Skip: TNNetLayer;
   ConvCnt: integer;
 begin
-  if GetLastLayer().Output.SizeY <> 1 then
-    FErrorProc('AddTCNBlock requires a (SeqLen,1,C) input (SizeY=1). Got SizeY=' +
-      IntToStr(GetLastLayer().Output.SizeY));
   BlockInput := GetLastLayer();
   for ConvCnt := 1 to 2 do
   begin
