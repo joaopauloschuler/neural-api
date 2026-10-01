@@ -19748,14 +19748,11 @@ type
       // the residual sum scaled by 0.5 via TNNetMulByConstant (macaron).
       // Convolution module:
       //   PointwiseConvLinear(2*d_model) -> TNNetGLU (glu gating, back to d_model)
-      //   -> TNNetCausalConv1D(d_model, ConvKernelSize) (1-D depth-mixing conv over
-      //      the time axis, causal/SAME so length is preserved) -> TNNetSwish
+      //   -> TNNetDepthwiseConv1D(ConvKernelSize, causal) (the paper's per-channel
+      //      depthwise conv over the time axis, no channel mixing, length
+      //      preserved) -> TNNetSwish
       //   -> PointwiseConvLinear(d_model) (point-wise projection back).
-      // NOTE on the depthwise conv: the paper uses a per-channel DEPTHWISE 1-D
-      // conv; the library has no per-channel 1-D-over-sequence primitive, so
-      // TNNetCausalConv1D (a full 1-D conv that DOES mix channels across the
-      // kernel window) is used as the closest existing shape-preserving 1-D
-      // sequence conv. d_model is inferred from the input depth. All sub-layers
+      // d_model is inferred from the input depth. All sub-layers
       // are already serializable, so the block needs no new class and round-trips
       // through SaveToString/LoadFromString. Returns the final-LayerNorm layer so
       // blocks can be stacked. (Coded by Claude (AI).)
