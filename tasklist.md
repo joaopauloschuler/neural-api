@@ -365,7 +365,8 @@ rather than acted on.
       and examples/TCNClassifier using it. Measured (window 64, 4 channels,
       KernelSize 2, receptive field 63): dilated TCN 97.11% test accuracy vs
       non-dilated baseline 39.46% (receptive field 11, same 4864 weights);
-      chance 25%. Peak RSS 36 MB. The builder and the dilated input-gradient
+      chance 25%. Peak RSS 36 MB. Wall clock varies widely, cause not yet
+      diagnosed: 8:08 and 33:34 measured. The builder and the dilated input-gradient
       check are done; the narrow-InputDepth speedup is still open.
 
 ### Computer vision & generative models

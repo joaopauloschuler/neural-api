@@ -17,12 +17,17 @@ the effect of dilation is visible.
   is 25%.
 
 Cues are sparse, so the most recent cue is often far back in the window. The
-program prints how many test windows have their last cue inside each model's
-receptive field: 98.6% for the dilated TCN, 24.0% for the baseline.
+program prints, for each model, the fraction of test windows whose label
+channel's last COMPLETE 3-step cue ends inside that model's receptive field:
+98.6% for the dilated TCN, 24.0% for the baseline. A cue still in progress at
+the window end counts as not visible.
+
+About 1 window in 45 has its cue starting at the last step. That single pulse
+looks exactly like a distractor, so the best possible accuracy is about 98-99%.
 
 ## The model
 
-```pascal
+```text
 NN.AddLayer(TNNetInput.Create(64, 1, 4));          // (WindowLen, 1, NumFeatures)
 for Dilation in 1, 2, 4, 8, 16:
   NN.AddTCNBlock({Channels=}16, {KernelSize=}2, Dilation, DropoutRate, UseNormalization);
@@ -38,8 +43,8 @@ final ReLU. With two convs per block the receptive field is
 `1 + 2*(KernelSize-1)*sum(dilations)` = 63 steps (baseline with all dilations 1:
 11 steps). The window length (64) is chosen to be at least the receptive field.
 
-`TNNetCrop` keeps only the last time step: because every conv is causal, that
-position is the only one that sees the whole window.
+`TNNetCrop` keeps only the last time step. Every conv is causal, so the last
+step is the position with the widest view: it sees the last 63 of the 64 steps.
 
 ### Options
 
@@ -74,7 +79,10 @@ Baseline (all dilations 1): test accuracy  39.46%  (trained in 387.4 s)
 Summary: dilated TCN 97.11%, non-dilated baseline 39.46%, chance 25.0%
 ```
 
-Peak resident memory was 36 MB. The baseline's training time includes several
-multi-second stalls between epochs (visible in `autosave.csv`); its steady
-epochs took 1-3 s, like the dilated model's. The whole run normally takes 2-3
-minutes.
+Peak resident memory was 36 MB.
+
+**Run time varies widely between runs, for a reason not yet diagnosed.** Two
+measured runs of the same build: 8:08 wall clock (dilated 101 s, baseline
+387 s) and 33:34 wall clock (dilated ~100 s, baseline 1915 s). The slow parts
+are multi-second stalls between epochs (visible in `autosave.csv`), and they
+can hit either model.

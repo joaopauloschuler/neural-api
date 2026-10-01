@@ -14,7 +14,7 @@ the window and only a long receptive field can see it.
 Model (cDilations = 1, 2, 4, 8, 16; KernelSize 2; receptive field 63 steps):
   Input (cWindowLen,1,cNumFeatures)
     -> 5x NN.AddTCNBlock(cChannels, cKernelSize, Dilation, DropoutRate, UseNormalization)
-    -> TNNetCrop(cWindowLen-1, 0, 1, 1)   (last time step: it sees the whole window causally)
+    -> TNNetCrop(cWindowLen-1, 0, 1, 1)   (last time step: sees the last 63 of 64 steps)
     -> TNNetFullConnectLinear(cNumFeatures) -> TNNetSoftMax
 A baseline with every dilation set to 1 (same layers, same weight count) is
 trained on the same data so the effect of dilation is visible.
@@ -74,8 +74,13 @@ begin
   ArgCnt := 1;
   while ArgCnt <= ParamCount do
   begin
-    if (ParamStr(ArgCnt) = '--dropout') and (ArgCnt < ParamCount) then
+    if ParamStr(ArgCnt) = '--dropout' then
     begin
+      if ArgCnt = ParamCount then
+      begin
+        WriteLn('--dropout: missing value (e.g. --dropout 0.1)');
+        Halt(1);
+      end;
       Inc(ArgCnt);
       DropoutRate := StrToFloat(ParamStr(ArgCnt));
     end
@@ -223,7 +228,8 @@ begin
   NFit.InferHitFn := @ClassCompare;
   StartTime := Now();
   NFit.Fit(NN, TrainPairs, ValPairs, TestPairs, cBatchSize, cEpochs);
-  // Fit reloads the best (validation) net into NN.
+  // Fit reloads the best (validation) net into NN; reloaded dropout layers start enabled.
+  NN.EnableDropouts(false);
   Result := EvaluateAccuracy(NN, TestPairs);
   WriteLn(Name, ': test accuracy ', (Result * 100):6:2, '%  (trained in ',
     ((Now() - StartTime) * 86400):0:1, ' s)');
