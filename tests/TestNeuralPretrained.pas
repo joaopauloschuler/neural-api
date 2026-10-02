@@ -347,6 +347,8 @@ type
     procedure TestGGUFWriterRoundTrip;
     procedure TestGGUFQ4_0PackedRowStreaming;
     procedure TestLlamaGGUFQ4_0DirectInt4Load;
+    procedure TestLlamaInt4RowImportLoad;
+    procedure TestLlamaChatInt4RowImport;
     procedure TestBuildFromGGUFQwen2RoundTrip;
     procedure TestBuildFromGGUFGemma2RoundTrip;
     procedure TestGGUFGemma2Q8AndF16ImportDrift;
@@ -7085,6 +7087,268 @@ begin
     NNRequant.Free; NNDirect.Free; NNFP32.Free;
     DeleteFile(Q8Path);
     DeleteFile(Q4Path);
+  end;
+end;
+
+// NeuralImportInt4FromRows on the tiny llama: each int4 layer (tied head too)
+// holds QuantizeRow of its FP32 rows bit for bit. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLlamaInt4RowImportLoad;
+const
+  SeqLen = 4;
+  Int4LayerCount = 13; // 2 blocks x {q, k, v, o, gate|up, down} + tied head
+var
+  Dir: string;
+  FP32Net, Direct, Requant: TNNet;
+  Expected: TNNetVolumeQuant4;
+  Input, OutFP32, OutDirect, OutRequant: TNNetVolume;
+  Reader: TNNetSafeTensorsReader;
+  FP32Layer, DirectLayer, DownLayer: TNNetLayerConcatedWeights;
+  LayerPos, NeuronCnt, i, Int4Count, Vocab, T, Pass: integer;
+  DirectDiff, RequantDiff: double;
+  Raised: boolean;
+begin
+  Dir := MakeChatModelDir('llama_q8');
+  FP32Net := nil; Direct := nil; Requant := nil;
+  Expected := TNNetVolumeQuant4.Create();
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  OutFP32 := TNNetVolume.Create();
+  OutDirect := TNNetVolume.Create();
+  OutRequant := TNNetVolume.Create();
+  try
+    FP32Net := BuildFromPretrained(Dir, SeqLen, {pTrainable=}false, '',
+      {pQuantizeInt8=}false);
+    NeuralImportInt4FromRows := true;
+    NeuralImportInt4FromRowsLayerCount := 0;
+    try
+      Direct := BuildFromPretrained(Dir, SeqLen, {pTrainable=}false, '',
+        {pQuantizeInt8=}true);
+    finally
+      NeuralImportInt4FromRows := false;
+    end;
+    AssertEquals('layers the loader quantized from the rows', Int4LayerCount,
+      NeuralImportInt4FromRowsLayerCount);
+    Int4Count := 0;
+    for LayerPos := 0 to Direct.CountLayers() - 1 do
+    begin
+      if not (Direct.Layers[LayerPos] is TNNetLayerConcatedWeights) then
+        continue;
+      DirectLayer := TNNetLayerConcatedWeights(Direct.Layers[LayerPos]);
+      if not DirectLayer.WeightsQuantizedInt4 then continue;
+      Inc(Int4Count);
+      FP32Layer := TNNetLayerConcatedWeights(FP32Net.Layers[LayerPos]);
+      AssertFalse('layer ' + IntToStr(LayerPos) + ' left int8',
+        DirectLayer.WeightsQuantizedInt8);
+      AssertFalse('layer ' + IntToStr(LayerPos) + ' has no open import',
+        DirectLayer.Int4QuantImportOpen());
+      AssertEquals('layer ' + IntToStr(LayerPos) + ' holds no int8 table',
+        DirectLayer.QuantTableInt4.GetMemSize(),
+        DirectLayer.Int8QuantizedSizeBytes());
+      Expected.ReSize(FP32Layer.Neurons.Count, 1,
+        FP32Layer.Neurons[0].Weights.Size);
+      for NeuronCnt := 0 to FP32Layer.Neurons.Count - 1 do
+        Expected.QuantizeRow(NeuronCnt, 0,
+          FP32Layer.Neurons[NeuronCnt].Weights.DataPtr);
+      AssertEquals('layer ' + IntToStr(LayerPos) + ' packed size',
+        Expected.PackedSize, DirectLayer.QuantTableInt4.PackedSize);
+      for i := 0 to Expected.PackedSize - 1 do
+        if Expected.FData[i] <> DirectLayer.QuantTableInt4.FData[i] then
+          AssertEquals('layer ' + IntToStr(LayerPos) + ' packed byte ' +
+            IntToStr(i), Expected.FData[i],
+            DirectLayer.QuantTableInt4.FData[i]);
+      for i := 0 to Expected.ScaleData.Size - 1 do
+        if PLongWord(@Expected.ScaleData.FData[i])^ <>
+          PLongWord(@DirectLayer.QuantTableInt4.ScaleData.FData[i])^ then
+          AssertEquals('layer ' + IntToStr(LayerPos) + ' scale ' + IntToStr(i),
+            Expected.ScaleData.FData[i],
+            DirectLayer.QuantTableInt4.ScaleData.FData[i], 0);
+    end;
+    AssertEquals('int4 layers after the load', Int4LayerCount, Int4Count);
+    AssertEquals('the sweep finds no layer left to convert', Int4LayerCount,
+      Direct.QuantizeWeightsInt4());
+    Requant := BuildFromPretrained(Dir, SeqLen, {pTrainable=}false, '',
+      {pQuantizeInt8=}true);
+    AssertEquals('the int8 -> int4 route converts the same layers',
+      Int4LayerCount, Requant.QuantizeWeightsInt4());
+    Vocab := FP32Net.GetLastLayer().Output.Depth;
+    DirectDiff := 0;
+    RequantDiff := 0;
+    for Pass := 0 to 2 do
+    begin
+      for T := 0 to SeqLen - 1 do
+        Input.FData[T] := (Pass * 5 + T * 3 + 1) mod Vocab;
+      FP32Net.Compute(Input);  FP32Net.GetOutput(OutFP32);
+      Direct.Compute(Input);   Direct.GetOutput(OutDirect);
+      Requant.Compute(Input);  Requant.GetOutput(OutRequant);
+      for i := 0 to OutFP32.Size - 1 do
+      begin
+        DirectDiff := DirectDiff + Abs(OutDirect.FData[i] - OutFP32.FData[i]);
+        RequantDiff := RequantDiff +
+          Abs(OutRequant.FData[i] - OutFP32.FData[i]);
+      end;
+    end;
+    WriteLn('  int4 logit sum |diff| vs FP32: rows -> int4 ',
+      DirectDiff:0:6, ', int8 -> int4 ', RequantDiff:0:6);
+    // Fixture-specific: one rounding is closer here (32.78 vs 37.09), not by
+    // construction on every checkpoint.
+    AssertTrue('direct sum |diff| ' + FloatToStr(DirectDiff) +
+      ' must not exceed the int8 -> int4 sum |diff| ' + FloatToStr(RequantDiff),
+      DirectDiff <= RequantDiff);
+    // A second fill of a layer already holding int4 rows has no FP32 rows to
+    // write into, so the loader refuses it.
+    DownLayer := nil;
+    for LayerPos := Direct.CountLayers() - 1 downto 0 do
+      if (Direct.Layers[LayerPos] is TNNetLayerConcatedWeights) and
+        TNNetLayerConcatedWeights(Direct.Layers[LayerPos]).WeightsQuantizedInt4
+        and (Direct.Layers[LayerPos].Neurons.Count = 32) and
+        (Direct.Layers[LayerPos].Neurons[0].Weights.Size = 1) then
+      begin
+        DownLayer := TNNetLayerConcatedWeights(Direct.Layers[LayerPos]);
+        break;
+      end;
+    AssertTrue('a 32-neuron int4 layer', DownLayer <> nil);
+    Reader := TNNetSafeTensorsReader.Create(Dir + 'model.safetensors');
+    try
+      Raised := false;
+      try
+        LoadLlamaLinearWeights(Reader, DownLayer,
+          'model.layers.1.mlp.down_proj.weight', 32, 32);
+      except
+        on E: EPretrainedImportError do Raised := true;
+      end;
+      AssertTrue('refilling an int4 layer raises', Raised);
+    finally
+      Reader.Free;
+    end;
+  finally
+    OutRequant.Free; OutDirect.Free; OutFP32.Free; Input.Free;
+    Expected.Free;
+    Requant.Free; Direct.Free; FP32Net.Free;
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+// TChatEngine --int4, tiny llama: the loader quantizes every int4 layer, the
+// twin borrows them, a later --int8 load stays int8. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestLlamaChatInt4RowImport;
+const
+  Ctx = 12;
+  PromptLen = 7;
+  Vocab = 8;
+var
+  Dir, ErrorMsg: string;
+  Prompt: TNeuralIntegerArray;
+  TokenPos, Int4Count, BorrowedInt4Count: integer;
+  Engine: TChatEngine;
+  Args: TStringList;
+  Opt: TChatOptions;
+  Raised: boolean;
+
+  function RunEngine(const Flags: array of string): TChatEngine;
+  var
+    Args: TStringList;
+    Opt: TChatOptions;
+    ArgPos: integer;
+  begin
+    Result := TChatEngine.Create();
+    Args := TStringList.Create();
+    try
+      Args.Add(Dir);
+      Args.Add('--greedy'); Args.Add('--cpu'); Args.Add('--serial');
+      Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
+      Args.Add('--max-new-tokens'); Args.Add('2');
+      for ArgPos := 0 to High(Flags) do Args.Add(Flags[ArgPos]);
+      AssertTrue('chat options parse', ParseArgs(Args, Opt));
+      FNotices := '';
+      Result.OnNotice := @CaptureNotice;
+      ErrorMsg := '';
+      AssertTrue('LoadModel: ' + ErrorMsg, Result.LoadModel(Opt, ErrorMsg));
+      Result.GenerateFromIds(Prompt, Result.Opt);
+      AssertTrue('tokens produced', Result.LastCompletionTokens > 0);
+    finally
+      Args.Free;
+    end;
+  end;
+
+  function CountInt4Layers(Net: TNNet; out Borrowed: integer): integer;
+  var
+    Layer: TNNetLayer;
+    LayerPos: integer;
+  begin
+    Result := 0;
+    Borrowed := 0;
+    for LayerPos := 0 to Net.CountLayers() - 1 do
+    begin
+      Layer := Net.Layers[LayerPos];
+      if (Layer is TNNetLayerConcatedWeights) and
+        TNNetLayerConcatedWeights(Layer).WeightsQuantizedInt4 then
+      begin
+        Inc(Result);
+        if Layer.WeightOwner <> nil then Inc(Borrowed);
+      end;
+    end;
+  end;
+
+begin
+  RandSeed := 535353;
+  Dir := MakeChatModelDir('llama_q8');
+  SetLength(Prompt, PromptLen);
+  for TokenPos := 0 to PromptLen - 1 do
+    Prompt[TokenPos] := (5 * TokenPos + 2) mod Vocab;
+  try
+    Engine := RunEngine(['--int4']);
+    try
+      AssertTrue('the notice counts the loader-quantized layers: ' + FNotices,
+        Pos('13 quantized from the checkpoint rows by the loader, ' +
+          '0 requantized from int8', FNotices) > 0);
+      AssertEquals('int4 layers', 13, CountInt4Layers(Engine.NN,
+        BorrowedInt4Count));
+      AssertFalse('the row route is off after the load',
+        NeuralImportInt4FromRows);
+    finally
+      Engine.Free;
+    end;
+    Engine := RunEngine(['--int4', '--prefill-window', '4']);
+    try
+      AssertTrue('the llama twin borrows', Engine.WindowBorrowsWeights);
+      Int4Count := CountInt4Layers(Engine.WindowNN, BorrowedInt4Count);
+      AssertEquals('int4 layers on the twin', 13, Int4Count);
+      AssertEquals('every int4 layer of the twin is borrowed', Int4Count,
+        BorrowedInt4Count);
+      AssertEquals('one window fed', 1, Engine.LastPrefillWindows);
+    finally
+      Engine.Free;
+    end;
+    Engine := RunEngine(['--int8']);
+    try
+      AssertEquals('an --int8 load after --int4 holds no int4 layer', 0,
+        CountInt4Layers(Engine.NN, BorrowedInt4Count));
+    finally
+      Engine.Free;
+    end;
+    // A build that raises leaves no import route or attention flag set.
+    DeleteFile(Dir + 'model.safetensors');
+    Args := TStringList.Create();
+    Engine := TChatEngine.Create();
+    try
+      Args.Add(Dir); Args.Add('--int4'); Args.Add('--no-fused-attn');
+      Args.Add('--cpu');
+      AssertTrue('chat options parse', ParseArgs(Args, Opt));
+      Raised := false;
+      try
+        Engine.LoadModel(Opt, ErrorMsg);
+      except
+        on E: EPretrainedImportError do Raised := true;
+      end;
+      AssertTrue('the load without weights raises', Raised);
+      AssertFalse('row route off', NeuralImportInt4FromRows);
+      AssertFalse('Q4_0 route off', NeuralImportInt4FromQ4_0);
+      AssertTrue('fused attention restored', NeuralAllowFusedAttention);
+    finally
+      Engine.Free;
+      Args.Free;
+    end;
+  finally
+    RemoveChatModelDir(Dir);
   end;
 end;
 
@@ -27047,19 +27311,19 @@ begin
   end;
 end;
 
-// A non-streamable call cancels an untouched int4 import (FP32, then sweep)
-// and raises over imported rows; refusals keep rows. Coded by Claude (AI).
+// A non-streamable call cancels an untouched int4 import, and after imported
+// rows moves them to FP32 rows (mixed GateUp). Coded by Claude (AI).
 procedure TTestNeuralPretrained.TestQwenImage21Int4ImportRefusals;
 var
   Config: TQwenImage21TransformerConfig;
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
   Block: TQwenImage21BlockLayers;
-  Slab: TNNetVolume;
+  Slab, ProjSlab, RowSrc, DequantRow, ExpectedRow: TNNetVolume;
   Expected: TNNetVolumeQuant4;
   GateUp, Down: TNNetLayerConcatedWeights;
   Prefix: string;
-  NeuronCnt, i: integer;
+  NeuronCnt, i, RowOfs: integer;
   Raised: boolean;
 
   procedure BuildArmedBlockNet();
@@ -27087,6 +27351,9 @@ begin
     'tiny_qwenimage21/transformer/diffusion_pytorch_model.safetensors.index.json'));
   NN := nil;
   Slab := TNNetVolume.Create();
+  ProjSlab := TNNetVolume.Create();
+  DequantRow := TNNetVolume.Create(1, 1, Config.Hidden);
+  ExpectedRow := TNNetVolume.Create(1, 1, Config.Hidden);
   Expected := TNNetVolumeQuant4.Create();
   Prefix := 'transformer_blocks.0.';
   try
@@ -27136,18 +27403,61 @@ begin
       GateUp.BeginInt4QuantImport(Config.Hidden));
     AssertEquals('the imported rows survive both refusals', Config.MlpHidden,
       GateUp.Int4QuantImportedRows);
+    // A non-streamable second half: the imported rows move to the FP32 rows,
+    // the load goes on, and the sweep requantizes the whole layer.
     Reader.LoadTensorFlat(Prefix + 'img_mlp.gate_layer.weight', Slab);
-    Raised := false;
-    try
-      LoadLlamaLinearWeights(Reader, GateUp, Prefix +
-        'img_mlp.gate_layer.weight', Config.Hidden, Config.MlpHidden,
-        Config.MlpHidden, 2 * Config.MlpHidden, 0, '', 1.0, 0, 0, 0, false,
-        false, Slab);
-    except
-      on E: EPretrainedImportError do Raised := true;
+    LoadLlamaLinearWeights(Reader, GateUp, Prefix +
+      'img_mlp.gate_layer.weight', Config.Hidden, Config.MlpHidden,
+      Config.MlpHidden, 2 * Config.MlpHidden, 0, '', 1.0, 0, 0, 0, false,
+      false, Slab);
+    AssertFalse('mixed GateUp: import closed', GateUp.Int4QuantImportOpen());
+    AssertFalse('mixed GateUp: FP32, not int8', GateUp.WeightsQuantizedInt8);
+    AssertEquals('mixed GateUp: FP32 rows', Config.Hidden,
+      GateUp.Neurons[0].Weights.Size);
+    AssertEquals('no partial import left', 0, NN.PartialInt4QuantImportCount());
+    // FP32 reference of the whole layer: proj rows, then gate_layer rows.
+    Reader.LoadTensorFlat(Prefix + 'img_mlp.proj.weight', ProjSlab);
+    Expected.ReSize(GateUp.Neurons.Count, 1, Config.Hidden);
+    for NeuronCnt := 0 to GateUp.Neurons.Count - 1 do
+    begin
+      if NeuronCnt < Config.MlpHidden
+        then RowSrc := ProjSlab
+        else RowSrc := Slab;
+      RowOfs := (NeuronCnt mod Config.MlpHidden) * Config.Hidden;
+      Expected.QuantizeRow(NeuronCnt, 0,
+        TNeuralFloatArrPtr(@RowSrc.FData[RowOfs]));
+      // The streamed half holds its int4 rows, dequantized; the slab half
+      // holds the checkpoint rows.
+      if NeuronCnt < Config.MlpHidden then
+        Expected.DequantizeRowTo(NeuronCnt, 0, DequantRow.DataPtr)
+      else
+        Move(RowSrc.FData[RowOfs], DequantRow.FData[0],
+          Config.Hidden * SizeOf(TNeuralFloat));
+      for i := 0 to Config.Hidden - 1 do
+        if DequantRow.FData[i] <> GateUp.Neurons[NeuronCnt].Weights.FData[i]
+        then AssertEquals('mixed GateUp row ' + IntToStr(NeuronCnt) +
+          ' weight ' + IntToStr(i), DequantRow.FData[i],
+          GateUp.Neurons[NeuronCnt].Weights.FData[i], 0);
     end;
-    AssertTrue('a non-streamable half after imported rows raises', Raised);
+    GateUp.QuantizeWeightsInt4();
+    AssertTrue('mixed GateUp swept to int4', GateUp.WeightsQuantizedInt4);
+    // Against Q4_0 of the FP32 layer: within one quantization step per weight
+    // (the streamed half was rounded twice).
+    for NeuronCnt := 0 to GateUp.Neurons.Count - 1 do
+    begin
+      GateUp.QuantTableInt4.DequantizeRowTo(NeuronCnt, 0, DequantRow.DataPtr);
+      Expected.DequantizeRowTo(NeuronCnt, 0, ExpectedRow.DataPtr);
+      for i := 0 to Config.Hidden - 1 do
+        AssertTrue('mixed GateUp row ' + IntToStr(NeuronCnt) + ' weight ' +
+          IntToStr(i) + ' within one Q4_0 step',
+          Abs(DequantRow.FData[i] - ExpectedRow.FData[i]) <= 1.0001 * Abs(
+          Expected.GetScaleRowPtr(NeuronCnt, 0)^[i div
+          TNNetVolumeQuant4.BlockSize]));
+    end;
   finally
+    DequantRow.Free;
+    ExpectedRow.Free;
+    ProjSlab.Free;
     Expected.Free;
     Slab.Free;
     NN.Free;

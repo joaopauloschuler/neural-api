@@ -13050,6 +13050,12 @@ var
   // Layers LoadLlamaLinearWeights direct-loaded that way. It only grows, so a
   // caller zeroes it before the build and reads it after. Coded by Claude (AI).
   NeuralImportInt4LayerCount: integer = 0;
+  // Direct FP32 -> int4 route (--int4): the loaders quantize each streamed row
+  // of an int4 layer to Q4_0; BuildFromPretrained refuses partial imports.
+  NeuralImportInt4FromRows: boolean = false;
+  // Layers whose FP32-row int4 import a loader committed; it only grows, like
+  // NeuralImportInt4LayerCount.
+  NeuralImportInt4FromRowsLayerCount: integer = 0;
 
 implementation
 
@@ -13224,10 +13230,36 @@ end;
 // is a +-127 code, so the recomputed scale and codes are identical.
 // Coded by Claude (AI).
 procedure EnsureWritableImportWeights(Layer: TNNetLayer);
+var
+  QLayer: TNNetLayerConcatedWeights;
+  NeuronCnt, MaxNeuronPos: integer;
+  ScaleRow: TNeuralFloatArrPtr;
 begin
-  if (Layer is TNNetLayerConcatedWeights) and
-     TNNetLayerConcatedWeights(Layer).WeightsQuantizedInt8 then
-    TNNetLayerConcatedWeights(Layer).DequantizeWeightsInt8()
+  if Layer is TNNetLayerConcatedWeights then
+  begin
+    QLayer := TNNetLayerConcatedWeights(Layer);
+    // A committed int4 layer kept no FP32 rows to refill (one element each).
+    if QLayer.WeightsQuantizedInt4 then
+      ImportError('Import: ' + Layer.ClassName + ' already holds int4 rows ' +
+        'from the checkpoint; it cannot be refilled through FP32 rows.');
+    if QLayer.WeightsQuantizedInt8 then QLayer.DequantizeWeightsInt8();
+    // Rows an open int4 import already holds move to the FP32 rows (a row
+    // never imported has zero block scales), so the layer leaves the import
+    // whole and the QuantizeWeightsInt4 sweep requantizes it.
+    if QLayer.Int4QuantImportOpen() and (QLayer.Int4QuantImportedRows > 0) then
+    begin
+      MaxNeuronPos := QLayer.Neurons.Count - 1;
+      for NeuronCnt := 0 to MaxNeuronPos do
+      begin
+        ScaleRow := QLayer.QuantTableInt4.GetScaleRowPtr(NeuronCnt, 0);
+        if TNNetVolume.MaxAbsFinite(ScaleRow,
+          QLayer.QuantTableInt4.BlocksPerRow) > 0 then
+          QLayer.QuantTableInt4.DequantizeRowTo(NeuronCnt, 0,
+            QLayer.Neurons[NeuronCnt].Weights.DataPtr);
+      end;
+    end;
+    QLayer.CancelInt4QuantImport();
+  end
   // The embedding keeps its vocab table in its own int8 container (outside
   // the concated-weights storage), so it needs its own writable-restore.
   else if (Layer is TNNetEmbedding) and
@@ -15292,6 +15324,7 @@ type
     FQLayer: TNNetLayerConcatedWeights;
     FScale: TNeuralFloat;
     FTargets: TNeuralIntegerArray;
+    // rows go into the open int4 import of FQLayer, or of FHead when tied
     FIntoInt4: boolean;
     // embedding path (RunEmbedding): chunk row r -> vocab row FBaseRow+r,
     // imported into the embedding and (when tied) the LM head container
@@ -15351,7 +15384,11 @@ begin
   begin
     FEmb.ImportInt8QuantRow(row, FSrc, ofs, FEmbScale);
     if HasHead then
-      FHead.ImportInt8QuantRow(row, FSrc, ofs, FHeadScale);
+    begin
+      if FIntoInt4
+        then FHead.ImportInt4QuantRow(row, FSrc, ofs, FHeadScale)
+        else FHead.ImportInt8QuantRow(row, FSrc, ofs, FHeadScale);
+    end;
     Inc(ofs, FRowSize); Inc(row);
   end;
 end;
@@ -15382,6 +15419,7 @@ procedure TQuantRowChunkFan.RunEmbedding(Emb: TNNetEmbedding;
 begin
   FEmb := Emb;
   FHead := Head;
+  FIntoInt4 := (Head <> nil) and Head.Int4QuantImportOpen();
   FSrc := Src;
   FBaseRow := BaseRow;
   FRowCount := RowCount;
@@ -15405,6 +15443,32 @@ begin
   if PartialCount > 0 then
     ImportError(What + ': ' + IntToStr(PartialCount) + ' layer(s) hold a ' +
       'partly imported int4 table after the load.');
+end;
+
+// True when QLayer has an open int4 import: the one a caller opened, or one
+// opened here for NeuralImportInt4FromRows. False leaves the int8 route.
+function OpenInt4RowImport(QLayer: TNNetLayerConcatedWeights;
+  RowSize: integer): boolean;
+begin
+  Result := QLayer.Int4QuantImportOpen();
+  if (not Result) and NeuralImportInt4FromRows then
+    Result := QLayer.BeginInt4QuantImport(RowSize);
+end;
+
+// Commits QLayer's int4 import once every neuron row arrived; raises when a
+// row came twice. Counts the commit in NeuralImportInt4FromRowsLayerCount.
+procedure CommitInt4RowImport(QLayer: TNNetLayerConcatedWeights;
+  const ErrPrefix, WName: string);
+begin
+  if QLayer.Int4QuantImportedRows > QLayer.Neurons.Count then
+    ImportError(ErrPrefix + '"' + WName + '" imported ' +
+      IntToStr(QLayer.Int4QuantImportedRows) + ' int4 rows into a ' +
+      IntToStr(QLayer.Neurons.Count) + '-neuron layer: a row twice.');
+  if QLayer.Int4QuantImportedRows = QLayer.Neurons.Count then
+  begin
+    QLayer.EndInt4QuantImport();
+    Inc(NeuralImportInt4FromRowsLayerCount);
+  end;
 end;
 
 // Materializes the WHOLE [SrcRows, InDim] tensor as one flat FP32 buffer,
@@ -15611,23 +15675,16 @@ begin
     (not IsNF4QuantizedTensor(Reader, WName)) and
     Reader.CanStreamTensorPackedQ4_0(WName);
   if DirectInt4 then DirectInt4 := QLayer.BeginInt4QuantImport(InDim);
-  // Direct FP32 -> int4: the caller opened an int4 import over the WHOLE layer
-  // before its first call (TNNet.BeginInt4QuantImports), so the streamed rows
-  // of every call - both fused gate/up halves too - quantize straight to Q4_0;
-  // the call that imports the last row commits the import.
+  // Direct FP32 -> int4: an int4 import over the WHOLE layer, opened before its
+  // first call (TNNet.BeginInt4QuantImports) or by that first call itself
+  // (NeuralImportInt4FromRows), so the streamed rows of every call - both
+  // fused gate/up halves too - quantize straight to Q4_0; the call that
+  // imports the last row commits the import.
   DirectInt4FromRows := DirectInt8 and (not DirectInt4) and
-    QLayer.Int4QuantImportOpen();
+    OpenInt4RowImport(QLayer, InDim);
   if DirectInt4 or DirectInt4FromRows then DirectInt8 := false;
-  if (QLayer <> nil) and QLayer.Int4QuantImportOpen() and
-    not (DirectInt4 or DirectInt4FromRows) then
-  begin
-    // This tensor cannot stream rows: the layer leaves the int4 import and
-    // takes the FP32 route, unless an earlier call already imported rows.
-    if QLayer.Int4QuantImportedRows > 0 then
-      ImportError('Llama import: "' + WName + '" cannot stream its rows into ' +
-        'the int4 import that earlier tensors of this layer started.');
-    QLayer.CancelInt4QuantImport();
-  end;
+  // A tensor that cannot stream rows takes the FP32 route; an open int4 import
+  // hands its rows to it there (EnsureWritableImportWeights).
   if not (DirectInt8 or DirectInt4 or DirectInt4FromRows) then
     EnsureWritableImportWeights(Layer);
   W := TNNetVolume.Create;
@@ -15714,14 +15771,7 @@ begin
         Inc(j, RowsInChunk);
       end;
       if DirectInt4FromRows then
-      begin
-        if QLayer.Int4QuantImportedRows > QLayer.Neurons.Count then
-          ImportError('Llama import: "' + WName + '" imported ' +
-            IntToStr(QLayer.Int4QuantImportedRows) + ' int4 rows into a ' +
-            IntToStr(QLayer.Neurons.Count) + '-neuron layer: a row twice.');
-        if QLayer.Int4QuantImportedRows = QLayer.Neurons.Count then
-          QLayer.EndInt4QuantImport();
-      end;
+        CommitInt4RowImport(QLayer, 'Llama import: ', WName);
     end
     else
     begin
@@ -16417,6 +16467,8 @@ begin
       (QHeadCW.Neurons.Count = VocabSize);
   if EmbDirect then
   begin
+    // The tied head's rows go straight to Q4_0 when the flag asks for it.
+    if TieWordEmbeddings then OpenInt4RowImport(QHeadCW, HiddenSize);
     // ~4 MB of FP32 rows per read (same chunking as LoadLlamaLinearWeights'
     // direct path).
     EmbChunkRows := (4 * 1024 * 1024) div (HiddenSize * 4);
@@ -16454,6 +16506,8 @@ begin
     Consumed.Add(EmbName);
     if TieWordEmbeddings then
     begin
+      if QHeadCW.Int4QuantImportOpen() then
+        CommitInt4RowImport(QHeadCW, ErrPrefix, EmbName);
       LMHead.FlushWeightCache();
       // A redundant serialized lm_head.weight is ignorable when tied.
       if Reader.HasTensor(LMHeadName) then Consumed.Add(LMHeadName);
@@ -84078,6 +84132,15 @@ begin
       'mistral, mixtral, qwen2, qwen3, gemma, gemma2, gemma3_text, rwkv, ' +
       'mamba, falcon_mamba, bloom, falcon, bert, distilbert, roberta, ' +
       'modernbert, deepseek_v2, olmo2, wav2vec2, hubert.');
+  end;
+  // A partly imported int4 layer runs neither as int8 nor as int4.
+  if NeuralImportInt4FromRows and Assigned(Result) then
+  try
+    RequireCompleteInt4QuantImports(Result,
+      'BuildFromPretrained (model_type "' + ModelType + '")');
+  except
+    FreeAndNil(Result);
+    raise;
   end;
 end;
 

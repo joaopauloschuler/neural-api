@@ -1978,8 +1978,13 @@ rather than acted on.
             int4 block loads in 0.8-2.3 s instead of 3.9-7.5 s (this box).
             Int4 results change slightly (one rounding instead of two).
             Follow-up:
-            - [ ] ChatTerminal / LLM --int4 still go int8 -> int4; switching
-                  needs a check of the window/borrowing twin builds.
+            - [x] ChatTerminal / LLM --int4 quantize streamed rows straight
+                  to int4 too (NeuralImportInt4FromRows, set by TChatEngine;
+                  LoadLlamaLinearWeights and the tied LM head open the import;
+                  BuildFromPretrained refuses partial imports). The borrowing
+                  twin reads no checkpoint; the fallback twin takes the same
+                  route. Layers that cannot stream rows keep the int8 -> int4
+                  sweep; the MoE banks have no int4 forward and stay int8.
       - [x] B1g3. Skip creating the four training volumes per neuron in
             inference-only builds.
             DONE differently: the cost was TVolume's per-volume TFormatSettings
