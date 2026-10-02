@@ -123,6 +123,8 @@ type
       const Tokens: TNeuralIntegerArray; Position: integer): integer;
     // Prompts A, B (sharing A's first ids), A on the tiny_<Stem> chat net.
     procedure RunChatCheckpointConversationSwitch(const Stem: string);
+    procedure RunChatCheckpointSystemPrompt(const Stem: string;
+      Ladder: boolean);
     {$IFDEF OpenCL}
     // First OpenCL platform/device on the box; false when there is none, which
     // every caller reports as a SKIP.
@@ -426,6 +428,9 @@ type
     procedure TestQwen35ChatCheckpointOpenCL;
     procedure TestQwen35ChatCheckpointRetention;
     procedure TestChatCheckpointConversationSwitch;
+    procedure TestChatCheckpointSystemPrompt;
+    procedure TestChatSystemCapturePosition;
+    procedure TestChatCountSystemPromptTokens;
     procedure TestMambaChatCheckpointEvictsUnresumedMatch;
     procedure TestQwen35ChatCheckpointFlagErrors;
     procedure TestQwen35ChatPrefillTailWindowErrors;
@@ -11948,16 +11953,15 @@ end;
 // by a fresh engine that sees only that prompt; both must produce the same
 // reply and cached ids (tolerance 0):
 //   start: P changed at id 0, then X - nothing to resume from, reused 0;
-//   inside: P changed at id |P| div 2, then X - the deepest checkpoint at or
-//     below the divergence is resumed (a window checkpoint with the ladder,
-//     within one window of the divergence; none without it);
+//   inside: P changed at id |P| div 2, then X - no checkpoint lies below
+//     the divergence (the windows capture none), so nothing is resumed;
 //   re-rendered: P + X with X[0] <> R[0] - the end-of-prompt checkpoint
 //     resumes at |P|-1 (P's last id, fed as turn 1's first decode input, is
 //     not in the cache) and |X| tokens are prefilled;
 //   echo: P + R + Y - the end-of-reply checkpoint is deeper and wins.
 // With the ladder (--prefill-window 6 --prefill-tail-window 2) Turn1Len 7, 9
 // and 10 put the end of P in the window, tail and width-1 session, and 17
-// puts a window checkpoint below the inside divergence. Prompt ids are fed
+// feeds two width-6 windows. Prompt ids are fed
 // directly (the fixture vocab is 13 ids). Coded by Claude (AI).
 procedure TTestNeuralPretrained.RunQwen35ChatCheckpointResume(
   const ExtraArgs: array of string; Ladder: boolean; Turn1Len: integer);
@@ -12020,13 +12024,13 @@ var
     end;
   end;
 
-  function HoldsPosition(Engine: TChatEngine; Position: integer): boolean;
+  function HeldCount(Engine: TChatEngine): integer;
   var
     SlotPos: integer;
   begin
-    Result := false;
+    Result := 0;
     for SlotPos := 0 to High(Engine.Checkpoints) do
-      if Engine.Checkpoints[SlotPos].Position = Position then exit(true);
+      if Engine.Checkpoints[SlotPos].Position > 0 then Inc(Result);
   end;
 
   function DeepestHeldAtOrBelow(Engine: TChatEngine; Limit: integer): integer;
@@ -12104,11 +12108,11 @@ var
           Warm.LastPrefillWindows);
         AssertEquals(Tag + 'turn 1 tail windows of 2',
           (FedCount mod WindowLen) div TailLen, Warm.LastPrefillTailWindows);
-        // Every window the width-6 twin fed left a checkpoint at its end.
-        for Pos := 1 to FedCount div WindowLen do
-          AssertTrue(Tag + 'window checkpoint at ' + IntToStr(Pos * WindowLen),
-            HoldsPosition(Warm, Pos * WindowLen));
       end;
+      // No system prompt: the windows leave no checkpoint, only the end of
+      // the prompt and the end of the reply do.
+      AssertEquals(Tag + 'turn 1 captured the two turn-boundary checkpoints',
+        2, HeldCount(Warm));
       AssertTrue(Tag + 'the cached sequence starts with P',
         CommonPrefixLen(Turn1.Cached, Prompt1) = Turn1Len);
       SetLength(Prompt2, Turn1Len + ExtraLen);
@@ -12128,13 +12132,8 @@ var
           Prompt2[DivPos] := (Prompt1[DivPos] + 1) mod Vocab;
           ExpectedPrefix := DivPos;
           ExpectedReused := DeepestHeldAtOrBelow(Warm, DivPos);
-          if Ladder and (DivPos >= WindowLen) then
-            AssertTrue(Tag + 'a window checkpoint within one window below' +
-              ' the divergence', (ExpectedReused > 0) and
-              (DivPos - ExpectedReused < WindowLen))
-          else
-            AssertEquals(Tag + 'no checkpoint below the divergence', 0,
-              ExpectedReused);
+          AssertEquals(Tag + 'no checkpoint below the divergence', 0,
+            ExpectedReused);
         end;
         spReRendered:
         begin
@@ -12206,9 +12205,8 @@ begin
   finally
     Args.Free;
   end;
-  // Token-by-token prefill, FP32 KV, the default parallel forward (the two
-  // turn-boundary checkpoints only); then the ladder with a window
-  // checkpoint below the inside divergence.
+  // Token-by-token prefill, FP32 KV, the default parallel forward; then the
+  // ladder, whose windows leave no checkpoint (two per turn either way).
   RunQwen35ChatCheckpointResume(['--kv-fp32'], false, 10);
   RunQwen35ChatCheckpointResume(['--kv-fp32'], true, 17);
 end;
@@ -12246,11 +12244,11 @@ end;
 // The retention rule on a store of 3 slots with the 6/2 ladder: after each
 // turn the engine's held checkpoints (position and last-used turn) must equal
 // those of a simulation of the least-recently-used rule over the same
-// capture sequence (every window end, the tail window ends, the end of the
-// prompt, the end of the reply). Turn 2 diverges inside prompt 1, so it
-// resumes the turn-1 checkpoint at the divergence (it covers only shared
-// ids), marks only that one used, and frees turn-1 checkpoints only when a
-// capture needs the slot; the slots are reused (same count, same bytes).
+// capture sequence (the system-prompt checkpoint at the last window end at
+// or below SystemLen, the end of the prompt, the end of the reply). Turn 2
+// diverges after the system prompt, so it resumes the system checkpoint,
+// marks only that one used, and its two captures free the two turn-1
+// checkpoints (a tie, the shallowest first); the slots are reused.
 // Coded by Claude (AI).
 procedure TTestNeuralPretrained.TestQwen35ChatCheckpointRetention;
 const
@@ -12260,7 +12258,9 @@ const
   TailLen = 2;
   Vocab = 13;
   Prompt1Len = 30;
-  DivPos = 28;    // turn 2 changes this id of prompt 1
+  SystemLen = 13; // ids of the system message both prompts start with
+  SystemPos = 12; // the last width-6 window end at or below SystemLen
+  DivPos = 20;    // turn 2 changes this id of prompt 1
   ExtraLen = 5;
   MaxNew = 3;
   MaxSlotPos = StoreSize - 1;
@@ -12324,29 +12324,18 @@ var
   end;
 
   // Marks the checkpoint resumed at Reused used (the only one a prompt
-  // refreshes), then replays the ladder's captures and the reply end.
-  procedure SimTurn(TurnNo, Reused, Len, ReplyEnd: integer);
+  // refreshes), then replays the turn's captures: the system checkpoint
+  // (none when SystemAt <= 0), the end of the prompt and the reply end.
+  procedure SimTurn(TurnNo, Reused, SystemAt, Len, ReplyEnd: integer);
   var
-    SlotPos, Fed, Windows, Tails, WindowPos: integer;
+    SlotPos: integer;
   begin
     if Reused > 0 then
       for SlotPos := 0 to MaxSlotPos do
         if (SimPos[SlotPos] = Reused) and
           (SimKey[SlotPos] = KeyOf(Reused, TurnNo)) then
           SimUsed[SlotPos] := TurnNo;
-    Fed := Reused;
-    Windows := (Len - 1 - Reused) div WindowLen;
-    for WindowPos := 1 to Windows do
-    begin
-      Inc(Fed, WindowLen);
-      SimCapture(Fed, TurnNo);
-    end;
-    Tails := (Len - 1 - Fed) div TailLen;
-    for WindowPos := 1 to Tails do
-    begin
-      Inc(Fed, TailLen);
-      SimCapture(Fed, TurnNo);
-    end;
+    if SystemAt > 0 then SimCapture(SystemAt, TurnNo);
     SimCapture(Len - 1, TurnNo);
     SimCapture(ReplyEnd, TurnNo);
   end;
@@ -12385,7 +12374,7 @@ var
 
   procedure RunTurn();
   begin
-    Turn.Reply := Engine.GenerateFromIds(Prompt, Engine.Opt);
+    Turn.Reply := Engine.GenerateFromIds(Prompt, Engine.Opt, SystemLen);
     Turn.Completion := Engine.LastCompletionTokens;
     Turn.Cached := Copy(Engine.CachedTokens);
   end;
@@ -12434,13 +12423,17 @@ begin
     AssertEquals('turn 1 windows', (Prompt1Len - 1) div WindowLen,
       Engine.LastPrefillWindows);
     AssertEquals('turn 1 is turn 1', 1, Engine.CurrentTurn);
-    SimTurn(1, 0, Prompt1Len, Length(Turn.Cached));
+    AssertTrue('the system checkpoint is at the last window end below' +
+      ' SystemLen', ChatCheckpointSlotOf(Engine, Prompt, SystemPos) >= 0);
+    SimTurn(1, 0, SystemPos, Prompt1Len, Length(Turn.Cached));
     AssertStoreMatchesSimulation('after turn 1');
     AssertEquals('turn 1 kept the slot bytes', BytesBefore, StoreBytes());
 
-    // Turn 2 diverges at DivPos: the turn-1 checkpoint AT DivPos covers only
-    // the shared ids, so it is resumed; the deeper turn-1 ones are not
-    // matched and stay until a capture needs their slot.
+    // Turn 2 diverges at DivPos, past the system prompt: it resumes the
+    // system checkpoint; the deeper turn-1 ones are not matched and stay
+    // until a capture needs their slot. It resumes at SystemPos, below
+    // SystemLen, and no window end lies past SystemPos below SystemLen, so it
+    // captures no system checkpoint of its own.
     SetLength(Prompt, Prompt1Len + ExtraLen);
     for Pos := 0 to MaxPrompt1Pos do Prompt[Pos] := (5 * Pos + 2) mod Vocab;
     Prompt[DivPos] := (Prompt[DivPos] + 1) mod Vocab;
@@ -12448,9 +12441,10 @@ begin
       Prompt[Prompt1Len + Pos] := (7 * Pos + 3) mod Vocab;
     RunTurn();
     AssertEquals('turn 2 prefix', DivPos, Engine.LastPrefixTokens);
-    AssertEquals('turn 2 resumed the checkpoint at the divergence', DivPos,
+    AssertEquals('turn 2 resumed the system checkpoint', SystemPos,
       Engine.LastReusedTokens);
-    SimTurn(2, Engine.LastReusedTokens, Length(Prompt), Length(Turn.Cached));
+    SimTurn(2, Engine.LastReusedTokens, -1, Length(Prompt),
+      Length(Turn.Cached));
     AssertStoreMatchesSimulation('after turn 2');
     AssertEquals('turn 2 kept the slot bytes', BytesBefore, StoreBytes());
   finally
@@ -12574,6 +12568,261 @@ procedure TTestNeuralPretrained.TestChatCheckpointConversationSwitch;
 begin
   RunChatCheckpointConversationSwitch('qwen3_5');
   RunChatCheckpointConversationSwitch('mamba');
+end;
+
+// Two conversations with the same system prompt (SystemLen ids): A captures
+// three checkpoints (the system prompt, the end of the prompt, the end of the
+// reply; with the 4/2 ladder the system one lands on the last window end at
+// or below SystemLen), then B resumes the system checkpoint (on the hybrid
+// it lies within the live-cache prefix B shares with A) and the store grows
+// by B's prompt and reply ends only. B's reply equals a fresh engine's.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunChatCheckpointSystemPrompt(
+  const Stem: string; Ladder: boolean);
+const
+  Ctx = 32;
+  Vocab = 13;
+  SystemLen = 7;
+  ALen = 12;
+  BLen = 14;
+  WindowLen = 4;
+  TailLen = 2;
+  MaxAPos = ALen - 1;
+  MaxBPos = BLen - 1;
+var
+  Dir, Tag: string;
+  Warm, Fresh: TChatEngine;
+  PromptA, PromptB: TNeuralIntegerArray;
+  TurnA, TurnB, FreshB: TChatTurnRecord;
+  SystemAt, TokenPos: integer;
+
+  function NewEngine(): TChatEngine;
+  var
+    Args: TStringList;
+    Opt: TChatOptions;
+    ErrorMsg: string;
+    ParsedOK, LoadedOK: boolean;
+  begin
+    Result := TChatEngine.Create();
+    Args := TStringList.Create();
+    try
+      Args.Add(Dir);
+      Args.Add('--greedy'); Args.Add('--fp32'); Args.Add('--cpu');
+      Args.Add('--serial');
+      Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
+      Args.Add('--max-new-tokens'); Args.Add('2');
+      if Ladder then
+      begin
+        Args.Add('--prefill-window'); Args.Add(IntToStr(WindowLen));
+        Args.Add('--prefill-tail-window'); Args.Add(IntToStr(TailLen));
+      end;
+      ParsedOK := ParseArgs(Args, Opt);
+      AssertTrue(Tag + 'chat options parse: ' + Opt.ErrorMsg, ParsedOK);
+      LoadedOK := Result.LoadModel(Opt, ErrorMsg);
+      AssertTrue(Tag + 'LoadModel: ' + ErrorMsg, LoadedOK);
+      AssertTrue(Tag + 'checkpoint route', Result.StateReuseOK);
+      AssertTrue(Tag + 'a store larger than one turn''s captures',
+        Length(Result.Checkpoints) > 3);
+    finally
+      Args.Free;
+    end;
+  end;
+
+  function HeldCount(Engine: TChatEngine): integer;
+  var
+    SlotPos, MaxSlotPos: integer;
+  begin
+    Result := 0;
+    MaxSlotPos := High(Engine.Checkpoints);
+    for SlotPos := 0 to MaxSlotPos do
+      if Engine.Checkpoints[SlotPos].Position > 0 then Inc(Result);
+  end;
+
+  procedure RunTurn(Engine: TChatEngine; const Prompt: TNeuralIntegerArray;
+    var Turn: TChatTurnRecord);
+  begin
+    Turn.Reply := Engine.GenerateFromIds(Prompt, Engine.Opt, SystemLen);
+    Turn.Completion := Engine.LastCompletionTokens;
+    Turn.Cached := Copy(Engine.CachedTokens);
+  end;
+
+begin
+  Tag := Stem + BoolToStr(Ladder, ' ladder', '') + ': ';
+  RandSeed := 505050;
+  SetLength(PromptA, ALen);
+  for TokenPos := 0 to MaxAPos do
+    PromptA[TokenPos] := (5 * TokenPos + 2) mod Vocab;
+  SetLength(PromptB, BLen);
+  for TokenPos := 0 to MaxBPos do
+    if TokenPos < SystemLen then PromptB[TokenPos] := PromptA[TokenPos]
+    else PromptB[TokenPos] := (7 * TokenPos + 3) mod Vocab;
+  AssertTrue(Tag + 'B diverges from A right after the system prompt',
+    PromptB[SystemLen] <> PromptA[SystemLen]);
+  // A feeds 11 ids; under the ladder: windows of 4 to 8, so the last window
+  // end at or below SystemLen is 4.
+  if Ladder then SystemAt := 4 else SystemAt := SystemLen;
+  Dir := MakeChatModelDir(Stem);
+  Warm := nil;
+  Fresh := nil;
+  try
+    Warm := NewEngine();
+    Fresh := NewEngine();
+    RunTurn(Warm, PromptA, TurnA);
+    AssertTrue(Tag + 'A produced tokens', TurnA.Completion > 0);
+    AssertEquals(Tag + 'A captured three checkpoints', 3, HeldCount(Warm));
+    AssertTrue(Tag + 'the system checkpoint is held',
+      ChatCheckpointSlotOf(Warm, PromptA, SystemAt) >= 0);
+
+    RunTurn(Warm, PromptB, TurnB);
+    AssertEquals(Tag + 'B shares the system prompt with the live cache',
+      SystemLen, Warm.LastPrefixTokens);
+    AssertEquals(Tag + 'B resumed the system checkpoint', SystemAt,
+      Warm.LastReusedTokens);
+    AssertEquals(Tag + 'B added only its prompt and reply ends', 5,
+      HeldCount(Warm));
+    RunTurn(Fresh, PromptB, FreshB);
+    AssertEquals(Tag + 'the fresh engine reused nothing', 0,
+      Fresh.LastReusedTokens);
+    AssertSameChatTurn(FreshB, TurnB, Tag + 'B vs fresh engine');
+  finally
+    Fresh.Free;
+    Warm.Free;
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestChatCheckpointSystemPrompt;
+begin
+  RunChatCheckpointSystemPrompt('qwen3_5', false);
+  RunChatCheckpointSystemPrompt('qwen3_5', true);
+  RunChatCheckpointSystemPrompt('mamba', false);
+  RunChatCheckpointSystemPrompt('mamba', true);
+end;
+
+// TChatEngine.CountSystemPromptTokens over the tiny Qwen3.5 BPE fixture: on
+// the ChatML family it is the token count of the system message rendered
+// alone (Qwen3.8 follows the reasoning-effort header). Llama-2 folds the
+// system message into the first [INST] (its lone render is empty); Gemma and
+// Mistral refuse a system role (ChatReply raises before counting, and the
+// count itself catches the refusal); raw mode and a conversation without a
+// leading system message give 0. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestChatCountSystemPromptTokens;
+var
+  Engine: TChatEngine;
+  Msgs: TChatMessages;
+  GenOpt: TChatOptions;
+
+  function CountFor(Format: TNeuralChatFormat;
+    Effort: TChatReasoningEffort): integer;
+  var
+    PromptIds: TNeuralIntegerArray;
+  begin
+    Engine.ChatFormat := Format;
+    GenOpt.ReasoningEffort := Effort;
+    // Gemma and Mistral refuse the system role in the full render as well,
+    // so the prompt ids come from ChatML there.
+    if (Format = cfGemma) or (Format = cfMistral) then
+      PromptIds := EncodeChat(Engine.Tokenizer, cfChatML, Msgs,
+        ChatTemplateOptions(true, false, Effort))
+    else
+      PromptIds := EncodeChat(Engine.Tokenizer, Format, Msgs,
+        ChatTemplateOptions(true, false, Effort));
+    Result := Engine.CountSystemPromptTokens(Msgs, PromptIds, GenOpt);
+  end;
+
+  function SystemOnlyLen(Format: TNeuralChatFormat;
+    Effort: TChatReasoningEffort): integer;
+  begin
+    Result := Length(EncodeChat(Engine.Tokenizer, Format, Msgs[0..0],
+      ChatTemplateOptions(false, false, Effort)));
+  end;
+
+begin
+  Engine := TChatEngine.Create();
+  try
+    Engine.Tokenizer := TNeuralHFTokenizer.Create();
+    Engine.Tokenizer.LoadFromFile(
+      FixturePath('tiny_bpe_split_qwen35_tokenizer.json'));
+    Engine.RawMode := false;
+    GenOpt := DefaultChatOptions();
+    SetLength(Msgs, 2);
+    Msgs[0] := ChatMessage('system', 'You are a helpful assistant.');
+    Msgs[1] := ChatMessage('user', 'Hello there.');
+    AssertTrue('cfChatML: the system-only render',
+      CountFor(cfChatML, reXHigh) > 0);
+    AssertEquals('cfChatML: the system-only render length',
+      SystemOnlyLen(cfChatML, reXHigh), CountFor(cfChatML, reXHigh));
+    AssertEquals('cfQwen3_5: the system-only render length',
+      SystemOnlyLen(cfQwen3_5, reXHigh), CountFor(cfQwen3_5, reXHigh));
+    AssertTrue('cfQwen3_8 low effort', CountFor(cfQwen3_8, reLow) > 0);
+    AssertEquals('cfQwen3_8 low effort: the system-only render length',
+      SystemOnlyLen(cfQwen3_8, reLow), CountFor(cfQwen3_8, reLow));
+    AssertEquals('cfQwen3_8 xhigh effort: the system-only render length',
+      SystemOnlyLen(cfQwen3_8, reXHigh), CountFor(cfQwen3_8, reXHigh));
+    AssertEquals('cfGemma refuses a system role', 0,
+      CountFor(cfGemma, reXHigh));
+    AssertEquals('cfMistral refuses a system role', 0,
+      CountFor(cfMistral, reXHigh));
+    AssertEquals('cfLlama2 folds the system message into the user turn', 0,
+      CountFor(cfLlama2, reXHigh));
+    Engine.RawMode := true;
+    AssertEquals('raw mode', 0, CountFor(cfChatML, reXHigh));
+    Engine.RawMode := false;
+    Msgs[0] := ChatMessage('user', 'Hi.');
+    Msgs[1] := ChatMessage('assistant', 'Hello.');
+    AssertEquals('no leading system message', 0, CountFor(cfChatML, reXHigh));
+  finally
+    Engine.Free;
+  end;
+end;
+
+// SystemPromptPrefixLen (a system message tokenized alone that is not a
+// prefix of the prompt gets no checkpoint) and SystemCapturePosition (which
+// prefill phase reaches the system boundary). Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestChatSystemCapturePosition;
+var
+  SystemIds, PromptIds: TNeuralIntegerArray;
+begin
+  SetLength(SystemIds, 3);
+  SystemIds[0] := 4; SystemIds[1] := 5; SystemIds[2] := 6;
+  SetLength(PromptIds, 5);
+  PromptIds[0] := 4; PromptIds[1] := 5; PromptIds[2] := 6;
+  PromptIds[3] := 7; PromptIds[4] := 8;
+  AssertEquals('a proper prefix', 3,
+    SystemPromptPrefixLen(SystemIds, PromptIds));
+  PromptIds[2] := 9; // the boundary merged into another id
+  AssertEquals('not a prefix', 0, SystemPromptPrefixLen(SystemIds, PromptIds));
+  PromptIds[2] := 6;
+  SetLength(PromptIds, 3);
+  AssertEquals('nothing follows the system prompt', 0,
+    SystemPromptPrefixLen(SystemIds, PromptIds));
+  SetLength(SystemIds, 0);
+  AssertEquals('no system prompt', 0,
+    SystemPromptPrefixLen(SystemIds, PromptIds));
+
+  // SystemCapturePosition(SystemTokens, Reused, PrefillEnd, WindowLen,
+  //   WindowCount, TailLen, TailCount); 29 fed from 0: windows of 6 to 24,
+  //   tails of 2 to 28, then single steps.
+  AssertEquals('no system prompt', -1,
+    SystemCapturePosition(0, 0, 29, 6, 4, 2, 2));
+  AssertEquals('window phase: last window end at or below', 12,
+    SystemCapturePosition(13, 0, 29, 6, 4, 2, 2));
+  AssertEquals('exactly on a window end', 18,
+    SystemCapturePosition(18, 0, 29, 6, 4, 2, 2));
+  AssertEquals('tail phase: last tail end at or below', 26,
+    SystemCapturePosition(27, 0, 29, 6, 4, 2, 2));
+  AssertEquals('single steps reach it exactly', 29,
+    SystemCapturePosition(29, 0, 29, 6, 4, 2, 2));
+  AssertEquals('past the prefill', -1,
+    SystemCapturePosition(30, 0, 29, 6, 4, 2, 2));
+  AssertEquals('below the first window end: nothing to capture', -1,
+    SystemCapturePosition(5, 0, 29, 6, 4, 2, 2));
+  AssertEquals('resumed at the boundary already', -1,
+    SystemCapturePosition(12, 12, 34, 6, 3, 2, 2));
+  AssertEquals('resumed below it, no window end in between', -1,
+    SystemCapturePosition(13, 12, 34, 6, 3, 2, 2));
+  AssertEquals('no ladder: the boundary itself', 13,
+    SystemCapturePosition(13, 0, 29, 0, 0, 0, 0));
 end;
 
 // Only the resumed checkpoint is refreshed (pure recurrent tiny_mamba, a

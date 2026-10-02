@@ -230,7 +230,7 @@ rather than acted on.
         conversation still resumes at the previous reply end; a diverging prompt
         leaves the old checkpoints in place; LRU order of eviction; resumed
         output equals a full re-prefill.
-  - [ ] T3. Capture points. Capture at the end of the system prompt, the end of
+  - [x] T3. Capture points. Capture at the end of the system prompt, the end of
         the prompt and the end of the reply only; remove the per-window captures
         in FeedWindows (one long prefill must not flush the store). The
         system-prompt token length comes from the chat format (e.g. render the

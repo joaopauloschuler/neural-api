@@ -54,7 +54,7 @@ Coded by Claude (AI).
 // flat time-to-first-token. A recurrent (SSM) state cannot be
 // position-truncated, so a hybrid/recurrent net resumes instead from the
 // deepest cache checkpoint (the recurrent half of the state, captured at
-// known positions during the prefill and at the turn boundaries) whose
+// the end of the system prompt, of the prompt and of the reply) whose
 // token prefix the prompt starts with (on a net with attention layers, only
 // within the prefix shared with the cached ids); --cache-checkpoints N sizes
 // that store, and a full store frees the checkpoint unused for the most turns.
@@ -299,9 +299,11 @@ type
     // bit-identical to a full re-prefill. The store holds up to
     // Opt.CacheCheckpoints of them, sized once in LoadModel so that a capture
     // allocates nothing; Position 0 marks a free slot. CaptureCheckpoint runs
-    // after every prefill window, at the end of the prompt and at the end of
-    // the reply. A checkpoint belongs to the token sequence it was captured
-    // on (CheckpointInfo), so checkpoints of other conversations stay held;
+    // at the end of the system prompt (the last prefill window end at or
+    // below it under a windowed prefill), of the prompt and of the reply,
+    // so one turn adds at most three. A checkpoint belongs to the token
+    // sequence it was captured on (CheckpointInfo), so checkpoints of other
+    // conversations stay held;
     // DeleteTheLongestUnusedCheckpoint frees one only when a capture finds
     // the store full. Under OpenCL every slot lives in OpenCL memory (a
     // capture is a copy between resident buffers), else in host RAM:
@@ -375,11 +377,15 @@ type
     // error (e.g. a system prompt on a format without a system role).
     function ChatReply(const Msgs: TChatMessages;
       const GenOpt: TChatOptions): string;
-    // One reply from raw prompt token ids (the --format raw completion path;
-    // also the primitive ChatReply sits on). GenOpt supplies the sampling
-    // parameters for THIS call (pass Opt for the launch defaults).
+    // One reply from prompt token ids, sampled with GenOpt; a checkpoint is
+    // captured at (or below) the first SystemPromptTokenCount ids when > 0.
     function GenerateFromIds(const PromptIds: TNeuralIntegerArray;
-      const GenOpt: TChatOptions): string;
+      const GenOpt: TChatOptions; SystemPromptTokenCount: integer = 0): string;
+    // Ids of Msgs' leading system message rendered alone, when they are a
+    // proper prefix of PromptIds; else 0 (no system message, or no clean cut).
+    function CountSystemPromptTokens(const Msgs: TChatMessages;
+      const PromptIds: TNeuralIntegerArray;
+      const GenOpt: TChatOptions): integer;
   private
     // Bytes of an unfinished UTF-8 sequence EmitToken is holding until the
     // token that completes it arrives (a codepoint can straddle two tokens).
@@ -418,6 +424,14 @@ function ArgMaxRow(Row: TNNetVolume): integer;
 function TailMatches(const Tokens: TNeuralIntegerArray; Len: integer;
   const Marker: TNeuralIntegerArray): boolean;
 function CommonPrefixLen(const A, B: TNeuralIntegerArray): integer;
+// Length(SystemIds) when SystemIds is a proper prefix of PromptIds, else 0
+// (the system message tokenized alone merged differently, or nothing follows).
+function SystemPromptPrefixLen(const SystemIds,
+  PromptIds: TNeuralIntegerArray): integer;
+// Fed position of the system-prompt checkpoint: SystemTokens when single steps
+// reach it, else the last prefill window end at or below it; -1 when none.
+function SystemCapturePosition(SystemTokens, Reused, PrefillEnd, WindowLen,
+  WindowCount, TailLen, TailCount: integer): integer;
 // Extends a token-prefix hash by TokenId (start: csTokenPrefixHashSeed). Unkeyed,
 // so not collision-resistant against crafted prompts; see TTokenPrefixGuard.
 function FoldTokenIntoPrefixHash(Hash: UInt64; TokenId: integer): UInt64;
@@ -527,8 +541,8 @@ begin
   WriteLn('                        reuse the shared KV-cache prefix from last turn)');
   WriteLn('  --cache-checkpoints N  hybrid/recurrent nets (qwen3_5, mamba, ...): keep');
   WriteLn('                        up to N checkpoints of the recurrent state, taken');
-  WriteLn('                        after every prefill window and at the end of the');
-  WriteLn('                        prompt and of the reply; a full store frees the one');
+  WriteLn('                        at the end of the system prompt, of the prompt');
+  WriteLn('                        and of the reply; a full store frees the one');
   WriteLn('                        unused for the most turns. A prompt resumes from the');
   WriteLn('                        deepest one whose tokens it starts with (with');
   WriteLn('                        attention layers, only within the prefix shared');
@@ -977,6 +991,34 @@ begin
   N := Length(A);
   if Length(B) < N then N := Length(B);
   while (Result < N) and (A[Result] = B[Result]) do Inc(Result);
+end;
+
+function SystemPromptPrefixLen(const SystemIds,
+  PromptIds: TNeuralIntegerArray): integer;
+begin
+  Result := 0;
+  if (Length(SystemIds) > 0) and (Length(SystemIds) < Length(PromptIds)) and
+    (CommonPrefixLen(SystemIds, PromptIds) = Length(SystemIds)) then
+    Result := Length(SystemIds);
+end;
+
+function SystemCapturePosition(SystemTokens, Reused, PrefillEnd, WindowLen,
+  WindowCount, TailLen, TailCount: integer): integer;
+var
+  WindowsEnd, TailEnd: integer;
+begin
+  Result := -1;
+  if (SystemTokens <= Reused) or (SystemTokens > PrefillEnd) then exit;
+  // The prefill feeds width-N windows, then width-T tail windows, then
+  // single steps, each phase starting where the previous one stopped.
+  WindowsEnd := Reused + WindowCount * WindowLen;
+  TailEnd := WindowsEnd + TailCount * TailLen;
+  if SystemTokens >= TailEnd then Result := SystemTokens
+  else if SystemTokens >= WindowsEnd then
+    Result := WindowsEnd + ((SystemTokens - WindowsEnd) div TailLen) * TailLen
+  else
+    Result := Reused + ((SystemTokens - Reused) div WindowLen) * WindowLen;
+  if Result <= Reused then Result := -1;
 end;
 
 // SplitMix64 is a bijection, so two prefixes that first differ at one token
@@ -2007,7 +2049,7 @@ begin
     SetLength(CheckpointInfo, Opt.CacheCheckpoints);
     SetLength(CheckpointOrder, Opt.CacheCheckpoints);
     // A twin built in its own OpenCL context cannot read a slot owned by
-    // NN's context, so the window captures are skipped on that fallback.
+    // NN's context, so a capture at a window end is skipped on that fallback.
     CheckpointOnTwins := (not OpenCLOn) or WindowBorrowsWeights;
   end;
   Line := Format('Model: %s, %d params, vocab %d, context %d, chat format ',
@@ -2041,8 +2083,8 @@ begin
           [Opt.CacheCheckpoints * Checkpoints[0].OpenCLBytes() / (1024 * 1024)])
       else Line := 'in host RAM';
       Notice(Format('[cache checkpoints ON - up to %d checkpoints of the' +
-        ' recurrent state (%.1f MB each, %.1f MB in all, %s), captured after' +
-        ' every prefill window and at the end of the prompt and of the reply;' +
+        ' recurrent state (%.1f MB each, %.1f MB in all, %s), captured at the' +
+        ' end of the system prompt, of the prompt and of the reply;' +
         ' a full store frees the checkpoint unused for the most turns; a' +
         ' prompt resumes from the deepest checkpoint whose tokens it starts' +
         ' with (on a net with attention layers, only within the prefix shared' +
@@ -2051,8 +2093,8 @@ begin
          Opt.CacheCheckpoints * Checkpoints[0].Bytes() / (1024 * 1024), Line]));
       if not CheckpointOnTwins then
         Notice('[--cache-checkpoints: the prefill twins run in their own' +
-          ' OpenCL context, so only the end-of-prompt and end-of-reply' +
-          ' checkpoints are captured]');
+          ' OpenCL context, so a system-prompt checkpoint below the last' +
+          ' prefill window end is not captured]');
     end;
   end
   else
@@ -2114,11 +2156,34 @@ function TChatEngine.ChatReply(const Msgs: TChatMessages;
   const GenOpt: TChatOptions): string;
 var
   PromptIds: TNeuralIntegerArray;
+  SystemTokens: integer;
 begin
   PromptIds := EncodeChat(Tokenizer, ChatFormat, Msgs,
     ChatTemplateOptions({AddGenerationPrompt=}true,
       {ContinueFinalMessage=}false, GenOpt.ReasoningEffort));
-  Result := GenerateFromIds(PromptIds, GenOpt);
+  SystemTokens := 0;
+  if StateReuseOK and (Length(Checkpoints) > 0) and not GenOpt.NoCacheReuse
+    then SystemTokens := CountSystemPromptTokens(Msgs, PromptIds, GenOpt);
+  Result := GenerateFromIds(PromptIds, GenOpt, SystemTokens);
+end;
+
+function TChatEngine.CountSystemPromptTokens(const Msgs: TChatMessages;
+  const PromptIds: TNeuralIntegerArray; const GenOpt: TChatOptions): integer;
+var
+  SystemIds: TNeuralIntegerArray;
+begin
+  Result := 0;
+  if RawMode or (Length(Msgs) = 0) or (Msgs[0].Role <> 'system') then exit;
+  try
+    SystemIds := EncodeChat(Tokenizer, ChatFormat, Msgs[0..0],
+      ChatTemplateOptions({AddGenerationPrompt=}false,
+        {ContinueFinalMessage=}false, GenOpt.ReasoningEffort));
+  except
+    // A format that folds the system message into the first user turn
+    // cannot render it alone: there is no system boundary to capture at.
+    on ENeuralChatError do exit;
+  end;
+  Result := SystemPromptPrefixLen(SystemIds, PromptIds);
 end;
 
 // ---------------------------------------------------------------------------
@@ -2148,7 +2213,7 @@ end;
 //     reset.
 // NoCacheReuse disables both: full reset, whole prompt re-prefilled.
 function TChatEngine.GenerateFromIds(const PromptIds: TNeuralIntegerArray;
-  const GenOpt: TChatOptions): string;
+  const GenOpt: TChatOptions; SystemPromptTokenCount: integer): string;
 var
   Chain: TNNetLogitsProcessorChain;
   Penalty: TNNetTokenHistoryPenalty;
@@ -2159,6 +2224,9 @@ var
   ResumeSlot: integer;         // its slot, -1 when none
   CaptureHash: UInt64;         // TokenPrefixHash of Tokens[0..CaptureHashPos-1]
   CaptureHashPos: integer;
+  // The fed position of the system-prompt checkpoint: the last window end at
+  // or below the system boundary, or the boundary itself; -1 when none.
+  SystemCapturePos: integer;
   GreedyFast: boolean;
   Tokens: TNeuralIntegerArray;
   Generated: TNeuralIntegerArray;
@@ -2239,7 +2307,8 @@ var
       WSession.StepForwardToHidden(WIn, Cnt);
       Inc(Cnt, WLen);
       Inc(Fed);
-      if StateReuse and CheckpointOnTwins then CaptureAt(WSession, Cnt);
+      if (Cnt = SystemCapturePos) and CheckpointOnTwins then
+        CaptureAt(WSession, Cnt);
     end;
   end;
 begin
@@ -2283,6 +2352,7 @@ begin
   ResumeSlot := -1;
   CaptureHash := csTokenPrefixHashSeed;
   CaptureHashPos := 0;
+  SystemCapturePos := -1;
   // Distribution pipeline (TGenerationConfig order: penalty -> temperature
   // -> sampler).
   Chain := TNNetLogitsProcessorChain.Create();
@@ -2413,6 +2483,9 @@ begin
     if WindowCount > 0 then FirstSession := WindowSession
     else if TailCount > 0 then FirstSession := TailSession
     else FirstSession := Session;
+    if StateReuse then
+      SystemCapturePos := SystemCapturePosition(SystemPromptTokenCount,
+        Reused, LenM2 + 1, WindowLen, WindowCount, TailLen, TailCount);
     ActiveSession := FirstSession;
     if Reused = 0 then ActiveSession.Reset() // SSM state cannot be truncated
     else
@@ -2437,11 +2510,13 @@ begin
       FeedWindows(TailSession, TailIn, TailCount, LastPrefillTailWindows);
     end;
     SwitchTo(Session);
+    if Cnt = SystemCapturePos then CaptureAt(Session, Cnt);
     while Cnt <= LenM2 do
     begin
       InV.FData[0] := Tokens[Cnt];
       Session.StepForwardToHidden(InV, Cnt);
       Inc(Cnt);
+      if Cnt = SystemCapturePos then CaptureAt(Session, Cnt);
     end;
     TPrefillEnd := GetTickCount64();
     // End-of-prompt checkpoint for the next call's resume: Session now holds

@@ -111,8 +111,9 @@ conversation. Correct independent of tokenizer round-tripping (the diff
 always finds the true shared prefix; /system and /reset just diverge earlier).
 A recurrent (SSM) state cannot be position-truncated, so a hybrid/recurrent
 net resumes instead from the deepest cache checkpoint (the recurrent state
-captured after every prefill window and at the turn boundaries;
---cache-checkpoints N sizes the store) at or below that prefix.
+captured at the end of the system prompt, of the prompt and of the reply;
+--cache-checkpoints N sizes the store) whose ids the prompt starts with
+(with attention layers, only within the prefix shared with the cache).
 --no-cache-reuse turns both routes off (full re-prefill).
 
 Copyright (C) 2026 Joao Paulo Schwarz Schuler

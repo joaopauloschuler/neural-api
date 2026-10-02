@@ -340,7 +340,10 @@ the session. It holds NO attention K/V. The engine keeps up to N of them in
 a **checkpoint store** allocated once at `LoadModel` (rule 17), N given by
 `--cache-checkpoints N`.
 
-**Capture points.** After every window the width-N twin feeds, after every
+**Capture points.** Superseded on 2026-10-02: captures now happen only at
+the end of the system prompt (the last window end at or below it under a
+windowed prefill), of the prompt and of the reply. The original design:
+after every window the width-N twin feeds, after every
 tail-twin window, at the end of the prompt (where `PromptSnap` is taken
 today, `:2068`) and at the end of the reply (where `TurnSnap` is taken,
 `:2243`). Under `--gpu` a capture is one `clEnqueueCopyBuffer` per layer from

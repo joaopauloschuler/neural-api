@@ -101,7 +101,7 @@ draws uniformly. `--greedy` hard-overrides everything.
 | `--stats` | per-turn timing to **stderr**. `input:` prompt tokens, `(reused K, prefix P of C cached)` — K tokens resumed from the KV cache or a cache checkpoint, P the length of the token-id prefix the prompt shares with the C ids cached from the previous turn (a small K next to a large P says the divergence fell below every checkpoint; on a pure recurrent net K can exceed P, because a checkpoint of an earlier conversation resumes past the ids shared with the cache), TTFT (prefill + first token) and `prefill X tok/s`; `output:` reply tokens, their time from the end of prefill, and the steady-state decode tok/s; a per-decode-step phase split; and `total input` / `total output` lines accumulated for as long as the process runs (`cached` = prompt tokens the reuse skipped) | off |
 | `--profile` | per-layer-class forward timing to **stderr** after each turn, one `[profile] prefill:` report (one table per net that ran: the windows on the `--prefill-window` twin, the windows on the tail twin, the single steps on the main net, each under a header line with its window count) and one for the decode steps, each followed by a `[sched]` line with the layer-graph scheduler stats (graph width, parallel vs serial passes, peak in-flight) | off |
 | `--no-cache-reuse` | re-prefill the whole prompt every turn instead of reusing the shared KV-cache prefix (A/B + debugging) | reuse on |
-| `--cache-checkpoints N` | hybrid/recurrent nets only (`qwen3_5`, `qwen3_8`, mamba, ...): keep up to N **cache checkpoints** of the recurrent state (see *cache checkpoints* below), captured after every prefill window and at the end of the prompt and of the reply; a full store frees the checkpoint unused for the most turns; a prompt resumes from the deepest checkpoint whose tokens it starts with and prefills only the tail. 0 turns the route off (full re-prefill every turn); 1 and values above 2048 stop the program with an error before loading. Inert with a notice on pure-attention nets, whose KV cache is truncated to the prefix instead | 16 with `--gpu`, 8 on the CPU |
+| `--cache-checkpoints N` | hybrid/recurrent nets only (`qwen3_5`, `qwen3_8`, mamba, ...): keep up to N **cache checkpoints** of the recurrent state (see *cache checkpoints* below), captured at the end of the system prompt, of the prompt and of the reply; a full store frees the checkpoint unused for the most turns; a prompt resumes from the deepest checkpoint whose tokens it starts with and prefills only the tail. 0 turns the route off (full re-prefill every turn); 1 and values above 2048 stop the program with an error before loading. Inert with a notice on pure-attention nets, whose KV cache is truncated to the prefix instead | 16 with `--gpu`, 8 on the CPU |
 | `--prefill-window N` | prefill the prompt N tokens per forward on a width-N twin of the net (`TChatEngine.WindowNN`); the state crosses to the width-1 net with a session snapshot before the tail and the decode loop. The tail that does not fill a window is fed one token at a time — nothing is padded. The twin borrows the loaded net's weights (`BuildFromPretrained` with `pWeightOwner`: the int8/int4 tables in RAM and the resident codes on the device are shared, the checkpoint is read once, and the twin allocates no weight storage — it costs its activations). Model families outside the Llama builder (`PretrainedModelTypeCanBorrowWeights`: llama, mistral, qwen*, gemma*, phi3, olmo*, mixtral, glm4, granite*, minicpm, bitnet) fall back to a full second build — checkpoint read twice, weights held twice — and the startup notice says so. N must be 0 or at least 2, and below the context length (`--ctx`), otherwise the program stops with an error before loading | 0 (one token per forward) |
 | `--prefill-tail-window T` | width of a second, width-T twin (`TChatEngine.TailNN`) that feeds what the width-N windows leave over T tokens per forward, so at most T-1 tokens go one at a time: the prompt runs down a ladder of widths N, then T, then 1. On a 7880-token prompt with N=256 the 199-token leftover cost 199 single steps, about a fifth of the time-to-first-token; with T=16 it costs 12 tail windows and 7 single steps. The tail twin borrows the weights like the width-N twin (it costs its activations) and is not built on the full-second-build fallback. T must be below N and needs `--prefill-window` (otherwise the program stops with an error before loading); 0 picks 16 when that is below N, else a notice and no tail twin; 1 builds none | 0 (auto) |
 | `--serial` | classic in-order serial layer loop, fully single-threaded, instead of the layer-graph parallel forward that also threads large conv/linear layers internally (see below) | parallel on |
@@ -238,9 +238,11 @@ per-position history. `TChatEngine` therefore keeps a store of up to N
 **cache checkpoints** (`--cache-checkpoints N`; `TNNetDecoderStateCheckpoint`:
 one copy of every recurrent layer's state and step count, no K/V), each
 tagged with the number of tokens fed when it was captured. Captures happen
-after every window the `--prefill-window` twins feed, at the end of the
-prompt and at the end of the reply; the store is sized once at load and a
-capture allocates nothing. Each checkpoint also records which token sequence
+at the end of the system prompt, at the end of the prompt and at the end of
+the reply, so one turn adds at most three; under `--prefill-window` the
+system-prompt capture lands on the last window end at or below the system
+prompt's end. The store is sized once at load and a capture allocates
+nothing. Each checkpoint also records which token sequence
 it belongs to: a 64-bit hash of the ids before its position plus their last
 64 ids. One pass over the next prompt finds its common prefix with the cached
 ids and every checkpoint whose ids the prompt starts with; the deepest one
@@ -250,9 +252,9 @@ truncated to its position, its recurrent state is put back
 (`RestoreStateFrom`) and only the tokens after it are prefilled —
 bit-identical to a fresh prefill. So a client that echoes the reply resumes
 at the end of the reply, one that re-renders the assistant turn resumes at
-the end of the prompt, and an agent that edits or appends to a message deep
-inside the history resumes at the last checkpoint before the edit instead of
-re-prefilling everything.
+the end of the prompt, and a new conversation with the same system prompt
+resumes at the end of the system prompt. An edit deep inside the history
+resumes at the deepest turn-boundary checkpoint before the edit.
 
 Retention: a prompt that diverges never frees a checkpoint, so the
 checkpoints of another conversation stay in the store. A checkpoint counts as
