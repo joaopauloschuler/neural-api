@@ -27050,9 +27050,9 @@ end;
 // The pico decoder with OpenCL armed vs the CPU on the 4x4 latent: tiled
 // 32/16 (four tile shapes, each net armed in the one context of EnableOpenCL),
 // then whole, serial (parallel + OpenCL is slow on PoCL; the pipeline test
-// covers it). Only the FP32 summation order differs (measured 3.6e-6, 3.9e-6);
-// tolerance 5e-5 = TestQwenImage21VaeDecoderParity's float32 budget. A 3x3
-// conv (all padded) with a resident source moves nothing host <-> OpenCL.
+// covers it). Only the FP32 summation order differs (measured 3.9e-6, 2.1e-6);
+// tolerance 5e-5 = TestQwenImage21VaeDecoderParity's float32 budget. Every 3x3
+// conv binds a resident source; only the attention leaves OpenCL memory.
 procedure TTestNeuralPretrained.TestQwenImage21VaeDecoderOpenCL;
 {$IFDEF OpenCL}
 const
@@ -27068,6 +27068,7 @@ var
   BoundSpatialConvCount, HostSourceSpatialConvCount: integer;
   Layer: TNNetLayer;
   MaxDiff: double;
+  Transfers, NoTransfers: TOpenCLTransferCounts;
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
@@ -27141,7 +27142,29 @@ begin
     WriteLn('  Qwen-Image-2.1 VAE 3x3 convs: ', BoundSpatialConvCount,
       ' bind a resident source, ', HostSourceSpatialConvCount,
       ' read a host source');
-    AssertTrue('3x3 convs bind a resident source', BoundSpatialConvCount > 0);
+    FillChar(Transfers, SizeOf(Transfers), 0);
+    FillChar(NoTransfers, SizeOf(NoTransfers), 0);
+    for LayerPos := 0 to Decoder.Net.GetLastLayerIdx() do
+    begin
+      Layer := Decoder.Net.Layers[LayerPos];
+      AddOpenCLTransferDelta(Transfers, Layer.ProfiledTransfers, NoTransfers);
+      if (Layer.ProfiledTransfers.UploadCount > 0) or
+        (Layer.ProfiledTransfers.DownloadCount > 0) then
+        WriteLn('    layer ', LayerPos, ' ', Layer.ClassName, ': up ',
+          Layer.ProfiledTransfers.UploadCount, ' (',
+          Layer.ProfiledTransfers.UploadBytes, ' B), down ',
+          Layer.ProfiledTransfers.DownloadCount, ' (',
+          Layer.ProfiledTransfers.DownloadBytes, ' B)');
+    end;
+    WriteLn('  Qwen-Image-2.1 VAE decode transfers: up ', Transfers.UploadCount,
+      ' (', Transfers.UploadBytes, ' B), down ', Transfers.DownloadCount, ' (',
+      Transfers.DownloadBytes, ' B)');
+    AssertEquals('3x3 convs that read a host source', 0,
+      HostSourceSpatialConvCount);
+    // The mid-block attention runs on the host: it downloads its Q|K|V input
+    // and the projection after it uploads; the latent is the other upload.
+    AssertEquals('uploads per decode', 2, Transfers.UploadCount);
+    AssertEquals('downloads per decode', 1, Transfers.DownloadCount);
   finally
     Image.Free;
     WholeCPU.Free;

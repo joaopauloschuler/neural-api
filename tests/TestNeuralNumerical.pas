@@ -486,6 +486,9 @@ type
     // Device-side channel gather (cai_split_channels) forward parity for
     // TNNetSplitChannels: contiguous slice, single channel, SplitChannelEvery.
     procedure TestSplitChannelsOpenCLParity;
+    // Reshape (alias), DeMaxPool, DeAvgPool, Upsample, PixelShuffle and
+    // GatherChannels follow a resident source; host-path cases stay on the CPU.
+    procedure TestRelayoutResidentOpenCLParity;
     // Device-side depth-axis scatter (cai_deep_concat) forward parity for
     // TNNetDeepConcat: 2 and 3 equal sources, unequal depths, and a Replicate
     // broadcast (one launch instead of one per replica).
@@ -67443,6 +67446,156 @@ begin
         '): max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-4',
         MaxDiff < 1e-4);
     finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// Input -> forced 3x3 conv -> [host identity] -> layer -> forced pointwise
+// conv; 1e-4 covers the conv's FP32 summation order (the layers only copy).
+procedure TTestNeuralNumerical.TestRelayoutResidentOpenCLParity;
+{$IFDEF OpenCL}
+const
+  csSentinel = 999;
+  CaseCount = 15;
+var
+  NN: TNNet;
+  Input, OutCPU, LayerCPU: TNNetVolume;
+  SourceConv, LayerSource, LayerUnderTest, Consumer: TNNetLayer;
+  PlatformId: cl_platform_id;
+  DeviceId: cl_device_id;
+  i, CaseCnt, SourceDepth, SourceKept, LayerKept: integer;
+  HostSource, ExpectOpenCL: boolean;
+  Diff, MaxDiff, LayerMaxDiff: TNeuralFloat;
+  CaseName: string;
+  Transfers: TOpenCLTransferCounts;
+begin
+  if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+  begin
+    AssertTrue('no OpenCL device: SKIP', true);
+    Exit;
+  end;
+  for CaseCnt := 0 to CaseCount - 1 do
+  begin
+    // Cases 12-14 have a resident source; random spacing (12) and a
+    // size-changing reshape (14) must stay on the host, DeAvgPool (13) not.
+    HostSource := Odd(CaseCnt) and (CaseCnt < 12);
+    ExpectOpenCL := (not HostSource) and (CaseCnt <> 12) and (CaseCnt <> 14);
+    if CaseCnt div 2 = 4 then SourceDepth := 18 else SourceDepth := 8;
+    RandSeed := 424242;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(5, 4, 3);
+    OutCPU := TNNetVolume.Create();
+    LayerCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(5, 4, 3, 1));
+      SourceConv := NN.AddLayer(TNNetConvolutionLinear.Create(SourceDepth, 3,
+        1, 1));
+      if HostSource
+        then LayerSource := NN.AddLayer(TNNetIdentity.Create())
+        else LayerSource := SourceConv;
+      if CaseCnt = 12 then
+        LayerUnderTest := TNNetDeMaxPool.Create(2, {pSpacing=}1)
+      else if CaseCnt = 13 then
+        LayerUnderTest := TNNetDeAvgPool.Create(2)
+      else if CaseCnt = 14 then
+        LayerUnderTest := TNNetReshape.Create(10, 1, SourceDepth)
+      else
+      case CaseCnt div 2 of
+        0: LayerUnderTest := TNNetReshape.Create(20, 1, SourceDepth);
+        1: LayerUnderTest := TNNetDeMaxPool.Create(2);
+        2: LayerUnderTest := TNNetUpsample.Create();
+        3: LayerUnderTest := TNNetPixelShuffle.Create(2);
+        4: LayerUnderTest := TNNetPixelShuffle.Create(3);
+      else
+        LayerUnderTest := TNNetGatherChannels.Create([3, 0, 0, 7, 5, 6]);
+      end;
+      NN.AddLayerAfter(LayerUnderTest, LayerSource);
+      Consumer := NN.AddLayer(TNNetPointwiseConvLinear.Create(3));
+      NN.SetTrainable(False, False);
+      CaseName := ' (case ' + IntToStr(CaseCnt) + ' ' +
+        LayerUnderTest.ClassName + ', host source=' +
+        BoolToStr(HostSource, true) + ')';
+      for i := 0 to Input.Size - 1 do Input.Raw[i] := Sin(i * 0.37) - 0.2;
+
+      // The random-spacing DeMaxPool draws its positions per forward.
+      RandSeed := 7;
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+      LayerCPU.Copy(LayerUnderTest.Output);
+
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      SourceConv.ForceOpenCL(True);
+      Consumer.ForceOpenCL(True);
+      NN.Compute(Input);
+      NN.LayerProfiling := true;
+      NN.ClearTime();
+      SourceConv.Output.Fill(csSentinel);
+      LayerUnderTest.Output.Fill(csSentinel);
+      RandSeed := 7;
+      NN.Compute(Input);
+      Transfers := LayerUnderTest.ProfiledTransfers;
+      SourceKept := 0;
+      for i := 0 to SourceConv.Output.Size - 1 do
+        if SourceConv.Output.Raw[i] = csSentinel then Inc(SourceKept);
+      LayerKept := 0;
+      for i := 0 to LayerUnderTest.Output.Size - 1 do
+        if LayerUnderTest.Output.Raw[i] = csSentinel then Inc(LayerKept);
+      MaxDiff := 0;
+      AssertEquals('output size match' + CaseName, OutCPU.Size,
+        NN.GetLastLayer.Output.Size);
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
+        if Diff > MaxDiff then MaxDiff := Diff;
+      end;
+      AssertTrue('ForceOutputOnRAM recovers the layer output' + CaseName,
+        LayerUnderTest.ForceOutputOnRAM());
+      LayerMaxDiff := 0;
+      for i := 0 to LayerCPU.Size - 1 do
+      begin
+        Diff := Abs(LayerCPU.Raw[i] - LayerUnderTest.Output.Raw[i]);
+        if Diff > LayerMaxDiff then LayerMaxDiff := Diff;
+      end;
+      WriteLn('  Relayout resident', CaseName, ': max|diff| net=', MaxDiff:0:9,
+        ' layer=', LayerMaxDiff:0:9, ' gpu forwards=',
+        LayerUnderTest.ForwardGPUCnt, ' uploads=', Transfers.UploadCount,
+        ' downloads=', Transfers.DownloadCount, ' source kept=', SourceKept,
+        '/', SourceConv.Output.Size, ' layer kept=', LayerKept, '/',
+        LayerUnderTest.Output.Size);
+      AssertTrue('net vs CPU parity' + CaseName + ': max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-4', MaxDiff < 1e-4);
+      AssertTrue('layer vs CPU parity' + CaseName + ': max |diff| = ' +
+        FloatToStr(LayerMaxDiff) + ' must be < 1e-4', LayerMaxDiff < 1e-4);
+      if not ExpectOpenCL then
+      begin
+        AssertEquals('the layer stays on the CPU' + CaseName, 0,
+          LayerUnderTest.ForwardGPUCnt);
+        AssertEquals('the CPU path writes the host output' + CaseName, 0,
+          LayerKept);
+      end
+      else
+      begin
+        AssertTrue('the layer must run on OpenCL' + CaseName,
+          LayerUnderTest.ForwardGPUCnt > 0);
+        AssertEquals('the layer uploads nothing' + CaseName, 0,
+          Transfers.UploadCount);
+        AssertEquals('the layer downloads nothing' + CaseName, 0,
+          Transfers.DownloadCount);
+        AssertEquals('the source output must NOT be downloaded' + CaseName,
+          SourceConv.Output.Size, SourceKept);
+        AssertEquals('the layer output must NOT be downloaded' + CaseName,
+          LayerUnderTest.Output.Size, LayerKept);
+      end;
+    finally
+      LayerCPU.Free;
       OutCPU.Free;
       Input.Free;
       NN.Free;

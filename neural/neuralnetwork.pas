@@ -5088,27 +5088,22 @@ type
       Dst: TNNetVolume; NumOut, Depth: integer); override;
   end;
 
-  /// OpenCL forward helper for TNNetPixelShuffle (depth-to-space). The shuffle is
-  // a pure gather with NO arithmetic: each output element is a verbatim copy of
-  // one source element. The CALLING layer computes, per output element, the
-  // source linear offset into the raw source feature map ON THE CPU (byte-
-  // identical to its scalar forward) and hands it here; the device just performs
-  // the copy. Binds the cai_pixel_shuffle entry point on the shared dot-product
-  // program's device. One work-item per output element. Forward-only.
-  // Coded by Claude (AI).
-  TNNetPixelShuffleCL = class(TNNetKernelCL)
+  /// OpenCL forward of the nearest-neighbour upsample and depth-to-space layers
+  // (cai_upsample_gather); the layer passes its channel strides.
+  TNNetUpsampleGatherCL = class(TNNetKernelCL)
   private
-    // Persistent device buffers (grow-only), reused every forward.
-    FBufSrc, FBufIdx, FBufDst: cl_mem;
-    FCapSrc, FCapIdx, FCapDst: csize_t;
+    // Persistent buffers (grow-only): the uploaded host source and the result.
+    FBufSrc, FBufDst: cl_mem;
+    FCapSrc, FCapDst: csize_t;
   public
     constructor Create(NN: TNNet);
     destructor Destroy(); override;
-    // SrcIdx is a NumOut-long host array of source linear element offsets already
-    // filled by the caller; Src is the source feature map; Dst receives the
-    // NumOut gathered values. NumOut = output element count (Size).
-    procedure Gather(Src: TNNetVolume; SrcIdx: TNNetVolume;
-      Dst: TNNetVolume; NumOut: integer);
+    function ResultBuffer(): cl_mem;
+    function OutputKernel(): TNeuralKernel;
+    // Gathers Consumer.PrevLayer's output into Consumer.Output's shape: binds a
+    // resident source and keeps the result in OpenCL memory unless trainable.
+    procedure GatherFromPrevLayer(Consumer: TNNetLayer;
+      Factor, ChannelStride, XStride, YStride: integer);
   end;
 
   /// OpenCL forward helper for TNNetBicubicUpsample, the 16-corner sibling of
@@ -12552,41 +12547,6 @@ type
       procedure Backpropagate(); override;
   end;
 
-  /// Multi-index gather layer. Selects an ORDERED SUBSET of depth channels
-  // (the indices given to the constructor) and produces an output of shape
-  // (SizeX, SizeY, N) where N = number of selected indices:
-  //   Output[X, Y, k] := Input[X, Y, Channels[k]].
-  // This is the natural multi-index generalisation of the single-channel
-  // TNNetGather (which is the degenerate N=1 case); it doubles as a learnable-
-  // free channel reorder/prune. Backward scatters each output channel's error
-  // back to its SOURCE input channel:
-  //   PrevLayer.OutputError[X, Y, Channels[k]] += OutputError[X, Y, k].
-  // DESIGN: repeated indices ARE allowed (e.g. duplicating a channel). When an
-  // input channel appears more than once in Channels, the backward pass uses
-  // Add (not assignment), so the gradients from every output copy ACCUMULATE
-  // onto that single source channel - the mathematically correct adjoint of a
-  // forward duplication. Every selected index must satisfy
-  // 0 <= Channel < Input.Depth and the index list must be non-empty; otherwise
-  // the layer raises an error in SetPrevLayer. The index list is stored in its
-  // own structure-string segment (like TNNetSplitChannels), not in FStruct, so
-  // there is no fixed cap on N. The parameterless constructor selects a single
-  // channel 0 (so the serialization registry can always round-trip the layer).
-  // Coded by Claude (AI).
-  TNNetGatherChannels = class(TNNetIdentity)
-    private
-      FChannels: TNeuralIntegerArray;
-      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
-    public
-      constructor Create(); overload; override;
-      constructor Create(pChannels: array of integer); reintroduce; overload;
-      destructor Destroy(); override;
-
-      procedure Compute(); override;
-      procedure Backpropagate(); override;
-
-      function SaveStructureToString(): string; override;
-  end;
-
   /// Token-axis gather/reorder layer. The X-axis analogue of
   // TNNetGatherChannels: selects an ORDERED SUBSET of positions along the SizeX
   // (token/sequence) axis of a (SizeX, 1, Depth) sequence, producing an output
@@ -12920,8 +12880,20 @@ type
   TNNetReshape = class(TNNetLayer)
     private
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+      {$IFDEF OpenCL}
+      // The alias's host copy comes from the source's host copy.
+      procedure MoveOutputToRAM(); override;
+      {$ENDIF}
     public
       constructor Create(pSizeX, pSizeY, pDepth: integer); reintroduce; overload;
+      {$IFDEF OpenCL}
+      procedure DisableOpenCL(); override;
+      // Inference with a resident source of the same Size: the output is the
+      // source's OpenCL buffer (no copy) until the source's next forward.
+      function WillOpenCL(): boolean; override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+      {$ENDIF}
 
       procedure Compute(); override;
       procedure Backpropagate(); override;
@@ -13276,6 +13248,35 @@ type
   public
     constructor Create(GetChannelEvery, ChannelShift: integer); overload;
     constructor Create(pChannels: array of integer); overload;
+  end;
+
+  /// Multi-index gather layer. Selects an ORDERED SUBSET of depth channels
+  // (the indices given to the constructor) and produces an output of shape
+  // (SizeX, SizeY, N) where N = number of selected indices:
+  //   Output[X, Y, k] := Input[X, Y, Channels[k]].
+  // This is the natural multi-index generalisation of the single-channel
+  // TNNetGather (which is the degenerate N=1 case); it doubles as a learnable-
+  // free channel reorder/prune. Backward scatters each output channel's error
+  // back to its SOURCE input channel:
+  //   PrevLayer.OutputError[X, Y, Channels[k]] += OutputError[X, Y, k].
+  // DESIGN: repeated indices ARE allowed (e.g. duplicating a channel). When an
+  // input channel appears more than once in Channels, the backward pass uses
+  // Add (not assignment), so the gradients from every output copy ACCUMULATE
+  // onto that single source channel - the mathematically correct adjoint of a
+  // forward duplication. Every selected index must satisfy
+  // 0 <= Channel < Input.Depth and the index list must be non-empty; otherwise
+  // the layer raises an error in SetPrevLayer. The index list is stored in its
+  // own structure-string segment, not in FStruct, so there is no fixed cap on
+  // N. The parameterless constructor selects a single channel 0 (so the
+  // serialization registry can always round-trip the layer). Forward, backward,
+  // serialization and the OpenCL gather come from TNNetSplitChannels; this
+  // class adds the index validation. Coded by Claude (AI).
+  TNNetGatherChannels = class(TNNetSplitChannels)
+    private
+      procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
+    public
+      constructor Create(); overload; override;
+      constructor Create(pChannels: array of integer); reintroduce; overload;
   end;
 
   /// Fully connected layer with hyperbolic tangent.
@@ -17503,10 +17504,30 @@ type
   TNNetDeMaxPool = class(TNNetMaxPool)
     private
       FSpacing: integer;
+      // cai_upsample_gather source-channel strides (see neural.cl), set by the
+      // constructor: nearest upsample here, depth-to-space in TNNetUpsample.
+      FGatherChannelStride, FGatherXStride, FGatherYStride: integer;
+      {$IFDEF OpenCL}
+      FUpsampleCL: TNNetUpsampleGatherCL;
+      {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
       function CalcOutputSize(pInputSize: integer) : integer; override;
+    protected
+      // True when the OpenCL gather ran. False means the caller's CPU path
+      // follows, with the source in RAM and both residency flags reset.
+      function ComputeUpsampleOnOpenCL(StartTime: double): boolean;
     public
       constructor Create(pPoolSize: integer; pSpacing: integer = 0); overload;
+      {$IFDEF OpenCL}
+      destructor Destroy(); override;
+      procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
+      procedure DisableOpenCL(); override;
+      // A resident source in inference (or ForceOpenCL); random spacing stays
+      // on the host.
+      function WillOpenCL(): boolean; override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
+      {$ENDIF}
       procedure Compute(); override;
       procedure Backpropagate(); override;
       procedure ComputePreviousLayerError(); override;
@@ -17532,10 +17553,9 @@ type
   TNNetPixelShuffle = class(TNNetLayer)
     private
       {$IFDEF OpenCL}
-      FShuffleCL: TNNetPixelShuffleCL;
+      FUpsampleCL: TNNetUpsampleGatherCL;
       FScatterCL: TNNetPixelShuffleScatterCL;
-      FIdxBuf, FDstFlat, FBackErrFlat, FBackOutFlat: TNNetVolume;
-      procedure ComputeOpenCL();
+      FIdxBuf, FBackErrFlat, FBackOutFlat: TNNetVolume;
       procedure BackpropagateOpenCL();
       {$ENDIF}
       procedure SetPrevLayer(pPrevLayer: TNNetLayer); override;
@@ -17547,9 +17567,13 @@ type
       procedure Compute(); override;
       procedure Backpropagate(); override;
       {$IFDEF OpenCL}
+      // Forward only: a resident source in inference, or ForceOpenCL. The
+      // backward scatter runs under ForceOpenCL alone.
       function WillOpenCL(): boolean; override;
       procedure EnableOpenCL(DotProductKernel: TNeuralKernel); override;
       procedure DisableOpenCL(); override;
+      function OpenCLOutputBuffer(): cl_mem; override;
+      function OpenCLOutputKernel(): TNeuralKernel; override;
       {$ENDIF}
   end;
 
@@ -38121,40 +38145,83 @@ begin
   // Buffers are persistent (FBuf*CL), reused next forward - not released here.
 end;
 
-{ TNNetPixelShuffleCL }
+{ TNNetUpsampleGatherCL }
 
-constructor TNNetPixelShuffleCL.Create(NN: TNNet);
+constructor TNNetUpsampleGatherCL.Create(NN: TNNet);
 begin
-  inherited Create(NN, 'cai_pixel_shuffle');
+  inherited Create(NN, 'cai_upsample_gather');
 end;
 
-destructor TNNetPixelShuffleCL.Destroy();
+destructor TNNetUpsampleGatherCL.Destroy();
 begin
   if Assigned(FBufSrc) then clReleaseMemObject(FBufSrc);
-  if Assigned(FBufIdx) then clReleaseMemObject(FBufIdx);
   if Assigned(FBufDst) then clReleaseMemObject(FBufDst);
   inherited Destroy();
 end;
 
-procedure TNNetPixelShuffleCL.Gather(Src: TNNetVolume; SrcIdx: TNNetVolume;
-  Dst: TNNetVolume; NumOut: integer);
-var
-  bufSrc, bufIdx, bufDst: cl_mem;
-  k: cl_kernel;
+function TNNetUpsampleGatherCL.ResultBuffer(): cl_mem;
 begin
+  Result := FBufDst;
+end;
+
+function TNNetUpsampleGatherCL.OutputKernel(): TNeuralKernel;
+begin
+  Result := FKernel;
+end;
+
+procedure TNNetUpsampleGatherCL.GatherFromPrevLayer(Consumer: TNNetLayer;
+  Factor, ChannelStride, XStride, YStride: integer);
+var
+  Prev: TNNetLayer;
+  Y: TNNetVolume;
+  bufSrc, bufDst: cl_mem;
+  k: cl_kernel;
+  NumOut, OutSizeX, OutDepth, InSizeX, InDepth: longint;
+  KeepResult: boolean;
+begin
+  Prev := Consumer.FPrevLayer;
+  Y := Consumer.FOutput;
+  KeepResult := not Consumer.FIsTrainable;
+  if KeepResult and Prev.OutputBindableOnOpenCL() then
+  begin
+    bufSrc := Prev.OpenCLOutputBuffer();
+    Prev.OpenCLWaitOutputIfAnotherQueue(FKernel);
+  end
+  else
+  begin
+    Prev.ForceOutputOnRAM();
+    bufSrc := FKernel.EnsureWriteBuffer(FBufSrc, FCapSrc, Prev.FOutput);
+  end;
+  bufDst := FKernel.EnsureOutputBuffer(FBufDst, FCapDst, Y);
   k := FKernel.Kernel;
-  bufSrc := FKernel.EnsureWriteBuffer(FBufSrc, FCapSrc, Src);
-  bufIdx := FKernel.EnsureWriteBuffer(FBufIdx, FCapIdx, SrcIdx);
-  bufDst := FKernel.EnsureOutputBuffer(FBufDst, FCapDst, Dst);
+  NumOut := Y.Size;
+  OutSizeX := Y.SizeX;
+  OutDepth := Y.Depth;
+  InSizeX := Prev.FOutput.SizeX;
+  InDepth := Prev.FOutput.Depth;
   clSetKernelArg(k, 0, csLongintSize, @NumOut);
-  clSetKernelArg(k, 1, csCLMemSize, @bufIdx);
-  clSetKernelArg(k, 2, csCLMemSize, @bufSrc);
-  clSetKernelArg(k, 3, csCLMemSize, @bufDst);
-  // One work-item per output element.
+  clSetKernelArg(k, 1, csLongintSize, @OutSizeX);
+  clSetKernelArg(k, 2, csLongintSize, @OutDepth);
+  clSetKernelArg(k, 3, csLongintSize, @InSizeX);
+  clSetKernelArg(k, 4, csLongintSize, @InDepth);
+  clSetKernelArg(k, 5, csLongintSize, @Factor);
+  clSetKernelArg(k, 6, csLongintSize, @ChannelStride);
+  clSetKernelArg(k, 7, csLongintSize, @XStride);
+  clSetKernelArg(k, 8, csLongintSize, @YStride);
+  clSetKernelArg(k, 9, csCLMemSize, @bufSrc);
+  clSetKernelArg(k, 10, csCLMemSize, @bufDst);
   FKernel.RunKernel(k, NumOut);
-  FKernel.Finish();
-  FKernel.ReadBuffer(bufDst, Dst, CL_TRUE);
-  // Buffers are persistent (FBuf*), reused next forward - not released here.
+  if KeepResult then
+  begin
+    Consumer.FOutputOnOpenCL := true;
+    Consumer.FOutputOnRAM := false;
+  end
+  else
+  begin
+    FKernel.ReadBuffer(bufDst, Y, CL_TRUE);
+    Consumer.FOutputOnOpenCL := false;
+    Consumer.FOutputOnRAM := true;
+  end;
 end;
 
 { TNNetBicubicGatherCL }
@@ -51458,38 +51525,23 @@ begin
 end;
 
 constructor TNNetGatherChannels.Create(pChannels: array of integer);
-var
-  I: integer;
-  ChannelMaxIdx: integer;
 begin
-  inherited Create();
-  SetLength(FChannels, Length(pChannels));
-  ChannelMaxIdx := High(pChannels);
-  for I := 0 to ChannelMaxIdx do
-    FChannels[I] := pChannels[I];
-end;
-
-destructor TNNetGatherChannels.Destroy();
-begin
-  SetLength(FChannels, 0);
-  inherited Destroy();
+  inherited Create(pChannels);
 end;
 
 procedure TNNetGatherChannels.SetPrevLayer(pPrevLayer: TNNetLayer);
 var
-  I, Channel, Depth, OutDepth: integer;
-  OutDepthM1: integer;
+  I, Channel, Depth: integer;
+  MaxChannelPos: integer;
 begin
-  inherited SetPrevLayer(pPrevLayer);
-  Depth := pPrevLayer.Output.Depth;
-  OutDepth := Length(FChannels);
-  if OutDepth = 0 then
+  if Length(FChannels) = 0 then
   begin
     FErrorProc('TNNetGatherChannels requires a non-empty channel list');
     Exit;
   end;
-  OutDepthM1 := OutDepth - 1;
-  for I := 0 to OutDepthM1 do
+  Depth := pPrevLayer.Output.Depth;
+  MaxChannelPos := Length(FChannels) - 1;
+  for I := 0 to MaxChannelPos do
   begin
     Channel := FChannels[I];
     if (Channel < 0) or (Channel >= Depth) then
@@ -51499,87 +51551,7 @@ begin
       Exit;
     end;
   end;
-  FOutput.ReSize(pPrevLayer.Output.SizeX, pPrevLayer.Output.SizeY, OutDepth);
-  SetOutputErrorSize(FOutput);
-end;
-
-procedure TNNetGatherChannels.Compute();
-var
-  StartTime: double;
-  X, Y, K, MaxX, MaxY, MaxK: integer;
-  basePrev0, baseOut0: integer;
-  Prev: TNNetVolume;
-begin
-  StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  Prev := FPrevLayer.Output;
-  MaxX := Prev.SizeX - 1;
-  MaxY := Prev.SizeY - 1;
-  MaxK := Length(FChannels) - 1;
-  for Y := 0 to MaxY do
-    for X := 0 to MaxX do
-    begin
-      basePrev0 := Prev.GetRawPos(X, Y);
-      baseOut0  := FOutput.GetRawPos(X, Y);
-      for K := 0 to MaxK do
-        FOutput.FData[baseOut0 + K] := Prev.FData[basePrev0 + FChannels[K]];
-    end;
-  FForwardTime := FForwardTime + (Now() - StartTime);
-end;
-
-procedure TNNetGatherChannels.Backpropagate();
-var
-  StartTime: double;
-  X, Y, K, MaxX, MaxY, MaxK, idx: integer;
-  basePrevErr0, baseOutErr0: integer;
-  PrevErr: TNNetVolume;
-begin
-  Inc(FBackPropCallCurrentCnt);
-  if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
-  TestBackPropCallCurrCnt();
-  StartTime := Now();
-  if Assigned(FPrevLayer) and
-    (FPrevLayer.OutputError.Size > 0) and
-    (FPrevLayer.OutputError.Size = FPrevLayer.Output.Size) then
-  begin
-    PrevErr := FPrevLayer.OutputError;
-    MaxX := FOutput.SizeX - 1;
-    MaxY := FOutput.SizeY - 1;
-    MaxK := Length(FChannels) - 1;
-    // Scatter each output channel's error back to its source channel. Add (not
-    // assign) so repeated indices correctly accumulate onto the shared source.
-    for Y := 0 to MaxY do
-      for X := 0 to MaxX do
-      begin
-        basePrevErr0 := PrevErr.GetRawPos(X, Y);
-        baseOutErr0  := FOutputError.GetRawPos(X, Y);
-        for K := 0 to MaxK do
-        begin
-          idx := basePrevErr0 + FChannels[K];
-          PrevErr.FData[idx] := PrevErr.FData[idx] + FOutputError.FData[baseOutErr0 + K];
-        end;
-      end;
-  end;
-  FBackwardTime := FBackwardTime + (Now() - StartTime);
-  if Assigned(FPrevLayer) then FPrevLayer.Backpropagate();
-end;
-
-function TNNetGatherChannels.SaveStructureToString(): string;
-var
-  I, MaxChannels: integer;
-  ChannelsStr: string;
-begin
-  // The variable-length index list lives in its own structure-string segment
-  // (the same mechanism TNNetSplitChannels uses), reconstructed via aIdx in
-  // CreateLayer - so there is no fixed cap on the number of indices.
-  ChannelsStr := '';
-  MaxChannels := Length(FChannels) - 1;
-  for I := 0 to MaxChannels do
-  begin
-    if I > 0 then ChannelsStr := ChannelsStr + ';';
-    ChannelsStr := ChannelsStr + IntToStr(FChannels[I]);
-  end;
-  Result := StringReplace(inherited SaveStructureToString,'::',':'+ChannelsStr+':',[rfReplaceAll]);
+  inherited SetPrevLayer(pPrevLayer);
 end;
 
 { TNNetGatherTokens }
@@ -56271,6 +56243,9 @@ end;
 constructor TNNetUpsample.Create();
 begin
   inherited Create(2);
+  FGatherChannelStride := 4;
+  FGatherXStride := 1;
+  FGatherYStride := 2;
 end;
 
 procedure TNNetUpsample.Compute();
@@ -56283,7 +56258,7 @@ var
   PrevOutput: TNNetVolume;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeUpsampleOnOpenCL(StartTime) then exit;
   PrevOutput := FPrevLayer.Output;
   MaxX := PrevOutput.SizeX - 1;
   MaxY := PrevOutput.SizeY - 1;
@@ -56374,8 +56349,7 @@ begin
                  pPrevLayer.Output.Depth div rr);
   SetOutputErrorSize(FOutput);
   {$IFDEF OpenCL}
-  FShouldOpenCL := false; // bandwidth-bound: GPU < CPU on the device (OpenCLForwardBenchmark), pin to CPU. Old verdict: Int64(FOutput.Size) >= cNeuralOpenCLMinWork
-  // Empty the cached device index map: the new geometry needs a new one.
+  // Empty the cached backward index map: the new geometry needs a new one.
   if Assigned(FIdxBuf) then FIdxBuf.ReSize(0, 0, 0);
   {$ENDIF}
 end;
@@ -56389,10 +56363,9 @@ end;
 {$IFDEF OpenCL}
 destructor TNNetPixelShuffle.Destroy();
 begin
-  if Assigned(FShuffleCL)   then FreeAndNil(FShuffleCL);
+  if Assigned(FUpsampleCL)  then FreeAndNil(FUpsampleCL);
   if Assigned(FScatterCL)   then FreeAndNil(FScatterCL);
   if Assigned(FIdxBuf)      then FreeAndNil(FIdxBuf);
-  if Assigned(FDstFlat)     then FreeAndNil(FDstFlat);
   if Assigned(FBackErrFlat) then FreeAndNil(FBackErrFlat);
   if Assigned(FBackOutFlat) then FreeAndNil(FBackOutFlat);
   inherited Destroy();
@@ -56408,25 +56381,28 @@ var
   PrevOutput: TNNetVolume;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
   r := FStruct[0];
+  RR := r * r;
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    FUpsampleCL.GatherFromPrevLayer(Self, r, {ChannelStride=}RR, {XStride=}r,
+      {YStride=}1);
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
   MaxD := FOutput.Depth - 1;
   rM1 := r - 1;
   // Elements between consecutive output rows (the j step advances Y by 1).
   OutRowStride := FOutput.GetRawPos(0, 1);
-  {$IFDEF OpenCL}
-  if WillOpenCL() then
-  begin
-    Inc(FForwardGPUCnt);
-    ComputeOpenCL();
-    FForwardTime := FForwardTime + (Now() - StartTime);
-    exit;
-  end
-  else Inc(FForwardCPUCnt);
-  {$ENDIF}
-  RR := r * r;
   PrevOutput := FPrevLayer.Output;
   // Position-outer, channel-inner: (x, y) fix the source column and the output
   // row base, and the output depth is the contiguous axis, so both bases are
@@ -56460,71 +56436,41 @@ end;
 {$IFDEF OpenCL}
 procedure TNNetPixelShuffle.DisableOpenCL();
 begin
+  // FUpsampleCL owns the buffer a resident output lives in.
+  ForceOutputOnRAM();
   inherited DisableOpenCL();
-  FreeAndNil(FShuffleCL);
+  FreeAndNil(FUpsampleCL);
   FreeAndNil(FScatterCL);
 end;
 
 procedure TNNetPixelShuffle.EnableOpenCL(DotProductKernel: TNeuralKernel);
 begin
   FHasOpenCL := true;
-  if not Assigned(FShuffleCL) then
-    FShuffleCL := TNNetPixelShuffleCL.Create(FNN);
+  if not Assigned(FUpsampleCL) then
+    FUpsampleCL := TNNetUpsampleGatherCL.Create(FNN);
   if not Assigned(FScatterCL) then
     FScatterCL := TNNetPixelShuffleScatterCL.Create(FNN);
   if not Assigned(FIdxBuf)      then FIdxBuf      := TNNetVolume.Create();
-  if not Assigned(FDstFlat)     then FDstFlat     := TNNetVolume.Create();
   if not Assigned(FBackErrFlat) then FBackErrFlat := TNNetVolume.Create();
   if not Assigned(FBackOutFlat) then FBackOutFlat := TNNetVolume.Create();
 end;
 
 function TNNetPixelShuffle.WillOpenCL(): boolean;
 begin
-  Result := Assigned(FShuffleCL) and FHasOpenCL
-            and (FShouldOpenCL or FForceOpenCL);
+  Result := Assigned(FUpsampleCL) and FHasOpenCL and
+    (FForceOpenCL or ((not FIsTrainable) and PrevOutputOnOpenCL()));
 end;
 
-// Device per-output-element depth->space gather. The source linear offset for
-// every output element is computed on the CPU bit-identically to Compute() (a
-// pure copy, no arithmetic); the device performs the gather. Output/source raw
-// layouts are [(y*W + x)*Depth + d]; NumOut = FOutput.Size.
-procedure TNNetPixelShuffle.ComputeOpenCL();
-var
-  r, SrcX, SrcD, OutX, OutD, MaxX, MaxY, MaxD, x, y, c, i, j, InD: integer;
-  rM1, OutIdx, SrcIdx: integer;
+function TNNetPixelShuffle.OpenCLOutputBuffer(): cl_mem;
 begin
-  {$IFDEF OpenCL} FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
-  r := FStruct[0];
-  SrcX := FPrevLayer.Output.SizeX;
-  SrcD := FPrevLayer.Output.Depth;
-  OutX := FOutput.SizeX;
-  OutD := FOutput.Depth;
-  MaxX := SrcX - 1;
-  MaxY := FPrevLayer.Output.SizeY - 1;
-  MaxD := OutD - 1;
-  rM1 := r - 1;
-  FDstFlat.ReSize(FOutput.Size, 1, 1);
-  // The map depends only on the layer geometry, so it survives every token;
-  // SetPrevLayer empties FIdxBuf so a reshape rebuilds it (#27).
-  if FIdxBuf.Size <> FOutput.Size then
-  begin
-    FIdxBuf.ReSize(FOutput.Size, 1, 1);
-    for c := 0 to MaxD do
-      for x := 0 to MaxX do
-        for y := 0 to MaxY do
-          for i := 0 to rM1 do
-            for j := 0 to rM1 do
-            begin
-              InD := c * r * r + i * r + j;
-              // Output raw index of FOutput[r*x+i, r*y+j, c] and the matching
-              // source raw index of FPrevLayer.Output[x, y, InD].
-              OutIdx := ((r * y + j) * OutX + (r * x + i)) * OutD + c;
-              SrcIdx := (y * SrcX + x) * SrcD + InD;
-              FIdxBuf.FData[OutIdx] := SrcIdx;
-            end;
-  end;
-  FShuffleCL.Gather(FPrevLayer.Output, FIdxBuf, FDstFlat, FOutput.Size);
-  Move(FDstFlat.FData[0], FOutput.FData[0], FOutput.Size * csNeuralFloatSize);
+  if Assigned(FUpsampleCL) then Result := FUpsampleCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetPixelShuffle.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FUpsampleCL) then Result := FUpsampleCL.OutputKernel()
+  else Result := nil;
 end;
 {$ENDIF}
 
@@ -56541,7 +56487,7 @@ begin
   if FBackPropCallCurrentCnt < FDepartingBranchesCnt then exit;
   TestBackPropCallCurrCnt();
   {$IFDEF OpenCL}
-  if WillOpenCL() then
+  if Assigned(FScatterCL) and FHasOpenCL and FForceOpenCL then
   begin
     BackpropagateOpenCL();
     FBackwardTime := FBackwardTime + (Now() - StartTime);
@@ -56591,9 +56537,9 @@ end;
 
 {$IFDEF OpenCL}
 // Device inverse depth->space scatter. The forward shuffle is a permutation, so
-// each source element receives EXACTLY one output gradient: we reuse the same
-// output-element->source-offset index map (rebuilt here bit-identically to
-// ComputeOpenCL) and scatter the output error in the OTHER direction, then ADD
+// each source element receives EXACTLY one output gradient: an
+// output-element->source-offset index map (built here once per shape) scatters
+// the output error in the OTHER direction, then we ADD
 // the fully-covered result into FPrevLayer.OutputError (matching the host
 // Backpropagate's accumulate semantics for branched graphs). Layouts match
 // Compute: source/prev raw [(y*W + x)*Depth + d], output raw [outpix*OutD + c].
@@ -99954,6 +99900,7 @@ begin
   if Depth = 0 then
   begin
     FErrorProc('Channel count can not be zero at TNNetSplitChannels');
+    Exit;
   end;
 
   // Detect a contiguous ascending channel run once, at setup (no compute-path
@@ -102796,6 +102743,69 @@ begin
   inherited Create(pPoolSize);
   FSpacing := pSpacing;
   FStruct[7] := FSpacing;
+  FGatherChannelStride := 1;
+  FGatherXStride := 0;
+  FGatherYStride := 0;
+end;
+
+{$IFDEF OpenCL}
+destructor TNNetDeMaxPool.Destroy();
+begin
+  if Assigned(FUpsampleCL) then FreeAndNil(FUpsampleCL);
+  inherited Destroy();
+end;
+
+procedure TNNetDeMaxPool.EnableOpenCL(DotProductKernel: TNeuralKernel);
+begin
+  FHasOpenCL := true;
+  if not Assigned(FUpsampleCL) then
+    FUpsampleCL := TNNetUpsampleGatherCL.Create(FNN);
+end;
+
+procedure TNNetDeMaxPool.DisableOpenCL();
+begin
+  // FUpsampleCL owns the buffer a resident output lives in.
+  ForceOutputOnRAM();
+  inherited DisableOpenCL();
+  FreeAndNil(FUpsampleCL);
+end;
+
+function TNNetDeMaxPool.WillOpenCL(): boolean;
+begin
+  Result := Assigned(FUpsampleCL) and FHasOpenCL and (FSpacing = 0) and
+    (FForceOpenCL or ((not FIsTrainable) and PrevOutputOnOpenCL()));
+end;
+
+function TNNetDeMaxPool.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FUpsampleCL) then Result := FUpsampleCL.ResultBuffer()
+  else Result := nil;
+end;
+
+function TNNetDeMaxPool.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FUpsampleCL) then Result := FUpsampleCL.OutputKernel()
+  else Result := nil;
+end;
+{$ENDIF}
+
+function TNNetDeMaxPool.ComputeUpsampleOnOpenCL(StartTime: double): boolean;
+begin
+  Result := false;
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    FUpsampleCL.GatherFromPrevLayer(Self, FPoolSize, FGatherChannelStride,
+      FGatherXStride, FGatherYStride);
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit(true);
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
 end;
 
 procedure TNNetDeMaxPool.Compute();
@@ -102809,7 +102819,7 @@ var
   Pos, DepthBytes, OutDepth: integer;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  if ComputeUpsampleOnOpenCL(StartTime) then exit;
   Output.Fill(0);
   MaxX := FPrevLayer.Output.SizeX - 1;
   MaxY := FPrevLayer.Output.SizeY - 1;
@@ -103542,13 +103552,69 @@ begin
   FStruct[2] := pDepth;
 end;
 
+{$IFDEF OpenCL}
+procedure TNNetReshape.MoveOutputToRAM();
+begin
+  if FPrevLayer.ForceOutputOnRAM() then
+  begin
+    FOutput.Copy(FPrevLayer.FOutput, FOutput.Size);
+    FOutputOnRAM := true;
+  end
+  else
+    ErrorProc('Error at moving output from OpenCL to RAM at layer ' +
+      IntToStr(FLayerIdx) + ':' + ClassName);
+end;
+
+procedure TNNetReshape.DisableOpenCL();
+begin
+  // TNNet.DisableOpenCL has already disabled the source, which may have
+  // released its buffer: then FOutputOnOpenCL stays set, so ForceOutputOnRAM
+  // reports the loss instead of returning stale host data.
+  if FOutputOnOpenCL and (not FOutputOnRAM) and Assigned(FPrevLayer) and
+    (FPrevLayer.FOutputOnRAM or FPrevLayer.OutputBindableOnOpenCL()) then
+    ForceOutputOnRAM();
+  if FOutputOnRAM then FOutputOnOpenCL := false;
+  inherited DisableOpenCL();
+end;
+
+function TNNetReshape.WillOpenCL(): boolean;
+begin
+  Result := FHasOpenCL and (not FIsTrainable) and PrevOutputOnOpenCLSameSize();
+end;
+
+function TNNetReshape.OpenCLOutputBuffer(): cl_mem;
+begin
+  if Assigned(FPrevLayer) then Result := FPrevLayer.OpenCLOutputBuffer()
+  else Result := nil;
+end;
+
+function TNNetReshape.OpenCLOutputKernel(): TNeuralKernel;
+begin
+  if Assigned(FPrevLayer) then Result := FPrevLayer.OpenCLOutputKernel()
+  else Result := nil;
+end;
+{$ENDIF}
+
 procedure TNNetReshape.Compute;
 var
   Len: integer;
   StartTime: double;
 begin
   StartTime := Now();
-  {$IFDEF OpenCL} if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM(); {$ENDIF}
+  {$IFDEF OpenCL}
+  if WillOpenCL() then
+  begin
+    Inc(FForwardGPUCnt);
+    FOutputOnOpenCL := true;
+    FOutputOnRAM := false;
+    FForwardTime := FForwardTime + (Now() - StartTime);
+    exit;
+  end;
+  Inc(FForwardCPUCnt);
+  if Assigned(FPrevLayer) then FPrevLayer.ForceOutputOnRAM();
+  FOutputOnOpenCL := false;
+  FOutputOnRAM := true;
+  {$ENDIF}
   Len := Min(FOutput.Size, FPrevLayer.FOutput.Size);
   FOutput.Copy(FPrevLayer.FOutput, Len);
   FForwardTime := FForwardTime + (Now() - StartTime);

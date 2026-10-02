@@ -1541,28 +1541,40 @@ __kernel void cai_bilinear_gather
   FDst[g_id] = acc;
 }
 
-// CAI Pixel Shuffle (depth-to-space gather forward)
-// Coded by Claude (AI).
-// Device forward for TNNetPixelShuffle: a pure depth->space gather with NO
-// arithmetic (each output element is a verbatim copy of one source element).
-// The caller precomputes, per output element, the source LINEAR offset into the
-// raw source feature map [(y*W + x)*Depth + d] (stored as float, exact for any
-// realistic element count) and uploads it; this kernel only performs the copy.
-//   FSrcIdx : source linear element offset per output element, [g_id].
-//   FSrc    : source feature map, raw.
-//   FDst    : output feature map, raw, [g_id].
-// One work-item per OUTPUT element: global size = FNumOut (dim 0).
-__kernel void cai_pixel_shuffle
+// CAI upsample gather: the forward of the nearest-neighbour upsample and the
+// depth-to-space layers (TNNetDeMaxPool, TNNetUpsample, TNNetPixelShuffle).
+// Output pixel (OX, OY) copies from source pixel (OX / FFactor, OY / FFactor),
+// the channel picked by the output channel c and the pixel's offset (i, j)
+// inside its FFactor x FFactor block:
+//   src channel = c*FChannelStride + i*FXStride + j*FYStride
+// (nearest upsample: 1, 0, 0; PixelShuffle(r): r*r, r, 1;
+// TNNetUpsample: 4, 1, 2).
+// Raw layouts [(y*SizeX + x)*Depth + d]. One work-item per OUTPUT element.
+__kernel void cai_upsample_gather
 (
   const int FNumOut,
-  __global const float* FSrcIdx,
+  const int FOutSizeX,
+  const int FOutDepth,
+  const int FInSizeX,
+  const int FInDepth,
+  const int FFactor,
+  const int FChannelStride,
+  const int FXStride,
+  const int FYStride,
   __global const float* FSrc,
   __global float* FDst
 )
 {
   const int g_id = get_global_id(0);
   if (g_id >= FNumOut) return;
-  FDst[g_id] = FSrc[(int)FSrcIdx[g_id]];
+  const int pos = g_id / FOutDepth;
+  const int c = g_id - pos * FOutDepth;
+  const int OY = pos / FOutSizeX;
+  const int OX = pos - OY * FOutSizeX;
+  const int x = OX / FFactor;
+  const int y = OY / FFactor;
+  FDst[g_id] = FSrc[(y * FInSizeX + x) * FInDepth + c * FChannelStride +
+    (OX - x * FFactor) * FXStride + (OY - y * FFactor) * FYStride];
 }
 
 // CAI Bicubic Gather (separable 4x4 weighted gather forward)
@@ -1609,11 +1621,11 @@ __kernel void cai_bicubic_gather
 // Device backward for TNNetPixelShuffle. The forward shuffle is a bijection
 // (a pure permutation: each output element copies exactly one source element),
 // so the backward gradient scatter is collision-free: every source element
-// receives exactly one output gradient. We REUSE the SAME index buffer the
-// forward built (output element -> source linear offset) and write in the OTHER
-// direction. One work-item per OUTPUT element, no atomics needed.
-//   FSrcIdx : source linear element offset per output element, [g_id] (same
-//             buffer as the forward cai_pixel_shuffle).
+// receives exactly one output gradient. The host index map (output element ->
+// source linear offset) is read in the OTHER direction. One work-item per
+// OUTPUT element, no atomics needed.
+//   FSrcIdx : source linear element offset per output element, [g_id], built
+//             on the host by TNNetPixelShuffle.BackpropagateOpenCL.
 //   FSrc    : output gradient, raw, [g_id].
 //   FDst    : scattered source gradient, raw (zero-init by the host; this
 //             permutation fully covers it with one write per element).

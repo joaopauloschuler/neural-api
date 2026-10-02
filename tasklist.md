@@ -2125,8 +2125,22 @@ rather than acted on.
           convs move 0 bytes, 14 still read a host source until B2e (~22 of
           ~39 GB per 1024x1024 decode removed, computed). OpenCL binaries must
           be rebuilt with the new neural.cl (kernel arguments changed).
-    - [ ] B2e. VAE residency gaps: Reshape alias, nearest-2x upsample kernel,
+    - [x] B2e. VAE residency gaps: Reshape alias, nearest-2x upsample kernel,
           DupUp gather/pixel shuffle bind+keep, SDPA output.
+          DONE (inference only): TNNetReshape offers its source's OpenCL
+          buffer when the Size matches (alias, no copy; MoveOutputToRAM copies
+          from the source's host copy); `cai_upsample_gather` (replaces
+          `cai_pixel_shuffle`, integer indexing, no index map) serves
+          TNNetDeMaxPool, TNNetUpsample and TNNetPixelShuffle forwards (bind a
+          resident source, keep the output); TNNetGatherChannels is now a
+          TNNetSplitChannels descendant (cai_split_channels). Pico VAE: all 40
+          3x3 convs bind; per decode 20 up / 17 down -> 2 up / 1 down besides
+          the image download. 1024x1024 at 128/96 tiles: ~17.6 GB -> ~0.16 GB
+          of activation transfers (computed). Left on the host: the mid-block
+          SDPA (downloads Q|K|V, the out-projection uploads; softmax on host).
+          TNNetSum needed no change. Follow-up:
+          - [ ] Mid-block attention in OpenCL memory (device softmax, or the
+                VAE through TNNetFusedSDPA's non-causal tiled kernel).
     - [ ] B2f. Later, for big tiles / untiled decode: implicit-GEMM conv (no
           im2col, folds the 2x upsample), per-row bias instead of the
           output-sized bias copy, activation buffer reuse by liveness; then
