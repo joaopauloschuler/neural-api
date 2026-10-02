@@ -140,9 +140,11 @@ type
     FSizeY: integer;
     FDepth: integer;
     FTag: array[0..1] of integer;
-    FFormatSettings: TFormatSettings;
     FLastPos: integer;
     function GetTag: integer; {$IFDEF Release} inline; {$ENDIF}
+    // GetDefaultNumericFormat, built per call: a TFormatSettings field would
+    // cost every volume ~1.8 us (create + free) and 376 bytes.
+    function GetFormatSettings: TFormatSettings;
     procedure SetTag(I: integer); {$IFDEF Release} inline; {$ENDIF}
     function GetTags(x: integer): integer; {$IFDEF Release} inline; {$ENDIF}
     procedure SetTags(x: integer; AValue: integer); {$IFDEF Release} inline; {$ENDIF}
@@ -421,7 +423,7 @@ type
     property SizeX: integer read FSizeX;
     property SizeY: integer read FSizeY;
     property Depth: integer read FDepth;
-    property FormatSettings: TFormatSettings read FFormatSettings;
+    property FormatSettings: TFormatSettings read GetFormatSettings;
   end;
 
   TNNetToken = record
@@ -1042,6 +1044,10 @@ type
       // down, leaving the last Count rows stale. Capacity is untouched: this
       // is the rolling-window eviction primitive, not a resize.
       procedure DeleteRows(StartY: integer; Count: integer = 1);
+      // Copies rows [FirstRow, FirstRow + RowCount) transposed: code d of row r
+      // goes to Dst[r + d * DstColStride], written in contiguous row-tile runs.
+      procedure CopyRowsTransposedTo(FirstRow, RowCount: integer;
+        Dst: TNeuralInt8ArrPtr; DstColStride: integer);
       // Plain copies of both planes, for callers that export or serialize.
       procedure GetQuantData(out pCodes: TInt8DynArr; out pScales: TNeuralFloatDynArr);
       function GetMemSize(): int64;
@@ -1107,6 +1113,11 @@ type
       // Copies one Q4_0 row (BlocksPerRow x 16 packed bytes) and its block
       // scales from the caller's buffers; the loader's direct path.
       procedure ImportPackedRow(x, y: integer; PackedSrc: TNeuralByteArrPtr; Scales: TNeuralFloatArrPtr);
+      // As CopyRowsTransposedTo, blocks re-paired (byte p: elements 2p, 2p+1);
+      // scale b of row r goes to ScaleDst[r + b * DstColStride].
+      procedure CopyRowsAsPairedTransposedTo(FirstRow, RowCount: integer;
+        PairDst: TNeuralByteArrPtr; ScaleDst: TNeuralFloatArrPtr;
+        DstColStride: integer);
       procedure DequantizeRowTo(x, y: integer; Dest: TNeuralFloatArrPtr);
       // Expands every row into Dest, resized to (SizeX, SizeY, Depth). Leaves
       // Dest untouched when this volume is empty.
@@ -2738,6 +2749,152 @@ begin
     Code := Round(Scaled);
     PtrDst^[i] := ShortInt(Code);
   end;
+end;
+
+// Q4BlockExtremeIdx's AVX2 path: index of the first of the 32 floats with
+// the largest finite magnitude, -1 when none. Coded by Claude (AI).
+function AVXQ4BlockExtremeIdx(BlockSrc: TNeuralFloatArrPtr): integer;
+var
+  // [0] = $7FFFFFFF sign-clearing mask, [1] = $7F7FFFFF largest finite bits.
+  Consts: array[0..1] of LongWord;
+  ConstsPtr: pointer;
+  MaxAbsBits, EqualMask: LongWord;
+begin
+  Consts[0] := $7FFFFFFF;
+  Consts[1] := $7F7FFFFF;
+  // Constants from LOCALS through a pointer: PIC-safe (see AVXMaxAbsFinite).
+  ConstsPtr := Addr(Consts[0]);
+  // Finite magnitudes order like their sign-cleared bits, so the scan is an
+  // integer max; vpcmpeqd + vmovmskps then mark the lanes holding it.
+  asm
+  mov rax, BlockSrc
+  mov rdx, ConstsPtr
+  vbroadcastss ymm5, [rdx]
+  vbroadcastss ymm6, [rdx+4]
+  vpand     ymm0, ymm5, [rax]     // |bits| of 4 x 8 floats
+  vpand     ymm1, ymm5, [rax+32]
+  vpand     ymm2, ymm5, [rax+64]
+  vpand     ymm3, ymm5, [rax+96]
+  vpcmpgtd  ymm7, ymm0, ymm6      // NaN or Inf
+  vpcmpgtd  ymm8, ymm1, ymm6
+  vpcmpgtd  ymm9, ymm2, ymm6
+  vpcmpgtd  ymm10, ymm3, ymm6
+  vpandn    ymm0, ymm7, ymm0      // non-finite magnitude -> 0
+  vpandn    ymm1, ymm8, ymm1
+  vpandn    ymm2, ymm9, ymm2
+  vpandn    ymm3, ymm10, ymm3
+  vpmaxud   ymm4, ymm0, ymm1
+  vpmaxud   ymm7, ymm2, ymm3
+  vpmaxud   ymm4, ymm4, ymm7
+  vextracti128 xmm7, ymm4, 1
+  vpmaxud   xmm4, xmm4, xmm7
+  vpshufd   xmm7, xmm4, $4E
+  vpmaxud   xmm4, xmm4, xmm7
+  vpshufd   xmm7, xmm4, $B1
+  vpmaxud   xmm4, xmm4, xmm7      // every lane holds the block max
+  vmovd     edx, xmm4
+  mov       MaxAbsBits, edx
+  vinserti128 ymm4, ymm4, xmm4, 1
+  vpcmpeqd  ymm0, ymm0, ymm4
+  vpcmpeqd  ymm1, ymm1, ymm4
+  vpcmpeqd  ymm2, ymm2, ymm4
+  vpcmpeqd  ymm3, ymm3, ymm4
+  vmovmskps ecx, ymm0
+  vmovmskps edx, ymm1
+  shl       edx, 8
+  or        ecx, edx
+  vmovmskps edx, ymm2
+  shl       edx, 16
+  or        ecx, edx
+  vmovmskps edx, ymm3
+  shl       edx, 24
+  or        ecx, edx
+  mov       EqualMask, ecx
+  vzeroupper
+  end
+  [
+    'RAX', 'RCX', 'RDX',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm4', 'ymm5', 'ymm6', 'ymm7',
+    'ymm8', 'ymm9', 'ymm10'
+  ];
+  if MaxAbsBits = 0
+    then Result := -1
+    else Result := BsfDWord(EqualMask);
+end;
+
+// Q4BlockCodes's AVX2 path: vmulps then vaddps, the scalar loop's two single
+// roundings, so its codes are bit-identical. Coded by Claude (AI).
+procedure AVXQ4BlockCodes(BlockSrc: TNeuralFloatArrPtr;
+  PackedDst: TNeuralByteArrPtr; InvScale: Single);
+var
+  // [0] = $7FFFFFFF, [1] = $7F7FFFFF, [2] = InvScale, [3] = 8.5, [4] = 15.
+  Consts: array[0..4] of LongWord;
+  ConstsPtr: pointer;
+begin
+  Consts[0] := $7FFFFFFF;
+  Consts[1] := $7F7FFFFF;
+  PSingle(@Consts[2])^ := InvScale;
+  PSingle(@Consts[3])^ := 8.5;
+  Consts[4] := 15;
+  ConstsPtr := Addr(Consts[0]);
+  asm
+  mov rax, BlockSrc
+  mov rdx, PackedDst
+  mov r8, ConstsPtr
+  vbroadcastss ymm5, [r8]
+  vbroadcastss ymm6, [r8+4]
+  vbroadcastss ymm11, [r8+8]
+  vbroadcastss ymm12, [r8+12]
+  vbroadcastss ymm13, [r8+16]
+  vmovups   ymm0, [rax]
+  vmovups   ymm1, [rax+32]
+  vmovups   ymm2, [rax+64]
+  vmovups   ymm3, [rax+96]
+  vpand     ymm7, ymm0, ymm5
+  vpand     ymm8, ymm1, ymm5
+  vpand     ymm9, ymm2, ymm5
+  vpand     ymm10, ymm3, ymm5
+  vpcmpgtd  ymm7, ymm7, ymm6      // NaN or Inf
+  vpcmpgtd  ymm8, ymm8, ymm6
+  vpcmpgtd  ymm9, ymm9, ymm6
+  vpcmpgtd  ymm10, ymm10, ymm6
+  vpandn    ymm0, ymm7, ymm0      // non-finite -> +0
+  vpandn    ymm1, ymm8, ymm1
+  vpandn    ymm2, ymm9, ymm2
+  vpandn    ymm3, ymm10, ymm3
+  vmulps    ymm0, ymm0, ymm11
+  vmulps    ymm1, ymm1, ymm11
+  vmulps    ymm2, ymm2, ymm11
+  vmulps    ymm3, ymm3, ymm11
+  vaddps    ymm0, ymm0, ymm12
+  vaddps    ymm1, ymm1, ymm12
+  vaddps    ymm2, ymm2, ymm12
+  vaddps    ymm3, ymm3, ymm12
+  vcvttps2dq ymm0, ymm0
+  vcvttps2dq ymm1, ymm1
+  vcvttps2dq ymm2, ymm2
+  vcvttps2dq ymm3, ymm3
+  vpminsd   ymm0, ymm0, ymm13
+  vpminsd   ymm1, ymm1, ymm13
+  vpminsd   ymm2, ymm2, ymm13
+  vpminsd   ymm3, ymm3, ymm13
+  vpslld    ymm2, ymm2, 4         // elements 16..31 -> high nibbles
+  vpslld    ymm3, ymm3, 4
+  vpor      ymm0, ymm0, ymm2      // bytes 0..7 as dwords
+  vpor      ymm1, ymm1, ymm3      // bytes 8..15 as dwords
+  vextracti128 xmm2, ymm0, 1
+  vextracti128 xmm3, ymm1, 1
+  vpackusdw xmm0, xmm0, xmm2      // 8 words, in lane order
+  vpackusdw xmm1, xmm1, xmm3
+  vpackuswb xmm0, xmm0, xmm1      // 16 bytes
+  vmovups   [rdx], xmm0
+  vzeroupper
+  end
+  [
+    'RAX', 'RDX', 'R8',
+    'ymm0', 'ymm1', 'ymm2', 'ymm3', 'ymm5', 'ymm6', 'ymm7', 'ymm8',
+    'ymm9', 'ymm10', 'ymm11', 'ymm12', 'ymm13'
+  ];
 end;
 
 // dst[i] := Scale * src[i] over NumElements symmetric int8 codes. Per 8 lanes:
@@ -7493,8 +7650,10 @@ function TNNetDictionary.VolumeToString(Volume: TNNetVolume;
 var
   I: integer;
   vHigh: integer;
+  NumericFormat: TFormatSettings;
 begin
   FTokenizer.Text := '';
+  NumericFormat := GetDefaultNumericFormat;
   if Length(Volume.FData) > 0 then
   begin
     vHigh := High(Volume.FData);
@@ -7504,7 +7663,7 @@ begin
       begin
         if Volume.FData[I] > Threshold then
         begin
-          FTokenizer.Add(Self[I]+':'+Volume.NeuralToStr(Volume.FData[I]));
+          FTokenizer.Add(Self[I]+':'+FloatToStr(Volume.FData[I], NumericFormat));
         end;
       end;
     end;
@@ -8257,6 +8416,11 @@ begin
   FTag[0] := I;
 end;
 
+function TVolume.GetFormatSettings: TFormatSettings;
+begin
+  Result := GetDefaultNumericFormat;
+end;
+
 function TVolume.GetTag: integer;
 begin
   GetTag := FTag[0];
@@ -8271,8 +8435,6 @@ begin
   ReSize(pSizeX, pSizeY, pDepth);
   Fill(c);
   ClearTag();
-
-  FFormatSettings := GetDefaultNumericFormat;
 end;
 
 constructor TVolume.Create(pInput: array of T);
@@ -10786,7 +10948,7 @@ end;
 
 function TVolume.NeuralToStr(V: TNeuralFloat): string;
 begin
-  Result := FloatToStr(V, FFormatSettings);
+  Result := FloatToStr(V, GetDefaultNumericFormat);
 end;
 
 procedure TVolume.LoadNonZeroPosIntoTIntegerList(Ints: TIntegerList;
@@ -12825,8 +12987,10 @@ var
   I, Hi, Lo: integer;
   version: integer;
   AuxFloat: Single;
+  NumericFormat: TFormatSettings;
 begin
   version := 1;
+  NumericFormat := GetDefaultNumericFormat;
   S := CreateTokenizedStringList(';');
   S.SetCapacity(FSize+10);
   S.Add( IntToStr(version) );
@@ -12839,7 +13003,7 @@ begin
   for I := Lo to Hi do
   begin
     AuxFloat := FData[I];
-    S.Add( FloatToStr(AuxFloat, FFormatSettings) );
+    S.Add( FloatToStr(AuxFloat, NumericFormat) );
   end;
 
   Result := S.GetDelimitedTextFast();
@@ -12854,8 +13018,10 @@ var
   pSizeX, pSizeY, pDepth: integer;
   I, SCountMax: integer;
   AuxFloat: Single;
+  NumericFormat: TFormatSettings;
 begin
   //version := 1;
+  NumericFormat := GetDefaultNumericFormat;
   S := CreateTokenizedStringList(strData,';');
 
   //version := StrToInt(S[0]);
@@ -12884,7 +13050,7 @@ begin
     SCountMax := S.Count-1;
     for I := 4 to SCountMax do
     begin
-      AuxFloat := StrToFloat(S[I], FFormatSettings);
+      AuxFloat := StrToFloat(S[I], NumericFormat);
       FData[I-4] := AuxFloat;
     end;
   end;
@@ -20195,6 +20361,51 @@ begin
     MoveRows * RowScales * csNeuralFloatSize);
 end;
 
+const
+  // Rows per tile of the transposed quant-row copies: the tile's source lines
+  // stay cached while each transposed column receives one contiguous run.
+  csTransposeTileRows = 64;
+
+// Dst^[c * DstColStride + r] := Src^[r * SrcRowStride + c] for r < RowCount and
+// c < ColCount. Coded by Claude (AI).
+procedure TransposeByteTile(Src: TNeuralByteArrPtr; SrcRowStride: integer;
+  Dst: TNeuralByteArrPtr; DstColStride, RowCount, ColCount: integer);
+var
+  RowCnt, ColCnt, MaxRowPos, MaxColPos, SrcPos, DstPos: integer;
+begin
+  MaxRowPos := RowCount - 1;
+  MaxColPos := ColCount - 1;
+  DstPos := 0;
+  for ColCnt := 0 to MaxColPos do
+  begin
+    SrcPos := ColCnt;
+    for RowCnt := 0 to MaxRowPos do
+    begin
+      Dst^[DstPos + RowCnt] := Src^[SrcPos];
+      Inc(SrcPos, SrcRowStride);
+    end;
+    Inc(DstPos, DstColStride);
+  end;
+end;
+
+procedure TNNetVolumeQuant8.CopyRowsTransposedTo(FirstRow, RowCount: integer;
+  Dst: TNeuralInt8ArrPtr; DstColStride: integer);
+var
+  TileRow, EndRow, TileRowCount: integer;
+begin
+  TileRow := FirstRow;
+  EndRow := FirstRow + RowCount;
+  while TileRow < EndRow do
+  begin
+    TileRowCount := EndRow - TileRow;
+    if TileRowCount > csTransposeTileRows then
+      TileRowCount := csTransposeTileRows;
+    TransposeByteTile(TNeuralByteArrPtr(@FDataPtr^[TileRow * FDepth]), FDepth,
+      TNeuralByteArrPtr(@Dst^[TileRow]), DstColStride, TileRowCount, FDepth);
+    Inc(TileRow, TileRowCount);
+  end;
+end;
+
 procedure TNNetVolumeQuant8.GetQuantData(out pCodes: TInt8DynArr;
   out pScales: TNeuralFloatDynArr);
 var
@@ -20312,50 +20523,115 @@ begin
     FScaleData.FData[((FSizeX * y) + x) * FBlocksPerRow + d div BlockSize];
 end;
 
+// Bits of a binary32 value, or 0 (+0.0) when they encode NaN or +/-Inf: an
+// all-ones exponent selects a zero mask, so no branch and no float compare.
+function FiniteBitsOrZero(Bits: LongWord): LongWord;
+  {$IFDEF Release} inline; {$ENDIF}
+begin
+  Result := Bits and
+    LongWord(-LongInt(Ord((Bits and $7F800000) <> $7F800000)));
+end;
+
+// Index of the first of the 32 floats at BlockSrc with the largest finite
+// magnitude, or -1 when none is finite and non-zero. Coded by Claude (AI).
+function Q4BlockExtremeIdx(BlockSrc: TNeuralFloatArrPtr): integer;
+var
+  ElementIdx: integer;
+  MaxAbsBits, AbsBits: LongWord;
+begin
+  {$IFDEF AVX64}
+  {$IFDEF AVX2}
+  Result := AVXQ4BlockExtremeIdx(BlockSrc);
+  exit;
+  {$ENDIF}
+  {$ENDIF}
+  // Finite magnitudes order like their sign-cleared bits.
+  Result := -1;
+  MaxAbsBits := 0;
+  for ElementIdx := 0 to TNNetVolumeQuant4.BlockSize - 1 do
+  begin
+    AbsBits := FiniteBitsOrZero(PLongWord(@BlockSrc^[ElementIdx])^) and
+      $7FFFFFFF;
+    if AbsBits > MaxAbsBits then
+    begin
+      MaxAbsBits := AbsBits;
+      Result := ElementIdx;
+    end;
+  end;
+end;
+
+// Packs nibbles Min(15, Trunc(v * InvScale + 8.5)) of 32 floats into 16
+// bytes; NaN/Inf store nibble 8 (value 0). Coded by Claude (AI).
+procedure Q4BlockCodes(BlockSrc: TNeuralFloatArrPtr;
+  PackedDst: TNeuralByteArrPtr; InvScale: Single);
+var
+  ByteIdx, LowCode, HighCode: integer;
+  LowBits, HighBits: LongWord;
+begin
+  {$IFDEF AVX64}
+  {$IFDEF AVX2}
+  AVXQ4BlockCodes(BlockSrc, PackedDst, InvScale);
+  exit;
+  {$ENDIF}
+  {$ENDIF}
+  for ByteIdx := 0 to TNNetVolumeQuant4.PackedBlockBytes - 1 do
+  begin
+    LowBits := FiniteBitsOrZero(PLongWord(@BlockSrc^[ByteIdx])^);
+    HighBits := FiniteBitsOrZero(PLongWord(
+      @BlockSrc^[ByteIdx + TNNetVolumeQuant4.PackedBlockBytes])^);
+    LowCode := Min(15, Trunc(PSingle(@LowBits)^ * InvScale + 8.5));
+    HighCode := Min(15, Trunc(PSingle(@HighBits)^ * InvScale + 8.5));
+    PackedDst^[ByteIdx] := Byte(LowCode or (HighCode shl 4));
+  end;
+end;
+
 procedure TNNetVolumeQuant4.QuantizeRow(x, y: integer; Src: TNeuralFloatArrPtr);
 var
   PackedRow: TNeuralByteArrPtr;
   Scales: TNeuralFloatArrPtr;
-  BlockIdx, MaxBlockIdx, ByteIdx, SrcOfs, PackedOfs: integer;
-  Value, MaxAbs, MaxSigned, InvScale: TNeuralFloat;
+  BlockSrc: TNeuralFloatArrPtr;
+  BlockIdx, MaxBlockIdx, ByteIdx, ExtremeIdx, PackedOfs: integer;
+  MaxSigned: TNeuralFloat;
+  InvScaleDouble: double;
+  LowBits, HighBits: LongWord;
   LowCode, HighCode: integer;
 begin
   PackedRow := GetRawPtr(x, y);
   Scales := GetScaleRowPtr(x, y);
   MaxBlockIdx := FBlocksPerRow - 1;
-  SrcOfs := 0;
+  BlockSrc := Src;
   PackedOfs := 0;
   for BlockIdx := 0 to MaxBlockIdx do
   begin
-    // Q4_0: the largest-magnitude value maps to code -8 exactly, so the scale
-    // carries its sign. Non-finite values are skipped and quantize to 0.
-    MaxAbs := 0;
-    MaxSigned := 0;
-    for ByteIdx := 0 to BlockSize - 1 do
+    // Q4_0: the largest-magnitude finite value (the first one on a tie) maps
+    // to code -8 exactly, so the scale carries its sign.
+    ExtremeIdx := Q4BlockExtremeIdx(BlockSrc);
+    if ExtremeIdx >= 0
+    then MaxSigned := BlockSrc^[ExtremeIdx]
+    else MaxSigned := 0;
+    Scales^[BlockIdx] := MaxSigned / (-8);
+    // A double quotient rounded to single equals the single quotient, so the
+    // codes match a single divide wherever that divide cannot overflow.
+    if MaxSigned <> 0
+    then InvScaleDouble := -8 / Double(MaxSigned)
+    else InvScaleDouble := 0;
+    if Abs(InvScaleDouble) <= MaxSingle then
+      Q4BlockCodes(BlockSrc, TNeuralByteArrPtr(@PackedRow^[PackedOfs]),
+        InvScaleDouble)
+    else
     begin
-      Value := Src^[SrcOfs + ByteIdx];
-      if IsNan(Value) or IsInfinite(Value) then continue;
-      if Abs(Value) > MaxAbs then
+      // A block max below 8/MaxSingle has no single-precision -8/max.
+      for ByteIdx := 0 to PackedBlockBytes - 1 do
       begin
-        MaxAbs := Abs(Value);
-        MaxSigned := Value;
+        LowBits := FiniteBitsOrZero(PLongWord(@BlockSrc^[ByteIdx])^);
+        HighBits := FiniteBitsOrZero(
+          PLongWord(@BlockSrc^[ByteIdx + PackedBlockBytes])^);
+        LowCode := Min(15, Trunc(PSingle(@LowBits)^ * InvScaleDouble + 8.5));
+        HighCode := Min(15, Trunc(PSingle(@HighBits)^ * InvScaleDouble + 8.5));
+        PackedRow^[PackedOfs + ByteIdx] := Byte(LowCode or (HighCode shl 4));
       end;
     end;
-    Scales^[BlockIdx] := MaxSigned / (-8);
-    if MaxSigned <> 0
-    then InvScale := -8 / MaxSigned
-    else InvScale := 0;
-    for ByteIdx := 0 to PackedBlockBytes - 1 do
-    begin
-      Value := Src^[SrcOfs + ByteIdx];
-      if IsNan(Value) or IsInfinite(Value) then Value := 0;
-      LowCode := Min(15, Trunc(Value * InvScale + 8.5));
-      Value := Src^[SrcOfs + ByteIdx + PackedBlockBytes];
-      if IsNan(Value) or IsInfinite(Value) then Value := 0;
-      HighCode := Min(15, Trunc(Value * InvScale + 8.5));
-      PackedRow^[PackedOfs + ByteIdx] := Byte(LowCode or (HighCode shl 4));
-    end;
-    Inc(SrcOfs, BlockSize);
+    BlockSrc := TNeuralFloatArrPtr(@BlockSrc^[BlockSize]);
     Inc(PackedOfs, PackedBlockBytes);
   end;
 end;
@@ -20380,6 +20656,61 @@ procedure TNNetVolumeQuant4.ImportPackedRow(x, y: integer;
 begin
   Move(PackedSrc^[0], GetRawPtr(x, y)^[0], FPackedRowBytes);
   Move(Scales^[0], GetScaleRowPtr(x, y)^[0], FBlocksPerRow * csNeuralFloatSize);
+end;
+
+procedure TNNetVolumeQuant4.CopyRowsAsPairedTransposedTo(FirstRow,
+  RowCount: integer; PairDst: TNeuralByteArrPtr; ScaleDst: TNeuralFloatArrPtr;
+  DstColStride: integer);
+const
+  HalfBlockBytes = PackedBlockBytes div 2;
+var
+  PairTile: array[0..csTransposeTileRows * PackedBlockBytes - 1] of byte;
+  TileRow, EndRow, TileRowCount, MaxTileRowPos, RowCnt: integer;
+  BlockCnt, MaxBlockPos: integer;
+  PairCnt, SrcPos, TilePos, ScalePos, ScaleDstPos, PairDstPos: integer;
+  EvenByte, OddByte: byte;
+begin
+  MaxBlockPos := FBlocksPerRow - 1;
+  TileRow := FirstRow;
+  EndRow := FirstRow + RowCount;
+  while TileRow < EndRow do
+  begin
+    TileRowCount := EndRow - TileRow;
+    if TileRowCount > csTransposeTileRows then
+      TileRowCount := csTransposeTileRows;
+    MaxTileRowPos := TileRowCount - 1;
+    ScaleDstPos := TileRow;
+    PairDstPos := TileRow;
+    for BlockCnt := 0 to MaxBlockPos do
+    begin
+      SrcPos := TileRow * FPackedRowBytes + BlockCnt * PackedBlockBytes;
+      ScalePos := TileRow * FBlocksPerRow + BlockCnt;
+      TilePos := 0;
+      for RowCnt := 0 to MaxTileRowPos do
+      begin
+        // Q4_0 keeps elements j (low nibble) and j+16 (high) in byte j.
+        for PairCnt := 0 to HalfBlockBytes - 1 do
+        begin
+          EvenByte := FDataPtr^[SrcPos + 2 * PairCnt];
+          OddByte := FDataPtr^[SrcPos + 2 * PairCnt + 1];
+          PairTile[TilePos + PairCnt] :=
+            (EvenByte and 15) or ((OddByte and 15) shl 4);
+          PairTile[TilePos + HalfBlockBytes + PairCnt] :=
+            (EvenByte shr 4) or (OddByte and $F0);
+        end;
+        ScaleDst^[ScaleDstPos + RowCnt] := FScaleData.FDataPtr^[ScalePos];
+        Inc(SrcPos, FPackedRowBytes);
+        Inc(TilePos, PackedBlockBytes);
+        Inc(ScalePos, FBlocksPerRow);
+      end;
+      TransposeByteTile(TNeuralByteArrPtr(@PairTile[0]), PackedBlockBytes,
+        TNeuralByteArrPtr(@PairDst^[PairDstPos]), DstColStride, TileRowCount,
+        PackedBlockBytes);
+      Inc(ScaleDstPos, DstColStride);
+      Inc(PairDstPos, PackedBlockBytes * DstColStride);
+    end;
+    Inc(TileRow, TileRowCount);
+  end;
 end;
 
 procedure TNNetVolumeQuant4.DequantizeRowTo(x, y: integer; Dest: TNeuralFloatArrPtr);

@@ -29,17 +29,14 @@ layer class and a net containing it round-trips through
 * `AddMultiHeadSelfAttention` for the self-attention module;
 * `TNNetSwish` (SiLU) as the FFN/conv activation;
 * `TNNetGLU` for the conv-module gating;
-* `TNNetCausalConv1D` for the 1-D convolution over the time axis (causal/SAME,
-  length-preserving);
+* `TNNetDepthwiseConv1D` (causal mode) for the per-channel 1-D convolution over
+  the time axis (length-preserving);
 * `TNNetSum` for the residual adds and `TNNetMulByConstant(0.5)` for the macaron
   half-step scaling.
 
-> **Note on the convolution.** The original Conformer uses a *depthwise*
-> (per-channel) 1-D convolution. This library has no per-channel
-> 1-D-over-sequence primitive, so the closest available shape-preserving 1-D
-> sequence conv — `TNNetCausalConv1D`, a full conv that **does** mix channels
-> across the kernel window — is used instead. This is documented in the builder's
-> source comment.
+> **Note on the convolution.** As in the original Conformer, the conv module is
+> a *depthwise* (per-channel) 1-D convolution: `TNNetDepthwiseConv1D` gives each
+> channel its own time kernel and does not mix channels.
 
 The block is **shape-preserving** over a `(SeqLen, 1, d_model)` input (`SizeY=1`),
 so blocks stack directly.

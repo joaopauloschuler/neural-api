@@ -152,6 +152,7 @@ type
     procedure TestToGraphvizDotSmoke;
     procedure TestLayerTimingReportSmoke;
     procedure TestProfileReportStructureAndCounts;
+    procedure TestLayerGroupTimingsUnderLayerProfiling;
     procedure TestMixtureOfExpertsShapeForwardTrainAndRoundTrip;
     procedure TestMixtureOfDepthsShapeDegenerateAndRoundTrip;
     procedure TestDropBlockSmokeAndRoundTrip;
@@ -7356,6 +7357,66 @@ begin
   // nil NN must not crash.
   S := TNNet.ProfileReport(nil, nil);
   AssertTrue('nil NN handled', Length(S) > 0);
+end;
+
+procedure TTestNeuralLayersExtra.TestLayerGroupTimingsUnderLayerProfiling;
+var
+  NN: TNNet;
+  Sample: TNNetVolume;
+  Groups: TNNetLayerGroupTimingArray;
+  GroupPos, PassCnt: integer;
+  DenseFound: boolean;
+  S: string;
+begin
+  NN := TNNet.Create;
+  Sample := TNNetVolume.Create(4, 1, 1);
+  try
+    NN.AddLayer(TNNetInput.Create(4));
+    NN.AddLayer(TNNetFullConnectReLU.Create(5));
+    NN.AddLayer(TNNetFullConnectLinear.Create(3));
+    Sample.FillForDebug();
+    // Off: no layer counts profiled forwards.
+    NN.Compute(Sample);
+    AssertEquals('off: no profiled forwards', 0,
+      NN.Layers[1].ProfiledForwardCnt);
+    NN.LayerProfiling := true;
+    NN.ClearTime();
+    for PassCnt := 1 to 3 do NN.Compute(Sample);
+    AssertEquals('each layer counted per forward', 3,
+      NN.Layers[2].ProfiledForwardCnt);
+    // Two layers of different classes share the group 'Dense'.
+    Groups := TNNet.LayerGroupTimings(NN, ['', 'Dense', 'Dense']);
+    AssertEquals('two groups', 2, Length(Groups));
+    DenseFound := false;
+    for GroupPos := 0 to High(Groups) do
+      if Groups[GroupPos].GroupName = 'Dense' then
+      begin
+        DenseFound := true;
+        AssertEquals('Dense instances', 2, Groups[GroupPos].InstanceCnt);
+        AssertEquals('Dense forwards', 6, Groups[GroupPos].ProfiledForwardCnt);
+        AssertEquals('Dense spans two classes', '(mixed)',
+          Groups[GroupPos].LayerClassName);
+      end
+      else
+        AssertEquals('unnamed layer grouped by class', 'TNNetInput',
+          Groups[GroupPos].GroupName);
+    AssertTrue('Dense group present', DenseFound);
+    for GroupPos := 1 to High(Groups) do
+      AssertTrue('sorted by time', Groups[GroupPos - 1].ForwardUs >=
+        Groups[GroupPos].ForwardUs);
+    S := TNNet.LayerGroupTimingReport(NN, ['', 'Dense', 'Dense'], 3);
+    AssertTrue('report names the group', Pos('Dense', S) > 0);
+    AssertTrue('report says host only', Pos('Host only', S) > 0);
+    AssertTrue('report has TOTAL', Pos('TOTAL', S) > 0);
+    AssertTrue('class report still works',
+      Pos('Layer Class Timing Report', TNNet.LayerClassTimingReport(NN)) > 0);
+    NN.ClearTime();
+    AssertEquals('ClearTime resets the count', 0,
+      NN.Layers[2].ProfiledForwardCnt);
+  finally
+    Sample.Free;
+    NN.Free;
+  end;
 end;
 
 procedure TTestNeuralLayersExtra.TestMixtureOfExpertsShapeForwardTrainAndRoundTrip;

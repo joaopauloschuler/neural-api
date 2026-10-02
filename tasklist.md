@@ -332,6 +332,42 @@ rather than acted on.
       pooling over the variable grid and a padding/attention mask — needs a
       variable-SeqLen vision input, an interpolated/resampled position table,
       and key-padding-masked MAP pooling. Not yet wired.
+- [x] examples/TCNClassifier — a Temporal Convolutional Network (Bai, Kolter &
+      Koltun 2018, arXiv:1803.01271) for MULTIVARIATE time-series
+      classification, built only from existing layers (no new leaf class). A
+      user asked whether CAI Neural supports a standard TCN; it does, but no
+      example shows the layer structure (`examples/TimeSeriesForecast` is a
+      2-layer univariate causal-conv stack with no residuals). Scope:
+      - Input `(WindowLen, 1, NumFeatures)`: time on X, features on Depth;
+        fixed rolling windows cut from a synthetic multivariate series
+        generated in-code (no downloads, fixed RandSeed).
+      - Residual block: `TNNetCausalConv1D(C, K, 0, Dilation)` -> ReLU ->
+        `TNNetSpatialDropout1D` -> same again -> `TNNetSum` with the skip path
+        (a `TNNetPointwiseConvLinear(C)` 1x1 projection when the channel
+        count changes) -> ReLU. Dropout optional (README must say so).
+      - Dilations 1, 2, 4, 8, 16; print the receptive field
+        (1 + 2*(K-1)*sum(dilations)) and choose WindowLen >= it.
+      - Head: `TNNetCrop(WindowLen-1, 0, 1, 1)` (last time step) ->
+        `TNNetFullConnectLinear(NumClasses)` -> `TNNetSoftMax`; trained with
+        `TNeuralFit`. Report test accuracy vs chance.
+      - Synthetic task should need the long receptive field (e.g. the class
+        depends on an event far back in the window), so a non-dilated stack
+        scores worse; print both.
+      - Pure CPU, under 3 GB (`ulimit -v 3145728`), a few minutes at most;
+        .lpr (with `cthreads` first in uses) + .lpi + README + an
+        examples/README.md entry.
+      Related follow-ups (separate, each needs user OK): a
+      `TNNet.AddTCNBlock` builder; a dilated INPUT-gradient check for
+      `TNNetCausalConv1D` (only the dilated weight gradient is checked
+      today); a faster `TNNetCausalConv1D` forward/backward for narrow
+      InputDepth (one AVX call per tap is overhead-bound at e.g. 5 features).
+      DONE: builder `TNNet.AddTCNBlock` (68cf0d77, tests tightened 777a6d08)
+      and examples/TCNClassifier using it. Measured (window 64, 4 channels,
+      KernelSize 2, receptive field 63): dilated TCN 97.11% test accuracy vs
+      non-dilated baseline 39.46% (receptive field 11, same 4864 weights);
+      chance 25%. Peak RSS 36 MB. Wall clock varies widely, cause not yet
+      diagnosed: 8:08 and 33:34 measured. The builder and the dilated input-gradient
+      check are done; the narrow-InputDepth speedup is still open.
 
 ### Computer vision & generative models
 
@@ -1752,21 +1788,430 @@ rather than acted on.
   - [ ] timm naming variant.
   - [ ] downsample-in-first-stage=true real configs (code handles it, untested
         on a real ckpt).
-- [ ] Qwen-Image text-to-image MMDiT importer (`BuildQwenImageFromSafeTensors[Ex]`,
-      Qwen/Qwen-Image, model_type `qwen_image`). The 2025 flagship open text-to-image
-      model: a Qwen2.5-VL text encoder (LANDED — `BuildQwen2VL`-family) feeds an
-      MMDiT-style double-stream diffusion transformer over packed VAE latents, with a
-      16-channel VAE decoder (the landed `BuildVaeDecoder` path) producing the image.
-      Almost entirely a wiring job over already-landed pieces: the MMDiT joint-attention
-      blocks (the SD3/FLUX `MMDiT` task's building blocks), the landed
-      `TNNetDiffusionScheduler` (flow-matching/Euler sampling already supported), the
-      VAE decoder and the Qwen2.5-VL prompt encoder. New work is the config-driven
-      block stacking + the modulation (AdaLN-Zero) timestep/text conditioning wiring and
-      the 2-D RoPE over latent patches. Pico fixture + `TestQwenImage*Parity` < 1e-4 vs a
-      float64 HF `QwenImagePipeline` transformer forward on a fixed latent/text pair.
-      Real value: a current state-of-the-art open text-to-image generator runnable as a
-      single native binary, reusing the diffusion + VAE + Qwen-VL infrastructure already
-      in the repo.
+- [ ] Qwen-Image-2.1 text-to-image and image editing (Qwen/Qwen-Image-2.1, diffusers
+      `QwenImage21Pipeline`, Qwen Research License). Target: Phase A (text-to-image)
+      first, 1024x1024 on the OpenCL GPU box, branch a19; B and C are recorded, not
+      scheduled. One Opus agent per task, run serially, test + commit after each.
+      Reference: diffusers `transformer_qwenimage21.py`, `autoencoder_kl_qwenimage21.py`,
+      `pipelines/qwenimage21/pipeline_qwenimage21.py` (merged 2026-09-18).
+      Checkpoint facts (from the configs and safetensors headers):
+      - text encoder `text_encoder/`: Qwen3-VL-8B (`qwen3_vl`). Text part = Qwen3 dense
+        decoder, 36 layers, hidden 4096, 32 q / 8 kv heads, head_dim 128, per-head QK
+        RMSNorm, rope_theta 5e6, interleaved M-RoPE [24,20,20]. For a text-only prompt
+        the three M-RoPE positions are equal, so it reduces to plain 1D RoPE. The
+        transformer reads the LAST decoder layer's output BEFORE the final RMSNorm
+        (diffusers hooks the norm away), minus the system-prompt tokens (drop_idx =
+        tokenized length of the system message). Prompt template:
+        `<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n
+        <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n`.
+      - transformer `transformer/`: 7B, BF16, 2 shards, NO biases anywhere. 32
+        SINGLE-stream blocks, dim 4096, 32 heads x 128, SwiGLU 12288 (`gate_layer`,
+        `proj`, `out`). Block: non-affine LayerNorm -> x(1+scale) -> attention (QK
+        RMSNorm, 3-axis RoPE) -> residual with tanh(gate); same again for the MLP.
+        ONE shared `modulation` Linear 4096->16384 (scale1, gate1, scale2, gate2) feeds
+        every block. `txt_in` = zero-centred RMSNorm (stored weight-1) -> Linear ->
+        GELU-tanh -> Linear. `img_in` Linear 64->4096. `norm_out` = non-affine LayerNorm
+        x (1+scale), no shift. `proj_out` 4096->64. Timestep embedding: t in [0,1] x
+        1000, cos half FIRST then sin, dim 256 -> Linear -> SiLU -> Linear.
+      - attention mask: block-causal, `(q >= kv) or same_image_block`. With
+        `causal_condition`, text and condition-image tokens take modulation from t=0,
+        so their K/V are step-independent: the pipeline computes them once (extract)
+        and later steps run only the target-image tokens against the cached prefix
+        (cached). RoPE: axes (frame, h, w) = (16, 56, 56) dims, theta 10000,
+        consecutive-pair (complex) layout; text tokens get position p on all 3 axes;
+        an image block gets frame = position after the preceding text and an (h, w)
+        grid centred on zero (negative indices allowed).
+      - VAE `vae/` (`AutoencoderKLQwenImage21`, F32): 2D for images (all conv weights
+        [out,in,3,3]) despite the Wan-style names. RGBA in/out, z_dim 64, 16x spatial.
+        Encoder base 96, decoder base 144 (up to 1152 channels). Channel RMSNorm
+        (F.normalize x sqrt(C) x gamma), SiLU, residual AvgDown/DupUp shortcuts,
+        nearest-exact upsample + conv, single-head mid-block attention. Latents are
+        de-normalised with 64 `latents_mean` / `latents_std` values before decode.
+      - scheduler: `FlowMatchEulerDiscreteScheduler`, sigmas = linspace(1, 1/N, N),
+        exponential dynamic shift, mu linear in image token count (256 -> 0.5,
+        8192 -> 0.9), `shift_terminal` 0.02; x += (sigma_next - sigma) * v. Guidance
+        `true_cfg_scale` defaults to 1.0 (off): one transformer pass per step. Default
+        40 steps.
+      - cost: 1024x1024 = 4096 image tokens, ~66 TFLOP per step, ~2.6 PFLOP for 40
+        steps (2048x2048 ~6x more). Compute-bound GEMM, not decode GEMV. int8:
+        transformer ~7 GB, text encoder ~8 GB, loaded one after the other.
+  Phase A — text-to-image, correctness first:
+  - [x] A0. Parity oracle: install diffusers (git main) + transformers >= 5.17 into
+        the `x` venv; a script that builds tiny random-weight versions of each
+        component and writes float64 inputs/outputs to `tests/fixtures/`.
+        Done: `tools/make_pico_qwenimage21_fixture.py` -> `tests/fixtures/tiny_qwenimage21/` (pico diffusers folder), `qwenimage21_{scheduler_oracle,prompt_tokens}.json`, `tiny_qwenimage21_{text_encoder,rope,transformer,vae,pipeline}_io.json`.
+  - [x] A1. Flow-matching Euler scheduler in `neuraldiffusion.pas` (decide: extend
+        `TNNetDiffusionScheduler` or a new class): dynamic exponential shift,
+        `shift_terminal`, velocity step. JSON oracle test. Independent.
+        Done: new class `TNNetFlowMatchEulerScheduler` (CalculateShift, TimeShift, SetSigmas, SetTimesteps, Step); tests `TestFlowMatch*` in `tests/TestNeuralDiffusion.pas`.
+  - [x] A2. Qwen3-VL text encoder as prompt encoder: route `qwen3_vl` to the Qwen3
+        builder (`model.language_model.` prefix, skip `model.visual.*` and `lm_head`,
+        int8 load); test that text-only interleaved M-RoPE equals 1D RoPE; API returning
+        pre-final-norm last-layer hidden states; template + tokenization + drop_idx.
+        Done: `BuildQwen3VLTextEncoderFromSafeTensors` (Llama builder, `pStopBeforeFinalNorm`), `Qwen3VLEncodeHiddenStates`, `QwenImage21TextToImagePrompt`, `QwenImage21EncodeTextToImagePrompt`; `qwen3_vl` also in `BuildFromPretrained`; tests `TestQwen3VL*`, `TestQwenImage21PromptTemplateIds`.
+  - [x] A3. Qwen-Image RoPE: extend `TNNetMRotaryEmbedding` for the consecutive-pair
+        layout, 16/56/56 sections and negative positions; position builder (text
+        0..L-1, image frame = L, centred h/w grid).
+        Done: subclass `TNNetAxialRotaryEmbedding` (per-axis tables; M-RoPE gained `pRotaryHeadDim` head tiling), `BuildQwenImage21RopePositions`; tests `TestQwenImage21Rope*`, `TestAxialRoPE*`, `AxialRoPEOpenCLParity`, `TestMRoPETiledMatchesPerHead`.
+  - [x] A4. Transformer block, step pass: image-token queries attend (no causal mask)
+        to [cached prefix K/V ; own K/V]. Reuse `TNNetHeadRMSNorm`, `TNNetLayerNorm`,
+        `TNNetFiLM` / `TNNetChannelMulByLayer`, the fused SDPA KV cache and batched
+        prefill where they fit; fold the zero-centred +1 into the RMSNorm weight at
+        load. Single-block parity vs HF.
+        Done: `AddQwenImage21Block` (qibStep / qibPrefix), `AddQwenImage21Modulation`, `AddQwenImage21TextProjection`, `LoadQwenImage21BlockWeights`, `ReadQwenImage21TransformerConfig`; `TNNetFusedSDPA` gained `CachedForwardNonCausal` + `AppendCacheRowsFrom`; tests `TestQwenImage21StepBlockParity`, `TestQwenImage21PrefixBlockKVParity`, `TestCachedForwardNonCausal`.
+  - [x] A5. `BuildQwenImage21Transformer`: a PREFIX network (text tokens, causal, t=0
+        modulation, emits per-layer K/V) and a STEP network (target tokens); timestep
+        embedding, shared modulation computed once per step, `norm_out`, `proj_out`;
+        sharded diffusers-folder loader. Parity vs HF extract and cached modes.
+        Depends on A3 + A4. Memory: ONE reusable step block whose layers are pointed
+        at block i's weights before block i runs (each block keeps its own KV cache);
+        32 blocks in one TNNet would need ~64 GB of activations at 1024x1024 (~2 GB
+        per block at N=4096). One code path for every image size.
+        Done: class `TQwenImage21Transformer` (weight store `BlockStore[i]`, `SelectBlockWeights` re-links via `TNNet.LinkWeightsFrom`, `EncodePrefix`, `PredictVelocity`, `qiwFP32/qiwInt8/qiwInt4`), `QwenImage21SetRopePositions`; `TNNetLayer.LinkWeightsFrom` may re-link; tests `TestQwenImage21Transformer*`.
+  - [x] A6. VAE decoder: first check whether image decode ever runs `time_conv`;
+        channel RMSNorm, DupUp shortcuts, mid attention, latent de-normalisation,
+        tiled decode (2048x2048 full-resolution activations are ~2.4 GB each). Pico
+        parity. Independent.
+        Done: class `TQwenImage21VaeDecoder` (1x1-latent weight owner + borrowing sized net; `Decode`, `DecodeTiled` = diffusers tiled_decode), `ReadQwenImage21VaeConfig`, `BuildQwenImage21VaeDecoderNet`, `LoadQwenImage21VaeDecoderWeights` (skips time_conv, folds latents_mean/std into post_quant_conv), `QwenImage21DupUpChannels` + `AddQwenImage21DupUp`; conv kernels now clamp to the PADDED input; tests `TestQwenImage21Vae*`. Real-size activations (weights 1.01 GB): 0.58 GB at 64x64, ~9.3 GB at 256x256 (one default tile), ~149 GB untiled at 1024x1024, ~73% of it per-conv im2col/pad/raw buffers.
+  - [x] A7. Pipeline + `examples/QwenImage` CLI: read the `model_index.json` folder,
+        tokenize, encode, free the text encoder, denoise, decode, save PNG WITH ALPHA
+        (check that `SaveImageFromVolumeIntoFile` writes RGBA). `--width --height
+        --steps --seed --int8/--int4 --opencl`. End-to-end pico parity with fixed
+        initial latents (torch RNG is not reproducible). Test sizes: 64x64 with the
+        pico checkpoint on the dev box (extend the generator with a 64x64 case);
+        real weights on the GPU box, a 256x256 smoke test first, then 1024x1024 and
+        beyond, compared per step against diffusers with the same initial latents.
+        Done: class `TQwenImage21Pipeline` (neuralpretrained.pas: `TokenizePrompt`, `EncodeTokenIds`, `MakeInitialLatents`, `Denoise`, `DecodeLatents`, `GenerateFromEmbeds`, `Generate`, `RoundDownImageSide`, events `OnPhase`/`OnStep`), `TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfig` + `ShiftForImageSeqLen`, RGBA PNG in `SaveImageFromVolumeIntoFile` / `LoadImageIntoVolume(.., pWithAlpha)`; `examples/QwenImage` (`--model --prompt --output --width --height --steps --seed --int8|--int4 --int8-input --vae-tile S[,T] --token-ids --drop-count`, no `--opencl`); tests `TestQwenImage21Pipeline*`, `TestQwen3VLEncodeRefusesOutOfVocabIds`, `TestFlowMatchFromDiffusersConfig`, `TestSaveImageRGBAPngRoundTrip`; fixture `tiny_qwenimage21_pipeline_64_io.json`.
+        Follow-ups: `cthreads` in the example's uses clause (a26c3f72; without it the
+        first worker thread aborted with runtime error 232); parallel forward on every
+        core (74fa882d: `Parallel` / `MaxThreads` on the pipeline, transformer and VAE,
+        `PrepareInferenceThreads`, CLI `--serial` / `--max-threads N`; bit-identical to
+        serial). First real run (user, 2026-09-24, real Qwen/Qwen-Image-2.1, 12 threads):
+        256x256, `--int4`, 10 steps -> the image shows a fox. Step time 16.4 s int4,
+        34.3 s int8 (was ~162 s int8 single-threaded); load transformer 148 s int4 /
+        64 s int8; VAE decode 31 s.
+  - [ ] A8. Docs: README entry for Qwen-Image-2.1 text-to-image on the CPU, listed as
+        user-tested with the exact configuration (256x256, `--int4`, 10 steps, 2026-09-24).
+        Build line and binary path: `cd examples/QwenImage && lazbuild -B QwenImage.lpi`
+        writes `bin/x86_64-linux/bin/QwenImage` at the REPO ROOT (the A7 report gave a
+        path inside `examples/QwenImage`, which is wrong).
+  - [ ] A9. Keep-loaded mode + REPL: `TQwenImage21Pipeline` gains `LoadComponents` /
+        `UnloadComponents` so `Generate` reuses loaded weights (the one-shot CLI keeps
+        today's load-and-free order). The text encoder is built once for a maximum
+        prompt length (padding is exact, A2); prefix/step/VAE nets are rebuilt per
+        image by borrowing weights; activations are freed between images, weights
+        kept. `examples/QwenImage --repl`: one prompt per line, numbered output
+        files, `/size WxH`, `/steps N`, `/seed N` (else the seed increments),
+        `/tile SIZE[,STRIDE]`, `/quit`; print resident memory at startup. Test: two
+        prompts through one loaded pipeline equal two one-shot runs (pico). Estimated
+        resident at 1024x1024: ~19 GB int8, ~16 GB int4 (test boxes have 50-150 GB).
+        Removes the per-image loads measured on the first real run: text encoder
+        49-67 s, transformer 64 s int8 / 148 s int4.
+  Phase B — speed (after a first real measurement on the GPU box):
+  - [ ] B1. OpenCL for the transformer step pass. Int4 is required; int8 comes along
+        with it (the tiled OpenCL kernels share one layout). The text encoder and
+        the VAE stay on the CPU in this task. Target GPUs have 24-100 GB of memory.
+        Runs BEFORE B0 and A9 (user decision, 2026-09-25).
+        Already in the library: `cai_dot_product_int4_tiled` / `_int8_tiled`
+        (many-token projections, used by --prefill-window); resident-codes sharing
+        (`EnableOpenCLInContextOf`, `BorrowOwnerOpenCLCodes`); OpenCL paths for
+        TokenLayerNorm, ChannelMulByLayer, HeadRMSNorm (via TokenRMSNorm), axial
+        RoPE (via M-RoPE), DeepConcat, Sum, SwiGLU.
+        Estimate (not measured): 1024x1024 step ~57 TFLOP of projections + ~18
+        TFLOP of attention, limited by arithmetic, so int4 saves GPU memory
+        (~4.4 GB of weights vs ~7 GB int8), not time.
+        First GPU run (user, 2026-09-30, NVIDIA L4, tip dd2c2971, before B1d):
+        256x256 --int4, 40 steps: 2.2 s/step (CPU int4 16.4 s/step), denoise
+        91.7 s; load transformer 240.3 s (CPU int4 load 148 s); load text
+        encoder 39.8 s; VAE decode 33.3 s (CPU); peak RSS 8.8 GB. 2.2 s/step is
+        ~1.6 TFLOPS of projections, far below the L4, so host layers,
+        transfers and synchronisation dominate at 256 tokens.
+        Second GPU run (user, 2026-09-30, L4): 1024x1024 --int4, 10 steps:
+        36.3 s/step (16.5x the 256x256 step for 16x the tokens: linear, so
+        attention does not dominate; ~75 TFLOP/step, ~2 TFLOPS achieved),
+        denoise 370.4 s, VAE decode 528.2 s (CPU, now the largest cost), load
+        transformer 245.2 s, peak RSS 10.9 GB. B1f runs before B1d2 to tell
+        the int4 projection kernel, the host layers and the transfers apart.
+    - [x] B1f. Per-layer time profile of one GPU step (user's GPU box), to
+          measure where the step time goes before further kernel work.
+          DONE: `examples/QwenImage --profile` (TNNet.LayerProfiling drains the
+          net queue and the layer's output queue after every layer that
+          enqueued OpenCL work; per-role and per-class tables with OpenCL
+          forwards and host<->OpenCL transfer counts/MB). User run pending:
+          `--int4 --width 1024 --height 1024 --steps 2 --profile`.
+          L4 profile (user, 1024x1024 int4, b03fae2f): 34.6 s/step; transfers
+          22.5 GB up + 12.3 GB down per step at only ~2 GB/s effective, so about
+          half the step is host layers + transfers (Q/K RoPE 5.2 s, Norm2 2.6,
+          QKV concat 1.9, Norm1 1.5, Modulated1/2 2.2, BlockInput 1.0, input
+          uploads in Q/K/V/GateUp ~4). Attention ~7.8 s/step (~1.1 TFLOPS, the
+          weakest OpenCL kernel). Projections with a resident input are fine
+          (OutProj 13.7 ms/block, ~10 TFLOPS). Image-in net 1.16 s/step on the
+          CPU for ~2 GFLOP (odd; look later). Order chosen: B1d2 -> B1d3 ->
+          B1d4, then B2 (VAE 519 s), then the B1c deferred attention items.
+    - [x] B1g. Transformer load time with OpenCL (240 s vs 148 s on the CPU):
+          find the extra ~92 s (suspect: the host-side int4 repack loop in
+          `PrepareInt4DotCL`, one nested call per weight pair; unverified).
+          Investigated 2026-10-02 (real-shape block, this box): the extra time
+          is the host repack in `PrepareInt4DotCL` (2.4-2.9 s/block, ~76-92 s
+          for 32 blocks; byte-at-a-time writes with a NumAs stride, each on a
+          new cache line). The upload is ~2 s total. A 64-row tiled loop gives
+          byte-identical output ~3.5-4x faster single-threaded. The CPU int4
+          load is slow for a second reason: `QuantizeWeightsInt4` (int8 ->
+          dequantize -> int4, serial, scalar `QuantizeRow` with per-element
+          IsNan/IsInfinite) costs 2.4-3.9 s/block (~80 s). Neuron object
+          construction costs ~0.6-0.8 s/block (also the text encoder).
+      - [x] B1g1. Tiled + threaded repack in PrepareInt4DotCL and the int8
+            transpose in PrepareInt8DotCL (byte-identical layout).
+            DONE: 64-row tiles (TransposeByteTile; TNNetVolumeQuant8
+            .CopyRowsTransposedTo, TNNetVolumeQuant4
+            .CopyRowsAsPairedTransposedTo) fanned by TQuantRowsTransposeFan.
+            Arming one int4 block on PoCL 2.8-4.6 s -> 0.7-1.1 s (32 blocks
+            ~90-145 s -> ~23-36 s, extrapolated). Found: the shared fNTL pool
+            is 1 thread on Linux (FPC 3.2.2 TThread.ProcessorCount = 1), so
+            every fNTL fan runs inline; fix awaits the user's decision.
+      - [x] B1g2. Quantize to int4 directly in the loader (FP32/BF16 rows ->
+            Q4_0 in the threaded row fan), branch-free QuantizeRow.
+            DONE: TNNet.BeginInt4QuantImports + LoadLlamaLinearWeights'
+            DirectInt4FromRows route (Qwen-Image transformer only); QuantizeRow
+            branch-free with an AVX2 path (~15x, output identical for finite
+            input; tiny-max blocks no longer raise EOverflow). One real-shape
+            int4 block loads in 0.8-2.3 s instead of 3.9-7.5 s (this box).
+            Int4 results change slightly (one rounding instead of two).
+            Follow-up:
+            - [x] ChatTerminal / LLM --int4 quantize streamed rows straight
+                  to int4 too (NeuralImportInt4FromRows, set by TChatEngine;
+                  LoadLlamaLinearWeights and the tied LM head open the import;
+                  BuildFromPretrained refuses partial imports). The borrowing
+                  twin reads no checkpoint; the fallback twin takes the same
+                  route. Layers that cannot stream rows keep the int8 -> int4
+                  sweep; the MoE banks have no int4 forward and stay int8.
+      - [x] B1g3. Skip creating the four training volumes per neuron in
+            inference-only builds.
+            DONE differently: the cost was TVolume's per-volume TFormatSettings
+            copy (~45 managed strings per constructor/destructor), not the
+            training volumes. The field is gone (TNNetVolume 432 -> 56 bytes);
+            formatting reads GetDefaultNumericFormat at conversion time.
+            Neuron Create+Free 12.4 -> ~1.1 us; real-shape block build median
+            ~830 -> ~170 ms (~21 s per 32-block transformer load; text encoder
+            ~15 s, extrapolated). Skipping the training volumes would now save
+            only ~0.7 s per load (not done).
+    - [x] B1a. Read-only audit (2026-09-25, pico block 0 on PoCL, transfer trace;
+          probe in the session scratchpad, not in the repo). Only 9 of the
+          block's 31 layers run on OpenCL (6 projections, QNorm/KNorm, SwiGLU);
+          the activation chain leaves OpenCL memory ~6 times per block, ~1 GB of
+          transfers per block at 1024x1024 (estimate). Parity where OpenCL runs:
+          int8 block 2.7e-7, int4 tiled GEMM 1.1e-6, HeadRMSNorm + forced axial
+          RoPE 7.2e-7. PARITY-TEST TRAP: the CPU int4 path quantizes the input to
+          int8, OpenCL keeps it FP32 (3.6e-2 apart, both correct), so B1 parity
+          tests compare against an FP32-input oracle. Verified arming order that
+          shares one copy of the codes: BlockStore[0].EnableOpenCL, then
+          EnableOpenCLInContextOf(BlockStore[0]) for blocks 1-31 and the step net.
+    - [x] B1b. All 32 blocks' int4/int8 codes resident in OpenCL memory, one
+          DONE 88aad8ca (handle swap + RefreshResidentBias); GPU-by-default CLI
+          with --cpu: 807d61c5.
+          context, uploaded once. `SelectBlockWeights` swaps only handles: in
+          `TDotProductSharedKernel` FCodesBuffer / FScalesBuffer /
+          FBlockScalesBuffer (+ caps, FCodesBorrowed, FInt8Ready/FInt4Ready;
+          retain new, release old), AND re-set the tiled OpenCL kernel's args
+          4/9/10 (`PrepareTiled` binds them once; split-K and single-pass compare
+          handles and re-bind by themselves). `PrepareForComputeBorrowingCodes`
+          cannot be used per block (it re-creates the result and input buffers,
+          403 MB for GateUp at 4096 tokens). Layer side:
+          `TNNetLayerConcatedWeights.LinkWeightsFrom` refuses when FHasOpenCL, and
+          the host tables (FQuantTable, FQuantTableInt4, FWeightOwner, FNeurons)
+          must follow the swap for the CPU fallback. The prefix net stays on the
+          CPU. Parity test: pico, PoCL vs FP32-input oracle.
+    - [x] B1c. Tiled non-causal attention OpenCL kernel for
+          `CachedForwardNonCausal` (query tile + key tile in local memory, online
+          softmax, keys = text prefix + image rows). The decode kernel
+          (`cai_sdpa_decode_split`) re-reads all K/V per query row: ~540 GB per
+          block at 1024x1024. Keep the 32 blocks' prefix K/V resident once per
+          prompt (today `AppendCacheRowsFrom` goes through the host and
+          `UploadCache` re-uploads them every block of every step); the image
+          rows' K/V can be read straight from the packed QKV input. `WillOpenCL`
+          accepts FCachedForwardNonCausal when the new kernel fits (its own
+          local-memory test, not `QueryTileFits`). Parity test: pico, PoCL vs CPU.
+          DONE: `cai_sdpa_noncausal_tiled` (query tile x key tile in local
+          memory, online softmax; PoCL 64x32 tiles, NVIDIA 48 KB computed 26x32);
+          prefix K/V uploaded once per EncodePrefix and appended per block inside
+          OpenCL memory (`NewCacheRowsOnOpenCL` / `AppendCacheRowsFromOpenCL`).
+          Parity vs CPU 1.8e-7..3.0e-7 (layer), 6.0e-7 (pico velocity). Resident
+          prefixes cost NumLayers x L x hidden x 8 B of OpenCL memory (~256 MB at
+          L=256, ~1 GB at L=1024). Deferred until a GPU measurement:
+          - [x] O accumulator in private registers (raises R on 48 KB devices).
+          - [x] Register-blocked score and P.V loops (today 2 local reads per mad).
+          - [x] Tree reduction for the running-max fold (one lane per row today).
+          DONE (kernel rewrite): O in registers (3x2 float4 per lane), 3x2
+          score and P.V blocking with float4 local loads, parallel row max and
+          per-lane partial sums, one work-group per 128 head-dim columns,
+          reqd_work_group_size(16,16,1); 48 KB tiles 26x32 -> 42x32 (computed),
+          PoCL ~2.1x on one shape (not a GPU timing). L4 gain unmeasured.
+    - [x] B1d. Layers that send the activations back to RAM (B1a), worst first:
+      - [x] B1d1. `TNNetChannelMulByLayer` x4: the modulation operand is a host
+            row (TNNetAddConstant has no OpenCL path; SplitChannels/Tanh follow
+            their host source). Accept a host-only FLayerMul of Depth floats,
+            upload it to a small per-layer buffer once per step.
+            DONE: Gated1/Gated2 bind OutProj/Down and upload the host row (16 KB,
+            blocking write) every forward; both TNNetSum layers follow onto
+            OpenCL. Modulated1/2 stay on the host until B1d2. Follow-ups:
+            - [ ] Non-blocking row write + a queue Finish at the end of
+                  TNNet.Compute when the last layer ends on the host (worth it
+                  after B1d2, when these writes are the only mid-block waits).
+            - [ ] Run the modulation chain (SplitChannels, AddConstant, tanh) on
+                  OpenCL so the four rows stay resident for all 32 blocks.
+            - [ ] Shared "bind or upload the operand" helper for
+                  TNNetChannelMulByLayer and TNNetCellMulByCell.
+            - [ ] SE / CBAM / DiT importers now take this OpenCL path with no
+                  OpenCL parity test.
+      - [x] B1d2. `TNNetTokenLayerNorm` x2: FShouldOpenCL pinned false
+            (deliberate: OpenCLForwardBenchmark ~0.54x standalone), Compute
+            downloads before WillOpenCL, no residency clause, no bind/keep, no
+            OpenCLOutputBuffer. Mirror TNNetTokenRMSNorm; one work-item per token
+            is weak at depth 4096.
+            DONE: TNNetTokenLayerNorm binds a resident source and keeps its
+            output (FShouldOpenCL stays pinned for host sources);
+            cai_volume_norm runs one segment per work-group (cai_token_norm
+            removed; TokenRMSNorm/HeadRMSNorm share it); TNNetLayer
+            .PrevOutputOnOpenCLSameSize replaces 5 copies. Norm1/2,
+            Modulated1/2 on OpenCL; Q/K/V/GateUp no longer upload, Norm2 no
+            longer downloads (~10.7 GB/step less at 1024x1024, computed).
+            Follow-ups:
+            - [ ] Shared parent class for the four norm layers' identical
+                  FTokenNormCL / EnableOpenCL / WillOpenCL / output overrides.
+            - [ ] Forced-OpenCL TRAINING through TokenLayerNorm/TokenRMSNorm
+                  never fills FNormalized/FInvStd (FInvRMS): backprop reads
+                  stale values (pre-existing). TNNetRMSNorm.WillOpenCL has no
+                  trainable exclusion.
+      - [x] B1d3. `TNNetAxialRotaryEmbedding` x2 (via TNNetMRotaryEmbedding):
+            Compute downloads before WillOpenCL, no residency clause,
+            `TNNetMRoPECL.Rotate` has no bind/keep and uploads the whole angle
+            table every forward (32x redundant across heads). Add bind/keep as
+            TNNetRoPECL.Rotate has; keep the table resident, re-upload only when
+            positions change.
+            DONE: TNNetMRotaryEmbedding binds a resident source and keeps its
+            output (no size test: growing decode); the angle table is one
+            head's worth (cai_mrope FHalfTile) and stays resident, re-uploaded
+            only when positions/offset change. QRope/KRope, the QKV concat and
+            the Attn input stay in OpenCL memory (~23.6 GB/step less at
+            1024x1024, computed). Follow-up:
+            - [ ] Qwen2-VL/Qwen3-VL decode: M-RoPE is per head there and the
+                  positions change every token, so the blocking table write
+                  waits ~900 times per token (no worse than before; a
+                  non-blocking write would be safe in current graphs).
+      - [x] B1d4. Block boundary: TNNet.Compute downloads the last layer and
+            TNNetInput re-uploads it every block. Copy block i's output buffer
+            into the next pass's input inside OpenCL memory; download only after
+            block 31.
+            DONE: TNNet.KeepLastOutputOnOpenCL (a full forward drains the
+            queue instead of downloading the last layer) +
+            TNNet.ComputeFromLayerOutput (TNNetInput.CopyNextInputFrom: its
+            next Compute copies the source buffer with clEnqueueCopyBuffer on
+            the input's queue).
+            PredictVelocity: 1 upload + 1 download of the activation per step
+            instead of 32 + 32 (~4.2 GB/step less at 1024x1024, computed); 31
+            copies inside OpenCL memory (64 MiB each).
+      TNNetSum and TNNetDeepConcat follow once these are fixed.
+    - [ ] B1e. Pipeline wiring + `examples/QwenImage --gpu` (int4 and int8). User
+          runs on the GPU box: 256x256 first, then 1024x1024 and larger; record
+          s/step and peak GPU memory.
+      Risks from B1a (not measured): the tiled int4/int8 OpenCL kernel streams
+      the whole weight matrix once per 16-token tile (~35 GB of int4 codes per
+      block at 4096 tokens unless L2 absorbs it; a wider token tile is the likely
+      fix); if a device rejects the tiled kernel, int4 falls back to split-K
+      (correct, very slow); kernel int32 indices overflow past ~87k tokens; the
+      GateUp result buffer (403 MB at 4096 tokens) can hit
+      CL_DEVICE_MAX_MEM_ALLOC_SIZE at larger images.
+  - [ ] B0. CPU many-token int8/int4 projections. Evidence: at 256x256 a step is
+        34.3 s int8 and 16.4 s int4 (~2.1x, the weight-byte ratio), i.e. ~105 GFLOPS
+        and ~53 GB/s: the projections stream all ~7 GB of block weights once per
+        TOKEN instead of reusing each weight row across the 256 tokens. Step 1
+        (read-only): which kernel a many-token `TNNetPointwiseConvLinear` int8/int4
+        forward runs in inference-only low-memory mode, and whether the
+        `--prefill-window` batched path (27B TTFT 341 -> 53.9 s) can be reused; report
+        + proposed fix. Step 2: the fix, after approval. At 1024x1024 (16x the tokens)
+        today's rate is ~9 min per step.
+  - [ ] B2. VAE decode speed: 3x3 convolutions at 1152 channels.
+        Estimate (not measured): a CPU VAE decode at 1024x1024 is ~8 min (16x the
+        31 s measured at 256x256), so it is the next bottleneck once B1 lands.
+    - [x] B2a. Read-only audit (2026-10-01, pico VAE armed on PoCL: all 44
+          convolutions ran on OpenCL, clamped image 2.5e-6 vs CPU). Limits:
+          the FP32 GEMM is the naive `cai_dot_product` (one work-item per
+          output); every padded 3x3 conv downloads its source, pads on the host
+          and uploads (`ShouldBindPrevOutputAsIm2ColSrc` needs FPadding = 0);
+          Reshape, DeMaxPool, GatherChannels, PixelShuffle, the mid SDPA and its
+          one-source DeepConcat have no resident path, so the residual stream
+          drops to RAM after attention and at every upsampler. Memory with
+          today's per-layer buffers: 3.4 GB at 128 px tiles, 10.7 GB at 256,
+          22.8 GB at 384; untiled 1024 needs ~155 GB and overflows int32 im2col
+          indexing (2.72e9 elements). CPU decode measured ~56 GFLOPS (29 TFLOP
+          with 128/96 tile overlap in 519 s).
+    - [x] B2b. Arm OpenCL on the VAE in the pipeline
+          (`TQwenImage21VaeDecoder.EnableOpenCL`, sized nets in one context).
+          DONE: the CLI arms it by default (also with FP32 transformer
+          weights); closing "Compute :" line names where the VAE ran;
+          --profile prints a VAE table per tile shape. Follow-ups:
+          - [ ] FP32 weight sharing across the tile-shape nets (each uploads
+                the 1 GB of weights again).
+          - [ ] Drop the armed nets' host FConcatedWeights/FConcatedWInter
+                copies (~2 GB) after the upload.
+          - [ ] One OpenCL context per pipeline (today the transformer and the
+                VAE each build the program per image).
+          - [ ] Parallel scheduler + OpenCL on PoCL is 20-90x slower than
+                --serial (CPU oversubscription with PoCL's threads; worker
+                count 4 -> 2 gives 32 s -> 3.3 s). Measure --serial vs default
+                on the L4; cap the workers for CPU OpenCL devices.
+    - [x] B2c. FP32 tiled GEMM OpenCL kernel (twin of
+          `cai_dot_product_int8_tiled`), used by every FP32 conv/FC with >= 16
+          columns.
+          DONE: `cai_dot_product_tiled` shares `cai_dot_product_tiled_body`
+          with the int8 kernel; FP32 Compute takes it when FNumBs >= 16 and
+          FNumAs >= 64 (small-row GEMMs such as gram / attention P.V stay on
+          `cai_dot_product`). GPU speed unmeasured.
+    - [x] B2d. Padding-aware OpenCL im2col: bind the unpadded resident source.
+          DONE: `cai_im2col` / `cai_im2col_h` take InSizeY and Padding and
+          write zeros for out-of-source taps; a padded conv binds a resident
+          source (no download + host pad + upload). Pico VAE: 26 of 40 3x3
+          convs move 0 bytes, 14 still read a host source until B2e (~22 of
+          ~39 GB per 1024x1024 decode removed, computed). OpenCL binaries must
+          be rebuilt with the new neural.cl (kernel arguments changed).
+    - [x] B2e. VAE residency gaps: Reshape alias, nearest-2x upsample kernel,
+          DupUp gather/pixel shuffle bind+keep, SDPA output.
+          DONE (inference only): TNNetReshape offers its source's OpenCL
+          buffer when the Size matches (alias, no copy; MoveOutputToRAM copies
+          from the source's host copy); `cai_upsample_gather` (replaces
+          `cai_pixel_shuffle`, integer indexing, no index map) serves
+          TNNetDeMaxPool, TNNetUpsample and TNNetPixelShuffle forwards (bind a
+          resident source, keep the output); TNNetGatherChannels is now a
+          TNNetSplitChannels descendant (cai_split_channels). Pico VAE: all 40
+          3x3 convs bind; per decode 20 up / 17 down -> 2 up / 1 down besides
+          the image download. 1024x1024 at 128/96 tiles: ~17.6 GB -> ~0.16 GB
+          of activation transfers (computed). Left on the host: the mid-block
+          SDPA (downloads Q|K|V, the out-projection uploads; softmax on host).
+          TNNetSum needed no change. Follow-up:
+          - [ ] Mid-block attention in OpenCL memory (device softmax, or the
+                VAE through TNNetFusedSDPA's non-causal tiled kernel).
+    - [ ] B2f. Later, for big tiles / untiled decode: implicit-GEMM conv (no
+          im2col, folds the 2x upsample), per-row bias instead of the
+          output-sized bias copy, activation buffer reuse by liveness; then
+          256/192 -> 512/384 -> untiled tiles.
+  - [ ] B3. Optional guidance (negative prompt) with its own prefix cache.
+  Phase C — editing and reference images:
+  - [ ] C1. Qwen3-VL vision tower: 27-layer ViT, patch 16, 2x2 merge, DeepStack
+        features from layers 8/16/24 injected into the LLM (likely 2 tasks).
+  - [ ] C2. VAE encoder.
+  - [ ] C3. Edit pipeline: condition-image latents in the prefix, bidirectional
+        within each image block; `<image1>` template; RoPE for several image blocks;
+        up to 10 reference images.
+- [ ] Flow-matching sampler clean-ups surfaced by `TNNetFlowMatchEulerScheduler`
+      (fd99162f):
+  - [ ] `examples/F5TTS/F5TTS.lpr` (~108-122): replace the per-element Euler loop
+        `Xt.FData[i] + dt*Vel.FData[i]` with `TNNetVolume.MulAdd`. Upstream F5-TTS
+        also uses sway sampling, which the scheduler does not cover.
+  - [ ] `examples/FlowMatching/FlowMatching.lpr` (~296-312): optionally drive the
+        loop with `TNNetFlowMatchEulerScheduler`. The example integrates t from 0
+        (noise) to 1 (data) with dt = 1/N and no shift, so it needs time = 1 - sigma
+        and a reversed velocity sign; the gain is small (the loop is already one
+        `MulAdd` per step).
 
 ## OpenCL forward coverage — layers still on the host
 

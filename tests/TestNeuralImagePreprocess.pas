@@ -18,7 +18,7 @@ Coded by Claude (AI).
 interface
 
 uses
-  Classes, SysUtils, fpcunit, testregistry,
+  Classes, SysUtils, fpcunit, testregistry, FPImage,
   neuralnetwork, neuralvolume, neuraldatasets;
 
 type
@@ -40,6 +40,9 @@ type
     procedure TestReadConfigObjectSizes;
     // absent mean/std fall back to the CLIP defaults.
     procedure TestReadConfigDefaults;
+    // A (W,H,4) volume saved as PNG is 8-bit RGBA (colour type 6) and reloads
+    // with its alpha; a 3-channel volume reloads opaque.
+    procedure TestSaveImageRGBAPngRoundTrip;
   end;
 
 implementation
@@ -215,6 +218,72 @@ begin
     AssertEquals('clip std2', 0.27577711, Cfg.Std[2], csOracleTol);
   finally
     DeleteFile(FN);
+  end;
+end;
+
+procedure TTestNeuralImagePreprocess.TestSaveImageRGBAPngRoundTrip;
+var
+  Src, Reloaded: TNNetVolume;
+  Img: TFPMemoryImage;
+  FN: string;
+  PngHeader: TFileStream;
+  HeaderBytes: array[0..25] of byte;
+  X, Y, C: integer;
+begin
+  FN := GetTempDir + 'cai_rgba_roundtrip.png';
+  Src := TNNetVolume.Create(5, 3, 4);
+  Reloaded := TNNetVolume.Create;
+  Img := TFPMemoryImage.Create(1, 1);
+  try
+    // Fractional values: the saver rounds to the nearest byte.
+    for Y := 0 to 2 do
+      for X := 0 to 4 do
+        for C := 0 to 3 do
+          Src[X, Y, C] := (X * 37 + Y * 71 + C * 53) mod 256 + 0.3;
+    Src[0, 0, 3] := 255;
+    Src[1, 0, 3] := 0;
+    AssertTrue('saved', SaveImageFromVolumeIntoFile(Src, FN));
+    PngHeader := TFileStream.Create(FN, fmOpenRead);
+    try
+      PngHeader.ReadBuffer(HeaderBytes, SizeOf(HeaderBytes));
+    finally
+      PngHeader.Free;
+    end;
+    AssertEquals('IHDR bit depth', 8, HeaderBytes[24]);
+    AssertEquals('IHDR colour type 6 = RGBA', 6, HeaderBytes[25]);
+    AssertTrue('reloaded', Img.LoadFromFile(FN));
+    LoadImageIntoVolume(Img, Reloaded, {pWithAlpha=}true);
+    AssertEquals('width', 5, Reloaded.SizeX);
+    AssertEquals('height', 3, Reloaded.SizeY);
+    AssertEquals('4 channels', 4, Reloaded.Depth);
+    for Y := 0 to 2 do
+      for X := 0 to 4 do
+        for C := 0 to 3 do
+          AssertEquals('pixel ' + IntToStr(X) + ',' + IntToStr(Y) + ' c' +
+            IntToStr(C), Src[X, Y, C], Reloaded[X, Y, C], 0.5);
+    // Fully opaque RGBA is still written as RGBA.
+    for Y := 0 to 2 do
+      for X := 0 to 4 do Src[X, Y, 3] := 255;
+    AssertTrue('saved opaque', SaveImageFromVolumeIntoFile(Src, FN));
+    PngHeader := TFileStream.Create(FN, fmOpenRead);
+    try
+      PngHeader.ReadBuffer(HeaderBytes, SizeOf(HeaderBytes));
+    finally
+      PngHeader.Free;
+    end;
+    AssertEquals('opaque RGBA: colour type 6', 6, HeaderBytes[25]);
+    Src.ReSize(5, 3, 3);
+    Src.Fill(10);
+    AssertTrue('saved RGB', SaveImageFromVolumeIntoFile(Src, FN));
+    AssertTrue('reloaded RGB', Img.LoadFromFile(FN));
+    LoadImageIntoVolume(Img, Reloaded, {pWithAlpha=}true);
+    AssertEquals('RGB file reloads opaque', 255, Reloaded[4, 2, 3], 0);
+    AssertEquals('RGB value', 10, Reloaded[4, 2, 1], 0);
+  finally
+    DeleteFile(FN);
+    Img.Free;
+    Reloaded.Free;
+    Src.Free;
   end;
 end;
 

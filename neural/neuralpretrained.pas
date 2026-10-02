@@ -535,8 +535,8 @@ uses
   {$ENDIF}
   Classes, SysUtils, Math, fpjson, jsonparser,
   neuralvolume, neuralnetwork, neuralthread, neuralsafetensors, neuraltorchbin,
-  neuralgguf, neuralhftokenizer, neuralmxfp4, neuralnf4, neuralaudio,
-  neuraldiffusion, pascoremath32;
+  neuralgguf, neuralhftokenizer, neuralchat, neuralmxfp4, neuralnf4,
+  neuralaudio, neuraldiffusion, pascoremath32;
 
 type
   EPretrainedImportError = class(Exception);
@@ -568,6 +568,10 @@ function IsNF4QuantizedTensor(Reader: TNNetSafeTensorsReader;
   const WName: string): boolean;
 procedure LoadNF4QuantizedTensorFlat(Reader: TNNetSafeTensorsReader;
   const WName: string; NumRows, InDim: integer; Dest: TNNetVolume);
+
+// Raises EPretrainedImportError when a layer of NN holds a partly filled
+// int4 import (TNNet.BeginInt4QuantImports). Coded by Claude (AI).
+procedure RequireCompleteInt4QuantImports(NN: TNNet; const What: string);
 
 // HF nn.Linear [out, in] -> pointwise-linear neuron loader, and the staged
 // whole-slab helper feeding its pSrcSlab (see the implementation comments).
@@ -1058,10 +1062,12 @@ function LlamaConfigToString(const Config: TLlamaConfig): string;
 // A layer count or class mismatch raises. Arm it afterwards with
 // TNNet.EnableOpenCLInContextOf(owner), after the owner's EnableOpenCL, and
 // free it before the owner. Coded by Claude (AI).
+// pStopBeforeFinalNorm: the net ends at the last decoder block's residual
+// sum (no final RMSNorm, no LM head); norm.weight and lm_head are not loaded.
 function BuildLlamaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true; pQuantizeInt8: boolean = false;
-  pWeightOwner: TNNet = nil): TNNet;
+  pWeightOwner: TNNet = nil; pStopBeforeFinalNorm: boolean = false): TNNet;
 
 // Same, reading the config from ConfigFileName ('' = "config.json" in the
 // directory of FileName) and returning it in Config.
@@ -8589,6 +8595,495 @@ procedure Qwen2VLRunLogits(TextNet: TNNet; const Config: TQwen2VLConfig;
   ImageGridH, ImageGridW: integer; Logits: TNNetVolume);
 
 // ===========================================================================
+// QWEN3-VL TEXT DECODER AS A PROMPT ENCODER (model_type "qwen3_vl"; the
+// Qwen-Image-2.1 text_encoder). The text decoder is a dense Qwen3 decoder built
+// by the Llama builder; model.visual.* is skipped. For text-only input the
+// interleaved M-RoPE positions are equal on all three axes, so plain 1-D
+// rotate-half RoPE is exact; image/video placeholder ids are refused.
+// ---------------------------------------------------------------------------
+const
+  csQwenImage21SystemPrompt = 'Comprehend and analyze the provided prompt.';
+
+type
+  TQwen3VLConfig = record
+    Text: TLlamaConfig;    // the Qwen3 text decoder (text_config)
+    ImageTokenId: integer; // image_token_id (<|image_pad|>); -1 = absent
+    VideoTokenId: integer; // video_token_id (<|video_pad|>); -1 = absent
+  end;
+
+// Reads a HF Qwen3-VL config.json: text_config through
+// ReadLlamaConfigFromJSONFile plus the wrapper's image/video token ids.
+function ReadQwen3VLConfigFromJSONFile(const FileName: string): TQwen3VLConfig;
+
+// Builds the Qwen3-VL text decoder WITHOUT the final RMSNorm and LM head: input
+// (pSeqLen,1,1) token ids, output (pSeqLen,1,hidden) = last block before norm.
+function BuildQwen3VLTextEncoderFromSafeTensors(const FileName: string;
+  out Config: TQwen3VLConfig; pSeqLen: integer;
+  pQuantizeInt8: boolean = false; const ConfigFileName: string = ''): TNNet;
+
+// Runs Encoder on TokenIds (right-padded to its SeqLen; causal, so rows stay
+// exact) and returns rows DropCount.. as (Length(TokenIds)-DropCount,1,hidden).
+procedure Qwen3VLEncodeHiddenStates(Encoder: TNNet;
+  const Config: TQwen3VLConfig; const TokenIds: array of integer;
+  DropCount: integer; HiddenStates: TNNetVolume; Parallel: boolean = false);
+
+// Caps NN's worker pool at MaxThreads (0 = every CPU thread) and starts it, so
+// repeated parallel passes reuse the workers; does nothing when not Parallel.
+procedure PrepareInferenceThreads(NN: TNNet; Parallel: boolean;
+  MaxThreads: integer);
+
+// The Qwen-Image-2.1 text-to-image ChatML prompt (system message, user Prompt,
+// assistant opener); an empty Prompt becomes ' ' as in the diffusers pipeline.
+function QwenImage21TextToImagePrompt(const Prompt: string): string;
+
+// Tokenizes QwenImage21TextToImagePrompt(Prompt). DropCount = token count of
+// the rendered system message alone (the pipeline's drop_idx).
+function QwenImage21EncodeTextToImagePrompt(Tokenizer: TNeuralHFTokenizer;
+  const Prompt: string; out DropCount: integer): TNeuralIntegerArray;
+
+// 3-axis RoPE positions for text[0], image[0], text[1], ..., text[N] (N images,
+// N+1 text runs, which may be empty). Feed them to TNNetAxialRotaryEmbedding.
+procedure BuildQwenImage21RopePositions(const TextLengths, GridHeights,
+  GridWidths: array of integer; var PosF, PosH, PosW: TNeuralIntegerArray);
+
+type
+  // The diffusers QwenImage21Transformer2DModel config.json fields.
+  TQwenImage21TransformerConfig = record
+    NumLayers, NumHeads, HeadDim, Hidden, MlpHidden: integer;
+    InChannels, OutChannels, ContextInDim: integer;
+    AxesDims: array[0..2] of integer; // rotary dims per (frame, h, w) axis
+    Eps: TNeuralFloat;
+  end;
+
+  // The four per-step vectors every block reads, each (1,1,Hidden): 1+scale1,
+  // tanh(gate1), 1+scale2, tanh(gate2).
+  TQwenImage21Modulation = record
+    OnePlusScale1, TanhGate1, OnePlusScale2, TanhGate2: TNNetLayer;
+  end;
+
+  // Prefix pass: text tokens, causal, plain prefill. Step pass: target-image
+  // tokens attending [cached prefix K/V ; own K/V] with no causal mask.
+  TQwenImage21BlockMode = (qibPrefix, qibStep);
+
+  // The layers of one block that carry weights or run-time state.
+  TQwenImage21BlockLayers = record
+    QProj, KProj, VProj: TNNetLayer;  // to_q / to_k / to_v
+    QNorm, KNorm: TNNetLayer;         // norm_q / norm_k (TNNetHeadRMSNorm)
+    QRope, KRope: TNNetAxialRotaryEmbedding;
+    Attn: TNNetFusedSDPA;
+    OutProj: TNNetLayer;              // to_out.0
+    GateUp: TNNetLayer;               // [proj | gate_layer], read by TNNetSwiGLU
+    Down: TNNetLayer;                 // img_mlp.out
+    // TNNetChannelMulByLayer: norm x (1 + scale), branch output x tanh(gate).
+    Modulated1, Gated1, Modulated2, Gated2: TNNetLayer;
+    Norm1, Norm2: TNNetLayer;         // TNNetTokenLayerNorm, non-affine
+    QKV: TNNetLayer;                  // TNNetDeepConcat [QRope|KRope|VProj]
+    SwiGLU: TNNetLayer;               // silu(gate) * proj over GateUp
+    Residual1, Residual2: TNNetLayer; // TNNetSum, the block's two residuals
+  end;
+
+  // txt_in: zero-centred RMSNorm -> Linear -> GELU(tanh) -> Linear.
+  TQwenImage21TextProjectionLayers = record
+    Norm, InLayer, OutLayer: TNNetLayer;
+  end;
+
+function ReadQwenImage21TransformerConfig(
+  const FileName: string): TQwenImage21TransformerConfig;
+
+// Slices a (1,1,4*Hidden) [scale1|gate1|scale2|gate2] modulation layer into
+// the four block inputs; build it once per net and hand it to every block.
+function AddQwenImage21Modulation(NN: TNNet; ModulationLayer: TNNetLayer;
+  Hidden: integer): TQwenImage21Modulation;
+
+// One single-stream block over XInput (SeqLen,1,Hidden); returns its output.
+// qibStep needs pPrefixCapacity >= the prefix token count (see the impl).
+function AddQwenImage21Block(NN: TNNet; XInput: TNNetLayer;
+  const Modulation: TQwenImage21Modulation;
+  const Config: TQwenImage21TransformerConfig; Mode: TQwenImage21BlockMode;
+  pPrefixCapacity: integer; out Block: TQwenImage21BlockLayers;
+  pTrainable: boolean = false): TNNetLayer;
+
+// Loads transformer_blocks.{BlockIdx}.* into Block (bias-free Linears).
+procedure LoadQwenImage21BlockWeights(Reader: TNNetSafeTensorsReader;
+  const Block: TQwenImage21BlockLayers;
+  const Config: TQwenImage21TransformerConfig; BlockIdx: integer);
+
+// txt_in over XInput (SeqLen,1,ContextInDim); returns the (SeqLen,1,Hidden)
+// output.
+function AddQwenImage21TextProjection(NN: TNNet; XInput: TNNetLayer;
+  const Config: TQwenImage21TransformerConfig;
+  out TextIn: TQwenImage21TextProjectionLayers;
+  pTrainable: boolean = false): TNNetLayer;
+
+procedure LoadQwenImage21TextProjectionWeights(Reader: TNNetSafeTensorsReader;
+  const TextIn: TQwenImage21TextProjectionLayers;
+  const Config: TQwenImage21TransformerConfig);
+
+// Sets the positions of every TNNetAxialRotaryEmbedding in NN (raises when NN
+// has none). Positions are run-time state: set them after a build or a load.
+procedure QwenImage21SetRopePositions(NN: TNNet;
+  const PosF, PosH, PosW: array of integer);
+
+type
+  // Storage of the blocks' Linear weights; norms and the head nets stay FP32.
+  TQwenImage21WeightFormat = (qiwFP32, qiwInt8, qiwInt4);
+
+  // Qwen-Image-2.1 transformer (diffusers QwenImage21Transformer2DModel) run
+  // with ONE reusable prefix block and ONE reusable step block. BlockStore[i]
+  // is a 1-token net that owns block i's weights; SelectBlockWeights re-links a
+  // reusable block to it by reference (TNNet.LinkWeightsFrom, nothing copied).
+  // Layouts: TextHidden (L,1,context_in_dim); Latents (GridH*GridW,1,
+  // in_channels) in row-major (h, w) token order; Velocity (GridH*GridW,1,
+  // out_channels). Coded by Claude (AI).
+  TQwenImage21Transformer = class(TObject)
+  private
+    FConfig: TQwenImage21TransformerConfig;
+    FWeightFormat: TQwenImage21WeightFormat;
+    FInt8Input: boolean;
+    FBlockStore: array of TNNet;
+    FBlockStoreLayers: array of TQwenImage21BlockLayers;
+    FBlockWeightLayerCount: integer;
+    // 1-token owners of txt_in, img_in and norm_out + proj_out: the sized
+    // passes borrow from them, so a new token count reloads nothing.
+    FTextInOwner, FImageInOwner, FOutputOwner: TNNet;
+    // t * 1000 -> temb -> modulation (4 * hidden) and 1 + norm_out scale.
+    FTimestepNet: TNNet;
+    FTimestepInput: TNNetVolume;
+    FTimestepEmbeddingLayer, FModulationLayer, FNormOutScaleLayer: TNNetLayer;
+    FTextInNet, FImageInNet, FOutputNet, FPrefixNet, FStepNet: TNNet;
+    FPrefixBlock, FStepBlock: TQwenImage21BlockLayers;
+    // Block i's post-RoPE prefix keys and values, each (L,1,hidden).
+    FPrefixKeys, FPrefixValues: array of TNNetVolume;
+    FPrefixLength: integer;
+    FStepGridH, FStepGridW: integer;
+    FParallel: boolean;
+    FMaxThreads: integer;
+    // LayerProfiling: wall time of the last EncodePrefix and of every
+    // PredictVelocity since it, in ms.
+    FLayerProfiling: boolean;
+    FProfilePrefixMs: double;
+    FProfileStepMs: array of double;
+    {$IFDEF OpenCL}
+    // Set by EnableOpenCL: every block store holds its codes in OpenCL memory;
+    // PrepareStepPass arms each rebuilt step net in BlockStore[0]'s context.
+    FOpenCLEnabled: boolean;
+    FOpenCLHasSharedKernel: boolean;
+    // Block i's prefix K rows then V rows in OpenCL memory, uploaded by the
+    // first step after EncodePrefix (nil before), and the uploads so far.
+    FPrefixKVOnOpenCL: array of TNNetKVRowsOnOpenCL;
+    FPrefixKVUploadCount: integer;
+    procedure ReleasePrefixKVOnOpenCL();
+    {$ENDIF}
+    // Rewinds the step attention cache and fills it with block BlockIdx's
+    // prefix rows, inside OpenCL memory when the step attention runs there.
+    procedure LoadStepPrefix(BlockIdx: integer);
+    procedure BuildBlockNet(NN: TNNet; TokenCount: integer;
+      Mode: TQwenImage21BlockMode; PrefixCapacity: integer;
+      out Block: TQwenImage21BlockLayers);
+    function BuildImageInNet(NN: TNNet; TokenCount: integer): TNNetLayer;
+    function BuildOutputNet(NN: TNNet; TokenCount: integer): TNNetLayer;
+    procedure BuildTimestepNet(Reader: TNNetSafeTensorsReader);
+    procedure FreeStepPass();
+    function GetBlockStore(BlockIdx: integer): TNNet;
+    function GetBlockStoreLayers(BlockIdx: integer): TQwenImage21BlockLayers;
+    function GetPrefixKeys(BlockIdx: integer): TNNetVolume;
+    function GetPrefixValues(BlockIdx: integer): TNNetVolume;
+    function GetTimestepEmbedding(): TNNetVolume;
+    function GetModulation(): TNNetVolume;
+    procedure SetLayerProfiling(Value: boolean);
+    // One group name per layer of a BuildBlockNet net: Block's role names.
+    function BlockGroupNames(NN: TNNet;
+      const Block: TQwenImage21BlockLayers): TStringArray;
+  public
+    // Loads config.json and diffusion_pytorch_model(.safetensors.index.json)
+    // from a diffusers transformer folder. pInt8Input needs int8/int4 weights.
+    constructor Create(const TransformerFolder: string;
+      pWeightFormat: TQwenImage21WeightFormat = qiwFP32;
+      pInt8Input: boolean = false);
+    destructor Destroy(); override;
+    // Runs txt_in and every block over the prompt with the t = 0 modulation
+    // and keeps each block's post-RoPE K and V (PrefixKeys, PrefixValues).
+    procedure EncodePrefix(TextHidden: TNNetVolume);
+    // Velocity of the GridH x GridW image tokens at Timestep in [0, 1] (the
+    // pipeline's t / 1000), attending the prefix of the last EncodePrefix.
+    procedure PredictVelocity(Latents: TNNetVolume; Timestep: TNeuralFloat;
+      GridH, GridW: integer; Velocity: TNNetVolume);
+    // Runs the timestep net: TimestepEmbedding and Modulation (the raw
+    // [scale1|gate1|scale2|gate2] row) then hold Timestep's values.
+    procedure ComputeModulation(Timestep: TNeuralFloat);
+    // (Re)builds StepNet for a GridH x GridW image; needs EncodePrefix first.
+    procedure PrepareStepPass(GridH, GridW: integer);
+    // Re-links NN's (PrefixNet or StepNet) block to block BlockIdx's weights.
+    // Raises when a layer refuses; NN then mixes blocks and must be rebuilt.
+    procedure SelectBlockWeights(NN: TNNet; BlockIdx: integer);
+    {$IFDEF OpenCL}
+    // Uploads every block's int8/int4 codes once, in one OpenCL context, and
+    // arms StepNet there; false (nothing armed) if the program fails to build.
+    function EnableOpenCL(pPlatform: cl_platform_id; pDevice: cl_device_id;
+      pHasSharedKernel: boolean = true): boolean;
+    property OpenCLEnabled: boolean read FOpenCLEnabled;
+    // Blocks' prefix K/V uploads to OpenCL memory since Create: one per block
+    // per EncodePrefix, however many steps follow.
+    property PrefixKVUploadCount: integer read FPrefixKVUploadCount;
+    {$ENDIF}
+    property Config: TQwenImage21TransformerConfig read FConfig;
+    property WeightFormat: TQwenImage21WeightFormat read FWeightFormat;
+    property PrefixNet: TNNet read FPrefixNet;
+    property StepNet: TNNet read FStepNet;
+    property PrefixBlock: TQwenImage21BlockLayers read FPrefixBlock;
+    property StepBlock: TQwenImage21BlockLayers read FStepBlock;
+    property BlockStore[BlockIdx: integer]: TNNet read GetBlockStore;
+    property BlockStoreLayers[BlockIdx: integer]: TQwenImage21BlockLayers
+      read GetBlockStoreLayers;
+    property PrefixKeys[BlockIdx: integer]: TNNetVolume read GetPrefixKeys;
+    property PrefixValues[BlockIdx: integer]: TNNetVolume
+      read GetPrefixValues;
+    // Text token count of the last EncodePrefix; 0 before the first.
+    property PrefixLength: integer read FPrefixLength;
+    property TimestepEmbedding: TNNetVolume read GetTimestepEmbedding;
+    property Modulation: TNNetVolume read GetModulation;
+    // Prefix and step blocks run the parallel layer scheduler with intra-layer
+    // threading (default true); set both before EncodePrefix.
+    property Parallel: boolean read FParallel write FParallel;
+    // Worker cap for those passes; 0 = every CPU thread.
+    property MaxThreads: integer read FMaxThreads write FMaxThreads;
+    // TNNet.LayerProfiling on every pass (OpenCL drained per layer: slower);
+    // ProfileReport then covers the last EncodePrefix and the steps after it.
+    property LayerProfiling: boolean read FLayerProfiling
+      write SetLayerProfiling;
+    function ProfileReport(): string;
+  end;
+
+type
+  // The vae/config.json fields of diffusers AutoencoderKLQwenImage21 that the
+  // decoder reads. DecoderDims/TemporalUpsample are in decoder (up-block) order.
+  TQwenImage21VaeConfig = record
+    ZDim, DecoderBaseDim, NumResBlocks, OutChannels, SpatialScale: integer;
+    DimMult: TNeuralIntegerArray;
+    DecoderDims: TNeuralIntegerArray;     // Length(DimMult) + 1 widths
+    TemporalUpsample: array of boolean;   // one per up block with an upsampler
+    LatentsMean, LatentsStd: TNeuralFloatDynArr;
+  end;
+
+function ReadQwenImage21VaeConfig(const FileName: string): TQwenImage21VaeConfig;
+
+// Channel list of the TNNetGatherChannels that, followed by TNNetPixelShuffle(2),
+// reproduces diffusers DupUp3D(InCh, OutCh, TemporalFactor, 2) on a first chunk.
+function QwenImage21DupUpChannels(InCh, OutCh,
+  TemporalFactor: integer): TNeuralIntegerArray;
+
+// Adds that gather + pixel shuffle after Source; returns the pixel shuffle.
+function AddQwenImage21DupUp(NN: TNNet; Source: TNNetLayer; OutCh,
+  TemporalFactor: integer; pTrainable: boolean = false): TNNetLayer;
+
+// Adds the decoder (post_quant_conv .. conv_out) for a (LatentW, LatentH, z_dim)
+// normalised latent; returns the raw (16*LatentW, 16*LatentH, out) output.
+// TensorLayers (may be nil) receives one checkpoint prefix per weight layer.
+function BuildQwenImage21VaeDecoderNet(NN: TNNet;
+  const Config: TQwenImage21VaeConfig; LatentW, LatentH: integer;
+  TensorLayers: TStringList = nil): TNNetLayer;
+
+// Loads every TensorLayers prefix, folds latents_std/mean into post_quant_conv
+// and returns how many time_conv tensors it skipped. Raises on unused tensors.
+function LoadQwenImage21VaeDecoderWeights(Reader: TNNetSafeTensorsReader;
+  const Config: TQwenImage21VaeConfig; TensorLayers: TStringList): integer;
+
+type
+  // Qwen-Image-2.1 VAE decoder (diffusers AutoencoderKLQwenImage21.decode for
+  // one image). WeightOwner is a 1x1-latent net holding the weights; Net is the
+  // sized net that borrows them. Latent (W/16, H/16, z_dim) is the NORMALISED
+  // latent (SizeX = width); Image (W, H, out_channels) is clamped to [-1, 1].
+  // Coded by Claude (AI).
+  TQwenImage21VaeDecoder = class(TObject)
+  private
+    FConfig: TQwenImage21VaeConfig;
+    FWeightOwner: TNNet;
+    FNet: TNNet;
+    FNetLatentW, FNetLatentH: integer;
+    FSkippedTensorCount: integer;
+    FParallel: boolean;
+    FMaxThreads: integer;
+    // LayerProfiling: Net's forwards since PrepareNet, and the tables of the
+    // nets ReleaseNet already freed.
+    FLayerProfiling: boolean;
+    FNetPassCount: integer;
+    FReleasedNetsProfile: string;
+    {$IFDEF OpenCL}
+    // Set by EnableOpenCL: a weightless net that owns the OpenCL context and
+    // program; PrepareNet arms every sized net in it.
+    FOpenCLContextNet: TNNet;
+    FOpenCLHasSharedKernel: boolean;
+    {$ENDIF}
+    procedure LoadFromReader(Reader: TNNetSafeTensorsReader);
+    function NetProfile(): string;
+  public
+    // Reads config.json and diffusion_pytorch_model.safetensors of VaeFolder.
+    constructor Create(const VaeFolder: string);
+    constructor CreateFromReader(Reader: TNNetSafeTensorsReader;
+      const Config: TQwenImage21VaeConfig);
+    destructor Destroy(); override;
+    // (Re)builds Net for a LatentW x LatentH latent; a same-size call is free.
+    procedure PrepareNet(LatentW, LatentH: integer);
+    // Frees Net and its activations; the weights stay.
+    procedure ReleaseNet();
+    // Decodes the whole latent in one pass (the untiled diffusers decode).
+    procedure Decode(Latent, Image: TNNetVolume);
+    // diffusers tiled_decode: TileSampleSize-pixel tiles every TileSampleStride
+    // pixels, linear blend over the overlap. Matches diffusers' tiled output.
+    procedure DecodeTiled(Latent, Image: TNNetVolume;
+      TileSampleSize: integer = 256; TileSampleStride: integer = 192);
+    property Config: TQwenImage21VaeConfig read FConfig;
+    property WeightOwner: TNNet read FWeightOwner;
+    property Net: TNNet read FNet;
+    // time_conv weights present in the checkpoint and not loaded.
+    property SkippedTensorCount: integer read FSkippedTensorCount;
+    // Parallel layer scheduler with intra-layer threading (default true) and
+    // its worker cap (0 = every CPU thread); read when Net is (re)built.
+    property Parallel: boolean read FParallel write FParallel;
+    property MaxThreads: integer read FMaxThreads write FMaxThreads;
+    {$IFDEF OpenCL}
+    // Builds one OpenCL context and program and arms Net and every later sized
+    // net in it (FP32 weights, one upload per net); false if the build fails.
+    function EnableOpenCL(pPlatform: cl_platform_id; pDevice: cl_device_id;
+      pHasSharedKernel: boolean = true): boolean;
+    function OpenCLEnabled(): boolean;
+    {$ENDIF}
+    // TNNet.LayerProfiling on every sized net (read when Net is (re)built);
+    // ProfileReport has one per-class table per net since Create.
+    property LayerProfiling: boolean read FLayerProfiling
+      write FLayerProfiling;
+    function ProfileReport(): string;
+  end;
+
+const
+  // One latent (= one transformer token) covers 16x16 pixels; the pipeline
+  // rounds each image side DOWN to a multiple of 32, as diffusers does.
+  csQwenImage21PixelsPerLatent = 16;
+  csQwenImage21ImageSideMultiple = 32;
+
+type
+  // The stages of TQwenImage21Pipeline; OnPhase fires as each one starts.
+  TQwenImage21PipelinePhase = (qppLoadTextEncoder, qppEncodePrompt,
+    qppLoadTransformer, qppEncodePrefix, qppDenoise, qppLoadVae, qppDecode,
+    qppDone);
+  TQwenImage21PhaseEvent = procedure(Phase: TQwenImage21PipelinePhase)
+    of object;
+  // Fired after denoising step StepIndex (0-based) of StepCount; Latents holds
+  // the sample after that step, Timestep = sigma * 1000 of the step.
+  TQwenImage21StepEvent = procedure(StepIndex, StepCount: integer;
+    Timestep: double; Latents: TNNetVolume) of object;
+
+  // Qwen-Image-2.1 text-to-image (diffusers QwenImage21Pipeline, no guidance)
+  // over a model_index.json folder. Each component (text encoder, transformer,
+  // VAE decoder) is loaded when its stage starts and freed when it ends, so
+  // peak memory is the largest component, not the sum. Latents are
+  // (GridH*GridW,1,in_channels) in row-major (h, w) token order.
+  // Coded by Claude (AI).
+  TQwenImage21Pipeline = class(TObject)
+  private
+    FModelFolder: string;
+    FScheduler: TNNetFlowMatchEulerScheduler;
+    FTransformerConfig: TQwenImage21TransformerConfig;
+    FTransformerFormat: TQwenImage21WeightFormat;
+    FInt8Input, FTextEncoderInt8: boolean;
+    FVaeTileSize, FVaeTileStride: integer;
+    FParallel: boolean;
+    FMaxThreads: integer;
+    FOnPhase: TQwenImage21PhaseEvent;
+    FOnStep: TQwenImage21StepEvent;
+    FTransformerOnOpenCL, FVaeOnOpenCL: boolean;
+    FLayerProfiling: boolean;
+    FTransformerProfileReport, FVaeProfileReport: string;
+    {$IFDEF OpenCL}
+    FOpenCLRequested, FOpenCLHasSharedKernel: boolean;
+    FOpenCLPlatform: cl_platform_id;
+    FOpenCLDevice: cl_device_id;
+    // Returns Armed; when false, prints that Component runs on the CPU.
+    function OpenCLArmingResult(Armed: boolean;
+      const Component: string): boolean;
+    {$ENDIF}
+    procedure DoPhase(Phase: TQwenImage21PipelinePhase);
+    procedure EnableTransformerOpenCL(Transformer: TQwenImage21Transformer);
+    procedure EnableVaeOpenCL(Vae: TQwenImage21VaeDecoder);
+    function ComponentFolder(const Component: string): string;
+    procedure CheckImageSize(Width, Height: integer);
+  public
+    // Reads model_index.json, scheduler/scheduler_config.json and
+    // transformer/config.json; no weights are loaded here.
+    constructor Create(const ModelFolder: string);
+    destructor Destroy(); override;
+    // Side rounded down to a multiple of 32 (diffusers does the same after a
+    // warning); raises when that leaves less than 32.
+    class function RoundDownImageSide(Side: integer): integer;
+    // Tokenizes the text-to-image template with processor/tokenizer.json.
+    function TokenizePrompt(const Prompt: string;
+      out DropCount: integer): TNeuralIntegerArray;
+    // Builds text_encoder/ sized to the token count, encodes, frees it.
+    // PromptEmbeds becomes (Length(TokenIds)-DropCount,1,hidden).
+    procedure EncodeTokenIds(const TokenIds: array of integer;
+      DropCount: integer; PromptEmbeds: TNNetVolume);
+    procedure EncodePrompt(const Prompt: string; PromptEmbeds: TNNetVolume);
+    // Standard-normal latents for a Width x Height image from Seed (FPC RNG;
+    // the global RandSeed is restored). Torch's noise is not reproducible.
+    procedure MakeInitialLatents(Width, Height: integer; Seed: cardinal;
+      Latents: TNNetVolume);
+    // Loads transformer/, runs StepCount Euler steps on Latents in place (the
+    // initial noise in, the clean latents out), frees the transformer.
+    procedure Denoise(PromptEmbeds: TNNetVolume; Width, Height,
+      StepCount: integer; Latents: TNNetVolume);
+    // Loads vae/, decodes (tiled when the image exceeds one VaeTileSize tile)
+    // and frees it. Image becomes (Width,Height,4) RGBA in [0, 1].
+    procedure DecodeLatents(Latents: TNNetVolume; Width, Height: integer;
+      Image: TNNetVolume);
+    // Denoise + DecodeLatents; InitialLatents = nil draws them from Seed.
+    // Width and Height are rounded down with RoundDownImageSide.
+    procedure GenerateFromEmbeds(PromptEmbeds: TNNetVolume; Width, Height,
+      StepCount: integer; Seed: cardinal; Image: TNNetVolume;
+      InitialLatents: TNNetVolume = nil);
+    procedure Generate(const Prompt: string; Width, Height, StepCount: integer;
+      Seed: cardinal; Image: TNNetVolume);
+    {$IFDEF OpenCL}
+    // Denoise runs the transformer step pass (int8/int4 weights) and
+    // DecodeLatents the VAE on this OpenCL device; the rest stays on the CPU.
+    procedure EnableOpenCL(pPlatform: cl_platform_id; pDevice: cl_device_id;
+      pHasSharedKernel: boolean = true);
+    {$ENDIF}
+    // The last Denoise ran the step pass with OpenCL armed; when the request
+    // could not be met, Denoise printed why and ran it on the CPU.
+    property TransformerOnOpenCL: boolean read FTransformerOnOpenCL;
+    // The last DecodeLatents ran the VAE with OpenCL armed; when the request
+    // could not be met, DecodeLatents printed why and ran it on the CPU.
+    property VaeOnOpenCL: boolean read FVaeOnOpenCL;
+    property ModelFolder: string read FModelFolder;
+    property Scheduler: TNNetFlowMatchEulerScheduler read FScheduler;
+    property TransformerConfig: TQwenImage21TransformerConfig
+      read FTransformerConfig;
+    // Transformer block weights (qiwFP32 at real size runs a slow kernel).
+    property TransformerFormat: TQwenImage21WeightFormat
+      read FTransformerFormat write FTransformerFormat;
+    // int8 activations into the transformer's int8/int4 projections.
+    property Int8Input: boolean read FInt8Input write FInt8Input;
+    property TextEncoderInt8: boolean read FTextEncoderInt8
+      write FTextEncoderInt8;
+    // VAE tile in pixels (multiples of 16); default 128/96 keeps a real-size
+    // tile's activations near 2.3 GB.
+    property VaeTileSize: integer read FVaeTileSize write FVaeTileSize;
+    property VaeTileStride: integer read FVaeTileStride write FVaeTileStride;
+    // Every component runs the parallel layer scheduler with intra-layer
+    // threading (default true), capped at MaxThreads workers (0 = all).
+    property Parallel: boolean read FParallel write FParallel;
+    property MaxThreads: integer read FMaxThreads write FMaxThreads;
+    property OnPhase: TQwenImage21PhaseEvent read FOnPhase write FOnPhase;
+    property OnStep: TQwenImage21StepEvent read FOnStep write FOnStep;
+    // LayerProfiling of the transformer (Denoise) and of the VAE decoder
+    // (DecodeLatents); each leaves its ProfileReport in the property below.
+    property LayerProfiling: boolean read FLayerProfiling
+      write FLayerProfiling;
+    property TransformerProfileReport: string read FTransformerProfileReport;
+    property VaeProfileReport: string read FVaeProfileReport;
+  end;
+
+// ===========================================================================
 // RAFT OPTICAL-FLOW IMPORT (model_type "raft_small", the torchvision
 // raft_small architecture, Teed & Deng 2020 "RAFT", arXiv:2003.12039) - the
 // FIRST optical-flow vertical and the first TWO-image-in / dense-2-channel-out
@@ -12297,6 +12792,7 @@ function DecodeYoloDetections(Output: TNNetVolume; const Config: TYoloConfig;
 //     from the same directory unless ConfigFileName overrides it).
 // Supported model_types: gpt2 (n_head read from the config when present),
 // gpt_neo, gpt_neox, gptj, phi, llama, mistral, qwen2, qwen3, qwen3_moe,
+// qwen3_vl (text decoder only, 1-D RoPE; vision tower skipped),
 // qwen3_5, qwen3_5_moe (Qwen3.5/3.6 hybrid DeltaNet+attention text
 // decoders; vision tower and MTP head skipped), gemma,
 // gemma2, gemma3_text, rwkv, mamba, falcon_mamba, bloom, falcon (legacy
@@ -12332,8 +12828,8 @@ function BuildFromPretrained(const Path: string; pSeqLen: integer = 0;
 
 // True for the config.json model_type values BuildFromPretrained routes
 // through the Llama builder (llama, mistral, qwen2, qwen3, qwen3_moe,
-// qwen3_5, qwen3_5_moe, gemma, gemma2, gemma3_text, phi3, olmo2, olmoe,
-// mixtral, glm4, granite, granitemoe, minicpm, bitnet) - the families whose
+// qwen3_vl, qwen3_5, qwen3_5_moe, gemma, gemma2, gemma3_text, phi3, olmo2,
+// olmoe, mixtral, glm4, granite, granitemoe, minicpm, bitnet) - the families whose
 // twin can borrow an already-loaded net's weights (pWeightOwner).
 function PretrainedModelTypeCanBorrowWeights(const ModelType: string): boolean;
 
@@ -12554,6 +13050,12 @@ var
   // Layers LoadLlamaLinearWeights direct-loaded that way. It only grows, so a
   // caller zeroes it before the build and reads it after. Coded by Claude (AI).
   NeuralImportInt4LayerCount: integer = 0;
+  // Direct FP32 -> int4 route (--int4): the loaders quantize each streamed row
+  // of an int4 layer to Q4_0; BuildFromPretrained refuses partial imports.
+  NeuralImportInt4FromRows: boolean = false;
+  // Layers whose FP32-row int4 import a loader committed; it only grows, like
+  // NeuralImportInt4LayerCount.
+  NeuralImportInt4FromRowsLayerCount: integer = 0;
 
 implementation
 
@@ -12649,9 +13151,10 @@ type
   end;
 
 // Loads a HF LayerNorm weight/bias pair into a TNNetTokenLayerNorm.
-// Shared core for every per-importer affine norm-weight loader. Loads a 1-D
-// [d_model] gamma tensor into FArrNeurons[0].Weights (each element offset by
-// GainOffset - the +1 fold some RMSNorm variants need), and OPTIONALLY a beta
+// Shared core for every per-importer affine norm-weight loader. Loads a
+// [d_model] (or [d_model,1,..]) gamma tensor into FArrNeurons[0].Weights
+// (each element offset by GainOffset - the +1 fold some RMSNorm variants
+// need), and OPTIONALLY a beta
 // vector into FArrNeurons[1] (loaded from the BName tensor when BetaFromTensor
 // is true, otherwise zeroed - the bias-free case). All callers index the
 // public FArrNeurons mirror, never Neurons[].
@@ -12671,7 +13174,9 @@ var
 begin
   if not Reader.HasTensor(WName) then
     ImportError(ImporterName + ' import: missing tensor "' + WName + '".');
-  if (Reader.DimCount(WName) <> 1) or (Reader.DimSize(WName, 0) <> d_model) then
+  // Trailing singleton dims are accepted: conv-style gains ship as [C,1,1].
+  if (Reader.DimCount(WName) < 1) or (Reader.DimSize(WName, 0) <> d_model) or
+     (Reader.ElementCount(WName) <> d_model) then
     ImportError(ImporterName + ' import: "' + WName + '" must have shape [' +
       IntToStr(d_model) + '], got ' + Reader.ShapeAsString(WName));
   if HasBeta and BetaFromTensor then
@@ -12725,10 +13230,36 @@ end;
 // is a +-127 code, so the recomputed scale and codes are identical.
 // Coded by Claude (AI).
 procedure EnsureWritableImportWeights(Layer: TNNetLayer);
+var
+  QLayer: TNNetLayerConcatedWeights;
+  NeuronCnt, MaxNeuronPos: integer;
+  ScaleRow: TNeuralFloatArrPtr;
 begin
-  if (Layer is TNNetLayerConcatedWeights) and
-     TNNetLayerConcatedWeights(Layer).WeightsQuantizedInt8 then
-    TNNetLayerConcatedWeights(Layer).DequantizeWeightsInt8()
+  if Layer is TNNetLayerConcatedWeights then
+  begin
+    QLayer := TNNetLayerConcatedWeights(Layer);
+    // A committed int4 layer kept no FP32 rows to refill (one element each).
+    if QLayer.WeightsQuantizedInt4 then
+      ImportError('Import: ' + Layer.ClassName + ' already holds int4 rows ' +
+        'from the checkpoint; it cannot be refilled through FP32 rows.');
+    if QLayer.WeightsQuantizedInt8 then QLayer.DequantizeWeightsInt8();
+    // Rows an open int4 import already holds move to the FP32 rows (a row
+    // never imported has zero block scales), so the layer leaves the import
+    // whole and the QuantizeWeightsInt4 sweep requantizes it.
+    if QLayer.Int4QuantImportOpen() and (QLayer.Int4QuantImportedRows > 0) then
+    begin
+      MaxNeuronPos := QLayer.Neurons.Count - 1;
+      for NeuronCnt := 0 to MaxNeuronPos do
+      begin
+        ScaleRow := QLayer.QuantTableInt4.GetScaleRowPtr(NeuronCnt, 0);
+        if TNNetVolume.MaxAbsFinite(ScaleRow,
+          QLayer.QuantTableInt4.BlocksPerRow) > 0 then
+          QLayer.QuantTableInt4.DequantizeRowTo(NeuronCnt, 0,
+            QLayer.Neurons[NeuronCnt].Weights.DataPtr);
+      end;
+    end;
+    QLayer.CancelInt4QuantImport();
+  end
   // The embedding keeps its vocab table in its own int8 container (outside
   // the concated-weights storage), so it needs its own writable-restore.
   else if (Layer is TNNetEmbedding) and
@@ -13620,8 +14151,12 @@ var
   HeadDimField, SlidingWindowField, FloatField: TJSONData;
   MoEMlpOnlyArr, ClipQKVField: TJSONData;
   TextCfgField, LayerTypesArr: TJSONData;
+  RopeParamsField: TJSONData;
   LayerTypeStr: string;
   FullAttnInterval: integer;
+  TieFromWrapper: boolean;
+  MRoPESectionArr: TJSONArray;
+  MRoPEPairCount, MaxSectionPos: integer;
   i: integer;
   MoEMax: integer;
   DimModelBase: integer;
@@ -13666,26 +14201,37 @@ begin
         '" is not a JSON object.');
     Obj := TJSONObject(Root);
     ModelType := Obj.Get('model_type', 'llama');
+    TieFromWrapper := False;
     // Qwen3.5 / Qwen3.6 (multimodal wrapper configs, e.g. Qwen3.6-27B /
     // Qwen3.6-35B-A3B): the TEXT decoder fields live NESTED under
     // "text_config" (top-level model_type qwen3_5 / qwen3_5_moe, inner
     // model_type qwen3_5_text / qwen3_5_moe_text). Descend into the nested
     // object when present (a flat text-only config is also accepted
     // defensively) and normalize the *_text spellings to the dispatch names.
+    // Qwen3-VL (qwen3_vl / qwen3_vl_text) nests its Qwen3 text decoder the
+    // same way; only that text decoder is read here.
     if (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_moe') or
-       (ModelType = 'qwen3_5_text') or (ModelType = 'qwen3_5_moe_text') then
+       (ModelType = 'qwen3_5_text') or (ModelType = 'qwen3_5_moe_text') or
+       (ModelType = 'qwen3_vl') or (ModelType = 'qwen3_vl_text') then
     begin
       TextCfgField := Obj.Find('text_config');
       if (TextCfgField <> nil) and (TextCfgField is TJSONObject) then
+      begin
+        // tie_word_embeddings belongs to the wrapper config; the nested
+        // text_config usually omits it.
+        TieFromWrapper := Obj.Get('tie_word_embeddings', False);
         Obj := TJSONObject(TextCfgField);
+      end;
       if (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_text') then
         ModelType := 'qwen3_5'
+      else if (ModelType = 'qwen3_vl') or (ModelType = 'qwen3_vl_text') then
+        ModelType := 'qwen3_vl'
       else
         ModelType := 'qwen3_5_moe';
     end;
     if (ModelType <> 'llama') and (ModelType <> 'mistral') and
        (ModelType <> 'qwen2') and (ModelType <> 'qwen3') and
-       (ModelType <> 'qwen3_moe') and
+       (ModelType <> 'qwen3_moe') and (ModelType <> 'qwen3_vl') and
        (ModelType <> 'qwen3_5') and (ModelType <> 'qwen3_5_moe') and
        (ModelType <> 'gemma') and (ModelType <> 'gemma2') and
        (ModelType <> 'gemma3_text') and (ModelType <> 'phi3') and
@@ -13697,7 +14243,7 @@ begin
        (ModelType <> 'minicpm') then
       ImportError('Llama import: config model_type is "' + ModelType +
         '" - only "llama", "mistral", "qwen2", "qwen3", "qwen3_moe", ' +
-        '"qwen3_5", "qwen3_5_moe", ' +
+        '"qwen3_vl", "qwen3_5", "qwen3_5_moe", ' +
         '"gemma", "gemma2", "gemma3_text", "phi3", "olmo2", "olmoe", ' +
         '"mixtral", "glm4", "granite", "granitemoe", "bitnet", ' +
         '"internlm2" and "minicpm" are supported here ' +
@@ -13728,7 +14274,7 @@ begin
     // Gemma2Config default is tie_word_embeddings=true); the other families
     // default off.
     Result.TieWordEmbeddings := Obj.Get('tie_word_embeddings',
-      (ModelType = 'gemma') or (ModelType = 'gemma2') or
+      TieFromWrapper or (ModelType = 'gemma') or (ModelType = 'gemma2') or
       (ModelType = 'gemma3_text'));
     // An explicit head_dim is honored even when it is DECOUPLED from
     // hidden_size/num_attention_heads (Qwen3-0.6B: head_dim=128 with
@@ -13862,7 +14408,7 @@ begin
         ImportError('Llama import: Qwen2 use_sliding_window=true (per-layer ' +
           'max_window_layers windowing) is not wired into this importer yet.');
     end
-    else if ModelType = 'qwen3' then
+    else if (ModelType = 'qwen3') or (ModelType = 'qwen3_vl') then
     begin
       // Qwen3 dropped the Qwen2 q/k/v biases (attention_bias defaults to
       // false) and added per-head RMSNorm on q/k before RoPE.
@@ -13871,6 +14417,40 @@ begin
       if Obj.Get('use_sliding_window', False) then
         ImportError('Llama import: Qwen3 use_sliding_window=true (per-layer ' +
           'max_window_layers windowing) is not wired into this importer yet.');
+      // Qwen3-VL text decoder: interleaved M-RoPE, whose three position
+      // streams are equal for text, so plain 1-D rotate-half RoPE is exact.
+      // Image/video tokens are refused at encode time (Qwen3VLEncodeHiddenStates).
+      if ModelType = 'qwen3_vl' then
+      begin
+        RopeParamsField := Obj.Find('rope_parameters');
+        if (RopeParamsField = nil) or not (RopeParamsField is TJSONObject) then
+          RopeParamsField := Obj.Find('rope_scaling');
+        if (RopeParamsField <> nil) and (RopeParamsField is TJSONObject) then
+        begin
+          LayerTypeStr := TJSONObject(RopeParamsField).Get('rope_type',
+            TJSONObject(RopeParamsField).Get('type', 'default'));
+          if LayerTypeStr <> 'default' then
+            ImportError('Llama import: Qwen3-VL rope_type "' + LayerTypeStr +
+              '" is not supported - only "default" (M-RoPE without ' +
+              'scaling) reduces to 1-D RoPE for text.');
+          Result.RopeTheta := TJSONObject(RopeParamsField).Get('rope_theta',
+            Result.RopeTheta);
+          if TJSONObject(RopeParamsField).Find('mrope_section') is TJSONArray then
+          begin
+            MRoPESectionArr :=
+              TJSONArray(TJSONObject(RopeParamsField).Find('mrope_section'));
+            MRoPEPairCount := 0;
+            MaxSectionPos := MRoPESectionArr.Count - 1;
+            for i := 0 to MaxSectionPos do
+              Inc(MRoPEPairCount, MRoPESectionArr.Integers[i]);
+            if (Result.HeadDim > 0) and
+               (2 * MRoPEPairCount <> Result.HeadDim) then
+              ImportError('Llama import: Qwen3-VL mrope_section sums to ' +
+                IntToStr(MRoPEPairCount) + ' channel pairs, expected ' +
+                'head_dim/2 = ' + IntToStr(Result.HeadDim div 2) + '.');
+          end;
+        end;
+      end;
     end
     else if ModelType = 'qwen3_moe' then
     begin
@@ -14733,17 +15313,10 @@ begin
 end;
 
 type
-  { TInt8RowChunkFan }
-  // Fans the PER-ROW direct-int8 quant imports of ONE streamed row chunk
-  // over the shared neuralthread pool. Each chunk row r quantizes source
-  // elements [r*RowSize, (r+1)*RowSize) into its own target code row and
-  // scale slot (ImportInt8QuantRow touches nothing shared, and
-  // QuantizeInt8RowTolerant is pure), so the parallel result is
-  // bit-identical to the serial loop. The caller's sequential
-  // LoadTensorRowsFlat read stays on the calling thread - only the
-  // CPU-bound abs-max + quantize sweep fans out. Small chunks run inline
-  // (pool dispatch would dominate). Coded by Claude (AI).
-  TInt8RowChunkFan = class
+  { TQuantRowChunkFan }
+  // Fans the int8 (or Q4_0 int4) row imports of ONE streamed row chunk over
+  // the neuralthread pool; disjoint target rows, so bit-identical to serial.
+  TQuantRowChunkFan = class
   private
     FSrc: TNNetVolume;
     FRowSize, FRowCount: integer;
@@ -14751,6 +15324,8 @@ type
     FQLayer: TNNetLayerConcatedWeights;
     FScale: TNeuralFloat;
     FTargets: TNeuralIntegerArray;
+    // rows go into the open int4 import of FQLayer, or of FHead when tied
+    FIntoInt4: boolean;
     // embedding path (RunEmbedding): chunk row r -> vocab row FBaseRow+r,
     // imported into the embedding and (when tied) the LM head container
     FEmb: TNNetEmbedding;
@@ -14763,14 +15338,14 @@ type
   public
     procedure RunLinear(QLayer: TNNetLayerConcatedWeights; Src: TNNetVolume;
       RowCount, RowSize: integer; const Targets: TNeuralIntegerArray;
-      Scale: TNeuralFloat);
+      Scale: TNeuralFloat; pIntoInt4: boolean);
     procedure RunEmbedding(Emb: TNNetEmbedding;
       Head: TNNetLayerConcatedWeights; Src: TNNetVolume;
       BaseRow, RowCount, RowSize: integer;
       EmbScale, HeadScale: TNeuralFloat);
   end;
 
-function TInt8RowChunkFan.ShouldFan: boolean;
+function TQuantRowChunkFan.ShouldFan: boolean;
 const
   // Below ~64K elements the pool dispatch costs more than the quant sweep.
   cParallelQuantMinElements = 64 * 1024;
@@ -14779,7 +15354,7 @@ begin
     (NeuralDefaultThreadCount > 1);
 end;
 
-procedure TInt8RowChunkFan.LinearJob(index, threadnum: integer);
+procedure TQuantRowChunkFan.LinearJob(index, threadnum: integer);
 var
   StartPos, FinishPos, r, ofs: integer;
 begin
@@ -14788,12 +15363,14 @@ begin
   ofs := StartPos * FRowSize;
   for r := StartPos to FinishPos do
   begin
-    FQLayer.ImportInt8QuantRow(FTargets[r], FSrc, ofs, FScale);
+    if FIntoInt4
+      then FQLayer.ImportInt4QuantRow(FTargets[r], FSrc, ofs, FScale)
+      else FQLayer.ImportInt8QuantRow(FTargets[r], FSrc, ofs, FScale);
     Inc(ofs, FRowSize);
   end;
 end;
 
-procedure TInt8RowChunkFan.EmbeddingJob(index, threadnum: integer);
+procedure TQuantRowChunkFan.EmbeddingJob(index, threadnum: integer);
 var
   StartPos, FinishPos, r, ofs, row: integer;
   HasHead: boolean;
@@ -14807,16 +15384,21 @@ begin
   begin
     FEmb.ImportInt8QuantRow(row, FSrc, ofs, FEmbScale);
     if HasHead then
-      FHead.ImportInt8QuantRow(row, FSrc, ofs, FHeadScale);
+    begin
+      if FIntoInt4
+        then FHead.ImportInt4QuantRow(row, FSrc, ofs, FHeadScale)
+        else FHead.ImportInt8QuantRow(row, FSrc, ofs, FHeadScale);
+    end;
     Inc(ofs, FRowSize); Inc(row);
   end;
 end;
 
-procedure TInt8RowChunkFan.RunLinear(QLayer: TNNetLayerConcatedWeights;
+procedure TQuantRowChunkFan.RunLinear(QLayer: TNNetLayerConcatedWeights;
   Src: TNNetVolume; RowCount, RowSize: integer;
-  const Targets: TNeuralIntegerArray; Scale: TNeuralFloat);
+  const Targets: TNeuralIntegerArray; Scale: TNeuralFloat; pIntoInt4: boolean);
 begin
   FQLayer := QLayer;
+  FIntoInt4 := pIntoInt4;
   FSrc := Src;
   FRowCount := RowCount;
   FRowSize := RowSize;
@@ -14831,12 +15413,13 @@ begin
     LinearJob(0, 1);
 end;
 
-procedure TInt8RowChunkFan.RunEmbedding(Emb: TNNetEmbedding;
+procedure TQuantRowChunkFan.RunEmbedding(Emb: TNNetEmbedding;
   Head: TNNetLayerConcatedWeights; Src: TNNetVolume;
   BaseRow, RowCount, RowSize: integer; EmbScale, HeadScale: TNeuralFloat);
 begin
   FEmb := Emb;
   FHead := Head;
+  FIntoInt4 := (Head <> nil) and Head.Int4QuantImportOpen();
   FSrc := Src;
   FBaseRow := BaseRow;
   FRowCount := RowCount;
@@ -14850,6 +15433,42 @@ begin
   end
   else
     EmbeddingJob(0, 1);
+end;
+
+procedure RequireCompleteInt4QuantImports(NN: TNNet; const What: string);
+var
+  PartialCount: integer;
+begin
+  PartialCount := NN.PartialInt4QuantImportCount();
+  if PartialCount > 0 then
+    ImportError(What + ': ' + IntToStr(PartialCount) + ' layer(s) hold a ' +
+      'partly imported int4 table after the load.');
+end;
+
+// True when QLayer has an open int4 import: the one a caller opened, or one
+// opened here for NeuralImportInt4FromRows. False leaves the int8 route.
+function OpenInt4RowImport(QLayer: TNNetLayerConcatedWeights;
+  RowSize: integer): boolean;
+begin
+  Result := QLayer.Int4QuantImportOpen();
+  if (not Result) and NeuralImportInt4FromRows then
+    Result := QLayer.BeginInt4QuantImport(RowSize);
+end;
+
+// Commits QLayer's int4 import once every neuron row arrived; raises when a
+// row came twice. Counts the commit in NeuralImportInt4FromRowsLayerCount.
+procedure CommitInt4RowImport(QLayer: TNNetLayerConcatedWeights;
+  const ErrPrefix, WName: string);
+begin
+  if QLayer.Int4QuantImportedRows > QLayer.Neurons.Count then
+    ImportError(ErrPrefix + '"' + WName + '" imported ' +
+      IntToStr(QLayer.Int4QuantImportedRows) + ' int4 rows into a ' +
+      IntToStr(QLayer.Neurons.Count) + '-neuron layer: a row twice.');
+  if QLayer.Int4QuantImportedRows = QLayer.Neurons.Count then
+  begin
+    QLayer.EndInt4QuantImport();
+    Inc(NeuralImportInt4FromRowsLayerCount);
+  end;
 end;
 
 // Materializes the WHOLE [SrcRows, InDim] tensor as one flat FP32 buffer,
@@ -14926,11 +15545,11 @@ var
   j, TargetIdx, HalfDim, SrcRow, Base, Row: integer;
   OutDimM1: integer;
   QLayer: TNNetLayerConcatedWeights;
-  DirectInt8, DirectInt4, RowStream: boolean;
+  DirectInt8, DirectInt4, DirectInt4FromRows, RowStream: boolean;
   WRowBase: integer;
   ChunkRows, RowsInChunk, RowCnt, RowsInChunkM1: integer;
   ChunkTargets: TNeuralIntegerArray;
-  Fan: TInt8RowChunkFan;
+  Fan: TQuantRowChunkFan;
   PackedChunk: TNNetVolumeQuant4;
 
   // Maps checkpoint row pRow (0-based within this OutDim slice) to its
@@ -15056,8 +15675,17 @@ begin
     (not IsNF4QuantizedTensor(Reader, WName)) and
     Reader.CanStreamTensorPackedQ4_0(WName);
   if DirectInt4 then DirectInt4 := QLayer.BeginInt4QuantImport(InDim);
-  if DirectInt4 then DirectInt8 := false;
-  if not (DirectInt8 or DirectInt4) then
+  // Direct FP32 -> int4: an int4 import over the WHOLE layer, opened before its
+  // first call (TNNet.BeginInt4QuantImports) or by that first call itself
+  // (NeuralImportInt4FromRows), so the streamed rows of every call - both
+  // fused gate/up halves too - quantize straight to Q4_0; the call that
+  // imports the last row commits the import.
+  DirectInt4FromRows := DirectInt8 and (not DirectInt4) and
+    OpenInt4RowImport(QLayer, InDim);
+  if DirectInt4 or DirectInt4FromRows then DirectInt8 := false;
+  // A tensor that cannot stream rows takes the FP32 route; an open int4 import
+  // hands its rows to it there (EnsureWritableImportWeights).
+  if not (DirectInt8 or DirectInt4 or DirectInt4FromRows) then
     EnsureWritableImportWeights(Layer);
   W := TNNetVolume.Create;
   B := nil;
@@ -15070,7 +15698,7 @@ begin
       Reader.LoadTensorFlat(BiasName, B);
     end;
     OutDimM1 := OutDim - 1;
-    if DirectInt8 or DirectInt4 then
+    if DirectInt8 or DirectInt4 or DirectInt4FromRows then
     begin
       // ~4 MB of FP32 rows per read keeps the syscall count low while
       // bounding the scratch far below the full [SrcRows, InDim] tensor.
@@ -15112,10 +15740,10 @@ begin
       QLayer.EndInt4QuantImport();
       Inc(NeuralImportInt4LayerCount);
     end
-    else if DirectInt8 then
+    else if DirectInt8 or DirectInt4FromRows then
     begin
       SetLength(ChunkTargets, ChunkRows);
-      Fan := TInt8RowChunkFan.Create; // freed by the outer finally
+      Fan := TQuantRowChunkFan.Create; // freed by the outer finally
       j := 0;
       while j < OutDim do
       begin
@@ -15138,9 +15766,12 @@ begin
           else
             Layer.FArrNeurons[TargetIdx].BiasWeight := 0; // bias-free Linear
         end;
-        Fan.RunLinear(QLayer, W, RowsInChunk, InDim, ChunkTargets, Scale);
+        Fan.RunLinear(QLayer, W, RowsInChunk, InDim, ChunkTargets, Scale,
+          DirectInt4FromRows);
         Inc(j, RowsInChunk);
       end;
+      if DirectInt4FromRows then
+        CommitInt4RowImport(QLayer, 'Llama import: ', WName);
     end
     else
     begin
@@ -15807,7 +16438,7 @@ var
   EmbChunkRows, EmbRowsInChunk: integer;
   EmbFold: TNeuralFloat;
   EmbDirect: boolean;
-  EmbFan: TInt8RowChunkFan;
+  EmbFan: TQuantRowChunkFan;
   QHeadCW: TNNetLayerConcatedWeights;
   WV: TNNetVolume;
 begin
@@ -15824,18 +16455,26 @@ begin
   QHeadCW := nil;
   if LMHead is TNNetLayerConcatedWeights then
     QHeadCW := TNNetLayerConcatedWeights(LMHead);
+  // A nil LMHead loads the embedding only; the head tensor is marked consumed.
+  if LMHead = nil then
+  begin
+    TieWordEmbeddings := false;
+    if Reader.HasTensor(LMHeadName) then Consumed.Add(LMHeadName);
+  end;
   if EmbDirect and TieWordEmbeddings then
     EmbDirect := (QHeadCW <> nil) and QHeadCW.WeightsQuantizedInt8 and
       (QHeadCW.QuantInt8VectorSize = HiddenSize) and
       (QHeadCW.Neurons.Count = VocabSize);
   if EmbDirect then
   begin
+    // The tied head's rows go straight to Q4_0 when the flag asks for it.
+    if TieWordEmbeddings then OpenInt4RowImport(QHeadCW, HiddenSize);
     // ~4 MB of FP32 rows per read (same chunking as LoadLlamaLinearWeights'
     // direct path).
     EmbChunkRows := (4 * 1024 * 1024) div (HiddenSize * 4);
     if EmbChunkRows < 1 then EmbChunkRows := 1;
     if EmbChunkRows > VocabSize then EmbChunkRows := VocabSize;
-    EmbFan := TInt8RowChunkFan.Create;
+    EmbFan := TQuantRowChunkFan.Create;
     try
       j := 0;
       while j < VocabSize do
@@ -15867,11 +16506,13 @@ begin
     Consumed.Add(EmbName);
     if TieWordEmbeddings then
     begin
+      if QHeadCW.Int4QuantImportOpen() then
+        CommitInt4RowImport(QHeadCW, ErrPrefix, EmbName);
       LMHead.FlushWeightCache();
       // A redundant serialized lm_head.weight is ignorable when tied.
       if Reader.HasTensor(LMHeadName) then Consumed.Add(LMHeadName);
     end
-    else
+    else if LMHead <> nil then
     begin
       LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
         HiddenSize, VocabSize, 0, -1, 0, '', LogitScaleFold);
@@ -15916,7 +16557,7 @@ begin
     // A redundant serialized lm_head.weight is ignorable when tied.
     if Reader.HasTensor(LMHeadName) then Consumed.Add(LMHeadName);
   end
-  else
+  else if LMHead <> nil then
   begin
     LoadLlamaLinearWeights(Reader, LMHead, LMHeadName,
       HiddenSize, VocabSize, 0, -1, 0, '', LogitScaleFold);
@@ -16458,12 +17099,13 @@ end;
 // the same index (TNNet.BuildWeightOwner); nothing is read from pReader
 // (nil is accepted), no tensor is loaded, no FP32 or int8 weight storage is
 // allocated, and no quantize sweep runs. A layer count or class mismatch
-// raises. Coded by Claude (AI).
+// raises. pStopBeforeFinalNorm: see BuildLlamaFromSafeTensorsWithConfig.
+// Coded by Claude (AI).
 function BuildLlamaFromTensorReaderWithConfig(
   pReader: TNNetSafeTensorsReader; const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true; pQuantizeInt8: boolean = false;
-  pWeightOwner: TNNet = nil): TNNet;
+  pWeightOwner: TNNet = nil; pStopBeforeFinalNorm: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
   NN: TNNet;
@@ -16499,7 +17141,7 @@ var
   EmbFold: TNeuralFloat;
   QHeadCW: TNNetLayerConcatedWeights;
   EmbChunkRows, EmbRowsInChunk: integer;
-  EmbFan: TInt8RowChunkFan;
+  EmbFan: TQuantRowChunkFan;
   QSlab: TNNetVolume;
   Consumed: TStringList;
 
@@ -16664,7 +17306,7 @@ begin
             IntToStr(Config.VocabSize) + ', ' + IntToStr(Config.HiddenSize) +
             '], got ' +
             Reader.ShapeAsString(Config.Prefix + 'embed_tokens.weight'));
-        if (not Config.TieWordEmbeddings) and
+        if (not Config.TieWordEmbeddings) and (not pStopBeforeFinalNorm) and
            (not Reader.HasTensor(LMHeadName)) then
           ImportError('Llama import: config says tie_word_embeddings=false ' +
             'but "' + LMHeadName + '" is missing from ' + Reader.FileName + '.');
@@ -17177,15 +17819,23 @@ begin
         if not pTrainable then NN.SetTrainable();
         if QuantizeSweeps then NN.QuantizeWeightsInt8();
       end;
-      FinalNorm := NN.AddLayer(
-        TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
-      LMHead := NN.AddLayer(
-        TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
-      // Config.FinalLogitSoftCap (Gemma-2): the LM-head logits are squashed
-      // to cap*tanh(logits/cap) - a plain TNNetSoftCapping after the head
-      // (HF applies it to the logits before any sampling softmax).
-      if Config.FinalLogitSoftCap > 0 then
-        NN.AddLayer( TNNetSoftCapping.Create(Config.FinalLogitSoftCap) );
+      if pStopBeforeFinalNorm then
+      begin
+        FinalNorm := nil;
+        LMHead := nil;
+      end
+      else
+      begin
+        FinalNorm := NN.AddLayer(
+          TNNetTokenRMSNorm.Create(Config.RmsNormEps).SetTrainable(pTrainable) );
+        LMHead := NN.AddLayer(
+          TNNetPointwiseConvLinear.Create(Config.VocabSize).SetTrainable(pTrainable) );
+        // Config.FinalLogitSoftCap (Gemma-2): the LM-head logits are squashed
+        // to cap*tanh(logits/cap) - a plain TNNetSoftCapping after the head
+        // (HF applies it to the logits before any sampling softmax).
+        if Config.FinalLogitSoftCap > 0 then
+          NN.AddLayer( TNNetSoftCapping.Create(Config.FinalLogitSoftCap) );
+      end;
       if not pTrainable then NN.SetTrainable();
       if QuantizeSweeps then NN.QuantizeWeightsInt8();
 
@@ -17794,8 +18444,9 @@ begin
         // Re-quantize the block just refilled with checkpoint weights.
         if QuantizeSweeps then NN.QuantizeWeightsInt8();
       end;
-      LoadLlamaRMSNormWeights(Reader, FinalNorm,
-        Config.Prefix + 'norm.weight', Config.HiddenSize, NormGainOffset);
+      if FinalNorm <> nil then
+        LoadLlamaRMSNormWeights(Reader, FinalNorm,
+          Config.Prefix + 'norm.weight', Config.HiddenSize, NormGainOffset);
       MarkConsumed(Config.Prefix + 'norm.weight');
 
       // Final sweep: everything refilled above ends int8-quantized.
@@ -17810,13 +18461,14 @@ begin
         TensorNameStr := Reader.TensorName(i);
         if Consumed.IndexOf(TensorNameStr) >= 0 then continue;
         if Pos('rotary_emb.inv_freq', TensorNameStr) > 0 then continue;
-        // Qwen3.5 / Qwen3.6 multimodal checkpoints: the vision tower
-        // (model.visual.*) and the multi-token-prediction head (mtp.*) are
+        // Qwen3.5 / Qwen3.6 / Qwen3-VL multimodal checkpoints: the vision
+        // tower (model.visual.*) and the multi-token-prediction head (mtp.*) are
         // OUT OF SCOPE for the text decoder - HF's ForCausalLM route
         // ignores them too (_keys_to_ignore_on_load_unexpected), so they
         // are SKIPPED here, not errors.
         if ((Config.ModelType = 'qwen3_5') or
-            (Config.ModelType = 'qwen3_5_moe')) and
+            (Config.ModelType = 'qwen3_5_moe') or
+            (Config.ModelType = 'qwen3_vl')) and
            ((Pos('model.visual.', TensorNameStr) = 1) or
             (Pos('visual.', TensorNameStr) = 1) or
             (Pos('model.mtp.', TensorNameStr) = 1) or
@@ -17841,7 +18493,7 @@ end;
 function BuildLlamaFromSafeTensorsWithConfig(const FileName: string;
   var Config: TLlamaConfig; pSeqLen: integer = 0;
   pTrainable: boolean = true; pQuantizeInt8: boolean = false;
-  pWeightOwner: TNNet = nil): TNNet;
+  pWeightOwner: TNNet = nil; pStopBeforeFinalNorm: boolean = false): TNNet;
 var
   Reader: TNNetSafeTensorsReader;
 begin
@@ -17850,7 +18502,7 @@ begin
   if Assigned(pWeightOwner) then Reader := nil
   else Reader := CreatePretrainedTensorReader(FileName);
   Result := BuildLlamaFromTensorReaderWithConfig(Reader, FileName, Config,
-    pSeqLen, pTrainable, pQuantizeInt8, pWeightOwner);
+    pSeqLen, pTrainable, pQuantizeInt8, pWeightOwner, pStopBeforeFinalNorm);
 end;
 
 function BuildLlamaFromGGUFEx(const FileName: string;
@@ -67166,51 +67818,65 @@ end;
 
 type
   TVaeResnetLayers = record
-    GN1, Conv1, GN2, Conv2, Shortcut: TNNetLayer; // Shortcut nil = identity
+    Norm1, Conv1, Norm2, Conv2, Shortcut: TNNetLayer; // Shortcut nil = identity
   end;
 
-// Adds (architecture) one diffusers ResnetBlock2D to NN and returns the layer
-// refs. Pre-norm: GN1 -> SiLU -> conv1(3x3) -> GN2 -> SiLU -> conv2(3x3),
-// added to the shortcut (identity, or a 1x1 conv_shortcut when InCh<>OutCh).
-// Same residual idiom as AddResNetBlock: main path with AddLayer, the shortcut
-// branch with AddLayerAfter(..., Input).
-procedure AddVaeResnetBlock(NN: TNNet; const Config: TVaeDecoderConfig;
-  InCh, OutCh: integer; out Refs: TVaeResnetLayers);
+// Returns Layer, switched to inference-only first when pTrainable is false so
+// that attaching it never sizes the backprop buffers.
+function VaeLayerTrainable(Layer: TNNetLayer; pTrainable: boolean): TNNetLayer;
+begin
+  if not pTrainable then Layer.SetTrainable(false);
+  Result := Layer;
+end;
+
+// One pre-norm ResnetBlock2D on the last layer: Norm1 -> SiLU -> conv1(3x3) ->
+// Norm2 -> SiLU -> conv2(3x3) + shortcut (identity, or 1x1 when InCh<>OutCh).
+procedure AddVaeResnetBlockWithNorms(NN: TNNet; InCh, OutCh: integer;
+  Norm1, Norm2: TNNetLayer; out Refs: TVaeResnetLayers;
+  pTrainable: boolean = true);
 var
   Input, Branch: TNNetLayer;
-  Groups: integer;
 begin
-  Refs.GN1 := nil; Refs.Conv1 := nil; Refs.GN2 := nil;
-  Refs.Conv2 := nil; Refs.Shortcut := nil;
+  Refs.Shortcut := nil;
   Input := NN.GetLastLayer();
-  Groups := Config.NormNumGroups;
-  Refs.GN1 := NN.AddLayer( TNNetGroupNorm.Create(Groups) );
-  NN.AddLayer( TNNetSiLU.Create() );
-  Refs.Conv1 := NN.AddLayer(
-    TNNetConvolutionLinear.Create(OutCh, 3, {pad=}1, {stride=}1, {bias=}0) );
-  Refs.GN2 := NN.AddLayer( TNNetGroupNorm.Create(Groups) );
-  NN.AddLayer( TNNetSiLU.Create() );
-  Refs.Conv2 := NN.AddLayer(
-    TNNetConvolutionLinear.Create(OutCh, 3, {pad=}1, {stride=}1, {bias=}0) );
+  Refs.Norm1 := NN.AddLayer( VaeLayerTrainable(Norm1, pTrainable) );
+  NN.AddLayer( VaeLayerTrainable(TNNetSiLU.Create(), pTrainable) );
+  Refs.Conv1 := NN.AddLayer( VaeLayerTrainable(TNNetConvolutionLinear.Create(
+    OutCh, 3, {pad=}1, {stride=}1, {bias=}0), pTrainable) );
+  Refs.Norm2 := NN.AddLayer( VaeLayerTrainable(Norm2, pTrainable) );
+  NN.AddLayer( VaeLayerTrainable(TNNetSiLU.Create(), pTrainable) );
+  Refs.Conv2 := NN.AddLayer( VaeLayerTrainable(TNNetConvolutionLinear.Create(
+    OutCh, 3, {pad=}1, {stride=}1, {bias=}0), pTrainable) );
   Branch := NN.GetLastLayer();
   if InCh <> OutCh then
   begin
-    Refs.Shortcut := NN.AddLayerAfter(
-      [TNNetConvolutionLinear.Create(OutCh, 1, 0, 1, 0)], Input);
-    NN.AddLayer( TNNetSum.Create([Branch, Refs.Shortcut]) );
+    Refs.Shortcut := NN.AddLayerAfter(VaeLayerTrainable(
+      TNNetConvolutionLinear.Create(OutCh, 1, 0, 1, 0), pTrainable), Input);
+    NN.AddLayer( VaeLayerTrainable(
+      TNNetSum.Create([Branch, Refs.Shortcut]), pTrainable) );
   end
   else
-    NN.AddLayer( TNNetSum.Create([Branch, Input]) );
+    NN.AddLayer( VaeLayerTrainable(TNNetSum.Create([Branch, Input]),
+      pTrainable) );
+end;
+
+// Adds (architecture) one diffusers ResnetBlock2D with GroupNorm norms.
+procedure AddVaeResnetBlock(NN: TNNet; const Config: TVaeDecoderConfig;
+  InCh, OutCh: integer; out Refs: TVaeResnetLayers);
+begin
+  AddVaeResnetBlockWithNorms(NN, InCh, OutCh,
+    TNNetGroupNorm.Create(Config.NormNumGroups),
+    TNNetGroupNorm.Create(Config.NormNumGroups), Refs);
 end;
 
 procedure LoadVaeResnetBlock(Reader: TNNetSafeTensorsReader;
   const Refs: TVaeResnetLayers; const Prefix: string;
   InCh, OutCh: integer; const Config: TVaeDecoderConfig);
 begin
-  LoadVaeGroupNorm(Reader, Refs.GN1, Prefix + 'norm1', InCh, Config.NormEps);
+  LoadVaeGroupNorm(Reader, Refs.Norm1, Prefix + 'norm1', InCh, Config.NormEps);
   LoadVaeConv(Reader, Refs.Conv1, Prefix + 'conv1.weight', Prefix + 'conv1.bias',
     OutCh, InCh, 3);
-  LoadVaeGroupNorm(Reader, Refs.GN2, Prefix + 'norm2', OutCh, Config.NormEps);
+  LoadVaeGroupNorm(Reader, Refs.Norm2, Prefix + 'norm2', OutCh, Config.NormEps);
   LoadVaeConv(Reader, Refs.Conv2, Prefix + 'conv2.weight', Prefix + 'conv2.bias',
     OutCh, OutCh, 3);
   if Refs.Shortcut <> nil then
@@ -67220,31 +67886,42 @@ end;
 
 type
   TVaeAttnLayers = record
-    GN, QKV, AttnOut: TNNetLayer;
+    Norm, QKV, AttnOut: TNNetLayer;
   end;
 
-// Adds the MID spatial self-attention (diffusers AttentionBlock / Attention).
-// GroupNorm (the residual branch is its INPUT) -> flatten (H,W,C)->(H*W,1,C)
-// -> single-head SDPA (head_dim=C, scale 1/sqrt(C)) -> reshape back -> add.
-procedure AddVaeAttention(NN: TNNet; const Config: TVaeDecoderConfig;
-  Channels: integer; out Refs: TVaeAttnLayers);
+// Single-head spatial self-attention on the last layer: Norm -> flatten
+// (W,H,C)->(H*W,1,C) -> Q|K|V -> SDPA -> out proj -> fold back -> + input.
+procedure AddVaeAttentionWithNorm(NN: TNNet; Channels: integer;
+  Norm: TNNetLayer; out Refs: TVaeAttnLayers; pTrainable: boolean = true);
 var
   ResidualIn: TNNetLayer;
   H, W: integer;
 begin
-  Refs.GN := nil; Refs.QKV := nil; Refs.AttnOut := nil;
   ResidualIn := NN.GetLastLayer();
   H := ResidualIn.Output.SizeY;
   W := ResidualIn.Output.SizeX;
-  Refs.GN := NN.AddLayer( TNNetGroupNorm.Create(Config.NormNumGroups) );
+  Refs.Norm := NN.AddLayer( VaeLayerTrainable(Norm, pTrainable) );
   // Flatten the spatial grid row-major to (H*W, 1, C) tokens, exactly the
   // BuildClipVisionTower patch flatten.
-  NN.AddLayer( TNNetReshape.Create(H * W, 1, Channels) );
-  Refs.QKV := NN.AddLayer( TNNetPointwiseConvLinear.Create(3 * Channels) );
+  NN.AddLayer( VaeLayerTrainable(TNNetReshape.Create(H * W, 1, Channels),
+    pTrainable) );
+  Refs.QKV := NN.AddLayer( VaeLayerTrainable(
+    TNNetPointwiseConvLinear.Create(3 * Channels), pTrainable) );
   Refs.AttnOut := NN.AddMultiHeadSelfAttention({Heads=}1, {CausalMask=}false);
   // Fold the tokens back to the (W, H, C) grid (SizeX=W, SizeY=H).
-  NN.AddLayer( TNNetReshape.Create(W, H, Channels) );
-  NN.AddLayer( TNNetSum.Create([NN.GetLastLayer(), ResidualIn]) );
+  NN.AddLayer( VaeLayerTrainable(TNNetReshape.Create(W, H, Channels),
+    pTrainable) );
+  NN.AddLayer( VaeLayerTrainable(
+    TNNetSum.Create([NN.GetLastLayer(), ResidualIn]), pTrainable) );
+end;
+
+// Adds the MID spatial self-attention (diffusers AttentionBlock / Attention)
+// with a GroupNorm before it; the residual branch is the norm's INPUT.
+procedure AddVaeAttention(NN: TNNet; const Config: TVaeDecoderConfig;
+  Channels: integer; out Refs: TVaeAttnLayers);
+begin
+  AddVaeAttentionWithNorm(NN, Channels,
+    TNNetGroupNorm.Create(Config.NormNumGroups), Refs);
 end;
 
 procedure LoadVaeAttention(Reader: TNNetSafeTensorsReader;
@@ -67254,7 +67931,7 @@ var
   d: integer;
 begin
   d := Channels;
-  LoadVaeGroupNorm(Reader, Refs.GN, Prefix + 'group_norm', d, Config.NormEps);
+  LoadVaeGroupNorm(Reader, Refs.Norm, Prefix + 'group_norm', d, Config.NormEps);
   // q/k/v are biased nn.Linear over channels -> fused Q|K|V slab.
   LoadLlamaLinearWeights(Reader, Refs.QKV, Prefix + 'to_q.weight',
     d, d, 0, 3 * d, 0, Prefix + 'to_q.bias');
@@ -67569,6 +68246,654 @@ begin
   finally
     LatTile.Free;
   end;
+end;
+
+// ===========================================================================
+// QWEN-IMAGE-2.1 VAE DECODER (diffusers AutoencoderKLQwenImage21, one image).
+// ===========================================================================
+const
+  csQwenImage21VaeImporter = 'Qwen-Image-2.1 VAE';
+  csQwenImage21PostQuantPrefix = 'post_quant_conv.';
+
+function ReadQwenImage21VaeConfig(const FileName: string): TQwenImage21VaeConfig;
+var
+  JsonText: TStringList;
+  Root, FieldData: TJSONData;
+  Obj: TJSONObject;
+  FieldArr: TJSONArray;
+  TemporalDownsample: array of boolean;
+  LevelCount, LevelPos, MaxLevelPos, ChannelPos, MaxChannelPos: integer;
+  BaseDim: integer;
+  ClassName: string;
+
+  function ReadFloatArray(const Key: string): TNeuralFloatDynArr;
+  var
+    ValuePos, MaxValuePos: integer;
+  begin
+    FieldArr := TJSONArray(Obj.Find(Key, jtArray));
+    if FieldArr = nil then
+      ImportError(csQwenImage21VaeImporter + ': config "' + FileName +
+        '" is missing the array "' + Key + '".');
+    Result := nil;
+    SetLength(Result, FieldArr.Count);
+    MaxValuePos := FieldArr.Count - 1;
+    for ValuePos := 0 to MaxValuePos do
+      Result[ValuePos] := FieldArr.Floats[ValuePos];
+  end;
+
+begin
+  if not FileExists(FileName) then
+    ImportError(csQwenImage21VaeImporter + ': config file not found: ' +
+      FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError(csQwenImage21VaeImporter + ': config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    ClassName := Obj.Get('_class_name', 'AutoencoderKLQwenImage21');
+    if ClassName <> 'AutoencoderKLQwenImage21' then
+      ImportError(csQwenImage21VaeImporter + ': _class_name is "' + ClassName +
+        '", expected AutoencoderKLQwenImage21.');
+    if not Obj.Get('is_residual', true) then
+      ImportError(csQwenImage21VaeImporter + ': is_residual=false (the plain ' +
+        'up blocks) is not supported.');
+    FieldData := Obj.Find('patch_size');
+    if (FieldData <> nil) and (FieldData.JSONType <> jtNull) then
+      ImportError(csQwenImage21VaeImporter + ': patch_size is not supported.');
+    Result.ZDim := Obj.Get('z_dim', 64);
+    BaseDim := Obj.Get('base_dim', 96);
+    FieldData := Obj.Find('decoder_base_dim');
+    if (FieldData = nil) or (FieldData.JSONType = jtNull)
+      then Result.DecoderBaseDim := BaseDim
+      else Result.DecoderBaseDim := FieldData.AsInteger;
+    Result.NumResBlocks := Obj.Get('num_res_blocks', 2);
+    Result.OutChannels := Obj.Get('out_channels', 4);
+    Result.SpatialScale := Obj.Get('scale_factor_spatial', 16);
+    FieldArr := TJSONArray(Obj.Find('dim_mult', jtArray));
+    if FieldArr = nil then
+      Result.DimMult := TNeuralIntegerArray.Create(1, 2, 4, 8, 8)
+    else
+    begin
+      SetLength(Result.DimMult, FieldArr.Count);
+      MaxLevelPos := FieldArr.Count - 1;
+      for LevelPos := 0 to MaxLevelPos do
+        Result.DimMult[LevelPos] := FieldArr.Integers[LevelPos];
+    end;
+    LevelCount := Length(Result.DimMult);
+    if LevelCount < 2 then
+      ImportError(csQwenImage21VaeImporter + ': dim_mult needs >= 2 entries.');
+    SetLength(TemporalDownsample, LevelCount - 1);
+    FieldArr := TJSONArray(Obj.Find('temperal_downsample', jtArray));
+    MaxLevelPos := LevelCount - 2;
+    if FieldArr = nil then
+    begin
+      for LevelPos := 0 to MaxLevelPos do
+        TemporalDownsample[LevelPos] := LevelPos > 0;
+    end
+    else
+    begin
+      if FieldArr.Count <> LevelCount - 1 then
+        ImportError(csQwenImage21VaeImporter + ': temperal_downsample must ' +
+          'hold ' + IntToStr(LevelCount - 1) + ' entries.');
+      for LevelPos := 0 to MaxLevelPos do
+        TemporalDownsample[LevelPos] := FieldArr.Booleans[LevelPos];
+    end;
+    Result.LatentsMean := ReadFloatArray('latents_mean');
+    Result.LatentsStd := ReadFloatArray('latents_std');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+  if (Result.ZDim < 1) or (Result.DecoderBaseDim < 1) or
+     (Result.NumResBlocks < 0) or (Result.OutChannels < 1) then
+    ImportError(csQwenImage21VaeImporter + ': config "' + FileName +
+      '" has a non-positive size.');
+  if Result.SpatialScale <> 1 shl (LevelCount - 1) then
+    ImportError(csQwenImage21VaeImporter + ': scale_factor_spatial ' +
+      IntToStr(Result.SpatialScale) + ' does not match ' +
+      IntToStr(LevelCount - 1) + ' upsamplers.');
+  if (Length(Result.LatentsMean) <> Result.ZDim) or
+     (Length(Result.LatentsStd) <> Result.ZDim) then
+    ImportError(csQwenImage21VaeImporter + ': latents_mean and latents_std ' +
+      'must hold z_dim = ' + IntToStr(Result.ZDim) + ' values.');
+  // diffusers Decoder3d: dims = base * ([dim_mult[-1]] + dim_mult[::-1]).
+  SetLength(Result.DecoderDims, LevelCount + 1);
+  Result.DecoderDims[0] := Result.DecoderBaseDim * Result.DimMult[LevelCount - 1];
+  for LevelPos := 1 to LevelCount do
+    Result.DecoderDims[LevelPos] :=
+      Result.DecoderBaseDim * Result.DimMult[LevelCount - LevelPos];
+  SetLength(Result.TemporalUpsample, LevelCount - 1);
+  MaxLevelPos := LevelCount - 2;
+  for LevelPos := 0 to MaxLevelPos do
+    Result.TemporalUpsample[LevelPos] :=
+      TemporalDownsample[MaxLevelPos - LevelPos];
+  MaxChannelPos := Result.ZDim - 1;
+  for ChannelPos := 0 to MaxChannelPos do
+    if not (Result.LatentsStd[ChannelPos] > 0) then
+      ImportError(csQwenImage21VaeImporter + ': latents_std[' +
+        IntToStr(ChannelPos) + '] must be positive.');
+end;
+
+// DupUp3D repeat_interleaves the input channels Repeats times, views them as
+// (OutCh, TemporalFactor, 2, 2) and keeps the last temporal copy (first_chunk):
+// output (2w+XOffset, 2h+YOffset, c) = input channel
+// (c*F + (TemporalFactor-1)*4 + YOffset*2 + XOffset) div Repeats, F = 4*TemporalFactor.
+// TNNetPixelShuffle(2) reads that pixel from gathered channel c*4 + XOffset*2 + YOffset.
+function QwenImage21DupUpChannels(InCh, OutCh,
+  TemporalFactor: integer): TNeuralIntegerArray;
+var
+  Factor, Repeats, ChannelPos, MaxChannelPos, XOffset, YOffset: integer;
+  FirstRepeatedPos: integer;
+begin
+  Factor := 4 * TemporalFactor;
+  if (InCh < 1) or (OutCh < 1) or (TemporalFactor < 1) or
+     ((OutCh * Factor) mod InCh <> 0) then
+    ImportError(csQwenImage21VaeImporter + ': DupUp3D needs out_channels * ' +
+      IntToStr(Factor) + ' divisible by in_channels (' + IntToStr(OutCh) +
+      ', ' + IntToStr(InCh) + ').');
+  Repeats := (OutCh * Factor) div InCh;
+  Result := nil;
+  SetLength(Result, 4 * OutCh);
+  MaxChannelPos := OutCh - 1;
+  for ChannelPos := 0 to MaxChannelPos do
+  begin
+    FirstRepeatedPos := ChannelPos * Factor + (TemporalFactor - 1) * 4;
+    for XOffset := 0 to 1 do
+      for YOffset := 0 to 1 do
+        Result[ChannelPos * 4 + XOffset * 2 + YOffset] :=
+          (FirstRepeatedPos + YOffset * 2 + XOffset) div Repeats;
+  end;
+end;
+
+function AddQwenImage21DupUp(NN: TNNet; Source: TNNetLayer; OutCh,
+  TemporalFactor: integer; pTrainable: boolean): TNNetLayer;
+begin
+  NN.AddLayerAfter(VaeLayerTrainable(TNNetGatherChannels.Create(
+    QwenImage21DupUpChannels(Source.Output.Depth, OutCh, TemporalFactor)),
+    pTrainable), Source);
+  Result := NN.AddLayer(VaeLayerTrainable(TNNetPixelShuffle.Create(2),
+    pTrainable));
+end;
+
+// Channel RMSNorm: F.normalize(x, dim=channels) * sqrt(C) * gamma equals
+// x / sqrt(mean(x^2) + 1e-24/C) * gamma whenever |x| >= 1e-12 (F.normalize's floor).
+function CreateQwenImage21VaeNorm(Channels: integer): TNNetLayer;
+begin
+  Result := TNNetTokenRMSNorm.Create(1e-24 / Channels).SetTrainable(false);
+end;
+
+function BuildQwenImage21VaeDecoderNet(NN: TNNet;
+  const Config: TQwenImage21VaeConfig; LatentW, LatentH: integer;
+  TensorLayers: TStringList): TNNetLayer;
+var
+  LevelCount, UpPos, MaxUpPos, ResPos, InCh, OutCh, TopCh, TemporalFactor: integer;
+  UpPrefix: string;
+  BlockInput, Resample, Shortcut: TNNetLayer;
+  Attn: TVaeAttnLayers;
+
+  function Track(Layer: TNNetLayer; const TensorPrefix: string): TNNetLayer;
+  begin
+    if TensorLayers <> nil then TensorLayers.AddObject(TensorPrefix, Layer);
+    Result := Layer;
+  end;
+
+  procedure AddResnet(const ResPrefix: string; ResInCh, ResOutCh: integer);
+  var
+    Res: TVaeResnetLayers;
+  begin
+    AddVaeResnetBlockWithNorms(NN, ResInCh, ResOutCh,
+      CreateQwenImage21VaeNorm(ResInCh), CreateQwenImage21VaeNorm(ResOutCh),
+      Res, {pTrainable=}false);
+    Track(Res.Norm1, ResPrefix + 'norm1.');
+    Track(Res.Conv1, ResPrefix + 'conv1.');
+    Track(Res.Norm2, ResPrefix + 'norm2.');
+    Track(Res.Conv2, ResPrefix + 'conv2.');
+    if Res.Shortcut <> nil then Track(Res.Shortcut, ResPrefix + 'conv_shortcut.');
+  end;
+
+begin
+  if (LatentW < 1) or (LatentH < 1) then
+    ImportError(csQwenImage21VaeImporter + ': empty latent grid ' +
+      IntToStr(LatentW) + 'x' + IntToStr(LatentH) + '.');
+  LevelCount := Length(Config.DimMult);
+  TopCh := Config.DecoderDims[0];
+  NN.AddLayer(TNNetInput.Create(LatentW, LatentH, Config.ZDim).SetTrainable(false));
+  Track(NN.AddLayer(TNNetConvolutionLinear.Create(Config.ZDim, 1, 0, 1, 0).
+    SetTrainable(false)), csQwenImage21PostQuantPrefix);
+  Track(NN.AddLayer(TNNetConvolutionLinear.Create(TopCh, 3, 1, 1, 0).
+    SetTrainable(false)), 'decoder.conv_in.');
+  AddResnet('decoder.mid_block.resnets.0.', TopCh, TopCh);
+  AddVaeAttentionWithNorm(NN, TopCh, CreateQwenImage21VaeNorm(TopCh), Attn,
+    {pTrainable=}false);
+  Track(Attn.Norm, 'decoder.mid_block.attentions.0.norm.');
+  Track(Attn.QKV, 'decoder.mid_block.attentions.0.to_qkv.');
+  Track(Attn.AttnOut, 'decoder.mid_block.attentions.0.proj.');
+  AddResnet('decoder.mid_block.resnets.1.', TopCh, TopCh);
+  MaxUpPos := LevelCount - 1;
+  for UpPos := 0 to MaxUpPos do
+  begin
+    UpPrefix := 'decoder.up_blocks.' + IntToStr(UpPos) + '.';
+    BlockInput := NN.GetLastLayer();
+    InCh := Config.DecoderDims[UpPos];
+    OutCh := Config.DecoderDims[UpPos + 1];
+    for ResPos := 0 to Config.NumResBlocks do
+    begin
+      AddResnet(UpPrefix + 'resnets.' + IntToStr(ResPos) + '.', InCh, OutCh);
+      InCh := OutCh;
+    end;
+    if UpPos < MaxUpPos then
+    begin
+      // upsample2d and upsample3d resample alike on one image: nearest-exact
+      // x2 (= nearest at an integer factor) + 3x3 conv; time_conv never runs.
+      NN.AddLayer(TNNetDeMaxPool.Create(2).SetTrainable(false));
+      Resample := Track(NN.AddLayer(TNNetConvolutionLinear.Create(OutCh, 3, 1,
+        1, 0).SetTrainable(false)), UpPrefix + 'upsampler.resample.1.');
+      if Config.TemporalUpsample[UpPos]
+        then TemporalFactor := 2
+        else TemporalFactor := 1;
+      Shortcut := AddQwenImage21DupUp(NN, BlockInput, OutCh, TemporalFactor);
+      NN.AddLayer(TNNetSum.Create([Resample, Shortcut]).SetTrainable(false));
+    end;
+  end;
+  Track(NN.AddLayer(CreateQwenImage21VaeNorm(Config.DecoderDims[LevelCount])),
+    'decoder.norm_out.');
+  NN.AddLayer(TNNetSiLU.Create().SetTrainable(false));
+  Track(NN.AddLayer(TNNetConvolutionLinear.Create(Config.OutChannels, 3, 1, 1,
+    0).SetTrainable(false)), 'decoder.conv_out.');
+  // The attention's inner layers are created trainable.
+  NN.SetTrainable(false);
+  Result := NN.GetLastLayer();
+end;
+
+// x = latent * std + mean feeds post_quant_conv (1x1), so it folds into it:
+// W'[o,i] = W[o,i] * std[i], b'[o] = b[o] + sum_i W[o,i] * mean[i].
+procedure FoldQwenImage21LatentNorm(PostQuant: TNNetLayer;
+  const Config: TQwenImage21VaeConfig);
+var
+  OutPos, MaxOutPos, InPos, MaxInPos: integer;
+  Weights: TNNetVolume;
+  Bias: double;
+begin
+  MaxOutPos := PostQuant.Neurons.Count - 1;
+  MaxInPos := Config.ZDim - 1;
+  for OutPos := 0 to MaxOutPos do
+  begin
+    Weights := PostQuant.FArrNeurons[OutPos].Weights;
+    Bias := PostQuant.FArrNeurons[OutPos].BiasWeight;
+    for InPos := 0 to MaxInPos do
+    begin
+      Bias := Bias + double(Weights.FData[InPos]) * Config.LatentsMean[InPos];
+      Weights.FData[InPos] := Weights.FData[InPos] * Config.LatentsStd[InPos];
+    end;
+    PostQuant.FArrNeurons[OutPos].BiasWeight := Bias;
+  end;
+  PostQuant.FlushWeightCache();
+end;
+
+function LoadQwenImage21VaeDecoderWeights(Reader: TNNetSafeTensorsReader;
+  const Config: TQwenImage21VaeConfig; TensorLayers: TStringList): integer;
+var
+  LoadedNames: TStringList;
+  LayerPos, MaxLayerPos, TensorPos, MaxTensorPos, PostQuantPos: integer;
+  Prefix, WeightName, TensorName: string;
+  Layer: TNNetLayer;
+begin
+  LoadedNames := TStringList.Create;
+  try
+    LoadedNames.Sorted := true;
+    LoadedNames.Duplicates := dupIgnore;
+    MaxLayerPos := TensorLayers.Count - 1;
+    for LayerPos := 0 to MaxLayerPos do
+    begin
+      Prefix := TensorLayers[LayerPos];
+      Layer := TNNetLayer(TensorLayers.Objects[LayerPos]);
+      if Layer is TNNetTokenRMSNorm then
+      begin
+        WeightName := Prefix + 'gamma';
+        LoadAffineNormWeights(Reader, Layer, WeightName, '',
+          Layer.Output.Depth, 0, {HasBeta=}false, false, false,
+          csQwenImage21VaeImporter);
+        LoadedNames.Add(WeightName);
+      end
+      else
+      begin
+        WeightName := Prefix + 'weight';
+        if not Reader.HasTensor(WeightName) then
+          ImportError(csQwenImage21VaeImporter + ': missing tensor "' +
+            WeightName + '".');
+        if Reader.DimCount(WeightName) <> 4 then
+          ImportError(csQwenImage21VaeImporter + ': "' + WeightName +
+            '" must be a [out,in,k,k] conv weight, got ' +
+            Reader.ShapeAsString(WeightName));
+        LoadVaeConv(Reader, Layer, WeightName, Prefix + 'bias',
+          Layer.Neurons.Count, Layer.PrevLayer.Output.Depth,
+          Reader.DimSize(WeightName, 3));
+        LoadedNames.Add(WeightName);
+        LoadedNames.Add(Prefix + 'bias');
+      end;
+    end;
+    PostQuantPos := TensorLayers.IndexOf(csQwenImage21PostQuantPrefix);
+    if PostQuantPos < 0 then
+      ImportError(csQwenImage21VaeImporter + ': TensorLayers has no ' +
+        csQwenImage21PostQuantPrefix + ' entry.');
+    FoldQwenImage21LatentNorm(TNNetLayer(TensorLayers.Objects[PostQuantPos]),
+      Config);
+    // A single-image decode never runs time_conv (diffusers caches "Rep" on
+    // the first chunk), so its weights are the only decoder tensors left out.
+    Result := 0;
+    MaxTensorPos := Reader.Count - 1;
+    for TensorPos := 0 to MaxTensorPos do
+    begin
+      TensorName := Reader.TensorName(TensorPos);
+      if (Pos('decoder.', TensorName) <> 1) and
+         (Pos(csQwenImage21PostQuantPrefix, TensorName) <> 1) then continue;
+      if Pos('.time_conv.', TensorName) > 0 then Inc(Result)
+      else if LoadedNames.IndexOf(TensorName) < 0 then
+        ImportError(csQwenImage21VaeImporter + ': tensor "' + TensorName +
+          '" is not used by the decoder.');
+    end;
+  finally
+    LoadedNames.Free;
+  end;
+end;
+
+// diffusers blend_v: the first Extent rows of Tile ramp from Above's last
+// Extent rows (weight 1 - y/Extent) to Tile's own (weight y/Extent).
+procedure QwenImage21VaeBlendTileTop(Above, Tile: TNNetVolume;
+  Extent: integer);
+var
+  RowPos, MaxRowPos, RowLength: integer;
+  TileWeight: TNeuralFloat;
+begin
+  Extent := Min(Extent, Min(Above.SizeY, Tile.SizeY));
+  RowLength := Tile.SizeX * Tile.Depth;
+  MaxRowPos := Extent - 1;
+  for RowPos := 0 to MaxRowPos do
+  begin
+    TileWeight := RowPos / Extent;
+    TNNetVolume.Mul(Tile.GetRawPtr(Tile.GetRawPos(0, RowPos)), TileWeight,
+      RowLength);
+    TNNetVolume.MulAdd(Tile.GetRawPtr(Tile.GetRawPos(0, RowPos)),
+      Above.GetRawPtr(Above.GetRawPos(0, Above.SizeY - Extent + RowPos)),
+      1 - TileWeight, RowLength);
+  end;
+end;
+
+// diffusers blend_h: the same ramp over the first Extent columns, from Left's
+// last Extent columns.
+procedure QwenImage21VaeBlendTileLeft(Left, Tile: TNNetVolume;
+  Extent: integer);
+var
+  RowPos, MaxRowPos, ColumnPos, MaxColumnPos, ChannelPos, MaxChannelPos: integer;
+  TilePos, LeftPos: integer;
+  TileWeight, LeftWeight: TNeuralFloat;
+begin
+  Extent := Min(Extent, Min(Left.SizeX, Tile.SizeX));
+  MaxRowPos := Tile.SizeY - 1;
+  MaxColumnPos := Extent - 1;
+  MaxChannelPos := Tile.Depth - 1;
+  for RowPos := 0 to MaxRowPos do
+  begin
+    TilePos := Tile.GetRawPos(0, RowPos);
+    LeftPos := Left.GetRawPos(Left.SizeX - Extent, RowPos);
+    for ColumnPos := 0 to MaxColumnPos do
+    begin
+      TileWeight := ColumnPos / Extent;
+      LeftWeight := 1 - TileWeight;
+      // Depth is the few output channels: a bulk call per pixel costs more.
+      for ChannelPos := 0 to MaxChannelPos do
+        Tile.FData[TilePos + ChannelPos] :=
+          Left.FData[LeftPos + ChannelPos] * LeftWeight +
+          Tile.FData[TilePos + ChannelPos] * TileWeight;
+      Inc(TilePos, Tile.Depth);
+      Inc(LeftPos, Left.Depth);
+    end;
+  end;
+end;
+
+{ TQwenImage21VaeDecoder }
+
+constructor TQwenImage21VaeDecoder.Create(const VaeFolder: string);
+var
+  Folder: string;
+  Reader: TNNetSafeTensorsReader;
+begin
+  inherited Create();
+  FParallel := true;
+  FMaxThreads := 0;
+  Folder := IncludeTrailingPathDelimiter(VaeFolder);
+  FConfig := ReadQwenImage21VaeConfig(Folder + 'config.json');
+  Reader := TNNetSafeTensorsReader.Create(Folder +
+    'diffusion_pytorch_model.safetensors');
+  try
+    LoadFromReader(Reader);
+  finally
+    Reader.Free;
+  end;
+end;
+
+constructor TQwenImage21VaeDecoder.CreateFromReader(
+  Reader: TNNetSafeTensorsReader; const Config: TQwenImage21VaeConfig);
+begin
+  inherited Create();
+  FParallel := true;
+  FMaxThreads := 0;
+  FConfig := Config;
+  LoadFromReader(Reader);
+end;
+
+destructor TQwenImage21VaeDecoder.Destroy();
+begin
+  ReleaseNet();
+  {$IFDEF OpenCL}
+  FOpenCLContextNet.Free;
+  {$ENDIF}
+  FWeightOwner.Free;
+  inherited Destroy();
+end;
+
+procedure TQwenImage21VaeDecoder.LoadFromReader(
+  Reader: TNNetSafeTensorsReader);
+var
+  TensorLayers: TStringList;
+begin
+  TensorLayers := TStringList.Create;
+  try
+    FWeightOwner := TNNet.Create();
+    BuildQwenImage21VaeDecoderNet(FWeightOwner, FConfig, 1, 1, TensorLayers);
+    FSkippedTensorCount := LoadQwenImage21VaeDecoderWeights(Reader, FConfig,
+      TensorLayers);
+  finally
+    TensorLayers.Free;
+  end;
+end;
+
+procedure TQwenImage21VaeDecoder.PrepareNet(LatentW, LatentH: integer);
+begin
+  if Assigned(FNet) and (LatentW = FNetLatentW) and (LatentH = FNetLatentH) then
+    exit;
+  ReleaseNet();
+  FNet := TNNet.Create();
+  FNet.BuildWeightOwner := FWeightOwner;
+  BuildQwenImage21VaeDecoderNet(FNet, FConfig, LatentW, LatentH);
+  FNet.BuildWeightOwner := nil;
+  PrepareInferenceThreads(FNet, FParallel, FMaxThreads);
+  FNet.LayerProfiling := FLayerProfiling;
+  {$IFDEF OpenCL}
+  if Assigned(FOpenCLContextNet) then
+    FNet.EnableOpenCLInContextOf(FOpenCLContextNet, FOpenCLHasSharedKernel);
+  {$ENDIF}
+  FNetLatentW := LatentW;
+  FNetLatentH := LatentH;
+  FNetPassCount := 0;
+end;
+
+procedure TQwenImage21VaeDecoder.ReleaseNet();
+begin
+  FReleasedNetsProfile := FReleasedNetsProfile + NetProfile();
+  FreeAndNil(FNet);
+  FNetLatentW := 0;
+  FNetLatentH := 0;
+  FNetPassCount := 0;
+end;
+
+function TQwenImage21VaeDecoder.NetProfile(): string;
+begin
+  Result := '';
+  if not (FLayerProfiling and Assigned(FNet) and (FNetPassCount > 0)) then
+    exit;
+  Result := Format('[profile] VAE decoder net for a %dx%d latent (%dx%d ' +
+    'px), %d pass(es), by layer class:', [FNetLatentW, FNetLatentH,
+    FNetLatentW * FConfig.SpatialScale, FNetLatentH * FConfig.SpatialScale,
+    FNetPassCount]) + sLineBreak +
+    TNNet.LayerGroupTimingReport(FNet, [], FNetPassCount);
+end;
+
+function TQwenImage21VaeDecoder.ProfileReport(): string;
+begin
+  Result := FReleasedNetsProfile + NetProfile();
+end;
+
+{$IFDEF OpenCL}
+// The context net, not WeightOwner: arming WeightOwner would allocate an
+// OpenCL weight buffer per convolution that no forward ever fills.
+function TQwenImage21VaeDecoder.EnableOpenCL(pPlatform: cl_platform_id;
+  pDevice: cl_device_id; pHasSharedKernel: boolean): boolean;
+begin
+  Result := true;
+  if Assigned(FOpenCLContextNet) then exit;
+  FOpenCLContextNet := TNNet.Create();
+  FOpenCLContextNet.AddLayer(TNNetInput.Create(1, 1, 1));
+  FOpenCLContextNet.EnableOpenCL(pPlatform, pDevice, pHasSharedKernel);
+  // TNNet.EnableOpenCL has printed why the program is unavailable.
+  if not FOpenCLContextNet.Layers[0].HasOpenCL then
+  begin
+    FreeAndNil(FOpenCLContextNet);
+    exit(false);
+  end;
+  FOpenCLHasSharedKernel := pHasSharedKernel;
+  if Assigned(FNet) then
+    FNet.EnableOpenCLInContextOf(FOpenCLContextNet, pHasSharedKernel);
+end;
+
+function TQwenImage21VaeDecoder.OpenCLEnabled(): boolean;
+begin
+  Result := Assigned(FOpenCLContextNet);
+end;
+{$ENDIF}
+
+procedure TQwenImage21VaeDecoder.Decode(Latent, Image: TNNetVolume);
+begin
+  if Latent.Depth <> FConfig.ZDim then
+    ImportError(csQwenImage21VaeImporter + ': the latent has ' +
+      IntToStr(Latent.Depth) + ' channels, expected z_dim = ' +
+      IntToStr(FConfig.ZDim) + '.');
+  PrepareNet(Latent.SizeX, Latent.SizeY);
+  FNet.Compute(Latent, 0, FParallel);
+  Inc(FNetPassCount);
+  FNet.GetLastLayer().ForceOutputOnRAM();
+  Image.Copy(FNet.GetLastLayer().Output);
+  Image.ForceMaxRange(1.0);
+end;
+
+procedure TQwenImage21VaeDecoder.DecodeTiled(Latent, Image: TNNetVolume;
+  TileSampleSize, TileSampleStride: integer);
+var
+  Scale, TileLatentSize, TileLatentStride, BlendExtent: integer;
+  RowCount, ColumnCount, TileCount, TilePos, MaxTilePos, ShapeTilePos: integer;
+  RowPos, ColumnPos, TileW, TileH, CropW, CropH: integer;
+  Tiles: array of TNNetVolume;
+  TileWidths, TileHeights: TNeuralIntegerArray;
+  LatentTile: TNNetVolume;
+begin
+  Scale := FConfig.SpatialScale;
+  if (TileSampleSize mod Scale <> 0) or (TileSampleStride mod Scale <> 0) or
+     (TileSampleStride < Scale) or (TileSampleStride > TileSampleSize) then
+    ImportError(csQwenImage21VaeImporter + ': tile size ' +
+      IntToStr(TileSampleSize) + ' and stride ' + IntToStr(TileSampleStride) +
+      ' must be multiples of ' + IntToStr(Scale) + ' with stride <= size.');
+  TileLatentSize := TileSampleSize div Scale;
+  TileLatentStride := TileSampleStride div Scale;
+  BlendExtent := TileSampleSize - TileSampleStride;
+  // diffusers tiles only a latent wider or taller than one tile.
+  if (Latent.SizeX <= TileLatentSize) and (Latent.SizeY <= TileLatentSize) then
+  begin
+    Decode(Latent, Image);
+    exit;
+  end;
+  if Latent.Depth <> FConfig.ZDim then
+    ImportError(csQwenImage21VaeImporter + ': the latent has ' +
+      IntToStr(Latent.Depth) + ' channels, expected z_dim = ' +
+      IntToStr(FConfig.ZDim) + '.');
+  RowCount := (Latent.SizeY + TileLatentStride - 1) div TileLatentStride;
+  ColumnCount := (Latent.SizeX + TileLatentStride - 1) div TileLatentStride;
+  TileCount := RowCount * ColumnCount;
+  MaxTilePos := TileCount - 1;
+  SetLength(Tiles, TileCount);
+  SetLength(TileWidths, TileCount);
+  SetLength(TileHeights, TileCount);
+  for TilePos := 0 to MaxTilePos do
+  begin
+    Tiles[TilePos] := nil;
+    RowPos := TilePos div ColumnCount;
+    ColumnPos := TilePos mod ColumnCount;
+    TileWidths[TilePos] := Min(TileLatentSize,
+      Latent.SizeX - ColumnPos * TileLatentStride);
+    TileHeights[TilePos] := Min(TileLatentSize,
+      Latent.SizeY - RowPos * TileLatentStride);
+  end;
+  LatentTile := TNNetVolume.Create();
+  try
+    // Edge tiles are smaller; each tile shape gets one sized net.
+    for TilePos := 0 to MaxTilePos do
+    begin
+      if Tiles[TilePos] <> nil then continue;
+      TileW := TileWidths[TilePos];
+      TileH := TileHeights[TilePos];
+      PrepareNet(TileW, TileH);
+      for ShapeTilePos := TilePos to MaxTilePos do
+      begin
+        if (Tiles[ShapeTilePos] <> nil) or (TileWidths[ShapeTilePos] <> TileW) or
+           (TileHeights[ShapeTilePos] <> TileH) then continue;
+        LatentTile.CopyCropping(Latent,
+          (ShapeTilePos mod ColumnCount) * TileLatentStride,
+          (ShapeTilePos div ColumnCount) * TileLatentStride, TileW, TileH);
+        FNet.Compute(LatentTile, 0, FParallel);
+        Inc(FNetPassCount);
+        FNet.GetLastLayer().ForceOutputOnRAM();
+        Tiles[ShapeTilePos] := TNNetVolume.Create();
+        Tiles[ShapeTilePos].Copy(FNet.GetLastLayer().Output);
+      end;
+    end;
+    // Row-major and in place, as diffusers does: a tile blends with its
+    // neighbours after they were blended themselves.
+    Image.ReSize(Latent.SizeX * Scale, Latent.SizeY * Scale,
+      FConfig.OutChannels);
+    Image.Fill(0);
+    for TilePos := 0 to MaxTilePos do
+    begin
+      RowPos := TilePos div ColumnCount;
+      ColumnPos := TilePos mod ColumnCount;
+      if RowPos > 0 then
+        QwenImage21VaeBlendTileTop(Tiles[TilePos - ColumnCount],
+          Tiles[TilePos], BlendExtent);
+      if ColumnPos > 0 then
+        QwenImage21VaeBlendTileLeft(Tiles[TilePos - 1], Tiles[TilePos],
+          BlendExtent);
+      CropW := Min(TileSampleStride, Tiles[TilePos].SizeX);
+      CropH := Min(TileSampleStride, Tiles[TilePos].SizeY);
+      Image.AddArea(ColumnPos * TileSampleStride, RowPos * TileSampleStride,
+        0, 0, CropW, CropH, Tiles[TilePos]);
+    end;
+  finally
+    LatentTile.Free;
+    for TilePos := 0 to MaxTilePos do Tiles[TilePos].Free;
+  end;
+  Image.ForceMaxRange(1.0);
 end;
 
 // ===========================================================================
@@ -80452,6 +81777,1380 @@ begin
   end;
 end;
 
+function ReadQwen3VLConfigFromJSONFile(const FileName: string): TQwen3VLConfig;
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+begin
+  Result.Text := ReadLlamaConfigFromJSONFile(FileName);
+  if Result.Text.ModelType <> 'qwen3_vl' then
+    ImportError('Qwen3-VL import: config model_type is "' +
+      Result.Text.ModelType + '", expected "qwen3_vl".');
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    Result.ImageTokenId := TJSONObject(Root).Get('image_token_id', -1);
+    Result.VideoTokenId := TJSONObject(Root).Get('video_token_id', -1);
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+end;
+
+function BuildQwen3VLTextEncoderFromSafeTensors(const FileName: string;
+  out Config: TQwen3VLConfig; pSeqLen: integer;
+  pQuantizeInt8: boolean = false; const ConfigFileName: string = ''): TNNet;
+var
+  ConfigPath: string;
+begin
+  if pSeqLen < 1 then
+    ImportError('Qwen3-VL text encoder: pSeqLen must be >= 1 (the prompt ' +
+      'token count), got ' + IntToStr(pSeqLen) + '.');
+  if ConfigFileName <> '' then ConfigPath := ConfigFileName
+  else ConfigPath := ExtractFilePath(FileName) + 'config.json';
+  Config := ReadQwen3VLConfigFromJSONFile(ConfigPath);
+  Result := BuildLlamaFromSafeTensorsWithConfig(FileName, Config.Text, pSeqLen,
+    {pTrainable=}false, pQuantizeInt8, {pWeightOwner=}nil,
+    {pStopBeforeFinalNorm=}true);
+end;
+
+procedure Qwen3VLEncodeHiddenStates(Encoder: TNNet;
+  const Config: TQwen3VLConfig; const TokenIds: array of integer;
+  DropCount: integer; HiddenStates: TNNetVolume; Parallel: boolean);
+var
+  Input: TNNetVolume;
+  SeqLen, TokenCount, MaxTokenPos, TokenPos: integer;
+begin
+  SeqLen := Encoder.GetFirstLayer().Output.SizeX;
+  TokenCount := Length(TokenIds);
+  if (TokenCount < 1) or (TokenCount > SeqLen) then
+    ImportError('Qwen3VLEncodeHiddenStates: ' + IntToStr(TokenCount) +
+      ' token ids do not fit the encoder''s SeqLen ' + IntToStr(SeqLen) +
+      ' (need 1..SeqLen).');
+  if (DropCount < 0) or (DropCount >= TokenCount) then
+    ImportError('Qwen3VLEncodeHiddenStates: DropCount ' +
+      IntToStr(DropCount) + ' must be in [0, ' + IntToStr(TokenCount) + ').');
+  MaxTokenPos := TokenCount - 1;
+  for TokenPos := 0 to MaxTokenPos do
+  begin
+    if (TokenIds[TokenPos] < 0) or
+       (TokenIds[TokenPos] >= Config.Text.VocabSize) then
+      ImportError('Qwen3VLEncodeHiddenStates: token ' + IntToStr(TokenPos) +
+        ' has id ' + IntToStr(TokenIds[TokenPos]) + ', outside the ' +
+        'vocabulary 0..' + IntToStr(Config.Text.VocabSize - 1) + '.');
+    if ((Config.ImageTokenId >= 0) and
+        (TokenIds[TokenPos] = Config.ImageTokenId)) or
+       ((Config.VideoTokenId >= 0) and
+        (TokenIds[TokenPos] = Config.VideoTokenId)) then
+      ImportError('Qwen3VLEncodeHiddenStates: token ' + IntToStr(TokenPos) +
+        ' is an image/video placeholder (id ' + IntToStr(TokenIds[TokenPos]) +
+        '); vision input needs the vision tower and 3-D M-RoPE positions, ' +
+        'which this text-only encoder does not have.');
+  end;
+  Input := TNNetVolume.Create(SeqLen, 1, 1);
+  try
+    Input.Fill(0);
+    for TokenPos := 0 to MaxTokenPos do
+      Input.FData[TokenPos] := TokenIds[TokenPos];
+    Encoder.Compute(Input, 0, Parallel);
+    HiddenStates.CopyCropping(Encoder.GetLastLayer().Output, DropCount, 0,
+      TokenCount - DropCount, 1);
+  finally
+    Input.Free;
+  end;
+end;
+
+procedure PrepareInferenceThreads(NN: TNNet; Parallel: boolean;
+  MaxThreads: integer);
+begin
+  if not Parallel then exit;
+  // Set before StartThreadWorkers: the pool is created at the capped size.
+  if MaxThreads > 0 then NN.MaxThreadNum := MaxThreads;
+  NN.StartThreadWorkers();
+end;
+
+function QwenImage21TextToImagePrompt(const Prompt: string): string;
+var
+  UserText: string;
+begin
+  if Prompt = '' then UserText := ' ' else UserText := Prompt;
+  Result := ApplyChatTemplate(cfChatML,
+    [ChatMessage('system', csQwenImage21SystemPrompt),
+     ChatMessage('user', UserText)], {AddGenerationPrompt=}true);
+end;
+
+function QwenImage21EncodeTextToImagePrompt(Tokenizer: TNeuralHFTokenizer;
+  const Prompt: string; out DropCount: integer): TNeuralIntegerArray;
+begin
+  DropCount := Length(EncodeChat(Tokenizer, cfChatML,
+    [ChatMessage('system', csQwenImage21SystemPrompt)],
+    {AddGenerationPrompt=}false));
+  Result := Tokenizer.Encode(QwenImage21TextToImagePrompt(Prompt));
+end;
+
+procedure BuildQwenImage21RopePositions(const TextLengths, GridHeights,
+  GridWidths: array of integer; var PosF, PosH, PosW: TNeuralIntegerArray);
+var
+  MaxImagePos, MaxRunPos, RunCnt, MaxTextPos, TextCnt: integer;
+  TokenCount, TokenPos, Position, RowCnt, ColCnt: integer;
+  MinRow, MaxRow, MinCol, MaxCol: integer;
+begin
+  if (Length(GridHeights) <> Length(GridWidths)) or
+     (Length(TextLengths) <> Length(GridHeights) + 1) then
+    ImportError('BuildQwenImage21RopePositions: expected N image grids and ' +
+      'N+1 text lengths.');
+  MaxImagePos := Length(GridHeights) - 1;
+  MaxRunPos := Length(TextLengths) - 1;
+  TokenCount := 0;
+  for RunCnt := 0 to MaxRunPos do
+    Inc(TokenCount, TextLengths[RunCnt]);
+  for RunCnt := 0 to MaxImagePos do
+    Inc(TokenCount, GridHeights[RunCnt] * GridWidths[RunCnt]);
+  SetLength(PosF, TokenCount);
+  SetLength(PosH, TokenCount);
+  SetLength(PosW, TokenCount);
+  TokenPos := 0;
+  Position := 0;
+  for RunCnt := 0 to MaxRunPos do
+  begin
+    // Text run: one shared position per token on all three axes.
+    MaxTextPos := TextLengths[RunCnt] - 1;
+    for TextCnt := 0 to MaxTextPos do
+    begin
+      PosF[TokenPos] := Position;
+      PosH[TokenPos] := Position;
+      PosW[TokenPos] := Position;
+      Inc(Position);
+      Inc(TokenPos);
+    end;
+    if RunCnt > MaxImagePos then break;
+    // Image block: frame fixed at Position, (h, w) grid centred on zero.
+    MinRow := -(GridHeights[RunCnt] - GridHeights[RunCnt] div 2);
+    MaxRow := GridHeights[RunCnt] div 2 - 1;
+    MinCol := -(GridWidths[RunCnt] - GridWidths[RunCnt] div 2);
+    MaxCol := GridWidths[RunCnt] div 2 - 1;
+    for RowCnt := MinRow to MaxRow do
+      for ColCnt := MinCol to MaxCol do
+      begin
+        PosF[TokenPos] := Position;
+        PosH[TokenPos] := RowCnt;
+        PosW[TokenPos] := ColCnt;
+        Inc(TokenPos);
+      end;
+    Inc(Position, Max(GridHeights[RunCnt], GridWidths[RunCnt]));
+  end;
+end;
+
+const
+  // diffusers QwenImage21Rope(theta=10000): fixed, not in config.json.
+  csQwenImage21RopeTheta = 10000;
+
+function ReadQwenImage21TransformerConfig(
+  const FileName: string): TQwenImage21TransformerConfig;
+var
+  JsonText: TStringList;
+  Root, OutChannelsData: TJSONData;
+  Obj: TJSONObject;
+  AxesArr: TJSONArray;
+  AxisPos, PatchSize, MlpRatio: integer;
+begin
+  if not FileExists(FileName) then
+    ImportError('Qwen-Image-2.1 transformer: config file not found: ' +
+      FileName);
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(FileName);
+    Root := GetJSON(JsonText.Text);
+    if not (Root is TJSONObject) then
+      ImportError('Qwen-Image-2.1 transformer: config "' + FileName +
+        '" is not a JSON object.');
+    Obj := TJSONObject(Root);
+    Result.NumLayers := Obj.Get('num_layers', 32);
+    Result.NumHeads := Obj.Get('num_attention_heads', 32);
+    Result.HeadDim := Obj.Get('attention_head_dim', 128);
+    MlpRatio := Obj.Get('mlp_ratio', 3);
+    Result.InChannels := Obj.Get('in_channels', 64);
+    OutChannelsData := Obj.Find('out_channels');
+    if (OutChannelsData = nil) or (OutChannelsData.JSONType = jtNull) then
+      Result.OutChannels := Result.InChannels
+    else
+      Result.OutChannels := OutChannelsData.AsInteger;
+    Result.ContextInDim := Obj.Get('context_in_dim', 4096);
+    Result.Eps := Obj.Get('eps', 1e-6);
+    PatchSize := Obj.Get('patch_size', 1);
+    Result.AxesDims[0] := 16;
+    Result.AxesDims[1] := 56;
+    Result.AxesDims[2] := 56;
+    AxesArr := TJSONArray(Obj.Find('axes_dims_rope', jtArray));
+    if AxesArr <> nil then
+    begin
+      if AxesArr.Count <> 3 then
+        ImportError('Qwen-Image-2.1 transformer: axes_dims_rope must hold ' +
+          '3 entries, got ' + IntToStr(AxesArr.Count) + '.');
+      for AxisPos := 0 to 2 do
+        Result.AxesDims[AxisPos] := AxesArr.Integers[AxisPos];
+    end;
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+  Result.Hidden := Result.NumHeads * Result.HeadDim;
+  Result.MlpHidden := MlpRatio * Result.Hidden;
+  if PatchSize <> 1 then
+    ImportError('Qwen-Image-2.1 transformer: patch_size ' +
+      IntToStr(PatchSize) + ' is not supported (2.1 uses 1).');
+  if (Result.NumLayers < 1) or (Result.NumHeads < 1) or
+     (Result.HeadDim < 2) or (MlpRatio < 1) then
+    ImportError('Qwen-Image-2.1 transformer: config "' + FileName +
+      '" has a non-positive layer, head or MLP size.');
+  if Odd(Result.AxesDims[0]) or Odd(Result.AxesDims[1]) or
+     Odd(Result.AxesDims[2]) or
+     (Result.AxesDims[0] + Result.AxesDims[1] + Result.AxesDims[2] <>
+      Result.HeadDim) then
+    ImportError('Qwen-Image-2.1 transformer: axes_dims_rope must be even ' +
+      'and sum to attention_head_dim ' + IntToStr(Result.HeadDim) + '.');
+end;
+
+function AddQwenImage21Modulation(NN: TNNet; ModulationLayer: TNNetLayer;
+  Hidden: integer): TQwenImage21Modulation;
+begin
+  if ModulationLayer.Output.Size <> 4 * Hidden then
+    ImportError('AddQwenImage21Modulation: the modulation layer holds ' +
+      IntToStr(ModulationLayer.Output.Size) + ' values, expected 4*' +
+      IntToStr(Hidden) + '.');
+  Result.OnePlusScale1 := NN.AddLayerAfter(TNNetAddConstant.Create(1.0),
+    NN.AddLayerAfter(TNNetSplitChannels.Create(0, Hidden), ModulationLayer));
+  Result.TanhGate1 := NN.AddLayerAfter(TNNetHyperbolicTangent.Create(),
+    NN.AddLayerAfter(TNNetSplitChannels.Create(Hidden, Hidden),
+      ModulationLayer));
+  Result.OnePlusScale2 := NN.AddLayerAfter(TNNetAddConstant.Create(1.0),
+    NN.AddLayerAfter(TNNetSplitChannels.Create(2 * Hidden, Hidden),
+      ModulationLayer));
+  Result.TanhGate2 := NN.AddLayerAfter(TNNetHyperbolicTangent.Create(),
+    NN.AddLayerAfter(TNNetSplitChannels.Create(3 * Hidden, Hidden),
+      ModulationLayer));
+end;
+
+function AddQwenImage21Block(NN: TNNet; XInput: TNNetLayer;
+  const Modulation: TQwenImage21Modulation;
+  const Config: TQwenImage21TransformerConfig; Mode: TQwenImage21BlockMode;
+  pPrefixCapacity: integer; out Block: TQwenImage21BlockLayers;
+  pTrainable: boolean): TNNetLayer;
+var
+  Hidden, HeadDim: integer;
+begin
+  Hidden := Config.Hidden;
+  HeadDim := Config.HeadDim;
+  if XInput.Output.Depth <> Hidden then
+    ImportError('AddQwenImage21Block: input depth ' +
+      IntToStr(XInput.Output.Depth) + ' <> hidden ' + IntToStr(Hidden) + '.');
+  if (Mode = qibStep) and (pPrefixCapacity < 0) then
+    ImportError('AddQwenImage21Block: pPrefixCapacity must be >= 0.');
+  // ---- attention branch: x + tanh(gate1) * attn(LN(x) * (1 + scale1)) ----
+  // Non-affine LayerNorm: TNNetTokenLayerNorm keeps its default gamma=1, beta=0.
+  Block.Norm1 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.Eps).SetTrainable(pTrainable), XInput);
+  Block.Modulated1 := NN.AddLayer(
+    TNNetChannelMulByLayer.Create(Block.Norm1, Modulation.OnePlusScale1));
+  Block.QProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Hidden,
+      {pSuppressBias=}1).SetTrainable(pTrainable),
+    Block.Modulated1);
+  Block.KProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Hidden,
+      {pSuppressBias=}1).SetTrainable(pTrainable),
+    Block.Modulated1);
+  Block.VProj := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(Hidden,
+      {pSuppressBias=}1).SetTrainable(pTrainable),
+    Block.Modulated1);
+  Block.QNorm := NN.AddLayerAfter(
+    TNNetHeadRMSNorm.Create(HeadDim, Config.Eps).SetTrainable(pTrainable),
+    Block.QProj);
+  Block.KNorm := NN.AddLayerAfter(
+    TNNetHeadRMSNorm.Create(HeadDim, Config.Eps).SetTrainable(pTrainable),
+    Block.KProj);
+  // Consecutive (real, imag) pairs: the checkpoint rows need no permutation.
+  Block.QRope := TNNetAxialRotaryEmbedding.Create(csQwenImage21RopeTheta,
+    Config.AxesDims[0] div 2, Config.AxesDims[1] div 2,
+    Config.AxesDims[2] div 2, HeadDim);
+  NN.AddLayerAfter(Block.QRope, Block.QNorm);
+  Block.KRope := TNNetAxialRotaryEmbedding.Create(csQwenImage21RopeTheta,
+    Config.AxesDims[0] div 2, Config.AxesDims[1] div 2,
+    Config.AxesDims[2] div 2, HeadDim);
+  NN.AddLayerAfter(Block.KRope, Block.KNorm);
+  Block.QKV := NN.AddLayer(
+    TNNetDeepConcat.Create([Block.QRope, Block.KRope, Block.VProj]));
+  Block.Attn := TNNetFusedSDPA.Create(Config.NumHeads, Config.NumHeads,
+    HeadDim, {pCausalMask=}Mode = qibPrefix, {pWindow=}0, {pScoreSoftCap=}0,
+    {pCachedForwardNonCausal=}Mode = qibStep);
+  Block.Attn.SetTrainable(pTrainable);
+  // Armed BEFORE AddLayer, so SetPrevLayer never sizes the Heads x SeqLen x
+  // SeqLen prefill score map. The caller fills the prefix K/V with
+  // AppendCacheRowsFrom and calls TruncateCache(prefix length) before each step.
+  if Mode = qibStep then
+    Block.Attn.BeginIncrementalDecode(pPrefixCapacity + XInput.Output.SizeX);
+  NN.AddLayer(Block.Attn);
+  Block.OutProj := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Hidden,
+      {pSuppressBias=}1).SetTrainable(pTrainable));
+  Block.Gated1 := NN.AddLayer(
+    TNNetChannelMulByLayer.Create(Block.OutProj, Modulation.TanhGate1));
+  Block.Residual1 := NN.AddLayer(TNNetSum.Create([Block.Gated1, XInput]));
+  // ---- SwiGLU MLP branch: out(silu(gate_layer(h)) * proj(h)) ----
+  Block.Norm2 := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(Config.Eps).SetTrainable(pTrainable),
+    Block.Residual1);
+  Block.Modulated2 := NN.AddLayer(
+    TNNetChannelMulByLayer.Create(Block.Norm2, Modulation.OnePlusScale2));
+  Block.GateUp := NN.AddLayerAfter(
+    TNNetPointwiseConvLinear.Create(2 * Config.MlpHidden,
+      {pSuppressBias=}1).SetTrainable(pTrainable),
+    Block.Modulated2);
+  Block.SwiGLU := NN.AddLayer(TNNetSwiGLU.Create());
+  Block.Down := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Hidden,
+      {pSuppressBias=}1).SetTrainable(pTrainable));
+  Block.Gated2 := NN.AddLayer(
+    TNNetChannelMulByLayer.Create(Block.Down, Modulation.TanhGate2));
+  Block.Residual2 := NN.AddLayer(TNNetSum.Create([Block.Gated2,
+    Block.Residual1]));
+  Result := Block.Residual2;
+  if not pTrainable then NN.SetTrainable();
+end;
+
+procedure LoadQwenImage21BlockWeights(Reader: TNNetSafeTensorsReader;
+  const Block: TQwenImage21BlockLayers;
+  const Config: TQwenImage21TransformerConfig; BlockIdx: integer);
+var
+  Prefix: string;
+  Hidden, MlpHidden: integer;
+begin
+  Prefix := 'transformer_blocks.' + IntToStr(BlockIdx) + '.';
+  Hidden := Config.Hidden;
+  MlpHidden := Config.MlpHidden;
+  LoadLlamaLinearWeights(Reader, Block.QProj, Prefix + 'attn.to_q.weight',
+    Hidden, Hidden);
+  LoadLlamaLinearWeights(Reader, Block.KProj, Prefix + 'attn.to_k.weight',
+    Hidden, Hidden);
+  LoadLlamaLinearWeights(Reader, Block.VProj, Prefix + 'attn.to_v.weight',
+    Hidden, Hidden);
+  LoadLlamaRMSNormWeights(Reader, Block.QNorm, Prefix + 'attn.norm_q.weight',
+    Config.HeadDim);
+  LoadLlamaRMSNormWeights(Reader, Block.KNorm, Prefix + 'attn.norm_k.weight',
+    Config.HeadDim);
+  LoadLlamaLinearWeights(Reader, Block.OutProj,
+    Prefix + 'attn.to_out.0.weight', Hidden, Hidden);
+  // TNNetSwiGLU computes FIRSTHALF * silu(SECONDHALF): proj fills neurons
+  // 0..MlpHidden-1, gate_layer the rest; only the second call flushes.
+  LoadLlamaLinearWeights(Reader, Block.GateUp, Prefix + 'img_mlp.proj.weight',
+    Hidden, MlpHidden, 0, 2 * MlpHidden, {RotaryHeadDim=}0, {BiasName=}'',
+    {Scale=}1.0, {RotaryDims=}0, {SrcRowBase=}0, {SrcRows=}0,
+    {pFlatSlabRows=}false, {pDeferFlush=}true);
+  LoadLlamaLinearWeights(Reader, Block.GateUp,
+    Prefix + 'img_mlp.gate_layer.weight', Hidden, MlpHidden, MlpHidden,
+    2 * MlpHidden);
+  LoadLlamaLinearWeights(Reader, Block.Down, Prefix + 'img_mlp.out.weight',
+    MlpHidden, Hidden);
+end;
+
+function AddQwenImage21TextProjection(NN: TNNet; XInput: TNNetLayer;
+  const Config: TQwenImage21TransformerConfig;
+  out TextIn: TQwenImage21TextProjectionLayers;
+  pTrainable: boolean): TNNetLayer;
+begin
+  if XInput.Output.Depth <> Config.ContextInDim then
+    ImportError('AddQwenImage21TextProjection: input depth ' +
+      IntToStr(XInput.Output.Depth) + ' <> context_in_dim ' +
+      IntToStr(Config.ContextInDim) + '.');
+  TextIn.Norm := NN.AddLayerAfter(
+    TNNetTokenRMSNorm.Create(Config.Eps).SetTrainable(pTrainable), XInput);
+  TextIn.InLayer := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.Hidden,
+      {pSuppressBias=}1).SetTrainable(pTrainable));
+  NN.AddLayer(TNNetGELU.Create()); // nn.GELU(approximate="tanh")
+  TextIn.OutLayer := NN.AddLayer(
+    TNNetPointwiseConvLinear.Create(Config.Hidden,
+      {pSuppressBias=}1).SetTrainable(pTrainable));
+  Result := TextIn.OutLayer;
+  if not pTrainable then NN.SetTrainable();
+end;
+
+procedure LoadQwenImage21TextProjectionWeights(Reader: TNNetSafeTensorsReader;
+  const TextIn: TQwenImage21TextProjectionLayers;
+  const Config: TQwenImage21TransformerConfig);
+begin
+  // Zero-centred RMSNorm: the checkpoint stores scale - 1.
+  LoadLlamaRMSNormWeights(Reader, TextIn.Norm, 'txt_in.text_norm.weight',
+    Config.ContextInDim, {GainOffset=}1);
+  LoadLlamaLinearWeights(Reader, TextIn.InLayer, 'txt_in.in_layer.weight',
+    Config.ContextInDim, Config.Hidden);
+  LoadLlamaLinearWeights(Reader, TextIn.OutLayer, 'txt_in.out_layer.weight',
+    Config.Hidden, Config.Hidden);
+end;
+
+procedure QwenImage21SetRopePositions(NN: TNNet;
+  const PosF, PosH, PosW: array of integer);
+var
+  LayerCnt, LastLayerIdx, RopeCount: integer;
+begin
+  RopeCount := 0;
+  LastLayerIdx := NN.GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+    if NN.Layers[LayerCnt] is TNNetAxialRotaryEmbedding then
+    begin
+      TNNetAxialRotaryEmbedding(NN.Layers[LayerCnt]).SetPositions(PosF, PosH,
+        PosW);
+      Inc(RopeCount);
+    end;
+  if RopeCount = 0 then
+    ImportError('QwenImage21SetRopePositions: the net has no ' +
+      'TNNetAxialRotaryEmbedding layer.');
+end;
+
+// Defined with the PixArt importer below.
+procedure SwapSinCosInputColumns(Layer: TNNetLayer; InDim: integer); forward;
+
+const
+  // diffusers QwenImage21TimestepProjEmbeddings: fixed, not in config.json.
+  csQwenImage21TimestepDim = 256;
+  csQwenImage21TimeFactor = 1000;
+
+{ TQwenImage21Transformer }
+
+// Layers: input X (TokenCount,1,hidden), input modulation (1,1,4*hidden), the
+// four slices, the block. Every block net shares this graph, so the borrowing
+// build and TNNet.LinkWeightsFrom pair its layers by index.
+procedure TQwenImage21Transformer.BuildBlockNet(NN: TNNet; TokenCount: integer;
+  Mode: TQwenImage21BlockMode; PrefixCapacity: integer;
+  out Block: TQwenImage21BlockLayers);
+var
+  XInput, ModulationInput: TNNetLayer;
+begin
+  XInput := NN.AddLayer(TNNetInput.Create(TokenCount, 1, FConfig.Hidden));
+  ModulationInput := NN.AddLayer(TNNetInput.Create(1, 1, 4 * FConfig.Hidden));
+  AddQwenImage21Block(NN, XInput,
+    AddQwenImage21Modulation(NN, ModulationInput, FConfig.Hidden), FConfig,
+    Mode, PrefixCapacity, Block);
+end;
+
+function TQwenImage21Transformer.BuildImageInNet(NN: TNNet;
+  TokenCount: integer): TNNetLayer;
+begin
+  NN.AddLayer(TNNetInput.Create(TokenCount, 1, FConfig.InChannels));
+  Result := NN.AddLayer(TNNetPointwiseConvLinear.Create(FConfig.Hidden,
+    {pSuppressBias=}1).SetTrainable(false));
+  NN.SetTrainable();
+end;
+
+// Input X (TokenCount,1,hidden), input 1 + scale (1,1,hidden), non-affine
+// LayerNorm times (1 + scale), proj_out.
+function TQwenImage21Transformer.BuildOutputNet(NN: TNNet;
+  TokenCount: integer): TNNetLayer;
+var
+  XInput, ScaleInput, Norm: TNNetLayer;
+begin
+  XInput := NN.AddLayer(TNNetInput.Create(TokenCount, 1, FConfig.Hidden));
+  ScaleInput := NN.AddLayer(TNNetInput.Create(1, 1, FConfig.Hidden));
+  Norm := NN.AddLayerAfter(
+    TNNetTokenLayerNorm.Create(FConfig.Eps).SetTrainable(false), XInput);
+  NN.AddLayer(TNNetChannelMulByLayer.Create(Norm, ScaleInput));
+  Result := NN.AddLayer(TNNetPointwiseConvLinear.Create(FConfig.OutChannels,
+    {pSuppressBias=}1).SetTrainable(false));
+  NN.SetTrainable();
+end;
+
+// TNNetSinusoidalTimeEmbedding emits [sin|cos]; diffusers' cos-first order is
+// folded into linear_1's input columns (SwapSinCosInputColumns).
+procedure TQwenImage21Transformer.BuildTimestepNet(
+  Reader: TNNetSafeTensorsReader);
+var
+  Hidden: integer;
+  Linear1, Linear2, TembActivation, NormOutLinear: TNNetLayer;
+begin
+  Hidden := FConfig.Hidden;
+  FTimestepNet := TNNet.Create();
+  FTimestepNet.AddLayer(TNNetInput.Create(1, 1, 1));
+  FTimestepNet.AddLayer(
+    TNNetSinusoidalTimeEmbedding.Create(csQwenImage21TimestepDim));
+  Linear1 := FTimestepNet.AddLayer(TNNetPointwiseConvLinear.Create(Hidden,
+    {pSuppressBias=}1).SetTrainable(false));
+  FTimestepNet.AddLayer(TNNetSiLU.Create());
+  Linear2 := FTimestepNet.AddLayer(TNNetPointwiseConvLinear.Create(Hidden,
+    {pSuppressBias=}1).SetTrainable(false));
+  FTimestepEmbeddingLayer := Linear2;
+  TembActivation := FTimestepNet.AddLayer(TNNetSiLU.Create());
+  FModulationLayer := FTimestepNet.AddLayer(TNNetPointwiseConvLinear.Create(
+    4 * Hidden, {pSuppressBias=}1).SetTrainable(false));
+  NormOutLinear := FTimestepNet.AddLayerAfter(TNNetPointwiseConvLinear.Create(
+    Hidden, {pSuppressBias=}1).SetTrainable(false), TembActivation);
+  FNormOutScaleLayer := FTimestepNet.AddLayerAfter(
+    TNNetAddConstant.Create(1.0), NormOutLinear);
+  FTimestepNet.SetTrainable();
+  LoadLlamaLinearWeights(Reader, Linear1,
+    'time_text_embed.timestep_embedder.linear_1.weight',
+    csQwenImage21TimestepDim, Hidden);
+  SwapSinCosInputColumns(Linear1, csQwenImage21TimestepDim);
+  LoadLlamaLinearWeights(Reader, Linear2,
+    'time_text_embed.timestep_embedder.linear_2.weight', Hidden, Hidden);
+  LoadLlamaLinearWeights(Reader, FModulationLayer, 'modulation.1.weight',
+    Hidden, 4 * Hidden);
+  LoadLlamaLinearWeights(Reader, NormOutLinear, 'norm_out.linear.weight',
+    Hidden, Hidden);
+end;
+
+// Folder + Stem + '.safetensors.index.json' when that sharded index exists,
+// else Folder + Stem + '.safetensors'. Folder ends with a path delimiter.
+function SafeTensorsFolderWeightsFile(const Folder, Stem: string): string;
+begin
+  Result := Folder + Stem + '.safetensors.index.json';
+  if not FileExists(Result) then Result := Folder + Stem + '.safetensors';
+end;
+
+constructor TQwenImage21Transformer.Create(const TransformerFolder: string;
+  pWeightFormat: TQwenImage21WeightFormat; pInt8Input: boolean);
+var
+  Folder, WeightsFile: string;
+  Reader: TNNetSafeTensorsReader;
+  TextIn: TQwenImage21TextProjectionLayers;
+  BlockCnt, MaxBlockPos, LayerCnt, LastLayerIdx: integer;
+  BlockNet: TNNet;
+  WeightLayer: TNNetLayer;
+begin
+  inherited Create();
+  if pInt8Input and (pWeightFormat = qiwFP32) then
+    ImportError('TQwenImage21Transformer: int8 input needs int8 or int4 ' +
+      'weights.');
+  FWeightFormat := pWeightFormat;
+  FInt8Input := pInt8Input;
+  FParallel := true;
+  FMaxThreads := 0;
+  Folder := IncludeTrailingPathDelimiter(TransformerFolder);
+  FConfig := ReadQwenImage21TransformerConfig(Folder + 'config.json');
+  WeightsFile := SafeTensorsFolderWeightsFile(Folder,
+    'diffusion_pytorch_model');
+  FTimestepInput := TNNetVolume.Create(1, 1, 1);
+  Reader := TNNetSafeTensorsReader.Create(WeightsFile);
+  try
+    BuildTimestepNet(Reader);
+    FTextInOwner := TNNet.Create();
+    AddQwenImage21TextProjection(FTextInOwner,
+      FTextInOwner.AddLayer(TNNetInput.Create(1, 1, FConfig.ContextInDim)),
+      FConfig, TextIn);
+    LoadQwenImage21TextProjectionWeights(Reader, TextIn, FConfig);
+    FImageInOwner := TNNet.Create();
+    LoadLlamaLinearWeights(Reader, BuildImageInNet(FImageInOwner, 1),
+      'img_in.weight', FConfig.InChannels, FConfig.Hidden);
+    FOutputOwner := TNNet.Create();
+    LoadLlamaLinearWeights(Reader, BuildOutputNet(FOutputOwner, 1),
+      'proj_out.weight', FConfig.Hidden, FConfig.OutChannels);
+    MaxBlockPos := FConfig.NumLayers - 1;
+    SetLength(FBlockStore, FConfig.NumLayers);
+    SetLength(FBlockStoreLayers, FConfig.NumLayers);
+    SetLength(FPrefixKeys, FConfig.NumLayers);
+    SetLength(FPrefixValues, FConfig.NumLayers);
+    {$IFDEF OpenCL} SetLength(FPrefixKVOnOpenCL, FConfig.NumLayers); {$ENDIF}
+    for BlockCnt := 0 to MaxBlockPos do
+    begin
+      FPrefixKeys[BlockCnt] := TNNetVolume.Create();
+      FPrefixValues[BlockCnt] := TNNetVolume.Create();
+      {$IFDEF OpenCL} FPrefixKVOnOpenCL[BlockCnt].Buffer := nil; {$ENDIF}
+      BlockNet := TNNet.Create();
+      FBlockStore[BlockCnt] := BlockNet;
+      // Armed before the build: the loader streams rows straight into int8.
+      BlockNet.BuildQuantInt8 := pWeightFormat <> qiwFP32;
+      BuildBlockNet(BlockNet, {TokenCount=}1, qibPrefix, 0,
+        FBlockStoreLayers[BlockCnt]);
+      BlockNet.BuildQuantInt8 := false;
+      // int4: the loader quantizes the checkpoint rows straight to Q4_0; the
+      // sweep after it converts any layer the loader could not.
+      if pWeightFormat = qiwInt4 then BlockNet.BeginInt4QuantImports();
+      LoadQwenImage21BlockWeights(Reader, FBlockStoreLayers[BlockCnt],
+        FConfig, BlockCnt);
+      if pWeightFormat = qiwInt4 then
+      begin
+        RequireCompleteInt4QuantImports(BlockNet,
+          'Qwen-Image-2.1 transformer block ' + IntToStr(BlockCnt));
+        BlockNet.QuantizeWeightsInt4();
+      end;
+    end;
+  finally
+    Reader.Free;
+  end;
+  FBlockWeightLayerCount := 0;
+  LastLayerIdx := FBlockStore[0].GetLastLayerIdx();
+  for LayerCnt := 0 to LastLayerIdx do
+  begin
+    WeightLayer := FBlockStore[0].Layers[LayerCnt];
+    if WeightLayer.CountWeights() > 0 then Inc(FBlockWeightLayerCount);
+  end;
+end;
+
+destructor TQwenImage21Transformer.Destroy();
+var
+  BlockCnt, MaxBlockPos: integer;
+begin
+  FreeStepPass();
+  {$IFDEF OpenCL} ReleasePrefixKVOnOpenCL(); {$ENDIF}
+  FPrefixNet.Free;
+  FTextInNet.Free;
+  MaxBlockPos := Length(FBlockStore) - 1;
+  for BlockCnt := 0 to MaxBlockPos do
+  begin
+    FBlockStore[BlockCnt].Free;
+    FPrefixKeys[BlockCnt].Free;
+    FPrefixValues[BlockCnt].Free;
+  end;
+  FOutputOwner.Free;
+  FImageInOwner.Free;
+  FTextInOwner.Free;
+  FTimestepNet.Free;
+  FTimestepInput.Free;
+  inherited Destroy();
+end;
+
+procedure TQwenImage21Transformer.FreeStepPass();
+begin
+  FreeAndNil(FStepNet);
+  FreeAndNil(FImageInNet);
+  FreeAndNil(FOutputNet);
+  FStepGridH := 0;
+  FStepGridW := 0;
+end;
+
+// A layer with weights in OpenCL memory links only when they can follow by
+// handle; otherwise it refuses and the short count raises (no stale weights).
+procedure TQwenImage21Transformer.SelectBlockWeights(NN: TNNet;
+  BlockIdx: integer);
+begin
+  if (BlockIdx < 0) or (BlockIdx >= FConfig.NumLayers) then
+    raise Exception.Create('TQwenImage21Transformer.SelectBlockWeights: ' +
+      'block ' + IntToStr(BlockIdx) + ' is outside 0..' +
+      IntToStr(FConfig.NumLayers - 1) + '.');
+  if NN.LinkWeightsFrom(FBlockStore[BlockIdx]) <> FBlockWeightLayerCount then
+    raise Exception.Create('TQwenImage21Transformer.SelectBlockWeights: ' +
+      'block ' + IntToStr(BlockIdx) + ' could not be linked (see the ' +
+      'message above; a layer with OpenCL enabled links only when its ' +
+      'resident OpenCL codes can follow by handle).');
+end;
+
+{$IFDEF OpenCL}
+function TQwenImage21Transformer.EnableOpenCL(pPlatform: cl_platform_id;
+  pDevice: cl_device_id; pHasSharedKernel: boolean): boolean;
+var
+  BlockCnt, MaxBlockPos: integer;
+begin
+  Result := true;
+  if FOpenCLEnabled then exit;
+  if FWeightFormat = qiwFP32 then
+    raise Exception.Create('TQwenImage21Transformer.EnableOpenCL: needs int8 ' +
+      'or int4 block weights (only resident codes follow SelectBlockWeights).');
+  FBlockStore[0].EnableOpenCL(pPlatform, pDevice, pHasSharedKernel);
+  // TNNet.EnableOpenCL has printed why the program is unavailable.
+  if not FBlockStoreLayers[0].QProj.HasOpenCL then
+  begin
+    FBlockStore[0].DisableOpenCL();
+    exit(false);
+  end;
+  // One context: a borrowed cl_mem is only valid in the context that made it.
+  MaxBlockPos := FConfig.NumLayers - 1;
+  for BlockCnt := 1 to MaxBlockPos do
+    FBlockStore[BlockCnt].EnableOpenCLInContextOf(FBlockStore[0],
+      pHasSharedKernel);
+  FOpenCLHasSharedKernel := pHasSharedKernel;
+  FOpenCLEnabled := true;
+  if Assigned(FStepNet) then
+    FStepNet.EnableOpenCLInContextOf(FBlockStore[0], pHasSharedKernel);
+end;
+
+procedure TQwenImage21Transformer.ReleasePrefixKVOnOpenCL();
+var
+  BlockCnt, MaxBlockPos: integer;
+begin
+  MaxBlockPos := Length(FPrefixKVOnOpenCL) - 1;
+  for BlockCnt := 0 to MaxBlockPos do
+    if Assigned(FPrefixKVOnOpenCL[BlockCnt].Buffer) then
+    begin
+      clReleaseMemObject(FPrefixKVOnOpenCL[BlockCnt].Buffer);
+      FPrefixKVOnOpenCL[BlockCnt].Buffer := nil;
+    end;
+end;
+{$ENDIF}
+
+// An OpenCL-side append, not a second key source: the kernel reads one
+// head-major cache, and both paths keep the same CacheLength.
+procedure TQwenImage21Transformer.LoadStepPrefix(BlockIdx: integer);
+var
+  Attn: TNNetFusedSDPA;
+begin
+  Attn := FStepBlock.Attn;
+  Attn.TruncateCache(0);
+  {$IFDEF OpenCL}
+  if Attn.WillOpenCL() then
+  begin
+    if not Assigned(FPrefixKVOnOpenCL[BlockIdx].Buffer) then
+    begin
+      FPrefixKVOnOpenCL[BlockIdx] := Attn.NewCacheRowsOnOpenCL(
+        FPrefixKeys[BlockIdx], FPrefixValues[BlockIdx]);
+      Inc(FPrefixKVUploadCount);
+    end;
+    Attn.AppendCacheRowsFromOpenCL(FPrefixKVOnOpenCL[BlockIdx]);
+  end
+  else
+  {$ENDIF}
+    Attn.AppendCacheRowsFrom(FPrefixKeys[BlockIdx], FPrefixValues[BlockIdx]);
+  if Attn.CacheLength <> FPrefixLength then
+    raise Exception.Create('TQwenImage21Transformer.PredictVelocity: ' +
+      'block ' + IntToStr(BlockIdx) + ' cached ' +
+      IntToStr(Attn.CacheLength) + ' prefix rows, expected ' +
+      IntToStr(FPrefixLength) + '.');
+end;
+
+procedure TQwenImage21Transformer.ComputeModulation(Timestep: TNeuralFloat);
+begin
+  FTimestepInput.FData[0] := Timestep * csQwenImage21TimeFactor;
+  FTimestepNet.Compute(FTimestepInput);
+  FModulationLayer.ForceOutputOnRAM();
+  FTimestepEmbeddingLayer.ForceOutputOnRAM();
+  FNormOutScaleLayer.ForceOutputOnRAM();
+end;
+
+procedure TQwenImage21Transformer.EncodePrefix(TextHidden: TNNetVolume);
+var
+  TextIn: TQwenImage21TextProjectionLayers;
+  PosF, PosH, PosW: TNeuralIntegerArray;
+  BlockInput: TNNetVolume;
+  TokenCount, BlockCnt, MaxBlockPos, LastBlockEndIdx: integer;
+  PrefixStart: TDateTime;
+begin
+  TokenCount := TextHidden.SizeX;
+  if (TokenCount < 1) or (TextHidden.SizeY <> 1) or
+     (TextHidden.Depth <> FConfig.ContextInDim) then
+    raise Exception.Create('TQwenImage21Transformer.EncodePrefix: expected ' +
+      '(L,1,' + IntToStr(FConfig.ContextInDim) + ') text hidden states, got ' +
+      IntToStr(TextHidden.SizeX) + 'x' + IntToStr(TextHidden.SizeY) + 'x' +
+      IntToStr(TextHidden.Depth) + '.');
+  // The rows below replace every block's prefix K/V.
+  {$IFDEF OpenCL} ReleasePrefixKVOnOpenCL(); {$ENDIF}
+  if TokenCount <> FPrefixLength then
+  begin
+    // The step pass caches prefix + image rows, so it is rebuilt too.
+    FreeStepPass();
+    FreeAndNil(FPrefixNet);
+    FreeAndNil(FTextInNet);
+    FPrefixLength := 0;
+    FTextInNet := TNNet.Create();
+    FTextInNet.BuildWeightOwner := FTextInOwner;
+    AddQwenImage21TextProjection(FTextInNet,
+      FTextInNet.AddLayer(TNNetInput.Create(TokenCount, 1,
+        FConfig.ContextInDim)), FConfig, TextIn);
+    FTextInNet.BuildWeightOwner := nil;
+    FPrefixNet := TNNet.Create();
+    FPrefixNet.BuildWeightOwner := FBlockStore[0];
+    BuildBlockNet(FPrefixNet, TokenCount, qibPrefix, 0, FPrefixBlock);
+    FPrefixNet.BuildWeightOwner := nil;
+    if FInt8Input then FPrefixNet.EnableInt8Input();
+    PrepareInferenceThreads(FPrefixNet, FParallel, FMaxThreads);
+    BuildQwenImage21RopePositions([TokenCount], [], [], PosF, PosH, PosW);
+    QwenImage21SetRopePositions(FPrefixNet, PosF, PosH, PosW);
+    FPrefixLength := TokenCount;
+    SetLayerProfiling(FLayerProfiling);
+  end;
+  if FLayerProfiling then
+  begin
+    FTextInNet.ClearTime();
+    FPrefixNet.ClearTime();
+    FPrefixNet.ResetSchedulerStats();
+    SetLength(FProfileStepMs, 0);
+  end;
+  PrefixStart := Now();
+  ComputeModulation(0);
+  FPrefixNet.Layers[1].Output.Copy(FModulationLayer.Output);
+  FTextInNet.Compute(TextHidden);
+  BlockInput := FTextInNet.GetLastLayer().Output;
+  MaxBlockPos := FConfig.NumLayers - 1;
+  // The text rows after the last block are never read: its forward stops once
+  // K and V exist.
+  LastBlockEndIdx := FPrefixBlock.KRope.LayerIdx;
+  for BlockCnt := 0 to MaxBlockPos do
+  begin
+    SelectBlockWeights(FPrefixNet, BlockCnt);
+    if BlockCnt < MaxBlockPos
+      then FPrefixNet.Compute(BlockInput, 0, FParallel)
+      else FPrefixNet.Compute(BlockInput, 0, FParallel, LastBlockEndIdx);
+    FPrefixBlock.KRope.ForceOutputOnRAM();
+    FPrefixBlock.VProj.ForceOutputOnRAM();
+    FPrefixKeys[BlockCnt].Copy(FPrefixBlock.KRope.Output);
+    FPrefixValues[BlockCnt].Copy(FPrefixBlock.VProj.Output);
+    BlockInput := FPrefixNet.GetLastLayer().Output;
+  end;
+  FProfilePrefixMs := (Now() - PrefixStart) * MSecsPerDay;
+end;
+
+procedure TQwenImage21Transformer.PrepareStepPass(GridH, GridW: integer);
+var
+  PosF, PosH, PosW: TNeuralIntegerArray;
+  TokenCount: integer;
+begin
+  if FPrefixLength = 0 then
+    raise Exception.Create('TQwenImage21Transformer: call EncodePrefix ' +
+      'before the step pass.');
+  if (GridH < 1) or (GridW < 1) then
+    raise Exception.Create('TQwenImage21Transformer.PrepareStepPass: grid ' +
+      IntToStr(GridH) + 'x' + IntToStr(GridW) + ' is empty.');
+  if Assigned(FStepNet) and (GridH = FStepGridH) and (GridW = FStepGridW) then
+    exit;
+  FreeStepPass();
+  TokenCount := GridH * GridW;
+  FImageInNet := TNNet.Create();
+  FImageInNet.BuildWeightOwner := FImageInOwner;
+  BuildImageInNet(FImageInNet, TokenCount);
+  FImageInNet.BuildWeightOwner := nil;
+  FStepNet := TNNet.Create();
+  FStepNet.BuildWeightOwner := FBlockStore[0];
+  BuildBlockNet(FStepNet, TokenCount, qibStep, FPrefixLength, FStepBlock);
+  FStepNet.BuildWeightOwner := nil;
+  FStepNet.KeepLastOutputOnOpenCL := true;
+  if FInt8Input then FStepNet.EnableInt8Input();
+  PrepareInferenceThreads(FStepNet, FParallel, FMaxThreads);
+  {$IFDEF OpenCL}
+  if FOpenCLEnabled then
+    FStepNet.EnableOpenCLInContextOf(FBlockStore[0], FOpenCLHasSharedKernel);
+  {$ENDIF}
+  FOutputNet := TNNet.Create();
+  FOutputNet.BuildWeightOwner := FOutputOwner;
+  BuildOutputNet(FOutputNet, TokenCount);
+  FOutputNet.BuildWeightOwner := nil;
+  // The step pass carries only the image tokens: the tail of the joint layout.
+  BuildQwenImage21RopePositions([FPrefixLength, 0], [GridH], [GridW],
+    PosF, PosH, PosW);
+  QwenImage21SetRopePositions(FStepNet,
+    Copy(PosF, FPrefixLength, TokenCount),
+    Copy(PosH, FPrefixLength, TokenCount),
+    Copy(PosW, FPrefixLength, TokenCount));
+  FStepGridH := GridH;
+  FStepGridW := GridW;
+  SetLayerProfiling(FLayerProfiling);
+  SetLength(FProfileStepMs, 0);
+end;
+
+procedure TQwenImage21Transformer.PredictVelocity(Latents: TNNetVolume;
+  Timestep: TNeuralFloat; GridH, GridW: integer; Velocity: TNNetVolume);
+var
+  BlockCnt, MaxBlockPos, StepCnt: integer;
+  StepStart: TDateTime;
+begin
+  PrepareStepPass(GridH, GridW);
+  if (Latents.SizeX <> GridH * GridW) or (Latents.SizeY <> 1) or
+     (Latents.Depth <> FConfig.InChannels) then
+    raise Exception.Create('TQwenImage21Transformer.PredictVelocity: ' +
+      'expected (' + IntToStr(GridH * GridW) + ',1,' +
+      IntToStr(FConfig.InChannels) + ') latents, got ' +
+      IntToStr(Latents.SizeX) + 'x' + IntToStr(Latents.SizeY) + 'x' +
+      IntToStr(Latents.Depth) + '.');
+  if FLayerProfiling and (Length(FProfileStepMs) = 0) then
+  begin
+    FTimestepNet.ClearTime();
+    FImageInNet.ClearTime();
+    FStepNet.ClearTime();
+    FStepNet.ResetSchedulerStats();
+    FOutputNet.ClearTime();
+  end;
+  StepStart := Now();
+  ComputeModulation(Timestep);
+  FStepNet.Layers[1].Output.Copy(FModulationLayer.Output);
+  FOutputNet.Layers[1].Output.Copy(FNormOutScaleLayer.Output);
+  FImageInNet.Compute(Latents);
+  MaxBlockPos := FConfig.NumLayers - 1;
+  for BlockCnt := 0 to MaxBlockPos do
+  begin
+    SelectBlockWeights(FStepNet, BlockCnt);
+    LoadStepPrefix(BlockCnt);
+    // The prefix K/V copy is enqueued outside StepNet.Compute: under
+    // profiling it is drained here, in the time outside the nets.
+    {$IFDEF OpenCL}
+    if FLayerProfiling then FStepBlock.Attn.FinishOpenCLQueues();
+    {$ENDIF}
+    // Block b's output feeds block b + 1 inside OpenCL memory when it is there
+    // (FStepNet.KeepLastOutputOnOpenCL).
+    if BlockCnt = 0
+      then FStepNet.Compute(FImageInNet.GetLastLayer().Output, 0, FParallel)
+      else FStepNet.ComputeFromLayerOutput(FStepNet.GetLastLayer(), 0,
+        FParallel);
+  end;
+  FStepNet.GetLastLayer().ForceOutputOnRAM();
+  FOutputNet.Compute(FStepNet.GetLastLayer().Output);
+  FOutputNet.GetLastLayer().ForceOutputOnRAM();
+  Velocity.Copy(FOutputNet.GetLastLayer().Output);
+  if FLayerProfiling then
+  begin
+    StepCnt := Length(FProfileStepMs);
+    SetLength(FProfileStepMs, StepCnt + 1);
+    FProfileStepMs[StepCnt] := (Now() - StepStart) * MSecsPerDay;
+  end;
+end;
+
+function TQwenImage21Transformer.GetBlockStore(BlockIdx: integer): TNNet;
+begin
+  Result := FBlockStore[BlockIdx];
+end;
+
+function TQwenImage21Transformer.GetBlockStoreLayers(
+  BlockIdx: integer): TQwenImage21BlockLayers;
+begin
+  Result := FBlockStoreLayers[BlockIdx];
+end;
+
+function TQwenImage21Transformer.GetPrefixKeys(BlockIdx: integer): TNNetVolume;
+begin
+  Result := FPrefixKeys[BlockIdx];
+end;
+
+function TQwenImage21Transformer.GetPrefixValues(
+  BlockIdx: integer): TNNetVolume;
+begin
+  Result := FPrefixValues[BlockIdx];
+end;
+
+function TQwenImage21Transformer.GetTimestepEmbedding(): TNNetVolume;
+begin
+  Result := FTimestepEmbeddingLayer.Output;
+end;
+
+function TQwenImage21Transformer.GetModulation(): TNNetVolume;
+begin
+  Result := FModulationLayer.Output;
+end;
+
+procedure TQwenImage21Transformer.SetLayerProfiling(Value: boolean);
+var
+  Nets: array[0..5] of TNNet;
+  NetPos: integer;
+begin
+  FLayerProfiling := Value;
+  Nets[0] := FTimestepNet;
+  Nets[1] := FTextInNet;
+  Nets[2] := FPrefixNet;
+  Nets[3] := FImageInNet;
+  Nets[4] := FStepNet;
+  Nets[5] := FOutputNet;
+  for NetPos := Low(Nets) to High(Nets) do
+    if Assigned(Nets[NetPos]) then Nets[NetPos].LayerProfiling := Value;
+end;
+
+function TQwenImage21Transformer.BlockGroupNames(NN: TNNet;
+  const Block: TQwenImage21BlockLayers): TStringArray;
+
+  procedure AssignGroup(Layer: TNNetLayer; const GroupName: string);
+  begin
+    if Assigned(Layer) then Result[Layer.LayerIdx] := GroupName;
+  end;
+
+var
+  LayerCnt, MaxLayerPos: integer;
+begin
+  MaxLayerPos := NN.GetLastLayerIdx();
+  SetLength(Result, MaxLayerPos + 1);
+  // BuildBlockNet: layer 0 is the block input, then the modulation input and
+  // its slice/offset/tanh chain up to Norm1.
+  Result[0] := 'BlockInput';
+  for LayerCnt := 1 to MaxLayerPos do
+    if LayerCnt < Block.Norm1.LayerIdx
+      then Result[LayerCnt] := 'Modulation chain'
+      else Result[LayerCnt] := '';
+  AssignGroup(Block.Norm1, 'Norm1');
+  AssignGroup(Block.Modulated1, 'Modulated1');
+  AssignGroup(Block.QProj, 'QProj');
+  AssignGroup(Block.KProj, 'KProj');
+  AssignGroup(Block.VProj, 'VProj');
+  AssignGroup(Block.QNorm, 'QNorm');
+  AssignGroup(Block.KNorm, 'KNorm');
+  AssignGroup(Block.QRope, 'QRope');
+  AssignGroup(Block.KRope, 'KRope');
+  AssignGroup(Block.QKV, 'QKV concat');
+  AssignGroup(Block.Attn, 'Attn');
+  AssignGroup(Block.OutProj, 'OutProj');
+  AssignGroup(Block.Gated1, 'Gated1');
+  AssignGroup(Block.Residual1, 'Residual1');
+  AssignGroup(Block.Norm2, 'Norm2');
+  AssignGroup(Block.Modulated2, 'Modulated2');
+  AssignGroup(Block.GateUp, 'GateUp');
+  AssignGroup(Block.SwiGLU, 'SwiGLU');
+  AssignGroup(Block.Down, 'Down');
+  AssignGroup(Block.Gated2, 'Gated2');
+  AssignGroup(Block.Residual2, 'Residual2');
+end;
+
+function TQwenImage21Transformer.ProfileReport(): string;
+var
+  Lines: TStringList;
+  StepCnt, StepPos, MaxStepPos: integer;
+  WallMs, TimestepMs, ImageInMs, BlocksMs, OutputMs: double;
+  StepWalls: string;
+begin
+  Lines := TStringList.Create;
+  try
+    StepCnt := Length(FProfileStepMs);
+    if Assigned(FStepNet) and (StepCnt > 0) then
+    begin
+      WallMs := 0;
+      StepWalls := '';
+      MaxStepPos := StepCnt - 1;
+      for StepPos := 0 to MaxStepPos do
+      begin
+        WallMs := WallMs + FProfileStepMs[StepPos];
+        StepWalls := StepWalls + Format(' %.1f', [FProfileStepMs[StepPos]]);
+      end;
+      TimestepMs := FTimestepNet.NNetForwardTime * MSecsPerDay;
+      ImageInMs := FImageInNet.NNetForwardTime * MSecsPerDay;
+      BlocksMs := FStepNet.NNetForwardTime * MSecsPerDay;
+      OutputMs := FOutputNet.NNetForwardTime * MSecsPerDay;
+      Lines.Add(Format('[profile] transformer step pass: %d step(s) of %d ' +
+        'image tokens, %d blocks per step through one reused StepNet',
+        [StepCnt, FStepGridH * FStepGridW, FConfig.NumLayers]));
+      Lines.Add('[profile] step wall ms:' + StepWalls + Format(' (mean %.1f)',
+        [WallMs / StepCnt]));
+      Lines.Add(Format('[profile] mean ms/step: StepNet.Compute x %d %.1f | ' +
+        'timestep net %.1f | image-in net %.1f | output net %.1f | outside ' +
+        'the nets (weight swap, prefix K/V load, last block download) ' +
+        '%.1f', [FConfig.NumLayers, BlocksMs / StepCnt, TimestepMs / StepCnt,
+        ImageInMs / StepCnt, OutputMs / StepCnt, (WallMs - BlocksMs -
+        TimestepMs - ImageInMs - OutputMs) / StepCnt]));
+      Lines.Add('[profile] StepNet by block role, summed over blocks and ' +
+        'steps (pass = one step):');
+      Lines.Add(TNNet.LayerGroupTimingReport(FStepNet,
+        BlockGroupNames(FStepNet, FStepBlock), StepCnt));
+      Lines.Add('[profile] StepNet by layer class:');
+      Lines.Add(TNNet.LayerGroupTimingReport(FStepNet, [], StepCnt));
+    end;
+    if Assigned(FPrefixNet) then
+    begin
+      Lines.Add(Format('[profile] transformer prefix pass: %d text tokens, ' +
+        'wall %.1f ms (txt_in net %.1f ms)', [FPrefixLength, FProfilePrefixMs,
+        FTextInNet.NNetForwardTime * MSecsPerDay]));
+      Lines.Add('[profile] PrefixNet by block role, summed over blocks:');
+      Lines.Add(TNNet.LayerGroupTimingReport(FPrefixNet,
+        BlockGroupNames(FPrefixNet, FPrefixBlock), 1));
+    end;
+    Result := Lines.Text;
+  finally
+    Lines.Free;
+  end;
+end;
+
+constructor TQwenImage21Pipeline.Create(const ModelFolder: string);
+var
+  JsonText: TStringList;
+  Root: TJSONData;
+  IndexFile, PipelineClass: string;
+begin
+  inherited Create();
+  FModelFolder := IncludeTrailingPathDelimiter(ModelFolder);
+  IndexFile := FModelFolder + 'model_index.json';
+  if not FileExists(IndexFile) then
+    ImportError('TQwenImage21Pipeline: ' + IndexFile + ' not found.');
+  JsonText := TStringList.Create;
+  Root := nil;
+  try
+    JsonText.LoadFromFile(IndexFile);
+    Root := GetJSON(JsonText.Text);
+    PipelineClass := '';
+    if Root is TJSONObject then
+      PipelineClass := TJSONObject(Root).Get('_class_name', '');
+    if PipelineClass <> 'QwenImage21Pipeline' then
+      ImportError('TQwenImage21Pipeline: ' + IndexFile + ' names "' +
+        PipelineClass + '", expected "QwenImage21Pipeline".');
+  finally
+    Root.Free;
+    JsonText.Free;
+  end;
+  FScheduler := TNNetFlowMatchEulerScheduler.CreateFromDiffusersConfig(
+    ComponentFolder('scheduler') + 'scheduler_config.json');
+  FTransformerConfig := ReadQwenImage21TransformerConfig(
+    ComponentFolder('transformer') + 'config.json');
+  FTransformerFormat := qiwFP32;
+  FVaeTileSize := 128;
+  FVaeTileStride := 96;
+  FParallel := true;
+  FMaxThreads := 0;
+end;
+
+destructor TQwenImage21Pipeline.Destroy();
+begin
+  FScheduler.Free;
+  inherited Destroy();
+end;
+
+procedure TQwenImage21Pipeline.DoPhase(Phase: TQwenImage21PipelinePhase);
+begin
+  if Assigned(FOnPhase) then FOnPhase(Phase);
+end;
+
+function TQwenImage21Pipeline.ComponentFolder(const Component: string): string;
+begin
+  Result := FModelFolder + Component + PathDelim;
+end;
+
+procedure TQwenImage21Pipeline.CheckImageSize(Width, Height: integer);
+begin
+  if (Width < csQwenImage21ImageSideMultiple) or
+     (Height < csQwenImage21ImageSideMultiple) or
+     (Width mod csQwenImage21ImageSideMultiple <> 0) or
+     (Height mod csQwenImage21ImageSideMultiple <> 0) then
+    ImportError('TQwenImage21Pipeline: image ' + IntToStr(Width) + 'x' +
+      IntToStr(Height) + ' must have sides that are positive multiples of ' +
+      IntToStr(csQwenImage21ImageSideMultiple) + ' (see RoundDownImageSide).');
+end;
+
+class function TQwenImage21Pipeline.RoundDownImageSide(Side: integer): integer;
+begin
+  Result := (Side div csQwenImage21ImageSideMultiple) *
+    csQwenImage21ImageSideMultiple;
+  if Result < csQwenImage21ImageSideMultiple then
+    ImportError('TQwenImage21Pipeline: image side ' + IntToStr(Side) +
+      ' is below the minimum ' + IntToStr(csQwenImage21ImageSideMultiple) +
+      '.');
+end;
+
+function TQwenImage21Pipeline.TokenizePrompt(const Prompt: string;
+  out DropCount: integer): TNeuralIntegerArray;
+var
+  Tokenizer: TNeuralHFTokenizer;
+  TokenizerFile: string;
+begin
+  TokenizerFile := ComponentFolder('processor') + 'tokenizer.json';
+  if not FileExists(TokenizerFile) then
+    ImportError('TQwenImage21Pipeline: ' + TokenizerFile + ' not found.');
+  Tokenizer := TNeuralHFTokenizer.Create();
+  try
+    Tokenizer.LoadFromFile(TokenizerFile);
+    Result := QwenImage21EncodeTextToImagePrompt(Tokenizer, Prompt, DropCount);
+  finally
+    Tokenizer.Free;
+  end;
+end;
+
+procedure TQwenImage21Pipeline.EncodeTokenIds(const TokenIds: array of integer;
+  DropCount: integer; PromptEmbeds: TNNetVolume);
+var
+  Encoder: TNNet;
+  Config: TQwen3VLConfig;
+begin
+  DoPhase(qppLoadTextEncoder);
+  Encoder := BuildQwen3VLTextEncoderFromSafeTensors(
+    SafeTensorsFolderWeightsFile(ComponentFolder('text_encoder'), 'model'),
+    Config,
+    Length(TokenIds), FTextEncoderInt8);
+  try
+    PrepareInferenceThreads(Encoder, FParallel, FMaxThreads);
+    if Config.Text.HiddenSize <> FTransformerConfig.ContextInDim then
+      ImportError('TQwenImage21Pipeline: the text encoder hidden size ' +
+        IntToStr(Config.Text.HiddenSize) + ' differs from the transformer''s ' +
+        'context_in_dim ' + IntToStr(FTransformerConfig.ContextInDim) + '.');
+    DoPhase(qppEncodePrompt);
+    Qwen3VLEncodeHiddenStates(Encoder, Config, TokenIds, DropCount,
+      PromptEmbeds, FParallel);
+  finally
+    Encoder.Free;
+  end;
+end;
+
+procedure TQwenImage21Pipeline.EncodePrompt(const Prompt: string;
+  PromptEmbeds: TNNetVolume);
+var
+  TokenIds: TNeuralIntegerArray;
+  DropCount: integer;
+begin
+  TokenIds := TokenizePrompt(Prompt, DropCount);
+  EncodeTokenIds(TokenIds, DropCount, PromptEmbeds);
+end;
+
+procedure TQwenImage21Pipeline.MakeInitialLatents(Width, Height: integer;
+  Seed: cardinal; Latents: TNNetVolume);
+var
+  SavedSeed: cardinal;
+begin
+  CheckImageSize(Width, Height);
+  Latents.ReSize((Width div csQwenImage21PixelsPerLatent) *
+    (Height div csQwenImage21PixelsPerLatent), 1,
+    FTransformerConfig.InChannels);
+  SavedSeed := RandSeed;
+  RandSeed := Seed;
+  Latents.RandomizeGaussian(1.0);
+  RandSeed := SavedSeed;
+end;
+
+procedure TQwenImage21Pipeline.Denoise(PromptEmbeds: TNNetVolume; Width,
+  Height, StepCount: integer; Latents: TNNetVolume);
+var
+  Transformer: TQwenImage21Transformer;
+  Velocity: TNNetVolume;
+  GridH, GridW, StepPos, MaxStepPos: integer;
+begin
+  CheckImageSize(Width, Height);
+  GridH := Height div csQwenImage21PixelsPerLatent;
+  GridW := Width div csQwenImage21PixelsPerLatent;
+  // mu from the image token count, as the diffusers pipeline computes it.
+  FScheduler.SetTimesteps(StepCount,
+    FScheduler.ShiftForImageSeqLen(GridH * GridW));
+  DoPhase(qppLoadTransformer);
+  FTransformerProfileReport := '';
+  Velocity := TNNetVolume.Create();
+  Transformer := nil;
+  try
+    Transformer := TQwenImage21Transformer.Create(
+      ComponentFolder('transformer'), FTransformerFormat, FInt8Input);
+    Transformer.Parallel := FParallel;
+    Transformer.MaxThreads := FMaxThreads;
+    EnableTransformerOpenCL(Transformer);
+    Transformer.LayerProfiling := FLayerProfiling;
+    DoPhase(qppEncodePrefix);
+    Transformer.EncodePrefix(PromptEmbeds);
+    DoPhase(qppDenoise);
+    MaxStepPos := StepCount - 1;
+    for StepPos := 0 to MaxStepPos do
+    begin
+      // The pipeline passes timestep / 1000 = sigma.
+      Transformer.PredictVelocity(Latents, FScheduler.Sigma[StepPos], GridH,
+        GridW, Velocity);
+      FScheduler.Step(Latents, Velocity, StepPos);
+      if Assigned(FOnStep) then
+        FOnStep(StepPos, StepCount, FScheduler.Timestep[StepPos], Latents);
+    end;
+    if FLayerProfiling then
+      FTransformerProfileReport := Transformer.ProfileReport();
+  finally
+    Transformer.Free;
+    Velocity.Free;
+  end;
+end;
+
+procedure TQwenImage21Pipeline.EnableTransformerOpenCL(
+  Transformer: TQwenImage21Transformer);
+begin
+  FTransformerOnOpenCL := false;
+  {$IFDEF OpenCL}
+  if not FOpenCLRequested then exit;
+  if FTransformerFormat = qiwFP32 then
+    WriteLn('[OpenCL: the transformer step pass needs int8 or int4 weights, ' +
+      'not FP32 - running it on the CPU]')
+  else
+    FTransformerOnOpenCL := OpenCLArmingResult(Transformer.EnableOpenCL(
+      FOpenCLPlatform, FOpenCLDevice, FOpenCLHasSharedKernel),
+      'transformer step pass');
+  {$ENDIF}
+end;
+
+procedure TQwenImage21Pipeline.EnableVaeOpenCL(Vae: TQwenImage21VaeDecoder);
+begin
+  FVaeOnOpenCL := false;
+  {$IFDEF OpenCL}
+  if not FOpenCLRequested then exit;
+  FVaeOnOpenCL := OpenCLArmingResult(Vae.EnableOpenCL(FOpenCLPlatform,
+    FOpenCLDevice, FOpenCLHasSharedKernel), 'VAE decode');
+  {$ENDIF}
+end;
+
+{$IFDEF OpenCL}
+function TQwenImage21Pipeline.OpenCLArmingResult(Armed: boolean;
+  const Component: string): boolean;
+begin
+  Result := Armed;
+  if not Armed then
+    WriteLn('[OpenCL: program unavailable - running the ' + Component +
+      ' on the CPU]');
+end;
+{$ENDIF}
+
+{$IFDEF OpenCL}
+procedure TQwenImage21Pipeline.EnableOpenCL(pPlatform: cl_platform_id;
+  pDevice: cl_device_id; pHasSharedKernel: boolean);
+begin
+  FOpenCLRequested := true;
+  FOpenCLPlatform := pPlatform;
+  FOpenCLDevice := pDevice;
+  FOpenCLHasSharedKernel := pHasSharedKernel;
+end;
+{$ENDIF}
+
+procedure TQwenImage21Pipeline.DecodeLatents(Latents: TNNetVolume; Width,
+  Height: integer; Image: TNNetVolume);
+var
+  Vae: TQwenImage21VaeDecoder;
+  LatentImage: TNNetVolume;
+  GridH, GridW: integer;
+begin
+  CheckImageSize(Width, Height);
+  GridH := Height div csQwenImage21PixelsPerLatent;
+  GridW := Width div csQwenImage21PixelsPerLatent;
+  if Latents.Size <> GridH * GridW * Latents.Depth then
+    ImportError('TQwenImage21Pipeline.DecodeLatents: ' +
+      IntToStr(Latents.SizeX) + 'x' + IntToStr(Latents.SizeY) +
+      ' latent tokens do not form a ' + IntToStr(GridW) + 'x' +
+      IntToStr(GridH) + ' grid.');
+  DoPhase(qppLoadVae);
+  FVaeProfileReport := '';
+  LatentImage := TNNetVolume.Create();
+  Vae := nil;
+  try
+    Vae := TQwenImage21VaeDecoder.Create(ComponentFolder('vae'));
+    Vae.Parallel := FParallel;
+    Vae.MaxThreads := FMaxThreads;
+    Vae.LayerProfiling := FLayerProfiling;
+    EnableVaeOpenCL(Vae);
+    // Token h * GridW + w is pixel (w, h) of a (GridW, GridH, C) volume.
+    LatentImage.Copy(Latents);
+    LatentImage.ReSize(GridW, GridH, Latents.Depth);
+    DoPhase(qppDecode);
+    Vae.DecodeTiled(LatentImage, Image, FVaeTileSize, FVaeTileStride);
+    FVaeProfileReport := Vae.ProfileReport();
+  finally
+    Vae.Free;
+    LatentImage.Free;
+  end;
+  // The decoder clamps to [-1, 1]; the pipeline postprocess is x / 2 + 0.5.
+  Image.Mul(0.5);
+  Image.Add(0.5);
+end;
+
+procedure TQwenImage21Pipeline.GenerateFromEmbeds(PromptEmbeds: TNNetVolume;
+  Width, Height, StepCount: integer; Seed: cardinal; Image: TNNetVolume;
+  InitialLatents: TNNetVolume);
+var
+  Latents: TNNetVolume;
+  RoundedWidth, RoundedHeight: integer;
+begin
+  RoundedWidth := RoundDownImageSide(Width);
+  RoundedHeight := RoundDownImageSide(Height);
+  Latents := TNNetVolume.Create();
+  try
+    if Assigned(InitialLatents) then Latents.Copy(InitialLatents)
+    else MakeInitialLatents(RoundedWidth, RoundedHeight, Seed, Latents);
+    Denoise(PromptEmbeds, RoundedWidth, RoundedHeight, StepCount, Latents);
+    DecodeLatents(Latents, RoundedWidth, RoundedHeight, Image);
+  finally
+    Latents.Free;
+  end;
+  DoPhase(qppDone);
+end;
+
+procedure TQwenImage21Pipeline.Generate(const Prompt: string; Width, Height,
+  StepCount: integer; Seed: cardinal; Image: TNNetVolume);
+var
+  PromptEmbeds: TNNetVolume;
+begin
+  PromptEmbeds := TNNetVolume.Create();
+  try
+    EncodePrompt(Prompt, PromptEmbeds);
+    GenerateFromEmbeds(PromptEmbeds, Width, Height, StepCount, Seed, Image);
+  finally
+    PromptEmbeds.Free;
+  end;
+end;
+
 // ===========================================================================
 // RAFT optical-flow importer (model_type "raft_small"). See the interface
 // section for the architecture summary. Coded by Claude (AI).
@@ -80913,7 +83612,7 @@ function PretrainedModelTypeCanBorrowWeights(const ModelType: string): boolean;
 begin
   Result := (ModelType = 'llama') or (ModelType = 'mistral') or
     (ModelType = 'qwen2') or (ModelType = 'qwen3') or
-    (ModelType = 'qwen3_moe') or
+    (ModelType = 'qwen3_moe') or (ModelType = 'qwen3_vl') or
     (ModelType = 'qwen3_5') or (ModelType = 'qwen3_5_moe') or
     (ModelType = 'gemma') or (ModelType = 'gemma2') or
     (ModelType = 'gemma3_text') or (ModelType = 'phi3') or
@@ -81145,8 +83844,8 @@ begin
     Result := BuildLlama4FromSafeTensorsEx(WeightsPath, IgnoredLlamaConfig,
       pSeqLen, pTrainable, ConfigPath, pQuantizeInt8)
   else if PretrainedModelTypeCanBorrowWeights(ModelType) then
-    // llama, mistral, qwen2, qwen3, qwen3_moe, qwen3_5, qwen3_5_moe, gemma,
-    // gemma2, gemma3_text, phi3, olmo2, olmoe, mixtral, glm4, granite,
+    // llama, mistral, qwen2, qwen3, qwen3_moe, qwen3_vl, qwen3_5,
+    // qwen3_5_moe, gemma, gemma2, gemma3_text, phi3, olmo2, olmoe, mixtral, glm4, granite,
     // granitemoe, minicpm, bitnet - the one Llama builder, so these are also
     // the families whose twin can borrow a loaded net's weights.
     // 'glm4' (architectures ["Glm4ForCausalLM"], THUDM/GLM-4-9B-0414 etc.)
@@ -81433,6 +84132,15 @@ begin
       'mistral, mixtral, qwen2, qwen3, gemma, gemma2, gemma3_text, rwkv, ' +
       'mamba, falcon_mamba, bloom, falcon, bert, distilbert, roberta, ' +
       'modernbert, deepseek_v2, olmo2, wav2vec2, hubert.');
+  end;
+  // A partly imported int4 layer runs neither as int8 nor as int4.
+  if NeuralImportInt4FromRows and Assigned(Result) then
+  try
+    RequireCompleteInt4QuantImports(Result,
+      'BuildFromPretrained (model_type "' + ModelType + '")');
+  except
+    FreeAndNil(Result);
+    raise;
   end;
 end;
 

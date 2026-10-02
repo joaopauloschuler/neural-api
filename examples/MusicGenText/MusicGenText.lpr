@@ -129,6 +129,7 @@ var
   GpuPlatform, GpuDevice: integer;
   {$IFDEF OpenCL}
   GpuCL: TEasyOpenCL;            // platform/device handle for OpenCL offload (nil = CPU)
+  OpenCLProblem: string;         // why --gpu fell back to the CPU
   {$ENDIF}
 
   // Milliseconds elapsed since TickStart, formatted as a human-readable string
@@ -324,31 +325,15 @@ begin
     if Gpu then
     begin
       GpuCL := TEasyOpenCL.Create();
-      if GpuCL.GetPlatformCount() = 0 then
-      begin
-        WriteLn('[--gpu: no OpenCL platform found - falling back to CPU]');
-        FreeAndNil(GpuCL);
-      end
+      if GpuCL.SelectPlatformAndDevice(GpuPlatform, GpuDevice,
+        OpenCLProblem) then
+        WriteLn('[--gpu: OpenCL on ', GpuCL.PlatformNames[GpuPlatform],
+          ' / ', GpuCL.DeviceNames[GpuDevice],
+          ' - T5 encoder + MusicGen decoder; EnCodec stays on CPU]')
       else
       begin
-        if (GpuPlatform < 0) or (GpuPlatform >= GpuCL.GetPlatformCount()) then
-          GpuPlatform := 0;
-        GpuCL.SetCurrentPlatform(GpuCL.PlatformIds[GpuPlatform]);
-        if GpuCL.GetDeviceCount() = 0 then
-        begin
-          WriteLn('[--gpu: no OpenCL device on platform ',
-            GpuCL.PlatformNames[GpuPlatform], ' - falling back to CPU]');
-          FreeAndNil(GpuCL);
-        end
-        else
-        begin
-          if (GpuDevice < 0) or (GpuDevice >= GpuCL.GetDeviceCount()) then
-            GpuDevice := 0;
-          GpuCL.SetCurrentDevice(GpuCL.Devices[GpuDevice]);
-          WriteLn('[--gpu: OpenCL on ', GpuCL.PlatformNames[GpuPlatform],
-            ' / ', GpuCL.DeviceNames[GpuDevice],
-            ' - T5 encoder + MusicGen decoder; EnCodec stays on CPU]');
-        end;
+        WriteLn('[--gpu: ', OpenCLProblem, ' - falling back to CPU]');
+        FreeAndNil(GpuCL);
       end;
     end;
     {$ENDIF}
