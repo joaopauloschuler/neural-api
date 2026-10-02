@@ -12,11 +12,16 @@ type
   private
     FCounter: integer;
     procedure IncrementCounter(index, threadnum: integer);
+    procedure RaiseOnSecondJob(index, threadnum: integer);
   published
     procedure TestThreadListCreation;
     procedure TestCalculateWorkingRange;
     procedure TestParallelExecution;
     procedure TestDefaultThreadCount;
+    // The shared pool (fNTL) has one worker per CPU thread the OS reports.
+    procedure TestSharedPoolUsesEveryCPUThread;
+    // A job's exception reaches StartProc's caller instead of hanging it.
+    procedure TestJobExceptionReachesCaller;
   end;
 
 implementation
@@ -24,6 +29,12 @@ implementation
 procedure TTestNeuralThread.IncrementCounter(index, threadnum: integer);
 begin
   InterlockedIncrement(FCounter);
+end;
+
+procedure TTestNeuralThread.RaiseOnSecondJob(index, threadnum: integer);
+begin
+  InterlockedIncrement(FCounter);
+  if index = 1 then raise Exception.Create('job 1 failed');
 end;
 
 procedure TTestNeuralThread.TestThreadListCreation;
@@ -86,6 +97,41 @@ var
 begin
   DefaultCount := NeuralDefaultThreadCount();
   AssertTrue('Default thread count should be at least 1', DefaultCount >= 1);
+end;
+
+procedure TTestNeuralThread.TestSharedPoolUsesEveryCPUThread;
+begin
+  CreateNeuralThreadListIfRequired();
+  AssertEquals('shared pool size', NeuralDefaultThreadCount, fNTL.Count);
+  FCounter := 0;
+  fNTL.StartProc(@IncrementCounter);
+  AssertEquals('one job per worker', NeuralDefaultThreadCount, FCounter);
+end;
+
+procedure TTestNeuralThread.TestJobExceptionReachesCaller;
+var
+  ThreadList: TNeuralThreadList;
+  RaisedMessage: string;
+begin
+  ThreadList := TNeuralThreadList.Create(3);
+  try
+    FCounter := 0;
+    RaisedMessage := '';
+    try
+      ThreadList.StartProc(@RaiseOnSecondJob);
+    except
+      on E: Exception do RaisedMessage := E.Message;
+    end;
+    AssertEquals('the job exception reached the caller', 'job 1 failed',
+      RaisedMessage);
+    AssertEquals('every job ran', 3, FCounter);
+    // The workers survived: the pool still runs jobs.
+    FCounter := 0;
+    ThreadList.StartProc(@IncrementCounter);
+    AssertEquals('the pool still runs every job', 3, FCounter);
+  finally
+    ThreadList.Free;
+  end;
 end;
 
 initialization

@@ -266,6 +266,9 @@ type
     procedure TestSafeTensorsWriterRoundTrip;
     procedure TestSafeTensorsWriterF16BF16RoundTrip;
     procedure TestParallelHalfDecodeParity;
+    // The direct int8/int4 row loaders (TQuantRowChunkFan's linear path) give
+    // the same bytes on the shared pool as on one thread.
+    procedure TestQuantRowChunkFanPoolParity;
     procedure TestChunkedLoaderStageParity;
     procedure TestSafeTensorsWriterRejectsBadInput;
     procedure TestSaveLoadNNetToSafeTensors;
@@ -1946,6 +1949,137 @@ begin
   finally
     Reader.Free;
     Dst.Free;
+    Src.Free;
+    DeleteFile(Path);
+  end;
+end;
+
+// Reference: a 1-thread shared pool; every chunk is above the fan threshold.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQuantRowChunkFanPoolParity;
+const
+  cInDim = 4096;      // 256-row chunks: 640 rows load as 256 + 256 + 128
+  cOutDim = 640;
+  cHeadDim = 64;      // rotary reorder: chunk row r lands on neuron Targets[r]
+  cPooledRuns = 3;
+type
+  TLoadedBytes = record
+    Int8Codes: TInt8DynArr;
+    Int8Scales: TNeuralFloatDynArr;
+    Int4Packed: TNeuralByteDynArr;
+    Int4Scales: TNeuralFloatDynArr;
+  end;
+var
+  Path: string;
+  Writer: TNNetSafeTensorsWriter;
+  Src: TNNetVolume;
+  Reference, Pooled: TLoadedBytes;
+  RunCnt, i, UnitScaleCount: integer;
+
+  procedure FillRandom(V: TNNetVolume; ZeroRow, RowSize: integer);
+  var
+    j, MaxElementPos, MaxZeroRowPos: integer;
+  begin
+    MaxElementPos := V.Size - 1;
+    for j := 0 to MaxElementPos do V.FData[j] := (Random - 0.5) * 4;
+    MaxZeroRowPos := (ZeroRow + 1) * RowSize - 1;
+    for j := ZeroRow * RowSize to MaxZeroRowPos do
+      V.FData[j] := 0;
+  end;
+
+  procedure UseSharedPool(ThreadCount: integer);
+  begin
+    NeuralThreadListFree();
+    NeuralThreadListCreate(ThreadCount);
+  end;
+
+  function LoadAll(): TLoadedBytes;
+  var
+    Reader: TNNetSafeTensorsReader;
+    NN: TNNet;
+    Linear: TNNetLayerConcatedWeights;
+    NumRows, VS: integer;
+  begin
+    Reader := TNNetSafeTensorsReader.Create(Path);
+    NN := TNNet.Create();
+    try
+      NN.BuildQuantInt8 := true;
+      NN.AddLayer(TNNetInput.Create(1, 1, cInDim));
+      Linear := TNNetLayerConcatedWeights(
+        NN.AddLayer(TNNetPointwiseConvLinear.Create(cOutDim).SetTrainable()));
+      LoadLlamaLinearWeights(Reader, Linear, 'lin', cInDim, cOutDim, 0, -1,
+        cHeadDim, '', {Scale=}0.75);
+      AssertTrue('int8 loaded', Linear.GetInt8QuantData(Result.Int8Codes,
+        Result.Int8Scales, NumRows, VS));
+      NN.Free;
+      NN := TNNet.Create();
+      NN.BuildQuantInt8 := true;
+      NN.AddLayer(TNNetInput.Create(1, 1, cInDim));
+      Linear := TNNetLayerConcatedWeights(
+        NN.AddLayer(TNNetPointwiseConvLinear.Create(cOutDim).SetTrainable()));
+      AssertEquals('int4 import opened', 1, NN.BeginInt4QuantImports());
+      LoadLlamaLinearWeights(Reader, Linear, 'lin', cInDim, cOutDim, 0, -1,
+        cHeadDim, '', {Scale=}0.75);
+      AssertTrue('int4 loaded', Linear.WeightsQuantizedInt4);
+      SetLength(Result.Int4Packed, Linear.QuantTableInt4.PackedSize);
+      Move(Linear.QuantTableInt4.FData[0], Result.Int4Packed[0],
+        Linear.QuantTableInt4.PackedSize);
+      SetLength(Result.Int4Scales, Linear.QuantTableInt4.ScaleData.Size);
+      Move(Linear.QuantTableInt4.ScaleData.FData[0], Result.Int4Scales[0],
+        Linear.QuantTableInt4.ScaleData.Size * SizeOf(TNeuralFloat));
+    finally
+      NN.Free;
+      Reader.Free;
+    end;
+  end;
+
+  procedure AssertSameBytes(const What: string; const A, B; ByteCount: integer);
+  begin
+    AssertTrue(What + ': byte count', ByteCount > 0);
+    AssertTrue(What + ' are byte-identical', CompareByte(A, B, ByteCount) = 0);
+  end;
+
+begin
+  RandSeed := 4242;
+  Path := GetTempDir(false) + 'cai_quant_fan_pool.safetensors';
+  Src := TNNetVolume.Create();
+  try
+    Writer := TNNetSafeTensorsWriter.Create(Path);
+    try
+      Src.ReSize(cOutDim * cInDim, 1, 1);
+      FillRandom(Src, 300, cInDim);
+      Writer.AddTensorFlat('lin', [cOutDim, cInDim], Src, stwBF16);
+      Writer.SaveToFile;
+    finally
+      Writer.Free;
+    end;
+    UseSharedPool(1);
+    Reference := LoadAll();
+    UseSharedPool(NeuralDefaultThreadCount);
+    for RunCnt := 1 to cPooledRuns do
+    begin
+      Pooled := LoadAll();
+      AssertEquals('int8 code count', Length(Reference.Int8Codes),
+        Length(Pooled.Int8Codes));
+      AssertSameBytes('int8 codes', Reference.Int8Codes[0],
+        Pooled.Int8Codes[0], Length(Pooled.Int8Codes));
+      AssertSameBytes('int8 scales', Reference.Int8Scales[0],
+        Pooled.Int8Scales[0], Length(Pooled.Int8Scales) * SizeOf(TNeuralFloat));
+      AssertEquals('int4 byte count', Length(Reference.Int4Packed),
+        Length(Pooled.Int4Packed));
+      AssertSameBytes('int4 blocks', Reference.Int4Packed[0],
+        Pooled.Int4Packed[0], Length(Pooled.Int4Packed));
+      AssertSameBytes('int4 scales', Reference.Int4Scales[0],
+        Pooled.Int4Scales[0], Length(Pooled.Int4Scales) * SizeOf(TNeuralFloat));
+    end;
+    // The zero source row took the unit-scale branch, so the comparison saw it.
+    UnitScaleCount := 0;
+    for i := 0 to High(Reference.Int8Scales) do
+      if Reference.Int8Scales[i] = 1 then Inc(UnitScaleCount);
+    AssertEquals('one zero int8 row', 1, UnitScaleCount);
+  finally
+    NeuralThreadListFree();
+    CreateNeuralThreadListIfRequired();
     Src.Free;
     DeleteFile(Path);
   end;

@@ -132611,12 +132611,8 @@ begin
   IsHotWorker := index < FHotThreadWorkers;
   HotTimeoutDays := FHotThreadTimeout / (24.0 * 60.0 * 60.0);
   IdleStartTick := 0;
-  // ONE exception frame per worker per PASS, hoisted out of the per-layer
-  // loop (a per-layer try/except costs an FPC setjmp-style frame on every
-  // tiny layer). It must exist somewhere: TNeuralThread.Execute runs FProc
-  // bare, so an escaping exception would kill the thread BEFORE it signals
-  // FNeuronFinish and WaitForProc would hang the main thread forever.
-  // Coded by Claude (AI).
+  // One exception frame per worker per pass: a failure sets FSchedFailed so
+  // the other workers stop, and is reported through FErrorProc.
   try
   while (NeuralAtomicRead(FSchedRemaining) > 0) and
     (NeuralAtomicRead(FSchedFailed) = 0) do

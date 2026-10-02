@@ -78,6 +78,7 @@ type
     FRunning: boolean;
     FProcFinished: boolean;
     FIndex, FThreadNum: integer;
+    FJobException: TObject;
     FNeuronStart:  {$IFDEF FPC}TEventObject{$ELSE}TEvent {$ENDIF};
     FNeuronFinish: {$IFDEF FPC}TEventObject{$ELSE}TEvent {$ENDIF};
 
@@ -89,6 +90,8 @@ type
     procedure StartProc(pProc: TNeuralProc; pIndex, pThreadNum: integer); {$IFDEF Release} inline; {$ENDIF}
     procedure WaitForProc(); {$IFDEF Release} inline; {$ENDIF}
     procedure DoSomething(); {$IFDEF Release} inline; {$ENDIF}
+    // The exception the last job raised (nil if none); the caller owns it.
+    function TakeJobException(): TObject;
     property ShouldStart: boolean read FShouldStart;
     property Running: boolean read FRunning;
     property ProcFinished: boolean read FProcFinished;
@@ -115,11 +118,14 @@ type
     procedure StopEngine();
 
     procedure StartProc(pProc: TNeuralProc; pBlock: boolean = true);
-    procedure WaitForProc(); {$IFDEF Release} inline; {$ENDIF}
+    // Waits for every worker, then re-raises the first exception a job raised.
+    procedure WaitForProc();
   end;
 
   procedure NeuralThreadListCreate(pSize: integer);
   procedure NeuralThreadListFree();
+  // The shared pool: dispatch from one thread at a time; not re-entrant (a job
+  // must not call fNTL.StartProc).
   function fNTL: TNeuralThreadList; {$IFDEF FPC}{$IFDEF Release} inline; {$ENDIF}{$ENDIF}
   procedure CreateNeuralThreadListIfRequired();
   function NeuralDefaultThreadCount: integer;
@@ -246,7 +252,10 @@ procedure CreateNeuralThreadListIfRequired();
 begin
   if Not(Assigned(vNTL)) then
   begin
-    NeuralThreadListCreate(TThread.ProcessorCount);
+    // TThread.ProcessorCount is 1 on non-Windows FPC 3.2.2 (a GetCPUCount stub).
+    if NeuralDefaultThreadCount > 1
+      then NeuralThreadListCreate(NeuralDefaultThreadCount)
+      else NeuralThreadListCreate(1);
   end;
 end;
 
@@ -419,12 +428,19 @@ procedure TNeuralThreadList.WaitForProc();
 var
   I: integer;
   MaxCount: integer;
+  FirstException, JobException: TObject;
 begin
   MaxCount := Count - 1;
+  FirstException := nil;
   for I := 0 to MaxCount do
   begin
     Self.Items[I].WaitForProc();
+    JobException := Self.Items[I].TakeJobException();
+    if FirstException = nil
+      then FirstException := JobException
+      else JobException.Free;
   end;
+  if FirstException <> nil then raise FirstException;
 end;
 
 { TNeuralThread }
@@ -439,7 +455,13 @@ begin
       FRunning := true;
       FShouldStart := false;
 
-      FProc(FIndex, FThreadNum);
+      // An exception escaping Execute would end the thread before it signals
+      // FNeuronFinish, and WaitForProc would wait forever.
+      try
+        FProc(FIndex, FThreadNum);
+      except
+        FJobException := TObject(AcquireExceptionObject);
+      end;
 
       FRunning := false;
       FNeuronFinish.SetEvent;
@@ -455,6 +477,7 @@ var
 begin
   inherited Create(CreateSuspended);
   FProc := nil;
+  FJobException := nil;
   FIndex := pIndex;
   FThreadNum := 1;
   FShouldStart := false;
@@ -473,6 +496,7 @@ end;
 
 destructor TNeuralThread.Destroy();
 begin
+  FJobException.Free;
   FNeuronStart.Free;
   FNeuronFinish.Free;
   inherited Destroy();
@@ -481,6 +505,8 @@ end;
 procedure TNeuralThread.StartProc(pProc: TNeuralProc; pIndex,
   pThreadNum: integer);
 begin
+  // A non-blocking StartProc never followed by WaitForProc leaves one behind.
+  FreeAndNil(FJobException);
   FNeuronStart.ResetEvent;
   FNeuronFinish.ResetEvent;
   FProcFinished := false;
@@ -500,6 +526,12 @@ end;
 procedure TNeuralThread.DoSomething();
 begin
   FNeuronStart.SetEvent;
+end;
+
+function TNeuralThread.TakeJobException(): TObject;
+begin
+  Result := FJobException;
+  FJobException := nil;
 end;
 
 initialization
