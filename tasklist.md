@@ -2111,9 +2111,13 @@ rather than acted on.
                 --serial (CPU oversubscription with PoCL's threads; worker
                 count 4 -> 2 gives 32 s -> 3.3 s). Measure --serial vs default
                 on the L4; cap the workers for CPU OpenCL devices.
-    - [ ] B2c. FP32 tiled GEMM OpenCL kernel (twin of
+    - [x] B2c. FP32 tiled GEMM OpenCL kernel (twin of
           `cai_dot_product_int8_tiled`), used by every FP32 conv/FC with >= 16
           columns.
+          DONE: `cai_dot_product_tiled` shares `cai_dot_product_tiled_body`
+          with the int8 kernel; FP32 Compute takes it when FNumBs >= 16 and
+          FNumAs >= 64 (small-row GEMMs such as gram / attention P.V stay on
+          `cai_dot_product`). GPU speed unmeasured.
     - [ ] B2d. Padding-aware OpenCL im2col: bind the unpadded resident source.
     - [ ] B2e. VAE residency gaps: Reshape alias, nearest-2x upsample kernel,
           DupUp gather/pixel shuffle bind+keep, SDPA output.

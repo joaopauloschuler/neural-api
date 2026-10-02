@@ -584,6 +584,9 @@ type
     // axis; the launch counter proves the tiled path ran. Coded by Claude (AI).
     procedure TestTiledGemmInt8OpenCLParity;
     procedure TestTiledGemmInt4OpenCLParity;
+    // FP32 tiled GEMM (cai_dot_product_tiled) for pointwise and 3x3 im2col
+    // convolutions vs cai_dot_product and the CPU forward.
+    procedure TestTiledGemmFP32OpenCLParity;
     // LinkWeightsFrom on an OpenCL-armed int8/int4 pointwise conv takes the new
     // owner's resident codes by handle (tiled and untiled launches).
     procedure TestLinkWeightsSwapsOpenCLCodes;
@@ -69464,6 +69467,270 @@ begin
     @Swish, @SwishDerivative, 0, true);
   RunPointwise('130 col 160x257 tanh bias', 130, 160, 257,
     @HiperbolicTangent, @HiperbolicTangentDerivative, 0, true);
+end;
+{$ELSE}
+begin
+  AssertTrue('OpenCL not compiled in: SKIP', true);
+end;
+{$ENDIF}
+
+// cai_dot_product_tiled vs cai_dot_product and the CPU forward: FP32 pointwise
+// and 3x3 im2col convolutions, a resident B operand, a shape change.
+procedure TTestNeuralNumerical.TestTiledGemmFP32OpenCLParity;
+{$IFDEF OpenCL}
+  procedure RunConv(const aName: string; pSizeX, pSizeY, pDepth, pNeurons,
+    pFeatureSize, pPadding: integer; ActFn: TNeuralActivationFunction;
+    ActDeriv: TNeuralActivationFunction; pSuppressBias: integer;
+    ExpectTiled: boolean);
+  var
+    NN: TNNet;
+    Input, OutCPU, OutTiled, OutUntiled: TNNetVolume;
+    Conv: TNNetConvolution;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i, TiledLaunches, ExpectedLaunches: integer;
+    Diff, MaxDiffCPU, MaxDiffKernels, MaxAbs, Tol: TNeuralFloat;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    RandSeed := 20261001;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(pSizeX, pSizeY, pDepth);
+    OutCPU := TNNetVolume.Create();
+    OutTiled := TNNetVolume.Create();
+    OutUntiled := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(pSizeX, pSizeY, pDepth, 1));
+      Conv := TNNetConvolution.Create(pNeurons, pFeatureSize, pPadding, 1,
+        pSuppressBias);
+      Conv.ActivationFn := ActFn;
+      Conv.ActivationFnDerivative := ActDeriv;
+      NN.AddLayer(Conv);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.7 * Sin(i * 0.013) - 0.2;
+      for i := 0 to Conv.Neurons.Count - 1 do
+        Conv.Neurons[i].BiasWeight := 0.25 * Cos(i * 0.11);
+      NN.UpdateWeights();
+      Conv.SetTrainable(False, False);
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        SetTiledGemmMinColumns(csTiledGemmMinColumns);
+        NN.Compute(Input);
+        NN.Compute(Input); // resident weights and bias, re-bound arguments
+        OutTiled.Copy(NN.GetLastLayer.Output);
+        TiledLaunches := Conv.OpenCLTiledGemmLaunchCount();
+        SetTiledGemmMinColumns(0);
+        NN.Compute(Input);
+        OutUntiled.Copy(NN.GetLastLayer.Output);
+        AssertEquals('TiledGemmFP32 ' + aName +
+          ' switched-off path launched no tile', TiledLaunches,
+          Conv.OpenCLTiledGemmLaunchCount());
+      finally
+        SetTiledGemmMinColumns(csTiledGemmMinColumns);
+        NN.ForceOpenCL(False);
+      end;
+      AssertEquals('TiledGemmFP32 ' + aName + ' output size match', OutCPU.Size,
+        OutTiled.Size);
+      MaxDiffCPU := 0;
+      MaxDiffKernels := 0;
+      MaxAbs := 0;
+      for i := 0 to OutCPU.Size - 1 do
+      begin
+        Diff := Abs(OutCPU.Raw[i] - OutTiled.Raw[i]);
+        if Diff > MaxDiffCPU then MaxDiffCPU := Diff;
+        Diff := Abs(OutUntiled.Raw[i] - OutTiled.Raw[i]);
+        if Diff > MaxDiffKernels then MaxDiffKernels := Diff;
+        if Abs(OutCPU.Raw[i]) > MaxAbs then MaxAbs := Abs(OutCPU.Raw[i]);
+      end;
+      WriteLn('  TiledGemmFP32 ', aName, ': tiled vs cpu max|diff|=',
+        MaxDiffCPU:0:9, ' tiled vs cai_dot_product max|diff|=',
+        MaxDiffKernels:0:9,
+        ' max|ref|=', MaxAbs:0:6, ' tiled launches=', TiledLaunches,
+        ' gpu forwards=', Conv.ForwardGPUCnt);
+      AssertTrue('TiledGemmFP32 ' + aName + ' ran on OpenCL: ForwardGPUCnt = ' +
+        IntToStr(Conv.ForwardGPUCnt) + ' must be 3', Conv.ForwardGPUCnt = 3);
+      if ExpectTiled then ExpectedLaunches := 2 else ExpectedLaunches := 0;
+      AssertEquals('TiledGemmFP32 ' + aName + ' tiled launches',
+        ExpectedLaunches, TiledLaunches);
+      if MaxAbs < 1 then Tol := 1e-5 else Tol := 1e-5 * MaxAbs;
+      AssertTrue('TiledGemmFP32 ' + aName +
+        ' tiled vs cai_dot_product: max |diff| = ' +
+        FloatToStr(MaxDiffKernels) + ' must be < ' + FloatToStr(Tol),
+        MaxDiffKernels < Tol);
+      AssertTrue('TiledGemmFP32 ' + aName + ' tiled vs CPU: max |diff| = ' +
+        FloatToStr(MaxDiffCPU) + ' must be < ' + FloatToStr(Tol),
+        MaxDiffCPU < Tol);
+    finally
+      OutUntiled.Free;
+      OutTiled.Free;
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+
+  // Max |a - b| over two equally sized volumes.
+  function MaxAbsDiff(A, B: TNNetVolume): TNeuralFloat;
+  var
+    Pos: integer;
+  begin
+    AssertEquals('TiledGemmFP32 output size match', A.Size, B.Size);
+    Result := 0;
+    for Pos := 0 to A.Size - 1 do
+      if Abs(A.Raw[Pos] - B.Raw[Pos]) > Result then
+        Result := Abs(A.Raw[Pos] - B.Raw[Pos]);
+  end;
+
+  // TNNetInput -> pointwise -> pointwise: the consumer binds the producer's
+  // OpenCL output as its B operand (pExternalVBs) and runs tiled.
+  procedure RunResidentB();
+  const
+    csTokens = 33;
+    csInputs = 48;
+  var
+    NN: TNNet;
+    Input, OutCPU: TNNetVolume;
+    Source, Consumer: TNNetLayer;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i, SentinelsLeft, TiledBefore: integer;
+    MaxDiff: TNeuralFloat;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    RandSeed := 20261001;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(csTokens, 1, csInputs);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(csTokens, 1, csInputs, 1));
+      Source := NN.AddLayer(TNNetPointwiseConvLinear.Create(80));
+      Consumer := NN.AddLayer(TNNetPointwiseConvLinear.Create(70));
+      NN.SetTrainable(False, False);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.7 * Sin(i * 0.013) - 0.2;
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+      NN.ForceOpenCL(True);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      try
+        NN.Compute(Input);
+        TiledBefore := Consumer.OpenCLTiledGemmLaunchCount();
+        // Only a download into the source layer clears these.
+        Source.Output.Fill(999);
+        NN.Compute(Input);
+        SentinelsLeft := 0;
+        for i := 0 to Source.Output.Size - 1 do
+          if Source.Output.Raw[i] = 999 then Inc(SentinelsLeft);
+        MaxDiff := MaxAbsDiff(OutCPU, NN.GetLastLayer.Output);
+      finally
+        NN.ForceOpenCL(False);
+      end;
+      WriteLn('  TiledGemmFP32 resident B ', csTokens, ' tokens: max|diff|=',
+        MaxDiff:0:9, ' sentinels kept=', SentinelsLeft, '/', Source.Output.Size,
+        ' tiled launches=', Consumer.OpenCLTiledGemmLaunchCount());
+      AssertEquals('TiledGemmFP32 resident B: the source output stayed in ' +
+        'OpenCL memory', Source.Output.Size, SentinelsLeft);
+      AssertEquals('TiledGemmFP32 resident B: tiled launch on the bound source',
+        TiledBefore + 1, Consumer.OpenCLTiledGemmLaunchCount());
+      AssertTrue('TiledGemmFP32 resident B vs CPU: max |diff| = ' +
+        FloatToStr(MaxDiff) + ' must be < 1e-5', MaxDiff < 1e-5);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+
+  // TNNetScaledDotProductAttention runs Q.K^T (FNumAs = SeqLen, FSize = Dk),
+  // then P.V (FNumAs = Dk, FSize = SeqLen) on one FDotCL resized by
+  // ReallocateBuffersIfRequired: the tiled arguments change between launches.
+  procedure RunAttentionShapeChange(pDk, pSeqLen, pTiledPerForward: integer);
+  var
+    NN: TNNet;
+    Input, OutCPU: TNNetVolume;
+    Attn: TNNetScaledDotProductAttention;
+    PlatformId: cl_platform_id;
+    DeviceId: cl_device_id;
+    i: integer;
+    MaxDiff: TNeuralFloat;
+  begin
+    if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
+    begin
+      AssertTrue('no OpenCL device: SKIP', true);
+      Exit;
+    end;
+    NN := TNNet.Create();
+    Input := TNNetVolume.Create(pSeqLen, 1, 3 * pDk);
+    OutCPU := TNNetVolume.Create();
+    try
+      NN.AddLayer(TNNetInput.Create(pSeqLen, 1, 3 * pDk, 1));
+      Attn := TNNetScaledDotProductAttention.Create(pDk);
+      NN.AddLayer(Attn);
+      for i := 0 to Input.Size - 1 do
+        Input.Raw[i] := 0.5 * Sin(i * 0.3) + 0.2 * Cos(i * 0.11);
+      NN.Compute(Input);
+      OutCPU.Copy(NN.GetLastLayer.Output);
+      NN.EnableOpenCL(PlatformId, DeviceId);
+      NN.Compute(Input);
+      NN.Compute(Input);
+      MaxDiff := MaxAbsDiff(OutCPU, NN.GetLastLayer.Output);
+      WriteLn('  TiledGemmFP32 attention Dk=', pDk, ' SeqLen=', pSeqLen,
+        ': max|diff|=', MaxDiff:0:9, ' tiled launches=',
+        Attn.OpenCLTiledGemmLaunchCount());
+      AssertEquals('TiledGemmFP32 attention Dk=' + IntToStr(pDk) +
+        ' tiled launches over two forwards', 2 * pTiledPerForward,
+        Attn.OpenCLTiledGemmLaunchCount());
+      AssertTrue('TiledGemmFP32 attention Dk=' + IntToStr(pDk) +
+        ' vs CPU: max |diff| = ' + FloatToStr(MaxDiff) + ' must be < 1e-5',
+        MaxDiff < 1e-5);
+    finally
+      OutCPU.Free;
+      Input.Free;
+      NN.Free;
+    end;
+  end;
+begin
+  // Below the threshold: cai_dot_product, no tile.
+  RunConv('pointwise 7 col 1003x96 relu bias', 7, 1, 1003, 96, 1, 0,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false);
+  RunConv('3x3 3x5 px 13 ch x 40 identity bias', 3, 5, 13, 40, 3, 1,
+    @Identity, @IdentityDerivative, 0, false);
+  // One column tile; 200 rows = one 128-row tile + 72; 1003 = 31 K-steps + an
+  // 11-wide remainder whose last 3 elements take the scalar loop.
+  RunConv('pointwise 16 col 1003x200 relu bias', 16, 1, 1003, 200, 1, 0,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true);
+  // 130 columns = 8 tiles + 2; 257 rows = 2 tiles + 1; 96 = 3 K-steps exactly.
+  RunConv('pointwise 130 col 96x257 identity nobias', 130, 1, 96, 257, 1, 0,
+    @Identity, @IdentityDerivative, 1, true);
+  // 3x3 pad 1 over 9x7 px: 63 columns (3 tiles + 15), FSize 9*13 = 117
+  // (3 K-steps + 21), 70 rows (a lane's second row past FNumAs).
+  RunConv('3x3 9x7 px 13 ch x 70 relu bias', 9, 7, 13, 70, 3, 1,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true);
+  RunConv('3x3 9x7 px 13 ch x 70 identity nobias', 9, 7, 13, 70, 3, 1,
+    @Identity, @IdentityDerivative, 1, true);
+  RunConv('3x3 9x7 px 13 ch x 70 swish bias', 9, 7, 13, 70, 3, 1,
+    @Swish, @SwishDerivative, 0, true);
+  // The FP32 row gate (csTiledGemmFP32MinRows = 64): 63 rows stay on
+  // cai_dot_product, 64 take the tile.
+  RunConv('pointwise 32 col 100x63 relu bias', 32, 1, 100, 63, 1, 0,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, false);
+  RunConv('pointwise 32 col 100x64 relu bias', 32, 1, 100, 64, 1, 0,
+    @RectifiedLinearUnit, @RectifiedLinearUnitDerivative, 0, true);
+  RunResidentB();
+  // Both GEMMs tiled (80 and 64 rows); then only Q.K^T (P.V has 48 rows).
+  RunAttentionShapeChange(64, 80, 2);
+  RunAttentionShapeChange(48, 80, 1);
 end;
 {$ELSE}
 begin

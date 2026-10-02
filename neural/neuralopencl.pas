@@ -64,18 +64,21 @@ const
   /// Bytes per OpenCL half. There is no Pascal type for it: the FP16 B
   /// operand is only ever written and read by device kernels.
   csHalfSize = 2;
-  /// Tile geometry of cai_dot_product_int8_tiled / _tiled_h / _int4_tiled
-  /// (the CAI_TILED_* defines in neural.cl; the launch geometry derives from
-  /// them, so the two copies must agree): lanes per work-group, rows per
-  /// lane and columns per tile.
+  /// Tile geometry of cai_dot_product_tiled / _int8_tiled / _int8_tiled_h /
+  /// _int4_tiled (the CAI_TILED_* defines in neural.cl; the launch geometry
+  /// derives from them, so the two copies must agree): lanes per work-group,
+  /// rows per lane and columns per tile.
   csTiledGemmLanes = 64;
   csTiledGemmRowsPerLane = 2;
   csTiledGemmCols = 16;
-  /// Columns (FNumBs) from which ComputeResidentCodes takes the tiled GEMM:
-  /// one full column tile. Below it the tile would multiply zero-padded
-  /// columns, while the existing kernels re-read each weight row only a
-  /// handful of times.
+  /// Columns (FNumBs) from which Compute and ComputeResidentCodes take the
+  /// tiled GEMM: one full column tile. Below it the tile would multiply
+  /// zero-padded columns, while the existing kernels re-read each weight row
+  /// only a handful of times.
   csTiledGemmMinColumns = csTiledGemmCols;
+  /// Rows (FNumAs) from which the FP32 Compute takes the tiled GEMM: below one
+  /// lane per row a work-group leaves most of its 128-row tile idle.
+  csTiledGemmFP32MinRows = csTiledGemmLanes;
 
 type
   TPlatformNames = array of string;
@@ -431,17 +434,21 @@ type
       FSinglePassArgsBound: boolean;
       FBoundSPThreadCount, FBoundSPNumAs, FBoundSPNumBs, FBoundSPSize: longint;
       FBoundSPCodesBuffer, FBoundSPResultBuffer, FBoundSPScalesBuffer: cl_mem;
-      /// TILED GEMM (cai_dot_product_int8_tiled / _tiled_h / _int4_tiled) for
-      /// a window of FNumBs >= TiledGemmMinColumns columns: one work-group per
-      /// tile of rows x columns reads each weight code once per column tile.
-      /// The handle is owned here and bound lazily by PrepareTiled, which also
-      /// sets the arguments that are not per call: shape and result are fixed
-      /// from PrepareForComputeInt8/Int4 to UnprepareForCompute (which releases
-      /// the handle); codes and scales are re-set by BorrowCodesKeepingBuffers
-      /// when it swaps their handles (BindTiledCodesArgs). FTiledRejected
-      /// remembers a device that refused the kernel or its work-group size, so
-      /// the fallback is decided once. FTiledLaunchCount is the test hook that
-      /// proves the tiled path ran. Coded by Claude (AI).
+      /// TILED GEMM (cai_dot_product_tiled for FP32 weights, _int8_tiled /
+      /// _int8_tiled_h / _int4_tiled for resident codes) for a window of
+      /// FNumBs >= TiledGemmMinColumns columns: one work-group per tile of
+      /// rows x columns reads each weight once per column tile. The handle is
+      /// owned here and bound lazily by PrepareTiled. In a code mode
+      /// PrepareTiled also sets the arguments that are not per call: shape and
+      /// result are fixed from PrepareForComputeInt8/Int4 to
+      /// UnprepareForCompute (which releases the handle); codes and scales are
+      /// re-set by BorrowCodesKeepingBuffers when it swaps their handles
+      /// (BindTiledCodesArgs). In FP32 mode ReallocateBuffersIfRequired can
+      /// change the shape between calls, so Compute sets every argument per
+      /// launch. FTiledRejected remembers a device that refused the kernel or
+      /// its work-group size, so the fallback is decided once.
+      /// FTiledLaunchCount is the test hook that proves the tiled path ran.
+      /// Coded by Claude (AI).
       FTiledKernel: cl_kernel;
       FTiledRejected: boolean;
       FTiledLaunchCount: integer;
@@ -494,9 +501,12 @@ type
       /// True when the current shape and device take the tiled GEMM: at least
       /// TiledGemmMinColumns columns and a work-group of csTiledGemmLanes fits.
       function ShouldUseTiledGemm(): boolean;
-      /// Binds the tiled entry point for the armed weight mode and its fixed
-      /// arguments. False when the device rejected it (existing path runs).
+      /// Binds the tiled entry point for the armed weight mode (FP32 if none)
+      /// and a code mode's fixed arguments; False when the device rejected it.
       function PrepareTiled(): boolean;
+      /// Launches the bound tiled entry point over the current shape on the
+      /// shared in-order queue and counts the launch.
+      procedure RunTiledGemm();
       /// The shared body of ComputeInt8 and ComputeInt4: B operand, bias,
       /// tiled, split-K or single-pass launch against the resident codes. Coded by Claude (AI).
       procedure ComputeResidentCodes(VBs: TNNetVolume; pActFN: longint;
@@ -644,9 +654,10 @@ type
       procedure FinishAndLoadResult(Results: TNNetVolume; SaveCPU: TNeuralFloat = 0); overload;
   end;
 
-/// Columns (FNumBs) from which ComputeResidentCodes takes the tiled GEMM; 0
-/// turns it off. csTiledGemmMinColumns unless NEURAL_TILED_GEMM_MINCOLS is set
-/// (read once, at first use) or SetTiledGemmMinColumns was called.
+/// Columns (FNumBs) from which Compute (FP32) and ComputeResidentCodes take
+/// the tiled GEMM; 0 turns it off for both. csTiledGemmMinColumns unless
+/// NEURAL_TILED_GEMM_MINCOLS is set (read once, at first use) or
+/// SetTiledGemmMinColumns was called.
 function TiledGemmMinColumns(): integer;
 procedure SetTiledGemmMinColumns(pValue: integer);
 
@@ -1005,6 +1016,7 @@ var
   UseBias: longint;
   BufferBs: cl_mem;
   K: cl_kernel;
+  UseTiled: boolean;
 begin
   FActFun := pActFN;
   if pExternalVBs <> nil then BufferBs := pExternalVBs else BufferBs := FInputBufferBs;
@@ -1013,20 +1025,39 @@ begin
   begin
     if (VBs.Size = FSize * FNumBs) then
     begin
-      // Argument caching needs an entry point no other instance rebinds:
-      // FDotProductKernel is the net-wide shared cai_dot_product handle in the
-      // default shared-kernel mode, so this instance clones a handle of its
-      // own (the split-K recipe) and launches it on the same in-order queue.
-      if not Assigned(FMainKernel) then
-        FMainKernel := FDotProductKernel.CreateKernel('cai_dot_product');
-      K := FMainKernel;
       err := CL_SUCCESS;
       UseBias := PrepareBiasOperand(VBias, NewVBias, err);
-      // Shape, A operand, result and bias stay bound across launches; only
-      // the two arguments below change per call.
-      err := err or BindMainInvariantArgs(UseBias);
-      err := err or clSetKernelArg(K, 4, csLongintSize, @FActFun);
-      err := err or clSetKernelArg(K, 6, csCLMemSize,  @BufferBs);
+      UseTiled := not (FInt8Ready or FInt4Ready) and
+        (FNumAs >= csTiledGemmFP32MinRows) and ShouldUseTiledGemm() and
+        PrepareTiled();
+      if UseTiled then
+      begin
+        K := FTiledKernel;
+        err := err or clSetKernelArg(K, 0, csLongintSize, @FNumAs);
+        err := err or clSetKernelArg(K, 1, csLongintSize, @FNumBs);
+        err := err or clSetKernelArg(K, 2, csLongintSize, @FSize);
+        err := err or clSetKernelArg(K, 3, csLongintSize, @FActFun);
+        err := err or clSetKernelArg(K, 4, csCLMemSize, @FInputBufferAs);
+        err := err or clSetKernelArg(K, 5, csCLMemSize, @BufferBs);
+        err := err or clSetKernelArg(K, 6, csCLMemSize, @FResultBuffer);
+        err := err or clSetKernelArg(K, 7, csLongintSize, @UseBias);
+        err := err or clSetKernelArg(K, 8, csCLMemSize, @FBiasBuffer);
+      end
+      else
+      begin
+        // Argument caching needs an entry point no other instance rebinds:
+        // FDotProductKernel is the net-wide shared cai_dot_product handle in
+        // the default shared-kernel mode, so this instance clones a handle of
+        // its own (the split-K recipe) and launches it on the same queue.
+        if not Assigned(FMainKernel) then
+          FMainKernel := FDotProductKernel.CreateKernel('cai_dot_product');
+        K := FMainKernel;
+        // Shape, A operand, result and bias stay bound across launches; only
+        // the two arguments below change per call.
+        err := err or BindMainInvariantArgs(UseBias);
+        err := err or clSetKernelArg(K, 4, csLongintSize, @FActFun);
+        err := err or clSetKernelArg(K, 6, csCLMemSize,  @BufferBs);
+      end;
       if (err <> CL_SUCCESS) then
         ErrorProc('Error: TDotProductSharedKernel.Compute - failed setting ' +
           'kernel arguments: ' + IntToStr(err));
@@ -1039,7 +1070,11 @@ begin
       if err = CL_SUCCESS then
       begin
 
-        if (FGroupSizeA > 0) and (FGroupSizeB > 0)  then
+        if UseTiled then
+        begin
+          RunTiledGemm();
+        end
+        else if (FGroupSizeA > 0) and (FGroupSizeB > 0)  then
         begin
           FDotProductKernel.RunKernel2D(K, FNumAs, FNumBs, FGroupSizeA, FGroupSizeB);
         end
@@ -1466,6 +1501,8 @@ begin
   FTiledRejected := true;
   if FInt4Ready then
     FTiledKernel := FInt8Kernel.CreateKernel('cai_dot_product_int4_tiled')
+  else if not FInt8Ready then
+    FTiledKernel := FDotProductKernel.CreateKernel('cai_dot_product_tiled')
   else if FFP16Activations then
     FTiledKernel := FFP16Kernel.CreateKernel('cai_dot_product_int8_tiled_h')
   else
@@ -1476,6 +1513,12 @@ begin
   begin
     clReleaseKernel(FTiledKernel);
     FTiledKernel := nil;
+    exit;
+  end;
+  if not (FInt8Ready or FInt4Ready) then
+  begin
+    FTiledRejected := false;
+    Result := true;
     exit;
   end;
   err := clSetKernelArg(FTiledKernel, 0, csLongintSize, @FNumAs);
@@ -1493,6 +1536,18 @@ begin
   end;
   FTiledRejected := false;
   Result := true;
+end;
+
+procedure TDotProductSharedKernel.RunTiledGemm();
+var
+  RowTiles, ColTiles: longint;
+begin
+  RowTiles := (FNumAs + csTiledGemmLanes * csTiledGemmRowsPerLane - 1)
+    div (csTiledGemmLanes * csTiledGemmRowsPerLane);
+  ColTiles := (FNumBs + csTiledGemmCols - 1) div csTiledGemmCols;
+  FDotProductKernel.RunKernel2D(FTiledKernel, RowTiles * csTiledGemmLanes,
+    ColTiles, csTiledGemmLanes, 1);
+  Inc(FTiledLaunchCount);
 end;
 
 function TDotProductSharedKernel.Int8SplitCount(): integer;
@@ -1812,7 +1867,7 @@ var
   UseBias: longint;
   K, KReduce: cl_kernel;
   BufferBs: cl_mem;
-  Splits, RowTiles, ColTiles: longint;
+  Splits: longint;
 begin
   if (VBs.Size <> FSize * FNumBs) then
   begin
@@ -1840,12 +1895,7 @@ begin
     err := err or clSetKernelArg(K, 8, csCLMemSize, @FBiasBuffer);
     if err = CL_SUCCESS then
     begin
-      RowTiles := (FNumAs + csTiledGemmLanes * csTiledGemmRowsPerLane - 1)
-        div (csTiledGemmLanes * csTiledGemmRowsPerLane);
-      ColTiles := (FNumBs + csTiledGemmCols - 1) div csTiledGemmCols;
-      FDotProductKernel.RunKernel2D(K, RowTiles * csTiledGemmLanes, ColTiles,
-        csTiledGemmLanes, 1);
-      Inc(FTiledLaunchCount);
+      RunTiledGemm();
     end
     else
     begin
