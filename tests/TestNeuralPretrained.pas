@@ -10232,10 +10232,13 @@ end;
 // The production prefill shape with the LM head skipped: the first PromptLen
 // tokens step with StepForwardToHidden (whole windows on the width-4 twin,
 // the snapshot handoff, then the width-1 tail), every later token is a full
-// step. The rows after the prefill must be bit-identical to the all-width-1
-// full-step reference, with the FP32 and the int8 KV cache, on the serial
+// step. The rows after the prefill must match the all-width-1 full-step
+// reference within 1e-4, with the FP32 and the int8 KV cache, on the serial
 // loop and on the layer-graph scheduler: no state lives past the LM-head
-// input. The width-1-only variant (no twin) covers today's default path.
+// input. The width-1-only variant (no twin) covers today's default path and
+// stays bit-exact. The tolerance covers AVX builds: on the scheduler the
+// window width moves the chunk split, which decides which elements take
+// AVXExp or the scalar exp.
 // Coded by Claude (AI).
 procedure TTestNeuralPretrained.TestQwen35WindowedPrefillToHiddenParity;
 const
@@ -10272,7 +10275,7 @@ var
         LogitsHidden, PromptLen);
       AssertEquals('windows + width-1 tail to the hidden slot, then full' +
         ' steps (' + Mode + ')', 0.0,
-        MaxAbsRowDiffFrom(LogitsRef, LogitsHidden, PromptLen), 0.0);
+        MaxAbsRowDiffFrom(LogitsRef, LogitsHidden, PromptLen), 1e-4);
       AssertEquals('the hidden-only rows hold no logits (' + Mode + ')', 0.0,
         LogitsHidden.FData[(PromptLen - 1) * Vocab], 0.0);
       RunWindowedPrefillStream(Session1, Session1, Toks, 1, PromptLen,
@@ -12951,7 +12954,7 @@ end;
 // scratch row and two matrix-state rows instead of 256 BPTT rows; the same
 // graph built trainable costs more than twice as much; SetTrainable(true)
 // after the build brings the BPTT caches back; and the inference forward
-// (two alternating state rows) equals the trainable forward bit for bit.
+// (two alternating state rows) matches the trainable forward within 1e-4.
 // The fixture config caps the context at 16, so a copy with a 4096 cap is
 // written to a temp file. Coded by Claude (AI).
 procedure TTestNeuralPretrained.TestQwen35BorrowedTwinInferenceMemory;
@@ -13059,8 +13062,9 @@ begin
     Solo.SetTrainable({pTrainable=}false);
     AssertEquals('SetTrainable(false) releases them again',
       SoloInferenceBytes, Solo.GetLastLayer().NonWeightBytes());
-    // Bit-exact forward: the inference net's two alternating state rows
-    // against the trainable net's per-step cache, full width, no session.
+    // The inference net's two alternating state rows against the trainable
+    // net's per-step cache; 1e-4 because AVX builds sum the low-memory and the
+    // tiled dot products in different orders.
     Inference16 := BuildQwen35FromSafeTensorsEx(
       FixturePath('tiny_qwen3_5.safetensors'), Config, ParitySeqLen,
       {pTrainable=}false, CfgPath);
@@ -13075,8 +13079,8 @@ begin
     Trained16.GetOutput(OutTrained);
     AssertEquals('logits rows', ParitySeqLen * Config.VocabSize,
       OutInference.Size);
-    AssertEquals('inference forward vs trainable forward: bit-identical',
-      0.0, MaxAbsVolumeDiff(OutTrained, OutInference), 0.0);
+    AssertEquals('inference forward vs trainable forward',
+      0.0, MaxAbsVolumeDiff(OutTrained, OutInference), 1e-4);
   finally
     OutTrained.Free;
     OutInference.Free;
