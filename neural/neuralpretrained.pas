@@ -569,6 +569,10 @@ function IsNF4QuantizedTensor(Reader: TNNetSafeTensorsReader;
 procedure LoadNF4QuantizedTensorFlat(Reader: TNNetSafeTensorsReader;
   const WName: string; NumRows, InDim: integer; Dest: TNNetVolume);
 
+// Raises EPretrainedImportError when a layer of NN holds a partly filled
+// int4 import (TNNet.BeginInt4QuantImports). Coded by Claude (AI).
+procedure RequireCompleteInt4QuantImports(NN: TNNet; const What: string);
+
 // HF nn.Linear [out, in] -> pointwise-linear neuron loader, and the staged
 // whole-slab helper feeding its pSrcSlab (see the implementation comments).
 // Exposed for the staged-vs-streamed slice parity test.
@@ -15277,17 +15281,10 @@ begin
 end;
 
 type
-  { TInt8RowChunkFan }
-  // Fans the PER-ROW direct-int8 quant imports of ONE streamed row chunk
-  // over the shared neuralthread pool. Each chunk row r quantizes source
-  // elements [r*RowSize, (r+1)*RowSize) into its own target code row and
-  // scale slot (ImportInt8QuantRow touches nothing shared, and
-  // QuantizeInt8RowTolerant is pure), so the parallel result is
-  // bit-identical to the serial loop. The caller's sequential
-  // LoadTensorRowsFlat read stays on the calling thread - only the
-  // CPU-bound abs-max + quantize sweep fans out. Small chunks run inline
-  // (pool dispatch would dominate). Coded by Claude (AI).
-  TInt8RowChunkFan = class
+  { TQuantRowChunkFan }
+  // Fans the int8 (or Q4_0 int4) row imports of ONE streamed row chunk over
+  // the neuralthread pool; disjoint target rows, so bit-identical to serial.
+  TQuantRowChunkFan = class
   private
     FSrc: TNNetVolume;
     FRowSize, FRowCount: integer;
@@ -15295,6 +15292,7 @@ type
     FQLayer: TNNetLayerConcatedWeights;
     FScale: TNeuralFloat;
     FTargets: TNeuralIntegerArray;
+    FIntoInt4: boolean;
     // embedding path (RunEmbedding): chunk row r -> vocab row FBaseRow+r,
     // imported into the embedding and (when tied) the LM head container
     FEmb: TNNetEmbedding;
@@ -15307,14 +15305,14 @@ type
   public
     procedure RunLinear(QLayer: TNNetLayerConcatedWeights; Src: TNNetVolume;
       RowCount, RowSize: integer; const Targets: TNeuralIntegerArray;
-      Scale: TNeuralFloat);
+      Scale: TNeuralFloat; pIntoInt4: boolean);
     procedure RunEmbedding(Emb: TNNetEmbedding;
       Head: TNNetLayerConcatedWeights; Src: TNNetVolume;
       BaseRow, RowCount, RowSize: integer;
       EmbScale, HeadScale: TNeuralFloat);
   end;
 
-function TInt8RowChunkFan.ShouldFan: boolean;
+function TQuantRowChunkFan.ShouldFan: boolean;
 const
   // Below ~64K elements the pool dispatch costs more than the quant sweep.
   cParallelQuantMinElements = 64 * 1024;
@@ -15323,7 +15321,7 @@ begin
     (NeuralDefaultThreadCount > 1);
 end;
 
-procedure TInt8RowChunkFan.LinearJob(index, threadnum: integer);
+procedure TQuantRowChunkFan.LinearJob(index, threadnum: integer);
 var
   StartPos, FinishPos, r, ofs: integer;
 begin
@@ -15332,12 +15330,14 @@ begin
   ofs := StartPos * FRowSize;
   for r := StartPos to FinishPos do
   begin
-    FQLayer.ImportInt8QuantRow(FTargets[r], FSrc, ofs, FScale);
+    if FIntoInt4
+      then FQLayer.ImportInt4QuantRow(FTargets[r], FSrc, ofs, FScale)
+      else FQLayer.ImportInt8QuantRow(FTargets[r], FSrc, ofs, FScale);
     Inc(ofs, FRowSize);
   end;
 end;
 
-procedure TInt8RowChunkFan.EmbeddingJob(index, threadnum: integer);
+procedure TQuantRowChunkFan.EmbeddingJob(index, threadnum: integer);
 var
   StartPos, FinishPos, r, ofs, row: integer;
   HasHead: boolean;
@@ -15356,11 +15356,12 @@ begin
   end;
 end;
 
-procedure TInt8RowChunkFan.RunLinear(QLayer: TNNetLayerConcatedWeights;
+procedure TQuantRowChunkFan.RunLinear(QLayer: TNNetLayerConcatedWeights;
   Src: TNNetVolume; RowCount, RowSize: integer;
-  const Targets: TNeuralIntegerArray; Scale: TNeuralFloat);
+  const Targets: TNeuralIntegerArray; Scale: TNeuralFloat; pIntoInt4: boolean);
 begin
   FQLayer := QLayer;
+  FIntoInt4 := pIntoInt4;
   FSrc := Src;
   FRowCount := RowCount;
   FRowSize := RowSize;
@@ -15375,7 +15376,7 @@ begin
     LinearJob(0, 1);
 end;
 
-procedure TInt8RowChunkFan.RunEmbedding(Emb: TNNetEmbedding;
+procedure TQuantRowChunkFan.RunEmbedding(Emb: TNNetEmbedding;
   Head: TNNetLayerConcatedWeights; Src: TNNetVolume;
   BaseRow, RowCount, RowSize: integer; EmbScale, HeadScale: TNeuralFloat);
 begin
@@ -15394,6 +15395,16 @@ begin
   end
   else
     EmbeddingJob(0, 1);
+end;
+
+procedure RequireCompleteInt4QuantImports(NN: TNNet; const What: string);
+var
+  PartialCount: integer;
+begin
+  PartialCount := NN.PartialInt4QuantImportCount();
+  if PartialCount > 0 then
+    ImportError(What + ': ' + IntToStr(PartialCount) + ' layer(s) hold a ' +
+      'partly imported int4 table after the load.');
 end;
 
 // Materializes the WHOLE [SrcRows, InDim] tensor as one flat FP32 buffer,
@@ -15470,11 +15481,11 @@ var
   j, TargetIdx, HalfDim, SrcRow, Base, Row: integer;
   OutDimM1: integer;
   QLayer: TNNetLayerConcatedWeights;
-  DirectInt8, DirectInt4, RowStream: boolean;
+  DirectInt8, DirectInt4, DirectInt4FromRows, RowStream: boolean;
   WRowBase: integer;
   ChunkRows, RowsInChunk, RowCnt, RowsInChunkM1: integer;
   ChunkTargets: TNeuralIntegerArray;
-  Fan: TInt8RowChunkFan;
+  Fan: TQuantRowChunkFan;
   PackedChunk: TNNetVolumeQuant4;
 
   // Maps checkpoint row pRow (0-based within this OutDim slice) to its
@@ -15600,8 +15611,24 @@ begin
     (not IsNF4QuantizedTensor(Reader, WName)) and
     Reader.CanStreamTensorPackedQ4_0(WName);
   if DirectInt4 then DirectInt4 := QLayer.BeginInt4QuantImport(InDim);
-  if DirectInt4 then DirectInt8 := false;
-  if not (DirectInt8 or DirectInt4) then
+  // Direct FP32 -> int4: the caller opened an int4 import over the WHOLE layer
+  // before its first call (TNNet.BeginInt4QuantImports), so the streamed rows
+  // of every call - both fused gate/up halves too - quantize straight to Q4_0;
+  // the call that imports the last row commits the import.
+  DirectInt4FromRows := DirectInt8 and (not DirectInt4) and
+    QLayer.Int4QuantImportOpen();
+  if DirectInt4 or DirectInt4FromRows then DirectInt8 := false;
+  if (QLayer <> nil) and QLayer.Int4QuantImportOpen() and
+    not (DirectInt4 or DirectInt4FromRows) then
+  begin
+    // This tensor cannot stream rows: the layer leaves the int4 import and
+    // takes the FP32 route, unless an earlier call already imported rows.
+    if QLayer.Int4QuantImportedRows > 0 then
+      ImportError('Llama import: "' + WName + '" cannot stream its rows into ' +
+        'the int4 import that earlier tensors of this layer started.');
+    QLayer.CancelInt4QuantImport();
+  end;
+  if not (DirectInt8 or DirectInt4 or DirectInt4FromRows) then
     EnsureWritableImportWeights(Layer);
   W := TNNetVolume.Create;
   B := nil;
@@ -15614,7 +15641,7 @@ begin
       Reader.LoadTensorFlat(BiasName, B);
     end;
     OutDimM1 := OutDim - 1;
-    if DirectInt8 or DirectInt4 then
+    if DirectInt8 or DirectInt4 or DirectInt4FromRows then
     begin
       // ~4 MB of FP32 rows per read keeps the syscall count low while
       // bounding the scratch far below the full [SrcRows, InDim] tensor.
@@ -15656,10 +15683,10 @@ begin
       QLayer.EndInt4QuantImport();
       Inc(NeuralImportInt4LayerCount);
     end
-    else if DirectInt8 then
+    else if DirectInt8 or DirectInt4FromRows then
     begin
       SetLength(ChunkTargets, ChunkRows);
-      Fan := TInt8RowChunkFan.Create; // freed by the outer finally
+      Fan := TQuantRowChunkFan.Create; // freed by the outer finally
       j := 0;
       while j < OutDim do
       begin
@@ -15682,8 +15709,18 @@ begin
           else
             Layer.FArrNeurons[TargetIdx].BiasWeight := 0; // bias-free Linear
         end;
-        Fan.RunLinear(QLayer, W, RowsInChunk, InDim, ChunkTargets, Scale);
+        Fan.RunLinear(QLayer, W, RowsInChunk, InDim, ChunkTargets, Scale,
+          DirectInt4FromRows);
         Inc(j, RowsInChunk);
+      end;
+      if DirectInt4FromRows then
+      begin
+        if QLayer.Int4QuantImportedRows > QLayer.Neurons.Count then
+          ImportError('Llama import: "' + WName + '" imported ' +
+            IntToStr(QLayer.Int4QuantImportedRows) + ' int4 rows into a ' +
+            IntToStr(QLayer.Neurons.Count) + '-neuron layer: a row twice.');
+        if QLayer.Int4QuantImportedRows = QLayer.Neurons.Count then
+          QLayer.EndInt4QuantImport();
       end;
     end
     else
@@ -16351,7 +16388,7 @@ var
   EmbChunkRows, EmbRowsInChunk: integer;
   EmbFold: TNeuralFloat;
   EmbDirect: boolean;
-  EmbFan: TInt8RowChunkFan;
+  EmbFan: TQuantRowChunkFan;
   QHeadCW: TNNetLayerConcatedWeights;
   WV: TNNetVolume;
 begin
@@ -16385,7 +16422,7 @@ begin
     EmbChunkRows := (4 * 1024 * 1024) div (HiddenSize * 4);
     if EmbChunkRows < 1 then EmbChunkRows := 1;
     if EmbChunkRows > VocabSize then EmbChunkRows := VocabSize;
-    EmbFan := TInt8RowChunkFan.Create;
+    EmbFan := TQuantRowChunkFan.Create;
     try
       j := 0;
       while j < VocabSize do
@@ -17050,7 +17087,7 @@ var
   EmbFold: TNeuralFloat;
   QHeadCW: TNNetLayerConcatedWeights;
   EmbChunkRows, EmbRowsInChunk: integer;
-  EmbFan: TInt8RowChunkFan;
+  EmbFan: TQuantRowChunkFan;
   QSlab: TNNetVolume;
   Consumed: TStringList;
 
@@ -82274,9 +82311,17 @@ begin
       BuildBlockNet(BlockNet, {TokenCount=}1, qibPrefix, 0,
         FBlockStoreLayers[BlockCnt]);
       BlockNet.BuildQuantInt8 := false;
+      // int4: the loader quantizes the checkpoint rows straight to Q4_0; the
+      // sweep after it converts any layer the loader could not.
+      if pWeightFormat = qiwInt4 then BlockNet.BeginInt4QuantImports();
       LoadQwenImage21BlockWeights(Reader, FBlockStoreLayers[BlockCnt],
         FConfig, BlockCnt);
-      if pWeightFormat = qiwInt4 then BlockNet.QuantizeWeightsInt4();
+      if pWeightFormat = qiwInt4 then
+      begin
+        RequireCompleteInt4QuantImports(BlockNet,
+          'Qwen-Image-2.1 transformer block ' + IntToStr(BlockCnt));
+        BlockNet.QuantizeWeightsInt4();
+      end;
     end;
   finally
     Reader.Free;

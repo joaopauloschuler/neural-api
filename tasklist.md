@@ -1969,8 +1969,17 @@ rather than acted on.
             ~90-145 s -> ~23-36 s, extrapolated). Found: the shared fNTL pool
             is 1 thread on Linux (FPC 3.2.2 TThread.ProcessorCount = 1), so
             every fNTL fan runs inline; fix awaits the user's decision.
-      - [ ] B1g2. Quantize to int4 directly in the loader (FP32/BF16 rows ->
+      - [x] B1g2. Quantize to int4 directly in the loader (FP32/BF16 rows ->
             Q4_0 in the threaded row fan), branch-free QuantizeRow.
+            DONE: TNNet.BeginInt4QuantImports + LoadLlamaLinearWeights'
+            DirectInt4FromRows route (Qwen-Image transformer only); QuantizeRow
+            branch-free with an AVX2 path (~15x, output identical for finite
+            input; tiny-max blocks no longer raise EOverflow). One real-shape
+            int4 block loads in 0.8-2.3 s instead of 3.9-7.5 s (this box).
+            Int4 results change slightly (one rounding instead of two).
+            Follow-up:
+            - [ ] ChatTerminal / LLM --int4 still go int8 -> int4; switching
+                  needs a check of the window/borrowing twin builds.
       - [ ] B1g3. Skip creating the four training volumes per neuron in
             inference-only builds.
     - [x] B1a. Read-only audit (2026-09-25, pico block 0 on PoCL, transfer trace;

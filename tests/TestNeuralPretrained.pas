@@ -729,6 +729,8 @@ type
     procedure TestQwenImage21TransformerOpenCLAttention;
     procedure TestQwenImage21TransformerStepReplay;
     procedure TestQwenImage21TransformerQuantizedDrift;
+    procedure TestQwenImage21Int4DirectLoad;
+    procedure TestQwenImage21Int4ImportRefusals;
     procedure TestQwenImage21VaeDupUpMapping;
     procedure TestQwenImage21VaeDecoderTensorSet;
     procedure TestQwenImage21VaeDecoderParity;
@@ -26765,6 +26767,257 @@ begin
     Latents.Free;
     Embeds.Free;
     RefRoot.Free;
+  end;
+end;
+
+// Direct int4 block load: each projection table equals QuantizeRow of the
+// FP32 rows bit for bit, GateUp halves and Scale too. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwenImage21Int4DirectLoad;
+var
+  Config: TQwenImage21TransformerConfig;
+  Reader: TNNetSafeTensorsReader;
+  FP32Net, Int4Net: TNNet;
+  FP32Block, Int4Block: TQwenImage21BlockLayers;
+  Expected: TNNetVolumeQuant4;
+  BlockCnt, MaxBlockPos, LayerCnt: integer;
+  Prefix: string;
+
+  procedure BuildBlockNet(NN: TNNet; pInt8: boolean;
+    out Block: TQwenImage21BlockLayers);
+  var
+    XInput, ModulationInput: TNNetLayer;
+  begin
+    NN.BuildQuantInt8 := pInt8;
+    XInput := NN.AddLayer(TNNetInput.Create(1, 1, Config.Hidden));
+    ModulationInput := NN.AddLayer(TNNetInput.Create(1, 1, 4 * Config.Hidden));
+    AddQwenImage21Block(NN, XInput,
+      AddQwenImage21Modulation(NN, ModulationInput, Config.Hidden), Config,
+      qibPrefix, 0, Block);
+    NN.BuildQuantInt8 := false;
+  end;
+
+  function ProjectionOf(const Block: TQwenImage21BlockLayers;
+    LayerIdx: integer): TNNetLayerConcatedWeights;
+  begin
+    case LayerIdx of
+      0: Result := TNNetLayerConcatedWeights(Block.QProj);
+      1: Result := TNNetLayerConcatedWeights(Block.KProj);
+      2: Result := TNNetLayerConcatedWeights(Block.VProj);
+      3: Result := TNNetLayerConcatedWeights(Block.OutProj);
+      4: Result := TNNetLayerConcatedWeights(Block.GateUp);
+      else Result := TNNetLayerConcatedWeights(Block.Down);
+    end;
+  end;
+
+  // Expected := QuantizeRow of every FP32 neuron row of FP32Layer.
+  procedure QuantizeFP32Rows(FP32Layer: TNNetLayerConcatedWeights);
+  var
+    NeuronCnt, MaxNeuronPos: integer;
+  begin
+    MaxNeuronPos := FP32Layer.Neurons.Count - 1;
+    Expected.ReSize(FP32Layer.Neurons.Count, 1,
+      FP32Layer.Neurons[0].Weights.Size);
+    for NeuronCnt := 0 to MaxNeuronPos do
+      Expected.QuantizeRow(NeuronCnt, 0,
+        FP32Layer.Neurons[NeuronCnt].Weights.DataPtr);
+  end;
+
+  procedure AssertTablesEqual(const What: string;
+    Int4Layer: TNNetLayerConcatedWeights; ScaleFactor: TNeuralFloat);
+  var
+    i: integer;
+    ExpectedScale: TNeuralFloat;
+  begin
+    AssertTrue(What + ' is int4', Int4Layer.WeightsQuantizedInt4);
+    AssertFalse(What + ' dropped the int8 table',
+      Int4Layer.WeightsQuantizedInt8);
+    AssertFalse(What + ' has no open import', Int4Layer.Int4QuantImportOpen());
+    AssertEquals(What + ' packed size', Expected.PackedSize,
+      Int4Layer.QuantTableInt4.PackedSize);
+    for i := 0 to Expected.PackedSize - 1 do
+      if Expected.FData[i] <> Int4Layer.QuantTableInt4.FData[i] then
+        AssertEquals(What + ' packed byte ' + IntToStr(i), Expected.FData[i],
+          Int4Layer.QuantTableInt4.FData[i]);
+    for i := 0 to Expected.ScaleData.Size - 1 do
+    begin
+      ExpectedScale := Expected.ScaleData.FData[i] * ScaleFactor;
+      if PLongWord(@ExpectedScale)^ <>
+        PLongWord(@Int4Layer.QuantTableInt4.ScaleData.FData[i])^ then
+        AssertEquals(What + ' scale ' + IntToStr(i), ExpectedScale,
+          Int4Layer.QuantTableInt4.ScaleData.FData[i], 0);
+    end;
+  end;
+
+begin
+  Config := ReadQwenImage21TransformerConfig(
+    FixturePath('tiny_qwenimage21/transformer/config.json'));
+  Reader := TNNetSafeTensorsReader.Create(FixturePath(
+    'tiny_qwenimage21/transformer/diffusion_pytorch_model.safetensors.index.json'));
+  FP32Net := nil;
+  Int4Net := nil;
+  Expected := TNNetVolumeQuant4.Create();
+  try
+    MaxBlockPos := Config.NumLayers - 1;
+    for BlockCnt := 0 to MaxBlockPos do
+    begin
+      FreeAndNil(FP32Net);
+      FreeAndNil(Int4Net);
+      FP32Net := TNNet.Create();
+      BuildBlockNet(FP32Net, false, FP32Block);
+      LoadQwenImage21BlockWeights(Reader, FP32Block, Config, BlockCnt);
+      Int4Net := TNNet.Create();
+      BuildBlockNet(Int4Net, true, Int4Block);
+      AssertEquals('block ' + IntToStr(BlockCnt) + ': imports opened', 6,
+        Int4Net.BeginInt4QuantImports());
+      LoadQwenImage21BlockWeights(Reader, Int4Block, Config, BlockCnt);
+      for LayerCnt := 0 to 5 do
+      begin
+        QuantizeFP32Rows(ProjectionOf(FP32Block, LayerCnt));
+        AssertTablesEqual('block ' + IntToStr(BlockCnt) + ' projection ' +
+          IntToStr(LayerCnt), ProjectionOf(Int4Block, LayerCnt), 1);
+      end;
+    end;
+    // GateUp by hand: the import stays open after the proj half.
+    FreeAndNil(Int4Net);
+    Int4Net := TNNet.Create();
+    BuildBlockNet(Int4Net, true, Int4Block);
+    Int4Net.BeginInt4QuantImports();
+    Prefix := 'transformer_blocks.' + IntToStr(MaxBlockPos) + '.';
+    LoadLlamaLinearWeights(Reader, Int4Block.GateUp, Prefix +
+      'img_mlp.proj.weight', Config.Hidden, Config.MlpHidden, 0,
+      2 * Config.MlpHidden, 0, '', 1.0, 0, 0, 0, false, {pDeferFlush=}true);
+    AssertTrue('GateUp import open after one half', TNNetLayerConcatedWeights(
+      Int4Block.GateUp).Int4QuantImportOpen());
+    AssertEquals('GateUp rows after one half', Config.MlpHidden,
+      TNNetLayerConcatedWeights(Int4Block.GateUp).Int4QuantImportedRows);
+    AssertFalse('GateUp not int4 after one half', TNNetLayerConcatedWeights(
+      Int4Block.GateUp).WeightsQuantizedInt4);
+    LoadLlamaLinearWeights(Reader, Int4Block.GateUp, Prefix +
+      'img_mlp.gate_layer.weight', Config.Hidden, Config.MlpHidden,
+      Config.MlpHidden, 2 * Config.MlpHidden);
+    QuantizeFP32Rows(ProjectionOf(FP32Block, 4));
+    AssertTablesEqual('GateUp by hand', TNNetLayerConcatedWeights(
+      Int4Block.GateUp), 1);
+    // A uniform Scale lands on the block scales; the codes do not move.
+    LoadLlamaLinearWeights(Reader, Int4Block.Down, Prefix +
+      'img_mlp.out.weight', Config.MlpHidden, Config.Hidden, 0, -1, 0, '',
+      {Scale=}0.5);
+    QuantizeFP32Rows(ProjectionOf(FP32Block, 5));
+    AssertTablesEqual('Down with Scale 0.5', TNNetLayerConcatedWeights(
+      Int4Block.Down), 0.5);
+  finally
+    Expected.Free;
+    Int4Net.Free;
+    FP32Net.Free;
+    Reader.Free;
+  end;
+end;
+
+// A non-streamable call cancels an untouched int4 import (FP32, then sweep)
+// and raises over imported rows; refusals keep rows. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestQwenImage21Int4ImportRefusals;
+var
+  Config: TQwenImage21TransformerConfig;
+  Reader: TNNetSafeTensorsReader;
+  NN: TNNet;
+  Block: TQwenImage21BlockLayers;
+  Slab: TNNetVolume;
+  Expected: TNNetVolumeQuant4;
+  GateUp, Down: TNNetLayerConcatedWeights;
+  Prefix: string;
+  NeuronCnt, i: integer;
+  Raised: boolean;
+
+  procedure BuildArmedBlockNet();
+  var
+    XInput, ModulationInput: TNNetLayer;
+  begin
+    FreeAndNil(NN);
+    NN := TNNet.Create();
+    NN.BuildQuantInt8 := true;
+    XInput := NN.AddLayer(TNNetInput.Create(1, 1, Config.Hidden));
+    ModulationInput := NN.AddLayer(TNNetInput.Create(1, 1, 4 * Config.Hidden));
+    AddQwenImage21Block(NN, XInput,
+      AddQwenImage21Modulation(NN, ModulationInput, Config.Hidden), Config,
+      qibPrefix, 0, Block);
+    NN.BuildQuantInt8 := false;
+    AssertEquals('imports opened', 6, NN.BeginInt4QuantImports());
+    GateUp := TNNetLayerConcatedWeights(Block.GateUp);
+    Down := TNNetLayerConcatedWeights(Block.Down);
+  end;
+
+begin
+  Config := ReadQwenImage21TransformerConfig(
+    FixturePath('tiny_qwenimage21/transformer/config.json'));
+  Reader := TNNetSafeTensorsReader.Create(FixturePath(
+    'tiny_qwenimage21/transformer/diffusion_pytorch_model.safetensors.index.json'));
+  NN := nil;
+  Slab := TNNetVolume.Create();
+  Expected := TNNetVolumeQuant4.Create();
+  Prefix := 'transformer_blocks.0.';
+  try
+    // A staged slab cannot stream rows: the untouched import is cancelled and
+    // Down takes the FP32 route; the sweep then quantizes those FP32 rows.
+    BuildArmedBlockNet();
+    Reader.LoadTensorFlat(Prefix + 'img_mlp.out.weight', Slab);
+    LoadLlamaLinearWeights(Reader, Down, Prefix + 'img_mlp.out.weight',
+      Config.MlpHidden, Config.Hidden, 0, -1, 0, '', 1.0, 0, 0, 0, false,
+      false, Slab);
+    AssertFalse('cancelled: no open import', Down.Int4QuantImportOpen());
+    AssertFalse('cancelled: FP32, not int8', Down.WeightsQuantizedInt8);
+    AssertEquals('cancelled: FP32 rows', Config.MlpHidden,
+      Down.Neurons[0].Weights.Size);
+    Expected.ReSize(Down.Neurons.Count, 1, Config.MlpHidden);
+    for NeuronCnt := 0 to Down.Neurons.Count - 1 do
+      Expected.QuantizeRow(NeuronCnt, 0,
+        Down.Neurons[NeuronCnt].Weights.DataPtr);
+    NN.QuantizeWeightsInt4();
+    AssertTrue('swept Down is int4', Down.WeightsQuantizedInt4);
+    for i := 0 to Expected.PackedSize - 1 do
+      if Expected.FData[i] <> Down.QuantTableInt4.FData[i] then
+        AssertEquals('swept Down byte ' + IntToStr(i), Expected.FData[i],
+          Down.QuantTableInt4.FData[i]);
+    for i := 0 to Expected.ScaleData.Size - 1 do
+      if Expected.ScaleData.FData[i] <> Down.QuantTableInt4.ScaleData.FData[i]
+      then AssertEquals('swept Down scale ' + IntToStr(i),
+        Expected.ScaleData.FData[i], Down.QuantTableInt4.ScaleData.FData[i], 0);
+    // One streamed GateUp half leaves a partial import that nothing may
+    // overwrite, reset or skip past.
+    BuildArmedBlockNet();
+    LoadLlamaLinearWeights(Reader, GateUp, Prefix + 'img_mlp.proj.weight',
+      Config.Hidden, Config.MlpHidden, 0, 2 * Config.MlpHidden, 0, '', 1.0, 0,
+      0, 0, false, {pDeferFlush=}true);
+    AssertEquals('one partial import', 1, NN.PartialInt4QuantImportCount());
+    Raised := false;
+    try
+      RequireCompleteInt4QuantImports(NN, 'partial');
+    except
+      on E: EPretrainedImportError do Raised := true;
+    end;
+    AssertTrue('RequireCompleteInt4QuantImports raises', Raised);
+    GateUp.QuantizeWeightsInt4();
+    AssertFalse('QuantizeWeightsInt4 refused the partial import',
+      GateUp.WeightsQuantizedInt4);
+    AssertFalse('BeginInt4QuantImport refused the partial import',
+      GateUp.BeginInt4QuantImport(Config.Hidden));
+    AssertEquals('the imported rows survive both refusals', Config.MlpHidden,
+      GateUp.Int4QuantImportedRows);
+    Reader.LoadTensorFlat(Prefix + 'img_mlp.gate_layer.weight', Slab);
+    Raised := false;
+    try
+      LoadLlamaLinearWeights(Reader, GateUp, Prefix +
+        'img_mlp.gate_layer.weight', Config.Hidden, Config.MlpHidden,
+        Config.MlpHidden, 2 * Config.MlpHidden, 0, '', 1.0, 0, 0, 0, false,
+        false, Slab);
+    except
+      on E: EPretrainedImportError do Raised := true;
+    end;
+    AssertTrue('a non-streamable half after imported rows raises', Raised);
+  finally
+    Expected.Free;
+    Slab.Free;
+    NN.Free;
+    Reader.Free;
   end;
 end;
 
