@@ -54,9 +54,11 @@ Coded by Claude (AI).
 // flat time-to-first-token. A recurrent (SSM) state cannot be
 // position-truncated, so a hybrid/recurrent net resumes instead from the
 // deepest cache checkpoint (the recurrent half of the state, captured at
-// known positions during the prefill and at the turn boundaries) at or
-// below that prefix; --cache-checkpoints N sizes that store. NoCacheReuse
-// turns both routes off (full re-prefill).
+// known positions during the prefill and at the turn boundaries) whose
+// token prefix the prompt starts with (on a net with attention layers, only
+// within the prefix shared with the cached ids); --cache-checkpoints N sizes
+// that store, and a full store frees the checkpoint unused for the most turns.
+// NoCacheReuse turns both routes off (full re-prefill).
 //
 // The engine is single-session: one model, one KV cache, one conversation
 // position at a time. Callers that serve concurrent clients must
@@ -102,7 +104,6 @@ const
   csDefaultCacheCheckpointsOpenCL = 16;
   csDefaultCacheCheckpointsCPU = 8;
   csMaxCacheCheckpoints = 2048;
-  csDefaultCheckpointBandWidth = 256;
   // Start value of a token-prefix hash (the hash of the empty prefix).
   csTokenPrefixHashSeed = QWord($CBF29CE484222325);
   // Token ids a TTokenPrefixGuard keeps before its position.
@@ -114,6 +115,14 @@ type
   TTokenPrefixGuard = record
     Count: integer; // stored ids: min(Position, csTokenPrefixGuardLen)
     Tokens: array[0..csTokenPrefixGuardLen - 1] of integer;
+  end;
+
+  // Which token sequence a cache checkpoint belongs to, and when a request
+  // last captured or resumed it (the eviction order).
+  TCacheCheckpointInfo = record
+    PrefixHash: UInt64;       // TokenPrefixHash of the ids before Position
+    Guard: TTokenPrefixGuard; // their last ids, checked after a hash match
+    LastUsedTurn: integer;    // TChatEngine.CurrentTurn of that request
   end;
 
   // Weight storage the chat engine loads the checkpoint into.
@@ -291,23 +300,21 @@ type
     // Opt.CacheCheckpoints of them, sized once in LoadModel so that a capture
     // allocates nothing; Position 0 marks a free slot. CaptureCheckpoint runs
     // after every prefill window, at the end of the prompt and at the end of
-    // the reply; RetainCheckpointsBefore keeps one checkpoint per geometric
-    // band of distance from the fed position (CheckpointBand), so the store
-    // is densest near the newest token, where prompts diverge most often.
-    // Under OpenCL every slot lives in OpenCL memory (a capture is a copy
-    // between resident buffers), else in host RAM: Checkpoints[0].Bytes() /
-    // OpenCLBytes() say how much.
+    // the reply. A checkpoint belongs to the token sequence it was captured
+    // on (CheckpointInfo), so checkpoints of other conversations stay held;
+    // DeleteTheLongestUnusedCheckpoint frees one only when a capture finds
+    // the store full. Under OpenCL every slot lives in OpenCL memory (a
+    // capture is a copy between resident buffers), else in host RAM:
+    // Checkpoints[0].Bytes() / OpenCLBytes() say how much.
     StateReuseOK: boolean;       // checkpoint resume sound for this architecture?
     Checkpoints: array of TNNetDecoderStateCheckpoint; // owned; empty when off
-    CheckpointBandWidth: integer; // W: the finest capture spacing (the tail
-                                 // window, else the prefill window, else
-                                 // csDefaultCheckpointBandWidth capped at
-                                 // half the context)
-    CheckpointBandRatio: double; // r = (SeqLen / W)^(1 / N)
+    CheckpointInfo: array of TCacheCheckpointInfo; // per slot of Checkpoints
+    CheckpointOrder: array of integer; // MatchPromptAgainstCache's slot
+                                 // indices by Position, sized with the store
     CheckpointOnTwins: boolean;  // the twins' captures are legal (they share
                                  // NN's OpenCL context, or OpenCL is off)
-    CheckpointBandDeepest: array of integer; // RetainCheckpointsBefore's
-                                 // per-band slot index, sized with the store
+    CurrentTurn: integer;        // GenerateFromIds calls so far (the turn
+                                 // the checkpoint eviction order counts)
     SeqLen, VocabSize: integer;
     MarkerIds: TNeuralIntegerArray;   // end-of-turn stop sequence (token ids)
     CachedTokens: TNeuralIntegerArray; // token ids resident in the KV cache
@@ -373,9 +380,6 @@ type
     // parameters for THIS call (pass Opt for the launch defaults).
     function GenerateFromIds(const PromptIds: TNeuralIntegerArray;
       const GenOpt: TChatOptions): string;
-    // CheckpointBand maps a distance from the fed position to its retention
-    // band 0..N-1 (the rule RetainCheckpointsBefore keeps one checkpoint per).
-    function CheckpointBand(Distance: integer): integer;
   private
     // Bytes of an unfinished UTF-8 sequence EmitToken is holding until the
     // token that completes it arrives (a codepoint can straddle two tokens).
@@ -385,20 +389,17 @@ type
     // Emits U+FFFD for anything still held in PendingUtf8 at reply end.
     procedure FlushPendingUtf8();
     // Cache checkpoints (see the Checkpoints field).
-    // The live checkpoint with the largest Position at or below Limit; nil
-    // when none (a full reset follows).
-    function DeepestCheckpointAtOrBelow(Limit: integer):
-      TNNetDecoderStateCheckpoint;
-    // Frees every checkpoint whose position the fed sequence no longer
-    // vouches for (Position above Limit); 0 empties the store.
-    procedure DropCheckpointsAbove(Limit: integer);
-    // Applies the retention rule against a capture about to land at FedPos
-    // and leaves at least one free slot (nothing is allocated).
-    procedure RetainCheckpointsBefore(FedPos: integer);
-    // Copies ASession's recurrent state into a free slot at FedPos, the
-    // number of tokens fed into ASession; skipped when FedPos is held already.
+    // One pass: LivePrefix = common prefix with CachedTokens; ResumeSlot = the
+    // deepest resumable match (attention: <= LivePrefix), marked used, or -1.
+    procedure MatchPromptAgainstCache(const PromptIds: TNeuralIntegerArray;
+      out LivePrefix, ResumeSlot: integer);
+    // Frees the checkpoint unused for the most turns (the shallowest on a
+    // tie) and returns its slot. The store must be full.
+    function DeleteTheLongestUnusedCheckpoint(): integer;
+    // Copies ASession's recurrent state at FedPos, PrefixHash being the hash
+    // of Tokens[0..FedPos-1]; an already-held checkpoint is only marked used.
     procedure CaptureCheckpoint(ASession: TNNetStreamingDecoder;
-      FedPos: integer);
+      const Tokens: TNeuralIntegerArray; FedPos: integer; PrefixHash: UInt64);
     procedure FreeCheckpoints();
     // Moves the live state from ActiveSession into Target (snapshot, restore)
     // and makes Target the active session. No-op when Target is active.
@@ -527,10 +528,12 @@ begin
   WriteLn('  --cache-checkpoints N  hybrid/recurrent nets (qwen3_5, mamba, ...): keep');
   WriteLn('                        up to N checkpoints of the recurrent state, taken');
   WriteLn('                        after every prefill window and at the end of the');
-  WriteLn('                        prompt and of the reply, kept geometrically denser');
-  WriteLn('                        near the end; a prompt resumes from the deepest one');
-  WriteLn('                        at or below its shared token prefix and prefills');
-  WriteLn('                        only the tail (default 16 with OpenCL, 8 on the');
+  WriteLn('                        prompt and of the reply; a full store frees the one');
+  WriteLn('                        unused for the most turns. A prompt resumes from the');
+  WriteLn('                        deepest one whose tokens it starts with (with');
+  WriteLn('                        attention layers, only within the prefix shared');
+  WriteLn('                        with the cached ids) and prefills only the tail');
+  WriteLn('                        (default 16 with OpenCL, 8 on the');
   WriteLn('                        CPU; 0 = off, full re-prefill; N is 0 or 2 to');
   WriteLn('                        2048, else the program stops with an error before');
   WriteLn('                        loading). Ignored on pure-attention nets, whose');
@@ -1269,9 +1272,10 @@ begin
   ReuseOK := false;
   StateReuseOK := false;
   SetLength(Checkpoints, 0);
-  CheckpointBandWidth := csDefaultCheckpointBandWidth;
-  CheckpointBandRatio := 2;
+  SetLength(CheckpointInfo, 0);
+  SetLength(CheckpointOrder, 0);
   CheckpointOnTwins := false;
+  CurrentTurn := 0;
   SeqLen := 0;
   VocabSize := 0;
   SetLength(MarkerIds, 0);
@@ -1342,111 +1346,134 @@ begin
   if Assigned(OnToken) then OnToken(Utf8ReplacementChar);
 end;
 
-function TChatEngine.CheckpointBand(Distance: integer): integer;
+procedure TChatEngine.MatchPromptAgainstCache(
+  const PromptIds: TNeuralIntegerArray; out LivePrefix, ResumeSlot: integer);
+var
+  SlotPos, MaxSlotPos, CandidateCount, InsertPos, OrderPos: integer;
+  TokenPos, MaxFedPos, LivePrefixBound, CandidatePosition: integer;
+  Hash: UInt64;
+  HasAttention, LiveMatching: boolean;
 begin
-  // Band k covers distances [W * r^k, W * r^(k+1)); a distance below W is
-  // band 0 (the newest captures) and one past the context the last band.
-  if Distance < CheckpointBandWidth then exit(0);
-  Result := Trunc(Ln(Distance / CheckpointBandWidth) / Ln(CheckpointBandRatio));
-  if Result > High(Checkpoints) then Result := High(Checkpoints);
-  if Result < 0 then Result := 0;
+  LivePrefix := 0;
+  ResumeSlot := -1;
+  // A checkpoint past MaxFedPos would already hold the last prompt id, which
+  // the first decode step feeds; it cannot be resumed and is not visited.
+  MaxFedPos := Length(PromptIds) - 1;
+  CandidateCount := 0;
+  MaxSlotPos := High(Checkpoints);
+  for SlotPos := 0 to MaxSlotPos do
+  begin
+    CandidatePosition := Checkpoints[SlotPos].Position;
+    if (CandidatePosition <= 0) or (CandidatePosition > MaxFedPos) then continue;
+    InsertPos := CandidateCount;
+    while (InsertPos > 0) and
+      (Checkpoints[CheckpointOrder[InsertPos - 1]].Position > CandidatePosition) do
+    begin
+      CheckpointOrder[InsertPos] := CheckpointOrder[InsertPos - 1];
+      Dec(InsertPos);
+    end;
+    CheckpointOrder[InsertPos] := SlotPos;
+    Inc(CandidateCount);
+  end;
+  // A checkpoint holds no attention K/V: on a net with attention its rows
+  // must still be in the live cache, i.e. at or below LivePrefix.
+  HasAttention := Session.SDPACount > 0;
+  LivePrefixBound := Min(Length(CachedTokens), Length(PromptIds));
+  LiveMatching := LivePrefixBound > 0;
+  Hash := csTokenPrefixHashSeed;
+  TokenPos := 0;
+  OrderPos := 0;
+  while true do
+  begin
+    // Hash covers PromptIds[0..TokenPos-1]; candidates come in Position order.
+    while (OrderPos < CandidateCount) and
+      (Checkpoints[CheckpointOrder[OrderPos]].Position = TokenPos) do
+    begin
+      SlotPos := CheckpointOrder[OrderPos];
+      if ((not HasAttention) or (TokenPos <= LivePrefix)) and
+        (CheckpointInfo[SlotPos].PrefixHash = Hash) and
+        TokenPrefixGuardMatches(CheckpointInfo[SlotPos].Guard, PromptIds,
+          TokenPos) then ResumeSlot := SlotPos;
+      Inc(OrderPos);
+    end;
+    if LiveMatching and (TokenPos >= LivePrefixBound) then
+      LiveMatching := false;
+    // LivePrefix is final once LiveMatching is off; with attention no
+    // candidate past it can be resumed, and those at it were just checked.
+    if (not LiveMatching) and (HasAttention or (OrderPos >= CandidateCount))
+      then break;
+    if LiveMatching then
+    begin
+      if CachedTokens[TokenPos] = PromptIds[TokenPos] then Inc(LivePrefix)
+      else
+      begin
+        LiveMatching := false;
+        if HasAttention then break;
+      end;
+    end;
+    if OrderPos < CandidateCount then
+      Hash := FoldTokenIntoPrefixHash(Hash, PromptIds[TokenPos]);
+    Inc(TokenPos);
+  end;
+  // Only the resumed checkpoint is refreshed: a matching one that is never
+  // resumed ages out.
+  if ResumeSlot >= 0 then
+    CheckpointInfo[ResumeSlot].LastUsedTurn := CurrentTurn;
 end;
 
-function TChatEngine.DeepestCheckpointAtOrBelow(Limit: integer):
-  TNNetDecoderStateCheckpoint;
+function TChatEngine.DeleteTheLongestUnusedCheckpoint(): integer;
 var
   SlotPos, MaxSlotPos: integer;
 begin
-  Result := nil;
+  Result := -1;
   MaxSlotPos := High(Checkpoints);
-  for SlotPos := 0 to MaxSlotPos do
-    if (Checkpoints[SlotPos].Position > 0) and
-      (Checkpoints[SlotPos].Position <= Limit) and
-      ((Result = nil) or (Checkpoints[SlotPos].Position > Result.Position)) then
-      Result := Checkpoints[SlotPos];
-end;
-
-procedure TChatEngine.DropCheckpointsAbove(Limit: integer);
-var
-  SlotPos, MaxSlotPos: integer;
-begin
-  MaxSlotPos := High(Checkpoints);
-  for SlotPos := 0 to MaxSlotPos do
-    if Checkpoints[SlotPos].Position > Limit then
-      Checkpoints[SlotPos].Position := 0;
-end;
-
-procedure TChatEngine.RetainCheckpointsBefore(FedPos: integer);
-var
-  SlotPos, MaxSlotPos, Band, HolderPos, LiveCount, FarthestPos: integer;
-  Chk: TNNetDecoderStateCheckpoint;
-begin
-  MaxSlotPos := High(Checkpoints);
-  DropCheckpointsAbove(FedPos);
-  // One checkpoint per band of distance from FedPos, the deepest (largest
-  // Position) of the ones held. The capture about to land is not held yet,
-  // so the newest held checkpoint keeps its band and moves to a farther one
-  // as the fed position grows; the two turn-boundary checkpoints of a
-  // request are its two deepest and no capture follows them until the next
-  // request resumes, so the rule keeps them on its own.
-  for Band := 0 to MaxSlotPos do CheckpointBandDeepest[Band] := -1;
-  LiveCount := 0;
   for SlotPos := 0 to MaxSlotPos do
   begin
-    Chk := Checkpoints[SlotPos];
-    if Chk.Position <= 0 then continue;
-    Inc(LiveCount);
-    Band := CheckpointBand(FedPos - Chk.Position);
-    HolderPos := CheckpointBandDeepest[Band];
-    if HolderPos < 0 then CheckpointBandDeepest[Band] := SlotPos
-    else if Checkpoints[HolderPos].Position < Chk.Position then
-    begin
-      Checkpoints[HolderPos].Position := 0;
-      CheckpointBandDeepest[Band] := SlotPos;
-      Dec(LiveCount);
-    end
-    else
-    begin
-      Chk.Position := 0;
-      Dec(LiveCount);
-    end;
+    if Checkpoints[SlotPos].Position <= 0 then continue;
+    if (Result < 0) or
+      (CheckpointInfo[SlotPos].LastUsedTurn <
+       CheckpointInfo[Result].LastUsedTurn) or
+      ((CheckpointInfo[SlotPos].LastUsedTurn =
+        CheckpointInfo[Result].LastUsedTurn) and
+       (Checkpoints[SlotPos].Position < Checkpoints[Result].Position)) then
+      Result := SlotPos;
   end;
-  // Every band holding one leaves no slot for the capture: evict the
-  // farthest checkpoint, where divergence is the least likely.
-  if LiveCount >= Length(Checkpoints) then
-  begin
-    FarthestPos := -1;
-    for SlotPos := 0 to MaxSlotPos do
-    begin
-      Chk := Checkpoints[SlotPos];
-      if Chk.Position <= 0 then continue;
-      if (FarthestPos < 0) or
-        (Chk.Position < Checkpoints[FarthestPos].Position) then
-        FarthestPos := SlotPos;
-    end;
-    if FarthestPos >= 0 then Checkpoints[FarthestPos].Position := 0;
-  end;
+  if Result < 0 then
+    raise Exception.Create('TChatEngine.DeleteTheLongestUnusedCheckpoint:' +
+      ' the store holds no checkpoint');
+  Checkpoints[Result].Position := 0;
 end;
 
 procedure TChatEngine.CaptureCheckpoint(ASession: TNNetStreamingDecoder;
-  FedPos: integer);
+  const Tokens: TNeuralIntegerArray; FedPos: integer; PrefixHash: UInt64);
 var
-  SlotPos, MaxSlotPos: integer;
+  SlotPos, MaxSlotPos, FreeSlot: integer;
 begin
   if (FedPos <= 0) or (Length(Checkpoints) = 0) then exit;
   MaxSlotPos := High(Checkpoints);
+  FreeSlot := -1;
   for SlotPos := 0 to MaxSlotPos do
-    if Checkpoints[SlotPos].Position = FedPos then exit;
-  RetainCheckpointsBefore(FedPos);
-  for SlotPos := 0 to MaxSlotPos do
+  begin
     if Checkpoints[SlotPos].Position <= 0 then
     begin
-      ASession.CaptureStateInto(Checkpoints[SlotPos]);
-      Checkpoints[SlotPos].Position := FedPos;
+      if FreeSlot < 0 then FreeSlot := SlotPos;
+    end
+    else if (Checkpoints[SlotPos].Position = FedPos) and
+      (CheckpointInfo[SlotPos].PrefixHash = PrefixHash) and
+      TokenPrefixGuardMatches(CheckpointInfo[SlotPos].Guard, Tokens, FedPos) then
+    begin
+      CheckpointInfo[SlotPos].LastUsedTurn := CurrentTurn;
       exit;
     end;
-  raise Exception.Create('TChatEngine.CaptureCheckpoint: no free slot after' +
-    ' the retention pass');
+  end;
+  if FreeSlot < 0 then FreeSlot := DeleteTheLongestUnusedCheckpoint();
+  // Position stays 0 until the copy returns, so a capture that raises leaves
+  // a free slot rather than a half-written checkpoint.
+  ASession.CaptureStateInto(Checkpoints[FreeSlot]);
+  CheckpointInfo[FreeSlot].PrefixHash := PrefixHash;
+  FillTokenPrefixGuard(Tokens, FedPos, CheckpointInfo[FreeSlot].Guard);
+  CheckpointInfo[FreeSlot].LastUsedTurn := CurrentTurn;
+  Checkpoints[FreeSlot].Position := FedPos;
 end;
 
 procedure TChatEngine.FreeCheckpoints();
@@ -1456,7 +1483,8 @@ begin
   MaxSlotPos := High(Checkpoints);
   for SlotPos := 0 to MaxSlotPos do Checkpoints[SlotPos].Free;
   SetLength(Checkpoints, 0);
-  SetLength(CheckpointBandDeepest, 0);
+  SetLength(CheckpointInfo, 0);
+  SetLength(CheckpointOrder, 0);
 end;
 
 procedure TChatEngine.SwitchTo(Target: TNNetStreamingDecoder);
@@ -1976,18 +2004,8 @@ begin
     SetLength(Checkpoints, Opt.CacheCheckpoints);
     for SlotPos := 0 to High(Checkpoints) do
       Checkpoints[SlotPos] := Session.NewStateCheckpoint();
-    SetLength(CheckpointBandDeepest, Opt.CacheCheckpoints);
-    // The band width is the finest capture spacing, so every checkpoint
-    // falls under the one band rule: the tail window, else the prefill
-    // window, else (boundary captures only) a fixed width that still leaves
-    // at least one band of distance inside the context.
-    if Assigned(TailIn) then CheckpointBandWidth := TailIn.SizeX
-    else if Assigned(WindowIn) then CheckpointBandWidth := WindowIn.SizeX
-    else CheckpointBandWidth := Max(1, Min(csDefaultCheckpointBandWidth,
-      SeqLen div 2));
-    CheckpointBandRatio := Power(SeqLen / CheckpointBandWidth,
-      1 / Opt.CacheCheckpoints);
-    if CheckpointBandRatio <= 1 then CheckpointBandRatio := 2;
+    SetLength(CheckpointInfo, Opt.CacheCheckpoints);
+    SetLength(CheckpointOrder, Opt.CacheCheckpoints);
     // A twin built in its own OpenCL context cannot read a slot owned by
     // NN's context, so the window captures are skipped on that fallback.
     CheckpointOnTwins := (not OpenCLOn) or WindowBorrowsWeights;
@@ -2024,14 +2042,13 @@ begin
       else Line := 'in host RAM';
       Notice(Format('[cache checkpoints ON - up to %d checkpoints of the' +
         ' recurrent state (%.1f MB each, %.1f MB in all, %s), captured after' +
-        ' every prefill window and at the end of the prompt and of the reply,' +
-        ' kept one per band of distance from the newest token (%d bands,' +
-        ' width %d, ratio %.2f); a prompt resumes from the deepest' +
-        ' checkpoint at or below its shared prefix and only the tail after' +
-        ' it is prefilled]',
+        ' every prefill window and at the end of the prompt and of the reply;' +
+        ' a full store frees the checkpoint unused for the most turns; a' +
+        ' prompt resumes from the deepest checkpoint whose tokens it starts' +
+        ' with (on a net with attention layers, only within the prefix shared' +
+        ' with the cached ids) and only the tail after it is prefilled]',
         [Opt.CacheCheckpoints, Checkpoints[0].Bytes() / (1024 * 1024),
-         Opt.CacheCheckpoints * Checkpoints[0].Bytes() / (1024 * 1024), Line,
-         Opt.CacheCheckpoints, CheckpointBandWidth, CheckpointBandRatio]));
+         Opt.CacheCheckpoints * Checkpoints[0].Bytes() / (1024 * 1024), Line]));
       if not CheckpointOnTwins then
         Notice('[--cache-checkpoints: the prefill twins run in their own' +
           ' OpenCL context, so only the end-of-prompt and end-of-reply' +
@@ -2124,10 +2141,11 @@ end;
 //   ReuseOK (pure attention): keep the KV cache across calls, TruncateTo the
 //     common prefix and prefill only the diverging tail.
 //   StateReuseOK (hybrid/recurrent): recurrent state has no per-position
-//     history to truncate, so TruncateTo the deepest cache checkpoint at or
-//     below the common prefix, restore the recurrent state it holds, and
-//     prefill from there; a prompt below every checkpoint falls back to a
-//     full reset.
+//     history to truncate, so resume from the deepest cache checkpoint whose
+//     token prefix the prompt starts with (on a net with attention, at or
+//     below the common prefix with CachedTokens): TruncateTo it, restore the
+//     recurrent state it holds, and prefill from there; with none, a full
+//     reset.
 // NoCacheReuse disables both: full reset, whole prompt re-prefilled.
 function TChatEngine.GenerateFromIds(const PromptIds: TNeuralIntegerArray;
   const GenOpt: TChatOptions): string;
@@ -2138,6 +2156,9 @@ var
   CacheReuse: boolean;
   StateReuse: boolean;         // the checkpoint route: resume AND capture
   ResumeChk: TNNetDecoderStateCheckpoint; // the checkpoint this call resumes
+  ResumeSlot: integer;         // its slot, -1 when none
+  CaptureHash: UInt64;         // TokenPrefixHash of Tokens[0..CaptureHashPos-1]
+  CaptureHashPos: integer;
   GreedyFast: boolean;
   Tokens: TNeuralIntegerArray;
   Generated: TNeuralIntegerArray;
@@ -2176,6 +2197,22 @@ var
     Result := (NowMark - PhaseMark) * MSecsPerDay;
     PhaseMark := NowMark;
   end;
+  // Captures ASession's state at FedPos, advancing CaptureHash to it; the
+  // captures of one call come at increasing positions.
+  procedure CaptureAt(ASession: TNNetStreamingDecoder; FedPos: integer);
+  begin
+    {$IFDEF Debug}
+    Assert(FedPos >= CaptureHashPos,
+      'TChatEngine: a checkpoint capture behind the previous one');
+    {$ENDIF}
+    while CaptureHashPos < FedPos do
+    begin
+      CaptureHash := FoldTokenIntoPrefixHash(CaptureHash,
+        Tokens[CaptureHashPos]);
+      Inc(CaptureHashPos);
+    end;
+    CaptureCheckpoint(ASession, Tokens, FedPos, CaptureHash);
+  end;
   // Up to WindowCount whole windows of Tokens from Cnt on through WSession
   // (the active one), never padded. A window that would overflow the cache is
   // never fed: the fused attention layer only prints on overflow and then
@@ -2202,13 +2239,14 @@ var
       WSession.StepForwardToHidden(WIn, Cnt);
       Inc(Cnt, WLen);
       Inc(Fed);
-      if StateReuse and CheckpointOnTwins then CaptureCheckpoint(WSession, Cnt);
+      if StateReuse and CheckpointOnTwins then CaptureAt(WSession, Cnt);
     end;
   end;
 begin
   Result := '';
   if not Loaded then
     raise Exception.Create('TChatEngine.GenerateFromIds before LoadModel');
+  Inc(CurrentTurn);
   ContextFull := false;
   LastPromptTokens := Length(PromptIds);
   LastCompletionTokens := 0;
@@ -2242,6 +2280,9 @@ begin
   StateReuse := StateReuseOK and not GenOpt.NoCacheReuse and
     (Length(Checkpoints) > 0);
   ResumeChk := nil;
+  ResumeSlot := -1;
+  CaptureHash := csTokenPrefixHashSeed;
+  CaptureHashPos := 0;
   // Distribution pipeline (TGenerationConfig order: penalty -> temperature
   // -> sampler).
   Chain := TNNetLogitsProcessorChain.Create();
@@ -2329,25 +2370,28 @@ begin
     // (StepForwardToHidden): the vocab projection runs only in the decode
     // steps.
     LastCachedTokens := Length(CachedTokens);
-    LastPrefixTokens := CommonPrefixLen(CachedTokens, PromptIds);
-    Reused := LastPrefixTokens;
-    if Reused > Len - 1 then Reused := Len - 1;
     if StateReuse then
     begin
       // Checkpoint resume: a checkpoint holds the recurrent state at exactly
-      // its position, so the deepest one at or below the shared prefix is
-      // resumed and the tokens from there on are prefilled. Every checkpoint
-      // past that position describes a sequence the cache will no longer
-      // hold.
-      ResumeChk := DeepestCheckpointAtOrBelow(Reused);
-      if Assigned(ResumeChk) then Reused := ResumeChk.Position
+      // its position, so the deepest resumable one whose ids the prompt
+      // starts with is resumed and the tokens from there on are prefilled.
+      // Checkpoints of other sequences stay in the store.
+      MatchPromptAgainstCache(PromptIds, LastPrefixTokens, ResumeSlot);
+      if ResumeSlot >= 0 then
+      begin
+        ResumeChk := Checkpoints[ResumeSlot];
+        Reused := ResumeChk.Position;
+        CaptureHash := CheckpointInfo[ResumeSlot].PrefixHash;
+        CaptureHashPos := Reused;
+      end
       else Reused := 0;
-      DropCheckpointsAbove(Reused);
     end
-    else if not CacheReuse then
+    else
     begin
-      Reused := 0;
-      DropCheckpointsAbove(0); // a full reset leaves nothing to resume from
+      LastPrefixTokens := CommonPrefixLen(CachedTokens, PromptIds);
+      Reused := LastPrefixTokens;
+      if Reused > Len - 1 then Reused := Len - 1;
+      if not CacheReuse then Reused := 0;
     end;
     PrefillTokens := LenM2 + 1 - Reused;
     LastReusedTokens := Reused;
@@ -2404,7 +2448,7 @@ begin
     // exactly PromptIds[0..Len-2], a prefix of what CachedTokens will list
     // after the decode loop, so the prefix test above stays truthful for
     // it. The time counts toward TTFT (--stats prefill excludes it).
-    if StateReuse then CaptureCheckpoint(Session, Cnt);
+    if StateReuse then CaptureAt(Session, Cnt);
     SingleSteps := PrefillTokens - LastPrefillWindows * WindowLen -
       LastPrefillTailWindows * TailLen;
     // --profile: the prefill's own layer-class report, one table per net
@@ -2578,9 +2622,8 @@ begin
     // End-of-reply checkpoint for the next call's resume. Taken HERE, after
     // the decode loop, so the session holds exactly the tokens CachedTokens
     // lists (positions 0..Len-2) - the two must agree or the prefix test
-    // above would validate a boundary the session is not actually at. Its
-    // retention pass is the end-of-request one.
-    if StateReuse then CaptureCheckpoint(Session, Len - 1);
+    // above would validate a boundary the session is not actually at.
+    if StateReuse then CaptureAt(Session, Len - 1);
     // Lifetime usage totals, kept whether or not --stats prints them.
     // Input time is the prefill; output time runs from the end of prefill
     // to the end of decode (it includes the first decode step).
@@ -2600,7 +2643,8 @@ begin
     // prompt N (reused K, prefix P of C cached): K tokens were resumed from
     // the cache or a checkpoint; P is where the prompt's ids diverged from
     // the C cached ids, so a small K next to a large P names a divergence
-    // the checkpoints did not cover.
+    // the checkpoints did not cover. K can exceed P on a pure recurrent net,
+    // whose checkpoints resume past the ids it shares with the cache.
     if GenOpt.Stats and (Produced > 0) then
     begin
       Write(StdErr, Format('[stats] input: prompt %d tokens (reused %d,' +
@@ -2660,8 +2704,6 @@ begin
   end;
   except
     SetLength(CachedTokens, 0);
-    DropCheckpointsAbove(0); // captured at positions the sequence
-                             // CachedTokens no longer vouches for
     Session.Reset();
     if Assigned(WindowSession) then WindowSession.Reset();
     if Assigned(TailSession) then TailSession.Reset();

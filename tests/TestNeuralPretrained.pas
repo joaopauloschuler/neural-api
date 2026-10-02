@@ -117,6 +117,12 @@ type
     // Reply, completion count and cached ids equal.
     procedure AssertSameChatTurn(const Expected, Actual: TChatTurnRecord;
       const What: string);
+    // The slot of Engine's checkpoint at Position tagged with the hash and
+    // guard of Tokens[0..Position-1]; -1 when none is held.
+    function ChatCheckpointSlotOf(Engine: TChatEngine;
+      const Tokens: TNeuralIntegerArray; Position: integer): integer;
+    // Prompts A, B (sharing A's first ids), A on the tiny_<Stem> chat net.
+    procedure RunChatCheckpointConversationSwitch(const Stem: string);
     {$IFDEF OpenCL}
     // First OpenCL platform/device on the box; false when there is none, which
     // every caller reports as a SKIP.
@@ -419,6 +425,8 @@ type
     procedure TestQwen35ChatCheckpointInt8KV;
     procedure TestQwen35ChatCheckpointOpenCL;
     procedure TestQwen35ChatCheckpointRetention;
+    procedure TestChatCheckpointConversationSwitch;
+    procedure TestMambaChatCheckpointEvictsUnresumedMatch;
     procedure TestQwen35ChatCheckpointFlagErrors;
     procedure TestQwen35ChatPrefillTailWindowErrors;
     procedure TestQwen35BorrowedTwinBuild;
@@ -11761,6 +11769,20 @@ begin
       Expected.Cached[Pos], Actual.Cached[Pos]);
 end;
 
+function TTestNeuralPretrained.ChatCheckpointSlotOf(Engine: TChatEngine;
+  const Tokens: TNeuralIntegerArray; Position: integer): integer;
+var
+  SlotPos: integer;
+begin
+  Result := -1;
+  for SlotPos := 0 to High(Engine.Checkpoints) do
+    if (Engine.Checkpoints[SlotPos].Position = Position) and
+      (Engine.CheckpointInfo[SlotPos].PrefixHash =
+       TokenPrefixHash(Tokens, Position)) and
+      TokenPrefixGuardMatches(Engine.CheckpointInfo[SlotPos].Guard, Tokens,
+        Position) then exit(SlotPos);
+end;
+
 // Engine-level parity of the prefill ladder (Phase 5 step C) on the
 // tiny_qwen3_5 hybrid: --prefill-window 6 --prefill-tail-window 2 against
 // the token-by-token prefill over two greedy turns. Turn 1 feeds 9 tokens:
@@ -12027,14 +12049,12 @@ var
     Turn.Cached := Copy(Engine.CachedTokens);
     AssertTrue(Tag + 'the width-1 session holds the state after a turn',
       Engine.ActiveSession = Engine.Session);
-    // The store never claims a position past the cached sequence, and the
-    // two turn-boundary checkpoints are always held.
-    AssertEquals(Tag + 'no checkpoint past the cached sequence',
-      Length(Turn.Cached), DeepestHeldAtOrBelow(Engine, Ctx));
+    // The two turn-boundary checkpoints are held, tagged with the ids they
+    // were captured on.
     AssertTrue(Tag + 'end-of-prompt checkpoint held',
-      HoldsPosition(Engine, Length(Prompt) - 1));
+      ChatCheckpointSlotOf(Engine, Prompt, Length(Prompt) - 1) >= 0);
     AssertTrue(Tag + 'end-of-reply checkpoint held',
-      HoldsPosition(Engine, Length(Turn.Cached)));
+      ChatCheckpointSlotOf(Engine, Turn.Cached, Length(Turn.Cached)) >= 0);
   end;
 
   procedure AssertOnDevice(Engine: TChatEngine; const What: string);
@@ -12223,13 +12243,15 @@ begin
   {$ENDIF}
 end;
 
-// The retention rule on a store of 3 slots with the 6/2 ladder (band width
-// 2, the finest capture spacing): after each turn the engine's held
-// positions must equal those of a simulation of the band rule over the same
+// The retention rule on a store of 3 slots with the 6/2 ladder: after each
+// turn the engine's held checkpoints (position and last-used turn) must equal
+// those of a simulation of the least-recently-used rule over the same
 // capture sequence (every window end, the tail window ends, the end of the
-// prompt, the end of the reply), the two turn-boundary checkpoints are
-// always held, and the second turn, which resumes inside the first prompt,
-// reuses the slots: same slot count, same bytes. Coded by Claude (AI).
+// prompt, the end of the reply). Turn 2 diverges inside prompt 1, so it
+// resumes the turn-1 checkpoint at the divergence (it covers only shared
+// ids), marks only that one used, and frees turn-1 checkpoints only when a
+// capture needs the slot; the slots are reused (same count, same bytes).
+// Coded by Claude (AI).
 procedure TTestNeuralPretrained.TestQwen35ChatCheckpointRetention;
 const
   Ctx = 40;
@@ -12241,12 +12263,18 @@ const
   DivPos = 28;    // turn 2 changes this id of prompt 1
   ExtraLen = 5;
   MaxNew = 3;
+  MaxSlotPos = StoreSize - 1;
+  MaxPrompt1Pos = Prompt1Len - 1;
+  MaxExtraPos = ExtraLen - 1;
 var
   Dir: string;
   Engine: TChatEngine;
   Prompt: TNeuralIntegerArray;
   Turn: TChatTurnRecord;
-  Sim: array[0..StoreSize - 1] of integer; // the simulation's positions
+  // The simulation's store: a checkpoint's identity is its position plus,
+  // past DivPos, the turn whose ids it covers (both prompts share the ids
+  // before DivPos).
+  SimKey, SimPos, SimUsed: array[0..MaxSlotPos] of integer;
   BytesBefore: int64;
   Pos: integer;
 
@@ -12259,74 +12287,68 @@ var
       Result := Result + Engine.Checkpoints[SlotPos].Bytes();
   end;
 
-  // The band rule as section 7.3 states it: drop what the sequence no longer
-  // vouches for, keep the deepest held checkpoint per band of distance from
-  // the capture about to land, evict the farthest one when every slot is
-  // taken, then insert.
-  procedure SimCapture(Position: integer);
-  var
-    SlotPos, OtherPos, Live, Farthest, Distance: integer;
-    Dropped: boolean;
+  function KeyOf(Position, TurnNo: integer): integer;
   begin
-    for SlotPos := 0 to StoreSize - 1 do
-      if Sim[SlotPos] = Position then exit;
-    for SlotPos := 0 to StoreSize - 1 do
-      if Sim[SlotPos] > Position then Sim[SlotPos] := 0;
-    for SlotPos := 0 to StoreSize - 1 do
-    begin
-      if Sim[SlotPos] <= 0 then continue;
-      Distance := Position - Sim[SlotPos];
-      Dropped := false;
-      for OtherPos := 0 to StoreSize - 1 do
-        if (OtherPos <> SlotPos) and (Sim[OtherPos] > Sim[SlotPos]) and
-          (Engine.CheckpointBand(Position - Sim[OtherPos]) =
-           Engine.CheckpointBand(Distance)) then Dropped := true;
-      if Dropped then Sim[SlotPos] := 0;
-    end;
-    Live := 0;
-    for SlotPos := 0 to StoreSize - 1 do
-      if Sim[SlotPos] > 0 then Inc(Live);
-    if Live >= StoreSize then
-    begin
-      Farthest := -1;
-      for SlotPos := 0 to StoreSize - 1 do
-        if (Sim[SlotPos] > 0) and
-          ((Farthest < 0) or (Sim[SlotPos] < Sim[Farthest])) then
-          Farthest := SlotPos;
-      Sim[Farthest] := 0;
-    end;
-    for SlotPos := 0 to StoreSize - 1 do
-      if Sim[SlotPos] <= 0 then
-      begin
-        Sim[SlotPos] := Position;
-        exit;
-      end;
-    Fail('simulation: no free slot');
+    if Position <= DivPos then Result := Position
+    else Result := Position + 1000 * TurnNo;
   end;
 
-  // Replays the ladder's capture sequence for a prefill from Reused to the
-  // end of a Len-id prompt, then the reply end.
-  procedure SimTurn(Reused, Len, ReplyEnd: integer);
+  // Held: mark used. Else a free slot, else free the least recently used
+  // (the shallowest on a tie), then insert.
+  procedure SimCapture(Position, TurnNo: integer);
   var
-    Fed, Windows, Tails, WindowPos: integer;
+    SlotPos, Victim: integer;
   begin
-    for WindowPos := 0 to StoreSize - 1 do
-      if Sim[WindowPos] > Reused then Sim[WindowPos] := 0;
+    for SlotPos := 0 to MaxSlotPos do
+      if (SimPos[SlotPos] > 0) and (SimKey[SlotPos] = KeyOf(Position, TurnNo))
+        then
+      begin
+        SimUsed[SlotPos] := TurnNo;
+        exit;
+      end;
+    Victim := -1;
+    for SlotPos := 0 to MaxSlotPos do
+      if SimPos[SlotPos] <= 0 then
+      begin
+        Victim := SlotPos;
+        break;
+      end;
+    if Victim < 0 then
+      for SlotPos := 0 to MaxSlotPos do
+        if (Victim < 0) or (SimUsed[SlotPos] < SimUsed[Victim]) or
+          ((SimUsed[SlotPos] = SimUsed[Victim]) and
+           (SimPos[SlotPos] < SimPos[Victim])) then Victim := SlotPos;
+    SimKey[Victim] := KeyOf(Position, TurnNo);
+    SimPos[Victim] := Position;
+    SimUsed[Victim] := TurnNo;
+  end;
+
+  // Marks the checkpoint resumed at Reused used (the only one a prompt
+  // refreshes), then replays the ladder's captures and the reply end.
+  procedure SimTurn(TurnNo, Reused, Len, ReplyEnd: integer);
+  var
+    SlotPos, Fed, Windows, Tails, WindowPos: integer;
+  begin
+    if Reused > 0 then
+      for SlotPos := 0 to MaxSlotPos do
+        if (SimPos[SlotPos] = Reused) and
+          (SimKey[SlotPos] = KeyOf(Reused, TurnNo)) then
+          SimUsed[SlotPos] := TurnNo;
     Fed := Reused;
     Windows := (Len - 1 - Reused) div WindowLen;
     for WindowPos := 1 to Windows do
     begin
       Inc(Fed, WindowLen);
-      SimCapture(Fed);
+      SimCapture(Fed, TurnNo);
     end;
     Tails := (Len - 1 - Fed) div TailLen;
     for WindowPos := 1 to Tails do
     begin
       Inc(Fed, TailLen);
-      SimCapture(Fed);
+      SimCapture(Fed, TurnNo);
     end;
-    SimCapture(Len - 1);
-    SimCapture(ReplyEnd);
+    SimCapture(Len - 1, TurnNo);
+    SimCapture(ReplyEnd, TurnNo);
   end;
 
   procedure AssertStoreMatchesSimulation(const What: string);
@@ -12334,24 +12356,30 @@ var
     SlotPos, OtherPos, Found: integer;
   begin
     AssertEquals(What + ': slot count', StoreSize, Length(Engine.Checkpoints));
-    for SlotPos := 0 to StoreSize - 1 do
+    for SlotPos := 0 to MaxSlotPos do
     begin
-      if Sim[SlotPos] <= 0 then continue;
+      if SimPos[SlotPos] <= 0 then continue;
       Found := 0;
-      for OtherPos := 0 to StoreSize - 1 do
-        if Engine.Checkpoints[OtherPos].Position = Sim[SlotPos] then Inc(Found);
-      AssertEquals(What + ': simulated position ' + IntToStr(Sim[SlotPos]) +
-        ' held once', 1, Found);
+      for OtherPos := 0 to MaxSlotPos do
+        if (Engine.Checkpoints[OtherPos].Position = SimPos[SlotPos]) and
+          (Engine.CheckpointInfo[OtherPos].LastUsedTurn = SimUsed[SlotPos]) then
+          Inc(Found);
+      AssertEquals(What + ': simulated position ' + IntToStr(SimPos[SlotPos]) +
+        ' last used in turn ' + IntToStr(SimUsed[SlotPos]) + ' held once', 1,
+        Found);
     end;
-    for SlotPos := 0 to StoreSize - 1 do
+    for SlotPos := 0 to MaxSlotPos do
     begin
       if Engine.Checkpoints[SlotPos].Position <= 0 then continue;
       Found := 0;
-      for OtherPos := 0 to StoreSize - 1 do
-        if Sim[OtherPos] = Engine.Checkpoints[SlotPos].Position then Inc(Found);
+      for OtherPos := 0 to MaxSlotPos do
+        if (SimPos[OtherPos] = Engine.Checkpoints[SlotPos].Position) and
+          (SimUsed[OtherPos] = Engine.CheckpointInfo[SlotPos].LastUsedTurn) then
+          Inc(Found);
       AssertEquals(What + ': held position ' +
-        IntToStr(Engine.Checkpoints[SlotPos].Position) + ' simulated', 1,
-        Found);
+        IntToStr(Engine.Checkpoints[SlotPos].Position) + ' last used in turn ' +
+        IntToStr(Engine.CheckpointInfo[SlotPos].LastUsedTurn) + ' simulated',
+        1, Found);
     end;
   end;
 
@@ -12386,23 +12414,13 @@ begin
     LoadedOK := Engine.LoadModel(Opt, ErrorMsg);
     AssertTrue('LoadModel: ' + ErrorMsg, LoadedOK);
     AssertEquals('store of 3', StoreSize, Length(Engine.Checkpoints));
-    AssertEquals('band width is the tail window', TailLen,
-      Engine.CheckpointBandWidth);
-    AssertEquals('band ratio (Ctx / W)^(1 / N)',
-      Power(Ctx / TailLen, 1 / StoreSize), Engine.CheckpointBandRatio, 1e-9);
-    // The bands as the rule states them, at this ratio (about 2.71):
-    // [2, 5.4), [5.4, 14.7), [14.7, 40).
-    AssertEquals('below W is band 0', 0, Engine.CheckpointBand(1));
-    AssertEquals('W is band 0', 0, Engine.CheckpointBand(2));
-    AssertEquals('5 is band 0', 0, Engine.CheckpointBand(5));
-    AssertEquals('6 is band 1', 1, Engine.CheckpointBand(6));
-    AssertEquals('14 is band 1', 1, Engine.CheckpointBand(14));
-    AssertEquals('15 is band 2', 2, Engine.CheckpointBand(15));
-    AssertEquals('past the context is the last band', StoreSize - 1,
-      Engine.CheckpointBand(Ctx * 2));
-    for Pos := 0 to StoreSize - 1 do
+    AssertEquals('one info record per slot', StoreSize,
+      Length(Engine.CheckpointInfo));
+    for Pos := 0 to MaxSlotPos do
     begin
-      Sim[Pos] := 0;
+      SimKey[Pos] := 0;
+      SimPos[Pos] := 0;
+      SimUsed[Pos] := 0;
       AssertEquals('slot ' + IntToStr(Pos) + ' starts free', 0,
         Engine.Checkpoints[Pos].Position);
     end;
@@ -12410,30 +12428,241 @@ begin
     AssertTrue('the slots hold state bytes at load', BytesBefore > 0);
 
     SetLength(Prompt, Prompt1Len);
-    for Pos := 0 to Prompt1Len - 1 do Prompt[Pos] := (5 * Pos + 2) mod Vocab;
+    for Pos := 0 to MaxPrompt1Pos do Prompt[Pos] := (5 * Pos + 2) mod Vocab;
     RunTurn();
     AssertTrue('turn 1 produced tokens', Turn.Completion > 0);
     AssertEquals('turn 1 windows', (Prompt1Len - 1) div WindowLen,
       Engine.LastPrefillWindows);
-    SimTurn(0, Prompt1Len, Length(Turn.Cached));
+    AssertEquals('turn 1 is turn 1', 1, Engine.CurrentTurn);
+    SimTurn(1, 0, Prompt1Len, Length(Turn.Cached));
     AssertStoreMatchesSimulation('after turn 1');
     AssertEquals('turn 1 kept the slot bytes', BytesBefore, StoreBytes());
 
-    // Turn 2 diverges at DivPos: the deepest checkpoint at or below it is
-    // resumed and the ones past it are dropped before the new captures.
+    // Turn 2 diverges at DivPos: the turn-1 checkpoint AT DivPos covers only
+    // the shared ids, so it is resumed; the deeper turn-1 ones are not
+    // matched and stay until a capture needs their slot.
     SetLength(Prompt, Prompt1Len + ExtraLen);
-    for Pos := 0 to Prompt1Len - 1 do Prompt[Pos] := (5 * Pos + 2) mod Vocab;
+    for Pos := 0 to MaxPrompt1Pos do Prompt[Pos] := (5 * Pos + 2) mod Vocab;
     Prompt[DivPos] := (Prompt[DivPos] + 1) mod Vocab;
-    for Pos := 0 to ExtraLen - 1 do
+    for Pos := 0 to MaxExtraPos do
       Prompt[Prompt1Len + Pos] := (7 * Pos + 3) mod Vocab;
     RunTurn();
     AssertEquals('turn 2 prefix', DivPos, Engine.LastPrefixTokens);
-    AssertTrue('turn 2 resumed a checkpoint', Engine.LastReusedTokens > 0);
-    AssertTrue('turn 2 resumed at or below the divergence',
-      Engine.LastReusedTokens <= DivPos);
-    SimTurn(Engine.LastReusedTokens, Length(Prompt), Length(Turn.Cached));
+    AssertEquals('turn 2 resumed the checkpoint at the divergence', DivPos,
+      Engine.LastReusedTokens);
+    SimTurn(2, Engine.LastReusedTokens, Length(Prompt), Length(Turn.Cached));
     AssertStoreMatchesSimulation('after turn 2');
     AssertEquals('turn 2 kept the slot bytes', BytesBefore, StoreBytes());
+  finally
+    Args.Free;
+    Engine.Free;
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+// Two conversations taking turns: prompt A, then B (sharing A's first
+// SharedLen ids, so the live cache diverges at SharedLen), then A again. B
+// must leave A's checkpoints held. A checkpoint holds no attention K/V, so on
+// the hybrid (attention in the live cache, which now holds B) A cannot resume
+// past SharedLen and re-prefills (re-capturing its end-of-prompt
+// checkpoint), while the pure recurrent net resumes A's end-of-prompt
+// checkpoint and prefills nothing (which checkpoints a resume refreshes:
+// TestMambaChatCheckpointEvictsUnresumedMatch). Either way the second A reply equals the first.
+// Coded by Claude (AI).
+procedure TTestNeuralPretrained.RunChatCheckpointConversationSwitch(
+  const Stem: string);
+const
+  Ctx = 24;
+  Vocab = 13;
+  ALen = 10;
+  BLen = 12;
+  SharedLen = 4;
+  MaxAPos = ALen - 1;
+  MaxBPos = BLen - 1;
+var
+  Dir, Tag, ErrorMsg: string;
+  Engine: TChatEngine;
+  Args: TStringList;
+  Opt: TChatOptions;
+  PromptA, PromptB: TNeuralIntegerArray;
+  TurnA1, TurnB, TurnA3: TChatTurnRecord;
+  SlotA, SlotAReply, TokenPos: integer;
+  PureRecurrent, ParsedOK, LoadedOK: boolean;
+
+  procedure RunTurn(const Prompt: TNeuralIntegerArray;
+    var Turn: TChatTurnRecord);
+  begin
+    Turn.Reply := Engine.GenerateFromIds(Prompt, Engine.Opt);
+    Turn.Completion := Engine.LastCompletionTokens;
+    Turn.Cached := Copy(Engine.CachedTokens);
+  end;
+
+begin
+  Tag := Stem + ': ';
+  RandSeed := 484848;
+  SetLength(PromptA, ALen);
+  for TokenPos := 0 to MaxAPos do
+    PromptA[TokenPos] := (5 * TokenPos + 2) mod Vocab;
+  SetLength(PromptB, BLen);
+  for TokenPos := 0 to MaxBPos do
+    if TokenPos < SharedLen then PromptB[TokenPos] := PromptA[TokenPos]
+    else PromptB[TokenPos] := (7 * TokenPos + 3) mod Vocab;
+  AssertTrue(Tag + 'B diverges from A at SharedLen',
+    PromptB[SharedLen] <> PromptA[SharedLen]);
+  Dir := MakeChatModelDir(Stem);
+  Engine := TChatEngine.Create();
+  Args := TStringList.Create();
+  try
+    Args.Add(Dir);
+    Args.Add('--greedy'); Args.Add('--fp32'); Args.Add('--cpu');
+    Args.Add('--serial');
+    Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
+    Args.Add('--max-new-tokens'); Args.Add('2');
+    ParsedOK := ParseArgs(Args, Opt);
+    AssertTrue(Tag + 'chat options parse: ' + Opt.ErrorMsg, ParsedOK);
+    LoadedOK := Engine.LoadModel(Opt, ErrorMsg);
+    AssertTrue(Tag + 'LoadModel: ' + ErrorMsg, LoadedOK);
+    AssertTrue(Tag + 'checkpoint route', Engine.StateReuseOK);
+    PureRecurrent := Engine.Session.SDPACount = 0;
+
+    RunTurn(PromptA, TurnA1);
+    AssertTrue(Tag + 'A produced tokens', TurnA1.Completion > 0);
+    AssertEquals(Tag + 'A reused nothing', 0, Engine.LastReusedTokens);
+
+    RunTurn(PromptB, TurnB);
+    AssertEquals(Tag + 'B shares SharedLen ids with the live cache', SharedLen,
+      Engine.LastPrefixTokens);
+    AssertEquals(Tag + 'no checkpoint covers only B''s ids yet', 0,
+      Engine.LastReusedTokens);
+    SlotA := ChatCheckpointSlotOf(Engine, PromptA, ALen - 1);
+    SlotAReply := ChatCheckpointSlotOf(Engine, TurnA1.Cached,
+      Length(TurnA1.Cached));
+    AssertTrue(Tag + 'B left A''s end-of-prompt checkpoint held', SlotA >= 0);
+    AssertTrue(Tag + 'B left A''s end-of-reply checkpoint held',
+      SlotAReply >= 0);
+    AssertEquals(Tag + 'B did not mark A''s checkpoint used', 1,
+      Engine.CheckpointInfo[SlotA].LastUsedTurn);
+
+    RunTurn(PromptA, TurnA3);
+    AssertEquals(Tag + 'A again shares SharedLen ids with the live cache (B)',
+      SharedLen, Engine.LastPrefixTokens);
+    if PureRecurrent then
+    begin
+      AssertEquals(Tag + 'pure recurrent: A resumed its end-of-prompt' +
+        ' checkpoint', ALen - 1, Engine.LastReusedTokens);
+      AssertEquals(Tag + 'the resumed checkpoint is marked used', 3,
+        Engine.CheckpointInfo[SlotA].LastUsedTurn);
+    end
+    else
+    begin
+      AssertEquals(Tag + 'attention in the live cache: A cannot resume past' +
+        ' the shared ids', 0, Engine.LastReusedTokens);
+      // The full re-prefill passes A's end-of-prompt position again and
+      // re-captures that checkpoint, which marks it used.
+      AssertEquals(Tag + 'the re-prefill re-captured A''s end-of-prompt' +
+        ' checkpoint', 3, Engine.CheckpointInfo[SlotA].LastUsedTurn);
+    end;
+    AssertSameChatTurn(TurnA1, TurnA3, Tag + 'A again vs A');
+  finally
+    Args.Free;
+    Engine.Free;
+    RemoveChatModelDir(Dir);
+  end;
+end;
+
+procedure TTestNeuralPretrained.TestChatCheckpointConversationSwitch;
+begin
+  RunChatCheckpointConversationSwitch('qwen3_5');
+  RunChatCheckpointConversationSwitch('mamba');
+end;
+
+// Only the resumed checkpoint is refreshed (pure recurrent tiny_mamba, a
+// store of 4, captures at the end of the prompt and of the reply). Turn 1 A
+// fills two slots, turn 2 B (unrelated) the other two. Turn 3 extends A's
+// reply: it matches A's end-of-prompt AND end-of-reply checkpoints but
+// resumes only the deeper one, so A's end-of-prompt keeps turn 1 and is the
+// first evicted, before B's turn-2 checkpoints. Coded by Claude (AI).
+procedure TTestNeuralPretrained.TestMambaChatCheckpointEvictsUnresumedMatch;
+const
+  Ctx = 24;
+  Vocab = 13;
+  ALen = 6;
+  BLen = 6;
+  ExtraLen = 3;
+  MaxAPos = ALen - 1;
+  MaxBPos = BLen - 1;
+  MaxExtraPos = ExtraLen - 1;
+var
+  Dir, ErrorMsg: string;
+  Engine: TChatEngine;
+  Args: TStringList;
+  Opt: TChatOptions;
+  PromptA, PromptB, PromptA3: TNeuralIntegerArray;
+  TurnA, TurnB, TurnA3: TChatTurnRecord;
+  SlotAPrompt, SlotAReply, SlotBReply, TokenPos: integer;
+  ParsedOK, LoadedOK: boolean;
+
+  procedure RunTurn(const Prompt: TNeuralIntegerArray;
+    var Turn: TChatTurnRecord);
+  begin
+    Turn.Reply := Engine.GenerateFromIds(Prompt, Engine.Opt);
+    Turn.Completion := Engine.LastCompletionTokens;
+    Turn.Cached := Copy(Engine.CachedTokens);
+  end;
+
+begin
+  RandSeed := 494949;
+  SetLength(PromptA, ALen);
+  for TokenPos := 0 to MaxAPos do
+    PromptA[TokenPos] := (5 * TokenPos + 2) mod Vocab;
+  SetLength(PromptB, BLen);
+  for TokenPos := 0 to MaxBPos do
+    PromptB[TokenPos] := (7 * TokenPos + 3) mod Vocab;
+  AssertTrue('B differs from A at its first id', PromptB[0] <> PromptA[0]);
+  Dir := MakeChatModelDir('mamba');
+  Engine := TChatEngine.Create();
+  Args := TStringList.Create();
+  try
+    Args.Add(Dir);
+    Args.Add('--greedy'); Args.Add('--fp32'); Args.Add('--cpu');
+    Args.Add('--serial');
+    Args.Add('--ctx'); Args.Add(IntToStr(Ctx));
+    Args.Add('--max-new-tokens'); Args.Add('2');
+    Args.Add('--cache-checkpoints'); Args.Add('4');
+    ParsedOK := ParseArgs(Args, Opt);
+    AssertTrue('chat options parse: ' + Opt.ErrorMsg, ParsedOK);
+    LoadedOK := Engine.LoadModel(Opt, ErrorMsg);
+    AssertTrue('LoadModel: ' + ErrorMsg, LoadedOK);
+    AssertEquals('pure recurrent', 0, Engine.Session.SDPACount);
+    AssertEquals('store of 4', 4, Length(Engine.Checkpoints));
+
+    RunTurn(PromptA, TurnA);
+    RunTurn(PromptB, TurnB);
+    AssertEquals('B resumed nothing', 0, Engine.LastReusedTokens);
+    SetLength(PromptA3, Length(TurnA.Cached) + ExtraLen);
+    Move(TurnA.Cached[0], PromptA3[0], Length(TurnA.Cached) * csIntegerSize);
+    for TokenPos := 0 to MaxExtraPos do
+      PromptA3[Length(TurnA.Cached) + TokenPos] := (3 * TokenPos + 1) mod Vocab;
+    SlotAPrompt := ChatCheckpointSlotOf(Engine, PromptA, ALen - 1);
+    AssertTrue('A''s end-of-prompt checkpoint held before turn 3',
+      SlotAPrompt >= 0);
+
+    RunTurn(PromptA3, TurnA3);
+    AssertEquals('turn 3 resumed A''s end-of-reply checkpoint',
+      Length(TurnA.Cached), Engine.LastReusedTokens);
+    SlotAReply := ChatCheckpointSlotOf(Engine, TurnA.Cached,
+      Length(TurnA.Cached));
+    AssertTrue('the resumed checkpoint is still held', SlotAReply >= 0);
+    AssertEquals('the resumed checkpoint is marked used', 3,
+      Engine.CheckpointInfo[SlotAReply].LastUsedTurn);
+    AssertEquals('a matching but shallower checkpoint was evicted first', -1,
+      ChatCheckpointSlotOf(Engine, PromptA, ALen - 1));
+    SlotBReply := ChatCheckpointSlotOf(Engine, TurnB.Cached,
+      Length(TurnB.Cached));
+    AssertTrue('B''s end-of-reply checkpoint (turn 2) outlived it',
+      SlotBReply >= 0);
+    AssertEquals('B''s end-of-reply checkpoint keeps turn 2', 2,
+      Engine.CheckpointInfo[SlotBReply].LastUsedTurn);
   finally
     Args.Free;
     Engine.Free;
@@ -12535,8 +12764,6 @@ begin
       AssertTrue('the ON notice', Pos('cache checkpoints ON', FNotices) > 0);
       AssertTrue('the ON notice says where the store lives',
         Pos('in host RAM', FNotices) > 0);
-      AssertEquals('band width without a twin: half the context', Ctx div 2,
-        Engine.CheckpointBandWidth);
       Engine.GenerateFromIds(Prompt, Engine.Opt);
       Engine.GenerateFromIds(Prompt, Engine.Opt);
       AssertEquals('re-sent prompt resumed at its end', PromptLen - 1,

@@ -212,7 +212,7 @@ rather than acted on.
         existing 64-bit mix first (coding guide #3). Tests: equal prefixes give
         equal hashes, a one-token change at any position changes it, the guard
         rejects a forced hash collision.
-  - [ ] T2. One eviction policy + hash matching for the cache checkpoints.
+  - [x] T2. One eviction policy + hash matching for the cache checkpoints.
         Per checkpoint slot: PrefixHash, the guard tokens and LastUsedTurn
         (engine-side records; one GenerateFromIds call = one turn). Replace
         CheckpointBand, RetainCheckpointsBefore and DropCheckpointsAbove with
@@ -221,8 +221,9 @@ rather than acted on.
         frees a checkpoint because the prompt diverged. Resume: ONE pass over the
         prompt computes the running hash, finds the deepest matching checkpoint
         and the live-cache common prefix together (no second CommonPrefixLen
-        pass). Every matching checkpoint is marked used this turn, so the
-        system-prompt checkpoint never ages out. CORRECTNESS: on a net with
+        pass). Only the checkpoint a request actually resumes from (and a new
+        capture) is marked used this turn; a matching checkpoint that is not
+        resumed keeps its old turn, so unused ones age out. CORRECTNESS: on a net with
         attention layers a checkpoint is resumable only when its Position <= the
         live-cache common prefix (its K/V rows must still be in the live cache);
         a pure recurrent net has no such limit. Tests: a growing single

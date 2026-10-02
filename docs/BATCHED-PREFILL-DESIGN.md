@@ -348,7 +348,9 @@ the layer's resident state buffer into the store's slot buffer, on the
 layer's own queue; on CPU it is `CaptureState` into the slot's host volume.
 Nothing is allocated per capture.
 
-**Resume.** `Reused := CommonPrefixLen(CachedTokens, PromptIds)`, capped at
+**Resume.** Superseded on 2026-10-02 (see Retention below): a checkpoint is
+now matched by its token-prefix hash, not by position alone.
+`Reused := CommonPrefixLen(CachedTokens, PromptIds)`, capped at
 `Len - 1` as today. Pick the checkpoint with the largest position `<=
 Reused`. If none, full reset. Else `Session.TruncateTo(Pos)`, restore the
 recurrent half into `Session` from the slot (device-to-device under `--gpu`),
@@ -357,7 +359,10 @@ snapshots (`TurnSnap`, `PromptSnap`, `TransferSnap` stays) and the 2 x 1.1 GB
 they hold go away; the end-of-reply and end-of-prompt captures are ordinary
 checkpoints at N >= 2.
 
-**Retention (which N to keep).** Let `E` be the current fed position and
+**Retention (which N to keep).** Superseded on 2026-10-02: the store now
+matches checkpoints by a token-prefix hash and frees the checkpoint unused
+for the most turns (`TChatEngine.DeleteTheLongestUnusedCheckpoint`); the
+band rule below is the original design. Let `E` be the current fed position and
 `d = E - Pos` a checkpoint's distance from it. Divergence is far more likely
 near the end of a prompt than near its start, so slots are spent
 geometrically: with window `W` and context `C`, band `k` covers distances
