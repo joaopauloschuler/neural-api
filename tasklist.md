@@ -2118,7 +2118,13 @@ rather than acted on.
           with the int8 kernel; FP32 Compute takes it when FNumBs >= 16 and
           FNumAs >= 64 (small-row GEMMs such as gram / attention P.V stay on
           `cai_dot_product`). GPU speed unmeasured.
-    - [ ] B2d. Padding-aware OpenCL im2col: bind the unpadded resident source.
+    - [x] B2d. Padding-aware OpenCL im2col: bind the unpadded resident source.
+          DONE: `cai_im2col` / `cai_im2col_h` take InSizeY and Padding and
+          write zeros for out-of-source taps; a padded conv binds a resident
+          source (no download + host pad + upload). Pico VAE: 26 of 40 3x3
+          convs move 0 bytes, 14 still read a host source until B2e (~22 of
+          ~39 GB per 1024x1024 decode removed, computed). OpenCL binaries must
+          be rebuilt with the new neural.cl (kernel arguments changed).
     - [ ] B2e. VAE residency gaps: Reshape alias, nearest-2x upsample kernel,
           DupUp gather/pixel shuffle bind+keep, SDPA output.
     - [ ] B2f. Later, for big tiles / untiled decode: implicit-GEMM conv (no

@@ -27051,7 +27051,8 @@ end;
 // 32/16 (four tile shapes, each net armed in the one context of EnableOpenCL),
 // then whole, serial (parallel + OpenCL is slow on PoCL; the pipeline test
 // covers it). Only the FP32 summation order differs (measured 3.6e-6, 3.9e-6);
-// tolerance 5e-5 = TestQwenImage21VaeDecoderParity's float32 budget.
+// tolerance 5e-5 = TestQwenImage21VaeDecoderParity's float32 budget. A 3x3
+// conv (all padded) with a resident source moves nothing host <-> OpenCL.
 procedure TTestNeuralPretrained.TestQwenImage21VaeDecoderOpenCL;
 {$IFDEF OpenCL}
 const
@@ -27064,6 +27065,7 @@ var
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
   LayerPos, ConvCount, ConvOnOpenCLCount: integer;
+  BoundSpatialConvCount, HostSourceSpatialConvCount: integer;
   Layer: TNNetLayer;
   MaxDiff: double;
 begin
@@ -27115,6 +27117,31 @@ begin
     AssertTrue('the decoder has convolutions', ConvCount > 0);
     AssertEquals('convolutions that ran on OpenCL', ConvCount,
       ConvOnOpenCLCount);
+    Decoder.Net.LayerProfiling := true;
+    Decoder.Net.ClearTime();
+    Decoder.Decode(Latent, Image);
+    BoundSpatialConvCount := 0;
+    HostSourceSpatialConvCount := 0;
+    for LayerPos := 0 to Decoder.Net.GetLastLayerIdx() do
+    begin
+      Layer := Decoder.Net.Layers[LayerPos];
+      if not ((Layer is TNNetConvolution) and
+        (TNNetConvolution(Layer).FeatureSizeX > 1)) then continue;
+      if not Layer.PrevLayer.OutputBindableOnOpenCL() then
+      begin
+        Inc(HostSourceSpatialConvCount);
+        continue;
+      end;
+      Inc(BoundSpatialConvCount);
+      AssertEquals('layer ' + IntToStr(LayerPos) + ' uploads', 0,
+        Layer.ProfiledTransfers.UploadCount);
+      AssertEquals('layer ' + IntToStr(LayerPos) + ' downloads', 0,
+        Layer.ProfiledTransfers.DownloadCount);
+    end;
+    WriteLn('  Qwen-Image-2.1 VAE 3x3 convs: ', BoundSpatialConvCount,
+      ' bind a resident source, ', HostSourceSpatialConvCount,
+      ' read a host source');
+    AssertTrue('3x3 convs bind a resident source', BoundSpatialConvCount > 0);
   finally
     Image.Free;
     WholeCPU.Free;

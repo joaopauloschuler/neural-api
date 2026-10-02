@@ -15080,8 +15080,11 @@ type
       // the B operand instead of uploading it. Pointwise only. Coded by Claude (AI).
       function ShouldBindPrevOutputOnOpenCL(): boolean;
       // True when it will bind that output as the cai_im2col gather source
-      // instead of uploading FInputCopy. Spatial, unpadded. Coded by Claude (AI).
+      // instead of uploading FInputCopy; cai_im2col pads. Coded by Claude (AI).
       function ShouldBindPrevOutputAsIm2ColSrc(): boolean;
+      // Gathers FInputPrepared on OpenCL from the bound source (cai_im2col pads
+      // it) or, when nil, from the host FInputCopy. Coded by Claude (AI).
+      procedure BuildIm2ColOnOpenCL(pIm2ColSrcBuffer: cl_mem);
       procedure ComputeOpenCL();
       // Int8 device forward: resident interleaved codes + per-row scales via
       // cai_dot_product_int8 (armed in EnableOpenCL); shares the fused
@@ -15135,10 +15138,9 @@ type
       // serial dispatch - ShouldUseInterleavedDotProduct is pass-stable.
       // Coded by Claude (AI).
       procedure ComputeRange(StartRange, FinRange: integer); override;
-      // Shared per-forward CPU input prologue (refresh error state, build the
-      // padded FInputCopy, size the im2col strides) used by both Compute() and
-      // PrepareChunkedForward() so the two never drift. Coded by Claude (AI).
-      procedure PrepareForwardPrologue();
+      // Input prologue of Compute and PrepareChunkedForward: builds the padded
+      // FInputCopy unless cai_im2col pads a bound source. Coded by Claude (AI).
+      procedure PrepareForwardPrologue(pIm2ColSrcOnOpenCL: boolean = false);
       // Builds FInputCopy + the im2col (FInputPreparedInt8 when the forward runs
       // int8 x int8) before this layer's chunks run - the input prep Compute()
       // would otherwise do, which the chunk path skips. Coded by Claude (AI).
@@ -106927,7 +106929,9 @@ end;
 {$IFDEF OpenCL}
 function TNNetConvolution.ShouldOpenCLIm2Col(): boolean;
 begin
+  // cai_im2col indexes the column matrix with int.
   Result := Assigned(FIm2ColKernel) and (not FPointwise) and (not FIsTrainable)
+    and (Int64(FOutputSizeX) * FOutputSizeY * FVectorSize <= High(longint))
     and WillOpenCL() and (not WinogradEligible());
 end;
 
@@ -106954,11 +106958,25 @@ end;
 
 // The spatial twin. Here the B operand is the column matrix, which cai_im2col
 // gathers on the device - so what binds is the GATHER's source, in place of the
-// FInputCopy upload. Padding must be zero: CopyPadding builds FInputCopy on the
-// host, which needs the source in host memory. Coded by Claude (AI).
+// FInputCopy upload. cai_im2col applies the padding, so the host CopyPadding is
+// skipped (PrepareForwardPrologue). Coded by Claude (AI).
 function TNNetConvolution.ShouldBindPrevOutputAsIm2ColSrc(): boolean;
 begin
-  Result := (FPadding = 0) and PrevOutputOnOpenCL() and ShouldOpenCLIm2Col();
+  Result := PrevOutputOnOpenCL() and ShouldOpenCLIm2Col();
+end;
+
+procedure TNNetConvolution.BuildIm2ColOnOpenCL(pIm2ColSrcBuffer: cl_mem);
+begin
+  if pIm2ColSrcBuffer <> nil then
+    FDotCL.BuildInputColsOnDevice(FIm2ColKernel, FPrevLayer.Output,
+      {OutSizeX}FOutput.SizeX, {ColDepth}FVectorSize,
+      {RowSpan}FPrevLayer.Output.Depth * FFeatureSizeX, {Stride}FStride,
+      {Padding}FPadding, {NewSrc}true, pIm2ColSrcBuffer)
+  else
+    FDotCL.BuildInputColsOnDevice(FIm2ColKernel, FInputCopy,
+      {OutSizeX}FOutput.SizeX, {ColDepth}FVectorSize,
+      {RowSpan}FInputCopy.Depth * FFeatureSizeX, {Stride}FStride,
+      {Padding}0, {NewSrc}true, nil);
 end;
 
 procedure TNNetConvolution.ComputeOpenCL();
@@ -107012,25 +107030,21 @@ begin
   if ActivationFunctionInOpenCL and (FSuppressBias = 0) then BiasVol := FBiasOutput else BiasVol := nil;
 
   // Device-side im2col: when armed (inference-only, non-pointwise, non-Winograd),
-  // the small padded input FInputCopy is uploaded and the cai_im2col kernel
+  // the small (padded) input FInputCopy is uploaded and the cai_im2col kernel
   // gathers the column matrix straight into FInputBufferBs on the device - the
   // host im2col (skipped in Compute) and the upload of the ~FeatureSize^2-larger
   // FInputPrepared are both eliminated. Compute then reads that already-resident B
   // operand (NewVBs = false). FInputCopy re-uploads every forward (the activation
   // input changes each pass), matching the host path's per-forward B upload. Both
   // kernels share one in-order queue, so the gather is ordered before the GEMM.
-  // Im2ColSrcBuffer replaces even that upload when the source is already there.
-  // Coded by Claude (AI).
+  // Im2ColSrcBuffer replaces even that upload when the source is already there
+  // (the source is unpadded; cai_im2col pads it). Coded by Claude (AI).
   OpenCLIm2Col := ShouldOpenCLIm2Col();
   // A borrowed buffer was produced on the source layer's queue, so block on that
   // queue first (a no-op when it is this layer's queue too).
   if (PrevOutputBuffer <> nil) or (Im2ColSrcBuffer <> nil) then
     FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDotCL.DotProductKernel);
-  if OpenCLIm2Col then
-    FDotCL.BuildInputColsOnDevice(FIm2ColKernel, FInputCopy,
-      {OutSizeX}FOutput.SizeX, {ColDepth}FVectorSize,
-      {RowSpan}FInputCopy.Depth * FFeatureSizeX, {InSizeX}FInputCopy.SizeX,
-      {InDepth}FInputCopy.Depth, {Stride}FStride, {NewSrc}true, Im2ColSrcBuffer);
+  if OpenCLIm2Col then BuildIm2ColOnOpenCL(Im2ColSrcBuffer);
 
   FDotCL.Compute(InputAVolume, FInputPrepared, ActOpcode, {NewVAs}WUpdated,
     {NewVBs}(not OpenCLIm2Col), BiasVol, {NewVBias}WUpdated, PrevOutputBuffer);
@@ -107078,11 +107092,7 @@ begin
   OpenCLIm2Col := ShouldOpenCLIm2Col();
   if (pPrevOutputBuffer <> nil) or (pIm2ColSrcBuffer <> nil) then
     FPrevLayer.OpenCLWaitOutputIfAnotherQueue(FDotCL.DotProductKernel);
-  if OpenCLIm2Col then
-    FDotCL.BuildInputColsOnDevice(FIm2ColKernel, FInputCopy,
-      {OutSizeX}FOutput.SizeX, {ColDepth}FVectorSize,
-      {RowSpan}FInputCopy.Depth * FFeatureSizeX, {InSizeX}FInputCopy.SizeX,
-      {InDepth}FInputCopy.Depth, {Stride}FStride, {NewSrc}true, pIm2ColSrcBuffer);
+  if OpenCLIm2Col then BuildIm2ColOnOpenCL(pIm2ColSrcBuffer);
 
   if FQuantInt4 then
     FDotCL.ComputeInt4(FInputPrepared, ActOpcode, {NewVBs}(not OpenCLIm2Col),
@@ -107989,7 +107999,7 @@ begin
 end;
 {$ENDIF}
 
-procedure TNNetConvolution.PrepareForwardPrologue();
+procedure TNNetConvolution.PrepareForwardPrologue(pIm2ColSrcOnOpenCL: boolean);
 begin
   // Shared per-forward CPU input prologue - the exact prep Compute() does before
   // dispatching the forward, factored out so the parallel chunk path
@@ -107997,9 +108007,11 @@ begin
   // im2col (PrepareInputForConvolutionFast): Compute()'s OpenCL branch skips it
   // when the device builds FInputPrepared, so the caller owns that step.
   RefreshCalculatePrevLayerError();
-  if FPadding > 0
-    then FInputCopy.CopyPadding(FPrevLayer.Output, FPadding)
-    else FInputCopy := FPrevLayer.Output;
+  // A bound source stays in OpenCL memory: its host Output is stale, and
+  // cai_im2col pads it, so FInputCopy is neither built nor read.
+  if FPadding = 0 then FInputCopy := FPrevLayer.Output
+  else if not pIm2ColSrcOnOpenCL then
+    FInputCopy.CopyPadding(FPrevLayer.Output, FPadding);
 
   if FSmoothErrorPropagation then
   begin
@@ -108012,7 +108024,7 @@ begin
     FInvLearnSmoothener := 1.0;
   end;
 
-  FSizeXDepth := FFeatureSizeX * FInputCopy.Depth;
+  FSizeXDepth := FFeatureSizeX * FPrevLayer.Output.Depth;
   FSizeXDepthBytes := FSizeXDepth * csNeuralFloatSize;
 
   RefreshPrevSizeXDepthBytes();
@@ -108087,6 +108099,7 @@ procedure TNNetConvolution.Compute();
   end;
 var
     StartTime: double;
+    Im2ColSrcOnOpenCL: boolean;
 begin
   if FNeurons.Count > 0 then
   begin
@@ -108095,18 +108108,20 @@ begin
     // answerable before the prologue - and together they decide whether the
     // previous output has to come back to RAM at all. ComputeOpenCL asks them
     // again and does the binding; the calls see the same state.
+    Im2ColSrcOnOpenCL := false;
     {$IFDEF OpenCL}
-    if not (ShouldBindPrevOutputOnOpenCL() or ShouldBindPrevOutputAsIm2ColSrc())
+    Im2ColSrcOnOpenCL := ShouldBindPrevOutputAsIm2ColSrc();
+    if not (ShouldBindPrevOutputOnOpenCL() or Im2ColSrcOnOpenCL)
       then FPrevLayer.ForceOutputOnRAM();
     {$ENDIF}
-    PrepareForwardPrologue();
+    PrepareForwardPrologue(Im2ColSrcOnOpenCL);
 
     //FInputPrepared.ReSize(FOutput.SizeX, FOutput.SizeY, FInputCopy.Depth * FFeatureSizeX * FFeatureSizeY);
     // When ComputeOpenCL will build FInputPrepared on the device (cai_im2col), the
     // host im2col gather is redundant - skip it. FInputPrepared keeps its
     // SetPrevLayer size (FOutputSizeX x FOutputSizeY x FVectorSize), which is what
     // FDotCL was prepared with, so its device buffer stays correctly sized. The
-    // gather reads FInputCopy (built above), so padding still happens on host.
+    // gather reads FInputCopy (built above) or the bound source.
     {$IFDEF OpenCL}
     // The int8 x int8 CPU forward reads FInputPreparedInt8 only, and its
     // backward pass is refused (FQuantInt8), so the FP32 im2col is dead work.

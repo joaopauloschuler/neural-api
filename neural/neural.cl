@@ -2072,72 +2072,78 @@ __kernel void cai_embedding_gather_int8
     FY[gid] = convert_float(FCodes[row * FEmbeddingSize + e]) * FScales[row];
 }
 
-// Device-side im2col: builds the convolution's FInputPrepared column matrix
-// straight into device memory, so only the small (padded) input crosses the bus
-// instead of the ~FeatureSizeX*FeatureSizeY-times-larger column matrix, and the
-// host im2col gather (PrepareInputForConvolutionFast) is skipped entirely. Pure
-// gather - every output element FCols[gid] is a copy of one FInput element, index
-// computed from the closed-form conv geometry. It is bit-faithful to the CPU
-// PrepareInputForConvolutionFast (same TVolume layout ((SizeX*y)+x)*Depth+d), so
-// the GEMM that follows reads an identical B operand. FInput is the ALREADY
-// (zero-)padded input (FInputCopy), hence no bounds checks. Only used on the
-// inference-only, non-pointwise, non-Winograd forward path. One work-item per
-// column-matrix element. Coded by Claude (AI).
+/* Device-side im2col, shared by cai_im2col and cai_im2col_h. One work-item per
+   element of the convolution's FInputPrepared column matrix: a copy of one
+   FInput element, or 0 for a tap in the zero padding, in the layout of the CPU
+   PrepareInputForConvolutionFast ((SizeX*y)+x)*Depth+d, so the GEMM reads the
+   same B operand. FInput is either unpadded (a bound resident source; Padding
+   is applied here, symmetric on X and Y) or the host-padded FInputCopy with
+   Padding = 0. Indices are int: N must stay below 2^31.
+   Coded by Claude (AI). */
+// Index of the FInput element read by column element gid; -1 for a tap in the
+// zero padding.
+static inline int cai_im2col_src_index(const int gid, const int OutSizeX,
+  const int ColDepth, const int RowSpan, const int InSizeX, const int InSizeY,
+  const int InDepth, const int Stride, const int Padding)
+{
+  const int col_elem = gid % ColDepth;
+  const int pos      = gid / ColDepth;
+  const int ox       = pos % OutSizeX;
+  const int oy       = pos / OutSizeX;
+  const int yCount   = col_elem / RowSpan;
+  const int rem      = col_elem % RowSpan;
+  const int y        = oy * Stride + yCount - Padding;
+  const int xFirst   = ox * Stride - Padding;
+  const int x        = xFirst + rem / InDepth;
+  if ((y < 0) || (y >= InSizeY) || (x < 0) || (x >= InSizeX)) return -1;
+  return ((InSizeX * y) + xFirst) * InDepth + rem;
+}
+
+// FP32 gather into the GEMM B operand. Coded by Claude (AI).
 __kernel void cai_im2col
 (
   const int N,          // total elements = OutSizeX*OutSizeY*ColDepth
   const int OutSizeX,   // FOutput.SizeX
   const int ColDepth,   // FInputPrepared depth = InDepth*FeatX*FeatY
   const int RowSpan,    // one feature-row width = InDepth*FeatX
-  const int InSizeX,    // FInputCopy.SizeX (padded)
-  const int InDepth,    // FInputCopy.Depth
+  const int InSizeX,    // FInput.SizeX
+  const int InSizeY,    // FInput.SizeY
+  const int InDepth,    // FInput.Depth
   const int Stride,
+  const int Padding,    // zero border added on each side of FInput
   __global const float* FInput,
   __global float* FCols
 )
 {
   const int gid = get_global_id(0);
   if (gid >= N) return;
-  const int col_elem = gid % ColDepth;
-  const int pos      = gid / ColDepth;
-  const int ox       = pos % OutSizeX;
-  const int oy       = pos / OutSizeX;
-  const int yCount   = col_elem / RowSpan;
-  const int rem      = col_elem % RowSpan;
-  const int src = ((InSizeX * (oy * Stride + yCount)) + ox * Stride) * InDepth + rem;
-  FCols[gid] = FInput[src];
+  const int src = cai_im2col_src_index(gid, OutSizeX, ColDepth, RowSpan,
+    InSizeX, InSizeY, InDepth, Stride, Padding);
+  FCols[gid] = (src < 0) ? 0.0f : FInput[src];
 }
 
-// HALF-ACTIVATION twin of cai_im2col. The gather is unchanged - same closed-form
-// conv geometry, same source element per output element - only the WRITE narrows
-// to half via vstore_half (round-to-nearest-even, core OpenCL, no cl_khr_fp16).
-// FInput, the already-padded convolution input, stays FP32 and is what crosses
-// the bus; the FeatureSizeX*FeatureSizeY-larger column matrix it expands into
-// exists only on the device and only in half, which is where the traffic saving
-// comes from. Feeds cai_dot_product_int8_h. Coded by Claude (AI).
+// Half twin of cai_im2col: the same gather, written as half via vstore_half
+// (round to nearest even) for cai_dot_product_int8_h. Coded by Claude (AI).
 __kernel void cai_im2col_h
 (
-  const int N,          // total elements = OutSizeX*OutSizeY*ColDepth
-  const int OutSizeX,   // FOutput.SizeX
-  const int ColDepth,   // FInputPrepared depth = InDepth*FeatX*FeatY
-  const int RowSpan,    // one feature-row width = InDepth*FeatX
-  const int InSizeX,    // FInputCopy.SizeX (padded)
-  const int InDepth,    // FInputCopy.Depth
+  const int N,
+  const int OutSizeX,
+  const int ColDepth,
+  const int RowSpan,
+  const int InSizeX,
+  const int InSizeY,
+  const int InDepth,
   const int Stride,
+  const int Padding,
   __global const float* FInput,
   __global half* FCols
 )
 {
   const int gid = get_global_id(0);
   if (gid >= N) return;
-  const int col_elem = gid % ColDepth;
-  const int pos      = gid / ColDepth;
-  const int ox       = pos % OutSizeX;
-  const int oy       = pos / OutSizeX;
-  const int yCount   = col_elem / RowSpan;
-  const int rem      = col_elem % RowSpan;
-  const int src = ((InSizeX * (oy * Stride + yCount)) + ox * Stride) * InDepth + rem;
-  vstore_half(FInput[src], gid, FCols);
+  const int src = cai_im2col_src_index(gid, OutSizeX, ColDepth, RowSpan,
+    InSizeX, InSizeY, InDepth, Stride, Padding);
+  vstore_half((src < 0) ? 0.0f : FInput[src], gid, FCols);
 }
 
 // Narrows an FP32 device buffer to half, element for element. This is the

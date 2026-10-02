@@ -507,10 +507,9 @@ type
     // through cai_dot_product and int8 through cai_dot_product_int8. Same
     // sentinel probe on the source layer. Coded by Claude (AI).
     procedure TestFullConnectResidentInputOpenCLParity;
-    // The spatial twin: an unpadded conv gathers its column matrix with
-    // cai_im2col straight out of the source layer's device buffer, so the
-    // FInputCopy upload disappears too. Same sentinel probe, swept over feature
-    // size and stride. Coded by Claude (AI).
+    // The spatial twin: cai_im2col gathers (and pads) straight from the source
+    // layer's OpenCL buffer; sentinel + transfer counters over geometry sweeps,
+    // plus one host source (padded-copy upload). Coded by Claude (AI).
     procedure TestConvIm2ColResidentSourceOpenCLParity;
     // The whole chain: projection -> activation -> projection with nothing
     // returning to host memory in between. cai_activation reads the source
@@ -67100,38 +67099,85 @@ end;
 
 procedure TTestNeuralNumerical.TestConvIm2ColResidentSourceOpenCLParity;
 {$IFDEF OpenCL}
+type
+  TGatherCase = record
+    SizeX, SizeY, SrcDepth, Features: integer;
+    FeatureSizeX, FeatureSizeY, Padding, Stride: integer;
+    // A CPU-only layer between source and gather conv: the padded-copy upload.
+    // Same geometry as the case before it; their OpenCL outputs must be equal.
+    HostSource: boolean;
+    // int8 weights with a half B operand: the gather runs cai_im2col_h.
+    Int8FP16: boolean;
+  end;
+const
+  csSentinel = 999;
+  // Unpadded and padded (cai_im2col pads); square and non-square maps and
+  // kernels (TNNetConvolutionRectangular); depths that are not multiples of 4.
+  Cases: array[0..14] of TGatherCase = (
+    (SizeX: 8; SizeY: 8; SrcDepth: 8; Features: 4; FeatureSizeX: 2; FeatureSizeY: 2; Padding: 0; Stride: 1; HostSource: false; Int8FP16: false),
+    (SizeX: 8; SizeY: 8; SrcDepth: 8; Features: 4; FeatureSizeX: 3; FeatureSizeY: 3; Padding: 0; Stride: 1; HostSource: false; Int8FP16: false),
+    (SizeX: 8; SizeY: 8; SrcDepth: 8; Features: 4; FeatureSizeX: 3; FeatureSizeY: 3; Padding: 0; Stride: 2; HostSource: false; Int8FP16: false),
+    (SizeX: 8; SizeY: 8; SrcDepth: 8; Features: 4; FeatureSizeX: 3; FeatureSizeY: 3; Padding: 1; Stride: 1; HostSource: false; Int8FP16: false),
+    (SizeX: 8; SizeY: 8; SrcDepth: 8; Features: 4; FeatureSizeX: 3; FeatureSizeY: 3; Padding: 1; Stride: 2; HostSource: false; Int8FP16: false),
+    (SizeX: 8; SizeY: 8; SrcDepth: 8; Features: 4; FeatureSizeX: 5; FeatureSizeY: 5; Padding: 2; Stride: 1; HostSource: false; Int8FP16: false),
+    (SizeX: 9; SizeY: 6; SrcDepth: 6; Features: 4; FeatureSizeX: 5; FeatureSizeY: 5; Padding: 1; Stride: 2; HostSource: false; Int8FP16: false),
+    (SizeX: 7; SizeY: 10; SrcDepth: 5; Features: 6; FeatureSizeX: 3; FeatureSizeY: 3; Padding: 1; Stride: 2; HostSource: false; Int8FP16: false),
+    (SizeX: 8; SizeY: 8; SrcDepth: 8; Features: 4; FeatureSizeX: 5; FeatureSizeY: 5; Padding: 2; Stride: 2; HostSource: false; Int8FP16: false),
+    (SizeX: 9; SizeY: 6; SrcDepth: 5; Features: 4; FeatureSizeX: 1; FeatureSizeY: 3; Padding: 1; Stride: 1; HostSource: false; Int8FP16: false),
+    (SizeX: 9; SizeY: 6; SrcDepth: 5; Features: 4; FeatureSizeX: 3; FeatureSizeY: 1; Padding: 1; Stride: 2; HostSource: false; Int8FP16: false),
+    (SizeX: 9; SizeY: 6; SrcDepth: 3; Features: 5; FeatureSizeX: 3; FeatureSizeY: 3; Padding: 1; Stride: 1; HostSource: false; Int8FP16: false),
+    (SizeX: 9; SizeY: 6; SrcDepth: 3; Features: 5; FeatureSizeX: 3; FeatureSizeY: 3; Padding: 1; Stride: 1; HostSource: true; Int8FP16: false),
+    (SizeX: 9; SizeY: 6; SrcDepth: 6; Features: 8; FeatureSizeX: 3; FeatureSizeY: 3; Padding: 1; Stride: 2; HostSource: false; Int8FP16: true),
+    (SizeX: 9; SizeY: 6; SrcDepth: 6; Features: 8; FeatureSizeX: 3; FeatureSizeY: 3; Padding: 1; Stride: 2; HostSource: true; Int8FP16: true));
 var
   NN: TNNet;
-  Input, OutCPU: TNNetVolume;
-  SourceConv, GatherConv: TNNetLayer;
+  Input, OutCPU, BoundOutput: TNNetVolume;
+  SourceConv, GatherSource, GatherConv: TNNetLayer;
   PlatformId: cl_platform_id;
   DeviceId: cl_device_id;
   i, SentinelsLeft, CaseCnt: integer;
-  Diff, MaxDiff: TNeuralFloat;
-const
-  csSentinel = 999;
-  // The consumer must be unpadded: CopyPadding builds FInputCopy on the host.
-  FeatureSizes: array[0..2] of integer = (2, 3, 3);
-  Strides: array[0..2] of integer = (1, 1, 2);
+  Diff, MaxDiff, Tolerance: TNeuralFloat;
+  CaseName: string;
+  Transfers: TOpenCLTransferCounts;
 begin
   if not AcquireFirstOpenCLDevice(PlatformId, DeviceId) then
   begin
     AssertTrue('no OpenCL device: SKIP', true);
     Exit;
   end;
-  for CaseCnt := Low(FeatureSizes) to High(FeatureSizes) do
+  BoundOutput := TNNetVolume.Create();
+  try
+  for CaseCnt := Low(Cases) to High(Cases) do
+  with Cases[CaseCnt] do
   begin
+    CaseName := ' (case ' + IntToStr(CaseCnt) + ')';
     RandSeed := 424242;
     NN := TNNet.Create();
-    Input := TNNetVolume.Create(8, 8, 4);
+    Input := TNNetVolume.Create(SizeX, SizeY, 4);
     OutCPU := TNNetVolume.Create();
     try
-      NN.AddLayer(TNNetInput.Create(8, 8, 4, 1));
+      NN.AddLayer(TNNetInput.Create(SizeX, SizeY, 4, 1));
       // A fused-activation conv: its output is what stays in device memory.
-      SourceConv := NN.AddLayer(TNNetConvolutionReLU.Create(8, 3, 1, 1));
-      GatherConv := NN.AddLayer(TNNetConvolutionReLU.Create(4,
-        FeatureSizes[CaseCnt], {padding}0, Strides[CaseCnt]));
+      SourceConv := NN.AddLayer(TNNetConvolutionReLU.Create(SrcDepth, 3, 1, 1));
+      if HostSource
+        then GatherSource := NN.AddLayer(TNNetIdentity.Create())
+        else GatherSource := SourceConv;
+      if FeatureSizeX = FeatureSizeY
+        then GatherConv := NN.AddLayer(TNNetConvolutionReLU.Create(Features,
+          FeatureSizeX, Padding, Stride))
+        else GatherConv := NN.AddLayer(TNNetConvolutionRectangularReLU.Create(
+          Features, FeatureSizeX, FeatureSizeY, Padding, Stride));
+      // A consumer after the gather conv, so its resident output is bound
+      // rather than downloaded as the net's result.
+      NN.AddLayer(TNNetPointwiseConvLinear.Create(3));
       NN.SetTrainable(False, False);
+      // Half's tolerance: the B operand carries ~5e-4 relative error.
+      if Int8FP16 then
+      begin
+        NN.QuantizeWeightsInt8();
+        Tolerance := 1e-2;
+      end
+      else Tolerance := 1e-4;
 
       for i := 0 to Input.Size - 1 do Input.Raw[i] := 0.05 * i - 0.3;
 
@@ -67139,11 +67185,18 @@ begin
       OutCPU.Copy(NN.GetLastLayer.Output);
 
       NN.ForceOpenCL(True);
+      // Before EnableOpenCL: it sizes the half B buffer.
+      NN.OpenCLFP16 := Int8FP16;
       NN.EnableOpenCL(PlatformId, DeviceId);
       try
+        AssertEquals('gather conv FP16 route' + CaseName, Int8FP16,
+          TNNetConvolutionBase(GatherConv).FP16Active);
         NN.Compute(Input);
+        NN.LayerProfiling := true;
+        NN.ClearTime();
         SourceConv.Output.Fill(csSentinel);
         NN.Compute(Input);
+        Transfers := GatherConv.ProfiledTransfers;
         SentinelsLeft := 0;
         for i := 0 to SourceConv.Output.Size - 1 do
           if SourceConv.Output.Raw[i] = csSentinel then Inc(SentinelsLeft);
@@ -67154,25 +67207,53 @@ begin
           Diff := Abs(OutCPU.Raw[i] - NN.GetLastLayer.Output.Raw[i]);
           if Diff > MaxDiff then MaxDiff := Diff;
         end;
+        AssertTrue('gather conv output stays in OpenCL memory' + CaseName,
+          GatherConv.OutputBindableOnOpenCL());
+        AssertEquals('gather source offers OpenCL memory' + CaseName,
+          not HostSource, GatherSource.OutputBindableOnOpenCL());
       finally
         NN.ForceOpenCL(False);
       end;
-      WriteLn('  Conv im2col resident source: feature=', FeatureSizes[CaseCnt],
-        ' stride=', Strides[CaseCnt], ' max|diff|=', MaxDiff:0:9,
+      WriteLn('  Conv im2col resident source: ', SizeX, 'x', SizeY, 'x',
+        SrcDepth, ' feature=', FeatureSizeX, 'x', FeatureSizeY,
+        ' pad=', Padding, ' stride=', Stride, ' host source=', HostSource,
+        ' int8 fp16=', Int8FP16, ' max|diff|=', MaxDiff:0:9,
         ' gpu forwards=', GatherConv.ForwardGPUCnt,
+        ' uploads=', Transfers.UploadCount,
+        ' downloads=', Transfers.DownloadCount,
         ' sentinels kept=', SentinelsLeft, '/', SourceConv.Output.Size);
-      AssertTrue('gather conv must reach the device (case ' +
-        IntToStr(CaseCnt) + ')', GatherConv.ForwardGPUCnt > 0);
-      AssertEquals('the source output must NOT be downloaded (case ' +
-        IntToStr(CaseCnt) + ')', SourceConv.Output.Size, SentinelsLeft);
-      AssertTrue('conv im2col resident-source vs CPU parity (case ' +
-        IntToStr(CaseCnt) + '): max |diff| = ' + FloatToStr(MaxDiff) +
-        ' must be < 1e-4', MaxDiff < 1e-4);
+      AssertTrue('gather conv must reach the device' + CaseName,
+        GatherConv.ForwardGPUCnt > 0);
+      AssertTrue('conv im2col resident-source vs CPU parity' + CaseName +
+        ': max |diff| = ' + FloatToStr(MaxDiff) + ' must be < ' +
+        FloatToStr(Tolerance), MaxDiff < Tolerance);
+      AssertEquals('the gather conv downloads nothing' + CaseName, 0,
+        Transfers.DownloadCount);
+      if HostSource then
+      begin
+        AssertTrue('a host source uploads its padded copy' + CaseName,
+          Transfers.UploadCount > 0);
+        AssertEquals('a host source is read from RAM' + CaseName, 0,
+          SentinelsLeft);
+        AssertEquals('padded-copy gather = bound padded gather, bit for bit' +
+          CaseName, 0, NN.GetLastLayer.Output.SumDiff(BoundOutput));
+      end
+      else
+      begin
+        BoundOutput.Copy(NN.GetLastLayer.Output);
+        AssertEquals('a bound source uploads nothing' + CaseName, 0,
+          Transfers.UploadCount);
+        AssertEquals('the source output must NOT be downloaded' + CaseName,
+          SourceConv.Output.Size, SentinelsLeft);
+      end;
     finally
       OutCPU.Free;
       Input.Free;
       NN.Free;
     end;
+  end;
+  finally
+    BoundOutput.Free;
   end;
 end;
 {$ELSE}

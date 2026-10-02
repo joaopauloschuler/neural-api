@@ -329,7 +329,7 @@ type
       FBiasBuffer: cl_mem;
       FCapBias: csize_t;
       /// Optional resident source buffer for device-side im2col: holds the small
-      /// (padded) convolution input that BuildInputColsOnDevice gathers into
+      /// convolution input that BuildInputColsOnDevice gathers into
       /// FInputBufferBs. Grow-only and re-uploaded only when the source changed;
       /// nil until the first inference-only non-pointwise conv forward that opts in.
       /// Coded by Claude (AI).
@@ -528,7 +528,8 @@ type
       /// to avoid churning three clCreateBuffer/clReleaseMemObject pairs per GEMM.
       /// Coded by Claude (AI).
       procedure ReallocateBuffersIfRequired(VAs, VBs: TNNetVolume; pSize: longint; GroupSizeA: integer=0; GroupSizeB: integer=0);
-      /// Device-side im2col: gathers SrcVol (the padded conv input) into the
+      /// Device-side im2col: gathers SrcVol (the conv input, zero-padded by
+      /// Padding on each side inside the gather) into the
       /// resident B-operand buffer (FInputBufferBs) using the shared cai_im2col
       /// kernel, so the host never builds nor uploads the inflated column matrix.
       /// Must be called AFTER the B buffer is sized (PrepareForCompute in
@@ -540,8 +541,8 @@ type
       /// uploaded and nothing is released here. SrcVol then only carries the
       /// shape. Coded by Claude (AI).
       procedure BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel; SrcVol: TNNetVolume;
-        OutSizeX, ColDepth, RowSpan, InSizeX, InDepth, Stride: longint; NewSrc: boolean = true;
-        pExternalSrc: cl_mem = nil);
+        OutSizeX, ColDepth, RowSpan, Stride, Padding: longint;
+        NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
       /// pExternalVBs BORROWS a B operand that is already on the device (a
       /// producing layer's output buffer): it is bound instead of
       /// FInputBufferBs, never uploaded and never released here. VBs then only
@@ -940,11 +941,11 @@ begin
 end;
 
 procedure TDotProductSharedKernel.BuildInputColsOnDevice(Im2ColKernel: TNeuralKernel;
-  SrcVol: TNNetVolume; OutSizeX, ColDepth, RowSpan, InSizeX, InDepth, Stride: longint;
+  SrcVol: TNNetVolume; OutSizeX, ColDepth, RowSpan, Stride, Padding: longint;
   NewSrc: boolean = true; pExternalSrc: cl_mem = nil);
 var
   k: cl_kernel;
-  N: longint;
+  N, InSizeX, InSizeY, InDepth: longint;
   err: integer;
   NeededSrc: csize_t;
   SrcBuffer, ColsBuffer: cl_mem;
@@ -958,7 +959,16 @@ begin
     else ColsBuffer := FInputBufferBs;
   // Total column-matrix elements = FInputBufferBs capacity (already sized to
   // FInputPrepared by PrepareForCompute). FNumBs*FSize == FInputPrepared.Size.
+  // The OpenCL kernel indexes with int. TNNetConvolution.ShouldOpenCLIm2Col
+  // refuses such a layer first; a raise here cannot leave a stale B operand.
+  if Int64(FNumBs) * FSize > High(longint) then
+    raise Exception.Create('BuildInputColsOnDevice: column matrix of ' +
+      IntToStr(Int64(FNumBs) * FSize) +
+      ' elements exceeds the int index range.');
   N := FNumBs * FSize;
+  InSizeX := SrcVol.SizeX;
+  InSizeY := SrcVol.SizeY;
+  InDepth := SrcVol.Depth;
 
   err := CL_SUCCESS;
   if pExternalSrc <> nil then
@@ -985,10 +995,12 @@ begin
   err := err or clSetKernelArg(k, 2, csLongintSize, @ColDepth);
   err := err or clSetKernelArg(k, 3, csLongintSize, @RowSpan);
   err := err or clSetKernelArg(k, 4, csLongintSize, @InSizeX);
-  err := err or clSetKernelArg(k, 5, csLongintSize, @InDepth);
-  err := err or clSetKernelArg(k, 6, csLongintSize, @Stride);
-  err := err or clSetKernelArg(k, 7, csCLMemSize, @SrcBuffer);
-  err := err or clSetKernelArg(k, 8, csCLMemSize, @ColsBuffer);
+  err := err or clSetKernelArg(k, 5, csLongintSize, @InSizeY);
+  err := err or clSetKernelArg(k, 6, csLongintSize, @InDepth);
+  err := err or clSetKernelArg(k, 7, csLongintSize, @Stride);
+  err := err or clSetKernelArg(k, 8, csLongintSize, @Padding);
+  err := err or clSetKernelArg(k, 9, csCLMemSize, @SrcBuffer);
+  err := err or clSetKernelArg(k, 10, csCLMemSize, @ColsBuffer);
   if (err <> CL_SUCCESS) then
     ErrorProc('Error: BuildInputColsOnDevice - failed setting parameters: ' + IntToStr(err));
 
