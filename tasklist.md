@@ -195,25 +195,76 @@ rather than acted on.
 
 ## Infrastructure / dev experience
 
-- [ ] ChatServer: keep a prompt cache per conversation, so several parallel chats
-      do not re-prefill. Today TChatEngine is single-session (one KV cache, one
-      position; neuralchatengine.pas header): each request is diffed
-      (CommonPrefixLen) against the ONE resident token sequence, so two clients
-      taking turns diverge right after the shared system prompt and every request
-      pays a near-full prefill. For hybrid/recurrent nets the --cache-checkpoints
-      store is banded around the last fed position, so the other chat's
-      checkpoints are evicted too. Proposal: hold up to N saved conversation
-      states (the KV-cache rows + the recurrent checkpoints, e.g. via
-      TNNetDecoderSessionSnapshot), pick the one with the longest common token
-      prefix for each request (the OpenAI-style API is stateless, so no session
-      id is needed; an optional `user`/session field could break ties), restore
-      it, prefill only the tail, and evict least-recently-used. Needs a
-      memory-budgeted slot count flag (each slot costs one KV cache; --kv-int8
-      shrinks it; under OpenCL decide resident vs host-RAM slots) and must keep
-      the shared system-prompt prefix reusable across slots. Compute stays
-      serialized (one request at a time); batched concurrent decode is a
-      separate, larger item. Update examples/ChatTerminal/ChatServer.md
-      "Concurrency and cache reuse".
+- [ ] ChatServer: multiple chat sessions in cache, so parallel chats do not
+      re-prefill (design agreed with the user 2026-10-02). Today TChatEngine is
+      single-session (one KV cache, one position; neuralchatengine.pas header):
+      each request is diffed (CommonPrefixLen) against the ONE resident token
+      sequence, so two clients taking turns diverge right after the shared system
+      prompt and every request pays a near-full prefill; for hybrid/recurrent nets
+      DropCheckpointsAbove also frees the other chat's checkpoints. Compute stays
+      serialized (one request at a time). Process: one Opus coder per task, then
+      an independent Opus review, commit after review + green suites
+      (lazbuild -B; default AND -dAVX2 suites; the PoCL suite when OpenCL code is
+      touched; 3 GB ulimit). Each task ships its own tests.
+  - [ ] T1. Token-prefix hash primitive. A running 64-bit hash over token ids
+        (h := Mix(h, Token[i]), {$PUSH}{$Q-}{$R-} around the wrapping math) plus
+        a last-64-token guard compared exactly on a hash match. Search for an
+        existing 64-bit mix first (coding guide #3). Tests: equal prefixes give
+        equal hashes, a one-token change at any position changes it, the guard
+        rejects a forced hash collision.
+  - [ ] T2. One eviction policy + hash matching for the cache checkpoints.
+        Per checkpoint slot: PrefixHash, the guard tokens and LastUsedTurn
+        (engine-side records; one GenerateFromIds call = one turn). Replace
+        CheckpointBand, RetainCheckpointsBefore and DropCheckpointsAbove with
+        ONE routine, DeleteTheLongestUnusedCheckpoint, run only when a capture
+        finds no free slot (ties: the shallowest goes first). A request never
+        frees a checkpoint because the prompt diverged. Resume: ONE pass over the
+        prompt computes the running hash, finds the deepest matching checkpoint
+        and the live-cache common prefix together (no second CommonPrefixLen
+        pass). Every matching checkpoint is marked used this turn, so the
+        system-prompt checkpoint never ages out. CORRECTNESS: on a net with
+        attention layers a checkpoint is resumable only when its Position <= the
+        live-cache common prefix (its K/V rows must still be in the live cache);
+        a pure recurrent net has no such limit. Tests: a growing single
+        conversation still resumes at the previous reply end; a diverging prompt
+        leaves the old checkpoints in place; LRU order of eviction; resumed
+        output equals a full re-prefill.
+  - [ ] T3. Capture points. Capture at the end of the system prompt, the end of
+        the prompt and the end of the reply only; remove the per-window captures
+        in FeedWindows (one long prefill must not flush the store). The
+        system-prompt token length comes from the chat format (e.g. render the
+        system message alone and confirm it is a token prefix of the full
+        prompt); under a windowed prefill the capture lands on the last window
+        end at or below that boundary. Raw mode (no system role): prompt end and
+        reply end only. Revisit the --cache-checkpoints default (16/8) once the
+        store no longer holds per-window captures.
+  - [ ] T4. Conversation slots (--kv-slots N, small, e.g. 2-4): a full saved
+        session state (attention K/V rows + recurrent state, via
+        TNNetDecoderSessionSnapshot / SnapshotInto) per slot, with PrefixHash,
+        guard tokens and LastUsedTurn. When a request diverges from the live
+        conversation and a slot matches deeper than the live cache, save the
+        live conversation into a slot (DeleteTheLongestUnusedCheckpoint-style
+        LRU when full) and restore the matching slot; prefill only the tail.
+        Each slot costs up to one full KV cache (the live cache size at that
+        position), so slots live in host RAM and follow --kv-int8. Check first:
+        whether SnapshotInto copies only the live rows or the whole
+        MaxCacheLen buffers, and how it handles a KV cache resident in OpenCL
+        memory (FusedSDPA resident KV); fix to copy live rows only. Covers
+        hybrid AND pure-attention nets (Llama/Qwen2.5 have no recurrent
+        checkpoints, only KV).
+  - [ ] T5. Flags, stats, docs: --kv-slots in ParseArgs + help text; --stats
+        reports which checkpoint/slot matched, reused tokens, and slot memory;
+        update examples/ChatTerminal/ChatServer.md "Concurrency and cache
+        reuse", the ChatTerminal README and the neuralchatengine.pas header
+        ("The engine is single-session").
+  - [ ] T6. End-to-end tests on pico nets (pure attention, hybrid, pure
+        recurrent): requests A, B, A, B - the second A and B resume deep, and
+        every reply equals the full re-prefill reply.
+  - [ ] T7. User acceptance on the GPU box: TTFT of two alternating real
+        conversations on a real hybrid (qwen3_5) before and after.
+  - [ ] Follow-up (not in this task): shared paged KV blocks, so conversations
+        share the blocks of their common prefix instead of one full KV copy per
+        slot (vLLM-style); a large KV-cache rewrite.
 - [ ] Gradient checkpointing for training deeper nets in less memory
 - [ ] GGUF import beyond Llama — open follow-ups (core `BuildFromGGUF`/`BuildFromGGUFEx`
       arch dispatch with llama/qwen2/gemma2 LANDED & verified):
